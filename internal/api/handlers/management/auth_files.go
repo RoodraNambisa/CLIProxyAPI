@@ -1,6 +1,7 @@
 package management
 
 import (
+	"archive/zip"
 	"bytes"
 	"context"
 	"crypto/sha256"
@@ -553,29 +554,158 @@ func isUnsafeAuthFileName(name string) bool {
 	return false
 }
 
-// Download single auth file by name
-func (h *Handler) DownloadAuthFile(c *gin.Context) {
-	name := strings.TrimSpace(c.Query("name"))
+type authDownloadFile struct {
+	Name string
+	Data []byte
+}
+
+type authFilesArchiveRequest struct {
+	All   bool     `json:"all"`
+	Names []string `json:"names"`
+}
+
+func validateDownloadAuthFileName(name string) error {
+	name = strings.TrimSpace(name)
 	if isUnsafeAuthFileName(name) {
-		c.JSON(400, gin.H{"error": "invalid name"})
-		return
+		return fmt.Errorf("invalid name")
 	}
 	if !strings.HasSuffix(strings.ToLower(name), ".json") {
-		c.JSON(400, gin.H{"error": "name must end with .json"})
-		return
+		return fmt.Errorf("name must end with .json")
 	}
-	full := filepath.Join(h.cfg.AuthDir, name)
+	return nil
+}
+
+func (h *Handler) readDownloadAuthFile(name string) (*authDownloadFile, int, error) {
+	if err := validateDownloadAuthFileName(name); err != nil {
+		return nil, http.StatusBadRequest, err
+	}
+	full := filepath.Join(h.cfg.AuthDir, filepath.Base(strings.TrimSpace(name)))
 	data, err := os.ReadFile(full)
 	if err != nil {
 		if os.IsNotExist(err) {
-			c.JSON(404, gin.H{"error": "file not found"})
-		} else {
-			c.JSON(500, gin.H{"error": fmt.Sprintf("failed to read file: %v", err)})
+			return nil, http.StatusNotFound, fmt.Errorf("file not found")
 		}
+		return nil, http.StatusInternalServerError, fmt.Errorf("failed to read file: %w", err)
+	}
+	return &authDownloadFile{Name: filepath.Base(strings.TrimSpace(name)), Data: data}, http.StatusOK, nil
+}
+
+func (h *Handler) listAllDownloadAuthFiles() ([]authDownloadFile, error) {
+	entries, err := os.ReadDir(h.cfg.AuthDir)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read auth dir: %w", err)
+	}
+	files := make([]authDownloadFile, 0)
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		name := strings.TrimSpace(entry.Name())
+		if !strings.HasSuffix(strings.ToLower(name), ".json") {
+			continue
+		}
+		file, _, errRead := h.readDownloadAuthFile(name)
+		if errRead != nil {
+			return nil, errRead
+		}
+		files = append(files, *file)
+	}
+	sort.Slice(files, func(i, j int) bool {
+		return strings.ToLower(files[i].Name) < strings.ToLower(files[j].Name)
+	})
+	return files, nil
+}
+
+func (h *Handler) loadDownloadAuthFiles(names []string) ([]authDownloadFile, int, error) {
+	names = uniqueAuthFileNames(names)
+	if len(names) == 0 {
+		return nil, http.StatusBadRequest, fmt.Errorf("names is required")
+	}
+	files := make([]authDownloadFile, 0, len(names))
+	for _, name := range names {
+		file, status, err := h.readDownloadAuthFile(name)
+		if err != nil {
+			return nil, status, err
+		}
+		files = append(files, *file)
+	}
+	return files, http.StatusOK, nil
+}
+
+func buildAuthFilesArchive(files []authDownloadFile) ([]byte, error) {
+	var buf bytes.Buffer
+	zw := zip.NewWriter(&buf)
+	for _, file := range files {
+		w, err := zw.Create(file.Name)
+		if err != nil {
+			_ = zw.Close()
+			return nil, fmt.Errorf("create zip entry %s: %w", file.Name, err)
+		}
+		if _, err = w.Write(file.Data); err != nil {
+			_ = zw.Close()
+			return nil, fmt.Errorf("write zip entry %s: %w", file.Name, err)
+		}
+	}
+	if err := zw.Close(); err != nil {
+		return nil, fmt.Errorf("finalize zip archive: %w", err)
+	}
+	return buf.Bytes(), nil
+}
+
+// Download single auth file by name
+func (h *Handler) DownloadAuthFile(c *gin.Context) {
+	name := strings.TrimSpace(c.Query("name"))
+	file, status, err := h.readDownloadAuthFile(name)
+	if err != nil {
+		c.JSON(status, gin.H{"error": err.Error()})
 		return
 	}
-	c.Header("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s\"", name))
-	c.Data(200, "application/json", data)
+	c.Header("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s\"", file.Name))
+	c.Data(http.StatusOK, "application/json", file.Data)
+}
+
+// DownloadAuthFilesArchive downloads all or selected auth files as a zip archive.
+func (h *Handler) DownloadAuthFilesArchive(c *gin.Context) {
+	var req authFilesArchiveRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+		return
+	}
+	if req.All && len(req.Names) > 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "all and names are mutually exclusive"})
+		return
+	}
+	if !req.All && len(req.Names) == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "all or names is required"})
+		return
+	}
+
+	var (
+		files []authDownloadFile
+		err   error
+	)
+	if req.All {
+		files, err = h.listAllDownloadAuthFiles()
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+	} else {
+		var status int
+		files, status, err = h.loadDownloadAuthFiles(req.Names)
+		if err != nil {
+			c.JSON(status, gin.H{"error": err.Error()})
+			return
+		}
+	}
+
+	archive, err := buildAuthFilesArchive(files)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.Header("Content-Disposition", `attachment; filename="auth-files.zip"`)
+	c.Data(http.StatusOK, "application/zip", archive)
 }
 
 // Upload auth file: multipart or raw JSON with ?name=

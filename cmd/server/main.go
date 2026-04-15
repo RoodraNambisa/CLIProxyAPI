@@ -42,6 +42,24 @@ var (
 	DefaultConfigPath = ""
 )
 
+func resolveDefaultConfigPath(workDir string) string {
+	workDir = strings.TrimSpace(workDir)
+	if workDir == "" {
+		return ""
+	}
+	candidates := []string{
+		filepath.Join(workDir, "data", "config.yaml"),
+		filepath.Join(workDir, "config.yaml"),
+	}
+	for _, candidate := range candidates {
+		info, err := os.Stat(candidate)
+		if err == nil && !info.IsDir() {
+			return candidate
+		}
+	}
+	return candidates[0]
+}
+
 // init initializes the shared logger setup.
 func init() {
 	logging.SetupBaseLogger()
@@ -390,7 +408,7 @@ func main() {
 			log.Errorf("failed to get working directory: %v", err)
 			return
 		}
-		configFilePath = filepath.Join(wd, "config.yaml")
+		configFilePath = resolveDefaultConfigPath(wd)
 		cfg, err = config.LoadConfigOptional(configFilePath, isCloudDeploy)
 	}
 	if err != nil {
