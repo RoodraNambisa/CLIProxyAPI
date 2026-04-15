@@ -8,6 +8,7 @@ import (
 	"sync"
 	"testing"
 
+	internalconfig "github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
@@ -141,6 +142,11 @@ type invalidJSONStreamExecutor struct{}
 
 type splitResponsesEventStreamExecutor struct{}
 
+type streamBudgetPoolExecutor struct {
+	mu    sync.Mutex
+	calls int
+}
+
 func (e *invalidJSONStreamExecutor) Identifier() string { return "codex" }
 
 func (e *invalidJSONStreamExecutor) Execute(context.Context, *coreauth.Auth, coreexecutor.Request, coreexecutor.Options) (coreexecutor.Response, error) {
@@ -198,6 +204,44 @@ func (e *splitResponsesEventStreamExecutor) HttpRequest(ctx context.Context, aut
 		Message:    "HttpRequest not implemented",
 		HTTPStatus: http.StatusNotImplemented,
 	}
+}
+
+func (e *streamBudgetPoolExecutor) Identifier() string { return "pool" }
+
+func (e *streamBudgetPoolExecutor) Execute(context.Context, *coreauth.Auth, coreexecutor.Request, coreexecutor.Options) (coreexecutor.Response, error) {
+	return coreexecutor.Response{}, &coreauth.Error{Code: "not_implemented", Message: "Execute not implemented"}
+}
+
+func (e *streamBudgetPoolExecutor) ExecuteStream(context.Context, *coreauth.Auth, coreexecutor.Request, coreexecutor.Options) (*coreexecutor.StreamResult, error) {
+	e.mu.Lock()
+	e.calls++
+	e.mu.Unlock()
+	ch := make(chan coreexecutor.StreamChunk, 1)
+	ch <- coreexecutor.StreamChunk{Err: &coreauth.Error{Code: "quota", Message: "quota", HTTPStatus: http.StatusTooManyRequests}}
+	close(ch)
+	return &coreexecutor.StreamResult{Chunks: ch}, nil
+}
+
+func (e *streamBudgetPoolExecutor) Refresh(ctx context.Context, auth *coreauth.Auth) (*coreauth.Auth, error) {
+	return auth, nil
+}
+
+func (e *streamBudgetPoolExecutor) CountTokens(context.Context, *coreauth.Auth, coreexecutor.Request, coreexecutor.Options) (coreexecutor.Response, error) {
+	return coreexecutor.Response{}, &coreauth.Error{Code: "not_implemented", Message: "CountTokens not implemented"}
+}
+
+func (e *streamBudgetPoolExecutor) HttpRequest(ctx context.Context, auth *coreauth.Auth, req *http.Request) (*http.Response, error) {
+	return nil, &coreauth.Error{
+		Code:       "not_implemented",
+		Message:    "HttpRequest not implemented",
+		HTTPStatus: http.StatusNotImplemented,
+	}
+}
+
+func (e *streamBudgetPoolExecutor) Calls() int {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.calls
 }
 
 func (e *authAwareStreamExecutor) Identifier() string { return "codex" }
@@ -658,6 +702,64 @@ func TestExecuteStreamWithAuthManager_SelectedAuthCallbackReceivesAuthID(t *test
 	}
 	if selectedAuthID != "auth2" {
 		t.Fatalf("selectedAuthID = %q, want %q", selectedAuthID, "auth2")
+	}
+}
+
+func TestExecuteStreamWithAuthManager_SharesBudgetAcrossModelFallbackAndBootstrapReplay(t *testing.T) {
+	executor := &streamBudgetPoolExecutor{}
+	manager := coreauth.NewManager(nil, nil, nil)
+	manager.SetConfig(&internalconfig.Config{
+		OpenAICompatibility: []internalconfig.OpenAICompatibility{{
+			Name: "pool",
+			Models: []internalconfig.OpenAICompatibilityModel{
+				{Name: "qwen3.5-plus", Alias: "test-model"},
+				{Name: "glm-5", Alias: "test-model"},
+			},
+		}},
+	})
+	manager.SetRetryConfig(0, 0, 1)
+	manager.RegisterExecutor(executor)
+
+	auth := &coreauth.Auth{
+		ID:       "pool-auth",
+		Provider: "pool",
+		Status:   coreauth.StatusActive,
+		Attributes: map[string]string{
+			"api_key":      "test-key",
+			"compat_name":  "pool",
+			"provider_key": "pool",
+		},
+	}
+	if _, err := manager.Register(context.Background(), auth); err != nil {
+		t.Fatalf("manager.Register(auth): %v", err)
+	}
+
+	registry.GetGlobalRegistry().RegisterClient(auth.ID, auth.Provider, []*registry.ModelInfo{{ID: "test-model"}})
+	t.Cleanup(func() {
+		registry.GetGlobalRegistry().UnregisterClient(auth.ID)
+	})
+
+	handler := NewBaseAPIHandlers(&sdkconfig.SDKConfig{
+		Streaming: sdkconfig.StreamingConfig{BootstrapRetries: 2},
+	}, manager)
+	dataChan, _, errChan := handler.ExecuteStreamWithAuthManager(context.Background(), "openai", "test-model", []byte(`{"model":"test-model"}`), "")
+	if dataChan == nil || errChan == nil {
+		t.Fatalf("expected non-nil channels")
+	}
+
+	for range dataChan {
+	}
+	var gotErr *interfaces.ErrorMessage
+	for msg := range errChan {
+		if msg != nil {
+			gotErr = msg
+		}
+	}
+	if gotErr == nil {
+		t.Fatalf("expected terminal error after shared retry budget is exhausted")
+	}
+	if calls := executor.Calls(); calls != 2 {
+		t.Fatalf("expected 2 stream attempts after model fallback exhausts the shared retry budget, got %d", calls)
 	}
 }
 

@@ -34,6 +34,15 @@ type VertexCredentialStorage struct {
 	// Prefix optionally namespaces models for this credential (e.g., "teamA").
 	// This results in model names like "teamA/gemini-2.0-flash".
 	Prefix string `json:"prefix,omitempty"`
+
+	// Metadata holds extra top-level fields that should be merged into the saved
+	// credential payload.
+	Metadata map[string]any `json:"-"`
+}
+
+// SetMetadata allows callers to inject metadata before saving the credential file.
+func (s *VertexCredentialStorage) SetMetadata(meta map[string]any) {
+	s.Metadata = meta
 }
 
 // SaveTokenToFile writes the credential payload to the given file path in JSON format.
@@ -61,9 +70,14 @@ func (s *VertexCredentialStorage) SaveTokenToFile(authFilePath string) error {
 			log.Errorf("vertex credential: failed to close file: %v", errClose)
 		}
 	}()
+	data, errMerge := misc.MergeMetadata(s, s.Metadata)
+	if errMerge != nil {
+		return fmt.Errorf("vertex credential: merge metadata failed: %w", errMerge)
+	}
+
 	enc := json.NewEncoder(f)
 	enc.SetIndent("", "  ")
-	if err = enc.Encode(s); err != nil {
+	if err = enc.Encode(data); err != nil {
 		return fmt.Errorf("vertex credential: encode failed: %w", err)
 	}
 	return nil

@@ -129,7 +129,11 @@ func (w *Watcher) prepareAuthUpdatesLocked(auths []*coreauth.Auth, force bool) [
 	}
 	for id := range w.currentAuths {
 		if _, ok := newState[id]; !ok {
-			updates = append(updates, AuthUpdate{Action: AuthUpdateActionDelete, ID: id})
+			var deletedAuth *coreauth.Auth
+			if existing := w.currentAuths[id]; existing != nil {
+				deletedAuth = existing.Clone()
+			}
+			updates = append(updates, AuthUpdate{Action: AuthUpdateActionDelete, ID: id, Auth: deletedAuth})
 		}
 	}
 	w.currentAuths = newState

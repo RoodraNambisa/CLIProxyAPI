@@ -129,6 +129,72 @@ func TestFileSynthesizer_Synthesize_ValidAuthFile(t *testing.T) {
 	if auths[0].Status != coreauth.StatusActive {
 		t.Errorf("expected status active, got %s", auths[0].Status)
 	}
+	wantRaw, err := coreauth.CanonicalMetadataBytes(auths[0])
+	if err != nil {
+		t.Fatalf("CanonicalMetadataBytes() error = %v", err)
+	}
+	wantHash := coreauth.SourceHashFromBytes(wantRaw)
+	if got := auths[0].Attributes[coreauth.SourceHashAttributeKey]; got != wantHash {
+		t.Fatalf("source hash = %q, want %q", got, wantHash)
+	}
+	if rawHash := coreauth.SourceHashFromBytes(data); rawHash == wantHash {
+		t.Fatal("expected canonical source hash to differ from raw file hash")
+	}
+}
+
+func TestFileSynthesizer_Synthesize_MultiProjectGeminiUsesCanonicalSourceHash(t *testing.T) {
+	tempDir := t.TempDir()
+	authData := map[string]any{
+		"type":       "gemini",
+		"email":      "gemini@example.com",
+		"project_id": "project-a,project-b",
+	}
+	data, err := json.Marshal(authData)
+	if err != nil {
+		t.Fatalf("marshal auth data: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(tempDir, "gemini-auth.json"), data, 0o644); err != nil {
+		t.Fatalf("failed to write auth file: %v", err)
+	}
+
+	synth := NewFileSynthesizer()
+	ctx := &SynthesisContext{
+		Config:      &config.Config{},
+		AuthDir:     tempDir,
+		Now:         time.Now(),
+		IDGenerator: NewStableIDGenerator(),
+	}
+
+	auths, err := synth.Synthesize(ctx)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(auths) != 3 {
+		t.Fatalf("expected 3 auths (1 primary + 2 virtual), got %d", len(auths))
+	}
+
+	expected := &coreauth.Auth{
+		Disabled: false,
+		Metadata: map[string]any{
+			"type":       "gemini",
+			"email":      "gemini@example.com",
+			"project_id": "project-a,project-b",
+		},
+	}
+	wantRaw, err := coreauth.CanonicalMetadataBytes(expected)
+	if err != nil {
+		t.Fatalf("CanonicalMetadataBytes() error = %v", err)
+	}
+	wantHash := coreauth.SourceHashFromBytes(wantRaw)
+
+	for i, auth := range auths {
+		if got := auth.Attributes[coreauth.SourceHashAttributeKey]; got != wantHash {
+			t.Fatalf("auth %d source hash = %q, want %q", i, got, wantHash)
+		}
+	}
+	if rawHash := coreauth.SourceHashFromBytes(data); rawHash == wantHash {
+		t.Fatal("expected canonical source hash to differ from raw file hash")
+	}
 }
 
 func TestFileSynthesizer_Synthesize_GeminiProviderMapping(t *testing.T) {
@@ -460,9 +526,10 @@ func TestSynthesizeGeminiVirtualAuths_MultiProject(t *testing.T) {
 		Prefix:   "test-prefix",
 		ProxyURL: "http://proxy.local",
 		Attributes: map[string]string{
-			"source":       "test-source",
-			"path":         "/path/to/auth",
-			"header:X-Tra": "value",
+			"source":                        "test-source",
+			"path":                          "/path/to/auth",
+			"header:X-Tra":                  "value",
+			coreauth.SourceHashAttributeKey: "test-source-hash",
 		},
 	}
 	metadata := map[string]any{
@@ -525,6 +592,9 @@ func TestSynthesizeGeminiVirtualAuths_MultiProject(t *testing.T) {
 		}
 		if v.Attributes["gemini_virtual_project"] != projectIDs[i] {
 			t.Errorf("expected gemini_virtual_project=%s, got %s", projectIDs[i], v.Attributes["gemini_virtual_project"])
+		}
+		if got := v.Attributes[coreauth.SourceHashAttributeKey]; got != "test-source-hash" {
+			t.Errorf("expected virtual %d source hash %q, got %q", i, "test-source-hash", got)
 		}
 		if !strings.Contains(v.Label, "["+projectIDs[i]+"]") {
 			t.Errorf("expected label to contain [%s], got %s", projectIDs[i], v.Label)
@@ -953,5 +1023,58 @@ func TestFileSynthesizer_Synthesize_MultiProjectGeminiWithNote(t *testing.T) {
 		if gotPriority := v.Attributes["priority"]; gotPriority != "5" {
 			t.Errorf("expected virtual %d priority %q, got %q", i, "5", gotPriority)
 		}
+	}
+}
+
+func TestFileSynthesizer_Synthesize_MultiProjectGeminiHasSinglePersistedPrimary(t *testing.T) {
+	tempDir := t.TempDir()
+	authPath := filepath.Join(tempDir, "gemini-multi.json")
+	authData := map[string]any{
+		"type":       "gemini",
+		"email":      "multi@example.com",
+		"project_id": "project-a, project-b, project-c",
+	}
+	data, err := json.Marshal(authData)
+	if err != nil {
+		t.Fatalf("marshal auth data: %v", err)
+	}
+	if err := os.WriteFile(authPath, data, 0o644); err != nil {
+		t.Fatalf("failed to write auth file: %v", err)
+	}
+
+	synth := NewFileSynthesizer()
+	ctx := &SynthesisContext{
+		Config:      &config.Config{},
+		AuthDir:     tempDir,
+		Now:         time.Now(),
+		IDGenerator: NewStableIDGenerator(),
+	}
+
+	auths, err := synth.Synthesize(ctx)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(auths) != 4 {
+		t.Fatalf("expected 4 auths (1 primary + 3 virtuals), got %d", len(auths))
+	}
+
+	persistedCount := 0
+	for _, auth := range auths {
+		if auth == nil {
+			t.Fatal("expected synthesized auth to be non-nil")
+		}
+		if got := auth.Attributes["path"]; got != authPath {
+			t.Fatalf("auth %q path = %q, want %q", auth.ID, got, authPath)
+		}
+		if strings.EqualFold(strings.TrimSpace(auth.Attributes["runtime_only"]), "true") {
+			continue
+		}
+		persistedCount++
+		if auth.ID != "gemini-multi.json" {
+			t.Fatalf("persisted primary ID = %q, want %q", auth.ID, "gemini-multi.json")
+		}
+	}
+	if persistedCount != 1 {
+		t.Fatalf("persisted primary count = %d, want 1", persistedCount)
 	}
 }

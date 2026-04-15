@@ -53,13 +53,13 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 	}
 	passthroughSessionID := uuid.NewString()
 	downstreamSessionKey := websocketDownstreamSessionKey(c.Request)
-	retainResponsesWebsocketToolCaches(downstreamSessionKey)
+	toolPairState := acquireResponsesWebsocketToolPairState(downstreamSessionKey)
 	clientIP := websocketClientAddress(c)
 	log.Infof("responses websocket: client connected id=%s remote=%s", passthroughSessionID, clientIP)
 	var wsTerminateErr error
 	var wsTimelineLog strings.Builder
 	defer func() {
-		releaseResponsesWebsocketToolCaches(downstreamSessionKey)
+		releaseResponsesWebsocketToolPairState(downstreamSessionKey)
 		if wsTerminateErr != nil {
 			appendWebsocketTimelineDisconnect(&wsTimelineLog, wsTerminateErr, time.Now())
 			// log.Infof("responses websocket: session closing id=%s reason=%v", passthroughSessionID, wsTerminateErr)
@@ -163,7 +163,7 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 			continue
 		}
 
-		requestJSON = repairResponsesWebsocketToolCalls(downstreamSessionKey, requestJSON)
+		requestJSON = repairResponsesWebsocketToolCalls(toolPairState, requestJSON)
 		updatedLastRequest = bytes.Clone(requestJSON)
 		lastRequest = updatedLastRequest
 
@@ -190,7 +190,7 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 		}
 		dataChan, _, errChan := h.ExecuteStreamWithAuthManager(cliCtx, h.HandlerType(), modelName, requestJSON, "")
 
-		completedOutput, errForward := h.forwardResponsesWebsocket(c, conn, cliCancel, dataChan, errChan, &wsTimelineLog, passthroughSessionID)
+		completedOutput, errForward := h.forwardResponsesWebsocket(c, conn, cliCancel, dataChan, errChan, &wsTimelineLog, passthroughSessionID, toolPairState)
 		if errForward != nil {
 			wsTerminateErr = errForward
 			log.Warnf("responses websocket: forward failed id=%s error=%v", passthroughSessionID, errForward)
@@ -711,13 +711,10 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesWebsocket(
 	errs <-chan *interfaces.ErrorMessage,
 	wsTimelineLog *strings.Builder,
 	sessionID string,
+	toolPairState *websocketToolPairState,
 ) ([]byte, error) {
 	completed := false
 	completedOutput := []byte("[]")
-	downstreamSessionKey := ""
-	if c != nil && c.Request != nil {
-		downstreamSessionKey = websocketDownstreamSessionKey(c.Request)
-	}
 
 	for {
 		select {
@@ -793,7 +790,7 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesWebsocket(
 
 			payloads := websocketJSONPayloadsFromChunk(chunk)
 			for i := range payloads {
-				recordResponsesWebsocketToolCallsFromPayload(downstreamSessionKey, payloads[i])
+				recordResponsesWebsocketToolCallsFromPayload(toolPairState, payloads[i])
 				eventType := gjson.GetBytes(payloads[i], "type").String()
 				if eventType == wsEventTypeCompleted {
 					completed = true

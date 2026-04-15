@@ -48,6 +48,11 @@ type ExecutionSessionCloser interface {
 	CloseExecutionSession(sessionID string)
 }
 
+// AuthExecutionSessionCloser allows executors to release runtime resources for one auth.
+type AuthExecutionSessionCloser interface {
+	CloseAuthExecutionSessions(authID string, reason string)
+}
+
 const (
 	// CloseAllExecutionSessionsID asks an executor to release all active execution sessions.
 	// Executors that do not support this marker may ignore it.
@@ -127,12 +132,16 @@ func (NoopHook) OnAuthUpdated(context.Context, *Auth) {}
 // OnResult implements Hook.
 func (NoopHook) OnResult(context.Context, Result) {}
 
+type hookState struct {
+	hook Hook
+}
+
 // Manager orchestrates auth lifecycle, selection, execution, and persistence.
 type Manager struct {
 	store     Store
 	executors map[string]ProviderExecutor
 	selector  Selector
-	hook      Hook
+	hookValue atomic.Value
 	mu        sync.RWMutex
 	auths     map[string]*Auth
 	scheduler *authScheduler
@@ -164,6 +173,18 @@ type Manager struct {
 	// Auto refresh state
 	refreshCancel context.CancelFunc
 	refreshLoop   *authAutoRefreshLoop
+
+	// persistLocks serializes store operations per auth ID.
+	persistLocks sync.Map
+}
+
+type requestRetryBudgetContextKey struct{}
+
+type requestRetryBudget struct {
+	remaining            atomic.Int32
+	bootstrapRetries     int
+	unlimitedCredentials bool
+	providerScoped       bool
 }
 
 // NewManager constructs a manager with optional custom selector and hook.
@@ -178,11 +199,11 @@ func NewManager(store Store, selector Selector, hook Hook) *Manager {
 		store:            store,
 		executors:        make(map[string]ProviderExecutor),
 		selector:         selector,
-		hook:             hook,
 		auths:            make(map[string]*Auth),
 		providerOffsets:  make(map[string]int),
 		modelPoolOffsets: make(map[string]int),
 	}
+	manager.hookValue.Store(hookState{hook: hook})
 	// atomic.Value requires non-nil initial value.
 	manager.runtimeConfig.Store(&internalconfig.Config{})
 	manager.apiKeyModelAlias.Store(apiKeyModelAliasTable(nil))
@@ -192,7 +213,7 @@ func NewManager(store Store, selector Selector, hook Hook) *Manager {
 
 func isBuiltInSelector(selector Selector) bool {
 	switch selector.(type) {
-	case *RoundRobinSelector, *FillFirstSelector:
+	case *RoundRobinSelector, *FillFirstSelector, *RandomSelector:
 		return true
 	default:
 		return false
@@ -268,7 +289,10 @@ func (m *Manager) ReconcileRegistryModelStates(ctx context.Context, authID strin
 		supported[modelKey] = struct{}{}
 	}
 
-	var snapshot *Auth
+	var (
+		snapshot    *Auth
+		persistAuth *Auth
+	)
 	now := time.Now()
 
 	m.mu.Lock()
@@ -308,13 +332,18 @@ func (m *Manager) ReconcileRegistryModelStates(ctx context.Context, authID strin
 				auth.Status = StatusActive
 			}
 			auth.UpdatedAt = now
-			if errPersist := m.persist(ctx, auth); errPersist != nil {
-				logEntryWithRequestID(ctx).WithField("auth_id", auth.ID).Warnf("failed to persist auth changes during model state reconciliation: %v", errPersist)
-			}
-			snapshot = auth.Clone()
+			persistAuth = auth
 		}
 	}
 	m.mu.Unlock()
+
+	if persistAuth != nil {
+		var errPersist error
+		snapshot, errPersist = m.snapshotCurrentAuthForPersistence(ctx, persistAuth)
+		if errPersist != nil {
+			logEntryWithRequestID(ctx).WithField("auth_id", persistAuth.ID).Warnf("failed to persist auth changes during model state reconciliation: %v", errPersist)
+		}
+	}
 
 	if m.scheduler != nil && snapshot != nil {
 		m.scheduler.upsertAuth(snapshot)
@@ -335,6 +364,76 @@ func (m *Manager) SetSelector(selector Selector) {
 		m.scheduler.setSelector(selector)
 		m.syncScheduler()
 	}
+}
+
+// Hook returns the currently configured lifecycle hook.
+func (m *Manager) Hook() Hook {
+	if m == nil {
+		return NoopHook{}
+	}
+	state, _ := m.hookValue.Load().(hookState)
+	if state.hook == nil {
+		return NoopHook{}
+	}
+	return state.hook
+}
+
+// SetHook replaces the lifecycle hook used for auth callbacks.
+func (m *Manager) SetHook(hook Hook) {
+	if m == nil {
+		return
+	}
+	if hook == nil {
+		hook = NoopHook{}
+	}
+	m.hookValue.Store(hookState{hook: hook})
+}
+
+type chainedHook struct {
+	hooks []Hook
+}
+
+func (h chainedHook) OnAuthRegistered(ctx context.Context, auth *Auth) {
+	for _, hook := range h.hooks {
+		if hook != nil {
+			hook.OnAuthRegistered(ctx, auth)
+		}
+	}
+}
+
+func (h chainedHook) OnAuthUpdated(ctx context.Context, auth *Auth) {
+	for _, hook := range h.hooks {
+		if hook != nil {
+			hook.OnAuthUpdated(ctx, auth)
+		}
+	}
+}
+
+func (h chainedHook) OnResult(ctx context.Context, result Result) {
+	for _, hook := range h.hooks {
+		if hook != nil {
+			hook.OnResult(ctx, result)
+		}
+	}
+}
+
+// AddHook appends another lifecycle hook without replacing the existing one.
+func (m *Manager) AddHook(hook Hook) {
+	if m == nil || hook == nil {
+		return
+	}
+	current := m.Hook()
+	if _, ok := current.(NoopHook); ok {
+		m.SetHook(hook)
+		return
+	}
+	if chained, ok := current.(chainedHook); ok {
+		hooks := append([]Hook(nil), chained.hooks...)
+		hooks = append(hooks, hook)
+		m.SetHook(chainedHook{hooks: hooks})
+		return
+	}
+	m.SetHook(chainedHook{hooks: []Hook{current, hook}})
 }
 
 // SetStore swaps the underlying persistence store.
@@ -590,7 +689,7 @@ func (m *Manager) prepareExecutionModels(auth *Auth, routeModel string) []string
 	return models
 }
 
-func (m *Manager) availableAuthsForRouteModel(auths []*Auth, provider, routeModel string, now time.Time) ([]*Auth, error) {
+func (m *Manager) availableAuthsForRouteModel(auths []*Auth, provider, routeModel string, opts cliproxyexecutor.Options, now time.Time) ([]*Auth, error) {
 	if len(auths) == 0 {
 		return nil, &Error{Code: "auth_not_found", Message: "no auth candidates"}
 	}
@@ -629,16 +728,14 @@ func (m *Manager) availableAuthsForRouteModel(auths []*Auth, provider, routeMode
 		return nil, &Error{Code: "auth_unavailable", Message: "no auth available"}
 	}
 
-	bestPriority := 0
-	found := false
-	for priority := range availableByPriority {
-		if !found || priority > bestPriority {
-			bestPriority = priority
-			found = true
-		}
+	selectionAttempt := 0
+	if selectorStrategy(m.selector) == schedulerStrategyRandom {
+		selectionAttempt = selectionAttemptFromMetadata(opts.Metadata)
 	}
-
-	available := availableByPriority[bestPriority]
+	available, ok := availableAuthsForAttempt(availableByPriority, selectionAttempt)
+	if !ok {
+		return nil, &Error{Code: "auth_unavailable", Message: "no auth available"}
+	}
 	if len(available) > 1 {
 		sort.Slice(available, func(i, j int) bool { return available[i].ID < available[j].ID })
 	}
@@ -650,6 +747,23 @@ func selectionArgForSelector(selector Selector, routeModel string) string {
 		return ""
 	}
 	return routeModel
+}
+
+func setSelectionAttemptMetadata(opts cliproxyexecutor.Options, selectionAttempt int) cliproxyexecutor.Options {
+	if selectionAttempt < 0 {
+		selectionAttempt = 0
+	}
+	if len(opts.Metadata) == 0 {
+		opts.Metadata = map[string]any{cliproxyexecutor.SelectionAttemptMetadataKey: selectionAttempt}
+		return opts
+	}
+	meta := make(map[string]any, len(opts.Metadata)+1)
+	for key, value := range opts.Metadata {
+		meta[key] = value
+	}
+	meta[cliproxyexecutor.SelectionAttemptMetadataKey] = selectionAttempt
+	opts.Metadata = meta
+	return opts
 }
 
 func (m *Manager) authSupportsRouteModel(registryRef *registry.ModelRegistry, auth *Auth, routeModel string) bool {
@@ -817,6 +931,9 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 	}
 	var lastErr error
 	for idx, execModel := range execModels {
+		if idx > 0 && !ConsumeRequestRetryBudget(ctx) {
+			break
+		}
 		resultModel := m.stateModelForExecution(auth, routeModel, execModel, pooled)
 		execReq := req
 		execReq.Model = execModel
@@ -1088,7 +1205,21 @@ func (m *Manager) Register(ctx context.Context, auth *Auth) (*Auth, error) {
 	if auth.ID == "" {
 		auth.ID = uuid.NewString()
 	}
+	unlockPersist := m.lockPersistKey(auth.ID)
+	skipStateCarryForward := shouldSkipStateCarryForward(ctx)
+	m.mu.RLock()
+	if existing, ok := m.auths[auth.ID]; ok && existing != nil {
+		if !skipStateCarryForward {
+			carryForwardAuthRuntimeState(existing, auth)
+			carryForwardAuthModelStates(existing, auth)
+		}
+	}
+	m.mu.RUnlock()
 	auth.EnsureIndex()
+	if err := m.persistWithoutLock(ctx, auth); err != nil {
+		unlockPersist()
+		return nil, err
+	}
 	authClone := auth.Clone()
 	m.mu.Lock()
 	m.auths[auth.ID] = authClone
@@ -1098,8 +1229,8 @@ func (m *Manager) Register(ctx context.Context, auth *Auth) (*Auth, error) {
 		m.scheduler.upsertAuth(authClone)
 	}
 	m.queueRefreshReschedule(auth.ID)
-	_ = m.persist(ctx, auth)
-	m.hook.OnAuthRegistered(ctx, auth.Clone())
+	unlockPersist()
+	m.Hook().OnAuthRegistered(ctx, auth.Clone())
 	return auth.Clone(), nil
 }
 
@@ -1108,20 +1239,27 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 	if auth == nil || auth.ID == "" {
 		return nil, nil
 	}
-	m.mu.Lock()
+	unlockPersist := m.lockPersistKey(auth.ID)
+	skipStateCarryForward := shouldSkipStateCarryForward(ctx)
+	m.mu.RLock()
 	if existing, ok := m.auths[auth.ID]; ok && existing != nil {
 		if !auth.indexAssigned && auth.Index == "" {
 			auth.Index = existing.Index
 			auth.indexAssigned = existing.indexAssigned
 		}
-		if !existing.Disabled && existing.Status != StatusDisabled && !auth.Disabled && auth.Status != StatusDisabled {
-			if len(auth.ModelStates) == 0 && len(existing.ModelStates) > 0 {
-				auth.ModelStates = existing.ModelStates
-			}
+		if !skipStateCarryForward {
+			carryForwardAuthRuntimeState(existing, auth)
+			carryForwardAuthModelStates(existing, auth)
 		}
 	}
+	m.mu.RUnlock()
 	auth.EnsureIndex()
+	if err := m.persistWithoutLock(ctx, auth); err != nil {
+		unlockPersist()
+		return nil, err
+	}
 	authClone := auth.Clone()
+	m.mu.Lock()
 	m.auths[auth.ID] = authClone
 	m.mu.Unlock()
 	m.rebuildAPIKeyModelAliasFromRuntimeConfig()
@@ -1129,9 +1267,151 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 		m.scheduler.upsertAuth(authClone)
 	}
 	m.queueRefreshReschedule(auth.ID)
-	_ = m.persist(ctx, auth)
-	m.hook.OnAuthUpdated(ctx, auth.Clone())
+	unlockPersist()
+	m.Hook().OnAuthUpdated(ctx, auth.Clone())
 	return auth.Clone(), nil
+}
+
+func carryForwardAuthModelStates(existing *Auth, next *Auth) {
+	if !authStateCarryForwardAllowed(existing, next) {
+		return
+	}
+	if len(next.ModelStates) == 0 && len(existing.ModelStates) > 0 {
+		next.ModelStates = cloneAuthModelStates(existing.ModelStates)
+	}
+}
+
+func carryForwardAuthRuntimeState(existing *Auth, next *Auth) {
+	if !authStateCarryForwardAllowed(existing, next) {
+		return
+	}
+	if existing.Unavailable && !next.Unavailable {
+		next.Unavailable = true
+	}
+	if (next.Status == "" || next.Status == StatusActive) && existing.Status != "" && existing.Status != StatusActive {
+		next.Status = existing.Status
+	}
+	if next.LastError == nil && existing.LastError != nil {
+		next.LastError = cloneError(existing.LastError)
+	}
+	if next.StatusMessage == "" && existing.StatusMessage != "" {
+		next.StatusMessage = existing.StatusMessage
+	}
+	if next.NextRetryAfter.IsZero() && !existing.NextRetryAfter.IsZero() {
+		next.NextRetryAfter = existing.NextRetryAfter
+	}
+	if quotaStateEmpty(next.Quota) && !quotaStateEmpty(existing.Quota) {
+		next.Quota = existing.Quota
+	}
+}
+
+func authStateCarryForwardAllowed(existing *Auth, next *Auth) bool {
+	if existing == nil || next == nil {
+		return false
+	}
+	if existing.Disabled || existing.Status == StatusDisabled || next.Disabled || next.Status == StatusDisabled {
+		return false
+	}
+	existingHash := authSourceHash(existing)
+	nextHash := authSourceHash(next)
+	if existingHash == "" || nextHash == "" {
+		return false
+	}
+	if existingHash != nextHash {
+		return false
+	}
+	return true
+}
+
+func authSourceHash(auth *Auth) string {
+	if auth == nil || auth.Attributes == nil {
+		return ""
+	}
+	return strings.TrimSpace(auth.Attributes[SourceHashAttributeKey])
+}
+
+func cloneAuthModelStates(states map[string]*ModelState) map[string]*ModelState {
+	if len(states) == 0 {
+		return nil
+	}
+	cloned := make(map[string]*ModelState, len(states))
+	for key, state := range states {
+		cloned[key] = state.Clone()
+	}
+	return cloned
+}
+
+func quotaStateEmpty(state QuotaState) bool {
+	return !state.Exceeded &&
+		state.Reason == "" &&
+		state.NextRecoverAt.IsZero() &&
+		state.BackoffLevel == 0 &&
+		state.StrikeCount == 0
+}
+
+// Delete removes an auth entry from runtime state and optionally from the backing store.
+func (m *Manager) Delete(ctx context.Context, id string) error {
+	if m == nil {
+		return nil
+	}
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	unlockPersist := m.lockPersistKey(id)
+	defer unlockPersist()
+
+	var deleted *Auth
+	var deletedRuntime *Auth
+	m.mu.RLock()
+	if existing, ok := m.auths[id]; ok && existing != nil {
+		deletedRuntime = existing
+		deleted = existing.Clone()
+	}
+	m.mu.RUnlock()
+	if deleted == nil {
+		return nil
+	}
+
+	shouldPersistDelete := m.store != nil && !shouldSkipPersist(ctx)
+	if shouldPersistDelete && deleted.Attributes != nil {
+		if v := strings.ToLower(strings.TrimSpace(deleted.Attributes["runtime_only"])); v == "true" {
+			shouldPersistDelete = false
+		}
+	}
+	if shouldPersistDelete {
+		if err := m.store.Delete(ctx, id); err != nil {
+			return err
+		}
+	}
+
+	removed := false
+	m.mu.Lock()
+	if current, ok := m.auths[id]; ok && current == deletedRuntime {
+		delete(m.auths, id)
+		removed = true
+	}
+	m.mu.Unlock()
+	if !removed {
+		return nil
+	}
+
+	if providerExecutor := m.executorFor(executorKeyFromAuth(deleted)); providerExecutor != nil {
+		if closer, ok := providerExecutor.(AuthExecutionSessionCloser); ok && closer != nil {
+			closer.CloseAuthExecutionSessions(id, "auth_removed")
+		}
+	}
+	registry.GetGlobalRegistry().UnregisterClient(id)
+	m.rebuildAPIKeyModelAliasFromRuntimeConfig()
+	if m.scheduler != nil {
+		m.scheduler.removeAuth(id)
+	}
+	m.queueRefreshReschedule(id)
+	return nil
 }
 
 // Load resets manager state from the backing store.
@@ -1171,11 +1451,15 @@ func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxye
 	if len(normalized) == 0 {
 		return cliproxyexecutor.Response{}, &Error{Code: "provider_not_found", Message: "no provider supplied"}
 	}
+	ctx = m.withRequestRetryBudget(ctx, normalized, 0)
 
 	_, maxRetryCredentials, maxWait := m.retrySettings()
 
 	var lastErr error
 	for attempt := 0; ; attempt++ {
+		if attempt > 0 && !ConsumeRequestRetryBudget(ctx) {
+			break
+		}
 		resp, errExec := m.executeMixedOnce(ctx, normalized, req, opts, maxRetryCredentials)
 		if errExec == nil {
 			return resp, nil
@@ -1202,11 +1486,15 @@ func (m *Manager) ExecuteCount(ctx context.Context, providers []string, req clip
 	if len(normalized) == 0 {
 		return cliproxyexecutor.Response{}, &Error{Code: "provider_not_found", Message: "no provider supplied"}
 	}
+	ctx = m.withRequestRetryBudget(ctx, normalized, 0)
 
 	_, maxRetryCredentials, maxWait := m.retrySettings()
 
 	var lastErr error
 	for attempt := 0; ; attempt++ {
+		if attempt > 0 && !ConsumeRequestRetryBudget(ctx) {
+			break
+		}
 		resp, errExec := m.executeCountMixedOnce(ctx, normalized, req, opts, maxRetryCredentials)
 		if errExec == nil {
 			return resp, nil
@@ -1233,11 +1521,15 @@ func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cli
 	if len(normalized) == 0 {
 		return nil, &Error{Code: "provider_not_found", Message: "no provider supplied"}
 	}
+	ctx = m.withRequestRetryBudget(ctx, normalized, 0)
 
 	_, maxRetryCredentials, maxWait := m.retrySettings()
 
 	var lastErr error
 	for attempt := 0; ; attempt++ {
+		if attempt > 0 && !ConsumeRequestRetryBudget(ctx) {
+			break
+		}
 		result, errStream := m.executeStreamMixedOnce(ctx, normalized, req, opts, maxRetryCredentials)
 		if errStream == nil {
 			return result, nil
@@ -1265,6 +1557,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 	opts = ensureRequestedModelMetadata(opts, routeModel)
 	tried := make(map[string]struct{})
 	attempted := make(map[string]struct{})
+	selectionAttempt := 0
 	var lastErr error
 	for {
 		if maxRetryCredentials > 0 && len(attempted) >= maxRetryCredentials {
@@ -1273,6 +1566,13 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			}
 			return cliproxyexecutor.Response{}, &Error{Code: "auth_not_found", Message: "no auth available"}
 		}
+		if len(attempted) > 0 && !consumeCredentialRetryBudget(ctx) {
+			if lastErr != nil {
+				return cliproxyexecutor.Response{}, lastErr
+			}
+			return cliproxyexecutor.Response{}, &Error{Code: "auth_not_found", Message: "no auth available"}
+		}
+		opts = setSelectionAttemptMetadata(opts, selectionAttempt)
 		auth, executor, provider, errPick := m.pickNextMixed(ctx, providers, routeModel, opts, tried)
 		if errPick != nil {
 			if lastErr != nil {
@@ -1297,8 +1597,12 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			continue
 		}
 		attempted[auth.ID] = struct{}{}
+		selectionAttempt++
 		var authErr error
-		for _, upstreamModel := range models {
+		for idx, upstreamModel := range models {
+			if idx > 0 && !ConsumeRequestRetryBudget(ctx) {
+				break
+			}
 			resultModel := m.stateModelForExecution(auth, routeModel, upstreamModel, pooled)
 			execReq := req
 			execReq.Model = upstreamModel
@@ -1343,6 +1647,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 	opts = ensureRequestedModelMetadata(opts, routeModel)
 	tried := make(map[string]struct{})
 	attempted := make(map[string]struct{})
+	selectionAttempt := 0
 	var lastErr error
 	for {
 		if maxRetryCredentials > 0 && len(attempted) >= maxRetryCredentials {
@@ -1351,6 +1656,13 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 			}
 			return cliproxyexecutor.Response{}, &Error{Code: "auth_not_found", Message: "no auth available"}
 		}
+		if len(attempted) > 0 && !consumeCredentialRetryBudget(ctx) {
+			if lastErr != nil {
+				return cliproxyexecutor.Response{}, lastErr
+			}
+			return cliproxyexecutor.Response{}, &Error{Code: "auth_not_found", Message: "no auth available"}
+		}
+		opts = setSelectionAttemptMetadata(opts, selectionAttempt)
 		auth, executor, provider, errPick := m.pickNextMixed(ctx, providers, routeModel, opts, tried)
 		if errPick != nil {
 			if lastErr != nil {
@@ -1375,8 +1687,12 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 			continue
 		}
 		attempted[auth.ID] = struct{}{}
+		selectionAttempt++
 		var authErr error
-		for _, upstreamModel := range models {
+		for idx, upstreamModel := range models {
+			if idx > 0 && !ConsumeRequestRetryBudget(ctx) {
+				break
+			}
 			resultModel := m.stateModelForExecution(auth, routeModel, upstreamModel, pooled)
 			execReq := req
 			execReq.Model = upstreamModel
@@ -1421,6 +1737,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 	opts = ensureRequestedModelMetadata(opts, routeModel)
 	tried := make(map[string]struct{})
 	attempted := make(map[string]struct{})
+	selectionAttempt := 0
 	var lastErr error
 	for {
 		if maxRetryCredentials > 0 && len(attempted) >= maxRetryCredentials {
@@ -1433,6 +1750,17 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			}
 			return nil, &Error{Code: "auth_not_found", Message: "no auth available"}
 		}
+		if len(attempted) > 0 && !consumeCredentialRetryBudget(ctx) {
+			if lastErr != nil {
+				var bootstrapErr *streamBootstrapError
+				if errors.As(lastErr, &bootstrapErr) && bootstrapErr != nil {
+					return streamErrorResult(bootstrapErr.Headers(), bootstrapErr.cause), nil
+				}
+				return nil, lastErr
+			}
+			return nil, &Error{Code: "auth_not_found", Message: "no auth available"}
+		}
+		opts = setSelectionAttemptMetadata(opts, selectionAttempt)
 		auth, executor, provider, errPick := m.pickNextMixed(ctx, providers, routeModel, opts, tried)
 		if errPick != nil {
 			if lastErr != nil {
@@ -1460,6 +1788,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			continue
 		}
 		attempted[auth.ID] = struct{}{}
+		selectionAttempt++
 		streamResult, errStream := m.executeStreamWithModelPool(execCtx, executor, auth, provider, req, opts, routeModel, models, pooled)
 		if errStream != nil {
 			if errCtx := execCtx.Err(); errCtx != nil {
@@ -1800,6 +2129,165 @@ func (m *Manager) retrySettings() (int, int, time.Duration) {
 	return int(m.requestRetry.Load()), int(m.maxRetryCredentials.Load()), time.Duration(m.maxRetryInterval.Load())
 }
 
+// WithRequestRetryBudget returns a context carrying a shared retry budget for one request.
+func (m *Manager) WithRequestRetryBudget(ctx context.Context, bootstrapRetries int) context.Context {
+	return m.withRequestRetryBudget(ctx, nil, bootstrapRetries)
+}
+
+// WithRequestRetryBudgetForProviders returns a context carrying a shared retry
+// budget scoped to the supplied providers.
+func (m *Manager) WithRequestRetryBudgetForProviders(ctx context.Context, providers []string, bootstrapRetries int) context.Context {
+	return m.withRequestRetryBudget(ctx, providers, bootstrapRetries)
+}
+
+// ConsumeRequestRetryBudget spends one retry from the shared request budget.
+func ConsumeRequestRetryBudget(ctx context.Context) bool {
+	budget := requestRetryBudgetFromContext(ctx)
+	if budget == nil {
+		return true
+	}
+	return budget.consume()
+}
+
+func consumeCredentialRetryBudget(ctx context.Context) bool {
+	budget := requestRetryBudgetFromContext(ctx)
+	if budget == nil {
+		return true
+	}
+	return budget.consumeCredential()
+}
+
+func (m *Manager) withRequestRetryBudget(ctx context.Context, providers []string, bootstrapRetries int) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if existing := requestRetryBudgetFromContext(ctx); existing != nil {
+		if len(providers) == 0 || existing.providerScoped {
+			return ctx
+		}
+		if existing.bootstrapRetries > bootstrapRetries {
+			bootstrapRetries = existing.bootstrapRetries
+		}
+	}
+	total, unlimitedCredentials := m.initialRequestRetryBudget(providers, bootstrapRetries)
+	return context.WithValue(ctx, requestRetryBudgetContextKey{}, newRequestRetryBudget(total, unlimitedCredentials, len(providers) > 0, bootstrapRetries))
+}
+
+func (m *Manager) initialRequestRetryBudget(providers []string, bootstrapRetries int) (int, bool) {
+	requestRetry := m.maxRequestRetryForProviders(providers)
+	_, maxRetryCredentials, _ := m.retrySettings()
+	if bootstrapRetries < 0 {
+		bootstrapRetries = 0
+	}
+	unlimitedCredentials := maxRetryCredentials <= 0
+	total := requestRetry + bootstrapRetries
+	if !unlimitedCredentials {
+		total += maxRetryCredentials
+	}
+	if total < 1 {
+		total = 1
+	}
+	return total, unlimitedCredentials
+}
+
+func (m *Manager) maxRequestRetryForProviders(providers []string) int {
+	defaultRetry, _, _ := m.retrySettings()
+	if defaultRetry < 0 {
+		defaultRetry = 0
+	}
+	if m == nil || len(providers) == 0 {
+		return defaultRetry
+	}
+	var providerSet map[string]struct{}
+	providerSet = make(map[string]struct{}, len(providers))
+	for _, provider := range providers {
+		key := strings.TrimSpace(strings.ToLower(provider))
+		if key == "" {
+			continue
+		}
+		providerSet[key] = struct{}{}
+	}
+	if len(providerSet) == 0 {
+		return defaultRetry
+	}
+
+	maxRetry := defaultRetry
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	for _, auth := range m.auths {
+		if auth == nil {
+			continue
+		}
+		if providerSet != nil {
+			providerKey := strings.TrimSpace(strings.ToLower(auth.Provider))
+			if _, ok := providerSet[providerKey]; !ok {
+				continue
+			}
+		}
+		effectiveRetry := defaultRetry
+		if override, ok := auth.RequestRetryOverride(); ok {
+			effectiveRetry = override
+		}
+		if effectiveRetry < 0 {
+			effectiveRetry = 0
+		}
+		if effectiveRetry > maxRetry {
+			maxRetry = effectiveRetry
+		}
+	}
+	return maxRetry
+}
+
+func requestRetryBudgetFromContext(ctx context.Context) *requestRetryBudget {
+	if ctx == nil {
+		return nil
+	}
+	raw := ctx.Value(requestRetryBudgetContextKey{})
+	budget, _ := raw.(*requestRetryBudget)
+	return budget
+}
+
+func newRequestRetryBudget(total int, unlimitedCredentials bool, providerScoped bool, bootstrapRetries int) *requestRetryBudget {
+	if total < 0 {
+		total = 0
+	}
+	if bootstrapRetries < 0 {
+		bootstrapRetries = 0
+	}
+	budget := &requestRetryBudget{
+		bootstrapRetries:     bootstrapRetries,
+		unlimitedCredentials: unlimitedCredentials,
+		providerScoped:       providerScoped,
+	}
+	budget.remaining.Store(int32(total))
+	return budget
+}
+
+func (b *requestRetryBudget) consume() bool {
+	if b == nil {
+		return true
+	}
+	for {
+		remaining := b.remaining.Load()
+		if remaining <= 0 {
+			return false
+		}
+		if b.remaining.CompareAndSwap(remaining, remaining-1) {
+			return true
+		}
+	}
+}
+
+func (b *requestRetryBudget) consumeCredential() bool {
+	if b == nil {
+		return true
+	}
+	if b.unlimitedCredentials {
+		return true
+	}
+	return b.consume()
+}
+
 func (m *Manager) closestCooldownWait(providers []string, model string, attempt int) (time.Duration, bool) {
 	if m == nil || len(providers) == 0 {
 		return 0, false
@@ -1964,7 +2452,10 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	suspendReason := ""
 	clearModelQuota := false
 	setModelQuota := false
-	var authSnapshot *Auth
+	var (
+		authSnapshot *Auth
+		persistAuth  *Auth
+	)
 
 	m.mu.Lock()
 	if auth, ok := m.auths[result.AuthID]; ok && auth != nil {
@@ -2039,6 +2530,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 						case 429:
 							var next time.Time
 							backoffLevel := state.Quota.BackoffLevel
+							strikeCount := state.Quota.StrikeCount + 1
 							if !disableCooling {
 								if result.RetryAfter != nil {
 									next = now.Add(*result.RetryAfter)
@@ -2056,6 +2548,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 								Reason:        "quota",
 								NextRecoverAt: next,
 								BackoffLevel:  backoffLevel,
+								StrikeCount:   strikeCount,
 							}
 							if !disableCooling {
 								suspendReason = "quota"
@@ -2083,12 +2576,14 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 			}
 		}
 
-		_ = m.persist(ctx, auth)
-		authSnapshot = auth.Clone()
+		persistAuth = auth
 	}
 	m.mu.Unlock()
+	if persistAuth != nil {
+		authSnapshot, _ = m.snapshotCurrentAuthForPersistence(ctx, persistAuth)
+	}
 	if m.scheduler != nil && authSnapshot != nil {
-		m.scheduler.upsertAuth(authSnapshot)
+		m.scheduler.upsertAuthState(authSnapshot)
 	}
 
 	if clearModelQuota && result.Model != "" {
@@ -2103,7 +2598,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 		registry.GetGlobalRegistry().SuspendClientModel(result.AuthID, result.Model, suspendReason)
 	}
 
-	m.hook.OnResult(ctx, result)
+	m.Hook().OnResult(ctx, result)
 }
 
 func ensureModelState(auth *Auth, model string) *ModelState {
@@ -2144,7 +2639,7 @@ func modelStateIsClean(state *ModelState) bool {
 	if state.Unavailable || state.StatusMessage != "" || !state.NextRetryAfter.IsZero() || state.LastError != nil {
 		return false
 	}
-	if state.Quota.Exceeded || state.Quota.Reason != "" || !state.Quota.NextRecoverAt.IsZero() || state.Quota.BackoffLevel != 0 {
+	if state.Quota.Exceeded || state.Quota.Reason != "" || !state.Quota.NextRecoverAt.IsZero() || state.Quota.BackoffLevel != 0 || state.Quota.StrikeCount != 0 {
 		return false
 	}
 	return true
@@ -2163,6 +2658,7 @@ func updateAggregatedAvailability(auth *Auth, now time.Time) {
 	quotaExceeded := false
 	quotaRecover := time.Time{}
 	maxBackoffLevel := 0
+	maxStrikeCount := 0
 	hasState := false
 	for _, state := range auth.ModelStates {
 		if state == nil {
@@ -2196,6 +2692,9 @@ func updateAggregatedAvailability(auth *Auth, now time.Time) {
 			if state.Quota.BackoffLevel > maxBackoffLevel {
 				maxBackoffLevel = state.Quota.BackoffLevel
 			}
+			if state.Quota.StrikeCount > maxStrikeCount {
+				maxStrikeCount = state.Quota.StrikeCount
+			}
 		}
 	}
 	if !hasState {
@@ -2213,11 +2712,13 @@ func updateAggregatedAvailability(auth *Auth, now time.Time) {
 		auth.Quota.Reason = "quota"
 		auth.Quota.NextRecoverAt = quotaRecover
 		auth.Quota.BackoffLevel = maxBackoffLevel
+		auth.Quota.StrikeCount = maxStrikeCount
 	} else {
 		auth.Quota.Exceeded = false
 		auth.Quota.Reason = ""
 		auth.Quota.NextRecoverAt = time.Time{}
 		auth.Quota.BackoffLevel = 0
+		auth.Quota.StrikeCount = 0
 	}
 }
 
@@ -2261,6 +2762,7 @@ func clearAuthStateOnSuccess(auth *Auth, now time.Time) {
 	auth.Quota.Reason = ""
 	auth.Quota.NextRecoverAt = time.Time{}
 	auth.Quota.BackoffLevel = 0
+	auth.Quota.StrikeCount = 0
 	auth.LastError = nil
 	auth.NextRetryAfter = time.Time{}
 	auth.UpdatedAt = now
@@ -2451,6 +2953,7 @@ func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Durati
 		auth.StatusMessage = "quota exhausted"
 		auth.Quota.Exceeded = true
 		auth.Quota.Reason = "quota"
+		auth.Quota.StrikeCount++
 		var next time.Time
 		if !disableCooling {
 			if retryAfter != nil {
@@ -2467,12 +2970,18 @@ func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Durati
 		auth.NextRetryAfter = next
 	case 408, 500, 502, 503, 504:
 		auth.StatusMessage = "transient upstream error"
+		auth.Quota.Exceeded = false
+		auth.Quota.Reason = ""
+		auth.Quota.NextRecoverAt = time.Time{}
 		if disableCooling {
 			auth.NextRetryAfter = time.Time{}
 		} else {
 			auth.NextRetryAfter = now.Add(1 * time.Minute)
 		}
 	default:
+		auth.Quota.Exceeded = false
+		auth.Quota.Reason = ""
+		auth.Quota.NextRecoverAt = time.Time{}
 		if auth.StatusMessage == "" {
 			auth.StatusMessage = "request failed"
 		}
@@ -2637,7 +3146,7 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 		m.mu.RUnlock()
 		return nil, nil, &Error{Code: "auth_not_found", Message: "no auth available"}
 	}
-	available, errAvailable := m.availableAuthsForRouteModel(candidates, provider, model, time.Now())
+	available, errAvailable := m.availableAuthsForRouteModel(candidates, provider, model, opts, time.Now())
 	if errAvailable != nil {
 		m.mu.RUnlock()
 		return nil, nil, errAvailable
@@ -2766,7 +3275,7 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 		m.mu.RUnlock()
 		return nil, nil, "", &Error{Code: "auth_not_found", Message: "no auth available"}
 	}
-	available, errAvailable := m.availableAuthsForRouteModel(candidates, "mixed", model, time.Now())
+	available, errAvailable := m.availableAuthsForRouteModel(candidates, "mixed", model, opts, time.Now())
 	if errAvailable != nil {
 		m.mu.RUnlock()
 		return nil, nil, "", errAvailable
@@ -2875,23 +3384,109 @@ func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model s
 }
 
 func (m *Manager) persist(ctx context.Context, auth *Auth) error {
-	if m.store == nil || auth == nil {
+	if !m.shouldPersistAuth(ctx, auth) {
 		return nil
 	}
+	unlockPersist := m.lockPersistKey(auth.ID)
+	defer unlockPersist()
+	return m.persistWithoutLock(ctx, auth)
+}
+
+func (m *Manager) shouldPersistAuth(ctx context.Context, auth *Auth) bool {
+	if m == nil || m.store == nil || auth == nil {
+		return false
+	}
 	if shouldSkipPersist(ctx) {
-		return nil
+		return false
 	}
 	if auth.Attributes != nil {
 		if v := strings.ToLower(strings.TrimSpace(auth.Attributes["runtime_only"])); v == "true" {
-			return nil
+			return false
 		}
 	}
-	// Skip persistence when metadata is absent (e.g., runtime-only auths).
 	if auth.Metadata == nil {
+		return false
+	}
+	return true
+}
+
+func (m *Manager) persistWithoutLock(ctx context.Context, auth *Auth) error {
+	if !m.shouldPersistAuth(ctx, auth) {
 		return nil
 	}
 	_, err := m.store.Save(ctx, auth)
-	return err
+	if err != nil {
+		return err
+	}
+	m.syncRuntimeSourceHash(auth)
+	return nil
+}
+
+func (m *Manager) snapshotCurrentAuthForPersistence(ctx context.Context, current *Auth) (*Auth, error) {
+	if m == nil || current == nil {
+		return nil, nil
+	}
+	id := strings.TrimSpace(current.ID)
+	if id == "" {
+		return nil, nil
+	}
+	unlockPersist := m.lockPersistKey(id)
+	defer unlockPersist()
+
+	m.mu.RLock()
+	latest, ok := m.auths[id]
+	if !ok || latest == nil {
+		m.mu.RUnlock()
+		return nil, nil
+	}
+	snapshot := latest.Clone()
+	m.mu.RUnlock()
+
+	if err := m.persistWithoutLock(ctx, snapshot); err != nil {
+		return nil, err
+	}
+	return snapshot, nil
+}
+
+func (m *Manager) lockPersistKey(id string) func() {
+	if m == nil {
+		return func() {}
+	}
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return func() {}
+	}
+	raw, _ := m.persistLocks.LoadOrStore(id, &sync.Mutex{})
+	mutex, ok := raw.(*sync.Mutex)
+	if !ok || mutex == nil {
+		return func() {}
+	}
+	mutex.Lock()
+	return mutex.Unlock
+}
+
+func (m *Manager) syncRuntimeSourceHash(auth *Auth) {
+	if m == nil || auth == nil {
+		return
+	}
+	hash := authSourceHash(auth)
+	if hash == "" {
+		return
+	}
+	id := strings.TrimSpace(auth.ID)
+	if id == "" {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	current, ok := m.auths[id]
+	if !ok || current == nil {
+		return
+	}
+	if current.Attributes == nil {
+		current.Attributes = make(map[string]string)
+	}
+	current.Attributes[SourceHashAttributeKey] = hash
 }
 
 // StartAutoRefresh launches a background loop that evaluates auth freshness
@@ -3207,7 +3802,7 @@ func (m *Manager) refreshAuth(ctx context.Context, id string) {
 			m.auths[id] = current
 			shouldReschedule = true
 			if m.scheduler != nil {
-				m.scheduler.upsertAuth(current.Clone())
+				m.scheduler.upsertAuthState(current.Clone())
 			}
 		}
 		m.mu.Unlock()
@@ -3228,7 +3823,9 @@ func (m *Manager) refreshAuth(ctx context.Context, id string) {
 	updated.NextRefreshAfter = time.Time{}
 	updated.LastError = nil
 	updated.UpdatedAt = now
-	_, _ = m.Update(ctx, updated)
+	if _, errUpdate := m.Update(ctx, updated); errUpdate != nil {
+		logEntryWithRequestID(ctx).WithField("auth_id", updated.ID).Warnf("failed to persist refreshed auth state: %v", errUpdate)
+	}
 }
 
 func (m *Manager) executorFor(provider string) ProviderExecutor {

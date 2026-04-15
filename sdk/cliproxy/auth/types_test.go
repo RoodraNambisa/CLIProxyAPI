@@ -96,3 +96,28 @@ func TestEnsureIndexUsesCredentialIdentity(t *testing.T) {
 		t.Fatalf("duplicate config entries should be separated by source-derived seed, got %q", geminiIndex)
 	}
 }
+
+func TestMetadataWithDisabledClonesAndInjectsDisabled(t *testing.T) {
+	t.Parallel()
+
+	auth := &Auth{
+		Disabled: true,
+		Metadata: map[string]any{
+			"type":  "vertex",
+			"label": "vertex-label",
+		},
+	}
+
+	got := MetadataWithDisabled(auth)
+	if got["disabled"] != true {
+		t.Fatalf("disabled = %#v, want true", got["disabled"])
+	}
+	if got["label"] != "vertex-label" {
+		t.Fatalf("label = %#v, want %q", got["label"], "vertex-label")
+	}
+
+	got["label"] = "mutated"
+	if auth.Metadata["label"] != "vertex-label" {
+		t.Fatalf("original metadata mutated = %#v, want %q", auth.Metadata["label"], "vertex-label")
+	}
+}

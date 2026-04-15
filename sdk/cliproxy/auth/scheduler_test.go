@@ -119,6 +119,44 @@ func TestSchedulerPick_FillFirstSticksToFirstReady(t *testing.T) {
 	}
 }
 
+func TestSchedulerPick_RandomRetryFallsBackToLowerPriority(t *testing.T) {
+	t.Parallel()
+
+	scheduler := newSchedulerForTest(
+		&RandomSelector{},
+		&Auth{ID: "low", Provider: "gemini", Attributes: map[string]string{"priority": "0"}},
+		&Auth{ID: "high-a", Provider: "gemini", Attributes: map[string]string{"priority": "10"}},
+		&Auth{ID: "high-b", Provider: "gemini", Attributes: map[string]string{"priority": "10"}},
+	)
+
+	got, errPick := scheduler.pickSingle(context.Background(), "gemini", "", cliproxyexecutor.Options{}, nil)
+	if errPick != nil {
+		t.Fatalf("pickSingle() initial error = %v", errPick)
+	}
+	if got == nil {
+		t.Fatalf("pickSingle() initial auth = nil")
+	}
+	if got.ID == "low" {
+		t.Fatalf("pickSingle() initial selected lower priority auth %q", got.ID)
+	}
+
+	retryOpts := cliproxyexecutor.Options{
+		Metadata: map[string]any{
+			cliproxyexecutor.SelectionAttemptMetadataKey: 1,
+		},
+	}
+	got, errPick = scheduler.pickSingle(context.Background(), "gemini", "", retryOpts, nil)
+	if errPick != nil {
+		t.Fatalf("pickSingle() retry error = %v", errPick)
+	}
+	if got == nil {
+		t.Fatalf("pickSingle() retry auth = nil")
+	}
+	if got.ID != "low" {
+		t.Fatalf("pickSingle() retry auth.ID = %q, want %q", got.ID, "low")
+	}
+}
+
 func TestSchedulerPick_PromotesExpiredCooldownBeforePick(t *testing.T) {
 	t.Parallel()
 
@@ -148,6 +186,74 @@ func TestSchedulerPick_PromotesExpiredCooldownBeforePick(t *testing.T) {
 	}
 	if got.ID != "cooldown-expired" {
 		t.Fatalf("pickSingle() auth.ID = %q, want %q", got.ID, "cooldown-expired")
+	}
+}
+
+func TestSchedulerPickSingle_BlocksRebuildWhileProviderSelectionIsInFlight(t *testing.T) {
+	scheduler := newSchedulerForTest(
+		&RoundRobinSelector{},
+		&Auth{ID: "old", Provider: "gemini"},
+	)
+
+	oldProvider := scheduler.providers["gemini"]
+	if oldProvider == nil {
+		t.Fatal("expected provider scheduler")
+	}
+	oldProvider.mu.Lock()
+
+	type pickResult struct {
+		auth *Auth
+		err  error
+	}
+	pickDone := make(chan pickResult, 1)
+	go func() {
+		auth, errPick := scheduler.pickSingle(context.Background(), "gemini", "", cliproxyexecutor.Options{}, nil)
+		pickDone <- pickResult{auth: auth, err: errPick}
+	}()
+
+	time.Sleep(20 * time.Millisecond)
+
+	rebuildDone := make(chan struct{})
+	go func() {
+		scheduler.rebuild([]*Auth{{ID: "new", Provider: "gemini"}})
+		close(rebuildDone)
+	}()
+
+	select {
+	case <-rebuildDone:
+		oldProvider.mu.Unlock()
+		t.Fatal("rebuild completed before in-flight pick released the provider state")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	oldProvider.mu.Unlock()
+
+	result := <-pickDone
+	if result.err != nil {
+		t.Fatalf("pickSingle() error = %v", result.err)
+	}
+	if result.auth == nil {
+		t.Fatal("pickSingle() auth = nil")
+	}
+	if result.auth.ID != "old" {
+		t.Fatalf("pickSingle() auth.ID = %q, want %q", result.auth.ID, "old")
+	}
+
+	select {
+	case <-rebuildDone:
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("rebuild did not complete after pick released the provider state")
+	}
+
+	got, errPick := scheduler.pickSingle(context.Background(), "gemini", "", cliproxyexecutor.Options{}, nil)
+	if errPick != nil {
+		t.Fatalf("pickSingle() after rebuild error = %v", errPick)
+	}
+	if got == nil {
+		t.Fatal("pickSingle() after rebuild auth = nil")
+	}
+	if got.ID != "new" {
+		t.Fatalf("pickSingle() after rebuild auth.ID = %q, want %q", got.ID, "new")
 	}
 }
 
@@ -260,6 +366,51 @@ func TestSchedulerPick_MixedProvidersUsesWeightedProviderRotationOverReadyCandid
 		if got.ID != wantIDs[index] {
 			t.Fatalf("pickMixed() #%d auth.ID = %q, want %q", index, got.ID, wantIDs[index])
 		}
+	}
+}
+
+func TestSchedulerPick_MixedRandomRetryFallsBackToLowerPriority(t *testing.T) {
+	t.Parallel()
+
+	scheduler := newSchedulerForTest(
+		&RandomSelector{},
+		&Auth{ID: "gemini-low", Provider: "gemini", Attributes: map[string]string{"priority": "0"}},
+		&Auth{ID: "gemini-high", Provider: "gemini", Attributes: map[string]string{"priority": "10"}},
+		&Auth{ID: "claude-high", Provider: "claude", Attributes: map[string]string{"priority": "10"}},
+	)
+
+	providers := []string{"gemini", "claude"}
+	got, provider, errPick := scheduler.pickMixed(context.Background(), providers, "", cliproxyexecutor.Options{}, nil)
+	if errPick != nil {
+		t.Fatalf("pickMixed() initial error = %v", errPick)
+	}
+	if got == nil {
+		t.Fatalf("pickMixed() initial auth = nil")
+	}
+	if got.ID == "gemini-low" {
+		t.Fatalf("pickMixed() initial selected lower priority auth %q", got.ID)
+	}
+	if provider == "" {
+		t.Fatalf("pickMixed() initial provider = empty")
+	}
+
+	retryOpts := cliproxyexecutor.Options{
+		Metadata: map[string]any{
+			cliproxyexecutor.SelectionAttemptMetadataKey: 1,
+		},
+	}
+	got, provider, errPick = scheduler.pickMixed(context.Background(), providers, "", retryOpts, nil)
+	if errPick != nil {
+		t.Fatalf("pickMixed() retry error = %v", errPick)
+	}
+	if got == nil {
+		t.Fatalf("pickMixed() retry auth = nil")
+	}
+	if got.ID != "gemini-low" {
+		t.Fatalf("pickMixed() retry auth.ID = %q, want %q", got.ID, "gemini-low")
+	}
+	if provider != "gemini" {
+		t.Fatalf("pickMixed() retry provider = %q, want %q", provider, "gemini")
 	}
 }
 
@@ -525,5 +676,42 @@ func TestManager_SchedulerTracksMarkResultCooldownAndRecovery(t *testing.T) {
 	}
 	if len(seen) != 2 {
 		t.Fatalf("len(seen) = %d, want %d", len(seen), 2)
+	}
+}
+
+func TestManager_SchedulerPreservesSupportedModelsAcrossMarkResult(t *testing.T) {
+	t.Parallel()
+
+	manager := NewManager(nil, &RoundRobinSelector{}, nil)
+	if _, errRegister := manager.Register(context.Background(), &Auth{ID: "auth-a", Provider: "gemini"}); errRegister != nil {
+		t.Fatalf("Register(auth-a) error = %v", errRegister)
+	}
+
+	registerSchedulerModels(t, "gemini", "test-model", "auth-a")
+	manager.RefreshSchedulerEntry("auth-a")
+
+	got, errPick := manager.scheduler.pickSingle(context.Background(), "gemini", "test-model", cliproxyexecutor.Options{}, nil)
+	if errPick != nil {
+		t.Fatalf("pickSingle() before registry drift error = %v", errPick)
+	}
+	if got == nil || got.ID != "auth-a" {
+		t.Fatalf("pickSingle() before registry drift auth = %v, want auth-a", got)
+	}
+
+	registry.GetGlobalRegistry().UnregisterClient("auth-a")
+
+	manager.MarkResult(context.Background(), Result{
+		AuthID:   "auth-a",
+		Provider: "gemini",
+		Model:    "test-model",
+		Success:  true,
+	})
+
+	got, errPick = manager.scheduler.pickSingle(context.Background(), "gemini", "test-model", cliproxyexecutor.Options{}, nil)
+	if errPick != nil {
+		t.Fatalf("pickSingle() after state-only update error = %v", errPick)
+	}
+	if got == nil || got.ID != "auth-a" {
+		t.Fatalf("pickSingle() after state-only update auth = %v, want auth-a", got)
 	}
 }

@@ -1,6 +1,8 @@
 package store
 
 import (
+	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -12,7 +14,148 @@ import (
 	gitconfig "github.com/go-git/go-git/v6/config"
 	"github.com/go-git/go-git/v6/plumbing"
 	"github.com/go-git/go-git/v6/plumbing/object"
+	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 )
+
+func TestGitTokenStoreReadAuthFileSetsCanonicalSourceHash(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "auth.json")
+	data := []byte(`{"type":"claude","email":"reader@example.com"}`)
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatalf("write auth file: %v", err)
+	}
+
+	store := NewGitTokenStore("", "", "", "")
+	auth, err := store.readAuthFile(path, dir)
+	if err != nil {
+		t.Fatalf("readAuthFile returned error: %v", err)
+	}
+	if auth == nil {
+		t.Fatal("expected auth to be loaded")
+	}
+	wantRaw, err := cliproxyauth.CanonicalMetadataBytes(auth)
+	if err != nil {
+		t.Fatalf("CanonicalMetadataBytes() error = %v", err)
+	}
+	if got, want := auth.Attributes[cliproxyauth.SourceHashAttributeKey], cliproxyauth.SourceHashFromBytes(wantRaw); got != want {
+		t.Fatalf("source hash = %q, want %q", got, want)
+	}
+	if rawHash := cliproxyauth.SourceHashFromBytes(data); rawHash == auth.Attributes[cliproxyauth.SourceHashAttributeKey] {
+		t.Fatal("expected canonical source hash to differ from raw file hash")
+	}
+}
+
+func TestGitTokenStoreReadAuthFilePreservesDisabledState(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "auth.json")
+	if err := os.WriteFile(path, []byte(`{"type":"claude","email":"reader@example.com","disabled":true}`), 0o600); err != nil {
+		t.Fatalf("write auth file: %v", err)
+	}
+
+	store := NewGitTokenStore("", "", "", "")
+	auth, err := store.readAuthFile(path, dir)
+	if err != nil {
+		t.Fatalf("readAuthFile returned error: %v", err)
+	}
+	if auth == nil {
+		t.Fatal("expected auth to be loaded")
+	}
+	if !auth.Disabled {
+		t.Fatal("expected auth to remain disabled")
+	}
+	if auth.Status != cliproxyauth.StatusDisabled {
+		t.Fatalf("status = %q, want %q", auth.Status, cliproxyauth.StatusDisabled)
+	}
+}
+
+func TestGitTokenStoreSaveStorageBackedAuthSetsCanonicalSourceHash(t *testing.T) {
+	root := t.TempDir()
+	remoteDir := setupGitRemoteRepository(t, root, "main",
+		testBranchSpec{name: "main", contents: "remote default branch\n"},
+	)
+
+	store := NewGitTokenStore(remoteDir, "", "", "")
+	store.SetBaseDir(filepath.Join(root, "workspace", "auths"))
+
+	auth := &cliproxyauth.Auth{
+		ID:       "auth.json",
+		FileName: "auth.json",
+		Provider: "gemini",
+		Storage:  &testTokenStorage{},
+		Metadata: map[string]any{
+			"type":                 "gemini",
+			"email":                "writer@example.com",
+			"tool_prefix_disabled": true,
+		},
+	}
+
+	path, err := store.Save(context.Background(), auth)
+	if err != nil {
+		t.Fatalf("Save() error = %v", err)
+	}
+
+	if got, ok := auth.Metadata["access_token"].(string); !ok || got != "tok-storage" {
+		t.Fatalf("metadata access_token = %#v, want %q", auth.Metadata["access_token"], "tok-storage")
+	}
+	if got, ok := auth.Metadata["refresh_token"].(string); !ok || got != "refresh-storage" {
+		t.Fatalf("metadata refresh_token = %#v, want %q", auth.Metadata["refresh_token"], "refresh-storage")
+	}
+	if got, ok := auth.Metadata["tool_prefix_disabled"].(bool); !ok || !got {
+		t.Fatalf("metadata tool_prefix_disabled = %#v, want true", auth.Metadata["tool_prefix_disabled"])
+	}
+
+	rawFile, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile() error = %v", err)
+	}
+	wantRaw, err := cliproxyauth.CanonicalMetadataBytes(auth)
+	if err != nil {
+		t.Fatalf("CanonicalMetadataBytes() error = %v", err)
+	}
+	wantHash := cliproxyauth.SourceHashFromBytes(wantRaw)
+	if got := auth.Attributes[cliproxyauth.SourceHashAttributeKey]; got != wantHash {
+		t.Fatalf("source hash = %q, want %q", got, wantHash)
+	}
+	if got, ok := auth.Metadata["disabled"].(bool); !ok || got {
+		t.Fatalf("metadata disabled = %#v, want false", auth.Metadata["disabled"])
+	}
+	if rawHash := cliproxyauth.SourceHashFromBytes(rawFile); rawHash != wantHash {
+		t.Fatalf("raw storage file hash = %q, want %q", rawHash, wantHash)
+	}
+}
+
+func TestGitTokenStoreDelete_CommitsWhenLocalFileAlreadyMissing(t *testing.T) {
+	root := t.TempDir()
+	remoteDir := setupGitRemoteRepository(t, root, "main",
+		testBranchSpec{name: "main", contents: "remote default branch\n"},
+	)
+
+	store := NewGitTokenStore(remoteDir, "", "", "")
+	store.SetBaseDir(filepath.Join(root, "workspace", "auths"))
+	if err := store.EnsureRepository(); err != nil {
+		t.Fatalf("EnsureRepository: %v", err)
+	}
+
+	auth := &cliproxyauth.Auth{
+		ID:       "auth.json",
+		Provider: "claude",
+		FileName: "auth.json",
+		Metadata: map[string]any{"type": "claude", "email": "persist@example.com"},
+	}
+	path, err := store.Save(context.Background(), auth)
+	if err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	if err := os.Remove(path); err != nil {
+		t.Fatalf("remove local auth file: %v", err)
+	}
+
+	if err := store.Delete(context.Background(), auth.ID); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+
+	assertRemoteBranchFileMissing(t, remoteDir, "main", filepath.Join("auths", "auth.json"))
+}
 
 type testBranchSpec struct {
 	name     string
@@ -373,6 +516,37 @@ func setupGitRemoteRepository(t *testing.T, root, defaultBranch string, branches
 	return remoteDir
 }
 
+type testTokenStorage struct {
+	metadata map[string]any
+}
+
+func (s *testTokenStorage) SetMetadata(meta map[string]any) {
+	if meta == nil {
+		s.metadata = nil
+		return
+	}
+	cloned := make(map[string]any, len(meta))
+	for key, value := range meta {
+		cloned[key] = value
+	}
+	s.metadata = cloned
+}
+
+func (s *testTokenStorage) SaveTokenToFile(authFilePath string) error {
+	payload := map[string]any{
+		"access_token":  "tok-storage",
+		"refresh_token": "refresh-storage",
+	}
+	for key, value := range s.metadata {
+		payload[key] = value
+	}
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(authFilePath, raw, 0o600)
+}
+
 func commitBranchMarker(t *testing.T, seedDir string, worktree *git.Worktree, branch testBranchSpec, message string) {
 	t.Helper()
 
@@ -581,5 +755,29 @@ func assertRemoteBranchContents(t *testing.T, remoteDir, branch, wantContents st
 	}
 	if contents != wantContents {
 		t.Fatalf("remote branch %s contents = %q, want %q", branch, contents, wantContents)
+	}
+}
+
+func assertRemoteBranchFileMissing(t *testing.T, remoteDir, branch, filePath string) {
+	t.Helper()
+
+	remoteRepo, err := git.PlainOpen(remoteDir)
+	if err != nil {
+		t.Fatalf("open remote repo: %v", err)
+	}
+	ref, err := remoteRepo.Reference(plumbing.NewBranchReferenceName(branch), false)
+	if err != nil {
+		t.Fatalf("read remote branch %s: %v", branch, err)
+	}
+	commit, err := remoteRepo.CommitObject(ref.Hash())
+	if err != nil {
+		t.Fatalf("read remote branch %s commit: %v", branch, err)
+	}
+	tree, err := commit.Tree()
+	if err != nil {
+		t.Fatalf("read remote branch %s tree: %v", branch, err)
+	}
+	if _, err := tree.File(filePath); err == nil {
+		t.Fatalf("remote branch %s still contains %s", branch, filePath)
 	}
 }

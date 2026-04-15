@@ -116,7 +116,7 @@ func (w *Watcher) reloadClients(rescanAuth bool, affectedOAuthProviders []string
 						}
 						if generated := synthesizer.SynthesizeAuthFile(ctx, fullPath, data); len(generated) > 0 {
 							if pathAuths := authSliceToMap(generated); len(pathAuths) > 0 {
-								w.fileAuthsByPath[normalizedPath] = authIDSet(pathAuths)
+								w.fileAuthsByPath[normalizedPath] = cloneAuthMap(pathAuths)
 							}
 						}
 					}
@@ -224,7 +224,7 @@ func (w *Watcher) addOrUpdateClient(path string) {
 	generated := synthesizer.SynthesizeAuthFile(sctx, path, data)
 	newByID := authSliceToMap(generated)
 	if len(newByID) > 0 {
-		w.fileAuthsByPath[normalized] = authIDSet(newByID)
+		w.fileAuthsByPath[normalized] = cloneAuthMap(newByID)
 	} else {
 		delete(w.fileAuthsByPath, normalized)
 	}
@@ -274,8 +274,12 @@ func (w *Watcher) computePerPathUpdatesLocked(oldByID, newByID map[string]*corea
 		if _, stillExists := newByID[id]; stillExists {
 			continue
 		}
+		var deletedAuth *coreauth.Auth
+		if previous := oldByID[id]; previous != nil {
+			deletedAuth = previous.Clone()
+		}
 		delete(w.currentAuths, id)
-		updates = append(updates, AuthUpdate{Action: AuthUpdateActionDelete, ID: id})
+		updates = append(updates, AuthUpdate{Action: AuthUpdateActionDelete, ID: id, Auth: deletedAuth})
 	}
 	return updates
 }
@@ -291,10 +295,14 @@ func authSliceToMap(auths []*coreauth.Auth) map[string]*coreauth.Auth {
 	return byID
 }
 
-func authIDSet(auths map[string]*coreauth.Auth) map[string]*coreauth.Auth {
+func cloneAuthMap(auths map[string]*coreauth.Auth) map[string]*coreauth.Auth {
 	set := make(map[string]*coreauth.Auth, len(auths))
-	for id := range auths {
-		set[id] = nil
+	for id, auth := range auths {
+		if auth == nil {
+			set[id] = nil
+			continue
+		}
+		set[id] = auth.Clone()
 	}
 	return set
 }

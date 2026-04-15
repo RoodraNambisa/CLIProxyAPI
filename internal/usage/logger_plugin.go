@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
 	coreusage "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/usage"
 )
 
@@ -60,10 +61,12 @@ func StatisticsEnabled() bool { return statisticsEnabled.Load() }
 type RequestStatistics struct {
 	mu sync.RWMutex
 
-	totalRequests int64
-	successCount  int64
-	failureCount  int64
-	totalTokens   int64
+	totalRequests  int64
+	successCount   int64
+	failureCount   int64
+	totalTokens    int64
+	changeCount    uint64
+	persistedCount uint64
 
 	apis map[string]*apiStats
 
@@ -92,6 +95,7 @@ type RequestDetail struct {
 	Timestamp time.Time  `json:"timestamp"`
 	LatencyMs int64      `json:"latency_ms"`
 	Source    string     `json:"source"`
+	ClientIP  string     `json:"client_ip"`
 	AuthIndex string     `json:"auth_index"`
 	Tokens    TokenStats `json:"tokens"`
 	Failed    bool       `json:"failed"`
@@ -201,6 +205,7 @@ func (s *RequestStatistics) Record(ctx context.Context, record coreusage.Record)
 		Timestamp: timestamp,
 		LatencyMs: normaliseLatency(record.Latency),
 		Source:    record.Source,
+		ClientIP:  resolveClientIP(ctx),
 		AuthIndex: record.AuthIndex,
 		Tokens:    detail,
 		Failed:    failed,
@@ -210,6 +215,7 @@ func (s *RequestStatistics) Record(ctx context.Context, record coreusage.Record)
 	s.requestsByHour[hourKey]++
 	s.tokensByDay[dayKey] += totalTokens
 	s.tokensByHour[hourKey] += totalTokens
+	s.markChangedLocked()
 }
 
 func (s *RequestStatistics) updateAPIStats(stats *apiStats, model string, detail RequestDetail) {
@@ -227,9 +233,16 @@ func (s *RequestStatistics) updateAPIStats(stats *apiStats, model string, detail
 
 // Snapshot returns a copy of the aggregated metrics for external consumption.
 func (s *RequestStatistics) Snapshot() StatisticsSnapshot {
+	result, _, _ := s.SnapshotWithState()
+	return result
+}
+
+// SnapshotWithState returns a copy of the aggregated metrics together with the
+// current mutation and persisted counters.
+func (s *RequestStatistics) SnapshotWithState() (StatisticsSnapshot, uint64, uint64) {
 	result := StatisticsSnapshot{}
 	if s == nil {
-		return result
+		return result, 0, 0
 	}
 
 	s.mu.RLock()
@@ -281,7 +294,7 @@ func (s *RequestStatistics) Snapshot() StatisticsSnapshot {
 		result.TokensByHour[key] = v
 	}
 
-	return result
+	return result, s.changeCount, s.persistedCount
 }
 
 type MergeResult struct {
@@ -355,6 +368,154 @@ func (s *RequestStatistics) MergeSnapshot(snapshot StatisticsSnapshot) MergeResu
 	return result
 }
 
+// HasPendingPersistence reports whether there are in-memory changes that have
+// not been written to the snapshot file yet.
+func (s *RequestStatistics) HasPendingPersistence() bool {
+	if s == nil {
+		return false
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.changeCount != s.persistedCount
+}
+
+// MarkPersisted advances the persisted counter to the provided snapshot
+// version. Newer in-memory changes remain pending.
+func (s *RequestStatistics) MarkPersisted(version uint64) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if version > s.changeCount {
+		version = s.changeCount
+	}
+	if version > s.persistedCount {
+		s.persistedCount = version
+	}
+}
+
+// MarkAllPersisted marks the current in-memory state as already persisted.
+func (s *RequestStatistics) MarkAllPersisted() {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.persistedCount = s.changeCount
+}
+
+// RemoveAuthIndexes removes request details belonging to the supplied auth
+// indexes and rebuilds derived totals.
+func (s *RequestStatistics) RemoveAuthIndexes(indexes []string) int {
+	if s == nil {
+		return 0
+	}
+	indexSet := make(map[string]struct{}, len(indexes))
+	for _, index := range indexes {
+		index = strings.TrimSpace(index)
+		if index != "" {
+			indexSet[index] = struct{}{}
+		}
+	}
+	if len(indexSet) == 0 {
+		return 0
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	removed := 0
+	for apiName, stats := range s.apis {
+		if stats == nil {
+			delete(s.apis, apiName)
+			continue
+		}
+		for modelName, modelStatsValue := range stats.Models {
+			if modelStatsValue == nil {
+				delete(stats.Models, modelName)
+				continue
+			}
+			kept := make([]RequestDetail, 0, len(modelStatsValue.Details))
+			for _, detail := range modelStatsValue.Details {
+				if _, ok := indexSet[strings.TrimSpace(detail.AuthIndex)]; ok {
+					removed++
+					continue
+				}
+				kept = append(kept, detail)
+			}
+			if len(kept) == 0 {
+				delete(stats.Models, modelName)
+				continue
+			}
+			modelStatsValue.Details = kept
+		}
+		if len(stats.Models) == 0 {
+			delete(s.apis, apiName)
+		}
+	}
+	if removed == 0 {
+		return 0
+	}
+
+	s.rebuildLocked()
+	s.markChangedLocked()
+	return removed
+}
+
+// PruneAuthIndexes removes request details whose auth index is no longer
+// present in the valid set.
+func (s *RequestStatistics) PruneAuthIndexes(valid map[string]struct{}) int {
+	if s == nil {
+		return 0
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	removed := 0
+	for apiName, stats := range s.apis {
+		if stats == nil {
+			delete(s.apis, apiName)
+			continue
+		}
+		for modelName, modelStatsValue := range stats.Models {
+			if modelStatsValue == nil {
+				delete(stats.Models, modelName)
+				continue
+			}
+			kept := make([]RequestDetail, 0, len(modelStatsValue.Details))
+			for _, detail := range modelStatsValue.Details {
+				authIndex := strings.TrimSpace(detail.AuthIndex)
+				if authIndex == "" {
+					kept = append(kept, detail)
+					continue
+				}
+				if _, ok := valid[authIndex]; ok {
+					kept = append(kept, detail)
+					continue
+				}
+				removed++
+			}
+			if len(kept) == 0 {
+				delete(stats.Models, modelName)
+				continue
+			}
+			modelStatsValue.Details = kept
+		}
+		if len(stats.Models) == 0 {
+			delete(s.apis, apiName)
+		}
+	}
+	if removed == 0 {
+		return 0
+	}
+
+	s.rebuildLocked()
+	s.markChangedLocked()
+	return removed
+}
+
 func (s *RequestStatistics) recordImported(apiName, modelName string, stats *apiStats, detail RequestDetail) {
 	totalTokens := detail.Tokens.TotalTokens
 	if totalTokens < 0 {
@@ -378,17 +539,88 @@ func (s *RequestStatistics) recordImported(apiName, modelName string, stats *api
 	s.requestsByHour[hourKey]++
 	s.tokensByDay[dayKey] += totalTokens
 	s.tokensByHour[hourKey] += totalTokens
+	s.markChangedLocked()
+}
+
+func (s *RequestStatistics) rebuildLocked() {
+	s.totalRequests = 0
+	s.successCount = 0
+	s.failureCount = 0
+	s.totalTokens = 0
+	s.requestsByDay = make(map[string]int64)
+	s.requestsByHour = make(map[int]int64)
+	s.tokensByDay = make(map[string]int64)
+	s.tokensByHour = make(map[int]int64)
+
+	for apiName, stats := range s.apis {
+		if stats == nil {
+			delete(s.apis, apiName)
+			continue
+		}
+		stats.TotalRequests = 0
+		stats.TotalTokens = 0
+		if stats.Models == nil {
+			stats.Models = make(map[string]*modelStats)
+		}
+		for modelName, modelStatsValue := range stats.Models {
+			if modelStatsValue == nil || len(modelStatsValue.Details) == 0 {
+				delete(stats.Models, modelName)
+				continue
+			}
+			modelStatsValue.TotalRequests = 0
+			modelStatsValue.TotalTokens = 0
+			for idx, detail := range modelStatsValue.Details {
+				detail.Tokens = normaliseTokenStats(detail.Tokens)
+				if detail.LatencyMs < 0 {
+					detail.LatencyMs = 0
+				}
+				if detail.Timestamp.IsZero() {
+					detail.Timestamp = time.Now()
+				}
+				modelStatsValue.Details[idx] = detail
+
+				totalTokens := detail.Tokens.TotalTokens
+				s.totalRequests++
+				if detail.Failed {
+					s.failureCount++
+				} else {
+					s.successCount++
+				}
+				s.totalTokens += totalTokens
+
+				stats.TotalRequests++
+				stats.TotalTokens += totalTokens
+				modelStatsValue.TotalRequests++
+				modelStatsValue.TotalTokens += totalTokens
+
+				dayKey := detail.Timestamp.Format("2006-01-02")
+				hourKey := detail.Timestamp.Hour()
+				s.requestsByDay[dayKey]++
+				s.requestsByHour[hourKey]++
+				s.tokensByDay[dayKey] += totalTokens
+				s.tokensByHour[hourKey] += totalTokens
+			}
+		}
+		if len(stats.Models) == 0 {
+			delete(s.apis, apiName)
+		}
+	}
+}
+
+func (s *RequestStatistics) markChangedLocked() {
+	s.changeCount++
 }
 
 func dedupKey(apiName, modelName string, detail RequestDetail) string {
 	timestamp := detail.Timestamp.UTC().Format(time.RFC3339Nano)
 	tokens := normaliseTokenStats(detail.Tokens)
 	return fmt.Sprintf(
-		"%s|%s|%s|%s|%s|%t|%d|%d|%d|%d|%d",
+		"%s|%s|%s|%s|%s|%s|%t|%d|%d|%d|%d|%d",
 		apiName,
 		modelName,
 		timestamp,
 		detail.Source,
+		strings.TrimSpace(detail.ClientIP),
 		detail.AuthIndex,
 		detail.Failed,
 		tokens.InputTokens,
@@ -437,6 +669,17 @@ func resolveSuccess(ctx context.Context) bool {
 		return true
 	}
 	return status < httpStatusBadRequest
+}
+
+func resolveClientIP(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+	ginCtx, ok := ctx.Value("gin").(*gin.Context)
+	if !ok || ginCtx == nil {
+		return ""
+	}
+	return logging.ResolveClientIP(ginCtx)
 }
 
 const httpStatusBadRequest = 400

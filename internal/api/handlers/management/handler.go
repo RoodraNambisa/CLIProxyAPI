@@ -48,6 +48,7 @@ type Handler struct {
 	envSecret           string
 	logDir              string
 	postAuthHook        coreauth.PostAuthHook
+	authStatusHook      coreauth.AuthStatusHook
 }
 
 // NewHandler creates a new management handler instance.
@@ -132,6 +133,11 @@ func (h *Handler) SetLogDirectory(dir string) {
 // SetPostAuthHook registers a hook to be called after auth record creation but before persistence.
 func (h *Handler) SetPostAuthHook(hook coreauth.PostAuthHook) {
 	h.postAuthHook = hook
+}
+
+// SetAuthStatusHook registers a hook to be called after auth status changes.
+func (h *Handler) SetAuthStatusHook(hook coreauth.AuthStatusHook) {
+	h.authStatusHook = hook
 }
 
 // Middleware enforces access control for management endpoints.
@@ -299,6 +305,10 @@ func (h *Handler) updateBoolField(c *gin.Context, set func(bool)) {
 }
 
 func (h *Handler) updateIntField(c *gin.Context, set func(int)) {
+	h.updateIntFieldNormalized(c, nil, set)
+}
+
+func (h *Handler) updateIntFieldNormalized(c *gin.Context, normalize func(int) int, set func(int)) {
 	var body struct {
 		Value *int `json:"value"`
 	}
@@ -306,7 +316,11 @@ func (h *Handler) updateIntField(c *gin.Context, set func(int)) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
 		return
 	}
-	set(*body.Value)
+	value := *body.Value
+	if normalize != nil {
+		value = normalize(value)
+	}
+	set(value)
 	h.persist(c)
 }
 

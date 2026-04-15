@@ -14,6 +14,7 @@ import (
 	"time"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
+	internalauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/misc"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	log "github.com/sirupsen/logrus"
@@ -214,16 +215,27 @@ func (s *PostgresStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (stri
 
 	switch {
 	case auth.Storage != nil:
+		if setter, ok := auth.Storage.(internalauth.MetadataSetter); ok {
+			setter.SetMetadata(cliproxyauth.MetadataWithDisabled(auth))
+		}
 		if err = auth.Storage.SaveTokenToFile(path); err != nil {
 			return "", err
 		}
+		data, errRead := os.ReadFile(path)
+		if errRead != nil {
+			return "", fmt.Errorf("postgres store: read persisted storage auth: %w", errRead)
+		}
+		if errSync := cliproxyauth.SyncPersistedMetadataAndSourceHash(auth, data); errSync != nil {
+			return "", fmt.Errorf("postgres store: sync persisted storage auth: %w", errSync)
+		}
 	case auth.Metadata != nil:
-		raw, errMarshal := json.Marshal(auth.Metadata)
+		raw, errMarshal := cliproxyauth.CanonicalMetadataBytes(auth)
 		if errMarshal != nil {
-			return "", fmt.Errorf("postgres store: marshal metadata: %w", errMarshal)
+			return "", fmt.Errorf("postgres store: canonicalize metadata: %w", errMarshal)
 		}
 		if existing, errRead := os.ReadFile(path); errRead == nil {
 			if jsonEqual(existing, raw) {
+				cliproxyauth.SetSourceHashAttribute(auth, raw)
 				return path, nil
 			}
 		} else if errRead != nil && !errors.Is(errRead, fs.ErrNotExist) {
@@ -236,6 +248,7 @@ func (s *PostgresStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (stri
 		if errRename := os.Rename(tmp, path); errRename != nil {
 			return "", fmt.Errorf("postgres store: rename auth file: %w", errRename)
 		}
+		cliproxyauth.SetSourceHashAttribute(auth, raw)
 	default:
 		return "", fmt.Errorf("postgres store: nothing to persist for %s", auth.ID)
 	}
@@ -297,18 +310,28 @@ func (s *PostgresStore) List(ctx context.Context) ([]*cliproxyauth.Auth, error) 
 		if email := strings.TrimSpace(valueAsString(metadata["email"])); email != "" {
 			attr["email"] = email
 		}
+		disabled, _ := metadata["disabled"].(bool)
+		status := cliproxyauth.StatusActive
+		if disabled {
+			status = cliproxyauth.StatusDisabled
+		}
 		auth := &cliproxyauth.Auth{
 			ID:               normalizeAuthID(id),
 			Provider:         provider,
 			FileName:         normalizeAuthID(id),
 			Label:            labelFor(metadata),
-			Status:           cliproxyauth.StatusActive,
+			Status:           status,
+			Disabled:         disabled,
 			Attributes:       attr,
 			Metadata:         metadata,
 			CreatedAt:        createdAt,
 			UpdatedAt:        updatedAt,
 			LastRefreshedAt:  time.Time{},
 			NextRefreshAfter: time.Time{},
+		}
+		if errHash := cliproxyauth.SetCanonicalSourceHashAttribute(auth); errHash != nil {
+			log.WithError(errHash).Warnf("postgres store: skipping auth %s with invalid canonical metadata", id)
+			continue
 		}
 		cliproxyauth.ApplyCustomHeadersFromMetadata(auth)
 		auths = append(auths, auth)

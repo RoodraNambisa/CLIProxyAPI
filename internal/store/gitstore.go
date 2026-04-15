@@ -18,6 +18,7 @@ import (
 	"github.com/go-git/go-git/v6/plumbing/object"
 	"github.com/go-git/go-git/v6/plumbing/transport"
 	"github.com/go-git/go-git/v6/plumbing/transport/http"
+	internalauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 )
 
@@ -287,16 +288,27 @@ func (s *GitTokenStore) Save(_ context.Context, auth *cliproxyauth.Auth) (string
 
 	switch {
 	case auth.Storage != nil:
+		if setter, ok := auth.Storage.(internalauth.MetadataSetter); ok {
+			setter.SetMetadata(cliproxyauth.MetadataWithDisabled(auth))
+		}
 		if err = auth.Storage.SaveTokenToFile(path); err != nil {
 			return "", err
 		}
+		data, errRead := os.ReadFile(path)
+		if errRead != nil {
+			return "", fmt.Errorf("auth filestore: read persisted storage auth failed: %w", errRead)
+		}
+		if errSync := cliproxyauth.SyncPersistedMetadataAndSourceHash(auth, data); errSync != nil {
+			return "", fmt.Errorf("auth filestore: sync persisted storage auth failed: %w", errSync)
+		}
 	case auth.Metadata != nil:
-		raw, errMarshal := json.Marshal(auth.Metadata)
+		raw, errMarshal := cliproxyauth.CanonicalMetadataBytes(auth)
 		if errMarshal != nil {
-			return "", fmt.Errorf("auth filestore: marshal metadata failed: %w", errMarshal)
+			return "", fmt.Errorf("auth filestore: canonicalize metadata failed: %w", errMarshal)
 		}
 		if existing, errRead := os.ReadFile(path); errRead == nil {
 			if jsonEqual(existing, raw) {
+				cliproxyauth.SetSourceHashAttribute(auth, raw)
 				return path, nil
 			}
 		} else if !os.IsNotExist(errRead) {
@@ -309,6 +321,7 @@ func (s *GitTokenStore) Save(_ context.Context, auth *cliproxyauth.Auth) (string
 		if errRename := os.Rename(tmp, path); errRename != nil {
 			return "", fmt.Errorf("auth filestore: rename failed: %w", errRename)
 		}
+		cliproxyauth.SetSourceHashAttribute(auth, raw)
 	default:
 		return "", fmt.Errorf("auth filestore: nothing to persist for %s", auth.ID)
 	}
@@ -392,15 +405,13 @@ func (s *GitTokenStore) Delete(_ context.Context, id string) error {
 	if err = os.Remove(path); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("auth filestore: delete failed: %w", err)
 	}
-	if err == nil {
-		rel, errRel := s.relativeToRepo(path)
-		if errRel != nil {
-			return errRel
-		}
-		messageID := id
-		if errCommit := s.commitAndPushLocked(fmt.Sprintf("Delete auth %s", messageID), rel); errCommit != nil {
-			return errCommit
-		}
+	rel, errRel := s.relativeToRepo(path)
+	if errRel != nil {
+		return errRel
+	}
+	messageID := id
+	if errCommit := s.commitAndPushLocked(fmt.Sprintf("Delete auth %s", messageID), rel); errCommit != nil {
+		return errCommit
 	}
 	return nil
 }
@@ -472,18 +483,27 @@ func (s *GitTokenStore) readAuthFile(path, baseDir string) (*cliproxyauth.Auth, 
 		return nil, fmt.Errorf("stat file: %w", err)
 	}
 	id := s.idFor(path, baseDir)
+	disabled, _ := metadata["disabled"].(bool)
+	status := cliproxyauth.StatusActive
+	if disabled {
+		status = cliproxyauth.StatusDisabled
+	}
 	auth := &cliproxyauth.Auth{
 		ID:               id,
 		Provider:         provider,
 		FileName:         id,
 		Label:            s.labelFor(metadata),
-		Status:           cliproxyauth.StatusActive,
+		Status:           status,
+		Disabled:         disabled,
 		Attributes:       map[string]string{"path": path},
 		Metadata:         metadata,
 		CreatedAt:        info.ModTime(),
 		UpdatedAt:        info.ModTime(),
 		LastRefreshedAt:  time.Time{},
 		NextRefreshAfter: time.Time{},
+	}
+	if errHash := cliproxyauth.SetCanonicalSourceHashAttribute(auth); errHash != nil {
+		return nil, fmt.Errorf("canonicalize auth metadata: %w", errHash)
 	}
 	if email, ok := metadata["email"].(string); ok && email != "" {
 		auth.Attributes["email"] = email

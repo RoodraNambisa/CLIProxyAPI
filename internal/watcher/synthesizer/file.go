@@ -102,7 +102,6 @@ func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) []
 	if p, ok := metadata["proxy_url"].(string); ok {
 		proxyURL = p
 	}
-
 	prefix := ""
 	if rawPrefix, ok := metadata["prefix"].(string); ok {
 		trimmed := strings.TrimSpace(rawPrefix)
@@ -136,6 +135,9 @@ func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) []
 		Metadata:  metadata,
 		CreatedAt: now,
 		UpdatedAt: now,
+	}
+	if errHash := coreauth.SetCanonicalSourceHashAttribute(a); errHash != nil {
+		return nil
 	}
 	// Read priority from auth file.
 	if rawPriority, ok := metadata["priority"]; ok {
@@ -205,6 +207,7 @@ func SynthesizeGeminiVirtualAuths(primary *coreauth.Auth, metadata map[string]an
 	primary.Attributes["virtual_children"] = strings.Join(projects, ",")
 	source := primary.Attributes["source"]
 	authPath := primary.Attributes["path"]
+	sourceHash := primary.Attributes[coreauth.SourceHashAttributeKey]
 	originalProvider := primary.Provider
 	if originalProvider == "" {
 		originalProvider = "gemini-cli"
@@ -225,6 +228,9 @@ func SynthesizeGeminiVirtualAuths(primary *coreauth.Auth, metadata map[string]an
 		}
 		if authPath != "" {
 			attrs["path"] = authPath
+		}
+		if sourceHash != "" {
+			attrs[coreauth.SourceHashAttributeKey] = sourceHash
 		}
 		// Propagate priority from primary auth to virtual auths
 		if priorityVal, hasPriority := primary.Attributes["priority"]; hasPriority && priorityVal != "" {

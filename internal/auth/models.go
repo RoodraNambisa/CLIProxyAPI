@@ -15,3 +15,9 @@ type TokenStorage interface {
 	//   - error: An error if the save operation fails, nil otherwise
 	SaveTokenToFile(authFilePath string) error
 }
+
+// MetadataSetter is an optional interface for token storages that can accept
+// metadata before persisting their payload.
+type MetadataSetter interface {
+	SetMetadata(map[string]any)
+}

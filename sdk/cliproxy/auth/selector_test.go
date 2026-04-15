@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"math/rand/v2"
 	"net/http"
 	"sync"
 	"testing"
@@ -119,6 +120,44 @@ func TestFillFirstSelectorPick_PriorityFallbackCooldown(t *testing.T) {
 	}
 	if got.ID != "low" {
 		t.Fatalf("Pick() auth.ID = %q, want %q", got.ID, "low")
+	}
+}
+
+func TestRandomSelectorPick_StaysWithinHighestPriorityUntilRetry(t *testing.T) {
+	t.Parallel()
+
+	selector := &RandomSelector{rnd: rand.New(rand.NewPCG(1, 2))}
+	auths := []*Auth{
+		{ID: "low", Attributes: map[string]string{"priority": "0"}},
+		{ID: "high-a", Attributes: map[string]string{"priority": "10"}},
+		{ID: "high-b", Attributes: map[string]string{"priority": "10"}},
+	}
+
+	got, err := selector.Pick(context.Background(), "mixed", "", cliproxyexecutor.Options{}, auths)
+	if err != nil {
+		t.Fatalf("Pick() error = %v", err)
+	}
+	if got == nil {
+		t.Fatalf("Pick() auth = nil")
+	}
+	if got.ID == "low" {
+		t.Fatalf("Pick() selected lower priority auth %q on initial attempt", got.ID)
+	}
+
+	retryOpts := cliproxyexecutor.Options{
+		Metadata: map[string]any{
+			cliproxyexecutor.SelectionAttemptMetadataKey: 1,
+		},
+	}
+	got, err = selector.Pick(context.Background(), "mixed", "", retryOpts, auths)
+	if err != nil {
+		t.Fatalf("Pick() retry error = %v", err)
+	}
+	if got == nil {
+		t.Fatalf("Pick() retry auth = nil")
+	}
+	if got.ID != "low" {
+		t.Fatalf("Pick() retry auth.ID = %q, want %q", got.ID, "low")
 	}
 }
 

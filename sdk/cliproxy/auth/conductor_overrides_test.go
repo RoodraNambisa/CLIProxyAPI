@@ -2,6 +2,8 @@ package auth
 
 import (
 	"context"
+	"fmt"
+	rand "math/rand/v2"
 	"net/http"
 	"sync"
 	"testing"
@@ -65,6 +67,147 @@ func TestManager_ShouldRetryAfterError_RespectsAuthRequestRetryOverride(t *testi
 	}
 }
 
+func TestManager_InitialRequestRetryBudget_UsesAuthRequestRetryOverride(t *testing.T) {
+	m := NewManager(nil, nil, nil)
+	m.SetRetryConfig(0, 30*time.Second, 0)
+
+	auth := &Auth{
+		ID:       "auth-override-budget",
+		Provider: "claude",
+		Metadata: map[string]any{
+			"request_retry": float64(2),
+		},
+	}
+	if _, errRegister := m.Register(context.Background(), auth); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+
+	total, unlimitedCredentials := m.initialRequestRetryBudget([]string{"claude"}, 0)
+	if total != 2 {
+		t.Fatalf("initialRequestRetryBudget() total = %d, want 2", total)
+	}
+	if !unlimitedCredentials {
+		t.Fatal("initialRequestRetryBudget() unlimitedCredentials = false, want true")
+	}
+}
+
+func TestManager_WithRequestRetryBudget_RebuildsProviderScopedBudget(t *testing.T) {
+	m := NewManager(nil, nil, nil)
+	m.SetRetryConfig(0, 100*time.Millisecond, 0)
+
+	executor := &authFallbackExecutor{
+		id: "claude",
+		executeErrors: map[string]error{
+			"auth-override-budget-context": &retryAfterStatusError{
+				status:     http.StatusTooManyRequests,
+				message:    "quota exhausted",
+				retryAfter: 5 * time.Millisecond,
+			},
+		},
+	}
+	m.RegisterExecutor(executor)
+
+	auth := &Auth{
+		ID:       "auth-override-budget-context",
+		Provider: "claude",
+		Metadata: map[string]any{
+			"request_retry": float64(2),
+		},
+	}
+	if _, errRegister := m.Register(context.Background(), auth); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient(auth.ID, "claude", []*registry.ModelInfo{{ID: "test-model"}})
+	t.Cleanup(func() { reg.UnregisterClient(auth.ID) })
+
+	ctx := m.WithRequestRetryBudget(context.Background(), 0)
+	if _, errExecute := m.Execute(ctx, []string{"claude"}, cliproxyexecutor.Request{Model: "test-model"}, cliproxyexecutor.Options{}); errExecute == nil {
+		t.Fatal("Execute() error = nil, want retry exhaustion error")
+	}
+	if got := executor.ExecuteCalls(); len(got) != 3 {
+		t.Fatalf("execute call count = %d, want 3 (initial attempt + 2 auth-level retries)", len(got))
+	}
+}
+
+func TestManager_WithRequestRetryBudget_DoesNotUseUnrelatedProviderOverride(t *testing.T) {
+	m := NewManager(nil, nil, nil)
+	m.SetRetryConfig(0, 100*time.Millisecond, 0)
+
+	claudeExecutor := &authFallbackExecutor{
+		id: "claude",
+		executeErrors: map[string]error{
+			"claude-budget-target": &retryAfterStatusError{
+				status:     http.StatusTooManyRequests,
+				message:    "quota exhausted",
+				retryAfter: 5 * time.Millisecond,
+			},
+		},
+	}
+	geminiExecutor := &authFallbackExecutor{id: "gemini"}
+	m.RegisterExecutor(claudeExecutor)
+	m.RegisterExecutor(geminiExecutor)
+
+	claudeAuth := &Auth{
+		ID:       "claude-budget-target",
+		Provider: "claude",
+		Metadata: map[string]any{"type": "claude"},
+	}
+	geminiAuth := &Auth{
+		ID:       "gemini-budget-unrelated",
+		Provider: "gemini",
+		Metadata: map[string]any{
+			"type":          "gemini",
+			"request_retry": float64(5),
+		},
+	}
+	if _, errRegister := m.Register(context.Background(), claudeAuth); errRegister != nil {
+		t.Fatalf("register claude auth: %v", errRegister)
+	}
+	if _, errRegister := m.Register(context.Background(), geminiAuth); errRegister != nil {
+		t.Fatalf("register gemini auth: %v", errRegister)
+	}
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient(claudeAuth.ID, "claude", []*registry.ModelInfo{{ID: "test-model"}})
+	reg.RegisterClient(geminiAuth.ID, "gemini", []*registry.ModelInfo{{ID: "test-model"}})
+	t.Cleanup(func() {
+		reg.UnregisterClient(claudeAuth.ID)
+		reg.UnregisterClient(geminiAuth.ID)
+	})
+
+	ctx := m.WithRequestRetryBudget(context.Background(), 0)
+	if _, errExecute := m.Execute(ctx, []string{"claude"}, cliproxyexecutor.Request{Model: "test-model"}, cliproxyexecutor.Options{}); errExecute == nil {
+		t.Fatal("Execute() error = nil, want auth failure")
+	}
+	if got := claudeExecutor.ExecuteCalls(); len(got) != 1 {
+		t.Fatalf("claude execute call count = %d, want 1", len(got))
+	}
+	if got := geminiExecutor.ExecuteCalls(); len(got) != 0 {
+		t.Fatalf("gemini execute call count = %d, want 0", len(got))
+	}
+}
+
+func TestManager_WithRequestRetryBudget_PreservesBootstrapRetriesOnProviderScopeRebuild(t *testing.T) {
+	m := NewManager(nil, nil, nil)
+	m.SetRetryConfig(0, 100*time.Millisecond, 0)
+
+	ctx := m.WithRequestRetryBudget(context.Background(), 2)
+	rebuilt := m.withRequestRetryBudget(ctx, []string{"claude"}, 0)
+	budget := requestRetryBudgetFromContext(rebuilt)
+	if budget == nil {
+		t.Fatal("requestRetryBudgetFromContext() = nil, want budget")
+	}
+	if got := budget.remaining.Load(); got != 2 {
+		t.Fatalf("remaining budget = %d, want 2", got)
+	}
+	if !budget.providerScoped {
+		t.Fatal("expected rebuilt budget to be provider-scoped")
+	}
+	if budget.bootstrapRetries != 2 {
+		t.Fatalf("bootstrapRetries = %d, want 2", budget.bootstrapRetries)
+	}
+}
+
 func TestManager_ShouldRetryAfterError_UsesOAuthModelAliasForCooldown(t *testing.T) {
 	m := NewManager(nil, nil, nil)
 	m.SetRetryConfig(3, 30*time.Second, 0)
@@ -105,6 +248,43 @@ func TestManager_ShouldRetryAfterError_UsesOAuthModelAliasForCooldown(t *testing
 	}
 	if wait <= 0 {
 		t.Fatalf("expected wait > 0, got %v", wait)
+	}
+}
+
+func TestSetSelectionAttemptMetadata_DoesNotMutateCallerMetadata(t *testing.T) {
+	originalMetadata := map[string]any{"email": "user@example.com"}
+	opts := cliproxyexecutor.Options{Metadata: originalMetadata}
+
+	updated := setSelectionAttemptMetadata(opts, 2)
+
+	if _, exists := originalMetadata[cliproxyexecutor.SelectionAttemptMetadataKey]; exists {
+		t.Fatal("expected original metadata to remain unchanged")
+	}
+	if got := updated.Metadata[cliproxyexecutor.SelectionAttemptMetadataKey]; got != 2 {
+		t.Fatalf("selection_attempt = %v, want 2", got)
+	}
+	if got := updated.Metadata["email"]; got != "user@example.com" {
+		t.Fatalf("email metadata = %v, want user@example.com", got)
+	}
+}
+
+func TestAvailableAuthsForRouteModel_SortsSelectedPriorityDeterministically(t *testing.T) {
+	m := NewManager(nil, &FillFirstSelector{}, nil)
+	auths := []*Auth{
+		{ID: "b-auth", Provider: "claude", Attributes: map[string]string{"priority": "10"}},
+		{ID: "a-auth", Provider: "claude", Attributes: map[string]string{"priority": "10"}},
+		{ID: "z-low", Provider: "claude", Attributes: map[string]string{"priority": "1"}},
+	}
+
+	available, err := m.availableAuthsForRouteModel(auths, "claude", "", cliproxyexecutor.Options{}, time.Now())
+	if err != nil {
+		t.Fatalf("availableAuthsForRouteModel() error = %v", err)
+	}
+	if len(available) != 2 {
+		t.Fatalf("availableAuthsForRouteModel() len = %d, want 2", len(available))
+	}
+	if available[0].ID != "a-auth" || available[1].ID != "b-auth" {
+		t.Fatalf("availableAuthsForRouteModel() IDs = [%s %s], want [a-auth b-auth]", available[0].ID, available[1].ID)
 	}
 }
 
@@ -253,7 +433,14 @@ func (e *retryAfterStatusError) RetryAfter() *time.Duration {
 }
 
 func newCredentialRetryLimitTestManager(t *testing.T, maxRetryCredentials int) (*Manager, *credentialRetryLimitExecutor) {
+	return newCredentialRetryLimitTestManagerWithAuthCount(t, maxRetryCredentials, 2)
+}
+
+func newCredentialRetryLimitTestManagerWithAuthCount(t *testing.T, maxRetryCredentials int, authCount int) (*Manager, *credentialRetryLimitExecutor) {
 	t.Helper()
+	if authCount <= 0 {
+		authCount = 1
+	}
 
 	m := NewManager(nil, nil, nil)
 	m.SetRetryConfig(0, 0, maxRetryCredentials)
@@ -261,24 +448,25 @@ func newCredentialRetryLimitTestManager(t *testing.T, maxRetryCredentials int) (
 	executor := &credentialRetryLimitExecutor{id: "claude"}
 	m.RegisterExecutor(executor)
 
-	baseID := uuid.NewString()
-	auth1 := &Auth{ID: baseID + "-auth-1", Provider: "claude"}
-	auth2 := &Auth{ID: baseID + "-auth-2", Provider: "claude"}
-
 	// Auth selection requires that the global model registry knows each credential supports the model.
 	reg := registry.GetGlobalRegistry()
-	reg.RegisterClient(auth1.ID, "claude", []*registry.ModelInfo{{ID: "test-model"}})
-	reg.RegisterClient(auth2.ID, "claude", []*registry.ModelInfo{{ID: "test-model"}})
+	baseID := uuid.NewString()
+	authIDs := make([]string, 0, authCount)
+	for i := 0; i < authCount; i++ {
+		authID := fmt.Sprintf("%s-auth-%d", baseID, i+1)
+		authIDs = append(authIDs, authID)
+		reg.RegisterClient(authID, "claude", []*registry.ModelInfo{{ID: "test-model"}})
+	}
 	t.Cleanup(func() {
-		reg.UnregisterClient(auth1.ID)
-		reg.UnregisterClient(auth2.ID)
+		for _, authID := range authIDs {
+			reg.UnregisterClient(authID)
+		}
 	})
 
-	if _, errRegister := m.Register(context.Background(), auth1); errRegister != nil {
-		t.Fatalf("register auth1: %v", errRegister)
-	}
-	if _, errRegister := m.Register(context.Background(), auth2); errRegister != nil {
-		t.Fatalf("register auth2: %v", errRegister)
+	for _, authID := range authIDs {
+		if _, errRegister := m.Register(context.Background(), &Auth{ID: authID, Provider: "claude"}); errRegister != nil {
+			t.Fatalf("register %s: %v", authID, errRegister)
+		}
 	}
 
 	return m, executor
@@ -332,6 +520,18 @@ func TestManager_MaxRetryCredentials_LimitsCrossCredentialRetries(t *testing.T) 
 				t.Fatalf("expected 2 calls with max-retry-credentials=0, got %d", calls)
 			}
 		})
+	}
+}
+
+func TestManager_MaxRetryCredentialsZeroKeepsTryingAllAvailableCredentials(t *testing.T) {
+	request := cliproxyexecutor.Request{Model: "test-model"}
+	manager, executor := newCredentialRetryLimitTestManagerWithAuthCount(t, 0, 6)
+
+	if _, errExecute := manager.Execute(context.Background(), []string{"claude"}, request, cliproxyexecutor.Options{}); errExecute == nil {
+		t.Fatalf("expected error for unlimited retry execution")
+	}
+	if calls := executor.Calls(); calls != 6 {
+		t.Fatalf("expected 6 calls with max-retry-credentials=0, got %d", calls)
 	}
 }
 
@@ -479,6 +679,126 @@ func TestManagerExecuteStream_ModelSupportBadRequestFallsBackAndSuspendsAuth(t *
 	}
 	if state.NextRetryAfter.IsZero() {
 		t.Fatalf("expected bad auth model state cooldown to be set")
+	}
+}
+
+func TestManagerExecute_RandomRetryDropsToLowerPriority(t *testing.T) {
+	m := NewManager(nil, &RandomSelector{}, nil)
+	m.SetRetryConfig(0, 0, 2)
+
+	executor := &authFallbackExecutor{
+		id: "claude",
+		executeErrors: map[string]error{
+			"high-a": &Error{HTTPStatus: http.StatusTooManyRequests, Message: "high-a exhausted"},
+			"high-b": &Error{HTTPStatus: http.StatusTooManyRequests, Message: "high-b exhausted"},
+		},
+	}
+	m.RegisterExecutor(executor)
+
+	auths := []*Auth{
+		{ID: "high-a", Provider: "claude", Attributes: map[string]string{"priority": "10"}},
+		{ID: "high-b", Provider: "claude", Attributes: map[string]string{"priority": "10"}},
+		{ID: "low", Provider: "claude", Attributes: map[string]string{"priority": "0"}},
+	}
+	for _, auth := range auths {
+		if _, errRegister := m.Register(context.Background(), auth); errRegister != nil {
+			t.Fatalf("register auth %q: %v", auth.ID, errRegister)
+		}
+	}
+
+	resp, errExecute := m.Execute(context.Background(), []string{"claude"}, cliproxyexecutor.Request{}, cliproxyexecutor.Options{})
+	if errExecute != nil {
+		t.Fatalf("Execute() error = %v", errExecute)
+	}
+	if string(resp.Payload) != "low" {
+		t.Fatalf("Execute() payload = %q, want %q", string(resp.Payload), "low")
+	}
+
+	got := executor.ExecuteCalls()
+	if len(got) != 2 {
+		t.Fatalf("execute calls = %v, want exactly 2 calls", got)
+	}
+	if got[0] == "low" {
+		t.Fatalf("first execute call = %q, want a highest-priority auth", got[0])
+	}
+	if got[1] != "low" {
+		t.Fatalf("second execute call = %q, want %q", got[1], "low")
+	}
+}
+
+func TestManagerExecute_RandomRetryDoesNotDropPriorityWhenAuthHasNoExecutableModels(t *testing.T) {
+	m := NewManager(nil, &RandomSelector{rnd: rand.New(rand.NewPCG(1, 1))}, nil)
+	m.SetRetryConfig(0, 0, 2)
+	m.SetOAuthModelAlias(map[string][]internalconfig.OAuthModelAlias{
+		"claude": {
+			{Name: "upstream-model", Alias: "route-model"},
+		},
+	})
+
+	executor := &authFallbackExecutor{id: "claude"}
+	m.RegisterExecutor(executor)
+
+	blockedUntil := time.Now().Add(5 * time.Minute)
+	auths := []*Auth{
+		{
+			ID:       "high-empty",
+			Provider: "claude",
+			Attributes: map[string]string{
+				"priority": "10",
+			},
+			ModelStates: map[string]*ModelState{
+				"upstream-model": {
+					Unavailable:    true,
+					Status:         StatusError,
+					NextRetryAfter: blockedUntil,
+				},
+			},
+		},
+		{
+			ID:       "high-good",
+			Provider: "claude",
+			Attributes: map[string]string{
+				"priority": "10",
+			},
+		},
+		{
+			ID:       "low",
+			Provider: "claude",
+			Attributes: map[string]string{
+				"priority": "0",
+			},
+		},
+	}
+	reg := registry.GetGlobalRegistry()
+	for _, auth := range auths {
+		if _, errRegister := m.Register(context.Background(), auth); errRegister != nil {
+			t.Fatalf("register auth %q: %v", auth.ID, errRegister)
+		}
+		reg.RegisterClient(auth.ID, "claude", []*registry.ModelInfo{{ID: "upstream-model"}})
+	}
+	t.Cleanup(func() {
+		for _, auth := range auths {
+			reg.UnregisterClient(auth.ID)
+		}
+	})
+
+	resp, errExecute := m.Execute(context.Background(), []string{"claude"}, cliproxyexecutor.Request{Model: "route-model"}, cliproxyexecutor.Options{})
+	if errExecute != nil {
+		t.Fatalf("Execute() error = %v", errExecute)
+	}
+	if string(resp.Payload) != "high-good" {
+		t.Fatalf("Execute() payload = %q, want %q", string(resp.Payload), "high-good")
+	}
+
+	got := executor.ExecuteCalls()
+	want := []string{"high-good"}
+	if len(got) != len(want) {
+		t.Fatalf("execute calls = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("execute call %d = %q, want %q", i, got[i], want[i])
+		}
 	}
 }
 

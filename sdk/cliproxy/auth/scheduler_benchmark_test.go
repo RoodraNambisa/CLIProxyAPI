@@ -214,3 +214,48 @@ func BenchmarkManagerPickNextAndMarkResult1000(b *testing.B) {
 		manager.MarkResult(ctx, Result{AuthID: auth.ID, Provider: "gemini", Model: model, Success: true})
 	}
 }
+
+func BenchmarkManagerPickNextParallel1000(b *testing.B) {
+	manager, _, model := benchmarkManagerSetup(b, 1000, false, false)
+	ctx := context.Background()
+	opts := cliproxyexecutor.Options{}
+	tried := map[string]struct{}{}
+	if _, _, errWarm := manager.pickNext(ctx, "gemini", model, opts, tried); errWarm != nil {
+		b.Fatalf("warmup pickNext error = %v", errWarm)
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		localTried := map[string]struct{}{}
+		for pb.Next() {
+			auth, exec, errPick := manager.pickNext(ctx, "gemini", model, opts, localTried)
+			if errPick != nil || auth == nil || exec == nil {
+				b.Fatalf("pickNext failed: auth=%v exec=%v err=%v", auth, exec, errPick)
+			}
+		}
+	})
+}
+
+func BenchmarkManagerPickNextAndMarkResultParallel1000(b *testing.B) {
+	manager, _, model := benchmarkManagerSetup(b, 1000, false, false)
+	ctx := context.Background()
+	opts := cliproxyexecutor.Options{}
+	tried := map[string]struct{}{}
+	if _, _, errWarm := manager.pickNext(ctx, "gemini", model, opts, tried); errWarm != nil {
+		b.Fatalf("warmup pickNext error = %v", errWarm)
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		localTried := map[string]struct{}{}
+		for pb.Next() {
+			auth, _, errPick := manager.pickNext(ctx, "gemini", model, opts, localTried)
+			if errPick != nil || auth == nil {
+				b.Fatalf("pickNext failed: auth=%v err=%v", auth, errPick)
+			}
+			manager.MarkResult(ctx, Result{AuthID: auth.ID, Provider: "gemini", Model: model, Success: true})
+		}
+	})
+}

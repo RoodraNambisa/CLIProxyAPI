@@ -1013,12 +1013,18 @@ func (h *Handler) buildAuthFromFileData(path string, data []byte) (*coreauth.Aut
 		"path":   path,
 		"source": path,
 	}
+	disabled, _ := metadata["disabled"].(bool)
+	status := coreauth.StatusActive
+	if disabled {
+		status = coreauth.StatusDisabled
+	}
 	auth := &coreauth.Auth{
 		ID:         authID,
 		Provider:   provider,
 		FileName:   filepath.Base(path),
 		Label:      label,
-		Status:     coreauth.StatusActive,
+		Status:     status,
+		Disabled:   disabled,
 		Attributes: attr,
 		Metadata:   metadata,
 		CreatedAt:  time.Now(),
@@ -1026,6 +1032,9 @@ func (h *Handler) buildAuthFromFileData(path string, data []byte) (*coreauth.Aut
 	}
 	if hasLastRefresh {
 		auth.LastRefreshedAt = lastRefresh
+	}
+	if err := coreauth.SetCanonicalSourceHashAttribute(auth); err != nil {
+		return nil, fmt.Errorf("failed to canonicalize auth metadata: %w", err)
 	}
 	if h != nil && h.authManager != nil {
 		if existing, ok := h.authManager.GetByID(authID); ok {
@@ -1106,15 +1115,51 @@ func (h *Handler) PatchAuthFileStatus(c *gin.Context) {
 	if *req.Disabled {
 		targetAuth.Status = coreauth.StatusDisabled
 		targetAuth.StatusMessage = "disabled via management API"
+		if targetAuth.Metadata == nil {
+			targetAuth.Metadata = make(map[string]any)
+		}
+		targetAuth.Metadata["disabled"] = true
 	} else {
+		now := time.Now()
 		targetAuth.Status = coreauth.StatusActive
 		targetAuth.StatusMessage = ""
+		targetAuth.Unavailable = false
+		targetAuth.NextRetryAfter = time.Time{}
+		targetAuth.LastError = nil
+		targetAuth.Quota = coreauth.QuotaState{}
+		for _, state := range targetAuth.ModelStates {
+			if state == nil {
+				continue
+			}
+			state.Status = coreauth.StatusActive
+			state.StatusMessage = ""
+			state.Unavailable = false
+			state.NextRetryAfter = time.Time{}
+			state.LastError = nil
+			state.Quota = coreauth.QuotaState{}
+			state.UpdatedAt = now
+		}
+		if targetAuth.Metadata != nil {
+			delete(targetAuth.Metadata, "disabled")
+			for key := range targetAuth.Metadata {
+				if strings.HasPrefix(key, "auth_maintenance_") {
+					delete(targetAuth.Metadata, key)
+				}
+			}
+		}
 	}
 	targetAuth.UpdatedAt = time.Now()
 
-	if _, err := h.authManager.Update(ctx, targetAuth); err != nil {
+	updateCtx := ctx
+	if !*req.Disabled {
+		updateCtx = coreauth.WithSkipStateCarryForward(updateCtx)
+	}
+	if _, err := h.authManager.Update(updateCtx, targetAuth); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to update auth: %v", err)})
 		return
+	}
+	if h.authStatusHook != nil {
+		h.authStatusHook(ctx, targetAuth.Clone())
 	}
 
 	c.JSON(http.StatusOK, gin.H{"status": "ok", "disabled": *req.Disabled})
@@ -1328,7 +1373,9 @@ func (h *Handler) disableAuth(ctx context.Context, id string) {
 		auth.Status = coreauth.StatusDisabled
 		auth.StatusMessage = "removed via management API"
 		auth.UpdatedAt = time.Now()
-		_, _ = h.authManager.Update(ctx, auth)
+		if _, err := h.authManager.Update(ctx, auth); err != nil {
+			log.Errorf("failed to disable auth %s: %v", id, err)
+		}
 		return
 	}
 	authID := h.authIDForPath(id)
@@ -1340,7 +1387,9 @@ func (h *Handler) disableAuth(ctx context.Context, id string) {
 		auth.Status = coreauth.StatusDisabled
 		auth.StatusMessage = "removed via management API"
 		auth.UpdatedAt = time.Now()
-		_, _ = h.authManager.Update(ctx, auth)
+		if _, err := h.authManager.Update(ctx, auth); err != nil {
+			log.Errorf("failed to disable auth %s: %v", authID, err)
+		}
 	}
 }
 

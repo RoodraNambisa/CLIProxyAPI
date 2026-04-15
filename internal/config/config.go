@@ -20,7 +20,7 @@ import (
 )
 
 const (
-	DefaultPanelGitHubRepository = "https://github.com/router-for-me/Cli-Proxy-API-Management-Center"
+	DefaultPanelGitHubRepository = "https://github.com/RoodraNambisa/Cli-Proxy-API-Management-Center"
 	DefaultPprofAddr             = "127.0.0.1:8316"
 )
 
@@ -65,6 +65,10 @@ type Config struct {
 	// UsageStatisticsEnabled toggles in-memory usage aggregation; when false, usage data is discarded.
 	UsageStatisticsEnabled bool `yaml:"usage-statistics-enabled" json:"usage-statistics-enabled"`
 
+	// UsageStatisticsPersistIntervalSeconds controls how often usage statistics
+	// are flushed to disk automatically. Set to 0 to disable periodic persistence.
+	UsageStatisticsPersistIntervalSeconds int `yaml:"usage-statistics-persist-interval-seconds" json:"usage-statistics-persist-interval-seconds"`
+
 	// DisableCooling disables quota cooldown scheduling when true.
 	DisableCooling bool `yaml:"disable-cooling" json:"disable-cooling"`
 
@@ -82,6 +86,9 @@ type Config struct {
 
 	// QuotaExceeded defines the behavior when a quota is exceeded.
 	QuotaExceeded QuotaExceeded `yaml:"quota-exceeded" json:"quota-exceeded"`
+
+	// AuthMaintenance controls optional background handling of broken or exhausted auth files.
+	AuthMaintenance AuthMaintenanceConfig `yaml:"auth-maintenance" json:"auth-maintenance"`
 
 	// Routing controls credential selection behavior.
 	Routing RoutingConfig `yaml:"routing" json:"routing"`
@@ -211,10 +218,31 @@ type QuotaExceeded struct {
 	AntigravityCredits bool `yaml:"antigravity-credits" json:"antigravity-credits"`
 }
 
+// AuthMaintenanceConfig controls optional background handling of auth files
+// that repeatedly fail with terminal or quota-related errors.
+type AuthMaintenanceConfig struct {
+	// Enable starts the background maintenance queue when true.
+	Enable bool `yaml:"enable" json:"enable"`
+	// ScanIntervalSeconds defines how often the runtime auth set is scanned for delete candidates.
+	ScanIntervalSeconds int `yaml:"scan-interval-seconds" json:"scan-interval-seconds"`
+	// DeleteIntervalSeconds defines the stagger interval between queued deletions.
+	DeleteIntervalSeconds int `yaml:"delete-interval-seconds" json:"delete-interval-seconds"`
+	// DeleteStatusCodes defines HTTP status codes that should trigger deletion immediately.
+	DeleteStatusCodes []int `yaml:"delete-status-codes" json:"delete-status-codes"`
+	// DeleteQuotaExceeded enables deletion for auths that repeatedly hit quota limits.
+	DeleteQuotaExceeded bool `yaml:"delete-quota-exceeded" json:"delete-quota-exceeded"`
+	// QuotaStrikeThreshold is the minimum number of 429 hits required before the delete path triggers.
+	QuotaStrikeThreshold int `yaml:"quota-strike-threshold" json:"quota-strike-threshold"`
+	// DisableQuotaExceeded enables disable-only handling for auths that repeatedly hit quota limits.
+	DisableQuotaExceeded bool `yaml:"disable-quota-exceeded" json:"disable-quota-exceeded"`
+	// DisableQuotaStrikeThreshold is the minimum number of 429 hits required before the disable-only path triggers.
+	DisableQuotaStrikeThreshold int `yaml:"disable-quota-strike-threshold" json:"disable-quota-strike-threshold"`
+}
+
 // RoutingConfig configures how credentials are selected for requests.
 type RoutingConfig struct {
 	// Strategy selects the credential selection strategy.
-	// Supported values: "round-robin" (default), "fill-first".
+	// Supported values: "round-robin" (default), "fill-first", "random".
 	Strategy string `yaml:"strategy,omitempty" json:"strategy,omitempty"`
 }
 

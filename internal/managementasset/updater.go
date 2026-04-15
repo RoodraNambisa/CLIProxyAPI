@@ -25,13 +25,13 @@ import (
 )
 
 const (
-	defaultManagementReleaseURL  = "https://api.github.com/repos/router-for-me/Cli-Proxy-API-Management-Center/releases/latest"
-	defaultManagementFallbackURL = "https://cpamc.router-for.me/"
+	defaultManagementReleaseURL  = "https://api.github.com/repos/RoodraNambisa/Cli-Proxy-API-Management-Center/releases/latest"
+	defaultManagementFallbackURL = ""
 	managementAssetName          = "management.html"
 	httpUserAgent                = "CLIProxyAPI-management-updater"
 	managementSyncMinInterval    = 30 * time.Second
 	updateCheckInterval          = 3 * time.Hour
-	maxAssetDownloadSize         = 50 << 20 // 10 MB safety limit for management asset downloads
+	maxAssetDownloadSize         = 10 << 20 // 10 MB safety limit for management asset downloads
 )
 
 // ManagementFileName exposes the control panel asset filename.
@@ -282,6 +282,10 @@ func EnsureLatestManagementHTML(ctx context.Context, staticDir string, proxyURL 
 }
 
 func ensureFallbackManagementHTML(ctx context.Context, client *http.Client, localPath string) bool {
+	if strings.TrimSpace(defaultManagementFallbackURL) == "" {
+		log.Debug("management asset fallback download skipped: no fallback URL configured")
+		return false
+	}
 	data, downloadedHash, err := downloadAsset(ctx, client, defaultManagementFallbackURL)
 	if err != nil {
 		log.WithError(err).Warn("failed to download fallback management control panel page")
@@ -399,6 +403,9 @@ func downloadAsset(ctx context.Context, client *http.Client, downloadURL string)
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
 		return nil, "", fmt.Errorf("unexpected download status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	if resp.ContentLength > maxAssetDownloadSize {
+		return nil, "", fmt.Errorf("download exceeds maximum allowed size of %d bytes", maxAssetDownloadSize)
 	}
 
 	data, err := io.ReadAll(io.LimitReader(resp.Body, maxAssetDownloadSize+1))

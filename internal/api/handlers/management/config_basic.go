@@ -260,7 +260,7 @@ func (h *Handler) GetRequestRetry(c *gin.Context) {
 	c.JSON(200, gin.H{"request-retry": h.cfg.RequestRetry})
 }
 func (h *Handler) PutRequestRetry(c *gin.Context) {
-	h.updateIntField(c, func(v int) { h.cfg.RequestRetry = v })
+	h.updateIntFieldNormalized(c, clampNonNegativeInt, func(v int) { h.cfg.RequestRetry = v })
 }
 
 // Max retry interval
@@ -268,7 +268,7 @@ func (h *Handler) GetMaxRetryInterval(c *gin.Context) {
 	c.JSON(200, gin.H{"max-retry-interval": h.cfg.MaxRetryInterval})
 }
 func (h *Handler) PutMaxRetryInterval(c *gin.Context) {
-	h.updateIntField(c, func(v int) { h.cfg.MaxRetryInterval = v })
+	h.updateIntFieldNormalized(c, clampNonNegativeInt, func(v int) { h.cfg.MaxRetryInterval = v })
 }
 
 // ForceModelPrefix
@@ -286,9 +286,18 @@ func normalizeRoutingStrategy(strategy string) (string, bool) {
 		return "round-robin", true
 	case "fill-first", "fillfirst", "ff":
 		return "fill-first", true
+	case "random", "rand", "r":
+		return "random", true
 	default:
 		return "", false
 	}
+}
+
+func clampNonNegativeInt(value int) int {
+	if value < 0 {
+		return 0
+	}
+	return value
 }
 
 // RoutingStrategy

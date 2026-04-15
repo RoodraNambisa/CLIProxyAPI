@@ -15,6 +15,7 @@ import (
 	"sync"
 	"time"
 
+	internalauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 )
 
@@ -65,27 +66,29 @@ func (s *FileTokenStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (str
 		return "", fmt.Errorf("auth filestore: create dir failed: %w", err)
 	}
 
-	// metadataSetter is a private interface for TokenStorage implementations that support metadata injection.
-	type metadataSetter interface {
-		SetMetadata(map[string]any)
-	}
-
 	switch {
 	case auth.Storage != nil:
-		if setter, ok := auth.Storage.(metadataSetter); ok {
-			setter.SetMetadata(auth.Metadata)
+		if setter, ok := auth.Storage.(internalauth.MetadataSetter); ok {
+			setter.SetMetadata(cliproxyauth.MetadataWithDisabled(auth))
 		}
 		if err = auth.Storage.SaveTokenToFile(path); err != nil {
 			return "", err
 		}
+		data, errRead := os.ReadFile(path)
+		if errRead != nil {
+			return "", fmt.Errorf("auth filestore: read persisted storage auth failed: %w", errRead)
+		}
+		if errSync := cliproxyauth.SyncPersistedMetadataAndSourceHash(auth, data); errSync != nil {
+			return "", fmt.Errorf("auth filestore: sync persisted storage auth failed: %w", errSync)
+		}
 	case auth.Metadata != nil:
-		auth.Metadata["disabled"] = auth.Disabled
-		raw, errMarshal := json.Marshal(auth.Metadata)
+		raw, errMarshal := cliproxyauth.CanonicalMetadataBytes(auth)
 		if errMarshal != nil {
-			return "", fmt.Errorf("auth filestore: marshal metadata failed: %w", errMarshal)
+			return "", fmt.Errorf("auth filestore: canonicalize metadata failed: %w", errMarshal)
 		}
 		if existing, errRead := os.ReadFile(path); errRead == nil {
 			if jsonEqual(existing, raw) {
+				cliproxyauth.SetSourceHashAttribute(auth, raw)
 				return path, nil
 			}
 			file, errOpen := os.OpenFile(path, os.O_WRONLY|os.O_TRUNC, 0o600)
@@ -99,6 +102,7 @@ func (s *FileTokenStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (str
 			if errClose := file.Close(); errClose != nil {
 				return "", fmt.Errorf("auth filestore: close existing failed: %w", errClose)
 			}
+			cliproxyauth.SetSourceHashAttribute(auth, raw)
 			return path, nil
 		} else if !os.IsNotExist(errRead) {
 			return "", fmt.Errorf("auth filestore: read existing failed: %w", errRead)
@@ -106,6 +110,7 @@ func (s *FileTokenStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (str
 		if errWrite := os.WriteFile(path, raw, 0o600); errWrite != nil {
 			return "", fmt.Errorf("auth filestore: write file failed: %w", errWrite)
 		}
+		cliproxyauth.SetSourceHashAttribute(auth, raw)
 	default:
 		return "", fmt.Errorf("auth filestore: nothing to persist for %s", auth.ID)
 	}
@@ -250,6 +255,9 @@ func (s *FileTokenStore) readAuthFile(path, baseDir string) (*cliproxyauth.Auth,
 		UpdatedAt:        info.ModTime(),
 		LastRefreshedAt:  time.Time{},
 		NextRefreshAfter: time.Time{},
+	}
+	if errHash := cliproxyauth.SetCanonicalSourceHashAttribute(auth); errHash != nil {
+		return nil, fmt.Errorf("canonicalize auth metadata: %w", errHash)
 	}
 	if email, ok := metadata["email"].(string); ok && email != "" {
 		auth.Attributes["email"] = email

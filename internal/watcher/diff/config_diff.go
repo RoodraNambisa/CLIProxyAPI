@@ -39,6 +39,9 @@ func BuildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 	if oldCfg.UsageStatisticsEnabled != newCfg.UsageStatisticsEnabled {
 		changes = append(changes, fmt.Sprintf("usage-statistics-enabled: %t -> %t", oldCfg.UsageStatisticsEnabled, newCfg.UsageStatisticsEnabled))
 	}
+	if oldCfg.UsageStatisticsPersistIntervalSeconds != newCfg.UsageStatisticsPersistIntervalSeconds {
+		changes = append(changes, fmt.Sprintf("usage-statistics-persist-interval-seconds: %d -> %d", oldCfg.UsageStatisticsPersistIntervalSeconds, newCfg.UsageStatisticsPersistIntervalSeconds))
+	}
 	if oldCfg.DisableCooling != newCfg.DisableCooling {
 		changes = append(changes, fmt.Sprintf("disable-cooling: %t -> %t", oldCfg.DisableCooling, newCfg.DisableCooling))
 	}
@@ -82,6 +85,31 @@ func BuildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 	}
 	if oldCfg.QuotaExceeded.AntigravityCredits != newCfg.QuotaExceeded.AntigravityCredits {
 		changes = append(changes, fmt.Sprintf("quota-exceeded.antigravity-credits: %t -> %t", oldCfg.QuotaExceeded.AntigravityCredits, newCfg.QuotaExceeded.AntigravityCredits))
+	}
+
+	if oldCfg.AuthMaintenance.Enable != newCfg.AuthMaintenance.Enable {
+		changes = append(changes, fmt.Sprintf("auth-maintenance.enable: %t -> %t", oldCfg.AuthMaintenance.Enable, newCfg.AuthMaintenance.Enable))
+	}
+	if oldCfg.AuthMaintenance.ScanIntervalSeconds != newCfg.AuthMaintenance.ScanIntervalSeconds {
+		changes = append(changes, fmt.Sprintf("auth-maintenance.scan-interval-seconds: %d -> %d", oldCfg.AuthMaintenance.ScanIntervalSeconds, newCfg.AuthMaintenance.ScanIntervalSeconds))
+	}
+	if oldCfg.AuthMaintenance.DeleteIntervalSeconds != newCfg.AuthMaintenance.DeleteIntervalSeconds {
+		changes = append(changes, fmt.Sprintf("auth-maintenance.delete-interval-seconds: %d -> %d", oldCfg.AuthMaintenance.DeleteIntervalSeconds, newCfg.AuthMaintenance.DeleteIntervalSeconds))
+	}
+	if !reflect.DeepEqual(oldCfg.AuthMaintenance.DeleteStatusCodes, newCfg.AuthMaintenance.DeleteStatusCodes) {
+		changes = append(changes, "auth-maintenance.delete-status-codes: updated")
+	}
+	if oldCfg.AuthMaintenance.DeleteQuotaExceeded != newCfg.AuthMaintenance.DeleteQuotaExceeded {
+		changes = append(changes, fmt.Sprintf("auth-maintenance.delete-quota-exceeded: %t -> %t", oldCfg.AuthMaintenance.DeleteQuotaExceeded, newCfg.AuthMaintenance.DeleteQuotaExceeded))
+	}
+	if oldCfg.AuthMaintenance.QuotaStrikeThreshold != newCfg.AuthMaintenance.QuotaStrikeThreshold {
+		changes = append(changes, fmt.Sprintf("auth-maintenance.quota-strike-threshold: %d -> %d", oldCfg.AuthMaintenance.QuotaStrikeThreshold, newCfg.AuthMaintenance.QuotaStrikeThreshold))
+	}
+	if oldCfg.AuthMaintenance.DisableQuotaExceeded != newCfg.AuthMaintenance.DisableQuotaExceeded {
+		changes = append(changes, fmt.Sprintf("auth-maintenance.disable-quota-exceeded: %t -> %t", oldCfg.AuthMaintenance.DisableQuotaExceeded, newCfg.AuthMaintenance.DisableQuotaExceeded))
+	}
+	if oldCfg.AuthMaintenance.DisableQuotaStrikeThreshold != newCfg.AuthMaintenance.DisableQuotaStrikeThreshold {
+		changes = append(changes, fmt.Sprintf("auth-maintenance.disable-quota-strike-threshold: %d -> %d", oldCfg.AuthMaintenance.DisableQuotaStrikeThreshold, newCfg.AuthMaintenance.DisableQuotaStrikeThreshold))
 	}
 
 	if oldCfg.Routing.Strategy != newCfg.Routing.Strategy {

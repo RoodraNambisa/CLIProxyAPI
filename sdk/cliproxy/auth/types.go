@@ -20,6 +20,10 @@ import (
 // Auth record (e.g., injecting metadata) based on external context.
 type PostAuthHook func(context.Context, *Auth) error
 
+// AuthStatusHook defines a callback invoked after a management status change
+// updates an Auth record in the runtime manager.
+type AuthStatusHook func(context.Context, *Auth)
+
 // RequestInfo holds information extracted from the HTTP request.
 // It is injected into the context passed to PostAuthHook.
 type RequestInfo struct {
@@ -28,6 +32,91 @@ type RequestInfo struct {
 }
 
 type requestInfoKey struct{}
+
+const (
+	// SourceHashAttributeKey stores a synthesized content fingerprint for file-backed auths.
+	SourceHashAttributeKey = "_source_hash"
+)
+
+// SourceHashFromBytes returns the stable content hash used to detect auth file replacements.
+func SourceHashFromBytes(data []byte) string {
+	if len(data) == 0 {
+		return ""
+	}
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:])
+}
+
+// SetSourceHashAttribute stores a stable file-content hash on the auth attributes.
+func SetSourceHashAttribute(auth *Auth, data []byte) {
+	if auth == nil {
+		return
+	}
+	hash := SourceHashFromBytes(data)
+	if hash == "" {
+		return
+	}
+	if auth.Attributes == nil {
+		auth.Attributes = make(map[string]string)
+	}
+	auth.Attributes[SourceHashAttributeKey] = hash
+}
+
+// CanonicalMetadataBytes returns the canonical serialized metadata used for
+// file-backed auth persistence and source hash generation.
+func CanonicalMetadataBytes(auth *Auth) ([]byte, error) {
+	if auth == nil || auth.Metadata == nil {
+		return nil, nil
+	}
+	metadata := MetadataWithDisabled(auth)
+	if metadata == nil {
+		return nil, nil
+	}
+	return json.Marshal(metadata)
+}
+
+// MetadataWithDisabled clones runtime metadata and injects the current disabled
+// flag so persistence and source hashes use a consistent payload.
+func MetadataWithDisabled(auth *Auth) map[string]any {
+	if auth == nil || auth.Metadata == nil {
+		return nil
+	}
+	metadata := make(map[string]any, len(auth.Metadata)+1)
+	for key, value := range auth.Metadata {
+		metadata[key] = value
+	}
+	metadata["disabled"] = auth.Disabled
+	return metadata
+}
+
+// SetCanonicalSourceHashAttribute stores a source hash derived from the
+// canonical serialized metadata representation.
+func SetCanonicalSourceHashAttribute(auth *Auth) error {
+	raw, err := CanonicalMetadataBytes(auth)
+	if err != nil {
+		return err
+	}
+	SetSourceHashAttribute(auth, raw)
+	return nil
+}
+
+// SyncPersistedMetadataAndSourceHash updates the runtime auth from a persisted
+// auth file payload so metadata-backed comparisons use the same canonical source
+// hash as subsequent reloads from disk.
+func SyncPersistedMetadataAndSourceHash(auth *Auth, data []byte) error {
+	if auth == nil {
+		return nil
+	}
+	metadata := make(map[string]any)
+	if err := json.Unmarshal(data, &metadata); err != nil {
+		return err
+	}
+	auth.Metadata = metadata
+	if disabled, ok := metadata["disabled"].(bool); ok {
+		auth.Disabled = disabled
+	}
+	return SetCanonicalSourceHashAttribute(auth)
+}
 
 // WithRequestInfo returns a new context with the given RequestInfo attached.
 func WithRequestInfo(ctx context.Context, info *RequestInfo) context.Context {
@@ -105,6 +194,8 @@ type QuotaState struct {
 	NextRecoverAt time.Time `json:"next_recover_at"`
 	// BackoffLevel stores the progressive cooldown exponent used for rate limits.
 	BackoffLevel int `json:"backoff_level,omitempty"`
+	// StrikeCount stores the number of observed 429 responses since the last success.
+	StrikeCount int `json:"strike_count,omitempty"`
 }
 
 // ModelState captures the execution state for a specific model under an auth entry.

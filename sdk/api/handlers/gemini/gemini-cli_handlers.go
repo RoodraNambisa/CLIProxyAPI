@@ -23,6 +23,47 @@ import (
 	"github.com/tidwall/gjson"
 )
 
+func geminiCLIRequestAllowed(req *http.Request) bool {
+	if req == nil {
+		return false
+	}
+	return geminiCLIRemoteAddrAllowed(req.RemoteAddr) && geminiCLIHostAllowed(req.Host)
+}
+
+func geminiCLIRemoteAddrAllowed(remoteAddr string) bool {
+	host := strings.TrimSpace(remoteAddr)
+	if parsedHost, _, errSplitHostPort := net.SplitHostPort(host); errSplitHostPort == nil {
+		host = parsedHost
+	}
+	host = strings.Trim(strings.TrimSpace(host), "[]")
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+func geminiCLIHostAllowed(host string) bool {
+	normalizedHost := normalizeGeminiCLIHost(host)
+	if normalizedHost == "" {
+		return false
+	}
+	if normalizedHost == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(normalizedHost)
+	return ip != nil && ip.IsLoopback()
+}
+
+func normalizeGeminiCLIHost(host string) string {
+	host = strings.TrimSpace(host)
+	if host == "" {
+		return ""
+	}
+	if parsedHost, _, errSplitHostPort := net.SplitHostPort(host); errSplitHostPort == nil {
+		host = parsedHost
+	}
+	host = strings.Trim(strings.TrimSpace(host), "[]")
+	return strings.ToLower(host)
+}
+
 // GeminiCLIAPIHandler contains the handlers for Gemini CLI API endpoints.
 // It holds a pool of clients to interact with the backend service.
 type GeminiCLIAPIHandler struct {
@@ -60,13 +101,7 @@ func (h *GeminiCLIAPIHandler) CLIHandler(c *gin.Context) {
 		return
 	}
 
-	requestHost := c.Request.Host
-	requestHostname := requestHost
-	if hostname, _, errSplitHostPort := net.SplitHostPort(requestHost); errSplitHostPort == nil {
-		requestHostname = hostname
-	}
-
-	if !strings.HasPrefix(c.Request.RemoteAddr, "127.0.0.1:") || requestHostname != "127.0.0.1" {
+	if !geminiCLIRequestAllowed(c.Request) {
 		c.JSON(http.StatusForbidden, handlers.ErrorResponse{
 			Error: handlers.ErrorDetail{
 				Message: "CLI reply only allow local access",

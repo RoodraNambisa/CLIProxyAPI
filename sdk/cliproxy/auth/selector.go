@@ -29,6 +29,13 @@ type RoundRobinSelector struct {
 // rolling-window subscription caps (e.g. chat message limits).
 type FillFirstSelector struct{}
 
+// RandomSelector selects a random credential from the active priority tier.
+// Retry attempts can opt into lower-priority tiers via selection metadata.
+type RandomSelector struct {
+	mu  sync.Mutex
+	rnd *rand.Rand
+}
+
 type blockReason int
 
 const (
@@ -211,7 +218,107 @@ func collectAvailableByPriority(auths []*Auth, model string, now time.Time) (ava
 	return available, cooldownCount, earliest
 }
 
-func getAvailableAuths(auths []*Auth, provider, model string, now time.Time) ([]*Auth, error) {
+func selectionAttemptFromMetadata(meta map[string]any) int {
+	if len(meta) == 0 {
+		return 0
+	}
+	raw, ok := meta[cliproxyexecutor.SelectionAttemptMetadataKey]
+	if !ok || raw == nil {
+		return 0
+	}
+	switch value := raw.(type) {
+	case int:
+		if value < 0 {
+			return 0
+		}
+		return value
+	case int8:
+		if value < 0 {
+			return 0
+		}
+		return int(value)
+	case int16:
+		if value < 0 {
+			return 0
+		}
+		return int(value)
+	case int32:
+		if value < 0 {
+			return 0
+		}
+		return int(value)
+	case int64:
+		if value < 0 {
+			return 0
+		}
+		return int(value)
+	case uint:
+		return int(value)
+	case uint8:
+		return int(value)
+	case uint16:
+		return int(value)
+	case uint32:
+		return int(value)
+	case uint64:
+		return int(value)
+	case float32:
+		if value < 0 {
+			return 0
+		}
+		return int(value)
+	case float64:
+		if value < 0 {
+			return 0
+		}
+		return int(value)
+	case string:
+		parsed, err := strconv.Atoi(strings.TrimSpace(value))
+		if err != nil || parsed < 0 {
+			return 0
+		}
+		return parsed
+	default:
+		return 0
+	}
+}
+
+func selectionPriorityForAttempt(priorities []int, attempt int) (int, bool) {
+	if len(priorities) == 0 {
+		return 0, false
+	}
+	if attempt < 0 {
+		attempt = 0
+	}
+	if attempt >= len(priorities) {
+		attempt = len(priorities) - 1
+	}
+	return priorities[attempt], true
+}
+
+func availableAuthsForAttempt(availableByPriority map[int][]*Auth, selectionAttempt int) ([]*Auth, bool) {
+	if len(availableByPriority) == 0 {
+		return nil, false
+	}
+	priorities := make([]int, 0, len(availableByPriority))
+	for priority := range availableByPriority {
+		priorities = append(priorities, priority)
+	}
+	sort.Slice(priorities, func(i, j int) bool {
+		return priorities[i] > priorities[j]
+	})
+	targetPriority, ok := selectionPriorityForAttempt(priorities, selectionAttempt)
+	if !ok {
+		return nil, false
+	}
+	available := append([]*Auth(nil), availableByPriority[targetPriority]...)
+	if len(available) > 1 {
+		sort.Slice(available, func(i, j int) bool { return available[i].ID < available[j].ID })
+	}
+	return available, true
+}
+
+func getAvailableAuths(auths []*Auth, provider, model string, now time.Time, selectionAttempt int) ([]*Auth, error) {
 	if len(auths) == 0 {
 		return nil, &Error{Code: "auth_not_found", Message: "no auth candidates"}
 	}
@@ -232,18 +339,9 @@ func getAvailableAuths(auths []*Auth, provider, model string, now time.Time) ([]
 		return nil, &Error{Code: "auth_unavailable", Message: "no auth available"}
 	}
 
-	bestPriority := 0
-	found := false
-	for priority := range availableByPriority {
-		if !found || priority > bestPriority {
-			bestPriority = priority
-			found = true
-		}
-	}
-
-	available := availableByPriority[bestPriority]
-	if len(available) > 1 {
-		sort.Slice(available, func(i, j int) bool { return available[i].ID < available[j].ID })
+	available, ok := availableAuthsForAttempt(availableByPriority, selectionAttempt)
+	if !ok {
+		return nil, &Error{Code: "auth_unavailable", Message: "no auth available"}
 	}
 	return available, nil
 }
@@ -255,7 +353,7 @@ func getAvailableAuths(auths []*Auth, provider, model string, now time.Time) ([]
 func (s *RoundRobinSelector) Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error) {
 	_ = opts
 	now := time.Now()
-	available, err := getAvailableAuths(auths, provider, model, now)
+	available, err := getAvailableAuths(auths, provider, model, now, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -354,12 +452,40 @@ func groupByVirtualParent(auths []*Auth) (map[string][]*Auth, []string) {
 func (s *FillFirstSelector) Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error) {
 	_ = opts
 	now := time.Now()
-	available, err := getAvailableAuths(auths, provider, model, now)
+	available, err := getAvailableAuths(auths, provider, model, now, 0)
 	if err != nil {
 		return nil, err
 	}
 	available = preferCodexWebsocketAuths(ctx, provider, available)
 	return available[0], nil
+}
+
+func (s *RandomSelector) Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error) {
+	now := time.Now()
+	available, err := getAvailableAuths(auths, provider, model, now, selectionAttemptFromMetadata(opts.Metadata))
+	if err != nil {
+		return nil, err
+	}
+	available = preferCodexWebsocketAuths(ctx, provider, available)
+	if len(available) == 0 {
+		return nil, &Error{Code: "auth_not_found", Message: "no auth available"}
+	}
+	if len(available) == 1 {
+		return available[0], nil
+	}
+	return available[s.intN(len(available))], nil
+}
+
+func (s *RandomSelector) intN(limit int) int {
+	if limit <= 1 {
+		return 0
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.rnd == nil {
+		s.rnd = rand.New(rand.NewPCG(rand.Uint64(), rand.Uint64()))
+	}
+	return s.rnd.IntN(limit)
 }
 
 func isAuthBlockedForModel(auth *Auth, model string, now time.Time) (bool, blockReason, time.Time) {
