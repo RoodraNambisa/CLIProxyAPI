@@ -633,3 +633,66 @@ func TestToolsDefinitionTranslated(t *testing.T) {
 		t.Errorf("tool 'search' not found in output tools: %s", gjson.Get(result, "tools").Raw)
 	}
 }
+
+func TestResponseFormatJSONSchemaIsNormalizedForCodex(t *testing.T) {
+	input := []byte(`{
+		"model": "gpt-5.4-mini",
+		"messages": [
+			{"role": "user", "content": "hello"}
+		],
+		"response_format": {
+			"type": "json_schema",
+			"json_schema": {
+				"name": "trans_schema",
+				"schema": {
+					"type": "object",
+					"properties": {
+						"content": {"type": "string"},
+						"meta": {
+							"type": "object",
+							"properties": {
+								"source_lang": {"type": "string"},
+								"target_lang": {"type": "string"}
+							},
+							"required": ["source_lang"]
+						}
+					},
+					"required": ["content", "ghost"]
+				}
+			}
+		},
+		"tools": [
+			{
+				"type": "function",
+				"function": {
+					"name": "search",
+					"parameters": {
+						"type": "object",
+						"properties": {
+							"query": {"type": "string"},
+							"cursor": {"type": "string"}
+						},
+						"required": ["query"]
+					}
+				}
+			}
+		]
+	}`)
+
+	out := ConvertOpenAIRequestToCodex("gpt-5.4-mini", input, false)
+
+	required := gjson.GetBytes(out, "text.format.schema.required").Array()
+	if len(required) != 2 || required[0].String() != "content" || required[1].String() != "meta" {
+		t.Fatalf("text.format.schema.required = %s, want [content meta]", gjson.GetBytes(out, "text.format.schema.required").Raw)
+	}
+
+	metaRequired := gjson.GetBytes(out, "text.format.schema.properties.meta.required").Array()
+	if len(metaRequired) != 2 || metaRequired[0].String() != "source_lang" || metaRequired[1].String() != "target_lang" {
+		t.Fatalf("text.format.schema.properties.meta.required = %s, want [source_lang target_lang]", gjson.GetBytes(out, "text.format.schema.properties.meta.required").Raw)
+	}
+
+	toolRequired := gjson.GetBytes(out, "tools.0.parameters.required").Array()
+	if len(toolRequired) != 1 || toolRequired[0].String() != "query" {
+		t.Fatalf("tools.0.parameters.required = %s, want [query]", gjson.GetBytes(out, "tools.0.parameters.required").Raw)
+	}
+}
