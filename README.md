@@ -51,12 +51,12 @@
 - 为 CLI 模型提供 OpenAI/Gemini/Claude/Codex 兼容的 API 端点
 - 支持 OpenAI Codex（GPT 系列）OAuth 登录
 - 支持 Claude Code OAuth 登录
-- 支持 iFlow OAuth 登录
 - 支持 Amp CLI 与 IDE 扩展的 provider 路由
 - 支持流式与非流式响应
 - 支持函数调用 / 工具调用
 - 支持多模态输入（文本、图片）
-- 支持多账户与负载均衡
+- 支持 Gemini / AI Studio / Claude Code / OpenAI Codex 多账户负载均衡
+- 支持 Generative Language API Key
 - 支持 OpenAI 兼容上游提供商接入
 - 提供可复用的 Go SDK
 
@@ -167,7 +167,7 @@ Shadow AI 是一款专为受限环境设计的 AI 辅助工具，提供无窗口
 
 ### [ProxyPal](https://github.com/buddingnewinsights/proxypal)
 
-跨平台桌面应用（macOS、Windows、Linux），以原生 GUI 封装 CLIProxyAPI。支持连接 Claude、ChatGPT、Gemini、GitHub Copilot、iFlow 及自定义 OpenAI 兼容端点，具备使用分析、请求监控和热门编程工具自动配置功能。
+跨平台桌面应用（macOS、Windows、Linux），以原生 GUI 封装 CLIProxyAPI。支持连接 Claude、ChatGPT、Gemini、GitHub Copilot 及自定义 OpenAI 兼容端点，具备使用分析、请求监控和热门编程工具自动配置功能，无需手动管理 API Key。
 
 ### [CLIProxyAPI Quota Inspector](https://github.com/AllenReder/CLIProxyAPI-Quota-Inspector)
 
