@@ -65,6 +65,8 @@ type ImagesConfig struct {
 	OverrideUnsupportedParams bool `yaml:"override-unsupported-params,omitempty" json:"override-unsupported-params,omitempty"`
 	// OverrideResponseFormatURL coerces response_format=url to b64_json when set.
 	OverrideResponseFormatURL *bool `yaml:"override-response-format-url,omitempty" json:"override-response-format-url,omitempty"`
+	// ResponseFormatURLDataURL returns data: URLs for response_format=url when set.
+	ResponseFormatURLDataURL *bool `yaml:"response-format-url-data-url,omitempty" json:"response-format-url-data-url,omitempty"`
 	// OverrideTransparentBackground coerces background=transparent to auto when set.
 	OverrideTransparentBackground *bool `yaml:"override-transparent-background,omitempty" json:"override-transparent-background,omitempty"`
 }

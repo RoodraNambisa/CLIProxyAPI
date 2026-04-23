@@ -100,6 +100,7 @@ type imageOutputItem struct {
 	Type          string          `json:"type"`
 	Result        string          `json:"result"`
 	RevisedPrompt string          `json:"revised_prompt,omitempty"`
+	OutputFormat  string          `json:"output_format,omitempty"`
 	Usage         json.RawMessage `json:"usage,omitempty"`
 	InputTokens   json.RawMessage `json:"input_tokens,omitempty"`
 	OutputTokens  json.RawMessage `json:"output_tokens,omitempty"`
@@ -110,8 +111,10 @@ type imageOutputItem struct {
 }
 
 type imageResult struct {
-	B64JSON       string `json:"b64_json"`
+	B64JSON       string `json:"b64_json,omitempty"`
+	URL           string `json:"url,omitempty"`
 	RevisedPrompt string `json:"revised_prompt,omitempty"`
+	OutputFormat  string `json:"-"`
 }
 
 type imagesResponse struct {
@@ -141,11 +144,13 @@ type responsePartialImageEvent struct {
 	Type              string `json:"type"`
 	PartialImageB64   string `json:"partial_image_b64"`
 	PartialImageIndex *int   `json:"partial_image_index,omitempty"`
+	OutputFormat      string `json:"output_format,omitempty"`
 }
 
 type imageStreamEvent struct {
 	Type              string          `json:"type"`
 	B64JSON           string          `json:"b64_json,omitempty"`
+	URL               string          `json:"url,omitempty"`
 	RevisedPrompt     string          `json:"revised_prompt,omitempty"`
 	PartialImageIndex *int            `json:"partial_image_index,omitempty"`
 	Usage             json.RawMessage `json:"usage,omitempty"`
@@ -208,14 +213,15 @@ func (h *OpenAIImagesAPIHandler) handleImagesRequest(c *gin.Context, req openAII
 		h.writeImagesRequestError(c, unsupportedImageErrorf("n > 1 is not supported when images.enable-n-aggregation is false"))
 		return
 	}
+	responseFormat := strings.ToLower(strings.TrimSpace(req.ResponseFormat))
 	if req.Stream {
-		h.handleStreamingImagesResponse(c, rawJSON, codexModel, op, count)
+		h.handleStreamingImagesResponse(c, rawJSON, codexModel, op, count, responseFormat)
 		return
 	}
-	h.handleNonStreamingImagesResponse(c, rawJSON, codexModel, count)
+	h.handleNonStreamingImagesResponse(c, rawJSON, codexModel, count, responseFormat)
 }
 
-func (h *OpenAIImagesAPIHandler) handleNonStreamingImagesResponse(c *gin.Context, rawJSON []byte, codexModel string, count int) {
+func (h *OpenAIImagesAPIHandler) handleNonStreamingImagesResponse(c *gin.Context, rawJSON []byte, codexModel string, count int, responseFormat string) {
 	c.Header("Content-Type", "application/json")
 	var combined imagesResponse
 	var upstreamHeaders http.Header
@@ -246,6 +252,7 @@ func (h *OpenAIImagesAPIHandler) handleNonStreamingImagesResponse(c *gin.Context
 		combined.Usage = mergeImageUsageForNAggregation(combined.Usage, parsed.Usage)
 		cliCancel(resp)
 	}
+	applyImageResponseFormat(&combined, responseFormat)
 	imagesPayload, err := json.Marshal(combined)
 	if err != nil {
 		h.writeImagesError(c, http.StatusInternalServerError, err)
@@ -255,14 +262,14 @@ func (h *OpenAIImagesAPIHandler) handleNonStreamingImagesResponse(c *gin.Context
 	_, _ = c.Writer.Write(imagesPayload)
 }
 
-func (h *OpenAIImagesAPIHandler) handleStreamingImagesResponse(c *gin.Context, rawJSON []byte, codexModel string, op imageOperation, count int) {
+func (h *OpenAIImagesAPIHandler) handleStreamingImagesResponse(c *gin.Context, rawJSON []byte, codexModel string, op imageOperation, count int, responseFormat string) {
 	flusher, ok := c.Writer.(http.Flusher)
 	if !ok {
 		h.writeImagesError(c, http.StatusInternalServerError, errors.New("streaming not supported"))
 		return
 	}
 	if count > 1 {
-		h.handleMultiStreamingImagesResponse(c, flusher, rawJSON, codexModel, op, count)
+		h.handleMultiStreamingImagesResponse(c, flusher, rawJSON, codexModel, op, count, responseFormat)
 		return
 	}
 	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
@@ -275,7 +282,7 @@ func (h *OpenAIImagesAPIHandler) handleStreamingImagesResponse(c *gin.Context, r
 		c.Header("Access-Control-Allow-Origin", "*")
 	}
 
-	mapper := &imageStreamMapper{operation: op}
+	mapper := &imageStreamMapper{operation: op, responseFormat: responseFormat}
 	for {
 		select {
 		case <-c.Request.Context().Done():
@@ -322,7 +329,7 @@ func (h *OpenAIImagesAPIHandler) handleStreamingImagesResponse(c *gin.Context, r
 	}
 }
 
-func (h *OpenAIImagesAPIHandler) handleMultiStreamingImagesResponse(c *gin.Context, flusher http.Flusher, rawJSON []byte, codexModel string, op imageOperation, count int) {
+func (h *OpenAIImagesAPIHandler) handleMultiStreamingImagesResponse(c *gin.Context, flusher http.Flusher, rawJSON []byte, codexModel string, op imageOperation, count int, responseFormat string) {
 	c.Header("Content-Type", "text/event-stream")
 	c.Header("Cache-Control", "no-cache")
 	c.Header("Connection", "keep-alive")
@@ -333,7 +340,7 @@ func (h *OpenAIImagesAPIHandler) handleMultiStreamingImagesResponse(c *gin.Conte
 		if i == 0 {
 			handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
 		}
-		mapper := &imageStreamMapper{operation: op, omitInputUsage: i > 0}
+		mapper := &imageStreamMapper{operation: op, omitInputUsage: i > 0, responseFormat: responseFormat}
 		var streamErr error
 		h.ForwardStream(c, flusher, func(err error) {
 			streamErr = err
@@ -514,12 +521,15 @@ func (h *OpenAIImagesAPIHandler) validateImageRequest(req *openAIImageRequest, o
 		return errors.New("prompt is required")
 	}
 	if strings.EqualFold(strings.TrimSpace(req.ResponseFormat), "url") {
-		if !h.imagesOverrideResponseFormatURLEnabled() {
+		if h.imagesResponseFormatURLDataURLEnabled() {
+			req.ResponseFormat = "url"
+		} else if h.imagesOverrideResponseFormatURLEnabled() {
+			req.ResponseFormat = "b64_json"
+		} else {
 			return unsupportedImageErrorf("response_format=url is not supported; use b64_json")
 		}
-		req.ResponseFormat = "b64_json"
 	}
-	if rf := strings.TrimSpace(req.ResponseFormat); rf != "" && rf != "b64_json" {
+	if rf := strings.TrimSpace(req.ResponseFormat); rf != "" && rf != "b64_json" && rf != "url" {
 		return unsupportedImageErrorf("unsupported response_format %q", rf)
 	}
 	if strings.EqualFold(strings.TrimSpace(req.Background), "transparent") {
@@ -612,6 +622,47 @@ func imageRequestCount(req openAIImageRequest) int {
 	return *req.N
 }
 
+func mimeTypeFromOutputFormat(outputFormat string) string {
+	outputFormat = strings.ToLower(strings.TrimSpace(outputFormat))
+	if outputFormat == "" {
+		return "image/png"
+	}
+	if strings.Contains(outputFormat, "/") {
+		return outputFormat
+	}
+	switch outputFormat {
+	case "png":
+		return "image/png"
+	case "jpg", "jpeg":
+		return "image/jpeg"
+	case "webp":
+		return "image/webp"
+	default:
+		return "image/png"
+	}
+}
+
+func imageDataURL(b64JSON, outputFormat string) string {
+	return "data:" + mimeTypeFromOutputFormat(outputFormat) + ";base64," + b64JSON
+}
+
+func imageResponseFormatIsURL(responseFormat string) bool {
+	return strings.EqualFold(strings.TrimSpace(responseFormat), "url")
+}
+
+func applyImageResponseFormat(out *imagesResponse, responseFormat string) {
+	if out == nil || !imageResponseFormatIsURL(responseFormat) {
+		return
+	}
+	for i := range out.Data {
+		if strings.TrimSpace(out.Data[i].B64JSON) == "" {
+			continue
+		}
+		out.Data[i].URL = imageDataURL(out.Data[i].B64JSON, out.Data[i].OutputFormat)
+		out.Data[i].B64JSON = ""
+	}
+}
+
 func convertResponsesToImagesResponse(raw []byte, fallbackCreated int64) ([]byte, error) {
 	out, err := parseResponsesToImagesResponse(raw, fallbackCreated)
 	if err != nil {
@@ -634,7 +685,7 @@ func parseResponsesToImagesResponse(raw []byte, fallbackCreated int64) (imagesRe
 		Data:    imageResultsFromOutput(respObj.Output),
 	}
 	if len(out.Data) == 0 {
-		return imagesResponse{}, errors.New("Codex response did not include an image_generation_call result")
+		return imagesResponse{}, errors.New("upstream did not return image output")
 	}
 	if usage := imageUsageFromToolUsage(respObj.ToolUsage); len(bytes.TrimSpace(usage)) > 0 && string(bytes.TrimSpace(usage)) != "null" {
 		out.Usage = usage
@@ -670,6 +721,7 @@ func imageResultsFromOutput(items []imageOutputItem) []imageResult {
 		results = append(results, imageResult{
 			B64JSON:       items[i].Result,
 			RevisedPrompt: items[i].RevisedPrompt,
+			OutputFormat:  items[i].OutputFormat,
 		})
 	}
 	return results
@@ -881,6 +933,7 @@ type imageStreamMapper struct {
 	finals         []imageResult
 	finalUsage     json.RawMessage
 	omitInputUsage bool
+	responseFormat string
 	completed      bool
 }
 
@@ -907,11 +960,13 @@ func (m *imageStreamMapper) writePayload(w io.Writer, payload []byte) {
 		if err := json.Unmarshal(payload, &event); err != nil || strings.TrimSpace(event.PartialImageB64) == "" {
 			return
 		}
-		m.writeSSE(w, m.operation.partialEvent, imageStreamEvent{
+		streamEvent := imageStreamEvent{
 			Type:              m.operation.partialEvent,
 			B64JSON:           event.PartialImageB64,
 			PartialImageIndex: event.PartialImageIndex,
-		})
+		}
+		m.applyStreamImageFormat(&streamEvent, event.OutputFormat)
+		m.writeSSE(w, m.operation.partialEvent, streamEvent)
 	case "response.output_item.done":
 		var event responseOutputItemDoneEvent
 		if err := json.Unmarshal(payload, &event); err != nil {
@@ -942,7 +997,9 @@ func (m *imageStreamMapper) writePayload(w io.Writer, payload []byte) {
 		}
 		if len(m.finals) > 0 {
 			m.writeCompletedSet(w, m.finals, mergeImageUsage(m.finalUsage, usage))
+			return
 		}
+		m.writeError(w, http.StatusBadGateway, "upstream did not return image output")
 	}
 }
 
@@ -959,6 +1016,7 @@ func (m *imageStreamMapper) writeCompleted(w io.Writer, result imageResult, usag
 		B64JSON:       result.B64JSON,
 		RevisedPrompt: result.RevisedPrompt,
 	}
+	m.applyStreamImageFormat(&event, result.OutputFormat)
 	if len(bytes.TrimSpace(usage)) > 0 && string(bytes.TrimSpace(usage)) != "null" {
 		if m.omitInputUsage {
 			usage = omitInputImageUsage(usage)
@@ -966,6 +1024,14 @@ func (m *imageStreamMapper) writeCompleted(w io.Writer, result imageResult, usag
 		event.Usage = usage
 	}
 	m.writeSSE(w, m.operation.completedEvent, event)
+}
+
+func (m *imageStreamMapper) applyStreamImageFormat(event *imageStreamEvent, outputFormat string) {
+	if event == nil || !imageResponseFormatIsURL(m.responseFormat) || strings.TrimSpace(event.B64JSON) == "" {
+		return
+	}
+	event.URL = imageDataURL(event.B64JSON, outputFormat)
+	event.B64JSON = ""
 }
 
 func (m *imageStreamMapper) writeSSE(w io.Writer, eventName string, payload imageStreamEvent) {
@@ -977,6 +1043,21 @@ func (m *imageStreamMapper) writeSSE(w io.Writer, eventName string, payload imag
 		return
 	}
 	_, _ = fmt.Fprintf(w, "event: %s\ndata: %s\n\n", eventName, string(data))
+}
+
+func (m *imageStreamMapper) writeError(w io.Writer, status int, message string) {
+	if w == nil {
+		return
+	}
+	m.completed = true
+	if status <= 0 {
+		status = http.StatusInternalServerError
+	}
+	if strings.TrimSpace(message) == "" {
+		message = http.StatusText(status)
+	}
+	body := handlers.BuildErrorResponseBody(status, message)
+	_, _ = fmt.Fprintf(w, "event: error\ndata: %s\n\n", string(body))
 }
 
 type imageSSEParser struct {
@@ -1082,6 +1163,13 @@ func (h *OpenAIImagesAPIHandler) imagesOverrideResponseFormatURLEnabled() bool {
 			return *h.Cfg.Images.OverrideResponseFormatURL
 		}
 		return h.Cfg.Images.OverrideUnsupportedParams
+	}
+	return false
+}
+
+func (h *OpenAIImagesAPIHandler) imagesResponseFormatURLDataURLEnabled() bool {
+	if h != nil && h.Cfg != nil && h.Cfg.Images.ResponseFormatURLDataURL != nil {
+		return *h.Cfg.Images.ResponseFormatURLDataURL
 	}
 	return false
 }

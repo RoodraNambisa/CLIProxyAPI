@@ -286,6 +286,33 @@ func TestOpenAIImagesCanOverrideUnsupportedOptions(t *testing.T) {
 	}
 }
 
+func TestOpenAIImagesCanReturnDataURLForURLResponseFormat(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	executor := &imageCaptureExecutor{
+		response: []byte(`{"created_at":1700000000,"output":[{"type":"image_generation_call","result":"aGVsbG8=","output_format":"png"}]}`),
+	}
+	h := newImagesTestHandler(t, executor)
+	responseFormatURLDataURL := true
+	h.Cfg.Images.ResponseFormatURLDataURL = &responseFormatURLDataURL
+	router := gin.New()
+	router.POST("/v1/images/generations", h.Generations)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/images/generations", strings.NewReader(`{"model":"gpt-image-2","prompt":"draw","response_format":"url"}`))
+	req.Header.Set("Content-Type", "application/json")
+	resp := httptest.NewRecorder()
+	router.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d, body=%s", resp.Code, http.StatusOK, resp.Body.String())
+	}
+	if got := gjson.Get(resp.Body.String(), "data.0.url").String(); got != "data:image/png;base64,aGVsbG8=" {
+		t.Fatalf("url = %q", got)
+	}
+	if got := gjson.Get(resp.Body.String(), "data.0.b64_json"); got.Exists() {
+		t.Fatalf("b64_json exists = %s, want absent", got.Raw)
+	}
+}
+
 func TestOpenAIImagesOverrideOptionsAreSeparate(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	overrideResponseFormatURL := true
@@ -435,6 +462,39 @@ func TestConvertResponsesToImagesResponse(t *testing.T) {
 	}
 }
 
+func TestConvertResponsesToImagesResponseErrorsWithoutImageOutput(t *testing.T) {
+	raw := []byte(`{"created_at":1700000000,"output":[{"type":"message","content":[{"type":"output_text","text":"blocked"}]}],"usage":{"total_tokens":9}}`)
+	_, err := convertResponsesToImagesResponse(raw, 1)
+	if err == nil {
+		t.Fatal("convertResponsesToImagesResponse succeeded, want error")
+	}
+	if !strings.Contains(err.Error(), "upstream did not return image output") {
+		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestOpenAIImagesNonStreamingErrorsWithoutImageOutput(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	executor := &imageCaptureExecutor{
+		response: []byte(`{"created_at":1700000000,"output":[{"type":"message","content":[{"type":"output_text","text":"blocked"}]}],"usage":{"total_tokens":9}}`),
+	}
+	h := newImagesTestHandler(t, executor)
+	router := gin.New()
+	router.POST("/v1/images/generations", h.Generations)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/images/generations", strings.NewReader(`{"model":"gpt-image-2","prompt":"draw"}`))
+	req.Header.Set("Content-Type", "application/json")
+	resp := httptest.NewRecorder()
+	router.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want %d, body=%s", resp.Code, http.StatusBadGateway, resp.Body.String())
+	}
+	if !strings.Contains(resp.Body.String(), "upstream did not return image output") {
+		t.Fatalf("error message missing: %s", resp.Body.String())
+	}
+}
+
 func TestOpenAIImagesStreamingMapsPartialAndCompletedEvents(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	executor := &imageCaptureExecutor{
@@ -464,6 +524,71 @@ func TestOpenAIImagesStreamingMapsPartialAndCompletedEvents(t *testing.T) {
 	}
 	if !strings.Contains(body, `"total_tokens":7`) {
 		t.Fatalf("usage missing: %s", body)
+	}
+}
+
+func TestOpenAIImagesStreamingCanReturnDataURLForURLResponseFormat(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	executor := &imageCaptureExecutor{
+		streamChunks: []coreexecutor.StreamChunk{
+			{Payload: []byte(`data: {"type":"response.image_generation_call.partial_image","partial_image_b64":"cGFydA==","partial_image_index":0,"output_format":"png"}`)},
+			{Payload: []byte(`data: {"type":"response.completed","response":{"created_at":1700000000,"output":[{"type":"image_generation_call","result":"ZmluYWw=","output_format":"webp"}]}}`)},
+		},
+	}
+	h := newImagesTestHandler(t, executor)
+	responseFormatURLDataURL := true
+	h.Cfg.Images.ResponseFormatURLDataURL = &responseFormatURLDataURL
+	router := gin.New()
+	router.POST("/v1/images/generations", h.Generations)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/images/generations", strings.NewReader(`{"model":"gpt-image-2","prompt":"draw","stream":true,"response_format":"url"}`))
+	req.Header.Set("Content-Type", "application/json")
+	resp := httptest.NewRecorder()
+	router.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d, body=%s", resp.Code, http.StatusOK, resp.Body.String())
+	}
+	body := resp.Body.String()
+	if !strings.Contains(body, `"url":"data:image/png;base64,cGFydA=="`) {
+		t.Fatalf("partial data URL missing: %s", body)
+	}
+	if !strings.Contains(body, `"url":"data:image/webp;base64,ZmluYWw="`) {
+		t.Fatalf("completed data URL missing: %s", body)
+	}
+	if strings.Contains(body, "b64_json") {
+		t.Fatalf("b64_json should be absent in URL response format: %s", body)
+	}
+}
+
+func TestOpenAIImagesStreamingEmitsErrorWhenCompletedWithoutImage(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	executor := &imageCaptureExecutor{
+		streamChunks: []coreexecutor.StreamChunk{
+			{Payload: []byte(`data: {"type":"response.completed","response":{"created_at":1700000000,"output":[{"type":"message","content":[{"type":"output_text","text":"blocked"}]}],"usage":{"total_tokens":7}}}`)},
+		},
+	}
+	h := newImagesTestHandler(t, executor)
+	router := gin.New()
+	router.POST("/v1/images/generations", h.Generations)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/images/generations", strings.NewReader(`{"model":"gpt-image-2","prompt":"draw","stream":true}`))
+	req.Header.Set("Content-Type", "application/json")
+	resp := httptest.NewRecorder()
+	router.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d, body=%s", resp.Code, http.StatusOK, resp.Body.String())
+	}
+	body := resp.Body.String()
+	if !strings.Contains(body, "event: error") {
+		t.Fatalf("error event missing: %s", body)
+	}
+	if !strings.Contains(body, "upstream did not return image output") {
+		t.Fatalf("error message missing: %s", body)
+	}
+	if strings.Contains(body, "event: image_generation.completed") {
+		t.Fatalf("completed event should not be emitted: %s", body)
 	}
 }
 
