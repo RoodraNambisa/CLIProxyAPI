@@ -133,6 +133,9 @@ func TestOpenAIImagesGenerationsNonStreamingUsesCodexImageTool(t *testing.T) {
 	if got := gjson.GetBytes(executor.payload, "tools.0.action").String(); got != "generate" {
 		t.Fatalf("tool action = %q", got)
 	}
+	if got := gjson.GetBytes(executor.payload, "tool_choice.type").String(); got != "image_generation" {
+		t.Fatalf("tool_choice.type = %q, want image_generation", got)
+	}
 	if got := gjson.Get(resp.Body.String(), "data.0.b64_json").String(); got != "aGVsbG8=" {
 		t.Fatalf("b64_json = %q", got)
 	}
@@ -395,6 +398,9 @@ func TestOpenAIImagesEditsMultipartBuildsDataURLsAndMask(t *testing.T) {
 	if err := writer.WriteField("prompt", "edit this"); err != nil {
 		t.Fatalf("WriteField prompt: %v", err)
 	}
+	if err := writer.WriteField("input_fidelity", "high"); err != nil {
+		t.Fatalf("WriteField input_fidelity: %v", err)
+	}
 	imagePart, err := writer.CreateFormFile("image[]", "image.png")
 	if err != nil {
 		t.Fatalf("CreateFormFile image: %v", err)
@@ -420,6 +426,9 @@ func TestOpenAIImagesEditsMultipartBuildsDataURLsAndMask(t *testing.T) {
 	if got := gjson.GetBytes(executor.payload, "tools.0.action").String(); got != "edit" {
 		t.Fatalf("tool action = %q", got)
 	}
+	if got := gjson.GetBytes(executor.payload, "tools.0.input_fidelity").String(); got != "high" {
+		t.Fatalf("tool input_fidelity = %q", got)
+	}
 	imageURL := gjson.GetBytes(executor.payload, "input.0.content.1.image_url").String()
 	if !strings.HasPrefix(imageURL, "data:image/png;base64,") {
 		t.Fatalf("image_url = %q", imageURL)
@@ -430,8 +439,51 @@ func TestOpenAIImagesEditsMultipartBuildsDataURLsAndMask(t *testing.T) {
 	}
 }
 
+func TestOpenAIImagesEditsCanOverrideInputFidelity(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	executor := &imageCaptureExecutor{}
+	h := newImagesTestHandler(t, executor)
+	overrideInputFidelity := true
+	h.Cfg.Images.OverrideInputFidelity = &overrideInputFidelity
+	h.Cfg.Images.ImageModel = "gpt-image-1.5"
+	router := gin.New()
+	router.POST("/v1/images/edits", h.Edits)
+
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	if err := writer.WriteField("model", "gpt-image-1.5"); err != nil {
+		t.Fatalf("WriteField model: %v", err)
+	}
+	if err := writer.WriteField("prompt", "edit this"); err != nil {
+		t.Fatalf("WriteField prompt: %v", err)
+	}
+	if err := writer.WriteField("input_fidelity", "high"); err != nil {
+		t.Fatalf("WriteField input_fidelity: %v", err)
+	}
+	imagePart, err := writer.CreateFormFile("image", "image.png")
+	if err != nil {
+		t.Fatalf("CreateFormFile image: %v", err)
+	}
+	_, _ = imagePart.Write([]byte("\x89PNG\r\n\x1a\nimage-data"))
+	if err := writer.Close(); err != nil {
+		t.Fatalf("Close writer: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/images/edits", &body)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	resp := httptest.NewRecorder()
+	router.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d, body=%s", resp.Code, http.StatusOK, resp.Body.String())
+	}
+	if got := gjson.GetBytes(executor.payload, "tools.0.input_fidelity"); got.Exists() {
+		t.Fatalf("tool input_fidelity exists = %s, want absent", got.Raw)
+	}
+}
+
 func TestConvertResponsesToImagesResponse(t *testing.T) {
-	raw := []byte(`{"created_at":1700000000,"output":[{"type":"message"},{"type":"image_generation_call","result":"ZmluYWw=","revised_prompt":"better"}],"tool_usage":{"image_gen":{"input_tokens":3,"input_tokens_details":{"text_tokens":3,"image_tokens":0},"output_tokens":6,"output_tokens_details":{"image_tokens":6,"text_tokens":0},"total_tokens":9}},"usage":{"total_tokens":999}}`)
+	raw := []byte(`{"created_at":1700000000,"output":[{"type":"message"},{"type":"image_generation_call","result":"ZmluYWw=","revised_prompt":"better","output_format":"webp","size":"1024x1024","background":"auto","quality":"high"}],"tool_usage":{"image_gen":{"input_tokens":3,"input_tokens_details":{"text_tokens":3,"image_tokens":0},"output_tokens":6,"output_tokens_details":{"image_tokens":6,"text_tokens":0},"total_tokens":9}},"usage":{"total_tokens":999}}`)
 	out, err := convertResponsesToImagesResponse(raw, 1)
 	if err != nil {
 		t.Fatalf("convertResponsesToImagesResponse: %v", err)
@@ -444,6 +496,18 @@ func TestConvertResponsesToImagesResponse(t *testing.T) {
 	}
 	if got := gjson.GetBytes(out, "data.0.revised_prompt").String(); got != "better" {
 		t.Fatalf("revised_prompt = %q", got)
+	}
+	if got := gjson.GetBytes(out, "output_format").String(); got != "webp" {
+		t.Fatalf("output_format = %q", got)
+	}
+	if got := gjson.GetBytes(out, "size").String(); got != "1024x1024" {
+		t.Fatalf("size = %q", got)
+	}
+	if got := gjson.GetBytes(out, "background").String(); got != "auto" {
+		t.Fatalf("background = %q", got)
+	}
+	if got := gjson.GetBytes(out, "quality").String(); got != "high" {
+		t.Fatalf("quality = %q", got)
 	}
 	if got := gjson.GetBytes(out, "usage.total_tokens").Int(); got != 9 {
 		t.Fatalf("usage.total_tokens = %d", got)

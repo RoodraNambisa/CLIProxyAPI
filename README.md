@@ -85,6 +85,7 @@ images:
   override-response-format-url: false
   response-format-url-data-url: false
   override-transparent-background: false
+  override-input-fidelity: false
 ```
 
 说明：
@@ -92,11 +93,12 @@ images:
 - `model` 默认支持 `gpt-image-2`；如需换成其他 Codex 支持的图片 tool 模型，修改 `images.image-model`，请求里的 `model` 也要使用同一个值。
 - `response_format=url` 默认不支持，请求传入 `url` 会直接返回错误。开启 `override-response-format-url` 后会自动按 `b64_json` 处理；开启 `response-format-url-data-url` 后会把图片 base64 包装成 `data:<mime>;base64,...` 放到 `url` 字段返回。
 - `background=transparent` 不支持，默认会直接返回错误。开启 `override-transparent-background` 后会自动改成 `auto` 再转发给 Codex。
+- `input_fidelity` 默认保持上游兼容行为，会原样透传给 Codex；实测 `gpt-image-2` 会返回 `invalid_input_fidelity_model`。开启 `override-input-fidelity` 后，所有图片请求都会自动不透传该字段。
 - `edits` 支持 multipart 的 `image` / `image[]` / `mask`，也支持 JSON 的 `images[].image_url`。
 - 暂不支持 JSON `file_id`，因为当前项目没有 OpenAI Files API 兼容层。
 - `unsupported-status-code` 控制不支持参数的错误状态码，默认 `400`。
-- `override-response-format-url`、`response-format-url-data-url` 和 `override-transparent-background` 默认关闭，分别控制对应参数覆盖；其它不支持参数仍会返回错误。
-- `override-unsupported-params` 是旧兼容字段，开启时等价于两个覆盖项都开启；新配置建议使用上面两个独立开关。
+- `override-response-format-url`、`response-format-url-data-url`、`override-transparent-background` 和 `override-input-fidelity` 默认关闭，分别控制对应参数覆盖；其它不支持参数仍会返回错误。
+- `override-unsupported-params` 是旧兼容字段，开启时等价于支持的覆盖项都开启；新配置建议使用上面的独立开关。
 - `enable-n-aggregation` 默认关闭，`n > 1` 会直接按不支持参数返回错误。开启时，`n > 1` 会拆成多次 Codex 图片调用再聚合，非流式返回多个 `data[]` 并累加 `usage.output_tokens` 等用量字段；流式依次输出多个 `image_generation.completed` 或 `image_edit.completed` 事件。
 
 示例：

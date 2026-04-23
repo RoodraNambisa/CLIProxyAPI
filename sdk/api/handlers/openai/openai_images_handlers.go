@@ -83,6 +83,7 @@ type openAIImageRequest struct {
 	Background        string           `json:"background"`
 	OutputFormat      string           `json:"output_format"`
 	OutputCompression *int             `json:"output_compression"`
+	InputFidelity     string           `json:"input_fidelity"`
 	Moderation        string           `json:"moderation"`
 	Stream            bool             `json:"stream"`
 	PartialImages     *int             `json:"partial_images"`
@@ -101,6 +102,9 @@ type imageOutputItem struct {
 	Result        string          `json:"result"`
 	RevisedPrompt string          `json:"revised_prompt,omitempty"`
 	OutputFormat  string          `json:"output_format,omitempty"`
+	Size          string          `json:"size,omitempty"`
+	Background    string          `json:"background,omitempty"`
+	Quality       string          `json:"quality,omitempty"`
 	Usage         json.RawMessage `json:"usage,omitempty"`
 	InputTokens   json.RawMessage `json:"input_tokens,omitempty"`
 	OutputTokens  json.RawMessage `json:"output_tokens,omitempty"`
@@ -115,12 +119,19 @@ type imageResult struct {
 	URL           string `json:"url,omitempty"`
 	RevisedPrompt string `json:"revised_prompt,omitempty"`
 	OutputFormat  string `json:"-"`
+	Size          string `json:"-"`
+	Background    string `json:"-"`
+	Quality       string `json:"-"`
 }
 
 type imagesResponse struct {
-	Created int64           `json:"created"`
-	Data    []imageResult   `json:"data"`
-	Usage   json.RawMessage `json:"usage,omitempty"`
+	Created      int64           `json:"created"`
+	Data         []imageResult   `json:"data"`
+	Usage        json.RawMessage `json:"usage,omitempty"`
+	Background   string          `json:"background,omitempty"`
+	OutputFormat string          `json:"output_format,omitempty"`
+	Quality      string          `json:"quality,omitempty"`
+	Size         string          `json:"size,omitempty"`
 }
 
 type responsesImageObject struct {
@@ -198,7 +209,7 @@ func (h *OpenAIImagesAPIHandler) Edits(c *gin.Context) {
 
 func (h *OpenAIImagesAPIHandler) handleImagesRequest(c *gin.Context, req openAIImageRequest, op imageOperation) {
 	codexModel := h.imagesCodexModel()
-	payload, err := buildCodexImageResponsesPayload(req, op, codexModel, h.imagesImageModel())
+	payload, err := buildCodexImageResponsesPayload(req, op, codexModel, h.imagesImageModel(), h.imagesOverrideInputFidelityEnabled())
 	if err != nil {
 		h.writeImagesError(c, http.StatusBadRequest, err)
 		return
@@ -246,6 +257,10 @@ func (h *OpenAIImagesAPIHandler) handleNonStreamingImagesResponse(c *gin.Context
 		}
 		if combined.Created == 0 {
 			combined.Created = parsed.Created
+			combined.Background = parsed.Background
+			combined.OutputFormat = parsed.OutputFormat
+			combined.Quality = parsed.Quality
+			combined.Size = parsed.Size
 			upstreamHeaders = headers
 		}
 		combined.Data = append(combined.Data, parsed.Data...)
@@ -460,6 +475,7 @@ func parseMultipartImageEditRequest(c *gin.Context) (openAIImageRequest, error) 
 	req.Quality = multipartValue(form, "quality")
 	req.Background = multipartValue(form, "background")
 	req.OutputFormat = multipartValue(form, "output_format")
+	req.InputFidelity = multipartValue(form, "input_fidelity")
 	req.Moderation = multipartValue(form, "moderation")
 	req.ResponseFormat = multipartValue(form, "response_format")
 	req.Stream = parseBoolValue(multipartValue(form, "stream"))
@@ -557,7 +573,7 @@ func (h *OpenAIImagesAPIHandler) validateImageRequest(req *openAIImageRequest, o
 	return nil
 }
 
-func buildCodexImageResponsesPayload(req openAIImageRequest, op imageOperation, codexModel, imageModel string) (map[string]any, error) {
+func buildCodexImageResponsesPayload(req openAIImageRequest, op imageOperation, codexModel, imageModel string, overrideInputFidelity bool) (map[string]any, error) {
 	imageModel = strings.TrimSpace(imageModel)
 	if imageModel == "" {
 		imageModel = defaultImagesImageModel
@@ -586,6 +602,9 @@ func buildCodexImageResponsesPayload(req openAIImageRequest, op imageOperation, 
 	setOptionalString(tool, "quality", req.Quality)
 	setOptionalString(tool, "background", req.Background)
 	setOptionalString(tool, "output_format", req.OutputFormat)
+	if shouldForwardInputFidelity(overrideInputFidelity) {
+		setOptionalString(tool, "input_fidelity", req.InputFidelity)
+	}
 	setOptionalString(tool, "moderation", req.Moderation)
 	if req.OutputCompression != nil {
 		tool["output_compression"] = *req.OutputCompression
@@ -611,8 +630,13 @@ func buildCodexImageResponsesPayload(req openAIImageRequest, op imageOperation, 
 			"role":    "user",
 			"content": content,
 		}},
-		"tools": []map[string]any{tool},
+		"tools":       []map[string]any{tool},
+		"tool_choice": map[string]any{"type": "image_generation"},
 	}, nil
+}
+
+func shouldForwardInputFidelity(overrideInputFidelity bool) bool {
+	return !overrideInputFidelity
 }
 
 func imageRequestCount(req openAIImageRequest) int {
@@ -687,6 +711,7 @@ func parseResponsesToImagesResponse(raw []byte, fallbackCreated int64) (imagesRe
 	if len(out.Data) == 0 {
 		return imagesResponse{}, errors.New("upstream did not return image output")
 	}
+	out.applyMetadataFromFirstImage()
 	if usage := imageUsageFromToolUsage(respObj.ToolUsage); len(bytes.TrimSpace(usage)) > 0 && string(bytes.TrimSpace(usage)) != "null" {
 		out.Usage = usage
 	} else if usage := imageUsageFromOutput(respObj.Output); len(bytes.TrimSpace(usage)) > 0 && string(bytes.TrimSpace(usage)) != "null" {
@@ -722,9 +747,23 @@ func imageResultsFromOutput(items []imageOutputItem) []imageResult {
 			B64JSON:       items[i].Result,
 			RevisedPrompt: items[i].RevisedPrompt,
 			OutputFormat:  items[i].OutputFormat,
+			Size:          items[i].Size,
+			Background:    items[i].Background,
+			Quality:       items[i].Quality,
 		})
 	}
 	return results
+}
+
+func (r *imagesResponse) applyMetadataFromFirstImage() {
+	if r == nil || len(r.Data) == 0 {
+		return
+	}
+	first := r.Data[0]
+	r.Background = first.Background
+	r.OutputFormat = first.OutputFormat
+	r.Quality = first.Quality
+	r.Size = first.Size
 }
 
 func imageUsageFromToolUsage(toolUsage map[string]json.RawMessage) json.RawMessage {
@@ -1178,6 +1217,16 @@ func (h *OpenAIImagesAPIHandler) imagesOverrideTransparentBackgroundEnabled() bo
 	if h != nil && h.Cfg != nil {
 		if h.Cfg.Images.OverrideTransparentBackground != nil {
 			return *h.Cfg.Images.OverrideTransparentBackground
+		}
+		return h.Cfg.Images.OverrideUnsupportedParams
+	}
+	return false
+}
+
+func (h *OpenAIImagesAPIHandler) imagesOverrideInputFidelityEnabled() bool {
+	if h != nil && h.Cfg != nil {
+		if h.Cfg.Images.OverrideInputFidelity != nil {
+			return *h.Cfg.Images.OverrideInputFidelity
 		}
 		return h.Cfg.Images.OverrideUnsupportedParams
 	}

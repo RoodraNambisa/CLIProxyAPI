@@ -69,4 +69,6 @@ type ImagesConfig struct {
 	ResponseFormatURLDataURL *bool `yaml:"response-format-url-data-url,omitempty" json:"response-format-url-data-url,omitempty"`
 	// OverrideTransparentBackground coerces background=transparent to auto when set.
 	OverrideTransparentBackground *bool `yaml:"override-transparent-background,omitempty" json:"override-transparent-background,omitempty"`
+	// OverrideInputFidelity omits input_fidelity instead of forwarding it when set.
+	OverrideInputFidelity *bool `yaml:"override-input-fidelity,omitempty" json:"override-input-fidelity,omitempty"`
 }
