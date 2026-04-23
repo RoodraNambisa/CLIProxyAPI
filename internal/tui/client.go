@@ -9,20 +9,29 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 )
 
 // Client wraps HTTP calls to the management API.
 type Client struct {
-	baseURL   string
-	secretKey string
-	http      *http.Client
+	baseURL                string
+	secretKey              string
+	managementAccessPrefix string
+	http                   *http.Client
 }
 
 // NewClient creates a new management API client.
 func NewClient(port int, secretKey string) *Client {
+	return NewClientWithAccessPath(port, secretKey, "")
+}
+
+// NewClientWithAccessPath creates a management API client with an optional route prefix.
+func NewClientWithAccessPath(port int, secretKey, accessPath string) *Client {
 	return &Client{
-		baseURL:   fmt.Sprintf("http://127.0.0.1:%d", port),
-		secretKey: strings.TrimSpace(secretKey),
+		baseURL:                fmt.Sprintf("http://127.0.0.1:%d", port),
+		secretKey:              strings.TrimSpace(secretKey),
+		managementAccessPrefix: config.ManagementAccessPathPrefix(accessPath),
 		http: &http.Client{
 			Timeout: 10 * time.Second,
 		},
@@ -35,7 +44,7 @@ func (c *Client) SetSecretKey(secretKey string) {
 }
 
 func (c *Client) doRequest(method, path string, body io.Reader) ([]byte, int, error) {
-	url := c.baseURL + path
+	url := c.baseURL + c.resolvePath(path)
 	req, err := http.NewRequest(method, url, body)
 	if err != nil {
 		return nil, 0, err
@@ -56,6 +65,22 @@ func (c *Client) doRequest(method, path string, body io.Reader) ([]byte, int, er
 		return nil, resp.StatusCode, err
 	}
 	return data, resp.StatusCode, nil
+}
+
+func (c *Client) resolvePath(path string) string {
+	if !strings.HasPrefix(path, "/") {
+		path = "/" + path
+	}
+	if c.managementAccessPrefix == "" {
+		return path
+	}
+	if strings.HasPrefix(path, c.managementAccessPrefix+"/") || path == c.managementAccessPrefix {
+		return path
+	}
+	if path == "/v0/management" || strings.HasPrefix(path, "/v0/management/") || strings.HasPrefix(path, "/v0/management?") {
+		return c.managementAccessPrefix + path
+	}
+	return path
 }
 
 func (c *Client) get(path string) ([]byte, error) {

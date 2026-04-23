@@ -64,6 +64,30 @@ func TestShouldSkipMethodForRequestLogging(t *testing.T) {
 	}
 }
 
+func TestShouldLogRequestSkipsManagementPaths(t *testing.T) {
+	tests := []struct {
+		name string
+		path string
+		want bool
+	}{
+		{name: "legacy management config", path: "/v0/management/config", want: false},
+		{name: "prefixed management root", path: "/secret-token/v0/management", want: false},
+		{name: "prefixed management config", path: "/secret-token/v0/management/config", want: false},
+		{name: "prefixed management oauth callback", path: "/secret-token/v0/management/oauth-callback", want: false},
+		{name: "management panel", path: "/management.html", want: false},
+		{name: "similar path is not management api", path: "/secret-token/v0/managementevil/config", want: true},
+		{name: "normal api path", path: "/v1/chat/completions", want: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := shouldLogRequest(tt.path); got != tt.want {
+				t.Fatalf("shouldLogRequest(%q) = %t, want %t", tt.path, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestShouldCaptureRequestBody(t *testing.T) {
 	tests := []struct {
 		name          string

@@ -60,6 +60,11 @@ type authConnectMsg struct {
 
 // NewApp creates the root TUI application model.
 func NewApp(port int, secretKey string, hook *LogHook) App {
+	return NewAppWithAccessPath(port, secretKey, "", hook)
+}
+
+// NewAppWithAccessPath creates the root TUI application model with an optional management route prefix.
+func NewAppWithAccessPath(port int, secretKey, accessPath string, hook *LogHook) App {
 	standalone := hook != nil
 	authRequired := !standalone
 	ti := textinput.New()
@@ -69,7 +74,7 @@ func NewApp(port int, secretKey string, hook *LogHook) App {
 	ti.SetValue(strings.TrimSpace(secretKey))
 	ti.Focus()
 
-	client := NewClient(port, secretKey)
+	client := NewClientWithAccessPath(port, secretKey, accessPath)
 	app := App{
 		activeTab:     tabDashboard,
 		standalone:    standalone,
@@ -496,10 +501,15 @@ func (a App) connectWithPassword(password string) tea.Cmd {
 // Run starts the TUI application.
 // output specifies where bubbletea renders. If nil, defaults to os.Stdout.
 func Run(port int, secretKey string, hook *LogHook, output io.Writer) error {
+	return RunWithAccessPath(port, secretKey, "", hook, output)
+}
+
+// RunWithAccessPath starts the TUI application with an optional management route prefix.
+func RunWithAccessPath(port int, secretKey, accessPath string, hook *LogHook, output io.Writer) error {
 	if output == nil {
 		output = os.Stdout
 	}
-	app := NewApp(port, secretKey, hook)
+	app := NewAppWithAccessPath(port, secretKey, accessPath, hook)
 	p := tea.NewProgram(app, tea.WithAltScreen(), tea.WithOutput(output))
 	_, err := p.Run()
 	return err

@@ -153,7 +153,7 @@ func captureRequestInfo(c *gin.Context, captureBody bool) (*RequestInfo, error) 
 // It skips management endpoints to avoid leaking secrets but allows
 // all other routes, including module-provided ones, to honor request-log.
 func shouldLogRequest(path string) bool {
-	if strings.HasPrefix(path, "/v0/management") || strings.HasPrefix(path, "/management") {
+	if isManagementAPIPath(path) || strings.HasPrefix(path, "/management") {
 		return false
 	}
 
@@ -162,4 +162,19 @@ func shouldLogRequest(path string) bool {
 	}
 
 	return true
+}
+
+func isManagementAPIPath(path string) bool {
+	const marker = "/v0/management"
+	for {
+		idx := strings.Index(path, marker)
+		if idx < 0 {
+			return false
+		}
+		end := idx + len(marker)
+		if end == len(path) || path[end] == '/' || path[end] == '?' {
+			return true
+		}
+		path = path[idx+1:]
+	}
 }

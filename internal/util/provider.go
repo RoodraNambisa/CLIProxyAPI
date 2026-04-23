@@ -206,6 +206,7 @@ func MaskSensitiveHeaderValue(key, value string) string {
 		return MaskAuthorizationHeader(value)
 	case strings.Contains(lowerKey, "api-key"),
 		strings.Contains(lowerKey, "apikey"),
+		strings.Contains(lowerKey, "management-key"),
 		strings.Contains(lowerKey, "token"),
 		strings.Contains(lowerKey, "secret"):
 		return HideAPIKey(value)
