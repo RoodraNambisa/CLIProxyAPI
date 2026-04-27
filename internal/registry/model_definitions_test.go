@@ -14,6 +14,19 @@ func assertCodexModelsDoNotContain(t *testing.T, models []*ModelInfo, modelID st
 	}
 }
 
+func assertCodexModelsContain(t *testing.T, models []*ModelInfo, modelID string) {
+	t.Helper()
+	for _, model := range models {
+		if model == nil {
+			continue
+		}
+		if model.ID == modelID {
+			return
+		}
+	}
+	t.Fatalf("expected codex models to include %q", modelID)
+}
+
 func TestGetCodexFreeModels_NoLongerIncludesBuiltInImageModel(t *testing.T) {
 	assertCodexModelsDoNotContain(t, GetCodexFreeModels(), "gpt-image-2")
 }
@@ -56,4 +69,18 @@ func TestGetCodexPlusModels_ExcludesSpark(t *testing.T) {
 			t.Fatalf("expected codex plus models to exclude %q", codexSparkModelID)
 		}
 	}
+}
+
+func TestGetCodexModels_GPT55Availability(t *testing.T) {
+	assertCodexModelsDoNotContain(t, GetCodexFreeModels(), "gpt-5.5")
+	assertCodexModelsContain(t, GetCodexPlusModels(), "gpt-5.5")
+	assertCodexModelsContain(t, GetCodexTeamModels(), "gpt-5.5")
+	assertCodexModelsContain(t, GetCodexProModels(), "gpt-5.5")
+}
+
+func TestGetCodexModels_AutoReviewAvailability(t *testing.T) {
+	assertCodexModelsContain(t, GetCodexFreeModels(), "codex-auto-review")
+	assertCodexModelsContain(t, GetCodexPlusModels(), "codex-auto-review")
+	assertCodexModelsContain(t, GetCodexTeamModels(), "codex-auto-review")
+	assertCodexModelsContain(t, GetCodexProModels(), "codex-auto-review")
 }

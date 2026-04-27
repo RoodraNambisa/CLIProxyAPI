@@ -724,6 +724,7 @@ func (e *AntigravityExecutor) Execute(ctx context.Context, auth *cliproxyauth.Au
 	baseURLs := antigravityBaseURLFallbackOrder(auth)
 	httpClient := newAntigravityHTTPClient(ctx, e.cfg, auth, 0)
 	attempts := antigravityRetryAttempts(auth, e.cfg)
+	useCredits := cliproxyauth.AntigravityCreditsRequested(ctx) && antigravityCreditsRetryEnabled(e.cfg)
 
 attemptLoop:
 	for attempt := 0; attempt < attempts; attempt++ {
@@ -734,7 +735,7 @@ attemptLoop:
 		for idx, baseURL := range baseURLs {
 			requestPayload := translated
 			usedCreditsDirect := false
-			if antigravityCreditsRetryEnabled(e.cfg) && antigravityShouldPreferCredits(auth, baseModel, time.Now()) {
+			if antigravityCreditsRetryEnabled(e.cfg) && (useCredits || antigravityShouldPreferCredits(auth, baseModel, time.Now())) {
 				if creditsPayload := injectEnabledCreditTypes(translated); len(creditsPayload) > 0 {
 					requestPayload = creditsPayload
 					usedCreditsDirect = true
@@ -939,6 +940,7 @@ func (e *AntigravityExecutor) executeClaudeNonStream(ctx context.Context, auth *
 	httpClient := newAntigravityHTTPClient(ctx, e.cfg, auth, 0)
 
 	attempts := antigravityRetryAttempts(auth, e.cfg)
+	useCredits := cliproxyauth.AntigravityCreditsRequested(ctx) && antigravityCreditsRetryEnabled(e.cfg)
 
 attemptLoop:
 	for attempt := 0; attempt < attempts; attempt++ {
@@ -949,7 +951,7 @@ attemptLoop:
 		for idx, baseURL := range baseURLs {
 			requestPayload := translated
 			usedCreditsDirect := false
-			if antigravityCreditsRetryEnabled(e.cfg) && antigravityShouldPreferCredits(auth, baseModel, time.Now()) {
+			if antigravityCreditsRetryEnabled(e.cfg) && (useCredits || antigravityShouldPreferCredits(auth, baseModel, time.Now())) {
 				if creditsPayload := injectEnabledCreditTypes(translated); len(creditsPayload) > 0 {
 					requestPayload = creditsPayload
 					usedCreditsDirect = true
@@ -1404,6 +1406,7 @@ func (e *AntigravityExecutor) ExecuteStream(ctx context.Context, auth *cliproxya
 	httpClient := newAntigravityHTTPClient(ctx, e.cfg, auth, 0)
 
 	attempts := antigravityRetryAttempts(auth, e.cfg)
+	useCredits := cliproxyauth.AntigravityCreditsRequested(ctx) && antigravityCreditsRetryEnabled(e.cfg)
 
 attemptLoop:
 	for attempt := 0; attempt < attempts; attempt++ {
@@ -1414,7 +1417,7 @@ attemptLoop:
 		for idx, baseURL := range baseURLs {
 			requestPayload := translated
 			usedCreditsDirect := false
-			if antigravityCreditsRetryEnabled(e.cfg) && antigravityShouldPreferCredits(auth, baseModel, time.Now()) {
+			if antigravityCreditsRetryEnabled(e.cfg) && (useCredits || antigravityShouldPreferCredits(auth, baseModel, time.Now())) {
 				if creditsPayload := injectEnabledCreditTypes(translated); len(creditsPayload) > 0 {
 					requestPayload = creditsPayload
 					usedCreditsDirect = true

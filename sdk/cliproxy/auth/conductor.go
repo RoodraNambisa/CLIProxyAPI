@@ -1486,6 +1486,11 @@ func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxye
 		}
 	}
 	if lastErr != nil {
+		if shouldAttemptAntigravityCreditsFallback(m, lastErr, normalized) {
+			if resp, ok := m.tryAntigravityCreditsExecute(ctx, req, opts); ok {
+				return resp, nil
+			}
+		}
 		return cliproxyexecutor.Response{}, lastErr
 	}
 	return cliproxyexecutor.Response{}, &Error{Code: "auth_not_found", Message: "no auth available"}
@@ -1556,6 +1561,11 @@ func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cli
 		}
 	}
 	if lastErr != nil {
+		if shouldAttemptAntigravityCreditsFallback(m, lastErr, normalized) {
+			if result, ok := m.tryAntigravityCreditsExecuteStream(ctx, req, opts); ok {
+				return result, nil
+			}
+		}
 		return nil, lastErr
 	}
 	return nil, &Error{Code: "auth_not_found", Message: "no auth available"}
@@ -1756,6 +1766,11 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			if lastErr != nil {
 				var bootstrapErr *streamBootstrapError
 				if errors.As(lastErr, &bootstrapErr) && bootstrapErr != nil {
+					if shouldAttemptAntigravityCreditsFallback(m, lastErr, providers) {
+						if result, ok := m.tryAntigravityCreditsExecuteStream(ctx, req, opts); ok {
+							return result, nil
+						}
+					}
 					return streamErrorResult(bootstrapErr.Headers(), bootstrapErr.cause), nil
 				}
 				return nil, lastErr
@@ -1766,6 +1781,11 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			if lastErr != nil {
 				var bootstrapErr *streamBootstrapError
 				if errors.As(lastErr, &bootstrapErr) && bootstrapErr != nil {
+					if shouldAttemptAntigravityCreditsFallback(m, lastErr, providers) {
+						if result, ok := m.tryAntigravityCreditsExecuteStream(ctx, req, opts); ok {
+							return result, nil
+						}
+					}
 					return streamErrorResult(bootstrapErr.Headers(), bootstrapErr.cause), nil
 				}
 				return nil, lastErr
@@ -1778,6 +1798,11 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			if lastErr != nil {
 				var bootstrapErr *streamBootstrapError
 				if errors.As(lastErr, &bootstrapErr) && bootstrapErr != nil {
+					if shouldAttemptAntigravityCreditsFallback(m, lastErr, providers) {
+						if result, ok := m.tryAntigravityCreditsExecuteStream(ctx, req, opts); ok {
+							return result, nil
+						}
+					}
 					return streamErrorResult(bootstrapErr.Headers(), bootstrapErr.cause), nil
 				}
 				return nil, lastErr
@@ -1814,6 +1839,160 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 		}
 		return streamResult, nil
 	}
+}
+
+type creditsCandidateEntry struct {
+	auth     *Auth
+	executor ProviderExecutor
+	provider string
+}
+
+func (m *Manager) findAllAntigravityCreditsCandidateAuths(routeModel string, opts cliproxyexecutor.Options) []creditsCandidateEntry {
+	if m == nil {
+		return nil
+	}
+	if !strings.Contains(strings.ToLower(strings.TrimSpace(routeModel)), "claude") {
+		return nil
+	}
+	pinnedAuthID := pinnedAuthIDFromMetadata(opts.Metadata)
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	var known []creditsCandidateEntry
+	var unknown []creditsCandidateEntry
+	for _, auth := range m.auths {
+		if auth == nil || auth.Disabled || auth.Status == StatusDisabled {
+			continue
+		}
+		if pinnedAuthID != "" && auth.ID != pinnedAuthID {
+			continue
+		}
+		if !strings.EqualFold(strings.TrimSpace(auth.Provider), "antigravity") {
+			continue
+		}
+		providerKey := strings.TrimSpace(strings.ToLower(auth.Provider))
+		executor, ok := m.executors[providerKey]
+		if !ok {
+			continue
+		}
+		hint, okHint := GetAntigravityCreditsHint(auth.ID)
+		if okHint && hint.Known {
+			if !hint.Available {
+				continue
+			}
+			known = append(known, creditsCandidateEntry{auth: auth.Clone(), executor: executor, provider: providerKey})
+			continue
+		}
+		unknown = append(unknown, creditsCandidateEntry{auth: auth.Clone(), executor: executor, provider: providerKey})
+	}
+	sort.Slice(known, func(i, j int) bool {
+		return known[i].auth.ID < known[j].auth.ID
+	})
+	sort.Slice(unknown, func(i, j int) bool {
+		return unknown[i].auth.ID < unknown[j].auth.ID
+	})
+	return append(known, unknown...)
+}
+
+func shouldAttemptAntigravityCreditsFallback(m *Manager, lastErr error, providers []string) bool {
+	if m == nil || lastErr == nil {
+		return false
+	}
+	hasAntigravity := len(providers) == 0
+	for _, p := range providers {
+		if strings.EqualFold(strings.TrimSpace(p), "antigravity") {
+			hasAntigravity = true
+			break
+		}
+	}
+	if !hasAntigravity {
+		return false
+	}
+	cfg, _ := m.runtimeConfig.Load().(*internalconfig.Config)
+	if cfg == nil || !cfg.QuotaExceeded.AntigravityCredits {
+		return false
+	}
+	switch statusCodeFromError(lastErr) {
+	case http.StatusTooManyRequests, http.StatusServiceUnavailable:
+		return true
+	case 0:
+		var authErr *Error
+		if errors.As(lastErr, &authErr) && authErr != nil {
+			return strings.EqualFold(authErr.Code, "auth_not_found")
+		}
+		return false
+	default:
+		return false
+	}
+}
+
+func (m *Manager) tryAntigravityCreditsExecute(ctx context.Context, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, bool) {
+	routeModel := req.Model
+	candidates := m.findAllAntigravityCreditsCandidateAuths(routeModel, opts)
+	for _, c := range candidates {
+		if ctx.Err() != nil {
+			return cliproxyexecutor.Response{}, false
+		}
+		creditsCtx := WithAntigravityCredits(ctx)
+		if rt := m.roundTripperFor(c.auth); rt != nil {
+			creditsCtx = context.WithValue(creditsCtx, roundTripperContextKey{}, rt)
+			creditsCtx = context.WithValue(creditsCtx, "cliproxy.roundtripper", rt)
+		}
+		creditsOpts := ensureRequestedModelMetadata(opts, routeModel)
+		publishSelectedAuthMetadata(creditsOpts.Metadata, c.auth.ID)
+		models := m.executionModelCandidates(c.auth, routeModel)
+		if len(models) == 0 {
+			continue
+		}
+		pooled := len(models) > 1
+		for _, upstreamModel := range models {
+			resultModel := m.stateModelForExecution(c.auth, routeModel, upstreamModel, pooled)
+			execReq := req
+			execReq.Model = upstreamModel
+			resp, errExec := c.executor.Execute(creditsCtx, c.auth, execReq, creditsOpts)
+			result := Result{AuthID: c.auth.ID, Provider: c.provider, Model: resultModel, Success: errExec == nil}
+			if errExec != nil {
+				result.Error = &Error{Message: errExec.Error()}
+				if se, ok := errors.AsType[cliproxyexecutor.StatusError](errExec); ok && se != nil {
+					result.Error.HTTPStatus = se.StatusCode()
+				}
+				if ra := retryAfterFromError(errExec); ra != nil {
+					result.RetryAfter = ra
+				}
+				m.MarkResult(creditsCtx, result)
+				continue
+			}
+			m.MarkResult(creditsCtx, result)
+			return resp, true
+		}
+	}
+	return cliproxyexecutor.Response{}, false
+}
+
+func (m *Manager) tryAntigravityCreditsExecuteStream(ctx context.Context, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, bool) {
+	routeModel := req.Model
+	candidates := m.findAllAntigravityCreditsCandidateAuths(routeModel, opts)
+	for _, c := range candidates {
+		if ctx.Err() != nil {
+			return nil, false
+		}
+		creditsCtx := WithAntigravityCredits(ctx)
+		if rt := m.roundTripperFor(c.auth); rt != nil {
+			creditsCtx = context.WithValue(creditsCtx, roundTripperContextKey{}, rt)
+			creditsCtx = context.WithValue(creditsCtx, "cliproxy.roundtripper", rt)
+		}
+		creditsOpts := ensureRequestedModelMetadata(opts, routeModel)
+		publishSelectedAuthMetadata(creditsOpts.Metadata, c.auth.ID)
+		models := m.executionModelCandidates(c.auth, routeModel)
+		if len(models) == 0 {
+			continue
+		}
+		result, errStream := m.executeStreamWithModelPool(creditsCtx, c.executor, c.auth, c.provider, req, creditsOpts, routeModel, models, len(models) > 1)
+		if errStream != nil {
+			continue
+		}
+		return result, true
+	}
+	return nil, false
 }
 
 func ensureRequestedModelMetadata(opts cliproxyexecutor.Options, requestedModel string) cliproxyexecutor.Options {
@@ -2116,6 +2295,9 @@ func resolveOpenAICompatConfig(cfg *internalconfig.Config, providerKey, compatNa
 	}
 	for i := range cfg.OpenAICompatibility {
 		compat := &cfg.OpenAICompatibility[i]
+		if compat.Disabled {
+			continue
+		}
 		for _, candidate := range candidates {
 			if candidate != "" && strings.EqualFold(strings.TrimSpace(candidate), compat.Name) {
 				return compat

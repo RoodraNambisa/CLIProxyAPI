@@ -47,6 +47,23 @@ func TestParseOpenAIUsageResponses(t *testing.T) {
 	}
 }
 
+func TestParseCodexImageToolUsage(t *testing.T) {
+	data := []byte(`{"response":{"tool_usage":{"image_gen":{"input_tokens":0,"output_tokens":7024,"total_tokens":7024,"output_tokens_details":{"image_tokens":7024,"text_tokens":0}}}}}`)
+	detail, ok := ParseCodexImageToolUsage(data)
+	if !ok {
+		t.Fatal("expected image tool usage")
+	}
+	if detail.InputTokens != 0 {
+		t.Fatalf("input tokens = %d, want 0", detail.InputTokens)
+	}
+	if detail.OutputTokens != 7024 {
+		t.Fatalf("output tokens = %d, want 7024", detail.OutputTokens)
+	}
+	if detail.TotalTokens != 7024 {
+		t.Fatalf("total tokens = %d, want 7024", detail.TotalTokens)
+	}
+}
+
 func TestUsageReporterBuildRecordIncludesLatency(t *testing.T) {
 	reporter := &UsageReporter{
 		provider:    "openai",
@@ -60,5 +77,15 @@ func TestUsageReporterBuildRecordIncludesLatency(t *testing.T) {
 	}
 	if record.Latency > 3*time.Second {
 		t.Fatalf("latency = %v, want <= 3s", record.Latency)
+	}
+}
+
+func TestUsageReporterAdditionalModelSkipsZeroUsage(t *testing.T) {
+	reporter := &UsageReporter{provider: "codex", model: "gpt-5.4", requestedAt: time.Now()}
+	if _, ok := reporter.buildAdditionalModelRecord("gpt-image-2", usage.Detail{}); ok {
+		t.Fatal("expected zero-token additional model usage to be skipped")
+	}
+	if record, ok := reporter.buildAdditionalModelRecord("gpt-image-2", usage.Detail{OutputTokens: 10}); !ok || record.Model != "gpt-image-2" || record.Detail.TotalTokens != 10 {
+		t.Fatalf("unexpected additional model record: %#v ok=%v", record, ok)
 	}
 }

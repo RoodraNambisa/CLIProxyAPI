@@ -345,6 +345,20 @@ func TestConfigSynthesizer_OpenAICompat(t *testing.T) {
 			},
 			wantLen: 1,
 		},
+		{
+			name: "disabled provider skipped",
+			compat: []config.OpenAICompatibility{
+				{
+					Name:     "DisabledProvider",
+					BaseURL:  "https://disabled.api.com",
+					Disabled: true,
+					APIKeyEntries: []config.OpenAICompatibilityAPIKey{
+						{APIKey: "disabled-key"},
+					},
+				},
+			},
+			wantLen: 0,
+		},
 	}
 
 	for _, tt := range tests {

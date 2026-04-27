@@ -5,6 +5,8 @@ import (
 	"strconv"
 	"testing"
 	"time"
+
+	"github.com/tidwall/gjson"
 )
 
 func TestParseCodexRetryAfter(t *testing.T) {
@@ -70,6 +72,58 @@ func TestNewCodexStatusErrTreatsCapacityAsRetryableRateLimit(t *testing.T) {
 	}
 	if err.RetryAfter() != nil {
 		t.Fatalf("expected nil explicit retryAfter for capacity fallback, got %v", *err.RetryAfter())
+	}
+}
+
+func TestNewCodexStatusErrClassifiesKnownFailures(t *testing.T) {
+	testCases := []struct {
+		name       string
+		statusCode int
+		body       []byte
+		wantCode   string
+		wantType   string
+	}{
+		{
+			name:       "context too large by message",
+			statusCode: http.StatusBadRequest,
+			body:       []byte(`{"error":{"message":"maximum context length exceeded"}}`),
+			wantCode:   "context_too_large",
+			wantType:   "invalid_request_error",
+		},
+		{
+			name:       "invalid thinking signature",
+			statusCode: http.StatusBadRequest,
+			body:       []byte(`{"error":{"message":"invalid signature in thinking block"}}`),
+			wantCode:   "thinking_signature_invalid",
+			wantType:   "invalid_request_error",
+		},
+		{
+			name:       "previous response missing",
+			statusCode: http.StatusBadRequest,
+			body:       []byte(`{"error":{"message":"previous_response_id was not found"}}`),
+			wantCode:   "previous_response_not_found",
+			wantType:   "invalid_request_error",
+		},
+		{
+			name:       "auth unavailable",
+			statusCode: http.StatusUnauthorized,
+			body:       []byte(`{"error":{"message":"invalid or expired token"}}`),
+			wantCode:   "auth_unavailable",
+			wantType:   "authentication_error",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := newCodexStatusErr(tc.statusCode, tc.body)
+			body := []byte(err.Error())
+			if got := gjson.GetBytes(body, "error.code").String(); got != tc.wantCode {
+				t.Fatalf("error.code = %q, want %q; body=%s", got, tc.wantCode, body)
+			}
+			if got := gjson.GetBytes(body, "error.type").String(); got != tc.wantType {
+				t.Fatalf("error.type = %q, want %q; body=%s", got, tc.wantType, body)
+			}
+		})
 	}
 }
 

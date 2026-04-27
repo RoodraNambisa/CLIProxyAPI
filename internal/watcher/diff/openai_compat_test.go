@@ -30,7 +30,8 @@ func TestDiffOpenAICompatibility(t *testing.T) {
 				{Name: "m1"},
 				{Name: "m2"},
 			},
-			Headers: map[string]string{"X-Test": "1"},
+			Disabled: true,
+			Headers:  map[string]string{"X-Test": "1"},
 		},
 		{
 			Name:          "provider-b",
@@ -40,7 +41,7 @@ func TestDiffOpenAICompatibility(t *testing.T) {
 
 	changes := DiffOpenAICompatibility(oldList, newList)
 	expectContains(t, changes, "provider added: provider-b (api-keys=1, models=0)")
-	expectContains(t, changes, "provider updated: provider-a (api-keys 1 -> 2, models 1 -> 2, headers updated)")
+	expectContains(t, changes, "provider updated: provider-a (api-keys 1 -> 2, models 1 -> 2, disabled false -> true, headers updated)")
 }
 
 func TestDiffOpenAICompatibility_RemovedAndUnchanged(t *testing.T) {
