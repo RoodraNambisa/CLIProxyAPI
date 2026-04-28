@@ -87,6 +87,13 @@ func stringValue(raw any) string {
 	}
 }
 
+func assertImageToolNAbsent(t *testing.T, payload []byte) {
+	t.Helper()
+	if n := gjson.GetBytes(payload, "tools.0.n"); n.Exists() {
+		t.Fatalf("tool n exists = %s, want absent", n.Raw)
+	}
+}
+
 func newImagesTestHandler(t *testing.T, executor *imageCaptureExecutor, registeredModels ...string) *OpenAIImagesAPIHandler {
 	t.Helper()
 	manager := coreauth.NewManager(nil, nil, nil)
@@ -167,6 +174,7 @@ func TestOpenAIImagesGenerationsNonStreamingUsesCodexImageTool(t *testing.T) {
 	if got := gjson.GetBytes(executor.payload, "tools.0.action").String(); got != "generate" {
 		t.Fatalf("tool action = %q", got)
 	}
+	assertImageToolNAbsent(t, executor.payload)
 	if got := gjson.GetBytes(executor.payload, "tool_choice.type").String(); got != "image_generation" {
 		t.Fatalf("tool_choice.type = %q, want image_generation", got)
 	}
@@ -274,9 +282,7 @@ func TestOpenAIImagesGenerationsAggregatesMultipleNonStreamingImages(t *testing.
 	if executor.calls != 2 {
 		t.Fatalf("executor calls = %d, want 2", executor.calls)
 	}
-	if n := gjson.GetBytes(executor.payload, "tools.0.n"); n.Exists() {
-		t.Fatalf("tool n exists = %s, want absent", n.Raw)
-	}
+	assertImageToolNAbsent(t, executor.payload)
 	if count := len(gjson.Get(resp.Body.String(), "data").Array()); count != 2 {
 		t.Fatalf("data count = %d, want 2: %s", count, resp.Body.String())
 	}
@@ -484,6 +490,9 @@ func TestOpenAIImagesEditsMultipartBuildsDataURLsAndMask(t *testing.T) {
 	if err := writer.WriteField("input_fidelity", "high"); err != nil {
 		t.Fatalf("WriteField input_fidelity: %v", err)
 	}
+	if err := writer.WriteField("n", "1"); err != nil {
+		t.Fatalf("WriteField n: %v", err)
+	}
 	imagePart, err := writer.CreateFormFile("image[]", "image.png")
 	if err != nil {
 		t.Fatalf("CreateFormFile image: %v", err)
@@ -512,6 +521,7 @@ func TestOpenAIImagesEditsMultipartBuildsDataURLsAndMask(t *testing.T) {
 	if got := gjson.GetBytes(executor.payload, "tools.0.input_fidelity").String(); got != "high" {
 		t.Fatalf("tool input_fidelity = %q", got)
 	}
+	assertImageToolNAbsent(t, executor.payload)
 	imageURL := gjson.GetBytes(executor.payload, "input.0.content.1.image_url").String()
 	if !strings.HasPrefix(imageURL, "data:image/png;base64,") {
 		t.Fatalf("image_url = %q", imageURL)
@@ -563,6 +573,30 @@ func TestOpenAIImagesEditsCanOverrideInputFidelity(t *testing.T) {
 	if got := gjson.GetBytes(executor.payload, "tools.0.input_fidelity"); got.Exists() {
 		t.Fatalf("tool input_fidelity exists = %s, want absent", got.Raw)
 	}
+}
+
+func TestOpenAIImagesEditsJSONDoesNotForwardN(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	executor := &imageCaptureExecutor{}
+	h := newImagesTestHandler(t, executor)
+	router := gin.New()
+	router.POST("/v1/images/edits", h.Edits)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/images/edits", strings.NewReader(`{"model":"gpt-image-2","prompt":"edit this","n":1,"images":[{"image_url":"data:image/png;base64,aGVsbG8="}]}`))
+	req.Header.Set("Content-Type", "application/json")
+	resp := httptest.NewRecorder()
+	router.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d, body=%s", resp.Code, http.StatusOK, resp.Body.String())
+	}
+	if executor.calls != 1 {
+		t.Fatalf("executor calls = %d, want 1", executor.calls)
+	}
+	if got := gjson.GetBytes(executor.payload, "tools.0.action").String(); got != "edit" {
+		t.Fatalf("tool action = %q", got)
+	}
+	assertImageToolNAbsent(t, executor.payload)
 }
 
 func TestConvertResponsesToImagesResponse(t *testing.T) {
@@ -764,9 +798,7 @@ func TestOpenAIImagesStreamingSupportsMultipleCompletedImages(t *testing.T) {
 	if executor.streamCalls != 2 {
 		t.Fatalf("stream calls = %d, want 2", executor.streamCalls)
 	}
-	if n := gjson.GetBytes(executor.payload, "tools.0.n"); n.Exists() {
-		t.Fatalf("tool n exists = %s, want absent", n.Raw)
-	}
+	assertImageToolNAbsent(t, executor.payload)
 	body := resp.Body.String()
 	if count := strings.Count(body, "event: image_generation.completed"); count != 2 {
 		t.Fatalf("completed event count = %d, want 2: %s", count, body)
