@@ -662,9 +662,16 @@ func authEligibleForMaintenanceDelete(auth *coreauth.Auth, result *coreauth.Resu
 	return "", false
 }
 
-func authEligibleForMaintenanceDisable(auth *coreauth.Auth, cfg config.AuthMaintenanceConfig) (string, bool) {
+func authEligibleForMaintenanceDisable(auth *coreauth.Auth, result *coreauth.Result, cfg config.AuthMaintenanceConfig) (string, bool) {
 	if auth == nil || auth.Disabled || auth.Status == coreauth.StatusDisabled {
 		return "", false
+	}
+	statusCode := authMaintenanceStatusCode(auth, result)
+	if containsStatusCode(cfg.DeleteStatusCodes, statusCode) {
+		return "", false
+	}
+	if containsStatusCode(cfg.DisableStatusCodes, statusCode) {
+		return fmt.Sprintf("http_%d", statusCode), true
 	}
 	if cfg.DeleteQuotaExceeded && cfg.DisableQuotaExceeded {
 		return "", false
@@ -983,6 +990,48 @@ func (s *Service) scanAuthMaintenanceCandidates(cfg config.AuthMaintenanceConfig
 	return candidates
 }
 
+func (s *Service) scanAuthMaintenanceDisableCandidates(cfg config.AuthMaintenanceConfig, authDir string) []authMaintenanceCandidate {
+	if s == nil || s.coreManager == nil || !cfg.Enable {
+		return nil
+	}
+	snapshot := s.coreManager.List()
+	grouped := make(map[string]authMaintenanceCandidate)
+	for _, auth := range snapshot {
+		reason, ok := authEligibleForMaintenanceDisable(auth, nil, cfg)
+		if !ok {
+			continue
+		}
+		candidate, ok := s.authMaintenanceCandidateForAuth(auth, authDir, reason)
+		if !ok {
+			continue
+		}
+		group := grouped[candidate.Key]
+		if group.Key == "" {
+			group = candidate
+		}
+		if group.Reason == "" {
+			group.Reason = candidate.Reason
+		}
+		seen := make(map[string]struct{}, len(group.IDs))
+		for _, id := range group.IDs {
+			seen[id] = struct{}{}
+		}
+		for _, id := range candidate.IDs {
+			if _, exists := seen[id]; exists {
+				continue
+			}
+			group.IDs = append(group.IDs, id)
+			seen[id] = struct{}{}
+		}
+		grouped[candidate.Key] = group
+	}
+	candidates := make([]authMaintenanceCandidate, 0, len(grouped))
+	for _, candidate := range grouped {
+		candidates = append(candidates, candidate)
+	}
+	return candidates
+}
+
 func (s *Service) startAuthMaintenance(parent context.Context) {
 	if s == nil {
 		return
@@ -1056,6 +1105,9 @@ func (s *Service) startAuthMaintenance(parent context.Context) {
 					if s.enqueueAuthMaintenanceCandidate(candidate) {
 						log.Debugf("auth maintenance queued %s (%s)", candidate.Path, candidate.Reason)
 					}
+				}
+				for _, candidate := range s.scanAuthMaintenanceDisableCandidates(cfg, authDir) {
+					s.disableAuthMaintenanceCandidate(context.Background(), candidate, false)
 				}
 				if s.hasQueuedAuthMaintenanceCandidates() {
 					continue
@@ -1140,7 +1192,7 @@ func (s *Service) handleAuthMaintenanceResult(_ context.Context, result coreauth
 		}
 		return
 	}
-	if reason, ok := authEligibleForMaintenanceDisable(auth, cfg); ok {
+	if reason, ok := authEligibleForMaintenanceDisable(auth, &result, cfg); ok {
 		candidate, candidateOK := s.authMaintenanceCandidateForAuth(auth, authDir, reason)
 		if !candidateOK {
 			return

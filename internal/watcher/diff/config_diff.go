@@ -99,6 +99,9 @@ func BuildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 	if !reflect.DeepEqual(oldCfg.AuthMaintenance.DeleteStatusCodes, newCfg.AuthMaintenance.DeleteStatusCodes) {
 		changes = append(changes, "auth-maintenance.delete-status-codes: updated")
 	}
+	if !reflect.DeepEqual(oldCfg.AuthMaintenance.DisableStatusCodes, newCfg.AuthMaintenance.DisableStatusCodes) {
+		changes = append(changes, "auth-maintenance.disable-status-codes: updated")
+	}
 	if oldCfg.AuthMaintenance.DeleteQuotaExceeded != newCfg.AuthMaintenance.DeleteQuotaExceeded {
 		changes = append(changes, fmt.Sprintf("auth-maintenance.delete-quota-exceeded: %t -> %t", oldCfg.AuthMaintenance.DeleteQuotaExceeded, newCfg.AuthMaintenance.DeleteQuotaExceeded))
 	}

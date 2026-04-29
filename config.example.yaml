@@ -115,7 +115,8 @@ auth-maintenance:
   enable: false
   scan-interval-seconds: 30
   delete-interval-seconds: 5
-  delete-status-codes: [401]
+  delete-status-codes: []
+  disable-status-codes: [401]
   delete-quota-exceeded: false
   quota-strike-threshold: 6
   disable-quota-exceeded: false

@@ -235,6 +235,8 @@ type AuthMaintenanceConfig struct {
 	DeleteIntervalSeconds int `yaml:"delete-interval-seconds" json:"delete-interval-seconds"`
 	// DeleteStatusCodes defines HTTP status codes that should trigger deletion immediately.
 	DeleteStatusCodes []int `yaml:"delete-status-codes" json:"delete-status-codes"`
+	// DisableStatusCodes defines HTTP status codes that should disable auths without deleting files.
+	DisableStatusCodes []int `yaml:"disable-status-codes" json:"disable-status-codes"`
 	// DeleteQuotaExceeded enables deletion for auths that repeatedly hit quota limits.
 	DeleteQuotaExceeded bool `yaml:"delete-quota-exceeded" json:"delete-quota-exceeded"`
 	// QuotaStrikeThreshold is the minimum number of 429 hits required before the delete path triggers.

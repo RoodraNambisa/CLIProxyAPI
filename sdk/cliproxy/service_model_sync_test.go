@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -351,6 +352,19 @@ func containsRegisteredModel(models []*registry.ModelInfo, modelID string) bool 
 	return false
 }
 
+func readServiceTestAuthMetadata(t *testing.T, path string) map[string]any {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read auth file: %v", err)
+	}
+	var metadata map[string]any
+	if err := json.Unmarshal(data, &metadata); err != nil {
+		t.Fatalf("unmarshal auth file: %v", err)
+	}
+	return metadata
+}
+
 func TestServiceDeleteAuthMaintenanceCandidate_PersistsDelete(t *testing.T) {
 	authDir := t.TempDir()
 	store := &serviceCountingDeleteStore{}
@@ -396,6 +410,191 @@ func TestServiceDeleteAuthMaintenanceCandidate_PersistsDelete(t *testing.T) {
 	}
 	if _, ok := service.coreManager.GetByID(auth.ID); ok {
 		t.Fatal("expected auth to be removed from runtime state")
+	}
+}
+
+func TestServiceHandleAuthMaintenanceResult_DisablesStatusCodeWithoutDeletingFile(t *testing.T) {
+	authDir := t.TempDir()
+	store := sdkauth.NewFileTokenStore()
+	store.SetBaseDir(authDir)
+	service := &Service{
+		cfg: &config.Config{
+			AuthDir: authDir,
+			AuthMaintenance: config.AuthMaintenanceConfig{
+				Enable:             true,
+				DisableStatusCodes: []int{http.StatusUnauthorized},
+			},
+		},
+		coreManager: coreauth.NewManager(store, nil, nil),
+	}
+
+	path := filepath.Join(authDir, "service-maintenance-disable-401-auth.json")
+	if err := os.WriteFile(path, []byte(`{"type":"claude","email":"disabled@example.com"}`), 0o600); err != nil {
+		t.Fatalf("write auth file: %v", err)
+	}
+	auth := &coreauth.Auth{
+		ID:       "service-maintenance-disable-401-auth.json",
+		Provider: "claude",
+		Status:   coreauth.StatusActive,
+		FileName: path,
+		Attributes: map[string]string{
+			"path": path,
+		},
+		Metadata: map[string]any{"type": "claude", "email": "disabled@example.com"},
+	}
+	if _, err := service.coreManager.Register(context.Background(), auth); err != nil {
+		t.Fatalf("register auth: %v", err)
+	}
+
+	service.handleAuthMaintenanceResult(context.Background(), coreauth.Result{
+		AuthID:   auth.ID,
+		Provider: auth.Provider,
+		Success:  false,
+		Error:    &coreauth.Error{HTTPStatus: http.StatusUnauthorized, Message: "unauthorized"},
+	})
+
+	current, ok := service.coreManager.GetByID(auth.ID)
+	if !ok || current == nil {
+		t.Fatal("expected auth to remain registered")
+	}
+	if !current.Disabled || current.Status != coreauth.StatusDisabled {
+		t.Fatalf("disabled=%v status=%q, want disabled status", current.Disabled, current.Status)
+	}
+	if got, _ := current.Metadata[authMaintenanceActionMetadataKey].(string); got != authMaintenanceDisableAction {
+		t.Fatalf("maintenance action = %q, want %q", got, authMaintenanceDisableAction)
+	}
+	if got, _ := current.Metadata[authMaintenanceReasonMetadataKey].(string); got != "http_401" {
+		t.Fatalf("maintenance reason = %q, want http_401", got)
+	}
+	metadata := readServiceTestAuthMetadata(t, path)
+	if disabled, _ := metadata["disabled"].(bool); !disabled {
+		t.Fatalf("persisted disabled = %#v, want true", metadata["disabled"])
+	}
+	service.maintenanceMu.Lock()
+	queueLen := len(service.maintenanceQueue)
+	service.maintenanceMu.Unlock()
+	if queueLen != 0 {
+		t.Fatalf("maintenance queue length = %d, want 0", queueLen)
+	}
+}
+
+func TestServiceScanAuthMaintenance_DisablesStatusCodeWithoutQueueingDelete(t *testing.T) {
+	authDir := t.TempDir()
+	store := sdkauth.NewFileTokenStore()
+	store.SetBaseDir(authDir)
+	service := &Service{
+		cfg:         &config.Config{AuthDir: authDir},
+		coreManager: coreauth.NewManager(store, nil, nil),
+	}
+
+	path := filepath.Join(authDir, "service-maintenance-scan-disable-401-auth.json")
+	if err := os.WriteFile(path, []byte(`{"type":"claude","email":"scan@example.com"}`), 0o600); err != nil {
+		t.Fatalf("write auth file: %v", err)
+	}
+	auth := &coreauth.Auth{
+		ID:            "service-maintenance-scan-disable-401-auth.json",
+		Provider:      "claude",
+		Status:        coreauth.StatusError,
+		StatusMessage: "unauthorized",
+		LastError:     &coreauth.Error{HTTPStatus: http.StatusUnauthorized, Message: "unauthorized"},
+		FileName:      path,
+		Attributes: map[string]string{
+			"path": path,
+		},
+		Metadata: map[string]any{"type": "claude", "email": "scan@example.com"},
+	}
+	if _, err := service.coreManager.Register(context.Background(), auth); err != nil {
+		t.Fatalf("register auth: %v", err)
+	}
+
+	cfg := config.AuthMaintenanceConfig{
+		Enable:             true,
+		DisableStatusCodes: []int{http.StatusUnauthorized},
+	}
+	if candidates := service.scanAuthMaintenanceCandidates(cfg, authDir); len(candidates) != 0 {
+		t.Fatalf("delete candidates = %d, want 0", len(candidates))
+	}
+	candidates := service.scanAuthMaintenanceDisableCandidates(cfg, authDir)
+	if len(candidates) != 1 {
+		t.Fatalf("disable candidates = %d, want 1", len(candidates))
+	}
+	if got := strings.TrimSpace(candidates[0].Reason); got != "http_401" {
+		t.Fatalf("candidate reason = %q, want http_401", got)
+	}
+	if !service.disableAuthMaintenanceCandidate(context.Background(), candidates[0], false) {
+		t.Fatal("expected disable maintenance candidate to persist")
+	}
+	current, ok := service.coreManager.GetByID(auth.ID)
+	if !ok || current == nil {
+		t.Fatal("expected auth to remain registered")
+	}
+	if !current.Disabled || current.Status != coreauth.StatusDisabled {
+		t.Fatalf("disabled=%v status=%q, want disabled status", current.Disabled, current.Status)
+	}
+	if candidates := service.scanAuthMaintenanceDisableCandidates(cfg, authDir); len(candidates) != 0 {
+		t.Fatalf("disable candidates after disabled auth = %d, want 0", len(candidates))
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("expected auth file to remain after disable, stat err=%v", err)
+	}
+}
+
+func TestServiceAuthMaintenance_DeleteStatusCodeTakesPrecedenceOverDisable(t *testing.T) {
+	authDir := t.TempDir()
+	store := sdkauth.NewFileTokenStore()
+	store.SetBaseDir(authDir)
+	service := &Service{
+		cfg: &config.Config{
+			AuthDir: authDir,
+			AuthMaintenance: config.AuthMaintenanceConfig{
+				Enable:             true,
+				DeleteStatusCodes:  []int{http.StatusUnauthorized},
+				DisableStatusCodes: []int{http.StatusUnauthorized},
+			},
+		},
+		coreManager: coreauth.NewManager(store, nil, nil),
+	}
+
+	path := filepath.Join(authDir, "service-maintenance-delete-priority-401-auth.json")
+	if err := os.WriteFile(path, []byte(`{"type":"claude","email":"delete-priority@example.com"}`), 0o600); err != nil {
+		t.Fatalf("write auth file: %v", err)
+	}
+	auth := &coreauth.Auth{
+		ID:       "service-maintenance-delete-priority-401-auth.json",
+		Provider: "claude",
+		Status:   coreauth.StatusActive,
+		FileName: path,
+		Attributes: map[string]string{
+			"path": path,
+		},
+		Metadata: map[string]any{"type": "claude", "email": "delete-priority@example.com"},
+	}
+	if _, err := service.coreManager.Register(context.Background(), auth); err != nil {
+		t.Fatalf("register auth: %v", err)
+	}
+
+	service.handleAuthMaintenanceResult(context.Background(), coreauth.Result{
+		AuthID:   auth.ID,
+		Provider: auth.Provider,
+		Success:  false,
+		Error:    &coreauth.Error{HTTPStatus: http.StatusUnauthorized, Message: "unauthorized"},
+	})
+
+	current, ok := service.coreManager.GetByID(auth.ID)
+	if !ok || current == nil {
+		t.Fatal("expected auth to remain registered before queued delete runs")
+	}
+	if !authMaintenancePendingDelete(current) {
+		t.Fatal("expected auth to be marked pending delete")
+	}
+	if got, _ := current.Metadata[authMaintenanceActionMetadataKey].(string); got != authMaintenanceDeleteAction {
+		t.Fatalf("maintenance action = %q, want %q", got, authMaintenanceDeleteAction)
+	}
+	service.maintenanceMu.Lock()
+	queueLen := len(service.maintenanceQueue)
+	service.maintenanceMu.Unlock()
+	if queueLen != 1 {
+		t.Fatalf("maintenance queue length = %d, want 1", queueLen)
 	}
 }
 
