@@ -1040,7 +1040,9 @@ func parseCodexWebsocketError(payload []byte) (error, bool) {
 	out := buildCodexWebsocketErrorPayload(payload, status)
 	headers := parseCodexWebsocketErrorHeaders(payload)
 	statusError := statusErr{code: status, msg: string(out)}
-	if isCodexWebsocketConnectionLimitError(payload) {
+	if retryAfter := parseCodexRetryAfter(status, out, time.Now()); retryAfter != nil {
+		statusError.retryAfter = retryAfter
+	} else if isCodexWebsocketConnectionLimitError(payload) {
 		retryAfter := time.Duration(0)
 		statusError.retryAfter = &retryAfter
 	}
