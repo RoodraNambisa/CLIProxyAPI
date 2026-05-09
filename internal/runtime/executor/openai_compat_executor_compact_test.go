@@ -58,7 +58,7 @@ func TestOpenAICompatExecutorCompactPassthrough(t *testing.T) {
 	}
 }
 
-func TestOpenAICompatExecutorPayloadOverrideWinsOverThinkingSuffix(t *testing.T) {
+func TestOpenAICompatExecutorThinkingSuffixWinsOverPayloadOverride(t *testing.T) {
 	var gotBody []byte
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
@@ -97,8 +97,8 @@ func TestOpenAICompatExecutorPayloadOverrideWinsOverThinkingSuffix(t *testing.T)
 	if err != nil {
 		t.Fatalf("Execute error: %v", err)
 	}
-	if got := gjson.GetBytes(gotBody, "reasoning_effort").String(); got != "low" {
-		t.Fatalf("reasoning_effort = %q, want %q; body=%s", got, "low", string(gotBody))
+	if got := gjson.GetBytes(gotBody, "reasoning_effort").String(); got != "high" {
+		t.Fatalf("reasoning_effort = %q, want %q; body=%s", got, "high", string(gotBody))
 	}
 }
 

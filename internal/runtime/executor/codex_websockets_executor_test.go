@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -67,7 +68,7 @@ func TestCodexWebsocketsExecutePreservesPreviousResponseIDUpstream(t *testing.T)
 	}))
 	defer server.Close()
 
-	exec := NewCodexWebsocketsExecutor(&config.Config{SDKConfig: config.SDKConfig{DisableImageGeneration: config.DisableImageGenerationAll}})
+	exec := NewCodexWebsocketsExecutor(&config.Config{})
 	auth := &cliproxyauth.Auth{Attributes: map[string]string{"api_key": "sk-test", "base_url": server.URL}}
 	req := cliproxyexecutor.Request{
 		Model:   "gpt-5-codex",
@@ -174,8 +175,11 @@ func TestApplyCodexWebsocketHeadersDefaultsToCurrentResponsesBeta(t *testing.T) 
 	if got := headers.Get("X-Client-Request-Id"); got != "" {
 		t.Fatalf("X-Client-Request-Id = %q, want empty", got)
 	}
-	if got := headers.Get("Session_id"); got == "" {
-		t.Fatalf("Session_id = %q, want non-empty for default Mac OS user agent", got)
+	if got := headerValueCaseInsensitive(headers, "session_id"); got == "" {
+		t.Fatalf("session_id = %q, want non-empty for default Mac OS user agent", got)
+	}
+	if _, ok := headers["session_id"]; !ok {
+		t.Fatalf("expected lowercase session_id header key, got %#v", headers)
 	}
 }
 
@@ -311,8 +315,8 @@ func TestApplyCodexWebsocketHeadersSkipsSessionIDForNonMacUserAgent(t *testing.T
 
 	headers := applyCodexWebsocketHeaders(context.Background(), http.Header{}, auth, "", cfg)
 
-	if got := headers.Get("Session_id"); got != "" {
-		t.Fatalf("Session_id = %q, want empty for non-Mac user agent", got)
+	if got := headerValueCaseInsensitive(headers, "session_id"); got != "" {
+		t.Fatalf("session_id = %q, want empty for non-Mac user agent", got)
 	}
 }
 
