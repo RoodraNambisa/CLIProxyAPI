@@ -100,3 +100,16 @@ func TestSanitizeCodexCustomModels(t *testing.T) {
 		}
 	}
 }
+
+func TestNormalizeStatusCodes(t *testing.T) {
+	got := NormalizeStatusCodes([]int{0, 429, 401, 429, 99, 600, 500})
+	want := []int{429, 401, 500}
+	if len(got) != len(want) {
+		t.Fatalf("status codes = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("status codes = %v, want %v", got, want)
+		}
+	}
+}

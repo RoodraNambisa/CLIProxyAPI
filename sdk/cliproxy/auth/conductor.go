@@ -94,6 +94,22 @@ func quotaCooldownDisabledForAuth(auth *Auth) bool {
 	return quotaCooldownDisabled.Load()
 }
 
+func (m *Manager) cooldownSkippedForStatus(statusCode int) bool {
+	if m == nil || statusCode == 0 {
+		return false
+	}
+	cfg, _ := m.runtimeConfig.Load().(*internalconfig.Config)
+	if cfg == nil || len(cfg.NoCooldownStatusCodes) == 0 {
+		return false
+	}
+	for _, code := range cfg.NoCooldownStatusCodes {
+		if code == statusCode {
+			return true
+		}
+	}
+	return false
+}
+
 // Result captures execution outcome used to adjust auth state.
 type Result struct {
 	// AuthID references the auth that produced this result.
@@ -2699,9 +2715,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 		} else {
 			if result.Model != "" {
 				if !isRequestScopedNotFoundResultError(result.Error) {
-					disableCooling := quotaCooldownDisabledForAuth(auth)
 					state := ensureModelState(auth, result.Model)
-					state.Unavailable = true
 					state.Status = StatusError
 					state.UpdatedAt = now
 					if result.Error != nil {
@@ -2712,12 +2726,17 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 					}
 
 					statusCode := statusCodeFromResult(result.Error)
-					if isModelSupportResultError(result.Error) {
+					skipCooling := m.cooldownSkippedForStatus(statusCode)
+					disableCooling := quotaCooldownDisabledForAuth(auth)
+					if !skipCooling {
+						state.Unavailable = true
+					}
+					if isModelSupportResultError(result.Error) && !skipCooling {
 						next := now.Add(12 * time.Hour)
 						state.NextRetryAfter = next
 						suspendReason = "model_not_supported"
 						shouldSuspendModel = true
-					} else {
+					} else if !skipCooling {
 						switch statusCode {
 						case 401:
 							if disableCooling {
@@ -2791,7 +2810,8 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 					updateAggregatedAvailability(auth, now)
 				}
 			} else {
-				applyAuthFailureState(auth, result.Error, result.RetryAfter, now)
+				statusCode := statusCodeFromResult(result.Error)
+				applyAuthFailureState(auth, result.Error, result.RetryAfter, now, m.cooldownSkippedForStatus(statusCode))
 			}
 		}
 
@@ -3128,15 +3148,13 @@ func isRequestInvalidError(err error) bool {
 	}
 }
 
-func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Duration, now time.Time) {
+func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Duration, now time.Time, skipCooling bool) {
 	if auth == nil {
 		return
 	}
 	if isRequestScopedNotFoundResultError(resultErr) {
 		return
 	}
-	disableCooling := quotaCooldownDisabledForAuth(auth)
-	auth.Unavailable = true
 	auth.Status = StatusError
 	auth.UpdatedAt = now
 	if resultErr != nil {
@@ -3145,6 +3163,11 @@ func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Durati
 			auth.StatusMessage = resultErr.Message
 		}
 	}
+	if skipCooling {
+		return
+	}
+	disableCooling := quotaCooldownDisabledForAuth(auth)
+	auth.Unavailable = true
 	statusCode := statusCodeFromResult(resultErr)
 	switch statusCode {
 	case 401:

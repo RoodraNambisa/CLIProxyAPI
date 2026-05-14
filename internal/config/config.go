@@ -73,6 +73,9 @@ type Config struct {
 	// DisableCooling disables quota cooldown scheduling when true.
 	DisableCooling bool `yaml:"disable-cooling" json:"disable-cooling"`
 
+	// NoCooldownStatusCodes lists HTTP status codes that should record failures without scheduling auth/model cooldowns.
+	NoCooldownStatusCodes []int `yaml:"no-cooldown-status-codes" json:"no-cooldown-status-codes"`
+
 	// AuthAutoRefreshWorkers overrides the size of the core auth auto-refresh worker pool.
 	// When <= 0, the default worker count is used.
 	AuthAutoRefreshWorkers int `yaml:"auth-auto-refresh-workers" json:"auth-auto-refresh-workers"`
@@ -739,6 +742,7 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	if cfg.MaxRetryCredentials < 0 {
 		cfg.MaxRetryCredentials = 0
 	}
+	cfg.NoCooldownStatusCodes = NormalizeStatusCodes(cfg.NoCooldownStatusCodes)
 
 	// Sanitize Gemini API key configuration and migrate legacy entries.
 	cfg.SanitizeGeminiKeys()
@@ -986,6 +990,26 @@ func isCodexCustomModelGroup(group string) bool {
 	default:
 		return false
 	}
+}
+
+// NormalizeStatusCodes keeps valid HTTP status codes in first-seen order and removes duplicates.
+func NormalizeStatusCodes(codes []int) []int {
+	if len(codes) == 0 {
+		return nil
+	}
+	seen := make(map[int]struct{}, len(codes))
+	out := make([]int, 0, len(codes))
+	for _, code := range codes {
+		if code < 100 || code > 599 {
+			continue
+		}
+		if _, ok := seen[code]; ok {
+			continue
+		}
+		seen[code] = struct{}{}
+		out = append(out, code)
+	}
+	return out
 }
 
 // SanitizeOpenAICompatibility removes OpenAI-compatibility provider entries that are

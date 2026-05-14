@@ -890,6 +890,106 @@ func TestManager_MarkResult_RespectsAuthDisableCoolingOverride_On403(t *testing.
 	}
 }
 
+func TestManager_MarkResult_NoCooldownStatusCodeSkipsModelCooldown(t *testing.T) {
+	prev := quotaCooldownDisabled.Load()
+	quotaCooldownDisabled.Store(false)
+	t.Cleanup(func() { quotaCooldownDisabled.Store(prev) })
+
+	m := NewManager(nil, nil, nil)
+	m.SetConfig(&internalconfig.Config{NoCooldownStatusCodes: []int{http.StatusUnauthorized}})
+
+	auth := &Auth{
+		ID:       "auth-no-cooldown-401",
+		Provider: "claude",
+	}
+	if _, errRegister := m.Register(context.Background(), auth); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+
+	model := "test-model-no-cooldown-401"
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient(auth.ID, "claude", []*registry.ModelInfo{{ID: model}})
+	t.Cleanup(func() { reg.UnregisterClient(auth.ID) })
+
+	m.MarkResult(context.Background(), Result{
+		AuthID:   auth.ID,
+		Provider: "claude",
+		Model:    model,
+		Success:  false,
+		Error:    &Error{HTTPStatus: http.StatusUnauthorized, Message: "unauthorized"},
+	})
+
+	updated, ok := m.GetByID(auth.ID)
+	if !ok || updated == nil {
+		t.Fatalf("expected auth to be present")
+	}
+	if updated.Unavailable {
+		t.Fatal("expected auth to remain available")
+	}
+	state := updated.ModelStates[model]
+	if state == nil {
+		t.Fatalf("expected model state to be present")
+	}
+	if state.Unavailable {
+		t.Fatal("expected model state to remain available")
+	}
+	if !state.NextRetryAfter.IsZero() {
+		t.Fatalf("expected NextRetryAfter to be zero, got %v", state.NextRetryAfter)
+	}
+	if state.Quota.Exceeded {
+		t.Fatalf("expected quota state to remain clear, got %#v", state.Quota)
+	}
+	if state.LastError == nil {
+		t.Fatal("expected LastError to be recorded")
+	}
+	if count := reg.GetModelCount(model); count <= 0 {
+		t.Fatalf("expected model count > 0 when cooldown is skipped, got %d", count)
+	}
+}
+
+func TestManager_MarkResult_NoCooldownStatusCodeSkipsAuthCooldown(t *testing.T) {
+	prev := quotaCooldownDisabled.Load()
+	quotaCooldownDisabled.Store(false)
+	t.Cleanup(func() { quotaCooldownDisabled.Store(prev) })
+
+	m := NewManager(nil, nil, nil)
+	m.SetConfig(&internalconfig.Config{NoCooldownStatusCodes: []int{http.StatusTooManyRequests}})
+
+	auth := &Auth{
+		ID:       "auth-no-cooldown-429",
+		Provider: "claude",
+	}
+	if _, errRegister := m.Register(context.Background(), auth); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+
+	retryAfter := 2 * time.Minute
+	m.MarkResult(context.Background(), Result{
+		AuthID:     auth.ID,
+		Provider:   "claude",
+		Success:    false,
+		RetryAfter: &retryAfter,
+		Error:      &Error{HTTPStatus: http.StatusTooManyRequests, Message: "quota exhausted"},
+	})
+
+	updated, ok := m.GetByID(auth.ID)
+	if !ok || updated == nil {
+		t.Fatalf("expected auth to be present")
+	}
+	if updated.Unavailable {
+		t.Fatal("expected auth to remain available")
+	}
+	if !updated.NextRetryAfter.IsZero() {
+		t.Fatalf("expected NextRetryAfter to be zero, got %v", updated.NextRetryAfter)
+	}
+	if updated.Quota.Exceeded || updated.Quota.StrikeCount != 0 {
+		t.Fatalf("expected quota state to remain clear, got %#v", updated.Quota)
+	}
+	if updated.LastError == nil {
+		t.Fatal("expected LastError to be recorded")
+	}
+}
+
 func TestManager_Execute_DisableCooling_DoesNotBlackoutAfter403(t *testing.T) {
 	prev := quotaCooldownDisabled.Load()
 	quotaCooldownDisabled.Store(false)

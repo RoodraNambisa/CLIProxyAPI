@@ -225,6 +225,7 @@ func TestBuildConfigChangeDetails_FlagsAndKeys(t *testing.T) {
 		LoggingToFile:          false,
 		UsageStatisticsEnabled: false,
 		DisableCooling:         false,
+		NoCooldownStatusCodes:  []int{429},
 		RequestRetry:           1,
 		MaxRetryCredentials:    1,
 		MaxRetryInterval:       1,
@@ -249,6 +250,7 @@ func TestBuildConfigChangeDetails_FlagsAndKeys(t *testing.T) {
 		LoggingToFile:          true,
 		UsageStatisticsEnabled: true,
 		DisableCooling:         true,
+		NoCooldownStatusCodes:  []int{401, 429},
 		RequestRetry:           2,
 		MaxRetryCredentials:    3,
 		MaxRetryInterval:       3,
@@ -287,6 +289,7 @@ func TestBuildConfigChangeDetails_FlagsAndKeys(t *testing.T) {
 	expectContains(t, details, "logging-to-file: false -> true")
 	expectContains(t, details, "usage-statistics-enabled: false -> true")
 	expectContains(t, details, "disable-cooling: false -> true")
+	expectContains(t, details, "no-cooldown-status-codes: updated")
 	expectContains(t, details, "request-log: false -> true")
 	expectContains(t, details, "request-retry: 1 -> 2")
 	expectContains(t, details, "max-retry-credentials: 1 -> 3")
