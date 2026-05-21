@@ -19,6 +19,7 @@ import (
 	. "github.com/router-for-me/CLIProxyAPI/v6/internal/constant"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/api/handlers"
+	"github.com/tidwall/gjson"
 )
 
 const (
@@ -289,6 +290,7 @@ func (h *OpenAIImagesAPIHandler) handleStreamingImagesResponse(c *gin.Context, r
 		return
 	}
 	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
+	cliCtx = handlers.WithImageGenerationStreamPassthrough(cliCtx, true)
 	dataChan, upstreamHeaders, errChan := h.ExecuteStreamWithProvidersAndExecutionModel(cliCtx, []string{Codex}, h.HandlerType(), imageModel, codexModel, rawJSON, "")
 
 	setSSEHeaders := func() {
@@ -352,6 +354,7 @@ func (h *OpenAIImagesAPIHandler) handleMultiStreamingImagesResponse(c *gin.Conte
 	c.Header("Access-Control-Allow-Origin", "*")
 	for i := 0; i < count; i++ {
 		cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
+		cliCtx = handlers.WithImageGenerationStreamPassthrough(cliCtx, true)
 		dataChan, upstreamHeaders, errChan := h.ExecuteStreamWithProvidersAndExecutionModel(cliCtx, []string{Codex}, h.HandlerType(), imageModel, codexModel, rawJSON, "")
 		if i == 0 {
 			handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
@@ -694,45 +697,127 @@ func convertResponsesToImagesResponse(raw []byte, fallbackCreated int64) ([]byte
 }
 
 func parseResponsesToImagesResponse(raw []byte, fallbackCreated int64) (imagesResponse, error) {
-	respObj, err := parseResponsesImageObject(raw)
-	if err != nil {
-		return imagesResponse{}, err
+	respObj := responsesImageResult(raw)
+	if !respObj.Exists() || !respObj.IsObject() {
+		return imagesResponse{}, errors.New("invalid Codex response")
 	}
-	created := respObj.CreatedAt
+	created := respObj.Get("created_at").Int()
 	if created == 0 {
 		created = fallbackCreated
 	}
 	out := imagesResponse{
 		Created: created,
-		Data:    imageResultsFromOutput(respObj.Output),
+		Data:    imageResultsFromOutputResult(respObj.Get("output")),
 	}
 	if len(out.Data) == 0 {
 		return imagesResponse{}, errors.New("upstream did not return image output")
 	}
 	out.applyMetadataFromFirstImage()
-	if usage := imageUsageFromToolUsage(respObj.ToolUsage); len(bytes.TrimSpace(usage)) > 0 && string(bytes.TrimSpace(usage)) != "null" {
-		out.Usage = usage
-	} else if usage := imageUsageFromOutput(respObj.Output); len(bytes.TrimSpace(usage)) > 0 && string(bytes.TrimSpace(usage)) != "null" {
-		out.Usage = usage
-	} else if usage := respObj.Usage; len(bytes.TrimSpace(usage)) > 0 && string(bytes.TrimSpace(usage)) != "null" {
+	if usage := imageUsageFromResponseResult(respObj); len(bytes.TrimSpace(usage)) > 0 && string(bytes.TrimSpace(usage)) != "null" {
 		out.Usage = usage
 	}
 	return out, nil
 }
 
-func parseResponsesImageObject(raw []byte) (responsesImageObject, error) {
-	var obj responsesImageObject
-	if err := json.Unmarshal(raw, &obj); err != nil {
-		return obj, fmt.Errorf("invalid Codex response: %w", err)
+func responsesImageResult(raw []byte) gjson.Result {
+	root := gjson.ParseBytes(raw)
+	if response := root.Get("response"); response.IsObject() {
+		return response
 	}
-	if len(obj.Output) > 0 || obj.CreatedAt != 0 || len(obj.Usage) > 0 || len(obj.ToolUsage) > 0 {
-		return obj, nil
+	return root
+}
+
+func imageResultsFromOutputResult(output gjson.Result) []imageResult {
+	if !output.IsArray() {
+		return nil
 	}
-	var completed responseCompletedEvent
-	if err := json.Unmarshal(raw, &completed); err == nil && completed.Response.Output != nil {
-		return completed.Response, nil
+	items := output.Array()
+	results := make([]imageResult, 0, len(items))
+	for i := range items {
+		result, ok := imageResultFromOutputItemResult(items[i])
+		if ok {
+			results = append(results, result)
+		}
 	}
-	return obj, nil
+	return results
+}
+
+func imageResultFromOutputItemResult(item gjson.Result) (imageResult, bool) {
+	if item.Get("type").String() != "image_generation_call" {
+		return imageResult{}, false
+	}
+	b64 := strings.TrimSpace(item.Get("result").String())
+	if b64 == "" {
+		return imageResult{}, false
+	}
+	return imageResult{
+		B64JSON:       b64,
+		RevisedPrompt: item.Get("revised_prompt").String(),
+		OutputFormat:  item.Get("output_format").String(),
+		Size:          item.Get("size").String(),
+		Background:    item.Get("background").String(),
+		Quality:       item.Get("quality").String(),
+	}, true
+}
+
+func imageUsageFromResponseResult(resp gjson.Result) json.RawMessage {
+	if usage := imageUsageFromToolUsageResult(resp.Get("tool_usage")); len(bytes.TrimSpace(usage)) > 0 && string(bytes.TrimSpace(usage)) != "null" {
+		return usage
+	}
+	if usage := imageUsageFromOutputResult(resp.Get("output")); len(bytes.TrimSpace(usage)) > 0 && string(bytes.TrimSpace(usage)) != "null" {
+		return usage
+	}
+	return imageRawMessageFromResult(resp.Get("usage"))
+}
+
+func imageUsageFromToolUsageResult(toolUsage gjson.Result) json.RawMessage {
+	for _, key := range []string{"image_gen", "image_generation"} {
+		if usage := imageRawMessageFromResult(toolUsage.Get(key)); len(bytes.TrimSpace(usage)) > 0 && string(bytes.TrimSpace(usage)) != "null" {
+			return usage
+		}
+	}
+	return nil
+}
+
+func imageUsageFromOutputResult(output gjson.Result) json.RawMessage {
+	if !output.IsArray() {
+		return nil
+	}
+	var combined json.RawMessage
+	for _, item := range output.Array() {
+		if item.Get("type").String() != "image_generation_call" {
+			continue
+		}
+		combined = mergeImageUsage(combined, imageUsageRawFromOutputItemResult(item))
+	}
+	return combined
+}
+
+func imageUsageRawFromOutputItemResult(item gjson.Result) json.RawMessage {
+	if usage := imageRawMessageFromResult(item.Get("usage")); len(bytes.TrimSpace(usage)) > 0 && string(bytes.TrimSpace(usage)) != "null" {
+		return usage
+	}
+	fields := map[string]json.RawMessage{}
+	setRawUsageField(fields, "input_tokens", imageRawMessageFromResult(item.Get("input_tokens")))
+	setRawUsageField(fields, "output_tokens", imageRawMessageFromResult(item.Get("output_tokens")))
+	setRawUsageField(fields, "total_tokens", imageRawMessageFromResult(item.Get("total_tokens")))
+	setRawUsageField(fields, "input_tokens_details", imageRawMessageFromResult(item.Get("input_tokens_details")))
+	setRawUsageField(fields, "output_tokens_details", imageRawMessageFromResult(item.Get("output_tokens_details")))
+	if len(fields) == 0 {
+		return nil
+	}
+	data, err := json.Marshal(fields)
+	if err != nil {
+		return nil
+	}
+	return data
+}
+
+func imageRawMessageFromResult(result gjson.Result) json.RawMessage {
+	if !result.Exists() || strings.TrimSpace(result.Raw) == "" || strings.TrimSpace(result.Raw) == "null" {
+		return nil
+	}
+	return json.RawMessage([]byte(result.Raw))
 }
 
 func imageResultsFromOutput(items []imageOutputItem) []imageResult {
@@ -993,41 +1078,30 @@ func (m *imageStreamMapper) writePayload(w io.Writer, payload []byte) {
 	eventType := responseEventType(payload)
 	switch eventType {
 	case "response.image_generation_call.partial_image":
-		var event responsePartialImageEvent
-		if err := json.Unmarshal(payload, &event); err != nil || strings.TrimSpace(event.PartialImageB64) == "" {
+		event := gjson.ParseBytes(payload)
+		b64 := strings.TrimSpace(event.Get("partial_image_b64").String())
+		if b64 == "" {
 			return
 		}
 		streamEvent := imageStreamEvent{
 			Type:              m.operation.partialEvent,
-			B64JSON:           event.PartialImageB64,
-			PartialImageIndex: event.PartialImageIndex,
+			B64JSON:           b64,
+			PartialImageIndex: imagePartialIndexFromResult(event.Get("partial_image_index")),
 		}
-		m.applyStreamImageFormat(&streamEvent, event.OutputFormat)
+		m.applyStreamImageFormat(&streamEvent, event.Get("output_format").String())
 		m.writeSSE(w, m.operation.partialEvent, streamEvent)
 	case "response.output_item.done":
-		var event responseOutputItemDoneEvent
-		if err := json.Unmarshal(payload, &event); err != nil {
+		item := gjson.GetBytes(payload, "item")
+		result, ok := imageResultFromOutputItemResult(item)
+		if !ok {
 			return
 		}
-		results := imageResultsFromOutput([]imageOutputItem{event.Item})
-		if len(results) == 0 {
-			return
-		}
-		m.finals = append(m.finals, results...)
-		m.finalUsage = mergeImageUsage(m.finalUsage, imageUsageRawFromOutputItem(event.Item))
+		m.finals = append(m.finals, result)
+		m.finalUsage = mergeImageUsage(m.finalUsage, imageUsageRawFromOutputItemResult(item))
 	case "response.completed":
-		var event responseCompletedEvent
-		if err := json.Unmarshal(payload, &event); err != nil {
-			return
-		}
-		results := imageResultsFromOutput(event.Response.Output)
-		usage := imageUsageFromToolUsage(event.Response.ToolUsage)
-		if len(bytes.TrimSpace(usage)) == 0 || string(bytes.TrimSpace(usage)) == "null" {
-			usage = imageUsageFromOutput(event.Response.Output)
-		}
-		if len(bytes.TrimSpace(usage)) == 0 || string(bytes.TrimSpace(usage)) == "null" {
-			usage = event.Response.Usage
-		}
+		response := responsesImageResult(payload)
+		results := imageResultsFromOutputResult(response.Get("output"))
+		usage := imageUsageFromResponseResult(response)
 		if len(results) > 0 {
 			m.writeCompletedSet(w, results, usage)
 			return
@@ -1038,6 +1112,14 @@ func (m *imageStreamMapper) writePayload(w io.Writer, payload []byte) {
 		}
 		m.writeError(w, http.StatusBadGateway, "upstream did not return image output")
 	}
+}
+
+func imagePartialIndexFromResult(result gjson.Result) *int {
+	if !result.Exists() || result.Type == gjson.Null {
+		return nil
+	}
+	value := int(result.Int())
+	return &value
 }
 
 func (m *imageStreamMapper) writeCompletedSet(w io.Writer, results []imageResult, usage json.RawMessage) {
@@ -1119,7 +1201,7 @@ func (p *imageSSEParser) Push(chunk []byte) [][]byte {
 		copy(p.pending, p.pending[frameLen:])
 		p.pending = p.pending[:len(p.pending)-frameLen]
 	}
-	if responsesSSECanEmitWithoutDelimiter(p.pending) || json.Valid(bytes.TrimSpace(p.pending)) {
+	if imageSSECanEmitWithoutDelimiter(p.pending) || imageSSELooksLikeJSON(p.pending) {
 		payloads = append(payloads, extractImageSSEPayloads(p.pending)...)
 		p.pending = p.pending[:0]
 	}
@@ -1141,7 +1223,7 @@ func extractImageSSEPayloads(frame []byte) [][]byte {
 	if len(trimmed) == 0 {
 		return nil
 	}
-	if json.Valid(trimmed) {
+	if imageSSELooksLikeJSON(trimmed) {
 		return [][]byte{bytes.Clone(trimmed)}
 	}
 	var payloads [][]byte
@@ -1151,7 +1233,7 @@ func extractImageSSEPayloads(frame []byte) [][]byte {
 			continue
 		}
 		data := bytes.TrimSpace(line[len("data:"):])
-		if len(data) == 0 || bytes.Equal(data, []byte("[DONE]")) || !json.Valid(data) {
+		if len(data) == 0 || bytes.Equal(data, []byte("[DONE]")) {
 			continue
 		}
 		payloads = append(payloads, bytes.Clone(data))
@@ -1159,14 +1241,38 @@ func extractImageSSEPayloads(frame []byte) [][]byte {
 	return payloads
 }
 
+func imageSSECanEmitWithoutDelimiter(chunk []byte) bool {
+	trimmed := bytes.TrimSpace(chunk)
+	if len(trimmed) == 0 || responsesSSENeedsMoreData(trimmed) || !responsesSSEHasField(trimmed, []byte("data:")) {
+		return false
+	}
+	return imageSSEDataLinesLookComplete(trimmed)
+}
+
+func imageSSEDataLinesLookComplete(chunk []byte) bool {
+	for _, line := range bytes.Split(chunk, []byte("\n")) {
+		line = bytes.TrimSpace(bytes.TrimSuffix(line, []byte("\r")))
+		if len(line) == 0 || !bytes.HasPrefix(line, []byte("data:")) {
+			continue
+		}
+		data := bytes.TrimSpace(line[len("data:"):])
+		if len(data) == 0 || bytes.Equal(data, []byte("[DONE]")) {
+			continue
+		}
+		if !imageSSELooksLikeJSON(data) {
+			return false
+		}
+	}
+	return true
+}
+
+func imageSSELooksLikeJSON(chunk []byte) bool {
+	trimmed := bytes.TrimSpace(chunk)
+	return len(trimmed) > 1 && trimmed[0] == '{' && trimmed[len(trimmed)-1] == '}'
+}
+
 func responseEventType(payload []byte) string {
-	var event struct {
-		Type string `json:"type"`
-	}
-	if err := json.Unmarshal(payload, &event); err != nil {
-		return ""
-	}
-	return event.Type
+	return gjson.GetBytes(payload, "type").String()
 }
 
 func (h *OpenAIImagesAPIHandler) imagesCodexModel() string {

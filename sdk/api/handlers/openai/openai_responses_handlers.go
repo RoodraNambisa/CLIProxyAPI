@@ -50,10 +50,15 @@ type responsesSSEFramer struct {
 	outputItems          map[int][]byte
 	outputOrder          []int
 	unindexedOutputItems [][]byte
+	passthrough          bool
 }
 
 func (f *responsesSSEFramer) WriteChunk(w io.Writer, chunk []byte) {
 	if len(chunk) == 0 {
+		return
+	}
+	if f.passthrough {
+		writeResponsesSSEChunk(w, chunk)
 		return
 	}
 	if responsesSSENeedsLineBreak(f.pending, chunk) {
@@ -81,6 +86,9 @@ func (f *responsesSSEFramer) WriteChunk(w io.Writer, chunk []byte) {
 }
 
 func (f *responsesSSEFramer) Flush(w io.Writer) {
+	if f.passthrough {
+		return
+	}
 	if len(f.pending) == 0 {
 		return
 	}
@@ -321,6 +329,19 @@ func responsesSSENeedsLineBreak(pending, chunk []byte) bool {
 	return false
 }
 
+func responsesRequestHasImageGenerationTool(rawJSON []byte) bool {
+	tools := gjson.GetBytes(rawJSON, "tools")
+	if !tools.IsArray() {
+		return false
+	}
+	for _, tool := range tools.Array() {
+		if tool.Get("type").String() == "image_generation" {
+			return true
+		}
+	}
+	return false
+}
+
 // OpenAIResponsesAPIHandler contains the handlers for OpenAIResponses API endpoints.
 // It holds a pool of clients to interact with the backend service.
 type OpenAIResponsesAPIHandler struct {
@@ -485,6 +506,10 @@ func (h *OpenAIResponsesAPIHandler) handleStreamingResponse(c *gin.Context, rawJ
 	// New core execution path
 	modelName := gjson.GetBytes(rawJSON, "model").String()
 	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
+	imageStreamPassthrough := responsesRequestHasImageGenerationTool(rawJSON)
+	if imageStreamPassthrough {
+		cliCtx = handlers.WithImageGenerationStreamPassthrough(cliCtx, true)
+	}
 	dataChan, upstreamHeaders, errChan := h.ExecuteStreamWithAuthManager(cliCtx, h.HandlerType(), modelName, rawJSON, "")
 
 	setSSEHeaders := func() {
@@ -493,7 +518,7 @@ func (h *OpenAIResponsesAPIHandler) handleStreamingResponse(c *gin.Context, rawJ
 		c.Header("Connection", "keep-alive")
 		c.Header("Access-Control-Allow-Origin", "*")
 	}
-	framer := &responsesSSEFramer{}
+	framer := &responsesSSEFramer{passthrough: imageStreamPassthrough}
 
 	// Peek at the first chunk
 	for {

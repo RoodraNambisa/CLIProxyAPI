@@ -91,6 +91,28 @@ func TestForwardResponsesStreamRepairsEmptyCompletedOutputFromDoneItems(t *testi
 	}
 }
 
+func TestForwardResponsesStreamPassthroughSkipsImageOutputRepair(t *testing.T) {
+	h, recorder, c, flusher := newResponsesStreamTestHandler(t)
+
+	data := make(chan []byte, 2)
+	errs := make(chan *interfaces.ErrorMessage)
+	data <- []byte(`data: {"type":"response.output_item.done","output_index":0,"item":{"type":"image_generation_call","result":"ZmluYWw="}}`)
+	data <- []byte(`data: {"type":"response.completed","response":{"id":"resp-1","output":[]}}`)
+	close(data)
+	close(errs)
+
+	h.forwardResponsesStream(c, flusher, func(error) {}, data, errs, &responsesSSEFramer{passthrough: true})
+
+	body := recorder.Body.String()
+	if !strings.Contains(body, `"type":"image_generation_call"`) {
+		t.Fatalf("image output item should pass through: %s", body)
+	}
+	completedPayload := gjson.Get(strings.TrimPrefix(strings.Split(strings.TrimSpace(body), "\n\n")[1], "data: "), "response.output")
+	if !completedPayload.IsArray() || len(completedPayload.Array()) != 0 {
+		t.Fatalf("completed output should not be repaired in passthrough mode: %s", body)
+	}
+}
+
 func TestForwardResponsesStreamRepairsMixedIndexedAndUnindexedDoneItems(t *testing.T) {
 	h, recorder, c, flusher := newResponsesStreamTestHandler(t)
 

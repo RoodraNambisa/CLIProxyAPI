@@ -55,6 +55,7 @@ const (
 type pinnedAuthContextKey struct{}
 type selectedAuthCallbackContextKey struct{}
 type executionSessionContextKey struct{}
+type imageGenerationStreamPassthroughContextKey struct{}
 
 // WithPinnedAuthID returns a child context that requests execution on a specific auth ID.
 func WithPinnedAuthID(ctx context.Context, authID string) context.Context {
@@ -66,6 +67,33 @@ func WithPinnedAuthID(ctx context.Context, authID string) context.Context {
 		ctx = context.Background()
 	}
 	return context.WithValue(ctx, pinnedAuthContextKey{}, authID)
+}
+
+// WithImageGenerationStreamPassthrough marks a Responses stream as safe to
+// forward image_generation frames without expensive repair/validation passes.
+func WithImageGenerationStreamPassthrough(ctx context.Context, enabled bool) context.Context {
+	if !enabled {
+		return ctx
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, imageGenerationStreamPassthroughContextKey{}, true)
+}
+
+func imageGenerationStreamPassthrough(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+	enabled, _ := ctx.Value(imageGenerationStreamPassthroughContextKey{}).(bool)
+	return enabled
+}
+
+func providersAreOnlyCodex(providers []string) bool {
+	if len(providers) != 1 {
+		return false
+	}
+	return strings.EqualFold(strings.TrimSpace(providers[0]), "codex")
 }
 
 // WithSelectedAuthIDCallback returns a child context that receives the selected auth ID.
@@ -534,6 +562,10 @@ func (h *BaseAPIHandler) ExecuteWithProvidersAndExecutionModel(ctx context.Conte
 	if normalizedExecutionModel := strings.TrimSpace(executionModelName); normalizedExecutionModel != "" && normalizedExecutionModel != normalizedRouteModel {
 		reqMeta[coreexecutor.ExecutionModelOverrideMetadataKey] = normalizedExecutionModel
 	}
+	imageStreamPassthrough := handlerType == "openai-response" && imageGenerationStreamPassthrough(ctx) && providersAreOnlyCodex(providers)
+	if imageStreamPassthrough {
+		reqMeta[coreexecutor.ImageGenerationStreamPassthroughMetadataKey] = true
+	}
 	payload := rawJSON
 	if len(payload) == 0 {
 		payload = nil
@@ -653,6 +685,10 @@ func (h *BaseAPIHandler) executeStreamWithResolvedProviders(ctx context.Context,
 	reqMeta[coreexecutor.RequestedModelMetadataKey] = normalizedRouteModel
 	if normalizedExecutionModel := strings.TrimSpace(executionModelName); normalizedExecutionModel != "" && normalizedExecutionModel != normalizedRouteModel {
 		reqMeta[coreexecutor.ExecutionModelOverrideMetadataKey] = normalizedExecutionModel
+	}
+	imageStreamPassthrough := handlerType == "openai-response" && imageGenerationStreamPassthrough(ctx) && providersAreOnlyCodex(providers)
+	if imageStreamPassthrough {
+		reqMeta[coreexecutor.ImageGenerationStreamPassthroughMetadataKey] = true
 	}
 	payload := rawJSON
 	if len(payload) == 0 {
@@ -801,14 +837,18 @@ func (h *BaseAPIHandler) executeStreamWithResolvedProviders(ctx context.Context,
 					return
 				}
 				if len(chunk.Payload) > 0 {
-					if handlerType == "openai-response" {
+					if handlerType == "openai-response" && !imageStreamPassthrough {
 						if err := validateSSEDataJSON(chunk.Payload); err != nil {
 							_ = sendErr(&interfaces.ErrorMessage{StatusCode: http.StatusBadGateway, Error: err})
 							return
 						}
 					}
 					sentPayload = true
-					if okSendData := sendData(cloneBytes(chunk.Payload)); !okSendData {
+					payload := chunk.Payload
+					if !imageStreamPassthrough {
+						payload = cloneBytes(chunk.Payload)
+					}
+					if okSendData := sendData(payload); !okSendData {
 						return
 					}
 				}
