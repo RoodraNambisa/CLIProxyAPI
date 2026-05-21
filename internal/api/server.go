@@ -525,6 +525,15 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.PUT("/debug", s.mgmt.PutDebug)
 		mgmt.PATCH("/debug", s.mgmt.PutDebug)
 
+		mgmt.GET("/pprof/config", s.mgmt.GetPprofConfig)
+		mgmt.GET("/pprof/enable", s.mgmt.GetPprofEnable)
+		mgmt.PUT("/pprof/enable", s.mgmt.PutPprofEnable)
+		mgmt.PATCH("/pprof/enable", s.mgmt.PutPprofEnable)
+		mgmt.GET("/pprof/addr", s.mgmt.GetPprofAddr)
+		mgmt.PUT("/pprof/addr", s.mgmt.PutPprofAddr)
+		mgmt.PATCH("/pprof/addr", s.mgmt.PutPprofAddr)
+		mgmt.GET("/pprof/profile/:profile", s.mgmt.GetPprofProfile)
+
 		mgmt.GET("/logging-to-file", s.mgmt.GetLoggingToFile)
 		mgmt.PUT("/logging-to-file", s.mgmt.PutLoggingToFile)
 		mgmt.PATCH("/logging-to-file", s.mgmt.PutLoggingToFile)

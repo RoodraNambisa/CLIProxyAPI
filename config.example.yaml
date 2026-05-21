@@ -50,7 +50,8 @@ api-keys:
 # Enable debug logging
 debug: false
 
-# Enable pprof HTTP debug server (host:port). Keep it bound to localhost for safety.
+# Enable pprof diagnostics. Management endpoints are exposed behind /v0/management/pprof/*.
+# The optional standalone pprof HTTP server uses addr; keep it bound to localhost for safety.
 pprof:
   enable: false
   addr: "127.0.0.1:8316"
