@@ -158,6 +158,8 @@ nonstream-keepalive-interval: 0
 #   override-transparent-background: false # Coerce background=transparent to auto.
 #   override-input-fidelity: false # Omit input_fidelity instead of forwarding it.
 #   override-unsupported-params: false # Legacy shortcut for enabling supported override options above.
+#   stream-flush-interval-ms: 0      # Batch image stream flushes for up to N ms. 0 keeps per-chunk flushes.
+#   stream-flush-min-bytes: 0        # Flush image streams after N pending bytes. 0 disables byte batching.
 # Streaming behavior (SSE keep-alives + safe bootstrap retries).
 # streaming:
 #   keepalive-seconds: 15   # Default: 0 (disabled). <= 0 disables keep-alives.

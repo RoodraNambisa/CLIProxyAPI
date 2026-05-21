@@ -87,6 +87,8 @@ images:
   response-format-url-data-url: false
   override-transparent-background: false
   override-input-fidelity: false
+  stream-flush-interval-ms: 0
+  stream-flush-min-bytes: 0
 ```
 
 说明：
@@ -102,6 +104,7 @@ images:
 - `override-response-format-url`、`response-format-url-data-url`、`override-transparent-background` 和 `override-input-fidelity` 默认关闭，分别控制对应参数覆盖；其它不支持参数仍会返回错误。
 - `override-unsupported-params` 是旧兼容字段，开启时等价于支持的覆盖项都开启；新配置建议使用上面的独立开关。
 - `enable-n-aggregation` 默认关闭，`n > 1` 会直接按不支持参数返回错误。开启时，`n > 1` 会拆成多次 Codex 图片调用再聚合，非流式返回多个 `data[]` 并累加 `usage.output_tokens` 等用量字段；流式依次输出多个 `image_generation.completed` 或 `image_edit.completed` 事件。
+- `stream-flush-interval-ms` 和 `stream-flush-min-bytes` 默认关闭，保持每个流式 chunk 立即 flush。高并发画图时可设置为例如 `20` 和 `65536`，让图片流式输出按时间或字节阈值合并 flush，降低系统调用和 CPU 调度开销。
 
 示例：
 

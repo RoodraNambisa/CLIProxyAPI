@@ -14,6 +14,7 @@ import (
 	"io"
 	"net/http"
 	"sort"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	. "github.com/router-for-me/CLIProxyAPI/v6/internal/constant"
@@ -560,17 +561,26 @@ func (h *OpenAIResponsesAPIHandler) handleStreamingResponse(c *gin.Context, rawJ
 			flusher.Flush()
 
 			// Continue
-			h.forwardResponsesStream(c, flusher, func(err error) { cliCancel(err) }, dataChan, errChan, framer)
+			h.forwardResponsesStream(c, flusher, func(err error) { cliCancel(err) }, dataChan, errChan, framer, imageStreamPassthrough)
 			return
 		}
 	}
 }
 
-func (h *OpenAIResponsesAPIHandler) forwardResponsesStream(c *gin.Context, flusher http.Flusher, cancel func(error), data <-chan []byte, errs <-chan *interfaces.ErrorMessage, framer *responsesSSEFramer) {
+func (h *OpenAIResponsesAPIHandler) forwardResponsesStream(c *gin.Context, flusher http.Flusher, cancel func(error), data <-chan []byte, errs <-chan *interfaces.ErrorMessage, framer *responsesSSEFramer, imageStreamPassthrough ...bool) {
 	if framer == nil {
 		framer = &responsesSSEFramer{}
 	}
+	passthrough := len(imageStreamPassthrough) > 0 && imageStreamPassthrough[0]
+	var flushInterval *time.Duration
+	var flushMinBytes int
+	if passthrough {
+		flushInterval = imageStreamFlushInterval(h.Cfg)
+		flushMinBytes = imageStreamFlushMinBytes(h.Cfg)
+	}
 	h.ForwardStream(c, flusher, cancel, data, errs, handlers.StreamForwardOptions{
+		FlushInterval: flushInterval,
+		FlushMinBytes: flushMinBytes,
 		WriteChunk: func(chunk []byte) {
 			framer.WriteChunk(c.Writer, chunk)
 		},

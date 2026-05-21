@@ -725,6 +725,12 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	if cfg.Images.UnsupportedStatusCode < http.StatusBadRequest || cfg.Images.UnsupportedStatusCode > 599 {
 		cfg.Images.UnsupportedStatusCode = http.StatusBadRequest
 	}
+	if cfg.Images.StreamFlushIntervalMS < 0 {
+		cfg.Images.StreamFlushIntervalMS = 0
+	}
+	if cfg.Images.StreamFlushMinBytes < 0 {
+		cfg.Images.StreamFlushMinBytes = 0
+	}
 
 	cfg.Pprof.Addr = strings.TrimSpace(cfg.Pprof.Addr)
 	if cfg.Pprof.Addr == "" {

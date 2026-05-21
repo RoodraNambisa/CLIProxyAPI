@@ -13,6 +13,14 @@ type StreamForwardOptions struct {
 	// If nil, the configured default is used. If set to <= 0, keep-alives are disabled.
 	KeepAliveInterval *time.Duration
 
+	// FlushInterval batches response flushes for up to this duration.
+	// If nil or <= 0, every chunk is flushed immediately.
+	FlushInterval *time.Duration
+
+	// FlushMinBytes flushes once at least this many bytes have been written
+	// since the previous flush. <= 0 disables the byte threshold.
+	FlushMinBytes int
+
 	// WriteChunk writes a single data chunk to the response body. It should not flush.
 	WriteChunk func(chunk []byte)
 
@@ -62,6 +70,61 @@ func (h *BaseAPIHandler) ForwardStream(c *gin.Context, flusher http.Flusher, can
 	}
 
 	var terminalErr *interfaces.ErrorMessage
+	var flushTimer *time.Timer
+	var flushC <-chan time.Time
+	unflushedBytes := 0
+
+	stopFlushTimer := func() {
+		if flushTimer == nil {
+			return
+		}
+		if !flushTimer.Stop() {
+			select {
+			case <-flushTimer.C:
+			default:
+			}
+		}
+		flushTimer = nil
+		flushC = nil
+	}
+	defer stopFlushTimer()
+
+	flushInterval := time.Duration(0)
+	if opts.FlushInterval != nil {
+		flushInterval = *opts.FlushInterval
+	}
+	batchedFlush := flushInterval > 0 || opts.FlushMinBytes > 0
+
+	flushPending := func() {
+		if unflushedBytes <= 0 {
+			stopFlushTimer()
+			return
+		}
+		flusher.Flush()
+		unflushedBytes = 0
+		stopFlushTimer()
+	}
+
+	noteWrite := func(size int) {
+		if size <= 0 {
+			return
+		}
+		if !batchedFlush {
+			flusher.Flush()
+			return
+		}
+		unflushedBytes += size
+		if opts.FlushMinBytes > 0 && unflushedBytes >= opts.FlushMinBytes {
+			flushPending()
+			return
+		}
+		if flushInterval <= 0 || flushTimer != nil {
+			return
+		}
+		flushTimer = time.NewTimer(flushInterval)
+		flushC = flushTimer.C
+	}
+
 	for {
 		select {
 		case <-c.Request.Context().Done():
@@ -80,6 +143,7 @@ func (h *BaseAPIHandler) ForwardStream(c *gin.Context, flusher http.Flusher, can
 					}
 				}
 				if terminalErr != nil {
+					flushPending()
 					if opts.WriteTerminalError != nil {
 						opts.WriteTerminalError(terminalErr)
 					}
@@ -90,18 +154,20 @@ func (h *BaseAPIHandler) ForwardStream(c *gin.Context, flusher http.Flusher, can
 				if opts.WriteDone != nil {
 					opts.WriteDone()
 				}
+				flushPending()
 				flusher.Flush()
 				cancel(nil)
 				return
 			}
 			writeChunk(chunk)
-			flusher.Flush()
+			noteWrite(len(chunk))
 		case errMsg, ok := <-errs:
 			if !ok {
 				continue
 			}
 			if errMsg != nil {
 				terminalErr = errMsg
+				flushPending()
 				if opts.WriteTerminalError != nil {
 					opts.WriteTerminalError(errMsg)
 					flusher.Flush()
@@ -114,8 +180,11 @@ func (h *BaseAPIHandler) ForwardStream(c *gin.Context, flusher http.Flusher, can
 			cancel(execErr)
 			return
 		case <-keepAliveC:
+			flushPending()
 			writeKeepAlive()
 			flusher.Flush()
+		case <-flushC:
+			flushPending()
 		}
 	}
 }

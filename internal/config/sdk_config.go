@@ -73,4 +73,8 @@ type ImagesConfig struct {
 	OverrideTransparentBackground *bool `yaml:"override-transparent-background,omitempty" json:"override-transparent-background,omitempty"`
 	// OverrideInputFidelity omits input_fidelity instead of forwarding it when set.
 	OverrideInputFidelity *bool `yaml:"override-input-fidelity,omitempty" json:"override-input-fidelity,omitempty"`
+	// StreamFlushIntervalMS batches image streaming flushes for up to this many milliseconds.
+	StreamFlushIntervalMS int `yaml:"stream-flush-interval-ms,omitempty" json:"stream-flush-interval-ms,omitempty"`
+	// StreamFlushMinBytes flushes image streaming output once this many bytes are pending.
+	StreamFlushMinBytes int `yaml:"stream-flush-min-bytes,omitempty" json:"stream-flush-min-bytes,omitempty"`
 }

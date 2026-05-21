@@ -19,6 +19,7 @@ import (
 	. "github.com/router-for-me/CLIProxyAPI/v6/internal/constant"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/api/handlers"
+	sdkconfig "github.com/router-for-me/CLIProxyAPI/v6/sdk/config"
 	"github.com/tidwall/gjson"
 )
 
@@ -365,6 +366,8 @@ func (h *OpenAIImagesAPIHandler) handleMultiStreamingImagesResponse(c *gin.Conte
 			streamErr = err
 			cliCancel(err)
 		}, dataChan, errChan, handlers.StreamForwardOptions{
+			FlushInterval: imageStreamFlushInterval(h.Cfg),
+			FlushMinBytes: imageStreamFlushMinBytes(h.Cfg),
 			WriteChunk: func(chunk []byte) {
 				mapper.writeChunk(c.Writer, chunk)
 			},
@@ -400,6 +403,8 @@ func (h *OpenAIImagesAPIHandler) forwardImagesStream(c *gin.Context, flusher htt
 		mapper = &imageStreamMapper{operation: imageGenerationOperation}
 	}
 	h.ForwardStream(c, flusher, cancel, data, errs, handlers.StreamForwardOptions{
+		FlushInterval: imageStreamFlushInterval(h.Cfg),
+		FlushMinBytes: imageStreamFlushMinBytes(h.Cfg),
 		WriteChunk: func(chunk []byte) {
 			mapper.writeChunk(c.Writer, chunk)
 		},
@@ -1335,6 +1340,21 @@ func (h *OpenAIImagesAPIHandler) imagesOverrideInputFidelityEnabled() bool {
 		return h.Cfg.Images.OverrideUnsupportedParams
 	}
 	return false
+}
+
+func imageStreamFlushInterval(cfg *sdkconfig.SDKConfig) *time.Duration {
+	if cfg == nil || cfg.Images.StreamFlushIntervalMS <= 0 {
+		return nil
+	}
+	interval := time.Duration(cfg.Images.StreamFlushIntervalMS) * time.Millisecond
+	return &interval
+}
+
+func imageStreamFlushMinBytes(cfg *sdkconfig.SDKConfig) int {
+	if cfg == nil || cfg.Images.StreamFlushMinBytes <= 0 {
+		return 0
+	}
+	return cfg.Images.StreamFlushMinBytes
 }
 
 func (h *OpenAIImagesAPIHandler) imagesUnsupportedStatusCode() int {
