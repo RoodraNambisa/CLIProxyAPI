@@ -49,6 +49,20 @@ type StreamingConfig struct {
 	// to allow auth rotation / transient recovery.
 	// <= 0 disables bootstrap retries. Default is 0.
 	BootstrapRetries int `yaml:"bootstrap-retries,omitempty" json:"bootstrap-retries,omitempty"`
+
+	// EnableStreamFlush enables flush batching for regular streaming responses.
+	// Default is false to preserve token-by-token latency.
+	EnableStreamFlush bool `yaml:"enable-stream-flush,omitempty" json:"enable-stream-flush,omitempty"`
+
+	// StreamFlushIntervalMS batches regular streaming flushes for up to this many milliseconds.
+	StreamFlushIntervalMS int `yaml:"stream-flush-interval-ms,omitempty" json:"stream-flush-interval-ms,omitempty"`
+
+	// StreamFlushMinBytes flushes regular streaming output once this many bytes are pending.
+	StreamFlushMinBytes int `yaml:"stream-flush-min-bytes,omitempty" json:"stream-flush-min-bytes,omitempty"`
+
+	// TrustUpstreamSSE forwards OpenAI Responses SSE without repair/validation.
+	// Default is false for compatibility with split or incomplete upstream SSE frames.
+	TrustUpstreamSSE bool `yaml:"trust-upstream-sse,omitempty" json:"trust-upstream-sse,omitempty"`
 }
 
 // ImagesConfig holds OpenAI Images compatibility configuration.
@@ -73,6 +87,8 @@ type ImagesConfig struct {
 	OverrideTransparentBackground *bool `yaml:"override-transparent-background,omitempty" json:"override-transparent-background,omitempty"`
 	// OverrideInputFidelity omits input_fidelity instead of forwarding it when set.
 	OverrideInputFidelity *bool `yaml:"override-input-fidelity,omitempty" json:"override-input-fidelity,omitempty"`
+	// EnableStreamFlush enables flush batching for image streaming responses. Default is true.
+	EnableStreamFlush *bool `yaml:"enable-stream-flush,omitempty" json:"enable-stream-flush,omitempty"`
 	// StreamFlushIntervalMS batches image streaming flushes for up to this many milliseconds.
 	StreamFlushIntervalMS int `yaml:"stream-flush-interval-ms,omitempty" json:"stream-flush-interval-ms,omitempty"`
 	// StreamFlushMinBytes flushes image streaming output once this many bytes are pending.

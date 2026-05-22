@@ -1343,18 +1343,50 @@ func (h *OpenAIImagesAPIHandler) imagesOverrideInputFidelityEnabled() bool {
 }
 
 func imageStreamFlushInterval(cfg *sdkconfig.SDKConfig) *time.Duration {
-	if cfg == nil || cfg.Images.StreamFlushIntervalMS <= 0 {
+	if cfg == nil || !imageStreamFlushEnabled(cfg) {
 		return nil
 	}
-	interval := time.Duration(cfg.Images.StreamFlushIntervalMS) * time.Millisecond
+	ms := cfg.Images.StreamFlushIntervalMS
+	if ms <= 0 {
+		ms = cfg.Streaming.StreamFlushIntervalMS
+	}
+	if ms <= 0 {
+		return nil
+	}
+	interval := time.Duration(ms) * time.Millisecond
 	return &interval
 }
 
 func imageStreamFlushMinBytes(cfg *sdkconfig.SDKConfig) int {
-	if cfg == nil || cfg.Images.StreamFlushMinBytes <= 0 {
+	if cfg == nil || !imageStreamFlushEnabled(cfg) {
 		return 0
 	}
-	return cfg.Images.StreamFlushMinBytes
+	if cfg.Images.StreamFlushMinBytes > 0 {
+		return cfg.Images.StreamFlushMinBytes
+	}
+	if cfg.Streaming.StreamFlushMinBytes > 0 {
+		return cfg.Streaming.StreamFlushMinBytes
+	}
+	return 0
+}
+
+func imageStreamFlushEnabled(cfg *sdkconfig.SDKConfig) bool {
+	if cfg == nil || cfg.Images.EnableStreamFlush == nil {
+		return true
+	}
+	return *cfg.Images.EnableStreamFlush
+}
+
+func responseStreamFlushInterval(cfg *sdkconfig.SDKConfig) *time.Duration {
+	interval := handlers.StreamingFlushInterval(cfg)
+	if interval <= 0 {
+		return nil
+	}
+	return &interval
+}
+
+func responseStreamFlushMinBytes(cfg *sdkconfig.SDKConfig) int {
+	return handlers.StreamingFlushMinBytes(cfg)
 }
 
 func (h *OpenAIImagesAPIHandler) imagesUnsupportedStatusCode() int {

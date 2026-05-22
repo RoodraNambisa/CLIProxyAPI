@@ -519,7 +519,8 @@ func (h *OpenAIResponsesAPIHandler) handleStreamingResponse(c *gin.Context, rawJ
 		c.Header("Connection", "keep-alive")
 		c.Header("Access-Control-Allow-Origin", "*")
 	}
-	framer := &responsesSSEFramer{passthrough: imageStreamPassthrough}
+	trustUpstreamSSE := handlers.StreamingTrustUpstreamSSE(h.Cfg)
+	framer := &responsesSSEFramer{passthrough: imageStreamPassthrough || trustUpstreamSSE}
 
 	// Peek at the first chunk
 	for {
@@ -577,6 +578,9 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesStream(c *gin.Context, flush
 	if passthrough {
 		flushInterval = imageStreamFlushInterval(h.Cfg)
 		flushMinBytes = imageStreamFlushMinBytes(h.Cfg)
+	} else {
+		flushInterval = responseStreamFlushInterval(h.Cfg)
+		flushMinBytes = responseStreamFlushMinBytes(h.Cfg)
 	}
 	h.ForwardStream(c, flusher, cancel, data, errs, handlers.StreamForwardOptions{
 		FlushInterval: flushInterval,

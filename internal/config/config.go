@@ -722,8 +722,18 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 		enableNAggregation := false
 		cfg.Images.EnableNAggregation = &enableNAggregation
 	}
+	if cfg.Images.EnableStreamFlush == nil {
+		enableStreamFlush := true
+		cfg.Images.EnableStreamFlush = &enableStreamFlush
+	}
 	if cfg.Images.UnsupportedStatusCode < http.StatusBadRequest || cfg.Images.UnsupportedStatusCode > 599 {
 		cfg.Images.UnsupportedStatusCode = http.StatusBadRequest
+	}
+	if cfg.Streaming.StreamFlushIntervalMS < 0 {
+		cfg.Streaming.StreamFlushIntervalMS = 0
+	}
+	if cfg.Streaming.StreamFlushMinBytes < 0 {
+		cfg.Streaming.StreamFlushMinBytes = 0
 	}
 	if cfg.Images.StreamFlushIntervalMS < 0 {
 		cfg.Images.StreamFlushIntervalMS = 0

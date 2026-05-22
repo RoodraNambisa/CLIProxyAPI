@@ -207,6 +207,39 @@ func StreamingBootstrapRetries(cfg *config.SDKConfig) int {
 	return retries
 }
 
+// StreamingFlushEnabled returns whether regular streaming responses should batch flushes.
+func StreamingFlushEnabled(cfg *config.SDKConfig) bool {
+	return cfg != nil && cfg.Streaming.EnableStreamFlush
+}
+
+// StreamingFlushInterval returns the regular streaming flush batching interval.
+func StreamingFlushInterval(cfg *config.SDKConfig) time.Duration {
+	if !StreamingFlushEnabled(cfg) {
+		return 0
+	}
+	ms := 0
+	if cfg != nil {
+		ms = cfg.Streaming.StreamFlushIntervalMS
+	}
+	if ms <= 0 {
+		return 0
+	}
+	return time.Duration(ms) * time.Millisecond
+}
+
+// StreamingFlushMinBytes returns the regular streaming byte threshold for flush batching.
+func StreamingFlushMinBytes(cfg *config.SDKConfig) int {
+	if !StreamingFlushEnabled(cfg) || cfg == nil || cfg.Streaming.StreamFlushMinBytes <= 0 {
+		return 0
+	}
+	return cfg.Streaming.StreamFlushMinBytes
+}
+
+// StreamingTrustUpstreamSSE returns whether OpenAI Responses SSE should bypass repair/validation.
+func StreamingTrustUpstreamSSE(cfg *config.SDKConfig) bool {
+	return cfg != nil && cfg.Streaming.TrustUpstreamSSE
+}
+
 // PassthroughHeadersEnabled returns whether upstream response headers should be forwarded to clients.
 // Default is false.
 func PassthroughHeadersEnabled(cfg *config.SDKConfig) bool {
@@ -690,6 +723,7 @@ func (h *BaseAPIHandler) executeStreamWithResolvedProviders(ctx context.Context,
 	if imageStreamPassthrough {
 		reqMeta[coreexecutor.ImageGenerationStreamPassthroughMetadataKey] = true
 	}
+	trustResponsesSSE := handlerType == "openai-response" && StreamingTrustUpstreamSSE(h.Cfg)
 	payload := rawJSON
 	if len(payload) == 0 {
 		payload = nil
@@ -837,7 +871,7 @@ func (h *BaseAPIHandler) executeStreamWithResolvedProviders(ctx context.Context,
 					return
 				}
 				if len(chunk.Payload) > 0 {
-					if handlerType == "openai-response" && !imageStreamPassthrough {
+					if handlerType == "openai-response" && !imageStreamPassthrough && !trustResponsesSSE {
 						if err := validateSSEDataJSON(chunk.Payload); err != nil {
 							_ = sendErr(&interfaces.ErrorMessage{StatusCode: http.StatusBadGateway, Error: err})
 							return
@@ -845,7 +879,7 @@ func (h *BaseAPIHandler) executeStreamWithResolvedProviders(ctx context.Context,
 					}
 					sentPayload = true
 					payload := chunk.Payload
-					if !imageStreamPassthrough {
+					if !imageStreamPassthrough && !trustResponsesSSE {
 						payload = cloneBytes(chunk.Payload)
 					}
 					if okSendData := sendData(payload); !okSendData {

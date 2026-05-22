@@ -87,8 +87,15 @@ images:
   response-format-url-data-url: false
   override-transparent-background: false
   override-input-fidelity: false
+  enable-stream-flush: true
   stream-flush-interval-ms: 0
   stream-flush-min-bytes: 0
+
+streaming:
+  enable-stream-flush: false
+  stream-flush-interval-ms: 0
+  stream-flush-min-bytes: 0
+  trust-upstream-sse: false
 ```
 
 说明：
@@ -104,7 +111,9 @@ images:
 - `override-response-format-url`、`response-format-url-data-url`、`override-transparent-background` 和 `override-input-fidelity` 默认关闭，分别控制对应参数覆盖；其它不支持参数仍会返回错误。
 - `override-unsupported-params` 是旧兼容字段，开启时等价于支持的覆盖项都开启；新配置建议使用上面的独立开关。
 - `enable-n-aggregation` 默认关闭，`n > 1` 会直接按不支持参数返回错误。开启时，`n > 1` 会拆成多次 Codex 图片调用再聚合，非流式返回多个 `data[]` 并累加 `usage.output_tokens` 等用量字段；流式依次输出多个 `image_generation.completed` 或 `image_edit.completed` 事件。
-- `stream-flush-interval-ms` 和 `stream-flush-min-bytes` 默认关闭，保持每个流式 chunk 立即 flush。高并发画图时可设置为例如 `20` 和 `65536`，让图片流式输出按时间或字节阈值合并 flush，降低系统调用和 CPU 调度开销。
+- `images.enable-stream-flush` 默认开启。`images.stream-flush-interval-ms` 和 `images.stream-flush-min-bytes` 未设置时会回退使用 `streaming.stream-flush-*`，便于用同一组阈值优化图片流式输出。
+- `streaming.enable-stream-flush` 默认关闭。开启后，普通 `/v1/responses` 流式输出也会按 `stream-flush-interval-ms` 或 `stream-flush-min-bytes` 合并 flush，高并发下可降低系统调用和 CPU 调度开销，但会引入最多一个 flush 间隔的输出延迟。
+- `streaming.trust-upstream-sse` 默认关闭。开启后，`/v1/responses` 会跳过 SSE 修复和 JSON 校验，直接信任上游帧格式；CPU 更低，但如果上游返回 split SSE 或空 completed output，服务端不再自动修复。
 
 示例：
 

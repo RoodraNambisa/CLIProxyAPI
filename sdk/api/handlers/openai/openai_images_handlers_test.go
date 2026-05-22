@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
@@ -811,5 +812,68 @@ func TestOpenAIImagesStreamingSupportsMultipleCompletedImages(t *testing.T) {
 	}
 	if strings.Count(body, `"output_tokens":2`) != 2 {
 		t.Fatalf("output tokens should appear on each completed image: %s", body)
+	}
+}
+
+func TestImageStreamFlushFallsBackToStreamingConfig(t *testing.T) {
+	cfg := &sdkconfig.SDKConfig{
+		Streaming: sdkconfig.StreamingConfig{
+			EnableStreamFlush:     true,
+			StreamFlushIntervalMS: 25,
+			StreamFlushMinBytes:   32768,
+		},
+	}
+
+	interval := imageStreamFlushInterval(cfg)
+	if interval == nil || *interval != 25*time.Millisecond {
+		t.Fatalf("imageStreamFlushInterval = %v, want 25ms", interval)
+	}
+	if got := imageStreamFlushMinBytes(cfg); got != 32768 {
+		t.Fatalf("imageStreamFlushMinBytes = %d, want 32768", got)
+	}
+}
+
+func TestImageStreamFlushCanBeDisabled(t *testing.T) {
+	disabled := false
+	cfg := &sdkconfig.SDKConfig{
+		Streaming: sdkconfig.StreamingConfig{
+			EnableStreamFlush:     true,
+			StreamFlushIntervalMS: 25,
+			StreamFlushMinBytes:   32768,
+		},
+		Images: sdkconfig.ImagesConfig{
+			EnableStreamFlush: &disabled,
+		},
+	}
+
+	if interval := imageStreamFlushInterval(cfg); interval != nil {
+		t.Fatalf("imageStreamFlushInterval = %v, want nil", interval)
+	}
+	if got := imageStreamFlushMinBytes(cfg); got != 0 {
+		t.Fatalf("imageStreamFlushMinBytes = %d, want 0", got)
+	}
+}
+
+func TestResponseStreamFlushRequiresEnableSwitch(t *testing.T) {
+	cfg := &sdkconfig.SDKConfig{
+		Streaming: sdkconfig.StreamingConfig{
+			StreamFlushIntervalMS: 25,
+			StreamFlushMinBytes:   32768,
+		},
+	}
+	if interval := responseStreamFlushInterval(cfg); interval != nil {
+		t.Fatalf("responseStreamFlushInterval = %v, want nil", interval)
+	}
+	if got := responseStreamFlushMinBytes(cfg); got != 0 {
+		t.Fatalf("responseStreamFlushMinBytes = %d, want 0", got)
+	}
+
+	cfg.Streaming.EnableStreamFlush = true
+	interval := responseStreamFlushInterval(cfg)
+	if interval == nil || *interval != 25*time.Millisecond {
+		t.Fatalf("responseStreamFlushInterval = %v, want 25ms", interval)
+	}
+	if got := responseStreamFlushMinBytes(cfg); got != 32768 {
+		t.Fatalf("responseStreamFlushMinBytes = %d, want 32768", got)
 	}
 }
