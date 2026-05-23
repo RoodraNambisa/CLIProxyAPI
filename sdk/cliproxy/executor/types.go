@@ -15,11 +15,16 @@ const RequestedModelMetadataKey = "requested_model"
 const ExecutionModelOverrideMetadataKey = "execution_model_override"
 
 const (
+	// StreamBufferSize bounds per-stream buffering between executor layers.
+	StreamBufferSize = 16
+
 	// PinnedAuthMetadataKey locks execution to a specific auth ID.
 	PinnedAuthMetadataKey = "pinned_auth_id"
 	// ImageGenerationStreamPassthroughMetadataKey requests low-overhead passthrough for
 	// streaming Responses image_generation events.
 	ImageGenerationStreamPassthroughMetadataKey = "image_generation_stream_passthrough"
+	// TrustUpstreamSSEMetadataKey requests direct forwarding of trusted upstream SSE frames.
+	TrustUpstreamSSEMetadataKey = "trust_upstream_sse"
 	// SelectionAttemptMetadataKey stores the outer retry attempt index for auth selection.
 	SelectionAttemptMetadataKey = "selection_attempt"
 	// SelectedAuthMetadataKey stores the auth ID selected by the scheduler.

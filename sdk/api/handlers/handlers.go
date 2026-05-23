@@ -724,6 +724,9 @@ func (h *BaseAPIHandler) executeStreamWithResolvedProviders(ctx context.Context,
 		reqMeta[coreexecutor.ImageGenerationStreamPassthroughMetadataKey] = true
 	}
 	trustResponsesSSE := handlerType == "openai-response" && StreamingTrustUpstreamSSE(h.Cfg)
+	if trustResponsesSSE {
+		reqMeta[coreexecutor.TrustUpstreamSSEMetadataKey] = true
+	}
 	payload := rawJSON
 	if len(payload) == 0 {
 		payload = nil

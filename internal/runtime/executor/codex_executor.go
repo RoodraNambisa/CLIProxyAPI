@@ -548,6 +548,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	body, _ = sjson.SetBytes(body, "model", baseModel)
 	body = normalizeCodexInstructions(body)
 	imageStreamPassthrough := metadataBool(opts.Metadata, cliproxyexecutor.ImageGenerationStreamPassthroughMetadataKey) && from == sdktranslator.FormatOpenAIResponse && codexHasImageGenerationTool(body)
+	trustUpstreamSSE := metadataBool(opts.Metadata, cliproxyexecutor.TrustUpstreamSSEMetadataKey) && from == sdktranslator.FormatOpenAIResponse
 
 	url := strings.TrimSuffix(baseURL, "/") + "/responses"
 	httpReq, err := e.cacheHelper(ctx, from, url, req, body)
@@ -594,7 +595,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 		err = newCodexStatusErr(httpResp.StatusCode, data)
 		return nil, err
 	}
-	out := make(chan cliproxyexecutor.StreamChunk)
+	out := make(chan cliproxyexecutor.StreamChunk, cliproxyexecutor.StreamBufferSize)
 	go func() {
 		defer close(out)
 		defer func() {
@@ -603,15 +604,51 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 			}
 		}()
 		scanner := bufio.NewScanner(httpResp.Body)
-		scanner.Buffer(nil, 52_428_800) // 50MB
+		scanner.Buffer(make([]byte, 64*1024), 52_428_800) // 50MB
 		var param any
 		outputItemsByIndex := make(map[int64][]byte)
 		var outputItemsFallback [][]byte
+		var trustedFrame []byte
+		emit := func(chunk cliproxyexecutor.StreamChunk) bool {
+			if ctx == nil {
+				out <- chunk
+				return true
+			}
+			select {
+			case <-ctx.Done():
+				return false
+			case out <- chunk:
+				return true
+			}
+		}
+		flushTrustedFrame := func() bool {
+			if len(bytes.TrimSpace(trustedFrame)) == 0 {
+				trustedFrame = trustedFrame[:0]
+				return true
+			}
+			payload := append([]byte(nil), trustedFrame...)
+			trustedFrame = trustedFrame[:0]
+			return emit(cliproxyexecutor.StreamChunk{Payload: payload})
+		}
 		for scanner.Scan() {
 			line := scanner.Bytes()
 			helps.AppendAPIResponseChunk(ctx, e.cfg, line)
+			if trustUpstreamSSE {
+				publishCodexStreamUsage(ctx, reporter, body, line)
+				if len(bytes.TrimSpace(line)) == 0 {
+					if !flushTrustedFrame() {
+						return
+					}
+					continue
+				}
+				trustedFrame = append(trustedFrame, line...)
+				trustedFrame = append(trustedFrame, '\n')
+				continue
+			}
 			if imageStreamPassthrough {
-				out <- cliproxyexecutor.StreamChunk{Payload: append([]byte(nil), line...)}
+				if !emit(cliproxyexecutor.StreamChunk{Payload: append([]byte(nil), line...)}) {
+					return
+				}
 				continue
 			}
 			translatedLine := bytes.Clone(line)
@@ -633,13 +670,20 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 
 			chunks := sdktranslator.TranslateStream(ctx, to, from, req.Model, originalPayload, body, translatedLine, &param)
 			for i := range chunks {
-				out <- cliproxyexecutor.StreamChunk{Payload: chunks[i]}
+				if !emit(cliproxyexecutor.StreamChunk{Payload: chunks[i]}) {
+					return
+				}
+			}
+		}
+		if trustUpstreamSSE && scanner.Err() == nil {
+			if !flushTrustedFrame() {
+				return
 			}
 		}
 		if errScan := scanner.Err(); errScan != nil {
 			helps.RecordAPIResponseError(ctx, e.cfg, errScan)
 			reporter.PublishFailure(ctx)
-			out <- cliproxyexecutor.StreamChunk{Err: errScan}
+			_ = emit(cliproxyexecutor.StreamChunk{Err: errScan})
 		}
 	}()
 	return &cliproxyexecutor.StreamResult{Headers: httpResp.Header.Clone(), Chunks: out}, nil
@@ -1008,6 +1052,28 @@ func publishCodexImageToolUsage(ctx context.Context, reporter *helps.UsageReport
 	}
 	reporter.EnsurePublished(ctx)
 	reporter.PublishAdditionalModel(ctx, codexImageGenerationToolModel(body), detail)
+}
+
+func publishCodexStreamUsage(ctx context.Context, reporter *helps.UsageReporter, body []byte, line []byte) {
+	data, ok := codexStreamDataPayload(line)
+	if !ok || !bytes.Contains(data, []byte("response.completed")) {
+		return
+	}
+	if gjson.GetBytes(data, "type").String() != "response.completed" {
+		return
+	}
+	if detail, ok := helps.ParseCodexUsage(data); ok {
+		reporter.Publish(ctx, detail)
+	}
+	publishCodexImageToolUsage(ctx, reporter, body, data)
+}
+
+func codexStreamDataPayload(line []byte) ([]byte, bool) {
+	line = bytes.TrimSpace(line)
+	if !bytes.HasPrefix(line, dataTag) {
+		return nil, false
+	}
+	return bytes.TrimSpace(line[len(dataTag):]), true
 }
 
 func metadataBool(meta map[string]any, key string) bool {
