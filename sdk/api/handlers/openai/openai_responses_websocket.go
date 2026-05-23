@@ -26,13 +26,15 @@ import (
 )
 
 const (
-	wsRequestTypeCreate  = "response.create"
-	wsRequestTypeAppend  = "response.append"
-	wsEventTypeError     = "error"
-	wsEventTypeCompleted = "response.completed"
-	wsDoneMarker         = "[DONE]"
-	wsTurnStateHeader    = "x-codex-turn-state"
-	wsTimelineBodyKey    = "WEBSOCKET_TIMELINE_OVERRIDE"
+	wsRequestTypeCreate   = "response.create"
+	wsRequestTypeAppend   = "response.append"
+	wsEventTypeError      = "error"
+	wsEventTypeCompleted  = "response.completed"
+	wsEventTypeFailed     = "response.failed"
+	wsEventTypeIncomplete = "response.incomplete"
+	wsDoneMarker          = "[DONE]"
+	wsTurnStateHeader     = "x-codex-turn-state"
+	wsTimelineBodyKey     = "WEBSOCKET_TIMELINE_OVERRIDE"
 )
 
 var responsesWebsocketUpgrader = websocket.Upgrader{
@@ -817,9 +819,11 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesWebsocket(
 			for i := range payloads {
 				recordResponsesWebsocketToolCallsFromPayload(toolPairState, payloads[i])
 				eventType := gjson.GetBytes(payloads[i], "type").String()
-				if eventType == wsEventTypeCompleted {
+				if responsesWebsocketTerminalEvent(eventType) {
 					completed = true
-					completedOutput = responseCompletedOutputFromPayload(payloads[i])
+					if eventType == wsEventTypeCompleted {
+						completedOutput = responseCompletedOutputFromPayload(payloads[i])
+					}
 				}
 				markAPIResponseTimestamp(c)
 				// log.Infof(
@@ -841,6 +845,15 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesWebsocket(
 				}
 			}
 		}
+	}
+}
+
+func responsesWebsocketTerminalEvent(eventType string) bool {
+	switch eventType {
+	case wsEventTypeCompleted, wsEventTypeFailed, wsEventTypeIncomplete, wsEventTypeError:
+		return true
+	default:
+		return false
 	}
 }
 

@@ -5,6 +5,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
@@ -43,6 +44,120 @@ func TestCodexExecutorExecute_EmptyStreamCompletionOutputUsesOutputItemDone(t *t
 	gotContent := gjson.GetBytes(resp.Payload, "choices.0.message.content").String()
 	if gotContent != "ok" {
 		t.Fatalf("choices.0.message.content = %q, want %q; payload=%s", gotContent, "ok", string(resp.Payload))
+	}
+}
+
+func TestCodexExecutorExecute_ResponseFailedReturnsTerminalError(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte(`data: {"type":"response.failed","response":{"id":"resp_1","status":"failed","error":{"code":"server_error","message":"The model failed to generate a response."},"output":[]}}` + "\n\n"))
+	}))
+	defer server.Close()
+
+	executor := NewCodexExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"base_url": server.URL,
+		"api_key":  "test",
+	}}
+
+	_, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "gpt-5.4-mini",
+		Payload: []byte(`{"model":"gpt-5.4-mini","input":"Say ok"}`),
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("openai-response"),
+		Stream:       false,
+	})
+	if err == nil {
+		t.Fatal("Execute error = nil, want response.failed error")
+	}
+	status, ok := err.(interface{ StatusCode() int })
+	if !ok {
+		t.Fatalf("Execute error type = %T, want StatusCode", err)
+	}
+	if got := status.StatusCode(); got != http.StatusInternalServerError {
+		t.Fatalf("StatusCode = %d, want %d; err=%v", got, http.StatusInternalServerError, err)
+	}
+	if strings.Contains(err.Error(), "response.completed") {
+		t.Fatalf("error should not mention missing response.completed: %v", err)
+	}
+	if !strings.Contains(err.Error(), "The model failed to generate a response.") {
+		t.Fatalf("error = %v, want upstream failed message", err)
+	}
+}
+
+func TestCodexExecutorExecute_ResponseIncompleteReturnsTerminalError(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte(`data: {"type":"response.incomplete","response":{"id":"resp_1","status":"incomplete","error":null,"incomplete_details":{"reason":"max_tokens"},"output":[]}}` + "\n\n"))
+	}))
+	defer server.Close()
+
+	executor := NewCodexExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"base_url": server.URL,
+		"api_key":  "test",
+	}}
+
+	_, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "gpt-5.4-mini",
+		Payload: []byte(`{"model":"gpt-5.4-mini","input":"Say ok"}`),
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("openai-response"),
+		Stream:       false,
+	})
+	if err == nil {
+		t.Fatal("Execute error = nil, want response.incomplete error")
+	}
+	status, ok := err.(interface{ StatusCode() int })
+	if !ok {
+		t.Fatalf("Execute error type = %T, want StatusCode", err)
+	}
+	if got := status.StatusCode(); got != http.StatusBadGateway {
+		t.Fatalf("StatusCode = %d, want %d; err=%v", got, http.StatusBadGateway, err)
+	}
+	if strings.Contains(err.Error(), "response.completed") {
+		t.Fatalf("error should not mention missing response.completed: %v", err)
+	}
+	if !strings.Contains(err.Error(), "response incomplete: max_tokens") {
+		t.Fatalf("error = %v, want incomplete reason", err)
+	}
+}
+
+func TestCodexExecutorExecute_ErrorEventReturnsTerminalError(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte(`data: {"type":"error","error":{"type":"server_error","code":"server_error","message":"upstream server error","param":null},"sequence_number":5}` + "\n\n"))
+	}))
+	defer server.Close()
+
+	executor := NewCodexExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"base_url": server.URL,
+		"api_key":  "test",
+	}}
+
+	_, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "gpt-5.4-mini",
+		Payload: []byte(`{"model":"gpt-5.4-mini","input":"Say ok"}`),
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("openai-response"),
+		Stream:       false,
+	})
+	if err == nil {
+		t.Fatal("Execute error = nil, want error event")
+	}
+	status, ok := err.(interface{ StatusCode() int })
+	if !ok {
+		t.Fatalf("Execute error type = %T, want StatusCode", err)
+	}
+	if got := status.StatusCode(); got != http.StatusInternalServerError {
+		t.Fatalf("StatusCode = %d, want %d; err=%v", got, http.StatusInternalServerError, err)
+	}
+	if strings.Contains(err.Error(), "response.completed") {
+		t.Fatalf("error should not mention missing response.completed: %v", err)
+	}
+	if !strings.Contains(err.Error(), "upstream server error") {
+		t.Fatalf("error = %v, want upstream error message", err)
 	}
 }
 

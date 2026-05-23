@@ -100,6 +100,131 @@ func patchCodexCompletedOutput(eventData []byte, outputItemsByIndex map[int64][]
 	return completedDataPatched
 }
 
+func codexTerminalStreamError(eventData []byte) (statusErr, bool) {
+	eventType := gjson.GetBytes(eventData, "type").String()
+	switch eventType {
+	case "response.failed":
+		return codexResponseFailedError(eventData), true
+	case "response.incomplete":
+		return codexResponseIncompleteError(eventData), true
+	case "error":
+		return codexStreamErrorEventError(eventData), true
+	default:
+		return statusErr{}, false
+	}
+}
+
+func codexResponseFailedError(eventData []byte) statusErr {
+	code := strings.TrimSpace(gjson.GetBytes(eventData, "response.error.code").String())
+	message := strings.TrimSpace(gjson.GetBytes(eventData, "response.error.message").String())
+	if message == "" {
+		message = "response failed"
+	}
+	if code == "" {
+		code = "server_error"
+	}
+	return codexStreamStatusErr(codexStreamErrorStatus(code, http.StatusInternalServerError), message, code, codexStreamErrorType(code), nil)
+}
+
+func codexResponseIncompleteError(eventData []byte) statusErr {
+	reason := strings.TrimSpace(gjson.GetBytes(eventData, "response.incomplete_details.reason").String())
+	message := strings.TrimSpace(gjson.GetBytes(eventData, "response.error.message").String())
+	if message == "" && reason != "" {
+		message = fmt.Sprintf("response incomplete: %s", reason)
+	}
+	if message == "" {
+		message = "response incomplete"
+	}
+	code := reason
+	if code == "" {
+		code = "response_incomplete"
+	}
+	return codexStreamStatusErr(codexStreamErrorStatus(code, http.StatusBadGateway), message, code, "server_error", nil)
+}
+
+func codexStreamErrorEventError(eventData []byte) statusErr {
+	code := strings.TrimSpace(gjson.GetBytes(eventData, "error.code").String())
+	if code == "" {
+		code = strings.TrimSpace(gjson.GetBytes(eventData, "code").String())
+	}
+	message := strings.TrimSpace(gjson.GetBytes(eventData, "error.message").String())
+	if message == "" {
+		message = strings.TrimSpace(gjson.GetBytes(eventData, "message").String())
+	}
+	if message == "" {
+		message = "stream error"
+	}
+	if code == "" {
+		code = "stream_error"
+	}
+	errType := strings.TrimSpace(gjson.GetBytes(eventData, "error.type").String())
+	var param *gjson.Result
+	if paramResult := gjson.GetBytes(eventData, "error.param"); paramResult.Exists() {
+		param = &paramResult
+	} else if paramResult := gjson.GetBytes(eventData, "param"); paramResult.Exists() {
+		param = &paramResult
+	}
+	return codexStreamStatusErr(codexStreamErrorStatus(code, http.StatusInternalServerError), message, code, errType, param)
+}
+
+func codexStreamErrorStatus(code string, fallback int) int {
+	switch strings.ToLower(strings.TrimSpace(code)) {
+	case "invalid_api_key", "authentication_error", "unauthorized":
+		return http.StatusUnauthorized
+	case "permission_error", "permission_denied", "forbidden":
+		return http.StatusForbidden
+	case "rate_limit_exceeded", "quota_exceeded", "insufficient_quota":
+		return http.StatusTooManyRequests
+	case "not_found", "model_not_found":
+		return http.StatusNotFound
+	case "bad_request", "invalid_request", "invalid_request_error", "invalid_prompt", "invalid_value":
+		return http.StatusBadRequest
+	case "server_error", "internal_server_error":
+		return http.StatusInternalServerError
+	case "overloaded", "service_unavailable":
+		return http.StatusServiceUnavailable
+	default:
+		return fallback
+	}
+}
+
+func codexStreamErrorType(code string) string {
+	switch strings.ToLower(strings.TrimSpace(code)) {
+	case "invalid_api_key", "authentication_error", "unauthorized":
+		return "authentication_error"
+	case "permission_error", "permission_denied", "forbidden":
+		return "permission_error"
+	case "rate_limit_exceeded", "quota_exceeded", "insufficient_quota":
+		return "rate_limit_error"
+	case "server_error", "internal_server_error", "overloaded", "service_unavailable":
+		return "server_error"
+	default:
+		return "invalid_request_error"
+	}
+}
+
+func codexStreamStatusErr(status int, message, code, errType string, param *gjson.Result) statusErr {
+	if status <= 0 {
+		status = http.StatusInternalServerError
+	}
+	if strings.TrimSpace(message) == "" {
+		message = http.StatusText(status)
+	}
+	if strings.TrimSpace(errType) == "" {
+		errType = codexStreamErrorType(code)
+	}
+	body := []byte(`{"error":{}}`)
+	body, _ = sjson.SetBytes(body, "error.message", message)
+	body, _ = sjson.SetBytes(body, "error.type", errType)
+	if strings.TrimSpace(code) != "" {
+		body, _ = sjson.SetBytes(body, "error.code", code)
+	}
+	if param != nil {
+		body, _ = sjson.SetRawBytes(body, "error.param", []byte(param.Raw))
+	}
+	return statusErr{code: status, msg: string(body)}
+}
+
 // CodexExecutor is a stateless executor for Codex (OpenAI Responses API entrypoint).
 // If api_key is unavailable on auth, it falls back to legacy via ClientAdapter.
 type CodexExecutor struct {
@@ -261,6 +386,11 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 				outputItemsFallback = append(outputItemsFallback, []byte(itemResult.Raw))
 			}
 			continue
+		}
+
+		if terminalErr, ok := codexTerminalStreamError(eventData); ok {
+			err = terminalErr
+			return resp, err
 		}
 
 		if eventType != "response.completed" {
