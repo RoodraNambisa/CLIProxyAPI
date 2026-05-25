@@ -271,6 +271,17 @@ nonstream-keepalive-interval: 0
 #   user-agent: "codex_cli_rs/0.114.0 (Mac OS 14.2.0; x86_64) vscode/1.111.0"
 #   beta-features: "multi_agent"
 
+# Optional Codex upstream fingerprinting. Disabled by default.
+# `ja3` uses a Chrome-like uTLS ClientHello for Codex HTTPS requests.
+# `browser-headers` injects Chrome-style browser request headers such as
+# sec-ch-ua/sec-fetch/origin/referer while keeping API-specific Accept values.
+# `stabilize-per-account` defaults to true; each OAuth email or API key hashes
+# to a stable browser persona. Set it to false to rotate per request.
+# codex-fingerprint:
+#   ja3: false
+#   browser-headers: false
+#   stabilize-per-account: true
+
 # OpenAI compatibility providers
 # openai-compatibility:
 #   - name: "openrouter" # The name of the provider; it will be used in the user agent and other places.

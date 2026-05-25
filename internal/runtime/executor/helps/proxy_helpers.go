@@ -43,12 +43,7 @@ type cachedProxyTransport struct {
 // Returns:
 //   - *http.Client: An HTTP client with configured proxy or transport
 func NewProxyAwareHTTPClient(ctx context.Context, cfg *config.Config, auth *cliproxyauth.Auth, timeout time.Duration) *http.Client {
-	var contextTransport http.RoundTripper
-	if ctx != nil {
-		if rt, ok := ctx.Value("cliproxy.roundtripper").(http.RoundTripper); ok && rt != nil {
-			contextTransport = rt
-		}
-	}
+	contextTransport := roundTripperFromContext(ctx)
 
 	var proxyURL string
 	if auth != nil {
@@ -74,6 +69,17 @@ func NewProxyAwareHTTPClient(ctx context.Context, cfg *config.Config, auth *clip
 	}
 
 	return newProxyHTTPClient(nil, timeout)
+}
+
+func roundTripperFromContext(ctx context.Context) http.RoundTripper {
+	if ctx == nil {
+		return nil
+	}
+	rt, ok := ctx.Value("cliproxy.roundtripper").(http.RoundTripper)
+	if !ok || rt == nil {
+		return nil
+	}
+	return rt
 }
 
 func cachedTransportForProxyURL(proxyURL string) *http.Transport {

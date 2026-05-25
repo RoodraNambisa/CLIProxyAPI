@@ -117,6 +117,9 @@ type Config struct {
 	// These are used only when the client does not send its own headers.
 	CodexHeaderDefaults CodexHeaderDefaults `yaml:"codex-header-defaults" json:"codex-header-defaults"`
 
+	// CodexFingerprint controls optional browser-style request fingerprinting for Codex upstreams.
+	CodexFingerprint CodexFingerprintConfig `yaml:"codex-fingerprint" json:"codex-fingerprint"`
+
 	// CodexCustomModels defines additional Codex OAuth/file-backed models.
 	CodexCustomModels []CodexCustomModel `yaml:"codex-custom-models,omitempty" json:"codex-custom-models,omitempty"`
 
@@ -175,6 +178,13 @@ type ClaudeHeaderDefaults struct {
 type CodexHeaderDefaults struct {
 	UserAgent    string `yaml:"user-agent" json:"user-agent"`
 	BetaFeatures string `yaml:"beta-features" json:"beta-features"`
+}
+
+// CodexFingerprintConfig controls optional browser-style Codex upstream fingerprinting.
+type CodexFingerprintConfig struct {
+	JA3                 bool  `yaml:"ja3" json:"ja3"`
+	BrowserHeaders      bool  `yaml:"browser-headers" json:"browser-headers"`
+	StabilizePerAccount *bool `yaml:"stabilize-per-account,omitempty" json:"stabilize-per-account,omitempty"`
 }
 
 // TLSConfig holds HTTPS server settings.

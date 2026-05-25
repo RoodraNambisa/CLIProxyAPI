@@ -13,6 +13,10 @@ func TestLoadConfigOptional_CodexHeaderDefaults(t *testing.T) {
 codex-header-defaults:
   user-agent: "  my-codex-client/1.0  "
   beta-features: "  feature-a,feature-b  "
+codex-fingerprint:
+  ja3: true
+  browser-headers: true
+  stabilize-per-account: false
 `)
 	if err := os.WriteFile(configPath, configYAML, 0o600); err != nil {
 		t.Fatalf("failed to write config: %v", err)
@@ -28,5 +32,14 @@ codex-header-defaults:
 	}
 	if got := cfg.CodexHeaderDefaults.BetaFeatures; got != "feature-a,feature-b" {
 		t.Fatalf("BetaFeatures = %q, want %q", got, "feature-a,feature-b")
+	}
+	if !cfg.CodexFingerprint.JA3 {
+		t.Fatalf("CodexFingerprint.JA3 = false, want true")
+	}
+	if !cfg.CodexFingerprint.BrowserHeaders {
+		t.Fatalf("CodexFingerprint.BrowserHeaders = false, want true")
+	}
+	if cfg.CodexFingerprint.StabilizePerAccount == nil || *cfg.CodexFingerprint.StabilizePerAccount {
+		t.Fatalf("CodexFingerprint.StabilizePerAccount = %v, want false", cfg.CodexFingerprint.StabilizePerAccount)
 	}
 }

@@ -174,6 +174,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	ctx = contextWithCodexFingerprintPersona(ctx, e.cfg, auth)
 	if opts.Alt == "responses/compact" {
 		return e.CodexExecutor.executeCompact(ctx, auth, req, opts)
 	}
@@ -222,7 +223,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 	}
 
 	body, wsHeaders := applyCodexPromptCacheHeaders(from, req, body)
-	wsHeaders = applyCodexWebsocketHeaders(ctx, wsHeaders, auth, apiKey, e.cfg)
+	wsHeaders = applyCodexWebsocketHeadersForURL(ctx, wsHeaders, auth, apiKey, e.cfg, parsedURLOrNil(wsURL))
 
 	var authID, authLabel, authType, authValue string
 	if auth != nil {
@@ -385,6 +386,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	ctx = contextWithCodexFingerprintPersona(ctx, e.cfg, auth)
 	if opts.Alt == "responses/compact" {
 		return nil, statusErr{code: http.StatusBadRequest, msg: "streaming not supported for /responses/compact"}
 	}
@@ -421,7 +423,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 	}
 
 	body, wsHeaders := applyCodexPromptCacheHeaders(from, req, body)
-	wsHeaders = applyCodexWebsocketHeaders(ctx, wsHeaders, auth, apiKey, e.cfg)
+	wsHeaders = applyCodexWebsocketHeadersForURL(ctx, wsHeaders, auth, apiKey, e.cfg, parsedURLOrNil(wsURL))
 
 	var authID, authLabel, authType, authValue string
 	authID = auth.ID
@@ -645,7 +647,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 }
 
 func (e *CodexWebsocketsExecutor) dialCodexWebsocket(ctx context.Context, auth *cliproxyauth.Auth, wsURL string, headers http.Header) (*websocket.Conn, *http.Response, error) {
-	dialer := newProxyAwareWebsocketDialer(e.cfg, auth)
+	dialer := newProxyAwareWebsocketDialer(ctx, e.cfg, auth)
 	dialer.HandshakeTimeout = codexResponsesWebsocketHandshakeTO
 	dialer.EnableCompression = true
 	if ctx == nil {
@@ -721,7 +723,7 @@ func readCodexWebsocketMessage(ctx context.Context, sess *codexWebsocketSession,
 	}
 }
 
-func newProxyAwareWebsocketDialer(cfg *config.Config, auth *cliproxyauth.Auth) *websocket.Dialer {
+func newProxyAwareWebsocketDialer(ctx context.Context, cfg *config.Config, auth *cliproxyauth.Auth) *websocket.Dialer {
 	dialer := &websocket.Dialer{
 		Proxy:             http.ProxyFromEnvironment,
 		HandshakeTimeout:  codexResponsesWebsocketHandshakeTO,
@@ -740,22 +742,22 @@ func newProxyAwareWebsocketDialer(cfg *config.Config, auth *cliproxyauth.Auth) *
 		proxyURL = strings.TrimSpace(cfg.ProxyURL)
 	}
 	if proxyURL == "" {
-		return dialer
+		return enableCodexWebsocketUTLS(dialer, ctx, cfg, auth, proxyURL)
 	}
 
 	setting, errParse := proxyutil.Parse(proxyURL)
 	if errParse != nil {
 		log.Errorf("codex websockets executor: %v", errParse)
-		return dialer
+		return enableCodexWebsocketUTLS(dialer, ctx, cfg, auth, "")
 	}
 
 	switch setting.Mode {
 	case proxyutil.ModeDirect:
 		dialer.Proxy = nil
-		return dialer
+		return enableCodexWebsocketUTLS(dialer, ctx, cfg, auth, proxyURL)
 	case proxyutil.ModeProxy:
 	default:
-		return dialer
+		return enableCodexWebsocketUTLS(dialer, ctx, cfg, auth, "")
 	}
 
 	switch setting.URL.Scheme {
@@ -781,6 +783,22 @@ func newProxyAwareWebsocketDialer(cfg *config.Config, auth *cliproxyauth.Auth) *
 		log.Errorf("codex websockets executor: unsupported proxy scheme: %s", setting.URL.Scheme)
 	}
 
+	return enableCodexWebsocketUTLS(dialer, ctx, cfg, auth, proxyURL)
+}
+
+func enableCodexWebsocketUTLS(dialer *websocket.Dialer, ctx context.Context, cfg *config.Config, auth *cliproxyauth.Auth, proxyURL string) *websocket.Dialer {
+	if dialer == nil || !codexFingerprintJA3Enabled(cfg) {
+		return dialer
+	}
+	persona := codexFingerprintPersonaFromContext(ctx, cfg, auth)
+	dialer.Proxy = nil
+	dialer.NetDialTLSContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		serverName := addr
+		if host, _, errSplit := net.SplitHostPort(addr); errSplit == nil && strings.TrimSpace(host) != "" {
+			serverName = host
+		}
+		return helps.DialChromeUTLSContext(ctx, network, addr, serverName, proxyURL, persona.tlsProfile)
+	}
 	return dialer
 }
 
@@ -840,6 +858,10 @@ func applyCodexPromptCacheHeaders(from sdktranslator.Format, req cliproxyexecuto
 }
 
 func applyCodexWebsocketHeaders(ctx context.Context, headers http.Header, auth *cliproxyauth.Auth, token string, cfg *config.Config) http.Header {
+	return applyCodexWebsocketHeadersForURL(ctx, headers, auth, token, cfg, nil)
+}
+
+func applyCodexWebsocketHeadersForURL(ctx context.Context, headers http.Header, auth *cliproxyauth.Auth, token string, cfg *config.Config, target *url.URL) http.Header {
 	if headers == nil {
 		headers = http.Header{}
 	}
@@ -865,6 +887,7 @@ func applyCodexWebsocketHeaders(ctx context.Context, headers http.Header, auth *
 	} else {
 		ensureHeaderWithConfigPrecedence(headers, ginHeaders, "User-Agent", cfgUserAgent, codexUserAgent)
 	}
+	applyCodexBrowserFingerprintHeaders(ctx, headers, cfg, auth, target, true)
 
 	betaHeader := strings.TrimSpace(headers.Get("OpenAI-Beta"))
 	if betaHeader == "" && ginHeaders != nil {
