@@ -2,6 +2,7 @@ package helps
 
 import (
 	"context"
+	"crypto/tls"
 	"net/http"
 	"net/url"
 	"os"
@@ -18,9 +19,13 @@ import (
 
 var (
 	proxyHTTPTransportCache        sync.Map // map[string]*cachedProxyTransport
+	proxyHTTP1TransportCache       sync.Map // map[string]*cachedProxyTransport
 	environmentProxyKeys           = []string{"HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"}
 	environmentNoProxyKeys         = []string{"NO_PROXY", "no_proxy"}
 	environmentProxyTransportCache sync.Map // map[string]*http.Transport
+	environmentHTTP1TransportCache sync.Map // map[string]*http.Transport
+	defaultHTTP1TransportOnce      sync.Once
+	defaultHTTP1Transport          *http.Transport
 )
 
 type cachedProxyTransport struct {
@@ -71,6 +76,90 @@ func NewProxyAwareHTTPClient(ctx context.Context, cfg *config.Config, auth *clip
 	return newProxyHTTPClient(nil, timeout)
 }
 
+// NewProxyAwareHTTP1Client creates a proxy-aware client with HTTP/2 disabled
+// when the selected transport is a standard *http.Transport.
+func NewProxyAwareHTTP1Client(ctx context.Context, cfg *config.Config, auth *cliproxyauth.Auth, timeout time.Duration) *http.Client {
+	contextTransport := roundTripperFromContext(ctx)
+
+	var proxyURL string
+	if auth != nil {
+		proxyURL = strings.TrimSpace(auth.ProxyURL)
+	}
+	if proxyURL == "" && cfg != nil {
+		proxyURL = strings.TrimSpace(cfg.ProxyURL)
+	}
+
+	if proxyURL != "" {
+		if transport := cachedHTTP1TransportForProxyURL(proxyURL); transport != nil {
+			return newProxyHTTPClient(transport, timeout)
+		}
+		log.Debugf("failed to setup proxy from URL: %s, falling back to injected/default transport", proxyURL)
+	}
+
+	if contextTransport != nil {
+		if transport, ok := contextTransport.(*http.Transport); ok && transport != nil {
+			clone := transport.Clone()
+			disableHTTP2(clone)
+			return newProxyHTTPClient(clone, timeout)
+		}
+		return newProxyHTTPClient(contextTransport, timeout)
+	}
+
+	if environmentProxyConfigured() {
+		return newProxyHTTPClient(newEnvironmentProxyHTTP1Transport(), timeout)
+	}
+
+	return newProxyHTTPClient(newDefaultHTTP1Transport(), timeout)
+}
+
+func cloneDefaultHTTPTransport() *http.Transport {
+	if transport, ok := http.DefaultTransport.(*http.Transport); ok && transport != nil {
+		return transport.Clone()
+	}
+	return &http.Transport{}
+}
+
+func disableHTTP2(transport *http.Transport) {
+	if transport == nil {
+		return
+	}
+	transport.ForceAttemptHTTP2 = false
+	protocols := new(http.Protocols)
+	protocols.SetHTTP1(true)
+	transport.Protocols = protocols
+	transport.TLSNextProto = map[string]func(string, *tls.Conn) http.RoundTripper{}
+	if transport.TLSClientConfig != nil {
+		tlsConfig := transport.TLSClientConfig.Clone()
+		tlsConfig.NextProtos = withoutHTTP2Proto(tlsConfig.NextProtos)
+		transport.TLSClientConfig = tlsConfig
+	}
+}
+
+func withoutHTTP2Proto(nextProtos []string) []string {
+	if len(nextProtos) == 0 {
+		return nextProtos
+	}
+	out := make([]string, 0, len(nextProtos))
+	for _, proto := range nextProtos {
+		if proto == "h2" {
+			continue
+		}
+		out = append(out, proto)
+	}
+	if len(out) == 0 {
+		return []string{"http/1.1"}
+	}
+	return out
+}
+
+func newDefaultHTTP1Transport() *http.Transport {
+	defaultHTTP1TransportOnce.Do(func() {
+		defaultHTTP1Transport = cloneDefaultHTTPTransport()
+		disableHTTP2(defaultHTTP1Transport)
+	})
+	return defaultHTTP1Transport
+}
+
 func roundTripperFromContext(ctx context.Context) http.RoundTripper {
 	if ctx == nil {
 		return nil
@@ -91,6 +180,20 @@ func cachedTransportForProxyURL(proxyURL string) *http.Transport {
 	entry := entryAny.(*cachedProxyTransport)
 	entry.once.Do(func() {
 		entry.transport = buildProxyTransport(proxyURL)
+	})
+	return entry.transport
+}
+
+func cachedHTTP1TransportForProxyURL(proxyURL string) *http.Transport {
+	proxyURL = strings.TrimSpace(proxyURL)
+	if proxyURL == "" {
+		return nil
+	}
+	entryAny, _ := proxyHTTP1TransportCache.LoadOrStore(proxyURL, &cachedProxyTransport{})
+	entry := entryAny.(*cachedProxyTransport)
+	entry.once.Do(func() {
+		entry.transport = buildProxyTransport(proxyURL)
+		disableHTTP2(entry.transport)
 	})
 	return entry.transport
 }
@@ -145,6 +248,18 @@ func newEnvironmentProxyTransport() *http.Transport {
 		transport = &http.Transport{Proxy: proxyFunc}
 	}
 	actual, _ := environmentProxyTransportCache.LoadOrStore(signature, transport)
+	return actual.(*http.Transport)
+}
+
+func newEnvironmentProxyHTTP1Transport() *http.Transport {
+	signature := environmentProxySignature()
+	if cached, ok := environmentHTTP1TransportCache.Load(signature); ok {
+		return cached.(*http.Transport)
+	}
+
+	transport := newEnvironmentProxyTransport().Clone()
+	disableHTTP2(transport)
+	actual, _ := environmentHTTP1TransportCache.LoadOrStore(signature, transport)
 	return actual.(*http.Transport)
 }
 

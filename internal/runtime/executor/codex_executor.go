@@ -278,7 +278,7 @@ func (e *CodexExecutor) HttpRequest(ctx context.Context, auth *cliproxyauth.Auth
 	if err := e.PrepareRequest(httpReq, auth); err != nil {
 		return nil, err
 	}
-	httpClient := e.newCodexHTTPClient(ctx, auth)
+	httpClient := e.newCodexHTTPClient(ctx, auth, false)
 	return httpClient.Do(httpReq)
 }
 
@@ -339,7 +339,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 		AuthType:  authType,
 		AuthValue: authValue,
 	})
-	httpClient := e.newCodexHTTPClient(ctx, auth)
+	httpClient := e.newCodexHTTPClient(ctx, auth, true)
 	httpResp, err := httpClient.Do(httpReq)
 	if err != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
@@ -486,7 +486,7 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 		AuthType:  authType,
 		AuthValue: authValue,
 	})
-	httpClient := e.newCodexHTTPClient(ctx, auth)
+	httpClient := e.newCodexHTTPClient(ctx, auth, false)
 	httpResp, err := httpClient.Do(httpReq)
 	if err != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
@@ -578,7 +578,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 		AuthValue: authValue,
 	})
 
-	httpClient := e.newCodexHTTPClient(ctx, auth)
+	httpClient := e.newCodexHTTPClient(ctx, auth, true)
 	httpResp, err := httpClient.Do(httpReq)
 	if err != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
@@ -983,7 +983,14 @@ func applyCodexHeaders(r *http.Request, auth *cliproxyauth.Auth, token string, s
 	util.ApplyCustomHeadersFromAttrs(r, attrs)
 }
 
-func (e *CodexExecutor) newCodexHTTPClient(ctx context.Context, auth *cliproxyauth.Auth) *http.Client {
+func (e *CodexExecutor) newCodexHTTPClient(ctx context.Context, auth *cliproxyauth.Auth, forceHTTP1 bool) *http.Client {
+	if forceHTTP1 {
+		var cfg *config.Config
+		if e != nil {
+			cfg = e.cfg
+		}
+		return helps.NewProxyAwareHTTP1Client(ctx, cfg, auth, 0)
+	}
 	if e != nil && codexFingerprintJA3Enabled(e.cfg) {
 		persona := codexFingerprintPersonaFromContext(ctx, e.cfg, auth)
 		return helps.NewChromeUtlsHTTPClient(ctx, e.cfg, auth, 0, persona.tlsProfile)
