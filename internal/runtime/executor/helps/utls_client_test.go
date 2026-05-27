@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	tls "github.com/refraction-networking/utls"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 )
@@ -52,6 +53,29 @@ func TestNewChromeUtlsHTTPClientUsesInjectedTransportWithoutExplicitProxy(t *tes
 	}
 }
 
+func TestNewChromeUtlsHTTP1ClientUsesInjectedTransportWithoutExplicitProxy(t *testing.T) {
+	wantTransport := &stubRoundTripper{}
+	ctx := context.WithValue(context.Background(), "cliproxy.roundtripper", http.RoundTripper(wantTransport))
+
+	client := NewChromeUtlsHTTP1Client(ctx, &config.Config{}, &cliproxyauth.Auth{}, 0, "chrome_133")
+
+	if client.Transport != wantTransport {
+		t.Fatalf("transport = %T, want injected context RoundTripper", client.Transport)
+	}
+}
+
+func TestNewChromeUtlsHTTP1ClientUsesHTTP1RoundTripper(t *testing.T) {
+	client := NewChromeUtlsHTTP1Client(context.Background(), &config.Config{}, &cliproxyauth.Auth{}, 0, "chrome_133")
+
+	fallback, ok := client.Transport.(*fallbackRoundTripper)
+	if !ok {
+		t.Fatalf("transport type = %T, want *fallbackRoundTripper", client.Transport)
+	}
+	if _, ok := fallback.utls.(*utlsHTTP1RoundTripper); !ok {
+		t.Fatalf("utls transport type = %T, want *utlsHTTP1RoundTripper", fallback.utls)
+	}
+}
+
 func TestUtlsRoundTripperUsesEnvironmentProxy(t *testing.T) {
 	setEnvironmentProxy(t, "http://env-proxy.example.com:8080")
 	req, err := http.NewRequest(http.MethodGet, "https://example.com", nil)
@@ -66,6 +90,46 @@ func TestUtlsRoundTripperUsesEnvironmentProxy(t *testing.T) {
 	}
 	if proxyURL != "http://env-proxy.example.com:8080" {
 		t.Fatalf("proxyURL = %q, want env proxy", proxyURL)
+	}
+}
+
+func TestUtlsHTTP1RoundTripperUsesEnvironmentProxy(t *testing.T) {
+	setEnvironmentProxy(t, "http://env-proxy.example.com:8080")
+	req, err := http.NewRequest(http.MethodGet, "https://example.com", nil)
+	if err != nil {
+		t.Fatalf("NewRequest() error = %v", err)
+	}
+	rt := newUtlsHTTP1RoundTripper("", "chrome_133", true)
+
+	proxyURL, err := rt.proxyURLForRequest(req)
+	if err != nil {
+		t.Fatalf("proxyURLForRequest() error = %v", err)
+	}
+	if proxyURL != "http://env-proxy.example.com:8080" {
+		t.Fatalf("proxyURL = %q, want env proxy", proxyURL)
+	}
+}
+
+func TestChromeSpecWithALPNForcesHTTP1(t *testing.T) {
+	spec, err := chromeSpecWithALPN(tls.HelloChrome_133, []string{"http/1.1"})
+	if err != nil {
+		t.Fatalf("chromeSpecWithALPN() error = %v", err)
+	}
+
+	foundALPN := false
+	for _, ext := range spec.Extensions {
+		switch ext := ext.(type) {
+		case *tls.ALPNExtension:
+			foundALPN = true
+			if len(ext.AlpnProtocols) != 1 || ext.AlpnProtocols[0] != "http/1.1" {
+				t.Fatalf("ALPN protocols = %#v, want [http/1.1]", ext.AlpnProtocols)
+			}
+		case *tls.ApplicationSettingsExtension, *tls.ApplicationSettingsExtensionNew:
+			t.Fatalf("unexpected h2 application settings extension: %T", ext)
+		}
+	}
+	if !foundALPN {
+		t.Fatal("ALPN extension was not found")
 	}
 }
 

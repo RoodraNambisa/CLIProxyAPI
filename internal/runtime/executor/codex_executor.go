@@ -278,7 +278,7 @@ func (e *CodexExecutor) HttpRequest(ctx context.Context, auth *cliproxyauth.Auth
 	if err := e.PrepareRequest(httpReq, auth); err != nil {
 		return nil, err
 	}
-	httpClient := e.newCodexHTTPClient(ctx, auth)
+	httpClient := e.newCodexHTTPClient(ctx, auth, false)
 	return httpClient.Do(httpReq)
 }
 
@@ -315,6 +315,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	body, _ = sjson.DeleteBytes(body, "safety_identifier")
 	body, _ = sjson.DeleteBytes(body, "stream_options")
 	body = normalizeCodexInstructions(body)
+	imageRequest := codexHasImageGenerationTool(body)
 
 	url := strings.TrimSuffix(baseURL, "/") + "/responses"
 	httpReq, err := e.cacheHelper(ctx, from, url, req, body)
@@ -339,7 +340,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 		AuthType:  authType,
 		AuthValue: authValue,
 	})
-	httpClient := e.newCodexHTTPClient(ctx, auth)
+	httpClient := e.newCodexHTTPClient(ctx, auth, imageRequest)
 	httpResp, err := httpClient.Do(httpReq)
 	if err != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
@@ -462,6 +463,7 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 	body, _ = sjson.SetBytes(body, "model", baseModel)
 	body, _ = sjson.DeleteBytes(body, "stream")
 	body = normalizeCodexInstructions(body)
+	imageRequest := codexHasImageGenerationTool(body)
 
 	url := strings.TrimSuffix(baseURL, "/") + "/responses/compact"
 	httpReq, err := e.cacheHelper(ctx, from, url, req, body)
@@ -486,7 +488,7 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 		AuthType:  authType,
 		AuthValue: authValue,
 	})
-	httpClient := e.newCodexHTTPClient(ctx, auth)
+	httpClient := e.newCodexHTTPClient(ctx, auth, imageRequest)
 	httpResp, err := httpClient.Do(httpReq)
 	if err != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
@@ -551,7 +553,8 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	body, _ = sjson.DeleteBytes(body, "stream_options")
 	body, _ = sjson.SetBytes(body, "model", baseModel)
 	body = normalizeCodexInstructions(body)
-	imageStreamPassthrough := metadataBool(opts.Metadata, cliproxyexecutor.ImageGenerationStreamPassthroughMetadataKey) && from == sdktranslator.FormatOpenAIResponse && codexHasImageGenerationTool(body)
+	imageRequest := codexHasImageGenerationTool(body)
+	imageStreamPassthrough := metadataBool(opts.Metadata, cliproxyexecutor.ImageGenerationStreamPassthroughMetadataKey) && from == sdktranslator.FormatOpenAIResponse && imageRequest
 	trustUpstreamSSE := metadataBool(opts.Metadata, cliproxyexecutor.TrustUpstreamSSEMetadataKey) && from == sdktranslator.FormatOpenAIResponse
 
 	url := strings.TrimSuffix(baseURL, "/") + "/responses"
@@ -578,7 +581,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 		AuthValue: authValue,
 	})
 
-	httpClient := e.newCodexHTTPClient(ctx, auth)
+	httpClient := e.newCodexHTTPClient(ctx, auth, imageRequest)
 	httpResp, err := httpClient.Do(httpReq)
 	if err != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
@@ -983,14 +986,21 @@ func applyCodexHeaders(r *http.Request, auth *cliproxyauth.Auth, token string, s
 	util.ApplyCustomHeadersFromAttrs(r, attrs)
 }
 
-func (e *CodexExecutor) newCodexHTTPClient(ctx context.Context, auth *cliproxyauth.Auth) *http.Client {
-	if e != nil && codexFingerprintJA3Enabled(e.cfg) {
-		persona := codexFingerprintPersonaFromContext(ctx, e.cfg, auth)
-		return helps.NewChromeUtlsHTTPClient(ctx, e.cfg, auth, 0, persona.tlsProfile)
-	}
+func (e *CodexExecutor) newCodexHTTPClient(ctx context.Context, auth *cliproxyauth.Auth, imageRequest bool) *http.Client {
 	var cfg *config.Config
 	if e != nil {
 		cfg = e.cfg
+	}
+	forceHTTP1 := codexFingerprintShouldForceHTTP1(cfg, imageRequest)
+	if codexFingerprintJA3Enabled(cfg) {
+		persona := codexFingerprintPersonaFromContext(ctx, cfg, auth)
+		if forceHTTP1 {
+			return helps.NewChromeUtlsHTTP1Client(ctx, cfg, auth, 0, persona.tlsProfile)
+		}
+		return helps.NewChromeUtlsHTTPClient(ctx, cfg, auth, 0, persona.tlsProfile)
+	}
+	if forceHTTP1 {
+		return helps.NewProxyAwareHTTP1Client(ctx, cfg, auth, 0)
 	}
 	return helps.NewProxyAwareHTTPClient(ctx, cfg, auth, 0)
 }

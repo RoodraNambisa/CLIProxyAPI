@@ -6,6 +6,7 @@ import (
 	stdtls "crypto/tls"
 	"encoding/base64"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
@@ -136,6 +137,164 @@ func (t *utlsRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) 
 	return resp, nil
 }
 
+// utlsHTTP1RoundTripper implements one-shot HTTPS requests using a Chrome-like
+// uTLS ClientHello while forcing HTTP/1.1 ALPN.
+type utlsHTTP1RoundTripper struct {
+	explicitProxyURL    string
+	useEnvironmentProxy bool
+	helloID             tls.ClientHelloID
+}
+
+func newUtlsHTTP1RoundTripper(proxyURL string, profile string, useEnvironmentProxy bool) *utlsHTTP1RoundTripper {
+	return &utlsHTTP1RoundTripper{
+		explicitProxyURL:    strings.TrimSpace(proxyURL),
+		useEnvironmentProxy: useEnvironmentProxy,
+		helloID:             chromeHelloID(profile),
+	}
+}
+
+func (t *utlsHTTP1RoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	if req == nil || req.URL == nil {
+		return nil, fmt.Errorf("utls http1: request is nil")
+	}
+	hostname := req.URL.Hostname()
+	port := req.URL.Port()
+	if port == "" {
+		port = "443"
+	}
+	addr := net.JoinHostPort(hostname, port)
+	proxyURL, err := t.proxyURLForRequest(req)
+	if err != nil {
+		return nil, err
+	}
+	dialer, err := buildUtlsContextDialerOrDirect(proxyURL)
+	if err != nil {
+		return nil, err
+	}
+	conn, err := dialChromeUTLSWithDialerNextProtos(req.Context(), dialer, "tcp", addr, hostname, t.helloID, []string{"http/1.1"})
+	if err != nil {
+		return nil, err
+	}
+
+	outReq := cloneRequestForHTTP1(req)
+	if errWrite := runConnOperationWithContext(req.Context(), conn, func() error {
+		return outReq.Write(conn)
+	}); errWrite != nil {
+		conn.Close()
+		return nil, errWrite
+	}
+	resp, errRead := readHTTPResponse(req.Context(), conn, outReq)
+	if errRead != nil {
+		conn.Close()
+		return nil, errRead
+	}
+	resp.Body = newConnBoundReadCloser(req.Context(), resp.Body, conn)
+	return resp, nil
+}
+
+func (t *utlsHTTP1RoundTripper) proxyURLForRequest(req *http.Request) (string, error) {
+	if t == nil || req == nil {
+		return "", nil
+	}
+	if t.explicitProxyURL != "" {
+		return t.explicitProxyURL, nil
+	}
+	if !t.useEnvironmentProxy {
+		return "", nil
+	}
+	proxyURL, err := environmentProxyFunc()(req)
+	if err != nil {
+		return "", err
+	}
+	if proxyURL == nil {
+		return "", nil
+	}
+	return proxyURL.String(), nil
+}
+
+func cloneRequestForHTTP1(req *http.Request) *http.Request {
+	cloned := req.Clone(req.Context())
+	cloned.Header = req.Header.Clone()
+	cloned.RequestURI = ""
+	cloned.Proto = "HTTP/1.1"
+	cloned.ProtoMajor = 1
+	cloned.ProtoMinor = 1
+	return cloned
+}
+
+func readHTTPResponse(ctx context.Context, conn net.Conn, req *http.Request) (*http.Response, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	type readResult struct {
+		resp *http.Response
+		err  error
+	}
+	resultCh := make(chan readResult, 1)
+	go func() {
+		resp, errRead := http.ReadResponse(bufio.NewReader(conn), req)
+		resultCh <- readResult{resp: resp, err: errRead}
+	}()
+	select {
+	case <-ctx.Done():
+		conn.Close()
+		return nil, ctx.Err()
+	case result := <-resultCh:
+		return result.resp, result.err
+	}
+}
+
+type connBoundReadCloser struct {
+	ctx    context.Context
+	body   io.ReadCloser
+	conn   net.Conn
+	done   chan struct{}
+	once   sync.Once
+	cancel sync.Once
+}
+
+func newConnBoundReadCloser(ctx context.Context, body io.ReadCloser, conn net.Conn) io.ReadCloser {
+	if body == nil {
+		body = http.NoBody
+	}
+	wrapped := &connBoundReadCloser{
+		ctx:  ctx,
+		body: body,
+		conn: conn,
+		done: make(chan struct{}),
+	}
+	if ctx != nil && ctx.Done() != nil {
+		go wrapped.closeConnOnContextDone()
+	}
+	return wrapped
+}
+
+func (c *connBoundReadCloser) Read(p []byte) (int, error) {
+	return c.body.Read(p)
+}
+
+func (c *connBoundReadCloser) Close() error {
+	var err error
+	c.once.Do(func() {
+		close(c.done)
+		err = c.body.Close()
+		if errClose := c.conn.Close(); err == nil {
+			err = errClose
+		}
+	})
+	return err
+}
+
+func (c *connBoundReadCloser) closeConnOnContextDone() {
+	select {
+	case <-c.ctx.Done():
+		c.cancel.Do(func() {
+			c.conn.Close()
+		})
+	case <-c.done:
+	}
+}
+
 func utlsConnectionCacheKey(addr, proxyURL string) string {
 	return addr + "|" + proxyURL
 }
@@ -185,7 +344,7 @@ var anthropicHosts = map[string]struct{}{
 // fallbackRoundTripper uses uTLS for selected HTTPS requests and falls back to
 // the standard transport for all other requests.
 type fallbackRoundTripper struct {
-	utls     *utlsRoundTripper
+	utls     http.RoundTripper
 	fallback http.RoundTripper
 	allHTTPS bool
 }
@@ -235,6 +394,28 @@ func NewChromeUtlsHTTPClient(ctx context.Context, cfg *config.Config, auth *clip
 	client := &http.Client{
 		Transport: &fallbackRoundTripper{
 			utls:     newUtlsRoundTripper(proxyURL, profile, proxyURL == "" && environmentProxyConfigured()),
+			fallback: proxyAwareFallbackTransport(ctx, cfg, auth),
+			allHTTPS: true,
+		},
+	}
+	if timeout > 0 {
+		client.Timeout = timeout
+	}
+	return client
+}
+
+// NewChromeUtlsHTTP1Client creates an HTTP client that uses a Chrome-like uTLS
+// ClientHello for all HTTPS requests while forcing HTTP/1.1 framing.
+func NewChromeUtlsHTTP1Client(ctx context.Context, cfg *config.Config, auth *cliproxyauth.Auth, timeout time.Duration, profile string) *http.Client {
+	proxyURL := explicitProxyURL(cfg, auth)
+	if proxyURL == "" {
+		if transport := roundTripperFromContext(ctx); transport != nil {
+			return newProxyHTTPClient(transport, timeout)
+		}
+	}
+	client := &http.Client{
+		Transport: &fallbackRoundTripper{
+			utls:     newUtlsHTTP1RoundTripper(proxyURL, profile, proxyURL == "" && environmentProxyConfigured()),
 			fallback: proxyAwareFallbackTransport(ctx, cfg, auth),
 			allHTTPS: true,
 		},
@@ -340,6 +521,10 @@ func (d proxyContextDialerAdapter) DialContext(ctx context.Context, network, add
 }
 
 func dialChromeUTLSWithDialer(ctx context.Context, dialer utlsContextDialer, network, addr, serverName string, helloID tls.ClientHelloID) (net.Conn, error) {
+	return dialChromeUTLSWithDialerNextProtos(ctx, dialer, network, addr, serverName, helloID, nil)
+}
+
+func dialChromeUTLSWithDialerNextProtos(ctx context.Context, dialer utlsContextDialer, network, addr, serverName string, helloID tls.ClientHelloID, nextProtos []string) (net.Conn, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -352,12 +537,54 @@ func dialChromeUTLSWithDialer(ctx context.Context, dialer utlsContextDialer, net
 	}
 
 	tlsConfig := &tls.Config{ServerName: serverName}
-	tlsConn := tls.UClient(conn, tlsConfig, helloID)
+	clientHelloID := helloID
+	if len(nextProtos) > 0 {
+		tlsConfig.NextProtos = append([]string(nil), nextProtos...)
+		clientHelloID = tls.HelloCustom
+	}
+	tlsConn := tls.UClient(conn, tlsConfig, clientHelloID)
+	if len(nextProtos) > 0 {
+		spec, errSpec := chromeSpecWithALPN(helloID, nextProtos)
+		if errSpec != nil {
+			conn.Close()
+			return nil, errSpec
+		}
+		if errApply := tlsConn.ApplyPreset(&spec); errApply != nil {
+			conn.Close()
+			return nil, errApply
+		}
+	}
 	if errHandshake := tlsConn.HandshakeContext(ctx); errHandshake != nil {
 		conn.Close()
 		return nil, errHandshake
 	}
 	return tlsConn, nil
+}
+
+func chromeSpecWithALPN(helloID tls.ClientHelloID, nextProtos []string) (tls.ClientHelloSpec, error) {
+	spec, err := tls.UTLSIdToSpec(helloID)
+	if err != nil {
+		return tls.ClientHelloSpec{}, err
+	}
+	nextProtos = append([]string(nil), nextProtos...)
+	extensions := make([]tls.TLSExtension, 0, len(spec.Extensions)+1)
+	foundALPN := false
+	for _, ext := range spec.Extensions {
+		switch ext := ext.(type) {
+		case *tls.ALPNExtension:
+			foundALPN = true
+			extensions = append(extensions, &tls.ALPNExtension{AlpnProtocols: nextProtos})
+		case *tls.ApplicationSettingsExtension, *tls.ApplicationSettingsExtensionNew:
+			continue
+		default:
+			extensions = append(extensions, ext)
+		}
+	}
+	if !foundALPN {
+		extensions = append(extensions, &tls.ALPNExtension{AlpnProtocols: nextProtos})
+	}
+	spec.Extensions = extensions
+	return spec, nil
 }
 
 type httpConnectDialer struct {

@@ -153,3 +153,44 @@ func TestNewProxyAwareHTTPClientHonorsNoProxy(t *testing.T) {
 		t.Fatalf("proxy URL = %v, want nil for NO_PROXY match", proxyURL)
 	}
 }
+
+func TestNewProxyAwareHTTP1ClientDirectDisablesHTTP2(t *testing.T) {
+	t.Parallel()
+
+	client := NewProxyAwareHTTP1Client(
+		context.Background(),
+		&config.Config{SDKConfig: sdkconfig.SDKConfig{ProxyURL: "direct"}},
+		nil,
+		0,
+	)
+
+	transport, ok := client.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("transport type = %T, want *http.Transport", client.Transport)
+	}
+	if transport.ForceAttemptHTTP2 {
+		t.Fatal("ForceAttemptHTTP2 = true, want false")
+	}
+	if transport.TLSNextProto == nil {
+		t.Fatal("TLSNextProto = nil, want empty map to disable HTTP/2")
+	}
+	if transport.TLSClientConfig == nil {
+		t.Fatal("TLSClientConfig = nil, want HTTP/1.1 ALPN config")
+	}
+	if len(transport.TLSClientConfig.NextProtos) != 1 || transport.TLSClientConfig.NextProtos[0] != "http/1.1" {
+		t.Fatalf("NextProtos = %#v, want [http/1.1]", transport.TLSClientConfig.NextProtos)
+	}
+}
+
+func TestNewProxyAwareHTTP1ClientUsesInjectedTransportWithoutExplicitProxy(t *testing.T) {
+	t.Parallel()
+
+	wantTransport := &stubRoundTripper{}
+	ctx := context.WithValue(context.Background(), "cliproxy.roundtripper", http.RoundTripper(wantTransport))
+
+	client := NewProxyAwareHTTP1Client(ctx, &config.Config{}, &cliproxyauth.Auth{}, 0)
+
+	if client.Transport != wantTransport {
+		t.Fatalf("transport = %T, want injected context RoundTripper", client.Transport)
+	}
+}

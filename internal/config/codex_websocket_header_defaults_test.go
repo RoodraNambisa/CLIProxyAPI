@@ -17,6 +17,8 @@ codex-fingerprint:
   ja3: true
   browser-headers: true
   stabilize-per-account: false
+  force-http1: true
+  images-force-http1: true
 `)
 	if err := os.WriteFile(configPath, configYAML, 0o600); err != nil {
 		t.Fatalf("failed to write config: %v", err)
@@ -41,5 +43,11 @@ codex-fingerprint:
 	}
 	if cfg.CodexFingerprint.StabilizePerAccount == nil || *cfg.CodexFingerprint.StabilizePerAccount {
 		t.Fatalf("CodexFingerprint.StabilizePerAccount = %v, want false", cfg.CodexFingerprint.StabilizePerAccount)
+	}
+	if !cfg.CodexFingerprint.ForceHTTP1 {
+		t.Fatalf("CodexFingerprint.ForceHTTP1 = false, want true")
+	}
+	if !cfg.CodexFingerprint.ImagesForceHTTP1 {
+		t.Fatalf("CodexFingerprint.ImagesForceHTTP1 = false, want true")
 	}
 }

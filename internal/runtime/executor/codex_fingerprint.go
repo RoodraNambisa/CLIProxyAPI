@@ -108,6 +108,21 @@ func codexFingerprintBrowserHeadersEnabled(cfg *config.Config) bool {
 	return cfg != nil && cfg.CodexFingerprint.BrowserHeaders
 }
 
+func codexFingerprintForceHTTP1Enabled(cfg *config.Config) bool {
+	return cfg != nil && cfg.CodexFingerprint.ForceHTTP1
+}
+
+func codexFingerprintImagesForceHTTP1Enabled(cfg *config.Config) bool {
+	return cfg != nil && cfg.CodexFingerprint.ImagesForceHTTP1
+}
+
+func codexFingerprintShouldForceHTTP1(cfg *config.Config, imageRequest bool) bool {
+	if codexFingerprintForceHTTP1Enabled(cfg) {
+		return true
+	}
+	return imageRequest && codexFingerprintImagesForceHTTP1Enabled(cfg)
+}
+
 func codexFingerprintStabilizePerAccount(cfg *config.Config) bool {
 	if cfg == nil || cfg.CodexFingerprint.StabilizePerAccount == nil {
 		return true

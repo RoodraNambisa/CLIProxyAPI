@@ -185,6 +185,8 @@ type CodexFingerprintConfig struct {
 	JA3                 bool  `yaml:"ja3" json:"ja3"`
 	BrowserHeaders      bool  `yaml:"browser-headers" json:"browser-headers"`
 	StabilizePerAccount *bool `yaml:"stabilize-per-account,omitempty" json:"stabilize-per-account,omitempty"`
+	ForceHTTP1          bool  `yaml:"force-http1" json:"force-http1"`
+	ImagesForceHTTP1    bool  `yaml:"images-force-http1" json:"images-force-http1"`
 }
 
 // TLSConfig holds HTTPS server settings.
