@@ -535,6 +535,59 @@ func TestManager_MaxRetryCredentialsZeroKeepsTryingAllAvailableCredentials(t *te
 	}
 }
 
+func TestManager_StrictSessionAffinityDoesNotTryAnotherAuthAfterFailure(t *testing.T) {
+	failover := false
+	selector := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{
+		Fallback: &RoundRobinSelector{},
+		TTL:      time.Minute,
+		Failover: &failover,
+	})
+	m := NewManager(nil, selector, nil)
+	m.SetConfig(&internalconfig.Config{
+		Routing: internalconfig.RoutingConfig{
+			SessionAffinity:         true,
+			SessionAffinityFailover: &failover,
+		},
+	})
+	m.SetRetryConfig(0, 0, 0)
+
+	executor := &authFallbackExecutor{
+		id:            "claude",
+		executeErrors: map[string]error{"auth-a": &Error{HTTPStatus: http.StatusInternalServerError, Message: "boom"}},
+	}
+	m.RegisterExecutor(executor)
+
+	reg := registry.GetGlobalRegistry()
+	for _, authID := range []string{"auth-a", "auth-b"} {
+		reg.RegisterClient(authID, "claude", []*registry.ModelInfo{{ID: "test-model"}})
+		if _, errRegister := m.Register(context.Background(), &Auth{ID: authID, Provider: "claude"}); errRegister != nil {
+			t.Fatalf("register %s: %v", authID, errRegister)
+		}
+	}
+	t.Cleanup(func() {
+		reg.UnregisterClient("auth-a")
+		reg.UnregisterClient("auth-b")
+	})
+
+	payload := []byte(`{"metadata":{"user_id":"user_xxx_account__session_manager-strict"}}`)
+	_, errExecute := m.Execute(context.Background(), []string{"claude"}, cliproxyexecutor.Request{
+		Model:   "test-model",
+		Payload: payload,
+	}, cliproxyexecutor.Options{OriginalRequest: payload})
+	if errExecute == nil {
+		t.Fatalf("Execute() error = nil, want auth-a failure")
+	}
+
+	executor.mu.Lock()
+	defer executor.mu.Unlock()
+	if len(executor.executeCalls) != 1 {
+		t.Fatalf("execute calls = %v, want only auth-a", executor.executeCalls)
+	}
+	if executor.executeCalls[0] != "auth-a" {
+		t.Fatalf("first execute auth = %q, want auth-a", executor.executeCalls[0])
+	}
+}
+
 func TestManager_ModelSupportBadRequest_FallsBackAndSuspendsAuth(t *testing.T) {
 	m := NewManager(nil, nil, nil)
 	executor := &authFallbackExecutor{

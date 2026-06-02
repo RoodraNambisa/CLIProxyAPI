@@ -191,6 +191,7 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 		}
 
 		requestJSON = repairResponsesWebsocketToolCalls(toolPairState, requestJSON)
+		requestJSON = dedupeResponsesWebsocketInputItemsByID(requestJSON)
 		updatedLastRequest = bytes.Clone(requestJSON)
 		lastRequest = updatedLastRequest
 
@@ -362,6 +363,10 @@ func normalizeResponseSubsequentRequest(rawJSON []byte, lastRequest []byte, last
 	if errDedupeFunctionCalls == nil {
 		mergedInput = dedupedInput
 	}
+	dedupedInput, errDedupeItems := dedupeInputItemsByID(mergedInput)
+	if errDedupeItems == nil {
+		mergedInput = dedupedInput
+	}
 
 	normalized, errDelete := sjson.DeleteBytes(rawJSON, "type")
 	if errDelete != nil {
@@ -466,6 +471,55 @@ func dedupeFunctionCallsByCallID(rawArray string) (string, error) {
 				}
 				seenCallIDs[callID] = struct{}{}
 			}
+		}
+		filtered = append(filtered, item)
+	}
+
+	out, errMarshal := json.Marshal(filtered)
+	if errMarshal != nil {
+		return "", errMarshal
+	}
+	return string(out), nil
+}
+
+func dedupeResponsesWebsocketInputItemsByID(payload []byte) []byte {
+	input := gjson.GetBytes(payload, "input")
+	if !input.Exists() || !input.IsArray() {
+		return payload
+	}
+	deduped, errDedupe := dedupeInputItemsByID(input.Raw)
+	if errDedupe != nil {
+		return payload
+	}
+	updated, errSet := sjson.SetRawBytes(payload, "input", []byte(deduped))
+	if errSet != nil {
+		return payload
+	}
+	return updated
+}
+
+func dedupeInputItemsByID(rawArray string) (string, error) {
+	rawArray = strings.TrimSpace(rawArray)
+	if rawArray == "" {
+		return "[]", nil
+	}
+	var items []json.RawMessage
+	if errUnmarshal := json.Unmarshal([]byte(rawArray), &items); errUnmarshal != nil {
+		return "", errUnmarshal
+	}
+
+	seenIDs := make(map[string]struct{}, len(items))
+	filtered := make([]json.RawMessage, 0, len(items))
+	for _, item := range items {
+		if len(item) == 0 {
+			continue
+		}
+		id := strings.TrimSpace(gjson.GetBytes(item, "id").String())
+		if id != "" {
+			if _, ok := seenIDs[id]; ok {
+				continue
+			}
+			seenIDs[id] = struct{}{}
 		}
 		filtered = append(filtered, item)
 	}

@@ -2250,6 +2250,7 @@ func (s *Service) Run(ctx context.Context) error {
 		previousUsageInterval := time.Duration(0)
 		var previousSessionAffinity bool
 		var previousSessionAffinityTTL string
+		var previousSessionAffinityFailover bool
 		var previousCfgSnapshot *config.Config
 		s.cfgMu.RLock()
 		if s.cfg != nil {
@@ -2258,6 +2259,7 @@ func (s *Service) Run(ctx context.Context) error {
 			previousUsageInterval = usagePersistenceIntervalForConfig(s.cfg)
 			previousSessionAffinity = s.cfg.Routing.ClaudeCodeSessionAffinity || s.cfg.Routing.SessionAffinity
 			previousSessionAffinityTTL = s.cfg.Routing.SessionAffinityTTL
+			previousSessionAffinityFailover = routingSessionAffinityFailoverEnabled(s.cfg)
 			previousCfgSnapshot = s.cfg
 		}
 		s.cfgMu.RUnlock()
@@ -2287,10 +2289,12 @@ func (s *Service) Run(ctx context.Context) error {
 
 		nextSessionAffinity := newCfg.Routing.ClaudeCodeSessionAffinity || newCfg.Routing.SessionAffinity
 		nextSessionAffinityTTL := newCfg.Routing.SessionAffinityTTL
+		nextSessionAffinityFailover := routingSessionAffinityFailoverEnabled(newCfg)
 
 		selectorChanged := previousStrategy != nextStrategy ||
 			previousSessionAffinity != nextSessionAffinity ||
-			previousSessionAffinityTTL != nextSessionAffinityTTL
+			previousSessionAffinityTTL != nextSessionAffinityTTL ||
+			previousSessionAffinityFailover != nextSessionAffinityFailover
 
 		if s.coreManager != nil && selectorChanged {
 			var selector coreauth.Selector
@@ -2313,6 +2317,7 @@ func (s *Service) Run(ctx context.Context) error {
 				selector = coreauth.NewSessionAffinitySelectorWithConfig(coreauth.SessionAffinityConfig{
 					Fallback: selector,
 					TTL:      ttl,
+					Failover: &nextSessionAffinityFailover,
 				})
 			}
 

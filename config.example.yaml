@@ -130,10 +130,12 @@ auth-maintenance:
 routing:
   strategy: "round-robin" # round-robin (default), fill-first, random
   # Enable universal session-sticky routing for all clients.
-  # Session IDs are extracted from: X-Session-ID header, Idempotency-Key,
-  # metadata.user_id, conversation_id, or first few messages hash.
-  # Automatic failover is always enabled when bound auth becomes unavailable.
+  # Session IDs are extracted from: metadata.user_id, X-Session-ID,
+  # Session-Id/Session_id, X-Client-Request-Id, conversation_id, or message hash.
   session-affinity: false # default: false
+  # Allow a bound session to move to another credential when the bound credential
+  # is unavailable or the request fails. Set false for strict sticky sessions.
+  session-affinity-failover: true # default: true
   # How long session-to-auth bindings are retained. Default: 1h
   session-affinity-ttl: "1h"
 
@@ -270,6 +272,12 @@ nonstream-keepalive-interval: 0
 # codex-header-defaults:
 #   user-agent: "codex_cli_rs/0.114.0 (Mac OS 14.2.0; x86_64) vscode/1.111.0"
 #   beta-features: "multi_agent"
+
+# Provider-wide Codex behavior. Disabled by default.
+# `identity-confuse` remaps Codex session/window/turn identity before sending
+# upstream, then restores the original values before returning responses.
+# codex:
+#   identity-confuse: false
 
 # Optional Codex upstream fingerprinting. Disabled by default.
 # `ja3` uses a Chrome-like uTLS ClientHello for Codex HTTPS requests.

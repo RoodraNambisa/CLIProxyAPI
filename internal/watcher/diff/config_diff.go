@@ -121,6 +121,9 @@ func BuildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 	if oldCfg.Routing.Strategy != newCfg.Routing.Strategy {
 		changes = append(changes, fmt.Sprintf("routing.strategy: %s -> %s", oldCfg.Routing.Strategy, newCfg.Routing.Strategy))
 	}
+	if routingSessionAffinityFailoverEnabled(oldCfg) != routingSessionAffinityFailoverEnabled(newCfg) {
+		changes = append(changes, fmt.Sprintf("routing.session-affinity-failover: %t -> %t", routingSessionAffinityFailoverEnabled(oldCfg), routingSessionAffinityFailoverEnabled(newCfg)))
+	}
 
 	// API keys (redacted) and counts
 	if len(oldCfg.APIKeys) != len(newCfg.APIKeys) {
@@ -206,6 +209,10 @@ func BuildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 				}
 			}
 		}
+	}
+
+	if oldCfg.Codex.IdentityConfuse != newCfg.Codex.IdentityConfuse {
+		changes = append(changes, fmt.Sprintf("codex.identity-confuse: %t -> %t", oldCfg.Codex.IdentityConfuse, newCfg.Codex.IdentityConfuse))
 	}
 
 	// Codex keys (do not print key material)
@@ -439,6 +446,13 @@ func equalStringSet(a, b []string) bool {
 		}
 	}
 	return true
+}
+
+func routingSessionAffinityFailoverEnabled(cfg *config.Config) bool {
+	if cfg == nil || cfg.Routing.SessionAffinityFailover == nil {
+		return true
+	}
+	return *cfg.Routing.SessionAffinityFailover
 }
 
 // equalUpstreamAPIKeys compares two slices of AmpUpstreamAPIKeyEntry for equality.

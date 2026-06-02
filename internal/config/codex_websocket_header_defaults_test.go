@@ -19,6 +19,8 @@ codex-fingerprint:
   stabilize-per-account: false
   force-http1: true
   images-force-http1: true
+codex:
+  identity-confuse: true
 `)
 	if err := os.WriteFile(configPath, configYAML, 0o600); err != nil {
 		t.Fatalf("failed to write config: %v", err)
@@ -49,5 +51,8 @@ codex-fingerprint:
 	}
 	if !cfg.CodexFingerprint.ImagesForceHTTP1 {
 		t.Fatalf("CodexFingerprint.ImagesForceHTTP1 = false, want true")
+	}
+	if !cfg.Codex.IdentityConfuse {
+		t.Fatalf("Codex.IdentityConfuse = false, want true")
 	}
 }

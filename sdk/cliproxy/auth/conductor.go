@@ -23,6 +23,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 	log "github.com/sirupsen/logrus"
+	"github.com/tidwall/sjson"
 )
 
 // ProviderExecutor defines the contract required by Manager to execute provider calls.
@@ -1480,6 +1481,7 @@ func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxye
 		return cliproxyexecutor.Response{}, &Error{Code: "provider_not_found", Message: "no provider supplied"}
 	}
 	ctx = m.withRequestRetryBudget(ctx, normalized, 0)
+	strictSessionAffinity := m.strictSessionAffinityForRequest(req, opts)
 
 	_, maxRetryCredentials, maxWait := m.retrySettings()
 
@@ -1502,7 +1504,7 @@ func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxye
 		}
 	}
 	if lastErr != nil {
-		if shouldAttemptAntigravityCreditsFallback(m, lastErr, normalized) {
+		if !strictSessionAffinity && shouldAttemptAntigravityCreditsFallback(m, lastErr, normalized) {
 			if resp, ok := m.tryAntigravityCreditsExecute(ctx, req, opts); ok {
 				return resp, nil
 			}
@@ -1555,6 +1557,7 @@ func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cli
 		return nil, &Error{Code: "provider_not_found", Message: "no provider supplied"}
 	}
 	ctx = m.withRequestRetryBudget(ctx, normalized, 0)
+	strictSessionAffinity := m.strictSessionAffinityForRequest(req, opts)
 
 	_, maxRetryCredentials, maxWait := m.retrySettings()
 
@@ -1577,7 +1580,7 @@ func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cli
 		}
 	}
 	if lastErr != nil {
-		if shouldAttemptAntigravityCreditsFallback(m, lastErr, normalized) {
+		if !strictSessionAffinity && shouldAttemptAntigravityCreditsFallback(m, lastErr, normalized) {
 			if result, ok := m.tryAntigravityCreditsExecuteStream(ctx, req, opts); ok {
 				return result, nil
 			}
@@ -1596,6 +1599,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 	tried := make(map[string]struct{})
 	attempted := make(map[string]struct{})
 	selectionAttempt := 0
+	strictSessionAffinity := m.strictSessionAffinityForRequest(req, opts)
 	var lastErr error
 	for {
 		if maxRetryCredentials > 0 && len(attempted) >= maxRetryCredentials {
@@ -1632,6 +1636,9 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 
 		models, pooled := m.preparedExecutionModels(auth, routeModel, opts)
 		if len(models) == 0 {
+			if strictSessionAffinity {
+				return cliproxyexecutor.Response{}, newStrictSessionAffinityError("session bound auth has no executable models")
+			}
 			continue
 		}
 		attempted[auth.ID] = struct{}{}
@@ -1671,6 +1678,9 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			if isRequestInvalidError(authErr) {
 				return cliproxyexecutor.Response{}, authErr
 			}
+			if strictSessionAffinity {
+				return cliproxyexecutor.Response{}, authErr
+			}
 			lastErr = authErr
 			continue
 		}
@@ -1686,6 +1696,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 	tried := make(map[string]struct{})
 	attempted := make(map[string]struct{})
 	selectionAttempt := 0
+	strictSessionAffinity := m.strictSessionAffinityForRequest(req, opts)
 	var lastErr error
 	for {
 		if maxRetryCredentials > 0 && len(attempted) >= maxRetryCredentials {
@@ -1722,6 +1733,9 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 
 		models, pooled := m.preparedExecutionModels(auth, routeModel, opts)
 		if len(models) == 0 {
+			if strictSessionAffinity {
+				return cliproxyexecutor.Response{}, newStrictSessionAffinityError("session bound auth has no executable models")
+			}
 			continue
 		}
 		attempted[auth.ID] = struct{}{}
@@ -1761,6 +1775,9 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 			if isRequestInvalidError(authErr) {
 				return cliproxyexecutor.Response{}, authErr
 			}
+			if strictSessionAffinity {
+				return cliproxyexecutor.Response{}, authErr
+			}
 			lastErr = authErr
 			continue
 		}
@@ -1776,13 +1793,14 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 	tried := make(map[string]struct{})
 	attempted := make(map[string]struct{})
 	selectionAttempt := 0
+	strictSessionAffinity := m.strictSessionAffinityForRequest(req, opts)
 	var lastErr error
 	for {
 		if maxRetryCredentials > 0 && len(attempted) >= maxRetryCredentials {
 			if lastErr != nil {
 				var bootstrapErr *streamBootstrapError
 				if errors.As(lastErr, &bootstrapErr) && bootstrapErr != nil {
-					if shouldAttemptAntigravityCreditsFallback(m, lastErr, providers) {
+					if !strictSessionAffinity && shouldAttemptAntigravityCreditsFallback(m, lastErr, providers) {
 						if result, ok := m.tryAntigravityCreditsExecuteStream(ctx, req, opts); ok {
 							return result, nil
 						}
@@ -1797,7 +1815,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			if lastErr != nil {
 				var bootstrapErr *streamBootstrapError
 				if errors.As(lastErr, &bootstrapErr) && bootstrapErr != nil {
-					if shouldAttemptAntigravityCreditsFallback(m, lastErr, providers) {
+					if !strictSessionAffinity && shouldAttemptAntigravityCreditsFallback(m, lastErr, providers) {
 						if result, ok := m.tryAntigravityCreditsExecuteStream(ctx, req, opts); ok {
 							return result, nil
 						}
@@ -1814,7 +1832,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			if lastErr != nil {
 				var bootstrapErr *streamBootstrapError
 				if errors.As(lastErr, &bootstrapErr) && bootstrapErr != nil {
-					if shouldAttemptAntigravityCreditsFallback(m, lastErr, providers) {
+					if !strictSessionAffinity && shouldAttemptAntigravityCreditsFallback(m, lastErr, providers) {
 						if result, ok := m.tryAntigravityCreditsExecuteStream(ctx, req, opts); ok {
 							return result, nil
 						}
@@ -1838,11 +1856,15 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 		}
 		models, pooled := m.preparedExecutionModels(auth, routeModel, opts)
 		if len(models) == 0 {
+			if strictSessionAffinity {
+				return nil, newStrictSessionAffinityError("session bound auth has no executable models")
+			}
 			continue
 		}
 		attempted[auth.ID] = struct{}{}
 		selectionAttempt++
-		streamResult, errStream := m.executeStreamWithModelPool(execCtx, executor, auth, provider, req, opts, routeModel, models, pooled)
+		execReq := sanitizeDownstreamWebsocketFallbackRequest(execCtx, auth, req)
+		streamResult, errStream := m.executeStreamWithModelPool(execCtx, executor, auth, provider, execReq, opts, routeModel, models, pooled)
 		if errStream != nil {
 			if errCtx := execCtx.Err(); errCtx != nil {
 				return nil, errCtx
@@ -1850,10 +1872,61 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			if isRequestInvalidError(errStream) {
 				return nil, errStream
 			}
+			if strictSessionAffinity {
+				return nil, errStream
+			}
 			lastErr = errStream
 			continue
 		}
 		return streamResult, nil
+	}
+}
+
+func sanitizeDownstreamWebsocketFallbackRequest(ctx context.Context, auth *Auth, req cliproxyexecutor.Request) cliproxyexecutor.Request {
+	if !cliproxyexecutor.DownstreamWebsocket(ctx) || authWebsocketsEnabled(auth) || len(req.Payload) == 0 {
+		return req
+	}
+	updated, errDelete := sjson.DeleteBytes(req.Payload, "generate")
+	if errDelete != nil {
+		return req
+	}
+	req.Payload = updated
+	return req
+}
+
+func (m *Manager) strictSessionAffinityForRequest(req cliproxyexecutor.Request, opts cliproxyexecutor.Options) bool {
+	if m == nil {
+		return false
+	}
+	cfg, _ := m.runtimeConfig.Load().(*internalconfig.Config)
+	if cfg == nil {
+		return false
+	}
+	if !(cfg.Routing.ClaudeCodeSessionAffinity || cfg.Routing.SessionAffinity) {
+		return false
+	}
+	if sessionAffinityFailoverEnabled(cfg) {
+		return false
+	}
+	payload := opts.OriginalRequest
+	if len(payload) == 0 {
+		payload = req.Payload
+	}
+	return ExtractSessionID(opts.Headers, payload, opts.Metadata) != ""
+}
+
+func sessionAffinityFailoverEnabled(cfg *internalconfig.Config) bool {
+	if cfg == nil || cfg.Routing.SessionAffinityFailover == nil {
+		return true
+	}
+	return *cfg.Routing.SessionAffinityFailover
+}
+
+func newStrictSessionAffinityError(message string) *Error {
+	return &Error{
+		Code:       "session_bound_auth_unavailable",
+		Message:    message,
+		HTTPStatus: http.StatusServiceUnavailable,
 	}
 }
 

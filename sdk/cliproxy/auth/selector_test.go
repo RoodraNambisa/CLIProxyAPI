@@ -739,6 +739,48 @@ func TestSessionAffinitySelector_FailoverWhenAuthUnavailable(t *testing.T) {
 	}
 }
 
+func TestSessionAffinitySelector_StrictFailoverDisabledWhenAuthUnavailable(t *testing.T) {
+	t.Parallel()
+
+	failover := false
+	selector := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{
+		Fallback: &RoundRobinSelector{},
+		TTL:      time.Minute,
+		Failover: &failover,
+	})
+	defer selector.Stop()
+
+	auths := []*Auth{
+		{ID: "auth-a"},
+		{ID: "auth-b"},
+	}
+	opts := cliproxyexecutor.Options{OriginalRequest: []byte(`{"metadata":{"user_id":"user_xxx_account__session_strict-failover-test"}}`)}
+
+	first, err := selector.Pick(context.Background(), "claude", "claude-3", opts, auths)
+	if err != nil {
+		t.Fatalf("Pick() error = %v", err)
+	}
+
+	availableWithoutFirst := make([]*Auth, 0, len(auths)-1)
+	for _, auth := range auths {
+		if auth.ID != first.ID {
+			availableWithoutFirst = append(availableWithoutFirst, auth)
+		}
+	}
+
+	second, err := selector.Pick(context.Background(), "claude", "claude-3", opts, availableWithoutFirst)
+	if err == nil {
+		t.Fatalf("Pick() error = nil, got auth %v", second)
+	}
+	authErr, ok := err.(*Error)
+	if !ok {
+		t.Fatalf("Pick() error type = %T, want *Error", err)
+	}
+	if authErr.Code != "session_bound_auth_unavailable" {
+		t.Fatalf("error code = %q, want session_bound_auth_unavailable", authErr.Code)
+	}
+}
+
 func TestRoundRobinSelectorPick_MixedVirtualAndNonVirtualFallsBackToFlat(t *testing.T) {
 	t.Parallel()
 
@@ -812,6 +854,34 @@ func TestExtractSessionID_Headers(t *testing.T) {
 	want := "header:my-explicit-session"
 	if got != want {
 		t.Errorf("ExtractSessionID() with header = %q, want %q", got, want)
+	}
+}
+
+func TestExtractSessionID_CodexSessionIDPriorityOverClientRequestID(t *testing.T) {
+	t.Parallel()
+
+	headers := make(http.Header)
+	headers.Set("X-Client-Request-Id", "pi-session-123")
+	headers.Set("Session_id", "codex-session-456")
+
+	got := ExtractSessionID(headers, nil, nil)
+	want := "codex:codex-session-456"
+	if got != want {
+		t.Errorf("ExtractSessionID() = %q, want %q (Session_id should take priority over X-Client-Request-Id)", got, want)
+	}
+}
+
+func TestExtractSessionID_CodexHyphenSessionIDPriorityOverClientRequestID(t *testing.T) {
+	t.Parallel()
+
+	headers := make(http.Header)
+	headers.Set("X-Client-Request-Id", "pi-session-123")
+	headers.Set("Session-Id", "codex-session-789")
+
+	got := ExtractSessionID(headers, nil, nil)
+	want := "codex:codex-session-789"
+	if got != want {
+		t.Errorf("ExtractSessionID() = %q, want %q (Session-Id should take priority over X-Client-Request-Id)", got, want)
 	}
 }
 

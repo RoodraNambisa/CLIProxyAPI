@@ -1393,6 +1393,15 @@ func TestResponsesWebsocketSharesToolStateAcrossConnectionsWithSameSessionID(t *
 	}
 }
 
+func TestResponsesWebsocketDownstreamSessionKeyAcceptsHyphenCodexSessionID(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/v1/responses/ws", nil)
+	req.Header.Set("Session-Id", "codex-session-hyphen")
+
+	if got := websocketDownstreamSessionKey(req); got != "codex-session-hyphen" {
+		t.Fatalf("websocketDownstreamSessionKey() = %q, want codex-session-hyphen", got)
+	}
+}
+
 func TestNormalizeResponsesWebsocketRequestTreatsTranscriptReplacementAsReset(t *testing.T) {
 	lastRequest := []byte(`{"model":"test-model","stream":true,"input":[{"type":"message","id":"msg-1"},{"type":"function_call","id":"fc-1","call_id":"call-1"},{"type":"function_call_output","id":"tool-out-1","call_id":"call-1"},{"type":"message","id":"assistant-1","role":"assistant"}]}`)
 	lastResponseOutput := []byte(`[
@@ -1465,6 +1474,43 @@ func TestNormalizeResponsesWebsocketRequestDropsDuplicateFunctionCallsByCallID(t
 		items[1].Get("id").String() != "tool-out-1" ||
 		items[2].Get("id").String() != "msg-2" {
 		t.Fatalf("unexpected merged input order: %s", normalized)
+	}
+}
+
+func TestNormalizeResponsesWebsocketRequestDropsDuplicateInputItemsByID(t *testing.T) {
+	lastRequest := []byte(`{"model":"test-model","stream":true,"input":[{"type":"message","id":"msg-1"},{"type":"message","id":"msg-2"}]}`)
+	lastResponseOutput := []byte(`[
+		{"type":"message","id":"msg-2"}
+	]`)
+	raw := []byte(`{"type":"response.create","input":[{"type":"message","id":"msg-2"},{"type":"message","id":"msg-3"}]}`)
+
+	normalized, _, errMsg := normalizeResponsesWebsocketRequest(raw, lastRequest, lastResponseOutput)
+	if errMsg != nil {
+		t.Fatalf("unexpected error: %v", errMsg.Error)
+	}
+
+	items := gjson.GetBytes(normalized, "input").Array()
+	if len(items) != 3 {
+		t.Fatalf("merged input len = %d, want 3: %s", len(items), normalized)
+	}
+	if items[0].Get("id").String() != "msg-1" ||
+		items[1].Get("id").String() != "msg-2" ||
+		items[2].Get("id").String() != "msg-3" {
+		t.Fatalf("unexpected deduped input order: %s", normalized)
+	}
+}
+
+func TestDedupeResponsesWebsocketInputItemsByIDAfterRepair(t *testing.T) {
+	payload := []byte(`{"type":"response.create","input":[{"type":"message","id":"msg-1"},{"type":"message","id":"msg-1"},{"type":"function_call","id":"fc-1","call_id":"call-1"},{"type":"function_call","id":"fc-1","call_id":"call-1"}]}`)
+
+	deduped := dedupeResponsesWebsocketInputItemsByID(payload)
+
+	items := gjson.GetBytes(deduped, "input").Array()
+	if len(items) != 2 {
+		t.Fatalf("deduped input len = %d, want 2: %s", len(items), deduped)
+	}
+	if items[0].Get("id").String() != "msg-1" || items[1].Get("id").String() != "fc-1" {
+		t.Fatalf("unexpected deduped input order: %s", deduped)
 	}
 }
 
