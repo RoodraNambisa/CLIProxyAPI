@@ -665,6 +665,8 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.DELETE("/auth-files", s.mgmt.DeleteAuthFile)
 		mgmt.GET("/auth-files/codex/plan-type-refresh", s.mgmt.GetCodexPlanTypeRefreshStatus)
 		mgmt.POST("/auth-files/codex/plan-type-refresh", s.mgmt.StartCodexPlanTypeRefresh)
+		mgmt.PATCH("/auth-files/codex/plan-type-refresh", s.mgmt.ControlCodexPlanTypeRefresh)
+		mgmt.DELETE("/auth-files/codex/plan-type-refresh", s.mgmt.ClearCodexPlanTypeRefresh)
 		mgmt.PATCH("/auth-files/status", s.mgmt.PatchAuthFileStatus)
 		mgmt.PATCH("/auth-files/fields", s.mgmt.PatchAuthFileFields)
 		mgmt.POST("/vertex/import", s.mgmt.ImportVertexCredential)

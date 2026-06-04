@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -157,6 +158,55 @@ func TestCodexPlanTypeRefreshRejectsConcurrentRequests(t *testing.T) {
 	waitForCodexPlanTypeRefreshDone(t, h)
 }
 
+func TestCodexPlanTypeRefreshClearCompletedTask(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"plan_type":"team"}`))
+	}))
+	defer server.Close()
+
+	restoreUsageURL := codexPlanTypeRefreshUsageURL
+	codexPlanTypeRefreshUsageURL = server.URL
+	defer func() { codexPlanTypeRefreshUsageURL = restoreUsageURL }()
+
+	h, _, _, _ := newCodexPlanRefreshTestHandler(t, map[string]any{
+		"type":         "codex",
+		"email":        "codex@example.com",
+		"access_token": "access-1",
+		"id_token":     testManagementCodexJWT("acct-1", "pro"),
+	})
+
+	postRec := performManagementRequest(t, http.MethodPost, "/v0/management/auth-files/codex/plan-type-refresh", "", h.StartCodexPlanTypeRefresh)
+	if postRec.Code != http.StatusAccepted {
+		t.Fatalf("POST status = %d, want %d; body=%s", postRec.Code, http.StatusAccepted, postRec.Body.String())
+	}
+	done := waitForCodexPlanTypeRefreshDone(t, h)
+	if done.State != codexPlanTypeRefreshStateCompleted {
+		t.Fatalf("state = %q, want %q", done.State, codexPlanTypeRefreshStateCompleted)
+	}
+
+	deleteRec := performManagementRequest(t, http.MethodDelete, "/v0/management/auth-files/codex/plan-type-refresh", "", h.ClearCodexPlanTypeRefresh)
+	if deleteRec.Code != http.StatusOK {
+		t.Fatalf("DELETE status = %d, want %d; body=%s", deleteRec.Code, http.StatusOK, deleteRec.Body.String())
+	}
+
+	var cleared codexPlanTypeRefreshTask
+	if err := json.Unmarshal(deleteRec.Body.Bytes(), &cleared); err != nil {
+		t.Fatalf("unmarshal DELETE response: %v", err)
+	}
+	if cleared.State != codexPlanTypeRefreshStateIdle {
+		t.Fatalf("state = %q, want %q", cleared.State, codexPlanTypeRefreshStateIdle)
+	}
+	if cleared.Running {
+		t.Fatal("running = true, want false")
+	}
+	if len(cleared.Results) != 0 {
+		t.Fatalf("results = %d, want 0", len(cleared.Results))
+	}
+}
+
 func TestCodexPlanTypeRefreshRetriesAfterUnauthorized(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
@@ -242,11 +292,188 @@ func TestCodexPlanTypeRefreshRetriesAfterUnauthorized(t *testing.T) {
 	}
 }
 
+func TestCodexPlanTypeRefreshRetryFailedOnly(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	var mu sync.Mutex
+	requestsByAccount := make(map[string]int)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		accountID := r.Header.Get("Chatgpt-Account-Id")
+		mu.Lock()
+		requestsByAccount[accountID]++
+		count := requestsByAccount[accountID]
+		mu.Unlock()
+
+		if accountID == "acct-fail" && count == 1 {
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = w.Write([]byte(`{"error":"temporary failure"}`))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"plan_type":"team"}`))
+	}))
+	defer server.Close()
+
+	restoreUsageURL := codexPlanTypeRefreshUsageURL
+	codexPlanTypeRefreshUsageURL = server.URL
+	defer func() { codexPlanTypeRefreshUsageURL = restoreUsageURL }()
+
+	h, manager, _, _ := newCodexPlanRefreshTestHandler(t, map[string]any{
+		"type":         "codex",
+		"email":        "fail@example.com",
+		"access_token": "access-fail",
+		"id_token":     testManagementCodexJWT("acct-fail", "pro"),
+	})
+	addCodexPlanRefreshTestAuth(t, h, manager, "success.json", map[string]any{
+		"type":         "codex",
+		"email":        "success@example.com",
+		"access_token": "access-success",
+		"id_token":     testManagementCodexJWT("acct-success", "pro"),
+	})
+
+	postRec := performManagementRequest(t, http.MethodPost, "/v0/management/auth-files/codex/plan-type-refresh", "", h.StartCodexPlanTypeRefresh)
+	if postRec.Code != http.StatusAccepted {
+		t.Fatalf("POST status = %d, want %d; body=%s", postRec.Code, http.StatusAccepted, postRec.Body.String())
+	}
+	first := waitForCodexPlanTypeRefreshDone(t, h)
+	if first.State != codexPlanTypeRefreshStateCompletedWithErrors {
+		t.Fatalf("first state = %q, want %q", first.State, codexPlanTypeRefreshStateCompletedWithErrors)
+	}
+	if !first.CanRetryFailed {
+		t.Fatal("can_retry_failed = false, want true")
+	}
+	if first.Summary.Failed != 1 {
+		t.Fatalf("failed = %d, want 1", first.Summary.Failed)
+	}
+
+	retryRec := performManagementRequest(t, http.MethodPost, "/v0/management/auth-files/codex/plan-type-refresh", `{"mode":"failed"}`, h.StartCodexPlanTypeRefresh)
+	if retryRec.Code != http.StatusAccepted {
+		t.Fatalf("retry POST status = %d, want %d; body=%s", retryRec.Code, http.StatusAccepted, retryRec.Body.String())
+	}
+	second := waitForCodexPlanTypeRefreshDone(t, h)
+	if second.State != codexPlanTypeRefreshStateCompleted {
+		t.Fatalf("second state = %q, want %q", second.State, codexPlanTypeRefreshStateCompleted)
+	}
+	if second.Summary.Processed != 1 {
+		t.Fatalf("retry processed = %d, want 1", second.Summary.Processed)
+	}
+
+	mu.Lock()
+	failRequests := requestsByAccount["acct-fail"]
+	successRequests := requestsByAccount["acct-success"]
+	mu.Unlock()
+	if failRequests != 2 {
+		t.Fatalf("acct-fail requests = %d, want 2", failRequests)
+	}
+	if successRequests != 1 {
+		t.Fatalf("acct-success requests = %d, want 1", successRequests)
+	}
+}
+
+func TestCodexPlanTypeRefreshPauseAndResume(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	firstStarted := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	var firstStartedClosed int32
+	var requestCount int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		count := atomic.AddInt32(&requestCount, 1)
+		if count == 1 {
+			if atomic.CompareAndSwapInt32(&firstStartedClosed, 0, 1) {
+				close(firstStarted)
+			}
+			<-releaseFirst
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"plan_type":"team"}`))
+	}))
+	defer server.Close()
+
+	restoreUsageURL := codexPlanTypeRefreshUsageURL
+	codexPlanTypeRefreshUsageURL = server.URL
+	defer func() { codexPlanTypeRefreshUsageURL = restoreUsageURL }()
+
+	h, manager, _, _ := newCodexPlanRefreshTestHandler(t, map[string]any{
+		"type":         "codex",
+		"email":        "first@example.com",
+		"access_token": "access-first",
+		"id_token":     testManagementCodexJWT("acct-first", "pro"),
+	})
+	addCodexPlanRefreshTestAuth(t, h, manager, "second.json", map[string]any{
+		"type":         "codex",
+		"email":        "second@example.com",
+		"access_token": "access-second",
+		"id_token":     testManagementCodexJWT("acct-second", "pro"),
+	})
+
+	postRec := performManagementRequest(t, http.MethodPost, "/v0/management/auth-files/codex/plan-type-refresh", "", h.StartCodexPlanTypeRefresh)
+	if postRec.Code != http.StatusAccepted {
+		t.Fatalf("POST status = %d, want %d; body=%s", postRec.Code, http.StatusAccepted, postRec.Body.String())
+	}
+	select {
+	case <-firstStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for first request")
+	}
+
+	pauseRec := performManagementRequest(t, http.MethodPatch, "/v0/management/auth-files/codex/plan-type-refresh", `{"action":"pause"}`, h.ControlCodexPlanTypeRefresh)
+	if pauseRec.Code != http.StatusOK {
+		t.Fatalf("pause status = %d, want %d; body=%s", pauseRec.Code, http.StatusOK, pauseRec.Body.String())
+	}
+
+	deleteRec := performManagementRequest(t, http.MethodDelete, "/v0/management/auth-files/codex/plan-type-refresh", "", h.ClearCodexPlanTypeRefresh)
+	if deleteRec.Code != http.StatusConflict {
+		t.Fatalf("DELETE running status = %d, want %d; body=%s", deleteRec.Code, http.StatusConflict, deleteRec.Body.String())
+	}
+
+	close(releaseFirst)
+	paused := waitForCodexPlanTypeRefreshPaused(t, h)
+	if paused.Summary.Processed != 1 {
+		t.Fatalf("processed while paused = %d, want 1", paused.Summary.Processed)
+	}
+	if !paused.Running || !paused.Paused {
+		t.Fatalf("running/paused = %v/%v, want true/true", paused.Running, paused.Paused)
+	}
+	if got := atomic.LoadInt32(&requestCount); got != 1 {
+		t.Fatalf("request count while paused = %d, want 1", got)
+	}
+
+	resumeRec := performManagementRequest(t, http.MethodPatch, "/v0/management/auth-files/codex/plan-type-refresh", `{"action":"resume"}`, h.ControlCodexPlanTypeRefresh)
+	if resumeRec.Code != http.StatusOK {
+		t.Fatalf("resume status = %d, want %d; body=%s", resumeRec.Code, http.StatusOK, resumeRec.Body.String())
+	}
+
+	done := waitForCodexPlanTypeRefreshDone(t, h)
+	if done.State != codexPlanTypeRefreshStateCompleted {
+		t.Fatalf("state = %q, want %q", done.State, codexPlanTypeRefreshStateCompleted)
+	}
+	if done.Summary.Processed != 2 {
+		t.Fatalf("processed = %d, want 2", done.Summary.Processed)
+	}
+	if got := atomic.LoadInt32(&requestCount); got != 2 {
+		t.Fatalf("request count = %d, want 2", got)
+	}
+}
+
 func newCodexPlanRefreshTestHandler(t *testing.T, metadata map[string]any) (*Handler, *coreauth.Manager, string, string) {
 	t.Helper()
 
 	authDir := t.TempDir()
-	path := filepath.Join(authDir, "codex-auth.json")
+	store := sdkauth.NewFileTokenStore()
+	store.SetBaseDir(authDir)
+	manager := coreauth.NewManager(store, nil, nil)
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, manager)
+
+	path, authID := addCodexPlanRefreshTestAuth(t, h, manager, "codex-auth.json", metadata)
+	return h, manager, path, authID
+}
+
+func addCodexPlanRefreshTestAuth(t *testing.T, h *Handler, manager *coreauth.Manager, fileName string, metadata map[string]any) (string, string) {
+	t.Helper()
+
+	authDir := h.cfg.AuthDir
+	path := filepath.Join(authDir, fileName)
 	data, err := json.Marshal(metadata)
 	if err != nil {
 		t.Fatalf("marshal auth metadata: %v", err)
@@ -255,11 +482,6 @@ func newCodexPlanRefreshTestHandler(t *testing.T, metadata map[string]any) (*Han
 		t.Fatalf("write auth file: %v", err)
 	}
 
-	store := sdkauth.NewFileTokenStore()
-	store.SetBaseDir(authDir)
-	manager := coreauth.NewManager(store, nil, nil)
-	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, manager)
-
 	auth, err := h.buildAuthFromFileData(path, data)
 	if err != nil {
 		t.Fatalf("buildAuthFromFileData: %v", err)
@@ -267,7 +489,7 @@ func newCodexPlanRefreshTestHandler(t *testing.T, metadata map[string]any) (*Han
 	if _, err := manager.Register(context.Background(), auth); err != nil {
 		t.Fatalf("register auth: %v", err)
 	}
-	return h, manager, path, auth.ID
+	return path, auth.ID
 }
 
 func performManagementRequest(t *testing.T, method string, target string, body string, handler func(*gin.Context)) *httptest.ResponseRecorder {
@@ -308,6 +530,20 @@ func waitForCodexPlanTypeRefreshDone(t *testing.T, h *Handler) codexPlanTypeRefr
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatal("timed out waiting for refresh task to finish")
+	return codexPlanTypeRefreshTask{}
+}
+
+func waitForCodexPlanTypeRefreshPaused(t *testing.T, h *Handler) codexPlanTypeRefreshTask {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		snapshot := h.codexPlanTypeRefreshSnapshot()
+		if snapshot.State == codexPlanTypeRefreshStatePaused && snapshot.Paused {
+			return snapshot
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("timed out waiting for refresh task to pause")
 	return codexPlanTypeRefreshTask{}
 }
 

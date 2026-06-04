@@ -19,6 +19,7 @@ import (
 const (
 	codexPlanTypeRefreshStateIdle                = "idle"
 	codexPlanTypeRefreshStateRunning             = "running"
+	codexPlanTypeRefreshStatePaused              = "paused"
 	codexPlanTypeRefreshStateCompleted           = "completed"
 	codexPlanTypeRefreshStateCompletedWithErrors = "completed_with_errors"
 	codexPlanTypeRefreshStateFailed              = "failed"
@@ -27,6 +28,10 @@ const (
 	codexPlanTypeRefreshStatusSkipped            = "skipped"
 	codexPlanTypeRefreshStatusFailed             = "failed"
 	codexPlanTypeRefreshUserAgent                = "codex_cli_rs/0.76.0 (Debian 13.0.0; x86_64) WindowsTerminal"
+	codexPlanTypeRefreshModeAll                  = "all"
+	codexPlanTypeRefreshModeFailed               = "failed"
+	codexPlanTypeRefreshActionPause              = "pause"
+	codexPlanTypeRefreshActionResume             = "resume"
 )
 
 var codexPlanTypeRefreshUsageURL = "https://chatgpt.com/backend-api/wham/usage"
@@ -53,11 +58,28 @@ type codexPlanTypeRefreshResult struct {
 type codexPlanTypeRefreshTask struct {
 	State       string                       `json:"state"`
 	Running     bool                         `json:"running"`
+	Paused      bool                         `json:"paused,omitempty"`
+	PauseWanted bool                         `json:"pause_requested,omitempty"`
+	Mode        string                       `json:"mode,omitempty"`
 	StartedAt   time.Time                    `json:"started_at,omitempty"`
 	FinishedAt  time.Time                    `json:"finished_at,omitempty"`
 	CurrentName string                       `json:"current_name,omitempty"`
 	Summary     codexPlanTypeRefreshSummary  `json:"summary"`
 	Results     []codexPlanTypeRefreshResult `json:"results"`
+
+	CanRetryFailed bool `json:"can_retry_failed"`
+
+	resumeCh      chan struct{}
+	targetAuthIDs []string
+	targetNames   []string
+}
+
+type codexPlanTypeRefreshStartRequest struct {
+	Mode string `json:"mode"`
+}
+
+type codexPlanTypeRefreshControlRequest struct {
+	Action string `json:"action"`
 }
 
 func (h *Handler) StartCodexPlanTypeRefresh(c *gin.Context) {
@@ -72,6 +94,97 @@ func (h *Handler) StartCodexPlanTypeRefresh(c *gin.Context) {
 
 	manager := h.authManager
 	startedAt := time.Now().UTC()
+	mode, ok := parseCodexPlanTypeRefreshMode(c)
+	if !ok {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid mode"})
+		return
+	}
+
+	h.codexPlanRefreshMu.Lock()
+	if h.codexPlanRefresh.Running {
+		snapshot := h.codexPlanTypeRefreshSnapshotLocked()
+		h.codexPlanRefreshMu.Unlock()
+		c.JSON(http.StatusConflict, snapshot)
+		return
+	}
+	targetAuthIDs := []string(nil)
+	targetNames := []string(nil)
+	if mode == codexPlanTypeRefreshModeFailed {
+		targetAuthIDs, targetNames = codexPlanTypeRefreshFailedTargets(h.codexPlanRefresh.Results)
+		if len(targetAuthIDs) == 0 && len(targetNames) == 0 {
+			snapshot := h.codexPlanTypeRefreshSnapshotLocked()
+			h.codexPlanRefreshMu.Unlock()
+			c.JSON(http.StatusOK, snapshot)
+			return
+		}
+	}
+	h.codexPlanRefresh = codexPlanTypeRefreshTask{
+		State:         codexPlanTypeRefreshStateRunning,
+		Running:       true,
+		Mode:          mode,
+		StartedAt:     startedAt,
+		Results:       make([]codexPlanTypeRefreshResult, 0),
+		targetAuthIDs: append([]string(nil), targetAuthIDs...),
+		targetNames:   append([]string(nil), targetNames...),
+	}
+	snapshot := h.codexPlanTypeRefreshSnapshotLocked()
+	h.codexPlanRefreshMu.Unlock()
+
+	go h.runCodexPlanTypeRefresh(manager)
+
+	c.JSON(http.StatusAccepted, snapshot)
+}
+
+func (h *Handler) ControlCodexPlanTypeRefresh(c *gin.Context) {
+	if h == nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "handler not initialized"})
+		return
+	}
+
+	var req codexPlanTypeRefreshControlRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+		return
+	}
+	action := strings.ToLower(strings.TrimSpace(req.Action))
+
+	h.codexPlanRefreshMu.Lock()
+	if !h.codexPlanRefresh.Running {
+		snapshot := h.codexPlanTypeRefreshSnapshotLocked()
+		h.codexPlanRefreshMu.Unlock()
+		c.JSON(http.StatusConflict, snapshot)
+		return
+	}
+
+	switch action {
+	case codexPlanTypeRefreshActionPause:
+		h.codexPlanRefresh.PauseWanted = true
+		snapshot := h.codexPlanTypeRefreshSnapshotLocked()
+		h.codexPlanRefreshMu.Unlock()
+		c.JSON(http.StatusOK, snapshot)
+	case codexPlanTypeRefreshActionResume:
+		resumeCh := h.codexPlanRefresh.resumeCh
+		h.codexPlanRefresh.resumeCh = nil
+		h.codexPlanRefresh.PauseWanted = false
+		h.codexPlanRefresh.Paused = false
+		h.codexPlanRefresh.State = codexPlanTypeRefreshStateRunning
+		snapshot := h.codexPlanTypeRefreshSnapshotLocked()
+		h.codexPlanRefreshMu.Unlock()
+		if resumeCh != nil {
+			close(resumeCh)
+		}
+		c.JSON(http.StatusOK, snapshot)
+	default:
+		h.codexPlanRefreshMu.Unlock()
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid action"})
+	}
+}
+
+func (h *Handler) ClearCodexPlanTypeRefresh(c *gin.Context) {
+	if h == nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "handler not initialized"})
+		return
+	}
 
 	h.codexPlanRefreshMu.Lock()
 	if h.codexPlanRefresh.Running {
@@ -81,17 +194,12 @@ func (h *Handler) StartCodexPlanTypeRefresh(c *gin.Context) {
 		return
 	}
 	h.codexPlanRefresh = codexPlanTypeRefreshTask{
-		State:     codexPlanTypeRefreshStateRunning,
-		Running:   true,
-		StartedAt: startedAt,
-		Results:   make([]codexPlanTypeRefreshResult, 0),
+		State:   codexPlanTypeRefreshStateIdle,
+		Results: make([]codexPlanTypeRefreshResult, 0),
 	}
 	snapshot := h.codexPlanTypeRefreshSnapshotLocked()
 	h.codexPlanRefreshMu.Unlock()
-
-	go h.runCodexPlanTypeRefresh(manager)
-
-	c.JSON(http.StatusAccepted, snapshot)
+	c.JSON(http.StatusOK, snapshot)
 }
 
 func (h *Handler) GetCodexPlanTypeRefreshStatus(c *gin.Context) {
@@ -118,6 +226,10 @@ func (h *Handler) codexPlanTypeRefreshSnapshotLocked() codexPlanTypeRefreshTask 
 	} else {
 		snapshot.Results = append([]codexPlanTypeRefreshResult(nil), snapshot.Results...)
 	}
+	snapshot.targetAuthIDs = nil
+	snapshot.targetNames = nil
+	snapshot.resumeCh = nil
+	snapshot.CanRetryFailed = !snapshot.Running && codexPlanTypeRefreshHasFailedResult(snapshot.Results)
 	return snapshot
 }
 
@@ -134,9 +246,9 @@ func (h *Handler) runCodexPlanTypeRefresh(manager *coreauth.Manager) {
 		return
 	}
 
-	for _, auth := range manager.List() {
-		if !isCodexPlanTypeRefreshEligibleAuth(auth) {
-			continue
+	for _, auth := range h.codexPlanTypeRefreshTargets(manager) {
+		if !h.waitIfCodexPlanTypeRefreshPaused() {
+			return
 		}
 		name := codexPlanTypeRefreshName(auth)
 		h.beginCodexPlanTypeRefreshAuth(name)
@@ -150,6 +262,129 @@ func (h *Handler) runCodexPlanTypeRefresh(manager *coreauth.Manager) {
 		state = codexPlanTypeRefreshStateCompletedWithErrors
 	}
 	h.finishCodexPlanTypeRefresh(state)
+}
+
+func parseCodexPlanTypeRefreshMode(c *gin.Context) (string, bool) {
+	mode := codexPlanTypeRefreshModeAll
+	if c == nil || c.Request == nil || c.Request.Body == nil || c.Request.ContentLength == 0 {
+		return mode, true
+	}
+
+	var req codexPlanTypeRefreshStartRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		return "", false
+	}
+	switch strings.ToLower(strings.TrimSpace(req.Mode)) {
+	case "", codexPlanTypeRefreshModeAll:
+		return codexPlanTypeRefreshModeAll, true
+	case codexPlanTypeRefreshModeFailed:
+		return codexPlanTypeRefreshModeFailed, true
+	default:
+		return "", false
+	}
+}
+
+func codexPlanTypeRefreshFailedTargets(results []codexPlanTypeRefreshResult) ([]string, []string) {
+	authIDs := make([]string, 0)
+	names := make([]string, 0)
+	seenAuthIDs := make(map[string]struct{})
+	seenNames := make(map[string]struct{})
+	for _, result := range results {
+		if !strings.EqualFold(strings.TrimSpace(result.Status), codexPlanTypeRefreshStatusFailed) {
+			continue
+		}
+		if authID := strings.TrimSpace(result.AuthID); authID != "" {
+			if _, exists := seenAuthIDs[authID]; !exists {
+				seenAuthIDs[authID] = struct{}{}
+				authIDs = append(authIDs, authID)
+			}
+			continue
+		}
+		if name := strings.TrimSpace(result.Name); name != "" {
+			if _, exists := seenNames[name]; !exists {
+				seenNames[name] = struct{}{}
+				names = append(names, name)
+			}
+		}
+	}
+	return authIDs, names
+}
+
+func codexPlanTypeRefreshHasFailedResult(results []codexPlanTypeRefreshResult) bool {
+	for _, result := range results {
+		if strings.EqualFold(strings.TrimSpace(result.Status), codexPlanTypeRefreshStatusFailed) {
+			return true
+		}
+	}
+	return false
+}
+
+func (h *Handler) codexPlanTypeRefreshTargets(manager *coreauth.Manager) []*coreauth.Auth {
+	if manager == nil {
+		return nil
+	}
+
+	h.codexPlanRefreshMu.Lock()
+	targetAuthIDs := append([]string(nil), h.codexPlanRefresh.targetAuthIDs...)
+	targetNames := append([]string(nil), h.codexPlanRefresh.targetNames...)
+	h.codexPlanRefreshMu.Unlock()
+
+	authIDSet := make(map[string]struct{}, len(targetAuthIDs))
+	for _, id := range targetAuthIDs {
+		if trimmed := strings.TrimSpace(id); trimmed != "" {
+			authIDSet[trimmed] = struct{}{}
+		}
+	}
+	nameSet := make(map[string]struct{}, len(targetNames))
+	for _, name := range targetNames {
+		if trimmed := strings.TrimSpace(name); trimmed != "" {
+			nameSet[trimmed] = struct{}{}
+		}
+	}
+	filtered := len(authIDSet) > 0 || len(nameSet) > 0
+
+	targets := make([]*coreauth.Auth, 0)
+	for _, auth := range manager.List() {
+		if !isCodexPlanTypeRefreshEligibleAuth(auth) {
+			continue
+		}
+		if filtered {
+			if _, ok := authIDSet[strings.TrimSpace(auth.ID)]; ok {
+				targets = append(targets, auth)
+				continue
+			}
+			if _, ok := nameSet[codexPlanTypeRefreshName(auth)]; !ok {
+				continue
+			}
+		}
+		targets = append(targets, auth)
+	}
+	return targets
+}
+
+func (h *Handler) waitIfCodexPlanTypeRefreshPaused() bool {
+	for {
+		h.codexPlanRefreshMu.Lock()
+		if !h.codexPlanRefresh.Running {
+			h.codexPlanRefreshMu.Unlock()
+			return false
+		}
+		if !h.codexPlanRefresh.PauseWanted && !h.codexPlanRefresh.Paused {
+			h.codexPlanRefreshMu.Unlock()
+			return true
+		}
+		h.codexPlanRefresh.State = codexPlanTypeRefreshStatePaused
+		h.codexPlanRefresh.Paused = true
+		h.codexPlanRefresh.PauseWanted = false
+		h.codexPlanRefresh.CurrentName = ""
+		resumeCh := h.codexPlanRefresh.resumeCh
+		if resumeCh == nil {
+			resumeCh = make(chan struct{})
+			h.codexPlanRefresh.resumeCh = resumeCh
+		}
+		h.codexPlanRefreshMu.Unlock()
+		<-resumeCh
+	}
 }
 
 func isCodexPlanTypeRefreshEligibleAuth(auth *coreauth.Auth) bool {
