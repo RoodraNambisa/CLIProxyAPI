@@ -177,9 +177,10 @@ type ClaudeHeaderDefaults struct {
 
 // CodexHeaderDefaults configures fallback header values injected into Codex
 // model requests for OAuth/file-backed auth when the client omits them.
-// UserAgent applies to HTTP and websocket requests; BetaFeatures only applies to websockets.
+// UserAgent and Originator apply to HTTP and websocket requests; BetaFeatures only applies to websockets.
 type CodexHeaderDefaults struct {
 	UserAgent    string `yaml:"user-agent" json:"user-agent"`
+	Originator   string `yaml:"originator" json:"originator"`
 	BetaFeatures string `yaml:"beta-features" json:"beta-features"`
 }
 
@@ -188,13 +189,11 @@ type CodexConfig struct {
 	IdentityConfuse bool `yaml:"identity-confuse" json:"identity-confuse"`
 }
 
-// CodexFingerprintConfig controls optional browser-style Codex upstream fingerprinting.
+// CodexFingerprintConfig controls optional Codex upstream fingerprinting.
 type CodexFingerprintConfig struct {
-	JA3                 bool  `yaml:"ja3" json:"ja3"`
-	BrowserHeaders      bool  `yaml:"browser-headers" json:"browser-headers"`
-	StabilizePerAccount *bool `yaml:"stabilize-per-account,omitempty" json:"stabilize-per-account,omitempty"`
-	ForceHTTP1          bool  `yaml:"force-http1" json:"force-http1"`
-	ImagesForceHTTP1    bool  `yaml:"images-force-http1" json:"images-force-http1"`
+	JA3              bool `yaml:"ja3" json:"ja3"`
+	ForceHTTP1       bool `yaml:"force-http1" json:"force-http1"`
+	ImagesForceHTTP1 bool `yaml:"images-force-http1" json:"images-force-http1"`
 }
 
 // TLSConfig holds HTTPS server settings.
@@ -898,6 +897,7 @@ func (cfg *Config) SanitizeCodexHeaderDefaults() {
 		return
 	}
 	cfg.CodexHeaderDefaults.UserAgent = strings.TrimSpace(cfg.CodexHeaderDefaults.UserAgent)
+	cfg.CodexHeaderDefaults.Originator = strings.TrimSpace(cfg.CodexHeaderDefaults.Originator)
 	cfg.CodexHeaderDefaults.BetaFeatures = strings.TrimSpace(cfg.CodexHeaderDefaults.BetaFeatures)
 }
 

@@ -251,6 +251,7 @@ func TestApplyCodexWebsocketHeadersPrefersExistingHeadersOverClientAndConfig(t *
 	cfg := &config.Config{
 		CodexHeaderDefaults: config.CodexHeaderDefaults{
 			UserAgent:    "config-ua",
+			Originator:   "config-originator",
 			BetaFeatures: "config-beta",
 		},
 	}
@@ -280,6 +281,7 @@ func TestApplyCodexWebsocketHeadersConfigUserAgentOverridesClientHeader(t *testi
 	cfg := &config.Config{
 		CodexHeaderDefaults: config.CodexHeaderDefaults{
 			UserAgent:    "config-ua",
+			Originator:   "config-originator",
 			BetaFeatures: "config-beta",
 		},
 	}
@@ -324,6 +326,7 @@ func TestApplyCodexWebsocketHeadersIgnoresConfigForAPIKeyAuth(t *testing.T) {
 	cfg := &config.Config{
 		CodexHeaderDefaults: config.CodexHeaderDefaults{
 			UserAgent:    "config-ua",
+			Originator:   "config-originator",
 			BetaFeatures: "config-beta",
 		},
 	}
@@ -642,6 +645,7 @@ func TestApplyCodexHeadersUsesConfigUserAgentForOAuth(t *testing.T) {
 	cfg := &config.Config{
 		CodexHeaderDefaults: config.CodexHeaderDefaults{
 			UserAgent:    "config-ua",
+			Originator:   "config-originator",
 			BetaFeatures: "config-beta",
 		},
 	}
@@ -658,64 +662,18 @@ func TestApplyCodexHeadersUsesConfigUserAgentForOAuth(t *testing.T) {
 	if got := req.Header.Get("User-Agent"); got != "config-ua" {
 		t.Fatalf("User-Agent = %s, want %s", got, "config-ua")
 	}
+	if got := req.Header.Get("Originator"); got != "config-originator" {
+		t.Fatalf("Originator = %s, want %s", got, "config-originator")
+	}
 	if got := req.Header.Get("x-codex-beta-features"); got != "" {
 		t.Fatalf("x-codex-beta-features = %q, want empty", got)
 	}
 }
 
-func TestApplyCodexHeadersBrowserFingerprintStablePerAccount(t *testing.T) {
-	cfg := &config.Config{
-		CodexFingerprint: config.CodexFingerprintConfig{
-			BrowserHeaders: true,
-		},
-	}
-	auth := &cliproxyauth.Auth{
-		Provider: "codex",
-		Metadata: map[string]any{"email": "user@example.com"},
-	}
-
-	reqA, err := http.NewRequest(http.MethodPost, "https://chatgpt.com/backend-api/codex/responses", nil)
-	if err != nil {
-		t.Fatalf("NewRequest() error = %v", err)
-	}
-	applyCodexHeaders(reqA, auth, "oauth-token", true, cfg)
-
-	reqB, err := http.NewRequest(http.MethodPost, "https://chatgpt.com/backend-api/codex/responses", nil)
-	if err != nil {
-		t.Fatalf("NewRequest() error = %v", err)
-	}
-	applyCodexHeaders(reqB, auth, "oauth-token", true, cfg)
-
-	if got := reqA.Header.Get("User-Agent"); !strings.Contains(got, "Chrome/") || !strings.Contains(got, "Macintosh") {
-		t.Fatalf("User-Agent = %q, want Chrome macOS persona", got)
-	}
-	if gotA, gotB := reqA.Header.Get("User-Agent"), reqB.Header.Get("User-Agent"); gotA != gotB {
-		t.Fatalf("stable User-Agent mismatch: %q != %q", gotA, gotB)
-	}
-	if got := reqA.Header.Get("Sec-CH-UA"); !strings.Contains(got, `"Google Chrome"`) {
-		t.Fatalf("Sec-CH-UA = %q, want Chrome brands", got)
-	}
-	if got := reqA.Header.Get("Sec-Fetch-Mode"); got != "cors" {
-		t.Fatalf("Sec-Fetch-Mode = %q, want cors", got)
-	}
-	if got := reqA.Header.Get("Origin"); got != "https://chatgpt.com" {
-		t.Fatalf("Origin = %q, want https://chatgpt.com", got)
-	}
-	if got := reqA.Header.Get("Accept"); got != "text/event-stream" {
-		t.Fatalf("Accept = %q, want text/event-stream", got)
-	}
-	if got := reqA.Header.Get("Accept-Encoding"); got != "" {
-		t.Fatalf("Accept-Encoding = %q, want empty", got)
-	}
-}
-
-func TestApplyCodexHeadersBrowserFingerprintHonorsConfiguredUserAgent(t *testing.T) {
+func TestApplyCodexHeadersDoesNotInjectChromeHeaders(t *testing.T) {
 	cfg := &config.Config{
 		CodexHeaderDefaults: config.CodexHeaderDefaults{
-			UserAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
-		},
-		CodexFingerprint: config.CodexFingerprintConfig{
-			BrowserHeaders: true,
+			UserAgent: "config-ua",
 		},
 	}
 	auth := &cliproxyauth.Auth{
@@ -729,74 +687,10 @@ func TestApplyCodexHeadersBrowserFingerprintHonorsConfiguredUserAgent(t *testing
 
 	applyCodexHeaders(req, auth, "oauth-token", false, cfg)
 
-	if got := req.Header.Get("User-Agent"); !strings.Contains(got, "Chrome/146.0.0.0") {
-		t.Fatalf("User-Agent = %q, want configured Chrome/146 UA", got)
-	}
-	if got := req.Header.Get("Sec-CH-UA"); !strings.Contains(got, `v="146"`) {
-		t.Fatalf("Sec-CH-UA = %q, want version 146", got)
-	}
-	if got := req.Header.Get("Accept"); got != "application/json" {
-		t.Fatalf("Accept = %q, want application/json", got)
-	}
-}
-
-func TestApplyCodexWebsocketHeadersBrowserFingerprint(t *testing.T) {
-	cfg := &config.Config{
-		CodexFingerprint: config.CodexFingerprintConfig{
-			BrowserHeaders: true,
-		},
-	}
-	auth := &cliproxyauth.Auth{
-		Provider: "codex",
-		Metadata: map[string]any{"email": "user@example.com"},
-	}
-
-	headers := applyCodexWebsocketHeaders(context.Background(), http.Header{}, auth, "oauth-token", cfg)
-
-	if got := headers.Get("User-Agent"); !strings.Contains(got, "Chrome/") {
-		t.Fatalf("User-Agent = %q, want Chrome persona", got)
-	}
-	if got := headers.Get("Sec-Fetch-Mode"); got != "websocket" {
-		t.Fatalf("Sec-Fetch-Mode = %q, want websocket", got)
-	}
-	if got := headers.Get("Sec-Fetch-Dest"); got != "websocket" {
-		t.Fatalf("Sec-Fetch-Dest = %q, want websocket", got)
-	}
-	if got := headers.Get("Origin"); got != "https://chatgpt.com" {
-		t.Fatalf("Origin = %q, want https://chatgpt.com", got)
-	}
-}
-
-func TestApplyCodexWebsocketHeadersBrowserFingerprintKeepsCustomHeaders(t *testing.T) {
-	cfg := &config.Config{
-		CodexFingerprint: config.CodexFingerprintConfig{
-			BrowserHeaders: true,
-		},
-	}
-	auth := &cliproxyauth.Auth{
-		Provider: "codex",
-		Attributes: map[string]string{
-			"header:Origin":         "https://custom.example",
-			"header:Referer":        "https://custom.example/codex",
-			"header:Sec-Fetch-Mode": "custom-mode",
-		},
-		Metadata: map[string]any{"email": "user@example.com"},
-	}
-	target := parsedURLOrNil("wss://gateway.example/backend-api/codex/responses")
-
-	headers := applyCodexWebsocketHeadersForURL(context.Background(), http.Header{}, auth, "oauth-token", cfg, target)
-
-	if got := headers.Get("Origin"); got != "https://custom.example" {
-		t.Fatalf("Origin = %q, want custom header", got)
-	}
-	if got := headers.Get("Referer"); got != "https://custom.example/codex" {
-		t.Fatalf("Referer = %q, want custom header", got)
-	}
-	if got := headers.Get("Sec-Fetch-Mode"); got != "custom-mode" {
-		t.Fatalf("Sec-Fetch-Mode = %q, want custom header", got)
-	}
-	if got := headers.Get("Sec-CH-UA"); !strings.Contains(got, "Chromium") {
-		t.Fatalf("Sec-CH-UA = %q, want browser fingerprint header", got)
+	for _, key := range []string{"Sec-CH-UA", "Sec-Fetch-Mode", "Origin", "Referer", "DNT", "Accept-Language"} {
+		if got := req.Header.Get(key); got != "" {
+			t.Fatalf("%s = %q, want empty", key, got)
+		}
 	}
 }
 

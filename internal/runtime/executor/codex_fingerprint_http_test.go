@@ -41,6 +41,20 @@ func TestCodexFingerprintShouldForceHTTP1(t *testing.T) {
 			imageRequest: true,
 			want:         true,
 		},
+		{
+			name: "global and image force can both be enabled",
+			cfg: &config.Config{
+				CodexFingerprint: config.CodexFingerprintConfig{ForceHTTP1: true, ImagesForceHTTP1: true},
+			},
+			want: true,
+		},
+		{
+			name: "codex tls fingerprint overrides force http1",
+			cfg: &config.Config{
+				CodexFingerprint: config.CodexFingerprintConfig{JA3: true, ForceHTTP1: true, ImagesForceHTTP1: true},
+			},
+			imageRequest: true,
+		},
 	}
 
 	for _, tt := range tests {

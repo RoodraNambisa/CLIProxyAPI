@@ -267,10 +267,12 @@ nonstream-keepalive-interval: 0
 
 # Default headers for Codex OAuth model requests.
 # These are used only for file-backed/OAuth Codex requests when the client
-# does not send the header. `user-agent` applies to HTTP and websocket requests;
-# `beta-features` only applies to websocket requests. They do not apply to codex-api-key entries.
+# does not send the header. `user-agent` and `originator` apply to HTTP and
+# websocket requests; `beta-features` only applies to websocket requests.
+# They do not apply to codex-api-key entries.
 # codex-header-defaults:
 #   user-agent: "codex_cli_rs/0.114.0 (Mac OS 14.2.0; x86_64) vscode/1.111.0"
+#   originator: "codex_cli_rs"
 #   beta-features: "multi_agent"
 
 # Provider-wide Codex behavior. Disabled by default.
@@ -280,17 +282,13 @@ nonstream-keepalive-interval: 0
 #   identity-confuse: false
 
 # Optional Codex upstream fingerprinting. Disabled by default.
-# `ja3` uses a Chrome-like uTLS ClientHello for Codex HTTPS requests.
-# `browser-headers` injects Chrome-style browser request headers such as
-# sec-ch-ua/sec-fetch/origin/referer while keeping API-specific Accept values.
-# `stabilize-per-account` defaults to true; each OAuth email or API key hashes
-# to a stable browser persona. Set it to false to rotate per request.
+# `ja3` forces the observed native Codex TLS 1.2 ClientHello, HTTP/1.1,
+# and Codex request header order. It is mutually exclusive with the
+# HTTP/1.1-only options.
 # `force-http1` forces all Codex HTTPS requests to use HTTP/1.1.
 # `images-force-http1` only forces image_generation requests to use HTTP/1.1.
 # codex-fingerprint:
 #   ja3: false
-#   browser-headers: false
-#   stabilize-per-account: true
 #   force-http1: false
 #   images-force-http1: false
 

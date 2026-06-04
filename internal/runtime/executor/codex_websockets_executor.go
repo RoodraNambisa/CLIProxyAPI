@@ -804,14 +804,17 @@ func enableCodexWebsocketUTLS(dialer *websocket.Dialer, ctx context.Context, cfg
 	if dialer == nil || !codexFingerprintJA3Enabled(cfg) {
 		return dialer
 	}
-	persona := codexFingerprintPersonaFromContext(ctx, cfg, auth)
 	dialer.Proxy = nil
 	dialer.NetDialTLSContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
 		serverName := addr
 		if host, _, errSplit := net.SplitHostPort(addr); errSplit == nil && strings.TrimSpace(host) != "" {
 			serverName = host
 		}
-		return helps.DialChromeUTLSContext(ctx, network, addr, serverName, proxyURL, persona.tlsProfile)
+		conn, err := helps.DialCodexNativeTLSContext(ctx, network, addr, serverName, proxyURL)
+		if err != nil {
+			return nil, err
+		}
+		return helps.WrapCodexWebsocketHeaderOrder(conn), nil
 	}
 	return dialer
 }
@@ -889,7 +892,7 @@ func applyCodexWebsocketHeadersForURL(ctx context.Context, headers http.Header, 
 	}
 
 	isAPIKey := codexAuthUsesAPIKey(auth)
-	cfgUserAgent, cfgBetaFeatures := codexHeaderDefaults(cfg, auth)
+	cfgUserAgent, cfgOriginator, cfgBetaFeatures := codexHeaderDefaults(cfg, auth)
 	ensureHeaderWithPriority(headers, ginHeaders, "x-codex-beta-features", cfgBetaFeatures, "")
 	misc.EnsureHeader(headers, ginHeaders, "x-codex-turn-state", "")
 	misc.EnsureHeader(headers, ginHeaders, "x-codex-turn-metadata", "")
@@ -901,7 +904,6 @@ func applyCodexWebsocketHeadersForURL(ctx context.Context, headers http.Header, 
 	} else {
 		ensureHeaderWithConfigPrecedence(headers, ginHeaders, "User-Agent", cfgUserAgent, codexUserAgent)
 	}
-	applyCodexBrowserFingerprintHeaders(ctx, headers, cfg, auth, target, true)
 
 	betaHeader := strings.TrimSpace(headers.Get("OpenAI-Beta"))
 	if betaHeader == "" && ginHeaders != nil {
@@ -917,6 +919,8 @@ func applyCodexWebsocketHeadersForURL(ctx context.Context, headers http.Header, 
 	ensureHeaderCasePreserved(headers, ginHeaders, "session_id", "", "")
 	if originator := strings.TrimSpace(ginHeaders.Get("Originator")); originator != "" {
 		headers.Set("Originator", originator)
+	} else if cfgOriginator != "" {
+		headers.Set("Originator", cfgOriginator)
 	} else if !isAPIKey {
 		headers.Set("Originator", codexOriginator)
 	}
@@ -1010,16 +1014,18 @@ func deleteHeaderCaseInsensitive(headers http.Header, key string) {
 	}
 }
 
-func codexHeaderDefaults(cfg *config.Config, auth *cliproxyauth.Auth) (string, string) {
+func codexHeaderDefaults(cfg *config.Config, auth *cliproxyauth.Auth) (string, string, string) {
 	if cfg == nil || auth == nil {
-		return "", ""
+		return "", "", ""
 	}
 	if auth.Attributes != nil {
 		if v := strings.TrimSpace(auth.Attributes["api_key"]); v != "" {
-			return "", ""
+			return "", "", ""
 		}
 	}
-	return strings.TrimSpace(cfg.CodexHeaderDefaults.UserAgent), strings.TrimSpace(cfg.CodexHeaderDefaults.BetaFeatures)
+	return strings.TrimSpace(cfg.CodexHeaderDefaults.UserAgent),
+		strings.TrimSpace(cfg.CodexHeaderDefaults.Originator),
+		strings.TrimSpace(cfg.CodexHeaderDefaults.BetaFeatures)
 }
 
 func ensureHeaderWithPriority(target http.Header, source http.Header, key, configValue, fallbackValue string) {

@@ -1109,9 +1109,8 @@ func applyCodexHeaders(r *http.Request, auth *cliproxyauth.Auth, token string, s
 	misc.EnsureHeader(r.Header, ginHeaders, "Version", "")
 	misc.EnsureHeader(r.Header, ginHeaders, "X-Codex-Turn-Metadata", "")
 	misc.EnsureHeader(r.Header, ginHeaders, "X-Client-Request-Id", "")
-	cfgUserAgent, _ := codexHeaderDefaults(cfg, auth)
+	cfgUserAgent, cfgOriginator, _ := codexHeaderDefaults(cfg, auth)
 	ensureHeaderWithConfigPrecedence(r.Header, ginHeaders, "User-Agent", cfgUserAgent, codexUserAgent)
-	applyCodexBrowserFingerprintHeaders(r.Context(), r.Header, cfg, auth, r.URL, false)
 
 	if strings.Contains(r.Header.Get("User-Agent"), "Mac OS") {
 		misc.EnsureHeader(r.Header, ginHeaders, "Session_id", uuid.NewString())
@@ -1132,6 +1131,8 @@ func applyCodexHeaders(r *http.Request, auth *cliproxyauth.Auth, token string, s
 	}
 	if originator := strings.TrimSpace(ginHeaders.Get("Originator")); originator != "" {
 		r.Header.Set("Originator", originator)
+	} else if cfgOriginator != "" {
+		r.Header.Set("Originator", cfgOriginator)
 	} else if !isAPIKey {
 		r.Header.Set("Originator", codexOriginator)
 	}
@@ -1154,14 +1155,10 @@ func (e *CodexExecutor) newCodexHTTPClient(ctx context.Context, auth *cliproxyau
 	if e != nil {
 		cfg = e.cfg
 	}
-	forceHTTP1 := codexFingerprintShouldForceHTTP1(cfg, imageRequest)
 	if codexFingerprintJA3Enabled(cfg) {
-		persona := codexFingerprintPersonaFromContext(ctx, cfg, auth)
-		if forceHTTP1 {
-			return helps.NewChromeUtlsHTTP1Client(ctx, cfg, auth, 0, persona.tlsProfile)
-		}
-		return helps.NewChromeUtlsHTTPClient(ctx, cfg, auth, 0, persona.tlsProfile)
+		return helps.NewCodexNativeTLSHTTP1Client(ctx, cfg, auth, 0)
 	}
+	forceHTTP1 := codexFingerprintShouldForceHTTP1(cfg, imageRequest)
 	if forceHTTP1 {
 		return helps.NewProxyAwareHTTP1Client(ctx, cfg, auth, 0)
 	}

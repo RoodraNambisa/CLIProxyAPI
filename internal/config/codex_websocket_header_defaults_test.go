@@ -12,11 +12,10 @@ func TestLoadConfigOptional_CodexHeaderDefaults(t *testing.T) {
 	configYAML := []byte(`
 codex-header-defaults:
   user-agent: "  my-codex-client/1.0  "
+  originator: "  my-originator  "
   beta-features: "  feature-a,feature-b  "
 codex-fingerprint:
   ja3: true
-  browser-headers: true
-  stabilize-per-account: false
   force-http1: true
   images-force-http1: true
 codex:
@@ -34,17 +33,14 @@ codex:
 	if got := cfg.CodexHeaderDefaults.UserAgent; got != "my-codex-client/1.0" {
 		t.Fatalf("UserAgent = %q, want %q", got, "my-codex-client/1.0")
 	}
+	if got := cfg.CodexHeaderDefaults.Originator; got != "my-originator" {
+		t.Fatalf("Originator = %q, want %q", got, "my-originator")
+	}
 	if got := cfg.CodexHeaderDefaults.BetaFeatures; got != "feature-a,feature-b" {
 		t.Fatalf("BetaFeatures = %q, want %q", got, "feature-a,feature-b")
 	}
 	if !cfg.CodexFingerprint.JA3 {
 		t.Fatalf("CodexFingerprint.JA3 = false, want true")
-	}
-	if !cfg.CodexFingerprint.BrowserHeaders {
-		t.Fatalf("CodexFingerprint.BrowserHeaders = false, want true")
-	}
-	if cfg.CodexFingerprint.StabilizePerAccount == nil || *cfg.CodexFingerprint.StabilizePerAccount {
-		t.Fatalf("CodexFingerprint.StabilizePerAccount = %v, want false", cfg.CodexFingerprint.StabilizePerAccount)
 	}
 	if !cfg.CodexFingerprint.ForceHTTP1 {
 		t.Fatalf("CodexFingerprint.ForceHTTP1 = false, want true")
