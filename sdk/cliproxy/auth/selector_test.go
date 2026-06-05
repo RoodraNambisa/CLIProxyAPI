@@ -176,7 +176,7 @@ func TestSessionAffinitySelector_CodexWebsocketIgnoresHTTPCacheWhenWebsocketRead
 	}
 }
 
-func TestFillFirstSelectorPick_PriorityFallbackCooldown(t *testing.T) {
+func TestFillFirstSelectorPick_FallsBackWhenHigherPriorityCooling(t *testing.T) {
 	t.Parallel()
 
 	selector := &FillFirstSelector{}
@@ -199,24 +199,12 @@ func TestFillFirstSelectorPick_PriorityFallbackCooldown(t *testing.T) {
 	}
 	low := &Auth{ID: "low", Attributes: map[string]string{"priority": "0"}}
 
-	_, err := selector.Pick(context.Background(), "mixed", model, cliproxyexecutor.Options{}, []*Auth{high, low})
-	if err == nil {
-		t.Fatal("Pick() error = nil, want cooldown error for target priority")
-	}
-	var cooldownErr *modelCooldownError
-	if !errors.As(err, &cooldownErr) {
-		t.Fatalf("Pick() error = %T, want *modelCooldownError", err)
-	}
-
-	retryOpts := cliproxyexecutor.Options{
-		Metadata: map[string]any{cliproxyexecutor.SelectionAttemptMetadataKey: 1},
-	}
-	got, err := selector.Pick(context.Background(), "mixed", model, retryOpts, []*Auth{high, low})
+	got, err := selector.Pick(context.Background(), "mixed", model, cliproxyexecutor.Options{}, []*Auth{high, low})
 	if err != nil {
-		t.Fatalf("Pick() retry error = %v", err)
+		t.Fatalf("Pick() error = %v", err)
 	}
 	if got == nil || got.ID != "low" {
-		t.Fatalf("Pick() retry auth = %v, want low", got)
+		t.Fatalf("Pick() auth = %v, want low", got)
 	}
 }
 
@@ -475,24 +463,12 @@ func TestFillFirstSelectorPick_ThinkingSuffixFallsBackToBaseModelState(t *testin
 		Attributes: map[string]string{"priority": "0"},
 	}
 
-	_, err := selector.Pick(context.Background(), "mixed", requestedModel, cliproxyexecutor.Options{}, []*Auth{high, low})
-	if err == nil {
-		t.Fatal("Pick() error = nil, want cooldown error for target priority")
-	}
-	var cooldownErr *modelCooldownError
-	if !errors.As(err, &cooldownErr) {
-		t.Fatalf("Pick() error = %T, want *modelCooldownError", err)
-	}
-
-	retryOpts := cliproxyexecutor.Options{
-		Metadata: map[string]any{cliproxyexecutor.SelectionAttemptMetadataKey: 1},
-	}
-	got, err := selector.Pick(context.Background(), "mixed", requestedModel, retryOpts, []*Auth{high, low})
+	got, err := selector.Pick(context.Background(), "mixed", requestedModel, cliproxyexecutor.Options{}, []*Auth{high, low})
 	if err != nil {
-		t.Fatalf("Pick() retry error = %v", err)
+		t.Fatalf("Pick() error = %v", err)
 	}
 	if got == nil || got.ID != "low" {
-		t.Fatalf("Pick() retry auth = %v, want low", got)
+		t.Fatalf("Pick() auth = %v, want low", got)
 	}
 }
 

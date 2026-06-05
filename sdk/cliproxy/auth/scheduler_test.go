@@ -2,7 +2,6 @@ package auth
 
 import (
 	"context"
-	"errors"
 	"net/http"
 	"strings"
 	"testing"
@@ -376,7 +375,7 @@ func TestSchedulerPick_CodexWebsocketFallsBackWhenOnlyWebsocketCandidatesBlocked
 	}
 }
 
-func TestSchedulerPick_CodexWebsocketDoesNotFallbackToHTTPWithinRestrictedPriority(t *testing.T) {
+func TestSchedulerPick_CodexWebsocketFallsBackWhenHigherWebsocketPriorityCooling(t *testing.T) {
 	t.Parallel()
 
 	scheduler := newSchedulerForTest(
@@ -393,23 +392,12 @@ func TestSchedulerPick_CodexWebsocketDoesNotFallbackToHTTPWithinRestrictedPriori
 	)
 
 	ctx := cliproxyexecutor.WithDownstreamWebsocket(context.Background())
-	_, errPick := scheduler.pickSingle(ctx, "codex", "", cliproxyexecutor.Options{}, nil)
-	if errPick == nil {
-		t.Fatal("pickSingle() error = nil, want cooldown at restricted websocket priority")
-	}
-	var cooldownErr *modelCooldownError
-	if !errors.As(errPick, &cooldownErr) {
-		t.Fatalf("pickSingle() error = %T, want *modelCooldownError", errPick)
-	}
-
-	got, errPick := scheduler.pickSingle(ctx, "codex", "", cliproxyexecutor.Options{
-		Metadata: map[string]any{cliproxyexecutor.SelectionAttemptMetadataKey: 1},
-	}, nil)
+	got, errPick := scheduler.pickSingle(ctx, "codex", "", cliproxyexecutor.Options{}, nil)
 	if errPick != nil {
-		t.Fatalf("pickSingle() attempt 1 error = %v", errPick)
+		t.Fatalf("pickSingle() error = %v", errPick)
 	}
 	if got == nil || got.ID != "codex-ws-ready" {
-		t.Fatalf("pickSingle() attempt 1 auth = %v, want codex-ws-ready", got)
+		t.Fatalf("pickSingle() auth = %v, want codex-ws-ready", got)
 	}
 }
 

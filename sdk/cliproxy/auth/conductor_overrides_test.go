@@ -941,7 +941,7 @@ func TestManagerExecute_RequestRetryDropsPriorityForBuiltInSelectors(t *testing.
 	}
 }
 
-func TestManagerRequestRetryZeroDoesNotDropPriorityWithinRound(t *testing.T) {
+func TestManagerRequestRetryZeroFallsBackWhenHigherPriorityUnavailableWithinRound(t *testing.T) {
 	selectors := map[string]Selector{
 		"round_robin": &RoundRobinSelector{},
 		"fill_first":  &FillFirstSelector{},
@@ -998,6 +998,7 @@ func TestManagerRequestRetryZeroDoesNotDropPriorityWithinRound(t *testing.T) {
 				errByAuth := map[string]error{
 					"high-a": &Error{HTTPStatus: http.StatusInternalServerError, Message: "high-a failed"},
 					"high-b": &Error{HTTPStatus: http.StatusInternalServerError, Message: "high-b failed"},
+					"low":    &Error{HTTPStatus: http.StatusInternalServerError, Message: "low failed"},
 				}
 				executor := &authFallbackExecutor{
 					id:                "claude",
@@ -1019,23 +1020,21 @@ func TestManagerRequestRetryZeroDoesNotDropPriorityWithinRound(t *testing.T) {
 				}
 
 				if errInvoke := mode.invoke(m); errInvoke == nil {
-					t.Fatal("Execute path returned nil error, want highest-priority failure")
+					t.Fatal("Execute path returned nil error, want retry exhaustion failure")
 				}
 				got := mode.calls(executor)
-				if len(got) != 2 {
-					t.Fatalf("calls = %v, want exactly two highest-priority calls", got)
+				if len(got) != 3 {
+					t.Fatalf("calls = %v, want high priority credentials followed by low priority credential", got)
 				}
-				for _, authID := range got {
-					if authID == "low" {
-						t.Fatalf("calls = %v, low priority should not be used when request-retry=0", got)
-					}
+				if got[0] == "low" || got[1] == "low" || got[2] != "low" {
+					t.Fatalf("calls = %v, want low priority only after higher priority is unavailable", got)
 				}
 			})
 		}
 	}
 }
 
-func TestManagerExecute_WaitsForTargetPriorityCooldownWithinMaxInterval(t *testing.T) {
+func TestManagerExecute_FallsBackWhenHigherPriorityCooling(t *testing.T) {
 	m := NewManager(nil, &RoundRobinSelector{}, nil)
 	m.SetRetryConfig(1, 100*time.Millisecond, 1)
 
@@ -1075,15 +1074,15 @@ func TestManagerExecute_WaitsForTargetPriorityCooldownWithinMaxInterval(t *testi
 	if errExecute != nil {
 		t.Fatalf("Execute() error = %v", errExecute)
 	}
-	if string(resp.Payload) != "high" {
-		t.Fatalf("Execute() payload = %q, want high", string(resp.Payload))
+	if string(resp.Payload) != "low" {
+		t.Fatalf("Execute() payload = %q, want low", string(resp.Payload))
 	}
-	if got := executor.ExecuteCalls(); len(got) != 1 || got[0] != "high" {
-		t.Fatalf("execute calls = %v, want [high]", got)
+	if got := executor.ExecuteCalls(); len(got) != 1 || got[0] != "low" {
+		t.Fatalf("execute calls = %v, want [low]", got)
 	}
 }
 
-func TestManagerWaitsForCooldownAfterSameRoundFailure(t *testing.T) {
+func TestManagerFallsBackAfterSameRoundFailureWhenHigherPriorityCooling(t *testing.T) {
 	modes := []struct {
 		name   string
 		invoke func(*Manager) (string, error)
@@ -1181,11 +1180,11 @@ func TestManagerWaitsForCooldownAfterSameRoundFailure(t *testing.T) {
 			if errExecute != nil {
 				t.Fatalf("Execute path error = %v", errExecute)
 			}
-			if payload != highCoolID {
-				t.Fatalf("payload = %q, want %q", payload, highCoolID)
+			if payload != lowID {
+				t.Fatalf("payload = %q, want %q", payload, lowID)
 			}
-			if got := mode.calls(executor); len(got) != 2 || got[0] != highFailID || got[1] != highCoolID {
-				t.Fatalf("calls = %v, want [%s %s]", got, highFailID, highCoolID)
+			if got := mode.calls(executor); len(got) != 2 || got[0] != highFailID || got[1] != lowID {
+				t.Fatalf("calls = %v, want [%s %s]", got, highFailID, lowID)
 			}
 		})
 	}
@@ -1411,7 +1410,7 @@ func TestManagerExecute_SessionAffinityCodexWebsocketPrefersReadyWebsocketAuth(t
 	}
 }
 
-func TestManagerExecute_SessionAffinityCodexWebsocketPreservesCoolingPriority(t *testing.T) {
+func TestManagerExecute_SessionAffinityCodexWebsocketFallsBackWhenHigherPriorityCooling(t *testing.T) {
 	failover := true
 	selector := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{
 		Fallback: &RoundRobinSelector{},
@@ -1465,16 +1464,15 @@ func TestManagerExecute_SessionAffinityCodexWebsocketPreservesCoolingPriority(t 
 
 	ctx := cliproxyexecutor.WithDownstreamWebsocket(context.Background())
 	opts := cliproxyexecutor.Options{OriginalRequest: []byte(`{"metadata":{"user_id":"user_xxx_account__session_` + uuid.NewString() + `"}}`)}
-	_, errExecute := m.Execute(ctx, []string{"codex"}, cliproxyexecutor.Request{Model: "test-model"}, opts)
-	if errExecute == nil {
-		t.Fatal("Execute() error = nil, want target-priority cooldown")
+	resp, errExecute := m.Execute(ctx, []string{"codex"}, cliproxyexecutor.Request{Model: "test-model"}, opts)
+	if errExecute != nil {
+		t.Fatalf("Execute() error = %v", errExecute)
 	}
-	var authErr *Error
-	if !errors.As(errExecute, &authErr) || authErr.Code != "auth_unavailable" {
-		t.Fatalf("Execute() error = %T %[1]v, want final auth_unavailable from target cooldown", errExecute)
+	if string(resp.Payload) != wsReadyID {
+		t.Fatalf("Execute() payload = %q, want %q", string(resp.Payload), wsReadyID)
 	}
-	if got := executor.ExecuteCalls(); len(got) != 0 {
-		t.Fatalf("execute calls = %v, want none while target websocket priority is cooling", got)
+	if got := executor.ExecuteCalls(); len(got) != 1 || got[0] != wsReadyID {
+		t.Fatalf("execute calls = %v, want [%s]", got, wsReadyID)
 	}
 }
 

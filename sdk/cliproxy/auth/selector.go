@@ -279,6 +279,19 @@ func selectionPriorityForAttempt(priorities []int, attempt int) (int, bool) {
 	return priorities[attempt], true
 }
 
+func selectionPrioritiesForAttempt(priorities []int, attempt int) []int {
+	if len(priorities) == 0 {
+		return nil
+	}
+	if attempt < 0 {
+		attempt = 0
+	}
+	if attempt >= len(priorities) {
+		attempt = len(priorities) - 1
+	}
+	return priorities[attempt:]
+}
+
 func availableAuthsForAttempt(availableByPriority map[int][]*Auth, selectionAttempt int) ([]*Auth, bool) {
 	if len(availableByPriority) == 0 {
 		return nil, false
@@ -290,15 +303,17 @@ func availableAuthsForAttempt(availableByPriority map[int][]*Auth, selectionAtte
 	sort.Slice(priorities, func(i, j int) bool {
 		return priorities[i] > priorities[j]
 	})
-	targetPriority, ok := selectionPriorityForAttempt(priorities, selectionAttempt)
-	if !ok {
-		return nil, false
+	for _, priority := range selectionPrioritiesForAttempt(priorities, selectionAttempt) {
+		available := append([]*Auth(nil), availableByPriority[priority]...)
+		if len(available) == 0 {
+			continue
+		}
+		if len(available) > 1 {
+			sort.Slice(available, func(i, j int) bool { return available[i].ID < available[j].ID })
+		}
+		return available, true
 	}
-	available := append([]*Auth(nil), availableByPriority[targetPriority]...)
-	if len(available) > 1 {
-		sort.Slice(available, func(i, j int) bool { return available[i].ID < available[j].ID })
-	}
-	return available, true
+	return nil, false
 }
 
 func getAvailableAuths(auths []*Auth, provider, model string, now time.Time, selectionAttempt int) ([]*Auth, error) {
@@ -380,24 +395,26 @@ func selectAvailableAuthsForAttemptFilteredWithPriority(auths []*Auth, provider,
 	sort.Slice(priorities, func(i, j int) bool {
 		return priorities[i] > priorities[j]
 	})
-	targetPriority, ok := selectionPriorityForAttempt(priorities, selectionAttempt)
-	if !ok {
-		return nil, &Error{Code: "auth_unavailable", Message: "no auth available"}
-	}
-
-	available := append([]*Auth(nil), availableByPriority[targetPriority]...)
-	if len(available) > 0 {
+	var earliest time.Time
+	for _, priority := range selectionPrioritiesForAttempt(priorities, selectionAttempt) {
+		available := append([]*Auth(nil), availableByPriority[priority]...)
+		if len(available) == 0 {
+			if info, ok := blockedByPriority[priority]; ok && !info.earliest.IsZero() && (earliest.IsZero() || info.earliest.Before(earliest)) {
+				earliest = info.earliest
+			}
+			continue
+		}
 		if len(available) > 1 {
 			sort.Slice(available, func(i, j int) bool { return available[i].ID < available[j].ID })
 		}
 		return available, nil
 	}
-	if info, ok := blockedByPriority[targetPriority]; ok && !info.earliest.IsZero() {
+	if !earliest.IsZero() {
 		providerForError := provider
 		if providerForError == "mixed" {
 			providerForError = ""
 		}
-		resetIn := info.earliest.Sub(now)
+		resetIn := earliest.Sub(now)
 		if resetIn < 0 {
 			resetIn = 0
 		}

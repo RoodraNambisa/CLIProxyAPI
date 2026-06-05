@@ -409,8 +409,8 @@ func (s *authScheduler) pickMixed(ctx context.Context, providers []string, model
 	sort.Slice(priorities, func(i, j int) bool {
 		return priorities[i] > priorities[j]
 	})
-	targetPriority, okPriority := selectionPriorityForAttempt(priorities, selectionAttempt)
-	if !okPriority {
+	prioritiesToTry := selectionPrioritiesForAttempt(priorities, selectionAttempt)
+	if len(prioritiesToTry) == 0 {
 		return nil, "", mixedUnavailableErrorFromShards(normalized, candidateShards, model, tried)
 	}
 
@@ -419,97 +419,103 @@ func (s *authScheduler) pickMixed(ctx context.Context, providers []string, model
 			auth        *Auth
 			providerKey string
 		}
-		candidates := make([]randomMixedCandidate, 0)
-		for providerIndex, providerKey := range normalized {
-			shard := candidateShards[providerIndex]
-			if shard == nil {
-				continue
-			}
-			for _, entry := range shard.readyEntriesAtPriorityLocked(false, targetPriority, pickPredicate) {
-				if entry == nil || entry.auth == nil {
+		for _, targetPriority := range prioritiesToTry {
+			candidates := make([]randomMixedCandidate, 0)
+			for providerIndex, providerKey := range normalized {
+				shard := candidateShards[providerIndex]
+				if shard == nil {
 					continue
 				}
-				candidates = append(candidates, randomMixedCandidate{
-					auth:        entry.auth,
-					providerKey: providerKey,
-				})
+				for _, entry := range shard.readyEntriesAtPriorityLocked(false, targetPriority, pickPredicate) {
+					if entry == nil || entry.auth == nil {
+						continue
+					}
+					candidates = append(candidates, randomMixedCandidate{
+						auth:        entry.auth,
+						providerKey: providerKey,
+					})
+				}
+			}
+			if len(candidates) > 0 {
+				picked := candidates[rand.IntN(len(candidates))]
+				return picked.auth, picked.providerKey, nil
 			}
 		}
-		if len(candidates) == 0 {
-			return nil, "", mixedUnavailableErrorFromShardsForAttempt(normalized, candidateShards, model, priorityPredicate, pickPredicate, selectionAttempt)
-		}
-		picked := candidates[rand.IntN(len(candidates))]
-		return picked.auth, picked.providerKey, nil
+		return nil, "", mixedUnavailableErrorFromShardsForAttempt(normalized, candidateShards, model, priorityPredicate, pickPredicate, selectionAttempt)
 	}
 
 	if strategy == schedulerStrategyFillFirst {
-		for providerIndex, providerKey := range normalized {
-			shard := candidateShards[providerIndex]
-			if shard == nil {
-				continue
-			}
-			picked := shard.pickReadyAtPriorityLocked(false, targetPriority, strategy, pickPredicate)
-			if picked != nil {
-				return picked, providerKey, nil
+		for _, targetPriority := range prioritiesToTry {
+			for providerIndex, providerKey := range normalized {
+				shard := candidateShards[providerIndex]
+				if shard == nil {
+					continue
+				}
+				picked := shard.pickReadyAtPriorityLocked(false, targetPriority, strategy, pickPredicate)
+				if picked != nil {
+					return picked, providerKey, nil
+				}
 			}
 		}
 		return nil, "", mixedUnavailableErrorFromShardsForAttempt(normalized, candidateShards, model, priorityPredicate, pickPredicate, selectionAttempt)
 	}
 
 	cursorKey := strings.Join(normalized, ",") + ":" + modelKey
-	weights := make([]int, len(normalized))
-	segmentStarts := make([]int, len(normalized))
-	segmentEnds := make([]int, len(normalized))
-	totalWeight := 0
-	for providerIndex, shard := range candidateShards {
-		segmentStarts[providerIndex] = totalWeight
-		if shard != nil {
-			weights[providerIndex] = shard.readyCountAtPriorityLocked(false, targetPriority, pickPredicate)
-		}
-		totalWeight += weights[providerIndex]
-		segmentEnds[providerIndex] = totalWeight
-	}
-	if totalWeight == 0 {
-		return nil, "", mixedUnavailableErrorFromShardsForAttempt(normalized, candidateShards, model, priorityPredicate, pickPredicate, selectionAttempt)
-	}
-
 	s.mixedCursorMu.Lock()
 	defer s.mixedCursorMu.Unlock()
-	startSlot := s.mixedCursors[cursorKey] % totalWeight
-	startProviderIndex := -1
-	for providerIndex := range normalized {
-		if weights[providerIndex] == 0 {
+	for _, targetPriority := range prioritiesToTry {
+		weights := make([]int, len(normalized))
+		segmentStarts := make([]int, len(normalized))
+		segmentEnds := make([]int, len(normalized))
+		totalWeight := 0
+		for providerIndex, shard := range candidateShards {
+			segmentStarts[providerIndex] = totalWeight
+			if shard != nil {
+				weights[providerIndex] = shard.readyCountAtPriorityLocked(false, targetPriority, pickPredicate)
+			}
+			totalWeight += weights[providerIndex]
+			segmentEnds[providerIndex] = totalWeight
+		}
+		if totalWeight == 0 {
 			continue
 		}
-		if startSlot < segmentEnds[providerIndex] {
-			startProviderIndex = providerIndex
-			break
-		}
-	}
-	if startProviderIndex < 0 {
-		return nil, "", mixedUnavailableErrorFromShardsForAttempt(normalized, candidateShards, model, priorityPredicate, pickPredicate, selectionAttempt)
-	}
 
-	slot := startSlot
-	for offset := 0; offset < len(normalized); offset++ {
-		providerIndex := (startProviderIndex + offset) % len(normalized)
-		if weights[providerIndex] == 0 {
+		startSlot := s.mixedCursors[cursorKey] % totalWeight
+		startProviderIndex := -1
+		for providerIndex := range normalized {
+			if weights[providerIndex] == 0 {
+				continue
+			}
+			if startSlot < segmentEnds[providerIndex] {
+				startProviderIndex = providerIndex
+				break
+			}
+		}
+		if startProviderIndex < 0 {
 			continue
 		}
-		if providerIndex != startProviderIndex {
-			slot = segmentStarts[providerIndex]
+
+		slot := startSlot
+		for offset := 0; offset < len(normalized); offset++ {
+			providerIndex := (startProviderIndex + offset) % len(normalized)
+			if weights[providerIndex] == 0 {
+				continue
+			}
+			if providerIndex != startProviderIndex {
+				slot = segmentStarts[providerIndex]
+			}
+			providerKey := normalized[providerIndex]
+			shard := candidateShards[providerIndex]
+			if shard == nil {
+				continue
+			}
+			picked := shard.pickReadyAtPriorityLocked(false, targetPriority, schedulerStrategyRoundRobin, pickPredicate)
+			if picked == nil {
+				continue
+			}
+			s.mixedCursors[cursorKey] = slot + 1
+			return picked, providerKey, nil
 		}
-		providerKey := normalized[providerIndex]
-		shard := candidateShards[providerIndex]
-		if shard == nil {
-			continue
-		}
-		picked := shard.pickReadyAtPriorityLocked(false, targetPriority, schedulerStrategyRoundRobin, pickPredicate)
-		if picked == nil {
-			continue
-		}
-		s.mixedCursors[cursorKey] = slot + 1
-		return picked, providerKey, nil
 	}
 	return nil, "", mixedUnavailableErrorFromShardsForAttempt(normalized, candidateShards, model, priorityPredicate, pickPredicate, selectionAttempt)
 }
@@ -573,18 +579,20 @@ func mixedUnavailableErrorFromShardsForAttempt(providers []string, candidateShar
 	sort.Slice(priorities, func(i, j int) bool {
 		return priorities[i] > priorities[j]
 	})
-	targetPriority, ok := selectionPriorityForAttempt(priorities, selectionAttempt)
-	if !ok {
+	prioritiesToTry := selectionPrioritiesForAttempt(priorities, selectionAttempt)
+	if len(prioritiesToTry) == 0 {
 		return mixedUnavailableErrorFromShardsWithPredicate(providers, candidateShards, model, pickPredicate)
 	}
 	now := time.Now()
 	var earliest time.Time
-	for _, shard := range candidateShards {
-		if shard == nil {
-			continue
-		}
-		if next, okNext := shard.blockedEarliestAtPriorityLocked(false, targetPriority, pickPredicate); okNext && (earliest.IsZero() || next.Before(earliest)) {
-			earliest = next
+	for _, priority := range prioritiesToTry {
+		for _, shard := range candidateShards {
+			if shard == nil {
+				continue
+			}
+			if next, okNext := shard.blockedEarliestAtPriorityLocked(false, priority, pickPredicate); okNext && (earliest.IsZero() || next.Before(earliest)) {
+				earliest = next
+			}
 		}
 	}
 	if !earliest.IsZero() {
@@ -976,11 +984,12 @@ func (m *modelScheduler) pickReadyLocked(preferWebsocket bool, strategy schedule
 	if len(priorities) == 0 {
 		return nil
 	}
-	priorityReady, okPriority := selectionPriorityForAttempt(priorities, selectionAttempt)
-	if !okPriority {
-		return nil
+	for _, priorityReady := range selectionPrioritiesForAttempt(priorities, selectionAttempt) {
+		if picked := m.pickReadyAtPriorityLocked(restrictWebsocket, priorityReady, strategy, pickPredicate); picked != nil {
+			return picked
+		}
 	}
-	return m.pickReadyAtPriorityLocked(restrictWebsocket, priorityReady, strategy, pickPredicate)
+	return nil
 }
 
 func (m *modelScheduler) readyPrioritiesLocked(preferWebsocket bool, predicate func(*scheduledAuth) bool) []int {
@@ -1209,16 +1218,18 @@ func (m *modelScheduler) unavailableErrorForAttemptLocked(provider, model string
 	if len(priorities) == 0 {
 		return m.unavailableErrorLocked(provider, model, pickPredicate)
 	}
-	targetPriority, ok := selectionPriorityForAttempt(priorities, selectionAttempt)
-	if !ok {
-		return m.unavailableErrorLocked(provider, model, pickPredicate)
+	var earliest time.Time
+	for _, priority := range selectionPrioritiesForAttempt(priorities, selectionAttempt) {
+		if next, okNext := m.blockedEarliestAtPriorityLocked(restrictWebsocket, priority, pickPredicate); okNext && (earliest.IsZero() || next.Before(earliest)) {
+			earliest = next
+		}
 	}
-	if next, okNext := m.blockedEarliestAtPriorityLocked(restrictWebsocket, targetPriority, pickPredicate); okNext {
+	if !earliest.IsZero() {
 		providerForError := provider
 		if providerForError == "mixed" {
 			providerForError = ""
 		}
-		resetIn := next.Sub(now)
+		resetIn := earliest.Sub(now)
 		if resetIn < 0 {
 			resetIn = 0
 		}
