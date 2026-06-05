@@ -90,6 +90,92 @@ func TestRoundRobinSelectorPick_PriorityBuckets(t *testing.T) {
 	}
 }
 
+func TestRoundRobinSelectorPick_CodexWebsocketPreferenceUsesWebsocketPriorities(t *testing.T) {
+	t.Parallel()
+
+	selector := &RoundRobinSelector{}
+	auths := []*Auth{
+		{ID: "codex-http", Attributes: map[string]string{"priority": "10"}},
+		{ID: "codex-ws", Attributes: map[string]string{"priority": "0", "websockets": "true"}},
+	}
+
+	ctx := cliproxyexecutor.WithDownstreamWebsocket(context.Background())
+	got, err := selector.Pick(ctx, "codex", "", cliproxyexecutor.Options{}, auths)
+	if err != nil {
+		t.Fatalf("Pick() error = %v", err)
+	}
+	if got == nil || got.ID != "codex-ws" {
+		t.Fatalf("Pick() auth = %v, want codex-ws", got)
+	}
+}
+
+func TestRoundRobinSelectorPick_CodexWebsocketFallsBackWhenNoWebsocketReady(t *testing.T) {
+	t.Parallel()
+
+	selector := &RoundRobinSelector{}
+	auths := []*Auth{
+		{ID: "codex-http", Attributes: map[string]string{"priority": "10"}},
+		{
+			ID:             "codex-ws-cooling",
+			Attributes:     map[string]string{"priority": "0", "websockets": "true"},
+			Unavailable:    true,
+			NextRetryAfter: time.Now().Add(time.Minute),
+		},
+	}
+
+	ctx := cliproxyexecutor.WithDownstreamWebsocket(context.Background())
+	got, err := selector.Pick(ctx, "codex", "", cliproxyexecutor.Options{}, auths)
+	if err != nil {
+		t.Fatalf("Pick() error = %v", err)
+	}
+	if got == nil || got.ID != "codex-http" {
+		t.Fatalf("Pick() auth = %v, want codex-http", got)
+	}
+}
+
+func TestSelectAvailableAuthsForAttemptFilteredWithPickablePriorityIgnoresTriedReadyWebsocket(t *testing.T) {
+	t.Parallel()
+
+	auths := []*Auth{
+		{ID: "codex-ws-high", Attributes: map[string]string{"priority": "10", "websockets": "true"}},
+		{ID: "codex-ws-low", Attributes: map[string]string{"priority": "0", "websockets": "true"}},
+	}
+	got, err := selectAvailableAuthsForAttemptFilteredWithPickablePriority(auths, "codex", "", time.Now(), 0, nil, func(auth *Auth) bool {
+		return auth.ID != "codex-ws-high"
+	})
+	if err != nil {
+		t.Fatalf("selectAvailableAuthsForAttemptFilteredWithPickablePriority() error = %v", err)
+	}
+	if len(got) != 1 || got[0].ID != "codex-ws-low" {
+		t.Fatalf("available auths = %v, want [codex-ws-low]", got)
+	}
+}
+
+func TestSessionAffinitySelector_CodexWebsocketIgnoresHTTPCacheWhenWebsocketReady(t *testing.T) {
+	t.Parallel()
+
+	selector := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{
+		Fallback: &RoundRobinSelector{},
+		TTL:      time.Minute,
+	})
+	t.Cleanup(selector.Stop)
+	auths := []*Auth{
+		{ID: "codex-http", Attributes: map[string]string{"priority": "10"}},
+		{ID: "codex-ws", Attributes: map[string]string{"priority": "0", "websockets": "true"}},
+	}
+	opts := cliproxyexecutor.Options{Headers: http.Header{"Session-Id": {"session-websocket"}}}
+	selector.cache.Set("codex::codex:session-websocket::test-model", "codex-http")
+
+	ctx := cliproxyexecutor.WithDownstreamWebsocket(context.Background())
+	got, err := selector.Pick(ctx, "codex", "test-model", opts, auths)
+	if err != nil {
+		t.Fatalf("Pick() error = %v", err)
+	}
+	if got == nil || got.ID != "codex-ws" {
+		t.Fatalf("Pick() auth = %v, want codex-ws", got)
+	}
+}
+
 func TestFillFirstSelectorPick_PriorityFallbackCooldown(t *testing.T) {
 	t.Parallel()
 
@@ -113,15 +199,24 @@ func TestFillFirstSelectorPick_PriorityFallbackCooldown(t *testing.T) {
 	}
 	low := &Auth{ID: "low", Attributes: map[string]string{"priority": "0"}}
 
-	got, err := selector.Pick(context.Background(), "mixed", model, cliproxyexecutor.Options{}, []*Auth{high, low})
+	_, err := selector.Pick(context.Background(), "mixed", model, cliproxyexecutor.Options{}, []*Auth{high, low})
+	if err == nil {
+		t.Fatal("Pick() error = nil, want cooldown error for target priority")
+	}
+	var cooldownErr *modelCooldownError
+	if !errors.As(err, &cooldownErr) {
+		t.Fatalf("Pick() error = %T, want *modelCooldownError", err)
+	}
+
+	retryOpts := cliproxyexecutor.Options{
+		Metadata: map[string]any{cliproxyexecutor.SelectionAttemptMetadataKey: 1},
+	}
+	got, err := selector.Pick(context.Background(), "mixed", model, retryOpts, []*Auth{high, low})
 	if err != nil {
-		t.Fatalf("Pick() error = %v", err)
+		t.Fatalf("Pick() retry error = %v", err)
 	}
-	if got == nil {
-		t.Fatalf("Pick() auth = nil")
-	}
-	if got.ID != "low" {
-		t.Fatalf("Pick() auth.ID = %q, want %q", got.ID, "low")
+	if got == nil || got.ID != "low" {
+		t.Fatalf("Pick() retry auth = %v, want low", got)
 	}
 }
 
@@ -380,15 +475,24 @@ func TestFillFirstSelectorPick_ThinkingSuffixFallsBackToBaseModelState(t *testin
 		Attributes: map[string]string{"priority": "0"},
 	}
 
-	got, err := selector.Pick(context.Background(), "mixed", requestedModel, cliproxyexecutor.Options{}, []*Auth{high, low})
+	_, err := selector.Pick(context.Background(), "mixed", requestedModel, cliproxyexecutor.Options{}, []*Auth{high, low})
+	if err == nil {
+		t.Fatal("Pick() error = nil, want cooldown error for target priority")
+	}
+	var cooldownErr *modelCooldownError
+	if !errors.As(err, &cooldownErr) {
+		t.Fatalf("Pick() error = %T, want *modelCooldownError", err)
+	}
+
+	retryOpts := cliproxyexecutor.Options{
+		Metadata: map[string]any{cliproxyexecutor.SelectionAttemptMetadataKey: 1},
+	}
+	got, err := selector.Pick(context.Background(), "mixed", requestedModel, retryOpts, []*Auth{high, low})
 	if err != nil {
-		t.Fatalf("Pick() error = %v", err)
+		t.Fatalf("Pick() retry error = %v", err)
 	}
-	if got == nil {
-		t.Fatalf("Pick() auth = nil")
-	}
-	if got.ID != "low" {
-		t.Fatalf("Pick() auth.ID = %q, want %q", got.ID, "low")
+	if got == nil || got.ID != "low" {
+		t.Fatalf("Pick() retry auth = %v, want low", got)
 	}
 }
 
@@ -559,6 +663,7 @@ func TestSessionAffinitySelector_SameSessionSameAuth(t *testing.T) {
 
 	fallback := &RoundRobinSelector{}
 	selector := NewSessionAffinitySelector(fallback)
+	t.Cleanup(selector.Stop)
 
 	auths := []*Auth{
 		{ID: "auth-a"},
@@ -596,6 +701,7 @@ func TestSessionAffinitySelector_NoSessionFallback(t *testing.T) {
 
 	fallback := &FillFirstSelector{}
 	selector := NewSessionAffinitySelector(fallback)
+	t.Cleanup(selector.Stop)
 
 	auths := []*Auth{
 		{ID: "auth-b"},
@@ -621,6 +727,7 @@ func TestSessionAffinitySelector_DifferentSessionsDifferentAuths(t *testing.T) {
 
 	fallback := &RoundRobinSelector{}
 	selector := NewSessionAffinitySelector(fallback)
+	t.Cleanup(selector.Stop)
 
 	auths := []*Auth{
 		{ID: "auth-a"},

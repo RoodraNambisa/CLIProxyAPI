@@ -88,14 +88,15 @@ force-model-prefix: false
 # Default is false (disabled).
 passthrough-headers: false
 
-# Number of times to retry a request. Retries will occur if the HTTP response code is 403, 408, 500, 502, 503, or 504.
+# Number of additional request rounds after retryable execution failures.
+# Each request round targets the next lower credential priority when available.
 request-retry: 3
 
-# Maximum number of different credentials to try for one failed request.
-# Set to 0 to keep legacy behavior (try all available credentials).
+# Maximum number of different credentials to try in each request round.
+# Set to 0 to try all available credentials in the current target priority.
 max-retry-credentials: 0
 
-# Maximum wait time in seconds for a cooled-down credential before triggering a retry.
+# Maximum wait time in seconds for current target-priority cooldown recovery before moving to the next request round.
 max-retry-interval: 30
 
 # When true, disable auth/model cooldown scheduling globally (prevents blackout windows after failure states).

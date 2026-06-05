@@ -2,7 +2,9 @@ package auth
 
 import (
 	"context"
+	"errors"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -68,6 +70,12 @@ func registerSchedulerModels(t *testing.T, provider string, model string, authID
 			reg.UnregisterClient(authID)
 		}
 	})
+}
+
+func schedulerTestID(t *testing.T, prefix string) string {
+	t.Helper()
+	name := strings.NewReplacer("/", "-", " ", "-", "_", "-").Replace(t.Name())
+	return prefix + "-" + name
 }
 
 func TestSchedulerPick_RoundRobinHighestPriority(t *testing.T) {
@@ -337,6 +345,110 @@ func TestSchedulerPick_CodexWebsocketPrefersWebsocketEnabledAcrossPriorities(t *
 		if got.ID != wantID {
 			t.Fatalf("pickSingle() #%d auth.ID = %q, want %q", index, got.ID, wantID)
 		}
+	}
+}
+
+func TestSchedulerPick_CodexWebsocketFallsBackWhenOnlyWebsocketCandidatesBlocked(t *testing.T) {
+	t.Parallel()
+
+	scheduler := newSchedulerForTest(
+		&RoundRobinSelector{},
+		&Auth{ID: "codex-http", Provider: "codex", Attributes: map[string]string{"priority": "10"}},
+		&Auth{
+			ID:             "codex-ws-cooling",
+			Provider:       "codex",
+			Attributes:     map[string]string{"priority": "0", "websockets": "true"},
+			Unavailable:    true,
+			NextRetryAfter: time.Now().Add(time.Minute),
+		},
+	)
+
+	ctx := cliproxyexecutor.WithDownstreamWebsocket(context.Background())
+	got, errPick := scheduler.pickSingle(ctx, "codex", "", cliproxyexecutor.Options{}, nil)
+	if errPick != nil {
+		t.Fatalf("pickSingle() error = %v", errPick)
+	}
+	if got == nil {
+		t.Fatal("pickSingle() auth = nil")
+	}
+	if got.ID != "codex-http" {
+		t.Fatalf("pickSingle() auth.ID = %q, want codex-http", got.ID)
+	}
+}
+
+func TestSchedulerPick_CodexWebsocketDoesNotFallbackToHTTPWithinRestrictedPriority(t *testing.T) {
+	t.Parallel()
+
+	scheduler := newSchedulerForTest(
+		&RoundRobinSelector{},
+		&Auth{ID: "codex-http", Provider: "codex", Attributes: map[string]string{"priority": "10"}},
+		&Auth{
+			ID:             "codex-ws-cooling",
+			Provider:       "codex",
+			Attributes:     map[string]string{"priority": "10", "websockets": "true"},
+			Unavailable:    true,
+			NextRetryAfter: time.Now().Add(time.Minute),
+		},
+		&Auth{ID: "codex-ws-ready", Provider: "codex", Attributes: map[string]string{"priority": "0", "websockets": "true"}},
+	)
+
+	ctx := cliproxyexecutor.WithDownstreamWebsocket(context.Background())
+	_, errPick := scheduler.pickSingle(ctx, "codex", "", cliproxyexecutor.Options{}, nil)
+	if errPick == nil {
+		t.Fatal("pickSingle() error = nil, want cooldown at restricted websocket priority")
+	}
+	var cooldownErr *modelCooldownError
+	if !errors.As(errPick, &cooldownErr) {
+		t.Fatalf("pickSingle() error = %T, want *modelCooldownError", errPick)
+	}
+
+	got, errPick := scheduler.pickSingle(ctx, "codex", "", cliproxyexecutor.Options{
+		Metadata: map[string]any{cliproxyexecutor.SelectionAttemptMetadataKey: 1},
+	}, nil)
+	if errPick != nil {
+		t.Fatalf("pickSingle() attempt 1 error = %v", errPick)
+	}
+	if got == nil || got.ID != "codex-ws-ready" {
+		t.Fatalf("pickSingle() attempt 1 auth = %v, want codex-ws-ready", got)
+	}
+}
+
+func TestSchedulerPick_CodexWebsocketFallsBackToHTTPAfterWebsocketTried(t *testing.T) {
+	t.Parallel()
+
+	scheduler := newSchedulerForTest(
+		&RoundRobinSelector{},
+		&Auth{ID: "codex-http", Provider: "codex", Attributes: map[string]string{"priority": "10"}},
+		&Auth{ID: "codex-ws", Provider: "codex", Attributes: map[string]string{"priority": "10", "websockets": "true"}},
+	)
+
+	ctx := cliproxyexecutor.WithDownstreamWebsocket(context.Background())
+	got, errPick := scheduler.pickSingle(ctx, "codex", "", cliproxyexecutor.Options{}, map[string]struct{}{"codex-ws": {}})
+	if errPick != nil {
+		t.Fatalf("pickSingle() error = %v", errPick)
+	}
+	if got == nil || got.ID != "codex-http" {
+		t.Fatalf("pickSingle() auth = %v, want codex-http", got)
+	}
+}
+
+func TestSchedulerPick_CodexWebsocketTriedReadyDoesNotHoldRestrictedPriority(t *testing.T) {
+	t.Parallel()
+
+	scheduler := newSchedulerForTest(
+		&RoundRobinSelector{},
+		&Auth{ID: "codex-http", Provider: "codex", Attributes: map[string]string{"priority": "10"}},
+		&Auth{ID: "codex-ws-high", Provider: "codex", Attributes: map[string]string{"priority": "10", "websockets": "true"}},
+		&Auth{ID: "codex-ws-low", Provider: "codex", Attributes: map[string]string{"priority": "0", "websockets": "true"}},
+	)
+
+	ctx := cliproxyexecutor.WithDownstreamWebsocket(context.Background())
+	got, errPick := scheduler.pickSingle(ctx, "codex", "", cliproxyexecutor.Options{}, map[string]struct{}{"codex-ws-high": {}})
+	if errPick != nil {
+		t.Fatalf("pickSingle() error = %v", errPick)
+	}
+	if got == nil || got.ID != "codex-ws-low" {
+		t.Fatalf("pickSingle() auth = %v, want codex-ws-low", got)
 	}
 }
 
@@ -626,46 +738,49 @@ func TestManager_SchedulerTracksMarkResultCooldownAndRecovery(t *testing.T) {
 	t.Parallel()
 
 	manager := NewManager(nil, &RoundRobinSelector{}, nil)
+	model := schedulerTestID(t, "test-model")
+	authA := schedulerTestID(t, "auth-a")
+	authB := schedulerTestID(t, "auth-b")
 	reg := registry.GetGlobalRegistry()
-	reg.RegisterClient("auth-a", "gemini", []*registry.ModelInfo{{ID: "test-model"}})
-	reg.RegisterClient("auth-b", "gemini", []*registry.ModelInfo{{ID: "test-model"}})
+	reg.RegisterClient(authA, "gemini", []*registry.ModelInfo{{ID: model}})
+	reg.RegisterClient(authB, "gemini", []*registry.ModelInfo{{ID: model}})
 	t.Cleanup(func() {
-		reg.UnregisterClient("auth-a")
-		reg.UnregisterClient("auth-b")
+		reg.UnregisterClient(authA)
+		reg.UnregisterClient(authB)
 	})
-	if _, errRegister := manager.Register(context.Background(), &Auth{ID: "auth-a", Provider: "gemini"}); errRegister != nil {
-		t.Fatalf("Register(auth-a) error = %v", errRegister)
+	if _, errRegister := manager.Register(context.Background(), &Auth{ID: authA, Provider: "gemini"}); errRegister != nil {
+		t.Fatalf("Register(%s) error = %v", authA, errRegister)
 	}
-	if _, errRegister := manager.Register(context.Background(), &Auth{ID: "auth-b", Provider: "gemini"}); errRegister != nil {
-		t.Fatalf("Register(auth-b) error = %v", errRegister)
+	if _, errRegister := manager.Register(context.Background(), &Auth{ID: authB, Provider: "gemini"}); errRegister != nil {
+		t.Fatalf("Register(%s) error = %v", authB, errRegister)
 	}
 
 	manager.MarkResult(context.Background(), Result{
-		AuthID:   "auth-a",
+		AuthID:   authA,
 		Provider: "gemini",
-		Model:    "test-model",
+		Model:    model,
 		Success:  false,
 		Error:    &Error{HTTPStatus: 429, Message: "quota"},
 	})
 
-	got, errPick := manager.scheduler.pickSingle(context.Background(), "gemini", "test-model", cliproxyexecutor.Options{}, nil)
+	got, errPick := manager.scheduler.pickSingle(context.Background(), "gemini", model, cliproxyexecutor.Options{}, nil)
 	if errPick != nil {
 		t.Fatalf("scheduler.pickSingle() after cooldown error = %v", errPick)
 	}
-	if got == nil || got.ID != "auth-b" {
-		t.Fatalf("scheduler.pickSingle() after cooldown auth = %v, want auth-b", got)
+	if got == nil || got.ID != authB {
+		t.Fatalf("scheduler.pickSingle() after cooldown auth = %v, want %s", got, authB)
 	}
 
 	manager.MarkResult(context.Background(), Result{
-		AuthID:   "auth-a",
+		AuthID:   authA,
 		Provider: "gemini",
-		Model:    "test-model",
+		Model:    model,
 		Success:  true,
 	})
 
 	seen := make(map[string]struct{}, 2)
 	for index := 0; index < 2; index++ {
-		got, errPick = manager.scheduler.pickSingle(context.Background(), "gemini", "test-model", cliproxyexecutor.Options{}, nil)
+		got, errPick = manager.scheduler.pickSingle(context.Background(), "gemini", model, cliproxyexecutor.Options{}, nil)
 		if errPick != nil {
 			t.Fatalf("scheduler.pickSingle() after recovery #%d error = %v", index, errPick)
 		}
@@ -683,35 +798,37 @@ func TestManager_SchedulerPreservesSupportedModelsAcrossMarkResult(t *testing.T)
 	t.Parallel()
 
 	manager := NewManager(nil, &RoundRobinSelector{}, nil)
-	if _, errRegister := manager.Register(context.Background(), &Auth{ID: "auth-a", Provider: "gemini"}); errRegister != nil {
-		t.Fatalf("Register(auth-a) error = %v", errRegister)
+	model := schedulerTestID(t, "test-model")
+	authID := schedulerTestID(t, "auth-a")
+	if _, errRegister := manager.Register(context.Background(), &Auth{ID: authID, Provider: "gemini"}); errRegister != nil {
+		t.Fatalf("Register(%s) error = %v", authID, errRegister)
 	}
 
-	registerSchedulerModels(t, "gemini", "test-model", "auth-a")
-	manager.RefreshSchedulerEntry("auth-a")
+	registerSchedulerModels(t, "gemini", model, authID)
+	manager.RefreshSchedulerEntry(authID)
 
-	got, errPick := manager.scheduler.pickSingle(context.Background(), "gemini", "test-model", cliproxyexecutor.Options{}, nil)
+	got, errPick := manager.scheduler.pickSingle(context.Background(), "gemini", model, cliproxyexecutor.Options{}, nil)
 	if errPick != nil {
 		t.Fatalf("pickSingle() before registry drift error = %v", errPick)
 	}
-	if got == nil || got.ID != "auth-a" {
-		t.Fatalf("pickSingle() before registry drift auth = %v, want auth-a", got)
+	if got == nil || got.ID != authID {
+		t.Fatalf("pickSingle() before registry drift auth = %v, want %s", got, authID)
 	}
 
-	registry.GetGlobalRegistry().UnregisterClient("auth-a")
+	registry.GetGlobalRegistry().UnregisterClient(authID)
 
 	manager.MarkResult(context.Background(), Result{
-		AuthID:   "auth-a",
+		AuthID:   authID,
 		Provider: "gemini",
-		Model:    "test-model",
+		Model:    model,
 		Success:  true,
 	})
 
-	got, errPick = manager.scheduler.pickSingle(context.Background(), "gemini", "test-model", cliproxyexecutor.Options{}, nil)
+	got, errPick = manager.scheduler.pickSingle(context.Background(), "gemini", model, cliproxyexecutor.Options{}, nil)
 	if errPick != nil {
 		t.Fatalf("pickSingle() after state-only update error = %v", errPick)
 	}
-	if got == nil || got.ID != "auth-a" {
-		t.Fatalf("pickSingle() after state-only update auth = %v, want auth-a", got)
+	if got == nil || got.ID != authID {
+		t.Fatalf("pickSingle() after state-only update auth = %v, want %s", got, authID)
 	}
 }

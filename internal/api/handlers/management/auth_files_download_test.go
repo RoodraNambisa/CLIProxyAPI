@@ -45,7 +45,6 @@ func unzipAuthArchive(t *testing.T, data []byte) map[string]string {
 
 func TestDownloadAuthFile_ReturnsFile(t *testing.T) {
 	t.Setenv("MANAGEMENT_PASSWORD", "")
-	gin.SetMode(gin.TestMode)
 
 	authDir := t.TempDir()
 	fileName := "download-user.json"
@@ -71,7 +70,6 @@ func TestDownloadAuthFile_ReturnsFile(t *testing.T) {
 
 func TestDownloadAuthFilesArchive_ReturnsSelectedFiles(t *testing.T) {
 	t.Setenv("MANAGEMENT_PASSWORD", "")
-	gin.SetMode(gin.TestMode)
 
 	authDir := t.TempDir()
 	files := map[string]string{
@@ -120,7 +118,6 @@ func TestDownloadAuthFilesArchive_ReturnsSelectedFiles(t *testing.T) {
 
 func TestDownloadAuthFilesArchive_ReturnsAllFiles(t *testing.T) {
 	t.Setenv("MANAGEMENT_PASSWORD", "")
-	gin.SetMode(gin.TestMode)
 
 	authDir := t.TempDir()
 	files := map[string]string{
@@ -165,7 +162,6 @@ func TestDownloadAuthFilesArchive_ReturnsAllFiles(t *testing.T) {
 
 func TestDownloadAuthFilesArchive_RejectsInvalidPayload(t *testing.T) {
 	t.Setenv("MANAGEMENT_PASSWORD", "")
-	gin.SetMode(gin.TestMode)
 
 	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, nil)
 
@@ -191,7 +187,6 @@ func TestDownloadAuthFilesArchive_RejectsInvalidPayload(t *testing.T) {
 
 func TestDownloadAuthFilesArchive_ReturnsNotFoundWhenRequestedFileMissing(t *testing.T) {
 	t.Setenv("MANAGEMENT_PASSWORD", "")
-	gin.SetMode(gin.TestMode)
 
 	authDir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(authDir, "alpha.json"), []byte(`{"type":"codex"}`), 0o600); err != nil {
@@ -219,7 +214,6 @@ func TestDownloadAuthFilesArchive_ReturnsNotFoundWhenRequestedFileMissing(t *tes
 
 func TestDownloadAuthFile_RejectsPathSeparators(t *testing.T) {
 	t.Setenv("MANAGEMENT_PASSWORD", "")
-	gin.SetMode(gin.TestMode)
 
 	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, nil)
 

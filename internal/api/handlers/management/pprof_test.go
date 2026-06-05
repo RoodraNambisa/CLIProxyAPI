@@ -11,7 +11,6 @@ import (
 )
 
 func TestGetPprofProfile_Disabled(t *testing.T) {
-	gin.SetMode(gin.TestMode)
 	handler := NewHandlerWithoutConfigFilePath(&config.Config{}, nil)
 	rec := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(rec)
@@ -29,7 +28,6 @@ func TestGetPprofProfile_Disabled(t *testing.T) {
 }
 
 func TestGetPprofProfile_GoroutineText(t *testing.T) {
-	gin.SetMode(gin.TestMode)
 	handler := NewHandlerWithoutConfigFilePath(&config.Config{Pprof: config.PprofConfig{Enable: true}}, nil)
 	rec := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(rec)
@@ -47,7 +45,6 @@ func TestGetPprofProfile_GoroutineText(t *testing.T) {
 }
 
 func TestGetPprofConfigReportsCapabilities(t *testing.T) {
-	gin.SetMode(gin.TestMode)
 	handler := NewHandlerWithoutConfigFilePath(&config.Config{Pprof: config.PprofConfig{Enable: true, Addr: "127.0.0.1:8316"}}, nil)
 	rec := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(rec)

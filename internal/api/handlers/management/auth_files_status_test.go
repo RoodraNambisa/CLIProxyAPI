@@ -20,7 +20,6 @@ import (
 
 func TestPatchAuthFileStatus_InvokesAuthStatusHook(t *testing.T) {
 	t.Setenv("MANAGEMENT_PASSWORD", "")
-	gin.SetMode(gin.TestMode)
 
 	manager := coreauth.NewManager(nil, nil, nil)
 	record := &coreauth.Auth{
@@ -67,7 +66,6 @@ func TestPatchAuthFileStatus_InvokesAuthStatusHook(t *testing.T) {
 
 func TestPatchAuthFileStatus_DisableSetsMetadataDisabled(t *testing.T) {
 	t.Setenv("MANAGEMENT_PASSWORD", "")
-	gin.SetMode(gin.TestMode)
 
 	manager := coreauth.NewManager(nil, nil, nil)
 	record := &coreauth.Auth{
@@ -468,7 +466,6 @@ func TestUpsertAuthRecord_PreservesVertexMetadataAndCooldownStateForSameSourceRe
 
 func TestPatchAuthFileStatus_ReenableClearsCooldownState(t *testing.T) {
 	t.Setenv("MANAGEMENT_PASSWORD", "")
-	gin.SetMode(gin.TestMode)
 
 	manager := coreauth.NewManager(nil, nil, nil)
 	record := &coreauth.Auth{

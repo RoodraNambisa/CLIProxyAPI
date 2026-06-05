@@ -80,12 +80,12 @@ type Config struct {
 	// When <= 0, the default worker count is used.
 	AuthAutoRefreshWorkers int `yaml:"auth-auto-refresh-workers" json:"auth-auto-refresh-workers"`
 
-	// RequestRetry defines the retry times when the request failed.
+	// RequestRetry defines additional request rounds after a retryable execution failure.
 	RequestRetry int `yaml:"request-retry" json:"request-retry"`
-	// MaxRetryCredentials defines the maximum number of credentials to try for a failed request.
-	// Set to 0 or a negative value to keep trying all available credentials (legacy behavior).
+	// MaxRetryCredentials defines the maximum number of credentials to try in each request round.
+	// Set to 0 or a negative value to try all available credentials in the target priority.
 	MaxRetryCredentials int `yaml:"max-retry-credentials" json:"max-retry-credentials"`
-	// MaxRetryInterval defines the maximum wait time in seconds before retrying a cooled-down credential.
+	// MaxRetryInterval defines the maximum wait time in seconds for target-priority cooldown recovery.
 	MaxRetryInterval int `yaml:"max-retry-interval" json:"max-retry-interval"`
 
 	// QuotaExceeded defines the behavior when a quota is exceeded.

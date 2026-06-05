@@ -51,6 +51,10 @@ const (
 	blockReasonOther
 )
 
+type priorityBlockInfo struct {
+	earliest time.Time
+}
+
 type modelCooldownError struct {
 	model    string
 	resetIn  time.Duration
@@ -180,48 +184,21 @@ func authWebsocketsEnabled(auth *Auth) bool {
 	return false
 }
 
-func preferCodexWebsocketAuths(ctx context.Context, provider string, available []*Auth) []*Auth {
-	if len(available) == 0 {
-		return available
-	}
-	if !cliproxyexecutor.DownstreamWebsocket(ctx) {
-		return available
-	}
-	if !strings.EqualFold(strings.TrimSpace(provider), "codex") {
-		return available
-	}
-
-	wsEnabled := make([]*Auth, 0, len(available))
-	for i := 0; i < len(available); i++ {
-		candidate := available[i]
-		if authWebsocketsEnabled(candidate) {
-			wsEnabled = append(wsEnabled, candidate)
-		}
-	}
-	if len(wsEnabled) > 0 {
-		return wsEnabled
-	}
-	return available
+func shouldPreferCodexWebsocket(ctx context.Context, provider string) bool {
+	return cliproxyexecutor.DownstreamWebsocket(ctx) && strings.EqualFold(strings.TrimSpace(provider), "codex")
 }
 
-func collectAvailableByPriority(auths []*Auth, model string, now time.Time) (available map[int][]*Auth, cooldownCount int, earliest time.Time) {
-	available = make(map[int][]*Auth)
-	for i := 0; i < len(auths); i++ {
-		candidate := auths[i]
-		blocked, reason, next := isAuthBlockedForModel(candidate, model, now)
-		if !blocked {
-			priority := authPriority(candidate)
-			available[priority] = append(available[priority], candidate)
+func hasReadyCodexWebsocketAuth(auths []*Auth, model string, now time.Time) bool {
+	for _, auth := range auths {
+		if !authWebsocketsEnabled(auth) {
 			continue
 		}
-		if reason == blockReasonCooldown {
-			cooldownCount++
-			if !next.IsZero() && (earliest.IsZero() || next.Before(earliest)) {
-				earliest = next
-			}
+		blocked, _, _ := isAuthBlockedForModel(auth, model, now)
+		if !blocked {
+			return true
 		}
 	}
-	return available, cooldownCount, earliest
+	return false
 }
 
 func selectionAttemptFromMetadata(meta map[string]any) int {
@@ -325,31 +302,108 @@ func availableAuthsForAttempt(availableByPriority map[int][]*Auth, selectionAtte
 }
 
 func getAvailableAuths(auths []*Auth, provider, model string, now time.Time, selectionAttempt int) ([]*Auth, error) {
+	return selectAvailableAuthsForAttempt(auths, provider, model, now, selectionAttempt, nil)
+}
+
+func getAvailableAuthsForContext(ctx context.Context, auths []*Auth, provider, model string, now time.Time, selectionAttempt int) ([]*Auth, error) {
+	if shouldPreferCodexWebsocket(ctx, provider) && hasReadyCodexWebsocketAuth(auths, model, now) {
+		websocketAuths := make([]*Auth, 0, len(auths))
+		for _, auth := range auths {
+			if authWebsocketsEnabled(auth) {
+				websocketAuths = append(websocketAuths, auth)
+			}
+		}
+		return selectAvailableAuthsForAttempt(websocketAuths, provider, model, now, selectionAttempt, nil)
+	}
+	return getAvailableAuths(auths, provider, model, now, selectionAttempt)
+}
+
+func selectAvailableAuthsForAttempt(auths []*Auth, provider, model string, now time.Time, selectionAttempt int, modelForAuth func(*Auth) string) ([]*Auth, error) {
+	return selectAvailableAuthsForAttemptFiltered(auths, provider, model, now, selectionAttempt, modelForAuth, nil)
+}
+
+func selectAvailableAuthsForAttemptFiltered(auths []*Auth, provider, model string, now time.Time, selectionAttempt int, modelForAuth func(*Auth) string, pickAllowed func(*Auth) bool) ([]*Auth, error) {
+	return selectAvailableAuthsForAttemptFilteredWithPriority(auths, provider, model, now, selectionAttempt, modelForAuth, pickAllowed, true)
+}
+
+func selectAvailableAuthsForAttemptFilteredWithPickablePriority(auths []*Auth, provider, model string, now time.Time, selectionAttempt int, modelForAuth func(*Auth) string, pickAllowed func(*Auth) bool) ([]*Auth, error) {
+	return selectAvailableAuthsForAttemptFilteredWithPriority(auths, provider, model, now, selectionAttempt, modelForAuth, pickAllowed, false)
+}
+
+func selectAvailableAuthsForAttemptFilteredWithPriority(auths []*Auth, provider, model string, now time.Time, selectionAttempt int, modelForAuth func(*Auth) string, pickAllowed func(*Auth) bool, preserveFilteredPriority bool) ([]*Auth, error) {
 	if len(auths) == 0 {
 		return nil, &Error{Code: "auth_not_found", Message: "no auth candidates"}
 	}
 
-	availableByPriority, cooldownCount, earliest := collectAvailableByPriority(auths, model, now)
-	if len(availableByPriority) == 0 {
-		if cooldownCount == len(auths) && !earliest.IsZero() {
-			providerForError := provider
-			if providerForError == "mixed" {
-				providerForError = ""
-			}
-			resetIn := earliest.Sub(now)
-			if resetIn < 0 {
-				resetIn = 0
-			}
-			return nil, newModelCooldownError(model, providerForError, resetIn)
+	availableByPriority := make(map[int][]*Auth)
+	blockedByPriority := make(map[int]priorityBlockInfo)
+	prioritySet := make(map[int]struct{})
+	for _, candidate := range auths {
+		priority := authPriority(candidate)
+		checkModel := model
+		if modelForAuth != nil {
+			checkModel = modelForAuth(candidate)
 		}
+		blocked, reason, next := isAuthBlockedForModel(candidate, checkModel, now)
+		allowed := pickAllowed == nil || pickAllowed(candidate)
+		if !blocked {
+			if preserveFilteredPriority || allowed {
+				prioritySet[priority] = struct{}{}
+			}
+			if allowed {
+				availableByPriority[priority] = append(availableByPriority[priority], candidate)
+			}
+			continue
+		}
+		if reason == blockReasonDisabled || next.IsZero() {
+			continue
+		}
+		if preserveFilteredPriority || allowed {
+			prioritySet[priority] = struct{}{}
+		}
+		if allowed {
+			info := blockedByPriority[priority]
+			if info.earliest.IsZero() || next.Before(info.earliest) {
+				info.earliest = next
+				blockedByPriority[priority] = info
+			}
+		}
+	}
+	if len(prioritySet) == 0 {
 		return nil, &Error{Code: "auth_unavailable", Message: "no auth available"}
 	}
 
-	available, ok := availableAuthsForAttempt(availableByPriority, selectionAttempt)
+	priorities := make([]int, 0, len(prioritySet))
+	for priority := range prioritySet {
+		priorities = append(priorities, priority)
+	}
+	sort.Slice(priorities, func(i, j int) bool {
+		return priorities[i] > priorities[j]
+	})
+	targetPriority, ok := selectionPriorityForAttempt(priorities, selectionAttempt)
 	if !ok {
 		return nil, &Error{Code: "auth_unavailable", Message: "no auth available"}
 	}
-	return available, nil
+
+	available := append([]*Auth(nil), availableByPriority[targetPriority]...)
+	if len(available) > 0 {
+		if len(available) > 1 {
+			sort.Slice(available, func(i, j int) bool { return available[i].ID < available[j].ID })
+		}
+		return available, nil
+	}
+	if info, ok := blockedByPriority[targetPriority]; ok && !info.earliest.IsZero() {
+		providerForError := provider
+		if providerForError == "mixed" {
+			providerForError = ""
+		}
+		resetIn := info.earliest.Sub(now)
+		if resetIn < 0 {
+			resetIn = 0
+		}
+		return nil, newModelCooldownError(model, providerForError, resetIn)
+	}
+	return nil, &Error{Code: "auth_unavailable", Message: "no auth available"}
 }
 
 // Pick selects the next available auth for the provider in a round-robin manner.
@@ -357,13 +411,11 @@ func getAvailableAuths(auths []*Auth, provider, model string, now time.Time, sel
 // a two-level round-robin is used: first cycling across credential groups (parent
 // accounts), then cycling within each group's project auths.
 func (s *RoundRobinSelector) Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error) {
-	_ = opts
 	now := time.Now()
-	available, err := getAvailableAuths(auths, provider, model, now, 0)
+	available, err := getAvailableAuthsForContext(ctx, auths, provider, model, now, selectionAttemptFromMetadata(opts.Metadata))
 	if err != nil {
 		return nil, err
 	}
-	available = preferCodexWebsocketAuths(ctx, provider, available)
 	key := provider + ":" + canonicalModelKey(model)
 	s.mu.Lock()
 	if s.cursors == nil {
@@ -456,23 +508,20 @@ func groupByVirtualParent(auths []*Auth) (map[string][]*Auth, []string) {
 
 // Pick selects the first available auth for the provider in a deterministic manner.
 func (s *FillFirstSelector) Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error) {
-	_ = opts
 	now := time.Now()
-	available, err := getAvailableAuths(auths, provider, model, now, 0)
+	available, err := getAvailableAuthsForContext(ctx, auths, provider, model, now, selectionAttemptFromMetadata(opts.Metadata))
 	if err != nil {
 		return nil, err
 	}
-	available = preferCodexWebsocketAuths(ctx, provider, available)
 	return available[0], nil
 }
 
 func (s *RandomSelector) Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error) {
 	now := time.Now()
-	available, err := getAvailableAuths(auths, provider, model, now, selectionAttemptFromMetadata(opts.Metadata))
+	available, err := getAvailableAuthsForContext(ctx, auths, provider, model, now, selectionAttemptFromMetadata(opts.Metadata))
 	if err != nil {
 		return nil, err
 	}
-	available = preferCodexWebsocketAuths(ctx, provider, available)
 	if len(available) == 0 {
 		return nil, &Error{Code: "auth_not_found", Message: "no auth available"}
 	}
@@ -622,7 +671,7 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 	}
 
 	now := time.Now()
-	available, err := getAvailableAuths(auths, provider, model, now, selectionAttemptFromMetadata(opts.Metadata))
+	available, err := getAvailableAuthsForContext(ctx, auths, provider, model, now, selectionAttemptFromMetadata(opts.Metadata))
 	if err != nil {
 		return nil, err
 	}
@@ -646,7 +695,7 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 			entry.Infof("session-affinity: cache hit but auth unavailable, strict failover disabled | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), cachedAuthID, provider, model)
 			return nil, err
 		}
-		auth, err := s.fallback.Pick(ctx, provider, model, opts, auths)
+		auth, err := s.fallback.Pick(ctx, provider, model, opts, available)
 		if err != nil {
 			return nil, err
 		}
@@ -668,13 +717,28 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 		}
 	}
 
-	auth, err := s.fallback.Pick(ctx, provider, model, opts, auths)
+	auth, err := s.fallback.Pick(ctx, provider, model, opts, available)
 	if err != nil {
 		return nil, err
 	}
 	s.cache.Set(cacheKey, auth.ID)
 	entry.Infof("session-affinity: cache miss, new binding | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
 	return auth, nil
+}
+
+// BindSession records the successful auth for the extracted session ID.
+func (s *SessionAffinitySelector) BindSession(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, authID string) {
+	if s == nil || s.cache == nil || authID == "" {
+		return
+	}
+	entry := selectorLogEntry(ctx)
+	primaryID, _ := extractSessionIDs(opts.Headers, opts.OriginalRequest, opts.Metadata)
+	if primaryID == "" {
+		return
+	}
+	cacheKey := provider + "::" + primaryID + "::" + model
+	s.cache.Set(cacheKey, authID)
+	entry.Infof("session-affinity: bound on success | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), authID, provider, model)
 }
 
 func selectorLogEntry(ctx context.Context) *log.Entry {

@@ -15,7 +15,6 @@ import (
 
 func TestPatchAuthFileFields_MergeHeadersAndDeleteEmptyValues(t *testing.T) {
 	t.Setenv("MANAGEMENT_PASSWORD", "")
-	gin.SetMode(gin.TestMode)
 
 	store := &memoryAuthStore{}
 	manager := coreauth.NewManager(store, nil, nil)
@@ -110,7 +109,6 @@ func TestPatchAuthFileFields_MergeHeadersAndDeleteEmptyValues(t *testing.T) {
 
 func TestPatchAuthFileFields_HeadersEmptyMapIsNoop(t *testing.T) {
 	t.Setenv("MANAGEMENT_PASSWORD", "")
-	gin.SetMode(gin.TestMode)
 
 	store := &memoryAuthStore{}
 	manager := coreauth.NewManager(store, nil, nil)

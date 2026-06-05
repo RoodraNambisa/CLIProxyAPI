@@ -23,7 +23,6 @@ import (
 )
 
 func TestCodexPlanTypeRefreshUpdatesPlanTypeAndListAuthFiles(t *testing.T) {
-	gin.SetMode(gin.TestMode)
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if got := r.Header.Get("Authorization"); got != "Bearer access-1" {
@@ -109,7 +108,6 @@ func TestCodexPlanTypeRefreshUpdatesPlanTypeAndListAuthFiles(t *testing.T) {
 }
 
 func TestCodexPlanTypeRefreshRejectsConcurrentRequests(t *testing.T) {
-	gin.SetMode(gin.TestMode)
 
 	release := make(chan struct{})
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -159,7 +157,6 @@ func TestCodexPlanTypeRefreshRejectsConcurrentRequests(t *testing.T) {
 }
 
 func TestCodexPlanTypeRefreshClearCompletedTask(t *testing.T) {
-	gin.SetMode(gin.TestMode)
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -208,7 +205,6 @@ func TestCodexPlanTypeRefreshClearCompletedTask(t *testing.T) {
 }
 
 func TestCodexPlanTypeRefreshRetriesAfterUnauthorized(t *testing.T) {
-	gin.SetMode(gin.TestMode)
 
 	var requests int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -293,7 +289,6 @@ func TestCodexPlanTypeRefreshRetriesAfterUnauthorized(t *testing.T) {
 }
 
 func TestCodexPlanTypeRefreshRetryFailedOnly(t *testing.T) {
-	gin.SetMode(gin.TestMode)
 
 	var mu sync.Mutex
 	requestsByAccount := make(map[string]int)
@@ -371,7 +366,6 @@ func TestCodexPlanTypeRefreshRetryFailedOnly(t *testing.T) {
 }
 
 func TestCodexPlanTypeRefreshPauseAndResume(t *testing.T) {
-	gin.SetMode(gin.TestMode)
 
 	firstStarted := make(chan struct{})
 	releaseFirst := make(chan struct{})

@@ -19,6 +19,9 @@ type openAICompatPoolExecutor struct {
 	executeModels     []string
 	countModels       []string
 	streamModels      []string
+	executeAuthModels []string
+	countAuthModels   []string
+	streamAuthModels  []string
 	executeErrors     map[string]error
 	countErrors       map[string]error
 	streamFirstErrors map[string]error
@@ -29,10 +32,10 @@ func (e *openAICompatPoolExecutor) Identifier() string { return e.id }
 
 func (e *openAICompatPoolExecutor) Execute(ctx context.Context, auth *Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
 	_ = ctx
-	_ = auth
 	_ = opts
 	e.mu.Lock()
 	e.executeModels = append(e.executeModels, req.Model)
+	e.executeAuthModels = append(e.executeAuthModels, auth.ID+"|"+req.Model)
 	err := e.executeErrors[req.Model]
 	e.mu.Unlock()
 	if err != nil {
@@ -43,10 +46,10 @@ func (e *openAICompatPoolExecutor) Execute(ctx context.Context, auth *Auth, req 
 
 func (e *openAICompatPoolExecutor) ExecuteStream(ctx context.Context, auth *Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
 	_ = ctx
-	_ = auth
 	_ = opts
 	e.mu.Lock()
 	e.streamModels = append(e.streamModels, req.Model)
+	e.streamAuthModels = append(e.streamAuthModels, auth.ID+"|"+req.Model)
 	err := e.streamFirstErrors[req.Model]
 	payloadChunks, hasCustomChunks := e.streamPayloads[req.Model]
 	chunks := append([]cliproxyexecutor.StreamChunk(nil), payloadChunks...)
@@ -74,10 +77,10 @@ func (e *openAICompatPoolExecutor) Refresh(_ context.Context, auth *Auth) (*Auth
 
 func (e *openAICompatPoolExecutor) CountTokens(ctx context.Context, auth *Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
 	_ = ctx
-	_ = auth
 	_ = opts
 	e.mu.Lock()
 	e.countModels = append(e.countModels, req.Model)
+	e.countAuthModels = append(e.countAuthModels, auth.ID+"|"+req.Model)
 	err := e.countErrors[req.Model]
 	e.mu.Unlock()
 	if err != nil {
@@ -114,6 +117,30 @@ func (e *openAICompatPoolExecutor) StreamModels() []string {
 	defer e.mu.Unlock()
 	out := make([]string, len(e.streamModels))
 	copy(out, e.streamModels)
+	return out
+}
+
+func (e *openAICompatPoolExecutor) ExecuteAuthModels() []string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	out := make([]string, len(e.executeAuthModels))
+	copy(out, e.executeAuthModels)
+	return out
+}
+
+func (e *openAICompatPoolExecutor) CountAuthModels() []string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	out := make([]string, len(e.countAuthModels))
+	copy(out, e.countAuthModels)
+	return out
+}
+
+func (e *openAICompatPoolExecutor) StreamAuthModels() []string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	out := make([]string, len(e.streamAuthModels))
+	copy(out, e.streamAuthModels)
 	return out
 }
 
@@ -208,6 +235,28 @@ func readOpenAICompatStreamPayload(t *testing.T, streamResult *cliproxyexecutor.
 		payload = append(payload, chunk.Payload...)
 	}
 	return string(payload)
+}
+
+func assertOpenAICompatAuthModelCalls(t *testing.T, got []string, authIDs []string, models []string) {
+	t.Helper()
+	expected := make(map[string]struct{}, len(authIDs)*len(models))
+	for _, authID := range authIDs {
+		for _, model := range models {
+			expected[authID+"|"+model] = struct{}{}
+		}
+	}
+	if len(got) != len(expected) {
+		t.Fatalf("auth/model calls = %v, want %d calls", got, len(expected))
+	}
+	for _, call := range got {
+		if _, ok := expected[call]; !ok {
+			t.Fatalf("unexpected auth/model call %q in %v", call, got)
+		}
+		delete(expected, call)
+	}
+	if len(expected) != 0 {
+		t.Fatalf("missing auth/model calls: %v", expected)
+	}
 }
 
 func TestManagerExecuteCount_OpenAICompatAliasPoolStopsOnInvalidRequest(t *testing.T) {
@@ -408,9 +457,10 @@ func TestManagerExecute_OpenAICompatAliasPoolFallsBackWithinSameAuth(t *testing.
 	}
 }
 
-func TestManagerExecute_OpenAICompatAliasPoolSharesBudgetAcrossAuthAndModelRetries(t *testing.T) {
+func TestManagerExecute_OpenAICompatAliasPoolDoesNotShareRequestRetryBudget(t *testing.T) {
 	alias := "claude-opus-4.66"
 	retryErr := &Error{HTTPStatus: http.StatusTooManyRequests, Message: "quota"}
+	models := []string{"qwen3.5-plus", "glm-5"}
 	executor := &openAICompatPoolExecutor{
 		id: "pool",
 		executeErrors: map[string]error{
@@ -447,9 +497,111 @@ func TestManagerExecute_OpenAICompatAliasPoolSharesBudgetAcrossAuthAndModelRetri
 	if err == nil {
 		t.Fatalf("expected execute error")
 	}
-	if got := executor.ExecuteModels(); len(got) != 3 {
-		t.Fatalf("execute calls = %v, want 3 total attempts under shared request budget", got)
+	if got := executor.ExecuteModels(); len(got) != 4 {
+		t.Fatalf("execute calls = %v, want 4 attempts across 2 credentials and 2 pooled models", got)
 	}
+	assertOpenAICompatAuthModelCalls(t, executor.ExecuteAuthModels(), []string{"pool-auth-" + t.Name(), secondAuth.ID}, models)
+}
+
+func TestManagerExecuteCount_OpenAICompatAliasPoolDoesNotShareRequestRetryBudget(t *testing.T) {
+	alias := "claude-opus-4.66"
+	retryErr := &Error{HTTPStatus: http.StatusTooManyRequests, Message: "quota"}
+	models := []string{"qwen3.5-plus", "glm-5"}
+	executor := &openAICompatPoolExecutor{
+		id: "pool",
+		countErrors: map[string]error{
+			"qwen3.5-plus": retryErr,
+			"glm-5":        retryErr,
+		},
+	}
+	m := newOpenAICompatPoolTestManager(t, alias, []internalconfig.OpenAICompatibilityModel{
+		{Name: "qwen3.5-plus", Alias: alias},
+		{Name: "glm-5", Alias: alias},
+	}, executor)
+	m.SetRetryConfig(0, 0, 2)
+
+	secondAuth := &Auth{
+		ID:       "pool-count-auth-second-" + t.Name(),
+		Provider: "pool",
+		Status:   StatusActive,
+		Attributes: map[string]string{
+			"api_key":      "test-key-2",
+			"compat_name":  "pool",
+			"provider_key": "pool",
+		},
+	}
+	if _, err := m.Register(context.Background(), secondAuth); err != nil {
+		t.Fatalf("register second auth: %v", err)
+	}
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient(secondAuth.ID, "pool", []*registry.ModelInfo{{ID: alias}})
+	t.Cleanup(func() {
+		reg.UnregisterClient(secondAuth.ID)
+	})
+
+	_, err := m.ExecuteCount(context.Background(), []string{"pool"}, cliproxyexecutor.Request{Model: alias}, cliproxyexecutor.Options{})
+	if err == nil {
+		t.Fatalf("expected count error")
+	}
+	if got := executor.CountModels(); len(got) != 4 {
+		t.Fatalf("count calls = %v, want 4 attempts across 2 credentials and 2 pooled models", got)
+	}
+	assertOpenAICompatAuthModelCalls(t, executor.CountAuthModels(), []string{"pool-auth-" + t.Name(), secondAuth.ID}, models)
+}
+
+func TestManagerExecuteStream_OpenAICompatAliasPoolDoesNotShareRequestRetryBudget(t *testing.T) {
+	alias := "claude-opus-4.66"
+	retryErr := &Error{HTTPStatus: http.StatusTooManyRequests, Message: "quota"}
+	models := []string{"qwen3.5-plus", "glm-5"}
+	executor := &openAICompatPoolExecutor{
+		id: "pool",
+		streamFirstErrors: map[string]error{
+			"qwen3.5-plus": retryErr,
+			"glm-5":        retryErr,
+		},
+	}
+	m := newOpenAICompatPoolTestManager(t, alias, []internalconfig.OpenAICompatibilityModel{
+		{Name: "qwen3.5-plus", Alias: alias},
+		{Name: "glm-5", Alias: alias},
+	}, executor)
+	m.SetRetryConfig(0, 0, 2)
+
+	secondAuth := &Auth{
+		ID:       "pool-stream-auth-second-" + t.Name(),
+		Provider: "pool",
+		Status:   StatusActive,
+		Attributes: map[string]string{
+			"api_key":      "test-key-2",
+			"compat_name":  "pool",
+			"provider_key": "pool",
+		},
+	}
+	if _, err := m.Register(context.Background(), secondAuth); err != nil {
+		t.Fatalf("register second auth: %v", err)
+	}
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient(secondAuth.ID, "pool", []*registry.ModelInfo{{ID: alias}})
+	t.Cleanup(func() {
+		reg.UnregisterClient(secondAuth.ID)
+	})
+
+	streamResult, err := m.ExecuteStream(context.Background(), []string{"pool"}, cliproxyexecutor.Request{Model: alias}, cliproxyexecutor.Options{})
+	if err != nil {
+		t.Fatalf("execute stream returned immediate error: %v", err)
+	}
+	var gotErr error
+	for chunk := range streamResult.Chunks {
+		if chunk.Err != nil {
+			gotErr = chunk.Err
+		}
+	}
+	if gotErr == nil {
+		t.Fatal("expected terminal stream error")
+	}
+	if got := executor.StreamModels(); len(got) != 4 {
+		t.Fatalf("stream calls = %v, want 4 attempts across 2 credentials and 2 pooled models", got)
+	}
+	assertOpenAICompatAuthModelCalls(t, executor.StreamAuthModels(), []string{"pool-auth-" + t.Name(), secondAuth.ID}, models)
 }
 
 func TestManagerExecuteStream_OpenAICompatAliasPoolRetriesOnEmptyBootstrap(t *testing.T) {

@@ -705,10 +705,11 @@ func TestExecuteStreamWithAuthManager_SelectedAuthCallbackReceivesAuthID(t *test
 	}
 }
 
-func TestExecuteStreamWithAuthManager_SharesBudgetAcrossModelFallbackAndBootstrapReplay(t *testing.T) {
+func TestExecuteStreamWithAuthManager_DoesNotShareBudgetAcrossModelFallbackAndBootstrapReplay(t *testing.T) {
 	executor := &streamBudgetPoolExecutor{}
 	manager := coreauth.NewManager(nil, nil, nil)
 	manager.SetConfig(&internalconfig.Config{
+		NoCooldownStatusCodes: []int{http.StatusTooManyRequests},
 		OpenAICompatibility: []internalconfig.OpenAICompatibility{{
 			Name: "pool",
 			Models: []internalconfig.OpenAICompatibilityModel{
@@ -740,7 +741,7 @@ func TestExecuteStreamWithAuthManager_SharesBudgetAcrossModelFallbackAndBootstra
 	})
 
 	handler := NewBaseAPIHandlers(&sdkconfig.SDKConfig{
-		Streaming: sdkconfig.StreamingConfig{BootstrapRetries: 2},
+		Streaming: sdkconfig.StreamingConfig{BootstrapRetries: 1},
 	}, manager)
 	dataChan, _, errChan := handler.ExecuteStreamWithAuthManager(context.Background(), "openai", "test-model", []byte(`{"model":"test-model"}`), "")
 	if dataChan == nil || errChan == nil {
@@ -756,10 +757,10 @@ func TestExecuteStreamWithAuthManager_SharesBudgetAcrossModelFallbackAndBootstra
 		}
 	}
 	if gotErr == nil {
-		t.Fatalf("expected terminal error after shared retry budget is exhausted")
+		t.Fatalf("expected terminal error after bootstrap retry budget is exhausted")
 	}
-	if calls := executor.Calls(); calls != 2 {
-		t.Fatalf("expected 2 stream attempts after model fallback exhausts the shared retry budget, got %d", calls)
+	if calls := executor.Calls(); calls != 4 {
+		t.Fatalf("expected 4 stream attempts across model fallback and bootstrap replay, got %d", calls)
 	}
 }
 
