@@ -23,6 +23,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 	log "github.com/sirupsen/logrus"
+	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
 
@@ -79,6 +80,11 @@ const (
 	quotaBackoffMax           = 30 * time.Minute
 )
 
+const (
+	cooldownScopeModel = "model"
+	cooldownScopeAuth  = "auth"
+)
+
 var quotaCooldownDisabled atomic.Bool
 
 // SetQuotaCooldownDisabled toggles quota cooldown scheduling globally.
@@ -109,6 +115,68 @@ func (m *Manager) cooldownSkippedForStatus(statusCode int) bool {
 		}
 	}
 	return false
+}
+
+type fixedErrorCooldownMatch struct {
+	cooldown time.Duration
+	scope    string
+}
+
+func (m *Manager) fixedErrorCooldownForResult(err *Error) (fixedErrorCooldownMatch, bool) {
+	statusCode := statusCodeFromResult(err)
+	if m == nil || err == nil || statusCode == 0 {
+		return fixedErrorCooldownMatch{}, false
+	}
+	cfg, _ := m.runtimeConfig.Load().(*internalconfig.Config)
+	if cfg == nil || len(cfg.FixedErrorCooldowns) == 0 {
+		return fixedErrorCooldownMatch{}, false
+	}
+	errorText := fixedErrorCooldownMatchText(err)
+	lowerText := strings.ToLower(errorText)
+	for _, rule := range cfg.FixedErrorCooldowns {
+		if rule.StatusCode != statusCode {
+			continue
+		}
+		needle := strings.ToLower(strings.TrimSpace(rule.MessageContains))
+		if needle != "" && !strings.Contains(lowerText, needle) {
+			continue
+		}
+		if rule.CooldownSeconds <= 0 {
+			continue
+		}
+		scope := strings.ToLower(strings.TrimSpace(rule.Scope))
+		switch scope {
+		case "", cooldownScopeModel:
+			scope = cooldownScopeModel
+		case cooldownScopeAuth:
+		default:
+			continue
+		}
+		return fixedErrorCooldownMatch{
+			cooldown: time.Duration(rule.CooldownSeconds) * time.Second,
+			scope:    scope,
+		}, true
+	}
+	return fixedErrorCooldownMatch{}, false
+}
+
+func fixedErrorCooldownMatchText(err *Error) string {
+	if err == nil {
+		return ""
+	}
+	message := strings.TrimSpace(err.Message)
+	if message == "" {
+		return ""
+	}
+	if parsed := gjson.Parse(message); parsed.Exists() {
+		if value := strings.TrimSpace(parsed.Get("error.message").String()); value != "" {
+			return value
+		}
+		if value := strings.TrimSpace(parsed.Get("message").String()); value != "" {
+			return value
+		}
+	}
+	return message
 }
 
 // Result captures execution outcome used to adjust auth state.
@@ -2695,23 +2763,26 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 					}
 
 					statusCode := statusCodeFromResult(result.Error)
-					skipCooling := m.cooldownSkippedForStatus(statusCode)
+					fixedCooldown, hasFixedCooldown := m.fixedErrorCooldownForResult(result.Error)
+					skipCooling := !hasFixedCooldown && m.cooldownSkippedForStatus(statusCode)
 					disableCooling := quotaCooldownDisabledForAuth(auth)
-					if !skipCooling {
+					if hasFixedCooldown && fixedCooldown.scope == cooldownScopeAuth && !skipCooling {
+						applyAuthWideCooldown(auth, fixedCooldown.cooldown, now, disableCooling)
+					} else if !skipCooling {
 						state.Unavailable = true
 					}
 					if isModelSupportResultError(result.Error) && !skipCooling {
-						next := now.Add(12 * time.Hour)
+						next := cooldownTime(now, 12*time.Hour, fixedCooldown, hasFixedCooldown, disableCooling)
 						state.NextRetryAfter = next
 						suspendReason = "model_not_supported"
 						shouldSuspendModel = true
-					} else if !skipCooling {
+					} else if !skipCooling && !(hasFixedCooldown && fixedCooldown.scope == cooldownScopeAuth) {
 						switch statusCode {
 						case 401:
 							if disableCooling {
 								state.NextRetryAfter = time.Time{}
 							} else {
-								next := now.Add(30 * time.Minute)
+								next := cooldownTime(now, 30*time.Minute, fixedCooldown, hasFixedCooldown, disableCooling)
 								state.NextRetryAfter = next
 								suspendReason = "unauthorized"
 								shouldSuspendModel = true
@@ -2720,7 +2791,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 							if disableCooling {
 								state.NextRetryAfter = time.Time{}
 							} else {
-								next := now.Add(30 * time.Minute)
+								next := cooldownTime(now, 30*time.Minute, fixedCooldown, hasFixedCooldown, disableCooling)
 								state.NextRetryAfter = next
 								suspendReason = "payment_required"
 								shouldSuspendModel = true
@@ -2729,7 +2800,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 							if disableCooling {
 								state.NextRetryAfter = time.Time{}
 							} else {
-								next := now.Add(12 * time.Hour)
+								next := cooldownTime(now, 12*time.Hour, fixedCooldown, hasFixedCooldown, disableCooling)
 								state.NextRetryAfter = next
 								suspendReason = "not_found"
 								shouldSuspendModel = true
@@ -2739,7 +2810,9 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 							backoffLevel := state.Quota.BackoffLevel
 							strikeCount := state.Quota.StrikeCount + 1
 							if !disableCooling {
-								if result.RetryAfter != nil {
+								if hasFixedCooldown {
+									next = cooldownTime(now, 0, fixedCooldown, true, false)
+								} else if result.RetryAfter != nil {
 									next = now.Add(*result.RetryAfter)
 								} else {
 									cooldown, nextLevel := nextQuotaCooldown(backoffLevel, disableCooling)
@@ -2766,21 +2839,28 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 							if disableCooling {
 								state.NextRetryAfter = time.Time{}
 							} else {
-								next := now.Add(1 * time.Minute)
+								next := cooldownTime(now, time.Minute, fixedCooldown, hasFixedCooldown, disableCooling)
 								state.NextRetryAfter = next
 							}
 						default:
-							state.NextRetryAfter = time.Time{}
+							if hasFixedCooldown {
+								state.NextRetryAfter = cooldownTime(now, 0, fixedCooldown, true, disableCooling)
+							} else {
+								state.NextRetryAfter = time.Time{}
+							}
 						}
 					}
 
 					auth.Status = StatusError
 					auth.UpdatedAt = now
-					updateAggregatedAvailability(auth, now)
+					if !(hasFixedCooldown && fixedCooldown.scope == cooldownScopeAuth && !skipCooling) {
+						updateAggregatedAvailability(auth, now)
+					}
 				}
 			} else {
 				statusCode := statusCodeFromResult(result.Error)
-				applyAuthFailureState(auth, result.Error, result.RetryAfter, now, m.cooldownSkippedForStatus(statusCode))
+				fixedCooldown, hasFixedCooldown := m.fixedErrorCooldownForResult(result.Error)
+				applyAuthFailureState(auth, result.Error, result.RetryAfter, now, !hasFixedCooldown && m.cooldownSkippedForStatus(statusCode), fixedCooldown, hasFixedCooldown)
 			}
 		}
 
@@ -2912,8 +2992,10 @@ func updateAggregatedAvailability(auth *Auth, now time.Time) {
 	auth.Unavailable = allUnavailable
 	if allUnavailable {
 		auth.NextRetryAfter = earliestRetry
+		auth.CooldownScope = cooldownScopeModel
 	} else {
 		auth.NextRetryAfter = time.Time{}
+		auth.CooldownScope = ""
 	}
 	if quotaExceeded {
 		auth.Quota.Exceeded = true
@@ -2936,6 +3018,7 @@ func clearAggregatedAvailability(auth *Auth) {
 	}
 	auth.Unavailable = false
 	auth.NextRetryAfter = time.Time{}
+	auth.CooldownScope = ""
 	auth.Quota = QuotaState{}
 }
 
@@ -2973,6 +3056,7 @@ func clearAuthStateOnSuccess(auth *Auth, now time.Time) {
 	auth.Quota.StrikeCount = 0
 	auth.LastError = nil
 	auth.NextRetryAfter = time.Time{}
+	auth.CooldownScope = ""
 	auth.UpdatedAt = now
 }
 
@@ -3117,7 +3201,30 @@ func isRequestInvalidError(err error) bool {
 	}
 }
 
-func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Duration, now time.Time, skipCooling bool) {
+func cooldownTime(now time.Time, defaultCooldown time.Duration, fixed fixedErrorCooldownMatch, hasFixed, disableCooling bool) time.Time {
+	if disableCooling {
+		return time.Time{}
+	}
+	cooldown := defaultCooldown
+	if hasFixed {
+		cooldown = fixed.cooldown
+	}
+	if cooldown <= 0 {
+		return time.Time{}
+	}
+	return now.Add(cooldown)
+}
+
+func applyAuthWideCooldown(auth *Auth, cooldown time.Duration, now time.Time, disableCooling bool) {
+	if auth == nil {
+		return
+	}
+	auth.Unavailable = true
+	auth.CooldownScope = cooldownScopeAuth
+	auth.NextRetryAfter = cooldownTime(now, 0, fixedErrorCooldownMatch{cooldown: cooldown}, true, disableCooling)
+}
+
+func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Duration, now time.Time, skipCooling bool, fixed fixedErrorCooldownMatch, hasFixed bool) {
 	if auth == nil {
 		return
 	}
@@ -3137,6 +3244,7 @@ func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Durati
 	}
 	disableCooling := quotaCooldownDisabledForAuth(auth)
 	auth.Unavailable = true
+	auth.CooldownScope = cooldownScopeAuth
 	statusCode := statusCodeFromResult(resultErr)
 	switch statusCode {
 	case 401:
@@ -3144,21 +3252,21 @@ func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Durati
 		if disableCooling {
 			auth.NextRetryAfter = time.Time{}
 		} else {
-			auth.NextRetryAfter = now.Add(30 * time.Minute)
+			auth.NextRetryAfter = cooldownTime(now, 30*time.Minute, fixed, hasFixed, disableCooling)
 		}
 	case 402, 403:
 		auth.StatusMessage = "payment_required"
 		if disableCooling {
 			auth.NextRetryAfter = time.Time{}
 		} else {
-			auth.NextRetryAfter = now.Add(30 * time.Minute)
+			auth.NextRetryAfter = cooldownTime(now, 30*time.Minute, fixed, hasFixed, disableCooling)
 		}
 	case 404:
 		auth.StatusMessage = "not_found"
 		if disableCooling {
 			auth.NextRetryAfter = time.Time{}
 		} else {
-			auth.NextRetryAfter = now.Add(12 * time.Hour)
+			auth.NextRetryAfter = cooldownTime(now, 12*time.Hour, fixed, hasFixed, disableCooling)
 		}
 	case 429:
 		auth.StatusMessage = "quota exhausted"
@@ -3167,7 +3275,9 @@ func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Durati
 		auth.Quota.StrikeCount++
 		var next time.Time
 		if !disableCooling {
-			if retryAfter != nil {
+			if hasFixed {
+				next = cooldownTime(now, 0, fixed, true, false)
+			} else if retryAfter != nil {
 				next = now.Add(*retryAfter)
 			} else {
 				cooldown, nextLevel := nextQuotaCooldown(auth.Quota.BackoffLevel, disableCooling)
@@ -3187,7 +3297,7 @@ func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Durati
 		if disableCooling {
 			auth.NextRetryAfter = time.Time{}
 		} else {
-			auth.NextRetryAfter = now.Add(1 * time.Minute)
+			auth.NextRetryAfter = cooldownTime(now, time.Minute, fixed, hasFixed, disableCooling)
 		}
 	default:
 		auth.Quota.Exceeded = false
@@ -3195,6 +3305,9 @@ func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Durati
 		auth.Quota.NextRecoverAt = time.Time{}
 		if auth.StatusMessage == "" {
 			auth.StatusMessage = "request failed"
+		}
+		if hasFixed {
+			auth.NextRetryAfter = cooldownTime(now, 0, fixed, true, disableCooling)
 		}
 	}
 }

@@ -113,3 +113,25 @@ func TestNormalizeStatusCodes(t *testing.T) {
 		}
 	}
 }
+
+func TestNormalizeFixedErrorCooldowns(t *testing.T) {
+	got := NormalizeFixedErrorCooldowns([]FixedErrorCooldownRule{
+		{StatusCode: 0, MessageContains: "ignored", CooldownSeconds: 60, Scope: "auth"},
+		{StatusCode: 401, MessageContains: " token invalidated ", CooldownSeconds: 3600, Scope: " AUTH "},
+		{StatusCode: 429, CooldownSeconds: 30},
+		{StatusCode: 500, CooldownSeconds: -1, Scope: "model"},
+		{StatusCode: 503, CooldownSeconds: 10, Scope: "bad"},
+	})
+	want := []FixedErrorCooldownRule{
+		{StatusCode: 401, MessageContains: "token invalidated", CooldownSeconds: 3600, Scope: "auth"},
+		{StatusCode: 429, CooldownSeconds: 30, Scope: "model"},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("rules = %#v, want %#v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("rules = %#v, want %#v", got, want)
+		}
+	}
+}

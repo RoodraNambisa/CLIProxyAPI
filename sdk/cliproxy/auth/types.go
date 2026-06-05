@@ -175,6 +175,8 @@ type Auth struct {
 	NextRefreshAfter time.Time `json:"next_refresh_after"`
 	// NextRetryAfter is the earliest time a retry should retrigger.
 	NextRetryAfter time.Time `json:"next_retry_after"`
+	// CooldownScope records whether auth-level cooldown blocks all models or reflects model aggregation.
+	CooldownScope string `json:"cooldown_scope,omitempty"`
 	// ModelStates tracks per-model runtime availability data.
 	ModelStates map[string]*ModelState `json:"model_states,omitempty"`
 

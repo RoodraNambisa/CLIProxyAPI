@@ -2008,6 +2008,119 @@ func TestManager_MarkResult_NoCooldownStatusCodeSkipsModelCooldown(t *testing.T)
 	}
 }
 
+func TestManager_MarkResult_FixedErrorCooldownScopesAuth(t *testing.T) {
+	prev := quotaCooldownDisabled.Load()
+	quotaCooldownDisabled.Store(false)
+	t.Cleanup(func() { quotaCooldownDisabled.Store(prev) })
+
+	m := NewManager(nil, nil, nil)
+	m.SetConfig(&internalconfig.Config{FixedErrorCooldowns: []internalconfig.FixedErrorCooldownRule{
+		{
+			StatusCode:      http.StatusUnauthorized,
+			MessageContains: "authentication token has been invalidated",
+			CooldownSeconds: 7200,
+			Scope:           "auth",
+		},
+	}})
+	auth := &Auth{
+		ID:       "auth-fixed-error-auth-scope",
+		Provider: "codex",
+	}
+	if _, errRegister := m.Register(context.Background(), auth); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+
+	m.MarkResult(context.Background(), Result{
+		AuthID:   auth.ID,
+		Provider: "codex",
+		Model:    "gpt-5-codex",
+		Success:  false,
+		Error: &Error{
+			Message:    `{"error":{"message":"Your authentication token has been invalidated."}}`,
+			HTTPStatus: http.StatusUnauthorized,
+		},
+	})
+
+	updated, ok := m.GetByID(auth.ID)
+	if !ok || updated == nil {
+		t.Fatal("updated auth missing")
+	}
+	if updated.CooldownScope != cooldownScopeAuth {
+		t.Fatalf("cooldown scope = %q, want %q", updated.CooldownScope, cooldownScopeAuth)
+	}
+	if updated.NextRetryAfter.IsZero() {
+		t.Fatal("expected auth next retry time")
+	}
+	remaining := time.Until(updated.NextRetryAfter)
+	if remaining < 7190*time.Second || remaining > 7210*time.Second {
+		t.Fatalf("auth cooldown remaining = %s, want about 2h", remaining)
+	}
+	blocked, _, _ := isAuthBlockedForModel(updated, "other-model", time.Now())
+	if !blocked {
+		t.Fatal("expected auth-wide cooldown to block other model")
+	}
+	state := updated.ModelStates["gpt-5-codex"]
+	if state == nil {
+		t.Fatal("expected current model state")
+	}
+	if state.Unavailable {
+		t.Fatal("expected auth-scoped fixed cooldown not to mark only the current model unavailable")
+	}
+}
+
+func TestManager_MarkResult_FixedErrorCooldownScopesModel(t *testing.T) {
+	prev := quotaCooldownDisabled.Load()
+	quotaCooldownDisabled.Store(false)
+	t.Cleanup(func() { quotaCooldownDisabled.Store(prev) })
+
+	m := NewManager(nil, nil, nil)
+	m.SetConfig(&internalconfig.Config{FixedErrorCooldowns: []internalconfig.FixedErrorCooldownRule{
+		{
+			StatusCode:      http.StatusUnauthorized,
+			MessageContains: "temporary model credential issue",
+			CooldownSeconds: 180,
+			Scope:           "model",
+		},
+	}})
+	auth := &Auth{
+		ID:       "auth-fixed-error-model-scope",
+		Provider: "codex",
+	}
+	if _, errRegister := m.Register(context.Background(), auth); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+
+	m.MarkResult(context.Background(), Result{
+		AuthID:   auth.ID,
+		Provider: "codex",
+		Model:    "gpt-5-codex",
+		Success:  false,
+		Error: &Error{
+			Message:    "temporary model credential issue",
+			HTTPStatus: http.StatusUnauthorized,
+		},
+	})
+
+	updated, ok := m.GetByID(auth.ID)
+	if !ok || updated == nil {
+		t.Fatal("updated auth missing")
+	}
+	if updated.CooldownScope == cooldownScopeAuth {
+		t.Fatalf("cooldown scope = %q, want non-auth scope", updated.CooldownScope)
+	}
+	if blocked, _, _ := isAuthBlockedForModel(updated, "other-model", time.Now()); blocked {
+		t.Fatal("expected model-scoped cooldown not to block other model")
+	}
+	state := updated.ModelStates["gpt-5-codex"]
+	if state == nil || !state.Unavailable || state.NextRetryAfter.IsZero() {
+		t.Fatalf("expected current model cooldown state, got %#v", state)
+	}
+	remaining := time.Until(state.NextRetryAfter)
+	if remaining < 170*time.Second || remaining > 190*time.Second {
+		t.Fatalf("model cooldown remaining = %s, want about 3m", remaining)
+	}
+}
+
 func TestManager_MarkResult_NoCooldownStatusCodeSkipsAuthCooldown(t *testing.T) {
 	prev := quotaCooldownDisabled.Load()
 	quotaCooldownDisabled.Store(false)

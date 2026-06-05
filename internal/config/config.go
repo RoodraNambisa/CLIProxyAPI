@@ -76,6 +76,9 @@ type Config struct {
 	// NoCooldownStatusCodes lists HTTP status codes that should record failures without scheduling auth/model cooldowns.
 	NoCooldownStatusCodes []int `yaml:"no-cooldown-status-codes" json:"no-cooldown-status-codes"`
 
+	// FixedErrorCooldowns overrides auth/model cooldown duration for matching status and error text.
+	FixedErrorCooldowns []FixedErrorCooldownRule `yaml:"fixed-error-cooldowns" json:"fixed-error-cooldowns"`
+
 	// AuthAutoRefreshWorkers overrides the size of the core auth auto-refresh worker pool.
 	// When <= 0, the default worker count is used.
 	AuthAutoRefreshWorkers int `yaml:"auth-auto-refresh-workers" json:"auth-auto-refresh-workers"`
@@ -267,6 +270,18 @@ type AuthMaintenanceConfig struct {
 	DisableQuotaExceeded bool `yaml:"disable-quota-exceeded" json:"disable-quota-exceeded"`
 	// DisableQuotaStrikeThreshold is the minimum number of 429 hits required before the disable-only path triggers.
 	DisableQuotaStrikeThreshold int `yaml:"disable-quota-strike-threshold" json:"disable-quota-strike-threshold"`
+}
+
+// FixedErrorCooldownRule defines a custom cooldown for a stable upstream error.
+type FixedErrorCooldownRule struct {
+	// StatusCode is the HTTP status code that must match the upstream error.
+	StatusCode int `yaml:"status-code" json:"status-code"`
+	// MessageContains optionally matches a substring in the upstream error message, case-insensitively.
+	MessageContains string `yaml:"message-contains,omitempty" json:"message-contains,omitempty"`
+	// CooldownSeconds is the cooldown duration applied when the rule matches. Must be greater than 0.
+	CooldownSeconds int `yaml:"cooldown-seconds" json:"cooldown-seconds"`
+	// Scope controls whether the rule cools only the model or the whole auth. Valid values: model, auth.
+	Scope string `yaml:"scope,omitempty" json:"scope,omitempty"`
 }
 
 // RoutingConfig configures how credentials are selected for requests.
@@ -782,6 +797,7 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 		cfg.MaxRetryCredentials = 0
 	}
 	cfg.NoCooldownStatusCodes = NormalizeStatusCodes(cfg.NoCooldownStatusCodes)
+	cfg.FixedErrorCooldowns = NormalizeFixedErrorCooldowns(cfg.FixedErrorCooldowns)
 
 	// Sanitize Gemini API key configuration and migrate legacy entries.
 	cfg.SanitizeGeminiKeys()
@@ -1048,6 +1064,41 @@ func NormalizeStatusCodes(codes []int) []int {
 		}
 		seen[code] = struct{}{}
 		out = append(out, code)
+	}
+	return out
+}
+
+// NormalizeFixedErrorCooldowns keeps valid custom cooldown rules in first-seen order.
+func NormalizeFixedErrorCooldowns(rules []FixedErrorCooldownRule) []FixedErrorCooldownRule {
+	if len(rules) == 0 {
+		return nil
+	}
+	out := make([]FixedErrorCooldownRule, 0, len(rules))
+	for _, rule := range rules {
+		if rule.StatusCode < 100 || rule.StatusCode > 599 {
+			continue
+		}
+		if rule.CooldownSeconds <= 0 {
+			continue
+		}
+		scope := strings.ToLower(strings.TrimSpace(rule.Scope))
+		switch scope {
+		case "", "model":
+			scope = "model"
+		case "auth":
+		default:
+			continue
+		}
+		message := strings.TrimSpace(rule.MessageContains)
+		out = append(out, FixedErrorCooldownRule{
+			StatusCode:      rule.StatusCode,
+			MessageContains: message,
+			CooldownSeconds: rule.CooldownSeconds,
+			Scope:           scope,
+		})
+	}
+	if len(out) == 0 {
+		return nil
 	}
 	return out
 }

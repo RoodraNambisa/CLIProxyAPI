@@ -48,6 +48,9 @@ func BuildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 	if !reflect.DeepEqual(oldCfg.NoCooldownStatusCodes, newCfg.NoCooldownStatusCodes) {
 		changes = append(changes, "no-cooldown-status-codes: updated")
 	}
+	if !reflect.DeepEqual(oldCfg.FixedErrorCooldowns, newCfg.FixedErrorCooldowns) {
+		changes = append(changes, "fixed-error-cooldowns: updated")
+	}
 	if oldCfg.RequestLog != newCfg.RequestLog {
 		changes = append(changes, fmt.Sprintf("request-log: %t -> %t", oldCfg.RequestLog, newCfg.RequestLog))
 	}

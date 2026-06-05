@@ -105,6 +105,13 @@ disable-cooling: false
 # HTTP status codes that should record the failure without scheduling auth/model cooldowns.
 no-cooldown-status-codes: []
 
+# Custom cooldowns for stable upstream errors. scope can be "model" or "auth".
+fixed-error-cooldowns:
+  - status-code: 401
+    message-contains: "Your authentication token has been invalidated."
+    cooldown-seconds: 2592000
+    scope: auth
+
 # Core auth auto-refresh worker pool size (OAuth/file-based auth token refresh).
 # When > 0, overrides the default worker count (16).
 # auth-auto-refresh-workers: 16

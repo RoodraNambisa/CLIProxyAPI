@@ -226,6 +226,7 @@ func TestBuildConfigChangeDetails_FlagsAndKeys(t *testing.T) {
 		UsageStatisticsEnabled: false,
 		DisableCooling:         false,
 		NoCooldownStatusCodes:  []int{429},
+		FixedErrorCooldowns:    []config.FixedErrorCooldownRule{{StatusCode: 401, MessageContains: "old", CooldownSeconds: 60, Scope: "model"}},
 		RequestRetry:           1,
 		MaxRetryCredentials:    1,
 		MaxRetryInterval:       1,
@@ -251,6 +252,7 @@ func TestBuildConfigChangeDetails_FlagsAndKeys(t *testing.T) {
 		UsageStatisticsEnabled: true,
 		DisableCooling:         true,
 		NoCooldownStatusCodes:  []int{401, 429},
+		FixedErrorCooldowns:    []config.FixedErrorCooldownRule{{StatusCode: 401, MessageContains: "new", CooldownSeconds: 3600, Scope: "auth"}},
 		RequestRetry:           2,
 		MaxRetryCredentials:    3,
 		MaxRetryInterval:       3,
@@ -290,6 +292,7 @@ func TestBuildConfigChangeDetails_FlagsAndKeys(t *testing.T) {
 	expectContains(t, details, "usage-statistics-enabled: false -> true")
 	expectContains(t, details, "disable-cooling: false -> true")
 	expectContains(t, details, "no-cooldown-status-codes: updated")
+	expectContains(t, details, "fixed-error-cooldowns: updated")
 	expectContains(t, details, "request-log: false -> true")
 	expectContains(t, details, "request-retry: 1 -> 2")
 	expectContains(t, details, "max-retry-credentials: 1 -> 3")
