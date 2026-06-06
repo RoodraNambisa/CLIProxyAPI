@@ -124,7 +124,7 @@ type fixedErrorCooldownMatch struct {
 
 func (m *Manager) fixedErrorCooldownForResult(err *Error) (fixedErrorCooldownMatch, bool) {
 	statusCode := statusCodeFromResult(err)
-	if m == nil || err == nil || statusCode == 0 {
+	if m == nil || err == nil {
 		return fixedErrorCooldownMatch{}, false
 	}
 	cfg, _ := m.runtimeConfig.Load().(*internalconfig.Config)
@@ -134,10 +134,13 @@ func (m *Manager) fixedErrorCooldownForResult(err *Error) (fixedErrorCooldownMat
 	errorText := fixedErrorCooldownMatchText(err)
 	lowerText := strings.ToLower(errorText)
 	for _, rule := range cfg.FixedErrorCooldowns {
-		if rule.StatusCode != statusCode {
+		if rule.StatusCode != 0 && rule.StatusCode != statusCode {
 			continue
 		}
 		needle := strings.ToLower(strings.TrimSpace(rule.MessageContains))
+		if rule.StatusCode == 0 && needle == "" {
+			continue
+		}
 		if needle != "" && !strings.Contains(lowerText, needle) {
 			continue
 		}

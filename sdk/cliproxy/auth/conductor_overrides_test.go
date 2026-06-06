@@ -2203,6 +2203,50 @@ func TestManager_MarkResult_FixedErrorCooldownScopesAuth(t *testing.T) {
 	}
 }
 
+func TestManager_MarkResult_FixedErrorCooldownMatchesMessageWithoutStatusCode(t *testing.T) {
+	prev := quotaCooldownDisabled.Load()
+	quotaCooldownDisabled.Store(false)
+	t.Cleanup(func() { quotaCooldownDisabled.Store(prev) })
+
+	m := NewManager(nil, nil, nil)
+	m.SetConfig(&internalconfig.Config{FixedErrorCooldowns: []internalconfig.FixedErrorCooldownRule{
+		{
+			MessageContains: "authentication token has been invalidated",
+			CooldownSeconds: 7200,
+			Scope:           "auth",
+		},
+	}})
+	auth := &Auth{
+		ID:       "auth-fixed-error-message-only",
+		Provider: "codex",
+	}
+	if _, errRegister := m.Register(context.Background(), auth); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+
+	m.MarkResult(context.Background(), Result{
+		AuthID:   auth.ID,
+		Provider: "codex",
+		Model:    "gpt-5-codex",
+		Success:  false,
+		Error: &Error{
+			Message:    `{"error":{"message":"Your authentication token has been invalidated."}}`,
+			HTTPStatus: http.StatusInternalServerError,
+		},
+	})
+
+	updated, ok := m.GetByID(auth.ID)
+	if !ok || updated == nil {
+		t.Fatal("updated auth missing")
+	}
+	if updated.CooldownScope != cooldownScopeAuth {
+		t.Fatalf("cooldown scope = %q, want %q", updated.CooldownScope, cooldownScopeAuth)
+	}
+	if updated.NextRetryAfter.IsZero() {
+		t.Fatal("expected message-only fixed cooldown to set auth next retry time")
+	}
+}
+
 func TestManager_MarkResult_ModelSuccessPreservesActiveAuthWideCooldown(t *testing.T) {
 	prev := quotaCooldownDisabled.Load()
 	quotaCooldownDisabled.Store(false)

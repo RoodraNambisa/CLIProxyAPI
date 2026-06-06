@@ -274,7 +274,8 @@ type AuthMaintenanceConfig struct {
 
 // FixedErrorCooldownRule defines a custom cooldown for a stable upstream error.
 type FixedErrorCooldownRule struct {
-	// StatusCode is the HTTP status code that must match the upstream error.
+	// StatusCode optionally restricts the rule to one HTTP status code.
+	// Set to 0 or omit it to match by message only.
 	StatusCode int `yaml:"status-code" json:"status-code"`
 	// MessageContains optionally matches a substring in the upstream error message, case-insensitively.
 	MessageContains string `yaml:"message-contains,omitempty" json:"message-contains,omitempty"`
@@ -1096,7 +1097,12 @@ func NormalizeFixedErrorCooldowns(rules []FixedErrorCooldownRule) []FixedErrorCo
 	}
 	out := make([]FixedErrorCooldownRule, 0, len(rules))
 	for _, rule := range rules {
-		if rule.StatusCode < 100 || rule.StatusCode > 599 {
+		statusCode := rule.StatusCode
+		if statusCode != 0 && (statusCode < 100 || statusCode > 599) {
+			continue
+		}
+		message := strings.TrimSpace(rule.MessageContains)
+		if statusCode == 0 && message == "" {
 			continue
 		}
 		if rule.CooldownSeconds <= 0 {
@@ -1110,9 +1116,8 @@ func NormalizeFixedErrorCooldowns(rules []FixedErrorCooldownRule) []FixedErrorCo
 		default:
 			continue
 		}
-		message := strings.TrimSpace(rule.MessageContains)
 		out = append(out, FixedErrorCooldownRule{
-			StatusCode:      rule.StatusCode,
+			StatusCode:      statusCode,
 			MessageContains: message,
 			CooldownSeconds: rule.CooldownSeconds,
 			Scope:           scope,

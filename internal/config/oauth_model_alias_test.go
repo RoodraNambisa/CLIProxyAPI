@@ -116,13 +116,15 @@ func TestNormalizeStatusCodes(t *testing.T) {
 
 func TestNormalizeFixedErrorCooldowns(t *testing.T) {
 	got := NormalizeFixedErrorCooldowns([]FixedErrorCooldownRule{
-		{StatusCode: 0, MessageContains: "ignored", CooldownSeconds: 60, Scope: "auth"},
+		{StatusCode: 0, MessageContains: " message only ", CooldownSeconds: 60, Scope: "auth"},
 		{StatusCode: 401, MessageContains: " token invalidated ", CooldownSeconds: 3600, Scope: " AUTH "},
 		{StatusCode: 429, CooldownSeconds: 30},
+		{StatusCode: 0, CooldownSeconds: 60, Scope: "auth"},
 		{StatusCode: 500, CooldownSeconds: -1, Scope: "model"},
 		{StatusCode: 503, CooldownSeconds: 10, Scope: "bad"},
 	})
 	want := []FixedErrorCooldownRule{
+		{StatusCode: 0, MessageContains: "message only", CooldownSeconds: 60, Scope: "auth"},
 		{StatusCode: 401, MessageContains: "token invalidated", CooldownSeconds: 3600, Scope: "auth"},
 		{StatusCode: 429, CooldownSeconds: 30, Scope: "model"},
 	}

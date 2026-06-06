@@ -423,6 +423,12 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
 	if !auth.LastRefreshedAt.IsZero() {
 		entry["last_refresh"] = auth.LastRefreshedAt
 	}
+	if auth.LastError != nil {
+		entry["last_error"] = auth.LastError
+		if auth.LastError.HTTPStatus > 0 {
+			entry["last_error_status_code"] = auth.LastError.HTTPStatus
+		}
+	}
 	if !auth.NextRetryAfter.IsZero() {
 		entry["next_retry_after"] = auth.NextRetryAfter
 	}

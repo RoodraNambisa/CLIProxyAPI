@@ -130,6 +130,23 @@ type releaseResponse struct {
 	Assets []releaseAsset `json:"assets"`
 }
 
+// ManagementHTMLStatus describes the local and remote management panel asset state.
+type ManagementHTMLStatus struct {
+	Disabled              bool       `json:"disabled,omitempty"`
+	AutoUpdateDisabled    bool       `json:"auto_update_disabled,omitempty"`
+	LocalExists           bool       `json:"local_exists"`
+	LocalHash             string     `json:"local_hash,omitempty"`
+	LocalModifiedAt       *time.Time `json:"local_modified_at,omitempty"`
+	RemoteHash            string     `json:"remote_hash,omitempty"`
+	RemoteDigestAvailable bool       `json:"remote_digest_available"`
+	UpdateAvailable       bool       `json:"update_available"`
+	Updated               bool       `json:"updated"`
+	CheckedAt             time.Time  `json:"checked_at"`
+	ReleaseURL            string     `json:"release_url,omitempty"`
+	AssetURL              string     `json:"asset_url,omitempty"`
+	Error                 string     `json:"error,omitempty"`
+}
+
 // StaticDir resolves the directory that stores the management control panel asset.
 func StaticDir(configFilePath string) string {
 	if override := strings.TrimSpace(os.Getenv("MANAGEMENT_STATIC_PATH")); override != "" {
@@ -180,105 +197,205 @@ func FilePath(configFilePath string) string {
 // EnsureLatestManagementHTML checks the latest management.html asset and updates the local copy when needed.
 // It coalesces concurrent sync attempts and returns whether the asset exists after the sync attempt.
 func EnsureLatestManagementHTML(ctx context.Context, staticDir string, proxyURL string, panelRepository string) bool {
+	status := UpdateManagementHTML(ctx, staticDir, proxyURL, panelRepository, false)
+	return status.LocalExists
+}
+
+// CheckManagementHTMLStatus compares the local management.html asset with the latest release metadata.
+func CheckManagementHTMLStatus(ctx context.Context, staticDir string, proxyURL string, panelRepository string) ManagementHTMLStatus {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	staticDir = strings.TrimSpace(staticDir)
+	status := ManagementHTMLStatus{
+		CheckedAt:  time.Now().UTC(),
+		ReleaseURL: resolveReleaseURL(panelRepository),
+	}
+	if staticDir == "" {
+		status.Error = "empty static directory"
+		return status
+	}
+	localPath := filepath.Join(staticDir, managementAssetName)
+
+	if info, errStat := os.Stat(localPath); errStat == nil {
+		status.LocalExists = true
+		modTime := info.ModTime().UTC()
+		status.LocalModifiedAt = &modTime
+		if hash, errHash := fileSHA256(localPath); errHash == nil {
+			status.LocalHash = hash
+		} else {
+			status.Error = fmt.Sprintf("read local management asset hash: %v", errHash)
+		}
+	} else if !errors.Is(errStat, os.ErrNotExist) {
+		status.Error = fmt.Sprintf("stat local management asset: %v", errStat)
+	}
+
+	client := newHTTPClient(proxyURL)
+	asset, remoteHash, errFetch := fetchLatestAsset(ctx, client, status.ReleaseURL)
+	if errFetch != nil {
+		remoteError := errFetch.Error()
+		if status.Error != "" {
+			status.Error = fmt.Sprintf("%s; local status error: %s", remoteError, status.Error)
+		} else {
+			status.Error = remoteError
+		}
+		return status
+	}
+	status.AssetURL = asset.BrowserDownloadURL
+	status.RemoteHash = remoteHash
+	status.RemoteDigestAvailable = remoteHash != ""
+	if !status.LocalExists {
+		status.UpdateAvailable = true
+	} else if status.LocalHash != "" && remoteHash != "" {
+		status.UpdateAvailable = !strings.EqualFold(status.LocalHash, remoteHash)
+	}
+	return status
+}
+
+// UpdateManagementHTML checks and updates the local management.html asset.
+// Set force to true for user-triggered updates that should bypass the periodic throttle.
+func UpdateManagementHTML(ctx context.Context, staticDir string, proxyURL string, panelRepository string, force bool) ManagementHTMLStatus {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 
 	staticDir = strings.TrimSpace(staticDir)
 	if staticDir == "" {
-		log.Debug("management asset sync skipped: empty static directory")
-		return false
+		return ManagementHTMLStatus{
+			CheckedAt:  time.Now().UTC(),
+			ReleaseURL: resolveReleaseURL(panelRepository),
+			Error:      "empty static directory",
+		}
 	}
 	localPath := filepath.Join(staticDir, managementAssetName)
 
-	_, _, _ = sfGroup.Do(localPath, func() (interface{}, error) {
+	result, _, _ := sfGroup.Do(localPath, func() (interface{}, error) {
 		lastUpdateCheckMu.Lock()
 		now := time.Now()
 		timeSinceLastAttempt := now.Sub(lastUpdateCheckTime)
-		if !lastUpdateCheckTime.IsZero() && timeSinceLastAttempt < managementSyncMinInterval {
+		if !force && !lastUpdateCheckTime.IsZero() && timeSinceLastAttempt < managementSyncMinInterval {
 			lastUpdateCheckMu.Unlock()
 			log.Debugf(
 				"management asset sync skipped by throttle: last attempt %v ago (interval %v)",
 				timeSinceLastAttempt.Round(time.Second),
 				managementSyncMinInterval,
 			)
-			return nil, nil
+			return localManagementHTMLStatus(staticDir, panelRepository), nil
 		}
 		lastUpdateCheckTime = now
 		lastUpdateCheckMu.Unlock()
 
-		localFileMissing := false
-		if _, errStat := os.Stat(localPath); errStat != nil {
-			if errors.Is(errStat, os.ErrNotExist) {
-				localFileMissing = true
-			} else {
-				log.WithError(errStat).Debug("failed to stat local management asset")
-			}
-		}
-
 		if errMkdirAll := os.MkdirAll(staticDir, 0o755); errMkdirAll != nil {
 			log.WithError(errMkdirAll).Warn("failed to prepare static directory for management asset")
-			return nil, nil
+			status := localManagementHTMLStatus(staticDir, panelRepository)
+			status.Error = errMkdirAll.Error()
+			return status, nil
 		}
 
-		releaseURL := resolveReleaseURL(panelRepository)
-		client := newHTTPClient(proxyURL)
-
-		localHash, err := fileSHA256(localPath)
-		if err != nil {
-			if !errors.Is(err, os.ErrNotExist) {
-				log.WithError(err).Debug("failed to read local management asset hash")
-			}
-			localHash = ""
-		}
-
-		asset, remoteHash, err := fetchLatestAsset(ctx, client, releaseURL)
-		if err != nil {
-			if localFileMissing {
-				log.WithError(err).Warn("failed to fetch latest management release information, trying fallback page")
-				if ensureFallbackManagementHTML(ctx, client, localPath) {
-					return nil, nil
+		status := CheckManagementHTMLStatus(ctx, staticDir, proxyURL, panelRepository)
+		localFileMissing := !status.LocalExists
+		if status.Error != "" {
+			if status.AssetURL == "" {
+				if localFileMissing {
+					log.WithField("error", status.Error).Warn("failed to fetch latest management release information, trying fallback page")
+					if ensureFallbackManagementHTML(ctx, newHTTPClient(proxyURL), localPath) {
+						fallbackStatus := localManagementHTMLStatus(staticDir, panelRepository)
+						fallbackStatus.Updated = true
+						return fallbackStatus, nil
+					}
+				} else {
+					log.Warnf("failed to fetch latest management release information: %s", status.Error)
 				}
-				return nil, nil
+				return status, nil
 			}
-			log.WithError(err).Warn("failed to fetch latest management release information")
-			return nil, nil
+			log.Debugf("continuing management asset update despite local status error: %s", status.Error)
+			status.Error = ""
 		}
-
-		if remoteHash != "" && localHash != "" && strings.EqualFold(remoteHash, localHash) {
+		if status.LocalExists && status.LocalHash != "" && !status.UpdateAvailable && status.RemoteDigestAvailable {
 			log.Debug("management asset is already up to date")
-			return nil, nil
+			return status, nil
 		}
-
-		data, downloadedHash, err := downloadAsset(ctx, client, asset.BrowserDownloadURL)
+		if status.AssetURL == "" {
+			status.Error = "latest management asset download url is empty"
+			return status, nil
+		}
+		client := newHTTPClient(proxyURL)
+		data, downloadedHash, err := downloadAsset(ctx, client, status.AssetURL)
 		if err != nil {
 			if localFileMissing {
 				log.WithError(err).Warn("failed to download management asset, trying fallback page")
 				if ensureFallbackManagementHTML(ctx, client, localPath) {
-					return nil, nil
+					fallbackStatus := localManagementHTMLStatus(staticDir, panelRepository)
+					fallbackStatus.Updated = true
+					return fallbackStatus, nil
 				}
-				return nil, nil
+				status.Error = err.Error()
+				return status, nil
 			}
 			log.WithError(err).Warn("failed to download management asset")
-			return nil, nil
+			status.Error = err.Error()
+			return status, nil
 		}
 
-		if remoteHash != "" && !strings.EqualFold(remoteHash, downloadedHash) {
-			log.Errorf("management asset digest mismatch: expected %s got %s — aborting update for safety", remoteHash, downloadedHash)
-			return nil, nil
+		if status.RemoteHash != "" && !strings.EqualFold(status.RemoteHash, downloadedHash) {
+			status.Error = fmt.Sprintf("management asset digest mismatch: expected %s got %s", status.RemoteHash, downloadedHash)
+			log.Errorf("%s — aborting update for safety", status.Error)
+			return status, nil
 		}
 
 		if err = atomicWriteFile(localPath, data); err != nil {
 			log.WithError(err).Warn("failed to update management asset on disk")
-			return nil, nil
+			status.Error = err.Error()
+			return status, nil
 		}
 
+		assetURL := status.AssetURL
+		remoteHash := status.RemoteHash
+		remoteDigestAvailable := status.RemoteDigestAvailable
+		status = localManagementHTMLStatus(staticDir, panelRepository)
+		status.AssetURL = assetURL
+		status.RemoteHash = remoteHash
+		status.RemoteDigestAvailable = remoteDigestAvailable
+		status.UpdateAvailable = false
+		status.Updated = true
 		log.Infof("management asset updated successfully (hash=%s)", downloadedHash)
-		return nil, nil
+		return status, nil
 	})
 
-	_, err := os.Stat(localPath)
-	return err == nil
+	if status, ok := result.(ManagementHTMLStatus); ok {
+		return status
+	}
+	return localManagementHTMLStatus(staticDir, panelRepository)
+}
+
+func localManagementHTMLStatus(staticDir string, panelRepository string) ManagementHTMLStatus {
+	status := ManagementHTMLStatus{
+		CheckedAt:  time.Now().UTC(),
+		ReleaseURL: resolveReleaseURL(panelRepository),
+	}
+	staticDir = strings.TrimSpace(staticDir)
+	if staticDir == "" {
+		status.Error = "empty static directory"
+		return status
+	}
+	localPath := filepath.Join(staticDir, managementAssetName)
+	info, err := os.Stat(localPath)
+	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			status.Error = err.Error()
+		}
+		return status
+	}
+	status.LocalExists = true
+	modTime := info.ModTime().UTC()
+	status.LocalModifiedAt = &modTime
+	if hash, errHash := fileSHA256(localPath); errHash == nil {
+		status.LocalHash = hash
+	} else {
+		status.Error = errHash.Error()
+	}
+	return status
 }
 
 func ensureFallbackManagementHTML(ctx context.Context, client *http.Client, localPath string) bool {
@@ -317,11 +434,12 @@ func resolveReleaseURL(repo string) string {
 
 	host := strings.ToLower(parsed.Host)
 	parsed.Path = strings.TrimSuffix(parsed.Path, "/")
+	if strings.HasSuffix(strings.ToLower(parsed.Path), "/releases/latest") {
+		return parsed.String()
+	}
 
 	if host == "api.github.com" {
-		if !strings.HasSuffix(strings.ToLower(parsed.Path), "/releases/latest") {
-			parsed.Path = parsed.Path + "/releases/latest"
-		}
+		parsed.Path = parsed.Path + "/releases/latest"
 		return parsed.String()
 	}
 

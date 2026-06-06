@@ -161,6 +161,40 @@ func TestBuildAuthFromFileData_PreservesDisabledState(t *testing.T) {
 	}
 }
 
+func TestBuildAuthFileEntry_ExposesLastErrorStatusCode(t *testing.T) {
+	authDir := t.TempDir()
+	path := filepath.Join(authDir, "error-status.json")
+	if err := os.WriteFile(path, []byte(`{"type":"codex"}`), 0o600); err != nil {
+		t.Fatalf("write auth file: %v", err)
+	}
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, nil)
+	auth := &coreauth.Auth{
+		ID:       "error-status.json",
+		Provider: "codex",
+		FileName: "error-status.json",
+		Attributes: map[string]string{
+			"path": path,
+		},
+		LastError: &coreauth.Error{
+			HTTPStatus: http.StatusUnauthorized,
+			Message:    "authentication token has been invalidated",
+		},
+		StatusMessage: "authentication token has been invalidated",
+	}
+
+	entry := h.buildAuthFileEntry(auth)
+	if entry == nil {
+		t.Fatal("expected auth file entry")
+	}
+	if got, ok := entry["last_error_status_code"].(int); !ok || got != http.StatusUnauthorized {
+		t.Fatalf("last_error_status_code = %#v, want %d", entry["last_error_status_code"], http.StatusUnauthorized)
+	}
+	lastError, ok := entry["last_error"].(*coreauth.Error)
+	if !ok || lastError == nil || lastError.HTTPStatus != http.StatusUnauthorized {
+		t.Fatalf("last_error = %#v, want unauthorized error", entry["last_error"])
+	}
+}
+
 func TestUpsertAuthRecord_PreservesCooldownStateForSameSourceRewrite(t *testing.T) {
 	authDir := t.TempDir()
 	manager := coreauth.NewManager(nil, nil, nil)

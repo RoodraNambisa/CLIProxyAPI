@@ -106,6 +106,8 @@ disable-cooling: false
 no-cooldown-status-codes: []
 
 # Custom cooldowns for stable upstream errors. scope can be "model" or "auth".
+# status-code is optional; omit it or set 0 to match by message only.
+# At least one of status-code or message-contains must be set.
 fixed-error-cooldowns:
   - status-code: 401
     message-contains: "Your authentication token has been invalidated."
