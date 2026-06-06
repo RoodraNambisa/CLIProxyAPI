@@ -30,3 +30,62 @@ routing:
 		t.Fatalf("SessionAffinityFailover = true, want false")
 	}
 }
+
+func TestLoadConfigOptional_RoutingPriorityOverrides(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.yaml")
+	configYAML := []byte(`
+routing:
+  priority-overrides:
+    - priority: 0
+      strategy: ff
+      max-retry-credentials: 2
+    - priority: -1
+      max-retry-credentials: -4
+`)
+	if err := os.WriteFile(configPath, configYAML, 0o600); err != nil {
+		t.Fatalf("failed to write config: %v", err)
+	}
+
+	cfg, err := LoadConfigOptional(configPath, false)
+	if err != nil {
+		t.Fatalf("LoadConfigOptional() error = %v", err)
+	}
+	if len(cfg.Routing.PriorityOverrides) != 2 {
+		t.Fatalf("PriorityOverrides length = %d, want 2", len(cfg.Routing.PriorityOverrides))
+	}
+	first := cfg.Routing.PriorityOverrides[0]
+	if first.Priority != 0 || first.Strategy != "fill-first" {
+		t.Fatalf("first override = %+v, want priority 0 fill-first", first)
+	}
+	if first.MaxRetryCredentials == nil || *first.MaxRetryCredentials != 2 {
+		t.Fatalf("first MaxRetryCredentials = %v, want 2", first.MaxRetryCredentials)
+	}
+	second := cfg.Routing.PriorityOverrides[1]
+	if second.Priority != -1 {
+		t.Fatalf("second priority = %d, want -1", second.Priority)
+	}
+	if second.MaxRetryCredentials == nil || *second.MaxRetryCredentials != 0 {
+		t.Fatalf("second MaxRetryCredentials = %v, want 0", second.MaxRetryCredentials)
+	}
+}
+
+func TestLoadConfigOptional_RejectsDuplicateRoutingPriorityOverrides(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.yaml")
+	configYAML := []byte(`
+routing:
+  priority-overrides:
+    - priority: 0
+      strategy: fill-first
+    - priority: 0
+      strategy: random
+`)
+	if err := os.WriteFile(configPath, configYAML, 0o600); err != nil {
+		t.Fatalf("failed to write config: %v", err)
+	}
+
+	if _, err := LoadConfigOptional(configPath, false); err == nil {
+		t.Fatalf("LoadConfigOptional() error = nil, want duplicate priority error")
+	}
+}

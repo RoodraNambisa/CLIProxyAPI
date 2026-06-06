@@ -284,11 +284,26 @@ type FixedErrorCooldownRule struct {
 	Scope string `yaml:"scope,omitempty" json:"scope,omitempty"`
 }
 
+// RoutingPriorityOverride overrides routing behavior for one credential priority.
+type RoutingPriorityOverride struct {
+	// Priority is the credential priority this rule applies to.
+	Priority int `yaml:"priority" json:"priority"`
+	// Strategy optionally overrides the global credential selection strategy.
+	// Supported values: "round-robin", "fill-first", "random".
+	Strategy string `yaml:"strategy,omitempty" json:"strategy,omitempty"`
+	// MaxRetryCredentials optionally overrides the global per-round credential limit.
+	// Set to 0 to try all available credentials in this priority.
+	MaxRetryCredentials *int `yaml:"max-retry-credentials,omitempty" json:"max-retry-credentials,omitempty"`
+}
+
 // RoutingConfig configures how credentials are selected for requests.
 type RoutingConfig struct {
 	// Strategy selects the credential selection strategy.
 	// Supported values: "round-robin" (default), "fill-first", "random".
 	Strategy string `yaml:"strategy,omitempty" json:"strategy,omitempty"`
+
+	// PriorityOverrides customizes routing behavior for specific credential priorities.
+	PriorityOverrides []RoutingPriorityOverride `yaml:"priority-overrides,omitempty" json:"priority-overrides,omitempty"`
 
 	// ClaudeCodeSessionAffinity enables session-sticky routing for Claude Code clients.
 	// When enabled, requests with the same session ID (extracted from metadata.user_id)
@@ -796,6 +811,12 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	if cfg.MaxRetryCredentials < 0 {
 		cfg.MaxRetryCredentials = 0
 	}
+	if err = cfg.NormalizeRoutingPriorityOverrides(); err != nil {
+		if optional {
+			return &Config{}, nil
+		}
+		return nil, err
+	}
 	cfg.NoCooldownStatusCodes = NormalizeStatusCodes(cfg.NoCooldownStatusCodes)
 	cfg.FixedErrorCooldowns = NormalizeFixedErrorCooldowns(cfg.FixedErrorCooldowns)
 
@@ -1101,6 +1122,74 @@ func NormalizeFixedErrorCooldowns(rules []FixedErrorCooldownRule) []FixedErrorCo
 		return nil
 	}
 	return out
+}
+
+// NormalizeRoutingStrategy returns the canonical routing strategy name.
+func NormalizeRoutingStrategy(strategy string) (string, bool) {
+	normalized := strings.ToLower(strings.TrimSpace(strategy))
+	switch normalized {
+	case "", "round-robin", "roundrobin", "rr":
+		return "round-robin", true
+	case "fill-first", "fillfirst", "ff":
+		return "fill-first", true
+	case "random", "rand", "r":
+		return "random", true
+	default:
+		return "", false
+	}
+}
+
+// NormalizeRoutingPriorityOverrides validates and canonicalizes per-priority routing overrides.
+func NormalizeRoutingPriorityOverrides(overrides []RoutingPriorityOverride) ([]RoutingPriorityOverride, error) {
+	if len(overrides) == 0 {
+		return nil, nil
+	}
+	seen := make(map[int]struct{}, len(overrides))
+	out := make([]RoutingPriorityOverride, 0, len(overrides))
+	for _, override := range overrides {
+		if _, ok := seen[override.Priority]; ok {
+			return nil, fmt.Errorf("routing.priority-overrides: duplicate priority %d", override.Priority)
+		}
+		seen[override.Priority] = struct{}{}
+
+		strategy := strings.TrimSpace(override.Strategy)
+		if strategy != "" {
+			normalized, ok := NormalizeRoutingStrategy(strategy)
+			if !ok {
+				return nil, fmt.Errorf("routing.priority-overrides[%d].strategy: invalid strategy %q", override.Priority, override.Strategy)
+			}
+			strategy = normalized
+		}
+
+		var maxRetryCredentials *int
+		if override.MaxRetryCredentials != nil {
+			value := *override.MaxRetryCredentials
+			if value < 0 {
+				value = 0
+			}
+			maxRetryCredentials = &value
+		}
+
+		out = append(out, RoutingPriorityOverride{
+			Priority:            override.Priority,
+			Strategy:            strategy,
+			MaxRetryCredentials: maxRetryCredentials,
+		})
+	}
+	return out, nil
+}
+
+// NormalizeRoutingPriorityOverrides validates and stores per-priority routing overrides.
+func (cfg *Config) NormalizeRoutingPriorityOverrides() error {
+	if cfg == nil {
+		return nil
+	}
+	normalized, err := NormalizeRoutingPriorityOverrides(cfg.Routing.PriorityOverrides)
+	if err != nil {
+		return err
+	}
+	cfg.Routing.PriorityOverrides = normalized
+	return nil
 }
 
 // SanitizeOpenAICompatibility removes OpenAI-compatibility provider entries that are

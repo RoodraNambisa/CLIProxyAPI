@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	internalconfig "github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 )
@@ -75,6 +76,55 @@ func schedulerTestID(t *testing.T, prefix string) string {
 	t.Helper()
 	name := strings.NewReplacer("/", "-", " ", "-", "_", "-").Replace(t.Name())
 	return prefix + "-" + name
+}
+
+func TestSchedulerPick_PriorityStrategyOverrideBeatsGlobalStrategy(t *testing.T) {
+	t.Parallel()
+
+	scheduler := newSchedulerForTest(
+		&RoundRobinSelector{},
+		&Auth{ID: "priority-a", Provider: "claude", Attributes: map[string]string{"priority": "0"}},
+		&Auth{ID: "priority-b", Provider: "claude", Attributes: map[string]string{"priority": "0"}},
+	)
+	scheduler.setRoutingPriorityOverrides([]internalconfig.RoutingPriorityOverride{
+		{Priority: 0, Strategy: "fill-first"},
+	})
+
+	for index := 0; index < 2; index++ {
+		got, errPick := scheduler.pickSingle(context.Background(), "claude", "", cliproxyexecutor.Options{}, nil)
+		if errPick != nil {
+			t.Fatalf("pickSingle() #%d error = %v", index, errPick)
+		}
+		if got == nil || got.ID != "priority-a" {
+			t.Fatalf("pickSingle() #%d auth = %v, want priority-a", index, got)
+		}
+	}
+}
+
+func TestSchedulerPick_MixedPriorityStrategyOverrideBeatsGlobalStrategy(t *testing.T) {
+	t.Parallel()
+
+	scheduler := newSchedulerForTest(
+		&RoundRobinSelector{},
+		&Auth{ID: "claude-a", Provider: "claude", Attributes: map[string]string{"priority": "0"}},
+		&Auth{ID: "gemini-a", Provider: "gemini", Attributes: map[string]string{"priority": "0"}},
+	)
+	scheduler.setRoutingPriorityOverrides([]internalconfig.RoutingPriorityOverride{
+		{Priority: 0, Strategy: "fill-first"},
+	})
+
+	for index := 0; index < 2; index++ {
+		got, provider, errPick := scheduler.pickMixed(context.Background(), []string{"gemini", "claude"}, "", cliproxyexecutor.Options{}, nil)
+		if errPick != nil {
+			t.Fatalf("pickMixed() #%d error = %v", index, errPick)
+		}
+		if provider != "gemini" {
+			t.Fatalf("pickMixed() #%d provider = %q, want gemini", index, provider)
+		}
+		if got == nil || got.ID != "gemini-a" {
+			t.Fatalf("pickMixed() #%d auth = %v, want gemini-a", index, got)
+		}
+	}
 }
 
 func TestSchedulerPick_RoundRobinHighestPriority(t *testing.T) {

@@ -324,21 +324,22 @@ func TestAvailableAuthsForRouteModel_SortsSelectedPriorityDeterministically(t *t
 type credentialRetryLimitExecutor struct {
 	id string
 
-	mu    sync.Mutex
-	calls int
+	mu          sync.Mutex
+	calls       int
+	callAuthIDs []string
 }
 
 func (e *credentialRetryLimitExecutor) Identifier() string {
 	return e.id
 }
 
-func (e *credentialRetryLimitExecutor) Execute(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
-	e.recordCall()
+func (e *credentialRetryLimitExecutor) Execute(_ context.Context, auth *Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	e.recordCall(authIDForCall(auth))
 	return cliproxyexecutor.Response{}, &Error{HTTPStatus: 500, Message: "boom"}
 }
 
-func (e *credentialRetryLimitExecutor) ExecuteStream(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
-	e.recordCall()
+func (e *credentialRetryLimitExecutor) ExecuteStream(_ context.Context, auth *Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
+	e.recordCall(authIDForCall(auth))
 	return nil, &Error{HTTPStatus: 500, Message: "boom"}
 }
 
@@ -346,8 +347,8 @@ func (e *credentialRetryLimitExecutor) Refresh(_ context.Context, auth *Auth) (*
 	return auth, nil
 }
 
-func (e *credentialRetryLimitExecutor) CountTokens(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
-	e.recordCall()
+func (e *credentialRetryLimitExecutor) CountTokens(_ context.Context, auth *Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	e.recordCall(authIDForCall(auth))
 	return cliproxyexecutor.Response{}, &Error{HTTPStatus: 500, Message: "boom"}
 }
 
@@ -355,16 +356,30 @@ func (e *credentialRetryLimitExecutor) HttpRequest(context.Context, *Auth, *http
 	return nil, nil
 }
 
-func (e *credentialRetryLimitExecutor) recordCall() {
+func authIDForCall(auth *Auth) string {
+	if auth == nil {
+		return ""
+	}
+	return auth.ID
+}
+
+func (e *credentialRetryLimitExecutor) recordCall(authID string) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.calls++
+	e.callAuthIDs = append(e.callAuthIDs, authID)
 }
 
 func (e *credentialRetryLimitExecutor) Calls() int {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	return e.calls
+}
+
+func (e *credentialRetryLimitExecutor) CallAuthIDs() []string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return append([]string(nil), e.callAuthIDs...)
 }
 
 type authFallbackExecutor struct {
@@ -638,6 +653,66 @@ func TestManager_MaxRetryCredentialsZeroKeepsTryingAllAvailableCredentials(t *te
 	}
 	if calls := executor.Calls(); calls != 6 {
 		t.Fatalf("expected 6 calls with max-retry-credentials=0, got %d", calls)
+	}
+}
+
+func TestManager_PriorityMaxRetryCredentialsFallsThroughToLowerPriority(t *testing.T) {
+	request := cliproxyexecutor.Request{Model: "test-model"}
+	manager := NewManager(nil, nil, nil)
+	manager.SetRetryConfig(0, 0, 0)
+	highPriorityLimit := 2
+	manager.SetConfig(&internalconfig.Config{
+		Routing: internalconfig.RoutingConfig{
+			PriorityOverrides: []internalconfig.RoutingPriorityOverride{
+				{Priority: 0, MaxRetryCredentials: &highPriorityLimit},
+			},
+		},
+	})
+
+	executor := &credentialRetryLimitExecutor{id: "claude"}
+	manager.RegisterExecutor(executor)
+
+	reg := registry.GetGlobalRegistry()
+	baseID := uuid.NewString()
+	auths := []*Auth{
+		{ID: baseID + "-high-1", Provider: "claude", Attributes: map[string]string{"priority": "0"}},
+		{ID: baseID + "-high-2", Provider: "claude", Attributes: map[string]string{"priority": "0"}},
+		{ID: baseID + "-high-3", Provider: "claude", Attributes: map[string]string{"priority": "0"}},
+		{ID: baseID + "-low-1", Provider: "claude", Attributes: map[string]string{"priority": "-1"}},
+		{ID: baseID + "-low-2", Provider: "claude", Attributes: map[string]string{"priority": "-1"}},
+	}
+	for _, auth := range auths {
+		reg.RegisterClient(auth.ID, "claude", []*registry.ModelInfo{{ID: "test-model"}})
+		if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
+			t.Fatalf("register %s: %v", auth.ID, errRegister)
+		}
+	}
+	t.Cleanup(func() {
+		for _, auth := range auths {
+			reg.UnregisterClient(auth.ID)
+		}
+	})
+
+	if _, errExecute := manager.Execute(context.Background(), []string{"claude"}, request, cliproxyexecutor.Options{}); errExecute == nil {
+		t.Fatalf("expected error for retry limit execution")
+	}
+
+	callIDs := executor.CallAuthIDs()
+	if len(callIDs) != 4 {
+		t.Fatalf("call auth IDs = %v, want 4 calls", callIDs)
+	}
+	highCalls := 0
+	lowCalls := 0
+	for _, authID := range callIDs {
+		switch {
+		case strings.Contains(authID, "-high-"):
+			highCalls++
+		case strings.Contains(authID, "-low-"):
+			lowCalls++
+		}
+	}
+	if highCalls != 2 || lowCalls != 2 {
+		t.Fatalf("call auth IDs = %v, want 2 high-priority and 2 low-priority calls", callIDs)
 	}
 }
 
@@ -1593,6 +1668,66 @@ func TestManagerExecute_SessionAffinityBindsSuccessfulAuthAfterFailover(t *testi
 	}
 }
 
+func TestManagerExecute_SessionAffinityUsesPriorityStrategyOverride(t *testing.T) {
+	failover := true
+	selector := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{
+		Fallback: &RoundRobinSelector{},
+		TTL:      time.Minute,
+		Failover: &failover,
+	})
+	t.Cleanup(selector.Stop)
+	m := NewManager(nil, selector, nil)
+	m.SetConfig(&internalconfig.Config{
+		Routing: internalconfig.RoutingConfig{
+			SessionAffinity:         true,
+			SessionAffinityFailover: &failover,
+			PriorityOverrides: []internalconfig.RoutingPriorityOverride{
+				{Priority: 0, Strategy: "fill-first"},
+			},
+		},
+	})
+	m.SetRetryConfig(0, 0, 0)
+
+	executor := &authFallbackExecutor{id: "claude"}
+	m.RegisterExecutor(executor)
+
+	baseID := uuid.NewString()
+	authA := baseID + "-a"
+	authB := baseID + "-b"
+	auths := []*Auth{
+		{ID: authA, Provider: "claude", Attributes: map[string]string{"priority": "0"}},
+		{ID: authB, Provider: "claude", Attributes: map[string]string{"priority": "0"}},
+	}
+	reg := registry.GetGlobalRegistry()
+	for _, auth := range auths {
+		reg.RegisterClient(auth.ID, "claude", []*registry.ModelInfo{{ID: "test-model"}})
+		if _, errRegister := m.Register(context.Background(), auth); errRegister != nil {
+			t.Fatalf("register auth %q: %v", auth.ID, errRegister)
+		}
+	}
+	t.Cleanup(func() {
+		for _, auth := range auths {
+			reg.UnregisterClient(auth.ID)
+		}
+	})
+
+	req := cliproxyexecutor.Request{Model: "test-model"}
+	for index, sessionID := range []string{"user_xxx_account__priority_override_a", "user_xxx_account__priority_override_b"} {
+		payload := []byte(fmt.Sprintf(`{"metadata":{"user_id":%q}}`, sessionID))
+		resp, errExecute := m.Execute(context.Background(), []string{"claude"}, req, cliproxyexecutor.Options{OriginalRequest: payload})
+		if errExecute != nil {
+			t.Fatalf("Execute() #%d error = %v", index, errExecute)
+		}
+		if string(resp.Payload) != authA {
+			t.Fatalf("Execute() #%d payload = %q, want %s", index, string(resp.Payload), authA)
+		}
+	}
+
+	if calls := executor.ExecuteCalls(); len(calls) != 2 || calls[0] != authA || calls[1] != authA {
+		t.Fatalf("execute calls = %v, want [%s %s]", calls, authA, authA)
+	}
+}
+
 func TestManagerExecuteCount_SessionAffinityBindsSuccessfulAuthAfterFailover(t *testing.T) {
 	failover := true
 	selector := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{
@@ -2065,6 +2200,79 @@ func TestManager_MarkResult_FixedErrorCooldownScopesAuth(t *testing.T) {
 	}
 	if state.Unavailable {
 		t.Fatal("expected auth-scoped fixed cooldown not to mark only the current model unavailable")
+	}
+}
+
+func TestManager_MarkResult_ModelSuccessPreservesActiveAuthWideCooldown(t *testing.T) {
+	prev := quotaCooldownDisabled.Load()
+	quotaCooldownDisabled.Store(false)
+	t.Cleanup(func() { quotaCooldownDisabled.Store(prev) })
+
+	m := NewManager(nil, nil, nil)
+	m.SetConfig(&internalconfig.Config{FixedErrorCooldowns: []internalconfig.FixedErrorCooldownRule{
+		{
+			StatusCode:      http.StatusUnauthorized,
+			MessageContains: "authentication token has been invalidated",
+			CooldownSeconds: 7200,
+			Scope:           "auth",
+		},
+	}})
+	auth := &Auth{
+		ID:       "auth-fixed-error-auth-preserve",
+		Provider: "codex",
+	}
+	if _, errRegister := m.Register(context.Background(), auth); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+
+	m.MarkResult(context.Background(), Result{
+		AuthID:   auth.ID,
+		Provider: "codex",
+		Model:    "gpt-5-codex",
+		Success:  false,
+		Error: &Error{
+			Message:    `{"error":{"message":"Your authentication token has been invalidated."}}`,
+			HTTPStatus: http.StatusUnauthorized,
+		},
+	})
+
+	afterFailure, ok := m.GetByID(auth.ID)
+	if !ok || afterFailure == nil {
+		t.Fatal("updated auth missing after failure")
+	}
+	authWideRetry := afterFailure.NextRetryAfter
+	if afterFailure.CooldownScope != cooldownScopeAuth || authWideRetry.IsZero() {
+		t.Fatalf("auth-wide cooldown = scope %q retry %s, want active auth cooldown", afterFailure.CooldownScope, authWideRetry)
+	}
+
+	m.MarkResult(context.Background(), Result{
+		AuthID:   auth.ID,
+		Provider: "codex",
+		Model:    "other-model",
+		Success:  true,
+	})
+
+	updated, ok := m.GetByID(auth.ID)
+	if !ok || updated == nil {
+		t.Fatal("updated auth missing after success")
+	}
+	if updated.CooldownScope != cooldownScopeAuth {
+		t.Fatalf("cooldown scope = %q, want %q", updated.CooldownScope, cooldownScopeAuth)
+	}
+	if !updated.Unavailable {
+		t.Fatal("expected auth to remain unavailable")
+	}
+	if !updated.NextRetryAfter.Equal(authWideRetry) {
+		t.Fatalf("next retry = %s, want preserved %s", updated.NextRetryAfter, authWideRetry)
+	}
+	if updated.Status != StatusError {
+		t.Fatalf("status = %q, want %q", updated.Status, StatusError)
+	}
+	if updated.LastError == nil {
+		t.Fatal("expected auth-wide error to remain recorded")
+	}
+	if blocked, _, _ := isAuthBlockedForModel(updated, "third-model", time.Now()); !blocked {
+		t.Fatal("expected preserved auth-wide cooldown to block other models")
 	}
 }
 

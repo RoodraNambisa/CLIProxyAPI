@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	internalconfig "github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 )
@@ -36,6 +37,7 @@ const (
 type authScheduler struct {
 	mu            sync.RWMutex
 	strategy      schedulerStrategy
+	priorityRules map[int]schedulerStrategy
 	providers     map[string]*providerScheduler
 	authProviders map[string]string
 	mixedCursorMu sync.Mutex
@@ -171,6 +173,7 @@ func normalizeCursor(cursor, size int) int {
 func newAuthScheduler(selector Selector) *authScheduler {
 	return &authScheduler{
 		strategy:      selectorStrategy(selector),
+		priorityRules: make(map[int]schedulerStrategy),
 		providers:     make(map[string]*providerScheduler),
 		authProviders: make(map[string]string),
 		mixedCursors:  make(map[string]int),
@@ -189,6 +192,51 @@ func selectorStrategy(selector Selector) schedulerStrategy {
 	default:
 		return schedulerStrategyCustom
 	}
+}
+
+func schedulerStrategyFromName(strategy string) (schedulerStrategy, bool) {
+	normalized, ok := internalconfig.NormalizeRoutingStrategy(strategy)
+	if !ok {
+		return schedulerStrategyRoundRobin, false
+	}
+	switch normalized {
+	case "fill-first":
+		return schedulerStrategyFillFirst, true
+	case "random":
+		return schedulerStrategyRandom, true
+	default:
+		return schedulerStrategyRoundRobin, true
+	}
+}
+
+func (s *authScheduler) setRoutingPriorityOverrides(overrides []internalconfig.RoutingPriorityOverride) {
+	if s == nil {
+		return
+	}
+	rules := make(map[int]schedulerStrategy, len(overrides))
+	for _, override := range overrides {
+		if strings.TrimSpace(override.Strategy) == "" {
+			continue
+		}
+		strategy, ok := schedulerStrategyFromName(override.Strategy)
+		if !ok {
+			continue
+		}
+		rules[override.Priority] = strategy
+	}
+	s.mu.Lock()
+	s.priorityRules = rules
+	s.mu.Unlock()
+}
+
+func (s *authScheduler) strategyForPriorityLocked(priority int) schedulerStrategy {
+	if s == nil {
+		return schedulerStrategyRoundRobin
+	}
+	if strategy, ok := s.priorityRules[priority]; ok {
+		return strategy
+	}
+	return s.strategy
 }
 
 // setSelector updates the active built-in strategy and resets mixed-provider cursors.
@@ -257,7 +305,7 @@ func (s *authScheduler) removeAuth(authID string) {
 }
 
 // pickSingle returns the next auth for a single provider/model request using scheduler state.
-func (s *authScheduler) pickSingle(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, error) {
+func (s *authScheduler) pickSingle(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, tried map[string]struct{}, authAllowed ...func(*Auth) bool) (*Auth, error) {
 	if s == nil {
 		return nil, &Error{Code: "auth_not_found", Message: "no auth available"}
 	}
@@ -269,7 +317,7 @@ func (s *authScheduler) pickSingle(ctx context.Context, provider, model string, 
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	providerState := s.providers[providerKey]
-	strategy := s.strategy
+	strategyForPriority := s.strategyForPriorityLocked
 	selectionAttempt = selectionAttemptFromMetadata(opts.Metadata)
 	if providerState == nil {
 		return nil, &Error{Code: "auth_not_found", Message: "no auth available"}
@@ -298,16 +346,19 @@ func (s *authScheduler) pickSingle(ctx context.Context, provider, model string, 
 				return false
 			}
 		}
+		if len(authAllowed) > 0 && authAllowed[0] != nil && !authAllowed[0](entry.auth) {
+			return false
+		}
 		return true
 	}
-	if picked := shard.pickReadyLocked(preferWebsocket, strategy, selectionAttempt, priorityPredicate, pickPredicate); picked != nil {
+	if picked := shard.pickReadyLocked(preferWebsocket, strategyForPriority, selectionAttempt, priorityPredicate, pickPredicate); picked != nil {
 		return picked, nil
 	}
 	return nil, shard.unavailableErrorForAttemptLocked(provider, model, preferWebsocket, selectionAttempt, priorityPredicate, pickPredicate)
 }
 
 // pickMixed returns the next auth and provider for a mixed-provider request.
-func (s *authScheduler) pickMixed(ctx context.Context, providers []string, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, string, error) {
+func (s *authScheduler) pickMixed(ctx context.Context, providers []string, model string, opts cliproxyexecutor.Options, tried map[string]struct{}, authAllowed ...func(*Auth) bool) (*Auth, string, error) {
 	if s == nil {
 		return nil, "", &Error{Code: "auth_not_found", Message: "no auth available"}
 	}
@@ -319,7 +370,7 @@ func (s *authScheduler) pickMixed(ctx context.Context, providers []string, model
 		// When a single provider is eligible, reuse pickSingle so provider-specific preferences
 		// (for example Codex websocket transport) are applied consistently.
 		providerKey := normalized[0]
-		picked, errPick := s.pickSingle(ctx, providerKey, model, opts, tried)
+		picked, errPick := s.pickSingle(ctx, providerKey, model, opts, tried, authAllowed...)
 		if errPick != nil {
 			return nil, "", errPick
 		}
@@ -333,7 +384,7 @@ func (s *authScheduler) pickMixed(ctx context.Context, providers []string, model
 	selectionAttempt := 0
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	strategy := s.strategy
+	strategyForPriority := s.strategyForPriorityLocked
 	selectionAttempt = selectionAttemptFromMetadata(opts.Metadata)
 	if pinnedAuthID != "" {
 		providerKey := s.authProviders[pinnedAuthID]
@@ -358,12 +409,15 @@ func (s *authScheduler) pickMixed(ctx context.Context, providers []string, model
 				return false
 			}
 			if len(tried) == 0 {
-				return true
+				return len(authAllowed) == 0 || authAllowed[0] == nil || authAllowed[0](entry.auth)
 			}
 			_, ok := tried[pinnedAuthID]
-			return !ok
+			if ok {
+				return false
+			}
+			return len(authAllowed) == 0 || authAllowed[0] == nil || authAllowed[0](entry.auth)
 		}
-		if picked := shard.pickReadyLocked(false, strategy, selectionAttempt, priorityPredicate, pickPredicate); picked != nil {
+		if picked := shard.pickReadyLocked(false, strategyForPriority, selectionAttempt, priorityPredicate, pickPredicate); picked != nil {
 			return picked, providerKey, nil
 		}
 		return nil, "", shard.unavailableErrorForAttemptLocked("mixed", model, false, selectionAttempt, priorityPredicate, pickPredicate)
@@ -378,7 +432,7 @@ func (s *authScheduler) pickMixed(ctx context.Context, providers []string, model
 	priorityPredicate := func(entry *scheduledAuth) bool {
 		return entry != nil && entry.auth != nil
 	}
-	pickPredicate := triedPredicate(tried)
+	pickPredicate := triedPredicate(tried, authAllowed...)
 	candidateShards := make([]*modelScheduler, len(normalized))
 	prioritySet := make(map[int]struct{})
 	now := time.Now()
@@ -414,12 +468,14 @@ func (s *authScheduler) pickMixed(ctx context.Context, providers []string, model
 		return nil, "", mixedUnavailableErrorFromShards(normalized, candidateShards, model, tried)
 	}
 
-	if strategy == schedulerStrategyRandom {
-		type randomMixedCandidate struct {
-			auth        *Auth
-			providerKey string
-		}
-		for _, targetPriority := range prioritiesToTry {
+	type randomMixedCandidate struct {
+		auth        *Auth
+		providerKey string
+	}
+	cursorKey := strings.Join(normalized, ",") + ":" + modelKey
+	for _, targetPriority := range prioritiesToTry {
+		switch strategyForPriority(targetPriority) {
+		case schedulerStrategyRandom:
 			candidates := make([]randomMixedCandidate, 0)
 			for providerIndex, providerKey := range normalized {
 				shard := candidateShards[providerIndex]
@@ -440,81 +496,74 @@ func (s *authScheduler) pickMixed(ctx context.Context, providers []string, model
 				picked := candidates[rand.IntN(len(candidates))]
 				return picked.auth, picked.providerKey, nil
 			}
-		}
-		return nil, "", mixedUnavailableErrorFromShardsForAttempt(normalized, candidateShards, model, priorityPredicate, pickPredicate, selectionAttempt)
-	}
-
-	if strategy == schedulerStrategyFillFirst {
-		for _, targetPriority := range prioritiesToTry {
+		case schedulerStrategyFillFirst:
 			for providerIndex, providerKey := range normalized {
 				shard := candidateShards[providerIndex]
 				if shard == nil {
 					continue
 				}
-				picked := shard.pickReadyAtPriorityLocked(false, targetPriority, strategy, pickPredicate)
+				picked := shard.pickReadyAtPriorityLocked(false, targetPriority, schedulerStrategyFillFirst, pickPredicate)
 				if picked != nil {
 					return picked, providerKey, nil
 				}
 			}
-		}
-		return nil, "", mixedUnavailableErrorFromShardsForAttempt(normalized, candidateShards, model, priorityPredicate, pickPredicate, selectionAttempt)
-	}
+		default:
+			weights := make([]int, len(normalized))
+			segmentStarts := make([]int, len(normalized))
+			segmentEnds := make([]int, len(normalized))
+			totalWeight := 0
+			for providerIndex, shard := range candidateShards {
+				segmentStarts[providerIndex] = totalWeight
+				if shard != nil {
+					weights[providerIndex] = shard.readyCountAtPriorityLocked(false, targetPriority, pickPredicate)
+				}
+				totalWeight += weights[providerIndex]
+				segmentEnds[providerIndex] = totalWeight
+			}
+			if totalWeight == 0 {
+				continue
+			}
 
-	cursorKey := strings.Join(normalized, ",") + ":" + modelKey
-	s.mixedCursorMu.Lock()
-	defer s.mixedCursorMu.Unlock()
-	for _, targetPriority := range prioritiesToTry {
-		weights := make([]int, len(normalized))
-		segmentStarts := make([]int, len(normalized))
-		segmentEnds := make([]int, len(normalized))
-		totalWeight := 0
-		for providerIndex, shard := range candidateShards {
-			segmentStarts[providerIndex] = totalWeight
-			if shard != nil {
-				weights[providerIndex] = shard.readyCountAtPriorityLocked(false, targetPriority, pickPredicate)
+			s.mixedCursorMu.Lock()
+			startSlot := s.mixedCursors[cursorKey] % totalWeight
+			startProviderIndex := -1
+			for providerIndex := range normalized {
+				if weights[providerIndex] == 0 {
+					continue
+				}
+				if startSlot < segmentEnds[providerIndex] {
+					startProviderIndex = providerIndex
+					break
+				}
 			}
-			totalWeight += weights[providerIndex]
-			segmentEnds[providerIndex] = totalWeight
-		}
-		if totalWeight == 0 {
-			continue
-		}
+			if startProviderIndex < 0 {
+				s.mixedCursorMu.Unlock()
+				continue
+			}
 
-		startSlot := s.mixedCursors[cursorKey] % totalWeight
-		startProviderIndex := -1
-		for providerIndex := range normalized {
-			if weights[providerIndex] == 0 {
-				continue
+			slot := startSlot
+			for offset := 0; offset < len(normalized); offset++ {
+				providerIndex := (startProviderIndex + offset) % len(normalized)
+				if weights[providerIndex] == 0 {
+					continue
+				}
+				if providerIndex != startProviderIndex {
+					slot = segmentStarts[providerIndex]
+				}
+				providerKey := normalized[providerIndex]
+				shard := candidateShards[providerIndex]
+				if shard == nil {
+					continue
+				}
+				picked := shard.pickReadyAtPriorityLocked(false, targetPriority, schedulerStrategyRoundRobin, pickPredicate)
+				if picked == nil {
+					continue
+				}
+				s.mixedCursors[cursorKey] = slot + 1
+				s.mixedCursorMu.Unlock()
+				return picked, providerKey, nil
 			}
-			if startSlot < segmentEnds[providerIndex] {
-				startProviderIndex = providerIndex
-				break
-			}
-		}
-		if startProviderIndex < 0 {
-			continue
-		}
-
-		slot := startSlot
-		for offset := 0; offset < len(normalized); offset++ {
-			providerIndex := (startProviderIndex + offset) % len(normalized)
-			if weights[providerIndex] == 0 {
-				continue
-			}
-			if providerIndex != startProviderIndex {
-				slot = segmentStarts[providerIndex]
-			}
-			providerKey := normalized[providerIndex]
-			shard := candidateShards[providerIndex]
-			if shard == nil {
-				continue
-			}
-			picked := shard.pickReadyAtPriorityLocked(false, targetPriority, schedulerStrategyRoundRobin, pickPredicate)
-			if picked == nil {
-				continue
-			}
-			s.mixedCursors[cursorKey] = slot + 1
-			return picked, providerKey, nil
+			s.mixedCursorMu.Unlock()
 		}
 	}
 	return nil, "", mixedUnavailableErrorFromShardsForAttempt(normalized, candidateShards, model, priorityPredicate, pickPredicate, selectionAttempt)
@@ -606,16 +655,19 @@ func mixedUnavailableErrorFromShardsForAttempt(providers []string, candidateShar
 }
 
 // triedPredicate builds a filter that excludes auths already attempted for the current request.
-func triedPredicate(tried map[string]struct{}) func(*scheduledAuth) bool {
+func triedPredicate(tried map[string]struct{}, authAllowed ...func(*Auth) bool) func(*scheduledAuth) bool {
+	allowed := func(auth *Auth) bool {
+		return len(authAllowed) == 0 || authAllowed[0] == nil || authAllowed[0](auth)
+	}
 	if len(tried) == 0 {
-		return func(entry *scheduledAuth) bool { return entry != nil && entry.auth != nil }
+		return func(entry *scheduledAuth) bool { return entry != nil && entry.auth != nil && allowed(entry.auth) }
 	}
 	return func(entry *scheduledAuth) bool {
 		if entry == nil || entry.auth == nil {
 			return false
 		}
 		_, ok := tried[entry.auth.ID]
-		return !ok
+		return !ok && allowed(entry.auth)
 	}
 }
 
@@ -975,7 +1027,7 @@ func (m *modelScheduler) promoteExpiredLocked(now time.Time) {
 }
 
 // pickReadyLocked selects the next ready auth from the target priority bucket for the request attempt.
-func (m *modelScheduler) pickReadyLocked(preferWebsocket bool, strategy schedulerStrategy, selectionAttempt int, priorityPredicate func(*scheduledAuth) bool, pickPredicate func(*scheduledAuth) bool) *Auth {
+func (m *modelScheduler) pickReadyLocked(preferWebsocket bool, strategyForPriority func(int) schedulerStrategy, selectionAttempt int, priorityPredicate func(*scheduledAuth) bool, pickPredicate func(*scheduledAuth) bool) *Auth {
 	if m == nil {
 		return nil
 	}
@@ -985,6 +1037,10 @@ func (m *modelScheduler) pickReadyLocked(preferWebsocket bool, strategy schedule
 		return nil
 	}
 	for _, priorityReady := range selectionPrioritiesForAttempt(priorities, selectionAttempt) {
+		strategy := schedulerStrategyRoundRobin
+		if strategyForPriority != nil {
+			strategy = strategyForPriority(priorityReady)
+		}
 		if picked := m.pickReadyAtPriorityLocked(restrictWebsocket, priorityReady, strategy, pickPredicate); picked != nil {
 			return picked
 		}

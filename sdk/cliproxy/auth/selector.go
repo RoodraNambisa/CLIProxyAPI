@@ -693,11 +693,21 @@ func NewSessionAffinitySelectorWithConfig(cfg SessionAffinityConfig) *SessionAff
 // a session uses multiple models (e.g., gemini-2.5-pro and gemini-3-flash-preview)
 // that may be supported by different auth credentials, and to avoid cross-provider conflicts.
 func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error) {
+	return s.pickWithFallback(ctx, provider, model, opts, auths, s.fallback)
+}
+
+func (s *SessionAffinitySelector) pickWithFallback(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth, fallback Selector) (*Auth, error) {
+	if fallback == nil {
+		fallback = s.fallback
+	}
+	if fallback == nil {
+		fallback = &RoundRobinSelector{}
+	}
 	entry := selectorLogEntry(ctx)
 	primaryID, fallbackID := extractSessionIDs(opts.Headers, opts.OriginalRequest, opts.Metadata)
 	if primaryID == "" {
 		entry.Debugf("session-affinity: no session ID extracted, falling back to default selector | provider=%s model=%s", provider, model)
-		return s.fallback.Pick(ctx, provider, model, opts, auths)
+		return fallback.Pick(ctx, provider, model, opts, auths)
 	}
 
 	now := time.Now()
@@ -725,7 +735,7 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 			entry.Infof("session-affinity: cache hit but auth unavailable, strict failover disabled | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), cachedAuthID, provider, model)
 			return nil, err
 		}
-		auth, err := s.fallback.Pick(ctx, provider, model, opts, available)
+		auth, err := fallback.Pick(ctx, provider, model, opts, available)
 		if err != nil {
 			return nil, err
 		}
@@ -747,7 +757,7 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 		}
 	}
 
-	auth, err := s.fallback.Pick(ctx, provider, model, opts, available)
+	auth, err := fallback.Pick(ctx, provider, model, opts, available)
 	if err != nil {
 		return nil, err
 	}

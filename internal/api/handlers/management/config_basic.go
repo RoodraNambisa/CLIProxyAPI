@@ -288,17 +288,7 @@ func (h *Handler) PutForceModelPrefix(c *gin.Context) {
 }
 
 func normalizeRoutingStrategy(strategy string) (string, bool) {
-	normalized := strings.ToLower(strings.TrimSpace(strategy))
-	switch normalized {
-	case "", "round-robin", "roundrobin", "rr":
-		return "round-robin", true
-	case "fill-first", "fillfirst", "ff":
-		return "fill-first", true
-	case "random", "rand", "r":
-		return "random", true
-	default:
-		return "", false
-	}
+	return config.NormalizeRoutingStrategy(strategy)
 }
 
 func clampNonNegativeInt(value int) int {
@@ -331,6 +321,27 @@ func (h *Handler) PutRoutingStrategy(c *gin.Context) {
 		return
 	}
 	h.cfg.Routing.Strategy = normalized
+	h.persist(c)
+}
+
+func (h *Handler) GetRoutingPriorityOverrides(c *gin.Context) {
+	c.JSON(200, gin.H{"priority-overrides": h.cfg.Routing.PriorityOverrides})
+}
+
+func (h *Handler) PutRoutingPriorityOverrides(c *gin.Context) {
+	var body struct {
+		Value *[]config.RoutingPriorityOverride `json:"value"`
+	}
+	if errBindJSON := c.ShouldBindJSON(&body); errBindJSON != nil || body.Value == nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
+		return
+	}
+	normalized, errNormalize := config.NormalizeRoutingPriorityOverrides(*body.Value)
+	if errNormalize != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid priority overrides", "message": errNormalize.Error()})
+		return
+	}
+	h.cfg.Routing.PriorityOverrides = normalized
 	h.persist(c)
 }
 

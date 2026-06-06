@@ -137,6 +137,19 @@ auth-maintenance:
 # Routing strategy for selecting credentials when multiple match.
 routing:
   strategy: "round-robin" # round-robin (default), fill-first, random
+  # Optional per-priority overrides. These take precedence over routing.strategy
+  # and the global max-retry-credentials for the matching priority.
+  # max-retry-credentials counts the first credential in the round; 1 means no
+  # same-priority credential retry, and 0 means try all available credentials.
+  priority-overrides: []
+  # Example:
+  # priority-overrides:
+  #   - priority: 0
+  #     strategy: fill-first
+  #     max-retry-credentials: 2
+  #   - priority: -1
+  #     strategy: random
+  #     max-retry-credentials: 1
   # Enable universal session-sticky routing for all clients.
   # Session IDs are extracted from: metadata.user_id, X-Session-ID,
   # Session-Id/Session_id, X-Client-Request-Id, conversation_id, or message hash.

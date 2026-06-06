@@ -108,6 +108,21 @@ func TestBuildConfigChangeDetails_NoChanges(t *testing.T) {
 	}
 }
 
+func TestBuildConfigChangeDetails_RoutingPriorityOverrides(t *testing.T) {
+	limit := 2
+	oldCfg := &config.Config{}
+	newCfg := &config.Config{
+		Routing: config.RoutingConfig{
+			PriorityOverrides: []config.RoutingPriorityOverride{
+				{Priority: 0, Strategy: "fill-first", MaxRetryCredentials: &limit},
+			},
+		},
+	}
+
+	details := BuildConfigChangeDetails(oldCfg, newCfg)
+	expectContains(t, details, "routing.priority-overrides: updated")
+}
+
 func TestBuildConfigChangeDetails_GeminiVertexHeadersAndForceMappings(t *testing.T) {
 	oldCfg := &config.Config{
 		GeminiKey: []config.GeminiKey{

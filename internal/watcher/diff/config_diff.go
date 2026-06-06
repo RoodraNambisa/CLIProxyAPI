@@ -124,6 +124,9 @@ func BuildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 	if oldCfg.Routing.Strategy != newCfg.Routing.Strategy {
 		changes = append(changes, fmt.Sprintf("routing.strategy: %s -> %s", oldCfg.Routing.Strategy, newCfg.Routing.Strategy))
 	}
+	if !reflect.DeepEqual(oldCfg.Routing.PriorityOverrides, newCfg.Routing.PriorityOverrides) {
+		changes = append(changes, "routing.priority-overrides: updated")
+	}
 	if routingSessionAffinityFailoverEnabled(oldCfg) != routingSessionAffinityFailoverEnabled(newCfg) {
 		changes = append(changes, fmt.Sprintf("routing.session-affinity-failover: %t -> %t", routingSessionAffinityFailoverEnabled(oldCfg), routingSessionAffinityFailoverEnabled(newCfg)))
 	}
