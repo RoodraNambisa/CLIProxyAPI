@@ -9,6 +9,7 @@ import (
 	"sync"
 
 	"github.com/gin-gonic/gin"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/api/middleware"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/api/modules"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	sdkaccess "github.com/router-for-me/CLIProxyAPI/v6/sdk/access"
@@ -38,9 +39,10 @@ type AmpModule struct {
 	restrictToLocalhost bool
 	restrictMu          sync.RWMutex
 
-	// configMu protects lastConfig for partial reload comparison
+	// configMu protects lastConfig for partial reload comparison and rootConfig for dynamic middleware.
 	configMu   sync.RWMutex
 	lastConfig *config.AmpCode
+	rootConfig *config.Config
 }
 
 // New creates a new Amp routing module with the given options.
@@ -116,6 +118,7 @@ func (m *AmpModule) forceModelMappings() bool {
 func (m *AmpModule) Register(ctx modules.Context) error {
 	settings := ctx.Config.AmpCode
 	upstreamURL := strings.TrimSpace(settings.UpstreamURL)
+	m.setRootConfig(ctx.Config)
 
 	// Determine auth middleware (from module or context)
 	auth := m.getAuthMiddleware(ctx)
@@ -178,6 +181,11 @@ func (m *AmpModule) getAuthMiddleware(ctx modules.Context) gin.HandlerFunc {
 // Only updates components that have actually changed to avoid unnecessary work.
 // Supports hot-reload for: model-mappings, upstream-api-key, upstream-url, restrict-management-to-localhost.
 func (m *AmpModule) OnConfigUpdated(cfg *config.Config) error {
+	m.setRootConfig(cfg)
+	if cfg == nil {
+		return nil
+	}
+
 	newSettings := cfg.AmpCode
 
 	// Get previous config for comparison
@@ -255,6 +263,26 @@ func (m *AmpModule) OnConfigUpdated(cfg *config.Config) error {
 	m.configMu.Unlock()
 
 	return nil
+}
+
+func (m *AmpModule) setRootConfig(cfg *config.Config) {
+	m.configMu.Lock()
+	m.rootConfig = cfg
+	m.configMu.Unlock()
+}
+
+func (m *AmpModule) requestBodyAuditMiddleware() gin.HandlerFunc {
+	return middleware.RequestBodyAuditMiddleware(func() config.RequestBodyAuditConfig {
+		if m == nil {
+			return config.RequestBodyAuditConfig{}
+		}
+		m.configMu.RLock()
+		defer m.configMu.RUnlock()
+		if m.rootConfig == nil {
+			return config.RequestBodyAuditConfig{}
+		}
+		return m.rootConfig.RequestBodyAudit
+	})
 }
 
 func (m *AmpModule) enableUpstreamProxy(upstreamURL string, settings *config.AmpCode) error {

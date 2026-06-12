@@ -359,6 +359,7 @@ func (s *Server) setupRoutes() {
 	// OpenAI compatible API routes
 	v1 := s.engine.Group("/v1")
 	v1.Use(AuthMiddleware(s.accessManager))
+	v1.Use(s.requestBodyAuditMiddleware())
 	{
 		v1.GET("/models", s.unifiedModelsHandler(openaiHandlers, claudeCodeHandlers))
 		v1.POST("/chat/completions", openaiHandlers.ChatCompletions)
@@ -375,6 +376,7 @@ func (s *Server) setupRoutes() {
 	// Gemini compatible API routes
 	v1beta := s.engine.Group("/v1beta")
 	v1beta.Use(AuthMiddleware(s.accessManager))
+	v1beta.Use(s.requestBodyAuditMiddleware())
 	{
 		v1beta.GET("/models", geminiHandlers.GeminiModels)
 		v1beta.POST("/models/*action", geminiHandlers.GeminiHandler)
@@ -392,9 +394,18 @@ func (s *Server) setupRoutes() {
 			},
 		})
 	})
-	s.engine.POST("/v1internal:method", AuthMiddleware(s.accessManager), geminiCLIHandlers.CLIHandler)
+	s.engine.POST("/v1internal:method", AuthMiddleware(s.accessManager), s.requestBodyAuditMiddleware(), geminiCLIHandlers.CLIHandler)
 
 	// Management routes are registered lazily by registerManagementRoutes when a secret is configured.
+}
+
+func (s *Server) requestBodyAuditMiddleware() gin.HandlerFunc {
+	return middleware.RequestBodyAuditMiddleware(func() config.RequestBodyAuditConfig {
+		if s == nil || s.cfg == nil {
+			return config.RequestBodyAuditConfig{}
+		}
+		return s.cfg.RequestBodyAudit
+	})
 }
 
 // AttachWebsocketRoute registers a websocket upgrade handler on the primary Gin engine.
@@ -520,6 +531,8 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.GET("/config", s.mgmt.GetConfig)
 		mgmt.GET("/config.yaml", s.mgmt.GetConfigYAML)
 		mgmt.PUT("/config.yaml", s.mgmt.PutConfigYAML)
+		mgmt.GET("/request-body-audit", s.mgmt.GetRequestBodyAudit)
+		mgmt.PUT("/request-body-audit", s.mgmt.PutRequestBodyAudit)
 		mgmt.GET("/latest-version", s.mgmt.GetLatestVersion)
 		mgmt.GET("/control-panel/update", s.mgmt.GetControlPanelUpdate)
 		mgmt.POST("/control-panel/update", s.mgmt.PostControlPanelUpdate)

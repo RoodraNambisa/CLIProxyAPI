@@ -160,6 +160,7 @@ func (m *AmpModule) registerManagementRoutes(engine *gin.Engine, baseHandler *ha
 		ampAPI.Use(auth)
 		authWithBypass = wrapManagementAuth(auth, "/threads", "/auth", "/docs", "/settings")
 	}
+	ampAPI.Use(m.requestBodyAuditMiddleware())
 
 	// Inject client API key into request context for per-client upstream routing
 	ampAPI.Use(clientAPIKeyMiddleware())
@@ -281,6 +282,7 @@ func (m *AmpModule) registerProviderAliases(engine *gin.Engine, baseHandler *han
 	if auth != nil {
 		ampProviders.Use(auth)
 	}
+	ampProviders.Use(m.requestBodyAuditMiddleware())
 	// Inject client API key into request context for per-client upstream routing
 	ampProviders.Use(clientAPIKeyMiddleware())
 

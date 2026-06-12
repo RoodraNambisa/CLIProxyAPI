@@ -136,3 +136,35 @@ func TestPutRoutingPriorityOverrides_RejectsDuplicatePriority(t *testing.T) {
 		t.Fatalf("PriorityOverrides = %+v, want unchanged empty", h.cfg.Routing.PriorityOverrides)
 	}
 }
+
+func TestPutRequestBodyAudit_NormalizesAndPersists(t *testing.T) {
+	t.Parallel()
+
+	h := &Handler{
+		cfg:            &config.Config{},
+		configFilePath: writeTestConfigFile(t),
+	}
+
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPut, "/v0/management/request-body-audit", bytes.NewBufferString(`{"value":{"enable":true,"keywords":[" blocked ",""],"keywords-base64":["@@bad@@"],"error":{"status-code":451,"message":"blocked","type":"policy_error","code":"policy_blocked"}}}`))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	h.PutRequestBodyAudit(c)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	if !h.cfg.RequestBodyAudit.Enable {
+		t.Fatal("request-body-audit.enable = false, want true")
+	}
+	if len(h.cfg.RequestBodyAudit.Keywords) != 1 || h.cfg.RequestBodyAudit.Keywords[0] != "blocked" {
+		t.Fatalf("keywords = %#v, want normalized keyword", h.cfg.RequestBodyAudit.Keywords)
+	}
+	if len(h.cfg.RequestBodyAudit.KeywordsBase64) != 0 {
+		t.Fatalf("keywords-base64 = %#v, want invalid entries dropped", h.cfg.RequestBodyAudit.KeywordsBase64)
+	}
+	if h.cfg.RequestBodyAudit.Error.StatusCode != http.StatusUnavailableForLegalReasons {
+		t.Fatalf("status-code = %d, want %d", h.cfg.RequestBodyAudit.Error.StatusCode, http.StatusUnavailableForLegalReasons)
+	}
+}

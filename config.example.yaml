@@ -114,6 +114,25 @@ fixed-error-cooldowns:
     cooldown-seconds: 2592000
     scope: auth
 
+# Block API requests when the raw request body contains configured byte keywords.
+# Matching is performed on raw request bytes before provider routing.
+request-body-audit:
+  enable: false
+  keywords: []
+  # Base64-encoded raw byte keywords for binary-safe matching.
+  keywords-base64: []
+  # false means case-insensitive matching after byte-level lowercasing.
+  case-sensitive: false
+  # 0 means read the full request body for auditing.
+  max-body-bytes: 0
+  # When max-body-bytes > 0, reject requests larger than that limit instead of scanning only the prefix.
+  reject-oversize: true
+  error:
+    status-code: 400
+    message: "Request body was rejected by policy."
+    type: "invalid_request_error"
+    code: "request_body_blocked"
+
 # Core auth auto-refresh worker pool size (OAuth/file-based auth token refresh).
 # When > 0, overrides the default worker count (16).
 # auth-auto-refresh-workers: 16

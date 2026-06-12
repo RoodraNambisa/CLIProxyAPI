@@ -6,6 +6,7 @@ package config
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -23,6 +24,11 @@ import (
 const (
 	DefaultPanelGitHubRepository = "https://github.com/RoodraNambisa/Cli-Proxy-API-Management-Center"
 	DefaultPprofAddr             = "127.0.0.1:8316"
+
+	DefaultRequestBodyAuditStatusCode = http.StatusBadRequest
+	DefaultRequestBodyAuditMessage    = "Request body was rejected by policy."
+	DefaultRequestBodyAuditType       = "invalid_request_error"
+	DefaultRequestBodyAuditCode       = "request_body_blocked"
 )
 
 // Config represents the application's configuration, loaded from a YAML file.
@@ -78,6 +84,9 @@ type Config struct {
 
 	// FixedErrorCooldowns overrides auth/model cooldown duration for matching status and error text.
 	FixedErrorCooldowns []FixedErrorCooldownRule `yaml:"fixed-error-cooldowns" json:"fixed-error-cooldowns"`
+
+	// RequestBodyAudit blocks API requests whose raw body contains configured byte keywords.
+	RequestBodyAudit RequestBodyAuditConfig `yaml:"request-body-audit" json:"request-body-audit"`
 
 	// AuthAutoRefreshWorkers overrides the size of the core auth auto-refresh worker pool.
 	// When <= 0, the default worker count is used.
@@ -283,6 +292,32 @@ type FixedErrorCooldownRule struct {
 	CooldownSeconds int `yaml:"cooldown-seconds" json:"cooldown-seconds"`
 	// Scope controls whether the rule cools only the model or the whole auth. Valid values: model, auth.
 	Scope string `yaml:"scope,omitempty" json:"scope,omitempty"`
+}
+
+// RequestBodyAuditConfig defines byte-level request body keyword blocking for model APIs.
+type RequestBodyAuditConfig struct {
+	Enable bool `yaml:"enable" json:"enable"`
+	// Keywords are UTF-8 strings matched against the raw request body bytes.
+	Keywords []string `yaml:"keywords,omitempty" json:"keywords,omitempty"`
+	// KeywordsBase64 are raw byte keywords encoded as base64 for YAML/JSON transport.
+	KeywordsBase64 []string `yaml:"keywords-base64,omitempty" json:"keywords-base64,omitempty"`
+	// CaseSensitive controls case folding before byte matching.
+	CaseSensitive bool `yaml:"case-sensitive" json:"case-sensitive"`
+	// MaxBodyBytes limits bytes read for auditing. Set 0 to read the complete request body.
+	MaxBodyBytes int64 `yaml:"max-body-bytes,omitempty" json:"max-body-bytes,omitempty"`
+	// RejectOversize rejects bodies larger than MaxBodyBytes when MaxBodyBytes > 0.
+	RejectOversize bool                        `yaml:"reject-oversize" json:"reject-oversize"`
+	Error          RequestBodyAuditErrorConfig `yaml:"error" json:"error"`
+
+	compiledKeywords [][]byte `yaml:"-" json:"-"`
+}
+
+// RequestBodyAuditErrorConfig defines the response returned when request body audit blocks a request.
+type RequestBodyAuditErrorConfig struct {
+	StatusCode int    `yaml:"status-code" json:"status-code"`
+	Message    string `yaml:"message" json:"message"`
+	Type       string `yaml:"type" json:"type"`
+	Code       string `yaml:"code,omitempty" json:"code,omitempty"`
 }
 
 // RoutingPriorityOverride overrides routing behavior for one credential priority.
@@ -711,6 +746,13 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	cfg.Pprof.Addr = DefaultPprofAddr
 	cfg.AmpCode.RestrictManagementToLocalhost = false // Default to false: API key auth is sufficient
 	cfg.RemoteManagement.PanelGitHubRepository = DefaultPanelGitHubRepository
+	cfg.RequestBodyAudit.RejectOversize = true
+	cfg.RequestBodyAudit.Error = RequestBodyAuditErrorConfig{
+		StatusCode: DefaultRequestBodyAuditStatusCode,
+		Message:    DefaultRequestBodyAuditMessage,
+		Type:       DefaultRequestBodyAuditType,
+		Code:       DefaultRequestBodyAuditCode,
+	}
 	cfg.Images.CodexModel = "gpt-5.4"
 	cfg.Images.ImageModel = "gpt-image-2"
 	defaultImagesNAggregation := false
@@ -820,6 +862,7 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	}
 	cfg.NoCooldownStatusCodes = NormalizeStatusCodes(cfg.NoCooldownStatusCodes)
 	cfg.FixedErrorCooldowns = NormalizeFixedErrorCooldowns(cfg.FixedErrorCooldowns)
+	cfg.NormalizeRequestBodyAudit()
 
 	// Sanitize Gemini API key configuration and migrate legacy entries.
 	cfg.SanitizeGeminiKeys()
@@ -1125,6 +1168,142 @@ func NormalizeFixedErrorCooldowns(rules []FixedErrorCooldownRule) []FixedErrorCo
 	}
 	if len(out) == 0 {
 		return nil
+	}
+	return out
+}
+
+// NormalizeRequestBodyAudit canonicalizes request body audit settings and compiles byte keywords.
+func (cfg *Config) NormalizeRequestBodyAudit() {
+	if cfg == nil {
+		return
+	}
+	cfg.RequestBodyAudit = NormalizeRequestBodyAudit(cfg.RequestBodyAudit)
+}
+
+// NormalizeRequestBodyAudit canonicalizes request body audit settings and compiles byte keywords.
+func NormalizeRequestBodyAudit(in RequestBodyAuditConfig) RequestBodyAuditConfig {
+	out := in
+	out.Keywords = normalizeRequestBodyAuditKeywords(in.Keywords)
+	out.KeywordsBase64 = normalizeRequestBodyAuditBase64Keywords(in.KeywordsBase64)
+	if out.MaxBodyBytes < 0 {
+		out.MaxBodyBytes = 0
+	}
+	out.Error = NormalizeRequestBodyAuditError(out.Error)
+	out.compiledKeywords = compileRequestBodyAuditKeywords(out.Keywords, out.KeywordsBase64, out.CaseSensitive)
+	return out
+}
+
+// NormalizeRequestBodyAuditError fills safe defaults for a request body audit error response.
+func NormalizeRequestBodyAuditError(in RequestBodyAuditErrorConfig) RequestBodyAuditErrorConfig {
+	out := in
+	if out.StatusCode < 100 || out.StatusCode > 599 {
+		out.StatusCode = DefaultRequestBodyAuditStatusCode
+	}
+	out.Message = strings.TrimSpace(out.Message)
+	if out.Message == "" {
+		out.Message = DefaultRequestBodyAuditMessage
+	}
+	out.Type = strings.TrimSpace(out.Type)
+	if out.Type == "" {
+		out.Type = DefaultRequestBodyAuditType
+	}
+	out.Code = strings.TrimSpace(out.Code)
+	if out.Code == "" {
+		out.Code = DefaultRequestBodyAuditCode
+	}
+	return out
+}
+
+// CompiledRequestBodyAuditKeywords returns byte keywords ready for request-body scanning.
+func CompiledRequestBodyAuditKeywords(cfg RequestBodyAuditConfig) [][]byte {
+	if len(cfg.compiledKeywords) > 0 {
+		return cloneByteSlices(cfg.compiledKeywords)
+	}
+	normalized := NormalizeRequestBodyAudit(cfg)
+	return cloneByteSlices(normalized.compiledKeywords)
+}
+
+func normalizeRequestBodyAuditKeywords(values []string) []string {
+	if len(values) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(values))
+	out := make([]string, 0, len(values))
+	for _, raw := range values {
+		value := strings.TrimSpace(raw)
+		if value == "" {
+			continue
+		}
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		out = append(out, value)
+	}
+	return out
+}
+
+func normalizeRequestBodyAuditBase64Keywords(values []string) []string {
+	if len(values) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(values))
+	out := make([]string, 0, len(values))
+	for _, raw := range values {
+		value := strings.TrimSpace(raw)
+		if value == "" {
+			continue
+		}
+		if _, err := base64.StdEncoding.DecodeString(value); err != nil {
+			continue
+		}
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		out = append(out, value)
+	}
+	return out
+}
+
+func compileRequestBodyAuditKeywords(keywords []string, base64Keywords []string, caseSensitive bool) [][]byte {
+	total := len(keywords) + len(base64Keywords)
+	if total == 0 {
+		return nil
+	}
+	out := make([][]byte, 0, total)
+	for _, keyword := range keywords {
+		data := []byte(keyword)
+		if !caseSensitive {
+			data = bytes.ToLower(data)
+		}
+		if len(data) > 0 {
+			out = append(out, data)
+		}
+	}
+	for _, encoded := range base64Keywords {
+		data, err := base64.StdEncoding.DecodeString(encoded)
+		if err != nil || len(data) == 0 {
+			continue
+		}
+		if !caseSensitive {
+			data = bytes.ToLower(data)
+		}
+		out = append(out, data)
+	}
+	return out
+}
+
+func cloneByteSlices(values [][]byte) [][]byte {
+	if len(values) == 0 {
+		return nil
+	}
+	out := make([][]byte, 0, len(values))
+	for _, value := range values {
+		if len(value) == 0 {
+			continue
+		}
+		out = append(out, bytes.Clone(value))
 	}
 	return out
 }
