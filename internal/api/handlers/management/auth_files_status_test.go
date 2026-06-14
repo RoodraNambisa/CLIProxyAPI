@@ -600,6 +600,207 @@ func TestPatchAuthFileStatus_ReenableClearsCooldownState(t *testing.T) {
 	}
 }
 
+func TestClearAllAuthCooldowns_ClearsCooldownState(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+
+	manager := coreauth.NewManager(nil, nil, nil)
+	retryAt := time.Now().Add(5 * time.Minute).UTC()
+	record := &coreauth.Auth{
+		ID:             "cooldown-all.json",
+		FileName:       "cooldown-all.json",
+		Provider:       "gemini",
+		Status:         coreauth.StatusError,
+		Unavailable:    true,
+		CooldownScope:  "auth",
+		StatusMessage:  "quota exhausted",
+		LastError:      &coreauth.Error{HTTPStatus: 429, Message: "quota exhausted"},
+		NextRetryAfter: retryAt,
+		Quota:          coreauth.QuotaState{Exceeded: true, NextRecoverAt: retryAt},
+		ModelStates: map[string]*coreauth.ModelState{
+			"gemini-2.5-pro": {
+				Status:         coreauth.StatusError,
+				StatusMessage:  "quota exhausted",
+				Unavailable:    true,
+				LastError:      &coreauth.Error{HTTPStatus: 429, Message: "quota exhausted"},
+				NextRetryAfter: retryAt,
+				Quota:          coreauth.QuotaState{Exceeded: true, NextRecoverAt: retryAt},
+			},
+		},
+	}
+	if _, errRegister := manager.Register(context.Background(), record); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+
+	disabled := &coreauth.Auth{
+		ID:             "cooldown-disabled.json",
+		FileName:       "cooldown-disabled.json",
+		Provider:       "gemini",
+		Status:         coreauth.StatusDisabled,
+		Disabled:       true,
+		Unavailable:    true,
+		CooldownScope:  "auth",
+		StatusMessage:  "disabled via management API",
+		NextRetryAfter: retryAt,
+		Quota:          coreauth.QuotaState{Exceeded: true, NextRecoverAt: retryAt},
+	}
+	if _, errRegister := manager.Register(context.Background(), disabled); errRegister != nil {
+		t.Fatalf("register disabled auth: %v", errRegister)
+	}
+
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, manager)
+
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v0/management/auth-files/cooldowns/clear", nil)
+
+	h.ClearAllAuthCooldowns(ctx)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	current, ok := manager.GetByID("cooldown-all.json")
+	if !ok || current == nil {
+		t.Fatal("expected auth to remain registered")
+	}
+	if current.Status != coreauth.StatusActive {
+		t.Fatalf("status = %q, want %q", current.Status, coreauth.StatusActive)
+	}
+	if current.Unavailable {
+		t.Fatal("expected auth unavailable flag to be cleared")
+	}
+	if !current.NextRetryAfter.IsZero() {
+		t.Fatalf("next retry after = %v, want zero", current.NextRetryAfter)
+	}
+	if current.CooldownScope != "" {
+		t.Fatalf("cooldown scope = %q, want empty", current.CooldownScope)
+	}
+	if current.LastError != nil {
+		t.Fatalf("last error = %#v, want nil", current.LastError)
+	}
+	if current.Quota.Exceeded {
+		t.Fatalf("quota = %#v, want zero state", current.Quota)
+	}
+	state := current.ModelStates["gemini-2.5-pro"]
+	if state == nil {
+		t.Fatal("expected model state to remain present")
+	}
+	if state.Status != coreauth.StatusActive {
+		t.Fatalf("model status = %q, want %q", state.Status, coreauth.StatusActive)
+	}
+	if state.Unavailable || !state.NextRetryAfter.IsZero() || state.LastError != nil || state.Quota.Exceeded {
+		t.Fatalf("model state = %#v, want cooldown cleared", state)
+	}
+
+	currentDisabled, ok := manager.GetByID("cooldown-disabled.json")
+	if !ok || currentDisabled == nil {
+		t.Fatal("expected disabled auth to remain registered")
+	}
+	if !currentDisabled.Disabled || currentDisabled.Status != coreauth.StatusDisabled {
+		t.Fatalf("disabled auth status = disabled:%v status:%q, want still disabled", currentDisabled.Disabled, currentDisabled.Status)
+	}
+	if currentDisabled.Unavailable || !currentDisabled.NextRetryAfter.IsZero() || currentDisabled.CooldownScope != "" {
+		t.Fatalf("disabled cooldown = unavailable:%v retry:%v scope:%q, want cooldown cleared only", currentDisabled.Unavailable, currentDisabled.NextRetryAfter, currentDisabled.CooldownScope)
+	}
+}
+
+func TestClearSelectedAuthCooldowns_ClearsOnlySelectedModels(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+
+	manager := coreauth.NewManager(nil, nil, nil)
+	retryA := time.Now().Add(5 * time.Minute).UTC()
+	retryB := time.Now().Add(10 * time.Minute).UTC()
+	record := &coreauth.Auth{
+		ID:             "cooldown-selected.json",
+		FileName:       "cooldown-selected.json",
+		Provider:       "gemini",
+		Status:         coreauth.StatusError,
+		Unavailable:    true,
+		CooldownScope:  "model",
+		StatusMessage:  "quota exhausted",
+		LastError:      &coreauth.Error{HTTPStatus: 429, Message: "quota exhausted"},
+		NextRetryAfter: retryA,
+		Quota:          coreauth.QuotaState{Exceeded: true, NextRecoverAt: retryA},
+		ModelStates: map[string]*coreauth.ModelState{
+			"gemini-2.5-pro": {
+				Status:         coreauth.StatusError,
+				StatusMessage:  "quota exhausted",
+				Unavailable:    true,
+				LastError:      &coreauth.Error{HTTPStatus: 429, Message: "quota exhausted"},
+				NextRetryAfter: retryA,
+				Quota:          coreauth.QuotaState{Exceeded: true, NextRecoverAt: retryA},
+			},
+			"gemini-2.5-flash": {
+				Status:         coreauth.StatusError,
+				StatusMessage:  "quota exhausted",
+				Unavailable:    true,
+				LastError:      &coreauth.Error{HTTPStatus: 429, Message: "quota exhausted"},
+				NextRetryAfter: retryB,
+				Quota:          coreauth.QuotaState{Exceeded: true, NextRecoverAt: retryB},
+			},
+		},
+	}
+	if _, errRegister := manager.Register(context.Background(), record); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, manager)
+
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	req := httptest.NewRequest(http.MethodPost, "/v0/management/auth-files/cooldowns/clear-selected", bytes.NewBufferString(`{"items":[{"name":"cooldown-selected.json","models":["gemini-2.5-pro"]}]}`))
+	req.Header.Set("Content-Type", "application/json")
+	ctx.Request = req
+
+	h.ClearSelectedAuthCooldowns(ctx)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	current, ok := manager.GetByID("cooldown-selected.json")
+	if !ok || current == nil {
+		t.Fatal("expected auth to remain registered")
+	}
+	if current.Unavailable {
+		t.Fatal("expected aggregate auth unavailable flag to be cleared after one model recovers")
+	}
+	if !current.NextRetryAfter.IsZero() {
+		t.Fatalf("aggregate next retry after = %v, want zero", current.NextRetryAfter)
+	}
+	selected := current.ModelStates["gemini-2.5-pro"]
+	if selected == nil {
+		t.Fatal("expected selected model state")
+	}
+	if selected.Status != coreauth.StatusActive || selected.Unavailable || !selected.NextRetryAfter.IsZero() || selected.LastError != nil {
+		t.Fatalf("selected model state = %#v, want cooldown cleared", selected)
+	}
+	other := current.ModelStates["gemini-2.5-flash"]
+	if other == nil {
+		t.Fatal("expected other model state")
+	}
+	if other.Status != coreauth.StatusError || !other.Unavailable || !other.NextRetryAfter.Equal(retryB) || other.LastError == nil {
+		t.Fatalf("other model state = %#v, want cooldown preserved", other)
+	}
+}
+
+func TestClearSelectedAuthCooldowns_RejectsEmptySelection(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+
+	manager := coreauth.NewManager(nil, nil, nil)
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, manager)
+
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	req := httptest.NewRequest(http.MethodPost, "/v0/management/auth-files/cooldowns/clear-selected", bytes.NewBufferString(`{}`))
+	req.Header.Set("Content-Type", "application/json")
+	ctx.Request = req
+
+	h.ClearSelectedAuthCooldowns(ctx)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusBadRequest, rec.Body.String())
+	}
+}
+
 type managementTestTokenStorage struct {
 	metadata map[string]any
 }
