@@ -755,6 +755,12 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	}
 	cfg.Images.CodexModel = "gpt-5.4"
 	cfg.Images.ImageModel = "gpt-image-2"
+	cfg.Images.Native.Generations.Models = defaultNativeImageModels()
+	cfg.Images.Native.Generations.UnsupportedModelStatusCode = http.StatusBadRequest
+	cfg.Images.Native.Generations.UnsupportedModelMessage = "Native image generation is not enabled for model {model}"
+	cfg.Images.Native.Edits.Models = defaultNativeImageModels()
+	cfg.Images.Native.Edits.UnsupportedModelStatusCode = http.StatusBadRequest
+	cfg.Images.Native.Edits.UnsupportedModelMessage = "Native image edit is not enabled for model {model}"
 	defaultImagesNAggregation := false
 	cfg.Images.EnableNAggregation = &defaultImagesNAggregation
 	cfg.Images.UnsupportedStatusCode = http.StatusBadRequest
@@ -825,6 +831,8 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	if cfg.Images.UnsupportedStatusCode < http.StatusBadRequest || cfg.Images.UnsupportedStatusCode > 599 {
 		cfg.Images.UnsupportedStatusCode = http.StatusBadRequest
 	}
+	normalizeNativeImageEndpointConfig(&cfg.Images.Native.Generations, "Native image generation is not enabled for model {model}")
+	normalizeNativeImageEndpointConfig(&cfg.Images.Native.Edits, "Native image edit is not enabled for model {model}")
 	if cfg.Streaming.StreamFlushIntervalMS < 0 {
 		cfg.Streaming.StreamFlushIntervalMS = 0
 	}
@@ -914,6 +922,49 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 
 	// Return the populated configuration struct.
 	return &cfg, nil
+}
+
+func defaultNativeImageModels() []string {
+	return []string{"gpt-image-2", "gpt-image-1.5"}
+}
+
+func normalizeNativeImageEndpointConfig(endpoint *NativeImageEndpointConfig, defaultMessage string) {
+	if endpoint == nil {
+		return
+	}
+	endpoint.Models = normalizeStringList(endpoint.Models)
+	if len(endpoint.Models) == 0 {
+		endpoint.Models = defaultNativeImageModels()
+	}
+	endpoint.ParamRules = normalizeStringList(endpoint.ParamRules)
+	if endpoint.UnsupportedModelStatusCode < http.StatusBadRequest || endpoint.UnsupportedModelStatusCode > 599 {
+		endpoint.UnsupportedModelStatusCode = http.StatusBadRequest
+	}
+	endpoint.UnsupportedModelMessage = strings.TrimSpace(endpoint.UnsupportedModelMessage)
+	if endpoint.UnsupportedModelMessage == "" {
+		endpoint.UnsupportedModelMessage = defaultMessage
+	}
+}
+
+func normalizeStringList(values []string) []string {
+	if len(values) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(values))
+	seen := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		key := strings.ToLower(value)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, value)
+	}
+	return out
 }
 
 // SanitizePayloadRules validates raw JSON payload rule params and drops invalid rules.

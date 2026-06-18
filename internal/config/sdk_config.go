@@ -93,4 +93,28 @@ type ImagesConfig struct {
 	StreamFlushIntervalMS int `yaml:"stream-flush-interval-ms,omitempty" json:"stream-flush-interval-ms,omitempty"`
 	// StreamFlushMinBytes flushes image streaming output once this many bytes are pending.
 	StreamFlushMinBytes int `yaml:"stream-flush-min-bytes,omitempty" json:"stream-flush-min-bytes,omitempty"`
+	// Native configures direct Codex Images API proxying.
+	Native NativeImagesConfig `yaml:"native,omitempty" json:"native,omitempty"`
+}
+
+// NativeImagesConfig holds direct Codex Images API configuration.
+type NativeImagesConfig struct {
+	// Generations configures POST /v1/images/generations native proxying.
+	Generations NativeImageEndpointConfig `yaml:"generations,omitempty" json:"generations,omitempty"`
+	// Edits configures POST /v1/images/edits native proxying.
+	Edits NativeImageEndpointConfig `yaml:"edits,omitempty" json:"edits,omitempty"`
+}
+
+// NativeImageEndpointConfig holds per-endpoint native Images API options.
+type NativeImageEndpointConfig struct {
+	// Enabled controls whether this endpoint uses the native Images API path.
+	Enabled bool `yaml:"enabled,omitempty" json:"enabled,omitempty"`
+	// Models lists image models allowed on the native path.
+	Models []string `yaml:"models,omitempty" json:"models,omitempty"`
+	// ParamRules deletes or overrides request parameters before forwarding.
+	ParamRules []string `yaml:"param-rules,omitempty" json:"param-rules,omitempty"`
+	// UnsupportedModelStatusCode is returned when native is enabled but the model is not allowed.
+	UnsupportedModelStatusCode int `yaml:"unsupported-model-status-code,omitempty" json:"unsupported-model-status-code,omitempty"`
+	// UnsupportedModelMessage is returned when native is enabled but the model is not allowed.
+	UnsupportedModelMessage string `yaml:"unsupported-model-message,omitempty" json:"unsupported-model-message,omitempty"`
 }

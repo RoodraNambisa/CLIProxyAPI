@@ -158,6 +158,112 @@ func TestRegisterModelsForAuth_CodexImageModelRespectsExcludedModels(t *testing.
 	}
 }
 
+func TestRegisterModelsForAuth_CodexNativeImageModelsWhenEnabled(t *testing.T) {
+	testCases := []struct {
+		name       string
+		native     config.NativeImagesConfig
+		wantModel  string
+		want       bool
+		planType   string
+		enableFree bool
+	}{
+		{
+			name: "native disabled does not expose default native models",
+			native: config.NativeImagesConfig{
+				Generations: config.NativeImageEndpointConfig{
+					Models: []string{"gpt-image-1.5"},
+				},
+			},
+			wantModel: "gpt-image-1.5",
+		},
+		{
+			name: "enabled generation model is registered",
+			native: config.NativeImagesConfig{
+				Generations: config.NativeImageEndpointConfig{
+					Enabled: true,
+					Models:  []string{"gpt-image-1.5"},
+				},
+			},
+			wantModel: "gpt-image-1.5",
+			want:      true,
+		},
+		{
+			name: "enabled edit default models are registered",
+			native: config.NativeImagesConfig{
+				Edits: config.NativeImageEndpointConfig{Enabled: true},
+			},
+			wantModel: "gpt-image-1.5",
+			want:      true,
+		},
+		{
+			name: "free plan still follows image permission",
+			native: config.NativeImagesConfig{
+				Generations: config.NativeImageEndpointConfig{
+					Enabled: true,
+					Models:  []string{"gpt-image-1.5"},
+				},
+			},
+			planType:  "free",
+			wantModel: "gpt-image-1.5",
+		},
+		{
+			name: "free plan opt in registers native models",
+			native: config.NativeImagesConfig{
+				Generations: config.NativeImageEndpointConfig{
+					Enabled: true,
+					Models:  []string{"gpt-image-1.5"},
+				},
+			},
+			planType:   "free",
+			enableFree: true,
+			wantModel:  "gpt-image-1.5",
+			want:       true,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			service := &Service{
+				cfg: &config.Config{
+					SDKConfig: config.SDKConfig{
+						Images: config.ImagesConfig{
+							ImageModel:               "gpt-image-2",
+							EnableFreePlanImageModel: tc.enableFree,
+							Native:                   tc.native,
+						},
+					},
+				},
+			}
+			auth := &coreauth.Auth{
+				ID:       "auth-codex-native-image-" + strings.ReplaceAll(tc.name, " ", "-"),
+				Provider: "codex",
+				Status:   coreauth.StatusActive,
+				Attributes: map[string]string{
+					"plan_type": tc.planType,
+				},
+			}
+			reg := GlobalModelRegistry()
+			reg.UnregisterClient(auth.ID)
+			t.Cleanup(func() {
+				reg.UnregisterClient(auth.ID)
+			})
+
+			service.registerModelsForAuth(auth)
+
+			hasModel := false
+			for _, model := range registry.GetGlobalRegistry().GetModelsForClient(auth.ID) {
+				if model != nil && strings.EqualFold(strings.TrimSpace(model.ID), tc.wantModel) {
+					hasModel = true
+					break
+				}
+			}
+			if hasModel != tc.want {
+				t.Fatalf("native image model presence = %v, want %v", hasModel, tc.want)
+			}
+		})
+	}
+}
+
 func TestRegisterModelsForAuth_CodexCustomModelsFollowPlanGroups(t *testing.T) {
 	testCases := []struct {
 		name     string

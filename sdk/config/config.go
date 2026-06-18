@@ -12,6 +12,8 @@ type Config = internalconfig.Config
 
 type StreamingConfig = internalconfig.StreamingConfig
 type ImagesConfig = internalconfig.ImagesConfig
+type NativeImagesConfig = internalconfig.NativeImagesConfig
+type NativeImageEndpointConfig = internalconfig.NativeImageEndpointConfig
 type TLSConfig = internalconfig.TLSConfig
 type RemoteManagement = internalconfig.RemoteManagement
 type AuthMaintenanceConfig = internalconfig.AuthMaintenanceConfig

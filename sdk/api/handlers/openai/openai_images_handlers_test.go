@@ -29,6 +29,7 @@ type imageCaptureExecutor struct {
 	payload      []byte
 	stream       bool
 	sourceFormat string
+	alt          string
 	response     []byte
 	streamChunks []coreexecutor.StreamChunk
 }
@@ -43,6 +44,7 @@ func (e *imageCaptureExecutor) Execute(ctx context.Context, auth *coreauth.Auth,
 	e.payload = append([]byte(nil), req.Payload...)
 	e.stream = opts.Stream
 	e.sourceFormat = opts.SourceFormat.String()
+	e.alt = opts.Alt
 	if len(e.response) == 0 {
 		e.response = []byte(`{"created_at":1700000000,"output":[{"type":"image_generation_call","result":"aGVsbG8=","revised_prompt":"rev"}],"usage":{"total_tokens":3}}`)
 	}
@@ -57,6 +59,7 @@ func (e *imageCaptureExecutor) ExecuteStream(_ context.Context, _ *coreauth.Auth
 	e.payload = append([]byte(nil), req.Payload...)
 	e.stream = opts.Stream
 	e.sourceFormat = opts.SourceFormat.String()
+	e.alt = opts.Alt
 	ch := make(chan coreexecutor.StreamChunk, len(e.streamChunks))
 	for _, chunk := range e.streamChunks {
 		ch <- chunk
@@ -187,6 +190,122 @@ func TestOpenAIImagesGenerationsNonStreamingUsesCodexImageTool(t *testing.T) {
 	}
 	if got := gjson.Get(resp.Body.String(), "usage.total_tokens").Int(); got != 3 {
 		t.Fatalf("usage.total_tokens = %d", got)
+	}
+}
+
+func TestOpenAIImagesNativeGenerationsDirectProxyAppliesParamRules(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	executor := &imageCaptureExecutor{
+		response: []byte(`{"created":1700000000,"data":[{"b64_json":"bmF0aXZl"}]}`),
+	}
+	h := newImagesTestHandler(t, executor, "gpt-image-2")
+	h.Cfg.Images.Native.Generations.Enabled = true
+	h.Cfg.Images.Native.Generations.Models = []string{"gpt-image-2"}
+	h.Cfg.Images.Native.Generations.UnsupportedModelStatusCode = http.StatusBadRequest
+	h.Cfg.Images.Native.Generations.UnsupportedModelMessage = "native generation disabled for {model}"
+	h.Cfg.Images.Native.Generations.ParamRules = []string{"n", "background=transparent", "partial_images=2"}
+	router := gin.New()
+	router.POST("/v1/images/generations", h.Generations)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/images/generations", strings.NewReader(`{"model":"gpt-image-2","prompt":"draw","n":3,"background":"auto"}`))
+	req.Header.Set("Content-Type", "application/json")
+	resp := httptest.NewRecorder()
+	router.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d, body=%s", resp.Code, http.StatusOK, resp.Body.String())
+	}
+	if executor.calls != 1 {
+		t.Fatalf("executor calls = %d, want 1", executor.calls)
+	}
+	if executor.sourceFormat != nativeImagesHandlerType {
+		t.Fatalf("source format = %q, want %s", executor.sourceFormat, nativeImagesHandlerType)
+	}
+	if executor.alt != nativeImagesGenerations {
+		t.Fatalf("alt = %q, want %s", executor.alt, nativeImagesGenerations)
+	}
+	if got := gjson.GetBytes(executor.payload, "model").String(); got != "gpt-image-2" {
+		t.Fatalf("payload model = %q", got)
+	}
+	if got := gjson.GetBytes(executor.payload, "tools"); got.Exists() {
+		t.Fatalf("tools exists = %s, want absent", got.Raw)
+	}
+	if got := gjson.GetBytes(executor.payload, "n"); got.Exists() {
+		t.Fatalf("n exists = %s, want absent", got.Raw)
+	}
+	if got := gjson.GetBytes(executor.payload, "background").String(); got != "transparent" {
+		t.Fatalf("background = %q, want transparent", got)
+	}
+	if got := gjson.GetBytes(executor.payload, "partial_images").Int(); got != 2 {
+		t.Fatalf("partial_images = %d, want 2", got)
+	}
+	if got := gjson.Get(resp.Body.String(), "data.0.b64_json").String(); got != "bmF0aXZl" {
+		t.Fatalf("native response not forwarded, b64_json = %q", got)
+	}
+}
+
+func TestOpenAIImagesNativeGenerationsRejectsUnsupportedModel(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	executor := &imageCaptureExecutor{}
+	h := newImagesTestHandler(t, executor, "gpt-image-2", "gpt-image-1.5")
+	h.Cfg.Images.Native.Generations.Enabled = true
+	h.Cfg.Images.Native.Generations.Models = []string{"gpt-image-2"}
+	h.Cfg.Images.Native.Generations.UnsupportedModelStatusCode = http.StatusConflict
+	h.Cfg.Images.Native.Generations.UnsupportedModelMessage = "no native generation for {model}"
+	router := gin.New()
+	router.POST("/v1/images/generations", h.Generations)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/images/generations", strings.NewReader(`{"model":"gpt-image-1.5","prompt":"draw"}`))
+	req.Header.Set("Content-Type", "application/json")
+	resp := httptest.NewRecorder()
+	router.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want %d, body=%s", resp.Code, http.StatusConflict, resp.Body.String())
+	}
+	if executor.calls != 0 || executor.streamCalls != 0 {
+		t.Fatalf("executor calls = %d streamCalls = %d, want none", executor.calls, executor.streamCalls)
+	}
+	if !strings.Contains(resp.Body.String(), "no native generation for gpt-image-1.5") {
+		t.Fatalf("body = %s, want custom unsupported model message", resp.Body.String())
+	}
+}
+
+func TestOpenAIImagesNativeGenerationsStreamsUpstreamEvents(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	executor := &imageCaptureExecutor{
+		streamChunks: []coreexecutor.StreamChunk{
+			{Payload: []byte("event: image_generation.partial_image\n")},
+			{Payload: []byte(`data: {"type":"image_generation.partial_image","b64_json":"cGFydA=="}` + "\n\n")},
+		},
+	}
+	h := newImagesTestHandler(t, executor, "gpt-image-2")
+	h.Cfg.Images.Native.Generations.Enabled = true
+	h.Cfg.Images.Native.Generations.Models = []string{"gpt-image-2"}
+	h.Cfg.Images.Native.Generations.UnsupportedModelStatusCode = http.StatusBadRequest
+	h.Cfg.Images.Native.Generations.UnsupportedModelMessage = "native generation disabled for {model}"
+	router := gin.New()
+	router.POST("/v1/images/generations", h.Generations)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/images/generations", strings.NewReader(`{"model":"gpt-image-2","prompt":"draw","stream":true}`))
+	req.Header.Set("Content-Type", "application/json")
+	resp := httptest.NewRecorder()
+	router.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d, body=%s", resp.Code, http.StatusOK, resp.Body.String())
+	}
+	if executor.streamCalls != 1 {
+		t.Fatalf("streamCalls = %d, want 1", executor.streamCalls)
+	}
+	if executor.sourceFormat != nativeImagesHandlerType {
+		t.Fatalf("source format = %q, want %s", executor.sourceFormat, nativeImagesHandlerType)
+	}
+	if executor.alt != nativeImagesGenerations {
+		t.Fatalf("alt = %q, want %s", executor.alt, nativeImagesGenerations)
+	}
+	if !strings.Contains(resp.Body.String(), "image_generation.partial_image") {
+		t.Fatalf("body = %q, want upstream image event", resp.Body.String())
 	}
 }
 
@@ -530,6 +649,108 @@ func TestOpenAIImagesEditsMultipartBuildsDataURLsAndMask(t *testing.T) {
 	maskURL := gjson.GetBytes(executor.payload, "tools.0.input_image_mask.image_url").String()
 	if !strings.HasPrefix(maskURL, "data:image/png;base64,") {
 		t.Fatalf("mask image_url = %q", maskURL)
+	}
+}
+
+func TestOpenAIImagesNativeEditsJSONForwardsFileIDs(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	executor := &imageCaptureExecutor{
+		response: []byte(`{"created":1700000000,"data":[{"b64_json":"ZWRpdA=="}]}`),
+	}
+	h := newImagesTestHandler(t, executor, "gpt-image-2")
+	h.Cfg.Images.Native.Edits.Enabled = true
+	h.Cfg.Images.Native.Edits.Models = []string{"gpt-image-2"}
+	h.Cfg.Images.Native.Edits.UnsupportedModelStatusCode = http.StatusBadRequest
+	h.Cfg.Images.Native.Edits.UnsupportedModelMessage = "native edit disabled for {model}"
+	router := gin.New()
+	router.POST("/v1/images/edits", h.Edits)
+
+	raw := `{"model":"gpt-image-2","prompt":"edit this","images":[{"file_id":"file_image"},{"image_url":"https://example.com/image.png"}],"mask":{"file_id":"file_mask"}}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/images/edits", strings.NewReader(raw))
+	req.Header.Set("Content-Type", "application/json")
+	resp := httptest.NewRecorder()
+	router.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d, body=%s", resp.Code, http.StatusOK, resp.Body.String())
+	}
+	if executor.calls != 1 {
+		t.Fatalf("executor calls = %d, want 1", executor.calls)
+	}
+	if executor.sourceFormat != nativeImagesHandlerType {
+		t.Fatalf("source format = %q, want %s", executor.sourceFormat, nativeImagesHandlerType)
+	}
+	if executor.alt != nativeImagesEdits {
+		t.Fatalf("alt = %q, want %s", executor.alt, nativeImagesEdits)
+	}
+	if got := gjson.GetBytes(executor.payload, "images.0.file_id").String(); got != "file_image" {
+		t.Fatalf("images.0.file_id = %q", got)
+	}
+	if got := gjson.GetBytes(executor.payload, "mask.file_id").String(); got != "file_mask" {
+		t.Fatalf("mask.file_id = %q", got)
+	}
+	if got := gjson.GetBytes(executor.payload, "images.1.image_url").String(); got != "https://example.com/image.png" {
+		t.Fatalf("images.1.image_url = %q", got)
+	}
+}
+
+func TestOpenAIImagesNativeEditsMultipartConvertsToDataURLJSON(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	executor := &imageCaptureExecutor{
+		response: []byte(`{"created":1700000000,"data":[{"b64_json":"ZWRpdA=="}]}`),
+	}
+	h := newImagesTestHandler(t, executor, "gpt-image-2")
+	h.Cfg.Images.Native.Edits.Enabled = true
+	h.Cfg.Images.Native.Edits.Models = []string{"gpt-image-2"}
+	h.Cfg.Images.Native.Edits.UnsupportedModelStatusCode = http.StatusBadRequest
+	h.Cfg.Images.Native.Edits.UnsupportedModelMessage = "native edit disabled for {model}"
+	router := gin.New()
+	router.POST("/v1/images/edits", h.Edits)
+
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	if err := writer.WriteField("model", "gpt-image-2"); err != nil {
+		t.Fatalf("WriteField model: %v", err)
+	}
+	if err := writer.WriteField("prompt", "edit this"); err != nil {
+		t.Fatalf("WriteField prompt: %v", err)
+	}
+	if err := writer.WriteField("n", "1"); err != nil {
+		t.Fatalf("WriteField n: %v", err)
+	}
+	imagePart, err := writer.CreateFormFile("image", "image.png")
+	if err != nil {
+		t.Fatalf("CreateFormFile image: %v", err)
+	}
+	_, _ = imagePart.Write([]byte("\x89PNG\r\n\x1a\nimage-data"))
+	maskPart, err := writer.CreateFormFile("mask", "mask.png")
+	if err != nil {
+		t.Fatalf("CreateFormFile mask: %v", err)
+	}
+	_, _ = maskPart.Write([]byte("\x89PNG\r\n\x1a\nmask-data"))
+	if err := writer.Close(); err != nil {
+		t.Fatalf("Close writer: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/images/edits", &body)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	resp := httptest.NewRecorder()
+	router.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d, body=%s", resp.Code, http.StatusOK, resp.Body.String())
+	}
+	if got := gjson.GetBytes(executor.payload, "tools"); got.Exists() {
+		t.Fatalf("tools exists = %s, want absent", got.Raw)
+	}
+	if got := gjson.GetBytes(executor.payload, "images.0.image_url").String(); !strings.HasPrefix(got, "data:image/png;base64,") {
+		t.Fatalf("images.0.image_url = %q", got)
+	}
+	if got := gjson.GetBytes(executor.payload, "mask.image_url").String(); !strings.HasPrefix(got, "data:image/png;base64,") {
+		t.Fatalf("mask.image_url = %q", got)
+	}
+	if got := gjson.GetBytes(executor.payload, "n").Int(); got != 1 {
+		t.Fatalf("n = %d, want 1", got)
 	}
 }
 

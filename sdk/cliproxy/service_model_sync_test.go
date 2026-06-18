@@ -273,6 +273,57 @@ func TestShouldRefreshCodexRegistrations(t *testing.T) {
 			want: true,
 		},
 		{
+			name: "native image models changed",
+			previous: &config.Config{SDKConfig: config.SDKConfig{
+				Images: config.ImagesConfig{
+					ImageModel: "gpt-image-2",
+					Native: config.NativeImagesConfig{
+						Generations: config.NativeImageEndpointConfig{
+							Enabled: true,
+							Models:  []string{"gpt-image-2"},
+						},
+					},
+				},
+			}},
+			next: &config.Config{SDKConfig: config.SDKConfig{
+				Images: config.ImagesConfig{
+					ImageModel: "gpt-image-2",
+					Native: config.NativeImagesConfig{
+						Generations: config.NativeImageEndpointConfig{
+							Enabled: true,
+							Models:  []string{"gpt-image-2", "gpt-image-1.5"},
+						},
+					},
+				},
+			}},
+			want: true,
+		},
+		{
+			name: "native image enabled changed",
+			previous: &config.Config{SDKConfig: config.SDKConfig{
+				Images: config.ImagesConfig{
+					ImageModel: "gpt-image-2",
+					Native: config.NativeImagesConfig{
+						Generations: config.NativeImageEndpointConfig{
+							Models: []string{"gpt-image-1.5"},
+						},
+					},
+				},
+			}},
+			next: &config.Config{SDKConfig: config.SDKConfig{
+				Images: config.ImagesConfig{
+					ImageModel: "gpt-image-2",
+					Native: config.NativeImagesConfig{
+						Generations: config.NativeImageEndpointConfig{
+							Enabled: true,
+							Models:  []string{"gpt-image-1.5"},
+						},
+					},
+				},
+			}},
+			want: true,
+		},
+		{
 			name: "custom models changed",
 			previous: &config.Config{
 				CodexCustomModels: []config.CodexCustomModel{

@@ -205,6 +205,19 @@ nonstream-keepalive-interval: 0
 #   enable-stream-flush: true        # Allow image stream flush batching. Uses image or global streaming thresholds.
 #   stream-flush-interval-ms: 0      # Image-specific flush interval. 0 falls back to streaming.stream-flush-interval-ms.
 #   stream-flush-min-bytes: 0        # Image-specific byte threshold. 0 falls back to streaming.stream-flush-min-bytes.
+#   native:
+#     generations:
+#       enabled: false
+#       models: ["gpt-image-2", "gpt-image-1.5"]
+#       param-rules: []              # Native-only rules. "n" deletes, "n=1" overrides, JSON values keep JSON types.
+#       unsupported-model-status-code: 400
+#       unsupported-model-message: "Native image generation is not enabled for model {model}"
+#     edits:
+#       enabled: false
+#       models: ["gpt-image-2", "gpt-image-1.5"]
+#       param-rules: []
+#       unsupported-model-status-code: 400
+#       unsupported-model-message: "Native image edit is not enabled for model {model}"
 # Streaming behavior (SSE keep-alives + safe bootstrap retries).
 # streaming:
 #   keepalive-seconds: 15            # Default: 0 (disabled). <= 0 disables keep-alives.

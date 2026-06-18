@@ -21,6 +21,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/api/handlers"
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v6/sdk/config"
 	"github.com/tidwall/gjson"
+	"github.com/tidwall/sjson"
 )
 
 const (
@@ -28,6 +29,9 @@ const (
 	defaultImagesImageModel = "gpt-image-2"
 	maxImageUploadBytes     = 50 << 20
 	maxImageMultipartBytes  = 220 << 20
+	nativeImagesHandlerType = "openai-image"
+	nativeImagesGenerations = "images/generations"
+	nativeImagesEdits       = "images/edits"
 )
 
 type imageOperation struct {
@@ -183,6 +187,21 @@ func (e imageUnsupportedError) Unwrap() error {
 
 // Generations handles POST /v1/images/generations.
 func (h *OpenAIImagesAPIHandler) Generations(c *gin.Context) {
+	if h.imagesNativeEnabled(imageGenerationOperation) {
+		rawJSON, err := io.ReadAll(c.Request.Body)
+		if err != nil {
+			h.writeImagesRequestError(c, fmt.Errorf("invalid request: %w", err))
+			return
+		}
+		req, err := parseImageGenerationRequestBytes(rawJSON)
+		if err != nil {
+			h.writeImagesRequestError(c, err)
+			return
+		}
+		h.handleNativeImagesRequest(c, rawJSON, req, imageGenerationOperation)
+		return
+	}
+
 	req, err := parseImageGenerationRequest(c)
 	if err != nil {
 		h.writeImagesRequestError(c, err)
@@ -197,6 +216,16 @@ func (h *OpenAIImagesAPIHandler) Generations(c *gin.Context) {
 
 // Edits handles POST /v1/images/edits.
 func (h *OpenAIImagesAPIHandler) Edits(c *gin.Context) {
+	if h.imagesNativeEnabled(imageEditOperation) {
+		req, rawJSON, err := h.parseNativeImageEditRequest(c)
+		if err != nil {
+			h.writeImagesRequestError(c, err)
+			return
+		}
+		h.handleNativeImagesRequest(c, rawJSON, req, imageEditOperation)
+		return
+	}
+
 	req, err := parseImageEditRequest(c)
 	if err != nil {
 		h.writeImagesRequestError(c, err)
@@ -233,6 +262,87 @@ func (h *OpenAIImagesAPIHandler) handleImagesRequest(c *gin.Context, req openAII
 		return
 	}
 	h.handleNonStreamingImagesResponse(c, rawJSON, imageModel, codexModel, count, responseFormat)
+}
+
+func (h *OpenAIImagesAPIHandler) handleNativeImagesRequest(c *gin.Context, rawJSON []byte, req openAIImageRequest, op imageOperation) {
+	cfg := h.nativeImageEndpointConfig(op)
+	imageModel := strings.TrimSpace(req.Model)
+	if imageModel == "" {
+		imageModel = h.imagesImageModel()
+	}
+	if !nativeImageModelAllowed(cfg.Models, imageModel) {
+		h.writeImagesError(c, cfg.UnsupportedModelStatusCode, errors.New(nativeImageUnsupportedModelMessage(cfg.UnsupportedModelMessage, imageModel)))
+		return
+	}
+	if strings.TrimSpace(req.Prompt) == "" {
+		h.writeImagesError(c, http.StatusBadRequest, errors.New("prompt is required"))
+		return
+	}
+	if op.action == imageEditOperation.action && len(req.Images) == 0 {
+		h.writeImagesError(c, http.StatusBadRequest, errors.New("at least one image is required"))
+		return
+	}
+	rawJSON, _ = sjson.SetBytes(rawJSON, "model", imageModel)
+	rawJSON = applyNativeImageParamRules(rawJSON, cfg.ParamRules)
+	if req.Stream {
+		h.handleNativeStreamingImagesResponse(c, rawJSON, imageModel, op)
+		return
+	}
+	h.handleNativeNonStreamingImagesResponse(c, rawJSON, imageModel, op)
+}
+
+func (h *OpenAIImagesAPIHandler) handleNativeNonStreamingImagesResponse(c *gin.Context, rawJSON []byte, imageModel string, op imageOperation) {
+	c.Header("Content-Type", "application/json")
+	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
+	stopKeepAlive := h.StartNonStreamingKeepAlive(c, cliCtx)
+	resp, headers, errMsg := h.ExecuteWithProvidersAndExecutionModel(cliCtx, []string{Codex}, nativeImagesHandlerType, imageModel, "", rawJSON, nativeImagesAlt(op))
+	stopKeepAlive()
+	if errMsg != nil {
+		h.WriteErrorResponse(c, errMsg)
+		cliCancel(errMsg.Error)
+		return
+	}
+	handlers.WriteUpstreamHeaders(c.Writer.Header(), headers)
+	_, _ = c.Writer.Write(resp)
+	cliCancel(resp)
+}
+
+func (h *OpenAIImagesAPIHandler) handleNativeStreamingImagesResponse(c *gin.Context, rawJSON []byte, imageModel string, op imageOperation) {
+	flusher, ok := c.Writer.(http.Flusher)
+	if !ok {
+		h.writeImagesError(c, http.StatusInternalServerError, errors.New("streaming not supported"))
+		return
+	}
+	c.Header("Content-Type", "text/event-stream")
+	c.Header("Cache-Control", "no-cache")
+	c.Header("Connection", "keep-alive")
+	c.Header("Access-Control-Allow-Origin", "*")
+
+	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
+	dataChan, upstreamHeaders, errChan := h.ExecuteStreamWithProvidersAndExecutionModel(cliCtx, []string{Codex}, nativeImagesHandlerType, imageModel, "", rawJSON, nativeImagesAlt(op))
+	handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
+	h.ForwardStream(c, flusher, func(err error) { cliCancel(err) }, dataChan, errChan, handlers.StreamForwardOptions{
+		FlushInterval: imageStreamFlushInterval(h.Cfg),
+		FlushMinBytes: imageStreamFlushMinBytes(h.Cfg),
+		WriteChunk: func(chunk []byte) {
+			_, _ = c.Writer.Write(chunk)
+		},
+		WriteTerminalError: func(errMsg *interfaces.ErrorMessage) {
+			if errMsg == nil {
+				return
+			}
+			status := http.StatusInternalServerError
+			if errMsg.StatusCode > 0 {
+				status = errMsg.StatusCode
+			}
+			errText := http.StatusText(status)
+			if errMsg.Error != nil && strings.TrimSpace(errMsg.Error.Error()) != "" {
+				errText = errMsg.Error.Error()
+			}
+			body := handlers.BuildErrorResponseBody(status, errText)
+			_, _ = fmt.Fprintf(c.Writer, "\nevent: error\ndata: %s\n\n", string(body))
+		},
+	})
 }
 
 func (h *OpenAIImagesAPIHandler) handleNonStreamingImagesResponse(c *gin.Context, rawJSON []byte, imageModel, codexModel string, count int, responseFormat string) {
@@ -431,8 +541,16 @@ func (h *OpenAIImagesAPIHandler) forwardImagesStream(c *gin.Context, flusher htt
 }
 
 func parseImageGenerationRequest(c *gin.Context) (openAIImageRequest, error) {
+	rawJSON, err := io.ReadAll(c.Request.Body)
+	if err != nil {
+		return openAIImageRequest{}, fmt.Errorf("invalid request: %w", err)
+	}
+	return parseImageGenerationRequestBytes(rawJSON)
+}
+
+func parseImageGenerationRequestBytes(rawJSON []byte) (openAIImageRequest, error) {
 	var req openAIImageRequest
-	if err := json.NewDecoder(c.Request.Body).Decode(&req); err != nil {
+	if err := json.Unmarshal(rawJSON, &req); err != nil {
 		return req, fmt.Errorf("invalid request: %w", err)
 	}
 	return req, nil
@@ -444,13 +562,47 @@ func parseImageEditRequest(c *gin.Context) (openAIImageRequest, error) {
 	if err == nil && strings.EqualFold(mediaType, "multipart/form-data") {
 		return parseMultipartImageEditRequest(c)
 	}
+	rawJSON, err := io.ReadAll(c.Request.Body)
+	if err != nil {
+		return openAIImageRequest{}, fmt.Errorf("invalid request: %w", err)
+	}
+	return parseJSONImageEditRequest(rawJSON, false)
+}
+
+func (h *OpenAIImagesAPIHandler) parseNativeImageEditRequest(c *gin.Context) (openAIImageRequest, []byte, error) {
+	contentType := c.GetHeader("Content-Type")
+	mediaType, _, err := mime.ParseMediaType(contentType)
+	if err == nil && strings.EqualFold(mediaType, "multipart/form-data") {
+		req, errParse := parseMultipartImageEditRequest(c)
+		if errParse != nil {
+			return req, nil, errParse
+		}
+		rawJSON, errBuild := buildNativeImageRequestJSON(req)
+		if errBuild != nil {
+			return req, nil, errBuild
+		}
+		return req, rawJSON, nil
+	}
+
+	rawJSON, err := io.ReadAll(c.Request.Body)
+	if err != nil {
+		return openAIImageRequest{}, nil, fmt.Errorf("invalid request: %w", err)
+	}
+	req, err := parseJSONImageEditRequest(rawJSON, true)
+	return req, rawJSON, err
+}
+
+func parseJSONImageEditRequest(rawJSON []byte, allowFileID bool) (openAIImageRequest, error) {
 	var req openAIImageRequest
-	if err := json.NewDecoder(c.Request.Body).Decode(&req); err != nil {
+	if err := json.Unmarshal(rawJSON, &req); err != nil {
 		return req, fmt.Errorf("invalid request: %w", err)
 	}
 	for i := range req.Images {
-		if strings.TrimSpace(req.Images[i].FileID) != "" {
+		if strings.TrimSpace(req.Images[i].FileID) != "" && !allowFileID {
 			return req, unsupportedImageErrorf("JSON image file_id is not supported")
+		}
+		if strings.TrimSpace(req.Images[i].FileID) != "" {
+			continue
 		}
 		imageURL, err := imageURLFromReference(req.Images[i])
 		if err != nil {
@@ -459,8 +611,11 @@ func parseImageEditRequest(c *gin.Context) (openAIImageRequest, error) {
 		req.Images[i].ImageURL = imageURL
 	}
 	if req.Mask != nil {
-		if strings.TrimSpace(req.Mask.FileID) != "" {
+		if strings.TrimSpace(req.Mask.FileID) != "" && !allowFileID {
 			return req, unsupportedImageErrorf("JSON mask file_id is not supported")
+		}
+		if strings.TrimSpace(req.Mask.FileID) != "" {
+			return req, nil
 		}
 		maskURL, err := imageURLFromReference(*req.Mask)
 		if err != nil {
@@ -639,6 +794,61 @@ func buildCodexImageResponsesPayload(req openAIImageRequest, op imageOperation, 
 		"tools":       []map[string]any{tool},
 		"tool_choice": map[string]any{"type": "image_generation"},
 	}, nil
+}
+
+func buildNativeImageRequestJSON(req openAIImageRequest) ([]byte, error) {
+	body := map[string]any{}
+	setOptionalString(body, "model", req.Model)
+	setOptionalString(body, "prompt", req.Prompt)
+	setOptionalString(body, "size", req.Size)
+	setOptionalString(body, "quality", req.Quality)
+	setOptionalString(body, "background", req.Background)
+	setOptionalString(body, "output_format", req.OutputFormat)
+	setOptionalString(body, "input_fidelity", req.InputFidelity)
+	setOptionalString(body, "moderation", req.Moderation)
+	setOptionalString(body, "response_format", req.ResponseFormat)
+	if req.N != nil {
+		body["n"] = *req.N
+	}
+	if req.OutputCompression != nil {
+		body["output_compression"] = *req.OutputCompression
+	}
+	if req.PartialImages != nil {
+		body["partial_images"] = *req.PartialImages
+	}
+	if req.Stream {
+		body["stream"] = true
+	}
+	if len(req.Images) > 0 {
+		images := make([]map[string]any, 0, len(req.Images))
+		for i := range req.Images {
+			ref, err := nativeImageReferenceMap(req.Images[i])
+			if err != nil {
+				return nil, fmt.Errorf("invalid images[%d]: %w", i, err)
+			}
+			images = append(images, ref)
+		}
+		body["images"] = images
+	}
+	if req.Mask != nil {
+		mask, err := nativeImageReferenceMap(*req.Mask)
+		if err != nil {
+			return nil, fmt.Errorf("invalid mask: %w", err)
+		}
+		body["mask"] = mask
+	}
+	return json.Marshal(body)
+}
+
+func nativeImageReferenceMap(ref imageReference) (map[string]any, error) {
+	if fileID := strings.TrimSpace(ref.FileID); fileID != "" {
+		return map[string]any{"file_id": fileID}, nil
+	}
+	imageURL, err := imageURLFromReference(ref)
+	if err != nil {
+		return nil, err
+	}
+	return map[string]any{"image_url": imageURL}, nil
 }
 
 func shouldForwardInputFidelity(overrideInputFidelity bool) bool {
@@ -1340,6 +1550,123 @@ func (h *OpenAIImagesAPIHandler) imagesOverrideInputFidelityEnabled() bool {
 		return h.Cfg.Images.OverrideUnsupportedParams
 	}
 	return false
+}
+
+func (h *OpenAIImagesAPIHandler) imagesNativeEnabled(op imageOperation) bool {
+	return h.nativeImageEndpointConfig(op).Enabled
+}
+
+func (h *OpenAIImagesAPIHandler) nativeImageEndpointConfig(op imageOperation) sdkconfig.NativeImageEndpointConfig {
+	defaultMessage := "Native image generation is not enabled for model {model}"
+	if h == nil || h.Cfg == nil {
+		return nativeImageEndpointConfigWithDefaults(sdkconfig.NativeImageEndpointConfig{}, defaultMessage)
+	}
+	if op.action == imageEditOperation.action {
+		defaultMessage = "Native image edit is not enabled for model {model}"
+		return nativeImageEndpointConfigWithDefaults(h.Cfg.Images.Native.Edits, defaultMessage)
+	}
+	return nativeImageEndpointConfigWithDefaults(h.Cfg.Images.Native.Generations, defaultMessage)
+}
+
+func nativeImageEndpointConfigWithDefaults(cfg sdkconfig.NativeImageEndpointConfig, defaultMessage string) sdkconfig.NativeImageEndpointConfig {
+	if len(cfg.Models) == 0 {
+		cfg.Models = []string{"gpt-image-2", "gpt-image-1.5"}
+	}
+	if cfg.UnsupportedModelStatusCode < http.StatusBadRequest || cfg.UnsupportedModelStatusCode > 599 {
+		cfg.UnsupportedModelStatusCode = http.StatusBadRequest
+	}
+	cfg.UnsupportedModelMessage = strings.TrimSpace(cfg.UnsupportedModelMessage)
+	if cfg.UnsupportedModelMessage == "" {
+		cfg.UnsupportedModelMessage = defaultMessage
+	}
+	return cfg
+}
+
+func nativeImagesAlt(op imageOperation) string {
+	if op.action == imageEditOperation.action {
+		return nativeImagesEdits
+	}
+	return nativeImagesGenerations
+}
+
+func nativeImageModelAllowed(models []string, model string) bool {
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return false
+	}
+	modelKey := nativeImageModelKey(model)
+	for _, allowed := range models {
+		allowed = strings.TrimSpace(allowed)
+		if allowed == "" {
+			continue
+		}
+		if strings.EqualFold(allowed, model) || nativeImageModelKey(allowed) == modelKey {
+			return true
+		}
+	}
+	return false
+}
+
+func nativeImageModelKey(model string) string {
+	model = strings.ToLower(strings.TrimSpace(model))
+	if idx := strings.LastIndex(model, "/"); idx >= 0 && idx+1 < len(model) {
+		return model[idx+1:]
+	}
+	return model
+}
+
+func nativeImageUnsupportedModelMessage(template string, model string) string {
+	template = strings.TrimSpace(template)
+	if template == "" {
+		template = "Native image request is not enabled for model {model}"
+	}
+	return strings.ReplaceAll(template, "{model}", strings.TrimSpace(model))
+}
+
+func applyNativeImageParamRules(rawJSON []byte, rules []string) []byte {
+	out := rawJSON
+	for _, rule := range rules {
+		rule = strings.TrimSpace(rule)
+		if rule == "" {
+			continue
+		}
+		path, value, hasValue := strings.Cut(rule, "=")
+		path = strings.TrimSpace(path)
+		if path == "" {
+			continue
+		}
+		if !hasValue {
+			updated, err := sjson.DeleteBytes(out, path)
+			if err == nil {
+				out = updated
+			}
+			continue
+		}
+		value = strings.TrimSpace(value)
+		if rawValue, ok := nativeImageRuleJSONValue(value); ok {
+			updated, err := sjson.SetRawBytes(out, path, rawValue)
+			if err == nil {
+				out = updated
+			}
+			continue
+		}
+		updated, err := sjson.SetBytes(out, path, value)
+		if err == nil {
+			out = updated
+		}
+	}
+	return out
+}
+
+func nativeImageRuleJSONValue(value string) ([]byte, bool) {
+	if value == "" {
+		return nil, false
+	}
+	raw := []byte(value)
+	if !json.Valid(raw) {
+		return nil, false
+	}
+	return raw, true
 }
 
 func imageStreamFlushInterval(cfg *sdkconfig.SDKConfig) *time.Duration {

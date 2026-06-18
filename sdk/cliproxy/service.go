@@ -2587,7 +2587,7 @@ func (s *Service) registerModelsForAuth(a *coreauth.Auth) {
 			allowImageModel = true
 		}
 		if allowImageModel {
-			models = upsertModelInfo(models, codexDynamicImageModelInfo(s.cfg))
+			models = upsertModelInfos(models, codexDynamicImageModelInfos(s.cfg))
 		}
 		models = applyExcludedModels(models, excluded)
 	case "kimi":
@@ -2940,6 +2940,9 @@ func shouldRefreshCodexRegistrations(previousCfg, nextCfg *config.Config) bool {
 	if configuredImagesImageModel(previousCfg) != configuredImagesImageModel(nextCfg) {
 		return true
 	}
+	if configuredNativeImageModelsSignature(previousCfg) != configuredNativeImageModelsSignature(nextCfg) {
+		return true
+	}
 	if freePlanImageModelEnabled(previousCfg) != freePlanImageModelEnabled(nextCfg) {
 		return true
 	}
@@ -2955,6 +2958,85 @@ func freePlanImageModelEnabled(cfg *config.Config) bool {
 
 func codexDynamicImageModelInfo(cfg *config.Config) *ModelInfo {
 	modelID := configuredImagesImageModel(cfg)
+	if modelID == "" {
+		return nil
+	}
+	return codexImageModelInfo(modelID)
+}
+
+func codexDynamicImageModelInfos(cfg *config.Config) []*ModelInfo {
+	modelIDs := configuredCodexImageModels(cfg)
+	out := make([]*ModelInfo, 0, len(modelIDs))
+	for _, modelID := range modelIDs {
+		if info := codexImageModelInfo(modelID); info != nil {
+			out = append(out, info)
+		}
+	}
+	return out
+}
+
+func configuredCodexImageModels(cfg *config.Config) []string {
+	models := []string{configuredImagesImageModel(cfg)}
+	models = append(models, enabledNativeImageEndpointModels(cfg, "generations")...)
+	models = append(models, enabledNativeImageEndpointModels(cfg, "edits")...)
+	return normalizeModelIDs(models)
+}
+
+func enabledNativeImageEndpointModels(cfg *config.Config, endpoint string) []string {
+	if cfg == nil {
+		return nil
+	}
+	var endpointCfg config.NativeImageEndpointConfig
+	switch endpoint {
+	case "generations":
+		endpointCfg = cfg.Images.Native.Generations
+	case "edits":
+		endpointCfg = cfg.Images.Native.Edits
+	default:
+		return nil
+	}
+	if !endpointCfg.Enabled {
+		return nil
+	}
+	if len(endpointCfg.Models) == 0 {
+		return []string{"gpt-image-2", "gpt-image-1.5"}
+	}
+	return endpointCfg.Models
+}
+
+func normalizeModelIDs(models []string) []string {
+	if len(models) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(models))
+	seen := make(map[string]struct{}, len(models))
+	for _, modelID := range models {
+		modelID = strings.TrimSpace(modelID)
+		if modelID == "" {
+			continue
+		}
+		key := strings.ToLower(modelID)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, modelID)
+	}
+	return out
+}
+
+func configuredNativeImageModelsSignature(cfg *config.Config) string {
+	if cfg == nil {
+		return ""
+	}
+	return strings.Join(normalizeModelIDs(append(
+		enabledNativeImageEndpointModels(cfg, "generations"),
+		enabledNativeImageEndpointModels(cfg, "edits")...,
+	)), "\x00")
+}
+
+func codexImageModelInfo(modelID string) *ModelInfo {
+	modelID = strings.TrimSpace(modelID)
 	if modelID == "" {
 		return nil
 	}
