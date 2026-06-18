@@ -2,9 +2,11 @@ package usage
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -324,6 +326,233 @@ func TestRequestStatisticsPruneAuthIndexesRemovesStaleEntries(t *testing.T) {
 	snapshot := stats.Snapshot()
 	if snapshot.TotalRequests != 1 || snapshot.TotalTokens != 10 {
 		t.Fatalf("snapshot totals = %+v, want requests=1 tokens=10", snapshot)
+	}
+}
+
+func TestRequestStatisticsSummaryOmitsDetails(t *testing.T) {
+	stats := NewRequestStatistics()
+	stats.Record(context.Background(), coreusage.Record{
+		APIKey:      "test-key",
+		Model:       "gpt-5.4",
+		RequestedAt: time.Date(2026, 3, 20, 12, 0, 0, 0, time.UTC),
+		Detail: coreusage.Detail{
+			InputTokens:  10,
+			OutputTokens: 20,
+			TotalTokens:  30,
+		},
+		AuthIndex: "auth-a",
+	})
+
+	summary := stats.Summary()
+	if summary.TotalRequests != 1 || summary.TotalTokens != 30 {
+		t.Fatalf("summary totals = %+v, want requests=1 tokens=30", summary)
+	}
+	model := summary.APIs["test-key"].Models["gpt-5.4"]
+	if model.TotalRequests != 1 || model.TotalTokens != 30 {
+		t.Fatalf("model summary = %+v, want requests=1 tokens=30", model)
+	}
+	raw, err := json.Marshal(summary)
+	if err != nil {
+		t.Fatalf("Marshal(summary) error = %v", err)
+	}
+	if strings.Contains(string(raw), "details") {
+		t.Fatalf("summary JSON contains details: %s", raw)
+	}
+}
+
+func TestRequestStatisticsAuthSummariesAndModels(t *testing.T) {
+	stats := NewRequestStatistics()
+	timestamp := time.Date(2026, 3, 20, 12, 0, 0, 0, time.UTC)
+
+	stats.Record(context.Background(), coreusage.Record{
+		APIKey:      "test-key",
+		Model:       "gpt-5.4",
+		RequestedAt: timestamp,
+		Detail: coreusage.Detail{
+			InputTokens:  10,
+			OutputTokens: 20,
+			TotalTokens:  30,
+		},
+		AuthIndex: "auth-a",
+	})
+	stats.Record(context.Background(), coreusage.Record{
+		APIKey:      "test-key",
+		Model:       "gpt-5.5",
+		RequestedAt: timestamp.Add(time.Minute),
+		Failed:      true,
+		Detail: coreusage.Detail{
+			InputTokens:     5,
+			OutputTokens:    6,
+			ReasoningTokens: 7,
+			CachedTokens:    8,
+			TotalTokens:     26,
+		},
+		AuthIndex: "auth-a",
+	})
+
+	summary, ok := stats.AuthSummary("auth-a")
+	if !ok {
+		t.Fatal("AuthSummary(auth-a) ok = false, want true")
+	}
+	if summary.TotalRequests != 2 || summary.SuccessCount != 1 || summary.FailureCount != 1 || summary.TotalTokens != 56 {
+		t.Fatalf("auth summary = %+v, want requests=2 success=1 failure=1 tokens=56", summary)
+	}
+	if summary.Tokens.InputTokens != 15 || summary.Tokens.OutputTokens != 26 || summary.Tokens.ReasoningTokens != 7 || summary.Tokens.CachedTokens != 8 {
+		t.Fatalf("auth token breakdown = %+v, want input=15 output=26 reasoning=7 cached=8", summary.Tokens)
+	}
+
+	models, ok := stats.AuthModelSummaries("auth-a")
+	if !ok {
+		t.Fatal("AuthModelSummaries(auth-a) ok = false, want true")
+	}
+	if len(models) != 2 {
+		t.Fatalf("models len = %d, want 2: %+v", len(models), models)
+	}
+	if models[0].Model != "gpt-5.4" || models[0].TotalRequests != 1 || models[0].SuccessCount != 1 || models[0].TotalTokens != 30 {
+		t.Fatalf("first model summary = %+v, want gpt-5.4 success tokens=30", models[0])
+	}
+	if models[1].Model != "gpt-5.5" || models[1].TotalRequests != 1 || models[1].FailureCount != 1 || models[1].TotalTokens != 26 {
+		t.Fatalf("second model summary = %+v, want gpt-5.5 failure tokens=26", models[1])
+	}
+}
+
+func TestRequestStatisticsMergeSnapshotRestoresAuthSummaries(t *testing.T) {
+	stats := NewRequestStatistics()
+	timestamp := time.Date(2026, 3, 20, 12, 0, 0, 0, time.UTC)
+
+	result := stats.MergeSnapshot(StatisticsSnapshot{
+		APIs: map[string]APISnapshot{
+			"test-key": {
+				Models: map[string]ModelSnapshot{
+					"gpt-5.4": {
+						Details: []RequestDetail{{
+							Timestamp: timestamp,
+							AuthIndex: "auth-a",
+							Tokens: TokenStats{
+								InputTokens: 10,
+								TotalTokens: 10,
+							},
+						}},
+					},
+				},
+			},
+		},
+	})
+	if result.Added != 1 || result.Skipped != 0 {
+		t.Fatalf("MergeSnapshot() = %+v, want added=1 skipped=0", result)
+	}
+
+	summary, ok := stats.AuthSummary("auth-a")
+	if !ok {
+		t.Fatal("AuthSummary(auth-a) ok = false, want true")
+	}
+	if summary.TotalRequests != 1 || summary.SuccessCount != 1 || summary.TotalTokens != 10 {
+		t.Fatalf("auth summary = %+v, want requests=1 success=1 tokens=10", summary)
+	}
+}
+
+func TestRequestStatisticsRemoveAndPruneRebuildAuthSummaries(t *testing.T) {
+	stats := NewRequestStatistics()
+	timestamp := time.Date(2026, 3, 20, 12, 0, 0, 0, time.UTC)
+
+	stats.Record(context.Background(), coreusage.Record{
+		APIKey:      "test-key",
+		Model:       "gpt-5.4",
+		RequestedAt: timestamp,
+		Detail: coreusage.Detail{
+			TotalTokens: 10,
+		},
+		AuthIndex: "auth-a",
+	})
+	stats.Record(context.Background(), coreusage.Record{
+		APIKey:      "test-key",
+		Model:       "gpt-5.4",
+		RequestedAt: timestamp.Add(time.Minute),
+		Detail: coreusage.Detail{
+			TotalTokens: 20,
+		},
+		AuthIndex: "auth-b",
+	})
+	stats.Record(context.Background(), coreusage.Record{
+		APIKey:      "test-key",
+		Model:       "gpt-5.4",
+		RequestedAt: timestamp.Add(2 * time.Minute),
+		Detail: coreusage.Detail{
+			TotalTokens: 30,
+		},
+		AuthIndex: "auth-c",
+	})
+
+	if removed := stats.RemoveAuthIndexes([]string{"auth-a"}); removed != 1 {
+		t.Fatalf("RemoveAuthIndexes() = %d, want 1", removed)
+	}
+	if _, ok := stats.AuthSummary("auth-a"); ok {
+		t.Fatal("AuthSummary(auth-a) ok = true after remove, want false")
+	}
+	if summary, ok := stats.AuthSummary("auth-b"); !ok || summary.TotalTokens != 20 {
+		t.Fatalf("AuthSummary(auth-b) = %+v, %t; want tokens=20 ok=true", summary, ok)
+	}
+
+	if removed := stats.PruneAuthIndexes(map[string]struct{}{"auth-b": {}}); removed != 1 {
+		t.Fatalf("PruneAuthIndexes() = %d, want 1", removed)
+	}
+	if _, ok := stats.AuthSummary("auth-c"); ok {
+		t.Fatal("AuthSummary(auth-c) ok = true after prune, want false")
+	}
+	if summary, ok := stats.AuthSummary("auth-b"); !ok || summary.TotalRequests != 1 || summary.TotalTokens != 20 {
+		t.Fatalf("AuthSummary(auth-b) = %+v, %t; want one request and 20 tokens", summary, ok)
+	}
+}
+
+func TestRequestStatisticsDetailsFiltersAndPaginates(t *testing.T) {
+	stats := NewRequestStatistics()
+	timestamp := time.Date(2026, 3, 20, 12, 0, 0, 0, time.UTC)
+
+	stats.Record(context.Background(), coreusage.Record{
+		APIKey:      "test-key",
+		Model:       "gpt-5.4",
+		Source:      "source-a",
+		RequestedAt: timestamp,
+		Detail:      coreusage.Detail{TotalTokens: 10},
+		AuthIndex:   "auth-a",
+	})
+	stats.Record(context.Background(), coreusage.Record{
+		APIKey:      "test-key",
+		Model:       "gpt-5.4",
+		Source:      "source-a",
+		RequestedAt: timestamp.Add(time.Minute),
+		Detail:      coreusage.Detail{TotalTokens: 20},
+		AuthIndex:   "auth-a",
+	})
+	stats.Record(context.Background(), coreusage.Record{
+		APIKey:      "test-key",
+		Model:       "gpt-5.5",
+		Source:      "source-b",
+		RequestedAt: timestamp.Add(2 * time.Minute),
+		Detail:      coreusage.Detail{TotalTokens: 30},
+		AuthIndex:   "auth-b",
+	})
+
+	page := stats.Details(DetailQuery{AuthIndex: "auth-a", Limit: 1})
+	if page.TotalMatched != 2 || !page.HasMore || page.NextOffset != 1 || len(page.Details) != 1 {
+		t.Fatalf("first page = %+v, want two matches with one returned and next offset", page)
+	}
+	if page.Details[0].AuthIndex != "auth-a" || page.Details[0].Tokens.TotalTokens != 20 {
+		t.Fatalf("first page detail = %+v, want newest auth-a detail with 20 tokens", page.Details[0])
+	}
+
+	page = stats.Details(DetailQuery{AuthIndex: "auth-a", Limit: 1, Offset: 1})
+	if page.TotalMatched != 2 || page.HasMore || len(page.Details) != 1 {
+		t.Fatalf("second page = %+v, want one final match", page)
+	}
+	if page.Details[0].Tokens.TotalTokens != 10 {
+		t.Fatalf("second page detail tokens = %d, want 10", page.Details[0].Tokens.TotalTokens)
+	}
+
+	failed := true
+	page = stats.Details(DetailQuery{AuthIndex: "auth-a", Failed: &failed})
+	if page.TotalMatched != 0 || len(page.Details) != 0 {
+		t.Fatalf("failed page = %+v, want no auth-a failed requests", page)
 	}
 }
 

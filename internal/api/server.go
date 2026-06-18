@@ -526,6 +526,12 @@ func (s *Server) registerManagementRoutes() {
 	mgmt.Use(s.activeManagementPrefixMiddleware(prefix), s.managementAvailabilityMiddleware(), s.mgmt.Middleware())
 	{
 		mgmt.GET("/usage", s.mgmt.GetUsageStatistics)
+		mgmt.GET("/usage/meta", s.mgmt.GetUsageMeta)
+		mgmt.GET("/usage/summary", s.mgmt.GetUsageSummary)
+		mgmt.GET("/usage/details", s.mgmt.GetUsageDetails)
+		mgmt.GET("/usage/auths", s.mgmt.GetUsageAuthSummaries)
+		mgmt.GET("/usage/auths/:auth_index/models", s.mgmt.GetUsageAuthModelSummaries)
+		mgmt.GET("/usage/auths/:auth_index", s.mgmt.GetUsageAuthSummary)
 		mgmt.GET("/usage/export", s.mgmt.ExportUsageStatistics)
 		mgmt.POST("/usage/import", s.mgmt.ImportUsageStatistics)
 		mgmt.GET("/config", s.mgmt.GetConfig)

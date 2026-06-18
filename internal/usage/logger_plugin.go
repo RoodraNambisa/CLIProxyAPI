@@ -70,6 +70,8 @@ type RequestStatistics struct {
 
 	apis map[string]*apiStats
 
+	auths map[string]*authStats
+
 	requestsByDay  map[string]int64
 	requestsByHour map[int]int64
 	tokensByDay    map[string]int64
@@ -88,6 +90,23 @@ type modelStats struct {
 	TotalRequests int64
 	TotalTokens   int64
 	Details       []RequestDetail
+}
+
+type authStats struct {
+	TotalRequests int64
+	SuccessCount  int64
+	FailureCount  int64
+	TotalTokens   int64
+	Tokens        TokenStats
+	Models        map[string]*authModelStats
+}
+
+type authModelStats struct {
+	TotalRequests int64
+	SuccessCount  int64
+	FailureCount  int64
+	TotalTokens   int64
+	Tokens        TokenStats
 }
 
 // RequestDetail stores the timestamp, latency, and token usage for a single request.
@@ -148,6 +167,7 @@ func GetRequestStatistics() *RequestStatistics { return defaultRequestStatistics
 func NewRequestStatistics() *RequestStatistics {
 	return &RequestStatistics{
 		apis:           make(map[string]*apiStats),
+		auths:          make(map[string]*authStats),
 		requestsByDay:  make(map[string]int64),
 		requestsByHour: make(map[int]int64),
 		tokensByDay:    make(map[string]int64),
@@ -201,7 +221,7 @@ func (s *RequestStatistics) Record(ctx context.Context, record coreusage.Record)
 		stats = &apiStats{Models: make(map[string]*modelStats)}
 		s.apis[statsKey] = stats
 	}
-	s.updateAPIStats(stats, modelName, RequestDetail{
+	requestDetail := RequestDetail{
 		Timestamp: timestamp,
 		LatencyMs: normaliseLatency(record.Latency),
 		Source:    record.Source,
@@ -209,7 +229,9 @@ func (s *RequestStatistics) Record(ctx context.Context, record coreusage.Record)
 		AuthIndex: record.AuthIndex,
 		Tokens:    detail,
 		Failed:    failed,
-	})
+	}
+	s.updateAPIStats(stats, modelName, requestDetail)
+	s.updateAuthStats(modelName, requestDetail)
 
 	s.requestsByDay[dayKey]++
 	s.requestsByHour[hourKey]++
@@ -229,6 +251,68 @@ func (s *RequestStatistics) updateAPIStats(stats *apiStats, model string, detail
 	modelStatsValue.TotalRequests++
 	modelStatsValue.TotalTokens += detail.Tokens.TotalTokens
 	modelStatsValue.Details = append(modelStatsValue.Details, detail)
+}
+
+func (s *RequestStatistics) updateAuthStats(model string, detail RequestDetail) {
+	authIndex := strings.TrimSpace(detail.AuthIndex)
+	if authIndex == "" {
+		return
+	}
+	authStatsValue, ok := s.auths[authIndex]
+	if !ok {
+		authStatsValue = &authStats{Models: make(map[string]*authModelStats)}
+		s.auths[authIndex] = authStatsValue
+	}
+	updateUsageAggregate(
+		&authStatsValue.TotalRequests,
+		&authStatsValue.SuccessCount,
+		&authStatsValue.FailureCount,
+		&authStatsValue.TotalTokens,
+		&authStatsValue.Tokens,
+		detail,
+	)
+
+	model = strings.TrimSpace(model)
+	if model == "" {
+		model = "unknown"
+	}
+	modelStatsValue, ok := authStatsValue.Models[model]
+	if !ok {
+		modelStatsValue = &authModelStats{}
+		authStatsValue.Models[model] = modelStatsValue
+	}
+	updateUsageAggregate(
+		&modelStatsValue.TotalRequests,
+		&modelStatsValue.SuccessCount,
+		&modelStatsValue.FailureCount,
+		&modelStatsValue.TotalTokens,
+		&modelStatsValue.Tokens,
+		detail,
+	)
+}
+
+func updateUsageAggregate(totalRequests, successCount, failureCount, totalTokens *int64, tokens *TokenStats, detail RequestDetail) {
+	if totalRequests != nil {
+		(*totalRequests)++
+	}
+	if detail.Failed {
+		if failureCount != nil {
+			(*failureCount)++
+		}
+	} else if successCount != nil {
+		(*successCount)++
+	}
+	normalizedTokens := normaliseTokenStats(detail.Tokens)
+	if totalTokens != nil {
+		*totalTokens += normalizedTokens.TotalTokens
+	}
+	if tokens != nil {
+		tokens.InputTokens += normalizedTokens.InputTokens
+		tokens.OutputTokens += normalizedTokens.OutputTokens
+		tokens.ReasoningTokens += normalizedTokens.ReasoningTokens
+		tokens.CachedTokens += normalizedTokens.CachedTokens
+		tokens.TotalTokens += normalizedTokens.TotalTokens
+	}
 }
 
 // Snapshot returns a copy of the aggregated metrics for external consumption.
@@ -531,6 +615,7 @@ func (s *RequestStatistics) recordImported(apiName, modelName string, stats *api
 	s.totalTokens += totalTokens
 
 	s.updateAPIStats(stats, modelName, detail)
+	s.updateAuthStats(modelName, detail)
 
 	dayKey := detail.Timestamp.Format("2006-01-02")
 	hourKey := detail.Timestamp.Hour()
@@ -551,6 +636,7 @@ func (s *RequestStatistics) rebuildLocked() {
 	s.requestsByHour = make(map[int]int64)
 	s.tokensByDay = make(map[string]int64)
 	s.tokensByHour = make(map[int]int64)
+	s.auths = make(map[string]*authStats)
 
 	for apiName, stats := range s.apis {
 		if stats == nil {
@@ -592,6 +678,7 @@ func (s *RequestStatistics) rebuildLocked() {
 				stats.TotalTokens += totalTokens
 				modelStatsValue.TotalRequests++
 				modelStatsValue.TotalTokens += totalTokens
+				s.updateAuthStats(modelName, detail)
 
 				dayKey := detail.Timestamp.Format("2006-01-02")
 				hourKey := detail.Timestamp.Hour()
