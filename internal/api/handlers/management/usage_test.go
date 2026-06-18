@@ -187,6 +187,178 @@ func TestUsageAuthModelSummaries(t *testing.T) {
 	}
 }
 
+func TestUsageSummaryHandlerFiltersTimeRangeAndRejectsInvalid(t *testing.T) {
+	handler, stats, _ := newUsageHandlerForTest(t)
+	base := time.Date(2026, 3, 20, 12, 0, 0, 0, time.UTC)
+	stats.Record(context.Background(), coreusage.Record{
+		APIKey:      "api-a",
+		Model:       "model-a",
+		RequestedAt: base,
+		Detail:      coreusage.Detail{TotalTokens: 10},
+		AuthIndex:   "auth-a",
+	})
+	stats.Record(context.Background(), coreusage.Record{
+		APIKey:      "api-a",
+		Model:       "model-b",
+		RequestedAt: base.Add(time.Hour),
+		Failed:      true,
+		Detail:      coreusage.Detail{TotalTokens: 20},
+		AuthIndex:   "auth-b",
+	})
+
+	target := "/v0/management/usage/summary?from=" + base.Add(30*time.Minute).Format(time.RFC3339) + "&to=" + base.Add(2*time.Hour).Format(time.RFC3339)
+	ctx, recorder := newUsageRequestContext(target)
+	handler.GetUsageSummary(ctx)
+	var body struct {
+		Usage usage.SummarySnapshot `json:"usage"`
+	}
+	decodeUsageResponse(t, recorder, &body)
+	if body.Usage.TotalRequests != 1 || body.Usage.FailureCount != 1 || body.Usage.TotalTokens != 20 {
+		t.Fatalf("summary = %+v, want only second request", body.Usage)
+	}
+
+	ctx, recorder = newUsageRequestContext("/v0/management/usage/summary?from=not-time")
+	handler.GetUsageSummary(ctx)
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("invalid from status = %d, want 400", recorder.Code)
+	}
+}
+
+func TestUsageDetailsHandlerAliasesAndSortValidation(t *testing.T) {
+	handler, stats, _ := newUsageHandlerForTest(t)
+	base := time.Date(2026, 3, 20, 12, 0, 0, 0, time.UTC)
+	stats.Record(context.Background(), coreusage.Record{
+		APIKey:      "api-b",
+		Model:       "model-b",
+		RequestedAt: base,
+		Detail:      coreusage.Detail{TotalTokens: 30},
+		AuthIndex:   "auth-b",
+	})
+	stats.Record(context.Background(), coreusage.Record{
+		APIKey:      "api-a",
+		Model:       "model-a",
+		RequestedAt: base.Add(time.Minute),
+		Detail:      coreusage.Detail{TotalTokens: 10},
+		AuthIndex:   "auth-a",
+	})
+
+	ctx, recorder := newUsageRequestContext("/v0/management/usage/details?sort_by=tokens&sort_order=asc&limit=1")
+	handler.GetUsageDetails(ctx)
+	var page usage.DetailPage
+	decodeUsageResponse(t, recorder, &page)
+	if page.Total != 2 || page.TotalMatched != 2 || !page.HasMore || page.NextOffset != 1 {
+		t.Fatalf("page metadata = %+v, want new and legacy aliases", page)
+	}
+	if len(page.Items) != 1 || len(page.Details) != 1 || page.Items[0].Tokens.TotalTokens != 10 || page.Details[0].Tokens.TotalTokens != 10 {
+		t.Fatalf("page aliases = %+v, want one lowest-token item", page)
+	}
+
+	ctx, recorder = newUsageRequestContext("/v0/management/usage/details?sort_by=bad")
+	handler.GetUsageDetails(ctx)
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("invalid sort_by status = %d, want 400", recorder.Code)
+	}
+	ctx, recorder = newUsageRequestContext("/v0/management/usage/details?sort_order=bad")
+	handler.GetUsageDetails(ctx)
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("invalid sort_order status = %d, want 400", recorder.Code)
+	}
+}
+
+func TestUsageAuthSummariesBatchFilter(t *testing.T) {
+	handler, stats, manager := newUsageHandlerForTest(t)
+	usedIndex := registerUsageAuthForTest(t, manager, "used-auth", "used.json", "codex", "Used", "used@example.com")
+	zeroIndex := registerUsageAuthForTest(t, manager, "zero-auth", "zero.json", "codex", "Zero", "zero@example.com")
+	otherIndex := registerUsageAuthForTest(t, manager, "other-auth", "other.json", "codex", "Other", "other@example.com")
+	base := time.Date(2026, 3, 20, 12, 0, 0, 0, time.UTC)
+	stats.Record(context.Background(), coreusage.Record{
+		APIKey:      "api-a",
+		Model:       "model-a",
+		RequestedAt: base,
+		Detail:      coreusage.Detail{TotalTokens: 10},
+		AuthIndex:   usedIndex,
+	})
+	stats.Record(context.Background(), coreusage.Record{
+		APIKey:      "api-a",
+		Model:       "model-a",
+		RequestedAt: base,
+		Detail:      coreusage.Detail{TotalTokens: 20},
+		AuthIndex:   otherIndex,
+	})
+	stats.Record(context.Background(), coreusage.Record{
+		APIKey:      "api-a",
+		Model:       "model-a",
+		RequestedAt: base,
+		Detail:      coreusage.Detail{TotalTokens: 30},
+		AuthIndex:   "stale-auth",
+	})
+
+	target := "/v0/management/usage/auths?auth_index=" + usedIndex + "," + zeroIndex + ",stale-auth,missing"
+	ctx, recorder := newUsageRequestContext(target)
+	handler.GetUsageAuthSummaries(ctx)
+	var body struct {
+		Auths []usageAuthSummaryForTest `json:"auths"`
+	}
+	decodeUsageResponse(t, recorder, &body)
+	if len(body.Auths) != 3 {
+		t.Fatalf("auths len = %d, want 3: %+v", len(body.Auths), body.Auths)
+	}
+	byIndex := usageAuthsByIndexForTest(body.Auths)
+	if byIndex[usedIndex].TotalTokens != 10 {
+		t.Fatalf("used auth = %+v, want 10 tokens", byIndex[usedIndex])
+	}
+	if byIndex[zeroIndex].AuthIndex == "" || byIndex[zeroIndex].TotalRequests != 0 {
+		t.Fatalf("zero auth = %+v, want current zero usage", byIndex[zeroIndex])
+	}
+	if !byIndex["stale-auth"].Stale || byIndex["stale-auth"].TotalTokens != 30 {
+		t.Fatalf("stale auth = %+v, want stale 30 tokens", byIndex["stale-auth"])
+	}
+	if _, ok := byIndex[otherIndex]; ok {
+		t.Fatalf("batch response includes unrequested auth %s: %+v", otherIndex, body.Auths)
+	}
+}
+
+func TestUsageSeriesHandlerDefaultsAndValidation(t *testing.T) {
+	handler, stats, _ := newUsageHandlerForTest(t)
+	now := time.Now().UTC()
+	stats.Record(context.Background(), coreusage.Record{
+		APIKey:      "api-a",
+		Model:       "recent-model",
+		RequestedAt: now.Add(-time.Hour),
+		Detail:      coreusage.Detail{TotalTokens: 10},
+		AuthIndex:   "auth-a",
+	})
+	stats.Record(context.Background(), coreusage.Record{
+		APIKey:      "api-a",
+		Model:       "old-model",
+		RequestedAt: now.Add(-48 * time.Hour),
+		Detail:      coreusage.Detail{TotalTokens: 20},
+		AuthIndex:   "auth-b",
+	})
+
+	ctx, recorder := newUsageRequestContext("/v0/management/usage/series")
+	handler.GetUsageSeries(ctx)
+	var result usage.SeriesResult
+	decodeUsageResponse(t, recorder, &result)
+	if result.Bucket != usage.BucketHour || result.GroupBy != usage.GroupByModel {
+		t.Fatalf("series defaults = %+v, want hour/model", result)
+	}
+	if len(result.Items) != 1 || result.Items[0].Group != "recent-model" || result.Items[0].TotalTokens != 10 {
+		t.Fatalf("series items = %+v, want only recent model", result.Items)
+	}
+
+	ctx, recorder = newUsageRequestContext("/v0/management/usage/series?bucket=bad")
+	handler.GetUsageSeries(ctx)
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("invalid bucket status = %d, want 400", recorder.Code)
+	}
+	ctx, recorder = newUsageRequestContext("/v0/management/usage/series?group_by=bad")
+	handler.GetUsageSeries(ctx)
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("invalid group_by status = %d, want 400", recorder.Code)
+	}
+}
+
 type usageAuthSummaryForTest struct {
 	AuthIndex     string           `json:"auth_index"`
 	ID            string           `json:"id"`

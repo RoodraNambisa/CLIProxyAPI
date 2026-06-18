@@ -556,6 +556,208 @@ func TestRequestStatisticsDetailsFiltersAndPaginates(t *testing.T) {
 	}
 }
 
+func TestRequestStatisticsSummaryForRange(t *testing.T) {
+	stats := NewRequestStatistics()
+	base := time.Date(2026, 3, 20, 12, 0, 0, 0, time.UTC)
+	stats.Record(context.Background(), coreusage.Record{
+		APIKey:      "api-a",
+		Model:       "model-a",
+		RequestedAt: base,
+		Detail:      coreusage.Detail{TotalTokens: 10},
+		AuthIndex:   "auth-a",
+	})
+	stats.Record(context.Background(), coreusage.Record{
+		APIKey:      "api-a",
+		Model:       "model-b",
+		RequestedAt: base.Add(time.Hour),
+		Failed:      true,
+		Detail:      coreusage.Detail{TotalTokens: 20},
+		AuthIndex:   "auth-b",
+	})
+	stats.Record(context.Background(), coreusage.Record{
+		APIKey:      "api-b",
+		Model:       "model-c",
+		RequestedAt: base.Add(2 * time.Hour),
+		Detail:      coreusage.Detail{TotalTokens: 30},
+		AuthIndex:   "auth-c",
+	})
+
+	summary := stats.SummaryForRange(TimeRange{
+		From: base.Add(30 * time.Minute),
+		To:   base.Add(2 * time.Hour),
+	})
+	if summary.TotalRequests != 1 || summary.SuccessCount != 0 || summary.FailureCount != 1 || summary.TotalTokens != 20 {
+		t.Fatalf("range summary = %+v, want one failed request with 20 tokens", summary)
+	}
+	if got := summary.APIs["api-a"].Models["model-b"].TotalRequests; got != 1 {
+		t.Fatalf("range model requests = %d, want 1", got)
+	}
+	if _, ok := summary.APIs["api-b"]; ok {
+		t.Fatalf("range summary includes upper-bound api-b: %+v", summary.APIs)
+	}
+}
+
+func TestRequestStatisticsDetailsAliasesAndSorts(t *testing.T) {
+	stats := NewRequestStatistics()
+	base := time.Date(2026, 3, 20, 12, 0, 0, 0, time.UTC)
+	records := []coreusage.Record{
+		{APIKey: "api-b", Model: "model-c", RequestedAt: base, Detail: coreusage.Detail{TotalTokens: 30}, AuthIndex: "auth-b"},
+		{APIKey: "api-a", Model: "model-b", RequestedAt: base.Add(time.Minute), Detail: coreusage.Detail{TotalTokens: 10}, AuthIndex: "auth-c"},
+		{APIKey: "api-c", Model: "model-a", RequestedAt: base.Add(2 * time.Minute), Detail: coreusage.Detail{TotalTokens: 20}, AuthIndex: "auth-a"},
+	}
+	for _, record := range records {
+		stats.Record(context.Background(), record)
+	}
+
+	page := stats.Details(DetailQuery{Limit: 2, SortBy: SortByCreatedAt, SortOrder: SortOrderDesc})
+	if page.Total != 3 || page.TotalMatched != 3 || !page.HasMore || page.NextOffset != 2 {
+		t.Fatalf("page metadata = %+v, want total aliases and next offset", page)
+	}
+	if len(page.Items) != 2 || len(page.Details) != 2 {
+		t.Fatalf("page item aliases len = items:%d details:%d, want 2", len(page.Items), len(page.Details))
+	}
+	if page.Items[0].Tokens.TotalTokens != 20 || page.Details[0].Tokens.TotalTokens != 20 {
+		t.Fatalf("page first aliases = items:%+v details:%+v, want newest request", page.Items[0], page.Details[0])
+	}
+
+	tests := []struct {
+		name      string
+		sortBy    string
+		sortOrder string
+		wantFirst func(DetailEntry) bool
+	}{
+		{name: "created asc", sortBy: SortByCreatedAt, sortOrder: SortOrderAsc, wantFirst: func(item DetailEntry) bool { return item.Tokens.TotalTokens == 30 }},
+		{name: "tokens asc", sortBy: SortByTokens, sortOrder: SortOrderAsc, wantFirst: func(item DetailEntry) bool { return item.Tokens.TotalTokens == 10 }},
+		{name: "model asc", sortBy: SortByModel, sortOrder: SortOrderAsc, wantFirst: func(item DetailEntry) bool { return item.Model == "model-a" }},
+		{name: "api desc", sortBy: SortByAPI, sortOrder: SortOrderDesc, wantFirst: func(item DetailEntry) bool { return item.API == "api-c" }},
+		{name: "auth asc", sortBy: SortByAuthIndex, sortOrder: SortOrderAsc, wantFirst: func(item DetailEntry) bool { return item.AuthIndex == "auth-a" }},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := stats.Details(DetailQuery{SortBy: tt.sortBy, SortOrder: tt.sortOrder})
+			if len(got.Items) != 3 {
+				t.Fatalf("items len = %d, want 3", len(got.Items))
+			}
+			if !tt.wantFirst(got.Items[0]) {
+				t.Fatalf("first item = %+v, did not match sort expectation", got.Items[0])
+			}
+		})
+	}
+
+	filtered := stats.Details(DetailQuery{
+		TimeRange: TimeRange{From: base.Add(time.Minute), To: base.Add(2 * time.Minute)},
+	})
+	if filtered.Total != 1 || filtered.Items[0].Tokens.TotalTokens != 10 {
+		t.Fatalf("filtered page = %+v, want only middle request", filtered)
+	}
+}
+
+func TestRequestStatisticsAuthSummariesForQuery(t *testing.T) {
+	stats := NewRequestStatistics()
+	base := time.Date(2026, 3, 20, 12, 0, 0, 0, time.UTC)
+	stats.Record(context.Background(), coreusage.Record{
+		APIKey:      "api-a",
+		Model:       "model-a",
+		RequestedAt: base,
+		Detail:      coreusage.Detail{TotalTokens: 10},
+		AuthIndex:   "auth-a",
+	})
+	stats.Record(context.Background(), coreusage.Record{
+		APIKey:      "api-a",
+		Model:       "model-a",
+		RequestedAt: base.Add(time.Hour),
+		Detail:      coreusage.Detail{TotalTokens: 20},
+		AuthIndex:   "auth-b",
+	})
+	stats.Record(context.Background(), coreusage.Record{
+		APIKey:      "api-a",
+		Model:       "model-a",
+		RequestedAt: base.Add(2 * time.Hour),
+		Detail:      coreusage.Detail{TotalTokens: 30},
+		AuthIndex:   "auth-c",
+	})
+
+	summaries := stats.AuthSummariesForQuery(AuthUsageQuery{
+		TimeRange:   TimeRange{From: base.Add(30 * time.Minute), To: base.Add(2 * time.Hour)},
+		AuthIndexes: []string{"auth-a", "auth-b"},
+	})
+	if len(summaries) != 1 {
+		t.Fatalf("summaries len = %d, want 1: %+v", len(summaries), summaries)
+	}
+	if summaries[0].AuthIndex != "auth-b" || summaries[0].TotalTokens != 20 {
+		t.Fatalf("summary = %+v, want only auth-b with 20 tokens", summaries[0])
+	}
+}
+
+func TestRequestStatisticsSeriesBucketsAndGroups(t *testing.T) {
+	stats := NewRequestStatistics()
+	base := time.Date(2026, 3, 20, 12, 34, 45, 0, time.UTC)
+	stats.Record(context.Background(), coreusage.Record{
+		APIKey:      "api-a",
+		Model:       "model-a",
+		Source:      "source-a",
+		RequestedAt: base,
+		Detail:      coreusage.Detail{TotalTokens: 10},
+		AuthIndex:   "auth-a",
+	})
+	stats.Record(context.Background(), coreusage.Record{
+		APIKey:      "api-a",
+		Model:       "model-a",
+		Source:      "source-b",
+		RequestedAt: base.Add(time.Minute),
+		Failed:      true,
+		Detail:      coreusage.Detail{TotalTokens: 20},
+		AuthIndex:   "auth-b",
+	})
+	stats.Record(context.Background(), coreusage.Record{
+		APIKey:      "api-b",
+		Model:       "model-b",
+		Source:      "source-a",
+		RequestedAt: base.Add(31 * time.Minute),
+		Detail:      coreusage.Detail{TotalTokens: 30},
+		AuthIndex:   "auth-a",
+	})
+
+	hourly := stats.Series(SeriesQuery{
+		TimeRange: TimeRange{From: base.Add(-time.Minute), To: base.Add(time.Hour)},
+		Bucket:    BucketHour,
+		GroupBy:   GroupByModel,
+	})
+	if hourly.Bucket != BucketHour || hourly.GroupBy != GroupByModel || len(hourly.Items) != 2 {
+		t.Fatalf("hourly series = %+v, want two model groups", hourly)
+	}
+	if hourly.Items[0].Group != "model-a" || hourly.Items[0].TotalRequests != 2 || hourly.Items[0].FailureCount != 1 || hourly.Items[0].TotalTokens != 30 {
+		t.Fatalf("first hourly item = %+v, want model-a aggregate", hourly.Items[0])
+	}
+
+	minuteFailed := stats.Series(SeriesQuery{
+		TimeRange: TimeRange{From: base.Add(-time.Minute), To: base.Add(2 * time.Minute)},
+		Bucket:    BucketMinute,
+		GroupBy:   GroupByFailed,
+	})
+	if len(minuteFailed.Items) != 2 {
+		t.Fatalf("minute failed len = %d, want 2: %+v", len(minuteFailed.Items), minuteFailed.Items)
+	}
+	if minuteFailed.Items[0].Bucket != base.Truncate(time.Minute) || minuteFailed.Items[0].Group != "success" {
+		t.Fatalf("first minute item = %+v, want success at base minute", minuteFailed.Items[0])
+	}
+	if minuteFailed.Items[1].Group != "failed" || minuteFailed.Items[1].FailureCount != 1 {
+		t.Fatalf("second minute item = %+v, want failed aggregate", minuteFailed.Items[1])
+	}
+
+	dailyAuth := stats.Series(SeriesQuery{
+		TimeRange: TimeRange{From: base.Add(-time.Minute), To: base.Add(time.Hour)},
+		Bucket:    BucketDay,
+		GroupBy:   GroupByAuthIndex,
+	})
+	if len(dailyAuth.Items) != 2 {
+		t.Fatalf("daily auth len = %d, want 2: %+v", len(dailyAuth.Items), dailyAuth.Items)
+	}
+	if dailyAuth.Items[0].Bucket.Hour() != 0 || dailyAuth.Items[0].Bucket.Location() != time.UTC {
+		t.Fatalf("daily bucket = %s, want UTC midnight", dailyAuth.Items[0].Bucket)
+	}
+}
+
 func TestPersistAndRestoreRequestStatistics(t *testing.T) {
 	dir := t.TempDir()
 	path := StatisticsFilePath(&config.Config{LoggingToFile: true, AuthDir: dir})

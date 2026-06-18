@@ -254,41 +254,7 @@ func (s *RequestStatistics) updateAPIStats(stats *apiStats, model string, detail
 }
 
 func (s *RequestStatistics) updateAuthStats(model string, detail RequestDetail) {
-	authIndex := strings.TrimSpace(detail.AuthIndex)
-	if authIndex == "" {
-		return
-	}
-	authStatsValue, ok := s.auths[authIndex]
-	if !ok {
-		authStatsValue = &authStats{Models: make(map[string]*authModelStats)}
-		s.auths[authIndex] = authStatsValue
-	}
-	updateUsageAggregate(
-		&authStatsValue.TotalRequests,
-		&authStatsValue.SuccessCount,
-		&authStatsValue.FailureCount,
-		&authStatsValue.TotalTokens,
-		&authStatsValue.Tokens,
-		detail,
-	)
-
-	model = strings.TrimSpace(model)
-	if model == "" {
-		model = "unknown"
-	}
-	modelStatsValue, ok := authStatsValue.Models[model]
-	if !ok {
-		modelStatsValue = &authModelStats{}
-		authStatsValue.Models[model] = modelStatsValue
-	}
-	updateUsageAggregate(
-		&modelStatsValue.TotalRequests,
-		&modelStatsValue.SuccessCount,
-		&modelStatsValue.FailureCount,
-		&modelStatsValue.TotalTokens,
-		&modelStatsValue.Tokens,
-		detail,
-	)
+	updateAuthStatsMap(s.auths, model, detail)
 }
 
 func updateUsageAggregate(totalRequests, successCount, failureCount, totalTokens *int64, tokens *TokenStats, detail RequestDetail) {

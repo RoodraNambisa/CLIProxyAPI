@@ -62,9 +62,17 @@ func (h *Handler) GetUsageMeta(c *gin.Context) {
 
 // GetUsageSummary returns aggregated usage statistics without request details.
 func (h *Handler) GetUsageSummary(c *gin.Context) {
+	timeRange, ok := parseUsageTimeRange(c)
+	if !ok {
+		return
+	}
 	var summary usage.SummarySnapshot
 	if h != nil && h.usageStats != nil {
-		summary = h.usageStats.Summary()
+		if timeRange.IsZero() {
+			summary = h.usageStats.Summary()
+		} else {
+			summary = h.usageStats.SummaryForRange(timeRange)
+		}
 	}
 	c.JSON(http.StatusOK, gin.H{
 		"usage":           summary,
@@ -82,23 +90,47 @@ func (h *Handler) GetUsageDetails(c *gin.Context) {
 	if h != nil && h.usageStats != nil {
 		page = h.usageStats.Details(query)
 	} else {
-		page = usage.DetailPage{Details: []usage.DetailEntry{}, Limit: query.Limit}
+		page = usage.DetailPage{Items: []usage.DetailEntry{}, Details: []usage.DetailEntry{}, Limit: query.Limit}
 	}
 	c.JSON(http.StatusOK, page)
 }
 
 // GetUsageAuthSummaries returns per-auth usage summaries enriched with current auth metadata.
 func (h *Handler) GetUsageAuthSummaries(c *gin.Context) {
+	timeRange, ok := parseUsageTimeRange(c)
+	if !ok {
+		return
+	}
+	authIndexes := parseUsageAuthIndexList(c)
 	infoByIndex := h.usageAuthInfoByIndex()
 	summaries := map[string]usage.AuthUsageSnapshot{}
 	if h != nil && h.usageStats != nil {
-		for _, summary := range h.usageStats.AuthSummaries() {
+		query := usage.AuthUsageQuery{
+			TimeRange:   timeRange,
+			AuthIndexes: authIndexes,
+		}
+		for _, summary := range h.usageStats.AuthSummariesForQuery(query) {
 			summaries[summary.AuthIndex] = summary
 		}
 	}
 
 	seen := make(map[string]struct{}, len(infoByIndex)+len(summaries))
 	auths := make([]gin.H, 0, len(infoByIndex)+len(summaries))
+	if len(authIndexes) > 0 {
+		for _, authIndex := range authIndexes {
+			summary, hasUsage := summaries[authIndex]
+			info, current := infoByIndex[authIndex]
+			if !hasUsage && !current {
+				continue
+			}
+			if summary.AuthIndex == "" {
+				summary.AuthIndex = authIndex
+			}
+			auths = append(auths, buildUsageAuthResponse(summary, info, !current))
+		}
+		c.JSON(http.StatusOK, gin.H{"auths": auths})
+		return
+	}
 	for authIndex, info := range infoByIndex {
 		summary := summaries[authIndex]
 		if summary.AuthIndex == "" {
@@ -115,6 +147,25 @@ func (h *Handler) GetUsageAuthSummaries(c *gin.Context) {
 	}
 	sortUsageAuthResponses(auths)
 	c.JSON(http.StatusOK, gin.H{"auths": auths})
+}
+
+// GetUsageSeries returns grouped time-series usage aggregates.
+func (h *Handler) GetUsageSeries(c *gin.Context) {
+	query, ok := parseUsageSeriesQuery(c)
+	if !ok {
+		return
+	}
+	var result usage.SeriesResult
+	if h != nil && h.usageStats != nil {
+		result = h.usageStats.Series(query)
+	} else {
+		result = usage.SeriesResult{
+			Bucket:  query.Bucket,
+			GroupBy: query.GroupBy,
+			Items:   []usage.SeriesEntry{},
+		}
+	}
+	c.JSON(http.StatusOK, result)
 }
 
 // GetUsageAuthSummary returns one auth usage summary by auth_index.
@@ -212,12 +263,23 @@ func (h *Handler) ImportUsageStatistics(c *gin.Context) {
 }
 
 func parseUsageDetailQuery(c *gin.Context) (usage.DetailQuery, bool) {
+	timeRange, ok := parseUsageTimeRange(c)
+	if !ok {
+		return usage.DetailQuery{}, false
+	}
+	sortBy, sortOrder, ok := parseUsageSort(c)
+	if !ok {
+		return usage.DetailQuery{}, false
+	}
 	query := usage.DetailQuery{
 		API:       strings.TrimSpace(c.Query("api")),
 		Model:     strings.TrimSpace(c.Query("model")),
 		AuthIndex: strings.TrimSpace(c.Query("auth_index")),
 		Source:    strings.TrimSpace(c.Query("source")),
 		ClientIP:  strings.TrimSpace(c.Query("client_ip")),
+		TimeRange: timeRange,
+		SortBy:    sortBy,
+		SortOrder: sortOrder,
 		Limit:     usage.DefaultDetailsLimit,
 	}
 	if rawOffset := strings.TrimSpace(c.Query("offset")); rawOffset != "" {
@@ -245,6 +307,132 @@ func parseUsageDetailQuery(c *gin.Context) (usage.DetailQuery, bool) {
 		query.Failed = &failed
 	}
 	return query, true
+}
+
+func parseUsageTimeRange(c *gin.Context) (usage.TimeRange, bool) {
+	var timeRange usage.TimeRange
+	if rawFrom := strings.TrimSpace(c.Query("from")); rawFrom != "" {
+		from, err := time.Parse(time.RFC3339, rawFrom)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid from"})
+			return usage.TimeRange{}, false
+		}
+		timeRange.From = from
+	}
+	if rawTo := strings.TrimSpace(c.Query("to")); rawTo != "" {
+		to, err := time.Parse(time.RFC3339, rawTo)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid to"})
+			return usage.TimeRange{}, false
+		}
+		timeRange.To = to
+	}
+	if !timeRange.From.IsZero() && !timeRange.To.IsZero() && timeRange.From.After(timeRange.To) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid time range"})
+		return usage.TimeRange{}, false
+	}
+	return timeRange, true
+}
+
+func parseUsageSort(c *gin.Context) (string, string, bool) {
+	sortBy := strings.TrimSpace(c.Query("sort_by"))
+	if sortBy == "" {
+		sortBy = usage.SortByCreatedAt
+	}
+	if !isUsageSortBy(sortBy) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid sort_by"})
+		return "", "", false
+	}
+	sortOrder := strings.TrimSpace(c.Query("sort_order"))
+	if sortOrder == "" {
+		sortOrder = usage.SortOrderDesc
+	}
+	if sortOrder != usage.SortOrderAsc && sortOrder != usage.SortOrderDesc {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid sort_order"})
+		return "", "", false
+	}
+	return sortBy, sortOrder, true
+}
+
+func parseUsageAuthIndexList(c *gin.Context) []string {
+	raw := strings.TrimSpace(c.Query("auth_index"))
+	if raw == "" {
+		return nil
+	}
+	seen := map[string]struct{}{}
+	out := []string{}
+	for _, part := range strings.Split(raw, ",") {
+		authIndex := strings.TrimSpace(part)
+		if authIndex == "" {
+			continue
+		}
+		if _, ok := seen[authIndex]; ok {
+			continue
+		}
+		seen[authIndex] = struct{}{}
+		out = append(out, authIndex)
+	}
+	return out
+}
+
+func parseUsageSeriesQuery(c *gin.Context) (usage.SeriesQuery, bool) {
+	timeRange, ok := parseUsageTimeRange(c)
+	if !ok {
+		return usage.SeriesQuery{}, false
+	}
+	if timeRange.IsZero() {
+		now := time.Now().UTC()
+		timeRange.From = now.Add(-24 * time.Hour)
+		timeRange.To = now
+	}
+	bucket := strings.TrimSpace(c.Query("bucket"))
+	if bucket == "" {
+		bucket = usage.BucketHour
+	}
+	if !isUsageBucket(bucket) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid bucket"})
+		return usage.SeriesQuery{}, false
+	}
+	groupBy := strings.TrimSpace(c.Query("group_by"))
+	if groupBy == "" {
+		groupBy = usage.GroupByModel
+	}
+	if !isUsageGroupBy(groupBy) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid group_by"})
+		return usage.SeriesQuery{}, false
+	}
+	return usage.SeriesQuery{
+		TimeRange: timeRange,
+		Bucket:    bucket,
+		GroupBy:   groupBy,
+	}, true
+}
+
+func isUsageSortBy(sortBy string) bool {
+	switch sortBy {
+	case usage.SortByCreatedAt, usage.SortByTokens, usage.SortByModel, usage.SortByAPI, usage.SortByAuthIndex:
+		return true
+	default:
+		return false
+	}
+}
+
+func isUsageBucket(bucket string) bool {
+	switch bucket {
+	case usage.BucketMinute, usage.BucketHour, usage.BucketDay:
+		return true
+	default:
+		return false
+	}
+}
+
+func isUsageGroupBy(groupBy string) bool {
+	switch groupBy {
+	case usage.GroupByAPI, usage.GroupByModel, usage.GroupByAuthIndex, usage.GroupBySource, usage.GroupByFailed:
+		return true
+	default:
+		return false
+	}
 }
 
 func (h *Handler) usageAuthInfoByIndex() map[string]usageAuthInfo {

@@ -530,6 +530,7 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.GET("/usage/summary", s.mgmt.GetUsageSummary)
 		mgmt.GET("/usage/details", s.mgmt.GetUsageDetails)
 		mgmt.GET("/usage/auths", s.mgmt.GetUsageAuthSummaries)
+		mgmt.GET("/usage/series", s.mgmt.GetUsageSeries)
 		mgmt.GET("/usage/auths/:auth_index/models", s.mgmt.GetUsageAuthModelSummaries)
 		mgmt.GET("/usage/auths/:auth_index", s.mgmt.GetUsageAuthSummary)
 		mgmt.GET("/usage/export", s.mgmt.ExportUsageStatistics)
