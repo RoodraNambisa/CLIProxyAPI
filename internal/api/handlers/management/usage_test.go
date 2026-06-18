@@ -92,6 +92,46 @@ func TestUsageDetailsHandlerFiltersAndPaginates(t *testing.T) {
 	}
 }
 
+func TestClearUsageStatisticsHandler(t *testing.T) {
+	handler, stats, _ := newUsageHandlerForTest(t)
+	stats.Record(context.Background(), coreusage.Record{
+		APIKey:      "test-key",
+		Model:       "gpt-5.4",
+		RequestedAt: time.Date(2026, 3, 20, 12, 0, 0, 0, time.UTC),
+		Detail:      coreusage.Detail{TotalTokens: 30},
+		AuthIndex:   "auth-a",
+	})
+
+	ctx, recorder := newUsageRequestContext("/v0/management/usage")
+	handler.ClearUsageStatistics(ctx)
+	var body struct {
+		Cleared              bool   `json:"cleared"`
+		Version              uint64 `json:"version"`
+		TotalRequestsBefore  int64  `json:"total_requests_before"`
+		FailedRequestsBefore int64  `json:"failed_requests_before"`
+		TotalRequestsAfter   int64  `json:"total_requests_after"`
+		FailedRequestsAfter  int64  `json:"failed_requests_after"`
+	}
+	decodeUsageResponse(t, recorder, &body)
+	if !body.Cleared {
+		t.Fatal("cleared = false, want true")
+	}
+	if body.Version == 0 {
+		t.Fatal("version = 0, want changed version")
+	}
+	if body.TotalRequestsBefore != 1 || body.FailedRequestsBefore != 0 {
+		t.Fatalf("before counters = %+v, want one successful request", body)
+	}
+	if body.TotalRequestsAfter != 0 || body.FailedRequestsAfter != 0 {
+		t.Fatalf("after counters = %+v, want zero counters", body)
+	}
+
+	meta := stats.Meta()
+	if meta.TotalRequests != 0 || meta.SuccessCount != 0 || meta.FailureCount != 0 || meta.TotalTokens != 0 {
+		t.Fatalf("meta after clear = %+v, want zero", meta)
+	}
+}
+
 func TestUsageAuthSummariesIncludesCurrentZeroUsageAndStale(t *testing.T) {
 	handler, stats, manager := newUsageHandlerForTest(t)
 	usedIndex := registerUsageAuthForTest(t, manager, "used-auth", "used.json", "codex", "Used", "used@example.com")

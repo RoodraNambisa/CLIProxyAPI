@@ -60,6 +60,30 @@ func (h *Handler) GetUsageMeta(c *gin.Context) {
 	})
 }
 
+// ClearUsageStatistics removes all in-memory request usage statistics.
+func (h *Handler) ClearUsageStatistics(c *gin.Context) {
+	if h == nil || h.usageStats == nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "usage statistics unavailable"})
+		return
+	}
+	previous := h.usageStats.Clear()
+	meta := h.usageStats.Meta()
+	c.JSON(http.StatusOK, gin.H{
+		"cleared":                true,
+		"version":                meta.Version,
+		"total_requests_before":  previous.TotalRequests,
+		"success_count_before":   previous.SuccessCount,
+		"failure_count_before":   previous.FailureCount,
+		"total_tokens_before":    previous.TotalTokens,
+		"total_requests_after":   meta.TotalRequests,
+		"success_count_after":    meta.SuccessCount,
+		"failure_count_after":    meta.FailureCount,
+		"total_tokens_after":     meta.TotalTokens,
+		"failed_requests_before": previous.FailureCount,
+		"failed_requests_after":  meta.FailureCount,
+	})
+}
+
 // GetUsageSummary returns aggregated usage statistics without request details.
 func (h *Handler) GetUsageSummary(c *gin.Context) {
 	timeRange, ok := parseUsageTimeRange(c)

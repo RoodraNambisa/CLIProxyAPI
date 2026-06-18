@@ -329,6 +329,45 @@ func TestRequestStatisticsPruneAuthIndexesRemovesStaleEntries(t *testing.T) {
 	}
 }
 
+func TestRequestStatisticsClearResetsStatsAndBumpsVersion(t *testing.T) {
+	stats := NewRequestStatistics()
+	stats.Record(context.Background(), coreusage.Record{
+		APIKey:      "test-key",
+		Model:       "gpt-5.4",
+		RequestedAt: time.Date(2026, 3, 20, 12, 0, 0, 0, time.UTC),
+		Detail:      coreusage.Detail{TotalTokens: 10},
+		AuthIndex:   "auth-a",
+	})
+	stats.Record(context.Background(), coreusage.Record{
+		APIKey:      "test-key",
+		Model:       "gpt-5.5",
+		RequestedAt: time.Date(2026, 3, 20, 12, 1, 0, 0, time.UTC),
+		Failed:      true,
+		Detail:      coreusage.Detail{TotalTokens: 20},
+		AuthIndex:   "auth-b",
+	})
+	_, versionBefore, _ := stats.SnapshotWithState()
+
+	previous := stats.Clear()
+	if previous.TotalRequests != 2 || previous.SuccessCount != 1 || previous.FailureCount != 1 || previous.TotalTokens != 30 {
+		t.Fatalf("previous snapshot = %+v, want requests=2 success=1 failure=1 tokens=30", previous)
+	}
+
+	snapshot, versionAfter, _ := stats.SnapshotWithState()
+	if versionAfter <= versionBefore {
+		t.Fatalf("version after clear = %d, want > %d", versionAfter, versionBefore)
+	}
+	if snapshot.TotalRequests != 0 || snapshot.SuccessCount != 0 || snapshot.FailureCount != 0 || snapshot.TotalTokens != 0 {
+		t.Fatalf("snapshot after clear = %+v, want zero totals", snapshot)
+	}
+	if len(snapshot.APIs) != 0 || len(snapshot.RequestsByDay) != 0 || len(snapshot.RequestsByHour) != 0 || len(snapshot.TokensByDay) != 0 || len(snapshot.TokensByHour) != 0 {
+		t.Fatalf("snapshot after clear still has aggregates: %+v", snapshot)
+	}
+	if auths := stats.AuthSummaries(); len(auths) != 0 {
+		t.Fatalf("auth summaries after clear = %+v, want empty", auths)
+	}
+}
+
 func TestRequestStatisticsSummaryOmitsDetails(t *testing.T) {
 	stats := NewRequestStatistics()
 	stats.Record(context.Background(), coreusage.Record{

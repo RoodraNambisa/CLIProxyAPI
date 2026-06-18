@@ -298,6 +298,12 @@ func (s *RequestStatistics) SnapshotWithState() (StatisticsSnapshot, uint64, uin
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
+	result = s.snapshotLocked()
+	return result, s.changeCount, s.persistedCount
+}
+
+func (s *RequestStatistics) snapshotLocked() StatisticsSnapshot {
+	result := StatisticsSnapshot{}
 	result.TotalRequests = s.totalRequests
 	result.SuccessCount = s.successCount
 	result.FailureCount = s.failureCount
@@ -344,7 +350,7 @@ func (s *RequestStatistics) SnapshotWithState() (StatisticsSnapshot, uint64, uin
 		result.TokensByHour[key] = v
 	}
 
-	return result, s.changeCount, s.persistedCount
+	return result
 }
 
 type MergeResult struct {
@@ -453,6 +459,29 @@ func (s *RequestStatistics) MarkAllPersisted() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.persistedCount = s.changeCount
+}
+
+// Clear removes all in-memory request statistics and marks the store changed.
+func (s *RequestStatistics) Clear() StatisticsSnapshot {
+	if s == nil {
+		return StatisticsSnapshot{}
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	previous := s.snapshotLocked()
+	s.totalRequests = 0
+	s.successCount = 0
+	s.failureCount = 0
+	s.totalTokens = 0
+	s.apis = make(map[string]*apiStats)
+	s.auths = make(map[string]*authStats)
+	s.requestsByDay = make(map[string]int64)
+	s.requestsByHour = make(map[int]int64)
+	s.tokensByDay = make(map[string]int64)
+	s.tokensByHour = make(map[int]int64)
+	s.markChangedLocked()
+	return previous
 }
 
 // RemoveAuthIndexes removes request details belonging to the supplied auth

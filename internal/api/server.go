@@ -526,6 +526,7 @@ func (s *Server) registerManagementRoutes() {
 	mgmt.Use(s.activeManagementPrefixMiddleware(prefix), s.managementAvailabilityMiddleware(), s.mgmt.Middleware())
 	{
 		mgmt.GET("/usage", s.mgmt.GetUsageStatistics)
+		mgmt.DELETE("/usage", s.mgmt.ClearUsageStatistics)
 		mgmt.GET("/usage/meta", s.mgmt.GetUsageMeta)
 		mgmt.GET("/usage/summary", s.mgmt.GetUsageSummary)
 		mgmt.GET("/usage/details", s.mgmt.GetUsageDetails)
