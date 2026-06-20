@@ -101,11 +101,19 @@ func quotaCooldownDisabledForAuth(auth *Auth) bool {
 	return quotaCooldownDisabled.Load()
 }
 
+func (m *Manager) currentConfig() *internalconfig.Config {
+	if m == nil {
+		return nil
+	}
+	cfg, _ := m.runtimeConfig.Load().(*internalconfig.Config)
+	return cfg
+}
+
 func (m *Manager) cooldownSkippedForStatus(statusCode int) bool {
 	if m == nil || statusCode == 0 {
 		return false
 	}
-	cfg, _ := m.runtimeConfig.Load().(*internalconfig.Config)
+	cfg := m.currentConfig()
 	if cfg == nil || len(cfg.NoCooldownStatusCodes) == 0 {
 		return false
 	}
@@ -127,7 +135,7 @@ func (m *Manager) fixedErrorCooldownForResult(err *Error) (fixedErrorCooldownMat
 	if m == nil || err == nil {
 		return fixedErrorCooldownMatch{}, false
 	}
-	cfg, _ := m.runtimeConfig.Load().(*internalconfig.Config)
+	cfg := m.currentConfig()
 	if cfg == nil || len(cfg.FixedErrorCooldowns) == 0 {
 		return fixedErrorCooldownMatch{}, false
 	}
@@ -1168,7 +1176,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr}
 			result.RetryAfter = retryAfterFromError(errStream)
 			m.MarkResult(ctx, result)
-			if isRequestInvalidError(errStream) {
+			if m.isRequestInvalidError(errStream) {
 				return nil, errStream
 			}
 			lastErr = errStream
@@ -1181,7 +1189,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 				discardStreamChunks(streamResult.Chunks)
 				return nil, errCtx
 			}
-			if isRequestInvalidError(bootstrapErr) {
+			if m.isRequestInvalidError(bootstrapErr) {
 				rerr := &Error{Message: bootstrapErr.Error()}
 				if se, ok := errors.AsType[cliproxyexecutor.StatusError](bootstrapErr); ok && se != nil {
 					rerr.HTTPStatus = se.StatusCode()
@@ -1689,7 +1697,7 @@ func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxye
 			}
 			continue
 		}
-		if strictSessionAffinity || !shouldRetryRequestRound(errExec) || attempt >= requestRetry {
+		if strictSessionAffinity || !shouldRetryRequestRound(errExec, m.currentConfig()) || attempt >= requestRetry {
 			break
 		}
 		if wait, shouldWait := retryAfterWaitFromError(errExec, maxWait); shouldWait {
@@ -1737,7 +1745,7 @@ func (m *Manager) ExecuteCount(ctx context.Context, providers []string, req clip
 			}
 			continue
 		}
-		if strictSessionAffinity || !shouldRetryRequestRound(errExec) || attempt >= requestRetry {
+		if strictSessionAffinity || !shouldRetryRequestRound(errExec, m.currentConfig()) || attempt >= requestRetry {
 			break
 		}
 		if wait, shouldWait := retryAfterWaitFromError(errExec, maxWait); shouldWait {
@@ -1780,7 +1788,7 @@ func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cli
 			}
 			continue
 		}
-		if strictSessionAffinity || !shouldRetryRequestRound(errStream) || attempt >= requestRetry {
+		if strictSessionAffinity || !shouldRetryRequestRound(errStream, m.currentConfig()) || attempt >= requestRetry {
 			break
 		}
 		if wait, shouldWait := retryAfterWaitFromError(errStream, maxWait); shouldWait {
@@ -1867,7 +1875,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 					result.RetryAfter = ra
 				}
 				m.MarkResult(execCtx, result)
-				if isRequestInvalidError(errExec) {
+				if m.isRequestInvalidError(errExec) {
 					return cliproxyexecutor.Response{}, errExec
 				}
 				authErr = errExec
@@ -1878,7 +1886,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			return resp, nil
 		}
 		if authErr != nil {
-			if isRequestInvalidError(authErr) {
+			if m.isRequestInvalidError(authErr) {
 				return cliproxyexecutor.Response{}, authErr
 			}
 			if strictSessionAffinity {
@@ -1951,7 +1959,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 					result.RetryAfter = ra
 				}
 				m.MarkResult(execCtx, result)
-				if isRequestInvalidError(errExec) {
+				if m.isRequestInvalidError(errExec) {
 					return cliproxyexecutor.Response{}, errExec
 				}
 				authErr = errExec
@@ -1962,7 +1970,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 			return resp, nil
 		}
 		if authErr != nil {
-			if isRequestInvalidError(authErr) {
+			if m.isRequestInvalidError(authErr) {
 				return cliproxyexecutor.Response{}, authErr
 			}
 			if strictSessionAffinity {
@@ -2020,7 +2028,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			if errCtx := execCtx.Err(); errCtx != nil {
 				return nil, errCtx
 			}
-			if isRequestInvalidError(errStream) {
+			if m.isRequestInvalidError(errStream) {
 				return nil, errStream
 			}
 			if strictSessionAffinity {
@@ -2778,7 +2786,7 @@ func (b *requestRetryBudget) consume() bool {
 	}
 }
 
-func shouldRetryRequestRound(err error) bool {
+func shouldRetryRequestRound(err error, cfg *internalconfig.Config) bool {
 	if err == nil {
 		return false
 	}
@@ -2786,13 +2794,17 @@ func shouldRetryRequestRound(err error) bool {
 	if status == http.StatusOK {
 		return false
 	}
-	if isRequestInvalidError(err) {
+	if isRequestInvalidErrorWithConfig(err, cfg) {
 		return false
 	}
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return false
 	}
 	return true
+}
+
+func (m *Manager) isRequestInvalidError(err error) bool {
+	return isRequestInvalidErrorWithConfig(err, m.currentConfig())
 }
 
 func finalAuthSelectionError(err error) error {
@@ -3333,13 +3345,10 @@ func isRequestScopedNotFoundResultError(err *Error) bool {
 	return isRequestScopedNotFoundMessage(err.Message)
 }
 
-// isRequestInvalidError returns true if the error represents a client request
-// error that should not be retried. Specifically, it treats 400 responses with
-// "invalid_request_error", request-scoped 404 item misses caused by `store=false`,
-// and all 422 responses as request-shape failures, where switching auths or
-// pooled upstream models will not help. Model-support errors are excluded so
-// routing can fall through to another auth or upstream.
-func isRequestInvalidError(err error) bool {
+// isRequestInvalidErrorWithConfig returns true if the error represents a client
+// request error that should not be retried. Built-in request-shape failures are
+// preserved, and custom non-retryable error rules can add stable upstream errors.
+func isRequestInvalidErrorWithConfig(err error, cfg *internalconfig.Config) bool {
 	if err == nil {
 		return false
 	}
@@ -3349,13 +3358,93 @@ func isRequestInvalidError(err error) bool {
 	status := statusCodeFromError(err)
 	switch status {
 	case http.StatusBadRequest:
-		return strings.Contains(err.Error(), "invalid_request_error")
+		if strings.Contains(strings.ToLower(err.Error()), "invalid_request_error") {
+			return true
+		}
 	case http.StatusNotFound:
 		return isRequestScopedNotFoundMessage(err.Error())
 	case http.StatusUnprocessableEntity:
 		return true
-	default:
+	}
+	return matchesNonRetryableErrorRules(err, status, cfg)
+}
+
+func matchesNonRetryableErrorRules(err error, statusCode int, cfg *internalconfig.Config) bool {
+	if err == nil {
 		return false
+	}
+	rules := nonRetryableErrorRulesForConfig(cfg)
+	if len(rules) == 0 {
+		return false
+	}
+	fields := nonRetryableErrorFieldsFromError(err)
+	for _, rule := range rules {
+		if rule.StatusCode != 0 && rule.StatusCode != statusCode {
+			continue
+		}
+		if rule.Type != "" && !strings.EqualFold(rule.Type, fields.errType) {
+			continue
+		}
+		if rule.Code != "" && !strings.EqualFold(rule.Code, fields.code) {
+			continue
+		}
+		if rule.MessageContains != "" {
+			needle := strings.ToLower(strings.TrimSpace(rule.MessageContains))
+			if needle == "" {
+				continue
+			}
+			if !strings.Contains(fields.messageLower, needle) && !strings.Contains(fields.rawLower, needle) {
+				continue
+			}
+		}
+		return true
+	}
+	return false
+}
+
+func nonRetryableErrorRulesForConfig(cfg *internalconfig.Config) []internalconfig.NonRetryableErrorRule {
+	if cfg == nil || cfg.NonRetryableErrors == nil {
+		return internalconfig.DefaultNonRetryableErrorRules()
+	}
+	return cfg.NonRetryableErrors
+}
+
+type nonRetryableErrorFields struct {
+	errType      string
+	code         string
+	messageLower string
+	rawLower     string
+}
+
+func nonRetryableErrorFieldsFromError(err error) nonRetryableErrorFields {
+	raw := ""
+	if err != nil {
+		raw = strings.TrimSpace(err.Error())
+	}
+	payload := raw
+	if idx := strings.Index(payload, "{"); idx >= 0 {
+		payload = payload[idx:]
+	}
+	errType := strings.TrimSpace(gjson.Get(payload, "error.type").String())
+	if errType == "" {
+		errType = strings.TrimSpace(gjson.Get(payload, "type").String())
+	}
+	code := strings.TrimSpace(gjson.Get(payload, "error.code").String())
+	if code == "" {
+		code = strings.TrimSpace(gjson.Get(payload, "code").String())
+	}
+	message := strings.TrimSpace(gjson.Get(payload, "error.message").String())
+	if message == "" {
+		message = strings.TrimSpace(gjson.Get(payload, "message").String())
+	}
+	if message == "" {
+		message = raw
+	}
+	return nonRetryableErrorFields{
+		errType:      strings.ToLower(errType),
+		code:         strings.ToLower(code),
+		messageLower: strings.ToLower(message),
+		rawLower:     strings.ToLower(raw),
 	}
 }
 

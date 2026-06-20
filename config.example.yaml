@@ -114,6 +114,25 @@ fixed-error-cooldowns:
     cooldown-seconds: 2592000
     scope: auth
 
+# Stable request errors that should not retry another credential or request round.
+# Set to [] to disable the default image_generation_user_error invalid_value/moderation_blocked rules.
+non-retryable-errors:
+  - status-code: 400
+    type: image_generation_user_error
+    code: invalid_value
+  - status-code: 400
+    type: image_generation_user_error
+    code: moderation_blocked
+
+# Remove route models from matching credentials before model prefixing and registry registration.
+# Matching fields use non-secret auth metadata only.
+auth-model-exclusions: []
+# auth-model-exclusions:
+#   - models: ["gpt-image-2"]
+#     priorities: [-1]
+#   - models: ["gpt-image-2"]
+#     keyword-contains: ["free"]
+
 # Block API requests when the raw request body contains configured byte keywords.
 # Matching is performed on raw request bytes before provider routing.
 request-body-audit:

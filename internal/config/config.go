@@ -85,6 +85,12 @@ type Config struct {
 	// FixedErrorCooldowns overrides auth/model cooldown duration for matching status and error text.
 	FixedErrorCooldowns []FixedErrorCooldownRule `yaml:"fixed-error-cooldowns" json:"fixed-error-cooldowns"`
 
+	// NonRetryableErrors marks stable request errors that should not trigger credential or request-round retry.
+	NonRetryableErrors []NonRetryableErrorRule `yaml:"non-retryable-errors" json:"non-retryable-errors"`
+
+	// AuthModelExclusions removes models from matching credentials before registry registration.
+	AuthModelExclusions []AuthModelExclusionRule `yaml:"auth-model-exclusions" json:"auth-model-exclusions"`
+
 	// RequestBodyAudit blocks API requests whose raw body contains configured byte keywords.
 	RequestBodyAudit RequestBodyAuditConfig `yaml:"request-body-audit" json:"request-body-audit"`
 
@@ -292,6 +298,30 @@ type FixedErrorCooldownRule struct {
 	CooldownSeconds int `yaml:"cooldown-seconds" json:"cooldown-seconds"`
 	// Scope controls whether the rule cools only the model or the whole auth. Valid values: model, auth.
 	Scope string `yaml:"scope,omitempty" json:"scope,omitempty"`
+}
+
+// NonRetryableErrorRule marks a stable upstream error as request-scoped so the router will not retry it.
+type NonRetryableErrorRule struct {
+	// StatusCode optionally restricts the rule to one HTTP status code. Set to 0 or omit it to ignore status.
+	StatusCode int `yaml:"status-code" json:"status-code"`
+	// Type matches error.type or top-level type case-insensitively.
+	Type string `yaml:"type,omitempty" json:"type,omitempty"`
+	// Code matches error.code or top-level code case-insensitively.
+	Code string `yaml:"code,omitempty" json:"code,omitempty"`
+	// MessageContains matches a substring in error.message, message, or the raw error string case-insensitively.
+	MessageContains string `yaml:"message-contains,omitempty" json:"message-contains,omitempty"`
+}
+
+// AuthModelExclusionRule removes models from credentials that match non-secret auth metadata.
+type AuthModelExclusionRule struct {
+	// Models are route model IDs to remove before applying model prefixes.
+	Models []string `yaml:"models" json:"models"`
+	// Providers optionally restricts the rule to provider keys.
+	Providers []string `yaml:"providers,omitempty" json:"providers,omitempty"`
+	// Priorities optionally restricts the rule to credential priorities.
+	Priorities []int `yaml:"priorities,omitempty" json:"priorities,omitempty"`
+	// KeywordContains matches non-secret identity fields case-insensitively.
+	KeywordContains []string `yaml:"keyword-contains,omitempty" json:"keyword-contains,omitempty"`
 }
 
 // RequestBodyAuditConfig defines byte-level request body keyword blocking for model APIs.
@@ -753,6 +783,7 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 		Type:       DefaultRequestBodyAuditType,
 		Code:       DefaultRequestBodyAuditCode,
 	}
+	cfg.NonRetryableErrors = DefaultNonRetryableErrorRules()
 	cfg.Images.CodexModel = "gpt-5.4"
 	cfg.Images.ImageModel = "gpt-image-2"
 	cfg.Images.Native.Generations.Models = defaultNativeImageModels()
@@ -870,6 +901,8 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	}
 	cfg.NoCooldownStatusCodes = NormalizeStatusCodes(cfg.NoCooldownStatusCodes)
 	cfg.FixedErrorCooldowns = NormalizeFixedErrorCooldowns(cfg.FixedErrorCooldowns)
+	cfg.NonRetryableErrors = NormalizeNonRetryableErrorRules(cfg.NonRetryableErrors)
+	cfg.AuthModelExclusions = NormalizeAuthModelExclusionRules(cfg.AuthModelExclusions)
 	cfg.NormalizeRequestBodyAudit()
 
 	// Sanitize Gemini API key configuration and migrate legacy entries.
@@ -1221,6 +1254,133 @@ func NormalizeFixedErrorCooldowns(rules []FixedErrorCooldownRule) []FixedErrorCo
 		return nil
 	}
 	return out
+}
+
+// DefaultNonRetryableErrorRules returns stable upstream request errors that should not be retried by default.
+func DefaultNonRetryableErrorRules() []NonRetryableErrorRule {
+	return []NonRetryableErrorRule{
+		{StatusCode: http.StatusBadRequest, Type: "image_generation_user_error", Code: "invalid_value"},
+		{StatusCode: http.StatusBadRequest, Type: "image_generation_user_error", Code: "moderation_blocked"},
+	}
+}
+
+// NormalizeNonRetryableErrorRules keeps valid non-retryable error rules in first-seen order.
+func NormalizeNonRetryableErrorRules(rules []NonRetryableErrorRule) []NonRetryableErrorRule {
+	if rules == nil {
+		return nil
+	}
+	out := make([]NonRetryableErrorRule, 0, len(rules))
+	seen := make(map[string]struct{}, len(rules))
+	for _, rule := range rules {
+		statusCode := rule.StatusCode
+		if statusCode != 0 && (statusCode < 100 || statusCode > 599) {
+			continue
+		}
+		errType := strings.ToLower(strings.TrimSpace(rule.Type))
+		code := strings.ToLower(strings.TrimSpace(rule.Code))
+		message := strings.ToLower(strings.TrimSpace(rule.MessageContains))
+		if statusCode == 0 && errType == "" && code == "" && message == "" {
+			continue
+		}
+		key := fmt.Sprintf("%d\x00%s\x00%s\x00%s", statusCode, errType, code, message)
+		if _, exists := seen[key]; exists {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, NonRetryableErrorRule{
+			StatusCode:      statusCode,
+			Type:            errType,
+			Code:            code,
+			MessageContains: message,
+		})
+	}
+	return out
+}
+
+// NormalizeAuthModelExclusionRules keeps model exclusion rules with at least one matcher.
+func NormalizeAuthModelExclusionRules(rules []AuthModelExclusionRule) []AuthModelExclusionRule {
+	if len(rules) == 0 {
+		return nil
+	}
+	out := make([]AuthModelExclusionRule, 0, len(rules))
+	seen := make(map[string]struct{}, len(rules))
+	for _, rule := range rules {
+		models := NormalizeExcludedModels(rule.Models)
+		if len(models) == 0 {
+			continue
+		}
+		providers := normalizeStringListLower(rule.Providers)
+		priorities := normalizeIntList(rule.Priorities)
+		keywords := normalizeStringListLower(rule.KeywordContains)
+		if len(providers) == 0 && len(priorities) == 0 && len(keywords) == 0 {
+			continue
+		}
+		key := strings.Join(models, ",") + "\x00" + strings.Join(providers, ",") + "\x00" + intsSignature(priorities) + "\x00" + strings.Join(keywords, ",")
+		if _, exists := seen[key]; exists {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, AuthModelExclusionRule{
+			Models:          models,
+			Providers:       providers,
+			Priorities:      priorities,
+			KeywordContains: keywords,
+		})
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func normalizeStringListLower(values []string) []string {
+	if len(values) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(values))
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		value = strings.ToLower(strings.TrimSpace(value))
+		if value == "" {
+			continue
+		}
+		if _, exists := seen[value]; exists {
+			continue
+		}
+		seen[value] = struct{}{}
+		out = append(out, value)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func normalizeIntList(values []int) []int {
+	if len(values) == 0 {
+		return nil
+	}
+	seen := make(map[int]struct{}, len(values))
+	out := make([]int, 0, len(values))
+	for _, value := range values {
+		if _, exists := seen[value]; exists {
+			continue
+		}
+		seen[value] = struct{}{}
+		out = append(out, value)
+	}
+	return out
+}
+
+func intsSignature(values []int) string {
+	if len(values) == 0 {
+		return ""
+	}
+	parts := make([]string, 0, len(values))
+	for _, value := range values {
+		parts = append(parts, fmt.Sprintf("%d", value))
+	}
+	return strings.Join(parts, ",")
 }
 
 // NormalizeRequestBodyAudit canonicalizes request body audit settings and compiles byte keywords.

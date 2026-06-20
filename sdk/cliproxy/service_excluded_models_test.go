@@ -158,6 +158,176 @@ func TestRegisterModelsForAuth_CodexImageModelRespectsExcludedModels(t *testing.
 	}
 }
 
+func TestRegisterModelsForAuth_AuthModelExclusionsFilterByPriority(t *testing.T) {
+	service := &Service{
+		cfg: &config.Config{
+			SDKConfig: config.SDKConfig{
+				Images: config.ImagesConfig{ImageModel: "gpt-image-2"},
+			},
+			AuthModelExclusions: []config.AuthModelExclusionRule{
+				{Models: []string{"gpt-image-2"}, Priorities: []int{-1}},
+			},
+		},
+	}
+	testCases := []struct {
+		name      string
+		priority  string
+		wantImage bool
+	}{
+		{name: "excluded priority", priority: "-1", wantImage: false},
+		{name: "allowed priority", priority: "0", wantImage: true},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			auth := &coreauth.Auth{
+				ID:       "auth-codex-model-exclusion-priority-" + strings.ReplaceAll(tc.name, " ", "-"),
+				Provider: "codex",
+				Status:   coreauth.StatusActive,
+				Attributes: map[string]string{
+					"plan_type": "plus",
+					"priority":  tc.priority,
+				},
+			}
+			reg := GlobalModelRegistry()
+			reg.UnregisterClient(auth.ID)
+			t.Cleanup(func() {
+				reg.UnregisterClient(auth.ID)
+			})
+
+			service.registerModelsForAuth(auth)
+
+			hasImage := containsRegisteredModel(registry.GetGlobalRegistry().GetModelsForClient(auth.ID), "gpt-image-2")
+			if hasImage != tc.wantImage {
+				t.Fatalf("gpt-image-2 presence = %v, want %v", hasImage, tc.wantImage)
+			}
+		})
+	}
+}
+
+func TestRegisterModelsForAuth_AuthModelExclusionsFilterByKeyword(t *testing.T) {
+	service := &Service{
+		cfg: &config.Config{
+			SDKConfig: config.SDKConfig{
+				Images: config.ImagesConfig{ImageModel: "gpt-image-2"},
+			},
+			AuthModelExclusions: []config.AuthModelExclusionRule{
+				{Models: []string{"gpt-image-2"}, KeywordContains: []string{"free"}},
+			},
+		},
+	}
+	auth := &coreauth.Auth{
+		ID:       "auth-codex-model-exclusion-keyword",
+		Provider: "codex",
+		FileName: "codex-free-account.json",
+		Status:   coreauth.StatusActive,
+		Attributes: map[string]string{
+			"plan_type": "plus",
+		},
+		Metadata: map[string]any{
+			"email": "tester-free@example.com",
+		},
+	}
+	reg := GlobalModelRegistry()
+	reg.UnregisterClient(auth.ID)
+	t.Cleanup(func() {
+		reg.UnregisterClient(auth.ID)
+	})
+
+	service.registerModelsForAuth(auth)
+
+	models := registry.GetGlobalRegistry().GetModelsForClient(auth.ID)
+	if containsRegisteredModel(models, "gpt-image-2") {
+		t.Fatal("expected keyword-matched auth to exclude gpt-image-2")
+	}
+	if len(models) == 0 {
+		t.Fatal("expected other codex models to remain registered")
+	}
+}
+
+func TestRegisterModelsForAuth_AuthModelExclusionsApplyBeforePrefix(t *testing.T) {
+	service := &Service{
+		cfg: &config.Config{
+			SDKConfig: config.SDKConfig{
+				ForceModelPrefix: true,
+				Images:           config.ImagesConfig{ImageModel: "gpt-image-2"},
+			},
+			AuthModelExclusions: []config.AuthModelExclusionRule{
+				{Models: []string{"gpt-image-2"}, Priorities: []int{0}},
+			},
+		},
+	}
+	auth := &coreauth.Auth{
+		ID:       "auth-codex-model-exclusion-prefix",
+		Provider: "codex",
+		Prefix:   "team-a",
+		Status:   coreauth.StatusActive,
+		Attributes: map[string]string{
+			"plan_type": "plus",
+			"priority":  "0",
+		},
+	}
+	reg := GlobalModelRegistry()
+	reg.UnregisterClient(auth.ID)
+	t.Cleanup(func() {
+		reg.UnregisterClient(auth.ID)
+	})
+
+	service.registerModelsForAuth(auth)
+
+	models := registry.GetGlobalRegistry().GetModelsForClient(auth.ID)
+	if containsRegisteredModel(models, "gpt-image-2") {
+		t.Fatal("expected unprefixed image model to be absent with forced prefix")
+	}
+	if containsRegisteredModel(models, "team-a/gpt-image-2") {
+		t.Fatal("expected model exclusion to remove image model before prefixing")
+	}
+}
+
+func TestRegisterModelsForAuth_AuthModelExclusionsApplyToOpenAICompatibility(t *testing.T) {
+	service := &Service{
+		cfg: &config.Config{
+			OpenAICompatibility: []config.OpenAICompatibility{
+				{
+					Name:    "compat-images",
+					BaseURL: "https://example.invalid/v1",
+					Models: []config.OpenAICompatibilityModel{
+						{Name: "gpt-image-2"},
+						{Name: "gpt-5.5"},
+					},
+				},
+			},
+			AuthModelExclusions: []config.AuthModelExclusionRule{
+				{Models: []string{"gpt-image-2"}, Priorities: []int{-1}},
+			},
+		},
+	}
+	auth := &coreauth.Auth{
+		ID:       "auth-openai-compat-model-exclusion",
+		Provider: "openai-compatibility",
+		Label:    "compat-images",
+		Status:   coreauth.StatusActive,
+		Attributes: map[string]string{
+			"priority": "-1",
+		},
+	}
+	reg := GlobalModelRegistry()
+	reg.UnregisterClient(auth.ID)
+	t.Cleanup(func() {
+		reg.UnregisterClient(auth.ID)
+	})
+
+	service.registerModelsForAuth(auth)
+
+	models := registry.GetGlobalRegistry().GetModelsForClient(auth.ID)
+	if containsRegisteredModel(models, "gpt-image-2") {
+		t.Fatal("expected OpenAI compatibility image model to be filtered")
+	}
+	if !containsRegisteredModel(models, "gpt-5.5") {
+		t.Fatal("expected non-filtered OpenAI compatibility model to remain")
+	}
+}
+
 func TestRegisterModelsForAuth_CodexNativeImageModelsWhenEnabled(t *testing.T) {
 	testCases := []struct {
 		name       string

@@ -362,6 +362,31 @@ func TestShouldRefreshCodexRegistrations(t *testing.T) {
 	}
 }
 
+func TestAuthModelExclusionsSignature(t *testing.T) {
+	previous := &config.Config{
+		AuthModelExclusions: []config.AuthModelExclusionRule{
+			{Models: []string{"gpt-image-2"}, Priorities: []int{-1}},
+		},
+	}
+	nextSame := &config.Config{
+		AuthModelExclusions: []config.AuthModelExclusionRule{
+			{Models: []string{"gpt-image-2"}, Priorities: []int{-1}},
+		},
+	}
+	nextChanged := &config.Config{
+		AuthModelExclusions: []config.AuthModelExclusionRule{
+			{Models: []string{"gpt-image-2"}, KeywordContains: []string{"free"}},
+		},
+	}
+
+	if authModelExclusionsSignature(previous) != authModelExclusionsSignature(nextSame) {
+		t.Fatal("expected unchanged auth model exclusions to have the same signature")
+	}
+	if authModelExclusionsSignature(previous) == authModelExclusionsSignature(nextChanged) {
+		t.Fatal("expected changed auth model exclusions to have a different signature")
+	}
+}
+
 func TestServiceDeleteCoreAuth_DeleteFailureKeepsRuntimeAndModels(t *testing.T) {
 	service := &Service{
 		cfg:         &config.Config{},

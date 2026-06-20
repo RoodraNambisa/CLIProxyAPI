@@ -1,6 +1,10 @@
 package config
 
-import "testing"
+import (
+	"os"
+	"path/filepath"
+	"testing"
+)
 
 func TestSanitizeOAuthModelAlias_PreservesForkFlag(t *testing.T) {
 	cfg := &Config{
@@ -135,5 +139,89 @@ func TestNormalizeFixedErrorCooldowns(t *testing.T) {
 		if got[i] != want[i] {
 			t.Fatalf("rules = %#v, want %#v", got, want)
 		}
+	}
+}
+
+func TestLoadConfigOptional_NonRetryableErrorsDefaultAndExplicitEmpty(t *testing.T) {
+	t.Run("default image errors", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "config.yaml")
+		if err := os.WriteFile(path, []byte(`request-retry: 2`), 0o600); err != nil {
+			t.Fatalf("write config: %v", err)
+		}
+
+		cfg, err := LoadConfigOptional(path, false)
+		if err != nil {
+			t.Fatalf("LoadConfigOptional() error = %v", err)
+		}
+		if len(cfg.NonRetryableErrors) != 2 {
+			t.Fatalf("NonRetryableErrors len = %d, want 2", len(cfg.NonRetryableErrors))
+		}
+		if cfg.NonRetryableErrors[0].StatusCode != 400 ||
+			cfg.NonRetryableErrors[0].Type != "image_generation_user_error" ||
+			cfg.NonRetryableErrors[0].Code != "invalid_value" {
+			t.Fatalf("first default rule = %+v", cfg.NonRetryableErrors[0])
+		}
+	})
+
+	t.Run("explicit empty disables defaults", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "config.yaml")
+		if err := os.WriteFile(path, []byte(`non-retryable-errors: []`), 0o600); err != nil {
+			t.Fatalf("write config: %v", err)
+		}
+
+		cfg, err := LoadConfigOptional(path, false)
+		if err != nil {
+			t.Fatalf("LoadConfigOptional() error = %v", err)
+		}
+		if len(cfg.NonRetryableErrors) != 0 {
+			t.Fatalf("NonRetryableErrors = %+v, want empty", cfg.NonRetryableErrors)
+		}
+	})
+}
+
+func TestNormalizeNonRetryableErrorRules(t *testing.T) {
+	input := []NonRetryableErrorRule{
+		{StatusCode: 99, Type: "bad", Code: "bad"},
+		{StatusCode: 400, Type: " Image_Generation_User_Error ", Code: " INVALID_VALUE "},
+		{StatusCode: 400, Type: "image_generation_user_error", Code: "invalid_value"},
+		{MessageContains: " Safety System "},
+		{},
+	}
+	got := NormalizeNonRetryableErrorRules(input)
+	want := []NonRetryableErrorRule{
+		{StatusCode: 400, Type: "image_generation_user_error", Code: "invalid_value"},
+		{MessageContains: "safety system"},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("rules = %#v, want %#v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("rules = %#v, want %#v", got, want)
+		}
+	}
+}
+
+func TestNormalizeAuthModelExclusionRules(t *testing.T) {
+	got := NormalizeAuthModelExclusionRules([]AuthModelExclusionRule{
+		{Models: []string{"gpt-image-2"}},
+		{Models: []string{" gpt-image-2 ", "GPT-IMAGE-2", ""}, Priorities: []int{-1, -1, 0}},
+		{Models: []string{"gpt-image-1.5"}, Providers: []string{" CoDeX ", "codex"}, KeywordContains: []string{" Free ", "free", ""}},
+		{Priorities: []int{0}},
+	})
+	if len(got) != 2 {
+		t.Fatalf("rules = %#v, want 2 valid rules", got)
+	}
+	if len(got[0].Models) != 1 || got[0].Models[0] != "gpt-image-2" {
+		t.Fatalf("first models = %#v", got[0].Models)
+	}
+	if len(got[0].Priorities) != 2 || got[0].Priorities[0] != -1 || got[0].Priorities[1] != 0 {
+		t.Fatalf("first priorities = %#v", got[0].Priorities)
+	}
+	if len(got[1].Providers) != 1 || got[1].Providers[0] != "codex" {
+		t.Fatalf("second providers = %#v", got[1].Providers)
+	}
+	if len(got[1].KeywordContains) != 1 || got[1].KeywordContains[0] != "free" {
+		t.Fatalf("second keywords = %#v", got[1].KeywordContains)
 	}
 }

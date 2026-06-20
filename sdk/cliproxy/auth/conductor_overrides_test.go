@@ -322,7 +322,8 @@ func TestAvailableAuthsForRouteModel_SortsSelectedPriorityDeterministically(t *t
 }
 
 type credentialRetryLimitExecutor struct {
-	id string
+	id  string
+	err error
 
 	mu          sync.Mutex
 	calls       int
@@ -335,11 +336,17 @@ func (e *credentialRetryLimitExecutor) Identifier() string {
 
 func (e *credentialRetryLimitExecutor) Execute(_ context.Context, auth *Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
 	e.recordCall(authIDForCall(auth))
+	if e.err != nil {
+		return cliproxyexecutor.Response{}, e.err
+	}
 	return cliproxyexecutor.Response{}, &Error{HTTPStatus: 500, Message: "boom"}
 }
 
 func (e *credentialRetryLimitExecutor) ExecuteStream(_ context.Context, auth *Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
 	e.recordCall(authIDForCall(auth))
+	if e.err != nil {
+		return nil, e.err
+	}
 	return nil, &Error{HTTPStatus: 500, Message: "boom"}
 }
 
@@ -349,6 +356,9 @@ func (e *credentialRetryLimitExecutor) Refresh(_ context.Context, auth *Auth) (*
 
 func (e *credentialRetryLimitExecutor) CountTokens(_ context.Context, auth *Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
 	e.recordCall(authIDForCall(auth))
+	if e.err != nil {
+		return cliproxyexecutor.Response{}, e.err
+	}
 	return cliproxyexecutor.Response{}, &Error{HTTPStatus: 500, Message: "boom"}
 }
 
@@ -653,6 +663,133 @@ func TestManager_MaxRetryCredentialsZeroKeepsTryingAllAvailableCredentials(t *te
 	}
 	if calls := executor.Calls(); calls != 6 {
 		t.Fatalf("expected 6 calls with max-retry-credentials=0, got %d", calls)
+	}
+}
+
+func TestManager_ImageGenerationUserBadRequestStopsRetry(t *testing.T) {
+	request := cliproxyexecutor.Request{Model: "test-model"}
+	testCases := []struct {
+		name    string
+		message string
+	}{
+		{
+			name:    "invalid_value",
+			message: `{"error":{"message":"Invalid size '887x1774'. Width and height must both be divisible by 16.","type":"image_generation_user_error","param":"size","code":"invalid_value"}}`,
+		},
+		{
+			name:    "moderation_blocked",
+			message: `{"error":{"message":"Your request was rejected by the safety system.","type":"image_generation_user_error","param":null,"code":"moderation_blocked"}}`,
+		},
+	}
+
+	for _, tc := range testCases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			invocations := []struct {
+				name   string
+				invoke func(*Manager) error
+			}{
+				{
+					name: "execute",
+					invoke: func(manager *Manager) error {
+						_, err := manager.Execute(context.Background(), []string{"claude"}, request, cliproxyexecutor.Options{})
+						return err
+					},
+				},
+				{
+					name: "execute_count",
+					invoke: func(manager *Manager) error {
+						_, err := manager.ExecuteCount(context.Background(), []string{"claude"}, request, cliproxyexecutor.Options{})
+						return err
+					},
+				},
+				{
+					name: "execute_stream",
+					invoke: func(manager *Manager) error {
+						_, err := manager.ExecuteStream(context.Background(), []string{"claude"}, request, cliproxyexecutor.Options{})
+						return err
+					},
+				},
+			}
+			for _, invocation := range invocations {
+				invocation := invocation
+				t.Run(invocation.name, func(t *testing.T) {
+					manager, executor := newCredentialRetryLimitTestManagerWithAuthCount(t, 0, 2)
+					manager.SetRetryConfig(2, 0, 0)
+					executor.err = &Error{HTTPStatus: http.StatusBadRequest, Message: tc.message}
+
+					if errInvoke := invocation.invoke(manager); errInvoke == nil {
+						t.Fatalf("%s error = nil, want image generation user error", invocation.name)
+					}
+					if calls := executor.Calls(); calls != 1 {
+						t.Fatalf("%s calls = %d, want 1 without credential or request retry", invocation.name, calls)
+					}
+				})
+			}
+		})
+	}
+}
+
+func TestManager_CustomNonRetryableErrorRulesStopRetry(t *testing.T) {
+	request := cliproxyexecutor.Request{Model: "test-model"}
+	testCases := []struct {
+		name    string
+		rules   []internalconfig.NonRetryableErrorRule
+		message string
+	}{
+		{
+			name: "type_and_code",
+			rules: []internalconfig.NonRetryableErrorRule{{
+				StatusCode: http.StatusBadRequest,
+				Type:       "custom_user_error",
+				Code:       "blocked_by_policy",
+			}},
+			message: `{"error":{"message":"blocked","type":"custom_user_error","code":"blocked_by_policy"}}`,
+		},
+		{
+			name: "message_contains",
+			rules: []internalconfig.NonRetryableErrorRule{{
+				StatusCode:      http.StatusBadRequest,
+				MessageContains: "stable client failure",
+			}},
+			message: `{"error":{"message":"Stable client failure: bad image settings","type":"other_error","code":"bad_input"}}`,
+		},
+	}
+	for _, tc := range testCases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			manager, executor := newCredentialRetryLimitTestManagerWithAuthCount(t, 0, 2)
+			manager.SetRetryConfig(2, 0, 0)
+			manager.SetConfig(&internalconfig.Config{NonRetryableErrors: tc.rules})
+			executor.err = &Error{HTTPStatus: http.StatusBadRequest, Message: tc.message}
+
+			_, errExecute := manager.Execute(context.Background(), []string{"claude"}, request, cliproxyexecutor.Options{})
+			if errExecute == nil {
+				t.Fatalf("Execute() error = nil, want configured non-retryable error")
+			}
+			if calls := executor.Calls(); calls != 1 {
+				t.Fatalf("execute calls = %d, want 1 without credential or request retry", calls)
+			}
+		})
+	}
+}
+
+func TestManager_EmptyNonRetryableErrorRulesDisablesDefaultImageRules(t *testing.T) {
+	request := cliproxyexecutor.Request{Model: "test-model"}
+	manager, executor := newCredentialRetryLimitTestManagerWithAuthCount(t, 0, 2)
+	manager.SetRetryConfig(0, 0, 0)
+	manager.SetConfig(&internalconfig.Config{NonRetryableErrors: []internalconfig.NonRetryableErrorRule{}})
+	executor.err = &Error{
+		HTTPStatus: http.StatusBadRequest,
+		Message:    `{"error":{"message":"Invalid size","type":"image_generation_user_error","code":"invalid_value"}}`,
+	}
+
+	_, errExecute := manager.Execute(context.Background(), []string{"claude"}, request, cliproxyexecutor.Options{})
+	if errExecute == nil {
+		t.Fatalf("Execute() error = nil, want image generation user error")
+	}
+	if calls := executor.Calls(); calls != 2 {
+		t.Fatalf("execute calls = %d, want 2 when default image rules are disabled", calls)
 	}
 }
 

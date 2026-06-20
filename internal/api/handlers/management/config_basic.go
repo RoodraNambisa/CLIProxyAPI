@@ -288,6 +288,54 @@ func (h *Handler) PutRequestRetry(c *gin.Context) {
 	h.updateIntFieldNormalized(c, clampNonNegativeInt, func(v int) { h.cfg.RequestRetry = v })
 }
 
+func (h *Handler) GetNonRetryableErrors(c *gin.Context) {
+	if h == nil || h.cfg == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "configuration unavailable"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"non-retryable-errors": config.NormalizeNonRetryableErrorRules(h.cfg.NonRetryableErrors)})
+}
+
+func (h *Handler) PutNonRetryableErrors(c *gin.Context) {
+	if h == nil || h.cfg == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "configuration unavailable"})
+		return
+	}
+	var body struct {
+		Value *[]config.NonRetryableErrorRule `json:"value"`
+	}
+	if errBindJSON := c.ShouldBindJSON(&body); errBindJSON != nil || body.Value == nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
+		return
+	}
+	h.cfg.NonRetryableErrors = config.NormalizeNonRetryableErrorRules(*body.Value)
+	h.persist(c)
+}
+
+func (h *Handler) GetAuthModelExclusions(c *gin.Context) {
+	if h == nil || h.cfg == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "configuration unavailable"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"auth-model-exclusions": config.NormalizeAuthModelExclusionRules(h.cfg.AuthModelExclusions)})
+}
+
+func (h *Handler) PutAuthModelExclusions(c *gin.Context) {
+	if h == nil || h.cfg == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "configuration unavailable"})
+		return
+	}
+	var body struct {
+		Value *[]config.AuthModelExclusionRule `json:"value"`
+	}
+	if errBindJSON := c.ShouldBindJSON(&body); errBindJSON != nil || body.Value == nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
+		return
+	}
+	h.cfg.AuthModelExclusions = config.NormalizeAuthModelExclusionRules(*body.Value)
+	h.persist(c)
+}
+
 // Max retry credentials
 func (h *Handler) GetMaxRetryCredentials(c *gin.Context) {
 	c.JSON(200, gin.H{"max-retry-credentials": h.cfg.MaxRetryCredentials})

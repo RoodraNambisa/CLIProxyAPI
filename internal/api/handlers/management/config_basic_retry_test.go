@@ -37,6 +37,74 @@ func TestPutRequestRetry_ClampsNegativeValues(t *testing.T) {
 	}
 }
 
+func TestPutNonRetryableErrors_NormalizesValues(t *testing.T) {
+	t.Parallel()
+
+	h := &Handler{
+		cfg:            &config.Config{},
+		configFilePath: writeTestConfigFile(t),
+	}
+
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPut, "/v0/management/non-retryable-errors", bytes.NewBufferString(`{"value":[{"status-code":400,"type":" Image_Generation_User_Error ","code":" INVALID_VALUE "},{"message-contains":" Safety System "},{"status-code":99,"type":"bad"}]}`))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	h.PutNonRetryableErrors(c)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	if len(h.cfg.NonRetryableErrors) != 2 {
+		t.Fatalf("non-retryable-errors = %+v, want 2 rules", h.cfg.NonRetryableErrors)
+	}
+	first := h.cfg.NonRetryableErrors[0]
+	if first.StatusCode != http.StatusBadRequest || first.Type != "image_generation_user_error" || first.Code != "invalid_value" {
+		t.Fatalf("first rule = %+v, want normalized image rule", first)
+	}
+	second := h.cfg.NonRetryableErrors[1]
+	if second.MessageContains != "safety system" {
+		t.Fatalf("second message-contains = %q, want safety system", second.MessageContains)
+	}
+}
+
+func TestPutAuthModelExclusions_NormalizesValues(t *testing.T) {
+	t.Parallel()
+
+	h := &Handler{
+		cfg:            &config.Config{},
+		configFilePath: writeTestConfigFile(t),
+	}
+
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPatch, "/v0/management/auth-model-exclusions", bytes.NewBufferString(`{"value":[{"models":[" gpt-image-2 ","GPT-IMAGE-2"],"priorities":[-1,-1]},{"models":["gpt-image-1.5"],"keyword-contains":[" Free ","free"],"providers":[" CoDeX "]},{"models":["gpt-5.5"]}]}`))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	h.PutAuthModelExclusions(c)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	if len(h.cfg.AuthModelExclusions) != 2 {
+		t.Fatalf("auth-model-exclusions = %+v, want 2 rules", h.cfg.AuthModelExclusions)
+	}
+	first := h.cfg.AuthModelExclusions[0]
+	if len(first.Models) != 1 || first.Models[0] != "gpt-image-2" {
+		t.Fatalf("first models = %#v, want gpt-image-2", first.Models)
+	}
+	if len(first.Priorities) != 1 || first.Priorities[0] != -1 {
+		t.Fatalf("first priorities = %#v, want [-1]", first.Priorities)
+	}
+	second := h.cfg.AuthModelExclusions[1]
+	if len(second.Providers) != 1 || second.Providers[0] != "codex" {
+		t.Fatalf("second providers = %#v, want [codex]", second.Providers)
+	}
+	if len(second.KeywordContains) != 1 || second.KeywordContains[0] != "free" {
+		t.Fatalf("second keywords = %#v, want [free]", second.KeywordContains)
+	}
+}
+
 func TestPutMaxRetryInterval_ClampsNegativeValues(t *testing.T) {
 	t.Parallel()
 
