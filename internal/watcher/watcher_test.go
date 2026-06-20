@@ -1443,6 +1443,64 @@ func TestReloadConfigTriggersCallbackForMaxRetryCredentialsChange(t *testing.T) 
 	}
 }
 
+func TestReloadConfigForcesAuthRefreshForAuthModelExclusionsChange(t *testing.T) {
+	tmpDir := t.TempDir()
+	authDir := filepath.Join(tmpDir, "auth")
+	if err := os.MkdirAll(authDir, 0o755); err != nil {
+		t.Fatalf("failed to create auth dir: %v", err)
+	}
+	configPath := filepath.Join(tmpDir, "config.yaml")
+
+	oldCfg := &config.Config{AuthDir: authDir}
+	newCfg := &config.Config{
+		AuthDir: authDir,
+		AuthModelExclusions: []config.AuthModelExclusionRule{
+			{Models: []string{"gpt-image-2"}, Priorities: []int{-1}},
+		},
+	}
+	data, errMarshal := yaml.Marshal(newCfg)
+	if errMarshal != nil {
+		t.Fatalf("failed to marshal config: %v", errMarshal)
+	}
+	if errWrite := os.WriteFile(configPath, data, 0o644); errWrite != nil {
+		t.Fatalf("failed to write config: %v", errWrite)
+	}
+
+	origSnapshot := snapshotCoreAuthsFunc
+	snapshotCoreAuthsFunc = func(*config.Config, string) []*coreauth.Auth {
+		return []*coreauth.Auth{{ID: "auth-1", Provider: "codex"}}
+	}
+	defer func() { snapshotCoreAuthsFunc = origSnapshot }()
+
+	w := &Watcher{
+		configPath:     configPath,
+		authDir:        authDir,
+		authQueue:      make(chan AuthUpdate, 4),
+		lastAuthHashes: make(map[string]string),
+	}
+	w.SetConfig(oldCfg)
+	w.clientsMutex.Lock()
+	w.currentAuths = map[string]*coreauth.Auth{
+		"auth-1": {ID: "auth-1", Provider: "codex"},
+	}
+	w.clientsMutex.Unlock()
+
+	if ok := w.reloadConfig(); !ok {
+		t.Fatal("expected reloadConfig to succeed")
+	}
+
+	w.dispatchMu.Lock()
+	defer w.dispatchMu.Unlock()
+	if len(w.pendingUpdates) != 1 {
+		t.Fatalf("pending updates = %+v, want one forced modify", w.pendingUpdates)
+	}
+	for _, update := range w.pendingUpdates {
+		if update.Action != AuthUpdateActionModify || update.ID != "auth-1" {
+			t.Fatalf("update = %+v, want forced modify for auth-1", update)
+		}
+	}
+}
+
 func TestStartFailsWhenAuthDirMissing(t *testing.T) {
 	tmpDir := t.TempDir()
 	configPath := filepath.Join(tmpDir, "config.yaml")
