@@ -140,6 +140,16 @@ func (e *GeminiCLIExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth
 	basePayload = fixGeminiCLIImageAspectRatio(baseModel, basePayload)
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
 	basePayload = helps.ApplyPayloadConfigWithRoot(e.cfg, baseModel, "gemini", "request", basePayload, originalTranslated, requestedModel)
+	originalRef, basePayloadRef, unregisterBaseBodies := helps.RequestBodyRefs(ctx, opts, opts.OriginalRequest, basePayload)
+	defer unregisterBaseBodies()
+	defer originalRef.Release()
+	defer basePayloadRef.Release()
+	originalPayload = nil
+	originalPayloadSource = nil
+	originalTranslated = nil
+	basePayload = nil
+	req.Payload = nil
+	opts.OriginalRequest = nil
 
 	action := "generateContent"
 	if req.Metadata != nil {
@@ -166,7 +176,14 @@ func (e *GeminiCLIExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth
 	var lastBody []byte
 
 	for idx, attemptModel := range models {
-		payload := append([]byte(nil), basePayload...)
+		if !helps.RequestBodyReplayable(ctx, opts) {
+			if lastStatus > 0 || len(lastBody) > 0 {
+				break
+			}
+			err = fmt.Errorf("request body released; retry disabled")
+			return resp, err
+		}
+		payload := append([]byte(nil), basePayloadRef.Bytes()...)
 		if action == "countTokens" {
 			payload = deleteJSONField(payload, "project")
 			payload = deleteJSONField(payload, "model")
@@ -187,11 +204,14 @@ func (e *GeminiCLIExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth
 			url = url + fmt.Sprintf("?$alt=%s", opts.Alt)
 		}
 
-		reqHTTP, errReq := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(payload))
+		bodyReader := cliproxyexecutor.NewReleasableReadCloser(payload, nil)
+		reqHTTP, errReq := http.NewRequestWithContext(ctx, http.MethodPost, url, bodyReader)
 		if errReq != nil {
 			err = errReq
 			return resp, err
 		}
+		reqHTTP.ContentLength = int64(bodyReader.Len())
+		_, payloadRef, unregisterAttemptBodies := helps.RequestBodyRefs(ctx, opts, nil, payload)
 		reqHTTP.Header.Set("Content-Type", "application/json")
 		reqHTTP.Header.Set("Authorization", "Bearer "+tok.AccessToken)
 		applyGeminiCLIHeaders(reqHTTP, attemptModel)
@@ -201,7 +221,7 @@ func (e *GeminiCLIExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth
 			URL:       url,
 			Method:    http.MethodPost,
 			Headers:   reqHTTP.Header.Clone(),
-			Body:      payload,
+			Body:      payloadRef.Bytes(),
 			Provider:  e.Identifier(),
 			AuthID:    authID,
 			AuthLabel: authLabel,
@@ -211,6 +231,8 @@ func (e *GeminiCLIExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth
 
 		httpResp, errDo := httpClient.Do(reqHTTP)
 		if errDo != nil {
+			unregisterAttemptBodies()
+			payloadRef.Release()
 			helps.RecordAPIResponseError(ctx, e.cfg, errDo)
 			err = errDo
 			return resp, err
@@ -222,6 +244,8 @@ func (e *GeminiCLIExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth
 		}
 		helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
 		if errRead != nil {
+			unregisterAttemptBodies()
+			payloadRef.Release()
 			helps.RecordAPIResponseError(ctx, e.cfg, errRead)
 			err = errRead
 			return resp, err
@@ -230,7 +254,9 @@ func (e *GeminiCLIExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth
 		if httpResp.StatusCode >= 200 && httpResp.StatusCode < 300 {
 			reporter.Publish(ctx, helps.ParseGeminiCLIUsage(data))
 			var param any
-			out := sdktranslator.TranslateNonStream(respCtx, to, from, attemptModel, opts.OriginalRequest, payload, data, &param)
+			out := sdktranslator.TranslateNonStream(respCtx, to, from, attemptModel, originalRef.Bytes(), payloadRef.Bytes(), data, &param)
+			unregisterAttemptBodies()
+			payloadRef.Release()
 			resp = cliproxyexecutor.Response{Payload: out, Headers: httpResp.Header.Clone()}
 			return resp, nil
 		}
@@ -239,6 +265,11 @@ func (e *GeminiCLIExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth
 		lastBody = append([]byte(nil), data...)
 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), data))
 		if httpResp.StatusCode == 429 {
+			unregisterAttemptBodies()
+			payloadRef.Release()
+			if !helps.RequestBodyReplayable(ctx, opts) {
+				break
+			}
 			if idx+1 < len(models) {
 				log.Debugf("gemini cli executor: rate limited, retrying with next model: %s", models[idx+1])
 			} else {
@@ -248,6 +279,8 @@ func (e *GeminiCLIExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth
 		}
 
 		err = newGeminiStatusErr(httpResp.StatusCode, data)
+		unregisterAttemptBodies()
+		payloadRef.Release()
 		return resp, err
 	}
 
@@ -295,6 +328,18 @@ func (e *GeminiCLIExecutor) ExecuteStream(ctx context.Context, auth *cliproxyaut
 	basePayload = fixGeminiCLIImageAspectRatio(baseModel, basePayload)
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
 	basePayload = helps.ApplyPayloadConfigWithRoot(e.cfg, baseModel, "gemini", "request", basePayload, originalTranslated, requestedModel)
+	originalRef, basePayloadRef, unregisterBaseBodies := helps.RequestBodyRefs(ctx, opts, opts.OriginalRequest, basePayload)
+	cleanupBaseBodies := func() {
+		unregisterBaseBodies()
+		originalRef.Release()
+		basePayloadRef.Release()
+	}
+	originalPayload = nil
+	originalPayloadSource = nil
+	originalTranslated = nil
+	basePayload = nil
+	req.Payload = nil
+	opts.OriginalRequest = nil
 
 	projectID := resolveGeminiProjectID(auth)
 
@@ -315,12 +360,21 @@ func (e *GeminiCLIExecutor) ExecuteStream(ctx context.Context, auth *cliproxyaut
 	var lastBody []byte
 
 	for idx, attemptModel := range models {
-		payload := append([]byte(nil), basePayload...)
+		if !helps.RequestBodyReplayable(ctx, opts) {
+			if lastStatus > 0 || len(lastBody) > 0 {
+				break
+			}
+			cleanupBaseBodies()
+			err = fmt.Errorf("request body released; retry disabled")
+			return nil, err
+		}
+		payload := append([]byte(nil), basePayloadRef.Bytes()...)
 		payload = setJSONField(payload, "project", projectID)
 		payload = setJSONField(payload, "model", attemptModel)
 
 		tok, errTok := tokenSource.Token()
 		if errTok != nil {
+			cleanupBaseBodies()
 			err = errTok
 			return nil, err
 		}
@@ -333,11 +387,15 @@ func (e *GeminiCLIExecutor) ExecuteStream(ctx context.Context, auth *cliproxyaut
 			url = url + fmt.Sprintf("?$alt=%s", opts.Alt)
 		}
 
-		reqHTTP, errReq := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(payload))
+		bodyReader := cliproxyexecutor.NewReleasableReadCloser(payload, nil)
+		reqHTTP, errReq := http.NewRequestWithContext(ctx, http.MethodPost, url, bodyReader)
 		if errReq != nil {
+			cleanupBaseBodies()
 			err = errReq
 			return nil, err
 		}
+		reqHTTP.ContentLength = int64(bodyReader.Len())
+		_, payloadRef, unregisterAttemptBodies := helps.RequestBodyRefs(ctx, opts, nil, payload)
 		reqHTTP.Header.Set("Content-Type", "application/json")
 		reqHTTP.Header.Set("Authorization", "Bearer "+tok.AccessToken)
 		applyGeminiCLIHeaders(reqHTTP, attemptModel)
@@ -347,7 +405,7 @@ func (e *GeminiCLIExecutor) ExecuteStream(ctx context.Context, auth *cliproxyaut
 			URL:       url,
 			Method:    http.MethodPost,
 			Headers:   reqHTTP.Header.Clone(),
-			Body:      payload,
+			Body:      payloadRef.Bytes(),
 			Provider:  e.Identifier(),
 			AuthID:    authID,
 			AuthLabel: authLabel,
@@ -357,6 +415,9 @@ func (e *GeminiCLIExecutor) ExecuteStream(ctx context.Context, auth *cliproxyaut
 
 		httpResp, errDo := httpClient.Do(reqHTTP)
 		if errDo != nil {
+			unregisterAttemptBodies()
+			payloadRef.Release()
+			cleanupBaseBodies()
 			helps.RecordAPIResponseError(ctx, e.cfg, errDo)
 			err = errDo
 			return nil, err
@@ -368,6 +429,9 @@ func (e *GeminiCLIExecutor) ExecuteStream(ctx context.Context, auth *cliproxyaut
 				log.Errorf("gemini cli executor: close response body error: %v", errClose)
 			}
 			if errRead != nil {
+				unregisterAttemptBodies()
+				payloadRef.Release()
+				cleanupBaseBodies()
 				helps.RecordAPIResponseError(ctx, e.cfg, errRead)
 				err = errRead
 				return nil, err
@@ -377,6 +441,11 @@ func (e *GeminiCLIExecutor) ExecuteStream(ctx context.Context, auth *cliproxyaut
 			lastBody = append([]byte(nil), data...)
 			helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), data))
 			if httpResp.StatusCode == 429 {
+				unregisterAttemptBodies()
+				payloadRef.Release()
+				if !helps.RequestBodyReplayable(ctx, opts) {
+					break
+				}
 				if idx+1 < len(models) {
 					log.Debugf("gemini cli executor: rate limited, retrying with next model: %s", models[idx+1])
 				} else {
@@ -385,12 +454,18 @@ func (e *GeminiCLIExecutor) ExecuteStream(ctx context.Context, auth *cliproxyaut
 				continue
 			}
 			err = newGeminiStatusErr(httpResp.StatusCode, data)
+			unregisterAttemptBodies()
+			payloadRef.Release()
+			cleanupBaseBodies()
 			return nil, err
 		}
 
 		out := make(chan cliproxyexecutor.StreamChunk)
-		go func(resp *http.Response, reqBody []byte, attemptModel string) {
+		go func(resp *http.Response, attemptModel string) {
 			defer close(out)
+			defer cleanupBaseBodies()
+			defer unregisterAttemptBodies()
+			defer payloadRef.Release()
 			defer func() {
 				if errClose := resp.Body.Close(); errClose != nil {
 					log.Errorf("gemini cli executor: close response body error: %v", errClose)
@@ -407,14 +482,14 @@ func (e *GeminiCLIExecutor) ExecuteStream(ctx context.Context, auth *cliproxyaut
 						reporter.Publish(ctx, detail)
 					}
 					if bytes.HasPrefix(line, dataTag) {
-						segments := sdktranslator.TranslateStream(respCtx, to, from, attemptModel, opts.OriginalRequest, reqBody, bytes.Clone(line), &param)
+						segments := sdktranslator.TranslateStream(respCtx, to, from, attemptModel, originalRef.Bytes(), payloadRef.Bytes(), bytes.Clone(line), &param)
 						for i := range segments {
 							out <- cliproxyexecutor.StreamChunk{Payload: segments[i]}
 						}
 					}
 				}
 
-				segments := sdktranslator.TranslateStream(respCtx, to, from, attemptModel, opts.OriginalRequest, reqBody, []byte("[DONE]"), &param)
+				segments := sdktranslator.TranslateStream(respCtx, to, from, attemptModel, originalRef.Bytes(), payloadRef.Bytes(), []byte("[DONE]"), &param)
 				for i := range segments {
 					out <- cliproxyexecutor.StreamChunk{Payload: segments[i]}
 				}
@@ -436,20 +511,21 @@ func (e *GeminiCLIExecutor) ExecuteStream(ctx context.Context, auth *cliproxyaut
 			helps.AppendAPIResponseChunk(ctx, e.cfg, data)
 			reporter.Publish(ctx, helps.ParseGeminiCLIUsage(data))
 			var param any
-			segments := sdktranslator.TranslateStream(respCtx, to, from, attemptModel, opts.OriginalRequest, reqBody, data, &param)
+			segments := sdktranslator.TranslateStream(respCtx, to, from, attemptModel, originalRef.Bytes(), payloadRef.Bytes(), data, &param)
 			for i := range segments {
 				out <- cliproxyexecutor.StreamChunk{Payload: segments[i]}
 			}
 
-			segments = sdktranslator.TranslateStream(respCtx, to, from, attemptModel, opts.OriginalRequest, reqBody, []byte("[DONE]"), &param)
+			segments = sdktranslator.TranslateStream(respCtx, to, from, attemptModel, originalRef.Bytes(), payloadRef.Bytes(), []byte("[DONE]"), &param)
 			for i := range segments {
 				out <- cliproxyexecutor.StreamChunk{Payload: segments[i]}
 			}
-		}(httpResp, append([]byte(nil), payload...), attemptModel)
+		}(httpResp, attemptModel)
 
 		return &cliproxyexecutor.StreamResult{Headers: httpResp.Header.Clone(), Chunks: out}, nil
 	}
 
+	cleanupBaseBodies()
 	if len(lastBody) > 0 {
 		helps.AppendAPIResponseChunk(ctx, e.cfg, lastBody)
 	}
@@ -489,11 +565,22 @@ func (e *GeminiCLIExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.
 
 	var lastStatus int
 	var lastBody []byte
+	requestRef := cliproxyexecutor.NewReleasableBytes(req.Payload)
+	unregisterRequest := cliproxyexecutor.RegisterRequestBodyReleaseCallback(ctx, opts, func([]byte) {
+		requestRef.Release()
+	})
+	defer unregisterRequest()
+	defer requestRef.Release()
+	req.Payload = nil
+	opts.OriginalRequest = nil
 
 	// The loop variable attemptModel is only used as the concrete model id sent to the upstream
 	// Gemini CLI endpoint when iterating fallback variants.
 	for range models {
-		payload := sdktranslator.TranslateRequest(from, to, baseModel, req.Payload, false)
+		if !helps.RequestBodyReplayable(ctx, opts) {
+			break
+		}
+		payload := sdktranslator.TranslateRequest(from, to, baseModel, requestRef.Bytes(), false)
 
 		payload, err = thinking.ApplyThinking(payload, req.Model, from.String(), to.String(), e.Identifier())
 		if err != nil {
@@ -516,10 +603,13 @@ func (e *GeminiCLIExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.
 			url = url + fmt.Sprintf("?$alt=%s", opts.Alt)
 		}
 
-		reqHTTP, errReq := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(payload))
+		bodyReader := cliproxyexecutor.NewReleasableReadCloser(payload, nil)
+		reqHTTP, errReq := http.NewRequestWithContext(ctx, http.MethodPost, url, bodyReader)
 		if errReq != nil {
 			return cliproxyexecutor.Response{}, errReq
 		}
+		reqHTTP.ContentLength = int64(bodyReader.Len())
+		_, payloadRef, unregisterAttemptBodies := helps.RequestBodyRefs(ctx, opts, nil, payload)
 		reqHTTP.Header.Set("Content-Type", "application/json")
 		reqHTTP.Header.Set("Authorization", "Bearer "+tok.AccessToken)
 		applyGeminiCLIHeaders(reqHTTP, baseModel)
@@ -529,7 +619,7 @@ func (e *GeminiCLIExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.
 			URL:       url,
 			Method:    http.MethodPost,
 			Headers:   reqHTTP.Header.Clone(),
-			Body:      payload,
+			Body:      payloadRef.Bytes(),
 			Provider:  e.Identifier(),
 			AuthID:    authID,
 			AuthLabel: authLabel,
@@ -539,6 +629,8 @@ func (e *GeminiCLIExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.
 
 		resp, errDo := httpClient.Do(reqHTTP)
 		if errDo != nil {
+			unregisterAttemptBodies()
+			payloadRef.Release()
 			helps.RecordAPIResponseError(ctx, e.cfg, errDo)
 			return cliproxyexecutor.Response{}, errDo
 		}
@@ -548,6 +640,8 @@ func (e *GeminiCLIExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.
 		}
 		helps.RecordAPIResponseMetadata(ctx, e.cfg, resp.StatusCode, resp.Header.Clone())
 		if errRead != nil {
+			unregisterAttemptBodies()
+			payloadRef.Release()
 			helps.RecordAPIResponseError(ctx, e.cfg, errRead)
 			return cliproxyexecutor.Response{}, errRead
 		}
@@ -555,14 +649,23 @@ func (e *GeminiCLIExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.
 		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 			count := gjson.GetBytes(data, "totalTokens").Int()
 			translated := sdktranslator.TranslateTokenCount(respCtx, to, from, count, data)
+			unregisterAttemptBodies()
+			payloadRef.Release()
 			return cliproxyexecutor.Response{Payload: translated, Headers: resp.Header.Clone()}, nil
 		}
 		lastStatus = resp.StatusCode
 		lastBody = append([]byte(nil), data...)
 		if resp.StatusCode == 429 {
+			unregisterAttemptBodies()
+			payloadRef.Release()
+			if !helps.RequestBodyReplayable(ctx, opts) {
+				break
+			}
 			log.Debugf("gemini cli executor: rate limited, retrying with next model")
 			continue
 		}
+		unregisterAttemptBodies()
+		payloadRef.Release()
 		break
 	}
 

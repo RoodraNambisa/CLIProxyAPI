@@ -248,6 +248,149 @@ func translateCodexRequestBodies(from, to sdktranslator.Format, baseModel string
 	return originalPayload, originalTranslated, body
 }
 
+func dropCodexRawRequestCopies(req *cliproxyexecutor.Request, opts *cliproxyexecutor.Options) {
+	if req != nil {
+		req.Payload = nil
+	}
+	if opts != nil {
+		opts.OriginalRequest = nil
+	}
+}
+
+func codexStreamBodyRefs(ctx context.Context, opts cliproxyexecutor.Options, originalPayload, body, releasedOriginalPayload, releasedBody []byte) (*cliproxyexecutor.ReleasableBytes, *cliproxyexecutor.ReleasableBytes, func()) {
+	originalRef := cliproxyexecutor.NewReleasableBytes(originalPayload)
+	bodyRef := cliproxyexecutor.NewReleasableBytes(body)
+	ctrl := cliproxyexecutor.RequestBodyReleaseControllerFromOptions(opts)
+	if ctrl == nil {
+		ctrl = cliproxyexecutor.RequestBodyReleaseControllerFromContext(ctx)
+	}
+	if ctrl == nil || ctrl.LogOnly() {
+		return originalRef, bodyRef, func() {}
+	}
+	unregister := ctrl.RegisterReleaseCallback(func([]byte) {
+		originalRef.Replace(releasedOriginalPayload)
+		bodyRef.Replace(releasedBody)
+	})
+	return originalRef, bodyRef, unregister
+}
+
+func slimCodexOriginalPayloadForTranslation(from sdktranslator.Format, original []byte) []byte {
+	if len(original) == 0 {
+		return nil
+	}
+	tools := gjson.GetBytes(original, "tools")
+	if !tools.IsArray() {
+		return nil
+	}
+	switch from {
+	case sdktranslator.FormatOpenAI, sdktranslator.FormatOpenAIResponse:
+		return slimCodexOpenAITools(tools.Array())
+	case sdktranslator.FormatClaude:
+		return slimCodexClaudeTools(tools.Array())
+	case sdktranslator.FormatGemini, sdktranslator.FormatGeminiCLI:
+		return slimCodexGeminiTools(tools.Array())
+	default:
+		return nil
+	}
+}
+
+func slimCodexOpenAITools(tools []gjson.Result) []byte {
+	out := []byte(`{"tools":[]}`)
+	index := 0
+	for _, tool := range tools {
+		name := strings.TrimSpace(tool.Get("function.name").String())
+		if name == "" {
+			continue
+		}
+		entry := []byte(`{"type":"function","function":{}}`)
+		entry, _ = sjson.SetBytes(entry, "function.name", name)
+		out, _ = sjson.SetRawBytes(out, fmt.Sprintf("tools.%d", index), entry)
+		index++
+	}
+	if index == 0 {
+		return nil
+	}
+	return out
+}
+
+func slimCodexClaudeTools(tools []gjson.Result) []byte {
+	out := []byte(`{"tools":[]}`)
+	index := 0
+	for _, tool := range tools {
+		name := strings.TrimSpace(tool.Get("name").String())
+		if name == "" {
+			continue
+		}
+		entry := []byte(`{}`)
+		entry, _ = sjson.SetBytes(entry, "name", name)
+		out, _ = sjson.SetRawBytes(out, fmt.Sprintf("tools.%d", index), entry)
+		index++
+	}
+	if index == 0 {
+		return nil
+	}
+	return out
+}
+
+func slimCodexGeminiTools(tools []gjson.Result) []byte {
+	out := []byte(`{"tools":[]}`)
+	toolIndex := 0
+	for _, tool := range tools {
+		declarations := tool.Get("functionDeclarations")
+		if !declarations.IsArray() {
+			continue
+		}
+		entry := []byte(`{"functionDeclarations":[]}`)
+		declarationIndex := 0
+		for _, declaration := range declarations.Array() {
+			name := strings.TrimSpace(declaration.Get("name").String())
+			if name == "" {
+				continue
+			}
+			item := []byte(`{}`)
+			item, _ = sjson.SetBytes(item, "name", name)
+			entry, _ = sjson.SetRawBytes(entry, fmt.Sprintf("functionDeclarations.%d", declarationIndex), item)
+			declarationIndex++
+		}
+		if declarationIndex == 0 {
+			continue
+		}
+		out, _ = sjson.SetRawBytes(out, fmt.Sprintf("tools.%d", toolIndex), entry)
+		toolIndex++
+	}
+	if toolIndex == 0 {
+		return nil
+	}
+	return out
+}
+
+func slimCodexBodyForStreamUsage(body []byte) []byte {
+	if len(body) == 0 {
+		return nil
+	}
+	tools := gjson.GetBytes(body, "tools")
+	if !tools.IsArray() {
+		return nil
+	}
+	out := []byte(`{"tools":[]}`)
+	index := 0
+	for _, tool := range tools.Array() {
+		if tool.Get("type").String() != "image_generation" {
+			continue
+		}
+		entry := []byte(`{"type":"image_generation"}`)
+		if model := strings.TrimSpace(tool.Get("model").String()); model != "" {
+			entry, _ = sjson.SetBytes(entry, "model", model)
+		}
+		out, _ = sjson.SetRawBytes(out, fmt.Sprintf("tools.%d", index), entry)
+		index++
+	}
+	if index == 0 {
+		return nil
+	}
+	return out
+}
+
 // PrepareRequest injects Codex credentials into the outgoing HTTP request.
 func (e *CodexExecutor) PrepareRequest(req *http.Request, auth *cliproxyauth.Auth) error {
 	if req == nil {
@@ -311,6 +454,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
 	body = helps.ApplyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", body, originalTranslated, requestedModel)
+	originalTranslated = nil
 	body, _ = sjson.SetBytes(body, "model", baseModel)
 	body, _ = sjson.SetBytes(body, "stream", true)
 	body, _ = sjson.DeleteBytes(body, "previous_response_id")
@@ -325,6 +469,15 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	if err != nil {
 		return resp, err
 	}
+	releasedOriginalPayload := slimCodexOriginalPayloadForTranslation(from, originalPayload)
+	releasedBody := slimCodexBodyForStreamUsage(body)
+	originalRef, bodyRef, unregisterBodies := codexStreamBodyRefs(ctx, opts, originalPayload, body, releasedOriginalPayload, releasedBody)
+	defer unregisterBodies()
+	defer originalRef.Release()
+	defer bodyRef.Release()
+	originalPayload = nil
+	body = nil
+	dropCodexRawRequestCopies(&req, &opts)
 	applyCodexHeaders(httpReq, auth, apiKey, true, e.cfg)
 	applyCodexIdentityConfuseHeaders(httpReq.Header, &identityState)
 	var authID, authLabel, authType, authValue string
@@ -344,6 +497,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 		AuthType:  authType,
 		AuthValue: authValue,
 	})
+	upstreamBody = nil
 	httpClient := e.newCodexHTTPClient(ctx, auth, imageRequest)
 	httpResp, err := httpClient.Do(httpReq)
 	if err != nil {
@@ -411,7 +565,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 		if detail, ok := helps.ParseCodexUsage(eventData); ok {
 			reporter.Publish(ctx, detail)
 		}
-		publishCodexImageToolUsage(ctx, reporter, body, eventData)
+		publishCodexImageToolUsage(ctx, reporter, bodyRef.Bytes(), eventData)
 
 		completedData := eventData
 		outputResult := gjson.GetBytes(completedData, "response.output")
@@ -438,7 +592,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 
 		var param any
 		clientCompletedData := applyCodexIdentityExposeResponsePayload(completedData, identityState)
-		out := sdktranslator.TranslateNonStream(ctx, to, from, req.Model, originalPayload, body, clientCompletedData, &param)
+		out := sdktranslator.TranslateNonStream(ctx, to, from, req.Model, originalRef.Bytes(), bodyRef.Bytes(), clientCompletedData, &param)
 		resp = cliproxyexecutor.Response{Payload: out, Headers: httpResp.Header.Clone()}
 		return resp, nil
 	}
@@ -469,6 +623,7 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
 	body = helps.ApplyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", body, originalTranslated, requestedModel)
+	originalTranslated = nil
 	body, _ = sjson.SetBytes(body, "model", baseModel)
 	body, _ = sjson.DeleteBytes(body, "stream")
 	body = normalizeCodexInstructions(body)
@@ -479,6 +634,15 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 	if err != nil {
 		return resp, err
 	}
+	releasedOriginalPayload := slimCodexOriginalPayloadForTranslation(from, originalPayload)
+	releasedBody := slimCodexBodyForStreamUsage(body)
+	originalRef, bodyRef, unregisterBodies := codexStreamBodyRefs(ctx, opts, originalPayload, body, releasedOriginalPayload, releasedBody)
+	defer unregisterBodies()
+	defer originalRef.Release()
+	defer bodyRef.Release()
+	originalPayload = nil
+	body = nil
+	dropCodexRawRequestCopies(&req, &opts)
 	applyCodexHeaders(httpReq, auth, apiKey, false, e.cfg)
 	applyCodexIdentityConfuseHeaders(httpReq.Header, &identityState)
 	var authID, authLabel, authType, authValue string
@@ -498,6 +662,7 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 		AuthType:  authType,
 		AuthValue: authValue,
 	})
+	upstreamBody = nil
 	httpClient := e.newCodexHTTPClient(ctx, auth, imageRequest)
 	httpResp, err := httpClient.Do(httpReq)
 	if err != nil {
@@ -530,7 +695,7 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 	reporter.EnsurePublished(ctx)
 	var param any
 	clientData := applyCodexIdentityExposeResponsePayload(upstreamData, identityState)
-	out := sdktranslator.TranslateNonStream(ctx, to, from, req.Model, originalPayload, body, clientData, &param)
+	out := sdktranslator.TranslateNonStream(ctx, to, from, req.Model, originalRef.Bytes(), bodyRef.Bytes(), clientData, &param)
 	resp = cliproxyexecutor.Response{Payload: out, Headers: httpResp.Header.Clone()}
 	return resp, nil
 }
@@ -564,6 +729,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
 	body = helps.ApplyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", body, originalTranslated, requestedModel)
+	originalTranslated = nil
 	body, _ = sjson.DeleteBytes(body, "previous_response_id")
 	body, _ = sjson.DeleteBytes(body, "prompt_cache_retention")
 	body, _ = sjson.DeleteBytes(body, "safety_identifier")
@@ -579,6 +745,17 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	if err != nil {
 		return nil, err
 	}
+	releasedOriginalPayload := slimCodexOriginalPayloadForTranslation(from, originalPayload)
+	releasedBody := slimCodexBodyForStreamUsage(body)
+	streamOriginalPayload, streamBody, unregisterStreamBodies := codexStreamBodyRefs(ctx, opts, originalPayload, body, releasedOriginalPayload, releasedBody)
+	cleanupBodies := func() {
+		unregisterStreamBodies()
+		streamOriginalPayload.Release()
+		streamBody.Release()
+	}
+	originalPayload = nil
+	body = nil
+	dropCodexRawRequestCopies(&req, &opts)
 	applyCodexHeaders(httpReq, auth, apiKey, true, e.cfg)
 	applyCodexIdentityConfuseHeaders(httpReq.Header, &identityState)
 	var authID, authLabel, authType, authValue string
@@ -598,15 +775,18 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 		AuthType:  authType,
 		AuthValue: authValue,
 	})
+	upstreamBody = nil
 
 	httpClient := e.newCodexHTTPClient(ctx, auth, imageRequest)
 	httpResp, err := httpClient.Do(httpReq)
 	if err != nil {
+		cleanupBodies()
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
 		return nil, err
 	}
 	helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
+		defer cleanupBodies()
 		data, readErr := io.ReadAll(httpResp.Body)
 		if errClose := httpResp.Body.Close(); errClose != nil {
 			log.Errorf("codex executor: close response body error: %v", errClose)
@@ -625,6 +805,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	out := make(chan cliproxyexecutor.StreamChunk, cliproxyexecutor.StreamBufferSize)
 	go func() {
 		defer close(out)
+		defer cleanupBodies()
 		defer func() {
 			if errClose := httpResp.Body.Close(); errClose != nil {
 				log.Errorf("codex executor: close response body error: %v", errClose)
@@ -662,7 +843,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 			helps.AppendAPIResponseChunk(ctx, e.cfg, line)
 			clientLine := applyCodexIdentityExposeResponsePayload(line, identityState)
 			if trustUpstreamSSE {
-				publishCodexStreamUsage(ctx, reporter, body, line)
+				publishCodexStreamUsage(ctx, reporter, streamBody.Bytes(), line)
 				if len(bytes.TrimSpace(line)) == 0 {
 					if !flushTrustedFrame() {
 						return
@@ -690,14 +871,14 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 					if detail, ok := helps.ParseCodexUsage(data); ok {
 						reporter.Publish(ctx, detail)
 					}
-					publishCodexImageToolUsage(ctx, reporter, body, data)
+					publishCodexImageToolUsage(ctx, reporter, streamBody.Bytes(), data)
 					data = patchCodexCompletedOutput(data, outputItemsByIndex, outputItemsFallback)
 					translatedLine = append([]byte("data: "), data...)
 				}
 			}
 
 			translatedLine = applyCodexIdentityExposeResponsePayload(translatedLine, identityState)
-			chunks := sdktranslator.TranslateStream(ctx, to, from, req.Model, originalPayload, body, translatedLine, &param)
+			chunks := sdktranslator.TranslateStream(ctx, to, from, req.Model, streamOriginalPayload.Bytes(), streamBody.Bytes(), translatedLine, &param)
 			for i := range chunks {
 				if !emit(cliproxyexecutor.StreamChunk{Payload: chunks[i]}) {
 					return
@@ -961,10 +1142,12 @@ func (e *CodexExecutor) cacheHelper(ctx context.Context, from sdktranslator.Form
 	if identityState.promptCacheKey != "" {
 		cache.ID = identityState.promptCacheKey
 	}
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(rawJSON))
+	bodyReader := cliproxyexecutor.NewReleasableReadCloser(rawJSON, nil)
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bodyReader)
 	if err != nil {
 		return nil, nil, codexIdentityConfuseState{}, err
 	}
+	httpReq.ContentLength = int64(bodyReader.Len())
 	if cache.ID != "" {
 		httpReq.Header.Set("Session_id", cache.ID)
 	}

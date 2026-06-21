@@ -61,3 +61,24 @@ func TestNormalizeRequestBodyAuditDefaultsError(t *testing.T) {
 		t.Fatalf("code = %q, want default", cfg.Error.Code)
 	}
 }
+
+func TestNormalizeRequestBodyRelease(t *testing.T) {
+	cfg := NormalizeRequestBodyRelease(RequestBodyReleaseConfig{
+		Enable:       true,
+		LogOnly:      true,
+		AfterSeconds: -30,
+		MinBodyBytes: -1024,
+	})
+	if !cfg.Enable {
+		t.Fatal("enable = false, want true")
+	}
+	if cfg.AfterSeconds != 0 {
+		t.Fatalf("after-seconds = %d, want 0", cfg.AfterSeconds)
+	}
+	if !cfg.LogOnly {
+		t.Fatal("log-only = false, want true")
+	}
+	if cfg.MinBodyBytes != 0 {
+		t.Fatalf("min-body-bytes = %d, want 0", cfg.MinBodyBytes)
+	}
+}

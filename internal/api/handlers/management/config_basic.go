@@ -272,6 +272,30 @@ func (h *Handler) PutRequestBodyAudit(c *gin.Context) {
 	h.persist(c)
 }
 
+func (h *Handler) GetRequestBodyRelease(c *gin.Context) {
+	if h == nil || h.cfg == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "configuration unavailable"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"request-body-release": config.NormalizeRequestBodyRelease(h.cfg.RequestBodyRelease)})
+}
+
+func (h *Handler) PutRequestBodyRelease(c *gin.Context) {
+	if h == nil || h.cfg == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "configuration unavailable"})
+		return
+	}
+	var body struct {
+		Value *config.RequestBodyReleaseConfig `json:"value"`
+	}
+	if errBindJSON := c.ShouldBindJSON(&body); errBindJSON != nil || body.Value == nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
+		return
+	}
+	h.cfg.RequestBodyRelease = config.NormalizeRequestBodyRelease(*body.Value)
+	h.persist(c)
+}
+
 // Websocket auth
 func (h *Handler) GetWebsocketAuth(c *gin.Context) {
 	c.JSON(200, gin.H{"ws-auth": h.cfg.WebsocketAuth})

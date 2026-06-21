@@ -84,6 +84,131 @@ func TestManager_RequestRetryOverrideZeroOverridesGlobalDefault(t *testing.T) {
 	}
 }
 
+func TestManagerExecute_RequestBodyReleaseStopsCredentialAndRequestRetry(t *testing.T) {
+	m := NewManager(nil, nil, nil)
+	m.SetRetryConfig(2, 0, 0)
+	m.SetConfig(&internalconfig.Config{NoCooldownStatusCodes: []int{http.StatusInternalServerError}})
+
+	ctrl := cliproxyexecutor.NewRequestBodyReleaseController(1024, []byte("<released>"))
+	executor := &releaseThenFailExecutor{id: "claude", ctrl: ctrl}
+	m.RegisterExecutor(executor)
+	for _, authID := range []string{"auth-a", "auth-b"} {
+		auth := &Auth{ID: authID, Provider: "claude"}
+		if _, errRegister := m.Register(context.Background(), auth); errRegister != nil {
+			t.Fatalf("register auth %s: %v", authID, errRegister)
+		}
+		registry.GetGlobalRegistry().RegisterClient(authID, "claude", []*registry.ModelInfo{{ID: "test-model"}})
+		t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(authID) })
+	}
+
+	payload := []byte(`{"model":"test-model","messages":[{"role":"user","content":"large"}]}`)
+	opts := cliproxyexecutor.Options{
+		OriginalRequest: payload,
+		Metadata: map[string]any{
+			cliproxyexecutor.BodyReleaseControllerMetadataKey: ctrl,
+		},
+	}
+	_, errExecute := m.Execute(context.Background(), []string{"claude"}, cliproxyexecutor.Request{Model: "test-model", Payload: payload}, opts)
+	if errExecute == nil {
+		t.Fatal("Execute() error = nil, want released request failure")
+	}
+	if ctrl.Replayable() {
+		t.Fatal("controller Replayable() = true, want false after release")
+	}
+	if got := executor.Calls(); len(got) != 1 {
+		t.Fatalf("execute calls = %v, want one call only", got)
+	}
+}
+
+func TestManagerExecute_LogOnlyRequestBodyReleaseDoesNotStopCredentialRetry(t *testing.T) {
+	m := NewManager(nil, nil, nil)
+	m.SetRetryConfig(0, 0, 0)
+	m.SetConfig(&internalconfig.Config{NoCooldownStatusCodes: []int{http.StatusInternalServerError}})
+
+	ctrl := cliproxyexecutor.NewRequestBodyReleaseControllerWithMode(1024, []byte("<released>"), true)
+	executor := &releaseThenFailExecutor{id: "claude", ctrl: ctrl}
+	m.RegisterExecutor(executor)
+	for _, authID := range []string{"auth-a", "auth-b"} {
+		auth := &Auth{ID: authID, Provider: "claude"}
+		if _, errRegister := m.Register(context.Background(), auth); errRegister != nil {
+			t.Fatalf("register auth %s: %v", authID, errRegister)
+		}
+		registry.GetGlobalRegistry().RegisterClient(authID, "claude", []*registry.ModelInfo{{ID: "test-model"}})
+		t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(authID) })
+	}
+
+	payload := []byte(`{"model":"test-model","messages":[{"role":"user","content":"large"}]}`)
+	opts := cliproxyexecutor.Options{
+		OriginalRequest: payload,
+		Metadata: map[string]any{
+			cliproxyexecutor.BodyReleaseControllerMetadataKey: ctrl,
+		},
+	}
+	_, errExecute := m.Execute(context.Background(), []string{"claude"}, cliproxyexecutor.Request{Model: "test-model", Payload: payload}, opts)
+	if errExecute == nil {
+		t.Fatal("Execute() error = nil, want auth failure")
+	}
+	if !ctrl.Replayable() {
+		t.Fatal("controller Replayable() = false, want true after log-only release")
+	}
+	if got := executor.Calls(); len(got) < 2 {
+		t.Fatalf("execute calls = %v, want log-only release to allow another credential", got)
+	}
+}
+
+func TestConsumeRequestRetryBudget_LogOnlyReleaseStillAllowsBudget(t *testing.T) {
+	m := NewManager(nil, nil, nil)
+	ctrl := cliproxyexecutor.NewRequestBodyReleaseControllerWithMode(1024, []byte("<released>"), true)
+	ctx := m.WithRequestRetryBudget(context.Background(), 1)
+	ctx = cliproxyexecutor.WithRequestBodyReleaseController(ctx, ctrl)
+
+	ctrl.Release()
+	if !ConsumeRequestRetryBudget(ctx) {
+		t.Fatal("ConsumeRequestRetryBudget() = false after log-only release, want true")
+	}
+	if ConsumeRequestRetryBudget(ctx) {
+		t.Fatal("second ConsumeRequestRetryBudget() = true, want budget exhausted")
+	}
+}
+
+func TestManagerExecuteStream_RequestBodyReleaseStopsBootstrapRetry(t *testing.T) {
+	m := NewManager(nil, nil, nil)
+	m.SetRetryConfig(1, 0, 0)
+	m.SetConfig(&internalconfig.Config{NoCooldownStatusCodes: []int{http.StatusInternalServerError}})
+
+	ctrl := cliproxyexecutor.NewRequestBodyReleaseController(1024, []byte("<released>"))
+	executor := &releaseThenFailExecutor{id: "claude", ctrl: ctrl, stream: true}
+	m.RegisterExecutor(executor)
+	for _, authID := range []string{"auth-a", "auth-b"} {
+		auth := &Auth{ID: authID, Provider: "claude"}
+		if _, errRegister := m.Register(context.Background(), auth); errRegister != nil {
+			t.Fatalf("register auth %s: %v", authID, errRegister)
+		}
+		registry.GetGlobalRegistry().RegisterClient(authID, "claude", []*registry.ModelInfo{{ID: "test-model"}})
+		t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(authID) })
+	}
+
+	payload := []byte(`{"model":"test-model","stream":true}`)
+	opts := cliproxyexecutor.Options{
+		Stream:          true,
+		OriginalRequest: payload,
+		Metadata: map[string]any{
+			cliproxyexecutor.BodyReleaseControllerMetadataKey: ctrl,
+		},
+	}
+	result, errExecute := m.ExecuteStream(context.Background(), []string{"claude"}, cliproxyexecutor.Request{Model: "test-model", Payload: payload}, opts)
+	if errExecute != nil {
+		t.Fatalf("ExecuteStream() error = %v, want stream result with error chunk", errExecute)
+	}
+	chunk, ok := <-result.Chunks
+	if !ok || chunk.Err == nil {
+		t.Fatalf("first stream chunk = %+v, ok=%t; want error chunk", chunk, ok)
+	}
+	if got := executor.Calls(); len(got) != 1 {
+		t.Fatalf("stream calls = %v, want one call only", got)
+	}
+}
+
 func TestManagerExecute_WaitsForUpstreamRetryAfter429WithinMaxInterval(t *testing.T) {
 	m := NewManager(nil, nil, nil)
 	m.SetRetryConfig(1, 50*time.Millisecond, 0)
@@ -402,6 +527,62 @@ type authFallbackExecutor struct {
 	executeErrors     map[string]error
 	countErrors       map[string]error
 	streamFirstErrors map[string]error
+}
+
+type releaseThenFailExecutor struct {
+	id     string
+	ctrl   *cliproxyexecutor.RequestBodyReleaseController
+	stream bool
+
+	mu    sync.Mutex
+	calls []string
+}
+
+func (e *releaseThenFailExecutor) Identifier() string {
+	return e.id
+}
+
+func (e *releaseThenFailExecutor) Execute(_ context.Context, auth *Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	e.mu.Lock()
+	e.calls = append(e.calls, auth.ID)
+	e.mu.Unlock()
+	if e.ctrl != nil {
+		e.ctrl.Release()
+	}
+	return cliproxyexecutor.Response{}, &Error{HTTPStatus: http.StatusInternalServerError, Message: "released failure"}
+}
+
+func (e *releaseThenFailExecutor) ExecuteStream(_ context.Context, auth *Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
+	e.mu.Lock()
+	e.calls = append(e.calls, auth.ID)
+	e.mu.Unlock()
+	if e.ctrl != nil {
+		e.ctrl.Release()
+	}
+	ch := make(chan cliproxyexecutor.StreamChunk, 1)
+	ch <- cliproxyexecutor.StreamChunk{Err: &Error{HTTPStatus: http.StatusInternalServerError, Message: "released stream failure"}}
+	close(ch)
+	return &cliproxyexecutor.StreamResult{Chunks: ch}, nil
+}
+
+func (e *releaseThenFailExecutor) Refresh(_ context.Context, auth *Auth) (*Auth, error) {
+	return auth, nil
+}
+
+func (e *releaseThenFailExecutor) CountTokens(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	return cliproxyexecutor.Response{}, &Error{HTTPStatus: http.StatusNotImplemented, Message: "not implemented"}
+}
+
+func (e *releaseThenFailExecutor) HttpRequest(context.Context, *Auth, *http.Request) (*http.Response, error) {
+	return nil, &Error{HTTPStatus: http.StatusNotImplemented, Message: "not implemented"}
+}
+
+func (e *releaseThenFailExecutor) Calls() []string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	out := make([]string, len(e.calls))
+	copy(out, e.calls)
+	return out
 }
 
 func (e *authFallbackExecutor) Identifier() string {

@@ -3,9 +3,14 @@ package middleware
 import (
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"strings"
 	"testing"
+
+	"github.com/gin-gonic/gin"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 )
 
 func TestShouldSkipMethodForRequestLogging(t *testing.T) {
@@ -158,5 +163,106 @@ func TestShouldCaptureRequestBody(t *testing.T) {
 		if got != tests[i].want {
 			t.Fatalf("%s: got %t, want %t", tests[i].name, got, tests[i].want)
 		}
+	}
+}
+
+func TestCaptureRequestInfoRegistersRequestBodyRelease(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"test","input":"large"}`))
+	c.Request.Header.Set("Content-Type", "application/json")
+	c.Request.ContentLength = int64(len(`{"model":"test","input":"large"}`))
+
+	info, err := captureRequestInfo(c, true, config.RequestBodyReleaseConfig{
+		Enable:       true,
+		AfterSeconds: 30,
+		MinBodyBytes: 1,
+	})
+	if err != nil {
+		t.Fatalf("captureRequestInfo() error = %v", err)
+	}
+	if !strings.Contains(string(info.Body), `"large"`) {
+		t.Fatalf("captured body = %s, want original body", info.Body)
+	}
+	ctrl := ensureRequestBodyReleaseController(c, config.RequestBodyReleaseConfig{
+		Enable:       true,
+		AfterSeconds: 30,
+		MinBodyBytes: 1,
+	}, int64(len(info.Body)))
+	if ctrl == nil {
+		t.Fatal("release controller = nil")
+	}
+	ctrl.Release()
+	if got := string(info.Body); !strings.Contains(got, "request body released after 30s") {
+		t.Fatalf("released body = %q, want placeholder", got)
+	}
+}
+
+func TestCaptureRequestInfoLogOnlyReleaseUsesLogPlaceholder(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"test","input":"large"}`))
+	c.Request.Header.Set("Content-Type", "application/json")
+	c.Request.ContentLength = int64(len(`{"model":"test","input":"large"}`))
+
+	info, err := captureRequestInfo(c, true, config.RequestBodyReleaseConfig{
+		Enable:       true,
+		LogOnly:      true,
+		AfterSeconds: 30,
+		MinBodyBytes: 1,
+	})
+	if err != nil {
+		t.Fatalf("captureRequestInfo() error = %v", err)
+	}
+	ctrl := ensureRequestBodyReleaseController(c, config.RequestBodyReleaseConfig{
+		Enable:       true,
+		LogOnly:      true,
+		AfterSeconds: 30,
+		MinBodyBytes: 1,
+	}, int64(len(info.Body)))
+	if ctrl == nil {
+		t.Fatal("release controller = nil")
+	}
+	ctrl.Release()
+	if got := string(info.BodyBytes()); !strings.Contains(got, "request body log released after 30s") {
+		t.Fatalf("released body = %q, want log placeholder", got)
+	}
+	if !ctrl.Replayable() {
+		t.Fatal("Replayable() = false after log-only release")
+	}
+}
+
+func TestCaptureRequestInfoRestoredBodyReleasesAfterHandlerRead(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	body := `{"model":"test","input":"large"}`
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+	c.Request.ContentLength = int64(len(body))
+
+	_, err := captureRequestInfo(c, true, config.RequestBodyReleaseConfig{
+		Enable:       true,
+		AfterSeconds: 30,
+		MinBodyBytes: 1,
+	})
+	if err != nil {
+		t.Fatalf("captureRequestInfo() error = %v", err)
+	}
+	reader, ok := c.Request.Body.(*cliproxyexecutor.ReleasableReadCloser)
+	if !ok {
+		t.Fatalf("restored request body type = %T, want *ReleasableReadCloser", c.Request.Body)
+	}
+	got, err := io.ReadAll(c.Request.Body)
+	if err != nil {
+		t.Fatalf("ReadAll(restored body) error = %v", err)
+	}
+	if string(got) != body {
+		t.Fatalf("restored body = %q, want %q", got, body)
+	}
+	if reader.Len() != 0 {
+		t.Fatalf("restored body retained %d bytes after EOF, want 0", reader.Len())
 	}
 }

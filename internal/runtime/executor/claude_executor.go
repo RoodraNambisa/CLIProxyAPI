@@ -208,10 +208,23 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	}
 
 	url := fmt.Sprintf("%s/v1/messages?beta=true", baseURL)
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(bodyForUpstream))
+	bodyReader := cliproxyexecutor.NewReleasableReadCloser(bodyForUpstream, nil)
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bodyReader)
 	if err != nil {
 		return resp, err
 	}
+	httpReq.ContentLength = int64(bodyReader.Len())
+	originalRef, translationRef, unregisterBodies := helps.RequestBodyRefs(ctx, opts, opts.OriginalRequest, bodyForTranslation)
+	defer unregisterBodies()
+	defer originalRef.Release()
+	defer translationRef.Release()
+	originalPayload = nil
+	originalPayloadSource = nil
+	originalTranslated = nil
+	body = nil
+	bodyForTranslation = nil
+	req.Payload = nil
+	opts.OriginalRequest = nil
 	applyClaudeHeaders(httpReq, auth, apiKey, false, extraBetas, e.cfg)
 	var authID, authLabel, authType, authValue string
 	if auth != nil {
@@ -230,6 +243,7 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 		AuthType:  authType,
 		AuthValue: authValue,
 	})
+	bodyForUpstream = nil
 
 	httpClient := helps.NewUtlsHTTPClient(e.cfg, auth, 0)
 	httpResp, err := httpClient.Do(httpReq)
@@ -306,8 +320,8 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 		to,
 		from,
 		req.Model,
-		opts.OriginalRequest,
-		bodyForTranslation,
+		originalRef.Bytes(),
+		translationRef.Bytes(),
 		data,
 		&param,
 	)
@@ -389,10 +403,25 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	}
 
 	url := fmt.Sprintf("%s/v1/messages?beta=true", baseURL)
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(bodyForUpstream))
+	bodyReader := cliproxyexecutor.NewReleasableReadCloser(bodyForUpstream, nil)
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bodyReader)
 	if err != nil {
 		return nil, err
 	}
+	httpReq.ContentLength = int64(bodyReader.Len())
+	originalRef, translationRef, unregisterBodies := helps.RequestBodyRefs(ctx, opts, opts.OriginalRequest, bodyForTranslation)
+	cleanupBodies := func() {
+		unregisterBodies()
+		originalRef.Release()
+		translationRef.Release()
+	}
+	originalPayload = nil
+	originalPayloadSource = nil
+	originalTranslated = nil
+	body = nil
+	bodyForTranslation = nil
+	req.Payload = nil
+	opts.OriginalRequest = nil
 	applyClaudeHeaders(httpReq, auth, apiKey, true, extraBetas, e.cfg)
 	var authID, authLabel, authType, authValue string
 	if auth != nil {
@@ -411,15 +440,18 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		AuthType:  authType,
 		AuthValue: authValue,
 	})
+	bodyForUpstream = nil
 
 	httpClient := helps.NewUtlsHTTPClient(e.cfg, auth, 0)
 	httpResp, err := httpClient.Do(httpReq)
 	if err != nil {
+		cleanupBodies()
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
 		return nil, err
 	}
 	helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
+		defer cleanupBodies()
 		// Decompress error responses — pass the Content-Encoding value (may be empty)
 		// and let decodeResponseBody handle both header-declared and magic-byte-detected
 		// compression.  This keeps error-path behaviour consistent with the success path.
@@ -456,6 +488,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	out := make(chan cliproxyexecutor.StreamChunk)
 	go func() {
 		defer close(out)
+		defer cleanupBodies()
 		defer func() {
 			if errClose := decodedBody.Close(); errClose != nil {
 				log.Errorf("response body close error: %v", errClose)
@@ -513,8 +546,8 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 				to,
 				from,
 				req.Model,
-				opts.OriginalRequest,
-				bodyForTranslation,
+				originalRef.Bytes(),
+				translationRef.Bytes(),
 				bytes.Clone(line),
 				&param,
 			)
@@ -566,10 +599,14 @@ func (e *ClaudeExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Aut
 	}
 
 	url := fmt.Sprintf("%s/v1/messages/count_tokens?beta=true", baseURL)
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+	bodyReader := cliproxyexecutor.NewReleasableReadCloser(body, nil)
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bodyReader)
 	if err != nil {
 		return cliproxyexecutor.Response{}, err
 	}
+	httpReq.ContentLength = int64(bodyReader.Len())
+	req.Payload = nil
+	opts.OriginalRequest = nil
 	applyClaudeHeaders(httpReq, auth, apiKey, false, extraBetas, e.cfg)
 	var authID, authLabel, authType, authValue string
 	if auth != nil {
@@ -588,6 +625,7 @@ func (e *ClaudeExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Aut
 		AuthType:  authType,
 		AuthValue: authValue,
 	})
+	body = nil
 
 	httpClient := helps.NewUtlsHTTPClient(e.cfg, auth, 0)
 	resp, err := httpClient.Do(httpReq)

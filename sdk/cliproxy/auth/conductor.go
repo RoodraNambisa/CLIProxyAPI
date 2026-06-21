@@ -1161,10 +1161,28 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 	}
 	var lastErr error
 	for idx, execModel := range execModels {
+		if !requestBodyReplayable(ctx, opts) {
+			if lastErr != nil {
+				return nil, lastErr
+			}
+			return nil, &Error{Code: "request_body_released", Message: "request body released; retry disabled"}
+		}
 		resultModel := m.stateModelForExecution(auth, routeModel, execModel, pooled)
 		execReq := req
 		execReq.Model = execModel
+		unregisterRelease := registerRequestBodyReleaseCallback(ctx, opts, func([]byte) {
+			execReq.Payload = nil
+			opts.OriginalRequest = nil
+		})
+		if !requestBodyReplayable(ctx, opts) {
+			unregisterRelease()
+			if lastErr != nil {
+				return nil, lastErr
+			}
+			return nil, &Error{Code: "request_body_released", Message: "request body released; retry disabled"}
+		}
 		streamResult, errStream := executor.ExecuteStream(ctx, auth, execReq, opts)
+		unregisterRelease()
 		if errStream != nil {
 			if errCtx := ctx.Err(); errCtx != nil {
 				return nil, errCtx
@@ -1180,6 +1198,9 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 				return nil, errStream
 			}
 			lastErr = errStream
+			if !requestBodyReplayable(ctx, opts) {
+				return nil, errStream
+			}
 			continue
 		}
 
@@ -1200,7 +1221,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 				discardStreamChunks(streamResult.Chunks)
 				return nil, bootstrapErr
 			}
-			if idx < len(execModels)-1 {
+			if idx < len(execModels)-1 && requestBodyReplayable(ctx, opts) {
 				rerr := &Error{Message: bootstrapErr.Error()}
 				if se, ok := errors.AsType[cliproxyexecutor.StatusError](bootstrapErr); ok && se != nil {
 					rerr.HTTPStatus = se.StatusCode()
@@ -1227,7 +1248,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			emptyErr := &Error{Code: "empty_stream", Message: "upstream stream closed before first payload", Retryable: true}
 			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: emptyErr}
 			m.MarkResult(ctx, result)
-			if idx < len(execModels)-1 {
+			if idx < len(execModels)-1 && requestBodyReplayable(ctx, opts) {
 				lastErr = emptyErr
 				continue
 			}
@@ -1691,25 +1712,34 @@ func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxye
 			return resp, nil
 		}
 		lastErr = errExec
+		if !requestBodyReplayable(ctx, opts) {
+			break
+		}
 		if wait, shouldWait := cooldownWaitFromError(errExec, maxWait); shouldWait {
 			if errWait := waitForCooldown(ctx, wait); errWait != nil {
 				return cliproxyexecutor.Response{}, errWait
 			}
+			if !requestBodyReplayable(ctx, opts) {
+				break
+			}
 			continue
 		}
-		if strictSessionAffinity || !shouldRetryRequestRound(errExec, m.currentConfig()) || attempt >= requestRetry {
+		if strictSessionAffinity || !requestBodyReplayable(ctx, opts) || !shouldRetryRequestRound(errExec, m.currentConfig()) || attempt >= requestRetry {
 			break
 		}
 		if wait, shouldWait := retryAfterWaitFromError(errExec, maxWait); shouldWait {
 			if errWait := waitForCooldown(ctx, wait); errWait != nil {
 				return cliproxyexecutor.Response{}, errWait
 			}
+			if !requestBodyReplayable(ctx, opts) {
+				break
+			}
 		}
 		attempt++
 		roundState = newRequestRoundState()
 	}
 	if lastErr != nil {
-		if !strictSessionAffinity && shouldAttemptAntigravityCreditsFallback(m, lastErr, normalized) {
+		if requestBodyReplayable(ctx, opts) && !strictSessionAffinity && shouldAttemptAntigravityCreditsFallback(m, lastErr, normalized) {
 			if resp, ok := m.tryAntigravityCreditsExecute(ctx, req, opts); ok {
 				return resp, nil
 			}
@@ -1739,18 +1769,27 @@ func (m *Manager) ExecuteCount(ctx context.Context, providers []string, req clip
 			return resp, nil
 		}
 		lastErr = errExec
+		if !requestBodyReplayable(ctx, opts) {
+			break
+		}
 		if wait, shouldWait := cooldownWaitFromError(errExec, maxWait); shouldWait {
 			if errWait := waitForCooldown(ctx, wait); errWait != nil {
 				return cliproxyexecutor.Response{}, errWait
 			}
+			if !requestBodyReplayable(ctx, opts) {
+				break
+			}
 			continue
 		}
-		if strictSessionAffinity || !shouldRetryRequestRound(errExec, m.currentConfig()) || attempt >= requestRetry {
+		if strictSessionAffinity || !requestBodyReplayable(ctx, opts) || !shouldRetryRequestRound(errExec, m.currentConfig()) || attempt >= requestRetry {
 			break
 		}
 		if wait, shouldWait := retryAfterWaitFromError(errExec, maxWait); shouldWait {
 			if errWait := waitForCooldown(ctx, wait); errWait != nil {
 				return cliproxyexecutor.Response{}, errWait
+			}
+			if !requestBodyReplayable(ctx, opts) {
+				break
 			}
 		}
 		attempt++
@@ -1782,25 +1821,34 @@ func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cli
 			return result, nil
 		}
 		lastErr = errStream
+		if !requestBodyReplayable(ctx, opts) {
+			break
+		}
 		if wait, shouldWait := cooldownWaitFromError(errStream, maxWait); shouldWait {
 			if errWait := waitForCooldown(ctx, wait); errWait != nil {
 				return nil, errWait
 			}
+			if !requestBodyReplayable(ctx, opts) {
+				break
+			}
 			continue
 		}
-		if strictSessionAffinity || !shouldRetryRequestRound(errStream, m.currentConfig()) || attempt >= requestRetry {
+		if strictSessionAffinity || !requestBodyReplayable(ctx, opts) || !shouldRetryRequestRound(errStream, m.currentConfig()) || attempt >= requestRetry {
 			break
 		}
 		if wait, shouldWait := retryAfterWaitFromError(errStream, maxWait); shouldWait {
 			if errWait := waitForCooldown(ctx, wait); errWait != nil {
 				return nil, errWait
 			}
+			if !requestBodyReplayable(ctx, opts) {
+				break
+			}
 		}
 		attempt++
 		roundState = newRequestRoundState()
 	}
 	if lastErr != nil {
-		if !strictSessionAffinity && shouldAttemptAntigravityCreditsFallback(m, lastErr, normalized) {
+		if requestBodyReplayable(ctx, opts) && !strictSessionAffinity && shouldAttemptAntigravityCreditsFallback(m, lastErr, normalized) {
 			if result, ok := m.tryAntigravityCreditsExecuteStream(ctx, req, opts); ok {
 				return result, nil
 			}
@@ -1824,7 +1872,18 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 	opts = setSelectionAttemptMetadata(opts, requestAttempt)
 	strictSessionAffinity := m.strictSessionAffinityForRequest(req, opts)
 	pickAllowed := m.roundPickAllowed(roundState, maxRetryCredentials)
+	unregisterRelease := registerRequestBodyReleaseCallback(ctx, opts, func([]byte) {
+		req.Payload = nil
+		opts.OriginalRequest = nil
+	})
+	defer unregisterRelease()
 	for {
+		if !requestBodyReplayable(ctx, opts) {
+			if roundState.lastErr != nil {
+				return cliproxyexecutor.Response{}, roundState.lastErr
+			}
+			return cliproxyexecutor.Response{}, &Error{Code: "request_body_released", Message: "request body released; retry disabled"}
+		}
 		auth, executor, provider, errPick := m.pickNextMixed(ctx, providers, routeModel, opts, roundState.tried, pickAllowed)
 		if errPick != nil {
 			if isModelCooldownError(errPick) {
@@ -1858,10 +1917,22 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 		baseReq := sanitizeDownstreamWebsocketFallbackRequest(execCtx, auth, req)
 		var authErr error
 		for _, upstreamModel := range models {
+			if !requestBodyReplayable(execCtx, opts) {
+				break
+			}
 			resultModel := m.stateModelForExecution(auth, routeModel, upstreamModel, pooled)
 			execReq := baseReq
 			execReq.Model = upstreamModel
+			unregisterAttemptRelease := registerRequestBodyReleaseCallback(execCtx, opts, func([]byte) {
+				execReq.Payload = nil
+				opts.OriginalRequest = nil
+			})
+			if !requestBodyReplayable(execCtx, opts) {
+				unregisterAttemptRelease()
+				return cliproxyexecutor.Response{}, &Error{Code: "request_body_released", Message: "request body released; retry disabled"}
+			}
 			resp, errExec := executor.Execute(execCtx, auth, execReq, opts)
+			unregisterAttemptRelease()
 			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: errExec == nil}
 			if errExec != nil {
 				if errCtx := execCtx.Err(); errCtx != nil {
@@ -1879,6 +1950,9 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 					return cliproxyexecutor.Response{}, errExec
 				}
 				authErr = errExec
+				if !requestBodyReplayable(execCtx, opts) {
+					return cliproxyexecutor.Response{}, errExec
+				}
 				continue
 			}
 			m.MarkResult(execCtx, result)
@@ -1893,6 +1967,9 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 				return cliproxyexecutor.Response{}, authErr
 			}
 			roundState.lastErr = authErr
+			if !requestBodyReplayable(ctx, opts) {
+				return cliproxyexecutor.Response{}, authErr
+			}
 			continue
 		}
 	}
@@ -1908,7 +1985,18 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 	opts = setSelectionAttemptMetadata(opts, requestAttempt)
 	strictSessionAffinity := m.strictSessionAffinityForRequest(req, opts)
 	pickAllowed := m.roundPickAllowed(roundState, maxRetryCredentials)
+	unregisterRelease := registerRequestBodyReleaseCallback(ctx, opts, func([]byte) {
+		req.Payload = nil
+		opts.OriginalRequest = nil
+	})
+	defer unregisterRelease()
 	for {
+		if !requestBodyReplayable(ctx, opts) {
+			if roundState.lastErr != nil {
+				return cliproxyexecutor.Response{}, roundState.lastErr
+			}
+			return cliproxyexecutor.Response{}, &Error{Code: "request_body_released", Message: "request body released; retry disabled"}
+		}
 		auth, executor, provider, errPick := m.pickNextMixed(ctx, providers, routeModel, opts, roundState.tried, pickAllowed)
 		if errPick != nil {
 			if isModelCooldownError(errPick) {
@@ -1942,10 +2030,22 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 		baseReq := sanitizeDownstreamWebsocketFallbackRequest(execCtx, auth, req)
 		var authErr error
 		for _, upstreamModel := range models {
+			if !requestBodyReplayable(execCtx, opts) {
+				break
+			}
 			resultModel := m.stateModelForExecution(auth, routeModel, upstreamModel, pooled)
 			execReq := baseReq
 			execReq.Model = upstreamModel
+			unregisterAttemptRelease := registerRequestBodyReleaseCallback(execCtx, opts, func([]byte) {
+				execReq.Payload = nil
+				opts.OriginalRequest = nil
+			})
+			if !requestBodyReplayable(execCtx, opts) {
+				unregisterAttemptRelease()
+				return cliproxyexecutor.Response{}, &Error{Code: "request_body_released", Message: "request body released; retry disabled"}
+			}
 			resp, errExec := executor.CountTokens(execCtx, auth, execReq, opts)
+			unregisterAttemptRelease()
 			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: errExec == nil}
 			if errExec != nil {
 				if errCtx := execCtx.Err(); errCtx != nil {
@@ -1963,6 +2063,9 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 					return cliproxyexecutor.Response{}, errExec
 				}
 				authErr = errExec
+				if !requestBodyReplayable(execCtx, opts) {
+					return cliproxyexecutor.Response{}, errExec
+				}
 				continue
 			}
 			m.MarkResult(execCtx, result)
@@ -1977,6 +2080,9 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 				return cliproxyexecutor.Response{}, authErr
 			}
 			roundState.lastErr = authErr
+			if !requestBodyReplayable(ctx, opts) {
+				return cliproxyexecutor.Response{}, authErr
+			}
 			continue
 		}
 	}
@@ -1992,7 +2098,18 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 	opts = setSelectionAttemptMetadata(opts, requestAttempt)
 	strictSessionAffinity := m.strictSessionAffinityForRequest(req, opts)
 	pickAllowed := m.roundPickAllowed(roundState, maxRetryCredentials)
+	unregisterRelease := registerRequestBodyReleaseCallback(ctx, opts, func([]byte) {
+		req.Payload = nil
+		opts.OriginalRequest = nil
+	})
+	defer unregisterRelease()
 	for {
+		if !requestBodyReplayable(ctx, opts) {
+			if roundState.lastErr != nil {
+				return nil, roundState.lastErr
+			}
+			return nil, &Error{Code: "request_body_released", Message: "request body released; retry disabled"}
+		}
 		auth, executor, provider, errPick := m.pickNextMixed(ctx, providers, routeModel, opts, roundState.tried, pickAllowed)
 		if errPick != nil {
 			if isModelCooldownError(errPick) {
@@ -2023,7 +2140,16 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 		}
 		roundState.markAttempted(auth)
 		execReq := sanitizeDownstreamWebsocketFallbackRequest(execCtx, auth, req)
+		unregisterAttemptRelease := registerRequestBodyReleaseCallback(execCtx, opts, func([]byte) {
+			execReq.Payload = nil
+			opts.OriginalRequest = nil
+		})
+		if !requestBodyReplayable(execCtx, opts) {
+			unregisterAttemptRelease()
+			return nil, &Error{Code: "request_body_released", Message: "request body released; retry disabled"}
+		}
 		streamResult, errStream := m.executeStreamWithModelPool(execCtx, executor, auth, providers, provider, execReq, opts, routeModel, models, pooled)
+		unregisterAttemptRelease()
 		if errStream != nil {
 			if errCtx := execCtx.Err(); errCtx != nil {
 				return nil, errCtx
@@ -2035,6 +2161,9 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 				return nil, errStream
 			}
 			roundState.lastErr = errStream
+			if !requestBodyReplayable(execCtx, opts) {
+				return nil, errStream
+			}
 			continue
 		}
 		return streamResult, nil
@@ -2204,10 +2333,13 @@ func shouldAttemptAntigravityCreditsFallback(m *Manager, lastErr error, provider
 }
 
 func (m *Manager) tryAntigravityCreditsExecute(ctx context.Context, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, bool) {
+	if !requestBodyReplayable(ctx, opts) {
+		return cliproxyexecutor.Response{}, false
+	}
 	routeModel := req.Model
 	candidates := m.findAllAntigravityCreditsCandidateAuths(routeModel, opts)
 	for _, c := range candidates {
-		if ctx.Err() != nil {
+		if ctx.Err() != nil || !requestBodyReplayable(ctx, opts) {
 			return cliproxyexecutor.Response{}, false
 		}
 		creditsCtx := WithAntigravityCredits(ctx)
@@ -2223,6 +2355,9 @@ func (m *Manager) tryAntigravityCreditsExecute(ctx context.Context, req cliproxy
 		}
 		pooled := len(models) > 1
 		for _, upstreamModel := range models {
+			if !requestBodyReplayable(creditsCtx, creditsOpts) {
+				return cliproxyexecutor.Response{}, false
+			}
 			resultModel := m.stateModelForExecution(c.auth, routeModel, upstreamModel, pooled)
 			execReq := req
 			execReq.Model = upstreamModel
@@ -2247,10 +2382,13 @@ func (m *Manager) tryAntigravityCreditsExecute(ctx context.Context, req cliproxy
 }
 
 func (m *Manager) tryAntigravityCreditsExecuteStream(ctx context.Context, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, bool) {
+	if !requestBodyReplayable(ctx, opts) {
+		return nil, false
+	}
 	routeModel := req.Model
 	candidates := m.findAllAntigravityCreditsCandidateAuths(routeModel, opts)
 	for _, c := range candidates {
-		if ctx.Err() != nil {
+		if ctx.Err() != nil || !requestBodyReplayable(ctx, opts) {
 			return nil, false
 		}
 		creditsCtx := WithAntigravityCredits(ctx)
@@ -2673,11 +2811,28 @@ func (m *Manager) WithRequestRetryBudgetForProviders(ctx context.Context, provid
 
 // ConsumeRequestRetryBudget spends one bootstrap retry from the context budget.
 func ConsumeRequestRetryBudget(ctx context.Context) bool {
+	if ctrl := cliproxyexecutor.RequestBodyReleaseControllerFromContext(ctx); ctrl != nil && !ctrl.Replayable() {
+		return false
+	}
 	budget := requestRetryBudgetFromContext(ctx)
 	if budget == nil {
 		return true
 	}
 	return budget.consume()
+}
+
+func requestBodyReplayable(ctx context.Context, opts cliproxyexecutor.Options) bool {
+	if ctrl := cliproxyexecutor.RequestBodyReleaseControllerFromOptions(opts); ctrl != nil {
+		return ctrl.Replayable()
+	}
+	if ctrl := cliproxyexecutor.RequestBodyReleaseControllerFromContext(ctx); ctrl != nil {
+		return ctrl.Replayable()
+	}
+	return true
+}
+
+func registerRequestBodyReleaseCallback(ctx context.Context, opts cliproxyexecutor.Options, callback func([]byte)) func() {
+	return cliproxyexecutor.RegisterRequestBodyReleaseCallback(ctx, opts, callback)
 }
 
 func (m *Manager) withRequestRetryBudget(ctx context.Context, providers []string, bootstrapRetries int) context.Context {

@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -17,15 +18,36 @@ import (
 const requestBodyOverrideContextKey = "REQUEST_BODY_OVERRIDE"
 const responseBodyOverrideContextKey = "RESPONSE_BODY_OVERRIDE"
 const websocketTimelineOverrideContextKey = "WEBSOCKET_TIMELINE_OVERRIDE"
+const requestLogContextMutexKey = "REQUEST_LOG_CONTEXT_MUTEX"
 
 // RequestInfo holds essential details of an incoming HTTP request for logging purposes.
 type RequestInfo struct {
-	URL       string              // URL is the request URL.
-	Method    string              // Method is the HTTP method (e.g., GET, POST).
-	Headers   map[string][]string // Headers contains the request headers.
-	Body      []byte              // Body is the raw request body.
-	RequestID string              // RequestID is the unique identifier for the request.
-	Timestamp time.Time           // Timestamp is when the request was received.
+	mu         sync.RWMutex
+	URL        string              // URL is the request URL.
+	Method     string              // Method is the HTTP method (e.g., GET, POST).
+	Headers    map[string][]string // Headers contains the request headers.
+	Body       []byte              // Body is the raw request body.
+	RequestID  string              // RequestID is the unique identifier for the request.
+	Timestamp  time.Time           // Timestamp is when the request was received.
+	StreamHint bool                // StreamHint records whether the original request body asked for streaming.
+}
+
+func (r *RequestInfo) BodyBytes() []byte {
+	if r == nil {
+		return nil
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return bytes.Clone(r.Body)
+}
+
+func (r *RequestInfo) SetBody(body []byte) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.Body = bytes.Clone(body)
 }
 
 // ResponseWriterWrapper wraps the standard gin.ResponseWriter to intercept and log response data.
@@ -164,7 +186,7 @@ func (w *ResponseWriterWrapper) WriteHeader(statusCode int) {
 			w.requestInfo.URL,
 			w.requestInfo.Method,
 			w.requestInfo.Headers,
-			w.requestInfo.Body,
+			w.requestInfo.BodyBytes(),
 			w.requestInfo.RequestID,
 		)
 		if err == nil {
@@ -226,9 +248,8 @@ func (w *ResponseWriterWrapper) detectStreaming(contentType string) bool {
 	}
 
 	// Only fall back to request payload hints when Content-Type is not set yet.
-	if w.requestInfo != nil && len(w.requestInfo.Body) > 0 {
-		return bytes.Contains(w.requestInfo.Body, []byte(`"stream": true`)) ||
-			bytes.Contains(w.requestInfo.Body, []byte(`"stream":true`))
+	if w.requestInfo != nil {
+		return w.requestInfo.StreamHint
 	}
 
 	return false
@@ -335,6 +356,8 @@ func (w *ResponseWriterWrapper) cloneHeaders() map[string][]string {
 }
 
 func (w *ResponseWriterWrapper) extractAPIRequest(c *gin.Context) []byte {
+	unlock := requestLogContextRLock(c)
+	defer unlock()
 	apiRequest, isExist := c.Get("API_REQUEST")
 	if !isExist {
 		return nil
@@ -347,6 +370,8 @@ func (w *ResponseWriterWrapper) extractAPIRequest(c *gin.Context) []byte {
 }
 
 func (w *ResponseWriterWrapper) extractAPIResponse(c *gin.Context) []byte {
+	unlock := requestLogContextRLock(c)
+	defer unlock()
 	apiResponse, isExist := c.Get("API_RESPONSE")
 	if !isExist {
 		return nil
@@ -359,6 +384,8 @@ func (w *ResponseWriterWrapper) extractAPIResponse(c *gin.Context) []byte {
 }
 
 func (w *ResponseWriterWrapper) extractAPIWebsocketTimeline(c *gin.Context) []byte {
+	unlock := requestLogContextRLock(c)
+	defer unlock()
 	apiTimeline, isExist := c.Get("API_WEBSOCKET_TIMELINE")
 	if !isExist {
 		return nil
@@ -371,6 +398,8 @@ func (w *ResponseWriterWrapper) extractAPIWebsocketTimeline(c *gin.Context) []by
 }
 
 func (w *ResponseWriterWrapper) extractAPIResponseTimestamp(c *gin.Context) time.Time {
+	unlock := requestLogContextRLock(c)
+	defer unlock()
 	ts, isExist := c.Get("API_RESPONSE_TIMESTAMP")
 	if !isExist {
 		return time.Time{}
@@ -385,8 +414,8 @@ func (w *ResponseWriterWrapper) extractRequestBody(c *gin.Context) []byte {
 	if body := extractBodyOverride(c, requestBodyOverrideContextKey); len(body) > 0 {
 		return body
 	}
-	if w.requestInfo != nil && len(w.requestInfo.Body) > 0 {
-		return w.requestInfo.Body
+	if w.requestInfo != nil {
+		return w.requestInfo.BodyBytes()
 	}
 	return nil
 }
@@ -409,6 +438,8 @@ func extractBodyOverride(c *gin.Context, key string) []byte {
 	if c == nil {
 		return nil
 	}
+	unlock := requestLogContextRLock(c)
+	defer unlock()
 	bodyOverride, isExist := c.Get(key)
 	if !isExist {
 		return nil
@@ -424,6 +455,29 @@ func extractBodyOverride(c *gin.Context, key string) []byte {
 		}
 	}
 	return nil
+}
+
+func ensureRequestLogContextMutex(c *gin.Context) *sync.RWMutex {
+	if c == nil {
+		return nil
+	}
+	if raw, exists := c.Get(requestLogContextMutexKey); exists {
+		if mu, ok := raw.(*sync.RWMutex); ok && mu != nil {
+			return mu
+		}
+	}
+	mu := &sync.RWMutex{}
+	c.Set(requestLogContextMutexKey, mu)
+	return mu
+}
+
+func requestLogContextRLock(c *gin.Context) func() {
+	mu := ensureRequestLogContextMutex(c)
+	if mu == nil {
+		return func() {}
+	}
+	mu.RLock()
+	return mu.RUnlock
 }
 
 func (w *ResponseWriterWrapper) logRequest(requestBody []byte, statusCode int, headers map[string][]string, body, websocketTimeline, apiRequestBody, apiResponseBody, apiWebsocketTimeline []byte, apiResponseTimestamp time.Time, apiResponseErrors []*interfaces.ErrorMessage, forceLog bool) error {

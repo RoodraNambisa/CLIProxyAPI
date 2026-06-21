@@ -131,18 +131,28 @@ func (e *AIStudioExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth,
 	reporter := helps.NewUsageReporter(ctx, e.Identifier(), baseModel, auth)
 	defer reporter.TrackFailure(ctx, &err)
 
-	translatedReq, body, err := e.translateRequest(req, opts, false)
+	_, body, err := e.translateRequest(req, opts, false)
 	if err != nil {
 		return resp, err
 	}
+	payload := body.payload
+	originalRef, payloadRef, unregisterBodies := helps.RequestBodyRefs(ctx, opts, opts.OriginalRequest, payload)
+	defer unregisterBodies()
+	defer originalRef.Release()
+	defer payloadRef.Release()
+	toFormat := body.toFormat
 
 	endpoint := e.buildEndpoint(baseModel, body.action, opts.Alt)
 	wsReq := &wsrelay.HTTPRequest{
 		Method:  http.MethodPost,
 		URL:     endpoint,
 		Headers: http.Header{"Content-Type": []string{"application/json"}},
-		Body:    body.payload,
+		Body:    payload,
 	}
+	body.payload = nil
+	payload = nil
+	req.Payload = nil
+	opts.OriginalRequest = nil
 	var attrs map[string]string
 	if auth != nil {
 		attrs = auth.Attributes
@@ -159,7 +169,7 @@ func (e *AIStudioExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth,
 		URL:       endpoint,
 		Method:    http.MethodPost,
 		Headers:   wsReq.Headers.Clone(),
-		Body:      body.payload,
+		Body:      payloadRef.Bytes(),
 		Provider:  e.Identifier(),
 		AuthID:    authID,
 		AuthLabel: authLabel,
@@ -181,7 +191,7 @@ func (e *AIStudioExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth,
 	}
 	reporter.Publish(ctx, helps.ParseGeminiUsage(wsResp.Body))
 	var param any
-	out := sdktranslator.TranslateNonStream(ctx, body.toFormat, opts.SourceFormat, req.Model, opts.OriginalRequest, translatedReq, wsResp.Body, &param)
+	out := sdktranslator.TranslateNonStream(ctx, toFormat, opts.SourceFormat, req.Model, originalRef.Bytes(), payloadRef.Bytes(), wsResp.Body, &param)
 	resp = cliproxyexecutor.Response{Payload: ensureColonSpacedJSON(out), Headers: wsResp.Headers.Clone()}
 	return resp, nil
 }
@@ -195,18 +205,30 @@ func (e *AIStudioExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth
 	reporter := helps.NewUsageReporter(ctx, e.Identifier(), baseModel, auth)
 	defer reporter.TrackFailure(ctx, &err)
 
-	translatedReq, body, err := e.translateRequest(req, opts, true)
+	_, body, err := e.translateRequest(req, opts, true)
 	if err != nil {
 		return nil, err
 	}
+	payload := body.payload
+	originalRef, payloadRef, unregisterBodies := helps.RequestBodyRefs(ctx, opts, opts.OriginalRequest, payload)
+	cleanupBodies := func() {
+		unregisterBodies()
+		originalRef.Release()
+		payloadRef.Release()
+	}
+	toFormat := body.toFormat
 
 	endpoint := e.buildEndpoint(baseModel, body.action, opts.Alt)
 	wsReq := &wsrelay.HTTPRequest{
 		Method:  http.MethodPost,
 		URL:     endpoint,
 		Headers: http.Header{"Content-Type": []string{"application/json"}},
-		Body:    body.payload,
+		Body:    payload,
 	}
+	body.payload = nil
+	payload = nil
+	req.Payload = nil
+	opts.OriginalRequest = nil
 	var attrs map[string]string
 	if auth != nil {
 		attrs = auth.Attributes
@@ -222,7 +244,7 @@ func (e *AIStudioExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth
 		URL:       endpoint,
 		Method:    http.MethodPost,
 		Headers:   wsReq.Headers.Clone(),
-		Body:      body.payload,
+		Body:      payloadRef.Bytes(),
 		Provider:  e.Identifier(),
 		AuthID:    authID,
 		AuthLabel: authLabel,
@@ -231,16 +253,19 @@ func (e *AIStudioExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth
 	})
 	wsStream, err := e.relay.Stream(ctx, authID, wsReq)
 	if err != nil {
+		cleanupBodies()
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
 		return nil, err
 	}
 	firstEvent, ok := <-wsStream
 	if !ok {
+		cleanupBodies()
 		err = fmt.Errorf("wsrelay: stream closed before start")
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
 		return nil, err
 	}
 	if firstEvent.Status > 0 && firstEvent.Status != http.StatusOK {
+		defer cleanupBodies()
 		metadataLogged := false
 		if firstEvent.Status > 0 {
 			helps.RecordAPIResponseMetadata(ctx, e.cfg, firstEvent.Status, firstEvent.Headers.Clone())
@@ -279,6 +304,7 @@ func (e *AIStudioExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth
 	out := make(chan cliproxyexecutor.StreamChunk)
 	go func(first wsrelay.StreamEvent) {
 		defer close(out)
+		defer cleanupBodies()
 		var param any
 		metadataLogged := false
 		processEvent := func(event wsrelay.StreamEvent) bool {
@@ -301,7 +327,7 @@ func (e *AIStudioExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth
 					if detail, ok := helps.ParseGeminiStreamUsage(filtered); ok {
 						reporter.Publish(ctx, detail)
 					}
-					lines := sdktranslator.TranslateStream(ctx, body.toFormat, opts.SourceFormat, req.Model, opts.OriginalRequest, translatedReq, filtered, &param)
+					lines := sdktranslator.TranslateStream(ctx, toFormat, opts.SourceFormat, req.Model, originalRef.Bytes(), payloadRef.Bytes(), filtered, &param)
 					for i := range lines {
 						out <- cliproxyexecutor.StreamChunk{Payload: ensureColonSpacedJSON(lines[i])}
 					}
@@ -317,7 +343,7 @@ func (e *AIStudioExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth
 				if len(event.Payload) > 0 {
 					helps.AppendAPIResponseChunk(ctx, e.cfg, event.Payload)
 				}
-				lines := sdktranslator.TranslateStream(ctx, body.toFormat, opts.SourceFormat, req.Model, opts.OriginalRequest, translatedReq, event.Payload, &param)
+				lines := sdktranslator.TranslateStream(ctx, toFormat, opts.SourceFormat, req.Model, originalRef.Bytes(), payloadRef.Bytes(), event.Payload, &param)
 				for i := range lines {
 					out <- cliproxyexecutor.StreamChunk{Payload: ensureColonSpacedJSON(lines[i])}
 				}
@@ -362,6 +388,8 @@ func (e *AIStudioExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.A
 		Headers: http.Header{"Content-Type": []string{"application/json"}},
 		Body:    body.payload,
 	}
+	req.Payload = nil
+	opts.OriginalRequest = nil
 	var authID, authLabel, authType, authValue string
 	if auth != nil {
 		authID = auth.ID
@@ -379,6 +407,7 @@ func (e *AIStudioExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.A
 		AuthType:  authType,
 		AuthValue: authValue,
 	})
+	body.payload = nil
 	resp, err := e.relay.NonStream(ctx, authID, wsReq)
 	if err != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, err)

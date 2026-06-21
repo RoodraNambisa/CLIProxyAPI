@@ -272,6 +272,53 @@ func requestExecutionMetadata(ctx context.Context) map[string]any {
 	return meta
 }
 
+func (h *BaseAPIHandler) attachRequestBodyRelease(ctx context.Context, rawJSON []byte, meta map[string]any) (context.Context, *coreexecutor.RequestBodyReleaseController) {
+	if h == nil || h.Cfg == nil || len(rawJSON) == 0 {
+		return ctx, nil
+	}
+	cfg := config.NormalizeRequestBodyRelease(h.Cfg.RequestBodyRelease)
+	if !cfg.Enable || cfg.LogOnly || cfg.AfterSeconds <= 0 {
+		return ctx, nil
+	}
+	size := int64(len(rawJSON))
+	if cfg.MinBodyBytes > 0 && size < cfg.MinBodyBytes {
+		return ctx, nil
+	}
+	placeholder := []byte(fmt.Sprintf("<request body released after %ds; original size %d bytes>", cfg.AfterSeconds, size))
+	ctrl := requestBodyReleaseControllerFromContext(ctx)
+	if ctrl == nil {
+		ctrl = coreexecutor.NewRequestBodyReleaseController(size, placeholder)
+	}
+	if meta != nil {
+		meta[coreexecutor.BodyReleaseControllerMetadataKey] = ctrl
+	}
+	if ginCtx, ok := ctx.Value("gin").(*gin.Context); ok && ginCtx != nil {
+		ginCtx.Set(coreexecutor.BodyReleaseControllerMetadataKey, ctrl)
+	}
+	ctx = coreexecutor.WithRequestBodyReleaseController(ctx, ctrl)
+	ctrl.StartTimer(time.Duration(cfg.AfterSeconds)*time.Second, ctx.Done())
+	return ctx, ctrl
+}
+
+func requestBodyReleaseControllerFromContext(ctx context.Context) *coreexecutor.RequestBodyReleaseController {
+	if ctrl := coreexecutor.RequestBodyReleaseControllerFromContext(ctx); ctrl != nil {
+		return ctrl
+	}
+	if ctx == nil {
+		return nil
+	}
+	ginCtx, _ := ctx.Value("gin").(*gin.Context)
+	if ginCtx == nil {
+		return nil
+	}
+	raw, exists := ginCtx.Get(coreexecutor.BodyReleaseControllerMetadataKey)
+	if !exists {
+		return nil
+	}
+	ctrl, _ := raw.(*coreexecutor.RequestBodyReleaseController)
+	return ctrl
+}
+
 func pinnedAuthIDFromContext(ctx context.Context) string {
 	if ctx == nil {
 		return ""
@@ -536,6 +583,7 @@ func (h *BaseAPIHandler) ExecuteWithAuthManager(ctx context.Context, handlerType
 	}
 	reqMeta := requestExecutionMetadata(ctx)
 	reqMeta[coreexecutor.RequestedModelMetadataKey] = normalizedModel
+	ctx, _ = h.attachRequestBodyRelease(ctx, rawJSON, reqMeta)
 	payload := rawJSON
 	if len(payload) == 0 {
 		payload = nil
@@ -599,6 +647,7 @@ func (h *BaseAPIHandler) ExecuteWithProvidersAndExecutionModel(ctx context.Conte
 	if imageStreamPassthrough {
 		reqMeta[coreexecutor.ImageGenerationStreamPassthroughMetadataKey] = true
 	}
+	ctx, _ = h.attachRequestBodyRelease(ctx, rawJSON, reqMeta)
 	payload := rawJSON
 	if len(payload) == 0 {
 		payload = nil
@@ -658,6 +707,7 @@ func (h *BaseAPIHandler) ExecuteCountWithAuthManager(ctx context.Context, handle
 	}
 	reqMeta := requestExecutionMetadata(ctx)
 	reqMeta[coreexecutor.RequestedModelMetadataKey] = normalizedModel
+	ctx, _ = h.attachRequestBodyRelease(ctx, rawJSON, reqMeta)
 	payload := rawJSON
 	if len(payload) == 0 {
 		payload = nil
@@ -727,6 +777,7 @@ func (h *BaseAPIHandler) executeStreamWithResolvedProviders(ctx context.Context,
 	if trustResponsesSSE {
 		reqMeta[coreexecutor.TrustUpstreamSSEMetadataKey] = true
 	}
+	ctx, _ = h.attachRequestBodyRelease(ctx, rawJSON, reqMeta)
 	payload := rawJSON
 	if len(payload) == 0 {
 		payload = nil

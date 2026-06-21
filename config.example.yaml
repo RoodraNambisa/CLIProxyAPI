@@ -133,6 +133,15 @@ auth-model-exclusions: []
 #   - models: ["gpt-image-2"]
 #     keyword-contains: ["free"]
 
+# Release retained request body copies after a request has been waiting for N seconds.
+# log-only=true only drops request log/upstream log copies and does not affect retries.
+# log-only=false drops replay payload references and disables credential/model/request retries.
+request-body-release:
+  enable: false
+  log-only: false
+  after-seconds: 0
+  min-body-bytes: 0
+
 # Block API requests when the raw request body contains configured byte keywords.
 # Matching is performed on raw request bytes before provider routing.
 request-body-audit:

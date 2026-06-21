@@ -42,6 +42,7 @@ func (m *Manager) NonStream(ctx context.Context, provider string, req *HTTPReque
 	}
 	msg := Message{ID: uuid.NewString(), Type: MessageTypeHTTPReq, Payload: encodeRequest(req)}
 	respCh, err := m.Send(ctx, provider, msg)
+	releaseHTTPRequestBody(req, &msg)
 	if err != nil {
 		return nil, err
 	}
@@ -118,6 +119,7 @@ func (m *Manager) Stream(ctx context.Context, provider string, req *HTTPRequest)
 	}
 	msg := Message{ID: uuid.NewString(), Type: MessageTypeHTTPReq, Payload: encodeRequest(req)}
 	respCh, err := m.Send(ctx, provider, msg)
+	releaseHTTPRequestBody(req, &msg)
 	if err != nil {
 		return nil, err
 	}
@@ -187,6 +189,18 @@ func encodeRequest(req *HTTPRequest) map[string]any {
 		"headers": headers,
 		"body":    string(req.Body),
 		"sent_at": time.Now().UTC().Format(time.RFC3339Nano),
+	}
+}
+
+func releaseHTTPRequestBody(req *HTTPRequest, msg *Message) {
+	if req != nil {
+		req.Body = nil
+	}
+	if msg != nil {
+		if msg.Payload != nil {
+			delete(msg.Payload, "body")
+		}
+		msg.Payload = nil
 	}
 }
 

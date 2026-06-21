@@ -324,6 +324,14 @@ type AuthModelExclusionRule struct {
 	KeywordContains []string `yaml:"keyword-contains,omitempty" json:"keyword-contains,omitempty"`
 }
 
+// RequestBodyReleaseConfig controls timed release of retained request body copies.
+type RequestBodyReleaseConfig struct {
+	Enable       bool  `yaml:"enable" json:"enable"`
+	LogOnly      bool  `yaml:"log-only" json:"log-only"`
+	AfterSeconds int   `yaml:"after-seconds" json:"after-seconds"`
+	MinBodyBytes int64 `yaml:"min-body-bytes" json:"min-body-bytes"`
+}
+
 // RequestBodyAuditConfig defines byte-level request body keyword blocking for model APIs.
 type RequestBodyAuditConfig struct {
 	Enable bool `yaml:"enable" json:"enable"`
@@ -903,6 +911,7 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	cfg.FixedErrorCooldowns = NormalizeFixedErrorCooldowns(cfg.FixedErrorCooldowns)
 	cfg.NonRetryableErrors = NormalizeNonRetryableErrorRules(cfg.NonRetryableErrors)
 	cfg.AuthModelExclusions = NormalizeAuthModelExclusionRules(cfg.AuthModelExclusions)
+	cfg.RequestBodyRelease = NormalizeRequestBodyRelease(cfg.RequestBodyRelease)
 	cfg.NormalizeRequestBodyAudit()
 
 	// Sanitize Gemini API key configuration and migrate legacy entries.
@@ -1381,6 +1390,18 @@ func intsSignature(values []int) string {
 		parts = append(parts, fmt.Sprintf("%d", value))
 	}
 	return strings.Join(parts, ",")
+}
+
+// NormalizeRequestBodyRelease clamps request body release settings.
+func NormalizeRequestBodyRelease(in RequestBodyReleaseConfig) RequestBodyReleaseConfig {
+	out := in
+	if out.AfterSeconds < 0 {
+		out.AfterSeconds = 0
+	}
+	if out.MinBodyBytes < 0 {
+		out.MinBodyBytes = 0
+	}
+	return out
 }
 
 // NormalizeRequestBodyAudit canonicalizes request body audit settings and compiles byte keywords.

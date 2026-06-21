@@ -37,6 +37,38 @@ func TestPutRequestRetry_ClampsNegativeValues(t *testing.T) {
 	}
 }
 
+func TestPutRequestBodyRelease_NormalizesValues(t *testing.T) {
+	t.Parallel()
+
+	h := &Handler{
+		cfg:            &config.Config{},
+		configFilePath: writeTestConfigFile(t),
+	}
+
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPatch, "/v0/management/request-body-release", bytes.NewBufferString(`{"value":{"enable":true,"log-only":true,"after-seconds":-7,"min-body-bytes":-1024}}`))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	h.PutRequestBodyRelease(c)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	if !h.cfg.RequestBodyRelease.Enable {
+		t.Fatal("request-body-release.enable = false, want true")
+	}
+	if !h.cfg.RequestBodyRelease.LogOnly {
+		t.Fatal("request-body-release.log-only = false, want true")
+	}
+	if h.cfg.RequestBodyRelease.AfterSeconds != 0 {
+		t.Fatalf("after-seconds = %d, want 0", h.cfg.RequestBodyRelease.AfterSeconds)
+	}
+	if h.cfg.RequestBodyRelease.MinBodyBytes != 0 {
+		t.Fatalf("min-body-bytes = %d, want 0", h.cfg.RequestBodyRelease.MinBodyBytes)
+	}
+}
+
 func TestPutNonRetryableErrors_NormalizesValues(t *testing.T) {
 	t.Parallel()
 

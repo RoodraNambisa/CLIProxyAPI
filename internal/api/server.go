@@ -230,12 +230,21 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 	// Resolve logs directory relative to the configuration file directory.
 	var requestLogger logging.RequestLogger
 	var toggle func(bool)
+	var serverRef *Server
 	if !cfg.CommercialMode {
 		if optionState.requestLoggerFactory != nil {
 			requestLogger = optionState.requestLoggerFactory(cfg, configFilePath)
 		}
 		if requestLogger != nil {
-			engine.Use(middleware.RequestLoggingMiddleware(requestLogger))
+			engine.Use(middleware.RequestLoggingMiddleware(requestLogger, func() config.RequestBodyReleaseConfig {
+				if serverRef != nil && serverRef.cfg != nil {
+					return serverRef.cfg.RequestBodyRelease
+				}
+				if cfg != nil {
+					return cfg.RequestBodyRelease
+				}
+				return config.RequestBodyReleaseConfig{}
+			}))
 			if setter, ok := requestLogger.(interface{ SetEnabled(bool) }); ok {
 				toggle = setter.SetEnabled
 			}
@@ -267,6 +276,7 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 		managementAPIPrefixes:  make(map[string]struct{}),
 		managementSurfacePaths: make(map[string]struct{}),
 	}
+	serverRef = s
 	s.wsAuthEnabled.Store(cfg.WebsocketAuth)
 	// Save initial YAML snapshot
 	s.oldConfigYaml, _ = yaml.Marshal(cfg)
@@ -640,6 +650,9 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.GET("/request-retry", s.mgmt.GetRequestRetry)
 		mgmt.PUT("/request-retry", s.mgmt.PutRequestRetry)
 		mgmt.PATCH("/request-retry", s.mgmt.PutRequestRetry)
+		mgmt.GET("/request-body-release", s.mgmt.GetRequestBodyRelease)
+		mgmt.PUT("/request-body-release", s.mgmt.PutRequestBodyRelease)
+		mgmt.PATCH("/request-body-release", s.mgmt.PutRequestBodyRelease)
 		mgmt.GET("/non-retryable-errors", s.mgmt.GetNonRetryableErrors)
 		mgmt.PUT("/non-retryable-errors", s.mgmt.PutNonRetryableErrors)
 		mgmt.PATCH("/non-retryable-errors", s.mgmt.PutNonRetryableErrors)

@@ -17,6 +17,7 @@ type NativeImageEndpointConfig = internalconfig.NativeImageEndpointConfig
 type TLSConfig = internalconfig.TLSConfig
 type RemoteManagement = internalconfig.RemoteManagement
 type AuthMaintenanceConfig = internalconfig.AuthMaintenanceConfig
+type RequestBodyReleaseConfig = internalconfig.RequestBodyReleaseConfig
 type NonRetryableErrorRule = internalconfig.NonRetryableErrorRule
 type AuthModelExclusionRule = internalconfig.AuthModelExclusionRule
 type AmpCode = internalconfig.AmpCode
@@ -58,4 +59,8 @@ func SaveConfigPreserveCommentsUpdateNestedScalar(configFile string, path []stri
 
 func NormalizeCommentIndentation(data []byte) []byte {
 	return internalconfig.NormalizeCommentIndentation(data)
+}
+
+func NormalizeRequestBodyRelease(in RequestBodyReleaseConfig) RequestBodyReleaseConfig {
+	return internalconfig.NormalizeRequestBodyRelease(in)
 }

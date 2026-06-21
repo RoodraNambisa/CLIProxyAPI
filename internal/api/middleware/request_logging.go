@@ -5,23 +5,29 @@ package middleware
 
 import (
 	"bytes"
+	"fmt"
 	"io"
 	"net/http"
 	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 )
 
 const maxErrorOnlyCapturedRequestBodyBytes int64 = 1 << 20 // 1 MiB
+
+// RequestBodyReleaseConfigProvider returns the current request body release configuration.
+type RequestBodyReleaseConfigProvider func() config.RequestBodyReleaseConfig
 
 // RequestLoggingMiddleware creates a Gin middleware that logs HTTP requests and responses.
 // It captures detailed information about the request and response, including headers and body,
 // and uses the provided RequestLogger to record this data. When full request logging is disabled,
 // body capture is limited to small known-size payloads to avoid large per-request memory spikes.
-func RequestLoggingMiddleware(logger logging.RequestLogger) gin.HandlerFunc {
+func RequestLoggingMiddleware(logger logging.RequestLogger, releaseProviders ...RequestBodyReleaseConfigProvider) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		if logger == nil {
 			c.Next()
@@ -38,11 +44,16 @@ func RequestLoggingMiddleware(logger logging.RequestLogger) gin.HandlerFunc {
 			c.Next()
 			return
 		}
+		ensureRequestLogContextMutex(c)
 
 		loggerEnabled := logger.IsEnabled()
+		releaseCfg := config.RequestBodyReleaseConfig{}
+		if len(releaseProviders) > 0 && releaseProviders[0] != nil {
+			releaseCfg = config.NormalizeRequestBodyRelease(releaseProviders[0]())
+		}
 
 		// Capture request information
-		requestInfo, err := captureRequestInfo(c, shouldCaptureRequestBody(loggerEnabled, c.Request))
+		requestInfo, err := captureRequestInfo(c, shouldCaptureRequestBody(loggerEnabled, c.Request), releaseCfg)
 		if err != nil {
 			// Log error but continue processing
 			// In a real implementation, you might want to use a proper logger here
@@ -108,7 +119,7 @@ func shouldCaptureRequestBody(loggerEnabled bool, req *http.Request) bool {
 // captureRequestInfo extracts relevant information from the incoming HTTP request.
 // It captures the URL, method, headers, and body. The request body is read and then
 // restored so that it can be processed by subsequent handlers.
-func captureRequestInfo(c *gin.Context, captureBody bool) (*RequestInfo, error) {
+func captureRequestInfo(c *gin.Context, captureBody bool, releaseCfg config.RequestBodyReleaseConfig) (*RequestInfo, error) {
 	// Capture URL with sensitive query parameters masked
 	maskedQuery := util.MaskSensitiveQuery(c.Request.URL.RawQuery)
 	url := c.Request.URL.Path
@@ -134,19 +145,61 @@ func captureRequestInfo(c *gin.Context, captureBody bool) (*RequestInfo, error) 
 			return nil, err
 		}
 
-		// Restore the body for the actual request processing
-		c.Request.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
+		// Restore the body for the actual request processing, then drop this
+		// restored copy as soon as the handler consumes it.
+		c.Request.Body = cliproxyexecutor.NewReleasableReadCloser(bodyBytes, nil)
 		body = bodyBytes
 	}
 
-	return &RequestInfo{
+	requestInfo := &RequestInfo{
 		URL:       url,
 		Method:    method,
 		Headers:   headers,
 		Body:      body,
 		RequestID: logging.GetGinRequestID(c),
 		Timestamp: time.Now(),
-	}, nil
+		StreamHint: bytes.Contains(body, []byte(`"stream": true`)) ||
+			bytes.Contains(body, []byte(`"stream":true`)),
+	}
+	if ctrl := ensureRequestBodyReleaseController(c, releaseCfg, int64(len(body))); ctrl != nil && len(body) > 0 {
+		ctrl.RegisterReleaseCallback(func(placeholder []byte) {
+			requestInfo.SetBody(placeholder)
+		})
+	}
+	return requestInfo, nil
+}
+
+func ensureRequestBodyReleaseController(c *gin.Context, cfg config.RequestBodyReleaseConfig, bodySize int64) *cliproxyexecutor.RequestBodyReleaseController {
+	if c == nil || c.Request == nil {
+		return nil
+	}
+	cfg = config.NormalizeRequestBodyRelease(cfg)
+	if !cfg.Enable || cfg.AfterSeconds <= 0 {
+		return nil
+	}
+	if bodySize <= 0 && c.Request.ContentLength > 0 {
+		bodySize = c.Request.ContentLength
+	}
+	if bodySize <= 0 {
+		return nil
+	}
+	if cfg.MinBodyBytes > 0 && bodySize < cfg.MinBodyBytes {
+		return nil
+	}
+	if raw, exists := c.Get(cliproxyexecutor.BodyReleaseControllerMetadataKey); exists {
+		if ctrl, ok := raw.(*cliproxyexecutor.RequestBodyReleaseController); ok && ctrl != nil {
+			ctrl.StartTimer(time.Duration(cfg.AfterSeconds)*time.Second, c.Request.Context().Done())
+			return ctrl
+		}
+	}
+	placeholder := []byte(fmt.Sprintf("<request body released after %ds; original size %d bytes>", cfg.AfterSeconds, bodySize))
+	if cfg.LogOnly {
+		placeholder = []byte(fmt.Sprintf("<request body log released after %ds; original size %d bytes>", cfg.AfterSeconds, bodySize))
+	}
+	ctrl := cliproxyexecutor.NewRequestBodyReleaseControllerWithMode(bodySize, placeholder, cfg.LogOnly)
+	c.Set(cliproxyexecutor.BodyReleaseControllerMetadataKey, ctrl)
+	ctrl.StartTimer(time.Duration(cfg.AfterSeconds)*time.Second, c.Request.Context().Done())
+	return ctrl
 }
 
 // shouldLogRequest determines whether the request should be logged.
