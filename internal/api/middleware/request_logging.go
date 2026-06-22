@@ -5,7 +5,6 @@ package middleware
 
 import (
 	"bytes"
-	"fmt"
 	"io"
 	"net/http"
 	"strings"
@@ -174,7 +173,7 @@ func ensureRequestBodyReleaseController(c *gin.Context, cfg config.RequestBodyRe
 		return nil
 	}
 	cfg = config.NormalizeRequestBodyRelease(cfg)
-	if !cfg.Enable || cfg.AfterSeconds <= 0 {
+	if !cfg.Enable {
 		return nil
 	}
 	if bodySize <= 0 && c.Request.ContentLength > 0 {
@@ -188,17 +187,18 @@ func ensureRequestBodyReleaseController(c *gin.Context, cfg config.RequestBodyRe
 	}
 	if raw, exists := c.Get(cliproxyexecutor.BodyReleaseControllerMetadataKey); exists {
 		if ctrl, ok := raw.(*cliproxyexecutor.RequestBodyReleaseController); ok && ctrl != nil {
-			ctrl.StartTimer(time.Duration(cfg.AfterSeconds)*time.Second, c.Request.Context().Done())
+			if cfg.AfterSeconds > 0 {
+				ctrl.StartTimer(time.Duration(cfg.AfterSeconds)*time.Second, c.Request.Context().Done())
+			}
 			return ctrl
 		}
 	}
-	placeholder := []byte(fmt.Sprintf("<request body released after %ds; original size %d bytes>", cfg.AfterSeconds, bodySize))
-	if cfg.LogOnly {
-		placeholder = []byte(fmt.Sprintf("<request body log released after %ds; original size %d bytes>", cfg.AfterSeconds, bodySize))
-	}
+	placeholder := cliproxyexecutor.RequestBodyReleaseTimerPlaceholder(bodySize, cfg.AfterSeconds, cfg.LogOnly)
 	ctrl := cliproxyexecutor.NewRequestBodyReleaseControllerWithMode(bodySize, placeholder, cfg.LogOnly)
 	c.Set(cliproxyexecutor.BodyReleaseControllerMetadataKey, ctrl)
-	ctrl.StartTimer(time.Duration(cfg.AfterSeconds)*time.Second, c.Request.Context().Done())
+	if cfg.AfterSeconds > 0 {
+		ctrl.StartTimer(time.Duration(cfg.AfterSeconds)*time.Second, c.Request.Context().Done())
+	}
 	return ctrl
 }
 

@@ -277,14 +277,14 @@ func (h *BaseAPIHandler) attachRequestBodyRelease(ctx context.Context, rawJSON [
 		return ctx, nil
 	}
 	cfg := config.NormalizeRequestBodyRelease(h.Cfg.RequestBodyRelease)
-	if !cfg.Enable || cfg.LogOnly || cfg.AfterSeconds <= 0 {
+	if !cfg.Enable || cfg.LogOnly {
 		return ctx, nil
 	}
 	size := int64(len(rawJSON))
 	if cfg.MinBodyBytes > 0 && size < cfg.MinBodyBytes {
 		return ctx, nil
 	}
-	placeholder := []byte(fmt.Sprintf("<request body released after %ds; original size %d bytes>", cfg.AfterSeconds, size))
+	placeholder := coreexecutor.RequestBodyReleaseTimerPlaceholder(size, cfg.AfterSeconds, false)
 	ctrl := requestBodyReleaseControllerFromContext(ctx)
 	if ctrl == nil {
 		ctrl = coreexecutor.NewRequestBodyReleaseController(size, placeholder)
@@ -296,7 +296,9 @@ func (h *BaseAPIHandler) attachRequestBodyRelease(ctx context.Context, rawJSON [
 		ginCtx.Set(coreexecutor.BodyReleaseControllerMetadataKey, ctrl)
 	}
 	ctx = coreexecutor.WithRequestBodyReleaseController(ctx, ctrl)
-	ctrl.StartTimer(time.Duration(cfg.AfterSeconds)*time.Second, ctx.Done())
+	if cfg.AfterSeconds > 0 {
+		ctrl.StartTimer(time.Duration(cfg.AfterSeconds)*time.Second, ctx.Done())
+	}
 	return ctx, ctrl
 }
 

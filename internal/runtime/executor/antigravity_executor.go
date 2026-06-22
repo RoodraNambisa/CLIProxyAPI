@@ -1639,6 +1639,7 @@ attemptLoop:
 			}
 
 		streamSuccessExecuteStream:
+			helps.ReleaseRequestBodyAfterStreamEstablished(ctx, opts)
 			out := make(chan cliproxyexecutor.StreamChunk)
 			go func(resp *http.Response) {
 				defer close(out)

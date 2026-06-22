@@ -1170,20 +1170,27 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 		resultModel := m.stateModelForExecution(auth, routeModel, execModel, pooled)
 		execReq := req
 		execReq.Model = execModel
+		releaseMu := sync.Mutex{}
+		execOpts := opts
+		replayOpts := cliproxyexecutor.Options{Metadata: opts.Metadata}
 		unregisterRelease := registerRequestBodyReleaseCallback(ctx, opts, func([]byte) {
+			releaseMu.Lock()
+			defer releaseMu.Unlock()
+			req.Payload = nil
 			execReq.Payload = nil
 			opts.OriginalRequest = nil
+			execOpts.OriginalRequest = nil
 		})
-		if !requestBodyReplayable(ctx, opts) {
+		if !requestBodyReplayable(ctx, replayOpts) {
 			unregisterRelease()
 			if lastErr != nil {
 				return nil, lastErr
 			}
 			return nil, &Error{Code: "request_body_released", Message: "request body released; retry disabled"}
 		}
-		streamResult, errStream := executor.ExecuteStream(ctx, auth, execReq, opts)
-		unregisterRelease()
+		streamResult, errStream := executor.ExecuteStream(ctx, auth, execReq, execOpts)
 		if errStream != nil {
+			unregisterRelease()
 			if errCtx := ctx.Err(); errCtx != nil {
 				return nil, errCtx
 			}
@@ -1198,13 +1205,17 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 				return nil, errStream
 			}
 			lastErr = errStream
-			if !requestBodyReplayable(ctx, opts) {
+			if !requestBodyReplayable(ctx, replayOpts) {
 				return nil, errStream
 			}
 			continue
 		}
 
 		buffered, closed, bootstrapErr := readStreamBootstrap(ctx, streamResult.Chunks)
+		unregisterRelease()
+		releaseMu.Lock()
+		wrapOpts := opts
+		releaseMu.Unlock()
 		if bootstrapErr != nil {
 			if errCtx := ctx.Err(); errCtx != nil {
 				discardStreamChunks(streamResult.Chunks)
@@ -1221,7 +1232,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 				discardStreamChunks(streamResult.Chunks)
 				return nil, bootstrapErr
 			}
-			if idx < len(execModels)-1 && requestBodyReplayable(ctx, opts) {
+			if idx < len(execModels)-1 && requestBodyReplayable(ctx, replayOpts) {
 				rerr := &Error{Message: bootstrapErr.Error()}
 				if se, ok := errors.AsType[cliproxyexecutor.StatusError](bootstrapErr); ok && se != nil {
 					rerr.HTTPStatus = se.StatusCode()
@@ -1248,7 +1259,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			emptyErr := &Error{Code: "empty_stream", Message: "upstream stream closed before first payload", Retryable: true}
 			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: emptyErr}
 			m.MarkResult(ctx, result)
-			if idx < len(execModels)-1 && requestBodyReplayable(ctx, opts) {
+			if idx < len(execModels)-1 && requestBodyReplayable(ctx, replayOpts) {
 				lastErr = emptyErr
 				continue
 			}
@@ -1261,7 +1272,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			close(closedCh)
 			remaining = closedCh
 		}
-		return m.wrapStreamResult(ctx, auth.Clone(), affinityProviders, provider, routeModel, resultModel, opts, streamResult.Headers, buffered, remaining), nil
+		return m.wrapStreamResult(ctx, auth.Clone(), affinityProviders, provider, routeModel, resultModel, wrapOpts, streamResult.Headers, buffered, remaining), nil
 	}
 	if lastErr == nil {
 		lastErr = &Error{Code: "auth_not_found", Message: "no upstream model available"}

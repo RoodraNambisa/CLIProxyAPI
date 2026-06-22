@@ -671,6 +671,7 @@ func (e *GeminiVertexExecutor) executeStreamWithServiceAccount(ctx context.Conte
 		return nil, statusErr{code: httpResp.StatusCode, msg: string(b)}
 	}
 
+	helps.ReleaseRequestBodyAfterStreamEstablished(ctx, opts)
 	out := make(chan cliproxyexecutor.StreamChunk)
 	go func() {
 		defer close(out)
@@ -817,6 +818,7 @@ func (e *GeminiVertexExecutor) executeStreamWithAPIKey(ctx context.Context, auth
 		return nil, statusErr{code: httpResp.StatusCode, msg: string(b)}
 	}
 
+	helps.ReleaseRequestBodyAfterStreamEstablished(ctx, opts)
 	out := make(chan cliproxyexecutor.StreamChunk)
 	go func() {
 		defer close(out)

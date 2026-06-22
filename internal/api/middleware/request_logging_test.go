@@ -234,6 +234,26 @@ func TestCaptureRequestInfoLogOnlyReleaseUsesLogPlaceholder(t *testing.T) {
 	}
 }
 
+func TestEnsureRequestBodyReleaseControllerAllowsStreamOnlyRelease(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"test","input":"large"}`))
+	c.Request.ContentLength = int64(len(`{"model":"test","input":"large"}`))
+
+	ctrl := ensureRequestBodyReleaseController(c, config.RequestBodyReleaseConfig{
+		Enable:       true,
+		AfterSeconds: 0,
+		MinBodyBytes: 1,
+	}, c.Request.ContentLength)
+	if ctrl == nil {
+		t.Fatal("release controller = nil, want controller for stream-established release")
+	}
+	if ctrl.Released() {
+		t.Fatal("Released() = true before explicit release")
+	}
+}
+
 func TestCaptureRequestInfoRestoredBodyReleasesAfterHandlerRead(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	rec := httptest.NewRecorder()

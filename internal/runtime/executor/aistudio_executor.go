@@ -301,6 +301,9 @@ func (e *AIStudioExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth
 		}
 		return nil, statusErr{code: firstEvent.Status, msg: body.String()}
 	}
+	if firstEvent.Err == nil && firstEvent.Type != wsrelay.MessageTypeError && firstEvent.Type != wsrelay.MessageTypeStreamEnd {
+		helps.ReleaseRequestBodyAfterStreamEstablished(ctx, opts)
+	}
 	out := make(chan cliproxyexecutor.StreamChunk)
 	go func(first wsrelay.StreamEvent) {
 		defer close(out)

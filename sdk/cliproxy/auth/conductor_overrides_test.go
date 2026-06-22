@@ -209,6 +209,49 @@ func TestManagerExecuteStream_RequestBodyReleaseStopsBootstrapRetry(t *testing.T
 	}
 }
 
+func TestManagerExecuteStream_AsyncRequestBodyReleaseClearsWrappedOptions(t *testing.T) {
+	selector := &recordingBindSelector{}
+	m := NewManager(nil, selector, nil)
+	m.SetRetryConfig(0, 0, 0)
+
+	ctrl := cliproxyexecutor.NewRequestBodyReleaseController(1024, []byte("<released>"))
+	executor := &asyncReleaseStreamExecutor{id: "claude", ctrl: ctrl}
+	m.RegisterExecutor(executor)
+	auth := &Auth{ID: "auth-async-release", Provider: "claude"}
+	if _, errRegister := m.Register(context.Background(), auth); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient(auth.ID, "claude", []*registry.ModelInfo{{ID: "test-model"}})
+	t.Cleanup(func() { reg.UnregisterClient(auth.ID) })
+
+	payload := []byte(`{"model":"test-model","stream":true,"input":"` + strings.Repeat("x", 2048) + `"}`)
+	result, errExecute := m.ExecuteStream(context.Background(), []string{"claude"}, cliproxyexecutor.Request{
+		Model:   "test-model",
+		Payload: payload,
+	}, cliproxyexecutor.Options{
+		Stream:          true,
+		OriginalRequest: payload,
+		Metadata: map[string]any{
+			cliproxyexecutor.BodyReleaseControllerMetadataKey: ctrl,
+		},
+	})
+	if errExecute != nil {
+		t.Fatalf("ExecuteStream() error = %v", errExecute)
+	}
+	for chunk := range result.Chunks {
+		if chunk.Err != nil {
+			t.Fatalf("unexpected stream error: %v", chunk.Err)
+		}
+	}
+	if !ctrl.Released() {
+		t.Fatal("controller Released() = false")
+	}
+	if got := selector.BoundOriginalRequestLengths(); len(got) != 1 || got[0] != 0 {
+		t.Fatalf("bound OriginalRequest lengths = %v, want [0]", got)
+	}
+}
+
 func TestManagerExecute_WaitsForUpstreamRetryAfter429WithinMaxInterval(t *testing.T) {
 	m := NewManager(nil, nil, nil)
 	m.SetRetryConfig(1, 50*time.Millisecond, 0)
@@ -538,6 +581,16 @@ type releaseThenFailExecutor struct {
 	calls []string
 }
 
+type asyncReleaseStreamExecutor struct {
+	id   string
+	ctrl *cliproxyexecutor.RequestBodyReleaseController
+}
+
+type recordingBindSelector struct {
+	mu           sync.Mutex
+	originalLens []int
+}
+
 func (e *releaseThenFailExecutor) Identifier() string {
 	return e.id
 }
@@ -583,6 +636,58 @@ func (e *releaseThenFailExecutor) Calls() []string {
 	out := make([]string, len(e.calls))
 	copy(out, e.calls)
 	return out
+}
+
+func (e *asyncReleaseStreamExecutor) Identifier() string {
+	return e.id
+}
+
+func (e *asyncReleaseStreamExecutor) Execute(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	return cliproxyexecutor.Response{}, &Error{HTTPStatus: http.StatusNotImplemented, Message: "not implemented"}
+}
+
+func (e *asyncReleaseStreamExecutor) ExecuteStream(_ context.Context, auth *Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
+	ch := make(chan cliproxyexecutor.StreamChunk, 1)
+	go func() {
+		time.Sleep(10 * time.Millisecond)
+		if e.ctrl != nil {
+			e.ctrl.Release()
+		}
+		ch <- cliproxyexecutor.StreamChunk{Payload: []byte(auth.ID)}
+		close(ch)
+	}()
+	return &cliproxyexecutor.StreamResult{Chunks: ch}, nil
+}
+
+func (e *asyncReleaseStreamExecutor) Refresh(_ context.Context, auth *Auth) (*Auth, error) {
+	return auth, nil
+}
+
+func (e *asyncReleaseStreamExecutor) CountTokens(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	return cliproxyexecutor.Response{}, &Error{HTTPStatus: http.StatusNotImplemented, Message: "not implemented"}
+}
+
+func (e *asyncReleaseStreamExecutor) HttpRequest(context.Context, *Auth, *http.Request) (*http.Response, error) {
+	return nil, &Error{HTTPStatus: http.StatusNotImplemented, Message: "not implemented"}
+}
+
+func (s *recordingBindSelector) Pick(_ context.Context, _ string, _ string, _ cliproxyexecutor.Options, auths []*Auth) (*Auth, error) {
+	if len(auths) == 0 {
+		return nil, fmt.Errorf("no auths")
+	}
+	return auths[0], nil
+}
+
+func (s *recordingBindSelector) BindSession(_ context.Context, _ string, _ string, opts cliproxyexecutor.Options, _ string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.originalLens = append(s.originalLens, len(opts.OriginalRequest))
+}
+
+func (s *recordingBindSelector) BoundOriginalRequestLengths() []int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]int(nil), s.originalLens...)
 }
 
 func (e *authFallbackExecutor) Identifier() string {

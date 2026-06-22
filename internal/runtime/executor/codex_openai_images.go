@@ -182,6 +182,7 @@ func (e *CodexExecutor) executeOpenAIImageStream(ctx context.Context, auth *clip
 		return nil, err
 	}
 
+	helps.ReleaseRequestBodyAfterStreamEstablished(ctx, opts)
 	out := make(chan cliproxyexecutor.StreamChunk, cliproxyexecutor.StreamBufferSize)
 	go func() {
 		defer close(out)

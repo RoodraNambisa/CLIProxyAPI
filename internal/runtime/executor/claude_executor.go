@@ -485,6 +485,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		}
 		return nil, err
 	}
+	helps.ReleaseRequestBodyAfterStreamEstablished(ctx, opts)
 	out := make(chan cliproxyexecutor.StreamChunk)
 	go func() {
 		defer close(out)

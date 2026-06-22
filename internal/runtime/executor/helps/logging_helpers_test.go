@@ -78,3 +78,28 @@ func TestRequestBodyRefsReleaseKeepsSlimTranslationMetadata(t *testing.T) {
 		t.Fatalf("translated slim body retained large fields: %s", gotTranslated)
 	}
 }
+
+func TestReleaseRequestBodyAfterStreamEstablishedLogOnlyStaysReplayable(t *testing.T) {
+	ctrl := cliproxyexecutor.NewRequestBodyReleaseControllerWithMode(1024, []byte("<released>"), true)
+	opts := cliproxyexecutor.Options{
+		Metadata: map[string]any{
+			cliproxyexecutor.BodyReleaseControllerMetadataKey: ctrl,
+		},
+	}
+
+	if !ReleaseRequestBodyAfterStreamEstablished(context.Background(), opts) {
+		t.Fatal("ReleaseRequestBodyAfterStreamEstablished() = false, want true")
+	}
+	if !ctrl.Released() {
+		t.Fatal("controller Released() = false")
+	}
+	if got := string(ctrl.Placeholder()); !strings.Contains(got, "stream established") {
+		t.Fatalf("release placeholder = %q, want stream-established placeholder", got)
+	}
+	if !ctrl.Replayable() {
+		t.Fatal("controller Replayable() = false for log-only release")
+	}
+	if ReleaseRequestBodyAfterStreamEstablished(context.Background(), opts) {
+		t.Fatal("second ReleaseRequestBodyAfterStreamEstablished() = true, want false")
+	}
+}

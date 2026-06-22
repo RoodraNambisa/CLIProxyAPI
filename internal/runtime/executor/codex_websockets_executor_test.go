@@ -93,6 +93,78 @@ func TestCodexWebsocketsExecutePreservesPreviousResponseIDUpstream(t *testing.T)
 	}
 }
 
+func TestCodexWebsocketsExecuteStreamReleasesRequestBodyAfterFirstEvent(t *testing.T) {
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Errorf("upgrade websocket: %v", err)
+			return
+		}
+		defer func() { _ = conn.Close() }()
+
+		if _, _, errRead := conn.ReadMessage(); errRead != nil {
+			t.Errorf("read upstream websocket message: %v", errRead)
+			return
+		}
+		created := []byte(`{"type":"response.created","response":{"id":"resp-1"}}`)
+		if errWrite := conn.WriteMessage(websocket.TextMessage, created); errWrite != nil {
+			t.Errorf("write created websocket message: %v", errWrite)
+			return
+		}
+		completed := []byte(`{"type":"response.completed","response":{"id":"resp-1","output":[],"usage":{"input_tokens":0,"output_tokens":0,"total_tokens":0}}}`)
+		if errWrite := conn.WriteMessage(websocket.TextMessage, completed); errWrite != nil {
+			t.Errorf("write completed websocket message: %v", errWrite)
+		}
+	}))
+	defer server.Close()
+
+	ctrl := cliproxyexecutor.NewRequestBodyReleaseController(1024, []byte("<released>"))
+	exec := NewCodexWebsocketsExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{ID: "auth-1", Attributes: map[string]string{"api_key": "sk-test", "base_url": server.URL}}
+	req := cliproxyexecutor.Request{
+		Model:   "gpt-5-codex",
+		Payload: []byte(`{"model":"gpt-5-codex","input":[{"role":"user","content":"hi"}],"stream":true}`),
+	}
+	opts := cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("codex"),
+		Stream:       true,
+		Metadata: map[string]any{
+			cliproxyexecutor.BodyReleaseControllerMetadataKey: ctrl,
+		},
+	}
+
+	result, err := exec.ExecuteStream(context.Background(), auth, req, opts)
+	if err != nil {
+		t.Fatalf("ExecuteStream() error = %v", err)
+	}
+	deadline := time.After(5 * time.Second)
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for !ctrl.Released() {
+		select {
+		case chunk, ok := <-result.Chunks:
+			if !ok {
+				t.Fatal("stream closed before request body release")
+			}
+			if chunk.Err != nil {
+				t.Fatalf("unexpected stream error: %v", chunk.Err)
+			}
+		case <-ticker.C:
+		case <-deadline:
+			t.Fatal("timed out waiting for request body release")
+		}
+	}
+	if ctrl.Replayable() {
+		t.Fatal("request body controller Replayable() = true after websocket stream release")
+	}
+	for chunk := range result.Chunks {
+		if chunk.Err != nil {
+			t.Fatalf("unexpected stream error after release: %v", chunk.Err)
+		}
+	}
+}
+
 func TestCodexWebsocketsUpstreamDisconnectChanSignalsOnInvalidate(t *testing.T) {
 	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

@@ -33,6 +33,18 @@ func RequestBodyReplayable(ctx context.Context, opts cliproxyexecutor.Options) b
 	return true
 }
 
+// ReleaseRequestBodyAfterStreamEstablished releases request body references once
+// an upstream stream is established and later replay is no longer needed.
+func ReleaseRequestBodyAfterStreamEstablished(ctx context.Context, opts cliproxyexecutor.Options) bool {
+	if ctrl := cliproxyexecutor.RequestBodyReleaseControllerFromOptions(opts); ctrl != nil {
+		return ctrl.ReleaseWithPlaceholder(cliproxyexecutor.RequestBodyReleaseStreamPlaceholder(ctrl.OriginalSize(), ctrl.LogOnly()))
+	}
+	if ctrl := cliproxyexecutor.RequestBodyReleaseControllerFromContext(ctx); ctrl != nil {
+		return ctrl.ReleaseWithPlaceholder(cliproxyexecutor.RequestBodyReleaseStreamPlaceholder(ctrl.OriginalSize(), ctrl.LogOnly()))
+	}
+	return false
+}
+
 // SlimRequestBodyForTranslation drops prompt/content payloads and keeps only
 // request metadata used by response translators.
 func SlimRequestBodyForTranslation(body []byte) []byte {

@@ -2,6 +2,7 @@ package executor
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"sync"
 	"sync/atomic"
@@ -85,6 +86,37 @@ func NewRequestBodyReleaseControllerWithMode(originalSize int64, placeholder []b
 	}
 }
 
+// RequestBodyReleaseTimerPlaceholder formats the replacement text for timed releases.
+func RequestBodyReleaseTimerPlaceholder(originalSize int64, afterSeconds int, logOnly bool) []byte {
+	if originalSize < 0 {
+		originalSize = 0
+	}
+	if afterSeconds < 0 {
+		afterSeconds = 0
+	}
+	if afterSeconds == 0 {
+		if logOnly {
+			return []byte(fmt.Sprintf("<request body log released; original size %d bytes>", originalSize))
+		}
+		return []byte(fmt.Sprintf("<request body released; original size %d bytes>", originalSize))
+	}
+	if logOnly {
+		return []byte(fmt.Sprintf("<request body log released after %ds; original size %d bytes>", afterSeconds, originalSize))
+	}
+	return []byte(fmt.Sprintf("<request body released after %ds; original size %d bytes>", afterSeconds, originalSize))
+}
+
+// RequestBodyReleaseStreamPlaceholder formats the replacement text for stream-established releases.
+func RequestBodyReleaseStreamPlaceholder(originalSize int64, logOnly bool) []byte {
+	if originalSize < 0 {
+		originalSize = 0
+	}
+	if logOnly {
+		return []byte(fmt.Sprintf("<request body log released after stream established; original size %d bytes>", originalSize))
+	}
+	return []byte(fmt.Sprintf("<request body released after stream established; original size %d bytes>", originalSize))
+}
+
 // OriginalSize returns the captured request body size.
 func (c *RequestBodyReleaseController) OriginalSize() int64 {
 	if c == nil {
@@ -98,6 +130,8 @@ func (c *RequestBodyReleaseController) Placeholder() []byte {
 	if c == nil {
 		return nil
 	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	return append([]byte(nil), c.placeholder...)
 }
 
@@ -140,13 +174,22 @@ func (c *RequestBodyReleaseController) StartTimer(after time.Duration, done <-ch
 
 // Release invokes registered release callbacks and marks real releases as non-replayable.
 func (c *RequestBodyReleaseController) Release() bool {
+	return c.ReleaseWithPlaceholder(nil)
+}
+
+// ReleaseWithPlaceholder releases using a custom replacement text.
+func (c *RequestBodyReleaseController) ReleaseWithPlaceholder(placeholder []byte) bool {
 	if c == nil {
 		return false
 	}
-	if !c.released.CompareAndSwap(false, true) {
+	c.mu.Lock()
+	if c.released.Load() {
+		c.mu.Unlock()
 		return false
 	}
-	c.mu.Lock()
+	if len(placeholder) > 0 {
+		c.placeholder = append([]byte(nil), placeholder...)
+	}
 	callbacks := make([]func([]byte), 0, len(c.callbacks))
 	for _, callback := range c.callbacks {
 		if callback != nil {
@@ -154,10 +197,11 @@ func (c *RequestBodyReleaseController) Release() bool {
 		}
 	}
 	c.callbacks = nil
-	placeholder := append([]byte(nil), c.placeholder...)
+	placeholderCopy := append([]byte(nil), c.placeholder...)
+	c.released.Store(true)
 	c.mu.Unlock()
 	for _, callback := range callbacks {
-		callback(placeholder)
+		callback(placeholderCopy)
 	}
 	return true
 }

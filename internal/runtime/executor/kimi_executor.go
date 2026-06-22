@@ -297,6 +297,7 @@ func (e *KimiExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 		err = statusErr{code: httpResp.StatusCode, msg: string(b)}
 		return nil, err
 	}
+	helps.ReleaseRequestBodyAfterStreamEstablished(ctx, opts)
 	out := make(chan cliproxyexecutor.StreamChunk)
 	go func() {
 		defer close(out)

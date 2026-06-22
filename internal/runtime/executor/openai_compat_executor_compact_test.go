@@ -179,3 +179,86 @@ func TestOpenAICompatExecutorStreamSkipsKeepAliveUntilDataLine(t *testing.T) {
 		t.Fatalf("stream payload = %s", got.String())
 	}
 }
+
+func TestOpenAICompatExecutorStreamReleasesRequestBodyAfterHeaders(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		_, _ = w.Write([]byte(`data: {"id":"chatcmpl_1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"hello"},"finish_reason":null}]}` + "\n"))
+		_, _ = w.Write([]byte("data: [DONE]\n"))
+	}))
+	defer server.Close()
+
+	ctrl := cliproxyexecutor.NewRequestBodyReleaseController(1024, []byte("<released>"))
+	executor := NewOpenAICompatExecutor("openai-compatibility", &config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"base_url": server.URL + "/v1",
+		"api_key":  "test",
+	}}
+	payload := []byte(`{"model":"openrouter-model","messages":[{"role":"user","content":"hi"}],"stream":true}`)
+	result, err := executor.ExecuteStream(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "openrouter-model",
+		Payload: payload,
+	}, cliproxyexecutor.Options{
+		SourceFormat:    sdktranslator.FromString("openai"),
+		Stream:          true,
+		OriginalRequest: payload,
+		Metadata: map[string]any{
+			cliproxyexecutor.BodyReleaseControllerMetadataKey: ctrl,
+		},
+	})
+	if err != nil {
+		t.Fatalf("ExecuteStream error: %v", err)
+	}
+	if !ctrl.Released() {
+		t.Fatal("request body controller Released() = false after stream headers")
+	}
+	if got := string(ctrl.Placeholder()); !strings.Contains(got, "stream established") {
+		t.Fatalf("release placeholder = %q, want stream-established placeholder", got)
+	}
+	if ctrl.Replayable() {
+		t.Fatal("request body controller Replayable() = true after real stream release")
+	}
+	for chunk := range result.Chunks {
+		if chunk.Err != nil {
+			t.Fatalf("unexpected stream error: %v", chunk.Err)
+		}
+	}
+}
+
+func TestOpenAICompatExecutorStreamErrorDoesNotReleaseRequestBody(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, `{"error":{"message":"bad request"}}`, http.StatusBadRequest)
+	}))
+	defer server.Close()
+
+	ctrl := cliproxyexecutor.NewRequestBodyReleaseController(1024, []byte("<released>"))
+	executor := NewOpenAICompatExecutor("openai-compatibility", &config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"base_url": server.URL + "/v1",
+		"api_key":  "test",
+	}}
+	payload := []byte(`{"model":"openrouter-model","messages":[{"role":"user","content":"hi"}],"stream":true}`)
+	_, err := executor.ExecuteStream(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "openrouter-model",
+		Payload: payload,
+	}, cliproxyexecutor.Options{
+		SourceFormat:    sdktranslator.FromString("openai"),
+		Stream:          true,
+		OriginalRequest: payload,
+		Metadata: map[string]any{
+			cliproxyexecutor.BodyReleaseControllerMetadataKey: ctrl,
+		},
+	})
+	if err == nil {
+		t.Fatal("ExecuteStream error = nil, want upstream status error")
+	}
+	if ctrl.Released() {
+		t.Fatal("request body controller Released() = true on non-2xx response")
+	}
+	if !ctrl.Replayable() {
+		t.Fatal("request body controller Replayable() = false on non-2xx response")
+	}
+}

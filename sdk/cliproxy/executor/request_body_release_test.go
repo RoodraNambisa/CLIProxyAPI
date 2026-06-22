@@ -41,6 +41,18 @@ func TestRequestBodyReleaseControllerLogOnlyStaysReplayable(t *testing.T) {
 	}
 }
 
+func TestRequestBodyReleasePlaceholders(t *testing.T) {
+	if got := string(RequestBodyReleaseTimerPlaceholder(12, 0, false)); got != "<request body released; original size 12 bytes>" {
+		t.Fatalf("timer placeholder without timer = %q", got)
+	}
+	if got := string(RequestBodyReleaseTimerPlaceholder(12, 30, true)); got != "<request body log released after 30s; original size 12 bytes>" {
+		t.Fatalf("log timer placeholder = %q", got)
+	}
+	if got := string(RequestBodyReleaseStreamPlaceholder(12, false)); got != "<request body released after stream established; original size 12 bytes>" {
+		t.Fatalf("stream placeholder = %q", got)
+	}
+}
+
 func TestReleasableBytesReleaseDropsReference(t *testing.T) {
 	holder := NewReleasableBytes([]byte("large-body"))
 	if got := string(holder.Bytes()); got != "large-body" {
