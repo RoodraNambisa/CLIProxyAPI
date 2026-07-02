@@ -60,17 +60,18 @@ func patchCodexCompletedOutput(eventData []byte, outputItemsByIndex map[int64][]
 		return eventData
 	}
 
-	indexes := make([]int64, 0, len(outputItemsByIndex))
-	for idx := range outputItemsByIndex {
-		indexes = append(indexes, idx)
-	}
-	sort.Slice(indexes, func(i, j int) bool {
-		return indexes[i] < indexes[j]
-	})
-
 	items := make([][]byte, 0, len(outputItemsByIndex)+len(outputItemsFallback))
-	for _, idx := range indexes {
-		items = append(items, outputItemsByIndex[idx])
+	if len(outputItemsByIndex) > 0 {
+		indexes := make([]int64, 0, len(outputItemsByIndex))
+		for idx := range outputItemsByIndex {
+			indexes = append(indexes, idx)
+		}
+		sort.Slice(indexes, func(i, j int) bool {
+			return indexes[i] < indexes[j]
+		})
+		for _, idx := range indexes {
+			items = append(items, outputItemsByIndex[idx])
+		}
 	}
 	items = append(items, outputItemsFallback...)
 
@@ -539,16 +540,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 		eventType := gjson.GetBytes(eventData, "type").String()
 
 		if eventType == "response.output_item.done" {
-			itemResult := gjson.GetBytes(eventData, "item")
-			if !itemResult.Exists() || itemResult.Type != gjson.JSON {
-				continue
-			}
-			outputIndexResult := gjson.GetBytes(eventData, "output_index")
-			if outputIndexResult.Exists() {
-				outputItemsByIndex[outputIndexResult.Int()] = []byte(itemResult.Raw)
-			} else {
-				outputItemsFallback = append(outputItemsFallback, []byte(itemResult.Raw))
-			}
+			collectCodexOutputItemDone(eventData, outputItemsByIndex, &outputItemsFallback)
 			continue
 		}
 
@@ -567,28 +559,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 		}
 		publishCodexImageToolUsage(ctx, reporter, bodyRef.Bytes(), eventData)
 
-		completedData := eventData
-		outputResult := gjson.GetBytes(completedData, "response.output")
-		shouldPatchOutput := (!outputResult.Exists() || !outputResult.IsArray() || len(outputResult.Array()) == 0) && (len(outputItemsByIndex) > 0 || len(outputItemsFallback) > 0)
-		if shouldPatchOutput {
-			completedDataPatched := completedData
-			completedDataPatched, _ = sjson.SetRawBytes(completedDataPatched, "response.output", []byte(`[]`))
-
-			indexes := make([]int64, 0, len(outputItemsByIndex))
-			for idx := range outputItemsByIndex {
-				indexes = append(indexes, idx)
-			}
-			sort.Slice(indexes, func(i, j int) bool {
-				return indexes[i] < indexes[j]
-			})
-			for _, idx := range indexes {
-				completedDataPatched, _ = sjson.SetRawBytes(completedDataPatched, "response.output.-1", outputItemsByIndex[idx])
-			}
-			for _, item := range outputItemsFallback {
-				completedDataPatched, _ = sjson.SetRawBytes(completedDataPatched, "response.output.-1", item)
-			}
-			completedData = completedDataPatched
-		}
+		completedData := patchCodexCompletedOutput(eventData, outputItemsByIndex, outputItemsFallback)
 
 		var param any
 		clientCompletedData := applyCodexIdentityExposeResponsePayload(completedData, identityState)
@@ -1285,13 +1256,25 @@ func codexIdentityConfuseUUID(authID string, kind string, value string) string {
 }
 
 func applyCodexHeaders(r *http.Request, auth *cliproxyauth.Auth, token string, stream bool, cfg *config.Config) {
-	r.Header.Set("Content-Type", "application/json")
-	r.Header.Set("Authorization", "Bearer "+token)
-
 	var ginHeaders http.Header
 	if ginCtx, ok := r.Context().Value("gin").(*gin.Context); ok && ginCtx != nil && ginCtx.Request != nil {
 		ginHeaders = ginCtx.Request.Header
 	}
+	applyCodexHeadersFromSources(r, auth, token, stream, cfg, ginHeaders)
+}
+
+func applyCodexDirectImageHeaders(r *http.Request, auth *cliproxyauth.Auth, token string, stream bool, cfg *config.Config) {
+	var ginHeaders http.Header
+	if ginCtx, ok := r.Context().Value("gin").(*gin.Context); ok && ginCtx != nil && ginCtx.Request != nil {
+		ginHeaders = ginCtx.Request.Header.Clone()
+		ginHeaders.Del("User-Agent")
+	}
+	applyCodexHeadersFromSources(r, auth, token, stream, cfg, ginHeaders)
+}
+
+func applyCodexHeadersFromSources(r *http.Request, auth *cliproxyauth.Auth, token string, stream bool, cfg *config.Config, ginHeaders http.Header) {
+	r.Header.Set("Content-Type", "application/json")
+	r.Header.Set("Authorization", "Bearer "+token)
 
 	if ginHeaders.Get("X-Codex-Beta-Features") != "" {
 		r.Header.Set("X-Codex-Beta-Features", ginHeaders.Get("X-Codex-Beta-Features"))

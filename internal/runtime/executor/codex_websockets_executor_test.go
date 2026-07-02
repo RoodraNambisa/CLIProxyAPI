@@ -742,6 +742,31 @@ func TestApplyCodexHeadersUsesConfigUserAgentForOAuth(t *testing.T) {
 	}
 }
 
+func TestApplyCodexDirectImageHeadersIgnoresDownstreamUserAgent(t *testing.T) {
+	req, err := http.NewRequest(http.MethodPost, "https://example.com/images/generations", nil)
+	if err != nil {
+		t.Fatalf("NewRequest() error = %v", err)
+	}
+	auth := &cliproxyauth.Auth{Provider: "codex"}
+	req = req.WithContext(contextWithGinHeaders(map[string]string{
+		"User-Agent":          "client-ua",
+		"Version":             "0.115.0-alpha.27",
+		"X-Client-Request-Id": "req-1",
+	}))
+
+	applyCodexDirectImageHeaders(req, auth, "oauth-token", false, nil)
+
+	if got := req.Header.Get("User-Agent"); got == "client-ua" {
+		t.Fatalf("User-Agent = %s, want generated Codex default", got)
+	}
+	if got := req.Header.Get("Version"); got != "0.115.0-alpha.27" {
+		t.Fatalf("Version = %s, want %s", got, "0.115.0-alpha.27")
+	}
+	if got := req.Header.Get("X-Client-Request-Id"); got != "req-1" {
+		t.Fatalf("X-Client-Request-Id = %s, want req-1", got)
+	}
+}
+
 func TestApplyCodexHeadersDoesNotInjectChromeHeaders(t *testing.T) {
 	cfg := &config.Config{
 		CodexHeaderDefaults: config.CodexHeaderDefaults{

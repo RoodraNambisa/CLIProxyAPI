@@ -190,3 +190,25 @@ func TestApplyOAuthModelAlias_SuffixPreservation(t *testing.T) {
 		t.Errorf("applyOAuthModelAlias() model = %q, want %q", resolvedModel, "gemini-2.5-pro-exp-03-25(8192)")
 	}
 }
+
+func TestApplyOAuthModelAliasWithResult_ForceMapping(t *testing.T) {
+	t.Parallel()
+
+	aliases := map[string][]internalconfig.OAuthModelAlias{
+		"codex": {{Name: "gpt-5.5-upstream", Alias: "gpt-5.5-public", ForceMapping: true}},
+	}
+	mgr := NewManager(nil, nil, nil)
+	mgr.SetConfig(&internalconfig.Config{})
+	mgr.SetOAuthModelAlias(aliases)
+
+	result := mgr.applyOAuthModelAliasWithResult(createAuthForChannel("codex"), "gpt-5.5-public")
+	if result.UpstreamModel != "gpt-5.5-upstream" {
+		t.Fatalf("UpstreamModel = %q, want gpt-5.5-upstream", result.UpstreamModel)
+	}
+	if !result.ForceMapping {
+		t.Fatalf("ForceMapping = false, want true")
+	}
+	if result.OriginalAlias != "gpt-5.5-public" {
+		t.Fatalf("OriginalAlias = %q, want gpt-5.5-public", result.OriginalAlias)
+	}
+}

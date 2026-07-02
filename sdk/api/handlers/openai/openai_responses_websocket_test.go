@@ -811,7 +811,7 @@ func TestForwardResponsesWebsocketPreservesCompletedEvent(t *testing.T) {
 		close(errCh)
 
 		var timelineLog strings.Builder
-		completedOutput, err := (*OpenAIResponsesAPIHandler)(nil).forwardResponsesWebsocket(
+		completedOutput, _, err := (*OpenAIResponsesAPIHandler)(nil).forwardResponsesWebsocket(
 			ctx,
 			conn,
 			func(...interface{}) {},
@@ -865,6 +865,77 @@ func TestForwardResponsesWebsocketPreservesCompletedEvent(t *testing.T) {
 	}
 }
 
+func TestForwardResponsesWebsocketCapturesDoneOutput(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	serverErrCh := make(chan error, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := responsesWebsocketUpgrader.Upgrade(w, r, nil)
+		if err != nil {
+			serverErrCh <- err
+			return
+		}
+		defer func() {
+			if errClose := conn.Close(); errClose != nil {
+				serverErrCh <- errClose
+			}
+		}()
+
+		ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+		ctx.Request = r
+
+		data := make(chan []byte, 1)
+		errCh := make(chan *interfaces.ErrorMessage)
+		data <- []byte("data: {\"type\":\"response.done\",\"response\":{\"id\":\"resp-1\",\"output\":[{\"type\":\"message\",\"id\":\"out-done\"}]}}\n\n")
+		close(data)
+		close(errCh)
+
+		var timelineLog strings.Builder
+		completedOutput, _, err := (*OpenAIResponsesAPIHandler)(nil).forwardResponsesWebsocket(
+			ctx,
+			conn,
+			func(...interface{}) {},
+			data,
+			errCh,
+			&timelineLog,
+			"session-1",
+			newWebsocketToolPairState(),
+		)
+		if err != nil {
+			serverErrCh <- err
+			return
+		}
+		if gjson.GetBytes(completedOutput, "0.id").String() != "out-done" {
+			serverErrCh <- errors.New("done output not captured")
+			return
+		}
+		serverErrCh <- nil
+	}))
+	defer server.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if err != nil {
+		t.Fatalf("dial websocket: %v", err)
+	}
+	defer func() {
+		if errClose := conn.Close(); errClose != nil {
+			t.Fatalf("close websocket: %v", errClose)
+		}
+	}()
+
+	_, payload, errReadMessage := conn.ReadMessage()
+	if errReadMessage != nil {
+		t.Fatalf("read websocket message: %v", errReadMessage)
+	}
+	if gjson.GetBytes(payload, "type").String() != wsEventTypeDone {
+		t.Fatalf("payload type = %s, want %s", gjson.GetBytes(payload, "type").String(), wsEventTypeDone)
+	}
+	if errServer := <-serverErrCh; errServer != nil {
+		t.Fatalf("server error: %v", errServer)
+	}
+}
+
 func TestForwardResponsesWebsocketTreatsFailedEventAsTerminal(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
@@ -892,7 +963,8 @@ func TestForwardResponsesWebsocketTreatsFailedEventAsTerminal(t *testing.T) {
 		close(errCh)
 
 		var timelineLog strings.Builder
-		_, err = (*OpenAIResponsesAPIHandler)(nil).forwardResponsesWebsocket(
+		var forwardErrMsg *interfaces.ErrorMessage
+		_, forwardErrMsg, err = (*OpenAIResponsesAPIHandler)(nil).forwardResponsesWebsocket(
 			ctx,
 			conn,
 			func(...interface{}) {},
@@ -904,6 +976,22 @@ func TestForwardResponsesWebsocketTreatsFailedEventAsTerminal(t *testing.T) {
 		)
 		if err != nil {
 			serverErrCh <- err
+			return
+		}
+		if forwardErrMsg == nil {
+			serverErrCh <- errors.New("forward error message is nil")
+			return
+		}
+		if forwardErrMsg.StatusCode != http.StatusInternalServerError {
+			serverErrCh <- fmt.Errorf("status = %d, want %d", forwardErrMsg.StatusCode, http.StatusInternalServerError)
+			return
+		}
+		if forwardErrMsg.Error == nil || !strings.Contains(forwardErrMsg.Error.Error(), "server_error") {
+			serverErrCh <- fmt.Errorf("error = %v, want server_error", forwardErrMsg.Error)
+			return
+		}
+		if !shouldClearResponsesWebsocketPinnedAuth("ws-auth", "ws-auth", forwardErrMsg) {
+			serverErrCh <- errors.New("response.failed should clear pinned auth")
 			return
 		}
 		if strings.Contains(timelineLog.String(), "stream closed before response.completed") {
@@ -939,6 +1027,108 @@ func TestForwardResponsesWebsocketTreatsFailedEventAsTerminal(t *testing.T) {
 	}
 }
 
+func TestForwardResponsesWebsocketReturnsErrorPayloadMessage(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	serverErrCh := make(chan error, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := responsesWebsocketUpgrader.Upgrade(w, r, nil)
+		if err != nil {
+			serverErrCh <- err
+			return
+		}
+		defer func() {
+			errClose := conn.Close()
+			if errClose != nil {
+				serverErrCh <- errClose
+			}
+		}()
+
+		ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+		ctx.Request = r
+
+		data := make(chan []byte, 1)
+		errCh := make(chan *interfaces.ErrorMessage)
+		data <- []byte("data: {\"type\":\"error\",\"status\":429,\"error\":{\"message\":\"rate limited\"}}\n\n")
+		close(data)
+		close(errCh)
+
+		var timelineLog strings.Builder
+		var forwardErrMsg *interfaces.ErrorMessage
+		_, forwardErrMsg, err = (*OpenAIResponsesAPIHandler)(nil).forwardResponsesWebsocket(
+			ctx,
+			conn,
+			func(...interface{}) {},
+			data,
+			errCh,
+			&timelineLog,
+			"session-1",
+			newWebsocketToolPairState(),
+		)
+		if err != nil {
+			serverErrCh <- err
+			return
+		}
+		if forwardErrMsg == nil {
+			serverErrCh <- errors.New("forward error message is nil")
+			return
+		}
+		if forwardErrMsg.StatusCode != http.StatusTooManyRequests {
+			serverErrCh <- fmt.Errorf("status = %d, want %d", forwardErrMsg.StatusCode, http.StatusTooManyRequests)
+			return
+		}
+		if forwardErrMsg.Error == nil || !strings.Contains(forwardErrMsg.Error.Error(), "rate limited") {
+			serverErrCh <- fmt.Errorf("error = %v, want rate limited", forwardErrMsg.Error)
+			return
+		}
+		serverErrCh <- nil
+	}))
+	defer server.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if err != nil {
+		t.Fatalf("dial websocket: %v", err)
+	}
+	defer func() {
+		errClose := conn.Close()
+		if errClose != nil {
+			t.Fatalf("close websocket: %v", errClose)
+		}
+	}()
+
+	_, payload, errReadMessage := conn.ReadMessage()
+	if errReadMessage != nil {
+		t.Fatalf("read websocket message: %v", errReadMessage)
+	}
+	if gjson.GetBytes(payload, "type").String() != wsEventTypeError {
+		t.Fatalf("payload type = %s, want %s", gjson.GetBytes(payload, "type").String(), wsEventTypeError)
+	}
+
+	if errServer := <-serverErrCh; errServer != nil {
+		t.Fatalf("server error: %v", errServer)
+	}
+}
+
+func TestResponsesWebsocketDoneEventIsTerminal(t *testing.T) {
+	if !responsesWebsocketTerminalEvent(wsEventTypeDone) {
+		t.Fatalf("response.done should be treated as a terminal event")
+	}
+}
+
+func TestShouldClearResponsesWebsocketPinnedAuth(t *testing.T) {
+	if !shouldClearResponsesWebsocketPinnedAuth("ws-auth", "http-auth", nil) {
+		t.Fatalf("expected pinned auth to clear when final attempted auth differs")
+	}
+	if shouldClearResponsesWebsocketPinnedAuth("ws-auth", "ws-auth", nil) {
+		t.Fatalf("expected pinned auth to remain after same auth succeeds")
+	}
+	errMsg := &interfaces.ErrorMessage{StatusCode: http.StatusTooManyRequests, Error: errors.New("rate limited")}
+	if !shouldClearResponsesWebsocketPinnedAuth("ws-auth", "ws-auth", errMsg) {
+		t.Fatalf("expected pinned auth to clear on retryable websocket error")
+	}
+}
+
 func TestForwardResponsesWebsocketLogsAttemptedResponseOnWriteFailure(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
@@ -965,7 +1155,7 @@ func TestForwardResponsesWebsocketLogsAttemptedResponseOnWriteFailure(t *testing
 			return
 		}
 
-		_, err = (*OpenAIResponsesAPIHandler)(nil).forwardResponsesWebsocket(
+		_, _, err = (*OpenAIResponsesAPIHandler)(nil).forwardResponsesWebsocket(
 			ctx,
 			conn,
 			func(...interface{}) {},

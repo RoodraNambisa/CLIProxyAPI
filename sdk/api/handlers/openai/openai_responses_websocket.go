@@ -30,6 +30,7 @@ const (
 	wsRequestTypeAppend   = "response.append"
 	wsEventTypeError      = "error"
 	wsEventTypeCompleted  = "response.completed"
+	wsEventTypeDone       = "response.done"
 	wsEventTypeFailed     = "response.failed"
 	wsEventTypeIncomplete = "response.incomplete"
 	wsDoneMarker          = "[DONE]"
@@ -106,6 +107,7 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 	var lastRequest []byte
 	lastResponseOutput := []byte("[]")
 	pinnedAuthID := ""
+	lastAttemptedAuthID := ""
 
 	for {
 		msgType, payload, errReadMessage := conn.ReadMessage()
@@ -135,12 +137,6 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 			if pinnedAuth, ok := h.AuthManager.GetByID(pinnedAuthID); ok && pinnedAuth != nil {
 				allowIncrementalInputWithPreviousResponseID = websocketUpstreamSupportsIncrementalInput(pinnedAuth.Attributes, pinnedAuth.Metadata)
 			}
-		} else {
-			requestModelName := strings.TrimSpace(gjson.GetBytes(payload, "model").String())
-			if requestModelName == "" {
-				requestModelName = strings.TrimSpace(gjson.GetBytes(lastRequest, "model").String())
-			}
-			allowIncrementalInputWithPreviousResponseID = h.websocketUpstreamSupportsIncrementalInputForModel(requestModelName)
 		}
 
 		var requestJSON []byte
@@ -199,7 +195,9 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 		cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
 		cliCtx = cliproxyexecutor.WithDownstreamWebsocket(cliCtx)
 		cliCtx = handlers.WithExecutionSessionID(cliCtx, passthroughSessionID)
+		lastAttemptedAuthID = ""
 		if pinnedAuthID != "" {
+			lastAttemptedAuthID = pinnedAuthID
 			cliCtx = handlers.WithPinnedAuthID(cliCtx, pinnedAuthID)
 		} else {
 			cliCtx = handlers.WithSelectedAuthIDCallback(cliCtx, func(authID string) {
@@ -207,6 +205,7 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 				if authID == "" || h == nil || h.AuthManager == nil {
 					return
 				}
+				lastAttemptedAuthID = authID
 				selectedAuth, ok := h.AuthManager.GetByID(authID)
 				if !ok || selectedAuth == nil {
 					return
@@ -218,11 +217,14 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 		}
 		dataChan, _, errChan := h.ExecuteStreamWithAuthManager(cliCtx, h.HandlerType(), modelName, requestJSON, "")
 
-		completedOutput, errForward := h.forwardResponsesWebsocket(c, conn, cliCancel, dataChan, errChan, &wsTimelineLog, passthroughSessionID, toolPairState)
+		completedOutput, forwardErrMsg, errForward := h.forwardResponsesWebsocket(c, conn, cliCancel, dataChan, errChan, &wsTimelineLog, passthroughSessionID, toolPairState)
 		if errForward != nil {
 			wsTerminateErr = errForward
 			log.Warnf("responses websocket: forward failed id=%s error=%v", passthroughSessionID, errForward)
 			return
+		}
+		if shouldClearResponsesWebsocketPinnedAuth(pinnedAuthID, lastAttemptedAuthID, forwardErrMsg) {
+			pinnedAuthID = ""
 		}
 		lastResponseOutput = completedOutput
 	}
@@ -793,7 +795,7 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesWebsocket(
 	wsTimelineLog *strings.Builder,
 	sessionID string,
 	toolPairState *websocketToolPairState,
-) ([]byte, error) {
+) ([]byte, *interfaces.ErrorMessage, error) {
 	completed := false
 	completedOutput := []byte("[]")
 
@@ -801,7 +803,7 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesWebsocket(
 		select {
 		case <-c.Request.Context().Done():
 			cancel(c.Request.Context().Err())
-			return completedOutput, c.Request.Context().Err()
+			return completedOutput, nil, c.Request.Context().Err()
 		case errMsg, ok := <-errs:
 			if !ok {
 				errs = nil
@@ -826,7 +828,7 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesWebsocket(
 					// 	errWrite,
 					// )
 					cancel(errMsg.Error)
-					return completedOutput, errWrite
+					return completedOutput, errMsg, errWrite
 				}
 			}
 			if errMsg != nil {
@@ -834,7 +836,7 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesWebsocket(
 			} else {
 				cancel(nil)
 			}
-			return completedOutput, nil
+			return completedOutput, errMsg, nil
 		case chunk, ok := <-data:
 			if !ok {
 				if !completed {
@@ -860,23 +862,26 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesWebsocket(
 							errWrite,
 						)
 						cancel(errMsg.Error)
-						return completedOutput, errWrite
+						return completedOutput, errMsg, errWrite
 					}
 					cancel(errMsg.Error)
-					return completedOutput, nil
+					return completedOutput, errMsg, nil
 				}
 				cancel(nil)
-				return completedOutput, nil
+				return completedOutput, nil, nil
 			}
 
 			payloads := websocketJSONPayloadsFromChunk(chunk)
 			for i := range payloads {
 				recordResponsesWebsocketToolCallsFromPayload(toolPairState, payloads[i])
 				eventType := gjson.GetBytes(payloads[i], "type").String()
+				var payloadErrMsg *interfaces.ErrorMessage
 				if responsesWebsocketTerminalEvent(eventType) {
 					completed = true
-					if eventType == wsEventTypeCompleted {
+					if responsesWebsocketCompletionEvent(eventType) {
 						completedOutput = responseCompletedOutputFromPayload(payloads[i])
+					} else if eventType == wsEventTypeError || eventType == wsEventTypeFailed {
+						payloadErrMsg = responsesWebsocketErrorMessageFromPayload(payloads[i])
 					}
 				}
 				markAPIResponseTimestamp(c)
@@ -895,7 +900,11 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesWebsocket(
 						errWrite,
 					)
 					cancel(errWrite)
-					return completedOutput, errWrite
+					return completedOutput, nil, errWrite
+				}
+				if payloadErrMsg != nil {
+					cancel(payloadErrMsg.Error)
+					return completedOutput, payloadErrMsg, nil
 				}
 			}
 		}
@@ -904,11 +913,95 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesWebsocket(
 
 func responsesWebsocketTerminalEvent(eventType string) bool {
 	switch eventType {
-	case wsEventTypeCompleted, wsEventTypeFailed, wsEventTypeIncomplete, wsEventTypeError:
+	case wsEventTypeCompleted, wsEventTypeDone, wsEventTypeFailed, wsEventTypeIncomplete, wsEventTypeError:
 		return true
 	default:
 		return false
 	}
+}
+
+func responsesWebsocketCompletionEvent(eventType string) bool {
+	return eventType == wsEventTypeCompleted || eventType == wsEventTypeDone
+}
+
+func responsesWebsocketErrorMessageFromPayload(payload []byte) *interfaces.ErrorMessage {
+	eventType := gjson.GetBytes(payload, "type").String()
+	if eventType != wsEventTypeError && eventType != wsEventTypeFailed {
+		return nil
+	}
+	status := int(gjson.GetBytes(payload, "status").Int())
+	if status <= 0 {
+		status = int(gjson.GetBytes(payload, "error.status").Int())
+	}
+	if status <= 0 {
+		status = int(gjson.GetBytes(payload, "response.status_code").Int())
+	}
+	if status <= 0 {
+		status = int(gjson.GetBytes(payload, "response.error.status").Int())
+	}
+	if status <= 0 {
+		status = http.StatusInternalServerError
+	}
+	message := strings.TrimSpace(gjson.GetBytes(payload, "error.message").String())
+	if message == "" {
+		message = strings.TrimSpace(gjson.GetBytes(payload, "response.error.message").String())
+	}
+	if message == "" {
+		message = strings.TrimSpace(gjson.GetBytes(payload, "message").String())
+	}
+	if message == "" {
+		message = http.StatusText(status)
+	}
+	code := strings.TrimSpace(gjson.GetBytes(payload, "error.code").String())
+	if code == "" {
+		code = strings.TrimSpace(gjson.GetBytes(payload, "response.error.code").String())
+	}
+	if code != "" && !strings.Contains(strings.ToLower(message), strings.ToLower(code)) {
+		message = code + ": " + message
+	}
+	return &interfaces.ErrorMessage{StatusCode: status, Error: fmt.Errorf("%s", message)}
+}
+
+func shouldClearResponsesWebsocketPinnedAuth(pinnedAuthID, lastAttemptedAuthID string, errMsg *interfaces.ErrorMessage) bool {
+	pinnedAuthID = strings.TrimSpace(pinnedAuthID)
+	if pinnedAuthID == "" {
+		return false
+	}
+	lastAttemptedAuthID = strings.TrimSpace(lastAttemptedAuthID)
+	if lastAttemptedAuthID != "" && lastAttemptedAuthID != pinnedAuthID {
+		return true
+	}
+	return shouldReleaseResponsesWebsocketPinnedAuth(errMsg)
+}
+
+func shouldReleaseResponsesWebsocketPinnedAuth(errMsg *interfaces.ErrorMessage) bool {
+	if errMsg == nil {
+		return false
+	}
+	switch errMsg.StatusCode {
+	case http.StatusUnauthorized, http.StatusPaymentRequired, http.StatusForbidden, http.StatusRequestTimeout, http.StatusTooManyRequests, http.StatusInternalServerError, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+		return true
+	}
+	if errMsg.Error == nil {
+		return false
+	}
+	message := strings.ToLower(strings.TrimSpace(errMsg.Error.Error()))
+	if message == "" {
+		return false
+	}
+	retryableMarkers := []string{
+		"stream closed before response.completed",
+		"previous_response_not_found",
+		"ws_failed",
+		"upstream stream closed before first payload",
+		"empty_stream",
+	}
+	for _, marker := range retryableMarkers {
+		if strings.Contains(message, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 func responseCompletedOutputFromPayload(payload []byte) []byte {

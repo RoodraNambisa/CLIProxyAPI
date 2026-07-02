@@ -848,9 +848,56 @@ func (m *Manager) preparedExecutionModels(auth *Auth, routeModel string, opts cl
 	return m.filterExecutionModels(auth, routeModel, candidates, pooled), pooled
 }
 
+func (m *Manager) preparedExecutionModelsWithAlias(auth *Auth, routeModel string, opts cliproxyexecutor.Options) ([]string, bool, OAuthModelAliasResult) {
+	executionRouteModel := effectiveExecutionRouteModel(routeModel, opts)
+	models, pooled := m.preparedExecutionModels(auth, routeModel, opts)
+	return models, pooled, m.resolveExecutionAliasResult(auth, executionRouteModel)
+}
+
+func (m *Manager) resolveExecutionAliasResult(auth *Auth, executionRouteModel string) OAuthModelAliasResult {
+	requestedModel := rewriteModelForAuth(executionRouteModel, auth)
+	if isAPIKeyAuth(auth) {
+		return m.resolveAPIKeyModelAliasWithResult(auth, requestedModel)
+	}
+	return m.applyOAuthModelAliasWithResult(auth, requestedModel)
+}
+
 func (m *Manager) prepareExecutionModels(auth *Auth, routeModel string, opts cliproxyexecutor.Options) []string {
 	models, _ := m.preparedExecutionModels(auth, routeModel, opts)
 	return models
+}
+
+func rewriteForceMappedResponse(resp *cliproxyexecutor.Response, aliasResult OAuthModelAliasResult) {
+	if resp == nil || !aliasResult.ForceMapping || strings.TrimSpace(aliasResult.OriginalAlias) == "" {
+		return
+	}
+	resp.Payload = rewriteModelInResponse(resp.Payload, aliasResult.OriginalAlias)
+}
+
+func rewriteForceMappedStreamChunk(rewriter *StreamRewriter, payload []byte) []byte {
+	if rewriter == nil || len(payload) == 0 {
+		return payload
+	}
+	rewritten := rewriter.RewriteChunk(payload)
+	if len(rewritten) > 0 {
+		return rewritten
+	}
+	if len(rewriter.pendingBuf) > 0 {
+		return nil
+	}
+	if bytes.Contains(payload, []byte("data:")) {
+		if lineWise := rewriteSSEPayloadLines(payload, rewriter.options.RewriteModel); len(lineWise) > 0 {
+			return lineWise
+		}
+	}
+	return payload
+}
+
+func finishForceMappedStreamChunks(rewriter *StreamRewriter) []byte {
+	if rewriter == nil {
+		return nil
+	}
+	return rewriter.Finish()
 }
 
 func (m *Manager) availableAuthsForRouteModel(auths []*Auth, provider, routeModel string, opts cliproxyexecutor.Options, now time.Time) ([]*Auth, error) {
@@ -1105,12 +1152,16 @@ func readStreamBootstrap(ctx context.Context, ch <-chan cliproxyexecutor.StreamC
 	}
 }
 
-func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, affinityProviders []string, provider, routeModel, resultModel string, opts cliproxyexecutor.Options, headers http.Header, buffered []cliproxyexecutor.StreamChunk, remaining <-chan cliproxyexecutor.StreamChunk) *cliproxyexecutor.StreamResult {
+func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, affinityProviders []string, provider, routeModel, resultModel string, opts cliproxyexecutor.Options, headers http.Header, buffered []cliproxyexecutor.StreamChunk, remaining <-chan cliproxyexecutor.StreamChunk, aliasResult OAuthModelAliasResult) *cliproxyexecutor.StreamResult {
 	out := make(chan cliproxyexecutor.StreamChunk, cliproxyexecutor.StreamBufferSize)
 	go func() {
 		defer close(out)
 		var failed bool
 		forward := true
+		var rewriter *StreamRewriter
+		if aliasResult.ForceMapping && strings.TrimSpace(aliasResult.OriginalAlias) != "" {
+			rewriter = NewStreamRewriter(StreamRewriteOptions{RewriteModel: aliasResult.OriginalAlias})
+		}
 		emit := func(chunk cliproxyexecutor.StreamChunk) bool {
 			if chunk.Err != nil && !failed {
 				failed = true
@@ -1122,6 +1173,13 @@ func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, affinityProv
 			}
 			if !forward {
 				return false
+			}
+			if chunk.Err == nil && len(chunk.Payload) > 0 {
+				payload := rewriteForceMappedStreamChunk(rewriter, chunk.Payload)
+				if len(payload) == 0 {
+					return true
+				}
+				chunk.Payload = payload
 			}
 			if ctx == nil {
 				out <- chunk
@@ -1147,6 +1205,11 @@ func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, affinityProv
 				return
 			}
 		}
+		if tail := finishForceMappedStreamChunks(rewriter); len(tail) > 0 {
+			if ok := emit(cliproxyexecutor.StreamChunk{Payload: tail}); !ok {
+				return
+			}
+		}
 		if !failed {
 			m.MarkResult(ctx, Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: true})
 			m.bindSessionAffinity(ctx, affinityProviders, routeModel, opts, auth.ID)
@@ -1155,7 +1218,7 @@ func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, affinityProv
 	return &cliproxyexecutor.StreamResult{Headers: headers, Chunks: out}
 }
 
-func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor ProviderExecutor, auth *Auth, affinityProviders []string, provider string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, routeModel string, execModels []string, pooled bool) (*cliproxyexecutor.StreamResult, error) {
+func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor ProviderExecutor, auth *Auth, affinityProviders []string, provider string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, routeModel string, execModels []string, pooled bool, aliasResult OAuthModelAliasResult) (*cliproxyexecutor.StreamResult, error) {
 	if executor == nil {
 		return nil, &Error{Code: "executor_not_found", Message: "executor not registered"}
 	}
@@ -1272,7 +1335,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			close(closedCh)
 			remaining = closedCh
 		}
-		return m.wrapStreamResult(ctx, auth.Clone(), affinityProviders, provider, routeModel, resultModel, wrapOpts, streamResult.Headers, buffered, remaining), nil
+		return m.wrapStreamResult(ctx, auth.Clone(), affinityProviders, provider, routeModel, resultModel, wrapOpts, streamResult.Headers, buffered, remaining, aliasResult), nil
 	}
 	if lastErr == nil {
 		lastErr = &Error{Code: "auth_not_found", Message: "no upstream model available"}
@@ -1917,7 +1980,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			execCtx = context.WithValue(execCtx, "cliproxy.roundtripper", rt)
 		}
 
-		models, pooled := m.preparedExecutionModels(auth, routeModel, opts)
+		models, pooled, aliasResult := m.preparedExecutionModelsWithAlias(auth, routeModel, opts)
 		if len(models) == 0 {
 			if strictSessionAffinity {
 				return cliproxyexecutor.Response{}, newStrictSessionAffinityError("session bound auth has no executable models")
@@ -1968,6 +2031,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			}
 			m.MarkResult(execCtx, result)
 			m.bindSessionAffinity(ctx, providers, routeModel, opts, auth.ID)
+			rewriteForceMappedResponse(&resp, aliasResult)
 			return resp, nil
 		}
 		if authErr != nil {
@@ -2142,7 +2206,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			execCtx = context.WithValue(execCtx, roundTripperContextKey{}, rt)
 			execCtx = context.WithValue(execCtx, "cliproxy.roundtripper", rt)
 		}
-		models, pooled := m.preparedExecutionModels(auth, routeModel, opts)
+		models, pooled, aliasResult := m.preparedExecutionModelsWithAlias(auth, routeModel, opts)
 		if len(models) == 0 {
 			if strictSessionAffinity {
 				return nil, newStrictSessionAffinityError("session bound auth has no executable models")
@@ -2159,7 +2223,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			unregisterAttemptRelease()
 			return nil, &Error{Code: "request_body_released", Message: "request body released; retry disabled"}
 		}
-		streamResult, errStream := m.executeStreamWithModelPool(execCtx, executor, auth, providers, provider, execReq, opts, routeModel, models, pooled)
+		streamResult, errStream := m.executeStreamWithModelPool(execCtx, executor, auth, providers, provider, execReq, opts, routeModel, models, pooled, aliasResult)
 		unregisterAttemptRelease()
 		if errStream != nil {
 			if errCtx := execCtx.Err(); errCtx != nil {
@@ -2413,7 +2477,8 @@ func (m *Manager) tryAntigravityCreditsExecuteStream(ctx context.Context, req cl
 		if len(models) == 0 {
 			continue
 		}
-		result, errStream := m.executeStreamWithModelPool(creditsCtx, c.executor, c.auth, []string{c.provider}, c.provider, req, creditsOpts, routeModel, models, len(models) > 1)
+		aliasResult := m.resolveExecutionAliasResult(c.auth, effectiveExecutionRouteModel(routeModel, creditsOpts))
+		result, errStream := m.executeStreamWithModelPool(creditsCtx, c.executor, c.auth, []string{c.provider}, c.provider, req, creditsOpts, routeModel, models, len(models) > 1, aliasResult)
 		if errStream != nil {
 			continue
 		}
@@ -2582,6 +2647,60 @@ func (m *Manager) applyAPIKeyModelAlias(auth *Auth, requestedModel string) strin
 	return requestedModel
 }
 
+func (m *Manager) resolveAPIKeyModelAliasWithResult(auth *Auth, requestedModel string) OAuthModelAliasResult {
+	if m == nil || auth == nil {
+		return OAuthModelAliasResult{}
+	}
+	requestedModel = strings.TrimSpace(requestedModel)
+	if requestedModel == "" {
+		return OAuthModelAliasResult{}
+	}
+	cfg, _ := m.runtimeConfig.Load().(*internalconfig.Config)
+	if cfg == nil {
+		cfg = &internalconfig.Config{}
+	}
+	provider := strings.ToLower(strings.TrimSpace(auth.Provider))
+	var models []modelAliasEntry
+	switch provider {
+	case "gemini":
+		if entry := resolveGeminiAPIKeyConfig(cfg, auth); entry != nil {
+			models = asModelAliasEntries(entry.Models)
+		}
+	case "claude":
+		if entry := resolveClaudeAPIKeyConfig(cfg, auth); entry != nil {
+			models = asModelAliasEntries(entry.Models)
+		}
+	case "codex":
+		if entry := resolveCodexAPIKeyConfig(cfg, auth); entry != nil {
+			models = asModelAliasEntries(entry.Models)
+		}
+	case "vertex":
+		if entry := resolveVertexAPIKeyConfig(cfg, auth); entry != nil {
+			models = asModelAliasEntries(entry.Models)
+		}
+	default:
+		providerKey := ""
+		compatName := ""
+		if auth.Attributes != nil {
+			providerKey = strings.TrimSpace(auth.Attributes["provider_key"])
+			compatName = strings.TrimSpace(auth.Attributes["compat_name"])
+		}
+		if compatName != "" || strings.EqualFold(strings.TrimSpace(auth.Provider), "openai-compatibility") {
+			if entry := resolveOpenAICompatConfig(cfg, providerKey, compatName, auth.Provider); entry != nil {
+				models = asModelAliasEntries(entry.Models)
+			}
+		}
+	}
+	if len(models) == 0 {
+		return OAuthModelAliasResult{UpstreamModel: requestedModel}
+	}
+	result := resolveModelAliasResultFromConfigModels(requestedModel, models)
+	if strings.TrimSpace(result.UpstreamModel) == "" {
+		return OAuthModelAliasResult{UpstreamModel: requestedModel}
+	}
+	return result
+}
+
 // APIKeyConfigEntry is a generic interface for API key configurations.
 type APIKeyConfigEntry interface {
 	GetAPIKey() string
@@ -2737,6 +2856,7 @@ func resolveOpenAICompatConfig(cfg *internalconfig.Config, providerKey, compatNa
 func asModelAliasEntries[T interface {
 	GetName() string
 	GetAlias() string
+	GetForceMapping() bool
 }](models []T) []modelAliasEntry {
 	if len(models) == 0 {
 		return nil
