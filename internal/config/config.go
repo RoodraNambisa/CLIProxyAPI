@@ -314,7 +314,8 @@ type NonRetryableErrorRule struct {
 
 // AuthModelExclusionRule removes models from credentials that match non-secret auth metadata.
 type AuthModelExclusionRule struct {
-	// Models are route model IDs to remove before applying model prefixes.
+	// Models are route model IDs to remove before applying model prefixes. Use "-all"
+	// as the first item and "+model-id" entries to keep only selected models.
 	Models []string `yaml:"models" json:"models"`
 	// Providers optionally restricts the rule to provider keys.
 	Providers []string `yaml:"providers,omitempty" json:"providers,omitempty"`

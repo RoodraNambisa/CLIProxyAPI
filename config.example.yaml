@@ -129,9 +129,11 @@ non-retryable-errors:
 auth-model-exclusions: []
 # auth-model-exclusions:
 #   - models: ["gpt-image-2"]
-#     priorities: [-1]
+#     priorities: [-1, 0]
 #   - models: ["gpt-image-2"]
-#     keyword-contains: ["free"]
+#     keyword-contains: ["free", "trial"]
+#   - models: ["-all", "+gpt-5.5"]
+#     priorities: [-1]
 
 # Release retained request body copies after a request has been waiting for N seconds.
 # log-only=true only drops request log/upstream log copies and does not affect retries.

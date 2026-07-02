@@ -328,6 +328,178 @@ func TestRegisterModelsForAuth_AuthModelExclusionsApplyToOpenAICompatibility(t *
 	}
 }
 
+func TestRegisterModelsForAuth_AuthModelExclusionsAllAllowsSelectedCodexModel(t *testing.T) {
+	service := &Service{
+		cfg: &config.Config{
+			SDKConfig: config.SDKConfig{
+				Images: config.ImagesConfig{ImageModel: "gpt-image-2"},
+			},
+			AuthModelExclusions: []config.AuthModelExclusionRule{
+				{Models: []string{"", " -all ", "+gpt-5.5"}, Priorities: []int{-1}},
+			},
+		},
+	}
+	auth := &coreauth.Auth{
+		ID:       "auth-codex-model-exclusion-all-allow",
+		Provider: "codex",
+		Status:   coreauth.StatusActive,
+		Attributes: map[string]string{
+			"plan_type": "plus",
+			"priority":  "-1",
+		},
+	}
+	reg := GlobalModelRegistry()
+	reg.UnregisterClient(auth.ID)
+	t.Cleanup(func() {
+		reg.UnregisterClient(auth.ID)
+	})
+
+	service.registerModelsForAuth(auth)
+
+	assertOnlyRegisteredModels(t, registry.GetGlobalRegistry().GetModelsForClient(auth.ID), "gpt-5.5")
+}
+
+func TestRegisterModelsForAuth_AuthModelExclusionsAllWithoutAllowedModelsClearsCodexModels(t *testing.T) {
+	service := &Service{
+		cfg: &config.Config{
+			AuthModelExclusions: []config.AuthModelExclusionRule{
+				{Models: []string{"-all"}, Priorities: []int{-1}},
+			},
+		},
+	}
+	auth := &coreauth.Auth{
+		ID:       "auth-codex-model-exclusion-all-empty",
+		Provider: "codex",
+		Status:   coreauth.StatusActive,
+		Attributes: map[string]string{
+			"plan_type": "plus",
+			"priority":  "-1",
+		},
+	}
+	reg := GlobalModelRegistry()
+	reg.UnregisterClient(auth.ID)
+	t.Cleanup(func() {
+		reg.UnregisterClient(auth.ID)
+	})
+
+	service.registerModelsForAuth(auth)
+
+	if models := registry.GetGlobalRegistry().GetModelsForClient(auth.ID); len(models) != 0 {
+		t.Fatalf("expected all matched codex models to be removed, got %v", registeredModelIDs(models))
+	}
+}
+
+func TestRegisterModelsForAuth_AuthModelExclusionsAllMustBeFirstEffectiveModel(t *testing.T) {
+	service := &Service{
+		cfg: &config.Config{
+			SDKConfig: config.SDKConfig{
+				Images: config.ImagesConfig{ImageModel: "gpt-image-2"},
+			},
+			AuthModelExclusions: []config.AuthModelExclusionRule{
+				{Models: []string{"gpt-image-2", "-all", "+gpt-5.5"}, Priorities: []int{-1}},
+			},
+		},
+	}
+	auth := &coreauth.Auth{
+		ID:       "auth-codex-model-exclusion-all-not-first",
+		Provider: "codex",
+		Status:   coreauth.StatusActive,
+		Attributes: map[string]string{
+			"plan_type": "plus",
+			"priority":  "-1",
+		},
+	}
+	reg := GlobalModelRegistry()
+	reg.UnregisterClient(auth.ID)
+	t.Cleanup(func() {
+		reg.UnregisterClient(auth.ID)
+	})
+
+	service.registerModelsForAuth(auth)
+
+	models := registry.GetGlobalRegistry().GetModelsForClient(auth.ID)
+	if containsRegisteredModel(models, "gpt-image-2") {
+		t.Fatal("expected ordinary exclusion to remove gpt-image-2")
+	}
+	if containsRegisteredModel(models, "gpt-5.5") {
+		t.Fatal("expected +gpt-5.5 to be treated as an ordinary exclusion without leading -all")
+	}
+	if len(models) == 0 {
+		t.Fatal("expected other codex models to remain when -all is not first")
+	}
+}
+
+func TestRegisterModelsForAuth_AuthModelExclusionsAllApplyBeforePrefix(t *testing.T) {
+	service := &Service{
+		cfg: &config.Config{
+			SDKConfig: config.SDKConfig{
+				ForceModelPrefix: true,
+			},
+			AuthModelExclusions: []config.AuthModelExclusionRule{
+				{Models: []string{"-all", "+gpt-5.5"}, Priorities: []int{0}},
+			},
+		},
+	}
+	auth := &coreauth.Auth{
+		ID:       "auth-codex-model-exclusion-all-prefix",
+		Provider: "codex",
+		Prefix:   "team-a",
+		Status:   coreauth.StatusActive,
+		Attributes: map[string]string{
+			"plan_type": "plus",
+			"priority":  "0",
+		},
+	}
+	reg := GlobalModelRegistry()
+	reg.UnregisterClient(auth.ID)
+	t.Cleanup(func() {
+		reg.UnregisterClient(auth.ID)
+	})
+
+	service.registerModelsForAuth(auth)
+
+	assertOnlyRegisteredModels(t, registry.GetGlobalRegistry().GetModelsForClient(auth.ID), "team-a/gpt-5.5")
+}
+
+func TestRegisterModelsForAuth_AuthModelExclusionsAllApplyToOpenAICompatibility(t *testing.T) {
+	service := &Service{
+		cfg: &config.Config{
+			OpenAICompatibility: []config.OpenAICompatibility{
+				{
+					Name:    "compat-images-all",
+					BaseURL: "https://example.invalid/v1",
+					Models: []config.OpenAICompatibilityModel{
+						{Name: "gpt-image-2"},
+						{Name: "gpt-5.5"},
+						{Name: "gpt-5.6"},
+					},
+				},
+			},
+			AuthModelExclusions: []config.AuthModelExclusionRule{
+				{Models: []string{"-all", "+gpt-5.5"}, Priorities: []int{-1}},
+			},
+		},
+	}
+	auth := &coreauth.Auth{
+		ID:       "auth-openai-compat-model-exclusion-all",
+		Provider: "openai-compatibility",
+		Label:    "compat-images-all",
+		Status:   coreauth.StatusActive,
+		Attributes: map[string]string{
+			"priority": "-1",
+		},
+	}
+	reg := GlobalModelRegistry()
+	reg.UnregisterClient(auth.ID)
+	t.Cleanup(func() {
+		reg.UnregisterClient(auth.ID)
+	})
+
+	service.registerModelsForAuth(auth)
+
+	assertOnlyRegisteredModels(t, registry.GetGlobalRegistry().GetModelsForClient(auth.ID), "gpt-5.5")
+}
+
 func TestRegisterModelsForAuth_CodexNativeImageModelsWhenEnabled(t *testing.T) {
 	testCases := []struct {
 		name       string
@@ -623,4 +795,51 @@ func TestRegisterModelsForAuth_CodexCustomModelsApplyOAuthAlias(t *testing.T) {
 	if !containsRegisteredModel(models, "codex-latest") {
 		t.Fatal("expected alias for custom model to be registered")
 	}
+}
+
+func assertOnlyRegisteredModels(t *testing.T, models []*registry.ModelInfo, wants ...string) {
+	t.Helper()
+	wantSet := make(map[string]struct{}, len(wants))
+	for _, want := range wants {
+		want = strings.ToLower(strings.TrimSpace(want))
+		if want != "" {
+			wantSet[want] = struct{}{}
+		}
+	}
+	gotSet := make(map[string]struct{}, len(models))
+	for _, model := range models {
+		if model == nil {
+			continue
+		}
+		modelID := strings.ToLower(strings.TrimSpace(model.ID))
+		if modelID == "" {
+			continue
+		}
+		gotSet[modelID] = struct{}{}
+		if _, ok := wantSet[modelID]; !ok {
+			t.Fatalf("unexpected model %q, got all models %v, want only %v", model.ID, registeredModelIDs(models), wants)
+		}
+	}
+	if len(gotSet) != len(wantSet) {
+		t.Fatalf("registered models = %v, want only %v", registeredModelIDs(models), wants)
+	}
+	for want := range wantSet {
+		if _, ok := gotSet[want]; !ok {
+			t.Fatalf("registered models = %v, want %q", registeredModelIDs(models), want)
+		}
+	}
+}
+
+func registeredModelIDs(models []*registry.ModelInfo) []string {
+	ids := make([]string, 0, len(models))
+	for _, model := range models {
+		if model == nil {
+			continue
+		}
+		modelID := strings.TrimSpace(model.ID)
+		if modelID != "" {
+			ids = append(ids, modelID)
+		}
+	}
+	return ids
 }

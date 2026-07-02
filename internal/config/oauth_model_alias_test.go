@@ -207,10 +207,11 @@ func TestNormalizeAuthModelExclusionRules(t *testing.T) {
 		{Models: []string{"gpt-image-2"}},
 		{Models: []string{" gpt-image-2 ", "GPT-IMAGE-2", ""}, Priorities: []int{-1, -1, 0}},
 		{Models: []string{"gpt-image-1.5"}, Providers: []string{" CoDeX ", "codex"}, KeywordContains: []string{" Free ", "free", ""}},
+		{Models: []string{" -ALL ", "+GPT-5.5", "+gpt-5.5"}, Priorities: []int{1, 1}, KeywordContains: []string{" Team ", "team"}},
 		{Priorities: []int{0}},
 	})
-	if len(got) != 2 {
-		t.Fatalf("rules = %#v, want 2 valid rules", got)
+	if len(got) != 3 {
+		t.Fatalf("rules = %#v, want 3 valid rules", got)
 	}
 	if len(got[0].Models) != 1 || got[0].Models[0] != "gpt-image-2" {
 		t.Fatalf("first models = %#v", got[0].Models)
@@ -223,5 +224,14 @@ func TestNormalizeAuthModelExclusionRules(t *testing.T) {
 	}
 	if len(got[1].KeywordContains) != 1 || got[1].KeywordContains[0] != "free" {
 		t.Fatalf("second keywords = %#v", got[1].KeywordContains)
+	}
+	if len(got[2].Models) != 2 || got[2].Models[0] != "-all" || got[2].Models[1] != "+gpt-5.5" {
+		t.Fatalf("third models = %#v", got[2].Models)
+	}
+	if len(got[2].Priorities) != 1 || got[2].Priorities[0] != 1 {
+		t.Fatalf("third priorities = %#v", got[2].Priorities)
+	}
+	if len(got[2].KeywordContains) != 1 || got[2].KeywordContains[0] != "team" {
+		t.Fatalf("third keywords = %#v", got[2].KeywordContains)
 	}
 }

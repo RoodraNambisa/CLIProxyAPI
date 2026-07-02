@@ -3258,18 +3258,27 @@ func applyAuthModelExclusions(cfg *config.Config, auth *coreauth.Auth, provider 
 		return models
 	}
 	blocked := make(map[string]struct{})
+	allowOnly := false
+	allowed := make(map[string]struct{})
 	for _, rule := range cfg.AuthModelExclusions {
 		if !authModelExclusionRuleMatches(rule, auth, provider) {
 			continue
 		}
-		for _, modelID := range rule.Models {
-			modelID = strings.ToLower(strings.TrimSpace(modelID))
+		allMode, ruleBlocked, ruleAllowed := parseAuthModelExclusionModels(rule.Models)
+		if allMode {
+			allowOnly = true
+			for _, modelID := range ruleAllowed {
+				allowed[modelID] = struct{}{}
+			}
+			continue
+		}
+		for _, modelID := range ruleBlocked {
 			if modelID != "" {
 				blocked[modelID] = struct{}{}
 			}
 		}
 	}
-	if len(blocked) == 0 {
+	if !allowOnly && len(blocked) == 0 {
 		return models
 	}
 	out := make([]*ModelInfo, 0, len(models))
@@ -3278,12 +3287,61 @@ func applyAuthModelExclusions(cfg *config.Config, auth *coreauth.Auth, provider 
 			continue
 		}
 		modelID := strings.ToLower(strings.TrimSpace(model.ID))
+		if allowOnly {
+			if _, keep := allowed[modelID]; !keep {
+				continue
+			}
+		}
 		if _, skip := blocked[modelID]; skip {
 			continue
 		}
 		out = append(out, model)
 	}
 	return out
+}
+
+func parseAuthModelExclusionModels(models []string) (bool, []string, []string) {
+	if len(models) == 0 {
+		return false, nil, nil
+	}
+	firstModelIndex := -1
+	for i, raw := range models {
+		if strings.TrimSpace(raw) != "" {
+			firstModelIndex = i
+			break
+		}
+	}
+	if firstModelIndex < 0 {
+		return false, nil, nil
+	}
+	allMode := strings.ToLower(strings.TrimSpace(models[firstModelIndex])) == "-all"
+	blocked := make([]string, 0, len(models))
+	allowed := make([]string, 0, len(models))
+	for i, raw := range models {
+		modelID := strings.ToLower(strings.TrimSpace(raw))
+		if modelID == "" {
+			continue
+		}
+		if i == firstModelIndex && allMode {
+			continue
+		}
+		if allMode {
+			if strings.HasPrefix(modelID, "+") {
+				modelID = strings.TrimSpace(strings.TrimPrefix(modelID, "+"))
+				if modelID != "" {
+					allowed = append(allowed, modelID)
+				}
+			}
+			continue
+		}
+		if strings.HasPrefix(modelID, "+") {
+			modelID = strings.TrimSpace(strings.TrimPrefix(modelID, "+"))
+		}
+		if modelID != "" {
+			blocked = append(blocked, modelID)
+		}
+	}
+	return allMode, blocked, allowed
 }
 
 func authModelExclusionRuleMatches(rule config.AuthModelExclusionRule, auth *coreauth.Auth, provider string) bool {
