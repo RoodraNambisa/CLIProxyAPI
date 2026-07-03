@@ -29,6 +29,14 @@ const (
 	DefaultRequestBodyAuditMessage    = "Request body was rejected by policy."
 	DefaultRequestBodyAuditType       = "invalid_request_error"
 	DefaultRequestBodyAuditCode       = "request_body_blocked"
+
+	DisabledImageGenerationToolActionRemove = "remove"
+	DisabledImageGenerationToolActionError  = "error"
+
+	DefaultDisabledImageGenerationToolStatusCode = http.StatusBadRequest
+	DefaultDisabledImageGenerationToolMessage    = "image_generation tool is disabled for this credential"
+	DefaultDisabledImageGenerationToolType       = "image_generation_disabled"
+	DefaultDisabledImageGenerationToolCode       = "image_generation_disabled"
 )
 
 // Config represents the application's configuration, loaded from a YAML file.
@@ -90,6 +98,12 @@ type Config struct {
 
 	// AuthModelExclusions removes models from matching credentials before registry registration.
 	AuthModelExclusions []AuthModelExclusionRule `yaml:"auth-model-exclusions" json:"auth-model-exclusions"`
+
+	// DisabledImageGenerationToolAction controls text requests that carry an image_generation tool for credentials with image generation disabled.
+	DisabledImageGenerationToolAction string `yaml:"disabled-image-generation-tool-action" json:"disabled-image-generation-tool-action"`
+
+	// DisabledImageGenerationToolError defines the response returned when the disabled image_generation tool action is error.
+	DisabledImageGenerationToolError DisabledImageGenerationToolErrorConfig `yaml:"disabled-image-generation-tool-error" json:"disabled-image-generation-tool-error"`
 
 	// RequestBodyAudit blocks API requests whose raw body contains configured byte keywords.
 	RequestBodyAudit RequestBodyAuditConfig `yaml:"request-body-audit" json:"request-body-audit"`
@@ -323,6 +337,16 @@ type AuthModelExclusionRule struct {
 	Priorities []int `yaml:"priorities,omitempty" json:"priorities,omitempty"`
 	// KeywordContains matches non-secret identity fields case-insensitively.
 	KeywordContains []string `yaml:"keyword-contains,omitempty" json:"keyword-contains,omitempty"`
+	// DisableImageGeneration disables Codex image-generation capability for matching credentials.
+	DisableImageGeneration bool `yaml:"disable-image-generation,omitempty" json:"disable-image-generation,omitempty"`
+}
+
+// DisabledImageGenerationToolErrorConfig defines the response for disabled image_generation tool requests.
+type DisabledImageGenerationToolErrorConfig struct {
+	StatusCode int    `yaml:"status-code" json:"status-code"`
+	Message    string `yaml:"message" json:"message"`
+	Type       string `yaml:"type" json:"type"`
+	Code       string `yaml:"code" json:"code"`
 }
 
 // RequestBodyReleaseConfig controls timed release of retained request body copies.
@@ -809,6 +833,13 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 		Type:       DefaultRequestBodyAuditType,
 		Code:       DefaultRequestBodyAuditCode,
 	}
+	cfg.DisabledImageGenerationToolAction = DisabledImageGenerationToolActionRemove
+	cfg.DisabledImageGenerationToolError = DisabledImageGenerationToolErrorConfig{
+		StatusCode: DefaultDisabledImageGenerationToolStatusCode,
+		Message:    DefaultDisabledImageGenerationToolMessage,
+		Type:       DefaultDisabledImageGenerationToolType,
+		Code:       DefaultDisabledImageGenerationToolCode,
+	}
 	cfg.NonRetryableErrors = DefaultNonRetryableErrorRules()
 	cfg.Images.CodexModel = "gpt-5.4"
 	cfg.Images.ImageModel = "gpt-image-2"
@@ -929,6 +960,12 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	cfg.FixedErrorCooldowns = NormalizeFixedErrorCooldowns(cfg.FixedErrorCooldowns)
 	cfg.NonRetryableErrors = NormalizeNonRetryableErrorRules(cfg.NonRetryableErrors)
 	cfg.AuthModelExclusions = NormalizeAuthModelExclusionRules(cfg.AuthModelExclusions)
+	if err = cfg.NormalizeDisabledImageGenerationTool(); err != nil {
+		if optional {
+			return &Config{}, nil
+		}
+		return nil, err
+	}
 	cfg.RequestBodyRelease = NormalizeRequestBodyRelease(cfg.RequestBodyRelease)
 	cfg.NormalizeRequestBodyAudit()
 
@@ -1324,7 +1361,7 @@ func NormalizeNonRetryableErrorRules(rules []NonRetryableErrorRule) []NonRetryab
 	return out
 }
 
-// NormalizeAuthModelExclusionRules keeps model exclusion rules with at least one matcher.
+// NormalizeAuthModelExclusionRules keeps active exclusion rules with at least one matcher.
 func NormalizeAuthModelExclusionRules(rules []AuthModelExclusionRule) []AuthModelExclusionRule {
 	if len(rules) == 0 {
 		return nil
@@ -1333,7 +1370,7 @@ func NormalizeAuthModelExclusionRules(rules []AuthModelExclusionRule) []AuthMode
 	seen := make(map[string]struct{}, len(rules))
 	for _, rule := range rules {
 		models := NormalizeExcludedModels(rule.Models)
-		if len(models) == 0 {
+		if len(models) == 0 && !rule.DisableImageGeneration {
 			continue
 		}
 		providers := normalizeStringListLower(rule.Providers)
@@ -1342,22 +1379,72 @@ func NormalizeAuthModelExclusionRules(rules []AuthModelExclusionRule) []AuthMode
 		if len(providers) == 0 && len(priorities) == 0 && len(keywords) == 0 {
 			continue
 		}
-		key := strings.Join(models, ",") + "\x00" + strings.Join(providers, ",") + "\x00" + intsSignature(priorities) + "\x00" + strings.Join(keywords, ",")
+		key := strings.Join(models, ",") + "\x00" + strings.Join(providers, ",") + "\x00" + intsSignature(priorities) + "\x00" + strings.Join(keywords, ",") + fmt.Sprintf("\x00%t", rule.DisableImageGeneration)
 		if _, exists := seen[key]; exists {
 			continue
 		}
 		seen[key] = struct{}{}
 		out = append(out, AuthModelExclusionRule{
-			Models:          models,
-			Providers:       providers,
-			Priorities:      priorities,
-			KeywordContains: keywords,
+			Models:                 models,
+			Providers:              providers,
+			Priorities:             priorities,
+			KeywordContains:        keywords,
+			DisableImageGeneration: rule.DisableImageGeneration,
 		})
 	}
 	if len(out) == 0 {
 		return nil
 	}
 	return out
+}
+
+// NormalizeDisabledImageGenerationToolAction validates the configured disabled image tool behavior.
+func NormalizeDisabledImageGenerationToolAction(action string) (string, bool) {
+	action = strings.ToLower(strings.TrimSpace(action))
+	if action == "" {
+		return DisabledImageGenerationToolActionRemove, true
+	}
+	switch action {
+	case DisabledImageGenerationToolActionRemove, DisabledImageGenerationToolActionError:
+		return action, true
+	default:
+		return "", false
+	}
+}
+
+// NormalizeDisabledImageGenerationToolError fills defaults for disabled image tool error responses.
+func NormalizeDisabledImageGenerationToolError(in DisabledImageGenerationToolErrorConfig) DisabledImageGenerationToolErrorConfig {
+	out := in
+	if out.StatusCode < 100 || out.StatusCode > 599 {
+		out.StatusCode = DefaultDisabledImageGenerationToolStatusCode
+	}
+	out.Message = strings.TrimSpace(out.Message)
+	if out.Message == "" {
+		out.Message = DefaultDisabledImageGenerationToolMessage
+	}
+	out.Type = strings.TrimSpace(out.Type)
+	if out.Type == "" {
+		out.Type = DefaultDisabledImageGenerationToolType
+	}
+	out.Code = strings.TrimSpace(out.Code)
+	if out.Code == "" {
+		out.Code = DefaultDisabledImageGenerationToolCode
+	}
+	return out
+}
+
+// NormalizeDisabledImageGenerationTool canonicalizes disabled image tool settings.
+func (cfg *Config) NormalizeDisabledImageGenerationTool() error {
+	if cfg == nil {
+		return nil
+	}
+	action, ok := NormalizeDisabledImageGenerationToolAction(cfg.DisabledImageGenerationToolAction)
+	if !ok {
+		return fmt.Errorf("invalid disabled-image-generation-tool-action %q: must be remove or error", cfg.DisabledImageGenerationToolAction)
+	}
+	cfg.DisabledImageGenerationToolAction = action
+	cfg.DisabledImageGenerationToolError = NormalizeDisabledImageGenerationToolError(cfg.DisabledImageGenerationToolError)
+	return nil
 }
 
 func normalizeStringListLower(values []string) []string {

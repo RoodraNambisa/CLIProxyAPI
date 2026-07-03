@@ -17,6 +17,7 @@ import (
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/api"
 	internalcodex "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/codex"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/authrules"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor"
 	internalusage "github.com/router-for-me/CLIProxyAPI/v6/internal/usage"
@@ -3063,6 +3064,10 @@ func authModelExclusionsSignature(cfg *config.Config) string {
 		}
 		b.WriteByte(':')
 		b.WriteString(strings.Join(rule.KeywordContains, ","))
+		b.WriteByte(':')
+		if rule.DisableImageGeneration {
+			b.WriteString("disable-image-generation")
+		}
 	}
 	return b.String()
 }
@@ -3258,10 +3263,18 @@ func applyAuthModelExclusions(cfg *config.Config, auth *coreauth.Auth, provider 
 		return models
 	}
 	blocked := make(map[string]struct{})
+	if authrules.AuthDisablesImageGeneration(cfg, auth, provider) {
+		for _, modelID := range configuredCodexImageModels(cfg) {
+			modelID = strings.ToLower(strings.TrimSpace(modelID))
+			if modelID != "" {
+				blocked[modelID] = struct{}{}
+			}
+		}
+	}
 	allowOnly := false
 	allowed := make(map[string]struct{})
 	for _, rule := range cfg.AuthModelExclusions {
-		if !authModelExclusionRuleMatches(rule, auth, provider) {
+		if !authrules.AuthModelExclusionRuleMatches(rule, auth, provider) {
 			continue
 		}
 		allMode, ruleBlocked, ruleAllowed := parseAuthModelExclusionModels(rule.Models)
@@ -3342,138 +3355,6 @@ func parseAuthModelExclusionModels(models []string) (bool, []string, []string) {
 		}
 	}
 	return allMode, blocked, allowed
-}
-
-func authModelExclusionRuleMatches(rule config.AuthModelExclusionRule, auth *coreauth.Auth, provider string) bool {
-	if auth == nil || len(rule.Models) == 0 {
-		return false
-	}
-	if len(rule.Providers) > 0 {
-		providerKey := strings.ToLower(strings.TrimSpace(provider))
-		authProvider := strings.ToLower(strings.TrimSpace(auth.Provider))
-		matched := false
-		for _, item := range rule.Providers {
-			item = strings.ToLower(strings.TrimSpace(item))
-			if item != "" && (item == providerKey || item == authProvider) {
-				matched = true
-				break
-			}
-		}
-		if !matched {
-			return false
-		}
-	}
-	if len(rule.Priorities) > 0 {
-		priority, ok := authPriorityForModelExclusion(auth)
-		if !ok {
-			return false
-		}
-		matched := false
-		for _, item := range rule.Priorities {
-			if item == priority {
-				matched = true
-				break
-			}
-		}
-		if !matched {
-			return false
-		}
-	}
-	if len(rule.KeywordContains) > 0 {
-		haystack := authModelExclusionKeywordHaystack(auth)
-		if haystack == "" {
-			return false
-		}
-		matched := false
-		for _, keyword := range rule.KeywordContains {
-			keyword = strings.ToLower(strings.TrimSpace(keyword))
-			if keyword != "" && strings.Contains(haystack, keyword) {
-				matched = true
-				break
-			}
-		}
-		if !matched {
-			return false
-		}
-	}
-	return len(rule.Providers) > 0 || len(rule.Priorities) > 0 || len(rule.KeywordContains) > 0
-}
-
-func authPriorityForModelExclusion(auth *coreauth.Auth) (int, bool) {
-	if auth == nil {
-		return 0, false
-	}
-	if auth.Attributes != nil {
-		if value := strings.TrimSpace(auth.Attributes["priority"]); value != "" {
-			if parsed, err := strconv.Atoi(value); err == nil {
-				return parsed, true
-			}
-		}
-	}
-	if auth.Metadata == nil {
-		return 0, false
-	}
-	switch value := auth.Metadata["priority"].(type) {
-	case int:
-		return value, true
-	case int64:
-		return int(value), true
-	case float64:
-		return int(value), true
-	case string:
-		parsed, err := strconv.Atoi(strings.TrimSpace(value))
-		if err == nil {
-			return parsed, true
-		}
-	}
-	return 0, false
-}
-
-func authModelExclusionKeywordHaystack(auth *coreauth.Auth) string {
-	if auth == nil {
-		return ""
-	}
-	values := []string{auth.ID, auth.FileName, auth.Provider, auth.Label}
-	if priority, ok := authPriorityForModelExclusion(auth); ok {
-		values = append(values, strconv.Itoa(priority))
-	}
-	if auth.Attributes != nil {
-		for _, key := range []string{"email", "account", "plan_type", "path", "priority"} {
-			values = append(values, auth.Attributes[key])
-		}
-	}
-	if auth.Metadata != nil {
-		for _, key := range []string{"email", "account", "plan_type", "path", "priority"} {
-			switch value := auth.Metadata[key].(type) {
-			case string:
-				values = append(values, value)
-			case float64:
-				values = append(values, strconv.Itoa(int(value)))
-			case int:
-				values = append(values, strconv.Itoa(value))
-			case int64:
-				values = append(values, strconv.Itoa(int(value)))
-			}
-		}
-		if planType := strings.TrimSpace(internalcodex.EffectivePlanType(auth.Metadata)); planType != "" {
-			values = append(values, planType)
-		}
-	}
-	if accountType, account := auth.AccountInfo(); !strings.EqualFold(accountType, "api_key") {
-		values = append(values, accountType, account)
-	}
-	var b strings.Builder
-	for _, value := range values {
-		value = strings.ToLower(strings.TrimSpace(value))
-		if value == "" {
-			continue
-		}
-		if b.Len() > 0 {
-			b.WriteByte('\n')
-		}
-		b.WriteString(value)
-	}
-	return b.String()
 }
 
 func applyModelPrefixes(models []*ModelInfo, prefix string, forceModelPrefix bool) []*ModelInfo {

@@ -110,7 +110,7 @@ func TestPutAuthModelExclusions_NormalizesValues(t *testing.T) {
 
 	rec := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(rec)
-	c.Request = httptest.NewRequest(http.MethodPatch, "/v0/management/auth-model-exclusions", bytes.NewBufferString(`{"value":[{"models":[" gpt-image-2 ","GPT-IMAGE-2"],"priorities":[-1,-1]},{"models":["gpt-image-1.5"],"keyword-contains":[" Free ","free"],"providers":[" CoDeX "]},{"models":["gpt-5.5"]}]}`))
+	c.Request = httptest.NewRequest(http.MethodPatch, "/v0/management/auth-model-exclusions", bytes.NewBufferString(`{"value":[{"models":[" gpt-image-2 ","GPT-IMAGE-2"],"priorities":[-1,-1]},{"models":["gpt-image-1.5"],"keyword-contains":[" Free ","free"],"providers":[" CoDeX "]},{"disable-image-generation":true,"priorities":[0,0],"keyword-contains":[" Trial "]},{"models":["gpt-5.5"]}]}`))
 	c.Request.Header.Set("Content-Type", "application/json")
 
 	h.PutAuthModelExclusions(c)
@@ -118,8 +118,8 @@ func TestPutAuthModelExclusions_NormalizesValues(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
 	}
-	if len(h.cfg.AuthModelExclusions) != 2 {
-		t.Fatalf("auth-model-exclusions = %+v, want 2 rules", h.cfg.AuthModelExclusions)
+	if len(h.cfg.AuthModelExclusions) != 3 {
+		t.Fatalf("auth-model-exclusions = %+v, want 3 rules", h.cfg.AuthModelExclusions)
 	}
 	first := h.cfg.AuthModelExclusions[0]
 	if len(first.Models) != 1 || first.Models[0] != "gpt-image-2" {
@@ -134,6 +134,19 @@ func TestPutAuthModelExclusions_NormalizesValues(t *testing.T) {
 	}
 	if len(second.KeywordContains) != 1 || second.KeywordContains[0] != "free" {
 		t.Fatalf("second keywords = %#v, want [free]", second.KeywordContains)
+	}
+	third := h.cfg.AuthModelExclusions[2]
+	if !third.DisableImageGeneration {
+		t.Fatalf("third disable-image-generation = false, want true")
+	}
+	if len(third.Models) != 0 {
+		t.Fatalf("third models = %#v, want empty", third.Models)
+	}
+	if len(third.Priorities) != 1 || third.Priorities[0] != 0 {
+		t.Fatalf("third priorities = %#v, want [0]", third.Priorities)
+	}
+	if len(third.KeywordContains) != 1 || third.KeywordContains[0] != "trial" {
+		t.Fatalf("third keywords = %#v, want [trial]", third.KeywordContains)
 	}
 }
 

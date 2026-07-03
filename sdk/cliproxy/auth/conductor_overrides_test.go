@@ -19,6 +19,60 @@ import (
 
 const requestScopedNotFoundMessage = "Item with id 'rs_0b5f3eb6f51f175c0169ca74e4a85881998539920821603a74' not found. Items are not persisted when `store` is set to false. Try again with `store` set to true, or remove this item from your input."
 
+type localPolicyError struct {
+	status int
+	msg    string
+}
+
+func (e localPolicyError) Error() string {
+	return e.msg
+}
+
+func (e localPolicyError) StatusCode() int {
+	return e.status
+}
+
+func (e localPolicyError) SkipAuthResult() bool {
+	return true
+}
+
+func TestManager_LocalPolicyErrorStopsRetryAndSkipsAuthResult(t *testing.T) {
+	m := NewManager(nil, nil, nil)
+	m.SetRetryConfig(1, 0, 0)
+
+	executor := &authFallbackExecutor{
+		id:            "codex",
+		executeErrors: map[string]error{"high": localPolicyError{status: http.StatusBadRequest, msg: `{"error":{"message":"image disabled","type":"image_generation_disabled","code":"image_generation_disabled"}}`}},
+	}
+	m.RegisterExecutor(executor)
+	for _, auth := range []*Auth{
+		{ID: "high", Provider: "codex", Attributes: map[string]string{"priority": "10"}},
+		{ID: "low", Provider: "codex", Attributes: map[string]string{"priority": "0"}},
+	} {
+		if _, errRegister := m.Register(context.Background(), auth); errRegister != nil {
+			t.Fatalf("register auth %s: %v", auth.ID, errRegister)
+		}
+	}
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient("high", "codex", []*registry.ModelInfo{{ID: "test-model"}})
+	reg.RegisterClient("low", "codex", []*registry.ModelInfo{{ID: "test-model"}})
+	t.Cleanup(func() {
+		reg.UnregisterClient("high")
+		reg.UnregisterClient("low")
+	})
+
+	_, errExecute := m.Execute(context.Background(), []string{"codex"}, cliproxyexecutor.Request{Model: "test-model"}, cliproxyexecutor.Options{})
+	if errExecute == nil || !strings.Contains(errExecute.Error(), "image disabled") {
+		t.Fatalf("Execute() error = %v, want local policy error", errExecute)
+	}
+	if got := executor.ExecuteCalls(); len(got) != 1 || got[0] != "high" {
+		t.Fatalf("execute calls = %v, want only high", got)
+	}
+	if high, ok := m.GetByID("high"); !ok || high.Status == StatusError || high.LastError != nil {
+		t.Fatalf("high auth state = %+v, want no recorded auth failure", high)
+	}
+}
+
 func TestManager_RequestRetryOverrideControlsRequestRounds(t *testing.T) {
 	m := NewManager(nil, nil, nil)
 	m.SetRetryConfig(0, 0, 0)

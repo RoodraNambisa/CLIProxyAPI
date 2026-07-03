@@ -134,6 +134,19 @@ auth-model-exclusions: []
 #     keyword-contains: ["free", "trial"]
 #   - models: ["-all", "+gpt-5.5"]
 #     priorities: [-1]
+#   - disable-image-generation: true
+#     priorities: [-1]
+#   - disable-image-generation: true
+#     keyword-contains: ["free", "trial"]
+
+# How to handle regular Codex text requests when a matched credential has image generation disabled
+# but the request body still carries an image_generation tool. Valid values: remove, error.
+disabled-image-generation-tool-action: remove
+disabled-image-generation-tool-error:
+  status-code: 400
+  message: "image_generation tool is disabled for this credential"
+  type: image_generation_disabled
+  code: image_generation_disabled
 
 # Release retained request body copies after a request has been waiting for N seconds.
 # log-only=true only drops request log/upstream log copies and does not affect retries.

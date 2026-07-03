@@ -1169,7 +1169,9 @@ func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, affinityProv
 				if se, ok := errors.AsType[cliproxyexecutor.StatusError](chunk.Err); ok && se != nil {
 					rerr.HTTPStatus = se.StatusCode()
 				}
-				m.MarkResult(ctx, Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr})
+				if !skipAuthResultForError(chunk.Err) {
+					m.MarkResult(ctx, Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr})
+				}
 			}
 			if !forward {
 				return false
@@ -1263,7 +1265,9 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			}
 			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr}
 			result.RetryAfter = retryAfterFromError(errStream)
-			m.MarkResult(ctx, result)
+			if !skipAuthResultForError(errStream) {
+				m.MarkResult(ctx, result)
+			}
 			if m.isRequestInvalidError(errStream) {
 				return nil, errStream
 			}
@@ -1291,7 +1295,9 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 				}
 				result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr}
 				result.RetryAfter = retryAfterFromError(bootstrapErr)
-				m.MarkResult(ctx, result)
+				if !skipAuthResultForError(bootstrapErr) {
+					m.MarkResult(ctx, result)
+				}
 				discardStreamChunks(streamResult.Chunks)
 				return nil, bootstrapErr
 			}
@@ -1302,7 +1308,9 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 				}
 				result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr}
 				result.RetryAfter = retryAfterFromError(bootstrapErr)
-				m.MarkResult(ctx, result)
+				if !skipAuthResultForError(bootstrapErr) {
+					m.MarkResult(ctx, result)
+				}
 				discardStreamChunks(streamResult.Chunks)
 				lastErr = bootstrapErr
 				continue
@@ -1313,7 +1321,9 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			}
 			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr}
 			result.RetryAfter = retryAfterFromError(bootstrapErr)
-			m.MarkResult(ctx, result)
+			if !skipAuthResultForError(bootstrapErr) {
+				m.MarkResult(ctx, result)
+			}
 			discardStreamChunks(streamResult.Chunks)
 			return nil, newStreamBootstrapError(bootstrapErr, streamResult.Headers)
 		}
@@ -2019,7 +2029,9 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 				if ra := retryAfterFromError(errExec); ra != nil {
 					result.RetryAfter = ra
 				}
-				m.MarkResult(execCtx, result)
+				if !skipAuthResultForError(errExec) {
+					m.MarkResult(execCtx, result)
+				}
 				if m.isRequestInvalidError(errExec) {
 					return cliproxyexecutor.Response{}, errExec
 				}
@@ -2133,7 +2145,9 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 				if ra := retryAfterFromError(errExec); ra != nil {
 					result.RetryAfter = ra
 				}
-				m.MarkResult(execCtx, result)
+				if !skipAuthResultForError(errExec) {
+					m.MarkResult(execCtx, result)
+				}
 				if m.isRequestInvalidError(errExec) {
 					return cliproxyexecutor.Response{}, errExec
 				}
@@ -3560,6 +3574,17 @@ func retryAfterFromError(err error) *time.Duration {
 	return new(*retryAfter)
 }
 
+func skipAuthResultForError(err error) bool {
+	if err == nil {
+		return false
+	}
+	type skipAuthResultError interface {
+		SkipAuthResult() bool
+	}
+	var target skipAuthResultError
+	return errors.As(err, &target) && target.SkipAuthResult()
+}
+
 func statusCodeFromResult(err *Error) int {
 	if err == nil {
 		return 0
@@ -3637,6 +3662,9 @@ func isRequestScopedNotFoundResultError(err *Error) bool {
 func isRequestInvalidErrorWithConfig(err error, cfg *internalconfig.Config) bool {
 	if err == nil {
 		return false
+	}
+	if skipAuthResultForError(err) {
+		return true
 	}
 	if isModelSupportError(err) {
 		return false

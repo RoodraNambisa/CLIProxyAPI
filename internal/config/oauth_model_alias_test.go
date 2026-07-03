@@ -208,10 +208,11 @@ func TestNormalizeAuthModelExclusionRules(t *testing.T) {
 		{Models: []string{" gpt-image-2 ", "GPT-IMAGE-2", ""}, Priorities: []int{-1, -1, 0}},
 		{Models: []string{"gpt-image-1.5"}, Providers: []string{" CoDeX ", "codex"}, KeywordContains: []string{" Free ", "free", ""}},
 		{Models: []string{" -ALL ", "+GPT-5.5", "+gpt-5.5"}, Priorities: []int{1, 1}, KeywordContains: []string{" Team ", "team"}},
+		{DisableImageGeneration: true, Priorities: []int{-1, -1}, KeywordContains: []string{" Trial "}},
 		{Priorities: []int{0}},
 	})
-	if len(got) != 3 {
-		t.Fatalf("rules = %#v, want 3 valid rules", got)
+	if len(got) != 4 {
+		t.Fatalf("rules = %#v, want 4 valid rules", got)
 	}
 	if len(got[0].Models) != 1 || got[0].Models[0] != "gpt-image-2" {
 		t.Fatalf("first models = %#v", got[0].Models)
@@ -233,5 +234,53 @@ func TestNormalizeAuthModelExclusionRules(t *testing.T) {
 	}
 	if len(got[2].KeywordContains) != 1 || got[2].KeywordContains[0] != "team" {
 		t.Fatalf("third keywords = %#v", got[2].KeywordContains)
+	}
+	if len(got[3].Models) != 0 || !got[3].DisableImageGeneration {
+		t.Fatalf("fourth rule = %#v, want disable-image-generation rule without models", got[3])
+	}
+	if len(got[3].Priorities) != 1 || got[3].Priorities[0] != -1 {
+		t.Fatalf("fourth priorities = %#v", got[3].Priorities)
+	}
+	if len(got[3].KeywordContains) != 1 || got[3].KeywordContains[0] != "trial" {
+		t.Fatalf("fourth keywords = %#v", got[3].KeywordContains)
+	}
+}
+
+func TestNormalizeDisabledImageGenerationToolDefaults(t *testing.T) {
+	cfg := &Config{}
+	if err := cfg.NormalizeDisabledImageGenerationTool(); err != nil {
+		t.Fatalf("NormalizeDisabledImageGenerationTool() error = %v", err)
+	}
+	if cfg.DisabledImageGenerationToolAction != DisabledImageGenerationToolActionRemove {
+		t.Fatalf("action = %q, want %q", cfg.DisabledImageGenerationToolAction, DisabledImageGenerationToolActionRemove)
+	}
+	if cfg.DisabledImageGenerationToolError.StatusCode != DefaultDisabledImageGenerationToolStatusCode {
+		t.Fatalf("status = %d, want %d", cfg.DisabledImageGenerationToolError.StatusCode, DefaultDisabledImageGenerationToolStatusCode)
+	}
+	if cfg.DisabledImageGenerationToolError.Message != DefaultDisabledImageGenerationToolMessage {
+		t.Fatalf("message = %q, want default", cfg.DisabledImageGenerationToolError.Message)
+	}
+	if cfg.DisabledImageGenerationToolError.Type != DefaultDisabledImageGenerationToolType {
+		t.Fatalf("type = %q, want default", cfg.DisabledImageGenerationToolError.Type)
+	}
+	if cfg.DisabledImageGenerationToolError.Code != DefaultDisabledImageGenerationToolCode {
+		t.Fatalf("code = %q, want default", cfg.DisabledImageGenerationToolError.Code)
+	}
+}
+
+func TestNormalizeDisabledImageGenerationToolRejectsInvalidAction(t *testing.T) {
+	cfg := &Config{DisabledImageGenerationToolAction: "block"}
+	if err := cfg.NormalizeDisabledImageGenerationTool(); err == nil {
+		t.Fatal("NormalizeDisabledImageGenerationTool() error = nil, want invalid action error")
+	}
+}
+
+func TestLoadConfigOptionalRejectsInvalidDisabledImageGenerationToolAction(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(`disabled-image-generation-tool-action: block`), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	if _, err := LoadConfigOptional(path, false); err == nil {
+		t.Fatal("LoadConfigOptional() error = nil, want invalid action error")
 	}
 }

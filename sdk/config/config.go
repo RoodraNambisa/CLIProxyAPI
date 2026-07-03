@@ -18,6 +18,7 @@ type TLSConfig = internalconfig.TLSConfig
 type RemoteManagement = internalconfig.RemoteManagement
 type AuthMaintenanceConfig = internalconfig.AuthMaintenanceConfig
 type RequestBodyReleaseConfig = internalconfig.RequestBodyReleaseConfig
+type DisabledImageGenerationToolErrorConfig = internalconfig.DisabledImageGenerationToolErrorConfig
 type NonRetryableErrorRule = internalconfig.NonRetryableErrorRule
 type AuthModelExclusionRule = internalconfig.AuthModelExclusionRule
 type AmpCode = internalconfig.AmpCode

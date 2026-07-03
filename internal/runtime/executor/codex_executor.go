@@ -12,6 +12,7 @@ import (
 	"time"
 
 	codexauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/codex"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/authrules"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/misc"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor/helps"
@@ -463,6 +464,10 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	body, _ = sjson.DeleteBytes(body, "safety_identifier")
 	body, _ = sjson.DeleteBytes(body, "stream_options")
 	body = normalizeCodexInstructions(body)
+	body, err = e.applyDisabledImageGenerationToolPolicy(auth, body)
+	if err != nil {
+		return resp, err
+	}
 	imageRequest := codexHasImageGenerationTool(body)
 
 	url := strings.TrimSuffix(baseURL, "/") + "/responses"
@@ -598,6 +603,10 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 	body, _ = sjson.SetBytes(body, "model", baseModel)
 	body, _ = sjson.DeleteBytes(body, "stream")
 	body = normalizeCodexInstructions(body)
+	body, err = e.applyDisabledImageGenerationToolPolicy(auth, body)
+	if err != nil {
+		return resp, err
+	}
 	imageRequest := codexHasImageGenerationTool(body)
 
 	url := strings.TrimSuffix(baseURL, "/") + "/responses/compact"
@@ -707,6 +716,10 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	body, _ = sjson.DeleteBytes(body, "stream_options")
 	body, _ = sjson.SetBytes(body, "model", baseModel)
 	body = normalizeCodexInstructions(body)
+	body, err = e.applyDisabledImageGenerationToolPolicy(auth, body)
+	if err != nil {
+		return nil, err
+	}
 	imageRequest := codexHasImageGenerationTool(body)
 	imageStreamPassthrough := metadataBool(opts.Metadata, cliproxyexecutor.ImageGenerationStreamPassthroughMetadataKey) && from == sdktranslator.FormatOpenAIResponse && imageRequest
 	trustUpstreamSSE := metadataBool(opts.Metadata, cliproxyexecutor.TrustUpstreamSSEMetadataKey) && from == sdktranslator.FormatOpenAIResponse
@@ -1461,6 +1474,69 @@ func codexHasImageGenerationTool(body []byte) bool {
 		}
 	}
 	return false
+}
+
+func (e *CodexExecutor) applyDisabledImageGenerationToolPolicy(auth *cliproxyauth.Auth, body []byte) ([]byte, error) {
+	if !authrules.AuthDisablesImageGeneration(e.cfg, auth, e.Identifier()) || !codexHasImageGenerationTool(body) {
+		return body, nil
+	}
+	action, ok := config.NormalizeDisabledImageGenerationToolAction(disabledImageGenerationToolAction(e.cfg))
+	if !ok || action == config.DisabledImageGenerationToolActionRemove {
+		return removeCodexImageGenerationTool(body), nil
+	}
+	return nil, disabledImageGenerationToolError(e.cfg)
+}
+
+func disabledImageGenerationToolAction(cfg *config.Config) string {
+	if cfg == nil {
+		return ""
+	}
+	return cfg.DisabledImageGenerationToolAction
+}
+
+func disabledImageGenerationToolError(cfg *config.Config) statusErr {
+	var errCfg config.DisabledImageGenerationToolErrorConfig
+	if cfg != nil {
+		errCfg = cfg.DisabledImageGenerationToolError
+	}
+	errCfg = config.NormalizeDisabledImageGenerationToolError(errCfg)
+	body := []byte(`{"error":{}}`)
+	body, _ = sjson.SetBytes(body, "error.message", errCfg.Message)
+	body, _ = sjson.SetBytes(body, "error.type", errCfg.Type)
+	body, _ = sjson.SetBytes(body, "error.code", errCfg.Code)
+	return statusErr{code: errCfg.StatusCode, msg: string(body), skipAuthResult: true}
+}
+
+func removeCodexImageGenerationTool(body []byte) []byte {
+	tools := gjson.GetBytes(body, "tools")
+	if !tools.IsArray() {
+		return body
+	}
+	var retained bytes.Buffer
+	retained.WriteByte('[')
+	retainedCount := 0
+	for _, tool := range tools.Array() {
+		if tool.Get("type").String() == "image_generation" {
+			continue
+		}
+		if retainedCount > 0 {
+			retained.WriteByte(',')
+		}
+		retained.WriteString(tool.Raw)
+		retainedCount++
+	}
+	retained.WriteByte(']')
+	if retainedCount == 0 {
+		body, _ = sjson.DeleteBytes(body, "tools")
+		body, _ = sjson.DeleteBytes(body, "tool_choice")
+		body, _ = sjson.DeleteBytes(body, "parallel_tool_calls")
+	} else {
+		body, _ = sjson.SetRawBytes(body, "tools", retained.Bytes())
+	}
+	if gjson.GetBytes(body, "tool_choice.type").String() == "image_generation" {
+		body, _ = sjson.DeleteBytes(body, "tool_choice")
+	}
+	return body
 }
 
 func codexImageGenerationToolModel(body []byte) string {

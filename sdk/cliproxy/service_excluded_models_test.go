@@ -205,6 +205,51 @@ func TestRegisterModelsForAuth_AuthModelExclusionsFilterByPriority(t *testing.T)
 	}
 }
 
+func TestRegisterModelsForAuth_DisableImageGenerationHidesConfiguredImageModels(t *testing.T) {
+	service := &Service{
+		cfg: &config.Config{
+			SDKConfig: config.SDKConfig{
+				Images: config.ImagesConfig{
+					ImageModel: "gpt-image-2",
+					Native: config.NativeImagesConfig{
+						Generations: config.NativeImageEndpointConfig{Enabled: true, Models: []string{"gpt-image-1.5"}},
+						Edits:       config.NativeImageEndpointConfig{Enabled: true, Models: []string{"gpt-image-edit"}},
+					},
+				},
+			},
+			AuthModelExclusions: []config.AuthModelExclusionRule{
+				{DisableImageGeneration: true, Priorities: []int{-1}},
+			},
+		},
+	}
+	auth := &coreauth.Auth{
+		ID:       "auth-codex-disable-image-generation",
+		Provider: "codex",
+		Status:   coreauth.StatusActive,
+		Attributes: map[string]string{
+			"plan_type": "plus",
+			"priority":  "-1",
+		},
+	}
+	reg := GlobalModelRegistry()
+	reg.UnregisterClient(auth.ID)
+	t.Cleanup(func() {
+		reg.UnregisterClient(auth.ID)
+	})
+
+	service.registerModelsForAuth(auth)
+
+	models := registry.GetGlobalRegistry().GetModelsForClient(auth.ID)
+	for _, modelID := range []string{"gpt-image-2", "gpt-image-1.5", "gpt-image-edit"} {
+		if containsRegisteredModel(models, modelID) {
+			t.Fatalf("expected disabled image model %q to be absent; got %v", modelID, registeredModelIDs(models))
+		}
+	}
+	if !containsRegisteredModel(models, "gpt-5.4") {
+		t.Fatalf("expected text model to remain; got %v", registeredModelIDs(models))
+	}
+}
+
 func TestRegisterModelsForAuth_AuthModelExclusionsFilterByKeyword(t *testing.T) {
 	service := &Service{
 		cfg: &config.Config{
