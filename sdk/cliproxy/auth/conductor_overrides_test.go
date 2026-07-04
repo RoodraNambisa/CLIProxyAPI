@@ -36,6 +36,27 @@ func (e localPolicyError) SkipAuthResult() bool {
 	return true
 }
 
+func imageToolFallbackPayload(model string) []byte {
+	return []byte(fmt.Sprintf(`{"model":%q,"tools":[{"type":"image_generation","model":"gpt-image-2"}],"input":"draw"}`, model))
+}
+
+func registerFallbackAuthForModel(t *testing.T, manager *Manager, auth *Auth, model string) {
+	t.Helper()
+	if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
+		t.Fatalf("register auth %s: %v", auth.ID, errRegister)
+	}
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient(auth.ID, auth.Provider, []*registry.ModelInfo{{ID: model}})
+	t.Cleanup(func() {
+		reg.UnregisterClient(auth.ID)
+	})
+}
+
+func registerCodexFallbackAuthForModel(t *testing.T, manager *Manager, auth *Auth, model string) {
+	t.Helper()
+	registerFallbackAuthForModel(t, manager, auth, model)
+}
+
 func TestManager_LocalPolicyErrorStopsRetryAndSkipsAuthResult(t *testing.T) {
 	m := NewManager(nil, nil, nil)
 	m.SetRetryConfig(1, 0, 0)
@@ -70,6 +91,180 @@ func TestManager_LocalPolicyErrorStopsRetryAndSkipsAuthResult(t *testing.T) {
 	}
 	if high, ok := m.GetByID("high"); !ok || high.Status == StatusError || high.LastError != nil {
 		t.Fatalf("high auth state = %+v, want no recorded auth failure", high)
+	}
+}
+
+func TestManager_ImageToolFallbackRoutesToLowerPriorityCapableAuth(t *testing.T) {
+	m := NewManager(nil, nil, nil)
+	m.SetRetryConfig(0, 0, 0)
+	m.SetConfig(&internalconfig.Config{
+		DisabledImageGenerationToolFallback: true,
+		AuthModelExclusions: []internalconfig.AuthModelExclusionRule{
+			{DisableImageGeneration: true, Priorities: []int{10}},
+		},
+	})
+	executor := &authFallbackExecutor{id: "codex"}
+	m.RegisterExecutor(executor)
+	model := "image-tool-fallback-lower-" + uuid.NewString()
+	registerCodexFallbackAuthForModel(t, m, &Auth{ID: "image-tool-high-" + uuid.NewString(), Provider: "codex", Attributes: map[string]string{"priority": "10"}}, model)
+	lowID := "image-tool-low-" + uuid.NewString()
+	registerCodexFallbackAuthForModel(t, m, &Auth{ID: lowID, Provider: "codex", Attributes: map[string]string{"priority": "0"}}, model)
+
+	resp, errExecute := m.Execute(context.Background(), []string{"codex"}, cliproxyexecutor.Request{Model: model, Payload: imageToolFallbackPayload(model)}, cliproxyexecutor.Options{})
+	if errExecute != nil {
+		t.Fatalf("Execute() error = %v", errExecute)
+	}
+	if string(resp.Payload) != lowID {
+		t.Fatalf("payload = %q, want %q", string(resp.Payload), lowID)
+	}
+	if got := executor.ExecuteCalls(); len(got) != 1 || got[0] != lowID {
+		t.Fatalf("execute calls = %v, want [%s]", got, lowID)
+	}
+}
+
+func TestManager_ImageToolFallbackPrefersSamePriorityCapableAuth(t *testing.T) {
+	m := NewManager(nil, nil, nil)
+	m.SetRetryConfig(0, 0, 0)
+	m.SetConfig(&internalconfig.Config{
+		DisabledImageGenerationToolFallback: true,
+		AuthModelExclusions: []internalconfig.AuthModelExclusionRule{
+			{DisableImageGeneration: true, KeywordContains: []string{"disabled"}},
+		},
+	})
+	executor := &authFallbackExecutor{id: "codex"}
+	m.RegisterExecutor(executor)
+	model := "image-tool-fallback-same-" + uuid.NewString()
+	registerCodexFallbackAuthForModel(t, m, &Auth{ID: "image-tool-disabled-" + uuid.NewString(), Provider: "codex", Label: "disabled", Attributes: map[string]string{"priority": "10"}}, model)
+	sameID := "image-tool-same-" + uuid.NewString()
+	registerCodexFallbackAuthForModel(t, m, &Auth{ID: sameID, Provider: "codex", Attributes: map[string]string{"priority": "10"}}, model)
+	registerCodexFallbackAuthForModel(t, m, &Auth{ID: "image-tool-low-" + uuid.NewString(), Provider: "codex", Attributes: map[string]string{"priority": "0"}}, model)
+
+	resp, errExecute := m.Execute(context.Background(), []string{"codex"}, cliproxyexecutor.Request{Model: model, Payload: imageToolFallbackPayload(model)}, cliproxyexecutor.Options{})
+	if errExecute != nil {
+		t.Fatalf("Execute() error = %v", errExecute)
+	}
+	if string(resp.Payload) != sameID {
+		t.Fatalf("payload = %q, want %q", string(resp.Payload), sameID)
+	}
+}
+
+func TestManager_ImageToolFallbackFallsBackToOriginalSelectionWhenNoCapableAuth(t *testing.T) {
+	m := NewManager(nil, nil, nil)
+	m.SetRetryConfig(0, 0, 0)
+	m.SetConfig(&internalconfig.Config{
+		DisabledImageGenerationToolFallback: true,
+		AuthModelExclusions: []internalconfig.AuthModelExclusionRule{
+			{DisableImageGeneration: true, Providers: []string{"codex"}},
+		},
+	})
+	executor := &authFallbackExecutor{id: "codex"}
+	m.RegisterExecutor(executor)
+	model := "image-tool-fallback-none-" + uuid.NewString()
+	highID := "image-tool-high-" + uuid.NewString()
+	registerCodexFallbackAuthForModel(t, m, &Auth{ID: highID, Provider: "codex", Attributes: map[string]string{"priority": "10"}}, model)
+	registerCodexFallbackAuthForModel(t, m, &Auth{ID: "image-tool-low-" + uuid.NewString(), Provider: "codex", Attributes: map[string]string{"priority": "0"}}, model)
+
+	resp, errExecute := m.Execute(context.Background(), []string{"codex"}, cliproxyexecutor.Request{Model: model, Payload: imageToolFallbackPayload(model)}, cliproxyexecutor.Options{})
+	if errExecute != nil {
+		t.Fatalf("Execute() error = %v", errExecute)
+	}
+	if string(resp.Payload) != highID {
+		t.Fatalf("payload = %q, want original highest-priority auth %q", string(resp.Payload), highID)
+	}
+}
+
+func TestManager_ImageToolFallbackIgnoresNonCodexProviders(t *testing.T) {
+	m := NewManager(nil, nil, nil)
+	m.SetRetryConfig(0, 0, 0)
+	m.SetConfig(&internalconfig.Config{
+		DisabledImageGenerationToolFallback: true,
+		AuthModelExclusions: []internalconfig.AuthModelExclusionRule{
+			{DisableImageGeneration: true, Providers: []string{"codex"}},
+		},
+	})
+	codexExecutor := &authFallbackExecutor{id: "codex"}
+	claudeExecutor := &authFallbackExecutor{id: "claude"}
+	m.RegisterExecutor(codexExecutor)
+	m.RegisterExecutor(claudeExecutor)
+	model := "image-tool-fallback-non-codex-" + uuid.NewString()
+	highID := "image-tool-codex-high-" + uuid.NewString()
+	registerFallbackAuthForModel(t, m, &Auth{ID: highID, Provider: "codex", Attributes: map[string]string{"priority": "10"}}, model)
+	registerFallbackAuthForModel(t, m, &Auth{ID: "image-tool-claude-low-" + uuid.NewString(), Provider: "claude", Attributes: map[string]string{"priority": "0"}}, model)
+
+	resp, errExecute := m.Execute(context.Background(), []string{"codex", "claude"}, cliproxyexecutor.Request{Model: model, Payload: imageToolFallbackPayload(model)}, cliproxyexecutor.Options{})
+	if errExecute != nil {
+		t.Fatalf("Execute() error = %v", errExecute)
+	}
+	if string(resp.Payload) != highID {
+		t.Fatalf("payload = %q, want original Codex auth %q", string(resp.Payload), highID)
+	}
+	if got := codexExecutor.ExecuteCalls(); len(got) != 1 || got[0] != highID {
+		t.Fatalf("codex execute calls = %v, want [%s]", got, highID)
+	}
+	if got := claudeExecutor.ExecuteCalls(); len(got) != 0 {
+		t.Fatalf("claude execute calls = %v, want none", got)
+	}
+}
+
+func TestManager_ImageToolFallbackDisabledKeepsOriginalSelection(t *testing.T) {
+	m := NewManager(nil, nil, nil)
+	m.SetRetryConfig(0, 0, 0)
+	m.SetConfig(&internalconfig.Config{
+		AuthModelExclusions: []internalconfig.AuthModelExclusionRule{
+			{DisableImageGeneration: true, Priorities: []int{10}},
+		},
+	})
+	executor := &authFallbackExecutor{id: "codex"}
+	m.RegisterExecutor(executor)
+	model := "image-tool-fallback-disabled-" + uuid.NewString()
+	highID := "image-tool-high-" + uuid.NewString()
+	registerCodexFallbackAuthForModel(t, m, &Auth{ID: highID, Provider: "codex", Attributes: map[string]string{"priority": "10"}}, model)
+	registerCodexFallbackAuthForModel(t, m, &Auth{ID: "image-tool-low-" + uuid.NewString(), Provider: "codex", Attributes: map[string]string{"priority": "0"}}, model)
+
+	resp, errExecute := m.Execute(context.Background(), []string{"codex"}, cliproxyexecutor.Request{Model: model, Payload: imageToolFallbackPayload(model)}, cliproxyexecutor.Options{})
+	if errExecute != nil {
+		t.Fatalf("Execute() error = %v", errExecute)
+	}
+	if string(resp.Payload) != highID {
+		t.Fatalf("payload = %q, want original highest-priority auth %q", string(resp.Payload), highID)
+	}
+}
+
+func TestManager_ImageToolFallbackRoutesStreamToCapableAuth(t *testing.T) {
+	m := NewManager(nil, nil, nil)
+	m.SetRetryConfig(0, 0, 0)
+	m.SetConfig(&internalconfig.Config{
+		DisabledImageGenerationToolFallback: true,
+		AuthModelExclusions: []internalconfig.AuthModelExclusionRule{
+			{DisableImageGeneration: true, Priorities: []int{10}},
+		},
+	})
+	executor := &authFallbackExecutor{id: "codex"}
+	m.RegisterExecutor(executor)
+	model := "image-tool-fallback-stream-" + uuid.NewString()
+	registerCodexFallbackAuthForModel(t, m, &Auth{ID: "image-tool-high-" + uuid.NewString(), Provider: "codex", Attributes: map[string]string{"priority": "10"}}, model)
+	lowID := "image-tool-low-" + uuid.NewString()
+	registerCodexFallbackAuthForModel(t, m, &Auth{ID: lowID, Provider: "codex", Attributes: map[string]string{"priority": "0"}}, model)
+
+	result, errStream := m.ExecuteStream(context.Background(), []string{"codex"}, cliproxyexecutor.Request{Model: model, Payload: imageToolFallbackPayload(model)}, cliproxyexecutor.Options{})
+	if errStream != nil {
+		t.Fatalf("ExecuteStream() error = %v", errStream)
+	}
+	if result == nil {
+		t.Fatal("ExecuteStream() result = nil")
+	}
+	var payload strings.Builder
+	for chunk := range result.Chunks {
+		if chunk.Err != nil {
+			t.Fatalf("stream chunk error = %v", chunk.Err)
+		}
+		payload.Write(chunk.Payload)
+	}
+	if payload.String() != lowID {
+		t.Fatalf("stream payload = %q, want %q", payload.String(), lowID)
+	}
+	if got := executor.StreamCalls(); len(got) != 1 || got[0] != lowID {
+		t.Fatalf("stream calls = %v, want [%s]", got, lowID)
 	}
 }
 

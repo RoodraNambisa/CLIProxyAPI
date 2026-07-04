@@ -102,6 +102,9 @@ type Config struct {
 	// DisabledImageGenerationToolAction controls text requests that carry an image_generation tool for credentials with image generation disabled.
 	DisabledImageGenerationToolAction string `yaml:"disabled-image-generation-tool-action" json:"disabled-image-generation-tool-action"`
 
+	// DisabledImageGenerationToolFallback routes image_generation tool requests to image-capable Codex credentials before applying the action.
+	DisabledImageGenerationToolFallback bool `yaml:"disabled-image-generation-tool-fallback" json:"disabled-image-generation-tool-fallback"`
+
 	// DisabledImageGenerationToolError defines the response returned when the disabled image_generation tool action is error.
 	DisabledImageGenerationToolError DisabledImageGenerationToolErrorConfig `yaml:"disabled-image-generation-tool-error" json:"disabled-image-generation-tool-error"`
 

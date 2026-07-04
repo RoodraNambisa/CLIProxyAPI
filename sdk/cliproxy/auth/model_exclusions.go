@@ -1,16 +1,15 @@
-package authrules
+package auth
 
 import (
 	"strconv"
 	"strings"
 
 	internalcodex "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/codex"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
-	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
+	internalconfig "github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 )
 
 // AuthModelExclusionRuleMatches reports whether a rule matches non-secret auth metadata.
-func AuthModelExclusionRuleMatches(rule config.AuthModelExclusionRule, auth *coreauth.Auth, provider string) bool {
+func AuthModelExclusionRuleMatches(rule internalconfig.AuthModelExclusionRule, auth *Auth, provider string) bool {
 	if auth == nil || (len(rule.Models) == 0 && !rule.DisableImageGeneration) {
 		return false
 	}
@@ -30,7 +29,7 @@ func AuthModelExclusionRuleMatches(rule config.AuthModelExclusionRule, auth *cor
 		}
 	}
 	if len(rule.Priorities) > 0 {
-		priority, ok := authPriority(auth)
+		priority, ok := authPriorityForModelExclusion(auth)
 		if !ok {
 			return false
 		}
@@ -46,7 +45,7 @@ func AuthModelExclusionRuleMatches(rule config.AuthModelExclusionRule, auth *cor
 		}
 	}
 	if len(rule.KeywordContains) > 0 {
-		haystack := keywordHaystack(auth)
+		haystack := authModelExclusionKeywordHaystack(auth)
 		if haystack == "" {
 			return false
 		}
@@ -66,7 +65,7 @@ func AuthModelExclusionRuleMatches(rule config.AuthModelExclusionRule, auth *cor
 }
 
 // AuthDisablesImageGeneration reports whether image_generation should be disabled for this Codex auth.
-func AuthDisablesImageGeneration(cfg *config.Config, auth *coreauth.Auth, provider string) bool {
+func AuthDisablesImageGeneration(cfg *internalconfig.Config, auth *Auth, provider string) bool {
 	if cfg == nil || auth == nil || len(cfg.AuthModelExclusions) == 0 {
 		return false
 	}
@@ -81,14 +80,14 @@ func AuthDisablesImageGeneration(cfg *config.Config, auth *coreauth.Auth, provid
 	return false
 }
 
-func isCodexProvider(auth *coreauth.Auth, provider string) bool {
+func isCodexProvider(auth *Auth, provider string) bool {
 	if strings.EqualFold(strings.TrimSpace(provider), "codex") {
 		return true
 	}
 	return auth != nil && strings.EqualFold(strings.TrimSpace(auth.Provider), "codex")
 }
 
-func authPriority(auth *coreauth.Auth) (int, bool) {
+func authPriorityForModelExclusion(auth *Auth) (int, bool) {
 	if auth == nil {
 		return 0, false
 	}
@@ -118,12 +117,12 @@ func authPriority(auth *coreauth.Auth) (int, bool) {
 	return 0, false
 }
 
-func keywordHaystack(auth *coreauth.Auth) string {
+func authModelExclusionKeywordHaystack(auth *Auth) string {
 	if auth == nil {
 		return ""
 	}
 	values := []string{auth.ID, auth.FileName, auth.Provider, auth.Label}
-	if priority, ok := authPriority(auth); ok {
+	if priority, ok := authPriorityForModelExclusion(auth); ok {
 		values = append(values, strconv.Itoa(priority))
 	}
 	if auth.Attributes != nil {

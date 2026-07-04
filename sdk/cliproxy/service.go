@@ -17,7 +17,6 @@ import (
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/api"
 	internalcodex "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/codex"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/authrules"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor"
 	internalusage "github.com/router-for-me/CLIProxyAPI/v6/internal/usage"
@@ -3263,7 +3262,7 @@ func applyAuthModelExclusions(cfg *config.Config, auth *coreauth.Auth, provider 
 		return models
 	}
 	blocked := make(map[string]struct{})
-	if authrules.AuthDisablesImageGeneration(cfg, auth, provider) {
+	if coreauth.AuthDisablesImageGeneration(cfg, auth, provider) {
 		for _, modelID := range configuredCodexImageModels(cfg) {
 			modelID = strings.ToLower(strings.TrimSpace(modelID))
 			if modelID != "" {
@@ -3274,7 +3273,7 @@ func applyAuthModelExclusions(cfg *config.Config, auth *coreauth.Auth, provider 
 	allowOnly := false
 	allowed := make(map[string]struct{})
 	for _, rule := range cfg.AuthModelExclusions {
-		if !authrules.AuthModelExclusionRuleMatches(rule, auth, provider) {
+		if !coreauth.AuthModelExclusionRuleMatches(rule, auth, provider) {
 			continue
 		}
 		allMode, ruleBlocked, ruleAllowed := parseAuthModelExclusionModels(rule.Models)

@@ -1968,7 +1968,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			}
 			return cliproxyexecutor.Response{}, &Error{Code: "request_body_released", Message: "request body released; retry disabled"}
 		}
-		auth, executor, provider, errPick := m.pickNextMixed(ctx, providers, routeModel, opts, roundState.tried, pickAllowed)
+		auth, executor, provider, errPick := m.pickNextMixedWithImageToolFallback(ctx, providers, routeModel, req, opts, roundState.tried, pickAllowed)
 		if errPick != nil {
 			if isModelCooldownError(errPick) {
 				return cliproxyexecutor.Response{}, errPick
@@ -2199,7 +2199,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			}
 			return nil, &Error{Code: "request_body_released", Message: "request body released; retry disabled"}
 		}
-		auth, executor, provider, errPick := m.pickNextMixed(ctx, providers, routeModel, opts, roundState.tried, pickAllowed)
+		auth, executor, provider, errPick := m.pickNextMixedWithImageToolFallback(ctx, providers, routeModel, req, opts, roundState.tried, pickAllowed)
 		if errPick != nil {
 			if isModelCooldownError(errPick) {
 				return nil, errPick
@@ -4285,6 +4285,75 @@ func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model s
 		m.mu.Unlock()
 	}
 	return authCopy, executor, providerKey, nil
+}
+
+func (m *Manager) pickNextMixedWithImageToolFallback(ctx context.Context, providers []string, model string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, tried map[string]struct{}, pickAllowed func(*Auth) bool) (*Auth, ProviderExecutor, string, error) {
+	cfg := m.currentConfig()
+	if !disabledImageGenerationToolFallbackEnabled(cfg) || !requestHasImageGenerationToolForFallback(req, opts) {
+		return m.pickNextMixed(ctx, providers, model, opts, tried, pickAllowed)
+	}
+	imageCapableAllowed := func(auth *Auth) bool {
+		if pickAllowed != nil && !pickAllowed(auth) {
+			return false
+		}
+		if !isCodexProvider(auth, auth.Provider) {
+			return false
+		}
+		return !AuthDisablesImageGeneration(cfg, auth, auth.Provider)
+	}
+	auth, executor, provider, errPick := m.pickNextMixed(ctx, providers, model, opts, tried, imageCapableAllowed)
+	if errPick == nil {
+		return auth, executor, provider, nil
+	}
+	if !shouldFallbackToDisabledImageGenerationToolAction(errPick) {
+		return nil, nil, "", errPick
+	}
+	return m.pickNextMixed(ctx, providers, model, opts, tried, pickAllowed)
+}
+
+func disabledImageGenerationToolFallbackEnabled(cfg *internalconfig.Config) bool {
+	return cfg != nil && cfg.DisabledImageGenerationToolFallback
+}
+
+func requestHasImageGenerationToolForFallback(req cliproxyexecutor.Request, opts cliproxyexecutor.Options) bool {
+	if strings.EqualFold(strings.TrimSpace(opts.SourceFormat.String()), "openai-image") {
+		return false
+	}
+	if executionModelOverrideFromMetadata(opts.Metadata) != "" {
+		return false
+	}
+	payload := req.Payload
+	if len(payload) == 0 {
+		payload = opts.OriginalRequest
+	}
+	return payloadHasImageGenerationTool(payload)
+}
+
+func payloadHasImageGenerationTool(payload []byte) bool {
+	if len(payload) == 0 {
+		return false
+	}
+	tools := gjson.GetBytes(payload, "tools")
+	if !tools.IsArray() {
+		return false
+	}
+	for _, tool := range tools.Array() {
+		if tool.Get("type").String() == "image_generation" {
+			return true
+		}
+	}
+	return false
+}
+
+func shouldFallbackToDisabledImageGenerationToolAction(err error) bool {
+	if err == nil || isModelCooldownError(err) {
+		return false
+	}
+	var authErr *Error
+	if !errors.As(err, &authErr) || authErr == nil {
+		return false
+	}
+	return authErr.Code == "auth_unavailable" || authErr.Code == "auth_not_found"
 }
 
 func (m *Manager) persist(ctx context.Context, auth *Auth) error {

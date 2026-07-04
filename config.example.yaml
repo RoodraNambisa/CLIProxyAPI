@@ -141,6 +141,7 @@ auth-model-exclusions: []
 
 # How to handle regular Codex text requests when a matched credential has image generation disabled
 # but the request body still carries an image_generation tool. Valid values: remove, error.
+disabled-image-generation-tool-fallback: false
 disabled-image-generation-tool-action: remove
 disabled-image-generation-tool-error:
   status-code: 400

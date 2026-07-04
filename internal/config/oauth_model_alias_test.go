@@ -254,6 +254,9 @@ func TestNormalizeDisabledImageGenerationToolDefaults(t *testing.T) {
 	if cfg.DisabledImageGenerationToolAction != DisabledImageGenerationToolActionRemove {
 		t.Fatalf("action = %q, want %q", cfg.DisabledImageGenerationToolAction, DisabledImageGenerationToolActionRemove)
 	}
+	if cfg.DisabledImageGenerationToolFallback {
+		t.Fatalf("fallback = true, want false")
+	}
 	if cfg.DisabledImageGenerationToolError.StatusCode != DefaultDisabledImageGenerationToolStatusCode {
 		t.Fatalf("status = %d, want %d", cfg.DisabledImageGenerationToolError.StatusCode, DefaultDisabledImageGenerationToolStatusCode)
 	}
@@ -282,5 +285,19 @@ func TestLoadConfigOptionalRejectsInvalidDisabledImageGenerationToolAction(t *te
 	}
 	if _, err := LoadConfigOptional(path, false); err == nil {
 		t.Fatal("LoadConfigOptional() error = nil, want invalid action error")
+	}
+}
+
+func TestLoadConfigOptionalEnablesDisabledImageGenerationToolFallback(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(`disabled-image-generation-tool-fallback: true`), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	cfg, err := LoadConfigOptional(path, false)
+	if err != nil {
+		t.Fatalf("LoadConfigOptional() error = %v", err)
+	}
+	if !cfg.DisabledImageGenerationToolFallback {
+		t.Fatal("fallback = false, want true")
 	}
 }

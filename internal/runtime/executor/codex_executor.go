@@ -12,7 +12,6 @@ import (
 	"time"
 
 	codexauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/codex"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/authrules"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/misc"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor/helps"
@@ -1477,7 +1476,7 @@ func codexHasImageGenerationTool(body []byte) bool {
 }
 
 func (e *CodexExecutor) applyDisabledImageGenerationToolPolicy(auth *cliproxyauth.Auth, body []byte) ([]byte, error) {
-	if !authrules.AuthDisablesImageGeneration(e.cfg, auth, e.Identifier()) || !codexHasImageGenerationTool(body) {
+	if !cliproxyauth.AuthDisablesImageGeneration(e.cfg, auth, e.Identifier()) || !codexHasImageGenerationTool(body) {
 		return body, nil
 	}
 	action, ok := config.NormalizeDisabledImageGenerationToolAction(disabledImageGenerationToolAction(e.cfg))

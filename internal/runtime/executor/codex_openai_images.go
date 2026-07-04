@@ -10,7 +10,6 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/authrules"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor/helps"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
@@ -71,7 +70,7 @@ func (e *CodexExecutor) executeOpenAIImage(ctx context.Context, auth *cliproxyau
 	if err != nil {
 		return resp, err
 	}
-	if authrules.AuthDisablesImageGeneration(e.cfg, auth, e.Identifier()) {
+	if cliproxyauth.AuthDisablesImageGeneration(e.cfg, auth, e.Identifier()) {
 		return resp, disabledImageGenerationToolError(e.cfg)
 	}
 
@@ -138,7 +137,7 @@ func (e *CodexExecutor) executeOpenAIImageStream(ctx context.Context, auth *clip
 	if err != nil {
 		return nil, err
 	}
-	if authrules.AuthDisablesImageGeneration(e.cfg, auth, e.Identifier()) {
+	if cliproxyauth.AuthDisablesImageGeneration(e.cfg, auth, e.Identifier()) {
 		return nil, disabledImageGenerationToolError(e.cfg)
 	}
 
