@@ -396,6 +396,8 @@ type RoutingPriorityOverride struct {
 	// MaxRetryCredentials optionally overrides the global per-round credential limit.
 	// Set to 0 to try all available credentials in this priority.
 	MaxRetryCredentials *int `yaml:"max-retry-credentials,omitempty" json:"max-retry-credentials,omitempty"`
+	// FillFirstRange optionally overrides routing.fill-first-range for this priority.
+	FillFirstRange *int `yaml:"fill-first-range,omitempty" json:"fill-first-range,omitempty"`
 }
 
 // RoutingConfig configures how credentials are selected for requests.
@@ -403,6 +405,9 @@ type RoutingConfig struct {
 	// Strategy selects the credential selection strategy.
 	// Supported values: "round-robin" (default), "fill-first", "random".
 	Strategy string `yaml:"strategy,omitempty" json:"strategy,omitempty"`
+
+	// FillFirstRange groups credentials for fill-first routing; 1 preserves legacy fill-first.
+	FillFirstRange int `yaml:"fill-first-range,omitempty" json:"fill-first-range,omitempty"`
 
 	// PriorityOverrides customizes routing behavior for specific credential priorities.
 	PriorityOverrides []RoutingPriorityOverride `yaml:"priority-overrides,omitempty" json:"priority-overrides,omitempty"`
@@ -953,6 +958,7 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	if cfg.MaxRetryCredentials < 0 {
 		cfg.MaxRetryCredentials = 0
 	}
+	cfg.Routing.FillFirstRange = NormalizeFillFirstRange(cfg.Routing.FillFirstRange)
 	if err = cfg.NormalizeRoutingPriorityOverrides(); err != nil {
 		if optional {
 			return &Config{}, nil
@@ -1663,6 +1669,14 @@ func NormalizeRoutingStrategy(strategy string) (string, bool) {
 	}
 }
 
+// NormalizeFillFirstRange returns a valid fill-first grouping size.
+func NormalizeFillFirstRange(value int) int {
+	if value < 1 {
+		return 1
+	}
+	return value
+}
+
 // NormalizeRoutingPriorityOverrides validates and canonicalizes per-priority routing overrides.
 func NormalizeRoutingPriorityOverrides(overrides []RoutingPriorityOverride) ([]RoutingPriorityOverride, error) {
 	if len(overrides) == 0 {
@@ -1693,11 +1707,17 @@ func NormalizeRoutingPriorityOverrides(overrides []RoutingPriorityOverride) ([]R
 			}
 			maxRetryCredentials = &value
 		}
+		var fillFirstRange *int
+		if override.FillFirstRange != nil {
+			value := NormalizeFillFirstRange(*override.FillFirstRange)
+			fillFirstRange = &value
+		}
 
 		out = append(out, RoutingPriorityOverride{
 			Priority:            override.Priority,
 			Strategy:            strategy,
 			MaxRetryCredentials: maxRetryCredentials,
+			FillFirstRange:      fillFirstRange,
 		})
 	}
 	return out, nil

@@ -118,11 +118,35 @@ func TestSchedulerPick_MixedPriorityStrategyOverrideBeatsGlobalStrategy(t *testi
 		if errPick != nil {
 			t.Fatalf("pickMixed() #%d error = %v", index, errPick)
 		}
-		if provider != "gemini" {
-			t.Fatalf("pickMixed() #%d provider = %q, want gemini", index, provider)
+		if provider != "claude" {
+			t.Fatalf("pickMixed() #%d provider = %q, want claude", index, provider)
 		}
-		if got == nil || got.ID != "gemini-a" {
-			t.Fatalf("pickMixed() #%d auth = %v, want gemini-a", index, got)
+		if got == nil || got.ID != "claude-a" {
+			t.Fatalf("pickMixed() #%d auth = %v, want claude-a", index, got)
+		}
+	}
+}
+
+func TestSchedulerPick_MixedFillFirstRangeGroupsAcrossProviders(t *testing.T) {
+	t.Parallel()
+
+	scheduler := newSchedulerForTest(
+		&FillFirstSelector{Range: 2},
+		&Auth{ID: "a-claude", Provider: "claude", Attributes: map[string]string{"priority": "0"}},
+		&Auth{ID: "b-gemini", Provider: "gemini", Attributes: map[string]string{"priority": "0"}},
+		&Auth{ID: "c-gemini", Provider: "gemini", Attributes: map[string]string{"priority": "0"}},
+	)
+
+	for index := 0; index < 40; index++ {
+		got, provider, errPick := scheduler.pickMixed(context.Background(), []string{"gemini", "claude"}, "", cliproxyexecutor.Options{}, nil)
+		if errPick != nil {
+			t.Fatalf("pickMixed() #%d error = %v", index, errPick)
+		}
+		if got == nil {
+			t.Fatalf("pickMixed() #%d auth = nil", index)
+		}
+		if got.ID != "a-claude" && got.ID != "b-gemini" {
+			t.Fatalf("pickMixed() #%d auth.ID = %q provider = %q, want first cross-provider fill group", index, got.ID, provider)
 		}
 	}
 }
@@ -173,6 +197,231 @@ func TestSchedulerPick_FillFirstSticksToFirstReady(t *testing.T) {
 		if got.ID != "a" {
 			t.Fatalf("pickSingle() #%d auth.ID = %q, want %q", index, got.ID, "a")
 		}
+	}
+}
+
+func TestSchedulerPick_FillFirstRangeUsesFirstGroup(t *testing.T) {
+	t.Parallel()
+
+	scheduler := newSchedulerForTest(
+		&FillFirstSelector{Range: 5},
+		&Auth{ID: "a", Provider: "gemini"},
+		&Auth{ID: "b", Provider: "gemini"},
+		&Auth{ID: "c", Provider: "gemini"},
+		&Auth{ID: "d", Provider: "gemini"},
+		&Auth{ID: "e", Provider: "gemini"},
+		&Auth{ID: "f", Provider: "gemini"},
+	)
+
+	for index := 0; index < 40; index++ {
+		got, errPick := scheduler.pickSingle(context.Background(), "gemini", "", cliproxyexecutor.Options{}, nil)
+		if errPick != nil {
+			t.Fatalf("pickSingle() #%d error = %v", index, errPick)
+		}
+		if got == nil {
+			t.Fatalf("pickSingle() #%d auth = nil", index)
+		}
+		if got.ID < "a" || got.ID > "e" {
+			t.Fatalf("pickSingle() #%d auth.ID = %q, want first fill range a-e", index, got.ID)
+		}
+	}
+}
+
+func TestSchedulerPick_FillFirstRangeKeepsPartialCoolingGroup(t *testing.T) {
+	t.Parallel()
+
+	model := schedulerTestID(t, "model")
+	aID := schedulerTestID(t, "a")
+	bID := schedulerTestID(t, "b")
+	cID := schedulerTestID(t, "c")
+	dID := schedulerTestID(t, "d")
+	registerSchedulerModels(t, "gemini", model, aID, bID, cID, dID)
+	scheduler := newSchedulerForTest(
+		&FillFirstSelector{Range: 3},
+		&Auth{
+			ID:       aID,
+			Provider: "gemini",
+			ModelStates: map[string]*ModelState{
+				model: {
+					Status:         StatusError,
+					Unavailable:    true,
+					NextRetryAfter: time.Now().Add(time.Hour),
+				},
+			},
+		},
+		&Auth{ID: bID, Provider: "gemini"},
+		&Auth{ID: cID, Provider: "gemini"},
+		&Auth{ID: dID, Provider: "gemini"},
+	)
+
+	for index := 0; index < 40; index++ {
+		got, errPick := scheduler.pickSingle(context.Background(), "gemini", model, cliproxyexecutor.Options{}, nil)
+		if errPick != nil {
+			t.Fatalf("pickSingle() #%d error = %v", index, errPick)
+		}
+		if got == nil {
+			t.Fatalf("pickSingle() #%d auth = nil", index)
+		}
+		if got.ID != bID && got.ID != cID {
+			t.Fatalf("pickSingle() #%d auth.ID = %q, want remaining ready auth from first group", index, got.ID)
+		}
+	}
+}
+
+func TestSchedulerPick_FillFirstRangeAdvancesWhenGroupUnavailable(t *testing.T) {
+	t.Parallel()
+
+	model := schedulerTestID(t, "model")
+	aID := schedulerTestID(t, "a")
+	bID := schedulerTestID(t, "b")
+	cID := schedulerTestID(t, "c")
+	dID := schedulerTestID(t, "d")
+	registerSchedulerModels(t, "gemini", model, aID, bID, cID, dID)
+	coolingState := func() map[string]*ModelState {
+		return map[string]*ModelState{
+			model: {
+				Status:         StatusError,
+				Unavailable:    true,
+				NextRetryAfter: time.Now().Add(time.Hour),
+			},
+		}
+	}
+	scheduler := newSchedulerForTest(
+		&FillFirstSelector{Range: 3},
+		&Auth{ID: aID, Provider: "gemini", ModelStates: coolingState()},
+		&Auth{ID: bID, Provider: "gemini", ModelStates: coolingState()},
+		&Auth{ID: cID, Provider: "gemini", ModelStates: coolingState()},
+		&Auth{ID: dID, Provider: "gemini"},
+	)
+
+	got, errPick := scheduler.pickSingle(context.Background(), "gemini", model, cliproxyexecutor.Options{}, nil)
+	if errPick != nil {
+		t.Fatalf("pickSingle() error = %v", errPick)
+	}
+	if got == nil || got.ID != dID {
+		t.Fatalf("pickSingle() auth = %v, want %s from second fill group", got, dID)
+	}
+}
+
+func TestSchedulerPick_FillFirstRangePriorityOverrideBeatsGlobal(t *testing.T) {
+	t.Parallel()
+
+	overrideRange := 2
+	scheduler := newSchedulerForTest(
+		&FillFirstSelector{Range: 5},
+		&Auth{ID: "a", Provider: "gemini", Attributes: map[string]string{"priority": "0"}},
+		&Auth{ID: "b", Provider: "gemini", Attributes: map[string]string{"priority": "0"}},
+		&Auth{ID: "c", Provider: "gemini", Attributes: map[string]string{"priority": "0"}},
+	)
+	scheduler.setRoutingConfig(internalconfig.RoutingConfig{
+		FillFirstRange: 5,
+		PriorityOverrides: []internalconfig.RoutingPriorityOverride{
+			{Priority: 0, FillFirstRange: &overrideRange},
+		},
+	})
+
+	for index := 0; index < 40; index++ {
+		got, errPick := scheduler.pickSingle(context.Background(), "gemini", "", cliproxyexecutor.Options{}, nil)
+		if errPick != nil {
+			t.Fatalf("pickSingle() #%d error = %v", index, errPick)
+		}
+		if got == nil {
+			t.Fatalf("pickSingle() #%d auth = nil", index)
+		}
+		if got.ID != "a" && got.ID != "b" {
+			t.Fatalf("pickSingle() #%d auth.ID = %q, want override range a-b", index, got.ID)
+		}
+	}
+}
+
+func TestSchedulerPick_FillFirstRangeDoesNotAffectRoundRobin(t *testing.T) {
+	t.Parallel()
+
+	scheduler := newSchedulerForTest(
+		&RoundRobinSelector{},
+		&Auth{ID: "a", Provider: "gemini"},
+		&Auth{ID: "b", Provider: "gemini"},
+	)
+	scheduler.setRoutingConfig(internalconfig.RoutingConfig{FillFirstRange: 2})
+
+	want := []string{"a", "b", "a"}
+	for index, wantID := range want {
+		got, errPick := scheduler.pickSingle(context.Background(), "gemini", "", cliproxyexecutor.Options{}, nil)
+		if errPick != nil {
+			t.Fatalf("pickSingle() #%d error = %v", index, errPick)
+		}
+		if got == nil || got.ID != wantID {
+			t.Fatalf("pickSingle() #%d auth = %v, want %s", index, got, wantID)
+		}
+	}
+}
+
+func TestManagerPrioritySelectorForAvailable_UsesSessionAffinityFallbackFillFirstRangeOverride(t *testing.T) {
+	t.Parallel()
+
+	overrideRange := 2
+	manager := NewManager(nil, NewSessionAffinitySelector(&FillFirstSelector{}), nil)
+	manager.SetConfig(&internalconfig.Config{
+		Routing: internalconfig.RoutingConfig{
+			PriorityOverrides: []internalconfig.RoutingPriorityOverride{
+				{Priority: 0, FillFirstRange: &overrideRange},
+			},
+		},
+	})
+
+	selector, ok := manager.prioritySelectorForAvailable([]*Auth{
+		{ID: "a", Attributes: map[string]string{"priority": "0"}},
+	})
+	if !ok {
+		t.Fatalf("prioritySelectorForAvailable() override = false, want true")
+	}
+	fillFirst, ok := selector.(*FillFirstSelector)
+	if !ok {
+		t.Fatalf("prioritySelectorForAvailable() selector = %T, want *FillFirstSelector", selector)
+	}
+	if fillFirst.Range != overrideRange {
+		t.Fatalf("FillFirstSelector.Range = %d, want %d", fillFirst.Range, overrideRange)
+	}
+}
+
+func TestManagerPickLegacyFillFirstRangeAuth_SessionAffinityUsesFixedGroups(t *testing.T) {
+	t.Parallel()
+
+	manager := NewManager(nil, NewSessionAffinitySelector(&FillFirstSelector{Range: 3}), nil)
+	manager.SetConfig(&internalconfig.Config{Routing: internalconfig.RoutingConfig{FillFirstRange: 3}})
+	model := schedulerTestID(t, "model")
+	candidates := []*Auth{
+		{
+			ID:       "a",
+			Provider: "gemini",
+			ModelStates: map[string]*ModelState{
+				model: {
+					Status:         StatusError,
+					Unavailable:    true,
+					NextRetryAfter: time.Now().Add(time.Hour),
+				},
+			},
+		},
+		{ID: "b", Provider: "gemini"},
+		{ID: "c", Provider: "gemini"},
+		{ID: "d", Provider: "gemini"},
+	}
+	opts := cliproxyexecutor.Options{
+		Headers: http.Header{"Session-Id": {"range-session"}},
+	}
+
+	got, handled, errPick := manager.pickLegacyFillFirstRangeAuth(context.Background(), "gemini", model, opts, candidates, nil)
+	if errPick != nil {
+		t.Fatalf("pickLegacyFillFirstRangeAuth() error = %v", errPick)
+	}
+	if !handled {
+		t.Fatalf("pickLegacyFillFirstRangeAuth() handled = false, want true")
+	}
+	if got == nil {
+		t.Fatalf("pickLegacyFillFirstRangeAuth() auth = nil")
+	}
+	if got.ID != "b" && got.ID != "c" {
+		t.Fatalf("pickLegacyFillFirstRangeAuth() auth.ID = %q, want remaining ready auth from first group", got.ID)
 	}
 }
 

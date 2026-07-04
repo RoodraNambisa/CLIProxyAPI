@@ -2252,6 +2252,7 @@ func (s *Service) Run(ctx context.Context) error {
 		var previousSessionAffinity bool
 		var previousSessionAffinityTTL string
 		var previousSessionAffinityFailover bool
+		var previousFillFirstRange int
 		var previousCfgSnapshot *config.Config
 		s.cfgMu.RLock()
 		if s.cfg != nil {
@@ -2261,6 +2262,7 @@ func (s *Service) Run(ctx context.Context) error {
 			previousSessionAffinity = s.cfg.Routing.ClaudeCodeSessionAffinity || s.cfg.Routing.SessionAffinity
 			previousSessionAffinityTTL = s.cfg.Routing.SessionAffinityTTL
 			previousSessionAffinityFailover = routingSessionAffinityFailoverEnabled(s.cfg)
+			previousFillFirstRange = normalizedRoutingFillFirstRange(s.cfg)
 			previousCfgSnapshot = s.cfg
 		}
 		s.cfgMu.RUnlock()
@@ -2291,17 +2293,19 @@ func (s *Service) Run(ctx context.Context) error {
 		nextSessionAffinity := newCfg.Routing.ClaudeCodeSessionAffinity || newCfg.Routing.SessionAffinity
 		nextSessionAffinityTTL := newCfg.Routing.SessionAffinityTTL
 		nextSessionAffinityFailover := routingSessionAffinityFailoverEnabled(newCfg)
+		nextFillFirstRange := normalizedRoutingFillFirstRange(newCfg)
 
 		selectorChanged := previousStrategy != nextStrategy ||
 			previousSessionAffinity != nextSessionAffinity ||
 			previousSessionAffinityTTL != nextSessionAffinityTTL ||
-			previousSessionAffinityFailover != nextSessionAffinityFailover
+			previousSessionAffinityFailover != nextSessionAffinityFailover ||
+			(previousStrategy == "fill-first" || nextStrategy == "fill-first") && previousFillFirstRange != nextFillFirstRange
 
 		if s.coreManager != nil && selectorChanged {
 			var selector coreauth.Selector
 			switch nextStrategy {
 			case "fill-first":
-				selector = &coreauth.FillFirstSelector{}
+				selector = &coreauth.FillFirstSelector{Range: nextFillFirstRange}
 			case "random":
 				selector = &coreauth.RandomSelector{}
 			default:

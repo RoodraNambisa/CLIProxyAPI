@@ -395,6 +395,10 @@ func clampNonNegativeInt(value int) int {
 	return value
 }
 
+func normalizeFillFirstRange(value int) int {
+	return config.NormalizeFillFirstRange(value)
+}
+
 // RoutingStrategy
 func (h *Handler) GetRoutingStrategy(c *gin.Context) {
 	strategy, ok := normalizeRoutingStrategy(h.cfg.Routing.Strategy)
@@ -418,6 +422,22 @@ func (h *Handler) PutRoutingStrategy(c *gin.Context) {
 		return
 	}
 	h.cfg.Routing.Strategy = normalized
+	h.persist(c)
+}
+
+func (h *Handler) GetRoutingFillFirstRange(c *gin.Context) {
+	c.JSON(200, gin.H{"fill-first-range": normalizeFillFirstRange(h.cfg.Routing.FillFirstRange)})
+}
+
+func (h *Handler) PutRoutingFillFirstRange(c *gin.Context) {
+	var body struct {
+		Value *int `json:"value"`
+	}
+	if errBindJSON := c.ShouldBindJSON(&body); errBindJSON != nil || body.Value == nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
+		return
+	}
+	h.cfg.Routing.FillFirstRange = normalizeFillFirstRange(*body.Value)
 	h.persist(c)
 }
 

@@ -2,6 +2,7 @@ package management
 
 import (
 	"bytes"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -206,7 +207,7 @@ func TestPutRoutingPriorityOverrides_NormalizesValues(t *testing.T) {
 
 	rec := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(rec)
-	c.Request = httptest.NewRequest(http.MethodPut, "/v0/management/routing/priority-overrides", bytes.NewBufferString(`{"value":[{"priority":0,"strategy":"ff","max-retry-credentials":2},{"priority":-1,"max-retry-credentials":-3}]}`))
+	c.Request = httptest.NewRequest(http.MethodPut, "/v0/management/routing/priority-overrides", bytes.NewBufferString(`{"value":[{"priority":0,"strategy":"ff","max-retry-credentials":2,"fill-first-range":5},{"priority":-1,"max-retry-credentials":-3,"fill-first-range":0}]}`))
 	c.Request.Header.Set("Content-Type", "application/json")
 
 	h.PutRoutingPriorityOverrides(c)
@@ -221,9 +222,55 @@ func TestPutRoutingPriorityOverrides_NormalizesValues(t *testing.T) {
 	if first.Strategy != "fill-first" || first.MaxRetryCredentials == nil || *first.MaxRetryCredentials != 2 {
 		t.Fatalf("first override = %+v, want fill-first limit 2", first)
 	}
+	if first.FillFirstRange == nil || *first.FillFirstRange != 5 {
+		t.Fatalf("first FillFirstRange = %v, want 5", first.FillFirstRange)
+	}
 	second := h.cfg.Routing.PriorityOverrides[1]
 	if second.MaxRetryCredentials == nil || *second.MaxRetryCredentials != 0 {
 		t.Fatalf("second override = %+v, want limit 0", second)
+	}
+	if second.FillFirstRange == nil || *second.FillFirstRange != 1 {
+		t.Fatalf("second FillFirstRange = %v, want 1", second.FillFirstRange)
+	}
+}
+
+func TestRoutingFillFirstRangeHandlers_NormalizeValues(t *testing.T) {
+	t.Parallel()
+
+	h := &Handler{
+		cfg:            &config.Config{},
+		configFilePath: writeTestConfigFile(t),
+	}
+
+	putRec := httptest.NewRecorder()
+	putCtx, _ := gin.CreateTestContext(putRec)
+	putCtx.Request = httptest.NewRequest(http.MethodPatch, "/v0/management/routing/fill-first-range", bytes.NewBufferString(`{"value":0}`))
+	putCtx.Request.Header.Set("Content-Type", "application/json")
+
+	h.PutRoutingFillFirstRange(putCtx)
+
+	if putRec.Code != http.StatusOK {
+		t.Fatalf("PUT status = %d, want %d; body=%s", putRec.Code, http.StatusOK, putRec.Body.String())
+	}
+	if h.cfg.Routing.FillFirstRange != 1 {
+		t.Fatalf("FillFirstRange = %d, want 1", h.cfg.Routing.FillFirstRange)
+	}
+
+	getRec := httptest.NewRecorder()
+	getCtx, _ := gin.CreateTestContext(getRec)
+	getCtx.Request = httptest.NewRequest(http.MethodGet, "/v0/management/routing/fill-first-range", nil)
+
+	h.GetRoutingFillFirstRange(getCtx)
+
+	if getRec.Code != http.StatusOK {
+		t.Fatalf("GET status = %d, want %d; body=%s", getRec.Code, http.StatusOK, getRec.Body.String())
+	}
+	var body map[string]int
+	if errDecode := json.Unmarshal(getRec.Body.Bytes(), &body); errDecode != nil {
+		t.Fatalf("decode response: %v", errDecode)
+	}
+	if body["fill-first-range"] != 1 {
+		t.Fatalf("fill-first-range response = %d, want 1", body["fill-first-range"])
 	}
 }
 

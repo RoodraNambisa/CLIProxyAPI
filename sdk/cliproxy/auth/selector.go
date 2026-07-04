@@ -33,7 +33,9 @@ type RoundRobinSelector struct {
 // FillFirstSelector selects the first available credential (deterministic ordering).
 // This "burns" one account before moving to the next, which can help stagger
 // rolling-window subscription caps (e.g. chat message limits).
-type FillFirstSelector struct{}
+type FillFirstSelector struct {
+	Range int
+}
 
 // RandomSelector selects a random credential from the active priority tier.
 // Retry attempts can opt into lower-priority tiers via selection metadata.
@@ -523,14 +525,146 @@ func groupByVirtualParent(auths []*Auth) (map[string][]*Auth, []string) {
 	return groups, parentOrder
 }
 
-// Pick selects the first available auth for the provider in a deterministic manner.
+// Pick selects the first fill group with available auths, then randomly selects within that group.
 func (s *FillFirstSelector) Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error) {
 	now := time.Now()
+	fillFirstRange := normalizeFillFirstRangeValue(s.Range)
+	if fillFirstRange > 1 {
+		return selectFillFirstRangeAuthsForContext(ctx, auths, provider, model, now, selectionAttemptFromMetadata(opts.Metadata), fillFirstRange, nil, nil)
+	}
 	available, err := getAvailableAuthsForContext(ctx, auths, provider, model, now, selectionAttemptFromMetadata(opts.Metadata))
 	if err != nil {
 		return nil, err
 	}
 	return available[0], nil
+}
+
+func normalizeFillFirstRangeValue(value int) int {
+	if value < 1 {
+		return 1
+	}
+	return value
+}
+
+func selectFillFirstRangeAuthsForContext(ctx context.Context, auths []*Auth, provider, model string, now time.Time, selectionAttempt int, fillFirstRange int, modelForAuth func(*Auth) string, pickAllowed func(*Auth) bool) (*Auth, error) {
+	if shouldPreferCodexWebsocket(ctx, provider) {
+		websocketAuths := make([]*Auth, 0, len(auths))
+		hasReadyWebsocket := false
+		for _, auth := range auths {
+			if !authWebsocketsEnabled(auth) {
+				continue
+			}
+			websocketAuths = append(websocketAuths, auth)
+			checkModel := model
+			if modelForAuth != nil {
+				checkModel = modelForAuth(auth)
+			}
+			blocked, _, _ := isAuthBlockedForModel(auth, checkModel, now)
+			if !blocked && (pickAllowed == nil || pickAllowed(auth)) {
+				hasReadyWebsocket = true
+			}
+		}
+		if hasReadyWebsocket {
+			return selectFillFirstRangeAuthsForAttempt(websocketAuths, provider, model, now, selectionAttempt, fillFirstRange, modelForAuth, pickAllowed)
+		}
+	}
+	return selectFillFirstRangeAuthsForAttempt(auths, provider, model, now, selectionAttempt, fillFirstRange, modelForAuth, pickAllowed)
+}
+
+func selectFillFirstRangeAuthsForAttempt(auths []*Auth, provider, model string, now time.Time, selectionAttempt int, fillFirstRange int, modelForAuth func(*Auth) string, pickAllowed func(*Auth) bool) (*Auth, error) {
+	if len(auths) == 0 {
+		return nil, &Error{Code: "auth_not_found", Message: "no auth candidates"}
+	}
+	fillFirstRange = normalizeFillFirstRangeValue(fillFirstRange)
+	membersByPriority := make(map[int][]*Auth)
+	readyByPriority := make(map[int]map[string]*Auth)
+	blockedByPriority := make(map[int]priorityBlockInfo)
+	prioritySet := make(map[int]struct{})
+	for _, candidate := range auths {
+		if candidate == nil {
+			continue
+		}
+		priority := authPriority(candidate)
+		checkModel := model
+		if modelForAuth != nil {
+			checkModel = modelForAuth(candidate)
+		}
+		blocked, reason, next := isAuthBlockedForModel(candidate, checkModel, now)
+		allowed := pickAllowed == nil || pickAllowed(candidate)
+		if !blocked {
+			prioritySet[priority] = struct{}{}
+			membersByPriority[priority] = append(membersByPriority[priority], candidate)
+			if allowed {
+				if readyByPriority[priority] == nil {
+					readyByPriority[priority] = make(map[string]*Auth)
+				}
+				readyByPriority[priority][candidate.ID] = candidate
+			}
+			continue
+		}
+		if reason == blockReasonDisabled || next.IsZero() {
+			continue
+		}
+		prioritySet[priority] = struct{}{}
+		membersByPriority[priority] = append(membersByPriority[priority], candidate)
+		if allowed {
+			info := blockedByPriority[priority]
+			if info.earliest.IsZero() || next.Before(info.earliest) {
+				info.earliest = next
+				blockedByPriority[priority] = info
+			}
+		}
+	}
+	if len(prioritySet) == 0 {
+		return nil, &Error{Code: "auth_unavailable", Message: "no auth available"}
+	}
+	priorities := make([]int, 0, len(prioritySet))
+	for priority := range prioritySet {
+		priorities = append(priorities, priority)
+	}
+	sort.Slice(priorities, func(i, j int) bool { return priorities[i] > priorities[j] })
+	var earliest time.Time
+	for _, priority := range selectionPrioritiesForAttempt(priorities, selectionAttempt) {
+		members := append([]*Auth(nil), membersByPriority[priority]...)
+		if len(members) == 0 {
+			continue
+		}
+		sort.Slice(members, func(i, j int) bool { return members[i].ID < members[j].ID })
+		readyByID := readyByPriority[priority]
+		for start := 0; start < len(members); start += fillFirstRange {
+			end := start + fillFirstRange
+			if end > len(members) {
+				end = len(members)
+			}
+			candidates := make([]*Auth, 0, end-start)
+			for _, member := range members[start:end] {
+				if ready := readyByID[member.ID]; ready != nil {
+					candidates = append(candidates, ready)
+				}
+			}
+			if len(candidates) == 1 {
+				return candidates[0], nil
+			}
+			if len(candidates) > 1 {
+				return candidates[rand.IntN(len(candidates))], nil
+			}
+		}
+		if info, ok := blockedByPriority[priority]; ok && !info.earliest.IsZero() && (earliest.IsZero() || info.earliest.Before(earliest)) {
+			earliest = info.earliest
+		}
+	}
+	if !earliest.IsZero() {
+		providerForError := provider
+		if providerForError == "mixed" {
+			providerForError = ""
+		}
+		resetIn := earliest.Sub(now)
+		if resetIn < 0 {
+			resetIn = 0
+		}
+		return nil, newModelCooldownError(model, providerForError, resetIn)
+	}
+	return nil, &Error{Code: "auth_unavailable", Message: "no auth available"}
 }
 
 func (s *RandomSelector) Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error) {
@@ -758,6 +892,65 @@ func (s *SessionAffinitySelector) pickWithFallback(ctx context.Context, provider
 	}
 
 	auth, err := fallback.Pick(ctx, provider, model, opts, available)
+	if err != nil {
+		return nil, err
+	}
+	s.cache.Set(cacheKey, auth.ID)
+	entry.Infof("session-affinity: cache miss, new binding | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
+	return auth, nil
+}
+
+func (s *SessionAffinitySelector) pickWithPreparedFallback(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, available []*Auth, pickFallback func() (*Auth, error)) (*Auth, error) {
+	if pickFallback == nil {
+		return nil, &Error{Code: "auth_not_found", Message: "no auth available"}
+	}
+	entry := selectorLogEntry(ctx)
+	primaryID, fallbackID := extractSessionIDs(opts.Headers, opts.OriginalRequest, opts.Metadata)
+	if primaryID == "" {
+		entry.Debugf("session-affinity: no session ID extracted, falling back to default selector | provider=%s model=%s", provider, model)
+		return pickFallback()
+	}
+
+	cacheKey := provider + "::" + primaryID + "::" + model
+	if cachedAuthID, ok := s.cache.GetAndRefresh(cacheKey); ok {
+		for _, auth := range available {
+			if auth.ID == cachedAuthID {
+				entry.Infof("session-affinity: cache hit | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
+				return auth, nil
+			}
+		}
+		if !s.failover {
+			err := &Error{
+				Code:       "session_bound_auth_unavailable",
+				Message:    fmt.Sprintf("session is bound to unavailable auth %s", cachedAuthID),
+				HTTPStatus: http.StatusServiceUnavailable,
+			}
+			entry.Infof("session-affinity: cache hit but auth unavailable, strict failover disabled | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), cachedAuthID, provider, model)
+			return nil, err
+		}
+		auth, err := pickFallback()
+		if err != nil {
+			return nil, err
+		}
+		s.cache.Set(cacheKey, auth.ID)
+		entry.Infof("session-affinity: cache hit but auth unavailable, reselected | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
+		return auth, nil
+	}
+
+	if fallbackID != "" && fallbackID != primaryID {
+		fallbackKey := provider + "::" + fallbackID + "::" + model
+		if cachedAuthID, ok := s.cache.Get(fallbackKey); ok {
+			for _, auth := range available {
+				if auth.ID == cachedAuthID {
+					s.cache.Set(cacheKey, auth.ID)
+					entry.Infof("session-affinity: fallback cache hit | session=%s fallback=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), truncateSessionID(fallbackID), auth.ID, provider, model)
+					return auth, nil
+				}
+			}
+		}
+	}
+
+	auth, err := pickFallback()
 	if err != nil {
 		return nil, err
 	}

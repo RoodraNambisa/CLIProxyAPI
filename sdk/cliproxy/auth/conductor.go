@@ -622,7 +622,7 @@ func (m *Manager) SetConfig(cfg *internalconfig.Config) {
 	}
 	m.runtimeConfig.Store(cfg)
 	if m.scheduler != nil {
-		m.scheduler.setRoutingPriorityOverrides(cfg.Routing.PriorityOverrides)
+		m.scheduler.setRoutingConfig(cfg.Routing)
 	}
 	m.rebuildAPIKeyModelAliasFromRuntimeConfig()
 }
@@ -961,14 +961,57 @@ func (m *Manager) routingStrategyOverrideForPriority(priority int) (schedulerStr
 	return schedulerStrategyRoundRobin, false
 }
 
-func (m *Manager) legacyPrioritySelector(priority int, strategy schedulerStrategy) Selector {
+func (m *Manager) routingFillFirstRangeOverrideForPriority(priority int) (int, bool) {
+	if m == nil {
+		return 1, false
+	}
+	cfg, _ := m.runtimeConfig.Load().(*internalconfig.Config)
+	if cfg == nil {
+		return 1, false
+	}
+	for _, override := range cfg.Routing.PriorityOverrides {
+		if override.Priority != priority || override.FillFirstRange == nil {
+			continue
+		}
+		return normalizeFillFirstRangeValue(*override.FillFirstRange), true
+	}
+	return 1, false
+}
+
+func (m *Manager) routingFillFirstRangeForPriority(priority int) int {
+	if m == nil {
+		return 1
+	}
+	if value, ok := m.routingFillFirstRangeOverrideForPriority(priority); ok {
+		return value
+	}
+	cfg, _ := m.runtimeConfig.Load().(*internalconfig.Config)
+	if cfg == nil {
+		return 1
+	}
+	return normalizeFillFirstRangeValue(cfg.Routing.FillFirstRange)
+}
+
+func (m *Manager) routingStrategyForPriority(priority int) schedulerStrategy {
+	if strategy, ok := m.routingStrategyOverrideForPriority(priority); ok {
+		return strategy
+	}
+	if m == nil {
+		return schedulerStrategyRoundRobin
+	}
+	return selectorStrategy(m.selector)
+}
+
+func (m *Manager) legacyPrioritySelector(priority int, strategy schedulerStrategy, fillFirstRange int) Selector {
 	if m == nil {
 		return &RoundRobinSelector{}
 	}
-	if selectorStrategy(m.selector) == strategy {
-		return m.selector
+	fillFirstRange = normalizeFillFirstRangeValue(fillFirstRange)
+	base := baseSelector(m.selector)
+	if selectorStrategy(base) == strategy && (strategy != schedulerStrategyFillFirst || fillFirstRangeFromSelector(base) == fillFirstRange) {
+		return base
 	}
-	key := strconv.Itoa(priority) + ":" + strconv.Itoa(int(strategy))
+	key := strconv.Itoa(priority) + ":" + strconv.Itoa(int(strategy)) + ":" + strconv.Itoa(fillFirstRange)
 	if cached, ok := m.prioritySelectors.Load(key); ok {
 		if selector, okSelector := cached.(Selector); okSelector && selector != nil {
 			return selector
@@ -977,7 +1020,7 @@ func (m *Manager) legacyPrioritySelector(priority int, strategy schedulerStrateg
 	var selector Selector
 	switch strategy {
 	case schedulerStrategyFillFirst:
-		selector = &FillFirstSelector{}
+		selector = &FillFirstSelector{Range: fillFirstRange}
 	case schedulerStrategyRandom:
 		selector = &RandomSelector{}
 	default:
@@ -996,10 +1039,55 @@ func (m *Manager) prioritySelectorForAvailable(available []*Auth) (Selector, boo
 	}
 	priority := authPriority(available[0])
 	strategy, ok := m.routingStrategyOverrideForPriority(priority)
+	fillFirstRange := m.routingFillFirstRangeForPriority(priority)
 	if !ok {
-		return nil, false
+		strategy = selectorStrategy(m.selector)
+		if strategy != schedulerStrategyFillFirst || fillFirstRange <= 1 {
+			return nil, false
+		}
+		return m.legacyPrioritySelector(priority, strategy, fillFirstRange), true
 	}
-	return m.legacyPrioritySelector(priority, strategy), true
+	if strategy != schedulerStrategyFillFirst {
+		fillFirstRange = 1
+	}
+	return m.legacyPrioritySelector(priority, strategy, fillFirstRange), true
+}
+
+func (m *Manager) pickLegacyFillFirstRangeAuth(ctx context.Context, provider, routeModel string, opts cliproxyexecutor.Options, candidates []*Auth, pickAllowed func(*Auth) bool) (*Auth, bool, error) {
+	if len(candidates) == 0 || m == nil {
+		return nil, false, nil
+	}
+	sessionSelector, hasSessionSelector := m.selector.(*SessionAffinitySelector)
+	if !isBuiltInSelector(m.selector) && !hasSessionSelector {
+		return nil, false, nil
+	}
+	available, errAvailable := m.availableAuthsForRouteModelFilteredForContext(ctx, candidates, provider, routeModel, opts, time.Now(), pickAllowed)
+	if errAvailable != nil {
+		return nil, true, errAvailable
+	}
+	if len(available) == 0 {
+		return nil, true, &Error{Code: "auth_not_found", Message: "no auth available"}
+	}
+	priority := authPriority(available[0])
+	strategy := m.routingStrategyForPriority(priority)
+	if strategy != schedulerStrategyFillFirst {
+		return nil, false, nil
+	}
+	fillFirstRange := m.routingFillFirstRangeForPriority(priority)
+	if fillFirstRange <= 1 {
+		return nil, false, nil
+	}
+	pickFallback := func() (*Auth, error) {
+		return selectFillFirstRangeAuthsForContext(ctx, candidates, provider, routeModel, time.Now(), selectionAttemptFromMetadata(opts.Metadata), fillFirstRange, func(auth *Auth) string {
+			return m.selectionModelForAuth(auth, routeModel)
+		}, pickAllowed)
+	}
+	if hasSessionSelector && sessionSelector != nil {
+		selected, errPick := sessionSelector.pickWithPreparedFallback(ctx, provider, routeModel, opts, available, pickFallback)
+		return selected, true, errPick
+	}
+	selected, errPick := pickFallback()
+	return selected, true, errPick
 }
 
 func (m *Manager) pickAvailableAuthWithPriorityPolicy(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, available []*Auth) (*Auth, error) {
@@ -4028,13 +4116,35 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 		m.mu.RUnlock()
 		return nil, nil, &Error{Code: "auth_not_found", Message: "no auth available"}
 	}
-	available, errAvailable := m.availableAuthsForRouteModelFilteredForContext(ctx, candidates, provider, model, opts, time.Now(), func(auth *Auth) bool {
+	pickAllowed := func(auth *Auth) bool {
 		if auth == nil {
 			return false
 		}
 		_, used := tried[auth.ID]
 		return !used
-	})
+	}
+	if selected, handled, errPick := m.pickLegacyFillFirstRangeAuth(ctx, provider, model, opts, candidates, pickAllowed); handled {
+		if errPick != nil {
+			m.mu.RUnlock()
+			return nil, nil, errPick
+		}
+		if selected == nil {
+			m.mu.RUnlock()
+			return nil, nil, &Error{Code: "auth_not_found", Message: "selector returned no auth"}
+		}
+		authCopy := selected.Clone()
+		m.mu.RUnlock()
+		if !selected.indexAssigned {
+			m.mu.Lock()
+			if current := m.auths[authCopy.ID]; current != nil && !current.indexAssigned {
+				current.EnsureIndex()
+				authCopy = current.Clone()
+			}
+			m.mu.Unlock()
+		}
+		return authCopy, executor, nil
+	}
+	available, errAvailable := m.availableAuthsForRouteModelFilteredForContext(ctx, candidates, provider, model, opts, time.Now(), pickAllowed)
 	if errAvailable != nil {
 		m.mu.RUnlock()
 		return nil, nil, errAvailable
@@ -4166,7 +4276,7 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 			selectorProvider = providerKey
 		}
 	}
-	available, errAvailable := m.availableAuthsForRouteModelFilteredForContext(ctx, candidates, selectorProvider, model, opts, time.Now(), func(auth *Auth) bool {
+	pickAllowedForSelection := func(auth *Auth) bool {
 		if auth == nil {
 			return false
 		}
@@ -4175,7 +4285,35 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 			return false
 		}
 		return pickAllowed == nil || pickAllowed(auth)
-	})
+	}
+	if selected, handled, errPick := m.pickLegacyFillFirstRangeAuth(ctx, selectorProvider, model, opts, candidates, pickAllowedForSelection); handled {
+		if errPick != nil {
+			m.mu.RUnlock()
+			return nil, nil, "", errPick
+		}
+		if selected == nil {
+			m.mu.RUnlock()
+			return nil, nil, "", &Error{Code: "auth_not_found", Message: "selector returned no auth"}
+		}
+		providerKey := strings.TrimSpace(strings.ToLower(selected.Provider))
+		executor, okExecutor := m.executors[providerKey]
+		if !okExecutor {
+			m.mu.RUnlock()
+			return nil, nil, "", &Error{Code: "executor_not_found", Message: "executor not registered"}
+		}
+		authCopy := selected.Clone()
+		m.mu.RUnlock()
+		if !selected.indexAssigned {
+			m.mu.Lock()
+			if current := m.auths[authCopy.ID]; current != nil && !current.indexAssigned {
+				current.EnsureIndex()
+				authCopy = current.Clone()
+			}
+			m.mu.Unlock()
+		}
+		return authCopy, executor, providerKey, nil
+	}
+	available, errAvailable := m.availableAuthsForRouteModelFilteredForContext(ctx, candidates, selectorProvider, model, opts, time.Now(), pickAllowedForSelection)
 	if errAvailable != nil {
 		m.mu.RUnlock()
 		return nil, nil, "", errAvailable

@@ -226,7 +226,7 @@ func (b *Builder) Build() (*Service, error) {
 		var selector coreauth.Selector
 		switch strategy {
 		case "fill-first", "fillfirst", "ff":
-			selector = &coreauth.FillFirstSelector{}
+			selector = &coreauth.FillFirstSelector{Range: normalizedRoutingFillFirstRange(b.cfg)}
 		case "random", "rand", "r":
 			selector = &coreauth.RandomSelector{}
 		default:
@@ -269,4 +269,11 @@ func routingSessionAffinityFailoverEnabled(cfg *config.Config) bool {
 		return true
 	}
 	return *cfg.Routing.SessionAffinityFailover
+}
+
+func normalizedRoutingFillFirstRange(cfg *config.Config) int {
+	if cfg == nil || cfg.Routing.FillFirstRange < 1 {
+		return 1
+	}
+	return cfg.Routing.FillFirstRange
 }

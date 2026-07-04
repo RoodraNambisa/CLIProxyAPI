@@ -202,6 +202,7 @@ auth-maintenance:
 # Routing strategy for selecting credentials when multiple match.
 routing:
   strategy: "round-robin" # round-robin (default), fill-first, random
+  fill-first-range: 1 # fill-first only; N credentials per fill group, group-internal random
   # Optional per-priority overrides. These take precedence over routing.strategy
   # and the global max-retry-credentials for the matching priority.
   # max-retry-credentials counts the first credential in the round; 1 means no
@@ -211,6 +212,7 @@ routing:
   # priority-overrides:
   #   - priority: 0
   #     strategy: fill-first
+  #     fill-first-range: 5
   #     max-retry-credentials: 2
   #   - priority: -1
   #     strategy: random

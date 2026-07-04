@@ -36,12 +36,15 @@ func TestLoadConfigOptional_RoutingPriorityOverrides(t *testing.T) {
 	configPath := filepath.Join(dir, "config.yaml")
 	configYAML := []byte(`
 routing:
+  fill-first-range: 0
   priority-overrides:
     - priority: 0
       strategy: ff
       max-retry-credentials: 2
+      fill-first-range: 5
     - priority: -1
       max-retry-credentials: -4
+      fill-first-range: -2
 `)
 	if err := os.WriteFile(configPath, configYAML, 0o600); err != nil {
 		t.Fatalf("failed to write config: %v", err)
@@ -54,6 +57,9 @@ routing:
 	if len(cfg.Routing.PriorityOverrides) != 2 {
 		t.Fatalf("PriorityOverrides length = %d, want 2", len(cfg.Routing.PriorityOverrides))
 	}
+	if cfg.Routing.FillFirstRange != 1 {
+		t.Fatalf("FillFirstRange = %d, want 1", cfg.Routing.FillFirstRange)
+	}
 	first := cfg.Routing.PriorityOverrides[0]
 	if first.Priority != 0 || first.Strategy != "fill-first" {
 		t.Fatalf("first override = %+v, want priority 0 fill-first", first)
@@ -61,12 +67,18 @@ routing:
 	if first.MaxRetryCredentials == nil || *first.MaxRetryCredentials != 2 {
 		t.Fatalf("first MaxRetryCredentials = %v, want 2", first.MaxRetryCredentials)
 	}
+	if first.FillFirstRange == nil || *first.FillFirstRange != 5 {
+		t.Fatalf("first FillFirstRange = %v, want 5", first.FillFirstRange)
+	}
 	second := cfg.Routing.PriorityOverrides[1]
 	if second.Priority != -1 {
 		t.Fatalf("second priority = %d, want -1", second.Priority)
 	}
 	if second.MaxRetryCredentials == nil || *second.MaxRetryCredentials != 0 {
 		t.Fatalf("second MaxRetryCredentials = %v, want 0", second.MaxRetryCredentials)
+	}
+	if second.FillFirstRange == nil || *second.FillFirstRange != 1 {
+		t.Fatalf("second FillFirstRange = %v, want 1", second.FillFirstRange)
 	}
 }
 
