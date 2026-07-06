@@ -35,15 +35,18 @@ const (
 
 // authScheduler keeps the incremental provider/model scheduling state used by Manager.
 type authScheduler struct {
-	mu                      sync.RWMutex
-	strategy                schedulerStrategy
-	globalFillFirstRange    int
-	priorityRules           map[int]schedulerStrategy
-	priorityFillFirstRanges map[int]int
-	providers               map[string]*providerScheduler
-	authProviders           map[string]string
-	mixedCursorMu           sync.Mutex
-	mixedCursors            map[string]int
+	mu                        sync.RWMutex
+	strategy                  schedulerStrategy
+	globalFillFirstRange      int
+	globalFillFirstPerAuthRPM int
+	priorityRules             map[int]schedulerStrategy
+	priorityFillFirstRanges   map[int]int
+	priorityFillFirstRPMs     map[int]int
+	providers                 map[string]*providerScheduler
+	authProviders             map[string]string
+	fillFirstLimiter          *fillFirstMinuteLimiter
+	mixedCursorMu             sync.Mutex
+	mixedCursors              map[string]int
 }
 
 // providerScheduler stores auth metadata and model shards for a single provider.
@@ -174,13 +177,16 @@ func normalizeCursor(cursor, size int) int {
 // newAuthScheduler constructs an empty scheduler configured for the supplied selector strategy.
 func newAuthScheduler(selector Selector) *authScheduler {
 	return &authScheduler{
-		strategy:                selectorStrategy(selector),
-		globalFillFirstRange:    fillFirstRangeFromSelector(selector),
-		priorityRules:           make(map[int]schedulerStrategy),
-		priorityFillFirstRanges: make(map[int]int),
-		providers:               make(map[string]*providerScheduler),
-		authProviders:           make(map[string]string),
-		mixedCursors:            make(map[string]int),
+		strategy:                  selectorStrategy(selector),
+		globalFillFirstRange:      fillFirstRangeFromSelector(selector),
+		globalFillFirstPerAuthRPM: 0,
+		priorityRules:             make(map[int]schedulerStrategy),
+		priorityFillFirstRanges:   make(map[int]int),
+		priorityFillFirstRPMs:     make(map[int]int),
+		providers:                 make(map[string]*providerScheduler),
+		authProviders:             make(map[string]string),
+		fillFirstLimiter:          newFillFirstMinuteLimiter(),
+		mixedCursors:              make(map[string]int),
 	}
 }
 
@@ -239,10 +245,14 @@ func (s *authScheduler) setRoutingConfig(routing internalconfig.RoutingConfig) {
 	}
 	rules := make(map[int]schedulerStrategy, len(routing.PriorityOverrides))
 	ranges := make(map[int]int, len(routing.PriorityOverrides))
+	rpms := make(map[int]int, len(routing.PriorityOverrides))
 	for _, override := range routing.PriorityOverrides {
 		if strings.TrimSpace(override.Strategy) == "" {
 			if override.FillFirstRange != nil {
 				ranges[override.Priority] = normalizeFillFirstRangeValue(*override.FillFirstRange)
+			}
+			if override.FillFirstPerAuthRPM != nil {
+				rpms[override.Priority] = normalizeFillFirstPerAuthRPMValue(*override.FillFirstPerAuthRPM)
 			}
 			continue
 		}
@@ -252,11 +262,16 @@ func (s *authScheduler) setRoutingConfig(routing internalconfig.RoutingConfig) {
 		if override.FillFirstRange != nil {
 			ranges[override.Priority] = normalizeFillFirstRangeValue(*override.FillFirstRange)
 		}
+		if override.FillFirstPerAuthRPM != nil {
+			rpms[override.Priority] = normalizeFillFirstPerAuthRPMValue(*override.FillFirstPerAuthRPM)
+		}
 	}
 	s.mu.Lock()
 	s.globalFillFirstRange = normalizeFillFirstRangeValue(routing.FillFirstRange)
+	s.globalFillFirstPerAuthRPM = normalizeFillFirstPerAuthRPMValue(routing.FillFirstPerAuthRPM)
 	s.priorityRules = rules
 	s.priorityFillFirstRanges = ranges
+	s.priorityFillFirstRPMs = rpms
 	s.mu.Unlock()
 }
 
@@ -278,6 +293,16 @@ func (s *authScheduler) fillFirstRangeForPriorityLocked(priority int) int {
 		return normalizeFillFirstRangeValue(value)
 	}
 	return normalizeFillFirstRangeValue(s.globalFillFirstRange)
+}
+
+func (s *authScheduler) fillFirstPerAuthRPMForPriorityLocked(priority int) int {
+	if s == nil {
+		return 0
+	}
+	if value, ok := s.priorityFillFirstRPMs[priority]; ok {
+		return normalizeFillFirstPerAuthRPMValue(value)
+	}
+	return normalizeFillFirstPerAuthRPMValue(s.globalFillFirstPerAuthRPM)
 }
 
 // setSelector updates the active built-in strategy and resets mixed-provider cursors.
@@ -361,6 +386,8 @@ func (s *authScheduler) pickSingle(ctx context.Context, provider, model string, 
 	providerState := s.providers[providerKey]
 	strategyForPriority := s.strategyForPriorityLocked
 	fillFirstRangeForPriority := s.fillFirstRangeForPriorityLocked
+	fillFirstPerAuthRPMForPriority := s.fillFirstPerAuthRPMForPriorityLocked
+	fillFirstLimiter := s.fillFirstLimiter
 	selectionAttempt = selectionAttemptFromMetadata(opts.Metadata)
 	if providerState == nil {
 		return nil, &Error{Code: "auth_not_found", Message: "no auth available"}
@@ -394,7 +421,9 @@ func (s *authScheduler) pickSingle(ctx context.Context, provider, model string, 
 		}
 		return true
 	}
-	if picked := shard.pickReadyLocked(preferWebsocket, strategyForPriority, fillFirstRangeForPriority, selectionAttempt, priorityPredicate, pickPredicate); picked != nil {
+	if picked, errPick := shard.pickReadyLocked(preferWebsocket, strategyForPriority, fillFirstRangeForPriority, fillFirstPerAuthRPMForPriority, fillFirstLimiter, selectionAttempt, priorityPredicate, pickPredicate, provider, model); errPick != nil {
+		return nil, errPick
+	} else if picked != nil {
 		return picked, nil
 	}
 	return nil, shard.unavailableErrorForAttemptLocked(provider, model, preferWebsocket, selectionAttempt, priorityPredicate, pickPredicate)
@@ -429,6 +458,8 @@ func (s *authScheduler) pickMixed(ctx context.Context, providers []string, model
 	defer s.mu.RUnlock()
 	strategyForPriority := s.strategyForPriorityLocked
 	fillFirstRangeForPriority := s.fillFirstRangeForPriorityLocked
+	fillFirstPerAuthRPMForPriority := s.fillFirstPerAuthRPMForPriorityLocked
+	fillFirstLimiter := s.fillFirstLimiter
 	selectionAttempt = selectionAttemptFromMetadata(opts.Metadata)
 	if pinnedAuthID != "" {
 		providerKey := s.authProviders[pinnedAuthID]
@@ -461,7 +492,9 @@ func (s *authScheduler) pickMixed(ctx context.Context, providers []string, model
 			}
 			return len(authAllowed) == 0 || authAllowed[0] == nil || authAllowed[0](entry.auth)
 		}
-		if picked := shard.pickReadyLocked(false, strategyForPriority, fillFirstRangeForPriority, selectionAttempt, priorityPredicate, pickPredicate); picked != nil {
+		if picked, errPick := shard.pickReadyLocked(false, strategyForPriority, fillFirstRangeForPriority, fillFirstPerAuthRPMForPriority, fillFirstLimiter, selectionAttempt, priorityPredicate, pickPredicate, "mixed", model); errPick != nil {
+			return nil, "", errPick
+		} else if picked != nil {
 			return picked, providerKey, nil
 		}
 		return nil, "", shard.unavailableErrorForAttemptLocked("mixed", model, false, selectionAttempt, priorityPredicate, pickPredicate)
@@ -517,6 +550,7 @@ func (s *authScheduler) pickMixed(ctx context.Context, providers []string, model
 		providerKey string
 	}
 	cursorKey := strings.Join(normalized, ",") + ":" + modelKey
+	rpmLimited := false
 	for _, targetPriority := range prioritiesToTry {
 		switch strategyForPriority(targetPriority) {
 		case schedulerStrategyRandom:
@@ -541,10 +575,11 @@ func (s *authScheduler) pickMixed(ctx context.Context, providers []string, model
 				return picked.auth, picked.providerKey, nil
 			}
 		case schedulerStrategyFillFirst:
-			picked, providerKey := pickMixedFillFirstAtPriorityLocked(normalized, candidateShards, targetPriority, fillFirstRangeForPriority(targetPriority), priorityPredicate, pickPredicate)
+			picked, providerKey, limited := pickMixedFillFirstAtPriorityLocked(normalized, candidateShards, targetPriority, fillFirstRangeForPriority(targetPriority), fillFirstPerAuthRPMForPriority(targetPriority), fillFirstLimiter, priorityPredicate, pickPredicate)
 			if picked != nil {
 				return picked, providerKey, nil
 			}
+			rpmLimited = rpmLimited || limited
 		default:
 			weights := make([]int, len(normalized))
 			segmentStarts := make([]int, len(normalized))
@@ -593,7 +628,7 @@ func (s *authScheduler) pickMixed(ctx context.Context, providers []string, model
 				if shard == nil {
 					continue
 				}
-				picked := shard.pickReadyAtPriorityLocked(false, targetPriority, schedulerStrategyRoundRobin, 1, pickPredicate, pickPredicate)
+				picked, _ := shard.pickReadyAtPriorityLocked(false, targetPriority, schedulerStrategyRoundRobin, 1, 0, nil, pickPredicate, pickPredicate)
 				if picked == nil {
 					continue
 				}
@@ -604,6 +639,14 @@ func (s *authScheduler) pickMixed(ctx context.Context, providers []string, model
 			s.mixedCursorMu.Unlock()
 		}
 	}
+	if rpmLimited {
+		rpmNow := fillFirstLimiterNow(fillFirstLimiter)
+		rpmRetryAfter := fillFirstRPMRetryAfterAt(fillFirstLimiter, rpmNow)
+		if earliest := mixedBlockedEarliestAtPrioritiesLocked(candidateShards, prioritiesToTry, pickPredicate); cooldownBeforeRPMReset(earliest, rpmRetryAfter, rpmNow) {
+			return nil, "", newModelCooldownErrorUntil(model, "", earliest, rpmNow)
+		}
+		return nil, "", newAuthRPMLimitedError(rpmRetryAfter)
+	}
 	return nil, "", mixedUnavailableErrorFromShardsForAttempt(normalized, candidateShards, model, priorityPredicate, pickPredicate, selectionAttempt)
 }
 
@@ -612,8 +655,9 @@ type mixedFillFirstEntry struct {
 	providerKey string
 }
 
-func pickMixedFillFirstAtPriorityLocked(providers []string, candidateShards []*modelScheduler, priority int, fillFirstRange int, membershipPredicate func(*scheduledAuth) bool, pickPredicate func(*scheduledAuth) bool) (*Auth, string) {
+func pickMixedFillFirstAtPriorityLocked(providers []string, candidateShards []*modelScheduler, priority int, fillFirstRange int, fillFirstPerAuthRPM int, rpmLimiter *fillFirstMinuteLimiter, membershipPredicate func(*scheduledAuth) bool, pickPredicate func(*scheduledAuth) bool) (*Auth, string, bool) {
 	fillFirstRange = normalizeFillFirstRangeValue(fillFirstRange)
+	fillFirstPerAuthRPM = normalizeFillFirstPerAuthRPMValue(fillFirstPerAuthRPM)
 	members := make([]mixedFillFirstEntry, 0)
 	for providerIndex, providerKey := range providers {
 		if providerIndex >= len(candidateShards) {
@@ -634,7 +678,7 @@ func pickMixedFillFirstAtPriorityLocked(providers []string, candidateShards []*m
 		}
 	}
 	if len(members) == 0 {
-		return nil, ""
+		return nil, "", false
 	}
 	sort.Slice(members, func(i, j int) bool {
 		leftID := members[i].entry.auth.ID
@@ -644,6 +688,27 @@ func pickMixedFillFirstAtPriorityLocked(providers []string, candidateShards []*m
 		}
 		return leftID < rightID
 	})
+	if fillFirstPerAuthRPM > 0 {
+		now := time.Now()
+		if rpmLimiter != nil {
+			now = rpmLimiter.nowTime()
+		}
+		rpmLimited := false
+		for _, member := range members {
+			if member.entry.state != scheduledStateReady {
+				continue
+			}
+			if pickPredicate != nil && !pickPredicate(member.entry) {
+				continue
+			}
+			if rpmLimiter != nil && !rpmLimiter.tryAcquireAt(member.entry.auth.ID, fillFirstPerAuthRPM, now) {
+				rpmLimited = true
+				continue
+			}
+			return member.entry.auth, member.providerKey, false
+		}
+		return nil, "", rpmLimited
+	}
 	for start := 0; start < len(members); start += fillFirstRange {
 		end := start + fillFirstRange
 		if end > len(members) {
@@ -660,14 +725,29 @@ func pickMixedFillFirstAtPriorityLocked(providers []string, candidateShards []*m
 			candidates = append(candidates, member)
 		}
 		if len(candidates) == 1 {
-			return candidates[0].entry.auth, candidates[0].providerKey
+			return candidates[0].entry.auth, candidates[0].providerKey, false
 		}
 		if len(candidates) > 1 {
 			picked := candidates[rand.IntN(len(candidates))]
-			return picked.entry.auth, picked.providerKey
+			return picked.entry.auth, picked.providerKey, false
 		}
 	}
-	return nil, ""
+	return nil, "", false
+}
+
+func mixedBlockedEarliestAtPrioritiesLocked(candidateShards []*modelScheduler, priorities []int, predicate func(*scheduledAuth) bool) time.Time {
+	var earliest time.Time
+	for _, priority := range priorities {
+		for _, shard := range candidateShards {
+			if shard == nil {
+				continue
+			}
+			if next, okNext := shard.blockedEarliestAtPriorityLocked(false, priority, predicate); okNext && (earliest.IsZero() || next.Before(earliest)) {
+				earliest = next
+			}
+		}
+	}
+	return earliest
 }
 
 // mixedUnavailableErrorFromShards synthesizes the mixed-provider cooldown or unavailable error.
@@ -1128,29 +1208,62 @@ func (m *modelScheduler) promoteExpiredLocked(now time.Time) {
 }
 
 // pickReadyLocked selects the next ready auth from the target priority bucket for the request attempt.
-func (m *modelScheduler) pickReadyLocked(preferWebsocket bool, strategyForPriority func(int) schedulerStrategy, fillFirstRangeForPriority func(int) int, selectionAttempt int, priorityPredicate func(*scheduledAuth) bool, pickPredicate func(*scheduledAuth) bool) *Auth {
+func (m *modelScheduler) pickReadyLocked(preferWebsocket bool, strategyForPriority func(int) schedulerStrategy, fillFirstRangeForPriority func(int) int, fillFirstPerAuthRPMForPriority func(int) int, rpmLimiter *fillFirstMinuteLimiter, selectionAttempt int, priorityPredicate func(*scheduledAuth) bool, pickPredicate func(*scheduledAuth) bool, provider, model string) (*Auth, error) {
 	if m == nil {
-		return nil
+		return nil, nil
 	}
-	m.promoteExpiredLocked(time.Now())
+	now := time.Now()
+	m.promoteExpiredLocked(now)
 	priorities, restrictWebsocket := m.candidatePrioritiesAndWebsocketRestrictionLocked(preferWebsocket, priorityPredicate, pickPredicate)
 	if len(priorities) == 0 {
-		return nil
+		return nil, nil
 	}
-	for _, priorityReady := range selectionPrioritiesForAttempt(priorities, selectionAttempt) {
-		strategy := schedulerStrategyRoundRobin
-		if strategyForPriority != nil {
-			strategy = strategyForPriority(priorityReady)
+	pickFromPriorities := func(candidatePriorities []int, onlyWebsocket bool) (*Auth, bool) {
+		rpmLimited := false
+		for _, priorityReady := range selectionPrioritiesForAttempt(candidatePriorities, selectionAttempt) {
+			strategy := schedulerStrategyRoundRobin
+			if strategyForPriority != nil {
+				strategy = strategyForPriority(priorityReady)
+			}
+			fillFirstRange := 1
+			if fillFirstRangeForPriority != nil {
+				fillFirstRange = fillFirstRangeForPriority(priorityReady)
+			}
+			fillFirstPerAuthRPM := 0
+			if fillFirstPerAuthRPMForPriority != nil {
+				fillFirstPerAuthRPM = fillFirstPerAuthRPMForPriority(priorityReady)
+			}
+			picked, limited := m.pickReadyAtPriorityLocked(onlyWebsocket, priorityReady, strategy, fillFirstRange, fillFirstPerAuthRPM, rpmLimiter, priorityPredicate, pickPredicate)
+			if picked != nil {
+				return picked, false
+			}
+			rpmLimited = rpmLimited || limited
 		}
-		fillFirstRange := 1
-		if fillFirstRangeForPriority != nil {
-			fillFirstRange = fillFirstRangeForPriority(priorityReady)
-		}
-		if picked := m.pickReadyAtPriorityLocked(restrictWebsocket, priorityReady, strategy, fillFirstRange, priorityPredicate, pickPredicate); picked != nil {
-			return picked
-		}
+		return nil, rpmLimited
 	}
-	return nil
+	picked, rpmLimited := pickFromPriorities(priorities, restrictWebsocket)
+	if picked != nil {
+		return picked, nil
+	}
+	if restrictWebsocket && rpmLimited {
+		fallbackPriorities := m.candidatePrioritiesForAllLocked(priorityPredicate)
+		picked, fallbackRPMLimited := pickFromPriorities(fallbackPriorities, false)
+		if picked != nil {
+			return picked, nil
+		}
+		priorities = fallbackPriorities
+		restrictWebsocket = false
+		rpmLimited = rpmLimited || fallbackRPMLimited
+	}
+	if rpmLimited {
+		rpmNow := fillFirstLimiterNow(rpmLimiter)
+		rpmRetryAfter := fillFirstRPMRetryAfterAt(rpmLimiter, rpmNow)
+		if earliest := m.blockedEarliestForAttemptLocked(restrictWebsocket, priorities, selectionAttempt, pickPredicate); cooldownBeforeRPMReset(earliest, rpmRetryAfter, rpmNow) {
+			return nil, newModelCooldownErrorUntil(model, provider, earliest, rpmNow)
+		}
+		return nil, newAuthRPMLimitedError(rpmRetryAfter)
+	}
+	return nil, nil
 }
 
 func (m *modelScheduler) readyPrioritiesLocked(preferWebsocket bool, predicate func(*scheduledAuth) bool) []int {
@@ -1282,16 +1395,16 @@ func sortedPrioritySet(prioritySet map[int]struct{}) []int {
 
 // pickReadyAtPriorityLocked selects the next ready auth from a specific priority bucket.
 // The caller must ensure expired entries are already promoted when needed.
-func (m *modelScheduler) pickReadyAtPriorityLocked(preferWebsocket bool, priority int, strategy schedulerStrategy, fillFirstRange int, membershipPredicate func(*scheduledAuth) bool, pickPredicate func(*scheduledAuth) bool) *Auth {
+func (m *modelScheduler) pickReadyAtPriorityLocked(preferWebsocket bool, priority int, strategy schedulerStrategy, fillFirstRange int, fillFirstPerAuthRPM int, rpmLimiter *fillFirstMinuteLimiter, membershipPredicate func(*scheduledAuth) bool, pickPredicate func(*scheduledAuth) bool) (*Auth, bool) {
 	if m == nil {
-		return nil
+		return nil, false
 	}
-	if strategy == schedulerStrategyFillFirst && normalizeFillFirstRangeValue(fillFirstRange) > 1 {
-		return m.pickFillFirstRangeAtPriorityLocked(preferWebsocket, priority, fillFirstRange, membershipPredicate, pickPredicate)
+	if strategy == schedulerStrategyFillFirst && (normalizeFillFirstPerAuthRPMValue(fillFirstPerAuthRPM) > 0 || normalizeFillFirstRangeValue(fillFirstRange) > 1) {
+		return m.pickFillFirstAtPriorityLocked(preferWebsocket, priority, fillFirstRange, fillFirstPerAuthRPM, rpmLimiter, membershipPredicate, pickPredicate)
 	}
 	bucket := m.readyByPriority[priority]
 	if bucket == nil {
-		return nil
+		return nil, false
 	}
 	view := &bucket.all
 	if preferWebsocket {
@@ -1307,16 +1420,17 @@ func (m *modelScheduler) pickReadyAtPriorityLocked(preferWebsocket bool, priorit
 		picked = view.pickRoundRobin(pickPredicate)
 	}
 	if picked == nil || picked.auth == nil {
-		return nil
+		return nil, false
 	}
-	return picked.auth
+	return picked.auth, false
 }
 
-func (m *modelScheduler) pickFillFirstRangeAtPriorityLocked(preferWebsocket bool, priority int, fillFirstRange int, membershipPredicate func(*scheduledAuth) bool, pickPredicate func(*scheduledAuth) bool) *Auth {
+func (m *modelScheduler) pickFillFirstAtPriorityLocked(preferWebsocket bool, priority int, fillFirstRange int, fillFirstPerAuthRPM int, rpmLimiter *fillFirstMinuteLimiter, membershipPredicate func(*scheduledAuth) bool, pickPredicate func(*scheduledAuth) bool) (*Auth, bool) {
 	if m == nil {
-		return nil
+		return nil, false
 	}
 	fillFirstRange = normalizeFillFirstRangeValue(fillFirstRange)
+	fillFirstPerAuthRPM = normalizeFillFirstPerAuthRPMValue(fillFirstPerAuthRPM)
 	members := make([]*scheduledAuth, 0)
 	for _, entry := range m.entries {
 		if entry == nil || entry.auth == nil || entry.meta == nil || entry.meta.priority != priority {
@@ -1331,11 +1445,32 @@ func (m *modelScheduler) pickFillFirstRangeAtPriorityLocked(preferWebsocket bool
 		members = append(members, entry)
 	}
 	if len(members) == 0 {
-		return nil
+		return nil, false
 	}
 	sort.Slice(members, func(i, j int) bool {
 		return members[i].auth.ID < members[j].auth.ID
 	})
+	if fillFirstPerAuthRPM > 0 {
+		now := time.Now()
+		if rpmLimiter != nil {
+			now = rpmLimiter.nowTime()
+		}
+		rpmLimited := false
+		for _, entry := range members {
+			if entry.state != scheduledStateReady {
+				continue
+			}
+			if pickPredicate != nil && !pickPredicate(entry) {
+				continue
+			}
+			if rpmLimiter != nil && !rpmLimiter.tryAcquireAt(entry.auth.ID, fillFirstPerAuthRPM, now) {
+				rpmLimited = true
+				continue
+			}
+			return entry.auth, false
+		}
+		return nil, rpmLimited
+	}
 	for start := 0; start < len(members); start += fillFirstRange {
 		end := start + fillFirstRange
 		if end > len(members) {
@@ -1352,13 +1487,13 @@ func (m *modelScheduler) pickFillFirstRangeAtPriorityLocked(preferWebsocket bool
 			candidates = append(candidates, entry)
 		}
 		if len(candidates) == 1 {
-			return candidates[0].auth
+			return candidates[0].auth, false
 		}
 		if len(candidates) > 1 {
-			return candidates[rand.IntN(len(candidates))].auth
+			return candidates[rand.IntN(len(candidates))].auth, false
 		}
 	}
-	return nil
+	return nil, false
 }
 
 func (m *modelScheduler) readyCountAtPriorityLocked(preferWebsocket bool, priority int, predicate func(*scheduledAuth) bool) int {
@@ -1431,24 +1566,21 @@ func (m *modelScheduler) unavailableErrorForAttemptLocked(provider, model string
 	if len(priorities) == 0 {
 		return m.unavailableErrorLocked(provider, model, pickPredicate)
 	}
+	earliest := m.blockedEarliestForAttemptLocked(restrictWebsocket, priorities, selectionAttempt, pickPredicate)
+	if !earliest.IsZero() {
+		return newModelCooldownErrorUntil(model, provider, earliest, now)
+	}
+	return &Error{Code: "auth_unavailable", Message: "no auth available"}
+}
+
+func (m *modelScheduler) blockedEarliestForAttemptLocked(preferWebsocket bool, priorities []int, selectionAttempt int, predicate func(*scheduledAuth) bool) time.Time {
 	var earliest time.Time
 	for _, priority := range selectionPrioritiesForAttempt(priorities, selectionAttempt) {
-		if next, okNext := m.blockedEarliestAtPriorityLocked(restrictWebsocket, priority, pickPredicate); okNext && (earliest.IsZero() || next.Before(earliest)) {
+		if next, okNext := m.blockedEarliestAtPriorityLocked(preferWebsocket, priority, predicate); okNext && (earliest.IsZero() || next.Before(earliest)) {
 			earliest = next
 		}
 	}
-	if !earliest.IsZero() {
-		providerForError := provider
-		if providerForError == "mixed" {
-			providerForError = ""
-		}
-		resetIn := earliest.Sub(now)
-		if resetIn < 0 {
-			resetIn = 0
-		}
-		return newModelCooldownError(model, providerForError, resetIn)
-	}
-	return &Error{Code: "auth_unavailable", Message: "no auth available"}
+	return earliest
 }
 
 func (m *modelScheduler) blockedEarliestAtPriorityLocked(preferWebsocket bool, priority int, predicate func(*scheduledAuth) bool) (time.Time, bool) {

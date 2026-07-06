@@ -992,6 +992,44 @@ func (m *Manager) routingFillFirstRangeForPriority(priority int) int {
 	return normalizeFillFirstRangeValue(cfg.Routing.FillFirstRange)
 }
 
+func (m *Manager) routingFillFirstPerAuthRPMOverrideForPriority(priority int) (int, bool) {
+	if m == nil {
+		return 0, false
+	}
+	cfg, _ := m.runtimeConfig.Load().(*internalconfig.Config)
+	if cfg == nil {
+		return 0, false
+	}
+	for _, override := range cfg.Routing.PriorityOverrides {
+		if override.Priority != priority || override.FillFirstPerAuthRPM == nil {
+			continue
+		}
+		return normalizeFillFirstPerAuthRPMValue(*override.FillFirstPerAuthRPM), true
+	}
+	return 0, false
+}
+
+func (m *Manager) routingFillFirstPerAuthRPMForPriority(priority int) int {
+	if m == nil {
+		return 0
+	}
+	if value, ok := m.routingFillFirstPerAuthRPMOverrideForPriority(priority); ok {
+		return value
+	}
+	cfg, _ := m.runtimeConfig.Load().(*internalconfig.Config)
+	if cfg == nil {
+		return 0
+	}
+	return normalizeFillFirstPerAuthRPMValue(cfg.Routing.FillFirstPerAuthRPM)
+}
+
+func (m *Manager) fillFirstLimiter() *fillFirstMinuteLimiter {
+	if m == nil || m.scheduler == nil {
+		return nil
+	}
+	return m.scheduler.fillFirstLimiter
+}
+
 func (m *Manager) routingStrategyForPriority(priority int) schedulerStrategy {
 	if strategy, ok := m.routingStrategyOverrideForPriority(priority); ok {
 		return strategy
@@ -1040,15 +1078,23 @@ func (m *Manager) prioritySelectorForAvailable(available []*Auth) (Selector, boo
 	priority := authPriority(available[0])
 	strategy, ok := m.routingStrategyOverrideForPriority(priority)
 	fillFirstRange := m.routingFillFirstRangeForPriority(priority)
+	fillFirstPerAuthRPM := m.routingFillFirstPerAuthRPMForPriority(priority)
 	if !ok {
 		strategy = selectorStrategy(m.selector)
-		if strategy != schedulerStrategyFillFirst || fillFirstRange <= 1 {
+		if strategy != schedulerStrategyFillFirst || (fillFirstRange <= 1 && fillFirstPerAuthRPM <= 0) {
+			return nil, false
+		}
+		if fillFirstPerAuthRPM > 0 {
 			return nil, false
 		}
 		return m.legacyPrioritySelector(priority, strategy, fillFirstRange), true
 	}
 	if strategy != schedulerStrategyFillFirst {
 		fillFirstRange = 1
+		fillFirstPerAuthRPM = 0
+	}
+	if fillFirstPerAuthRPM > 0 {
+		return nil, false
 	}
 	return m.legacyPrioritySelector(priority, strategy, fillFirstRange), true
 }
@@ -1074,15 +1120,28 @@ func (m *Manager) pickLegacyFillFirstRangeAuth(ctx context.Context, provider, ro
 		return nil, false, nil
 	}
 	fillFirstRange := m.routingFillFirstRangeForPriority(priority)
-	if fillFirstRange <= 1 {
+	fillFirstPerAuthRPM := m.routingFillFirstPerAuthRPMForPriority(priority)
+	if fillFirstRange <= 1 && fillFirstPerAuthRPM <= 0 {
 		return nil, false, nil
 	}
+	fillFirstRangeForPriority := func(priority int) int {
+		if m.routingStrategyForPriority(priority) != schedulerStrategyFillFirst {
+			return 1
+		}
+		return m.routingFillFirstRangeForPriority(priority)
+	}
+	fillFirstPerAuthRPMForPriority := func(priority int) int {
+		if m.routingStrategyForPriority(priority) != schedulerStrategyFillFirst {
+			return 0
+		}
+		return m.routingFillFirstPerAuthRPMForPriority(priority)
+	}
 	pickFallback := func() (*Auth, error) {
-		return selectFillFirstRangeAuthsForContext(ctx, candidates, provider, routeModel, time.Now(), selectionAttemptFromMetadata(opts.Metadata), fillFirstRange, func(auth *Auth) string {
+		return selectFillFirstAuthsForContextWithPolicy(ctx, candidates, provider, routeModel, time.Now(), selectionAttemptFromMetadata(opts.Metadata), fillFirstRangeForPriority, fillFirstPerAuthRPMForPriority, m.fillFirstLimiter(), func(auth *Auth) string {
 			return m.selectionModelForAuth(auth, routeModel)
 		}, pickAllowed)
 	}
-	if hasSessionSelector && sessionSelector != nil {
+	if hasSessionSelector && sessionSelector != nil && fillFirstPerAuthRPM <= 0 {
 		selected, errPick := sessionSelector.pickWithPreparedFallback(ctx, provider, routeModel, opts, available, pickFallback)
 		return selected, true, errPick
 	}

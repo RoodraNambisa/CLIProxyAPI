@@ -399,6 +399,26 @@ func normalizeFillFirstRange(value int) int {
 	return config.NormalizeFillFirstRange(value)
 }
 
+func normalizeFillFirstPerAuthRPM(value int) int {
+	return config.NormalizeFillFirstPerAuthRPM(value)
+}
+
+func (h *Handler) updateRoutingConfig(c *gin.Context, update func(*config.RoutingConfig)) bool {
+	if h == nil || h.cfg == nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "config not initialized"})
+		return false
+	}
+	routing := h.cfg.Routing
+	update(&routing)
+	normalized, errNormalize := config.NormalizeRoutingConfig(routing)
+	if errNormalize != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid routing config", "message": errNormalize.Error()})
+		return false
+	}
+	h.cfg.Routing = normalized
+	return true
+}
+
 // RoutingStrategy
 func (h *Handler) GetRoutingStrategy(c *gin.Context) {
 	strategy, ok := normalizeRoutingStrategy(h.cfg.Routing.Strategy)
@@ -421,7 +441,11 @@ func (h *Handler) PutRoutingStrategy(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid strategy"})
 		return
 	}
-	h.cfg.Routing.Strategy = normalized
+	if !h.updateRoutingConfig(c, func(routing *config.RoutingConfig) {
+		routing.Strategy = normalized
+	}) {
+		return
+	}
 	h.persist(c)
 }
 
@@ -437,7 +461,31 @@ func (h *Handler) PutRoutingFillFirstRange(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
 		return
 	}
-	h.cfg.Routing.FillFirstRange = normalizeFillFirstRange(*body.Value)
+	if !h.updateRoutingConfig(c, func(routing *config.RoutingConfig) {
+		routing.FillFirstRange = normalizeFillFirstRange(*body.Value)
+	}) {
+		return
+	}
+	h.persist(c)
+}
+
+func (h *Handler) GetRoutingFillFirstPerAuthRPM(c *gin.Context) {
+	c.JSON(200, gin.H{"fill-first-per-auth-rpm": normalizeFillFirstPerAuthRPM(h.cfg.Routing.FillFirstPerAuthRPM)})
+}
+
+func (h *Handler) PutRoutingFillFirstPerAuthRPM(c *gin.Context) {
+	var body struct {
+		Value *int `json:"value"`
+	}
+	if errBindJSON := c.ShouldBindJSON(&body); errBindJSON != nil || body.Value == nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
+		return
+	}
+	if !h.updateRoutingConfig(c, func(routing *config.RoutingConfig) {
+		routing.FillFirstPerAuthRPM = normalizeFillFirstPerAuthRPM(*body.Value)
+	}) {
+		return
+	}
 	h.persist(c)
 }
 
@@ -453,12 +501,11 @@ func (h *Handler) PutRoutingPriorityOverrides(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
 		return
 	}
-	normalized, errNormalize := config.NormalizeRoutingPriorityOverrides(*body.Value)
-	if errNormalize != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid priority overrides", "message": errNormalize.Error()})
+	if !h.updateRoutingConfig(c, func(routing *config.RoutingConfig) {
+		routing.PriorityOverrides = *body.Value
+	}) {
 		return
 	}
-	h.cfg.Routing.PriorityOverrides = normalized
 	h.persist(c)
 }
 

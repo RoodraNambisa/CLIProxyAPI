@@ -398,6 +398,8 @@ type RoutingPriorityOverride struct {
 	MaxRetryCredentials *int `yaml:"max-retry-credentials,omitempty" json:"max-retry-credentials,omitempty"`
 	// FillFirstRange optionally overrides routing.fill-first-range for this priority.
 	FillFirstRange *int `yaml:"fill-first-range,omitempty" json:"fill-first-range,omitempty"`
+	// FillFirstPerAuthRPM optionally overrides routing.fill-first-per-auth-rpm for this priority.
+	FillFirstPerAuthRPM *int `yaml:"fill-first-per-auth-rpm,omitempty" json:"fill-first-per-auth-rpm,omitempty"`
 }
 
 // RoutingConfig configures how credentials are selected for requests.
@@ -408,6 +410,9 @@ type RoutingConfig struct {
 
 	// FillFirstRange groups credentials for fill-first routing; 1 preserves legacy fill-first.
 	FillFirstRange int `yaml:"fill-first-range,omitempty" json:"fill-first-range,omitempty"`
+
+	// FillFirstPerAuthRPM caps selected requests per auth per fixed minute for fill-first routing.
+	FillFirstPerAuthRPM int `yaml:"fill-first-per-auth-rpm,omitempty" json:"fill-first-per-auth-rpm,omitempty"`
 
 	// PriorityOverrides customizes routing behavior for specific credential priorities.
 	PriorityOverrides []RoutingPriorityOverride `yaml:"priority-overrides,omitempty" json:"priority-overrides,omitempty"`
@@ -958,8 +963,7 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	if cfg.MaxRetryCredentials < 0 {
 		cfg.MaxRetryCredentials = 0
 	}
-	cfg.Routing.FillFirstRange = NormalizeFillFirstRange(cfg.Routing.FillFirstRange)
-	if err = cfg.NormalizeRoutingPriorityOverrides(); err != nil {
+	if err = cfg.NormalizeRouting(); err != nil {
 		if optional {
 			return &Config{}, nil
 		}
@@ -1677,6 +1681,14 @@ func NormalizeFillFirstRange(value int) int {
 	return value
 }
 
+// NormalizeFillFirstPerAuthRPM returns a valid per-auth RPM fill limit.
+func NormalizeFillFirstPerAuthRPM(value int) int {
+	if value < 0 {
+		return 0
+	}
+	return value
+}
+
 // NormalizeRoutingPriorityOverrides validates and canonicalizes per-priority routing overrides.
 func NormalizeRoutingPriorityOverrides(overrides []RoutingPriorityOverride) ([]RoutingPriorityOverride, error) {
 	if len(overrides) == 0 {
@@ -1712,28 +1724,91 @@ func NormalizeRoutingPriorityOverrides(overrides []RoutingPriorityOverride) ([]R
 			value := NormalizeFillFirstRange(*override.FillFirstRange)
 			fillFirstRange = &value
 		}
+		var fillFirstPerAuthRPM *int
+		if override.FillFirstPerAuthRPM != nil {
+			value := NormalizeFillFirstPerAuthRPM(*override.FillFirstPerAuthRPM)
+			fillFirstPerAuthRPM = &value
+		}
 
 		out = append(out, RoutingPriorityOverride{
 			Priority:            override.Priority,
 			Strategy:            strategy,
 			MaxRetryCredentials: maxRetryCredentials,
 			FillFirstRange:      fillFirstRange,
+			FillFirstPerAuthRPM: fillFirstPerAuthRPM,
 		})
 	}
 	return out, nil
 }
 
-// NormalizeRoutingPriorityOverrides validates and stores per-priority routing overrides.
-func (cfg *Config) NormalizeRoutingPriorityOverrides() error {
+func routingStrategyForFillFirstControl(strategy string) string {
+	strategy = strings.TrimSpace(strategy)
+	if normalized, ok := NormalizeRoutingStrategy(strategy); ok {
+		return normalized
+	}
+	return strings.ToLower(strategy)
+}
+
+// NormalizeRoutingConfig validates and canonicalizes routing configuration.
+func NormalizeRoutingConfig(routing RoutingConfig) (RoutingConfig, error) {
+	routing.FillFirstRange = NormalizeFillFirstRange(routing.FillFirstRange)
+	routing.FillFirstPerAuthRPM = NormalizeFillFirstPerAuthRPM(routing.FillFirstPerAuthRPM)
+	normalized, err := NormalizeRoutingPriorityOverrides(routing.PriorityOverrides)
+	if err != nil {
+		return routing, err
+	}
+	routing.PriorityOverrides = normalized
+	if err := ValidateRoutingFillFirstControls(routing); err != nil {
+		return routing, err
+	}
+	return routing, nil
+}
+
+// ValidateRoutingFillFirstControls enforces mutually exclusive fill-first controls.
+func ValidateRoutingFillFirstControls(routing RoutingConfig) error {
+	globalStrategy := routingStrategyForFillFirstControl(routing.Strategy)
+	if globalStrategy == "fill-first" && NormalizeFillFirstRange(routing.FillFirstRange) > 1 && NormalizeFillFirstPerAuthRPM(routing.FillFirstPerAuthRPM) > 0 {
+		return fmt.Errorf("routing.fill-first-range and routing.fill-first-per-auth-rpm are mutually exclusive for fill-first strategy")
+	}
+	for _, override := range routing.PriorityOverrides {
+		strategy := globalStrategy
+		if strings.TrimSpace(override.Strategy) != "" {
+			strategy = routingStrategyForFillFirstControl(override.Strategy)
+		}
+		if strategy != "fill-first" {
+			continue
+		}
+		fillFirstRange := NormalizeFillFirstRange(routing.FillFirstRange)
+		if override.FillFirstRange != nil {
+			fillFirstRange = NormalizeFillFirstRange(*override.FillFirstRange)
+		}
+		fillFirstPerAuthRPM := NormalizeFillFirstPerAuthRPM(routing.FillFirstPerAuthRPM)
+		if override.FillFirstPerAuthRPM != nil {
+			fillFirstPerAuthRPM = NormalizeFillFirstPerAuthRPM(*override.FillFirstPerAuthRPM)
+		}
+		if fillFirstRange > 1 && fillFirstPerAuthRPM > 0 {
+			return fmt.Errorf("routing.priority-overrides[%d]: fill-first-range and fill-first-per-auth-rpm are mutually exclusive for fill-first strategy", override.Priority)
+		}
+	}
+	return nil
+}
+
+// NormalizeRouting validates and stores routing configuration.
+func (cfg *Config) NormalizeRouting() error {
 	if cfg == nil {
 		return nil
 	}
-	normalized, err := NormalizeRoutingPriorityOverrides(cfg.Routing.PriorityOverrides)
+	normalized, err := NormalizeRoutingConfig(cfg.Routing)
 	if err != nil {
 		return err
 	}
-	cfg.Routing.PriorityOverrides = normalized
+	cfg.Routing = normalized
 	return nil
+}
+
+// NormalizeRoutingPriorityOverrides validates and stores per-priority routing overrides.
+func (cfg *Config) NormalizeRoutingPriorityOverrides() error {
+	return cfg.NormalizeRouting()
 }
 
 // SanitizeOpenAICompatibility removes OpenAI-compatibility provider entries that are

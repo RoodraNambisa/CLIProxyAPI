@@ -74,6 +74,20 @@ func newModelCooldownError(model, provider string, resetIn time.Duration) *model
 	}
 }
 
+func cooldownProviderForError(provider string) string {
+	if provider == "mixed" {
+		return ""
+	}
+	return provider
+}
+
+func newModelCooldownErrorUntil(model, provider string, earliest, now time.Time) *modelCooldownError {
+	if now.IsZero() {
+		now = time.Now()
+	}
+	return newModelCooldownError(model, cooldownProviderForError(provider), earliest.Sub(now))
+}
+
 func (e *modelCooldownError) Error() string {
 	modelName := e.model
 	if modelName == "" {
@@ -116,6 +130,95 @@ func (e *modelCooldownError) StatusCode() int {
 }
 
 func (e *modelCooldownError) Headers() http.Header {
+	headers := make(http.Header)
+	headers.Set("Content-Type", "application/json")
+	resetSeconds := int(math.Ceil(e.resetIn.Seconds()))
+	if resetSeconds < 0 {
+		resetSeconds = 0
+	}
+	headers.Set("Retry-After", strconv.Itoa(resetSeconds))
+	return headers
+}
+
+type authRPMLimitedError struct {
+	resetIn time.Duration
+}
+
+func newAuthRPMLimitedError(resetIn time.Duration) *authRPMLimitedError {
+	if resetIn < 0 {
+		resetIn = 0
+	}
+	return &authRPMLimitedError{resetIn: resetIn}
+}
+
+func fillFirstRPMRetryAfterAt(rpmLimiter *fillFirstMinuteLimiter, now time.Time) time.Duration {
+	if rpmLimiter != nil {
+		return rpmLimiter.retryAfterAt(now)
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	next := now.Truncate(time.Minute).Add(time.Minute)
+	if !next.After(now) {
+		next = next.Add(time.Minute)
+	}
+	return next.Sub(now)
+}
+
+func fillFirstLimiterNow(rpmLimiter *fillFirstMinuteLimiter) time.Time {
+	if rpmLimiter != nil {
+		return rpmLimiter.nowTime()
+	}
+	return time.Now()
+}
+
+func cooldownBeforeRPMReset(earliest time.Time, rpmRetryAfter time.Duration, now time.Time) bool {
+	if earliest.IsZero() {
+		return false
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	return !earliest.After(now.Add(rpmRetryAfter))
+}
+
+func isAuthRPMLimitedError(err error) bool {
+	_, ok := err.(*authRPMLimitedError)
+	return ok
+}
+
+func shouldFallbackFromWebsocketFillFirstError(err error) bool {
+	if isAuthRPMLimitedError(err) {
+		return true
+	}
+	_, ok := err.(*modelCooldownError)
+	return ok
+}
+
+func (e *authRPMLimitedError) Error() string {
+	resetSeconds := int(math.Ceil(e.resetIn.Seconds()))
+	if resetSeconds < 0 {
+		resetSeconds = 0
+	}
+	payload := map[string]any{
+		"error": map[string]any{
+			"code":          "auth_rpm_limited",
+			"message":       "All fill-first credentials reached their per-minute request limit",
+			"reset_seconds": resetSeconds,
+		},
+	}
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return `{"error":{"code":"auth_rpm_limited","message":"All fill-first credentials reached their per-minute request limit"}}`
+	}
+	return string(data)
+}
+
+func (e *authRPMLimitedError) StatusCode() int {
+	return http.StatusTooManyRequests
+}
+
+func (e *authRPMLimitedError) Headers() http.Header {
 	headers := make(http.Header)
 	headers.Set("Content-Type", "application/json")
 	resetSeconds := int(math.Ceil(e.resetIn.Seconds()))
@@ -546,7 +649,86 @@ func normalizeFillFirstRangeValue(value int) int {
 	return value
 }
 
+func normalizeFillFirstPerAuthRPMValue(value int) int {
+	if value < 0 {
+		return 0
+	}
+	return value
+}
+
+type fillFirstMinuteLimiter struct {
+	mu     sync.Mutex
+	now    func() time.Time
+	window int64
+	counts map[string]int
+}
+
+func newFillFirstMinuteLimiter() *fillFirstMinuteLimiter {
+	return &fillFirstMinuteLimiter{
+		counts: make(map[string]int),
+	}
+}
+
+func (l *fillFirstMinuteLimiter) nowTime() time.Time {
+	if l != nil && l.now != nil {
+		return l.now()
+	}
+	return time.Now()
+}
+
+func fillFirstMinuteWindow(now time.Time) int64 {
+	return now.UTC().Unix() / 60
+}
+
+func (l *fillFirstMinuteLimiter) resetWindowLocked(window int64) {
+	if l.window == window {
+		return
+	}
+	l.window = window
+	clear(l.counts)
+}
+
+func (l *fillFirstMinuteLimiter) tryAcquireAt(authID string, limit int, now time.Time) bool {
+	if l == nil || authID == "" || normalizeFillFirstPerAuthRPMValue(limit) == 0 {
+		return true
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.resetWindowLocked(fillFirstMinuteWindow(now))
+	if l.counts == nil {
+		l.counts = make(map[string]int)
+	}
+	if l.counts[authID] >= limit {
+		return false
+	}
+	l.counts[authID]++
+	return true
+}
+
+func (l *fillFirstMinuteLimiter) retryAfterAt(now time.Time) time.Duration {
+	if now.IsZero() {
+		now = l.nowTime()
+	}
+	next := now.Truncate(time.Minute).Add(time.Minute)
+	if !next.After(now) {
+		next = next.Add(time.Minute)
+	}
+	return next.Sub(now)
+}
+
 func selectFillFirstRangeAuthsForContext(ctx context.Context, auths []*Auth, provider, model string, now time.Time, selectionAttempt int, fillFirstRange int, modelForAuth func(*Auth) string, pickAllowed func(*Auth) bool) (*Auth, error) {
+	return selectFillFirstAuthsForContext(ctx, auths, provider, model, now, selectionAttempt, fillFirstRange, 0, nil, modelForAuth, pickAllowed)
+}
+
+func selectFillFirstAuthsForContext(ctx context.Context, auths []*Auth, provider, model string, now time.Time, selectionAttempt int, fillFirstRange int, fillFirstPerAuthRPM int, rpmLimiter *fillFirstMinuteLimiter, modelForAuth func(*Auth) string, pickAllowed func(*Auth) bool) (*Auth, error) {
+	return selectFillFirstAuthsForContextWithPolicy(ctx, auths, provider, model, now, selectionAttempt, func(int) int {
+		return fillFirstRange
+	}, func(int) int {
+		return fillFirstPerAuthRPM
+	}, rpmLimiter, modelForAuth, pickAllowed)
+}
+
+func selectFillFirstAuthsForContextWithPolicy(ctx context.Context, auths []*Auth, provider, model string, now time.Time, selectionAttempt int, fillFirstRangeForPriority func(int) int, fillFirstPerAuthRPMForPriority func(int) int, rpmLimiter *fillFirstMinuteLimiter, modelForAuth func(*Auth) string, pickAllowed func(*Auth) bool) (*Auth, error) {
 	if shouldPreferCodexWebsocket(ctx, provider) {
 		websocketAuths := make([]*Auth, 0, len(auths))
 		hasReadyWebsocket := false
@@ -565,17 +747,31 @@ func selectFillFirstRangeAuthsForContext(ctx context.Context, auths []*Auth, pro
 			}
 		}
 		if hasReadyWebsocket {
-			return selectFillFirstRangeAuthsForAttempt(websocketAuths, provider, model, now, selectionAttempt, fillFirstRange, modelForAuth, pickAllowed)
+			picked, errPick := selectFillFirstAuthsForAttemptWithPolicy(websocketAuths, provider, model, now, selectionAttempt, fillFirstRangeForPriority, fillFirstPerAuthRPMForPriority, rpmLimiter, modelForAuth, pickAllowed)
+			if picked != nil || !shouldFallbackFromWebsocketFillFirstError(errPick) {
+				return picked, errPick
+			}
 		}
 	}
-	return selectFillFirstRangeAuthsForAttempt(auths, provider, model, now, selectionAttempt, fillFirstRange, modelForAuth, pickAllowed)
+	return selectFillFirstAuthsForAttemptWithPolicy(auths, provider, model, now, selectionAttempt, fillFirstRangeForPriority, fillFirstPerAuthRPMForPriority, rpmLimiter, modelForAuth, pickAllowed)
 }
 
 func selectFillFirstRangeAuthsForAttempt(auths []*Auth, provider, model string, now time.Time, selectionAttempt int, fillFirstRange int, modelForAuth func(*Auth) string, pickAllowed func(*Auth) bool) (*Auth, error) {
+	return selectFillFirstAuthsForAttempt(auths, provider, model, now, selectionAttempt, fillFirstRange, 0, nil, modelForAuth, pickAllowed)
+}
+
+func selectFillFirstAuthsForAttempt(auths []*Auth, provider, model string, now time.Time, selectionAttempt int, fillFirstRange int, fillFirstPerAuthRPM int, rpmLimiter *fillFirstMinuteLimiter, modelForAuth func(*Auth) string, pickAllowed func(*Auth) bool) (*Auth, error) {
+	return selectFillFirstAuthsForAttemptWithPolicy(auths, provider, model, now, selectionAttempt, func(int) int {
+		return fillFirstRange
+	}, func(int) int {
+		return fillFirstPerAuthRPM
+	}, rpmLimiter, modelForAuth, pickAllowed)
+}
+
+func selectFillFirstAuthsForAttemptWithPolicy(auths []*Auth, provider, model string, now time.Time, selectionAttempt int, fillFirstRangeForPriority func(int) int, fillFirstPerAuthRPMForPriority func(int) int, rpmLimiter *fillFirstMinuteLimiter, modelForAuth func(*Auth) string, pickAllowed func(*Auth) bool) (*Auth, error) {
 	if len(auths) == 0 {
 		return nil, &Error{Code: "auth_not_found", Message: "no auth candidates"}
 	}
-	fillFirstRange = normalizeFillFirstRangeValue(fillFirstRange)
 	membersByPriority := make(map[int][]*Auth)
 	readyByPriority := make(map[int]map[string]*Auth)
 	blockedByPriority := make(map[int]priorityBlockInfo)
@@ -624,6 +820,7 @@ func selectFillFirstRangeAuthsForAttempt(auths []*Auth, provider, model string, 
 	}
 	sort.Slice(priorities, func(i, j int) bool { return priorities[i] > priorities[j] })
 	var earliest time.Time
+	rpmLimited := false
 	for _, priority := range selectionPrioritiesForAttempt(priorities, selectionAttempt) {
 		members := append([]*Auth(nil), membersByPriority[priority]...)
 		if len(members) == 0 {
@@ -631,6 +828,33 @@ func selectFillFirstRangeAuthsForAttempt(auths []*Auth, provider, model string, 
 		}
 		sort.Slice(members, func(i, j int) bool { return members[i].ID < members[j].ID })
 		readyByID := readyByPriority[priority]
+		fillFirstRange := 1
+		if fillFirstRangeForPriority != nil {
+			fillFirstRange = fillFirstRangeForPriority(priority)
+		}
+		fillFirstRange = normalizeFillFirstRangeValue(fillFirstRange)
+		fillFirstPerAuthRPM := 0
+		if fillFirstPerAuthRPMForPriority != nil {
+			fillFirstPerAuthRPM = fillFirstPerAuthRPMForPriority(priority)
+		}
+		fillFirstPerAuthRPM = normalizeFillFirstPerAuthRPMValue(fillFirstPerAuthRPM)
+		if fillFirstPerAuthRPM > 0 {
+			for _, member := range members {
+				ready := readyByID[member.ID]
+				if ready == nil {
+					continue
+				}
+				if rpmLimiter != nil && !rpmLimiter.tryAcquireAt(ready.ID, fillFirstPerAuthRPM, now) {
+					rpmLimited = true
+					continue
+				}
+				return ready, nil
+			}
+			if info, ok := blockedByPriority[priority]; ok && !info.earliest.IsZero() && (earliest.IsZero() || info.earliest.Before(earliest)) {
+				earliest = info.earliest
+			}
+			continue
+		}
 		for start := 0; start < len(members); start += fillFirstRange {
 			end := start + fillFirstRange
 			if end > len(members) {
@@ -653,16 +877,15 @@ func selectFillFirstRangeAuthsForAttempt(auths []*Auth, provider, model string, 
 			earliest = info.earliest
 		}
 	}
+	if rpmLimited {
+		rpmRetryAfter := fillFirstRPMRetryAfterAt(rpmLimiter, now)
+		if cooldownBeforeRPMReset(earliest, rpmRetryAfter, now) {
+			return nil, newModelCooldownErrorUntil(model, provider, earliest, now)
+		}
+		return nil, newAuthRPMLimitedError(rpmRetryAfter)
+	}
 	if !earliest.IsZero() {
-		providerForError := provider
-		if providerForError == "mixed" {
-			providerForError = ""
-		}
-		resetIn := earliest.Sub(now)
-		if resetIn < 0 {
-			resetIn = 0
-		}
-		return nil, newModelCooldownError(model, providerForError, resetIn)
+		return nil, newModelCooldownErrorUntil(model, provider, earliest, now)
 	}
 	return nil, &Error{Code: "auth_unavailable", Message: "no auth available"}
 }

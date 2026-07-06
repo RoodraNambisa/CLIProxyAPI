@@ -1135,22 +1135,36 @@ func enrichAuthSelectionError(err error, providers []string, model string) error
 	}
 }
 
+func shouldForwardErrorAddonHeader(key string, passthroughHeaders bool) bool {
+	if passthroughHeaders {
+		return true
+	}
+	return strings.EqualFold(key, "Retry-After")
+}
+
+func applyErrorAddonHeaders(dst http.Header, addon http.Header, passthroughHeaders bool) {
+	if dst == nil || addon == nil {
+		return
+	}
+	for key, values := range addon {
+		if len(values) == 0 || !shouldForwardErrorAddonHeader(key, passthroughHeaders) {
+			continue
+		}
+		dst.Del(key)
+		for _, value := range values {
+			dst.Add(key, value)
+		}
+	}
+}
+
 // WriteErrorResponse writes an error message to the response writer using the HTTP status embedded in the message.
 func (h *BaseAPIHandler) WriteErrorResponse(c *gin.Context, msg *interfaces.ErrorMessage) {
 	status := http.StatusInternalServerError
 	if msg != nil && msg.StatusCode > 0 {
 		status = msg.StatusCode
 	}
-	if msg != nil && msg.Addon != nil && PassthroughHeadersEnabled(h.Cfg) {
-		for key, values := range msg.Addon {
-			if len(values) == 0 {
-				continue
-			}
-			c.Writer.Header().Del(key)
-			for _, value := range values {
-				c.Writer.Header().Add(key, value)
-			}
-		}
+	if msg != nil && msg.Addon != nil {
+		applyErrorAddonHeaders(c.Writer.Header(), msg.Addon, PassthroughHeadersEnabled(h.Cfg))
 	}
 
 	errText := http.StatusText(status)

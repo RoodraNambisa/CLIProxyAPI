@@ -14,7 +14,7 @@ import (
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v6/sdk/config"
 )
 
-func TestWriteErrorResponse_AddonHeadersDisabledByDefault(t *testing.T) {
+func TestWriteErrorResponse_RetryAfterAddonHeaderEnabledByDefault(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	recorder := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(recorder)
@@ -33,8 +33,8 @@ func TestWriteErrorResponse_AddonHeadersDisabledByDefault(t *testing.T) {
 	if recorder.Code != http.StatusTooManyRequests {
 		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusTooManyRequests)
 	}
-	if got := recorder.Header().Get("Retry-After"); got != "" {
-		t.Fatalf("Retry-After should be empty when passthrough is disabled, got %q", got)
+	if got := recorder.Header().Get("Retry-After"); got != "30" {
+		t.Fatalf("Retry-After = %q, want %q", got, "30")
 	}
 	if got := recorder.Header().Get("X-Request-Id"); got != "" {
 		t.Fatalf("X-Request-Id should be empty when passthrough is disabled, got %q", got)

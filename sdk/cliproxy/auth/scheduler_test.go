@@ -356,6 +356,407 @@ func TestSchedulerPick_FillFirstRangeDoesNotAffectRoundRobin(t *testing.T) {
 	}
 }
 
+func TestSchedulerPick_FillFirstPerAuthRPMAdvancesAfterLimit(t *testing.T) {
+	t.Parallel()
+
+	fixed := time.Date(2026, 8, 19, 12, 0, 10, 0, time.UTC)
+	scheduler := newSchedulerForTest(
+		&FillFirstSelector{},
+		&Auth{ID: "a", Provider: "gemini"},
+		&Auth{ID: "b", Provider: "gemini"},
+	)
+	scheduler.fillFirstLimiter.now = func() time.Time { return fixed }
+	scheduler.setRoutingConfig(internalconfig.RoutingConfig{FillFirstPerAuthRPM: 2})
+
+	want := []string{"a", "a", "b"}
+	for index, wantID := range want {
+		got, errPick := scheduler.pickSingle(context.Background(), "gemini", "", cliproxyexecutor.Options{}, nil)
+		if errPick != nil {
+			t.Fatalf("pickSingle() #%d error = %v", index, errPick)
+		}
+		if got == nil || got.ID != wantID {
+			t.Fatalf("pickSingle() #%d auth = %v, want %s", index, got, wantID)
+		}
+	}
+}
+
+func TestSchedulerPick_FillFirstPerAuthRPMResetsNextMinute(t *testing.T) {
+	t.Parallel()
+
+	fixed := time.Date(2026, 8, 19, 12, 0, 10, 0, time.UTC)
+	scheduler := newSchedulerForTest(
+		&FillFirstSelector{},
+		&Auth{ID: "a", Provider: "gemini"},
+		&Auth{ID: "b", Provider: "gemini"},
+	)
+	scheduler.fillFirstLimiter.now = func() time.Time { return fixed }
+	scheduler.setRoutingConfig(internalconfig.RoutingConfig{FillFirstPerAuthRPM: 1})
+
+	for _, wantID := range []string{"a", "b"} {
+		got, errPick := scheduler.pickSingle(context.Background(), "gemini", "", cliproxyexecutor.Options{}, nil)
+		if errPick != nil {
+			t.Fatalf("pickSingle() error = %v", errPick)
+		}
+		if got == nil || got.ID != wantID {
+			t.Fatalf("pickSingle() auth = %v, want %s", got, wantID)
+		}
+	}
+	fixed = fixed.Add(time.Minute)
+	got, errPick := scheduler.pickSingle(context.Background(), "gemini", "", cliproxyexecutor.Options{}, nil)
+	if errPick != nil {
+		t.Fatalf("pickSingle() after minute error = %v", errPick)
+	}
+	if got == nil || got.ID != "a" {
+		t.Fatalf("pickSingle() after minute auth = %v, want a", got)
+	}
+}
+
+func TestSchedulerPick_FillFirstPerAuthRPMSkipsCoolingFirstAuth(t *testing.T) {
+	t.Parallel()
+
+	model := schedulerTestID(t, "model")
+	aID := schedulerTestID(t, "a")
+	bID := schedulerTestID(t, "b")
+	registerSchedulerModels(t, "gemini", model, aID, bID)
+	fixed := time.Date(2026, 8, 19, 12, 0, 10, 0, time.UTC)
+	scheduler := newSchedulerForTest(
+		&FillFirstSelector{},
+		&Auth{
+			ID:       aID,
+			Provider: "gemini",
+			ModelStates: map[string]*ModelState{
+				model: {
+					Status:         StatusError,
+					Unavailable:    true,
+					NextRetryAfter: fixed.Add(time.Hour),
+				},
+			},
+		},
+		&Auth{ID: bID, Provider: "gemini"},
+	)
+	scheduler.fillFirstLimiter.now = func() time.Time { return fixed }
+	scheduler.setRoutingConfig(internalconfig.RoutingConfig{FillFirstPerAuthRPM: 1})
+
+	got, errPick := scheduler.pickSingle(context.Background(), "gemini", model, cliproxyexecutor.Options{}, nil)
+	if errPick != nil {
+		t.Fatalf("pickSingle() error = %v", errPick)
+	}
+	if got == nil || got.ID != bID {
+		t.Fatalf("pickSingle() auth = %v, want %s", got, bID)
+	}
+}
+
+func TestSchedulerPick_FillFirstPerAuthRPMReturnsRetryAfterWhenFull(t *testing.T) {
+	t.Parallel()
+
+	fixed := time.Date(2026, 6, 19, 12, 0, 10, 0, time.UTC)
+	scheduler := newSchedulerForTest(
+		&FillFirstSelector{},
+		&Auth{ID: "a", Provider: "gemini"},
+		&Auth{ID: "b", Provider: "gemini"},
+	)
+	scheduler.fillFirstLimiter.now = func() time.Time { return fixed }
+	scheduler.setRoutingConfig(internalconfig.RoutingConfig{FillFirstPerAuthRPM: 1})
+
+	for _, wantID := range []string{"a", "b"} {
+		got, errPick := scheduler.pickSingle(context.Background(), "gemini", "", cliproxyexecutor.Options{}, nil)
+		if errPick != nil {
+			t.Fatalf("pickSingle() error = %v", errPick)
+		}
+		if got == nil || got.ID != wantID {
+			t.Fatalf("pickSingle() auth = %v, want %s", got, wantID)
+		}
+	}
+	_, errPick := scheduler.pickSingle(context.Background(), "gemini", "", cliproxyexecutor.Options{}, nil)
+	rpmErr, ok := errPick.(*authRPMLimitedError)
+	if !ok {
+		t.Fatalf("pickSingle() error = %T %v, want *authRPMLimitedError", errPick, errPick)
+	}
+	if rpmErr.StatusCode() != http.StatusTooManyRequests {
+		t.Fatalf("StatusCode() = %d, want %d", rpmErr.StatusCode(), http.StatusTooManyRequests)
+	}
+	if got := rpmErr.Headers().Get("Retry-After"); got != "50" {
+		t.Fatalf("Retry-After = %q, want 50", got)
+	}
+}
+
+func TestSchedulerPick_FillFirstPerAuthRPMReturnsCooldownWhenSooner(t *testing.T) {
+	t.Parallel()
+
+	fixed := time.Date(2026, 8, 19, 12, 0, 10, 0, time.UTC)
+	scheduler := newSchedulerForTest(
+		&FillFirstSelector{},
+		&Auth{ID: "a", Provider: "gemini"},
+		&Auth{
+			ID:             "b",
+			Provider:       "gemini",
+			Unavailable:    true,
+			NextRetryAfter: fixed.Add(10 * time.Second),
+			Quota:          QuotaState{Exceeded: true},
+		},
+	)
+	scheduler.fillFirstLimiter.now = func() time.Time { return fixed }
+	scheduler.setRoutingConfig(internalconfig.RoutingConfig{FillFirstPerAuthRPM: 1})
+
+	got, errPick := scheduler.pickSingle(context.Background(), "gemini", "", cliproxyexecutor.Options{}, nil)
+	if errPick != nil {
+		t.Fatalf("pickSingle() #1 error = %v", errPick)
+	}
+	if got == nil || got.ID != "a" {
+		t.Fatalf("pickSingle() #1 auth = %v, want a", got)
+	}
+	_, errPick = scheduler.pickSingle(context.Background(), "gemini", "", cliproxyexecutor.Options{}, nil)
+	if _, ok := errPick.(*modelCooldownError); !ok {
+		t.Fatalf("pickSingle() #2 error = %T %v, want *modelCooldownError", errPick, errPick)
+	}
+}
+
+func TestSchedulerPick_FillFirstPerAuthRPMFallsBackToHTTPWhenWebsocketFull(t *testing.T) {
+	t.Parallel()
+
+	fixed := time.Date(2026, 6, 19, 12, 0, 10, 0, time.UTC)
+	scheduler := newSchedulerForTest(
+		&FillFirstSelector{},
+		&Auth{ID: "codex-http", Provider: "codex"},
+		&Auth{ID: "codex-ws", Provider: "codex", Attributes: map[string]string{"websockets": "true"}},
+	)
+	scheduler.fillFirstLimiter.now = func() time.Time { return fixed }
+	scheduler.setRoutingConfig(internalconfig.RoutingConfig{FillFirstPerAuthRPM: 1})
+	ctx := cliproxyexecutor.WithDownstreamWebsocket(context.Background())
+
+	for index, wantID := range []string{"codex-ws", "codex-http"} {
+		got, errPick := scheduler.pickSingle(ctx, "codex", "", cliproxyexecutor.Options{}, nil)
+		if errPick != nil {
+			t.Fatalf("pickSingle() #%d error = %v", index, errPick)
+		}
+		if got == nil || got.ID != wantID {
+			t.Fatalf("pickSingle() #%d auth = %v, want %s", index, got, wantID)
+		}
+	}
+}
+
+func TestSelectorFillFirstPerAuthRPMReturnsCooldownWhenSooner(t *testing.T) {
+	t.Parallel()
+
+	fixed := time.Date(2026, 8, 19, 12, 0, 10, 0, time.UTC)
+	limiter := newFillFirstMinuteLimiter()
+	auths := []*Auth{
+		{ID: "a", Provider: "gemini"},
+		{
+			ID:             "b",
+			Provider:       "gemini",
+			Unavailable:    true,
+			NextRetryAfter: fixed.Add(10 * time.Second),
+			Quota:          QuotaState{Exceeded: true},
+		},
+	}
+	rpmForPriority := func(int) int { return 1 }
+	rangeForPriority := func(int) int { return 1 }
+
+	got, errPick := selectFillFirstAuthsForAttemptWithPolicy(auths, "gemini", "", fixed, 0, rangeForPriority, rpmForPriority, limiter, nil, nil)
+	if errPick != nil {
+		t.Fatalf("selectFillFirstAuthsForAttemptWithPolicy() #1 error = %v", errPick)
+	}
+	if got == nil || got.ID != "a" {
+		t.Fatalf("selectFillFirstAuthsForAttemptWithPolicy() #1 auth = %v, want a", got)
+	}
+	_, errPick = selectFillFirstAuthsForAttemptWithPolicy(auths, "gemini", "", fixed, 0, rangeForPriority, rpmForPriority, limiter, nil, nil)
+	if _, ok := errPick.(*modelCooldownError); !ok {
+		t.Fatalf("selectFillFirstAuthsForAttemptWithPolicy() #2 error = %T %v, want *modelCooldownError", errPick, errPick)
+	}
+}
+
+func TestSelectorFillFirstPerAuthRPMFallsBackToHTTPWhenWebsocketRPMFullAndCooldownSooner(t *testing.T) {
+	t.Parallel()
+
+	fixed := time.Date(2026, 8, 19, 12, 0, 10, 0, time.UTC)
+	limiter := newFillFirstMinuteLimiter()
+	auths := []*Auth{
+		{ID: "codex-http", Provider: "codex"},
+		{ID: "codex-ws-a", Provider: "codex", Attributes: map[string]string{"websockets": "true"}},
+		{
+			ID:             "codex-ws-b",
+			Provider:       "codex",
+			Attributes:     map[string]string{"websockets": "true"},
+			Unavailable:    true,
+			NextRetryAfter: fixed.Add(10 * time.Second),
+			Quota:          QuotaState{Exceeded: true},
+		},
+	}
+	rpmForPriority := func(int) int { return 1 }
+	rangeForPriority := func(int) int { return 1 }
+	ctx := cliproxyexecutor.WithDownstreamWebsocket(context.Background())
+
+	got, errPick := selectFillFirstAuthsForContextWithPolicy(ctx, auths, "codex", "", fixed, 0, rangeForPriority, rpmForPriority, limiter, nil, nil)
+	if errPick != nil {
+		t.Fatalf("selectFillFirstAuthsForContextWithPolicy() #1 error = %v", errPick)
+	}
+	if got == nil || got.ID != "codex-ws-a" {
+		t.Fatalf("selectFillFirstAuthsForContextWithPolicy() #1 auth = %v, want codex-ws-a", got)
+	}
+	got, errPick = selectFillFirstAuthsForContextWithPolicy(ctx, auths, "codex", "", fixed, 0, rangeForPriority, rpmForPriority, limiter, nil, nil)
+	if errPick != nil {
+		t.Fatalf("selectFillFirstAuthsForContextWithPolicy() #2 error = %v", errPick)
+	}
+	if got == nil || got.ID != "codex-http" {
+		t.Fatalf("selectFillFirstAuthsForContextWithPolicy() #2 auth = %v, want codex-http", got)
+	}
+}
+
+func TestSchedulerPick_MixedFillFirstPerAuthRPMAdvancesAcrossProviders(t *testing.T) {
+	t.Parallel()
+
+	fixed := time.Date(2026, 6, 19, 12, 0, 10, 0, time.UTC)
+	scheduler := newSchedulerForTest(
+		&FillFirstSelector{},
+		&Auth{ID: "a-claude", Provider: "claude", Attributes: map[string]string{"priority": "0"}},
+		&Auth{ID: "b-gemini", Provider: "gemini", Attributes: map[string]string{"priority": "0"}},
+	)
+	scheduler.fillFirstLimiter.now = func() time.Time { return fixed }
+	scheduler.setRoutingConfig(internalconfig.RoutingConfig{FillFirstPerAuthRPM: 1})
+
+	got, provider, errPick := scheduler.pickMixed(context.Background(), []string{"gemini", "claude"}, "", cliproxyexecutor.Options{}, nil)
+	if errPick != nil {
+		t.Fatalf("pickMixed() #1 error = %v", errPick)
+	}
+	if got == nil || got.ID != "a-claude" || provider != "claude" {
+		t.Fatalf("pickMixed() #1 auth/provider = %v/%q, want a-claude/claude", got, provider)
+	}
+	got, provider, errPick = scheduler.pickMixed(context.Background(), []string{"gemini", "claude"}, "", cliproxyexecutor.Options{}, nil)
+	if errPick != nil {
+		t.Fatalf("pickMixed() #2 error = %v", errPick)
+	}
+	if got == nil || got.ID != "b-gemini" || provider != "gemini" {
+		t.Fatalf("pickMixed() #2 auth/provider = %v/%q, want b-gemini/gemini", got, provider)
+	}
+	_, _, errPick = scheduler.pickMixed(context.Background(), []string{"gemini", "claude"}, "", cliproxyexecutor.Options{}, nil)
+	if _, ok := errPick.(*authRPMLimitedError); !ok {
+		t.Fatalf("pickMixed() #3 error = %T %v, want *authRPMLimitedError", errPick, errPick)
+	}
+}
+
+func TestSchedulerPick_MixedFillFirstPerAuthRPMReturnsCooldownWhenSooner(t *testing.T) {
+	t.Parallel()
+
+	fixed := time.Date(2026, 8, 19, 12, 0, 10, 0, time.UTC)
+	scheduler := newSchedulerForTest(
+		&FillFirstSelector{},
+		&Auth{ID: "a-claude", Provider: "claude", Attributes: map[string]string{"priority": "0"}},
+		&Auth{
+			ID:             "b-gemini",
+			Provider:       "gemini",
+			Attributes:     map[string]string{"priority": "0"},
+			Unavailable:    true,
+			NextRetryAfter: fixed.Add(10 * time.Second),
+			Quota:          QuotaState{Exceeded: true},
+		},
+	)
+	scheduler.fillFirstLimiter.now = func() time.Time { return fixed }
+	scheduler.setRoutingConfig(internalconfig.RoutingConfig{FillFirstPerAuthRPM: 1})
+
+	got, provider, errPick := scheduler.pickMixed(context.Background(), []string{"gemini", "claude"}, "", cliproxyexecutor.Options{}, nil)
+	if errPick != nil {
+		t.Fatalf("pickMixed() #1 error = %v", errPick)
+	}
+	if got == nil || got.ID != "a-claude" || provider != "claude" {
+		t.Fatalf("pickMixed() #1 auth/provider = %v/%q, want a-claude/claude", got, provider)
+	}
+	_, _, errPick = scheduler.pickMixed(context.Background(), []string{"gemini", "claude"}, "", cliproxyexecutor.Options{}, nil)
+	if _, ok := errPick.(*modelCooldownError); !ok {
+		t.Fatalf("pickMixed() #2 error = %T %v, want *modelCooldownError", errPick, errPick)
+	}
+}
+
+func TestManagerPickLegacyFillFirstRangeAuth_SessionAffinityUsesPerAuthRPM(t *testing.T) {
+	t.Parallel()
+
+	manager := NewManager(nil, NewSessionAffinitySelector(&FillFirstSelector{}), nil)
+	manager.SetConfig(&internalconfig.Config{Routing: internalconfig.RoutingConfig{FillFirstPerAuthRPM: 1}})
+	fixed := time.Date(2026, 6, 19, 12, 0, 10, 0, time.UTC)
+	manager.scheduler.fillFirstLimiter.now = func() time.Time { return fixed }
+	candidates := []*Auth{
+		{ID: "a", Provider: "gemini"},
+		{ID: "b", Provider: "gemini"},
+	}
+	opts := cliproxyexecutor.Options{
+		Headers: http.Header{"Session-Id": {"rpm-session"}},
+	}
+
+	for index, wantID := range []string{"a", "b"} {
+		got, handled, errPick := manager.pickLegacyFillFirstRangeAuth(context.Background(), "gemini", "", opts, candidates, nil)
+		if errPick != nil {
+			t.Fatalf("pickLegacyFillFirstRangeAuth() #%d error = %v", index, errPick)
+		}
+		if !handled {
+			t.Fatalf("pickLegacyFillFirstRangeAuth() #%d handled = false, want true", index)
+		}
+		if got == nil || got.ID != wantID {
+			t.Fatalf("pickLegacyFillFirstRangeAuth() #%d auth = %v, want %s", index, got, wantID)
+		}
+	}
+}
+
+func TestManagerPickLegacyFillFirstRangeAuth_FallsBackToHTTPWhenWebsocketRPMFull(t *testing.T) {
+	t.Parallel()
+
+	manager := NewManager(nil, &FillFirstSelector{}, nil)
+	manager.SetConfig(&internalconfig.Config{Routing: internalconfig.RoutingConfig{FillFirstPerAuthRPM: 1}})
+	fixed := time.Date(2026, 6, 19, 12, 0, 10, 0, time.UTC)
+	manager.scheduler.fillFirstLimiter.now = func() time.Time { return fixed }
+	candidates := []*Auth{
+		{ID: "codex-http", Provider: "codex"},
+		{ID: "codex-ws", Provider: "codex", Attributes: map[string]string{"websockets": "true"}},
+	}
+	ctx := cliproxyexecutor.WithDownstreamWebsocket(context.Background())
+
+	for index, wantID := range []string{"codex-ws", "codex-http"} {
+		got, handled, errPick := manager.pickLegacyFillFirstRangeAuth(ctx, "codex", "", cliproxyexecutor.Options{}, candidates, nil)
+		if errPick != nil {
+			t.Fatalf("pickLegacyFillFirstRangeAuth() #%d error = %v", index, errPick)
+		}
+		if !handled {
+			t.Fatalf("pickLegacyFillFirstRangeAuth() #%d handled = false, want true", index)
+		}
+		if got == nil || got.ID != wantID {
+			t.Fatalf("pickLegacyFillFirstRangeAuth() #%d auth = %v, want %s", index, got, wantID)
+		}
+	}
+}
+
+func TestManagerPickLegacyFillFirstRangeAuth_UsesPerPriorityRPMOnFallback(t *testing.T) {
+	t.Parallel()
+
+	lowerRPM := 0
+	manager := NewManager(nil, &FillFirstSelector{}, nil)
+	manager.SetConfig(&internalconfig.Config{
+		Routing: internalconfig.RoutingConfig{
+			FillFirstPerAuthRPM: 1,
+			PriorityOverrides: []internalconfig.RoutingPriorityOverride{
+				{Priority: 0, FillFirstPerAuthRPM: &lowerRPM},
+			},
+		},
+	})
+	fixed := time.Date(2026, 6, 19, 12, 0, 10, 0, time.UTC)
+	manager.scheduler.fillFirstLimiter.now = func() time.Time { return fixed }
+	candidates := []*Auth{
+		{ID: "high", Provider: "gemini", Attributes: map[string]string{"priority": "1"}},
+		{ID: "low", Provider: "gemini", Attributes: map[string]string{"priority": "0"}},
+	}
+
+	for index, wantID := range []string{"high", "low", "low"} {
+		got, handled, errPick := manager.pickLegacyFillFirstRangeAuth(context.Background(), "gemini", "", cliproxyexecutor.Options{}, candidates, nil)
+		if errPick != nil {
+			t.Fatalf("pickLegacyFillFirstRangeAuth() #%d error = %v", index, errPick)
+		}
+		if !handled {
+			t.Fatalf("pickLegacyFillFirstRangeAuth() #%d handled = false, want true", index)
+		}
+		if got == nil || got.ID != wantID {
+			t.Fatalf("pickLegacyFillFirstRangeAuth() #%d auth = %v, want %s", index, got, wantID)
+		}
+	}
+}
+
 func TestManagerPrioritySelectorForAvailable_UsesSessionAffinityFallbackFillFirstRangeOverride(t *testing.T) {
 	t.Parallel()
 
