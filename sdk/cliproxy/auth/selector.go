@@ -290,7 +290,15 @@ func authWebsocketsEnabled(auth *Auth) bool {
 }
 
 func shouldPreferCodexWebsocket(ctx context.Context, provider string) bool {
-	return cliproxyexecutor.DownstreamWebsocket(ctx) && strings.EqualFold(strings.TrimSpace(provider), "codex")
+	if !cliproxyexecutor.DownstreamWebsocket(ctx) {
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(provider)) {
+	case "codex", "xai":
+		return true
+	default:
+		return false
+	}
 }
 
 func hasReadyCodexWebsocketAuth(auths []*Auth, model string, now time.Time) bool {

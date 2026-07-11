@@ -111,22 +111,25 @@ type authModelStats struct {
 
 // RequestDetail stores the timestamp, latency, and token usage for a single request.
 type RequestDetail struct {
-	Timestamp time.Time  `json:"timestamp"`
-	LatencyMs int64      `json:"latency_ms"`
-	Source    string     `json:"source"`
-	ClientIP  string     `json:"client_ip"`
-	AuthIndex string     `json:"auth_index"`
-	Tokens    TokenStats `json:"tokens"`
-	Failed    bool       `json:"failed"`
+	Timestamp           time.Time  `json:"timestamp"`
+	LatencyMs           int64      `json:"latency_ms"`
+	Source              string     `json:"source"`
+	ClientIP            string     `json:"client_ip"`
+	AuthIndex           string     `json:"auth_index"`
+	RequestServiceTier  string     `json:"request_service_tier,omitempty"`
+	ResponseServiceTier string     `json:"response_service_tier,omitempty"`
+	Tokens              TokenStats `json:"tokens"`
+	Failed              bool       `json:"failed"`
 }
 
 // TokenStats captures the token usage breakdown for a request.
 type TokenStats struct {
-	InputTokens     int64 `json:"input_tokens"`
-	OutputTokens    int64 `json:"output_tokens"`
-	ReasoningTokens int64 `json:"reasoning_tokens"`
-	CachedTokens    int64 `json:"cached_tokens"`
-	TotalTokens     int64 `json:"total_tokens"`
+	InputTokens         int64 `json:"input_tokens"`
+	OutputTokens        int64 `json:"output_tokens"`
+	ReasoningTokens     int64 `json:"reasoning_tokens"`
+	CachedTokens        int64 `json:"cached_tokens"`
+	CacheCreationTokens int64 `json:"cache_creation_tokens"`
+	TotalTokens         int64 `json:"total_tokens"`
 }
 
 // StatisticsSnapshot represents an immutable view of the aggregated metrics.
@@ -222,13 +225,18 @@ func (s *RequestStatistics) Record(ctx context.Context, record coreusage.Record)
 		s.apis[statsKey] = stats
 	}
 	requestDetail := RequestDetail{
-		Timestamp: timestamp,
-		LatencyMs: normaliseLatency(record.Latency),
-		Source:    record.Source,
-		ClientIP:  resolveClientIP(ctx),
-		AuthIndex: record.AuthIndex,
-		Tokens:    detail,
-		Failed:    failed,
+		Timestamp:           timestamp,
+		LatencyMs:           normaliseLatency(record.Latency),
+		Source:              record.Source,
+		ClientIP:            resolveClientIP(ctx),
+		AuthIndex:           record.AuthIndex,
+		RequestServiceTier:  strings.TrimSpace(record.RequestServiceTier),
+		ResponseServiceTier: strings.TrimSpace(record.ResponseServiceTier),
+		Tokens:              detail,
+		Failed:              failed,
+	}
+	if requestDetail.ResponseServiceTier == "" {
+		requestDetail.ResponseServiceTier = strings.TrimSpace(record.Detail.ResponseServiceTier)
 	}
 	s.updateAPIStats(stats, modelName, requestDetail)
 	s.updateAuthStats(modelName, requestDetail)
@@ -277,6 +285,7 @@ func updateUsageAggregate(totalRequests, successCount, failureCount, totalTokens
 		tokens.OutputTokens += normalizedTokens.OutputTokens
 		tokens.ReasoningTokens += normalizedTokens.ReasoningTokens
 		tokens.CachedTokens += normalizedTokens.CachedTokens
+		tokens.CacheCreationTokens += normalizedTokens.CacheCreationTokens
 		tokens.TotalTokens += normalizedTokens.TotalTokens
 	}
 }
@@ -697,18 +706,21 @@ func dedupKey(apiName, modelName string, detail RequestDetail) string {
 	timestamp := detail.Timestamp.UTC().Format(time.RFC3339Nano)
 	tokens := normaliseTokenStats(detail.Tokens)
 	return fmt.Sprintf(
-		"%s|%s|%s|%s|%s|%s|%t|%d|%d|%d|%d|%d",
+		"%s|%s|%s|%s|%s|%s|%s|%s|%t|%d|%d|%d|%d|%d|%d",
 		apiName,
 		modelName,
 		timestamp,
 		detail.Source,
 		strings.TrimSpace(detail.ClientIP),
 		detail.AuthIndex,
+		strings.TrimSpace(detail.RequestServiceTier),
+		strings.TrimSpace(detail.ResponseServiceTier),
 		detail.Failed,
 		tokens.InputTokens,
 		tokens.OutputTokens,
 		tokens.ReasoningTokens,
 		tokens.CachedTokens,
+		tokens.CacheCreationTokens,
 		tokens.TotalTokens,
 	)
 }
@@ -768,17 +780,21 @@ const httpStatusBadRequest = 400
 
 func normaliseDetail(detail coreusage.Detail) TokenStats {
 	tokens := TokenStats{
-		InputTokens:     detail.InputTokens,
-		OutputTokens:    detail.OutputTokens,
-		ReasoningTokens: detail.ReasoningTokens,
-		CachedTokens:    detail.CachedTokens,
-		TotalTokens:     detail.TotalTokens,
+		InputTokens:         detail.InputTokens,
+		OutputTokens:        detail.OutputTokens,
+		ReasoningTokens:     detail.ReasoningTokens,
+		CachedTokens:        detail.CachedTokens,
+		CacheCreationTokens: detail.CacheCreationTokens,
+		TotalTokens:         detail.TotalTokens,
 	}
 	if tokens.TotalTokens == 0 {
 		tokens.TotalTokens = detail.InputTokens + detail.OutputTokens + detail.ReasoningTokens
 	}
 	if tokens.TotalTokens == 0 {
 		tokens.TotalTokens = detail.InputTokens + detail.OutputTokens + detail.ReasoningTokens + detail.CachedTokens
+	}
+	if tokens.TotalTokens == 0 {
+		tokens.TotalTokens = detail.CacheCreationTokens
 	}
 	return tokens
 }
@@ -789,6 +805,9 @@ func normaliseTokenStats(tokens TokenStats) TokenStats {
 	}
 	if tokens.TotalTokens == 0 {
 		tokens.TotalTokens = tokens.InputTokens + tokens.OutputTokens + tokens.ReasoningTokens + tokens.CachedTokens
+	}
+	if tokens.TotalTokens == 0 {
+		tokens.TotalTokens = tokens.CacheCreationTokens
 	}
 	return tokens
 }

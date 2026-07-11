@@ -198,14 +198,13 @@ func (e *CodexExecutor) executeOpenAIImageStream(ctx context.Context, auth *clip
 			}
 		}()
 		reader := bufio.NewReaderSize(httpResp.Body, 64*1024)
+		var streamUsage helps.StreamUsageBuffer
 		for {
 			line, readErr := reader.ReadBytes('\n')
 			if len(line) > 0 {
 				upstreamLine := applyCodexIdentityConfuseResponsePayload(line, identityState)
 				helps.AppendAPIResponseChunk(ctx, e.cfg, upstreamLine)
-				if detail, ok := helps.ParseOpenAIStreamUsage(upstreamLine); ok {
-					reporter.Publish(ctx, detail)
-				}
+				streamUsage.ObserveOpenAIStream(upstreamLine)
 				clientLine := applyCodexIdentityExposeResponsePayload(upstreamLine, identityState)
 				if !emitCodexOpenAIImageStreamChunk(ctx, out, cliproxyexecutor.StreamChunk{Payload: clientLine}) {
 					return
@@ -215,9 +214,11 @@ func (e *CodexExecutor) executeOpenAIImageStream(ctx context.Context, auth *clip
 				continue
 			}
 			if errors.Is(readErr, io.EOF) {
+				streamUsage.Publish(ctx, reporter)
 				reporter.EnsurePublished(ctx)
 				return
 			}
+			streamUsage.Publish(ctx, reporter)
 			helps.RecordAPIResponseError(ctx, e.cfg, readErr)
 			reporter.PublishFailure(ctx)
 			_ = emitCodexOpenAIImageStreamChunk(ctx, out, cliproxyexecutor.StreamChunk{Err: readErr})

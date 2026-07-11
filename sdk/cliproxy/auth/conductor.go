@@ -1317,7 +1317,7 @@ func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, affinityProv
 					rerr.HTTPStatus = se.StatusCode()
 				}
 				if !skipAuthResultForError(chunk.Err) {
-					m.MarkResult(ctx, Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr})
+					m.MarkResult(ctx, Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr, RetryAfter: retryAfterFromError(chunk.Err)})
 				}
 			}
 			if !forward {
@@ -4535,8 +4535,31 @@ func payloadHasImageGenerationTool(payload []byte) bool {
 		return false
 	}
 	for _, tool := range tools.Array() {
-		if tool.Get("type").String() == "image_generation" {
+		if payloadToolHasImageGeneration(tool) {
 			return true
+		}
+	}
+	return false
+}
+
+func payloadToolHasImageGeneration(tool gjson.Result) bool {
+	switch tool.Get("type").String() {
+	case "image_generation":
+		return true
+	case "function":
+		name := strings.TrimSpace(tool.Get("name").String())
+		if name == "" {
+			name = strings.TrimSpace(tool.Get("function.name").String())
+		}
+		return name == "image_gen.imagegen"
+	case "namespace":
+		if strings.TrimSpace(tool.Get("name").String()) != "image_gen" {
+			return false
+		}
+		for _, nestedTool := range tool.Get("tools").Array() {
+			if nestedTool.Get("type").String() == "function" && strings.TrimSpace(nestedTool.Get("name").String()) == "imagegen" {
+				return true
+			}
 		}
 	}
 	return false

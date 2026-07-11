@@ -379,7 +379,7 @@ func (s *authScheduler) pickSingle(ctx context.Context, provider, model string, 
 	providerKey := strings.ToLower(strings.TrimSpace(provider))
 	modelKey := canonicalModelKey(model)
 	pinnedAuthID := pinnedAuthIDFromMetadata(opts.Metadata)
-	preferWebsocket := cliproxyexecutor.DownstreamWebsocket(ctx) && providerKey == "codex" && pinnedAuthID == ""
+	preferWebsocket := shouldPreferCodexWebsocket(ctx, providerKey) && pinnedAuthID == ""
 	selectionAttempt := 0
 	s.mu.RLock()
 	defer s.mu.RUnlock()

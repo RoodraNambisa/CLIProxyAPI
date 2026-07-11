@@ -3,18 +3,69 @@ package executor
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor/helps"
 	_ "github.com/router-for-me/CLIProxyAPI/v6/internal/translator"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v6/sdk/translator"
 	"github.com/tidwall/gjson"
 )
+
+func TestCodexExecutorExecuteStreamClearsRejectedReasoningReplay(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte(`data: {"type":"response.failed","response":{"status":"failed","error":{"code":"invalid_encrypted_content","message":"invalid signature in thinking block"}}}` + "\n\n"))
+	}))
+	defer server.Close()
+
+	ctx := context.Background()
+	auth := &cliproxyauth.Auth{ID: "codex-replay-auth", Provider: "codex", Attributes: map[string]string{
+		"base_url": server.URL,
+		"api_key":  "test",
+	}}
+	namespace := helps.ReasoningReplayNamespace(ctx, "codex", auth.ID)
+	body := []byte(`{"input":[{"type":"function_call_output","call_id":"call_1","output":"ok"}]}`)
+	metadata := map[string]any{cliproxyexecutor.ExecutionSessionMetadataKey: "session-1"}
+	_, scope := helps.ApplyCodexReasoningReplay(ctx, "claude", namespace, "gpt-5.4-mini", nil, body, nil, metadata, nil)
+	signatureBytes := make([]byte, 73)
+	signatureBytes[0] = 0x80
+	signature := base64.RawURLEncoding.EncodeToString(signatureBytes)
+	completed := []byte(`{"response":{"output":[{"type":"reasoning","encrypted_content":"` + signature + `"},{"type":"function_call","call_id":"call_1","name":"lookup","arguments":"{}"}]}}`)
+	if !helps.CacheCodexReasoningReplayFromCompleted(scope, completed) {
+		t.Fatal("failed to seed replay cache")
+	}
+
+	executor := NewCodexExecutor(&config.Config{})
+	result, err := executor.ExecuteStream(ctx, auth, cliproxyexecutor.Request{
+		Model:    "gpt-5.4-mini",
+		Payload:  []byte(`{"model":"gpt-5.4-mini","messages":[{"role":"user","content":"continue"}]}`),
+		Metadata: metadata,
+	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatClaude, Stream: true, Metadata: metadata})
+	if err != nil {
+		t.Fatalf("ExecuteStream() error = %v", err)
+	}
+	var streamErr error
+	for chunk := range result.Chunks {
+		if chunk.Err != nil {
+			streamErr = chunk.Err
+		}
+	}
+	if streamErr == nil {
+		t.Fatal("stream error = nil")
+	}
+
+	replayed, _ := helps.ApplyCodexReasoningReplay(ctx, "claude", namespace, "gpt-5.4-mini", nil, body, nil, metadata, nil)
+	if got := gjson.GetBytes(replayed, "input.0.type").String(); got == "reasoning" {
+		t.Fatalf("rejected replay remained cached: %s", replayed)
+	}
+}
 
 func TestCodexExecutorExecute_EmptyStreamCompletionOutputUsesOutputItemDone(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -120,6 +171,10 @@ func TestCodexExecutorExecute_ResponseIncompleteReturnsTerminalError(t *testing.
 	}
 	if !strings.Contains(err.Error(), "response incomplete: max_tokens") {
 		t.Fatalf("error = %v, want incomplete reason", err)
+	}
+	skipper, ok := err.(interface{ SkipAuthResult() bool })
+	if !ok || !skipper.SkipAuthResult() {
+		t.Fatalf("SkipAuthResult = %v, want true", ok)
 	}
 }
 

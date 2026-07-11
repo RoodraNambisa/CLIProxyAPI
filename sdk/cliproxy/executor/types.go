@@ -10,6 +10,9 @@ import (
 // RequestedModelMetadataKey stores the client-requested model name in Options.Metadata.
 const RequestedModelMetadataKey = "requested_model"
 
+// RequestPathMetadataKey stores the inbound HTTP request path in Options.Metadata.
+const RequestPathMetadataKey = "request_path"
+
 // ExecutionModelOverrideMetadataKey overrides the upstream execution model while
 // keeping auth selection bound to Request.Model.
 const ExecutionModelOverrideMetadataKey = "execution_model_override"
@@ -61,8 +64,19 @@ type Options struct {
 	OriginalRequest []byte
 	// SourceFormat identifies the inbound schema.
 	SourceFormat sdktranslator.Format
+	// ResponseFormat identifies the downstream response schema. Empty preserves
+	// the historical behavior of using SourceFormat.
+	ResponseFormat sdktranslator.Format
 	// Metadata carries extra execution hints shared across selection and executors.
 	Metadata map[string]any
+}
+
+// ResponseFormatOrSource returns the explicit downstream format when present.
+func ResponseFormatOrSource(opts Options) sdktranslator.Format {
+	if opts.ResponseFormat != "" {
+		return opts.ResponseFormat
+	}
+	return opts.SourceFormat
 }
 
 // Response wraps either a full provider response or metadata for streaming flows.

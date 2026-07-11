@@ -317,3 +317,136 @@ func TestConvertCodexResponseToClaude_StreamEmptyOutputUsesOutputItemDoneMessage
 		t.Fatalf("expected fallback content from response.output_item.done message; outputs=%q", outputs)
 	}
 }
+
+func TestConvertCodexResponseToClaude_FinalizesPendingFunctionCallFromTerminalResponse(t *testing.T) {
+	ctx := context.Background()
+	originalRequest := []byte(`{"tools":[{"name":"lookup"}]}`)
+	var param any
+
+	chunks := [][]byte{
+		[]byte(`data: {"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","call_id":"call_1","name":""}}`),
+		[]byte(`data: {"type":"response.function_call_arguments.done","output_index":0,"arguments":"{\"q\":\"go\"}"}`),
+		[]byte(`data: {"type":"response.completed","response":{"output":[{"type":"function_call","call_id":"call_1","name":"lookup","arguments":"{\"q\":\"go\"}"}],"usage":{"input_tokens":1,"output_tokens":1}}}`),
+	}
+
+	var stream strings.Builder
+	for _, chunk := range chunks {
+		for _, output := range ConvertCodexResponseToClaude(ctx, "", originalRequest, nil, chunk, &param) {
+			stream.Write(output)
+		}
+	}
+
+	result := stream.String()
+	if strings.Count(result, `"type":"content_block_start"`) != 1 {
+		t.Fatalf("expected one tool block start, got: %s", result)
+	}
+	if !strings.Contains(result, `"name":"lookup"`) || !strings.Contains(result, `"partial_json":"{\"q\":\"go\"}"`) {
+		t.Fatalf("pending tool call was not hydrated from terminal response: %s", result)
+	}
+	if !strings.Contains(result, `"stop_reason":"tool_use"`) {
+		t.Fatalf("terminal response should report tool_use: %s", result)
+	}
+}
+
+func TestConvertCodexResponseToClaude_KeepsMultiplePendingFunctionCallsByCallID(t *testing.T) {
+	var param any
+	chunks := [][]byte{
+		[]byte(`data: {"type":"response.output_item.added","output_index":1,"item":{"type":"function_call","call_id":"call_first"}}`),
+		[]byte(`data: {"type":"response.output_item.added","output_index":2,"item":{"type":"function_call","call_id":"call_second"}}`),
+		[]byte(`data: {"type":"response.output_item.done","item":{"type":"function_call","call_id":"call_first","name":"lookup","arguments":"{\"id\":1}"}}`),
+		[]byte(`data: {"type":"response.output_item.done","item":{"type":"function_call","call_id":"call_second","name":"lookup","arguments":"{\"id\":2}"}}`),
+	}
+
+	var stream strings.Builder
+	for _, chunk := range chunks {
+		for _, output := range ConvertCodexResponseToClaude(context.Background(), "", nil, nil, chunk, &param) {
+			stream.Write(output)
+		}
+	}
+	result := stream.String()
+	if strings.Count(result, `"type":"tool_use"`) != 2 || !strings.Contains(result, `"id":"call_first"`) || !strings.Contains(result, `"id":"call_second"`) {
+		t.Fatalf("pending function calls were not preserved independently: %s", result)
+	}
+	if !strings.Contains(result, `"partial_json":"{\"id\":1}"`) || !strings.Contains(result, `"partial_json":"{\"id\":2}"`) {
+		t.Fatalf("pending arguments were not preserved: %s", result)
+	}
+}
+
+func TestConvertCodexResponseToClaude_UnresolvedPendingFunctionCallEndsTurn(t *testing.T) {
+	var param any
+	chunks := [][]byte{
+		[]byte(`data: {"type":"response.output_item.added","output_index":1,"item":{"type":"function_call","call_id":"call_hidden"}}`),
+		[]byte(`data: {"type":"response.completed","response":{"stop_reason":"stop","output":[],"usage":{}}}`),
+	}
+
+	var stream strings.Builder
+	for _, chunk := range chunks {
+		for _, output := range ConvertCodexResponseToClaude(context.Background(), "", nil, nil, chunk, &param) {
+			stream.Write(output)
+		}
+	}
+	result := stream.String()
+	if strings.Contains(result, `"type":"tool_use"`) {
+		t.Fatalf("unresolved pending function call emitted tool_use: %s", result)
+	}
+	if !strings.Contains(result, `"stop_reason":"end_turn"`) {
+		t.Fatalf("unresolved pending function call should end turn: %s", result)
+	}
+	params := param.(*ConvertCodexResponseToClaudeParams)
+	if len(params.PendingFunctionCalls) != 0 || params.LastPendingFunctionCallKey != "" {
+		t.Fatalf("pending state was not cleared: %#v", params)
+	}
+}
+
+func TestConvertCodexResponseToClaude_ClosesOpenFunctionCallAtTerminalResponse(t *testing.T) {
+	ctx := context.Background()
+	var param any
+	chunks := [][]byte{
+		[]byte(`data: {"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","call_id":"call_1","name":"lookup"}}`),
+		[]byte(`data: {"type":"response.completed","response":{"output":[{"type":"function_call","call_id":"call_1","name":"lookup","arguments":"{\"q\":1}"}],"usage":{}}}`),
+	}
+
+	var stream strings.Builder
+	for _, chunk := range chunks {
+		for _, output := range ConvertCodexResponseToClaude(ctx, "", nil, nil, chunk, &param) {
+			stream.Write(output)
+		}
+	}
+	result := stream.String()
+	if !strings.Contains(result, `"partial_json":"{\"q\":1}"`) {
+		t.Fatalf("terminal response should hydrate missing arguments: %s", result)
+	}
+	if strings.Count(result, `"type":"content_block_stop"`) != 1 {
+		t.Fatalf("open tool block should be closed once: %s", result)
+	}
+}
+
+func TestConvertCodexResponseToClaude_EmitsWebSearchServerToolBlocks(t *testing.T) {
+	ctx := context.Background()
+	var param any
+	chunk := []byte(`data: {"type":"response.output_item.done","output_index":0,"item":{"type":"web_search_call","id":"ws_1","action":{"query":"golang"},"results":[{"title":"Go","url":"https://go.dev"}]}}`)
+
+	outputs := ConvertCodexResponseToClaude(ctx, "", nil, nil, chunk, &param)
+	joined := ""
+	for _, output := range outputs {
+		joined += string(output)
+	}
+	if !strings.Contains(joined, `"type":"server_tool_use"`) || !strings.Contains(joined, `"name":"web_search"`) {
+		t.Fatalf("missing web search server tool block: %s", joined)
+	}
+	if !strings.Contains(joined, `"type":"web_search_tool_result"`) || !strings.Contains(joined, `"url":"https://go.dev"`) {
+		t.Fatalf("missing web search result block: %s", joined)
+	}
+}
+
+func TestConvertCodexResponseToClaudeNonStream_EmitsWebSearchServerToolBlocks(t *testing.T) {
+	response := []byte(`{"type":"response.completed","response":{"output":[{"type":"web_search_call","id":"ws_1","action":{"query":"golang"},"results":[{"title":"Go","url":"https://go.dev"}]}]}}`)
+	out := ConvertCodexResponseToClaudeNonStream(context.Background(), "", nil, nil, response, nil)
+
+	if got := gjson.GetBytes(out, "content.0.type").String(); got != "server_tool_use" {
+		t.Fatalf("content.0.type = %q, want server_tool_use; output=%s", got, out)
+	}
+	if got := gjson.GetBytes(out, "content.1.type").String(); got != "web_search_tool_result" {
+		t.Fatalf("content.1.type = %q, want web_search_tool_result; output=%s", got, out)
+	}
+}

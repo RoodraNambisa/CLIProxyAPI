@@ -28,7 +28,7 @@ func TestParseOpenAIUsageChatCompletions(t *testing.T) {
 }
 
 func TestParseOpenAIUsageResponses(t *testing.T) {
-	data := []byte(`{"usage":{"input_tokens":10,"output_tokens":20,"total_tokens":30,"input_tokens_details":{"cached_tokens":7},"output_tokens_details":{"reasoning_tokens":9}}}`)
+	data := []byte(`{"service_tier":"priority","usage":{"input_tokens":10,"output_tokens":20,"total_tokens":30,"input_tokens_details":{"cached_tokens":7,"cache_write_tokens":6},"output_tokens_details":{"reasoning_tokens":9}}}`)
 	detail := ParseOpenAIUsage(data)
 	if detail.InputTokens != 10 {
 		t.Fatalf("input tokens = %d, want %d", detail.InputTokens, 10)
@@ -44,6 +44,39 @@ func TestParseOpenAIUsageResponses(t *testing.T) {
 	}
 	if detail.ReasoningTokens != 9 {
 		t.Fatalf("reasoning tokens = %d, want %d", detail.ReasoningTokens, 9)
+	}
+	if detail.CacheCreationTokens != 6 {
+		t.Fatalf("cache creation tokens = %d, want %d", detail.CacheCreationTokens, 6)
+	}
+	if detail.ResponseServiceTier != "priority" {
+		t.Fatalf("response service tier = %q, want priority", detail.ResponseServiceTier)
+	}
+}
+
+func TestStreamUsageBufferRetainsTierAcrossUsageEvents(t *testing.T) {
+	var buffer StreamUsageBuffer
+	buffer.ObserveOpenAIStream([]byte(`data: {"service_tier":"priority"}`))
+	buffer.ObserveOpenAIStream([]byte(`data: {"usage":{"prompt_tokens":3,"completion_tokens":4,"total_tokens":7}}`))
+
+	detail, ok := buffer.Detail()
+	if !ok {
+		t.Fatal("expected buffered usage")
+	}
+	if detail.TotalTokens != 7 || detail.ResponseServiceTier != "priority" {
+		t.Fatalf("unexpected buffered detail: %+v", detail)
+	}
+}
+
+func TestParseOpenAIStreamUsageSkipsIrrelevantChunks(t *testing.T) {
+	if _, ok := ParseOpenAIStreamUsage([]byte(`data: {"type":"response.output_text.delta","delta":"usage"}`)); ok {
+		t.Fatal("irrelevant stream chunk should not be parsed as usage")
+	}
+}
+
+func TestParseClaudeUsagePreservesCacheCreationTokens(t *testing.T) {
+	detail := ParseClaudeUsage([]byte(`{"usage":{"input_tokens":2,"output_tokens":3,"cache_read_input_tokens":4,"cache_creation_input_tokens":5}}`))
+	if detail.CachedTokens != 4 || detail.CacheCreationTokens != 5 {
+		t.Fatalf("unexpected Claude cache tokens: %+v", detail)
 	}
 }
 
@@ -66,17 +99,21 @@ func TestParseCodexImageToolUsage(t *testing.T) {
 
 func TestUsageReporterBuildRecordIncludesLatency(t *testing.T) {
 	reporter := &UsageReporter{
-		provider:    "openai",
-		model:       "gpt-5.4",
-		requestedAt: time.Now().Add(-1500 * time.Millisecond),
+		provider:           "openai",
+		model:              "gpt-5.4",
+		requestServiceTier: "priority",
+		requestedAt:        time.Now().Add(-1500 * time.Millisecond),
 	}
 
-	record := reporter.buildRecord(usage.Detail{TotalTokens: 3}, false)
+	record := reporter.buildRecord(usage.Detail{TotalTokens: 3, ResponseServiceTier: "flex"}, false)
 	if record.Latency < time.Second {
 		t.Fatalf("latency = %v, want >= 1s", record.Latency)
 	}
 	if record.Latency > 3*time.Second {
 		t.Fatalf("latency = %v, want <= 3s", record.Latency)
+	}
+	if record.RequestServiceTier != "priority" || record.ResponseServiceTier != "flex" {
+		t.Fatalf("unexpected service tiers: request=%q response=%q", record.RequestServiceTier, record.ResponseServiceTier)
 	}
 }
 

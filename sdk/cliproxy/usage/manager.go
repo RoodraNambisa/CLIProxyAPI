@@ -2,33 +2,68 @@ package usage
 
 import (
 	"context"
+	"strings"
 	"sync"
 	"time"
 
 	log "github.com/sirupsen/logrus"
 )
 
+// DefaultServiceTier is used when a request does not specify service_tier.
+const DefaultServiceTier = "default"
+
 // Record contains the usage statistics captured for a single provider request.
 type Record struct {
-	Provider    string
-	Model       string
-	APIKey      string
-	AuthID      string
-	AuthIndex   string
-	Source      string
-	RequestedAt time.Time
-	Latency     time.Duration
-	Failed      bool
-	Detail      Detail
+	Provider            string
+	Model               string
+	APIKey              string
+	AuthID              string
+	AuthIndex           string
+	Source              string
+	RequestServiceTier  string
+	ResponseServiceTier string
+	RequestedAt         time.Time
+	Latency             time.Duration
+	Failed              bool
+	Detail              Detail
 }
 
 // Detail holds the token usage breakdown.
 type Detail struct {
-	InputTokens     int64
-	OutputTokens    int64
-	ReasoningTokens int64
-	CachedTokens    int64
-	TotalTokens     int64
+	InputTokens         int64
+	OutputTokens        int64
+	ReasoningTokens     int64
+	CachedTokens        int64
+	CacheCreationTokens int64
+	TotalTokens         int64
+	ResponseServiceTier string
+}
+
+type serviceTierContextKey struct{}
+
+// WithServiceTier stores the client-requested service tier for usage sinks.
+func WithServiceTier(ctx context.Context, tier string) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	tier = strings.TrimSpace(tier)
+	if tier == "" {
+		tier = DefaultServiceTier
+	}
+	return context.WithValue(ctx, serviceTierContextKey{}, tier)
+}
+
+// ServiceTierFromContext returns the client-requested service tier stored in ctx.
+func ServiceTierFromContext(ctx context.Context) string {
+	if ctx == nil {
+		return DefaultServiceTier
+	}
+	value, _ := ctx.Value(serviceTierContextKey{}).(string)
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return DefaultServiceTier
+	}
+	return value
 }
 
 // Plugin consumes usage records emitted by the proxy runtime.

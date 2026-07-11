@@ -72,10 +72,19 @@ func TestGetCodexPlusModels_ExcludesSpark(t *testing.T) {
 }
 
 func TestGetCodexModels_GPT55Availability(t *testing.T) {
-	assertCodexModelsDoNotContain(t, GetCodexFreeModels(), "gpt-5.5")
+	assertCodexModelsContain(t, GetCodexFreeModels(), "gpt-5.5")
 	assertCodexModelsContain(t, GetCodexPlusModels(), "gpt-5.5")
 	assertCodexModelsContain(t, GetCodexTeamModels(), "gpt-5.5")
 	assertCodexModelsContain(t, GetCodexProModels(), "gpt-5.5")
+}
+
+func TestGetCodexModels_GPT56Availability(t *testing.T) {
+	assertCodexModelsDoNotContain(t, GetCodexFreeModels(), "gpt-5.6-sol")
+	assertCodexModelsContain(t, GetCodexFreeModels(), "gpt-5.6-terra")
+	assertCodexModelsContain(t, GetCodexFreeModels(), "gpt-5.6-luna")
+	assertCodexModelsContain(t, GetCodexPlusModels(), "gpt-5.6-sol")
+	assertCodexModelsContain(t, GetCodexTeamModels(), "gpt-5.6-sol")
+	assertCodexModelsContain(t, GetCodexProModels(), "gpt-5.6-sol")
 }
 
 func TestGetCodexModels_AutoReviewAvailability(t *testing.T) {
@@ -83,4 +92,37 @@ func TestGetCodexModels_AutoReviewAvailability(t *testing.T) {
 	assertCodexModelsContain(t, GetCodexPlusModels(), "codex-auto-review")
 	assertCodexModelsContain(t, GetCodexTeamModels(), "codex-auto-review")
 	assertCodexModelsContain(t, GetCodexProModels(), "codex-auto-review")
+}
+
+func TestGetXAIModelsIncludesMediaBuiltins(t *testing.T) {
+	models := GetXAIModels()
+	want := map[string]bool{
+		xaiBuiltinImageModelID:          false,
+		xaiBuiltinImageQualityModelID:   false,
+		xaiBuiltinVideoModelID:          false,
+		xaiBuiltinVideo15PreviewModelID: false,
+	}
+
+	for _, model := range models {
+		if model == nil {
+			continue
+		}
+		if _, ok := want[model.ID]; ok {
+			want[model.ID] = true
+		}
+	}
+
+	for modelID, found := range want {
+		if !found {
+			t.Fatalf("expected xAI models to include %q", modelID)
+		}
+	}
+}
+
+func TestGetStaticModelDefinitionsByChannel_XAIAliases(t *testing.T) {
+	for _, channel := range []string{"xai", "x-ai", "grok"} {
+		if models := GetStaticModelDefinitionsByChannel(channel); len(models) == 0 {
+			t.Fatalf("expected %q channel to return xAI models", channel)
+		}
+	}
 }

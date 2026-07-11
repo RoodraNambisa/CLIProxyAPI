@@ -162,6 +162,7 @@ func newDefaultAuthManager() *sdkAuth.Manager {
 		sdkAuth.NewGeminiAuthenticator(),
 		sdkAuth.NewCodexAuthenticator(),
 		sdkAuth.NewClaudeAuthenticator(),
+		sdkAuth.NewXAIAuthenticator(),
 	)
 }
 
@@ -1712,9 +1713,16 @@ func (s *Service) deleteCoreAuth(ctx context.Context, id string) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	provider := ""
+	if existing, ok := s.coreManager.GetByID(id); ok && existing != nil {
+		provider = strings.TrimSpace(existing.Provider)
+	}
 	if err := s.coreManager.Delete(ctx, id); err != nil {
 		log.Errorf("failed to delete auth %s: %v", id, err)
 		return err
+	}
+	if strings.EqualFold(provider, "xai") {
+		executor.CloseXAIWebsocketSessionsForAuthID(id, "auth_removed")
 	}
 	return nil
 }
@@ -1785,6 +1793,9 @@ func (s *Service) applyCoreAuthRemovalWithReason(ctx context.Context, id string,
 	if strings.EqualFold(strings.TrimSpace(existing.Provider), "codex") {
 		executor.CloseCodexWebsocketSessionsForAuthID(existing.ID, "auth_removed")
 		s.ensureExecutorsForAuth(existing)
+	}
+	if strings.EqualFold(strings.TrimSpace(existing.Provider), "xai") {
+		executor.CloseXAIWebsocketSessionsForAuthID(existing.ID, "auth_removed")
 	}
 	return true
 }
@@ -2048,6 +2059,8 @@ func (s *Service) ensureExecutorsForAuthWithMode(a *coreauth.Auth, forceReplace 
 		s.coreManager.RegisterExecutor(executor.NewClaudeExecutor(s.cfg))
 	case "kimi":
 		s.coreManager.RegisterExecutor(executor.NewKimiExecutor(s.cfg))
+	case "xai":
+		s.coreManager.RegisterExecutor(executor.NewXAIAutoExecutor(s.cfg))
 	default:
 		providerKey := strings.ToLower(strings.TrimSpace(a.Provider))
 		if providerKey == "" {
@@ -2601,6 +2614,9 @@ func (s *Service) registerModelsForAuth(a *coreauth.Auth) {
 		models = applyExcludedModels(models, excluded)
 	case "kimi":
 		models = registry.GetKimiModels()
+		models = applyExcludedModels(models, excluded)
+	case "xai":
+		models = registry.GetXAIModels()
 		models = applyExcludedModels(models, excluded)
 	default:
 		// Handle OpenAI-compatibility providers by name using config

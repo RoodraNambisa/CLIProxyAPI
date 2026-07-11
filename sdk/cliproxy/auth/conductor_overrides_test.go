@@ -40,6 +40,26 @@ func imageToolFallbackPayload(model string) []byte {
 	return []byte(fmt.Sprintf(`{"model":%q,"tools":[{"type":"image_generation","model":"gpt-image-2"}],"input":"draw"}`, model))
 }
 
+func TestPayloadHasImageGenerationToolForms(t *testing.T) {
+	tests := []struct {
+		name    string
+		payload string
+		want    bool
+	}{
+		{name: "native", payload: `{"tools":[{"type":"image_generation"}]}`, want: true},
+		{name: "function", payload: `{"tools":[{"type":"function","name":"image_gen.imagegen"}]}`, want: true},
+		{name: "namespace", payload: `{"tools":[{"type":"namespace","name":"image_gen","tools":[{"type":"function","name":"imagegen"}]}]}`, want: true},
+		{name: "other function", payload: `{"tools":[{"type":"function","name":"lookup"}]}`, want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := payloadHasImageGenerationTool([]byte(tt.payload)); got != tt.want {
+				t.Fatalf("payloadHasImageGenerationTool() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
 func registerFallbackAuthForModel(t *testing.T, manager *Manager, auth *Auth, model string) {
 	t.Helper()
 	if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
@@ -1096,6 +1116,35 @@ func (e *retryAfterStatusError) RetryAfter() *time.Duration {
 	}
 	d := e.retryAfter
 	return &d
+}
+
+func TestWrapStreamResultPreservesPostBootstrapRetryAfter(t *testing.T) {
+	manager := NewManager(nil, &RoundRobinSelector{}, nil)
+	auth := &Auth{ID: "xai-stream-retry-after", Provider: "xai", Status: StatusActive}
+	if _, err := manager.Register(context.Background(), auth); err != nil {
+		t.Fatalf("Register() error = %v", err)
+	}
+
+	retryAfter := 24 * time.Hour
+	remaining := make(chan cliproxyexecutor.StreamChunk, 1)
+	remaining <- cliproxyexecutor.StreamChunk{Err: &retryAfterStatusError{
+		status:     http.StatusTooManyRequests,
+		message:    "free usage exhausted",
+		retryAfter: retryAfter,
+	}}
+	close(remaining)
+	result := manager.wrapStreamResult(context.Background(), auth, nil, "xai", "grok-4.5", "grok-4.5", cliproxyexecutor.Options{}, nil, nil, remaining, OAuthModelAliasResult{})
+	for range result.Chunks {
+	}
+
+	updated, ok := manager.GetByID(auth.ID)
+	if !ok || updated.NextRetryAfter.IsZero() {
+		t.Fatalf("updated auth = %#v", updated)
+	}
+	remainingCooldown := time.Until(updated.NextRetryAfter)
+	if remainingCooldown < retryAfter-time.Minute || remainingCooldown > retryAfter+time.Minute {
+		t.Fatalf("remaining cooldown = %v, want about %v", remainingCooldown, retryAfter)
+	}
 }
 
 func newCredentialRetryLimitTestManager(t *testing.T, maxRetryCredentials int) (*Manager, *credentialRetryLimitExecutor) {
@@ -2812,6 +2861,49 @@ func TestManager_MarkResult_NoCooldownStatusCodeSkipsModelCooldown(t *testing.T)
 	}
 	if count := reg.GetModelCount(model); count <= 0 {
 		t.Fatalf("expected model count > 0 when cooldown is skipped, got %d", count)
+	}
+}
+
+func TestManager_MarkResult_MessageTooBigDoesNotCooldownModel(t *testing.T) {
+	prev := quotaCooldownDisabled.Load()
+	quotaCooldownDisabled.Store(false)
+	t.Cleanup(func() { quotaCooldownDisabled.Store(prev) })
+
+	m := NewManager(nil, nil, nil)
+	auth := &Auth{
+		ID:       "auth-message-too-big",
+		Provider: "codex",
+	}
+	if _, errRegister := m.Register(context.Background(), auth); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+
+	model := "gpt-test-message-too-big"
+	m.MarkResult(context.Background(), Result{
+		AuthID:   auth.ID,
+		Provider: "codex",
+		Model:    model,
+		Success:  false,
+		Error:    &Error{HTTPStatus: http.StatusRequestEntityTooLarge, Message: "message too big"},
+	})
+
+	updated, ok := m.GetByID(auth.ID)
+	if !ok || updated == nil {
+		t.Fatal("expected auth to be present")
+	}
+	if updated.Unavailable {
+		t.Fatal("expected auth to remain available")
+	}
+	state := updated.ModelStates[model]
+	if state == nil {
+		t.Fatal("expected model state to be present")
+	}
+	if !state.NextRetryAfter.IsZero() {
+		t.Fatalf("expected NextRetryAfter to be zero, got %v", state.NextRetryAfter)
+	}
+	blocked, _, _ := isAuthBlockedForModel(updated, model, time.Now())
+	if blocked {
+		t.Fatal("expected model to remain immediately selectable")
 	}
 }
 

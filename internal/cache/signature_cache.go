@@ -70,6 +70,7 @@ func startCacheCleanup() {
 		defer ticker.Stop()
 		for range ticker.C {
 			purgeExpiredCaches()
+			purgeExpiredXAIReasoningReplayCache(time.Now())
 		}
 	}()
 }

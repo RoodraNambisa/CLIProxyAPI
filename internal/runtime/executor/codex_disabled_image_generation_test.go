@@ -68,6 +68,49 @@ func TestCodexExecutorDisabledImageGenerationToolRemoveDeletesStringToolChoiceWh
 	}
 }
 
+func TestCodexExecutorDisabledImageGenerationToolRemoveFunctionForm(t *testing.T) {
+	executor := NewCodexExecutor(&config.Config{AuthModelExclusions: []config.AuthModelExclusionRule{{DisableImageGeneration: true, Priorities: []int{-1}}}})
+	auth := &cliproxyauth.Auth{Provider: "codex", Attributes: map[string]string{"priority": "-1"}}
+	body := []byte(`{"tools":[{"type":"function","name":"image_gen.imagegen"},{"type":"function","name":"lookup"}],"tool_choice":{"type":"function","name":"image_gen.imagegen"}}`)
+
+	got, err := executor.applyDisabledImageGenerationToolPolicy(auth, body)
+	if err != nil {
+		t.Fatalf("applyDisabledImageGenerationToolPolicy() error = %v", err)
+	}
+	if codexHasImageGenerationTool(got) {
+		t.Fatalf("body still has image function tool: %s", got)
+	}
+	if gotName := gjson.GetBytes(got, "tools.0.name").String(); gotName != "lookup" {
+		t.Fatalf("retained tool = %q, want lookup", gotName)
+	}
+	if gjson.GetBytes(got, "tool_choice").Exists() {
+		t.Fatalf("tool_choice still exists: %s", got)
+	}
+}
+
+func TestCodexExecutorDisabledImageGenerationToolRemoveNamespaceMember(t *testing.T) {
+	executor := NewCodexExecutor(&config.Config{AuthModelExclusions: []config.AuthModelExclusionRule{{DisableImageGeneration: true, Priorities: []int{-1}}}})
+	auth := &cliproxyauth.Auth{Provider: "codex", Attributes: map[string]string{"priority": "-1"}}
+	body := []byte(`{"tools":[{"type":"namespace","name":"image_gen","tools":[{"type":"function","name":"imagegen"},{"type":"function","name":"inspect"}]},{"type":"function","name":"lookup"}],"tool_choice":{"type":"namespace","name":"image_gen"}}`)
+
+	got, err := executor.applyDisabledImageGenerationToolPolicy(auth, body)
+	if err != nil {
+		t.Fatalf("applyDisabledImageGenerationToolPolicy() error = %v", err)
+	}
+	if codexHasImageGenerationTool(got) {
+		t.Fatalf("body still has image namespace tool: %s", got)
+	}
+	if gotName := gjson.GetBytes(got, "tools.0.tools.0.name").String(); gotName != "inspect" {
+		t.Fatalf("retained namespace tool = %q, want inspect", gotName)
+	}
+	if gotName := gjson.GetBytes(got, "tools.1.name").String(); gotName != "lookup" {
+		t.Fatalf("retained top-level tool = %q, want lookup", gotName)
+	}
+	if gjson.GetBytes(got, "tool_choice").Exists() {
+		t.Fatalf("tool_choice still exists: %s", got)
+	}
+}
+
 func TestCodexExecutorDisabledImageGenerationToolError(t *testing.T) {
 	executor := NewCodexExecutor(&config.Config{
 		DisabledImageGenerationToolAction: config.DisabledImageGenerationToolActionError,

@@ -91,6 +91,29 @@ func TestHealthz(t *testing.T) {
 	})
 }
 
+func TestXAIVideoRoutesRegistered(t *testing.T) {
+	server := newTestServer(t)
+	want := map[string]bool{
+		http.MethodPost + " /v1/videos":             false,
+		http.MethodPost + " /v1/videos/generations": false,
+		http.MethodPost + " /v1/videos/edits":       false,
+		http.MethodPost + " /v1/videos/extensions":  false,
+		http.MethodGet + " /v1/videos/:request_id":  false,
+	}
+
+	for _, route := range server.engine.Routes() {
+		key := route.Method + " " + route.Path
+		if _, ok := want[key]; ok {
+			want[key] = true
+		}
+	}
+	for route, registered := range want {
+		if !registered {
+			t.Errorf("route %s is not registered", route)
+		}
+	}
+}
+
 func TestV1InternalMethodRequiresAuth(t *testing.T) {
 	server := newTestServer(t)
 

@@ -28,6 +28,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/auth/codex"
 	geminiAuth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/gemini"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/auth/kimi"
+	xaiauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/xai"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/misc"
@@ -336,6 +337,10 @@ func (h *Handler) listAuthFilesFromDisk(c *gin.Context) {
 				emailValue := gjson.GetBytes(data, "email").String()
 				fileData["type"] = typeValue
 				fileData["email"] = emailValue
+				if strings.EqualFold(strings.TrimSpace(typeValue), "xai") {
+					fileData["using_api"] = effectiveXAIUsingAPIFromJSON(data)
+					fileData["websockets"] = jsonBoolField(data, "websockets")
+				}
 				if strings.EqualFold(strings.TrimSpace(typeValue), "codex") {
 					var metadata map[string]any
 					if errUnmarshal := json.Unmarshal(data, &metadata); errUnmarshal == nil {
@@ -404,6 +409,10 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
 	}
 	if planType := effectiveCodexPlanType(auth); planType != "" {
 		entry["plan_type"] = planType
+	}
+	if strings.EqualFold(strings.TrimSpace(auth.Provider), "xai") {
+		entry["using_api"] = effectiveXAIUsingAPI(auth)
+		entry["websockets"] = authBooleanValue(auth, "websockets")
 	}
 	if accountType, account := auth.AccountInfo(); accountType != "" || account != "" {
 		if accountType != "" {
@@ -557,6 +566,84 @@ func authAttribute(auth *coreauth.Auth, key string) string {
 		return ""
 	}
 	return auth.Attributes[key]
+}
+
+func authBooleanValue(auth *coreauth.Auth, key string) bool {
+	value, _ := authOptionalBooleanValue(auth, key)
+	return value
+}
+
+func authOptionalBooleanValue(auth *coreauth.Auth, key string) (bool, bool) {
+	if auth == nil {
+		return false, false
+	}
+	if auth.Attributes != nil {
+		if raw := strings.TrimSpace(auth.Attributes[key]); raw != "" {
+			if parsed, errParse := strconv.ParseBool(raw); errParse == nil {
+				return parsed, true
+			}
+		}
+	}
+	if auth.Metadata == nil {
+		return false, false
+	}
+	switch value := auth.Metadata[key].(type) {
+	case bool:
+		return value, true
+	case string:
+		parsed, errParse := strconv.ParseBool(strings.TrimSpace(value))
+		if errParse == nil {
+			return parsed, true
+		}
+	default:
+	}
+	return false, false
+}
+
+func effectiveXAIUsingAPI(auth *coreauth.Auth) bool {
+	if auth == nil {
+		return true
+	}
+	if value, ok := authOptionalBooleanValue(auth, "using_api"); ok {
+		return value
+	}
+	authKind := strings.TrimSpace(authAttribute(auth, "auth_kind"))
+	if authKind == "" && auth.Metadata != nil {
+		if value, ok := auth.Metadata["auth_kind"].(string); ok {
+			authKind = strings.TrimSpace(value)
+		}
+	}
+	return !strings.EqualFold(authKind, "oauth")
+}
+
+func jsonBoolField(data []byte, key string) bool {
+	value, _ := jsonOptionalBoolField(data, key)
+	return value
+}
+
+func jsonOptionalBoolField(data []byte, key string) (bool, bool) {
+	value := gjson.GetBytes(data, key)
+	switch value.Type {
+	case gjson.True:
+		return true, true
+	case gjson.False:
+		return false, true
+	case gjson.String:
+		parsed, errParse := strconv.ParseBool(strings.TrimSpace(value.String()))
+		if errParse == nil {
+			return parsed, true
+		}
+	default:
+	}
+	return false, false
+}
+
+func effectiveXAIUsingAPIFromJSON(data []byte) bool {
+	if value, ok := jsonOptionalBoolField(data, "using_api"); ok {
+		return value
+	}
+	authKind := strings.TrimSpace(gjson.GetBytes(data, "auth_kind").String())
+	return !strings.EqualFold(authKind, "oauth")
 }
 
 func isRuntimeOnlyAuth(auth *coreauth.Auth) bool {
@@ -1324,7 +1411,7 @@ func (h *Handler) PatchAuthFileStatus(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"status": "ok", "disabled": *req.Disabled})
 }
 
-// PatchAuthFileFields updates editable fields (prefix, proxy_url, headers, priority, note) of an auth file.
+// PatchAuthFileFields updates editable fields of an auth file.
 func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 	if h.authManager == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "core auth manager unavailable"})
@@ -1332,12 +1419,14 @@ func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 	}
 
 	var req struct {
-		Name     string            `json:"name"`
-		Prefix   *string           `json:"prefix"`
-		ProxyURL *string           `json:"proxy_url"`
-		Headers  map[string]string `json:"headers"`
-		Priority *int              `json:"priority"`
-		Note     *string           `json:"note"`
+		Name       string            `json:"name"`
+		Prefix     *string           `json:"prefix"`
+		ProxyURL   *string           `json:"proxy_url"`
+		Headers    map[string]string `json:"headers"`
+		Priority   *int              `json:"priority"`
+		Note       *string           `json:"note"`
+		UsingAPI   *bool             `json:"using_api"`
+		Websockets *bool             `json:"websockets"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
@@ -1368,6 +1457,10 @@ func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 
 	if targetAuth == nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "auth file not found"})
+		return
+	}
+	if (req.UsingAPI != nil || req.Websockets != nil) && !strings.EqualFold(strings.TrimSpace(targetAuth.Provider), "xai") {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "using_api and websockets are only supported for xai auth files"})
 		return
 	}
 
@@ -1500,6 +1593,23 @@ func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 				targetAuth.Metadata["note"] = trimmedNote
 				targetAuth.Attributes["note"] = trimmedNote
 			}
+		}
+		changed = true
+	}
+	if req.UsingAPI != nil || req.Websockets != nil {
+		if targetAuth.Metadata == nil {
+			targetAuth.Metadata = make(map[string]any)
+		}
+		if targetAuth.Attributes == nil {
+			targetAuth.Attributes = make(map[string]string)
+		}
+		if req.UsingAPI != nil {
+			targetAuth.Metadata["using_api"] = *req.UsingAPI
+			targetAuth.Attributes["using_api"] = strconv.FormatBool(*req.UsingAPI)
+		}
+		if req.Websockets != nil {
+			targetAuth.Metadata["websockets"] = *req.Websockets
+			targetAuth.Attributes["websockets"] = strconv.FormatBool(*req.Websockets)
 		}
 		changed = true
 	}
@@ -1722,6 +1832,9 @@ func (h *Handler) RequestAnthropicToken(c *gin.Context) {
 			Storage:  tokenStorage,
 			Metadata: map[string]any{"email": tokenStorage.Email},
 		}
+		if errGuard := beginOAuthSessionSave(state, "anthropic"); errGuard != nil {
+			return
+		}
 		savedPath, errSave := h.saveTokenRecord(ctx, record)
 		if errSave != nil {
 			log.Errorf("Failed to save authentication tokens: %v", errSave)
@@ -1735,7 +1848,6 @@ func (h *Handler) RequestAnthropicToken(c *gin.Context) {
 		}
 		fmt.Println("You can now use Claude services through this CLI")
 		CompleteOAuthSession(state)
-		CompleteOAuthSessionsByProvider("anthropic")
 	}()
 
 	c.JSON(200, gin.H{"status": "ok", "url": authURL, "state": state})
@@ -1985,6 +2097,9 @@ func (h *Handler) RequestGeminiCLIToken(c *gin.Context) {
 			Storage:  &ts,
 			Metadata: recordMetadata,
 		}
+		if errGuard := beginOAuthSessionSave(state, "gemini"); errGuard != nil {
+			return
+		}
 		savedPath, errSave := h.saveTokenRecord(ctx, record)
 		if errSave != nil {
 			log.Errorf("Failed to save token to file: %v", errSave)
@@ -1993,7 +2108,6 @@ func (h *Handler) RequestGeminiCLIToken(c *gin.Context) {
 		}
 
 		CompleteOAuthSession(state)
-		CompleteOAuthSessionsByProvider("gemini")
 		fmt.Printf("You can now use Gemini CLI services through this CLI; token saved to %s\n", savedPath)
 	}()
 
@@ -2128,6 +2242,9 @@ func (h *Handler) RequestCodexToken(c *gin.Context) {
 				"account_id": tokenStorage.AccountID,
 			},
 		}
+		if errGuard := beginOAuthSessionSave(state, "codex"); errGuard != nil {
+			return
+		}
 		savedPath, errSave := h.saveTokenRecord(ctx, record)
 		if errSave != nil {
 			SetOAuthSessionError(state, "Failed to save authentication tokens")
@@ -2140,7 +2257,6 @@ func (h *Handler) RequestCodexToken(c *gin.Context) {
 		}
 		fmt.Println("You can now use Codex services through this CLI")
 		CompleteOAuthSession(state)
-		CompleteOAuthSessionsByProvider("codex")
 	}()
 
 	c.JSON(200, gin.H{"status": "ok", "url": authURL, "state": state})
@@ -2292,6 +2408,9 @@ func (h *Handler) RequestAntigravityToken(c *gin.Context) {
 			Label:    label,
 			Metadata: metadata,
 		}
+		if errGuard := beginOAuthSessionSave(state, "antigravity"); errGuard != nil {
+			return
+		}
 		savedPath, errSave := h.saveTokenRecord(ctx, record)
 		if errSave != nil {
 			log.Errorf("Failed to save token to file: %v", errSave)
@@ -2300,7 +2419,6 @@ func (h *Handler) RequestAntigravityToken(c *gin.Context) {
 		}
 
 		CompleteOAuthSession(state)
-		CompleteOAuthSessionsByProvider("antigravity")
 		fmt.Printf("Authentication successful! Token saved to %s\n", savedPath)
 		if projectID != "" {
 			fmt.Printf("Using GCP project: %s\n", projectID)
@@ -2309,6 +2427,122 @@ func (h *Handler) RequestAntigravityToken(c *gin.Context) {
 	}()
 
 	c.JSON(200, gin.H{"status": "ok", "url": authURL, "state": state})
+}
+
+// RequestXAIToken starts the xAI OAuth device-code flow.
+func (h *Handler) RequestXAIToken(c *gin.Context) {
+	ctx := PopulateAuthContext(context.Background(), c)
+
+	fmt.Println("Initializing xAI authentication...")
+
+	state := fmt.Sprintf("xai-%d", time.Now().UnixNano())
+	authSvc := xaiauth.NewXAIAuth(h.cfg)
+	deviceFlow, errStartDeviceFlow := authSvc.StartDeviceFlow(ctx)
+	if errStartDeviceFlow != nil {
+		log.Errorf("Failed to start xAI device flow: %v", errStartDeviceFlow)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to start device authorization flow"})
+		return
+	}
+	authURL := strings.TrimSpace(deviceFlow.VerificationURIComplete)
+	if authURL == "" {
+		authURL = strings.TrimSpace(deviceFlow.VerificationURI)
+	}
+
+	RegisterOAuthSession(state, "xai")
+
+	go func() {
+		pollCtx, cancelPoll := context.WithCancel(ctx)
+		defer cancelPoll()
+		go watchOAuthSessionCancel(pollCtx, cancelPoll, state, "xai")
+
+		fmt.Println("Waiting for xAI authentication...")
+		bundle, errWaitForAuthorization := authSvc.WaitForAuthorization(pollCtx, deviceFlow)
+		if errWaitForAuthorization != nil {
+			if !IsOAuthSessionPending(state, "xai") {
+				return
+			}
+			log.Errorf("xAI authentication failed: %v", errWaitForAuthorization)
+			SetOAuthSessionError(state, oauthSessionErrorWithCause("Authentication failed", errWaitForAuthorization))
+			return
+		}
+		if !IsOAuthSessionPending(state, "xai") {
+			return
+		}
+
+		tokenStorage := authSvc.CreateTokenStorage(bundle)
+		if tokenStorage == nil || strings.TrimSpace(tokenStorage.AccessToken) == "" {
+			log.Error("xAI token exchange returned empty access token")
+			SetOAuthSessionError(state, "Failed to exchange token")
+			return
+		}
+
+		fileName := xaiauth.CredentialFileName(tokenStorage.Email, tokenStorage.Subject)
+		label := strings.TrimSpace(tokenStorage.Email)
+		if label == "" {
+			label = "xAI"
+		}
+
+		metadata := map[string]any{
+			"type":           "xai",
+			"access_token":   tokenStorage.AccessToken,
+			"refresh_token":  tokenStorage.RefreshToken,
+			"id_token":       tokenStorage.IDToken,
+			"token_type":     tokenStorage.TokenType,
+			"expires_in":     tokenStorage.ExpiresIn,
+			"expired":        tokenStorage.Expire,
+			"last_refresh":   tokenStorage.LastRefresh,
+			"base_url":       tokenStorage.BaseURL,
+			"token_endpoint": tokenStorage.TokenEndpoint,
+			"auth_kind":      "oauth",
+			"using_api":      false,
+			"websockets":     false,
+		}
+		if tokenStorage.Email != "" {
+			metadata["email"] = tokenStorage.Email
+		}
+		if tokenStorage.Subject != "" {
+			metadata["sub"] = tokenStorage.Subject
+		}
+
+		record := &coreauth.Auth{
+			ID:       fileName,
+			Provider: "xai",
+			FileName: fileName,
+			Label:    label,
+			Storage:  tokenStorage,
+			Metadata: metadata,
+			Attributes: map[string]string{
+				"auth_kind":  "oauth",
+				"base_url":   tokenStorage.BaseURL,
+				"using_api":  "false",
+				"websockets": "false",
+			},
+		}
+		if errGuard := beginOAuthSessionSave(state, "xai"); errGuard != nil {
+			return
+		}
+		savedPath, errSave := h.saveTokenRecord(ctx, record)
+		if errSave != nil {
+			log.Errorf("Failed to save xAI token to file: %v", errSave)
+			SetOAuthSessionError(state, "Failed to save token to file")
+			return
+		}
+
+		CompleteOAuthSession(state)
+		fmt.Printf("Authentication successful! Token saved to %s\n", savedPath)
+		fmt.Println("You can now use xAI services through this CLI")
+	}()
+
+	response := gin.H{"status": "ok", "url": authURL, "state": state, "flow": "device"}
+	if userCode := strings.TrimSpace(deviceFlow.UserCode); userCode != "" {
+		response["user_code"] = userCode
+	}
+	if deviceFlow.ExpiresIn > 0 {
+		response["expires_in"] = deviceFlow.ExpiresIn
+	} else {
+		response["expires_in"] = int(xaiauth.MaxPollDuration / time.Second)
+	}
+	c.JSON(http.StatusOK, response)
 }
 
 func (h *Handler) RequestKimiToken(c *gin.Context) {
@@ -2372,6 +2606,9 @@ func (h *Handler) RequestKimiToken(c *gin.Context) {
 			Storage:  tokenStorage,
 			Metadata: metadata,
 		}
+		if errGuard := beginOAuthSessionSave(state, "kimi"); errGuard != nil {
+			return
+		}
 		savedPath, errSave := h.saveTokenRecord(ctx, record)
 		if errSave != nil {
 			log.Errorf("Failed to save authentication tokens: %v", errSave)
@@ -2382,7 +2619,6 @@ func (h *Handler) RequestKimiToken(c *gin.Context) {
 		fmt.Printf("Authentication successful! Token saved to %s\n", savedPath)
 		fmt.Println("You can now use Kimi services through this CLI")
 		CompleteOAuthSession(state)
-		CompleteOAuthSessionsByProvider("kimi")
 	}()
 
 	c.JSON(200, gin.H{"status": "ok", "url": authURL, "state": state})
@@ -2776,6 +3012,40 @@ func checkCloudAPIIsEnabled(ctx context.Context, httpClient *http.Client, projec
 		return false, fmt.Errorf("project activation required: %s", errMessage)
 	}
 	return true, nil
+}
+
+// watchOAuthSessionCancel cancels pollCtx once the OAuth session is no longer pending.
+func watchOAuthSessionCancel(pollCtx context.Context, cancel context.CancelFunc, state, provider string) {
+	if cancel == nil {
+		return
+	}
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-pollCtx.Done():
+			return
+		case <-ticker.C:
+			if !IsOAuthSessionPending(state, provider) {
+				cancel()
+				return
+			}
+		}
+	}
+}
+
+// CancelAuthSession cancels a pending OAuth session identified by state.
+func (h *Handler) CancelAuthSession(c *gin.Context) {
+	state := strings.TrimSpace(c.Query("state"))
+	if state == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": "missing state"})
+		return
+	}
+	if err := ValidateOAuthState(state); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": "invalid state"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"status": "ok", "cancelled": CancelOAuthSession(state)})
 }
 
 func (h *Handler) GetAuthStatus(c *gin.Context) {

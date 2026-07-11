@@ -5,6 +5,7 @@ package executor
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -72,6 +73,7 @@ type codexWebsocketSession struct {
 
 	activeMu     sync.Mutex
 	activeCh     chan codexWebsocketRead
+	activeConn   *websocket.Conn
 	activeDone   <-chan struct{}
 	activeCancel context.CancelFunc
 
@@ -96,6 +98,10 @@ type codexWebsocketRead struct {
 }
 
 func (s *codexWebsocketSession) setActive(ch chan codexWebsocketRead) {
+	s.setActiveForConn(ch, nil)
+}
+
+func (s *codexWebsocketSession) setActiveForConn(ch chan codexWebsocketRead, conn *websocket.Conn) {
 	if s == nil {
 		return
 	}
@@ -106,6 +112,7 @@ func (s *codexWebsocketSession) setActive(ch chan codexWebsocketRead) {
 		s.activeDone = nil
 	}
 	s.activeCh = ch
+	s.activeConn = conn
 	if ch != nil {
 		activeCtx, activeCancel := context.WithCancel(context.Background())
 		s.activeDone = activeCtx.Done()
@@ -114,13 +121,19 @@ func (s *codexWebsocketSession) setActive(ch chan codexWebsocketRead) {
 	s.activeMu.Unlock()
 }
 
-func (s *codexWebsocketSession) clearActive(ch chan codexWebsocketRead) {
+func (s *codexWebsocketSession) clearActive(ch chan codexWebsocketRead) bool {
+	return s.clearActiveForConn(ch, nil)
+}
+
+func (s *codexWebsocketSession) clearActiveForConn(ch chan codexWebsocketRead, conn *websocket.Conn) bool {
 	if s == nil {
-		return
+		return false
 	}
 	s.activeMu.Lock()
-	if s.activeCh == ch {
+	cleared := s.activeCh == ch && (conn == nil || s.activeConn == conn)
+	if cleared {
 		s.activeCh = nil
+		s.activeConn = nil
 		if s.activeCancel != nil {
 			s.activeCancel()
 		}
@@ -128,6 +141,19 @@ func (s *codexWebsocketSession) clearActive(ch chan codexWebsocketRead) {
 		s.activeDone = nil
 	}
 	s.activeMu.Unlock()
+	return cleared
+}
+
+func (s *codexWebsocketSession) activeForConn(conn *websocket.Conn) (chan codexWebsocketRead, <-chan struct{}) {
+	if s == nil {
+		return nil, nil
+	}
+	s.activeMu.Lock()
+	defer s.activeMu.Unlock()
+	if s.activeConn != nil && s.activeConn != conn {
+		return nil, nil
+	}
+	return s.activeCh, s.activeDone
 }
 
 func (s *codexWebsocketSession) writeMessage(conn *websocket.Conn, msgType int, payload []byte) error {
@@ -215,6 +241,9 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 	if !gjson.GetBytes(body, "instructions").Exists() {
 		body, _ = sjson.SetBytes(body, "instructions", "")
 	}
+	body = helps.SanitizeCodexReasoningEncryptedContent(ctx, "codex websockets executor", body)
+	body = helps.NormalizeCodexToolSelection(body)
+	reporter.SetRequestServiceTierFromPayload(body)
 
 	httpURL := strings.TrimSuffix(baseURL, "/") + "/responses"
 	wsURL, err := buildCodexResponsesWebsocketURL(httpURL)
@@ -367,8 +396,9 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 		}
 		msgType, payload, errRead := readCodexWebsocketMessage(ctx, sess, conn, readCh)
 		if errRead != nil {
-			helps.RecordAPIWebsocketError(ctx, e.cfg, "read", errRead)
-			return resp, errRead
+			mappedErr := mapCodexWebsocketReadError(errRead)
+			helps.RecordAPIWebsocketError(ctx, e.cfg, "read", mappedErr)
+			return resp, mappedErr
 		}
 		if msgType != websocket.TextMessage {
 			if msgType == websocket.BinaryMessage {
@@ -454,6 +484,9 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 	if err != nil {
 		return nil, err
 	}
+	body = helps.SanitizeCodexReasoningEncryptedContent(ctx, "codex websockets executor", body)
+	body = helps.NormalizeCodexToolSelection(body)
+	reporter.SetRequestServiceTierFromPayload(body)
 
 	httpURL := strings.TrimSuffix(baseURL, "/") + "/responses"
 	wsURL, err := buildCodexResponsesWebsocketURL(httpURL)
@@ -658,11 +691,12 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 					_ = send(cliproxyexecutor.StreamChunk{Err: ctx.Err()})
 					return
 				}
+				mappedErr := mapCodexWebsocketReadError(errRead)
 				terminateReason = "read_error"
-				terminateErr = errRead
-				helps.RecordAPIWebsocketError(ctx, e.cfg, "read", errRead)
+				terminateErr = mappedErr
+				helps.RecordAPIWebsocketError(ctx, e.cfg, "read", mappedErr)
 				reporter.PublishFailure(ctx)
-				_ = send(cliproxyexecutor.StreamChunk{Err: errRead})
+				_ = send(cliproxyexecutor.StreamChunk{Err: mappedErr})
 				return
 			}
 			if msgType != websocket.TextMessage {
@@ -755,6 +789,17 @@ func writeCodexWebsocketMessage(sess *codexWebsocketSession, conn *websocket.Con
 		return fmt.Errorf("codex websockets executor: websocket conn is nil")
 	}
 	return conn.WriteMessage(websocket.TextMessage, payload)
+}
+
+func mapCodexWebsocketReadError(err error) error {
+	if err == nil {
+		return nil
+	}
+	var closeErr *websocket.CloseError
+	if errors.As(err, &closeErr) && closeErr.Code == websocket.CloseMessageTooBig {
+		return statusErr{code: http.StatusRequestEntityTooLarge, msg: `{"error":{"message":"upstream websocket message too big","type":"invalid_request_error","code":"message_too_big"}}`}
+	}
+	return err
 }
 
 func buildCodexWebsocketRequestBody(body []byte) []byte {

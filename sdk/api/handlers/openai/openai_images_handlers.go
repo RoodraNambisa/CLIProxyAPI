@@ -187,6 +187,9 @@ func (e imageUnsupportedError) Unwrap() error {
 
 // Generations handles POST /v1/images/generations.
 func (h *OpenAIImagesAPIHandler) Generations(c *gin.Context) {
+	if h.handleXAIGenerationIfRequested(c) {
+		return
+	}
 	if h.imagesNativeEnabled(imageGenerationOperation) {
 		rawJSON, err := io.ReadAll(c.Request.Body)
 		if err != nil {
@@ -216,6 +219,9 @@ func (h *OpenAIImagesAPIHandler) Generations(c *gin.Context) {
 
 // Edits handles POST /v1/images/edits.
 func (h *OpenAIImagesAPIHandler) Edits(c *gin.Context) {
+	if h.handleXAIEditIfRequested(c) {
+		return
+	}
 	if h.imagesNativeEnabled(imageEditOperation) {
 		req, rawJSON, err := h.parseNativeImageEditRequest(c)
 		if err != nil {
@@ -1726,6 +1732,11 @@ func (h *OpenAIImagesAPIHandler) imagesUnsupportedStatusCode() int {
 }
 
 func (h *OpenAIImagesAPIHandler) writeImagesRequestError(c *gin.Context, err error) {
+	var maxBytesErr *http.MaxBytesError
+	if errors.As(err, &maxBytesErr) {
+		h.writeImagesError(c, http.StatusRequestEntityTooLarge, err)
+		return
+	}
 	var unsupported imageUnsupportedError
 	if errors.As(err, &unsupported) {
 		h.writeImagesError(c, h.imagesUnsupportedStatusCode(), err)

@@ -30,8 +30,8 @@ import (
 )
 
 const (
-	codexUserAgent             = "codex-tui/0.118.0 (Mac OS 26.3.1; arm64) iTerm.app/3.6.9 (codex-tui; 0.118.0)"
-	codexOriginator            = "codex_cli_rs"
+	codexUserAgent             = "codex-tui/0.135.0 (Mac OS 26.5.0; arm64) iTerm.app/3.6.10 (codex-tui; 0.135.0)"
+	codexOriginator            = "codex-tui"
 	codexDefaultImageToolModel = "gpt-image-2"
 )
 
@@ -140,7 +140,12 @@ func codexResponseIncompleteError(eventData []byte) statusErr {
 	if code == "" {
 		code = "response_incomplete"
 	}
-	return codexStreamStatusErr(codexStreamErrorStatus(code, http.StatusBadGateway), message, code, "server_error", nil)
+	err := codexStreamStatusErr(codexStreamErrorStatus(code, http.StatusBadGateway), message, code, "server_error", nil)
+	switch strings.ToLower(reason) {
+	case "max_tokens", "max_output_tokens", "content_filter":
+		err.skipAuthResult = true
+	}
+	return err
 }
 
 func codexStreamErrorEventError(eventData []byte) statusErr {
@@ -178,7 +183,7 @@ func codexStreamErrorStatus(code string, fallback int) int {
 		return http.StatusTooManyRequests
 	case "not_found", "model_not_found":
 		return http.StatusNotFound
-	case "bad_request", "invalid_request", "invalid_request_error", "invalid_prompt", "invalid_value":
+	case "bad_request", "invalid_request", "invalid_request_error", "invalid_prompt", "invalid_value", "invalid_encrypted_content", "invalid_signature":
 		return http.StatusBadRequest
 	case "server_error", "internal_server_error":
 		return http.StatusInternalServerError
@@ -467,6 +472,15 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	if err != nil {
 		return resp, err
 	}
+	body = helps.SanitizeCodexReasoningEncryptedContent(ctx, "codex executor", body)
+	body = helps.NormalizeCodexToolSelection(body)
+	replayAuthID := ""
+	if auth != nil {
+		replayAuthID = auth.ID
+	}
+	replayNamespace := helps.ReasoningReplayNamespace(ctx, e.Identifier(), replayAuthID)
+	body, replayScope := helps.ApplyCodexReasoningReplay(ctx, from.String(), replayNamespace, baseModel, originalPayload, body, req.Metadata, opts.Metadata, opts.Headers)
+	reporter.SetRequestServiceTierFromPayload(body)
 	imageRequest := codexHasImageGenerationTool(body)
 
 	url := strings.TrimSuffix(baseURL, "/") + "/responses"
@@ -521,6 +535,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 		helps.AppendAPIResponseChunk(ctx, e.cfg, upstreamBody)
 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), upstreamBody))
 		clientBody := applyCodexIdentityExposeResponsePayload(upstreamBody, identityState)
+		helps.ClearCodexReasoningReplayOnInvalidSignature(replayScope, httpResp.StatusCode, clientBody)
 		err = newCodexStatusErr(httpResp.StatusCode, clientBody)
 		return resp, err
 	}
@@ -550,6 +565,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 
 		clientEventData := applyCodexIdentityExposeResponsePayload(eventData, identityState)
 		if terminalErr, ok := codexTerminalStreamError(clientEventData); ok {
+			helps.ClearCodexReasoningReplayOnInvalidSignature(replayScope, terminalErr.code, clientEventData)
 			err = terminalErr
 			return resp, err
 		}
@@ -564,6 +580,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 		publishCodexImageToolUsage(ctx, reporter, bodyRef.Bytes(), eventData)
 
 		completedData := patchCodexCompletedOutput(eventData, outputItemsByIndex, outputItemsFallback)
+		helps.CacheCodexReasoningReplayFromCompleted(replayScope, completedData)
 
 		var param any
 		clientCompletedData := applyCodexIdentityExposeResponsePayload(completedData, identityState)
@@ -606,6 +623,9 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 	if err != nil {
 		return resp, err
 	}
+	body = helps.SanitizeCodexReasoningEncryptedContent(ctx, "codex executor", body)
+	body = helps.NormalizeCodexToolSelection(body)
+	reporter.SetRequestServiceTierFromPayload(body)
 	imageRequest := codexHasImageGenerationTool(body)
 
 	url := strings.TrimSuffix(baseURL, "/") + "/responses/compact"
@@ -719,6 +739,15 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	if err != nil {
 		return nil, err
 	}
+	body = helps.SanitizeCodexReasoningEncryptedContent(ctx, "codex executor", body)
+	body = helps.NormalizeCodexToolSelection(body)
+	replayAuthID := ""
+	if auth != nil {
+		replayAuthID = auth.ID
+	}
+	replayNamespace := helps.ReasoningReplayNamespace(ctx, e.Identifier(), replayAuthID)
+	body, replayScope := helps.ApplyCodexReasoningReplay(ctx, from.String(), replayNamespace, baseModel, originalPayload, body, req.Metadata, opts.Metadata, opts.Headers)
+	reporter.SetRequestServiceTierFromPayload(body)
 	imageRequest := codexHasImageGenerationTool(body)
 	imageStreamPassthrough := metadataBool(opts.Metadata, cliproxyexecutor.ImageGenerationStreamPassthroughMetadataKey) && from == sdktranslator.FormatOpenAIResponse && imageRequest
 	trustUpstreamSSE := metadataBool(opts.Metadata, cliproxyexecutor.TrustUpstreamSSEMetadataKey) && from == sdktranslator.FormatOpenAIResponse
@@ -782,6 +811,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 		helps.AppendAPIResponseChunk(ctx, e.cfg, upstreamBody)
 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), upstreamBody))
 		clientBody := applyCodexIdentityExposeResponsePayload(upstreamBody, identityState)
+		helps.ClearCodexReasoningReplayOnInvalidSignature(replayScope, httpResp.StatusCode, clientBody)
 		err = newCodexStatusErr(httpResp.StatusCode, clientBody)
 		return nil, err
 	}
@@ -826,6 +856,15 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 			line := applyCodexIdentityConfuseResponsePayload(scanner.Bytes(), identityState)
 			helps.AppendAPIResponseChunk(ctx, e.cfg, line)
 			clientLine := applyCodexIdentityExposeResponsePayload(line, identityState)
+			if bytes.HasPrefix(clientLine, dataTag) {
+				clientData := bytes.TrimSpace(clientLine[len(dataTag):])
+				if terminalErr, ok := codexTerminalStreamError(clientData); ok {
+					helps.ClearCodexReasoningReplayOnInvalidSignature(replayScope, terminalErr.code, clientData)
+					reporter.PublishFailure(ctx, terminalErr)
+					_ = emit(cliproxyexecutor.StreamChunk{Err: terminalErr})
+					return
+				}
+			}
 			if trustUpstreamSSE {
 				publishCodexStreamUsage(ctx, reporter, streamBody.Bytes(), line)
 				if len(bytes.TrimSpace(line)) == 0 {
@@ -857,6 +896,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 					}
 					publishCodexImageToolUsage(ctx, reporter, streamBody.Bytes(), data)
 					data = patchCodexCompletedOutput(data, outputItemsByIndex, outputItemsFallback)
+					helps.CacheCodexReasoningReplayFromCompleted(replayScope, data)
 					translatedLine = append([]byte("data: "), data...)
 				}
 			}
@@ -1468,8 +1508,31 @@ func codexHasImageGenerationTool(body []byte) bool {
 		return false
 	}
 	for _, tool := range tools.Array() {
-		if tool.Get("type").String() == "image_generation" {
+		if codexToolHasImageGeneration(tool) {
 			return true
+		}
+	}
+	return false
+}
+
+func codexToolHasImageGeneration(tool gjson.Result) bool {
+	switch tool.Get("type").String() {
+	case "image_generation":
+		return true
+	case "function":
+		name := strings.TrimSpace(tool.Get("name").String())
+		if name == "" {
+			name = strings.TrimSpace(tool.Get("function.name").String())
+		}
+		return name == "image_gen.imagegen"
+	case "namespace":
+		if strings.TrimSpace(tool.Get("name").String()) != "image_gen" {
+			return false
+		}
+		for _, nestedTool := range tool.Get("tools").Array() {
+			if nestedTool.Get("type").String() == "function" && strings.TrimSpace(nestedTool.Get("name").String()) == "imagegen" {
+				return true
+			}
 		}
 	}
 	return false
@@ -1515,13 +1578,14 @@ func removeCodexImageGenerationTool(body []byte) []byte {
 	retained.WriteByte('[')
 	retainedCount := 0
 	for _, tool := range tools.Array() {
-		if tool.Get("type").String() == "image_generation" {
+		toolRaw, keep := removeCodexImageGenerationFromTool(tool)
+		if !keep {
 			continue
 		}
 		if retainedCount > 0 {
 			retained.WriteByte(',')
 		}
-		retained.WriteString(tool.Raw)
+		retained.Write(toolRaw)
 		retainedCount++
 	}
 	retained.WriteByte(']')
@@ -1532,10 +1596,61 @@ func removeCodexImageGenerationTool(body []byte) []byte {
 	} else {
 		body, _ = sjson.SetRawBytes(body, "tools", retained.Bytes())
 	}
-	if gjson.GetBytes(body, "tool_choice.type").String() == "image_generation" {
+	if codexToolChoiceSelectsImageGeneration(gjson.GetBytes(body, "tool_choice")) {
 		body, _ = sjson.DeleteBytes(body, "tool_choice")
 	}
 	return body
+}
+
+func removeCodexImageGenerationFromTool(tool gjson.Result) ([]byte, bool) {
+	if tool.Get("type").String() != "namespace" {
+		if codexToolHasImageGeneration(tool) {
+			return nil, false
+		}
+		return []byte(tool.Raw), true
+	}
+	if strings.TrimSpace(tool.Get("name").String()) != "image_gen" || !tool.Get("tools").IsArray() {
+		return []byte(tool.Raw), true
+	}
+
+	nested := []byte(`[]`)
+	nestedCount := 0
+	for _, candidate := range tool.Get("tools").Array() {
+		if candidate.Get("type").String() == "function" && strings.TrimSpace(candidate.Get("name").String()) == "imagegen" {
+			continue
+		}
+		nested, _ = sjson.SetRawBytes(nested, fmt.Sprintf("%d", nestedCount), []byte(candidate.Raw))
+		nestedCount++
+	}
+	if nestedCount == 0 {
+		return nil, false
+	}
+	updated, errSet := sjson.SetRawBytes([]byte(tool.Raw), "tools", nested)
+	if errSet != nil {
+		return []byte(tool.Raw), true
+	}
+	return updated, true
+}
+
+func codexToolChoiceSelectsImageGeneration(choice gjson.Result) bool {
+	if !choice.Exists() || !choice.IsObject() {
+		return false
+	}
+	choiceType := strings.TrimSpace(choice.Get("type").String())
+	switch choiceType {
+	case "image_generation":
+		return true
+	case "function":
+		name := strings.TrimSpace(choice.Get("name").String())
+		if name == "" {
+			name = strings.TrimSpace(choice.Get("function.name").String())
+		}
+		return name == "image_gen.imagegen"
+	case "namespace":
+		return strings.TrimSpace(choice.Get("name").String()) == "image_gen"
+	default:
+		return false
+	}
 }
 
 func codexImageGenerationToolModel(body []byte) string {

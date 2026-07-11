@@ -149,3 +149,22 @@ func TestConvertCodexResponseToOpenAI_NonStreamImageGenerationCallAddsMessageIma
 		t.Fatalf("expected image url %q, got %q; chunk=%s", "data:image/png;base64,aGVsbG8=", gotURL, string(out))
 	}
 }
+
+func TestConvertCodexResponseToOpenAI_MapsCacheWriteTokens(t *testing.T) {
+	var param any
+	out := ConvertCodexResponseToOpenAI(context.Background(), "gpt-5.4", nil, nil, []byte(`data: {"type":"response.completed","response":{"id":"resp_1","model":"gpt-5.4","usage":{"input_tokens":10,"output_tokens":2,"total_tokens":12,"input_tokens_details":{"cache_write_tokens":6}}}}`), &param)
+	if len(out) != 1 {
+		t.Fatalf("expected one stream chunk, got %d", len(out))
+	}
+	if got := gjson.GetBytes(out[0], "usage.prompt_tokens_details.cached_creation_tokens").Int(); got != 6 {
+		t.Fatalf("stream cached_creation_tokens = %d, want 6; output=%s", got, out[0])
+	}
+}
+
+func TestConvertCodexResponseToOpenAINonStream_MapsCacheWriteTokens(t *testing.T) {
+	raw := []byte(`{"type":"response.completed","response":{"id":"resp_1","model":"gpt-5.4","usage":{"input_tokens":10,"output_tokens":2,"total_tokens":12,"input_tokens_details":{"cache_write_tokens":6}},"output":[]}}`)
+	out := ConvertCodexResponseToOpenAINonStream(context.Background(), "gpt-5.4", nil, nil, raw, nil)
+	if got := gjson.GetBytes(out, "usage.prompt_tokens_details.cached_creation_tokens").Int(); got != 6 {
+		t.Fatalf("non-stream cached_creation_tokens = %d, want 6; output=%s", got, out)
+	}
+}

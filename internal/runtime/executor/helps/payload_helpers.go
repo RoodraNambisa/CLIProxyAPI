@@ -2,6 +2,8 @@ package helps
 
 import (
 	"encoding/json"
+	"fmt"
+	"net/http"
 	"strings"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
@@ -10,6 +12,13 @@ import (
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
+
+// ApplyPayloadConfigWithRequest applies payload rules while preserving the
+// request-aware call shape used by provider executors. The v6 payload rule
+// schema does not yet expose source-protocol, path, or header predicates.
+func ApplyPayloadConfigWithRequest(cfg *config.Config, model, protocol, _ string, root string, payload, original []byte, requestedModel, _ string, _ http.Header) []byte {
+	return ApplyPayloadConfigWithRoot(cfg, model, protocol, root, payload, original, requestedModel)
+}
 
 // ApplyPayloadConfigWithRoot behaves like applyPayloadConfig but treats all parameter
 // paths as relative to the provided root path (for example, "request" for Gemini CLI)
@@ -270,6 +279,25 @@ func PayloadRequestedModel(opts cliproxyexecutor.Options, fallback string) strin
 		return trimmed
 	default:
 		return fallback
+	}
+}
+
+// PayloadRequestPath returns the inbound HTTP path recorded by handlers.
+func PayloadRequestPath(opts cliproxyexecutor.Options) string {
+	if len(opts.Metadata) == 0 {
+		return ""
+	}
+	raw, ok := opts.Metadata[cliproxyexecutor.RequestPathMetadataKey]
+	if !ok || raw == nil {
+		return ""
+	}
+	switch value := raw.(type) {
+	case string:
+		return strings.TrimSpace(value)
+	case fmt.Stringer:
+		return strings.TrimSpace(value.String())
+	default:
+		return strings.TrimSpace(fmt.Sprint(value))
 	}
 }
 

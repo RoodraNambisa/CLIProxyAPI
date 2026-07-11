@@ -72,7 +72,7 @@ func TestCodexWebsocketsExecutePreservesPreviousResponseIDUpstream(t *testing.T)
 	auth := &cliproxyauth.Auth{Attributes: map[string]string{"api_key": "sk-test", "base_url": server.URL}}
 	req := cliproxyexecutor.Request{
 		Model:   "gpt-5-codex",
-		Payload: []byte(`{"model":"gpt-5-codex","previous_response_id":"resp-1","input":[{"type":"message","id":"msg-1"}]}`),
+		Payload: []byte(`{"model":"gpt-5-codex","previous_response_id":"resp-1","input":[{"type":"reasoning","encrypted_content":"gAAAA-invalid"},{"type":"message","id":"msg-1"}],"tools":[],"tool_choice":"auto","parallel_tool_calls":true}`),
 	}
 	opts := cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("codex")}
 
@@ -87,6 +87,12 @@ func TestCodexWebsocketsExecutePreservesPreviousResponseIDUpstream(t *testing.T)
 		}
 		if got := gjson.GetBytes(payload, "previous_response_id").String(); got != "resp-1" {
 			t.Fatalf("upstream previous_response_id = %s, want resp-1; payload=%s", got, payload)
+		}
+		if gjson.GetBytes(payload, "input.0.encrypted_content").Exists() {
+			t.Fatalf("invalid encrypted_content reached upstream; payload=%s", payload)
+		}
+		if gjson.GetBytes(payload, "tool_choice").Exists() || gjson.GetBytes(payload, "parallel_tool_calls").Exists() {
+			t.Fatalf("tool controls remained with empty tools; payload=%s", payload)
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("timed out waiting for upstream websocket payload")
@@ -870,7 +876,10 @@ func TestCodexAutoExecutorExecuteStream_WebsocketStripsPrefixedModelFromOutbound
 			Model: "gpt-5.4",
 			Payload: []byte(`{
 				"model":"team/gpt-5.4",
-				"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}],
+				"input":[{"type":"reasoning","encrypted_content":"gAAAA-invalid"},{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}],
+				"tools":[],
+				"tool_choice":"auto",
+				"parallel_tool_calls":true,
 				"stream":true
 			}`),
 		},
@@ -908,6 +917,12 @@ func TestCodexAutoExecutorExecuteStream_WebsocketStripsPrefixedModelFromOutbound
 		}
 		if got := gjson.GetBytes(payload, "model").String(); got != "gpt-5.4" {
 			t.Fatalf("websocket request model = %q, want %q", got, "gpt-5.4")
+		}
+		if gjson.GetBytes(payload, "input.0.encrypted_content").Exists() {
+			t.Fatalf("invalid encrypted_content reached upstream; payload=%s", payload)
+		}
+		if gjson.GetBytes(payload, "tool_choice").Exists() || gjson.GetBytes(payload, "parallel_tool_calls").Exists() {
+			t.Fatalf("tool controls remained with empty tools; payload=%s", payload)
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for websocket request body")
@@ -988,5 +1003,21 @@ func TestNewProxyAwareWebsocketDialerDirectDisablesProxy(t *testing.T) {
 
 	if dialer.Proxy != nil {
 		t.Fatal("expected websocket proxy function to be nil for direct mode")
+	}
+}
+
+func TestMapCodexWebsocketReadErrorMessageTooBig(t *testing.T) {
+	err := mapCodexWebsocketReadError(&websocket.CloseError{Code: websocket.CloseMessageTooBig, Text: "message too big"})
+	status, ok := err.(interface{ StatusCode() int })
+	if !ok || status.StatusCode() != http.StatusRequestEntityTooLarge {
+		t.Fatalf("mapped error = %T %[1]v, want status %d", err, http.StatusRequestEntityTooLarge)
+	}
+	if !strings.Contains(err.Error(), `"code":"message_too_big"`) {
+		t.Fatalf("mapped error = %v, want message_too_big code", err)
+	}
+
+	original := errors.New("read failed")
+	if got := mapCodexWebsocketReadError(original); !errors.Is(got, original) {
+		t.Fatalf("non-close error = %v, want original", got)
 	}
 }

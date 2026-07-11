@@ -467,6 +467,37 @@ func TestResponseCompletedOutputFromPayload(t *testing.T) {
 	}
 }
 
+func TestRestoreResponsesWebsocketCompletionOutputUsesDoneItems(t *testing.T) {
+	indexed := make(map[int64][]byte)
+	var fallback [][]byte
+	collectResponsesWebsocketOutputItem([]byte(`{"type":"response.output_item.done","output_index":1,"item":{"type":"message","id":"out-2"}}`), indexed, &fallback)
+	collectResponsesWebsocketOutputItem([]byte(`{"type":"response.output_item.done","output_index":0,"item":{"type":"reasoning","id":"out-1"}}`), indexed, &fallback)
+	collectResponsesWebsocketOutputItem([]byte(`{"type":"response.output_item.done","item":{"type":"function_call","id":"out-3"}}`), indexed, &fallback)
+
+	restored := restoreResponsesWebsocketCompletionOutput(
+		[]byte(`{"type":"response.done","response":{"id":"resp-1","output":[]}}`),
+		indexed,
+		fallback,
+	)
+	items := gjson.GetBytes(restored, "response.output").Array()
+	if len(items) != 3 {
+		t.Fatalf("restored output len = %d, want 3: %s", len(items), restored)
+	}
+	for i, want := range []string{"out-1", "out-2", "out-3"} {
+		if got := items[i].Get("id").String(); got != want {
+			t.Fatalf("output[%d].id = %q, want %q", i, got, want)
+		}
+	}
+}
+
+func TestRestoreResponsesWebsocketCompletionOutputPreservesExistingOutput(t *testing.T) {
+	payload := []byte(`{"type":"response.completed","response":{"output":[{"id":"final"}]}}`)
+	restored := restoreResponsesWebsocketCompletionOutput(payload, map[int64][]byte{0: []byte(`{"id":"fallback"}`)}, nil)
+	if got := gjson.GetBytes(restored, "response.output.0.id").String(); got != "final" {
+		t.Fatalf("response.output.0.id = %q, want final", got)
+	}
+}
+
 func TestAppendWebsocketEvent(t *testing.T) {
 	var builder strings.Builder
 

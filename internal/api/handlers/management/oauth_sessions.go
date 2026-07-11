@@ -12,9 +12,15 @@ import (
 )
 
 const (
-	oauthSessionTTL     = 10 * time.Minute
+	// oauthSessionTTL must cover device-code flows such as xAI.
+	oauthSessionTTL     = 30 * time.Minute
 	maxOAuthStateLength = 128
+
+	oauthSessionPhasePending = iota
+	oauthSessionPhaseSaving
 )
+
+const oauthSessionCancelledStatus = "Authentication cancelled"
 
 var (
 	errInvalidOAuthState      = errors.New("invalid oauth state")
@@ -25,6 +31,7 @@ var (
 type oauthSession struct {
 	Provider  string
 	Status    string
+	Phase     int
 	CreatedAt time.Time
 	ExpiresAt time.Time
 }
@@ -68,6 +75,7 @@ func (s *oauthSessionStore) Register(state, provider string) {
 	s.sessions[state] = oauthSession{
 		Provider:  provider,
 		Status:    "",
+		Phase:     oauthSessionPhasePending,
 		CreatedAt: now,
 		ExpiresAt: now.Add(s.ttl),
 	}
@@ -92,6 +100,9 @@ func (s *oauthSessionStore) SetError(state, message string) {
 	if !ok {
 		return
 	}
+	if session.Status != "" {
+		return
+	}
 	session.Status = message
 	session.ExpiresAt = now.Add(s.ttl)
 	s.sessions[state] = session
@@ -109,27 +120,6 @@ func (s *oauthSessionStore) Complete(state string) {
 
 	s.purgeExpiredLocked(now)
 	delete(s.sessions, state)
-}
-
-func (s *oauthSessionStore) CompleteProvider(provider string) int {
-	provider = strings.ToLower(strings.TrimSpace(provider))
-	if provider == "" {
-		return 0
-	}
-	now := time.Now()
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	s.purgeExpiredLocked(now)
-	removed := 0
-	for state, session := range s.sessions {
-		if strings.EqualFold(session.Provider, provider) {
-			delete(s.sessions, state)
-			removed++
-		}
-	}
-	return removed
 }
 
 func (s *oauthSessionStore) Get(state string) (oauthSession, bool) {
@@ -157,13 +147,56 @@ func (s *oauthSessionStore) IsPending(state, provider string) bool {
 	if !ok {
 		return false
 	}
-	if session.Status != "" {
+	if session.Status != "" || session.Phase != oauthSessionPhasePending {
 		return false
 	}
 	if provider == "" {
 		return true
 	}
 	return strings.EqualFold(session.Provider, provider)
+}
+
+func (s *oauthSessionStore) BeginSave(state, provider string) bool {
+	state = strings.TrimSpace(state)
+	provider = strings.ToLower(strings.TrimSpace(provider))
+	if state == "" || provider == "" {
+		return false
+	}
+	now := time.Now()
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.purgeExpiredLocked(now)
+	session, ok := s.sessions[state]
+	if !ok || session.Status != "" || session.Phase != oauthSessionPhasePending || !strings.EqualFold(session.Provider, provider) {
+		return false
+	}
+	session.Phase = oauthSessionPhaseSaving
+	s.sessions[state] = session
+	return true
+}
+
+// Cancel retains a terminal state so status polling cannot report false success.
+func (s *oauthSessionStore) Cancel(state string) bool {
+	state = strings.TrimSpace(state)
+	if state == "" {
+		return false
+	}
+	now := time.Now()
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.purgeExpiredLocked(now)
+	session, ok := s.sessions[state]
+	if !ok || session.Status != "" || session.Phase != oauthSessionPhasePending {
+		return false
+	}
+	session.Status = oauthSessionCancelledStatus
+	session.ExpiresAt = now.Add(s.ttl)
+	s.sessions[state] = session
+	return true
 }
 
 var oauthSessions = newOAuthSessionStore(oauthSessionTTL)
@@ -173,10 +206,6 @@ func RegisterOAuthSession(state, provider string) { oauthSessions.Register(state
 func SetOAuthSessionError(state, message string) { oauthSessions.SetError(state, message) }
 
 func CompleteOAuthSession(state string) { oauthSessions.Complete(state) }
-
-func CompleteOAuthSessionsByProvider(provider string) int {
-	return oauthSessions.CompleteProvider(provider)
-}
 
 func GetOAuthSession(state string) (provider string, status string, ok bool) {
 	session, ok := oauthSessions.Get(state)
@@ -188,6 +217,33 @@ func GetOAuthSession(state string) (provider string, status string, ok bool) {
 
 func IsOAuthSessionPending(state, provider string) bool {
 	return oauthSessions.IsPending(state, provider)
+}
+
+func beginOAuthSessionSave(state, provider string) error {
+	if oauthSessions.BeginSave(state, provider) {
+		return nil
+	}
+	return errOAuthSessionNotPending
+}
+
+// CancelOAuthSession cancels a pending OAuth session by state.
+func CancelOAuthSession(state string) bool {
+	return oauthSessions.Cancel(state)
+}
+
+func oauthSessionErrorWithCause(message string, cause error) string {
+	message = strings.TrimSpace(message)
+	if message == "" {
+		message = "Authentication failed"
+	}
+	if cause == nil {
+		return message
+	}
+	detail := strings.TrimSpace(cause.Error())
+	if detail == "" {
+		return message
+	}
+	return message + ": " + detail
 }
 
 func ValidateOAuthState(state string) error {
@@ -227,6 +283,8 @@ func NormalizeOAuthProvider(provider string) (string, error) {
 		return "gemini", nil
 	case "antigravity", "anti-gravity":
 		return "antigravity", nil
+	case "xai", "x-ai", "x.ai", "grok":
+		return "xai", nil
 	default:
 		return "", errUnsupportedOAuthFlow
 	}

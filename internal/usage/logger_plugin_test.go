@@ -40,6 +40,59 @@ func TestRequestStatisticsRecordIncludesLatency(t *testing.T) {
 	}
 }
 
+func TestRequestStatisticsAggregatesCacheCreationAndServiceTiers(t *testing.T) {
+	stats := NewRequestStatistics()
+	timestamp := time.Date(2026, 7, 11, 8, 0, 0, 0, time.UTC)
+	stats.Record(context.Background(), coreusage.Record{
+		APIKey:              "test-key",
+		Model:               "gpt-5.4",
+		AuthIndex:           "auth-1",
+		RequestServiceTier:  "priority",
+		ResponseServiceTier: "flex",
+		RequestedAt:         timestamp,
+		Detail: coreusage.Detail{
+			InputTokens:         10,
+			OutputTokens:        20,
+			CacheCreationTokens: 7,
+			TotalTokens:         30,
+		},
+	})
+
+	detail := stats.Snapshot().APIs["test-key"].Models["gpt-5.4"].Details[0]
+	if detail.RequestServiceTier != "priority" || detail.ResponseServiceTier != "flex" {
+		t.Fatalf("unexpected service tiers: request=%q response=%q", detail.RequestServiceTier, detail.ResponseServiceTier)
+	}
+	if detail.Tokens.CacheCreationTokens != 7 {
+		t.Fatalf("detail cache_creation_tokens = %d, want 7", detail.Tokens.CacheCreationTokens)
+	}
+
+	authSummary, ok := stats.AuthSummary("auth-1")
+	if !ok || authSummary.Tokens.CacheCreationTokens != 7 {
+		t.Fatalf("unexpected auth summary: %+v ok=%v", authSummary, ok)
+	}
+	series := stats.Series(SeriesQuery{TimeRange: TimeRange{From: timestamp.Add(-time.Minute), To: timestamp.Add(time.Minute)}, Bucket: BucketHour, GroupBy: GroupByAuthIndex})
+	if len(series.Items) != 1 || series.Items[0].Tokens.CacheCreationTokens != 7 {
+		t.Fatalf("unexpected series: %+v", series.Items)
+	}
+}
+
+func TestRequestStatisticsOldJSONDefaultsNewUsageFields(t *testing.T) {
+	var snapshot StatisticsSnapshot
+	oldJSON := []byte(`{"apis":{"test-key":{"models":{"gpt-5.4":{"details":[{"timestamp":"2026-07-11T08:00:00Z","auth_index":"auth-1","tokens":{"input_tokens":1,"output_tokens":2,"total_tokens":3},"failed":false}]}}}}}`)
+	if err := json.Unmarshal(oldJSON, &snapshot); err != nil {
+		t.Fatalf("unmarshal old snapshot: %v", err)
+	}
+	stats := NewRequestStatistics()
+	result := stats.MergeSnapshot(snapshot)
+	if result.Added != 1 {
+		t.Fatalf("merge result = %+v, want one added", result)
+	}
+	detail := stats.Snapshot().APIs["test-key"].Models["gpt-5.4"].Details[0]
+	if detail.Tokens.CacheCreationTokens != 0 || detail.RequestServiceTier != "" || detail.ResponseServiceTier != "" {
+		t.Fatalf("new fields should use zero values for old JSON: %+v", detail)
+	}
+}
+
 func TestRequestStatisticsRecordIncludesClientIP(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
@@ -806,11 +859,14 @@ func TestPersistAndRestoreRequestStatistics(t *testing.T) {
 
 	stats := NewRequestStatistics()
 	stats.Record(context.Background(), coreusage.Record{
-		APIKey:      "test-key",
-		Model:       "gpt-5.4",
-		RequestedAt: time.Date(2026, 3, 20, 12, 0, 0, 0, time.UTC),
+		APIKey:              "test-key",
+		Model:               "gpt-5.4",
+		RequestServiceTier:  "priority",
+		ResponseServiceTier: "flex",
+		RequestedAt:         time.Date(2026, 3, 20, 12, 0, 0, 0, time.UTC),
 		Detail: coreusage.Detail{
-			TotalTokens: 30,
+			CacheCreationTokens: 7,
+			TotalTokens:         30,
 		},
 		AuthIndex: "auth-a",
 	})
@@ -838,5 +894,9 @@ func TestPersistAndRestoreRequestStatistics(t *testing.T) {
 	snapshot := restored.Snapshot()
 	if snapshot.TotalRequests != 1 || snapshot.TotalTokens != 30 {
 		t.Fatalf("restored snapshot = %+v, want requests=1 tokens=30", snapshot)
+	}
+	detail := snapshot.APIs["test-key"].Models["gpt-5.4"].Details[0]
+	if detail.Tokens.CacheCreationTokens != 7 || detail.RequestServiceTier != "priority" || detail.ResponseServiceTier != "flex" {
+		t.Fatalf("restored detail lost new usage fields: %+v", detail)
 	}
 }
