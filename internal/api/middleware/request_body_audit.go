@@ -72,8 +72,7 @@ func shouldAuditRequestBody(req *http.Request) bool {
 	path := req.URL.Path
 	return strings.HasPrefix(path, "/v1/") ||
 		path == "/v1internal:method" ||
-		strings.HasPrefix(path, "/v1beta/") ||
-		strings.HasPrefix(path, "/api/provider/")
+		strings.HasPrefix(path, "/v1beta/")
 }
 
 func readAuditRequestBody(req *http.Request, maxBodyBytes int64) ([]byte, bool, error) {

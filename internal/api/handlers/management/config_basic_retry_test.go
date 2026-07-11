@@ -5,6 +5,9 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/gin-gonic/gin"
@@ -35,6 +38,39 @@ func TestPutRequestRetry_ClampsNegativeValues(t *testing.T) {
 	}
 	if h.cfg.RequestRetry != 0 {
 		t.Fatalf("request-retry = %d, want 0", h.cfg.RequestRetry)
+	}
+}
+
+func TestPutRequestRetryPreservesIgnoredAmpConfig(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	original := `request-retry: 1
+ampcode:
+  upstream-url: https://nested.example
+  upstream-api-key: nested-sentinel
+amp-upstream-api-key: flat-sentinel
+`
+	if err := os.WriteFile(path, []byte(original), 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+	h := &Handler{cfg: &config.Config{RequestRetry: 1}, configFilePath: path}
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPut, "/v0/management/request-retry", bytes.NewBufferString(`{"value":2}`))
+	c.Request.Header.Set("Content-Type", "application/json")
+	h.PutRequestRetry(c)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile() error = %v", err)
+	}
+	saved := string(data)
+	for _, value := range []string{"nested-sentinel", "flat-sentinel", "request-retry: 2"} {
+		if !strings.Contains(saved, value) {
+			t.Fatalf("saved config missing %q:\n%s", value, saved)
+		}
 	}
 }
 

@@ -39,6 +39,10 @@ func RequestLoggingMiddleware(logger logging.RequestLogger, releaseProviders ...
 		}
 
 		path := c.Request.URL.Path
+		if util.IsRetiredAmpPath(path) && c.FullPath() == "" {
+			c.Next()
+			return
+		}
 		if !shouldLogRequest(path) {
 			c.Next()
 			return
@@ -203,17 +207,11 @@ func ensureRequestBodyReleaseController(c *gin.Context, cfg config.RequestBodyRe
 }
 
 // shouldLogRequest determines whether the request should be logged.
-// It skips management endpoints to avoid leaking secrets but allows
-// all other routes, including module-provided ones, to honor request-log.
+// It skips management and retired control-plane endpoints to avoid leaking secrets.
 func shouldLogRequest(path string) bool {
 	if isManagementAPIPath(path) || strings.HasPrefix(path, "/management") {
 		return false
 	}
-
-	if strings.HasPrefix(path, "/api") {
-		return strings.HasPrefix(path, "/api/provider")
-	}
-
 	return true
 }
 

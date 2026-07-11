@@ -13,6 +13,7 @@ import (
 	gin "github.com/gin-gonic/gin"
 	proxyconfig "github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	internallogging "github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	sdkaccess "github.com/router-for-me/CLIProxyAPI/v6/sdk/access"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v6/sdk/config"
@@ -89,6 +90,55 @@ func TestHealthz(t *testing.T) {
 			t.Fatalf("expected empty body for HEAD request, got %q", rr.Body.String())
 		}
 	})
+}
+
+func TestAmpRoutesAreRemoved(t *testing.T) {
+	server := newTestServer(t)
+	tests := []struct {
+		method string
+		path   string
+	}{
+		{method: http.MethodGet, path: "/threads"},
+		{method: http.MethodGet, path: "/threads/example"},
+		{method: http.MethodGet, path: "/docs"},
+		{method: http.MethodGet, path: "/docs/example"},
+		{method: http.MethodGet, path: "/settings"},
+		{method: http.MethodGet, path: "/settings/example"},
+		{method: http.MethodGet, path: "/threads.rss"},
+		{method: http.MethodGet, path: "/news.rss"},
+		{method: http.MethodPost, path: "/auth"},
+		{method: http.MethodPost, path: "/auth/token"},
+		{method: http.MethodPost, path: "/api/auth"},
+		{method: http.MethodPost, path: "/api/auth/token"},
+		{method: http.MethodPost, path: "/api/user"},
+		{method: http.MethodPost, path: "/api/threads"},
+		{method: http.MethodPost, path: "/api/telemetry"},
+		{method: http.MethodPost, path: "/api/provider/openai/v1/chat/completions"},
+	}
+	for _, test := range tests {
+		req := httptest.NewRequest(test.method, test.path, strings.NewReader(`{"token":"secret"}`))
+		rr := httptest.NewRecorder()
+		server.engine.ServeHTTP(rr, req)
+		if rr.Code != http.StatusNotFound {
+			t.Fatalf("%s %s status = %d, want %d", test.method, test.path, rr.Code, http.StatusNotFound)
+		}
+	}
+
+	managementServer := newTestServerWithConfig(t, func(cfg *proxyconfig.Config) {
+		cfg.RemoteManagement.SecretKey = "secret"
+	})
+	req := httptest.NewRequest(http.MethodGet, "/v0/management/ampcode", nil)
+	rr := httptest.NewRecorder()
+	managementServer.engine.ServeHTTP(rr, req)
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("GET /v0/management/ampcode status = %d, want %d", rr.Code, http.StatusNotFound)
+	}
+
+	for _, route := range managementServer.engine.Routes() {
+		if strings.Contains(route.Path, "/ampcode") || util.IsRetiredAmpPath(route.Path) {
+			t.Fatalf("retired Amp route is still registered: %s %s", route.Method, route.Path)
+		}
+	}
 }
 
 func TestXAIVideoRoutesRegistered(t *testing.T) {
@@ -190,72 +240,6 @@ func TestManagementAccessPathPrefixesManagementRoutesAndCallbacks(t *testing.T) 
 	server.engine.ServeHTTP(newRec, newReq)
 	if newRec.Code != http.StatusOK {
 		t.Fatalf("updated prefixed management route status = %d, want %d; body=%s", newRec.Code, http.StatusOK, newRec.Body.String())
-	}
-}
-
-func TestAmpProviderModelRoutes(t *testing.T) {
-	testCases := []struct {
-		name         string
-		path         string
-		wantStatus   int
-		wantContains string
-	}{
-		{
-			name:         "openai root models",
-			path:         "/api/provider/openai/models",
-			wantStatus:   http.StatusOK,
-			wantContains: `"object":"list"`,
-		},
-		{
-			name:         "groq root models",
-			path:         "/api/provider/groq/models",
-			wantStatus:   http.StatusOK,
-			wantContains: `"object":"list"`,
-		},
-		{
-			name:         "openai models",
-			path:         "/api/provider/openai/v1/models",
-			wantStatus:   http.StatusOK,
-			wantContains: `"object":"list"`,
-		},
-		{
-			name:         "anthropic models",
-			path:         "/api/provider/anthropic/v1/models",
-			wantStatus:   http.StatusOK,
-			wantContains: `"data"`,
-		},
-		{
-			name:         "google models v1",
-			path:         "/api/provider/google/v1/models",
-			wantStatus:   http.StatusOK,
-			wantContains: `"models"`,
-		},
-		{
-			name:         "google models v1beta",
-			path:         "/api/provider/google/v1beta/models",
-			wantStatus:   http.StatusOK,
-			wantContains: `"models"`,
-		},
-	}
-
-	for _, tc := range testCases {
-		tc := tc
-		t.Run(tc.name, func(t *testing.T) {
-			server := newTestServer(t)
-
-			req := httptest.NewRequest(http.MethodGet, tc.path, nil)
-			req.Header.Set("Authorization", "Bearer test-key")
-
-			rr := httptest.NewRecorder()
-			server.engine.ServeHTTP(rr, req)
-
-			if rr.Code != tc.wantStatus {
-				t.Fatalf("unexpected status code for %s: got %d want %d; body=%s", tc.path, rr.Code, tc.wantStatus, rr.Body.String())
-			}
-			if body := rr.Body.String(); !strings.Contains(body, tc.wantContains) {
-				t.Fatalf("response body for %s missing %q: %s", tc.path, tc.wantContains, body)
-			}
-		})
 	}
 }
 

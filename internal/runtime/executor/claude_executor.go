@@ -178,7 +178,7 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 
 	// Enforce Anthropic's cache_control block limit (max 4 breakpoints per request).
 	// Cloaking and ensureCacheControl may push the total over 4 when the client
-	// (e.g. Amp CLI) already sends multiple cache_control blocks.
+	// already sends multiple cache_control blocks.
 	body = enforceCacheControlLimit(body, 4)
 
 	// Normalize TTL values to prevent ordering violations under prompt-caching-scope-2026-01-05.

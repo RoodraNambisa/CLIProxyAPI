@@ -1,6 +1,7 @@
 package middleware
 
 import (
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -89,6 +90,8 @@ func TestShouldLogRequestSkipsManagementPaths(t *testing.T) {
 		{name: "prefixed management config", path: "/secret-token/v0/management/config", want: false},
 		{name: "prefixed management oauth callback", path: "/secret-token/v0/management/oauth-callback", want: false},
 		{name: "management panel", path: "/management.html", want: false},
+		{name: "similar api prefix", path: "/api-v2/messages", want: true},
+		{name: "custom api extension", path: "/api/custom", want: true},
 		{name: "similar path is not management api", path: "/secret-token/v0/managementevil/config", want: true},
 		{name: "normal api path", path: "/v1/chat/completions", want: true},
 	}
@@ -97,6 +100,52 @@ func TestShouldLogRequestSkipsManagementPaths(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			if got := shouldLogRequest(tt.path); got != tt.want {
 				t.Fatalf("shouldLogRequest(%q) = %t, want %t", tt.path, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestRequestLoggingMiddlewareSkipsOnlyUnmatchedRetiredAmpPaths(t *testing.T) {
+	for _, enabled := range []bool{false, true} {
+		t.Run(fmt.Sprintf("enabled=%t", enabled), func(t *testing.T) {
+			logger := &testRequestLogger{enabled: enabled}
+			router := gin.New()
+			router.Use(RequestLoggingMiddleware(logger))
+			customHandler := func(c *gin.Context) {
+				c.String(http.StatusBadRequest, "custom error")
+			}
+			router.POST("/api/custom", customHandler)
+			router.POST("/auth/custom", customHandler)
+			router.POST("/api/provider/custom", customHandler)
+
+			for _, path := range []string{
+				"/auth/token",
+				"/api/auth/token",
+				"/api/provider/openai/v1/messages",
+				"/api/user",
+				"/api/threads",
+				"/api/telemetry",
+			} {
+				req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(`{"token":"body-sentinel"}`))
+				req.Header.Set("Authorization", "Bearer header-sentinel")
+				recorder := httptest.NewRecorder()
+				router.ServeHTTP(recorder, req)
+				if logger.calls != 0 {
+					t.Fatalf("retired path %s produced %d request log calls", path, logger.calls)
+				}
+			}
+
+			for index, path := range []string{"/api/custom", "/auth/custom", "/api/provider/custom"} {
+				body := fmt.Sprintf(`{"token":"custom-body-%d"}`, index)
+				req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(body))
+				recorder := httptest.NewRecorder()
+				router.ServeHTTP(recorder, req)
+				if logger.calls != index+1 {
+					t.Fatalf("custom route %s produced %d total request log calls, want %d", path, logger.calls, index+1)
+				}
+				if string(logger.body) != body {
+					t.Fatalf("custom route %s body = %q, want %q", path, logger.body, body)
+				}
 			}
 		})
 	}

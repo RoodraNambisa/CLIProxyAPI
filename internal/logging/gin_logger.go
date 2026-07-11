@@ -23,10 +23,7 @@ var aiAPIPrefixes = []string{
 	"/v1/messages",
 	"/v1/responses",
 	"/v1beta/models/",
-	"/api/provider/",
 }
-
-const skipGinLogKey = "__gin_skip_request_logging__"
 
 // GinLogrusLogger returns a Gin middleware handler that logs HTTP requests and responses
 // using logrus. It captures request details including method, path, status code, latency,
@@ -53,8 +50,7 @@ func GinLogrusLogger() gin.HandlerFunc {
 		}
 
 		c.Next()
-
-		if shouldSkipGinRequestLogging(c) {
+		if util.IsRetiredAmpPath(path) && c.FullPath() == "" {
 			return
 		}
 
@@ -126,25 +122,4 @@ func GinLogrusRecovery() gin.HandlerFunc {
 
 		c.AbortWithStatus(http.StatusInternalServerError)
 	})
-}
-
-// SkipGinRequestLogging marks the provided Gin context so that GinLogrusLogger
-// will skip emitting a log line for the associated request.
-func SkipGinRequestLogging(c *gin.Context) {
-	if c == nil {
-		return
-	}
-	c.Set(skipGinLogKey, true)
-}
-
-func shouldSkipGinRequestLogging(c *gin.Context) bool {
-	if c == nil {
-		return false
-	}
-	val, exists := c.Get(skipGinLogKey)
-	if !exists {
-		return false
-	}
-	flag, ok := val.(bool)
-	return ok && flag
 }

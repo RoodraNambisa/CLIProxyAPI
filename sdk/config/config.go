@@ -21,7 +21,6 @@ type RequestBodyReleaseConfig = internalconfig.RequestBodyReleaseConfig
 type DisabledImageGenerationToolErrorConfig = internalconfig.DisabledImageGenerationToolErrorConfig
 type NonRetryableErrorRule = internalconfig.NonRetryableErrorRule
 type AuthModelExclusionRule = internalconfig.AuthModelExclusionRule
-type AmpCode = internalconfig.AmpCode
 type OAuthModelAlias = internalconfig.OAuthModelAlias
 type PayloadConfig = internalconfig.PayloadConfig
 type PayloadRule = internalconfig.PayloadRule

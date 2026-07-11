@@ -55,7 +55,6 @@
 - 为 CLI 模型提供 OpenAI/Gemini/Claude/Codex 兼容的 API 端点
 - 支持 OpenAI Codex（GPT 系列）OAuth 登录
 - 支持 Claude Code OAuth 登录
-- 支持 Amp CLI 与 IDE 扩展的 provider 路由
 - 支持流式与非流式响应
 - 支持函数调用 / 工具调用
 - 支持多模态输入（文本、图片）
@@ -167,25 +166,6 @@ remote-management:
 ```
 
 设置后管理页面会移动到 `/my-random-path/management.html`，管理 API 会移动到 `/my-random-path/v0/management/...`，OAuth 回调也会使用 `/my-random-path/{provider}/callback`。`access-path` 只是路径隐藏，不替代 `secret-key`，管理 API 仍然需要管理密钥。
-
-## Amp CLI 支持
-
-CLIProxyAPI 已内置对 [Amp CLI](https://ampcode.com) 和 Amp IDE 扩展的支持，可让你使用自己的 Google/ChatGPT/Claude OAuth 订阅来配合 Amp 编码工具：
-
-- 提供商路由别名，兼容 Amp 的 API 路径模式：`/api/provider/{provider}/v1...`
-- 管理代理，处理 OAuth 认证和账号功能
-- 智能模型回退与自动路由
-- 以安全为先的设计，管理端点仅限 localhost
-
-当你需要某一类后端的请求 / 响应协议形态时，优先使用 provider-specific 路径，而不是合并后的 `/v1/...` 端点：
-
-- 对于 messages 风格的后端，使用 `/api/provider/{provider}/v1/messages`
-- 对于按模型路径暴露生成接口的后端，使用 `/api/provider/{provider}/v1beta/models/...`
-- 对于 chat-completions 风格的后端，使用 `/api/provider/{provider}/v1/chat/completions`
-
-这些路径有助于选择协议表面，但当多个后端复用同一个客户端可见模型名时，它们本身并不能保证唯一的推理执行器。实际的推理路由仍然根据请求里的 `model` / `alias` 解析。若要严格固定某个后端，请使用唯一 alias、前缀，或避免多个后端暴露相同的客户端模型名。
-
-**→ [Amp CLI 完整集成指南](https://help.router-for.me/cn/agent-client/amp-cli.html)**
 
 ## SDK 文档
 

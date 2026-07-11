@@ -14,11 +14,6 @@ func TestBuildConfigChangeDetails(t *testing.T) {
 		GeminiKey: []config.GeminiKey{
 			{APIKey: "old", BaseURL: "http://old", ExcludedModels: []string{"old-model"}},
 		},
-		AmpCode: config.AmpCode{
-			UpstreamURL:                   "http://old-upstream",
-			ModelMappings:                 []config.AmpModelMapping{{From: "from-old", To: "to-old"}},
-			RestrictManagementToLocalhost: false,
-		},
 		RemoteManagement: config.RemoteManagement{
 			AllowRemote:            false,
 			SecretKey:              "old",
@@ -45,14 +40,6 @@ func TestBuildConfigChangeDetails(t *testing.T) {
 		AuthDir: "/tmp/auth-new",
 		GeminiKey: []config.GeminiKey{
 			{APIKey: "old", BaseURL: "http://old", ExcludedModels: []string{"old-model", "extra"}},
-		},
-		AmpCode: config.AmpCode{
-			UpstreamURL:                   "http://new-upstream",
-			RestrictManagementToLocalhost: true,
-			ModelMappings: []config.AmpModelMapping{
-				{From: "from-old", To: "to-old"},
-				{From: "from-new", To: "to-new"},
-			},
 		},
 		RemoteManagement: config.RemoteManagement{
 			AllowRemote:            true,
@@ -87,8 +74,6 @@ func TestBuildConfigChangeDetails(t *testing.T) {
 	expectContains(t, details, "port: 8080 -> 9090")
 	expectContains(t, details, "auth-dir: /tmp/auth-old -> /tmp/auth-new")
 	expectContains(t, details, "gemini[0].excluded-models: updated (1 -> 2 entries)")
-	expectContains(t, details, "ampcode.upstream-url: http://old-upstream -> http://new-upstream")
-	expectContains(t, details, "ampcode.model-mappings: updated (1 -> 2 entries)")
 	expectContains(t, details, "remote-management.allow-remote: false -> true")
 	expectContains(t, details, "remote-management.disable-auto-update-panel: false -> true")
 	expectContains(t, details, "remote-management.secret-key: updated")
@@ -131,10 +116,6 @@ func TestBuildConfigChangeDetails_GeminiVertexHeadersAndForceMappings(t *testing
 		VertexCompatAPIKey: []config.VertexCompatKey{
 			{APIKey: "v1", BaseURL: "http://v-old", Models: []config.VertexCompatModel{{Name: "m1"}}},
 		},
-		AmpCode: config.AmpCode{
-			ModelMappings:      []config.AmpModelMapping{{From: "a", To: "b"}},
-			ForceModelMappings: false,
-		},
 	}
 	newCfg := &config.Config{
 		GeminiKey: []config.GeminiKey{
@@ -143,17 +124,11 @@ func TestBuildConfigChangeDetails_GeminiVertexHeadersAndForceMappings(t *testing
 		VertexCompatAPIKey: []config.VertexCompatKey{
 			{APIKey: "v1", BaseURL: "http://v-new", Models: []config.VertexCompatModel{{Name: "m1"}, {Name: "m2"}}},
 		},
-		AmpCode: config.AmpCode{
-			ModelMappings:      []config.AmpModelMapping{{From: "a", To: "c"}},
-			ForceModelMappings: true,
-		},
 	}
 
 	details := BuildConfigChangeDetails(oldCfg, newCfg)
 	expectContains(t, details, "gemini[0].headers: updated")
 	expectContains(t, details, "gemini[0].excluded-models: updated (1 -> 2 entries)")
-	expectContains(t, details, "ampcode.model-mappings: updated (1 -> 1 entries)")
-	expectContains(t, details, "ampcode.force-model-mappings: false -> true")
 }
 
 func TestBuildConfigChangeDetails_ModelPrefixes(t *testing.T) {
@@ -207,9 +182,6 @@ func TestBuildConfigChangeDetails_SecretsAndCounts(t *testing.T) {
 		SDKConfig: sdkconfig.SDKConfig{
 			APIKeys: []string{"a"},
 		},
-		AmpCode: config.AmpCode{
-			UpstreamAPIKey: "",
-		},
 		RemoteManagement: config.RemoteManagement{
 			SecretKey: "",
 		},
@@ -218,9 +190,6 @@ func TestBuildConfigChangeDetails_SecretsAndCounts(t *testing.T) {
 		SDKConfig: sdkconfig.SDKConfig{
 			APIKeys: []string{"a", "b", "c"},
 		},
-		AmpCode: config.AmpCode{
-			UpstreamAPIKey: "new-key",
-		},
 		RemoteManagement: config.RemoteManagement{
 			SecretKey: "new-secret",
 		},
@@ -228,7 +197,6 @@ func TestBuildConfigChangeDetails_SecretsAndCounts(t *testing.T) {
 
 	details := BuildConfigChangeDetails(oldCfg, newCfg)
 	expectContains(t, details, "api-keys count: 1 -> 3")
-	expectContains(t, details, "ampcode.upstream-api-key: added")
 	expectContains(t, details, "remote-management.secret-key: created")
 }
 
@@ -249,7 +217,6 @@ func TestBuildConfigChangeDetails_FlagsAndKeys(t *testing.T) {
 		QuotaExceeded:          config.QuotaExceeded{SwitchProject: false, SwitchPreviewModel: false, AntigravityCredits: false},
 		ClaudeKey:              []config.ClaudeKey{{APIKey: "c1"}},
 		CodexKey:               []config.CodexKey{{APIKey: "x1"}},
-		AmpCode:                config.AmpCode{UpstreamAPIKey: "keep", RestrictManagementToLocalhost: false},
 		RemoteManagement:       config.RemoteManagement{DisableControlPanel: false, PanelGitHubRepository: "old/repo", SecretKey: "keep"},
 		SDKConfig: sdkconfig.SDKConfig{
 			RequestLog:                 false,
@@ -280,11 +247,6 @@ func TestBuildConfigChangeDetails_FlagsAndKeys(t *testing.T) {
 		CodexKey: []config.CodexKey{
 			{APIKey: "x1", BaseURL: "http://x", ProxyURL: "http://px", Headers: map[string]string{"H": "2"}, ExcludedModels: []string{"b"}},
 			{APIKey: "x2"},
-		},
-		AmpCode: config.AmpCode{
-			UpstreamAPIKey:                "",
-			RestrictManagementToLocalhost: true,
-			ModelMappings:                 []config.AmpModelMapping{{From: "a", To: "b"}},
 		},
 		RemoteManagement: config.RemoteManagement{
 			DisableControlPanel:    true,
@@ -322,8 +284,6 @@ func TestBuildConfigChangeDetails_FlagsAndKeys(t *testing.T) {
 	expectContains(t, details, "api-keys count: 1 -> 2")
 	expectContains(t, details, "claude-api-key count: 1 -> 2")
 	expectContains(t, details, "codex-api-key count: 1 -> 2")
-	expectContains(t, details, "ampcode.restrict-management-to-localhost: false -> true")
-	expectContains(t, details, "ampcode.upstream-api-key: removed")
 	expectContains(t, details, "remote-management.disable-control-panel: false -> true")
 	expectContains(t, details, "remote-management.disable-auto-update-panel: false -> true")
 	expectContains(t, details, "remote-management.panel-github-repository: old/repo -> new/repo")
@@ -354,13 +314,6 @@ func TestBuildConfigChangeDetails_AllBranches(t *testing.T) {
 		},
 		VertexCompatAPIKey: []config.VertexCompatKey{
 			{APIKey: "v-old", BaseURL: "http://v-old", ProxyURL: "http://vp-old", Headers: map[string]string{"H": "1"}, Models: []config.VertexCompatModel{{Name: "m1"}}},
-		},
-		AmpCode: config.AmpCode{
-			UpstreamURL:                   "http://amp-old",
-			UpstreamAPIKey:                "old-key",
-			RestrictManagementToLocalhost: false,
-			ModelMappings:                 []config.AmpModelMapping{{From: "a", To: "b"}},
-			ForceModelMappings:            false,
 		},
 		RemoteManagement: config.RemoteManagement{
 			AllowRemote:            false,
@@ -408,13 +361,6 @@ func TestBuildConfigChangeDetails_AllBranches(t *testing.T) {
 		},
 		VertexCompatAPIKey: []config.VertexCompatKey{
 			{APIKey: "v-new", BaseURL: "http://v-new", ProxyURL: "http://vp-new", Headers: map[string]string{"H": "2"}, Models: []config.VertexCompatModel{{Name: "m1"}, {Name: "m2"}}},
-		},
-		AmpCode: config.AmpCode{
-			UpstreamURL:                   "http://amp-new",
-			UpstreamAPIKey:                "",
-			RestrictManagementToLocalhost: true,
-			ModelMappings:                 []config.AmpModelMapping{{From: "a", To: "c"}},
-			ForceModelMappings:            true,
 		},
 		RemoteManagement: config.RemoteManagement{
 			AllowRemote:            true,
@@ -481,11 +427,6 @@ func TestBuildConfigChangeDetails_AllBranches(t *testing.T) {
 	expectContains(t, changes, "vertex[0].api-key: updated")
 	expectContains(t, changes, "vertex[0].models: updated (1 -> 2 entries)")
 	expectContains(t, changes, "vertex[0].headers: updated")
-	expectContains(t, changes, "ampcode.upstream-url: http://amp-old -> http://amp-new")
-	expectContains(t, changes, "ampcode.upstream-api-key: removed")
-	expectContains(t, changes, "ampcode.restrict-management-to-localhost: false -> true")
-	expectContains(t, changes, "ampcode.model-mappings: updated (1 -> 1 entries)")
-	expectContains(t, changes, "ampcode.force-model-mappings: false -> true")
 	expectContains(t, changes, "oauth-excluded-models[p1]: updated (1 -> 2 entries)")
 	expectContains(t, changes, "oauth-excluded-models[p2]: added (1 entries)")
 	expectContains(t, changes, "remote-management.allow-remote: false -> true")
@@ -520,26 +461,19 @@ func TestFormatProxyURL(t *testing.T) {
 	}
 }
 
-func TestBuildConfigChangeDetails_SecretAndUpstreamUpdates(t *testing.T) {
+func TestBuildConfigChangeDetails_SecretUpdate(t *testing.T) {
 	oldCfg := &config.Config{
-		AmpCode: config.AmpCode{
-			UpstreamAPIKey: "old",
-		},
 		RemoteManagement: config.RemoteManagement{
 			SecretKey: "old",
 		},
 	}
 	newCfg := &config.Config{
-		AmpCode: config.AmpCode{
-			UpstreamAPIKey: "new",
-		},
 		RemoteManagement: config.RemoteManagement{
 			SecretKey: "new",
 		},
 	}
 
 	changes := BuildConfigChangeDetails(oldCfg, newCfg)
-	expectContains(t, changes, "ampcode.upstream-api-key: updated")
 	expectContains(t, changes, "remote-management.secret-key: updated")
 }
 

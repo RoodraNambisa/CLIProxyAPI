@@ -136,3 +136,20 @@ func TestRequestBodyAuditMiddlewareRejectsOversize(t *testing.T) {
 		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusBadRequest, rec.Body.String())
 	}
 }
+
+func TestShouldAuditRequestBodySkipsRetiredAmpRoutes(t *testing.T) {
+	for _, path := range []string{
+		"/api/provider/openai/v1/messages",
+		"/api/auth/token",
+		"/auth/token",
+	} {
+		req := httptest.NewRequest(http.MethodPost, path, strings.NewReader("blocked"))
+		if shouldAuditRequestBody(req) {
+			t.Fatalf("shouldAuditRequestBody(%q) = true, want false", path)
+		}
+	}
+	apiReq := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader("blocked"))
+	if !shouldAuditRequestBody(apiReq) {
+		t.Fatal("shouldAuditRequestBody(/v1/responses) = false, want true")
+	}
+}

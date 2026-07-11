@@ -4,10 +4,58 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/gin-gonic/gin"
+	log "github.com/sirupsen/logrus"
+	logtest "github.com/sirupsen/logrus/hooks/test"
 )
+
+func TestGinLogrusLoggerSkipsRetiredAmpOAuthPath(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	hook := logtest.NewGlobal()
+	defer hook.Reset()
+	previousLevel := log.GetLevel()
+	log.SetLevel(log.InfoLevel)
+	defer log.SetLevel(previousLevel)
+
+	engine := gin.New()
+	engine.Use(GinLogrusLogger())
+	req := httptest.NewRequest(http.MethodGet, "/auth/callback?code=sensitive-code&state=sensitive-state", nil)
+	recorder := httptest.NewRecorder()
+	engine.ServeHTTP(recorder, req)
+
+	entries := hook.AllEntries()
+	for _, entry := range entries {
+		message := entry.Message
+		if strings.Contains(message, "sensitive-code") || strings.Contains(message, "sensitive-state") {
+			t.Fatalf("retired Amp OAuth query was logged: %s", message)
+		}
+	}
+	if len(entries) != 0 {
+		t.Fatalf("retired Amp OAuth path emitted %d access log entries", len(entries))
+	}
+}
+
+func TestGinLogrusLoggerKeepsCustomRouteUnderRetiredPrefix(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	hook := logtest.NewGlobal()
+	defer hook.Reset()
+	previousLevel := log.GetLevel()
+	log.SetLevel(log.InfoLevel)
+	defer log.SetLevel(previousLevel)
+
+	engine := gin.New()
+	engine.Use(GinLogrusLogger())
+	engine.GET("/auth/custom", func(c *gin.Context) { c.Status(http.StatusNoContent) })
+	req := httptest.NewRequest(http.MethodGet, "/auth/custom", nil)
+	recorder := httptest.NewRecorder()
+	engine.ServeHTTP(recorder, req)
+	if len(hook.AllEntries()) != 1 {
+		t.Fatalf("custom route emitted %d access log entries, want 1", len(hook.AllEntries()))
+	}
+}
 
 func TestGinLogrusRecoveryRepanicsErrAbortHandler(t *testing.T) {
 	gin.SetMode(gin.TestMode)
