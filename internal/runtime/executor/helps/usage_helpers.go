@@ -436,7 +436,7 @@ func extractResponseServiceTier(payload []byte) string {
 }
 
 func extractResponseServiceTierFromValidJSON(payload []byte) string {
-	for _, path := range []string{"response.service_tier", "service_tier"} {
+	for _, path := range []string{"response.service_tier", "service_tier", "interaction.service_tier"} {
 		if tier := strings.TrimSpace(gjson.GetBytes(payload, path).String()); tier != "" {
 			return tier
 		}
@@ -592,6 +592,72 @@ func parseGeminiFamilyUsageDetail(node gjson.Result) usage.Detail {
 		detail.TotalTokens = detail.InputTokens + detail.OutputTokens + detail.ReasoningTokens
 	}
 	return detail
+}
+
+func parseInteractionsUsageDetail(node gjson.Result) usage.Detail {
+	cacheReadTokens := firstInteractionsUsageNode(node, "cache_read_tokens", "cacheReadTokens").Int()
+	cachedTokens := firstInteractionsUsageNode(node, "cached_tokens", "cachedContentTokenCount", "total_cached_tokens").Int()
+	if cachedTokens == 0 {
+		cachedTokens = cacheReadTokens
+	}
+	detail := usage.Detail{
+		InputTokens:         firstInteractionsUsageNode(node, "input_tokens", "prompt_tokens", "total_input_tokens").Int(),
+		OutputTokens:        firstInteractionsUsageNode(node, "output_tokens", "completion_tokens", "total_output_tokens").Int(),
+		ReasoningTokens:     firstInteractionsUsageNode(node, "reasoning_tokens", "thoughtsTokenCount", "total_thought_tokens").Int(),
+		TotalTokens:         firstInteractionsUsageNode(node, "total_tokens", "totalTokenCount").Int(),
+		CachedTokens:        cachedTokens,
+		CacheCreationTokens: firstInteractionsUsageNode(node, "cache_creation_tokens", "cacheCreationTokens").Int(),
+	}
+	if detail.TotalTokens == 0 {
+		detail.TotalTokens = detail.InputTokens + detail.OutputTokens + detail.ReasoningTokens + cacheReadTokens + detail.CacheCreationTokens
+	}
+	return detail
+}
+
+func firstInteractionsUsageNode(root gjson.Result, paths ...string) gjson.Result {
+	for _, path := range paths {
+		if value := root.Get(path); value.Exists() {
+			return value
+		}
+	}
+	return gjson.Result{}
+}
+
+func hasUsageDetail(detail usage.Detail) bool {
+	return hasNonZeroTokenUsage(detail)
+}
+
+// ParseInteractionsUsage extracts usage from native Interactions response envelopes.
+func ParseInteractionsUsage(data []byte) usage.Detail {
+	root := gjson.ParseBytes(data)
+	node := firstInteractionsUsageNode(root, "usage", "total_usage", "metadata.total_usage", "metadata.usage", "usageMetadata", "usage_metadata", "interaction.usage", "interaction.total_usage", "interaction.metadata.total_usage", "interaction.metadata.usage")
+	if !node.Exists() {
+		return usage.Detail{}
+	}
+	if node.Get("promptTokenCount").Exists() || node.Get("candidatesTokenCount").Exists() {
+		detail := parseGeminiFamilyUsageDetail(node)
+		detail.ResponseServiceTier = extractResponseServiceTier(data)
+		return detail
+	}
+	detail := parseInteractionsUsageDetail(node)
+	detail.ResponseServiceTier = extractResponseServiceTier(data)
+	return detail
+}
+
+// ParseInteractionsStreamUsage extracts usage from a native Interactions stream event.
+func ParseInteractionsStreamUsage(line []byte) (usage.Detail, bool) {
+	payload := jsonPayload(line)
+	if len(payload) == 0 {
+		payload = line
+	}
+	if len(payload) == 0 || !gjson.ValidBytes(payload) {
+		return usage.Detail{}, false
+	}
+	detail := ParseInteractionsUsage(payload)
+	if !hasUsageDetail(detail) {
+		return usage.Detail{}, false
+	}
+	return detail, true
 }
 
 func ParseGeminiUsage(data []byte) usage.Detail {

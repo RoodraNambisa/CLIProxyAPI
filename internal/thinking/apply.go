@@ -62,7 +62,7 @@ func IsUserDefinedModel(modelInfo *registry.ModelInfo) bool {
 //   - body: Original request body JSON
 //   - model: Model name, optionally with thinking suffix (e.g., "claude-sonnet-4-5(16384)")
 //   - fromFormat: Source request format (e.g., openai, codex, gemini)
-//   - toFormat: Target provider format for the request body (gemini, antigravity, claude, openai, codex, kimi)
+//   - toFormat: Target provider format for the request body (gemini, antigravity, interactions, claude, openai, codex, kimi)
 //   - providerKey: Provider identifier used for registry model lookups (may differ from toFormat, e.g., openrouter -> openai)
 //
 // Returns:
@@ -322,6 +322,8 @@ func extractThinkingConfig(body []byte, provider string) ThinkingConfig {
 		return extractClaudeConfig(body)
 	case "gemini", "antigravity":
 		return extractGeminiConfig(body, provider)
+	case "interactions":
+		return extractInteractionsConfig(body)
 	case "openai":
 		return extractOpenAIConfig(body)
 	case "codex", "xai":
@@ -435,6 +437,56 @@ func extractGeminiConfig(body []byte, provider string) ThinkingConfig {
 		budget = gjson.GetBytes(body, prefix+".thinking_budget")
 	}
 	if budget.Exists() {
+		value := int(budget.Int())
+		switch value {
+		case 0:
+			return ThinkingConfig{Mode: ModeNone, Budget: 0}
+		case -1:
+			return ThinkingConfig{Mode: ModeAuto, Budget: -1}
+		default:
+			return ThinkingConfig{Mode: ModeBudget, Budget: value}
+		}
+	}
+
+	return ThinkingConfig{}
+}
+
+func extractInteractionsConfig(body []byte) ThinkingConfig {
+	for _, path := range []string{
+		"generation_config.thinking_level",
+		"generation_config.thinkingLevel",
+		"generation_config.thinking_config.thinking_level",
+		"generation_config.thinking_config.thinkingLevel",
+		"generation_config.thinkingConfig.thinking_level",
+		"generation_config.thinkingConfig.thinkingLevel",
+	} {
+		level := gjson.GetBytes(body, path)
+		if !level.Exists() {
+			continue
+		}
+		value := strings.ToLower(strings.TrimSpace(level.String()))
+		switch value {
+		case "none":
+			return ThinkingConfig{Mode: ModeNone, Budget: 0}
+		case "auto":
+			return ThinkingConfig{Mode: ModeAuto, Budget: -1}
+		default:
+			return ThinkingConfig{Mode: ModeLevel, Level: ThinkingLevel(value)}
+		}
+	}
+
+	for _, path := range []string{
+		"generation_config.thinking_budget",
+		"generation_config.thinkingBudget",
+		"generation_config.thinking_config.thinking_budget",
+		"generation_config.thinking_config.thinkingBudget",
+		"generation_config.thinkingConfig.thinking_budget",
+		"generation_config.thinkingConfig.thinkingBudget",
+	} {
+		budget := gjson.GetBytes(body, path)
+		if !budget.Exists() {
+			continue
+		}
 		value := int(budget.Int())
 		switch value {
 		case 0:

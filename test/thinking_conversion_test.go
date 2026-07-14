@@ -12,6 +12,7 @@ import (
 	_ "github.com/router-for-me/CLIProxyAPI/v6/internal/thinking/provider/claude"
 	_ "github.com/router-for-me/CLIProxyAPI/v6/internal/thinking/provider/codex"
 	_ "github.com/router-for-me/CLIProxyAPI/v6/internal/thinking/provider/gemini"
+	_ "github.com/router-for-me/CLIProxyAPI/v6/internal/thinking/provider/interactions"
 	_ "github.com/router-for-me/CLIProxyAPI/v6/internal/thinking/provider/kimi"
 	_ "github.com/router-for-me/CLIProxyAPI/v6/internal/thinking/provider/openai"
 
@@ -2640,6 +2641,49 @@ func TestThinkingE2EClaudeAdaptive_Body(t *testing.T) {
 			model:     "claude-sonnet-4-6-model",
 			inputJSON: `{"model":"claude-sonnet-4-6-model","messages":[{"role":"user","content":"hi"}],"thinking":{"type":"adaptive"},"output_config":{"effort":"xhigh"}}`,
 			expectErr: true,
+		},
+	}
+
+	runThinkingTests(t, cases)
+}
+
+func TestThinkingE2EInteractions(t *testing.T) {
+	reg := registry.GetGlobalRegistry()
+	uid := fmt.Sprintf("thinking-e2e-interactions-%d", time.Now().UnixNano())
+	reg.RegisterClient(uid, "test", []*registry.ModelInfo{
+		{
+			ID:       "gemini-zero-mixed-model",
+			Object:   "model",
+			Created:  1700000000,
+			OwnedBy:  "test",
+			Type:     "gemini",
+			Thinking: &registry.ThinkingSupport{Min: 1, Max: 65535, Levels: []string{"minimal", "low", "medium", "high"}, ZeroAllowed: true, DynamicAllowed: true},
+		},
+	})
+	defer reg.UnregisterClient(uid)
+
+	cases := []thinkingTestCase{
+		{
+			name:         "interactions_body_level",
+			from:         "interactions",
+			to:           "interactions",
+			model:        "gemini-zero-mixed-model",
+			inputJSON:    `{"model":"gemini-zero-mixed-model","generation_config":{"thinking_level":"high","thinking_summaries":"auto"},"input":"hi"}`,
+			expectField:  "generation_config.thinking_level",
+			expectValue:  "high",
+			expectField2: "generation_config.thinking_summaries",
+			expectValue2: "auto",
+		},
+		{
+			name:         "interactions_suffix_budget",
+			from:         "interactions",
+			to:           "interactions",
+			model:        "gemini-zero-mixed-model(8192)",
+			inputJSON:    `{"model":"gemini-zero-mixed-model(8192)","input":"hi"}`,
+			expectField:  "generation_config.thinking_level",
+			expectValue:  "medium",
+			expectField2: "generation_config.thinking_summaries",
+			expectValue2: "auto",
 		},
 	}
 
