@@ -1,4 +1,4 @@
-package executor
+package helps
 
 import (
 	"context"
@@ -9,38 +9,38 @@ import (
 	"strings"
 
 	internalcache "github.com/router-for-me/CLIProxyAPI/v6/internal/cache"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor/helps"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
 
-type antigravityReasoningReplayScope struct {
+// AntigravityReasoningReplayScope identifies one replay cache boundary.
+type AntigravityReasoningReplayScope struct {
 	modelName  string
 	sessionKey string
 }
 
-func (s antigravityReasoningReplayScope) valid() bool {
+func (s AntigravityReasoningReplayScope) valid() bool {
 	return strings.TrimSpace(s.modelName) != "" && strings.TrimSpace(s.sessionKey) != ""
 }
 
-func antigravityReasoningReplayScopeFromPayload(modelName string, payload []byte) antigravityReasoningReplayScope {
+func antigravityReasoningReplayScopeFromPayload(modelName string, payload []byte) AntigravityReasoningReplayScope {
 	sessionID := antigravityReplaySessionIDFromPayload(payload)
 	if sessionID == "" {
-		return antigravityReasoningReplayScope{}
+		return AntigravityReasoningReplayScope{}
 	}
-	return antigravityReasoningReplayScope{
+	return AntigravityReasoningReplayScope{
 		modelName:  strings.TrimSpace(modelName),
 		sessionKey: "session:" + sessionID,
 	}
 }
 
-func antigravityReasoningReplayScopeFromRequest(ctx context.Context, modelName string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, payload []byte) antigravityReasoningReplayScope {
+func antigravityReasoningReplayScopeFromRequest(ctx context.Context, modelName string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, payload []byte) AntigravityReasoningReplayScope {
 	if value := antigravityReplayMetadataString(opts.Metadata, cliproxyexecutor.ExecutionSessionMetadataKey); value != "" {
-		return antigravityReasoningReplayScope{modelName: modelName, sessionKey: "execution:" + value}
+		return AntigravityReasoningReplayScope{modelName: modelName, sessionKey: "execution:" + value}
 	}
 	if value := antigravityReplayMetadataString(req.Metadata, cliproxyexecutor.ExecutionSessionMetadataKey); value != "" {
-		return antigravityReasoningReplayScope{modelName: modelName, sessionKey: "execution:" + value}
+		return AntigravityReasoningReplayScope{modelName: modelName, sessionKey: "execution:" + value}
 	}
 	if scope := antigravityReasoningReplayScopeFromPayload(modelName, payload); scope.valid() {
 		return scope
@@ -49,7 +49,7 @@ func antigravityReasoningReplayScopeFromRequest(ctx context.Context, modelName s
 		return scope
 	}
 	_ = ctx
-	return antigravityReasoningReplayScope{}
+	return AntigravityReasoningReplayScope{}
 }
 
 func antigravityReplayMetadataString(metadata map[string]any, key string) string {
@@ -121,14 +121,16 @@ func antigravityReasoningReplayResolveContentIndex(payload []byte, cached int) (
 	return 0, false
 }
 
-func prepareAntigravityGeminiReasoningReplayPayload(ctx context.Context, modelName string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, payload []byte) ([]byte, antigravityReasoningReplayScope, error) {
-	if !antigravityUsesReasoningReplayCache(modelName) {
-		return payload, antigravityReasoningReplayScope{}, nil
+// PrepareAntigravityGeminiReasoningReplayPayload restores cached reasoning data when required.
+func PrepareAntigravityGeminiReasoningReplayPayload(ctx context.Context, modelName string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, payload []byte) ([]byte, AntigravityReasoningReplayScope, error) {
+	if !AntigravityUsesReasoningReplayCache(modelName) {
+		return payload, AntigravityReasoningReplayScope{}, nil
 	}
 	return applyAntigravityReasoningReplayCache(ctx, modelName, req, opts, payload)
 }
 
-func clearAntigravityReasoningReplayOnInvalidSignature(ctx context.Context, scope antigravityReasoningReplayScope, statusCode int, body []byte) error {
+// ClearAntigravityReasoningReplayOnInvalidSignature removes invalid cached signatures.
+func ClearAntigravityReasoningReplayOnInvalidSignature(ctx context.Context, scope AntigravityReasoningReplayScope, statusCode int, body []byte) error {
 	if !scope.valid() {
 		return nil
 	}
@@ -142,7 +144,7 @@ func clearAntigravityReasoningReplayOnInvalidSignature(ctx context.Context, scop
 	return internalcache.DeleteAntigravityReasoningReplayItemRequired(ctx, scope.modelName, scope.sessionKey)
 }
 
-func applyAntigravityReasoningReplayCache(ctx context.Context, modelName string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, payload []byte) ([]byte, antigravityReasoningReplayScope, error) {
+func applyAntigravityReasoningReplayCache(ctx context.Context, modelName string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, payload []byte) ([]byte, AntigravityReasoningReplayScope, error) {
 	scope := antigravityReasoningReplayScopeFromRequest(ctx, modelName, req, opts, payload)
 	if !scope.valid() {
 		return payload, scope, nil
@@ -539,8 +541,9 @@ func mergeAntigravityFunctionCallPartReplay(payload []byte, itemResult gjson.Res
 	return out, changed
 }
 
-type antigravityReasoningReplayAccumulator struct {
-	scope          antigravityReasoningReplayScope
+// AntigravityReasoningReplayAccumulator collects replay items from one response stream.
+type AntigravityReasoningReplayAccumulator struct {
+	scope          AntigravityReasoningReplayScope
 	requestPayload []byte
 	items          [][]byte
 	seenFC         map[string]bool
@@ -548,12 +551,13 @@ type antigravityReasoningReplayAccumulator struct {
 	nextPartIndex  int
 }
 
-func newAntigravityReasoningReplayAccumulator(scope antigravityReasoningReplayScope, requestPayload []byte) *antigravityReasoningReplayAccumulator {
+// NewAntigravityReasoningReplayAccumulator creates a stream replay collector.
+func NewAntigravityReasoningReplayAccumulator(scope AntigravityReasoningReplayScope, requestPayload []byte) *AntigravityReasoningReplayAccumulator {
 	if !scope.valid() {
 		return nil
 	}
 	contentIndex, basePartIndex := antigravityReasoningReplayPendingModelContentIndex(requestPayload)
-	return &antigravityReasoningReplayAccumulator{
+	return &AntigravityReasoningReplayAccumulator{
 		scope:          scope,
 		requestPayload: append([]byte(nil), requestPayload...),
 		seenFC:         make(map[string]bool),
@@ -562,18 +566,18 @@ func newAntigravityReasoningReplayAccumulator(scope antigravityReasoningReplaySc
 	}
 }
 
-func (a *antigravityReasoningReplayAccumulator) ObserveSSELine(line []byte) {
+func (a *AntigravityReasoningReplayAccumulator) ObserveSSELine(line []byte) {
 	if a == nil {
 		return
 	}
-	payload := helps.JSONPayload(line)
+	payload := JSONPayload(line)
 	if payload == nil {
 		return
 	}
 	a.observeResponsePayload(payload)
 }
 
-func (a *antigravityReasoningReplayAccumulator) observeResponsePayload(payload []byte) {
+func (a *AntigravityReasoningReplayAccumulator) observeResponsePayload(payload []byte) {
 	parts := gjson.GetBytes(payload, "response.candidates.0.content.parts")
 	if !parts.IsArray() {
 		return
@@ -638,7 +642,7 @@ func buildAntigravityFunctionCallPartItem(contentIndex, partIndex int, fc gjson.
 	return raw
 }
 
-func (a *antigravityReasoningReplayAccumulator) Flush(ctx context.Context) {
+func (a *AntigravityReasoningReplayAccumulator) Flush(ctx context.Context) {
 	if a == nil || !a.scope.valid() {
 		return
 	}
@@ -651,24 +655,26 @@ func (a *antigravityReasoningReplayAccumulator) Flush(ctx context.Context) {
 	}
 }
 
-func cacheAntigravityReasoningReplayFromResponse(ctx context.Context, scope antigravityReasoningReplayScope, requestPayload, body []byte) {
+// CacheAntigravityReasoningReplayFromResponse stores replay items from a complete response.
+func CacheAntigravityReasoningReplayFromResponse(ctx context.Context, scope AntigravityReasoningReplayScope, requestPayload, body []byte) {
 	if !scope.valid() || len(body) == 0 {
 		return
 	}
-	acc := newAntigravityReasoningReplayAccumulator(scope, requestPayload)
+	acc := NewAntigravityReasoningReplayAccumulator(scope, requestPayload)
 	acc.observeResponsePayload(body)
 	acc.Flush(ctx)
 }
 
 func applyAntigravityNativeSignatureReplayIfNeeded(modelName string, payload []byte) []byte {
-	if antigravityUsesReasoningReplayCache(modelName) {
+	if AntigravityUsesReasoningReplayCache(modelName) {
 		return payload
 	}
 	// Native per-part signature replay is not on upstream/dev; Gemini uses HOME replay only.
 	return payload
 }
 
-func antigravityUsesReasoningReplayCache(modelName string) bool {
+// AntigravityUsesReasoningReplayCache reports whether a model uses HOME-style replay.
+func AntigravityUsesReasoningReplayCache(modelName string) bool {
 	modelName = strings.ToLower(modelName)
 	if strings.Contains(modelName, "claude") {
 		return false

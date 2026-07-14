@@ -1010,9 +1010,9 @@ attemptLoop:
 					usedCreditsDirect = true
 				}
 			}
-			replayScope := antigravityReasoningReplayScope{}
-			if antigravityUsesReasoningReplayCache(baseModel) {
-				requestPayload, replayScope, err = prepareAntigravityGeminiReasoningReplayPayload(ctx, baseModel, req, opts, requestPayload)
+			replayScope := helps.AntigravityReasoningReplayScope{}
+			if helps.AntigravityUsesReasoningReplayCache(baseModel) {
+				requestPayload, replayScope, err = helps.PrepareAntigravityGeminiReasoningReplayPayload(ctx, baseModel, req, opts, requestPayload)
 				if err != nil {
 					return resp, err
 				}
@@ -1094,7 +1094,7 @@ attemptLoop:
 								return resp, err
 							}
 							helps.AppendAPIResponseChunk(ctx, e.cfg, creditsBody)
-							cacheAntigravityReasoningReplayFromResponse(ctx, replayScope, requestPayload, creditsBody)
+							helps.CacheAntigravityReasoningReplayFromResponse(ctx, replayScope, requestPayload, creditsBody)
 							creditsBody = e.resolveWebSearchGroundingURLs(ctx, auth, from, originalRef.Bytes(), translatedRef.Bytes(), creditsBody)
 							reporter.Publish(ctx, helps.ParseAntigravityUsage(creditsBody))
 							var param any
@@ -1148,7 +1148,7 @@ attemptLoop:
 						continue attemptLoop
 					}
 				}
-				if errClear := clearAntigravityReasoningReplayOnInvalidSignature(ctx, replayScope, httpResp.StatusCode, bodyBytes); errClear != nil {
+				if errClear := helps.ClearAntigravityReasoningReplayOnInvalidSignature(ctx, replayScope, httpResp.StatusCode, bodyBytes); errClear != nil {
 					return resp, errClear
 				}
 				err = newAntigravityStatusErr(httpResp.StatusCode, bodyBytes)
@@ -1158,7 +1158,7 @@ attemptLoop:
 			if usedCreditsDirect {
 				markAntigravityCreditsAvailable(auth, time.Now())
 			}
-			cacheAntigravityReasoningReplayFromResponse(ctx, replayScope, requestPayload, bodyBytes)
+			helps.CacheAntigravityReasoningReplayFromResponse(ctx, replayScope, requestPayload, bodyBytes)
 			bodyBytes = e.resolveWebSearchGroundingURLs(ctx, auth, from, originalRef.Bytes(), translatedRef.Bytes(), bodyBytes)
 			reporter.Publish(ctx, helps.ParseAntigravityUsage(bodyBytes))
 			var param any
@@ -1770,9 +1770,9 @@ attemptLoop:
 					usedCreditsDirect = true
 				}
 			}
-			replayScope := antigravityReasoningReplayScope{}
-			if antigravityUsesReasoningReplayCache(baseModel) {
-				requestPayload, replayScope, err = prepareAntigravityGeminiReasoningReplayPayload(ctx, baseModel, req, opts, requestPayload)
+			replayScope := helps.AntigravityReasoningReplayScope{}
+			if helps.AntigravityUsesReasoningReplayCache(baseModel) {
+				requestPayload, replayScope, err = helps.PrepareAntigravityGeminiReasoningReplayPayload(ctx, baseModel, req, opts, requestPayload)
 				if err != nil {
 					return nil, err
 				}
@@ -1905,7 +1905,7 @@ attemptLoop:
 						continue attemptLoop
 					}
 				}
-				if errClear := clearAntigravityReasoningReplayOnInvalidSignature(ctx, replayScope, httpResp.StatusCode, bodyBytes); errClear != nil {
+				if errClear := helps.ClearAntigravityReasoningReplayOnInvalidSignature(ctx, replayScope, httpResp.StatusCode, bodyBytes); errClear != nil {
 					return nil, errClear
 				}
 				err = newAntigravityStatusErr(httpResp.StatusCode, bodyBytes)
@@ -1916,7 +1916,7 @@ attemptLoop:
 			if usedCreditsDirect {
 				markAntigravityCreditsAvailable(auth, time.Now())
 			}
-			replayAccumulator := newAntigravityReasoningReplayAccumulator(replayScope, requestPayload)
+			replayAccumulator := helps.NewAntigravityReasoningReplayAccumulator(replayScope, requestPayload)
 			helps.ReleaseRequestBodyAfterStreamEstablished(ctx, opts)
 			out := make(chan cliproxyexecutor.StreamChunk)
 			go func(resp *http.Response) {
