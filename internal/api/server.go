@@ -343,7 +343,6 @@ func (s *Server) setupRoutes() {
 	s.registerManagementSurfaceRoutes()
 	openaiHandlers := openai.NewOpenAIAPIHandler(s.handlers)
 	geminiHandlers := gemini.NewGeminiAPIHandler(s.handlers)
-	geminiCLIHandlers := gemini.NewGeminiCLIAPIHandler(s.handlers)
 	claudeCodeHandlers := claude.NewClaudeCodeAPIHandler(s.handlers)
 	openaiResponsesHandlers := openai.NewOpenAIResponsesAPIHandler(s.handlers)
 	openaiImagesHandlers := openai.NewOpenAIImagesAPIHandler(s.handlers)
@@ -391,8 +390,6 @@ func (s *Server) setupRoutes() {
 			},
 		})
 	})
-	s.engine.POST("/v1internal:method", AuthMiddleware(s.accessManager), s.requestBodyAuditMiddleware(), geminiCLIHandlers.CLIHandler)
-
 	// Management routes are registered lazily by registerManagementRoutes when a secret is configured.
 }
 
@@ -471,7 +468,6 @@ func (s *Server) registerManagementSurfaceRoutes() {
 		{config.JoinManagementAccessPath(prefix, "/management.html"), s.serveManagementControlPanel},
 		{config.JoinManagementAccessPath(prefix, "/anthropic/callback"), s.oauthCallbackHandler("anthropic")},
 		{config.JoinManagementAccessPath(prefix, "/codex/callback"), s.oauthCallbackHandler("codex")},
-		{config.JoinManagementAccessPath(prefix, "/google/callback"), s.oauthCallbackHandler("gemini")},
 		{config.JoinManagementAccessPath(prefix, "/antigravity/callback"), s.oauthCallbackHandler("antigravity")},
 	}
 
@@ -694,8 +690,8 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.POST("/vertex/import", s.mgmt.ImportVertexCredential)
 
 		mgmt.GET("/anthropic-auth-url", s.mgmt.RequestAnthropicToken)
-		mgmt.GET("/codex-auth-url", s.mgmt.RequestCodexToken)
 		mgmt.GET("/gemini-cli-auth-url", s.mgmt.RequestGeminiCLIToken)
+		mgmt.GET("/codex-auth-url", s.mgmt.RequestCodexToken)
 		mgmt.GET("/antigravity-auth-url", s.mgmt.RequestAntigravityToken)
 		mgmt.GET("/kimi-auth-url", s.mgmt.RequestKimiToken)
 		mgmt.GET("/xai-auth-url", s.mgmt.RequestXAIToken)

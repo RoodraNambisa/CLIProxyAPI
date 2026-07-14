@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -251,20 +252,28 @@ func (e *AIStudioExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth
 		AuthType:  authType,
 		AuthValue: authValue,
 	})
-	wsStream, err := e.relay.Stream(ctx, authID, wsReq)
+	streamParent := ctx
+	if streamParent == nil {
+		streamParent = context.Background()
+	}
+	streamCtx, cancelStream := context.WithCancel(streamParent)
+	wsStream, err := e.relay.Stream(streamCtx, authID, wsReq)
 	if err != nil {
+		cancelStream()
 		cleanupBodies()
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
 		return nil, err
 	}
 	firstEvent, ok := <-wsStream
 	if !ok {
+		cancelStream()
 		cleanupBodies()
 		err = fmt.Errorf("wsrelay: stream closed before start")
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
 		return nil, err
 	}
 	if firstEvent.Status > 0 && firstEvent.Status != http.StatusOK {
+		defer cancelStream()
 		defer cleanupBodies()
 		metadataLogged := false
 		if firstEvent.Status > 0 {
@@ -307,14 +316,58 @@ func (e *AIStudioExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth
 	out := make(chan cliproxyexecutor.StreamChunk)
 	go func(first wsrelay.StreamEvent) {
 		defer close(out)
+		defer cancelStream()
 		defer cleanupBodies()
 		var param any
 		metadataLogged := false
+		markerRequested := metadataBool(opts.Metadata, cliproxyexecutor.StreamTerminalMarkerMetadataKey)
+		protocolFailed := false
+		var protocolErr error
+		emittedPayload := false
+		terminalSeen := false
+		terminalReady := false
+		var streamUsage helps.StreamUsageBuffer
+		var observationBuffer []byte
+		emitStreamError := func(streamErr error) {
+			if streamErr == nil {
+				streamErr = helps.IncompleteStreamError(e.Identifier())
+			}
+			helps.RecordAPIResponseError(ctx, e.cfg, streamErr)
+			reporter.PublishFailure(ctx, streamErr)
+			select {
+			case out <- cliproxyexecutor.StreamChunk{Err: streamErr}:
+			case <-ctx.Done():
+			}
+		}
+		observeLine := func(line []byte) {
+			payload := helps.JSONPayload(line)
+			if len(payload) == 0 {
+				return
+			}
+			if helps.IsJSONStreamProtocolError(payload) {
+				protocolFailed = true
+				if protocolErr == nil {
+					protocolErr = helps.JSONStreamProtocolError(e.Identifier(), payload)
+				}
+				return
+			}
+			terminal := helps.IsGeminiStreamTerminal(payload)
+			detail, usagePresent := helps.ParseGeminiStreamUsage(line)
+			streamUsage.Observe(detail, usagePresent)
+			terminalSeen = terminalSeen || terminal
+			terminalReady = terminalReady || terminal && !helps.GeminiTerminalAwaitsUsage(payload) || terminalSeen && usagePresent
+		}
+		publishStreamUsage := func(failed bool) {
+			if failed {
+				reporter.PublishFailure(ctx)
+				return
+			}
+			streamUsage.Publish(ctx, reporter)
+			reporter.EnsurePublished(ctx)
+		}
 		processEvent := func(event wsrelay.StreamEvent) bool {
 			if event.Err != nil {
-				helps.RecordAPIResponseError(ctx, e.cfg, event.Err)
-				reporter.PublishFailure(ctx)
-				out <- cliproxyexecutor.StreamChunk{Err: fmt.Errorf("wsrelay: %v", event.Err)}
+				emitStreamError(fmt.Errorf("wsrelay: %w", event.Err))
 				return false
 			}
 			switch event.Type {
@@ -326,19 +379,52 @@ func (e *AIStudioExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth
 			case wsrelay.MessageTypeStreamChunk:
 				if len(event.Payload) > 0 {
 					helps.AppendAPIResponseChunk(ctx, e.cfg, event.Payload)
-					filtered := helps.FilterSSEUsageMetadata(event.Payload)
-					if detail, ok := helps.ParseGeminiStreamUsage(filtered); ok {
-						reporter.Publish(ctx, detail)
+					if errObserve := helps.ObserveSSELines(&observationBuffer, event.Payload, false, streamScannerBuffer, observeLine); errObserve != nil {
+						emitStreamError(fmt.Errorf("wsrelay: %w", errObserve))
+						return false
 					}
+					if protocolFailed {
+						emitStreamError(protocolErr)
+						return false
+					}
+					filtered := helps.FilterSSEUsageMetadata(event.Payload)
 					lines := sdktranslator.TranslateStream(ctx, toFormat, opts.SourceFormat, req.Model, originalRef.Bytes(), payloadRef.Bytes(), filtered, &param)
 					for i := range lines {
+						emittedPayload = emittedPayload || len(lines[i]) > 0
 						out <- cliproxyexecutor.StreamChunk{Payload: ensureColonSpacedJSON(lines[i])}
+					}
+					if markerRequested && terminalReady && !protocolFailed {
+						publishStreamUsage(false)
+						if emittedPayload {
+							out <- cliproxyexecutor.SuccessfulStreamTerminalChunk()
+						}
+						return false
 					}
 					break
 				}
 			case wsrelay.MessageTypeStreamEnd:
+				if errObserve := helps.ObserveSSELines(&observationBuffer, nil, true, streamScannerBuffer, observeLine); errObserve != nil {
+					emitStreamError(fmt.Errorf("wsrelay: %w", errObserve))
+					return false
+				}
+				if protocolFailed || !terminalSeen {
+					if protocolFailed {
+						emitStreamError(protocolErr)
+					} else {
+						emitStreamError(helps.IncompleteStreamError(e.Identifier()))
+					}
+					return false
+				}
+				if markerRequested && emittedPayload {
+					out <- cliproxyexecutor.SuccessfulStreamTerminalChunk()
+				}
+				publishStreamUsage(false)
 				return false
 			case wsrelay.MessageTypeHTTPResp:
+				if errObserve := helps.ObserveSSELines(&observationBuffer, nil, true, streamScannerBuffer, observeLine); errObserve != nil {
+					emitStreamError(fmt.Errorf("wsrelay: %w", errObserve))
+					return false
+				}
 				if !metadataLogged && event.Status > 0 {
 					helps.RecordAPIResponseMetadata(ctx, e.cfg, event.Status, event.Headers.Clone())
 					metadataLogged = true
@@ -346,16 +432,37 @@ func (e *AIStudioExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth
 				if len(event.Payload) > 0 {
 					helps.AppendAPIResponseChunk(ctx, e.cfg, event.Payload)
 				}
+				responseFailed := protocolFailed || event.Status < http.StatusOK || event.Status >= http.StatusMultipleChoices ||
+					!gjson.ValidBytes(event.Payload) || helps.IsJSONStreamProtocolError(event.Payload)
+				if responseFailed {
+					streamErr := protocolErr
+					if event.Status < http.StatusOK || event.Status >= http.StatusMultipleChoices {
+						streamErr = statusErr{code: event.Status, msg: string(event.Payload)}
+					} else if streamErr == nil && helps.IsJSONStreamProtocolError(event.Payload) {
+						streamErr = helps.JSONStreamProtocolError(e.Identifier(), event.Payload)
+					} else if streamErr == nil {
+						streamErr = helps.IncompleteStreamError(e.Identifier())
+					}
+					emitStreamError(streamErr)
+					return false
+				}
 				lines := sdktranslator.TranslateStream(ctx, toFormat, opts.SourceFormat, req.Model, originalRef.Bytes(), payloadRef.Bytes(), event.Payload, &param)
 				for i := range lines {
+					emittedPayload = emittedPayload || len(lines[i]) > 0
 					out <- cliproxyexecutor.StreamChunk{Payload: ensureColonSpacedJSON(lines[i])}
 				}
-				reporter.Publish(ctx, helps.ParseGeminiUsage(event.Payload))
+				streamUsage.Observe(helps.ParseGeminiStreamUsage(event.Payload))
+				publishStreamUsage(false)
+				if markerRequested && emittedPayload {
+					out <- cliproxyexecutor.SuccessfulStreamTerminalChunk()
+				}
 				return false
 			case wsrelay.MessageTypeError:
-				helps.RecordAPIResponseError(ctx, e.cfg, event.Err)
-				reporter.PublishFailure(ctx)
-				out <- cliproxyexecutor.StreamChunk{Err: fmt.Errorf("wsrelay: %v", event.Err)}
+				streamErr := event.Err
+				if streamErr == nil {
+					streamErr = errors.New("upstream relay error")
+				}
+				emitStreamError(fmt.Errorf("wsrelay: %w", streamErr))
 				return false
 			}
 			return true
@@ -368,6 +475,7 @@ func (e *AIStudioExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth
 				return
 			}
 		}
+		emitStreamError(helps.IncompleteStreamError(e.Identifier()))
 	}(firstEvent)
 	return &cliproxyexecutor.StreamResult{Headers: firstEvent.Headers.Clone(), Chunks: out}, nil
 }

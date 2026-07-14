@@ -130,6 +130,18 @@ func TestUploadAuthFile_BatchMultipart_InvalidJSONDoesNotOverwriteExistingFile(t
 	if rec.Code != http.StatusMultiStatus {
 		t.Fatalf("expected upload status %d, got %d with body %s", http.StatusMultiStatus, rec.Code, rec.Body.String())
 	}
+	var payload struct {
+		Failed []struct {
+			Name   string `json:"name"`
+			Status int    `json:"status"`
+		} `json:"failed"`
+	}
+	if errDecode := json.Unmarshal(rec.Body.Bytes(), &payload); errDecode != nil {
+		t.Fatalf("decode response: %v", errDecode)
+	}
+	if len(payload.Failed) != 1 || payload.Failed[0].Name != existingName || payload.Failed[0].Status != http.StatusBadRequest {
+		t.Fatalf("batch response = %#v", payload)
+	}
 
 	data, err := os.ReadFile(filepath.Join(authDir, existingName))
 	if err != nil {
@@ -145,6 +157,234 @@ func TestUploadAuthFile_BatchMultipart_InvalidJSONDoesNotOverwriteExistingFile(t
 	}
 	if string(betaData) != files[1].content {
 		t.Fatalf("expected beta auth file content %q, got %q", files[1].content, string(betaData))
+	}
+}
+
+func TestUploadAuthFile_InvalidJSONReturnsBadRequestWithoutOverwrite(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+
+	for _, test := range []struct {
+		name    string
+		request func(t *testing.T) *http.Request
+	}{
+		{
+			name: "raw",
+			request: func(t *testing.T) *http.Request {
+				t.Helper()
+				return httptest.NewRequest(http.MethodPost, "/v0/management/auth-files?name=alpha.json", bytes.NewBufferString(`{"type":"codex"`))
+			},
+		},
+		{
+			name: "multipart",
+			request: func(t *testing.T) *http.Request {
+				t.Helper()
+				var body bytes.Buffer
+				writer := multipart.NewWriter(&body)
+				part, errCreate := writer.CreateFormFile("file", "alpha.json")
+				if errCreate != nil {
+					t.Fatalf("create multipart file: %v", errCreate)
+				}
+				if _, errWrite := part.Write([]byte(`{"type":"codex"`)); errWrite != nil {
+					t.Fatalf("write multipart content: %v", errWrite)
+				}
+				if errClose := writer.Close(); errClose != nil {
+					t.Fatalf("close multipart writer: %v", errClose)
+				}
+				request := httptest.NewRequest(http.MethodPost, "/v0/management/auth-files", &body)
+				request.Header.Set("Content-Type", writer.FormDataContentType())
+				return request
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			authDir := t.TempDir()
+			const existingContent = `{"type":"codex","email":"alpha@example.com"}`
+			path := filepath.Join(authDir, "alpha.json")
+			if errWrite := os.WriteFile(path, []byte(existingContent), 0o600); errWrite != nil {
+				t.Fatalf("seed existing auth: %v", errWrite)
+			}
+			h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, coreauth.NewManager(nil, nil, nil))
+			recorder := httptest.NewRecorder()
+			ctx, _ := gin.CreateTestContext(recorder)
+			ctx.Request = test.request(t)
+
+			h.UploadAuthFile(ctx)
+
+			if recorder.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want %d; body=%s", recorder.Code, http.StatusBadRequest, recorder.Body.String())
+			}
+			data, errRead := os.ReadFile(path)
+			if errRead != nil || string(data) != existingContent {
+				t.Fatalf("existing auth = %s, error=%v", data, errRead)
+			}
+		})
+	}
+}
+
+func TestUploadAuthFile_BatchMultipart_RetiredItemFailsWithoutBlockingValidItem(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+
+	authDir := t.TempDir()
+	manager := coreauth.NewManager(nil, nil, nil)
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, manager)
+	files := []struct {
+		name    string
+		content string
+	}{
+		{name: "retired.json", content: `{"type":"gemini","email":"legacy@example.com"}`},
+		{name: "active.json", content: `{"type":"codex","email":"active@example.com"}`},
+	}
+
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	for _, file := range files {
+		part, errCreate := writer.CreateFormFile("file", file.name)
+		if errCreate != nil {
+			t.Fatalf("create multipart file: %v", errCreate)
+		}
+		if _, errWrite := part.Write([]byte(file.content)); errWrite != nil {
+			t.Fatalf("write multipart content: %v", errWrite)
+		}
+	}
+	if errClose := writer.Close(); errClose != nil {
+		t.Fatalf("close multipart writer: %v", errClose)
+	}
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	request := httptest.NewRequest(http.MethodPost, "/v0/management/auth-files", &body)
+	request.Header.Set("Content-Type", writer.FormDataContentType())
+	ctx.Request = request
+	h.UploadAuthFile(ctx)
+
+	if recorder.Code != http.StatusMultiStatus {
+		t.Fatalf("status = %d, want %d; body=%s", recorder.Code, http.StatusMultiStatus, recorder.Body.String())
+	}
+	var payload struct {
+		Uploaded int `json:"uploaded"`
+		Failed   []struct {
+			Name   string `json:"name"`
+			Status int    `json:"status"`
+		} `json:"failed"`
+	}
+	if errDecode := json.Unmarshal(recorder.Body.Bytes(), &payload); errDecode != nil {
+		t.Fatalf("decode response: %v", errDecode)
+	}
+	if payload.Uploaded != 1 || len(payload.Failed) != 1 || payload.Failed[0].Name != "retired.json" || payload.Failed[0].Status != http.StatusGone {
+		t.Fatalf("batch response = %#v", payload)
+	}
+	if _, errStat := os.Stat(filepath.Join(authDir, "retired.json")); !os.IsNotExist(errStat) {
+		t.Fatalf("retired auth file was written: %v", errStat)
+	}
+	if _, errStat := os.Stat(filepath.Join(authDir, "active.json")); errStat != nil {
+		t.Fatalf("active auth file was not written: %v", errStat)
+	}
+	if _, ok := manager.GetByID("active.json"); !ok {
+		t.Fatal("active auth was not registered")
+	}
+}
+
+func TestUploadAuthFile_BatchMultipart_InvalidNameIncludesBadRequestStatus(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	authDir := t.TempDir()
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, coreauth.NewManager(nil, nil, nil))
+
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	part, errCreate := writer.CreateFormFile("file", `C:\bad.json`)
+	if errCreate != nil {
+		t.Fatalf("create multipart file: %v", errCreate)
+	}
+	if _, errWrite := part.Write([]byte(`{"type":"codex"}`)); errWrite != nil {
+		t.Fatalf("write multipart content: %v", errWrite)
+	}
+	validPart, errValid := writer.CreateFormFile("file", "valid.json")
+	if errValid != nil {
+		t.Fatalf("create valid multipart file: %v", errValid)
+	}
+	if _, errWrite := validPart.Write([]byte(`{"type":"codex"}`)); errWrite != nil {
+		t.Fatalf("write valid multipart content: %v", errWrite)
+	}
+	if errClose := writer.Close(); errClose != nil {
+		t.Fatalf("close multipart writer: %v", errClose)
+	}
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	request := httptest.NewRequest(http.MethodPost, "/v0/management/auth-files", &body)
+	request.Header.Set("Content-Type", writer.FormDataContentType())
+	ctx.Request = request
+	h.UploadAuthFile(ctx)
+
+	if recorder.Code != http.StatusMultiStatus {
+		t.Fatalf("status = %d, want %d; body=%s", recorder.Code, http.StatusMultiStatus, recorder.Body.String())
+	}
+	var payload struct {
+		Failed []struct {
+			Status int `json:"status"`
+		} `json:"failed"`
+	}
+	if errDecode := json.Unmarshal(recorder.Body.Bytes(), &payload); errDecode != nil {
+		t.Fatalf("decode response: %v", errDecode)
+	}
+	if len(payload.Failed) != 1 || payload.Failed[0].Status != http.StatusBadRequest {
+		t.Fatalf("batch response = %#v", payload)
+	}
+}
+
+func TestUploadAuthFile_RejectsPortableWindowsVolumeNamesAsBadRequest(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+
+	tests := []struct {
+		name    string
+		request func(t *testing.T) *http.Request
+	}{
+		{
+			name: "raw",
+			request: func(t *testing.T) *http.Request {
+				t.Helper()
+				return httptest.NewRequest(http.MethodPost, "/v0/management/auth-files?name=C%3Aauth.json", bytes.NewBufferString(`{"type":"codex"}`))
+			},
+		},
+		{
+			name: "multipart",
+			request: func(t *testing.T) *http.Request {
+				t.Helper()
+				var body bytes.Buffer
+				writer := multipart.NewWriter(&body)
+				part, errCreate := writer.CreateFormFile("file", `C:auth.json`)
+				if errCreate != nil {
+					t.Fatalf("create multipart file: %v", errCreate)
+				}
+				if _, errWrite := part.Write([]byte(`{"type":"codex"}`)); errWrite != nil {
+					t.Fatalf("write multipart file: %v", errWrite)
+				}
+				if errClose := writer.Close(); errClose != nil {
+					t.Fatalf("close multipart writer: %v", errClose)
+				}
+				request := httptest.NewRequest(http.MethodPost, "/v0/management/auth-files", &body)
+				request.Header.Set("Content-Type", writer.FormDataContentType())
+				return request
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			authDir := t.TempDir()
+			h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, coreauth.NewManager(nil, nil, nil))
+			recorder := httptest.NewRecorder()
+			ctx, _ := gin.CreateTestContext(recorder)
+			ctx.Request = test.request(t)
+			h.UploadAuthFile(ctx)
+			if recorder.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want %d; body=%s", recorder.Code, http.StatusBadRequest, recorder.Body.String())
+			}
+			entries, errRead := os.ReadDir(authDir)
+			if errRead != nil || len(entries) != 0 {
+				t.Fatalf("auth dir entries = %#v, error=%v; want empty", entries, errRead)
+			}
+		})
 	}
 }
 

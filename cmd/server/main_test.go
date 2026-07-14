@@ -1,6 +1,7 @@
 package main
 
 import (
+	"flag"
 	"os"
 	"path/filepath"
 	"testing"
@@ -45,4 +46,31 @@ func TestResolveDefaultConfigPath(t *testing.T) {
 			t.Fatalf("resolveDefaultConfigPath() = %s, want %s", got, want)
 		}
 	})
+}
+
+func TestDeprecatedGeminiCLIFlagsError(t *testing.T) {
+	tests := []struct {
+		name      string
+		args      []string
+		wantError bool
+	}{
+		{name: "no retired flags"},
+		{name: "retired login", args: []string{"--login"}, wantError: true},
+		{name: "explicitly disabled retired login", args: []string{"--login=false"}},
+		{name: "retired project", args: []string{"--project_id=legacy-project"}, wantError: true},
+		{name: "empty retired project", args: []string{"--project_id="}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			flagSet := flag.NewFlagSet(tt.name, flag.ContinueOnError)
+			flagSet.Bool("login", false, "")
+			flagSet.String("project_id", "", "")
+			if errParse := flagSet.Parse(tt.args); errParse != nil {
+				t.Fatalf("Parse() error = %v", errParse)
+			}
+			if got := deprecatedGeminiCLIFlagsError(flagSet); (got != nil) != tt.wantError {
+				t.Fatalf("deprecatedGeminiCLIFlagsError() error = %v, wantError %t", got, tt.wantError)
+			}
+		})
+	}
 }

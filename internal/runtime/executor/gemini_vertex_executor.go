@@ -684,25 +684,63 @@ func (e *GeminiVertexExecutor) executeStreamWithServiceAccount(ctx context.Conte
 		scanner := bufio.NewScanner(httpResp.Body)
 		scanner.Buffer(nil, streamScannerBuffer)
 		var param any
+		markerRequested := metadataBool(opts.Metadata, cliproxyexecutor.StreamTerminalMarkerMetadataKey)
+		protocolFailed := false
+		var protocolErr error
+		terminalSeen := false
 		for scanner.Scan() {
 			line := scanner.Bytes()
 			helps.AppendAPIResponseChunk(ctx, e.cfg, line)
-			if detail, ok := helps.ParseGeminiStreamUsage(line); ok {
-				reporter.Publish(ctx, detail)
+			payload := helps.JSONPayload(line)
+			if len(payload) > 0 && helps.IsJSONStreamProtocolError(payload) {
+				protocolFailed = true
+				if protocolErr == nil {
+					protocolErr = helps.JSONStreamProtocolError("vertex", payload)
+				}
+			}
+			terminal := helps.IsGeminiStreamTerminal(payload) ||
+				(isImagenModel(baseModel) && !protocolFailed && gjson.GetBytes(payload, "predictions").IsArray())
+			detail, usagePresent := helps.ParseGeminiStreamUsage(line)
+			if usagePresent {
+				reporter.Observe(detail)
 			}
 			lines := sdktranslator.TranslateStream(ctx, to, from, req.Model, originalRef.Bytes(), bodyRef.Bytes(), bytes.Clone(line), &param)
 			for i := range lines {
 				out <- cliproxyexecutor.StreamChunk{Payload: lines[i]}
 			}
-		}
-		lines := sdktranslator.TranslateStream(ctx, to, from, req.Model, originalRef.Bytes(), bodyRef.Bytes(), []byte("[DONE]"), &param)
-		for i := range lines {
-			out <- cliproxyexecutor.StreamChunk{Payload: lines[i]}
+			terminalSeen = terminalSeen || terminal
+			terminalReady := terminal && (isImagenModel(baseModel) || !helps.GeminiTerminalAwaitsUsage(payload)) || terminalSeen && usagePresent
+			if markerRequested && terminalReady && !protocolFailed {
+				reporter.EnsurePublished(ctx)
+				lines = sdktranslator.TranslateStream(ctx, to, from, req.Model, originalRef.Bytes(), bodyRef.Bytes(), []byte("[DONE]"), &param)
+				for i := range lines {
+					out <- cliproxyexecutor.StreamChunk{Payload: lines[i]}
+				}
+				out <- cliproxyexecutor.SuccessfulStreamTerminalChunk()
+				return
+			}
 		}
 		if errScan := scanner.Err(); errScan != nil {
 			helps.RecordAPIResponseError(ctx, e.cfg, errScan)
 			reporter.PublishFailure(ctx)
 			out <- cliproxyexecutor.StreamChunk{Err: errScan}
+		} else if terminalSeen && !protocolFailed {
+			lines := sdktranslator.TranslateStream(ctx, to, from, req.Model, originalRef.Bytes(), bodyRef.Bytes(), []byte("[DONE]"), &param)
+			for i := range lines {
+				out <- cliproxyexecutor.StreamChunk{Payload: lines[i]}
+			}
+			reporter.EnsurePublished(ctx)
+			if markerRequested {
+				out <- cliproxyexecutor.SuccessfulStreamTerminalChunk()
+			}
+		} else {
+			streamErr := protocolErr
+			if streamErr == nil {
+				streamErr = helps.IncompleteStreamError("vertex")
+			}
+			helps.RecordAPIResponseError(ctx, e.cfg, streamErr)
+			reporter.PublishFailure(ctx, streamErr)
+			out <- cliproxyexecutor.StreamChunk{Err: streamErr}
 		}
 	}()
 	return &cliproxyexecutor.StreamResult{Headers: httpResp.Header.Clone(), Chunks: out}, nil
@@ -831,25 +869,63 @@ func (e *GeminiVertexExecutor) executeStreamWithAPIKey(ctx context.Context, auth
 		scanner := bufio.NewScanner(httpResp.Body)
 		scanner.Buffer(nil, streamScannerBuffer)
 		var param any
+		markerRequested := metadataBool(opts.Metadata, cliproxyexecutor.StreamTerminalMarkerMetadataKey)
+		protocolFailed := false
+		var protocolErr error
+		terminalSeen := false
 		for scanner.Scan() {
 			line := scanner.Bytes()
 			helps.AppendAPIResponseChunk(ctx, e.cfg, line)
-			if detail, ok := helps.ParseGeminiStreamUsage(line); ok {
-				reporter.Publish(ctx, detail)
+			payload := helps.JSONPayload(line)
+			if len(payload) > 0 && helps.IsJSONStreamProtocolError(payload) {
+				protocolFailed = true
+				if protocolErr == nil {
+					protocolErr = helps.JSONStreamProtocolError("vertex", payload)
+				}
+			}
+			terminal := helps.IsGeminiStreamTerminal(payload) ||
+				(isImagenModel(baseModel) && !protocolFailed && gjson.GetBytes(payload, "predictions").IsArray())
+			detail, usagePresent := helps.ParseGeminiStreamUsage(line)
+			if usagePresent {
+				reporter.Observe(detail)
 			}
 			lines := sdktranslator.TranslateStream(ctx, to, from, req.Model, originalRef.Bytes(), bodyRef.Bytes(), bytes.Clone(line), &param)
 			for i := range lines {
 				out <- cliproxyexecutor.StreamChunk{Payload: lines[i]}
 			}
-		}
-		lines := sdktranslator.TranslateStream(ctx, to, from, req.Model, originalRef.Bytes(), bodyRef.Bytes(), []byte("[DONE]"), &param)
-		for i := range lines {
-			out <- cliproxyexecutor.StreamChunk{Payload: lines[i]}
+			terminalSeen = terminalSeen || terminal
+			terminalReady := terminal && (isImagenModel(baseModel) || !helps.GeminiTerminalAwaitsUsage(payload)) || terminalSeen && usagePresent
+			if markerRequested && terminalReady && !protocolFailed {
+				reporter.EnsurePublished(ctx)
+				lines = sdktranslator.TranslateStream(ctx, to, from, req.Model, originalRef.Bytes(), bodyRef.Bytes(), []byte("[DONE]"), &param)
+				for i := range lines {
+					out <- cliproxyexecutor.StreamChunk{Payload: lines[i]}
+				}
+				out <- cliproxyexecutor.SuccessfulStreamTerminalChunk()
+				return
+			}
 		}
 		if errScan := scanner.Err(); errScan != nil {
 			helps.RecordAPIResponseError(ctx, e.cfg, errScan)
 			reporter.PublishFailure(ctx)
 			out <- cliproxyexecutor.StreamChunk{Err: errScan}
+		} else if terminalSeen && !protocolFailed {
+			lines := sdktranslator.TranslateStream(ctx, to, from, req.Model, originalRef.Bytes(), bodyRef.Bytes(), []byte("[DONE]"), &param)
+			for i := range lines {
+				out <- cliproxyexecutor.StreamChunk{Payload: lines[i]}
+			}
+			reporter.EnsurePublished(ctx)
+			if markerRequested {
+				out <- cliproxyexecutor.SuccessfulStreamTerminalChunk()
+			}
+		} else {
+			streamErr := protocolErr
+			if streamErr == nil {
+				streamErr = helps.IncompleteStreamError("vertex")
+			}
+			helps.RecordAPIResponseError(ctx, e.cfg, streamErr)
+			reporter.PublishFailure(ctx, streamErr)
+			out <- cliproxyexecutor.StreamChunk{Err: streamErr}
 		}
 	}()
 	return &cliproxyexecutor.StreamResult{Headers: httpResp.Header.Clone(), Chunks: out}, nil

@@ -2,10 +2,33 @@ package vertex
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
 )
+
+func TestVertexCredentialStorageSaveTokenToFile_InvalidStorageDoesNotCreateDirectory(t *testing.T) {
+	tests := []struct {
+		name    string
+		storage *VertexCredentialStorage
+	}{
+		{name: "nil storage"},
+		{name: "empty service account", storage: &VertexCredentialStorage{}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			parent := filepath.Join(t.TempDir(), "missing")
+			path := filepath.Join(parent, "vertex.json")
+			if errSave := test.storage.SaveTokenToFile(path); errSave == nil {
+				t.Fatal("SaveTokenToFile() accepted invalid storage")
+			}
+			if _, errStat := os.Stat(parent); !errors.Is(errStat, os.ErrNotExist) {
+				t.Fatalf("invalid storage created parent directory: %v", errStat)
+			}
+		})
+	}
+}
 
 func TestVertexCredentialStorageSaveTokenToFile_MergesMetadata(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "vertex.json")

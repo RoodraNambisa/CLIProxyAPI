@@ -32,11 +32,23 @@ const (
 	SelectionAttemptMetadataKey = "selection_attempt"
 	// SelectedAuthMetadataKey stores the auth ID selected by the scheduler.
 	SelectedAuthMetadataKey = "selected_auth_id"
+	// SelectedAuthInstanceMetadataKey stores the immutable runtime instance selected by the scheduler.
+	SelectedAuthInstanceMetadataKey = "selected_auth_instance_id"
+	// SelectedAuthInstanceRetirementMetadataKey carries the selected instance retirement state.
+	SelectedAuthInstanceRetirementMetadataKey = "selected_auth_instance_retirement"
+	// StreamTerminalMarkerMetadataKey asks compatible executors to emit an internal
+	// zero-payload completion marker before closing a successful stream.
+	StreamTerminalMarkerMetadataKey = "stream_terminal_marker"
 	// SelectedAuthCallbackMetadataKey carries an optional callback invoked with the selected auth ID.
 	SelectedAuthCallbackMetadataKey = "selected_auth_callback"
 	// ExecutionSessionMetadataKey identifies a long-lived downstream execution session.
 	ExecutionSessionMetadataKey = "execution_session_id"
 )
+
+// AuthInstanceRetirement reports whether a selected runtime auth instance was retired.
+type AuthInstanceRetirement interface {
+	Retired() bool
+}
 
 // Request encapsulates the translated payload that will be sent to a provider executor.
 type Request struct {

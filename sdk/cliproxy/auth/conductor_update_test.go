@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -9,6 +10,47 @@ import (
 
 type countingHook struct {
 	results int
+}
+
+type orderedAuthUpdateHook struct {
+	NoopHook
+	mu     sync.Mutex
+	labels []string
+}
+
+func (h *orderedAuthUpdateHook) OnAuthRegistered(_ context.Context, auth *Auth) {
+	h.record(auth)
+}
+
+func (h *orderedAuthUpdateHook) OnAuthUpdated(_ context.Context, auth *Auth) {
+	h.record(auth)
+}
+
+func (h *orderedAuthUpdateHook) record(auth *Auth) {
+	if h == nil || auth == nil {
+		return
+	}
+	h.mu.Lock()
+	h.labels = append(h.labels, auth.Label)
+	h.mu.Unlock()
+}
+
+func (h *orderedAuthUpdateHook) Labels() []string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return append([]string(nil), h.labels...)
+}
+
+type blockingAuthCleanupExecutor struct {
+	schedulerProviderTestExecutor
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (e *blockingAuthCleanupExecutor) CloseAuthInstanceExecutionSessions(string, string, string) {
+	e.once.Do(func() { close(e.started) })
+	<-e.release
 }
 
 func (h *countingHook) OnAuthRegistered(context.Context, *Auth) {}
@@ -517,5 +559,62 @@ func TestManager_Update_ReentrantHookDoesNotDeadlock(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("hook Delete did not complete")
+	}
+}
+
+func TestManagerReplacementSkipsStaleLifecycleNotification(t *testing.T) {
+	for _, testCase := range []struct {
+		name    string
+		replace func(*Manager, context.Context, *Auth) (*Auth, error)
+	}{
+		{name: "register", replace: (*Manager).Register},
+		{name: "update", replace: (*Manager).Update},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			const authID = "stale-hook-auth"
+			manager := NewManager(nil, nil, nil)
+			blocker := &blockingAuthCleanupExecutor{
+				schedulerProviderTestExecutor: schedulerProviderTestExecutor{provider: "initial"},
+				started:                       make(chan struct{}),
+				release:                       make(chan struct{}),
+			}
+			manager.RegisterExecutor(blocker)
+			manager.RegisterExecutor(schedulerProviderTestExecutor{provider: "middle"})
+			manager.RegisterExecutor(schedulerProviderTestExecutor{provider: "latest"})
+			if _, errRegister := manager.Register(t.Context(), &Auth{ID: authID, Provider: "initial", Label: "initial"}); errRegister != nil {
+				t.Fatalf("Register() error = %v", errRegister)
+			}
+
+			hook := &orderedAuthUpdateHook{}
+			manager.SetHook(hook)
+			middleDone := make(chan error, 1)
+			go func() {
+				_, errReplace := testCase.replace(manager, t.Context(), &Auth{ID: authID, Provider: "middle", Label: "middle"})
+				middleDone <- errReplace
+			}()
+			select {
+			case <-blocker.started:
+			case <-time.After(5 * time.Second):
+				t.Fatal("middle replacement did not enter cleanup")
+			}
+
+			if _, errReplace := testCase.replace(manager, t.Context(), &Auth{ID: authID, Provider: "latest", Label: "latest"}); errReplace != nil {
+				t.Fatalf("latest replacement error = %v", errReplace)
+			}
+			close(blocker.release)
+			select {
+			case errReplace := <-middleDone:
+				if errReplace != nil {
+					t.Fatalf("middle replacement error = %v", errReplace)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("middle replacement remained blocked")
+			}
+
+			labels := hook.Labels()
+			if len(labels) != 1 || labels[0] != "latest" {
+				t.Fatalf("update hook labels = %v, want [latest]", labels)
+			}
+		})
 	}
 }

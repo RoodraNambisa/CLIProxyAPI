@@ -25,6 +25,7 @@ const oauthSessionCancelledStatus = "Authentication cancelled"
 var (
 	errInvalidOAuthState      = errors.New("invalid oauth state")
 	errUnsupportedOAuthFlow   = errors.New("unsupported oauth provider")
+	errRetiredGeminiCLIOAuth  = errors.New("Gemini CLI OAuth is no longer supported")
 	errOAuthSessionNotPending = errors.New("oauth session is not pending")
 )
 
@@ -279,8 +280,8 @@ func NormalizeOAuthProvider(provider string) (string, error) {
 		return "anthropic", nil
 	case "codex", "openai":
 		return "codex", nil
-	case "gemini", "google":
-		return "gemini", nil
+	case "gemini", "google", "gemini-cli":
+		return "", errRetiredGeminiCLIOAuth
 	case "antigravity", "anti-gravity":
 		return "antigravity", nil
 	case "xai", "x-ai", "x.ai", "grok":

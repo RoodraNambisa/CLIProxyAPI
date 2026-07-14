@@ -311,26 +311,59 @@ func (e *KimiExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 		scanner.Buffer(nil, 1_048_576) // 1MB
 		var param any
 		var streamUsage helps.StreamUsageBuffer
+		markerRequested := metadataBool(opts.Metadata, cliproxyexecutor.StreamTerminalMarkerMetadataKey)
+		protocolFailed := false
+		var protocolErr error
+		terminalSeen := false
 		for scanner.Scan() {
 			line := scanner.Bytes()
 			helps.AppendAPIResponseChunk(ctx, e.cfg, line)
 			streamUsage.ObserveOpenAIStream(line)
+			terminal := helps.IsOpenAIStreamTerminal(line)
+			terminalSeen = terminalSeen || terminal
+			if !terminal {
+				payload := helps.JSONPayload(line)
+				if len(payload) > 0 && helps.IsJSONStreamProtocolError(payload) {
+					protocolFailed = true
+					if protocolErr == nil {
+						protocolErr = helps.JSONStreamProtocolError("kimi", payload)
+					}
+				}
+			}
 			chunks := sdktranslator.TranslateStream(ctx, to, from, req.Model, originalRef.Bytes(), bodyRef.Bytes(), bytes.Clone(line), &param)
 			for i := range chunks {
 				out <- cliproxyexecutor.StreamChunk{Payload: chunks[i]}
 			}
-		}
-		streamUsage.Publish(ctx, reporter)
-		doneChunks := sdktranslator.TranslateStream(ctx, to, from, req.Model, originalRef.Bytes(), bodyRef.Bytes(), []byte("[DONE]"), &param)
-		for i := range doneChunks {
-			out <- cliproxyexecutor.StreamChunk{Payload: doneChunks[i]}
+			if markerRequested && terminal && !protocolFailed && scanner.Err() == nil {
+				streamUsage.Publish(ctx, reporter)
+				reporter.EnsurePublished(ctx)
+				out <- cliproxyexecutor.SuccessfulStreamTerminalChunk()
+				return
+			}
 		}
 		if errScan := scanner.Err(); errScan != nil {
 			helps.RecordAPIResponseError(ctx, e.cfg, errScan)
 			reporter.PublishFailure(ctx)
 			out <- cliproxyexecutor.StreamChunk{Err: errScan}
+		} else if terminalSeen && !protocolFailed {
+			streamUsage.Publish(ctx, reporter)
+			doneChunks := sdktranslator.TranslateStream(ctx, to, from, req.Model, originalRef.Bytes(), bodyRef.Bytes(), []byte("[DONE]"), &param)
+			for i := range doneChunks {
+				out <- cliproxyexecutor.StreamChunk{Payload: doneChunks[i]}
+			}
+			reporter.EnsurePublished(ctx)
+			if markerRequested {
+				out <- cliproxyexecutor.SuccessfulStreamTerminalChunk()
+			}
+		} else {
+			streamErr := protocolErr
+			if streamErr == nil {
+				streamErr = helps.IncompleteStreamError("kimi")
+			}
+			helps.RecordAPIResponseError(ctx, e.cfg, streamErr)
+			reporter.PublishFailure(ctx, streamErr)
+			out <- cliproxyexecutor.StreamChunk{Err: streamErr}
 		}
-		reporter.EnsurePublished(ctx)
 	}()
 	return &cliproxyexecutor.StreamResult{Headers: httpResp.Header.Clone(), Chunks: out}, nil
 }

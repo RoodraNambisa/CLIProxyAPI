@@ -24,12 +24,13 @@ func defaultWatcherFactory(configPath, authDir string, reload func(*config.Confi
 		setConfig: func(cfg *config.Config) {
 			w.SetConfig(cfg)
 		},
-		snapshotAuths: func() []*coreauth.Auth { return w.SnapshotCoreAuths() },
+		snapshotAuths:        func() []*coreauth.Auth { return w.SnapshotCoreAuths() },
+		seedCurrentFileAuths: func(auths []*coreauth.Auth) { w.SeedCurrentFileAuths(auths) },
 		setUpdateQueue: func(queue chan<- watcher.AuthUpdate) {
 			w.SetAuthUpdateQueue(queue)
 		},
-		dispatchRuntimeUpdate: func(update watcher.AuthUpdate) bool {
-			return w.DispatchRuntimeAuthUpdate(update)
+		dispatchRuntimeUpdate: func(update watcher.AuthUpdate) watcher.RuntimeAuthUpdateResult {
+			return w.DispatchRuntimeAuthUpdateResult(update)
 		},
 	}, nil
 }

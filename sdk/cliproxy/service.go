@@ -17,6 +17,7 @@ import (
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/api"
 	internalcodex "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/codex"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/authfileguard"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor"
 	internalusage "github.com/router-for-me/CLIProxyAPI/v6/internal/usage"
@@ -159,7 +160,6 @@ func (s *Service) RegisterUsagePlugin(plugin sdkusage.Plugin) {
 func newDefaultAuthManager() *sdkAuth.Manager {
 	return sdkAuth.NewManager(
 		sdkAuth.GetTokenStore(),
-		sdkAuth.NewGeminiAuthenticator(),
 		sdkAuth.NewCodexAuthenticator(),
 		sdkAuth.NewClaudeAuthenticator(),
 		sdkAuth.NewXAIAuthenticator(),
@@ -446,6 +446,26 @@ func authUpdateDeletionPath(auth *coreauth.Auth, authDir string) string {
 		return ""
 	}
 	return resolveAuthFilePath(auth, authDir)
+}
+
+func sameAuthFilePath(left, right string) bool {
+	left = authfileguard.PathIdentity(left)
+	right = authfileguard.PathIdentity(right)
+	return left != "" && left == right
+}
+
+func authDeleteUpdateMatchesCurrentGeneration(update, current *coreauth.Auth) bool {
+	if update == nil || update.Attributes == nil {
+		return true
+	}
+	expectedHash := strings.TrimSpace(update.Attributes[coreauth.SourceHashAttributeKey])
+	if expectedHash == "" {
+		return true
+	}
+	if current == nil || current.Attributes == nil {
+		return false
+	}
+	return strings.TrimSpace(current.Attributes[coreauth.SourceHashAttributeKey]) == expectedHash
 }
 
 func authUpdateIsMaintenanceDelete(auth *coreauth.Auth) bool {
@@ -1493,8 +1513,14 @@ func (s *Service) emitAuthUpdate(ctx context.Context, update watcher.AuthUpdate)
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if s.watcher != nil && s.watcher.DispatchRuntimeAuthUpdate(update) {
-		return
+	if s.watcher != nil {
+		result := s.watcher.dispatchRuntimeAuthUpdateResult(update)
+		if result.Enqueued || result.Consumed {
+			return
+		}
+		if result.Fallback != nil {
+			update = *result.Fallback
+		}
 	}
 	if s.authUpdates != nil {
 		select {
@@ -1541,19 +1567,23 @@ func (s *Service) handleAuthUpdate(ctx context.Context, update watcher.AuthUpdat
 			return
 		}
 		if deletedPath != "" {
+			matchesDelete := func(current *coreauth.Auth) bool {
+				if current == nil || !sameAuthFilePath(resolveAuthFilePath(current, strings.TrimSpace(cfg.AuthDir)), deletedPath) {
+					return false
+				}
+				if !authDeleteUpdateMatchesCurrentGeneration(update.Auth, current) {
+					return false
+				}
+				return !authUpdateIsMaintenanceDelete(update.Auth) || authMaintenancePendingDelete(current)
+			}
 			current, ok := s.coreManager.GetByID(id)
-			if !ok || current == nil {
-				return
-			}
-			if resolveAuthFilePath(current, strings.TrimSpace(cfg.AuthDir)) != deletedPath {
-				return
-			}
-			if authUpdateIsMaintenanceDelete(update.Auth) && !authMaintenancePendingDelete(current) {
+			if !ok || !matchesDelete(current) {
 				return
 			}
 			indexes := s.usageAuthIndexesForIDs([]string{id})
 			ctx = coreauth.WithSkipPersist(ctx)
-			if errDelete := s.deleteCoreAuth(ctx, id); errDelete != nil {
+			deleted, errDelete := s.coreManager.DeleteIf(ctx, id, matchesDelete)
+			if errDelete != nil || !deleted {
 				return
 			}
 			s.removeUsageStatisticsForAuthIndexes(indexes, "auth delete")
@@ -1658,6 +1688,29 @@ func (s *Service) applyCoreAuthAddOrUpdate(ctx context.Context, auth *coreauth.A
 	if s == nil || s.coreManager == nil || auth == nil || auth.ID == "" {
 		return
 	}
+	s.cfgMu.RLock()
+	authDir := ""
+	if s.cfg != nil {
+		authDir = strings.TrimSpace(s.cfg.AuthDir)
+	}
+	s.cfgMu.RUnlock()
+	path := resolveAuthFilePath(auth, authDir)
+	unlockPath := func() {}
+	pathLocked := false
+	if path != "" {
+		unlockPath = authfileguard.Lock(path)
+		pathLocked = true
+		ctx = coreauth.WithSkipPersist(ctx)
+	}
+	defer func() {
+		if pathLocked {
+			unlockPath()
+		}
+	}()
+	if !authFileUpdateStillCurrentAtPath(auth, path) {
+		log.Debugf("ignoring stale auth file update for %s", auth.ID)
+		return
+	}
 	auth = auth.Clone()
 	s.ensureExecutorsForAuth(auth)
 
@@ -1680,6 +1733,10 @@ func (s *Service) applyCoreAuthAddOrUpdate(ctx context.Context, auth *coreauth.A
 	} else {
 		_, err = s.coreManager.Register(ctx, auth)
 	}
+	if pathLocked {
+		unlockPath()
+		pathLocked = false
+	}
 	if err != nil {
 		log.Errorf("failed to %s auth %s: %v", op, auth.ID, err)
 		current, ok := s.coreManager.GetByID(auth.ID)
@@ -1698,6 +1755,33 @@ func (s *Service) applyCoreAuthAddOrUpdate(ctx context.Context, auth *coreauth.A
 	}
 }
 
+func authFileUpdateStillCurrent(auth *coreauth.Auth, authDir string) bool {
+	path := resolveAuthFilePath(auth, authDir)
+	return authFileUpdateStillCurrentAtPath(auth, path)
+}
+
+func authFileUpdateStillCurrentAtPath(auth *coreauth.Auth, path string) bool {
+	if path == "" {
+		return true
+	}
+	data, errRead := sdkAuth.ReadAuthFileSnapshot(path)
+	if errRead != nil || len(data) == 0 || coreauth.IsRetiredGeminiCLIAuthFileData(data) {
+		return false
+	}
+	expectedHash := ""
+	if auth.Attributes != nil {
+		expectedHash = strings.TrimSpace(auth.Attributes[coreauth.SourceHashAttributeKey])
+	}
+	if expectedHash == "" {
+		return true
+	}
+	current := &coreauth.Auth{}
+	if errSync := coreauth.SyncPersistedMetadataAndSourceHash(current, data); errSync != nil || current.Attributes == nil {
+		return false
+	}
+	return strings.TrimSpace(current.Attributes[coreauth.SourceHashAttributeKey]) == expectedHash
+}
+
 func (s *Service) applyCoreAuthRemoval(ctx context.Context, id string) {
 	s.applyCoreAuthRemovalWithReason(ctx, id, "", false)
 }
@@ -1713,16 +1797,9 @@ func (s *Service) deleteCoreAuth(ctx context.Context, id string) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	provider := ""
-	if existing, ok := s.coreManager.GetByID(id); ok && existing != nil {
-		provider = strings.TrimSpace(existing.Provider)
-	}
 	if err := s.coreManager.Delete(ctx, id); err != nil {
 		log.Errorf("failed to delete auth %s: %v", id, err)
 		return err
-	}
-	if strings.EqualFold(provider, "xai") {
-		executor.CloseXAIWebsocketSessionsForAuthID(id, "auth_removed")
 	}
 	return nil
 }
@@ -1791,11 +1868,7 @@ func (s *Service) applyCoreAuthRemovalWithReason(ctx context.Context, id string,
 	}
 	GlobalModelRegistry().UnregisterClient(id)
 	if strings.EqualFold(strings.TrimSpace(existing.Provider), "codex") {
-		executor.CloseCodexWebsocketSessionsForAuthID(existing.ID, "auth_removed")
 		s.ensureExecutorsForAuth(existing)
-	}
-	if strings.EqualFold(strings.TrimSpace(existing.Provider), "xai") {
-		executor.CloseXAIWebsocketSessionsForAuthID(existing.ID, "auth_removed")
 	}
 	return true
 }
@@ -2046,8 +2119,6 @@ func (s *Service) ensureExecutorsForAuthWithMode(a *coreauth.Auth, forceReplace 
 		s.coreManager.RegisterExecutor(executor.NewGeminiExecutor(s.cfg))
 	case "vertex":
 		s.coreManager.RegisterExecutor(executor.NewGeminiVertexExecutor(s.cfg))
-	case "gemini-cli":
-		s.coreManager.RegisterExecutor(executor.NewGeminiCLIExecutor(s.cfg))
 	case "aistudio":
 		if s.wsGateway != nil {
 			s.coreManager.RegisterExecutor(executor.NewAIStudioExecutor(s.cfg, a.ID, s.wsGateway))
@@ -2131,6 +2202,9 @@ func (s *Service) Run(ctx context.Context) error {
 	}
 
 	s.applyRetryConfig(s.cfg)
+	if errQuarantine := watcher.LoadAuthDeleteQuarantine(s.configPath, s.cfg.AuthDir); errQuarantine != nil {
+		return fmt.Errorf("cliproxy: load auth deletion quarantine: %w", errQuarantine)
+	}
 
 	if s.coreManager != nil {
 		if errLoad := s.coreManager.Load(ctx); errLoad != nil {
@@ -2382,6 +2456,9 @@ func (s *Service) Run(ctx context.Context) error {
 		watcherWrapper.SetAuthUpdateQueue(s.authUpdates)
 	}
 	watcherWrapper.SetConfig(s.cfg)
+	if s.coreManager != nil {
+		watcherWrapper.SeedCurrentFileAuths(s.coreManager.List())
+	}
 
 	watcherCtx, watcherCancel := context.WithCancel(context.Background())
 	s.watcherCancel = watcherCancel
@@ -2517,12 +2594,6 @@ func (s *Service) registerModelsForAuth(a *coreauth.Auth) {
 			authKind = "apikey"
 		}
 	}
-	if a.Attributes != nil {
-		if v := strings.TrimSpace(a.Attributes["gemini_virtual_primary"]); strings.EqualFold(v, "true") {
-			GlobalModelRegistry().UnregisterClient(a.ID)
-			return
-		}
-	}
 	// Unregister legacy client ID (if present) to avoid double counting
 	if a.Runtime != nil {
 		if idGetter, ok := a.Runtime.(interface{ GetClientID() string }); ok {
@@ -2568,9 +2639,6 @@ func (s *Service) registerModelsForAuth(a *coreauth.Auth) {
 				excluded = entry.ExcludedModels
 			}
 		}
-		models = applyExcludedModels(models, excluded)
-	case "gemini-cli":
-		models = registry.GetGeminiCLIModels()
 		models = applyExcludedModels(models, excluded)
 	case "aistudio":
 		models = registry.GetAIStudioModels()

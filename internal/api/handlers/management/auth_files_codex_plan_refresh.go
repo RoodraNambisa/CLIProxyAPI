@@ -466,6 +466,17 @@ func (h *Handler) refreshSingleCodexPlanType(manager *coreauth.Manager, auth *co
 		AuthID:         strings.TrimSpace(auth.ID),
 		PlanTypeBefore: effectiveCodexPlanType(auth),
 	}
+	retired, errRetired := h.authBackedByRetiredGeminiCLIFile(auth)
+	if errRetired != nil {
+		result.Status = codexPlanTypeRefreshStatusFailed
+		result.Error = "unable to verify auth file"
+		return result
+	}
+	if retired {
+		result.Status = codexPlanTypeRefreshStatusFailed
+		result.Error = errGeminiCLIAuthGone.Error()
+		return result
+	}
 
 	accountID := internalcodex.EffectiveAccountID(auth.Metadata)
 	if accountID == "" {

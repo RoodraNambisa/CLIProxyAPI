@@ -46,4 +46,10 @@ func (s *memoryAuthStore) Delete(_ context.Context, id string) error {
 	return nil
 }
 
+func (s *memoryAuthStore) DeleteIfSourceHashMatches(ctx context.Context, id, _ string) error {
+	return s.Delete(ctx, id)
+}
+
+func (s *memoryAuthStore) FinalizeAuthFileDeletion(context.Context, string) error { return nil }
+
 func (s *memoryAuthStore) SetBaseDir(string) {}

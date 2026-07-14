@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"mime/multipart"
 	"net"
 	"net/http"
@@ -23,33 +24,30 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/auth/antigravity"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/auth/claude"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/auth/codex"
-	geminiAuth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/gemini"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/auth/kimi"
 	xaiauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/xai"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/authfileguard"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/misc"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
+	internalstore "github.com/router-for-me/CLIProxyAPI/v6/internal/store"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/watcher"
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v6/sdk/auth"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
-	"golang.org/x/oauth2"
-	"golang.org/x/oauth2/google"
 )
 
 var lastRefreshKeys = []string{"last_refresh", "lastRefresh", "last_refreshed_at", "lastRefreshedAt"}
 
 const (
 	anthropicCallbackPort = 54545
-	geminiCallbackPort    = 8085
 	codexCallbackPort     = 1455
-	geminiCLIEndpoint     = "https://cloudcode-pa.googleapis.com"
-	geminiCLIVersion      = "v1internal"
 )
 
 type callbackForwarder struct {
@@ -59,10 +57,14 @@ type callbackForwarder struct {
 }
 
 var (
-	callbackForwardersMu  sync.Mutex
-	callbackForwarders    = make(map[int]*callbackForwarder)
-	errAuthFileMustBeJSON = errors.New("auth file must be .json")
-	errAuthFileNotFound   = errors.New("auth file not found")
+	callbackForwardersMu   sync.Mutex
+	callbackForwarders     = make(map[int]*callbackForwarder)
+	errAuthFileMustBeJSON  = errors.New("auth file must be .json")
+	errInvalidAuthFileData = errors.New("invalid auth file")
+	errAuthFileNotFound    = errors.New("auth file not found")
+	errInvalidAuthFileName = errors.New("invalid auth file name")
+	errGeminiCLIAuthGone   = errors.New("Gemini CLI credentials are no longer supported")
+	errAuthFileQuarantined = errors.New("auth file deletion is still pending")
 )
 
 func extractLastRefreshTimestamp(meta map[string]any) (time.Time, bool) {
@@ -250,8 +252,41 @@ func (h *Handler) ListAuthFiles(c *gin.Context) {
 	}
 	auths := h.authManager.List()
 	files := make([]gin.H, 0, len(auths))
+	managedEntryIndexes := make(map[string]int, len(auths))
+	managedEntryNames := make(map[string]int, len(auths))
 	for _, auth := range auths {
+		managedName, managed := h.managedAuthBackingFileName(auth)
+		if managed && !isTopLevelManagedAuthName(managedName) {
+			continue
+		}
 		if entry := h.buildAuthFileEntry(auth); entry != nil {
+			files = append(files, entry)
+			if managed && managedName != "" {
+				managedEntryIndexes[managedAuthNameKey(managedName)] = len(files) - 1
+				managedEntryNames[managedName] = len(files) - 1
+			}
+		}
+	}
+	retiredFiles, errRetired := h.listRetiredGeminiCLIAuthFiles()
+	if errRetired != nil {
+		log.WithError(errRetired).Warn("failed to list retired Gemini CLI auth files")
+	} else {
+		for _, entry := range retiredFiles {
+			name, _ := entry["name"].(string)
+			index, exists := managedEntryIndexes[managedAuthNameKey(name)]
+			if !exists {
+				for managedName, managedIndex := range managedEntryNames {
+					if h.sameManagedAuthFile(managedName, name) {
+						index = managedIndex
+						exists = true
+						break
+					}
+				}
+			}
+			if exists {
+				files[index] = entry
+				continue
+			}
 			files = append(files, entry)
 		}
 	}
@@ -263,6 +298,60 @@ func (h *Handler) ListAuthFiles(c *gin.Context) {
 	c.JSON(200, gin.H{"files": files})
 }
 
+func (h *Handler) listRetiredGeminiCLIAuthFiles() ([]gin.H, error) {
+	if h == nil || h.cfg == nil || strings.TrimSpace(h.cfg.AuthDir) == "" {
+		return nil, nil
+	}
+	root, _, authDir, errRoot := h.openManagedAuthRootSnapshot()
+	if errRoot != nil {
+		if errors.Is(errRoot, fs.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, errRoot
+	}
+	defer closeManagedAuthRoot(root)
+	diskFiles, errList := listAuthJSONDiskFilesAtRoot(root)
+	if errList != nil {
+		return nil, errList
+	}
+	files := make([]gin.H, 0)
+	for _, diskFile := range diskFiles {
+		path := filepath.Join(authDir, filepath.FromSlash(diskFile.Name))
+		unlockPath := authfileguard.Lock(path)
+		data, _, _, errRead := readManagedAuthFileAtRoot(root, authDir, diskFile.Name)
+		if errRead != nil {
+			unlockPath()
+			continue
+		}
+		retired, metadata, errParse := parseRetiredGeminiCLIAuthFile(data)
+		if errParse != nil || !retired {
+			unlockPath()
+			continue
+		}
+		authfileguard.MarkRetired(path)
+		unlockPath()
+		fileEntry := gin.H{
+			"name":             diskFile.Name,
+			"size":             diskFile.Info.Size(),
+			"modtime":          diskFile.Info.ModTime(),
+			"type":             strings.TrimSpace(stringValue(metadata, "type")),
+			"provider":         "gemini-cli",
+			"email":            strings.TrimSpace(stringValue(metadata, "email")),
+			"unsupported":      true,
+			"retired":          true,
+			"runtime_eligible": false,
+			"support_status":   "unsupported",
+			"status":           "unsupported",
+			"status_message":   "Gemini CLI is no longer supported",
+		}
+		if disabled, ok := metadata["disabled"].(bool); ok {
+			fileEntry["disabled"] = disabled
+		}
+		files = append(files, fileEntry)
+	}
+	return files, nil
+}
+
 // GetAuthFileModels returns the models supported by a specific auth file
 func (h *Handler) GetAuthFileModels(c *gin.Context) {
 	name := c.Query("name")
@@ -270,21 +359,24 @@ func (h *Handler) GetAuthFileModels(c *gin.Context) {
 		c.JSON(400, gin.H{"error": "name is required"})
 		return
 	}
+	if h.rejectRetiredGeminiCLIAuthFileOperation(c, name) {
+		return
+	}
 
-	// Try to find auth ID via authManager
 	var authID string
-	if h.authManager != nil {
-		auths := h.authManager.List()
-		for _, auth := range auths {
-			if auth.FileName == name || auth.ID == name {
-				authID = auth.ID
-				break
-			}
-		}
+	if auth := h.findManagedAuth(name); auth != nil {
+		authID = auth.ID
 	}
 
 	if authID == "" {
-		authID = name // fallback to filename as ID
+		if exists, errPresence := h.managedAuthFileExists(name); errPresence != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": errPresence.Error()})
+			return
+		} else if exists {
+			c.JSON(http.StatusOK, gin.H{"models": []gin.H{}})
+			return
+		}
+		authID = name
 	}
 
 	// Get models from registry
@@ -313,61 +405,70 @@ func (h *Handler) GetAuthFileModels(c *gin.Context) {
 
 // List auth files from disk when the auth manager is unavailable.
 func (h *Handler) listAuthFilesFromDisk(c *gin.Context) {
-	entries, err := os.ReadDir(h.cfg.AuthDir)
+	diskFiles, err := h.listAuthJSONDiskFiles()
 	if err != nil {
 		c.JSON(500, gin.H{"error": fmt.Sprintf("failed to read auth dir: %v", err)})
 		return
 	}
 	files := make([]gin.H, 0)
-	for _, e := range entries {
-		if e.IsDir() {
-			continue
-		}
-		name := e.Name()
-		if !strings.HasSuffix(strings.ToLower(name), ".json") {
-			continue
-		}
-		if info, errInfo := e.Info(); errInfo == nil {
-			fileData := gin.H{"name": name, "size": info.Size(), "modtime": info.ModTime()}
+	for _, diskFile := range diskFiles {
+		fileData := gin.H{"name": diskFile.Name, "size": diskFile.Info.Size(), "modtime": diskFile.Info.ModTime()}
 
-			// Read file to get type field
-			full := filepath.Join(h.cfg.AuthDir, name)
-			if data, errRead := os.ReadFile(full); errRead == nil {
-				typeValue := gjson.GetBytes(data, "type").String()
-				emailValue := gjson.GetBytes(data, "email").String()
-				fileData["type"] = typeValue
-				fileData["email"] = emailValue
-				if strings.EqualFold(strings.TrimSpace(typeValue), "xai") {
-					fileData["using_api"] = effectiveXAIUsingAPIFromJSON(data)
-					fileData["websockets"] = jsonBoolField(data, "websockets")
-				}
-				if strings.EqualFold(strings.TrimSpace(typeValue), "codex") {
-					var metadata map[string]any
-					if errUnmarshal := json.Unmarshal(data, &metadata); errUnmarshal == nil {
-						if planType := codex.EffectivePlanType(metadata); planType != "" {
-							fileData["plan_type"] = planType
-						}
-					}
-				}
-				if pv := gjson.GetBytes(data, "priority"); pv.Exists() {
-					switch pv.Type {
-					case gjson.Number:
-						fileData["priority"] = int(pv.Int())
-					case gjson.String:
-						if parsed, errAtoi := strconv.Atoi(strings.TrimSpace(pv.String())); errAtoi == nil {
-							fileData["priority"] = parsed
-						}
-					}
-				}
-				if nv := gjson.GetBytes(data, "note"); nv.Exists() && nv.Type == gjson.String {
-					if trimmed := strings.TrimSpace(nv.String()); trimmed != "" {
-						fileData["note"] = trimmed
+		// Read file to get type field
+		path, _, errPath := h.resolveManagedAuthFilePath(diskFile.Name)
+		if errPath == nil {
+			unlockPath := authfileguard.Lock(path)
+			data, _, _, errRead := h.readManagedAuthFile(diskFile.Name)
+			if errRead != nil {
+				unlockPath()
+				files = append(files, fileData)
+				continue
+			}
+			typeValue := gjson.GetBytes(data, "type").String()
+			emailValue := gjson.GetBytes(data, "email").String()
+			fileData["type"] = typeValue
+			fileData["email"] = emailValue
+			if retired, _, errParse := parseRetiredGeminiCLIAuthFile(data); errParse == nil && retired {
+				authfileguard.MarkRetired(path)
+				fileData["provider"] = "gemini-cli"
+				fileData["unsupported"] = true
+				fileData["retired"] = true
+				fileData["runtime_eligible"] = false
+				fileData["support_status"] = "unsupported"
+				fileData["status"] = "unsupported"
+				fileData["status_message"] = "Gemini CLI is no longer supported"
+			}
+			if strings.EqualFold(strings.TrimSpace(typeValue), "xai") {
+				fileData["using_api"] = effectiveXAIUsingAPIFromJSON(data)
+				fileData["websockets"] = jsonBoolField(data, "websockets")
+			}
+			if strings.EqualFold(strings.TrimSpace(typeValue), "codex") {
+				var metadata map[string]any
+				if errUnmarshal := json.Unmarshal(data, &metadata); errUnmarshal == nil {
+					if planType := codex.EffectivePlanType(metadata); planType != "" {
+						fileData["plan_type"] = planType
 					}
 				}
 			}
-
-			files = append(files, fileData)
+			if pv := gjson.GetBytes(data, "priority"); pv.Exists() {
+				switch pv.Type {
+				case gjson.Number:
+					fileData["priority"] = int(pv.Int())
+				case gjson.String:
+					if parsed, errAtoi := strconv.Atoi(strings.TrimSpace(pv.String())); errAtoi == nil {
+						fileData["priority"] = parsed
+					}
+				}
+			}
+			if nv := gjson.GetBytes(data, "note"); nv.Exists() && nv.Type == gjson.String {
+				if trimmed := strings.TrimSpace(nv.String()); trimmed != "" {
+					fileData["note"] = trimmed
+				}
+			}
+			unlockPath()
 		}
+
+		files = append(files, fileData)
 	}
 	c.JSON(200, gin.H{"files": files})
 }
@@ -386,6 +487,9 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
 		return nil
 	}
 	name := strings.TrimSpace(auth.FileName)
+	if managedName, ok := h.managedAuthFileName(path); ok {
+		name = managedName
+	}
 	if name == "" {
 		name = auth.ID
 	}
@@ -657,6 +761,9 @@ func isUnsafeAuthFileName(name string) bool {
 	if strings.TrimSpace(name) == "" {
 		return true
 	}
+	if hasWindowsVolumePathShape(name) {
+		return true
+	}
 	if strings.ContainsAny(name, "/\\") {
 		return true
 	}
@@ -666,9 +773,434 @@ func isUnsafeAuthFileName(name string) bool {
 	return false
 }
 
+type authDiskFile struct {
+	Name string
+	Info os.FileInfo
+}
+
+func (h *Handler) resolvedAuthDir() (string, error) {
+	_, resolved, err := h.authDirSnapshot()
+	return resolved, err
+}
+
+func (h *Handler) authDirSnapshot() (string, string, error) {
+	if h == nil {
+		return "", "", fmt.Errorf("handler not initialized")
+	}
+	h.mu.Lock()
+	configuredAuthDir := ""
+	if h.cfg != nil {
+		configuredAuthDir = h.cfg.AuthDir
+	}
+	h.mu.Unlock()
+	if strings.TrimSpace(configuredAuthDir) == "" {
+		return "", "", fmt.Errorf("handler not initialized")
+	}
+	authDir, errResolve := util.ResolveAuthDir(strings.TrimSpace(configuredAuthDir))
+	if errResolve != nil {
+		return "", "", errResolve
+	}
+	if authDir == "" {
+		return "", "", fmt.Errorf("auth dir is not configured")
+	}
+	authDir, errAbs := filepath.Abs(authDir)
+	if errAbs != nil {
+		return "", "", fmt.Errorf("resolve auth dir: %w", errAbs)
+	}
+	lexicalAuthDir := filepath.Clean(authDir)
+	resolvedAuthDir := lexicalAuthDir
+	if resolved, errEval := filepath.EvalSymlinks(lexicalAuthDir); errEval == nil {
+		resolvedAuthDir = filepath.Clean(resolved)
+	} else if !os.IsNotExist(errEval) {
+		return "", "", fmt.Errorf("resolve auth dir symlink: %w", errEval)
+	}
+	return lexicalAuthDir, resolvedAuthDir, nil
+}
+
+func (h *Handler) openManagedAuthRoot() (*os.Root, string, error) {
+	root, _, authDir, errRoot := h.openManagedAuthRootSnapshot()
+	return root, authDir, errRoot
+}
+
+func (h *Handler) openManagedAuthRootSnapshot() (*os.Root, string, string, error) {
+	lexicalAuthDir, authDir, errAuthDir := h.authDirSnapshot()
+	if errAuthDir != nil {
+		return nil, "", "", errAuthDir
+	}
+	root, errOpen := os.OpenRoot(authDir)
+	if errOpen != nil {
+		return nil, "", "", fmt.Errorf("open auth root: %w", errOpen)
+	}
+	return root, lexicalAuthDir, authDir, nil
+}
+
+func closeManagedAuthRoot(root *os.Root) {
+	if root == nil {
+		return
+	}
+	if errClose := root.Close(); errClose != nil {
+		log.WithError(errClose).Debug("failed to close auth root")
+	}
+}
+
+func pathWithinDirectory(root, path string) bool {
+	rel, errRel := filepath.Rel(root, path)
+	if errRel != nil || rel == ".." {
+		return false
+	}
+	return !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+}
+
+func rootPathContainsSymlink(root *os.Root, relativePath string) (bool, error) {
+	if root == nil {
+		return false, fmt.Errorf("auth root is nil")
+	}
+	current := ""
+	for _, part := range strings.Split(filepath.Clean(relativePath), string(filepath.Separator)) {
+		if part == "" || part == "." {
+			continue
+		}
+		current = filepath.Join(current, part)
+		info, errInfo := root.Lstat(current)
+		if errInfo != nil {
+			if os.IsNotExist(errInfo) {
+				return false, nil
+			}
+			return false, errInfo
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func normalizeManagedAuthFileName(name string) (string, error) {
+	name = strings.TrimSpace(name)
+	if name == "" || !strings.HasSuffix(strings.ToLower(name), ".json") {
+		return "", errInvalidAuthFileName
+	}
+	if hasWindowsVolumePathShape(name) {
+		return "", errInvalidAuthFileName
+	}
+	if runtime.GOOS == "windows" {
+		name = strings.ReplaceAll(name, "\\", "/")
+	} else {
+		portableClean := filepath.ToSlash(filepath.Clean(filepath.FromSlash(strings.ReplaceAll(name, "\\", "/"))))
+		if portableClean == ".." || strings.HasPrefix(portableClean, "../") {
+			return "", errInvalidAuthFileName
+		}
+	}
+	normalized := filepath.Clean(filepath.FromSlash(name))
+	if normalized == "." || filepath.IsAbs(normalized) || filepath.VolumeName(normalized) != "" {
+		return "", errInvalidAuthFileName
+	}
+	return filepath.ToSlash(normalized), nil
+}
+
+func hasWindowsVolumePathShape(name string) bool {
+	name = strings.TrimSpace(name)
+	if strings.HasPrefix(name, `\`) || strings.HasPrefix(name, "/") {
+		return true
+	}
+	if len(name) < 2 || name[1] != ':' {
+		return false
+	}
+	first := name[0]
+	return first >= 'a' && first <= 'z' || first >= 'A' && first <= 'Z'
+}
+
+func (h *Handler) resolveManagedAuthFilePath(name string) (string, string, error) {
+	root, _, authDir, errRoot := h.openManagedAuthRootSnapshot()
+	if errRoot != nil {
+		return "", "", errRoot
+	}
+	defer closeManagedAuthRoot(root)
+	return resolveManagedAuthFilePathAtRoot(root, authDir, name)
+}
+
+func resolveManagedAuthFilePathAtRoot(root *os.Root, authDir, name string) (string, string, error) {
+	normalizedName, errNormalize := normalizeManagedAuthFileName(name)
+	if errNormalize != nil {
+		return "", "", errNormalize
+	}
+	normalized := filepath.FromSlash(normalizedName)
+	path := filepath.Clean(filepath.Join(authDir, normalized))
+	if !pathWithinDirectory(authDir, path) {
+		return "", "", errInvalidAuthFileName
+	}
+	containsSymlink, errSymlink := rootPathContainsSymlink(root, normalized)
+	if errSymlink != nil {
+		return "", "", fmt.Errorf("inspect auth path: %w", errSymlink)
+	}
+	if containsSymlink {
+		return "", "", errInvalidAuthFileName
+	}
+	rel, errRel := filepath.Rel(authDir, filepath.Clean(filepath.Join(authDir, normalized)))
+	if errRel != nil {
+		return "", "", fmt.Errorf("resolve auth relative path: %w", errRel)
+	}
+	if !pathWithinDirectory(authDir, filepath.Join(authDir, rel)) {
+		return "", "", errInvalidAuthFileName
+	}
+	return path, filepath.ToSlash(rel), nil
+}
+
+func actualManagedAuthFileNameAtRoot(root *os.Root, name string) (string, error) {
+	return actualManagedAuthFileNameAtRootForOS(root, name, runtime.GOOS)
+}
+
+func actualManagedAuthFileNameAtRootForOS(root *os.Root, name, goos string) (string, error) {
+	if goos != "windows" || root == nil {
+		return name, nil
+	}
+	parts := strings.Split(filepath.ToSlash(name), "/")
+	actualParts := make([]string, 0, len(parts))
+	for _, part := range parts {
+		currentDir := "."
+		if len(actualParts) > 0 {
+			currentDir = filepath.FromSlash(strings.Join(actualParts, "/"))
+		}
+		dir, errOpen := root.Open(currentDir)
+		if errOpen != nil {
+			if os.IsNotExist(errOpen) {
+				return name, nil
+			}
+			return "", errOpen
+		}
+		entries, errRead := dir.ReadDir(-1)
+		errClose := dir.Close()
+		if errRead != nil {
+			return "", errRead
+		}
+		if errClose != nil {
+			return "", errClose
+		}
+		actualPart := ""
+		for _, entry := range entries {
+			if entry.Name() == part {
+				actualPart = entry.Name()
+				break
+			}
+			if actualPart == "" && strings.EqualFold(entry.Name(), part) {
+				actualPart = entry.Name()
+			}
+		}
+		if actualPart == "" {
+			return name, nil
+		}
+		actualParts = append(actualParts, actualPart)
+	}
+	return strings.Join(actualParts, "/"), nil
+}
+
+func managedAuthPathErrorStatus(err error) int {
+	if errors.Is(err, errInvalidAuthFileName) {
+		return http.StatusBadRequest
+	}
+	return http.StatusInternalServerError
+}
+
+func (h *Handler) managedAuthFileName(path string) (string, bool) {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return "", false
+	}
+	root, lexicalAuthDir, authDir, errRoot := h.openManagedAuthRootSnapshot()
+	if errRoot != nil {
+		return "", false
+	}
+	defer closeManagedAuthRoot(root)
+	return managedAuthFileNameAtRoot(root, lexicalAuthDir, authDir, path)
+}
+
+func managedAuthFileNameAtRoot(root *os.Root, lexicalAuthDir, authDir, path string) (string, bool) {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return "", false
+	}
+	if !filepath.IsAbs(path) {
+		if abs, errAbs := filepath.Abs(path); errAbs == nil {
+			path = abs
+		}
+	}
+	path = filepath.Clean(path)
+	rel, errRel := filepath.Rel(authDir, path)
+	if errRel != nil || rel == "." || !pathWithinDirectory(authDir, path) {
+		rel, errRel = filepath.Rel(lexicalAuthDir, path)
+		if errRel != nil || rel == "." || !pathWithinDirectory(lexicalAuthDir, path) {
+			return "", false
+		}
+	}
+	_, displayName, errResolve := resolveManagedAuthFilePathAtRoot(root, authDir, filepath.ToSlash(rel))
+	if errResolve != nil {
+		return "", false
+	}
+	return displayName, true
+}
+
+func (h *Handler) listAuthJSONDiskFiles() ([]authDiskFile, error) {
+	root, _, errRoot := h.openManagedAuthRoot()
+	if errRoot != nil {
+		if errors.Is(errRoot, fs.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, errRoot
+	}
+	defer closeManagedAuthRoot(root)
+	return listAuthJSONDiskFilesAtRoot(root)
+}
+
+func listAuthJSONDiskFilesAtRoot(root *os.Root) ([]authDiskFile, error) {
+	if root == nil {
+		return nil, errors.New("auth root is nil")
+	}
+	directory, errOpen := root.Open(".")
+	if errOpen != nil {
+		return nil, errOpen
+	}
+	entries, errRead := directory.ReadDir(-1)
+	errClose := directory.Close()
+	if errRead != nil || errClose != nil {
+		return nil, errors.Join(errRead, errClose)
+	}
+	files := make([]authDiskFile, 0, len(entries))
+	for _, entry := range entries {
+		if entry == nil || entry.IsDir() || entry.Type()&os.ModeSymlink != 0 || !strings.HasSuffix(strings.ToLower(entry.Name()), ".json") {
+			continue
+		}
+		info, errInfo := entry.Info()
+		if errInfo != nil {
+			if os.IsNotExist(errInfo) {
+				continue
+			}
+			return nil, errInfo
+		}
+		files = append(files, authDiskFile{Name: entry.Name(), Info: info})
+	}
+	sort.Slice(files, func(i, j int) bool {
+		return strings.ToLower(files[i].Name) < strings.ToLower(files[j].Name)
+	})
+	return files, nil
+}
+
+func listAllManageableAuthFileNamesAtRoot(root *os.Root, authDir string) ([]string, error) {
+	diskFiles, errList := listAuthJSONDiskFilesAtRoot(root)
+	if errList != nil {
+		return nil, errList
+	}
+	names := make([]string, 0, len(diskFiles))
+	for _, diskFile := range diskFiles {
+		names = append(names, diskFile.Name)
+	}
+
+	nestedNames, errNested := listNestedAuthJSONFileNamesAtRoot(root)
+	if errNested != nil {
+		return nil, errNested
+	}
+	for _, name := range nestedNames {
+		data, displayName, _, errRead := readManagedAuthFileAtRoot(root, authDir, name)
+		if errors.Is(errRead, fs.ErrNotExist) {
+			continue
+		}
+		if errRead != nil {
+			return nil, fmt.Errorf("read nested auth file %s: %w", name, errRead)
+		}
+		if coreauth.IsRetiredGeminiCLIAuthFileData(data) {
+			names = append(names, displayName)
+		}
+	}
+	sort.Slice(names, func(i, j int) bool {
+		return strings.ToLower(names[i]) < strings.ToLower(names[j])
+	})
+	return names, nil
+}
+
+func listNestedAuthJSONFileNamesAtRoot(root *os.Root) ([]string, error) {
+	if root == nil {
+		return nil, errors.New("auth root is nil")
+	}
+	names := make([]string, 0)
+	if errWalk := walkNestedAuthJSONFileNames(root, "", &names); errWalk != nil {
+		return nil, errWalk
+	}
+	return names, nil
+}
+
+func walkNestedAuthJSONFileNames(root *os.Root, prefix string, names *[]string) (err error) {
+	directory, errOpen := root.Open(".")
+	if errOpen != nil {
+		return errOpen
+	}
+	entries, errRead := directory.ReadDir(-1)
+	errClose := directory.Close()
+	if errRead != nil || errClose != nil {
+		return errors.Join(errRead, errClose)
+	}
+	for _, entry := range entries {
+		if entry == nil || entry.Type()&os.ModeSymlink != 0 {
+			continue
+		}
+		name := entry.Name()
+		relativeName := name
+		if prefix != "" {
+			relativeName = prefix + "/" + name
+		}
+		if entry.IsDir() {
+			before, errBefore := root.Lstat(name)
+			if errors.Is(errBefore, fs.ErrNotExist) {
+				continue
+			}
+			if errBefore != nil || before.Mode()&os.ModeSymlink != 0 || !before.IsDir() {
+				if errBefore != nil {
+					return errBefore
+				}
+				continue
+			}
+			child, errChild := root.OpenRoot(name)
+			if errors.Is(errChild, fs.ErrNotExist) {
+				continue
+			}
+			if errChild != nil {
+				return errChild
+			}
+			opened, errOpened := child.Stat(".")
+			after, errAfter := root.Lstat(name)
+			if errOpened != nil || errAfter != nil || after.Mode()&os.ModeSymlink != 0 || !after.IsDir() || !os.SameFile(before, opened) || !os.SameFile(after, opened) {
+				return errors.Join(errOpened, errAfter, child.Close(), errors.New("managed auth directory changed while opening"))
+			}
+			errWalk := walkNestedAuthJSONFileNames(child, relativeName, names)
+			errChildClose := child.Close()
+			if errWalk != nil || errChildClose != nil {
+				return errors.Join(errWalk, errChildClose)
+			}
+			continue
+		}
+		if prefix == "" || !strings.HasSuffix(strings.ToLower(name), ".json") {
+			continue
+		}
+		info, errInfo := entry.Info()
+		if errors.Is(errInfo, fs.ErrNotExist) {
+			continue
+		}
+		if errInfo != nil {
+			return errInfo
+		}
+		if info.Mode().IsRegular() {
+			*names = append(*names, relativeName)
+		}
+	}
+	return nil
+}
+
 type authDownloadFile struct {
 	Name string
 	Data []byte
+}
+
+type managedAuthFileSnapshot struct {
+	data []byte
+	info fs.FileInfo
 }
 
 type authFilesArchiveRequest struct {
@@ -676,47 +1208,187 @@ type authFilesArchiveRequest struct {
 	Names []string `json:"names"`
 }
 
-func validateDownloadAuthFileName(name string) error {
-	name = strings.TrimSpace(name)
-	if isUnsafeAuthFileName(name) {
-		return fmt.Errorf("invalid name")
+func (h *Handler) readManagedAuthFile(name string) ([]byte, string, string, error) {
+	root, _, authDir, errRoot := h.openManagedAuthRootSnapshot()
+	if errRoot != nil {
+		return nil, "", "", errRoot
 	}
-	if !strings.HasSuffix(strings.ToLower(name), ".json") {
-		return fmt.Errorf("name must end with .json")
+	defer closeManagedAuthRoot(root)
+	return readManagedAuthFileAtRoot(root, authDir, name)
+}
+
+func readManagedAuthFileAtRoot(root *os.Root, authDir, name string) ([]byte, string, string, error) {
+	return readManagedAuthFileAtRootForOS(root, authDir, name, runtime.GOOS)
+}
+
+func readManagedAuthFileAtRootForOS(root *os.Root, authDir, name, goos string) ([]byte, string, string, error) {
+	_, displayName, errResolve := resolveManagedAuthFilePathAtRoot(root, authDir, name)
+	if errResolve != nil {
+		return nil, "", "", errResolve
+	}
+	actualName, errActual := actualManagedAuthFileNameAtRootForOS(root, displayName, goos)
+	if errActual != nil {
+		return nil, displayName, filepath.Join(authDir, filepath.FromSlash(displayName)), fmt.Errorf("resolve auth file name: %w", errActual)
+	}
+	displayName = actualName
+	relativePath := filepath.FromSlash(displayName)
+	snapshot, errRead := captureManagedAuthFileSnapshotAtRoot(root, relativePath)
+	if errRead != nil {
+		return nil, displayName, filepath.Join(authDir, relativePath), errRead
+	}
+	return snapshot.data, displayName, filepath.Join(authDir, relativePath), nil
+}
+
+func captureManagedAuthFileSnapshotAtRoot(root *os.Root, relativePath string) (snapshot managedAuthFileSnapshot, err error) {
+	parentRoot, leaf, closeParent, errParent := openManagedAuthSnapshotParent(root, relativePath)
+	if errParent != nil {
+		return managedAuthFileSnapshot{}, errParent
+	}
+	defer func() {
+		if errClose := closeParent(); errClose != nil {
+			err = errors.Join(err, fmt.Errorf("close managed auth parent: %w", errClose))
+		}
+	}()
+	before, errBefore := parentRoot.Lstat(leaf)
+	if errBefore != nil {
+		return managedAuthFileSnapshot{}, errBefore
+	}
+	if errValidate := validateManagedAuthSnapshotFile(before); errValidate != nil {
+		return managedAuthFileSnapshot{}, errValidate
+	}
+	file, errOpen := parentRoot.Open(leaf)
+	if errOpen != nil {
+		return managedAuthFileSnapshot{}, errOpen
+	}
+	defer func() {
+		if errClose := file.Close(); errClose != nil {
+			err = errors.Join(err, fmt.Errorf("close managed auth file: %w", errClose))
+		}
+	}()
+	opened, errOpened := file.Stat()
+	after, errAfter := parentRoot.Lstat(leaf)
+	if errOpened != nil || errAfter != nil {
+		return managedAuthFileSnapshot{}, errors.Join(errOpened, errAfter)
+	}
+	if errValidate := validateManagedAuthSnapshotFile(opened); errValidate != nil {
+		return managedAuthFileSnapshot{}, errValidate
+	}
+	if errValidate := validateManagedAuthSnapshotFile(after); errValidate != nil {
+		return managedAuthFileSnapshot{}, errValidate
+	}
+	if !os.SameFile(before, opened) || !os.SameFile(after, opened) {
+		return managedAuthFileSnapshot{}, errors.New("managed auth path changed while opening")
+	}
+	data, errRead := io.ReadAll(file)
+	if errRead != nil {
+		return managedAuthFileSnapshot{}, errRead
+	}
+	return managedAuthFileSnapshot{data: data, info: opened}, nil
+}
+
+func openManagedAuthSnapshotParent(root *os.Root, relativePath string) (*os.Root, string, func() error, error) {
+	if root == nil {
+		return nil, "", nil, errors.New("managed auth root is nil")
+	}
+	clean := filepath.Clean(filepath.FromSlash(strings.TrimSpace(relativePath)))
+	if clean == "." || clean == ".." || filepath.IsAbs(clean) || filepath.VolumeName(clean) != "" || strings.HasPrefix(clean, ".."+string(os.PathSeparator)) {
+		return nil, "", nil, errInvalidAuthFileName
+	}
+	parts := strings.Split(clean, string(os.PathSeparator))
+	current := root
+	owned := false
+	closeCurrent := func() error {
+		if !owned {
+			return nil
+		}
+		return current.Close()
+	}
+	for _, component := range parts[:len(parts)-1] {
+		before, errBefore := current.Lstat(component)
+		if errBefore != nil {
+			return nil, "", nil, errors.Join(errBefore, closeCurrent())
+		}
+		if before.Mode()&os.ModeSymlink != 0 || !before.IsDir() {
+			return nil, "", nil, errors.Join(errors.New("managed auth path component is not a stable directory"), closeCurrent())
+		}
+		next, errOpen := current.OpenRoot(component)
+		if errOpen != nil {
+			return nil, "", nil, errors.Join(errOpen, closeCurrent())
+		}
+		opened, errOpened := next.Stat(".")
+		after, errAfter := current.Lstat(component)
+		if errOpened != nil || errAfter != nil || after.Mode()&os.ModeSymlink != 0 || !after.IsDir() || !os.SameFile(before, opened) || !os.SameFile(after, opened) {
+			return nil, "", nil, errors.Join(errOpened, errAfter, next.Close(), closeCurrent(), errors.New("managed auth path component changed while opening"))
+		}
+		if errClose := closeCurrent(); errClose != nil {
+			return nil, "", nil, errors.Join(errClose, next.Close())
+		}
+		current = next
+		owned = true
+	}
+	return current, parts[len(parts)-1], closeCurrent, nil
+}
+
+func validateManagedAuthSnapshotFile(info fs.FileInfo) error {
+	if info == nil || info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+		return errors.New("managed auth path is not a regular file")
 	}
 	return nil
 }
 
+func sameManagedAuthFileSnapshot(a, b managedAuthFileSnapshot) bool {
+	return a.info != nil && b.info != nil && os.SameFile(a.info, b.info) && bytes.Equal(a.data, b.data)
+}
+
 func (h *Handler) readDownloadAuthFile(name string) (*authDownloadFile, int, error) {
-	if err := validateDownloadAuthFileName(name); err != nil {
-		return nil, http.StatusBadRequest, err
+	root, _, authDir, errRoot := h.openManagedAuthRootSnapshot()
+	if errRoot != nil {
+		if errors.Is(errRoot, fs.ErrNotExist) {
+			return nil, http.StatusNotFound, fmt.Errorf("file not found")
+		}
+		return nil, http.StatusInternalServerError, errRoot
 	}
-	full := filepath.Join(h.cfg.AuthDir, filepath.Base(strings.TrimSpace(name)))
-	data, err := os.ReadFile(full)
+	defer closeManagedAuthRoot(root)
+	return readDownloadAuthFileAtRoot(root, authDir, name)
+}
+
+func readDownloadAuthFileAtRoot(root *os.Root, authDir, name string) (*authDownloadFile, int, error) {
+	data, displayName, _, err := readManagedAuthFileAtRoot(root, authDir, name)
 	if err != nil {
-		if os.IsNotExist(err) {
+		if errors.Is(err, errInvalidAuthFileName) {
+			return nil, http.StatusBadRequest, err
+		}
+		if errors.Is(err, fs.ErrNotExist) {
 			return nil, http.StatusNotFound, fmt.Errorf("file not found")
 		}
 		return nil, http.StatusInternalServerError, fmt.Errorf("failed to read file: %w", err)
 	}
-	return &authDownloadFile{Name: filepath.Base(strings.TrimSpace(name)), Data: data}, http.StatusOK, nil
+	if errAccess := validateExplicitManagedAuthFileAccess(displayName, data); errAccess != nil {
+		return nil, http.StatusBadRequest, errAccess
+	}
+	return &authDownloadFile{Name: displayName, Data: data}, http.StatusOK, nil
+}
+
+func validateExplicitManagedAuthFileAccess(name string, data []byte) error {
+	if isTopLevelManagedAuthName(name) || coreauth.IsRetiredGeminiCLIAuthFileData(data) {
+		return nil
+	}
+	return errInvalidAuthFileName
 }
 
 func (h *Handler) listAllDownloadAuthFiles() ([]authDownloadFile, error) {
-	entries, err := os.ReadDir(h.cfg.AuthDir)
+	root, _, authDir, errRoot := h.openManagedAuthRootSnapshot()
+	if errRoot != nil {
+		return nil, errRoot
+	}
+	defer closeManagedAuthRoot(root)
+	names, err := listAllManageableAuthFileNamesAtRoot(root, authDir)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read auth dir: %w", err)
 	}
-	files := make([]authDownloadFile, 0)
-	for _, entry := range entries {
-		if entry.IsDir() {
-			continue
-		}
-		name := strings.TrimSpace(entry.Name())
-		if !strings.HasSuffix(strings.ToLower(name), ".json") {
-			continue
-		}
-		file, _, errRead := h.readDownloadAuthFile(name)
+	files := make([]authDownloadFile, 0, len(names))
+	for _, name := range names {
+		file, _, errRead := readDownloadAuthFileAtRoot(root, authDir, name)
 		if errRead != nil {
 			return nil, errRead
 		}
@@ -729,13 +1401,26 @@ func (h *Handler) listAllDownloadAuthFiles() ([]authDownloadFile, error) {
 }
 
 func (h *Handler) loadDownloadAuthFiles(names []string) ([]authDownloadFile, int, error) {
-	names = uniqueAuthFileNames(names)
+	root, lexicalAuthDir, authDir, errRoot := h.openManagedAuthRootSnapshot()
+	if errRoot != nil {
+		status := http.StatusInternalServerError
+		if errors.Is(errRoot, fs.ErrNotExist) {
+			status = http.StatusNotFound
+		}
+		return nil, status, errRoot
+	}
+	defer closeManagedAuthRoot(root)
+	var errCanonical error
+	names, errCanonical = h.canonicalAuthFileNamesAtRoot(root, lexicalAuthDir, authDir, names)
+	if errCanonical != nil {
+		return nil, managedAuthPathErrorStatus(errCanonical), errCanonical
+	}
 	if len(names) == 0 {
 		return nil, http.StatusBadRequest, fmt.Errorf("names is required")
 	}
 	files := make([]authDownloadFile, 0, len(names))
 	for _, name := range names {
-		file, status, err := h.readDownloadAuthFile(name)
+		file, status, err := readDownloadAuthFileAtRoot(root, authDir, name)
 		if err != nil {
 			return nil, status, err
 		}
@@ -772,7 +1457,7 @@ func (h *Handler) DownloadAuthFile(c *gin.Context) {
 		c.JSON(status, gin.H{"error": err.Error()})
 		return
 	}
-	c.Header("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s\"", file.Name))
+	c.Header("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s\"", filepath.Base(file.Name)))
 	c.Data(http.StatusOK, "application/json", file.Data)
 }
 
@@ -799,7 +1484,11 @@ func (h *Handler) DownloadAuthFilesArchive(c *gin.Context) {
 	if req.All {
 		files, err = h.listAllDownloadAuthFiles()
 		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			status := http.StatusInternalServerError
+			if errors.Is(err, fs.ErrNotExist) {
+				status = http.StatusNotFound
+			}
+			c.JSON(status, gin.H{"error": err.Error()})
 			return
 		}
 	} else {
@@ -835,11 +1524,21 @@ func (h *Handler) UploadAuthFile(c *gin.Context) {
 	}
 	if len(fileHeaders) == 1 {
 		if _, errUpload := h.storeUploadedAuthFile(ctx, fileHeaders[0]); errUpload != nil {
-			if errors.Is(errUpload, errAuthFileMustBeJSON) {
-				c.JSON(http.StatusBadRequest, gin.H{"error": "file must be .json"})
+			if errors.Is(errUpload, errAuthFileMustBeJSON) || errors.Is(errUpload, errInvalidAuthFileName) || errors.Is(errUpload, errInvalidAuthFileData) {
+				message := errUpload.Error()
+				if errors.Is(errUpload, errAuthFileMustBeJSON) {
+					message = "file must be .json"
+				}
+				c.JSON(http.StatusBadRequest, gin.H{"error": message})
 				return
 			}
-			c.JSON(http.StatusInternalServerError, gin.H{"error": errUpload.Error()})
+			status := http.StatusInternalServerError
+			if errors.Is(errUpload, errGeminiCLIAuthGone) {
+				status = http.StatusGone
+			} else if errors.Is(errUpload, errAuthFileQuarantined) {
+				status = http.StatusConflict
+			}
+			c.JSON(status, gin.H{"error": errUpload.Error()})
 			return
 		}
 		c.JSON(http.StatusOK, gin.H{"status": "ok"})
@@ -859,7 +1558,15 @@ func (h *Handler) UploadAuthFile(c *gin.Context) {
 				if errors.Is(errUpload, errAuthFileMustBeJSON) {
 					msg = "file must be .json"
 				}
-				failed = append(failed, gin.H{"name": failureName, "error": msg})
+				failure := gin.H{"name": failureName, "error": msg}
+				if errors.Is(errUpload, errAuthFileMustBeJSON) || errors.Is(errUpload, errInvalidAuthFileName) || errors.Is(errUpload, errInvalidAuthFileData) {
+					failure["status"] = http.StatusBadRequest
+				} else if errors.Is(errUpload, errGeminiCLIAuthGone) {
+					failure["status"] = http.StatusGone
+				} else if errors.Is(errUpload, errAuthFileQuarantined) {
+					failure["status"] = http.StatusConflict
+				}
+				failed = append(failed, failure)
 				continue
 			}
 			uploaded = append(uploaded, name)
@@ -895,7 +1602,15 @@ func (h *Handler) UploadAuthFile(c *gin.Context) {
 		return
 	}
 	if err = h.writeAuthFile(ctx, filepath.Base(name), data); err != nil {
-		c.JSON(500, gin.H{"error": err.Error()})
+		status := http.StatusInternalServerError
+		if errors.Is(err, errInvalidAuthFileName) || errors.Is(err, errInvalidAuthFileData) {
+			status = http.StatusBadRequest
+		} else if errors.Is(err, errGeminiCLIAuthGone) {
+			status = http.StatusGone
+		} else if errors.Is(err, errAuthFileQuarantined) {
+			status = http.StatusConflict
+		}
+		c.JSON(status, gin.H{"error": err.Error()})
 		return
 	}
 	c.JSON(200, gin.H{"status": "ok"})
@@ -903,40 +1618,38 @@ func (h *Handler) UploadAuthFile(c *gin.Context) {
 
 // Delete auth files: single by name or all
 func (h *Handler) DeleteAuthFile(c *gin.Context) {
-	if h.authManager == nil {
-		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "core auth manager unavailable"})
+	ctx := c.Request.Context()
+	root, lexicalAuthDir, authDir, errRoot := h.openManagedAuthRootSnapshot()
+	if errRoot != nil {
+		status := http.StatusInternalServerError
+		if errors.Is(errRoot, fs.ErrNotExist) {
+			status = http.StatusNotFound
+		}
+		c.JSON(status, gin.H{"error": errRoot.Error()})
 		return
 	}
-	ctx := c.Request.Context()
+	defer closeManagedAuthRoot(root)
 	if all := c.Query("all"); all == "true" || all == "1" || all == "*" {
-		entries, err := os.ReadDir(h.cfg.AuthDir)
+		names, err := listAllManageableAuthFileNamesAtRoot(root, authDir)
 		if err != nil {
 			c.JSON(500, gin.H{"error": fmt.Sprintf("failed to read auth dir: %v", err)})
 			return
 		}
 		deleted := 0
-		for _, e := range entries {
-			if e.IsDir() {
+		failed := make([]gin.H, 0)
+		for _, name := range names {
+			if _, status, errDelete := h.deleteAuthFileByNameAtRoot(ctx, root, lexicalAuthDir, authDir, name); errDelete != nil {
+				if errors.Is(errDelete, errAuthFileNotFound) || errors.Is(errDelete, fs.ErrNotExist) {
+					continue
+				}
+				failed = append(failed, gin.H{"name": name, "status": status, "error": errDelete.Error()})
 				continue
 			}
-			name := e.Name()
-			if !strings.HasSuffix(strings.ToLower(name), ".json") {
-				continue
-			}
-			full := filepath.Join(h.cfg.AuthDir, name)
-			if !filepath.IsAbs(full) {
-				if abs, errAbs := filepath.Abs(full); errAbs == nil {
-					full = abs
-				}
-			}
-			if err = os.Remove(full); err == nil {
-				if errDel := h.deleteTokenRecord(ctx, full); errDel != nil {
-					c.JSON(500, gin.H{"error": errDel.Error()})
-					return
-				}
-				deleted++
-				h.disableAuth(ctx, full)
-			}
+			deleted++
+		}
+		if len(failed) > 0 {
+			c.JSON(http.StatusMultiStatus, gin.H{"status": "partial", "deleted": deleted, "failed": failed})
+			return
 		}
 		c.JSON(200, gin.H{"status": "ok", "deleted": deleted})
 		return
@@ -951,8 +1664,13 @@ func (h *Handler) DeleteAuthFile(c *gin.Context) {
 		c.JSON(400, gin.H{"error": "invalid name"})
 		return
 	}
+	names, errNames = h.canonicalAuthFileNamesAtRoot(root, lexicalAuthDir, authDir, names)
+	if errNames != nil {
+		c.JSON(managedAuthPathErrorStatus(errNames), gin.H{"error": errNames.Error()})
+		return
+	}
 	if len(names) == 1 {
-		if _, status, errDelete := h.deleteAuthFileByName(ctx, names[0]); errDelete != nil {
+		if _, status, errDelete := h.deleteAuthFileByNameAtRoot(ctx, root, lexicalAuthDir, authDir, names[0]); errDelete != nil {
 			c.JSON(status, gin.H{"error": errDelete.Error()})
 			return
 		}
@@ -963,9 +1681,9 @@ func (h *Handler) DeleteAuthFile(c *gin.Context) {
 	deletedFiles := make([]string, 0, len(names))
 	failed := make([]gin.H, 0)
 	for _, name := range names {
-		deletedName, _, errDelete := h.deleteAuthFileByName(ctx, name)
+		deletedName, status, errDelete := h.deleteAuthFileByNameAtRoot(ctx, root, lexicalAuthDir, authDir, name)
 		if errDelete != nil {
-			failed = append(failed, gin.H{"name": name, "error": errDelete.Error()})
+			failed = append(failed, gin.H{"name": name, "status": status, "error": errDelete.Error()})
 			continue
 		}
 		deletedFiles = append(deletedFiles, deletedName)
@@ -1012,6 +1730,9 @@ func (h *Handler) storeUploadedAuthFile(ctx context.Context, file *multipart.Fil
 		return "", fmt.Errorf("no file uploaded")
 	}
 	name := filepath.Base(strings.TrimSpace(file.Filename))
+	if isUnsafeAuthFileName(name) {
+		return "", errInvalidAuthFileName
+	}
 	if !strings.HasSuffix(strings.ToLower(name), ".json") {
 		return "", errAuthFileMustBeJSON
 	}
@@ -1032,23 +1753,101 @@ func (h *Handler) storeUploadedAuthFile(ctx context.Context, file *multipart.Fil
 }
 
 func (h *Handler) writeAuthFile(ctx context.Context, name string, data []byte) error {
-	dst := filepath.Join(h.cfg.AuthDir, filepath.Base(name))
-	if !filepath.IsAbs(dst) {
-		if abs, errAbs := filepath.Abs(dst); errAbs == nil {
-			dst = abs
+	root, _, authDir, errRoot := h.openManagedAuthRootSnapshot()
+	if errRoot != nil {
+		return errRoot
+	}
+	defer closeManagedAuthRoot(root)
+	dst, displayName, errResolve := resolveManagedAuthFilePathAtRoot(root, authDir, filepath.Base(name))
+	if errResolve != nil {
+		return errResolve
+	}
+	unlockOperation := lockManagedAuthFileOperation(dst)
+	defer unlockOperation()
+	relativePath := filepath.FromSlash(displayName)
+	retired, _, errParse := parseRetiredGeminiCLIAuthFile(data)
+	if errParse != nil {
+		return fmt.Errorf("%w: %v", errInvalidAuthFileData, errParse)
+	}
+	if retired {
+		return errGeminiCLIAuthGone
+	}
+	auth, errBuild := h.buildAuthFromFileData(dst, data)
+	if errBuild != nil {
+		return errBuild
+	}
+	errWrite := func() error {
+		unlockPath := authfileguard.Lock(dst)
+		defer unlockPath()
+		if authfileguard.IsRetired(dst) {
+			return coreauth.ErrRetiredGeminiCLIAuthReadOnly
 		}
-	}
-	auth, err := h.buildAuthFromFileData(dst, data)
-	if err != nil {
-		return err
-	}
-	if errWrite := os.WriteFile(dst, data, 0o600); errWrite != nil {
+		if authfileguard.IsQuarantined(dst) {
+			return errAuthFileQuarantined
+		}
+		if existingData, errRead := root.ReadFile(relativePath); errRead == nil {
+			if errRetired := coreauth.RejectRetiredGeminiCLIAuthFileMutation(existingData); errRetired != nil {
+				authfileguard.MarkRetired(dst)
+				return errRetired
+			}
+		} else if !errors.Is(errRead, os.ErrNotExist) {
+			return fmt.Errorf("failed to read existing auth file: %w", errRead)
+		}
+		return writeAuthFileSafely(root, relativePath, data)
+	}()
+	if errWrite != nil {
+		if errors.Is(errWrite, coreauth.ErrRetiredGeminiCLIAuthReadOnly) {
+			return errGeminiCLIAuthGone
+		}
 		return fmt.Errorf("failed to write file: %w", errWrite)
 	}
 	if err := h.upsertAuthRecord(ctx, auth); err != nil {
 		return err
 	}
 	return nil
+}
+
+func writeAuthFileSafely(root *os.Root, relativePath string, data []byte) (err error) {
+	if root == nil {
+		return fmt.Errorf("auth root is nil")
+	}
+	tempPath := filepath.Join(filepath.Dir(relativePath), ".auth-upload-"+uuid.NewString())
+	tempFile, errCreate := root.OpenFile(tempPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if errCreate != nil {
+		return errCreate
+	}
+	defer func() { _ = root.Remove(tempPath) }()
+	if errChmod := tempFile.Chmod(0o600); errChmod != nil {
+		_ = tempFile.Close()
+		return errChmod
+	}
+	if _, errWrite := tempFile.Write(data); errWrite != nil {
+		_ = tempFile.Close()
+		return errWrite
+	}
+	if errSync := tempFile.Sync(); errSync != nil {
+		_ = tempFile.Close()
+		return errSync
+	}
+	if errClose := tempFile.Close(); errClose != nil {
+		return errClose
+	}
+	unlockTarget, errLock := authfileguard.LockRootTarget(root, relativePath)
+	if errLock != nil {
+		return fmt.Errorf("lock auth upload target: %w", errLock)
+	}
+	defer func() { err = errors.Join(err, unlockTarget()) }()
+	if existing, errRead := root.ReadFile(relativePath); errRead == nil {
+		if errRetired := coreauth.RejectRetiredGeminiCLIAuthFileMutation(existing); errRetired != nil {
+			return errRetired
+		}
+	} else if !errors.Is(errRead, os.ErrNotExist) {
+		return errRead
+	}
+	if errRename := root.Rename(tempPath, relativePath); errRename != nil {
+		return errRename
+	}
+	return syncManagedAuthDirectory(root, filepath.Dir(relativePath))
 }
 
 func requestedAuthFileNamesForDelete(c *gin.Context) ([]string, error) {
@@ -1112,43 +1911,365 @@ func uniqueAuthFileNames(names []string) []string {
 	return out
 }
 
-func (h *Handler) deleteAuthFileByName(ctx context.Context, name string) (string, int, error) {
-	name = strings.TrimSpace(name)
-	if isUnsafeAuthFileName(name) {
-		return "", http.StatusBadRequest, fmt.Errorf("invalid name")
+func (h *Handler) canonicalAuthFileNames(names []string) ([]string, error) {
+	root, lexicalAuthDir, authDir, errRoot := h.openManagedAuthRootSnapshot()
+	if errRoot != nil {
+		return nil, errRoot
 	}
-
-	targetPath := filepath.Join(h.cfg.AuthDir, filepath.Base(name))
-	targetID := ""
-	if targetAuth := h.findAuthForDelete(name); targetAuth != nil {
-		targetID = strings.TrimSpace(targetAuth.ID)
-		if path := strings.TrimSpace(authAttribute(targetAuth, "path")); path != "" {
-			targetPath = path
-		}
-	}
-	if !filepath.IsAbs(targetPath) {
-		if abs, errAbs := filepath.Abs(targetPath); errAbs == nil {
-			targetPath = abs
-		}
-	}
-	if errRemove := os.Remove(targetPath); errRemove != nil {
-		if os.IsNotExist(errRemove) {
-			return filepath.Base(name), http.StatusNotFound, errAuthFileNotFound
-		}
-		return filepath.Base(name), http.StatusInternalServerError, fmt.Errorf("failed to remove file: %w", errRemove)
-	}
-	if errDeleteRecord := h.deleteTokenRecord(ctx, targetPath); errDeleteRecord != nil {
-		return filepath.Base(name), http.StatusInternalServerError, errDeleteRecord
-	}
-	if targetID != "" {
-		h.disableAuth(ctx, targetID)
-	} else {
-		h.disableAuth(ctx, targetPath)
-	}
-	return filepath.Base(name), http.StatusOK, nil
+	defer closeManagedAuthRoot(root)
+	return h.canonicalAuthFileNamesAtRoot(root, lexicalAuthDir, authDir, names)
 }
 
-func (h *Handler) findAuthForDelete(name string) *coreauth.Auth {
+func (h *Handler) canonicalAuthFileNamesAtRoot(root *os.Root, lexicalAuthDir, authDir string, names []string) ([]string, error) {
+	seen := make(map[string]struct{}, len(names))
+	out := make([]string, 0, len(names))
+	for _, name := range names {
+		candidate := name
+		diskFileExists, errPresence := managedAuthFileExistsAtRoot(root, authDir, name)
+		if errPresence != nil {
+			return nil, errPresence
+		}
+		if !diskFileExists && h.authManager != nil {
+			lookupName := strings.TrimSpace(name)
+			auth, ok := h.authManager.GetByID(lookupName)
+			if !ok && runtime.GOOS == "windows" {
+				auth, ok = h.authManager.GetByID(strings.ToLower(lookupName))
+			}
+			if ok && auth != nil && !isRuntimeOnlyAuth(auth) {
+				if backingName, managed := managedAuthBackingFileNameAtRoot(root, lexicalAuthDir, authDir, auth); managed {
+					candidate = backingName
+				}
+			}
+		}
+		_, canonicalName, errResolve := resolveManagedAuthFilePathAtRoot(root, authDir, candidate)
+		if errResolve != nil {
+			return nil, errResolve
+		}
+		key := managedAuthNameKey(canonicalName)
+		if _, exists := seen[key]; exists {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, canonicalName)
+	}
+	return out, nil
+}
+
+func (h *Handler) managedAuthFileExists(name string) (bool, error) {
+	root, _, authDir, errRoot := h.openManagedAuthRootSnapshot()
+	if errRoot != nil {
+		return false, errRoot
+	}
+	defer closeManagedAuthRoot(root)
+	return managedAuthFileExistsAtRoot(root, authDir, name)
+}
+
+func managedAuthFileExistsAtRoot(root *os.Root, authDir, name string) (bool, error) {
+	_, normalizedName, errNormalize := resolveManagedAuthFilePathAtRoot(root, authDir, name)
+	if errNormalize != nil {
+		if errors.Is(errNormalize, errInvalidAuthFileName) {
+			return false, nil
+		}
+		return false, errNormalize
+	}
+	_, errStat := root.Lstat(filepath.FromSlash(normalizedName))
+	if errStat == nil {
+		return true, nil
+	}
+	if os.IsNotExist(errStat) {
+		return false, nil
+	}
+	return false, fmt.Errorf("inspect auth file: %w", errStat)
+}
+
+func (h *Handler) deleteAuthFileByName(ctx context.Context, name string) (string, int, error) {
+	name = strings.TrimSpace(name)
+	root, lexicalAuthDir, authDir, errRoot := h.openManagedAuthRootSnapshot()
+	if errRoot != nil {
+		if errors.Is(errRoot, fs.ErrNotExist) {
+			return "", http.StatusNotFound, errAuthFileNotFound
+		}
+		return "", http.StatusInternalServerError, errRoot
+	}
+	defer closeManagedAuthRoot(root)
+	return h.deleteAuthFileByNameAtRoot(ctx, root, lexicalAuthDir, authDir, name)
+}
+
+func (h *Handler) deleteAuthFileByNameAtRoot(ctx context.Context, root *os.Root, lexicalAuthDir, authDir, name string) (string, int, error) {
+	targetPath, displayName, errResolve := resolveManagedAuthFilePathAtRoot(root, authDir, name)
+	if errResolve != nil {
+		return "", managedAuthPathErrorStatus(errResolve), errResolve
+	}
+	actualName, errActualName := actualManagedAuthFileNameAtRoot(root, displayName)
+	if errActualName != nil {
+		return "", http.StatusInternalServerError, fmt.Errorf("resolve auth file name: %w", errActualName)
+	}
+	displayName = actualName
+	targetPath = filepath.Join(authDir, filepath.FromSlash(displayName))
+	unlockOperation := lockManagedAuthFileOperation(targetPath)
+	defer unlockOperation()
+	relativePath := filepath.FromSlash(displayName)
+	originalSnapshot, errRead := captureManagedAuthFileSnapshotAtRoot(root, relativePath)
+	if errRead != nil {
+		if errors.Is(errRead, fs.ErrNotExist) {
+			return displayName, http.StatusNotFound, errAuthFileNotFound
+		}
+		return displayName, http.StatusInternalServerError, fmt.Errorf("inspect auth file before deletion: %w", errRead)
+	}
+	data := originalSnapshot.data
+	if errAccess := validateExplicitManagedAuthFileAccess(displayName, data); errAccess != nil {
+		return displayName, http.StatusBadRequest, errAccess
+	}
+	if coreauth.IsRetiredGeminiCLIAuthFileData(data) {
+		authfileguard.MarkRetired(targetPath)
+	}
+	retiredSnapshot := authfileguard.CaptureRetired(targetPath)
+	targetID := ""
+	if h.authManager != nil {
+		for _, auth := range h.authManager.List() {
+			if auth == nil || isRuntimeOnlyAuth(auth) {
+				continue
+			}
+			managedName, managed := managedAuthBackingFileNameAtRoot(root, lexicalAuthDir, authDir, auth)
+			if managed && managedAuthNameEqual(managedName, displayName) {
+				targetID = strings.TrimSpace(auth.ID)
+				break
+			}
+		}
+	}
+	storeID := targetID
+	if storeID == "" {
+		storeID = h.authIDForPath(targetPath)
+	}
+	deleteStore := func(operationCtx context.Context) error {
+		return h.withTokenStore(func(store coreauth.Store) error {
+			switch builtin := store.(type) {
+			case *sdkAuth.FileTokenStore:
+				return h.deleteLocalAuthFileDurably(builtin, root, authDir, filepath.FromSlash(displayName))
+			case *internalstore.GitTokenStore:
+				return builtin.DeleteAuthFileAtRoot(operationCtx, authDir, root, filepath.FromSlash(displayName))
+			case *internalstore.ObjectTokenStore:
+				return builtin.DeleteAuthFileAtRoot(operationCtx, root, filepath.FromSlash(displayName))
+			case *internalstore.PostgresStore:
+				return builtin.DeleteAuthFileAtRoot(operationCtx, root, filepath.FromSlash(displayName))
+			}
+			if dirSetter, ok := store.(interface{ SetBaseDir(string) }); ok {
+				dirSetter.SetBaseDir(lexicalAuthDir)
+			}
+			conditionalStore, supportsConditionalDelete := store.(coreauth.SourceConditionalDeleteStore)
+			if !supportsConditionalDelete {
+				return coreauth.NewDeleteOutcomeError(coreauth.DeleteOutcomeRolledBack, errors.New("custom auth store does not support source-conditional deletion"))
+			}
+			if storeID == "" {
+				return coreauth.NewDeleteOutcomeError(coreauth.DeleteOutcomeRolledBack, errors.New("managed auth store identifier is empty"))
+			}
+			return h.deleteCustomAuthFileDurably(operationCtx, conditionalStore, storeID, root, authDir, relativePath, targetPath, originalSnapshot)
+		})
+	}
+	var errDelete error
+	if targetID != "" && h.authManager != nil {
+		errDelete = h.authManager.DeleteWithOperationFailClosed(ctx, targetID, deleteStore)
+	} else {
+		errDelete = deleteStore(ctx)
+		if outcome, ok := coreauth.DeleteOutcomeFromError(errDelete); ok && outcome == coreauth.DeleteOutcomeCommitted {
+			errDelete = nil
+		}
+	}
+	if errDelete != nil {
+		if errors.Is(errDelete, errAuthFileNotFound) || errors.Is(errDelete, fs.ErrNotExist) {
+			return displayName, http.StatusNotFound, errAuthFileNotFound
+		}
+		return displayName, http.StatusInternalServerError, errDelete
+	}
+	authfileguard.ClearRetiredSnapshot(retiredSnapshot)
+	if targetID == "" && h.authManager != nil {
+		for _, auth := range h.authManager.List() {
+			if !authBackedByManagedPath(auth, targetPath, authDir) {
+				continue
+			}
+			if errRuntimeDelete := h.authManager.Delete(coreauth.WithSkipPersist(ctx), auth.ID); errRuntimeDelete != nil {
+				return displayName, http.StatusInternalServerError, fmt.Errorf("remove deleted auth from runtime: %w", errRuntimeDelete)
+			}
+		}
+	}
+	return displayName, http.StatusOK, nil
+}
+
+func removeManagedAuthFileSnapshot(root *os.Root, relativePath string, original managedAuthFileSnapshot) (resultErr error) {
+	parentRoot, leaf, closeParent, errParent := openManagedAuthSnapshotParent(root, relativePath)
+	if errParent != nil {
+		return coreauth.NewDeleteOutcomeError(coreauth.DeleteOutcomeUncertain, fmt.Errorf("open auth parent after store deletion: %w", errParent))
+	}
+	defer func() {
+		if errClose := closeParent(); errClose != nil {
+			outcome := coreauth.DeleteOutcomeCommitted
+			if resultErr != nil {
+				if current, explicit := coreauth.DeleteOutcomeFromError(resultErr); explicit {
+					outcome = current
+				} else {
+					outcome = coreauth.DeleteOutcomeUncertain
+				}
+			}
+			resultErr = coreauth.NewDeleteOutcomeError(outcome, errors.Join(resultErr, fmt.Errorf("close auth parent after store deletion: %w", errClose)))
+		}
+	}()
+	return removeManagedAuthFileSnapshotAtParent(parentRoot, leaf, original)
+}
+
+func removeManagedAuthFileSnapshotAtParent(parentRoot *os.Root, leaf string, original managedAuthFileSnapshot) (resultErr error) {
+	unlockTarget, errLock := authfileguard.LockRootTarget(parentRoot, leaf)
+	if errLock != nil {
+		return coreauth.NewDeleteOutcomeError(coreauth.DeleteOutcomeUncertain, fmt.Errorf("lock auth file after store deletion: %w", errLock))
+	}
+	defer func() {
+		if errUnlock := unlockTarget(); errUnlock != nil {
+			outcome := coreauth.DeleteOutcomeCommitted
+			if resultErr != nil {
+				if current, explicit := coreauth.DeleteOutcomeFromError(resultErr); explicit {
+					outcome = current
+				} else {
+					outcome = coreauth.DeleteOutcomeUncertain
+				}
+			}
+			resultErr = coreauth.NewDeleteOutcomeError(outcome, errors.Join(resultErr, fmt.Errorf("unlock auth file after store deletion: %w", errUnlock)))
+		}
+	}()
+
+	current, errCurrent := captureManagedAuthFileSnapshotAtRoot(parentRoot, leaf)
+	if errCurrent != nil {
+		if errors.Is(errCurrent, fs.ErrNotExist) {
+			return nil
+		}
+		return coreauth.NewDeleteOutcomeError(coreauth.DeleteOutcomeUncertain, fmt.Errorf("revalidate auth file after store deletion: %w", errCurrent))
+	}
+	if !sameManagedAuthFileSnapshot(current, original) {
+		return coreauth.NewDeleteOutcomeError(coreauth.DeleteOutcomeUncertain, authfileguard.ErrPersistGenerationStale)
+	}
+	if errRemove := parentRoot.Remove(leaf); errRemove != nil {
+		if os.IsNotExist(errRemove) {
+			return nil
+		}
+		return coreauth.NewDeleteOutcomeError(coreauth.DeleteOutcomeUncertain, fmt.Errorf("failed to remove file: %w", errRemove))
+	}
+	if errSync := syncManagedAuthDirectory(parentRoot, "."); errSync != nil {
+		return coreauth.NewDeleteOutcomeError(coreauth.DeleteOutcomeUncertain, fmt.Errorf("sync removed auth file: %w", errSync))
+	}
+	return nil
+}
+
+func (h *Handler) deleteCustomAuthFileDurably(ctx context.Context, store coreauth.SourceConditionalDeleteStore, storeID string, root *os.Root, authDir, relativePath, targetPath string, original managedAuthFileSnapshot) error {
+	expectedHash := coreauth.SourceHashFromBytes(original.data)
+	generation := authfileguard.NewDeleteGeneration(expectedHash)
+	if errPersist := watcher.PersistAuthDeleteQuarantine(h.configFilePath, authDir, targetPath, generation); errPersist != nil {
+		return coreauth.NewDeleteOutcomeError(coreauth.DeleteOutcomeRolledBack, fmt.Errorf("persist custom store delete quarantine: %w", errPersist))
+	}
+
+	deleteCtx := authfileguard.WithDeleteGeneration(ctx, generation)
+	errDelete := store.DeleteIfSourceHashMatches(deleteCtx, storeID, expectedHash)
+	if errDelete != nil {
+		outcome, explicit := coreauth.DeleteOutcomeFromError(errDelete)
+		if !explicit || outcome == coreauth.DeleteOutcomeUncertain {
+			return errDelete
+		}
+		if outcome == coreauth.DeleteOutcomeRolledBack {
+			if errClear := watcher.ClearAuthDeleteQuarantine(h.configFilePath, authDir, targetPath, generation); errClear != nil {
+				return coreauth.NewDeleteOutcomeError(coreauth.DeleteOutcomeUncertain, errors.Join(errDelete, fmt.Errorf("clear rolled-back custom store delete quarantine: %w", errClear)))
+			}
+			return errDelete
+		}
+	}
+
+	if errRemove := removeManagedAuthFileSnapshot(root, relativePath, original); errRemove != nil {
+		outcome, explicit := coreauth.DeleteOutcomeFromError(errRemove)
+		if !explicit {
+			outcome = coreauth.DeleteOutcomeUncertain
+		}
+		return coreauth.NewDeleteOutcomeError(outcome, errors.Join(errDelete, errRemove))
+	}
+	if errClear := watcher.ClearAuthDeleteQuarantine(h.configFilePath, authDir, targetPath, generation); errClear != nil {
+		return coreauth.NewDeleteOutcomeError(coreauth.DeleteOutcomeCommitted, errors.Join(errDelete, fmt.Errorf("clear committed custom store delete quarantine: %w", errClear)))
+	}
+	return errDelete
+}
+
+func (h *Handler) deleteLocalAuthFileDurably(store *sdkAuth.FileTokenStore, root *os.Root, authDir, name string) error {
+	if store == nil {
+		return coreauth.NewDeleteOutcomeError(coreauth.DeleteOutcomeRolledBack, errors.New("auth filestore is nil"))
+	}
+	preparedPath := ""
+	var deleteGeneration *authfileguard.DeleteGeneration
+	errDelete := store.DeleteAuthFileAtRootPrepared(authDir, root, name, func(_ string, data []byte) error {
+		generation := authfileguard.NewDeleteGeneration(coreauth.SourceHashFromBytes(data))
+		path := filepath.Join(authDir, name)
+		if errPersist := watcher.PersistAuthDeleteQuarantine(h.configFilePath, authDir, path, generation); errPersist != nil {
+			return errPersist
+		}
+		preparedPath = path
+		deleteGeneration = generation
+		return nil
+	})
+	if errDelete != nil || preparedPath == "" {
+		return errDelete
+	}
+	if errClear := watcher.ClearAuthDeleteQuarantine(h.configFilePath, authDir, preparedPath, deleteGeneration); errClear != nil {
+		return coreauth.NewDeleteOutcomeError(coreauth.DeleteOutcomeCommitted, fmt.Errorf("clear local auth deletion quarantine: %w", errClear))
+	}
+	return nil
+}
+
+func authBackedByManagedPath(auth *coreauth.Auth, targetPath, authDir string) bool {
+	if auth == nil || isRuntimeOnlyAuth(auth) {
+		return false
+	}
+	path := strings.TrimSpace(authAttribute(auth, "path"))
+	if path == "" {
+		path = strings.TrimSpace(auth.FileName)
+	}
+	if path == "" {
+		return false
+	}
+	if !filepath.IsAbs(path) {
+		path = filepath.Join(authDir, filepath.FromSlash(path))
+	}
+	pathAbs, errPath := filepath.Abs(path)
+	targetAbs, errTarget := filepath.Abs(targetPath)
+	if errPath != nil || errTarget != nil {
+		return false
+	}
+	pathAbs = filepath.Clean(pathAbs)
+	targetAbs = filepath.Clean(targetAbs)
+	if runtime.GOOS == "windows" {
+		return strings.EqualFold(pathAbs, targetAbs)
+	}
+	return pathAbs == targetAbs
+}
+
+func (h *Handler) findManagedFileAuth(name string) *coreauth.Auth {
+	if h == nil || h.authManager == nil {
+		return nil
+	}
+	root, lexicalAuthDir, authDir, errRoot := h.openManagedAuthRootSnapshot()
+	if errRoot != nil {
+		return nil
+	}
+	defer closeManagedAuthRoot(root)
+	_, normalizedName, errNormalize := resolveManagedAuthFilePathAtRoot(root, authDir, name)
+	if errNormalize != nil {
+		return nil
+	}
+	for _, auth := range h.authManager.List() {
+		if auth == nil || isRuntimeOnlyAuth(auth) {
+			continue
+		}
+		managedName, managed := managedAuthBackingFileNameAtRoot(root, lexicalAuthDir, authDir, auth)
+		if managed && managedAuthNameEqual(managedName, normalizedName) {
+			return auth
+		}
+	}
+	return nil
+}
+
+func (h *Handler) findManagedAuth(name string) *coreauth.Auth {
 	if h == nil || h.authManager == nil {
 		return nil
 	}
@@ -1156,22 +2277,94 @@ func (h *Handler) findAuthForDelete(name string) *coreauth.Auth {
 	if name == "" {
 		return nil
 	}
-	if auth, ok := h.authManager.GetByID(name); ok {
-		return auth
+	exactAuth, _ := h.authManager.GetByID(name)
+	if exactAuth != nil && isRuntimeOnlyAuth(exactAuth) {
+		return exactAuth
+	}
+	if runtime.GOOS == "windows" && exactAuth == nil {
+		exactAuth, _ = h.authManager.GetByID(strings.ToLower(name))
+		if exactAuth != nil && isRuntimeOnlyAuth(exactAuth) {
+			return exactAuth
+		}
+	}
+	if exists, errPresence := h.managedAuthFileExists(name); errPresence == nil && exists {
+		return h.findManagedFileAuth(name)
+	}
+	if exactAuth != nil {
+		return exactAuth
 	}
 	auths := h.authManager.List()
+	for _, auth := range auths {
+		if auth != nil && isRuntimeOnlyAuth(auth) && managedAuthNameEqual(strings.TrimSpace(auth.FileName), name) {
+			return auth
+		}
+	}
+	normalizedName, errNormalize := normalizeManagedAuthFileName(name)
+	if errNormalize != nil {
+		return nil
+	}
+	lookupID := normalizedName
+	if runtime.GOOS == "windows" {
+		lookupID = strings.ToLower(lookupID)
+	}
+	if auth, ok := h.authManager.GetByID(lookupID); ok {
+		return auth
+	}
 	for _, auth := range auths {
 		if auth == nil {
 			continue
 		}
-		if strings.TrimSpace(auth.FileName) == name {
+		if managedAuthNameEqual(filepath.ToSlash(strings.TrimSpace(auth.ID)), normalizedName) {
 			return auth
 		}
-		if filepath.Base(strings.TrimSpace(authAttribute(auth, "path"))) == name {
+		managedName, managed := h.managedAuthBackingFileName(auth)
+		if managed && managedAuthNameEqual(managedName, normalizedName) {
 			return auth
 		}
 	}
 	return nil
+}
+
+func managedAuthNameEqual(a, b string) bool {
+	if runtime.GOOS == "windows" {
+		return strings.EqualFold(a, b)
+	}
+	return a == b
+}
+
+func managedAuthNameKey(name string) string {
+	return managedAuthNameKeyForOS(name, runtime.GOOS)
+}
+
+func isTopLevelManagedAuthName(name string) bool {
+	name = filepath.ToSlash(strings.TrimSpace(name))
+	return name != "" && !strings.Contains(name, "/")
+}
+
+func managedAuthNameKeyForOS(name, goos string) string {
+	if goos == "windows" {
+		return strings.ToLower(name)
+	}
+	return name
+}
+
+func (h *Handler) sameManagedAuthFile(a, b string) bool {
+	if managedAuthNameEqual(a, b) {
+		return true
+	}
+	root, _, authDir, errRoot := h.openManagedAuthRootSnapshot()
+	if errRoot != nil {
+		return false
+	}
+	defer closeManagedAuthRoot(root)
+	_, nameA, errA := resolveManagedAuthFilePathAtRoot(root, authDir, a)
+	_, nameB, errB := resolveManagedAuthFilePathAtRoot(root, authDir, b)
+	if errA != nil || errB != nil {
+		return false
+	}
+	infoA, errA := root.Stat(filepath.FromSlash(nameA))
+	infoB, errB := root.Stat(filepath.FromSlash(nameB))
+	return errA == nil && errB == nil && os.SameFile(infoA, infoB)
 }
 
 func (h *Handler) authIDForPath(path string) string {
@@ -1185,21 +2378,31 @@ func (h *Handler) authIDForPath(path string) string {
 			path = abs
 		}
 	}
-	id := path
-	if h != nil && h.cfg != nil {
-		authDir := strings.TrimSpace(h.cfg.AuthDir)
-		if resolvedAuthDir, errResolve := util.ResolveAuthDir(authDir); errResolve == nil && resolvedAuthDir != "" {
-			authDir = resolvedAuthDir
+	lexicalPath := filepath.Clean(path)
+	resolvedPath := lexicalPath
+	if resolved, errEval := filepath.EvalSymlinks(lexicalPath); errEval == nil {
+		resolvedPath = filepath.Clean(resolved)
+	}
+	id := lexicalPath
+	setRelativeID := func(root, candidate string) bool {
+		if root == "" {
+			return false
 		}
-		if authDir != "" {
-			authDir = filepath.Clean(authDir)
-			if !filepath.IsAbs(authDir) {
-				if abs, errAbs := filepath.Abs(authDir); errAbs == nil {
-					authDir = abs
+		if rel, errRel := filepath.Rel(root, candidate); errRel == nil && rel != "" && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			id = rel
+			return true
+		}
+		return false
+	}
+	if authDir, errAuthDir := h.resolvedAuthDir(); errAuthDir == nil {
+		if !setRelativeID(authDir, resolvedPath) && h != nil && h.cfg != nil {
+			if lexicalAuthDir, errResolve := util.ResolveAuthDir(strings.TrimSpace(h.cfg.AuthDir)); errResolve == nil && lexicalAuthDir != "" {
+				if !filepath.IsAbs(lexicalAuthDir) {
+					if abs, errAbs := filepath.Abs(lexicalAuthDir); errAbs == nil {
+						lexicalAuthDir = abs
+					}
 				}
-			}
-			if rel, errRel := filepath.Rel(authDir, path); errRel == nil && rel != "" {
-				id = rel
+				setRelativeID(filepath.Clean(lexicalAuthDir), lexicalPath)
 			}
 		}
 	}
@@ -1214,11 +2417,168 @@ func (h *Handler) registerAuthFromFile(ctx context.Context, path string, data []
 	if h.authManager == nil {
 		return nil
 	}
+	retired, _, errParse := parseRetiredGeminiCLIAuthFile(data)
+	if errParse != nil {
+		return fmt.Errorf("invalid auth file: %w", errParse)
+	}
+	if retired {
+		return nil
+	}
 	auth, err := h.buildAuthFromFileData(path, data)
 	if err != nil {
 		return err
 	}
 	return h.upsertAuthRecord(ctx, auth)
+}
+
+func parseRetiredGeminiCLIAuthFile(data []byte) (bool, map[string]any, error) {
+	metadata := make(map[string]any)
+	if errUnmarshal := json.Unmarshal(data, &metadata); errUnmarshal != nil {
+		return false, nil, errUnmarshal
+	}
+	return coreauth.IsRetiredGeminiCLIAuthFileData(data), metadata, nil
+}
+
+func (h *Handler) rejectRetiredGeminiCLIAuthFileOperation(c *gin.Context, name string) bool {
+	auth := h.findManagedAuth(name)
+	if auth != nil {
+		if isRuntimeOnlyAuth(auth) {
+			return false
+		}
+		retired, errCheck := h.authBackedByRetiredGeminiCLIFile(auth)
+		if errCheck != nil {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "unable to verify auth file"})
+			return true
+		}
+		if retired {
+			c.JSON(http.StatusGone, gin.H{"error": errGeminiCLIAuthGone.Error()})
+			return true
+		}
+		if backingName, managed := h.managedAuthBackingFileName(auth); managed && !isTopLevelManagedAuthName(backingName) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": errInvalidAuthFileName.Error()})
+			return true
+		}
+		return false
+	}
+	if !strings.HasSuffix(strings.ToLower(strings.TrimSpace(name)), ".json") {
+		return false
+	}
+	retired, errCheck := h.isRetiredGeminiCLIManagedFile(name)
+	if errCheck != nil {
+		status := http.StatusServiceUnavailable
+		message := "unable to verify auth file"
+		switch {
+		case errors.Is(errCheck, errInvalidAuthFileName):
+			status = http.StatusBadRequest
+			message = errInvalidAuthFileName.Error()
+		case errors.Is(errCheck, fs.ErrNotExist):
+			status = http.StatusNotFound
+			message = "auth file not found"
+		}
+		c.JSON(status, gin.H{"error": message})
+		return true
+	}
+	if retired {
+		c.JSON(http.StatusGone, gin.H{"error": errGeminiCLIAuthGone.Error()})
+		return true
+	}
+	normalizedName, errNormalize := normalizeManagedAuthFileName(name)
+	if errNormalize == nil && !isTopLevelManagedAuthName(normalizedName) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": errInvalidAuthFileName.Error()})
+		return true
+	}
+	return false
+}
+
+func (h *Handler) isRetiredGeminiCLIManagedFile(name string) (bool, error) {
+	data, _, _, errRead := h.readManagedAuthFile(name)
+	if errRead != nil {
+		return false, errRead
+	}
+	retired, _, errParse := parseRetiredGeminiCLIAuthFile(data)
+	if errParse != nil {
+		return false, errParse
+	}
+	return retired, nil
+}
+
+func (h *Handler) authBackedByRetiredGeminiCLIFile(auth *coreauth.Auth) (bool, error) {
+	if auth == nil || isRuntimeOnlyAuth(auth) {
+		return false, nil
+	}
+	if isProvablyConfigBackedAuth(auth) {
+		return false, nil
+	}
+	root, lexicalAuthDir, authDir, errRoot := h.openManagedAuthRootSnapshot()
+	if errRoot != nil {
+		return false, errRoot
+	}
+	defer closeManagedAuthRoot(root)
+	explicitPath := strings.TrimSpace(authAttribute(auth, "path")) != "" || strings.TrimSpace(authAttribute(auth, "source")) != ""
+	name, managed := managedAuthBackingFileNameAtRoot(root, lexicalAuthDir, authDir, auth)
+	if !managed {
+		return false, nil
+	}
+	data, _, _, errRead := readManagedAuthFileAtRoot(root, authDir, name)
+	if errRead != nil {
+		if errors.Is(errRead, fs.ErrNotExist) && !explicitPath {
+			return false, nil
+		}
+		return false, errRead
+	}
+	retired, _, errParse := parseRetiredGeminiCLIAuthFile(data)
+	if errParse != nil {
+		return false, errParse
+	}
+	return retired, nil
+}
+
+func isProvablyConfigBackedAuth(auth *coreauth.Auth) bool {
+	if auth == nil || strings.TrimSpace(auth.FileName) != "" || strings.TrimSpace(authAttribute(auth, "path")) != "" {
+		return false
+	}
+
+	const configSourcePrefix = "config:"
+	source := strings.TrimSpace(authAttribute(auth, "source"))
+	if len(source) <= len(configSourcePrefix) || !strings.EqualFold(source[:len(configSourcePrefix)], configSourcePrefix) || !strings.HasSuffix(source, "]") {
+		return false
+	}
+	sourceIdentity := source[len(configSourcePrefix) : len(source)-1]
+	openBracket := strings.LastIndexByte(sourceIdentity, '[')
+	return openBracket > 0 && openBracket < len(sourceIdentity)-1
+}
+
+func (h *Handler) managedAuthBackingFileName(auth *coreauth.Auth) (string, bool) {
+	if auth == nil || isRuntimeOnlyAuth(auth) {
+		return "", false
+	}
+	root, lexicalAuthDir, authDir, errRoot := h.openManagedAuthRootSnapshot()
+	if errRoot != nil {
+		return "", false
+	}
+	defer closeManagedAuthRoot(root)
+	return managedAuthBackingFileNameAtRoot(root, lexicalAuthDir, authDir, auth)
+}
+
+func managedAuthBackingFileNameAtRoot(root *os.Root, lexicalAuthDir, authDir string, auth *coreauth.Auth) (string, bool) {
+	if auth == nil || isRuntimeOnlyAuth(auth) {
+		return "", false
+	}
+	path := strings.TrimSpace(authAttribute(auth, "path"))
+	if path != "" {
+		if name, managed := managedAuthFileNameAtRoot(root, lexicalAuthDir, authDir, path); managed {
+			return name, true
+		}
+		return "", false
+	}
+	fileName := strings.TrimSpace(auth.FileName)
+	if name, managed := managedAuthFileNameAtRoot(root, lexicalAuthDir, authDir, fileName); managed {
+		return name, true
+	}
+	if _, name, errResolve := resolveManagedAuthFilePathAtRoot(root, authDir, fileName); errResolve == nil {
+		return name, true
+	}
+	return "", false
 }
 
 func (h *Handler) buildAuthFromFileData(path string, data []byte) (*coreauth.Auth, error) {
@@ -1234,7 +2594,7 @@ func (h *Handler) buildAuthFromFileData(path string, data []byte) (*coreauth.Aut
 	}
 	metadata := make(map[string]any)
 	if err := json.Unmarshal(data, &metadata); err != nil {
-		return nil, fmt.Errorf("invalid auth file: %w", err)
+		return nil, fmt.Errorf("%w: %v", errInvalidAuthFileData, err)
 	}
 	provider, _ := metadata["type"].(string)
 	if provider == "" {
@@ -1276,6 +2636,7 @@ func (h *Handler) buildAuthFromFileData(path string, data []byte) (*coreauth.Aut
 		CreatedAt:  time.Now(),
 		UpdatedAt:  time.Now(),
 	}
+	coreauth.ApplyFileBackedGeminiAPIKey(auth)
 	if hasLastRefresh {
 		auth.LastRefreshedAt = lastRefresh
 	}
@@ -1334,22 +2695,13 @@ func (h *Handler) PatchAuthFileStatus(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "disabled is required"})
 		return
 	}
+	if h.rejectRetiredGeminiCLIAuthFileOperation(c, name) {
+		return
+	}
 
 	ctx := c.Request.Context()
 
-	// Find auth by name or ID
-	var targetAuth *coreauth.Auth
-	if auth, ok := h.authManager.GetByID(name); ok {
-		targetAuth = auth
-	} else {
-		auths := h.authManager.List()
-		for _, auth := range auths {
-			if auth.FileName == name {
-				targetAuth = auth
-				break
-			}
-		}
-	}
+	targetAuth := h.findManagedAuth(name)
 
 	if targetAuth == nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "auth file not found"})
@@ -1401,6 +2753,10 @@ func (h *Handler) PatchAuthFileStatus(c *gin.Context) {
 		updateCtx = coreauth.WithSkipStateCarryForward(updateCtx)
 	}
 	if _, err := h.authManager.Update(updateCtx, targetAuth); err != nil {
+		if errors.Is(err, coreauth.ErrRetiredGeminiCLIAuthReadOnly) {
+			c.JSON(http.StatusGone, gin.H{"error": errGeminiCLIAuthGone.Error()})
+			return
+		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to update auth: %v", err)})
 		return
 	}
@@ -1438,22 +2794,13 @@ func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "name is required"})
 		return
 	}
+	if h.rejectRetiredGeminiCLIAuthFileOperation(c, name) {
+		return
+	}
 
 	ctx := c.Request.Context()
 
-	// Find auth by name or ID
-	var targetAuth *coreauth.Auth
-	if auth, ok := h.authManager.GetByID(name); ok {
-		targetAuth = auth
-	} else {
-		auths := h.authManager.List()
-		for _, auth := range auths {
-			if auth.FileName == name {
-				targetAuth = auth
-				break
-			}
-		}
-	}
+	targetAuth := h.findManagedAuth(name)
 
 	if targetAuth == nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "auth file not found"})
@@ -1622,6 +2969,10 @@ func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 	targetAuth.UpdatedAt = time.Now()
 
 	if _, err := h.authManager.Update(ctx, targetAuth); err != nil {
+		if errors.Is(err, coreauth.ErrRetiredGeminiCLIAuthReadOnly) {
+			c.JSON(http.StatusGone, gin.H{"error": errGeminiCLIAuthGone.Error()})
+			return
+		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to update auth: %v", err)})
 		return
 	}
@@ -1662,48 +3013,63 @@ func (h *Handler) disableAuth(ctx context.Context, id string) {
 	}
 }
 
-func (h *Handler) deleteTokenRecord(ctx context.Context, path string) error {
-	if strings.TrimSpace(path) == "" {
-		return fmt.Errorf("auth path is empty")
+func (h *Handler) configuredAuthDirSnapshot() string {
+	if h == nil {
+		return ""
 	}
-	store := h.tokenStoreWithBaseDir()
-	if store == nil {
-		return fmt.Errorf("token store unavailable")
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.cfg == nil {
+		return ""
 	}
-	return store.Delete(ctx, path)
+	return h.cfg.AuthDir
 }
 
-func (h *Handler) tokenStoreWithBaseDir() coreauth.Store {
-	if h == nil {
-		return nil
+func (h *Handler) withTokenStoreBaseDir(baseDir string, operation func(coreauth.Store) error) error {
+	return h.withTokenStore(func(store coreauth.Store) error {
+		if dirSetter, ok := store.(interface{ SetBaseDir(string) }); ok {
+			dirSetter.SetBaseDir(baseDir)
+		}
+		return operation(store)
+	})
+}
+
+func (h *Handler) withTokenStore(operation func(coreauth.Store) error) error {
+	if h == nil || operation == nil {
+		return fmt.Errorf("token store unavailable")
 	}
+	h.tokenStoreMu.Lock()
+	defer h.tokenStoreMu.Unlock()
+
+	h.mu.Lock()
 	store := h.tokenStore
 	if store == nil {
 		store = sdkAuth.GetTokenStore()
 		h.tokenStore = store
 	}
-	if h.cfg != nil {
-		if dirSetter, ok := store.(interface{ SetBaseDir(string) }); ok {
-			dirSetter.SetBaseDir(h.cfg.AuthDir)
-		}
+	h.mu.Unlock()
+	if store == nil {
+		return fmt.Errorf("token store unavailable")
 	}
-	return store
+	return operation(store)
 }
 
 func (h *Handler) saveTokenRecord(ctx context.Context, record *coreauth.Auth) (string, error) {
 	if record == nil {
 		return "", fmt.Errorf("token record is nil")
 	}
-	store := h.tokenStoreWithBaseDir()
-	if store == nil {
-		return "", fmt.Errorf("token store unavailable")
-	}
 	if h.postAuthHook != nil {
 		if err := h.postAuthHook(ctx, record); err != nil {
 			return "", fmt.Errorf("post-auth hook failed: %w", err)
 		}
 	}
-	return store.Save(ctx, record)
+	var savedPath string
+	errSave := h.withTokenStoreBaseDir(h.configuredAuthDirSnapshot(), func(store coreauth.Store) error {
+		var err error
+		savedPath, err = store.Save(ctx, record)
+		return err
+	})
+	return savedPath, errSave
 }
 
 func (h *Handler) RequestAnthropicToken(c *gin.Context) {
@@ -1848,267 +3214,6 @@ func (h *Handler) RequestAnthropicToken(c *gin.Context) {
 		}
 		fmt.Println("You can now use Claude services through this CLI")
 		CompleteOAuthSession(state)
-	}()
-
-	c.JSON(200, gin.H{"status": "ok", "url": authURL, "state": state})
-}
-
-func (h *Handler) RequestGeminiCLIToken(c *gin.Context) {
-	ctx := context.Background()
-	ctx = PopulateAuthContext(ctx, c)
-	proxyHTTPClient := util.SetProxy(&h.cfg.SDKConfig, &http.Client{})
-	ctx = context.WithValue(ctx, oauth2.HTTPClient, proxyHTTPClient)
-
-	// Optional project ID from query
-	projectID := c.Query("project_id")
-
-	fmt.Println("Initializing Google authentication...")
-
-	// OAuth2 configuration using exported constants from internal/auth/gemini
-	conf := &oauth2.Config{
-		ClientID:     geminiAuth.ClientID,
-		ClientSecret: geminiAuth.ClientSecret,
-		RedirectURL:  fmt.Sprintf("http://localhost:%d/oauth2callback", geminiAuth.DefaultCallbackPort),
-		Scopes:       geminiAuth.Scopes,
-		Endpoint:     google.Endpoint,
-	}
-
-	// Build authorization URL and return it immediately
-	state := fmt.Sprintf("gem-%d", time.Now().UnixNano())
-	authURL := conf.AuthCodeURL(state, oauth2.AccessTypeOffline, oauth2.SetAuthURLParam("prompt", "consent"))
-
-	RegisterOAuthSession(state, "gemini")
-
-	isWebUI := isWebUIRequest(c)
-	var forwarder *callbackForwarder
-	if isWebUI {
-		targetURL, errTarget := h.managementCallbackURL("/google/callback")
-		if errTarget != nil {
-			log.WithError(errTarget).Error("failed to compute gemini callback target")
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "callback server unavailable"})
-			return
-		}
-		var errStart error
-		if forwarder, errStart = startCallbackForwarder(geminiCallbackPort, "gemini", targetURL); errStart != nil {
-			log.WithError(errStart).Error("failed to start gemini callback forwarder")
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to start callback server"})
-			return
-		}
-	}
-
-	go func() {
-		if isWebUI {
-			defer stopCallbackForwarderInstance(geminiCallbackPort, forwarder)
-		}
-
-		// Wait for callback file written by server route
-		waitFile := filepath.Join(h.cfg.AuthDir, fmt.Sprintf(".oauth-gemini-%s.oauth", state))
-		fmt.Println("Waiting for authentication callback...")
-		deadline := time.Now().Add(5 * time.Minute)
-		var authCode string
-		for {
-			if !IsOAuthSessionPending(state, "gemini") {
-				return
-			}
-			if time.Now().After(deadline) {
-				log.Error("oauth flow timed out")
-				SetOAuthSessionError(state, "OAuth flow timed out")
-				return
-			}
-			if data, errR := os.ReadFile(waitFile); errR == nil {
-				var m map[string]string
-				_ = json.Unmarshal(data, &m)
-				_ = os.Remove(waitFile)
-				if errStr := m["error"]; errStr != "" {
-					log.Errorf("Authentication failed: %s", errStr)
-					SetOAuthSessionError(state, "Authentication failed")
-					return
-				}
-				authCode = m["code"]
-				if authCode == "" {
-					log.Errorf("Authentication failed: code not found")
-					SetOAuthSessionError(state, "Authentication failed: code not found")
-					return
-				}
-				break
-			}
-			time.Sleep(500 * time.Millisecond)
-		}
-
-		// Exchange authorization code for token
-		token, err := conf.Exchange(ctx, authCode)
-		if err != nil {
-			log.Errorf("Failed to exchange token: %v", err)
-			SetOAuthSessionError(state, "Failed to exchange token")
-			return
-		}
-
-		requestedProjectID := strings.TrimSpace(projectID)
-
-		// Create token storage (mirrors internal/auth/gemini createTokenStorage)
-		authHTTPClient := conf.Client(ctx, token)
-		req, errNewRequest := http.NewRequestWithContext(ctx, "GET", "https://www.googleapis.com/oauth2/v1/userinfo?alt=json", nil)
-		if errNewRequest != nil {
-			log.Errorf("Could not get user info: %v", errNewRequest)
-			SetOAuthSessionError(state, "Could not get user info")
-			return
-		}
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", token.AccessToken))
-
-		resp, errDo := authHTTPClient.Do(req)
-		if errDo != nil {
-			log.Errorf("Failed to execute request: %v", errDo)
-			SetOAuthSessionError(state, "Failed to execute request")
-			return
-		}
-		defer func() {
-			if errClose := resp.Body.Close(); errClose != nil {
-				log.Printf("warn: failed to close response body: %v", errClose)
-			}
-		}()
-
-		bodyBytes, _ := io.ReadAll(resp.Body)
-		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-			log.Errorf("Get user info request failed with status %d: %s", resp.StatusCode, string(bodyBytes))
-			SetOAuthSessionError(state, fmt.Sprintf("Get user info request failed with status %d", resp.StatusCode))
-			return
-		}
-
-		email := gjson.GetBytes(bodyBytes, "email").String()
-		if email != "" {
-			fmt.Printf("Authenticated user email: %s\n", email)
-		} else {
-			fmt.Println("Failed to get user email from token")
-		}
-
-		// Marshal/unmarshal oauth2.Token to generic map and enrich fields
-		var ifToken map[string]any
-		jsonData, _ := json.Marshal(token)
-		if errUnmarshal := json.Unmarshal(jsonData, &ifToken); errUnmarshal != nil {
-			log.Errorf("Failed to unmarshal token: %v", errUnmarshal)
-			SetOAuthSessionError(state, "Failed to unmarshal token")
-			return
-		}
-
-		ifToken["token_uri"] = "https://oauth2.googleapis.com/token"
-		ifToken["client_id"] = geminiAuth.ClientID
-		ifToken["client_secret"] = geminiAuth.ClientSecret
-		ifToken["scopes"] = geminiAuth.Scopes
-		ifToken["universe_domain"] = "googleapis.com"
-
-		ts := geminiAuth.GeminiTokenStorage{
-			Token:     ifToken,
-			ProjectID: requestedProjectID,
-			Email:     email,
-			Auto:      requestedProjectID == "",
-		}
-
-		// Initialize authenticated HTTP client via GeminiAuth to honor proxy settings
-		gemAuth := geminiAuth.NewGeminiAuth()
-		gemClient, errGetClient := gemAuth.GetAuthenticatedClient(ctx, &ts, h.cfg, &geminiAuth.WebLoginOptions{
-			NoBrowser: true,
-		})
-		if errGetClient != nil {
-			log.Errorf("failed to get authenticated client: %v", errGetClient)
-			SetOAuthSessionError(state, "Failed to get authenticated client")
-			return
-		}
-		fmt.Println("Authentication successful.")
-
-		if strings.EqualFold(requestedProjectID, "ALL") {
-			ts.Auto = false
-			projects, errAll := onboardAllGeminiProjects(ctx, gemClient, &ts)
-			if errAll != nil {
-				log.Errorf("Failed to complete Gemini CLI onboarding: %v", errAll)
-				SetOAuthSessionError(state, fmt.Sprintf("Failed to complete Gemini CLI onboarding: %v", errAll))
-				return
-			}
-			if errVerify := ensureGeminiProjectsEnabled(ctx, gemClient, projects); errVerify != nil {
-				log.Errorf("Failed to verify Cloud AI API status: %v", errVerify)
-				SetOAuthSessionError(state, fmt.Sprintf("Failed to verify Cloud AI API status: %v", errVerify))
-				return
-			}
-			ts.ProjectID = strings.Join(projects, ",")
-			ts.Checked = true
-		} else if strings.EqualFold(requestedProjectID, "GOOGLE_ONE") {
-			ts.Auto = false
-			if errSetup := performGeminiCLISetup(ctx, gemClient, &ts, ""); errSetup != nil {
-				log.Errorf("Google One auto-discovery failed: %v", errSetup)
-				SetOAuthSessionError(state, fmt.Sprintf("Google One auto-discovery failed: %v", errSetup))
-				return
-			}
-			if strings.TrimSpace(ts.ProjectID) == "" {
-				log.Error("Google One auto-discovery returned empty project ID")
-				SetOAuthSessionError(state, "Google One auto-discovery returned empty project ID")
-				return
-			}
-			isChecked, errCheck := checkCloudAPIIsEnabled(ctx, gemClient, ts.ProjectID)
-			if errCheck != nil {
-				log.Errorf("Failed to verify Cloud AI API status: %v", errCheck)
-				SetOAuthSessionError(state, fmt.Sprintf("Failed to verify Cloud AI API status: %v", errCheck))
-				return
-			}
-			ts.Checked = isChecked
-			if !isChecked {
-				log.Error("Cloud AI API is not enabled for the auto-discovered project")
-				SetOAuthSessionError(state, fmt.Sprintf("Cloud AI API not enabled for project %s", ts.ProjectID))
-				return
-			}
-		} else {
-			if errEnsure := ensureGeminiProjectAndOnboard(ctx, gemClient, &ts, requestedProjectID); errEnsure != nil {
-				log.Errorf("Failed to complete Gemini CLI onboarding: %v", errEnsure)
-				SetOAuthSessionError(state, fmt.Sprintf("Failed to complete Gemini CLI onboarding: %v", errEnsure))
-				return
-			}
-
-			if strings.TrimSpace(ts.ProjectID) == "" {
-				log.Error("Onboarding did not return a project ID")
-				SetOAuthSessionError(state, "Failed to resolve project ID")
-				return
-			}
-
-			isChecked, errCheck := checkCloudAPIIsEnabled(ctx, gemClient, ts.ProjectID)
-			if errCheck != nil {
-				log.Errorf("Failed to verify Cloud AI API status: %v", errCheck)
-				SetOAuthSessionError(state, fmt.Sprintf("Failed to verify Cloud AI API status: %v", errCheck))
-				return
-			}
-			ts.Checked = isChecked
-			if !isChecked {
-				log.Error("Cloud AI API is not enabled for the selected project")
-				SetOAuthSessionError(state, fmt.Sprintf("Cloud AI API not enabled for project %s", ts.ProjectID))
-				return
-			}
-		}
-
-		recordMetadata := map[string]any{
-			"email":      ts.Email,
-			"project_id": ts.ProjectID,
-			"auto":       ts.Auto,
-			"checked":    ts.Checked,
-		}
-
-		fileName := geminiAuth.CredentialFileName(ts.Email, ts.ProjectID, true)
-		record := &coreauth.Auth{
-			ID:       fileName,
-			Provider: "gemini",
-			FileName: fileName,
-			Storage:  &ts,
-			Metadata: recordMetadata,
-		}
-		if errGuard := beginOAuthSessionSave(state, "gemini"); errGuard != nil {
-			return
-		}
-		savedPath, errSave := h.saveTokenRecord(ctx, record)
-		if errSave != nil {
-			log.Errorf("Failed to save token to file: %v", errSave)
-			SetOAuthSessionError(state, "Failed to save token to file")
-			return
-		}
-
-		CompleteOAuthSession(state)
-		fmt.Printf("You can now use Gemini CLI services through this CLI; token saved to %s\n", savedPath)
 	}()
 
 	c.JSON(200, gin.H{"status": "ok", "url": authURL, "state": state})
@@ -2624,397 +3729,6 @@ func (h *Handler) RequestKimiToken(c *gin.Context) {
 	c.JSON(200, gin.H{"status": "ok", "url": authURL, "state": state})
 }
 
-type projectSelectionRequiredError struct{}
-
-func (e *projectSelectionRequiredError) Error() string {
-	return "gemini cli: project selection required"
-}
-
-func ensureGeminiProjectAndOnboard(ctx context.Context, httpClient *http.Client, storage *geminiAuth.GeminiTokenStorage, requestedProject string) error {
-	if storage == nil {
-		return fmt.Errorf("gemini storage is nil")
-	}
-
-	trimmedRequest := strings.TrimSpace(requestedProject)
-	if trimmedRequest == "" {
-		projects, errProjects := fetchGCPProjects(ctx, httpClient)
-		if errProjects != nil {
-			return fmt.Errorf("fetch project list: %w", errProjects)
-		}
-		if len(projects) == 0 {
-			return fmt.Errorf("no Google Cloud projects available for this account")
-		}
-		trimmedRequest = strings.TrimSpace(projects[0].ProjectID)
-		if trimmedRequest == "" {
-			return fmt.Errorf("resolved project id is empty")
-		}
-		storage.Auto = true
-	} else {
-		storage.Auto = false
-	}
-
-	if err := performGeminiCLISetup(ctx, httpClient, storage, trimmedRequest); err != nil {
-		return err
-	}
-
-	if strings.TrimSpace(storage.ProjectID) == "" {
-		storage.ProjectID = trimmedRequest
-	}
-
-	return nil
-}
-
-func onboardAllGeminiProjects(ctx context.Context, httpClient *http.Client, storage *geminiAuth.GeminiTokenStorage) ([]string, error) {
-	projects, errProjects := fetchGCPProjects(ctx, httpClient)
-	if errProjects != nil {
-		return nil, fmt.Errorf("fetch project list: %w", errProjects)
-	}
-	if len(projects) == 0 {
-		return nil, fmt.Errorf("no Google Cloud projects available for this account")
-	}
-	activated := make([]string, 0, len(projects))
-	seen := make(map[string]struct{}, len(projects))
-	for _, project := range projects {
-		candidate := strings.TrimSpace(project.ProjectID)
-		if candidate == "" {
-			continue
-		}
-		if _, dup := seen[candidate]; dup {
-			continue
-		}
-		if err := performGeminiCLISetup(ctx, httpClient, storage, candidate); err != nil {
-			return nil, fmt.Errorf("onboard project %s: %w", candidate, err)
-		}
-		finalID := strings.TrimSpace(storage.ProjectID)
-		if finalID == "" {
-			finalID = candidate
-		}
-		activated = append(activated, finalID)
-		seen[candidate] = struct{}{}
-	}
-	if len(activated) == 0 {
-		return nil, fmt.Errorf("no Google Cloud projects available for this account")
-	}
-	return activated, nil
-}
-
-func ensureGeminiProjectsEnabled(ctx context.Context, httpClient *http.Client, projectIDs []string) error {
-	for _, pid := range projectIDs {
-		trimmed := strings.TrimSpace(pid)
-		if trimmed == "" {
-			continue
-		}
-		isChecked, errCheck := checkCloudAPIIsEnabled(ctx, httpClient, trimmed)
-		if errCheck != nil {
-			return fmt.Errorf("project %s: %w", trimmed, errCheck)
-		}
-		if !isChecked {
-			return fmt.Errorf("project %s: Cloud AI API not enabled", trimmed)
-		}
-	}
-	return nil
-}
-
-func performGeminiCLISetup(ctx context.Context, httpClient *http.Client, storage *geminiAuth.GeminiTokenStorage, requestedProject string) error {
-	metadata := map[string]string{
-		"ideType":    "IDE_UNSPECIFIED",
-		"platform":   "PLATFORM_UNSPECIFIED",
-		"pluginType": "GEMINI",
-	}
-
-	trimmedRequest := strings.TrimSpace(requestedProject)
-	explicitProject := trimmedRequest != ""
-
-	loadReqBody := map[string]any{
-		"metadata": metadata,
-	}
-	if explicitProject {
-		loadReqBody["cloudaicompanionProject"] = trimmedRequest
-	}
-
-	var loadResp map[string]any
-	if errLoad := callGeminiCLI(ctx, httpClient, "loadCodeAssist", loadReqBody, &loadResp); errLoad != nil {
-		return fmt.Errorf("load code assist: %w", errLoad)
-	}
-
-	tierID := "legacy-tier"
-	if tiers, okTiers := loadResp["allowedTiers"].([]any); okTiers {
-		for _, rawTier := range tiers {
-			tier, okTier := rawTier.(map[string]any)
-			if !okTier {
-				continue
-			}
-			if isDefault, okDefault := tier["isDefault"].(bool); okDefault && isDefault {
-				if id, okID := tier["id"].(string); okID && strings.TrimSpace(id) != "" {
-					tierID = strings.TrimSpace(id)
-					break
-				}
-			}
-		}
-	}
-
-	projectID := trimmedRequest
-	if projectID == "" {
-		if id, okProject := loadResp["cloudaicompanionProject"].(string); okProject {
-			projectID = strings.TrimSpace(id)
-		}
-		if projectID == "" {
-			if projectMap, okProject := loadResp["cloudaicompanionProject"].(map[string]any); okProject {
-				if id, okID := projectMap["id"].(string); okID {
-					projectID = strings.TrimSpace(id)
-				}
-			}
-		}
-	}
-	if projectID == "" {
-		// Auto-discovery: try onboardUser without specifying a project
-		// to let Google auto-provision one (matches Gemini CLI headless behavior
-		// and Antigravity's FetchProjectID pattern).
-		autoOnboardReq := map[string]any{
-			"tierId":   tierID,
-			"metadata": metadata,
-		}
-
-		autoCtx, autoCancel := context.WithTimeout(ctx, 30*time.Second)
-		defer autoCancel()
-		for attempt := 1; ; attempt++ {
-			var onboardResp map[string]any
-			if errOnboard := callGeminiCLI(autoCtx, httpClient, "onboardUser", autoOnboardReq, &onboardResp); errOnboard != nil {
-				return fmt.Errorf("auto-discovery onboardUser: %w", errOnboard)
-			}
-
-			if done, okDone := onboardResp["done"].(bool); okDone && done {
-				if resp, okResp := onboardResp["response"].(map[string]any); okResp {
-					switch v := resp["cloudaicompanionProject"].(type) {
-					case string:
-						projectID = strings.TrimSpace(v)
-					case map[string]any:
-						if id, okID := v["id"].(string); okID {
-							projectID = strings.TrimSpace(id)
-						}
-					}
-				}
-				break
-			}
-
-			log.Debugf("Auto-discovery: onboarding in progress, attempt %d...", attempt)
-			select {
-			case <-autoCtx.Done():
-				return &projectSelectionRequiredError{}
-			case <-time.After(2 * time.Second):
-			}
-		}
-
-		if projectID == "" {
-			return &projectSelectionRequiredError{}
-		}
-		log.Infof("Auto-discovered project ID via onboarding: %s", projectID)
-	}
-
-	onboardReqBody := map[string]any{
-		"tierId":                  tierID,
-		"metadata":                metadata,
-		"cloudaicompanionProject": projectID,
-	}
-
-	storage.ProjectID = projectID
-
-	for {
-		var onboardResp map[string]any
-		if errOnboard := callGeminiCLI(ctx, httpClient, "onboardUser", onboardReqBody, &onboardResp); errOnboard != nil {
-			return fmt.Errorf("onboard user: %w", errOnboard)
-		}
-
-		if done, okDone := onboardResp["done"].(bool); okDone && done {
-			responseProjectID := ""
-			if resp, okResp := onboardResp["response"].(map[string]any); okResp {
-				switch projectValue := resp["cloudaicompanionProject"].(type) {
-				case map[string]any:
-					if id, okID := projectValue["id"].(string); okID {
-						responseProjectID = strings.TrimSpace(id)
-					}
-				case string:
-					responseProjectID = strings.TrimSpace(projectValue)
-				}
-			}
-
-			finalProjectID := projectID
-			if responseProjectID != "" {
-				if explicitProject && !strings.EqualFold(responseProjectID, projectID) {
-					// Check if this is a free user (gen-lang-client projects or free/legacy tier)
-					isFreeUser := strings.HasPrefix(projectID, "gen-lang-client-") ||
-						strings.EqualFold(tierID, "FREE") ||
-						strings.EqualFold(tierID, "LEGACY")
-
-					if isFreeUser {
-						// For free users, use backend project ID for preview model access
-						log.Infof("Gemini onboarding: frontend project %s maps to backend project %s", projectID, responseProjectID)
-						log.Infof("Using backend project ID: %s (recommended for preview model access)", responseProjectID)
-						finalProjectID = responseProjectID
-					} else {
-						// Pro users: keep requested project ID (original behavior)
-						log.Warnf("Gemini onboarding returned project %s instead of requested %s; keeping requested project ID.", responseProjectID, projectID)
-					}
-				} else {
-					finalProjectID = responseProjectID
-				}
-			}
-
-			storage.ProjectID = strings.TrimSpace(finalProjectID)
-			if storage.ProjectID == "" {
-				storage.ProjectID = strings.TrimSpace(projectID)
-			}
-			if storage.ProjectID == "" {
-				return fmt.Errorf("onboard user completed without project id")
-			}
-			log.Infof("Onboarding complete. Using Project ID: %s", storage.ProjectID)
-			return nil
-		}
-
-		log.Println("Onboarding in progress, waiting 5 seconds...")
-		time.Sleep(5 * time.Second)
-	}
-}
-
-func callGeminiCLI(ctx context.Context, httpClient *http.Client, endpoint string, body any, result any) error {
-	endPointURL := fmt.Sprintf("%s/%s:%s", geminiCLIEndpoint, geminiCLIVersion, endpoint)
-	if strings.HasPrefix(endpoint, "operations/") {
-		endPointURL = fmt.Sprintf("%s/%s", geminiCLIEndpoint, endpoint)
-	}
-
-	var reader io.Reader
-	if body != nil {
-		rawBody, errMarshal := json.Marshal(body)
-		if errMarshal != nil {
-			return fmt.Errorf("marshal request body: %w", errMarshal)
-		}
-		reader = bytes.NewReader(rawBody)
-	}
-
-	req, errRequest := http.NewRequestWithContext(ctx, http.MethodPost, endPointURL, reader)
-	if errRequest != nil {
-		return fmt.Errorf("create request: %w", errRequest)
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", misc.GeminiCLIUserAgent(""))
-
-	resp, errDo := httpClient.Do(req)
-	if errDo != nil {
-		return fmt.Errorf("execute request: %w", errDo)
-	}
-	defer func() {
-		if errClose := resp.Body.Close(); errClose != nil {
-			log.Errorf("response body close error: %v", errClose)
-		}
-	}()
-
-	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
-		bodyBytes, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("api request failed with status %d: %s", resp.StatusCode, strings.TrimSpace(string(bodyBytes)))
-	}
-
-	if result == nil {
-		_, _ = io.Copy(io.Discard, resp.Body)
-		return nil
-	}
-
-	if errDecode := json.NewDecoder(resp.Body).Decode(result); errDecode != nil {
-		return fmt.Errorf("decode response body: %w", errDecode)
-	}
-
-	return nil
-}
-
-func fetchGCPProjects(ctx context.Context, httpClient *http.Client) ([]interfaces.GCPProjectProjects, error) {
-	req, errRequest := http.NewRequestWithContext(ctx, http.MethodGet, "https://cloudresourcemanager.googleapis.com/v1/projects", nil)
-	if errRequest != nil {
-		return nil, fmt.Errorf("could not create project list request: %w", errRequest)
-	}
-
-	resp, errDo := httpClient.Do(req)
-	if errDo != nil {
-		return nil, fmt.Errorf("failed to execute project list request: %w", errDo)
-	}
-	defer func() {
-		if errClose := resp.Body.Close(); errClose != nil {
-			log.Errorf("response body close error: %v", errClose)
-		}
-	}()
-
-	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
-		bodyBytes, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("project list request failed with status %d: %s", resp.StatusCode, strings.TrimSpace(string(bodyBytes)))
-	}
-
-	var projects interfaces.GCPProject
-	if errDecode := json.NewDecoder(resp.Body).Decode(&projects); errDecode != nil {
-		return nil, fmt.Errorf("failed to unmarshal project list: %w", errDecode)
-	}
-
-	return projects.Projects, nil
-}
-
-func checkCloudAPIIsEnabled(ctx context.Context, httpClient *http.Client, projectID string) (bool, error) {
-	serviceUsageURL := "https://serviceusage.googleapis.com"
-	requiredServices := []string{
-		"cloudaicompanion.googleapis.com",
-	}
-	for _, service := range requiredServices {
-		checkURL := fmt.Sprintf("%s/v1/projects/%s/services/%s", serviceUsageURL, projectID, service)
-		req, errRequest := http.NewRequestWithContext(ctx, http.MethodGet, checkURL, nil)
-		if errRequest != nil {
-			return false, fmt.Errorf("failed to create request: %w", errRequest)
-		}
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("User-Agent", misc.GeminiCLIUserAgent(""))
-		resp, errDo := httpClient.Do(req)
-		if errDo != nil {
-			return false, fmt.Errorf("failed to execute request: %w", errDo)
-		}
-
-		if resp.StatusCode == http.StatusOK {
-			bodyBytes, _ := io.ReadAll(resp.Body)
-			if gjson.GetBytes(bodyBytes, "state").String() == "ENABLED" {
-				_ = resp.Body.Close()
-				continue
-			}
-		}
-		_ = resp.Body.Close()
-
-		enableURL := fmt.Sprintf("%s/v1/projects/%s/services/%s:enable", serviceUsageURL, projectID, service)
-		req, errRequest = http.NewRequestWithContext(ctx, http.MethodPost, enableURL, strings.NewReader("{}"))
-		if errRequest != nil {
-			return false, fmt.Errorf("failed to create request: %w", errRequest)
-		}
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("User-Agent", misc.GeminiCLIUserAgent(""))
-		resp, errDo = httpClient.Do(req)
-		if errDo != nil {
-			return false, fmt.Errorf("failed to execute request: %w", errDo)
-		}
-
-		bodyBytes, _ := io.ReadAll(resp.Body)
-		errMessage := string(bodyBytes)
-		errMessageResult := gjson.GetBytes(bodyBytes, "error.message")
-		if errMessageResult.Exists() {
-			errMessage = errMessageResult.String()
-		}
-		if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusCreated {
-			_ = resp.Body.Close()
-			continue
-		} else if resp.StatusCode == http.StatusBadRequest {
-			_ = resp.Body.Close()
-			if strings.Contains(strings.ToLower(errMessage), "already enabled") {
-				continue
-			}
-		}
-		_ = resp.Body.Close()
-		return false, fmt.Errorf("project activation required: %s", errMessage)
-	}
-	return true, nil
-}
-
-// watchOAuthSessionCancel cancels pollCtx once the OAuth session is no longer pending.
 func watchOAuthSessionCancel(pollCtx context.Context, cancel context.CancelFunc, state, provider string) {
 	if cancel == nil {
 		return

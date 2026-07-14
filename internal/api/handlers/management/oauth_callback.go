@@ -31,6 +31,10 @@ func (h *Handler) PostOAuthCallback(c *gin.Context) {
 
 	canonicalProvider, err := NormalizeOAuthProvider(req.Provider)
 	if err != nil {
+		if errors.Is(err, errRetiredGeminiCLIOAuth) {
+			c.JSON(http.StatusGone, gin.H{"status": "error", "error": err.Error()})
+			return
+		}
 		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": "unsupported provider"})
 		return
 	}

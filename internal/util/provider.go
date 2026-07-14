@@ -265,7 +265,7 @@ func shouldMaskQueryParam(key string) bool {
 		return false
 	}
 	key = strings.TrimSuffix(key, "[]")
-	if key == "key" || strings.Contains(key, "api-key") || strings.Contains(key, "apikey") || strings.Contains(key, "api_key") {
+	if key == "code" || key == "state" || key == "key" || strings.Contains(key, "api-key") || strings.Contains(key, "apikey") || strings.Contains(key, "api_key") {
 		return true
 	}
 	if strings.Contains(key, "token") || strings.Contains(key, "secret") {

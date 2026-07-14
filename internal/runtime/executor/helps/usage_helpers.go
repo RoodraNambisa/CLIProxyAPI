@@ -25,7 +25,16 @@ type UsageReporter struct {
 	source             string
 	requestServiceTier string
 	requestedAt        time.Time
-	once               sync.Once
+	mu                 sync.Mutex
+	published          bool
+	observedDetail     usage.Detail
+	observed           bool
+	observedAdditional []observedModelUsage
+}
+
+type observedModelUsage struct {
+	model  string
+	detail usage.Detail
 }
 
 type usageExecutor interface {
@@ -63,11 +72,59 @@ func (r *UsageReporter) SetRequestServiceTierFromPayload(payload []byte) {
 	if r == nil {
 		return
 	}
-	r.requestServiceTier = extractServiceTierFromPayload(payload)
+	if serviceTier, ok := extractServiceTierFromPayload(payload); ok {
+		r.requestServiceTier = serviceTier
+	}
 }
 
 func (r *UsageReporter) Publish(ctx context.Context, detail usage.Detail) {
-	r.publishWithOutcome(ctx, detail, false)
+	r.publishWithOutcome(ctx, detail, false, true)
+}
+
+// Observe stores usage seen before a stream reaches a successful terminal
+// event. A later failure can still win without emitting a second record.
+func (r *UsageReporter) Observe(detail usage.Detail) {
+	if r == nil {
+		return
+	}
+	detail = normalizeUsageDetailTotal(detail)
+	r.mu.Lock()
+	if !r.published {
+		r.observedDetail = mergeObservedUsageDetail(r.observedDetail, detail)
+		r.observed = true
+	}
+	r.mu.Unlock()
+}
+
+func mergeObservedUsageDetail(current, next usage.Detail) usage.Detail {
+	merged := current
+	if next.InputTokens != 0 {
+		merged.InputTokens = next.InputTokens
+	}
+	if next.OutputTokens != 0 {
+		merged.OutputTokens = next.OutputTokens
+	}
+	if next.ReasoningTokens != 0 {
+		merged.ReasoningTokens = next.ReasoningTokens
+	}
+	if next.CachedTokens != 0 {
+		merged.CachedTokens = next.CachedTokens
+	}
+	if next.CacheCreationTokens != 0 {
+		merged.CacheCreationTokens = next.CacheCreationTokens
+	}
+	if tier := strings.TrimSpace(next.ResponseServiceTier); tier != "" {
+		merged.ResponseServiceTier = tier
+	}
+	total := merged.InputTokens + merged.OutputTokens + merged.ReasoningTokens
+	if next.TotalTokens > total {
+		total = next.TotalTokens
+	}
+	if current.TotalTokens > total {
+		total = current.TotalTokens
+	}
+	merged.TotalTokens = total
+	return merged
 }
 
 // SetTranslatedReasoningEffort is retained for executor compatibility. The v6
@@ -91,6 +148,24 @@ func (r *UsageReporter) PublishAdditionalModel(ctx context.Context, model string
 	usage.PublishRecord(ctx, record)
 }
 
+// ObserveAdditionalModel stages secondary-model usage until the primary
+// stream reaches a successful terminal event.
+func (r *UsageReporter) ObserveAdditionalModel(model string, detail usage.Detail) {
+	if r == nil {
+		return
+	}
+	model = strings.TrimSpace(model)
+	detail = normalizeUsageDetailTotal(detail)
+	if model == "" || !hasNonZeroTokenUsage(detail) {
+		return
+	}
+	r.mu.Lock()
+	if !r.published {
+		r.observedAdditional = append(r.observedAdditional, observedModelUsage{model: model, detail: detail})
+	}
+	r.mu.Unlock()
+}
+
 func (r *UsageReporter) buildAdditionalModelRecord(model string, detail usage.Detail) (usage.Record, bool) {
 	if r == nil {
 		return usage.Record{}, false
@@ -107,7 +182,7 @@ func (r *UsageReporter) buildAdditionalModelRecord(model string, detail usage.De
 }
 
 func (r *UsageReporter) PublishFailure(ctx context.Context, _ ...error) {
-	r.publishWithOutcome(ctx, usage.Detail{}, true)
+	r.publishWithOutcome(ctx, usage.Detail{}, true, true)
 }
 
 func (r *UsageReporter) TrackFailure(ctx context.Context, errPtr *error) {
@@ -119,14 +194,31 @@ func (r *UsageReporter) TrackFailure(ctx context.Context, errPtr *error) {
 	}
 }
 
-func (r *UsageReporter) publishWithOutcome(ctx context.Context, detail usage.Detail, failed bool) {
+func (r *UsageReporter) publishWithOutcome(ctx context.Context, detail usage.Detail, failed, explicitDetail bool) {
 	if r == nil {
 		return
 	}
 	detail = normalizeUsageDetailTotal(detail)
-	r.once.Do(func() {
-		usage.PublishRecord(ctx, r.buildRecord(detail, failed))
-	})
+	r.mu.Lock()
+	if r.published {
+		r.mu.Unlock()
+		return
+	}
+	r.published = true
+	if !failed && !explicitDetail && r.observed {
+		detail = r.observedDetail
+	}
+	additional := r.observedAdditional
+	r.observedAdditional = nil
+	r.mu.Unlock()
+
+	usage.PublishRecord(ctx, r.buildRecord(detail, failed))
+	if failed {
+		return
+	}
+	for i := range additional {
+		usage.PublishRecord(ctx, r.buildRecordForModel(additional[i].model, additional[i].detail, false))
+	}
 }
 
 func normalizeUsageDetailTotal(detail usage.Detail) usage.Detail {
@@ -148,17 +240,15 @@ func hasNonZeroTokenUsage(detail usage.Detail) bool {
 		detail.TotalTokens != 0
 }
 
-// ensurePublished guarantees that a usage record is emitted exactly once.
-// It is safe to call multiple times; only the first call wins due to once.Do.
+// EnsurePublished guarantees that a successful usage record is emitted once.
+// Any usage observed before the terminal event is included in that record.
 // This is used to ensure request counting even when upstream responses do not
 // include any usage fields (tokens), especially for streaming paths.
 func (r *UsageReporter) EnsurePublished(ctx context.Context) {
 	if r == nil {
 		return
 	}
-	r.once.Do(func() {
-		usage.PublishRecord(ctx, r.buildRecord(usage.Detail{}, false))
-	})
+	r.publishWithOutcome(ctx, usage.Detail{}, false, false)
 }
 
 func (r *UsageReporter) buildRecord(detail usage.Detail, failed bool) usage.Record {
@@ -188,13 +278,13 @@ func (r *UsageReporter) buildRecordForModel(model string, detail usage.Detail, f
 	}
 }
 
-func extractServiceTierFromPayload(payload []byte) string {
+func extractServiceTierFromPayload(payload []byte) (string, bool) {
 	for _, path := range []string{"service_tier", "request.service_tier"} {
 		if tier := strings.TrimSpace(gjson.GetBytes(payload, path).String()); tier != "" {
-			return tier
+			return tier, true
 		}
 	}
-	return usage.DefaultServiceTier
+	return "", false
 }
 
 func (r *UsageReporter) latency() time.Duration {
@@ -232,11 +322,6 @@ func APIKeyFromContext(ctx context.Context) string {
 func resolveUsageSource(auth *cliproxyauth.Auth, ctxAPIKey string) string {
 	if auth != nil {
 		provider := strings.TrimSpace(auth.Provider)
-		if strings.EqualFold(provider, "gemini-cli") {
-			if id := strings.TrimSpace(auth.ID); id != "" {
-				return id
-			}
-		}
 		if strings.EqualFold(provider, "vertex") {
 			if auth.Metadata != nil {
 				if projectID, ok := auth.Metadata["project_id"].(string); ok {
@@ -311,12 +396,13 @@ func (b *StreamUsageBuffer) ObserveOpenAIStream(line []byte) {
 	b.Observe(ParseOpenAIStreamUsage(line))
 }
 
-// Publish emits the buffered usage detail when one was observed.
-func (b *StreamUsageBuffer) Publish(ctx context.Context, reporter *UsageReporter) bool {
+// Publish stages the buffered usage detail until the reporter records a
+// successful terminal event. The method name is retained for compatibility.
+func (b *StreamUsageBuffer) Publish(_ context.Context, reporter *UsageReporter) bool {
 	if b == nil || !b.ok || reporter == nil {
 		return false
 	}
-	reporter.Publish(ctx, b.detail)
+	reporter.Observe(b.detail)
 	return true
 }
 
@@ -508,18 +594,6 @@ func parseGeminiFamilyUsageDetail(node gjson.Result) usage.Detail {
 	return detail
 }
 
-func ParseGeminiCLIUsage(data []byte) usage.Detail {
-	usageNode := gjson.ParseBytes(data)
-	node := usageNode.Get("response.usageMetadata")
-	if !node.Exists() {
-		node = usageNode.Get("response.usage_metadata")
-	}
-	if !node.Exists() {
-		return usage.Detail{}
-	}
-	return parseGeminiFamilyUsageDetail(node)
-}
-
 func ParseGeminiUsage(data []byte) usage.Detail {
 	usageNode := gjson.ParseBytes(data)
 	node := usageNode.Get("usageMetadata")
@@ -547,24 +621,12 @@ func ParseGeminiStreamUsage(line []byte) (usage.Detail, bool) {
 	return parseGeminiFamilyUsageDetail(node), true
 }
 
-func ParseGeminiCLIStreamUsage(line []byte) (usage.Detail, bool) {
-	payload := jsonPayload(line)
-	if len(payload) == 0 || !gjson.ValidBytes(payload) {
-		return usage.Detail{}, false
-	}
-	node := gjson.GetBytes(payload, "response.usageMetadata")
-	if !node.Exists() {
-		node = gjson.GetBytes(payload, "usage_metadata")
-	}
-	if !node.Exists() {
-		return usage.Detail{}, false
-	}
-	return parseGeminiFamilyUsageDetail(node), true
-}
-
 func ParseAntigravityUsage(data []byte) usage.Detail {
 	usageNode := gjson.ParseBytes(data)
 	node := usageNode.Get("response.usageMetadata")
+	if !node.Exists() {
+		node = usageNode.Get("response.usage_metadata")
+	}
 	if !node.Exists() {
 		node = usageNode.Get("usageMetadata")
 	}
@@ -584,6 +646,9 @@ func ParseAntigravityStreamUsage(line []byte) (usage.Detail, bool) {
 	}
 	node := gjson.GetBytes(payload, "response.usageMetadata")
 	if !node.Exists() {
+		node = gjson.GetBytes(payload, "response.usage_metadata")
+	}
+	if !node.Exists() {
 		node = gjson.GetBytes(payload, "usageMetadata")
 	}
 	if !node.Exists() {
@@ -600,6 +665,15 @@ var stopChunkWithoutUsage sync.Map
 func rememberStopWithoutUsage(traceID string) {
 	stopChunkWithoutUsage.Store(traceID, struct{}{})
 	time.AfterFunc(10*time.Minute, func() { stopChunkWithoutUsage.Delete(traceID) })
+}
+
+// GeminiTerminalAwaitsUsage reports whether a terminal stop event omits usage
+// that may arrive in a follow-up event.
+func GeminiTerminalAwaitsUsage(payload []byte) bool {
+	if len(payload) == 0 || !gjson.ValidBytes(payload) {
+		return false
+	}
+	return isStopChunkWithoutUsage(payload)
 }
 
 // FilterSSEUsageMetadata removes usageMetadata from SSE events that are not
@@ -682,36 +756,32 @@ func StripUsageMetadataFromJSON(rawJSON []byte) ([]byte, bool) {
 	}
 	terminalReason := finishReason.Exists() && strings.TrimSpace(finishReason.String()) != ""
 
-	usageMetadata := gjson.GetBytes(jsonBytes, "usageMetadata")
-	if !usageMetadata.Exists() {
-		usageMetadata = gjson.GetBytes(jsonBytes, "response.usageMetadata")
-	}
-
 	// Terminal chunk: keep as-is.
 	if terminalReason {
 		return rawJSON, false
 	}
 
-	// Nothing to strip
-	if !usageMetadata.Exists() {
+	if !hasUsageMetadata(jsonBytes) {
 		return rawJSON, false
 	}
 
-	// Remove usageMetadata from both possible locations
 	cleaned := jsonBytes
 	var changed bool
-
-	if usageMetadata = gjson.GetBytes(cleaned, "usageMetadata"); usageMetadata.Exists() {
-		// Rename usageMetadata to cpaUsageMetadata in the message_start event of Claude
-		cleaned, _ = sjson.SetRawBytes(cleaned, "cpaUsageMetadata", []byte(usageMetadata.Raw))
-		cleaned, _ = sjson.DeleteBytes(cleaned, "usageMetadata")
-		changed = true
-	}
-
-	if usageMetadata = gjson.GetBytes(cleaned, "response.usageMetadata"); usageMetadata.Exists() {
-		// Rename usageMetadata to cpaUsageMetadata in the message_start event of Claude
-		cleaned, _ = sjson.SetRawBytes(cleaned, "response.cpaUsageMetadata", []byte(usageMetadata.Raw))
-		cleaned, _ = sjson.DeleteBytes(cleaned, "response.usageMetadata")
+	for _, item := range []struct {
+		source string
+		target string
+	}{
+		{source: "usageMetadata", target: "cpaUsageMetadata"},
+		{source: "usage_metadata", target: "cpaUsageMetadata"},
+		{source: "response.usageMetadata", target: "response.cpaUsageMetadata"},
+		{source: "response.usage_metadata", target: "response.cpaUsageMetadata"},
+	} {
+		usageMetadata := gjson.GetBytes(cleaned, item.source)
+		if !usageMetadata.Exists() {
+			continue
+		}
+		cleaned, _ = sjson.SetRawBytes(cleaned, item.target, []byte(usageMetadata.Raw))
+		cleaned, _ = sjson.DeleteBytes(cleaned, item.source)
 		changed = true
 	}
 
@@ -726,6 +796,12 @@ func hasUsageMetadata(jsonBytes []byte) bool {
 		return true
 	}
 	if gjson.GetBytes(jsonBytes, "response.usageMetadata").Exists() {
+		return true
+	}
+	if gjson.GetBytes(jsonBytes, "usage_metadata").Exists() {
+		return true
+	}
+	if gjson.GetBytes(jsonBytes, "response.usage_metadata").Exists() {
 		return true
 	}
 	return false

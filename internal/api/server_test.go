@@ -164,24 +164,50 @@ func TestXAIVideoRoutesRegistered(t *testing.T) {
 	}
 }
 
-func TestV1InternalMethodRequiresAuth(t *testing.T) {
+func TestV1InternalMethodIsNotRegistered(t *testing.T) {
 	server := newTestServer(t)
-
-	unauthorizedReq := httptest.NewRequest(http.MethodPost, "/v1internal:method", strings.NewReader(`{}`))
-	unauthorizedReq.Header.Set("Content-Type", "application/json")
-	unauthorizedRec := httptest.NewRecorder()
-	server.engine.ServeHTTP(unauthorizedRec, unauthorizedReq)
-	if unauthorizedRec.Code != http.StatusUnauthorized {
-		t.Fatalf("unauthorized status = %d, want %d; body=%s", unauthorizedRec.Code, http.StatusUnauthorized, unauthorizedRec.Body.String())
+	req := httptest.NewRequest(http.MethodPost, "/v1internal:method", nil)
+	req.Header.Set("Authorization", "Bearer test-key")
+	recorder := httptest.NewRecorder()
+	server.engine.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want %d; body=%s", recorder.Code, http.StatusNotFound, recorder.Body.String())
 	}
+}
 
-	authorizedReq := httptest.NewRequest(http.MethodPost, "/v1internal:method", strings.NewReader(`{}`))
-	authorizedReq.Header.Set("Content-Type", "application/json")
-	authorizedReq.Header.Set("Authorization", "Bearer test-key")
-	authorizedRec := httptest.NewRecorder()
-	server.engine.ServeHTTP(authorizedRec, authorizedReq)
-	if authorizedRec.Code == http.StatusUnauthorized {
-		t.Fatalf("authorized request unexpectedly returned 401; body=%s", authorizedRec.Body.String())
+func TestGeminiCLIRuntimeRoutesAreRemovedAndLoginReturnsGone(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "secret")
+	server := newTestServerWithConfig(t, func(cfg *proxyconfig.Config) {
+		cfg.RemoteManagement.SecretKey = "secret"
+		cfg.RemoteManagement.AllowRemote = true
+	})
+	for _, test := range []struct {
+		method string
+		path   string
+	}{
+		{method: http.MethodPost, path: "/v1internal:method"},
+		{method: http.MethodGet, path: "/google/callback"},
+	} {
+		req := httptest.NewRequest(test.method, test.path, nil)
+		req.Header.Set("Authorization", "Bearer test-key")
+		req.Header.Set("X-Management-Key", "secret")
+		recorder := httptest.NewRecorder()
+		server.engine.ServeHTTP(recorder, req)
+		if recorder.Code != http.StatusNotFound {
+			t.Fatalf("%s %s status = %d, want %d", test.method, test.path, recorder.Code, http.StatusNotFound)
+		}
+	}
+	loginReq := httptest.NewRequest(http.MethodGet, "/v0/management/gemini-cli-auth-url", nil)
+	loginReq.Header.Set("X-Management-Key", "secret")
+	loginRecorder := httptest.NewRecorder()
+	server.engine.ServeHTTP(loginRecorder, loginReq)
+	if loginRecorder.Code != http.StatusGone {
+		t.Fatalf("Gemini CLI login status = %d, want %d; body=%s", loginRecorder.Code, http.StatusGone, loginRecorder.Body.String())
+	}
+	for _, route := range server.engine.Routes() {
+		if route.Path == "/v1internal:method" || route.Path == "/google/callback" {
+			t.Fatalf("retired Gemini CLI route remains registered: %s %s", route.Method, route.Path)
+		}
 	}
 }
 

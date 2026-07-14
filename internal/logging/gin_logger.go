@@ -50,7 +50,7 @@ func GinLogrusLogger() gin.HandlerFunc {
 		}
 
 		c.Next()
-		if util.IsRetiredAmpPath(path) && c.FullPath() == "" {
+		if (util.IsRetiredAmpPath(path) || util.IsRetiredGeminiCLIPath(path)) && c.FullPath() == "" {
 			return
 		}
 

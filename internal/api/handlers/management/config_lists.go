@@ -3,6 +3,7 @@ package management
 import (
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"strings"
 
 	"github.com/gin-gonic/gin"
@@ -756,6 +757,7 @@ func (h *Handler) PutOAuthExcludedModels(c *gin.Context) {
 		}
 		entries = wrapper.Items
 	}
+	dropRetiredGeminiCLIConfigKey(entries)
 	h.cfg.OAuthExcludedModels = config.NormalizeOAuthExcludedModels(entries)
 	h.persist(c)
 }
@@ -772,6 +774,10 @@ func (h *Handler) PatchOAuthExcludedModels(c *gin.Context) {
 	provider := strings.ToLower(strings.TrimSpace(*body.Provider))
 	if provider == "" {
 		c.JSON(400, gin.H{"error": "invalid provider"})
+		return
+	}
+	if provider == "gemini-cli" {
+		c.JSON(http.StatusGone, gin.H{"error": "Gemini CLI is no longer supported"})
 		return
 	}
 	normalized := config.NormalizeExcludedModels(body.Models)
@@ -802,6 +808,11 @@ func (h *Handler) DeleteOAuthExcludedModels(c *gin.Context) {
 	provider := strings.ToLower(strings.TrimSpace(c.Query("provider")))
 	if provider == "" {
 		c.JSON(400, gin.H{"error": "missing provider"})
+		return
+	}
+	if provider == "gemini-cli" {
+		h.cfg.OAuthExcludedModels = config.NormalizeOAuthExcludedModels(h.cfg.OAuthExcludedModels)
+		h.persist(c)
 		return
 	}
 	if h.cfg.OAuthExcludedModels == nil {
@@ -841,6 +852,7 @@ func (h *Handler) PutOAuthModelAlias(c *gin.Context) {
 		}
 		entries = wrapper.Items
 	}
+	dropRetiredGeminiCLIConfigKey(entries)
 	h.cfg.OAuthModelAlias = sanitizedOAuthModelAlias(entries)
 	h.persist(c)
 }
@@ -864,6 +876,10 @@ func (h *Handler) PatchOAuthModelAlias(c *gin.Context) {
 	channel := strings.ToLower(strings.TrimSpace(channelRaw))
 	if channel == "" {
 		c.JSON(400, gin.H{"error": "invalid channel"})
+		return
+	}
+	if channel == "gemini-cli" {
+		c.JSON(http.StatusGone, gin.H{"error": "Gemini CLI is no longer supported"})
 		return
 	}
 
@@ -899,6 +915,11 @@ func (h *Handler) DeleteOAuthModelAlias(c *gin.Context) {
 	}
 	if channel == "" {
 		c.JSON(400, gin.H{"error": "missing channel"})
+		return
+	}
+	if channel == "gemini-cli" {
+		h.cfg.OAuthModelAlias = sanitizedOAuthModelAlias(h.cfg.OAuthModelAlias)
+		h.persist(c)
 		return
 	}
 	if h.cfg.OAuthModelAlias == nil {
@@ -1211,4 +1232,12 @@ func sanitizedOAuthModelAlias(entries map[string][]config.OAuthModelAlias) map[s
 		return nil
 	}
 	return cfg.OAuthModelAlias
+}
+
+func dropRetiredGeminiCLIConfigKey[T any](entries map[string]T) {
+	for key := range entries {
+		if strings.EqualFold(strings.TrimSpace(key), "gemini-cli") {
+			delete(entries, key)
+		}
+	}
 }

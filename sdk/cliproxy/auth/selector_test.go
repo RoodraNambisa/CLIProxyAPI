@@ -524,61 +524,6 @@ func TestRoundRobinSelectorPick_CursorKeyCap(t *testing.T) {
 	}
 }
 
-func TestRoundRobinSelectorPick_GeminiCLICredentialGrouping(t *testing.T) {
-	t.Parallel()
-
-	selector := &RoundRobinSelector{}
-
-	// Simulate two gemini-cli credentials, each with multiple projects:
-	// Credential A (parent = "cred-a.json") has 3 projects
-	// Credential B (parent = "cred-b.json") has 2 projects
-	auths := []*Auth{
-		{ID: "cred-a.json::proj-a1", Attributes: map[string]string{"gemini_virtual_parent": "cred-a.json"}},
-		{ID: "cred-a.json::proj-a2", Attributes: map[string]string{"gemini_virtual_parent": "cred-a.json"}},
-		{ID: "cred-a.json::proj-a3", Attributes: map[string]string{"gemini_virtual_parent": "cred-a.json"}},
-		{ID: "cred-b.json::proj-b1", Attributes: map[string]string{"gemini_virtual_parent": "cred-b.json"}},
-		{ID: "cred-b.json::proj-b2", Attributes: map[string]string{"gemini_virtual_parent": "cred-b.json"}},
-	}
-
-	// Two-level round-robin: consecutive picks must alternate between credentials.
-	// Credential group order is randomized, but within each call the group cursor
-	// advances by 1, so consecutive picks should cycle through different parents.
-	picks := make([]string, 6)
-	parents := make([]string, 6)
-	for i := 0; i < 6; i++ {
-		got, err := selector.Pick(context.Background(), "gemini-cli", "gemini-2.5-pro", cliproxyexecutor.Options{}, auths)
-		if err != nil {
-			t.Fatalf("Pick() #%d error = %v", i, err)
-		}
-		if got == nil {
-			t.Fatalf("Pick() #%d auth = nil", i)
-		}
-		picks[i] = got.ID
-		parents[i] = got.Attributes["gemini_virtual_parent"]
-	}
-
-	// Verify property: consecutive picks must alternate between credential groups.
-	for i := 1; i < len(parents); i++ {
-		if parents[i] == parents[i-1] {
-			t.Fatalf("Pick() #%d and #%d both from same parent %q (IDs: %q, %q); expected alternating credentials",
-				i-1, i, parents[i], picks[i-1], picks[i])
-		}
-	}
-
-	// Verify property: each credential's projects are picked in sequence (round-robin within group).
-	credPicks := map[string][]string{}
-	for i, id := range picks {
-		credPicks[parents[i]] = append(credPicks[parents[i]], id)
-	}
-	for parent, ids := range credPicks {
-		for i := 1; i < len(ids); i++ {
-			if ids[i] == ids[i-1] {
-				t.Fatalf("Credential %q picked same project %q twice in a row", parent, ids[i])
-			}
-		}
-	}
-}
-
 func TestExtractSessionID(t *testing.T) {
 	t.Parallel()
 
@@ -735,42 +680,6 @@ func TestSessionAffinitySelector_DifferentSessionsDifferentAuths(t *testing.T) {
 	}
 }
 
-func TestRoundRobinSelectorPick_SingleParentFallsBackToFlat(t *testing.T) {
-	t.Parallel()
-
-	selector := &RoundRobinSelector{}
-
-	// All auths from the same parent - should fall back to flat round-robin
-	// because there's only one credential group (no benefit from two-level).
-	auths := []*Auth{
-		{ID: "cred-a.json::proj-a1", Attributes: map[string]string{"gemini_virtual_parent": "cred-a.json"}},
-		{ID: "cred-a.json::proj-a2", Attributes: map[string]string{"gemini_virtual_parent": "cred-a.json"}},
-		{ID: "cred-a.json::proj-a3", Attributes: map[string]string{"gemini_virtual_parent": "cred-a.json"}},
-	}
-
-	// With single parent group, parentOrder has length 1, so it uses flat round-robin.
-	// Sorted by ID: proj-a1, proj-a2, proj-a3
-	want := []string{
-		"cred-a.json::proj-a1",
-		"cred-a.json::proj-a2",
-		"cred-a.json::proj-a3",
-		"cred-a.json::proj-a1",
-	}
-
-	for i, expectedID := range want {
-		got, err := selector.Pick(context.Background(), "gemini-cli", "gemini-2.5-pro", cliproxyexecutor.Options{}, auths)
-		if err != nil {
-			t.Fatalf("Pick() #%d error = %v", i, err)
-		}
-		if got == nil {
-			t.Fatalf("Pick() #%d auth = nil", i)
-		}
-		if got.ID != expectedID {
-			t.Fatalf("Pick() #%d auth.ID = %q, want %q", i, got.ID, expectedID)
-		}
-	}
-}
-
 func TestSessionAffinitySelector_FailoverWhenAuthUnavailable(t *testing.T) {
 	t.Parallel()
 
@@ -864,39 +773,6 @@ func TestSessionAffinitySelector_StrictFailoverDisabledWhenAuthUnavailable(t *te
 	}
 }
 
-func TestRoundRobinSelectorPick_MixedVirtualAndNonVirtualFallsBackToFlat(t *testing.T) {
-	t.Parallel()
-
-	selector := &RoundRobinSelector{}
-
-	// Mix of virtual and non-virtual auths (e.g., a regular gemini-cli auth without projects
-	// alongside virtual ones). Should fall back to flat round-robin.
-	auths := []*Auth{
-		{ID: "cred-a.json::proj-a1", Attributes: map[string]string{"gemini_virtual_parent": "cred-a.json"}},
-		{ID: "cred-regular.json"}, // no gemini_virtual_parent
-	}
-
-	// groupByVirtualParent returns nil when any auth lacks the attribute,
-	// so flat round-robin is used. Sorted by ID: cred-a.json::proj-a1, cred-regular.json
-	want := []string{
-		"cred-a.json::proj-a1",
-		"cred-regular.json",
-		"cred-a.json::proj-a1",
-	}
-
-	for i, expectedID := range want {
-		got, err := selector.Pick(context.Background(), "gemini-cli", "", cliproxyexecutor.Options{}, auths)
-		if err != nil {
-			t.Fatalf("Pick() #%d error = %v", i, err)
-		}
-		if got == nil {
-			t.Fatalf("Pick() #%d auth = nil", i)
-		}
-		if got.ID != expectedID {
-			t.Fatalf("Pick() #%d auth.ID = %q, want %q", i, got.ID, expectedID)
-		}
-	}
-}
 func TestExtractSessionID_ClaudeCodePriorityOverHeader(t *testing.T) {
 	t.Parallel()
 
@@ -1445,6 +1321,49 @@ func TestSessionCache_GetAndRefresh(t *testing.T) {
 	got, ok = cache.GetAndRefresh("session1")
 	if ok {
 		t.Fatalf("GetAndRefresh() after expiry = %q, %v, want '', false", got, ok)
+	}
+}
+
+func TestSessionCacheConditionalInvalidationKeepsNewerBinding(t *testing.T) {
+	cache := NewSessionCache(time.Minute)
+	defer cache.Stop()
+	const sessionID = "conditional-session"
+	firstVersion := cache.setWithVersion(sessionID, "auth-a")
+	secondVersion := cache.setWithVersion(sessionID, "auth-a")
+	cache.invalidateIfVersion(sessionID, firstVersion)
+	if got, ok := cache.Get(sessionID); !ok || got != "auth-a" {
+		t.Fatalf("newer binding = (%q, %t), want auth-a", got, ok)
+	}
+	cache.invalidateIfVersion(sessionID, secondVersion)
+	if got, ok := cache.Get(sessionID); ok || got != "" {
+		t.Fatalf("current binding survived conditional invalidation: (%q, %t)", got, ok)
+	}
+}
+
+func TestSessionCacheRollbackDoesNotRestoreInvalidatedAuth(t *testing.T) {
+	cache := NewSessionCache(time.Minute)
+	defer cache.Stop()
+	const sessionID = "rollback-invalidated-session"
+	cache.Set(sessionID, "auth-a")
+	mutation := cache.setWithRollback(sessionID, "auth-b")
+	cache.InvalidateAuth("auth-a")
+	cache.rollback(sessionID, mutation)
+	if got, ok := cache.Get(sessionID); ok || got != "" {
+		t.Fatalf("invalidated previous binding was restored: (%q, %t)", got, ok)
+	}
+}
+
+func TestSessionCacheCleansExpiredAuthGenerationTombstone(t *testing.T) {
+	cache := NewSessionCache(10 * time.Millisecond)
+	defer cache.Stop()
+	cache.InvalidateAuth("deleted-auth")
+	time.Sleep(15 * time.Millisecond)
+	cache.cleanup()
+	cache.mu.RLock()
+	_, exists := cache.authGenerations["deleted-auth"]
+	cache.mu.RUnlock()
+	if exists {
+		t.Fatal("expired auth generation tombstone was not cleaned")
 	}
 }
 

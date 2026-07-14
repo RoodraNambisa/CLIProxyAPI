@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"context"
 	"strings"
 	"testing"
 	"time"
@@ -9,6 +10,61 @@ import (
 type testRefreshEvaluator struct{}
 
 func (testRefreshEvaluator) ShouldRefresh(time.Time, *Auth) bool { return false }
+
+type autoRefreshShutdownExecutor struct {
+	schedulerProviderTestExecutor
+	started chan struct{}
+	stopped chan struct{}
+}
+
+func (e *autoRefreshShutdownExecutor) Refresh(ctx context.Context, _ *Auth) (*Auth, error) {
+	close(e.started)
+	<-ctx.Done()
+	close(e.stopped)
+	return nil, ctx.Err()
+}
+
+func TestStopAutoRefreshWaitsForWorkers(t *testing.T) {
+	const provider = "auto-refresh-shutdown"
+	manager := NewManager(nil, nil, nil)
+	executor := &autoRefreshShutdownExecutor{
+		schedulerProviderTestExecutor: schedulerProviderTestExecutor{provider: provider},
+		started:                       make(chan struct{}),
+		stopped:                       make(chan struct{}),
+	}
+	manager.RegisterExecutor(executor)
+	registered, errRegister := manager.Register(t.Context(), &Auth{ID: "shutdown-auth", Provider: provider, Status: StatusActive})
+	if errRegister != nil {
+		t.Fatalf("Register() error = %v", errRegister)
+	}
+	job, marked := manager.markRefreshPending(registered.ID, time.Now())
+	if !marked {
+		t.Fatal("markRefreshPending() = false")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	loop := newAuthAutoRefreshLoop(manager, time.Hour, 1)
+	manager.mu.Lock()
+	manager.refreshCancel = cancel
+	manager.refreshLoop = loop
+	manager.mu.Unlock()
+	loop.jobs <- job
+	go loop.run(ctx)
+	select {
+	case <-executor.started:
+	case <-time.After(time.Second):
+		t.Fatal("refresh worker did not start")
+	}
+
+	manager.StopAutoRefresh()
+	select {
+	case <-executor.stopped:
+	default:
+		t.Fatal("StopAutoRefresh() returned before refresh worker exited")
+	}
+	if !loop.wait(time.Millisecond) {
+		t.Fatal("StopAutoRefresh() returned before refresh loop exited")
+	}
+}
 
 func setRefreshLeadFactory(t *testing.T, provider string, factory func() *time.Duration) {
 	t.Helper()

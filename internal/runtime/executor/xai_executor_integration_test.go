@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
@@ -18,6 +19,7 @@ import (
 	_ "github.com/router-for-me/CLIProxyAPI/v6/internal/translator"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
+	cliproxyusage "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/usage"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v6/sdk/translator"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -30,6 +32,38 @@ func makeValidXAIEncryptedContent(seed byte) string {
 		buf = append(buf, sum[:]...)
 	}
 	return base64.RawStdEncoding.EncodeToString(buf[:256])
+}
+
+func TestXAIRuntimeExecutionBodyPreservesEOFWhenRetired(t *testing.T) {
+	body := &xaiRuntimeExecutionBody{
+		ReadCloser: io.NopCloser(strings.NewReader("ok")),
+		release:    func() bool { return true },
+	}
+	data, errRead := io.ReadAll(body)
+	if errRead != nil {
+		t.Fatalf("ReadAll() error = %v", errRead)
+	}
+	if string(data) != "ok" {
+		t.Fatalf("ReadAll() data = %q, want ok", data)
+	}
+}
+
+func TestXAIExecuteAcceptsResponseDoneAndRestoresOutput(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"hello\"}]}}\n\n"))
+		_, _ = w.Write([]byte("data: {\"type\":\"response.done\",\"response\":{\"id\":\"resp_done\",\"status\":\"completed\",\"output\":[]}}\n\n"))
+	}))
+	defer server.Close()
+	exec := NewXAIExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{Provider: "xai", Attributes: map[string]string{"base_url": server.URL, "api_key": "token"}}
+	response, errExecute := exec.Execute(t.Context(), auth, xaiStreamRequest(), cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatOpenAIResponse})
+	if errExecute != nil {
+		t.Fatalf("Execute() error = %v", errExecute)
+	}
+	if !bytes.Contains(response.Payload, []byte("hello")) {
+		t.Fatalf("Execute() payload = %s, want restored output", response.Payload)
+	}
 }
 
 func TestXAIUsingAPIRoutingAndChatProxyHeaders(t *testing.T) {
@@ -161,6 +195,292 @@ func TestXAIExecuteStreamEmitsTerminalFailure(t *testing.T) {
 	if !ok || !skipper.SkipAuthResult() {
 		t.Fatalf("SkipAuthResult = %v, want true", ok)
 	}
+}
+
+func TestXAIExecuteStreamRejectsEOFWithoutTerminal(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\"}}\n\n"))
+	}))
+	defer server.Close()
+
+	const authID = "xai-stream-incomplete"
+	usageRecords := make(chan cliproxyusage.Record, 1)
+	cliproxyusage.RegisterPlugin(&streamTerminalUsagePlugin{authID: authID, records: usageRecords})
+	exec := NewXAIExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{ID: authID, Provider: "xai", Attributes: map[string]string{"base_url": server.URL, "api_key": "token"}}
+	result, err := exec.ExecuteStream(t.Context(), auth, xaiStreamRequest(), cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FormatOpenAIResponse,
+		Stream:       true,
+		Metadata: map[string]any{
+			cliproxyexecutor.StreamTerminalMarkerMetadataKey: true,
+		},
+	})
+	if err != nil {
+		t.Fatalf("ExecuteStream() error = %v", err)
+	}
+	_, markers, streamErrs := collectStreamTerminalChunks(t, result)
+	if markers != 0 || len(streamErrs) != 1 || !strings.Contains(streamErrs[0].Error(), "successful terminal event") {
+		t.Fatalf("markers = %d, errors = %v; want one incomplete stream error", markers, streamErrs)
+	}
+	select {
+	case record := <-usageRecords:
+		if !record.Failed {
+			t.Fatalf("usage record = %#v, want failure", record)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for usage record")
+	}
+}
+
+func TestXAIExecuteStreamEmitsSuccessfulTerminalAfterTranslatedCompletion(t *testing.T) {
+	responseFormat := registerXAITerminalOrderTestTranslator()
+	for _, completionType := range []string{"response.completed", "response.done"} {
+		t.Run(completionType, func(t *testing.T) {
+			releaseHandler := make(chan struct{})
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "text/event-stream")
+				_, _ = w.Write([]byte("event: " + completionType + "\n"))
+				_, _ = w.Write([]byte(`data: {"type":"` + completionType + `","response":{"id":"resp_1","status":"completed","output":[],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}` + "\n\n"))
+				if flusher, ok := w.(http.Flusher); ok {
+					flusher.Flush()
+				}
+				select {
+				case <-r.Context().Done():
+				case <-releaseHandler:
+				}
+			}))
+			defer server.Close()
+			defer close(releaseHandler)
+
+			manager := cliproxyauth.NewManager(nil, nil, nil)
+			authID := "xai-http-terminal-" + strings.ReplaceAll(completionType, ".", "-")
+			selected, errRegister := manager.Register(t.Context(), &cliproxyauth.Auth{
+				ID:       authID,
+				Provider: "xai",
+				Attributes: map[string]string{
+					"base_url": server.URL,
+					"api_key":  "token",
+				},
+				Metadata: map[string]any{"type": "xai"},
+			})
+			if errRegister != nil {
+				t.Fatalf("Register() error = %v", errRegister)
+			}
+
+			exec := NewXAIExecutor(&config.Config{})
+			result, err := exec.ExecuteStream(t.Context(), selected, xaiStreamRequest(), cliproxyexecutor.Options{
+				SourceFormat:   sdktranslator.FormatOpenAIResponse,
+				ResponseFormat: responseFormat,
+				Stream:         true,
+				Metadata: map[string]any{
+					cliproxyexecutor.StreamTerminalMarkerMetadataKey: true,
+				},
+			})
+			if err != nil {
+				t.Fatalf("ExecuteStream() error = %v", err)
+			}
+
+			var first cliproxyexecutor.StreamChunk
+			select {
+			case first = <-result.Chunks:
+			case <-time.After(5 * time.Second):
+				t.Fatal("timed out waiting for first translated completion chunk")
+			}
+			if first.Err != nil || string(first.Payload) != "completion-1" {
+				t.Fatalf("first chunk = %#v, want completion-1", first)
+			}
+
+			if _, errUpdate := manager.Update(t.Context(), &cliproxyauth.Auth{ID: authID, Provider: "codex", Metadata: map[string]any{"type": "codex"}}); errUpdate != nil {
+				t.Fatalf("Update() error = %v", errUpdate)
+			}
+
+			remaining := make([]cliproxyexecutor.StreamChunk, 0, 2)
+			closed := false
+			for !closed {
+				select {
+				case chunk, ok := <-result.Chunks:
+					if !ok {
+						closed = true
+						continue
+					}
+					remaining = append(remaining, chunk)
+				case <-time.After(5 * time.Second):
+					t.Fatal("timed out waiting for successful terminal marker")
+				}
+			}
+			if len(remaining) != 2 {
+				t.Fatalf("remaining chunks = %#v, want completion-2 then terminal marker", remaining)
+			}
+			if remaining[0].Err != nil || string(remaining[0].Payload) != "completion-2" {
+				t.Fatalf("second chunk = %#v, want completion-2", remaining[0])
+			}
+			if !cliproxyexecutor.IsSuccessfulStreamTerminalChunk(remaining[1]) {
+				t.Fatalf("last chunk = %#v, want successful terminal marker", remaining[1])
+			}
+		})
+	}
+}
+
+func TestXAIExecuteStreamCancellationDoesNotBlockTerminalMarker(t *testing.T) {
+	responseFormat := registerXAITerminalOrderTestTranslator()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("event: response.completed\n"))
+		_, _ = w.Write([]byte(`data: {"type":"response.completed","response":{"id":"resp_1","status":"completed","output":[]}}` + "\n\n"))
+	}))
+	defer server.Close()
+
+	ctx, cancel := context.WithCancel(t.Context())
+	exec := NewXAIExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{ID: "xai-cancel-terminal", Provider: "xai", Attributes: map[string]string{
+		"base_url": server.URL,
+		"api_key":  "token",
+	}}
+	result, errExecute := exec.ExecuteStream(ctx, auth, xaiStreamRequest(), cliproxyexecutor.Options{
+		SourceFormat:   sdktranslator.FormatOpenAIResponse,
+		ResponseFormat: responseFormat,
+		Stream:         true,
+		Metadata: map[string]any{
+			cliproxyexecutor.StreamTerminalMarkerMetadataKey: true,
+		},
+	})
+	if errExecute != nil {
+		t.Fatalf("ExecuteStream() error = %v", errExecute)
+	}
+	for range 2 {
+		select {
+		case chunk := <-result.Chunks:
+			if chunk.Err != nil || len(chunk.Payload) == 0 {
+				t.Fatalf("translated completion chunk = %#v", chunk)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("timed out waiting for translated completion chunk")
+		}
+	}
+	cancel()
+	closed := false
+	for !closed {
+		select {
+		case _, ok := <-result.Chunks:
+			closed = !ok
+		case <-time.After(5 * time.Second):
+			t.Fatal("stream goroutine remained blocked on terminal marker")
+		}
+	}
+}
+
+func TestXAIExecuteStreamDirectCallOmitsSuccessfulTerminalMarker(t *testing.T) {
+	responseFormat := registerXAITerminalOrderTestTranslator()
+	for _, completionType := range []string{"response.completed", "response.done"} {
+		t.Run(completionType, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "text/event-stream")
+				_, _ = w.Write([]byte(`data: {"type":"` + completionType + `","response":{"id":"resp_1","status":"completed","output":[]}}` + "\n\n"))
+				_, _ = w.Write([]byte("data: {\"type\":\"response.created\",\"response\":{\"id\":\"late\"}}\n\n"))
+			}))
+			defer server.Close()
+
+			exec := NewXAIExecutor(&config.Config{})
+			auth := &cliproxyauth.Auth{Provider: "xai", Attributes: map[string]string{"base_url": server.URL, "api_key": "token"}}
+			result, err := exec.ExecuteStream(t.Context(), auth, xaiStreamRequest(), cliproxyexecutor.Options{
+				SourceFormat:   sdktranslator.FormatOpenAIResponse,
+				ResponseFormat: responseFormat,
+				Stream:         true,
+			})
+			if err != nil {
+				t.Fatalf("ExecuteStream() error = %v", err)
+			}
+
+			var chunks []cliproxyexecutor.StreamChunk
+			for chunk := range result.Chunks {
+				chunks = append(chunks, chunk)
+			}
+			if len(chunks) != 2 || string(chunks[0].Payload) != "completion-1" || string(chunks[1].Payload) != "completion-2" {
+				t.Fatalf("chunks = %#v, want only translated completion chunks", chunks)
+			}
+			for _, chunk := range chunks {
+				if chunk.Err != nil || cliproxyexecutor.IsSuccessfulStreamTerminalChunk(chunk) {
+					t.Fatalf("direct executor exposed internal terminal state: %#v", chunk)
+				}
+			}
+		})
+	}
+}
+
+func TestXAICompactionTriggerStreamTerminalMarker(t *testing.T) {
+	for _, markerEnabled := range []bool{false, true} {
+		name := "direct"
+		if markerEnabled {
+			name = "manager"
+		}
+		t.Run(name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"id":"resp_compact","object":"response.compaction","output":[{"type":"compaction","encrypted_content":"opaque"}],"usage":{"input_tokens":1,"output_tokens":2,"total_tokens":3}}`))
+			}))
+			defer server.Close()
+
+			metadata := map[string]any(nil)
+			if markerEnabled {
+				metadata = map[string]any{cliproxyexecutor.StreamTerminalMarkerMetadataKey: true}
+			}
+			exec := NewXAIExecutor(&config.Config{})
+			auth := &cliproxyauth.Auth{Provider: "xai", Attributes: map[string]string{"base_url": server.URL, "api_key": "token"}}
+			result, err := exec.ExecuteStream(t.Context(), auth, cliproxyexecutor.Request{
+				Model:   "grok-4.3",
+				Payload: []byte(`{"model":"grok-4.3","input":[{"role":"user","content":"hello"},{"type":"compaction_trigger"}]}`),
+			}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatOpenAIResponse, Stream: true, Metadata: metadata})
+			if err != nil {
+				t.Fatalf("ExecuteStream() error = %v", err)
+			}
+
+			var chunks []cliproxyexecutor.StreamChunk
+			for chunk := range result.Chunks {
+				if chunk.Err != nil {
+					t.Fatalf("stream chunk error = %v", chunk.Err)
+				}
+				chunks = append(chunks, chunk)
+			}
+			wantChunks := 6
+			if markerEnabled {
+				wantChunks++
+			}
+			if len(chunks) != wantChunks {
+				t.Fatalf("chunk count = %d, want %d", len(chunks), wantChunks)
+			}
+			if !bytes.Contains(chunks[5].Payload, []byte(`"type":"response.completed"`)) {
+				t.Fatalf("last synthetic payload is not response.completed: %s", chunks[5].Payload)
+			}
+			for i, chunk := range chunks {
+				isMarker := cliproxyexecutor.IsSuccessfulStreamTerminalChunk(chunk)
+				if isMarker != (markerEnabled && i == len(chunks)-1) {
+					t.Fatalf("chunk %d marker = %t, markerEnabled = %t", i, isMarker, markerEnabled)
+				}
+			}
+		})
+	}
+}
+
+func registerXAITerminalOrderTestTranslator() sdktranslator.Format {
+	format := sdktranslator.FromString("xai-terminal-order-test")
+	sdktranslator.Register(format, sdktranslator.FormatCodex, nil, sdktranslator.ResponseTransform{
+		Stream: func(_ context.Context, _ string, _, _, raw []byte, _ *any) [][]byte {
+			line := bytes.TrimSpace(raw)
+			if !bytes.HasPrefix(line, xaiDataTag) {
+				return nil
+			}
+			switch gjson.GetBytes(bytes.TrimSpace(line[len(xaiDataTag):]), "type").String() {
+			case "response.completed":
+				return [][]byte{[]byte("completion-1"), []byte("completion-2")}
+			case "response.created":
+				return [][]byte{[]byte("late")}
+			default:
+				return nil
+			}
+		},
+	})
+	return format
 }
 
 func TestNormalizeXAIToolsAndForeignEncryptedContent(t *testing.T) {

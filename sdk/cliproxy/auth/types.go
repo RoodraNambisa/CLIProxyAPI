@@ -5,11 +5,13 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	baseauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth"
@@ -45,6 +47,35 @@ func SourceHashFromBytes(data []byte) string {
 	}
 	sum := sha256.Sum256(data)
 	return hex.EncodeToString(sum[:])
+}
+
+// CanonicalSourceHashFromBytes returns the stable JSON metadata hash used by
+// file-backed auth records. Non-JSON payloads return an error.
+func CanonicalSourceHashFromBytes(data []byte) (string, error) {
+	metadata := make(map[string]any)
+	if err := json.Unmarshal(data, &metadata); err != nil {
+		return "", err
+	}
+	canonical, err := json.Marshal(metadata)
+	if err != nil {
+		return "", err
+	}
+	return SourceHashFromBytes(canonical), nil
+}
+
+// SourceHashMatchesBytes accepts either an exact payload hash or the canonical
+// JSON metadata hash. PostgreSQL JSONB normalizes object serialization, while
+// file, git, and object stores preserve the original bytes.
+func SourceHashMatchesBytes(expectedHash string, data []byte) bool {
+	expectedHash = strings.TrimSpace(expectedHash)
+	if expectedHash == "" {
+		return false
+	}
+	if SourceHashFromBytes(data) == expectedHash {
+		return true
+	}
+	canonicalHash, err := CanonicalSourceHashFromBytes(data)
+	return err == nil && canonicalHash == expectedHash
 }
 
 // SetSourceHashAttribute stores a stable file-content hash on the auth attributes.
@@ -183,7 +214,189 @@ type Auth struct {
 	// Runtime carries non-serialisable data used during execution (in-memory only).
 	Runtime any `json:"-"`
 
-	indexAssigned bool `json:"-"`
+	indexAssigned bool   `json:"-"`
+	instanceID    string `json:"-"`
+	instanceState *authInstanceState
+}
+
+type authInstanceState struct {
+	mu              sync.Mutex
+	retired         atomic.Bool
+	executorOwners  []ProviderExecutor
+	cleanupDone     chan struct{}
+	cleanupComplete bool
+	nextLease       uint64
+	executions      map[uint64]context.CancelCauseFunc
+}
+
+var errRuntimeAuthInstanceRetired = errors.New("runtime auth instance retired")
+
+type runtimeAuthInstanceContextKey struct{}
+
+func (s *authInstanceState) Retired() bool {
+	return s != nil && s.retired.Load()
+}
+
+func (s *authInstanceState) bindExecutorOwner(executor ProviderExecutor) {
+	if s == nil || executor == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.retired.Load() {
+		return
+	}
+	for _, owner := range s.executorOwners {
+		if sameProviderExecutor(owner, executor) {
+			return
+		}
+	}
+	s.executorOwners = append(s.executorOwners, executor)
+}
+
+func (s *authInstanceState) owners() []ProviderExecutor {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	owners := append([]ProviderExecutor(nil), s.executorOwners...)
+	s.mu.Unlock()
+	return owners
+}
+
+func (a *Auth) bindExecutorOwner(executor ProviderExecutor) {
+	if a == nil || a.instanceState == nil {
+		return
+	}
+	a.instanceState.bindExecutorOwner(executor)
+}
+
+func (a *Auth) executorOwners() []ProviderExecutor {
+	if a == nil || a.instanceState == nil {
+		return nil
+	}
+	return a.instanceState.owners()
+}
+
+func (s *authInstanceState) cleanupDoneSignal() <-chan struct{} {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	if s.cleanupDone == nil {
+		s.cleanupDone = make(chan struct{})
+		if s.cleanupComplete {
+			close(s.cleanupDone)
+		}
+	}
+	done := s.cleanupDone
+	s.mu.Unlock()
+	return done
+}
+
+func (s *authInstanceState) completeCleanup() {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	if s.cleanupComplete {
+		s.mu.Unlock()
+		return
+	}
+	s.cleanupComplete = true
+	if s.cleanupDone == nil {
+		s.cleanupDone = make(chan struct{})
+	}
+	close(s.cleanupDone)
+	s.mu.Unlock()
+}
+
+func (a *Auth) retireInstance() {
+	if a == nil || a.instanceState == nil {
+		return
+	}
+	state := a.instanceState
+	state.mu.Lock()
+	if state.retired.Load() {
+		state.mu.Unlock()
+		return
+	}
+	state.retired.Store(true)
+	cancels := make([]context.CancelCauseFunc, 0, len(state.executions))
+	for _, cancel := range state.executions {
+		cancels = append(cancels, cancel)
+	}
+	state.executions = nil
+	state.mu.Unlock()
+	for _, cancel := range cancels {
+		cancel(errRuntimeAuthInstanceRetired)
+	}
+}
+
+// RuntimeInstanceRetired reports whether this runtime auth instance has been replaced or removed.
+func (a *Auth) RuntimeInstanceRetired() bool {
+	return a != nil && a.instanceState != nil && a.instanceState.Retired()
+}
+
+// RuntimeInstanceID returns the opaque identity shared by clones of one runtime auth instance.
+func (a *Auth) RuntimeInstanceID() string {
+	if a == nil {
+		return ""
+	}
+	return a.instanceID
+}
+
+// RuntimeInstanceCleanupDone returns a channel that closes after a retired
+// runtime auth instance leaves cleanup quarantine. It remains open while the
+// instance is active.
+func (a *Auth) RuntimeInstanceCleanupDone() <-chan struct{} {
+	if a == nil {
+		return nil
+	}
+	return a.instanceState.cleanupDoneSignal()
+}
+
+// BeginRuntimeExecution registers a cancellable execution against this auth instance.
+// The returned release function must be called when execution finishes.
+func (a *Auth) BeginRuntimeExecution(ctx context.Context) (context.Context, func() bool, bool) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if a == nil || a.instanceState == nil {
+		return ctx, func() bool { return false }, true
+	}
+	state := a.instanceState
+	if existing, _ := ctx.Value(runtimeAuthInstanceContextKey{}).(*authInstanceState); existing == state {
+		return ctx, func() bool { return state.retired.Load() }, !state.retired.Load()
+	}
+	state.mu.Lock()
+	if state.retired.Load() {
+		state.mu.Unlock()
+		return ctx, func() bool { return true }, false
+	}
+	state.nextLease++
+	leaseID := state.nextLease
+	execCtx, cancel := context.WithCancelCause(ctx)
+	execCtx = context.WithValue(execCtx, runtimeAuthInstanceContextKey{}, state)
+	if state.executions == nil {
+		state.executions = make(map[uint64]context.CancelCauseFunc)
+	}
+	state.executions[leaseID] = cancel
+	state.mu.Unlock()
+
+	var once sync.Once
+	retiredAtRelease := false
+	release := func() bool {
+		once.Do(func() {
+			state.mu.Lock()
+			delete(state.executions, leaseID)
+			retiredAtRelease = state.retired.Load()
+			state.mu.Unlock()
+			cancel(nil)
+		})
+		return retiredAtRelease
+	}
+	return execCtx, release, true
 }
 
 // QuotaState contains limiter tracking data for a credential.
@@ -244,6 +457,18 @@ func (a *Auth) Clone() *Auth {
 	}
 	copyAuth.Runtime = a.Runtime
 	return &copyAuth
+}
+
+// CloneWithoutRuntimeInstance returns a clone without manager-owned runtime
+// instance identity or session state.
+func (a *Auth) CloneWithoutRuntimeInstance() *Auth {
+	clone := a.Clone()
+	if clone == nil {
+		return nil
+	}
+	clone.instanceID = ""
+	clone.instanceState = nil
+	return clone
 }
 
 func stableAuthIndex(seed string) string {
@@ -482,23 +707,6 @@ func (a *Auth) AccountInfo() (string, string) {
 	if a == nil {
 		return "", ""
 	}
-	// For Gemini CLI, include project ID in the OAuth account info if present.
-	if strings.ToLower(a.Provider) == "gemini-cli" {
-		if a.Metadata != nil {
-			email, _ := a.Metadata["email"].(string)
-			email = strings.TrimSpace(email)
-			if email != "" {
-				if p, ok := a.Metadata["project_id"].(string); ok {
-					p = strings.TrimSpace(p)
-					if p != "" {
-						return "oauth", email + " (" + p + ")"
-					}
-				}
-				return "oauth", email
-			}
-		}
-	}
-
 	// Check metadata for email first (OAuth-style auth)
 	if a.Metadata != nil {
 		if v, ok := a.Metadata["email"].(string); ok {

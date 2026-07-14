@@ -43,6 +43,18 @@ func (ts *CodexTokenStorage) SetMetadata(meta map[string]any) {
 	ts.Metadata = meta
 }
 
+// MetadataSnapshot returns a copy of the currently injected metadata.
+func (ts *CodexTokenStorage) MetadataSnapshot() map[string]any {
+	if ts == nil || ts.Metadata == nil {
+		return nil
+	}
+	snapshot := make(map[string]any, len(ts.Metadata))
+	for key, value := range ts.Metadata {
+		snapshot[key] = value
+	}
+	return snapshot
+}
+
 // SaveTokenToFile serializes the Codex token storage to a JSON file.
 // This method creates the necessary directory structure and writes the token
 // data in JSON format to the specified file path for persistent storage.
@@ -55,28 +67,29 @@ func (ts *CodexTokenStorage) SetMetadata(meta map[string]any) {
 //   - error: An error if the operation fails, nil otherwise
 func (ts *CodexTokenStorage) SaveTokenToFile(authFilePath string) error {
 	misc.LogSavingCredentials(authFilePath)
-	ts.Type = "codex"
 	if err := os.MkdirAll(filepath.Dir(authFilePath), 0700); err != nil {
 		return fmt.Errorf("failed to create directory: %v", err)
 	}
-
-	f, err := os.Create(authFilePath)
-	if err != nil {
-		return fmt.Errorf("failed to create token file: %w", err)
+	raw, errMarshal := ts.MarshalTokenData()
+	if errMarshal != nil {
+		return errMarshal
 	}
-	defer func() {
-		_ = f.Close()
-	}()
-
-	// Merge metadata using helper
-	data, errMerge := misc.MergeMetadata(ts, ts.Metadata)
-	if errMerge != nil {
-		return fmt.Errorf("failed to merge metadata: %w", errMerge)
-	}
-
-	if err = json.NewEncoder(f).Encode(data); err != nil {
-		return fmt.Errorf("failed to write token to file: %w", err)
+	if errWrite := os.WriteFile(authFilePath, raw, 0o600); errWrite != nil {
+		return fmt.Errorf("failed to write token to file: %w", errWrite)
 	}
 	return nil
+}
 
+// MarshalTokenData serializes the credential without performing filesystem I/O.
+func (ts *CodexTokenStorage) MarshalTokenData() ([]byte, error) {
+	ts.Type = "codex"
+	data, errMerge := misc.MergeMetadata(ts, ts.Metadata)
+	if errMerge != nil {
+		return nil, fmt.Errorf("failed to merge metadata: %w", errMerge)
+	}
+	raw, errMarshal := json.Marshal(data)
+	if errMarshal != nil {
+		return nil, fmt.Errorf("failed to marshal token: %w", errMarshal)
+	}
+	return append(raw, '\n'), nil
 }

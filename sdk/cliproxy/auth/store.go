@@ -1,6 +1,57 @@
 package auth
 
-import "context"
+import (
+	"context"
+	"errors"
+)
+
+// DeleteOutcome describes the durable result of a delete operation that
+// returned an error after touching an external store.
+type DeleteOutcome uint8
+
+const (
+	DeleteOutcomeUncertain DeleteOutcome = iota
+	DeleteOutcomeCommitted
+	DeleteOutcomeRolledBack
+)
+
+// DeleteOutcomeError preserves the original error while telling the runtime
+// whether the credential is durably deleted, durably retained, or unknown.
+type DeleteOutcomeError struct {
+	Outcome DeleteOutcome
+	Err     error
+}
+
+func (e *DeleteOutcomeError) Error() string {
+	if e == nil || e.Err == nil {
+		return "auth delete outcome error"
+	}
+	return e.Err.Error()
+}
+
+func (e *DeleteOutcomeError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Err
+}
+
+// NewDeleteOutcomeError attaches a durable delete outcome to err.
+func NewDeleteOutcomeError(outcome DeleteOutcome, err error) error {
+	if err == nil {
+		return nil
+	}
+	return &DeleteOutcomeError{Outcome: outcome, Err: err}
+}
+
+// DeleteOutcomeFromError returns the durable delete outcome carried by err.
+func DeleteOutcomeFromError(err error) (DeleteOutcome, bool) {
+	var outcomeErr *DeleteOutcomeError
+	if !errors.As(err, &outcomeErr) || outcomeErr == nil {
+		return DeleteOutcomeUncertain, false
+	}
+	return outcomeErr.Outcome, true
+}
 
 // Store abstracts persistence of Auth state across restarts.
 type Store interface {
@@ -10,4 +61,13 @@ type Store interface {
 	Save(ctx context.Context, auth *Auth) (string, error)
 	// Delete removes the auth record identified by id.
 	Delete(ctx context.Context, id string) error
+}
+
+// SourceConditionalDeleteStore atomically deletes a record only when its
+// current source generation matches expectedSourceHash. The expected value is
+// the hash of the exact source bytes; stores that normalize JSON should compare
+// it with SourceHashMatchesBytes. Implementations must return a rolled-back
+// delete outcome when the generation no longer matches.
+type SourceConditionalDeleteStore interface {
+	DeleteIfSourceHashMatches(ctx context.Context, id, expectedSourceHash string) error
 }

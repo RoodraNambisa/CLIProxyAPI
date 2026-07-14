@@ -6,7 +6,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/interfaces"
 )
 
-// ProjectSelectionError indicates that the user must choose a specific project ID.
+// ProjectSelectionError is retained for v6 source compatibility with the removed Gemini CLI login flow.
 type ProjectSelectionError struct {
 	Email    string
 	Projects []interfaces.GCPProjectProjects
@@ -19,7 +19,7 @@ func (e *ProjectSelectionError) Error() string {
 	return fmt.Sprintf("cliproxy auth: project selection required for %s", e.Email)
 }
 
-// ProjectsDisplay returns the projects list for caller presentation.
+// ProjectsDisplay returns the legacy projects list.
 func (e *ProjectSelectionError) ProjectsDisplay() []interfaces.GCPProjectProjects {
 	if e == nil {
 		return nil

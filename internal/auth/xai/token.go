@@ -7,7 +7,6 @@ import (
 	"path/filepath"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/misc"
-	log "github.com/sirupsen/logrus"
 )
 
 // TokenStorage stores xAI OAuth credentials on disk.
@@ -37,32 +36,45 @@ func (ts *TokenStorage) SetMetadata(meta map[string]any) {
 	ts.Metadata = meta
 }
 
+// MetadataSnapshot returns a copy of the currently injected metadata.
+func (ts *TokenStorage) MetadataSnapshot() map[string]any {
+	if ts == nil || ts.Metadata == nil {
+		return nil
+	}
+	snapshot := make(map[string]any, len(ts.Metadata))
+	for key, value := range ts.Metadata {
+		snapshot[key] = value
+	}
+	return snapshot
+}
+
 // SaveTokenToFile writes xAI credentials to a JSON auth file.
 func (ts *TokenStorage) SaveTokenToFile(authFilePath string) error {
 	misc.LogSavingCredentials(authFilePath)
-	ts.Type = "xai"
-	ts.AuthKind = "oauth"
 	if errMkdirAll := os.MkdirAll(filepath.Dir(authFilePath), 0o700); errMkdirAll != nil {
 		return fmt.Errorf("xai token storage: create directory: %w", errMkdirAll)
 	}
-	file, err := os.Create(authFilePath)
-	if err != nil {
-		return fmt.Errorf("xai token storage: create token file: %w", err)
+	raw, errMarshal := ts.MarshalTokenData()
+	if errMarshal != nil {
+		return errMarshal
 	}
-	defer func() {
-		if errClose := file.Close(); errClose != nil {
-			log.Errorf("xai token storage: close token file error: %v", errClose)
-		}
-	}()
-
-	data, errMerge := misc.MergeMetadata(ts, ts.Metadata)
-	if errMerge != nil {
-		return fmt.Errorf("xai token storage: merge metadata: %w", errMerge)
-	}
-	encoder := json.NewEncoder(file)
-	encoder.SetIndent("", "  ")
-	if err = encoder.Encode(data); err != nil {
-		return fmt.Errorf("xai token storage: write token file: %w", err)
+	if errWrite := os.WriteFile(authFilePath, raw, 0o600); errWrite != nil {
+		return fmt.Errorf("xai token storage: write token file: %w", errWrite)
 	}
 	return nil
+}
+
+// MarshalTokenData serializes the credential without performing filesystem I/O.
+func (ts *TokenStorage) MarshalTokenData() ([]byte, error) {
+	ts.Type = "xai"
+	ts.AuthKind = "oauth"
+	data, errMerge := misc.MergeMetadata(ts, ts.Metadata)
+	if errMerge != nil {
+		return nil, fmt.Errorf("xai token storage: merge metadata: %w", errMerge)
+	}
+	raw, errMarshal := json.MarshalIndent(data, "", "  ")
+	if errMarshal != nil {
+		return nil, fmt.Errorf("xai token storage: marshal token: %w", errMarshal)
+	}
+	return append(raw, '\n'), nil
 }

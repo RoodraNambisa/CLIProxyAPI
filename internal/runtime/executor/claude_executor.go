@@ -500,11 +500,23 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		if from == to {
 			scanner := bufio.NewScanner(decodedBody)
 			scanner.Buffer(nil, 52_428_800) // 50MB
+			markerRequested := metadataBool(opts.Metadata, cliproxyexecutor.StreamTerminalMarkerMetadataKey)
+			protocolFailed := false
+			var protocolErr error
+			terminalSeen := false
 			for scanner.Scan() {
 				line := scanner.Bytes()
 				helps.AppendAPIResponseChunk(ctx, e.cfg, line)
+				if payload := helps.JSONPayload(line); len(payload) > 0 && helps.IsJSONStreamProtocolError(payload) {
+					protocolFailed = true
+					if protocolErr == nil {
+						protocolErr = helps.JSONStreamProtocolError("claude", payload)
+					}
+				}
+				terminal := helps.IsClaudeStreamTerminal(line)
+				terminalSeen = terminalSeen || terminal
 				if detail, ok := helps.ParseClaudeStreamUsage(line); ok {
-					reporter.Publish(ctx, detail)
+					reporter.Observe(detail)
 				}
 				if isClaudeOAuthToken(apiKey) && !auth.ToolPrefixDisabled() {
 					line = stripClaudeToolPrefixFromStreamLine(line, claudeToolPrefix)
@@ -513,15 +525,36 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 					line = reverseRemapOAuthToolNamesFromStreamLine(line)
 				}
 				// Forward the line as-is to preserve SSE format
-				cloned := make([]byte, len(line)+1)
+				lineEnding := 1
+				if markerRequested && terminal && !protocolFailed {
+					lineEnding = 2
+				}
+				cloned := make([]byte, len(line)+lineEnding)
 				copy(cloned, line)
-				cloned[len(line)] = '\n'
+				for i := len(line); i < len(cloned); i++ {
+					cloned[i] = '\n'
+				}
 				out <- cliproxyexecutor.StreamChunk{Payload: cloned}
+				if markerRequested && terminal && !protocolFailed && scanner.Err() == nil {
+					reporter.EnsurePublished(ctx)
+					out <- cliproxyexecutor.SuccessfulStreamTerminalChunk()
+					return
+				}
 			}
 			if errScan := scanner.Err(); errScan != nil {
 				helps.RecordAPIResponseError(ctx, e.cfg, errScan)
 				reporter.PublishFailure(ctx)
 				out <- cliproxyexecutor.StreamChunk{Err: errScan}
+			} else if terminalSeen && !protocolFailed {
+				reporter.EnsurePublished(ctx)
+			} else {
+				streamErr := protocolErr
+				if streamErr == nil {
+					streamErr = helps.IncompleteStreamError("claude")
+				}
+				helps.RecordAPIResponseError(ctx, e.cfg, streamErr)
+				reporter.PublishFailure(ctx, streamErr)
+				out <- cliproxyexecutor.StreamChunk{Err: streamErr}
 			}
 			return
 		}
@@ -530,11 +563,23 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		scanner := bufio.NewScanner(decodedBody)
 		scanner.Buffer(nil, 52_428_800) // 50MB
 		var param any
+		markerRequested := metadataBool(opts.Metadata, cliproxyexecutor.StreamTerminalMarkerMetadataKey)
+		protocolFailed := false
+		var protocolErr error
+		terminalSeen := false
 		for scanner.Scan() {
 			line := scanner.Bytes()
 			helps.AppendAPIResponseChunk(ctx, e.cfg, line)
+			if payload := helps.JSONPayload(line); len(payload) > 0 && helps.IsJSONStreamProtocolError(payload) {
+				protocolFailed = true
+				if protocolErr == nil {
+					protocolErr = helps.JSONStreamProtocolError("claude", payload)
+				}
+			}
+			terminal := helps.IsClaudeStreamTerminal(line)
+			terminalSeen = terminalSeen || terminal
 			if detail, ok := helps.ParseClaudeStreamUsage(line); ok {
-				reporter.Publish(ctx, detail)
+				reporter.Observe(detail)
 			}
 			if isClaudeOAuthToken(apiKey) && !auth.ToolPrefixDisabled() {
 				line = stripClaudeToolPrefixFromStreamLine(line, claudeToolPrefix)
@@ -555,11 +600,26 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 			for i := range chunks {
 				out <- cliproxyexecutor.StreamChunk{Payload: chunks[i]}
 			}
+			if markerRequested && terminal && !protocolFailed && scanner.Err() == nil {
+				reporter.EnsurePublished(ctx)
+				out <- cliproxyexecutor.SuccessfulStreamTerminalChunk()
+				return
+			}
 		}
 		if errScan := scanner.Err(); errScan != nil {
 			helps.RecordAPIResponseError(ctx, e.cfg, errScan)
 			reporter.PublishFailure(ctx)
 			out <- cliproxyexecutor.StreamChunk{Err: errScan}
+		} else if terminalSeen && !protocolFailed {
+			reporter.EnsurePublished(ctx)
+		} else {
+			streamErr := protocolErr
+			if streamErr == nil {
+				streamErr = helps.IncompleteStreamError("claude")
+			}
+			helps.RecordAPIResponseError(ctx, e.cfg, streamErr)
+			reporter.PublishFailure(ctx, streamErr)
+			out <- cliproxyexecutor.StreamChunk{Err: streamErr}
 		}
 	}()
 	return &cliproxyexecutor.StreamResult{Headers: httpResp.Header.Clone(), Chunks: out}, nil

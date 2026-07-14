@@ -60,6 +60,26 @@ func resolveDefaultConfigPath(workDir string) string {
 	return candidates[0]
 }
 
+func deprecatedGeminiCLIFlagsError(flagSet *flag.FlagSet) error {
+	var errDeprecated error
+	flagSet.Visit(func(parsedFlag *flag.Flag) {
+		if errDeprecated != nil {
+			return
+		}
+		switch parsedFlag.Name {
+		case "login":
+			if strings.EqualFold(strings.TrimSpace(parsedFlag.Value.String()), "true") {
+				errDeprecated = errors.New("Gemini CLI login is no longer supported")
+			}
+		case "project_id":
+			if strings.TrimSpace(parsedFlag.Value.String()) != "" {
+				errDeprecated = errors.New("Gemini CLI --project_id is no longer supported")
+			}
+		}
+	})
+	return errDeprecated
+}
+
 // init initializes the shared logger setup.
 func init() {
 	logging.SetupBaseLogger()
@@ -70,12 +90,11 @@ func init() {
 
 // main is the entry point of the application.
 // It parses command-line flags, loads configuration, and starts the appropriate
-// service based on the provided flags (login, codex-login, or server mode).
+// service based on the provided flags (provider login or server mode).
 func main() {
 	fmt.Printf("CLIProxyAPI Version: %s, Commit: %s, BuiltAt: %s\n", buildinfo.Version, buildinfo.Commit, buildinfo.BuildDate)
 
 	// Command-line flags to control the application's behavior.
-	var login bool
 	var codexLogin bool
 	var codexDeviceLogin bool
 	var claudeLogin bool
@@ -84,7 +103,6 @@ func main() {
 	var antigravityLogin bool
 	var kimiLogin bool
 	var xaiLogin bool
-	var projectID string
 	var vertexImport string
 	var vertexImportPrefix string
 	var configPath string
@@ -92,9 +110,10 @@ func main() {
 	var tuiMode bool
 	var standalone bool
 	var localModel bool
+	var deprecatedGeminiLogin bool
+	var deprecatedGeminiProjectID string
 
 	// Define command-line flags for different operation modes.
-	flag.BoolVar(&login, "login", false, "Login Google Account")
 	flag.BoolVar(&codexLogin, "codex-login", false, "Login to Codex using OAuth")
 	flag.BoolVar(&codexDeviceLogin, "codex-device-login", false, "Login to Codex using device code flow")
 	flag.BoolVar(&claudeLogin, "claude-login", false, "Login to Claude using OAuth")
@@ -103,7 +122,6 @@ func main() {
 	flag.BoolVar(&antigravityLogin, "antigravity-login", false, "Login to Antigravity using OAuth")
 	flag.BoolVar(&kimiLogin, "kimi-login", false, "Login to Kimi using OAuth")
 	flag.BoolVar(&xaiLogin, "xai-login", false, "Login to xAI using OAuth")
-	flag.StringVar(&projectID, "project_id", "", "Project ID (Gemini only, not required)")
 	flag.StringVar(&configPath, "config", DefaultConfigPath, "Configure File Path")
 	flag.StringVar(&vertexImport, "vertex-import", "", "Import Vertex service account key JSON file")
 	flag.StringVar(&vertexImportPrefix, "vertex-import-prefix", "", "Prefix for Vertex model namespacing (use with -vertex-import)")
@@ -111,12 +129,14 @@ func main() {
 	flag.BoolVar(&tuiMode, "tui", false, "Start with terminal management UI")
 	flag.BoolVar(&standalone, "standalone", false, "In TUI mode, start an embedded local server")
 	flag.BoolVar(&localModel, "local-model", false, "Use embedded model catalog only, skip remote model fetching")
+	flag.BoolVar(&deprecatedGeminiLogin, "login", false, "Deprecated Gemini CLI login flag")
+	flag.StringVar(&deprecatedGeminiProjectID, "project_id", "", "Deprecated Gemini CLI project flag")
 
 	flag.CommandLine.Usage = func() {
 		out := flag.CommandLine.Output()
 		_, _ = fmt.Fprintf(out, "Usage of %s\n", os.Args[0])
 		flag.CommandLine.VisitAll(func(f *flag.Flag) {
-			if f.Name == "password" {
+			if f.Name == "password" || f.Name == "login" || f.Name == "project_id" {
 				return
 			}
 			s := fmt.Sprintf("  -%s", f.Name)
@@ -141,6 +161,10 @@ func main() {
 
 	// Parse the command-line flags.
 	flag.Parse()
+	if errDeprecated := deprecatedGeminiCLIFlagsError(flag.CommandLine); errDeprecated != nil {
+		log.Error(errDeprecated)
+		os.Exit(1)
+	}
 
 	// Core application variables.
 	var err error
@@ -483,9 +507,6 @@ func main() {
 	if vertexImport != "" {
 		// Handle Vertex service account import
 		cmd.DoVertexImport(cfg, vertexImport, vertexImportPrefix)
-	} else if login {
-		// Handle Google/Gemini login
-		cmd.DoLogin(cfg, projectID, options)
 	} else if antigravityLogin {
 		// Handle Antigravity login
 		cmd.DoAntigravityLogin(cfg, options)
@@ -549,12 +570,18 @@ func main() {
 					password = localMgmtPassword
 				}
 
-				cancel, done := cmd.StartServiceBackground(cfg, configFilePath, password)
+				cancel, done, serviceResult := cmd.StartServiceBackground(cfg, configFilePath, password)
 
 				client := tui.NewClientWithAccessPath(cfg.Port, password, cfg.RemoteManagement.AccessPath)
 				ready := false
 				backoff := 100 * time.Millisecond
+			waitForEmbeddedServer:
 				for i := 0; i < 30; i++ {
+					select {
+					case <-done:
+						break waitForEmbeddedServer
+					default:
+					}
 					if _, errGetConfig := client.GetConfig(); errGetConfig == nil {
 						ready = true
 						break
@@ -569,7 +596,12 @@ func main() {
 					restoreIO()
 					cancel()
 					<-done
-					fmt.Fprintf(os.Stderr, "TUI error: embedded server is not ready\n")
+					errService := <-serviceResult
+					if errService != nil && !errors.Is(errService, context.Canceled) {
+						fmt.Fprintf(os.Stderr, "TUI error: %v\n", errService)
+					} else {
+						fmt.Fprintln(os.Stderr, "TUI error: embedded server is not ready")
+					}
 					return
 				}
 

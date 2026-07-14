@@ -64,6 +64,56 @@ func TestPatchAuthFileStatus_InvokesAuthStatusHook(t *testing.T) {
 	}
 }
 
+func TestPatchAuthFileStatus_RuntimeOnlyIDDoesNotRequireJSONSuffix(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+
+	manager := coreauth.NewManager(nil, nil, nil)
+	record := &coreauth.Auth{
+		ID:       "aistudio-runtime-id",
+		FileName: "aistudio-runtime-display",
+		Provider: "aistudio",
+		Status:   coreauth.StatusActive,
+		Attributes: map[string]string{
+			"runtime_only": "true",
+		},
+		Runtime: map[string]any{"source": "runtime"},
+	}
+	if _, errRegister := manager.Register(context.Background(), record); errRegister != nil {
+		t.Fatalf("register runtime-only auth: %v", errRegister)
+	}
+
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, manager)
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	request := httptest.NewRequest(http.MethodPatch, "/v0/management/auth-files/status", bytes.NewBufferString(`{"name":"aistudio-runtime-display","disabled":true}`))
+	request.Header.Set("Content-Type", "application/json")
+	ctx.Request = request
+
+	h.PatchAuthFileStatus(ctx)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	current, ok := manager.GetByID(record.ID)
+	if !ok || current == nil || !current.Disabled {
+		t.Fatalf("runtime-only auth after status update = %#v, want disabled", current)
+	}
+}
+
+func TestPatchAuthFileStatus_UnknownRuntimeIDReturnsNotFound(t *testing.T) {
+	manager := coreauth.NewManager(nil, nil, nil)
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, manager)
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	request := httptest.NewRequest(http.MethodPatch, "/v0/management/auth-files/status", bytes.NewBufferString(`{"name":"missing-runtime-id","disabled":true}`))
+	request.Header.Set("Content-Type", "application/json")
+	ctx.Request = request
+	h.PatchAuthFileStatus(ctx)
+	if recorder.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want %d; body=%s", recorder.Code, http.StatusNotFound, recorder.Body.String())
+	}
+}
+
 func TestPatchAuthFileStatus_DisableSetsMetadataDisabled(t *testing.T) {
 	t.Setenv("MANAGEMENT_PASSWORD", "")
 
@@ -114,7 +164,7 @@ func TestBuildAuthFromFileData_SetsSourceHashAttribute(t *testing.T) {
 	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, manager)
 
 	path := filepath.Join(authDir, "managed.json")
-	data := []byte(`{"type":"gemini","email":"same@example.com"}`)
+	data := []byte(`{"type":"antigravity","email":"same@example.com"}`)
 
 	auth, err := h.buildAuthFromFileData(path, data)
 	if err != nil {
@@ -139,7 +189,7 @@ func TestBuildAuthFromFileData_PreservesDisabledState(t *testing.T) {
 	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, nil)
 
 	path := filepath.Join(authDir, "managed-disabled.json")
-	data := []byte(`{"type":"gemini","email":"same@example.com","disabled":true}`)
+	data := []byte(`{"type":"antigravity","email":"same@example.com","disabled":true}`)
 
 	auth, err := h.buildAuthFromFileData(path, data)
 	if err != nil {
@@ -201,7 +251,7 @@ func TestUpsertAuthRecord_PreservesCooldownStateForSameSourceRewrite(t *testing.
 	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, manager)
 
 	path := filepath.Join(authDir, "managed.json")
-	data := []byte(`{"type":"gemini","email":"same@example.com"}`)
+	data := []byte(`{"type":"antigravity","email":"same@example.com"}`)
 	authID := h.authIDForPath(path)
 	retryAt := time.Now().Add(5 * time.Minute).UTC()
 	if err := os.WriteFile(path, data, 0o600); err != nil {
@@ -300,10 +350,10 @@ func TestUpsertAuthRecord_PreservesCooldownStateForStorageBackedSameSourceRewrit
 	record := &coreauth.Auth{
 		ID:       "managed-token.json",
 		FileName: "managed-token.json",
-		Provider: "gemini",
+		Provider: "antigravity",
 		Storage:  &managementTestTokenStorage{},
 		Metadata: map[string]any{
-			"type":  "gemini",
+			"type":  "antigravity",
 			"email": "same@example.com",
 		},
 	}
@@ -505,11 +555,11 @@ func TestPatchAuthFileStatus_ReenableClearsCooldownState(t *testing.T) {
 	record := &coreauth.Auth{
 		ID:          "status-reset.json",
 		FileName:    "status-reset.json",
-		Provider:    "gemini",
+		Provider:    "antigravity",
 		Status:      coreauth.StatusError,
 		Unavailable: true,
 		Metadata: map[string]any{
-			"type": "gemini",
+			"type": "antigravity",
 		},
 		LastError:      &coreauth.Error{HTTPStatus: 429, Message: "quota exhausted"},
 		StatusMessage:  "quota exhausted",

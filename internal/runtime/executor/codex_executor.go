@@ -108,11 +108,67 @@ func codexTerminalStreamError(eventData []byte) (statusErr, bool) {
 		return codexResponseFailedError(eventData), true
 	case "response.incomplete":
 		return codexResponseIncompleteError(eventData), true
+	case "response.completed", "response.done":
+		switch strings.ToLower(strings.TrimSpace(gjson.GetBytes(eventData, "response.status").String())) {
+		case "failed":
+			return codexResponseFailedError(eventData), true
+		case "incomplete":
+			return codexResponseIncompleteError(eventData), true
+		case "cancelled", "canceled":
+			return codexResponseCancelledError(), true
+		}
+		if responseError := gjson.GetBytes(eventData, "response.error"); responseError.Exists() && strings.TrimSpace(responseError.Raw) != "null" {
+			return codexResponseFailedError(eventData), true
+		}
 	case "error":
 		return codexStreamErrorEventError(eventData), true
 	default:
 		return statusErr{}, false
 	}
+	return statusErr{}, false
+}
+
+func normalizeCodexCompletion(payload []byte) []byte {
+	if strings.TrimSpace(gjson.GetBytes(payload, "type").String()) == "response.done" && isCodexSuccessfulCompletion(payload) {
+		updated, err := sjson.SetBytes(payload, "type", "response.completed")
+		if err == nil && len(updated) > 0 {
+			return updated
+		}
+	}
+	return payload
+}
+
+func isCodexSuccessfulCompletion(payload []byte) bool {
+	if !isCodexCompletionType(gjson.GetBytes(payload, "type").String()) {
+		return false
+	}
+	status := strings.ToLower(strings.TrimSpace(gjson.GetBytes(payload, "response.status").String()))
+	if status != "" && status != "completed" {
+		return false
+	}
+	responseError := gjson.GetBytes(payload, "response.error")
+	return !responseError.Exists() || strings.TrimSpace(responseError.Raw) == "null"
+}
+
+func isCodexCompletionType(eventType string) bool {
+	eventType = strings.TrimSpace(eventType)
+	return eventType == "response.completed" || eventType == "response.done"
+}
+
+func codexSSEDataCompletion(line []byte) bool {
+	line = bytes.TrimSpace(line)
+	if !bytes.HasPrefix(line, dataTag) {
+		return false
+	}
+	return isCodexSuccessfulCompletion(bytes.TrimSpace(line[len(dataTag):]))
+}
+
+func codexSSEEventCompletion(line []byte) bool {
+	line = bytes.TrimSpace(line)
+	if !bytes.HasPrefix(line, []byte("event:")) {
+		return false
+	}
+	return isCodexCompletionType(string(bytes.TrimSpace(line[len("event:"):])))
 }
 
 func codexResponseFailedError(eventData []byte) statusErr {
@@ -145,6 +201,12 @@ func codexResponseIncompleteError(eventData []byte) statusErr {
 	case "max_tokens", "max_output_tokens", "content_filter":
 		err.skipAuthResult = true
 	}
+	return err
+}
+
+func codexResponseCancelledError() statusErr {
+	err := codexStreamStatusErr(http.StatusBadGateway, "response cancelled", "response_cancelled", "server_error", nil)
+	err.skipAuthResult = true
 	return err
 }
 
@@ -293,7 +355,7 @@ func slimCodexOriginalPayloadForTranslation(from sdktranslator.Format, original 
 		return slimCodexOpenAITools(tools.Array())
 	case sdktranslator.FormatClaude:
 		return slimCodexClaudeTools(tools.Array())
-	case sdktranslator.FormatGemini, sdktranslator.FormatGeminiCLI:
+	case sdktranslator.FormatGemini:
 		return slimCodexGeminiTools(tools.Array())
 	default:
 		return nil
@@ -569,6 +631,8 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 			err = terminalErr
 			return resp, err
 		}
+		eventData = normalizeCodexCompletion(eventData)
+		eventType = gjson.GetBytes(eventData, "type").String()
 
 		if eventType != "response.completed" {
 			continue
@@ -831,6 +895,9 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 		outputItemsByIndex := make(map[int64][]byte)
 		var outputItemsFallback [][]byte
 		var trustedFrame []byte
+		var trustedFrameTerminal bool
+		var pendingImageCompletionEvent []byte
+		var pendingTranslatedCompletionEvent []byte
 		emit := func(chunk cliproxyexecutor.StreamChunk) bool {
 			if ctx == nil {
 				out <- chunk
@@ -843,14 +910,26 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 				return true
 			}
 		}
-		flushTrustedFrame := func() bool {
+		emitSuccessfulTerminal := func() {
+			reporter.EnsurePublished(ctx)
+			if metadataBool(opts.Metadata, cliproxyexecutor.StreamTerminalMarkerMetadataKey) {
+				_ = emit(cliproxyexecutor.SuccessfulStreamTerminalChunk())
+			}
+		}
+		flushTrustedFrame := func() (bool, bool) {
 			if len(bytes.TrimSpace(trustedFrame)) == 0 {
 				trustedFrame = trustedFrame[:0]
-				return true
+				trustedFrameTerminal = false
+				return true, false
 			}
 			payload := append([]byte(nil), trustedFrame...)
+			terminal := trustedFrameTerminal
+			if terminal {
+				payload = normalizeCodexSSECompletionEventLines(payload)
+			}
 			trustedFrame = trustedFrame[:0]
-			return emit(cliproxyexecutor.StreamChunk{Payload: payload})
+			trustedFrameTerminal = false
+			return emit(cliproxyexecutor.StreamChunk{Payload: payload}), terminal
 		}
 		for scanner.Scan() {
 			line := applyCodexIdentityConfuseResponsePayload(scanner.Bytes(), identityState)
@@ -866,38 +945,95 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 				}
 			}
 			if trustUpstreamSSE {
-				publishCodexStreamUsage(ctx, reporter, streamBody.Bytes(), line)
+				clientLine = normalizeCodexSSEPassThroughLine(clientLine)
+				publishCodexStreamUsage(ctx, reporter, streamBody.Bytes(), clientLine)
 				if len(bytes.TrimSpace(line)) == 0 {
-					if !flushTrustedFrame() {
+					emitted, terminal := flushTrustedFrame()
+					if !emitted {
+						return
+					}
+					if terminal && scanner.Err() == nil {
+						emitSuccessfulTerminal()
 						return
 					}
 					continue
 				}
+				trustedFrameTerminal = trustedFrameTerminal || codexSSEDataCompletion(clientLine)
 				trustedFrame = append(trustedFrame, clientLine...)
 				trustedFrame = append(trustedFrame, '\n')
 				continue
 			}
 			if imageStreamPassthrough {
+				if codexSSEEventCompletion(clientLine) {
+					pendingImageCompletionEvent = append(pendingImageCompletionEvent[:0], normalizeCodexSSEEventLine(clientLine)...)
+					continue
+				}
+				clientLine = normalizeCodexSSEPassThroughLine(clientLine)
+				terminal := false
+				trimmedClientLine := bytes.TrimSpace(clientLine)
+				if bytes.HasPrefix(trimmedClientLine, dataTag) {
+					data := bytes.TrimSpace(trimmedClientLine[len(dataTag):])
+					terminal = isCodexSuccessfulCompletion(data)
+					if len(pendingImageCompletionEvent) > 0 {
+						if terminal {
+							if !emit(cliproxyexecutor.StreamChunk{Payload: append([]byte(nil), pendingImageCompletionEvent...)}) {
+								return
+							}
+						}
+						pendingImageCompletionEvent = pendingImageCompletionEvent[:0]
+					}
+				} else if len(trimmedClientLine) == 0 || bytes.HasPrefix(trimmedClientLine, []byte("event:")) {
+					pendingImageCompletionEvent = pendingImageCompletionEvent[:0]
+				}
 				if !emit(cliproxyexecutor.StreamChunk{Payload: append([]byte(nil), clientLine...)}) {
+					return
+				}
+				if terminal && scanner.Err() == nil {
+					emitSuccessfulTerminal()
 					return
 				}
 				continue
 			}
+			if codexSSEEventCompletion(clientLine) {
+				pendingTranslatedCompletionEvent = append(pendingTranslatedCompletionEvent[:0], normalizeCodexSSEEventLine(clientLine)...)
+				continue
+			}
 			translatedLine := bytes.Clone(line)
+			terminal := false
 
 			if bytes.HasPrefix(line, dataTag) {
 				data := bytes.TrimSpace(line[5:])
+				terminal = isCodexSuccessfulCompletion(data)
+				if terminal {
+					data = normalizeCodexCompletion(data)
+				}
 				switch gjson.GetBytes(data, "type").String() {
 				case "response.output_item.done":
 					collectCodexOutputItemDone(data, outputItemsByIndex, &outputItemsFallback)
 				case "response.completed":
 					if detail, ok := helps.ParseCodexUsage(data); ok {
-						reporter.Publish(ctx, detail)
+						reporter.Observe(detail)
 					}
-					publishCodexImageToolUsage(ctx, reporter, streamBody.Bytes(), data)
+					observeCodexImageToolUsage(reporter, streamBody.Bytes(), data)
 					data = patchCodexCompletedOutput(data, outputItemsByIndex, outputItemsFallback)
 					helps.CacheCodexReasoningReplayFromCompleted(replayScope, data)
 					translatedLine = append([]byte("data: "), data...)
+				}
+				if len(pendingTranslatedCompletionEvent) > 0 {
+					if terminal {
+						eventChunks := sdktranslator.TranslateStream(ctx, to, from, req.Model, streamOriginalPayload.Bytes(), streamBody.Bytes(), pendingTranslatedCompletionEvent, &param)
+						for i := range eventChunks {
+							if !emit(cliproxyexecutor.StreamChunk{Payload: eventChunks[i]}) {
+								return
+							}
+						}
+					}
+					pendingTranslatedCompletionEvent = pendingTranslatedCompletionEvent[:0]
+				}
+			} else {
+				trimmedClientLine := bytes.TrimSpace(clientLine)
+				if len(trimmedClientLine) == 0 || bytes.HasPrefix(trimmedClientLine, []byte("event:")) {
+					pendingTranslatedCompletionEvent = pendingTranslatedCompletionEvent[:0]
 				}
 			}
 
@@ -908,9 +1044,18 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 					return
 				}
 			}
+			if terminal && scanner.Err() == nil {
+				emitSuccessfulTerminal()
+				return
+			}
 		}
 		if trustUpstreamSSE && scanner.Err() == nil {
-			if !flushTrustedFrame() {
+			emitted, terminal := flushTrustedFrame()
+			if !emitted {
+				return
+			}
+			if terminal {
+				emitSuccessfulTerminal()
 				return
 			}
 		}
@@ -918,9 +1063,42 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 			helps.RecordAPIResponseError(ctx, e.cfg, errScan)
 			reporter.PublishFailure(ctx)
 			_ = emit(cliproxyexecutor.StreamChunk{Err: errScan})
+		} else {
+			errIncomplete := helps.IncompleteStreamError("codex")
+			helps.RecordAPIResponseError(ctx, e.cfg, errIncomplete)
+			reporter.PublishFailure(ctx, errIncomplete)
+			_ = emit(cliproxyexecutor.StreamChunk{Err: errIncomplete})
 		}
 	}()
 	return &cliproxyexecutor.StreamResult{Headers: httpResp.Header.Clone(), Chunks: out}, nil
+}
+
+func normalizeCodexSSEEventLine(line []byte) []byte {
+	trimmed := bytes.TrimSpace(line)
+	if !bytes.HasPrefix(trimmed, []byte("event:")) || strings.TrimSpace(string(trimmed[len("event:"):])) != "response.done" {
+		return line
+	}
+	return []byte("event: response.completed")
+}
+
+func normalizeCodexSSEPassThroughLine(line []byte) []byte {
+	trimmed := bytes.TrimSpace(line)
+	if !bytes.HasPrefix(trimmed, dataTag) {
+		return line
+	}
+	data := bytes.TrimSpace(trimmed[len(dataTag):])
+	if !isCodexSuccessfulCompletion(data) {
+		return line
+	}
+	return append([]byte("data: "), normalizeCodexCompletion(data)...)
+}
+
+func normalizeCodexSSECompletionEventLines(frame []byte) []byte {
+	lines := bytes.Split(frame, []byte{'\n'})
+	for i := range lines {
+		lines[i] = normalizeCodexSSEEventLine(lines[i])
+	}
+	return bytes.Join(lines, []byte{'\n'})
 }
 
 func (e *CodexExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
@@ -1466,7 +1644,15 @@ func publishCodexImageToolUsage(ctx context.Context, reporter *helps.UsageReport
 	reporter.PublishAdditionalModel(ctx, codexImageGenerationToolModel(body), detail)
 }
 
-func publishCodexStreamUsage(ctx context.Context, reporter *helps.UsageReporter, body []byte, line []byte) {
+func observeCodexImageToolUsage(reporter *helps.UsageReporter, body []byte, completedData []byte) {
+	detail, ok := helps.ParseCodexImageToolUsage(completedData)
+	if !ok {
+		return
+	}
+	reporter.ObserveAdditionalModel(codexImageGenerationToolModel(body), detail)
+}
+
+func publishCodexStreamUsage(_ context.Context, reporter *helps.UsageReporter, body []byte, line []byte) {
 	data, ok := codexStreamDataPayload(line)
 	if !ok || !bytes.Contains(data, []byte("response.completed")) {
 		return
@@ -1475,9 +1661,9 @@ func publishCodexStreamUsage(ctx context.Context, reporter *helps.UsageReporter,
 		return
 	}
 	if detail, ok := helps.ParseCodexUsage(data); ok {
-		reporter.Publish(ctx, detail)
+		reporter.Observe(detail)
 	}
-	publishCodexImageToolUsage(ctx, reporter, body, data)
+	observeCodexImageToolUsage(reporter, body, data)
 }
 
 func codexStreamDataPayload(line []byte) ([]byte, bool) {

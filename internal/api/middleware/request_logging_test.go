@@ -151,6 +151,62 @@ func TestRequestLoggingMiddlewareSkipsOnlyUnmatchedRetiredAmpPaths(t *testing.T)
 	}
 }
 
+func TestRequestLoggingMiddlewareSkipsOnlyUnmatchedRetiredGeminiCLIPaths(t *testing.T) {
+	for _, enabled := range []bool{false, true} {
+		t.Run(fmt.Sprintf("enabled=%t", enabled), func(t *testing.T) {
+			t.Run("unmatched paths", func(t *testing.T) {
+				logger := &testRequestLogger{enabled: enabled}
+				router := gin.New()
+				router.Use(RequestLoggingMiddleware(logger))
+
+				for _, path := range []string{
+					"/v1internal:generateContent",
+					"/v1internal:streamGenerateContent",
+				} {
+					body := fmt.Sprintf(`{"code":"gemini-cli-body-sentinel","path":%q}`, path)
+					req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(body))
+					recorder := httptest.NewRecorder()
+					router.ServeHTTP(recorder, req)
+
+					if recorder.Code != http.StatusNotFound {
+						t.Fatalf("%s status = %d, want %d", path, recorder.Code, http.StatusNotFound)
+					}
+					if logger.calls != 0 {
+						t.Fatalf("unmatched retired Gemini CLI path %s produced %d request log calls", path, logger.calls)
+					}
+					if strings.Contains(string(logger.body), "gemini-cli-body-sentinel") {
+						t.Fatalf("unmatched retired Gemini CLI request body was logged: %s", logger.body)
+					}
+				}
+			})
+
+			t.Run("registered template", func(t *testing.T) {
+				const body = `{"code":"custom-route-body"}`
+				logger := &testRequestLogger{enabled: enabled}
+				router := gin.New()
+				router.Use(RequestLoggingMiddleware(logger))
+				router.POST("/v1internal:method", func(c *gin.Context) {
+					c.String(http.StatusBadRequest, "custom error")
+				})
+
+				req := httptest.NewRequest(http.MethodPost, "/v1internal:generateContent", strings.NewReader(body))
+				recorder := httptest.NewRecorder()
+				router.ServeHTTP(recorder, req)
+
+				if recorder.Code != http.StatusBadRequest {
+					t.Fatalf("status = %d, want %d", recorder.Code, http.StatusBadRequest)
+				}
+				if logger.calls != 1 {
+					t.Fatalf("registered custom route produced %d request log calls, want 1", logger.calls)
+				}
+				if string(logger.body) != body {
+					t.Fatalf("registered custom route body = %q, want %q", logger.body, body)
+				}
+			})
+		})
+	}
+}
+
 func TestShouldCaptureRequestBody(t *testing.T) {
 	tests := []struct {
 		name          string

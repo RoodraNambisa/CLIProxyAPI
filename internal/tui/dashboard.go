@@ -163,7 +163,7 @@ func (m dashboardModel) renderDashboard(cfg, usage map[string]any, authFiles []m
 	authCount := len(authFiles)
 	activeAuth := 0
 	for _, f := range authFiles {
-		if !getBool(f, "disabled") {
+		if !getBool(f, "disabled") && !isRetiredAuthFile(f) {
 			activeAuth++
 		}
 	}

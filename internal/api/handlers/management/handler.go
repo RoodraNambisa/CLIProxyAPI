@@ -44,6 +44,7 @@ type Handler struct {
 	failedAttempts      map[string]*attemptInfo // keyed by client IP
 	authManager         *coreauth.Manager
 	usageStats          *usage.RequestStatistics
+	tokenStoreMu        sync.Mutex
 	tokenStore          coreauth.Store
 	localPassword       string
 	allowRemoteOverride bool

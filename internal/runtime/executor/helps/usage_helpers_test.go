@@ -1,11 +1,27 @@
 package helps
 
 import (
+	"bytes"
+	"context"
 	"testing"
 	"time"
 
+	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/usage"
+	"github.com/tidwall/gjson"
 )
+
+type usageReporterTestPlugin struct {
+	authID  string
+	records chan usage.Record
+}
+
+func (p *usageReporterTestPlugin) HandleUsage(_ context.Context, record usage.Record) {
+	if record.AuthID != p.authID {
+		return
+	}
+	p.records <- record
+}
 
 func TestParseOpenAIUsageChatCompletions(t *testing.T) {
 	data := []byte(`{"usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3,"prompt_tokens_details":{"cached_tokens":4},"completion_tokens_details":{"reasoning_tokens":5}}}`)
@@ -80,6 +96,35 @@ func TestParseClaudeUsagePreservesCacheCreationTokens(t *testing.T) {
 	}
 }
 
+func TestParseAntigravityUsageAcceptsResponseSnakeCase(t *testing.T) {
+	detail := ParseAntigravityUsage([]byte(`{"response":{"usage_metadata":{"promptTokenCount":2,"candidatesTokenCount":3,"totalTokenCount":5}}}`))
+	if detail.InputTokens != 2 || detail.OutputTokens != 3 || detail.TotalTokens != 5 {
+		t.Fatalf("unexpected Antigravity snake-case usage: %+v", detail)
+	}
+}
+
+func TestStripUsageMetadataFromJSONHandlesSnakeCase(t *testing.T) {
+	for _, payload := range [][]byte{
+		[]byte(`{"usage_metadata":{"totalTokenCount":5}}`),
+		[]byte(`{"response":{"usage_metadata":{"totalTokenCount":5}}}`),
+	} {
+		cleaned, changed := StripUsageMetadataFromJSON(payload)
+		if !changed {
+			t.Fatalf("snake-case usage was not stripped: %s", payload)
+		}
+		if gjson.GetBytes(cleaned, "usage_metadata").Exists() || gjson.GetBytes(cleaned, "response.usage_metadata").Exists() {
+			t.Fatalf("snake-case usage remained in payload: %s", cleaned)
+		}
+		if !gjson.GetBytes(cleaned, "cpaUsageMetadata").Exists() && !gjson.GetBytes(cleaned, "response.cpaUsageMetadata").Exists() {
+			t.Fatalf("stripped usage was not preserved: %s", cleaned)
+		}
+	}
+	terminal := []byte(`{"candidates":[{"finishReason":"STOP"}],"usage_metadata":{"totalTokenCount":5}}`)
+	if cleaned, changed := StripUsageMetadataFromJSON(terminal); changed || !bytes.Equal(cleaned, terminal) {
+		t.Fatalf("terminal usage changed: payload=%s changed=%t", cleaned, changed)
+	}
+}
+
 func TestParseCodexImageToolUsage(t *testing.T) {
 	data := []byte(`{"response":{"tool_usage":{"image_gen":{"input_tokens":0,"output_tokens":7024,"total_tokens":7024,"output_tokens_details":{"image_tokens":7024,"text_tokens":0}}}}}`)
 	detail, ok := ParseCodexImageToolUsage(data)
@@ -124,5 +169,59 @@ func TestUsageReporterAdditionalModelSkipsZeroUsage(t *testing.T) {
 	}
 	if record, ok := reporter.buildAdditionalModelRecord("gpt-image-2", usage.Detail{OutputTokens: 10}); !ok || record.Model != "gpt-image-2" || record.Detail.TotalTokens != 10 {
 		t.Fatalf("unexpected additional model record: %#v ok=%v", record, ok)
+	}
+}
+
+func TestUsageReporterObservedUsageDoesNotHideTerminalFailure(t *testing.T) {
+	const authID = "usage-reporter-observed-terminal-failure"
+	records := make(chan usage.Record, 2)
+	usage.RegisterPlugin(&usageReporterTestPlugin{authID: authID, records: records})
+	reporter := NewUsageReporter(context.Background(), "codex", "gpt-5.4", &cliproxyauth.Auth{ID: authID})
+	reporter.Observe(usage.Detail{InputTokens: 3, OutputTokens: 4})
+	reporter.PublishFailure(context.Background(), context.Canceled)
+	reporter.EnsurePublished(context.Background())
+
+	select {
+	case record := <-records:
+		if !record.Failed {
+			t.Fatalf("record failed = false, want true: %#v", record)
+		}
+		if record.Detail.TotalTokens != 0 {
+			t.Fatalf("failed record retained observed tokens: %#v", record.Detail)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for usage record")
+	}
+	select {
+	case record := <-records:
+		t.Fatalf("received a second usage record: %#v", record)
+	case <-time.After(50 * time.Millisecond):
+	}
+}
+
+func TestUsageReporterObserveMergesSplitStreamUsage(t *testing.T) {
+	reporter := &UsageReporter{}
+	reporter.Observe(usage.Detail{InputTokens: 11, CachedTokens: 4})
+	reporter.Observe(usage.Detail{OutputTokens: 7})
+
+	reporter.mu.Lock()
+	detail := reporter.observedDetail
+	reporter.mu.Unlock()
+	if detail.InputTokens != 11 || detail.OutputTokens != 7 || detail.CachedTokens != 4 || detail.TotalTokens != 18 {
+		t.Fatalf("merged observed usage = %#v", detail)
+	}
+}
+
+func TestSetRequestServiceTierFromPayloadPreservesContextTierWhenAbsent(t *testing.T) {
+	ctx := usage.WithServiceTier(context.Background(), "priority")
+	reporter := NewUsageReporter(ctx, "codex", "gpt-5.4", nil)
+
+	reporter.SetRequestServiceTierFromPayload([]byte(`{"model":"gpt-5.4"}`))
+	if reporter.requestServiceTier != "priority" {
+		t.Fatalf("request service tier = %q, want priority", reporter.requestServiceTier)
+	}
+	reporter.SetRequestServiceTierFromPayload([]byte(`{"service_tier":"flex"}`))
+	if reporter.requestServiceTier != "flex" {
+		t.Fatalf("request service tier = %q, want flex", reporter.requestServiceTier)
 	}
 }

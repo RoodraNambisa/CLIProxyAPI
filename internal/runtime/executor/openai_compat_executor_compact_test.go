@@ -169,14 +169,19 @@ func TestOpenAICompatExecutorStreamSkipsKeepAliveUntilDataLine(t *testing.T) {
 	}
 
 	var got strings.Builder
+	var streamErr error
 	for chunk := range result.Chunks {
 		if chunk.Err != nil {
-			t.Fatalf("unexpected stream error: %v", chunk.Err)
+			streamErr = chunk.Err
+			continue
 		}
 		got.Write(chunk.Payload)
 	}
 	if gjson.Get(got.String(), "choices.0.delta.content").String() != "hello" {
 		t.Fatalf("stream payload = %s", got.String())
+	}
+	if streamErr == nil || !strings.Contains(streamErr.Error(), "successful terminal event") {
+		t.Fatalf("stream error = %v, want incomplete terminal error", streamErr)
 	}
 }
 

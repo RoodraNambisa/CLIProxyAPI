@@ -199,6 +199,10 @@ func (e *CodexExecutor) executeOpenAIImageStream(ctx context.Context, auth *clip
 		}()
 		reader := bufio.NewReaderSize(httpResp.Body, 64*1024)
 		var streamUsage helps.StreamUsageBuffer
+		markerRequested := metadataBool(opts.Metadata, cliproxyexecutor.StreamTerminalMarkerMetadataKey)
+		protocolFailed := false
+		var protocolErr error
+		terminalSeen := false
 		for {
 			line, readErr := reader.ReadBytes('\n')
 			if len(line) > 0 {
@@ -206,7 +210,21 @@ func (e *CodexExecutor) executeOpenAIImageStream(ctx context.Context, auth *clip
 				helps.AppendAPIResponseChunk(ctx, e.cfg, upstreamLine)
 				streamUsage.ObserveOpenAIStream(upstreamLine)
 				clientLine := applyCodexIdentityExposeResponsePayload(upstreamLine, identityState)
+				if payload := helps.JSONPayload(clientLine); len(payload) > 0 && helps.IsJSONStreamProtocolError(payload) {
+					protocolFailed = true
+					if protocolErr == nil {
+						protocolErr = helps.JSONStreamProtocolError("codex image", payload)
+					}
+				}
+				terminal := helps.IsOpenAIStreamTerminal(clientLine) || codexSSEDataCompletion(clientLine)
+				terminalSeen = terminalSeen || terminal
 				if !emitCodexOpenAIImageStreamChunk(ctx, out, cliproxyexecutor.StreamChunk{Payload: clientLine}) {
+					return
+				}
+				if markerRequested && terminal && !protocolFailed && (readErr == nil || errors.Is(readErr, io.EOF)) {
+					streamUsage.Publish(ctx, reporter)
+					reporter.EnsurePublished(ctx)
+					_ = emitCodexOpenAIImageStreamChunk(ctx, out, cliproxyexecutor.SuccessfulStreamTerminalChunk())
 					return
 				}
 			}
@@ -214,11 +232,23 @@ func (e *CodexExecutor) executeOpenAIImageStream(ctx context.Context, auth *clip
 				continue
 			}
 			if errors.Is(readErr, io.EOF) {
-				streamUsage.Publish(ctx, reporter)
-				reporter.EnsurePublished(ctx)
+				if terminalSeen && !protocolFailed {
+					streamUsage.Publish(ctx, reporter)
+					reporter.EnsurePublished(ctx)
+					if markerRequested {
+						_ = emitCodexOpenAIImageStreamChunk(ctx, out, cliproxyexecutor.SuccessfulStreamTerminalChunk())
+					}
+					return
+				}
+				streamErr := protocolErr
+				if streamErr == nil {
+					streamErr = helps.IncompleteStreamError("codex image")
+				}
+				helps.RecordAPIResponseError(ctx, e.cfg, streamErr)
+				reporter.PublishFailure(ctx, streamErr)
+				_ = emitCodexOpenAIImageStreamChunk(ctx, out, cliproxyexecutor.StreamChunk{Err: streamErr})
 				return
 			}
-			streamUsage.Publish(ctx, reporter)
 			helps.RecordAPIResponseError(ctx, e.cfg, readErr)
 			reporter.PublishFailure(ctx)
 			_ = emitCodexOpenAIImageStreamChunk(ctx, out, cliproxyexecutor.StreamChunk{Err: readErr})

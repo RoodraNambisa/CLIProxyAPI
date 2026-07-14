@@ -294,7 +294,7 @@ func decideAntigravity429(body []byte) antigravity429Decision {
 		return decision
 	}
 
-	if retryAfter, parseErr := parseRetryDelay(body); parseErr == nil && retryAfter != nil {
+	if retryAfter, parseErr := helps.ParseRetryDelay(body); parseErr == nil && retryAfter != nil {
 		decision.retryAfter = retryAfter
 	}
 
@@ -550,7 +550,7 @@ func shouldMarkAntigravityCreditsExhausted(statusCode int, body []byte, reqErr e
 func newAntigravityStatusErr(statusCode int, body []byte) statusErr {
 	err := statusErr{code: statusCode, msg: string(body)}
 	if statusCode == http.StatusTooManyRequests {
-		if retryAfter, parseErr := parseRetryDelay(body); parseErr == nil && retryAfter != nil {
+		if retryAfter, parseErr := helps.ParseRetryDelay(body); parseErr == nil && retryAfter != nil {
 			err.retryAfter = retryAfter
 		}
 	}
@@ -611,7 +611,7 @@ func (e *AntigravityExecutor) attemptCreditsFallback(
 		return nil, true
 	}
 	if httpResp.StatusCode >= http.StatusOK && httpResp.StatusCode < http.StatusMultipleChoices {
-		retryAfter, _ := parseRetryDelay(originalBody)
+		retryAfter, _ := helps.ParseRetryDelay(originalBody)
 		markAntigravityPreferCredits(auth, modelName, now, retryAfter)
 		clearAntigravityCreditsFailureState(auth)
 		return httpResp, true
@@ -1652,9 +1652,28 @@ attemptLoop:
 				scanner := bufio.NewScanner(resp.Body)
 				scanner.Buffer(nil, streamScannerBuffer)
 				var param any
+				markerRequested := metadataBool(opts.Metadata, cliproxyexecutor.StreamTerminalMarkerMetadataKey)
+				protocolFailed := false
+				var protocolErr error
+				terminalSeen := false
 				for scanner.Scan() {
 					line := scanner.Bytes()
 					helps.AppendAPIResponseChunk(ctx, e.cfg, line)
+					rawPayload := helps.JSONPayload(line)
+					if rawPayload == nil {
+						continue
+					}
+					if helps.IsJSONStreamProtocolError(rawPayload) {
+						protocolFailed = true
+						if protocolErr == nil {
+							protocolErr = helps.JSONStreamProtocolError("antigravity", rawPayload)
+						}
+					}
+					terminal := helps.IsGeminiStreamTerminal(rawPayload)
+					detail, usagePresent := helps.ParseAntigravityStreamUsage(rawPayload)
+					if usagePresent {
+						reporter.Observe(detail)
+					}
 
 					// Filter usage metadata for all models
 					// Only retain usage statistics in the terminal chunk
@@ -1665,25 +1684,43 @@ attemptLoop:
 						continue
 					}
 
-					if detail, ok := helps.ParseAntigravityStreamUsage(payload); ok {
-						reporter.Publish(ctx, detail)
-					}
-
 					chunks := sdktranslator.TranslateStream(ctx, to, from, req.Model, originalRef.Bytes(), translatedRef.Bytes(), bytes.Clone(payload), &param)
 					for i := range chunks {
 						out <- cliproxyexecutor.StreamChunk{Payload: chunks[i]}
 					}
-				}
-				tail := sdktranslator.TranslateStream(ctx, to, from, req.Model, originalRef.Bytes(), translatedRef.Bytes(), []byte("[DONE]"), &param)
-				for i := range tail {
-					out <- cliproxyexecutor.StreamChunk{Payload: tail[i]}
+					terminalSeen = terminalSeen || terminal
+					terminalReady := terminal && !helps.GeminiTerminalAwaitsUsage(rawPayload) || terminalSeen && usagePresent
+					if markerRequested && terminalReady && !protocolFailed && scanner.Err() == nil {
+						tail := sdktranslator.TranslateStream(ctx, to, from, req.Model, originalRef.Bytes(), translatedRef.Bytes(), []byte("[DONE]"), &param)
+						for i := range tail {
+							out <- cliproxyexecutor.StreamChunk{Payload: tail[i]}
+						}
+						reporter.EnsurePublished(ctx)
+						out <- cliproxyexecutor.SuccessfulStreamTerminalChunk()
+						return
+					}
 				}
 				if errScan := scanner.Err(); errScan != nil {
 					helps.RecordAPIResponseError(ctx, e.cfg, errScan)
 					reporter.PublishFailure(ctx)
 					out <- cliproxyexecutor.StreamChunk{Err: errScan}
-				} else {
+				} else if terminalSeen && !protocolFailed {
+					tail := sdktranslator.TranslateStream(ctx, to, from, req.Model, originalRef.Bytes(), translatedRef.Bytes(), []byte("[DONE]"), &param)
+					for i := range tail {
+						out <- cliproxyexecutor.StreamChunk{Payload: tail[i]}
+					}
 					reporter.EnsurePublished(ctx)
+					if markerRequested {
+						out <- cliproxyexecutor.SuccessfulStreamTerminalChunk()
+					}
+				} else {
+					streamErr := protocolErr
+					if streamErr == nil {
+						streamErr = helps.IncompleteStreamError("antigravity")
+					}
+					helps.RecordAPIResponseError(ctx, e.cfg, streamErr)
+					reporter.PublishFailure(ctx, streamErr)
+					out <- cliproxyexecutor.StreamChunk{Err: streamErr}
 				}
 			}(httpResp)
 			cleanupInStream = true
@@ -1751,9 +1788,9 @@ func (e *AntigravityExecutor) CountTokens(ctx context.Context, auth *cliproxyaut
 		return cliproxyexecutor.Response{}, err
 	}
 
-	payload = deleteJSONField(payload, "project")
-	payload = deleteJSONField(payload, "model")
-	payload = deleteJSONField(payload, "request.safetySettings")
+	payload = helps.DeleteJSONField(payload, "project")
+	payload = helps.DeleteJSONField(payload, "model")
+	payload = helps.DeleteJSONField(payload, "request.safetySettings")
 	_, payloadRef, unregisterBodies := helps.RequestBodyRefs(ctx, opts, nil, payload)
 	defer unregisterBodies()
 	defer payloadRef.Release()
@@ -1866,7 +1903,7 @@ func (e *AntigravityExecutor) CountTokens(ctx context.Context, auth *cliproxyaut
 		}
 		sErr := statusErr{code: httpResp.StatusCode, msg: string(bodyBytes)}
 		if httpResp.StatusCode == http.StatusTooManyRequests {
-			if retryAfter, parseErr := parseRetryDelay(bodyBytes); parseErr == nil && retryAfter != nil {
+			if retryAfter, parseErr := helps.ParseRetryDelay(bodyBytes); parseErr == nil && retryAfter != nil {
 				sErr.retryAfter = retryAfter
 			}
 		}
@@ -1877,7 +1914,7 @@ func (e *AntigravityExecutor) CountTokens(ctx context.Context, auth *cliproxyaut
 	case lastStatus != 0:
 		sErr := statusErr{code: lastStatus, msg: string(lastBody)}
 		if lastStatus == http.StatusTooManyRequests {
-			if retryAfter, parseErr := parseRetryDelay(lastBody); parseErr == nil && retryAfter != nil {
+			if retryAfter, parseErr := helps.ParseRetryDelay(lastBody); parseErr == nil && retryAfter != nil {
 				sErr.retryAfter = retryAfter
 			}
 		}
@@ -1954,7 +1991,7 @@ func (e *AntigravityExecutor) refreshToken(ctx context.Context, auth *cliproxyau
 	if httpResp.StatusCode < http.StatusOK || httpResp.StatusCode >= http.StatusMultipleChoices {
 		sErr := statusErr{code: httpResp.StatusCode, msg: string(bodyBytes)}
 		if httpResp.StatusCode == http.StatusTooManyRequests {
-			if retryAfter, parseErr := parseRetryDelay(bodyBytes); parseErr == nil && retryAfter != nil {
+			if retryAfter, parseErr := helps.ParseRetryDelay(bodyBytes); parseErr == nil && retryAfter != nil {
 				sErr.retryAfter = retryAfter
 			}
 		}

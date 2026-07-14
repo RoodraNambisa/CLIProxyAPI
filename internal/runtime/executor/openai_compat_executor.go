@@ -304,6 +304,10 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 		scanner.Buffer(nil, 52_428_800) // 50MB
 		var param any
 		var streamUsage helps.StreamUsageBuffer
+		markerRequested := metadataBool(opts.Metadata, cliproxyexecutor.StreamTerminalMarkerMetadataKey)
+		protocolFailed := false
+		var protocolErr error
+		terminalSeen := false
 		for scanner.Scan() {
 			line := scanner.Bytes()
 			helps.AppendAPIResponseChunk(ctx, e.cfg, line)
@@ -332,28 +336,51 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 			}
 
 			// OpenAI-compatible streams must use SSE data lines.
+			terminal := helps.IsOpenAIStreamTerminal(trimmedLine)
+			terminalSeen = terminalSeen || terminal
+			if !terminal {
+				payload := helps.JSONPayload(trimmedLine)
+				if len(payload) > 0 && helps.IsJSONStreamProtocolError(payload) {
+					protocolFailed = true
+					if protocolErr == nil {
+						protocolErr = helps.JSONStreamProtocolError("openai-compatible", payload)
+					}
+				}
+			}
 			chunks := sdktranslator.TranslateStream(ctx, to, from, req.Model, originalRef.Bytes(), translatedRef.Bytes(), bytes.Clone(trimmedLine), &param)
 			for i := range chunks {
 				out <- cliproxyexecutor.StreamChunk{Payload: chunks[i]}
 			}
+			if markerRequested && terminal && !protocolFailed && scanner.Err() == nil {
+				streamUsage.Publish(ctx, reporter)
+				reporter.EnsurePublished(ctx)
+				out <- cliproxyexecutor.SuccessfulStreamTerminalChunk()
+				return
+			}
 		}
 		if errScan := scanner.Err(); errScan != nil {
-			streamUsage.Publish(ctx, reporter)
 			helps.RecordAPIResponseError(ctx, e.cfg, errScan)
 			reporter.PublishFailure(ctx)
 			out <- cliproxyexecutor.StreamChunk{Err: errScan}
-		} else {
+		} else if terminalSeen && !protocolFailed {
 			streamUsage.Publish(ctx, reporter)
-			// In case the upstream close the stream without a terminal [DONE] marker.
-			// Feed a synthetic done marker through the translator so pending
-			// response.completed events are still emitted exactly once.
 			chunks := sdktranslator.TranslateStream(ctx, to, from, req.Model, originalRef.Bytes(), translatedRef.Bytes(), []byte("data: [DONE]"), &param)
 			for i := range chunks {
 				out <- cliproxyexecutor.StreamChunk{Payload: chunks[i]}
 			}
+			reporter.EnsurePublished(ctx)
+			if markerRequested {
+				out <- cliproxyexecutor.SuccessfulStreamTerminalChunk()
+			}
+		} else {
+			streamErr := protocolErr
+			if streamErr == nil {
+				streamErr = helps.IncompleteStreamError("openai-compatible")
+			}
+			helps.RecordAPIResponseError(ctx, e.cfg, streamErr)
+			reporter.PublishFailure(ctx, streamErr)
+			out <- cliproxyexecutor.StreamChunk{Err: streamErr}
 		}
-		// Ensure we record the request if no usage chunk was ever seen
-		reporter.EnsurePublished(ctx)
 	}()
 	return &cliproxyexecutor.StreamResult{Headers: httpResp.Header.Clone(), Chunks: out}, nil
 }

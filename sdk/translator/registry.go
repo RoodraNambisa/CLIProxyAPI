@@ -47,26 +47,42 @@ func (r *Registry) Register(from, to Format, request RequestTransform, response 
 // "model" field is still updated to match the resolved model name so that
 // client-side prefixes (e.g. "copilot/gpt-5-mini") are not leaked upstream.
 func (r *Registry) TranslateRequest(from, to Format, model string, rawJSON []byte, stream bool) []byte {
+	translated, err := r.TranslateRequestChecked(from, to, model, rawJSON, stream)
+	if err != nil {
+		return rawJSON
+	}
+	return translated
+}
+
+// TranslateRequestChecked converts a payload and reports retired formats as an
+// explicit error. TranslateRequest retains its legacy byte-only signature.
+func (r *Registry) TranslateRequestChecked(from, to Format, model string, rawJSON []byte, stream bool) ([]byte, error) {
+	if usesRetiredGeminiCLIFormat(from, to) {
+		return nil, ErrGeminiCLIFormatNotSupported
+	}
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
 	if byTarget, ok := r.requests[from]; ok {
 		if fn, isOk := byTarget[to]; isOk && fn != nil {
-			return fn(model, rawJSON, stream)
+			return fn(model, rawJSON, stream), nil
 		}
 	}
 	if model != "" && gjson.GetBytes(rawJSON, "model").String() != model {
 		if updated, err := sjson.SetBytes(rawJSON, "model", model); err != nil {
 			log.Warnf("translator: failed to normalize model in request fallback: %v", err)
 		} else {
-			return updated
+			return updated, nil
 		}
 	}
-	return rawJSON
+	return rawJSON, nil
 }
 
 // HasResponseTransformer indicates whether a response translator exists.
 func (r *Registry) HasResponseTransformer(from, to Format) bool {
+	if usesRetiredGeminiCLIFormat(from, to) {
+		return false
+	}
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
@@ -80,6 +96,9 @@ func (r *Registry) HasResponseTransformer(from, to Format) bool {
 
 // TranslateStream applies the registered streaming response translator.
 func (r *Registry) TranslateStream(ctx context.Context, from, to Format, model string, originalRequestRawJSON, requestRawJSON, rawJSON []byte, param *any) [][]byte {
+	if usesRetiredGeminiCLIFormat(from, to) {
+		return [][]byte{rawJSON}
+	}
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
@@ -93,6 +112,9 @@ func (r *Registry) TranslateStream(ctx context.Context, from, to Format, model s
 
 // TranslateNonStream applies the registered non-stream response translator.
 func (r *Registry) TranslateNonStream(ctx context.Context, from, to Format, model string, originalRequestRawJSON, requestRawJSON, rawJSON []byte, param *any) []byte {
+	if usesRetiredGeminiCLIFormat(from, to) {
+		return rawJSON
+	}
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
@@ -106,6 +128,9 @@ func (r *Registry) TranslateNonStream(ctx context.Context, from, to Format, mode
 
 // TranslateTokenCount applies the registered token count response translator.
 func (r *Registry) TranslateTokenCount(ctx context.Context, from, to Format, count int64, rawJSON []byte) []byte {
+	if usesRetiredGeminiCLIFormat(from, to) {
+		return rawJSON
+	}
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
@@ -132,6 +157,11 @@ func Register(from, to Format, request RequestTransform, response ResponseTransf
 // TranslateRequest is a helper on the default registry.
 func TranslateRequest(from, to Format, model string, rawJSON []byte, stream bool) []byte {
 	return defaultRegistry.TranslateRequest(from, to, model, rawJSON, stream)
+}
+
+// TranslateRequestChecked is the error-returning counterpart to TranslateRequest.
+func TranslateRequestChecked(from, to Format, model string, rawJSON []byte, stream bool) ([]byte, error) {
+	return defaultRegistry.TranslateRequestChecked(from, to, model, rawJSON, stream)
 }
 
 // HasResponseTransformer inspects the default registry.

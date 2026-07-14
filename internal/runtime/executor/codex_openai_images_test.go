@@ -99,6 +99,7 @@ func TestCodexExecutorOpenAIImageExecuteStreamProxiesEdits(t *testing.T) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		_, _ = w.Write([]byte("event: image_generation.partial_image\n"))
 		_, _ = w.Write([]byte(`data: {"type":"image_generation.partial_image","b64_json":"cGFydA=="}` + "\n\n"))
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
 	}))
 	defer server.Close()
 
@@ -110,16 +111,27 @@ func TestCodexExecutorOpenAIImageExecuteStreamProxiesEdits(t *testing.T) {
 	}, cliproxyexecutor.Options{
 		SourceFormat: sdktranslator.FromString(codexOpenAIImageSourceFormat),
 		Alt:          codexOpenAIImageEdits,
+		Metadata: map[string]any{
+			cliproxyexecutor.StreamTerminalMarkerMetadataKey: true,
+		},
 	})
 	if err != nil {
 		t.Fatalf("ExecuteStream() error = %v", err)
 	}
 	var out bytes.Buffer
+	terminalCount := 0
 	for chunk := range result.Chunks {
 		if chunk.Err != nil {
 			t.Fatalf("stream chunk error = %v", chunk.Err)
 		}
+		if cliproxyexecutor.IsSuccessfulStreamTerminalChunk(chunk) {
+			terminalCount++
+			continue
+		}
 		out.Write(chunk.Payload)
+	}
+	if terminalCount != 1 {
+		t.Fatalf("terminal marker count = %d, want 1", terminalCount)
 	}
 	if capturedPath != "/images/edits" {
 		t.Fatalf("path = %q, want /images/edits", capturedPath)

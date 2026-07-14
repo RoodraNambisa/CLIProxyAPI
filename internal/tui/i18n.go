@@ -145,6 +145,8 @@ var zhStrings = map[string]string{
 	"updated_field":   "已更新 %s 的 %s",
 	"status_active":   "活跃",
 	"status_disabled": "已停用",
+	"status_retired":  "已退休",
+	"auth_read_only":  "该历史凭证已停止支持，仅可查看或删除",
 
 	// ── API Keys ──
 	"keys_title":         "🔐 API 密钥",
@@ -296,6 +298,8 @@ var enStrings = map[string]string{
 	"updated_field":   "Updated %s on %s",
 	"status_active":   "active",
 	"status_disabled": "disabled",
+	"status_retired":  "retired",
+	"auth_read_only":  "This retired credential can only be viewed or deleted",
 
 	// ── API Keys ──
 	"keys_title":         "🔐 API Keys",

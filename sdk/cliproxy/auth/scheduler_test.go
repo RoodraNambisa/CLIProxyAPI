@@ -78,6 +78,20 @@ func schedulerTestID(t *testing.T, prefix string) string {
 	return prefix + "-" + name
 }
 
+func TestSchedulerBlockAuthQuarantinesConcurrentUpsert(t *testing.T) {
+	scheduler := newSchedulerForTest(&RoundRobinSelector{})
+	auth := &Auth{ID: "auth-1", Provider: "codex"}
+	scheduler.blockAuth(auth.ID)
+	scheduler.upsertAuth(auth)
+	if selected, errPick := scheduler.pickSingle(t.Context(), auth.Provider, "", cliproxyexecutor.Options{}, nil); errPick == nil || selected != nil {
+		t.Fatalf("pick while blocked = (%#v, %v), want unavailable", selected, errPick)
+	}
+	scheduler.unblockAuth(auth.ID, auth)
+	if selected, errPick := scheduler.pickSingle(t.Context(), auth.Provider, "", cliproxyexecutor.Options{}, nil); errPick != nil || selected == nil || selected.ID != auth.ID {
+		t.Fatalf("pick after unblock = (%#v, %v), want %s", selected, errPick, auth.ID)
+	}
+}
+
 func TestSchedulerPick_PriorityStrategyOverrideBeatsGlobalStrategy(t *testing.T) {
 	t.Parallel()
 
@@ -961,37 +975,6 @@ func TestSchedulerPickSingle_BlocksRebuildWhileProviderSelectionIsInFlight(t *te
 	}
 	if got.ID != "new" {
 		t.Fatalf("pickSingle() after rebuild auth.ID = %q, want %q", got.ID, "new")
-	}
-}
-
-func TestSchedulerPick_GeminiVirtualParentUsesTwoLevelRotation(t *testing.T) {
-	t.Parallel()
-
-	registerSchedulerModels(t, "gemini-cli", "gemini-2.5-pro", "cred-a::proj-1", "cred-a::proj-2", "cred-b::proj-1", "cred-b::proj-2")
-	scheduler := newSchedulerForTest(
-		&RoundRobinSelector{},
-		&Auth{ID: "cred-a::proj-1", Provider: "gemini-cli", Attributes: map[string]string{"gemini_virtual_parent": "cred-a"}},
-		&Auth{ID: "cred-a::proj-2", Provider: "gemini-cli", Attributes: map[string]string{"gemini_virtual_parent": "cred-a"}},
-		&Auth{ID: "cred-b::proj-1", Provider: "gemini-cli", Attributes: map[string]string{"gemini_virtual_parent": "cred-b"}},
-		&Auth{ID: "cred-b::proj-2", Provider: "gemini-cli", Attributes: map[string]string{"gemini_virtual_parent": "cred-b"}},
-	)
-
-	wantParents := []string{"cred-a", "cred-b", "cred-a", "cred-b"}
-	wantIDs := []string{"cred-a::proj-1", "cred-b::proj-1", "cred-a::proj-2", "cred-b::proj-2"}
-	for index := range wantIDs {
-		got, errPick := scheduler.pickSingle(context.Background(), "gemini-cli", "gemini-2.5-pro", cliproxyexecutor.Options{}, nil)
-		if errPick != nil {
-			t.Fatalf("pickSingle() #%d error = %v", index, errPick)
-		}
-		if got == nil {
-			t.Fatalf("pickSingle() #%d auth = nil", index)
-		}
-		if got.ID != wantIDs[index] {
-			t.Fatalf("pickSingle() #%d auth.ID = %q, want %q", index, got.ID, wantIDs[index])
-		}
-		if got.Attributes["gemini_virtual_parent"] != wantParents[index] {
-			t.Fatalf("pickSingle() #%d parent = %q, want %q", index, got.Attributes["gemini_virtual_parent"], wantParents[index])
-		}
 	}
 }
 

@@ -87,6 +87,21 @@ func TestManagerExecuteStream_AntigravityCreditsFallbackAfterBootstrap429(t *tes
 	}
 }
 
+func TestFindAllAntigravityCreditsCandidateAuths_SkipsSessionCleanup(t *testing.T) {
+	executor := &antigravityCreditsFallbackExecutor{}
+	manager := NewManager(nil, nil, nil)
+	manager.RegisterExecutor(executor)
+	if _, errRegister := manager.Register(t.Context(), &Auth{ID: "ag-cleanup", Provider: "antigravity"}); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+
+	manager.beginSessionCleanup("ag-cleanup")
+	t.Cleanup(func() { manager.endSessionCleanup("ag-cleanup") })
+	if candidates := manager.findAllAntigravityCreditsCandidateAuths("claude-opus-4-6-thinking", cliproxyexecutor.Options{}); len(candidates) != 0 {
+		t.Fatalf("cleanup candidates = %#v, want none", candidates)
+	}
+}
+
 func TestStatusCodeFromError_UnwrapsStreamBootstrap429(t *testing.T) {
 	bootstrapErr := newStreamBootstrapError(&Error{HTTPStatus: http.StatusTooManyRequests, Message: "quota exhausted"}, nil)
 	wrappedErr := fmt.Errorf("conductor stream failed: %w", bootstrapErr)

@@ -87,8 +87,9 @@ type WatcherWrapper struct {
 
 	setConfig             func(cfg *config.Config)
 	snapshotAuths         func() []*coreauth.Auth
+	seedCurrentFileAuths  func(auths []*coreauth.Auth)
 	setUpdateQueue        func(queue chan<- watcher.AuthUpdate)
-	dispatchRuntimeUpdate func(update watcher.AuthUpdate) bool
+	dispatchRuntimeUpdate func(update watcher.AuthUpdate) watcher.RuntimeAuthUpdateResult
 }
 
 // Start proxies to the underlying watcher Start implementation.
@@ -115,12 +116,25 @@ func (w *WatcherWrapper) SetConfig(cfg *config.Config) {
 	w.setConfig(cfg)
 }
 
+// SeedCurrentFileAuths lets the first watcher refresh reconcile credentials
+// that were loaded by the runtime manager before the watcher started.
+func (w *WatcherWrapper) SeedCurrentFileAuths(auths []*coreauth.Auth) {
+	if w == nil || w.seedCurrentFileAuths == nil {
+		return
+	}
+	w.seedCurrentFileAuths(auths)
+}
+
 // DispatchRuntimeAuthUpdate forwards runtime auth updates (e.g., websocket providers)
 // into the watcher-managed auth update queue when available.
 // Returns true if the update was enqueued successfully.
 func (w *WatcherWrapper) DispatchRuntimeAuthUpdate(update watcher.AuthUpdate) bool {
+	return w.dispatchRuntimeAuthUpdateResult(update).Enqueued
+}
+
+func (w *WatcherWrapper) dispatchRuntimeAuthUpdateResult(update watcher.AuthUpdate) watcher.RuntimeAuthUpdateResult {
 	if w == nil || w.dispatchRuntimeUpdate == nil {
-		return false
+		return watcher.RuntimeAuthUpdateResult{}
 	}
 	return w.dispatchRuntimeUpdate(update)
 }

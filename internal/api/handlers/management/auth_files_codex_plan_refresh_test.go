@@ -107,6 +107,41 @@ func TestCodexPlanTypeRefreshUpdatesPlanTypeAndListAuthFiles(t *testing.T) {
 	}
 }
 
+func TestCodexPlanTypeRefreshRejectsRetiredBackingFileBeforeNetwork(t *testing.T) {
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		calls.Add(1)
+	}))
+	defer server.Close()
+	restoreUsageURL := codexPlanTypeRefreshUsageURL
+	codexPlanTypeRefreshUsageURL = server.URL
+	defer func() { codexPlanTypeRefreshUsageURL = restoreUsageURL }()
+
+	h, manager, path, authID := newCodexPlanRefreshTestHandler(t, map[string]any{
+		"type":               "codex",
+		"account_id":         "acct-retired",
+		"access_token":       "access-retired",
+		"refresh_token":      "refresh-retired",
+		"last_refresh":       time.Now().Format(time.RFC3339),
+		"expired":            time.Now().Add(time.Hour).Format(time.RFC3339),
+		"chatgpt_account_id": "acct-retired",
+	})
+	if errWrite := os.WriteFile(path, []byte(`{"type":"gemini","access_token":"legacy"}`), 0o600); errWrite != nil {
+		t.Fatalf("replace auth with retired file: %v", errWrite)
+	}
+	auth, ok := manager.GetByID(authID)
+	if !ok || auth == nil {
+		t.Fatal("test auth not found")
+	}
+	result := h.refreshSingleCodexPlanType(manager, auth)
+	if result.Status != codexPlanTypeRefreshStatusFailed || result.Error != errGeminiCLIAuthGone.Error() {
+		t.Fatalf("refresh result = %#v", result)
+	}
+	if got := calls.Load(); got != 0 {
+		t.Fatalf("usage endpoint calls = %d, want 0", got)
+	}
+}
+
 func TestCodexPlanTypeRefreshRejectsConcurrentRequests(t *testing.T) {
 
 	release := make(chan struct{})

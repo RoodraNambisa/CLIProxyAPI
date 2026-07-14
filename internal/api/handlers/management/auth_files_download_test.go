@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 
 	"github.com/gin-gonic/gin"
@@ -43,6 +44,26 @@ func unzipAuthArchive(t *testing.T, data []byte) map[string]string {
 	return files
 }
 
+func TestManagedAuthNameKeyForOS(t *testing.T) {
+	if got := managedAuthNameKeyForOS("Foo.JSON", "windows"); got != "foo.json" {
+		t.Fatalf("Windows key = %q, want foo.json", got)
+	}
+	if got := managedAuthNameKeyForOS("Foo.JSON", "linux"); got != "Foo.JSON" {
+		t.Fatalf("Linux key = %q, want Foo.JSON", got)
+	}
+}
+
+func TestNormalizeManagedAuthFileNameRejectsWindowsVolumeShapes(t *testing.T) {
+	for _, name := range []string{`C:\auth.json`, `C:auth.json`, `\auth.json`, `\\server\share\auth.json`, `/auth.json`} {
+		if normalized, errNormalize := normalizeManagedAuthFileName(name); errNormalize == nil {
+			t.Fatalf("normalizeManagedAuthFileName(%q) = %q, want error", name, normalized)
+		}
+	}
+	if normalized, errNormalize := normalizeManagedAuthFileName(`team\legacy.json`); runtime.GOOS != "windows" && (errNormalize != nil || normalized != `team\legacy.json`) {
+		t.Fatalf("Unix literal backslash name = %q, error=%v", normalized, errNormalize)
+	}
+}
+
 func TestDownloadAuthFile_ReturnsFile(t *testing.T) {
 	t.Setenv("MANAGEMENT_PASSWORD", "")
 
@@ -68,6 +89,35 @@ func TestDownloadAuthFile_ReturnsFile(t *testing.T) {
 	}
 }
 
+func TestDownloadAuthFile_ReportsAuthDirectoryFailureAsServerError(t *testing.T) {
+	authDirFile := filepath.Join(t.TempDir(), "not-a-directory")
+	if errWrite := os.WriteFile(authDirFile, []byte("x"), 0o600); errWrite != nil {
+		t.Fatalf("write auth-dir placeholder: %v", errWrite)
+	}
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDirFile}, nil)
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/v0/management/auth-files/download?name=auth.json", nil)
+
+	h.DownloadAuthFile(ctx)
+
+	if recorder.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want %d; body=%s", recorder.Code, http.StatusInternalServerError, recorder.Body.String())
+	}
+}
+
+func TestDownloadAuthFile_MissingAuthDirectoryReturnsNotFound(t *testing.T) {
+	authDir := filepath.Join(t.TempDir(), "missing")
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, nil)
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/v0/management/auth-files/download?name=auth.json", nil)
+	h.DownloadAuthFile(ctx)
+	if recorder.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want %d; body=%s", recorder.Code, http.StatusNotFound, recorder.Body.String())
+	}
+}
+
 func TestDownloadAuthFilesArchive_ReturnsSelectedFiles(t *testing.T) {
 	t.Setenv("MANAGEMENT_PASSWORD", "")
 
@@ -87,7 +137,7 @@ func TestDownloadAuthFilesArchive_ReturnsSelectedFiles(t *testing.T) {
 	rec := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(rec)
 
-	body := bytes.NewBufferString(`{"names":["beta.json","alpha.json","beta.json"]}`)
+	body := bytes.NewBufferString(`{"names":["beta.json","alpha.json","nested/../alpha.json"]}`)
 	req := httptest.NewRequest(http.MethodPost, "/v0/management/auth-files/archive", body)
 	req.Header.Set("Content-Type", "application/json")
 	ctx.Request = req
@@ -132,6 +182,13 @@ func TestDownloadAuthFilesArchive_ReturnsAllFiles(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(authDir, "notes.txt"), []byte("ignore"), 0o600); err != nil {
 		t.Fatalf("write notes.txt: %v", err)
 	}
+	nestedDir := filepath.Join(authDir, "nested")
+	if errMkdir := os.Mkdir(nestedDir, 0o700); errMkdir != nil {
+		t.Fatalf("create nested directory: %v", errMkdir)
+	}
+	if errWrite := os.WriteFile(filepath.Join(nestedDir, "sidecar.json"), []byte(`{"not":"an auth file"}`), 0o600); errWrite != nil {
+		t.Fatalf("write nested sidecar: %v", errWrite)
+	}
 
 	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, nil)
 	rec := httptest.NewRecorder()
@@ -157,6 +214,9 @@ func TestDownloadAuthFilesArchive_ReturnsAllFiles(t *testing.T) {
 	}
 	if _, exists := gotFiles["notes.txt"]; exists {
 		t.Fatalf("did not expect non-json file in archive")
+	}
+	if _, exists := gotFiles["nested/sidecar.json"]; exists {
+		t.Fatal("did not expect nested JSON file in archive")
 	}
 }
 
@@ -212,7 +272,29 @@ func TestDownloadAuthFilesArchive_ReturnsNotFoundWhenRequestedFileMissing(t *tes
 	}
 }
 
-func TestDownloadAuthFile_RejectsPathSeparators(t *testing.T) {
+func TestDownloadAuthFilesArchive_ReturnsNotFoundWhenAuthDirectoryMissing(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+
+	authDir := filepath.Join(t.TempDir(), "missing")
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, nil)
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	for _, body := range []string{`{"names":["missing.json"]}`, `{"all":true}`} {
+		recorder = httptest.NewRecorder()
+		ctx, _ = gin.CreateTestContext(recorder)
+		request := httptest.NewRequest(http.MethodPost, "/v0/management/auth-files/archive", bytes.NewBufferString(body))
+		request.Header.Set("Content-Type", "application/json")
+		ctx.Request = request
+
+		h.DownloadAuthFilesArchive(ctx)
+
+		if recorder.Code != http.StatusNotFound {
+			t.Fatalf("body %s: status = %d, want %d; response=%s", body, recorder.Code, http.StatusNotFound, recorder.Body.String())
+		}
+	}
+}
+
+func TestDownloadAuthFile_RejectsPathTraversal(t *testing.T) {
 	t.Setenv("MANAGEMENT_PASSWORD", "")
 
 	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, nil)
@@ -220,8 +302,7 @@ func TestDownloadAuthFile_RejectsPathSeparators(t *testing.T) {
 	for _, name := range []string{
 		"../external/secret.json",
 		`..\\external\\secret.json`,
-		"nested/secret.json",
-		`nested\\secret.json`,
+		"/external/secret.json",
 	} {
 		rec := httptest.NewRecorder()
 		ctx, _ := gin.CreateTestContext(rec)

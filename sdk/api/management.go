@@ -5,6 +5,8 @@
 package api
 
 import (
+	"net/http"
+
 	"github.com/gin-gonic/gin"
 	internalmanagement "github.com/router-for-me/CLIProxyAPI/v6/internal/api/handlers/management"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
@@ -14,6 +16,7 @@ import (
 // ManagementTokenRequester exposes a limited subset of management endpoints for requesting tokens.
 type ManagementTokenRequester interface {
 	RequestAnthropicToken(*gin.Context)
+	// RequestGeminiCLIToken is retained for v6 source compatibility and always reports that the provider is gone.
 	RequestGeminiCLIToken(*gin.Context)
 	RequestCodexToken(*gin.Context)
 	RequestAntigravityToken(*gin.Context)
@@ -38,7 +41,7 @@ func (m *managementTokenRequester) RequestAnthropicToken(c *gin.Context) {
 }
 
 func (m *managementTokenRequester) RequestGeminiCLIToken(c *gin.Context) {
-	m.handler.RequestGeminiCLIToken(c)
+	c.JSON(http.StatusGone, gin.H{"error": "Gemini CLI OAuth is no longer supported"})
 }
 
 func (m *managementTokenRequester) RequestCodexToken(c *gin.Context) {

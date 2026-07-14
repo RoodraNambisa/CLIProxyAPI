@@ -63,7 +63,13 @@ func (p *Pipeline) UseResponse(mw ResponseMiddleware) {
 // TranslateRequest applies middleware and registry transformations.
 func (p *Pipeline) TranslateRequest(ctx context.Context, from, to Format, req RequestEnvelope) (RequestEnvelope, error) {
 	terminal := func(ctx context.Context, input RequestEnvelope) (RequestEnvelope, error) {
-		translated := p.registry.TranslateRequest(from, to, input.Model, input.Body, input.Stream)
+		if usesRetiredGeminiCLIFormat(from, to) {
+			return input, ErrGeminiCLIFormatNotSupported
+		}
+		translated, errTranslate := p.registry.TranslateRequestChecked(from, to, input.Model, input.Body, input.Stream)
+		if errTranslate != nil {
+			return input, errTranslate
+		}
 		input.Body = translated
 		input.Format = to
 		return input, nil
@@ -84,6 +90,9 @@ func (p *Pipeline) TranslateRequest(ctx context.Context, from, to Format, req Re
 // TranslateResponse applies middleware and registry transformations.
 func (p *Pipeline) TranslateResponse(ctx context.Context, from, to Format, resp ResponseEnvelope, originalReq, translatedReq []byte, param *any) (ResponseEnvelope, error) {
 	terminal := func(ctx context.Context, input ResponseEnvelope) (ResponseEnvelope, error) {
+		if usesRetiredGeminiCLIFormat(from, to) {
+			return input, ErrGeminiCLIFormatNotSupported
+		}
 		if input.Stream {
 			input.Chunks = p.registry.TranslateStream(ctx, from, to, input.Model, originalReq, translatedReq, input.Body, param)
 		} else {

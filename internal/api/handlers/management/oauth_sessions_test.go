@@ -5,10 +5,12 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 )
 
 func TestOAuthSessionStoreCancelPreservesTerminalStatus(t *testing.T) {
@@ -136,6 +138,25 @@ func TestNormalizeOAuthProviderSupportsXAI(t *testing.T) {
 		if err != nil || normalized != "xai" {
 			t.Fatalf("NormalizeOAuthProvider(%q) = %q, %v", provider, normalized, err)
 		}
+	}
+}
+
+func TestPostOAuthCallbackRejectsRetiredGeminiCLIProvider(t *testing.T) {
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, nil)
+	for _, provider := range []string{"gemini", "google", "gemini-cli"} {
+		t.Run(provider, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			ctx, _ := gin.CreateTestContext(recorder)
+			ctx.Request = httptest.NewRequest(http.MethodPost, "/v0/management/oauth-callback", strings.NewReader(`{"provider":"`+provider+`","state":"legacy","code":"code"}`))
+			ctx.Request.Header.Set("Content-Type", "application/json")
+			h.PostOAuthCallback(ctx)
+			if recorder.Code != http.StatusGone {
+				t.Fatalf("status = %d, want %d; body=%s", recorder.Code, http.StatusGone, recorder.Body.String())
+			}
+			if !strings.Contains(recorder.Body.String(), "Gemini CLI OAuth is no longer supported") {
+				t.Fatalf("body = %s", recorder.Body.String())
+			}
+		})
 	}
 }
 

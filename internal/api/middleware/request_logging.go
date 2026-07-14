@@ -39,7 +39,7 @@ func RequestLoggingMiddleware(logger logging.RequestLogger, releaseProviders ...
 		}
 
 		path := c.Request.URL.Path
-		if util.IsRetiredAmpPath(path) && c.FullPath() == "" {
+		if (util.IsRetiredAmpPath(path) || util.IsRetiredGeminiCLIPath(path)) && c.FullPath() == "" {
 			c.Next()
 			return
 		}

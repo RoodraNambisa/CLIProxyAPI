@@ -40,12 +40,126 @@ const (
 	DefaultDisabledImageGenerationToolCode       = "image_generation_disabled"
 )
 
-var deprecatedAmpConfigWarning sync.Once
+var (
+	deprecatedAmpConfigWarning       sync.Once
+	deprecatedGeminiCLIConfigWarning sync.Once
+)
 
 func warnDeprecatedAmpConfig(data []byte) {
 	warnDeprecatedAmpConfigOnce(data, &deprecatedAmpConfigWarning, func() {
 		log.Warn("amp integration has been removed; ampcode configuration is ignored; remove or rotate any retired Amp credentials")
 	})
+}
+
+func warnDeprecatedGeminiCLIConfig(data []byte) {
+	warnDeprecatedGeminiCLIConfigOnce(data, &deprecatedGeminiCLIConfigWarning, func() {
+		log.Warn("Gemini CLI integration has been removed; legacy endpoint, model alias, and excluded-model configuration is ignored")
+	})
+}
+
+func warnDeprecatedGeminiCLIConfigOnce(data []byte, once *sync.Once, warn func()) {
+	if !containsDeprecatedGeminiCLIConfig(data) {
+		return
+	}
+	once.Do(warn)
+}
+
+func containsDeprecatedGeminiCLIConfig(data []byte) bool {
+	var document yaml.Node
+	if err := yaml.Unmarshal(data, &document); err != nil || len(document.Content) == 0 {
+		return false
+	}
+	return yamlConfigMappingContainsDeprecatedGeminiCLI(document.Content[0], make(map[*yaml.Node]bool))
+}
+
+func yamlConfigMappingContainsDeprecatedGeminiCLI(node *yaml.Node, visited map[*yaml.Node]bool) bool {
+	node = yamlAliasTarget(node)
+	if node == nil || node.Kind != yaml.MappingNode || visited[node] {
+		return false
+	}
+	visited[node] = true
+	for index := 0; index+1 < len(node.Content); index += 2 {
+		key := strings.ToLower(strings.TrimSpace(node.Content[index].Value))
+		value := node.Content[index+1]
+		switch key {
+		case "enable-gemini-cli-endpoint":
+			return true
+		case "oauth-model-alias", "oauth-excluded-models":
+			if yamlMappingContainsKey(value, "gemini-cli", make(map[*yaml.Node]bool)) {
+				return true
+			}
+		case "<<":
+			if yamlMergedConfigContainsDeprecatedGeminiCLI(value, visited) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func yamlMergedConfigContainsDeprecatedGeminiCLI(node *yaml.Node, visited map[*yaml.Node]bool) bool {
+	node = yamlAliasTarget(node)
+	if node == nil {
+		return false
+	}
+	if node.Kind == yaml.SequenceNode {
+		if visited[node] {
+			return false
+		}
+		visited[node] = true
+		for _, item := range node.Content {
+			if yamlMergedConfigContainsDeprecatedGeminiCLI(item, visited) {
+				return true
+			}
+		}
+		return false
+	}
+	return yamlConfigMappingContainsDeprecatedGeminiCLI(node, visited)
+}
+
+func yamlMappingContainsKey(node *yaml.Node, target string, visited map[*yaml.Node]bool) bool {
+	node = yamlAliasTarget(node)
+	if node == nil || node.Kind != yaml.MappingNode || visited[node] {
+		return false
+	}
+	visited[node] = true
+	for index := 0; index+1 < len(node.Content); index += 2 {
+		key := strings.ToLower(strings.TrimSpace(node.Content[index].Value))
+		if key == target {
+			return true
+		}
+		if key == "<<" && yamlMergedMappingContainsKey(node.Content[index+1], target, visited) {
+			return true
+		}
+	}
+	return false
+}
+
+func yamlMergedMappingContainsKey(node *yaml.Node, target string, visited map[*yaml.Node]bool) bool {
+	node = yamlAliasTarget(node)
+	if node == nil {
+		return false
+	}
+	if node.Kind == yaml.SequenceNode {
+		if visited[node] {
+			return false
+		}
+		visited[node] = true
+		for _, item := range node.Content {
+			if yamlMergedMappingContainsKey(item, target, visited) {
+				return true
+			}
+		}
+		return false
+	}
+	return yamlMappingContainsKey(node, target, visited)
+}
+
+func yamlAliasTarget(node *yaml.Node) *yaml.Node {
+	for node != nil && node.Kind == yaml.AliasNode && node.Alias != nil {
+		node = node.Alias
+	}
+	return node
 }
 
 func warnDeprecatedAmpConfigOnce(data []byte, once *sync.Once, warn func()) {
@@ -246,7 +360,7 @@ type Config struct {
 
 	// OAuthModelAlias defines global model name aliases for OAuth/file-backed auth channels.
 	// These aliases affect both model listing and model routing for supported channels:
-	// gemini-cli, vertex, aistudio, antigravity, claude, codex, kimi.
+	// vertex, aistudio, antigravity, claude, codex, kimi, xai.
 	//
 	// NOTE: This does not apply to existing per-credential model alias features under:
 	// gemini-api-key, codex-api-key, claude-api-key, openai-compatibility, and vertex-api-key.
@@ -878,6 +992,7 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 		return nil, fmt.Errorf("failed to parse config file: %w", err)
 	}
 	warnDeprecatedAmpConfig(data)
+	warnDeprecatedGeminiCLIConfig(data)
 
 	// NOTE: Startup legacy key migration is intentionally disabled.
 	// Reason: avoid mutating config.yaml during server startup.
@@ -1208,7 +1323,7 @@ func (cfg *Config) SanitizeOAuthModelAlias() {
 	out := make(map[string][]OAuthModelAlias, len(cfg.OAuthModelAlias))
 	for rawChannel, aliases := range cfg.OAuthModelAlias {
 		channel := strings.ToLower(strings.TrimSpace(rawChannel))
-		if channel == "" || len(aliases) == 0 {
+		if channel == "" || channel == "gemini-cli" || len(aliases) == 0 {
 			continue
 		}
 		seenAlias := make(map[string]struct{}, len(aliases))
@@ -1972,7 +2087,7 @@ func NormalizeOAuthExcludedModels(entries map[string][]string) map[string][]stri
 	out := make(map[string][]string, len(entries))
 	for provider, models := range entries {
 		key := strings.ToLower(strings.TrimSpace(provider))
-		if key == "" {
+		if key == "" || key == "gemini-cli" {
 			continue
 		}
 		normalized := NormalizeExcludedModels(models)
@@ -2038,6 +2153,8 @@ func SaveConfigPreserveComments(configFile string, cfg *Config) error {
 	removeLegacyAuthBlock(original.Content[0])
 	removeLegacyOpenAICompatAPIKeys(original.Content[0])
 	removeLegacyGenerativeLanguageKeys(original.Content[0])
+	removeDeprecatedGeminiCLIConfigRoot(original.Content[0])
+	removeDeprecatedGeminiCLIConfigRoot(generated.Content[0])
 
 	pruneMappingToGeneratedKeys(original.Content[0], generated.Content[0], "oauth-excluded-models")
 	pruneMappingToGeneratedKeys(original.Content[0], generated.Content[0], "oauth-model-alias")
@@ -2606,6 +2723,86 @@ func removeMapKey(mapNode *yaml.Node, key string) {
 			mapNode.Content = append(mapNode.Content[:i], mapNode.Content[i+2:]...)
 			return
 		}
+	}
+}
+
+func removeDeprecatedGeminiCLIConfigRoot(root *yaml.Node) {
+	removeDeprecatedGeminiCLIConfigMapping(root, make(map[*yaml.Node]struct{}))
+}
+
+func removeDeprecatedGeminiCLIConfigMapping(node *yaml.Node, visited map[*yaml.Node]struct{}) {
+	if node == nil {
+		return
+	}
+	if _, seen := visited[node]; seen {
+		return
+	}
+	visited[node] = struct{}{}
+	if node.Kind == yaml.AliasNode {
+		removeDeprecatedGeminiCLIConfigMapping(node.Alias, visited)
+		return
+	}
+	if node.Kind == yaml.SequenceNode {
+		for _, child := range node.Content {
+			removeDeprecatedGeminiCLIConfigMapping(child, visited)
+		}
+		return
+	}
+	if node.Kind != yaml.MappingNode {
+		return
+	}
+
+	for index := 0; index+1 < len(node.Content); {
+		key := strings.ToLower(strings.TrimSpace(node.Content[index].Value))
+		value := node.Content[index+1]
+		switch key {
+		case "enable-gemini-cli-endpoint":
+			node.Content = append(node.Content[:index], node.Content[index+2:]...)
+			continue
+		case "oauth-model-alias", "oauth-excluded-models":
+			removeMapKeyFold(value, "gemini-cli")
+		case "<<":
+			removeDeprecatedGeminiCLIConfigMapping(value, visited)
+		}
+		index += 2
+	}
+}
+
+func removeMapKeyFold(mapNode *yaml.Node, key string) {
+	removeMapKeyFoldVisited(mapNode, key, make(map[*yaml.Node]struct{}))
+}
+
+func removeMapKeyFoldVisited(node *yaml.Node, key string, visited map[*yaml.Node]struct{}) {
+	if node == nil || key == "" {
+		return
+	}
+	if _, seen := visited[node]; seen {
+		return
+	}
+	visited[node] = struct{}{}
+	if node.Kind == yaml.AliasNode {
+		removeMapKeyFoldVisited(node.Alias, key, visited)
+		return
+	}
+	if node.Kind == yaml.SequenceNode {
+		for _, child := range node.Content {
+			removeMapKeyFoldVisited(child, key, visited)
+		}
+		return
+	}
+	if node.Kind != yaml.MappingNode {
+		return
+	}
+	for index := 0; index+1 < len(node.Content); {
+		currentKey := strings.TrimSpace(node.Content[index].Value)
+		if strings.EqualFold(currentKey, key) {
+			node.Content = append(node.Content[:index], node.Content[index+2:]...)
+			continue
+		}
+		if currentKey == "<<" {
+			removeMapKeyFoldVisited(node.Content[index+1], key, visited)
+		}
+		index += 2
 	}
 }
 

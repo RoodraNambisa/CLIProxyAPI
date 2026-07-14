@@ -16,8 +16,20 @@ type TokenStorage interface {
 	SaveTokenToFile(authFilePath string) error
 }
 
+// TokenDataMarshaler is an optional interface implemented by token storages
+// that can produce their persisted payload without writing to a path.
+type TokenDataMarshaler interface {
+	MarshalTokenData() ([]byte, error)
+}
+
 // MetadataSetter is an optional interface for token storages that can accept
 // metadata before persisting their payload.
 type MetadataSetter interface {
 	SetMetadata(map[string]any)
+}
+
+// MetadataSnapshotter exposes the current injected metadata so a failed
+// persistence transaction can restore token storage state.
+type MetadataSnapshotter interface {
+	MetadataSnapshot() map[string]any
 }

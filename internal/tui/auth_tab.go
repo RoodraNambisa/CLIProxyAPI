@@ -129,6 +129,11 @@ func (m *authTabModel) startEdit(fieldIdx int) tea.Cmd {
 		return nil
 	}
 	f := m.files[m.cursor]
+	if isRetiredAuthFile(f) {
+		m.status = warningStyle.Render(T("auth_read_only"))
+		m.viewport.SetContent(m.renderContent())
+		return nil
+	}
 	m.editFileName = getString(f, "name")
 	m.editField = fieldIdx
 	m.editing = true
@@ -193,10 +198,14 @@ func (m authTabModel) renderContent() string {
 		channel := getString(f, "channel")
 		email := getString(f, "email")
 		disabled := getBool(f, "disabled")
+		retired := isRetiredAuthFile(f)
 
 		statusIcon := successStyle.Render("●")
 		statusText := T("status_active")
-		if disabled {
+		if retired {
+			statusIcon = warningStyle.Render("○")
+			statusText = T("status_retired")
+		} else if disabled {
 			statusIcon = lipgloss.NewStyle().Foreground(colorMuted).Render("○")
 			statusText = T("status_disabled")
 		}
@@ -286,6 +295,7 @@ func (m authTabModel) renderDetail(f map[string]any) string {
 		{"Updated", "updated_at", false},
 	}
 
+	retired := isRetiredAuthFile(f)
 	for _, field := range fields {
 		val := getAnyString(f, field.key)
 		if val == "" || val == "<nil>" {
@@ -296,7 +306,7 @@ func (m authTabModel) renderDetail(f map[string]any) string {
 			}
 		}
 		editMark := ""
-		if field.editable {
+		if field.editable && !retired {
 			editMark = editableMarker
 		}
 		line := fmt.Sprintf("    │ %s %s%s",
@@ -318,6 +328,20 @@ func getAnyString(m map[string]any, key string) string {
 		return ""
 	}
 	return fmt.Sprintf("%v", v)
+}
+
+func isRetiredAuthFile(file map[string]any) bool {
+	if getBool(file, "retired") || getBool(file, "unsupported") {
+		return true
+	}
+	if eligible, ok := file["runtime_eligible"].(bool); ok && !eligible {
+		return true
+	}
+	status := strings.ToLower(strings.TrimSpace(getString(file, "support_status")))
+	if status == "" {
+		status = strings.ToLower(strings.TrimSpace(getString(file, "status")))
+	}
+	return status == "retired" || status == "unsupported"
 }
 
 func max(a, b int) int {
@@ -423,6 +447,11 @@ func (m authTabModel) handleNormalInput(msg tea.KeyMsg) (authTabModel, tea.Cmd) 
 	case "e", "E":
 		if m.cursor < len(m.files) {
 			f := m.files[m.cursor]
+			if isRetiredAuthFile(f) {
+				m.status = warningStyle.Render(T("auth_read_only"))
+				m.viewport.SetContent(m.renderContent())
+				return m, nil
+			}
 			name := getString(f, "name")
 			disabled := getBool(f, "disabled")
 			newDisabled := !disabled

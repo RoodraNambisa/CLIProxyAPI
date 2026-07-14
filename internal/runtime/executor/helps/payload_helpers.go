@@ -21,8 +21,8 @@ func ApplyPayloadConfigWithRequest(cfg *config.Config, model, protocol, _ string
 }
 
 // ApplyPayloadConfigWithRoot behaves like applyPayloadConfig but treats all parameter
-// paths as relative to the provided root path (for example, "request" for Gemini CLI)
-// and restricts matches to the given protocol when supplied. Defaults are checked
+// paths as relative to the provided root path and restricts matches to the given
+// protocol when supplied. Defaults are checked
 // against the original payload when provided. requestedModel carries the client-visible
 // model name before alias resolution so payload rules can target aliases precisely.
 func ApplyPayloadConfigWithRoot(cfg *config.Config, model, protocol, root string, payload, original []byte, requestedModel string) []byte {

@@ -5,10 +5,13 @@ package watcher
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 	"reflect"
+	"strings"
 	"sync"
 	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/authfileguard"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/watcher/synthesizer"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
@@ -16,32 +19,97 @@ import (
 
 var snapshotCoreAuthsFunc = snapshotCoreAuths
 
-func (w *Watcher) setAuthUpdateQueue(queue chan<- AuthUpdate) {
+// SeedCurrentFileAuths records file-backed auths already loaded by the runtime
+// manager so the first watcher snapshot can emit deletions for quarantined or
+// removed files instead of treating every entry as new.
+func (w *Watcher) SeedCurrentFileAuths(auths []*coreauth.Auth) {
+	if w == nil || len(auths) == 0 {
+		return
+	}
+	authDirValue := strings.TrimSpace(w.authDir)
+	if authDirValue == "" {
+		return
+	}
+	authDir, errAuthDir := filepath.Abs(authDirValue)
+	if errAuthDir != nil {
+		return
+	}
 	w.clientsMutex.Lock()
 	defer w.clientsMutex.Unlock()
-	w.authQueue = queue
-	if w.dispatchCond == nil {
-		w.dispatchCond = sync.NewCond(&w.dispatchMu)
+	if w.currentAuths == nil {
+		w.currentAuths = make(map[string]*coreauth.Auth)
 	}
-	if w.dispatchCancel != nil {
-		w.dispatchCancel()
-		if w.dispatchCond != nil {
-			w.dispatchMu.Lock()
-			w.dispatchCond.Broadcast()
-			w.dispatchMu.Unlock()
+	for _, auth := range auths {
+		if auth == nil || auth.ID == "" || !fileAuthBelongsToDirectory(auth, authDir) {
+			continue
 		}
-		w.dispatchCancel = nil
-	}
-	if queue != nil {
-		ctx, cancel := context.WithCancel(context.Background())
-		w.dispatchCancel = cancel
-		go w.dispatchLoop(ctx)
+		w.currentAuths[auth.ID] = auth.Clone()
 	}
 }
 
-func (w *Watcher) dispatchRuntimeAuthUpdate(update AuthUpdate) bool {
-	if w == nil {
+func fileAuthBelongsToDirectory(auth *coreauth.Auth, authDir string) bool {
+	if auth.Attributes != nil && strings.EqualFold(strings.TrimSpace(auth.Attributes["runtime_only"]), "true") {
 		return false
+	}
+	path := strings.TrimSpace(auth.FileName)
+	if path == "" && auth.Attributes != nil {
+		path = strings.TrimSpace(auth.Attributes["path"])
+		if path == "" {
+			path = strings.TrimSpace(auth.Attributes["source"])
+		}
+	}
+	if path == "" || strings.HasPrefix(strings.ToLower(path), "config:") || !strings.HasSuffix(strings.ToLower(path), ".json") {
+		return false
+	}
+	if !filepath.IsAbs(path) {
+		path = filepath.Join(authDir, filepath.FromSlash(path))
+	}
+	absolutePath, errAbs := filepath.Abs(path)
+	if errAbs != nil {
+		return false
+	}
+	authDirIdentity := authfileguard.PathIdentity(authDir)
+	pathIdentity := authfileguard.PathIdentity(absolutePath)
+	if authDirIdentity == "" || pathIdentity == "" {
+		return false
+	}
+	relativePath, errRel := filepath.Rel(authDirIdentity, pathIdentity)
+	return errRel == nil && relativePath != "." && relativePath != ".." && !strings.HasPrefix(relativePath, ".."+string(filepath.Separator))
+}
+
+func (w *Watcher) setAuthUpdateQueue(queue chan<- AuthUpdate) {
+	if w == nil {
+		return
+	}
+	w.dispatchLifecycleMu.Lock()
+	defer w.dispatchLifecycleMu.Unlock()
+	w.stopDispatchLoopLocked()
+
+	w.clientsMutex.Lock()
+	w.authQueue = queue
+	w.clientsMutex.Unlock()
+	if queue == nil {
+		return
+	}
+
+	w.dispatchMu.Lock()
+	if w.dispatchCond == nil {
+		w.dispatchCond = sync.NewCond(&w.dispatchMu)
+	}
+	w.dispatchMu.Unlock()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	w.dispatchCancel = cancel
+	w.dispatchDone = done
+	go func() {
+		defer close(done)
+		w.dispatchLoop(ctx)
+	}()
+}
+
+func (w *Watcher) dispatchRuntimeAuthUpdate(update AuthUpdate) RuntimeAuthUpdateResult {
+	if w == nil {
+		return RuntimeAuthUpdateResult{}
 	}
 	w.clientsMutex.Lock()
 	if w.runtimeAuths == nil {
@@ -50,6 +118,31 @@ func (w *Watcher) dispatchRuntimeAuthUpdate(update AuthUpdate) bool {
 	switch update.Action {
 	case AuthUpdateActionAdd, AuthUpdateActionModify:
 		if update.Auth != nil && update.Auth.ID != "" {
+			retiredAuth := coreauth.IsRetiredGeminiCLIAuth(update.Auth)
+			if retiredAuth {
+				coreauth.WarnRetiredGeminiCLIAuthIgnored()
+			}
+			if retiredAuth || w.authUsesRetiredPathLocked(update.Auth) {
+				existing, exists := w.runtimeAuths[update.Auth.ID]
+				if !exists {
+					w.clientsMutex.Unlock()
+					return RuntimeAuthUpdateResult{Consumed: true}
+				}
+				delete(w.runtimeAuths, update.Auth.ID)
+				if w.currentAuths != nil {
+					delete(w.currentAuths, update.Auth.ID)
+				}
+				var deletedAuth *coreauth.Auth
+				if existing != nil {
+					deletedAuth = existing.Clone()
+				}
+				w.clientsMutex.Unlock()
+				fallback := AuthUpdate{Action: AuthUpdateActionDelete, ID: update.Auth.ID, Auth: deletedAuth}
+				if w.dispatchAuthUpdates([]AuthUpdate{fallback}) {
+					return RuntimeAuthUpdateResult{Enqueued: true, Consumed: true}
+				}
+				return RuntimeAuthUpdateResult{Fallback: &fallback}
+			}
 			clone := update.Auth.Clone()
 			w.runtimeAuths[clone.ID] = clone
 			if w.currentAuths == nil {
@@ -70,11 +163,8 @@ func (w *Watcher) dispatchRuntimeAuthUpdate(update AuthUpdate) bool {
 		}
 	}
 	w.clientsMutex.Unlock()
-	if w.getAuthQueue() == nil {
-		return false
-	}
-	w.dispatchAuthUpdates([]AuthUpdate{update})
-	return true
+	enqueued := w.dispatchAuthUpdates([]AuthUpdate{update})
+	return RuntimeAuthUpdateResult{Enqueued: enqueued, Consumed: enqueued}
 }
 
 func (w *Watcher) refreshAuthState(force bool) {
@@ -85,15 +175,80 @@ func (w *Watcher) refreshAuthState(force bool) {
 	auths := snapshotCoreAuthsFunc(cfg, authDir)
 	w.clientsMutex.Lock()
 	if len(w.runtimeAuths) > 0 {
-		for _, a := range w.runtimeAuths {
-			if a != nil {
-				auths = append(auths, a.Clone())
+		for id, a := range w.runtimeAuths {
+			if a == nil {
+				continue
 			}
+			if coreauth.IsRetiredGeminiCLIAuth(a) || w.authUsesRetiredPathLocked(a) {
+				delete(w.runtimeAuths, id)
+				continue
+			}
+			auths = append(auths, a.Clone())
 		}
 	}
+	auths = w.filterRetiredPathAuthsLocked(auths)
 	updates := w.prepareAuthUpdatesLocked(auths, force)
 	w.clientsMutex.Unlock()
 	w.dispatchAuthUpdates(updates)
+}
+
+func (w *Watcher) filterRetiredPathAuthsLocked(auths []*coreauth.Auth) []*coreauth.Auth {
+	if w == nil || len(w.retiredAuthPaths) == 0 || len(auths) == 0 {
+		return auths
+	}
+	filtered := make([]*coreauth.Auth, 0, len(auths))
+	for _, auth := range auths {
+		if auth == nil {
+			continue
+		}
+		if w.authUsesRetiredPathLocked(auth) {
+			continue
+		}
+		filtered = append(filtered, auth)
+	}
+	return filtered
+}
+
+func (w *Watcher) authUsesRetiredPathLocked(auth *coreauth.Auth) bool {
+	if w == nil || auth == nil || len(w.retiredAuthPaths) == 0 {
+		return false
+	}
+	path := ""
+	if auth.Attributes != nil {
+		if strings.EqualFold(strings.TrimSpace(auth.Attributes["runtime_only"]), "true") {
+			return false
+		}
+		path = strings.TrimSpace(auth.Attributes["source"])
+		if path == "" {
+			path = strings.TrimSpace(auth.Attributes["path"])
+		}
+	}
+	if path == "" {
+		path = strings.TrimSpace(auth.FileName)
+		if !strings.HasSuffix(strings.ToLower(path), ".json") {
+			return false
+		}
+	}
+	if path == "" || strings.HasPrefix(strings.ToLower(path), "config:") {
+		return false
+	}
+	if !filepath.IsAbs(path) && strings.TrimSpace(w.authDir) != "" {
+		path = filepath.Join(w.authDir, filepath.FromSlash(path))
+	}
+	normalized := w.normalizeAuthPath(path)
+	if _, retired := w.retiredAuthPaths[normalized]; retired {
+		return true
+	}
+	identity := authfileguard.PathIdentity(normalized)
+	if identity == "" {
+		return false
+	}
+	for retiredPath := range w.retiredAuthPaths {
+		if authfileguard.PathIdentity(retiredPath) == identity {
+			return true
+		}
+	}
+	return false
 }
 
 func (w *Watcher) prepareAuthUpdatesLocked(auths []*coreauth.Auth, force bool) []AuthUpdate {
@@ -140,13 +295,15 @@ func (w *Watcher) prepareAuthUpdatesLocked(auths []*coreauth.Auth, force bool) [
 	return updates
 }
 
-func (w *Watcher) dispatchAuthUpdates(updates []AuthUpdate) {
+func (w *Watcher) dispatchAuthUpdates(updates []AuthUpdate) bool {
 	if len(updates) == 0 {
-		return
+		return false
 	}
+	w.dispatchLifecycleMu.Lock()
+	defer w.dispatchLifecycleMu.Unlock()
 	queue := w.getAuthQueue()
 	if queue == nil {
-		return
+		return false
 	}
 	baseTS := time.Now().UnixNano()
 	w.dispatchMu.Lock()
@@ -164,6 +321,7 @@ func (w *Watcher) dispatchAuthUpdates(updates []AuthUpdate) {
 		w.dispatchCond.Signal()
 	}
 	w.dispatchMu.Unlock()
+	return true
 }
 
 func (w *Watcher) authUpdateKey(update AuthUpdate, ts int64) string {
@@ -200,6 +358,9 @@ func (w *Watcher) dispatchLoop(ctx context.Context) {
 func (w *Watcher) nextPendingBatch(ctx context.Context) ([]AuthUpdate, bool) {
 	w.dispatchMu.Lock()
 	defer w.dispatchMu.Unlock()
+	if ctx.Err() != nil {
+		return nil, false
+	}
 	for len(w.pendingOrder) == 0 {
 		if ctx.Err() != nil {
 			return nil, false
@@ -225,20 +386,37 @@ func (w *Watcher) getAuthQueue() chan<- AuthUpdate {
 }
 
 func (w *Watcher) stopDispatch() {
+	if w == nil {
+		return
+	}
+	w.dispatchLifecycleMu.Lock()
+	defer w.dispatchLifecycleMu.Unlock()
+	w.stopDispatchLoopLocked()
+}
+
+func (w *Watcher) stopDispatchLoopLocked() {
+	w.clientsMutex.Lock()
+	w.authQueue = nil
+	w.clientsMutex.Unlock()
+
 	if w.dispatchCancel != nil {
 		w.dispatchCancel()
-		w.dispatchCancel = nil
 	}
 	w.dispatchMu.Lock()
-	w.pendingOrder = nil
-	w.pendingUpdates = nil
 	if w.dispatchCond != nil {
 		w.dispatchCond.Broadcast()
 	}
 	w.dispatchMu.Unlock()
-	w.clientsMutex.Lock()
-	w.authQueue = nil
-	w.clientsMutex.Unlock()
+	if w.dispatchDone != nil {
+		<-w.dispatchDone
+	}
+	w.dispatchCancel = nil
+	w.dispatchDone = nil
+
+	w.dispatchMu.Lock()
+	w.pendingOrder = nil
+	w.pendingUpdates = nil
+	w.dispatchMu.Unlock()
 }
 
 func authEqual(a, b *coreauth.Auth) bool {
@@ -249,7 +427,7 @@ func normalizeAuth(a *coreauth.Auth) *coreauth.Auth {
 	if a == nil {
 		return nil
 	}
-	clone := a.Clone()
+	clone := a.CloneWithoutRuntimeInstance()
 	clone.CreatedAt = time.Time{}
 	clone.UpdatedAt = time.Time{}
 	clone.LastRefreshedAt = time.Time{}

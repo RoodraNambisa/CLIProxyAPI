@@ -18,6 +18,38 @@ func TestMaskSensitiveHeaderValueMasksManagementKey(t *testing.T) {
 	}
 }
 
+func TestMaskSensitiveQueryMasksOAuthCallbackParameters(t *testing.T) {
+	tests := []struct {
+		name string
+		raw  string
+		want string
+	}{
+		{
+			name: "code and state",
+			raw:  "code=abcd1234wxyz&state=lmno5678pqrs&scope=openid",
+			want: "code=abcd...wxyz&state=lmno...pqrs&scope=openid",
+		},
+		{
+			name: "case array suffix and encoded values",
+			raw:  "CoDe%5B%5D=abcd%2Fmiddle%2Fwxyz&STATE[]=lmno-middle-pqrs",
+			want: "CoDe%5B%5D=abcd...wxyz&STATE[]=lmno...pqrs",
+		},
+		{
+			name: "similar names remain unchanged",
+			raw:  "zipcode=postal-code-value&stateful=session-state-value&decode=encoded-value",
+			want: "zipcode=postal-code-value&stateful=session-state-value&decode=encoded-value",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := MaskSensitiveQuery(test.raw); got != test.want {
+				t.Fatalf("MaskSensitiveQuery(%q) = %q, want %q", test.raw, got, test.want)
+			}
+		})
+	}
+}
+
 func TestOpenAICompatibilityAliasSkipsDisabledProviders(t *testing.T) {
 	cfg := &config.Config{
 		OpenAICompatibility: []config.OpenAICompatibility{

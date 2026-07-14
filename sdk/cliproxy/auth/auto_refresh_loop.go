@@ -21,7 +21,14 @@ type authAutoRefreshLoop struct {
 	dirty map[string]struct{}
 
 	wakeCh chan struct{}
-	jobs   chan string
+	jobs   chan authRefreshJob
+	done   chan struct{}
+}
+
+type authRefreshJob struct {
+	authID       string
+	expected     *Auth
+	pendingUntil time.Time
 }
 
 func newAuthAutoRefreshLoop(manager *Manager, interval time.Duration, concurrency int) *authAutoRefreshLoop {
@@ -42,7 +49,8 @@ func newAuthAutoRefreshLoop(manager *Manager, interval time.Duration, concurrenc
 		index:       make(map[string]*refreshHeapItem),
 		dirty:       make(map[string]struct{}),
 		wakeCh:      make(chan struct{}, 1),
-		jobs:        make(chan string, jobBuffer),
+		jobs:        make(chan authRefreshJob, jobBuffer),
+		done:        make(chan struct{}),
 	}
 }
 
@@ -60,7 +68,11 @@ func (l *authAutoRefreshLoop) queueReschedule(authID string) {
 }
 
 func (l *authAutoRefreshLoop) run(ctx context.Context) {
-	if l == nil || l.manager == nil {
+	if l == nil {
+		return
+	}
+	defer close(l.done)
+	if l.manager == nil {
 		return
 	}
 
@@ -68,25 +80,57 @@ func (l *authAutoRefreshLoop) run(ctx context.Context) {
 	if workers <= 0 {
 		workers = refreshMaxConcurrency
 	}
+	var workerWG sync.WaitGroup
+	workerWG.Add(workers)
 	for i := 0; i < workers; i++ {
-		go l.worker(ctx)
+		go func() {
+			defer workerWG.Done()
+			l.worker(ctx)
+		}()
 	}
 
 	l.loop(ctx)
+	workerWG.Wait()
+	l.releaseQueuedJobs()
 }
 
 func (l *authAutoRefreshLoop) worker(ctx context.Context) {
 	for {
+		if ctx.Err() != nil {
+			return
+		}
 		select {
 		case <-ctx.Done():
 			return
-		case authID := <-l.jobs:
-			if authID == "" {
+		case job := <-l.jobs:
+			if job.authID == "" {
 				continue
 			}
-			l.manager.refreshAuth(ctx, authID)
-			l.queueReschedule(authID)
+			if ctx.Err() != nil {
+				l.manager.clearRefreshPendingJob(job)
+				return
+			}
+			l.manager.refreshAuthJob(ctx, job)
+			l.queueReschedule(job.authID)
 		}
+	}
+}
+
+func (l *authAutoRefreshLoop) wait(timeout time.Duration) bool {
+	if l == nil {
+		return true
+	}
+	if timeout <= 0 {
+		<-l.done
+		return true
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-l.done:
+		return true
+	case <-timer.C:
+		return false
 	}
 }
 
@@ -227,6 +271,7 @@ func (l *authAutoRefreshLoop) handleDueAuth(ctx context.Context, now time.Time, 
 
 	manager.mu.RLock()
 	auth := manager.auths[authID]
+	cleanupPending := manager.sessionCleanupPendingLocked(authID)
 	if auth == nil {
 		manager.mu.RUnlock()
 		return
@@ -235,6 +280,10 @@ func (l *authAutoRefreshLoop) handleDueAuth(ctx context.Context, now time.Time, 
 	shouldRefresh := manager.shouldRefresh(auth, now)
 	exec := manager.executors[auth.Provider]
 	manager.mu.RUnlock()
+	if cleanupPending {
+		l.remove(authID)
+		return
+	}
 
 	if !shouldSchedule {
 		l.remove(authID)
@@ -251,11 +300,17 @@ func (l *authAutoRefreshLoop) handleDueAuth(ctx context.Context, now time.Time, 
 		return
 	}
 
-	if !manager.markRefreshPending(authID, now) {
+	job, marked := manager.markRefreshPending(authID, now)
+	if !marked {
 		manager.mu.RLock()
 		auth = manager.auths[authID]
+		cleanupPending = manager.sessionCleanupPendingLocked(authID)
 		next, shouldSchedule = nextRefreshCheckAt(now, auth, l.interval)
 		manager.mu.RUnlock()
+		if cleanupPending {
+			l.remove(authID)
+			return
+		}
 		if shouldSchedule {
 			l.upsert(authID, next)
 		} else {
@@ -266,8 +321,23 @@ func (l *authAutoRefreshLoop) handleDueAuth(ctx context.Context, now time.Time, 
 
 	select {
 	case <-ctx.Done():
+		manager.clearRefreshPendingJob(job)
 		return
-	case l.jobs <- authID:
+	case l.jobs <- job:
+	}
+}
+
+func (l *authAutoRefreshLoop) releaseQueuedJobs() {
+	if l == nil || l.manager == nil {
+		return
+	}
+	for {
+		select {
+		case job := <-l.jobs:
+			l.manager.clearRefreshPendingJob(job)
+		default:
+			return
+		}
 	}
 }
 

@@ -2,9 +2,11 @@ package management
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io/fs"
 	"net/http"
-	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -39,8 +41,30 @@ func (h *Handler) ClearAllAuthCooldowns(c *gin.Context) {
 	ctx := c.Request.Context()
 	now := time.Now()
 	auths := h.authManager.List()
-	updated := 0
+	sort.Slice(auths, func(i, j int) bool {
+		if auths[i] == nil {
+			return false
+		}
+		if auths[j] == nil {
+			return true
+		}
+		return auths[i].ID < auths[j].ID
+	})
+	verified := make([]*coreauth.Auth, 0, len(auths))
 	for _, auth := range auths {
+		retired, errCheck := h.authBackedByRetiredGeminiCLIFile(auth)
+		if errCheck != nil {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "unable to verify auth file"})
+			return
+		}
+		if retired {
+			continue
+		}
+		verified = append(verified, auth)
+	}
+
+	updated := 0
+	for _, auth := range verified {
 		if !clearFullAuthCooldownState(auth, now) {
 			continue
 		}
@@ -70,11 +94,41 @@ func (h *Handler) ClearSelectedAuthCooldowns(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "items or names is required"})
 		return
 	}
-
+	for _, name := range req.Names {
+		if h.rejectRetiredCooldownReference(c, strings.TrimSpace(name)) {
+			return
+		}
+	}
+	for _, item := range req.Items {
+		ref := strings.TrimSpace(item.ID)
+		if ref == "" {
+			ref = strings.TrimSpace(item.Name)
+		}
+		if h.rejectRetiredCooldownReference(c, ref) {
+			return
+		}
+	}
 	targets, missing := h.resolveCooldownTargets(req)
 	if len(targets) == 0 {
 		c.JSON(http.StatusNotFound, gin.H{"error": "selected auths not found", "missing": missing})
 		return
+	}
+	for _, target := range targets {
+		if target != nil {
+			retired, errCheck := h.authBackedByRetiredGeminiCLIFile(target.auth)
+			if errCheck != nil {
+				c.JSON(http.StatusServiceUnavailable, gin.H{"error": "unable to verify auth file"})
+				return
+			}
+			if retired {
+				c.JSON(http.StatusGone, gin.H{"error": errGeminiCLIAuthGone.Error()})
+				return
+			}
+			if backingName, managed := h.managedAuthBackingFileName(target.auth); managed && !isTopLevelManagedAuthName(backingName) {
+				c.JSON(http.StatusBadRequest, gin.H{"error": errInvalidAuthFileName.Error()})
+				return
+			}
+		}
 	}
 
 	ctx := c.Request.Context()
@@ -103,6 +157,36 @@ func (h *Handler) ClearSelectedAuthCooldowns(c *gin.Context) {
 		"updated": updated,
 		"missing": missing,
 	})
+}
+
+func (h *Handler) rejectRetiredCooldownReference(c *gin.Context, ref string) bool {
+	if !strings.HasSuffix(strings.ToLower(strings.TrimSpace(ref)), ".json") {
+		return false
+	}
+	retired, errCheck := h.isRetiredGeminiCLIManagedFile(ref)
+	if errors.Is(errCheck, fs.ErrNotExist) {
+		return false
+	}
+	if errCheck != nil {
+		status := http.StatusServiceUnavailable
+		message := "unable to verify auth file"
+		if errors.Is(errCheck, errInvalidAuthFileName) {
+			status = http.StatusBadRequest
+			message = errInvalidAuthFileName.Error()
+		}
+		c.JSON(status, gin.H{"error": message})
+		return true
+	}
+	if retired {
+		c.JSON(http.StatusGone, gin.H{"error": errGeminiCLIAuthGone.Error()})
+		return true
+	}
+	normalizedName, errNormalize := normalizeManagedAuthFileName(ref)
+	if errNormalize == nil && !isTopLevelManagedAuthName(normalizedName) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": errInvalidAuthFileName.Error()})
+		return true
+	}
+	return false
 }
 
 func (h *Handler) resolveCooldownTargets(req clearAuthCooldownRequest) (map[string]*resolvedCooldownTarget, []string) {
@@ -162,21 +246,12 @@ func (h *Handler) findAuthForCooldown(ref string) *coreauth.Auth {
 	if ref == "" {
 		return nil
 	}
-	if auth, ok := h.authManager.GetByID(ref); ok {
+	if auth := h.findManagedAuth(ref); auth != nil {
 		return auth
 	}
 	auths := h.authManager.List()
 	for _, auth := range auths {
-		if auth == nil {
-			continue
-		}
-		if auth.ID == ref || auth.Index == ref || strings.TrimSpace(auth.FileName) == ref {
-			return auth
-		}
-		if filepath.Base(strings.TrimSpace(auth.FileName)) == ref {
-			return auth
-		}
-		if filepath.Base(strings.TrimSpace(authAttribute(auth, "path"))) == ref {
+		if auth != nil && auth.Index == ref {
 			return auth
 		}
 	}

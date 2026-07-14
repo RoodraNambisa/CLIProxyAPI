@@ -19,6 +19,10 @@ func (h *Handler) GetStaticModelDefinitions(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "channel is required"})
 		return
 	}
+	if strings.EqualFold(channel, "gemini-cli") {
+		c.JSON(http.StatusGone, gin.H{"error": "Gemini CLI is no longer supported"})
+		return
+	}
 
 	models := registry.GetStaticModelDefinitionsByChannel(channel)
 	if models == nil {

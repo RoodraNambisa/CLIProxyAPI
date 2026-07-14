@@ -537,9 +537,6 @@ func selectAvailableAuthsForAttemptFilteredWithPriority(auths []*Auth, provider,
 }
 
 // Pick selects the next available auth for the provider in a round-robin manner.
-// For gemini-cli virtual auths (identified by the gemini_virtual_parent attribute),
-// a two-level round-robin is used: first cycling across credential groups (parent
-// accounts), then cycling within each group's project auths.
 func (s *RoundRobinSelector) Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error) {
 	now := time.Now()
 	available, err := getAvailableAuthsForContext(ctx, auths, provider, model, now, selectionAttemptFromMetadata(opts.Metadata))
@@ -556,39 +553,6 @@ func (s *RoundRobinSelector) Pick(ctx context.Context, provider, model string, o
 		limit = 4096
 	}
 
-	// Check if any available auth has gemini_virtual_parent attribute,
-	// indicating gemini-cli virtual auths that should use credential-level polling.
-	groups, parentOrder := groupByVirtualParent(available)
-	if len(parentOrder) > 1 {
-		// Two-level round-robin: first select a credential group, then pick within it.
-		groupKey := key + "::group"
-		s.ensureCursorKey(groupKey, limit)
-		if _, exists := s.cursors[groupKey]; !exists {
-			// Seed with a random initial offset so the starting credential is randomized.
-			s.cursors[groupKey] = rand.IntN(len(parentOrder))
-		}
-		groupIndex := s.cursors[groupKey]
-		if groupIndex >= 2_147_483_640 {
-			groupIndex = 0
-		}
-		s.cursors[groupKey] = groupIndex + 1
-
-		selectedParent := parentOrder[groupIndex%len(parentOrder)]
-		group := groups[selectedParent]
-
-		// Second level: round-robin within the selected credential group.
-		innerKey := key + "::cred:" + selectedParent
-		s.ensureCursorKey(innerKey, limit)
-		innerIndex := s.cursors[innerKey]
-		if innerIndex >= 2_147_483_640 {
-			innerIndex = 0
-		}
-		s.cursors[innerKey] = innerIndex + 1
-		s.mu.Unlock()
-		return group[innerIndex%len(group)], nil
-	}
-
-	// Flat round-robin for non-grouped auths (original behavior).
 	s.ensureCursorKey(key, limit)
 	index := s.cursors[key]
 	if index >= 2_147_483_640 {
@@ -605,35 +569,6 @@ func (s *RoundRobinSelector) ensureCursorKey(key string, limit int) {
 	if _, ok := s.cursors[key]; !ok && len(s.cursors) >= limit {
 		s.cursors = make(map[string]int)
 	}
-}
-
-// groupByVirtualParent groups auths by their gemini_virtual_parent attribute.
-// Returns a map of parentID -> auths and a sorted slice of parent IDs for stable iteration.
-// Only auths with a non-empty gemini_virtual_parent are grouped; if any auth lacks
-// this attribute, nil/nil is returned so the caller falls back to flat round-robin.
-func groupByVirtualParent(auths []*Auth) (map[string][]*Auth, []string) {
-	if len(auths) == 0 {
-		return nil, nil
-	}
-	groups := make(map[string][]*Auth)
-	for _, a := range auths {
-		parent := ""
-		if a.Attributes != nil {
-			parent = strings.TrimSpace(a.Attributes["gemini_virtual_parent"])
-		}
-		if parent == "" {
-			// Non-virtual auth present; fall back to flat round-robin.
-			return nil, nil
-		}
-		groups[parent] = append(groups[parent], a)
-	}
-	// Collect parent IDs in sorted order for stable cursor indexing.
-	parentOrder := make([]string, 0, len(groups))
-	for p := range groups {
-		parentOrder = append(parentOrder, p)
-	}
-	sort.Strings(parentOrder)
-	return groups, parentOrder
 }
 
 // Pick selects the first fill group with available auths, then randomly selects within that group.
@@ -1192,17 +1127,30 @@ func (s *SessionAffinitySelector) pickWithPreparedFallback(ctx context.Context, 
 
 // BindSession records the successful auth for the extracted session ID.
 func (s *SessionAffinitySelector) BindSession(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, authID string) {
+	s.BindSessionWithRollback(ctx, provider, model, opts, authID)
+}
+
+// BindSessionWithRollback records a binding and returns a conditional rollback
+// for callers that detect auth retirement after the bind completes.
+func (s *SessionAffinitySelector) BindSessionWithRollback(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, authID string) func() {
 	if s == nil || s.cache == nil || authID == "" {
-		return
+		return nil
 	}
 	entry := selectorLogEntry(ctx)
 	primaryID, _ := extractSessionIDs(opts.Headers, opts.OriginalRequest, opts.Metadata)
 	if primaryID == "" {
-		return
+		return nil
 	}
 	cacheKey := provider + "::" + primaryID + "::" + model
-	s.cache.Set(cacheKey, authID)
+	mutation := s.cache.setWithRollback(cacheKey, authID)
 	entry.Infof("session-affinity: bound on success | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), authID, provider, model)
+	return func() {
+		s.cache.rollback(cacheKey, mutation)
+	}
+}
+
+func (s *SessionAffinitySelector) bindSessionWithRollback(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, authID string) func() {
+	return s.BindSessionWithRollback(ctx, provider, model, opts, authID)
 }
 
 func selectorLogEntry(ctx context.Context) *log.Entry {

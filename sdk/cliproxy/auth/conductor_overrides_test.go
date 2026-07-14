@@ -624,6 +624,9 @@ func TestManager_RequestRetryOverrideDoesNotUseUnrelatedProvider(t *testing.T) {
 	geminiAuth := &Auth{
 		ID:       "gemini-budget-unrelated",
 		Provider: "gemini",
+		Attributes: map[string]string{
+			"api_key": "test-key",
+		},
 		Metadata: map[string]any{
 			"type":          "gemini",
 			"request_retry": float64(5),
@@ -1133,7 +1136,7 @@ func TestWrapStreamResultPreservesPostBootstrapRetryAfter(t *testing.T) {
 		retryAfter: retryAfter,
 	}}
 	close(remaining)
-	result := manager.wrapStreamResult(context.Background(), auth, nil, "xai", "grok-4.5", "grok-4.5", cliproxyexecutor.Options{}, nil, nil, remaining, OAuthModelAliasResult{})
+	result := manager.wrapStreamResult(context.Background(), context.Background(), auth, nil, "xai", "grok-4.5", "grok-4.5", cliproxyexecutor.Options{}, nil, nil, remaining, OAuthModelAliasResult{}, nil)
 	for range result.Chunks {
 	}
 

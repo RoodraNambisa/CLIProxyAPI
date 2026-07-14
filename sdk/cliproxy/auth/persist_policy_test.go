@@ -192,7 +192,7 @@ func (e *authScopedCloserExecutor) HttpRequest(context.Context, *Auth, *http.Req
 	return nil, nil
 }
 
-func (e *authScopedCloserExecutor) CloseAuthExecutionSessions(authID string, reason string) {
+func (e *authScopedCloserExecutor) CloseAuthInstanceExecutionSessions(authID string, _ string, reason string) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.closedAuthIDs = append(e.closedAuthIDs, authID)
@@ -221,6 +221,59 @@ func TestWithSkipPersist_DisablesUpdatePersistence(t *testing.T) {
 	}
 	if got := store.saveCount.Load(); got != 1 {
 		t.Fatalf("expected Save call count to remain 1, got %d", got)
+	}
+}
+
+func TestManagerUpdateRotatesInstanceAfterPersistedSourceChanges(t *testing.T) {
+	store := &hashingFileStore{baseDir: t.TempDir()}
+	hook := &countingHook{}
+	manager := NewManager(store, &RoundRobinSelector{}, hook)
+	closer := &authScopedCloserExecutor{}
+	manager.RegisterExecutor(closer)
+	const authID = "persisted-source-change"
+	if _, errRegister := manager.Register(t.Context(), &Auth{
+		ID:       authID,
+		FileName: filepath.Join(store.baseDir, "auth.json"),
+		Provider: "codex",
+		Status:   StatusActive,
+		Metadata: map[string]any{"type": "codex", "access_token": "old-token"},
+	}); errRegister != nil {
+		t.Fatalf("Register() error = %v", errRegister)
+	}
+	original, ok := manager.GetByID(authID)
+	if !ok || original == nil {
+		t.Fatal("GetByID() did not return original auth")
+	}
+	originalInstanceID := managerAuthInstanceID(t, manager, authID)
+	staleResult := resultForAuth(original, "codex", "", false)
+	staleResult.Error = &Error{HTTPStatus: http.StatusUnauthorized, Message: "old token rejected"}
+
+	updated := original.Clone()
+	updated.Metadata["access_token"] = "new-token"
+	if _, errUpdate := manager.Update(t.Context(), updated); errUpdate != nil {
+		t.Fatalf("Update() error = %v", errUpdate)
+	}
+	if currentInstanceID := managerAuthInstanceID(t, manager, authID); currentInstanceID == originalInstanceID {
+		t.Fatalf("persisted source change retained instance %q", currentInstanceID)
+	}
+	closer.mu.Lock()
+	closedIDs := append([]string(nil), closer.closedAuthIDs...)
+	closeReasons := append([]string(nil), closer.reasons...)
+	closer.mu.Unlock()
+	if len(closedIDs) != 1 || closedIDs[0] != authID || len(closeReasons) != 1 || closeReasons[0] != "auth_replaced" {
+		t.Fatalf("session cleanup = ids %#v reasons %#v", closedIDs, closeReasons)
+	}
+
+	manager.markExecutionResult(t.Context(), staleResult)
+	current, ok := manager.GetByID(authID)
+	if !ok || current == nil {
+		t.Fatal("updated auth disappeared")
+	}
+	if current.LastError != nil || current.Status == StatusError || !current.NextRetryAfter.IsZero() {
+		t.Fatalf("stale result changed replacement auth: %#v", current)
+	}
+	if hook.results != 0 {
+		t.Fatalf("stale result hook count = %d, want 0", hook.results)
 	}
 }
 
@@ -269,8 +322,8 @@ func TestRegister_FailedPersistReturnsErrorAndKeepsRuntimeStateUnchanged(t *test
 	mgr := NewManager(store, nil, nil)
 	auth := &Auth{
 		ID:       "auth-register-failure",
-		Provider: "gemini",
-		Metadata: map[string]any{"type": "gemini"},
+		Provider: "claude",
+		Metadata: map[string]any{"type": "claude"},
 	}
 
 	if _, err := mgr.Register(context.Background(), auth); err == nil {
@@ -286,8 +339,8 @@ func TestUpdate_FailedPersistReturnsErrorAndKeepsPreviousRuntimeState(t *testing
 	mgr := NewManager(store, nil, nil)
 	auth := &Auth{
 		ID:       "auth-update-failure",
-		Provider: "gemini",
-		Metadata: map[string]any{"type": "gemini"},
+		Provider: "claude",
+		Metadata: map[string]any{"type": "claude"},
 		Attributes: map[string]string{
 			"api_key": "old-key",
 		},
@@ -318,7 +371,7 @@ func TestDelete_PersistsWithoutMetadata(t *testing.T) {
 	mgr := NewManager(store, nil, nil)
 	auth := &Auth{
 		ID:         "auth-no-metadata",
-		Provider:   "gemini",
+		Provider:   "claude",
 		Attributes: map[string]string{"api_key": "test-key"},
 	}
 
@@ -365,8 +418,8 @@ func TestDelete_FailedPersistKeepsRuntimeState(t *testing.T) {
 	mgr := NewManager(store, nil, nil)
 	auth := &Auth{
 		ID:       "auth-delete-failure",
-		Provider: "gemini",
-		Metadata: map[string]any{"type": "gemini"},
+		Provider: "claude",
+		Metadata: map[string]any{"type": "claude"},
 	}
 
 	if _, err := mgr.Register(context.Background(), auth); err != nil {
@@ -388,8 +441,8 @@ func TestDelete_ConcurrentReplacementKeepsNewRuntimeAuth(t *testing.T) {
 	mgr := NewManager(store, nil, nil)
 	original := &Auth{
 		ID:       "auth-replaced",
-		Provider: "gemini",
-		Metadata: map[string]any{"type": "gemini"},
+		Provider: "claude",
+		Metadata: map[string]any{"type": "claude"},
 	}
 	if _, err := mgr.Register(context.Background(), original); err != nil {
 		t.Fatalf("Register returned error: %v", err)
@@ -444,8 +497,8 @@ func TestDelete_ConcurrentReplacementPersistsWithCanceledDeleteContext(t *testin
 	mgr := NewManager(store, nil, nil)
 	original := &Auth{
 		ID:       "auth-replaced-canceled-context",
-		Provider: "gemini",
-		Metadata: map[string]any{"type": "gemini"},
+		Provider: "claude",
+		Metadata: map[string]any{"type": "claude"},
 	}
 	if _, err := mgr.Register(context.Background(), original); err != nil {
 		t.Fatalf("Register returned error: %v", err)
@@ -525,8 +578,8 @@ func TestMarkResult_ConcurrentDeleteDoesNotDeadlock(t *testing.T) {
 	mgr := NewManager(store, nil, nil)
 	auth := &Auth{
 		ID:       "auth-markresult-delete-race",
-		Provider: "gemini",
-		Metadata: map[string]any{"type": "gemini"},
+		Provider: "claude",
+		Metadata: map[string]any{"type": "claude"},
 	}
 	if _, err := mgr.Register(context.Background(), auth); err != nil {
 		t.Fatalf("Register returned error: %v", err)
@@ -572,11 +625,11 @@ func TestUpdate_ClearsTransientFailureStateForSameIDReplacement(t *testing.T) {
 	mgr := NewManager(nil, nil, nil)
 	auth := &Auth{
 		ID:       "auth-markresult-update-state",
-		Provider: "gemini",
+		Provider: "claude",
 		Attributes: map[string]string{
 			SourceHashAttributeKey: "old-hash",
 		},
-		Metadata: map[string]any{"type": "gemini"},
+		Metadata: map[string]any{"type": "claude"},
 	}
 	if _, err := mgr.Register(context.Background(), auth); err != nil {
 		t.Fatalf("Register returned error: %v", err)
@@ -597,7 +650,7 @@ func TestUpdate_ClearsTransientFailureStateForSameIDReplacement(t *testing.T) {
 		Attributes: map[string]string{
 			SourceHashAttributeKey: "new-hash",
 		},
-		Metadata: map[string]any{"type": "gemini"},
+		Metadata: map[string]any{"type": "claude"},
 	}
 	if _, err := mgr.Update(WithSkipPersist(context.Background()), reloaded); err != nil {
 		t.Fatalf("Update returned error: %v", err)
@@ -634,8 +687,8 @@ func TestUpdate_DoesNotCarryTransientFailureStateWithoutSourceHash(t *testing.T)
 	mgr := NewManager(nil, nil, nil)
 	auth := &Auth{
 		ID:       "auth-hashless-replacement",
-		Provider: "gemini",
-		Metadata: map[string]any{"type": "gemini"},
+		Provider: "claude",
+		Metadata: map[string]any{"type": "claude"},
 	}
 	if _, err := mgr.Register(context.Background(), auth); err != nil {
 		t.Fatalf("Register returned error: %v", err)
@@ -653,7 +706,7 @@ func TestUpdate_DoesNotCarryTransientFailureStateWithoutSourceHash(t *testing.T)
 		ID:       auth.ID,
 		Provider: auth.Provider,
 		Status:   StatusActive,
-		Metadata: map[string]any{"type": "gemini", "label": "replacement"},
+		Metadata: map[string]any{"type": "claude", "label": "replacement"},
 	}
 	if _, err := mgr.Update(WithSkipPersist(context.Background()), reloaded); err != nil {
 		t.Fatalf("Update returned error: %v", err)
@@ -692,14 +745,14 @@ func TestUpdate_PreservesModelStatesAfterInProcessFileRewrite(t *testing.T) {
 	mgr := NewManager(store, nil, nil)
 
 	path := filepath.Join(dir, "auth.json")
-	initialMetadata := map[string]any{"type": "gemini", "disabled": false, "label": "initial"}
+	initialMetadata := map[string]any{"type": "claude", "disabled": false, "label": "initial"}
 	initialRaw, err := json.Marshal(initialMetadata)
 	if err != nil {
 		t.Fatalf("marshal initial metadata: %v", err)
 	}
 	auth := &Auth{
 		ID:       "auth.json",
-		Provider: "gemini",
+		Provider: "claude",
 		FileName: path,
 		Status:   StatusActive,
 		Attributes: map[string]string{
@@ -729,7 +782,7 @@ func TestUpdate_PreservesModelStatesAfterInProcessFileRewrite(t *testing.T) {
 	if !ok || current == nil {
 		t.Fatal("expected auth to be registered")
 	}
-	current.Metadata = map[string]any{"type": "gemini", "disabled": false, "label": "updated"}
+	current.Metadata = map[string]any{"type": "claude", "disabled": false, "label": "updated"}
 	if _, err := mgr.Update(context.Background(), current); err != nil {
 		t.Fatalf("Update returned error: %v", err)
 	}
@@ -746,7 +799,7 @@ func TestUpdate_PreservesModelStatesAfterInProcessFileRewrite(t *testing.T) {
 		Attributes: map[string]string{
 			"path": path,
 		},
-		Metadata: map[string]any{"type": "gemini", "disabled": false, "label": "updated"},
+		Metadata: map[string]any{"type": "claude", "disabled": false, "label": "updated"},
 	}
 	SetSourceHashAttribute(reloaded, reloadedRaw)
 	if _, err := mgr.Update(WithSkipPersist(context.Background()), reloaded); err != nil {

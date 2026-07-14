@@ -40,6 +40,18 @@ func (ts *KimiTokenStorage) SetMetadata(meta map[string]any) {
 	ts.Metadata = meta
 }
 
+// MetadataSnapshot returns a copy of the currently injected metadata.
+func (ts *KimiTokenStorage) MetadataSnapshot() map[string]any {
+	if ts == nil || ts.Metadata == nil {
+		return nil
+	}
+	snapshot := make(map[string]any, len(ts.Metadata))
+	for key, value := range ts.Metadata {
+		snapshot[key] = value
+	}
+	return snapshot
+}
+
 // KimiTokenData holds the raw OAuth token response from Kimi.
 type KimiTokenData struct {
 	// AccessToken is the OAuth2 access token.
@@ -81,32 +93,31 @@ type DeviceCodeResponse struct {
 // SaveTokenToFile serializes the Kimi token storage to a JSON file.
 func (ts *KimiTokenStorage) SaveTokenToFile(authFilePath string) error {
 	misc.LogSavingCredentials(authFilePath)
-	ts.Type = "kimi"
-
 	if err := os.MkdirAll(filepath.Dir(authFilePath), 0700); err != nil {
 		return fmt.Errorf("failed to create directory: %v", err)
 	}
-
-	f, err := os.Create(authFilePath)
-	if err != nil {
-		return fmt.Errorf("failed to create token file: %w", err)
+	raw, errMarshal := ts.MarshalTokenData()
+	if errMarshal != nil {
+		return errMarshal
 	}
-	defer func() {
-		_ = f.Close()
-	}()
-
-	// Merge metadata using helper
-	data, errMerge := misc.MergeMetadata(ts, ts.Metadata)
-	if errMerge != nil {
-		return fmt.Errorf("failed to merge metadata: %w", errMerge)
-	}
-
-	encoder := json.NewEncoder(f)
-	encoder.SetIndent("", "  ")
-	if err = encoder.Encode(data); err != nil {
-		return fmt.Errorf("failed to write token to file: %w", err)
+	if errWrite := os.WriteFile(authFilePath, raw, 0o600); errWrite != nil {
+		return fmt.Errorf("failed to write token to file: %w", errWrite)
 	}
 	return nil
+}
+
+// MarshalTokenData serializes the credential without performing filesystem I/O.
+func (ts *KimiTokenStorage) MarshalTokenData() ([]byte, error) {
+	ts.Type = "kimi"
+	data, errMerge := misc.MergeMetadata(ts, ts.Metadata)
+	if errMerge != nil {
+		return nil, fmt.Errorf("failed to merge metadata: %w", errMerge)
+	}
+	raw, errMarshal := json.MarshalIndent(data, "", "  ")
+	if errMarshal != nil {
+		return nil, fmt.Errorf("failed to marshal token: %w", errMarshal)
+	}
+	return append(raw, '\n'), nil
 }
 
 // IsExpired checks if the token has expired.

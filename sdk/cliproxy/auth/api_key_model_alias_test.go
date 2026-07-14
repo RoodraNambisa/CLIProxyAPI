@@ -145,7 +145,7 @@ func TestApplyAPIKeyModelAlias(t *testing.T) {
 
 	ctx := context.Background()
 	apiKeyAuth := &Auth{ID: "a1", Provider: "gemini", Attributes: map[string]string{"api_key": "k"}}
-	oauthAuth := &Auth{ID: "oauth-auth", Provider: "gemini", Attributes: map[string]string{"auth_kind": "oauth"}}
+	oauthAuth := &Auth{ID: "oauth-auth", Provider: "antigravity", Attributes: map[string]string{"auth_kind": "oauth"}, Metadata: map[string]any{"type": "antigravity"}}
 	_, _ = mgr.Register(ctx, apiKeyAuth)
 
 	tests := []struct {
@@ -161,7 +161,7 @@ func TestApplyAPIKeyModelAlias(t *testing.T) {
 			wantModel:  "gemini-2.5-pro-exp-03-25(8192)",
 		},
 		{
-			name:       "oauth auth passthrough",
+			name:       "non API key auth passthrough",
 			auth:       oauthAuth,
 			inputModel: "some-model",
 			wantModel:  "some-model",

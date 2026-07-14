@@ -1591,6 +1591,80 @@ func TestServiceHandleAuthUpdate_DeleteWithStalePathKeepsReplacementAuth(t *test
 	}
 }
 
+func TestServiceHandleAuthUpdate_DeleteMatchesSymlinkedAuthPath(t *testing.T) {
+	realDir := t.TempDir()
+	linkDir := filepath.Join(t.TempDir(), "auths")
+	if errLink := os.Symlink(realDir, linkDir); errLink != nil {
+		t.Skipf("symlink is unavailable: %v", errLink)
+	}
+	service := &Service{
+		cfg:         &config.Config{AuthDir: linkDir},
+		coreManager: coreauth.NewManager(nil, nil, nil),
+	}
+	current := &coreauth.Auth{
+		ID:       "service-symlink-delete-auth",
+		Provider: "claude",
+		Status:   coreauth.StatusActive,
+		FileName: filepath.Join(realDir, "auth.json"),
+		Metadata: map[string]any{"type": "claude"},
+	}
+	if _, errRegister := service.coreManager.Register(context.Background(), current); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+
+	service.handleAuthUpdate(context.Background(), watcher.AuthUpdate{
+		Action: watcher.AuthUpdateActionDelete,
+		ID:     current.ID,
+		Auth: &coreauth.Auth{
+			ID:       current.ID,
+			FileName: filepath.Join(linkDir, "auth.json"),
+		},
+	})
+	if _, exists := service.coreManager.GetByID(current.ID); exists {
+		t.Fatal("equivalent symlinked delete path left auth registered")
+	}
+}
+
+func TestServiceHandleAuthUpdate_DeleteWithStaleGenerationKeepsSamePathReplacement(t *testing.T) {
+	authDir := t.TempDir()
+	path := filepath.Join(authDir, "replacement.json")
+	service := &Service{
+		cfg:         &config.Config{AuthDir: authDir},
+		coreManager: coreauth.NewManager(nil, nil, nil),
+	}
+	current := &coreauth.Auth{
+		ID:         "same-path-replacement",
+		Provider:   "claude",
+		Status:     coreauth.StatusActive,
+		FileName:   path,
+		Attributes: map[string]string{"path": path},
+	}
+	if errSync := coreauth.SyncPersistedMetadataAndSourceHash(current, []byte(`{"type":"claude","generation":"new"}`)); errSync != nil {
+		t.Fatalf("set current source hash: %v", errSync)
+	}
+	if _, errRegister := service.coreManager.Register(context.Background(), current); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+	deleted := &coreauth.Auth{
+		ID:         current.ID,
+		Provider:   current.Provider,
+		FileName:   path,
+		Attributes: map[string]string{"path": path},
+	}
+	if errSync := coreauth.SyncPersistedMetadataAndSourceHash(deleted, []byte(`{"type":"claude","generation":"old"}`)); errSync != nil {
+		t.Fatalf("set deleted source hash: %v", errSync)
+	}
+
+	service.handleAuthUpdate(context.Background(), watcher.AuthUpdate{
+		Action: watcher.AuthUpdateActionDelete,
+		ID:     current.ID,
+		Auth:   deleted,
+	})
+	if _, exists := service.coreManager.GetByID(current.ID); !exists {
+		t.Fatal("stale same-path delete removed replacement generation")
+	}
+}
+
 func TestServiceAuthMaintenanceCandidateForAuth_ExcludesRuntimeOnlyChildrenFromFileGroup(t *testing.T) {
 	authDir := t.TempDir()
 	service := &Service{
@@ -1598,10 +1672,10 @@ func TestServiceAuthMaintenanceCandidateForAuth_ExcludesRuntimeOnlyChildrenFromF
 		coreManager: coreauth.NewManager(nil, nil, nil),
 	}
 
-	path := filepath.Join(authDir, "gemini-multi.json")
+	path := filepath.Join(authDir, "oauth-multi.json")
 	primary := &coreauth.Auth{
-		ID:       "gemini-multi.json",
-		Provider: "gemini-cli",
+		ID:       "oauth-multi.json",
+		Provider: "claude",
 		Status:   coreauth.StatusDisabled,
 		Disabled: true,
 		FileName: path,
@@ -1612,41 +1686,37 @@ func TestServiceAuthMaintenanceCandidateForAuth_ExcludesRuntimeOnlyChildrenFromF
 			authMaintenanceActionMetadataKey:        authMaintenanceDeleteAction,
 			authMaintenancePendingDeleteMetadataKey: true,
 			authMaintenanceReasonMetadataKey:        "pending_delete",
-			"type":                                  "gemini",
+			"type":                                  "claude",
 		},
 	}
 	virtualA := &coreauth.Auth{
-		ID:       "gemini-multi.json#project-a",
-		Provider: "gemini-cli",
+		ID:       "oauth-multi.json#child-a",
+		Provider: "claude",
 		Status:   coreauth.StatusActive,
 		Attributes: map[string]string{
-			"path":                   path,
-			"runtime_only":           "true",
-			"gemini_virtual_parent":  primary.ID,
-			"gemini_virtual_project": "project-a",
+			"path":         path,
+			"runtime_only": "true",
 		},
 		Metadata: map[string]any{
 			authMaintenanceActionMetadataKey:        authMaintenanceDeleteAction,
 			authMaintenancePendingDeleteMetadataKey: true,
 			authMaintenanceReasonMetadataKey:        "pending_delete",
-			"type":                                  "gemini",
+			"type":                                  "claude",
 		},
 	}
 	virtualB := &coreauth.Auth{
-		ID:       "gemini-multi.json#project-b",
-		Provider: "gemini-cli",
+		ID:       "oauth-multi.json#child-b",
+		Provider: "claude",
 		Status:   coreauth.StatusActive,
 		Attributes: map[string]string{
-			"path":                   path,
-			"runtime_only":           "true",
-			"gemini_virtual_parent":  primary.ID,
-			"gemini_virtual_project": "project-b",
+			"path":         path,
+			"runtime_only": "true",
 		},
 		Metadata: map[string]any{
 			authMaintenanceActionMetadataKey:        authMaintenanceDeleteAction,
 			authMaintenancePendingDeleteMetadataKey: true,
 			authMaintenanceReasonMetadataKey:        "pending_delete",
-			"type":                                  "gemini",
+			"type":                                  "claude",
 		},
 	}
 
