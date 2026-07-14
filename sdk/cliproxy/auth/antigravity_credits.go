@@ -2,6 +2,9 @@ package auth
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
 	"strings"
 	"sync"
 	"time"
@@ -26,12 +29,51 @@ func AntigravityCreditsRequested(ctx context.Context) bool {
 
 // AntigravityCreditsHint stores the latest known AI credits state for one auth.
 type AntigravityCreditsHint struct {
-	Known           bool
-	Available       bool
-	CreditAmount    float64
-	MinCreditAmount float64
-	PaidTierID      string
-	UpdatedAt       time.Time
+	Known                  bool
+	Available              bool
+	CreditAmount           float64
+	MinCreditAmount        float64
+	PaidTierID             string
+	CredentialKey          string
+	UnavailableUntil       time.Time
+	PermanentlyUnavailable bool
+	UpdatedAt              time.Time
+}
+
+// AntigravityCreditsHintRefreshInterval controls when a cached credits hint becomes stale.
+const AntigravityCreditsHintRefreshInterval = 10 * time.Minute
+
+// IsFresh reports whether the hint can still be used for routing decisions.
+func (h AntigravityCreditsHint) IsFresh(now time.Time) bool {
+	return h.Known && !h.UpdatedAt.IsZero() && now.Sub(h.UpdatedAt) < AntigravityCreditsHintRefreshInterval
+}
+
+// BlocksRouting reports whether a negative hint is still authoritative for routing.
+func (h AntigravityCreditsHint) BlocksRouting(now time.Time) bool {
+	return h.Known && !h.Available && (h.PermanentlyUnavailable || h.UnavailableUntil.After(now))
+}
+
+// MatchesAuth reports whether a hint belongs to the current credential generation.
+func (h AntigravityCreditsHint) MatchesAuth(auth *Auth) bool {
+	return h.CredentialKey != "" && auth != nil && h.CredentialKey == AntigravityCreditsCredentialKey(auth)
+}
+
+// AntigravityCreditsCredentialKey returns an in-memory identity for credits state.
+func AntigravityCreditsCredentialKey(auth *Auth) string {
+	if auth == nil {
+		return ""
+	}
+	var accessToken, refreshToken string
+	if auth.Metadata != nil {
+		if value := auth.Metadata["access_token"]; value != nil {
+			accessToken = strings.TrimSpace(fmt.Sprint(value))
+		}
+		if value := auth.Metadata["refresh_token"]; value != nil {
+			refreshToken = strings.TrimSpace(fmt.Sprint(value))
+		}
+	}
+	sum := sha256.Sum256([]byte(accessToken + "\x00" + refreshToken))
+	return auth.RuntimeInstanceID() + ":" + hex.EncodeToString(sum[:8])
 }
 
 var antigravityCreditsHintByAuth sync.Map

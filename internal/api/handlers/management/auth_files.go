@@ -3477,11 +3477,18 @@ func (h *Handler) RequestAntigravityToken(c *gin.Context) {
 		if accessToken != "" {
 			fetchedProjectID, errProject := authSvc.FetchProjectID(ctx, accessToken)
 			if errProject != nil {
-				log.Warnf("antigravity: failed to fetch project ID: %v", errProject)
+				log.Errorf("antigravity: failed to fetch project ID: %v", errProject)
+				SetOAuthSessionError(state, "Failed to fetch project ID")
+				return
 			} else {
-				projectID = fetchedProjectID
-				log.Infof("antigravity: obtained project ID %s", projectID)
+				projectID = strings.TrimSpace(fetchedProjectID)
+				log.Infof("antigravity: obtained project ID %s", util.HideAPIKey(projectID))
 			}
+		}
+		if projectID == "" {
+			log.Error("antigravity: project ID discovery returned empty project")
+			SetOAuthSessionError(state, "Failed to fetch project ID")
+			return
 		}
 
 		now := time.Now()
@@ -3526,7 +3533,7 @@ func (h *Handler) RequestAntigravityToken(c *gin.Context) {
 		CompleteOAuthSession(state)
 		fmt.Printf("Authentication successful! Token saved to %s\n", savedPath)
 		if projectID != "" {
-			fmt.Printf("Using GCP project: %s\n", projectID)
+			fmt.Printf("Using GCP project: %s\n", util.HideAPIKey(projectID))
 		}
 		fmt.Println("You can now use Antigravity services through this CLI")
 	}()

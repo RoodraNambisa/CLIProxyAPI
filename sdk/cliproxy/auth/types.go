@@ -214,9 +214,10 @@ type Auth struct {
 	// Runtime carries non-serialisable data used during execution (in-memory only).
 	Runtime any `json:"-"`
 
-	indexAssigned bool   `json:"-"`
-	instanceID    string `json:"-"`
-	instanceState *authInstanceState
+	indexAssigned  bool   `json:"-"`
+	installationID string `json:"-"`
+	instanceID     string `json:"-"`
+	instanceState  *authInstanceState
 }
 
 type authInstanceState struct {
@@ -466,6 +467,7 @@ func (a *Auth) CloneWithoutRuntimeInstance() *Auth {
 	if clone == nil {
 		return nil
 	}
+	clone.installationID = ""
 	clone.instanceID = ""
 	clone.instanceState = nil
 	return clone

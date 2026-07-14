@@ -130,7 +130,10 @@ func TestAntigravityCreditsReturnsSuccessfulResponseWhenSelectedInstanceRetires(
 	}
 	originalInstance := managerAuthInstanceID(t, manager, authID)
 
-	response, ok := manager.tryAntigravityCreditsExecute(t.Context(), cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
+	response, ok, errCredits := manager.tryAntigravityCreditsExecute(t.Context(), cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
+	if errCredits != nil {
+		t.Fatalf("tryAntigravityCreditsExecute() error = %v", errCredits)
+	}
 	if !ok {
 		t.Fatal("tryAntigravityCreditsExecute() did not return the successful response")
 	}

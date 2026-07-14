@@ -2511,6 +2511,12 @@ func (s *Service) Shutdown(ctx context.Context) error {
 		}
 		if s.coreManager != nil {
 			s.coreManager.StopAutoRefresh()
+			if errCloseExecutors := s.coreManager.CloseExecutors(); errCloseExecutors != nil {
+				log.Errorf("failed to close provider executors: %v", errCloseExecutors)
+				if shutdownErr == nil {
+					shutdownErr = errCloseExecutors
+				}
+			}
 		}
 		if s.watcher != nil {
 			if err := s.watcher.Stop(); err != nil {

@@ -1,6 +1,9 @@
 package registry
 
-import "testing"
+import (
+	"slices"
+	"testing"
+)
 
 func assertCodexModelsDoNotContain(t *testing.T, models []*ModelInfo, modelID string) {
 	t.Helper()
@@ -123,6 +126,79 @@ func TestGetStaticModelDefinitionsByChannel_XAIAliases(t *testing.T) {
 	for _, channel := range []string{"xai", "x-ai", "grok"} {
 		if models := GetStaticModelDefinitionsByChannel(channel); len(models) == 0 {
 			t.Fatalf("expected %q channel to return xAI models", channel)
+		}
+	}
+}
+
+func TestGetAntigravityModelsMatchesUpstreamCatalog(t *testing.T) {
+	want := []string{
+		"claude-opus-4-6-thinking",
+		"claude-sonnet-4-6",
+		"gemini-3-flash",
+		"gemini-3-flash-agent",
+		"gemini-3.1-flash-image",
+		"gemini-pro-agent",
+		"gemini-3.1-pro-low",
+		"gpt-oss-120b-medium",
+		"gemini-3.1-flash-lite",
+		"gemini-3.5-flash-low",
+		"gemini-3.5-flash-extra-low",
+	}
+	models := GetAntigravityModels()
+	if len(models) != len(want) {
+		t.Fatalf("Antigravity model count = %d, want %d", len(models), len(want))
+	}
+	for i, model := range models {
+		if model == nil {
+			t.Fatalf("Antigravity model %d is nil", i)
+		}
+		if model.ID != want[i] {
+			t.Fatalf("Antigravity model %d = %q, want %q", i, model.ID, want[i])
+		}
+		if model.Object != "model" || model.OwnedBy != "antigravity" || model.Type != "antigravity" {
+			t.Fatalf("Antigravity model %q ownership metadata = (%q, %q, %q)", model.ID, model.Object, model.OwnedBy, model.Type)
+		}
+	}
+
+	type metadata struct {
+		displayName string
+		context     int
+		maxTokens   int
+		thinkingMin int
+		thinkingMax int
+		levels      []string
+	}
+	wantMetadata := map[string]metadata{
+		"gemini-3-flash-agent": {
+			displayName: "Gemini 3.5 Flash (High)", context: 1048576, maxTokens: 65536,
+			thinkingMin: 128, thinkingMax: 32768, levels: []string{"minimal", "low", "medium", "high"},
+		},
+		"gemini-pro-agent": {
+			displayName: "Gemini 3.1 Pro (High)", context: 1048576, maxTokens: 65535,
+			thinkingMin: 1, thinkingMax: 65535, levels: []string{"low", "medium", "high"},
+		},
+		"gemini-3.5-flash-low": {
+			displayName: "Gemini 3.5 Flash (Medium)", context: 1048576, maxTokens: 65535,
+			thinkingMin: 1, thinkingMax: 65535, levels: []string{"low", "medium", "high"},
+		},
+		"gemini-3.5-flash-extra-low": {
+			displayName: "Gemini 3.5 Flash (Low)", context: 1048576, maxTokens: 65535,
+			thinkingMin: 1, thinkingMax: 65535, levels: []string{"low", "medium", "high"},
+		},
+	}
+	for _, model := range models {
+		wantModel, ok := wantMetadata[model.ID]
+		if !ok {
+			continue
+		}
+		if model.Name != model.ID || model.DisplayName != wantModel.displayName || model.Description != wantModel.displayName {
+			t.Fatalf("Antigravity model %q names = (%q, %q, %q)", model.ID, model.Name, model.DisplayName, model.Description)
+		}
+		if model.ContextLength != wantModel.context || model.MaxCompletionTokens != wantModel.maxTokens {
+			t.Fatalf("Antigravity model %q limits = (%d, %d)", model.ID, model.ContextLength, model.MaxCompletionTokens)
+		}
+		if model.Thinking == nil || model.Thinking.Min != wantModel.thinkingMin || model.Thinking.Max != wantModel.thinkingMax || !model.Thinking.DynamicAllowed || !slices.Equal(model.Thinking.Levels, wantModel.levels) {
+			t.Fatalf("Antigravity model %q thinking = %#v", model.ID, model.Thinking)
 		}
 	}
 }
