@@ -39,7 +39,8 @@ const (
 // It supports regular and streaming requests to the Google Generative Language API.
 type GeminiExecutor struct {
 	// cfg holds the application configuration.
-	cfg *config.Config
+	cfg        *config.Config
+	identifier string
 }
 
 // NewGeminiExecutor creates a new Gemini executor instance.
@@ -50,11 +51,16 @@ type GeminiExecutor struct {
 // Returns:
 //   - *GeminiExecutor: A new Gemini executor instance
 func NewGeminiExecutor(cfg *config.Config) *GeminiExecutor {
-	return &GeminiExecutor{cfg: cfg}
+	return &GeminiExecutor{cfg: cfg, identifier: "gemini"}
 }
 
 // Identifier returns the executor identifier.
-func (e *GeminiExecutor) Identifier() string { return "gemini" }
+func (e *GeminiExecutor) Identifier() string {
+	if e == nil || strings.TrimSpace(e.identifier) == "" {
+		return "gemini"
+	}
+	return e.identifier
+}
 
 // PrepareRequest injects Gemini credentials into the outgoing HTTP request.
 func (e *GeminiExecutor) PrepareRequest(req *http.Request, auth *cliproxyauth.Auth) error {
@@ -102,6 +108,9 @@ func (e *GeminiExecutor) HttpRequest(ctx context.Context, auth *cliproxyauth.Aut
 func (e *GeminiExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (resp cliproxyexecutor.Response, err error) {
 	if opts.Alt == "responses/compact" {
 		return resp, statusErr{code: http.StatusNotImplemented, msg: "/responses/compact not supported"}
+	}
+	if shouldExecuteNativeInteractions(auth, opts) {
+		return e.executeInteractions(ctx, auth, req, opts)
 	}
 	baseModel := thinking.ParseSuffix(req.Model).ModelName
 
@@ -220,6 +229,9 @@ func (e *GeminiExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 func (e *GeminiExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (_ *cliproxyexecutor.StreamResult, err error) {
 	if opts.Alt == "responses/compact" {
 		return nil, statusErr{code: http.StatusNotImplemented, msg: "/responses/compact not supported"}
+	}
+	if shouldExecuteNativeInteractions(auth, opts) {
+		return e.executeInteractionsStream(ctx, auth, req, opts)
 	}
 	baseModel := thinking.ParseSuffix(req.Model).ModelName
 

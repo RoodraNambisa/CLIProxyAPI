@@ -1,6 +1,7 @@
 package synthesizer
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -151,6 +152,56 @@ func TestConfigSynthesizer_GeminiKeys(t *testing.T) {
 				tt.validate(t, auths)
 			}
 		})
+	}
+}
+
+func TestConfigSynthesizer_InteractionsKeys(t *testing.T) {
+	synth := NewConfigSynthesizer()
+	ctx := &SynthesisContext{
+		Config: &config.Config{
+			InteractionsKey: []config.GeminiKey{{
+				APIKey:   "interactions-key",
+				Priority: 2,
+				BaseURL:  "https://interactions.example.com",
+				ProxyURL: "http://proxy.local:8080",
+				Prefix:   "native",
+				Headers:  map[string]string{"X-Custom": "value"},
+			}},
+		},
+		Now:         time.Date(2026, 7, 14, 0, 0, 0, 0, time.UTC),
+		IDGenerator: NewStableIDGenerator(),
+	}
+
+	auths, errSynthesize := synth.Synthesize(ctx)
+	if errSynthesize != nil {
+		t.Fatalf("Synthesize() error = %v", errSynthesize)
+	}
+	if len(auths) != 1 {
+		t.Fatalf("auth count = %d, want 1", len(auths))
+	}
+	auth := auths[0]
+	if auth.Provider != "gemini-interactions" {
+		t.Fatalf("provider = %q, want gemini-interactions", auth.Provider)
+	}
+	if auth.Label != "interactions-apikey" || auth.Prefix != "native" {
+		t.Fatalf("label/prefix = %q/%q", auth.Label, auth.Prefix)
+	}
+	if auth.ProxyURL != "http://proxy.local:8080" {
+		t.Fatalf("proxy URL = %q", auth.ProxyURL)
+	}
+	if got := auth.Attributes["source"]; !strings.HasPrefix(got, "config:interactions[") {
+		t.Fatalf("source = %q, want interactions namespace", got)
+	}
+	if auth.Attributes["api_key"] != "interactions-key" || auth.Attributes["base_url"] != "https://interactions.example.com" {
+		t.Fatalf("auth attributes = %#v", auth.Attributes)
+	}
+	if auth.Attributes["priority"] != "2" || auth.Attributes["header:X-Custom"] != "value" {
+		t.Fatalf("priority/header attributes = %#v", auth.Attributes)
+	}
+
+	expectedID, _ := NewStableIDGenerator().Next("gemini-interactions:apikey", "interactions-key", "https://interactions.example.com")
+	if auth.ID != expectedID {
+		t.Fatalf("auth ID = %q, want %q", auth.ID, expectedID)
 	}
 }
 

@@ -17,6 +17,12 @@ const RequestPathMetadataKey = "request_path"
 // keeping auth selection bound to Request.Model.
 const ExecutionModelOverrideMetadataKey = "execution_model_override"
 
+// InteractionsAPIVersionMetadataKey stores the trusted Interactions route version.
+const InteractionsAPIVersionMetadataKey = "interactions_api_version"
+
+// InteractionsAPIRevisionMetadataKey stores the client-supplied Interactions revision.
+const InteractionsAPIRevisionMetadataKey = "interactions_api_revision"
+
 const (
 	// StreamBufferSize bounds per-stream buffering between executor layers.
 	StreamBufferSize = 16

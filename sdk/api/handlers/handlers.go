@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/constant"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
@@ -56,6 +57,12 @@ type pinnedAuthContextKey struct{}
 type selectedAuthCallbackContextKey struct{}
 type executionSessionContextKey struct{}
 type imageGenerationStreamPassthroughContextKey struct{}
+type interactionsAPIMetadataContextKey struct{}
+
+type interactionsAPIMetadata struct {
+	version  string
+	revision string
+}
 
 // WithPinnedAuthID returns a child context that requests execution on a specific auth ID.
 func WithPinnedAuthID(ctx context.Context, authID string) context.Context {
@@ -96,6 +103,45 @@ func providersAreOnlyCodex(providers []string) bool {
 	return strings.EqualFold(strings.TrimSpace(providers[0]), "codex")
 }
 
+func adjustExecutionProvidersForEntryProtocol(entryProtocol string, providers []string) []string {
+	entryProtocol = strings.ToLower(strings.TrimSpace(entryProtocol))
+	if entryProtocol == constant.Interactions {
+		return preferExecutionProvider(providers, constant.GeminiInteractions)
+	}
+	switch entryProtocol {
+	case constant.OpenAI, constant.OpenaiResponse, constant.Claude, constant.Gemini:
+		return providers
+	default:
+		return excludeExecutionProvider(providers, constant.GeminiInteractions)
+	}
+}
+
+func preferExecutionProvider(providers []string, preferred string) []string {
+	preferred = strings.ToLower(strings.TrimSpace(preferred))
+	for i := range providers {
+		if strings.ToLower(strings.TrimSpace(providers[i])) != preferred || i == 0 {
+			continue
+		}
+		out := make([]string, 0, len(providers))
+		out = append(out, providers[i])
+		out = append(out, providers[:i]...)
+		out = append(out, providers[i+1:]...)
+		return out
+	}
+	return providers
+}
+
+func excludeExecutionProvider(providers []string, excluded string) []string {
+	excluded = strings.ToLower(strings.TrimSpace(excluded))
+	out := make([]string, 0, len(providers))
+	for _, provider := range providers {
+		if strings.ToLower(strings.TrimSpace(provider)) != excluded {
+			out = append(out, provider)
+		}
+	}
+	return out
+}
+
 // WithSelectedAuthIDCallback returns a child context that receives the selected auth ID.
 func WithSelectedAuthIDCallback(ctx context.Context, callback func(string)) context.Context {
 	if callback == nil {
@@ -117,6 +163,17 @@ func WithExecutionSessionID(ctx context.Context, sessionID string) context.Conte
 		ctx = context.Background()
 	}
 	return context.WithValue(ctx, executionSessionContextKey{}, sessionID)
+}
+
+// WithInteractionsAPIMetadata attaches the trusted route version and optional request revision.
+func WithInteractionsAPIMetadata(ctx context.Context, version, revision string) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, interactionsAPIMetadataContextKey{}, interactionsAPIMetadata{
+		version:  strings.TrimSpace(version),
+		revision: strings.TrimSpace(revision),
+	})
 }
 
 // BuildErrorResponseBody builds an OpenAI-compatible JSON error response body.
@@ -276,6 +333,16 @@ func requestExecutionMetadata(ctx context.Context) map[string]any {
 	}
 	if executionSessionID := executionSessionIDFromContext(ctx); executionSessionID != "" {
 		meta[coreexecutor.ExecutionSessionMetadataKey] = executionSessionID
+	}
+	if ctx != nil {
+		if interactions, ok := ctx.Value(interactionsAPIMetadataContextKey{}).(interactionsAPIMetadata); ok {
+			if interactions.version != "" {
+				meta[coreexecutor.InteractionsAPIVersionMetadataKey] = interactions.version
+			}
+			if interactions.revision != "" {
+				meta[coreexecutor.InteractionsAPIRevisionMetadataKey] = interactions.revision
+			}
+		}
 	}
 	return meta
 }
@@ -591,6 +658,7 @@ func (h *BaseAPIHandler) ExecuteWithAuthManager(ctx context.Context, handlerType
 	if errMsg != nil {
 		return nil, nil, errMsg
 	}
+	providers = adjustExecutionProvidersForEntryProtocol(handlerType, providers)
 	reqMeta := requestExecutionMetadata(ctx)
 	reqMeta[coreexecutor.RequestedModelMetadataKey] = normalizedModel
 	ctx, _ = h.attachRequestBodyRelease(ctx, rawJSON, reqMeta)
@@ -715,6 +783,7 @@ func (h *BaseAPIHandler) ExecuteCountWithAuthManager(ctx context.Context, handle
 	if errMsg != nil {
 		return nil, nil, errMsg
 	}
+	providers = adjustExecutionProvidersForEntryProtocol(handlerType, providers)
 	reqMeta := requestExecutionMetadata(ctx)
 	reqMeta[coreexecutor.RequestedModelMetadataKey] = normalizedModel
 	ctx, _ = h.attachRequestBodyRelease(ctx, rawJSON, reqMeta)
@@ -767,6 +836,7 @@ func (h *BaseAPIHandler) ExecuteStreamWithAuthManager(ctx context.Context, handl
 		close(errChan)
 		return nil, nil, errChan
 	}
+	providers = adjustExecutionProvidersForEntryProtocol(handlerType, providers)
 	return h.executeStreamWithResolvedProviders(ctx, providers, handlerType, normalizedModel, "", rawJSON, alt)
 }
 

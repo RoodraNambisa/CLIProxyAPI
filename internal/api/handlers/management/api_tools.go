@@ -560,6 +560,31 @@ func resolveAPIKeyConfig[T apiKeyConfigEntry](entries []T, auth *coreauth.Auth) 
 	return nil
 }
 
+func resolveAPIKeyConfigExact[T apiKeyConfigEntry](entries []T, auth *coreauth.Auth) *T {
+	if auth == nil || len(entries) == 0 {
+		return nil
+	}
+	attrKey, attrBase := "", ""
+	if auth.Attributes != nil {
+		attrKey = strings.TrimSpace(auth.Attributes["api_key"])
+		attrBase = strings.TrimSpace(auth.Attributes["base_url"])
+	}
+	for i := range entries {
+		entry := &entries[i]
+		cfgKey := strings.TrimSpace((*entry).GetAPIKey())
+		cfgBase := strings.TrimSpace((*entry).GetBaseURL())
+		switch {
+		case attrKey != "" && attrBase != "" && cfgKey == attrKey && cfgBase == attrBase:
+			return entry
+		case attrKey != "" && attrBase == "" && cfgKey == attrKey && cfgBase == "":
+			return entry
+		case attrKey == "" && attrBase != "" && cfgBase == attrBase:
+			return entry
+		}
+	}
+	return nil
+}
+
 func proxyURLFromAPIKeyConfig(cfg *config.Config, auth *coreauth.Auth) string {
 	if cfg == nil || auth == nil {
 		return ""
@@ -583,6 +608,10 @@ func proxyURLFromAPIKeyConfig(cfg *config.Config, auth *coreauth.Auth) string {
 	switch strings.ToLower(strings.TrimSpace(auth.Provider)) {
 	case "gemini":
 		if entry := resolveAPIKeyConfig(cfg.GeminiKey, auth); entry != nil {
+			return strings.TrimSpace(entry.ProxyURL)
+		}
+	case "gemini-interactions":
+		if entry := resolveAPIKeyConfigExact(cfg.InteractionsKey, auth); entry != nil {
 			return strings.TrimSpace(entry.ProxyURL)
 		}
 	case "claude":

@@ -1718,6 +1718,7 @@ func (e *AntigravityExecutor) ExecuteStream(ctx context.Context, auth *cliproxya
 
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
 	translated = helps.ApplyPayloadConfigWithRoot(e.cfg, baseModel, "antigravity", "request", translated, originalTranslated, requestedModel)
+	translated, _ = sjson.DeleteBytes(translated, "request.stream")
 	originalRef, translatedRef, unregisterBodies := helps.RequestBodyRefs(ctx, opts, originalPayload, translated)
 	cleanupBodies := func() {
 		unregisterBodies()

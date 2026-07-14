@@ -131,6 +131,36 @@ func TestBuildConfigChangeDetails_GeminiVertexHeadersAndForceMappings(t *testing
 	expectContains(t, details, "gemini[0].excluded-models: updated (1 -> 2 entries)")
 }
 
+func TestBuildConfigChangeDetails_InteractionsKeys(t *testing.T) {
+	oldCfg := &config.Config{InteractionsKey: []config.GeminiKey{{
+		APIKey:         "old-key",
+		BaseURL:        "https://old.example.com",
+		ProxyURL:       "http://old-proxy.example.com",
+		Prefix:         "old",
+		Headers:        map[string]string{"X-Test": "old"},
+		Models:         []config.GeminiModel{{Name: "gemini-2.5-flash", Alias: "flash"}},
+		ExcludedModels: []string{"gemini-2.5-pro"},
+	}}}
+	newCfg := &config.Config{InteractionsKey: []config.GeminiKey{{
+		APIKey:         "new-key",
+		BaseURL:        "https://new.example.com",
+		ProxyURL:       "http://new-proxy.example.com",
+		Prefix:         "new",
+		Headers:        map[string]string{"X-Test": "new"},
+		Models:         []config.GeminiModel{{Name: "gemini-3-flash", Alias: "flash"}},
+		ExcludedModels: []string{"gemini-3-pro"},
+	}}}
+
+	details := BuildConfigChangeDetails(oldCfg, newCfg)
+	expectContains(t, details, "interactions[0].api-key: updated")
+	expectContains(t, details, "interactions[0].base-url: https://old.example.com -> https://new.example.com")
+	expectContains(t, details, "interactions[0].proxy-url: http://old-proxy.example.com -> http://new-proxy.example.com")
+	expectContains(t, details, "interactions[0].prefix: old -> new")
+	expectContains(t, details, "interactions[0].headers: updated")
+	expectContains(t, details, "interactions[0].models: updated (1 -> 1 entries)")
+	expectContains(t, details, "interactions[0].excluded-models: updated (1 -> 1 entries)")
+}
+
 func TestBuildConfigChangeDetails_ModelPrefixes(t *testing.T) {
 	oldCfg := &config.Config{
 		GeminiKey: []config.GeminiKey{

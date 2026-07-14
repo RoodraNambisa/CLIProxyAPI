@@ -50,6 +50,24 @@ func TestTokenValueForAuthPrefersAPIKeyOverLegacyOAuthMetadata(t *testing.T) {
 	}
 }
 
+func TestProxyURLFromInteractionsConfigUsesExactCredentialIdentity(t *testing.T) {
+	cfg := &config.Config{InteractionsKey: []config.GeminiKey{
+		{APIKey: "KEY", BaseURL: "https://EXAMPLE.com/v1", ProxyURL: "http://wrong-proxy.example.com"},
+		{APIKey: "key", BaseURL: "https://example.com/v1", ProxyURL: "http://right-proxy.example.com"},
+	}}
+	auth := &coreauth.Auth{
+		Provider: "gemini-interactions",
+		Attributes: map[string]string{
+			"api_key":  "key",
+			"base_url": "https://example.com/v1",
+		},
+	}
+
+	if got := proxyURLFromAPIKeyConfig(cfg, auth); got != "http://right-proxy.example.com" {
+		t.Fatalf("proxy URL = %q, want exact credential proxy", got)
+	}
+}
+
 func TestAPICallConfigBackedAuthBypassesUnavailableAuthDir(t *testing.T) {
 	authCases := []struct {
 		name       string

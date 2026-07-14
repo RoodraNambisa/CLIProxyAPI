@@ -92,6 +92,21 @@ func TestHealthz(t *testing.T) {
 	})
 }
 
+func TestInteractionsRoutesAreRegistered(t *testing.T) {
+	server := newTestServer(t)
+	for _, path := range []string{"/v1/interactions", "/v1beta/interactions"} {
+		t.Run(path, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(`{"model":"gemini-3.5-flash","input":"hi"}`))
+			req.Header.Set("Authorization", "Bearer test-key")
+			recorder := httptest.NewRecorder()
+			server.engine.ServeHTTP(recorder, req)
+			if recorder.Code == http.StatusNotFound {
+				t.Fatalf("route %s is not registered", path)
+			}
+		})
+	}
+}
+
 func TestAmpRoutesAreRemoved(t *testing.T) {
 	server := newTestServer(t)
 	tests := []struct {
