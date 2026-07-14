@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"math"
 	"net/http"
 	"strings"
 	"sync"
@@ -90,22 +91,42 @@ func (r *UsageReporter) Observe(detail usage.Detail) {
 	detail = normalizeUsageDetailTotal(detail)
 	r.mu.Lock()
 	if !r.published {
-		r.observedDetail = mergeObservedUsageDetail(r.observedDetail, detail)
+		r.observedDetail = mergeObservedUsageDetail(r.observedDetail, detail, reportsReasoningSeparately(r.provider))
 		r.observed = true
 	}
 	r.mu.Unlock()
 }
 
-func mergeObservedUsageDetail(current, next usage.Detail) usage.Detail {
+func mergeObservedUsageDetail(current, next usage.Detail, reasoningSeparate bool) usage.Detail {
 	merged := current
 	if next.InputTokens != 0 {
 		merged.InputTokens = next.InputTokens
 	}
-	if next.OutputTokens != 0 {
-		merged.OutputTokens = next.OutputTokens
-	}
-	if next.ReasoningTokens != 0 {
-		merged.ReasoningTokens = next.ReasoningTokens
+	if reasoningSeparate {
+		baseOutput := merged.OutputTokens - merged.ReasoningTokens
+		if baseOutput < 0 {
+			baseOutput = 0
+		}
+		if next.OutputTokens != 0 {
+			nextBaseOutput := next.OutputTokens - next.ReasoningTokens
+			if nextBaseOutput < 0 {
+				nextBaseOutput = 0
+			}
+			if nextBaseOutput > 0 || next.ReasoningTokens == 0 {
+				baseOutput = nextBaseOutput
+			}
+		}
+		if next.ReasoningTokens != 0 {
+			merged.ReasoningTokens = next.ReasoningTokens
+		}
+		merged.OutputTokens = sumUsageTokens(baseOutput, merged.ReasoningTokens)
+	} else {
+		if next.OutputTokens != 0 {
+			merged.OutputTokens = next.OutputTokens
+		}
+		if next.ReasoningTokens != 0 {
+			merged.ReasoningTokens = next.ReasoningTokens
+		}
 	}
 	if next.CachedTokens != 0 {
 		merged.CachedTokens = next.CachedTokens
@@ -116,7 +137,7 @@ func mergeObservedUsageDetail(current, next usage.Detail) usage.Detail {
 	if tier := strings.TrimSpace(next.ResponseServiceTier); tier != "" {
 		merged.ResponseServiceTier = tier
 	}
-	total := merged.InputTokens + merged.OutputTokens + merged.ReasoningTokens
+	total := sumUsageTokens(merged.InputTokens, merged.OutputTokens)
 	if next.TotalTokens > total {
 		total = next.TotalTokens
 	}
@@ -125,6 +146,15 @@ func mergeObservedUsageDetail(current, next usage.Detail) usage.Detail {
 	}
 	merged.TotalTokens = total
 	return merged
+}
+
+func reportsReasoningSeparately(provider string) bool {
+	switch strings.ToLower(strings.TrimSpace(provider)) {
+	case "aistudio", "antigravity", "gemini", "gemini-interactions", "vertex":
+		return true
+	default:
+		return false
+	}
 }
 
 // SetTranslatedReasoningEffort is retained for executor compatibility. The v6
@@ -223,7 +253,9 @@ func (r *UsageReporter) publishWithOutcome(ctx context.Context, detail usage.Det
 
 func normalizeUsageDetailTotal(detail usage.Detail) usage.Detail {
 	if detail.TotalTokens == 0 {
-		total := detail.InputTokens + detail.OutputTokens + detail.ReasoningTokens
+		input := maxUsageTokens(detail.InputTokens, detail.CachedTokens, detail.CacheCreationTokens)
+		output := maxUsageTokens(detail.OutputTokens, detail.ReasoningTokens)
+		total := sumUsageTokens(input, output)
 		if total > 0 {
 			detail.TotalTokens = total
 		}
@@ -544,17 +576,16 @@ func ParseClaudeUsage(data []byte) usage.Detail {
 	if !usageNode.Exists() {
 		return usage.Detail{}
 	}
+	baseInputTokens := usageNode.Get("input_tokens").Int()
+	cacheReadTokens := usageNode.Get("cache_read_input_tokens").Int()
+	cacheCreationTokens := usageNode.Get("cache_creation_input_tokens").Int()
 	detail := usage.Detail{
-		InputTokens:         usageNode.Get("input_tokens").Int(),
+		InputTokens:         sumUsageTokens(baseInputTokens, cacheReadTokens, cacheCreationTokens),
 		OutputTokens:        usageNode.Get("output_tokens").Int(),
-		CachedTokens:        usageNode.Get("cache_read_input_tokens").Int(),
-		CacheCreationTokens: usageNode.Get("cache_creation_input_tokens").Int(),
+		CachedTokens:        cacheReadTokens,
+		CacheCreationTokens: cacheCreationTokens,
 	}
-	if detail.CachedTokens == 0 {
-		// fall back to creation tokens when read tokens are absent
-		detail.CachedTokens = detail.CacheCreationTokens
-	}
-	detail.TotalTokens = detail.InputTokens + detail.OutputTokens
+	detail.TotalTokens = sumUsageTokens(detail.InputTokens, detail.OutputTokens)
 	return detail
 }
 
@@ -567,29 +598,30 @@ func ParseClaudeStreamUsage(line []byte) (usage.Detail, bool) {
 	if !usageNode.Exists() {
 		return usage.Detail{}, false
 	}
+	baseInputTokens := usageNode.Get("input_tokens").Int()
+	cacheReadTokens := usageNode.Get("cache_read_input_tokens").Int()
+	cacheCreationTokens := usageNode.Get("cache_creation_input_tokens").Int()
 	detail := usage.Detail{
-		InputTokens:         usageNode.Get("input_tokens").Int(),
+		InputTokens:         sumUsageTokens(baseInputTokens, cacheReadTokens, cacheCreationTokens),
 		OutputTokens:        usageNode.Get("output_tokens").Int(),
-		CachedTokens:        usageNode.Get("cache_read_input_tokens").Int(),
-		CacheCreationTokens: usageNode.Get("cache_creation_input_tokens").Int(),
+		CachedTokens:        cacheReadTokens,
+		CacheCreationTokens: cacheCreationTokens,
 	}
-	if detail.CachedTokens == 0 {
-		detail.CachedTokens = detail.CacheCreationTokens
-	}
-	detail.TotalTokens = detail.InputTokens + detail.OutputTokens
+	detail.TotalTokens = sumUsageTokens(detail.InputTokens, detail.OutputTokens)
 	return detail, true
 }
 
 func parseGeminiFamilyUsageDetail(node gjson.Result) usage.Detail {
+	reasoningTokens := node.Get("thoughtsTokenCount").Int()
 	detail := usage.Detail{
 		InputTokens:     node.Get("promptTokenCount").Int(),
-		OutputTokens:    node.Get("candidatesTokenCount").Int(),
-		ReasoningTokens: node.Get("thoughtsTokenCount").Int(),
+		OutputTokens:    sumUsageTokens(node.Get("candidatesTokenCount").Int(), reasoningTokens),
+		ReasoningTokens: reasoningTokens,
 		TotalTokens:     node.Get("totalTokenCount").Int(),
 		CachedTokens:    node.Get("cachedContentTokenCount").Int(),
 	}
 	if detail.TotalTokens == 0 {
-		detail.TotalTokens = detail.InputTokens + detail.OutputTokens + detail.ReasoningTokens
+		detail.TotalTokens = sumUsageTokens(detail.InputTokens, detail.OutputTokens)
 	}
 	return detail
 }
@@ -600,18 +632,43 @@ func parseInteractionsUsageDetail(node gjson.Result) usage.Detail {
 	if cachedTokens == 0 {
 		cachedTokens = cacheReadTokens
 	}
+	reasoningTokens := firstInteractionsUsageNode(node, "reasoning_tokens", "thoughtsTokenCount", "total_thought_tokens").Int()
 	detail := usage.Detail{
 		InputTokens:         firstInteractionsUsageNode(node, "input_tokens", "prompt_tokens", "total_input_tokens").Int(),
-		OutputTokens:        firstInteractionsUsageNode(node, "output_tokens", "completion_tokens", "total_output_tokens").Int(),
-		ReasoningTokens:     firstInteractionsUsageNode(node, "reasoning_tokens", "thoughtsTokenCount", "total_thought_tokens").Int(),
+		OutputTokens:        sumUsageTokens(firstInteractionsUsageNode(node, "output_tokens", "completion_tokens", "total_output_tokens").Int(), reasoningTokens),
+		ReasoningTokens:     reasoningTokens,
 		TotalTokens:         firstInteractionsUsageNode(node, "total_tokens", "totalTokenCount").Int(),
 		CachedTokens:        cachedTokens,
 		CacheCreationTokens: firstInteractionsUsageNode(node, "cache_creation_tokens", "cacheCreationTokens").Int(),
 	}
 	if detail.TotalTokens == 0 {
-		detail.TotalTokens = detail.InputTokens + detail.OutputTokens + detail.ReasoningTokens + cacheReadTokens + detail.CacheCreationTokens
+		detail.TotalTokens = sumUsageTokens(detail.InputTokens, detail.OutputTokens)
 	}
 	return detail
+}
+
+func sumUsageTokens(values ...int64) int64 {
+	var total int64
+	for _, value := range values {
+		if value <= 0 {
+			continue
+		}
+		if total > math.MaxInt64-value {
+			return math.MaxInt64
+		}
+		total += value
+	}
+	return total
+}
+
+func maxUsageTokens(values ...int64) int64 {
+	var maximum int64
+	for _, value := range values {
+		if value > maximum {
+			maximum = value
+		}
+	}
+	return maximum
 }
 
 func firstInteractionsUsageNode(root gjson.Result, paths ...string) gjson.Result {

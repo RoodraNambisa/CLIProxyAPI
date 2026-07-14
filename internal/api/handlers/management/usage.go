@@ -282,6 +282,31 @@ func (h *Handler) GetUsageTokens(c *gin.Context) {
 	c.JSON(http.StatusOK, result)
 }
 
+// GetUsageCosts returns server-side cost totals and breakdowns using shared prices.
+func (h *Handler) GetUsageCosts(c *gin.Context) {
+	query, ok := parseUsageCostQuery(c)
+	if !ok {
+		return
+	}
+	query.Prices = h.usageCostPrices()
+	var result usage.CostResult
+	if h != nil && h.usageStats != nil {
+		result = h.usageStats.Costs(query)
+	} else {
+		result = usage.CostResult{
+			AsOf:               time.Now().UTC(),
+			Bucket:             query.Bucket,
+			Total:              usage.Money{Currency: usage.CostCurrencyUSD},
+			ByModel:            []usage.ModelCostEntry{},
+			ByAPI:              []usage.APICostEntry{},
+			Series:             []usage.CostSeriesEntry{},
+			UnpricedModels:     []usage.UnpricedModelEntry{},
+			UncalculatedModels: []usage.UncalculatedModelEntry{},
+		}
+	}
+	c.JSON(http.StatusOK, result)
+}
+
 // GetUsageAuthSummary returns one auth usage summary by auth_index.
 func (h *Handler) GetUsageAuthSummary(c *gin.Context) {
 	authIndex := strings.TrimSpace(c.Param("auth_index"))
@@ -611,6 +636,26 @@ func parseUsageTokenQuery(c *gin.Context) (usage.TokenQuery, bool) {
 		return usage.TokenQuery{}, false
 	}
 	return usage.TokenQuery{TimeRange: timeRange, Bucket: bucket, GroupBy: groupBy}, true
+}
+
+func parseUsageCostQuery(c *gin.Context) (usage.CostQuery, bool) {
+	timeRange, ok := parseUsageTimeRange(c)
+	if !ok {
+		return usage.CostQuery{}, false
+	}
+	if timeRange.IsZero() {
+		now := time.Now().UTC()
+		timeRange = usage.TimeRange{From: now.Add(-usage.DefaultTokenRange), To: now}
+	}
+	bucket := strings.TrimSpace(c.Query("bucket"))
+	if bucket == "" {
+		bucket = usage.BucketDay
+	}
+	if bucket != usage.BucketHour && bucket != usage.BucketDay {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid bucket"})
+		return usage.CostQuery{}, false
+	}
+	return usage.CostQuery{TimeRange: timeRange, Bucket: bucket}, true
 }
 
 func parseUsagePositiveMinutes(c *gin.Context, name string, fallback int) (int, bool) {

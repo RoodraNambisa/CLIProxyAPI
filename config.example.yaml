@@ -77,6 +77,15 @@ usage-statistics-enabled: false
 # Set to 0 to disable automatic snapshot persistence.
 usage-statistics-persist-interval-seconds: 0
 
+# Shared USD prices per one million tokens for server-side usage cost reports.
+# Model names are matched exactly after trimming and converting to lowercase.
+usage-pricing:
+  models:
+#    gpt-5.4:
+#      input-per-million: 1.25
+#      output-per-million: 10
+#      cached-input-per-million: 0.125
+
 # Proxy URL. Supports socks5/http/https protocols. Example: socks5://user:pass@192.168.1.1:1080/
 # Per-entry proxy-url also supports "direct" or "none" to bypass both the global proxy-url and environment proxies explicitly.
 proxy-url: ""

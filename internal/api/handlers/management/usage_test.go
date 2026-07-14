@@ -67,7 +67,8 @@ func TestUsageMetaAndSummaryHandlers(t *testing.T) {
 
 func TestUsageHealthRatesAndTokensHandlers(t *testing.T) {
 	handler, stats, _ := newUsageHandlerForTest(t)
-	base := time.Now().UTC().Truncate(time.Hour).Add(-time.Hour)
+	now := time.Now().UTC()
+	base := now.Truncate(time.Hour).Add(-2 * time.Hour)
 	stats.Record(context.Background(), coreusage.Record{
 		APIKey:      "api-a",
 		Model:       "model-a",
@@ -88,7 +89,7 @@ func TestUsageHealthRatesAndTokensHandlers(t *testing.T) {
 		Model:       "model-rates",
 		AuthIndex:   "auth-rates",
 		Source:      "source-rates",
-		RequestedAt: time.Now().UTC().Add(-time.Minute),
+		RequestedAt: now.Add(-time.Minute),
 		Detail:      coreusage.Detail{InputTokens: 60, TotalTokens: 60},
 	})
 
@@ -133,6 +134,39 @@ func TestUsageHealthRatesAndTokensHandlers(t *testing.T) {
 	}
 }
 
+func TestUsageCostsHandlerUsesSharedPrices(t *testing.T) {
+	handler, stats, _ := newUsageHandlerForTest(t)
+	base := time.Now().UTC().Truncate(time.Hour).Add(-time.Hour)
+	handler.cfg.UsagePricing = config.UsagePricingConfig{Models: map[string]config.UsageModelPrice{
+		"model-a": {
+			InputPerMillion:       2,
+			OutputPerMillion:      10,
+			CachedInputPerMillion: 0.5,
+		},
+	}}
+	stats.Record(context.Background(), coreusage.Record{
+		APIKey:      "api-a",
+		Model:       "model-a",
+		RequestedAt: base.Add(time.Minute),
+		Detail: coreusage.Detail{
+			InputTokens:  1000,
+			CachedTokens: 200,
+			OutputTokens: 500,
+			TotalTokens:  1700,
+		},
+	})
+
+	from := base.Format(time.RFC3339)
+	to := base.Add(time.Hour).Format(time.RFC3339)
+	ctx, recorder := newUsageRequestContext("/v0/management/usage/costs?from=" + from + "&to=" + to + "&bucket=hour")
+	handler.GetUsageCosts(ctx)
+	var result usage.CostResult
+	decodeUsageResponse(t, recorder, &result)
+	if result.Total.AmountMicros != 6700 || len(result.ByModel) != 1 || len(result.ByAPI) != 1 || len(result.Series) != 1 {
+		t.Fatalf("cost result = %+v", result)
+	}
+}
+
 func TestUsageAnalyticsHandlersRejectInvalidParameters(t *testing.T) {
 	handler, _, _ := newUsageHandlerForTest(t)
 	tests := []struct {
@@ -145,6 +179,7 @@ func TestUsageAnalyticsHandlersRejectInvalidParameters(t *testing.T) {
 		{target: "/v0/management/usage/rates?sparkline_minutes=1441", call: handler.GetUsageRates},
 		{target: "/v0/management/usage/tokens?bucket=minute", call: handler.GetUsageTokens},
 		{target: "/v0/management/usage/tokens?group_by=source", call: handler.GetUsageTokens},
+		{target: "/v0/management/usage/costs?bucket=minute", call: handler.GetUsageCosts},
 	}
 	for _, test := range tests {
 		t.Run(test.target, func(t *testing.T) {
@@ -194,6 +229,20 @@ func TestUsageTokenQueryDefaultsToRecentThirtyDays(t *testing.T) {
 	}
 	if got := query.TimeRange.To.Sub(query.TimeRange.From); got != usage.DefaultTokenRange {
 		t.Fatalf("default token range = %s, want %s", got, usage.DefaultTokenRange)
+	}
+}
+
+func TestUsageCostQueryDefaultsToRecentThirtyDays(t *testing.T) {
+	ctx, recorder := newUsageRequestContext("/v0/management/usage/costs")
+	query, ok := parseUsageCostQuery(ctx)
+	if !ok {
+		t.Fatalf("default cost query rejected: %s", recorder.Body.String())
+	}
+	if got := query.TimeRange.To.Sub(query.TimeRange.From); got != usage.DefaultTokenRange {
+		t.Fatalf("default cost range = %s, want %s", got, usage.DefaultTokenRange)
+	}
+	if query.Bucket != usage.BucketDay {
+		t.Fatalf("default cost bucket = %q, want day", query.Bucket)
 	}
 }
 

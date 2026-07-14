@@ -31,6 +31,8 @@ type Record struct {
 
 // Detail holds the token usage breakdown.
 type Detail struct {
+	// InputTokens and OutputTokens are inclusive billing totals. The cache and
+	// reasoning fields below are subsets retained for usage breakdowns.
 	InputTokens         int64
 	OutputTokens        int64
 	ReasoningTokens     int64

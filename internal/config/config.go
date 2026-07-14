@@ -264,6 +264,9 @@ type Config struct {
 	// are flushed to disk automatically. Set to 0 to disable periodic persistence.
 	UsageStatisticsPersistIntervalSeconds int `yaml:"usage-statistics-persist-interval-seconds" json:"usage-statistics-persist-interval-seconds"`
 
+	// UsagePricing defines shared per-model prices for usage cost aggregation.
+	UsagePricing UsagePricingConfig `yaml:"usage-pricing" json:"usage-pricing"`
+
 	// DisableCooling disables quota cooldown scheduling when true.
 	DisableCooling bool `yaml:"disable-cooling" json:"disable-cooling"`
 
@@ -1079,6 +1082,13 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 
 	if cfg.ErrorLogsMaxFiles < 0 {
 		cfg.ErrorLogsMaxFiles = 10
+	}
+
+	if cfg.UsagePricing, err = NormalizeUsagePricing(cfg.UsagePricing); err != nil {
+		if optional {
+			return &Config{}, nil
+		}
+		return nil, err
 	}
 
 	if cfg.MaxRetryCredentials < 0 {
@@ -2176,6 +2186,8 @@ func SaveConfigPreserveComments(configFile string, cfg *Config) error {
 
 	pruneMappingToGeneratedKeys(original.Content[0], generated.Content[0], "oauth-excluded-models")
 	pruneMappingToGeneratedKeys(original.Content[0], generated.Content[0], "oauth-model-alias")
+	normalizeUsagePricingModelKeys(original.Content[0])
+	pruneNestedMappingToGeneratedKeys(original.Content[0], generated.Content[0], "usage-pricing", "models")
 
 	// Merge generated into original in-place, preserving comments/order of existing nodes.
 	mergeMappingPreserve(original.Content[0], generated.Content[0])
@@ -2865,6 +2877,42 @@ func pruneMappingToGeneratedKeys(dstRoot, srcRoot *yaml.Node, key string) {
 		return
 	}
 	pruneMissingMapKeys(dstVal, srcVal)
+}
+
+func pruneNestedMappingToGeneratedKeys(dstRoot, srcRoot *yaml.Node, parentKey, key string) {
+	if dstRoot == nil || srcRoot == nil || dstRoot.Kind != yaml.MappingNode || srcRoot.Kind != yaml.MappingNode {
+		return
+	}
+	dstIndex := findMapKeyIndex(dstRoot, parentKey)
+	srcIndex := findMapKeyIndex(srcRoot, parentKey)
+	if dstIndex < 0 || srcIndex < 0 || dstIndex+1 >= len(dstRoot.Content) || srcIndex+1 >= len(srcRoot.Content) {
+		return
+	}
+	pruneMappingToGeneratedKeys(dstRoot.Content[dstIndex+1], srcRoot.Content[srcIndex+1], key)
+}
+
+func normalizeUsagePricingModelKeys(root *yaml.Node) {
+	if root == nil || root.Kind != yaml.MappingNode {
+		return
+	}
+	pricingIndex := findMapKeyIndex(root, "usage-pricing")
+	if pricingIndex < 0 || pricingIndex+1 >= len(root.Content) {
+		return
+	}
+	pricing := root.Content[pricingIndex+1]
+	modelsIndex := findMapKeyIndex(pricing, "models")
+	if modelsIndex < 0 || modelsIndex+1 >= len(pricing.Content) {
+		return
+	}
+	models := pricing.Content[modelsIndex+1]
+	if models == nil || models.Kind != yaml.MappingNode {
+		return
+	}
+	for index := 0; index+1 < len(models.Content); index += 2 {
+		if models.Content[index] != nil {
+			models.Content[index].Value = strings.ToLower(strings.TrimSpace(models.Content[index].Value))
+		}
+	}
 }
 
 func pruneMissingMapKeys(dstMap, srcMap *yaml.Node) {

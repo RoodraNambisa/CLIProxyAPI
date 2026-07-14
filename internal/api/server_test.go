@@ -112,9 +112,15 @@ func TestLightweightUsageAnalyticsRoutesAreRegistered(t *testing.T) {
 		cfg.RemoteManagement.SecretKey = "secret"
 	})
 	want := map[string]bool{
-		http.MethodGet + " /v0/management/usage/health": false,
-		http.MethodGet + " /v0/management/usage/rates":  false,
-		http.MethodGet + " /v0/management/usage/tokens": false,
+		http.MethodGet + " /v0/management/usage/health":           false,
+		http.MethodGet + " /v0/management/usage/rates":            false,
+		http.MethodGet + " /v0/management/usage/tokens":           false,
+		http.MethodGet + " /v0/management/usage/costs":            false,
+		http.MethodGet + " /v0/management/usage/prices":           false,
+		http.MethodPut + " /v0/management/usage/prices":           false,
+		http.MethodPatch + " /v0/management/usage/prices":         false,
+		http.MethodDelete + " /v0/management/usage/prices":        false,
+		http.MethodDelete + " /v0/management/usage/prices/*model": false,
 	}
 	for _, route := range server.engine.Routes() {
 		key := route.Method + " " + route.Path
@@ -126,6 +132,38 @@ func TestLightweightUsageAnalyticsRoutesAreRegistered(t *testing.T) {
 		if !registered {
 			t.Errorf("route %s is not registered", route)
 		}
+	}
+}
+
+func TestUsagePriceDeleteRouteHandlesModelPath(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "secret")
+	server := newTestServerWithConfig(t, func(cfg *proxyconfig.Config) {
+		cfg.RemoteManagement.SecretKey = "secret"
+		cfg.RemoteManagement.AllowRemote = true
+		cfg.UsagePricing = proxyconfig.UsagePricingConfig{Models: map[string]proxyconfig.UsageModelPrice{
+			"provider/model-a": {InputPerMillion: 1},
+		}}
+	})
+	if err := os.WriteFile(server.configFilePath, []byte("usage-pricing:\n  models:\n    provider/model-a:\n      input-per-million: 1\n"), 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+	req := httptest.NewRequest(http.MethodDelete, "/v0/management/usage/prices/provider/model-a", nil)
+	req.Header.Set("X-Management-Key", "secret")
+	recorder := httptest.NewRecorder()
+	server.engine.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("DELETE model status = %d, want 200: %s", recorder.Code, recorder.Body.String())
+	}
+	if len(server.cfg.UsagePricing.Models) != 0 {
+		t.Fatalf("models after DELETE = %#v, want empty", server.cfg.UsagePricing.Models)
+	}
+
+	missing := httptest.NewRequest(http.MethodDelete, "/v0/management/usage/prices/provider/missing", nil)
+	missing.Header.Set("X-Management-Key", "secret")
+	missingRecorder := httptest.NewRecorder()
+	server.engine.ServeHTTP(missingRecorder, missing)
+	if missingRecorder.Code != http.StatusNotFound {
+		t.Fatalf("DELETE missing status = %d, want 404: %s", missingRecorder.Code, missingRecorder.Body.String())
 	}
 }
 

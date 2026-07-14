@@ -40,6 +40,87 @@ func TestRequestStatisticsRecordIncludesLatency(t *testing.T) {
 	}
 }
 
+func TestRequestStatisticsNormalizesNegativeRecordTokens(t *testing.T) {
+	stats := NewRequestStatistics()
+	stats.Record(context.Background(), coreusage.Record{
+		APIKey:      "test-key",
+		Model:       "gpt-5.4",
+		RequestedAt: time.Now().UTC(),
+		Detail: coreusage.Detail{
+			InputTokens:         -1,
+			OutputTokens:        -2,
+			ReasoningTokens:     -3,
+			CachedTokens:        -4,
+			CacheCreationTokens: -5,
+			TotalTokens:         -6,
+		},
+	})
+	assertUsageTokensAreZero(t, stats)
+}
+
+func TestMergeSnapshotNormalizesNegativeTokens(t *testing.T) {
+	stats := NewRequestStatistics()
+	result := stats.MergeSnapshot(StatisticsSnapshot{APIs: map[string]APISnapshot{
+		"test-key": {
+			Models: map[string]ModelSnapshot{
+				"gpt-5.4": {Details: []RequestDetail{{
+					Timestamp: time.Now().UTC(),
+					Tokens: TokenStats{
+						InputTokens:         -1,
+						OutputTokens:        -2,
+						ReasoningTokens:     -3,
+						CachedTokens:        -4,
+						CacheCreationTokens: -5,
+						TotalTokens:         -6,
+					},
+				}}},
+			},
+		},
+	}})
+	if result.Added != 1 {
+		t.Fatalf("merge result = %+v, want one added detail", result)
+	}
+	assertUsageTokensAreZero(t, stats)
+}
+
+func TestRebuildNormalizesNegativeTokens(t *testing.T) {
+	stats := NewRequestStatistics()
+	stats.apis["test-key"] = &apiStats{Models: map[string]*modelStats{
+		"gpt-5.4": {Details: []RequestDetail{{
+			Timestamp: time.Now().UTC(),
+			Tokens: TokenStats{
+				InputTokens:         -1,
+				OutputTokens:        -2,
+				ReasoningTokens:     -3,
+				CachedTokens:        -4,
+				CacheCreationTokens: -5,
+				TotalTokens:         -6,
+			},
+		}}},
+	}}
+	stats.mu.Lock()
+	stats.rebuildLocked()
+	stats.mu.Unlock()
+	assertUsageTokensAreZero(t, stats)
+}
+
+func assertUsageTokensAreZero(t *testing.T, stats *RequestStatistics) {
+	t.Helper()
+	summary := stats.Summary()
+	if summary.TotalRequests != 1 || summary.TotalTokens != 0 || summary.Tokens != (TokenStats{}) {
+		t.Fatalf("summary = %+v, want one zero-token request", summary)
+	}
+	apiSummary := summary.APIs["test-key"]
+	modelSummary := apiSummary.Models["gpt-5.4"]
+	if apiSummary.TotalTokens != 0 || apiSummary.Tokens != (TokenStats{}) || modelSummary.TotalTokens != 0 || modelSummary.Tokens != (TokenStats{}) {
+		t.Fatalf("API/model summaries contain negative tokens: api=%+v model=%+v", apiSummary, modelSummary)
+	}
+	details := stats.Snapshot().APIs["test-key"].Models["gpt-5.4"].Details
+	if len(details) != 1 || details[0].Tokens != (TokenStats{}) {
+		t.Fatalf("details = %+v, want one normalized zero-token detail", details)
+	}
+}
+
 func TestRequestStatisticsAggregatesCacheCreationAndServiceTiers(t *testing.T) {
 	stats := NewRequestStatistics()
 	timestamp := time.Date(2026, 7, 11, 8, 0, 0, 0, time.UTC)

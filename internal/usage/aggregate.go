@@ -1,6 +1,7 @@
 package usage
 
 import (
+	"math"
 	"sort"
 	"strings"
 	"time"
@@ -13,14 +14,17 @@ const (
 )
 
 type aggregateStats struct {
-	TotalRequests int64
-	SuccessCount  int64
-	FailureCount  int64
-	TotalTokens   int64
-	Tokens        TokenStats
-	SuccessTokens TokenStats
-	FailureTokens TokenStats
-	LastUsedAt    time.Time
+	TotalRequests      int64
+	SuccessCount       int64
+	FailureCount       int64
+	TotalTokens        int64
+	CalculableRequests int64
+	CalculableTokens   int64
+	NonCachedInput     int64
+	Tokens             TokenStats
+	SuccessTokens      TokenStats
+	FailureTokens      TokenStats
+	LastUsedAt         time.Time
 }
 
 type usageAggregateBucket struct {
@@ -70,6 +74,12 @@ func (a *aggregateStats) addDetail(detail RequestDetail) {
 	} else {
 		addTokenStats(&a.SuccessTokens, detail.Tokens)
 	}
+	normalizedTokens := normaliseTokenStats(detail.Tokens)
+	if hasCostBreakdown(normalizedTokens) {
+		a.CalculableRequests = saturatingAddInt64(a.CalculableRequests, 1)
+		a.CalculableTokens = saturatingAddInt64(a.CalculableTokens, nonNegativeInt64(normalizedTokens.TotalTokens))
+		a.NonCachedInput = saturatingAddInt64(a.NonCachedInput, nonCachedInputTokens(normalizedTokens))
+	}
 	if a.LastUsedAt.IsZero() || detail.Timestamp.After(a.LastUsedAt) {
 		a.LastUsedAt = detail.Timestamp
 	}
@@ -79,10 +89,13 @@ func (a *aggregateStats) merge(other aggregateStats) {
 	if a == nil {
 		return
 	}
-	a.TotalRequests += other.TotalRequests
-	a.SuccessCount += other.SuccessCount
-	a.FailureCount += other.FailureCount
-	a.TotalTokens += other.TotalTokens
+	a.TotalRequests = saturatingAddInt64(a.TotalRequests, other.TotalRequests)
+	a.SuccessCount = saturatingAddInt64(a.SuccessCount, other.SuccessCount)
+	a.FailureCount = saturatingAddInt64(a.FailureCount, other.FailureCount)
+	a.TotalTokens = saturatingAddInt64(a.TotalTokens, other.TotalTokens)
+	a.CalculableRequests = saturatingAddInt64(a.CalculableRequests, other.CalculableRequests)
+	a.CalculableTokens = saturatingAddInt64(a.CalculableTokens, other.CalculableTokens)
+	a.NonCachedInput = saturatingAddInt64(a.NonCachedInput, other.NonCachedInput)
 	addTokenStats(&a.Tokens, other.Tokens)
 	addTokenStats(&a.SuccessTokens, other.SuccessTokens)
 	addTokenStats(&a.FailureTokens, other.FailureTokens)
@@ -96,12 +109,28 @@ func addTokenStats(target *TokenStats, value TokenStats) {
 		return
 	}
 	value = normaliseTokenStats(value)
-	target.InputTokens += value.InputTokens
-	target.OutputTokens += value.OutputTokens
-	target.ReasoningTokens += value.ReasoningTokens
-	target.CachedTokens += value.CachedTokens
-	target.CacheCreationTokens += value.CacheCreationTokens
-	target.TotalTokens += value.TotalTokens
+	target.InputTokens = saturatingAddInt64(target.InputTokens, value.InputTokens)
+	target.OutputTokens = saturatingAddInt64(target.OutputTokens, value.OutputTokens)
+	target.ReasoningTokens = saturatingAddInt64(target.ReasoningTokens, value.ReasoningTokens)
+	target.CachedTokens = saturatingAddInt64(target.CachedTokens, value.CachedTokens)
+	target.CacheCreationTokens = saturatingAddInt64(target.CacheCreationTokens, value.CacheCreationTokens)
+	target.TotalTokens = saturatingAddInt64(target.TotalTokens, value.TotalTokens)
+}
+
+func hasCostBreakdown(tokens TokenStats) bool {
+	if tokens.TotalTokens <= 0 {
+		return true
+	}
+	return tokens.InputTokens > 0 || tokens.OutputTokens > 0 || tokens.CachedTokens > 0
+}
+
+func nonCachedInputTokens(tokens TokenStats) int64 {
+	input := nonNegativeInt64(tokens.InputTokens)
+	cached := nonNegativeInt64(tokens.CachedTokens)
+	if cached >= input {
+		return 0
+	}
+	return input - cached
 }
 
 func (b *usageAggregateBucket) add(apiName, modelName string, detail RequestDetail) {
@@ -493,9 +522,9 @@ func (s *RequestStatistics) updateLegacyHourBucketLocked(detail RequestDetail) {
 		stats = &legacyHourStats{}
 		s.legacyHourBuckets[key] = stats
 	}
-	stats.Requests++
+	stats.Requests = saturatingAddInt64(stats.Requests, 1)
 	totalTokens := normaliseTokenStats(detail.Tokens).TotalTokens
-	stats.Tokens += totalTokens
+	stats.Tokens = saturatingAddInt64(stats.Tokens, nonNegativeInt64(totalTokens))
 	stats.Entries = append(stats.Entries, legacyUsageEntry{
 		Timestamp: timestamp,
 		Tokens:    totalTokens,
@@ -516,4 +545,21 @@ func ceilAggregateTime(timestamp time.Time, step time.Duration) time.Time {
 		return truncated
 	}
 	return truncated.Add(step)
+}
+
+func saturatingAddInt64(left, right int64) int64 {
+	if right > 0 && left > math.MaxInt64-right {
+		return math.MaxInt64
+	}
+	if right < 0 && left < math.MinInt64-right {
+		return math.MinInt64
+	}
+	return left + right
+}
+
+func nonNegativeInt64(value int64) int64 {
+	if value < 0 {
+		return 0
+	}
+	return value
 }

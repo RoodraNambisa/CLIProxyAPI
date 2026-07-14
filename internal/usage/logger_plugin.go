@@ -240,7 +240,7 @@ func (s *RequestStatistics) Record(ctx context.Context, record coreusage.Record)
 		timestamp = time.Now()
 	}
 	detail := normaliseDetail(record.Detail)
-	totalTokens := detail.TotalTokens
+	totalTokens := nonNegativeInt64(detail.TotalTokens)
 	statsKey := record.APIKey
 	if statsKey == "" {
 		statsKey = resolveAPIIdentifier(ctx, record)
@@ -264,13 +264,13 @@ func (s *RequestStatistics) Record(ctx context.Context, record coreusage.Record)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	s.totalRequests++
+	s.totalRequests = saturatingAddInt64(s.totalRequests, 1)
 	if success {
-		s.successCount++
+		s.successCount = saturatingAddInt64(s.successCount, 1)
 	} else {
-		s.failureCount++
+		s.failureCount = saturatingAddInt64(s.failureCount, 1)
 	}
-	s.totalTokens += totalTokens
+	s.totalTokens = saturatingAddInt64(s.totalTokens, totalTokens)
 
 	stats, ok := s.apis[statsKey]
 	if !ok {
@@ -303,10 +303,10 @@ func (s *RequestStatistics) Record(ctx context.Context, record coreusage.Record)
 	})
 	s.pruneTimeBucketsLocked(now)
 
-	s.requestsByDay[dayKey]++
-	s.requestsByHour[hourKey]++
-	s.tokensByDay[dayKey] += totalTokens
-	s.tokensByHour[hourKey] += totalTokens
+	s.requestsByDay[dayKey] = saturatingAddInt64(s.requestsByDay[dayKey], 1)
+	s.requestsByHour[hourKey] = saturatingAddInt64(s.requestsByHour[hourKey], 1)
+	s.tokensByDay[dayKey] = saturatingAddInt64(s.tokensByDay[dayKey], totalTokens)
+	s.tokensByHour[hourKey] = saturatingAddInt64(s.tokensByHour[hourKey], totalTokens)
 	s.updateLegacyHourBucketLocked(requestDetail)
 	s.markChangedLocked()
 }
@@ -357,26 +357,21 @@ func (s *RequestStatistics) updateAuthStats(model string, detail RequestDetail) 
 
 func updateUsageAggregate(totalRequests, successCount, failureCount, totalTokens *int64, tokens *TokenStats, detail RequestDetail) {
 	if totalRequests != nil {
-		(*totalRequests)++
+		*totalRequests = saturatingAddInt64(*totalRequests, 1)
 	}
 	if detail.Failed {
 		if failureCount != nil {
-			(*failureCount)++
+			*failureCount = saturatingAddInt64(*failureCount, 1)
 		}
 	} else if successCount != nil {
-		(*successCount)++
+		*successCount = saturatingAddInt64(*successCount, 1)
 	}
 	normalizedTokens := normaliseTokenStats(detail.Tokens)
 	if totalTokens != nil {
-		*totalTokens += normalizedTokens.TotalTokens
+		*totalTokens = saturatingAddInt64(*totalTokens, normalizedTokens.TotalTokens)
 	}
 	if tokens != nil {
-		tokens.InputTokens += normalizedTokens.InputTokens
-		tokens.OutputTokens += normalizedTokens.OutputTokens
-		tokens.ReasoningTokens += normalizedTokens.ReasoningTokens
-		tokens.CachedTokens += normalizedTokens.CachedTokens
-		tokens.CacheCreationTokens += normalizedTokens.CacheCreationTokens
-		tokens.TotalTokens += normalizedTokens.TotalTokens
+		addTokenStats(tokens, normalizedTokens)
 	}
 }
 
@@ -740,13 +735,13 @@ func (s *RequestStatistics) recordImported(apiName, modelName string, stats *api
 		totalTokens = 0
 	}
 
-	s.totalRequests++
+	s.totalRequests = saturatingAddInt64(s.totalRequests, 1)
 	if detail.Failed {
-		s.failureCount++
+		s.failureCount = saturatingAddInt64(s.failureCount, 1)
 	} else {
-		s.successCount++
+		s.successCount = saturatingAddInt64(s.successCount, 1)
 	}
-	s.totalTokens += totalTokens
+	s.totalTokens = saturatingAddInt64(s.totalTokens, totalTokens)
 
 	s.updateAPIStats(stats, modelName, detail)
 	s.updateAuthStats(modelName, detail)
@@ -755,10 +750,10 @@ func (s *RequestStatistics) recordImported(apiName, modelName string, stats *api
 	dayKey := detail.Timestamp.Format("2006-01-02")
 	hourKey := detail.Timestamp.Hour()
 
-	s.requestsByDay[dayKey]++
-	s.requestsByHour[hourKey]++
-	s.tokensByDay[dayKey] += totalTokens
-	s.tokensByHour[hourKey] += totalTokens
+	s.requestsByDay[dayKey] = saturatingAddInt64(s.requestsByDay[dayKey], 1)
+	s.requestsByHour[hourKey] = saturatingAddInt64(s.requestsByHour[hourKey], 1)
+	s.tokensByDay[dayKey] = saturatingAddInt64(s.tokensByDay[dayKey], totalTokens)
+	s.tokensByHour[hourKey] = saturatingAddInt64(s.tokensByHour[hourKey], totalTokens)
 	s.updateLegacyHourBucketLocked(detail)
 	s.markChangedLocked()
 }
@@ -824,14 +819,14 @@ func (s *RequestStatistics) rebuildLocked() {
 				}
 				modelStatsValue.Details[idx] = detail
 
-				totalTokens := detail.Tokens.TotalTokens
-				s.totalRequests++
+				totalTokens := nonNegativeInt64(detail.Tokens.TotalTokens)
+				s.totalRequests = saturatingAddInt64(s.totalRequests, 1)
 				if detail.Failed {
-					s.failureCount++
+					s.failureCount = saturatingAddInt64(s.failureCount, 1)
 				} else {
-					s.successCount++
+					s.successCount = saturatingAddInt64(s.successCount, 1)
 				}
-				s.totalTokens += totalTokens
+				s.totalTokens = saturatingAddInt64(s.totalTokens, totalTokens)
 
 				updateAPIAggregates(stats, modelStatsValue, detail)
 				s.updateAuthStats(modelName, detail)
@@ -839,10 +834,10 @@ func (s *RequestStatistics) rebuildLocked() {
 
 				dayKey := detail.Timestamp.Format("2006-01-02")
 				hourKey := detail.Timestamp.Hour()
-				s.requestsByDay[dayKey]++
-				s.requestsByHour[hourKey]++
-				s.tokensByDay[dayKey] += totalTokens
-				s.tokensByHour[hourKey] += totalTokens
+				s.requestsByDay[dayKey] = saturatingAddInt64(s.requestsByDay[dayKey], 1)
+				s.requestsByHour[hourKey] = saturatingAddInt64(s.requestsByHour[hourKey], 1)
+				s.tokensByDay[dayKey] = saturatingAddInt64(s.tokensByDay[dayKey], totalTokens)
+				s.tokensByHour[hourKey] = saturatingAddInt64(s.tokensByHour[hourKey], totalTokens)
 				s.updateLegacyHourBucketLocked(detail)
 			}
 		}
@@ -943,29 +938,32 @@ func normaliseDetail(detail coreusage.Detail) TokenStats {
 		CacheCreationTokens: detail.CacheCreationTokens,
 		TotalTokens:         detail.TotalTokens,
 	}
+	return normaliseTokenStats(tokens)
+}
+
+func normaliseTokenStats(tokens TokenStats) TokenStats {
+	tokens.InputTokens = nonNegativeInt64(tokens.InputTokens)
+	tokens.OutputTokens = nonNegativeInt64(tokens.OutputTokens)
+	tokens.ReasoningTokens = nonNegativeInt64(tokens.ReasoningTokens)
+	tokens.CachedTokens = nonNegativeInt64(tokens.CachedTokens)
+	tokens.CacheCreationTokens = nonNegativeInt64(tokens.CacheCreationTokens)
+	tokens.TotalTokens = nonNegativeInt64(tokens.TotalTokens)
 	if tokens.TotalTokens == 0 {
-		tokens.TotalTokens = detail.InputTokens + detail.OutputTokens + detail.ReasoningTokens
-	}
-	if tokens.TotalTokens == 0 {
-		tokens.TotalTokens = detail.InputTokens + detail.OutputTokens + detail.ReasoningTokens + detail.CachedTokens
-	}
-	if tokens.TotalTokens == 0 {
-		tokens.TotalTokens = detail.CacheCreationTokens
+		input := maxUsageTokenCount(tokens.InputTokens, tokens.CachedTokens, tokens.CacheCreationTokens)
+		output := maxUsageTokenCount(tokens.OutputTokens, tokens.ReasoningTokens)
+		tokens.TotalTokens = saturatingAddInt64(input, output)
 	}
 	return tokens
 }
 
-func normaliseTokenStats(tokens TokenStats) TokenStats {
-	if tokens.TotalTokens == 0 {
-		tokens.TotalTokens = tokens.InputTokens + tokens.OutputTokens + tokens.ReasoningTokens
+func maxUsageTokenCount(values ...int64) int64 {
+	var maximum int64
+	for _, value := range values {
+		if value > maximum {
+			maximum = value
+		}
 	}
-	if tokens.TotalTokens == 0 {
-		tokens.TotalTokens = tokens.InputTokens + tokens.OutputTokens + tokens.ReasoningTokens + tokens.CachedTokens
-	}
-	if tokens.TotalTokens == 0 {
-		tokens.TotalTokens = tokens.CacheCreationTokens
-	}
-	return tokens
+	return maximum
 }
 
 func normaliseLatency(latency time.Duration) int64 {

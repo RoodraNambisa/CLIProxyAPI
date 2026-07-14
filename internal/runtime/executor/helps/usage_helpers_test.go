@@ -94,11 +94,24 @@ func TestParseClaudeUsagePreservesCacheCreationTokens(t *testing.T) {
 	if detail.CachedTokens != 4 || detail.CacheCreationTokens != 5 {
 		t.Fatalf("unexpected Claude cache tokens: %+v", detail)
 	}
+	if detail.InputTokens != 11 || detail.TotalTokens != 14 {
+		t.Fatalf("Claude inclusive input totals = %+v, want input=11 total=14", detail)
+	}
+}
+
+func TestParseClaudeStreamUsageUsesInclusiveInputTotal(t *testing.T) {
+	detail, ok := ParseClaudeStreamUsage([]byte(`data: {"usage":{"input_tokens":2,"output_tokens":3,"cache_read_input_tokens":4,"cache_creation_input_tokens":5}}`))
+	if !ok {
+		t.Fatal("ParseClaudeStreamUsage() ok = false, want true")
+	}
+	if detail.InputTokens != 11 || detail.CachedTokens != 4 || detail.CacheCreationTokens != 5 || detail.TotalTokens != 14 {
+		t.Fatalf("unexpected Claude stream usage: %+v", detail)
+	}
 }
 
 func TestParseAntigravityUsageAcceptsResponseSnakeCase(t *testing.T) {
-	detail := ParseAntigravityUsage([]byte(`{"response":{"usage_metadata":{"promptTokenCount":2,"candidatesTokenCount":3,"totalTokenCount":5}}}`))
-	if detail.InputTokens != 2 || detail.OutputTokens != 3 || detail.TotalTokens != 5 {
+	detail := ParseAntigravityUsage([]byte(`{"response":{"usage_metadata":{"promptTokenCount":2,"candidatesTokenCount":3,"thoughtsTokenCount":5,"totalTokenCount":10}}}`))
+	if detail.InputTokens != 2 || detail.OutputTokens != 8 || detail.ReasoningTokens != 5 || detail.TotalTokens != 10 {
 		t.Fatalf("unexpected Antigravity snake-case usage: %+v", detail)
 	}
 }
@@ -147,8 +160,8 @@ func TestParseInteractionsUsage(t *testing.T) {
 	if detail.InputTokens != 3 {
 		t.Fatalf("input tokens = %d, want 3", detail.InputTokens)
 	}
-	if detail.OutputTokens != 4 {
-		t.Fatalf("output tokens = %d, want 4", detail.OutputTokens)
+	if detail.OutputTokens != 9 {
+		t.Fatalf("output tokens = %d, want 9", detail.OutputTokens)
 	}
 	if detail.ReasoningTokens != 5 {
 		t.Fatalf("reasoning tokens = %d, want 5", detail.ReasoningTokens)
@@ -182,8 +195,8 @@ func TestParseInteractionsStreamUsageOfficialMetadata(t *testing.T) {
 	if detail.InputTokens != 2 {
 		t.Fatalf("input tokens = %d, want 2", detail.InputTokens)
 	}
-	if detail.OutputTokens != 6 {
-		t.Fatalf("output tokens = %d, want 6", detail.OutputTokens)
+	if detail.OutputTokens != 9 {
+		t.Fatalf("output tokens = %d, want 9", detail.OutputTokens)
 	}
 	if detail.ReasoningTokens != 3 {
 		t.Fatalf("reasoning tokens = %d, want 3", detail.ReasoningTokens)
@@ -197,12 +210,52 @@ func TestParseInteractionsStreamUsageOfficialMetadata(t *testing.T) {
 }
 
 func TestParseInteractionsUsageTotalFallbackUsesExplicitCacheRead(t *testing.T) {
-	detail := ParseInteractionsUsage([]byte(`{"usage":{"input_tokens":2,"output_tokens":3,"reasoning_tokens":4,"total_cached_tokens":7,"cache_read_tokens":5,"cache_creation_tokens":6}}`))
+	detail := ParseInteractionsUsage([]byte(`{"usage":{"input_tokens":13,"output_tokens":3,"reasoning_tokens":4,"total_cached_tokens":7,"cache_read_tokens":5,"cache_creation_tokens":6}}`))
 	if detail.CachedTokens != 7 {
 		t.Fatalf("cached tokens = %d, want 7", detail.CachedTokens)
 	}
 	if detail.TotalTokens != 20 {
 		t.Fatalf("total tokens = %d, want 20", detail.TotalTokens)
+	}
+	if detail.CachedTokens > detail.InputTokens || detail.CacheCreationTokens > detail.InputTokens {
+		t.Fatalf("cache fields are not input subsets: %+v", detail)
+	}
+}
+
+func TestNormalizeUsageDetailTotalTreatsReasoningAsOutputSubset(t *testing.T) {
+	detail := normalizeUsageDetailTotal(usage.Detail{InputTokens: 2, OutputTokens: 7, ReasoningTokens: 5})
+	if detail.TotalTokens != 9 {
+		t.Fatalf("total tokens = %d, want 9", detail.TotalTokens)
+	}
+}
+
+func TestNormalizeUsageDetailTotalUsesChildFieldsWhenParentIsMissing(t *testing.T) {
+	detail := normalizeUsageDetailTotal(usage.Detail{
+		InputTokens:         1,
+		ReasoningTokens:     5,
+		CachedTokens:        100,
+		CacheCreationTokens: 80,
+	})
+	if detail.TotalTokens != 105 {
+		t.Fatalf("total tokens = %d, want max input subtype 100 plus reasoning 5", detail.TotalTokens)
+	}
+}
+
+func TestUsageReporterMergesPartialGeminiReasoningUsage(t *testing.T) {
+	reporter := NewUsageReporter(context.Background(), "gemini", "gemini-test", nil)
+	reporter.Observe(usage.Detail{InputTokens: 2, OutputTokens: 8, ReasoningTokens: 5, TotalTokens: 10})
+	reporter.Observe(usage.Detail{InputTokens: 2, OutputTokens: 4, TotalTokens: 11})
+	if reporter.observedDetail.OutputTokens != 9 || reporter.observedDetail.ReasoningTokens != 5 || reporter.observedDetail.TotalTokens != 11 {
+		t.Fatalf("merged Gemini usage = %+v, want output=9 reasoning=5 total=11", reporter.observedDetail)
+	}
+}
+
+func TestUsageReporterMergesReasoningOnlyGeminiUsage(t *testing.T) {
+	reporter := NewUsageReporter(context.Background(), "gemini", "gemini-test", nil)
+	reporter.Observe(usage.Detail{InputTokens: 2, OutputTokens: 3, TotalTokens: 5})
+	reporter.Observe(usage.Detail{InputTokens: 2, OutputTokens: 5, ReasoningTokens: 5, TotalTokens: 10})
+	if reporter.observedDetail.OutputTokens != 8 || reporter.observedDetail.ReasoningTokens != 5 || reporter.observedDetail.TotalTokens != 10 {
+		t.Fatalf("merged Gemini usage = %+v, want output=8 reasoning=5 total=10", reporter.observedDetail)
 	}
 }
 
