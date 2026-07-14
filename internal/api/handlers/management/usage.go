@@ -1,7 +1,9 @@
 package management
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"sort"
 	"strconv"
@@ -10,6 +12,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/usage"
+	coreusage "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/usage"
 )
 
 type usageExportPayload struct {
@@ -36,6 +39,11 @@ type usageAuthInfo struct {
 	Email       string
 }
 
+const (
+	maxUsageHealthFilterValues = 200
+	maxUsageHealthFilterBytes  = 16 * 1024
+)
+
 // GetUsageStatistics returns the in-memory request statistics snapshot.
 func (h *Handler) GetUsageStatistics(c *gin.Context) {
 	var snapshot usage.StatisticsSnapshot
@@ -60,13 +68,26 @@ func (h *Handler) GetUsageMeta(c *gin.Context) {
 	})
 }
 
-// ClearUsageStatistics removes all in-memory request usage statistics.
+// ClearUsageStatistics removes all request usage statistics and persists the empty state.
 func (h *Handler) ClearUsageStatistics(c *gin.Context) {
 	if h == nil || h.usageStats == nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "usage statistics unavailable"})
 		return
 	}
-	previous := h.usageStats.Clear()
+	if err := coreusage.DefaultManager().Barrier(c.Request.Context()); err != nil {
+		status, message := usageBarrierErrorResponse(err)
+		c.JSON(status, gin.H{"error": message})
+		return
+	}
+	path := h.usageStatisticsFilePath()
+	previous, err := usage.ClearAndPersistRequestStatistics(path, h.usageStats)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"cleared": true,
+			"error":   "failed to persist cleared usage statistics",
+		})
+		return
+	}
 	meta := h.usageStats.Meta()
 	c.JSON(http.StatusOK, gin.H{
 		"cleared":                true,
@@ -82,6 +103,13 @@ func (h *Handler) ClearUsageStatistics(c *gin.Context) {
 		"failed_requests_before": previous.FailureCount,
 		"failed_requests_after":  meta.FailureCount,
 	})
+}
+
+func usageBarrierErrorResponse(err error) (int, string) {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return http.StatusRequestTimeout, "usage statistics clear canceled"
+	}
+	return http.StatusServiceUnavailable, "usage statistics queue unavailable"
 }
 
 // GetUsageSummary returns aggregated usage statistics without request details.
@@ -187,6 +215,68 @@ func (h *Handler) GetUsageSeries(c *gin.Context) {
 			Bucket:  query.Bucket,
 			GroupBy: query.GroupBy,
 			Items:   []usage.SeriesEntry{},
+		}
+	}
+	c.JSON(http.StatusOK, result)
+}
+
+// GetUsageHealth returns continuous service-health buckets without request details.
+func (h *Handler) GetUsageHealth(c *gin.Context) {
+	query, ok := parseUsageHealthQuery(c)
+	if !ok {
+		return
+	}
+	var result usage.HealthResult
+	if h != nil && h.usageStats != nil {
+		result = h.usageStats.Health(query)
+	} else {
+		result = usage.HealthResult{
+			AsOf:    time.Now().UTC(),
+			From:    query.TimeRange.From,
+			To:      query.TimeRange.To,
+			Bucket:  query.Bucket,
+			GroupBy: query.GroupBy,
+			Items:   []usage.HealthEntry{},
+		}
+	}
+	c.JSON(http.StatusOK, result)
+}
+
+// GetUsageRates returns trailing RPM/TPM values and a minute sparkline.
+func (h *Handler) GetUsageRates(c *gin.Context) {
+	query, ok := parseUsageRatesQuery(c)
+	if !ok {
+		return
+	}
+	var result usage.RatesResult
+	if h != nil && h.usageStats != nil {
+		result = h.usageStats.Rates(query)
+	} else {
+		result = usage.RatesResult{
+			AsOf:             time.Now().UTC(),
+			WindowMinutes:    query.WindowMinutes,
+			SparklineMinutes: query.SparklineMinutes,
+			Items:            []usage.RateEntry{},
+		}
+	}
+	c.JSON(http.StatusOK, result)
+}
+
+// GetUsageTokens returns token breakdowns grouped into time buckets.
+func (h *Handler) GetUsageTokens(c *gin.Context) {
+	query, ok := parseUsageTokenQuery(c)
+	if !ok {
+		return
+	}
+	var result usage.TokenResult
+	if h != nil && h.usageStats != nil {
+		result = h.usageStats.TokensForQuery(query)
+	} else {
+		result = usage.TokenResult{
+			AsOf:    time.Now().UTC(),
+			Bucket:  query.Bucket,
+			GroupBy: query.GroupBy,
+			Items:   []usage.TokenEntry{},
 		}
 	}
 	c.JSON(http.StatusOK, result)
@@ -432,6 +522,177 @@ func parseUsageSeriesQuery(c *gin.Context) (usage.SeriesQuery, bool) {
 	}, true
 }
 
+func parseUsageHealthQuery(c *gin.Context) (usage.HealthQuery, bool) {
+	timeRange, ok := parseUsageTimeRange(c)
+	if !ok {
+		return usage.HealthQuery{}, false
+	}
+	bucket := strings.TrimSpace(c.Query("bucket"))
+	if bucket == "" {
+		bucket = usage.Bucket15Min
+	}
+	if bucket != usage.Bucket15Min && bucket != usage.BucketHour && bucket != usage.BucketDay {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid bucket"})
+		return usage.HealthQuery{}, false
+	}
+	groupBy := strings.TrimSpace(c.Query("group_by"))
+	if groupBy == "" {
+		groupBy = usage.GroupByNone
+	}
+	if groupBy != usage.GroupByNone && groupBy != usage.GroupByAuthIndex && groupBy != usage.GroupBySource {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid group_by"})
+		return usage.HealthQuery{}, false
+	}
+	authIndexes, ok := parseUsageCSVList(c, "auth_index")
+	if !ok {
+		return usage.HealthQuery{}, false
+	}
+	sources, ok := parseUsageCSVList(c, "source")
+	if !ok {
+		return usage.HealthQuery{}, false
+	}
+	explicitGroups := 0
+	if groupBy == usage.GroupByAuthIndex {
+		explicitGroups = len(authIndexes)
+	} else if groupBy == usage.GroupBySource {
+		explicitGroups = len(sources)
+	}
+	if explicitGroups > 0 && usageHealthBucketCount(timeRange, bucket, time.Now().UTC())*explicitGroups > usage.MaxUsageAnalyticsItems {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "too many health groups for time range"})
+		return usage.HealthQuery{}, false
+	}
+	return usage.HealthQuery{
+		TimeRange:   timeRange,
+		Bucket:      bucket,
+		GroupBy:     groupBy,
+		AuthIndexes: authIndexes,
+		Sources:     sources,
+	}, true
+}
+
+func parseUsageRatesQuery(c *gin.Context) (usage.RatesQuery, bool) {
+	windowMinutes, ok := parseUsagePositiveMinutes(c, "window_minutes", usage.DefaultRatesWindowMinutes)
+	if !ok {
+		return usage.RatesQuery{}, false
+	}
+	sparklineMinutes, ok := parseUsagePositiveMinutes(c, "sparkline_minutes", usage.DefaultSparklineMinutes)
+	if !ok {
+		return usage.RatesQuery{}, false
+	}
+	return usage.RatesQuery{
+		WindowMinutes:    windowMinutes,
+		SparklineMinutes: sparklineMinutes,
+	}, true
+}
+
+func parseUsageTokenQuery(c *gin.Context) (usage.TokenQuery, bool) {
+	timeRange, ok := parseUsageTimeRange(c)
+	if !ok {
+		return usage.TokenQuery{}, false
+	}
+	if timeRange.IsZero() {
+		now := time.Now().UTC()
+		timeRange = usage.TimeRange{From: now.Add(-usage.DefaultTokenRange), To: now}
+	}
+	bucket := strings.TrimSpace(c.Query("bucket"))
+	if bucket == "" {
+		bucket = usage.BucketDay
+	}
+	if bucket != usage.BucketHour && bucket != usage.BucketDay {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid bucket"})
+		return usage.TokenQuery{}, false
+	}
+	groupBy := strings.TrimSpace(c.Query("group_by"))
+	if groupBy == "" {
+		groupBy = usage.GroupByNone
+	}
+	if groupBy != usage.GroupByNone && groupBy != usage.GroupByModel && groupBy != usage.GroupByAPI {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid group_by"})
+		return usage.TokenQuery{}, false
+	}
+	return usage.TokenQuery{TimeRange: timeRange, Bucket: bucket, GroupBy: groupBy}, true
+}
+
+func parseUsagePositiveMinutes(c *gin.Context, name string, fallback int) (int, bool) {
+	raw := strings.TrimSpace(c.Query(name))
+	if raw == "" {
+		return fallback, true
+	}
+	value, err := strconv.Atoi(raw)
+	if err != nil || value <= 0 || value > usage.MaxUsageAnalyticsMinutes {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid " + name})
+		return 0, false
+	}
+	return value, true
+}
+
+func parseUsageCSVList(c *gin.Context, name string) ([]string, bool) {
+	raw := c.Query(name)
+	if len(raw) > maxUsageHealthFilterBytes {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid " + name})
+		return nil, false
+	}
+	seen := map[string]struct{}{}
+	values := make([]string, 0)
+	for _, value := range strings.Split(raw, ",") {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		values = append(values, value)
+		if len(values) > maxUsageHealthFilterValues {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid " + name})
+			return nil, false
+		}
+	}
+	return values, true
+}
+
+func usageHealthBucketCount(timeRange usage.TimeRange, bucket string, now time.Time) int {
+	step := 15 * time.Minute
+	if bucket == usage.BucketHour {
+		step = time.Hour
+	} else if bucket == usage.BucketDay {
+		step = 24 * time.Hour
+	}
+	if timeRange.IsZero() {
+		end := truncateUsageManagementTime(now, step).Add(step)
+		timeRange = usage.TimeRange{From: end.Add(-usage.DefaultHealthRange), To: end}
+	} else {
+		if timeRange.To.IsZero() {
+			timeRange.To = now
+		}
+		if timeRange.From.IsZero() {
+			timeRange.From = timeRange.To.Add(-usage.DefaultHealthRange)
+		}
+	}
+	first := truncateUsageManagementTime(timeRange.From, step)
+	if !first.Before(timeRange.To) {
+		return 0
+	}
+	span := timeRange.To.Sub(first)
+	buckets := int(span / step)
+	if span%step != 0 {
+		buckets++
+	}
+	if buckets > usage.MaxUsageAnalyticsBuckets {
+		return usage.MaxUsageAnalyticsBuckets
+	}
+	return buckets
+}
+
+func truncateUsageManagementTime(value time.Time, step time.Duration) time.Time {
+	value = value.UTC()
+	if step == 24*time.Hour {
+		return time.Date(value.Year(), value.Month(), value.Day(), 0, 0, 0, 0, time.UTC)
+	}
+	return value.Truncate(step)
+}
+
 func isUsageSortBy(sortBy string) bool {
 	switch sortBy {
 	case usage.SortByCreatedAt, usage.SortByTokens, usage.SortByModel, usage.SortByAPI, usage.SortByAuthIndex:
@@ -507,6 +768,8 @@ func buildUsageAuthResponse(summary usage.AuthUsageSnapshot, info usageAuthInfo,
 		"failure_count":  summary.FailureCount,
 		"total_tokens":   summary.TotalTokens,
 		"tokens":         summary.Tokens,
+		"last_used_at":   summary.LastUsedAt,
+		"model_count":    summary.ModelCount,
 	}
 	if stale {
 		item["stale"] = true

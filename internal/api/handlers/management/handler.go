@@ -131,6 +131,19 @@ func (h *Handler) SetAuthManager(manager *coreauth.Manager) {
 // SetUsageStatistics allows replacing the usage statistics reference.
 func (h *Handler) SetUsageStatistics(stats *usage.RequestStatistics) { h.usageStats = stats }
 
+func (h *Handler) usageStatisticsFilePath() string {
+	if h == nil {
+		return usage.StatisticsFilePath(nil)
+	}
+	h.mu.Lock()
+	authDir := ""
+	if h.cfg != nil {
+		authDir = h.cfg.AuthDir
+	}
+	h.mu.Unlock()
+	return usage.StatisticsFilePath(&config.Config{AuthDir: authDir})
+}
+
 // SetLocalPassword configures the runtime-local password accepted for localhost requests.
 func (h *Handler) SetLocalPassword(password string) { h.localPassword = password }
 

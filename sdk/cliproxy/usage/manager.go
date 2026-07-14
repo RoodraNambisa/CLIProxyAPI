@@ -2,6 +2,7 @@ package usage
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"sync"
 	"time"
@@ -72,9 +73,13 @@ type Plugin interface {
 }
 
 type queueItem struct {
-	ctx    context.Context
-	record Record
+	ctx     context.Context
+	record  Record
+	barrier chan struct{}
 }
+
+// ErrManagerClosed is returned when work cannot be queued after shutdown.
+var ErrManagerClosed = errors.New("usage: manager is closed")
 
 // Manager maintains a queue of usage records and delivers them to registered plugins.
 type Manager struct {
@@ -107,8 +112,15 @@ func (m *Manager) Start(ctx context.Context) {
 		if ctx == nil {
 			ctx = context.Background()
 		}
-		var workerCtx context.Context
-		workerCtx, m.cancel = context.WithCancel(ctx)
+		workerCtx, cancel := context.WithCancel(ctx)
+		m.mu.Lock()
+		if m.closed {
+			m.mu.Unlock()
+			cancel()
+			return
+		}
+		m.cancel = cancel
+		m.mu.Unlock()
 		go m.run(workerCtx)
 	})
 }
@@ -119,12 +131,13 @@ func (m *Manager) Stop() {
 		return
 	}
 	m.stopOnce.Do(func() {
-		if m.cancel != nil {
-			m.cancel()
-		}
 		m.mu.Lock()
 		m.closed = true
+		cancel := m.cancel
 		m.mu.Unlock()
+		if cancel != nil {
+			cancel()
+		}
 		m.cond.Broadcast()
 	})
 }
@@ -157,6 +170,34 @@ func (m *Manager) Publish(ctx context.Context, record Record) {
 	m.cond.Signal()
 }
 
+// Barrier waits until every item queued before it has been delivered.
+func (m *Manager) Barrier(ctx context.Context) error {
+	if m == nil {
+		return ErrManagerClosed
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	m.Start(context.Background())
+
+	done := make(chan struct{})
+	m.mu.Lock()
+	if m.closed {
+		m.mu.Unlock()
+		return ErrManagerClosed
+	}
+	m.queue = append(m.queue, queueItem{barrier: done})
+	m.mu.Unlock()
+	m.cond.Signal()
+
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
 func (m *Manager) run(ctx context.Context) {
 	for {
 		m.mu.Lock()
@@ -170,6 +211,10 @@ func (m *Manager) run(ctx context.Context) {
 		item := m.queue[0]
 		m.queue = m.queue[1:]
 		m.mu.Unlock()
+		if item.barrier != nil {
+			close(item.barrier)
+			continue
+		}
 		m.dispatch(item)
 	}
 }

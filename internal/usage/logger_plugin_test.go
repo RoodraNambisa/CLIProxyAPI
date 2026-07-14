@@ -836,6 +836,9 @@ func TestRequestStatisticsSeriesBucketsAndGroups(t *testing.T) {
 	if minuteFailed.Items[1].Group != "failed" || minuteFailed.Items[1].FailureCount != 1 {
 		t.Fatalf("second minute item = %+v, want failed aggregate", minuteFailed.Items[1])
 	}
+	if minuteFailed.Items[1].TotalTokens != 20 || minuteFailed.Items[1].Tokens.TotalTokens != 20 {
+		t.Fatalf("failed token aggregate = %+v, want 20 tokens", minuteFailed.Items[1])
+	}
 
 	dailyAuth := stats.Series(SeriesQuery{
 		TimeRange: TimeRange{From: base.Add(-time.Minute), To: base.Add(time.Hour)},
@@ -847,6 +850,24 @@ func TestRequestStatisticsSeriesBucketsAndGroups(t *testing.T) {
 	}
 	if dailyAuth.Items[0].Bucket.Hour() != 0 || dailyAuth.Items[0].Bucket.Location() != time.UTC {
 		t.Fatalf("daily bucket = %s, want UTC midnight", dailyAuth.Items[0].Bucket)
+	}
+}
+
+func TestRequestStatisticsSeriesGroupsMissingAuthAsUnknown(t *testing.T) {
+	stats := NewRequestStatistics()
+	base := time.Now().UTC().Truncate(time.Hour).Add(-time.Hour)
+	stats.Record(context.Background(), coreusage.Record{
+		APIKey:      "api-a",
+		Model:       "model-a",
+		RequestedAt: base.Add(time.Minute),
+	})
+	result := stats.Series(SeriesQuery{
+		TimeRange: TimeRange{From: base, To: base.Add(time.Hour)},
+		Bucket:    BucketHour,
+		GroupBy:   GroupByAuthIndex,
+	})
+	if len(result.Items) != 1 || result.Items[0].Group != "unknown" || result.Items[0].TotalRequests != 1 {
+		t.Fatalf("auth series = %+v, want unknown group", result.Items)
 	}
 }
 
@@ -898,5 +919,188 @@ func TestPersistAndRestoreRequestStatistics(t *testing.T) {
 	detail := snapshot.APIs["test-key"].Models["gpt-5.4"].Details[0]
 	if detail.Tokens.CacheCreationTokens != 7 || detail.RequestServiceTier != "priority" || detail.ResponseServiceTier != "flex" {
 		t.Fatalf("restored detail lost new usage fields: %+v", detail)
+	}
+}
+
+func TestClearAndPersistRequestStatistics(t *testing.T) {
+	path := filepath.Join(t.TempDir(), StatisticsFileName)
+	stats := NewRequestStatistics()
+	stats.Record(context.Background(), coreusage.Record{
+		APIKey:      "test-key",
+		Model:       "gpt-5.4",
+		RequestedAt: time.Date(2026, 3, 20, 12, 0, 0, 0, time.UTC),
+		Detail:      coreusage.Detail{TotalTokens: 30},
+		AuthIndex:   "auth-a",
+	})
+	if _, err := PersistRequestStatistics(path, stats); err != nil {
+		t.Fatalf("PersistRequestStatistics() error = %v", err)
+	}
+
+	previous, err := ClearAndPersistRequestStatistics(path, stats)
+	if err != nil {
+		t.Fatalf("ClearAndPersistRequestStatistics() error = %v", err)
+	}
+	if previous.TotalRequests != 1 || previous.TotalTokens != 30 {
+		t.Fatalf("previous snapshot = %+v, want one request and 30 tokens", previous)
+	}
+	if stats.HasPendingPersistence() {
+		t.Fatal("cleared statistics unexpectedly remain pending")
+	}
+
+	persisted, err := LoadSnapshotFile(path)
+	if err != nil {
+		t.Fatalf("LoadSnapshotFile() error = %v", err)
+	}
+	if persisted.TotalRequests != 0 || persisted.TotalTokens != 0 || len(persisted.APIs) != 0 {
+		t.Fatalf("persisted snapshot = %+v, want empty usage", persisted)
+	}
+
+	stats.Record(context.Background(), coreusage.Record{
+		APIKey:      "test-key",
+		Model:       "gpt-5.4",
+		RequestedAt: time.Date(2026, 3, 20, 12, 1, 0, 0, time.UTC),
+	})
+	if !stats.HasPendingPersistence() {
+		t.Fatal("request recorded after clear should remain pending")
+	}
+}
+
+func TestClearAndPersistSerializesWithActivePersistence(t *testing.T) {
+	path := filepath.Join(t.TempDir(), StatisticsFileName)
+	stats := NewRequestStatistics()
+	stats.Record(context.Background(), coreusage.Record{
+		APIKey: "test-key",
+		Model:  "gpt-5.4",
+	})
+
+	persistStarted := make(chan struct{})
+	releasePersist := make(chan struct{})
+	persistDone := make(chan error, 1)
+	go func() {
+		_, err := persistRequestStatisticsWithSave(path, stats, func(path string, snapshot StatisticsSnapshot) error {
+			close(persistStarted)
+			<-releasePersist
+			return SaveSnapshotFile(path, snapshot)
+		})
+		persistDone <- err
+	}()
+	<-persistStarted
+
+	clearBeforeLock := make(chan struct{})
+	clearLockAcquired := make(chan struct{})
+	clearSaveStarted := make(chan struct{})
+	clearDone := make(chan error, 1)
+	go func() {
+		_, err := clearAndPersistRequestStatisticsWithHooks(
+			path,
+			stats,
+			func(path string, snapshot StatisticsSnapshot) error {
+				close(clearSaveStarted)
+				return SaveSnapshotFile(path, snapshot)
+			},
+			func() { clearBeforeLock <- struct{}{} },
+			func() { close(clearLockAcquired) },
+		)
+		clearDone <- err
+	}()
+	<-clearBeforeLock
+	select {
+	case <-clearLockAcquired:
+		t.Fatal("clear acquired persistence lock while prior persistence was active")
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(releasePersist)
+	if err := <-persistDone; err != nil {
+		t.Fatalf("persistRequestStatisticsWithSave() error = %v", err)
+	}
+	select {
+	case <-clearLockAcquired:
+	case <-time.After(time.Second):
+		t.Fatal("clear did not acquire lock after prior persistence completed")
+	}
+	select {
+	case <-clearSaveStarted:
+	case <-time.After(time.Second):
+		t.Fatal("clear save did not start after acquiring persistence lock")
+	}
+	if err := <-clearDone; err != nil {
+		t.Fatalf("ClearAndPersistRequestStatistics() error = %v", err)
+	}
+
+	persisted, err := LoadSnapshotFile(path)
+	if err != nil {
+		t.Fatalf("LoadSnapshotFile() error = %v", err)
+	}
+	if persisted.TotalRequests != 0 || len(persisted.APIs) != 0 {
+		t.Fatalf("persisted snapshot = %+v, want clear to win", persisted)
+	}
+}
+
+func TestMergePersistedSnapshotDoesNotHideExistingPendingChanges(t *testing.T) {
+	stats := NewRequestStatistics()
+	stats.Record(context.Background(), coreusage.Record{
+		APIKey: "live-key",
+		Model:  "gpt-5.4",
+	})
+	snapshot := StatisticsSnapshot{
+		APIs: map[string]APISnapshot{
+			"restored-key": {
+				Models: map[string]ModelSnapshot{
+					"gpt-5.4": {
+						Details: []RequestDetail{{Timestamp: time.Now().UTC()}},
+					},
+				},
+			},
+		},
+	}
+	if result := stats.mergePersistedSnapshot(snapshot); result.Added != 1 {
+		t.Fatalf("merge result = %+v, want added=1", result)
+	}
+	if !stats.HasPendingPersistence() {
+		t.Fatal("pre-existing live record was incorrectly marked persisted")
+	}
+}
+
+func TestClearAndPersistKeepsConcurrentRecordPending(t *testing.T) {
+	path := filepath.Join(t.TempDir(), StatisticsFileName)
+	stats := NewRequestStatistics()
+	stats.Record(context.Background(), coreusage.Record{
+		APIKey: "old-key",
+		Model:  "gpt-5.4",
+	})
+
+	saveStarted := make(chan struct{})
+	releaseSave := make(chan struct{})
+	clearDone := make(chan error, 1)
+	go func() {
+		_, err := clearAndPersistRequestStatisticsWithSave(path, stats, func(path string, snapshot StatisticsSnapshot) error {
+			close(saveStarted)
+			<-releaseSave
+			return SaveSnapshotFile(path, snapshot)
+		})
+		clearDone <- err
+	}()
+	<-saveStarted
+
+	stats.Record(context.Background(), coreusage.Record{
+		APIKey: "new-key",
+		Model:  "gpt-5.4",
+	})
+	close(releaseSave)
+	if err := <-clearDone; err != nil {
+		t.Fatalf("clearAndPersistRequestStatisticsWithSave() error = %v", err)
+	}
+	if !stats.HasPendingPersistence() {
+		t.Fatal("record written during clear persistence should remain pending")
+	}
+	if snapshot := stats.Snapshot(); snapshot.TotalRequests != 1 {
+		t.Fatalf("in-memory snapshot = %+v, want only concurrent record", snapshot)
+	}
+	persisted, err := LoadSnapshotFile(path)
+	if err != nil {
+		t.Fatalf("LoadSnapshotFile() error = %v", err)
+	}
+	if persisted.TotalRequests != 0 {
+		t.Fatalf("persisted snapshot = %+v, want empty clear state", persisted)
 	}
 }

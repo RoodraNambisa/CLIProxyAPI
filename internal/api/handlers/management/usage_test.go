@@ -5,7 +5,11 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -36,6 +40,9 @@ func TestUsageMetaAndSummaryHandlers(t *testing.T) {
 	if metaBody.Usage.Version == 0 || metaBody.Usage.TotalRequests != 1 || metaBody.Usage.TotalTokens != 30 {
 		t.Fatalf("meta usage = %+v, want version and totals", metaBody.Usage)
 	}
+	if !metaBody.Usage.Available || metaBody.Usage.AsOf.IsZero() || metaBody.Usage.OldestAt == nil || metaBody.Usage.NewestAt == nil {
+		t.Fatalf("meta availability = %+v, want timestamps and available=true", metaBody.Usage)
+	}
 	if metaBody.FailedRequests != 0 {
 		t.Fatalf("failed_requests = %d, want 0", metaBody.FailedRequests)
 	}
@@ -50,8 +57,143 @@ func TestUsageMetaAndSummaryHandlers(t *testing.T) {
 	}
 	decodeUsageResponse(t, recorder, &summaryBody)
 	model := summaryBody.Usage.APIs["test-key"].Models["gpt-5.4"]
-	if model.TotalRequests != 1 || model.TotalTokens != 30 {
+	if model.TotalRequests != 1 || model.SuccessCount != 1 || model.FailureCount != 0 || model.TotalTokens != 30 || model.Tokens.TotalTokens != 30 {
 		t.Fatalf("model summary = %+v, want requests=1 tokens=30", model)
+	}
+	if summaryBody.Usage.Models["gpt-5.4"].TotalRequests != 1 {
+		t.Fatalf("global model summary = %+v", summaryBody.Usage.Models)
+	}
+}
+
+func TestUsageHealthRatesAndTokensHandlers(t *testing.T) {
+	handler, stats, _ := newUsageHandlerForTest(t)
+	base := time.Now().UTC().Truncate(time.Hour).Add(-time.Hour)
+	stats.Record(context.Background(), coreusage.Record{
+		APIKey:      "api-a",
+		Model:       "model-a",
+		AuthIndex:   "auth-a",
+		Source:      "source-a",
+		RequestedAt: base.Add(time.Minute),
+		Detail: coreusage.Detail{
+			InputTokens:         10,
+			OutputTokens:        5,
+			ReasoningTokens:     2,
+			CachedTokens:        3,
+			CacheCreationTokens: 4,
+			TotalTokens:         24,
+		},
+	})
+	stats.Record(context.Background(), coreusage.Record{
+		APIKey:      "api-rates",
+		Model:       "model-rates",
+		AuthIndex:   "auth-rates",
+		Source:      "source-rates",
+		RequestedAt: time.Now().UTC().Add(-time.Minute),
+		Detail:      coreusage.Detail{InputTokens: 60, TotalTokens: 60},
+	})
+
+	from := base.Format(time.RFC3339)
+	to := base.Add(time.Hour).Format(time.RFC3339)
+	ctx, recorder := newUsageRequestContext("/v0/management/usage/health?from=" + from + "&to=" + to + "&bucket=15m&group_by=none")
+	handler.GetUsageHealth(ctx)
+	var health usage.HealthResult
+	decodeUsageResponse(t, recorder, &health)
+	if len(health.Items) != 4 || health.Items[0].State != usage.HealthStateHealthy || health.Items[1].State != usage.HealthStateNoData {
+		t.Fatalf("health response = %+v", health)
+	}
+
+	ctx, recorder = newUsageRequestContext("/v0/management/usage/rates?window_minutes=30&sparkline_minutes=60")
+	handler.GetUsageRates(ctx)
+	var rates usage.RatesResult
+	decodeUsageResponse(t, recorder, &rates)
+	if rates.WindowMinutes != 30 || rates.SparklineMinutes != 60 || len(rates.Items) != 60 || rates.RequestCount < 1 || rates.TokenCount < 60 || rates.RPM <= 0 || rates.TPM <= 0 {
+		t.Fatalf("rates response = %+v", rates)
+	}
+
+	ctx, recorder = newUsageRequestContext("/v0/management/usage/tokens?from=" + from + "&to=" + to + "&bucket=hour&group_by=model")
+	handler.GetUsageTokens(ctx)
+	var tokens usage.TokenResult
+	decodeUsageResponse(t, recorder, &tokens)
+	if len(tokens.Items) != 1 || tokens.TotalTokens != 24 || tokens.Items[0].Group != "model-a" || tokens.Items[0].Tokens.CacheCreationTokens != 4 {
+		t.Fatalf("tokens response = %+v", tokens)
+	}
+
+	ctx, recorder = newUsageRequestContext("/v0/management/usage/health?from=" + from + "&to=" + to + "&bucket=15m&group_by=auth_index&auth_index=auth-a,missing")
+	handler.GetUsageHealth(ctx)
+	decodeUsageResponse(t, recorder, &health)
+	if len(health.Items) != 8 || health.Items[0].Group != "auth-a" || health.Items[1].Group != "missing" {
+		t.Fatalf("grouped health response = %+v", health)
+	}
+
+	ctx, recorder = newUsageRequestContext("/v0/management/usage/health?from=" + from + "&to=" + to + "&bucket=15m&group_by=source&source=source-a,missing")
+	handler.GetUsageHealth(ctx)
+	decodeUsageResponse(t, recorder, &health)
+	if len(health.Items) != 8 || health.Items[0].Group != "missing" || health.Items[1].Group != "source-a" {
+		t.Fatalf("source health response = %+v", health)
+	}
+}
+
+func TestUsageAnalyticsHandlersRejectInvalidParameters(t *testing.T) {
+	handler, _, _ := newUsageHandlerForTest(t)
+	tests := []struct {
+		target string
+		call   func(*gin.Context)
+	}{
+		{target: "/v0/management/usage/health?bucket=minute", call: handler.GetUsageHealth},
+		{target: "/v0/management/usage/health?group_by=model", call: handler.GetUsageHealth},
+		{target: "/v0/management/usage/rates?window_minutes=0", call: handler.GetUsageRates},
+		{target: "/v0/management/usage/rates?sparkline_minutes=1441", call: handler.GetUsageRates},
+		{target: "/v0/management/usage/tokens?bucket=minute", call: handler.GetUsageTokens},
+		{target: "/v0/management/usage/tokens?group_by=source", call: handler.GetUsageTokens},
+	}
+	for _, test := range tests {
+		t.Run(test.target, func(t *testing.T) {
+			ctx, recorder := newUsageRequestContext(test.target)
+			test.call(ctx)
+			if recorder.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400: %s", recorder.Code, recorder.Body.String())
+			}
+		})
+	}
+}
+
+func TestUsageHealthRejectsOversizedFilterLists(t *testing.T) {
+	handler, _, _ := newUsageHandlerForTest(t)
+	values := make([]string, maxUsageHealthFilterValues+1)
+	for index := range values {
+		values[index] = "auth-" + strconv.Itoa(index)
+	}
+	ctx, recorder := newUsageRequestContext("/v0/management/usage/health?auth_index=" + strings.Join(values, ","))
+	handler.GetUsageHealth(ctx)
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("oversized auth filter status = %d, want 400: %s", recorder.Code, recorder.Body.String())
+	}
+
+	ctx, recorder = newUsageRequestContext("/v0/management/usage/health?source=" + strings.Repeat("x", maxUsageHealthFilterBytes+1))
+	handler.GetUsageHealth(ctx)
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("oversized source filter status = %d, want 400: %s", recorder.Code, recorder.Body.String())
+	}
+
+	values = values[:15]
+	ctx, recorder = newUsageRequestContext("/v0/management/usage/health?group_by=auth_index&auth_index=" + strings.Join(values, ","))
+	handler.GetUsageHealth(ctx)
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("oversized health matrix status = %d, want 400: %s", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestUsageTokenQueryDefaultsToRecentThirtyDays(t *testing.T) {
+	ctx, recorder := newUsageRequestContext("/v0/management/usage/tokens")
+	query, ok := parseUsageTokenQuery(ctx)
+	if !ok {
+		t.Fatalf("default token query rejected: %s", recorder.Body.String())
+	}
+	if query.TimeRange.From.IsZero() || query.TimeRange.To.IsZero() {
+		t.Fatalf("default token range = %+v", query.TimeRange)
+	}
+	if got := query.TimeRange.To.Sub(query.TimeRange.From); got != usage.DefaultTokenRange {
+		t.Fatalf("default token range = %s, want %s", got, usage.DefaultTokenRange)
 	}
 }
 
@@ -94,6 +236,8 @@ func TestUsageDetailsHandlerFiltersAndPaginates(t *testing.T) {
 
 func TestClearUsageStatisticsHandler(t *testing.T) {
 	handler, stats, _ := newUsageHandlerForTest(t)
+	logDir := t.TempDir()
+	t.Setenv("WRITABLE_PATH", logDir)
 	stats.Record(context.Background(), coreusage.Record{
 		APIKey:      "test-key",
 		Model:       "gpt-5.4",
@@ -130,6 +274,169 @@ func TestClearUsageStatisticsHandler(t *testing.T) {
 	if meta.TotalRequests != 0 || meta.SuccessCount != 0 || meta.FailureCount != 0 || meta.TotalTokens != 0 {
 		t.Fatalf("meta after clear = %+v, want zero", meta)
 	}
+	persisted, err := usage.LoadSnapshotFile(handler.usageStatisticsFilePath())
+	if err != nil {
+		t.Fatalf("LoadSnapshotFile() error = %v", err)
+	}
+	if persisted.TotalRequests != 0 || persisted.SuccessCount != 0 || persisted.FailureCount != 0 || persisted.TotalTokens != 0 {
+		t.Fatalf("persisted usage after clear = %+v, want zero", persisted)
+	}
+}
+
+func TestClearUsageStatisticsWaitsForQueuedRecords(t *testing.T) {
+	stats := usage.GetRequestStatistics()
+	if err := coreusage.DefaultManager().Barrier(context.Background()); err != nil {
+		t.Fatalf("initial Barrier() error = %v", err)
+	}
+	stats.Clear()
+	t.Cleanup(func() {
+		_ = coreusage.DefaultManager().Barrier(context.Background())
+		stats.Clear()
+	})
+
+	blocker := &blockingUsagePlugin{
+		entered: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	coreusage.RegisterPlugin(blocker)
+	coreusage.PublishRecord(context.Background(), coreusage.Record{APIKey: "first", Model: "model-a"})
+	select {
+	case <-blocker.entered:
+	case <-time.After(time.Second):
+		t.Fatal("blocking usage plugin was not entered")
+	}
+	coreusage.PublishRecord(context.Background(), coreusage.Record{APIKey: "second", Model: "model-a"})
+
+	handler, _, _ := newUsageHandlerForTest(t)
+	handler.SetUsageStatistics(stats)
+	t.Setenv("WRITABLE_PATH", t.TempDir())
+	ctx, recorder := newUsageRequestContext("/v0/management/usage")
+	done := make(chan struct{})
+	go func() {
+		handler.ClearUsageStatistics(ctx)
+		close(done)
+	}()
+	select {
+	case <-done:
+		t.Fatal("clear completed before queued usage was released")
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(blocker.release)
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("clear did not complete after queued usage was released")
+	}
+
+	var body struct {
+		TotalRequestsBefore int64 `json:"total_requests_before"`
+		TotalRequestsAfter  int64 `json:"total_requests_after"`
+	}
+	decodeUsageResponse(t, recorder, &body)
+	if body.TotalRequestsBefore != 2 || body.TotalRequestsAfter != 0 {
+		t.Fatalf("clear response = %+v, want both queued records cleared", body)
+	}
+	if err := coreusage.DefaultManager().Barrier(context.Background()); err != nil {
+		t.Fatalf("final Barrier() error = %v", err)
+	}
+	if got := stats.Meta().TotalRequests; got != 0 {
+		t.Fatalf("usage revived after clear: total_requests=%d", got)
+	}
+}
+
+func TestClearUsageStatisticsCanceledBarrierPreservesData(t *testing.T) {
+	handler, stats, _ := newUsageHandlerForTest(t)
+	stats.Record(context.Background(), coreusage.Record{APIKey: "test-key", Model: "model-a"})
+	ctx, recorder := newUsageRequestContext("/v0/management/usage")
+	requestContext, cancel := context.WithCancel(ctx.Request.Context())
+	cancel()
+	ctx.Request = ctx.Request.WithContext(requestContext)
+
+	handler.ClearUsageStatistics(ctx)
+	if recorder.Code != http.StatusRequestTimeout {
+		t.Fatalf("status = %d, want 408: %s", recorder.Code, recorder.Body.String())
+	}
+	if got := stats.Meta().TotalRequests; got != 1 {
+		t.Fatalf("canceled clear changed usage: total_requests=%d", got)
+	}
+}
+
+type blockingUsagePlugin struct {
+	once    sync.Once
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (p *blockingUsagePlugin) HandleUsage(context.Context, coreusage.Record) {
+	p.once.Do(func() {
+		close(p.entered)
+		<-p.release
+	})
+}
+
+func TestClearUsageStatisticsHandlerReportsPersistenceFailure(t *testing.T) {
+	handler, stats, _ := newUsageHandlerForTest(t)
+	blockedPath := filepath.Join(t.TempDir(), "not-a-directory")
+	if err := os.WriteFile(blockedPath, []byte("blocked"), 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+	t.Setenv("WRITABLE_PATH", blockedPath)
+	stats.Record(context.Background(), coreusage.Record{
+		APIKey:      "test-key",
+		Model:       "gpt-5.4",
+		RequestedAt: time.Date(2026, 3, 20, 12, 0, 0, 0, time.UTC),
+	})
+
+	ctx, recorder := newUsageRequestContext("/v0/management/usage")
+	handler.ClearUsageStatistics(ctx)
+	if recorder.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want %d: %s", recorder.Code, http.StatusInternalServerError, recorder.Body.String())
+	}
+	var body struct {
+		Cleared bool   `json:"cleared"`
+		Error   string `json:"error"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
+		t.Fatalf("json.Unmarshal(%s) error = %v", recorder.Body.String(), err)
+	}
+	if !body.Cleared || body.Error == "" {
+		t.Fatalf("response = %+v, want cleared persistence error", body)
+	}
+	if stats.Meta().TotalRequests != 0 {
+		t.Fatalf("usage was not cleared after persistence failure: %+v", stats.Meta())
+	}
+	if !stats.HasPendingPersistence() {
+		t.Fatal("failed clear persistence should remain pending")
+	}
+}
+
+func TestUsageBarrierErrorResponse(t *testing.T) {
+	status, message := usageBarrierErrorResponse(context.Canceled)
+	if status != http.StatusRequestTimeout || message != "usage statistics clear canceled" {
+		t.Fatalf("canceled response = (%d, %q)", status, message)
+	}
+	status, message = usageBarrierErrorResponse(coreusage.ErrManagerClosed)
+	if status != http.StatusServiceUnavailable || message != "usage statistics queue unavailable" {
+		t.Fatalf("closed response = (%d, %q)", status, message)
+	}
+}
+
+func TestUsageStatisticsFilePathUsesHotReloadedAuthDir(t *testing.T) {
+	workDir := t.TempDir()
+	t.Chdir(workDir)
+	if err := os.WriteFile(filepath.Join(workDir, "logs"), []byte("blocked"), 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+	t.Setenv("WRITABLE_PATH", "")
+	t.Setenv("writable_path", "")
+
+	handler, _, _ := newUsageHandlerForTest(t)
+	newAuthDir := t.TempDir()
+	handler.SetConfig(&config.Config{AuthDir: newAuthDir})
+	want := filepath.Join(newAuthDir, "logs", usage.StatisticsFileName)
+	if got := handler.usageStatisticsFilePath(); got != want {
+		t.Fatalf("usageStatisticsFilePath() = %q, want hot-reloaded path %q", got, want)
+	}
 }
 
 func TestUsageAuthSummariesIncludesCurrentZeroUsageAndStale(t *testing.T) {
@@ -161,7 +468,7 @@ func TestUsageAuthSummariesIncludesCurrentZeroUsageAndStale(t *testing.T) {
 	byIndex := usageAuthsByIndexForTest(body.Auths)
 
 	used := byIndex[usedIndex]
-	if used.TotalRequests != 1 || used.TotalTokens != 30 || used.Email != "used@example.com" || used.Stale {
+	if used.TotalRequests != 1 || used.TotalTokens != 30 || used.Email != "used@example.com" || used.Stale || used.LastUsedAt == nil || used.ModelCount != 1 {
 		t.Fatalf("used auth = %+v, want current usage with email", used)
 	}
 	zero := byIndex[zeroIndex]
@@ -416,6 +723,8 @@ type usageAuthSummaryForTest struct {
 	FailureCount  int64            `json:"failure_count"`
 	TotalTokens   int64            `json:"total_tokens"`
 	Tokens        usage.TokenStats `json:"tokens"`
+	LastUsedAt    *time.Time       `json:"last_used_at"`
+	ModelCount    int              `json:"model_count"`
 }
 
 func newUsageHandlerForTest(t *testing.T) (*Handler, *usage.RequestStatistics, *coreauth.Manager) {

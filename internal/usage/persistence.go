@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
@@ -18,6 +19,8 @@ const (
 	StatisticsFileName       = "usage-statistics.snapshot"
 	legacyStatisticsFileName = "usage-statistics.json"
 )
+
+var statisticsPersistenceMu sync.Mutex
 
 // StatisticsFilePayload is the on-disk representation used for automatic
 // persistence.
@@ -102,7 +105,9 @@ func RestoreRequestStatistics(path string, stats *RequestStatistics) (loaded boo
 	if stats == nil {
 		return false, result, nil
 	}
-	_, versionBefore, persistedBefore := stats.SnapshotWithState()
+	statisticsPersistenceMu.Lock()
+	defer statisticsPersistenceMu.Unlock()
+
 	snapshot, errLoad := LoadSnapshotFile(path)
 	if errLoad != nil {
 		if os.IsNotExist(errLoad) {
@@ -117,28 +122,69 @@ func RestoreRequestStatistics(path string, stats *RequestStatistics) (loaded boo
 			return false, result, errLoad
 		}
 	}
-	result = stats.MergeSnapshot(snapshot)
-	if versionBefore == persistedBefore {
-		stats.MarkAllPersisted()
-	}
+	result = stats.mergePersistedSnapshot(snapshot)
 	return true, result, nil
 }
 
 // PersistRequestStatistics writes the current statistics snapshot to disk when
 // there are unpersisted changes.
 func PersistRequestStatistics(path string, stats *RequestStatistics) (bool, error) {
+	return persistRequestStatisticsWithSave(path, stats, SaveSnapshotFile)
+}
+
+func persistRequestStatisticsWithSave(path string, stats *RequestStatistics, save func(string, StatisticsSnapshot) error) (bool, error) {
 	if stats == nil {
 		return false, nil
 	}
+	statisticsPersistenceMu.Lock()
+	defer statisticsPersistenceMu.Unlock()
+
 	snapshot, version, persistedVersion := stats.SnapshotWithState()
 	if version == persistedVersion {
 		return false, nil
 	}
-	if err := SaveSnapshotFile(path, snapshot); err != nil {
+	if err := save(path, snapshot); err != nil {
 		return false, err
 	}
 	stats.MarkPersisted(version)
 	return true, nil
+}
+
+// ClearAndPersistRequestStatistics clears stats and synchronously writes the
+// empty snapshot without allowing an older background snapshot to overwrite it.
+func ClearAndPersistRequestStatistics(path string, stats *RequestStatistics) (StatisticsSnapshot, error) {
+	return clearAndPersistRequestStatisticsWithSave(path, stats, SaveSnapshotFile)
+}
+
+func clearAndPersistRequestStatisticsWithSave(path string, stats *RequestStatistics, save func(string, StatisticsSnapshot) error) (StatisticsSnapshot, error) {
+	return clearAndPersistRequestStatisticsWithHooks(path, stats, save, nil, nil)
+}
+
+func clearAndPersistRequestStatisticsWithHooks(
+	path string,
+	stats *RequestStatistics,
+	save func(string, StatisticsSnapshot) error,
+	beforeLock func(),
+	afterLock func(),
+) (StatisticsSnapshot, error) {
+	if stats == nil {
+		return StatisticsSnapshot{}, nil
+	}
+	if beforeLock != nil {
+		beforeLock()
+	}
+	statisticsPersistenceMu.Lock()
+	defer statisticsPersistenceMu.Unlock()
+	if afterLock != nil {
+		afterLock()
+	}
+
+	previous, empty, version := stats.clearWithState()
+	if err := save(path, empty); err != nil {
+		return previous, err
+	}
+	stats.MarkPersisted(version)
+	return previous, nil
 }
 
 func writeFileAtomic(path string, data []byte) error {

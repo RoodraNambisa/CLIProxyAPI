@@ -65,30 +65,71 @@ type RequestStatistics struct {
 	successCount   int64
 	failureCount   int64
 	totalTokens    int64
+	tokens         TokenStats
 	changeCount    uint64
 	persistedCount uint64
 
 	apis map[string]*apiStats
 
-	auths map[string]*authStats
+	auths   map[string]*authStats
+	models  map[string]*aggregateStats
+	sources map[string]*aggregateStats
+
+	oldestAt            time.Time
+	newestAt            time.Time
+	dayOnlyFutureOldest time.Time
+	dayOnlyFutureNewest time.Time
 
 	requestsByDay  map[string]int64
 	requestsByHour map[int]int64
 	tokensByDay    map[string]int64
 	tokensByHour   map[int]int64
+
+	minuteBuckets     map[int64]*usageAggregateBucket
+	hourBuckets       map[int64]*usageAggregateBucket
+	dayBuckets        map[int64]*usageAggregateBucket
+	detailIndex       []usageDetailRef
+	detailIndexDirty  bool
+	lastPrunedMinute  int64
+	legacyHourBuckets map[legacyHourKey]*legacyHourStats
+}
+
+type legacyHourKey struct {
+	StartUnix int64
+	Day       string
+	Hour      int
+}
+
+type legacyHourStats struct {
+	Requests int64
+	Tokens   int64
+	Entries  []legacyUsageEntry
+}
+
+type legacyUsageEntry struct {
+	Timestamp time.Time
+	Tokens    int64
 }
 
 // apiStats holds aggregated metrics for a single API key.
 type apiStats struct {
 	TotalRequests int64
+	SuccessCount  int64
+	FailureCount  int64
 	TotalTokens   int64
+	Tokens        TokenStats
+	LastUsedAt    time.Time
 	Models        map[string]*modelStats
 }
 
 // modelStats holds aggregated metrics for a specific model within an API.
 type modelStats struct {
 	TotalRequests int64
+	SuccessCount  int64
+	FailureCount  int64
 	TotalTokens   int64
+	Tokens        TokenStats
+	LastUsedAt    time.Time
 	Details       []RequestDetail
 }
 
@@ -98,6 +139,7 @@ type authStats struct {
 	FailureCount  int64
 	TotalTokens   int64
 	Tokens        TokenStats
+	LastUsedAt    time.Time
 	Models        map[string]*authModelStats
 }
 
@@ -107,6 +149,7 @@ type authModelStats struct {
 	FailureCount  int64
 	TotalTokens   int64
 	Tokens        TokenStats
+	LastUsedAt    time.Time
 }
 
 // RequestDetail stores the timestamp, latency, and token usage for a single request.
@@ -169,12 +212,18 @@ func GetRequestStatistics() *RequestStatistics { return defaultRequestStatistics
 // NewRequestStatistics constructs an empty statistics store.
 func NewRequestStatistics() *RequestStatistics {
 	return &RequestStatistics{
-		apis:           make(map[string]*apiStats),
-		auths:          make(map[string]*authStats),
-		requestsByDay:  make(map[string]int64),
-		requestsByHour: make(map[int]int64),
-		tokensByDay:    make(map[string]int64),
-		tokensByHour:   make(map[int]int64),
+		apis:              make(map[string]*apiStats),
+		auths:             make(map[string]*authStats),
+		models:            make(map[string]*aggregateStats),
+		sources:           make(map[string]*aggregateStats),
+		requestsByDay:     make(map[string]int64),
+		requestsByHour:    make(map[int]int64),
+		tokensByDay:       make(map[string]int64),
+		tokensByHour:      make(map[int]int64),
+		minuteBuckets:     make(map[int64]*usageAggregateBucket),
+		hourBuckets:       make(map[int64]*usageAggregateBucket),
+		dayBuckets:        make(map[int64]*usageAggregateBucket),
+		legacyHourBuckets: make(map[legacyHourKey]*legacyHourStats),
 	}
 }
 
@@ -196,12 +245,16 @@ func (s *RequestStatistics) Record(ctx context.Context, record coreusage.Record)
 	if statsKey == "" {
 		statsKey = resolveAPIIdentifier(ctx, record)
 	}
+	statsKey = strings.TrimSpace(statsKey)
+	if statsKey == "" {
+		statsKey = "unknown"
+	}
 	failed := record.Failed
 	if !failed {
 		failed = !resolveSuccess(ctx)
 	}
 	success := !failed
-	modelName := record.Model
+	modelName := strings.TrimSpace(record.Model)
 	if modelName == "" {
 		modelName = "unknown"
 	}
@@ -238,27 +291,64 @@ func (s *RequestStatistics) Record(ctx context.Context, record coreusage.Record)
 	if requestDetail.ResponseServiceTier == "" {
 		requestDetail.ResponseServiceTier = strings.TrimSpace(record.Detail.ResponseServiceTier)
 	}
-	s.updateAPIStats(stats, modelName, requestDetail)
+	detailOffset := s.updateAPIStats(stats, modelName, requestDetail)
 	s.updateAuthStats(modelName, requestDetail)
+	now := time.Now().UTC()
+	s.updateRealtimeAggregatesLocked(statsKey, modelName, requestDetail, now)
+	s.insertDetailRefLocked(usageDetailRef{
+		Timestamp: requestDetail.Timestamp,
+		API:       statsKey,
+		Model:     modelName,
+		Offset:    detailOffset,
+	})
+	s.pruneTimeBucketsLocked(now)
 
 	s.requestsByDay[dayKey]++
 	s.requestsByHour[hourKey]++
 	s.tokensByDay[dayKey] += totalTokens
 	s.tokensByHour[hourKey] += totalTokens
+	s.updateLegacyHourBucketLocked(requestDetail)
 	s.markChangedLocked()
 }
 
-func (s *RequestStatistics) updateAPIStats(stats *apiStats, model string, detail RequestDetail) {
-	stats.TotalRequests++
-	stats.TotalTokens += detail.Tokens.TotalTokens
+func (s *RequestStatistics) updateAPIStats(stats *apiStats, model string, detail RequestDetail) int {
 	modelStatsValue, ok := stats.Models[model]
 	if !ok {
 		modelStatsValue = &modelStats{}
 		stats.Models[model] = modelStatsValue
 	}
-	modelStatsValue.TotalRequests++
-	modelStatsValue.TotalTokens += detail.Tokens.TotalTokens
+	detailOffset := len(modelStatsValue.Details)
 	modelStatsValue.Details = append(modelStatsValue.Details, detail)
+	updateAPIAggregates(stats, modelStatsValue, detail)
+	return detailOffset
+}
+
+func updateAPIAggregates(stats *apiStats, modelStatsValue *modelStats, detail RequestDetail) {
+	if stats == nil || modelStatsValue == nil {
+		return
+	}
+	updateUsageAggregate(
+		&stats.TotalRequests,
+		&stats.SuccessCount,
+		&stats.FailureCount,
+		&stats.TotalTokens,
+		&stats.Tokens,
+		detail,
+	)
+	if stats.LastUsedAt.IsZero() || detail.Timestamp.After(stats.LastUsedAt) {
+		stats.LastUsedAt = detail.Timestamp
+	}
+	updateUsageAggregate(
+		&modelStatsValue.TotalRequests,
+		&modelStatsValue.SuccessCount,
+		&modelStatsValue.FailureCount,
+		&modelStatsValue.TotalTokens,
+		&modelStatsValue.Tokens,
+		detail,
+	)
+	if modelStatsValue.LastUsedAt.IsZero() || detail.Timestamp.After(modelStatsValue.LastUsedAt) {
+		modelStatsValue.LastUsedAt = detail.Timestamp
+	}
 }
 
 func (s *RequestStatistics) updateAuthStats(model string, detail RequestDetail) {
@@ -370,6 +460,14 @@ type MergeResult struct {
 // MergeSnapshot merges an exported statistics snapshot into the current store.
 // Existing data is preserved and duplicate request details are skipped.
 func (s *RequestStatistics) MergeSnapshot(snapshot StatisticsSnapshot) MergeResult {
+	return s.mergeSnapshot(snapshot, false)
+}
+
+func (s *RequestStatistics) mergePersistedSnapshot(snapshot StatisticsSnapshot) MergeResult {
+	return s.mergeSnapshot(snapshot, true)
+}
+
+func (s *RequestStatistics) mergeSnapshot(snapshot StatisticsSnapshot, markPersistedIfClean bool) MergeResult {
 	result := MergeResult{}
 	if s == nil {
 		return result
@@ -377,6 +475,8 @@ func (s *RequestStatistics) MergeSnapshot(snapshot StatisticsSnapshot) MergeResu
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	cleanBeforeMerge := s.changeCount == s.persistedCount
+	now := time.Now().UTC()
 
 	seen := make(map[string]struct{})
 	for apiName, stats := range s.apis {
@@ -424,10 +524,17 @@ func (s *RequestStatistics) MergeSnapshot(snapshot StatisticsSnapshot) MergeResu
 					continue
 				}
 				seen[key] = struct{}{}
-				s.recordImported(apiName, modelName, stats, detail)
+				s.recordImported(apiName, modelName, stats, detail, now)
 				result.Added++
 			}
 		}
+	}
+	if result.Added > 0 {
+		s.rebuildDetailIndexLocked()
+		s.pruneTimeBucketsLocked(now)
+	}
+	if markPersistedIfClean && cleanBeforeMerge {
+		s.persistedCount = s.changeCount
 	}
 
 	return result
@@ -472,25 +579,48 @@ func (s *RequestStatistics) MarkAllPersisted() {
 
 // Clear removes all in-memory request statistics and marks the store changed.
 func (s *RequestStatistics) Clear() StatisticsSnapshot {
+	previous, _, _ := s.clearWithState()
+	return previous
+}
+
+func (s *RequestStatistics) clearWithState() (StatisticsSnapshot, StatisticsSnapshot, uint64) {
 	if s == nil {
-		return StatisticsSnapshot{}
+		return StatisticsSnapshot{}, StatisticsSnapshot{}, 0
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	previous := s.snapshotLocked()
+	s.resetLocked()
+	s.markChangedLocked()
+	return previous, s.snapshotLocked(), s.changeCount
+}
+
+func (s *RequestStatistics) resetLocked() {
 	s.totalRequests = 0
 	s.successCount = 0
 	s.failureCount = 0
 	s.totalTokens = 0
+	s.tokens = TokenStats{}
 	s.apis = make(map[string]*apiStats)
 	s.auths = make(map[string]*authStats)
+	s.models = make(map[string]*aggregateStats)
+	s.sources = make(map[string]*aggregateStats)
+	s.oldestAt = time.Time{}
+	s.newestAt = time.Time{}
+	s.dayOnlyFutureOldest = time.Time{}
+	s.dayOnlyFutureNewest = time.Time{}
 	s.requestsByDay = make(map[string]int64)
 	s.requestsByHour = make(map[int]int64)
 	s.tokensByDay = make(map[string]int64)
 	s.tokensByHour = make(map[int]int64)
-	s.markChangedLocked()
-	return previous
+	s.minuteBuckets = make(map[int64]*usageAggregateBucket)
+	s.hourBuckets = make(map[int64]*usageAggregateBucket)
+	s.dayBuckets = make(map[int64]*usageAggregateBucket)
+	s.legacyHourBuckets = make(map[legacyHourKey]*legacyHourStats)
+	s.detailIndex = nil
+	s.detailIndexDirty = false
+	s.lastPrunedMinute = 0
 }
 
 // RemoveAuthIndexes removes request details belonging to the supplied auth
@@ -604,7 +734,7 @@ func (s *RequestStatistics) PruneAuthIndexes(valid map[string]struct{}) int {
 	return removed
 }
 
-func (s *RequestStatistics) recordImported(apiName, modelName string, stats *apiStats, detail RequestDetail) {
+func (s *RequestStatistics) recordImported(apiName, modelName string, stats *apiStats, detail RequestDetail, now time.Time) {
 	totalTokens := detail.Tokens.TotalTokens
 	if totalTokens < 0 {
 		totalTokens = 0
@@ -620,6 +750,7 @@ func (s *RequestStatistics) recordImported(apiName, modelName string, stats *api
 
 	s.updateAPIStats(stats, modelName, detail)
 	s.updateAuthStats(modelName, detail)
+	s.updateRealtimeAggregatesLocked(apiName, modelName, detail, now)
 
 	dayKey := detail.Timestamp.Format("2006-01-02")
 	hourKey := detail.Timestamp.Hour()
@@ -628,6 +759,7 @@ func (s *RequestStatistics) recordImported(apiName, modelName string, stats *api
 	s.requestsByHour[hourKey]++
 	s.tokensByDay[dayKey] += totalTokens
 	s.tokensByHour[hourKey] += totalTokens
+	s.updateLegacyHourBucketLocked(detail)
 	s.markChangedLocked()
 }
 
@@ -636,11 +768,26 @@ func (s *RequestStatistics) rebuildLocked() {
 	s.successCount = 0
 	s.failureCount = 0
 	s.totalTokens = 0
+	s.tokens = TokenStats{}
 	s.requestsByDay = make(map[string]int64)
 	s.requestsByHour = make(map[int]int64)
 	s.tokensByDay = make(map[string]int64)
 	s.tokensByHour = make(map[int]int64)
 	s.auths = make(map[string]*authStats)
+	s.models = make(map[string]*aggregateStats)
+	s.sources = make(map[string]*aggregateStats)
+	s.oldestAt = time.Time{}
+	s.newestAt = time.Time{}
+	s.dayOnlyFutureOldest = time.Time{}
+	s.dayOnlyFutureNewest = time.Time{}
+	s.minuteBuckets = make(map[int64]*usageAggregateBucket)
+	s.hourBuckets = make(map[int64]*usageAggregateBucket)
+	s.dayBuckets = make(map[int64]*usageAggregateBucket)
+	s.legacyHourBuckets = make(map[legacyHourKey]*legacyHourStats)
+	s.detailIndex = nil
+	s.detailIndexDirty = false
+	s.lastPrunedMinute = 0
+	now := time.Now().UTC()
 
 	for apiName, stats := range s.apis {
 		if stats == nil {
@@ -648,7 +795,11 @@ func (s *RequestStatistics) rebuildLocked() {
 			continue
 		}
 		stats.TotalRequests = 0
+		stats.SuccessCount = 0
+		stats.FailureCount = 0
 		stats.TotalTokens = 0
+		stats.Tokens = TokenStats{}
+		stats.LastUsedAt = time.Time{}
 		if stats.Models == nil {
 			stats.Models = make(map[string]*modelStats)
 		}
@@ -658,7 +809,11 @@ func (s *RequestStatistics) rebuildLocked() {
 				continue
 			}
 			modelStatsValue.TotalRequests = 0
+			modelStatsValue.SuccessCount = 0
+			modelStatsValue.FailureCount = 0
 			modelStatsValue.TotalTokens = 0
+			modelStatsValue.Tokens = TokenStats{}
+			modelStatsValue.LastUsedAt = time.Time{}
 			for idx, detail := range modelStatsValue.Details {
 				detail.Tokens = normaliseTokenStats(detail.Tokens)
 				if detail.LatencyMs < 0 {
@@ -678,11 +833,9 @@ func (s *RequestStatistics) rebuildLocked() {
 				}
 				s.totalTokens += totalTokens
 
-				stats.TotalRequests++
-				stats.TotalTokens += totalTokens
-				modelStatsValue.TotalRequests++
-				modelStatsValue.TotalTokens += totalTokens
+				updateAPIAggregates(stats, modelStatsValue, detail)
 				s.updateAuthStats(modelName, detail)
+				s.updateRealtimeAggregatesLocked(apiName, modelName, detail, now)
 
 				dayKey := detail.Timestamp.Format("2006-01-02")
 				hourKey := detail.Timestamp.Hour()
@@ -690,12 +843,15 @@ func (s *RequestStatistics) rebuildLocked() {
 				s.requestsByHour[hourKey]++
 				s.tokensByDay[dayKey] += totalTokens
 				s.tokensByHour[hourKey] += totalTokens
+				s.updateLegacyHourBucketLocked(detail)
 			}
 		}
 		if len(stats.Models) == 0 {
 			delete(s.apis, apiName)
 		}
 	}
+	s.rebuildDetailIndexLocked()
+	s.pruneTimeBucketsLocked(now)
 }
 
 func (s *RequestStatistics) markChangedLocked() {
