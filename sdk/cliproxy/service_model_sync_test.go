@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -159,6 +160,197 @@ func TestServiceApplyCoreAuthAddOrUpdate_FallsBackToInlineSyncWhenQueueIsFull(t 
 	}
 }
 
+func TestAuthMaintenanceHookQueuesAntigravityModelSyncAfterAuthUpdate(t *testing.T) {
+	service := &Service{}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	service.modelSyncCancel = cancel
+	service.modelSyncQueue = make(chan string, 1)
+	service.modelSyncPending = make(map[string]modelSyncTaskState)
+	hook := authMaintenanceHook{service: service}
+
+	hook.OnAuthUpdated(ctx, &coreauth.Auth{
+		ID:       "service-antigravity-refresh-resync",
+		Provider: "antigravity",
+		Status:   coreauth.StatusActive,
+	})
+
+	select {
+	case authID := <-service.modelSyncQueue:
+		if authID != "service-antigravity-refresh-resync" {
+			t.Fatalf("queued auth ID = %q", authID)
+		}
+	default:
+		t.Fatal("expected refreshed Antigravity auth to queue model capability sync")
+	}
+}
+
+func TestAuthMaintenanceHookFallsBackInlineWhenModelSyncQueueIsFull(t *testing.T) {
+	service := &Service{
+		cfg:         &config.Config{},
+		coreManager: coreauth.NewManager(nil, nil, nil),
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	service.modelSyncCancel = cancel
+	service.modelSyncQueue = make(chan string, 1)
+	service.modelSyncQueue <- "busy"
+	service.modelSyncPending = make(map[string]modelSyncTaskState)
+	auth := &coreauth.Auth{ID: "service-antigravity-full-sync-queue", Provider: "antigravity", Status: coreauth.StatusActive}
+	if _, errRegister := service.coreManager.Register(ctx, auth); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+	t.Cleanup(func() { GlobalModelRegistry().UnregisterClient(auth.ID) })
+
+	authMaintenanceHook{service: service}.OnAuthUpdated(ctx, auth)
+
+	if _, pending := service.modelSyncPending[auth.ID]; pending {
+		t.Fatal("queue-full inline fallback left an unowned pending task")
+	}
+	if models := registry.GetGlobalRegistry().GetModelsForClient(auth.ID); len(models) == 0 {
+		t.Fatal("queue-full hook did not run the inline model sync fallback")
+	}
+}
+
+func TestAuthMaintenanceHookSkipsSuppressedModelSync(t *testing.T) {
+	service := &Service{}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	service.modelSyncCancel = cancel
+	service.modelSyncQueue = make(chan string, 1)
+	service.modelSyncPending = make(map[string]modelSyncTaskState)
+	hook := authMaintenanceHook{service: service}
+	refreshCtx := context.WithValue(ctx, modelSyncHookSuppressedContextKey{}, true)
+
+	hook.OnAuthUpdated(refreshCtx, &coreauth.Auth{
+		ID:       "service-antigravity-capability-refresh",
+		Provider: "antigravity",
+		Status:   coreauth.StatusActive,
+	})
+
+	select {
+	case authID := <-service.modelSyncQueue:
+		t.Fatalf("capability refresh unexpectedly queued a second sync for %q", authID)
+	default:
+	}
+}
+
+func TestServiceApplyCoreAuthAddOrUpdateQueuesAntigravitySyncOnce(t *testing.T) {
+	service := &Service{
+		cfg:         &config.Config{},
+		coreManager: coreauth.NewManager(nil, nil, nil),
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	service.modelSyncCancel = cancel
+	service.modelSyncQueue = make(chan string, 2)
+	service.modelSyncPending = make(map[string]modelSyncTaskState)
+	service.coreManager.AddHook(authMaintenanceHook{service: service})
+	authID := "service-antigravity-single-sync"
+	t.Cleanup(func() { GlobalModelRegistry().UnregisterClient(authID) })
+
+	service.applyCoreAuthAddOrUpdate(ctx, &coreauth.Auth{
+		ID:       authID,
+		Provider: "antigravity",
+		Status:   coreauth.StatusActive,
+	})
+
+	select {
+	case queuedID := <-service.modelSyncQueue:
+		if queuedID != authID {
+			t.Fatalf("queued auth ID = %q, want %q", queuedID, authID)
+		}
+	default:
+		t.Fatal("expected Antigravity model sync to be queued")
+	}
+	select {
+	case queuedID := <-service.modelSyncQueue:
+		t.Fatalf("duplicate model sync queued for %q", queuedID)
+	default:
+	}
+	state, ok := service.modelSyncPending[authID]
+	if !ok {
+		t.Fatal("expected queued Antigravity sync to remain pending")
+	}
+	if state.dirty {
+		t.Fatal("single Antigravity update incorrectly marked model sync dirty")
+	}
+}
+
+func TestAuthMaintenanceHookClearsStaleAntigravityCapabilityCache(t *testing.T) {
+	service := &Service{}
+	hook := authMaintenanceHook{service: service}
+	for _, auth := range []*coreauth.Auth{
+		{ID: "service-antigravity-disabled-cache", Provider: "antigravity", Disabled: true, Status: coreauth.StatusDisabled},
+		{ID: "service-antigravity-provider-change-cache", Provider: "claude", Status: coreauth.StatusActive},
+	} {
+		service.antigravityModelCapabilities.Store(auth.ID, &antigravityModelCapabilityCacheEntry{
+			RuntimeInstanceID: auth.RuntimeInstanceID(),
+			Hints: antigravityModelCapabilityHints{
+				WebSearchModelIDs: map[string]struct{}{"gemini-3.1-flash-lite": {}},
+			},
+		})
+		hook.OnAuthUpdated(context.Background(), auth)
+		if _, exists := service.antigravityModelCapabilities.Load(auth.ID); exists {
+			t.Fatalf("stale capability cache remained for %q", auth.ID)
+		}
+	}
+}
+
+func TestServiceSyncAuthModelsRejectsStaleAntigravityDiscoveryAfterProviderChange(t *testing.T) {
+	requestStarted := make(chan struct{})
+	releaseResponse := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		close(requestStarted)
+		<-releaseResponse
+		_, _ = w.Write([]byte(`{"webSearchModelIds":["gemini-3.1-flash-lite"]}`))
+	}))
+	defer server.Close()
+
+	service := &Service{
+		cfg:         &config.Config{},
+		coreManager: coreauth.NewManager(nil, nil, nil),
+	}
+	authID := "service-stale-antigravity-discovery"
+	oldAuth := &coreauth.Auth{
+		ID:         authID,
+		Provider:   "antigravity",
+		Status:     coreauth.StatusActive,
+		Attributes: map[string]string{"base_url": server.URL},
+		Metadata:   map[string]any{"access_token": "token"},
+	}
+	if _, errRegister := service.coreManager.Register(context.Background(), oldAuth); errRegister != nil {
+		t.Fatalf("register old auth: %v", errRegister)
+	}
+	t.Cleanup(func() { GlobalModelRegistry().UnregisterClient(authID) })
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		service.syncAuthModels(context.Background(), authID)
+	}()
+	<-requestStarted
+
+	newAuth := &coreauth.Auth{ID: authID, Provider: "claude", Status: coreauth.StatusActive}
+	installed, errUpdate := service.coreManager.Update(context.Background(), newAuth)
+	if errUpdate != nil {
+		close(releaseResponse)
+		<-done
+		t.Fatalf("replace auth provider: %v", errUpdate)
+	}
+	service.registerModelsForAuth(installed)
+	close(releaseResponse)
+	<-done
+
+	if _, exists := service.antigravityModelCapabilities.Load(authID); exists {
+		t.Fatal("stale Antigravity discovery populated cache after provider change")
+	}
+	models := registry.GetGlobalRegistry().GetModelsForClient(authID)
+	if len(models) == 0 || !containsRegisteredModel(models, registry.GetClaudeModels()[0].ID) {
+		t.Fatalf("stale discovery replaced the current Claude registration: %v", registeredModelIDs(models))
+	}
+}
+
 func TestServiceHandleManagementAuthStatusChange_ReRegistersModelsForEnabledAuth(t *testing.T) {
 	service := &Service{
 		cfg:         &config.Config{},
@@ -182,6 +374,52 @@ func TestServiceHandleManagementAuthStatusChange_ReRegistersModelsForEnabledAuth
 
 	if models := registry.GetGlobalRegistry().GetModelsForClient(auth.ID); len(models) == 0 {
 		t.Fatalf("expected management status change hook to re-register models for %q", auth.ID)
+	}
+}
+
+func TestServiceHandleManagementAuthStatusChangeReusesQueuedAntigravitySync(t *testing.T) {
+	service := &Service{
+		cfg:         &config.Config{},
+		coreManager: coreauth.NewManager(nil, nil, nil),
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	service.modelSyncCancel = cancel
+	service.modelSyncQueue = make(chan string, 2)
+	service.modelSyncPending = make(map[string]modelSyncTaskState)
+	service.coreManager.AddHook(authMaintenanceHook{service: service})
+	auth := &coreauth.Auth{
+		ID:       "service-management-antigravity-single-sync",
+		Provider: "antigravity",
+		Status:   coreauth.StatusActive,
+	}
+	installed, errRegister := service.coreManager.Register(ctx, auth)
+	if errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+	t.Cleanup(func() { GlobalModelRegistry().UnregisterClient(auth.ID) })
+
+	service.handleManagementAuthStatusChange(ctx, installed)
+
+	select {
+	case queuedID := <-service.modelSyncQueue:
+		if queuedID != auth.ID {
+			t.Fatalf("queued auth ID = %q, want %q", queuedID, auth.ID)
+		}
+	default:
+		t.Fatal("expected manager hook to queue Antigravity model sync")
+	}
+	select {
+	case queuedID := <-service.modelSyncQueue:
+		t.Fatalf("management status callback queued duplicate sync for %q", queuedID)
+	default:
+	}
+	state, ok := service.modelSyncPending[auth.ID]
+	if !ok {
+		t.Fatal("expected queued Antigravity sync to remain pending")
+	}
+	if state.dirty {
+		t.Fatal("management status callback incorrectly marked Antigravity sync dirty")
 	}
 }
 
@@ -403,6 +641,12 @@ func TestServiceDeleteCoreAuth_DeleteFailureKeepsRuntimeAndModels(t *testing.T) 
 		t.Fatalf("register auth: %v", errRegister)
 	}
 	registry.GetGlobalRegistry().RegisterClient(auth.ID, "claude", []*registry.ModelInfo{{ID: "test-model"}})
+	service.antigravityModelCapabilities.Store(auth.ID, &antigravityModelCapabilityCacheEntry{
+		RuntimeInstanceID: auth.RuntimeInstanceID(),
+		Hints: antigravityModelCapabilityHints{
+			WebSearchModelIDs: map[string]struct{}{"gemini-3.1-flash-lite": {}},
+		},
+	})
 	t.Cleanup(func() {
 		registry.GetGlobalRegistry().UnregisterClient(auth.ID)
 	})
@@ -416,6 +660,33 @@ func TestServiceDeleteCoreAuth_DeleteFailureKeepsRuntimeAndModels(t *testing.T) 
 	}
 	if models := registry.GetGlobalRegistry().GetModelsForClient(auth.ID); len(models) == 0 {
 		t.Fatalf("expected models to remain registered after delete failure for %q", auth.ID)
+	}
+	if _, exists := service.antigravityModelCapabilities.Load(auth.ID); !exists {
+		t.Fatal("expected capability cache to remain after delete persistence failure")
+	}
+}
+
+func TestServiceDeleteCoreAuth_ClearsAntigravityCapabilityCache(t *testing.T) {
+	service := &Service{
+		cfg:         &config.Config{},
+		coreManager: coreauth.NewManager(nil, nil, nil),
+	}
+	auth := &coreauth.Auth{ID: "service-delete-antigravity-cache", Provider: "antigravity", Status: coreauth.StatusActive}
+	if _, errRegister := service.coreManager.Register(context.Background(), auth); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+	service.antigravityModelCapabilities.Store(auth.ID, &antigravityModelCapabilityCacheEntry{
+		RuntimeInstanceID: auth.RuntimeInstanceID(),
+		Hints: antigravityModelCapabilityHints{
+			WebSearchModelIDs: map[string]struct{}{"gemini-3.1-flash-lite": {}},
+		},
+	})
+
+	if errDelete := service.deleteCoreAuth(context.Background(), auth.ID); errDelete != nil {
+		t.Fatalf("delete auth: %v", errDelete)
+	}
+	if _, exists := service.antigravityModelCapabilities.Load(auth.ID); exists {
+		t.Fatal("capability cache remained after successful auth deletion")
 	}
 }
 

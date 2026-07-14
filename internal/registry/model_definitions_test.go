@@ -202,3 +202,30 @@ func TestGetAntigravityModelsMatchesUpstreamCatalog(t *testing.T) {
 		}
 	}
 }
+
+func TestClientSupportsWebSearchUsesSelectedClientAndUpstreamModel(t *testing.T) {
+	registryRef := GetGlobalRegistry()
+	registryRef.RegisterClient("test-antigravity-websearch-capable", "antigravity", []*ModelInfo{
+		{ID: "team-a/search-capable", UpstreamID: "gemini-web-search-test", SupportsWebSearch: true},
+	})
+	registryRef.RegisterClient("test-antigravity-websearch-unsupported", "antigravity", []*ModelInfo{
+		{ID: "team-b/search-capable", UpstreamID: "gemini-web-search-test"},
+	})
+	t.Cleanup(func() {
+		registryRef.UnregisterClient("test-antigravity-websearch-capable")
+		registryRef.UnregisterClient("test-antigravity-websearch-unsupported")
+	})
+
+	if !registryRef.ClientSupportsWebSearch("test-antigravity-websearch-capable", "gemini-web-search-test(high)") {
+		t.Fatal("selected capable client should support its resolved upstream model")
+	}
+	if registryRef.ClientSupportsWebSearch("test-antigravity-websearch-unsupported", "gemini-web-search-test") {
+		t.Fatal("selected unsupported client must not inherit another client's capability")
+	}
+	if registryRef.ClientSupportsWebSearch("test-antigravity-websearch-capable", "team-a/search-capable") {
+		t.Fatal("execution capability lookup must use the resolved upstream model, not the public alias")
+	}
+	if registryRef.ClientSupportsWebSearch("unknown-client", "gemini-web-search-test") {
+		t.Fatal("unknown client must not support web search")
+	}
+}

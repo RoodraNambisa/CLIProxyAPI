@@ -1,6 +1,9 @@
 package cliproxy
 
 import (
+	"context"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
@@ -840,6 +843,208 @@ func TestRegisterModelsForAuth_CodexCustomModelsApplyOAuthAlias(t *testing.T) {
 	if !containsRegisteredModel(models, "codex-latest") {
 		t.Fatal("expected alias for custom model to be registered")
 	}
+}
+
+func TestRegisterModelsForAuth_AntigravityFetchesWebSearchCapability(t *testing.T) {
+	type requestDetails struct {
+		method        string
+		path          string
+		authorization string
+	}
+	requests := make(chan requestDetails, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests <- requestDetails{
+			method:        r.Method,
+			path:          r.URL.Path,
+			authorization: r.Header.Get("Authorization"),
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"models": {
+				"gemini-3.1-flash-lite": {
+					"displayName": "Fetched Metadata Must Not Replace Static Metadata",
+					"maxTokens": 1,
+					"maxOutputTokens": 2
+				},
+				"fetched-only-search-model": {
+					"displayName": "Fetched Only Search Model"
+				}
+			},
+			"webSearchModelIds": [
+				" GEMINI-3.1-FLASH-LITE ",
+				"gemini-3-flash-agent",
+				"fetched-only-search-model"
+			]
+		}`))
+	}))
+	defer server.Close()
+
+	service := &Service{
+		cfg: &config.Config{
+			SDKConfig: config.SDKConfig{ForceModelPrefix: true},
+			OAuthModelAlias: map[string][]config.OAuthModelAlias{
+				"antigravity": {
+					{Name: "gemini-3.1-flash-lite", Alias: "search-capable"},
+				},
+			},
+		},
+	}
+	auth := &coreauth.Auth{
+		ID:       "auth-antigravity-fetch-models",
+		Provider: "antigravity",
+		Prefix:   "team-a",
+		Status:   coreauth.StatusActive,
+		Attributes: map[string]string{
+			"auth_kind":       "oauth",
+			"base_url":        server.URL,
+			"excluded_models": "gemini-3-flash-agent",
+		},
+		Metadata: map[string]any{
+			"access_token": "token",
+		},
+	}
+
+	reg := registry.GetGlobalRegistry()
+	reg.UnregisterClient(auth.ID)
+	t.Cleanup(func() {
+		reg.UnregisterClient(auth.ID)
+	})
+
+	hints, okFetch := service.fetchAntigravityModelCapabilityHintsForAuth(context.Background(), auth)
+	if !okFetch {
+		t.Fatal("expected fetchAvailableModels capability response")
+	}
+	service.antigravityModelCapabilities.Store(auth.ID, &antigravityModelCapabilityCacheEntry{
+		RuntimeInstanceID: auth.RuntimeInstanceID(),
+		Hints:             hints,
+	})
+	service.registerModelsForAuth(auth)
+	select {
+	case request := <-requests:
+		if request.method != http.MethodPost {
+			t.Fatalf("method = %q, want POST", request.method)
+		}
+		if request.path != antigravityModelsPath {
+			t.Fatalf("path = %q, want %s", request.path, antigravityModelsPath)
+		}
+		if request.authorization != "Bearer token" {
+			t.Fatalf("Authorization = %q, want bearer token", request.authorization)
+		}
+	default:
+		t.Fatal("expected fetchAvailableModels request")
+	}
+
+	models := reg.GetModelsForClient(auth.ID)
+	staticModels := registry.GetAntigravityModels()
+	if got, want := len(models), len(staticModels)-1; got != want {
+		t.Fatalf("registered model count = %d, want %d static models after one exclusion", got, want)
+	}
+
+	var webSearchModel, unsupportedModel, staticOnlyModel *registry.ModelInfo
+	for _, model := range models {
+		if model == nil {
+			continue
+		}
+		switch strings.TrimSpace(model.ID) {
+		case "team-a/search-capable":
+			webSearchModel = model
+		case "team-a/gemini-3-flash":
+			unsupportedModel = model
+		case "team-a/gpt-oss-120b-medium":
+			staticOnlyModel = model
+		case "team-a/gemini-3-flash-agent":
+			t.Fatal("locally excluded model should not be registered")
+		case "team-a/fetched-only-search-model", "fetched-only-search-model":
+			t.Fatalf("fetched-only model should not be registered: %#v", model)
+		default:
+			if !strings.HasPrefix(model.ID, "team-a/") {
+				t.Fatalf("model %q should retain the forced prefix", model.ID)
+			}
+		}
+	}
+
+	if webSearchModel == nil {
+		t.Fatal("expected aliased static web search model to be registered")
+	}
+	if !webSearchModel.SupportsWebSearch {
+		t.Fatal("expected aliased static model to retain web search capability")
+	}
+	staticWebSearchModel := findAntigravityModelByID(staticModels, "gemini-3.1-flash-lite")
+	if staticWebSearchModel == nil {
+		t.Fatal("expected static gemini-3.1-flash-lite definition")
+	}
+	if webSearchModel.DisplayName != staticWebSearchModel.DisplayName ||
+		webSearchModel.ContextLength != staticWebSearchModel.ContextLength ||
+		webSearchModel.MaxCompletionTokens != staticWebSearchModel.MaxCompletionTokens {
+		t.Fatalf("static metadata should be preserved, got=%#v static=%#v", webSearchModel, staticWebSearchModel)
+	}
+	if unsupportedModel == nil {
+		t.Fatal("expected unsupported static model to remain registered")
+	}
+	if unsupportedModel.SupportsWebSearch {
+		t.Fatal("static model absent from webSearchModelIds should not support web search")
+	}
+	if staticOnlyModel == nil {
+		t.Fatal("expected static-only Antigravity model to remain registered")
+	}
+	if !reg.ClientSupportsWebSearch(auth.ID, "gemini-3.1-flash-lite(high)") {
+		t.Fatal("prefixed alias should retain capability for its resolved upstream model")
+	}
+	if reg.ClientSupportsWebSearch(auth.ID, "team-a/search-capable") {
+		t.Fatal("capability lookup should not use the public prefixed alias")
+	}
+}
+
+func TestRegisterModelsForAuth_AntigravityIgnoresCacheFromReusedAuthID(t *testing.T) {
+	manager := coreauth.NewManager(nil, nil, nil)
+	service := &Service{cfg: &config.Config{}, coreManager: manager}
+	authID := "auth-antigravity-reused-capability-cache"
+	oldAuth, errRegister := manager.Register(context.Background(), &coreauth.Auth{
+		ID:       authID,
+		Provider: "antigravity",
+		Status:   coreauth.StatusActive,
+	})
+	if errRegister != nil {
+		t.Fatalf("register old auth: %v", errRegister)
+	}
+	service.antigravityModelCapabilities.Store(authID, &antigravityModelCapabilityCacheEntry{
+		RuntimeInstanceID: oldAuth.RuntimeInstanceID(),
+		Hints: antigravityModelCapabilityHints{
+			WebSearchModelIDs: map[string]struct{}{"gemini-3.1-flash-lite": {}},
+		},
+	})
+	if errDelete := manager.Delete(context.Background(), authID); errDelete != nil {
+		t.Fatalf("delete old auth: %v", errDelete)
+	}
+	newAuth, errRegister := manager.Register(context.Background(), &coreauth.Auth{
+		ID:       authID,
+		Provider: "antigravity",
+		Status:   coreauth.StatusActive,
+	})
+	if errRegister != nil {
+		t.Fatalf("register reused auth ID: %v", errRegister)
+	}
+	t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(authID) })
+
+	service.registerModelsForAuth(newAuth)
+
+	if _, exists := service.antigravityModelCapabilities.Load(authID); exists {
+		t.Fatal("cache entry from the retired auth instance was not removed")
+	}
+	for _, model := range registry.GetGlobalRegistry().GetModelsForClient(authID) {
+		if model != nil && model.SupportsWebSearch {
+			t.Fatalf("reused auth inherited unverified web search capability for %q", model.ID)
+		}
+	}
+}
+
+func findAntigravityModelByID(models []*registry.ModelInfo, modelID string) *registry.ModelInfo {
+	for _, model := range models {
+		if model != nil && strings.EqualFold(strings.TrimSpace(model.ID), strings.TrimSpace(modelID)) {
+			return model
+		}
+	}
+	return nil
 }
 
 func assertOnlyRegisteredModels(t *testing.T, models []*registry.ModelInfo, wants ...string) {

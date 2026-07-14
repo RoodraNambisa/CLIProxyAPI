@@ -7017,6 +7017,13 @@ func (m *Manager) refreshAntigravityForRequest(ctx context.Context, id, failedAc
 	return saved, nil
 }
 
+// RefreshAntigravityAfterUnauthorized refreshes an Antigravity credential after
+// an upstream request rejects the supplied access token. Concurrent callers for
+// the same credential share the existing request refresh lock.
+func (m *Manager) RefreshAntigravityAfterUnauthorized(ctx context.Context, id, failedAccessToken string) (*Auth, error) {
+	return m.refreshAntigravityForRequest(ctx, id, failedAccessToken)
+}
+
 func (m *Manager) refreshAuthJob(ctx context.Context, job authRefreshJob) {
 	m.refreshAuthExpected(ctx, job.authID, job.expected, job.pendingUntil)
 }

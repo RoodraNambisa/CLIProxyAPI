@@ -287,6 +287,51 @@ func validateAntigravityRequestSignatures(from sdktranslator.Format, rawJSON []b
 	return rawJSON, nil
 }
 
+func hasAntigravityClaudeTypedWebSearchTool(payload []byte) bool {
+	tools := gjson.GetBytes(payload, "tools")
+	if !tools.IsArray() {
+		return false
+	}
+	for _, tool := range tools.Array() {
+		switch tool.Get("type").String() {
+		case "web_search_20250305", "web_search_20260209":
+			return true
+		}
+	}
+	return false
+}
+
+func hasAntigravityGoogleSearchTool(payload []byte) bool {
+	tools := gjson.GetBytes(payload, "request.tools")
+	if !tools.IsArray() {
+		return false
+	}
+	for _, tool := range tools.Array() {
+		if tool.Get("googleSearch").Exists() {
+			return true
+		}
+	}
+	return false
+}
+
+func shouldResolveAntigravityWebSearchGroundingURLs(from sdktranslator.Format, originalRequestRawJSON, requestRawJSON []byte) bool {
+	return from.String() == "claude" &&
+		hasAntigravityClaudeTypedWebSearchTool(originalRequestRawJSON) &&
+		hasAntigravityGoogleSearchTool(requestRawJSON)
+}
+
+func (e *AntigravityExecutor) resolveWebSearchGroundingURLs(ctx context.Context, auth *cliproxyauth.Auth, from sdktranslator.Format, originalRequestRawJSON, requestRawJSON, responseRawJSON []byte) []byte {
+	if !shouldResolveAntigravityWebSearchGroundingURLs(from, originalRequestRawJSON, requestRawJSON) {
+		return responseRawJSON
+	}
+	return helps.ResolveAntigravityGroundingURLs(ctx, e.cfg, auth, responseRawJSON)
+}
+
+func prepareAntigravityWebSearchTranslationPayload(auth *cliproxyauth.Auth, model string, payload []byte) []byte {
+	supported := auth != nil && registry.GetGlobalRegistry().ClientSupportsWebSearch(auth.ID, model)
+	return antigravityclaude.WithAntigravityWebSearchCapability(payload, supported)
+}
+
 // Identifier returns the executor identifier.
 func (e *AntigravityExecutor) Identifier() string { return antigravityAuthType }
 
@@ -906,6 +951,7 @@ func (e *AntigravityExecutor) Execute(ctx context.Context, auth *cliproxyauth.Au
 	if errValidate != nil {
 		return resp, errValidate
 	}
+	originalPayload = prepareAntigravityWebSearchTranslationPayload(auth, baseModel, originalPayload)
 	req.Payload = originalPayload
 	token, updatedAuth, errToken := e.ensureAccessToken(ctx, auth)
 	if errToken != nil {
@@ -962,6 +1008,13 @@ attemptLoop:
 				if creditsPayload := injectEnabledCreditTypes(basePayload); len(creditsPayload) > 0 {
 					requestPayload = creditsPayload
 					usedCreditsDirect = true
+				}
+			}
+			replayScope := antigravityReasoningReplayScope{}
+			if antigravityUsesReasoningReplayCache(baseModel) {
+				requestPayload, replayScope, err = prepareAntigravityGeminiReasoningReplayPayload(ctx, baseModel, req, opts, requestPayload)
+				if err != nil {
+					return resp, err
 				}
 			}
 
@@ -1027,7 +1080,7 @@ attemptLoop:
 					} else {
 						var creditsResp *http.Response
 						if helps.RequestBodyReplayable(ctx, opts) {
-							creditsResp, _ = e.attemptCreditsFallback(ctx, auth, httpClient, token, baseModel, translatedRef.Bytes(), false, opts.Alt, baseURL, bodyBytes)
+							creditsResp, _ = e.attemptCreditsFallback(ctx, auth, httpClient, token, baseModel, requestPayload, false, opts.Alt, baseURL, bodyBytes)
 						}
 						if creditsResp != nil {
 							helps.RecordAPIResponseMetadata(ctx, e.cfg, creditsResp.StatusCode, creditsResp.Header.Clone())
@@ -1041,6 +1094,8 @@ attemptLoop:
 								return resp, err
 							}
 							helps.AppendAPIResponseChunk(ctx, e.cfg, creditsBody)
+							cacheAntigravityReasoningReplayFromResponse(ctx, replayScope, requestPayload, creditsBody)
+							creditsBody = e.resolveWebSearchGroundingURLs(ctx, auth, from, originalRef.Bytes(), translatedRef.Bytes(), creditsBody)
 							reporter.Publish(ctx, helps.ParseAntigravityUsage(creditsBody))
 							var param any
 							converted := sdktranslator.TranslateNonStream(ctx, to, from, req.Model, originalRef.Bytes(), translatedRef.Bytes(), creditsBody, &param)
@@ -1093,6 +1148,9 @@ attemptLoop:
 						continue attemptLoop
 					}
 				}
+				if errClear := clearAntigravityReasoningReplayOnInvalidSignature(ctx, replayScope, httpResp.StatusCode, bodyBytes); errClear != nil {
+					return resp, errClear
+				}
 				err = newAntigravityStatusErr(httpResp.StatusCode, bodyBytes)
 				return resp, err
 			}
@@ -1100,6 +1158,8 @@ attemptLoop:
 			if usedCreditsDirect {
 				markAntigravityCreditsAvailable(auth, time.Now())
 			}
+			cacheAntigravityReasoningReplayFromResponse(ctx, replayScope, requestPayload, bodyBytes)
+			bodyBytes = e.resolveWebSearchGroundingURLs(ctx, auth, from, originalRef.Bytes(), translatedRef.Bytes(), bodyBytes)
 			reporter.Publish(ctx, helps.ParseAntigravityUsage(bodyBytes))
 			var param any
 			converted := sdktranslator.TranslateNonStream(ctx, to, from, req.Model, originalRef.Bytes(), translatedRef.Bytes(), bodyBytes, &param)
@@ -1146,6 +1206,7 @@ func (e *AntigravityExecutor) executeClaudeNonStream(ctx context.Context, auth *
 	if errValidate != nil {
 		return resp, errValidate
 	}
+	originalPayload = prepareAntigravityWebSearchTranslationPayload(auth, baseModel, originalPayload)
 	req.Payload = originalPayload
 	token, updatedAuth, errToken := e.ensureAccessToken(ctx, auth)
 	if errToken != nil {
@@ -1392,6 +1453,7 @@ attemptLoop:
 			}
 			resp = cliproxyexecutor.Response{Payload: e.convertStreamToNonStream(buffer.Bytes())}
 
+			resp.Payload = e.resolveWebSearchGroundingURLs(ctx, auth, from, originalRef.Bytes(), translatedRef.Bytes(), resp.Payload)
 			reporter.Publish(ctx, helps.ParseAntigravityUsage(resp.Payload))
 			var param any
 			converted := sdktranslator.TranslateNonStream(ctx, to, from, req.Model, originalRef.Bytes(), translatedRef.Bytes(), resp.Payload, &param)
@@ -1637,6 +1699,7 @@ func (e *AntigravityExecutor) ExecuteStream(ctx context.Context, auth *cliproxya
 	if errValidate != nil {
 		return nil, errValidate
 	}
+	originalPayload = prepareAntigravityWebSearchTranslationPayload(auth, baseModel, originalPayload)
 	req.Payload = originalPayload
 	token, updatedAuth, errToken := e.ensureAccessToken(ctx, auth)
 	if errToken != nil {
@@ -1704,6 +1767,13 @@ attemptLoop:
 				if creditsPayload := injectEnabledCreditTypes(basePayload); len(creditsPayload) > 0 {
 					requestPayload = creditsPayload
 					usedCreditsDirect = true
+				}
+			}
+			replayScope := antigravityReasoningReplayScope{}
+			if antigravityUsesReasoningReplayCache(baseModel) {
+				requestPayload, replayScope, err = prepareAntigravityGeminiReasoningReplayPayload(ctx, baseModel, req, opts, requestPayload)
+				if err != nil {
+					return nil, err
 				}
 			}
 			httpReq, errReq := e.buildRequest(ctx, auth, token, baseModel, requestPayload, true, opts.Alt, baseURL)
@@ -1782,7 +1852,7 @@ attemptLoop:
 						} else {
 							var creditsResp *http.Response
 							if helps.RequestBodyReplayable(ctx, opts) {
-								creditsResp, _ = e.attemptCreditsFallback(ctx, auth, httpClient, token, baseModel, translatedRef.Bytes(), true, opts.Alt, baseURL, bodyBytes)
+								creditsResp, _ = e.attemptCreditsFallback(ctx, auth, httpClient, token, baseModel, requestPayload, true, opts.Alt, baseURL, bodyBytes)
 							}
 							if creditsResp != nil {
 								httpResp = creditsResp
@@ -1834,6 +1904,9 @@ attemptLoop:
 						continue attemptLoop
 					}
 				}
+				if errClear := clearAntigravityReasoningReplayOnInvalidSignature(ctx, replayScope, httpResp.StatusCode, bodyBytes); errClear != nil {
+					return nil, errClear
+				}
 				err = newAntigravityStatusErr(httpResp.StatusCode, bodyBytes)
 				return nil, err
 			}
@@ -1842,12 +1915,17 @@ attemptLoop:
 			if usedCreditsDirect {
 				markAntigravityCreditsAvailable(auth, time.Now())
 			}
+			replayAccumulator := newAntigravityReasoningReplayAccumulator(replayScope, requestPayload)
 			helps.ReleaseRequestBodyAfterStreamEstablished(ctx, opts)
 			out := make(chan cliproxyexecutor.StreamChunk)
 			go func(resp *http.Response) {
 				defer close(out)
 				defer cleanupBodies()
+				replayComplete := false
 				defer func() {
+					if replayComplete && replayAccumulator != nil {
+						replayAccumulator.Flush(ctx)
+					}
 					if errClose := resp.Body.Close(); errClose != nil {
 						log.Errorf("antigravity executor: close response body error: %v", errClose)
 					}
@@ -1870,6 +1948,9 @@ attemptLoop:
 				for scanner.Scan() {
 					line := scanner.Bytes()
 					helps.AppendAPIResponseChunk(ctx, e.cfg, line)
+					if replayAccumulator != nil {
+						replayAccumulator.ObserveSSELine(line)
+					}
 					rawPayload := helps.JSONPayload(line)
 					if rawPayload == nil {
 						continue
@@ -1895,6 +1976,7 @@ attemptLoop:
 						continue
 					}
 
+					payload = e.resolveWebSearchGroundingURLs(ctx, auth, from, originalRef.Bytes(), translatedRef.Bytes(), payload)
 					chunks := sdktranslator.TranslateStream(ctx, to, from, req.Model, originalRef.Bytes(), translatedRef.Bytes(), bytes.Clone(payload), &param)
 					for i := range chunks {
 						if !send(cliproxyexecutor.StreamChunk{Payload: chunks[i]}) {
@@ -1911,7 +1993,10 @@ attemptLoop:
 							}
 						}
 						reporter.EnsurePublished(ctx)
-						send(cliproxyexecutor.SuccessfulStreamTerminalChunk())
+						if !send(cliproxyexecutor.SuccessfulStreamTerminalChunk()) {
+							return
+						}
+						replayComplete = true
 						return
 					}
 				}
@@ -1928,8 +2013,11 @@ attemptLoop:
 					}
 					reporter.EnsurePublished(ctx)
 					if markerRequested {
-						send(cliproxyexecutor.SuccessfulStreamTerminalChunk())
+						if !send(cliproxyexecutor.SuccessfulStreamTerminalChunk()) {
+							return
+						}
 					}
+					replayComplete = true
 				} else {
 					streamErr := protocolErr
 					if streamErr == nil {
@@ -2020,6 +2108,7 @@ func (e *AntigravityExecutor) CountTokens(ctx context.Context, auth *cliproxyaut
 	if errValidate != nil {
 		return cliproxyexecutor.Response{}, errValidate
 	}
+	originalPayloadSource = prepareAntigravityWebSearchTranslationPayload(auth, baseModel, originalPayloadSource)
 	req.Payload = originalPayloadSource
 	token, updatedAuth, errToken := e.ensureAccessToken(ctx, auth)
 	if errToken != nil {
@@ -3102,14 +3191,15 @@ func geminiToAntigravity(modelName string, payload []byte, projectID string) []b
 	template, _ = sjson.SetBytes(template, "userAgent", "antigravity")
 
 	isImageModel := strings.Contains(modelName, "image")
-
-	var reqType string
-	if isImageModel {
-		reqType = "image_gen"
-	} else {
-		reqType = "agent"
+	reqType := strings.TrimSpace(gjson.GetBytes(template, "requestType").String())
+	if reqType == "" {
+		if isImageModel {
+			reqType = "image_gen"
+		} else {
+			reqType = "agent"
+		}
+		template, _ = sjson.SetBytes(template, "requestType", reqType)
 	}
-	template, _ = sjson.SetBytes(template, "requestType", reqType)
 
 	if projectID != "" {
 		template, _ = sjson.SetBytes(template, "project", projectID)
@@ -3119,7 +3209,7 @@ func geminiToAntigravity(modelName string, payload []byte, projectID string) []b
 
 	if isImageModel {
 		template, _ = sjson.SetBytes(template, "requestId", generateImageGenRequestID())
-	} else {
+	} else if reqType != "web_search" {
 		template, _ = sjson.SetBytes(template, "requestId", generateRequestID())
 		template, _ = sjson.SetBytes(template, "request.sessionId", generateStableSessionID(payload))
 	}

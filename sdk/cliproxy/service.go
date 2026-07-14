@@ -95,6 +95,9 @@ type Service struct {
 	// modelSyncPending deduplicates queued or running auth sync tasks.
 	modelSyncPending map[string]modelSyncTaskState
 
+	// antigravityModelCapabilities caches per-auth model discovery results.
+	antigravityModelCapabilities sync.Map
+
 	// usagePersistenceMu protects the periodic persistence loop lifecycle.
 	usagePersistenceMu sync.Mutex
 
@@ -208,9 +211,30 @@ type authMaintenanceHook struct {
 	service *Service
 }
 
-func (h authMaintenanceHook) OnAuthRegistered(context.Context, *coreauth.Auth) {}
+func (h authMaintenanceHook) OnAuthRegistered(ctx context.Context, auth *coreauth.Auth) {
+	h.handleAuthChange(ctx, auth)
+}
 
-func (h authMaintenanceHook) OnAuthUpdated(context.Context, *coreauth.Auth) {}
+func (h authMaintenanceHook) OnAuthUpdated(ctx context.Context, auth *coreauth.Auth) {
+	h.handleAuthChange(ctx, auth)
+}
+
+func (h authMaintenanceHook) handleAuthChange(ctx context.Context, auth *coreauth.Auth) {
+	if h.service == nil || auth == nil || strings.TrimSpace(auth.ID) == "" {
+		return
+	}
+	if ctx != nil && ctx.Value(modelSyncHookSuppressedContextKey{}) != nil {
+		return
+	}
+	provider := strings.ToLower(strings.TrimSpace(auth.Provider))
+	if provider != "antigravity" || auth.Disabled || auth.Status == coreauth.StatusDisabled {
+		h.service.antigravityModelCapabilities.Delete(auth.ID)
+		return
+	}
+	if !h.service.enqueueModelSync(auth.ID) {
+		h.service.syncAuthModelsInline(ctx, auth.ID)
+	}
+}
 
 func (h authMaintenanceHook) OnResult(ctx context.Context, result coreauth.Result) {
 	if h.service != nil {
@@ -1688,6 +1712,9 @@ func (s *Service) applyCoreAuthAddOrUpdate(ctx context.Context, auth *coreauth.A
 	if s == nil || s.coreManager == nil || auth == nil || auth.ID == "" {
 		return
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	s.cfgMu.RLock()
 	authDir := ""
 	if s.cfg != nil {
@@ -1719,6 +1746,7 @@ func (s *Service) applyCoreAuthAddOrUpdate(ctx context.Context, auth *coreauth.A
 	// immediately for API calls, rather than waiting for model registration to complete.
 	op := "register"
 	var err error
+	managerCtx := context.WithValue(ctx, modelSyncHookSuppressedContextKey{}, true)
 	if existing, ok := s.coreManager.GetByID(auth.ID); ok {
 		auth.CreatedAt = existing.CreatedAt
 		if !existing.Disabled && existing.Status != coreauth.StatusDisabled && !auth.Disabled && auth.Status != coreauth.StatusDisabled {
@@ -1729,9 +1757,9 @@ func (s *Service) applyCoreAuthAddOrUpdate(ctx context.Context, auth *coreauth.A
 			}
 		}
 		op = "update"
-		_, err = s.coreManager.Update(ctx, auth)
+		_, err = s.coreManager.Update(managerCtx, auth)
 	} else {
-		_, err = s.coreManager.Register(ctx, auth)
+		_, err = s.coreManager.Register(managerCtx, auth)
 	}
 	if pathLocked {
 		unlockPath()
@@ -1801,6 +1829,7 @@ func (s *Service) deleteCoreAuth(ctx context.Context, id string) error {
 		log.Errorf("failed to delete auth %s: %v", id, err)
 		return err
 	}
+	s.antigravityModelCapabilities.Delete(id)
 	return nil
 }
 
@@ -1817,6 +1846,7 @@ func (s *Service) applyCoreAuthRemovalWithReason(ctx context.Context, id string,
 	id = strings.TrimSpace(id)
 	existing, ok := s.coreManager.GetByID(id)
 	if !ok || existing == nil {
+		s.antigravityModelCapabilities.Delete(id)
 		GlobalModelRegistry().UnregisterClient(id)
 		return true
 	}
@@ -1866,6 +1896,7 @@ func (s *Service) applyCoreAuthRemovalWithReason(ctx context.Context, id string,
 		log.Errorf("failed to disable auth %s: %v", id, err)
 		return false
 	}
+	s.antigravityModelCapabilities.Delete(id)
 	GlobalModelRegistry().UnregisterClient(id)
 	if strings.EqualFold(strings.TrimSpace(existing.Provider), "codex") {
 		s.ensureExecutorsForAuth(existing)
@@ -1909,7 +1940,6 @@ func (s *Service) enqueueModelSync(authID string) bool {
 		s.modelSyncMu.Unlock()
 		return true
 	default:
-		s.modelSyncPending[authID] = modelSyncTaskState{}
 		s.modelSyncMu.Unlock()
 		return false
 	}
@@ -1951,12 +1981,69 @@ func (s *Service) syncAuthModels(ctx context.Context, authID string) {
 	}
 	current, ok := s.coreManager.GetByID(authID)
 	if !ok || current == nil {
+		s.antigravityModelCapabilities.Delete(authID)
 		GlobalModelRegistry().UnregisterClient(authID)
 		return
+	}
+	provider := strings.ToLower(strings.TrimSpace(current.Provider))
+	if provider != "antigravity" || current.Disabled || current.Status == coreauth.StatusDisabled {
+		s.antigravityModelCapabilities.Delete(authID)
 	}
 	s.registerModelsForAuth(current)
 	s.coreManager.ReconcileRegistryModelStates(ctx, current.ID)
 	s.coreManager.RefreshSchedulerEntry(current.ID)
+
+	if provider != "antigravity" || current.Disabled || current.Status == coreauth.StatusDisabled {
+		return
+	}
+
+	hints, source, okFetch := s.fetchAntigravityModelCapabilityHintsWithSource(ctx, current)
+	if !okFetch {
+		return
+	}
+	latest, currentSource := s.currentAuthForAntigravityCapability(source)
+	if !currentSource {
+		return
+	}
+	entry := &antigravityModelCapabilityCacheEntry{
+		RuntimeInstanceID: latest.RuntimeInstanceID(),
+		Hints:             hints,
+	}
+	s.antigravityModelCapabilities.Store(latest.ID, entry)
+	s.registerModelsForAuth(latest)
+	s.coreManager.ReconcileRegistryModelStates(ctx, latest.ID)
+	s.coreManager.RefreshSchedulerEntry(latest.ID)
+
+	finalAuth, stillCurrent := s.currentAuthForAntigravityCapability(latest)
+	if stillCurrent {
+		return
+	}
+	s.antigravityModelCapabilities.CompareAndDelete(latest.ID, entry)
+	if finalAuth == nil {
+		GlobalModelRegistry().UnregisterClient(latest.ID)
+		return
+	}
+	s.registerModelsForAuth(finalAuth)
+	s.coreManager.ReconcileRegistryModelStates(ctx, finalAuth.ID)
+	s.coreManager.RefreshSchedulerEntry(finalAuth.ID)
+	if strings.EqualFold(strings.TrimSpace(finalAuth.Provider), "antigravity") && !finalAuth.Disabled && finalAuth.Status != coreauth.StatusDisabled {
+		s.enqueueModelSync(finalAuth.ID)
+	}
+}
+
+func (s *Service) currentAuthForAntigravityCapability(source *coreauth.Auth) (*coreauth.Auth, bool) {
+	if s == nil || s.coreManager == nil || source == nil || strings.TrimSpace(source.ID) == "" {
+		return nil, false
+	}
+	current, ok := s.coreManager.GetByID(source.ID)
+	if !ok || current == nil {
+		return nil, false
+	}
+	if current.Disabled || current.Status == coreauth.StatusDisabled || !strings.EqualFold(strings.TrimSpace(current.Provider), "antigravity") {
+		return current, false
+	}
+	expectedInstanceID := strings.TrimSpace(source.RuntimeInstanceID())
+	return current, expectedInstanceID != "" && expectedInstanceID == strings.TrimSpace(current.RuntimeInstanceID())
 }
 
 func (s *Service) syncAuthModelsInline(ctx context.Context, authID string) {
@@ -1975,7 +2062,11 @@ func (s *Service) handleManagementAuthStatusChange(ctx context.Context, auth *co
 	if s == nil || auth == nil {
 		return
 	}
-	if strings.TrimSpace(auth.ID) == "" || auth.Disabled || auth.Status == coreauth.StatusDisabled {
+	if strings.TrimSpace(auth.ID) == "" {
+		return
+	}
+	if auth.Disabled || auth.Status == coreauth.StatusDisabled {
+		s.antigravityModelCapabilities.Delete(auth.ID)
 		return
 	}
 	authDir := ""
@@ -1986,6 +2077,10 @@ func (s *Service) handleManagementAuthStatusChange(ctx context.Context, auth *co
 		s.cancelAuthMaintenanceCandidate(candidate)
 	}
 	s.ensureExecutorsForAuth(auth)
+	if strings.EqualFold(strings.TrimSpace(auth.Provider), "antigravity") {
+		// The manager update hook already queued or completed Antigravity capability sync.
+		return
+	}
 	s.syncAuthModels(ctx, auth.ID)
 }
 
@@ -2651,6 +2746,16 @@ func (s *Service) registerModelsForAuth(a *coreauth.Auth) {
 		models = applyExcludedModels(models, excluded)
 	case "antigravity":
 		models = registry.GetAntigravityModels()
+		hints := antigravityModelCapabilityHints{}
+		if cached, ok := s.antigravityModelCapabilities.Load(a.ID); ok {
+			if entry, okEntry := cached.(*antigravityModelCapabilityCacheEntry); okEntry && entry != nil &&
+				entry.RuntimeInstanceID == a.RuntimeInstanceID() {
+				hints = entry.Hints
+			} else if okEntry && entry != nil {
+				s.antigravityModelCapabilities.CompareAndDelete(a.ID, entry)
+			}
+		}
+		models = applyAntigravityFetchedModelCapabilities(models, hints)
 		models = applyExcludedModels(models, excluded)
 	case "claude":
 		models = registry.GetClaudeModels()

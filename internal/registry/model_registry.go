@@ -22,6 +22,8 @@ const OpenAIImageModelType = "openai-image"
 type ModelInfo struct {
 	// ID is the unique identifier for the model
 	ID string `json:"id"`
+	// UpstreamID preserves the provider model ID before aliases and prefixes.
+	UpstreamID string `json:"-"`
 	// Object type for the model (typically "model")
 	Object string `json:"object"`
 	// Created timestamp when the model was created
@@ -54,6 +56,9 @@ type ModelInfo struct {
 	SupportedInputModalities []string `json:"supportedInputModalities,omitempty"`
 	// SupportedOutputModalities lists supported output modalities (e.g., TEXT, IMAGE)
 	SupportedOutputModalities []string `json:"supportedOutputModalities,omitempty"`
+	// SupportsWebSearch indicates this Antigravity model is listed by
+	// fetchAvailableModels.webSearchModelIds and can execute native googleSearch.
+	SupportsWebSearch bool `json:"supports_web_search,omitempty"`
 
 	// Thinking holds provider-specific reasoning/thinking budget capabilities.
 	// This is optional and currently used for Gemini thinking budget normalization.
@@ -63,6 +68,40 @@ type ModelInfo struct {
 	// array (e.g., openai-compatibility.*.models[], *-api-key.models[]).
 	// UserDefined models have thinking configuration passed through without validation.
 	UserDefined bool `json:"-"`
+}
+
+// ClientSupportsWebSearch reports whether one registered client supports
+// native Antigravity web search for the resolved upstream model.
+func (r *ModelRegistry) ClientSupportsWebSearch(clientID, modelID string) bool {
+	clientID = strings.TrimSpace(clientID)
+	modelID = normalizeRegistryCapabilityModelID(modelID)
+	if clientID == "" || modelID == "" {
+		return false
+	}
+
+	r.mutex.RLock()
+	defer r.mutex.RUnlock()
+	for _, info := range r.clientModelInfos[clientID] {
+		if info == nil || !info.SupportsWebSearch {
+			continue
+		}
+		upstreamID := info.UpstreamID
+		if strings.TrimSpace(upstreamID) == "" {
+			upstreamID = info.ID
+		}
+		if normalizeRegistryCapabilityModelID(upstreamID) == modelID {
+			return true
+		}
+	}
+	return false
+}
+
+func normalizeRegistryCapabilityModelID(modelID string) string {
+	modelID = strings.ToLower(strings.TrimSpace(modelID))
+	if open := strings.LastIndex(modelID, "("); open >= 0 && strings.HasSuffix(modelID, ")") {
+		modelID = strings.TrimSpace(modelID[:open])
+	}
+	return modelID
 }
 
 type availableModelsCacheEntry struct {
