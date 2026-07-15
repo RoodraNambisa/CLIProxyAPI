@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -661,6 +662,57 @@ func TestCodexExecutorExecuteStream_ImagePassthroughDoesNotReuseCompletionEventA
 	}
 }
 
+func TestCodexExecutorExecuteStreamReportsEffectivePassthroughAfterToolRemoval(t *testing.T) {
+	upstreamBodies := make(chan []byte, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamBody, _ := io.ReadAll(r.Body)
+		upstreamBodies <- upstreamBody
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte(`data: {"type":"response.completed","response":{"id":"resp_text","status":"completed","output":[]}}` + "\n\n"))
+	}))
+	defer server.Close()
+
+	executor := NewCodexExecutor(&config.Config{AuthModelExclusions: []config.AuthModelExclusionRule{{
+		DisableImageGeneration: true,
+		Priorities:             []int{-1},
+	}}})
+	auth := &cliproxyauth.Auth{
+		Provider: "codex",
+		Attributes: map[string]string{
+			"base_url": server.URL,
+			"api_key":  "test",
+			"priority": "-1",
+		},
+	}
+	state := &cliproxyexecutor.ImageGenerationStreamPassthroughState{}
+	result, err := executor.ExecuteStream(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "gpt-5.4-mini",
+		Payload: []byte(`{"model":"gpt-5.4-mini","input":"draw","tools":[{"type":"function","name":"image_gen.imagegen"}],"stream":true}`),
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FormatOpenAIResponse,
+		Stream:       true,
+		Metadata: map[string]any{
+			cliproxyexecutor.ImageGenerationStreamPassthroughMetadataKey:      true,
+			cliproxyexecutor.ImageGenerationStreamPassthroughStateMetadataKey: state,
+		},
+	})
+	if err != nil {
+		t.Fatalf("ExecuteStream error: %v", err)
+	}
+	if state.Enabled() {
+		t.Fatal("effective image passthrough = true after policy removed the image tool")
+	}
+	upstreamBody := <-upstreamBodies
+	if cliproxyauth.PayloadHasImageGenerationTool(upstreamBody) {
+		t.Fatalf("upstream body still contains image tool: %s", upstreamBody)
+	}
+	for chunk := range result.Chunks {
+		if chunk.Err != nil {
+			t.Fatalf("stream chunk error: %v", chunk.Err)
+		}
+	}
+}
+
 func TestCodexExecutorExecuteStream_ImagePassthroughMarksDoneTerminal(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -674,6 +726,7 @@ func TestCodexExecutorExecuteStream_ImagePassthroughMarksDoneTerminal(t *testing
 
 	executor := NewCodexExecutor(&config.Config{})
 	auth := &cliproxyauth.Auth{Attributes: map[string]string{"base_url": server.URL, "api_key": "test"}}
+	state := &cliproxyexecutor.ImageGenerationStreamPassthroughState{}
 	result, err := executor.ExecuteStream(context.Background(), auth, cliproxyexecutor.Request{
 		Model:   "gpt-5.4-mini",
 		Payload: []byte(`{"model":"gpt-5.4-mini","input":"draw","tools":[{"type":"image_generation"}],"stream":true}`),
@@ -681,12 +734,16 @@ func TestCodexExecutorExecuteStream_ImagePassthroughMarksDoneTerminal(t *testing
 		SourceFormat: sdktranslator.FormatOpenAIResponse,
 		Stream:       true,
 		Metadata: map[string]any{
-			cliproxyexecutor.ImageGenerationStreamPassthroughMetadataKey: true,
-			cliproxyexecutor.StreamTerminalMarkerMetadataKey:             true,
+			cliproxyexecutor.ImageGenerationStreamPassthroughMetadataKey:      true,
+			cliproxyexecutor.ImageGenerationStreamPassthroughStateMetadataKey: state,
+			cliproxyexecutor.StreamTerminalMarkerMetadataKey:                  true,
 		},
 	})
 	if err != nil {
 		t.Fatalf("ExecuteStream error: %v", err)
+	}
+	if !state.Enabled() {
+		t.Fatal("effective image passthrough = false for an unchanged image request")
 	}
 
 	terminalCount := 0

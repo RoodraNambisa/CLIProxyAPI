@@ -3,6 +3,7 @@ package executor
 import (
 	"net/http"
 	"net/url"
+	"sync/atomic"
 
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v6/sdk/translator"
 )
@@ -32,6 +33,9 @@ const (
 	// ImageGenerationStreamPassthroughMetadataKey requests low-overhead passthrough for
 	// streaming Responses image_generation events.
 	ImageGenerationStreamPassthroughMetadataKey = "image_generation_stream_passthrough"
+	// ImageGenerationStreamPassthroughStateMetadataKey carries the effective passthrough
+	// state after provider policy has transformed the request.
+	ImageGenerationStreamPassthroughStateMetadataKey = "image_generation_stream_passthrough_state"
 	// TrustUpstreamSSEMetadataKey requests direct forwarding of trusted upstream SSE frames.
 	TrustUpstreamSSEMetadataKey = "trust_upstream_sse"
 	// SelectionAttemptMetadataKey stores the outer retry attempt index for auth selection.
@@ -50,6 +54,24 @@ const (
 	// ExecutionSessionMetadataKey identifies a long-lived downstream execution session.
 	ExecutionSessionMetadataKey = "execution_session_id"
 )
+
+// ImageGenerationStreamPassthroughState reports whether the selected upstream request
+// still contains an image generation tool after provider policy is applied.
+type ImageGenerationStreamPassthroughState struct {
+	enabled atomic.Bool
+}
+
+// SetEnabled updates the effective image stream passthrough state.
+func (s *ImageGenerationStreamPassthroughState) SetEnabled(enabled bool) {
+	if s != nil {
+		s.enabled.Store(enabled)
+	}
+}
+
+// Enabled returns the effective image stream passthrough state.
+func (s *ImageGenerationStreamPassthroughState) Enabled() bool {
+	return s != nil && s.enabled.Load()
+}
 
 // AuthInstanceRetirement reports whether a selected runtime auth instance was retired.
 type AuthInstanceRetirement interface {

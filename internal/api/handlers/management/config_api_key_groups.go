@@ -25,6 +25,11 @@ func (h *Handler) PutAPIKeys(c *gin.Context) {
 	if !ok {
 		return
 	}
+	keys, errNormalizeKeys := normalizeAPIKeys(keys)
+	if errNormalizeKeys != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": errNormalizeKeys.Error()})
+		return
+	}
 
 	h.mu.Lock()
 	groups, errNormalize := config.PruneAPIKeyGroups(h.cfg.APIKeyGroups, keys)
@@ -57,41 +62,49 @@ func (h *Handler) PatchAPIKeys(c *gin.Context) {
 	groups := cloneAPIKeyGroups(h.cfg.APIKeyGroups)
 	oldKey := ""
 	newKey := ""
+	replacementIndex := -1
 	switch {
 	case body.Index != nil && body.Value != nil && *body.Index >= 0 && *body.Index < len(keys):
-		oldKey = keys[*body.Index]
+		replacementIndex = *body.Index
+		oldKey = keys[replacementIndex]
 		newKey = strings.TrimSpace(*body.Value)
-		if newKey == "" {
-			h.mu.Unlock()
-			c.JSON(http.StatusBadRequest, gin.H{"error": "api key cannot be empty"})
-			return
-		}
-		keys[*body.Index] = newKey
 	case body.Old != nil && body.New != nil:
+		lookupKey := strings.TrimSpace(*body.Old)
 		newKey = strings.TrimSpace(*body.New)
-		if newKey == "" {
+		if lookupKey == "" || newKey == "" {
 			h.mu.Unlock()
 			c.JSON(http.StatusBadRequest, gin.H{"error": "api key cannot be empty"})
 			return
 		}
-		found := false
 		for index := range keys {
-			if keys[index] != *body.Old {
+			if strings.TrimSpace(keys[index]) != lookupKey {
 				continue
 			}
+			replacementIndex = index
 			oldKey = keys[index]
-			keys[index] = newKey
-			found = true
 			break
 		}
-		if !found {
-			keys = append(keys, newKey)
+		if replacementIndex == -1 {
+			h.mu.Unlock()
+			c.JSON(http.StatusNotFound, gin.H{"error": "api key not found"})
+			return
 		}
 	default:
 		h.mu.Unlock()
 		c.JSON(http.StatusBadRequest, gin.H{"error": "missing fields"})
 		return
 	}
+	if newKey == "" {
+		h.mu.Unlock()
+		c.JSON(http.StatusBadRequest, gin.H{"error": "api key cannot be empty"})
+		return
+	}
+	if containsAPIKeyExcept(keys, newKey, replacementIndex) {
+		h.mu.Unlock()
+		c.JSON(http.StatusBadRequest, gin.H{"error": "api key already exists"})
+		return
+	}
+	keys[replacementIndex] = newKey
 	if oldKey != "" {
 		var errMigrate error
 		if containsAPIKey(keys, strings.TrimSpace(oldKey)) {
@@ -267,6 +280,23 @@ func parseAPIKeyGroupsBody(c *gin.Context) ([]config.APIKeyGroup, bool) {
 	return object.Items, true
 }
 
+func normalizeAPIKeys(keys []string) ([]string, error) {
+	normalized := make([]string, len(keys))
+	seen := make(map[string]struct{}, len(keys))
+	for index, rawKey := range keys {
+		key := strings.TrimSpace(rawKey)
+		if key == "" {
+			return nil, errAPIKeyEmpty
+		}
+		if _, exists := seen[key]; exists {
+			return nil, errAPIKeyDuplicate
+		}
+		seen[key] = struct{}{}
+		normalized[index] = key
+	}
+	return normalized, nil
+}
+
 func cloneAPIKeyGroups(groups []config.APIKeyGroup) []config.APIKeyGroup {
 	if len(groups) == 0 {
 		return nil
@@ -341,6 +371,15 @@ func containsAPIKey(keys []string, target string) bool {
 	return false
 }
 
+func containsAPIKeyExcept(keys []string, target string, excludedIndex int) bool {
+	for index, key := range keys {
+		if index != excludedIndex && strings.TrimSpace(key) == target {
+			return true
+		}
+	}
+	return false
+}
+
 func deleteAPIKeyGroup(groups []config.APIKeyGroup, key string) []config.APIKeyGroup {
 	key = strings.TrimSpace(key)
 	filtered := make([]config.APIKeyGroup, 0, len(groups))
@@ -356,4 +395,8 @@ func deleteAPIKeyGroup(groups []config.APIKeyGroup, key string) []config.APIKeyG
 	return filtered
 }
 
-var errAPIKeyGroupConflict = errors.New("api key group conflict")
+var (
+	errAPIKeyEmpty         = errors.New("api key cannot be empty")
+	errAPIKeyDuplicate     = errors.New("api key already exists")
+	errAPIKeyGroupConflict = errors.New("api key group conflict")
+)

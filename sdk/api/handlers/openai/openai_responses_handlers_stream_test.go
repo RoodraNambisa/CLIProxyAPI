@@ -20,7 +20,9 @@ import (
 )
 
 type responsesMetadataCaptureExecutor struct {
-	metadata map[string]any
+	metadata             map[string]any
+	effectivePassthrough *bool
+	chunks               [][]byte
 }
 
 func (e *responsesMetadataCaptureExecutor) Identifier() string { return "codex" }
@@ -34,10 +36,81 @@ func (e *responsesMetadataCaptureExecutor) ExecuteStream(_ context.Context, _ *c
 	for key, value := range opts.Metadata {
 		e.metadata[key] = value
 	}
-	chunks := make(chan coreexecutor.StreamChunk, 1)
-	chunks <- coreexecutor.StreamChunk{Payload: []byte(`data: {"type":"response.completed","response":{"id":"resp-1","output":[]}}`)}
+	if state, ok := opts.Metadata[coreexecutor.ImageGenerationStreamPassthroughStateMetadataKey].(*coreexecutor.ImageGenerationStreamPassthroughState); ok {
+		effective := false
+		if requested, _ := opts.Metadata[coreexecutor.ImageGenerationStreamPassthroughMetadataKey].(bool); requested {
+			effective = true
+		}
+		if e.effectivePassthrough != nil {
+			effective = *e.effectivePassthrough
+		}
+		state.SetEnabled(effective)
+	}
+	payloads := e.chunks
+	if len(payloads) == 0 {
+		payloads = [][]byte{[]byte(`data: {"type":"response.completed","response":{"id":"resp-1","output":[]}}`)}
+	}
+	chunks := make(chan coreexecutor.StreamChunk, len(payloads))
+	for _, payload := range payloads {
+		chunks <- coreexecutor.StreamChunk{Payload: payload}
+	}
 	close(chunks)
 	return &coreexecutor.StreamResult{Chunks: chunks}, nil
+}
+
+func TestResponsesStreamingUsesEffectiveImagePassthroughAfterPolicy(t *testing.T) {
+	for _, tt := range []struct {
+		name       string
+		trustSSE   bool
+		wantOutput int
+	}{
+		{name: "removed tool uses normal repair", wantOutput: 1},
+		{name: "trusted SSE keeps direct passthrough", trustSSE: true, wantOutput: 0},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			effective := false
+			executor := &responsesMetadataCaptureExecutor{
+				effectivePassthrough: &effective,
+				chunks: [][]byte{
+					[]byte(`data: {"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","id":"fc-1","name":"lookup","arguments":"{}"}}`),
+					[]byte(`data: {"type":"response.completed","response":{"id":"resp-1","output":[]}}`),
+				},
+			}
+			manager := coreauth.NewManager(nil, nil, nil)
+			manager.RegisterExecutor(executor)
+			model := "responses-effective-passthrough-" + strings.ReplaceAll(tt.name, " ", "-")
+			auth := &coreauth.Auth{ID: model + "-auth", Provider: "codex", Status: coreauth.StatusActive}
+			if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
+				t.Fatalf("register auth: %v", errRegister)
+			}
+			registry.GetGlobalRegistry().RegisterClient(auth.ID, auth.Provider, []*registry.ModelInfo{{ID: model}})
+			t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(auth.ID) })
+
+			cfg := &sdkconfig.SDKConfig{Streaming: sdkconfig.StreamingConfig{TrustUpstreamSSE: tt.trustSSE}}
+			h := NewOpenAIResponsesAPIHandler(handlers.NewBaseAPIHandlers(cfg, manager))
+			router := gin.New()
+			router.POST("/v1/responses", h.Responses)
+			body := fmt.Sprintf(`{"model":%q,"stream":true,"input":"draw","tools":[{"type":"function","name":"image_gen.imagegen"}]}`, model)
+			request := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(body))
+			request.Header.Set("Content-Type", "application/json")
+			response := httptest.NewRecorder()
+			router.ServeHTTP(response, request)
+			if response.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200; body=%s", response.Code, response.Body.String())
+			}
+
+			var completedOutput gjson.Result
+			for _, frame := range strings.Split(strings.TrimSpace(response.Body.String()), "\n\n") {
+				payload, okPayload := responsesSSEDataPayload([]byte(frame))
+				if okPayload && gjson.GetBytes(payload, "type").String() == "response.completed" {
+					completedOutput = gjson.GetBytes(payload, "response.output")
+				}
+			}
+			if !completedOutput.IsArray() || len(completedOutput.Array()) != tt.wantOutput {
+				t.Fatalf("completed output = %s, want %d items; body=%s", completedOutput.Raw, tt.wantOutput, response.Body.String())
+			}
+		})
+	}
 }
 
 func (e *responsesMetadataCaptureExecutor) Refresh(_ context.Context, auth *coreauth.Auth) (*coreauth.Auth, error) {

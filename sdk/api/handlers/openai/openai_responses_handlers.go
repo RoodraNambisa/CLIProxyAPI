@@ -22,6 +22,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/api/handlers"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
+	coreexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
@@ -495,9 +496,12 @@ func (h *OpenAIResponsesAPIHandler) handleStreamingResponse(c *gin.Context, rawJ
 	// New core execution path
 	modelName := gjson.GetBytes(rawJSON, "model").String()
 	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
-	imageStreamPassthrough := cliproxyauth.PayloadHasImageGenerationTool(rawJSON)
-	if imageStreamPassthrough {
+	requestedImageStreamPassthrough := cliproxyauth.PayloadHasImageGenerationTool(rawJSON)
+	var imageStreamPassthroughState *coreexecutor.ImageGenerationStreamPassthroughState
+	if requestedImageStreamPassthrough {
+		imageStreamPassthroughState = &coreexecutor.ImageGenerationStreamPassthroughState{}
 		cliCtx = handlers.WithImageGenerationStreamPassthrough(cliCtx, true)
+		cliCtx = handlers.WithImageGenerationStreamPassthroughState(cliCtx, imageStreamPassthroughState)
 	}
 	dataChan, upstreamHeaders, errChan := h.ExecuteStreamWithAuthManager(cliCtx, h.HandlerType(), modelName, rawJSON, "")
 
@@ -508,7 +512,6 @@ func (h *OpenAIResponsesAPIHandler) handleStreamingResponse(c *gin.Context, rawJ
 		c.Header("Access-Control-Allow-Origin", "*")
 	}
 	trustUpstreamSSE := handlers.StreamingTrustUpstreamSSE(h.Cfg)
-	framer := &responsesSSEFramer{passthrough: imageStreamPassthrough || trustUpstreamSSE}
 
 	// Peek at the first chunk
 	for {
@@ -544,6 +547,8 @@ func (h *OpenAIResponsesAPIHandler) handleStreamingResponse(c *gin.Context, rawJ
 			// Success! Set headers.
 			setSSEHeaders()
 			handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
+			imageStreamPassthrough := requestedImageStreamPassthrough && imageStreamPassthroughState.Enabled()
+			framer := &responsesSSEFramer{passthrough: imageStreamPassthrough || trustUpstreamSSE}
 
 			// Write first chunk logic (matching forwardResponsesStream)
 			framer.WriteChunk(c.Writer, chunk)

@@ -879,6 +879,9 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 		err = newCodexStatusErr(httpResp.StatusCode, clientBody)
 		return nil, err
 	}
+	if state, ok := opts.Metadata[cliproxyexecutor.ImageGenerationStreamPassthroughStateMetadataKey].(*cliproxyexecutor.ImageGenerationStreamPassthroughState); ok {
+		state.SetEnabled(imageStreamPassthrough)
+	}
 	helps.ReleaseRequestBodyAfterStreamEstablished(ctx, opts)
 	out := make(chan cliproxyexecutor.StreamChunk, cliproxyexecutor.StreamBufferSize)
 	go func() {

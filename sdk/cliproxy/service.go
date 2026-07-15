@@ -2871,6 +2871,7 @@ func (s *Service) registerModelsForAuth(a *coreauth.Auth) {
 						}
 						ms = append(ms, &ModelInfo{
 							ID:          modelID,
+							UpstreamID:  strings.TrimSpace(m.Name),
 							Object:      "model",
 							Created:     time.Now().Unix(),
 							OwnedBy:     compat.Name,
@@ -3644,9 +3645,20 @@ func applyModelPrefixes(models []*ModelInfo, prefix string, forceModelPrefix boo
 		}
 		clone := *model
 		clone.ID = trimmedPrefix + "/" + baseID
+		clone.UpstreamID = modelInfoUpstreamID(model)
 		addModel(&clone)
 	}
 	return out
+}
+
+func modelInfoUpstreamID(model *ModelInfo) string {
+	if model == nil {
+		return ""
+	}
+	if upstreamID := strings.TrimSpace(model.UpstreamID); upstreamID != "" {
+		return upstreamID
+	}
+	return strings.TrimSpace(model.ID)
 }
 
 // matchWildcard performs case-insensitive wildcard matching where '*' matches any substring.
@@ -3726,6 +3738,7 @@ func buildConfigModels[T modelEntry](models []T, ownedBy, modelType string) []*M
 		}
 		info := &ModelInfo{
 			ID:          alias,
+			UpstreamID:  name,
 			Object:      "model",
 			Created:     now,
 			OwnedBy:     ownedBy,
@@ -3883,6 +3896,7 @@ func applyOAuthModelAlias(cfg *config.Config, provider, authKind string, models 
 			seen[aliasKey] = struct{}{}
 			clone := *model
 			clone.ID = mappedID
+			clone.UpstreamID = modelInfoUpstreamID(model)
 			if clone.Name != "" {
 				clone.Name = rewriteModelInfoName(clone.Name, id, mappedID)
 			}
