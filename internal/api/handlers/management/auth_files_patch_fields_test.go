@@ -3,6 +3,7 @@ package management
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -165,6 +166,32 @@ func TestPatchAuthFileFields_HeadersEmptyMapIsNoop(t *testing.T) {
 	}
 }
 
+func TestPatchAuthFileFields_LegacyUnchangedHeadersReturnNoFields(t *testing.T) {
+	manager := coreauth.NewManager(&memoryAuthStore{}, nil, nil)
+	record := &coreauth.Auth{
+		ID:         "unchanged.json",
+		FileName:   "unchanged.json",
+		Provider:   "claude",
+		Attributes: map[string]string{"path": "/tmp/unchanged.json", "header:X-Keep": "1"},
+		Metadata:   map[string]any{"type": "claude", "headers": map[string]any{"X-Keep": "1"}},
+	}
+	if _, errRegister := manager.Register(context.Background(), record); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, manager)
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	req := httptest.NewRequest(http.MethodPatch, "/v0/management/auth-files/fields", strings.NewReader(`{"name":"unchanged.json","headers":{"X-Keep":"1"}}`))
+	req.Header.Set("Content-Type", "application/json")
+	ctx.Request = req
+	h.PatchAuthFileFields(ctx)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusBadRequest, rec.Body.String())
+	}
+}
+
 func TestPatchAuthFileFields_XAIBooleanFields(t *testing.T) {
 	store := &memoryAuthStore{}
 	manager := coreauth.NewManager(store, nil, nil)
@@ -285,6 +312,259 @@ func TestPatchAuthFileFields_RejectsXAIFieldsForOtherProviders(t *testing.T) {
 	if updated.Prefix != "old" {
 		t.Fatalf("prefix changed on rejected request: %q", updated.Prefix)
 	}
+}
+
+func TestPatchAuthFileFields_BatchReplacementAndExplicitPriority(t *testing.T) {
+	store := &countingAuthStore{}
+	manager := coreauth.NewManager(store, nil, nil)
+	record := &coreauth.Auth{
+		ID:       "xai-batch.json",
+		FileName: "xai-batch.json",
+		Provider: "xai",
+		Attributes: map[string]string{
+			"path":            "/tmp/xai-batch.json",
+			"priority":        "9",
+			"header:X-Old":    "old",
+			"excluded_models": "old-model",
+			"disable_cooling": "false",
+			"websockets":      "false",
+		},
+		Metadata: map[string]any{
+			"type":            "xai",
+			"priority":        9,
+			"headers":         map[string]any{"X-Old": "old"},
+			"excluded_models": []string{"old-model"},
+			"disable_cooling": false,
+			"websockets":      false,
+		},
+	}
+	if _, errRegister := manager.Register(context.Background(), record); errRegister != nil {
+		t.Fatalf("register xai auth: %v", errRegister)
+	}
+
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, manager)
+	hookCalls := 0
+	h.SetAuthStatusHook(func(_ context.Context, auth *coreauth.Auth) {
+		if auth != nil && auth.ID == record.ID {
+			hookCalls++
+		}
+	})
+
+	body := `{"names":["xai-batch.json"," xai-batch.json "],"fields":{"priority":0,"headers":{"X-New":" value "},"excluded_models":[" GPT-5 ","gpt-5"],"disable_cooling":true,"websockets":true}}`
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	req := httptest.NewRequest(http.MethodPatch, "/v0/management/auth-files/fields", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	ctx.Request = req
+	h.PatchAuthFileFields(ctx)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	var response struct {
+		Matched int                         `json:"matched"`
+		Updated int                         `json:"updated"`
+		Files   []string                    `json:"files"`
+		Failed  []authFileFieldPatchFailure `json:"failed"`
+	}
+	if errDecode := json.Unmarshal(rec.Body.Bytes(), &response); errDecode != nil {
+		t.Fatalf("decode response: %v", errDecode)
+	}
+	if response.Matched != 1 || response.Updated != 1 || len(response.Files) != 1 || len(response.Failed) != 0 {
+		t.Fatalf("unexpected batch response: %#v", response)
+	}
+	if store.saveCalls != 2 {
+		t.Fatalf("save calls = %d, want 2 (register plus one deduplicated update)", store.saveCalls)
+	}
+	if hookCalls != 1 {
+		t.Fatalf("hook calls = %d, want 1", hookCalls)
+	}
+
+	updated, ok := manager.GetByID(record.ID)
+	if !ok || updated == nil {
+		t.Fatal("updated auth not found")
+	}
+	if got := updated.Attributes["priority"]; got != "0" {
+		t.Fatalf("priority attribute = %q, want 0", got)
+	}
+	if got, okPriority := updated.Metadata["priority"].(int); !okPriority || got != 0 {
+		t.Fatalf("priority metadata = %#v, want int(0)", updated.Metadata["priority"])
+	}
+	if _, exists := updated.Attributes["header:X-Old"]; exists {
+		t.Fatal("old header was not replaced")
+	}
+	if got := updated.Attributes["header:X-New"]; got != "value" {
+		t.Fatalf("new header = %q, want value", got)
+	}
+	if got := updated.Attributes["excluded_models"]; got != "gpt-5" {
+		t.Fatalf("excluded_models attribute = %q, want gpt-5", got)
+	}
+	if got, okBool := updated.Metadata["disable_cooling"].(bool); !okBool || !got {
+		t.Fatalf("disable_cooling metadata = %#v, want true", updated.Metadata["disable_cooling"])
+	}
+	if got, okBool := updated.Metadata["websockets"].(bool); !okBool || !got {
+		t.Fatalf("websockets metadata = %#v, want true", updated.Metadata["websockets"])
+	}
+
+	clearBody := `{"names":["xai-batch.json"],"fields":{"priority":null,"headers":{},"excluded_models":[]}}`
+	clearRec := httptest.NewRecorder()
+	clearCtx, _ := gin.CreateTestContext(clearRec)
+	clearReq := httptest.NewRequest(http.MethodPatch, "/v0/management/auth-files/fields", strings.NewReader(clearBody))
+	clearReq.Header.Set("Content-Type", "application/json")
+	clearCtx.Request = clearReq
+	h.PatchAuthFileFields(clearCtx)
+	if clearRec.Code != http.StatusOK {
+		t.Fatalf("clear status = %d, want %d; body=%s", clearRec.Code, http.StatusOK, clearRec.Body.String())
+	}
+
+	cleared, _ := manager.GetByID(record.ID)
+	for _, key := range []string{"priority", "headers", "excluded_models"} {
+		if _, exists := cleared.Metadata[key]; exists {
+			t.Fatalf("metadata %q was not cleared: %#v", key, cleared.Metadata[key])
+		}
+	}
+	for _, key := range []string{"priority", "header:X-New", "excluded_models"} {
+		if _, exists := cleared.Attributes[key]; exists {
+			t.Fatalf("attribute %q was not cleared: %#v", key, cleared.Attributes[key])
+		}
+	}
+}
+
+func TestPatchAuthFileFields_BatchReturnsPerTargetFailures(t *testing.T) {
+	manager := coreauth.NewManager(&memoryAuthStore{}, nil, nil)
+	for _, record := range []*coreauth.Auth{
+		{ID: "codex.json", FileName: "codex.json", Provider: "codex", Attributes: map[string]string{"path": "/tmp/codex.json"}, Metadata: map[string]any{"type": "codex"}},
+		{ID: "claude.json", FileName: "claude.json", Provider: "claude", Attributes: map[string]string{"path": "/tmp/claude.json"}, Metadata: map[string]any{"type": "claude"}},
+	} {
+		if _, errRegister := manager.Register(context.Background(), record); errRegister != nil {
+			t.Fatalf("register %s: %v", record.ID, errRegister)
+		}
+	}
+
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, manager)
+	hooked := make([]string, 0, 1)
+	h.SetAuthStatusHook(func(_ context.Context, auth *coreauth.Auth) {
+		if auth != nil {
+			hooked = append(hooked, auth.ID)
+		}
+	})
+
+	body := `{"names":["codex.json","claude.json","missing.json"],"fields":{"websockets":true}}`
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	req := httptest.NewRequest(http.MethodPatch, "/v0/management/auth-files/fields", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	ctx.Request = req
+	h.PatchAuthFileFields(ctx)
+
+	if rec.Code != http.StatusMultiStatus {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusMultiStatus, rec.Body.String())
+	}
+	var response struct {
+		Matched int                         `json:"matched"`
+		Updated int                         `json:"updated"`
+		Files   []string                    `json:"files"`
+		Failed  []authFileFieldPatchFailure `json:"failed"`
+	}
+	if errDecode := json.Unmarshal(rec.Body.Bytes(), &response); errDecode != nil {
+		t.Fatalf("decode response: %v", errDecode)
+	}
+	if response.Matched != 2 || response.Updated != 1 || len(response.Files) != 1 || response.Files[0] != "codex.json" {
+		t.Fatalf("unexpected batch response: %#v", response)
+	}
+	if len(response.Failed) != 2 || response.Failed[0].Status != http.StatusBadRequest || response.Failed[1].Status != http.StatusNotFound {
+		t.Fatalf("unexpected failures: %#v", response.Failed)
+	}
+	if len(hooked) != 1 || hooked[0] != "codex.json" {
+		t.Fatalf("hooked auths = %#v, want [codex.json]", hooked)
+	}
+	updated, _ := manager.GetByID("codex.json")
+	if got, ok := updated.Metadata["websockets"].(bool); !ok || !got {
+		t.Fatalf("codex websockets = %#v, want true", updated.Metadata["websockets"])
+	}
+	unchanged, _ := manager.GetByID("claude.json")
+	if _, exists := unchanged.Metadata["websockets"]; exists {
+		t.Fatalf("unsupported target was mutated: %#v", unchanged.Metadata)
+	}
+}
+
+func TestPatchAuthFileFields_BatchMergesGlobalOAuthExclusions(t *testing.T) {
+	manager := coreauth.NewManager(&memoryAuthStore{}, nil, nil)
+	record := &coreauth.Auth{
+		ID:         "codex-oauth.json",
+		FileName:   "codex-oauth.json",
+		Provider:   "codex",
+		Attributes: map[string]string{"path": "/tmp/codex-oauth.json", "auth_kind": "oauth"},
+		Metadata:   map[string]any{"type": "codex"},
+	}
+	if _, errRegister := manager.Register(context.Background(), record); errRegister != nil {
+		t.Fatalf("register codex auth: %v", errRegister)
+	}
+
+	h := NewHandlerWithoutConfigFilePath(&config.Config{
+		AuthDir:             t.TempDir(),
+		OAuthExcludedModels: map[string][]string{"codex": {"global-model"}},
+	}, manager)
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	req := httptest.NewRequest(http.MethodPatch, "/v0/management/auth-files/fields", strings.NewReader(`{"names":["codex-oauth.json"],"fields":{"excluded_models":["local-model"]}}`))
+	req.Header.Set("Content-Type", "application/json")
+	ctx.Request = req
+	h.PatchAuthFileFields(ctx)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	updated, _ := manager.GetByID(record.ID)
+	if got := updated.Attributes["excluded_models"]; got != "global-model,local-model" {
+		t.Fatalf("effective excluded_models = %q, want global-model,local-model", got)
+	}
+	if got := updated.Attributes["excluded_models_hash"]; got == "" {
+		t.Fatal("excluded_models_hash was not refreshed")
+	}
+	if got := updated.Metadata["excluded_models"]; fmt.Sprint(got) != "[local-model]" {
+		t.Fatalf("persisted per-auth excluded_models = %#v, want [local-model]", got)
+	}
+}
+
+func TestPatchAuthFileFields_BatchRejectsCaseInsensitiveDuplicateHeaders(t *testing.T) {
+	manager := coreauth.NewManager(&memoryAuthStore{}, nil, nil)
+	record := &coreauth.Auth{
+		ID:         "headers.json",
+		FileName:   "headers.json",
+		Provider:   "claude",
+		Attributes: map[string]string{"path": "/tmp/headers.json"},
+		Metadata:   map[string]any{"type": "claude"},
+	}
+	if _, errRegister := manager.Register(context.Background(), record); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, manager)
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	req := httptest.NewRequest(http.MethodPatch, "/v0/management/auth-files/fields", strings.NewReader(`{"names":["headers.json"],"fields":{"headers":{"X-Test":"a","x-test":"b"}}}`))
+	req.Header.Set("Content-Type", "application/json")
+	ctx.Request = req
+	h.PatchAuthFileFields(ctx)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusBadRequest, rec.Body.String())
+	}
+	updated, _ := manager.GetByID(record.ID)
+	if _, exists := updated.Metadata["headers"]; exists {
+		t.Fatalf("duplicate headers request mutated auth: %#v", updated.Metadata)
+	}
+}
+
+type countingAuthStore struct {
+	memoryAuthStore
+	saveCalls int
+}
+
+func (s *countingAuthStore) Save(ctx context.Context, auth *coreauth.Auth) (string, error) {
+	s.saveCalls++
+	return s.memoryAuthStore.Save(ctx, auth)
 }
 
 func TestBuildAuthFileEntry_XAIEffectiveBooleanDefaults(t *testing.T) {
