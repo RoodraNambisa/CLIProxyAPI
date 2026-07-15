@@ -62,7 +62,7 @@ func NewProxyAwareHTTPClient(ctx context.Context, cfg *config.Config, auth *clip
 		if transport := cachedTransportForProxyURL(proxyURL); transport != nil {
 			return newProxyHTTPClient(transport, timeout)
 		}
-		log.Debugf("failed to setup proxy from URL: %s, falling back to injected/default transport", proxyURL)
+		log.Debugf("failed to setup proxy from URL: %s, falling back to injected/default transport", proxyutil.MaskProxyURL(proxyURL))
 	}
 
 	if contextTransport != nil {
@@ -93,7 +93,7 @@ func NewProxyAwareHTTP1Client(ctx context.Context, cfg *config.Config, auth *cli
 		if transport := cachedHTTP1TransportForProxyURL(proxyURL); transport != nil {
 			return newProxyHTTPClient(transport, timeout)
 		}
-		log.Debugf("failed to setup HTTP/1.1 proxy from URL: %s, falling back to injected/default transport", proxyURL)
+		log.Debugf("failed to setup HTTP/1.1 proxy from URL: %s, falling back to injected/default transport", proxyutil.MaskProxyURL(proxyURL))
 	}
 
 	if contextTransport != nil {

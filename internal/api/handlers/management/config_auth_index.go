@@ -6,6 +6,7 @@ import (
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/watcher/synthesizer"
+	"github.com/router-for-me/CLIProxyAPI/v6/sdk/proxyutil"
 )
 
 type geminiKeyWithAuthIndex struct {
@@ -98,6 +99,7 @@ func (h *Handler) geminiKeysWithAuthIndex() []geminiKeyWithAuthIndex {
 			id, _ := idGen.Next("gemini:apikey", key, entry.BaseURL)
 			authIndex = liveIndexByID[id]
 		}
+		entry.ProxyURL = proxyutil.MaskProxyURL(entry.ProxyURL)
 		out[i] = geminiKeyWithAuthIndex{
 			GeminiKey: entry,
 			AuthIndex: authIndex,
@@ -127,6 +129,7 @@ func (h *Handler) interactionsKeysWithAuthIndex() []geminiKeyWithAuthIndex {
 			id, _ := idGen.Next("gemini-interactions:apikey", key, entry.BaseURL)
 			authIndex = liveIndexByID[id]
 		}
+		entry.ProxyURL = proxyutil.MaskProxyURL(entry.ProxyURL)
 		out[i] = geminiKeyWithAuthIndex{
 			GeminiKey: entry,
 			AuthIndex: authIndex,
@@ -156,6 +159,7 @@ func (h *Handler) claudeKeysWithAuthIndex() []claudeKeyWithAuthIndex {
 			id, _ := idGen.Next("claude:apikey", key, entry.BaseURL)
 			authIndex = liveIndexByID[id]
 		}
+		entry.ProxyURL = proxyutil.MaskProxyURL(entry.ProxyURL)
 		out[i] = claudeKeyWithAuthIndex{
 			ClaudeKey: entry,
 			AuthIndex: authIndex,
@@ -185,6 +189,7 @@ func (h *Handler) codexKeysWithAuthIndex() []codexKeyWithAuthIndex {
 			id, _ := idGen.Next("codex:apikey", key, entry.BaseURL)
 			authIndex = liveIndexByID[id]
 		}
+		entry.ProxyURL = proxyutil.MaskProxyURL(entry.ProxyURL)
 		out[i] = codexKeyWithAuthIndex{
 			CodexKey:  entry,
 			AuthIndex: authIndex,
@@ -211,6 +216,7 @@ func (h *Handler) vertexCompatKeysWithAuthIndex() []vertexCompatKeyWithAuthIndex
 		entry := h.cfg.VertexCompatAPIKey[i]
 		id, _ := idGen.Next("vertex:apikey", entry.APIKey, entry.BaseURL, entry.ProxyURL)
 		authIndex := liveIndexByID[id]
+		entry.ProxyURL = proxyutil.MaskProxyURL(entry.ProxyURL)
 		out[i] = vertexCompatKeyWithAuthIndex{
 			VertexCompatKey: entry,
 			AuthIndex:       authIndex,
@@ -260,6 +266,7 @@ func (h *Handler) openAICompatibilityWithAuthIndex() []openAICompatibilityWithAu
 			for j := range entry.APIKeyEntries {
 				apiKeyEntry := entry.APIKeyEntries[j]
 				id, _ := idGen.Next(idKind, apiKeyEntry.APIKey, entry.BaseURL, apiKeyEntry.ProxyURL)
+				apiKeyEntry.ProxyURL = proxyutil.MaskProxyURL(apiKeyEntry.ProxyURL)
 				response.APIKeyEntries[j] = openAICompatibilityAPIKeyWithAuthIndex{
 					OpenAICompatibilityAPIKey: apiKeyEntry,
 					AuthIndex:                 liveIndexByID[id],

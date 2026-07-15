@@ -9,6 +9,12 @@ type SDKConfig struct {
 	// ProxyURL is the URL of an optional proxy server to use for outbound requests.
 	ProxyURL string `yaml:"proxy-url" json:"proxy-url"`
 
+	// ProxyPools defines reusable structured proxy sources.
+	ProxyPools []ProxyPoolConfig `yaml:"proxy-pools" json:"proxy-pools,omitempty"`
+
+	// ProxyRules selects proxy pools by runtime provider and credential priority.
+	ProxyRules []ProxyRuleConfig `yaml:"proxy-rules" json:"proxy-rules,omitempty"`
+
 	// EnableGeminiCLIEndpoint is retained for v6 source compatibility and has no effect.
 	// Gemini CLI routes and execution support have been removed.
 	EnableGeminiCLIEndpoint bool `yaml:"-" json:"-"`
@@ -43,6 +49,30 @@ type SDKConfig struct {
 
 	// Images configures OpenAI Images compatibility backed by Codex Responses.
 	Images ImagesConfig `yaml:"images,omitempty" json:"images,omitempty"`
+}
+
+// ProxyPoolConfig defines one named proxy pool.
+type ProxyPoolConfig struct {
+	Name                 string                 `yaml:"name" json:"name"`
+	PlaceholderCharset   string                 `yaml:"placeholder-charset,omitempty" json:"placeholder-charset,omitempty"`
+	CheckIntervalSeconds int                    `yaml:"check-interval-seconds,omitempty" json:"check-interval-seconds,omitempty"`
+	BindAttempts         int                    `yaml:"bind-attempts,omitempty" json:"bind-attempts,omitempty"`
+	Entries              []ProxyPoolEntryConfig `yaml:"entries" json:"entries"`
+}
+
+// ProxyPoolEntryConfig defines a URL template and an optional compact port set.
+type ProxyPoolEntryConfig struct {
+	ID          string `yaml:"id" json:"id"`
+	URLTemplate string `yaml:"url-template" json:"url-template"`
+	Ports       string `yaml:"ports,omitempty" json:"ports,omitempty"`
+}
+
+// ProxyRuleConfig routes matching credentials through a named proxy pool.
+type ProxyRuleConfig struct {
+	Name       string   `yaml:"name" json:"name"`
+	Pool       string   `yaml:"pool" json:"pool"`
+	Providers  []string `yaml:"providers,omitempty" json:"providers,omitempty"`
+	Priorities []int    `yaml:"priorities,omitempty" json:"priorities,omitempty"`
 }
 
 // APIKeyGroup restricts one configured API key to a set of runtime provider IDs.

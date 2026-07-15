@@ -14,6 +14,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v6/sdk/config"
+	"github.com/router-for-me/CLIProxyAPI/v6/sdk/proxyutil"
 	log "github.com/sirupsen/logrus"
 	"gopkg.in/yaml.v3"
 )
@@ -24,11 +25,23 @@ const (
 )
 
 func (h *Handler) GetConfig(c *gin.Context) {
-	if h == nil || h.cfg == nil {
+	if h == nil {
 		c.JSON(200, gin.H{})
 		return
 	}
-	c.JSON(200, new(*h.cfg))
+	h.mu.Lock()
+	if h.cfg == nil {
+		h.mu.Unlock()
+		c.JSON(200, gin.H{})
+		return
+	}
+	snapshot, errSnapshot := cloneConfigWithMaskedProxyURLs(h.cfg)
+	h.mu.Unlock()
+	if errSnapshot != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to snapshot configuration"})
+		return
+	}
+	c.JSON(200, &snapshot)
 }
 
 type releaseInfo struct {
@@ -40,8 +53,12 @@ type releaseInfo struct {
 func (h *Handler) GetLatestVersion(c *gin.Context) {
 	client := &http.Client{Timeout: 10 * time.Second}
 	proxyURL := ""
-	if h != nil && h.cfg != nil {
-		proxyURL = strings.TrimSpace(h.cfg.ProxyURL)
+	if h != nil {
+		h.mu.Lock()
+		if h.cfg != nil {
+			proxyURL = strings.TrimSpace(h.cfg.ProxyURL)
+		}
+		h.mu.Unlock()
 	}
 	if proxyURL != "" {
 		sdkCfg := &sdkconfig.SDKConfig{ProxyURL: proxyURL}
@@ -510,11 +527,52 @@ func (h *Handler) PutRoutingPriorityOverrides(c *gin.Context) {
 }
 
 // Proxy URL
-func (h *Handler) GetProxyURL(c *gin.Context) { c.JSON(200, gin.H{"proxy-url": h.cfg.ProxyURL}) }
+func (h *Handler) GetProxyURL(c *gin.Context) {
+	if h == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "configuration unavailable"})
+		return
+	}
+	h.mu.Lock()
+	if h.cfg == nil {
+		h.mu.Unlock()
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "configuration unavailable"})
+		return
+	}
+	proxyURL := proxyutil.MaskProxyURL(h.cfg.ProxyURL)
+	h.mu.Unlock()
+	c.JSON(200, gin.H{"proxy-url": proxyURL})
+}
 func (h *Handler) PutProxyURL(c *gin.Context) {
-	h.updateStringField(c, func(v string) { h.cfg.ProxyURL = v })
+	var body struct {
+		Value *string `json:"value"`
+	}
+	if errBind := c.ShouldBindJSON(&body); errBind != nil || body.Value == nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
+		return
+	}
+	h.mu.Lock()
+	previous := h.cfg.ProxyURL
+	value := strings.TrimSpace(*body.Value)
+	if isMaskedProxyURL(value) && !replaceMaskedProxyRequested(c) {
+		if value != proxyutil.MaskProxyURL(previous) {
+			h.mu.Unlock()
+			c.JSON(http.StatusBadRequest, gin.H{"error": "value must contain the complete proxy credential"})
+			return
+		}
+		value = previous
+	}
+	h.cfg.ProxyURL = value
+	if !h.persistLocked(c) {
+		h.cfg.ProxyURL = previous
+	}
+	h.mu.Unlock()
 }
 func (h *Handler) DeleteProxyURL(c *gin.Context) {
+	h.mu.Lock()
+	previous := h.cfg.ProxyURL
 	h.cfg.ProxyURL = ""
-	h.persist(c)
+	if !h.persistLocked(c) {
+		h.cfg.ProxyURL = previous
+	}
+	h.mu.Unlock()
 }

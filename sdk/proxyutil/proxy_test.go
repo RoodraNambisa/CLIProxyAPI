@@ -2,6 +2,7 @@ package proxyutil
 
 import (
 	"net/http"
+	"strings"
 	"testing"
 )
 
@@ -13,6 +14,30 @@ func mustDefaultTransport(t *testing.T) *http.Transport {
 		t.Fatal("http.DefaultTransport is not an *http.Transport")
 	}
 	return transport
+}
+
+func TestParseErrorDoesNotExposeProxyPassword(t *testing.T) {
+	_, errParse := Parse("http://user:sec%ret@proxy.example:8080")
+	if errParse == nil {
+		t.Fatal("Parse() error = nil")
+	}
+	if strings.Contains(errParse.Error(), "sec%ret") {
+		t.Fatalf("Parse() error leaked proxy password: %v", errParse)
+	}
+}
+
+func TestParseRejectsUnbracketedIPv6Proxy(t *testing.T) {
+	if _, errParse := Parse("socks5h://user:pass@2001:db8::1"); errParse == nil {
+		t.Fatal("Parse() error = nil")
+	}
+}
+
+func TestParseRejectsOutOfRangePort(t *testing.T) {
+	for _, raw := range []string{"http://proxy.example:0", "http://proxy.example:65536"} {
+		if _, errParse := Parse(raw); errParse == nil {
+			t.Fatalf("Parse(%q) error = nil", raw)
+		}
+	}
 }
 
 func TestParse(t *testing.T) {

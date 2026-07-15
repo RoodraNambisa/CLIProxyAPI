@@ -96,6 +96,28 @@ usage-pricing:
 # Per-entry proxy-url also supports "direct" or "none" to bypass both the global proxy-url and environment proxies explicitly.
 proxy-url: ""
 
+# Optional structured proxy pools. Port ranges stay compact and are selected when a credential is bound.
+# A {N} placeholder in proxy credentials is expanded once per binding with N URL-safe random characters.
+# proxy-pools:
+#   - name: "residential"
+#     placeholder-charset: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+#     check-interval-seconds: 300
+#     bind-attempts: 3
+#     entries:
+#       - id: "home"
+#         url-template: "socks5h://user:pass@10.0.0.6"
+#         ports: "3334,3336-6000"
+#       - id: "geo"
+#         url-template: "http://user-session-{9}:pass@geo.example:18080"
+
+# Ordered proxy rules. The first rule matching both provider and priority wins.
+# A matched rule never falls back to the global proxy or direct connections when its pool is unavailable.
+# proxy-rules:
+#   - name: "web-and-codex"
+#     pool: "residential"
+#     providers: ["chatgpt-web", "codex"]
+#     priorities: [0, -1]
+
 # When true, unprefixed model requests only use credentials without a prefix (except when prefix == model name).
 force-model-prefix: false
 

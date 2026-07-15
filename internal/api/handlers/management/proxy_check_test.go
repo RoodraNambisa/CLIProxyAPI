@@ -126,3 +126,14 @@ func TestCheckProxyURLInvalidProxyReturnsDiagnostic(t *testing.T) {
 		t.Fatalf("error = %q, want invalid_proxy", resp.Error)
 	}
 }
+
+func TestCheckProxyURLMasksMalformedCredential(t *testing.T) {
+	resp := checkProxyURL(context.Background(), "http://user:sec%ret@proxy.example:8080")
+	encoded, errEncode := json.Marshal(resp)
+	if errEncode != nil {
+		t.Fatalf("marshal response: %v", errEncode)
+	}
+	if bytes.Contains(encoded, []byte("sec%ret")) || !bytes.Contains(encoded, []byte("********")) {
+		t.Fatalf("response leaked proxy password: %s", encoded)
+	}
+}

@@ -1100,6 +1100,12 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 		}
 		return nil, err
 	}
+	if err = cfg.NormalizeProxyConfiguration(); err != nil {
+		if optional {
+			return &Config{}, nil
+		}
+		return nil, err
+	}
 	cfg.NoCooldownStatusCodes = NormalizeStatusCodes(cfg.NoCooldownStatusCodes)
 	cfg.FixedErrorCooldowns = NormalizeFixedErrorCooldowns(cfg.FixedErrorCooldowns)
 	cfg.NonRetryableErrors = NormalizeNonRetryableErrorRules(cfg.NonRetryableErrors)

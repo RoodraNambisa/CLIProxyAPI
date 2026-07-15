@@ -50,11 +50,21 @@ func Parse(raw string) (Setting, error) {
 	parsedURL, errParse := url.Parse(trimmed)
 	if errParse != nil {
 		setting.Mode = ModeInvalid
-		return setting, fmt.Errorf("parse proxy URL failed: %w", errParse)
+		return setting, fmt.Errorf("parse proxy URL failed")
 	}
 	if parsedURL.Scheme == "" || parsedURL.Host == "" {
 		setting.Mode = ModeInvalid
 		return setting, fmt.Errorf("proxy URL missing scheme/host")
+	}
+	if strings.Count(parsedURL.Host, ":") > 1 && !strings.HasPrefix(parsedURL.Host, "[") {
+		setting.Mode = ModeInvalid
+		return setting, fmt.Errorf("IPv6 proxy host must be enclosed in brackets")
+	}
+	if port := parsedURL.Port(); port != "" {
+		if _, errPort := parsePort(port); errPort != nil {
+			setting.Mode = ModeInvalid
+			return setting, fmt.Errorf("proxy URL contains an invalid port")
+		}
 	}
 
 	switch parsedURL.Scheme {

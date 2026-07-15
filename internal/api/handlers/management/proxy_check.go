@@ -39,8 +39,12 @@ type proxyCheckResponse struct {
 // GetProxyURLCheck checks the currently configured global proxy-url.
 func (h *Handler) GetProxyURLCheck(c *gin.Context) {
 	proxyURL := ""
-	if h != nil && h.cfg != nil {
-		proxyURL = h.cfg.ProxyURL
+	if h != nil {
+		h.mu.Lock()
+		if h.cfg != nil {
+			proxyURL = h.cfg.ProxyURL
+		}
+		h.mu.Unlock()
 	}
 	h.writeProxyURLCheck(c, proxyURL)
 }
@@ -66,11 +70,11 @@ func checkProxyURL(ctx context.Context, proxyURL string) proxyCheckResponse {
 	transport, mode, errTransport := proxyCheckTransport(proxyURL)
 	result := proxyCheckResponse{
 		Mode:     mode,
-		ProxyURL: proxyURL,
+		ProxyURL: proxyutil.MaskProxyURL(proxyURL),
 	}
 	if errTransport != nil {
 		result.Error = "invalid_proxy"
-		result.Message = errTransport.Error()
+		result.Message = "invalid proxy configuration"
 		return result
 	}
 
@@ -91,6 +95,9 @@ func checkProxyURL(ctx context.Context, proxyURL string) proxyCheckResponse {
 	if errDo != nil {
 		result.Error = "request_failed"
 		result.Message = errDo.Error()
+		if proxyURL != "" {
+			result.Message = strings.ReplaceAll(result.Message, proxyURL, proxyutil.MaskProxyURL(proxyURL))
+		}
 		return result
 	}
 	defer func() { _ = resp.Body.Close() }()

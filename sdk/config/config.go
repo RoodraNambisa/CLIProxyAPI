@@ -8,6 +8,9 @@ import internalconfig "github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 
 type SDKConfig = internalconfig.SDKConfig
 type APIKeyGroup = internalconfig.APIKeyGroup
+type ProxyPoolConfig = internalconfig.ProxyPoolConfig
+type ProxyPoolEntryConfig = internalconfig.ProxyPoolEntryConfig
+type ProxyRuleConfig = internalconfig.ProxyRuleConfig
 
 type Config = internalconfig.Config
 

@@ -8,6 +8,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v6/sdk/proxyutil"
 )
 
 // Generic helpers for list[string]
@@ -128,9 +129,18 @@ func (h *Handler) PutGeminiKeys(c *gin.Context) {
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	if errRestore := restoreMaskedProxyURLs(arr, h.cfg.GeminiKey,
+		func(entry config.GeminiKey) string { return entry.APIKey + "\x00" + entry.BaseURL },
+		func(entry *config.GeminiKey) *string { return &entry.ProxyURL }, replaceMaskedProxyRequested(c)); errRestore != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": errRestore.Error()})
+		return
+	}
+	previous := append([]config.GeminiKey(nil), h.cfg.GeminiKey...)
 	h.cfg.GeminiKey = append([]config.GeminiKey(nil), arr...)
 	h.cfg.SanitizeGeminiKeys()
-	h.persistLocked(c)
+	if !h.persistLocked(c) {
+		h.cfg.GeminiKey = previous
+	}
 }
 func (h *Handler) PatchGeminiKey(c *gin.Context) {
 	type geminiKeyPatch struct {
@@ -160,11 +170,16 @@ func (h *Handler) PatchGeminiKey(c *gin.Context) {
 	if targetIndex == -1 && body.Match != nil {
 		match := strings.TrimSpace(*body.Match)
 		if match != "" {
+			matchCount := 0
 			for i := range h.cfg.GeminiKey {
 				if h.cfg.GeminiKey[i].APIKey == match {
+					matchCount++
 					targetIndex = i
-					break
 				}
+			}
+			if matchCount > 1 {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "multiple items match api-key; index is required"})
+				return
 			}
 		}
 	}
@@ -173,13 +188,16 @@ func (h *Handler) PatchGeminiKey(c *gin.Context) {
 		return
 	}
 
+	previous := append([]config.GeminiKey(nil), h.cfg.GeminiKey...)
 	entry := h.cfg.GeminiKey[targetIndex]
 	if body.Value.APIKey != nil {
 		trimmed := strings.TrimSpace(*body.Value.APIKey)
 		if trimmed == "" {
 			h.cfg.GeminiKey = append(h.cfg.GeminiKey[:targetIndex], h.cfg.GeminiKey[targetIndex+1:]...)
 			h.cfg.SanitizeGeminiKeys()
-			h.persistLocked(c)
+			if !h.persistLocked(c) {
+				h.cfg.GeminiKey = previous
+			}
 			return
 		}
 		entry.APIKey = trimmed
@@ -191,7 +209,12 @@ func (h *Handler) PatchGeminiKey(c *gin.Context) {
 		entry.BaseURL = strings.TrimSpace(*body.Value.BaseURL)
 	}
 	if body.Value.ProxyURL != nil {
-		entry.ProxyURL = strings.TrimSpace(*body.Value.ProxyURL)
+		proxyURL, errProxy := applyProxyURLPatch(entry.ProxyURL, body.Value.ProxyURL, replaceMaskedProxyRequested(c))
+		if errProxy != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": errProxy.Error()})
+			return
+		}
+		entry.ProxyURL = proxyURL
 	}
 	if body.Value.Headers != nil {
 		entry.Headers = config.NormalizeHeaders(*body.Value.Headers)
@@ -201,12 +224,15 @@ func (h *Handler) PatchGeminiKey(c *gin.Context) {
 	}
 	h.cfg.GeminiKey[targetIndex] = entry
 	h.cfg.SanitizeGeminiKeys()
-	h.persistLocked(c)
+	if !h.persistLocked(c) {
+		h.cfg.GeminiKey = previous
+	}
 }
 
 func (h *Handler) DeleteGeminiKey(c *gin.Context) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	previous := append([]config.GeminiKey(nil), h.cfg.GeminiKey...)
 	if val := strings.TrimSpace(c.Query("api-key")); val != "" {
 		if baseRaw, okBase := c.GetQuery("base-url"); okBase {
 			base := strings.TrimSpace(baseRaw)
@@ -220,7 +246,9 @@ func (h *Handler) DeleteGeminiKey(c *gin.Context) {
 			if len(out) != len(h.cfg.GeminiKey) {
 				h.cfg.GeminiKey = out
 				h.cfg.SanitizeGeminiKeys()
-				h.persistLocked(c)
+				if !h.persistLocked(c) {
+					h.cfg.GeminiKey = previous
+				}
 			} else {
 				c.JSON(404, gin.H{"error": "item not found"})
 			}
@@ -247,7 +275,9 @@ func (h *Handler) DeleteGeminiKey(c *gin.Context) {
 		}
 		h.cfg.GeminiKey = append(h.cfg.GeminiKey[:matchIndex], h.cfg.GeminiKey[matchIndex+1:]...)
 		h.cfg.SanitizeGeminiKeys()
-		h.persistLocked(c)
+		if !h.persistLocked(c) {
+			h.cfg.GeminiKey = previous
+		}
 		return
 	}
 	if idxStr := c.Query("index"); idxStr != "" {
@@ -255,7 +285,9 @@ func (h *Handler) DeleteGeminiKey(c *gin.Context) {
 		if _, err := fmt.Sscanf(idxStr, "%d", &idx); err == nil && idx >= 0 && idx < len(h.cfg.GeminiKey) {
 			h.cfg.GeminiKey = append(h.cfg.GeminiKey[:idx], h.cfg.GeminiKey[idx+1:]...)
 			h.cfg.SanitizeGeminiKeys()
-			h.persistLocked(c)
+			if !h.persistLocked(c) {
+				h.cfg.GeminiKey = previous
+			}
 			return
 		}
 	}
@@ -286,9 +318,18 @@ func (h *Handler) PutInteractionsKeys(c *gin.Context) {
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	if errRestore := restoreMaskedProxyURLs(arr, h.cfg.InteractionsKey,
+		func(entry config.GeminiKey) string { return entry.APIKey + "\x00" + entry.BaseURL },
+		func(entry *config.GeminiKey) *string { return &entry.ProxyURL }, replaceMaskedProxyRequested(c)); errRestore != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": errRestore.Error()})
+		return
+	}
+	previous := append([]config.GeminiKey(nil), h.cfg.InteractionsKey...)
 	h.cfg.InteractionsKey = append([]config.GeminiKey(nil), arr...)
 	h.cfg.SanitizeInteractionsKeys()
-	h.persistLocked(c)
+	if !h.persistLocked(c) {
+		h.cfg.InteractionsKey = previous
+	}
 }
 
 func (h *Handler) PatchInteractionsKey(c *gin.Context) {
@@ -339,13 +380,16 @@ func (h *Handler) PatchInteractionsKey(c *gin.Context) {
 		return
 	}
 
+	previous := append([]config.GeminiKey(nil), h.cfg.InteractionsKey...)
 	entry := h.cfg.InteractionsKey[targetIndex]
 	if body.Value.APIKey != nil {
 		trimmed := strings.TrimSpace(*body.Value.APIKey)
 		if trimmed == "" {
 			h.cfg.InteractionsKey = append(h.cfg.InteractionsKey[:targetIndex], h.cfg.InteractionsKey[targetIndex+1:]...)
 			h.cfg.SanitizeInteractionsKeys()
-			h.persistLocked(c)
+			if !h.persistLocked(c) {
+				h.cfg.InteractionsKey = previous
+			}
 			return
 		}
 		entry.APIKey = trimmed
@@ -360,7 +404,12 @@ func (h *Handler) PatchInteractionsKey(c *gin.Context) {
 		entry.BaseURL = strings.TrimSpace(*body.Value.BaseURL)
 	}
 	if body.Value.ProxyURL != nil {
-		entry.ProxyURL = strings.TrimSpace(*body.Value.ProxyURL)
+		proxyURL, errProxy := applyProxyURLPatch(entry.ProxyURL, body.Value.ProxyURL, replaceMaskedProxyRequested(c))
+		if errProxy != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": errProxy.Error()})
+			return
+		}
+		entry.ProxyURL = proxyURL
 	}
 	if body.Value.Models != nil {
 		entry.Models = append([]config.GeminiModel(nil), (*body.Value.Models)...)
@@ -373,12 +422,15 @@ func (h *Handler) PatchInteractionsKey(c *gin.Context) {
 	}
 	h.cfg.InteractionsKey[targetIndex] = entry
 	h.cfg.SanitizeInteractionsKeys()
-	h.persistLocked(c)
+	if !h.persistLocked(c) {
+		h.cfg.InteractionsKey = previous
+	}
 }
 
 func (h *Handler) DeleteInteractionsKey(c *gin.Context) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	previous := append([]config.GeminiKey(nil), h.cfg.InteractionsKey...)
 	if val := strings.TrimSpace(c.Query("api-key")); val != "" {
 		if baseRaw, okBase := c.GetQuery("base-url"); okBase {
 			base := strings.TrimSpace(baseRaw)
@@ -392,7 +444,9 @@ func (h *Handler) DeleteInteractionsKey(c *gin.Context) {
 			if len(out) != len(h.cfg.InteractionsKey) {
 				h.cfg.InteractionsKey = out
 				h.cfg.SanitizeInteractionsKeys()
-				h.persistLocked(c)
+				if !h.persistLocked(c) {
+					h.cfg.InteractionsKey = previous
+				}
 			} else {
 				c.JSON(404, gin.H{"error": "item not found"})
 			}
@@ -419,7 +473,9 @@ func (h *Handler) DeleteInteractionsKey(c *gin.Context) {
 		}
 		h.cfg.InteractionsKey = append(h.cfg.InteractionsKey[:matchIndex], h.cfg.InteractionsKey[matchIndex+1:]...)
 		h.cfg.SanitizeInteractionsKeys()
-		h.persistLocked(c)
+		if !h.persistLocked(c) {
+			h.cfg.InteractionsKey = previous
+		}
 		return
 	}
 	if idxStr := c.Query("index"); idxStr != "" {
@@ -427,7 +483,9 @@ func (h *Handler) DeleteInteractionsKey(c *gin.Context) {
 		if _, errScan := fmt.Sscanf(idxStr, "%d", &idx); errScan == nil && idx >= 0 && idx < len(h.cfg.InteractionsKey) {
 			h.cfg.InteractionsKey = append(h.cfg.InteractionsKey[:idx], h.cfg.InteractionsKey[idx+1:]...)
 			h.cfg.SanitizeInteractionsKeys()
-			h.persistLocked(c)
+			if !h.persistLocked(c) {
+				h.cfg.InteractionsKey = previous
+			}
 			return
 		}
 	}
@@ -460,9 +518,18 @@ func (h *Handler) PutClaudeKeys(c *gin.Context) {
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	if errRestore := restoreMaskedProxyURLs(arr, h.cfg.ClaudeKey,
+		func(entry config.ClaudeKey) string { return entry.APIKey + "\x00" + entry.BaseURL },
+		func(entry *config.ClaudeKey) *string { return &entry.ProxyURL }, replaceMaskedProxyRequested(c)); errRestore != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": errRestore.Error()})
+		return
+	}
+	previous := append([]config.ClaudeKey(nil), h.cfg.ClaudeKey...)
 	h.cfg.ClaudeKey = arr
 	h.cfg.SanitizeClaudeKeys()
-	h.persistLocked(c)
+	if !h.persistLocked(c) {
+		h.cfg.ClaudeKey = previous
+	}
 }
 func (h *Handler) PatchClaudeKey(c *gin.Context) {
 	type claudeKeyPatch struct {
@@ -492,11 +559,16 @@ func (h *Handler) PatchClaudeKey(c *gin.Context) {
 	}
 	if targetIndex == -1 && body.Match != nil {
 		match := strings.TrimSpace(*body.Match)
+		matchCount := 0
 		for i := range h.cfg.ClaudeKey {
 			if h.cfg.ClaudeKey[i].APIKey == match {
+				matchCount++
 				targetIndex = i
-				break
 			}
+		}
+		if matchCount > 1 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "multiple items match api-key; index is required"})
+			return
 		}
 	}
 	if targetIndex == -1 {
@@ -504,6 +576,7 @@ func (h *Handler) PatchClaudeKey(c *gin.Context) {
 		return
 	}
 
+	previous := append([]config.ClaudeKey(nil), h.cfg.ClaudeKey...)
 	entry := h.cfg.ClaudeKey[targetIndex]
 	if body.Value.APIKey != nil {
 		entry.APIKey = strings.TrimSpace(*body.Value.APIKey)
@@ -515,7 +588,12 @@ func (h *Handler) PatchClaudeKey(c *gin.Context) {
 		entry.BaseURL = strings.TrimSpace(*body.Value.BaseURL)
 	}
 	if body.Value.ProxyURL != nil {
-		entry.ProxyURL = strings.TrimSpace(*body.Value.ProxyURL)
+		proxyURL, errProxy := applyProxyURLPatch(entry.ProxyURL, body.Value.ProxyURL, replaceMaskedProxyRequested(c))
+		if errProxy != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": errProxy.Error()})
+			return
+		}
+		entry.ProxyURL = proxyURL
 	}
 	if body.Value.Models != nil {
 		entry.Models = append([]config.ClaudeModel(nil), (*body.Value.Models)...)
@@ -529,12 +607,15 @@ func (h *Handler) PatchClaudeKey(c *gin.Context) {
 	normalizeClaudeKey(&entry)
 	h.cfg.ClaudeKey[targetIndex] = entry
 	h.cfg.SanitizeClaudeKeys()
-	h.persistLocked(c)
+	if !h.persistLocked(c) {
+		h.cfg.ClaudeKey = previous
+	}
 }
 
 func (h *Handler) DeleteClaudeKey(c *gin.Context) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	previous := append([]config.ClaudeKey(nil), h.cfg.ClaudeKey...)
 	if val := strings.TrimSpace(c.Query("api-key")); val != "" {
 		if baseRaw, okBase := c.GetQuery("base-url"); okBase {
 			base := strings.TrimSpace(baseRaw)
@@ -547,7 +628,9 @@ func (h *Handler) DeleteClaudeKey(c *gin.Context) {
 			}
 			h.cfg.ClaudeKey = out
 			h.cfg.SanitizeClaudeKeys()
-			h.persistLocked(c)
+			if !h.persistLocked(c) {
+				h.cfg.ClaudeKey = previous
+			}
 			return
 		}
 
@@ -569,7 +652,9 @@ func (h *Handler) DeleteClaudeKey(c *gin.Context) {
 			h.cfg.ClaudeKey = append(h.cfg.ClaudeKey[:matchIndex], h.cfg.ClaudeKey[matchIndex+1:]...)
 		}
 		h.cfg.SanitizeClaudeKeys()
-		h.persistLocked(c)
+		if !h.persistLocked(c) {
+			h.cfg.ClaudeKey = previous
+		}
 		return
 	}
 	if idxStr := c.Query("index"); idxStr != "" {
@@ -578,7 +663,9 @@ func (h *Handler) DeleteClaudeKey(c *gin.Context) {
 		if err == nil && idx >= 0 && idx < len(h.cfg.ClaudeKey) {
 			h.cfg.ClaudeKey = append(h.cfg.ClaudeKey[:idx], h.cfg.ClaudeKey[idx+1:]...)
 			h.cfg.SanitizeClaudeKeys()
-			h.persistLocked(c)
+			if !h.persistLocked(c) {
+				h.cfg.ClaudeKey = previous
+			}
 			return
 		}
 	}
@@ -615,9 +702,16 @@ func (h *Handler) PutOpenAICompat(c *gin.Context) {
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	if errRestore := restoreMaskedOpenAICompatibilityProxyURLs(filtered, h.cfg.OpenAICompatibility, replaceMaskedProxyRequested(c)); errRestore != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": errRestore.Error()})
+		return
+	}
+	previous := cloneOpenAICompatibilityEntries(h.cfg.OpenAICompatibility)
 	h.cfg.OpenAICompatibility = filtered
 	h.cfg.SanitizeOpenAICompatibility()
-	h.persistLocked(c)
+	if !h.persistLocked(c) {
+		h.cfg.OpenAICompatibility = previous
+	}
 }
 func (h *Handler) PatchOpenAICompat(c *gin.Context) {
 	type openAICompatPatch struct {
@@ -647,11 +741,16 @@ func (h *Handler) PatchOpenAICompat(c *gin.Context) {
 	}
 	if targetIndex == -1 && body.Name != nil {
 		match := strings.TrimSpace(*body.Name)
+		matchCount := 0
 		for i := range h.cfg.OpenAICompatibility {
 			if h.cfg.OpenAICompatibility[i].Name == match {
+				matchCount++
 				targetIndex = i
-				break
 			}
+		}
+		if matchCount > 1 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "multiple items match name; index is required"})
+			return
 		}
 	}
 	if targetIndex == -1 {
@@ -659,6 +758,7 @@ func (h *Handler) PatchOpenAICompat(c *gin.Context) {
 		return
 	}
 
+	previous := cloneOpenAICompatibilityEntries(h.cfg.OpenAICompatibility)
 	entry := h.cfg.OpenAICompatibility[targetIndex]
 	if body.Value.Name != nil {
 		entry.Name = strings.TrimSpace(*body.Value.Name)
@@ -674,13 +774,26 @@ func (h *Handler) PatchOpenAICompat(c *gin.Context) {
 		if trimmed == "" {
 			h.cfg.OpenAICompatibility = append(h.cfg.OpenAICompatibility[:targetIndex], h.cfg.OpenAICompatibility[targetIndex+1:]...)
 			h.cfg.SanitizeOpenAICompatibility()
-			h.persistLocked(c)
+			if !h.persistLocked(c) {
+				h.cfg.OpenAICompatibility = previous
+			}
 			return
 		}
 		entry.BaseURL = trimmed
 	}
 	if body.Value.APIKeyEntries != nil {
-		entry.APIKeyEntries = append([]config.OpenAICompatibilityAPIKey(nil), (*body.Value.APIKeyEntries)...)
+		patchedEntries := append([]config.OpenAICompatibilityAPIKey(nil), (*body.Value.APIKeyEntries)...)
+		if errRestore := restoreMaskedProxyURLs(
+			patchedEntries,
+			entry.APIKeyEntries,
+			func(key config.OpenAICompatibilityAPIKey) string { return key.APIKey },
+			func(key *config.OpenAICompatibilityAPIKey) *string { return &key.ProxyURL },
+			replaceMaskedProxyRequested(c),
+		); errRestore != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": errRestore.Error()})
+			return
+		}
+		entry.APIKeyEntries = patchedEntries
 	}
 	if body.Value.Models != nil {
 		entry.Models = append([]config.OpenAICompatibilityModel(nil), (*body.Value.Models)...)
@@ -691,22 +804,40 @@ func (h *Handler) PatchOpenAICompat(c *gin.Context) {
 	normalizeOpenAICompatibilityEntry(&entry)
 	h.cfg.OpenAICompatibility[targetIndex] = entry
 	h.cfg.SanitizeOpenAICompatibility()
-	h.persistLocked(c)
+	if !h.persistLocked(c) {
+		h.cfg.OpenAICompatibility = previous
+	}
 }
 
 func (h *Handler) DeleteOpenAICompat(c *gin.Context) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	previous := cloneOpenAICompatibilityEntries(h.cfg.OpenAICompatibility)
 	if name := c.Query("name"); name != "" {
-		out := make([]config.OpenAICompatibility, 0, len(h.cfg.OpenAICompatibility))
-		for _, v := range h.cfg.OpenAICompatibility {
-			if v.Name != name {
-				out = append(out, v)
+		matchCount := 0
+		matchIndex := -1
+		for index := range h.cfg.OpenAICompatibility {
+			if h.cfg.OpenAICompatibility[index].Name == name {
+				matchCount++
+				matchIndex = index
 			}
 		}
+		if matchCount == 0 {
+			c.JSON(http.StatusNotFound, gin.H{"error": "item not found"})
+			return
+		}
+		if matchCount > 1 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "multiple items match name; index is required"})
+			return
+		}
+		out := make([]config.OpenAICompatibility, 0, len(h.cfg.OpenAICompatibility))
+		out = append(out, h.cfg.OpenAICompatibility[:matchIndex]...)
+		out = append(out, h.cfg.OpenAICompatibility[matchIndex+1:]...)
 		h.cfg.OpenAICompatibility = out
 		h.cfg.SanitizeOpenAICompatibility()
-		h.persistLocked(c)
+		if !h.persistLocked(c) {
+			h.cfg.OpenAICompatibility = previous
+		}
 		return
 	}
 	if idxStr := c.Query("index"); idxStr != "" {
@@ -715,7 +846,9 @@ func (h *Handler) DeleteOpenAICompat(c *gin.Context) {
 		if err == nil && idx >= 0 && idx < len(h.cfg.OpenAICompatibility) {
 			h.cfg.OpenAICompatibility = append(h.cfg.OpenAICompatibility[:idx], h.cfg.OpenAICompatibility[idx+1:]...)
 			h.cfg.SanitizeOpenAICompatibility()
-			h.persistLocked(c)
+			if !h.persistLocked(c) {
+				h.cfg.OpenAICompatibility = previous
+			}
 			return
 		}
 	}
@@ -752,9 +885,18 @@ func (h *Handler) PutVertexCompatKeys(c *gin.Context) {
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	if errRestore := restoreMaskedProxyURLs(arr, h.cfg.VertexCompatAPIKey,
+		func(entry config.VertexCompatKey) string { return entry.APIKey + "\x00" + entry.BaseURL },
+		func(entry *config.VertexCompatKey) *string { return &entry.ProxyURL }, replaceMaskedProxyRequested(c)); errRestore != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": errRestore.Error()})
+		return
+	}
+	previous := append([]config.VertexCompatKey(nil), h.cfg.VertexCompatAPIKey...)
 	h.cfg.VertexCompatAPIKey = append([]config.VertexCompatKey(nil), arr...)
 	h.cfg.SanitizeVertexCompatKeys()
-	h.persistLocked(c)
+	if !h.persistLocked(c) {
+		h.cfg.VertexCompatAPIKey = previous
+	}
 }
 func (h *Handler) PatchVertexCompatKey(c *gin.Context) {
 	type vertexCompatPatch struct {
@@ -785,11 +927,16 @@ func (h *Handler) PatchVertexCompatKey(c *gin.Context) {
 	if targetIndex == -1 && body.Match != nil {
 		match := strings.TrimSpace(*body.Match)
 		if match != "" {
+			matchCount := 0
 			for i := range h.cfg.VertexCompatAPIKey {
 				if h.cfg.VertexCompatAPIKey[i].APIKey == match {
+					matchCount++
 					targetIndex = i
-					break
 				}
+			}
+			if matchCount > 1 {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "multiple items match api-key; index is required"})
+				return
 			}
 		}
 	}
@@ -798,13 +945,16 @@ func (h *Handler) PatchVertexCompatKey(c *gin.Context) {
 		return
 	}
 
+	previous := append([]config.VertexCompatKey(nil), h.cfg.VertexCompatAPIKey...)
 	entry := h.cfg.VertexCompatAPIKey[targetIndex]
 	if body.Value.APIKey != nil {
 		trimmed := strings.TrimSpace(*body.Value.APIKey)
 		if trimmed == "" {
 			h.cfg.VertexCompatAPIKey = append(h.cfg.VertexCompatAPIKey[:targetIndex], h.cfg.VertexCompatAPIKey[targetIndex+1:]...)
 			h.cfg.SanitizeVertexCompatKeys()
-			h.persistLocked(c)
+			if !h.persistLocked(c) {
+				h.cfg.VertexCompatAPIKey = previous
+			}
 			return
 		}
 		entry.APIKey = trimmed
@@ -817,13 +967,20 @@ func (h *Handler) PatchVertexCompatKey(c *gin.Context) {
 		if trimmed == "" {
 			h.cfg.VertexCompatAPIKey = append(h.cfg.VertexCompatAPIKey[:targetIndex], h.cfg.VertexCompatAPIKey[targetIndex+1:]...)
 			h.cfg.SanitizeVertexCompatKeys()
-			h.persistLocked(c)
+			if !h.persistLocked(c) {
+				h.cfg.VertexCompatAPIKey = previous
+			}
 			return
 		}
 		entry.BaseURL = trimmed
 	}
 	if body.Value.ProxyURL != nil {
-		entry.ProxyURL = strings.TrimSpace(*body.Value.ProxyURL)
+		proxyURL, errProxy := applyProxyURLPatch(entry.ProxyURL, body.Value.ProxyURL, replaceMaskedProxyRequested(c))
+		if errProxy != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": errProxy.Error()})
+			return
+		}
+		entry.ProxyURL = proxyURL
 	}
 	if body.Value.Headers != nil {
 		entry.Headers = config.NormalizeHeaders(*body.Value.Headers)
@@ -837,12 +994,15 @@ func (h *Handler) PatchVertexCompatKey(c *gin.Context) {
 	normalizeVertexCompatKey(&entry)
 	h.cfg.VertexCompatAPIKey[targetIndex] = entry
 	h.cfg.SanitizeVertexCompatKeys()
-	h.persistLocked(c)
+	if !h.persistLocked(c) {
+		h.cfg.VertexCompatAPIKey = previous
+	}
 }
 
 func (h *Handler) DeleteVertexCompatKey(c *gin.Context) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	previous := append([]config.VertexCompatKey(nil), h.cfg.VertexCompatAPIKey...)
 	if val := strings.TrimSpace(c.Query("api-key")); val != "" {
 		if baseRaw, okBase := c.GetQuery("base-url"); okBase {
 			base := strings.TrimSpace(baseRaw)
@@ -855,7 +1015,9 @@ func (h *Handler) DeleteVertexCompatKey(c *gin.Context) {
 			}
 			h.cfg.VertexCompatAPIKey = out
 			h.cfg.SanitizeVertexCompatKeys()
-			h.persistLocked(c)
+			if !h.persistLocked(c) {
+				h.cfg.VertexCompatAPIKey = previous
+			}
 			return
 		}
 
@@ -877,7 +1039,9 @@ func (h *Handler) DeleteVertexCompatKey(c *gin.Context) {
 			h.cfg.VertexCompatAPIKey = append(h.cfg.VertexCompatAPIKey[:matchIndex], h.cfg.VertexCompatAPIKey[matchIndex+1:]...)
 		}
 		h.cfg.SanitizeVertexCompatKeys()
-		h.persistLocked(c)
+		if !h.persistLocked(c) {
+			h.cfg.VertexCompatAPIKey = previous
+		}
 		return
 	}
 	if idxStr := c.Query("index"); idxStr != "" {
@@ -886,7 +1050,9 @@ func (h *Handler) DeleteVertexCompatKey(c *gin.Context) {
 		if errScan == nil && idx >= 0 && idx < len(h.cfg.VertexCompatAPIKey) {
 			h.cfg.VertexCompatAPIKey = append(h.cfg.VertexCompatAPIKey[:idx], h.cfg.VertexCompatAPIKey[idx+1:]...)
 			h.cfg.SanitizeVertexCompatKeys()
-			h.persistLocked(c)
+			if !h.persistLocked(c) {
+				h.cfg.VertexCompatAPIKey = previous
+			}
 			return
 		}
 	}
@@ -1128,9 +1294,18 @@ func (h *Handler) PutCodexKeys(c *gin.Context) {
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	if errRestore := restoreMaskedProxyURLs(filtered, h.cfg.CodexKey,
+		func(entry config.CodexKey) string { return entry.APIKey + "\x00" + entry.BaseURL },
+		func(entry *config.CodexKey) *string { return &entry.ProxyURL }, replaceMaskedProxyRequested(c)); errRestore != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": errRestore.Error()})
+		return
+	}
+	previous := append([]config.CodexKey(nil), h.cfg.CodexKey...)
 	h.cfg.CodexKey = filtered
 	h.cfg.SanitizeCodexKeys()
-	h.persistLocked(c)
+	if !h.persistLocked(c) {
+		h.cfg.CodexKey = previous
+	}
 }
 func (h *Handler) PatchCodexKey(c *gin.Context) {
 	type codexKeyPatch struct {
@@ -1160,11 +1335,16 @@ func (h *Handler) PatchCodexKey(c *gin.Context) {
 	}
 	if targetIndex == -1 && body.Match != nil {
 		match := strings.TrimSpace(*body.Match)
+		matchCount := 0
 		for i := range h.cfg.CodexKey {
 			if h.cfg.CodexKey[i].APIKey == match {
+				matchCount++
 				targetIndex = i
-				break
 			}
+		}
+		if matchCount > 1 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "multiple items match api-key; index is required"})
+			return
 		}
 	}
 	if targetIndex == -1 {
@@ -1172,6 +1352,7 @@ func (h *Handler) PatchCodexKey(c *gin.Context) {
 		return
 	}
 
+	previous := append([]config.CodexKey(nil), h.cfg.CodexKey...)
 	entry := h.cfg.CodexKey[targetIndex]
 	if body.Value.APIKey != nil {
 		entry.APIKey = strings.TrimSpace(*body.Value.APIKey)
@@ -1184,13 +1365,20 @@ func (h *Handler) PatchCodexKey(c *gin.Context) {
 		if trimmed == "" {
 			h.cfg.CodexKey = append(h.cfg.CodexKey[:targetIndex], h.cfg.CodexKey[targetIndex+1:]...)
 			h.cfg.SanitizeCodexKeys()
-			h.persistLocked(c)
+			if !h.persistLocked(c) {
+				h.cfg.CodexKey = previous
+			}
 			return
 		}
 		entry.BaseURL = trimmed
 	}
 	if body.Value.ProxyURL != nil {
-		entry.ProxyURL = strings.TrimSpace(*body.Value.ProxyURL)
+		proxyURL, errProxy := applyProxyURLPatch(entry.ProxyURL, body.Value.ProxyURL, replaceMaskedProxyRequested(c))
+		if errProxy != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": errProxy.Error()})
+			return
+		}
+		entry.ProxyURL = proxyURL
 	}
 	if body.Value.Models != nil {
 		entry.Models = append([]config.CodexModel(nil), (*body.Value.Models)...)
@@ -1204,12 +1392,15 @@ func (h *Handler) PatchCodexKey(c *gin.Context) {
 	normalizeCodexKey(&entry)
 	h.cfg.CodexKey[targetIndex] = entry
 	h.cfg.SanitizeCodexKeys()
-	h.persistLocked(c)
+	if !h.persistLocked(c) {
+		h.cfg.CodexKey = previous
+	}
 }
 
 func (h *Handler) DeleteCodexKey(c *gin.Context) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	previous := append([]config.CodexKey(nil), h.cfg.CodexKey...)
 	if val := strings.TrimSpace(c.Query("api-key")); val != "" {
 		if baseRaw, okBase := c.GetQuery("base-url"); okBase {
 			base := strings.TrimSpace(baseRaw)
@@ -1222,7 +1413,9 @@ func (h *Handler) DeleteCodexKey(c *gin.Context) {
 			}
 			h.cfg.CodexKey = out
 			h.cfg.SanitizeCodexKeys()
-			h.persistLocked(c)
+			if !h.persistLocked(c) {
+				h.cfg.CodexKey = previous
+			}
 			return
 		}
 
@@ -1244,7 +1437,9 @@ func (h *Handler) DeleteCodexKey(c *gin.Context) {
 			h.cfg.CodexKey = append(h.cfg.CodexKey[:matchIndex], h.cfg.CodexKey[matchIndex+1:]...)
 		}
 		h.cfg.SanitizeCodexKeys()
-		h.persistLocked(c)
+		if !h.persistLocked(c) {
+			h.cfg.CodexKey = previous
+		}
 		return
 	}
 	if idxStr := c.Query("index"); idxStr != "" {
@@ -1253,7 +1448,9 @@ func (h *Handler) DeleteCodexKey(c *gin.Context) {
 		if err == nil && idx >= 0 && idx < len(h.cfg.CodexKey) {
 			h.cfg.CodexKey = append(h.cfg.CodexKey[:idx], h.cfg.CodexKey[idx+1:]...)
 			h.cfg.SanitizeCodexKeys()
-			h.persistLocked(c)
+			if !h.persistLocked(c) {
+				h.cfg.CodexKey = previous
+			}
 			return
 		}
 	}
@@ -1277,18 +1474,130 @@ func normalizeOpenAICompatibilityEntry(entry *config.OpenAICompatibility) {
 	}
 }
 
+func applyProxyURLPatch(current string, incoming *string, replaceMasked bool) (string, error) {
+	if incoming == nil {
+		return current, nil
+	}
+	value := strings.TrimSpace(*incoming)
+	if replaceMasked || !isMaskedProxyURL(value) {
+		return value, nil
+	}
+	if value != proxyutil.MaskProxyURL(current) {
+		return "", fmt.Errorf("proxy-url must contain the complete proxy credential")
+	}
+	return current, nil
+}
+
+func sliceContainsMaskedProxyURL[T any](entries []T, proxyURL func(T) string) bool {
+	for _, entry := range entries {
+		if isMaskedProxyURL(proxyURL(entry)) {
+			return true
+		}
+	}
+	return false
+}
+
+func restoreMaskedProxyURLs[T any](incoming, current []T, identity func(T) string, proxyURL func(*T) *string, replaceMasked bool) error {
+	if replaceMasked {
+		return nil
+	}
+	used := make([]bool, len(current))
+	for incomingIndex := range incoming {
+		incomingURL := proxyURL(&incoming[incomingIndex])
+		if incomingURL == nil || !isMaskedProxyURL(*incomingURL) {
+			continue
+		}
+		incomingIdentity := identity(incoming[incomingIndex])
+		matched := -1
+		matchedRawURL := ""
+		for currentIndex := range current {
+			if used[currentIndex] || identity(current[currentIndex]) != incomingIdentity {
+				continue
+			}
+			currentURL := proxyURL(&current[currentIndex])
+			if currentURL == nil || proxyutil.MaskProxyURL(*currentURL) != *incomingURL {
+				continue
+			}
+			if matched >= 0 && *currentURL != matchedRawURL {
+				return fmt.Errorf("proxy-url is ambiguous; submit the complete proxy credential")
+			}
+			if matched < 0 {
+				matched = currentIndex
+				matchedRawURL = *currentURL
+			}
+		}
+		if matched < 0 {
+			return fmt.Errorf("proxy-url must contain the complete proxy credential")
+		}
+		used[matched] = true
+		*incomingURL = *proxyURL(&current[matched])
+	}
+	return nil
+}
+
+func restoreMaskedOpenAICompatibilityProxyURLs(incoming, current []config.OpenAICompatibility, replaceMasked bool) error {
+	if replaceMasked {
+		return nil
+	}
+	usedProviders := make([]bool, len(current))
+	for providerIndex := range incoming {
+		if !sliceContainsMaskedProxyURL(incoming[providerIndex].APIKeyEntries, func(key config.OpenAICompatibilityAPIKey) string { return key.ProxyURL }) {
+			continue
+		}
+		matchedProvider := -1
+		for currentIndex := range current {
+			if usedProviders[currentIndex] || !strings.EqualFold(strings.TrimSpace(incoming[providerIndex].Name), strings.TrimSpace(current[currentIndex].Name)) {
+				continue
+			}
+			if matchedProvider >= 0 {
+				return fmt.Errorf("proxy-url is ambiguous; submit the complete proxy credential")
+			}
+			matchedProvider = currentIndex
+		}
+		if matchedProvider < 0 {
+			return fmt.Errorf("proxy-url must contain the complete proxy credential")
+		}
+		if errRestore := restoreMaskedProxyURLs(
+			incoming[providerIndex].APIKeyEntries,
+			current[matchedProvider].APIKeyEntries,
+			func(entry config.OpenAICompatibilityAPIKey) string { return entry.APIKey },
+			func(entry *config.OpenAICompatibilityAPIKey) *string { return &entry.ProxyURL },
+			false,
+		); errRestore != nil {
+			return errRestore
+		}
+		usedProviders[matchedProvider] = true
+	}
+	return nil
+}
+
+func replaceMaskedProxyRequested(c *gin.Context) bool {
+	return c != nil && strings.EqualFold(strings.TrimSpace(c.Query("replace-masked-proxy")), "true")
+}
+
 func normalizedOpenAICompatibilityEntries(entries []config.OpenAICompatibility) []config.OpenAICompatibility {
+	out := cloneOpenAICompatibilityEntries(entries)
+	for i := range entries {
+		normalizeOpenAICompatibilityEntry(&out[i])
+	}
+	return out
+}
+
+func cloneOpenAICompatibilityEntries(entries []config.OpenAICompatibility) []config.OpenAICompatibility {
 	if len(entries) == 0 {
 		return nil
 	}
 	out := make([]config.OpenAICompatibility, len(entries))
 	for i := range entries {
-		copyEntry := entries[i]
-		if len(copyEntry.APIKeyEntries) > 0 {
-			copyEntry.APIKeyEntries = append([]config.OpenAICompatibilityAPIKey(nil), copyEntry.APIKeyEntries...)
+		out[i] = entries[i]
+		out[i].APIKeyEntries = append([]config.OpenAICompatibilityAPIKey(nil), entries[i].APIKeyEntries...)
+		out[i].Models = append([]config.OpenAICompatibilityModel(nil), entries[i].Models...)
+		if len(entries[i].Headers) > 0 {
+			out[i].Headers = make(map[string]string, len(entries[i].Headers))
+			for key, value := range entries[i].Headers {
+				out[i].Headers[key] = value
+			}
 		}
-		normalizeOpenAICompatibilityEntry(&copyEntry)
-		out[i] = copyEntry
 	}
 	return out
 }
