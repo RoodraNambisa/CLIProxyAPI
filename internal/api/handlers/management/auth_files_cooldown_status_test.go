@@ -18,6 +18,7 @@ func TestSummarizeAuthCooldown(t *testing.T) {
 	now := time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC)
 	authUntil := now.Add(10 * time.Minute)
 	modelUntil := now.Add(30 * time.Minute)
+	quotaUntil := now.Add(45 * time.Minute)
 
 	authWide := &coreauth.Auth{
 		Unavailable:    true,
@@ -69,6 +70,52 @@ func TestSummarizeAuthCooldown(t *testing.T) {
 	}
 	if got := modelCooldownForAuth(disabled, now, "any-model"); got.Active {
 		t.Fatalf("disabled model status = %#v, want inactive", got)
+	}
+
+	quotaExtended := &coreauth.Auth{
+		Unavailable:    true,
+		CooldownScope:  "auth",
+		NextRetryAfter: authUntil,
+		Quota:          coreauth.QuotaState{NextRecoverAt: quotaUntil},
+		ModelStates: map[string]*coreauth.ModelState{
+			"model-a": {
+				Unavailable:    true,
+				NextRetryAfter: modelUntil,
+				Quota:          coreauth.QuotaState{NextRecoverAt: quotaUntil},
+			},
+		},
+	}
+	if got := summarizeAuthCooldown(quotaExtended, now); !got.Active || got.Scope != "auth" || !got.Until.Equal(quotaUntil) {
+		t.Fatalf("quota-extended auth summary = %#v", got)
+	}
+	quotaExtended.CooldownScope = "model"
+	if got := summarizeAuthCooldown(quotaExtended, now); !got.Active || got.Scope != "model" || !got.Until.Equal(quotaUntil) {
+		t.Fatalf("quota-extended model summary = %#v", got)
+	}
+	if got := modelCooldownForAuth(quotaExtended, now, "model-a"); !got.Active || !got.Until.Equal(quotaUntil) {
+		t.Fatalf("quota-extended model status = %#v", got)
+	}
+
+	retryLater := &coreauth.Auth{
+		Unavailable:    true,
+		CooldownScope:  "auth",
+		NextRetryAfter: quotaUntil,
+		Quota:          coreauth.QuotaState{NextRecoverAt: authUntil},
+	}
+	if got := summarizeAuthCooldown(retryLater, now); !got.Active || !got.Until.Equal(quotaUntil) {
+		t.Fatalf("retry-later auth summary = %#v", got)
+	}
+
+	quotaOnly := &coreauth.Auth{
+		Unavailable:   true,
+		CooldownScope: "auth",
+		Quota:         coreauth.QuotaState{NextRecoverAt: quotaUntil},
+		ModelStates: map[string]*coreauth.ModelState{
+			"model-a": {Unavailable: true, Quota: coreauth.QuotaState{NextRecoverAt: quotaUntil}},
+		},
+	}
+	if got := summarizeAuthCooldown(quotaOnly, now); got.Active {
+		t.Fatalf("quota-only summary = %#v, want inactive", got)
 	}
 }
 

@@ -20,7 +20,7 @@ func summarizeAuthCooldown(auth *coreauth.Auth, now time.Time) authCooldownStatu
 		return authCooldownStatus{}
 	}
 	if auth.Unavailable && strings.EqualFold(strings.TrimSpace(auth.CooldownScope), "auth") && auth.NextRetryAfter.After(now) {
-		return authCooldownStatus{Active: true, Scope: "auth", Until: auth.NextRetryAfter}
+		return authCooldownStatus{Active: true, Scope: "auth", Until: cooldownUntil(auth.NextRetryAfter, auth.Quota.NextRecoverAt)}
 	}
 
 	status := authCooldownStatus{Scope: "model"}
@@ -30,8 +30,8 @@ func summarizeAuthCooldown(auth *coreauth.Auth, now time.Time) authCooldownStatu
 		}
 		status.Active = true
 		status.ModelCount++
-		if state.NextRetryAfter.After(status.Until) {
-			status.Until = state.NextRetryAfter
+		if until := cooldownUntil(state.NextRetryAfter, state.Quota.NextRecoverAt); until.After(status.Until) {
+			status.Until = until
 		}
 	}
 	if !status.Active {
@@ -45,7 +45,7 @@ func modelCooldownForAuth(auth *coreauth.Auth, now time.Time, modelIDs ...string
 		return authCooldownStatus{}
 	}
 	if auth.Unavailable && strings.EqualFold(strings.TrimSpace(auth.CooldownScope), "auth") && auth.NextRetryAfter.After(now) {
-		return authCooldownStatus{Active: true, Scope: "auth", Until: auth.NextRetryAfter}
+		return authCooldownStatus{Active: true, Scope: "auth", Until: cooldownUntil(auth.NextRetryAfter, auth.Quota.NextRecoverAt)}
 	}
 	for _, modelID := range modelIDs {
 		modelID = strings.TrimSpace(modelID)
@@ -59,7 +59,7 @@ func modelCooldownForAuth(auth *coreauth.Auth, now time.Time, modelIDs ...string
 		for _, candidate := range candidates {
 			state := auth.ModelStates[candidate]
 			if modelStateCooldownActive(state, now) {
-				return authCooldownStatus{Active: true, Scope: "model", Until: state.NextRetryAfter, ModelCount: 1}
+				return authCooldownStatus{Active: true, Scope: "model", Until: cooldownUntil(state.NextRetryAfter, state.Quota.NextRecoverAt), ModelCount: 1}
 			}
 		}
 	}
@@ -68,6 +68,13 @@ func modelCooldownForAuth(auth *coreauth.Auth, now time.Time, modelIDs ...string
 
 func modelStateCooldownActive(state *coreauth.ModelState, now time.Time) bool {
 	return state != nil && state.Status != coreauth.StatusDisabled && state.Unavailable && state.NextRetryAfter.After(now)
+}
+
+func cooldownUntil(nextRetryAfter, nextRecoverAt time.Time) time.Time {
+	if nextRecoverAt.After(nextRetryAfter) {
+		return nextRecoverAt
+	}
+	return nextRetryAfter
 }
 
 func applyAuthCooldownStatus(entry map[string]any, status authCooldownStatus) {
