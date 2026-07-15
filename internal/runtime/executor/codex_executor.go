@@ -543,7 +543,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	replayNamespace := helps.ReasoningReplayNamespace(ctx, e.Identifier(), replayAuthID)
 	body, replayScope := helps.ApplyCodexReasoningReplay(ctx, from.String(), replayNamespace, baseModel, originalPayload, body, req.Metadata, opts.Metadata, opts.Headers)
 	reporter.SetRequestServiceTierFromPayload(body)
-	imageRequest := codexHasImageGenerationTool(body)
+	imageRequest := cliproxyauth.PayloadHasImageGenerationTool(body)
 
 	url := strings.TrimSuffix(baseURL, "/") + "/responses"
 	httpReq, upstreamBody, identityState, err := e.cacheHelper(ctx, from, url, auth, req, originalPayload, body)
@@ -690,7 +690,7 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 	body = helps.SanitizeCodexReasoningEncryptedContent(ctx, "codex executor", body)
 	body = helps.NormalizeCodexToolSelection(body)
 	reporter.SetRequestServiceTierFromPayload(body)
-	imageRequest := codexHasImageGenerationTool(body)
+	imageRequest := cliproxyauth.PayloadHasImageGenerationTool(body)
 
 	url := strings.TrimSuffix(baseURL, "/") + "/responses/compact"
 	httpReq, upstreamBody, identityState, err := e.cacheHelper(ctx, from, url, auth, req, originalPayload, body)
@@ -812,7 +812,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	replayNamespace := helps.ReasoningReplayNamespace(ctx, e.Identifier(), replayAuthID)
 	body, replayScope := helps.ApplyCodexReasoningReplay(ctx, from.String(), replayNamespace, baseModel, originalPayload, body, req.Metadata, opts.Metadata, opts.Headers)
 	reporter.SetRequestServiceTierFromPayload(body)
-	imageRequest := codexHasImageGenerationTool(body)
+	imageRequest := cliproxyauth.PayloadHasImageGenerationTool(body)
 	imageStreamPassthrough := metadataBool(opts.Metadata, cliproxyexecutor.ImageGenerationStreamPassthroughMetadataKey) && from == sdktranslator.FormatOpenAIResponse && imageRequest
 	trustUpstreamSSE := metadataBool(opts.Metadata, cliproxyexecutor.TrustUpstreamSSEMetadataKey) && from == sdktranslator.FormatOpenAIResponse
 
@@ -1688,44 +1688,8 @@ func metadataBool(meta map[string]any, key string) bool {
 	}
 }
 
-func codexHasImageGenerationTool(body []byte) bool {
-	tools := gjson.GetBytes(body, "tools")
-	if !tools.IsArray() {
-		return false
-	}
-	for _, tool := range tools.Array() {
-		if codexToolHasImageGeneration(tool) {
-			return true
-		}
-	}
-	return false
-}
-
-func codexToolHasImageGeneration(tool gjson.Result) bool {
-	switch tool.Get("type").String() {
-	case "image_generation":
-		return true
-	case "function":
-		name := strings.TrimSpace(tool.Get("name").String())
-		if name == "" {
-			name = strings.TrimSpace(tool.Get("function.name").String())
-		}
-		return name == "image_gen.imagegen"
-	case "namespace":
-		if strings.TrimSpace(tool.Get("name").String()) != "image_gen" {
-			return false
-		}
-		for _, nestedTool := range tool.Get("tools").Array() {
-			if nestedTool.Get("type").String() == "function" && strings.TrimSpace(nestedTool.Get("name").String()) == "imagegen" {
-				return true
-			}
-		}
-	}
-	return false
-}
-
 func (e *CodexExecutor) applyDisabledImageGenerationToolPolicy(auth *cliproxyauth.Auth, body []byte) ([]byte, error) {
-	if !cliproxyauth.AuthDisablesImageGeneration(e.cfg, auth, e.Identifier()) || !codexHasImageGenerationTool(body) {
+	if !cliproxyauth.AuthDisablesImageGeneration(e.cfg, auth, e.Identifier()) || !cliproxyauth.PayloadHasImageGenerationTool(body) {
 		return body, nil
 	}
 	action, ok := config.NormalizeDisabledImageGenerationToolAction(disabledImageGenerationToolAction(e.cfg))
@@ -1790,7 +1754,7 @@ func removeCodexImageGenerationTool(body []byte) []byte {
 
 func removeCodexImageGenerationFromTool(tool gjson.Result) ([]byte, bool) {
 	if tool.Get("type").String() != "namespace" {
-		if codexToolHasImageGeneration(tool) {
+		if cliproxyauth.ToolHasImageGeneration(tool) {
 			return nil, false
 		}
 		return []byte(tool.Raw), true
@@ -1802,7 +1766,7 @@ func removeCodexImageGenerationFromTool(tool gjson.Result) ([]byte, bool) {
 	nested := []byte(`[]`)
 	nestedCount := 0
 	for _, candidate := range tool.Get("tools").Array() {
-		if candidate.Get("type").String() == "function" && strings.TrimSpace(candidate.Get("name").String()) == "imagegen" {
+		if cliproxyauth.IsImageGenerationNamespaceMember(candidate) {
 			continue
 		}
 		nested, _ = sjson.SetRawBytes(nested, fmt.Sprintf("%d", nestedCount), []byte(candidate.Raw))

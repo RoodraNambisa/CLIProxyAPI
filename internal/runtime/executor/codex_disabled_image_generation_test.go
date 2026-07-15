@@ -28,7 +28,7 @@ func TestCodexExecutorDisabledImageGenerationToolRemove(t *testing.T) {
 	if err != nil {
 		t.Fatalf("applyDisabledImageGenerationToolPolicy() error = %v", err)
 	}
-	if codexHasImageGenerationTool(got) {
+	if cliproxyauth.PayloadHasImageGenerationTool(got) {
 		t.Fatalf("body still has image_generation tool: %s", got)
 	}
 	if gjson.GetBytes(got, "tool_choice").Exists() {
@@ -77,7 +77,7 @@ func TestCodexExecutorDisabledImageGenerationToolRemoveFunctionForm(t *testing.T
 	if err != nil {
 		t.Fatalf("applyDisabledImageGenerationToolPolicy() error = %v", err)
 	}
-	if codexHasImageGenerationTool(got) {
+	if cliproxyauth.PayloadHasImageGenerationTool(got) {
 		t.Fatalf("body still has image function tool: %s", got)
 	}
 	if gotName := gjson.GetBytes(got, "tools.0.name").String(); gotName != "lookup" {
@@ -97,7 +97,7 @@ func TestCodexExecutorDisabledImageGenerationToolRemoveNamespaceMember(t *testin
 	if err != nil {
 		t.Fatalf("applyDisabledImageGenerationToolPolicy() error = %v", err)
 	}
-	if codexHasImageGenerationTool(got) {
+	if cliproxyauth.PayloadHasImageGenerationTool(got) {
 		t.Fatalf("body still has image namespace tool: %s", got)
 	}
 	if gotName := gjson.GetBytes(got, "tools.0.tools.0.name").String(); gotName != "inspect" {
@@ -108,6 +108,23 @@ func TestCodexExecutorDisabledImageGenerationToolRemoveNamespaceMember(t *testin
 	}
 	if gjson.GetBytes(got, "tool_choice").Exists() {
 		t.Fatalf("tool_choice still exists: %s", got)
+	}
+}
+
+func TestCodexExecutorDisabledImageGenerationToolRemoveNamespaceFunctionObject(t *testing.T) {
+	executor := NewCodexExecutor(&config.Config{AuthModelExclusions: []config.AuthModelExclusionRule{{DisableImageGeneration: true, Priorities: []int{-1}}}})
+	auth := &cliproxyauth.Auth{Provider: "codex", Attributes: map[string]string{"priority": "-1"}}
+	body := []byte(`{"tools":[{"type":"namespace","name":"image_gen","tools":[{"type":"function","function":{"name":"imagegen"}},{"type":"function","name":"inspect"}]}]}`)
+
+	got, err := executor.applyDisabledImageGenerationToolPolicy(auth, body)
+	if err != nil {
+		t.Fatalf("applyDisabledImageGenerationToolPolicy() error = %v", err)
+	}
+	if cliproxyauth.PayloadHasImageGenerationTool(got) {
+		t.Fatalf("body still has nested image function object: %s", got)
+	}
+	if gotName := gjson.GetBytes(got, "tools.0.tools.0.name").String(); gotName != "inspect" {
+		t.Fatalf("retained namespace tool = %q, want inspect", gotName)
 	}
 }
 

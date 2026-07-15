@@ -1,6 +1,9 @@
 package openai
 
 import (
+	"context"
+	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -8,10 +11,46 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/interfaces"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/api/handlers"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
+	coreexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v6/sdk/config"
 	"github.com/tidwall/gjson"
 )
+
+type responsesMetadataCaptureExecutor struct {
+	metadata map[string]any
+}
+
+func (e *responsesMetadataCaptureExecutor) Identifier() string { return "codex" }
+
+func (e *responsesMetadataCaptureExecutor) Execute(context.Context, *coreauth.Auth, coreexecutor.Request, coreexecutor.Options) (coreexecutor.Response, error) {
+	return coreexecutor.Response{}, errors.New("not implemented")
+}
+
+func (e *responsesMetadataCaptureExecutor) ExecuteStream(_ context.Context, _ *coreauth.Auth, _ coreexecutor.Request, opts coreexecutor.Options) (*coreexecutor.StreamResult, error) {
+	e.metadata = make(map[string]any, len(opts.Metadata))
+	for key, value := range opts.Metadata {
+		e.metadata[key] = value
+	}
+	chunks := make(chan coreexecutor.StreamChunk, 1)
+	chunks <- coreexecutor.StreamChunk{Payload: []byte(`data: {"type":"response.completed","response":{"id":"resp-1","output":[]}}`)}
+	close(chunks)
+	return &coreexecutor.StreamResult{Chunks: chunks}, nil
+}
+
+func (e *responsesMetadataCaptureExecutor) Refresh(_ context.Context, auth *coreauth.Auth) (*coreauth.Auth, error) {
+	return auth, nil
+}
+
+func (e *responsesMetadataCaptureExecutor) CountTokens(context.Context, *coreauth.Auth, coreexecutor.Request, coreexecutor.Options) (coreexecutor.Response, error) {
+	return coreexecutor.Response{}, errors.New("not implemented")
+}
+
+func (e *responsesMetadataCaptureExecutor) HttpRequest(context.Context, *coreauth.Auth, *http.Request) (*http.Response, error) {
+	return nil, errors.New("not implemented")
+}
 
 func newResponsesStreamTestHandler(t *testing.T) (*OpenAIResponsesAPIHandler, *httptest.ResponseRecorder, *gin.Context, http.Flusher) {
 	t.Helper()
@@ -30,6 +69,55 @@ func newResponsesStreamTestHandler(t *testing.T) (*OpenAIResponsesAPIHandler, *h
 	}
 
 	return h, recorder, c, flusher
+}
+
+func TestResponsesStreamingImageToolFormsEnablePassthrough(t *testing.T) {
+	tests := []struct {
+		name      string
+		tools     string
+		trustSSE  bool
+		wantImage bool
+		wantTrust bool
+	}{
+		{name: "native", tools: `[{"type":"image_generation"}]`, wantImage: true},
+		{name: "function", tools: `[{"type":"function","name":"image_gen.imagegen"}]`, wantImage: true},
+		{name: "namespace", tools: `[{"type":"namespace","name":"image_gen","tools":[{"type":"function","name":"imagegen"}]}]`, wantImage: true},
+		{name: "trusted function", tools: `[{"type":"function","name":"image_gen.imagegen"}]`, trustSSE: true, wantImage: true, wantTrust: true},
+		{name: "trusted text", tools: `[{"type":"function","name":"lookup"}]`, trustSSE: true, wantTrust: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			executor := &responsesMetadataCaptureExecutor{}
+			manager := coreauth.NewManager(nil, nil, nil)
+			manager.RegisterExecutor(executor)
+			model := "responses-image-tool-" + strings.ReplaceAll(tt.name, " ", "-")
+			auth := &coreauth.Auth{ID: model + "-auth", Provider: executor.Identifier(), Status: coreauth.StatusActive}
+			if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
+				t.Fatalf("register auth: %v", errRegister)
+			}
+			registry.GetGlobalRegistry().RegisterClient(auth.ID, auth.Provider, []*registry.ModelInfo{{ID: model}})
+			t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(auth.ID) })
+
+			cfg := &sdkconfig.SDKConfig{Streaming: sdkconfig.StreamingConfig{TrustUpstreamSSE: tt.trustSSE}}
+			h := NewOpenAIResponsesAPIHandler(handlers.NewBaseAPIHandlers(cfg, manager))
+			router := gin.New()
+			router.POST("/v1/responses", h.Responses)
+			body := fmt.Sprintf(`{"model":%q,"stream":true,"input":"draw","tools":%s}`, model, tt.tools)
+			request := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(body))
+			request.Header.Set("Content-Type", "application/json")
+			response := httptest.NewRecorder()
+			router.ServeHTTP(response, request)
+			if response.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200; body=%s", response.Code, response.Body.String())
+			}
+			if got, _ := executor.metadata[coreexecutor.ImageGenerationStreamPassthroughMetadataKey].(bool); got != tt.wantImage {
+				t.Fatalf("image passthrough metadata = %v, want %v", got, tt.wantImage)
+			}
+			if got, _ := executor.metadata[coreexecutor.TrustUpstreamSSEMetadataKey].(bool); got != tt.wantTrust {
+				t.Fatalf("trust SSE metadata = %v, want %v", got, tt.wantTrust)
+			}
+		})
+	}
 }
 
 func TestForwardResponsesStreamSeparatesDataOnlySSEChunks(t *testing.T) {

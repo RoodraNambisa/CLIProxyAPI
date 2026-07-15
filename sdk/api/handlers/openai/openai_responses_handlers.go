@@ -21,6 +21,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/api/handlers"
+	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
@@ -330,19 +331,6 @@ func responsesSSENeedsLineBreak(pending, chunk []byte) bool {
 	return false
 }
 
-func responsesRequestHasImageGenerationTool(rawJSON []byte) bool {
-	tools := gjson.GetBytes(rawJSON, "tools")
-	if !tools.IsArray() {
-		return false
-	}
-	for _, tool := range tools.Array() {
-		if tool.Get("type").String() == "image_generation" {
-			return true
-		}
-	}
-	return false
-}
-
 // OpenAIResponsesAPIHandler contains the handlers for OpenAIResponses API endpoints.
 // It holds a pool of clients to interact with the backend service.
 type OpenAIResponsesAPIHandler struct {
@@ -507,7 +495,7 @@ func (h *OpenAIResponsesAPIHandler) handleStreamingResponse(c *gin.Context, rawJ
 	// New core execution path
 	modelName := gjson.GetBytes(rawJSON, "model").String()
 	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
-	imageStreamPassthrough := responsesRequestHasImageGenerationTool(rawJSON)
+	imageStreamPassthrough := cliproxyauth.PayloadHasImageGenerationTool(rawJSON)
 	if imageStreamPassthrough {
 		cliCtx = handlers.WithImageGenerationStreamPassthrough(cliCtx, true)
 	}

@@ -6396,46 +6396,7 @@ func requestHasImageGenerationToolForFallback(req cliproxyexecutor.Request, opts
 	if len(payload) == 0 {
 		payload = opts.OriginalRequest
 	}
-	return payloadHasImageGenerationTool(payload)
-}
-
-func payloadHasImageGenerationTool(payload []byte) bool {
-	if len(payload) == 0 {
-		return false
-	}
-	tools := gjson.GetBytes(payload, "tools")
-	if !tools.IsArray() {
-		return false
-	}
-	for _, tool := range tools.Array() {
-		if payloadToolHasImageGeneration(tool) {
-			return true
-		}
-	}
-	return false
-}
-
-func payloadToolHasImageGeneration(tool gjson.Result) bool {
-	switch tool.Get("type").String() {
-	case "image_generation":
-		return true
-	case "function":
-		name := strings.TrimSpace(tool.Get("name").String())
-		if name == "" {
-			name = strings.TrimSpace(tool.Get("function.name").String())
-		}
-		return name == "image_gen.imagegen"
-	case "namespace":
-		if strings.TrimSpace(tool.Get("name").String()) != "image_gen" {
-			return false
-		}
-		for _, nestedTool := range tool.Get("tools").Array() {
-			if nestedTool.Get("type").String() == "function" && strings.TrimSpace(nestedTool.Get("name").String()) == "imagegen" {
-				return true
-			}
-		}
-	}
-	return false
+	return PayloadHasImageGenerationTool(payload)
 }
 
 func shouldFallbackToDisabledImageGenerationToolAction(err error) bool {
