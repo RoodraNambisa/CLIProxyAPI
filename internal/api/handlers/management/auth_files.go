@@ -254,12 +254,13 @@ func (h *Handler) ListAuthFiles(c *gin.Context) {
 	files := make([]gin.H, 0, len(auths))
 	managedEntryIndexes := make(map[string]int, len(auths))
 	managedEntryNames := make(map[string]int, len(auths))
+	now := time.Now()
 	for _, auth := range auths {
 		managedName, managed := h.managedAuthBackingFileName(auth)
 		if managed && !isTopLevelManagedAuthName(managedName) {
 			continue
 		}
-		if entry := h.buildAuthFileEntry(auth); entry != nil {
+		if entry := h.buildAuthFileEntryAt(auth, now); entry != nil {
 			files = append(files, entry)
 			if managed && managedName != "" {
 				managedEntryIndexes[managedAuthNameKey(managedName)] = len(files) - 1
@@ -331,18 +332,20 @@ func (h *Handler) listRetiredGeminiCLIAuthFiles() ([]gin.H, error) {
 		authfileguard.MarkRetired(path)
 		unlockPath()
 		fileEntry := gin.H{
-			"name":             diskFile.Name,
-			"size":             diskFile.Info.Size(),
-			"modtime":          diskFile.Info.ModTime(),
-			"type":             strings.TrimSpace(stringValue(metadata, "type")),
-			"provider":         "gemini-cli",
-			"email":            strings.TrimSpace(stringValue(metadata, "email")),
-			"unsupported":      true,
-			"retired":          true,
-			"runtime_eligible": false,
-			"support_status":   "unsupported",
-			"status":           "unsupported",
-			"status_message":   "Gemini CLI is no longer supported",
+			"name":                 diskFile.Name,
+			"size":                 diskFile.Info.Size(),
+			"modtime":              diskFile.Info.ModTime(),
+			"type":                 strings.TrimSpace(stringValue(metadata, "type")),
+			"provider":             "gemini-cli",
+			"email":                strings.TrimSpace(stringValue(metadata, "email")),
+			"unsupported":          true,
+			"retired":              true,
+			"runtime_eligible":     false,
+			"support_status":       "unsupported",
+			"status":               "unsupported",
+			"status_message":       "Gemini CLI is no longer supported",
+			"cooldown_active":      false,
+			"cooldown_model_count": 0,
 		}
 		if disabled, ok := metadata["disabled"].(bool); ok {
 			fileEntry["disabled"] = disabled
@@ -364,7 +367,8 @@ func (h *Handler) GetAuthFileModels(c *gin.Context) {
 	}
 
 	var authID string
-	if auth := h.findManagedAuth(name); auth != nil {
+	auth := h.findManagedAuth(name)
+	if auth != nil {
 		authID = auth.ID
 	}
 
@@ -384,6 +388,7 @@ func (h *Handler) GetAuthFileModels(c *gin.Context) {
 	models := reg.GetModelsForClient(authID)
 
 	result := make([]gin.H, 0, len(models))
+	now := time.Now()
 	for _, m := range models {
 		entry := gin.H{
 			"id": m.ID,
@@ -397,6 +402,7 @@ func (h *Handler) GetAuthFileModels(c *gin.Context) {
 		if m.OwnedBy != "" {
 			entry["owned_by"] = m.OwnedBy
 		}
+		applyModelCooldownStatus(entry, modelCooldownForAuth(auth, now, m.ID, m.UpstreamID, strings.TrimPrefix(m.Name, "models/")))
 		result = append(result, entry)
 	}
 
@@ -412,7 +418,13 @@ func (h *Handler) listAuthFilesFromDisk(c *gin.Context) {
 	}
 	files := make([]gin.H, 0)
 	for _, diskFile := range diskFiles {
-		fileData := gin.H{"name": diskFile.Name, "size": diskFile.Info.Size(), "modtime": diskFile.Info.ModTime()}
+		fileData := gin.H{
+			"name":                 diskFile.Name,
+			"size":                 diskFile.Info.Size(),
+			"modtime":              diskFile.Info.ModTime(),
+			"cooldown_active":      false,
+			"cooldown_model_count": 0,
+		}
 
 		// Read file to get type field
 		path, _, errPath := h.resolveManagedAuthFilePath(diskFile.Name)
@@ -474,6 +486,10 @@ func (h *Handler) listAuthFilesFromDisk(c *gin.Context) {
 }
 
 func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
+	return h.buildAuthFileEntryAt(auth, time.Now())
+}
+
+func (h *Handler) buildAuthFileEntryAt(auth *coreauth.Auth, now time.Time) gin.H {
 	if auth == nil {
 		return nil
 	}
@@ -508,6 +524,7 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
 		"source":         "memory",
 		"size":           int64(0),
 	}
+	applyAuthCooldownStatus(entry, summarizeAuthCooldown(auth, now))
 	if email := authEmail(auth); email != "" {
 		entry["email"] = email
 	}
