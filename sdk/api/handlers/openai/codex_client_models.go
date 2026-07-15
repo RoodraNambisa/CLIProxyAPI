@@ -30,10 +30,6 @@ var codexClientAllowedReasoningLevels = map[string]struct{}{
 	"ultra":  {},
 }
 
-func (h *OpenAIAPIHandler) codexClientModelsResponse() map[string]any {
-	return CodexClientModelsResponse(h.Models())
-}
-
 func CodexClientModelsResponse(models []map[string]any) map[string]any {
 	return map[string]any{
 		"models": buildCodexClientModels(models),

@@ -17,8 +17,10 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/constant"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
+	sdkaccess "github.com/router-for-me/CLIProxyAPI/v6/sdk/access"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	coreexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/config"
@@ -140,6 +142,109 @@ func excludeExecutionProvider(providers []string, excluded string) []string {
 		}
 	}
 	return out
+}
+
+func allowedProviderSetFromGin(c *gin.Context) (map[string]struct{}, bool) {
+	if c == nil {
+		return nil, false
+	}
+	rawMetadata, exists := c.Get("accessMetadata")
+	if !exists {
+		return nil, false
+	}
+	metadata, ok := rawMetadata.(map[string]string)
+	if !ok {
+		return nil, false
+	}
+	rawProviders := strings.TrimSpace(metadata[sdkaccess.MetadataAllowedProviders])
+	if rawProviders == "" {
+		return nil, false
+	}
+	allowed := make(map[string]struct{})
+	for _, rawProvider := range strings.Split(rawProviders, ",") {
+		provider := strings.ToLower(strings.TrimSpace(rawProvider))
+		if provider != "" {
+			allowed[provider] = struct{}{}
+		}
+	}
+	if len(allowed) == 0 {
+		return nil, false
+	}
+	return allowed, true
+}
+
+func allowedProviderSetFromContext(ctx context.Context) (map[string]struct{}, bool) {
+	if ctx == nil {
+		return nil, false
+	}
+	ginContext, _ := ctx.Value("gin").(*gin.Context)
+	return allowedProviderSetFromGin(ginContext)
+}
+
+func restrictExecutionProviders(ctx context.Context, providers []string) ([]string, *interfaces.ErrorMessage) {
+	allowed, restricted := allowedProviderSetFromContext(ctx)
+	if !restricted {
+		return providers, nil
+	}
+	filtered := make([]string, 0, len(providers))
+	for _, provider := range providers {
+		if _, ok := allowed[strings.ToLower(strings.TrimSpace(provider))]; ok {
+			filtered = append(filtered, provider)
+		}
+	}
+	if len(filtered) > 0 {
+		return filtered, nil
+	}
+	return nil, providerNotAllowedError()
+}
+
+// ValidateModelProviderAccess checks a model route without selecting or executing an auth.
+func (h *BaseAPIHandler) ValidateModelProviderAccess(ctx context.Context, handlerType, modelName string) *interfaces.ErrorMessage {
+	if _, restricted := allowedProviderSetFromContext(ctx); !restricted {
+		return nil
+	}
+	providers, _, errDetails := h.getRequestDetails(modelName)
+	if errDetails != nil {
+		return errDetails
+	}
+	providers = adjustExecutionProvidersForEntryProtocol(handlerType, providers)
+	_, errRestricted := restrictExecutionProviders(ctx, providers)
+	return errRestricted
+}
+
+func providerNotAllowedError() *interfaces.ErrorMessage {
+	return &interfaces.ErrorMessage{
+		StatusCode: http.StatusForbidden,
+		Error:      errors.New(`{"error":{"message":"API key is not allowed to use this provider","type":"permission_error","code":"provider_not_allowed"}}`),
+	}
+}
+
+// FilterModelsByProviderAccess removes models that cannot use any provider allowed for the request API key.
+func (h *BaseAPIHandler) FilterModelsByProviderAccess(c *gin.Context, models []map[string]any) []map[string]any {
+	allowed, restricted := allowedProviderSetFromGin(c)
+	if !restricted {
+		return models
+	}
+	filtered := make([]map[string]any, 0, len(models))
+	modelRegistry := registry.GetGlobalRegistry()
+	for _, model := range models {
+		modelID, _ := model["id"].(string)
+		if strings.TrimSpace(modelID) == "" {
+			modelID, _ = model["name"].(string)
+		}
+		modelID = strings.TrimPrefix(strings.TrimSpace(modelID), "models/")
+		if modelID == "" {
+			continue
+		}
+		for _, provider := range modelRegistry.GetModelProviders(modelID) {
+			if _, ok := allowed[strings.ToLower(strings.TrimSpace(provider))]; !ok {
+				continue
+			}
+			filtered = append(filtered, model)
+			break
+		}
+	}
+	return filtered
 }
 
 // WithSelectedAuthIDCallback returns a child context that receives the selected auth ID.
@@ -659,6 +764,10 @@ func (h *BaseAPIHandler) ExecuteWithAuthManager(ctx context.Context, handlerType
 		return nil, nil, errMsg
 	}
 	providers = adjustExecutionProvidersForEntryProtocol(handlerType, providers)
+	providers, errMsg = restrictExecutionProviders(ctx, providers)
+	if errMsg != nil {
+		return nil, nil, errMsg
+	}
 	reqMeta := requestExecutionMetadata(ctx)
 	reqMeta[coreexecutor.RequestedModelMetadataKey] = normalizedModel
 	ctx, _ = h.attachRequestBodyRelease(ctx, rawJSON, reqMeta)
@@ -715,6 +824,10 @@ func (h *BaseAPIHandler) ExecuteWithProvidersAndExecutionModel(ctx context.Conte
 	}
 	if len(providers) == 0 {
 		return nil, nil, &interfaces.ErrorMessage{StatusCode: http.StatusBadGateway, Error: fmt.Errorf("no provider configured for model %s", normalizedRouteModel)}
+	}
+	providers, errRestricted := restrictExecutionProviders(ctx, providers)
+	if errRestricted != nil {
+		return nil, nil, errRestricted
 	}
 	reqMeta := requestExecutionMetadata(ctx)
 	reqMeta[coreexecutor.RequestedModelMetadataKey] = normalizedRouteModel
@@ -784,6 +897,10 @@ func (h *BaseAPIHandler) ExecuteCountWithAuthManager(ctx context.Context, handle
 		return nil, nil, errMsg
 	}
 	providers = adjustExecutionProvidersForEntryProtocol(handlerType, providers)
+	providers, errMsg = restrictExecutionProviders(ctx, providers)
+	if errMsg != nil {
+		return nil, nil, errMsg
+	}
 	reqMeta := requestExecutionMetadata(ctx)
 	reqMeta[coreexecutor.RequestedModelMetadataKey] = normalizedModel
 	ctx, _ = h.attachRequestBodyRelease(ctx, rawJSON, reqMeta)
@@ -841,6 +958,14 @@ func (h *BaseAPIHandler) ExecuteStreamWithAuthManager(ctx context.Context, handl
 }
 
 func (h *BaseAPIHandler) executeStreamWithResolvedProviders(ctx context.Context, providers []string, handlerType, normalizedRouteModel, executionModelName string, rawJSON []byte, alt string) (<-chan []byte, http.Header, <-chan *interfaces.ErrorMessage) {
+	var errRestricted *interfaces.ErrorMessage
+	providers, errRestricted = restrictExecutionProviders(ctx, providers)
+	if errRestricted != nil {
+		errChan := make(chan *interfaces.ErrorMessage, 1)
+		errChan <- errRestricted
+		close(errChan)
+		return nil, nil, errChan
+	}
 	if h != nil && h.AuthManager != nil {
 		ctx = h.AuthManager.WithRequestRetryBudgetForProviders(ctx, providers, StreamingBootstrapRetries(h.Cfg))
 	}

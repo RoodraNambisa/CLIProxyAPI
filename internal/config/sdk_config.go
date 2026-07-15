@@ -27,6 +27,9 @@ type SDKConfig struct {
 	// APIKeys is a list of keys for authenticating clients to this proxy server.
 	APIKeys []string `yaml:"api-keys" json:"api-keys"`
 
+	// APIKeyGroups optionally restricts API keys to selected runtime providers.
+	APIKeyGroups []APIKeyGroup `yaml:"api-key-groups" json:"api-key-groups"`
+
 	// PassthroughHeaders controls whether upstream response headers are forwarded to downstream clients.
 	// Default is false (disabled).
 	PassthroughHeaders bool `yaml:"passthrough-headers" json:"passthrough-headers"`
@@ -40,6 +43,12 @@ type SDKConfig struct {
 
 	// Images configures OpenAI Images compatibility backed by Codex Responses.
 	Images ImagesConfig `yaml:"images,omitempty" json:"images,omitempty"`
+}
+
+// APIKeyGroup restricts one configured API key to a set of runtime provider IDs.
+type APIKeyGroup struct {
+	APIKey    string   `yaml:"api-key" json:"api-key"`
+	Providers []string `yaml:"providers" json:"providers"`
 }
 
 // StreamingConfig holds server streaming behavior configuration.

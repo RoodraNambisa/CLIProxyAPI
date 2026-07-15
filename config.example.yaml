@@ -47,6 +47,12 @@ api-keys:
   - "your-api-key-2"
   - "your-api-key-3"
 
+# Optional provider restrictions for client API keys. Keys without a mapping can use all providers.
+# Provider IDs are matched exactly after trimming and lowercasing; use "xai" for Grok credentials.
+# api-key-groups:
+#   - api-key: "your-api-key-1"
+#     providers: ["codex", "xai"]
+
 # Enable debug logging
 debug: false
 

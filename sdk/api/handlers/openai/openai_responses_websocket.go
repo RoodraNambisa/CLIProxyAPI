@@ -172,6 +172,25 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 			continue
 		}
 		if shouldHandleResponsesWebsocketPrewarmLocally(payload, lastRequest, allowIncrementalInputWithPreviousResponseID) {
+			accessContext := context.WithValue(context.Background(), "gin", c)
+			modelName := gjson.GetBytes(requestJSON, "model").String()
+			if accessError := h.ValidateModelProviderAccess(accessContext, h.HandlerType(), modelName); accessError != nil {
+				h.LoggingAPIResponseError(accessContext, accessError)
+				markAPIResponseTimestamp(c)
+				errorPayload, errWrite := writeResponsesWebsocketError(conn, &wsTimelineLog, accessError)
+				log.Infof(
+					"responses websocket: downstream_out id=%s type=%d event=%s payload=%s",
+					passthroughSessionID,
+					websocket.TextMessage,
+					websocketPayloadEventType(errorPayload),
+					websocketPayloadPreview(errorPayload),
+				)
+				if errWrite != nil {
+					wsTerminateErr = errWrite
+					return
+				}
+				continue
+			}
 			if updated, errDelete := sjson.DeleteBytes(requestJSON, "generate"); errDelete == nil {
 				requestJSON = updated
 			}

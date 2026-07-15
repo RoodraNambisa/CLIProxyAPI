@@ -20,6 +20,9 @@ type Result struct {
 	Metadata  map[string]string
 }
 
+// MetadataAllowedProviders carries trusted comma-separated runtime provider restrictions.
+const MetadataAllowedProviders = "allowed_providers"
+
 var (
 	registryMu sync.RWMutex
 	registry   = make(map[string]Provider)

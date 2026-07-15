@@ -1112,6 +1112,10 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	}
 	cfg.RequestBodyRelease = NormalizeRequestBodyRelease(cfg.RequestBodyRelease)
 	cfg.NormalizeRequestBodyAudit()
+	cfg.APIKeyGroups, err = NormalizeAPIKeyGroups(cfg.APIKeyGroups, cfg.APIKeys)
+	if err != nil {
+		return nil, err
+	}
 
 	// Sanitize Gemini API key configuration and migrate legacy entries.
 	cfg.SanitizeGeminiKeys()
@@ -2106,6 +2110,73 @@ func NormalizeExcludedModels(models []string) []string {
 	return out
 }
 
+// NormalizeAPIKeyGroups validates provider restrictions against configured API keys.
+func NormalizeAPIKeyGroups(groups []APIKeyGroup, apiKeys []string) ([]APIKeyGroup, error) {
+	return normalizeAPIKeyGroups(groups, apiKeys, false)
+}
+
+// PruneAPIKeyGroups normalizes restrictions while removing mappings for deleted API keys.
+func PruneAPIKeyGroups(groups []APIKeyGroup, apiKeys []string) ([]APIKeyGroup, error) {
+	return normalizeAPIKeyGroups(groups, apiKeys, true)
+}
+
+func normalizeAPIKeyGroups(groups []APIKeyGroup, apiKeys []string, pruneUnknown bool) ([]APIKeyGroup, error) {
+	if len(groups) == 0 {
+		return nil, nil
+	}
+	configuredKeys := make(map[string]struct{}, len(apiKeys))
+	for _, rawKey := range apiKeys {
+		if key := strings.TrimSpace(rawKey); key != "" {
+			configuredKeys[key] = struct{}{}
+		}
+	}
+	seenKeys := make(map[string]struct{}, len(groups))
+	normalized := make([]APIKeyGroup, 0, len(groups))
+	for _, group := range groups {
+		key := strings.TrimSpace(group.APIKey)
+		if key == "" {
+			return nil, fmt.Errorf("api-key-groups contains an empty api-key")
+		}
+		if _, exists := configuredKeys[key]; !exists {
+			if pruneUnknown {
+				continue
+			}
+			return nil, fmt.Errorf("api-key-groups references unknown api-key %q", key)
+		}
+		if _, exists := seenKeys[key]; exists {
+			return nil, fmt.Errorf("api-key-groups contains duplicate api-key %q", key)
+		}
+		seenKeys[key] = struct{}{}
+
+		providers := make([]string, 0, len(group.Providers))
+		seenProviders := make(map[string]struct{}, len(group.Providers))
+		unrestricted := false
+		for _, rawProvider := range group.Providers {
+			provider := strings.ToLower(strings.TrimSpace(rawProvider))
+			if provider == "" {
+				continue
+			}
+			if provider == "all" || provider == "*" {
+				unrestricted = true
+				break
+			}
+			if _, exists := seenProviders[provider]; exists {
+				continue
+			}
+			seenProviders[provider] = struct{}{}
+			providers = append(providers, provider)
+		}
+		if unrestricted || len(providers) == 0 {
+			continue
+		}
+		normalized = append(normalized, APIKeyGroup{APIKey: key, Providers: providers})
+	}
+	if len(normalized) == 0 {
+		return nil, nil
+	}
+	return normalized, nil
+}
+
 // NormalizeOAuthExcludedModels cleans provider -> excluded models mappings by normalizing provider keys
 // and applying model exclusion normalization to each entry.
 func NormalizeOAuthExcludedModels(entries map[string][]string) map[string][]string {
@@ -2143,7 +2214,15 @@ func hashSecret(secret string) (string, error) {
 // SaveConfigPreserveComments writes the config back to YAML while preserving existing comments
 // and key ordering by loading the original file into a yaml.Node tree and updating values in-place.
 func SaveConfigPreserveComments(configFile string, cfg *Config) error {
-	persistCfg := cfg
+	if cfg == nil {
+		return fmt.Errorf("config is nil")
+	}
+	persistCfg := *cfg
+	groups, errNormalizeGroups := NormalizeAPIKeyGroups(persistCfg.APIKeyGroups, persistCfg.APIKeys)
+	if errNormalizeGroups != nil {
+		return errNormalizeGroups
+	}
+	persistCfg.APIKeyGroups = groups
 	// Load original YAML as a node tree to preserve comments and ordering.
 	data, err := os.ReadFile(configFile)
 	if err != nil {
@@ -2162,7 +2241,7 @@ func SaveConfigPreserveComments(configFile string, cfg *Config) error {
 	}
 
 	// Marshal the current cfg to YAML, then unmarshal to a yaml.Node we can merge from.
-	rendered, err := yaml.Marshal(persistCfg)
+	rendered, err := yaml.Marshal(&persistCfg)
 	if err != nil {
 		return err
 	}

@@ -24,23 +24,34 @@ func Register(cfg *sdkconfig.SDKConfig) {
 
 	sdkaccess.RegisterProvider(
 		sdkaccess.AccessProviderTypeConfigAPIKey,
-		newProvider(sdkaccess.DefaultAccessProviderName, keys),
+		newProvider(sdkaccess.DefaultAccessProviderName, keys, cfg.APIKeyGroups),
 	)
 }
 
 type provider struct {
 	name string
-	keys map[string]struct{}
+	keys map[string][]string
 }
 
-func newProvider(name string, keys []string) *provider {
+func newProvider(name string, keys []string, groups []sdkconfig.APIKeyGroup) *provider {
 	providerName := strings.TrimSpace(name)
 	if providerName == "" {
 		providerName = sdkaccess.DefaultAccessProviderName
 	}
-	keySet := make(map[string]struct{}, len(keys))
+	groupProviders := make(map[string][]string, len(groups))
+	for _, group := range groups {
+		key := strings.TrimSpace(group.APIKey)
+		if key == "" {
+			continue
+		}
+		providers := normalizeProviders(group.Providers)
+		if len(providers) > 0 {
+			groupProviders[key] = providers
+		}
+	}
+	keySet := make(map[string][]string, len(keys))
 	for _, key := range keys {
-		keySet[key] = struct{}{}
+		keySet[key] = append([]string(nil), groupProviders[key]...)
 	}
 	return &provider{name: providerName, keys: keySet}
 }
@@ -89,18 +100,40 @@ func (p *provider) Authenticate(_ context.Context, r *http.Request) (*sdkaccess.
 		if candidate.value == "" {
 			continue
 		}
-		if _, ok := p.keys[candidate.value]; ok {
+		if allowedProviders, ok := p.keys[candidate.value]; ok {
+			metadata := map[string]string{"source": candidate.source}
+			if len(allowedProviders) > 0 {
+				metadata[sdkaccess.MetadataAllowedProviders] = strings.Join(allowedProviders, ",")
+			}
 			return &sdkaccess.Result{
 				Provider:  p.Identifier(),
 				Principal: candidate.value,
-				Metadata: map[string]string{
-					"source": candidate.source,
-				},
+				Metadata:  metadata,
 			}, nil
 		}
 	}
 
 	return nil, sdkaccess.NewInvalidCredentialError()
+}
+
+func normalizeProviders(providers []string) []string {
+	normalized := make([]string, 0, len(providers))
+	seen := make(map[string]struct{}, len(providers))
+	for _, rawProvider := range providers {
+		provider := strings.ToLower(strings.TrimSpace(rawProvider))
+		if provider == "all" || provider == "*" {
+			return nil
+		}
+		if provider == "" {
+			continue
+		}
+		if _, exists := seen[provider]; exists {
+			continue
+		}
+		seen[provider] = struct{}{}
+		normalized = append(normalized, provider)
+	}
+	return normalized
 }
 
 func extractBearerToken(header string) string {
