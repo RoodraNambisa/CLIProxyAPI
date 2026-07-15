@@ -662,6 +662,58 @@ func TestCodexExecutorExecuteStream_ImagePassthroughDoesNotReuseCompletionEventA
 	}
 }
 
+func TestCodexExecutorExecuteStream_ImagePassthroughRestoresCompletedOutput(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("event: response.output_item.done\n"))
+		_, _ = w.Write([]byte(`data: {"type":"response.output_item.done","output_index":0,"item":{"type":"image_generation_call","id":"img-1","result":"ZmluYWw="}}` + "\n\n"))
+		_, _ = w.Write([]byte("event: response.done\n"))
+		_, _ = w.Write([]byte(`data: {"type":"response.done","response":{"id":"resp_image","status":"completed","output":[]}}` + "\n\n"))
+	}))
+	defer server.Close()
+
+	executor := NewCodexExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{"base_url": server.URL, "api_key": "test"}}
+	result, err := executor.ExecuteStream(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "gpt-5.4-mini",
+		Payload: []byte(`{"model":"gpt-5.4-mini","input":"draw","tools":[{"type":"function","name":"image_gen.imagegen"}],"stream":true}`),
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FormatOpenAIResponse,
+		Stream:       true,
+		Metadata: map[string]any{
+			cliproxyexecutor.ImageGenerationStreamPassthroughMetadataKey: true,
+			cliproxyexecutor.StreamTerminalMarkerMetadataKey:             true,
+		},
+	})
+	if err != nil {
+		t.Fatalf("ExecuteStream error: %v", err)
+	}
+
+	var completed []byte
+	for chunk := range result.Chunks {
+		if chunk.Err != nil {
+			t.Fatalf("stream chunk error: %v", chunk.Err)
+		}
+		line := bytes.TrimSpace(chunk.Payload)
+		if !bytes.HasPrefix(line, dataTag) {
+			continue
+		}
+		data := bytes.TrimSpace(line[len(dataTag):])
+		if gjson.GetBytes(data, "type").String() == "response.completed" {
+			completed = bytes.Clone(data)
+		}
+	}
+	if len(completed) == 0 {
+		t.Fatal("missing response.completed payload")
+	}
+	if got := gjson.GetBytes(completed, "response.output.0.type").String(); got != "image_generation_call" {
+		t.Fatalf("completed output type = %q, want image_generation_call; payload=%s", got, completed)
+	}
+	if got := gjson.GetBytes(completed, "response.output.0.result").String(); got != "ZmluYWw=" {
+		t.Fatalf("completed output result = %q, want restored image; payload=%s", got, completed)
+	}
+}
+
 func TestCodexExecutorExecuteStreamReportsEffectivePassthroughAfterToolRemoval(t *testing.T) {
 	upstreamBodies := make(chan []byte, 1)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

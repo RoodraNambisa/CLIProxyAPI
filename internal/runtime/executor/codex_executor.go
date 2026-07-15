@@ -977,6 +977,13 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 				if bytes.HasPrefix(trimmedClientLine, dataTag) {
 					data := bytes.TrimSpace(trimmedClientLine[len(dataTag):])
 					terminal = isCodexSuccessfulCompletion(data)
+					switch gjson.GetBytes(data, "type").String() {
+					case "response.output_item.done":
+						collectCodexOutputItemDone(data, outputItemsByIndex, &outputItemsFallback)
+					case "response.completed":
+						data = patchCodexCompletedOutput(data, outputItemsByIndex, outputItemsFallback)
+						clientLine = append([]byte("data: "), data...)
+					}
 					if len(pendingImageCompletionEvent) > 0 {
 						if terminal {
 							if !emit(cliproxyexecutor.StreamChunk{Payload: append([]byte(nil), pendingImageCompletionEvent...)}) {
