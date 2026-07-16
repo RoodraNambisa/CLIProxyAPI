@@ -406,7 +406,7 @@ func (l *authAutoRefreshLoop) remove(authID string) {
 }
 
 func nextRefreshCheckAt(now time.Time, auth *Auth, interval time.Duration) (time.Time, bool) {
-	if auth == nil || auth.Disabled {
+	if auth == nil || auth.Disabled || !auth.LifecycleRefreshable() {
 		return time.Time{}, false
 	}
 

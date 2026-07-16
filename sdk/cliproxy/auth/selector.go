@@ -867,6 +867,9 @@ func isAuthBlockedForModel(auth *Auth, model string, now time.Time) (bool, block
 	if auth.Disabled || auth.Status == StatusDisabled {
 		return true, blockReasonDisabled, time.Time{}
 	}
+	if !auth.LifecycleSelectable() {
+		return true, blockReasonOther, time.Time{}
+	}
 	if auth.Unavailable && auth.CooldownScope == cooldownScopeAuth && auth.NextRetryAfter.After(now) {
 		next := auth.NextRetryAfter
 		if !auth.Quota.NextRecoverAt.IsZero() && auth.Quota.NextRecoverAt.After(now) {

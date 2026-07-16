@@ -211,10 +211,7 @@ func (s *ConfigSynthesizer) synthesizeOpenAICompat(ctx *SynthesisContext) []*cor
 			continue
 		}
 		prefix := strings.TrimSpace(compat.Prefix)
-		providerName := strings.ToLower(strings.TrimSpace(compat.Name))
-		if providerName == "" {
-			providerName = "openai-compatibility"
-		}
+		providerName := openAICompatRuntimeProviderName(compat.Name)
 		base := strings.TrimSpace(compat.BaseURL)
 
 		// Handle new APIKeyEntries format (preferred)
@@ -286,6 +283,17 @@ func (s *ConfigSynthesizer) synthesizeOpenAICompat(ctx *SynthesisContext) []*cor
 		}
 	}
 	return out
+}
+
+func openAICompatRuntimeProviderName(name string) string {
+	providerName := strings.ToLower(strings.TrimSpace(name))
+	if providerName == "" {
+		return "openai-compatibility"
+	}
+	if providerName == "chatgpt-web" {
+		return "openai-compatibility-chatgpt-web"
+	}
+	return providerName
 }
 
 // synthesizeVertexCompat creates Auth entries for Vertex-compatible providers.

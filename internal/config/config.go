@@ -337,6 +337,9 @@ type Config struct {
 	// Codex configures provider-wide Codex request behavior.
 	Codex CodexConfig `yaml:"codex" json:"codex"`
 
+	// ChatGPTWeb configures provider-wide ChatGPT Web credential behavior.
+	ChatGPTWeb ChatGPTWebConfig `yaml:"chatgpt-web" json:"chatgpt-web"`
+
 	// CodexHeaderDefaults configures fallback headers for Codex OAuth model requests.
 	// These are used only when the client does not send its own headers.
 	CodexHeaderDefaults CodexHeaderDefaults `yaml:"codex-header-defaults" json:"codex-header-defaults"`
@@ -405,6 +408,12 @@ type CodexHeaderDefaults struct {
 // CodexConfig configures provider-wide Codex request behavior.
 type CodexConfig struct {
 	IdentityConfuse bool `yaml:"identity-confuse" json:"identity-confuse"`
+}
+
+// ChatGPTWebConfig configures ChatGPT Web credential lifecycle behavior.
+type ChatGPTWebConfig struct {
+	// AutoRelogin starts a background password login after a terminal refresh failure.
+	AutoRelogin bool `yaml:"auto-relogin" json:"auto-relogin"`
 }
 
 // CodexFingerprintConfig controls optional Codex upstream fingerprinting.

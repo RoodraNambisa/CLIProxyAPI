@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -208,6 +209,88 @@ func TestBuildAuthFromFileData_PreservesDisabledState(t *testing.T) {
 	wantHash := coreauth.SourceHashFromBytes(wantRaw)
 	if got := auth.Attributes[coreauth.SourceHashAttributeKey]; got != wantHash {
 		t.Fatalf("source hash = %q, want %q", got, wantHash)
+	}
+}
+
+func TestBuildAuthFromFileData_MapsChatGPTWebLifecycle(t *testing.T) {
+	tests := []struct {
+		name         string
+		state        string
+		reason       string
+		disabled     bool
+		wantStatus   coreauth.Status
+		wantMessage  string
+		wantDisabled bool
+	}{
+		{
+			name:        "active",
+			state:       coreauth.LifecycleStateActive,
+			reason:      "ready",
+			wantStatus:  coreauth.StatusActive,
+			wantMessage: "ready",
+		},
+		{
+			name:        "login pending",
+			state:       coreauth.LifecycleStateLoginPending,
+			reason:      "awaiting_login",
+			wantStatus:  coreauth.StatusPending,
+			wantMessage: "awaiting_login",
+		},
+		{
+			name:        "interaction required",
+			state:       coreauth.LifecycleStateInteractionRequired,
+			reason:      "passkey_required",
+			wantStatus:  coreauth.StatusError,
+			wantMessage: "passkey_required",
+		},
+		{
+			name:        "dead",
+			state:       coreauth.LifecycleStateDead,
+			reason:      "account_deactivated",
+			wantStatus:  coreauth.StatusError,
+			wantMessage: "account_deactivated",
+		},
+		{
+			name:         "disabled overrides dead",
+			state:        coreauth.LifecycleStateDead,
+			reason:       "account_deactivated",
+			disabled:     true,
+			wantStatus:   coreauth.StatusDisabled,
+			wantDisabled: true,
+		},
+	}
+
+	authDir := t.TempDir()
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, nil)
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			metadata := map[string]any{
+				"type":             "chatgpt-web",
+				"lifecycle_state":  test.state,
+				"lifecycle_reason": test.reason,
+			}
+			if test.disabled {
+				metadata["disabled"] = true
+			}
+			data, errMarshal := json.Marshal(metadata)
+			if errMarshal != nil {
+				t.Fatalf("marshal metadata: %v", errMarshal)
+			}
+			path := filepath.Join(authDir, strings.ReplaceAll(test.name, " ", "-")+".json")
+			auth, errBuild := h.buildAuthFromFileData(path, data)
+			if errBuild != nil {
+				t.Fatalf("buildAuthFromFileData() error = %v", errBuild)
+			}
+			if auth.Status != test.wantStatus {
+				t.Fatalf("status = %q, want %q", auth.Status, test.wantStatus)
+			}
+			if auth.StatusMessage != test.wantMessage {
+				t.Fatalf("status message = %q, want %q", auth.StatusMessage, test.wantMessage)
+			}
+			if auth.Disabled != test.wantDisabled {
+				t.Fatalf("disabled = %v, want %v", auth.Disabled, test.wantDisabled)
+			}
+		})
 	}
 }
 

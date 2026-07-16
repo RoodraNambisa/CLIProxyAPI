@@ -434,6 +434,34 @@ func TestConfigSynthesizer_OpenAICompat(t *testing.T) {
 	}
 }
 
+func TestConfigSynthesizer_OpenAICompatReservesChatGPTWebProviderID(t *testing.T) {
+	synth := NewConfigSynthesizer()
+	auths, err := synth.Synthesize(&SynthesisContext{
+		Config: &config.Config{OpenAICompatibility: []config.OpenAICompatibility{{
+			Name:    "chatgpt-web",
+			BaseURL: "https://compat.example/v1",
+			APIKeyEntries: []config.OpenAICompatibilityAPIKey{{
+				APIKey: "compat-key",
+			}},
+		}}},
+		Now:         time.Now(),
+		IDGenerator: NewStableIDGenerator(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(auths) != 1 {
+		t.Fatalf("auth count = %d, want 1", len(auths))
+	}
+	auth := auths[0]
+	if auth.Provider != "openai-compatibility-chatgpt-web" || auth.Attributes["provider_key"] != "openai-compatibility-chatgpt-web" {
+		t.Fatalf("runtime provider = %q/%q", auth.Provider, auth.Attributes["provider_key"])
+	}
+	if auth.Attributes["compat_name"] != "chatgpt-web" {
+		t.Fatalf("compatibility name = %q, want chatgpt-web", auth.Attributes["compat_name"])
+	}
+}
+
 func TestConfigSynthesizer_VertexCompat(t *testing.T) {
 	synth := NewConfigSynthesizer()
 	ctx := &SynthesisContext{

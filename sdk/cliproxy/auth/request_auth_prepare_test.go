@@ -83,6 +83,17 @@ type requestPrepareExecutor struct {
 	prepareStart    chan struct{}
 	prepareGate     chan struct{}
 	prepareErr      error
+	updateOnError   bool
+}
+
+type requestPreparePersistError struct {
+	err error
+}
+
+func (e requestPreparePersistError) Error() string { return e.err.Error() }
+func (e requestPreparePersistError) Unwrap() error { return e.err }
+func (requestPreparePersistError) PersistAuthUpdateOnError() bool {
+	return true
 }
 
 func (*requestPrepareExecutor) Identifier() string { return "antigravity" }
@@ -110,6 +121,12 @@ func (e *requestPrepareExecutor) PrepareRequestAuth(ctx context.Context, auth *A
 		return nil, &Error{HTTPStatus: http.StatusUnauthorized, Message: "expired access token"}
 	}
 	if e.prepareErr != nil {
+		if e.updateOnError {
+			updated := auth.Clone()
+			updated.Metadata["lifecycle_state"] = LifecycleStateReauthRequired
+			updated.Metadata["lifecycle_reason"] = "refresh_token_invalid"
+			return updated, e.prepareErr
+		}
 		return nil, e.prepareErr
 	}
 	updated := auth.Clone()
@@ -475,6 +492,54 @@ func TestManagerRequestAuthPersistenceFailureDoesNotMarkCredential(t *testing.T)
 	}
 }
 
+func TestManagerPersistsRequestAuthLifecycleTransitionReturnedWithError(t *testing.T) {
+	manager, store, executor, authID, _ := newRequestPrepareManager(t, "lifecycle-error", nil, nil)
+	executor.updateOnError = true
+	executor.prepareErr = requestPreparePersistError{err: &Error{HTTPStatus: http.StatusUnauthorized, Message: "refresh token is no longer valid"}}
+
+	auth, ok := manager.GetByID(authID)
+	if !ok {
+		t.Fatal("auth missing before preparation")
+	}
+	_, errPrepare := manager.prepareRequestAuth(t.Context(), executor, auth)
+	if errPrepare == nil {
+		t.Fatal("prepareRequestAuth() error = nil, want terminal refresh error")
+	}
+	current, ok := manager.GetByID(authID)
+	if !ok || current.LifecycleState() != LifecycleStateReauthRequired {
+		t.Fatalf("manager lifecycle state = %#v, want reauth_required", current)
+	}
+	if current.Status != StatusError || current.StatusMessage != "refresh_token_invalid" {
+		t.Fatalf("manager runtime status = %q/%q, want lifecycle error", current.Status, current.StatusMessage)
+	}
+	stored := store.lastAuth()
+	if stored == nil || stored.LifecycleState() != LifecycleStateReauthRequired {
+		t.Fatalf("persisted lifecycle state = %#v, want reauth_required", stored)
+	}
+}
+
+func TestManagerDoesNotPersistUnmarkedRequestAuthUpdateReturnedWithError(t *testing.T) {
+	manager, store, executor, authID, _ := newRequestPrepareManager(t, "unmarked-lifecycle-error", nil, nil)
+	executor.updateOnError = true
+	executor.prepareErr = &Error{HTTPStatus: http.StatusUnauthorized, Message: "refresh failed"}
+
+	auth, ok := manager.GetByID(authID)
+	if !ok {
+		t.Fatal("auth missing before preparation")
+	}
+	_, errPrepare := manager.prepareRequestAuth(t.Context(), executor, auth)
+	if errPrepare == nil {
+		t.Fatal("prepareRequestAuth() error = nil, want refresh error")
+	}
+	current, ok := manager.GetByID(authID)
+	if !ok || current.LifecycleState() != "" {
+		t.Fatalf("manager lifecycle state = %#v, want unchanged auth", current)
+	}
+	if stored := store.lastAuth(); stored != nil && stored.LifecycleState() != "" {
+		t.Fatalf("persisted lifecycle state = %#v, want unchanged auth", stored)
+	}
+}
+
 func TestAntigravityCreditsFallbackReturnsRequestAuthPreparationError(t *testing.T) {
 	manager, _, executor, authID, _ := newRequestPrepareManager(t, "credits-error", nil, nil)
 	model := "claude-credits-request-prepare"
@@ -558,6 +623,60 @@ func assertPreparedRequestAuth(t *testing.T, manager *Manager, store *requestPre
 	current, ok := manager.GetByID(authID)
 	if !ok || requestPrepareString(current.Metadata["project_id"]) != "prepared-project" {
 		t.Fatalf("manager project_id = %v, want prepared-project", current)
+	}
+}
+
+func TestUpdateIfCurrentRejectsReplacedAuth(t *testing.T) {
+	manager, _, _, authID, _ := newRequestPrepareManager(t, "conditional-update", nil, nil)
+	expected, ok := manager.GetByID(authID)
+	if !ok {
+		t.Fatal("expected registered auth")
+	}
+
+	replacement := expected.Clone()
+	replacement.Attributes[SourceHashAttributeKey] = "replacement-source"
+	replacement.Metadata["access_token"] = "replacement-token"
+	if _, errUpdate := manager.Update(WithSkipPersist(t.Context()), replacement); errUpdate != nil {
+		t.Fatalf("Update() error: %v", errUpdate)
+	}
+
+	staleResult := expected.Clone()
+	staleResult.Metadata["access_token"] = "stale-background-token"
+	installed, current, errConditional := manager.UpdateIfCurrent(t.Context(), expected, staleResult)
+	if errConditional != nil {
+		t.Fatalf("UpdateIfCurrent() error: %v", errConditional)
+	}
+	if current || installed != nil {
+		t.Fatalf("UpdateIfCurrent() = (%v, %v), want stale rejection", installed, current)
+	}
+
+	got, ok := manager.GetByID(authID)
+	if !ok || requestPrepareString(got.Metadata["access_token"]) != "replacement-token" {
+		t.Fatalf("current access token = %v, want replacement-token", got)
+	}
+}
+
+func TestUpdateIfCurrentPersistsMatchingAuth(t *testing.T) {
+	manager, store, _, authID, _ := newRequestPrepareManager(t, "conditional-success", nil, nil)
+	expected, ok := manager.GetByID(authID)
+	if !ok {
+		t.Fatal("expected registered auth")
+	}
+
+	updated := expected.Clone()
+	updated.Metadata["access_token"] = "background-token"
+	installed, current, errConditional := manager.UpdateIfCurrent(t.Context(), expected, updated)
+	if errConditional != nil {
+		t.Fatalf("UpdateIfCurrent() error: %v", errConditional)
+	}
+	if !current || installed == nil {
+		t.Fatalf("UpdateIfCurrent() = (%v, %v), want installed auth", installed, current)
+	}
+	if got := requestPrepareString(installed.Metadata["access_token"]); got != "background-token" {
+		t.Fatalf("installed access token = %q, want background-token", got)
+	}
+	if stored := store.lastAuth(); stored == nil || requestPrepareString(stored.Metadata["access_token"]) != "background-token" {
+		t.Fatalf("persisted auth = %v, want background-token", stored)
 	}
 }
 

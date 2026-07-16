@@ -189,6 +189,82 @@ func TestFileTokenStoreReadAuthFileSetsCanonicalSourceHash(t *testing.T) {
 	}
 }
 
+func TestFileTokenStoreRestrictsExistingChatGPTWebCredentialPermissions(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows does not expose Unix credential permission bits")
+	}
+	t.Run("load", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "chatgpt-web.json")
+		if errWrite := os.WriteFile(path, []byte(`{"type":"chatgpt-web","access_token":"secret"}`), 0o600); errWrite != nil {
+			t.Fatal(errWrite)
+		}
+		if errChmod := os.Chmod(path, 0o644); errChmod != nil {
+			t.Fatal(errChmod)
+		}
+		store := NewFileTokenStore()
+		if _, errRead := store.readAuthFile(t.Context(), path, dir); errRead != nil {
+			t.Fatal(errRead)
+		}
+		assertFileMode(t, path, 0o600)
+	})
+
+	t.Run("unchanged save", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "chatgpt-web.json")
+		auth := &cliproxyauth.Auth{
+			ID:         "chatgpt-web.json",
+			FileName:   "chatgpt-web.json",
+			Provider:   "chatgpt-web",
+			Attributes: map[string]string{"path": path},
+			Metadata:   map[string]any{"type": "chatgpt-web", "access_token": "secret"},
+		}
+		raw, errCanonical := cliproxyauth.CanonicalMetadataBytes(auth)
+		if errCanonical != nil {
+			t.Fatal(errCanonical)
+		}
+		if errWrite := os.WriteFile(path, raw, 0o600); errWrite != nil {
+			t.Fatal(errWrite)
+		}
+		if errChmod := os.Chmod(path, 0o644); errChmod != nil {
+			t.Fatal(errChmod)
+		}
+		store := NewFileTokenStore()
+		store.SetBaseDir(dir)
+		if _, errSave := store.Save(t.Context(), auth); errSave != nil {
+			t.Fatal(errSave)
+		}
+		assertFileMode(t, path, 0o600)
+	})
+
+	t.Run("other provider unchanged", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "codex.json")
+		if errWrite := os.WriteFile(path, []byte(`{"type":"codex","access_token":"secret"}`), 0o600); errWrite != nil {
+			t.Fatal(errWrite)
+		}
+		if errChmod := os.Chmod(path, 0o644); errChmod != nil {
+			t.Fatal(errChmod)
+		}
+		store := NewFileTokenStore()
+		if _, errRead := store.readAuthFile(t.Context(), path, dir); errRead != nil {
+			t.Fatal(errRead)
+		}
+		assertFileMode(t, path, 0o644)
+	})
+}
+
+func assertFileMode(t *testing.T, path string, want fs.FileMode) {
+	t.Helper()
+	info, errStat := os.Stat(path)
+	if errStat != nil {
+		t.Fatal(errStat)
+	}
+	if got := info.Mode().Perm(); got != want {
+		t.Fatalf("file mode = %o, want %o", got, want)
+	}
+}
+
 func TestFileTokenStoreReadsFileBackedGeminiAPIKey(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "gemini-key.json")

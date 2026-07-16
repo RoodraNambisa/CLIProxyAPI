@@ -12,6 +12,8 @@ const (
 
 	// Codex represents the OpenAI Codex provider identifier.
 	Codex = "codex"
+	// ChatGPTWeb represents the ChatGPT Web provider identifier.
+	ChatGPTWeb = "chatgpt-web"
 
 	// Claude represents the Anthropic Claude provider identifier.
 	Claude = "claude"

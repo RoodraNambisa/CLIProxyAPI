@@ -3,6 +3,7 @@ package auth
 import (
 	"time"
 
+	chatgptwebauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/chatgptweb"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 )
 
@@ -12,6 +13,10 @@ func init() {
 	registerRefreshLead("antigravity", func() Authenticator { return NewAntigravityAuthenticator() })
 	registerRefreshLead("kimi", func() Authenticator { return NewKimiAuthenticator() })
 	registerRefreshLead("xai", func() Authenticator { return NewXAIAuthenticator() })
+	cliproxyauth.RegisterRefreshLeadProvider(chatgptwebauth.Provider, func() *time.Duration {
+		lead := chatgptwebauth.DefaultRefreshLead
+		return &lead
+	})
 }
 
 func registerRefreshLead(provider string, factory func() Authenticator) {

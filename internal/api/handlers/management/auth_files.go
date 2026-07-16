@@ -2638,20 +2638,26 @@ func (h *Handler) buildAuthFromFileData(path string, data []byte) (*coreauth.Aut
 	}
 	disabled, _ := metadata["disabled"].(bool)
 	status := coreauth.StatusActive
+	statusMessage := ""
 	if disabled {
 		status = coreauth.StatusDisabled
+	} else if strings.EqualFold(strings.TrimSpace(provider), "chatgpt-web") {
+		state := (&coreauth.Auth{Provider: provider, Metadata: metadata}).LifecycleState()
+		status = coreauth.RuntimeStatusForLifecycle(state)
+		statusMessage = stringValue(metadata, "lifecycle_reason")
 	}
 	auth := &coreauth.Auth{
-		ID:         authID,
-		Provider:   provider,
-		FileName:   filepath.Base(path),
-		Label:      label,
-		Status:     status,
-		Disabled:   disabled,
-		Attributes: attr,
-		Metadata:   metadata,
-		CreatedAt:  time.Now(),
-		UpdatedAt:  time.Now(),
+		ID:            authID,
+		Provider:      provider,
+		FileName:      filepath.Base(path),
+		Label:         label,
+		Status:        status,
+		StatusMessage: statusMessage,
+		Disabled:      disabled,
+		Attributes:    attr,
+		Metadata:      metadata,
+		CreatedAt:     time.Now(),
+		UpdatedAt:     time.Now(),
 	}
 	coreauth.ApplyFileBackedGeminiAPIKey(auth)
 	if hasLastRefresh {

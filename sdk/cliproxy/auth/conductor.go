@@ -3027,7 +3027,7 @@ func (m *Manager) prepareRequestAuth(ctx context.Context, executor ProviderExecu
 	if retiredDuringPreparation || runtimeAuthInstanceRetiredContext(prepareCtx) {
 		return auth, runtimeAuthInstanceRetiredError()
 	}
-	if errPrepare != nil {
+	if errPrepare != nil && (updated == nil || !persistAuthUpdateForError(errPrepare)) {
 		return auth, errPrepare
 	}
 	if updated == nil {
@@ -3036,6 +3036,12 @@ func (m *Manager) prepareRequestAuth(ctx context.Context, executor ProviderExecu
 	installed, errUpdate := m.installPreparedRequestAuth(ctx, target, updated)
 	if errUpdate != nil {
 		return updated, errUpdate
+	}
+	if errPrepare != nil {
+		if installed != nil {
+			return installed, errPrepare
+		}
+		return updated, errPrepare
 	}
 	if installed != nil {
 		return installed, nil
@@ -3100,6 +3106,21 @@ func (m *Manager) installPreparedRequestAuth(ctx context.Context, expected, upda
 	return installed, nil
 }
 
+// UpdateIfCurrent persists updated only when expected still identifies the
+// currently installed auth instance and source generation. It is intended for
+// asynchronous provider work that must not overwrite a concurrent file reload
+// or management edit.
+func (m *Manager) UpdateIfCurrent(ctx context.Context, expected, updated *Auth) (*Auth, bool, error) {
+	installed, err := m.installPreparedRequestAuth(ctx, expected, updated)
+	if isRuntimeAuthInstanceRetiredError(err) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	return installed, true, nil
+}
+
 func requestPreparationMatchesCurrent(current, expected *Auth) bool {
 	if current == nil || expected == nil || current.ID != expected.ID {
 		return false
@@ -3138,6 +3159,7 @@ func carryForwardPreparedAuthRuntimeState(current, next *Auth) {
 	next.CooldownScope = current.CooldownScope
 	next.ModelStates = cloneAuthModelStates(current.ModelStates)
 	next.Runtime = current.Runtime
+	applyLifecycleRuntimeState(next)
 }
 
 func (m *Manager) prepareRequestAuthWithUnauthorizedRefresh(ctx context.Context, executor ProviderExecutor, auth *Auth) (*Auth, error) {
@@ -5625,6 +5647,17 @@ func skipAuthResultForError(err error) bool {
 	return errors.As(err, &target) && target.SkipAuthResult()
 }
 
+func persistAuthUpdateForError(err error) bool {
+	if err == nil {
+		return false
+	}
+	type persistAuthUpdateError interface {
+		PersistAuthUpdateOnError() bool
+	}
+	var target persistAuthUpdateError
+	return errors.As(err, &target) && target.PersistAuthUpdateOnError()
+}
+
 func retryOtherAuthForError(err error) bool {
 	if err == nil {
 		return false
@@ -6760,7 +6793,7 @@ func (m *Manager) queueRefreshReschedule(authID string) {
 }
 
 func (m *Manager) shouldRefresh(a *Auth, now time.Time) bool {
-	if a == nil || a.Disabled {
+	if a == nil || a.Disabled || !a.LifecycleRefreshable() {
 		return false
 	}
 	if !a.NextRefreshAfter.IsZero() && now.Before(a.NextRefreshAfter) {
@@ -7246,6 +7279,14 @@ func (m *Manager) refreshAuthExpected(ctx context.Context, id string, expected *
 	log.Debugf("refreshed %s, %s, %v", auth.Provider, auth.ID, err)
 	now := time.Now()
 	if err != nil {
+		if updated != nil && persistAuthUpdateForError(err) {
+			updated.NextRefreshAfter = time.Time{}
+			updated.UpdatedAt = now
+			if _, errUpdate := m.applyRefreshedAuth(ctx, auth, refreshBaseline, updated, pendingUntil); errUpdate != nil {
+				logEntryWithRequestID(ctx).WithField("auth_id", updated.ID).Warnf("failed to persist auth state after refresh error: %v", errUpdate)
+			}
+			return
+		}
 		if skipAuthResultForError(err) {
 			m.deferRefreshAfterProxyFailure(id, auth, pendingUntil, err)
 			return
@@ -7427,6 +7468,7 @@ func carryForwardConcurrentRefreshRuntimeState(baseline, current, next *Auth) {
 	next.Quota = current.Quota
 	next.UpdatedAt = current.UpdatedAt
 	next.ModelStates = cloneAuthModelStates(current.ModelStates)
+	applyLifecycleRuntimeState(next)
 }
 
 func clearRefreshPendingMarker(auth *Auth, pendingUntil time.Time) bool {

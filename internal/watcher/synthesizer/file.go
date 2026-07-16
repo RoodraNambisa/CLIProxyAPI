@@ -114,20 +114,26 @@ func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) []
 
 	disabled, _ := metadata["disabled"].(bool)
 	status := coreauth.StatusActive
+	statusMessage := ""
 	if disabled {
 		status = coreauth.StatusDisabled
+	} else if provider == "chatgpt-web" {
+		state := (&coreauth.Auth{Provider: provider, Metadata: metadata}).LifecycleState()
+		status = coreauth.RuntimeStatusForLifecycle(state)
+		statusMessage = strings.TrimSpace(metadataString(metadata, "lifecycle_reason"))
 	}
 
 	// Read per-account excluded models from the OAuth JSON file.
 	perAccountExcluded := extractExcludedModelsFromMetadata(metadata)
 
 	a := &coreauth.Auth{
-		ID:       id,
-		Provider: provider,
-		Label:    label,
-		Prefix:   prefix,
-		Status:   status,
-		Disabled: disabled,
+		ID:            id,
+		Provider:      provider,
+		Label:         label,
+		Prefix:        prefix,
+		Status:        status,
+		StatusMessage: statusMessage,
+		Disabled:      disabled,
 		Attributes: map[string]string{
 			"source": fullPath,
 			"path":   fullPath,
@@ -136,6 +142,9 @@ func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) []
 		Metadata:  metadata,
 		CreatedAt: now,
 		UpdatedAt: now,
+	}
+	if provider == "chatgpt-web" {
+		a.FileName = id
 	}
 	coreauth.ApplyFileBackedGeminiAPIKey(a)
 	if errHash := coreauth.SetCanonicalSourceHashAttribute(a); errHash != nil {
@@ -173,6 +182,14 @@ func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) []
 		}
 	}
 	return []*coreauth.Auth{a}
+}
+
+func metadataString(metadata map[string]any, key string) string {
+	if metadata == nil {
+		return ""
+	}
+	value, _ := metadata[key].(string)
+	return value
 }
 
 // extractExcludedModelsFromMetadata reads per-account excluded models from the OAuth JSON metadata.

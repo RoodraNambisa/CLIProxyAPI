@@ -228,10 +228,13 @@ func (h authMaintenanceHook) handleAuthChange(ctx context.Context, auth *coreaut
 	if h.service == nil || auth == nil || strings.TrimSpace(auth.ID) == "" {
 		return
 	}
+	provider := strings.ToLower(strings.TrimSpace(auth.Provider))
+	if provider == "chatgpt-web" {
+		h.service.triggerChatGPTWebRelogin(auth)
+	}
 	if ctx != nil && ctx.Value(modelSyncHookSuppressedContextKey{}) != nil {
 		return
 	}
-	provider := strings.ToLower(strings.TrimSpace(auth.Provider))
 	if provider != "antigravity" || auth.Disabled || auth.Status == coreauth.StatusDisabled {
 		h.service.antigravityModelCapabilities.Delete(auth.ID)
 		return
@@ -769,6 +772,28 @@ func (s *Service) installAuthMaintenanceHook() {
 		return
 	}
 	s.coreManager.AddHook(authMaintenanceHook{service: s})
+	for _, auth := range s.coreManager.List() {
+		s.triggerChatGPTWebRelogin(auth)
+	}
+}
+
+func (s *Service) triggerChatGPTWebRelogin(auth *coreauth.Auth) {
+	if s == nil || s.coreManager == nil || auth == nil || auth.Disabled || auth.LifecycleState() != coreauth.LifecycleStateReloginPending || !strings.EqualFold(strings.TrimSpace(auth.Provider), "chatgpt-web") {
+		return
+	}
+	if _, _, isCompat := openAICompatInfoFromAuth(auth); isCompat {
+		return
+	}
+	s.ensureExecutorsForAuth(auth)
+	registered, ok := s.coreManager.Executor("chatgpt-web")
+	if !ok {
+		return
+	}
+	chatGPTWebExecutor, ok := registered.(*executor.ChatGPTWebExecutor)
+	if !ok {
+		return
+	}
+	chatGPTWebExecutor.TriggerBackgroundRelogin(auth)
 }
 
 func (s *Service) enqueueAuthMaintenanceCandidate(candidate authMaintenanceCandidate) bool {
@@ -2220,6 +2245,18 @@ func (s *Service) ensureExecutorsForAuthWithMode(a *coreauth.Auth, forceReplace 
 		s.coreManager.RegisterExecutor(executor.NewOpenAICompatExecutor(compatProviderKey, s.cfg))
 		return
 	}
+	if strings.EqualFold(strings.TrimSpace(a.Provider), "chatgpt-web") {
+		if !forceReplace {
+			existingExecutor, hasExecutor := s.coreManager.Executor("chatgpt-web")
+			if hasExecutor {
+				if _, isChatGPTWebExecutor := existingExecutor.(*executor.ChatGPTWebExecutor); isChatGPTWebExecutor {
+					return
+				}
+			}
+		}
+		s.coreManager.RegisterExecutor(executor.NewChatGPTWebExecutor(s.cfg, s.coreManager))
+		return
+	}
 	switch strings.ToLower(a.Provider) {
 	case "gemini":
 		s.coreManager.RegisterExecutor(executor.NewGeminiExecutor(s.cfg))
@@ -2265,14 +2302,29 @@ func (s *Service) rebindExecutors() {
 	if s == nil || s.coreManager == nil {
 		return
 	}
-	auths := s.coreManager.List()
+	s.rebindExecutorsForAuths(s.coreManager.List())
+}
+
+func (s *Service) rebindExecutorsForAuths(auths []*coreauth.Auth) {
 	reboundCodex := false
+	reboundChatGPTWeb := false
 	for _, auth := range auths {
 		if auth != nil && strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") {
 			if reboundCodex {
 				continue
 			}
 			reboundCodex = true
+		}
+		if auth != nil && strings.EqualFold(strings.TrimSpace(auth.Provider), "chatgpt-web") {
+			if _, _, isCompat := openAICompatInfoFromAuth(auth); !isCompat {
+				if auth.Disabled {
+					continue
+				}
+				if reboundChatGPTWeb {
+					continue
+				}
+				reboundChatGPTWeb = true
+			}
 		}
 		s.ensureExecutorsForAuthWithMode(auth, true)
 	}
@@ -2845,6 +2897,8 @@ func (s *Service) registerModelsForAuth(a *coreauth.Auth) {
 	case "xai":
 		models = registry.GetXAIModels()
 		models = applyExcludedModels(models, excluded)
+	case "chatgpt-web":
+		models = nil
 	default:
 		// Handle OpenAI-compatibility providers by name using config
 		if s.cfg != nil {

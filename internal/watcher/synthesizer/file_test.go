@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -626,6 +627,110 @@ func TestFileSynthesizer_Synthesize_NoteParsing(t *testing.T) {
 			}
 			if ok {
 				t.Fatalf("expected note attribute to be absent, got %q", value)
+			}
+		})
+	}
+}
+
+func TestSynthesizeAuthFileMapsChatGPTWebLifecycle(t *testing.T) {
+	tests := []struct {
+		name         string
+		payload      string
+		wantState    string
+		wantStatus   coreauth.Status
+		wantMessage  string
+		wantDisabled bool
+	}{
+		{
+			name:       "legacy token defaults active",
+			payload:    `{"type":"chatgpt-web","access_token":"token"}`,
+			wantState:  coreauth.LifecycleStateActive,
+			wantStatus: coreauth.StatusActive,
+		},
+		{
+			name:       "missing token defaults pending",
+			payload:    `{"type":"chatgpt-web"}`,
+			wantState:  coreauth.LifecycleStateLoginPending,
+			wantStatus: coreauth.StatusPending,
+		},
+		{
+			name:        "explicit active",
+			payload:     `{"type":"chatgpt-web","lifecycle_state":"active","lifecycle_reason":"ready"}`,
+			wantState:   coreauth.LifecycleStateActive,
+			wantStatus:  coreauth.StatusActive,
+			wantMessage: "ready",
+		},
+		{
+			name:        "explicit login pending",
+			payload:     `{"type":"chatgpt-web","lifecycle_state":"login_pending","lifecycle_reason":"awaiting_login"}`,
+			wantState:   coreauth.LifecycleStateLoginPending,
+			wantStatus:  coreauth.StatusPending,
+			wantMessage: "awaiting_login",
+		},
+		{
+			name:        "dead stays distinct from disabled",
+			payload:     `{"type":"chatgpt-web","lifecycle_state":"dead","lifecycle_reason":"account_deactivated"}`,
+			wantState:   coreauth.LifecycleStateDead,
+			wantStatus:  coreauth.StatusError,
+			wantMessage: "account_deactivated",
+		},
+		{
+			name:        "interaction required",
+			payload:     `{"type":"chatgpt-web","lifecycle_state":"interaction_required","lifecycle_reason":"passkey_required"}`,
+			wantState:   coreauth.LifecycleStateInteractionRequired,
+			wantStatus:  coreauth.StatusError,
+			wantMessage: "passkey_required",
+		},
+		{
+			name:         "disabled overrides lifecycle",
+			payload:      `{"type":"chatgpt-web","lifecycle_state":"dead","lifecycle_reason":"account_deactivated","disabled":true}`,
+			wantState:    coreauth.LifecycleStateDead,
+			wantStatus:   coreauth.StatusDisabled,
+			wantDisabled: true,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "chatgpt-web.json")
+			ctx := &SynthesisContext{AuthDir: dir, Now: time.Now()}
+			auths := SynthesizeAuthFile(ctx, path, []byte(test.payload))
+			if len(auths) != 1 {
+				t.Fatalf("SynthesizeAuthFile() returned %d auths, want 1", len(auths))
+			}
+			auth := auths[0]
+			if auth.Provider != "chatgpt-web" {
+				t.Fatalf("provider = %q, want chatgpt-web", auth.Provider)
+			}
+			if auth.LifecycleState() != test.wantState {
+				t.Fatalf("lifecycle state = %q, want %q", auth.LifecycleState(), test.wantState)
+			}
+			if auth.Status != test.wantStatus {
+				t.Fatalf("status = %q, want %q", auth.Status, test.wantStatus)
+			}
+			if auth.StatusMessage != test.wantMessage {
+				t.Fatalf("status message = %q, want %q", auth.StatusMessage, test.wantMessage)
+			}
+			if auth.Disabled != test.wantDisabled {
+				t.Fatalf("disabled = %v, want %v", auth.Disabled, test.wantDisabled)
+			}
+			var original map[string]any
+			if errUnmarshal := json.Unmarshal([]byte(test.payload), &original); errUnmarshal != nil {
+				t.Fatalf("unmarshal test payload: %v", errUnmarshal)
+			}
+			if !reflect.DeepEqual(auth.Metadata, original) {
+				t.Fatalf("derived lifecycle state mutated metadata: got %v want %v", auth.Metadata, original)
+			}
+			canonical, errCanonical := coreauth.CanonicalMetadataBytes(&coreauth.Auth{
+				Metadata: original,
+				Disabled: test.wantDisabled,
+			})
+			if errCanonical != nil {
+				t.Fatalf("canonicalize original metadata: %v", errCanonical)
+			}
+			if got, want := auth.Attributes[coreauth.SourceHashAttributeKey], coreauth.SourceHashFromBytes(canonical); got != want {
+				t.Fatalf("source hash = %q, want %q", got, want)
 			}
 		})
 	}
