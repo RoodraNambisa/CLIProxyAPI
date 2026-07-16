@@ -12,6 +12,7 @@ logs/*
 conv/*
 temp/*
 refs/*
+.cli-proxy-api/
 
 # Storage backends
 pgstore/*

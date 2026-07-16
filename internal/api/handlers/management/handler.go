@@ -4,6 +4,7 @@ package management
 
 import (
 	"crypto/subtle"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -15,9 +16,11 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/buildinfo"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/proxypool"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/usage"
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v6/sdk/auth"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
+	log "github.com/sirupsen/logrus"
 	"golang.org/x/crypto/bcrypt"
 )
 
@@ -52,6 +55,7 @@ type Handler struct {
 	logDir              string
 	postAuthHook        coreauth.PostAuthHook
 	authStatusHook      coreauth.AuthStatusHook
+	proxyPoolManager    *proxypool.Manager
 }
 
 // NewHandler creates a new management handler instance.
@@ -114,6 +118,13 @@ func (h *Handler) SetConfig(cfg *config.Config) {
 		return
 	}
 	h.mu.Lock()
+	if h.proxyPoolManager != nil {
+		if errProxyConfig := h.proxyPoolManager.UpdateConfig(cfg); errProxyConfig != nil {
+			log.WithError(errProxyConfig).Error("failed to update proxy pool runtime configuration")
+			h.mu.Unlock()
+			return
+		}
+	}
 	h.cfg = cfg
 	h.mu.Unlock()
 }
@@ -125,6 +136,22 @@ func (h *Handler) SetAuthManager(manager *coreauth.Manager) {
 	}
 	h.mu.Lock()
 	h.authManager = manager
+	h.mu.Unlock()
+}
+
+// SetProxyPoolManager updates the structured proxy runtime used by management endpoints.
+func (h *Handler) SetProxyPoolManager(manager *proxypool.Manager) {
+	if h == nil {
+		return
+	}
+	h.mu.Lock()
+	h.proxyPoolManager = manager
+	cfg := h.cfg
+	if manager != nil {
+		if errProxyConfig := manager.UpdateConfig(cfg); errProxyConfig != nil {
+			log.WithError(errProxyConfig).Error("failed to initialize proxy pool runtime configuration")
+		}
+	}
 	h.mu.Unlock()
 }
 
@@ -318,13 +345,74 @@ func (h *Handler) persist(c *gin.Context) bool {
 // persistLocked saves the current in-memory config to disk.
 // It expects the caller to hold h.mu.
 func (h *Handler) persistLocked(c *gin.Context) bool {
+	previousBody, previousExisted, errPreviousBody := h.readPersistedConfigBodyLocked()
+	if errPreviousBody != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read current config"})
+		return false
+	}
+	previousCfg, errPreviousConfig := config.LoadConfigOptional(h.configFilePath, true)
+	if errPreviousConfig != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to load current config"})
+		return false
+	}
 	// Preserve comments when writing
 	if err := config.SaveConfigPreserveComments(h.configFilePath, h.cfg); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to save config: %v", err)})
 		return false
 	}
+	if h.proxyPoolManager != nil {
+		if errProxyConfig := h.proxyPoolManager.UpdateConfig(h.cfg); errProxyConfig != nil {
+			h.restorePersistedConfigLocked(previousBody, previousExisted, previousCfg)
+			if errRollbackRuntime := h.proxyPoolManager.UpdateConfig(previousCfg); errRollbackRuntime != nil {
+				log.WithError(errRollbackRuntime).Error("failed to roll back proxy pool runtime configuration")
+			}
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update proxy pool runtime configuration"})
+			return false
+		}
+	}
 	c.JSON(http.StatusOK, gin.H{"status": "ok"})
 	return true
+}
+
+func (h *Handler) restorePersistedConfigLocked(previousBody []byte, previousExisted bool, previousCfg *config.Config) {
+	if h == nil {
+		return
+	}
+	if h.cfg != nil && previousCfg != nil {
+		*h.cfg = *previousCfg
+	} else {
+		h.cfg = previousCfg
+	}
+	h.restorePersistedConfigFileLocked(previousBody, previousExisted)
+}
+
+func (h *Handler) readPersistedConfigBodyLocked() ([]byte, bool, error) {
+	if h == nil {
+		return nil, false, nil
+	}
+	body, errRead := os.ReadFile(h.configFilePath)
+	if errRead == nil {
+		return body, true, nil
+	}
+	if errors.Is(errRead, os.ErrNotExist) {
+		return nil, false, nil
+	}
+	return nil, false, errRead
+}
+
+func (h *Handler) restorePersistedConfigFileLocked(previousBody []byte, previousExisted bool) {
+	if h == nil {
+		return
+	}
+	if previousExisted {
+		if errRestore := WriteConfig(h.configFilePath, previousBody); errRestore != nil {
+			log.WithError(errRestore).Error("failed to roll back persisted configuration")
+		}
+		return
+	}
+	if errRemove := os.Remove(h.configFilePath); errRemove != nil && !errors.Is(errRemove, os.ErrNotExist) {
+		log.WithError(errRemove).Error("failed to remove rejected configuration")
+	}
 }
 
 // Helper methods for simple types

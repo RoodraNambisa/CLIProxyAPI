@@ -5,6 +5,7 @@ package executor
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
@@ -31,7 +32,6 @@ import (
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
-	"golang.org/x/net/proxy"
 )
 
 const (
@@ -71,10 +71,14 @@ type codexWebsocketSession struct {
 	wsURL          string
 	authID         string
 	authInstanceID string
+	proxyBindingID string
+	proxyIdentity  string
 	// pendingAuthID and dialGeneration identify an in-flight Codex dial before a
 	// connection has been installed on the session.
 	pendingAuthID         string
 	pendingAuthInstanceID string
+	pendingProxyBindingID string
+	pendingProxyIdentity  string
 	dialGeneration        uint64
 	// terminated prevents Codex requests that already captured this session from
 	// reconnecting after the session has been removed from its store.
@@ -929,13 +933,7 @@ func newProxyAwareWebsocketDialer(ctx context.Context, cfg *config.Config, auth 
 		}).DialContext,
 	}
 
-	proxyURL := ""
-	if auth != nil {
-		proxyURL = strings.TrimSpace(auth.ProxyURL)
-	}
-	if proxyURL == "" && cfg != nil {
-		proxyURL = strings.TrimSpace(cfg.ProxyURL)
-	}
+	proxyURL := effectiveWebsocketProxyURL(cfg, auth)
 	if proxyURL == "" {
 		return enableCodexWebsocketUTLS(dialer, ctx, cfg, auth, proxyURL)
 	}
@@ -943,7 +941,11 @@ func newProxyAwareWebsocketDialer(ctx context.Context, cfg *config.Config, auth 
 	setting, errParse := proxyutil.Parse(proxyURL)
 	if errParse != nil {
 		log.Errorf("codex websockets executor: %v", errParse)
-		return enableCodexWebsocketUTLS(dialer, ctx, cfg, auth, "")
+		dialer.Proxy = nil
+		dialer.NetDialContext = func(context.Context, string, string) (net.Conn, error) {
+			return nil, errParse
+		}
+		return enableCodexWebsocketUTLS(dialer, ctx, cfg, auth, proxyURL)
 	}
 
 	switch setting.Mode {
@@ -955,30 +957,40 @@ func newProxyAwareWebsocketDialer(ctx context.Context, cfg *config.Config, auth 
 		return enableCodexWebsocketUTLS(dialer, ctx, cfg, auth, "")
 	}
 
-	switch setting.URL.Scheme {
-	case "socks5", "socks5h":
-		var proxyAuth *proxy.Auth
-		if setting.URL.User != nil {
-			username := setting.URL.User.Username()
-			password, _ := setting.URL.User.Password()
-			proxyAuth = &proxy.Auth{User: username, Password: password}
-		}
-		socksDialer, errSOCKS5 := proxy.SOCKS5("tcp", setting.URL.Host, proxyAuth, proxy.Direct)
-		if errSOCKS5 != nil {
-			log.Errorf("codex websockets executor: create SOCKS5 dialer failed: %v", errSOCKS5)
-			return dialer
-		}
+	proxyDialer, _, errBuild := proxyutil.BuildContextDialer(proxyURL)
+	if errBuild != nil {
+		log.Errorf("codex websockets executor: configure proxy dialer failed: %v", errBuild)
 		dialer.Proxy = nil
-		dialer.NetDialContext = func(_ context.Context, network, addr string) (net.Conn, error) {
-			return socksDialer.Dial(network, addr)
+		dialer.NetDialContext = func(context.Context, string, string) (net.Conn, error) {
+			return nil, errBuild
 		}
-	case "http", "https":
-		dialer.Proxy = http.ProxyURL(setting.URL)
-	default:
-		log.Errorf("codex websockets executor: unsupported proxy scheme: %s", setting.URL.Scheme)
+		return enableCodexWebsocketUTLS(dialer, ctx, cfg, auth, proxyURL)
 	}
+	dialer.Proxy = nil
+	dialer.NetDialContext = proxyDialer.DialContext
 
 	return enableCodexWebsocketUTLS(dialer, ctx, cfg, auth, proxyURL)
+}
+
+func effectiveWebsocketProxyURL(cfg *config.Config, auth *cliproxyauth.Auth) string {
+	if auth != nil {
+		if proxyURL := strings.TrimSpace(auth.EffectiveProxyURL()); proxyURL != "" {
+			return proxyURL
+		}
+	}
+	if cfg != nil {
+		return strings.TrimSpace(cfg.ProxyURL)
+	}
+	return ""
+}
+
+func websocketProxyIdentity(cfg *config.Config, auth *cliproxyauth.Auth) string {
+	proxyURL := effectiveWebsocketProxyURL(cfg, auth)
+	if proxyURL == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(proxyURL))
+	return fmt.Sprintf("%x", sum[:])
 }
 
 func enableCodexWebsocketUTLS(dialer *websocket.Dialer, ctx context.Context, cfg *config.Config, auth *cliproxyauth.Auth, proxyURL string) *websocket.Dialer {
@@ -1512,12 +1524,16 @@ func (e *CodexWebsocketsExecutor) ensureUpstreamConn(ctx context.Context, auth *
 	readerConn := sess.readerConn
 	currentAuthID := strings.TrimSpace(sess.authID)
 	currentAuthInstanceID := strings.TrimSpace(sess.authInstanceID)
+	currentProxyBindingID := strings.TrimSpace(sess.proxyBindingID)
+	currentProxyIdentity := strings.TrimSpace(sess.proxyIdentity)
 	currentWSURL := strings.TrimSpace(sess.wsURL)
 	sess.connMu.Unlock()
 	requestedAuthID := strings.TrimSpace(authID)
 	requestedAuthInstanceID := auth.RuntimeInstanceID()
+	requestedProxyBindingID := auth.EffectiveProxyBindingID()
+	requestedProxyIdentity := websocketProxyIdentity(e.cfg, auth)
 	requestedWSURL := strings.TrimSpace(wsURL)
-	if conn != nil && (currentAuthID != requestedAuthID || currentAuthInstanceID != requestedAuthInstanceID || currentWSURL != requestedWSURL) {
+	if conn != nil && (currentAuthID != requestedAuthID || currentAuthInstanceID != requestedAuthInstanceID || currentProxyBindingID != requestedProxyBindingID || currentProxyIdentity != requestedProxyIdentity || currentWSURL != requestedWSURL) {
 		e.invalidateUpstreamConnWithoutDisconnectNotify(sess, conn, "auth_changed", nil)
 		conn = nil
 		readerConn = nil
@@ -1551,6 +1567,8 @@ func (e *CodexWebsocketsExecutor) ensureUpstreamConn(ctx context.Context, auth *
 	dialGeneration := sess.dialGeneration
 	sess.pendingAuthID = strings.TrimSpace(authID)
 	sess.pendingAuthInstanceID = auth.RuntimeInstanceID()
+	sess.pendingProxyBindingID = requestedProxyBindingID
+	sess.pendingProxyIdentity = requestedProxyIdentity
 	sess.connMu.Unlock()
 
 	conn, resp, errDial := e.dialCodexWebsocket(ctx, auth, wsURL, headers)
@@ -1563,7 +1581,7 @@ func (e *CodexWebsocketsExecutor) ensureUpstreamConn(ctx context.Context, auth *
 	}
 
 	sess.connMu.Lock()
-	if sess.terminated || sess.dialGeneration != dialGeneration || sess.pendingAuthID != requestedAuthID || sess.pendingAuthInstanceID != requestedAuthInstanceID {
+	if sess.terminated || sess.dialGeneration != dialGeneration || sess.pendingAuthID != requestedAuthID || sess.pendingAuthInstanceID != requestedAuthInstanceID || sess.pendingProxyBindingID != requestedProxyBindingID || sess.pendingProxyIdentity != requestedProxyIdentity {
 		sess.connMu.Unlock()
 		if errClose := conn.Close(); errClose != nil {
 			log.Errorf("codex websockets executor: close websocket error: %v", errClose)
@@ -1574,6 +1592,8 @@ func (e *CodexWebsocketsExecutor) ensureUpstreamConn(ctx context.Context, auth *
 	if errCurrent := codexWebsocketExecutionStateError(ctx, auth); errCurrent != nil {
 		sess.pendingAuthID = ""
 		sess.pendingAuthInstanceID = ""
+		sess.pendingProxyBindingID = ""
+		sess.pendingProxyIdentity = ""
 		sess.connMu.Unlock()
 		if errClose := conn.Close(); errClose != nil {
 			log.Errorf("codex websockets executor: close websocket error: %v", errClose)
@@ -1585,6 +1605,8 @@ func (e *CodexWebsocketsExecutor) ensureUpstreamConn(ctx context.Context, auth *
 		previous := sess.conn
 		sess.pendingAuthID = ""
 		sess.pendingAuthInstanceID = ""
+		sess.pendingProxyBindingID = ""
+		sess.pendingProxyIdentity = ""
 		sess.connMu.Unlock()
 		if errClose := conn.Close(); errClose != nil {
 			log.Errorf("codex websockets executor: close websocket error: %v", errClose)
@@ -1595,8 +1617,12 @@ func (e *CodexWebsocketsExecutor) ensureUpstreamConn(ctx context.Context, auth *
 	sess.wsURL = wsURL
 	sess.authID = authID
 	sess.authInstanceID = auth.RuntimeInstanceID()
+	sess.proxyBindingID = requestedProxyBindingID
+	sess.proxyIdentity = requestedProxyIdentity
 	sess.pendingAuthID = ""
 	sess.pendingAuthInstanceID = ""
+	sess.pendingProxyBindingID = ""
+	sess.pendingProxyIdentity = ""
 	sess.readerConn = conn
 	sess.connMu.Unlock()
 
@@ -1624,6 +1650,8 @@ func clearCodexPendingWebsocketDial(sess *codexWebsocketSession, generation uint
 	if sess.dialGeneration == generation {
 		sess.pendingAuthID = ""
 		sess.pendingAuthInstanceID = ""
+		sess.pendingProxyBindingID = ""
+		sess.pendingProxyIdentity = ""
 	}
 	sess.connMu.Unlock()
 }
@@ -1710,6 +1738,8 @@ func (e *CodexWebsocketsExecutor) invalidateUpstreamConnWithNotify(sess *codexWe
 	}
 	sess.authID = ""
 	sess.authInstanceID = ""
+	sess.proxyBindingID = ""
+	sess.proxyIdentity = ""
 	sess.wsURL = ""
 	sess.connMu.Unlock()
 
@@ -1815,6 +1845,8 @@ func closeCodexWebsocketSession(sess *codexWebsocketSession, reason string) {
 	}
 	sess.pendingAuthID = ""
 	sess.pendingAuthInstanceID = ""
+	sess.pendingProxyBindingID = ""
+	sess.pendingProxyIdentity = ""
 	if sess.readerConn == conn {
 		sess.readerConn = nil
 	}
@@ -1895,6 +1927,8 @@ func closeCodexWebsocketSessionsForAuth(store *codexWebsocketSessionStore, authI
 		current.dialGeneration++
 		current.pendingAuthID = ""
 		current.pendingAuthInstanceID = ""
+		current.pendingProxyBindingID = ""
+		current.pendingProxyIdentity = ""
 		delete(store.sessions, items[i].sessionID)
 		current.connMu.Unlock()
 		store.mu.Unlock()

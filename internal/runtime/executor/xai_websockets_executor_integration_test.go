@@ -75,6 +75,122 @@ func (c *xaiObservedDoneContext) Done() <-chan struct{} {
 	return c.Context.Done()
 }
 
+func TestXAIWebsocketConversationIdentityIgnoresProxyRebind(t *testing.T) {
+	sess := &codexWebsocketSession{
+		authID:         "auth-1",
+		authInstanceID: "instance-1",
+		proxyBindingID: "binding-1",
+		proxyIdentity:  "proxy-hash-1",
+		wsURL:          "wss://example.test/responses",
+	}
+
+	if xaiWebsocketConversationIdentityChanged(sess, "auth-1", "instance-1", "wss://example.test/responses") {
+		t.Fatal("unchanged conversation identity was treated as new")
+	}
+	sess.proxyBindingID = "binding-2"
+	sess.proxyIdentity = "proxy-hash-2"
+	if xaiWebsocketConversationIdentityChanged(sess, "auth-1", "instance-1", "wss://example.test/responses") {
+		t.Fatal("proxy rebind changed logical conversation identity")
+	}
+	if !xaiWebsocketConversationIdentityChanged(sess, "auth-2", "instance-1", "wss://example.test/responses") {
+		t.Fatal("auth change did not invalidate conversation identity")
+	}
+}
+
+func TestXAIWebsocketProxyRebindReconnectsWithoutDroppingConversationState(t *testing.T) {
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	connections := make(chan struct{}, 2)
+	firstConnectionClosed := make(chan struct{})
+	var connectionCount atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, errUpgrade := upgrader.Upgrade(w, r, nil)
+		if errUpgrade != nil {
+			return
+		}
+		connectionNumber := connectionCount.Add(1)
+		defer func() {
+			_ = conn.Close()
+			if connectionNumber == 1 {
+				close(firstConnectionClosed)
+			}
+		}()
+		connections <- struct{}{}
+		for {
+			if _, _, errRead := conn.ReadMessage(); errRead != nil {
+				return
+			}
+		}
+	}))
+	defer server.Close()
+
+	store := &codexWebsocketSessionStore{sessions: make(map[string]*codexWebsocketSession)}
+	idStore := &xaiWebsocketIDStateStore{sessions: make(map[string]*xaiWebsocketIDState)}
+	exec := NewXAIWebsocketsExecutor(&config.Config{})
+	exec.store = store
+	exec.idStore = idStore
+
+	const sessionID = "proxy-rebind-session"
+	sess := exec.getOrCreateSession(sessionID)
+	auth := &cliproxyauth.Auth{
+		ID:                    "auth-1",
+		Provider:              "xai",
+		RuntimeProxyURL:       "direct",
+		RuntimeProxyBindingID: "binding-1",
+	}
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
+	connFirst, _, errDial := exec.ensureUpstreamConn(t.Context(), auth, sess, auth.ID, wsURL, http.Header{})
+	if errDial != nil {
+		t.Fatalf("first websocket dial: %v", errDial)
+	}
+	if connFirst == nil {
+		t.Fatal("first websocket connection is nil")
+	}
+	select {
+	case <-connections:
+	case <-time.After(5 * time.Second):
+		t.Fatal("first websocket connection was not observed")
+	}
+
+	state := getXAIWebsocketIDState(idStore, sessionID)
+	state.mapDownstreamToUpstream("downstream-prev", "upstream-prev")
+	state.replaceTranscriptWithItems([]byte(`{"type":"compaction","encrypted_content":"opaque"}`))
+
+	auth.RuntimeProxyBindingID = "binding-2"
+	if xaiWebsocketConversationIdentityChanged(sess, auth.ID, auth.RuntimeInstanceID(), wsURL) {
+		deleteXAIWebsocketIDStateForSession(store, idStore, sessionID, sessionID, sess)
+	}
+	connSecond, _, errDial := exec.ensureUpstreamConn(t.Context(), auth, sess, auth.ID, wsURL, http.Header{})
+	if errDial != nil {
+		t.Fatalf("second websocket dial after proxy rebind: %v", errDial)
+	}
+	if connSecond == nil || connSecond == connFirst {
+		t.Fatalf("second websocket connection = %p, first = %p; want replacement", connSecond, connFirst)
+	}
+	select {
+	case <-connections:
+	case <-time.After(5 * time.Second):
+		t.Fatal("replacement websocket connection was not observed")
+	}
+	select {
+	case <-firstConnectionClosed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("first websocket connection remained open after proxy rebind")
+	}
+
+	mapper := newXAIWebsocketRequestIDMapper(idStore, sessionID, []byte(`{"previous_response_id":"downstream-prev"}`))
+	if mapper == nil {
+		t.Fatal("request ID mapper was removed by proxy rebind")
+	}
+	if mapper.upstreamPreviousID != "upstream-prev" {
+		t.Fatalf("upstream previous response ID = %q, want upstream-prev", mapper.upstreamPreviousID)
+	}
+	if got := string(state.snapshotTranscriptInput()); got != `[{"type":"compaction","encrypted_content":"opaque"}]` {
+		t.Fatalf("transcript after proxy rebind = %s", got)
+	}
+
+	exec.CloseExecutionSession(sessionID)
+}
+
 func drainXAIStream(t *testing.T, result *cliproxyexecutor.StreamResult) {
 	t.Helper()
 	if result == nil {

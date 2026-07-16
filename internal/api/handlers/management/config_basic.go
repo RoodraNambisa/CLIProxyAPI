@@ -2,6 +2,7 @@ package management
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -164,19 +165,55 @@ func (h *Handler) PutConfigYAML(c *gin.Context) {
 		return
 	}
 	h.mu.Lock()
-	defer h.mu.Unlock()
+	previousBody, errPrevious := os.ReadFile(h.configFilePath)
+	previousExisted := errPrevious == nil
+	if errPrevious != nil && !errors.Is(errPrevious, os.ErrNotExist) {
+		h.mu.Unlock()
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "read_failed", "message": "failed to read current config"})
+		return
+	}
+	previousCfg := h.cfg
 	if WriteConfig(h.configFilePath, body) != nil {
+		h.mu.Unlock()
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "write_failed", "message": "failed to write config"})
 		return
 	}
 	// Reload into handler to keep memory in sync
 	newCfg, err := config.LoadConfig(h.configFilePath)
 	if err != nil {
+		h.rollbackConfigYAMLLocked(previousBody, previousExisted, previousCfg)
+		h.mu.Unlock()
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "reload_failed", "message": err.Error()})
 		return
 	}
+	proxyPoolManager := h.proxyPoolManager
+	if proxyPoolManager != nil {
+		if errProxyConfig := proxyPoolManager.UpdateConfig(newCfg); errProxyConfig != nil {
+			h.rollbackConfigYAMLLocked(previousBody, previousExisted, previousCfg)
+			if errRollbackRuntime := proxyPoolManager.UpdateConfig(previousCfg); errRollbackRuntime != nil {
+				log.WithError(errRollbackRuntime).Error("failed to roll back proxy pool runtime after config upload")
+			}
+			h.mu.Unlock()
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "runtime_update_failed", "message": "failed to update proxy pool runtime"})
+			return
+		}
+	}
 	h.cfg = newCfg
+	h.mu.Unlock()
 	c.JSON(http.StatusOK, gin.H{"ok": true, "changed": []string{"config"}})
+}
+
+func (h *Handler) rollbackConfigYAMLLocked(previousBody []byte, previousExisted bool, previousCfg *config.Config) {
+	h.cfg = previousCfg
+	if previousExisted {
+		if errRestore := WriteConfig(h.configFilePath, previousBody); errRestore != nil {
+			log.WithError(errRestore).Error("failed to roll back config upload")
+		}
+		return
+	}
+	if errRemove := os.Remove(h.configFilePath); errRemove != nil && !errors.Is(errRemove, os.ErrNotExist) {
+		log.WithError(errRemove).Error("failed to remove config created by rejected upload")
+	}
 }
 
 // GetConfigYAML returns the raw config.yaml file bytes without re-encoding.
@@ -554,7 +591,7 @@ func (h *Handler) PutProxyURL(c *gin.Context) {
 	previous := h.cfg.ProxyURL
 	value := strings.TrimSpace(*body.Value)
 	if isMaskedProxyURL(value) && !replaceMaskedProxyRequested(c) {
-		if value != proxyutil.MaskProxyURL(previous) {
+		if !proxyutil.MaskedProxyURLMatches(value, previous) {
 			h.mu.Unlock()
 			c.JSON(http.StatusBadRequest, gin.H{"error": "value must contain the complete proxy credential"})
 			return

@@ -207,6 +207,60 @@ func TestRefreshTokensDeduplicatesConcurrentRefresh(t *testing.T) {
 	}
 }
 
+func TestRefreshTokensDoesNotDeduplicateAcrossProxyScopes(t *testing.T) {
+	resetXAIRefreshGroupForTest()
+	t.Cleanup(resetXAIRefreshGroupForTest)
+
+	var calls int32
+	started := make(chan struct{}, 2)
+	release := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&calls, 1)
+		started <- struct{}{}
+		<-release
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"access_token": "new-access",
+			"expires_in":   3600,
+		})
+	}))
+	defer server.Close()
+
+	authA := NewXAIAuth(nil)
+	authA.refreshScope = xaiRefreshScope("http://proxy-a.example:8080")
+	authA.validateOAuthEndpoint = allowTestXAIEndpoint
+	authB := NewXAIAuth(nil)
+	authB.refreshScope = xaiRefreshScope("http://proxy-b.example:8080")
+	authB.validateOAuthEndpoint = allowTestXAIEndpoint
+
+	errs := make(chan error, 2)
+	go func() {
+		_, errRefresh := authA.RefreshTokens(context.Background(), "shared-refresh-token", server.URL)
+		errs <- errRefresh
+	}()
+	go func() {
+		_, errRefresh := authB.RefreshTokens(context.Background(), "shared-refresh-token", server.URL)
+		errs <- errRefresh
+	}()
+
+	for i := 0; i < 2; i++ {
+		select {
+		case <-started:
+		case <-time.After(time.Second):
+			t.Fatal("timed out waiting for independent refresh calls")
+		}
+	}
+	close(release)
+	for i := 0; i < 2; i++ {
+		if errRefresh := <-errs; errRefresh != nil {
+			t.Fatalf("RefreshTokens() error = %v", errRefresh)
+		}
+	}
+	if got := atomic.LoadInt32(&calls); got != 2 {
+		t.Fatalf("refresh calls = %d, want 2 proxy-scoped calls", got)
+	}
+}
+
 func TestRefreshTokensRejectsUntrustedEndpoint(t *testing.T) {
 	resetXAIRefreshGroupForTest()
 	t.Cleanup(resetXAIRefreshGroupForTest)

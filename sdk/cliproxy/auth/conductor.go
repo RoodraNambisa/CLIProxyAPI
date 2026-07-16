@@ -314,6 +314,8 @@ type Manager struct {
 
 	// Optional HTTP RoundTripper provider injected by host.
 	rtProvider RoundTripperProvider
+	// Optional structured proxy resolver injected by the host service.
+	proxyResolver ProxyResolver
 
 	// Auto refresh state
 	refreshCancel      context.CancelFunc
@@ -1515,6 +1517,8 @@ func (m *Manager) wrapStreamResult(ctx, resultCtx context.Context, auth *Auth, a
 				if runtimeAuthInstanceRetiredContext(ctx) {
 					retiredChunk = true
 					chunk.Err = runtimeAuthInstanceRetiredError()
+				} else {
+					chunk.Err = m.reportProxyFailure(resultCtx, auth, chunk.Err)
 				}
 				rerr := &Error{Message: chunk.Err.Error()}
 				if se, ok := errors.AsType[cliproxyexecutor.StatusError](chunk.Err); ok && se != nil {
@@ -1652,6 +1656,7 @@ func (m *Manager) executeStreamWithModelPool(ctx, resultCtx context.Context, exe
 			if errCtx := ctx.Err(); errCtx != nil {
 				return nil, errCtx
 			}
+			errStream = m.reportProxyFailure(ctx, auth, errStream)
 			rerr := &Error{Message: errStream.Error()}
 			if se, ok := errors.AsType[cliproxyexecutor.StatusError](errStream); ok && se != nil {
 				rerr.HTTPStatus = se.StatusCode()
@@ -1682,6 +1687,7 @@ func (m *Manager) executeStreamWithModelPool(ctx, resultCtx context.Context, exe
 				discardStreamChunks(streamResult.Chunks)
 				return nil, errCtx
 			}
+			bootstrapErr = m.reportProxyFailure(ctx, auth, bootstrapErr)
 			if m.isRequestInvalidError(bootstrapErr) {
 				rerr := &Error{Message: bootstrapErr.Error()}
 				if se, ok := errors.AsType[cliproxyexecutor.StatusError](bootstrapErr); ok && se != nil {
@@ -2055,6 +2061,8 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 	if auth == nil || auth.ID == "" {
 		return nil, nil
 	}
+	auth = auth.Clone()
+	clearRuntimeProxy(auth)
 	if IsRetiredGeminiCLIAuth(auth) {
 		WarnRetiredGeminiCLIAuthIgnored()
 		return nil, retiredGeminiCLIAuthError()
@@ -3004,6 +3012,7 @@ func (m *Manager) prepareRequestAuth(ctx context.Context, executor ProviderExecu
 	}
 	target := current.Clone()
 	m.mu.RUnlock()
+	carryRuntimeProxy(auth, target)
 	if !preparer.ShouldPrepareRequestAuth(target) {
 		return target, nil
 	}
@@ -3055,6 +3064,7 @@ func (m *Manager) installPreparedRequestAuth(ctx context.Context, expected, upda
 		return nil, runtimeAuthInstanceRetiredError()
 	}
 	candidate := updated.Clone()
+	clearRuntimeProxy(candidate)
 	carryForwardPreparedAuthRuntimeState(current, candidate)
 	candidate.EnsureIndex()
 	m.mu.Unlock()
@@ -3086,6 +3096,7 @@ func (m *Manager) installPreparedRequestAuth(ctx context.Context, expected, upda
 	if m.authInstallationCurrent(installedAuth) {
 		m.Hook().OnAuthUpdated(ctx, installed.Clone())
 	}
+	carryRuntimeProxy(expected, installed)
 	return installed, nil
 }
 
@@ -3176,13 +3187,23 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			}
 			return cliproxyexecutor.Response{}, errPick
 		}
+		roundState.tried[auth.ID] = struct{}{}
+		resolvedAuth, errProxy := m.ResolveProxyAuth(ctx, auth)
+		if errProxy != nil {
+			roundState.markAttempted(auth)
+			if strictSessionAffinity {
+				return cliproxyexecutor.Response{}, errProxy
+			}
+			roundState.lastErr = errProxy
+			continue
+		}
+		auth = resolvedAuth
 
 		entry := logEntryWithRequestID(ctx)
 		debugLogAuthSelection(entry, auth, provider, req.Model)
 		publishSelectedAuthMetadata(opts.Metadata, auth.ID)
 		opts = withSelectedAuthInstanceMetadata(opts, auth)
 
-		roundState.tried[auth.ID] = struct{}{}
 		execCtx := ctx
 		if rt := m.roundTripperFor(auth); rt != nil {
 			execCtx = context.WithValue(execCtx, roundTripperContextKey{}, rt)
@@ -3200,6 +3221,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 				}
 				continue
 			}
+			errPrepare = m.reportProxyFailure(execCtx, auth, errPrepare)
 			roundState.markAttempted(auth)
 			result := resultForAuth(auth, provider, routeModel, false)
 			result.Error = &Error{Message: errPrepare.Error()}
@@ -3216,6 +3238,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			roundState.lastErr = errPrepare
 			continue
 		}
+		carryRuntimeProxy(auth, preparedAuth)
 		auth = preparedAuth
 		opts = withSelectedAuthInstanceMetadata(opts, auth)
 
@@ -3288,6 +3311,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 					}
 					errExec = errRefresh
 				} else if attemptedRefresh {
+					carryRuntimeProxy(auth, refreshed)
 					auth = refreshed
 					opts = withSelectedAuthInstanceMetadata(opts, auth)
 					auth.bindExecutorOwner(executor)
@@ -3323,6 +3347,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 					}
 				}
 			}
+			errExec = m.reportProxyFailure(execCtx, auth, errExec)
 			result := resultForAuth(auth, provider, resultModel, false)
 			result.Error = &Error{Message: errExec.Error()}
 			if se, ok := errors.AsType[cliproxyexecutor.StatusError](errExec); ok && se != nil {
@@ -3391,13 +3416,23 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 			}
 			return cliproxyexecutor.Response{}, errPick
 		}
+		roundState.tried[auth.ID] = struct{}{}
+		resolvedAuth, errProxy := m.ResolveProxyAuth(ctx, auth)
+		if errProxy != nil {
+			roundState.markAttempted(auth)
+			if strictSessionAffinity {
+				return cliproxyexecutor.Response{}, errProxy
+			}
+			roundState.lastErr = errProxy
+			continue
+		}
+		auth = resolvedAuth
 
 		entry := logEntryWithRequestID(ctx)
 		debugLogAuthSelection(entry, auth, provider, req.Model)
 		publishSelectedAuthMetadata(opts.Metadata, auth.ID)
 		opts = withSelectedAuthInstanceMetadata(opts, auth)
 
-		roundState.tried[auth.ID] = struct{}{}
 		execCtx := ctx
 		if rt := m.roundTripperFor(auth); rt != nil {
 			execCtx = context.WithValue(execCtx, roundTripperContextKey{}, rt)
@@ -3415,6 +3450,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 				}
 				continue
 			}
+			errPrepare = m.reportProxyFailure(execCtx, auth, errPrepare)
 			roundState.markAttempted(auth)
 			result := resultForAuth(auth, provider, routeModel, false)
 			result.Error = &Error{Message: errPrepare.Error()}
@@ -3431,6 +3467,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 			roundState.lastErr = errPrepare
 			continue
 		}
+		carryRuntimeProxy(auth, preparedAuth)
 		auth = preparedAuth
 		opts = withSelectedAuthInstanceMetadata(opts, auth)
 
@@ -3502,6 +3539,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 					}
 					errExec = errRefresh
 				} else if attemptedRefresh {
+					carryRuntimeProxy(auth, refreshed)
 					auth = refreshed
 					opts = withSelectedAuthInstanceMetadata(opts, auth)
 					auth.bindExecutorOwner(executor)
@@ -3536,6 +3574,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 					}
 				}
 			}
+			errExec = m.reportProxyFailure(execCtx, auth, errExec)
 			result := resultForAuth(auth, provider, resultModel, false)
 			result.Error = &Error{Message: errExec.Error()}
 			if se, ok := errors.AsType[cliproxyexecutor.StatusError](errExec); ok && se != nil {
@@ -3604,13 +3643,23 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			}
 			return nil, errPick
 		}
+		roundState.tried[auth.ID] = struct{}{}
+		resolvedAuth, errProxy := m.ResolveProxyAuth(ctx, auth)
+		if errProxy != nil {
+			roundState.markAttempted(auth)
+			if strictSessionAffinity {
+				return nil, errProxy
+			}
+			roundState.lastErr = errProxy
+			continue
+		}
+		auth = resolvedAuth
 
 		entry := logEntryWithRequestID(ctx)
 		debugLogAuthSelection(entry, auth, provider, req.Model)
 		publishSelectedAuthMetadata(opts.Metadata, auth.ID)
 		opts = withSelectedAuthInstanceMetadata(opts, auth)
 
-		roundState.tried[auth.ID] = struct{}{}
 		execCtx := ctx
 		if rt := m.roundTripperFor(auth); rt != nil {
 			execCtx = context.WithValue(execCtx, roundTripperContextKey{}, rt)
@@ -3628,6 +3677,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 				}
 				continue
 			}
+			errPrepare = m.reportProxyFailure(execCtx, auth, errPrepare)
 			roundState.markAttempted(auth)
 			result := resultForAuth(auth, provider, routeModel, false)
 			result.Error = &Error{Message: errPrepare.Error()}
@@ -3644,6 +3694,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			roundState.lastErr = errPrepare
 			continue
 		}
+		carryRuntimeProxy(auth, preparedAuth)
 		auth = preparedAuth
 		opts = withSelectedAuthInstanceMetadata(opts, auth)
 		models, pooled, aliasResult := m.preparedExecutionModelsWithAlias(auth, routeModel, opts)
@@ -3701,6 +3752,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 					errStream = errRefresh
 					markDeferredFailure = true
 				} else if attemptedRefresh {
+					carryRuntimeProxy(auth, refreshed)
 					auth = refreshed
 					opts = withSelectedAuthInstanceMetadata(opts, auth)
 					auth.bindExecutorOwner(executor)
@@ -4151,6 +4203,12 @@ func (m *Manager) tryAntigravityCreditsExecute(ctx context.Context, req cliproxy
 		c := *candidate
 		roundState.tried[c.auth.ID] = struct{}{}
 		roundState.markAttempted(c.auth)
+		resolvedAuth, errProxy := m.ResolveProxyAuth(ctx, c.auth)
+		if errProxy != nil {
+			lastPrepareErr = errProxy
+			continue
+		}
+		c.auth = resolvedAuth
 		creditsCtx := WithAntigravityCredits(ctx)
 		if rt := m.roundTripperFor(c.auth); rt != nil {
 			creditsCtx = context.WithValue(creditsCtx, roundTripperContextKey{}, rt)
@@ -4163,6 +4221,7 @@ func (m *Manager) tryAntigravityCreditsExecute(ctx context.Context, req cliproxy
 				return cliproxyexecutor.Response{}, false, errCtx
 			}
 			if !isRuntimeAuthInstanceRetiredError(errPrepare) {
+				errPrepare = m.reportProxyFailure(creditsCtx, c.auth, errPrepare)
 				result := resultForAuth(c.auth, c.provider, routeModel, false)
 				result.Error = &Error{Message: errPrepare.Error(), HTTPStatus: statusCodeFromError(errPrepare)}
 				result.RetryAfter = retryAfterFromError(errPrepare)
@@ -4175,6 +4234,7 @@ func (m *Manager) tryAntigravityCreditsExecute(ctx context.Context, req cliproxy
 			}
 			continue
 		}
+		carryRuntimeProxy(c.auth, preparedAuth)
 		c.auth = preparedAuth
 		publishSelectedAuthMetadata(creditsOpts.Metadata, c.auth.ID)
 		creditsOpts = withSelectedAuthInstanceMetadata(creditsOpts, c.auth)
@@ -4207,6 +4267,7 @@ func (m *Manager) tryAntigravityCreditsExecute(ctx context.Context, req cliproxy
 			if retiredDuringExecution {
 				break
 			}
+			errExec = m.reportProxyFailure(creditsCtx, c.auth, errExec)
 			result := resultForAuth(c.auth, c.provider, resultModel, false)
 			result.Error = &Error{Message: errExec.Error()}
 			if se, ok := errors.AsType[cliproxyexecutor.StatusError](errExec); ok && se != nil {
@@ -4243,6 +4304,12 @@ func (m *Manager) tryAntigravityCreditsExecuteStream(ctx context.Context, req cl
 		c := *candidate
 		roundState.tried[c.auth.ID] = struct{}{}
 		roundState.markAttempted(c.auth)
+		resolvedAuth, errProxy := m.ResolveProxyAuth(ctx, c.auth)
+		if errProxy != nil {
+			lastPrepareErr = errProxy
+			continue
+		}
+		c.auth = resolvedAuth
 		creditsCtx := WithAntigravityCredits(ctx)
 		if rt := m.roundTripperFor(c.auth); rt != nil {
 			creditsCtx = context.WithValue(creditsCtx, roundTripperContextKey{}, rt)
@@ -4255,6 +4322,7 @@ func (m *Manager) tryAntigravityCreditsExecuteStream(ctx context.Context, req cl
 				return nil, false, errCtx
 			}
 			if !isRuntimeAuthInstanceRetiredError(errPrepare) {
+				errPrepare = m.reportProxyFailure(creditsCtx, c.auth, errPrepare)
 				result := resultForAuth(c.auth, c.provider, routeModel, false)
 				result.Error = &Error{Message: errPrepare.Error(), HTTPStatus: statusCodeFromError(errPrepare)}
 				result.RetryAfter = retryAfterFromError(errPrepare)
@@ -4267,6 +4335,7 @@ func (m *Manager) tryAntigravityCreditsExecuteStream(ctx context.Context, req cl
 			}
 			continue
 		}
+		carryRuntimeProxy(c.auth, preparedAuth)
 		c.auth = preparedAuth
 		publishSelectedAuthMetadata(creditsOpts.Metadata, c.auth.ID)
 		creditsOpts = withSelectedAuthInstanceMetadata(creditsOpts, c.auth)
@@ -4945,6 +5014,9 @@ func shouldRetryRequestRound(err error, cfg *internalconfig.Config) bool {
 	if err == nil {
 		return false
 	}
+	if retryOtherAuthForError(err) {
+		return false
+	}
 	status := statusCodeFromError(err)
 	if status == http.StatusOK {
 		return false
@@ -5553,6 +5625,17 @@ func skipAuthResultForError(err error) bool {
 	return errors.As(err, &target) && target.SkipAuthResult()
 }
 
+func retryOtherAuthForError(err error) bool {
+	if err == nil {
+		return false
+	}
+	type retryOtherAuthError interface {
+		RetryOtherAuth() bool
+	}
+	var target retryOtherAuthError
+	return errors.As(err, &target) && target.RetryOtherAuth()
+}
+
 func statusCodeFromResult(err *Error) int {
 	if err == nil {
 		return 0
@@ -5676,7 +5759,7 @@ func isRequestInvalidErrorWithConfig(err error, cfg *internalconfig.Config) bool
 	if err == nil {
 		return false
 	}
-	if skipAuthResultForError(err) {
+	if skipAuthResultForError(err) && !retryOtherAuthForError(err) {
 		return true
 	}
 	if isInvalidGrantError(err) {
@@ -6929,7 +7012,11 @@ func (m *Manager) tryRefreshAntigravityAfterUnauthorized(ctx context.Context, au
 		log.Debugf("antigravity credential refresh before fallback failed for %s: %v", auth.ID, errRefresh)
 		return auth, true, errRefresh
 	}
-	return refreshed, true, nil
+	resolved, errProxy := m.ResolveProxyAuth(ctx, refreshed)
+	if errProxy != nil {
+		return auth, true, errProxy
+	}
+	return resolved, true, nil
 }
 
 func (m *Manager) refreshAntigravityForRequest(ctx context.Context, id, failedAccessToken string) (*Auth, error) {
@@ -6984,13 +7071,28 @@ func (m *Manager) refreshAntigravityForRequest(ctx context.Context, id, failedAc
 	if !active {
 		return nil, runtimeAuthInstanceRetiredError()
 	}
+	resolvedRefreshInput, errProxy := m.ResolveProxyAuth(refreshCtx, refreshInput)
+	if errProxy != nil {
+		retiredDuringRefresh := releaseRefresh()
+		if retiredDuringRefresh || runtimeAuthInstanceRetiredContext(refreshCtx) {
+			return nil, runtimeAuthInstanceRetiredError()
+		}
+		return nil, errProxy
+	}
+	refreshInput = resolvedRefreshInput
 
 	updated, errRefresh := exec.Refresh(refreshCtx, refreshInput)
+	if errRefresh != nil {
+		errRefresh = m.reportProxyFailure(refreshCtx, refreshInput, errRefresh)
+	}
 	retiredDuringRefresh := releaseRefresh()
 	if retiredDuringRefresh || runtimeAuthInstanceRetiredContext(refreshCtx) {
 		return nil, runtimeAuthInstanceRetiredError()
 	}
 	if errRefresh != nil {
+		if skipAuthResultForError(errRefresh) {
+			return nil, errRefresh
+		}
 		if isInvalidGrantError(errRefresh) {
 			result := resultForAuth(auth, auth.Provider, "", false)
 			result.Error = &Error{
@@ -7006,6 +7108,7 @@ func (m *Manager) refreshAntigravityForRequest(ctx context.Context, id, failedAc
 	if updated == nil {
 		updated = refreshInput
 	}
+	carryRuntimeProxy(refreshInput, updated)
 	if updated.Runtime == nil {
 		updated.Runtime = baseline.Runtime
 	}
@@ -7119,7 +7222,16 @@ func (m *Manager) refreshAuthExpected(ctx context.Context, id string, expected *
 		return
 	}
 	defer releaseRefresh()
+	resolvedRefreshInput, errProxy := m.ResolveProxyAuth(refreshCtx, refreshInput)
+	if errProxy != nil {
+		m.deferRefreshAfterProxyFailure(id, auth, pendingUntil, errProxy)
+		return
+	}
+	refreshInput = resolvedRefreshInput
 	updated, err := exec.Refresh(refreshCtx, refreshInput)
+	if err != nil {
+		err = m.reportProxyFailure(refreshCtx, refreshInput, err)
+	}
 	retiredDuringRefresh := releaseRefresh()
 	if retiredDuringRefresh || runtimeAuthInstanceRetiredContext(refreshCtx) {
 		m.clearRefreshPendingJob(authRefreshJob{authID: id, expected: auth, pendingUntil: pendingUntil})
@@ -7134,6 +7246,10 @@ func (m *Manager) refreshAuthExpected(ctx context.Context, id string, expected *
 	log.Debugf("refreshed %s, %s, %v", auth.Provider, auth.ID, err)
 	now := time.Now()
 	if err != nil {
+		if skipAuthResultForError(err) {
+			m.deferRefreshAfterProxyFailure(id, auth, pendingUntil, err)
+			return
+		}
 		shouldReschedule := false
 		m.mu.Lock()
 		if current := m.auths[id]; current == auth {
@@ -7173,12 +7289,36 @@ func (m *Manager) refreshAuthExpected(ctx context.Context, id string, expected *
 	}
 }
 
+func (m *Manager) deferRefreshAfterProxyFailure(id string, expected *Auth, pendingUntil time.Time, err error) {
+	if m == nil || strings.TrimSpace(id) == "" {
+		return
+	}
+	delay := refreshFailureBackoff
+	if retryAfter := retryAfterFromError(err); retryAfter != nil && *retryAfter > 0 {
+		delay = *retryAfter
+	}
+	next := time.Now().Add(delay)
+	shouldReschedule := false
+	m.mu.Lock()
+	if current := m.auths[id]; current == expected {
+		current.NextRefreshAfter = next
+		shouldReschedule = true
+	} else if expected != nil {
+		shouldReschedule = clearRefreshPendingMarker(current, pendingUntil)
+	}
+	m.mu.Unlock()
+	if shouldReschedule {
+		m.queueRefreshReschedule(id)
+	}
+}
+
 func (m *Manager) applyRefreshedAuth(ctx context.Context, expected, refreshBaseline, updated *Auth, pendingUntil time.Time) (*Auth, error) {
 	if m == nil || expected == nil || updated == nil || expected.ID == "" {
 		return nil, nil
 	}
 	id := expected.ID
 	updated.ID = id
+	clearRuntimeProxy(updated)
 	if IsRetiredGeminiCLIAuth(updated) {
 		result, errRetired := m.handleRetiredAuth(ctx, updated, expected)
 		if result == nil {
@@ -7583,6 +7723,11 @@ func (m *Manager) HttpRequest(ctx context.Context, auth *Auth, req *http.Request
 	if ctx == nil {
 		ctx = req.Context()
 	}
+	resolvedAuth, errProxy := m.ResolveProxyAuth(ctx, auth)
+	if errProxy != nil {
+		return nil, errProxy
+	}
+	auth = resolvedAuth
 	runtimeCtx, releaseExecution, active := m.beginCurrentAuthExecution(ctx, auth, exec)
 	if !active {
 		return nil, runtimeAuthInstanceRetiredError()
@@ -7590,6 +7735,7 @@ func (m *Manager) HttpRequest(ctx context.Context, auth *Auth, req *http.Request
 	httpReq := req.WithContext(runtimeCtx)
 	resp, errRequest := exec.HttpRequest(runtimeCtx, auth, httpReq)
 	if errRequest != nil || resp == nil || resp.Body == nil {
+		errRequest = m.reportProxyFailure(runtimeCtx, auth, errRequest)
 		retiredDuringExecution := releaseExecution()
 		if retiredDuringExecution || runtimeAuthInstanceRetiredContext(runtimeCtx) {
 			return resp, runtimeAuthInstanceRetiredError()

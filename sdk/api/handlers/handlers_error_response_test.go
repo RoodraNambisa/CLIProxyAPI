@@ -10,6 +10,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/interfaces"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/proxypool"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v6/sdk/config"
 )
@@ -66,6 +67,16 @@ func TestWriteErrorResponse_AddonHeadersEnabled(t *testing.T) {
 	}
 	if got := recorder.Header().Values("X-Request-Id"); !reflect.DeepEqual(got, []string{"new-1", "new-2"}) {
 		t.Fatalf("X-Request-Id = %#v, want %#v", got, []string{"new-1", "new-2"})
+	}
+}
+
+func TestBuildErrorResponseBodyPreservesProxyUnavailableCode(t *testing.T) {
+	body := string(BuildErrorResponseBody(http.StatusServiceUnavailable, (&proxypool.UnavailableError{Pool: "residential"}).Error()))
+	if !strings.Contains(body, `"code":"proxy_unavailable"`) {
+		t.Fatalf("error body = %s, want proxy_unavailable code", body)
+	}
+	if !strings.Contains(body, "no proxy node is available in pool residential") {
+		t.Fatalf("error body = %s, want pool context", body)
 	}
 }
 

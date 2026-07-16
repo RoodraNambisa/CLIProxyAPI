@@ -1,6 +1,7 @@
 package cliproxy
 
 import (
+	"crypto/sha256"
 	"net/http"
 	"strings"
 	"sync"
@@ -11,14 +12,19 @@ import (
 )
 
 // defaultRoundTripperProvider returns a per-auth HTTP RoundTripper based on
-// the Auth.ProxyURL value. It caches transports per proxy URL string.
+// the auth's effective proxy URL. It caches transports per proxy URL string.
 type defaultRoundTripperProvider struct {
 	mu    sync.RWMutex
-	cache map[string]http.RoundTripper
+	cache map[string]cachedAuthRoundTripper
+}
+
+type cachedAuthRoundTripper struct {
+	identity  string
+	transport *http.Transport
 }
 
 func newDefaultRoundTripperProvider() *defaultRoundTripperProvider {
-	return &defaultRoundTripperProvider{cache: make(map[string]http.RoundTripper)}
+	return &defaultRoundTripperProvider{cache: make(map[string]cachedAuthRoundTripper)}
 }
 
 // RoundTripperFor implements coreauth.RoundTripperProvider.
@@ -26,15 +32,16 @@ func (p *defaultRoundTripperProvider) RoundTripperFor(auth *coreauth.Auth) http.
 	if auth == nil {
 		return nil
 	}
-	proxyStr := strings.TrimSpace(auth.ProxyURL)
+	proxyStr := auth.EffectiveProxyURL()
 	if proxyStr == "" {
 		return nil
 	}
+	cacheKey, identity := roundTripperCacheIdentity(auth, proxyStr)
 	p.mu.RLock()
-	rt := p.cache[proxyStr]
+	cached, exists := p.cache[cacheKey]
 	p.mu.RUnlock()
-	if rt != nil {
-		return rt
+	if exists && cached.identity == identity && cached.transport != nil {
+		return cached.transport
 	}
 	transport, _, errBuild := proxyutil.BuildHTTPTransport(proxyStr)
 	if errBuild != nil {
@@ -45,7 +52,31 @@ func (p *defaultRoundTripperProvider) RoundTripperFor(auth *coreauth.Auth) http.
 		return nil
 	}
 	p.mu.Lock()
-	p.cache[proxyStr] = transport
+	if current, ok := p.cache[cacheKey]; ok && current.identity == identity && current.transport != nil {
+		p.mu.Unlock()
+		transport.CloseIdleConnections()
+		return current.transport
+	}
+	if previous, ok := p.cache[cacheKey]; ok && previous.transport != nil {
+		previous.transport.CloseIdleConnections()
+	}
+	p.cache[cacheKey] = cachedAuthRoundTripper{identity: identity, transport: transport}
 	p.mu.Unlock()
 	return transport
+}
+
+func roundTripperCacheIdentity(auth *coreauth.Auth, proxyURL string) (string, string) {
+	digest := sha256.Sum256([]byte(strings.TrimSpace(proxyURL)))
+	proxyIdentity := string(digest[:])
+	bindingID := ""
+	authID := ""
+	if auth != nil {
+		bindingID = auth.EffectiveProxyBindingID()
+		authID = strings.TrimSpace(auth.ID)
+	}
+	identity := bindingID + "\x00" + proxyIdentity
+	if authID != "" && (bindingID != "" || strings.TrimSpace(auth.ProxyURL) != "") {
+		return "auth:" + authID, identity
+	}
+	return "proxy:" + proxyIdentity, identity
 }

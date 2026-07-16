@@ -2522,7 +2522,7 @@ func (e *AntigravityExecutor) antigravityTokenRefreshKey(ctx context.Context, au
 	if auth != nil {
 		authID = strings.TrimSpace(auth.ID)
 		instanceID = strings.TrimSpace(auth.RuntimeInstanceID())
-		proxyURL = strings.TrimSpace(auth.ProxyURL)
+		proxyURL = auth.EffectiveProxyURL()
 	}
 	globalProxyURL := ""
 	if e != nil && e.cfg != nil {
@@ -2540,7 +2540,7 @@ func (e *AntigravityExecutor) antigravityTokenRefreshKey(ctx context.Context, au
 		}
 	}
 	tokenHash := sha256.Sum256([]byte(refreshToken))
-	return strings.Join([]string{authID, instanceID, proxyURL, globalProxyURL, roundTripperKey, fmt.Sprintf("%x", tokenHash)}, "|")
+	return strings.Join([]string{authID, instanceID, proxyURL, auth.EffectiveProxyBindingID(), globalProxyURL, roundTripperKey, fmt.Sprintf("%x", tokenHash)}, "|")
 }
 
 func (e *AntigravityExecutor) refreshTokenSingleFlight(ctx context.Context, auth *cliproxyauth.Auth, refreshToken string) (*antigravityTokenRefreshData, error) {

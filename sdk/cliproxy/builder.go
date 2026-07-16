@@ -10,6 +10,7 @@ import (
 
 	configaccess "github.com/router-for-me/CLIProxyAPI/v6/internal/access/config_access"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/api"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/proxypool"
 	sdkaccess "github.com/router-for-me/CLIProxyAPI/v6/sdk/access"
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v6/sdk/auth"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
@@ -248,18 +249,25 @@ func (b *Builder) Build() (*Service, error) {
 	coreManager.SetRoundTripperProvider(newDefaultRoundTripperProvider())
 	coreManager.SetConfig(b.cfg)
 	coreManager.SetOAuthModelAlias(b.cfg.OAuthModelAlias)
+	proxyPoolManager, errProxyPool := proxypool.NewManager(b.configPath, b.cfg)
+	if errProxyPool != nil {
+		return nil, fmt.Errorf("cliproxy: initialize proxy pools: %w", errProxyPool)
+	}
+	proxyPoolManager.SetAuthSource(coreManager)
+	coreManager.SetProxyResolver(proxyPoolManager)
 
 	service := &Service{
-		cfg:            b.cfg,
-		configPath:     b.configPath,
-		tokenProvider:  tokenProvider,
-		apiKeyProvider: apiKeyProvider,
-		watcherFactory: watcherFactory,
-		hooks:          b.hooks,
-		authManager:    authManager,
-		accessManager:  accessManager,
-		coreManager:    coreManager,
-		serverOptions:  append([]api.ServerOption(nil), b.serverOptions...),
+		cfg:              b.cfg,
+		configPath:       b.configPath,
+		tokenProvider:    tokenProvider,
+		apiKeyProvider:   apiKeyProvider,
+		watcherFactory:   watcherFactory,
+		hooks:            b.hooks,
+		authManager:      authManager,
+		accessManager:    accessManager,
+		coreManager:      coreManager,
+		proxyPoolManager: proxyPoolManager,
+		serverOptions:    append([]api.ServerOption(nil), b.serverOptions...),
 	}
 	return service, nil
 }

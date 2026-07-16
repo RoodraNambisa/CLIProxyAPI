@@ -378,6 +378,9 @@ func TestCodexWebsocketsUpstreamDisconnectChanSignalsOnInvalidate(t *testing.T) 
 	sess.connMu.Lock()
 	sess.conn = conn
 	sess.authID = "auth-1"
+	sess.authInstanceID = "instance-1"
+	sess.proxyBindingID = "binding-1"
+	sess.proxyIdentity = "proxy-hash-1"
 	sess.wsURL = "ws://example.test/responses"
 	sess.readerConn = conn
 	sess.connMu.Unlock()
@@ -385,8 +388,8 @@ func TestCodexWebsocketsUpstreamDisconnectChanSignalsOnInvalidate(t *testing.T) 
 	upstreamErr := errors.New("upstream gone")
 	exec.invalidateUpstreamConn(sess, conn, "test_invalidate", upstreamErr)
 	sess.connMu.Lock()
-	if sess.authID != "" || sess.authInstanceID != "" || sess.wsURL != "" {
-		t.Fatalf("invalidated identity = (%q, %q, %q), want empty", sess.authID, sess.authInstanceID, sess.wsURL)
+	if sess.authID != "" || sess.authInstanceID != "" || sess.proxyBindingID != "" || sess.proxyIdentity != "" || sess.wsURL != "" {
+		t.Fatalf("invalidated identity = (%q, %q, %q, %q, %q), want empty", sess.authID, sess.authInstanceID, sess.proxyBindingID, sess.proxyIdentity, sess.wsURL)
 	}
 	sess.connMu.Unlock()
 
@@ -1404,6 +1407,42 @@ func TestNewProxyAwareWebsocketDialerDirectDisablesProxy(t *testing.T) {
 
 	if dialer.Proxy != nil {
 		t.Fatal("expected websocket proxy function to be nil for direct mode")
+	}
+}
+
+func TestNewProxyAwareWebsocketDialerOwnsHTTPAndHTTPSProxyDialing(t *testing.T) {
+	for _, proxyURL := range []string{
+		"http://user:pass@proxy.example.com:8080",
+		"https://user:pass@proxy.example.com:8443",
+	} {
+		t.Run(proxyURL[:strings.Index(proxyURL, "://")], func(t *testing.T) {
+			dialer := newProxyAwareWebsocketDialer(
+				context.Background(),
+				&config.Config{},
+				&cliproxyauth.Auth{ProxyURL: proxyURL},
+			)
+			if dialer.Proxy != nil {
+				t.Fatal("websocket dialer delegated proxy handling to gorilla")
+			}
+			if dialer.NetDialContext == nil {
+				t.Fatal("NetDialContext is nil, want shared CONNECT dialer")
+			}
+		})
+	}
+}
+
+func TestNewProxyAwareWebsocketDialerInvalidProxyDoesNotFallBack(t *testing.T) {
+	dialer := newProxyAwareWebsocketDialer(
+		context.Background(),
+		&config.Config{},
+		&cliproxyauth.Auth{ProxyURL: "http://proxy.example.com:0"},
+	)
+	conn, errDial := dialer.NetDialContext(context.Background(), "tcp", "upstream.example:443")
+	if conn != nil {
+		_ = conn.Close()
+	}
+	if errDial == nil {
+		t.Fatal("NetDialContext() error = nil, want invalid proxy error")
 	}
 }
 

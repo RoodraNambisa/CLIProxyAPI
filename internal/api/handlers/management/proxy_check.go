@@ -2,20 +2,16 @@ package management
 
 import (
 	"context"
-	"io"
 	"net/http"
 	"strings"
-	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/proxyutil"
 )
 
-const proxyTraceUserAgent = "Mozilla/5.0"
-
 var (
-	proxyTraceURL     = "https://cloudflare.com/cdn-cgi/trace"
-	proxyTraceTimeout = 8 * time.Second
+	proxyTraceURL     = proxyutil.DefaultTraceEndpoint
+	proxyTraceTimeout = proxyutil.DefaultTraceTimeout
 )
 
 type proxyCheckRequest struct {
@@ -65,103 +61,39 @@ func (h *Handler) writeProxyURLCheck(c *gin.Context, proxyURL string) {
 }
 
 func checkProxyURL(ctx context.Context, proxyURL string) proxyCheckResponse {
-	started := time.Now()
 	proxyURL = strings.TrimSpace(proxyURL)
-	transport, mode, errTransport := proxyCheckTransport(proxyURL)
-	result := proxyCheckResponse{
-		Mode:     mode,
-		ProxyURL: proxyutil.MaskProxyURL(proxyURL),
+	trace := proxyutil.CheckTrace(ctx, proxyURL, proxyutil.TraceOptions{
+		Endpoint: proxyTraceURL,
+		Timeout:  proxyTraceTimeout,
+	})
+	return proxyCheckResponse{
+		OK:        trace.OK,
+		Mode:      proxyCheckMode(proxyURL),
+		ProxyURL:  proxyutil.MaskProxyURL(proxyURL),
+		IP:        trace.IP,
+		Location:  trace.Location,
+		HTTP:      trace.HTTP,
+		TLS:       trace.TLS,
+		Colo:      trace.Colo,
+		ElapsedMS: trace.Elapsed.Milliseconds(),
+		Error:     trace.Error,
+		Message:   trace.Message,
 	}
-	if errTransport != nil {
-		result.Error = "invalid_proxy"
-		result.Message = "invalid proxy configuration"
-		return result
-	}
-
-	req, errRequest := http.NewRequestWithContext(ctx, http.MethodGet, proxyTraceURL, nil)
-	if errRequest != nil {
-		result.Error = "request_create_failed"
-		result.Message = errRequest.Error()
-		return result
-	}
-	req.Header.Set("User-Agent", proxyTraceUserAgent)
-
-	client := &http.Client{
-		Timeout:   proxyTraceTimeout,
-		Transport: transport,
-	}
-	resp, errDo := client.Do(req)
-	result.ElapsedMS = time.Since(started).Milliseconds()
-	if errDo != nil {
-		result.Error = "request_failed"
-		result.Message = errDo.Error()
-		if proxyURL != "" {
-			result.Message = strings.ReplaceAll(result.Message, proxyURL, proxyutil.MaskProxyURL(proxyURL))
-		}
-		return result
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	body, errRead := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
-	if errRead != nil {
-		result.Error = "read_failed"
-		result.Message = errRead.Error()
-		return result
-	}
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		result.Error = "unexpected_status"
-		result.Message = http.StatusText(resp.StatusCode)
-		if result.Message == "" {
-			result.Message = strings.TrimSpace(string(body))
-		}
-		return result
-	}
-
-	trace := parseCloudflareTrace(string(body))
-	result.IP = trace["ip"]
-	result.Location = trace["loc"]
-	result.HTTP = trace["http"]
-	result.TLS = trace["tls"]
-	result.Colo = trace["colo"]
-	result.OK = result.IP != "" || result.Location != ""
-	if !result.OK {
-		result.Error = "invalid_trace"
-		result.Message = "trace response missing ip and loc"
-	}
-	return result
 }
 
-func proxyCheckTransport(proxyURL string) (http.RoundTripper, string, error) {
+func proxyCheckMode(proxyURL string) string {
 	setting, errParse := proxyutil.Parse(proxyURL)
 	if errParse != nil {
-		return nil, "invalid", errParse
+		return "invalid"
 	}
 	switch setting.Mode {
 	case proxyutil.ModeInherit:
-		return nil, "inherit", nil
+		return "inherit"
 	case proxyutil.ModeDirect:
-		return proxyutil.NewDirectTransport(), "direct", nil
+		return "direct"
 	case proxyutil.ModeProxy:
-		transport, _, errBuild := proxyutil.BuildHTTPTransport(proxyURL)
-		return transport, "proxy", errBuild
+		return "proxy"
 	default:
-		return nil, "invalid", nil
+		return "invalid"
 	}
-}
-
-func parseCloudflareTrace(body string) map[string]string {
-	trace := make(map[string]string)
-	for _, line := range strings.Split(body, "\n") {
-		if !strings.Contains(line, "=") {
-			continue
-		}
-		parts := strings.SplitN(line, "=", 2)
-		key := strings.TrimSpace(parts[0])
-		value := strings.TrimSpace(parts[1])
-		if key == "" {
-			continue
-		}
-		trace[key] = value
-	}
-	return trace
 }

@@ -188,6 +188,15 @@ type Auth struct {
 	Unavailable bool `json:"unavailable"`
 	// ProxyURL overrides the global proxy setting for this auth if provided.
 	ProxyURL string `json:"proxy_url,omitempty"`
+	// RuntimeProxyURL is a resolved proxy-pool URL used only for the current
+	// execution. It never replaces or persists the credential's ProxyURL.
+	RuntimeProxyURL string `json:"-"`
+	// RuntimeProxyBindingID identifies the current proxy-pool binding so cached
+	// transports and long-lived sessions cannot survive a rebind.
+	RuntimeProxyBindingID string `json:"-"`
+	// runtimeProxyResolved distinguishes an explicit no-proxy decision from a
+	// clone that has not gone through request-time proxy resolution yet.
+	runtimeProxyResolved bool
 	// Attributes stores provider specific metadata needed by executors (immutable configuration).
 	Attributes map[string]string `json:"attributes,omitempty"`
 	// Metadata stores runtime mutable provider state (e.g. tokens, cookies).
@@ -576,7 +585,7 @@ func (a *Auth) ProxyInfo() string {
 	if a == nil {
 		return ""
 	}
-	proxyStr := strings.TrimSpace(a.ProxyURL)
+	proxyStr := a.EffectiveProxyURL()
 	if proxyStr == "" {
 		return ""
 	}
@@ -584,6 +593,26 @@ func (a *Auth) ProxyInfo() string {
 		return "via " + proxyStr[:idx] + " proxy"
 	}
 	return "via proxy"
+}
+
+// EffectiveProxyURL returns the credential override or its runtime pool
+// binding. The persisted credential override always has higher priority.
+func (a *Auth) EffectiveProxyURL() string {
+	if a == nil {
+		return ""
+	}
+	if proxyURL := strings.TrimSpace(a.ProxyURL); proxyURL != "" {
+		return proxyURL
+	}
+	return strings.TrimSpace(a.RuntimeProxyURL)
+}
+
+// EffectiveProxyBindingID returns the runtime proxy-pool binding identity.
+func (a *Auth) EffectiveProxyBindingID() string {
+	if a == nil || strings.TrimSpace(a.ProxyURL) != "" {
+		return ""
+	}
+	return strings.TrimSpace(a.RuntimeProxyBindingID)
 }
 
 // DisableCoolingOverride returns the auth-file scoped disable_cooling override when present.

@@ -25,6 +25,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/managementasset"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/proxypool"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/usage"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	sdkaccess "github.com/router-for-me/CLIProxyAPI/v6/sdk/access"
@@ -51,6 +52,7 @@ type serverOptionConfig struct {
 	keepAliveOnTimeout   func()
 	postAuthHook         auth.PostAuthHook
 	authStatusHook       auth.AuthStatusHook
+	proxyPoolManager     *proxypool.Manager
 }
 
 // ServerOption customises HTTP server construction.
@@ -120,6 +122,13 @@ func WithPostAuthHook(hook auth.PostAuthHook) ServerOption {
 func WithAuthStatusHook(hook auth.AuthStatusHook) ServerOption {
 	return func(cfg *serverOptionConfig) {
 		cfg.authStatusHook = hook
+	}
+}
+
+// WithProxyPoolManager exposes structured proxy runtime state to management endpoints.
+func WithProxyPoolManager(manager *proxypool.Manager) ServerOption {
+	return func(cfg *serverOptionConfig) {
+		cfg.proxyPoolManager = manager
 	}
 }
 
@@ -284,6 +293,7 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 	applySignatureCacheConfig(nil, cfg)
 	// Initialize management handler
 	s.mgmt = managementHandlers.NewHandler(cfg, configFilePath, authManager)
+	s.mgmt.SetProxyPoolManager(optionState.proxyPoolManager)
 	if optionState.localPassword != "" {
 		s.mgmt.SetLocalPassword(optionState.localPassword)
 	}
@@ -588,8 +598,12 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.POST("/proxy-pools", s.mgmt.PostProxyPool)
 		mgmt.PATCH("/proxy-pools/:name", s.mgmt.PatchProxyPool)
 		mgmt.DELETE("/proxy-pools/:name", s.mgmt.DeleteProxyPool)
+		mgmt.GET("/proxy-pools/:name/status", s.mgmt.GetProxyPoolStatus)
+		mgmt.POST("/proxy-pools/:name/check", s.mgmt.CheckProxyPool)
 		mgmt.GET("/proxy-rules", s.mgmt.GetProxyRules)
 		mgmt.PUT("/proxy-rules", s.mgmt.PutProxyRules)
+		mgmt.GET("/proxy-bindings", s.mgmt.GetProxyBindings)
+		mgmt.POST("/proxy-bindings/rebind", s.mgmt.RebindProxyBindings)
 
 		mgmt.POST("/api-call", s.mgmt.APICall)
 

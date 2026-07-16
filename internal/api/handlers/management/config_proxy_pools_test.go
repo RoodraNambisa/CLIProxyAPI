@@ -11,6 +11,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/proxypool"
 	"gopkg.in/yaml.v3"
 )
 
@@ -76,6 +77,286 @@ func TestProxyPoolManagementMasksSecretsAndMigratesRuleOnRename(t *testing.T) {
 	}
 	if got := cfg.ProxyRules[0].Pool; got != "primary" {
 		t.Fatalf("rule pool after rename = %q, want primary", got)
+	}
+}
+
+func TestProxyPoolManagementSynchronizesRuntimeAfterPersistence(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	if errWrite := os.WriteFile(configPath, []byte("proxy-pools: []\nproxy-rules: []\n"), 0o600); errWrite != nil {
+		t.Fatalf("write config: %v", errWrite)
+	}
+	cfg := &config.Config{}
+	proxyRuntime, errRuntime := proxypool.NewManager(configPath, cfg)
+	if errRuntime != nil {
+		t.Fatalf("NewManager() error = %v", errRuntime)
+	}
+	h := NewHandler(cfg, configPath, nil)
+	h.SetProxyPoolManager(proxyRuntime)
+	router := gin.New()
+	router.POST("/proxy-pools", h.PostProxyPool)
+	router.PATCH("/proxy-pools/:name", h.PatchProxyPool)
+
+	created := performProxyConfigRequest(router, http.MethodPost, "/proxy-pools", `{
+		"name":"residential",
+		"entries":[{"id":"node","url-template":"http://proxy.example:8080"}]
+	}`)
+	if created.Code != http.StatusOK {
+		t.Fatalf("create status = %d; body=%s", created.Code, created.Body.String())
+	}
+	statuses := proxyRuntime.PoolStatuses()
+	if len(statuses) != 1 || statuses[0].Name != "residential" {
+		t.Fatalf("runtime statuses after create = %#v", statuses)
+	}
+
+	renamed := performProxyConfigRequest(router, http.MethodPatch, "/proxy-pools/residential", `{"name":"primary"}`)
+	if renamed.Code != http.StatusOK {
+		t.Fatalf("rename status = %d; body=%s", renamed.Code, renamed.Body.String())
+	}
+	statuses = proxyRuntime.PoolStatuses()
+	if len(statuses) != 1 || statuses[0].Name != "primary" {
+		t.Fatalf("runtime statuses after rename = %#v", statuses)
+	}
+}
+
+func TestPersistLockedRollsBackDiskMemoryAndRuntimeOnProxyUpdateFailure(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	const previousBody = "proxy-pools: []\nproxy-rules: []\n"
+	if errWrite := os.WriteFile(configPath, []byte(previousBody), 0o600); errWrite != nil {
+		t.Fatalf("write config: %v", errWrite)
+	}
+	cfg := &config.Config{}
+	proxyRuntime, errRuntime := proxypool.NewManager(configPath, cfg)
+	if errRuntime != nil {
+		t.Fatalf("NewManager() error = %v", errRuntime)
+	}
+	h := NewHandler(cfg, configPath, nil)
+	h.SetProxyPoolManager(proxyRuntime)
+	cfg.ProxyPools = []config.ProxyPoolConfig{{
+		Name: "invalid",
+		Entries: []config.ProxyPoolEntryConfig{{
+			ID:          "node",
+			URLTemplate: "http://proxy.example:8080",
+			Ports:       "0",
+		}},
+	}}
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPatch, "/proxy-pools", nil)
+	if h.persist(ctx) {
+		t.Fatal("persist() succeeded for invalid proxy runtime configuration")
+	}
+	if recorder.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500; body=%s", recorder.Code, recorder.Body.String())
+	}
+	if len(cfg.ProxyPools) != 0 || len(cfg.ProxyRules) != 0 {
+		t.Fatalf("in-memory configuration was not rolled back: %#v %#v", cfg.ProxyPools, cfg.ProxyRules)
+	}
+	persisted, errRead := os.ReadFile(configPath)
+	if errRead != nil {
+		t.Fatalf("read config: %v", errRead)
+	}
+	if string(persisted) != previousBody {
+		t.Fatalf("persisted config = %q, want %q", persisted, previousBody)
+	}
+	if statuses := proxyRuntime.PoolStatuses(); len(statuses) != 0 {
+		t.Fatalf("runtime configuration changed after rejected update: %#v", statuses)
+	}
+}
+
+func TestSetConfigKeepsPreviousHandlerConfigWhenProxyRuntimeRejectsUpdate(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	if errWrite := os.WriteFile(configPath, []byte("proxy-pools: []\nproxy-rules: []\n"), 0o600); errWrite != nil {
+		t.Fatalf("write config: %v", errWrite)
+	}
+	previous := &config.Config{}
+	proxyRuntime, errRuntime := proxypool.NewManager(configPath, previous)
+	if errRuntime != nil {
+		t.Fatalf("NewManager() error = %v", errRuntime)
+	}
+	h := NewHandler(previous, configPath, nil)
+	h.SetProxyPoolManager(proxyRuntime)
+	invalid := &config.Config{SDKConfig: config.SDKConfig{ProxyPools: []config.ProxyPoolConfig{{
+		Name: "invalid",
+		Entries: []config.ProxyPoolEntryConfig{{
+			ID:          "node",
+			URLTemplate: "http://proxy.example:8080",
+			Ports:       "70000",
+		}},
+	}}}}
+
+	h.SetConfig(invalid)
+
+	h.mu.Lock()
+	got := h.cfg
+	h.mu.Unlock()
+	if got != previous {
+		t.Fatal("handler replaced its config after proxy runtime rejected update")
+	}
+	if statuses := proxyRuntime.PoolStatuses(); len(statuses) != 0 {
+		t.Fatalf("runtime configuration changed after rejected SetConfig: %#v", statuses)
+	}
+}
+
+func TestPutConfigYAMLSynchronizesProxyPoolRuntimeBeforeResponse(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	if errWrite := os.WriteFile(configPath, []byte("proxy-pools: []\nproxy-rules: []\n"), 0o600); errWrite != nil {
+		t.Fatalf("write config: %v", errWrite)
+	}
+	cfg := &config.Config{}
+	proxyRuntime, errRuntime := proxypool.NewManager(configPath, cfg)
+	if errRuntime != nil {
+		t.Fatalf("NewManager() error = %v", errRuntime)
+	}
+	h := NewHandler(cfg, configPath, nil)
+	h.SetProxyPoolManager(proxyRuntime)
+	body := `proxy-pools:
+  - name: uploaded
+    entries:
+      - id: node
+        url-template: http://proxy.example:8080
+proxy-rules:
+  - name: codex
+    pool: uploaded
+    providers: [codex]
+`
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPut, "/config.yaml", strings.NewReader(body))
+
+	h.PutConfigYAML(ctx)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("PutConfigYAML() status = %d; body=%s", recorder.Code, recorder.Body.String())
+	}
+	statuses := proxyRuntime.PoolStatuses()
+	if len(statuses) != 1 || statuses[0].Name != "uploaded" {
+		t.Fatalf("runtime statuses after upload = %+v", statuses)
+	}
+}
+
+func TestProxyPoolRenameMigratesPersistedRuntimeBinding(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	directory := t.TempDir()
+	configPath := filepath.Join(directory, "config.yaml")
+	rawConfig := `proxy-pools:
+  - name: residential
+    entries:
+      - id: node
+        url-template: http://proxy.example:8080
+proxy-rules:
+  - name: codex
+    pool: residential
+    providers: [codex]
+`
+	if errWrite := os.WriteFile(configPath, []byte(rawConfig), 0o600); errWrite != nil {
+		t.Fatalf("write config: %v", errWrite)
+	}
+	stateDirectory := filepath.Join(directory, ".cli-proxy-api")
+	if errMkdir := os.MkdirAll(stateDirectory, 0o700); errMkdir != nil {
+		t.Fatalf("create state directory: %v", errMkdir)
+	}
+	state := `{"version":1,"bindings":{"auth-a":{"id":"binding-a","auth_id":"auth-a","pool":"residential","entry":"node","bound_at":"2026-07-16T00:00:00Z"}}}`
+	if errWrite := os.WriteFile(filepath.Join(stateDirectory, "proxy-bindings.json"), []byte(state), 0o600); errWrite != nil {
+		t.Fatalf("write binding state: %v", errWrite)
+	}
+	cfg, errLoad := config.LoadConfig(configPath)
+	if errLoad != nil {
+		t.Fatalf("LoadConfig() error = %v", errLoad)
+	}
+	proxyRuntime, errRuntime := proxypool.NewManager(configPath, cfg)
+	if errRuntime != nil {
+		t.Fatalf("NewManager() error = %v", errRuntime)
+	}
+	h := NewHandler(cfg, configPath, nil)
+	h.SetProxyPoolManager(proxyRuntime)
+	router := gin.New()
+	router.PATCH("/proxy-pools/:name", h.PatchProxyPool)
+
+	response := performProxyConfigRequest(router, http.MethodPatch, "/proxy-pools/residential", `{"name":"primary"}`)
+	if response.Code != http.StatusOK {
+		t.Fatalf("rename status = %d; body=%s", response.Code, response.Body.String())
+	}
+	bindings := proxyRuntime.SortedBindings()
+	if len(bindings) != 1 || bindings[0].ID != "binding-a" || bindings[0].Pool != "primary" {
+		t.Fatalf("runtime bindings after rename = %+v", bindings)
+	}
+	restored, errRestore := proxypool.NewManager(configPath, cfg)
+	if errRestore != nil {
+		t.Fatalf("restore manager: %v", errRestore)
+	}
+	restoredBindings := restored.SortedBindings()
+	if len(restoredBindings) != 1 || restoredBindings[0].ID != "binding-a" || restoredBindings[0].Pool != "primary" {
+		t.Fatalf("restored bindings after rename = %+v", restoredBindings)
+	}
+}
+
+func TestProxyPoolRenameFailureRestoresOriginalYAMLBytes(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	directory := t.TempDir()
+	configPath := filepath.Join(directory, "config.yaml")
+	rawConfig := `# preserve this comment and formatting
+proxy-pools:
+  - name: residential
+    entries:
+      - id: node
+        url-template: http://proxy.example:8080
+proxy-rules:
+  - name: codex
+    pool: residential
+    providers: [codex]
+`
+	if errWrite := os.WriteFile(configPath, []byte(rawConfig), 0o600); errWrite != nil {
+		t.Fatalf("write config: %v", errWrite)
+	}
+	stateDirectory := filepath.Join(directory, ".cli-proxy-api")
+	if errMkdir := os.MkdirAll(stateDirectory, 0o700); errMkdir != nil {
+		t.Fatalf("create state directory: %v", errMkdir)
+	}
+	statePath := filepath.Join(stateDirectory, "proxy-bindings.json")
+	state := `{"version":1,"bindings":{"auth-a":{"id":"binding-a","auth_id":"auth-a","pool":"residential","entry":"node","bound_at":"2026-07-16T00:00:00Z"}}}`
+	if errWrite := os.WriteFile(statePath, []byte(state), 0o600); errWrite != nil {
+		t.Fatalf("write binding state: %v", errWrite)
+	}
+	cfg, errLoad := config.LoadConfig(configPath)
+	if errLoad != nil {
+		t.Fatalf("LoadConfig() error = %v", errLoad)
+	}
+	proxyRuntime, errRuntime := proxypool.NewManager(configPath, cfg)
+	if errRuntime != nil {
+		t.Fatalf("NewManager() error = %v", errRuntime)
+	}
+	if errRemove := os.Remove(statePath); errRemove != nil {
+		t.Fatalf("remove binding state: %v", errRemove)
+	}
+	if errMkdir := os.Mkdir(statePath, 0o700); errMkdir != nil {
+		t.Fatalf("replace binding state with directory: %v", errMkdir)
+	}
+	h := NewHandler(cfg, configPath, nil)
+	h.SetProxyPoolManager(proxyRuntime)
+	router := gin.New()
+	router.PATCH("/proxy-pools/:name", h.PatchProxyPool)
+
+	response := performProxyConfigRequest(router, http.MethodPatch, "/proxy-pools/residential", `{"name":"primary"}`)
+	if response.Code != http.StatusInternalServerError {
+		t.Fatalf("rename status = %d, want 500; body=%s", response.Code, response.Body.String())
+	}
+	persisted, errRead := os.ReadFile(configPath)
+	if errRead != nil {
+		t.Fatalf("read config: %v", errRead)
+	}
+	if string(persisted) != rawConfig {
+		t.Fatalf("rollback changed original YAML:\n%s\nwant:\n%s", persisted, rawConfig)
+	}
+	if cfg.ProxyPools[0].Name != "residential" || cfg.ProxyRules[0].Pool != "residential" {
+		t.Fatalf("in-memory rename was not rolled back: %#v %#v", cfg.ProxyPools, cfg.ProxyRules)
+	}
+	statuses := proxyRuntime.PoolStatuses()
+	if len(statuses) != 1 || statuses[0].Name != "residential" {
+		t.Fatalf("runtime rename was not rolled back: %#v", statuses)
 	}
 }
 
@@ -291,7 +572,13 @@ proxy-rules:
 
 func TestProxyPoolCreateRollsBackOnPersistenceFailure(t *testing.T) {
 	cfg := &config.Config{}
-	h := NewHandler(cfg, filepath.Join(t.TempDir(), "missing", "config.yaml"), nil)
+	configPath := filepath.Join(t.TempDir(), "missing", "config.yaml")
+	proxyRuntime, errRuntime := proxypool.NewManager(configPath, cfg)
+	if errRuntime != nil {
+		t.Fatalf("NewManager() error = %v", errRuntime)
+	}
+	h := NewHandler(cfg, configPath, nil)
+	h.SetProxyPoolManager(proxyRuntime)
 	router := gin.New()
 	router.POST("/proxy-pools", h.PostProxyPool)
 	response := performProxyConfigRequest(router, http.MethodPost, "/proxy-pools", `{
@@ -303,6 +590,9 @@ func TestProxyPoolCreateRollsBackOnPersistenceFailure(t *testing.T) {
 	}
 	if len(cfg.ProxyPools) != 0 || len(cfg.ProxyRules) != 0 {
 		t.Fatalf("configuration was not rolled back: %#v %#v", cfg.ProxyPools, cfg.ProxyRules)
+	}
+	if statuses := proxyRuntime.PoolStatuses(); len(statuses) != 0 {
+		t.Fatalf("runtime configuration changed after persistence failure: %#v", statuses)
 	}
 }
 

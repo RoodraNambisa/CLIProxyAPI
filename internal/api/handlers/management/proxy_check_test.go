@@ -12,32 +12,15 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v6/sdk/config"
+	"github.com/router-for-me/CLIProxyAPI/v6/sdk/proxyutil"
 )
-
-func TestParseCloudflareTrace(t *testing.T) {
-	trace := parseCloudflareTrace("ip=1.2.3.4\nloc=US\nhttp=http/2\ntls=TLSv1.3\ncolo=LAX\n")
-	if trace["ip"] != "1.2.3.4" {
-		t.Fatalf("ip = %q, want 1.2.3.4", trace["ip"])
-	}
-	if trace["loc"] != "US" {
-		t.Fatalf("loc = %q, want US", trace["loc"])
-	}
-	if trace["http"] != "http/2" {
-		t.Fatalf("http = %q, want http/2", trace["http"])
-	}
-	if trace["tls"] != "TLSv1.3" {
-		t.Fatalf("tls = %q, want TLSv1.3", trace["tls"])
-	}
-	if trace["colo"] != "LAX" {
-		t.Fatalf("colo = %q, want LAX", trace["colo"])
-	}
-}
 
 func TestGetProxyURLCheckUsesConfiguredProxyURL(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if got := r.Header.Get("User-Agent"); got != proxyTraceUserAgent {
-			t.Fatalf("user-agent = %q, want %q", got, proxyTraceUserAgent)
+		if got := r.Header.Get("User-Agent"); got != proxyutil.DefaultTraceUserAgent {
+			t.Fatalf("user-agent = %q, want %q", got, proxyutil.DefaultTraceUserAgent)
 		}
+		time.Sleep(2 * time.Millisecond)
 		_, _ = w.Write([]byte("ip=1.2.3.4\nloc=US\nhttp=http/1.1\ntls=TLSv1.3\ncolo=LAX\n"))
 	}))
 	defer server.Close()
@@ -73,6 +56,12 @@ func TestGetProxyURLCheckUsesConfiguredProxyURL(t *testing.T) {
 	}
 	if resp.IP != "1.2.3.4" || resp.Location != "US" {
 		t.Fatalf("response = %+v, want ip/loc", resp)
+	}
+	if resp.HTTP != "http/1.1" || resp.TLS != "TLSv1.3" || resp.Colo != "LAX" {
+		t.Fatalf("response = %+v, want http/tls/colo", resp)
+	}
+	if resp.ElapsedMS <= 0 {
+		t.Fatalf("elapsed_ms = %d, want positive", resp.ElapsedMS)
 	}
 }
 

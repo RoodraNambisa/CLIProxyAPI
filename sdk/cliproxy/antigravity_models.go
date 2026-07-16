@@ -3,6 +3,7 @@ package cliproxy
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"strings"
@@ -47,6 +48,14 @@ func (s *Service) fetchAntigravityModelCapabilityHintsWithSource(ctx context.Con
 
 	current := auth
 	for refreshAttempted := false; ; {
+		if s != nil && s.coreManager != nil {
+			resolved, errProxy := s.coreManager.ResolveProxyAuth(ctx, current)
+			if errProxy != nil {
+				log.Debugf("antigravity model fetch: proxy unavailable: %v", errProxy)
+				return antigravityModelCapabilityHints{}, current, false
+			}
+			current = resolved
+		}
 		accessToken, _ := current.Metadata["access_token"].(string)
 		accessToken = strings.TrimSpace(accessToken)
 		if accessToken == "" {
@@ -97,6 +106,12 @@ func (s *Service) fetchAntigravityModelCapabilityHints(ctx context.Context, auth
 
 		resp, errDo := client.Do(req)
 		if errDo != nil {
+			if s != nil && s.coreManager != nil {
+				errDo = s.coreManager.ReportProxyFailure(ctx, auth, errDo)
+				if antigravityModelProxyUnavailable(errDo) {
+					return antigravityModelCapabilityHints{}, false, false
+				}
+			}
 			continue
 		}
 		body, errRead := io.ReadAll(resp.Body)
@@ -104,6 +119,12 @@ func (s *Service) fetchAntigravityModelCapabilityHints(ctx context.Context, auth
 			log.Debugf("antigravity model fetch: close response body: %v", errClose)
 		}
 		if errRead != nil {
+			if s != nil && s.coreManager != nil {
+				errRead = s.coreManager.ReportProxyFailure(ctx, auth, errRead)
+				if antigravityModelProxyUnavailable(errRead) {
+					return antigravityModelCapabilityHints{}, false, false
+				}
+			}
 			continue
 		}
 		if resp.StatusCode == http.StatusUnauthorized {
@@ -120,9 +141,17 @@ func (s *Service) fetchAntigravityModelCapabilityHints(ctx context.Context, auth
 	return antigravityModelCapabilityHints{}, false, false
 }
 
+func antigravityModelProxyUnavailable(err error) bool {
+	type skipAuthResult interface {
+		SkipAuthResult() bool
+	}
+	var target skipAuthResult
+	return errors.As(err, &target) && target.SkipAuthResult()
+}
+
 func (s *Service) antigravityModelFetchProxyURL(auth *coreauth.Auth) string {
 	if auth != nil {
-		if proxyURL := strings.TrimSpace(auth.ProxyURL); proxyURL != "" {
+		if proxyURL := auth.EffectiveProxyURL(); proxyURL != "" {
 			return proxyURL
 		}
 	}

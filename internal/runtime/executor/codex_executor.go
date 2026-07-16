@@ -1282,7 +1282,7 @@ func (e *CodexExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*
 	if refreshToken == "" {
 		return auth, nil
 	}
-	svc := codexauth.NewCodexAuthWithProxyURL(e.cfg, auth.ProxyURL)
+	svc := codexauth.NewCodexAuthWithProxyURL(e.cfg, auth.EffectiveProxyURL())
 	td, err := svc.RefreshTokensWithRetry(ctx, refreshToken, 3)
 	if err != nil {
 		return nil, err

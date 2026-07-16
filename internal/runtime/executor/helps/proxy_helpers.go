@@ -2,6 +2,7 @@ package helps
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
 	"net/http"
 	"net/url"
@@ -18,19 +19,63 @@ import (
 )
 
 var (
-	proxyHTTPTransportCache        sync.Map // map[string]*cachedProxyTransport
-	proxyHTTP1TransportCache       sync.Map // map[string]*cachedProxyTransport
+	proxyHTTPTransportCache        = newProxyTransportCache()
+	proxyHTTP1TransportCache       = newProxyTransportCache()
 	environmentProxyKeys           = []string{"HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"}
 	environmentNoProxyKeys         = []string{"NO_PROXY", "no_proxy"}
-	environmentProxyTransportCache sync.Map // map[string]*http.Transport
-	environmentProxyHTTP1Cache     sync.Map // map[string]*http.Transport
+	environmentProxyTransportCache = newEnvironmentTransportCache()
+	environmentProxyHTTP1Cache     = newEnvironmentTransportCache()
 	defaultHTTP1TransportOnce      sync.Once
 	defaultHTTP1Transport          *http.Transport
 )
 
-type cachedProxyTransport struct {
-	once      sync.Once
+type proxyTransportCache struct {
+	mu         sync.Mutex
+	generation uint64
+	entries    map[string]proxyTransportCacheEntry
+}
+
+type proxyTransportCacheEntry struct {
+	identity  string
 	transport *http.Transport
+}
+
+type environmentTransportCache struct {
+	mu        sync.Mutex
+	signature string
+	transport *http.Transport
+}
+
+type proxyConfigurationError struct {
+	proxy string
+}
+
+func (e *proxyConfigurationError) Error() string {
+	if e == nil || strings.TrimSpace(e.proxy) == "" {
+		return "proxy configuration is unavailable"
+	}
+	return "proxy configuration is unavailable: " + e.proxy
+}
+
+func (*proxyConfigurationError) StatusCode() int                { return http.StatusServiceUnavailable }
+func (*proxyConfigurationError) SkipAuthResult() bool           { return true }
+func (*proxyConfigurationError) RetryOtherAuth() bool           { return true }
+func (*proxyConfigurationError) ProxyInfrastructureError() bool { return true }
+
+type proxyConfigurationErrorTransport struct {
+	err error
+}
+
+func (t proxyConfigurationErrorTransport) RoundTrip(*http.Request) (*http.Response, error) {
+	return nil, t.err
+}
+
+func newProxyTransportCache() *proxyTransportCache {
+	return &proxyTransportCache{entries: make(map[string]proxyTransportCacheEntry)}
+}
+
+func newEnvironmentTransportCache() *environmentTransportCache {
+	return &environmentTransportCache{}
 }
 
 // NewProxyAwareHTTPClient creates an HTTP client with proper proxy configuration priority:
@@ -52,17 +97,18 @@ func NewProxyAwareHTTPClient(ctx context.Context, cfg *config.Config, auth *clip
 
 	var proxyURL string
 	if auth != nil {
-		proxyURL = strings.TrimSpace(auth.ProxyURL)
+		proxyURL = auth.EffectiveProxyURL()
 	}
 	if proxyURL == "" && cfg != nil {
 		proxyURL = strings.TrimSpace(cfg.ProxyURL)
 	}
 
 	if proxyURL != "" {
-		if transport := cachedTransportForProxyURL(proxyURL); transport != nil {
+		if transport := proxyHTTPTransportCache.transportFor(auth, proxyURL, buildProxyTransport); transport != nil {
 			return newProxyHTTPClient(transport, timeout)
 		}
-		log.Debugf("failed to setup proxy from URL: %s, falling back to injected/default transport", proxyutil.MaskProxyURL(proxyURL))
+		log.Errorf("failed to setup explicit proxy from URL: %s", proxyutil.MaskProxyURL(proxyURL))
+		return newProxyConfigurationErrorClient(proxyURL, timeout)
 	}
 
 	if contextTransport != nil {
@@ -83,17 +129,23 @@ func NewProxyAwareHTTP1Client(ctx context.Context, cfg *config.Config, auth *cli
 
 	var proxyURL string
 	if auth != nil {
-		proxyURL = strings.TrimSpace(auth.ProxyURL)
+		proxyURL = auth.EffectiveProxyURL()
 	}
 	if proxyURL == "" && cfg != nil {
 		proxyURL = strings.TrimSpace(cfg.ProxyURL)
 	}
 
 	if proxyURL != "" {
-		if transport := cachedHTTP1TransportForProxyURL(proxyURL); transport != nil {
+		if transport := proxyHTTP1TransportCache.transportFor(auth, proxyURL, func(raw string) *http.Transport {
+			if transport := buildProxyTransport(raw); transport != nil {
+				return cloneTransportWithHTTP1(transport)
+			}
+			return nil
+		}); transport != nil {
 			return newProxyHTTPClient(transport, timeout)
 		}
-		log.Debugf("failed to setup HTTP/1.1 proxy from URL: %s, falling back to injected/default transport", proxyutil.MaskProxyURL(proxyURL))
+		log.Errorf("failed to setup explicit HTTP/1.1 proxy from URL: %s", proxyutil.MaskProxyURL(proxyURL))
+		return newProxyConfigurationErrorClient(proxyURL, timeout)
 	}
 
 	if contextTransport != nil {
@@ -118,32 +170,145 @@ func roundTripperFromContext(ctx context.Context) http.RoundTripper {
 	return rt
 }
 
-func cachedTransportForProxyURL(proxyURL string) *http.Transport {
+func (c *proxyTransportCache) transportFor(auth *cliproxyauth.Auth, proxyURL string, build func(string) *http.Transport) *http.Transport {
 	proxyURL = strings.TrimSpace(proxyURL)
-	if proxyURL == "" {
+	if c == nil || proxyURL == "" || build == nil {
 		return nil
 	}
-	entryAny, _ := proxyHTTPTransportCache.LoadOrStore(proxyURL, &cachedProxyTransport{})
-	entry := entryAny.(*cachedProxyTransport)
-	entry.once.Do(func() {
-		entry.transport = buildProxyTransport(proxyURL)
-	})
-	return entry.transport
+	cacheKey, identity := proxyTransportCacheIdentity(auth, proxyURL)
+	for {
+		c.mu.Lock()
+		if entry, ok := c.entries[cacheKey]; ok && entry.identity == identity && entry.transport != nil {
+			transport := entry.transport
+			c.mu.Unlock()
+			return transport
+		}
+		generation := c.generation
+		c.mu.Unlock()
+
+		built := build(proxyURL)
+		if built == nil {
+			return nil
+		}
+		c.mu.Lock()
+		if c.generation != generation {
+			built.DisableKeepAlives = true
+			c.mu.Unlock()
+			return built
+		}
+		if current, ok := c.entries[cacheKey]; ok && current.identity == identity && current.transport != nil {
+			c.mu.Unlock()
+			built.CloseIdleConnections()
+			return current.transport
+		}
+		if previous, ok := c.entries[cacheKey]; ok && previous.transport != nil {
+			previous.transport.CloseIdleConnections()
+		}
+		c.entries[cacheKey] = proxyTransportCacheEntry{identity: identity, transport: built}
+		c.mu.Unlock()
+		return built
+	}
 }
 
-func cachedHTTP1TransportForProxyURL(proxyURL string) *http.Transport {
-	proxyURL = strings.TrimSpace(proxyURL)
-	if proxyURL == "" {
+func (c *proxyTransportCache) closeMatching(match func(string) bool) {
+	if c == nil || match == nil {
+		return
+	}
+	c.mu.Lock()
+	c.generation++
+	toClose := make([]*http.Transport, 0)
+	for key, entry := range c.entries {
+		if !match(key) {
+			continue
+		}
+		delete(c.entries, key)
+		if entry.transport != nil {
+			toClose = append(toClose, entry.transport)
+		}
+	}
+	c.mu.Unlock()
+	for _, transport := range toClose {
+		transport.CloseIdleConnections()
+	}
+}
+
+// CloseProxyTransportCachesForAuth releases idle transports scoped to one credential.
+func CloseProxyTransportCachesForAuth(authID string) {
+	authID = strings.TrimSpace(authID)
+	if authID == "" {
+		return
+	}
+	key := "auth:" + authID
+	match := func(candidate string) bool { return candidate == key }
+	proxyHTTPTransportCache.closeMatching(match)
+	proxyHTTP1TransportCache.closeMatching(match)
+}
+
+// CloseUnscopedProxyTransportCaches releases transports keyed only by proxy configuration.
+func CloseUnscopedProxyTransportCaches() {
+	match := func(candidate string) bool { return strings.HasPrefix(candidate, "proxy:") }
+	proxyHTTPTransportCache.closeMatching(match)
+	proxyHTTP1TransportCache.closeMatching(match)
+	environmentProxyTransportCache.close()
+	environmentProxyHTTP1Cache.close()
+}
+
+// CloseAllProxyTransportCaches releases all shared idle proxy transports.
+func CloseAllProxyTransportCaches() {
+	match := func(string) bool { return true }
+	proxyHTTPTransportCache.closeMatching(match)
+	proxyHTTP1TransportCache.closeMatching(match)
+	environmentProxyTransportCache.close()
+	environmentProxyHTTP1Cache.close()
+}
+
+func (c *environmentTransportCache) close() {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	transport := c.transport
+	c.signature = ""
+	c.transport = nil
+	c.mu.Unlock()
+	if transport != nil {
+		transport.CloseIdleConnections()
+	}
+}
+
+func (c *environmentTransportCache) transportFor(signature string, build func() *http.Transport) *http.Transport {
+	if c == nil || build == nil {
 		return nil
 	}
-	entryAny, _ := proxyHTTP1TransportCache.LoadOrStore(proxyURL, &cachedProxyTransport{})
-	entry := entryAny.(*cachedProxyTransport)
-	entry.once.Do(func() {
-		if transport := buildProxyTransport(proxyURL); transport != nil {
-			entry.transport = cloneTransportWithHTTP1(transport)
-		}
-	})
-	return entry.transport
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.signature == signature && c.transport != nil {
+		return c.transport
+	}
+	previous := c.transport
+	transport := build()
+	c.signature = signature
+	c.transport = transport
+	if previous != nil && previous != transport {
+		previous.CloseIdleConnections()
+	}
+	return transport
+}
+
+func proxyTransportCacheIdentity(auth *cliproxyauth.Auth, proxyURL string) (string, string) {
+	digest := sha256.Sum256([]byte(strings.TrimSpace(proxyURL)))
+	proxyIdentity := string(digest[:])
+	bindingID := ""
+	authID := ""
+	if auth != nil {
+		bindingID = auth.EffectiveProxyBindingID()
+		authID = strings.TrimSpace(auth.ID)
+	}
+	identity := bindingID + "\x00" + proxyIdentity
+	if authID != "" && (bindingID != "" || strings.TrimSpace(auth.ProxyURL) != "") {
+		return "auth:" + authID, identity
+	}
+	return "proxy:" + proxyIdentity, identity
 }
 
 func newProxyHTTPClient(transport http.RoundTripper, timeout time.Duration) *http.Client {
@@ -152,6 +317,11 @@ func newProxyHTTPClient(transport http.RoundTripper, timeout time.Duration) *htt
 		client.Timeout = timeout
 	}
 	return client
+}
+
+func newProxyConfigurationErrorClient(proxyURL string, timeout time.Duration) *http.Client {
+	errProxy := &proxyConfigurationError{proxy: proxyutil.MaskProxyURL(proxyURL)}
+	return newProxyHTTPClient(proxyConfigurationErrorTransport{err: errProxy}, timeout)
 }
 
 // buildProxyTransport creates an HTTP transport configured for the given proxy URL.
@@ -182,32 +352,22 @@ func environmentProxyConfigured() bool {
 
 func newEnvironmentProxyTransport() *http.Transport {
 	signature := environmentProxySignature()
-	if cached, ok := environmentProxyTransportCache.Load(signature); ok {
-		return cached.(*http.Transport)
-	}
-
-	proxyFunc := environmentProxyFunc()
-	var transport *http.Transport
-	if base, ok := http.DefaultTransport.(*http.Transport); ok && base != nil {
-		clone := base.Clone()
-		clone.Proxy = proxyFunc
-		transport = clone
-	} else {
-		transport = &http.Transport{Proxy: proxyFunc}
-	}
-	actual, _ := environmentProxyTransportCache.LoadOrStore(signature, transport)
-	return actual.(*http.Transport)
+	return environmentProxyTransportCache.transportFor(signature, func() *http.Transport {
+		proxyFunc := environmentProxyFunc()
+		if base, ok := http.DefaultTransport.(*http.Transport); ok && base != nil {
+			clone := base.Clone()
+			clone.Proxy = proxyFunc
+			return clone
+		}
+		return &http.Transport{Proxy: proxyFunc}
+	})
 }
 
 func newEnvironmentProxyHTTP1Transport() *http.Transport {
 	signature := environmentProxySignature()
-	if cached, ok := environmentProxyHTTP1Cache.Load(signature); ok {
-		return cached.(*http.Transport)
-	}
-
-	transport := cloneTransportWithHTTP1(newEnvironmentProxyTransport())
-	actual, _ := environmentProxyHTTP1Cache.LoadOrStore(signature, transport)
-	return actual.(*http.Transport)
+	return environmentProxyHTTP1Cache.transportFor(signature, func() *http.Transport {
+		return cloneTransportWithHTTP1(newEnvironmentProxyTransport())
+	})
 }
 
 func newDefaultHTTP1Transport() *http.Transport {

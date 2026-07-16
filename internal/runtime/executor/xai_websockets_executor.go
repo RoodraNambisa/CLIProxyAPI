@@ -609,7 +609,7 @@ func (e *XAIWebsocketsExecutor) executeStream(ctx context.Context, auth *cliprox
 			}
 		}
 	}
-	if sess != nil && xaiWebsocketSessionIdentityChanged(sess, authID, auth.RuntimeInstanceID(), wsURL) {
+	if sess != nil && xaiWebsocketConversationIdentityChanged(sess, authID, auth.RuntimeInstanceID(), wsURL) {
 		deleteXAIWebsocketIDStateForSession(e.store, e.idStore, executionSessionID, stateSessionID, sess)
 	}
 	idMapper := newXAIWebsocketRequestIDMapper(e.idStore, stateSessionID, req.Payload)
@@ -1192,9 +1192,16 @@ func (e *XAIWebsocketsExecutor) ensureUpstreamConn(ctx context.Context, auth *cl
 	readerConn := sess.readerConn
 	currentAuthID := sess.authID
 	currentAuthInstanceID := sess.authInstanceID
+	currentProxyBindingID := sess.proxyBindingID
+	currentProxyIdentity := sess.proxyIdentity
 	currentWSURL := sess.wsURL
 	sess.connMu.Unlock()
-	if conn != nil && (strings.TrimSpace(currentAuthID) != strings.TrimSpace(authID) || strings.TrimSpace(currentAuthInstanceID) != auth.RuntimeInstanceID() || strings.TrimSpace(currentWSURL) != strings.TrimSpace(wsURL)) {
+	requestedAuthID := strings.TrimSpace(authID)
+	requestedAuthInstanceID := auth.RuntimeInstanceID()
+	requestedProxyBindingID := auth.EffectiveProxyBindingID()
+	requestedProxyIdentity := websocketProxyIdentity(e.cfg, auth)
+	requestedWSURL := strings.TrimSpace(wsURL)
+	if conn != nil && (strings.TrimSpace(currentAuthID) != requestedAuthID || strings.TrimSpace(currentAuthInstanceID) != requestedAuthInstanceID || strings.TrimSpace(currentProxyBindingID) != requestedProxyBindingID || strings.TrimSpace(currentProxyIdentity) != requestedProxyIdentity || strings.TrimSpace(currentWSURL) != requestedWSURL) {
 		e.invalidateUpstreamConnWithoutDisconnectNotify(sess, conn, "auth_changed", nil)
 		conn = nil
 		readerConn = nil
@@ -1222,8 +1229,10 @@ func (e *XAIWebsocketsExecutor) ensureUpstreamConn(ctx context.Context, auth *cl
 	}
 	sess.dialGeneration++
 	dialGeneration := sess.dialGeneration
-	sess.pendingAuthID = strings.TrimSpace(authID)
-	sess.pendingAuthInstanceID = auth.RuntimeInstanceID()
+	sess.pendingAuthID = requestedAuthID
+	sess.pendingAuthInstanceID = requestedAuthInstanceID
+	sess.pendingProxyBindingID = requestedProxyBindingID
+	sess.pendingProxyIdentity = requestedProxyIdentity
 	sess.connMu.Unlock()
 
 	conn, resp, errDial := e.dialXAIWebsocket(ctx, auth, wsURL, headers)
@@ -1233,7 +1242,7 @@ func (e *XAIWebsocketsExecutor) ensureUpstreamConn(ctx context.Context, auth *cl
 	}
 
 	sess.connMu.Lock()
-	if sess.terminated || !xaiAuthExecutionCurrent(auth) || sess.dialGeneration != dialGeneration || sess.pendingAuthID != strings.TrimSpace(authID) || sess.pendingAuthInstanceID != auth.RuntimeInstanceID() {
+	if sess.terminated || !xaiAuthExecutionCurrent(auth) || sess.dialGeneration != dialGeneration || sess.pendingAuthID != requestedAuthID || sess.pendingAuthInstanceID != requestedAuthInstanceID || sess.pendingProxyBindingID != requestedProxyBindingID || sess.pendingProxyIdentity != requestedProxyIdentity {
 		sess.connMu.Unlock()
 		if errClose := conn.Close(); errClose != nil {
 			log.Errorf("xai websockets executor: close websocket error: %v", errClose)
@@ -1245,6 +1254,8 @@ func (e *XAIWebsocketsExecutor) ensureUpstreamConn(ctx context.Context, auth *cl
 		previous := sess.conn
 		sess.pendingAuthID = ""
 		sess.pendingAuthInstanceID = ""
+		sess.pendingProxyBindingID = ""
+		sess.pendingProxyIdentity = ""
 		sess.connMu.Unlock()
 		if errClose := conn.Close(); errClose != nil {
 			log.Errorf("xai websockets executor: close websocket error: %v", errClose)
@@ -1254,9 +1265,13 @@ func (e *XAIWebsocketsExecutor) ensureUpstreamConn(ctx context.Context, auth *cl
 	sess.conn = conn
 	sess.wsURL = wsURL
 	sess.authID = authID
-	sess.authInstanceID = auth.RuntimeInstanceID()
+	sess.authInstanceID = requestedAuthInstanceID
+	sess.proxyBindingID = requestedProxyBindingID
+	sess.proxyIdentity = requestedProxyIdentity
 	sess.pendingAuthID = ""
 	sess.pendingAuthInstanceID = ""
+	sess.pendingProxyBindingID = ""
+	sess.pendingProxyIdentity = ""
 	sess.readerConn = conn
 	sess.connMu.Unlock()
 
@@ -1274,11 +1289,13 @@ func clearXAIPendingWebsocketDial(sess *codexWebsocketSession, generation uint64
 	if sess.dialGeneration == generation {
 		sess.pendingAuthID = ""
 		sess.pendingAuthInstanceID = ""
+		sess.pendingProxyBindingID = ""
+		sess.pendingProxyIdentity = ""
 	}
 	sess.connMu.Unlock()
 }
 
-func xaiWebsocketSessionIdentityChanged(sess *codexWebsocketSession, authID, authInstanceID, wsURL string) bool {
+func xaiWebsocketConversationIdentityChanged(sess *codexWebsocketSession, authID, authInstanceID, wsURL string) bool {
 	if sess == nil {
 		return false
 	}
@@ -1501,6 +1518,8 @@ func closeXAIWebsocketSession(sess *codexWebsocketSession, reason string) {
 	}
 	sess.pendingAuthID = ""
 	sess.pendingAuthInstanceID = ""
+	sess.pendingProxyBindingID = ""
+	sess.pendingProxyIdentity = ""
 	if sess.readerConn == conn {
 		sess.readerConn = nil
 	}
@@ -1648,6 +1667,8 @@ func detachXAIWebsocketSession(store *codexWebsocketSessionStore, idStore *xaiWe
 		sess.dialGeneration++
 		sess.pendingAuthID = ""
 		sess.pendingAuthInstanceID = ""
+		sess.pendingProxyBindingID = ""
+		sess.pendingProxyIdentity = ""
 		sess.connMu.Unlock()
 	}
 	delete(store.sessions, sessionID)
@@ -1688,6 +1709,8 @@ func detachXAIWebsocketSessionForAuth(store *codexWebsocketSessionStore, idStore
 	current.dialGeneration++
 	current.pendingAuthID = ""
 	current.pendingAuthInstanceID = ""
+	current.pendingProxyBindingID = ""
+	current.pendingProxyIdentity = ""
 	detached := detachedXAIWebsocketSession{
 		sessionID: current.sessionID,
 		authID:    currentAuthID,

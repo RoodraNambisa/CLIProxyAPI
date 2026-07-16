@@ -484,6 +484,13 @@ func (h *Handler) refreshSingleCodexPlanType(manager *coreauth.Manager, auth *co
 		result.Error = "account_id not found"
 		return result
 	}
+	resolvedAuth, errProxy := manager.ResolveProxyAuth(context.Background(), auth)
+	if errProxy != nil {
+		result.Status = codexPlanTypeRefreshStatusFailed
+		result.Error = "proxy unavailable"
+		return result
+	}
+	auth = resolvedAuth
 
 	accessToken := codexAccessTokenFromMetadata(auth.Metadata)
 	refreshToken := codexRefreshTokenFromMetadata(auth.Metadata)
@@ -589,12 +596,21 @@ func refreshCodexPlanTypeAuth(manager *coreauth.Manager, auth *coreauth.Auth) (*
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), defaultAPICallTimeout)
 	defer cancel()
+	resolvedAuth, errProxy := manager.ResolveProxyAuth(ctx, auth)
+	if errProxy != nil {
+		return auth, errProxy
+	}
+	auth = resolvedAuth
 	refreshed, err := executor.Refresh(ctx, auth)
 	if refreshed != nil {
+		if strings.TrimSpace(refreshed.ProxyURL) == "" {
+			refreshed.RuntimeProxyURL = auth.RuntimeProxyURL
+			refreshed.RuntimeProxyBindingID = auth.RuntimeProxyBindingID
+		}
 		auth = refreshed
 	}
 	if err != nil {
-		return auth, err
+		return auth, manager.ReportProxyFailure(ctx, auth, err)
 	}
 	return auth, nil
 }
@@ -662,6 +678,7 @@ func (h *Handler) fetchCodexUsagePlanType(ctx context.Context, auth *coreauth.Au
 	}
 	resp, err := httpClient.Do(req)
 	if err != nil {
+		err = h.reportManagementProxyFailure(ctxRequest, auth, err)
 		return "", 0, fmt.Errorf("usage request failed: %w", err)
 	}
 	defer func() {
@@ -672,6 +689,7 @@ func (h *Handler) fetchCodexUsagePlanType(ctx context.Context, auth *coreauth.Au
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
+		err = h.reportManagementProxyFailure(ctxRequest, auth, err)
 		return "", resp.StatusCode, fmt.Errorf("read usage response: %w", err)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {

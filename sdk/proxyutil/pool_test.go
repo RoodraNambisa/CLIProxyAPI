@@ -26,6 +26,9 @@ func TestParsePortSetNormalizesWithoutExpanding(t *testing.T) {
 	if !ok || last != 6000 {
 		t.Fatalf("last port = %d, %t; want 6000, true", last, ok)
 	}
+	if !set.Contains(3334) || !set.Contains(6000) || set.Contains(3335) || set.Contains(6001) {
+		t.Fatalf("Contains() returned an unexpected result for %q", set.String())
+	}
 }
 
 func TestParsePortSetRejectsInvalidValues(t *testing.T) {
@@ -50,6 +53,27 @@ func TestExpandURLTemplateUsesStableProvidedRandomness(t *testing.T) {
 	}
 	if got, want := strings.Join(values, ","), "abc,cb"; got != want {
 		t.Fatalf("values = %q, want %q", got, want)
+	}
+}
+
+func TestExpandURLTemplateValuesRestoresPersistedBinding(t *testing.T) {
+	got, err := ExpandURLTemplateValues(
+		"http://user-session-{3}-{2}:pass@proxy.example:18080",
+		[]string{"abc", "Z9"},
+	)
+	if err != nil {
+		t.Fatalf("ExpandURLTemplateValues() error = %v", err)
+	}
+	if want := "http://user-session-abc-Z9:pass@proxy.example:18080"; got != want {
+		t.Fatalf("ExpandURLTemplateValues() = %q, want %q", got, want)
+	}
+}
+
+func TestExpandURLTemplateValuesRejectsInvalidPersistedValues(t *testing.T) {
+	for _, values := range [][]string{{}, {"ab"}, {"a/b"}, {"abc", "extra"}} {
+		if _, err := ExpandURLTemplateValues("http://user-{3}:pass@proxy.example:18080", values); err == nil {
+			t.Fatalf("ExpandURLTemplateValues(%q) error = nil", values)
+		}
 	}
 }
 
@@ -112,11 +136,36 @@ func TestNormalizePlaceholderCharsetDeduplicates(t *testing.T) {
 
 func TestMaskProxyURL(t *testing.T) {
 	got := MaskProxyURL("http://user:p%40ss@proxy.example:18080")
-	if got != "http://user:********@proxy.example:18080" {
+	if got != "http://********:********@proxy.example:18080" {
 		t.Fatalf("MaskProxyURL() = %q", got)
 	}
-	if strings.Contains(got, "p%40ss") || strings.Contains(got, "p@ss") {
-		t.Fatal("masked URL leaked password")
+	if strings.Contains(got, "user") || strings.Contains(got, "p%40ss") || strings.Contains(got, "p@ss") {
+		t.Fatal("masked URL leaked credentials")
+	}
+}
+
+func TestMaskProxyURLMasksUsernameOnlyCredential(t *testing.T) {
+	got := MaskProxyURL("http://session-token@proxy.example:18080")
+	if got != "http://%2A%2A%2A%2A%2A%2A%2A%2A@proxy.example:18080" && got != "http://********@proxy.example:18080" {
+		t.Fatalf("MaskProxyURL() = %q", got)
+	}
+	if strings.Contains(got, "session-token") {
+		t.Fatal("masked URL leaked username-only credential")
+	}
+}
+
+func TestMaskedProxyURLMatchesCurrentAndLegacyMasks(t *testing.T) {
+	raw := "http://user:secret@proxy.example:8080"
+	for _, masked := range []string{
+		"http://********:********@proxy.example:8080",
+		"http://user:********@proxy.example:8080",
+	} {
+		if !MaskedProxyURLMatches(masked, raw) {
+			t.Fatalf("MaskedProxyURLMatches(%q) = false", masked)
+		}
+	}
+	if MaskedProxyURLMatches("http://other:********@proxy.example:8080", raw) {
+		t.Fatal("MaskedProxyURLMatches() accepted a different legacy username")
 	}
 }
 

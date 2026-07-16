@@ -18,8 +18,10 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/api"
 	internalcodex "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/codex"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/authfileguard"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/proxypool"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor"
+	executorhelps "github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor/helps"
 	internalusage "github.com/router-for-me/CLIProxyAPI/v6/internal/usage"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/watcher"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/wsrelay"
@@ -118,6 +120,9 @@ type Service struct {
 
 	// coreManager handles core authentication and execution.
 	coreManager *coreauth.Manager
+
+	// proxyPoolManager owns stable per-credential proxy bindings and health checks.
+	proxyPoolManager *proxypool.Manager
 
 	// shutdownOnce ensures shutdown is called only once.
 	shutdownOnce sync.Once
@@ -1610,6 +1615,7 @@ func (s *Service) handleAuthUpdate(ctx context.Context, update watcher.AuthUpdat
 			if errDelete != nil || !deleted {
 				return
 			}
+			executorhelps.CloseProxyTransportCachesForAuth(id)
 			s.removeUsageStatisticsForAuthIndexes(indexes, "auth delete")
 			if s.reconcileUsageStatistics("auth delete") > 0 {
 				s.persistUsageStatistics("auth-delete-reconcile")
@@ -1773,6 +1779,8 @@ func (s *Service) applyCoreAuthAddOrUpdate(ctx context.Context, auth *coreauth.A
 			return
 		}
 		auth = current
+	} else {
+		executorhelps.CloseProxyTransportCachesForAuth(auth.ID)
 	}
 
 	// Register models after auth is updated in coreManager.
@@ -1829,6 +1837,7 @@ func (s *Service) deleteCoreAuth(ctx context.Context, id string) error {
 		log.Errorf("failed to delete auth %s: %v", id, err)
 		return err
 	}
+	executorhelps.CloseProxyTransportCachesForAuth(id)
 	s.antigravityModelCapabilities.Delete(id)
 	return nil
 }
@@ -1846,6 +1855,7 @@ func (s *Service) applyCoreAuthRemovalWithReason(ctx context.Context, id string,
 	id = strings.TrimSpace(id)
 	existing, ok := s.coreManager.GetByID(id)
 	if !ok || existing == nil {
+		executorhelps.CloseProxyTransportCachesForAuth(id)
 		s.antigravityModelCapabilities.Delete(id)
 		GlobalModelRegistry().UnregisterClient(id)
 		return true
@@ -1896,6 +1906,7 @@ func (s *Service) applyCoreAuthRemovalWithReason(ctx context.Context, id string,
 		log.Errorf("failed to disable auth %s: %v", id, err)
 		return false
 	}
+	executorhelps.CloseProxyTransportCachesForAuth(id)
 	s.antigravityModelCapabilities.Delete(id)
 	GlobalModelRegistry().UnregisterClient(id)
 	if strings.EqualFold(strings.TrimSpace(existing.Provider), "codex") {
@@ -2330,12 +2341,12 @@ func (s *Service) Run(ctx context.Context) error {
 		apiKeyResult = &APIKeyClientResult{}
 	}
 	_ = apiKeyResult
-
 	// legacy clients removed; no caches to refresh
 
 	// handlers no longer depend on legacy clients; pass nil slice initially
 	serverOpts := append([]api.ServerOption(nil), s.serverOptions...)
 	serverOpts = append(serverOpts, api.WithAuthStatusHook(s.handleManagementAuthStatusChange))
+	serverOpts = append(serverOpts, api.WithProxyPoolManager(s.proxyPoolManager))
 	s.server = api.NewServer(s.cfg, s.coreManager, s.accessManager, s.configPath, serverOpts...)
 
 	if s.authManager == nil {
@@ -2368,8 +2379,11 @@ func (s *Service) Run(ctx context.Context) error {
 		})
 	}
 
-	if s.hooks.OnBeforeStart != nil {
-		s.hooks.OnBeforeStart(s.cfg)
+	if errBeforeStart := s.applyBeforeStartConfig(); errBeforeStart != nil {
+		return errBeforeStart
+	}
+	if s.proxyPoolManager != nil {
+		s.proxyPoolManager.Start(ctx)
 	}
 
 	// Register callback for startup and periodic model catalog refresh.
@@ -2515,8 +2529,13 @@ func (s *Service) Run(ctx context.Context) error {
 
 		s.applyRetryConfig(newCfg)
 		s.applyPprofConfig(newCfg)
+		executorhelps.CloseUnscopedProxyTransportCaches()
 		if s.server != nil {
 			s.server.UpdateClients(newCfg)
+		} else if s.proxyPoolManager != nil {
+			if errProxyConfig := s.proxyPoolManager.UpdateConfig(newCfg); errProxyConfig != nil {
+				log.WithError(errProxyConfig).Error("failed to update proxy pool runtime configuration")
+			}
 		}
 		s.cfgMu.Lock()
 		s.cfg = newCfg
@@ -2582,6 +2601,18 @@ func (s *Service) Run(ctx context.Context) error {
 	}
 }
 
+func (s *Service) applyBeforeStartConfig() error {
+	if s.hooks.OnBeforeStart != nil {
+		s.hooks.OnBeforeStart(s.cfg)
+	}
+	if s.proxyPoolManager != nil {
+		if errProxyConfig := s.proxyPoolManager.UpdateConfig(s.cfg); errProxyConfig != nil {
+			return fmt.Errorf("cliproxy: apply proxy configuration after before-start hook: %w", errProxyConfig)
+		}
+	}
+	return nil
+}
+
 // Shutdown gracefully stops background workers and the HTTP server.
 // It ensures all resources are properly cleaned up and connections are closed.
 // The shutdown is idempotent and can be called multiple times safely.
@@ -2605,6 +2636,9 @@ func (s *Service) Shutdown(ctx context.Context) error {
 
 		if s.watcherCancel != nil {
 			s.watcherCancel()
+		}
+		if s.proxyPoolManager != nil {
+			s.proxyPoolManager.Stop()
 		}
 		if s.coreManager != nil {
 			s.coreManager.StopAutoRefresh()
@@ -2660,6 +2694,7 @@ func (s *Service) Shutdown(ctx context.Context) error {
 		}
 
 		sdkusage.StopDefault()
+		executorhelps.CloseAllProxyTransportCaches()
 	})
 	return shutdownErr
 }

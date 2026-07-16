@@ -1482,7 +1482,7 @@ func applyProxyURLPatch(current string, incoming *string, replaceMasked bool) (s
 	if replaceMasked || !isMaskedProxyURL(value) {
 		return value, nil
 	}
-	if value != proxyutil.MaskProxyURL(current) {
+	if !proxyutil.MaskedProxyURLMatches(value, current) {
 		return "", fmt.Errorf("proxy-url must contain the complete proxy credential")
 	}
 	return current, nil
@@ -1515,7 +1515,7 @@ func restoreMaskedProxyURLs[T any](incoming, current []T, identity func(T) strin
 				continue
 			}
 			currentURL := proxyURL(&current[currentIndex])
-			if currentURL == nil || proxyutil.MaskProxyURL(*currentURL) != *incomingURL {
+			if currentURL == nil || !proxyutil.MaskedProxyURLMatches(*incomingURL, *currentURL) {
 				continue
 			}
 			if matched >= 0 && *currentURL != matchedRawURL {

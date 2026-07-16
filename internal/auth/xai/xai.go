@@ -2,6 +2,7 @@ package xai
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -21,6 +22,7 @@ import (
 type XAIAuth struct {
 	httpClient            *http.Client
 	validateOAuthEndpoint func(string, string) (string, error)
+	refreshScope          string
 }
 
 var xaiRefreshGroup singleflight.Group
@@ -44,7 +46,13 @@ func NewXAIAuthWithProxyURL(cfg *config.Config, proxyURL string) *XAIAuth {
 	return &XAIAuth{
 		httpClient:            util.SetProxy(&sdkCfg, &http.Client{Timeout: httpClientTimeout}),
 		validateOAuthEndpoint: ValidateOAuthEndpoint,
+		refreshScope:          xaiRefreshScope(effectiveProxyURL),
 	}
+}
+
+func xaiRefreshScope(proxyURL string) string {
+	sum := sha256.Sum256([]byte(strings.TrimSpace(proxyURL)))
+	return fmt.Sprintf("%x", sum[:])
 }
 
 // ValidateOAuthEndpoint validates an endpoint returned by xAI discovery.
@@ -353,7 +361,9 @@ func (a *XAIAuth) RefreshTokens(ctx context.Context, refreshToken, tokenEndpoint
 		return nil, errValidate
 	}
 
-	result, err, _ := xaiRefreshGroup.Do(refreshToken, func() (interface{}, error) {
+	keyMaterial := refreshToken + "\x00" + tokenEndpoint + "\x00" + a.refreshScope
+	keyHash := sha256.Sum256([]byte(keyMaterial))
+	result, err, _ := xaiRefreshGroup.Do(fmt.Sprintf("%x", keyHash[:]), func() (interface{}, error) {
 		return a.refreshTokensSingleFlight(context.WithoutCancel(ctx), refreshToken, tokenEndpoint)
 	})
 	if err != nil {

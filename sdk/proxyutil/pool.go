@@ -115,6 +115,16 @@ func (s PortSet) PortAt(index int) (int, bool) {
 	return 0, false
 }
 
+// Contains reports whether port belongs to the set.
+func (s PortSet) Contains(port int) bool {
+	for _, item := range s.ranges {
+		if port >= item.start && port <= item.end {
+			return true
+		}
+	}
+	return false
+}
+
 // String returns the canonical range expression.
 func (s PortSet) String() string {
 	parts := make([]string, 0, len(s.ranges))
@@ -196,6 +206,52 @@ func ExpandURLTemplate(template, charset string, source io.Reader) (string, []st
 		index = end + 1
 	}
 	return output.String(), values, nil
+}
+
+// ExpandURLTemplateValues rebuilds a URL template with previously generated
+// placeholder values. Values must remain URL-safe and match the placeholder
+// lengths exactly.
+func ExpandURLTemplateValues(template string, values []string) (string, error) {
+	var output strings.Builder
+	valueIndex := 0
+	for index := 0; index < len(template); {
+		if template[index] != '{' {
+			if template[index] == '}' {
+				return "", fmt.Errorf("unmatched placeholder delimiter")
+			}
+			output.WriteByte(template[index])
+			index++
+			continue
+		}
+		endOffset := strings.IndexByte(template[index+1:], '}')
+		if endOffset < 0 {
+			return "", fmt.Errorf("unmatched placeholder delimiter")
+		}
+		end := index + 1 + endOffset
+		length, errLength := strconv.Atoi(template[index+1 : end])
+		if errLength != nil || length < 1 || length > 128 {
+			return "", fmt.Errorf("placeholder length must be between 1 and 128")
+		}
+		if valueIndex >= len(values) {
+			return "", fmt.Errorf("missing placeholder value")
+		}
+		value := values[valueIndex]
+		if len(value) != length {
+			return "", fmt.Errorf("placeholder value length mismatch")
+		}
+		for valueOffset := 0; valueOffset < len(value); valueOffset++ {
+			if !isURLUnreserved(value[valueOffset]) {
+				return "", fmt.Errorf("placeholder value contains unsupported character")
+			}
+		}
+		output.WriteString(value)
+		valueIndex++
+		index = end + 1
+	}
+	if valueIndex != len(values) {
+		return "", fmt.Errorf("too many placeholder values")
+	}
+	return output.String(), nil
 }
 
 func randomPlaceholderValue(length int, charset string, source io.Reader) (string, error) {
@@ -300,28 +356,36 @@ func WithPort(raw string, port int) (string, error) {
 	return parsed.String(), nil
 }
 
-// MaskProxyURL hides proxy passwords for management responses and logs.
+// MaskProxyURL hides proxy credentials for management responses and logs.
 func MaskProxyURL(raw string) string {
 	trimmed := strings.TrimSpace(raw)
 	if hasAmbiguousProxyAuthority(trimmed) {
-		return maskRawProxyPassword(trimmed)
+		return maskRawProxyCredentials(trimmed)
 	}
 	parsed, errParse := url.Parse(trimmed)
 	if errParse != nil || parsed.Scheme == "" || parsed.Host == "" {
-		return maskRawProxyPassword(trimmed)
+		return maskRawProxyCredentials(trimmed)
 	}
 	if parsed.User == nil {
 		return trimmed
 	}
 	if _, hasPassword := parsed.User.Password(); !hasPassword {
-		return trimmed
+		clone := *parsed
+		clone.User = url.User("********")
+		return clone.String()
 	}
-	username := parsed.User.Username()
 	clone := *parsed
 	clone.User = nil
 	prefix := clone.Scheme + "://"
 	rest := strings.TrimPrefix(clone.String(), prefix)
-	return prefix + url.User(username).String() + ":********@" + rest
+	return prefix + "********:********@" + rest
+}
+
+// MaskedProxyURLMatches accepts both the current full userinfo mask and the
+// previous password-only mask when clients submit an unchanged proxy value.
+func MaskedProxyURLMatches(masked, raw string) bool {
+	masked = strings.TrimSpace(masked)
+	return masked == MaskProxyURL(raw) || masked == maskProxyPasswordOnly(raw)
 }
 
 func hasAmbiguousProxyAuthority(raw string) bool {
@@ -389,4 +453,58 @@ func maskRawProxyPassword(raw string) string {
 	}
 	maskedAuthority := authority[:firstColon] + ":********"
 	return raw[:authorityStart] + maskedAuthority + raw[authorityEnd:]
+}
+
+func maskRawProxyCredentials(raw string) string {
+	if at := strings.LastIndexByte(raw, '@'); at >= 0 {
+		userinfoStart := 0
+		if schemeEnd := strings.Index(raw[:at], "://"); schemeEnd >= 0 {
+			userinfoStart = schemeEnd + 3
+		} else if delimiter := strings.LastIndexAny(raw[:at], "/?#"); delimiter >= 0 {
+			userinfoStart = delimiter + 1
+		}
+		if strings.Contains(raw[userinfoStart:at], ":") {
+			return raw[:userinfoStart] + "********:********" + raw[at:]
+		}
+	}
+
+	passwordMasked := maskRawProxyPassword(raw)
+	schemeEnd := strings.Index(passwordMasked, "://")
+	authorityStart := 0
+	if schemeEnd >= 0 {
+		authorityStart = schemeEnd + 3
+	}
+	authorityEnd := len(passwordMasked)
+	if offset := strings.IndexAny(passwordMasked[authorityStart:], "/?#"); offset >= 0 {
+		authorityEnd = authorityStart + offset
+	}
+	authority := passwordMasked[authorityStart:authorityEnd]
+	colon := strings.IndexByte(authority, ':')
+	if colon < 0 || !strings.Contains(authority[colon+1:], "********") {
+		return passwordMasked
+	}
+	return passwordMasked[:authorityStart] + "********" + authority[colon:] + passwordMasked[authorityEnd:]
+}
+
+func maskProxyPasswordOnly(raw string) string {
+	trimmed := strings.TrimSpace(raw)
+	if hasAmbiguousProxyAuthority(trimmed) {
+		return maskRawProxyPassword(trimmed)
+	}
+	parsed, errParse := url.Parse(trimmed)
+	if errParse != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return maskRawProxyPassword(trimmed)
+	}
+	if parsed.User == nil {
+		return trimmed
+	}
+	if _, hasPassword := parsed.User.Password(); !hasPassword {
+		return trimmed
+	}
+	username := parsed.User.Username()
+	clone := *parsed
+	clone.User = nil
+	prefix := clone.Scheme + "://"
+	rest := strings.TrimPrefix(clone.String(), prefix)
+	return prefix + url.User(username).String() + ":********@" + rest
 }

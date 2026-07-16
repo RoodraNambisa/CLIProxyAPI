@@ -6,16 +6,55 @@ import (
 	"errors"
 	"net"
 	"net/http"
-	"net/url"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	tls "github.com/refraction-networking/utls"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
+	"golang.org/x/net/http2"
 )
+
+type observedCloseConn struct {
+	net.Conn
+	once   sync.Once
+	closed chan struct{}
+}
+
+func (c *observedCloseConn) Close() error {
+	c.once.Do(func() { close(c.closed) })
+	return c.Conn.Close()
+}
+
+func newTestHTTP2ClientConn(t *testing.T) (*http2.ClientConn, <-chan struct{}) {
+	t.Helper()
+	clientConn, serverConn := net.Pipe()
+	observed := &observedCloseConn{Conn: clientConn, closed: make(chan struct{})}
+	go func() {
+		defer func() { _ = serverConn.Close() }()
+		server := &http2.Server{}
+		server.ServeConn(serverConn, &http2.ServeConnOpts{Handler: http.HandlerFunc(func(http.ResponseWriter, *http.Request) {})})
+	}()
+	conn, errClient := (&http2.Transport{}).NewClientConn(observed)
+	if errClient != nil {
+		_ = observed.Close()
+		t.Fatalf("NewClientConn() error = %v", errClient)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+	return conn, observed.closed
+}
+
+func waitForObservedClose(t *testing.T, closed <-chan struct{}) {
+	t.Helper()
+	select {
+	case <-closed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("HTTP/2 client connection was not closed")
+	}
+}
 
 func TestStripHTTP2ConnectionHeaders(t *testing.T) {
 	req, err := http.NewRequest(http.MethodPost, "https://example.com/responses", nil)
@@ -43,6 +82,35 @@ func TestStripHTTP2ConnectionHeaders(t *testing.T) {
 	if value := req.Header.Get("Connection"); value == "" {
 		t.Fatalf("original request headers were mutated")
 	}
+}
+
+func TestUTLSRoundTripperClosesEvictedAndFailedHTTP2Connections(t *testing.T) {
+	t.Run("evicted", func(t *testing.T) {
+		conn, closed := newTestHTTP2ClientConn(t)
+		conn.SetDoNotReuse()
+		transport := newUtlsRoundTripper("direct", "chrome_133", false)
+		cacheKey := utlsConnectionCacheKey("example.com:443", "direct")
+		transport.connections[cacheKey] = conn
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		_, _ = transport.getOrCreateConnection(ctx, cacheKey, "example.com", "example.com:443", "direct")
+		waitForObservedClose(t, closed)
+	})
+
+	t.Run("round trip error", func(t *testing.T) {
+		conn, closed := newTestHTTP2ClientConn(t)
+		transport := newUtlsRoundTripper("direct", "chrome_133", false)
+		cacheKey := utlsConnectionCacheKey("example.com:443", "direct")
+		transport.connections[cacheKey] = conn
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		req, errRequest := http.NewRequestWithContext(ctx, http.MethodGet, "https://example.com", nil)
+		if errRequest != nil {
+			t.Fatalf("NewRequestWithContext() error = %v", errRequest)
+		}
+		_, _ = transport.RoundTrip(req)
+		waitForObservedClose(t, closed)
+	})
 }
 
 func TestCodexNativeTLS12ClientHelloSpec(t *testing.T) {
@@ -323,42 +391,6 @@ func TestEnvironmentProxyURLForHTTPSAddr(t *testing.T) {
 	}
 	if proxyURL != "http://env-proxy.example.com:8080" {
 		t.Fatalf("proxyURL = %q, want env proxy", proxyURL)
-	}
-}
-
-func TestHTTPConnectDialerHonorsContextCancellation(t *testing.T) {
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("Listen() error = %v", err)
-	}
-	defer listener.Close()
-
-	accepted := make(chan net.Conn, 1)
-	go func() {
-		conn, errAccept := listener.Accept()
-		if errAccept == nil {
-			accepted <- conn
-		}
-	}()
-
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
-	defer cancel()
-	dialer := &httpConnectDialer{
-		proxyURL: &url.URL{Scheme: "http", Host: listener.Addr().String()},
-		dialer:   directContextDialer{},
-	}
-
-	conn, err := dialer.DialContext(ctx, "tcp", "example.com:443")
-	if conn != nil {
-		_ = conn.Close()
-	}
-	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("DialContext() error = %v, want context deadline exceeded", err)
-	}
-	select {
-	case acceptedConn := <-accepted:
-		_ = acceptedConn.Close()
-	default:
 	}
 }
 

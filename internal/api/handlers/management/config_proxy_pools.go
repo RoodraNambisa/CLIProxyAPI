@@ -2,12 +2,14 @@ package management
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"strings"
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/proxyutil"
+	log "github.com/sirupsen/logrus"
 )
 
 // GetProxyPools returns structured proxy pools with credentials masked.
@@ -114,7 +116,7 @@ func (h *Handler) PatchProxyPool(c *gin.Context) {
 			if patch.URLTemplate != nil {
 				candidate := strings.TrimSpace(*patch.URLTemplate)
 				if isMaskedProxyURL(candidate) && !replaceMaskedProxyRequested(c) {
-					if existingIndex < 0 || candidate != proxyutil.MaskProxyURL(entry.URLTemplate) {
+					if existingIndex < 0 || !proxyutil.MaskedProxyURLMatches(candidate, entry.URLTemplate) {
 						h.mu.Unlock()
 						c.JSON(http.StatusBadRequest, gin.H{"error": "url-template must contain the complete proxy credential"})
 						return
@@ -157,10 +159,42 @@ func (h *Handler) PatchProxyPool(c *gin.Context) {
 	previousRules := h.cfg.ProxyRules
 	h.cfg.ProxyPools = normalizedPools
 	h.cfg.ProxyRules = normalizedRules
-	if !h.persistLocked(c) {
+	renamed := body.Name != nil && !strings.EqualFold(strings.TrimSpace(oldName), strings.TrimSpace(*body.Name))
+	if !renamed || h.proxyPoolManager == nil {
+		if !h.persistLocked(c) {
+			h.cfg.ProxyPools = previousPools
+			h.cfg.ProxyRules = previousRules
+		}
+		h.mu.Unlock()
+		return
+	}
+	previousBody, previousExisted, errPreviousBody := h.readPersistedConfigBodyLocked()
+	if errPreviousBody != nil {
 		h.cfg.ProxyPools = previousPools
 		h.cfg.ProxyRules = previousRules
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read current config"})
+		h.mu.Unlock()
+		return
 	}
+	if errSave := config.SaveConfigPreserveComments(h.configFilePath, h.cfg); errSave != nil {
+		h.cfg.ProxyPools = previousPools
+		h.cfg.ProxyRules = previousRules
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to save config: %v", errSave)})
+		h.mu.Unlock()
+		return
+	}
+	if errRuntime := h.proxyPoolManager.UpdateConfigWithPoolRename(h.cfg, oldName, *body.Name); errRuntime != nil {
+		h.cfg.ProxyPools = previousPools
+		h.cfg.ProxyRules = previousRules
+		h.restorePersistedConfigFileLocked(previousBody, previousExisted)
+		if errRollbackRuntime := h.proxyPoolManager.UpdateConfig(h.cfg); errRollbackRuntime != nil {
+			log.WithError(errRollbackRuntime).Error("failed to roll back proxy pool runtime configuration")
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to migrate proxy pool bindings"})
+		h.mu.Unlock()
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"status": "ok"})
 	h.mu.Unlock()
 }
 

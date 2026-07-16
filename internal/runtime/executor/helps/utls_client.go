@@ -4,8 +4,6 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	stdtls "crypto/tls"
-	"encoding/base64"
 	"fmt"
 	"io"
 	"net"
@@ -20,9 +18,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/proxyutil"
-	log "github.com/sirupsen/logrus"
 	"golang.org/x/net/http2"
-	"golang.org/x/net/proxy"
 )
 
 // utlsRoundTripper implements http.RoundTripper using a Chrome-like uTLS
@@ -51,14 +47,20 @@ func (t *utlsRoundTripper) getOrCreateConnection(ctx context.Context, cacheKey, 
 		ctx = context.Background()
 	}
 	for {
+		var stale *http2.ClientConn
 		t.mu.Lock()
-		if h2Conn, ok := t.connections[cacheKey]; ok && h2Conn.CanTakeNewRequest() {
-			t.mu.Unlock()
-			return h2Conn, nil
+		if h2Conn, ok := t.connections[cacheKey]; ok {
+			if h2Conn.CanTakeNewRequest() {
+				t.mu.Unlock()
+				return h2Conn, nil
+			}
+			delete(t.connections, cacheKey)
+			stale = h2Conn
 		}
 
 		if done, ok := t.pending[cacheKey]; ok {
 			t.mu.Unlock()
+			closeHTTP2ClientConn(stale)
 			select {
 			case <-ctx.Done():
 				return nil, ctx.Err()
@@ -70,6 +72,7 @@ func (t *utlsRoundTripper) getOrCreateConnection(ctx context.Context, cacheKey, 
 		done := make(chan struct{})
 		t.pending[cacheKey] = done
 		t.mu.Unlock()
+		closeHTTP2ClientConn(stale)
 
 		h2Conn, err := t.createConnection(ctx, host, addr, proxyURL)
 
@@ -133,10 +136,17 @@ func (t *utlsRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) 
 			delete(t.connections, cacheKey)
 		}
 		t.mu.Unlock()
+		closeHTTP2ClientConn(h2Conn)
 		return nil, err
 	}
 
 	return resp, nil
+}
+
+func closeHTTP2ClientConn(conn *http2.ClientConn) {
+	if conn != nil {
+		_ = conn.Close()
+	}
 }
 
 // utlsHTTP1RoundTripper implements one-shot HTTPS requests using a Chrome-like
@@ -730,7 +740,7 @@ func NewCodexNativeTLSHTTP1Client(ctx context.Context, cfg *config.Config, auth 
 func explicitProxyURL(cfg *config.Config, auth *cliproxyauth.Auth) string {
 	var proxyURL string
 	if auth != nil {
-		proxyURL = strings.TrimSpace(auth.ProxyURL)
+		proxyURL = auth.EffectiveProxyURL()
 	}
 	if proxyURL == "" && cfg != nil {
 		proxyURL = strings.TrimSpace(cfg.ProxyURL)
@@ -933,23 +943,6 @@ func (d directContextDialer) DialContext(ctx context.Context, network, addr stri
 	return d.dialer.DialContext(ctx, network, addr)
 }
 
-type proxyContextDialerAdapter struct {
-	dialer proxy.Dialer
-}
-
-func (d proxyContextDialerAdapter) DialContext(ctx context.Context, network, addr string) (net.Conn, error) {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	if d.dialer == nil {
-		return directContextDialer{}.DialContext(ctx, network, addr)
-	}
-	if contextDialer, ok := d.dialer.(proxy.ContextDialer); ok {
-		return contextDialer.DialContext(ctx, network, addr)
-	}
-	return nil, fmt.Errorf("proxy dialer does not support context")
-}
-
 func dialChromeUTLSWithDialer(ctx context.Context, dialer utlsContextDialer, network, addr, serverName string, helloID tls.ClientHelloID) (net.Conn, error) {
 	return dialChromeUTLSWithDialerNextProtos(ctx, dialer, network, addr, serverName, helloID, nil)
 }
@@ -1079,13 +1072,8 @@ func codexNativeTLS12ClientHelloSpec() tls.ClientHelloSpec {
 	}
 }
 
-type httpConnectDialer struct {
-	proxyURL *url.URL
-	dialer   utlsContextDialer
-}
-
 func buildUtlsContextDialerOrDirect(raw string) (utlsContextDialer, error) {
-	dialer, mode, errBuild := buildUtlsContextDialer(raw)
+	dialer, mode, errBuild := proxyutil.BuildContextDialer(raw)
 	if errBuild != nil {
 		return nil, errBuild
 	}
@@ -1093,40 +1081,6 @@ func buildUtlsContextDialerOrDirect(raw string) (utlsContextDialer, error) {
 		return directContextDialer{}, nil
 	}
 	return dialer, nil
-}
-
-func buildUtlsContextDialer(raw string) (utlsContextDialer, proxyutil.Mode, error) {
-	setting, errParse := proxyutil.Parse(raw)
-	if errParse != nil {
-		return nil, setting.Mode, errParse
-	}
-	switch setting.Mode {
-	case proxyutil.ModeInherit:
-		return nil, setting.Mode, nil
-	case proxyutil.ModeDirect:
-		return directContextDialer{}, setting.Mode, nil
-	case proxyutil.ModeProxy:
-		switch setting.URL.Scheme {
-		case "http", "https":
-			return &httpConnectDialer{proxyURL: setting.URL, dialer: directContextDialer{}}, setting.Mode, nil
-		case "socks5", "socks5h":
-			var proxyAuth *proxy.Auth
-			if setting.URL.User != nil {
-				username := setting.URL.User.Username()
-				password, _ := setting.URL.User.Password()
-				proxyAuth = &proxy.Auth{User: username, Password: password}
-			}
-			dialer, errSOCKS5 := proxy.SOCKS5("tcp", setting.URL.Host, proxyAuth, directContextDialer{})
-			if errSOCKS5 != nil {
-				return nil, setting.Mode, fmt.Errorf("create SOCKS5 dialer failed: %w", errSOCKS5)
-			}
-			return proxyContextDialerAdapter{dialer: dialer}, setting.Mode, nil
-		default:
-			return nil, setting.Mode, fmt.Errorf("unsupported proxy scheme: %s", setting.URL.Scheme)
-		}
-	default:
-		return nil, setting.Mode, nil
-	}
 }
 
 func environmentProxyURLForHTTPSAddr(addr string) (string, error) {
@@ -1143,89 +1097,6 @@ func environmentProxyURLForHTTPSAddr(addr string) (string, error) {
 		return "", nil
 	}
 	return proxyURL.String(), nil
-}
-
-func (d *httpConnectDialer) DialContext(ctx context.Context, network, addr string) (net.Conn, error) {
-	if d == nil || d.proxyURL == nil {
-		return nil, fmt.Errorf("http proxy dialer is not configured")
-	}
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	if d.dialer == nil {
-		d.dialer = directContextDialer{}
-	}
-	conn, err := d.dialer.DialContext(ctx, network, d.proxyURL.Host)
-	if err != nil {
-		return nil, err
-	}
-	if d.proxyURL.Scheme == "https" {
-		tlsConn := stdtls.Client(conn, &stdtls.Config{ServerName: d.proxyURL.Hostname()})
-		if errHandshake := tlsConn.HandshakeContext(ctx); errHandshake != nil {
-			conn.Close()
-			return nil, errHandshake
-		}
-		conn = tlsConn
-	}
-
-	req := &http.Request{
-		Method: http.MethodConnect,
-		URL:    &url.URL{Opaque: addr},
-		Host:   addr,
-		Header: make(http.Header),
-	}
-	if d.proxyURL.User != nil {
-		username := d.proxyURL.User.Username()
-		password, _ := d.proxyURL.User.Password()
-		encoded := base64.StdEncoding.EncodeToString([]byte(username + ":" + password))
-		req.Header.Set("Proxy-Authorization", "Basic "+encoded)
-	}
-	if errWrite := writeHTTPConnectRequest(ctx, conn, req); errWrite != nil {
-		conn.Close()
-		return nil, errWrite
-	}
-	resp, errRead := readHTTPConnectResponse(ctx, conn, req)
-	if errRead != nil {
-		conn.Close()
-		return nil, errRead
-	}
-	defer func() {
-		if resp.Body != nil {
-			if errClose := resp.Body.Close(); errClose != nil {
-				log.Errorf("utls: close proxy CONNECT response body error: %v", errClose)
-			}
-		}
-	}()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		conn.Close()
-		return nil, fmt.Errorf("proxy CONNECT failed: %s", resp.Status)
-	}
-	return conn, nil
-}
-
-func writeHTTPConnectRequest(ctx context.Context, conn net.Conn, req *http.Request) error {
-	return runConnOperationWithContext(ctx, conn, func() error {
-		return req.Write(conn)
-	})
-}
-
-func readHTTPConnectResponse(ctx context.Context, conn net.Conn, req *http.Request) (*http.Response, error) {
-	type readResult struct {
-		resp *http.Response
-		err  error
-	}
-	resultCh := make(chan readResult, 1)
-	go func() {
-		resp, errRead := http.ReadResponse(bufio.NewReader(conn), req)
-		resultCh <- readResult{resp: resp, err: errRead}
-	}()
-	select {
-	case <-ctx.Done():
-		conn.Close()
-		return nil, ctx.Err()
-	case result := <-resultCh:
-		return result.resp, result.err
-	}
 }
 
 func runConnOperationWithContext(ctx context.Context, conn net.Conn, op func() error) error {

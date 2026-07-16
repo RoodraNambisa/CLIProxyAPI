@@ -2,6 +2,7 @@ package management
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -16,6 +17,34 @@ import (
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v6/sdk/config"
 )
+
+type apiCallProxyResolver struct {
+	err error
+}
+
+type managementProxyError struct {
+	headers http.Header
+}
+
+func (managementProxyError) Error() string        { return "proxy unavailable" }
+func (managementProxyError) StatusCode() int      { return http.StatusServiceUnavailable }
+func (managementProxyError) SkipAuthResult() bool { return true }
+func (e managementProxyError) Headers() http.Header {
+	return e.headers
+}
+
+type managementUpstreamUnavailableError struct{}
+
+func (managementUpstreamUnavailableError) Error() string   { return "upstream unavailable" }
+func (managementUpstreamUnavailableError) StatusCode() int { return http.StatusServiceUnavailable }
+
+func (r apiCallProxyResolver) Resolve(context.Context, *coreauth.Auth) (coreauth.ResolvedProxy, error) {
+	return coreauth.ResolvedProxy{}, r.err
+}
+
+func (apiCallProxyResolver) ReportFailure(_ context.Context, _ *coreauth.Auth, err error) error {
+	return err
+}
 
 func TestAPICallTransportDirectBypassesGlobalProxy(t *testing.T) {
 	t.Parallel()
@@ -33,6 +62,68 @@ func TestAPICallTransportDirectBypassesGlobalProxy(t *testing.T) {
 	}
 	if httpTransport.Proxy != nil {
 		t.Fatal("expected direct transport to disable proxy function")
+	}
+}
+
+func TestAPICallProxyResolutionErrorDoesNotReturnEmptySuccess(t *testing.T) {
+	manager := coreauth.NewManager(nil, nil, nil)
+	auth, errRegister := manager.Register(coreauth.WithSkipPersist(t.Context()), &coreauth.Auth{
+		ID:         "api-call-proxy-error",
+		Provider:   "codex",
+		Attributes: map[string]string{"source": "config:codex[proxy-error]"},
+	})
+	if errRegister != nil {
+		t.Fatalf("Register() error = %v", errRegister)
+	}
+	manager.SetProxyResolver(apiCallProxyResolver{err: errors.New("resolver failed")})
+	h := NewHandlerWithoutConfigFilePath(&config.Config{}, manager)
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	body := fmt.Sprintf(`{"auth_index":%q,"method":"GET","url":"https://upstream.example"}`, auth.EnsureIndex())
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v0/management/api-call", strings.NewReader(body))
+	ctx.Request.Header.Set("Content-Type", "application/json")
+
+	h.APICall(ctx)
+
+	if recorder.Code != http.StatusBadGateway {
+		t.Fatalf("APICall() status = %d, want %d; body=%s", recorder.Code, http.StatusBadGateway, recorder.Body.String())
+	}
+	if !strings.Contains(recorder.Body.String(), "proxy_resolution_failed") {
+		t.Fatalf("APICall() body = %s, want proxy_resolution_failed", recorder.Body.String())
+	}
+}
+
+func TestWriteManagementProxyErrorOnlyCopiesRetryAfter(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	errProxy := managementProxyError{headers: http.Header{
+		"Retry-After":   []string{"42"},
+		"Set-Cookie":    []string{"secret=session"},
+		"Authorization": []string{"Bearer secret"},
+	}}
+
+	if !writeManagementProxyError(ctx, errProxy) {
+		t.Fatal("writeManagementProxyError() = false, want true")
+	}
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusServiceUnavailable)
+	}
+	if got := recorder.Header().Get("Retry-After"); got != "42" {
+		t.Fatalf("Retry-After = %q, want 42", got)
+	}
+	if got := recorder.Header().Get("Set-Cookie"); got != "" {
+		t.Fatalf("Set-Cookie leaked: %q", got)
+	}
+	if got := recorder.Header().Get("Authorization"); got != "" {
+		t.Fatalf("Authorization leaked: %q", got)
+	}
+}
+
+func TestWriteManagementProxyErrorDoesNotClaimGeneric503(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	if writeManagementProxyError(ctx, managementUpstreamUnavailableError{}) {
+		t.Fatal("generic upstream 503 was classified as proxy_unavailable")
 	}
 }
 

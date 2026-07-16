@@ -3,6 +3,7 @@ package management
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -130,6 +131,22 @@ func (h *Handler) APICall(c *gin.Context) {
 			return
 		}
 	}
+	if auth != nil && h.authManager != nil {
+		resolvedAuth, errProxy := h.authManager.ResolveProxyAuth(c.Request.Context(), auth)
+		if errProxy != nil {
+			if writeManagementProxyError(c, errProxy) {
+				return
+			}
+			if errors.Is(errProxy, context.Canceled) || errors.Is(errProxy, context.DeadlineExceeded) {
+				c.JSON(http.StatusRequestTimeout, gin.H{"error": "proxy_resolution_canceled"})
+				return
+			}
+			log.WithError(errProxy).Debug("management APICall proxy resolution failed")
+			c.JSON(http.StatusBadGateway, gin.H{"error": "proxy_resolution_failed"})
+			return
+		}
+		auth = resolvedAuth
+	}
 
 	reqHeaders := body.Header
 	if reqHeaders == nil {
@@ -150,6 +167,9 @@ func (h *Handler) APICall(c *gin.Context) {
 		}
 		if auth != nil && token == "" {
 			if tokenErr != nil {
+				if writeManagementProxyError(c, tokenErr) {
+					return
+				}
 				c.JSON(http.StatusBadRequest, gin.H{"error": "auth token refresh failed"})
 				return
 			}
@@ -191,7 +211,11 @@ func (h *Handler) APICall(c *gin.Context) {
 
 	resp, errDo := httpClient.Do(req)
 	if errDo != nil {
+		errDo = h.reportManagementProxyFailure(c.Request.Context(), auth, errDo)
 		log.WithError(errDo).Debug("management APICall request failed")
+		if writeManagementProxyError(c, errDo) {
+			return
+		}
 		c.JSON(http.StatusBadGateway, gin.H{"error": "request failed"})
 		return
 	}
@@ -203,6 +227,10 @@ func (h *Handler) APICall(c *gin.Context) {
 
 	respBody, errReadAll := io.ReadAll(resp.Body)
 	if errReadAll != nil {
+		errReadAll = h.reportManagementProxyFailure(c.Request.Context(), auth, errReadAll)
+		if writeManagementProxyError(c, errReadAll) {
+			return
+		}
 		c.JSON(http.StatusBadGateway, gin.H{"error": "failed to read response"})
 		return
 	}
@@ -299,7 +327,7 @@ func (h *Handler) refreshAntigravityOAuthAccessToken(ctx context.Context, auth *
 	}
 	resp, errDo := httpClient.Do(req)
 	if errDo != nil {
-		return "", errDo
+		return "", h.reportManagementProxyFailure(ctx, auth, errDo)
 	}
 	defer func() {
 		if errClose := resp.Body.Close(); errClose != nil {
@@ -486,7 +514,7 @@ func (h *Handler) authByIndex(authIndex string) *coreauth.Auth {
 func (h *Handler) apiCallTransport(auth *coreauth.Auth) http.RoundTripper {
 	var proxyCandidates []string
 	if auth != nil {
-		if proxyStr := strings.TrimSpace(auth.ProxyURL); proxyStr != "" {
+		if proxyStr := auth.EffectiveProxyURL(); proxyStr != "" {
 			proxyCandidates = append(proxyCandidates, proxyStr)
 		}
 		if h != nil && h.cfg != nil {
@@ -514,6 +542,38 @@ func (h *Handler) apiCallTransport(auth *coreauth.Auth) http.RoundTripper {
 	clone := transport.Clone()
 	clone.Proxy = nil
 	return clone
+}
+
+func (h *Handler) reportManagementProxyFailure(ctx context.Context, auth *coreauth.Auth, err error) error {
+	if h == nil || h.authManager == nil {
+		return err
+	}
+	return h.authManager.ReportProxyFailure(ctx, auth, err)
+}
+
+func writeManagementProxyError(c *gin.Context, err error) bool {
+	if c == nil || err == nil {
+		return false
+	}
+	type statusError interface{ StatusCode() int }
+	var status statusError
+	if !errors.As(err, &status) || status.StatusCode() != http.StatusServiceUnavailable {
+		return false
+	}
+	type skipAuthResultError interface{ SkipAuthResult() bool }
+	var skipAuthResult skipAuthResultError
+	if !errors.As(err, &skipAuthResult) || !skipAuthResult.SkipAuthResult() {
+		return false
+	}
+	type headerError interface{ Headers() http.Header }
+	var responseHeaders headerError
+	if errors.As(err, &responseHeaders) {
+		if retryAfter := strings.TrimSpace(responseHeaders.Headers().Get("Retry-After")); retryAfter != "" {
+			c.Writer.Header().Set("Retry-After", retryAfter)
+		}
+	}
+	c.JSON(http.StatusServiceUnavailable, gin.H{"error": "proxy_unavailable"})
+	return true
 }
 
 type apiKeyConfigEntry interface {
