@@ -36,6 +36,23 @@ type serviceDeleteSideEffectStore struct {
 	onDelete    func(id string)
 }
 
+type serviceChatGPTWebReplacementHook struct {
+	coreauth.NoopHook
+	replacements atomic.Int32
+	updated      chan struct{}
+}
+
+func (hook *serviceChatGPTWebReplacementHook) OnAuthUpdated(ctx context.Context, _ *coreauth.Auth) {
+	if !coreauth.ChatGPTWebCredentialReplaced(ctx) {
+		return
+	}
+	hook.replacements.Add(1)
+	select {
+	case hook.updated <- struct{}{}:
+	default:
+	}
+}
+
 func (s *serviceFailingDeleteStore) List(context.Context) ([]*coreauth.Auth, error) { return nil, nil }
 
 func (s *serviceFailingDeleteStore) Save(_ context.Context, auth *coreauth.Auth) (string, error) {
@@ -235,6 +252,389 @@ func TestAuthMaintenanceHookSkipsSuppressedModelSync(t *testing.T) {
 	}
 }
 
+func TestAuthMaintenanceHookSuppressedUpdateDoesNotReenterAuthModelTransitionLock(t *testing.T) {
+	manager := coreauth.NewManager(nil, nil, nil)
+	service := &Service{
+		cfg:         &config.Config{},
+		coreManager: manager,
+	}
+	manager.AddHook(authMaintenanceHook{service: service})
+	ctx := context.WithValue(context.Background(), modelSyncHookSuppressedContextKey{}, true)
+	auth := &coreauth.Auth{
+		ID:       "service-suppressed-chatgpt-web-hook",
+		Provider: "chatgpt-web",
+		Status:   coreauth.StatusActive,
+		Metadata: map[string]any{
+			"access_token":    "token",
+			"account_id":      "account",
+			"lifecycle_state": coreauth.LifecycleStateActive,
+		},
+	}
+
+	unlockTransition := service.lockAuthModelTransition(auth.ID)
+	done := make(chan error, 1)
+	go func() {
+		_, err := manager.Register(ctx, auth)
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		unlockTransition()
+		if err != nil {
+			t.Fatalf("register auth: %v", err)
+		}
+	case <-time.After(time.Second):
+		unlockTransition()
+		err := <-done
+		t.Fatalf("suppressed hook re-entered the auth model transition lock: %v", err)
+	}
+}
+
+func TestAuthMaintenanceHookDifferentAuthDoesNotWaitForModelTransitionLock(t *testing.T) {
+	service := &Service{cfg: &config.Config{}}
+	auth := &coreauth.Auth{
+		ID:       "service-non-chatgpt-model-hook",
+		Provider: "claude",
+		Status:   coreauth.StatusActive,
+	}
+	t.Cleanup(func() { GlobalModelRegistry().UnregisterClient(auth.ID) })
+
+	unlockTransition := service.lockAuthModelTransition("service-other-model-hook")
+	done := make(chan struct{})
+	go func() {
+		authMaintenanceHook{service: service}.OnAuthUpdated(context.Background(), auth)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		unlockTransition()
+	case <-time.After(time.Second):
+		unlockTransition()
+		<-done
+		t.Fatal("auth update waited for another auth's model transition lock")
+	}
+}
+
+func TestAuthMaintenanceHookFreshSameProviderUpdateResetsRegistryQuota(t *testing.T) {
+	service := &Service{cfg: &config.Config{}}
+	auth := &coreauth.Auth{
+		ID:       "service-fresh-same-provider-hook",
+		Provider: "claude",
+		Status:   coreauth.StatusActive,
+	}
+	models := registry.GetClaudeModels()
+	if len(models) == 0 {
+		t.Fatal("Claude model catalog is empty")
+	}
+	modelID := models[0].ID
+	t.Cleanup(func() { GlobalModelRegistry().UnregisterClient(auth.ID) })
+
+	GlobalModelRegistry().RegisterClient(auth.ID, auth.Provider, models)
+	beforeQuota := registry.GetGlobalRegistry().GetModelCount(modelID)
+	GlobalModelRegistry().SetModelQuotaExceeded(auth.ID, modelID)
+	if got := registry.GetGlobalRegistry().GetModelCount(modelID); got >= beforeQuota {
+		t.Fatalf("registry quota did not suppress model: before=%d after=%d", beforeQuota, got)
+	}
+
+	authMaintenanceHook{service: service}.OnAuthUpdated(context.Background(), auth)
+	if got := registry.GetGlobalRegistry().GetModelCount(modelID); got != beforeQuota {
+		t.Fatalf("fresh same-provider update retained registry quota: got=%d want=%d", got, beforeQuota)
+	}
+}
+
+func TestAuthMaintenanceHookRejectsStaleInstallationAfterModelLockWait(t *testing.T) {
+	manager := coreauth.NewManager(nil, nil, nil)
+	service := &Service{
+		cfg:         &config.Config{},
+		coreManager: manager,
+	}
+	authID := "service-stale-hook-installation"
+	t.Cleanup(func() { GlobalModelRegistry().UnregisterClient(authID) })
+
+	oldAuth, err := manager.Register(context.Background(), &coreauth.Auth{
+		ID:       authID,
+		Provider: "chatgpt-web",
+		Status:   coreauth.StatusActive,
+		Metadata: map[string]any{
+			"access_token":    "old-token",
+			"account_id":      "old-account",
+			"lifecycle_state": coreauth.LifecycleStateActive,
+		},
+	})
+	if err != nil {
+		t.Fatalf("register old auth: %v", err)
+	}
+
+	unlockTransition := service.lockAuthModelTransition(authID)
+	hookStarted := make(chan struct{})
+	hookDone := make(chan struct{})
+	go func() {
+		close(hookStarted)
+		authMaintenanceHook{service: service}.OnAuthUpdated(context.Background(), oldAuth)
+		close(hookDone)
+	}()
+	<-hookStarted
+
+	replacement := oldAuth.Clone()
+	replacement.Provider = "claude"
+	replacement.Metadata = nil
+	installed, err := manager.Update(context.Background(), replacement)
+	if err != nil {
+		unlockTransition()
+		t.Fatalf("install replacement auth: %v", err)
+	}
+	GlobalModelRegistry().RegisterClient(installed.ID, installed.Provider, []*registry.ModelInfo{{ID: "claude-current-model"}})
+	unlockTransition()
+
+	select {
+	case <-hookDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("stale hook did not finish")
+	}
+	if provider := registry.GetGlobalRegistry().GetProviderForClient(authID); provider != "claude" {
+		t.Fatalf("stale hook replaced provider with %q", provider)
+	}
+	models := registry.GetGlobalRegistry().GetModelsForClient(authID)
+	if len(models) != 1 || models[0].ID != "claude-current-model" {
+		t.Fatalf("stale hook replaced current models: %v", models)
+	}
+}
+
+func TestAuthMaintenanceHookRejectsStaleNonChatGPTInstallationAfterTransitionWait(t *testing.T) {
+	manager := coreauth.NewManager(nil, nil, nil)
+	service := &Service{
+		cfg:         &config.Config{},
+		coreManager: manager,
+	}
+	authID := "service-stale-non-chatgpt-hook-installation"
+	t.Cleanup(func() { GlobalModelRegistry().UnregisterClient(authID) })
+
+	oldAuth, err := manager.Register(context.Background(), &coreauth.Auth{
+		ID:       authID,
+		Provider: "claude",
+		Status:   coreauth.StatusActive,
+	})
+	if err != nil {
+		t.Fatalf("register old auth: %v", err)
+	}
+
+	unlockTransition := service.lockAuthModelTransition(authID)
+	hookStarted := make(chan struct{})
+	hookDone := make(chan struct{})
+	go func() {
+		close(hookStarted)
+		authMaintenanceHook{service: service}.OnAuthUpdated(context.Background(), oldAuth)
+		close(hookDone)
+	}()
+	<-hookStarted
+
+	replacement := oldAuth.Clone()
+	replacement.Provider = "chatgpt-web"
+	replacement.Metadata = map[string]any{
+		"access_token":    "token",
+		"account_id":      "account",
+		"lifecycle_state": coreauth.LifecycleStateActive,
+	}
+	installed, err := manager.Update(context.Background(), replacement)
+	if err != nil {
+		unlockTransition()
+		t.Fatalf("install replacement auth: %v", err)
+	}
+	GlobalModelRegistry().RegisterClient(installed.ID, installed.Provider, []*registry.ModelInfo{{ID: "chatgpt-current-model"}})
+	unlockTransition()
+
+	select {
+	case <-hookDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("stale non-ChatGPT hook did not finish")
+	}
+	if provider := registry.GetGlobalRegistry().GetProviderForClient(authID); provider != "chatgpt-web" {
+		t.Fatalf("stale hook replaced provider with %q", provider)
+	}
+	models := registry.GetGlobalRegistry().GetModelsForClient(authID)
+	if len(models) != 1 || models[0].ID != "chatgpt-current-model" {
+		t.Fatalf("stale hook replaced current models: %v", models)
+	}
+}
+
+func TestServiceSyncAuthModelsReReadsProviderAfterTransitionWait(t *testing.T) {
+	manager := coreauth.NewManager(nil, nil, nil)
+	service := &Service{
+		cfg:         &config.Config{},
+		coreManager: manager,
+	}
+	authID := "service-model-sync-provider-transition"
+	t.Cleanup(func() { GlobalModelRegistry().UnregisterClient(authID) })
+
+	oldAuth, err := manager.Register(context.Background(), &coreauth.Auth{
+		ID:       authID,
+		Provider: "claude",
+		Status:   coreauth.StatusActive,
+	})
+	if err != nil {
+		t.Fatalf("register old auth: %v", err)
+	}
+
+	unlockTransition := service.lockAuthModelTransition(authID)
+	started := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		close(started)
+		service.syncAuthModels(context.Background(), authID)
+		close(done)
+	}()
+	<-started
+
+	select {
+	case <-done:
+		unlockTransition()
+		t.Fatal("model sync bypassed the provider transition lock")
+	case <-time.After(25 * time.Millisecond):
+	}
+
+	replacement := oldAuth.Clone()
+	replacement.Provider = "xai"
+	installed, err := manager.Update(context.Background(), replacement)
+	if err != nil {
+		unlockTransition()
+		<-done
+		t.Fatalf("install replacement auth: %v", err)
+	}
+	unlockTransition()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("model sync did not finish after provider transition")
+	}
+	if provider := registry.GetGlobalRegistry().GetProviderForClient(authID); provider != installed.Provider {
+		t.Fatalf("registered provider = %q, want %q", provider, installed.Provider)
+	}
+	models := registry.GetGlobalRegistry().GetModelsForClient(authID)
+	if len(models) == 0 || !containsRegisteredModel(models, registry.GetXAIModels()[0].ID) {
+		t.Fatalf("provider transition registered stale models: %v", registeredModelIDs(models))
+	}
+}
+
+func TestAuthMaintenanceHookClearsChatGPTWebRegistryBeforeAntigravitySync(t *testing.T) {
+	manager := coreauth.NewManager(nil, nil, nil)
+	_, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	service := &Service{
+		cfg:              &config.Config{},
+		coreManager:      manager,
+		modelSyncCancel:  cancel,
+		modelSyncQueue:   make(chan string, 1),
+		modelSyncPending: make(map[string]modelSyncTaskState),
+	}
+	authID := "service-chatgpt-web-to-antigravity"
+	auth, err := manager.Register(context.Background(), &coreauth.Auth{
+		ID:       authID,
+		Provider: "chatgpt-web",
+		Status:   coreauth.StatusActive,
+		Metadata: map[string]any{
+			"access_token":    "token",
+			"account_id":      "account",
+			"lifecycle_state": coreauth.LifecycleStateActive,
+		},
+	})
+	if err != nil {
+		t.Fatalf("register ChatGPT Web auth: %v", err)
+	}
+	GlobalModelRegistry().RegisterClient(authID, "chatgpt-web", []*registry.ModelInfo{{ID: "web-only-model"}})
+	manager.RefreshSchedulerEntry(authID)
+	manager.AddHook(authMaintenanceHook{service: service})
+	t.Cleanup(func() { GlobalModelRegistry().UnregisterClient(authID) })
+
+	replacement := auth.Clone()
+	replacement.Provider = "antigravity"
+	replacement.Metadata = map[string]any{"access_token": "antigravity-token"}
+	if _, err = manager.Update(context.Background(), replacement); err != nil {
+		t.Fatalf("switch auth provider: %v", err)
+	}
+
+	if provider := registry.GetGlobalRegistry().GetProviderForClient(authID); provider != "" {
+		t.Fatalf("stale registry provider = %q", provider)
+	}
+	if models := registry.GetGlobalRegistry().GetModelsForClient(authID); len(models) != 0 {
+		t.Fatalf("stale ChatGPT Web models remained: %v", models)
+	}
+	select {
+	case queuedID := <-service.modelSyncQueue:
+		if queuedID != authID {
+			t.Fatalf("queued auth ID = %q, want %q", queuedID, authID)
+		}
+	default:
+		t.Fatal("Antigravity model sync was not queued")
+	}
+}
+
+func TestServiceConcurrentSameAccountUpdatesReplaceChatGPTWebRuntimeOnce(t *testing.T) {
+	hook := &serviceChatGPTWebReplacementHook{updated: make(chan struct{}, 2)}
+	manager := coreauth.NewManager(nil, nil, hook)
+	service := &Service{
+		cfg:              &config.Config{},
+		coreManager:      manager,
+		modelSyncQueue:   make(chan string, 4),
+		modelSyncPending: make(map[string]modelSyncTaskState),
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	service.modelSyncCancel = cancel
+	authID := "service-concurrent-same-chatgpt-web-account"
+	oldAuth, err := manager.Register(context.Background(), &coreauth.Auth{
+		ID:       authID,
+		Provider: "chatgpt-web",
+		Status:   coreauth.StatusActive,
+		Metadata: map[string]any{
+			"access_token":    "old-token",
+			"account_id":      "old-account",
+			"lifecycle_state": coreauth.LifecycleStateActive,
+		},
+	})
+	if err != nil {
+		t.Fatalf("register old auth: %v", err)
+	}
+	t.Cleanup(func() { GlobalModelRegistry().UnregisterClient(authID) })
+
+	replacement := oldAuth.Clone()
+	replacement.Metadata["access_token"] = "new-token"
+	replacement.Metadata["account_id"] = "new-account"
+	update := watcher.AuthUpdate{
+		Action: watcher.AuthUpdateActionModify,
+		Auth:   replacement,
+	}
+
+	unlockTransition := service.lockAuthModelTransition(authID)
+	started := make(chan struct{}, 2)
+	done := make(chan struct{}, 2)
+	for range 2 {
+		go func() {
+			started <- struct{}{}
+			service.handleAuthUpdate(ctx, update)
+			done <- struct{}{}
+		}()
+	}
+	<-started
+	<-started
+	time.Sleep(25 * time.Millisecond)
+	unlockTransition()
+	<-done
+	<-done
+
+	select {
+	case <-hook.updated:
+	case <-time.After(5 * time.Second):
+		t.Fatal("account replacement hook did not run")
+	}
+	time.Sleep(25 * time.Millisecond)
+	if got := hook.replacements.Load(); got != 1 {
+		t.Fatalf("runtime replacement count = %d, want 1", got)
+	}
+}
+
 func TestServiceApplyCoreAuthAddOrUpdateQueuesAntigravitySyncOnce(t *testing.T) {
 	service := &Service{
 		cfg:         &config.Config{},
@@ -274,6 +674,93 @@ func TestServiceApplyCoreAuthAddOrUpdateQueuesAntigravitySyncOnce(t *testing.T) 
 	}
 	if state.dirty {
 		t.Fatal("single Antigravity update incorrectly marked model sync dirty")
+	}
+}
+
+func TestServiceSyncAuthModelsInlineDrainsDirtyTaskWithFullQueue(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	const authID = "dirty-model-sync"
+	service := &Service{
+		modelSyncCancel: cancel,
+		modelSyncQueue:  make(chan string, 1),
+		modelSyncPending: map[string]modelSyncTaskState{
+			authID: {dirty: true},
+		},
+	}
+	service.modelSyncQueue <- "occupied"
+
+	done := make(chan struct{})
+	go func() {
+		service.syncAuthModelsInline(ctx, authID)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("dirty model sync blocked on a full worker queue")
+	}
+	service.modelSyncMu.Lock()
+	_, pending := service.modelSyncPending[authID]
+	service.modelSyncMu.Unlock()
+	if pending {
+		t.Fatal("dirty model sync remained pending after inline drain")
+	}
+	if queuedID := <-service.modelSyncQueue; queuedID != "occupied" {
+		t.Fatalf("worker queue item = %q, want occupied", queuedID)
+	}
+}
+
+func TestServiceApplyCoreAuthAddOrUpdateQueuesChatGPTWebSyncBeforeRelogin(t *testing.T) {
+	authID := "service-chatgpt-web-sync-before-relogin"
+	service := &Service{
+		cfg:         &config.Config{},
+		coreManager: coreauth.NewManager(nil, nil, nil),
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	service.modelSyncCancel = cancel
+	service.modelSyncQueue = make(chan string, 1)
+	service.modelSyncPending = make(map[string]modelSyncTaskState)
+	reloginObserved := make(chan bool, 1)
+	service.chatGPTWebReloginObserved = func(auth *coreauth.Auth) {
+		service.modelSyncMu.Lock()
+		_, queued := service.modelSyncPending[auth.ID]
+		service.modelSyncMu.Unlock()
+		reloginObserved <- queued
+	}
+	service.coreManager.AddHook(authMaintenanceHook{service: service})
+	t.Cleanup(func() { GlobalModelRegistry().UnregisterClient(authID) })
+
+	service.applyCoreAuthAddOrUpdate(ctx, &coreauth.Auth{
+		ID:       authID,
+		Provider: "chatgpt-web",
+		Status:   coreauth.StatusPending,
+		Metadata: map[string]any{
+			"access_token":         "token",
+			"account_id":           "account",
+			"lifecycle_state":      coreauth.LifecycleStateReloginPending,
+			"lifecycle_reason":     "refresh failed",
+			"lifecycle_updated_at": time.Now().UTC().Format(time.RFC3339Nano),
+		},
+	})
+
+	select {
+	case queued := <-reloginObserved:
+		if !queued {
+			t.Fatal("re-login was scheduled before the model sync task was queued")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("re-login scheduling was not observed")
+	}
+	select {
+	case queuedID := <-service.modelSyncQueue:
+		if queuedID != authID {
+			t.Fatalf("queued auth ID = %q, want %q", queuedID, authID)
+		}
+	default:
+		t.Fatal("expected ChatGPT Web model sync to be queued")
 	}
 }
 
@@ -1893,6 +2380,57 @@ func TestServiceHandleAuthUpdate_DeleteMatchesSymlinkedAuthPath(t *testing.T) {
 	})
 	if _, exists := service.coreManager.GetByID(current.ID); exists {
 		t.Fatal("equivalent symlinked delete path left auth registered")
+	}
+}
+
+func TestServiceHandleAuthUpdateDeleteClearsChatGPTWebCatalogState(t *testing.T) {
+	authDir := t.TempDir()
+	path := filepath.Join(authDir, "chatgpt-web-delete.json")
+	service := &Service{
+		cfg:         &config.Config{AuthDir: authDir},
+		coreManager: coreauth.NewManager(nil, nil, nil),
+	}
+	auth := &coreauth.Auth{
+		ID:         "chatgpt-web-direct-delete",
+		Provider:   "chatgpt-web",
+		Status:     coreauth.StatusActive,
+		FileName:   path,
+		Attributes: map[string]string{"path": path},
+		Metadata: map[string]any{
+			"access_token":    "token",
+			"lifecycle_state": coreauth.LifecycleStateActive,
+		},
+	}
+	installed, err := service.coreManager.Register(context.Background(), auth)
+	if err != nil {
+		t.Fatalf("register auth: %v", err)
+	}
+	service.chatGPTWebModelCatalog.Store(installed.ID, &chatGPTWebModelCatalogCacheEntry{
+		RuntimeInstanceID: installed.RuntimeInstanceID(),
+		Models:            []*registry.ModelInfo{chatGPTWebTextModelInfo("remote-model", "", 0, "")},
+	})
+	service.chatGPTWebModelFetchLocks = map[string]*chatGPTWebModelFetchLockEntry{
+		installed.ID: {},
+	}
+
+	service.handleAuthUpdate(context.Background(), watcher.AuthUpdate{
+		Action: watcher.AuthUpdateActionDelete,
+		ID:     installed.ID,
+		Auth: &coreauth.Auth{
+			ID:         installed.ID,
+			FileName:   path,
+			Attributes: map[string]string{"path": path},
+		},
+	})
+
+	if _, exists := service.coreManager.GetByID(installed.ID); exists {
+		t.Fatal("deleted ChatGPT Web auth remained registered")
+	}
+	if _, exists := service.chatGPTWebModelCatalog.Load(installed.ID); exists {
+		t.Fatal("deleted ChatGPT Web auth retained its model catalog")
+	}
+	if _, exists := service.chatGPTWebModelFetchLocks[installed.ID]; exists {
+		t.Fatal("deleted ChatGPT Web auth retained its model fetch lock")
 	}
 }
 

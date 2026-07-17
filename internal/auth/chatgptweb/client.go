@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/http"
 	"net/url"
 	"sort"
 	"strconv"
@@ -13,6 +14,7 @@ import (
 	"time"
 
 	fhttp "github.com/bogdanfinn/fhttp"
+	fhttpcookiejar "github.com/bogdanfinn/fhttp/cookiejar"
 	tls_client "github.com/bogdanfinn/tls-client"
 	"github.com/bogdanfinn/tls-client/profiles"
 )
@@ -113,8 +115,78 @@ func (client *Client) DoFollow(ctx context.Context, method, targetURL string, he
 	return client.do(ctx, client.follow, method, targetURL, headers, body)
 }
 
+// DoFollowStream executes a redirect-following request without buffering or
+// closing the response body. The caller must close the body.
+func (client *Client) DoFollowStream(ctx context.Context, method, targetURL string, headers map[string]string, body io.Reader) (*fhttp.Response, error) {
+	return client.doStream(ctx, client.follow, method, targetURL, headers, body)
+}
+
 func (client *Client) DoNoRedirect(ctx context.Context, method, targetURL string, headers map[string]string, body io.Reader) (*fhttp.Response, []byte, error) {
 	return client.do(ctx, client.noRedirect, method, targetURL, headers, body)
+}
+
+// DoNoRedirectStream executes a request without following redirects, buffering,
+// or closing the response body. The caller must close the body.
+func (client *Client) DoNoRedirectStream(ctx context.Context, method, targetURL string, headers map[string]string, body io.Reader) (*fhttp.Response, error) {
+	return client.doStream(ctx, client.noRedirect, method, targetURL, headers, body)
+}
+
+// DoSameOriginRedirectStream follows a bounded redirect chain only while every
+// target remains on the exact original origin.
+func (client *Client) DoSameOriginRedirectStream(ctx context.Context, method, targetURL string, headers map[string]string, maxRedirects int) (*fhttp.Response, error) {
+	if maxRedirects < 0 {
+		maxRedirects = 0
+	}
+	originalURL, err := url.Parse(strings.TrimSpace(targetURL))
+	if err != nil || originalURL.Scheme == "" || originalURL.Host == "" {
+		return nil, fmt.Errorf("invalid redirect origin %q", targetURL)
+	}
+	currentURL := originalURL
+	for redirects := 0; ; redirects++ {
+		response, errRequest := client.DoNoRedirectStream(ctx, method, currentURL.String(), headers, nil)
+		if errRequest != nil {
+			return nil, errRequest
+		}
+		if !isChatGPTWebRedirectStatus(response.StatusCode) {
+			return response, nil
+		}
+		location := strings.TrimSpace(response.Header.Get("Location"))
+		if location == "" {
+			return response, nil
+		}
+		nextURL, errLocation := currentURL.Parse(location)
+		if errLocation != nil || !sameChatGPTWebOrigin(originalURL, nextURL) {
+			return response, nil
+		}
+		if redirects >= maxRedirects {
+			_ = response.Body.Close()
+			return nil, fmt.Errorf("chatgpt web redirect chain exceeds %d hops", maxRedirects)
+		}
+		if errClose := response.Body.Close(); errClose != nil {
+			return nil, fmt.Errorf("close redirect response body: %w", errClose)
+		}
+		currentURL = nextURL
+		if response.StatusCode == http.StatusSeeOther {
+			method = http.MethodGet
+		}
+	}
+}
+
+func isChatGPTWebRedirectStatus(status int) bool {
+	switch status {
+	case http.StatusMovedPermanently, http.StatusFound, http.StatusSeeOther,
+		http.StatusTemporaryRedirect, http.StatusPermanentRedirect:
+		return true
+	default:
+		return false
+	}
+}
+
+func sameChatGPTWebOrigin(left, right *url.URL) bool {
+	if left == nil || right == nil {
+		return false
+	}
+	return strings.EqualFold(left.Scheme, right.Scheme) && strings.EqualFold(left.Host, right.Host)
 }
 
 func (client *Client) DoJSON(ctx context.Context, followRedirect bool, method, targetURL string, headers map[string]string, body any) (*fhttp.Response, []byte, error) {
@@ -132,18 +204,23 @@ func (client *Client) DoJSON(ctx context.Context, followRedirect bool, method, t
 	return client.DoNoRedirect(ctx, method, targetURL, headers, reader)
 }
 
-func (client *Client) do(ctx context.Context, httpClient tls_client.HttpClient, method, targetURL string, headers map[string]string, body io.Reader) (*fhttp.Response, []byte, error) {
-	if client == nil || httpClient == nil {
-		return nil, nil, fmt.Errorf("browser client is nil")
+// DoJSONStream executes a JSON request without buffering, closing the response
+// body, or following redirects. SSE POST bodies and proof headers must not be
+// replayed to a redirected origin.
+func (client *Client) DoJSONStream(ctx context.Context, method, targetURL string, headers map[string]string, body any) (*fhttp.Response, error) {
+	var reader io.Reader
+	if body != nil {
+		payload, err := json.Marshal(body)
+		if err != nil {
+			return nil, fmt.Errorf("encode request body: %w", err)
+		}
+		reader = bytes.NewReader(payload)
 	}
-	request, err := fhttp.NewRequest(strings.ToUpper(strings.TrimSpace(method)), targetURL, body)
-	if err != nil {
-		return nil, nil, fmt.Errorf("create request: %w", err)
-	}
-	request = request.WithContext(ctx)
-	client.applyHeaders(request, headers)
+	return client.doStream(ctx, client.noRedirect, method, targetURL, headers, reader)
+}
 
-	response, err := httpClient.Do(request)
+func (client *Client) do(ctx context.Context, httpClient tls_client.HttpClient, method, targetURL string, headers map[string]string, body io.Reader) (*fhttp.Response, []byte, error) {
+	response, err := client.doStream(ctx, httpClient, method, targetURL, headers, body)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -156,6 +233,19 @@ func (client *Client) do(ctx context.Context, httpClient tls_client.HttpClient, 
 		return response, nil, fmt.Errorf("close response body: %w", errClose)
 	}
 	return response, payload, nil
+}
+
+func (client *Client) doStream(ctx context.Context, httpClient tls_client.HttpClient, method, targetURL string, headers map[string]string, body io.Reader) (*fhttp.Response, error) {
+	if client == nil || httpClient == nil {
+		return nil, fmt.Errorf("browser client is nil")
+	}
+	request, err := fhttp.NewRequest(strings.ToUpper(strings.TrimSpace(method)), targetURL, body)
+	if err != nil {
+		return nil, fmt.Errorf("create request: %w", err)
+	}
+	request = request.WithContext(ctx)
+	client.applyHeaders(request, headers)
+	return httpClient.Do(request)
 }
 
 func (client *Client) applyHeaders(request *fhttp.Request, overrides map[string]string) {
@@ -276,6 +366,13 @@ func (client *Client) RestoreCookies(cookies []Cookie) error {
 	if client == nil || client.follow == nil {
 		return fmt.Errorf("browser client is nil")
 	}
+	return restoreCookies(client.jar, cookies)
+}
+
+func restoreCookies(jar fhttp.CookieJar, cookies []Cookie) error {
+	if jar == nil {
+		return fmt.Errorf("cookie jar is nil")
+	}
 	for _, persisted := range cookies {
 		if strings.TrimSpace(persisted.Name) == "" {
 			return fmt.Errorf("cookie name is empty")
@@ -301,12 +398,19 @@ func (client *Client) RestoreCookies(cookies []Cookie) error {
 			if err != nil {
 				return fmt.Errorf("restore cookie %q expiration: %w", persisted.Name, err)
 			}
+		} else if strings.TrimSpace(persisted.RawExpires) != "" {
+			if parsedExpiry, parseErr := http.ParseTime(strings.TrimSpace(persisted.RawExpires)); parseErr == nil {
+				expires = parsedExpiry
+			}
+		}
+		if !expires.IsZero() && !expires.After(time.Now()) {
+			continue
 		}
 		path := persisted.Path
 		if path == "" {
 			path = "/"
 		}
-		client.follow.SetCookies(targetURL, []*fhttp.Cookie{{
+		jar.SetCookies(targetURL, []*fhttp.Cookie{{
 			Name:       persisted.Name,
 			Value:      persisted.Value,
 			Path:       path,
@@ -320,6 +424,28 @@ func (client *Client) RestoreCookies(cookies []Cookie) error {
 		}})
 	}
 	return nil
+}
+
+func credentialCookieValueForURL(cookies []Cookie, rawURL, name string) (string, error) {
+	targetURL, err := url.Parse(strings.TrimSpace(rawURL))
+	if err != nil || targetURL.Hostname() == "" {
+		return "", fmt.Errorf("invalid cookie URL %q", rawURL)
+	}
+	jar, err := fhttpcookiejar.New(nil)
+	if err != nil {
+		return "", fmt.Errorf("create scoped cookie jar: %w", err)
+	}
+	if err = restoreCookies(jar, cookies); err != nil {
+		return "", err
+	}
+	for _, cookie := range jar.Cookies(targetURL) {
+		if cookie != nil && cookie.Name == name {
+			if value := strings.TrimSpace(cookie.Value); value != "" {
+				return value, nil
+			}
+		}
+	}
+	return "", nil
 }
 
 func (client *Client) CloneWithProxy(proxyURL string) (*Client, error) {

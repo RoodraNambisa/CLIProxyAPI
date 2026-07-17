@@ -227,6 +227,9 @@ type Auth struct {
 	installationID string `json:"-"`
 	instanceID     string `json:"-"`
 	instanceState  *authInstanceState
+
+	chatGPTWebCredentialGeneration string
+	requestRefreshFamilyID         string
 }
 
 type authInstanceState struct {
@@ -479,6 +482,7 @@ func (a *Auth) CloneWithoutRuntimeInstance() *Auth {
 	clone.installationID = ""
 	clone.instanceID = ""
 	clone.instanceState = nil
+	clone.requestRefreshFamilyID = ""
 	return clone
 }
 

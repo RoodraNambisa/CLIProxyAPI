@@ -122,6 +122,47 @@ func TestXAIImagesGenerationRoutesThroughExistingImagesHandler(t *testing.T) {
 	}
 }
 
+func TestXAIImagesJSONRoutesRejectCountAboveMaximum(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	capture := &xaiMediaCaptureExecutor{}
+	images, _ := newXAIMediaTestHandlers(t, capture, defaultXAIImagesModel)
+	router := gin.New()
+	router.POST("/v1/images/generations", images.Generations)
+	router.POST("/v1/images/edits", images.Edits)
+
+	for _, test := range []struct {
+		name string
+		path string
+		body string
+	}{
+		{
+			name: "generation",
+			path: "/v1/images/generations",
+			body: `{"model":"grok-imagine-image","prompt":"draw","n":11}`,
+		},
+		{
+			name: "edit",
+			path: "/v1/images/edits",
+			body: `{"model":"grok-imagine-image","prompt":"edit","image":"data:image/png;base64,aW1hZ2U=","n":11}`,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, test.path, strings.NewReader(test.body))
+			req.Header.Set("Content-Type", "application/json")
+			resp := httptest.NewRecorder()
+			router.ServeHTTP(resp, req)
+			if resp.Code != http.StatusBadRequest || !strings.Contains(resp.Body.String(), "n must be at most 10") {
+				t.Fatalf("status = %d, body=%s", resp.Code, resp.Body.String())
+			}
+		})
+	}
+	capture.mu.Lock()
+	defer capture.mu.Unlock()
+	if len(capture.payloads) != 0 {
+		t.Fatalf("payload count = %d, want none", len(capture.payloads))
+	}
+}
+
 func TestXAIMediaPinsExecutionToXAIProvider(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	xaiCapture := &xaiMediaCaptureExecutor{provider: xaiProvider}
@@ -266,6 +307,49 @@ func TestXAIImagesMultipartEditPreservesNativeOptions(t *testing.T) {
 	}
 	if gjson.GetBytes(payload, "n").Exists() {
 		t.Fatalf("implicit n was sent; payload=%s", payload)
+	}
+}
+
+func TestXAIImagesMultipartEditRejectsCountAboveMaximum(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	capture := &xaiMediaCaptureExecutor{}
+	images, _ := newXAIMediaTestHandlers(t, capture, defaultXAIImagesModel)
+	router := gin.New()
+	router.POST("/v1/images/edits", images.Edits)
+
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	for name, value := range map[string]string{
+		"model":  defaultXAIImagesModel,
+		"prompt": "edit",
+		"n":      "11",
+	} {
+		if err := writer.WriteField(name, value); err != nil {
+			t.Fatalf("WriteField(%s) error = %v", name, err)
+		}
+	}
+	imagePart, err := writer.CreateFormFile("image", "input.png")
+	if err != nil {
+		t.Fatalf("CreateFormFile() error = %v", err)
+	}
+	if _, err = imagePart.Write([]byte("image")); err != nil {
+		t.Fatalf("image write error = %v", err)
+	}
+	if err = writer.Close(); err != nil {
+		t.Fatalf("multipart close error = %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/images/edits", &body)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	resp := httptest.NewRecorder()
+	router.ServeHTTP(resp, req)
+	if resp.Code != http.StatusBadRequest || !strings.Contains(resp.Body.String(), "n must be at most 10") {
+		t.Fatalf("status = %d, body=%s", resp.Code, resp.Body.String())
+	}
+	capture.mu.Lock()
+	defer capture.mu.Unlock()
+	if len(capture.payloads) != 0 {
+		t.Fatalf("payload count = %d, want none", len(capture.payloads))
 	}
 }
 

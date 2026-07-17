@@ -29,7 +29,7 @@ func TestCodexExecutorCacheHelper_OpenAIChatCompletions_StablePromptCacheKeyFrom
 	}
 	url := "https://example.com/responses"
 
-	httpReq, _, _, err := executor.cacheHelper(ctx, sdktranslator.FromString("openai"), url, nil, req, req.Payload, rawJSON)
+	httpReq, _, _, err := executor.cacheHelper(ctx, sdktranslator.FromString("openai"), url, nil, req, req.Payload, rawJSON, true)
 	if err != nil {
 		t.Fatalf("cacheHelper error: %v", err)
 	}
@@ -51,7 +51,7 @@ func TestCodexExecutorCacheHelper_OpenAIChatCompletions_StablePromptCacheKeyFrom
 		t.Fatalf("Session_id = %q, want %q", gotSession, expectedKey)
 	}
 
-	httpReq2, _, _, err := executor.cacheHelper(ctx, sdktranslator.FromString("openai"), url, nil, req, req.Payload, rawJSON)
+	httpReq2, _, _, err := executor.cacheHelper(ctx, sdktranslator.FromString("openai"), url, nil, req, req.Payload, rawJSON, true)
 	if err != nil {
 		t.Fatalf("cacheHelper error (second call): %v", err)
 	}
@@ -85,7 +85,7 @@ func TestCodexExecutorCacheHelper_IdentityConfuseRemapsBodyAndHeaders(t *testing
 	}
 	url := "https://example.com/responses"
 
-	httpReq, body, identityState, err := executor.cacheHelper(ctx, sdktranslator.FromString("openai-response"), url, auth, req, req.Payload, rawJSON)
+	httpReq, body, identityState, err := executor.cacheHelper(ctx, sdktranslator.FromString("openai-response"), url, auth, req, req.Payload, rawJSON, true)
 	if err != nil {
 		t.Fatalf("cacheHelper error: %v", err)
 	}

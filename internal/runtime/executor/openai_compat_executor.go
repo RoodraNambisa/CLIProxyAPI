@@ -475,6 +475,7 @@ type statusErr struct {
 	msg            string
 	retryAfter     *time.Duration
 	skipAuthResult bool
+	retryOtherAuth bool
 }
 
 func (e statusErr) Error() string {
@@ -486,3 +487,4 @@ func (e statusErr) Error() string {
 func (e statusErr) StatusCode() int            { return e.code }
 func (e statusErr) RetryAfter() *time.Duration { return e.retryAfter }
 func (e statusErr) SkipAuthResult() bool       { return e.skipAuthResult }
+func (e statusErr) RetryOtherAuth() bool       { return e.retryOtherAuth }

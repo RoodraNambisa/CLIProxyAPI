@@ -415,29 +415,39 @@ func TestCodexExecutorExecuteStream_EmptyTranslationEmitsTerminal(t *testing.T) 
 		chunks = append(chunks, chunk)
 	}
 	if len(chunks) != 1 || !cliproxyexecutor.IsSuccessfulStreamTerminalChunk(chunks[0]) {
-		t.Fatalf("chunks = %#v, want one successful terminal marker", chunks)
+		t.Fatalf("chunks = %#v, want successful terminal marker", chunks)
 	}
 }
 
 func TestCodexExecutorExecuteStream_TrustUpstreamSSEBypassesOutputRepair(t *testing.T) {
+	requestBody := make(chan []byte, 1)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		payload, errRead := io.ReadAll(r.Body)
+		if errRead != nil {
+			t.Fatalf("read request body: %v", errRead)
+		}
+		requestBody <- payload
+		upstreamPromptCacheKey := gjson.GetBytes(payload, "prompt_cache_key").String()
 		w.Header().Set("Content-Type", "text/event-stream")
 		_, _ = w.Write([]byte("event: response.output_item.done\n"))
 		_, _ = w.Write([]byte("data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"ok\"}]},\"output_index\":0}\n\n"))
 		_, _ = w.Write([]byte("event: response.completed\n"))
-		_, _ = w.Write([]byte("data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"object\":\"response\",\"created_at\":1775555723,\"status\":\"completed\",\"model\":\"gpt-5.4-mini-2026-03-17\",\"output\":[],\"usage\":{\"input_tokens\":8,\"output_tokens\":28,\"total_tokens\":36}}}\n\n"))
+		_, _ = w.Write([]byte("data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"object\":\"response\",\"created_at\":1775555723,\"status\":\"completed\",\"model\":\"gpt-5.4-mini-2026-03-17\",\"prompt_cache_key\":\"" + upstreamPromptCacheKey + "\",\"output\":[],\"usage\":{\"input_tokens\":8,\"output_tokens\":28,\"total_tokens\":36}}}\n\n"))
 	}))
 	defer server.Close()
 
-	executor := NewCodexExecutor(&config.Config{})
-	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+	executor := NewCodexExecutor(&config.Config{
+		Codex:   config.CodexConfig{IdentityConfuse: true},
+		Routing: config.RoutingConfig{SessionAffinity: true},
+	})
+	auth := &cliproxyauth.Auth{ID: "trusted-sse-auth", Attributes: map[string]string{
 		"base_url": server.URL,
 		"api_key":  "test",
 	}}
 
 	result, err := executor.ExecuteStream(context.Background(), auth, cliproxyexecutor.Request{
 		Model:   "gpt-5.4-mini",
-		Payload: []byte(`{"model":"gpt-5.4-mini","input":"Say ok"}`),
+		Payload: []byte(`{"model":"gpt-5.4-mini","input":"Say ok","prompt_cache_key":"cache-1"}`),
 	}, cliproxyexecutor.Options{
 		SourceFormat: sdktranslator.FromString("openai-response"),
 		Stream:       true,
@@ -452,6 +462,7 @@ func TestCodexExecutorExecuteStream_TrustUpstreamSSEBypassesOutputRepair(t *test
 
 	var completed []byte
 	terminalCount := 0
+	var forwarded bytes.Buffer
 	for chunk := range result.Chunks {
 		if chunk.Err != nil {
 			t.Fatalf("stream chunk error: %v", chunk.Err)
@@ -460,6 +471,7 @@ func TestCodexExecutorExecuteStream_TrustUpstreamSSEBypassesOutputRepair(t *test
 			terminalCount++
 			continue
 		}
+		forwarded.Write(chunk.Payload)
 		payload := bytes.TrimSpace(chunk.Payload)
 		if !bytes.Contains(payload, []byte("event: response.completed")) {
 			continue
@@ -485,6 +497,21 @@ func TestCodexExecutorExecuteStream_TrustUpstreamSSEBypassesOutputRepair(t *test
 
 	if got := gjson.GetBytes(completed, "response.output").Raw; got != "[]" {
 		t.Fatalf("response.output = %s, want [] when upstream SSE is trusted; completed=%s", got, string(completed))
+	}
+	if got := gjson.GetBytes(completed, "response.prompt_cache_key").String(); got != "cache-1" {
+		t.Fatalf("response.prompt_cache_key = %q, want cache-1", got)
+	}
+	if frames := bytes.Count(forwarded.Bytes(), []byte("\n\n")); frames != 2 {
+		t.Fatalf("trusted SSE frame separators = %d, want 2; payload=%q", frames, forwarded.String())
+	}
+	select {
+	case payload := <-requestBody:
+		expected := codexIdentityConfuseUUID(auth.ID, "prompt-cache", "cache-1")
+		if got := gjson.GetBytes(payload, "prompt_cache_key").String(); got != expected {
+			t.Fatalf("upstream prompt_cache_key = %q, want %q", got, expected)
+		}
+	default:
+		t.Fatal("upstream request body was not captured")
 	}
 }
 
@@ -529,11 +556,53 @@ func TestCodexExecutorExecuteStream_TrustUpstreamSSERequiresCompletionData(t *te
 	}
 }
 
-func TestCodexExecutorExecuteStream_TrustUpstreamSSENormalizesSuccessfulDoneFrame(t *testing.T) {
+func TestCodexExecutorExecuteStream_DoesNotCommitBootstrapForUpstreamHeartbeat(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
-		_, _ = w.Write([]byte("event: response.done\n"))
-		_, _ = w.Write([]byte(`data: {"type":"response.done","response":{"id":"resp_1","status":"completed","output":[]}}` + "\n\n"))
+		_, _ = io.WriteString(w, ": upstream accepted\n\n")
+	}))
+	defer server.Close()
+
+	executor := NewCodexExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{"base_url": server.URL, "api_key": "test"}}
+	result, err := executor.ExecuteStream(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "gpt-5.4-mini",
+		Payload: []byte(`{"model":"gpt-5.4-mini","input":"Say ok"}`),
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FormatOpenAIResponse,
+		Stream:       true,
+		Metadata: map[string]any{
+			cliproxyexecutor.TrustUpstreamSSEMetadataKey: true,
+		},
+	})
+	if err != nil {
+		t.Fatalf("ExecuteStream error: %v", err)
+	}
+
+	var chunks []cliproxyexecutor.StreamChunk
+	for chunk := range result.Chunks {
+		chunks = append(chunks, chunk)
+	}
+	if len(chunks) != 2 {
+		t.Fatalf("chunks = %#v, want heartbeat and terminal error", chunks)
+	}
+	if cliproxyexecutor.IsBootstrapCommitStreamChunk(chunks[0]) {
+		t.Fatalf("chunks = %#v, heartbeat committed bootstrap before semantic data", chunks)
+	}
+	if got := string(chunks[0].Payload); got != ": upstream accepted\n\n" {
+		t.Fatalf("heartbeat = %q", got)
+	}
+	if chunks[len(chunks)-1].Err == nil {
+		t.Fatalf("final chunk = %#v, want incomplete stream error", chunks[len(chunks)-1])
+	}
+}
+
+func TestCodexExecutorExecuteStream_TrustUpstreamSSEPreservesSuccessfulDoneFrame(t *testing.T) {
+	upstream := "event: response.done\r\n" +
+		"data: {\"type\":\"response.done\",\"response\":{\"id\":\"resp_1\",\"status\":\"completed\",\"output\":[]}}\r\n\r\n"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte(upstream))
 	}))
 	defer server.Close()
 
@@ -569,8 +638,121 @@ func TestCodexExecutorExecuteStream_TrustUpstreamSSENormalizesSuccessfulDoneFram
 	if terminalCount != 1 {
 		t.Fatalf("terminal marker count = %d, want 1", terminalCount)
 	}
-	if !bytes.Contains(payload, []byte("event: response.completed")) || !bytes.Contains(payload, []byte(`"type":"response.completed"`)) {
-		t.Fatalf("successful legacy frame was not normalized: %s", payload)
+	if string(payload) != upstream {
+		t.Fatalf("trusted SSE bytes changed:\n got %q\nwant %q", payload, upstream)
+	}
+}
+
+func TestCodexExecutorExecuteStream_TrustUpstreamSSERecognizesMultilineCompletion(t *testing.T) {
+	upstream := "event: response.completed\n" +
+		"data: {\"type\":\"response.completed\",\n" +
+		"data: \"response\":{\"id\":\"resp_1\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":2,\"output_tokens\":3,\"total_tokens\":5}}}\n\n"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte(upstream))
+	}))
+	defer server.Close()
+
+	executor := NewCodexExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{"base_url": server.URL, "api_key": "test"}}
+	result, err := executor.ExecuteStream(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "gpt-5.4-mini",
+		Payload: []byte(`{"model":"gpt-5.4-mini","input":"Say ok"}`),
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FormatOpenAIResponse,
+		Stream:       true,
+		Metadata: map[string]any{
+			cliproxyexecutor.TrustUpstreamSSEMetadataKey:     true,
+			cliproxyexecutor.StreamTerminalMarkerMetadataKey: true,
+		},
+	})
+	if err != nil {
+		t.Fatalf("ExecuteStream error: %v", err)
+	}
+
+	var payload []byte
+	terminalCount := 0
+	for chunk := range result.Chunks {
+		if chunk.Err != nil {
+			t.Fatalf("stream chunk error: %v", chunk.Err)
+		}
+		if cliproxyexecutor.IsSuccessfulStreamTerminalChunk(chunk) {
+			terminalCount++
+			continue
+		}
+		payload = append(payload, chunk.Payload...)
+	}
+	if terminalCount != 1 {
+		t.Fatalf("terminal marker count = %d, want 1", terminalCount)
+	}
+	if string(payload) != upstream {
+		t.Fatalf("trusted SSE bytes changed:\n got %q\nwant %q", payload, upstream)
+	}
+	data, ok := codexSSEFrameDataPayload(payload)
+	if !ok || gjson.GetBytes(data, "response.usage.total_tokens").Int() != 5 {
+		t.Fatalf("multiline data payload = %q", data)
+	}
+}
+
+func TestCodexTrustedSSEFrameInspectionSkipsNonterminalImagePayload(t *testing.T) {
+	nonterminal := []byte(`event: response.image_generation_call.partial_image
+data: {"type":"response.image_generation_call.partial_image","partial_image_b64":"` + strings.Repeat("A", 1024) + `"}
+
+`)
+	if codexTrustedSSEFrameNeedsInspection(nonterminal) {
+		t.Fatal("nonterminal image payload requested terminal parsing")
+	}
+	for _, event := range []string{"response.completed", "response.done", "response.failed", "response.incomplete", "error"} {
+		frame := []byte(`data: {"type":"` + event + `"}` + "\n\n")
+		if !codexTrustedSSEFrameNeedsInspection(frame) {
+			t.Fatalf("terminal event %q was not inspected", event)
+		}
+	}
+}
+
+func TestAppendBoundedCodexTrustedSSEFrameRejectsCumulativeOverflow(t *testing.T) {
+	frame, err := appendBoundedCodexTrustedSSEFrame([]byte("1234"), []byte("5678"), 8)
+	if err != nil || string(frame) != "12345678" {
+		t.Fatalf("bounded append = %q, %v", frame, err)
+	}
+	frame, err = appendBoundedCodexTrustedSSEFrame(frame, []byte("9"), 8)
+	if err == nil || !strings.Contains(err.Error(), "exceeds 8 bytes") {
+		t.Fatalf("overflow append error = %v", err)
+	}
+	if string(frame) != "12345678" {
+		t.Fatalf("overflow append mutated frame: %q", frame)
+	}
+}
+
+func TestSplitCodexSSELinesPreservesAllLineEndings(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		atEOF bool
+		want  string
+	}{
+		{name: "LF", input: "data: one\nrest", want: "data: one\n"},
+		{name: "CRLF", input: "data: one\r\nrest", want: "data: one\r\n"},
+		{name: "CR", input: "data: one\rrest", want: "data: one\r"},
+		{name: "terminal CR", input: "data: one\r", atEOF: true, want: "data: one\r"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			advance, token, err := splitCodexSSELinesPreserveEndings([]byte(test.input), test.atEOF)
+			if err != nil {
+				t.Fatalf("split error = %v", err)
+			}
+			if advance != len(test.want) || string(token) != test.want {
+				t.Fatalf("split = (%d, %q), want (%d, %q)", advance, token, len(test.want), test.want)
+			}
+		})
+	}
+}
+
+func TestCodexSSEFrameDataPayloadSupportsCROnlyFrames(t *testing.T) {
+	payload, ok := codexSSEFrameDataPayload([]byte("event: response.completed\rdata: {\"type\":\"response.completed\"}\r\r"))
+	if !ok || string(payload) != `{"type":"response.completed"}` {
+		t.Fatalf("payload = %q, %t", payload, ok)
 	}
 }
 
@@ -801,6 +983,7 @@ func TestCodexExecutorExecuteStream_ImagePassthroughMarksDoneTerminal(t *testing
 	terminalCount := 0
 	completedEvent := false
 	completedPayload := false
+	var forwarded bytes.Buffer
 	for chunk := range result.Chunks {
 		if chunk.Err != nil {
 			t.Fatalf("stream chunk error: %v", chunk.Err)
@@ -821,12 +1004,16 @@ func TestCodexExecutorExecuteStream_ImagePassthroughMarksDoneTerminal(t *testing
 			terminalCount++
 			continue
 		}
+		forwarded.Write(chunk.Payload)
 	}
 	if terminalCount != 1 {
 		t.Fatalf("terminal chunk count = %d, want 1", terminalCount)
 	}
 	if !completedEvent || !completedPayload {
 		t.Fatal("missing normalized response.completed event and payload")
+	}
+	if frames := bytes.Count(forwarded.Bytes(), []byte("\n\n")); frames != 2 {
+		t.Fatalf("image passthrough frame separators = %d, want 2; payload=%q", frames, forwarded.String())
 	}
 }
 

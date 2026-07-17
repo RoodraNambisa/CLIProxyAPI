@@ -28,6 +28,7 @@ import (
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
+	"golang.org/x/sync/singleflight"
 )
 
 // ProviderExecutor defines the contract required by Manager to execute provider calls.
@@ -322,10 +323,14 @@ type Manager struct {
 	refreshLoop        *authAutoRefreshLoop
 	refreshExecutions  map[*authInstanceState]map[chan struct{}]struct{}
 	refreshCleanupWait time.Duration
-	// requestRefreshLocks serializes request-time Antigravity refreshes by auth ID.
-	requestRefreshLocks sync.Map
+	// requestRefreshLocks serializes request-time provider refreshes by auth ID.
+	requestRefreshLocksMu sync.Mutex
+	requestRefreshLocks   sync.Map
+	requestRefreshFlights singleflight.Group
 	// requestPrepareLocks serializes request-time auth metadata preparation by auth ID.
-	requestPrepareLocks sync.Map
+	requestPrepareLocksMu sync.Mutex
+	requestPrepareLocks   sync.Map
+	requestPrepareFlights singleflight.Group
 
 	// persistLocks serializes store operations per auth ID.
 	persistBarrier sync.RWMutex
@@ -563,8 +568,36 @@ func (m *Manager) RefreshSchedulerEntry(authID string) {
 // models that are no longer present in the registry are pruned entirely so
 // renamed/removed models cannot keep auth-level status stale.
 func (m *Manager) ReconcileRegistryModelStates(ctx context.Context, authID string) {
+	m.reconcileRegistryModelStates(ctx, authID, nil, true)
+}
+
+// PruneRegistryModelStates removes state for models that are no longer
+// registered while preserving state for overlapping model IDs.
+func (m *Manager) PruneRegistryModelStates(ctx context.Context, authID string) {
+	m.reconcileRegistryModelStates(ctx, authID, nil, false)
+}
+
+// ReconcileRegistryModelStatesIfCurrent aligns model state only when expected
+// still identifies the current auth installation.
+func (m *Manager) ReconcileRegistryModelStatesIfCurrent(ctx context.Context, expected *Auth) bool {
+	if expected == nil {
+		return false
+	}
+	return m.reconcileRegistryModelStates(ctx, expected.ID, expected, true)
+}
+
+// PruneRegistryModelStatesIfCurrent prunes model state only when expected still
+// identifies the current auth installation.
+func (m *Manager) PruneRegistryModelStatesIfCurrent(ctx context.Context, expected *Auth) bool {
+	if expected == nil {
+		return false
+	}
+	return m.reconcileRegistryModelStates(ctx, expected.ID, expected, false)
+}
+
+func (m *Manager) reconcileRegistryModelStates(ctx context.Context, authID string, expected *Auth, resetSupported bool) bool {
 	if m == nil || authID == "" {
-		return
+		return false
 	}
 
 	supportedModels := registry.GetGlobalRegistry().GetModelsForClient(authID)
@@ -588,6 +621,10 @@ func (m *Manager) ReconcileRegistryModelStates(ctx context.Context, authID strin
 
 	m.mu.Lock()
 	auth, ok := m.auths[authID]
+	if expected != nil && !requestPreparationMatchesCurrent(auth, expected) {
+		m.mu.Unlock()
+		return false
+	}
 	if ok && auth != nil && len(auth.ModelStates) > 0 {
 		changed := false
 		for modelKey, state := range auth.ModelStates {
@@ -603,7 +640,7 @@ func (m *Manager) ReconcileRegistryModelStates(ctx context.Context, authID strin
 				changed = true
 				continue
 			}
-			if state == nil {
+			if !resetSupported || state == nil {
 				continue
 			}
 			if modelStateIsClean(state) {
@@ -639,6 +676,7 @@ func (m *Manager) ReconcileRegistryModelStates(ctx context.Context, authID strin
 	if m.scheduler != nil && snapshot != nil {
 		m.scheduler.upsertAuth(snapshot)
 	}
+	return true
 }
 
 func (m *Manager) SetSelector(selector Selector) {
@@ -1411,10 +1449,13 @@ func enqueueTerminalStreamChunk(ctx context.Context, out chan cliproxyexecutor.S
 }
 
 func readStreamBootstrap(ctx context.Context, ch <-chan cliproxyexecutor.StreamChunk) ([]cliproxyexecutor.StreamChunk, bool, error) {
+	const maxBufferedBytes = 64 << 10
+
 	if ch == nil {
 		return nil, true, nil
 	}
 	buffered := make([]cliproxyexecutor.StreamChunk, 0, 1)
+	var payload bytes.Buffer
 	for {
 		var (
 			chunk cliproxyexecutor.StreamChunk
@@ -1439,10 +1480,71 @@ func readStreamBootstrap(ctx context.Context, ch <-chan cliproxyexecutor.StreamC
 		if cliproxyexecutor.IsSuccessfulStreamTerminalChunk(chunk) {
 			return buffered, true, nil
 		}
-		if len(chunk.Payload) > 0 {
+		if cliproxyexecutor.IsBootstrapCommitStreamChunk(chunk) {
+			return buffered, false, nil
+		}
+		if len(chunk.Payload) > maxBufferedBytes-payload.Len() {
+			buffered = append(buffered, cliproxyexecutor.BootstrapCommitStreamChunk())
+			return buffered, false, nil
+		}
+		appendStreamBootstrapPayload(&payload, chunk.Payload)
+		if streamBootstrapPayloadHasSemanticPayload(payload.Bytes()) {
 			return buffered, false, nil
 		}
 	}
+}
+
+func streamBootstrapHasSemanticPayload(chunks []cliproxyexecutor.StreamChunk) bool {
+	var payload bytes.Buffer
+	for _, chunk := range chunks {
+		appendStreamBootstrapPayload(&payload, chunk.Payload)
+	}
+	return streamBootstrapPayloadHasSemanticPayload(payload.Bytes())
+}
+
+func streamBootstrapHasSuccessfulTerminal(chunks []cliproxyexecutor.StreamChunk) bool {
+	for _, chunk := range chunks {
+		if cliproxyexecutor.IsSuccessfulStreamTerminalChunk(chunk) {
+			return true
+		}
+	}
+	return false
+}
+
+func appendStreamBootstrapPayload(payload *bytes.Buffer, chunk []byte) {
+	if payload == nil || len(chunk) == 0 {
+		return
+	}
+	if streamBootstrapNeedsLineBreak(payload.Bytes(), chunk) {
+		payload.WriteByte('\n')
+	}
+	payload.Write(chunk)
+}
+
+func streamBootstrapNeedsLineBreak(pending, chunk []byte) bool {
+	if len(pending) == 0 || len(chunk) == 0 ||
+		bytes.HasSuffix(pending, []byte("\n")) || bytes.HasSuffix(pending, []byte("\r")) ||
+		chunk[0] == '\n' || chunk[0] == '\r' {
+		return false
+	}
+	trimmed := bytes.TrimLeft(chunk, " \t")
+	for _, prefix := range [][]byte{[]byte("data:"), []byte("event:"), []byte("id:"), []byte("retry:"), []byte(":")} {
+		if bytes.HasPrefix(trimmed, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+func streamBootstrapPayloadHasSemanticPayload(payload []byte) bool {
+	for _, line := range bytes.Split(payload, []byte{'\n'}) {
+		line = bytes.TrimSpace(line)
+		if len(line) == 0 || line[0] == ':' {
+			continue
+		}
+		return true
+	}
+	return false
 }
 
 func (m *Manager) wrapStreamResult(ctx, resultCtx context.Context, auth *Auth, affinityProviders []string, provider, routeModel, resultModel string, opts cliproxyexecutor.Options, headers http.Header, buffered []cliproxyexecutor.StreamChunk, remaining <-chan cliproxyexecutor.StreamChunk, aliasResult OAuthModelAliasResult, onDone func() bool) *cliproxyexecutor.StreamResult {
@@ -1731,7 +1833,7 @@ func (m *Manager) executeStreamWithModelPool(ctx, resultCtx context.Context, exe
 			return nil, newStreamBootstrapError(bootstrapErr, streamResult.Headers)
 		}
 
-		if closed && len(buffered) == 0 {
+		if closed && !streamBootstrapHasSemanticPayload(buffered) && !streamBootstrapHasSuccessfulTerminal(buffered) {
 			if errCtx := ctx.Err(); errCtx != nil {
 				return nil, errCtx
 			}
@@ -1989,6 +2091,7 @@ func (m *Manager) Register(ctx context.Context, auth *Auth) (*Auth, error) {
 	if auth == nil {
 		return nil, nil
 	}
+	auth.requestRefreshFamilyID = ""
 	if auth.ID == "" {
 		auth.ID = uuid.NewString()
 	}
@@ -1998,8 +2101,16 @@ func (m *Manager) Register(ctx context.Context, auth *Auth) (*Auth, error) {
 	}
 	unlockPersist := m.lockPersistKey(auth.ID)
 	skipStateCarryForward := shouldSkipStateCarryForward(ctx)
+	forceRuntimeReplacement := shouldForceRuntimeReplacement(ctx)
+	replacementNow := time.Now()
 	m.mu.RLock()
-	prepareAuthReplacement(m.auths[auth.ID], auth, skipStateCarryForward)
+	existingBeforePersist := m.auths[auth.ID]
+	credentialChanged := prepareChatGPTWebCredentialReplacement(existingBeforePersist, auth, replacementNow)
+	if credentialChanged {
+		skipStateCarryForward = true
+		forceRuntimeReplacement = true
+	}
+	prepareAuthReplacement(existingBeforePersist, auth, skipStateCarryForward)
 	m.mu.RUnlock()
 	if err := m.persistWithoutLock(ctx, auth, false); err != nil {
 		unlockPersist()
@@ -2008,9 +2119,14 @@ func (m *Manager) Register(ctx context.Context, auth *Auth) (*Auth, error) {
 	var replaced *Auth
 	m.mu.Lock()
 	existing := m.auths[auth.ID]
+	credentialChanged = prepareChatGPTWebCredentialReplacement(existing, auth, replacementNow)
+	if credentialChanged {
+		skipStateCarryForward = true
+		forceRuntimeReplacement = true
+	}
 	instanceID := ""
 	var instanceState *authInstanceState
-	if existing != nil && authRuntimeInstanceEquivalent(existing, auth) {
+	if existing != nil && !forceRuntimeReplacement && authRuntimeInstanceEquivalent(existing, auth) {
 		instanceID = existing.instanceID
 		instanceState = existing.instanceState
 		prepareAuthReplacement(existing, auth, skipStateCarryForward)
@@ -2028,6 +2144,7 @@ func (m *Manager) Register(ctx context.Context, auth *Auth) (*Auth, error) {
 	auth.EnsureIndex()
 	authClone := auth.Clone()
 	authClone.installationID = uuid.NewString()
+	authClone.requestRefreshFamilyID = uuid.NewString()
 	authClone.instanceID = instanceID
 	authClone.instanceState = instanceState
 	m.auths[auth.ID] = authClone
@@ -2042,11 +2159,15 @@ func (m *Manager) Register(ctx context.Context, auth *Auth) (*Auth, error) {
 		m.queueRefreshReschedule(auth.ID)
 	}
 	unlockPersist()
+	hookCtx := withoutChatGPTWebCredentialUpdateMarkers(ctx)
+	if credentialChanged {
+		hookCtx = withChatGPTWebCredentialReplacement(hookCtx)
+	}
 	notifyRegistered := func() {
 		if !m.authInstallationCurrent(authClone) {
 			return
 		}
-		m.Hook().OnAuthRegistered(ctx, installed.Clone())
+		m.Hook().OnAuthRegistered(hookCtx, installed.Clone())
 	}
 	if replaced != nil {
 		m.finishAuthSessionCleanup(auth.ID, replaced, "auth_replaced", notifyRegistered)
@@ -2063,14 +2184,23 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 	}
 	auth = auth.Clone()
 	clearRuntimeProxy(auth)
+	auth.requestRefreshFamilyID = ""
 	if IsRetiredGeminiCLIAuth(auth) {
 		WarnRetiredGeminiCLIAuthIgnored()
 		return nil, retiredGeminiCLIAuthError()
 	}
 	unlockPersist := m.lockPersistKey(auth.ID)
 	skipStateCarryForward := shouldSkipStateCarryForward(ctx)
+	forceRuntimeReplacement := shouldForceRuntimeReplacement(ctx)
+	replacementNow := time.Now()
 	m.mu.RLock()
-	prepareAuthReplacement(m.auths[auth.ID], auth, skipStateCarryForward)
+	existingBeforePersist := m.auths[auth.ID]
+	credentialChanged := prepareChatGPTWebCredentialReplacement(existingBeforePersist, auth, replacementNow)
+	if credentialChanged {
+		skipStateCarryForward = true
+		forceRuntimeReplacement = true
+	}
+	prepareAuthReplacement(existingBeforePersist, auth, skipStateCarryForward)
 	m.mu.RUnlock()
 	if err := m.persistWithoutLock(ctx, auth, false); err != nil {
 		unlockPersist()
@@ -2079,9 +2209,14 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 	var replaced *Auth
 	m.mu.Lock()
 	existing := m.auths[auth.ID]
+	credentialChanged = prepareChatGPTWebCredentialReplacement(existing, auth, replacementNow)
+	if credentialChanged {
+		skipStateCarryForward = true
+		forceRuntimeReplacement = true
+	}
 	instanceID := ""
 	var instanceState *authInstanceState
-	if existing != nil && authRuntimeInstanceEquivalent(existing, auth) {
+	if existing != nil && !forceRuntimeReplacement && authRuntimeInstanceEquivalent(existing, auth) {
 		instanceID = existing.instanceID
 		instanceState = existing.instanceState
 		prepareAuthReplacement(existing, auth, skipStateCarryForward)
@@ -2099,6 +2234,7 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 	auth.EnsureIndex()
 	authClone := auth.Clone()
 	authClone.installationID = uuid.NewString()
+	authClone.requestRefreshFamilyID = uuid.NewString()
 	authClone.instanceID = instanceID
 	authClone.instanceState = instanceState
 	m.auths[auth.ID] = authClone
@@ -2113,11 +2249,15 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 		m.queueRefreshReschedule(auth.ID)
 	}
 	unlockPersist()
+	hookCtx := withoutChatGPTWebCredentialUpdateMarkers(ctx)
+	if credentialChanged {
+		hookCtx = withChatGPTWebCredentialReplacement(hookCtx)
+	}
 	notifyUpdated := func() {
 		if !m.authInstallationCurrent(authClone) {
 			return
 		}
-		m.Hook().OnAuthUpdated(ctx, installed.Clone())
+		m.Hook().OnAuthUpdated(hookCtx, installed.Clone())
 	}
 	if replaced != nil {
 		m.finishAuthSessionCleanup(auth.ID, replaced, "auth_replaced", notifyUpdated)
@@ -2229,7 +2369,32 @@ func (m *Manager) authInstallationCurrent(installed *Auth) bool {
 	m.mu.RLock()
 	current := m.auths[installed.ID]
 	m.mu.RUnlock()
+	if current == nil {
+		return false
+	}
+	if installed.installationID != "" {
+		return current.installationID == installed.installationID
+	}
 	return current == installed
+}
+
+// CurrentAuthInstallation returns the current auth only when expected still
+// identifies the installed generation for its auth ID.
+func (m *Manager) CurrentAuthInstallation(expected *Auth) (*Auth, bool) {
+	if m == nil || expected == nil || expected.ID == "" {
+		return nil, false
+	}
+	m.mu.RLock()
+	current := m.auths[expected.ID]
+	if current == nil ||
+		(expected.installationID != "" && current.installationID != expected.installationID) ||
+		(expected.installationID == "" && expected.instanceID != "" && current.instanceID != expected.instanceID) {
+		m.mu.RUnlock()
+		return nil, false
+	}
+	snapshot := current.Clone()
+	m.mu.RUnlock()
+	return snapshot, true
 }
 
 func (m *Manager) waitForRefreshExecutions(auth *Auth) {
@@ -2617,6 +2782,7 @@ func (m *Manager) deleteWithOperation(ctx context.Context, id string, operation 
 			if m.auths[id] == current {
 				restored := current.Clone()
 				restored.installationID = uuid.NewString()
+				restored.requestRefreshFamilyID = uuid.NewString()
 				restored.instanceID = uuid.NewString()
 				restored.instanceState = &authInstanceState{}
 				restored.bindExecutorOwner(m.executors[executorKeyFromAuth(restored)])
@@ -2707,7 +2873,9 @@ func (m *Manager) Load(ctx context.Context) error {
 		}
 		auth.EnsureIndex()
 		loadedAuth := auth.Clone()
+		stampChatGPTWebCredentialGeneration(loadedAuth)
 		loadedAuth.installationID = uuid.NewString()
+		loadedAuth.requestRefreshFamilyID = uuid.NewString()
 		if existing := previous[auth.ID]; existing != nil && authRuntimeInstanceEquivalent(existing, loadedAuth) {
 			loadedAuth.instanceID = existing.instanceID
 			loadedAuth.instanceState = existing.instanceState
@@ -2966,6 +3134,7 @@ func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cli
 
 type requestAuthPrepareLock struct {
 	semaphore chan struct{}
+	active    int
 }
 
 type requestAuthPersistenceError struct {
@@ -2984,18 +3153,58 @@ func (m *Manager) prepareRequestAuth(ctx context.Context, executor ProviderExecu
 	if !ok || !preparer.ShouldPrepareRequestAuth(auth) {
 		return auth, nil
 	}
+	if !strings.EqualFold(strings.TrimSpace(auth.Provider), "chatgpt-web") || strings.TrimSpace(auth.ID) == "" {
+		return m.prepareRequestAuthSynchronized(ctx, executor, preparer, auth)
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return auth, err
+	}
+	workerCtx := context.WithoutCancel(ctx)
+	resultChannel := m.requestPrepareFlights.DoChan(requestAuthPrepareFlightKey(auth), func() (any, error) {
+		return m.prepareRequestAuthSynchronized(workerCtx, executor, preparer, auth)
+	})
+	select {
+	case <-ctx.Done():
+		return auth, ctx.Err()
+	case result := <-resultChannel:
+		if result.Err != nil {
+			return auth, result.Err
+		}
+		prepared, ok := result.Val.(*Auth)
+		if !ok && result.Val != nil {
+			return auth, fmt.Errorf("chatgpt-web request auth preparation returned %T", result.Val)
+		}
+		return prepared, nil
+	}
+}
 
+func requestAuthPrepareFlightKey(auth *Auth) string {
+	if auth == nil {
+		return ""
+	}
+	key := strings.ToLower(strings.TrimSpace(auth.Provider)) + "\x00" + strings.TrimSpace(auth.ID)
+	if auth.installationID != "" || auth.RuntimeInstanceID() != "" {
+		key += "\x00" + auth.installationID + "\x00" + auth.RuntimeInstanceID()
+	}
+	if sourceHash := authSourceHash(auth); sourceHash != "" {
+		key += "\x00" + sourceHash
+	}
+	return key
+}
+
+func (m *Manager) prepareRequestAuthSynchronized(ctx context.Context, executor ProviderExecutor, preparer RequestAuthPreparer, auth *Auth) (*Auth, error) {
 	id := strings.TrimSpace(auth.ID)
 	if id == "" {
 		return preparer.PrepareRequestAuth(ctx, auth.Clone())
 	}
-	newLock := &requestAuthPrepareLock{semaphore: make(chan struct{}, 1)}
-	newLock.semaphore <- struct{}{}
-	lockValue, _ := m.requestPrepareLocks.LoadOrStore(id, newLock)
-	lock, ok := lockValue.(*requestAuthPrepareLock)
-	if !ok || lock == nil || lock.semaphore == nil {
+	lock := m.acquireRequestPrepareLock(id)
+	if lock == nil || lock.semaphore == nil {
 		return preparer.PrepareRequestAuth(ctx, auth.Clone())
 	}
+	defer m.releaseRequestPrepareLock(id, lock)
 
 	select {
 	case <-ctx.Done():
@@ -3033,7 +3242,8 @@ func (m *Manager) prepareRequestAuth(ctx context.Context, executor ProviderExecu
 	if updated == nil {
 		return target, nil
 	}
-	installed, errUpdate := m.installPreparedRequestAuth(ctx, target, updated)
+	refreshAware := isNativeChatGPTWebCredentialAuth(target) && isNativeChatGPTWebCredentialAuth(updated)
+	installed, errUpdate := m.installPreparedRequestAuth(ctx, target, updated, refreshAware)
 	if errUpdate != nil {
 		return updated, errUpdate
 	}
@@ -3049,12 +3259,46 @@ func (m *Manager) prepareRequestAuth(ctx context.Context, executor ProviderExecu
 	return updated, nil
 }
 
-func (m *Manager) installPreparedRequestAuth(ctx context.Context, expected, updated *Auth) (*Auth, error) {
+func (m *Manager) acquireRequestPrepareLock(id string) *requestAuthPrepareLock {
+	if m == nil || strings.TrimSpace(id) == "" {
+		return nil
+	}
+	m.requestPrepareLocksMu.Lock()
+	defer m.requestPrepareLocksMu.Unlock()
+	lockValue, ok := m.requestPrepareLocks.Load(id)
+	lock, _ := lockValue.(*requestAuthPrepareLock)
+	if !ok || lock == nil || lock.semaphore == nil {
+		lock = &requestAuthPrepareLock{semaphore: make(chan struct{}, 1)}
+		lock.semaphore <- struct{}{}
+		m.requestPrepareLocks.Store(id, lock)
+	}
+	lock.active++
+	return lock
+}
+
+func (m *Manager) releaseRequestPrepareLock(id string, lock *requestAuthPrepareLock) {
+	if m == nil || lock == nil {
+		return
+	}
+	m.requestPrepareLocksMu.Lock()
+	if lock.active > 0 {
+		lock.active--
+	}
+	if lock.active == 0 {
+		if current, ok := m.requestPrepareLocks.Load(id); ok && current == lock {
+			m.requestPrepareLocks.Delete(id)
+		}
+	}
+	m.requestPrepareLocksMu.Unlock()
+}
+
+func (m *Manager) installPreparedRequestAuth(ctx context.Context, expected, updated *Auth, refreshAware bool) (*Auth, error) {
 	if m == nil || expected == nil || updated == nil || strings.TrimSpace(expected.ID) == "" {
 		return updated, nil
 	}
 	id := expected.ID
 	updated.ID = id
+	forceRuntimeReplacement := shouldForceRuntimeReplacement(ctx)
 	unlockPersist, errLock := m.lockPersistKeyContext(ctx, id)
 	if errLock != nil {
 		return nil, errLock
@@ -3071,7 +3315,14 @@ func (m *Manager) installPreparedRequestAuth(ctx context.Context, expected, upda
 	}
 	candidate := updated.Clone()
 	clearRuntimeProxy(candidate)
-	carryForwardPreparedAuthRuntimeState(current, candidate)
+	candidate.requestRefreshFamilyID = current.requestRefreshFamilyID
+	if candidate.requestRefreshFamilyID == "" {
+		candidate.requestRefreshFamilyID = uuid.NewString()
+	}
+	credentialChanged := preparePreparedRequestCredentialReplacement(current, candidate, time.Now(), refreshAware)
+	if !credentialChanged {
+		carryForwardPreparedAuthRuntimeState(current, candidate)
+	}
 	candidate.EnsureIndex()
 	m.mu.Unlock()
 
@@ -3085,24 +3336,57 @@ func (m *Manager) installPreparedRequestAuth(ctx context.Context, expected, upda
 		m.mu.Unlock()
 		return nil, runtimeAuthInstanceRetiredError()
 	}
-	carryForwardPreparedAuthRuntimeState(current, candidate)
+	credentialChanged = preparePreparedRequestCredentialReplacement(current, candidate, time.Now(), refreshAware)
+	if !credentialChanged {
+		carryForwardPreparedAuthRuntimeState(current, candidate)
+	}
 	candidate.installationID = uuid.NewString()
-	candidate.instanceID = current.instanceID
-	candidate.instanceState = current.instanceState
+	var replaced *Auth
+	if credentialChanged || forceRuntimeReplacement {
+		m.beginAuthInstanceCleanupLocked(id)
+		replaced = current.Clone()
+		candidate.instanceID = uuid.NewString()
+		candidate.instanceState = &authInstanceState{}
+		candidate.instanceState.bindExecutorOwner(m.executors[executorKeyFromAuth(candidate)])
+		candidate.requestRefreshFamilyID = uuid.NewString()
+	} else {
+		candidate.instanceID = current.instanceID
+		candidate.instanceState = current.instanceState
+	}
 	installedAuth := candidate.Clone()
 	m.auths[id] = installedAuth
 	installed := installedAuth.Clone()
+	cleanupPending := m.sessionCleanupPendingLocked(id)
 	m.mu.Unlock()
 
 	if m.scheduler != nil {
 		m.scheduler.upsertAuth(installed.Clone())
 	}
-	m.queueRefreshReschedule(id)
-	releasePersist()
-	if m.authInstallationCurrent(installedAuth) {
-		m.Hook().OnAuthUpdated(ctx, installed.Clone())
+	if !cleanupPending {
+		m.queueRefreshReschedule(id)
 	}
 	carryRuntimeProxy(expected, installed)
+	releasePersist()
+	if replaced != nil {
+		hookCtx := context.Background()
+		if ctx != nil {
+			hookCtx = context.WithoutCancel(ctx)
+		}
+		hookCtx = withoutChatGPTWebCredentialUpdateMarkers(hookCtx)
+		cleanupReason := "auth_runtime_replaced"
+		if credentialChanged {
+			hookCtx = withChatGPTWebCredentialReplacement(hookCtx)
+			cleanupReason = "auth_identity_changed"
+		}
+		hookAuth := installed.Clone()
+		go m.finishAuthSessionCleanup(id, replaced, cleanupReason, func() {
+			if m.authInstallationCurrent(installedAuth) {
+				m.Hook().OnAuthUpdated(hookCtx, hookAuth.Clone())
+			}
+		})
+	} else if m.authInstallationCurrent(installedAuth) {
+		m.Hook().OnAuthUpdated(withoutChatGPTWebCredentialUpdateMarkers(ctx), installed.Clone())
+	}
 	return installed, nil
 }
 
@@ -3111,7 +3395,7 @@ func (m *Manager) installPreparedRequestAuth(ctx context.Context, expected, upda
 // asynchronous provider work that must not overwrite a concurrent file reload
 // or management edit.
 func (m *Manager) UpdateIfCurrent(ctx context.Context, expected, updated *Auth) (*Auth, bool, error) {
-	installed, err := m.installPreparedRequestAuth(ctx, expected, updated)
+	installed, err := m.installPreparedRequestAuth(ctx, expected, updated, false)
 	if isRuntimeAuthInstanceRetiredError(err) {
 		return nil, false, nil
 	}
@@ -3119,6 +3403,94 @@ func (m *Manager) UpdateIfCurrent(ctx context.Context, expected, updated *Auth) 
 		return nil, false, err
 	}
 	return installed, true, nil
+}
+
+func preparePreparedRequestCredentialReplacement(existing, next *Auth, now time.Time, refreshAware bool) bool {
+	if refreshAware {
+		return prepareRefreshedChatGPTWebCredentialReplacement(existing, next, now)
+	}
+	return prepareChatGPTWebCredentialReplacement(existing, next, now)
+}
+
+// UpdateRuntimeMetadataIfCurrent persists selected runtime metadata without
+// replacing the current auth installation or notifying model-sync hooks.
+func (m *Manager) UpdateRuntimeMetadataIfCurrent(ctx context.Context, expected *Auth, updates map[string]any) (*Auth, bool, error) {
+	if len(updates) == 0 {
+		return m.MutateRuntimeMetadataIfCurrent(ctx, expected, nil)
+	}
+	return m.MutateRuntimeMetadataIfCurrent(ctx, expected, func(auth *Auth) {
+		applyRuntimeMetadataUpdates(auth, updates)
+	})
+}
+
+// MutateRuntimeMetadataIfCurrent persists runtime metadata changes without
+// replacing the current auth installation or notifying model-sync hooks.
+// mutate must only update Metadata and must not call back into Manager.
+func (m *Manager) MutateRuntimeMetadataIfCurrent(ctx context.Context, expected *Auth, mutate func(*Auth)) (*Auth, bool, error) {
+	if m == nil || expected == nil || strings.TrimSpace(expected.ID) == "" {
+		return nil, false, nil
+	}
+	if mutate == nil {
+		m.mu.RLock()
+		current := m.auths[expected.ID]
+		if !runtimeMetadataMutationMatchesCurrent(current, expected) {
+			m.mu.RUnlock()
+			return nil, false, nil
+		}
+		snapshot := current.Clone()
+		m.mu.RUnlock()
+		return snapshot, true, nil
+	}
+	id := expected.ID
+	unlockPersist, errLock := m.lockPersistKeyContext(ctx, id)
+	if errLock != nil {
+		return nil, false, errLock
+	}
+	defer unlockPersist()
+
+	m.mu.Lock()
+	current := m.auths[id]
+	if !runtimeMetadataMutationMatchesCurrent(current, expected) {
+		m.mu.Unlock()
+		return nil, false, nil
+	}
+	candidate := current.Clone()
+	mutate(candidate)
+	m.mu.Unlock()
+
+	if errPersist := m.persistWithoutLock(ctx, candidate, false); errPersist != nil {
+		return nil, false, errPersist
+	}
+
+	m.mu.Lock()
+	current = m.auths[id]
+	if !runtimeMetadataMutationMatchesCurrent(current, expected) {
+		m.mu.Unlock()
+		return nil, false, nil
+	}
+	installed := current.Clone()
+	mutate(installed)
+	if persistedHash := authSourceHash(candidate); persistedHash != "" {
+		if installed.Attributes == nil {
+			installed.Attributes = make(map[string]string)
+		}
+		installed.Attributes[SourceHashAttributeKey] = persistedHash
+	}
+	m.auths[id] = installed
+	m.mu.Unlock()
+	return installed.Clone(), true, nil
+}
+
+func applyRuntimeMetadataUpdates(auth *Auth, updates map[string]any) {
+	if auth == nil || len(updates) == 0 {
+		return
+	}
+	if auth.Metadata == nil {
+		auth.Metadata = make(map[string]any, len(updates))
+	}
+	for key, value := range updates {
+		auth.Metadata[key] = value
+	}
 }
 
 func requestPreparationMatchesCurrent(current, expected *Auth) bool {
@@ -3137,6 +3509,16 @@ func requestPreparationMatchesCurrent(current, expected *Auth) bool {
 		return expectedHash != "" && expectedHash == currentHash
 	}
 	return true
+}
+
+func runtimeMetadataMutationMatchesCurrent(current, expected *Auth) bool {
+	if current == nil || expected == nil || current.ID != expected.ID {
+		return false
+	}
+	if current.instanceID == "" || current.instanceID != expected.instanceID || current.instanceState != expected.instanceState {
+		return false
+	}
+	return current.installationID == expected.installationID
 }
 
 func carryForwardPreparedAuthRuntimeState(current, next *Auth) {
@@ -3162,19 +3544,20 @@ func carryForwardPreparedAuthRuntimeState(current, next *Auth) {
 	applyLifecycleRuntimeState(next)
 }
 
-func (m *Manager) prepareRequestAuthWithUnauthorizedRefresh(ctx context.Context, executor ProviderExecutor, auth *Auth) (*Auth, error) {
+func (m *Manager) prepareRequestAuthWithUnauthorizedRefresh(ctx context.Context, executor ProviderExecutor, auth *Auth) (*Auth, bool, error) {
 	prepared, errPrepare := m.prepareRequestAuth(ctx, executor, auth)
 	if errPrepare == nil {
-		return prepared, nil
+		return prepared, false, nil
 	}
-	refreshed, attemptedRefresh, errRefresh := m.tryRefreshAntigravityAfterUnauthorized(ctx, auth, errPrepare, false)
+	refreshed, attemptedRefresh, errRefresh := m.tryRefreshAfterUnauthorized(ctx, auth, errPrepare, false)
 	if errRefresh != nil {
-		return prepared, errRefresh
+		return prepared, attemptedRefresh, errRefresh
 	}
 	if !attemptedRefresh {
-		return prepared, errPrepare
+		return prepared, false, errPrepare
 	}
-	return m.prepareRequestAuth(ctx, executor, refreshed)
+	prepared, errPrepare = m.prepareRequestAuth(ctx, executor, refreshed)
+	return prepared, true, errPrepare
 }
 
 func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, requestAttempt int, maxRetryCredentials int, roundState *requestRoundState) (cliproxyexecutor.Response, error) {
@@ -3231,7 +3614,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			execCtx = context.WithValue(execCtx, roundTripperContextKey{}, rt)
 			execCtx = context.WithValue(execCtx, "cliproxy.roundtripper", rt)
 		}
-		preparedAuth, errPrepare := m.prepareRequestAuthWithUnauthorizedRefresh(execCtx, executor, auth)
+		preparedAuth, refreshedOnUnauthorized, errPrepare := m.prepareRequestAuthWithUnauthorizedRefresh(execCtx, executor, auth)
 		if errPrepare != nil {
 			if errCtx := execCtx.Err(); errCtx != nil {
 				return cliproxyexecutor.Response{}, errCtx
@@ -3273,7 +3656,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 		}
 		baseReq := sanitizeDownstreamWebsocketFallbackRequest(execCtx, auth, req)
 		var authErr error
-		didRefreshOnUnauthorized := false
+		didRefreshOnUnauthorized := refreshedOnUnauthorized
 		for _, upstreamModel := range models {
 			if !requestBodyReplayable(execCtx, opts) {
 				break
@@ -3323,7 +3706,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 				return cliproxyexecutor.Response{}, errCtx
 			}
 			if errExec != nil && requestBodyReplayable(execCtx, opts) {
-				refreshed, attemptedRefresh, errRefresh := m.tryRefreshAntigravityAfterUnauthorized(execCtx, auth, errExec, didRefreshOnUnauthorized)
+				refreshed, attemptedRefresh, errRefresh := m.tryRefreshAfterUnauthorized(execCtx, auth, errExec, didRefreshOnUnauthorized)
 				if attemptedRefresh {
 					didRefreshOnUnauthorized = true
 				}
@@ -3460,7 +3843,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 			execCtx = context.WithValue(execCtx, roundTripperContextKey{}, rt)
 			execCtx = context.WithValue(execCtx, "cliproxy.roundtripper", rt)
 		}
-		preparedAuth, errPrepare := m.prepareRequestAuthWithUnauthorizedRefresh(execCtx, executor, auth)
+		preparedAuth, refreshedOnUnauthorized, errPrepare := m.prepareRequestAuthWithUnauthorizedRefresh(execCtx, executor, auth)
 		if errPrepare != nil {
 			if errCtx := execCtx.Err(); errCtx != nil {
 				return cliproxyexecutor.Response{}, errCtx
@@ -3502,7 +3885,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 		}
 		baseReq := sanitizeDownstreamWebsocketFallbackRequest(execCtx, auth, req)
 		var authErr error
-		didRefreshOnUnauthorized := false
+		didRefreshOnUnauthorized := refreshedOnUnauthorized
 		for _, upstreamModel := range models {
 			if !requestBodyReplayable(execCtx, opts) {
 				break
@@ -3551,7 +3934,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 				return cliproxyexecutor.Response{}, errCtx
 			}
 			if errExec != nil && requestBodyReplayable(execCtx, opts) {
-				refreshed, attemptedRefresh, errRefresh := m.tryRefreshAntigravityAfterUnauthorized(execCtx, auth, errExec, didRefreshOnUnauthorized)
+				refreshed, attemptedRefresh, errRefresh := m.tryRefreshAfterUnauthorized(execCtx, auth, errExec, didRefreshOnUnauthorized)
 				if attemptedRefresh {
 					didRefreshOnUnauthorized = true
 				}
@@ -3687,7 +4070,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			execCtx = context.WithValue(execCtx, roundTripperContextKey{}, rt)
 			execCtx = context.WithValue(execCtx, "cliproxy.roundtripper", rt)
 		}
-		preparedAuth, errPrepare := m.prepareRequestAuthWithUnauthorizedRefresh(execCtx, executor, auth)
+		preparedAuth, refreshedOnUnauthorized, errPrepare := m.prepareRequestAuthWithUnauthorizedRefresh(execCtx, executor, auth)
 		if errPrepare != nil {
 			if errCtx := execCtx.Err(); errCtx != nil {
 				return nil, errCtx
@@ -3727,7 +4110,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			continue
 		}
 		execReq := sanitizeDownstreamWebsocketFallbackRequest(execCtx, auth, req)
-		didRefreshOnUnauthorized := false
+		didRefreshOnUnauthorized := refreshedOnUnauthorized
 		unregisterAttemptRelease := registerRequestBodyReleaseCallback(execCtx, opts, func([]byte) {
 			execReq.Payload = nil
 			opts.OriginalRequest = nil
@@ -3763,7 +4146,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			}
 			markDeferredFailure := deferAntigravityUnauthorizedStreamResult(auth, errStream)
 			if requestBodyReplayable(execCtx, opts) {
-				refreshed, attemptedRefresh, errRefresh := m.tryRefreshAntigravityAfterUnauthorized(execCtx, auth, errStream, didRefreshOnUnauthorized)
+				refreshed, attemptedRefresh, errRefresh := m.tryRefreshAfterUnauthorized(execCtx, auth, errStream, didRefreshOnUnauthorized)
 				if attemptedRefresh {
 					didRefreshOnUnauthorized = true
 				}
@@ -4237,7 +4620,7 @@ func (m *Manager) tryAntigravityCreditsExecute(ctx context.Context, req cliproxy
 			creditsCtx = context.WithValue(creditsCtx, "cliproxy.roundtripper", rt)
 		}
 		creditsOpts := ensureRequestedModelMetadata(opts, routeModel)
-		preparedAuth, errPrepare := m.prepareRequestAuthWithUnauthorizedRefresh(creditsCtx, c.executor, c.auth)
+		preparedAuth, _, errPrepare := m.prepareRequestAuthWithUnauthorizedRefresh(creditsCtx, c.executor, c.auth)
 		if errPrepare != nil {
 			if errCtx := creditsCtx.Err(); errCtx != nil {
 				return cliproxyexecutor.Response{}, false, errCtx
@@ -4338,7 +4721,7 @@ func (m *Manager) tryAntigravityCreditsExecuteStream(ctx context.Context, req cl
 			creditsCtx = context.WithValue(creditsCtx, "cliproxy.roundtripper", rt)
 		}
 		creditsOpts := ensureRequestedModelMetadata(opts, routeModel)
-		preparedAuth, errPrepare := m.prepareRequestAuthWithUnauthorizedRefresh(creditsCtx, c.executor, c.auth)
+		preparedAuth, _, errPrepare := m.prepareRequestAuthWithUnauthorizedRefresh(creditsCtx, c.executor, c.auth)
 		if errPrepare != nil {
 			if errCtx := creditsCtx.Err(); errCtx != nil {
 				return nil, false, errCtx
@@ -5141,11 +5524,33 @@ func (m *Manager) markResult(ctx context.Context, result Result, authInstanceID 
 	if auth, ok := m.auths[result.AuthID]; ok && auth != nil && (authInstanceID == "" || authInstanceID == auth.instanceID) {
 		acceptedResult = true
 		now := time.Now()
+		dynamicFixedCooldown, hasDynamicFixedCooldown := m.fixedErrorCooldownForResult(result.Error)
+		resultStatusCode := statusCodeFromResult(result.Error)
+		chatGPTWebInFlightModelResult := authInstanceID != "" &&
+			result.Model != "" &&
+			strings.EqualFold(strings.TrimSpace(auth.Provider), "chatgpt-web") &&
+			!(!result.Success && isInvalidGrantResultError(result.Error))
+		authWideDynamicCooldown := chatGPTWebInFlightModelResult &&
+			((hasDynamicFixedCooldown && dynamicFixedCooldown.scope == cooldownScopeAuth) ||
+				(!hasDynamicFixedCooldown && resultStatusCode == http.StatusUnauthorized))
+		dynamicModelResult := chatGPTWebInFlightModelResult && !authWideDynamicCooldown
+		staleDynamicModelResult := dynamicModelResult &&
+			!clientRegistrySupportsExecutionModel(result.AuthID, result.Model)
+		removedDynamicModelWithAuthCooldown := authWideDynamicCooldown &&
+			!clientRegistrySupportsExecutionModel(result.AuthID, result.Model)
+		var beforeDynamicModelResult *Auth
+		if dynamicModelResult && !staleDynamicModelResult {
+			beforeDynamicModelResult = auth.Clone()
+		}
 
 		if !result.Success && isInvalidGrantResultError(result.Error) {
 			disableAuthForInvalidGrant(auth, result.Error, now)
 		} else if !result.Success && (auth.Disabled || auth.Status == StatusDisabled) {
 			// Preserve an explicit disabled state against late in-flight results.
+		} else if staleDynamicModelResult {
+			// A dynamic catalog refresh already removed this model while the
+			// request was in flight. Keep the result observable to hooks without
+			// recreating stale per-model cooldown state.
 		} else if result.Success {
 			if result.Model != "" {
 				state := ensureModelState(auth, result.Model)
@@ -5164,7 +5569,22 @@ func (m *Manager) markResult(ctx context.Context, result Result, authInstanceID 
 			}
 		} else {
 			if result.Model != "" {
-				if !isRequestScopedNotFoundResultError(result.Error) {
+				if authWideDynamicCooldown {
+					skipCooling := !hasDynamicFixedCooldown && m.cooldownSkippedForStatus(resultStatusCode)
+					auth.Status = StatusError
+					auth.UpdatedAt = now
+					if result.Error != nil {
+						auth.LastError = cloneError(result.Error)
+						auth.StatusMessage = result.Error.Message
+					}
+					if !skipCooling {
+						cooldown := 30 * time.Minute
+						if hasDynamicFixedCooldown {
+							cooldown = dynamicFixedCooldown.cooldown
+						}
+						applyAuthWideCooldown(auth, cooldown, now, quotaCooldownDisabledForAuth(auth))
+					}
+				} else if !isRequestScopedNotFoundResultError(result.Error) {
 					state := ensureModelState(auth, result.Model)
 					state.Status = StatusError
 					state.UpdatedAt = now
@@ -5280,7 +5700,25 @@ func (m *Manager) markResult(ctx context.Context, result Result, authInstanceID 
 			}
 		}
 
-		persistAuth = auth
+		if dynamicModelResult && !staleDynamicModelResult &&
+			!clientRegistrySupportsExecutionModel(result.AuthID, result.Model) {
+			*auth = *beforeDynamicModelResult
+			shouldResumeModel = false
+			shouldSuspendModel = false
+			suspendReason = ""
+			clearModelQuota = false
+			setModelQuota = false
+			staleDynamicModelResult = true
+		}
+		if removedDynamicModelWithAuthCooldown {
+			delete(auth.ModelStates, result.Model)
+			if len(auth.ModelStates) == 0 {
+				auth.ModelStates = nil
+			}
+		}
+		if !staleDynamicModelResult {
+			persistAuth = auth
+		}
 	}
 	m.mu.Unlock()
 	if persistAuth != nil {
@@ -5329,6 +5767,22 @@ func (m *Manager) markResult(ctx context.Context, result Result, authInstanceID 
 	if acceptedResult {
 		m.Hook().OnResult(ctx, result)
 	}
+}
+
+func clientRegistrySupportsExecutionModel(authID, model string) bool {
+	target := canonicalModelKey(model)
+	if strings.TrimSpace(authID) == "" || target == "" {
+		return false
+	}
+	for _, registered := range registry.GetGlobalRegistry().GetModelsForClient(authID) {
+		if registered == nil {
+			continue
+		}
+		if canonicalModelKey(registered.ID) == target || canonicalModelKey(registered.UpstreamID) == target {
+			return true
+		}
+	}
+	return false
 }
 
 func ensureModelState(auth *Auth, model string) *ModelState {
@@ -7022,27 +7476,61 @@ func (m *Manager) refreshAuth(ctx context.Context, id string) {
 	m.refreshAuthExpected(ctx, id, nil, time.Time{})
 }
 
-type authRequestRefreshLock struct {
-	semaphore chan struct{}
+const authRequestRefreshResultLimit = 32
+
+type authRequestRefreshResult struct {
+	provider                string
+	sourceInstallationID    string
+	sourceRuntimeInstanceID string
+	resultInstallationID    string
+	resultRuntimeInstanceID string
 }
 
-// tryRefreshAntigravityAfterUnauthorized refreshes one Antigravity credential
-// once before the request falls back to another credential.
-func (m *Manager) tryRefreshAntigravityAfterUnauthorized(ctx context.Context, auth *Auth, execErr error, alreadyTried bool) (*Auth, bool, error) {
+type authRequestRefreshLock struct {
+	semaphore chan struct{}
+	active    int
+
+	mu          sync.Mutex
+	results     map[string]authRequestRefreshResult
+	resultOrder []string
+	failures    map[string]error
+	waiters     map[string]int
+}
+
+// tryRefreshAfterUnauthorized refreshes one supported credential once before
+// the request falls back to another credential.
+func (m *Manager) tryRefreshAfterUnauthorized(ctx context.Context, auth *Auth, execErr error, alreadyTried bool) (*Auth, bool, error) {
 	if m == nil || auth == nil || alreadyTried || execErr == nil {
 		return auth, false, nil
 	}
-	if !strings.EqualFold(strings.TrimSpace(auth.Provider), "antigravity") || !isUnauthorizedError(execErr) || !authHasRefreshCredential(auth) {
+	if !isUnauthorizedError(execErr) {
 		return auth, false, nil
 	}
-	refreshed, errRefresh := m.refreshAntigravityForRequest(ctx, auth.ID, authAccessToken(auth))
+	provider := strings.ToLower(strings.TrimSpace(auth.Provider))
+	switch provider {
+	case "antigravity":
+		if !authHasRefreshCredential(auth) {
+			return auth, false, nil
+		}
+	case "chatgpt-web":
+		if !isNativeChatGPTWebCredentialAuth(auth) || !auth.LifecycleRefreshable() {
+			return auth, false, nil
+		}
+	default:
+		return auth, false, nil
+	}
+
+	refreshed, errRefresh := m.refreshProviderForRequest(ctx, auth.ID, authAccessToken(auth), provider, auth)
 	if errRefresh != nil {
-		log.Debugf("antigravity credential refresh before fallback failed for %s: %v", auth.ID, errRefresh)
+		log.Debugf("%s credential refresh before fallback failed for %s: %v", provider, auth.ID, errRefresh)
+		if provider == "chatgpt-web" && isChatGPTWebCredentialUnavailableError(errRefresh) && !persistAuthUpdateForError(errRefresh) {
+			return auth, true, execErr
+		}
 		return auth, true, errRefresh
 	}
 	if refreshed == nil {
-		errRefresh = errors.New("antigravity credential refresh returned no auth")
-		log.Debugf("antigravity credential refresh before fallback failed for %s: %v", auth.ID, errRefresh)
+		errRefresh = fmt.Errorf("%s credential refresh returned no auth", provider)
+		log.Debugf("%s credential refresh before fallback failed for %s: %v", provider, auth.ID, errRefresh)
 		return auth, true, errRefresh
 	}
 	resolved, errProxy := m.ResolveProxyAuth(ctx, refreshed)
@@ -7053,6 +7541,52 @@ func (m *Manager) tryRefreshAntigravityAfterUnauthorized(ctx context.Context, au
 }
 
 func (m *Manager) refreshAntigravityForRequest(ctx context.Context, id, failedAccessToken string) (*Auth, error) {
+	return m.refreshProviderForRequest(ctx, id, failedAccessToken, "antigravity", nil)
+}
+
+func (m *Manager) refreshProviderForRequest(ctx context.Context, id, failedAccessToken, provider string, expected *Auth) (*Auth, error) {
+	if m == nil {
+		return nil, errors.New("auth manager is nil")
+	}
+	if !strings.EqualFold(strings.TrimSpace(provider), "chatgpt-web") {
+		return m.refreshProviderForRequestSynchronized(ctx, id, failedAccessToken, provider, expected)
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	// Refresh tokens may rotate, so one shared worker per auth generation must
+	// finish applying its result even when every initiating request stops waiting.
+	workerCtx := context.WithoutCancel(ctx)
+	resultChannel := m.requestRefreshFlights.DoChan(chatGPTWebRequestRefreshFlightKey(id, expected), func() (any, error) {
+		return m.refreshProviderForRequestSynchronized(workerCtx, id, failedAccessToken, "chatgpt-web", expected)
+	})
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case result := <-resultChannel:
+		if result.Err != nil {
+			return nil, result.Err
+		}
+		refreshed, ok := result.Val.(*Auth)
+		if !ok && result.Val != nil {
+			return nil, fmt.Errorf("chatgpt-web credential refresh returned %T", result.Val)
+		}
+		return refreshed, nil
+	}
+}
+
+func chatGPTWebRequestRefreshFlightKey(id string, expected *Auth) string {
+	key := strings.TrimSpace(id)
+	if sourceKey := authRequestRefreshSourceKey("chatgpt-web", expected); sourceKey != "" {
+		key += "\x00" + sourceKey
+	}
+	return key
+}
+
+func (m *Manager) refreshProviderForRequestSynchronized(ctx context.Context, id, failedAccessToken, provider string, expected *Auth) (*Auth, error) {
 	if m == nil {
 		return nil, errors.New("auth manager is nil")
 	}
@@ -7063,14 +7597,18 @@ func (m *Manager) refreshAntigravityForRequest(ctx context.Context, id, failedAc
 	if id == "" {
 		return nil, errors.New("auth id is empty")
 	}
+	provider = strings.ToLower(strings.TrimSpace(provider))
+	if provider == "" {
+		return nil, errors.New("auth provider is empty")
+	}
 
-	newLock := &authRequestRefreshLock{semaphore: make(chan struct{}, 1)}
-	newLock.semaphore <- struct{}{}
-	lockValue, _ := m.requestRefreshLocks.LoadOrStore(id, newLock)
-	lock, _ := lockValue.(*authRequestRefreshLock)
+	lock := m.acquireRequestRefreshLock(id)
 	if lock == nil || lock.semaphore == nil {
 		return nil, errors.New("invalid auth refresh lock")
 	}
+	defer m.releaseRequestRefreshLock(id, lock)
+	releaseResultWaiter := lock.track(provider, expected)
+	defer releaseResultWaiter()
 	select {
 	case <-ctx.Done():
 		return nil, ctx.Err()
@@ -7080,9 +7618,26 @@ func (m *Manager) refreshAntigravityForRequest(ctx context.Context, id, failedAc
 
 	m.mu.Lock()
 	auth := m.auths[id]
-	if auth == nil || m.sessionCleanupPendingLocked(id) || !strings.EqualFold(strings.TrimSpace(auth.Provider), "antigravity") {
+	if auth == nil || m.sessionCleanupPendingLocked(id) || !strings.EqualFold(strings.TrimSpace(auth.Provider), provider) {
 		m.mu.Unlock()
-		return nil, errors.New("antigravity auth not available")
+		return nil, fmt.Errorf("%s auth not available", provider)
+	}
+	if provider == "chatgpt-web" && expected != nil {
+		if !runtimeMetadataMutationMatchesCurrent(auth, expected) {
+			reusable := chatGPTWebRequestRefreshResultReusable(lock, provider, expected, auth) ||
+				chatGPTWebRefreshLineageMatches(expected, auth)
+			if !reusable {
+				m.mu.Unlock()
+				return nil, runtimeAuthInstanceRetiredError()
+			}
+			lock.remember(provider, expected, auth)
+		}
+		if auth.Disabled || auth.Status == StatusDisabled || !auth.LifecycleRefreshable() {
+			current := auth.Clone()
+			errUnavailable := newChatGPTWebRefreshStateUnavailableError(auth)
+			m.mu.Unlock()
+			return current, errUnavailable
+		}
 	}
 	if failedAccessToken != "" {
 		if currentToken := authAccessToken(auth); currentToken != "" && currentToken != failedAccessToken {
@@ -7091,10 +7646,16 @@ func (m *Manager) refreshAntigravityForRequest(ctx context.Context, id, failedAc
 			return current, nil
 		}
 	}
+	if provider == "chatgpt-web" && expected != nil {
+		if sharedFailure, ok := lock.failure(provider, expected); ok {
+			m.mu.Unlock()
+			return nil, sharedFailure
+		}
+	}
 	exec := m.executors[auth.Provider]
 	if exec == nil {
 		m.mu.Unlock()
-		return nil, errors.New("antigravity executor not found")
+		return nil, fmt.Errorf("%s executor not found", provider)
 	}
 	auth.bindExecutorOwner(exec)
 	baseline := auth.Clone()
@@ -7120,13 +7681,43 @@ func (m *Manager) refreshAntigravityForRequest(ctx context.Context, id, failedAc
 	}
 	retiredDuringRefresh := releaseRefresh()
 	if retiredDuringRefresh || runtimeAuthInstanceRetiredContext(refreshCtx) {
+		if errRefresh == nil {
+			if current, ok := m.concurrentRequestRefreshResult(lock, auth, id, provider, failedAccessToken, updated); ok {
+				lock.remember(provider, auth, current)
+				return current, nil
+			}
+		}
 		return nil, runtimeAuthInstanceRetiredError()
 	}
+	applyCtx := ctx
+	if provider == "chatgpt-web" {
+		applyCtx = context.WithoutCancel(ctx)
+	}
 	if errRefresh != nil {
+		if updated != nil && persistAuthUpdateForError(errRefresh) {
+			carryRuntimeProxy(refreshInput, updated)
+			if updated.Runtime == nil {
+				updated.Runtime = baseline.Runtime
+			}
+			updated.NextRefreshAfter = time.Time{}
+			updated.UpdatedAt = time.Now()
+			saved, errUpdate := m.applyRefreshedAuth(applyCtx, auth, baseline, updated, time.Time{})
+			if errUpdate != nil {
+				return nil, errUpdate
+			}
+			if saved == nil {
+				return nil, fmt.Errorf("%s auth changed during refresh", provider)
+			}
+			lock.remember(provider, auth, saved)
+			return saved, errRefresh
+		}
+		if provider == "chatgpt-web" && !errors.Is(errRefresh, context.Canceled) && !errors.Is(errRefresh, context.DeadlineExceeded) {
+			lock.rememberFailure(provider, auth, errRefresh)
+		}
 		if skipAuthResultForError(errRefresh) {
 			return nil, errRefresh
 		}
-		if isInvalidGrantError(errRefresh) {
+		if provider == "antigravity" && isInvalidGrantError(errRefresh) {
 			result := resultForAuth(auth, auth.Provider, "", false)
 			result.Error = &Error{
 				Code:       "invalid_grant",
@@ -7154,14 +7745,276 @@ func (m *Manager) refreshAntigravityForRequest(ctx context.Context, id, failedAc
 		updated.NextRefreshAfter = now.Add(refreshIneffectiveBackoff)
 	}
 
-	saved, errUpdate := m.applyRefreshedAuth(ctx, auth, baseline, updated, time.Time{})
+	saved, errUpdate := m.applyRefreshedAuth(applyCtx, auth, baseline, updated, time.Time{})
 	if errUpdate != nil {
 		return nil, errUpdate
 	}
 	if saved == nil {
-		return nil, errors.New("antigravity auth changed during refresh")
+		if provider == "chatgpt-web" {
+			if current, ok := m.concurrentRequestRefreshResult(lock, auth, id, provider, failedAccessToken, updated); ok {
+				lock.remember(provider, auth, current)
+				return current, nil
+			}
+		}
+		return nil, fmt.Errorf("%s auth changed during refresh", provider)
 	}
+	lock.remember(provider, auth, saved)
 	return saved, nil
+}
+
+func (m *Manager) acquireRequestRefreshLock(id string) *authRequestRefreshLock {
+	if m == nil || strings.TrimSpace(id) == "" {
+		return nil
+	}
+	m.requestRefreshLocksMu.Lock()
+	defer m.requestRefreshLocksMu.Unlock()
+	lockValue, ok := m.requestRefreshLocks.Load(id)
+	lock, _ := lockValue.(*authRequestRefreshLock)
+	if !ok || lock == nil || lock.semaphore == nil {
+		lock = &authRequestRefreshLock{semaphore: make(chan struct{}, 1)}
+		lock.semaphore <- struct{}{}
+		m.requestRefreshLocks.Store(id, lock)
+	}
+	lock.active++
+	return lock
+}
+
+func (m *Manager) releaseRequestRefreshLock(id string, lock *authRequestRefreshLock) {
+	if m == nil || lock == nil {
+		return
+	}
+	m.requestRefreshLocksMu.Lock()
+	if lock.active > 0 {
+		lock.active--
+	}
+	if lock.active == 0 {
+		if current, ok := m.requestRefreshLocks.Load(id); ok && current == lock {
+			m.requestRefreshLocks.Delete(id)
+		}
+	}
+	m.requestRefreshLocksMu.Unlock()
+}
+
+func (lock *authRequestRefreshLock) remember(provider string, source, result *Auth) {
+	if lock == nil || source == nil || result == nil {
+		return
+	}
+	key := authRequestRefreshSourceKey(provider, source)
+	if key == "" || result.installationID == "" || result.RuntimeInstanceID() == "" {
+		return
+	}
+	record := authRequestRefreshResult{
+		provider:                strings.ToLower(strings.TrimSpace(provider)),
+		sourceInstallationID:    source.installationID,
+		sourceRuntimeInstanceID: source.RuntimeInstanceID(),
+		resultInstallationID:    result.installationID,
+		resultRuntimeInstanceID: result.RuntimeInstanceID(),
+	}
+	lock.mu.Lock()
+	if lock.results == nil {
+		lock.results = make(map[string]authRequestRefreshResult)
+	}
+	if _, exists := lock.results[key]; !exists {
+		lock.resultOrder = append(lock.resultOrder, key)
+	}
+	lock.results[key] = record
+	delete(lock.failures, key)
+	lock.pruneResultsLocked()
+	lock.mu.Unlock()
+}
+
+func (lock *authRequestRefreshLock) rememberFailure(provider string, source *Auth, err error) {
+	key := authRequestRefreshSourceKey(provider, source)
+	if lock == nil || key == "" || err == nil {
+		return
+	}
+	lock.mu.Lock()
+	if lock.failures == nil {
+		lock.failures = make(map[string]error)
+	}
+	if lock.waiters[key] > 0 {
+		lock.failures[key] = err
+	}
+	lock.mu.Unlock()
+}
+
+func (lock *authRequestRefreshLock) failure(provider string, source *Auth) (error, bool) {
+	key := authRequestRefreshSourceKey(provider, source)
+	if lock == nil || key == "" {
+		return nil, false
+	}
+	lock.mu.Lock()
+	err, ok := lock.failures[key]
+	lock.mu.Unlock()
+	return err, ok
+}
+
+func chatGPTWebRequestRefreshResultReusable(lock *authRequestRefreshLock, provider string, expected, current *Auth) bool {
+	key := authRequestRefreshSourceKey(provider, expected)
+	if lock == nil || key == "" || current == nil {
+		return false
+	}
+	lock.mu.Lock()
+	record, ok := lock.results[key]
+	lock.mu.Unlock()
+	return ok &&
+		expected.requestRefreshFamilyID != "" &&
+		expected.requestRefreshFamilyID == current.requestRefreshFamilyID &&
+		record.provider == strings.ToLower(strings.TrimSpace(provider)) &&
+		record.sourceInstallationID == expected.installationID &&
+		record.sourceRuntimeInstanceID == expected.RuntimeInstanceID() &&
+		record.resultInstallationID == current.installationID &&
+		record.resultRuntimeInstanceID == current.RuntimeInstanceID()
+}
+
+func chatGPTWebRefreshLineageMatches(source, result *Auth) bool {
+	return source != nil &&
+		result != nil &&
+		source.requestRefreshFamilyID != "" &&
+		result.requestRefreshFamilyID == source.requestRefreshFamilyID
+}
+
+func authRequestRefreshSourceKey(provider string, source *Auth) string {
+	if source == nil || source.installationID == "" || source.RuntimeInstanceID() == "" {
+		return ""
+	}
+	return strings.ToLower(strings.TrimSpace(provider)) + "\x00" +
+		source.installationID + "\x00" + source.RuntimeInstanceID()
+}
+
+func (lock *authRequestRefreshLock) track(provider string, source *Auth) func() {
+	key := authRequestRefreshSourceKey(provider, source)
+	if lock == nil || key == "" {
+		return func() {}
+	}
+	lock.mu.Lock()
+	if lock.waiters == nil {
+		lock.waiters = make(map[string]int)
+	}
+	lock.waiters[key]++
+	lock.mu.Unlock()
+	return func() {
+		lock.mu.Lock()
+		if lock.waiters[key] <= 1 {
+			delete(lock.waiters, key)
+			delete(lock.failures, key)
+		} else {
+			lock.waiters[key]--
+		}
+		lock.pruneResultsLocked()
+		lock.mu.Unlock()
+	}
+}
+
+func (lock *authRequestRefreshLock) pruneResultsLocked() {
+	if lock == nil || len(lock.results) <= authRequestRefreshResultLimit {
+		return
+	}
+	kept := lock.resultOrder[:0]
+	for _, key := range lock.resultOrder {
+		if len(lock.results) <= authRequestRefreshResultLimit {
+			kept = append(kept, key)
+			continue
+		}
+		if lock.waiters[key] > 0 {
+			kept = append(kept, key)
+			continue
+		}
+		delete(lock.results, key)
+	}
+	lock.resultOrder = kept
+}
+
+type chatGPTWebRefreshStateUnavailableError struct {
+	state  string
+	reason string
+}
+
+func newChatGPTWebRefreshStateUnavailableError(auth *Auth) *chatGPTWebRefreshStateUnavailableError {
+	state := ""
+	reason := ""
+	if auth != nil {
+		state = auth.LifecycleState()
+		reason = strings.TrimSpace(auth.StatusMessage)
+		if auth.Metadata != nil {
+			if value, _ := auth.Metadata["lifecycle_reason"].(string); strings.TrimSpace(value) != "" {
+				reason = strings.TrimSpace(value)
+			}
+		}
+		if auth.Disabled || auth.Status == StatusDisabled {
+			state = "disabled"
+		}
+	}
+	return &chatGPTWebRefreshStateUnavailableError{state: state, reason: reason}
+}
+
+func (err *chatGPTWebRefreshStateUnavailableError) Error() string {
+	if err == nil {
+		return "chatgpt web credential is unavailable"
+	}
+	detail := strings.TrimSpace(err.reason)
+	if detail == "" {
+		detail = strings.TrimSpace(err.state)
+	}
+	if detail == "" {
+		return "chatgpt web credential is unavailable"
+	}
+	return "chatgpt web credential is unavailable: " + detail
+}
+
+func (*chatGPTWebRefreshStateUnavailableError) StatusCode() int {
+	return http.StatusServiceUnavailable
+}
+
+func (*chatGPTWebRefreshStateUnavailableError) SkipAuthResult() bool {
+	return true
+}
+
+func (*chatGPTWebRefreshStateUnavailableError) RetryOtherAuth() bool {
+	return true
+}
+
+func (*chatGPTWebRefreshStateUnavailableError) ChatGPTWebCredentialUnavailable() bool {
+	return true
+}
+
+func (*chatGPTWebRefreshStateUnavailableError) PersistAuthUpdateOnError() bool {
+	return true
+}
+
+func (m *Manager) concurrentRequestRefreshResult(lock *authRequestRefreshLock, source *Auth, id, provider, failedAccessToken string, updated *Auth) (*Auth, bool) {
+	refreshedToken := authAccessToken(updated)
+	if m == nil || updated == nil || refreshedToken == "" || refreshedToken == failedAccessToken {
+		return nil, false
+	}
+	m.mu.RLock()
+	current := m.auths[id]
+	if current == nil || current.Disabled || current.Status == StatusDisabled ||
+		!strings.EqualFold(strings.TrimSpace(current.Provider), provider) ||
+		authAccessToken(current) != refreshedToken {
+		m.mu.RUnlock()
+		return nil, false
+	}
+	if strings.EqualFold(provider, "chatgpt-web") {
+		if !chatGPTWebRequestRefreshResultReusable(lock, provider, source, current) {
+			m.mu.RUnlock()
+			return nil, false
+		}
+	}
+	snapshot := current.Clone()
+	m.mu.RUnlock()
+	return snapshot, true
+}
+
+func isChatGPTWebCredentialUnavailableError(err error) bool {
+	if err == nil {
+		return false
+	}
+	type chatGPTWebCredentialUnavailable interface {
+		ChatGPTWebCredentialUnavailable() bool
+	}
+	var target chatGPTWebCredentialUnavailable
+	return errors.As(err, &target) && target.ChatGPTWebCredentialUnavailable()
 }
 
 // RefreshAntigravityAfterUnauthorized refreshes an Antigravity credential after
@@ -7293,7 +8146,7 @@ func (m *Manager) refreshAuthExpected(ctx context.Context, id string, expected *
 		}
 		shouldReschedule := false
 		m.mu.Lock()
-		if current := m.auths[id]; current == auth {
+		if current := m.auths[id]; runtimeMetadataMutationMatchesCurrent(current, auth) {
 			current.NextRefreshAfter = now.Add(refreshFailureBackoff)
 			current.LastError = &Error{Message: err.Error()}
 			m.auths[id] = current
@@ -7341,7 +8194,7 @@ func (m *Manager) deferRefreshAfterProxyFailure(id string, expected *Auth, pendi
 	next := time.Now().Add(delay)
 	shouldReschedule := false
 	m.mu.Lock()
-	if current := m.auths[id]; current == expected {
+	if current := m.auths[id]; runtimeMetadataMutationMatchesCurrent(current, expected) {
 		current.NextRefreshAfter = next
 		shouldReschedule = true
 	} else if expected != nil {
@@ -7365,7 +8218,7 @@ func (m *Manager) applyRefreshedAuth(ctx context.Context, expected, refreshBasel
 		if result == nil {
 			m.mu.Lock()
 			clearedPending := false
-			if current := m.auths[id]; current != expected {
+			if current := m.auths[id]; !runtimeMetadataMutationMatchesCurrent(current, expected) {
 				clearedPending = clearRefreshPendingMarker(current, pendingUntil)
 			}
 			m.mu.Unlock()
@@ -7379,7 +8232,7 @@ func (m *Manager) applyRefreshedAuth(ctx context.Context, expected, refreshBasel
 
 	m.mu.Lock()
 	current := m.auths[id]
-	if current != expected {
+	if !runtimeMetadataMutationMatchesCurrent(current, expected) {
 		clearedPending := clearRefreshPendingMarker(current, pendingUntil)
 		m.mu.Unlock()
 		unlockPersist()
@@ -7393,7 +8246,10 @@ func (m *Manager) applyRefreshedAuth(ctx context.Context, expected, refreshBasel
 		updated.indexAssigned = current.indexAssigned
 	}
 	updated.EnsureIndex()
-	carryForwardConcurrentRefreshRuntimeState(refreshBaseline, current, updated)
+	credentialChanged := prepareRefreshedChatGPTWebCredentialReplacement(current, updated, time.Now())
+	if !credentialChanged {
+		carryForwardConcurrentRefreshRuntimeState(refreshBaseline, current, updated)
+	}
 	clearUnauthorizedRefreshState(updated, time.Now())
 	m.mu.Unlock()
 
@@ -7404,7 +8260,7 @@ func (m *Manager) applyRefreshedAuth(ctx context.Context, expected, refreshBasel
 
 	m.mu.Lock()
 	current = m.auths[id]
-	if current != expected {
+	if !runtimeMetadataMutationMatchesCurrent(current, expected) {
 		clearedPending := clearRefreshPendingMarker(current, pendingUntil)
 		m.mu.Unlock()
 		unlockPersist()
@@ -7413,17 +8269,44 @@ func (m *Manager) applyRefreshedAuth(ctx context.Context, expected, refreshBasel
 		}
 		return nil, nil
 	}
-	carryForwardConcurrentRefreshRuntimeState(refreshBaseline, current, updated)
+	credentialChanged = prepareRefreshedChatGPTWebCredentialReplacement(current, updated, time.Now())
+	if !credentialChanged {
+		carryForwardConcurrentRefreshRuntimeState(refreshBaseline, current, updated)
+	}
 	modelsToResume := clearUnauthorizedRefreshState(updated, time.Now())
 	updated.EnsureIndex()
-	m.beginAuthInstanceCleanupLocked(id)
-	replaced := current.Clone()
+	preserveRuntimeInstance := isNativeChatGPTWebCredentialAuth(updated) && !credentialChanged
+	var replaced *Auth
+	if !preserveRuntimeInstance {
+		m.beginAuthInstanceCleanupLocked(id)
+		replaced = current.Clone()
+	}
 	updatedClone := updated.Clone()
 	updatedClone.installationID = uuid.NewString()
-	updatedClone.instanceID = uuid.NewString()
-	updatedClone.instanceState = &authInstanceState{}
-	updatedClone.bindExecutorOwner(m.executors[executorKeyFromAuth(updatedClone)])
+	if preserveRuntimeInstance {
+		updatedClone.instanceID = current.instanceID
+		updatedClone.instanceState = current.instanceState
+	} else {
+		updatedClone.instanceID = uuid.NewString()
+		updatedClone.instanceState = &authInstanceState{}
+		updatedClone.bindExecutorOwner(m.executors[executorKeyFromAuth(updatedClone)])
+	}
+	if credentialChanged {
+		updatedClone.requestRefreshFamilyID = uuid.NewString()
+	} else {
+		updatedClone.requestRefreshFamilyID = expected.requestRefreshFamilyID
+		if updatedClone.requestRefreshFamilyID == "" {
+			updatedClone.requestRefreshFamilyID = uuid.NewString()
+		}
+	}
 	m.auths[id] = updatedClone
+	if strings.EqualFold(strings.TrimSpace(updatedClone.Provider), "chatgpt-web") {
+		if lockValue, ok := m.requestRefreshLocks.Load(id); ok {
+			if requestLock, _ := lockValue.(*authRequestRefreshLock); requestLock != nil {
+				requestLock.remember(updatedClone.Provider, expected, updatedClone)
+			}
+		}
+	}
 	m.mu.Unlock()
 
 	m.rebuildAPIKeyModelAliasFromRuntimeConfig()
@@ -7435,12 +8318,23 @@ func (m *Manager) applyRefreshedAuth(ctx context.Context, expected, refreshBasel
 	}
 	result := updatedClone.Clone()
 	unlockPersist()
-	m.finishAuthSessionCleanup(id, replaced, "auth_refreshed", func() {
+	hookCtx := withoutChatGPTWebCredentialUpdateMarkers(ctx)
+	if credentialChanged {
+		hookCtx = withChatGPTWebCredentialReplacement(hookCtx)
+	} else if isNativeChatGPTWebCredentialAuth(updatedClone) {
+		hookCtx = withChatGPTWebCredentialRefresh(hookCtx)
+	}
+	notifyUpdated := func() {
 		if !m.authInstallationCurrent(updatedClone) {
 			return
 		}
-		m.Hook().OnAuthUpdated(ctx, result.Clone())
-	})
+		m.Hook().OnAuthUpdated(hookCtx, result.Clone())
+	}
+	if replaced != nil {
+		m.finishAuthSessionCleanup(id, replaced, "auth_refreshed", notifyUpdated)
+	} else {
+		notifyUpdated()
+	}
 	return result, nil
 }
 
@@ -7448,6 +8342,7 @@ func carryForwardConcurrentRefreshRuntimeState(baseline, current, next *Auth) {
 	if baseline == nil || current == nil || next == nil {
 		return
 	}
+	carryForwardConcurrentRefreshMetadata(baseline, current, next)
 	if baseline.Status == current.Status &&
 		baseline.StatusMessage == current.StatusMessage &&
 		baseline.Unavailable == current.Unavailable &&
@@ -7457,6 +8352,7 @@ func carryForwardConcurrentRefreshRuntimeState(baseline, current, next *Auth) {
 		baseline.Quota == current.Quota &&
 		baseline.UpdatedAt.Equal(current.UpdatedAt) &&
 		reflect.DeepEqual(baseline.ModelStates, current.ModelStates) {
+		applyLifecycleRuntimeState(next)
 		return
 	}
 	next.Status = current.Status
@@ -7469,6 +8365,31 @@ func carryForwardConcurrentRefreshRuntimeState(baseline, current, next *Auth) {
 	next.UpdatedAt = current.UpdatedAt
 	next.ModelStates = cloneAuthModelStates(current.ModelStates)
 	applyLifecycleRuntimeState(next)
+}
+
+func carryForwardConcurrentRefreshMetadata(baseline, current, next *Auth) {
+	if baseline == nil || current == nil || next == nil {
+		return
+	}
+	for _, key := range []string{"cookies", "persona", "device_id", "session_id"} {
+		baselineValue := authMetadataValue(baseline.Metadata, key)
+		currentValue := authMetadataValue(current.Metadata, key)
+		nextValue := authMetadataValue(next.Metadata, key)
+		if reflect.DeepEqual(currentValue, baselineValue) || !reflect.DeepEqual(nextValue, baselineValue) {
+			continue
+		}
+		if next.Metadata == nil {
+			next.Metadata = make(map[string]any)
+		}
+		next.Metadata[key] = currentValue
+	}
+}
+
+func authMetadataValue(metadata map[string]any, key string) any {
+	if metadata == nil {
+		return nil
+	}
+	return metadata[key]
 }
 
 func clearRefreshPendingMarker(auth *Auth, pendingUntil time.Time) bool {

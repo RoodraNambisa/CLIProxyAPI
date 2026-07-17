@@ -131,6 +131,10 @@ type ModelRegistration struct {
 	Info *ModelInfo
 	// InfoByProvider maps provider identifiers to specific ModelInfo to support differing capabilities.
 	InfoByProvider map[string]*ModelInfo
+	// infoClientID and infoClientByProvider retain metadata ownership so a
+	// departing client can hand it back to another active registration.
+	infoClientID         string
+	infoClientByProvider map[string]string
 	// Count is the number of active clients that can provide this model
 	Count int
 	// LastUpdated tracks when this registration was last modified
@@ -272,25 +276,33 @@ func (r *ModelRegistry) triggerModelsUnregistered(provider, clientID string) {
 //   - clientProvider: Provider name (e.g., "gemini", "claude", "openai")
 //   - models: List of models that this client can provide
 func (r *ModelRegistry) RegisterClient(clientID, clientProvider string, models []*ModelInfo) {
+	r.registerClient(clientID, clientProvider, models, true)
+}
+
+// RegisterClientPreservingState updates a client's model catalog while retaining
+// cooldown and suspension state for model IDs that remain registered.
+func (r *ModelRegistry) RegisterClientPreservingState(clientID, clientProvider string, models []*ModelInfo) {
+	r.registerClient(clientID, clientProvider, models, false)
+}
+
+func (r *ModelRegistry) registerClient(clientID, clientProvider string, models []*ModelInfo, resetTransientState bool) {
 	r.mutex.Lock()
 	defer r.mutex.Unlock()
 	r.ensureAvailableModelsCacheLocked()
 
 	provider := strings.ToLower(clientProvider)
 	uniqueModelIDs := make([]string, 0, len(models))
-	rawModelIDs := make([]string, 0, len(models))
 	newModels := make(map[string]*ModelInfo, len(models))
 	newCounts := make(map[string]int, len(models))
 	for _, model := range models {
 		if model == nil || model.ID == "" {
 			continue
 		}
-		rawModelIDs = append(rawModelIDs, model.ID)
-		newCounts[model.ID]++
 		if _, exists := newModels[model.ID]; exists {
 			continue
 		}
 		newModels[model.ID] = model
+		newCounts[model.ID] = 1
 		uniqueModelIDs = append(uniqueModelIDs, model.ID)
 	}
 
@@ -312,11 +324,11 @@ func (r *ModelRegistry) RegisterClient(clientID, clientProvider string, models [
 	providerChanged := oldProvider != provider
 	if !hadExisting {
 		// Pure addition path.
-		for _, modelID := range rawModelIDs {
+		for _, modelID := range uniqueModelIDs {
 			model := newModels[modelID]
-			r.addModelRegistration(modelID, provider, model, now)
+			r.addModelRegistration(clientID, modelID, provider, model, now)
 		}
-		r.clientModels[clientID] = append([]string(nil), rawModelIDs...)
+		r.clientModels[clientID] = append([]string(nil), uniqueModelIDs...)
 		// Store client's own model infos
 		clientInfos := make(map[string]*ModelInfo, len(newModels))
 		for id, m := range newModels {
@@ -330,7 +342,7 @@ func (r *ModelRegistry) RegisterClient(clientID, clientProvider string, models [
 		}
 		r.invalidateAvailableModelsCacheLocked()
 		r.triggerModelsRegistered(provider, clientID, models)
-		log.Debugf("Registered client %s from provider %s with %d models", clientID, clientProvider, len(rawModelIDs))
+		log.Debugf("Registered client %s from provider %s with %d models", clientID, clientProvider, len(uniqueModelIDs))
 		misc.LogCredentialSeparator()
 		return
 	}
@@ -375,6 +387,9 @@ func (r *ModelRegistry) RegisterClient(clientID, clientProvider string, models [
 						if reg.InfoByProvider != nil {
 							delete(reg.InfoByProvider, oldProvider)
 						}
+						if reg.infoClientByProvider != nil {
+							delete(reg.infoClientByProvider, oldProvider)
+						}
 					} else {
 						reg.Providers[oldProvider] = count - toRemove
 					}
@@ -387,7 +402,7 @@ func (r *ModelRegistry) RegisterClient(clientID, clientProvider string, models [
 	for _, id := range removed {
 		oldCount := oldCounts[id]
 		for i := 0; i < oldCount; i++ {
-			r.removeModelRegistration(clientID, id, oldProvider, now)
+			r.removeModelRegistration(clientID, id, oldProvider, now, true)
 		}
 	}
 
@@ -398,7 +413,7 @@ func (r *ModelRegistry) RegisterClient(clientID, clientProvider string, models [
 		}
 		overage := oldCount - newCount
 		for i := 0; i < overage; i++ {
-			r.removeModelRegistration(clientID, id, oldProvider, now)
+			r.removeModelRegistration(clientID, id, oldProvider, now, false)
 		}
 	}
 
@@ -411,7 +426,7 @@ func (r *ModelRegistry) RegisterClient(clientID, clientProvider string, models [
 		model := newModels[id]
 		diff := newCount - oldCount
 		for i := 0; i < diff; i++ {
-			r.addModelRegistration(id, provider, model, now)
+			r.addModelRegistration(clientID, id, provider, model, now)
 		}
 	}
 
@@ -424,21 +439,28 @@ func (r *ModelRegistry) RegisterClient(clientID, clientProvider string, models [
 		model := newModels[id]
 		if reg, ok := r.models[id]; ok {
 			reg.Info = cloneModelInfo(model)
+			reg.infoClientID = clientID
 			if provider != "" {
 				if reg.InfoByProvider == nil {
 					reg.InfoByProvider = make(map[string]*ModelInfo)
 				}
+				if reg.infoClientByProvider == nil {
+					reg.infoClientByProvider = make(map[string]string)
+				}
 				reg.InfoByProvider[provider] = cloneModelInfo(model)
+				reg.infoClientByProvider[provider] = clientID
 			}
 			reg.LastUpdated = now
-			// Re-registering an existing client/model binding starts a fresh registry
-			// snapshot for that binding. Cooldown and suspension are transient
-			// scheduling state and must not survive this reconciliation step.
-			if reg.QuotaExceededClients != nil {
-				delete(reg.QuotaExceededClients, clientID)
-			}
-			if reg.SuspendedClients != nil {
-				delete(reg.SuspendedClients, clientID)
+			if resetTransientState || providerChanged {
+				// Re-registering an existing client/model binding starts a fresh registry
+				// snapshot for that binding. Cooldown and suspension are transient
+				// scheduling state and must not survive this reconciliation step.
+				if reg.QuotaExceededClients != nil {
+					delete(reg.QuotaExceededClients, clientID)
+				}
+				if reg.SuspendedClients != nil {
+					delete(reg.SuspendedClients, clientID)
+				}
 			}
 			if providerChanged && provider != "" {
 				if _, newlyAdded := addedSet[id]; newlyAdded {
@@ -460,8 +482,10 @@ func (r *ModelRegistry) RegisterClient(clientID, clientProvider string, models [
 	}
 
 	// Update client bookkeeping.
-	if len(rawModelIDs) > 0 {
-		r.clientModels[clientID] = append([]string(nil), rawModelIDs...)
+	if len(uniqueModelIDs) > 0 {
+		r.clientModels[clientID] = append([]string(nil), uniqueModelIDs...)
+	} else {
+		delete(r.clientModels, clientID)
 	}
 	// Update client's own model infos
 	clientInfos := make(map[string]*ModelInfo, len(newModels))
@@ -473,6 +497,16 @@ func (r *ModelRegistry) RegisterClient(clientID, clientProvider string, models [
 		r.clientProviders[clientID] = provider
 	} else {
 		delete(r.clientProviders, clientID)
+	}
+	affectedModels := make(map[string]struct{}, len(oldCounts)+len(newCounts))
+	for id := range oldCounts {
+		affectedModels[id] = struct{}{}
+	}
+	for id := range newCounts {
+		affectedModels[id] = struct{}{}
+	}
+	for id := range affectedModels {
+		r.rebindModelInfoOwnersLocked(id)
 	}
 
 	r.invalidateAvailableModelsCacheLocked()
@@ -486,7 +520,7 @@ func (r *ModelRegistry) RegisterClient(clientID, clientProvider string, models [
 	misc.LogCredentialSeparator()
 }
 
-func (r *ModelRegistry) addModelRegistration(modelID, provider string, model *ModelInfo, now time.Time) {
+func (r *ModelRegistry) addModelRegistration(clientID, modelID, provider string, model *ModelInfo, now time.Time) {
 	if model == nil || modelID == "" {
 		return
 	}
@@ -494,11 +528,15 @@ func (r *ModelRegistry) addModelRegistration(modelID, provider string, model *Mo
 		existing.Count++
 		existing.LastUpdated = now
 		existing.Info = cloneModelInfo(model)
+		existing.infoClientID = clientID
 		if existing.SuspendedClients == nil {
 			existing.SuspendedClients = make(map[string]string)
 		}
 		if existing.InfoByProvider == nil {
 			existing.InfoByProvider = make(map[string]*ModelInfo)
+		}
+		if existing.infoClientByProvider == nil {
+			existing.infoClientByProvider = make(map[string]string)
 		}
 		if provider != "" {
 			if existing.Providers == nil {
@@ -506,6 +544,7 @@ func (r *ModelRegistry) addModelRegistration(modelID, provider string, model *Mo
 			}
 			existing.Providers[provider]++
 			existing.InfoByProvider[provider] = cloneModelInfo(model)
+			existing.infoClientByProvider[provider] = clientID
 		}
 		log.Debugf("Incremented count for model %s, now %d clients", modelID, existing.Count)
 		return
@@ -514,6 +553,8 @@ func (r *ModelRegistry) addModelRegistration(modelID, provider string, model *Mo
 	registration := &ModelRegistration{
 		Info:                 cloneModelInfo(model),
 		InfoByProvider:       make(map[string]*ModelInfo),
+		infoClientID:         clientID,
+		infoClientByProvider: make(map[string]string),
 		Count:                1,
 		LastUpdated:          now,
 		QuotaExceededClients: make(map[string]*time.Time),
@@ -522,22 +563,23 @@ func (r *ModelRegistry) addModelRegistration(modelID, provider string, model *Mo
 	if provider != "" {
 		registration.Providers = map[string]int{provider: 1}
 		registration.InfoByProvider[provider] = cloneModelInfo(model)
+		registration.infoClientByProvider[provider] = clientID
 	}
 	r.models[modelID] = registration
 	log.Debugf("Registered new model %s from provider %s", modelID, provider)
 }
 
-func (r *ModelRegistry) removeModelRegistration(clientID, modelID, provider string, now time.Time) {
+func (r *ModelRegistry) removeModelRegistration(clientID, modelID, provider string, now time.Time, clearClientState bool) {
 	registration, exists := r.models[modelID]
 	if !exists {
 		return
 	}
 	registration.Count--
 	registration.LastUpdated = now
-	if registration.QuotaExceededClients != nil {
+	if clearClientState && registration.QuotaExceededClients != nil {
 		delete(registration.QuotaExceededClients, clientID)
 	}
-	if registration.SuspendedClients != nil {
+	if clearClientState && registration.SuspendedClients != nil {
 		delete(registration.SuspendedClients, clientID)
 	}
 	if registration.Count < 0 {
@@ -549,6 +591,9 @@ func (r *ModelRegistry) removeModelRegistration(clientID, modelID, provider stri
 				delete(registration.Providers, provider)
 				if registration.InfoByProvider != nil {
 					delete(registration.InfoByProvider, provider)
+				}
+				if registration.infoClientByProvider != nil {
+					delete(registration.infoClientByProvider, provider)
 				}
 			} else {
 				registration.Providers[provider] = count - 1
@@ -629,8 +674,10 @@ func (r *ModelRegistry) unregisterClientInternal(clientID string) {
 		return
 	}
 
+	affectedModels := make(map[string]struct{}, len(models))
 	now := time.Now()
 	for _, modelID := range models {
+		affectedModels[modelID] = struct{}{}
 		if registration, isExists := r.models[modelID]; isExists {
 			registration.Count--
 			registration.LastUpdated = now
@@ -647,6 +694,9 @@ func (r *ModelRegistry) unregisterClientInternal(clientID string) {
 						delete(registration.Providers, provider)
 						if registration.InfoByProvider != nil {
 							delete(registration.InfoByProvider, provider)
+						}
+						if registration.infoClientByProvider != nil {
+							delete(registration.infoClientByProvider, provider)
 						}
 					} else {
 						registration.Providers[provider] = count - 1
@@ -669,10 +719,77 @@ func (r *ModelRegistry) unregisterClientInternal(clientID string) {
 	if hasProvider {
 		delete(r.clientProviders, clientID)
 	}
+	for modelID := range affectedModels {
+		r.rebindModelInfoOwnersLocked(modelID)
+	}
 	log.Debugf("Unregistered client %s", clientID)
 	// Separator line after completing client unregistration (after the summary line)
 	misc.LogCredentialSeparator()
 	r.triggerModelsUnregistered(provider, clientID)
+}
+
+func (r *ModelRegistry) rebindModelInfoOwnersLocked(modelID string) {
+	registration := r.models[modelID]
+	if registration == nil {
+		return
+	}
+	clientIDs := make([]string, 0, len(r.clientModelInfos))
+	for clientID := range r.clientModelInfos {
+		clientIDs = append(clientIDs, clientID)
+	}
+	sort.Strings(clientIDs)
+
+	clientModelInfo := func(clientID string) *ModelInfo {
+		if clientID == "" {
+			return nil
+		}
+		return r.clientModelInfos[clientID][modelID]
+	}
+	if clientModelInfo(registration.infoClientID) == nil {
+		registration.Info = nil
+		registration.infoClientID = ""
+		for _, clientID := range clientIDs {
+			if info := clientModelInfo(clientID); info != nil {
+				registration.Info = cloneModelInfo(info)
+				registration.infoClientID = clientID
+				break
+			}
+		}
+	}
+
+	if registration.InfoByProvider == nil {
+		registration.InfoByProvider = make(map[string]*ModelInfo)
+	}
+	if registration.infoClientByProvider == nil {
+		registration.infoClientByProvider = make(map[string]string)
+	}
+	for provider := range registration.InfoByProvider {
+		if registration.Providers == nil || registration.Providers[provider] <= 0 {
+			delete(registration.InfoByProvider, provider)
+			delete(registration.infoClientByProvider, provider)
+		}
+	}
+	for provider, count := range registration.Providers {
+		if count <= 0 {
+			continue
+		}
+		owner := registration.infoClientByProvider[provider]
+		if info := clientModelInfo(owner); info != nil && r.clientProviders[owner] == provider {
+			continue
+		}
+		delete(registration.InfoByProvider, provider)
+		delete(registration.infoClientByProvider, provider)
+		for _, clientID := range clientIDs {
+			if r.clientProviders[clientID] != provider {
+				continue
+			}
+			if info := clientModelInfo(clientID); info != nil {
+				registration.InfoByProvider[provider] = cloneModelInfo(info)
+				registration.infoClientByProvider[provider] = clientID
+				break
+			}
+		}
+	}
 }
 
 // SetModelQuotaExceeded marks a model as quota exceeded for a specific client
@@ -1356,4 +1473,14 @@ func (r *ModelRegistry) GetModelsForClient(clientID string) []*ModelInfo {
 		}
 	}
 	return result
+}
+
+// GetProviderForClient returns the provider currently registered for one client.
+func (r *ModelRegistry) GetProviderForClient(clientID string) string {
+	if r == nil || strings.TrimSpace(clientID) == "" {
+		return ""
+	}
+	r.mutex.RLock()
+	defer r.mutex.RUnlock()
+	return r.clientProviders[clientID]
 }

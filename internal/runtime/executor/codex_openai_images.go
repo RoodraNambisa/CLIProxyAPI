@@ -1,11 +1,11 @@
 package executor
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"strings"
@@ -20,9 +20,12 @@ import (
 )
 
 const (
-	codexOpenAIImageSourceFormat = "openai-image"
-	codexOpenAIImageGenerations  = "images/generations"
-	codexOpenAIImageEdits        = "images/edits"
+	codexOpenAIImageSourceFormat     = "openai-image"
+	codexOpenAIImageGenerations      = "images/generations"
+	codexOpenAIImageEdits            = "images/edits"
+	codexOpenAIImageMaxResponseBytes = 128 << 20
+	codexOpenAIImageMaxErrorBytes    = 1 << 20
+	codexOpenAIImageMaxSSEFrameBytes = 50 << 20
 )
 
 func isCodexOpenAIImageRequest(opts cliproxyexecutor.Options) bool {
@@ -38,6 +41,27 @@ func codexOpenAIImageEndpoint(opts cliproxyexecutor.Options) (string, error) {
 	default:
 		return "", statusErr{code: http.StatusBadRequest, msg: "unsupported native image endpoint"}
 	}
+}
+
+func readCodexOpenAIImageResponseBody(body io.Reader, maxBytes int64) ([]byte, error) {
+	if body == nil {
+		return nil, statusErr{code: http.StatusBadGateway, msg: "codex image response body is nil", skipAuthResult: true}
+	}
+	if maxBytes < 1 {
+		return nil, statusErr{code: http.StatusBadGateway, msg: "codex image response limit is invalid", skipAuthResult: true}
+	}
+	payload, err := io.ReadAll(io.LimitReader(body, maxBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(payload)) > maxBytes {
+		return nil, statusErr{
+			code:           http.StatusBadGateway,
+			msg:            fmt.Sprintf("codex image response exceeds %d bytes", maxBytes),
+			skipAuthResult: true,
+		}
+	}
+	return payload, nil
 }
 
 func codexPrepareOpenAIImageBody(req cliproxyexecutor.Request, stream bool) ([]byte, string, error) {
@@ -86,7 +110,7 @@ func (e *CodexExecutor) executeOpenAIImage(ctx context.Context, auth *cliproxyau
 		originalPayload = opts.OriginalRequest
 	}
 	url := strings.TrimSuffix(baseURL, "/") + endpoint
-	httpReq, upstreamBody, identityState, err := e.cacheHelper(ctx, sdktranslator.FromString(codexOpenAIImageSourceFormat), url, auth, req, originalPayload, body)
+	httpReq, upstreamBody, identityState, err := e.cacheHelper(ctx, sdktranslator.FromString(codexOpenAIImageSourceFormat), url, auth, req, originalPayload, body, true)
 	if err != nil {
 		return resp, err
 	}
@@ -109,7 +133,11 @@ func (e *CodexExecutor) executeOpenAIImage(ctx context.Context, auth *cliproxyau
 		}
 	}()
 	helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
-	data, readErr := io.ReadAll(httpResp.Body)
+	maxResponseBytes := int64(codexOpenAIImageMaxResponseBytes)
+	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
+		maxResponseBytes = codexOpenAIImageMaxErrorBytes
+	}
+	data, readErr := readCodexOpenAIImageResponseBody(httpResp.Body, maxResponseBytes)
 	if readErr != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, readErr)
 		return resp, readErr
@@ -153,7 +181,7 @@ func (e *CodexExecutor) executeOpenAIImageStream(ctx context.Context, auth *clip
 		originalPayload = opts.OriginalRequest
 	}
 	url := strings.TrimSuffix(baseURL, "/") + endpoint
-	httpReq, upstreamBody, identityState, err := e.cacheHelper(ctx, sdktranslator.FromString(codexOpenAIImageSourceFormat), url, auth, req, originalPayload, body)
+	httpReq, upstreamBody, identityState, err := e.cacheHelper(ctx, sdktranslator.FromString(codexOpenAIImageSourceFormat), url, auth, req, originalPayload, body, true)
 	if err != nil {
 		return nil, err
 	}
@@ -172,7 +200,7 @@ func (e *CodexExecutor) executeOpenAIImageStream(ctx context.Context, auth *clip
 	}
 	helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
-		data, readErr := io.ReadAll(httpResp.Body)
+		data, readErr := readCodexOpenAIImageResponseBody(httpResp.Body, codexOpenAIImageMaxErrorBytes)
 		if errClose := httpResp.Body.Close(); errClose != nil {
 			log.Errorf("codex executor: close native image response body error: %v", errClose)
 		}
@@ -197,28 +225,39 @@ func (e *CodexExecutor) executeOpenAIImageStream(ctx context.Context, auth *clip
 				log.Errorf("codex executor: close native image response body error: %v", errClose)
 			}
 		}()
-		reader := bufio.NewReaderSize(httpResp.Body, 64*1024)
+		frameBuffer := helps.NewSSEFrameBuffer(codexOpenAIImageMaxSSEFrameBytes)
+		readBuffer := make([]byte, 64*1024)
 		var streamUsage helps.StreamUsageBuffer
 		markerRequested := metadataBool(opts.Metadata, cliproxyexecutor.StreamTerminalMarkerMetadataKey)
 		protocolFailed := false
 		var protocolErr error
 		terminalSeen := false
 		for {
-			line, readErr := reader.ReadBytes('\n')
-			if len(line) > 0 {
-				upstreamLine := applyCodexIdentityConfuseResponsePayload(line, identityState)
-				helps.AppendAPIResponseChunk(ctx, e.cfg, upstreamLine)
-				streamUsage.ObserveOpenAIStream(upstreamLine)
-				clientLine := applyCodexIdentityExposeResponsePayload(upstreamLine, identityState)
-				if payload := helps.JSONPayload(clientLine); len(payload) > 0 && helps.IsJSONStreamProtocolError(payload) {
-					protocolFailed = true
-					if protocolErr == nil {
-						protocolErr = helps.JSONStreamProtocolError("codex image", payload)
+			bytesRead, readErr := httpResp.Body.Read(readBuffer)
+			frames, frameErr := frameBuffer.Feed(readBuffer[:bytesRead], errors.Is(readErr, io.EOF))
+			if frameErr != nil {
+				helps.RecordAPIResponseError(ctx, e.cfg, frameErr)
+				reporter.PublishFailure(ctx, frameErr)
+				_ = emitCodexOpenAIImageStreamChunk(ctx, out, cliproxyexecutor.StreamChunk{Err: frameErr})
+				return
+			}
+			for _, frame := range frames {
+				upstreamFrame := applyCodexIdentityConfuseResponsePayload(frame, identityState)
+				helps.AppendAPIResponseChunk(ctx, e.cfg, upstreamFrame)
+				clientFrame := applyCodexIdentityExposeResponsePayload(upstreamFrame, identityState)
+				terminal := false
+				for _, line := range helps.SplitSSEFrameLines(clientFrame) {
+					streamUsage.ObserveOpenAIStream(line)
+					if payload := helps.JSONPayload(line); len(payload) > 0 && helps.IsJSONStreamProtocolError(payload) {
+						protocolFailed = true
+						if protocolErr == nil {
+							protocolErr = helps.JSONStreamProtocolError("codex image", payload)
+						}
 					}
+					terminal = terminal || helps.IsOpenAIStreamTerminal(line) || codexSSEDataCompletion(line)
 				}
-				terminal := helps.IsOpenAIStreamTerminal(clientLine) || codexSSEDataCompletion(clientLine)
 				terminalSeen = terminalSeen || terminal
-				if !emitCodexOpenAIImageStreamChunk(ctx, out, cliproxyexecutor.StreamChunk{Payload: clientLine}) {
+				if !emitCodexOpenAIImageStreamChunk(ctx, out, cliproxyexecutor.StreamChunk{Payload: clientFrame}) {
 					return
 				}
 				if markerRequested && terminal && !protocolFailed && (readErr == nil || errors.Is(readErr, io.EOF)) {

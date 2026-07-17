@@ -244,6 +244,38 @@ func TestManager_Update_WithSkipStateCarryForwardClearsRuntimeState(t *testing.T
 	}
 }
 
+func TestManager_Update_WithForceRuntimeReplacementRetiresOldInstance(t *testing.T) {
+	m := NewManager(nil, nil, nil)
+	registered, err := m.Register(context.Background(), &Auth{
+		ID:       "auth-force-runtime-replacement",
+		Provider: "chatgpt-web",
+		Status:   StatusActive,
+		Attributes: map[string]string{
+			SourceHashAttributeKey: "same-hash",
+		},
+		Metadata: map[string]any{"account_id": "account-a"},
+	})
+	if err != nil {
+		t.Fatalf("register auth: %v", err)
+	}
+
+	updated, err := m.Update(WithForceRuntimeReplacement(context.Background()), &Auth{
+		ID:       registered.ID,
+		Provider: registered.Provider,
+		Status:   StatusActive,
+		Attributes: map[string]string{
+			SourceHashAttributeKey: "same-hash",
+		},
+		Metadata: map[string]any{"account_id": "account-b"},
+	})
+	if err != nil {
+		t.Fatalf("update auth: %v", err)
+	}
+	if updated.RuntimeInstanceID() == registered.RuntimeInstanceID() {
+		t.Fatal("forced replacement reused the old runtime instance")
+	}
+}
+
 func TestManager_Update_DisabledExistingDoesNotInheritModelStates(t *testing.T) {
 	m := NewManager(nil, nil, nil)
 
@@ -616,5 +648,68 @@ func TestManagerReplacementSkipsStaleLifecycleNotification(t *testing.T) {
 				t.Fatalf("update hook labels = %v, want [latest]", labels)
 			}
 		})
+	}
+}
+
+func TestManagerReplacementNotificationSurvivesRuntimeMetadataMutation(t *testing.T) {
+	const authID = "metadata-during-cleanup-hook-auth"
+	manager := NewManager(nil, nil, nil)
+	blocker := &blockingAuthCleanupExecutor{
+		schedulerProviderTestExecutor: schedulerProviderTestExecutor{provider: "initial"},
+		started:                       make(chan struct{}),
+		release:                       make(chan struct{}),
+	}
+	manager.RegisterExecutor(blocker)
+	manager.RegisterExecutor(schedulerProviderTestExecutor{provider: "middle"})
+	if _, err := manager.Register(t.Context(), &Auth{
+		ID:       authID,
+		Provider: "initial",
+		Label:    "initial",
+		Metadata: map[string]any{"session_id": "initial"},
+	}); err != nil {
+		t.Fatalf("Register() error = %v", err)
+	}
+
+	hook := &orderedAuthUpdateHook{}
+	manager.SetHook(hook)
+	updateDone := make(chan error, 1)
+	go func() {
+		_, err := manager.Update(t.Context(), &Auth{
+			ID:       authID,
+			Provider: "middle",
+			Label:    "middle",
+			Metadata: map[string]any{"session_id": "before"},
+		})
+		updateDone <- err
+	}()
+	select {
+	case <-blocker.started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("replacement did not enter cleanup")
+	}
+
+	current, ok := manager.GetByID(authID)
+	if !ok {
+		t.Fatal("replacement missing during cleanup")
+	}
+	if _, stillCurrent, err := manager.UpdateRuntimeMetadataIfCurrent(t.Context(), current, map[string]any{
+		"session_id": "after",
+	}); err != nil || !stillCurrent {
+		t.Fatalf("UpdateRuntimeMetadataIfCurrent() = current %v, err %v", stillCurrent, err)
+	}
+
+	close(blocker.release)
+	select {
+	case err := <-updateDone:
+		if err != nil {
+			t.Fatalf("Update() error = %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("replacement remained blocked")
+	}
+
+	labels := hook.Labels()
+	if len(labels) != 1 || labels[0] != "middle" {
+		t.Fatalf("update hook labels = %v, want [middle]", labels)
 	}
 }

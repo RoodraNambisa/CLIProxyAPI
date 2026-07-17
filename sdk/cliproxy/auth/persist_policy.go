@@ -4,6 +4,7 @@ import "context"
 
 type skipPersistContextKey struct{}
 type skipStateCarryForwardContextKey struct{}
+type forceRuntimeReplacementContextKey struct{}
 
 // WithSkipPersist returns a derived context that disables persistence for Manager Update/Register calls.
 // It is intended for code paths that are reacting to file watcher events, where the file on disk is
@@ -24,6 +25,16 @@ func WithSkipStateCarryForward(ctx context.Context) context.Context {
 	return context.WithValue(ctx, skipStateCarryForwardContextKey{}, true)
 }
 
+// WithForceRuntimeReplacement returns a derived context that prevents an
+// existing runtime instance from being reused during an auth update, register,
+// or conditional update.
+func WithForceRuntimeReplacement(ctx context.Context) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, forceRuntimeReplacementContextKey{}, true)
+}
+
 func shouldSkipPersist(ctx context.Context) bool {
 	if ctx == nil {
 		return false
@@ -38,6 +49,15 @@ func shouldSkipStateCarryForward(ctx context.Context) bool {
 		return false
 	}
 	v := ctx.Value(skipStateCarryForwardContextKey{})
+	enabled, ok := v.(bool)
+	return ok && enabled
+}
+
+func shouldForceRuntimeReplacement(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+	v := ctx.Value(forceRuntimeReplacementContextKey{})
 	enabled, ok := v.(bool)
 	return ok && enabled
 }

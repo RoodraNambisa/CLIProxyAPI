@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -1079,6 +1080,39 @@ func TestWrapStreamResultNormalizesProducerCancellationAfterRetirement(t *testin
 	}
 }
 
+func TestWrapStreamResultPreservesBootstrapCommitMarker(t *testing.T) {
+	manager := NewManager(nil, nil, nil)
+	auth := &Auth{ID: "bootstrap-marker-auth", Provider: "xai", Status: StatusActive}
+	remaining := make(chan cliproxyexecutor.StreamChunk)
+	close(remaining)
+	result := manager.wrapStreamResult(
+		t.Context(),
+		t.Context(),
+		auth,
+		nil,
+		"xai",
+		"model",
+		"model",
+		cliproxyexecutor.Options{},
+		nil,
+		[]cliproxyexecutor.StreamChunk{
+			{Payload: []byte(": pending\n\n")},
+			cliproxyexecutor.BootstrapCommitStreamChunk(),
+		},
+		remaining,
+		OAuthModelAliasResult{},
+		nil,
+	)
+	var chunks []cliproxyexecutor.StreamChunk
+	for chunk := range result.Chunks {
+		chunks = append(chunks, chunk)
+	}
+	if len(chunks) != 2 || string(chunks[0].Payload) != ": pending\n\n" ||
+		!cliproxyexecutor.IsBootstrapCommitStreamChunk(chunks[1]) {
+		t.Fatalf("downstream chunks = %#v", chunks)
+	}
+}
+
 func TestManagerLoadSkipsDurablyQuarantinedAuthFile(t *testing.T) {
 	authDir := t.TempDir()
 	path := filepath.Join(authDir, "quarantined.json")
@@ -1185,6 +1219,93 @@ func TestReadStreamBootstrapReturnsOnEmptyTerminal(t *testing.T) {
 		t.Fatalf("readStreamBootstrap() error = %v", err)
 	}
 	if !closed || len(buffered) != 1 || !cliproxyexecutor.IsSuccessfulStreamTerminalChunk(buffered[0]) {
+		t.Fatalf("bootstrap = %#v, closed=%t", buffered, closed)
+	}
+	if !streamBootstrapHasSuccessfulTerminal(buffered) {
+		t.Fatal("successful terminal marker was not recognized")
+	}
+}
+
+func TestReadStreamBootstrapDiscardsCompleteCommentBeforeError(t *testing.T) {
+	wantErr := errors.New("provider failed")
+	remaining := make(chan cliproxyexecutor.StreamChunk, 2)
+	remaining <- cliproxyexecutor.StreamChunk{Payload: []byte(": pending\n\n")}
+	remaining <- cliproxyexecutor.StreamChunk{Err: wantErr}
+	close(remaining)
+
+	buffered, closed, err := readStreamBootstrap(t.Context(), remaining)
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("readStreamBootstrap() error = %v, want %v", err, wantErr)
+	}
+	if closed || len(buffered) != 0 {
+		t.Fatalf("bootstrap = %#v, closed=%t", buffered, closed)
+	}
+}
+
+func TestReadStreamBootstrapBuffersSplitCommentUntilSemanticPayload(t *testing.T) {
+	remaining := make(chan cliproxyexecutor.StreamChunk, 3)
+	remaining <- cliproxyexecutor.StreamChunk{Payload: []byte(": pend")}
+	remaining <- cliproxyexecutor.StreamChunk{Payload: []byte("ing\n\n")}
+	remaining <- cliproxyexecutor.StreamChunk{Payload: []byte("data: {\"type\":\"response.completed\"}\n\n")}
+	close(remaining)
+
+	buffered, closed, err := readStreamBootstrap(t.Context(), remaining)
+	if err != nil {
+		t.Fatalf("readStreamBootstrap() error = %v", err)
+	}
+	if closed || len(buffered) != 3 {
+		t.Fatalf("bootstrap = %#v, closed=%t", buffered, closed)
+	}
+	if !bytes.Contains(buffered[2].Payload, []byte("response.completed")) {
+		t.Fatalf("semantic payload = %q", buffered[2].Payload)
+	}
+}
+
+func TestReadStreamBootstrapRestoresBoundaryBeforeSSEField(t *testing.T) {
+	remaining := make(chan cliproxyexecutor.StreamChunk, 2)
+	remaining <- cliproxyexecutor.StreamChunk{Payload: []byte(": pending")}
+	remaining <- cliproxyexecutor.StreamChunk{Payload: []byte("data: {\"type\":\"response.completed\"}\n\n")}
+	close(remaining)
+
+	buffered, closed, err := readStreamBootstrap(t.Context(), remaining)
+	if err != nil {
+		t.Fatalf("readStreamBootstrap() error = %v", err)
+	}
+	if closed || len(buffered) != 2 {
+		t.Fatalf("bootstrap = %#v, closed=%t", buffered, closed)
+	}
+	if !streamBootstrapHasSemanticPayload(buffered) {
+		t.Fatalf("split SSE field was not recognized as semantic payload: %#v", buffered)
+	}
+}
+
+func TestReadStreamBootstrapReturnsOnExplicitCommentCommit(t *testing.T) {
+	remaining := make(chan cliproxyexecutor.StreamChunk, 3)
+	remaining <- cliproxyexecutor.StreamChunk{Payload: []byte(": pending\n\n")}
+	remaining <- cliproxyexecutor.BootstrapCommitStreamChunk()
+	remaining <- cliproxyexecutor.StreamChunk{Err: errors.New("late failure")}
+	close(remaining)
+
+	buffered, closed, err := readStreamBootstrap(t.Context(), remaining)
+	if err != nil {
+		t.Fatalf("readStreamBootstrap() error = %v", err)
+	}
+	if closed || len(buffered) != 2 || !cliproxyexecutor.IsBootstrapCommitStreamChunk(buffered[1]) {
+		t.Fatalf("bootstrap = %#v, closed=%t", buffered, closed)
+	}
+}
+
+func TestReadStreamBootstrapBoundsIncompletePreamble(t *testing.T) {
+	remaining := make(chan cliproxyexecutor.StreamChunk, 2)
+	remaining <- cliproxyexecutor.StreamChunk{Payload: bytes.Repeat([]byte(":"), 40<<10)}
+	remaining <- cliproxyexecutor.StreamChunk{Payload: bytes.Repeat([]byte(":"), 40<<10)}
+	close(remaining)
+
+	buffered, closed, err := readStreamBootstrap(t.Context(), remaining)
+	if err != nil {
+		t.Fatalf("readStreamBootstrap() error = %v", err)
+	}
+	if closed || len(buffered) != 3 || !cliproxyexecutor.IsBootstrapCommitStreamChunk(buffered[2]) {
 		t.Fatalf("bootstrap = %#v, closed=%t", buffered, closed)
 	}
 }

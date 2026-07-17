@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -23,6 +24,17 @@ type requestPrepareStore struct {
 	saveStart chan struct{}
 	saveGate  chan struct{}
 	saveOnce  sync.Once
+}
+
+type requestPrepareDoneObservedContext struct {
+	context.Context
+	once     sync.Once
+	observed chan struct{}
+}
+
+func (ctx *requestPrepareDoneObservedContext) Done() <-chan struct{} {
+	ctx.once.Do(func() { close(ctx.observed) })
+	return ctx.Context.Done()
 }
 
 func (s *requestPrepareStore) List(context.Context) ([]*Auth, error) {
@@ -77,17 +89,32 @@ func (s *requestPrepareStore) setItems(items ...*Auth) {
 }
 
 type requestPrepareExecutor struct {
-	prepareCalls    atomic.Int32
-	refreshCalls    atomic.Int32
-	unauthorizedOne atomic.Bool
-	prepareStart    chan struct{}
-	prepareGate     chan struct{}
-	prepareErr      error
-	updateOnError   bool
+	prepareCalls         atomic.Int32
+	refreshCalls         atomic.Int32
+	unauthorizedOne      atomic.Bool
+	runtime401One        atomic.Bool
+	prepareStart         chan struct{}
+	prepareGate          chan struct{}
+	prepareErr           error
+	updateOnError        bool
+	preparedRefreshToken string
+}
+
+type chatGPTWebRequestPrepareExecutor struct {
+	*requestPrepareExecutor
 }
 
 type requestPreparePersistError struct {
 	err error
+}
+
+type runtimeMetadataUpdateHook struct {
+	NoopHook
+	updates atomic.Int32
+}
+
+func (h *runtimeMetadataUpdateHook) OnAuthUpdated(context.Context, *Auth) {
+	h.updates.Add(1)
 }
 
 func (e requestPreparePersistError) Error() string { return e.err.Error() }
@@ -97,6 +124,8 @@ func (requestPreparePersistError) PersistAuthUpdateOnError() bool {
 }
 
 func (*requestPrepareExecutor) Identifier() string { return "antigravity" }
+
+func (*chatGPTWebRequestPrepareExecutor) Identifier() string { return "chatgpt-web" }
 
 func (*requestPrepareExecutor) ShouldPrepareRequestAuth(auth *Auth) bool {
 	return auth == nil || requestPrepareString(auth.Metadata["project_id"]) == ""
@@ -134,19 +163,28 @@ func (e *requestPrepareExecutor) PrepareRequestAuth(ctx context.Context, auth *A
 		updated.Metadata = make(map[string]any)
 	}
 	updated.Metadata["project_id"] = "prepared-project"
+	if e.preparedRefreshToken != "" {
+		updated.Metadata["refresh_token"] = e.preparedRefreshToken
+	}
 	return updated, nil
 }
 
-func (*requestPrepareExecutor) Execute(_ context.Context, auth *Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+func (e *requestPrepareExecutor) Execute(_ context.Context, auth *Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
 	if requestPrepareString(auth.Metadata["project_id"]) != "prepared-project" {
 		return cliproxyexecutor.Response{}, &Error{HTTPStatus: http.StatusBadRequest, Message: "missing prepared project"}
+	}
+	if e.runtime401One.CompareAndSwap(true, false) {
+		return cliproxyexecutor.Response{}, &Error{HTTPStatus: http.StatusUnauthorized, Message: "runtime access token expired"}
 	}
 	return cliproxyexecutor.Response{Payload: []byte("execute")}, nil
 }
 
-func (*requestPrepareExecutor) ExecuteStream(_ context.Context, auth *Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
+func (e *requestPrepareExecutor) ExecuteStream(_ context.Context, auth *Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
 	if requestPrepareString(auth.Metadata["project_id"]) != "prepared-project" {
 		return nil, &Error{HTTPStatus: http.StatusBadRequest, Message: "missing prepared project"}
+	}
+	if e.runtime401One.CompareAndSwap(true, false) {
+		return nil, &Error{HTTPStatus: http.StatusUnauthorized, Message: "runtime access token expired"}
 	}
 	chunks := make(chan cliproxyexecutor.StreamChunk, 1)
 	chunks <- cliproxyexecutor.StreamChunk{Payload: []byte("stream")}
@@ -154,9 +192,12 @@ func (*requestPrepareExecutor) ExecuteStream(_ context.Context, auth *Auth, _ cl
 	return &cliproxyexecutor.StreamResult{Chunks: chunks}, nil
 }
 
-func (*requestPrepareExecutor) CountTokens(_ context.Context, auth *Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+func (e *requestPrepareExecutor) CountTokens(_ context.Context, auth *Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
 	if requestPrepareString(auth.Metadata["project_id"]) != "prepared-project" {
 		return cliproxyexecutor.Response{}, &Error{HTTPStatus: http.StatusBadRequest, Message: "missing prepared project"}
+	}
+	if e.runtime401One.CompareAndSwap(true, false) {
+		return cliproxyexecutor.Response{}, &Error{HTTPStatus: http.StatusUnauthorized, Message: "runtime access token expired"}
 	}
 	return cliproxyexecutor.Response{Payload: []byte("count")}, nil
 }
@@ -238,6 +279,54 @@ func TestManagerRefreshesOnceWhenRequestAuthPreparationReturnsUnauthorized(t *te
 	}
 }
 
+func TestManagerPreparationRefreshConsumesPerRequestUnauthorizedRefresh(t *testing.T) {
+	testCases := []struct {
+		name   string
+		invoke func(context.Context, *Manager, string) error
+	}{
+		{
+			name: "execute",
+			invoke: func(ctx context.Context, manager *Manager, model string) error {
+				_, err := manager.Execute(ctx, []string{"antigravity"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
+				return err
+			},
+		},
+		{
+			name: "count_tokens",
+			invoke: func(ctx context.Context, manager *Manager, model string) error {
+				_, err := manager.ExecuteCount(ctx, []string{"antigravity"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
+				return err
+			},
+		},
+		{
+			name: "stream",
+			invoke: func(ctx context.Context, manager *Manager, model string) error {
+				_, err := manager.ExecuteStream(ctx, []string{"antigravity"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
+				return err
+			},
+		},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			manager, _, executor, _, model := newRequestPrepareManager(t, "single-refresh-"+testCase.name, nil, nil)
+			executor.unauthorizedOne.Store(true)
+			executor.runtime401One.Store(true)
+
+			err := testCase.invoke(t.Context(), manager, model)
+			if statusCodeFromError(err) != http.StatusUnauthorized {
+				t.Fatalf("request error = %v, want runtime 401", err)
+			}
+			if got := executor.refreshCalls.Load(); got != 1 {
+				t.Fatalf("Refresh() calls = %d, want 1", got)
+			}
+			if got := executor.prepareCalls.Load(); got != 2 {
+				t.Fatalf("PrepareRequestAuth() calls = %d, want 2", got)
+			}
+		})
+	}
+}
+
 func TestManagerRequestAuthPreparationCancellationDoesNotMarkCredentialFailure(t *testing.T) {
 	prepareStart := make(chan struct{}, 1)
 	prepareGate := make(chan struct{})
@@ -266,6 +355,163 @@ func TestManagerRequestAuthPreparationCancellationDoesNotMarkCredentialFailure(t
 	}
 	if current.LastError != nil || current.Unavailable {
 		t.Fatalf("canceled preparation polluted auth state: %#v", current)
+	}
+}
+
+func TestManagerChatGPTWebPreparationInstallsRotatedTokenAfterCallerCancellation(t *testing.T) {
+	prepareStart := make(chan struct{}, 1)
+	prepareGate := make(chan struct{})
+	store := &requestPrepareStore{}
+	baseExecutor := &requestPrepareExecutor{
+		prepareStart:         prepareStart,
+		prepareGate:          prepareGate,
+		preparedRefreshToken: "rotated-refresh-token",
+	}
+	executor := &chatGPTWebRequestPrepareExecutor{requestPrepareExecutor: baseExecutor}
+	manager := NewManager(store, nil, nil)
+	manager.RegisterExecutor(executor)
+	registered, err := manager.Register(WithSkipPersist(t.Context()), &Auth{
+		ID:         "chatgpt-web-request-prepare-cancel",
+		Provider:   "chatgpt-web",
+		FileName:   "chatgpt-web-request-prepare-cancel.json",
+		Attributes: map[string]string{SourceHashAttributeKey: "chatgpt-web-request-prepare-source"},
+		Metadata: map[string]any{
+			"access_token":    "stale-token",
+			"refresh_token":   "original-refresh-token",
+			"lifecycle_state": LifecycleStateActive,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	originalInstanceID := registered.RuntimeInstanceID()
+
+	requestCtx, cancelRequest := context.WithCancel(t.Context())
+	result := make(chan error, 1)
+	go func() {
+		_, errPrepare := manager.prepareRequestAuth(requestCtx, executor, registered)
+		result <- errPrepare
+	}()
+	waitRequestPrepareStarted(t, prepareStart)
+	cancelRequest()
+	select {
+	case errPrepare := <-result:
+		if !errors.Is(errPrepare, context.Canceled) {
+			t.Fatalf("prepareRequestAuth() error = %v, want context canceled", errPrepare)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("canceled ChatGPT Web preparation did not return")
+	}
+
+	close(prepareGate)
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		current, ok := manager.GetByID(registered.ID)
+		stored := store.lastAuth()
+		_, lockRetained := manager.requestPrepareLocks.Load(registered.ID)
+		if ok && requestPrepareString(current.Metadata["refresh_token"]) == "rotated-refresh-token" &&
+			stored != nil && requestPrepareString(stored.Metadata["refresh_token"]) == "rotated-refresh-token" &&
+			!lockRetained {
+			if current.RuntimeInstanceID() != originalInstanceID {
+				t.Fatalf("refresh-token rotation replaced runtime instance: got %q, want %q", current.RuntimeInstanceID(), originalInstanceID)
+			}
+			_, release, active := registered.BeginRuntimeExecution(t.Context())
+			if !active {
+				t.Fatal("refresh-token rotation retired the existing runtime instance")
+			}
+			release()
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("detached ChatGPT Web preparation was not installed or released: runtime=%#v stored=%#v", current, stored)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if got := baseExecutor.prepareCalls.Load(); got != 1 {
+		t.Fatalf("PrepareRequestAuth() calls = %d, want 1", got)
+	}
+}
+
+func TestManagerChatGPTWebPreparationSharesDetachedWorker(t *testing.T) {
+	prepareStart := make(chan struct{}, 1)
+	prepareGate := make(chan struct{})
+	store := &requestPrepareStore{}
+	baseExecutor := &requestPrepareExecutor{
+		prepareStart:         prepareStart,
+		prepareGate:          prepareGate,
+		preparedRefreshToken: "rotated-refresh-token",
+	}
+	executor := &chatGPTWebRequestPrepareExecutor{requestPrepareExecutor: baseExecutor}
+	manager := NewManager(store, nil, nil)
+	manager.RegisterExecutor(executor)
+	registered, err := manager.Register(WithSkipPersist(t.Context()), &Auth{
+		ID:         "chatgpt-web-shared-request-prepare",
+		Provider:   "chatgpt-web",
+		FileName:   "chatgpt-web-shared-request-prepare.json",
+		Attributes: map[string]string{SourceHashAttributeKey: "chatgpt-web-shared-request-prepare-source"},
+		Metadata: map[string]any{
+			"access_token":    "stale-token",
+			"refresh_token":   "original-refresh-token",
+			"lifecycle_state": LifecycleStateActive,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	firstResult := make(chan error, 1)
+	go func() {
+		_, errPrepare := manager.prepareRequestAuth(t.Context(), executor, registered)
+		firstResult <- errPrepare
+	}()
+	waitRequestPrepareStarted(t, prepareStart)
+
+	waiterBase, cancelWaiter := context.WithCancel(t.Context())
+	waiterCtx := &requestPrepareDoneObservedContext{Context: waiterBase, observed: make(chan struct{})}
+	waiterResult := make(chan error, 1)
+	go func() {
+		_, errPrepare := manager.prepareRequestAuth(waiterCtx, executor, registered)
+		waiterResult <- errPrepare
+	}()
+	select {
+	case <-waiterCtx.observed:
+	case <-time.After(time.Second):
+		t.Fatal("second preparation did not join the shared worker")
+	}
+
+	lockValue, ok := manager.requestPrepareLocks.Load(registered.ID)
+	lock, _ := lockValue.(*requestAuthPrepareLock)
+	if !ok || lock == nil {
+		t.Fatal("request preparation lock is missing")
+	}
+	manager.requestPrepareLocksMu.Lock()
+	active := lock.active
+	manager.requestPrepareLocksMu.Unlock()
+	if active != 1 {
+		t.Fatalf("active preparation workers = %d, want one", active)
+	}
+
+	cancelWaiter()
+	select {
+	case errPrepare := <-waiterResult:
+		if !errors.Is(errPrepare, context.Canceled) {
+			t.Fatalf("canceled waiter error = %v", errPrepare)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("canceled waiter did not return")
+	}
+
+	close(prepareGate)
+	select {
+	case errPrepare := <-firstResult:
+		if errPrepare != nil {
+			t.Fatalf("shared preparation error: %v", errPrepare)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("shared preparation did not finish")
+	}
+	if got := baseExecutor.prepareCalls.Load(); got != 1 {
+		t.Fatalf("PrepareRequestAuth() calls = %d, want one", got)
 	}
 }
 
@@ -677,6 +923,153 @@ func TestUpdateIfCurrentPersistsMatchingAuth(t *testing.T) {
 	}
 	if stored := store.lastAuth(); stored == nil || requestPrepareString(stored.Metadata["access_token"]) != "background-token" {
 		t.Fatalf("persisted auth = %v, want background-token", stored)
+	}
+}
+
+func TestUpdateRuntimeMetadataIfCurrentPreservesInstallationAndSkipsHooks(t *testing.T) {
+	store := &requestPrepareStore{}
+	hook := &runtimeMetadataUpdateHook{}
+	manager := NewManager(store, nil, hook)
+	registered, errRegister := manager.Register(WithSkipPersist(t.Context()), &Auth{
+		ID:       "runtime-metadata-current",
+		Provider: "chatgpt-web",
+		Status:   StatusActive,
+		Attributes: map[string]string{
+			SourceHashAttributeKey: "runtime-metadata-source",
+		},
+		Metadata: map[string]any{
+			"access_token":    "token",
+			"lifecycle_state": LifecycleStateActive,
+			"session_id":      "old-session",
+		},
+	})
+	if errRegister != nil {
+		t.Fatalf("Register() error: %v", errRegister)
+	}
+
+	installed, current, errUpdate := manager.UpdateRuntimeMetadataIfCurrent(t.Context(), registered, map[string]any{
+		"session_id": "new-session",
+	})
+	if errUpdate != nil {
+		t.Fatalf("UpdateRuntimeMetadataIfCurrent() error: %v", errUpdate)
+	}
+	if !current || installed == nil {
+		t.Fatalf("UpdateRuntimeMetadataIfCurrent() = (%v, %v), want current install", installed, current)
+	}
+	if got := requestPrepareString(installed.Metadata["session_id"]); got != "new-session" {
+		t.Fatalf("session_id = %q, want new-session", got)
+	}
+	if !requestPreparationMatchesCurrent(installed, registered) {
+		t.Fatal("runtime metadata update replaced the auth installation")
+	}
+	if got := hook.updates.Load(); got != 0 {
+		t.Fatalf("auth update hook calls = %d, want 0", got)
+	}
+	if stored := store.lastAuth(); stored == nil || requestPrepareString(stored.Metadata["session_id"]) != "new-session" {
+		t.Fatalf("persisted auth = %#v, want new-session", stored)
+	}
+}
+
+func TestUpdateRuntimeMetadataIfCurrentSynchronizesPersistedSourceHash(t *testing.T) {
+	authPath := filepath.Join(t.TempDir(), "chatgpt-web.json")
+	store := &hashingFileStore{baseDir: filepath.Dir(authPath)}
+	manager := NewManager(store, nil, nil)
+	initial := &Auth{
+		ID:       "runtime-metadata-source-hash",
+		Provider: "chatgpt-web",
+		FileName: authPath,
+		Status:   StatusActive,
+		Attributes: map[string]string{
+			"path": authPath,
+		},
+		Metadata: map[string]any{
+			"access_token":    "opaque-token",
+			"email":           "person@example.com",
+			"lifecycle_state": LifecycleStateActive,
+			"session_id":      "before",
+		},
+	}
+	raw, errCanonical := CanonicalMetadataBytes(initial)
+	if errCanonical != nil {
+		t.Fatalf("CanonicalMetadataBytes() error: %v", errCanonical)
+	}
+	SetSourceHashAttribute(initial, raw)
+	registered, errRegister := manager.Register(WithSkipPersist(t.Context()), initial)
+	if errRegister != nil {
+		t.Fatalf("Register() error: %v", errRegister)
+	}
+	originalHash := authSourceHash(registered)
+
+	installed, current, errUpdate := manager.UpdateRuntimeMetadataIfCurrent(t.Context(), registered, map[string]any{
+		"session_id": "after",
+	})
+	if errUpdate != nil {
+		t.Fatalf("first UpdateRuntimeMetadataIfCurrent() error: %v", errUpdate)
+	}
+	if !current || installed == nil {
+		t.Fatalf("first UpdateRuntimeMetadataIfCurrent() = (%v, %v), want current install", installed, current)
+	}
+	if got := authSourceHash(installed); got == "" || got == originalHash {
+		t.Fatalf("persisted source hash = %q, original %q", got, originalHash)
+	}
+	latest, ok := manager.GetByID(initial.ID)
+	if !ok || latest == nil || authSourceHash(latest) != authSourceHash(installed) {
+		t.Fatalf("current source hash = %q, installed %q", authSourceHash(latest), authSourceHash(installed))
+	}
+
+	second, current, errUpdate := manager.UpdateRuntimeMetadataIfCurrent(t.Context(), registered, map[string]any{
+		"device_id": "device-after",
+	})
+	if errUpdate != nil {
+		t.Fatalf("second UpdateRuntimeMetadataIfCurrent() error: %v", errUpdate)
+	}
+	if !current || second == nil {
+		t.Fatalf("second UpdateRuntimeMetadataIfCurrent() = (%v, %v), want same-installation merge", second, current)
+	}
+	if got := requestPrepareString(second.Metadata["device_id"]); got != "device-after" {
+		t.Fatalf("device_id = %q, want device-after", got)
+	}
+}
+
+func TestUpdateRuntimeMetadataIfCurrentRejectsStaleInstallation(t *testing.T) {
+	manager, _, _, authID, _ := newRequestPrepareManager(t, "runtime-metadata-stale", nil, nil)
+	expected, ok := manager.GetByID(authID)
+	if !ok {
+		t.Fatal("expected registered auth")
+	}
+	replacement := expected.Clone()
+	replacement.Attributes[SourceHashAttributeKey] = "runtime-metadata-replacement"
+	replacement.Metadata["session_id"] = "replacement-session"
+	if _, errUpdate := manager.Update(WithSkipPersist(t.Context()), replacement); errUpdate != nil {
+		t.Fatalf("Update() error: %v", errUpdate)
+	}
+
+	installed, current, errUpdate := manager.UpdateRuntimeMetadataIfCurrent(t.Context(), expected, map[string]any{
+		"session_id": "stale-session",
+	})
+	if errUpdate != nil {
+		t.Fatalf("UpdateRuntimeMetadataIfCurrent() error: %v", errUpdate)
+	}
+	if current || installed != nil {
+		t.Fatalf("UpdateRuntimeMetadataIfCurrent() = (%v, %v), want stale rejection", installed, current)
+	}
+	installed, current, errUpdate = manager.UpdateRuntimeMetadataIfCurrent(t.Context(), expected, nil)
+	if errUpdate != nil {
+		t.Fatalf("empty UpdateRuntimeMetadataIfCurrent() error: %v", errUpdate)
+	}
+	if current || installed != nil {
+		t.Fatalf("empty UpdateRuntimeMetadataIfCurrent() = (%v, %v), want stale rejection", installed, current)
+	}
+	installed, current, errUpdate = manager.MutateRuntimeMetadataIfCurrent(t.Context(), expected, nil)
+	if errUpdate != nil {
+		t.Fatalf("nil MutateRuntimeMetadataIfCurrent() error: %v", errUpdate)
+	}
+	if current || installed != nil {
+		t.Fatalf("nil MutateRuntimeMetadataIfCurrent() = (%v, %v), want stale rejection", installed, current)
+	}
+	latest, _ := manager.GetByID(authID)
+	if got := requestPrepareString(latest.Metadata["session_id"]); got != "replacement-session" {
+		t.Fatalf("session_id = %q, want replacement-session", got)
 	}
 }
 

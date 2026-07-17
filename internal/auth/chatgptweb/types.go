@@ -1,6 +1,8 @@
 package chatgptweb
 
 import (
+	"bytes"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -88,12 +90,30 @@ type Credential struct {
 	Expired            string         `json:"expired"`
 	Cookies            []Cookie       `json:"cookies"`
 	Persona            Persona        `json:"persona"`
+	DeviceID           string         `json:"device_id,omitempty"`
+	SessionID          string         `json:"session_id,omitempty"`
 	LifecycleState     LifecycleState `json:"lifecycle_state"`
 	LifecycleReason    string         `json:"lifecycle_reason"`
 	LifecycleUpdatedAt string         `json:"lifecycle_updated_at"`
 	LastLoginAt        string         `json:"last_login_at"`
 	LastRefreshAt      string         `json:"last_refresh_at"`
 	LastReloginAt      string         `json:"last_relogin_at"`
+}
+
+// CredentialRuntimeIdentityReader derives stable runtime identity bytes for
+// credentials created before device and session IDs were persisted.
+func CredentialRuntimeIdentityReader(authID string, credential *Credential) io.Reader {
+	email := ""
+	if credential != nil {
+		email = strings.ToLower(strings.TrimSpace(credential.Email))
+	}
+	authID = strings.TrimSpace(authID)
+	deviceSeed := sha256.Sum256([]byte("chatgpt-web-device:" + authID + ":" + email))
+	sessionSeed := sha256.Sum256([]byte("chatgpt-web-session:" + authID + ":" + email))
+	seed := make([]byte, 0, len(deviceSeed)+len(sessionSeed))
+	seed = append(seed, deviceSeed[:]...)
+	seed = append(seed, sessionSeed[:]...)
+	return bytes.NewReader(seed)
 }
 
 func DecodeCredential(data []byte) (*Credential, error) {
@@ -134,6 +154,8 @@ func (credential *Credential) ApplyToMetadata(metadata map[string]any) {
 	metadata["expired"] = credential.Expired
 	metadata["cookies"] = credential.Cookies
 	metadata["persona"] = normalizePersona(credential.Persona)
+	metadata["device_id"] = credential.DeviceID
+	metadata["session_id"] = credential.SessionID
 	metadata["lifecycle_state"] = string(credential.LifecycleState)
 	metadata["lifecycle_reason"] = credential.LifecycleReason
 	metadata["lifecycle_updated_at"] = credential.LifecycleUpdatedAt

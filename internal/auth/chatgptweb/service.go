@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/url"
 	"strings"
@@ -65,6 +66,11 @@ func (service *Service) Login(ctx context.Context, input LoginInput) (*Credentia
 		service.applyFailure(credential, authError, input.Relogin)
 		return credential, authError
 	}
+	if err := EnsureCredentialRuntimeIDsForURL(credential, service.options.Rand, service.options.AuthBaseURL); err != nil {
+		authError := newAuthError("random_generation_failed", pendingState, 0, false, true, "initialize browser identity", err)
+		service.applyFailure(credential, authError, input.Relogin)
+		return credential, authError
+	}
 
 	acquisitionContext, cancel := service.acquisitionContext(ctx)
 	defer cancel()
@@ -76,12 +82,13 @@ func (service *Service) Login(ctx context.Context, input LoginInput) (*Credentia
 	}
 	defer client.CloseIdleConnections()
 
-	pkce, state, nonce, deviceID, err := service.oauthValues()
+	pkce, state, nonce, err := service.oauthValues()
 	if err != nil {
 		authError := newAuthError("random_generation_failed", pendingState, 0, false, true, "initialize OAuth request", err)
 		service.applyFailure(credential, authError, input.Relogin)
 		return credential, authError
 	}
+	deviceID := strings.TrimSpace(credential.DeviceID)
 	if err := client.SetCookie(service.options.AuthBaseURL, "oai-did", deviceID); err != nil {
 		authError := newAuthError("cookie_initialization_failed", pendingState, 0, false, true, "initialize device cookie", err)
 		service.applyFailure(credential, authError, input.Relogin)
@@ -248,6 +255,11 @@ func (service *Service) Refresh(ctx context.Context, credential Credential, prox
 	}
 
 	service.updateLifecycle(refreshed, LifecycleRefreshing, "")
+	if err := EnsureCredentialRuntimeIDsForURL(refreshed, service.options.Rand, service.options.AuthBaseURL); err != nil {
+		authError := newAuthError("random_generation_failed", LifecycleActive, 0, false, true, "initialize browser identity", err)
+		service.applyFailure(refreshed, authError, false)
+		return refreshed, authError
+	}
 	acquisitionContext, cancel := service.acquisitionContext(ctx)
 	defer cancel()
 	client, err := NewClient(refreshed.Persona, proxyURL, refreshed.Cookies)
@@ -257,6 +269,11 @@ func (service *Service) Refresh(ctx context.Context, credential Credential, prox
 		return refreshed, authError
 	}
 	defer client.CloseIdleConnections()
+	if err := client.SetCookie(service.options.AuthBaseURL, "oai-did", refreshed.DeviceID); err != nil {
+		authError := newAuthError("cookie_initialization_failed", LifecycleActive, 0, false, true, "initialize device cookie", err)
+		service.applyFailure(refreshed, authError, false)
+		return refreshed, authError
+	}
 
 	form := url.Values{
 		"grant_type":    {"refresh_token"},
@@ -301,6 +318,41 @@ func (service *Service) Refresh(ctx context.Context, credential Credential, prox
 	refreshed.LastRefreshAt = service.timestamp()
 	service.updateLifecycle(refreshed, LifecycleActive, "")
 	return refreshed, nil
+}
+
+// EnsureCredentialRuntimeIDs restores or creates the stable browser identity
+// fields required by login, refresh, and runtime requests.
+func EnsureCredentialRuntimeIDs(credential *Credential, reader io.Reader) error {
+	return EnsureCredentialRuntimeIDsForURL(credential, reader, AuthBaseURL)
+}
+
+// EnsureCredentialRuntimeIDsForURL restores a scoped device cookie or creates
+// the stable browser identity required for the supplied ChatGPT origin.
+func EnsureCredentialRuntimeIDsForURL(credential *Credential, reader io.Reader, rawURL string) error {
+	if credential == nil {
+		return nil
+	}
+	if strings.TrimSpace(credential.DeviceID) == "" {
+		deviceID, err := credentialCookieValueForURL(credential.Cookies, rawURL, "oai-did")
+		if err != nil {
+			return err
+		}
+		credential.DeviceID = deviceID
+	}
+	var err error
+	if strings.TrimSpace(credential.DeviceID) == "" {
+		credential.DeviceID, err = GenerateDeviceID(reader)
+		if err != nil {
+			return err
+		}
+	}
+	if strings.TrimSpace(credential.SessionID) == "" {
+		credential.SessionID, err = GenerateDeviceID(reader)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (service *Service) finishLogin(ctx context.Context, client *Client, credential *Credential, relogin bool, code, verifier string) (*Credential, error) {
@@ -443,24 +495,20 @@ func (service *Service) apiHeaders(deviceID, referer, sentinelToken string) map[
 	}
 }
 
-func (service *Service) oauthValues() (PKCE, string, string, string, error) {
+func (service *Service) oauthValues() (PKCE, string, string, error) {
 	pkce, err := GeneratePKCE(service.options.Rand)
 	if err != nil {
-		return PKCE{}, "", "", "", err
+		return PKCE{}, "", "", err
 	}
 	state, err := GenerateState(service.options.Rand)
 	if err != nil {
-		return PKCE{}, "", "", "", err
+		return PKCE{}, "", "", err
 	}
 	nonce, err := GenerateNonce(service.options.Rand)
 	if err != nil {
-		return PKCE{}, "", "", "", err
+		return PKCE{}, "", "", err
 	}
-	deviceID, err := GenerateDeviceID(service.options.Rand)
-	if err != nil {
-		return PKCE{}, "", "", "", err
-	}
-	return pkce, state, nonce, deviceID, nil
+	return pkce, state, nonce, nil
 }
 
 func (service *Service) acquisitionContext(ctx context.Context) (context.Context, context.CancelFunc) {

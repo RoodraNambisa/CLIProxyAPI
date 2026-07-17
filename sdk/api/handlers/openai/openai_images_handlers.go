@@ -18,6 +18,7 @@ import (
 	"github.com/gin-gonic/gin"
 	. "github.com/router-for-me/CLIProxyAPI/v6/internal/constant"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/interfaces"
+	executorhelps "github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/api/handlers"
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v6/sdk/config"
 	"github.com/tidwall/gjson"
@@ -29,6 +30,8 @@ const (
 	defaultImagesImageModel = "gpt-image-2"
 	maxImageUploadBytes     = 50 << 20
 	maxImageMultipartBytes  = 220 << 20
+	maxImageSSEPendingBytes = ((maxImageUploadBytes + 2) / 3 * 4) + (8 << 20)
+	maxImageRequestCount    = 10
 	nativeImagesHandlerType = "openai-image"
 	nativeImagesGenerations = "images/generations"
 	nativeImagesEdits       = "images/edits"
@@ -68,6 +71,13 @@ func NewOpenAIImagesAPIHandler(apiHandlers *handlers.BaseAPIHandler) *OpenAIImag
 // HandlerType returns the upstream schema used for the Codex-backed request.
 func (h *OpenAIImagesAPIHandler) HandlerType() string {
 	return OpenaiResponse
+}
+
+func imageResponsesProviders(req openAIImageRequest) []string {
+	if !chatGPTWebSupportsImageRequest(req) {
+		return []string{Codex}
+	}
+	return []string{Codex, ChatGPTWeb}
 }
 
 // Models returns the image model exposed by this compatibility layer.
@@ -187,29 +197,28 @@ func (e imageUnsupportedError) Unwrap() error {
 
 // Generations handles POST /v1/images/generations.
 func (h *OpenAIImagesAPIHandler) Generations(c *gin.Context) {
-	if h.handleXAIGenerationIfRequested(c) {
+	rawJSON, err := readOpenAIImageJSONRequestBody(c)
+	if err != nil {
+		h.writeImagesRequestError(c, fmt.Errorf("invalid request: %w", err))
 		return
 	}
-	if h.imagesNativeEnabled(imageGenerationOperation) {
-		rawJSON, err := io.ReadAll(c.Request.Body)
-		if err != nil {
-			h.writeImagesRequestError(c, fmt.Errorf("invalid request: %w", err))
-			return
-		}
-		req, err := parseImageGenerationRequestBytes(rawJSON)
-		if err != nil {
-			h.writeImagesRequestError(c, err)
-			return
-		}
-		h.handleNativeImagesRequest(c, rawJSON, req, imageGenerationOperation)
-		return
-	}
-
-	req, err := parseImageGenerationRequest(c)
+	req, err := parseImageGenerationRequestBytes(rawJSON)
 	if err != nil {
 		h.writeImagesRequestError(c, err)
 		return
 	}
+	if err = validateImageRequestCount(&req); err != nil {
+		h.writeImagesRequestError(c, err)
+		return
+	}
+	if h.handleXAIGenerationIfRequested(c, rawJSON) {
+		return
+	}
+	if h.imagesNativeEnabled(imageGenerationOperation) {
+		h.handleNativeImagesRequest(c, rawJSON, req, imageGenerationOperation)
+		return
+	}
+
 	if err := h.validateImageRequest(&req, imageGenerationOperation); err != nil {
 		h.writeImagesRequestError(c, err)
 		return
@@ -219,22 +228,56 @@ func (h *OpenAIImagesAPIHandler) Generations(c *gin.Context) {
 
 // Edits handles POST /v1/images/edits.
 func (h *OpenAIImagesAPIHandler) Edits(c *gin.Context) {
-	if h.handleXAIEditIfRequested(c) {
-		return
-	}
-	if h.imagesNativeEnabled(imageEditOperation) {
-		req, rawJSON, err := h.parseNativeImageEditRequest(c)
+	contentType, _, _ := mime.ParseMediaType(c.GetHeader("Content-Type"))
+	if strings.EqualFold(contentType, "multipart/form-data") {
+		if h.handleXAIEditIfRequested(c, nil) {
+			return
+		}
+		if h.imagesNativeEnabled(imageEditOperation) {
+			req, rawJSON, err := h.parseNativeImageEditRequest(c)
+			if err != nil {
+				h.writeImagesRequestError(c, err)
+				return
+			}
+			if err = validateImageRequestCount(&req); err != nil {
+				h.writeImagesRequestError(c, err)
+				return
+			}
+			h.handleNativeImagesRequest(c, rawJSON, req, imageEditOperation)
+			return
+		}
+		req, err := parseImageEditRequest(c)
 		if err != nil {
 			h.writeImagesRequestError(c, err)
 			return
 		}
-		h.handleNativeImagesRequest(c, rawJSON, req, imageEditOperation)
+		if err := h.validateImageRequest(&req, imageEditOperation); err != nil {
+			h.writeImagesRequestError(c, err)
+			return
+		}
+		h.handleImagesRequest(c, req, imageEditOperation)
 		return
 	}
 
-	req, err := parseImageEditRequest(c)
+	rawJSON, err := readOpenAIImageJSONRequestBody(c)
+	if err != nil {
+		h.writeImagesRequestError(c, fmt.Errorf("invalid request: %w", err))
+		return
+	}
+	if err = validateImageRequestCountJSON(rawJSON); err != nil {
+		h.writeImagesRequestError(c, err)
+		return
+	}
+	if h.handleXAIEditIfRequested(c, rawJSON) {
+		return
+	}
+	req, err := parseJSONImageEditRequest(rawJSON, h.imagesNativeEnabled(imageEditOperation))
 	if err != nil {
 		h.writeImagesRequestError(c, err)
+		return
+	}
+	if h.imagesNativeEnabled(imageEditOperation) {
+		h.handleNativeImagesRequest(c, rawJSON, req, imageEditOperation)
 		return
 	}
 	if err := h.validateImageRequest(&req, imageEditOperation); err != nil {
@@ -263,11 +306,12 @@ func (h *OpenAIImagesAPIHandler) handleImagesRequest(c *gin.Context, req openAII
 		return
 	}
 	responseFormat := strings.ToLower(strings.TrimSpace(req.ResponseFormat))
+	providers := imageResponsesProviders(req)
 	if req.Stream {
-		h.handleStreamingImagesResponse(c, rawJSON, imageModel, codexModel, op, count, responseFormat)
+		h.handleStreamingImagesResponse(c, rawJSON, imageModel, codexModel, op, count, responseFormat, providers)
 		return
 	}
-	h.handleNonStreamingImagesResponse(c, rawJSON, imageModel, codexModel, count, responseFormat)
+	h.handleNonStreamingImagesResponse(c, rawJSON, imageModel, codexModel, count, responseFormat, providers)
 }
 
 func (h *OpenAIImagesAPIHandler) handleNativeImagesRequest(c *gin.Context, rawJSON []byte, req openAIImageRequest, op imageOperation) {
@@ -351,17 +395,19 @@ func (h *OpenAIImagesAPIHandler) handleNativeStreamingImagesResponse(c *gin.Cont
 	})
 }
 
-func (h *OpenAIImagesAPIHandler) handleNonStreamingImagesResponse(c *gin.Context, rawJSON []byte, imageModel, codexModel string, count int, responseFormat string) {
+func (h *OpenAIImagesAPIHandler) handleNonStreamingImagesResponse(c *gin.Context, rawJSON []byte, imageModel, codexModel string, count int, responseFormat string, providers []string) {
 	c.Header("Content-Type", "application/json")
 	var combined imagesResponse
 	var upstreamHeaders http.Header
 	if count < 1 {
 		count = 1
 	}
-	for i := 0; i < count; i++ {
+	for i := 0; i < count && len(combined.Data) < count; i++ {
+		remaining := count - len(combined.Data)
 		cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
+		cliCtx = handlers.WithImageGenerationMaxResults(cliCtx, remaining)
 		stopKeepAlive := h.StartNonStreamingKeepAlive(c, cliCtx)
-		resp, headers, errMsg := h.ExecuteWithProvidersAndExecutionModel(cliCtx, []string{Codex}, h.HandlerType(), imageModel, codexModel, rawJSON, "")
+		resp, headers, errMsg := h.ExecuteWithProvidersAndExecutionModel(cliCtx, providers, h.HandlerType(), imageModel, codexModel, rawJSON, "")
 		stopKeepAlive()
 		if errMsg != nil {
 			h.WriteErrorResponse(c, errMsg)
@@ -382,6 +428,9 @@ func (h *OpenAIImagesAPIHandler) handleNonStreamingImagesResponse(c *gin.Context
 			combined.Size = parsed.Size
 			upstreamHeaders = headers
 		}
+		if len(parsed.Data) > remaining {
+			parsed.Data = parsed.Data[:remaining]
+		}
 		combined.Data = append(combined.Data, parsed.Data...)
 		combined.Usage = mergeImageUsageForNAggregation(combined.Usage, parsed.Usage)
 		cliCancel(resp)
@@ -396,19 +445,20 @@ func (h *OpenAIImagesAPIHandler) handleNonStreamingImagesResponse(c *gin.Context
 	_, _ = c.Writer.Write(imagesPayload)
 }
 
-func (h *OpenAIImagesAPIHandler) handleStreamingImagesResponse(c *gin.Context, rawJSON []byte, imageModel, codexModel string, op imageOperation, count int, responseFormat string) {
+func (h *OpenAIImagesAPIHandler) handleStreamingImagesResponse(c *gin.Context, rawJSON []byte, imageModel, codexModel string, op imageOperation, count int, responseFormat string, providers []string) {
 	flusher, ok := c.Writer.(http.Flusher)
 	if !ok {
 		h.writeImagesError(c, http.StatusInternalServerError, errors.New("streaming not supported"))
 		return
 	}
 	if count > 1 {
-		h.handleMultiStreamingImagesResponse(c, flusher, rawJSON, imageModel, codexModel, op, count, responseFormat)
+		h.handleMultiStreamingImagesResponse(c, flusher, rawJSON, imageModel, codexModel, op, count, responseFormat, providers)
 		return
 	}
 	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
 	cliCtx = handlers.WithImageGenerationStreamPassthrough(cliCtx, true)
-	dataChan, upstreamHeaders, errChan := h.ExecuteStreamWithProvidersAndExecutionModel(cliCtx, []string{Codex}, h.HandlerType(), imageModel, codexModel, rawJSON, "")
+	cliCtx = handlers.WithImageGenerationMaxResults(cliCtx, 1)
+	dataChan, upstreamHeaders, errChan := h.ExecuteStreamWithProvidersAndExecutionModel(cliCtx, providers, h.HandlerType(), imageModel, codexModel, rawJSON, "")
 
 	setSSEHeaders := func() {
 		c.Header("Content-Type", "text/event-stream")
@@ -417,7 +467,8 @@ func (h *OpenAIImagesAPIHandler) handleStreamingImagesResponse(c *gin.Context, r
 		c.Header("Access-Control-Allow-Origin", "*")
 	}
 
-	mapper := &imageStreamMapper{operation: op, responseFormat: responseFormat}
+	mapper := &imageStreamMapper{operation: op, responseFormat: responseFormat, maxResults: 1}
+	var firstFrame bytes.Buffer
 	for {
 		select {
 		case <-c.Request.Context().Done():
@@ -446,25 +497,47 @@ func (h *OpenAIImagesAPIHandler) handleStreamingImagesResponse(c *gin.Context, r
 					}
 				default:
 				}
+				mapper.flush(&firstFrame)
+				if errMapper := mapper.fatalError(); errMapper != nil {
+					h.WriteErrorResponse(c, &interfaces.ErrorMessage{
+						StatusCode: http.StatusBadGateway,
+						Error:      errMapper,
+					})
+					cliCancel(errMapper)
+					return
+				}
 				setSSEHeaders()
 				handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
-				mapper.flush(c.Writer)
+				_, _ = c.Writer.Write(firstFrame.Bytes())
 				_, _ = c.Writer.Write([]byte("\n"))
 				flusher.Flush()
 				cliCancel(nil)
 				return
 			}
+			mapper.writeChunk(&firstFrame, chunk)
+			if errMapper := mapper.fatalError(); errMapper != nil {
+				h.WriteErrorResponse(c, &interfaces.ErrorMessage{
+					StatusCode: http.StatusBadGateway,
+					Error:      errMapper,
+				})
+				cliCancel(errMapper)
+				return
+			}
+			if firstFrame.Len() == 0 {
+				continue
+			}
 			setSSEHeaders()
 			handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
-			mapper.writeChunk(c.Writer, chunk)
+			_, _ = c.Writer.Write(firstFrame.Bytes())
 			flusher.Flush()
+			_ = mapper.consumeForceFlush()
 			h.forwardImagesStream(c, flusher, func(err error) { cliCancel(err) }, dataChan, errChan, mapper)
 			return
 		}
 	}
 }
 
-func (h *OpenAIImagesAPIHandler) handleMultiStreamingImagesResponse(c *gin.Context, flusher http.Flusher, rawJSON []byte, imageModel, codexModel string, op imageOperation, count int, responseFormat string) {
+func (h *OpenAIImagesAPIHandler) handleMultiStreamingImagesResponse(c *gin.Context, flusher http.Flusher, rawJSON []byte, imageModel, codexModel string, op imageOperation, count int, responseFormat string, providers []string) {
 	c.Header("Content-Type", "text/event-stream")
 	c.Header("Cache-Control", "no-cache")
 	c.Header("Connection", "keep-alive")
@@ -472,11 +545,12 @@ func (h *OpenAIImagesAPIHandler) handleMultiStreamingImagesResponse(c *gin.Conte
 	for i := 0; i < count; i++ {
 		cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
 		cliCtx = handlers.WithImageGenerationStreamPassthrough(cliCtx, true)
-		dataChan, upstreamHeaders, errChan := h.ExecuteStreamWithProvidersAndExecutionModel(cliCtx, []string{Codex}, h.HandlerType(), imageModel, codexModel, rawJSON, "")
+		cliCtx = handlers.WithImageGenerationMaxResults(cliCtx, 1)
+		dataChan, upstreamHeaders, errChan := h.ExecuteStreamWithProvidersAndExecutionModel(cliCtx, providers, h.HandlerType(), imageModel, codexModel, rawJSON, "")
 		if i == 0 {
 			handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
 		}
-		mapper := &imageStreamMapper{operation: op, omitInputUsage: i > 0, responseFormat: responseFormat}
+		mapper := &imageStreamMapper{operation: op, omitInputUsage: i > 0, responseFormat: responseFormat, maxResults: 1}
 		var streamErr error
 		h.ForwardStream(c, flusher, func(err error) {
 			streamErr = err
@@ -486,6 +560,10 @@ func (h *OpenAIImagesAPIHandler) handleMultiStreamingImagesResponse(c *gin.Conte
 			FlushMinBytes: imageStreamFlushMinBytes(h.Cfg),
 			WriteChunk: func(chunk []byte) {
 				mapper.writeChunk(c.Writer, chunk)
+			},
+			ChunkError: mapper.fatalError,
+			FlushChunk: func([]byte) bool {
+				return mapper.consumeForceFlush()
 			},
 			WriteTerminalError: func(errMsg *interfaces.ErrorMessage) {
 				if errMsg == nil {
@@ -506,6 +584,9 @@ func (h *OpenAIImagesAPIHandler) handleMultiStreamingImagesResponse(c *gin.Conte
 				mapper.flush(c.Writer)
 			},
 		})
+		if streamErr == nil {
+			streamErr = mapper.fatalError()
+		}
 		if streamErr != nil {
 			return
 		}
@@ -524,6 +605,10 @@ func (h *OpenAIImagesAPIHandler) forwardImagesStream(c *gin.Context, flusher htt
 		WriteChunk: func(chunk []byte) {
 			mapper.writeChunk(c.Writer, chunk)
 		},
+		ChunkError: mapper.fatalError,
+		FlushChunk: func([]byte) bool {
+			return mapper.consumeForceFlush()
+		},
 		WriteTerminalError: func(errMsg *interfaces.ErrorMessage) {
 			if errMsg == nil {
 				return
@@ -541,17 +626,11 @@ func (h *OpenAIImagesAPIHandler) forwardImagesStream(c *gin.Context, flusher htt
 		},
 		WriteDone: func() {
 			mapper.flush(c.Writer)
-			_, _ = c.Writer.Write([]byte("\n"))
+			if mapper.fatalError() == nil {
+				_, _ = c.Writer.Write([]byte("\n"))
+			}
 		},
 	})
-}
-
-func parseImageGenerationRequest(c *gin.Context) (openAIImageRequest, error) {
-	rawJSON, err := io.ReadAll(c.Request.Body)
-	if err != nil {
-		return openAIImageRequest{}, fmt.Errorf("invalid request: %w", err)
-	}
-	return parseImageGenerationRequestBytes(rawJSON)
 }
 
 func parseImageGenerationRequestBytes(rawJSON []byte) (openAIImageRequest, error) {
@@ -568,7 +647,7 @@ func parseImageEditRequest(c *gin.Context) (openAIImageRequest, error) {
 	if err == nil && strings.EqualFold(mediaType, "multipart/form-data") {
 		return parseMultipartImageEditRequest(c)
 	}
-	rawJSON, err := io.ReadAll(c.Request.Body)
+	rawJSON, err := readOpenAIImageJSONRequestBody(c)
 	if err != nil {
 		return openAIImageRequest{}, fmt.Errorf("invalid request: %w", err)
 	}
@@ -590,7 +669,7 @@ func (h *OpenAIImagesAPIHandler) parseNativeImageEditRequest(c *gin.Context) (op
 		return req, rawJSON, nil
 	}
 
-	rawJSON, err := io.ReadAll(c.Request.Body)
+	rawJSON, err := readOpenAIImageJSONRequestBody(c)
 	if err != nil {
 		return openAIImageRequest{}, nil, fmt.Errorf("invalid request: %w", err)
 	}
@@ -718,15 +797,14 @@ func (h *OpenAIImagesAPIHandler) validateImageRequest(req *openAIImageRequest, o
 	if rf := strings.TrimSpace(req.ResponseFormat); rf != "" && rf != "b64_json" && rf != "url" {
 		return unsupportedImageErrorf("unsupported response_format %q", rf)
 	}
+	if strings.TrimSpace(req.OutputFormat) == "" {
+		req.OutputFormat = "png"
+	}
 	if strings.EqualFold(strings.TrimSpace(req.Background), "transparent") && h.imagesOverrideTransparentBackgroundEnabled() {
 		req.Background = "auto"
 	}
-	n := 1
-	if req.N != nil {
-		n = *req.N
-	}
-	if n < 1 {
-		return errors.New("n must be at least 1")
+	if err := validateImageRequestCount(req); err != nil {
+		return err
 	}
 	if req.OutputCompression != nil && (*req.OutputCompression < 0 || *req.OutputCompression > 100) {
 		return errors.New("output_compression must be between 0 and 100")
@@ -738,6 +816,33 @@ func (h *OpenAIImagesAPIHandler) validateImageRequest(req *openAIImageRequest, o
 		return errors.New("at least one image is required")
 	}
 	return nil
+}
+
+func validateImageRequestCount(req *openAIImageRequest) error {
+	if req == nil {
+		return errors.New("request is required")
+	}
+	n := 1
+	if req.N != nil {
+		n = *req.N
+	}
+	if n < 1 {
+		return errors.New("n must be at least 1")
+	}
+	if n > maxImageRequestCount {
+		return fmt.Errorf("n must be at most %d", maxImageRequestCount)
+	}
+	return nil
+}
+
+func validateImageRequestCountJSON(rawJSON []byte) error {
+	var requestCount struct {
+		N *int `json:"n"`
+	}
+	if err := json.Unmarshal(rawJSON, &requestCount); err != nil {
+		return fmt.Errorf("invalid request: %w", err)
+	}
+	return validateImageRequestCount(&openAIImageRequest{N: requestCount.N})
 }
 
 func buildCodexImageResponsesPayload(req openAIImageRequest, op imageOperation, codexModel, imageModel string, overrideInputFidelity bool) (map[string]any, error) {
@@ -883,6 +988,8 @@ func mimeTypeFromOutputFormat(outputFormat string) string {
 		return "image/jpeg"
 	case "webp":
 		return "image/webp"
+	case "gif":
+		return "image/gif"
 	default:
 		return "image/png"
 	}
@@ -1277,25 +1384,72 @@ type imageStreamMapper struct {
 	finalUsage     json.RawMessage
 	omitInputUsage bool
 	responseFormat string
+	maxResults     int
 	completed      bool
+	forceFlush     bool
+	fatalErr       error
 }
 
 func (m *imageStreamMapper) writeChunk(w io.Writer, chunk []byte) {
-	for _, payload := range m.parser.Push(chunk) {
-		m.writePayload(w, payload)
+	if m == nil || m.completed {
+		return
 	}
+	items := m.parser.Push(chunk)
+	if err := m.parser.Error(); err != nil {
+		m.completed = true
+		m.fatalErr = err
+		return
+	}
+	for _, item := range items {
+		if len(item.comment) > 0 {
+			_, _ = w.Write(item.comment)
+			m.forceFlush = true
+			continue
+		}
+		m.writePayload(w, item.payload)
+	}
+}
+
+func (m *imageStreamMapper) consumeForceFlush() bool {
+	if m == nil || !m.forceFlush {
+		return false
+	}
+	m.forceFlush = false
+	return true
 }
 
 func (m *imageStreamMapper) flush(w io.Writer) {
-	for _, payload := range m.parser.Flush() {
-		m.writePayload(w, payload)
+	if m == nil || m.completed {
+		return
+	}
+	for _, item := range m.parser.Flush() {
+		if len(item.comment) > 0 {
+			_, _ = w.Write(item.comment)
+			m.forceFlush = true
+			continue
+		}
+		m.writePayload(w, item.payload)
+	}
+	if err := m.parser.Error(); err != nil {
+		m.completed = true
+		m.fatalErr = err
+		return
+	}
+	if m.completed {
+		return
 	}
 	if !m.completed && len(m.finals) > 0 {
 		m.writeCompletedSet(w, m.finals, m.finalUsage)
+		return
 	}
+	m.completed = true
+	m.fatalErr = errors.New("upstream image stream ended without a completed response")
 }
 
 func (m *imageStreamMapper) writePayload(w io.Writer, payload []byte) {
+	if m == nil || m.completed {
+		return
+	}
 	eventType := responseEventType(payload)
 	switch eventType {
 	case "response.image_generation_call.partial_image":
@@ -1331,8 +1485,16 @@ func (m *imageStreamMapper) writePayload(w io.Writer, payload []byte) {
 			m.writeCompletedSet(w, m.finals, mergeImageUsage(m.finalUsage, usage))
 			return
 		}
-		m.writeError(w, http.StatusBadGateway, "upstream did not return image output")
+		m.completed = true
+		m.fatalErr = errors.New("upstream did not return image output")
 	}
+}
+
+func (m *imageStreamMapper) fatalError() error {
+	if m == nil {
+		return nil
+	}
+	return m.fatalErr
 }
 
 func imagePartialIndexFromResult(result gjson.Result) *int {
@@ -1345,9 +1507,68 @@ func imagePartialIndexFromResult(result gjson.Result) *int {
 
 func (m *imageStreamMapper) writeCompletedSet(w io.Writer, results []imageResult, usage json.RawMessage) {
 	m.completed = true
+	if m.maxResults > 0 && len(results) > m.maxResults {
+		results = results[:m.maxResults]
+	}
 	for i := range results {
 		m.writeCompleted(w, results[i], usage)
 	}
+}
+
+func chatGPTWebSupportsImageRequest(req openAIImageRequest) bool {
+	if strings.TrimSpace(req.Size) != "" ||
+		(strings.TrimSpace(req.Quality) != "" && !strings.EqualFold(strings.TrimSpace(req.Quality), "auto")) ||
+		strings.TrimSpace(req.Background) != "" ||
+		(strings.TrimSpace(req.OutputFormat) != "" && !strings.EqualFold(strings.TrimSpace(req.OutputFormat), "png")) ||
+		strings.TrimSpace(req.InputFidelity) != "" ||
+		strings.TrimSpace(req.Moderation) != "" ||
+		req.OutputCompression != nil ||
+		(req.PartialImages != nil && *req.PartialImages > 0) {
+		return false
+	}
+	references := make([]string, 0, len(req.Images)+1)
+	for _, reference := range req.Images {
+		if !chatGPTWebSupportsImageReference(reference) {
+			return false
+		}
+		imageURL, _ := imageURLFromReference(reference)
+		references = append(references, imageURL)
+	}
+	if req.Mask != nil {
+		if !chatGPTWebSupportsImageReference(*req.Mask) {
+			return false
+		}
+		maskURL, err := imageURLFromReference(*req.Mask)
+		if err != nil || strings.HasPrefix(strings.ToLower(maskURL), "data:image/webp") {
+			return false
+		}
+		references = append(references, maskURL)
+		for _, reference := range req.Images {
+			imageURL, errImage := imageURLFromReference(reference)
+			if errImage != nil || strings.HasPrefix(strings.ToLower(imageURL), "data:image/webp") {
+				return false
+			}
+		}
+	}
+	if err := executorhelps.ValidateChatGPTWebImageReferences(
+		references,
+		executorhelps.ChatGPTWebMaxImageBytes,
+		executorhelps.ChatGPTWebMaxImageRequestBytes,
+	); err != nil {
+		return false
+	}
+	return true
+}
+
+func chatGPTWebSupportsImageReference(reference imageReference) bool {
+	if strings.TrimSpace(reference.FileID) != "" {
+		return false
+	}
+	imageURL, err := imageURLFromReference(reference)
+	if err != nil {
+		return false
+	}
+	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(imageURL)), "data:image/")
 }
 
 func (m *imageStreamMapper) writeCompleted(w io.Writer, result imageResult, usage json.RawMessage) {
@@ -1385,71 +1606,89 @@ func (m *imageStreamMapper) writeSSE(w io.Writer, eventName string, payload imag
 	_, _ = fmt.Fprintf(w, "event: %s\ndata: %s\n\n", eventName, string(data))
 }
 
-func (m *imageStreamMapper) writeError(w io.Writer, status int, message string) {
-	if w == nil {
-		return
-	}
-	m.completed = true
-	if status <= 0 {
-		status = http.StatusInternalServerError
-	}
-	if strings.TrimSpace(message) == "" {
-		message = http.StatusText(status)
-	}
-	body := handlers.BuildErrorResponseBody(status, message)
-	_, _ = fmt.Fprintf(w, "event: error\ndata: %s\n\n", string(body))
-}
-
 type imageSSEParser struct {
-	pending []byte
+	pending         []byte
+	maxPendingBytes int
+	err             error
 }
 
-func (p *imageSSEParser) Push(chunk []byte) [][]byte {
-	if len(chunk) == 0 {
+type imageSSEItem struct {
+	comment []byte
+	payload []byte
+}
+
+func (p *imageSSEParser) Push(chunk []byte) []imageSSEItem {
+	if p == nil || p.err != nil || len(chunk) == 0 {
 		return nil
 	}
-	if responsesSSENeedsLineBreak(p.pending, chunk) {
-		p.pending = append(p.pending, '\n')
+	needsLineBreak := responsesSSENeedsLineBreak(p.pending, chunk)
+	maxPendingBytes := p.maxPendingBytes
+	if maxPendingBytes <= 0 {
+		maxPendingBytes = maxImageSSEPendingBytes
 	}
-	p.pending = append(p.pending, chunk...)
-	var payloads [][]byte
-	for {
-		frameLen := responsesSSEFrameLen(p.pending)
-		if frameLen == 0 {
-			break
-		}
-		payloads = append(payloads, extractImageSSEPayloads(p.pending[:frameLen])...)
-		copy(p.pending, p.pending[frameLen:])
-		p.pending = p.pending[:len(p.pending)-frameLen]
+	var items []imageSSEItem
+	appendFrameBytes := func(data []byte) bool {
+		return appendBoundedSSEFrames(&p.pending, data, maxPendingBytes, func(frame []byte) {
+			items = append(items, extractImageSSEItems(frame)...)
+		})
+	}
+	if needsLineBreak && !appendFrameBytes([]byte{'\n'}) {
+		p.pending = nil
+		p.err = fmt.Errorf("upstream image SSE frame exceeds %d bytes", maxPendingBytes)
+		return nil
+	}
+	if !appendFrameBytes(chunk) {
+		p.pending = nil
+		p.err = fmt.Errorf("upstream image SSE frame exceeds %d bytes", maxPendingBytes)
+		return nil
 	}
 	if imageSSECanEmitWithoutDelimiter(p.pending) || imageSSELooksLikeJSON(p.pending) {
-		payloads = append(payloads, extractImageSSEPayloads(p.pending)...)
+		items = append(items, extractImageSSEItems(p.pending)...)
 		p.pending = p.pending[:0]
 	}
-	return payloads
+	return items
 }
 
-func (p *imageSSEParser) Flush() [][]byte {
+func (p *imageSSEParser) Flush() []imageSSEItem {
+	if p == nil || p.err != nil {
+		return nil
+	}
 	if len(bytes.TrimSpace(p.pending)) == 0 {
 		p.pending = p.pending[:0]
 		return nil
 	}
-	payloads := extractImageSSEPayloads(p.pending)
+	items := extractImageSSEItems(p.pending)
 	p.pending = p.pending[:0]
-	return payloads
+	return items
 }
 
-func extractImageSSEPayloads(frame []byte) [][]byte {
+func (p *imageSSEParser) Error() error {
+	if p == nil {
+		return nil
+	}
+	return p.err
+}
+
+func extractImageSSEItems(frame []byte) []imageSSEItem {
 	trimmed := bytes.TrimSpace(frame)
 	if len(trimmed) == 0 {
 		return nil
 	}
 	if imageSSELooksLikeJSON(trimmed) {
-		return [][]byte{bytes.Clone(trimmed)}
+		return []imageSSEItem{{payload: bytes.Clone(trimmed)}}
 	}
-	var payloads [][]byte
-	for _, line := range bytes.Split(trimmed, []byte("\n")) {
-		line = bytes.TrimSpace(bytes.TrimSuffix(line, []byte("\r")))
+	if handlers.SSECommentsOnly(frame) {
+		return []imageSSEItem{{comment: bytes.Clone(frame)}}
+	}
+	var comments bytes.Buffer
+	var dataLines [][]byte
+	for _, line := range handlers.SplitSSELines(trimmed) {
+		line = bytes.TrimSpace(line)
+		if bytes.HasPrefix(line, []byte(":")) {
+			comments.Write(line)
+			comments.WriteByte('\n')
+			continue
+		}
 		if !bytes.HasPrefix(line, []byte("data:")) {
 			continue
 		}
@@ -1457,9 +1696,19 @@ func extractImageSSEPayloads(frame []byte) [][]byte {
 		if len(data) == 0 || bytes.Equal(data, []byte("[DONE]")) {
 			continue
 		}
-		payloads = append(payloads, bytes.Clone(data))
+		dataLines = append(dataLines, data)
 	}
-	return payloads
+	items := make([]imageSSEItem, 0, 2)
+	if comments.Len() > 0 {
+		comments.WriteByte('\n')
+		items = append(items, imageSSEItem{comment: bytes.Clone(comments.Bytes())})
+	}
+	if len(dataLines) == 1 {
+		items = append(items, imageSSEItem{payload: bytes.Clone(dataLines[0])})
+	} else if len(dataLines) > 1 {
+		items = append(items, imageSSEItem{payload: bytes.Join(dataLines, []byte{'\n'})})
+	}
+	return items
 }
 
 func imageSSECanEmitWithoutDelimiter(chunk []byte) bool {
@@ -1471,8 +1720,8 @@ func imageSSECanEmitWithoutDelimiter(chunk []byte) bool {
 }
 
 func imageSSEDataLinesLookComplete(chunk []byte) bool {
-	for _, line := range bytes.Split(chunk, []byte("\n")) {
-		line = bytes.TrimSpace(bytes.TrimSuffix(line, []byte("\r")))
+	for _, line := range handlers.SplitSSELines(chunk) {
+		line = bytes.TrimSpace(line)
 		if len(line) == 0 || !bytes.HasPrefix(line, []byte("data:")) {
 			continue
 		}
@@ -1489,7 +1738,7 @@ func imageSSEDataLinesLookComplete(chunk []byte) bool {
 
 func imageSSELooksLikeJSON(chunk []byte) bool {
 	trimmed := bytes.TrimSpace(chunk)
-	return len(trimmed) > 1 && trimmed[0] == '{' && trimmed[len(trimmed)-1] == '}'
+	return len(trimmed) > 1 && trimmed[0] == '{' && trimmed[len(trimmed)-1] == '}' && json.Valid(trimmed)
 }
 
 func responseEventType(payload []byte) string {

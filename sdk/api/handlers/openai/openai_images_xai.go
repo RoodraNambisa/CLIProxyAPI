@@ -1,11 +1,9 @@
 package openai
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"mime"
 	"net/http"
 	"strings"
@@ -207,13 +205,7 @@ func xaiImagesEditOptions(rawJSON []byte) (string, string, int64) {
 	return aspectRatio, resolution, n
 }
 
-func (h *OpenAIImagesAPIHandler) handleXAIGenerationIfRequested(c *gin.Context) bool {
-	rawJSON, err := io.ReadAll(c.Request.Body)
-	if err != nil {
-		h.writeImagesRequestError(c, fmt.Errorf("invalid request: %w", err))
-		return true
-	}
-	c.Request.Body = io.NopCloser(bytes.NewReader(rawJSON))
+func (h *OpenAIImagesAPIHandler) handleXAIGenerationIfRequested(c *gin.Context, rawJSON []byte) bool {
 	model := strings.TrimSpace(gjson.GetBytes(rawJSON, "model").String())
 	if !isXAIImagesModel(model) {
 		return false
@@ -232,7 +224,7 @@ func (h *OpenAIImagesAPIHandler) handleXAIGenerationIfRequested(c *gin.Context) 
 	return true
 }
 
-func (h *OpenAIImagesAPIHandler) handleXAIEditIfRequested(c *gin.Context) bool {
+func (h *OpenAIImagesAPIHandler) handleXAIEditIfRequested(c *gin.Context, rawJSON []byte) bool {
 	contentType, _, _ := mime.ParseMediaType(c.GetHeader("Content-Type"))
 	if strings.EqualFold(contentType, "multipart/form-data") {
 		c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxImageMultipartBytes)
@@ -246,6 +238,10 @@ func (h *OpenAIImagesAPIHandler) handleXAIEditIfRequested(c *gin.Context) bool {
 		}
 		req, err := parseMultipartImageEditRequest(c)
 		if err != nil {
+			h.writeImagesRequestError(c, err)
+			return true
+		}
+		if err = validateImageRequestCount(&req); err != nil {
 			h.writeImagesRequestError(c, err)
 			return true
 		}
@@ -279,12 +275,6 @@ func (h *OpenAIImagesAPIHandler) handleXAIEditIfRequested(c *gin.Context) bool {
 		return true
 	}
 
-	rawJSON, err := io.ReadAll(c.Request.Body)
-	if err != nil {
-		h.writeImagesRequestError(c, fmt.Errorf("invalid request: %w", err))
-		return true
-	}
-	c.Request.Body = io.NopCloser(bytes.NewReader(rawJSON))
 	model := strings.TrimSpace(gjson.GetBytes(rawJSON, "model").String())
 	if !isXAIImagesModel(model) {
 		return false

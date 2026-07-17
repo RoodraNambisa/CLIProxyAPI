@@ -9,12 +9,17 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/config"
 )
 
-func TestServiceBindsChatGPTWebExecutorWithoutModels(t *testing.T) {
+func TestServiceBindsChatGPTWebExecutorWithBuiltinModels(t *testing.T) {
 	service := &Service{
 		cfg:         &config.Config{},
 		coreManager: coreauth.NewManager(nil, nil, nil),
 	}
-	auth := &coreauth.Auth{ID: "chatgpt-web-service-auth", Provider: "chatgpt-web", Status: coreauth.StatusActive}
+	auth := &coreauth.Auth{
+		ID:       "chatgpt-web-service-auth",
+		Provider: "chatgpt-web",
+		Status:   coreauth.StatusActive,
+		Metadata: map[string]any{"access_token": "token", "lifecycle_state": coreauth.LifecycleStateActive},
+	}
 	t.Cleanup(func() { GlobalModelRegistry().UnregisterClient(auth.ID) })
 
 	service.ensureExecutorsForAuth(auth)
@@ -27,8 +32,9 @@ func TestServiceBindsChatGPTWebExecutorWithoutModels(t *testing.T) {
 	}
 
 	service.registerModelsForAuth(auth)
-	if models := registry.GetGlobalRegistry().GetModelsForClient(auth.ID); len(models) != 0 {
-		t.Fatalf("chatgpt web models = %v, want none before protocol integration", models)
+	models := registry.GetGlobalRegistry().GetModelsForClient(auth.ID)
+	if !containsRegisteredModel(models, "gpt-image-2") {
+		t.Fatalf("chatgpt web models = %v, want gpt-image-2", models)
 	}
 }
 

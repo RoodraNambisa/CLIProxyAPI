@@ -56,6 +56,183 @@ func TestGetModelsForClientReturnsClones(t *testing.T) {
 	}
 }
 
+func TestUnregisterClientRebindsModelInfoToRemainingClient(t *testing.T) {
+	r := newTestModelRegistry()
+	r.RegisterClient("client-a", "chatgpt-web", []*ModelInfo{{
+		ID:          "shared",
+		DisplayName: "Remaining",
+	}})
+	r.RegisterClient("client-z", "chatgpt-web", []*ModelInfo{{
+		ID:          "shared",
+		DisplayName: "Departing",
+	}})
+
+	r.UnregisterClient("client-z")
+
+	for _, provider := range []string{"", "chatgpt-web"} {
+		info := r.GetModelInfo("shared", provider)
+		if info == nil || info.DisplayName != "Remaining" {
+			t.Fatalf("provider %q info after unregister = %#v", provider, info)
+		}
+	}
+}
+
+func TestProviderChangeRebindsPreviousProviderModelInfo(t *testing.T) {
+	r := newTestModelRegistry()
+	r.RegisterClient("client-a", "provider-a", []*ModelInfo{{
+		ID:          "shared",
+		DisplayName: "Provider A",
+	}})
+	r.RegisterClient("client-z", "provider-a", []*ModelInfo{{
+		ID:          "shared",
+		DisplayName: "Moving",
+	}})
+
+	r.RegisterClient("client-z", "provider-b", []*ModelInfo{{
+		ID:          "shared",
+		DisplayName: "Provider B",
+	}})
+
+	infoA := r.GetModelInfo("shared", "provider-a")
+	if infoA == nil || infoA.DisplayName != "Provider A" {
+		t.Fatalf("provider-a info after provider change = %#v", infoA)
+	}
+	infoB := r.GetModelInfo("shared", "provider-b")
+	if infoB == nil || infoB.DisplayName != "Provider B" {
+		t.Fatalf("provider-b info after provider change = %#v", infoB)
+	}
+	global := r.GetModelInfo("shared", "")
+	if global == nil || global.DisplayName != "Provider B" {
+		t.Fatalf("global info after provider change = %#v", global)
+	}
+}
+
+func TestRegisterClientPreservingStateKeepsOverlappingTransientState(t *testing.T) {
+	r := newTestModelRegistry()
+	r.RegisterClient("client-1", "openai", []*ModelInfo{{ID: "keep"}, {ID: "remove"}})
+	r.SetModelQuotaExceeded("client-1", "keep")
+	r.SuspendClientModel("client-1", "keep", "cooldown")
+	r.SetModelQuotaExceeded("client-1", "remove")
+	r.SuspendClientModel("client-1", "remove", "cooldown")
+
+	r.RegisterClientPreservingState("client-1", "openai", []*ModelInfo{{ID: "keep"}, {ID: "add"}})
+
+	r.mutex.RLock()
+	defer r.mutex.RUnlock()
+	keep := r.models["keep"]
+	if keep == nil || keep.QuotaExceededClients["client-1"] == nil || keep.SuspendedClients["client-1"] != "cooldown" {
+		t.Fatalf("overlapping state = %#v", keep)
+	}
+	if _, exists := r.models["remove"]; exists {
+		t.Fatal("removed model registration remained")
+	}
+	added := r.models["add"]
+	if added == nil || added.QuotaExceededClients["client-1"] != nil || added.SuspendedClients["client-1"] != "" {
+		t.Fatalf("new model inherited transient state: %#v", added)
+	}
+}
+
+func TestRegisterClientDeduplicatesModelIDs(t *testing.T) {
+	r := newTestModelRegistry()
+	r.RegisterClient("client-1", "openai", []*ModelInfo{{ID: "keep"}, {ID: "keep"}})
+	r.SetModelQuotaExceeded("client-1", "keep")
+	r.SuspendClientModel("client-1", "keep", "cooldown")
+
+	r.RegisterClientPreservingState("client-1", "openai", []*ModelInfo{{ID: "keep"}, {ID: "keep"}})
+
+	r.mutex.RLock()
+	keep := r.models["keep"]
+	count := 0
+	providerCount := 0
+	quotaRetained := false
+	suspensionRetained := false
+	if keep != nil {
+		count = keep.Count
+		providerCount = keep.Providers["openai"]
+		quotaRetained = keep.QuotaExceededClients["client-1"] != nil
+		suspensionRetained = keep.SuspendedClients["client-1"] == "cooldown"
+	}
+	clientModels := append([]string(nil), r.clientModels["client-1"]...)
+	r.mutex.RUnlock()
+
+	if keep == nil || count != 1 {
+		t.Fatalf("remaining registration = %#v", keep)
+	}
+	if providerCount != 1 {
+		t.Fatalf("provider count = %d, want 1", providerCount)
+	}
+	if len(clientModels) != 1 || clientModels[0] != "keep" {
+		t.Fatalf("client models = %#v, want one keep", clientModels)
+	}
+	if !quotaRetained || !suspensionRetained {
+		t.Fatalf("remaining transient state = %#v", keep)
+	}
+
+	if count := r.GetModelCount("keep"); count != 0 {
+		t.Fatalf("available count with quota and suspension = %d, want 0", count)
+	}
+	r.UnregisterClient("client-1")
+	r.mutex.RLock()
+	defer r.mutex.RUnlock()
+	if _, exists := r.models["keep"]; exists {
+		t.Fatal("deduplicated model remained after client unregister")
+	}
+}
+
+func TestRegisterClientEmptySetClearsBookkeepingBeforeProviderChange(t *testing.T) {
+	r := newTestModelRegistry()
+	r.RegisterClient("client-a", "provider-a", []*ModelInfo{{
+		ID:          "shared",
+		DisplayName: "Remaining",
+	}})
+	r.RegisterClient("client-z", "provider-a", []*ModelInfo{{
+		ID:          "shared",
+		DisplayName: "Departing",
+	}})
+
+	r.RegisterClient("client-z", "provider-a", nil)
+	r.mutex.RLock()
+	_, staleBookkeeping := r.clientModels["client-z"]
+	r.mutex.RUnlock()
+	if staleBookkeeping {
+		t.Fatal("empty model set retained client bookkeeping")
+	}
+	r.RegisterClient("client-z", "provider-b", []*ModelInfo{{ID: "other"}})
+	r.UnregisterClient("client-z")
+
+	r.mutex.RLock()
+	defer r.mutex.RUnlock()
+	shared := r.models["shared"]
+	if shared == nil || shared.Count != 1 || shared.Providers["provider-a"] != 1 {
+		t.Fatalf("remaining shared registration = %#v", shared)
+	}
+	if info := shared.Info; info == nil || info.DisplayName != "Remaining" {
+		t.Fatalf("remaining shared metadata = %#v", info)
+	}
+	if _, exists := r.clientModels["client-z"]; exists {
+		t.Fatalf("empty client bookkeeping remained: %#v", r.clientModels["client-z"])
+	}
+}
+
+func TestRegisterClientPreservingStateClearsTransientStateOnProviderChange(t *testing.T) {
+	r := newTestModelRegistry()
+	r.RegisterClient("client-1", "provider-a", []*ModelInfo{{ID: "shared"}})
+	r.SetModelQuotaExceeded("client-1", "shared")
+	r.SuspendClientModel("client-1", "shared", "cooldown")
+
+	r.RegisterClientPreservingState("client-1", "provider-b", []*ModelInfo{{ID: "shared"}})
+
+	r.mutex.RLock()
+	defer r.mutex.RUnlock()
+	shared := r.models["shared"]
+	if shared == nil {
+		t.Fatal("shared model was removed")
+	}
+	if shared.QuotaExceededClients["client-1"] != nil || shared.SuspendedClients["client-1"] != "" {
+		t.Fatalf("provider replacement inherited transient state: %#v", shared)
+	}
+}
+
 func TestGetAvailableModelsByProviderReturnsClones(t *testing.T) {
 	r := newTestModelRegistry()
 	r.RegisterClient("client-1", "gemini", []*ModelInfo{{

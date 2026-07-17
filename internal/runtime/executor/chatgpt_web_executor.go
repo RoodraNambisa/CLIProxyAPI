@@ -2,9 +2,11 @@ package executor
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"strings"
@@ -41,6 +43,16 @@ type ChatGPTWebExecutor struct {
 	cfg                 *config.Config
 	manager             *cliproxyauth.Manager
 	authService         chatGPTWebAuthService
+	runtimeBaseURL      string
+	runtimeRand         io.Reader
+	imageInitialWait    time.Duration
+	imagePollInterval   time.Duration
+	imageSettleWait     time.Duration
+	imageMaxPolls       int
+	searchPollInterval  time.Duration
+	searchMaxPolls      int
+	streamInitialWait   time.Duration
+	streamHeartbeat     time.Duration
 	now                 func() time.Time
 	reloginBackoff      func(int) time.Duration
 	reloginSlotAcquired func()
@@ -58,14 +70,24 @@ type ChatGPTWebExecutor struct {
 func NewChatGPTWebExecutor(cfg *config.Config, manager *cliproxyauth.Manager) *ChatGPTWebExecutor {
 	lifecycleCtx, lifecycleCancel := context.WithCancel(context.Background())
 	return &ChatGPTWebExecutor{
-		cfg:               cfg,
-		manager:           manager,
-		authService:       chatgptwebauth.NewService(chatgptwebauth.Options{}),
-		now:               time.Now,
-		reloginBackoff:    chatGPTWebBackgroundReloginBackoff,
-		backgroundRunning: make(map[string]struct{}),
-		lifecycleCtx:      lifecycleCtx,
-		lifecycleCancel:   lifecycleCancel,
+		cfg:                cfg,
+		manager:            manager,
+		authService:        chatgptwebauth.NewService(chatgptwebauth.Options{}),
+		runtimeBaseURL:     "https://chatgpt.com",
+		runtimeRand:        rand.Reader,
+		imageInitialWait:   10 * time.Second,
+		imagePollInterval:  10 * time.Second,
+		imageSettleWait:    5 * time.Second,
+		imageMaxPolls:      chatGPTWebImageMaxPollAttempts,
+		searchPollInterval: 750 * time.Millisecond,
+		searchMaxPolls:     chatGPTWebSearchMaxPollAttempts,
+		streamInitialWait:  time.Second,
+		streamHeartbeat:    15 * time.Second,
+		now:                time.Now,
+		reloginBackoff:     chatGPTWebBackgroundReloginBackoff,
+		backgroundRunning:  make(map[string]struct{}),
+		lifecycleCtx:       lifecycleCtx,
+		lifecycleCancel:    lifecycleCancel,
 	}
 }
 
@@ -90,14 +112,15 @@ func (e *ChatGPTWebExecutor) Close() error {
 // Identifier returns the provider identifier.
 func (e *ChatGPTWebExecutor) Identifier() string { return chatgptwebauth.Provider }
 
-// Execute is completed with the ChatGPT Web protocol integration.
-func (e *ChatGPTWebExecutor) Execute(context.Context, *cliproxyauth.Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
-	return cliproxyexecutor.Response{}, newChatGPTWebProtocolUnavailableError()
+// Execute runs a ChatGPT Web request and translates the result to the inbound
+// protocol.
+func (e *ChatGPTWebExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	return e.executeRuntime(ctx, auth, req, opts)
 }
 
-// ExecuteStream is completed with the ChatGPT Web protocol integration.
-func (e *ChatGPTWebExecutor) ExecuteStream(context.Context, *cliproxyauth.Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
-	return nil, newChatGPTWebProtocolUnavailableError()
+// ExecuteStream runs a streaming ChatGPT Web request.
+func (e *ChatGPTWebExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
+	return e.executeRuntimeStream(ctx, auth, req, opts)
 }
 
 // CountTokens is not exposed by the ChatGPT Web upstream.
@@ -380,7 +403,11 @@ func (e *ChatGPTWebExecutor) reloginCurrent(ctx context.Context, expected *clipr
 		return nil, false, firstNonNilError(errLogin, errors.New("chatgpt web re-login returned no credential"))
 	}
 	updated := applyChatGPTWebCredential(expected, result)
-	installed, current, errUpdate := e.manager.UpdateIfCurrent(ctx, expected, updated)
+	installed, current, errUpdate := e.manager.UpdateIfCurrent(
+		cliproxyauth.WithForceRuntimeReplacement(ctx),
+		expected,
+		updated,
+	)
 	if errUpdate != nil {
 		if latest, ok := e.manager.GetByID(expected.ID); ok && chatGPTWebOperationKey(latest) != chatGPTWebOperationKey(expected) {
 			return cloneChatGPTWebAuth(latest), false, errChatGPTWebReloginSuperseded
@@ -410,10 +437,18 @@ func (e *ChatGPTWebExecutor) refreshCredential(ctx context.Context, auth *clipro
 		setChatGPTWebLifecycle(updated, cliproxyauth.LifecycleStateReauthRequired, "credential_invalid", e.currentTime())
 		return updated, fmt.Errorf("parse chatgpt web credential: %w", errCredential), true
 	}
+	if errIdentity := chatgptwebauth.EnsureCredentialRuntimeIDsForURL(credential, chatgptwebauth.CredentialRuntimeIdentityReader(auth.ID, credential), e.chatGPTWebBaseURL()); errIdentity != nil {
+		return nil, fmt.Errorf("initialize chatgpt web browser identity: %w", errIdentity), false
+	}
 	key := chatGPTWebOperationKey(auth)
 	resultChannel := e.refreshGroup.DoChan(key, func() (any, error) {
 		acquisitionCtx, cancel := e.acquisitionContext()
 		defer cancel()
+		acquisitionCtx, release, active := auth.BeginRuntimeExecution(acquisitionCtx)
+		if !active {
+			return chatGPTWebRefreshResult{err: context.Canceled}, nil
+		}
+		defer release()
 		result, errRefresh := e.authService.Refresh(acquisitionCtx, *credential, e.proxyURL(auth))
 		return chatGPTWebRefreshResult{credential: result, err: errRefresh}, nil
 	})
@@ -633,6 +668,9 @@ func (e *chatGPTWebCredentialUnavailableError) Unwrap() error      { return e.ca
 func (*chatGPTWebCredentialUnavailableError) StatusCode() int      { return http.StatusServiceUnavailable }
 func (*chatGPTWebCredentialUnavailableError) SkipAuthResult() bool { return true }
 func (*chatGPTWebCredentialUnavailableError) RetryOtherAuth() bool { return true }
+func (*chatGPTWebCredentialUnavailableError) ChatGPTWebCredentialUnavailable() bool {
+	return true
+}
 func (e *chatGPTWebCredentialUnavailableError) PersistAuthUpdateOnError() bool {
 	return e != nil && e.persistUpdate
 }

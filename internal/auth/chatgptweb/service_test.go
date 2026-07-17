@@ -1,6 +1,7 @@
 package chatgptweb
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
@@ -280,6 +281,35 @@ func TestServiceLogin(t *testing.T) {
 	}
 	if len(credential.Cookies) == 0 || credential.Persona.Profile != "chrome_146" {
 		t.Fatal("login did not persist cookies and persona")
+	}
+}
+
+func TestServiceReloginRestoresCookieBrowserIdentity(t *testing.T) {
+	fixedNow := time.Date(2026, time.July, 16, 12, 0, 0, 0, time.UTC)
+	fixture := newLoginFixture(t, http.StatusOK, "")
+	service := NewService(fixture.options(fixedNow))
+	authURL, err := url.Parse(fixture.server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	credential, err := service.Login(t.Context(), LoginInput{
+		Credential: &Credential{
+			Email:    "person@example.com",
+			Password: "correct-password",
+			Cookies: []Cookie{{
+				Name: "oai-did", Value: "existing-device", Host: authURL.Hostname(), Path: "/",
+			}},
+		},
+		Relogin: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if credential.DeviceID != "existing-device" {
+		t.Fatalf("device ID = %q, want existing-device", credential.DeviceID)
+	}
+	if strings.TrimSpace(credential.SessionID) == "" {
+		t.Fatal("re-login did not initialize a stable session ID")
 	}
 }
 
@@ -771,6 +801,89 @@ func TestServiceRefreshInvalidGrant(t *testing.T) {
 	}
 	if credential.LifecycleState != LifecycleReauthRequired {
 		t.Fatalf("credential state = %q", credential.LifecycleState)
+	}
+}
+
+func TestServiceRefreshMigratesBrowserIdentity(t *testing.T) {
+	expiresAt := time.Date(2026, time.July, 18, 0, 0, 0, 0, time.UTC).Unix()
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/oauth/token" {
+			http.NotFound(response, request)
+			return
+		}
+		_, _ = io.WriteString(response, `{"access_token":"`+testJWT(expiresAt)+`"}`)
+	}))
+	defer server.Close()
+	authURL, err := url.Parse(server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := NewService(Options{AuthBaseURL: server.URL, Rand: zeroReader{}})
+	credential, err := service.Refresh(t.Context(), Credential{
+		RefreshToken: "refresh",
+		Persona:      DefaultPersona(),
+		Cookies: []Cookie{
+			{Name: "oai-did", Value: "unrelated-device", Host: "evil.example", Domain: "evil.example", Path: "/"},
+			{Name: "OAI-DID", Value: "case-confused-device", Host: authURL.Hostname(), Path: "/"},
+			{Name: "oai-did", Value: "cookie-device", Host: authURL.Hostname(), Path: "/"},
+		},
+	}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if credential.DeviceID != "cookie-device" {
+		t.Fatalf("device ID = %q", credential.DeviceID)
+	}
+	if strings.TrimSpace(credential.SessionID) == "" {
+		t.Fatal("session ID was not generated")
+	}
+	if got, cookieErr := credentialCookieValueForURL(credential.Cookies, server.URL, "oai-did"); cookieErr != nil || got != "cookie-device" {
+		t.Fatalf("persisted oai-did = %q", got)
+	}
+}
+
+func TestCredentialCookieValueForURLRejectsExpiredCookie(t *testing.T) {
+	for _, cookie := range []Cookie{
+		{
+			Name: "oai-did", Value: "expired-device", Host: "auth.openai.com", Domain: "auth.openai.com",
+			Path: "/", Expires: time.Now().Add(-time.Hour).UTC().Format(time.RFC3339Nano), Secure: true,
+		},
+		{
+			Name: "oai-did", Value: "raw-expired-device", Host: "auth.openai.com", Domain: "auth.openai.com",
+			Path: "/", RawExpires: time.Now().Add(-time.Hour).UTC().Format(http.TimeFormat), Secure: true,
+		},
+	} {
+		got, err := credentialCookieValueForURL([]Cookie{cookie}, AuthBaseURL, "oai-did")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got != "" {
+			t.Fatalf("expired oai-did = %q, want empty", got)
+		}
+	}
+}
+
+func TestCredentialCookieValueForURLIgnoresInvalidRawExpiry(t *testing.T) {
+	got, err := credentialCookieValueForURL([]Cookie{{
+		Name: "oai-did", Value: "session-device", Host: "auth.openai.com", Domain: "auth.openai.com",
+		Path: "/", RawExpires: "invalid", Secure: true,
+	}}, AuthBaseURL, "oai-did")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "session-device" {
+		t.Fatalf("session oai-did = %q, want session-device", got)
+	}
+}
+
+func TestOAuthValuesDoNotGenerateUnusedDeviceID(t *testing.T) {
+	service := NewService(Options{Rand: bytes.NewReader(make([]byte, 96))})
+	pkce, state, nonce, err := service.oauthValues()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pkce.CodeVerifier == "" || state == "" || nonce == "" {
+		t.Fatalf("oauth values = %#v, %q, %q", pkce, state, nonce)
 	}
 }
 

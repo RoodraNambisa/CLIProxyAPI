@@ -53,6 +53,7 @@ const idempotencyKeyMetadataKey = "idempotency_key"
 const (
 	defaultStreamingKeepAliveSeconds = 0
 	defaultStreamingBootstrapRetries = 0
+	maxStreamingBootstrapBufferBytes = 64 << 10
 )
 
 type pinnedAuthContextKey struct{}
@@ -60,6 +61,7 @@ type selectedAuthCallbackContextKey struct{}
 type executionSessionContextKey struct{}
 type imageGenerationStreamPassthroughContextKey struct{}
 type imageGenerationStreamPassthroughStateContextKey struct{}
+type imageGenerationMaxResultsContextKey struct{}
 type interactionsAPIMetadataContextKey struct{}
 
 type interactionsAPIMetadata struct {
@@ -119,11 +121,41 @@ func imageGenerationStreamPassthroughState(ctx context.Context) *coreexecutor.Im
 	return state
 }
 
-func providersAreOnlyCodex(providers []string) bool {
-	if len(providers) != 1 {
+// WithImageGenerationMaxResults limits how many generated images a provider
+// should materialize for one compatibility endpoint execution.
+func WithImageGenerationMaxResults(ctx context.Context, maxResults int) context.Context {
+	if maxResults <= 0 {
+		return ctx
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, imageGenerationMaxResultsContextKey{}, maxResults)
+}
+
+func imageGenerationMaxResults(ctx context.Context) int {
+	if ctx == nil {
+		return 0
+	}
+	maxResults, _ := ctx.Value(imageGenerationMaxResultsContextKey{}).(int)
+	if maxResults < 0 {
+		return 0
+	}
+	return maxResults
+}
+
+func providersSupportImageStreamPassthrough(providers []string) bool {
+	if len(providers) == 0 {
 		return false
 	}
-	return strings.EqualFold(strings.TrimSpace(providers[0]), "codex")
+	for _, provider := range providers {
+		switch strings.ToLower(strings.TrimSpace(provider)) {
+		case constant.Codex, constant.ChatGPTWeb:
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 func adjustExecutionProvidersForEntryProtocol(entryProtocol string, providers []string) []string {
@@ -462,6 +494,9 @@ func requestExecutionMetadata(ctx context.Context) map[string]any {
 	}
 	if state := imageGenerationStreamPassthroughState(ctx); state != nil {
 		meta[coreexecutor.ImageGenerationStreamPassthroughStateMetadataKey] = state
+	}
+	if maxResults := imageGenerationMaxResults(ctx); maxResults > 0 {
+		meta[coreexecutor.ImageGenerationMaxResultsMetadataKey] = maxResults
 	}
 	if ctx != nil {
 		if interactions, ok := ctx.Value(interactionsAPIMetadataContextKey{}).(interactionsAPIMetadata); ok {
@@ -858,7 +893,7 @@ func (h *BaseAPIHandler) ExecuteWithProvidersAndExecutionModel(ctx context.Conte
 	if normalizedExecutionModel := strings.TrimSpace(executionModelName); normalizedExecutionModel != "" && normalizedExecutionModel != normalizedRouteModel {
 		reqMeta[coreexecutor.ExecutionModelOverrideMetadataKey] = normalizedExecutionModel
 	}
-	imageStreamPassthrough := handlerType == "openai-response" && imageGenerationStreamPassthrough(ctx) && providersAreOnlyCodex(providers)
+	imageStreamPassthrough := handlerType == "openai-response" && imageGenerationStreamPassthrough(ctx) && providersSupportImageStreamPassthrough(providers)
 	if imageStreamPassthrough {
 		reqMeta[coreexecutor.ImageGenerationStreamPassthroughMetadataKey] = true
 	}
@@ -998,7 +1033,7 @@ func (h *BaseAPIHandler) executeStreamWithResolvedProviders(ctx context.Context,
 	if normalizedExecutionModel := strings.TrimSpace(executionModelName); normalizedExecutionModel != "" && normalizedExecutionModel != normalizedRouteModel {
 		reqMeta[coreexecutor.ExecutionModelOverrideMetadataKey] = normalizedExecutionModel
 	}
-	requestedImageStreamPassthrough := handlerType == "openai-response" && imageGenerationStreamPassthrough(ctx) && providersAreOnlyCodex(providers)
+	requestedImageStreamPassthrough := handlerType == "openai-response" && imageGenerationStreamPassthrough(ctx) && providersSupportImageStreamPassthrough(providers)
 	if requestedImageStreamPassthrough {
 		reqMeta[coreexecutor.ImageGenerationStreamPassthroughMetadataKey] = true
 	}
@@ -1111,6 +1146,37 @@ func (h *BaseAPIHandler) executeStreamWithResolvedProviders(ctx context.Context,
 
 	outer:
 		for {
+			var bootstrapDetector SSEBootstrapDetector
+			var responsesSSEFramer sseDataJSONFramer
+			var bootstrapBuffer bytes.Buffer
+			flushBootstrapBuffer := func() bool {
+				if bootstrapBuffer.Len() == 0 {
+					return true
+				}
+				payload := cloneBytes(bootstrapBuffer.Bytes())
+				bootstrapBuffer.Reset()
+				return sendData(payload)
+			}
+			forwardPayload := func(payload []byte, clone, validatedSemantic bool) bool {
+				if validatedSemantic || bootstrapDetector.Feed(payload) {
+					sentPayload = true
+				}
+				if clone {
+					payload = cloneBytes(payload)
+				}
+				if !sentPayload && bootstrapBuffer.Len()+len(payload) <= maxStreamingBootstrapBufferBytes {
+					_, _ = bootstrapBuffer.Write(payload)
+					return true
+				}
+				if bootstrapBuffer.Len() > 0 {
+					if !flushBootstrapBuffer() {
+						return false
+					}
+					sentPayload = true
+				}
+				sentPayload = true
+				return sendData(payload)
+			}
 			for {
 				var chunk coreexecutor.StreamChunk
 				var ok bool
@@ -1124,6 +1190,28 @@ func (h *BaseAPIHandler) executeStreamWithResolvedProviders(ctx context.Context,
 					chunk, ok = <-chunks
 				}
 				if !ok {
+					if handlerType == "openai-response" && !imageStreamPassthrough() && !trustResponsesSSE {
+						frames, err := responsesSSEFramer.Finish()
+						if err != nil {
+							_ = sendErr(&interfaces.ErrorMessage{StatusCode: http.StatusBadGateway, Error: err})
+							return
+						}
+						for _, frame := range frames {
+							if !forwardPayload(frame, false, sseDataJSONFrameHasSemanticData(frame)) {
+								return
+							}
+						}
+						if bootstrapBuffer.Len() > 0 && !flushBootstrapBuffer() {
+							return
+						}
+					} else if !sentPayload && handlerType == "openai-response" && !trustResponsesSSE &&
+						sseDataJSONCanEmitWithoutDelimiter(bootstrapBuffer.Bytes()) {
+						sentPayload = true
+						_ = flushBootstrapBuffer()
+					} else if handlerType == "openai-response" && trustResponsesSSE && bootstrapBuffer.Len() > 0 {
+						sentPayload = true
+						_ = flushBootstrapBuffer()
+					}
 					return
 				}
 				if chunk.Err != nil {
@@ -1160,20 +1248,32 @@ func (h *BaseAPIHandler) executeStreamWithResolvedProviders(ctx context.Context,
 					_ = sendErr(&interfaces.ErrorMessage{StatusCode: status, Error: streamErr, Addon: addon})
 					return
 				}
+				if coreexecutor.IsBootstrapCommitStreamChunk(chunk) {
+					sentPayload = true
+					if !flushBootstrapBuffer() {
+						return
+					}
+					continue
+				}
 				if len(chunk.Payload) > 0 {
 					effectiveImageStreamPassthrough := imageStreamPassthrough()
 					if handlerType == "openai-response" && !effectiveImageStreamPassthrough && !trustResponsesSSE {
-						if err := validateSSEDataJSON(chunk.Payload); err != nil {
+						frames, err := responsesSSEFramer.Feed(chunk.Payload)
+						if err != nil {
 							_ = sendErr(&interfaces.ErrorMessage{StatusCode: http.StatusBadGateway, Error: err})
 							return
 						}
+						for _, frame := range frames {
+							if !forwardPayload(frame, false, sseDataJSONFrameHasSemanticData(frame)) {
+								return
+							}
+						}
+						continue
 					}
-					sentPayload = true
-					payload := chunk.Payload
-					if !effectiveImageStreamPassthrough && !trustResponsesSSE {
-						payload = cloneBytes(chunk.Payload)
-					}
-					if okSendData := sendData(payload); !okSendData {
+					validatedSemantic := !trustResponsesSSE &&
+						sseDataJSONCanEmitWithoutDelimiter(chunk.Payload) &&
+						sseDataJSONFrameHasSemanticData(chunk.Payload)
+					if !forwardPayload(chunk.Payload, !effectiveImageStreamPassthrough && !trustResponsesSSE, validatedSemantic) {
 						return
 					}
 				}
@@ -1181,35 +1281,6 @@ func (h *BaseAPIHandler) executeStreamWithResolvedProviders(ctx context.Context,
 		}
 	}()
 	return dataChan, upstreamHeaders, errChan
-}
-
-func validateSSEDataJSON(chunk []byte) error {
-	for _, line := range bytes.Split(chunk, []byte("\n")) {
-		line = bytes.TrimSpace(line)
-		if len(line) == 0 {
-			continue
-		}
-		if !bytes.HasPrefix(line, []byte("data:")) {
-			continue
-		}
-		data := bytes.TrimSpace(line[5:])
-		if len(data) == 0 {
-			continue
-		}
-		if bytes.Equal(data, []byte("[DONE]")) {
-			continue
-		}
-		if json.Valid(data) {
-			continue
-		}
-		const max = 512
-		preview := data
-		if len(preview) > max {
-			preview = preview[:max]
-		}
-		return fmt.Errorf("invalid SSE data JSON (len=%d): %q", len(data), preview)
-	}
-	return nil
 }
 
 func statusFromError(err error) int {

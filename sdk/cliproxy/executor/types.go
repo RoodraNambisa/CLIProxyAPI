@@ -36,6 +36,9 @@ const (
 	// ImageGenerationStreamPassthroughStateMetadataKey carries the effective passthrough
 	// state after provider policy has transformed the request.
 	ImageGenerationStreamPassthroughStateMetadataKey = "image_generation_stream_passthrough_state"
+	// ImageGenerationMaxResultsMetadataKey limits provider-side image result
+	// materialization for compatibility image endpoints.
+	ImageGenerationMaxResultsMetadataKey = "image_generation_max_results"
 	// TrustUpstreamSSEMetadataKey requests direct forwarding of trusted upstream SSE frames.
 	TrustUpstreamSSEMetadataKey = "trust_upstream_sse"
 	// SelectionAttemptMetadataKey stores the outer retry attempt index for auth selection.

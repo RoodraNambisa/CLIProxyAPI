@@ -33,6 +33,7 @@ const (
 	codexUserAgent             = "codex-tui/0.135.0 (Mac OS 26.5.0; arm64) iTerm.app/3.6.10 (codex-tui; 0.135.0)"
 	codexOriginator            = "codex-tui"
 	codexDefaultImageToolModel = "gpt-image-2"
+	codexSSEMaxFrameBytes      = 52_428_800
 )
 
 var dataTag = []byte("data:")
@@ -546,7 +547,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	imageRequest := cliproxyauth.PayloadHasImageGenerationTool(body)
 
 	url := strings.TrimSuffix(baseURL, "/") + "/responses"
-	httpReq, upstreamBody, identityState, err := e.cacheHelper(ctx, from, url, auth, req, originalPayload, body)
+	httpReq, upstreamBody, identityState, err := e.cacheHelper(ctx, from, url, auth, req, originalPayload, body, true)
 	if err != nil {
 		return resp, err
 	}
@@ -693,7 +694,7 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 	imageRequest := cliproxyauth.PayloadHasImageGenerationTool(body)
 
 	url := strings.TrimSuffix(baseURL, "/") + "/responses/compact"
-	httpReq, upstreamBody, identityState, err := e.cacheHelper(ctx, from, url, auth, req, originalPayload, body)
+	httpReq, upstreamBody, identityState, err := e.cacheHelper(ctx, from, url, auth, req, originalPayload, body, true)
 	if err != nil {
 		return resp, err
 	}
@@ -817,7 +818,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	trustUpstreamSSE := metadataBool(opts.Metadata, cliproxyexecutor.TrustUpstreamSSEMetadataKey) && from == sdktranslator.FormatOpenAIResponse
 
 	url := strings.TrimSuffix(baseURL, "/") + "/responses"
-	httpReq, upstreamBody, identityState, err := e.cacheHelper(ctx, from, url, auth, req, originalPayload, body)
+	httpReq, upstreamBody, identityState, err := e.cacheHelper(ctx, from, url, auth, req, originalPayload, body, true)
 	if err != nil {
 		return nil, err
 	}
@@ -893,12 +894,14 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 			}
 		}()
 		scanner := bufio.NewScanner(httpResp.Body)
-		scanner.Buffer(make([]byte, 64*1024), 52_428_800) // 50MB
+		scanner.Buffer(make([]byte, 64*1024), codexSSEMaxFrameBytes)
+		if trustUpstreamSSE {
+			scanner.Split(splitCodexSSELinesPreserveEndings)
+		}
 		var param any
 		outputItemsByIndex := make(map[int64][]byte)
 		var outputItemsFallback [][]byte
 		var trustedFrame []byte
-		var trustedFrameTerminal bool
 		var pendingImageCompletionEvent []byte
 		var pendingTranslatedCompletionEvent []byte
 		emit := func(chunk cliproxyexecutor.StreamChunk) bool {
@@ -921,21 +924,34 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 		}
 		flushTrustedFrame := func() (bool, bool) {
 			if len(bytes.TrimSpace(trustedFrame)) == 0 {
-				trustedFrame = trustedFrame[:0]
-				trustedFrameTerminal = false
+				trustedFrame = nil
 				return true, false
 			}
-			payload := append([]byte(nil), trustedFrame...)
-			terminal := trustedFrameTerminal
-			if terminal {
-				payload = normalizeCodexSSECompletionEventLines(payload)
+			frame := trustedFrame
+			trustedFrame = nil
+			hasData := false
+			terminal := false
+			if codexTrustedSSEFrameNeedsInspection(frame) {
+				data, frameHasData := codexSSEFrameDataPayload(frame)
+				hasData = frameHasData
+				if hasData {
+					if terminalErr, ok := codexTerminalStreamError(data); ok {
+						helps.ClearCodexReasoningReplayOnInvalidSignature(replayScope, terminalErr.code, data)
+						reporter.PublishFailure(ctx, terminalErr)
+						_ = emit(cliproxyexecutor.StreamChunk{Err: terminalErr})
+						return false, false
+					}
+					publishCodexStreamUsage(reporter, streamBody.Bytes(), data)
+					terminal = isCodexSuccessfulCompletion(data)
+				}
 			}
-			trustedFrame = trustedFrame[:0]
-			trustedFrameTerminal = false
-			return emit(cliproxyexecutor.StreamChunk{Payload: payload}), terminal
+			return emit(cliproxyexecutor.StreamChunk{Payload: frame}), terminal
 		}
 		for scanner.Scan() {
-			line := applyCodexIdentityConfuseResponsePayload(scanner.Bytes(), identityState)
+			line := scanner.Bytes()
+			if !trustUpstreamSSE {
+				line = applyCodexIdentityConfuseResponsePayload(line, identityState)
+			}
 			helps.AppendAPIResponseChunk(ctx, e.cfg, line)
 			clientLine := applyCodexIdentityExposeResponsePayload(line, identityState)
 			if bytes.HasPrefix(clientLine, dataTag) {
@@ -948,8 +964,26 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 				}
 			}
 			if trustUpstreamSSE {
-				clientLine = normalizeCodexSSEPassThroughLine(clientLine)
-				publishCodexStreamUsage(ctx, reporter, streamBody.Bytes(), clientLine)
+				nextTrustedFrame, errFrame := appendBoundedCodexTrustedSSEFrame(
+					trustedFrame,
+					clientLine,
+					codexSSEMaxFrameBytes,
+				)
+				if errFrame != nil {
+					frameErr := codexStreamStatusErr(
+						http.StatusBadGateway,
+						errFrame.Error(),
+						"stream_frame_too_large",
+						"server_error",
+						nil,
+					)
+					frameErr.skipAuthResult = true
+					helps.RecordAPIResponseError(ctx, e.cfg, frameErr)
+					reporter.PublishFailure(ctx, frameErr)
+					_ = emit(cliproxyexecutor.StreamChunk{Err: frameErr})
+					return
+				}
+				trustedFrame = nextTrustedFrame
 				if len(bytes.TrimSpace(line)) == 0 {
 					emitted, terminal := flushTrustedFrame()
 					if !emitted {
@@ -961,9 +995,6 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 					}
 					continue
 				}
-				trustedFrameTerminal = trustedFrameTerminal || codexSSEDataCompletion(clientLine)
-				trustedFrame = append(trustedFrame, clientLine...)
-				trustedFrame = append(trustedFrame, '\n')
 				continue
 			}
 			if imageStreamPassthrough {
@@ -986,7 +1017,9 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 					}
 					if len(pendingImageCompletionEvent) > 0 {
 						if terminal {
-							if !emit(cliproxyexecutor.StreamChunk{Payload: append([]byte(nil), pendingImageCompletionEvent...)}) {
+							pendingEvent := append([]byte(nil), pendingImageCompletionEvent...)
+							pendingEvent = append(pendingEvent, '\n')
+							if !emit(cliproxyexecutor.StreamChunk{Payload: pendingEvent}) {
 								return
 							}
 						}
@@ -995,7 +1028,12 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 				} else if len(trimmedClientLine) == 0 || bytes.HasPrefix(trimmedClientLine, []byte("event:")) {
 					pendingImageCompletionEvent = pendingImageCompletionEvent[:0]
 				}
-				if !emit(cliproxyexecutor.StreamChunk{Payload: append([]byte(nil), clientLine...)}) {
+				payload := append([]byte(nil), clientLine...)
+				payload = append(payload, '\n')
+				if terminal {
+					payload = append(payload, '\n')
+				}
+				if !emit(cliproxyexecutor.StreamChunk{Payload: payload}) {
 					return
 				}
 				if terminal && scanner.Err() == nil {
@@ -1083,6 +1121,35 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	return &cliproxyexecutor.StreamResult{Headers: httpResp.Header.Clone(), Chunks: out}, nil
 }
 
+func splitCodexSSELinesPreserveEndings(data []byte, atEOF bool) (advance int, token []byte, err error) {
+	for index, value := range data {
+		switch value {
+		case '\n':
+			return index + 1, data[:index+1], nil
+		case '\r':
+			if index+1 == len(data) && !atEOF {
+				return 0, nil, nil
+			}
+			lineEnd := index + 1
+			if lineEnd < len(data) && data[lineEnd] == '\n' {
+				lineEnd++
+			}
+			return lineEnd, data[:lineEnd], nil
+		}
+	}
+	if atEOF && len(data) > 0 {
+		return len(data), data, nil
+	}
+	return 0, nil, nil
+}
+
+func appendBoundedCodexTrustedSSEFrame(frame, line []byte, maxBytes int) ([]byte, error) {
+	if maxBytes < 1 || len(frame) > maxBytes || len(line) > maxBytes-len(frame) {
+		return frame, fmt.Errorf("codex trusted SSE frame exceeds %d bytes", maxBytes)
+	}
+	return append(frame, line...), nil
+}
+
 func normalizeCodexSSEEventLine(line []byte) []byte {
 	trimmed := bytes.TrimSpace(line)
 	if !bytes.HasPrefix(trimmed, []byte("event:")) || strings.TrimSpace(string(trimmed[len("event:"):])) != "response.done" {
@@ -1101,14 +1168,6 @@ func normalizeCodexSSEPassThroughLine(line []byte) []byte {
 		return line
 	}
 	return append([]byte("data: "), normalizeCodexCompletion(data)...)
-}
-
-func normalizeCodexSSECompletionEventLines(frame []byte) []byte {
-	lines := bytes.Split(frame, []byte{'\n'})
-	for i := range lines {
-		lines[i] = normalizeCodexSSEEventLine(lines[i])
-	}
-	return bytes.Join(lines, []byte{'\n'})
 }
 
 func (e *CodexExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
@@ -1320,7 +1379,7 @@ type codexIdentityReplacement struct {
 	confused string
 }
 
-func (e *CodexExecutor) cacheHelper(ctx context.Context, from sdktranslator.Format, url string, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, userPayload []byte, rawJSON []byte) (*http.Request, []byte, codexIdentityConfuseState, error) {
+func (e *CodexExecutor) cacheHelper(ctx context.Context, from sdktranslator.Format, url string, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, userPayload []byte, rawJSON []byte, allowIdentityConfuse bool) (*http.Request, []byte, codexIdentityConfuseState, error) {
 	var cache helps.CodexCache
 	if from == "claude" {
 		userIDResult := gjson.GetBytes(req.Payload, "metadata.user_id")
@@ -1350,7 +1409,9 @@ func (e *CodexExecutor) cacheHelper(ctx context.Context, from sdktranslator.Form
 		rawJSON, _ = sjson.SetBytes(rawJSON, "prompt_cache_key", cache.ID)
 	}
 	var identityState codexIdentityConfuseState
-	rawJSON, identityState = applyCodexIdentityConfuseBody(e.cfg, auth, userPayload, rawJSON)
+	if allowIdentityConfuse {
+		rawJSON, identityState = applyCodexIdentityConfuseBody(e.cfg, auth, userPayload, rawJSON)
+	}
 	if identityState.promptCacheKey != "" {
 		cache.ID = identityState.promptCacheKey
 	}
@@ -1662,18 +1723,66 @@ func observeCodexImageToolUsage(reporter *helps.UsageReporter, body []byte, comp
 	reporter.ObserveAdditionalModel(codexImageGenerationToolModel(body), detail)
 }
 
-func publishCodexStreamUsage(_ context.Context, reporter *helps.UsageReporter, body []byte, line []byte) {
-	data, ok := codexStreamDataPayload(line)
-	if !ok || !bytes.Contains(data, []byte("response.completed")) {
-		return
-	}
-	if gjson.GetBytes(data, "type").String() != "response.completed" {
+func publishCodexStreamUsage(reporter *helps.UsageReporter, body []byte, data []byte) {
+	if !isCodexCompletionType(gjson.GetBytes(data, "type").String()) {
 		return
 	}
 	if detail, ok := helps.ParseCodexUsage(data); ok {
 		reporter.Observe(detail)
 	}
 	observeCodexImageToolUsage(reporter, body, data)
+}
+
+func codexSSEFrameDataPayload(frame []byte) ([]byte, bool) {
+	var payload []byte
+	found := false
+	forEachCodexSSELine(frame, func(line []byte) {
+		line = bytes.TrimSpace(line)
+		if !bytes.HasPrefix(line, dataTag) {
+			return
+		}
+		if found {
+			payload = append(payload, '\n')
+		}
+		payload = append(payload, bytes.TrimSpace(line[len(dataTag):])...)
+		found = true
+	})
+	return payload, found
+}
+
+func forEachCodexSSELine(data []byte, visit func([]byte)) {
+	if visit == nil {
+		return
+	}
+	lineStart := 0
+	for index := 0; index < len(data); {
+		if data[index] != '\r' && data[index] != '\n' {
+			index++
+			continue
+		}
+		visit(data[lineStart:index])
+		index++
+		if data[index-1] == '\r' && index < len(data) && data[index] == '\n' {
+			index++
+		}
+		lineStart = index
+	}
+	visit(data[lineStart:])
+}
+
+func codexTrustedSSEFrameNeedsInspection(frame []byte) bool {
+	for _, marker := range [][]byte{
+		[]byte("response.completed"),
+		[]byte("response.done"),
+		[]byte("response.failed"),
+		[]byte("response.incomplete"),
+		[]byte(`"error"`),
+	} {
+		if bytes.Contains(frame, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 func codexStreamDataPayload(line []byte) ([]byte, bool) {

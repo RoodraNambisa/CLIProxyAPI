@@ -60,6 +60,42 @@ func TestChatGPTWebExecutorShouldPrepareExpiringCredential(t *testing.T) {
 	}
 }
 
+func TestChatGPTWebExecutorRefreshUsesStableLegacyRuntimeIdentity(t *testing.T) {
+	auth := chatGPTWebTestAuth("legacy-identity")
+	delete(auth.Metadata, "device_id")
+	delete(auth.Metadata, "session_id")
+	auth.Metadata["email"] = "person@example.com"
+	expected, err := chatgptwebauth.ParseCredential(auth.Metadata)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = chatgptwebauth.EnsureCredentialRuntimeIDs(expected, chatgptwebauth.CredentialRuntimeIdentityReader(auth.ID, expected)); err != nil {
+		t.Fatal(err)
+	}
+
+	var received chatgptwebauth.Credential
+	fake := &fakeChatGPTWebAuthService{}
+	fake.refreshFn = func(_ context.Context, credential chatgptwebauth.Credential, _ string) (*chatgptwebauth.Credential, error) {
+		received = credential
+		credential.AccessToken = "refreshed-token"
+		credential.LifecycleState = chatgptwebauth.LifecycleActive
+		return &credential, nil
+	}
+	executor := NewChatGPTWebExecutor(&config.Config{}, nil)
+	executor.authService = fake
+
+	updated, err := executor.Refresh(t.Context(), auth)
+	if err != nil {
+		t.Fatalf("Refresh() error = %v", err)
+	}
+	if received.DeviceID != expected.DeviceID || received.SessionID != expected.SessionID {
+		t.Fatalf("refresh identity = %q/%q, want %q/%q", received.DeviceID, received.SessionID, expected.DeviceID, expected.SessionID)
+	}
+	if updated.Metadata["device_id"] != expected.DeviceID || updated.Metadata["session_id"] != expected.SessionID {
+		t.Fatalf("persisted identity = %v/%v", updated.Metadata["device_id"], updated.Metadata["session_id"])
+	}
+}
+
 func TestChatGPTWebExecutorTerminalRefreshLifecycle(t *testing.T) {
 	for _, test := range []struct {
 		name        string
@@ -215,6 +251,61 @@ func TestChatGPTWebExecutorRefreshSingleflightCallerCancellation(t *testing.T) {
 	}
 	if got := fake.refreshCalls.Load(); got != 1 {
 		t.Fatalf("refresh calls = %d, want 1", got)
+	}
+}
+
+func TestChatGPTWebExecutorRefreshSingleflightStopsWhenAuthRetires(t *testing.T) {
+	manager := cliproxyauth.NewManager(nil, nil, nil)
+	auth := chatGPTWebTestAuth("refresh-retirement")
+	if _, err := manager.Register(cliproxyauth.WithSkipPersist(t.Context()), auth); err != nil {
+		t.Fatal(err)
+	}
+	installed, ok := manager.GetByID(auth.ID)
+	if !ok {
+		t.Fatal("registered auth not found")
+	}
+
+	started := make(chan struct{})
+	canceled := make(chan struct{})
+	fake := &fakeChatGPTWebAuthService{}
+	fake.refreshFn = func(ctx context.Context, _ chatgptwebauth.Credential, _ string) (*chatgptwebauth.Credential, error) {
+		close(started)
+		<-ctx.Done()
+		close(canceled)
+		return nil, ctx.Err()
+	}
+	executor := NewChatGPTWebExecutor(&config.Config{}, nil)
+	executor.authService = fake
+
+	refreshDone := make(chan error, 1)
+	go func() {
+		_, err := executor.PrepareRequestAuth(t.Context(), installed)
+		refreshDone <- err
+	}()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("refresh did not start")
+	}
+
+	replacement := installed.Clone()
+	replacement.Metadata["access_token"] = "replacement-token"
+	replacement.Attributes[cliproxyauth.SourceHashAttributeKey] = "replacement-source"
+	if _, err := manager.Update(cliproxyauth.WithSkipPersist(t.Context()), replacement); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-canceled:
+	case <-time.After(time.Second):
+		t.Fatal("retiring the auth did not cancel the shared refresh acquisition")
+	}
+	select {
+	case err := <-refreshDone:
+		if err == nil {
+			t.Fatal("retired auth refresh returned no error")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("retired auth refresh did not finish")
 	}
 }
 
@@ -590,6 +681,7 @@ func TestChatGPTWebExecutorReloginUsesConditionalUpdate(t *testing.T) {
 func TestChatGPTWebExecutorReloginResultDoesNotShareCredentialMetadata(t *testing.T) {
 	manager := cliproxyauth.NewManager(nil, nil, nil)
 	expected := registerChatGPTWebPendingAuth(t, manager, "clone-relogin")
+	cleanupDone := expected.RuntimeInstanceCleanupDone()
 	fake := &fakeChatGPTWebAuthService{}
 	fake.loginFn = func(_ context.Context, input chatgptwebauth.LoginInput) (*chatgptwebauth.Credential, error) {
 		credential := cloneChatGPTWebCredential(input.Credential)
@@ -604,12 +696,24 @@ func TestChatGPTWebExecutorReloginResultDoesNotShareCredentialMetadata(t *testin
 	if errRelogin != nil || !current || updated == nil {
 		t.Fatalf("ReloginCurrent() = (%v, %v, %v)", updated, current, errRelogin)
 	}
+	if updated.RuntimeInstanceID() == expected.RuntimeInstanceID() {
+		t.Fatal("successful re-login reused the previous runtime instance")
+	}
+	if _, release, active := expected.BeginRuntimeExecution(t.Context()); active {
+		release()
+		t.Fatal("successful re-login left the previous runtime instance active")
+	}
 	cookies := updated.Metadata["cookies"].([]chatgptwebauth.Cookie)
 	cookies[0].Value = "caller-mutation"
 	installed, _ := manager.GetByID(expected.ID)
 	installedCookies := installed.Metadata["cookies"].([]chatgptwebauth.Cookie)
 	if installedCookies[0].Value != "fresh-cookie" {
 		t.Fatalf("installed cookie = %q, want independent metadata", installedCookies[0].Value)
+	}
+	select {
+	case <-cleanupDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("successful re-login cleanup did not finish")
 	}
 }
 

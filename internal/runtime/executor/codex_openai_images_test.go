@@ -3,6 +3,7 @@ package executor
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -119,16 +120,24 @@ func TestCodexExecutorOpenAIImageExecuteStreamProxiesEdits(t *testing.T) {
 		t.Fatalf("ExecuteStream() error = %v", err)
 	}
 	var out bytes.Buffer
+	bootstrapCount := 0
 	terminalCount := 0
 	for chunk := range result.Chunks {
 		if chunk.Err != nil {
 			t.Fatalf("stream chunk error = %v", chunk.Err)
+		}
+		if cliproxyexecutor.IsBootstrapCommitStreamChunk(chunk) {
+			bootstrapCount++
+			continue
 		}
 		if cliproxyexecutor.IsSuccessfulStreamTerminalChunk(chunk) {
 			terminalCount++
 			continue
 		}
 		out.Write(chunk.Payload)
+	}
+	if bootstrapCount != 0 {
+		t.Fatalf("bootstrap marker count = %d, want 0 before semantic image data", bootstrapCount)
 	}
 	if terminalCount != 1 {
 		t.Fatalf("terminal marker count = %d, want 1", terminalCount)
@@ -147,5 +156,57 @@ func TestCodexExecutorOpenAIImageExecuteStreamProxiesEdits(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "image_generation.partial_image") {
 		t.Fatalf("stream output = %q, want partial image event", out.String())
+	}
+}
+
+func TestCodexExecutorOpenAIImageStreamSupportsCROnlySSE(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("event: image_generation.partial_image\r"))
+		_, _ = w.Write([]byte(`data: {"type":"image_generation.partial_image","b64_json":"cGFydA=="}` + "\r\r"))
+		_, _ = w.Write([]byte("data: [DONE]\r\r"))
+	}))
+	defer server.Close()
+
+	executor := NewCodexExecutor(&config.Config{SDKConfig: sdkconfig.SDKConfig{ProxyURL: "direct"}})
+	auth := &cliproxyauth.Auth{Provider: "codex", Attributes: map[string]string{"api_key": "test-key", "base_url": server.URL}}
+	result, err := executor.ExecuteStream(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "gpt-image-2",
+		Payload: []byte(`{"model":"gpt-image-2","prompt":"draw"}`),
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString(codexOpenAIImageSourceFormat),
+		Alt:          codexOpenAIImageGenerations,
+		Metadata: map[string]any{
+			cliproxyexecutor.StreamTerminalMarkerMetadataKey: true,
+		},
+	})
+	if err != nil {
+		t.Fatalf("ExecuteStream() error = %v", err)
+	}
+	var output bytes.Buffer
+	terminalCount := 0
+	for chunk := range result.Chunks {
+		if chunk.Err != nil {
+			t.Fatalf("stream chunk error = %v", chunk.Err)
+		}
+		if cliproxyexecutor.IsSuccessfulStreamTerminalChunk(chunk) {
+			terminalCount++
+			continue
+		}
+		output.Write(chunk.Payload)
+	}
+	if terminalCount != 1 {
+		t.Fatalf("terminal marker count = %d, want 1", terminalCount)
+	}
+	if !strings.Contains(output.String(), "image_generation.partial_image") || !strings.Contains(output.String(), "[DONE]") {
+		t.Fatalf("stream output = %q", output.String())
+	}
+}
+
+func TestReadCodexOpenAIImageResponseBodyEnforcesLimit(t *testing.T) {
+	_, err := readCodexOpenAIImageResponseBody(strings.NewReader("12345"), 4)
+	var status statusErr
+	if !errors.As(err, &status) || status.StatusCode() != http.StatusBadGateway || !status.SkipAuthResult() {
+		t.Fatalf("read error = %#v, want non-auth 502", err)
 	}
 }

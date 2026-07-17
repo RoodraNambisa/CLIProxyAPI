@@ -100,6 +100,27 @@ type Service struct {
 	// antigravityModelCapabilities caches per-auth model discovery results.
 	antigravityModelCapabilities sync.Map
 
+	// chatGPTWebModelCatalog caches the last successful per-auth web catalog.
+	chatGPTWebModelCatalog sync.Map
+
+	// chatGPTWebCatalogCommitObserved observes catalog commits after installation validation.
+	chatGPTWebCatalogCommitObserved func(*coreauth.Auth)
+
+	// chatGPTWebReloginObserved observes re-login scheduling after model state is synchronized.
+	chatGPTWebReloginObserved func(*coreauth.Auth)
+
+	// authModelTransitionMu protects per-auth model transition lock lifecycle.
+	authModelTransitionMu sync.Mutex
+
+	// authModelTransitionLocks serializes registry transitions for each auth ID.
+	authModelTransitionLocks map[string]*authModelTransitionLockEntry
+
+	// chatGPTWebModelFetchMu protects per-auth catalog fetch lock lifecycle.
+	chatGPTWebModelFetchMu sync.Mutex
+
+	// chatGPTWebModelFetchLocks serializes catalog fetches for each auth ID.
+	chatGPTWebModelFetchLocks map[string]*chatGPTWebModelFetchLockEntry
+
 	// usagePersistenceMu protects the periodic persistence loop lifecycle.
 	usagePersistenceMu sync.Mutex
 
@@ -212,6 +233,11 @@ type modelSyncTaskState struct {
 	dirty bool
 }
 
+type authModelTransitionLockEntry struct {
+	mu         sync.Mutex
+	references int
+}
+
 type authMaintenanceHook struct {
 	service *Service
 }
@@ -228,19 +254,93 @@ func (h authMaintenanceHook) handleAuthChange(ctx context.Context, auth *coreaut
 	if h.service == nil || auth == nil || strings.TrimSpace(auth.ID) == "" {
 		return
 	}
-	provider := strings.ToLower(strings.TrimSpace(auth.Provider))
-	if provider == "chatgpt-web" {
-		h.service.triggerChatGPTWebRelogin(auth)
-	}
 	if ctx != nil && ctx.Value(modelSyncHookSuppressedContextKey{}) != nil {
+		if h.service.coreManager != nil {
+			current, ok := h.service.coreManager.CurrentAuthInstallation(auth)
+			if !ok {
+				return
+			}
+			auth = current
+		}
+		if nativeChatGPTWeb := isNativeChatGPTWebAuth(auth); nativeChatGPTWeb {
+			h.service.ensureExecutorsForAuth(auth)
+		}
 		return
 	}
-	if provider != "antigravity" || auth.Disabled || auth.Status == coreauth.StatusDisabled {
+	unlockTransition := h.service.lockAuthModelTransition(auth.ID)
+	if h.service.coreManager != nil {
+		current, ok := h.service.coreManager.CurrentAuthInstallation(auth)
+		if !ok {
+			unlockTransition()
+			return
+		}
+		auth = current
+	}
+	provider := strings.ToLower(strings.TrimSpace(auth.Provider))
+	nativeChatGPTWeb := isNativeChatGPTWebAuth(auth)
+	registeredProvider := registry.GetGlobalRegistry().GetProviderForClient(auth.ID)
+	if nativeChatGPTWeb {
+		h.service.ensureExecutorsForAuth(auth)
+	}
+	if provider != "antigravity" {
 		h.service.antigravityModelCapabilities.Delete(auth.ID)
+	}
+	if !nativeChatGPTWeb {
+		h.service.chatGPTWebModelCatalog.Delete(auth.ID)
+	}
+	if auth.Disabled || auth.Status == coreauth.StatusDisabled {
+		h.service.chatGPTWebModelCatalog.Delete(auth.ID)
+		GlobalModelRegistry().UnregisterClient(auth.ID)
+		if provider == "antigravity" {
+			h.service.antigravityModelCapabilities.Delete(auth.ID)
+		}
+		unlockTransition()
 		return
+	}
+	registryAction := chatGPTWebRegistryStateNone
+	antigravityProviderChanged := false
+	if nativeChatGPTWeb {
+		if coreauth.ChatGPTWebCredentialRefreshed(ctx) {
+			h.service.migrateOpaqueChatGPTWebCatalogAfterRefreshLocked(auth)
+		}
+		resetTransientState := coreauth.ChatGPTWebCredentialReplaced(ctx)
+		registryAction = h.service.reconcileChatGPTWebAuthStateLocked(ctx, auth, resetTransientState, resetTransientState)
+	} else if provider != "antigravity" {
+		providerChanged := registeredProvider != "" && !strings.EqualFold(registeredProvider, provider)
+		preserveTransientState := registeredProvider != "" && !providerChanged && authHasTransientState(auth)
+		if preserveTransientState {
+			h.service.registerModelsForAuthPreservingState(auth)
+		} else {
+			h.service.registerModelsForAuth(auth)
+		}
+		unlockTransition()
+		if h.service.coreManager != nil {
+			if preserveTransientState {
+				h.service.coreManager.PruneRegistryModelStates(ctx, auth.ID)
+			} else {
+				h.service.coreManager.ReconcileRegistryModelStates(ctx, auth.ID)
+			}
+			h.service.coreManager.RefreshSchedulerEntry(auth.ID)
+		}
+		return
+	} else {
+		antigravityProviderChanged = registeredProvider != "" && !strings.EqualFold(registeredProvider, provider)
+		if antigravityProviderChanged {
+			GlobalModelRegistry().UnregisterClient(auth.ID)
+		}
+	}
+	unlockTransition()
+	if nativeChatGPTWeb {
+		h.service.applyChatGPTWebRegistryState(ctx, auth, registryAction)
+	} else if antigravityProviderChanged && h.service.coreManager != nil {
+		h.service.coreManager.ReconcileRegistryModelStates(ctx, auth.ID)
+		h.service.coreManager.RefreshSchedulerEntry(auth.ID)
 	}
 	if !h.service.enqueueModelSync(auth.ID) {
 		h.service.syncAuthModelsInline(ctx, auth.ID)
+	}
+	if nativeChatGPTWeb {
+		h.service.triggerChatGPTWebRelogin(auth)
 	}
 }
 
@@ -767,13 +867,16 @@ func (s *Service) wakeAuthMaintenance() {
 	}
 }
 
-func (s *Service) installAuthMaintenanceHook() {
+func (s *Service) installAuthMaintenanceHook(ctx context.Context) {
 	if s == nil || s.coreManager == nil {
 		return
 	}
-	s.coreManager.AddHook(authMaintenanceHook{service: s})
+	hook := authMaintenanceHook{service: s}
+	s.coreManager.AddHook(hook)
 	for _, auth := range s.coreManager.List() {
-		s.triggerChatGPTWebRelogin(auth)
+		if isNativeChatGPTWebAuth(auth) {
+			hook.OnAuthUpdated(ctx, auth)
+		}
 	}
 }
 
@@ -783,6 +886,9 @@ func (s *Service) triggerChatGPTWebRelogin(auth *coreauth.Auth) {
 	}
 	if _, _, isCompat := openAICompatInfoFromAuth(auth); isCompat {
 		return
+	}
+	if s.chatGPTWebReloginObserved != nil {
+		s.chatGPTWebReloginObserved(auth)
 	}
 	s.ensureExecutorsForAuth(auth)
 	registered, ok := s.coreManager.Executor("chatgpt-web")
@@ -1641,6 +1747,7 @@ func (s *Service) handleAuthUpdate(ctx context.Context, update watcher.AuthUpdat
 				return
 			}
 			executorhelps.CloseProxyTransportCachesForAuth(id)
+			s.cleanupChatGPTWebModelResourcesAfterDelete(id, current.RuntimeInstanceID())
 			s.removeUsageStatisticsForAuthIndexes(indexes, "auth delete")
 			if s.reconcileUsageStatistics("auth delete") > 0 {
 				s.persistUsageStatistics("auth-delete-reconcile")
@@ -1770,6 +1877,13 @@ func (s *Service) applyCoreAuthAddOrUpdate(ctx context.Context, auth *coreauth.A
 		return
 	}
 	auth = auth.Clone()
+	unlockTransition := s.lockAuthModelTransition(auth.ID)
+	transitionLocked := true
+	defer func() {
+		if transitionLocked {
+			unlockTransition()
+		}
+	}()
 	s.ensureExecutorsForAuth(auth)
 
 	// IMPORTANT: Update coreManager FIRST, before model registration.
@@ -1777,20 +1891,25 @@ func (s *Service) applyCoreAuthAddOrUpdate(ctx context.Context, auth *coreauth.A
 	// immediately for API calls, rather than waiting for model registration to complete.
 	op := "register"
 	var err error
+	var installed *coreauth.Auth
+	existing, existed := s.coreManager.GetByID(auth.ID)
+	touchesChatGPTWeb := isNativeChatGPTWebAuth(auth) ||
+		(existed && isNativeChatGPTWebAuth(existing))
 	managerCtx := context.WithValue(ctx, modelSyncHookSuppressedContextKey{}, true)
-	if existing, ok := s.coreManager.GetByID(auth.ID); ok {
+	if existed {
 		auth.CreatedAt = existing.CreatedAt
 		if !existing.Disabled && existing.Status != coreauth.StatusDisabled && !auth.Disabled && auth.Status != coreauth.StatusDisabled {
 			auth.LastRefreshedAt = existing.LastRefreshedAt
 			auth.NextRefreshAfter = existing.NextRefreshAfter
-			if len(auth.ModelStates) == 0 && len(existing.ModelStates) > 0 {
+			if !touchesChatGPTWeb && len(auth.ModelStates) == 0 && len(existing.ModelStates) > 0 {
 				auth.ModelStates = existing.ModelStates
 			}
 		}
+		preserveChatGPTWebReplacementRuntimeState(existing, auth)
 		op = "update"
-		_, err = s.coreManager.Update(managerCtx, auth)
+		installed, err = s.coreManager.Update(managerCtx, auth)
 	} else {
-		_, err = s.coreManager.Register(managerCtx, auth)
+		installed, err = s.coreManager.Register(managerCtx, auth)
 	}
 	if pathLocked {
 		unlockPath()
@@ -1805,7 +1924,23 @@ func (s *Service) applyCoreAuthAddOrUpdate(ctx context.Context, auth *coreauth.A
 		}
 		auth = current
 	} else {
+		auth = installed
 		executorhelps.CloseProxyTransportCachesForAuth(auth.ID)
+	}
+	registryAction := chatGPTWebRegistryStateNone
+	currentInstallation := false
+	if touchesChatGPTWeb {
+		var current *coreauth.Auth
+		current, currentInstallation = s.coreManager.CurrentAuthInstallation(auth)
+		if currentInstallation {
+			auth = current
+			registryAction = s.reconcileChatGPTWebAuthStateLocked(ctx, auth, true, false)
+		}
+	}
+	unlockTransition()
+	transitionLocked = false
+	if currentInstallation {
+		s.applyChatGPTWebRegistryState(ctx, auth, registryAction)
 	}
 
 	// Register models after auth is updated in coreManager.
@@ -1813,6 +1948,9 @@ func (s *Service) applyCoreAuthAddOrUpdate(ctx context.Context, auth *coreauth.A
 	// auth update hot path so watcher bursts do not block on registry sync.
 	if !s.enqueueModelSync(auth.ID) {
 		s.syncAuthModelsInline(ctx, auth.ID)
+	}
+	if isNativeChatGPTWebAuth(auth) {
+		s.triggerChatGPTWebRelogin(auth)
 	}
 }
 
@@ -1858,12 +1996,17 @@ func (s *Service) deleteCoreAuth(ctx context.Context, id string) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	removedRuntimeInstanceID := ""
+	if current, ok := s.coreManager.GetByID(id); ok && current != nil {
+		removedRuntimeInstanceID = current.RuntimeInstanceID()
+	}
 	if err := s.coreManager.Delete(ctx, id); err != nil {
 		log.Errorf("failed to delete auth %s: %v", id, err)
 		return err
 	}
 	executorhelps.CloseProxyTransportCachesForAuth(id)
 	s.antigravityModelCapabilities.Delete(id)
+	s.cleanupChatGPTWebModelResourcesAfterDelete(id, removedRuntimeInstanceID)
 	return nil
 }
 
@@ -1882,7 +2025,7 @@ func (s *Service) applyCoreAuthRemovalWithReason(ctx context.Context, id string,
 	if !ok || existing == nil {
 		executorhelps.CloseProxyTransportCachesForAuth(id)
 		s.antigravityModelCapabilities.Delete(id)
-		GlobalModelRegistry().UnregisterClient(id)
+		s.cleanupChatGPTWebModelResourcesAfterDelete(id, "")
 		return true
 	}
 
@@ -1933,6 +2076,7 @@ func (s *Service) applyCoreAuthRemovalWithReason(ctx context.Context, id string,
 	}
 	executorhelps.CloseProxyTransportCachesForAuth(id)
 	s.antigravityModelCapabilities.Delete(id)
+	s.chatGPTWebModelCatalog.Delete(id)
 	GlobalModelRegistry().UnregisterClient(id)
 	if strings.EqualFold(strings.TrimSpace(existing.Provider), "codex") {
 		s.ensureExecutorsForAuth(existing)
@@ -2004,6 +2148,37 @@ func (s *Service) finishModelSync(authID string) bool {
 	return false
 }
 
+func (s *Service) lockAuthModelTransition(authID string) func() {
+	authID = strings.TrimSpace(authID)
+	if authID == "" {
+		var lock sync.Mutex
+		lock.Lock()
+		return lock.Unlock
+	}
+	s.authModelTransitionMu.Lock()
+	if s.authModelTransitionLocks == nil {
+		s.authModelTransitionLocks = make(map[string]*authModelTransitionLockEntry)
+	}
+	entry := s.authModelTransitionLocks[authID]
+	if entry == nil {
+		entry = &authModelTransitionLockEntry{}
+		s.authModelTransitionLocks[authID] = entry
+	}
+	entry.references++
+	s.authModelTransitionMu.Unlock()
+
+	entry.mu.Lock()
+	return func() {
+		entry.mu.Unlock()
+		s.authModelTransitionMu.Lock()
+		entry.references--
+		if entry.references == 0 && s.authModelTransitionLocks[authID] == entry {
+			delete(s.authModelTransitionLocks, authID)
+		}
+		s.authModelTransitionMu.Unlock()
+	}
+}
+
 func (s *Service) syncAuthModels(ctx context.Context, authID string) {
 	if s == nil || s.coreManager == nil {
 		return
@@ -2015,19 +2190,40 @@ func (s *Service) syncAuthModels(ctx context.Context, authID string) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	unlockTransition := s.lockAuthModelTransition(authID)
 	current, ok := s.coreManager.GetByID(authID)
 	if !ok || current == nil {
 		s.antigravityModelCapabilities.Delete(authID)
+		s.chatGPTWebModelCatalog.Delete(authID)
 		GlobalModelRegistry().UnregisterClient(authID)
+		unlockTransition()
 		return
 	}
 	provider := strings.ToLower(strings.TrimSpace(current.Provider))
+	nativeChatGPTWeb := isNativeChatGPTWebAuth(current)
 	if provider != "antigravity" || current.Disabled || current.Status == coreauth.StatusDisabled {
 		s.antigravityModelCapabilities.Delete(authID)
 	}
-	s.registerModelsForAuth(current)
-	s.coreManager.ReconcileRegistryModelStates(ctx, current.ID)
+	if !nativeChatGPTWeb {
+		s.chatGPTWebModelCatalog.Delete(authID)
+	}
+	if nativeChatGPTWeb {
+		unlockTransition()
+		s.syncChatGPTWebModels(ctx, current)
+		return
+	}
+	preserveTransientState := provider != "antigravity" &&
+		registry.GetGlobalRegistry().GetProviderForClient(current.ID) != "" &&
+		authHasTransientState(current)
+	if preserveTransientState {
+		s.registerModelsForAuthPreservingState(current)
+		s.coreManager.PruneRegistryModelStates(ctx, current.ID)
+	} else {
+		s.registerModelsForAuth(current)
+		s.coreManager.ReconcileRegistryModelStates(ctx, current.ID)
+	}
 	s.coreManager.RefreshSchedulerEntry(current.ID)
+	unlockTransition()
 
 	if provider != "antigravity" || current.Disabled || current.Status == coreauth.StatusDisabled {
 		return
@@ -2037,8 +2233,10 @@ func (s *Service) syncAuthModels(ctx context.Context, authID string) {
 	if !okFetch {
 		return
 	}
+	unlockTransition = s.lockAuthModelTransition(authID)
 	latest, currentSource := s.currentAuthForAntigravityCapability(source)
 	if !currentSource {
+		unlockTransition()
 		return
 	}
 	entry := &antigravityModelCapabilityCacheEntry{
@@ -2052,17 +2250,22 @@ func (s *Service) syncAuthModels(ctx context.Context, authID string) {
 
 	finalAuth, stillCurrent := s.currentAuthForAntigravityCapability(latest)
 	if stillCurrent {
+		unlockTransition()
 		return
 	}
 	s.antigravityModelCapabilities.CompareAndDelete(latest.ID, entry)
 	if finalAuth == nil {
 		GlobalModelRegistry().UnregisterClient(latest.ID)
+		unlockTransition()
 		return
 	}
 	s.registerModelsForAuth(finalAuth)
 	s.coreManager.ReconcileRegistryModelStates(ctx, finalAuth.ID)
 	s.coreManager.RefreshSchedulerEntry(finalAuth.ID)
-	if strings.EqualFold(strings.TrimSpace(finalAuth.Provider), "antigravity") && !finalAuth.Disabled && finalAuth.Status != coreauth.StatusDisabled {
+	requeue := strings.EqualFold(strings.TrimSpace(finalAuth.Provider), "antigravity") &&
+		!finalAuth.Disabled && finalAuth.Status != coreauth.StatusDisabled
+	unlockTransition()
+	if requeue {
 		s.enqueueModelSync(finalAuth.ID)
 	}
 }
@@ -2103,6 +2306,13 @@ func (s *Service) handleManagementAuthStatusChange(ctx context.Context, auth *co
 	}
 	if auth.Disabled || auth.Status == coreauth.StatusDisabled {
 		s.antigravityModelCapabilities.Delete(auth.ID)
+		if isNativeChatGPTWebAuth(auth) {
+			s.chatGPTWebModelCatalog.Delete(auth.ID)
+			GlobalModelRegistry().UnregisterClient(auth.ID)
+			if s.coreManager != nil {
+				s.coreManager.RefreshSchedulerEntry(auth.ID)
+			}
+		}
 		return
 	}
 	authDir := ""
@@ -2113,11 +2323,25 @@ func (s *Service) handleManagementAuthStatusChange(ctx context.Context, auth *co
 		s.cancelAuthMaintenanceCandidate(candidate)
 	}
 	s.ensureExecutorsForAuth(auth)
-	if strings.EqualFold(strings.TrimSpace(auth.Provider), "antigravity") {
-		// The manager update hook already queued or completed Antigravity capability sync.
+	if provider := strings.ToLower(strings.TrimSpace(auth.Provider)); provider == "antigravity" || isNativeChatGPTWebAuth(auth) {
+		// The manager update hook already queued or completed provider model sync.
 		return
 	}
 	s.syncAuthModels(ctx, auth.ID)
+}
+
+func (s *Service) refreshChatGPTWebModelCatalogs(ctx context.Context) {
+	if s == nil || s.coreManager == nil {
+		return
+	}
+	for _, auth := range s.coreManager.List() {
+		if !isNativeChatGPTWebAuth(auth) || auth.Disabled || auth.Status == coreauth.StatusDisabled || !auth.LifecycleSelectable() {
+			continue
+		}
+		if !s.enqueueModelSync(auth.ID) {
+			s.syncAuthModelsInline(ctx, auth.ID)
+		}
+	}
 }
 
 func (s *Service) startModelSyncLoop(parent context.Context) {
@@ -2153,13 +2377,7 @@ func (s *Service) startModelSyncLoop(parent context.Context) {
 					case <-ctx.Done():
 						return
 					case authID := <-queue:
-						s.syncAuthModels(ctx, authID)
-						if s.finishModelSync(authID) {
-							select {
-							case <-ctx.Done():
-							case queue <- authID:
-							}
-						}
+						s.syncAuthModelsInline(ctx, authID)
 					}
 				}
 			}()
@@ -2287,11 +2505,23 @@ func (s *Service) ensureExecutorsForAuthWithMode(a *coreauth.Auth, forceReplace 
 }
 
 func (s *Service) registerResolvedModelsForAuth(a *coreauth.Auth, providerKey string, models []*ModelInfo) {
+	s.registerResolvedModelsForAuthWithState(a, providerKey, models, false)
+}
+
+func (s *Service) registerResolvedModelsForAuthPreservingState(a *coreauth.Auth, providerKey string, models []*ModelInfo) {
+	s.registerResolvedModelsForAuthWithState(a, providerKey, models, true)
+}
+
+func (s *Service) registerResolvedModelsForAuthWithState(a *coreauth.Auth, providerKey string, models []*ModelInfo, preserveTransientState bool) {
 	if a == nil || a.ID == "" {
 		return
 	}
 	if len(models) == 0 {
 		GlobalModelRegistry().UnregisterClient(a.ID)
+		return
+	}
+	if preserveTransientState {
+		registry.GetGlobalRegistry().RegisterClientPreservingState(a.ID, providerKey, models)
 		return
 	}
 	GlobalModelRegistry().RegisterClient(a.ID, providerKey, models)
@@ -2405,7 +2635,7 @@ func (s *Service) Run(ctx context.Context) error {
 		s.authManager = newDefaultAuthManager()
 	}
 	s.startModelSyncLoop(ctx)
-	s.installAuthMaintenanceHook()
+	s.installAuthMaintenanceHook(ctx)
 	if cfg, _ := s.snapshotAuthMaintenanceConfig(); cfg.Enable {
 		s.warnAuthMaintenanceConfig(cfg)
 	}
@@ -2597,8 +2827,13 @@ func (s *Service) Run(ctx context.Context) error {
 			s.coreManager.SetOAuthModelAlias(newCfg.OAuthModelAlias)
 		}
 		s.rebindExecutors()
+		s.refreshChatGPTWebModelCatalogs(ctx)
 		if s.coreManager != nil && authModelExclusionsSignature(previousCfgSnapshot) != authModelExclusionsSignature(newCfg) {
 			for _, auth := range s.coreManager.List() {
+				if isNativeChatGPTWebAuth(auth) {
+					s.refreshChatGPTWebModelRegistration(ctx, auth)
+					continue
+				}
 				s.refreshModelRegistrationForAuth(auth)
 			}
 		} else if s.coreManager != nil && shouldRefreshCodexRegistrations(previousCfgSnapshot, newCfg) {
@@ -2771,6 +3006,14 @@ func (s *Service) ensureAuthDir() error {
 
 // registerModelsForAuth (re)binds provider models in the global registry using the core auth ID as client identifier.
 func (s *Service) registerModelsForAuth(a *coreauth.Auth) {
+	s.registerModelsForAuthWithState(a, false)
+}
+
+func (s *Service) registerModelsForAuthPreservingState(a *coreauth.Auth) {
+	s.registerModelsForAuthWithState(a, true)
+}
+
+func (s *Service) registerModelsForAuthWithState(a *coreauth.Auth, preserveTransientState bool) {
 	if a == nil || a.ID == "" {
 		return
 	}
@@ -2898,7 +3141,12 @@ func (s *Service) registerModelsForAuth(a *coreauth.Auth) {
 		models = registry.GetXAIModels()
 		models = applyExcludedModels(models, excluded)
 	case "chatgpt-web":
-		models = nil
+		if !a.LifecycleSelectable() {
+			models = nil
+			break
+		}
+		models = s.chatGPTWebModelsForAuth(a)
+		models = applyExcludedModels(models, excluded)
 	default:
 		// Handle OpenAI-compatibility providers by name using config
 		if s.cfg != nil {
@@ -2976,7 +3224,12 @@ func (s *Service) registerModelsForAuth(a *coreauth.Auth) {
 							providerKey = "openai-compatibility"
 						}
 						ms = applyAuthModelExclusions(s.cfg, a, providerKey, ms)
-						s.registerResolvedModelsForAuth(a, providerKey, applyModelPrefixes(ms, a.Prefix, s.cfg.ForceModelPrefix))
+						resolved := applyModelPrefixes(ms, a.Prefix, s.cfg.ForceModelPrefix)
+						if preserveTransientState {
+							s.registerResolvedModelsForAuthPreservingState(a, providerKey, resolved)
+						} else {
+							s.registerResolvedModelsForAuth(a, providerKey, resolved)
+						}
 					} else {
 						// Ensure stale registrations are cleared when model list becomes empty.
 						GlobalModelRegistry().UnregisterClient(a.ID)
@@ -2998,7 +3251,12 @@ func (s *Service) registerModelsForAuth(a *coreauth.Auth) {
 			key = strings.ToLower(strings.TrimSpace(a.Provider))
 		}
 		models = applyAuthModelExclusions(s.cfg, a, key, models)
-		s.registerResolvedModelsForAuth(a, key, applyModelPrefixes(models, a.Prefix, s.cfg != nil && s.cfg.ForceModelPrefix))
+		resolved := applyModelPrefixes(models, a.Prefix, s.cfg != nil && s.cfg.ForceModelPrefix)
+		if preserveTransientState {
+			s.registerResolvedModelsForAuthPreservingState(a, key, resolved)
+		} else {
+			s.registerResolvedModelsForAuth(a, key, resolved)
+		}
 		return
 	}
 

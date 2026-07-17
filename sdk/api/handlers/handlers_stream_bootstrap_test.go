@@ -17,8 +17,13 @@ import (
 )
 
 type failOnceStreamExecutor struct {
-	mu    sync.Mutex
-	calls int
+	mu                sync.Mutex
+	calls             int
+	commentFirst      bool
+	controlFirst      bool
+	splitComment      bool
+	commitComment     bool
+	closeAfterComment bool
 }
 
 func (e *failOnceStreamExecutor) Identifier() string { return "codex" }
@@ -33,8 +38,29 @@ func (e *failOnceStreamExecutor) ExecuteStream(context.Context, *coreauth.Auth, 
 	call := e.calls
 	e.mu.Unlock()
 
-	ch := make(chan coreexecutor.StreamChunk, 1)
+	ch := make(chan coreexecutor.StreamChunk, 3)
 	if call == 1 {
+		if e.controlFirst {
+			ch <- coreexecutor.StreamChunk{Payload: []byte("event: pending\nid: 1\nretry: 1000\n\n")}
+		}
+		if e.commentFirst {
+			if e.splitComment {
+				ch <- coreexecutor.StreamChunk{Payload: []byte(": pend")}
+				ch <- coreexecutor.StreamChunk{Payload: []byte("ing\n\n")}
+			} else {
+				ch <- coreexecutor.StreamChunk{Payload: []byte(": pending\n\n")}
+			}
+			if e.commitComment {
+				ch <- coreexecutor.BootstrapCommitStreamChunk()
+			}
+			if e.closeAfterComment {
+				close(ch)
+				return &coreexecutor.StreamResult{
+					Headers: http.Header{"X-Upstream-Attempt": {"1"}},
+					Chunks:  ch,
+				}, nil
+			}
+		}
 		ch <- coreexecutor.StreamChunk{
 			Err: &coreauth.Error{
 				Code:       "unauthorized",
@@ -140,7 +166,9 @@ type authAwareStreamExecutor struct {
 
 type invalidJSONStreamExecutor struct{}
 
-type splitResponsesEventStreamExecutor struct{}
+type splitResponsesEventStreamExecutor struct {
+	trailingEventAtEOF bool
+}
 
 type streamBudgetPoolExecutor struct {
 	mu    sync.Mutex
@@ -183,6 +211,12 @@ func (e *splitResponsesEventStreamExecutor) Execute(context.Context, *coreauth.A
 }
 
 func (e *splitResponsesEventStreamExecutor) ExecuteStream(context.Context, *coreauth.Auth, coreexecutor.Request, coreexecutor.Options) (*coreexecutor.StreamResult, error) {
+	if e.trailingEventAtEOF {
+		ch := make(chan coreexecutor.StreamChunk, 1)
+		ch <- coreexecutor.StreamChunk{Payload: []byte("event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-1\",\"output\":[]}}\n")}
+		close(ch)
+		return &coreexecutor.StreamResult{Chunks: ch}, nil
+	}
 	ch := make(chan coreexecutor.StreamChunk, 2)
 	ch <- coreexecutor.StreamChunk{Payload: []byte("event: response.completed")}
 	ch <- coreexecutor.StreamChunk{Payload: []byte("data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-1\",\"output\":[]}}")}
@@ -377,6 +411,227 @@ func TestExecuteStreamWithAuthManager_RetriesBeforeFirstByte(t *testing.T) {
 	upstreamAttemptHeader := upstreamHeaders.Get("X-Upstream-Attempt")
 	if upstreamAttemptHeader != "2" {
 		t.Fatalf("expected upstream header from retry attempt, got %q", upstreamAttemptHeader)
+	}
+}
+
+func TestExecuteStreamWithAuthManager_RetriesAfterCommentOnlyHeartbeat(t *testing.T) {
+	executor := &failOnceStreamExecutor{commentFirst: true}
+	manager := coreauth.NewManager(nil, nil, nil)
+	manager.RegisterExecutor(executor)
+
+	for _, authID := range []string{"comment-auth-1", "comment-auth-2"} {
+		auth := &coreauth.Auth{ID: authID, Provider: "codex", Status: coreauth.StatusActive}
+		if _, err := manager.Register(context.Background(), auth); err != nil {
+			t.Fatalf("manager.Register(%s): %v", authID, err)
+		}
+		registry.GetGlobalRegistry().RegisterClient(auth.ID, auth.Provider, []*registry.ModelInfo{{ID: "comment-model"}})
+		t.Cleanup(func() {
+			registry.GetGlobalRegistry().UnregisterClient(auth.ID)
+		})
+	}
+
+	handler := NewBaseAPIHandlers(&sdkconfig.SDKConfig{
+		PassthroughHeaders: true,
+		Streaming:          sdkconfig.StreamingConfig{BootstrapRetries: 1},
+	}, manager)
+	dataChan, upstreamHeaders, errChan := handler.ExecuteStreamWithAuthManager(
+		context.Background(),
+		"openai-response",
+		"comment-model",
+		[]byte(`{"model":"comment-model"}`),
+		"",
+	)
+	var got strings.Builder
+	for chunk := range dataChan {
+		got.Write(chunk)
+	}
+	for errMsg := range errChan {
+		if errMsg != nil {
+			t.Fatalf("unexpected stream error: %v", errMsg.Error)
+		}
+	}
+	if executor.Calls() != 2 {
+		t.Fatalf("stream attempts = %d, want 2", executor.Calls())
+	}
+	if got.String() != "ok" {
+		t.Fatalf("stream payload = %q", got.String())
+	}
+	if gotHeader := upstreamHeaders.Get("X-Upstream-Attempt"); gotHeader != "2" {
+		t.Fatalf("upstream attempt header = %q, want retry attempt", gotHeader)
+	}
+}
+
+func TestExecuteStreamWithAuthManager_RetriesAfterControlOnlyFrame(t *testing.T) {
+	executor := &failOnceStreamExecutor{controlFirst: true}
+	manager := coreauth.NewManager(nil, nil, nil)
+	manager.RegisterExecutor(executor)
+
+	for _, authID := range []string{"control-auth-1", "control-auth-2"} {
+		auth := &coreauth.Auth{ID: authID, Provider: "codex", Status: coreauth.StatusActive}
+		if _, err := manager.Register(context.Background(), auth); err != nil {
+			t.Fatalf("manager.Register(%s): %v", authID, err)
+		}
+		registry.GetGlobalRegistry().RegisterClient(auth.ID, auth.Provider, []*registry.ModelInfo{{ID: "control-model"}})
+		t.Cleanup(func() {
+			registry.GetGlobalRegistry().UnregisterClient(auth.ID)
+		})
+	}
+
+	handler := NewBaseAPIHandlers(&sdkconfig.SDKConfig{
+		Streaming: sdkconfig.StreamingConfig{BootstrapRetries: 1},
+	}, manager)
+	dataChan, _, errChan := handler.ExecuteStreamWithAuthManager(
+		context.Background(),
+		"openai-response",
+		"control-model",
+		[]byte(`{"model":"control-model"}`),
+		"",
+	)
+	var got strings.Builder
+	for chunk := range dataChan {
+		got.Write(chunk)
+	}
+	for errMsg := range errChan {
+		if errMsg != nil {
+			t.Fatalf("unexpected stream error: %v", errMsg.Error)
+		}
+	}
+	if executor.Calls() != 2 {
+		t.Fatalf("stream attempts = %d, want 2", executor.Calls())
+	}
+	if got.String() != "ok" {
+		t.Fatalf("stream payload = %q", got.String())
+	}
+}
+
+func TestExecuteStreamWithAuthManager_RetriesAfterSplitCommentOnlyHeartbeat(t *testing.T) {
+	executor := &failOnceStreamExecutor{commentFirst: true, splitComment: true}
+	manager := coreauth.NewManager(nil, nil, nil)
+	manager.RegisterExecutor(executor)
+
+	for _, authID := range []string{"split-comment-auth-1", "split-comment-auth-2"} {
+		auth := &coreauth.Auth{ID: authID, Provider: "codex", Status: coreauth.StatusActive}
+		if _, err := manager.Register(context.Background(), auth); err != nil {
+			t.Fatalf("manager.Register(%s): %v", authID, err)
+		}
+		registry.GetGlobalRegistry().RegisterClient(auth.ID, auth.Provider, []*registry.ModelInfo{{ID: "split-comment-model"}})
+		t.Cleanup(func() {
+			registry.GetGlobalRegistry().UnregisterClient(auth.ID)
+		})
+	}
+
+	handler := NewBaseAPIHandlers(&sdkconfig.SDKConfig{
+		Streaming: sdkconfig.StreamingConfig{BootstrapRetries: 1},
+	}, manager)
+	dataChan, _, errChan := handler.ExecuteStreamWithAuthManager(
+		context.Background(),
+		"openai-response",
+		"split-comment-model",
+		[]byte(`{"model":"split-comment-model"}`),
+		"",
+	)
+	var got strings.Builder
+	for chunk := range dataChan {
+		got.Write(chunk)
+	}
+	for errMsg := range errChan {
+		if errMsg != nil {
+			t.Fatalf("unexpected stream error: %v", errMsg.Error)
+		}
+	}
+	if executor.Calls() != 2 {
+		t.Fatalf("stream attempts = %d, want 2", executor.Calls())
+	}
+	if got.String() != "ok" {
+		t.Fatalf("stream payload = %q", got.String())
+	}
+}
+
+func TestExecuteStreamWithAuthManager_RetriesAfterCommentOnlyClose(t *testing.T) {
+	executor := &failOnceStreamExecutor{commentFirst: true, closeAfterComment: true}
+	manager := coreauth.NewManager(nil, nil, nil)
+	manager.RegisterExecutor(executor)
+
+	for _, authID := range []string{"comment-close-auth-1", "comment-close-auth-2"} {
+		auth := &coreauth.Auth{ID: authID, Provider: "codex", Status: coreauth.StatusActive}
+		if _, err := manager.Register(context.Background(), auth); err != nil {
+			t.Fatalf("manager.Register(%s): %v", authID, err)
+		}
+		registry.GetGlobalRegistry().RegisterClient(auth.ID, auth.Provider, []*registry.ModelInfo{{ID: "comment-close-model"}})
+		t.Cleanup(func() {
+			registry.GetGlobalRegistry().UnregisterClient(auth.ID)
+		})
+	}
+
+	handler := NewBaseAPIHandlers(&sdkconfig.SDKConfig{
+		Streaming: sdkconfig.StreamingConfig{BootstrapRetries: 1},
+	}, manager)
+	dataChan, _, errChan := handler.ExecuteStreamWithAuthManager(
+		context.Background(),
+		"openai-response",
+		"comment-close-model",
+		[]byte(`{"model":"comment-close-model"}`),
+		"",
+	)
+	var got strings.Builder
+	for chunk := range dataChan {
+		got.Write(chunk)
+	}
+	for errMsg := range errChan {
+		if errMsg != nil {
+			t.Fatalf("unexpected stream error: %v", errMsg.Error)
+		}
+	}
+	if executor.Calls() != 2 {
+		t.Fatalf("stream attempts = %d, want 2", executor.Calls())
+	}
+	if got.String() != "ok" {
+		t.Fatalf("stream payload = %q", got.String())
+	}
+}
+
+func TestExecuteStreamWithAuthManager_ExplicitHeartbeatCommitsStream(t *testing.T) {
+	executor := &failOnceStreamExecutor{commentFirst: true, commitComment: true}
+	manager := coreauth.NewManager(nil, nil, nil)
+	manager.RegisterExecutor(executor)
+
+	auth := &coreauth.Auth{ID: "committed-comment-auth", Provider: "codex", Status: coreauth.StatusActive}
+	if _, err := manager.Register(context.Background(), auth); err != nil {
+		t.Fatalf("manager.Register(): %v", err)
+	}
+	registry.GetGlobalRegistry().RegisterClient(auth.ID, auth.Provider, []*registry.ModelInfo{{ID: "comment-model"}})
+	t.Cleanup(func() {
+		registry.GetGlobalRegistry().UnregisterClient(auth.ID)
+	})
+
+	handler := NewBaseAPIHandlers(&sdkconfig.SDKConfig{
+		Streaming: sdkconfig.StreamingConfig{BootstrapRetries: 1},
+	}, manager)
+	dataChan, _, errChan := handler.ExecuteStreamWithAuthManager(
+		context.Background(),
+		"openai-response",
+		"comment-model",
+		[]byte(`{"model":"comment-model"}`),
+		"",
+	)
+	var got strings.Builder
+	for chunk := range dataChan {
+		got.Write(chunk)
+	}
+	var streamErr *interfaces.ErrorMessage
+	for errMsg := range errChan {
+		if errMsg != nil {
+			streamErr = errMsg
+		}
+	}
+	if streamErr == nil {
+		t.Fatal("expected post-commit stream error")
+	}
+	if executor.Calls() != 1 {
+		t.Fatalf("stream attempts = %d, want 1", executor.Calls())
+	}
+	if got.String() != ": pending\n\n" {
+		t.Fatalf("stream payload = %q", got.String())
 	}
 }
 
@@ -853,14 +1108,48 @@ func TestExecuteStreamWithAuthManager_AllowsSplitOpenAIResponsesSSEEventLines(t 
 		}
 	}
 
-	if len(got) != 2 {
-		t.Fatalf("expected 2 forwarded chunks, got %d: %#v", len(got), got)
-	}
-	if got[0] != "event: response.completed" {
-		t.Fatalf("unexpected first chunk: %q", got[0])
-	}
 	expectedData := "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-1\",\"output\":[]}}"
-	if got[1] != expectedData {
-		t.Fatalf("unexpected second chunk.\nGot:  %q\nWant: %q", got[1], expectedData)
+	if joined, want := strings.Join(got, ""), "event: response.completed\n"+expectedData; joined != want {
+		t.Fatalf("unexpected forwarded data.\nGot:  %q\nWant: %q", joined, want)
+	}
+}
+
+func TestExecuteStreamWithAuthManager_ForwardsTrustedResponsesSSETrailingEventAtEOF(t *testing.T) {
+	executor := &splitResponsesEventStreamExecutor{trailingEventAtEOF: true}
+	manager := coreauth.NewManager(nil, nil, nil)
+	manager.RegisterExecutor(executor)
+
+	auth := &coreauth.Auth{ID: "trusted-eof-auth", Provider: "split-sse", Status: coreauth.StatusActive}
+	if _, err := manager.Register(context.Background(), auth); err != nil {
+		t.Fatalf("manager.Register(): %v", err)
+	}
+	registry.GetGlobalRegistry().RegisterClient(auth.ID, auth.Provider, []*registry.ModelInfo{{ID: "trusted-eof-model"}})
+	t.Cleanup(func() {
+		registry.GetGlobalRegistry().UnregisterClient(auth.ID)
+	})
+
+	handler := NewBaseAPIHandlers(&sdkconfig.SDKConfig{
+		Streaming: sdkconfig.StreamingConfig{TrustUpstreamSSE: true},
+	}, manager)
+	dataChan, _, errChan := handler.ExecuteStreamWithAuthManager(
+		context.Background(),
+		"openai-response",
+		"trusted-eof-model",
+		[]byte(`{"model":"trusted-eof-model"}`),
+		"",
+	)
+	var got strings.Builder
+	for chunk := range dataChan {
+		got.Write(chunk)
+	}
+	for msg := range errChan {
+		if msg != nil {
+			t.Fatalf("unexpected error: %+v", msg)
+		}
+	}
+
+	want := "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-1\",\"output\":[]}}\n"
+	if got.String() != want {
+		t.Fatalf("stream payload = %q, want %q", got.String(), want)
 	}
 }
