@@ -284,6 +284,18 @@ func TestFileTokenStoreReadsFileBackedGeminiAPIKey(t *testing.T) {
 	}
 }
 
+func TestFileTokenStoreListAcceptsNilContext(t *testing.T) {
+	store := NewFileTokenStore()
+	store.SetBaseDir(t.TempDir())
+	auths, errList := store.List(nil)
+	if errList != nil {
+		t.Fatalf("List(nil) error = %v", errList)
+	}
+	if len(auths) != 0 {
+		t.Fatalf("List(nil) auths = %#v, want empty", auths)
+	}
+}
+
 func TestWriteRootFileAtomicallyForSnapshotRejectsConcurrentReplacement(t *testing.T) {
 	dir := t.TempDir()
 	const fileName = "auth.json"

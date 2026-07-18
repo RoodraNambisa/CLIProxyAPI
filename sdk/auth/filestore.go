@@ -1111,6 +1111,9 @@ func finishFileTokenSave(auth *cliproxyauth.Auth, persistedPath string, committe
 
 // List enumerates all auth JSON files under the configured directory.
 func (s *FileTokenStore) List(ctx context.Context) ([]*cliproxyauth.Auth, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	_, dir, errBase := resolveFileTokenBaseDir(s.baseDirSnapshot(), false)
 	if errBase != nil {
 		return nil, errBase
@@ -1290,20 +1293,24 @@ func (s *FileTokenStore) Delete(ctx context.Context, id string) (resultErr error
 			fmt.Errorf("auth filestore: auth parent changed before deletion: %w", errParentIdentity),
 		)
 	}
-	err = parentRoot.Remove(leaf)
-	if err != nil && !os.IsNotExist(err) {
-		return cliproxyauth.NewDeleteOutcomeError(cliproxyauth.DeleteOutcomeRolledBack, fmt.Errorf("auth filestore: delete failed: %w", err))
+	currentSnapshot, errSnapshot := captureFileAuthSnapshot(parentRoot, leaf)
+	if errSnapshot != nil {
+		if errors.Is(errSnapshot, fs.ErrNotExist) {
+			authfileguard.ClearRetiredSnapshot(retiredSnapshot)
+			return nil
+		}
+		return cliproxyauth.NewDeleteOutcomeError(
+			cliproxyauth.DeleteOutcomeRolledBack,
+			fmt.Errorf("auth filestore: read auth before deletion: %w", errSnapshot),
+		)
 	}
-	var errSync error
-	if err == nil {
-		errSync = s.syncRootDirectory(parentRoot, ".")
-	}
+	errRemove := removePreparedFileAuthSnapshot(parentRoot, leaf, *currentSnapshot, s.syncRootDirectory)
 	errParentIdentity := revalidateFileTokenParent(root, relativePath, parentRoot)
-	if errSync != nil || errParentIdentity != nil {
+	if errRemove != nil || errParentIdentity != nil {
 		return cliproxyauth.NewDeleteOutcomeError(
 			cliproxyauth.DeleteOutcomeUncertain,
 			errors.Join(
-				wrapFileTokenError("auth filestore: sync deleted auth", errSync),
+				errRemove,
 				wrapFileTokenError("auth filestore: auth parent changed after deletion", errParentIdentity),
 			),
 		)
