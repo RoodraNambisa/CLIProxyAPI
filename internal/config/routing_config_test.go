@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestLoadConfigOptional_RoutingSessionAffinityFailover(t *testing.T) {
@@ -38,16 +39,22 @@ func TestLoadConfigOptional_RoutingPriorityOverrides(t *testing.T) {
 routing:
   fill-first-range: 0
   fill-first-per-auth-rpm: -10
+  per-auth-request-limit: -10
+  per-auth-request-window-minutes: 0
   priority-overrides:
     - priority: 0
       strategy: ff
       max-retry-credentials: 2
       fill-first-range: 5
       fill-first-per-auth-rpm: 0
+      per-auth-request-limit: 120
+      per-auth-request-window-minutes: 5
     - priority: -1
       max-retry-credentials: -4
       fill-first-range: -2
       fill-first-per-auth-rpm: -3
+      per-auth-request-limit: -3
+      per-auth-request-window-minutes: -2
 `)
 	if err := os.WriteFile(configPath, configYAML, 0o600); err != nil {
 		t.Fatalf("failed to write config: %v", err)
@@ -66,6 +73,12 @@ routing:
 	if cfg.Routing.FillFirstPerAuthRPM != 0 {
 		t.Fatalf("FillFirstPerAuthRPM = %d, want 0", cfg.Routing.FillFirstPerAuthRPM)
 	}
+	if cfg.Routing.PerAuthRequestLimit != 0 {
+		t.Fatalf("PerAuthRequestLimit = %d, want 0", cfg.Routing.PerAuthRequestLimit)
+	}
+	if cfg.Routing.PerAuthRequestWindowMinutes != 1 {
+		t.Fatalf("PerAuthRequestWindowMinutes = %d, want 1", cfg.Routing.PerAuthRequestWindowMinutes)
+	}
 	first := cfg.Routing.PriorityOverrides[0]
 	if first.Priority != 0 || first.Strategy != "fill-first" {
 		t.Fatalf("first override = %+v, want priority 0 fill-first", first)
@@ -79,6 +92,12 @@ routing:
 	if first.FillFirstPerAuthRPM == nil || *first.FillFirstPerAuthRPM != 0 {
 		t.Fatalf("first FillFirstPerAuthRPM = %v, want 0", first.FillFirstPerAuthRPM)
 	}
+	if first.PerAuthRequestLimit == nil || *first.PerAuthRequestLimit != 120 {
+		t.Fatalf("first PerAuthRequestLimit = %v, want 120", first.PerAuthRequestLimit)
+	}
+	if first.PerAuthRequestWindowMinutes == nil || *first.PerAuthRequestWindowMinutes != 5 {
+		t.Fatalf("first PerAuthRequestWindowMinutes = %v, want 5", first.PerAuthRequestWindowMinutes)
+	}
 	second := cfg.Routing.PriorityOverrides[1]
 	if second.Priority != -1 {
 		t.Fatalf("second priority = %d, want -1", second.Priority)
@@ -91,6 +110,24 @@ routing:
 	}
 	if second.FillFirstPerAuthRPM == nil || *second.FillFirstPerAuthRPM != 0 {
 		t.Fatalf("second FillFirstPerAuthRPM = %v, want 0", second.FillFirstPerAuthRPM)
+	}
+	if second.PerAuthRequestLimit == nil || *second.PerAuthRequestLimit != 0 {
+		t.Fatalf("second PerAuthRequestLimit = %v, want 0", second.PerAuthRequestLimit)
+	}
+	if second.PerAuthRequestWindowMinutes == nil || *second.PerAuthRequestWindowMinutes != 1 {
+		t.Fatalf("second PerAuthRequestWindowMinutes = %v, want 1", second.PerAuthRequestWindowMinutes)
+	}
+}
+
+func TestNormalizePerAuthRequestWindowMinutesClampsOverflow(t *testing.T) {
+	maxInt := int(^uint(0) >> 1)
+	want := maxInt / 60
+	maxDurationMinutes := int(time.Duration(1<<63-1) / time.Minute)
+	if want > maxDurationMinutes {
+		want = maxDurationMinutes
+	}
+	if got := NormalizePerAuthRequestWindowMinutes(maxInt); got != want {
+		t.Fatalf("NormalizePerAuthRequestWindowMinutes(maxInt) = %d, want %d", got, want)
 	}
 }
 

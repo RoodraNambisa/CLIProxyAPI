@@ -361,6 +361,7 @@ type requestRoundState struct {
 	attempted           map[string]struct{}
 	attemptedByPriority map[int]map[string]struct{}
 	lastErr             error
+	lastErrAuthID       string
 }
 
 type runtimeExecutionResponseBody struct {
@@ -445,6 +446,17 @@ func (s *requestRoundState) markAttempted(auth *Auth) {
 		s.attemptedByPriority[priority] = attempted
 	}
 	attempted[auth.ID] = struct{}{}
+}
+
+func (s *requestRoundState) setLastError(auth *Auth, err error) {
+	if s == nil {
+		return
+	}
+	s.lastErr = err
+	s.lastErrAuthID = ""
+	if auth != nil {
+		s.lastErrAuthID = auth.ID
+	}
 }
 
 func (s *requestRoundState) forgetRetiredAttempt(auth *Auth) {
@@ -806,10 +818,10 @@ func (m *Manager) SetConfig(cfg *internalconfig.Config) {
 	if cfg == nil {
 		cfg = &internalconfig.Config{}
 	}
-	m.runtimeConfig.Store(cfg)
 	if m.scheduler != nil {
 		m.scheduler.setRoutingConfig(cfg.Routing)
 	}
+	m.runtimeConfig.Store(cfg)
 	m.rebuildAPIKeyModelAliasFromRuntimeConfig()
 }
 
@@ -1216,6 +1228,98 @@ func (m *Manager) fillFirstLimiter() *fillFirstMinuteLimiter {
 	return m.scheduler.fillFirstLimiter
 }
 
+func (m *Manager) routingAuthRequestLimitPolicyForPriority(priority int) authRequestLimitPolicy {
+	if m == nil {
+		return normalizeAuthRequestLimitPolicy(authRequestLimitPolicy{})
+	}
+	if m.scheduler != nil {
+		return m.scheduler.requestLimitPolicyForPriority(priority)
+	}
+	cfg, _ := m.runtimeConfig.Load().(*internalconfig.Config)
+	if cfg == nil {
+		return normalizeAuthRequestLimitPolicy(authRequestLimitPolicy{})
+	}
+	return authRequestLimitPolicyForRouting(cfg.Routing, priority)
+}
+
+func (m *Manager) authRequestLimiter() *authRequestWindowLimiter {
+	if m == nil || m.scheduler == nil {
+		return nil
+	}
+	return m.scheduler.requestLimiter
+}
+
+func preferAuthRequestLimitError(err error, block authRequestLimitBlock) error {
+	if !block.limited() {
+		return err
+	}
+	if resetIn, isAvailabilityBlocker := availabilityBlockerResetIn(err); isAvailabilityBlocker {
+		if resetIn <= block.resetIn {
+			return err
+		}
+		return newAuthRequestLimitedError(block)
+	}
+	var authErr *Error
+	if err == nil || (errors.As(err, &authErr) && authErr != nil && (authErr.Code == "auth_not_found" || authErr.Code == "auth_unavailable" || authErr.Code == "session_bound_auth_unavailable")) {
+		return newAuthRequestLimitedError(block)
+	}
+	return err
+}
+
+func availabilityBlockerResetIn(err error) (time.Duration, bool) {
+	var requestLimitErr *authRequestLimitedError
+	if errors.As(err, &requestLimitErr) && requestLimitErr != nil {
+		return requestLimitErr.resetIn, true
+	}
+	var cooldownErr *modelCooldownError
+	if errors.As(err, &cooldownErr) && cooldownErr != nil {
+		return cooldownErr.resetIn, true
+	}
+	var rpmLimitErr *authRPMLimitedError
+	if errors.As(err, &rpmLimitErr) && rpmLimitErr != nil {
+		return rpmLimitErr.resetIn, true
+	}
+	if statusCodeFromError(err) == http.StatusTooManyRequests {
+		if retryAfter := retryAfterFromError(err); retryAfter != nil && *retryAfter > 0 {
+			return *retryAfter, true
+		}
+	}
+	return 0, false
+}
+
+func earlierAvailabilityBlocker(current, candidate error) error {
+	candidateReset, candidateOK := availabilityBlockerResetIn(candidate)
+	if !candidateOK {
+		return current
+	}
+	currentReset, currentOK := availabilityBlockerResetIn(current)
+	if !currentOK || candidateReset < currentReset {
+		return candidate
+	}
+	return current
+}
+
+func (m *Manager) preferEarlierRoundAvailabilityError(selectionErr error, roundState *requestRoundState) error {
+	if roundState == nil || roundState.lastErr == nil {
+		return selectionErr
+	}
+	if roundState.lastErrAuthID != "" {
+		auth, ok := m.GetByID(roundState.lastErrAuthID)
+		if !ok || auth == nil {
+			return selectionErr
+		}
+		limiter := m.authRequestLimiter()
+		if limiter != nil {
+			now := limiter.nowTime()
+			policy := m.routingAuthRequestLimitPolicyForPriority(authPriority(auth))
+			if available, _ := limiter.availableAt(auth.ID, policy, now); !available {
+				return selectionErr
+			}
+		}
+	}
+	return earlierAvailabilityBlocker(selectionErr, roundState.lastErr)
+}
+
 func (m *Manager) routingStrategyForPriority(priority int) schedulerStrategy {
 	if strategy, ok := m.routingStrategyOverrideForPriority(priority); ok {
 		return strategy
@@ -1265,6 +1369,9 @@ func (m *Manager) prioritySelectorForAvailable(available []*Auth) (Selector, boo
 	strategy, ok := m.routingStrategyOverrideForPriority(priority)
 	fillFirstRange := m.routingFillFirstRangeForPriority(priority)
 	fillFirstPerAuthRPM := m.routingFillFirstPerAuthRPMForPriority(priority)
+	if m.routingAuthRequestLimitPolicyForPriority(priority).limit > 0 {
+		fillFirstPerAuthRPM = 0
+	}
 	if !ok {
 		strategy = selectorStrategy(m.selector)
 		if strategy != schedulerStrategyFillFirst || (fillFirstRange <= 1 && fillFirstPerAuthRPM <= 0) {
@@ -1286,29 +1393,40 @@ func (m *Manager) prioritySelectorForAvailable(available []*Auth) (Selector, boo
 }
 
 func (m *Manager) pickLegacyFillFirstRangeAuth(ctx context.Context, provider, routeModel string, opts cliproxyexecutor.Options, candidates []*Auth, pickAllowed func(*Auth) bool) (*Auth, bool, error) {
+	auth, handled, bind, err := m.pickLegacyFillFirstRangeAuthWithDeferredBinding(ctx, provider, routeModel, opts, candidates, pickAllowed)
+	if err == nil && bind != nil {
+		bind()
+	}
+	return auth, handled, err
+}
+
+func (m *Manager) pickLegacyFillFirstRangeAuthWithDeferredBinding(ctx context.Context, provider, routeModel string, opts cliproxyexecutor.Options, candidates []*Auth, pickAllowed func(*Auth) bool) (*Auth, bool, func(), error) {
 	if len(candidates) == 0 || m == nil {
-		return nil, false, nil
+		return nil, false, nil, nil
 	}
 	sessionSelector, hasSessionSelector := m.selector.(*SessionAffinitySelector)
 	if !isBuiltInSelector(m.selector) && !hasSessionSelector {
-		return nil, false, nil
+		return nil, false, nil, nil
 	}
 	available, errAvailable := m.availableAuthsForRouteModelFilteredForContext(ctx, candidates, provider, routeModel, opts, time.Now(), pickAllowed)
 	if errAvailable != nil {
-		return nil, true, errAvailable
+		return nil, true, nil, errAvailable
 	}
 	if len(available) == 0 {
-		return nil, true, &Error{Code: "auth_not_found", Message: "no auth available"}
+		return nil, true, nil, &Error{Code: "auth_not_found", Message: "no auth available"}
 	}
 	priority := authPriority(available[0])
 	strategy := m.routingStrategyForPriority(priority)
 	if strategy != schedulerStrategyFillFirst {
-		return nil, false, nil
+		return nil, false, nil, nil
 	}
 	fillFirstRange := m.routingFillFirstRangeForPriority(priority)
 	fillFirstPerAuthRPM := m.routingFillFirstPerAuthRPMForPriority(priority)
+	if m.routingAuthRequestLimitPolicyForPriority(priority).limit > 0 {
+		fillFirstPerAuthRPM = 0
+	}
 	if fillFirstRange <= 1 && fillFirstPerAuthRPM <= 0 {
-		return nil, false, nil
+		return nil, false, nil, nil
 	}
 	fillFirstRangeForPriority := func(priority int) int {
 		if m.routingStrategyForPriority(priority) != schedulerStrategyFillFirst {
@@ -1320,6 +1438,9 @@ func (m *Manager) pickLegacyFillFirstRangeAuth(ctx context.Context, provider, ro
 		if m.routingStrategyForPriority(priority) != schedulerStrategyFillFirst {
 			return 0
 		}
+		if m.routingAuthRequestLimitPolicyForPriority(priority).limit > 0 {
+			return 0
+		}
 		return m.routingFillFirstPerAuthRPMForPriority(priority)
 	}
 	pickFallback := func() (*Auth, error) {
@@ -1328,11 +1449,11 @@ func (m *Manager) pickLegacyFillFirstRangeAuth(ctx context.Context, provider, ro
 		}, pickAllowed)
 	}
 	if hasSessionSelector && sessionSelector != nil && fillFirstPerAuthRPM <= 0 {
-		selected, errPick := sessionSelector.pickWithPreparedFallback(ctx, provider, routeModel, opts, available, pickFallback)
-		return selected, true, errPick
+		selected, bind, errPick := sessionSelector.pickWithPreparedFallbackDeferredBinding(ctx, provider, routeModel, opts, available, pickFallback)
+		return selected, true, bind, errPick
 	}
 	selected, errPick := pickFallback()
-	return selected, true, errPick
+	return selected, true, nil, errPick
 }
 
 func (m *Manager) pickAvailableAuthWithPriorityPolicy(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, available []*Auth) (*Auth, error) {
@@ -1344,9 +1465,11 @@ func (m *Manager) pickAvailableAuthWithPriorityPolicy(ctx context.Context, provi
 	}
 	if selector, ok := m.selector.(*SessionAffinitySelector); ok && selector != nil {
 		if fallback, hasOverride := m.prioritySelectorForAvailable(available); hasOverride {
-			return selector.pickWithFallback(ctx, provider, model, opts, available, fallback)
+			selected, _, err := selector.pickWithFallbackDeferredBinding(ctx, provider, model, opts, available, fallback)
+			return selected, err
 		}
-		return selector.Pick(ctx, provider, model, opts, available)
+		selected, _, err := selector.pickWithFallbackDeferredBinding(ctx, provider, model, opts, available, selector.fallback)
+		return selected, err
 	}
 	if !isBuiltInSelector(m.selector) {
 		return m.selector.Pick(ctx, provider, model, opts, available)
@@ -1356,6 +1479,18 @@ func (m *Manager) pickAvailableAuthWithPriorityPolicy(ctx context.Context, provi
 		return m.selector.Pick(ctx, provider, model, opts, available)
 	}
 	return selector.Pick(ctx, provider, model, opts, available)
+}
+
+func authFromListByID(auths []*Auth, authID string) *Auth {
+	if authID == "" {
+		return nil
+	}
+	for _, auth := range auths {
+		if auth != nil && auth.ID == authID {
+			return auth
+		}
+	}
+	return nil
 }
 
 func setSelectionAttemptMetadata(opts cliproxyexecutor.Options, selectionAttempt int) cliproxyexecutor.Options {
@@ -3905,8 +4040,8 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 		}
 		auth, executor, provider, errPick := m.pickNextMixedWithImageToolFallback(ctx, providers, routeModel, req, opts, roundState.tried, pickAllowed)
 		if errPick != nil {
-			if isModelCooldownError(errPick) {
-				return cliproxyexecutor.Response{}, errPick
+			if _, isAvailabilityBlocker := availabilityBlockerResetIn(errPick); isAvailabilityBlocker {
+				return cliproxyexecutor.Response{}, m.preferEarlierRoundAvailabilityError(errPick, roundState)
 			}
 			if roundState.lastErr != nil {
 				return cliproxyexecutor.Response{}, roundState.lastErr
@@ -3920,7 +4055,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			if strictSessionAffinity {
 				return cliproxyexecutor.Response{}, errProxy
 			}
-			roundState.lastErr = errProxy
+			roundState.setLastError(auth, errProxy)
 			continue
 		}
 		auth = resolvedAuth
@@ -3961,7 +4096,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			if strictSessionAffinity {
 				return cliproxyexecutor.Response{}, errPrepare
 			}
-			roundState.lastErr = errPrepare
+			roundState.setLastError(auth, errPrepare)
 			continue
 		}
 		carryRuntimeProxy(auth, preparedAuth)
@@ -4101,7 +4236,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			if strictSessionAffinity {
 				return cliproxyexecutor.Response{}, authErr
 			}
-			roundState.lastErr = authErr
+			roundState.setLastError(auth, authErr)
 			if !requestBodyReplayable(ctx, opts) {
 				return cliproxyexecutor.Response{}, authErr
 			}
@@ -4134,8 +4269,8 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 		}
 		auth, executor, provider, errPick := m.pickNextMixed(ctx, providers, routeModel, opts, roundState.tried, pickAllowed)
 		if errPick != nil {
-			if isModelCooldownError(errPick) {
-				return cliproxyexecutor.Response{}, errPick
+			if _, isAvailabilityBlocker := availabilityBlockerResetIn(errPick); isAvailabilityBlocker {
+				return cliproxyexecutor.Response{}, m.preferEarlierRoundAvailabilityError(errPick, roundState)
 			}
 			if roundState.lastErr != nil {
 				return cliproxyexecutor.Response{}, roundState.lastErr
@@ -4149,7 +4284,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 			if strictSessionAffinity {
 				return cliproxyexecutor.Response{}, errProxy
 			}
-			roundState.lastErr = errProxy
+			roundState.setLastError(auth, errProxy)
 			continue
 		}
 		auth = resolvedAuth
@@ -4190,7 +4325,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 			if strictSessionAffinity {
 				return cliproxyexecutor.Response{}, errPrepare
 			}
-			roundState.lastErr = errPrepare
+			roundState.setLastError(auth, errPrepare)
 			continue
 		}
 		carryRuntimeProxy(auth, preparedAuth)
@@ -4328,7 +4463,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 			if strictSessionAffinity {
 				return cliproxyexecutor.Response{}, authErr
 			}
-			roundState.lastErr = authErr
+			roundState.setLastError(auth, authErr)
 			if !requestBodyReplayable(ctx, opts) {
 				return cliproxyexecutor.Response{}, authErr
 			}
@@ -4361,8 +4496,8 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 		}
 		auth, executor, provider, errPick := m.pickNextMixedWithImageToolFallback(ctx, providers, routeModel, req, opts, roundState.tried, pickAllowed)
 		if errPick != nil {
-			if isModelCooldownError(errPick) {
-				return nil, errPick
+			if _, isAvailabilityBlocker := availabilityBlockerResetIn(errPick); isAvailabilityBlocker {
+				return nil, m.preferEarlierRoundAvailabilityError(errPick, roundState)
 			}
 			if roundState.lastErr != nil {
 				return nil, roundState.lastErr
@@ -4376,7 +4511,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			if strictSessionAffinity {
 				return nil, errProxy
 			}
-			roundState.lastErr = errProxy
+			roundState.setLastError(auth, errProxy)
 			continue
 		}
 		auth = resolvedAuth
@@ -4417,7 +4552,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			if strictSessionAffinity {
 				return nil, errPrepare
 			}
-			roundState.lastErr = errPrepare
+			roundState.setLastError(auth, errPrepare)
 			continue
 		}
 		carryRuntimeProxy(auth, preparedAuth)
@@ -4526,7 +4661,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			if strictSessionAffinity {
 				return nil, errStream
 			}
-			roundState.lastErr = errStream
+			roundState.setLastError(auth, errStream)
 			if !requestBodyReplayable(execCtx, opts) {
 				return nil, errStream
 			}
@@ -4796,39 +4931,78 @@ func (m *Manager) pickAntigravityCreditsAtPriority(ctx context.Context, opts cli
 	}
 	opts = setSelectionAttemptMetadata(opts, 0)
 	strategy := m.routingStrategyForPriority(priority)
-	var selected *Auth
-	var errPick error
-	if strategy == schedulerStrategyFillFirst {
-		fillFirstRange := m.routingFillFirstRangeForPriority(priority)
-		fillFirstRPM := m.routingFillFirstPerAuthRPMForPriority(priority)
-		selected, errPick = selectFillFirstAuthsForContext(ctx, auths, "antigravity", "", time.Now(), 0, fillFirstRange, fillFirstRPM, m.fillFirstLimiter(), nil, pickAllowed)
-	} else {
-		filtered := auths[:0]
-		for _, auth := range auths {
-			if pickAllowed == nil || pickAllowed(auth) {
-				filtered = append(filtered, auth)
+	requestPolicy := m.routingAuthRequestLimitPolicyForPriority(priority)
+	requestLimiter := m.authRequestLimiter()
+	requestBlocked := authRequestLimitBlock{}
+	dynamicallyLimited := make(map[string]struct{})
+	for {
+		now := requestLimiter.nowTime()
+		combinedAllowed := func(auth *Auth) bool {
+			if auth == nil || (pickAllowed != nil && !pickAllowed(auth)) {
+				return false
+			}
+			if _, limited := dynamicallyLimited[auth.ID]; limited {
+				return false
+			}
+			available, block := requestLimiter.availableAt(auth.ID, requestPolicy, now)
+			if !available {
+				requestBlocked = earlierAuthRequestLimitBlock(requestBlocked, block)
+			}
+			return available
+		}
+		var selected *Auth
+		var errPick error
+		if strategy == schedulerStrategyFillFirst {
+			fillFirstRange := m.routingFillFirstRangeForPriority(priority)
+			fillFirstRPM := m.routingFillFirstPerAuthRPMForPriority(priority)
+			if requestPolicy.limit > 0 {
+				fillFirstRPM = 0
+			}
+			selected, errPick = selectFillFirstAuthsForContext(ctx, auths, "antigravity", "", now, 0, fillFirstRange, fillFirstRPM, m.fillFirstLimiter(), nil, combinedAllowed)
+		} else {
+			filtered := make([]*Auth, 0, len(auths))
+			for _, auth := range auths {
+				if combinedAllowed(auth) {
+					filtered = append(filtered, auth)
+				}
+			}
+			if len(filtered) == 0 {
+				return nil, preferAuthRequestLimitError(nil, requestBlocked)
+			}
+			selector := baseSelector(m.selector)
+			if strategy != schedulerStrategyCustom {
+				selector = m.legacyPrioritySelector(priority, strategy, m.routingFillFirstRangeForPriority(priority))
+			}
+			if selector == nil {
+				selector = &RoundRobinSelector{}
+			}
+			selected, errPick = selector.Pick(ctx, "antigravity", "", opts, filtered)
+			if errPick == nil && selected != nil {
+				selected = authFromListByID(filtered, selected.ID)
+				if selected == nil {
+					return nil, &Error{Code: "auth_not_found", Message: "selector returned unavailable auth"}
+				}
 			}
 		}
-		auths = filtered
-		if len(auths) == 0 {
-			return nil, nil
+		if errPick != nil {
+			return nil, preferAuthRequestLimitError(errPick, requestBlocked)
 		}
-		selector := baseSelector(m.selector)
-		if strategy != schedulerStrategyCustom {
-			selector = m.legacyPrioritySelector(priority, strategy, m.routingFillFirstRangeForPriority(priority))
+		if selected == nil {
+			return nil, preferAuthRequestLimitError(nil, requestBlocked)
 		}
-		if selector == nil {
-			selector = &RoundRobinSelector{}
+		if acquired, block := requestLimiter.tryAcquireAt(selected.ID, requestPolicy, now); !acquired {
+			if block.stalePolicy {
+				requestPolicy = m.routingAuthRequestLimitPolicyForPriority(priority)
+				requestBlocked = authRequestLimitBlock{}
+				clear(dynamicallyLimited)
+				continue
+			}
+			requestBlocked = earlierAuthRequestLimitBlock(requestBlocked, block)
+			dynamicallyLimited[selected.ID] = struct{}{}
+			continue
 		}
-		selected, errPick = selector.Pick(ctx, "antigravity", "", opts, auths)
+		return entryByID[selected.ID], nil
 	}
-	if errPick != nil {
-		return nil, errPick
-	}
-	if selected == nil {
-		return nil, nil
-	}
-	return entryByID[selected.ID], nil
 }
 
 func (m *Manager) pickAntigravityCreditsCandidate(ctx context.Context, routeModel string, opts cliproxyexecutor.Options, roundState *requestRoundState, maxRetryCredentials int) (*creditsCandidateEntry, error) {
@@ -4836,6 +5010,7 @@ func (m *Manager) pickAntigravityCreditsCandidate(ctx context.Context, routeMode
 	candidates := m.collectAntigravityCreditsCandidateAuths(routeModel, opts)
 	pickAllowed := m.roundPickAllowed(roundState, maxRetryCredentials)
 	var lastPickErr error
+	var earliestBlocker error
 	for start := 0; start < len(candidates); {
 		priority := authPriority(candidates[start].auth)
 		end := start + 1
@@ -4863,7 +5038,11 @@ func (m *Manager) pickAntigravityCreditsCandidate(ctx context.Context, routeMode
 				return allowed
 			})
 			if errPick != nil {
-				lastPickErr = errPick
+				if _, isBlocker := availabilityBlockerResetIn(errPick); isBlocker {
+					earliestBlocker = earlierAvailabilityBlocker(earliestBlocker, errPick)
+				} else {
+					lastPickErr = errPick
+				}
 				continue
 			}
 			if selected != nil {
@@ -4872,11 +5051,17 @@ func (m *Manager) pickAntigravityCreditsCandidate(ctx context.Context, routeMode
 		}
 		start = end
 	}
-	return nil, lastPickErr
+	if lastPickErr != nil {
+		return nil, lastPickErr
+	}
+	return nil, earliestBlocker
 }
 
 func shouldAttemptAntigravityCreditsFallback(m *Manager, lastErr error, providers []string) bool {
 	if m == nil || lastErr == nil {
+		return false
+	}
+	if isAuthRequestLimitedError(lastErr) {
 		return false
 	}
 	hasAntigravity := len(providers) == 0
@@ -5743,6 +5928,9 @@ func shouldRetryRequestRound(err error, cfg *internalconfig.Config) bool {
 	if retryOtherAuthForError(err) {
 		return false
 	}
+	if isAuthRequestLimitedError(err) {
+		return false
+	}
 	status := statusCodeFromError(err)
 	if status == http.StatusOK {
 		return false
@@ -5774,6 +5962,11 @@ func finalAuthSelectionError(err error) error {
 func isModelCooldownError(err error) bool {
 	var cooldownErr *modelCooldownError
 	return errors.As(err, &cooldownErr)
+}
+
+func isAuthRequestLimitedError(err error) bool {
+	var limitErr *authRequestLimitedError
+	return errors.As(err, &limitErr)
 }
 
 func cooldownWaitFromError(err error, maxWait time.Duration) (time.Duration, bool) {
@@ -6939,21 +7132,97 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 		m.mu.RUnlock()
 		return nil, nil, &Error{Code: "auth_not_found", Message: "no auth available"}
 	}
-	pickAllowed := func(auth *Auth) bool {
-		if auth == nil {
-			return false
+	requestLimiter := m.authRequestLimiter()
+	requestBlocked := authRequestLimitBlock{}
+	dynamicallyLimited := make(map[string]struct{})
+	strictBoundAuthID := ""
+	if sessionSelector, ok := m.selector.(*SessionAffinitySelector); ok && sessionSelector != nil && !sessionSelector.failover {
+		strictBoundAuthID = sessionSelector.cachedAuthID(provider, selectionArgForSelector(m.selector, model), opts)
+		for _, candidate := range candidates {
+			if candidate == nil || candidate.ID != strictBoundAuthID {
+				continue
+			}
+			now := requestLimiter.nowTime()
+			if blocked, _, _ := isAuthBlockedForModel(candidate, m.selectionModelForAuth(candidate, model), now); blocked {
+				break
+			}
+			policy := m.routingAuthRequestLimitPolicyForPriority(authPriority(candidate))
+			if available, block := requestLimiter.availableAt(candidate.ID, policy, now); !available {
+				m.mu.RUnlock()
+				return nil, nil, newAuthRequestLimitedError(block)
+			}
+			break
 		}
-		_, used := tried[auth.ID]
-		return !used
 	}
-	if selected, handled, errPick := m.pickLegacyFillFirstRangeAuth(ctx, provider, model, opts, candidates, pickAllowed); handled {
-		if errPick != nil {
-			m.mu.RUnlock()
-			return nil, nil, errPick
+	for {
+		now := requestLimiter.nowTime()
+		pickAllowed := func(auth *Auth) bool {
+			if auth == nil {
+				return false
+			}
+			if _, used := tried[auth.ID]; used {
+				return false
+			}
+			if _, limited := dynamicallyLimited[auth.ID]; limited {
+				return false
+			}
+			if strictBoundAuthID != "" && auth.ID != strictBoundAuthID {
+				return true
+			}
+			if strictBoundAuthID != "" {
+				if blocked, _, _ := isAuthBlockedForModel(auth, m.selectionModelForAuth(auth, model), now); blocked {
+					return true
+				}
+			}
+			policy := m.routingAuthRequestLimitPolicyForPriority(authPriority(auth))
+			available, block := requestLimiter.availableAt(auth.ID, policy, now)
+			if !available {
+				requestBlocked = earlierAuthRequestLimitBlock(requestBlocked, block)
+			}
+			return available
+		}
+
+		var selected *Auth
+		if picked, handled, _, errPick := m.pickLegacyFillFirstRangeAuthWithDeferredBinding(ctx, provider, model, opts, candidates, pickAllowed); handled {
+			if errPick != nil {
+				m.mu.RUnlock()
+				return nil, nil, preferAuthRequestLimitError(errPick, requestBlocked)
+			}
+			selected = picked
+		} else {
+			available, errAvailable := m.availableAuthsForRouteModelFilteredForContext(ctx, candidates, provider, model, opts, now, pickAllowed)
+			if errAvailable != nil {
+				m.mu.RUnlock()
+				return nil, nil, preferAuthRequestLimitError(errAvailable, requestBlocked)
+			}
+			var errPick error
+			selected, errPick = m.pickAvailableAuthWithPriorityPolicy(ctx, provider, selectionArgForSelector(m.selector, model), opts, available)
+			if errPick != nil {
+				m.mu.RUnlock()
+				return nil, nil, preferAuthRequestLimitError(errPick, requestBlocked)
+			}
+			if selected != nil {
+				selected = authFromListByID(available, selected.ID)
+			}
+			if selected == nil {
+				m.mu.RUnlock()
+				return nil, nil, &Error{Code: "auth_not_found", Message: "selector returned unavailable auth"}
+			}
 		}
 		if selected == nil {
 			m.mu.RUnlock()
-			return nil, nil, &Error{Code: "auth_not_found", Message: "selector returned no auth"}
+			return nil, nil, preferAuthRequestLimitError(&Error{Code: "auth_not_found", Message: "selector returned no auth"}, requestBlocked)
+		}
+		policy := m.routingAuthRequestLimitPolicyForPriority(authPriority(selected))
+		if acquired, block := requestLimiter.tryAcquireAt(selected.ID, policy, now); !acquired {
+			if block.stalePolicy {
+				requestBlocked = authRequestLimitBlock{}
+				clear(dynamicallyLimited)
+				continue
+			}
+			requestBlocked = earlierAuthRequestLimitBlock(requestBlocked, block)
+			dynamicallyLimited[selected.ID] = struct{}{}
+			continue
 		}
 		authCopy := selected.Clone()
 		m.mu.RUnlock()
@@ -6967,31 +7236,6 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 		}
 		return authCopy, executor, nil
 	}
-	available, errAvailable := m.availableAuthsForRouteModelFilteredForContext(ctx, candidates, provider, model, opts, time.Now(), pickAllowed)
-	if errAvailable != nil {
-		m.mu.RUnlock()
-		return nil, nil, errAvailable
-	}
-	selected, errPick := m.pickAvailableAuthWithPriorityPolicy(ctx, provider, selectionArgForSelector(m.selector, model), opts, available)
-	if errPick != nil {
-		m.mu.RUnlock()
-		return nil, nil, errPick
-	}
-	if selected == nil {
-		m.mu.RUnlock()
-		return nil, nil, &Error{Code: "auth_not_found", Message: "selector returned no auth"}
-	}
-	authCopy := selected.Clone()
-	m.mu.RUnlock()
-	if !selected.indexAssigned {
-		m.mu.Lock()
-		if current := m.auths[authCopy.ID]; current != nil && !current.indexAssigned {
-			current.EnsureIndex()
-			authCopy = current.Clone()
-		}
-		m.mu.Unlock()
-	}
-	return authCopy, executor, nil
 }
 
 func (m *Manager) pickNext(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, ProviderExecutor, error) {
@@ -7099,24 +7343,100 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 			selectorProvider = providerKey
 		}
 	}
-	pickAllowedForSelection := func(auth *Auth) bool {
-		if auth == nil {
-			return false
+	requestLimiter := m.authRequestLimiter()
+	requestBlocked := authRequestLimitBlock{}
+	dynamicallyLimited := make(map[string]struct{})
+	strictBoundAuthID := ""
+	if sessionSelector, ok := m.selector.(*SessionAffinitySelector); ok && sessionSelector != nil && !sessionSelector.failover {
+		strictBoundAuthID = sessionSelector.cachedAuthID(selectorProvider, selectionArgForSelector(m.selector, model), opts)
+		for _, candidate := range candidates {
+			if candidate == nil || candidate.ID != strictBoundAuthID {
+				continue
+			}
+			now := requestLimiter.nowTime()
+			if blocked, _, _ := isAuthBlockedForModel(candidate, m.selectionModelForAuth(candidate, model), now); blocked {
+				break
+			}
+			policy := m.routingAuthRequestLimitPolicyForPriority(authPriority(candidate))
+			if available, block := requestLimiter.availableAt(candidate.ID, policy, now); !available {
+				m.mu.RUnlock()
+				return nil, nil, "", newAuthRequestLimitedError(block)
+			}
+			break
 		}
-		_, used := tried[auth.ID]
-		if used {
-			return false
-		}
-		return pickAllowed == nil || pickAllowed(auth)
 	}
-	if selected, handled, errPick := m.pickLegacyFillFirstRangeAuth(ctx, selectorProvider, model, opts, candidates, pickAllowedForSelection); handled {
-		if errPick != nil {
-			m.mu.RUnlock()
-			return nil, nil, "", errPick
+	for {
+		now := requestLimiter.nowTime()
+		pickAllowedForSelection := func(auth *Auth) bool {
+			if auth == nil {
+				return false
+			}
+			if _, used := tried[auth.ID]; used {
+				return false
+			}
+			if _, limited := dynamicallyLimited[auth.ID]; limited {
+				return false
+			}
+			if pickAllowed != nil && !pickAllowed(auth) {
+				return false
+			}
+			if strictBoundAuthID != "" && auth.ID != strictBoundAuthID {
+				return true
+			}
+			if strictBoundAuthID != "" {
+				if blocked, _, _ := isAuthBlockedForModel(auth, m.selectionModelForAuth(auth, model), now); blocked {
+					return true
+				}
+			}
+			policy := m.routingAuthRequestLimitPolicyForPriority(authPriority(auth))
+			available, block := requestLimiter.availableAt(auth.ID, policy, now)
+			if !available {
+				requestBlocked = earlierAuthRequestLimitBlock(requestBlocked, block)
+			}
+			return available
+		}
+
+		var selected *Auth
+		if picked, handled, _, errPick := m.pickLegacyFillFirstRangeAuthWithDeferredBinding(ctx, selectorProvider, model, opts, candidates, pickAllowedForSelection); handled {
+			if errPick != nil {
+				m.mu.RUnlock()
+				return nil, nil, "", preferAuthRequestLimitError(errPick, requestBlocked)
+			}
+			selected = picked
+		} else {
+			available, errAvailable := m.availableAuthsForRouteModelFilteredForContext(ctx, candidates, selectorProvider, model, opts, now, pickAllowedForSelection)
+			if errAvailable != nil {
+				m.mu.RUnlock()
+				return nil, nil, "", preferAuthRequestLimitError(errAvailable, requestBlocked)
+			}
+			var errPick error
+			selected, errPick = m.pickAvailableAuthWithPriorityPolicy(ctx, selectorProvider, selectionArgForSelector(m.selector, model), opts, available)
+			if errPick != nil {
+				m.mu.RUnlock()
+				return nil, nil, "", preferAuthRequestLimitError(errPick, requestBlocked)
+			}
+			if selected != nil {
+				selected = authFromListByID(available, selected.ID)
+			}
+			if selected == nil {
+				m.mu.RUnlock()
+				return nil, nil, "", &Error{Code: "auth_not_found", Message: "selector returned unavailable auth"}
+			}
 		}
 		if selected == nil {
 			m.mu.RUnlock()
-			return nil, nil, "", &Error{Code: "auth_not_found", Message: "selector returned no auth"}
+			return nil, nil, "", preferAuthRequestLimitError(&Error{Code: "auth_not_found", Message: "selector returned no auth"}, requestBlocked)
+		}
+		policy := m.routingAuthRequestLimitPolicyForPriority(authPriority(selected))
+		if acquired, block := requestLimiter.tryAcquireAt(selected.ID, policy, now); !acquired {
+			if block.stalePolicy {
+				requestBlocked = authRequestLimitBlock{}
+				clear(dynamicallyLimited)
+				continue
+			}
+			requestBlocked = earlierAuthRequestLimitBlock(requestBlocked, block)
+			dynamicallyLimited[selected.ID] = struct{}{}
+			continue
 		}
 		providerKey := strings.TrimSpace(strings.ToLower(selected.Provider))
 		executor, okExecutor := m.executors[providerKey]
@@ -7136,37 +7456,6 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 		}
 		return authCopy, executor, providerKey, nil
 	}
-	available, errAvailable := m.availableAuthsForRouteModelFilteredForContext(ctx, candidates, selectorProvider, model, opts, time.Now(), pickAllowedForSelection)
-	if errAvailable != nil {
-		m.mu.RUnlock()
-		return nil, nil, "", errAvailable
-	}
-	selected, errPick := m.pickAvailableAuthWithPriorityPolicy(ctx, selectorProvider, selectionArgForSelector(m.selector, model), opts, available)
-	if errPick != nil {
-		m.mu.RUnlock()
-		return nil, nil, "", errPick
-	}
-	if selected == nil {
-		m.mu.RUnlock()
-		return nil, nil, "", &Error{Code: "auth_not_found", Message: "selector returned no auth"}
-	}
-	providerKey := strings.TrimSpace(strings.ToLower(selected.Provider))
-	executor, okExecutor := m.executors[providerKey]
-	if !okExecutor {
-		m.mu.RUnlock()
-		return nil, nil, "", &Error{Code: "executor_not_found", Message: "executor not registered"}
-	}
-	authCopy := selected.Clone()
-	m.mu.RUnlock()
-	if !selected.indexAssigned {
-		m.mu.Lock()
-		if current := m.auths[authCopy.ID]; current != nil && !current.indexAssigned {
-			current.EnsureIndex()
-			authCopy = current.Clone()
-		}
-		m.mu.Unlock()
-	}
-	return authCopy, executor, providerKey, nil
 }
 
 func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model string, opts cliproxyexecutor.Options, tried map[string]struct{}, pickAllowed ...func(*Auth) bool) (*Auth, ProviderExecutor, string, error) {

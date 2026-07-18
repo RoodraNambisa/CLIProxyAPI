@@ -464,6 +464,14 @@ func normalizeFillFirstPerAuthRPM(value int) int {
 	return config.NormalizeFillFirstPerAuthRPM(value)
 }
 
+func normalizePerAuthRequestLimit(value int) int {
+	return config.NormalizePerAuthRequestLimit(value)
+}
+
+func normalizePerAuthRequestWindowMinutes(value int) int {
+	return config.NormalizePerAuthRequestWindowMinutes(value)
+}
+
 func (h *Handler) updateRoutingConfig(c *gin.Context, update func(*config.RoutingConfig)) bool {
 	if h == nil || h.cfg == nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "config not initialized"})
@@ -544,6 +552,46 @@ func (h *Handler) PutRoutingFillFirstPerAuthRPM(c *gin.Context) {
 	}
 	if !h.updateRoutingConfig(c, func(routing *config.RoutingConfig) {
 		routing.FillFirstPerAuthRPM = normalizeFillFirstPerAuthRPM(*body.Value)
+	}) {
+		return
+	}
+	h.persist(c)
+}
+
+func (h *Handler) GetRoutingPerAuthRequestLimit(c *gin.Context) {
+	c.JSON(200, gin.H{"per-auth-request-limit": normalizePerAuthRequestLimit(h.cfg.Routing.PerAuthRequestLimit)})
+}
+
+func (h *Handler) PutRoutingPerAuthRequestLimit(c *gin.Context) {
+	var body struct {
+		Value *int `json:"value"`
+	}
+	if errBindJSON := c.ShouldBindJSON(&body); errBindJSON != nil || body.Value == nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
+		return
+	}
+	if !h.updateRoutingConfig(c, func(routing *config.RoutingConfig) {
+		routing.PerAuthRequestLimit = normalizePerAuthRequestLimit(*body.Value)
+	}) {
+		return
+	}
+	h.persist(c)
+}
+
+func (h *Handler) GetRoutingPerAuthRequestWindowMinutes(c *gin.Context) {
+	c.JSON(200, gin.H{"per-auth-request-window-minutes": normalizePerAuthRequestWindowMinutes(h.cfg.Routing.PerAuthRequestWindowMinutes)})
+}
+
+func (h *Handler) PutRoutingPerAuthRequestWindowMinutes(c *gin.Context) {
+	var body struct {
+		Value *int `json:"value"`
+	}
+	if errBindJSON := c.ShouldBindJSON(&body); errBindJSON != nil || body.Value == nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
+		return
+	}
+	if !h.updateRoutingConfig(c, func(routing *config.RoutingConfig) {
+		routing.PerAuthRequestWindowMinutes = normalizePerAuthRequestWindowMinutes(*body.Value)
 	}) {
 		return
 	}

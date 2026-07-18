@@ -144,6 +144,31 @@ func TestLightweightUsageAnalyticsRoutesAreRegistered(t *testing.T) {
 	}
 }
 
+func TestPerAuthRequestLimitManagementRoutesAreRegistered(t *testing.T) {
+	server := newTestServerWithConfig(t, func(cfg *proxyconfig.Config) {
+		cfg.RemoteManagement.SecretKey = "secret"
+	})
+	want := map[string]bool{
+		http.MethodGet + " /v0/management/routing/per-auth-request-limit":            false,
+		http.MethodPut + " /v0/management/routing/per-auth-request-limit":            false,
+		http.MethodPatch + " /v0/management/routing/per-auth-request-limit":          false,
+		http.MethodGet + " /v0/management/routing/per-auth-request-window-minutes":   false,
+		http.MethodPut + " /v0/management/routing/per-auth-request-window-minutes":   false,
+		http.MethodPatch + " /v0/management/routing/per-auth-request-window-minutes": false,
+	}
+	for _, route := range server.engine.Routes() {
+		key := route.Method + " " + route.Path
+		if _, ok := want[key]; ok {
+			want[key] = true
+		}
+	}
+	for route, registered := range want {
+		if !registered {
+			t.Errorf("route %s is not registered", route)
+		}
+	}
+}
+
 func TestChatGPTWebManagementRoutesAreRegistered(t *testing.T) {
 	server := newTestServerWithConfig(t, func(cfg *proxyconfig.Config) {
 		cfg.RemoteManagement.SecretKey = "secret"

@@ -247,6 +247,9 @@ routing:
   strategy: "round-robin" # round-robin (default), fill-first, random
   fill-first-range: 1 # fill-first only; N credentials per fill group, group-internal random
   fill-first-per-auth-rpm: 0 # fill-first only; 0 disables; mutually exclusive with fill-first-range > 1
+  per-auth-request-limit: 0 # all strategies; 0 disables the generic per-auth fixed-window limit
+  per-auth-request-window-minutes: 1 # UTC-aligned fixed window; minimum 1 minute
+  # A positive generic limit takes precedence over fill-first-per-auth-rpm at the same priority.
   # Optional per-priority overrides. These take precedence over routing.strategy
   # and the global max-retry-credentials for the matching priority.
   # max-retry-credentials counts the first credential in the round; 1 means no
@@ -258,6 +261,8 @@ routing:
   #     strategy: fill-first
   #     fill-first-range: 5
   #     # fill-first-per-auth-rpm: 60 # alternatively, sequentially move to next auth after 60 selections/minute
+  #     per-auth-request-limit: 120
+  #     per-auth-request-window-minutes: 5
   #     max-retry-credentials: 2
   #   - priority: -1
   #     strategy: random

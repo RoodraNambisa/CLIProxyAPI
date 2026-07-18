@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -243,7 +244,7 @@ func TestPutRoutingPriorityOverrides_NormalizesValues(t *testing.T) {
 
 	rec := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(rec)
-	c.Request = httptest.NewRequest(http.MethodPut, "/v0/management/routing/priority-overrides", bytes.NewBufferString(`{"value":[{"priority":0,"strategy":"ff","max-retry-credentials":2,"fill-first-range":5,"fill-first-per-auth-rpm":0},{"priority":-1,"max-retry-credentials":-3,"fill-first-range":0,"fill-first-per-auth-rpm":-3}]}`))
+	c.Request = httptest.NewRequest(http.MethodPut, "/v0/management/routing/priority-overrides", bytes.NewBufferString(`{"value":[{"priority":0,"strategy":"ff","max-retry-credentials":2,"fill-first-range":5,"fill-first-per-auth-rpm":0,"per-auth-request-limit":120,"per-auth-request-window-minutes":5},{"priority":-1,"max-retry-credentials":-3,"fill-first-range":0,"fill-first-per-auth-rpm":-3,"per-auth-request-limit":-3,"per-auth-request-window-minutes":0}]}`))
 	c.Request.Header.Set("Content-Type", "application/json")
 
 	h.PutRoutingPriorityOverrides(c)
@@ -264,6 +265,12 @@ func TestPutRoutingPriorityOverrides_NormalizesValues(t *testing.T) {
 	if first.FillFirstPerAuthRPM == nil || *first.FillFirstPerAuthRPM != 0 {
 		t.Fatalf("first FillFirstPerAuthRPM = %v, want 0", first.FillFirstPerAuthRPM)
 	}
+	if first.PerAuthRequestLimit == nil || *first.PerAuthRequestLimit != 120 {
+		t.Fatalf("first PerAuthRequestLimit = %v, want 120", first.PerAuthRequestLimit)
+	}
+	if first.PerAuthRequestWindowMinutes == nil || *first.PerAuthRequestWindowMinutes != 5 {
+		t.Fatalf("first PerAuthRequestWindowMinutes = %v, want 5", first.PerAuthRequestWindowMinutes)
+	}
 	second := h.cfg.Routing.PriorityOverrides[1]
 	if second.MaxRetryCredentials == nil || *second.MaxRetryCredentials != 0 {
 		t.Fatalf("second override = %+v, want limit 0", second)
@@ -273,6 +280,126 @@ func TestPutRoutingPriorityOverrides_NormalizesValues(t *testing.T) {
 	}
 	if second.FillFirstPerAuthRPM == nil || *second.FillFirstPerAuthRPM != 0 {
 		t.Fatalf("second FillFirstPerAuthRPM = %v, want 0", second.FillFirstPerAuthRPM)
+	}
+	if second.PerAuthRequestLimit == nil || *second.PerAuthRequestLimit != 0 {
+		t.Fatalf("second PerAuthRequestLimit = %v, want 0", second.PerAuthRequestLimit)
+	}
+	if second.PerAuthRequestWindowMinutes == nil || *second.PerAuthRequestWindowMinutes != 1 {
+		t.Fatalf("second PerAuthRequestWindowMinutes = %v, want 1", second.PerAuthRequestWindowMinutes)
+	}
+}
+
+func TestRoutingPerAuthRequestLimitHandlers_NormalizeValues(t *testing.T) {
+	t.Parallel()
+
+	h := &Handler{
+		cfg:            &config.Config{},
+		configFilePath: writeTestConfigFile(t),
+	}
+
+	limitRec := httptest.NewRecorder()
+	limitCtx, _ := gin.CreateTestContext(limitRec)
+	limitCtx.Request = httptest.NewRequest(http.MethodPatch, "/v0/management/routing/per-auth-request-limit", bytes.NewBufferString(`{"value":-1}`))
+	limitCtx.Request.Header.Set("Content-Type", "application/json")
+	h.PutRoutingPerAuthRequestLimit(limitCtx)
+	if limitRec.Code != http.StatusOK || h.cfg.Routing.PerAuthRequestLimit != 0 {
+		t.Fatalf("limit update status=%d value=%d body=%s", limitRec.Code, h.cfg.Routing.PerAuthRequestLimit, limitRec.Body.String())
+	}
+
+	windowRec := httptest.NewRecorder()
+	windowCtx, _ := gin.CreateTestContext(windowRec)
+	windowCtx.Request = httptest.NewRequest(http.MethodPatch, "/v0/management/routing/per-auth-request-window-minutes", bytes.NewBufferString(`{"value":0}`))
+	windowCtx.Request.Header.Set("Content-Type", "application/json")
+	h.PutRoutingPerAuthRequestWindowMinutes(windowCtx)
+	if windowRec.Code != http.StatusOK || h.cfg.Routing.PerAuthRequestWindowMinutes != 1 {
+		t.Fatalf("window update status=%d value=%d body=%s", windowRec.Code, h.cfg.Routing.PerAuthRequestWindowMinutes, windowRec.Body.String())
+	}
+
+	getRec := httptest.NewRecorder()
+	getCtx, _ := gin.CreateTestContext(getRec)
+	h.GetRoutingPerAuthRequestWindowMinutes(getCtx)
+	var body map[string]int
+	if errDecode := json.Unmarshal(getRec.Body.Bytes(), &body); errDecode != nil {
+		t.Fatalf("decode response: %v", errDecode)
+	}
+	if body["per-auth-request-window-minutes"] != 1 {
+		t.Fatalf("window response = %d, want 1", body["per-auth-request-window-minutes"])
+	}
+
+	maxInt := int(^uint(0) >> 1)
+	maxWindowRec := httptest.NewRecorder()
+	maxWindowCtx, _ := gin.CreateTestContext(maxWindowRec)
+	maxWindowCtx.Request = httptest.NewRequest(http.MethodPut, "/v0/management/routing/per-auth-request-window-minutes", bytes.NewBufferString(`{"value":`+strconv.Itoa(maxInt)+`}`))
+	maxWindowCtx.Request.Header.Set("Content-Type", "application/json")
+	h.PutRoutingPerAuthRequestWindowMinutes(maxWindowCtx)
+	if maxWindowRec.Code != http.StatusOK || h.cfg.Routing.PerAuthRequestWindowMinutes != config.NormalizePerAuthRequestWindowMinutes(maxInt) {
+		t.Fatalf("maximum window update status=%d value=%d body=%s", maxWindowRec.Code, h.cfg.Routing.PerAuthRequestWindowMinutes, maxWindowRec.Body.String())
+	}
+}
+
+func TestRoutingPerAuthRequestLimitHandlers_PersistExplicitZero(t *testing.T) {
+	t.Parallel()
+
+	configPath := writeTestConfigFile(t)
+	if errWrite := os.WriteFile(configPath, []byte("routing:\n  per-auth-request-limit: 60\n"), 0o600); errWrite != nil {
+		t.Fatalf("write config: %v", errWrite)
+	}
+	h := &Handler{
+		cfg: &config.Config{Routing: config.RoutingConfig{
+			PerAuthRequestLimit:         60,
+			PerAuthRequestWindowMinutes: 1,
+		}},
+		configFilePath: configPath,
+	}
+
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPatch, "/v0/management/routing/per-auth-request-limit", bytes.NewBufferString(`{"value":0}`))
+	c.Request.Header.Set("Content-Type", "application/json")
+	h.PutRoutingPerAuthRequestLimit(c)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+
+	loaded, errLoad := config.LoadConfig(configPath)
+	if errLoad != nil {
+		t.Fatalf("load persisted config: %v", errLoad)
+	}
+	if loaded.Routing.PerAuthRequestLimit != 0 {
+		t.Fatalf("persisted limit = %d, want 0", loaded.Routing.PerAuthRequestLimit)
+	}
+}
+
+func TestPutRoutingPriorityOverrides_PersistsExplicitZeroLimit(t *testing.T) {
+	t.Parallel()
+
+	configPath := writeTestConfigFile(t)
+	if errWrite := os.WriteFile(configPath, []byte("routing:\n  per-auth-request-limit: 60\n"), 0o600); errWrite != nil {
+		t.Fatalf("write config: %v", errWrite)
+	}
+	h := &Handler{
+		cfg: &config.Config{Routing: config.RoutingConfig{
+			PerAuthRequestLimit:         60,
+			PerAuthRequestWindowMinutes: 1,
+		}},
+		configFilePath: configPath,
+	}
+
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPatch, "/v0/management/routing/priority-overrides", bytes.NewBufferString(`{"value":[{"priority":0,"per-auth-request-limit":0}]}`))
+	c.Request.Header.Set("Content-Type", "application/json")
+	h.PutRoutingPriorityOverrides(c)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+
+	loaded, errLoad := config.LoadConfig(configPath)
+	if errLoad != nil {
+		t.Fatalf("load persisted config: %v", errLoad)
+	}
+	if len(loaded.Routing.PriorityOverrides) != 1 || loaded.Routing.PriorityOverrides[0].PerAuthRequestLimit == nil || *loaded.Routing.PriorityOverrides[0].PerAuthRequestLimit != 0 {
+		t.Fatalf("persisted overrides = %+v, want explicit zero limit", loaded.Routing.PriorityOverrides)
 	}
 }
 

@@ -999,7 +999,34 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 	return s.pickWithFallback(ctx, provider, model, opts, auths, s.fallback)
 }
 
+func (s *SessionAffinitySelector) cachedAuthID(provider, model string, opts cliproxyexecutor.Options) string {
+	if s == nil || s.cache == nil {
+		return ""
+	}
+	primaryID, fallbackID := extractSessionIDs(opts.Headers, opts.OriginalRequest, opts.Metadata)
+	if primaryID == "" {
+		return ""
+	}
+	if authID, ok := s.cache.GetAndRefresh(provider + "::" + primaryID + "::" + model); ok {
+		return authID
+	}
+	if fallbackID != "" && fallbackID != primaryID {
+		if authID, ok := s.cache.GetAndRefresh(provider + "::" + fallbackID + "::" + model); ok {
+			return authID
+		}
+	}
+	return ""
+}
+
 func (s *SessionAffinitySelector) pickWithFallback(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth, fallback Selector) (*Auth, error) {
+	auth, bind, err := s.pickWithFallbackDeferredBinding(ctx, provider, model, opts, auths, fallback)
+	if err == nil && bind != nil {
+		bind()
+	}
+	return auth, err
+}
+
+func (s *SessionAffinitySelector) pickWithFallbackDeferredBinding(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth, fallback Selector) (*Auth, func(), error) {
 	if fallback == nil {
 		fallback = s.fallback
 	}
@@ -1010,13 +1037,14 @@ func (s *SessionAffinitySelector) pickWithFallback(ctx context.Context, provider
 	primaryID, fallbackID := extractSessionIDs(opts.Headers, opts.OriginalRequest, opts.Metadata)
 	if primaryID == "" {
 		entry.Debugf("session-affinity: no session ID extracted, falling back to default selector | provider=%s model=%s", provider, model)
-		return fallback.Pick(ctx, provider, model, opts, auths)
+		auth, err := fallback.Pick(ctx, provider, model, opts, auths)
+		return auth, nil, err
 	}
 
 	now := time.Now()
 	available, err := getAvailableAuthsForContext(ctx, auths, provider, model, now, selectionAttemptFromMetadata(opts.Metadata))
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	cacheKey := provider + "::" + primaryID + "::" + model
@@ -1025,7 +1053,7 @@ func (s *SessionAffinitySelector) pickWithFallback(ctx context.Context, provider
 		for _, auth := range available {
 			if auth.ID == cachedAuthID {
 				entry.Infof("session-affinity: cache hit | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
-				return auth, nil
+				return auth, nil, nil
 			}
 		}
 		// Cached auth not available, reselect via fallback selector for even distribution
@@ -1036,15 +1064,15 @@ func (s *SessionAffinitySelector) pickWithFallback(ctx context.Context, provider
 				HTTPStatus: http.StatusServiceUnavailable,
 			}
 			entry.Infof("session-affinity: cache hit but auth unavailable, strict failover disabled | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), cachedAuthID, provider, model)
-			return nil, err
+			return nil, nil, err
 		}
 		auth, err := fallback.Pick(ctx, provider, model, opts, available)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
-		s.cache.Set(cacheKey, auth.ID)
-		entry.Infof("session-affinity: cache hit but auth unavailable, reselected | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
-		return auth, nil
+		bind := s.deferSelectionBinding(cacheKey, auth.ID)
+		entry.Infof("session-affinity: cache hit but auth unavailable, selected fallback | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
+		return auth, bind, nil
 	}
 
 	if fallbackID != "" && fallbackID != primaryID {
@@ -1052,9 +1080,9 @@ func (s *SessionAffinitySelector) pickWithFallback(ctx context.Context, provider
 		if cachedAuthID, ok := s.cache.Get(fallbackKey); ok {
 			for _, auth := range available {
 				if auth.ID == cachedAuthID {
-					s.cache.Set(cacheKey, auth.ID)
+					bind := s.deferSelectionBinding(cacheKey, auth.ID)
 					entry.Infof("session-affinity: fallback cache hit | session=%s fallback=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), truncateSessionID(fallbackID), auth.ID, provider, model)
-					return auth, nil
+					return auth, bind, nil
 				}
 			}
 		}
@@ -1062,22 +1090,31 @@ func (s *SessionAffinitySelector) pickWithFallback(ctx context.Context, provider
 
 	auth, err := fallback.Pick(ctx, provider, model, opts, available)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	s.cache.Set(cacheKey, auth.ID)
-	entry.Infof("session-affinity: cache miss, new binding | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
-	return auth, nil
+	bind := s.deferSelectionBinding(cacheKey, auth.ID)
+	entry.Infof("session-affinity: cache miss, selected auth | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
+	return auth, bind, nil
 }
 
 func (s *SessionAffinitySelector) pickWithPreparedFallback(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, available []*Auth, pickFallback func() (*Auth, error)) (*Auth, error) {
+	auth, bind, err := s.pickWithPreparedFallbackDeferredBinding(ctx, provider, model, opts, available, pickFallback)
+	if err == nil && bind != nil {
+		bind()
+	}
+	return auth, err
+}
+
+func (s *SessionAffinitySelector) pickWithPreparedFallbackDeferredBinding(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, available []*Auth, pickFallback func() (*Auth, error)) (*Auth, func(), error) {
 	if pickFallback == nil {
-		return nil, &Error{Code: "auth_not_found", Message: "no auth available"}
+		return nil, nil, &Error{Code: "auth_not_found", Message: "no auth available"}
 	}
 	entry := selectorLogEntry(ctx)
 	primaryID, fallbackID := extractSessionIDs(opts.Headers, opts.OriginalRequest, opts.Metadata)
 	if primaryID == "" {
 		entry.Debugf("session-affinity: no session ID extracted, falling back to default selector | provider=%s model=%s", provider, model)
-		return pickFallback()
+		auth, err := pickFallback()
+		return auth, nil, err
 	}
 
 	cacheKey := provider + "::" + primaryID + "::" + model
@@ -1085,7 +1122,7 @@ func (s *SessionAffinitySelector) pickWithPreparedFallback(ctx context.Context, 
 		for _, auth := range available {
 			if auth.ID == cachedAuthID {
 				entry.Infof("session-affinity: cache hit | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
-				return auth, nil
+				return auth, nil, nil
 			}
 		}
 		if !s.failover {
@@ -1095,15 +1132,15 @@ func (s *SessionAffinitySelector) pickWithPreparedFallback(ctx context.Context, 
 				HTTPStatus: http.StatusServiceUnavailable,
 			}
 			entry.Infof("session-affinity: cache hit but auth unavailable, strict failover disabled | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), cachedAuthID, provider, model)
-			return nil, err
+			return nil, nil, err
 		}
 		auth, err := pickFallback()
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
-		s.cache.Set(cacheKey, auth.ID)
-		entry.Infof("session-affinity: cache hit but auth unavailable, reselected | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
-		return auth, nil
+		bind := s.deferSelectionBinding(cacheKey, auth.ID)
+		entry.Infof("session-affinity: cache hit but auth unavailable, selected fallback | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
+		return auth, bind, nil
 	}
 
 	if fallbackID != "" && fallbackID != primaryID {
@@ -1111,9 +1148,9 @@ func (s *SessionAffinitySelector) pickWithPreparedFallback(ctx context.Context, 
 		if cachedAuthID, ok := s.cache.Get(fallbackKey); ok {
 			for _, auth := range available {
 				if auth.ID == cachedAuthID {
-					s.cache.Set(cacheKey, auth.ID)
+					bind := s.deferSelectionBinding(cacheKey, auth.ID)
 					entry.Infof("session-affinity: fallback cache hit | session=%s fallback=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), truncateSessionID(fallbackID), auth.ID, provider, model)
-					return auth, nil
+					return auth, bind, nil
 				}
 			}
 		}
@@ -1121,11 +1158,20 @@ func (s *SessionAffinitySelector) pickWithPreparedFallback(ctx context.Context, 
 
 	auth, err := pickFallback()
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	s.cache.Set(cacheKey, auth.ID)
-	entry.Infof("session-affinity: cache miss, new binding | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
-	return auth, nil
+	bind := s.deferSelectionBinding(cacheKey, auth.ID)
+	entry.Infof("session-affinity: cache miss, selected auth | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
+	return auth, bind, nil
+}
+
+func (s *SessionAffinitySelector) deferSelectionBinding(cacheKey, authID string) func() {
+	if s == nil || s.cache == nil || cacheKey == "" || authID == "" {
+		return nil
+	}
+	return func() {
+		s.cache.Set(cacheKey, authID)
+	}
 }
 
 // BindSession records the successful auth for the extracted session ID.

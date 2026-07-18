@@ -15,6 +15,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	log "github.com/sirupsen/logrus"
@@ -592,6 +593,11 @@ type RoutingPriorityOverride struct {
 	FillFirstRange *int `yaml:"fill-first-range,omitempty" json:"fill-first-range,omitempty"`
 	// FillFirstPerAuthRPM optionally overrides routing.fill-first-per-auth-rpm for this priority.
 	FillFirstPerAuthRPM *int `yaml:"fill-first-per-auth-rpm,omitempty" json:"fill-first-per-auth-rpm,omitempty"`
+	// PerAuthRequestLimit optionally overrides routing.per-auth-request-limit for this priority.
+	// A non-nil zero value disables the generic request limit for this priority.
+	PerAuthRequestLimit *int `yaml:"per-auth-request-limit,omitempty" json:"per-auth-request-limit,omitempty"`
+	// PerAuthRequestWindowMinutes optionally overrides routing.per-auth-request-window-minutes for this priority.
+	PerAuthRequestWindowMinutes *int `yaml:"per-auth-request-window-minutes,omitempty" json:"per-auth-request-window-minutes,omitempty"`
 }
 
 // RoutingConfig configures how credentials are selected for requests.
@@ -605,6 +611,12 @@ type RoutingConfig struct {
 
 	// FillFirstPerAuthRPM caps selected requests per auth per fixed minute for fill-first routing.
 	FillFirstPerAuthRPM int `yaml:"fill-first-per-auth-rpm,omitempty" json:"fill-first-per-auth-rpm,omitempty"`
+
+	// PerAuthRequestLimit caps selected requests per auth in a fixed window for all built-in strategies.
+	PerAuthRequestLimit int `yaml:"per-auth-request-limit" json:"per-auth-request-limit,omitempty"`
+
+	// PerAuthRequestWindowMinutes configures the fixed request-limit window in minutes.
+	PerAuthRequestWindowMinutes int `yaml:"per-auth-request-window-minutes,omitempty" json:"per-auth-request-window-minutes,omitempty"`
 
 	// PriorityOverrides customizes routing behavior for specific credential priorities.
 	PriorityOverrides []RoutingPriorityOverride `yaml:"priority-overrides,omitempty" json:"priority-overrides,omitempty"`
@@ -1842,6 +1854,30 @@ func NormalizeFillFirstPerAuthRPM(value int) int {
 	return value
 }
 
+// NormalizePerAuthRequestLimit returns a valid generic per-auth request limit.
+func NormalizePerAuthRequestLimit(value int) int {
+	if value < 0 {
+		return 0
+	}
+	return value
+}
+
+// NormalizePerAuthRequestWindowMinutes returns a valid fixed-window size.
+func NormalizePerAuthRequestWindowMinutes(value int) int {
+	if value < 1 {
+		return 1
+	}
+	maxWindowMinutes := int(^uint(0)>>1) / 60
+	maxDurationMinutes := int(time.Duration(1<<63-1) / time.Minute)
+	if maxWindowMinutes > maxDurationMinutes {
+		maxWindowMinutes = maxDurationMinutes
+	}
+	if value > maxWindowMinutes {
+		return maxWindowMinutes
+	}
+	return value
+}
+
 // NormalizeRoutingPriorityOverrides validates and canonicalizes per-priority routing overrides.
 func NormalizeRoutingPriorityOverrides(overrides []RoutingPriorityOverride) ([]RoutingPriorityOverride, error) {
 	if len(overrides) == 0 {
@@ -1882,13 +1918,25 @@ func NormalizeRoutingPriorityOverrides(overrides []RoutingPriorityOverride) ([]R
 			value := NormalizeFillFirstPerAuthRPM(*override.FillFirstPerAuthRPM)
 			fillFirstPerAuthRPM = &value
 		}
+		var perAuthRequestLimit *int
+		if override.PerAuthRequestLimit != nil {
+			value := NormalizePerAuthRequestLimit(*override.PerAuthRequestLimit)
+			perAuthRequestLimit = &value
+		}
+		var perAuthRequestWindowMinutes *int
+		if override.PerAuthRequestWindowMinutes != nil {
+			value := NormalizePerAuthRequestWindowMinutes(*override.PerAuthRequestWindowMinutes)
+			perAuthRequestWindowMinutes = &value
+		}
 
 		out = append(out, RoutingPriorityOverride{
-			Priority:            override.Priority,
-			Strategy:            strategy,
-			MaxRetryCredentials: maxRetryCredentials,
-			FillFirstRange:      fillFirstRange,
-			FillFirstPerAuthRPM: fillFirstPerAuthRPM,
+			Priority:                    override.Priority,
+			Strategy:                    strategy,
+			MaxRetryCredentials:         maxRetryCredentials,
+			FillFirstRange:              fillFirstRange,
+			FillFirstPerAuthRPM:         fillFirstPerAuthRPM,
+			PerAuthRequestLimit:         perAuthRequestLimit,
+			PerAuthRequestWindowMinutes: perAuthRequestWindowMinutes,
 		})
 	}
 	return out, nil
@@ -1906,6 +1954,8 @@ func routingStrategyForFillFirstControl(strategy string) string {
 func NormalizeRoutingConfig(routing RoutingConfig) (RoutingConfig, error) {
 	routing.FillFirstRange = NormalizeFillFirstRange(routing.FillFirstRange)
 	routing.FillFirstPerAuthRPM = NormalizeFillFirstPerAuthRPM(routing.FillFirstPerAuthRPM)
+	routing.PerAuthRequestLimit = NormalizePerAuthRequestLimit(routing.PerAuthRequestLimit)
+	routing.PerAuthRequestWindowMinutes = NormalizePerAuthRequestWindowMinutes(routing.PerAuthRequestWindowMinutes)
 	normalized, err := NormalizeRoutingPriorityOverrides(routing.PriorityOverrides)
 	if err != nil {
 		return routing, err
@@ -2538,6 +2588,28 @@ func appendPath(path []string, key string) []string {
 // represents a known default value that should not be written to the config file.
 // This prevents non-zero defaults from polluting the config.
 func isKnownDefaultValue(path []string, node *yaml.Node) bool {
+	fullPath := strings.Join(path, ".")
+	if fullPath == "routing.priority-overrides" && node != nil && node.Kind == yaml.SequenceNode && len(node.Content) > 0 {
+		return false
+	}
+	if fullPath == "routing" && node != nil && node.Kind == yaml.MappingNode {
+		if index := findMapKeyIndex(node, "priority-overrides"); index >= 0 {
+			value := node.Content[index+1]
+			if value != nil && value.Kind == yaml.SequenceNode && len(value.Content) > 0 {
+				return false
+			}
+		}
+	}
+	if node != nil && node.Kind == yaml.ScalarNode && node.Tag == "!!int" {
+		switch fullPath {
+		case "routing.priority-overrides.priority":
+			// Priority zero is an identity, not an omitted default.
+			return false
+		case "routing.priority-overrides.per-auth-request-limit":
+			// This pointer field uses an explicit zero to disable an inherited limit.
+			return false
+		}
+	}
 	// First check if it's a zero value
 	if isZeroValueNode(node) {
 		return true
@@ -2547,8 +2619,6 @@ func isKnownDefaultValue(path []string, node *yaml.Node) bool {
 	if len(path) == 0 {
 		return false
 	}
-
-	fullPath := strings.Join(path, ".")
 
 	// Check string defaults
 	if node.Kind == yaml.ScalarNode && node.Tag == "!!str" {
@@ -2567,6 +2637,8 @@ func isKnownDefaultValue(path []string, node *yaml.Node) bool {
 		switch fullPath {
 		case "error-logs-max-files":
 			return node.Value == "10"
+		case "routing.per-auth-request-window-minutes":
+			return node.Value == "1"
 		}
 	}
 
