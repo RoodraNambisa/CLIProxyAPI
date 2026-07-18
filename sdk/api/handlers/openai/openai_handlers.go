@@ -29,6 +29,20 @@ type OpenAIAPIHandler struct {
 	*handlers.BaseAPIHandler
 }
 
+func takePendingStreamError(errs <-chan *interfaces.ErrorMessage) *interfaces.ErrorMessage {
+	if errs == nil {
+		return nil
+	}
+	select {
+	case errMsg, ok := <-errs:
+		if ok {
+			return errMsg
+		}
+	default:
+	}
+	return nil
+}
+
 // NewOpenAIAPIHandler creates a new OpenAI API handlers instance.
 // It takes an BaseAPIHandler instance as input and returns an OpenAIAPIHandler.
 //
@@ -499,6 +513,11 @@ func (h *OpenAIAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON []byt
 			return
 		case chunk, ok := <-dataChan:
 			if !ok {
+				if errMsg := takePendingStreamError(errChan); errMsg != nil {
+					h.WriteErrorResponse(c, errMsg)
+					cliCancel(errMsg.Error)
+					return
+				}
 				// Stream closed without data? Send DONE or just headers.
 				setSSEHeaders()
 				handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
@@ -606,6 +625,11 @@ func (h *OpenAIAPIHandler) handleCompletionsStreamingResponse(c *gin.Context, ra
 			return
 		case chunk, ok := <-dataChan:
 			if !ok {
+				if errMsg := takePendingStreamError(errChan); errMsg != nil {
+					h.WriteErrorResponse(c, errMsg)
+					cliCancel(errMsg.Error)
+					return
+				}
 				setSSEHeaders()
 				handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
 				_, _ = fmt.Fprintf(c.Writer, "data: [DONE]\n\n")

@@ -1142,6 +1142,158 @@ func TestForwardResponsesWebsocketReturnsErrorPayloadMessage(t *testing.T) {
 	}
 }
 
+func TestForwardResponsesWebsocketPrefersPendingErrorWhenDataCloses(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	handler := NewOpenAIResponsesAPIHandler(handlers.NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, nil))
+
+	serverErrCh := make(chan error, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := responsesWebsocketUpgrader.Upgrade(w, r, nil)
+		if err != nil {
+			serverErrCh <- err
+			return
+		}
+		defer func() { _ = conn.Close() }()
+
+		ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+		ctx.Request = r
+		data := make(chan []byte)
+		errCh := make(chan *interfaces.ErrorMessage, 1)
+		errCh <- &interfaces.ErrorMessage{
+			StatusCode: http.StatusTooManyRequests,
+			Error:      errors.New(`{"error":{"message":"maximum context length exceeded","code":"context_too_large"}}`),
+		}
+		close(errCh)
+		close(data)
+
+		var timelineLog strings.Builder
+		_, forwardErrMsg, errForward := handler.forwardResponsesWebsocket(
+			ctx,
+			conn,
+			func(...interface{}) {},
+			data,
+			errCh,
+			&timelineLog,
+			"session-pending-error",
+			newWebsocketToolPairState(),
+		)
+		if errForward != nil {
+			serverErrCh <- errForward
+			return
+		}
+		if forwardErrMsg == nil || forwardErrMsg.StatusCode != http.StatusTooManyRequests {
+			serverErrCh <- fmt.Errorf("forward error = %#v, want status 429", forwardErrMsg)
+			return
+		}
+		serverErrCh <- nil
+	}))
+	defer server.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
+	for attempt := 0; attempt < 64; attempt++ {
+		conn, _, errDial := websocket.DefaultDialer.Dial(wsURL, nil)
+		if errDial != nil {
+			t.Fatalf("attempt %d dial websocket: %v", attempt, errDial)
+		}
+		_, payload, errRead := conn.ReadMessage()
+		_ = conn.Close()
+		if errRead != nil {
+			t.Fatalf("attempt %d read websocket message: %v", attempt, errRead)
+		}
+		if got := int(gjson.GetBytes(payload, "status").Int()); got != http.StatusTooManyRequests {
+			t.Fatalf("attempt %d status = %d, want 429; payload=%s", attempt, got, payload)
+		}
+		if !strings.Contains(string(payload), "context_too_large") {
+			t.Fatalf("attempt %d payload = %s, want context error", attempt, payload)
+		}
+		if errServer := <-serverErrCh; errServer != nil {
+			t.Fatalf("attempt %d server error: %v", attempt, errServer)
+		}
+	}
+}
+
+func TestForwardResponsesWebsocketIgnoresLateErrorAfterCompletion(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	handler := NewOpenAIResponsesAPIHandler(handlers.NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, nil))
+
+	serverErrCh := make(chan error, 1)
+	releaseLateError := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(releaseLateError) }) }
+	defer release()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := responsesWebsocketUpgrader.Upgrade(w, r, nil)
+		if err != nil {
+			serverErrCh <- err
+			return
+		}
+		defer func() { _ = conn.Close() }()
+
+		ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+		ctx.Request = r
+		data := make(chan []byte, 1)
+		errCh := make(chan *interfaces.ErrorMessage, 1)
+		data <- []byte("data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-1\",\"output\":[]}}\n\n")
+		go func() {
+			<-releaseLateError
+			errCh <- &interfaces.ErrorMessage{
+				StatusCode: http.StatusTooManyRequests,
+				Error:      errors.New(`{"error":{"message":"late context error","code":"context_too_large"}}`),
+			}
+			close(errCh)
+			close(data)
+		}()
+
+		var timelineLog strings.Builder
+		_, forwardErrMsg, errForward := handler.forwardResponsesWebsocket(
+			ctx,
+			conn,
+			func(...interface{}) {},
+			data,
+			errCh,
+			&timelineLog,
+			"session-late-error",
+			newWebsocketToolPairState(),
+		)
+		if errForward != nil {
+			serverErrCh <- errForward
+			return
+		}
+		if forwardErrMsg != nil {
+			serverErrCh <- fmt.Errorf("forward error = %#v, want completed success", forwardErrMsg)
+			return
+		}
+		serverErrCh <- nil
+	}))
+	defer server.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
+	conn, _, errDial := websocket.DefaultDialer.Dial(wsURL, nil)
+	if errDial != nil {
+		t.Fatalf("dial websocket: %v", errDial)
+	}
+	defer func() { _ = conn.Close() }()
+
+	_, payload, errRead := conn.ReadMessage()
+	if errRead != nil {
+		t.Fatalf("read completion: %v", errRead)
+	}
+	if got := gjson.GetBytes(payload, "type").String(); got != wsEventTypeCompleted {
+		t.Fatalf("first event = %q, want %s; payload=%s", got, wsEventTypeCompleted, payload)
+	}
+	release()
+	if errServer := <-serverErrCh; errServer != nil {
+		t.Fatalf("server error: %v", errServer)
+	}
+	if errDeadline := conn.SetReadDeadline(time.Now().Add(time.Second)); errDeadline != nil {
+		t.Fatalf("set read deadline: %v", errDeadline)
+	}
+	if _, extraPayload, errExtra := conn.ReadMessage(); errExtra == nil {
+		t.Fatalf("unexpected event after completion: %s", extraPayload)
+	}
+}
+
 func TestResponsesWebsocketDoneEventIsTerminal(t *testing.T) {
 	if !responsesWebsocketTerminalEvent(wsEventTypeDone) {
 		t.Fatalf("response.done should be treated as a terminal event")
@@ -1158,6 +1310,10 @@ func TestShouldClearResponsesWebsocketPinnedAuth(t *testing.T) {
 	errMsg := &interfaces.ErrorMessage{StatusCode: http.StatusTooManyRequests, Error: errors.New("rate limited")}
 	if !shouldClearResponsesWebsocketPinnedAuth("ws-auth", "ws-auth", errMsg) {
 		t.Fatalf("expected pinned auth to clear on retryable websocket error")
+	}
+	requestScoped := &interfaces.ErrorMessage{StatusCode: http.StatusTooManyRequests, Error: committedContextError{}}
+	if shouldClearResponsesWebsocketPinnedAuth("ws-auth", "ws-auth", requestScoped) {
+		t.Fatalf("request-scoped context error must not clear pinned auth")
 	}
 }
 

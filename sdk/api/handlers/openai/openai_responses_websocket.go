@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"sort"
@@ -820,6 +821,36 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesWebsocket(
 	completedOutput := []byte("[]")
 	outputItemsByIndex := make(map[int64][]byte)
 	var outputItemsFallback [][]byte
+	forwardError := func(errMsg *interfaces.ErrorMessage, warnWriteFailure bool) (*interfaces.ErrorMessage, error) {
+		if errMsg == nil {
+			cancel(nil)
+			return nil, nil
+		}
+		h.LoggingAPIResponseError(context.WithValue(context.Background(), "gin", c), errMsg)
+		markAPIResponseTimestamp(c)
+		errorPayload, errWrite := writeResponsesWebsocketError(conn, wsTimelineLog, errMsg)
+		log.Infof(
+			"responses websocket: downstream_out id=%s type=%d event=%s payload=%s",
+			sessionID,
+			websocket.TextMessage,
+			websocketPayloadEventType(errorPayload),
+			websocketPayloadPreview(errorPayload),
+		)
+		if errWrite != nil {
+			if warnWriteFailure {
+				log.Warnf(
+					"responses websocket: downstream_out write failed id=%s event=%s error=%v",
+					sessionID,
+					websocketPayloadEventType(errorPayload),
+					errWrite,
+				)
+			}
+			cancel(errMsg.Error)
+			return errMsg, errWrite
+		}
+		cancel(errMsg.Error)
+		return errMsg, nil
+	}
 
 	for {
 		select {
@@ -831,63 +862,25 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesWebsocket(
 				errs = nil
 				continue
 			}
-			if errMsg != nil {
-				h.LoggingAPIResponseError(context.WithValue(context.Background(), "gin", c), errMsg)
-				markAPIResponseTimestamp(c)
-				errorPayload, errWrite := writeResponsesWebsocketError(conn, wsTimelineLog, errMsg)
-				log.Infof(
-					"responses websocket: downstream_out id=%s type=%d event=%s payload=%s",
-					sessionID,
-					websocket.TextMessage,
-					websocketPayloadEventType(errorPayload),
-					websocketPayloadPreview(errorPayload),
-				)
-				if errWrite != nil {
-					// log.Warnf(
-					// 	"responses websocket: downstream_out write failed id=%s event=%s error=%v",
-					// 	sessionID,
-					// 	websocketPayloadEventType(errorPayload),
-					// 	errWrite,
-					// )
-					cancel(errMsg.Error)
-					return completedOutput, errMsg, errWrite
-				}
-			}
-			if errMsg != nil {
-				cancel(errMsg.Error)
-			} else {
+			if completed {
 				cancel(nil)
+				return completedOutput, nil, nil
 			}
-			return completedOutput, errMsg, nil
+			forwardErrMsg, errForward := forwardError(errMsg, false)
+			return completedOutput, forwardErrMsg, errForward
 		case chunk, ok := <-data:
 			if !ok {
 				if !completed {
+					if errMsg := takePendingStreamError(errs); errMsg != nil {
+						forwardErrMsg, errForward := forwardError(errMsg, false)
+						return completedOutput, forwardErrMsg, errForward
+					}
 					errMsg := &interfaces.ErrorMessage{
 						StatusCode: http.StatusRequestTimeout,
 						Error:      fmt.Errorf("stream closed before response.completed"),
 					}
-					h.LoggingAPIResponseError(context.WithValue(context.Background(), "gin", c), errMsg)
-					markAPIResponseTimestamp(c)
-					errorPayload, errWrite := writeResponsesWebsocketError(conn, wsTimelineLog, errMsg)
-					log.Infof(
-						"responses websocket: downstream_out id=%s type=%d event=%s payload=%s",
-						sessionID,
-						websocket.TextMessage,
-						websocketPayloadEventType(errorPayload),
-						websocketPayloadPreview(errorPayload),
-					)
-					if errWrite != nil {
-						log.Warnf(
-							"responses websocket: downstream_out write failed id=%s event=%s error=%v",
-							sessionID,
-							websocketPayloadEventType(errorPayload),
-							errWrite,
-						)
-						cancel(errMsg.Error)
-						return completedOutput, errMsg, errWrite
-					}
-					cancel(errMsg.Error)
-					return completedOutput, errMsg, nil
+					forwardErrMsg, errForward := forwardError(errMsg, true)
+					return completedOutput, forwardErrMsg, errForward
 				}
 				cancel(nil)
 				return completedOutput, nil, nil
@@ -1015,6 +1008,15 @@ func shouldClearResponsesWebsocketPinnedAuth(pinnedAuthID, lastAttemptedAuthID s
 func shouldReleaseResponsesWebsocketPinnedAuth(errMsg *interfaces.ErrorMessage) bool {
 	if errMsg == nil {
 		return false
+	}
+	if errMsg.Error != nil {
+		var skipAuthResult interface{ SkipAuthResult() bool }
+		if errors.As(errMsg.Error, &skipAuthResult) && skipAuthResult.SkipAuthResult() {
+			var retryOtherAuth interface{ RetryOtherAuth() bool }
+			if !errors.As(errMsg.Error, &retryOtherAuth) || !retryOtherAuth.RetryOtherAuth() {
+				return false
+			}
+		}
 	}
 	switch handlers.OriginalErrorStatusCode(errMsg) {
 	case http.StatusUnauthorized, http.StatusPaymentRequired, http.StatusForbidden, http.StatusRequestTimeout, http.StatusTooManyRequests, http.StatusInternalServerError, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:

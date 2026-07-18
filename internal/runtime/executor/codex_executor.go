@@ -246,7 +246,7 @@ func codexStreamErrorStatus(code string, fallback int) int {
 		return http.StatusTooManyRequests
 	case "not_found", "model_not_found":
 		return http.StatusNotFound
-	case "bad_request", "invalid_request", "invalid_request_error", "invalid_prompt", "invalid_value", "invalid_encrypted_content", "invalid_signature":
+	case "bad_request", "invalid_request", "invalid_request_error", "invalid_prompt", "invalid_value", "invalid_encrypted_content", "invalid_signature", "context_length_exceeded", "context_too_large":
 		return http.StatusBadRequest
 	case "server_error", "internal_server_error":
 		return http.StatusInternalServerError
@@ -291,7 +291,11 @@ func codexStreamStatusErr(status int, message, code, errType string, param *gjso
 	if param != nil {
 		body, _ = sjson.SetRawBytes(body, "error.param", []byte(param.Raw))
 	}
-	return statusErr{code: status, msg: string(body)}
+	err := statusErr{code: status, msg: string(body)}
+	if isCodexContextTooLargeRequestError(status, body) {
+		err.skipAuthResult = true
+	}
+	return err
 }
 
 // CodexExecutor is a stateless executor for Codex (OpenAI Responses API entrypoint).
@@ -1644,8 +1648,12 @@ func newCodexStatusErr(statusCode int, body []byte) statusErr {
 	if isCodexModelCapacityError(body) {
 		errCode = http.StatusTooManyRequests
 	}
+	requestScopedContextError := isCodexContextTooLargeRequestError(errCode, body)
 	body = classifyCodexStatusError(errCode, body)
 	err := statusErr{code: errCode, msg: string(body)}
+	if requestScopedContextError {
+		err.skipAuthResult = true
+	}
 	if retryAfter := parseCodexRetryAfter(errCode, body, time.Now()); retryAfter != nil {
 		err.retryAfter = retryAfter
 	}
@@ -1685,7 +1693,7 @@ func codexStatusErrorClassification(statusCode int, body []byte) (code string, e
 	isInvalidRequest := upstreamType == "" || upstreamType == "invalid_request_error"
 
 	switch {
-	case statusCode == http.StatusRequestEntityTooLarge || upstreamCode == "context_length_exceeded" || upstreamCode == "context_too_large" || isInvalidRequest && (strings.Contains(errorMessage, "context length") || strings.Contains(errorMessage, "context_length") || strings.Contains(errorMessage, "maximum context") || strings.Contains(errorMessage, "too many tokens")):
+	case isCodexContextTooLargeRequestError(statusCode, body) || isInvalidRequest && statusCode != http.StatusTooManyRequests && strings.Contains(errorMessage, "too many tokens"):
 		return "context_too_large", "invalid_request_error", true
 	case strings.Contains(lower, "invalid signature in thinking block") || strings.Contains(lower, "invalid_encrypted_content"):
 		return "thinking_signature_invalid", "invalid_request_error", true
@@ -1696,6 +1704,27 @@ func codexStatusErrorClassification(statusCode int, body []byte) (code string, e
 	default:
 		return "", "", false
 	}
+}
+
+func isCodexContextTooLargeRequestError(statusCode int, body []byte) bool {
+	if statusCode == http.StatusRequestEntityTooLarge {
+		return true
+	}
+	upstreamCode := strings.ToLower(strings.TrimSpace(gjson.GetBytes(body, "error.code").String()))
+	if upstreamCode == "context_length_exceeded" || upstreamCode == "context_too_large" {
+		return true
+	}
+	upstreamType := strings.ToLower(strings.TrimSpace(gjson.GetBytes(body, "error.type").String()))
+	if upstreamType != "" && upstreamType != "invalid_request_error" {
+		return false
+	}
+	errorMessage := strings.ToLower(strings.TrimSpace(gjson.GetBytes(body, "error.message").String()))
+	if errorMessage == "" {
+		errorMessage = strings.ToLower(strings.TrimSpace(gjson.GetBytes(body, "message").String()))
+	}
+	return strings.Contains(errorMessage, "context length") ||
+		strings.Contains(errorMessage, "context_length") ||
+		strings.Contains(errorMessage, "maximum context")
 }
 
 func normalizeCodexInstructions(body []byte) []byte {
