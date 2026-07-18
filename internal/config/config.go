@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"reflect"
 	"strings"
 	"sync"
 	"syscall"
@@ -1129,6 +1130,12 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	}
 	cfg.NoCooldownStatusCodes = NormalizeStatusCodes(cfg.NoCooldownStatusCodes)
 	cfg.FixedErrorCooldowns = NormalizeFixedErrorCooldowns(cfg.FixedErrorCooldowns)
+	if cfg.ErrorResponseRewrites, err = NormalizeErrorResponseRewrites(cfg.ErrorResponseRewrites); err != nil {
+		if optional {
+			return &Config{}, nil
+		}
+		return nil, err
+	}
 	cfg.NonRetryableErrors = NormalizeNonRetryableErrorRules(cfg.NonRetryableErrors)
 	cfg.AuthModelExclusions = NormalizeAuthModelExclusionRules(cfg.AuthModelExclusions)
 	if err = cfg.NormalizeDisabledImageGenerationTool(); err != nil {
@@ -1496,6 +1503,115 @@ func NormalizeFixedErrorCooldowns(rules []FixedErrorCooldownRule) []FixedErrorCo
 		return nil
 	}
 	return out
+}
+
+// NormalizeErrorResponseRewrites validates final client-facing execution error projections.
+func NormalizeErrorResponseRewrites(rules []ErrorResponseRewriteRule) ([]ErrorResponseRewriteRule, error) {
+	if len(rules) == 0 {
+		return nil, nil
+	}
+	out := make([]ErrorResponseRewriteRule, 0, len(rules))
+	for index, rule := range rules {
+		statusCode := rule.StatusCode
+		if statusCode != 0 && (statusCode < 100 || statusCode > 599) {
+			return nil, fmt.Errorf("error-response-rewrites[%d].status-code must be between 100 and 599", index)
+		}
+		message := strings.TrimSpace(rule.MessageContains)
+		if statusCode == 0 && message == "" {
+			return nil, fmt.Errorf("error-response-rewrites[%d] requires status-code or message-contains", index)
+		}
+		responseStatusCode := rule.ResponseStatusCode
+		if responseStatusCode != 0 && (responseStatusCode < 400 || responseStatusCode > 599) {
+			return nil, fmt.Errorf("error-response-rewrites[%d].response-status-code must be between 400 and 599", index)
+		}
+		if responseStatusCode == 0 && rule.ResponseBody == nil {
+			return nil, fmt.Errorf("error-response-rewrites[%d] requires response-status-code or response-body", index)
+		}
+
+		var responseBody *map[string]any
+		if rule.ResponseBody != nil {
+			if *rule.ResponseBody == nil {
+				return nil, fmt.Errorf("error-response-rewrites[%d].response-body must be a JSON object", index)
+			}
+			_, errMarshal := json.Marshal(*rule.ResponseBody)
+			if errMarshal != nil {
+				return nil, fmt.Errorf("error-response-rewrites[%d].response-body must be a JSON object: %w", index, errMarshal)
+			}
+			normalizedBody := cloneErrorResponseBody(*rule.ResponseBody)
+			responseBody = &normalizedBody
+		}
+
+		out = append(out, ErrorResponseRewriteRule{
+			StatusCode:         statusCode,
+			MessageContains:    message,
+			ResponseStatusCode: responseStatusCode,
+			ResponseBody:       responseBody,
+		})
+	}
+	return out, nil
+}
+
+func cloneErrorResponseBody(src map[string]any) map[string]any {
+	dst := make(map[string]any, len(src))
+	for key, value := range src {
+		cloned := cloneErrorResponseValue(reflect.ValueOf(value))
+		if cloned.IsValid() {
+			dst[key] = cloned.Interface()
+		} else {
+			dst[key] = nil
+		}
+	}
+	return dst
+}
+
+func cloneErrorResponseValue(value reflect.Value) reflect.Value {
+	if !value.IsValid() {
+		return reflect.Value{}
+	}
+	switch value.Kind() {
+	case reflect.Interface:
+		if value.IsNil() {
+			return reflect.Zero(value.Type())
+		}
+		cloned := cloneErrorResponseValue(value.Elem())
+		out := reflect.New(value.Type()).Elem()
+		out.Set(cloned)
+		return out
+	case reflect.Pointer:
+		if value.IsNil() {
+			return reflect.Zero(value.Type())
+		}
+		out := reflect.New(value.Type().Elem())
+		out.Elem().Set(cloneErrorResponseValue(value.Elem()))
+		return out
+	case reflect.Map:
+		if value.IsNil() {
+			return reflect.Zero(value.Type())
+		}
+		out := reflect.MakeMapWithSize(value.Type(), value.Len())
+		iter := value.MapRange()
+		for iter.Next() {
+			out.SetMapIndex(cloneErrorResponseValue(iter.Key()), cloneErrorResponseValue(iter.Value()))
+		}
+		return out
+	case reflect.Slice:
+		if value.IsNil() {
+			return reflect.Zero(value.Type())
+		}
+		out := reflect.MakeSlice(value.Type(), value.Len(), value.Len())
+		for index := 0; index < value.Len(); index++ {
+			out.Index(index).Set(cloneErrorResponseValue(value.Index(index)))
+		}
+		return out
+	case reflect.Array:
+		out := reflect.New(value.Type()).Elem()
+		for index := 0; index < value.Len(); index++ {
+			out.Index(index).Set(cloneErrorResponseValue(value.Index(index)))
+		}
+		return out
+	default:
+		return value
+	}
 }
 
 // DefaultNonRetryableErrorRules returns stable upstream request errors that should not be retried by default.

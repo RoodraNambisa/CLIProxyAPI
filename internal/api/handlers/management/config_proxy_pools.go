@@ -1,6 +1,7 @@
 package management
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -351,7 +352,9 @@ func cloneConfigWithMaskedProxyURLs(input *config.Config) (config.Config, error)
 		return config.Config{}, errMarshal
 	}
 	var snapshot config.Config
-	if errUnmarshal := json.Unmarshal(data, &snapshot); errUnmarshal != nil {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.UseNumber()
+	if errUnmarshal := decoder.Decode(&snapshot); errUnmarshal != nil {
 		return config.Config{}, errUnmarshal
 	}
 	snapshot.ProxyURL = proxyutil.MaskProxyURL(snapshot.ProxyURL)

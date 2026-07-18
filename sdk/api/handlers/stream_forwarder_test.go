@@ -230,6 +230,46 @@ func TestForwardStreamSurfacesErrorCreatedByWriteDone(t *testing.T) {
 	}
 }
 
+func TestForwardStreamWritesProjectedErrorAsHTTPBeforeFirstPayload(t *testing.T) {
+	body := map[string]any{"error": map[string]any{"message": "rewritten"}}
+	h, c, flusher := newForwardStreamTestContext(t)
+	h.Cfg.ErrorResponseRewrites = []sdkconfig.ErrorResponseRewriteRule{
+		{StatusCode: http.StatusTooManyRequests, ResponseStatusCode: http.StatusBadRequest, ResponseBody: &body},
+	}
+	c.Writer.Header().Set("Retry-After", "30")
+	c.Writer.Header().Set("Content-Length", "999")
+	c.Writer.Header().Set("ETag", `"stale"`)
+	c.Writer.Header().Set("X-Request-Id", "request-1")
+	data := make(chan []byte)
+	errs := make(chan *interfaces.ErrorMessage, 1)
+	close(data)
+	errs <- h.RewriteExecutionErrorResponse(&interfaces.ErrorMessage{
+		StatusCode: http.StatusTooManyRequests,
+		Error:      errors.New("limited"),
+	})
+	close(errs)
+	terminalCalled := false
+
+	h.ForwardStream(c, flusher, func(error) {}, data, errs, StreamForwardOptions{
+		WriteTerminalError: func(*interfaces.ErrorMessage) { terminalCalled = true },
+	})
+
+	if terminalCalled {
+		t.Fatal("projected first error used the committed-stream callback")
+	}
+	if c.Writer.Status() != http.StatusBadRequest || c.Writer.Header().Get("Content-Type") != "application/json" {
+		t.Fatalf("response = status %d content-type %q", c.Writer.Status(), c.Writer.Header().Get("Content-Type"))
+	}
+	for _, key := range []string{"Retry-After", "Content-Length", "ETag"} {
+		if value := c.Writer.Header().Get(key); value != "" {
+			t.Fatalf("%s = %q, want removed", key, value)
+		}
+	}
+	if value := c.Writer.Header().Get("X-Request-Id"); value != "request-1" {
+		t.Fatalf("X-Request-Id = %q", value)
+	}
+}
+
 func TestForwardStreamUpdatesDynamicFlushPolicy(t *testing.T) {
 	h, c, _ := newForwardStreamTestContext(t)
 	ctx, cancelContext := context.WithCancel(c.Request.Context())

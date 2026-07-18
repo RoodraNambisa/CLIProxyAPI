@@ -1071,6 +1071,34 @@ func TestExecuteStreamWithAuthManager_ValidatesOpenAIResponsesStreamDataJSON(t *
 	}
 }
 
+func TestExecuteStreamWithAuthManager_ProjectsOpenAIResponsesFramingError(t *testing.T) {
+	executor := &invalidJSONStreamExecutor{}
+	manager := coreauth.NewManager(nil, nil, nil)
+	manager.RegisterExecutor(executor)
+
+	auth := &coreauth.Auth{ID: "framing-auth", Provider: "codex", Status: coreauth.StatusActive}
+	if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
+		t.Fatalf("manager.Register(): %v", errRegister)
+	}
+	registry.GetGlobalRegistry().RegisterClient(auth.ID, auth.Provider, []*registry.ModelInfo{{ID: "framing-model"}})
+	t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(auth.ID) })
+
+	handler := NewBaseAPIHandlers(&sdkconfig.SDKConfig{ErrorResponseRewrites: []sdkconfig.ErrorResponseRewriteRule{{
+		StatusCode:         http.StatusBadGateway,
+		MessageContains:    "invalid upstream Responses SSE data JSON",
+		ResponseStatusCode: http.StatusBadRequest,
+	}}}, manager)
+	dataChan, _, errChan := handler.ExecuteStreamWithAuthManager(context.Background(), "openai-response", "framing-model", []byte(`{"model":"framing-model"}`), "")
+
+	for payload := range dataChan {
+		t.Fatalf("unexpected payload: %q", payload)
+	}
+	errMsg := <-errChan
+	if errMsg == nil || errMsg.StatusCode != http.StatusBadRequest || OriginalErrorStatusCode(errMsg) != http.StatusBadGateway {
+		t.Fatalf("projected framing error = %#v", errMsg)
+	}
+}
+
 func TestExecuteStreamWithAuthManager_AllowsSplitOpenAIResponsesSSEEventLines(t *testing.T) {
 	executor := &splitResponsesEventStreamExecutor{}
 	manager := coreauth.NewManager(nil, nil, nil)

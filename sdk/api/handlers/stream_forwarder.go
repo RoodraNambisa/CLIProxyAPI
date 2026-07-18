@@ -543,6 +543,11 @@ func (h *BaseAPIHandler) ForwardStream(c *gin.Context, flusher http.Flusher, can
 	}
 
 	writeTerminalError := func(errMsg *interfaces.ErrorMessage) {
+		if !c.Writer.Written() && IsErrorResponseRewritten(errMsg) {
+			h.WriteErrorResponse(c, errMsg)
+			flusher.Flush()
+			return
+		}
 		flushPending()
 		if opts.WriteTerminalError != nil {
 			opts.WriteTerminalError(errMsg)

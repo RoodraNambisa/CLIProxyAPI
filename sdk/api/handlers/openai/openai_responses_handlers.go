@@ -75,13 +75,18 @@ type responsesSSEFramer struct {
 	passthroughState     *coreexecutor.ImageGenerationStreamPassthroughState
 	maxPendingBytes      int
 	err                  error
+	rewriteTerminalError func([]byte) ([]byte, *interfaces.ErrorMessage, bool)
+	terminalRewritten    bool
+	terminalBeforeData   bool
+	terminalError        *interfaces.ErrorMessage
+	sawNonTerminalData   bool
 }
 
 func (f *responsesSSEFramer) WriteChunk(w io.Writer, chunk []byte) {
 	if len(chunk) == 0 || f.err != nil {
 		return
 	}
-	if f.passthrough {
+	if f.passthrough && f.rewriteTerminalError == nil {
 		if len(f.pending) > 0 {
 			_, _ = w.Write(f.pending)
 			f.pending = f.pending[:0]
@@ -174,7 +179,7 @@ func (f *responsesSSEFramer) Err() error {
 }
 
 func (f *responsesSSEFramer) Flush(w io.Writer) {
-	if f.passthrough {
+	if f.passthrough && f.rewriteTerminalError == nil {
 		if len(f.pending) > 0 {
 			_, _ = w.Write(f.pending)
 			f.pending = f.pending[:0]
@@ -200,6 +205,10 @@ func writeResponsesStreamError(w io.Writer, errMsg *interfaces.ErrorMessage) {
 	if w == nil || errMsg == nil {
 		return
 	}
+	if body, rewritten := handlers.RewrittenErrorResponseBody(errMsg); rewritten {
+		_, _ = fmt.Fprintf(w, "\n\nevent: error\ndata: %s\n\n", string(body))
+		return
+	}
 	status := http.StatusInternalServerError
 	if errMsg.StatusCode > 0 {
 		status = errMsg.StatusCode
@@ -207,6 +216,10 @@ func writeResponsesStreamError(w io.Writer, errMsg *interfaces.ErrorMessage) {
 	errText := http.StatusText(status)
 	if errMsg.Error != nil && errMsg.Error.Error() != "" {
 		errText = errMsg.Error.Error()
+	}
+	if handlers.IsErrorResponseRewritten(errMsg) {
+		status = handlers.OriginalErrorStatusCode(errMsg)
+		errText = handlers.OriginalErrorText(errMsg)
 	}
 	chunk := handlers.BuildOpenAIResponsesStreamErrorChunk(status, errText, 0)
 	_, _ = fmt.Fprintf(w, "\n\nevent: error\ndata: %s\n\n", string(chunk))
@@ -221,11 +234,25 @@ func (f *responsesSSEFramer) imagePassthroughEnabled() bool {
 }
 
 func (f *responsesSSEFramer) writeFrame(w io.Writer, frame []byte) {
-	if f.imagePassthroughEnabled() {
-		writeResponsesSSEChunk(w, frame)
-		return
+	output := frame
+	if !f.imagePassthroughEnabled() && !f.passthrough {
+		output = f.repairFrame(frame)
 	}
-	writeResponsesSSEChunk(w, f.repairFrame(frame))
+	if f.rewriteTerminalError != nil {
+		if rewritten, errMsg, ok := f.rewriteTerminalError(output); ok {
+			output = rewritten
+			f.terminalRewritten = true
+			f.terminalBeforeData = !f.sawNonTerminalData
+			f.terminalError = errMsg
+		}
+	}
+	if payload, ok := responsesSSEDataPayload(output); ok && json.Valid(payload) {
+		eventType := gjson.GetBytes(payload, "type").String()
+		if eventType != "" && eventType != wsEventTypeError && eventType != wsEventTypeFailed {
+			f.sawNonTerminalData = true
+		}
+	}
+	writeResponsesSSEChunk(w, output)
 }
 
 func (f *responsesSSEFramer) repairFrame(frame []byte) []byte {
@@ -296,6 +323,34 @@ func responsesSSEFrameWithEvent(frame []byte, eventType string) []byte {
 	out.WriteByte('\n')
 	out.Write(frame)
 	return out.Bytes()
+}
+
+func (h *OpenAIResponsesAPIHandler) rewriteResponsesSSETerminalErrorFrame(frame []byte) ([]byte, *interfaces.ErrorMessage, bool) {
+	if h == nil || h.BaseAPIHandler == nil {
+		return frame, nil, false
+	}
+	payload, ok := responsesSSEDataPayload(frame)
+	if !ok || !json.Valid(payload) {
+		return frame, nil, false
+	}
+	eventType := gjson.GetBytes(payload, "type").String()
+	if eventType != wsEventTypeError && eventType != wsEventTypeFailed {
+		return frame, nil, false
+	}
+	projectionInput := responsesWebsocketErrorMessageFromPayload(payload)
+	projected := h.RewriteExecutionErrorResponse(projectionInput)
+	if projected == projectionInput {
+		return frame, nil, false
+	}
+	rewritten, errRewrite := rewriteResponsesWebsocketTerminalErrorPayload(payload, projected)
+	if errRewrite != nil {
+		return frame, nil, false
+	}
+	rewrittenFrame := responsesSSEFrameWithData(frame, rewritten)
+	if !responsesSSEHasField(rewrittenFrame, []byte("event:")) {
+		rewrittenFrame = responsesSSEFrameWithEvent(rewrittenFrame, eventType)
+	}
+	return rewrittenFrame, projected, true
 }
 
 func (f *responsesSSEFramer) recordOutputItem(payload []byte) {
@@ -605,6 +660,9 @@ func (h *OpenAIResponsesAPIHandler) handleStreamingResponse(c *gin.Context, rawJ
 	}
 	trustUpstreamSSE := handlers.StreamingTrustUpstreamSSE(h.Cfg)
 	framer := &responsesSSEFramer{passthrough: trustUpstreamSSE}
+	if !trustUpstreamSSE && h.Cfg != nil && len(h.Cfg.ErrorResponseRewrites) > 0 {
+		framer.rewriteTerminalError = h.rewriteResponsesSSETerminalErrorFrame
+	}
 	if requestedImageStreamPassthrough {
 		framer.passthroughState = imageStreamPassthroughState
 	}
@@ -670,6 +728,11 @@ func (h *OpenAIResponsesAPIHandler) handleStreamingResponse(c *gin.Context, rawJ
 				cliCancel(errFrame)
 				return
 			}
+			if framer.terminalBeforeData && framer.terminalError != nil {
+				h.WriteErrorResponse(c, framer.terminalError)
+				cliCancel(framer.terminalError.Error)
+				return
+			}
 			if firstFrame.Len() == 0 {
 				continue
 			}
@@ -713,6 +776,9 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesStream(c *gin.Context, flush
 		},
 		WriteTerminalError: func(errMsg *interfaces.ErrorMessage) {
 			framer.Flush(c.Writer)
+			if framer.terminalRewritten {
+				return
+			}
 			writeResponsesStreamError(c.Writer, errMsg)
 		},
 		WriteDone: func() {

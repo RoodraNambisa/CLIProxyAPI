@@ -18,6 +18,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
+	executorhelps "github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	sdkaccess "github.com/router-for-me/CLIProxyAPI/v6/sdk/access"
@@ -847,20 +848,7 @@ func (h *BaseAPIHandler) ExecuteWithAuthManager(ctx context.Context, handlerType
 	opts.Metadata = reqMeta
 	resp, err := h.AuthManager.Execute(ctx, providers, req, opts)
 	if err != nil {
-		err = enrichAuthSelectionError(err, providers, normalizedModel)
-		status := http.StatusInternalServerError
-		if se, ok := err.(interface{ StatusCode() int }); ok && se != nil {
-			if code := se.StatusCode(); code > 0 {
-				status = code
-			}
-		}
-		var addon http.Header
-		if he, ok := err.(interface{ Headers() http.Header }); ok && he != nil {
-			if hdr := he.Headers(); hdr != nil {
-				addon = hdr.Clone()
-			}
-		}
-		return nil, nil, &interfaces.ErrorMessage{StatusCode: status, Error: err, Addon: addon}
+		return nil, nil, h.RewriteExecutionErrorResponse(executionErrorMessage(err, providers, normalizedModel))
 	}
 	if !PassthroughHeadersEnabled(h.Cfg) {
 		return resp.Payload, nil, nil
@@ -915,7 +903,7 @@ func (h *BaseAPIHandler) ExecuteWithProvidersAndExecutionModel(ctx context.Conte
 	opts.Metadata = reqMeta
 	resp, err := h.AuthManager.Execute(ctx, providers, req, opts)
 	if err != nil {
-		return nil, nil, executionErrorMessage(err, providers, normalizedRouteModel)
+		return nil, nil, h.RewriteExecutionErrorResponse(executionErrorMessage(err, providers, normalizedRouteModel))
 	}
 	if !PassthroughHeadersEnabled(h.Cfg) {
 		return resp.Payload, nil, nil
@@ -980,20 +968,7 @@ func (h *BaseAPIHandler) ExecuteCountWithAuthManager(ctx context.Context, handle
 	opts.Metadata = reqMeta
 	resp, err := h.AuthManager.ExecuteCount(ctx, providers, req, opts)
 	if err != nil {
-		err = enrichAuthSelectionError(err, providers, normalizedModel)
-		status := http.StatusInternalServerError
-		if se, ok := err.(interface{ StatusCode() int }); ok && se != nil {
-			if code := se.StatusCode(); code > 0 {
-				status = code
-			}
-		}
-		var addon http.Header
-		if he, ok := err.(interface{ Headers() http.Header }); ok && he != nil {
-			if hdr := he.Headers(); hdr != nil {
-				addon = hdr.Clone()
-			}
-		}
-		return nil, nil, &interfaces.ErrorMessage{StatusCode: status, Error: err, Addon: addon}
+		return nil, nil, h.RewriteExecutionErrorResponse(executionErrorMessage(err, providers, normalizedModel))
 	}
 	if !PassthroughHeadersEnabled(h.Cfg) {
 		return resp.Payload, nil, nil
@@ -1066,21 +1041,8 @@ func (h *BaseAPIHandler) executeStreamWithResolvedProviders(ctx context.Context,
 	opts.Metadata = reqMeta
 	streamResult, err := h.AuthManager.ExecuteStream(ctx, providers, req, opts)
 	if err != nil {
-		err = enrichAuthSelectionError(err, providers, normalizedRouteModel)
 		errChan := make(chan *interfaces.ErrorMessage, 1)
-		status := http.StatusInternalServerError
-		if se, ok := err.(interface{ StatusCode() int }); ok && se != nil {
-			if code := se.StatusCode(); code > 0 {
-				status = code
-			}
-		}
-		var addon http.Header
-		if he, ok := err.(interface{ Headers() http.Header }); ok && he != nil {
-			if hdr := he.Headers(); hdr != nil {
-				addon = hdr.Clone()
-			}
-		}
-		errChan <- &interfaces.ErrorMessage{StatusCode: status, Error: err, Addon: addon}
+		errChan <- h.RewriteExecutionErrorResponse(executionErrorMessage(err, providers, normalizedRouteModel))
 		close(errChan)
 		return nil, nil, errChan
 	}
@@ -1149,6 +1111,7 @@ func (h *BaseAPIHandler) executeStreamWithResolvedProviders(ctx context.Context,
 			var bootstrapDetector SSEBootstrapDetector
 			var responsesSSEFramer sseDataJSONFramer
 			var bootstrapBuffer bytes.Buffer
+			var pendingProtocolProjection *interfaces.ErrorMessage
 			flushBootstrapBuffer := func() bool {
 				if bootstrapBuffer.Len() == 0 {
 					return true
@@ -1190,10 +1153,14 @@ func (h *BaseAPIHandler) executeStreamWithResolvedProviders(ctx context.Context,
 					chunk, ok = <-chunks
 				}
 				if !ok {
+					if pendingProtocolProjection != nil {
+						_ = sendErr(pendingProtocolProjection)
+						return
+					}
 					if handlerType == "openai-response" && !imageStreamPassthrough() && !trustResponsesSSE {
 						frames, err := responsesSSEFramer.Finish()
 						if err != nil {
-							_ = sendErr(&interfaces.ErrorMessage{StatusCode: http.StatusBadGateway, Error: err})
+							_ = sendErr(h.RewriteExecutionErrorResponse(&interfaces.ErrorMessage{StatusCode: http.StatusBadGateway, Error: err}))
 							return
 						}
 						for _, frame := range frames {
@@ -1218,7 +1185,7 @@ func (h *BaseAPIHandler) executeStreamWithResolvedProviders(ctx context.Context,
 					streamErr := chunk.Err
 					// Safe bootstrap recovery: if the upstream fails before any payload bytes are sent,
 					// retry a few times (to allow auth rotation / transient recovery) and then attempt model fallback.
-					if !sentPayload {
+					if !sentPayload && pendingProtocolProjection == nil {
 						if bootstrapRetries < maxBootstrapRetries && bootstrapEligible(streamErr) && coreauth.ConsumeRequestRetryBudget(ctx) {
 							bootstrapRetries++
 							retryResult, retryErr := h.AuthManager.ExecuteStream(ctx, providers, req, opts)
@@ -1233,19 +1200,11 @@ func (h *BaseAPIHandler) executeStreamWithResolvedProviders(ctx context.Context,
 						}
 					}
 
-					status := http.StatusInternalServerError
-					if se, ok := streamErr.(interface{ StatusCode() int }); ok && se != nil {
-						if code := se.StatusCode(); code > 0 {
-							status = code
-						}
+					errMsg := h.RewriteExecutionErrorResponse(executionErrorMessage(streamErr, providers, normalizedRouteModel))
+					if pendingProtocolProjection != nil && !IsErrorResponseRewritten(errMsg) {
+						errMsg = pendingProtocolProjection
 					}
-					var addon http.Header
-					if he, ok := streamErr.(interface{ Headers() http.Header }); ok && he != nil {
-						if hdr := he.Headers(); hdr != nil {
-							addon = hdr.Clone()
-						}
-					}
-					_ = sendErr(&interfaces.ErrorMessage{StatusCode: status, Error: streamErr, Addon: addon})
+					_ = sendErr(errMsg)
 					return
 				}
 				if coreexecutor.IsBootstrapCommitStreamChunk(chunk) {
@@ -1257,10 +1216,31 @@ func (h *BaseAPIHandler) executeStreamWithResolvedProviders(ctx context.Context,
 				}
 				if len(chunk.Payload) > 0 {
 					effectiveImageStreamPassthrough := imageStreamPassthrough()
+					if pendingProtocolProjection != nil {
+						continue
+					}
+					if handlerType != "openai-response" {
+						protocolPayload := executorhelps.JSONPayload(chunk.Payload)
+						if len(protocolPayload) > 0 && executorhelps.IsJSONStreamProtocolError(protocolPayload) {
+							protocolProvider := "upstream"
+							switch handlerType {
+							case constant.Claude:
+								protocolProvider = "claude"
+							case constant.Gemini:
+								protocolProvider = "gemini"
+							}
+							original := executionErrorMessage(executorhelps.JSONStreamProtocolError(protocolProvider, protocolPayload), providers, normalizedRouteModel)
+							projected := h.RewriteExecutionErrorResponse(original)
+							if projected != original {
+								pendingProtocolProjection = projected
+								continue
+							}
+						}
+					}
 					if handlerType == "openai-response" && !effectiveImageStreamPassthrough && !trustResponsesSSE {
 						frames, err := responsesSSEFramer.Feed(chunk.Payload)
 						if err != nil {
-							_ = sendErr(&interfaces.ErrorMessage{StatusCode: http.StatusBadGateway, Error: err})
+							_ = sendErr(h.RewriteExecutionErrorResponse(&interfaces.ErrorMessage{StatusCode: http.StatusBadGateway, Error: err}))
 							return
 						}
 						for _, frame := range frames {
@@ -1469,6 +1449,14 @@ func (h *BaseAPIHandler) WriteErrorResponse(c *gin.Context, msg *interfaces.Erro
 	if msg != nil && msg.StatusCode > 0 {
 		status = msg.StatusCode
 	}
+	if IsErrorResponseRewritten(msg) {
+		_, bodyRewritten := RewrittenErrorResponseBody(msg)
+		for key := range c.Writer.Header() {
+			if ShouldRemoveRewrittenErrorHeader(key, status, bodyRewritten) {
+				c.Writer.Header().Del(key)
+			}
+		}
+	}
 	if msg != nil && msg.Addon != nil {
 		applyErrorAddonHeaders(c.Writer.Header(), msg.Addon, PassthroughHeadersEnabled(h.Cfg))
 	}
@@ -1480,7 +1468,7 @@ func (h *BaseAPIHandler) WriteErrorResponse(c *gin.Context, msg *interfaces.Erro
 		}
 	}
 
-	body := BuildErrorResponseBody(status, errText)
+	body := BuildErrorResponseBodyForMessage(status, errText, msg)
 	// Append first to preserve upstream response logs, then drop duplicate payloads if already recorded.
 	var previous []byte
 	if existing, exists := c.Get("API_RESPONSE"); exists {

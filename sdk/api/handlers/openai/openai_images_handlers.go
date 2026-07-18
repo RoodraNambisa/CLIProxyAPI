@@ -389,7 +389,7 @@ func (h *OpenAIImagesAPIHandler) handleNativeStreamingImagesResponse(c *gin.Cont
 			if errMsg.Error != nil && strings.TrimSpace(errMsg.Error.Error()) != "" {
 				errText = errMsg.Error.Error()
 			}
-			body := handlers.BuildErrorResponseBody(status, errText)
+			body := handlers.BuildErrorResponseBodyForMessage(status, errText, errMsg)
 			_, _ = fmt.Fprintf(c.Writer, "\nevent: error\ndata: %s\n\n", string(body))
 		},
 	})
@@ -577,7 +577,7 @@ func (h *OpenAIImagesAPIHandler) handleMultiStreamingImagesResponse(c *gin.Conte
 				if errMsg.Error != nil && strings.TrimSpace(errMsg.Error.Error()) != "" {
 					errText = errMsg.Error.Error()
 				}
-				body := handlers.BuildErrorResponseBody(status, errText)
+				body := handlers.BuildErrorResponseBodyForMessage(status, errText, errMsg)
 				_, _ = fmt.Fprintf(c.Writer, "\nevent: error\ndata: %s\n\n", string(body))
 			},
 			WriteDone: func() {
@@ -621,7 +621,7 @@ func (h *OpenAIImagesAPIHandler) forwardImagesStream(c *gin.Context, flusher htt
 			if errMsg.Error != nil && strings.TrimSpace(errMsg.Error.Error()) != "" {
 				errText = errMsg.Error.Error()
 			}
-			body := handlers.BuildErrorResponseBody(status, errText)
+			body := handlers.BuildErrorResponseBodyForMessage(status, errText, errMsg)
 			_, _ = fmt.Fprintf(c.Writer, "\nevent: error\ndata: %s\n\n", string(body))
 		},
 		WriteDone: func() {

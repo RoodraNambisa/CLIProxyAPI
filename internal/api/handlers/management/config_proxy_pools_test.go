@@ -434,11 +434,15 @@ func TestDeleteProxyPoolRejectsReferencedPool(t *testing.T) {
 }
 
 func TestGetConfigMasksGlobalAndPoolProxyPasswords(t *testing.T) {
+	rewriteBody := map[string]any{"trace": int64(9007199254740993)}
 	cfg := &config.Config{SDKConfig: config.SDKConfig{
 		ProxyURL: "http://global:secret@proxy.example:8080",
 		ProxyPools: []config.ProxyPoolConfig{{Name: "pool", Entries: []config.ProxyPoolEntryConfig{{
 			ID: "node", URLTemplate: "socks5h://pool:secret@proxy.example:1080",
 		}}}},
+		ErrorResponseRewrites: []config.ErrorResponseRewriteRule{{
+			StatusCode: http.StatusTooManyRequests, ResponseBody: &rewriteBody,
+		}},
 	}, GeminiKey: []config.GeminiKey{{ProxyURL: "http://gemini:secret@proxy.example:8080"}},
 		InteractionsKey: []config.GeminiKey{{ProxyURL: "http://interactions:secret@proxy.example:8080"}},
 		CodexKey:        []config.CodexKey{{ProxyURL: "http://codex:secret@proxy.example:8080"}},
@@ -457,6 +461,9 @@ func TestGetConfigMasksGlobalAndPoolProxyPasswords(t *testing.T) {
 	h.GetConfig(ctx)
 	if strings.Contains(recorder.Body.String(), "secret") {
 		t.Fatalf("config response leaked proxy password: %s", recorder.Body.String())
+	}
+	if !strings.Contains(recorder.Body.String(), `"trace":9007199254740993`) {
+		t.Fatalf("config response changed response-body integer: %s", recorder.Body.String())
 	}
 	var body map[string]any
 	if errDecode := json.Unmarshal(recorder.Body.Bytes(), &body); errDecode != nil {

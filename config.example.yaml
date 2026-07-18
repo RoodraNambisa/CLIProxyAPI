@@ -157,6 +157,18 @@ fixed-error-cooldowns:
     cooldown-seconds: 2592000
     scope: auth
 
+# Rewrite only the final client-facing runtime error after retry and cooldown decisions.
+# Rules are evaluated in order against the original status and message.
+# error-response-rewrites:
+#   - status-code: 429
+#     message-contains: "maximum context"
+#     response-status-code: 400
+#     response-body:
+#       error:
+#         message: "Request context exceeds the model limit."
+#         type: "invalid_request_error"
+#         code: "context_too_large"
+
 # Stable request errors that should not retry another credential or request round.
 # Set to [] to disable the default image_generation_user_error invalid_value/moderation_blocked rules.
 non-retryable-errors:

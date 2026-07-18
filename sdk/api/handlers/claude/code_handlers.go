@@ -294,6 +294,10 @@ func (h *ClaudeCodeAPIHandler) forwardClaudeStream(c *gin.Context, flusher http.
 			if errMsg == nil {
 				return
 			}
+			if body, rewritten := handlers.RewrittenErrorResponseBody(errMsg); rewritten {
+				_, _ = fmt.Fprintf(c.Writer, "event: error\ndata: %s\n\n", string(body))
+				return
+			}
 			status := http.StatusInternalServerError
 			if errMsg.StatusCode > 0 {
 				status = errMsg.StatusCode

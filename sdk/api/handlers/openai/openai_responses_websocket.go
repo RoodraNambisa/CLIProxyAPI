@@ -908,6 +908,18 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesWebsocket(
 						completedOutput = responseCompletedOutputFromPayloadWithFallback(payloads[i], outputItemsByIndex, outputItemsFallback)
 					} else if eventType == wsEventTypeError || eventType == wsEventTypeFailed {
 						payloadErrMsg = responsesWebsocketErrorMessageFromPayload(payloads[i])
+						projected := payloadErrMsg
+						if h != nil && h.BaseAPIHandler != nil {
+							projected = h.RewriteExecutionErrorResponse(payloadErrMsg)
+						}
+						if projected != payloadErrMsg {
+							var errRewrite error
+							payloads[i], errRewrite = rewriteResponsesWebsocketTerminalErrorPayload(payloads[i], projected)
+							if errRewrite != nil {
+								cancel(errRewrite)
+								return completedOutput, payloadErrMsg, errRewrite
+							}
+						}
 					}
 				}
 				markAPIResponseTimestamp(c)
@@ -1004,14 +1016,11 @@ func shouldReleaseResponsesWebsocketPinnedAuth(errMsg *interfaces.ErrorMessage) 
 	if errMsg == nil {
 		return false
 	}
-	switch errMsg.StatusCode {
+	switch handlers.OriginalErrorStatusCode(errMsg) {
 	case http.StatusUnauthorized, http.StatusPaymentRequired, http.StatusForbidden, http.StatusRequestTimeout, http.StatusTooManyRequests, http.StatusInternalServerError, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
 		return true
 	}
-	if errMsg.Error == nil {
-		return false
-	}
-	message := strings.ToLower(strings.TrimSpace(errMsg.Error.Error()))
+	message := strings.ToLower(strings.TrimSpace(handlers.OriginalErrorText(errMsg)))
 	if message == "" {
 		return false
 	}
@@ -1028,6 +1037,92 @@ func shouldReleaseResponsesWebsocketPinnedAuth(errMsg *interfaces.ErrorMessage) 
 		}
 	}
 	return false
+}
+
+func rewriteResponsesWebsocketTerminalErrorPayload(payload []byte, errMsg *interfaces.ErrorMessage) ([]byte, error) {
+	if errMsg == nil {
+		return payload, nil
+	}
+	status := errMsg.StatusCode
+	if status <= 0 {
+		status = http.StatusInternalServerError
+	}
+	updated := bytes.Clone(payload)
+	hadErrorStatus := gjson.GetBytes(updated, "error.status").Exists()
+	hadResponseErrorStatus := gjson.GetBytes(updated, "response.error.status").Exists()
+	rewrittenStatus, rewriteStatus := handlers.RewrittenErrorResponseStatus(errMsg)
+	if rewriteStatus {
+		status = rewrittenStatus
+		var errSet error
+		updated, errSet = sjson.SetBytes(updated, "status", status)
+		if errSet != nil {
+			return nil, errSet
+		}
+		if gjson.GetBytes(updated, "type").String() == wsEventTypeFailed {
+			updated, errSet = sjson.SetBytes(updated, "response.status_code", status)
+			if errSet != nil {
+				return nil, errSet
+			}
+		}
+	}
+	_, rewriteBody := handlers.RewrittenErrorResponseBody(errMsg)
+	if body, ok := handlers.RewrittenErrorResponseBody(errMsg); ok {
+		errorBody := body
+		if errorNode := gjson.GetBytes(body, "error"); errorNode.Exists() {
+			errorBody = []byte(errorNode.Raw)
+		}
+		var errSet error
+		switch gjson.GetBytes(updated, "type").String() {
+		case wsEventTypeFailed:
+			updated, errSet = sjson.SetRawBytes(updated, "response.error", errorBody)
+		case wsEventTypeError:
+			updated, errSet = sjson.SetRawBytes(updated, "error", errorBody)
+		}
+		if errSet != nil {
+			return nil, errSet
+		}
+	}
+	if rewriteStatus {
+		var errSet error
+		if hadErrorStatus {
+			updated, errSet = sjson.SetBytes(updated, "error.status", status)
+			if errSet != nil {
+				return nil, errSet
+			}
+		}
+		if hadResponseErrorStatus {
+			updated, errSet = sjson.SetBytes(updated, "response.error.status", status)
+			if errSet != nil {
+				return nil, errSet
+			}
+		}
+	}
+	var errFilter error
+	updated, errFilter = filterResponsesWebsocketHeaders(updated, status, rewriteBody)
+	if errFilter != nil {
+		return nil, errFilter
+	}
+	return updated, nil
+}
+
+func filterResponsesWebsocketHeaders(payload []byte, status int, bodyRewritten bool) ([]byte, error) {
+	updated := payload
+	headers := gjson.GetBytes(updated, "headers")
+	if !headers.IsObject() {
+		return updated, nil
+	}
+	for key := range headers.Map() {
+		if !handlers.ShouldRemoveRewrittenErrorHeader(key, status, bodyRewritten) {
+			continue
+		}
+		headerPath := strings.ReplaceAll(strings.ReplaceAll(key, `\`, `\\`), ".", `\.`)
+		var errDelete error
+		updated, errDelete = sjson.DeleteBytes(updated, "headers."+headerPath)
+		if errDelete != nil {
+			return nil, errDelete
+		}
+	}
+	return updated, nil
 }
 
 func responseCompletedOutputFromPayload(payload []byte) []byte {
@@ -1128,6 +1223,14 @@ func websocketJSONPayloadsFromChunk(chunk []byte) [][]byte {
 }
 
 func writeResponsesWebsocketError(conn *websocket.Conn, wsTimelineLog *strings.Builder, errMsg *interfaces.ErrorMessage) ([]byte, error) {
+	payload, errBuild := buildResponsesWebsocketErrorPayload(errMsg)
+	if errBuild != nil {
+		return nil, errBuild
+	}
+	return payload, writeResponsesWebsocketPayload(conn, wsTimelineLog, payload, time.Now())
+}
+
+func buildResponsesWebsocketErrorPayload(errMsg *interfaces.ErrorMessage) ([]byte, error) {
 	status := http.StatusInternalServerError
 	errText := http.StatusText(status)
 	if errMsg != nil {
@@ -1140,7 +1243,16 @@ func writeResponsesWebsocketError(conn *websocket.Conn, wsTimelineLog *strings.B
 		}
 	}
 
-	body := handlers.BuildErrorResponseBody(status, errText)
+	body, rewriteBody := handlers.RewrittenErrorResponseBody(errMsg)
+	if !rewriteBody {
+		bodyStatus := status
+		bodyText := errText
+		if handlers.IsErrorResponseRewritten(errMsg) {
+			bodyStatus = handlers.OriginalErrorStatusCode(errMsg)
+			bodyText = handlers.OriginalErrorText(errMsg)
+		}
+		body = handlers.BuildErrorResponseBody(bodyStatus, bodyText)
+	}
 	payload := []byte(`{}`)
 	var errSet error
 	payload, errSet = sjson.SetBytes(payload, "type", wsEventTypeError)
@@ -1197,7 +1309,7 @@ func writeResponsesWebsocketError(conn *websocket.Conn, wsTimelineLog *strings.B
 		}
 	}
 
-	return payload, writeResponsesWebsocketPayload(conn, wsTimelineLog, payload, time.Now())
+	return payload, nil
 }
 
 func appendWebsocketEvent(builder *strings.Builder, eventType string, payload []byte) {

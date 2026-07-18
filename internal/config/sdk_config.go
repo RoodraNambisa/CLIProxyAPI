@@ -40,6 +40,9 @@ type SDKConfig struct {
 	// Default is false (disabled).
 	PassthroughHeaders bool `yaml:"passthrough-headers" json:"passthrough-headers"`
 
+	// ErrorResponseRewrites changes only the final client-facing representation of runtime execution errors.
+	ErrorResponseRewrites []ErrorResponseRewriteRule `yaml:"error-response-rewrites,omitempty" json:"error-response-rewrites,omitempty"`
+
 	// Streaming configures server-side streaming behavior (keep-alives and safe bootstrap retries).
 	Streaming StreamingConfig `yaml:"streaming" json:"streaming"`
 
@@ -80,6 +83,18 @@ type ProxyRuleConfig struct {
 type APIKeyGroup struct {
 	APIKey    string   `yaml:"api-key" json:"api-key"`
 	Providers []string `yaml:"providers" json:"providers"`
+}
+
+// ErrorResponseRewriteRule projects a matching runtime execution error to a client-facing status or JSON body.
+type ErrorResponseRewriteRule struct {
+	// StatusCode optionally restricts the rule to one original HTTP status code.
+	StatusCode int `yaml:"status-code,omitempty" json:"status-code,omitempty"`
+	// MessageContains optionally matches the original error text case-insensitively.
+	MessageContains string `yaml:"message-contains,omitempty" json:"message-contains,omitempty"`
+	// ResponseStatusCode optionally replaces the downstream HTTP or event status.
+	ResponseStatusCode int `yaml:"response-status-code,omitempty" json:"response-status-code,omitempty"`
+	// ResponseBody optionally replaces the downstream JSON object. A non-nil empty map means {}.
+	ResponseBody *map[string]any `yaml:"response-body,omitempty" json:"response-body,omitempty"`
 }
 
 // StreamingConfig holds server streaming behavior configuration.
