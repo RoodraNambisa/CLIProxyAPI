@@ -11,7 +11,8 @@ import (
 func TestNormalizeProxyConfiguration(t *testing.T) {
 	pools, rules, err := NormalizeProxyConfiguration(
 		[]ProxyPoolConfig{{
-			Name: " Residential ",
+			Name:           " Residential ",
+			SpreadBindings: true,
 			Entries: []ProxyPoolEntryConfig{{
 				ID:          " home ",
 				URLTemplate: "socks5h://user:pass@10.0.0.6",
@@ -29,7 +30,7 @@ func TestNormalizeProxyConfiguration(t *testing.T) {
 		t.Fatalf("NormalizeProxyConfiguration() error = %v", err)
 	}
 	pool := pools[0]
-	if pool.Name != "Residential" || pool.CheckIntervalSeconds != 300 || pool.BindAttempts != 3 {
+	if pool.Name != "Residential" || pool.CheckIntervalSeconds != 300 || pool.BindAttempts != 3 || !pool.SpreadBindings {
 		t.Fatalf("normalized pool = %#v", pool)
 	}
 	if got, want := pool.Entries[0].Ports, "3334,3336-6000"; got != want {

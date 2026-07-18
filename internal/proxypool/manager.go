@@ -69,6 +69,7 @@ type Manager struct {
 	mu       sync.RWMutex
 	bindings map[string]Binding
 	health   map[string]nodeHealth
+	reserved map[string]Binding
 	auths    AuthSource
 	leaseMu  sync.RWMutex
 	leases   map[string]int
@@ -91,6 +92,7 @@ func NewManager(configPath string, cfg *internalconfig.Config) (*Manager, error)
 	m := &Manager{
 		bindings:  make(map[string]Binding),
 		health:    make(map[string]nodeHealth),
+		reserved:  make(map[string]Binding),
 		leases:    make(map[string]int),
 		statePath: bindingStatePath(configPath),
 		random:    rand.Reader,
@@ -488,6 +490,7 @@ func (m *Manager) resolvePoolBinding(ctx context.Context, snapshot *configSnapsh
 		}
 		return coreauth.ResolvedProxy{}, &UnavailableError{Pool: pool.config.Name, RetryTime: retryAt, Cause: errAllocate}
 	}
+	defer m.releaseSpreadReservation(binding.ID)
 	if errSave := m.saveBindingForSnapshot(snapshot, binding); errSave != nil {
 		m.deleteHealth(binding.ID)
 		if errors.Is(errSave, errProxyConfigurationChanged) {
@@ -551,6 +554,9 @@ func (m *Manager) bindingUsable(ctx context.Context, snapshot *configSnapshot, b
 }
 
 func (m *Manager) allocateBinding(ctx context.Context, snapshot *configSnapshot, pool runtimePool, authID, excludedURL string) (Binding, string, time.Time, error) {
+	if pool.config.SpreadBindings {
+		return m.allocateSpreadBinding(ctx, snapshot, pool, authID, excludedURL)
+	}
 	attempts := pool.config.BindAttempts
 	if attempts < 1 {
 		attempts = internalconfig.DefaultProxyPoolBindAttempts
@@ -627,6 +633,198 @@ func (m *Manager) allocateBinding(ctx context.Context, snapshot *configSnapshot,
 	return Binding{}, "", earliestRetry, lastErr
 }
 
+func (m *Manager) allocateSpreadBinding(ctx context.Context, snapshot *configSnapshot, pool runtimePool, authID, excludedURL string) (Binding, string, time.Time, error) {
+	attempts := pool.config.BindAttempts
+	if attempts < 1 {
+		attempts = internalconfig.DefaultProxyPoolBindAttempts
+	}
+	attemptedOrdinals := make(map[int]struct{}, attempts)
+	attemptedFingerprints := make(map[string]struct{}, attempts)
+	var (
+		earliestRetry time.Time
+		lastErr       error
+	)
+	for probes := 0; probes < attempts; probes++ {
+		if ctx != nil && ctx.Err() != nil {
+			return Binding{}, "", time.Time{}, ctx.Err()
+		}
+		binding, resolvedURL, ordinal, errReserve := m.reserveSpreadBinding(pool, authID, excludedURL, attemptedOrdinals, attemptedFingerprints)
+		if errReserve != nil {
+			lastErr = errReserve
+			break
+		}
+		attemptedOrdinals[ordinal] = struct{}{}
+		attemptedFingerprints[proxyURLFingerprint(resolvedURL)] = struct{}{}
+		probeEpoch := m.nextProbeEpoch()
+		result := m.check(ctx, resolvedURL)
+		if ctx != nil && ctx.Err() != nil {
+			m.releaseSpreadReservation(binding.ID)
+			return Binding{}, "", time.Time{}, ctx.Err()
+		}
+		health := m.storeHealth(snapshot, binding, resolvedURL, result, probeEpoch)
+		if result.OK {
+			return binding, resolvedURL, time.Time{}, nil
+		}
+		m.deleteHealth(binding.ID)
+		m.releaseSpreadReservation(binding.ID)
+		lastErr = errors.New("proxy health check failed")
+		if earliestRetry.IsZero() || health.RetryAfter.Before(earliestRetry) {
+			earliestRetry = health.RetryAfter
+		}
+	}
+	if lastErr == nil {
+		lastErr = errors.New("proxy pool has no distinct candidate")
+	}
+	return Binding{}, "", earliestRetry, lastErr
+}
+
+func (m *Manager) reserveSpreadBinding(pool runtimePool, authID, excludedURL string, attemptedOrdinals map[int]struct{}, attemptedFingerprints map[string]struct{}) (Binding, string, int, error) {
+	m.persistMu.Lock()
+	defer m.persistMu.Unlock()
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	counts, usedFingerprints := spreadBindingUsage(pool, m.bindings, m.reserved)
+	total := poolCandidateCount(pool)
+	if total == 0 {
+		return Binding{}, "", 0, errors.New("proxy pool has no entries")
+	}
+	const maxPlaceholderDraws = 8
+	for selection := 0; selection < total; selection++ {
+		start, errRandom := randomInt(m.random, total)
+		if errRandom != nil {
+			return Binding{}, "", 0, errRandom
+		}
+		ordinal := pickSpreadOrdinal(pool, counts, attemptedOrdinals, start, false)
+		if ordinal < 0 {
+			ordinal = pickSpreadOrdinal(pool, counts, attemptedOrdinals, start, true)
+		}
+		if ordinal < 0 {
+			break
+		}
+		entry, _, ok := poolEntryAtOrdinal(pool, ordinal)
+		if !ok {
+			attemptedOrdinals[ordinal] = struct{}{}
+			continue
+		}
+		draws := 1
+		if entryHasPlaceholder(entry) {
+			draws = maxPlaceholderDraws
+		}
+		var lastBinding Binding
+		var lastURL string
+		for draw := 0; draw < draws; draw++ {
+			binding, resolvedURL, errCandidate := m.bindingAtOrdinal(pool, authID, ordinal)
+			if errCandidate != nil {
+				return Binding{}, "", 0, errCandidate
+			}
+			lastBinding = binding
+			lastURL = resolvedURL
+			if resolvedURL == excludedURL {
+				continue
+			}
+			if !entryHasPlaceholder(entry) {
+				m.reserved[binding.ID] = cloneBinding(binding)
+				return binding, resolvedURL, ordinal, nil
+			}
+			fingerprint := proxyURLFingerprint(resolvedURL)
+			_, used := usedFingerprints[fingerprint]
+			_, attempted := attemptedFingerprints[fingerprint]
+			if !used && !attempted {
+				m.reserved[binding.ID] = cloneBinding(binding)
+				return binding, resolvedURL, ordinal, nil
+			}
+		}
+		if lastURL != "" && lastURL != excludedURL {
+			m.reserved[lastBinding.ID] = cloneBinding(lastBinding)
+			return lastBinding, lastURL, ordinal, nil
+		}
+		attemptedOrdinals[ordinal] = struct{}{}
+	}
+	return Binding{}, "", 0, errors.New("proxy pool has no distinct candidate")
+}
+
+func (m *Manager) releaseSpreadReservation(bindingID string) {
+	if m == nil || strings.TrimSpace(bindingID) == "" {
+		return
+	}
+	m.mu.Lock()
+	delete(m.reserved, bindingID)
+	m.mu.Unlock()
+}
+
+func spreadBindingUsage(pool runtimePool, bindings map[string]Binding, reserved map[string]Binding) (map[string]int, map[string]struct{}) {
+	counts := make(map[string]int, len(bindings)+len(reserved))
+	fingerprints := make(map[string]struct{}, len(bindings)+len(reserved))
+	add := func(binding Binding) {
+		if !strings.EqualFold(strings.TrimSpace(binding.Pool), strings.TrimSpace(pool.config.Name)) {
+			return
+		}
+		resolvedURL, valid := resolveBindingURL(pool, binding)
+		if !valid {
+			return
+		}
+		entry, exists := pool.byID[strings.ToLower(strings.TrimSpace(binding.Entry))]
+		if !exists {
+			return
+		}
+		if key, static := spreadLogicalNodeKey(entry, binding.Port); static {
+			counts[key]++
+		}
+		if entryHasPlaceholder(entry) {
+			fingerprints[proxyURLFingerprint(resolvedURL)] = struct{}{}
+		}
+	}
+	for _, binding := range bindings {
+		add(binding)
+	}
+	for _, binding := range reserved {
+		add(binding)
+	}
+	return counts, fingerprints
+}
+
+func pickSpreadOrdinal(pool runtimePool, counts map[string]int, attempted map[int]struct{}, start int, allowPlaceholderRetry bool) int {
+	total := poolCandidateCount(pool)
+	bestOrdinal := -1
+	bestLoad := -1
+	for offset := 0; offset < total; offset++ {
+		ordinal := (start + offset) % total
+		_, wasAttempted := attempted[ordinal]
+		entry, port, ok := poolEntryAtOrdinal(pool, ordinal)
+		if !ok {
+			continue
+		}
+		if wasAttempted && (!allowPlaceholderRetry || !entryHasPlaceholder(entry)) {
+			continue
+		}
+		load := 0
+		if key, static := spreadLogicalNodeKey(entry, port); static {
+			load = counts[key]
+		}
+		if bestOrdinal < 0 || load < bestLoad {
+			bestOrdinal = ordinal
+			bestLoad = load
+		}
+	}
+	return bestOrdinal
+}
+
+func spreadLogicalNodeKey(entry runtimeEntry, port int) (string, bool) {
+	entryID := strings.ToLower(strings.TrimSpace(entry.config.ID))
+	if port > 0 {
+		return entryID + "\x00" + strconv.Itoa(port), true
+	}
+	if entryHasPlaceholder(entry) {
+		return "", false
+	}
+	return entryID + "\x00fixed", true
+}
+
+func entryHasPlaceholder(entry runtimeEntry) bool {
+	return strings.Contains(entry.config.URLTemplate, "{")
+}
+
 func (m *Manager) randomBinding(pool runtimePool, authID string) (Binding, string, error) {
 	total := poolCandidateCount(pool)
 	if total == 0 {
@@ -652,25 +850,9 @@ func poolCandidateCount(pool runtimePool) int {
 }
 
 func (m *Manager) bindingAtOrdinal(pool runtimePool, authID string, ordinal int) (Binding, string, error) {
-	if ordinal < 0 || ordinal >= poolCandidateCount(pool) {
+	selected, port, ok := poolEntryAtOrdinal(pool, ordinal)
+	if !ok {
 		return Binding{}, "", errors.New("proxy candidate ordinal is out of range")
-	}
-	var selected runtimeEntry
-	port := 0
-	for _, entry := range pool.entries {
-		weight := entry.ports.Count()
-		if weight == 0 {
-			weight = 1
-		}
-		if ordinal >= weight {
-			ordinal -= weight
-			continue
-		}
-		selected = entry
-		if entry.ports.Count() > 0 {
-			port, _ = entry.ports.PortAt(ordinal)
-		}
-		break
 	}
 	resolvedURL, values, errExpand := proxyutil.ExpandURLTemplate(selected.config.URLTemplate, pool.config.PlaceholderCharset, m.random)
 	if errExpand != nil {
@@ -697,6 +879,28 @@ func (m *Manager) bindingAtOrdinal(pool runtimePool, authID string, ordinal int)
 		BoundAt:           m.now().UTC(),
 	}
 	return binding, resolvedURL, nil
+}
+
+func poolEntryAtOrdinal(pool runtimePool, ordinal int) (runtimeEntry, int, bool) {
+	if ordinal < 0 || ordinal >= poolCandidateCount(pool) {
+		return runtimeEntry{}, 0, false
+	}
+	for _, entry := range pool.entries {
+		weight := entry.ports.Count()
+		if weight == 0 {
+			weight = 1
+		}
+		if ordinal >= weight {
+			ordinal -= weight
+			continue
+		}
+		port := 0
+		if entry.ports.Count() > 0 {
+			port, _ = entry.ports.PortAt(ordinal)
+		}
+		return entry, port, true
+	}
+	return runtimeEntry{}, 0, false
 }
 
 func randomInt(source io.Reader, max int) (int, error) {

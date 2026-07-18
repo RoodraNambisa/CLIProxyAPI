@@ -70,6 +70,7 @@ func (h *Handler) PatchProxyPool(c *gin.Context) {
 		PlaceholderCharset   *string       `json:"placeholder-charset"`
 		CheckIntervalSeconds *int          `json:"check-interval-seconds"`
 		BindAttempts         *int          `json:"bind-attempts"`
+		SpreadBindings       *bool         `json:"spread-bindings"`
 		Entries              *[]entryPatch `json:"entries"`
 		DeleteEntryIDs       []string      `json:"delete-entry-ids"`
 	}
@@ -105,6 +106,9 @@ func (h *Handler) PatchProxyPool(c *gin.Context) {
 	}
 	if body.BindAttempts != nil {
 		pools[index].BindAttempts = *body.BindAttempts
+	}
+	if body.SpreadBindings != nil {
+		pools[index].SpreadBindings = *body.SpreadBindings
 	}
 	if body.Entries != nil {
 		entries := append([]config.ProxyPoolEntryConfig(nil), pools[index].Entries...)

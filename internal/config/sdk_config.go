@@ -57,6 +57,7 @@ type ProxyPoolConfig struct {
 	PlaceholderCharset   string                 `yaml:"placeholder-charset,omitempty" json:"placeholder-charset,omitempty"`
 	CheckIntervalSeconds int                    `yaml:"check-interval-seconds,omitempty" json:"check-interval-seconds,omitempty"`
 	BindAttempts         int                    `yaml:"bind-attempts,omitempty" json:"bind-attempts,omitempty"`
+	SpreadBindings       bool                   `yaml:"spread-bindings,omitempty" json:"spread-bindings,omitempty"`
 	Entries              []ProxyPoolEntryConfig `yaml:"entries" json:"entries"`
 }
 

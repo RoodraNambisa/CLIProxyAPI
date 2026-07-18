@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -59,6 +60,289 @@ func TestResolvePersistsStableBindingWithoutExpandingPortRange(t *testing.T) {
 	}
 	if restoredResolved != resolved {
 		t.Fatalf("restored Resolve() = %+v, want %+v", restoredResolved, resolved)
+	}
+}
+
+func TestResolveSpreadBindingsUsesDistinctPortsWithoutRangeProbing(t *testing.T) {
+	t.Parallel()
+
+	cfg := proxyPoolTestConfig("10000-20000")
+	cfg.ProxyPools[0].SpreadBindings = true
+	cfg.ProxyPools[0].BindAttempts = 1
+	manager := newTestManager(t, filepath.Join(t.TempDir(), "config.yaml"), cfg)
+	var checks atomic.Int32
+	manager.check = func(context.Context, string) TraceResult {
+		checks.Add(1)
+		return successfulTrace(context.Background(), "")
+	}
+
+	first, errFirst := manager.Resolve(context.Background(), proxyPoolTestAuth("auth-a"))
+	if errFirst != nil {
+		t.Fatalf("first Resolve() error = %v", errFirst)
+	}
+	second, errSecond := manager.Resolve(context.Background(), proxyPoolTestAuth("auth-b"))
+	if errSecond != nil {
+		t.Fatalf("second Resolve() error = %v", errSecond)
+	}
+	firstURL, _ := url.Parse(first.URL)
+	secondURL, _ := url.Parse(second.URL)
+	if firstURL.Port() == "" || secondURL.Port() == "" || firstURL.Port() == secondURL.Port() {
+		t.Fatalf("spread ports = %q/%q, want distinct", firstURL.Port(), secondURL.Port())
+	}
+	if got := checks.Load(); got != 2 {
+		t.Fatalf("proxy checks = %d, want one bounded check per binding", got)
+	}
+	if got := manager.snapshot().pools["residential"].entries[0].ports.Count(); got != 10001 {
+		t.Fatalf("compact port count = %d, want 10001", got)
+	}
+}
+
+func TestResolveSpreadBindingsUsesDistinctPlaceholderInstances(t *testing.T) {
+	t.Parallel()
+
+	cfg := proxyPoolTestConfig("")
+	cfg.ProxyPools[0].SpreadBindings = true
+	cfg.ProxyPools[0].BindAttempts = 1
+	cfg.ProxyPools[0].Entries[0].URLTemplate = "http://user-session-{3}:password@proxy.example:18080"
+	manager := newTestManager(t, filepath.Join(t.TempDir(), "config.yaml"), cfg)
+	manager.random = &incrementingReader{}
+	manager.check = successfulTrace
+
+	first, errFirst := manager.Resolve(context.Background(), proxyPoolTestAuth("auth-a"))
+	if errFirst != nil {
+		t.Fatalf("first Resolve() error = %v", errFirst)
+	}
+	second, errSecond := manager.Resolve(context.Background(), proxyPoolTestAuth("auth-b"))
+	if errSecond != nil {
+		t.Fatalf("second Resolve() error = %v", errSecond)
+	}
+	if first.URL == second.URL {
+		t.Fatalf("placeholder bindings share URL %q", first.URL)
+	}
+}
+
+func TestResolveSpreadBindingsReservesPortsAcrossConcurrentAllocations(t *testing.T) {
+	t.Parallel()
+
+	cfg := proxyPoolTestConfig("10000-10001")
+	cfg.ProxyPools[0].SpreadBindings = true
+	cfg.ProxyPools[0].BindAttempts = 1
+	cfg.ProxyPools[0].Entries[0].URLTemplate = "http://proxy.example"
+	manager := newTestManager(t, filepath.Join(t.TempDir(), "config.yaml"), cfg)
+	started := make(chan string, 2)
+	release := make(chan struct{})
+	manager.check = func(_ context.Context, proxyURL string) TraceResult {
+		started <- proxyURL
+		<-release
+		return successfulTrace(context.Background(), proxyURL)
+	}
+
+	type resolveResult struct {
+		proxy coreauth.ResolvedProxy
+		err   error
+	}
+	results := make(chan resolveResult, 2)
+	for _, authID := range []string{"auth-a", "auth-b"} {
+		auth := proxyPoolTestAuth(authID)
+		go func() {
+			proxy, errResolve := manager.Resolve(context.Background(), auth)
+			results <- resolveResult{proxy: proxy, err: errResolve}
+		}()
+	}
+	waitStarted := func() string {
+		select {
+		case proxyURL := <-started:
+			return proxyURL
+		case <-time.After(time.Second):
+			close(release)
+			t.Fatal("concurrent allocation did not reach health check")
+			return ""
+		}
+	}
+	firstChecked := waitStarted()
+	secondChecked := waitStarted()
+	close(release)
+	if firstChecked == secondChecked {
+		t.Fatalf("concurrent allocations probed the same logical node %q", firstChecked)
+	}
+	for range 2 {
+		result := <-results
+		if result.err != nil {
+			t.Fatalf("concurrent Resolve() error = %v", result.err)
+		}
+	}
+}
+
+func TestResolveSpreadBindingsReusesLeastLoadedPortAfterExhaustion(t *testing.T) {
+	t.Parallel()
+
+	cfg := proxyPoolTestConfig("10000-10001")
+	cfg.ProxyPools[0].SpreadBindings = true
+	cfg.ProxyPools[0].BindAttempts = 1
+	cfg.ProxyPools[0].Entries[0].URLTemplate = "http://proxy.example"
+	manager := newTestManager(t, filepath.Join(t.TempDir(), "config.yaml"), cfg)
+	manager.check = successfulTrace
+
+	for _, authID := range []string{"auth-a", "auth-b", "auth-c"} {
+		if _, errResolve := manager.Resolve(context.Background(), proxyPoolTestAuth(authID)); errResolve != nil {
+			t.Fatalf("Resolve(%s) error = %v", authID, errResolve)
+		}
+	}
+	counts := make(map[int]int)
+	for _, binding := range manager.SortedBindings() {
+		counts[binding.Port]++
+	}
+	if len(counts) != 2 || counts[10000]+counts[10001] != 3 || counts[10000] > 2 || counts[10001] > 2 {
+		t.Fatalf("spread counts after exhaustion = %#v, want balanced 2/1", counts)
+	}
+}
+
+func TestEnablingSpreadBindingsPreservesExistingBindingsUntilRebind(t *testing.T) {
+	t.Parallel()
+
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	cfg := proxyPoolTestConfig("10000")
+	cfg.ProxyPools[0].Entries[0].URLTemplate = "http://proxy.example"
+	manager := newTestManager(t, configPath, cfg)
+	manager.check = successfulTrace
+	authA := proxyPoolTestAuth("auth-a")
+	authB := proxyPoolTestAuth("auth-b")
+	authC := proxyPoolTestAuth("auth-c")
+	for _, auth := range []*coreauth.Auth{authA, authB} {
+		if _, errResolve := manager.Resolve(context.Background(), auth); errResolve != nil {
+			t.Fatalf("initial Resolve(%s) error = %v", auth.ID, errResolve)
+		}
+	}
+
+	next := proxyPoolTestConfig("10000-10002")
+	next.ProxyPools[0].SpreadBindings = true
+	next.ProxyPools[0].Entries[0].URLTemplate = "http://proxy.example"
+	if errUpdate := manager.UpdateConfig(next); errUpdate != nil {
+		t.Fatalf("UpdateConfig() error = %v", errUpdate)
+	}
+	for _, auth := range []*coreauth.Auth{authA, authB} {
+		resolved, errResolve := manager.Resolve(context.Background(), auth)
+		if errResolve != nil {
+			t.Fatalf("preserved Resolve(%s) error = %v", auth.ID, errResolve)
+		}
+		parsed, _ := url.Parse(resolved.URL)
+		if parsed.Port() != "10000" {
+			t.Fatalf("preserved Resolve(%s) port = %q, want 10000", auth.ID, parsed.Port())
+		}
+	}
+	resolvedC, errC := manager.Resolve(context.Background(), authC)
+	if errC != nil {
+		t.Fatalf("new Resolve(auth-c) error = %v", errC)
+	}
+	parsedC, _ := url.Parse(resolvedC.URL)
+	if parsedC.Port() == "10000" {
+		t.Fatalf("new binding reused occupied port: %s", resolvedC.URL)
+	}
+
+	manager.SetAuthSource(staticAuthSource{authA.ID: authA, authB.ID: authB, authC.ID: authC})
+	rebound := manager.Rebind(context.Background(), []string{authB.ID})
+	if len(rebound) != 1 || !rebound[0].Updated || rebound[0].Binding == nil {
+		t.Fatalf("Rebind(auth-b) = %#v", rebound)
+	}
+	if rebound[0].Binding.Port == 10000 || strconv.Itoa(rebound[0].Binding.Port) == parsedC.Port() {
+		t.Fatalf("rebound port = %d, want remaining unoccupied port", rebound[0].Binding.Port)
+	}
+}
+
+func TestSpreadRebindSkipsExcludedLeastLoadedStaticNode(t *testing.T) {
+	t.Parallel()
+
+	cfg := proxyPoolTestConfig("10000-10001")
+	cfg.ProxyPools[0].SpreadBindings = true
+	cfg.ProxyPools[0].BindAttempts = 1
+	cfg.ProxyPools[0].Entries[0].URLTemplate = "http://proxy.example"
+	manager := newTestManager(t, filepath.Join(t.TempDir(), "config.yaml"), cfg)
+	manager.check = successfulTrace
+	current := proxyPoolTestAuth("auth-current")
+	manager.SetAuthSource(staticAuthSource{current.ID: current})
+	manager.mu.Lock()
+	manager.bindings = map[string]Binding{
+		current.ID: {ID: "current", AuthID: current.ID, Pool: "residential", Entry: "home", Port: 10000},
+		"auth-b":   {ID: "other-b", AuthID: "auth-b", Pool: "residential", Entry: "home", Port: 10001},
+		"auth-c":   {ID: "other-c", AuthID: "auth-c", Pool: "residential", Entry: "home", Port: 10001},
+	}
+	manager.mu.Unlock()
+
+	results := manager.Rebind(context.Background(), []string{current.ID})
+	if len(results) != 1 || !results[0].Updated || results[0].Binding == nil {
+		t.Fatalf("Rebind() = %#v", results)
+	}
+	if results[0].Binding.Port != 10001 {
+		t.Fatalf("rebound port = %d, want the non-excluded candidate 10001", results[0].Binding.Port)
+	}
+}
+
+func TestSpreadAllocationWaitsForBindingPersistenceRollback(t *testing.T) {
+	t.Parallel()
+
+	cfg := proxyPoolTestConfig("10000-10001")
+	cfg.ProxyPools[0].SpreadBindings = true
+	cfg.ProxyPools[0].BindAttempts = 1
+	cfg.ProxyPools[0].Entries[0].URLTemplate = "http://proxy.example"
+	manager := newTestManager(t, filepath.Join(t.TempDir(), "config.yaml"), cfg)
+	manager.check = successfulTrace
+	if _, errResolve := manager.Resolve(context.Background(), proxyPoolTestAuth("auth-a")); errResolve != nil {
+		t.Fatalf("initial Resolve() error = %v", errResolve)
+	}
+	before := manager.SortedBindings()[0]
+	replacement := before
+	replacement.ID = "replacement"
+	if before.Port == 10000 {
+		replacement.Port = 10001
+	} else {
+		replacement.Port = 10000
+	}
+
+	persistStarted := make(chan struct{})
+	releasePersist := make(chan struct{})
+	var syncCalls atomic.Int32
+	manager.syncDir = func(string) error {
+		if syncCalls.Add(1) == 1 {
+			close(persistStarted)
+			<-releasePersist
+			return errors.New("directory sync failed")
+		}
+		return nil
+	}
+	saveDone := make(chan error, 1)
+	go func() { saveDone <- manager.saveBinding(replacement) }()
+	select {
+	case <-persistStarted:
+	case <-time.After(time.Second):
+		t.Fatal("replacement persistence did not start")
+	}
+
+	type pendingResolve struct {
+		proxy coreauth.ResolvedProxy
+		err   error
+	}
+	resolveDone := make(chan pendingResolve, 1)
+	go func() {
+		proxy, errResolve := manager.Resolve(context.Background(), proxyPoolTestAuth("auth-b"))
+		resolveDone <- pendingResolve{proxy: proxy, err: errResolve}
+	}()
+	select {
+	case result := <-resolveDone:
+		close(releasePersist)
+		t.Fatalf("Resolve() completed against tentative binding state: %#v", result)
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(releasePersist)
+	if errSave := <-saveDone; errSave == nil {
+		t.Fatal("saveBinding() error = nil, want rollback")
+	}
+	result := <-resolveDone
+	if result.err != nil {
+		t.Fatalf("Resolve() after rollback error = %v", result.err)
+	}
+	parsed, _ := url.Parse(result.proxy.URL)
+	if parsed.Port() == strconv.Itoa(before.Port) {
+		t.Fatalf("Resolve() reused restored occupied port %d", before.Port)
 	}
 }
 
@@ -1069,6 +1353,21 @@ type blockingGetAuthSource struct {
 	started chan struct{}
 	release chan struct{}
 	once    sync.Once
+}
+
+type incrementingReader struct {
+	mu    sync.Mutex
+	value byte
+}
+
+func (r *incrementingReader) Read(p []byte) (int, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for index := range p {
+		p[index] = r.value
+		r.value++
+	}
+	return len(p), nil
 }
 
 type testStatusError struct {
