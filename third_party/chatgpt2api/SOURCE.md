@@ -7,4 +7,7 @@ This implementation was independently rewritten in Go with the following MIT-lic
 - `basketikun/chatgpt2api` at commit `1f96b49b2bf35e607a2c587e3fb9d40c5acb475d`:
   reference for password OAuth, refresh-token rotation, browser session headers, and Sentinel request flow.
 
-The accompanying `LICENSE` is retained for these derived protocol implementations. No Python runtime or source file is embedded in the binary.
+The locked revisions publish identical copyright and MIT license text. `LICENSE`
+retains the notice from `yukkcat/chatgpt2api`, and `LICENSE.basketikun` retains
+the notice from `basketikun/chatgpt2api`. No Python runtime or source file is
+embedded in the binary.
