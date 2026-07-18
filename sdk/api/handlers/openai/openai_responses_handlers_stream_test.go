@@ -147,6 +147,53 @@ func TestResponsesStreamingUsesEffectiveImagePassthroughAfterPolicy(t *testing.T
 	}
 }
 
+func TestResponsesStreamingTrustUpstreamSSEStillRewritesTerminalError(t *testing.T) {
+	const model = "responses-trusted-sse-error-rewrite"
+	normalFrame := []byte("event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\n")
+	executor := &responsesMetadataCaptureExecutor{chunks: [][]byte{
+		normalFrame,
+		[]byte("event: response.failed\ndata: {\"type\":\"response.failed\",\"status\":429,\"response\":{\"status_code\":429,\"error\":{\"message\":\"upstream-secret\"}}}\n\n"),
+	}}
+	manager := coreauth.NewManager(nil, nil, nil)
+	manager.RegisterExecutor(executor)
+	auth := &coreauth.Auth{ID: model + "-auth", Provider: "codex", Status: coreauth.StatusActive}
+	if _, errRegister := manager.Register(t.Context(), auth); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+	registry.GetGlobalRegistry().RegisterClient(auth.ID, auth.Provider, []*registry.ModelInfo{{ID: model}})
+	t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(auth.ID) })
+
+	rewriteBody := map[string]any{"error": map[string]any{"message": "client-safe", "code": "rewritten"}}
+	cfg := &sdkconfig.SDKConfig{
+		Streaming: sdkconfig.StreamingConfig{TrustUpstreamSSE: true},
+		ErrorResponseRewrites: []sdkconfig.ErrorResponseRewriteRule{{
+			StatusCode:         http.StatusTooManyRequests,
+			ResponseStatusCode: http.StatusBadRequest,
+			ResponseBody:       &rewriteBody,
+		}},
+	}
+	h := NewOpenAIResponsesAPIHandler(handlers.NewBaseAPIHandlers(cfg, manager))
+	router := gin.New()
+	router.POST("/v1/responses", h.Responses)
+	request := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(fmt.Sprintf(`{"model":%q,"stream":true,"input":"hello"}`, model)))
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 after stream commit; body=%s", response.Code, response.Body.String())
+	}
+	if !strings.Contains(response.Body.String(), string(normalFrame)) {
+		t.Fatalf("trusted non-terminal frame changed: %s", response.Body.String())
+	}
+	if !strings.Contains(response.Body.String(), `"message":"client-safe"`) || !strings.Contains(response.Body.String(), `"code":"rewritten"`) {
+		t.Fatalf("terminal error was not rewritten: %s", response.Body.String())
+	}
+	if strings.Contains(response.Body.String(), "upstream-secret") {
+		t.Fatalf("terminal error leaked upstream body: %s", response.Body.String())
+	}
+}
+
 func TestResponsesStreamingDoesNotLoseCommittedErrorWhenDataCloses(t *testing.T) {
 	for attempt := 0; attempt < 32; attempt++ {
 		executor := &responsesCommittedErrorExecutor{}

@@ -660,7 +660,7 @@ func (h *OpenAIResponsesAPIHandler) handleStreamingResponse(c *gin.Context, rawJ
 	}
 	trustUpstreamSSE := handlers.StreamingTrustUpstreamSSE(h.Cfg)
 	framer := &responsesSSEFramer{passthrough: trustUpstreamSSE}
-	if !trustUpstreamSSE && h.Cfg != nil && len(h.Cfg.ErrorResponseRewrites) > 0 {
+	if h.Cfg != nil && len(h.Cfg.ErrorResponseRewrites) > 0 {
 		framer.rewriteTerminalError = h.rewriteResponsesSSETerminalErrorFrame
 	}
 	if requestedImageStreamPassthrough {
