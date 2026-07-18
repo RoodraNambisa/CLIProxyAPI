@@ -211,7 +211,7 @@ func (s *ConfigSynthesizer) synthesizeOpenAICompat(ctx *SynthesisContext) []*cor
 			continue
 		}
 		prefix := strings.TrimSpace(compat.Prefix)
-		providerName := openAICompatRuntimeProviderName(compat.Name)
+		providerName := OpenAICompatRuntimeProviderName(compat.Name)
 		base := strings.TrimSpace(compat.BaseURL)
 
 		// Handle new APIKeyEntries format (preferred)
@@ -285,7 +285,9 @@ func (s *ConfigSynthesizer) synthesizeOpenAICompat(ctx *SynthesisContext) []*cor
 	return out
 }
 
-func openAICompatRuntimeProviderName(name string) string {
+// OpenAICompatRuntimeProviderName returns the provider ID used by synthesized
+// OpenAI-compatible credentials.
+func OpenAICompatRuntimeProviderName(name string) string {
 	providerName := strings.ToLower(strings.TrimSpace(name))
 	if providerName == "" {
 		return "openai-compatibility"

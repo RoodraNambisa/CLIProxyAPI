@@ -57,6 +57,8 @@ const (
 
 var chatGPTWebBackgroundReloginSlots = make(chan struct{}, chatGPTWebBackgroundReloginConcurrency)
 
+var errChatGPTWebReloginOwnershipChanged = errors.New("chatgpt web re-login ownership changed")
+
 // ChatGPTWebExecutor manages ChatGPT Web credential refresh and re-login.
 // Request protocol support is added separately from the credential lifecycle.
 type ChatGPTWebExecutor struct {
@@ -76,6 +78,7 @@ type ChatGPTWebExecutor struct {
 	now                 func() time.Time
 	reloginBackoff      func(int) time.Duration
 	reloginSlotAcquired func()
+	reloginSlots        chan struct{}
 	refreshGroup        singleflight.Group
 	refreshWG           sync.WaitGroup
 	reloginMu           sync.Mutex
@@ -118,6 +121,7 @@ func NewChatGPTWebExecutorWithLoginCoordinator(cfg *config.Config, manager *clip
 		streamHeartbeat:    15 * time.Second,
 		now:                time.Now,
 		reloginBackoff:     chatGPTWebBackgroundReloginBackoff,
+		reloginSlots:       chatGPTWebBackgroundReloginSlots,
 		reloginFlights:     make(map[string]*chatGPTWebReloginFlight),
 		loginCoordinator:   coordinator,
 		backgroundRunning:  make(map[string]struct{}),
@@ -375,7 +379,7 @@ func (e *ChatGPTWebExecutor) TriggerBackgroundRelogin(expected *cliproxyauth.Aut
 		return
 	}
 	expected = cloneChatGPTWebAuth(expected)
-	key := chatGPTWebOperationKey(expected)
+	key := chatGPTWebReloginGenerationKey(expected)
 	if !e.beginBackgroundRelogin(key) {
 		return
 	}
@@ -388,6 +392,10 @@ func (e *ChatGPTWebExecutor) TriggerBackgroundRelogin(expected *cliproxyauth.Aut
 // ReloginCurrent performs a synchronous re-login and conditionally installs
 // the result. It is used by management actions and background re-login.
 func (e *ChatGPTWebExecutor) ReloginCurrent(ctx context.Context, expected *cliproxyauth.Auth) (*cliproxyauth.Auth, bool, error) {
+	return e.reloginCurrentWithMode(ctx, expected, false)
+}
+
+func (e *ChatGPTWebExecutor) reloginCurrentWithMode(ctx context.Context, expected *cliproxyauth.Auth, background bool) (*cliproxyauth.Auth, bool, error) {
 	if e == nil || e.manager == nil || e.authService == nil || expected == nil {
 		return nil, false, errors.New("chatgpt web re-login is unavailable")
 	}
@@ -398,15 +406,15 @@ func (e *ChatGPTWebExecutor) ReloginCurrent(ctx context.Context, expected *clipr
 		return nil, false, err
 	}
 	expected = cloneChatGPTWebAuth(expected)
-	flight, errFlight := e.joinReloginFlight(ctx, expected)
+	flight, errFlight := e.joinReloginFlight(ctx, expected, background)
 	if errFlight != nil {
 		return nil, false, errFlight
 	}
 	select {
 	case <-flight.done:
-		e.releaseReloginWaiter(flight)
+		e.releaseReloginWaiter(flight, background)
 	case <-ctx.Done():
-		if e.releaseReloginWaiter(flight) {
+		if e.releaseReloginWaiter(flight, background) {
 			flight.cancel()
 		}
 		return nil, false, ctx.Err()
@@ -415,8 +423,8 @@ func (e *ChatGPTWebExecutor) ReloginCurrent(ctx context.Context, expected *clipr
 	return cloneChatGPTWebAuth(result.auth), result.current, result.err
 }
 
-func (e *ChatGPTWebExecutor) joinReloginFlight(ctx context.Context, expected *cliproxyauth.Auth) (*chatGPTWebReloginFlight, error) {
-	key := chatGPTWebOperationKey(expected)
+func (e *ChatGPTWebExecutor) joinReloginFlight(ctx context.Context, expected *cliproxyauth.Auth, background bool) (*chatGPTWebReloginFlight, error) {
+	key := chatGPTWebReloginGenerationKey(expected)
 	for {
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -436,6 +444,10 @@ func (e *ChatGPTWebExecutor) joinReloginFlight(ctx context.Context, expected *cl
 				}
 			}
 			flight.waiters++
+			if !background {
+				flight.manualWaiters++
+				signalReloginModeChange(flight)
+			}
 			e.reloginMu.Unlock()
 			return flight, nil
 		}
@@ -445,10 +457,14 @@ func (e *ChatGPTWebExecutor) joinReloginFlight(ctx context.Context, expected *cl
 		}
 		acquisitionCtx, cancel := e.acquisitionContext()
 		flight := &chatGPTWebReloginFlight{
-			key:     key,
-			done:    make(chan struct{}),
-			cancel:  cancel,
-			waiters: 1,
+			key:         key,
+			done:        make(chan struct{}),
+			cancel:      cancel,
+			waiters:     1,
+			modeChanged: make(chan struct{}, 1),
+		}
+		if !background {
+			flight.manualWaiters = 1
 		}
 		if e.reloginFlights == nil {
 			e.reloginFlights = make(map[string]*chatGPTWebReloginFlight)
@@ -478,11 +494,11 @@ func (e *ChatGPTWebExecutor) runReloginFlight(ctx context.Context, expected *cli
 	ctx, release, active := expected.BeginRuntimeExecution(ctx)
 	result := chatGPTWebReloginResult{err: context.Canceled}
 	if active {
-		updated, current, errRelogin := e.reloginCurrent(ctx, expected)
+		updated, current, errRelogin := e.reloginCurrent(ctx, expected, flight)
 		result = chatGPTWebReloginResult{auth: updated, current: current, err: errRelogin}
 		release()
 	} else if latest, ok := e.manager.GetByID(expected.ID); !ok ||
-		chatGPTWebOperationKey(latest) != chatGPTWebOperationKey(expected) {
+		chatGPTWebReloginGenerationKey(latest) != chatGPTWebReloginGenerationKey(expected) {
 		result = chatGPTWebReloginResult{
 			auth: cloneChatGPTWebAuth(latest),
 			err:  chatgptwebauth.ErrCredentialSuperseded,
@@ -490,6 +506,9 @@ func (e *ChatGPTWebExecutor) runReloginFlight(ctx context.Context, expected *cli
 	}
 
 	e.reloginMu.Lock()
+	if flight.restartBackground && errors.Is(result.err, context.Canceled) {
+		result.err = errChatGPTWebReloginOwnershipChanged
+	}
 	flight.result = result
 	flight.completed = true
 	if flight.waiters == 0 && e.reloginFlights[flight.key] == flight {
@@ -501,21 +520,39 @@ func (e *ChatGPTWebExecutor) runReloginFlight(ctx context.Context, expected *cli
 
 // releaseReloginWaiter reports whether the released waiter was the final
 // owner of a still-running acquisition.
-func (e *ChatGPTWebExecutor) releaseReloginWaiter(flight *chatGPTWebReloginFlight) bool {
+func (e *ChatGPTWebExecutor) releaseReloginWaiter(flight *chatGPTWebReloginFlight, background bool) bool {
 	e.reloginMu.Lock()
 	defer e.reloginMu.Unlock()
 	if flight == nil || flight.waiters == 0 {
 		return false
 	}
 	flight.waiters--
-	lastRunning := flight.waiters == 0 && !flight.completed
-	if lastRunning {
+	if !background && flight.manualWaiters > 0 {
+		flight.manualWaiters--
+		signalReloginModeChange(flight)
+	}
+	lastWaiter := flight.waiters == 0 && !flight.completed
+	manualOwnerReleased := !flight.completed && flight.waiters > 0 &&
+		flight.manualWaiters == 0 && flight.mode == chatGPTWebReloginModeManual
+	shouldCancel := lastWaiter || manualOwnerReleased
+	if shouldCancel {
 		flight.canceling = true
+		flight.restartBackground = manualOwnerReleased
 	}
 	if flight.waiters == 0 && flight.completed && e.reloginFlights[flight.key] == flight {
 		delete(e.reloginFlights, flight.key)
 	}
-	return lastRunning
+	return shouldCancel
+}
+
+func signalReloginModeChange(flight *chatGPTWebReloginFlight) {
+	if flight == nil || flight.modeChanged == nil {
+		return
+	}
+	select {
+	case flight.modeChanged <- struct{}{}:
+	default:
+	}
 }
 
 func (e *ChatGPTWebExecutor) runBackgroundRelogin(expected *cliproxyauth.Auth) {
@@ -533,15 +570,7 @@ func (e *ChatGPTWebExecutor) runBackgroundRelogin(expected *cliproxyauth.Auth) {
 		if !e.backgroundReloginPending(expected) {
 			return
 		}
-		if !e.acquireBackgroundReloginSlot(ctx, expected) {
-			return
-		}
-		if !e.backgroundReloginPending(expected) {
-			<-chatGPTWebBackgroundReloginSlots
-			return
-		}
-		_, _, errRelogin := e.ReloginCurrent(ctx, expected)
-		<-chatGPTWebBackgroundReloginSlots
+		_, _, errRelogin := e.reloginCurrentWithMode(ctx, expected, true)
 		if errRelogin == nil {
 			return
 		}
@@ -588,21 +617,51 @@ func (e *ChatGPTWebExecutor) finishBackgroundRelogin(key string) {
 	e.backgroundWG.Done()
 }
 
-func (e *ChatGPTWebExecutor) acquireBackgroundReloginSlot(ctx context.Context, expected *cliproxyauth.Auth) bool {
+func (e *ChatGPTWebExecutor) acquireReloginExecution(ctx context.Context, expected *cliproxyauth.Auth, flight *chatGPTWebReloginFlight) (background bool, release func(), ready bool) {
+	slots := e.reloginSlots
+	if slots == nil {
+		slots = chatGPTWebBackgroundReloginSlots
+	}
 	ticker := time.NewTicker(chatGPTWebBackgroundReloginStatePollInterval)
 	defer ticker.Stop()
 	for {
+		e.reloginMu.Lock()
+		if flight == nil || flight.canceling || flight.completed {
+			e.reloginMu.Unlock()
+			return false, nil, false
+		}
+		if flight.manualWaiters > 0 {
+			flight.mode = chatGPTWebReloginModeManual
+			e.reloginMu.Unlock()
+			return false, nil, true
+		}
+		e.reloginMu.Unlock()
 		if !e.backgroundReloginPending(expected) {
-			return false
+			return false, nil, false
 		}
 		select {
-		case chatGPTWebBackgroundReloginSlots <- struct{}{}:
+		case slots <- struct{}{}:
+			e.reloginMu.Lock()
+			if flight.canceling || flight.completed {
+				e.reloginMu.Unlock()
+				<-slots
+				return false, nil, false
+			}
+			if flight.manualWaiters > 0 {
+				flight.mode = chatGPTWebReloginModeManual
+				e.reloginMu.Unlock()
+				<-slots
+				return false, nil, true
+			}
+			flight.mode = chatGPTWebReloginModeBackground
+			e.reloginMu.Unlock()
 			if e.reloginSlotAcquired != nil {
 				e.reloginSlotAcquired()
 			}
-			return true
+			return true, func() { <-slots }, true
 		case <-ctx.Done():
-			return false
+			return false, nil, false
+		case <-flight.modeChanged:
 		case <-ticker.C:
 		}
 	}
@@ -639,7 +698,7 @@ func (e *ChatGPTWebExecutor) backgroundReloginPending(expected *cliproxyauth.Aut
 		return false
 	}
 	current, ok := e.manager.GetByID(expected.ID)
-	return ok && current.LifecycleState() == cliproxyauth.LifecycleStateReloginPending && chatGPTWebOperationKey(current) == chatGPTWebOperationKey(expected)
+	return ok && current.LifecycleState() == cliproxyauth.LifecycleStateReloginPending && chatGPTWebReloginGenerationKey(current) == chatGPTWebReloginGenerationKey(expected)
 }
 
 func (e *ChatGPTWebExecutor) backgroundReloginDelay(attempt int) time.Duration {
@@ -664,6 +723,9 @@ func chatGPTWebBackgroundReloginBackoff(attempt int) time.Duration {
 }
 
 func chatGPTWebBackgroundReloginRetryable(err error) bool {
+	if errors.Is(err, errChatGPTWebReloginOwnershipChanged) {
+		return true
+	}
 	if chatgptwebauth.IsRetryable(err) {
 		return true
 	}
@@ -676,7 +738,7 @@ func logChatGPTWebBackgroundReloginFailure(authID string, err error) {
 	log.WithFields(log.Fields{"auth_id": authID, "error_code": code}).Warn("chatgpt web background re-login failed")
 }
 
-func (e *ChatGPTWebExecutor) reloginCurrent(ctx context.Context, expected *cliproxyauth.Auth) (*cliproxyauth.Auth, bool, error) {
+func (e *ChatGPTWebExecutor) reloginCurrent(ctx context.Context, expected *cliproxyauth.Auth, flight *chatGPTWebReloginFlight) (*cliproxyauth.Auth, bool, error) {
 	if e == nil || e.manager == nil || e.authService == nil || expected == nil {
 		return nil, false, errors.New("chatgpt web re-login is unavailable")
 	}
@@ -693,6 +755,27 @@ func (e *ChatGPTWebExecutor) reloginCurrent(ctx context.Context, expected *clipr
 	}
 	defer releaseOperation()
 	ctx = operationCtx
+	latest, ok := e.manager.GetByID(expected.ID)
+	if !ok || chatGPTWebReloginGenerationKey(latest) != chatGPTWebReloginGenerationKey(expected) {
+		return cloneChatGPTWebAuth(latest), false, chatgptwebauth.ErrCredentialSuperseded
+	}
+	background, releaseSlot, ready := e.acquireReloginExecution(ctx, expected, flight)
+	if !ready {
+		if errContext := ctx.Err(); errContext != nil {
+			return nil, false, errContext
+		}
+		latest, _ = e.manager.GetByID(expected.ID)
+		return cloneChatGPTWebAuth(latest), false, chatgptwebauth.ErrCredentialSuperseded
+	}
+	if releaseSlot != nil {
+		defer releaseSlot()
+	}
+	if background {
+		if !e.backgroundReloginPending(expected) {
+			latest, _ = e.manager.GetByID(expected.ID)
+			return cloneChatGPTWebAuth(latest), false, chatgptwebauth.ErrCredentialSuperseded
+		}
+	}
 
 	releaseProxyBinding := e.manager.HoldProxyBinding(expected.ID)
 	defer releaseProxyBinding()
@@ -711,7 +794,7 @@ func (e *ChatGPTWebExecutor) reloginCurrent(ctx context.Context, expected *clipr
 	})
 	if errContext := ctx.Err(); errContext != nil {
 		if latest, ok := e.manager.GetByID(expected.ID); ok &&
-			chatGPTWebOperationKey(latest) != chatGPTWebOperationKey(expected) {
+			chatGPTWebReloginGenerationKey(latest) != chatGPTWebReloginGenerationKey(expected) {
 			return cloneChatGPTWebAuth(latest), false, chatgptwebauth.ErrCredentialSuperseded
 		}
 		return nil, false, errContext
@@ -729,7 +812,7 @@ func (e *ChatGPTWebExecutor) reloginCurrent(ctx context.Context, expected *clipr
 		updated,
 	)
 	if errUpdate != nil {
-		if latest, ok := e.manager.GetByID(expected.ID); ok && chatGPTWebOperationKey(latest) != chatGPTWebOperationKey(expected) {
+		if latest, ok := e.manager.GetByID(expected.ID); ok && chatGPTWebReloginGenerationKey(latest) != chatGPTWebReloginGenerationKey(expected) {
 			return cloneChatGPTWebAuth(latest), false, chatgptwebauth.ErrCredentialSuperseded
 		}
 		return nil, false, errUpdate
@@ -760,7 +843,7 @@ func (e *ChatGPTWebExecutor) refreshCredential(ctx context.Context, auth *clipro
 	if errIdentity := chatgptwebauth.EnsureCredentialRuntimeIDsForURL(credential, chatgptwebauth.CredentialRuntimeIdentityReader(auth.ID, credential), e.chatGPTWebBaseURL()); errIdentity != nil {
 		return nil, fmt.Errorf("initialize chatgpt web browser identity: %w", errIdentity), false
 	}
-	key := chatGPTWebOperationKey(auth)
+	key := chatGPTWebRefreshKey(auth)
 	if !e.beginRefreshWait() {
 		return nil, context.Canceled, false
 	}
@@ -856,14 +939,26 @@ type chatGPTWebReloginResult struct {
 }
 
 type chatGPTWebReloginFlight struct {
-	key       string
-	done      chan struct{}
-	cancel    context.CancelFunc
-	waiters   int
-	completed bool
-	canceling bool
-	result    chatGPTWebReloginResult
+	key               string
+	done              chan struct{}
+	cancel            context.CancelFunc
+	modeChanged       chan struct{}
+	waiters           int
+	manualWaiters     int
+	mode              chatGPTWebReloginMode
+	restartBackground bool
+	completed         bool
+	canceling         bool
+	result            chatGPTWebReloginResult
 }
+
+type chatGPTWebReloginMode uint8
+
+const (
+	chatGPTWebReloginModePending chatGPTWebReloginMode = iota
+	chatGPTWebReloginModeManual
+	chatGPTWebReloginModeBackground
+)
 
 func cloneChatGPTWebCredential(credential *chatgptwebauth.Credential) *chatgptwebauth.Credential {
 	if credential == nil {
@@ -933,7 +1028,7 @@ func chatGPTWebCredentialExpiry(credential *chatgptwebauth.Credential) (time.Tim
 	return chatgptwebauth.JWTExpiry(credential.IDToken)
 }
 
-func chatGPTWebOperationKey(auth *cliproxyauth.Auth) string {
+func chatGPTWebRefreshKey(auth *cliproxyauth.Auth) string {
 	if auth == nil {
 		return ""
 	}
@@ -943,6 +1038,17 @@ func chatGPTWebOperationKey(auth *cliproxyauth.Auth) string {
 	}
 	digest := sha256.Sum256([]byte(refreshToken))
 	return auth.ID + ":" + auth.RuntimeInstanceID() + ":" + fmt.Sprintf("%x", digest[:8])
+}
+
+func chatGPTWebReloginGenerationKey(auth *cliproxyauth.Auth) string {
+	if auth == nil {
+		return ""
+	}
+	sourceGeneration := ""
+	if auth.Attributes != nil {
+		sourceGeneration = strings.TrimSpace(auth.Attributes[cliproxyauth.SourceHashAttributeKey])
+	}
+	return chatGPTWebRefreshKey(auth) + ":" + auth.RuntimeInstallationID() + ":" + sourceGeneration
 }
 
 func (e *ChatGPTWebExecutor) currentTime() time.Time {

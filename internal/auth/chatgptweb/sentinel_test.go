@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -113,6 +114,55 @@ func TestSentinelTokenRequest(t *testing.T) {
 	}
 	if !foundCookie {
 		t.Fatal("oai-sc cookie was not persisted")
+	}
+}
+
+func TestSentinelTokenStopsUnsolvablePoWWhenContextCanceled(t *testing.T) {
+	t.Parallel()
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
+		response.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(response, `{"token":"challenge-token","proofofwork":{"required":true,"seed":"fixture","difficulty":"!"}}`)
+	}))
+	defer server.Close()
+
+	client, err := NewClient(DefaultPersona(), "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.CloseIdleConnections()
+	powStarted := make(chan struct{})
+	nowCalls := 0
+	now := func() time.Time {
+		nowCalls++
+		if nowCalls == 4 {
+			close(powStarted)
+		}
+		return time.Date(2026, time.July, 16, 12, 30, 0, 0, time.UTC)
+	}
+	sentinel, err := NewSentinel(client, server.URL, server.URL, "00000000-0000-4000-8000-000000000001", zeroReader{}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() {
+		_, tokenErr := sentinel.Token(ctx, "password_verify")
+		result <- tokenErr
+	}()
+	select {
+	case <-powStarted:
+	case <-time.After(time.Second):
+		t.Fatal("Sentinel.Token() did not start proof-of-work")
+	}
+	cancel()
+	select {
+	case tokenErr := <-result:
+		if !errors.Is(tokenErr, context.Canceled) {
+			t.Fatalf("Sentinel.Token() error = %v, want context.Canceled", tokenErr)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Sentinel.Token() did not stop after context cancellation")
 	}
 }
 

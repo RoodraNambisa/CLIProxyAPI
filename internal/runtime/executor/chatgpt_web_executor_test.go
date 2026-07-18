@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -457,6 +458,66 @@ func TestChatGPTWebExecutorRefreshSingleflightClonesCredential(t *testing.T) {
 	}
 }
 
+func TestChatGPTWebExecutorRefreshSingleflightSpansInstallationUpdates(t *testing.T) {
+	manager := cliproxyauth.NewManager(nil, nil, nil)
+	auth := chatGPTWebTestAuth("refresh-installation")
+	if _, errRegister := manager.Register(cliproxyauth.WithSkipPersist(t.Context()), auth); errRegister != nil {
+		t.Fatal(errRegister)
+	}
+	first, _ := manager.GetByID(auth.ID)
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseRefresh := func() { releaseOnce.Do(func() { close(release) }) }
+	fake := &fakeChatGPTWebAuthService{}
+	fake.refreshFn = func(_ context.Context, credential chatgptwebauth.Credential, _ string) (*chatgptwebauth.Credential, error) {
+		close(started)
+		<-release
+		credential.AccessToken = "refreshed-token"
+		return &credential, nil
+	}
+	executor := NewChatGPTWebExecutor(&config.Config{}, manager)
+	executor.authService = fake
+	t.Cleanup(func() { _ = executor.Close() })
+	t.Cleanup(releaseRefresh)
+
+	type refreshResult struct {
+		auth *cliproxyauth.Auth
+		err  error
+	}
+	results := make(chan refreshResult, 2)
+	go func() {
+		updated, errRefresh, _ := executor.refreshCredential(t.Context(), first)
+		results <- refreshResult{auth: updated, err: errRefresh}
+	}()
+	<-started
+
+	replacement := first.Clone()
+	if _, errUpdate := manager.Update(cliproxyauth.WithSkipPersist(t.Context()), replacement); errUpdate != nil {
+		t.Fatal(errUpdate)
+	}
+	second, _ := manager.GetByID(auth.ID)
+	if second.RuntimeInstanceID() != first.RuntimeInstanceID() || second.RuntimeInstallationID() == first.RuntimeInstallationID() {
+		t.Fatalf("installation update identities = runtime %q/%q installation %q/%q",
+			first.RuntimeInstanceID(), second.RuntimeInstanceID(), first.RuntimeInstallationID(), second.RuntimeInstallationID())
+	}
+	go func() {
+		updated, errRefresh, _ := executor.refreshCredential(t.Context(), second)
+		results <- refreshResult{auth: updated, err: errRefresh}
+	}()
+	time.Sleep(20 * time.Millisecond)
+	releaseRefresh()
+	for range 2 {
+		result := <-results
+		if result.err != nil || result.auth == nil {
+			t.Fatalf("refresh result = (%v, %v)", result.auth, result.err)
+		}
+	}
+	if got := fake.refreshCalls.Load(); got != 1 {
+		t.Fatalf("refresh calls across installation update = %d, want 1", got)
+	}
+}
+
 func TestChatGPTWebExecutorManualAndBackgroundReloginSingleflight(t *testing.T) {
 	manager := cliproxyauth.NewManager(nil, nil, nil)
 	expected := registerChatGPTWebPendingAuth(t, manager, "shared-relogin")
@@ -493,6 +554,55 @@ func TestChatGPTWebExecutorManualAndBackgroundReloginSingleflight(t *testing.T) 
 		current, ok := manager.GetByID(expected.ID)
 		return ok && current.LifecycleState() == cliproxyauth.LifecycleStateActive
 	})
+}
+
+func TestChatGPTWebExecutorManualPromotesQueuedBackgroundRelogin(t *testing.T) {
+	manager := cliproxyauth.NewManager(nil, nil, nil)
+	expected := registerChatGPTWebPendingAuth(t, manager, "manual-promotes-background")
+	started := make(chan struct{})
+	release := make(chan struct{})
+	fake := &fakeChatGPTWebAuthService{}
+	fake.loginFn = func(_ context.Context, input chatgptwebauth.LoginInput) (*chatgptwebauth.Credential, error) {
+		close(started)
+		<-release
+		credential := *input.Credential
+		credential.AccessToken = "promoted-token"
+		credential.LifecycleState = chatgptwebauth.LifecycleActive
+		return &credential, nil
+	}
+	executor := NewChatGPTWebExecutor(&config.Config{ChatGPTWeb: config.ChatGPTWebConfig{AutoRelogin: true}}, manager)
+	executor.authService = fake
+	executor.reloginSlots = make(chan struct{}, 1)
+	executor.reloginSlots <- struct{}{}
+	t.Cleanup(func() { _ = executor.Close() })
+
+	backgroundDone := make(chan error, 1)
+	go func() {
+		_, _, errRelogin := executor.reloginCurrentWithMode(t.Context(), expected, true)
+		backgroundDone <- errRelogin
+	}()
+	waitForChatGPTWebReloginWaiters(t, executor, expected, 1)
+
+	manualDone := make(chan error, 1)
+	go func() {
+		_, _, errRelogin := executor.ReloginCurrent(t.Context(), expected)
+		manualDone <- errRelogin
+	}()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("manual re-login did not promote the queued background flight")
+	}
+	close(release)
+	if errRelogin := <-manualDone; errRelogin != nil {
+		t.Fatalf("manual ReloginCurrent() error: %v", errRelogin)
+	}
+	if errRelogin := <-backgroundDone; errRelogin != nil {
+		t.Fatalf("background re-login error: %v", errRelogin)
+	}
+	if got := len(executor.reloginSlots); got != 1 {
+		t.Fatalf("background slot occupancy = %d, want original blocker only", got)
+	}
 }
 
 func TestChatGPTWebExecutorReloginHoldsProxyBindingLease(t *testing.T) {
@@ -701,15 +811,21 @@ func TestChatGPTWebExecutorCanceledReloginWaiterKeepsSharedOperationTracked(t *t
 	}
 }
 
-func TestChatGPTWebExecutorCanceledFirstReloginWaiterDoesNotCancelBackground(t *testing.T) {
+func TestChatGPTWebExecutorCanceledManualReloginRestartsBackgroundWithinLimit(t *testing.T) {
 	manager := cliproxyauth.NewManager(nil, nil, nil)
 	expected := registerChatGPTWebPendingAuth(t, manager, "first-cancel-relogin")
-	started := make(chan struct{})
-	release := make(chan struct{})
+	firstStarted := make(chan struct{})
+	firstCanceled := make(chan struct{})
+	secondStarted := make(chan struct{})
 	fake := &fakeChatGPTWebAuthService{}
-	fake.loginFn = func(_ context.Context, input chatgptwebauth.LoginInput) (*chatgptwebauth.Credential, error) {
-		close(started)
-		<-release
+	fake.loginFn = func(ctx context.Context, input chatgptwebauth.LoginInput) (*chatgptwebauth.Credential, error) {
+		if fake.loginCalls.Load() == 1 {
+			close(firstStarted)
+			<-ctx.Done()
+			close(firstCanceled)
+			return nil, ctx.Err()
+		}
+		close(secondStarted)
 		credential := *input.Credential
 		credential.AccessToken = "background-token"
 		credential.LifecycleState = chatgptwebauth.LifecycleActive
@@ -717,6 +833,9 @@ func TestChatGPTWebExecutorCanceledFirstReloginWaiterDoesNotCancelBackground(t *
 	}
 	executor := NewChatGPTWebExecutor(&config.Config{ChatGPTWeb: config.ChatGPTWebConfig{AutoRelogin: true}}, manager)
 	executor.authService = fake
+	executor.reloginBackoff = func(int) time.Duration { return 0 }
+	executor.reloginSlots = make(chan struct{}, 1)
+	executor.reloginSlots <- struct{}{}
 	defer func() {
 		if errClose := executor.Close(); errClose != nil {
 			t.Errorf("Close() error = %v", errClose)
@@ -729,8 +848,12 @@ func TestChatGPTWebExecutorCanceledFirstReloginWaiterDoesNotCancelBackground(t *
 		_, _, errRelogin := executor.ReloginCurrent(ctx, expected)
 		manualDone <- errRelogin
 	}()
-	<-started
-	executor.TriggerBackgroundRelogin(expected)
+	<-firstStarted
+	backgroundDone := make(chan struct{})
+	go func() {
+		executor.runBackgroundRelogin(expected)
+		close(backgroundDone)
+	}()
 	waitForChatGPTWebReloginWaiters(t, executor, expected, 2)
 	cancel()
 	select {
@@ -742,13 +865,29 @@ func TestChatGPTWebExecutorCanceledFirstReloginWaiterDoesNotCancelBackground(t *
 		t.Fatal("canceled manual ReloginCurrent() did not return")
 	}
 
-	close(release)
+	<-firstCanceled
+	select {
+	case <-secondStarted:
+		t.Fatal("background retry bypassed the full background slot limit")
+	case <-time.After(50 * time.Millisecond):
+	}
+	<-executor.reloginSlots
+	select {
+	case <-secondStarted:
+	case <-time.After(time.Second):
+		t.Fatal("background retry did not start after a slot became available")
+	}
+	select {
+	case <-backgroundDone:
+	case <-time.After(time.Second):
+		t.Fatal("background retry did not finish")
+	}
 	waitForChatGPTWebCondition(t, time.Second, func() bool {
 		current, ok := manager.GetByID(expected.ID)
 		return ok && current.LifecycleState() == cliproxyauth.LifecycleStateActive
 	})
-	if got := fake.loginCalls.Load(); got != 1 {
-		t.Fatalf("login calls = %d, want 1", got)
+	if got := fake.loginCalls.Load(); got != 2 {
+		t.Fatalf("login calls = %d, want 2", got)
 	}
 }
 
@@ -958,6 +1097,62 @@ func TestChatGPTWebExecutorBackgroundReloginContinuesUntilSuccess(t *testing.T) 
 	if got := fake.loginCalls.Load(); got != 4 {
 		t.Fatalf("login calls = %d, want 4", got)
 	}
+}
+
+func TestChatGPTWebExecutorBackgroundReloginAllowsNewInstallationAfterSupersededFlight(t *testing.T) {
+	manager := cliproxyauth.NewManager(nil, nil, nil)
+	expected := registerChatGPTWebPendingAuth(t, manager, "superseded-background")
+	firstStarted := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	fake := &fakeChatGPTWebAuthService{}
+	fake.loginFn = func(_ context.Context, input chatgptwebauth.LoginInput) (*chatgptwebauth.Credential, error) {
+		if fake.loginCalls.Load() == 1 {
+			close(firstStarted)
+			<-releaseFirst
+		}
+		credential := input.Credential
+		credential.AccessToken = "relogin-token-1"
+		if fake.loginCalls.Load() == 2 {
+			credential.AccessToken = "relogin-token-2"
+		}
+		credential.LifecycleState = chatgptwebauth.LifecycleActive
+		return credential, nil
+	}
+	executor := NewChatGPTWebExecutor(&config.Config{ChatGPTWeb: config.ChatGPTWebConfig{AutoRelogin: true}}, manager)
+	executor.authService = fake
+	t.Cleanup(func() { _ = executor.Close() })
+
+	executor.TriggerBackgroundRelogin(expected)
+	select {
+	case <-firstStarted:
+	case <-time.After(time.Second):
+		t.Fatal("first background re-login did not start")
+	}
+
+	replacement, ok := manager.GetByID(expected.ID)
+	if !ok {
+		t.Fatalf("auth %q not found", expected.ID)
+	}
+	if _, errUpdate := manager.Update(cliproxyauth.WithSkipPersist(t.Context()), replacement); errUpdate != nil {
+		t.Fatal(errUpdate)
+	}
+	current, ok := manager.GetByID(expected.ID)
+	if !ok {
+		t.Fatalf("replacement auth %q not found", expected.ID)
+	}
+	if current.RuntimeInstanceID() != expected.RuntimeInstanceID() {
+		t.Fatalf("test setup replaced runtime instance: got %q, want %q", current.RuntimeInstanceID(), expected.RuntimeInstanceID())
+	}
+
+	executor.TriggerBackgroundRelogin(current)
+	close(releaseFirst)
+	waitForChatGPTWebCondition(t, time.Second, func() bool {
+		return fake.loginCalls.Load() == 2
+	})
+	waitForChatGPTWebCondition(t, time.Second, func() bool {
+		installed, found := manager.GetByID(expected.ID)
+		return found && installed.LifecycleState() == cliproxyauth.LifecycleStateActive && installed.Metadata["access_token"] == "relogin-token-2"
+	})
 }
 
 func TestChatGPTWebExecutorBackgroundReloginStopsOnClose(t *testing.T) {
@@ -1367,6 +1562,68 @@ func TestChatGPTWebExecutorLoginCoordinatorSurvivesReplacement(t *testing.T) {
 	}
 }
 
+func TestChatGPTWebExecutorBackgroundReloginRechecksGenerationAfterAccountGate(t *testing.T) {
+	manager := cliproxyauth.NewManager(nil, nil, nil)
+	expected := registerChatGPTWebPendingAuth(t, manager, "queued-generation")
+	fake := &fakeChatGPTWebAuthService{}
+	fake.loginFn = func(context.Context, chatgptwebauth.LoginInput) (*chatgptwebauth.Credential, error) {
+		t.Fatal("superseded queued re-login must not reach the login service")
+		return nil, nil
+	}
+	executor := NewChatGPTWebExecutor(&config.Config{ChatGPTWeb: config.ChatGPTWebConfig{AutoRelogin: true}}, manager)
+	executor.authService = fake
+	t.Cleanup(func() { _ = executor.Close() })
+
+	email, _ := expected.Metadata["email"].(string)
+	_, releaseGate, errGate := executor.BeginLoginOperation(t.Context(), email)
+	if errGate != nil {
+		t.Fatal(errGate)
+	}
+	slotAcquired := make(chan struct{}, 1)
+	executor.reloginSlotAcquired = func() { slotAcquired <- struct{}{} }
+	type reloginResult struct {
+		auth    *cliproxyauth.Auth
+		current bool
+		err     error
+	}
+	done := make(chan reloginResult, 1)
+	go func() {
+		updated, current, errRelogin := executor.reloginCurrentWithMode(t.Context(), expected, true)
+		done <- reloginResult{auth: updated, current: current, err: errRelogin}
+	}()
+	waitForChatGPTWebCondition(t, time.Second, func() bool {
+		executor.loginCoordinator.mu.Lock()
+		defer executor.loginCoordinator.mu.Unlock()
+		gate := executor.loginCoordinator.gates[strings.ToLower(email)]
+		return gate != nil && gate.refs == 2
+	})
+	select {
+	case <-slotAcquired:
+		t.Fatal("queued re-login consumed a global slot before acquiring its account gate")
+	default:
+	}
+
+	for range 2 {
+		replacement, _ := manager.GetByID(expected.ID)
+		if _, errUpdate := manager.Update(cliproxyauth.WithSkipPersist(t.Context()), replacement); errUpdate != nil {
+			t.Fatal(errUpdate)
+		}
+	}
+	releaseGate()
+	result := <-done
+	if result.current || !errors.Is(result.err, chatgptwebauth.ErrCredentialSuperseded) {
+		t.Fatalf("queued re-login = (%v, %v, %v), want superseded", result.auth, result.current, result.err)
+	}
+	if got := fake.loginCalls.Load(); got != 0 {
+		t.Fatalf("login calls = %d, want 0", got)
+	}
+	select {
+	case <-slotAcquired:
+		t.Fatal("superseded queued re-login consumed a global slot")
+	default:
+	}
+}
+
 func TestChatGPTWebExecutorReloginUsesConditionalUpdate(t *testing.T) {
 	manager := cliproxyauth.NewManager(nil, nil, nil)
 	auth := chatGPTWebTestAuth("relogin")
@@ -1535,7 +1792,7 @@ func registerChatGPTWebPendingAuth(t *testing.T, manager *cliproxyauth.Manager, 
 
 func waitForChatGPTWebReloginWaiters(t *testing.T, executor *ChatGPTWebExecutor, auth *cliproxyauth.Auth, want int) {
 	t.Helper()
-	key := chatGPTWebOperationKey(auth)
+	key := chatGPTWebReloginGenerationKey(auth)
 	waitForChatGPTWebCondition(t, time.Second, func() bool {
 		executor.reloginMu.Lock()
 		defer executor.reloginMu.Unlock()

@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -449,6 +450,114 @@ func TestPutProxyURLPreservesMaskedPassword(t *testing.T) {
 	}
 	if cfg.ProxyURL != "http://user:********@proxy.example:8080" {
 		t.Fatalf("explicit replacement ProxyURL = %q", cfg.ProxyURL)
+	}
+}
+
+func TestPutProxyURLPreservesMaskedUsernameOnlyCredential(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	const rawProxyURL = "http://session-token@proxy.example:8080"
+	if errWrite := os.WriteFile(configPath, []byte("proxy-url: "+rawProxyURL+"\n"), 0o600); errWrite != nil {
+		t.Fatalf("write config: %v", errWrite)
+	}
+	cfg := &config.Config{SDKConfig: config.SDKConfig{ProxyURL: rawProxyURL}}
+	h := NewHandler(cfg, configPath, nil)
+
+	getRecorder := httptest.NewRecorder()
+	getContext, _ := gin.CreateTestContext(getRecorder)
+	getContext.Request = httptest.NewRequest(http.MethodGet, "/proxy-url", nil)
+	h.GetProxyURL(getContext)
+	if getRecorder.Code != http.StatusOK {
+		t.Fatalf("GET status = %d; body=%s", getRecorder.Code, getRecorder.Body.String())
+	}
+	var response struct {
+		ProxyURL string `json:"proxy-url"`
+	}
+	if errDecode := json.Unmarshal(getRecorder.Body.Bytes(), &response); errDecode != nil {
+		t.Fatalf("decode response: %v", errDecode)
+	}
+
+	putRecorder := httptest.NewRecorder()
+	putContext, _ := gin.CreateTestContext(putRecorder)
+	putContext.Request = httptest.NewRequest(http.MethodPut, "/proxy-url", strings.NewReader(`{"value":`+strconv.Quote(response.ProxyURL)+`}`))
+	putContext.Request.Header.Set("Content-Type", "application/json")
+	h.PutProxyURL(putContext)
+	if putRecorder.Code != http.StatusOK {
+		t.Fatalf("PUT status = %d; body=%s", putRecorder.Code, putRecorder.Body.String())
+	}
+	if cfg.ProxyURL != rawProxyURL {
+		t.Fatalf("ProxyURL = %q, want original username-only credential", cfg.ProxyURL)
+	}
+	contents, errRead := os.ReadFile(configPath)
+	if errRead != nil {
+		t.Fatalf("read config: %v", errRead)
+	}
+	if !strings.Contains(string(contents), "session-token") || strings.Contains(string(contents), "********") {
+		t.Fatalf("persisted config replaced username-only credential: %s", contents)
+	}
+}
+
+func TestPutProxyURLPreservesMaskedMalformedCredential(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	const rawProxyURL = "http:/user:secret@proxy.example:8080"
+	if errWrite := os.WriteFile(configPath, []byte("proxy-url: "+rawProxyURL+"\n"), 0o600); errWrite != nil {
+		t.Fatalf("write config: %v", errWrite)
+	}
+	cfg := &config.Config{SDKConfig: config.SDKConfig{ProxyURL: rawProxyURL}}
+	h := NewHandler(cfg, configPath, nil)
+
+	getRecorder := httptest.NewRecorder()
+	getContext, _ := gin.CreateTestContext(getRecorder)
+	getContext.Request = httptest.NewRequest(http.MethodGet, "/proxy-url", nil)
+	h.GetProxyURL(getContext)
+	var response struct {
+		ProxyURL string `json:"proxy-url"`
+	}
+	if getRecorder.Code != http.StatusOK || json.Unmarshal(getRecorder.Body.Bytes(), &response) != nil {
+		t.Fatalf("GET status/body = %d/%s", getRecorder.Code, getRecorder.Body.String())
+	}
+
+	putRecorder := httptest.NewRecorder()
+	putContext, _ := gin.CreateTestContext(putRecorder)
+	putContext.Request = httptest.NewRequest(http.MethodPut, "/proxy-url", strings.NewReader(`{"value":`+strconv.Quote(response.ProxyURL)+`}`))
+	putContext.Request.Header.Set("Content-Type", "application/json")
+	h.PutProxyURL(putContext)
+	if putRecorder.Code != http.StatusOK || cfg.ProxyURL != rawProxyURL {
+		t.Fatalf("PUT status/proxy = %d/%q, want original malformed credential", putRecorder.Code, cfg.ProxyURL)
+	}
+}
+
+func TestProxyPoolPatchPreservesMaskedUsernameOnlyCredential(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	const rawProxyURL = "http://tenant-secret-{8}@proxy.example:8080"
+	cfg := &config.Config{SDKConfig: config.SDKConfig{ProxyPools: []config.ProxyPoolConfig{{
+		Name: "residential",
+		Entries: []config.ProxyPoolEntryConfig{{
+			ID:          "node",
+			URLTemplate: rawProxyURL,
+		}},
+	}}}}
+	if errWrite := os.WriteFile(configPath, []byte("proxy-pools: []\n"), 0o600); errWrite != nil {
+		t.Fatalf("write config: %v", errWrite)
+	}
+	h := NewHandler(cfg, configPath, nil)
+	router := gin.New()
+	router.GET("/proxy-pools", h.GetProxyPools)
+	router.PATCH("/proxy-pools/:name", h.PatchProxyPool)
+
+	get := performProxyConfigRequest(router, http.MethodGet, "/proxy-pools", "")
+	var body struct {
+		Pools []config.ProxyPoolConfig `json:"proxy-pools"`
+	}
+	if errDecode := json.Unmarshal(get.Body.Bytes(), &body); errDecode != nil {
+		t.Fatalf("decode proxy pools: %v", errDecode)
+	}
+	masked := body.Pools[0].Entries[0].URLTemplate
+	patch := performProxyConfigRequest(router, http.MethodPatch, "/proxy-pools/residential", `{"entries":[{"id":"node","url-template":`+strconv.Quote(masked)+`}]} `)
+	if patch.Code != http.StatusOK {
+		t.Fatalf("PATCH status = %d; body=%s", patch.Code, patch.Body.String())
+	}
+	if got := cfg.ProxyPools[0].Entries[0].URLTemplate; got != rawProxyURL {
+		t.Fatalf("URLTemplate = %q, want original username-only credential", got)
 	}
 }
 

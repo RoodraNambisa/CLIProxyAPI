@@ -28,6 +28,9 @@ type loginFixture struct {
 	authorizeRedirect      bool
 	passwordPageRedirect   bool
 	passwordRedirect       bool
+	passwordRedirectURL    string
+	passwordRedirectStatus int
+	passwordRedirectMethod string
 	tokenCalls             int
 	mfaVerifyCalls         int
 	mfaStatus              int
@@ -65,6 +68,8 @@ func (fixture *loginFixture) serveHTTP(response http.ResponseWriter, request *ht
 		}
 		response.Header().Set("Content-Type", "text/html")
 		_, _ = io.WriteString(response, "password")
+	case "/password-redirect":
+		fixture.handlePasswordRedirect(response, request)
 	case "/auth/callback":
 		_, _ = io.WriteString(response, "callback")
 	case "/api/accounts/password/verify":
@@ -77,6 +82,26 @@ func (fixture *loginFixture) serveHTTP(response http.ResponseWriter, request *ht
 		fixture.t.Errorf("unexpected request: %s %s", request.Method, request.URL.String())
 		http.NotFound(response, request)
 	}
+}
+
+func (fixture *loginFixture) handlePasswordRedirect(response http.ResponseWriter, request *http.Request) {
+	if request.Method != fixture.passwordRedirectMethod {
+		fixture.t.Errorf("password redirect method = %s, want %s", request.Method, fixture.passwordRedirectMethod)
+	}
+	if request.Method == http.MethodPost {
+		if request.Header.Get("OpenAI-Sentinel-Token") == "" {
+			fixture.t.Error("same-origin password replay omitted sentinel token")
+		}
+		var body map[string]string
+		if err := json.NewDecoder(request.Body).Decode(&body); err != nil {
+			fixture.t.Errorf("decode replayed password: %v", err)
+		} else if body["password"] != "correct-password" {
+			fixture.t.Error("same-origin password replay changed password")
+		}
+	} else if request.Header.Get("OpenAI-Sentinel-Token") != "" {
+		fixture.t.Error("GET password redirect leaked sentinel token")
+	}
+	http.Redirect(response, request, fixture.callbackURL(), http.StatusFound)
 }
 
 func (fixture *loginFixture) handleAuthorize(response http.ResponseWriter, request *http.Request) {
@@ -168,6 +193,11 @@ func (fixture *loginFixture) handlePassword(response http.ResponseWriter, reques
 	}
 	if fixture.passwordRedirect {
 		http.Redirect(response, request, fixture.callbackURL(), http.StatusFound)
+		return
+	}
+	if fixture.passwordRedirectURL != "" {
+		response.Header().Set("Location", fixture.passwordRedirectURL)
+		response.WriteHeader(fixture.passwordRedirectStatus)
 		return
 	}
 	response.Header().Set("Content-Type", "application/json")
@@ -341,6 +371,79 @@ func TestServiceLoginCapturesFollowedOAuthCallbacks(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			fixture := newLoginFixture(t, http.StatusOK, "")
 			test.configure(fixture)
+			service := NewService(fixture.options(time.Date(2026, time.July, 16, 12, 0, 0, 0, time.UTC)))
+			credential, err := service.Login(t.Context(), LoginInput{
+				Email:    "person@example.com",
+				Password: "correct-password",
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if credential.LifecycleState != LifecycleActive || credential.RefreshToken != "refresh-token" {
+				t.Fatalf("credential = state %q refresh token %q", credential.LifecycleState, credential.RefreshToken)
+			}
+		})
+	}
+}
+
+func TestServiceLoginDoesNotReplayPasswordAcrossOrigins(t *testing.T) {
+	for _, status := range []int{http.StatusTemporaryRedirect, http.StatusPermanentRedirect} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			redirected := make(chan struct {
+				body          string
+				sentinelToken string
+			}, 1)
+			target := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+				payload, _ := io.ReadAll(request.Body)
+				redirected <- struct {
+					body          string
+					sentinelToken string
+				}{body: string(payload), sentinelToken: request.Header.Get("OpenAI-Sentinel-Token")}
+				response.WriteHeader(http.StatusNoContent)
+			}))
+			defer target.Close()
+
+			fixture := newLoginFixture(t, http.StatusOK, "")
+			fixture.passwordRedirectURL = target.URL + "/capture"
+			fixture.passwordRedirectStatus = status
+			service := NewService(fixture.options(time.Date(2026, time.July, 16, 12, 0, 0, 0, time.UTC)))
+			_, err := service.Login(t.Context(), LoginInput{
+				Email:    "person@example.com",
+				Password: "correct-password",
+			})
+			if err == nil {
+				t.Fatal("Login() succeeded after an untrusted password redirect")
+			}
+			authError, ok := AsAuthError(err)
+			if !ok || authError.Code != "oauth_redirect_untrusted" || authError.LifecycleState != LifecycleInteractionRequired {
+				t.Fatalf("Login() error = %#v, want oauth_redirect_untrusted interaction_required", err)
+			}
+
+			select {
+			case request := <-redirected:
+				t.Fatalf("cross-origin target received password request: body %q, sentinel token %q", request.body, request.sentinelToken)
+			default:
+			}
+		})
+	}
+}
+
+func TestServiceLoginFollowsSafePasswordRedirects(t *testing.T) {
+	for _, test := range []struct {
+		status int
+		method string
+	}{
+		{status: http.StatusMovedPermanently, method: http.MethodGet},
+		{status: http.StatusFound, method: http.MethodGet},
+		{status: http.StatusSeeOther, method: http.MethodGet},
+		{status: http.StatusTemporaryRedirect, method: http.MethodPost},
+		{status: http.StatusPermanentRedirect, method: http.MethodPost},
+	} {
+		t.Run(http.StatusText(test.status), func(t *testing.T) {
+			fixture := newLoginFixture(t, http.StatusOK, "")
+			fixture.passwordRedirectURL = fixture.server.URL + "/password-redirect"
+			fixture.passwordRedirectStatus = test.status
+			fixture.passwordRedirectMethod = test.method
 			service := NewService(fixture.options(time.Date(2026, time.July, 16, 12, 0, 0, 0, time.UTC)))
 			credential, err := service.Login(t.Context(), LoginInput{
 				Email:    "person@example.com",
@@ -689,11 +792,47 @@ func TestClassifyOAuthContinuationURL(t *testing.T) {
 	if authError := classifyOAuthContinuationURL(authBaseURL+"/authorize/resume", authBaseURL); authError != nil {
 		t.Fatalf("trusted continuation = %#v", authError)
 	}
+	for _, trusted := range []string{
+		"https://auth.openai.com:443/authorize/resume",
+		"https://AUTH.OPENAI.COM/authorize/resume",
+	} {
+		if authError := classifyOAuthContinuationURL(trusted, authBaseURL); authError != nil {
+			t.Fatalf("default-port continuation %q = %#v", trusted, authError)
+		}
+	}
 	if authError := classifyOAuthContinuationURL(authBaseURL+"/email-verification", authBaseURL); authError == nil || authError.Code != "email_otp_required" {
 		t.Fatalf("interaction continuation = %#v", authError)
 	}
-	if authError := classifyOAuthContinuationURL("https://attacker.example/continue", authBaseURL); authError == nil || authError.Code != "oauth_redirect_untrusted" {
-		t.Fatalf("untrusted continuation = %#v", authError)
+	for _, untrusted := range []string{
+		"https://attacker.example/continue",
+		"https://auth.openai.com:444/continue",
+		"http://auth.openai.com/continue",
+	} {
+		if authError := classifyOAuthContinuationURL(untrusted, authBaseURL); authError == nil || authError.Code != "oauth_redirect_untrusted" {
+			t.Fatalf("untrusted continuation %q = %#v", untrusted, authError)
+		}
+	}
+}
+
+func TestSameOAuthEndpointNormalizesDefaultPorts(t *testing.T) {
+	for _, test := range []struct {
+		candidate string
+		expected  string
+		want      bool
+	}{
+		{candidate: "https://auth.openai.com:443/callback", expected: "https://auth.openai.com/callback", want: true},
+		{candidate: "http://localhost:80/callback", expected: "http://localhost/callback", want: true},
+		{candidate: "https://auth.openai.com:444/callback", expected: "https://auth.openai.com/callback", want: false},
+		{candidate: "custom://auth.openai.com/callback", expected: "custom://auth.openai.com/callback", want: false},
+	} {
+		candidate, errCandidate := url.Parse(test.candidate)
+		expected, errExpected := url.Parse(test.expected)
+		if errCandidate != nil || errExpected != nil {
+			t.Fatalf("parse endpoints: %v %v", errCandidate, errExpected)
+		}
+		if got := sameOAuthEndpoint(candidate, expected); got != test.want {
+			t.Fatalf("sameOAuthEndpoint(%q, %q) = %t, want %t", test.candidate, test.expected, got, test.want)
+		}
 	}
 }
 

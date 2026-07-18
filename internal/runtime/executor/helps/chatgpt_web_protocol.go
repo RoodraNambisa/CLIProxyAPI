@@ -111,13 +111,14 @@ type ChatGPTWebMessage struct {
 // ChatGPTWebImageRequest describes an image_generation request embedded in a
 // canonical Responses payload.
 type ChatGPTWebImageRequest struct {
-	Prompt       string
-	Images       []string
-	MaskURL      string
-	Size         string
-	Quality      string
-	Action       string
-	OutputFormat string
+	Prompt         string
+	Images         []string
+	MaskURL        string
+	MaskImageIndex int
+	Size           string
+	Quality        string
+	Action         string
+	OutputFormat   string
 }
 
 // ChatGPTWebRequest is the subset of canonical Responses understood by the
@@ -842,16 +843,19 @@ func imageURLFromAny(value any) string {
 
 func imageRequestFromMessages(messages []ChatGPTWebMessage, tool map[string]any) (*ChatGPTWebImageRequest, error) {
 	request := &ChatGPTWebImageRequest{
-		Size:         strings.TrimSpace(stringFromAny(tool["size"])),
-		Quality:      strings.TrimSpace(stringFromAny(tool["quality"])),
-		Action:       strings.ToLower(strings.TrimSpace(stringFromAny(tool["action"]))),
-		OutputFormat: strings.ToLower(strings.TrimSpace(stringFromAny(tool["output_format"]))),
+		Size:           strings.TrimSpace(stringFromAny(tool["size"])),
+		Quality:        strings.TrimSpace(stringFromAny(tool["quality"])),
+		Action:         strings.ToLower(strings.TrimSpace(stringFromAny(tool["action"]))),
+		OutputFormat:   strings.ToLower(strings.TrimSpace(stringFromAny(tool["output_format"]))),
+		MaskImageIndex: -1,
 	}
 	if mask, ok := tool["input_image_mask"].(map[string]any); ok {
 		request.MaskURL = imageURLFromAny(mask["image_url"])
 	}
 	var instructions []string
-	var text []string
+	var currentText []string
+	var transcript []string
+	hasHistoricalText := false
 	lastUserIndex := -1
 	for index := range messages {
 		if strings.EqualFold(strings.TrimSpace(messages[index].Role), "user") {
@@ -860,26 +864,53 @@ func imageRequestFromMessages(messages []ChatGPTWebMessage, tool map[string]any)
 	}
 	for index, message := range messages {
 		role := strings.ToLower(strings.TrimSpace(message.Role))
-		if role != "developer" && role != "system" && index != lastUserIndex {
+		if role != "developer" && role != "system" && role != "user" && role != "assistant" {
 			continue
 		}
+		messageText := make([]string, 0, len(message.Parts))
 		for _, part := range message.Parts {
 			if strings.TrimSpace(part.Text) != "" {
 				if role == "developer" || role == "system" {
 					instructions = append(instructions, strings.TrimSpace(part.Text))
 				} else {
-					text = append(text, strings.TrimSpace(part.Text))
+					messageText = append(messageText, strings.TrimSpace(part.Text))
+					if index == lastUserIndex {
+						currentText = append(currentText, strings.TrimSpace(part.Text))
+					}
 				}
 			}
-			if index == lastUserIndex && strings.TrimSpace(part.ImageURL) != "" {
+			if (role == "user" || role == "assistant") && strings.TrimSpace(part.ImageURL) != "" {
+				if index == lastUserIndex && request.MaskImageIndex < 0 {
+					request.MaskImageIndex = len(request.Images)
+				}
 				request.Images = append(request.Images, strings.TrimSpace(part.ImageURL))
 			}
 		}
+		if len(messageText) > 0 && (role == "user" || role == "assistant") {
+			transcript = append(transcript, strings.ToUpper(role[:1])+role[1:]+": "+strings.Join(messageText, "\n"))
+			if index != lastUserIndex {
+				hasHistoricalText = true
+			}
+		}
 	}
-	promptParts := make([]string, 0, len(instructions)+len(text))
-	promptParts = append(promptParts, instructions...)
-	promptParts = append(promptParts, text...)
-	request.Prompt = strings.Join(promptParts, "\n\n")
+	if request.MaskImageIndex < 0 {
+		request.MaskImageIndex = 0
+	}
+	if hasHistoricalText {
+		promptSections := make([]string, 0, 2)
+		if len(instructions) > 0 {
+			promptSections = append(promptSections, "Instructions:\n"+strings.Join(instructions, "\n\n"))
+		}
+		if len(transcript) > 0 {
+			promptSections = append(promptSections, "Transcript:\n"+strings.Join(transcript, "\n"))
+		}
+		request.Prompt = strings.Join(promptSections, "\n\n")
+	} else {
+		promptParts := make([]string, 0, len(instructions)+len(currentText))
+		promptParts = append(promptParts, instructions...)
+		promptParts = append(promptParts, currentText...)
+		request.Prompt = strings.Join(promptParts, "\n\n")
+	}
 	if request.Action == "" || request.Action == "auto" {
 		if len(request.Images) > 0 {
 			request.Action = "edit"

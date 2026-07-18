@@ -18,15 +18,28 @@ import (
 )
 
 const (
-	rootLockFileName    = ".auth-root-lock"
-	targetLockPrefix    = ".auth-lock-"
-	targetLockHexLength = 32
-	lockRetryInterval   = 10 * time.Millisecond
+	rootLockFileName            = ".auth-root-lock"
+	rootWriterTurnstileFileName = ".auth-lock-root-turnstile"
+	targetLockPrefix            = ".auth-lock-"
+	targetLockHexLength         = 32
+	lockRetryInterval           = 10 * time.Millisecond
 )
 
 // ErrAtomicExchangeUnsupported reports that the current platform or
 // filesystem cannot atomically swap two auth file generations.
 var ErrAtomicExchangeUnsupported = errors.New("auth file guard: atomic file exchange is unsupported")
+
+// ErrExchangeOutcomeUncertain reports that a rename fallback changed the
+// target but could not confirm that the previous generation was restored.
+var ErrExchangeOutcomeUncertain = errors.New("auth file guard: exchange outcome is uncertain")
+
+// ErrExchangeRestoreFailed reports that a rename fallback could not restore
+// the displaced target after a rename failure.
+var ErrExchangeRestoreFailed = errors.New("auth file guard: exchange restore failed")
+
+// ErrExchangeCleanupRequired reports that a recoverable fallback left an
+// extra displaced generation which must not be discarded implicitly.
+var ErrExchangeCleanupRequired = errors.New("auth file guard: exchange cleanup is required")
 
 // ErrStagedFileCleanupRequired marks a successful no-replace installation
 // whose original staged path still needs removal.
@@ -78,7 +91,7 @@ func isPersistentLockFileName(name string, caseInsensitive bool) bool {
 	if caseInsensitive {
 		name = normalizeTargetLockKey(name, true)
 	}
-	if name == rootLockFileName {
+	if name == rootLockFileName || name == rootWriterTurnstileFileName {
 		return true
 	}
 	if len(name) != len(targetLockPrefix)+targetLockHexLength || !strings.HasPrefix(name, targetLockPrefix) {
@@ -122,8 +135,11 @@ func InstallStagedFileNoReplace(root *os.Root, stagedPath, targetPath string) (c
 	})
 }
 
-// ExchangeStagedFile atomically installs stagedPath at targetPath while
-// keeping the previous target generation at the returned root-relative path.
+// ExchangeStagedFile installs stagedPath at targetPath while keeping the
+// previous target generation at the returned root-relative path. It uses an
+// atomic exchange when available and a recoverable rename sequence otherwise.
+// The caller must hold the target's LockRootTarget lock until the transaction
+// is committed or restored.
 func ExchangeStagedFile(root *os.Root, stagedPath, targetPath string) (displacedPath string, err error) {
 	if root == nil {
 		return "", errors.New("auth file guard: root is nil")
@@ -270,20 +286,53 @@ func lockRoot(ctx context.Context, root *os.Root, exclusive bool) (unlock func()
 	if root == nil {
 		return nil, errors.New("auth file guard: root is nil")
 	}
+	rebuild := exclusive
 	if serializeRootMutationLocks {
 		exclusive = true
 	}
-	return lockPersistentFile(ctx, root, rootLockFileName, exclusive)
+	// Rebuilds publish shared writer intent while waiting for the root lock.
+	// Mutations take intent exclusively only until their shared root lock is
+	// acquired, so published intent stops new mutations while readers drain.
+	processExclusive, fileExclusive := rootWriterTurnstileModes(rebuild)
+	unlockTurnstile, errTurnstile := lockPersistentFileModes(
+		ctx,
+		root,
+		rootWriterTurnstileFileName,
+		processExclusive,
+		fileExclusive,
+	)
+	if errTurnstile != nil {
+		return nil, fmt.Errorf("auth file guard: lock root writer turnstile: %w", errTurnstile)
+	}
+	unlockRoot, errRoot := lockPersistentFile(ctx, root, rootLockFileName, exclusive)
+	if errRoot != nil {
+		return nil, errors.Join(errRoot, unlockTurnstile())
+	}
+	if errUnlockTurnstile := unlockTurnstile(); errUnlockTurnstile != nil {
+		return nil, errors.Join(
+			fmt.Errorf("auth file guard: unlock root writer turnstile: %w", errUnlockTurnstile),
+			unlockRoot(),
+		)
+	}
+	return unlockRoot, nil
+}
+
+func rootWriterTurnstileModes(rebuild bool) (processExclusive, fileExclusive bool) {
+	return rebuild || serializeRootMutationLocks, !rebuild
 }
 
 func lockPersistentFile(ctx context.Context, root *os.Root, lockPath string, exclusive bool) (unlock func() error, err error) {
+	return lockPersistentFileModes(ctx, root, lockPath, exclusive, exclusive)
+}
+
+func lockPersistentFileModes(ctx context.Context, root *os.Root, lockPath string, processExclusive, fileExclusive bool) (unlock func() error, err error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	if errContext := ctx.Err(); errContext != nil {
 		return nil, errContext
 	}
-	unlockProcess, errProcess := lockPersistentProcess(ctx, root, lockPath, exclusive)
+	unlockProcess, errProcess := lockPersistentProcess(ctx, root, lockPath, processExclusive)
 	if errProcess != nil {
 		return nil, errProcess
 	}
@@ -308,7 +357,7 @@ func lockPersistentFile(ctx context.Context, root *os.Root, lockPath string, exc
 			return nil, closeBeforeProcessUnlock(errContext)
 		}
 		var acquired bool
-		unlockFile, acquired, err = tryAcquirePersistentFileLock(file, exclusive)
+		unlockFile, acquired, err = tryAcquirePersistentFileLock(file, fileExclusive)
 		if err != nil {
 			return nil, closeBeforeProcessUnlock(err)
 		}

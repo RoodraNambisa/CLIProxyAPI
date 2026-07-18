@@ -70,6 +70,13 @@ func (generator *SentinelGenerator) GenerateRequirementsToken() (string, error) 
 }
 
 func (generator *SentinelGenerator) GenerateProof(seed, difficulty string) (string, error) {
+	return generator.GenerateProofContext(context.Background(), seed, difficulty)
+}
+
+func (generator *SentinelGenerator) GenerateProofContext(ctx context.Context, seed, difficulty string) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 	startedAt := generator.now()
 	configuration, err := generator.configuration()
 	if err != nil {
@@ -80,6 +87,9 @@ func (generator *SentinelGenerator) GenerateProof(seed, difficulty string) (stri
 		difficulty = "0"
 	}
 	for attempt := 0; attempt < generator.maxAttempts; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
 		configuration[3] = attempt
 		configuration[9] = math.RoundToEven(float64(generator.now().Sub(startedAt).Microseconds()) / 1000)
 		payload, err := base64JSON(configuration)
@@ -287,11 +297,14 @@ func (sentinel *Sentinel) Token(ctx context.Context, flow string) (string, error
 		if seed == "" {
 			return "", newAuthError("sentinel_pow_invalid", LifecycleLoginPending, response.StatusCode, true, false, "sentinel proof-of-work seed is missing", nil)
 		}
-		proof, err = sentinel.generator.GenerateProof(seed, stringValue(proofOfWork["difficulty"]))
+		proof, err = sentinel.generator.GenerateProofContext(ctx, seed, stringValue(proofOfWork["difficulty"]))
 	} else {
 		proof, err = sentinel.generator.GenerateRequirementsToken()
 	}
 	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return "", ctxErr
+		}
 		return "", newAuthError("sentinel_generation_failed", LifecycleLoginPending, response.StatusCode, false, true, err.Error(), err)
 	}
 	headerValue, err := json.Marshal(map[string]any{

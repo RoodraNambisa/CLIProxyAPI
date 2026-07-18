@@ -2,6 +2,24 @@ package auth
 
 import "testing"
 
+func TestRuntimeInstallationID(t *testing.T) {
+	var nilAuth *Auth
+	if got := nilAuth.RuntimeInstallationID(); got != "" {
+		t.Fatalf("nil RuntimeInstallationID() = %q, want empty", got)
+	}
+
+	auth := &Auth{installationID: "installation-1"}
+	if got := auth.RuntimeInstallationID(); got != "installation-1" {
+		t.Fatalf("RuntimeInstallationID() = %q, want installation-1", got)
+	}
+	if got := auth.Clone().RuntimeInstallationID(); got != "installation-1" {
+		t.Fatalf("clone RuntimeInstallationID() = %q, want installation-1", got)
+	}
+	if got := auth.CloneWithoutRuntimeInstance().RuntimeInstallationID(); got != "" {
+		t.Fatalf("runtime-free clone RuntimeInstallationID() = %q, want empty", got)
+	}
+}
+
 func TestToolPrefixDisabled(t *testing.T) {
 	var a *Auth
 	if a.ToolPrefixDisabled() {

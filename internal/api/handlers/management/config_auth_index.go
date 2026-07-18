@@ -242,10 +242,7 @@ func (h *Handler) openAICompatibilityWithAuthIndex() []openAICompatibilityWithAu
 	idGen := synthesizer.NewStableIDGenerator()
 	for i := range normalized {
 		entry := normalized[i]
-		providerName := strings.ToLower(strings.TrimSpace(entry.Name))
-		if providerName == "" {
-			providerName = "openai-compatibility"
-		}
+		providerName := synthesizer.OpenAICompatRuntimeProviderName(entry.Name)
 		idKind := fmt.Sprintf("openai-compatibility:%s", providerName)
 
 		response := openAICompatibilityWithAuthIndex{
@@ -259,17 +256,24 @@ func (h *Handler) openAICompatibilityWithAuthIndex() []openAICompatibilityWithAu
 			AuthIndex: "",
 		}
 		if len(entry.APIKeyEntries) == 0 {
-			id, _ := idGen.Next(idKind, entry.BaseURL)
-			response.AuthIndex = liveIndexByID[id]
+			if !entry.Disabled {
+				id, _ := idGen.Next(idKind, entry.BaseURL)
+				response.AuthIndex = liveIndexByID[id]
+			}
 		} else {
 			response.APIKeyEntries = make([]openAICompatibilityAPIKeyWithAuthIndex, len(entry.APIKeyEntries))
 			for j := range entry.APIKeyEntries {
 				apiKeyEntry := entry.APIKeyEntries[j]
-				id, _ := idGen.Next(idKind, apiKeyEntry.APIKey, entry.BaseURL, apiKeyEntry.ProxyURL)
+				rawProxyURL := apiKeyEntry.ProxyURL
 				apiKeyEntry.ProxyURL = proxyutil.MaskProxyURL(apiKeyEntry.ProxyURL)
+				authIndex := ""
+				if !entry.Disabled {
+					id, _ := idGen.Next(idKind, apiKeyEntry.APIKey, entry.BaseURL, rawProxyURL)
+					authIndex = liveIndexByID[id]
+				}
 				response.APIKeyEntries[j] = openAICompatibilityAPIKeyWithAuthIndex{
 					OpenAICompatibilityAPIKey: apiKeyEntry,
-					AuthIndex:                 liveIndexByID[id],
+					AuthIndex:                 authIndex,
 				}
 			}
 		}

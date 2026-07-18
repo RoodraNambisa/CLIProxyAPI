@@ -8,5 +8,13 @@ import (
 )
 
 func exchangeFile(root *os.Root, stagedName, targetName string) (string, error) {
-	return "", errors.Join(ErrAtomicExchangeUnsupported, errors.New("auth file guard: platform has no atomic file exchange primitive"))
+	displaced, errFallback := exchangeFileByRename(root, stagedName, targetName)
+	if errFallback != nil {
+		return displaced, errors.Join(
+			ErrAtomicExchangeUnsupported,
+			errors.New("auth file guard: platform has no atomic file exchange primitive"),
+			errFallback,
+		)
+	}
+	return displaced, nil
 }

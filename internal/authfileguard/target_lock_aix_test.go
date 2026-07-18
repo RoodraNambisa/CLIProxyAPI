@@ -12,6 +12,10 @@ func TestAIXSerializesRootMutationLocks(t *testing.T) {
 	if !serializeRootMutationLocks {
 		t.Fatal("AIX root mutations must use exclusive record locks")
 	}
+	processExclusive, fileExclusive := rootWriterTurnstileModes(false)
+	if !processExclusive || !fileExclusive {
+		t.Fatalf("AIX mutation turnstile modes = process %v, file %v; want both exclusive", processExclusive, fileExclusive)
+	}
 }
 
 func TestAIXPersistentLockIdentitySurvivesWorkingDirectoryChange(t *testing.T) {

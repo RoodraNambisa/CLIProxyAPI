@@ -773,6 +773,27 @@ func TestWriteAuthFileAtomicallyRollsBackDirectorySyncFailure(t *testing.T) {
 	}
 }
 
+func TestAuthExchangeRollbackConfirmedRequiresCertainCleanupFailure(t *testing.T) {
+	cleanupFailure := errors.Join(authfileguard.ErrExchangeCleanupRequired, errors.New("remove backup"))
+	if !authExchangeRollbackConfirmed(cleanupFailure) {
+		t.Fatal("confirmed cleanup failure was not classified as rolled back")
+	}
+	if authExchangeRollbackConfirmed(errors.Join(cleanupFailure, authfileguard.ErrExchangeOutcomeUncertain)) {
+		t.Fatal("uncertain cleanup failure was classified as rolled back")
+	}
+	explicitUncertain := cliproxyauth.NewSaveOutcomeError(cliproxyauth.SaveOutcomeUncertain, cleanupFailure)
+	if authExchangeRollbackConfirmed(explicitUncertain) {
+		t.Fatal("explicitly uncertain cleanup failure was classified as rolled back")
+	}
+	explicitRolledBack := cliproxyauth.NewSaveOutcomeError(cliproxyauth.SaveOutcomeRolledBack, cleanupFailure)
+	if !authExchangeRollbackConfirmed(explicitRolledBack) {
+		t.Fatal("explicitly rolled-back cleanup failure was not classified as rolled back")
+	}
+	if authExchangeRollbackConfirmed(errors.New("install failed")) {
+		t.Fatal("generic exchange failure was classified as rolled back")
+	}
+}
+
 func TestWriteAuthFileAtomicallyDetectsParentReplacementDuringDirectorySync(t *testing.T) {
 	rootDir := t.TempDir()
 	parentDir := filepath.Join(rootDir, "nested")

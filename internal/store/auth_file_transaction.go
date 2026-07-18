@@ -739,11 +739,22 @@ func writeAuthFileAtomicallyAtRootWithPolicyAndReceipt(ctx context.Context, root
 	} else if expected != nil {
 		var errExchange error
 		movedOriginal, errExchange = exchangeExpectedAuthSnapshot(parent, tempName, leaf, *expected, syncDirectory)
-		if movedOriginal != "" {
+		rollbackConfirmed := authExchangeRollbackConfirmed(errExchange)
+		if movedOriginal != "" && !rollbackConfirmed {
 			stagingOwned = false
 		}
 		if errExchange != nil {
-			if movedOriginal != "" {
+			if rollbackConfirmed {
+				errCleanup := discardMovedAuthSnapshot(parent, movedOriginal, syncDirectory)
+				return cliproxyauth.NewSaveOutcomeError(
+					cliproxyauth.SaveOutcomeRolledBack,
+					errors.Join(
+						fmt.Errorf("auth store: exchange auth file generation: %w", errExchange),
+						wrapOptionalError("auth store: remove linked previous auth generation", errCleanup),
+					),
+				)
+			}
+			if movedOriginal != "" || errors.Is(errExchange, authfileguard.ErrExchangeOutcomeUncertain) {
 				return cliproxyauth.NewSaveOutcomeError(
 					cliproxyauth.SaveOutcomeUncertain,
 					fmt.Errorf("auth store: exchange auth file generation: %w", errExchange),
@@ -831,6 +842,14 @@ func writeAuthFileAtomicallyAtRootWithPolicyAndReceipt(ctx context.Context, root
 		return cliproxyauth.NewSaveOutcomeError(cliproxyauth.SaveOutcomeCommitted, installCleanupWarning)
 	}
 	return nil
+}
+
+func authExchangeRollbackConfirmed(err error) bool {
+	if outcome, explicit := cliproxyauth.SaveOutcomeFromError(err); explicit {
+		return outcome == cliproxyauth.SaveOutcomeRolledBack
+	}
+	return errors.Is(err, authfileguard.ErrExchangeCleanupRequired) &&
+		!errors.Is(err, authfileguard.ErrExchangeOutcomeUncertain)
 }
 
 func joinAuthSaveCleanupError(resultErr, cleanupErr error, committed bool) error {

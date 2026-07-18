@@ -379,7 +379,7 @@ func cloneConfigWithMaskedProxyURLs(input *config.Config) (config.Config, error)
 }
 
 func isMaskedProxyURL(raw string) bool {
-	return strings.Contains(raw, ":********@")
+	return proxyutil.IsMaskedProxyURL(raw)
 }
 
 func containsMaskedProxySecret(pool config.ProxyPoolConfig) bool {

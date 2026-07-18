@@ -359,6 +359,15 @@ func (a *Auth) RuntimeInstanceID() string {
 	return a.instanceID
 }
 
+// RuntimeInstallationID returns the opaque identity shared by clones of one
+// installed auth generation.
+func (a *Auth) RuntimeInstallationID() string {
+	if a == nil {
+		return ""
+	}
+	return a.installationID
+}
+
 // RuntimeInstanceCleanupDone returns a channel that closes after a retired
 // runtime auth instance leaves cleanup quarantine. It remains open while the
 // instance is active.

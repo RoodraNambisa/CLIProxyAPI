@@ -50,6 +50,7 @@ func TestIsPersistentLockPath(t *testing.T) {
 		want bool
 	}{
 		{path: ".auth-root-lock", want: true},
+		{path: ".auth-lock-root-turnstile", want: true},
 		{path: "nested/.auth-root-lock", want: true},
 		{path: "nested/.auth-lock-0123456789abcdef0123456789abcdef", want: true},
 		{path: "nested/.auth-lock-short", want: false},
@@ -377,9 +378,100 @@ func TestRootMutationLocksShareAndBlockRebuild(t *testing.T) {
 	}
 }
 
+func TestRootRebuildKeepsSameProcessWriterPriority(t *testing.T) {
+	dir := t.TempDir()
+	initialRoot, errInitialRoot := os.OpenRoot(dir)
+	if errInitialRoot != nil {
+		t.Fatal(errInitialRoot)
+	}
+	defer initialRoot.Close()
+	rebuildRoot, errRebuildRoot := os.OpenRoot(dir)
+	if errRebuildRoot != nil {
+		t.Fatal(errRebuildRoot)
+	}
+	defer rebuildRoot.Close()
+	lateRoot, errLateRoot := os.OpenRoot(dir)
+	if errLateRoot != nil {
+		t.Fatal(errLateRoot)
+	}
+	defer lateRoot.Close()
+
+	unlockInitial, errInitial := LockRootMutation(initialRoot)
+	if errInitial != nil {
+		t.Fatal(errInitial)
+	}
+	initialLocked := true
+	defer func() {
+		if initialLocked {
+			_ = unlockInitial()
+		}
+	}()
+
+	type lockResult struct {
+		unlock func() error
+		err    error
+	}
+	rebuildResult := make(chan lockResult, 1)
+	go func() {
+		unlock, errLock := LockRootRebuild(rebuildRoot)
+		rebuildResult <- lockResult{unlock: unlock, err: errLock}
+	}()
+	waitForPersistentProcessWriter(t, rebuildRoot, rootWriterTurnstileFileName)
+
+	lateResult := make(chan lockResult, 1)
+	go func() {
+		unlock, errLock := LockRootMutation(lateRoot)
+		lateResult <- lockResult{unlock: unlock, err: errLock}
+	}()
+	waitForPersistentProcessReferences(t, lateRoot, rootWriterTurnstileFileName, 2)
+	if errUnlock := unlockInitial(); errUnlock != nil {
+		t.Fatal(errUnlock)
+	}
+	initialLocked = false
+
+	var unlockRebuild func() error
+	select {
+	case result := <-rebuildResult:
+		if result.err != nil {
+			t.Fatal(result.err)
+		}
+		unlockRebuild = result.unlock
+	case result := <-lateResult:
+		if result.unlock != nil {
+			_ = result.unlock()
+		}
+		t.Fatalf("late mutation acquired before waiting rebuild: %v", result.err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("waiting rebuild did not acquire")
+	}
+	select {
+	case result := <-lateResult:
+		if result.unlock != nil {
+			_ = result.unlock()
+		}
+		t.Fatalf("late mutation acquired while rebuild was held: %v", result.err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	if errUnlock := unlockRebuild(); errUnlock != nil {
+		t.Fatal(errUnlock)
+	}
+	select {
+	case result := <-lateResult:
+		if result.err != nil {
+			t.Fatal(result.err)
+		}
+		if errUnlock := result.unlock(); errUnlock != nil {
+			t.Fatal(errUnlock)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("late mutation did not acquire after rebuild released")
+	}
+}
+
 func TestIsPersistentLockFileName(t *testing.T) {
 	tests := map[string]bool{
-		".auth-root-lock": true,
+		".auth-root-lock":                             true,
+		".auth-lock-root-turnstile":                   true,
 		".auth-lock-0123456789abcdef0123456789abcdef": true,
 		".auth-lock-0123456789ABCDEF0123456789ABCDEF": runtime.GOOS == "darwin" || runtime.GOOS == "windows",
 		".auth-lock-0123456789abcdef":                 false,
@@ -394,9 +486,29 @@ func TestIsPersistentLockFileName(t *testing.T) {
 	}
 }
 
+func TestTargetLockDoesNotCreateRootWriterTurnstile(t *testing.T) {
+	root, errRoot := os.OpenRoot(t.TempDir())
+	if errRoot != nil {
+		t.Fatal(errRoot)
+	}
+	defer root.Close()
+
+	unlock, errLock := LockRootTarget(root, "auth.json")
+	if errLock != nil {
+		t.Fatal(errLock)
+	}
+	if errUnlock := unlock(); errUnlock != nil {
+		t.Fatal(errUnlock)
+	}
+	if _, errStat := root.Lstat(rootWriterTurnstileFileName); !errors.Is(errStat, fs.ErrNotExist) {
+		t.Fatalf("target lock created root writer turnstile: %v", errStat)
+	}
+}
+
 func TestIsPersistentLockFileNameNormalizesCaseInsensitiveAliases(t *testing.T) {
 	for _, name := range []string{
 		".AUTH-ROOT-LOCK",
+		".AUTH-LOCK-ROOT-TURNSTILE",
 		".AUTH-LOCK-0123456789ABCDEF0123456789ABCDEF",
 	} {
 		if !isPersistentLockFileName(name, true) {

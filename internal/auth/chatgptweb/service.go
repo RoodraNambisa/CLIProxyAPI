@@ -204,24 +204,36 @@ func (service *Service) Login(ctx context.Context, input LoginInput) (*Credentia
 	if err != nil {
 		return service.loginFailure(credential, input.Relogin, ensureAuthError(err, pendingState))
 	}
-	response, payload, err = client.DoJSON(acquisitionContext, true, http.MethodPost,
+	response, payload, err = client.DoJSON(acquisitionContext, false, http.MethodPost,
 		service.options.AuthBaseURL+"/api/accounts/password/verify",
 		service.apiHeaders(deviceID, service.options.AuthBaseURL+"/log-in/password", passwordSentinel),
 		map[string]string{"password": credential.Password})
 	if err != nil {
 		return service.loginFailure(credential, input.Relogin, networkAuthError("password_verify_network_error", pendingState, err))
 	}
+	var redirectCode string
+	response, payload, redirectCode, err = service.followPasswordRedirects(
+		acquisitionContext,
+		client,
+		response,
+		payload,
+		credential.Password,
+		deviceID,
+		passwordSentinel,
+		state,
+		pendingState,
+	)
+	if err != nil {
+		return service.loginFailure(credential, input.Relogin, ensureAuthError(err, pendingState))
+	}
+	if redirectCode != "" {
+		return service.finishLogin(acquisitionContext, client, credential, input.Relogin, redirectCode, pkce.CodeVerifier)
+	}
 	if authError := classifyHTTPResponse("password_verify", response.StatusCode, payload, pendingState); authError != nil {
 		return service.loginFailure(credential, input.Relogin, authError)
 	}
 	if authError := classifyPermanentAccountPayload(payload); authError != nil {
 		return service.loginFailure(credential, input.Relogin, authError)
-	}
-	if code, matched, callbackError := parseOAuthCallback(responseRequestURL(response), service.options.RedirectURL, state); matched {
-		if callbackError != nil {
-			return service.loginFailure(credential, input.Relogin, callbackError)
-		}
-		return service.finishLogin(acquisitionContext, client, credential, input.Relogin, code, pkce.CodeVerifier)
 	}
 	passwordEnvelope := parseAPIEnvelope(payload)
 	if isMFAChallenge(passwordEnvelope.PageType, passwordEnvelope.ContinueURL) {
@@ -457,6 +469,54 @@ func (service *Service) followOAuthCode(ctx context.Context, client *Client, sta
 		return "", newAuthError("authorization_completion_required", LifecycleInteractionRequired, response.StatusCode, false, true, "OAuth redirect did not reach the callback", nil)
 	}
 	return "", newAuthError("oauth_redirect_limit", transientState, 0, true, false, "OAuth redirect limit exceeded", nil)
+}
+
+func (service *Service) followPasswordRedirects(
+	ctx context.Context,
+	client *Client,
+	response *fhttp.Response,
+	payload []byte,
+	password, deviceID, sentinelToken, expectedState string,
+	transientState LifecycleState,
+) (*fhttp.Response, []byte, string, error) {
+	method := http.MethodPost
+	for redirects := 0; response != nil && isChatGPTWebRedirectStatus(response.StatusCode); redirects++ {
+		if redirects >= 10 {
+			return response, payload, "", newAuthError("oauth_redirect_limit", transientState, response.StatusCode, true, false, "OAuth redirect limit exceeded", nil)
+		}
+		currentURL := responseRequestURL(response)
+		location := strings.TrimSpace(response.Header.Get("Location"))
+		if location == "" {
+			return response, payload, "", newAuthError("authorization_completion_required", LifecycleInteractionRequired, response.StatusCode, false, true, "password redirect did not provide a destination", nil)
+		}
+		nextURL := resolveURL(currentURL, location)
+		if code, matched, callbackError := parseOAuthCallback(nextURL, service.options.RedirectURL, expectedState); matched {
+			if callbackError != nil {
+				return response, payload, "", callbackError
+			}
+			return response, payload, code, nil
+		}
+		if authError := classifyOAuthContinuationURL(nextURL, service.options.AuthBaseURL); authError != nil {
+			return response, payload, "", authError
+		}
+
+		if response.StatusCode != http.StatusTemporaryRedirect && response.StatusCode != http.StatusPermanentRedirect {
+			method = http.MethodGet
+		}
+		var err error
+		if method == http.MethodPost {
+			response, payload, err = client.DoJSON(ctx, false, http.MethodPost, nextURL,
+				service.apiHeaders(deviceID, currentURL, sentinelToken),
+				map[string]string{"password": password})
+		} else {
+			response, payload, err = client.DoNoRedirect(ctx, http.MethodGet, nextURL,
+				map[string]string{"referer": currentURL}, nil)
+		}
+		if err != nil {
+			return response, payload, "", networkAuthError("oauth_redirect_network_error", transientState, err)
+		}
+	}
+	return response, payload, "", nil
 }
 
 func (service *Service) authorizeURL(email, deviceID, state, nonce, challenge string) string {
@@ -917,12 +977,36 @@ func parseOAuthCallback(rawURL, redirectURL, expectedState string) (string, bool
 }
 
 func sameOAuthEndpoint(candidate, expected *url.URL) bool {
+	return sameOAuthOrigin(candidate, expected) &&
+		normalizeOAuthPath(candidate.Path) == normalizeOAuthPath(expected.Path)
+}
+
+func sameOAuthOrigin(candidate, expected *url.URL) bool {
 	if candidate == nil || expected == nil || candidate.User != nil || expected.User != nil {
 		return false
 	}
-	return strings.EqualFold(candidate.Scheme, expected.Scheme) &&
-		strings.EqualFold(candidate.Host, expected.Host) &&
-		normalizeOAuthPath(candidate.Path) == normalizeOAuthPath(expected.Path)
+	candidateScheme := strings.ToLower(strings.TrimSpace(candidate.Scheme))
+	expectedScheme := strings.ToLower(strings.TrimSpace(expected.Scheme))
+	return (candidateScheme == "http" || candidateScheme == "https") && candidateScheme == expectedScheme &&
+		candidate.Hostname() != "" && strings.EqualFold(candidate.Hostname(), expected.Hostname()) &&
+		oauthEffectivePort(candidate, candidateScheme) == oauthEffectivePort(expected, expectedScheme)
+}
+
+func oauthEffectivePort(parsed *url.URL, scheme string) string {
+	if parsed == nil {
+		return ""
+	}
+	if port := parsed.Port(); port != "" {
+		return port
+	}
+	switch scheme {
+	case "http":
+		return "80"
+	case "https":
+		return "443"
+	default:
+		return ""
+	}
 }
 
 func normalizeOAuthPath(value string) string {
@@ -936,8 +1020,7 @@ func normalizeOAuthPath(value string) string {
 func classifyOAuthContinuationURL(rawURL, authBaseURL string) *AuthError {
 	parsedURL, err := url.Parse(strings.TrimSpace(rawURL))
 	parsedAuthBase, errBase := url.Parse(strings.TrimSpace(authBaseURL))
-	if err != nil || errBase != nil || parsedURL.Scheme == "" || parsedURL.Host == "" ||
-		!strings.EqualFold(parsedURL.Scheme, parsedAuthBase.Scheme) || !strings.EqualFold(parsedURL.Host, parsedAuthBase.Host) {
+	if err != nil || errBase != nil || !sameOAuthOrigin(parsedURL, parsedAuthBase) {
 		return newAuthError("oauth_redirect_untrusted", LifecycleInteractionRequired, 0, false, true, "OAuth continuation left the trusted authentication origin", nil)
 	}
 	return classifyPageType(parsedURL.Path)

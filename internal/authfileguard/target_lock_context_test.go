@@ -99,6 +99,75 @@ func TestLockRootRebuildContextStopsWaitingForMutation(t *testing.T) {
 	}
 }
 
+func TestLockRootRebuildContextCancellationReleasesWriterTurnstile(t *testing.T) {
+	dir := t.TempDir()
+	mutationRoot, errMutationRoot := os.OpenRoot(dir)
+	if errMutationRoot != nil {
+		t.Fatal(errMutationRoot)
+	}
+	defer mutationRoot.Close()
+	rebuildRoot, errRebuildRoot := os.OpenRoot(dir)
+	if errRebuildRoot != nil {
+		t.Fatal(errRebuildRoot)
+	}
+	defer rebuildRoot.Close()
+	lateRoot, errLateRoot := os.OpenRoot(dir)
+	if errLateRoot != nil {
+		t.Fatal(errLateRoot)
+	}
+	defer lateRoot.Close()
+
+	unlockMutation, errMutation := LockRootMutation(mutationRoot)
+	if errMutation != nil {
+		t.Fatal(errMutation)
+	}
+	mutationLocked := true
+	defer func() {
+		if mutationLocked {
+			_ = unlockMutation()
+		}
+	}()
+
+	ctx, cancel := context.WithCancel(t.Context())
+	type lockResult struct {
+		unlock func() error
+		err    error
+	}
+	result := make(chan lockResult, 1)
+	go func() {
+		unlock, errLock := LockRootRebuildContext(ctx, rebuildRoot)
+		result <- lockResult{unlock: unlock, err: errLock}
+	}()
+	waitForPersistentProcessWriter(t, rebuildRoot, rootWriterTurnstileFileName)
+	cancel()
+	select {
+	case canceled := <-result:
+		if canceled.unlock != nil {
+			_ = canceled.unlock()
+			t.Fatal("canceled rebuild returned an unlock function")
+		}
+		if !errors.Is(canceled.err, context.Canceled) {
+			t.Fatalf("rebuild error = %v, want context canceled", canceled.err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("rebuild did not stop after cancellation")
+	}
+	if errUnlock := unlockMutation(); errUnlock != nil {
+		t.Fatal(errUnlock)
+	}
+	mutationLocked = false
+
+	lateCtx, cancelLate := context.WithTimeout(t.Context(), time.Second)
+	defer cancelLate()
+	unlockLate, errLate := LockRootMutationContext(lateCtx, lateRoot)
+	if errLate != nil {
+		t.Fatalf("mutation remained blocked by canceled writer: %v", errLate)
+	}
+	if errUnlock := unlockLate(); errUnlock != nil {
+		t.Fatal(errUnlock)
+	}
+}
+
 func TestLockRootTargetContextDoesNotRequireTargetParent(t *testing.T) {
 	dir := t.TempDir()
 	firstRoot, errFirstRoot := os.OpenRoot(dir)

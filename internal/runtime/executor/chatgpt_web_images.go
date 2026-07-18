@@ -64,6 +64,13 @@ type chatGPTWebUploadedImage struct {
 	Height   int
 }
 
+type chatGPTWebAssetTransportError struct {
+	statusErr
+	cause error
+}
+
+func (e chatGPTWebAssetTransportError) Unwrap() error { return e.cause }
+
 type chatGPTWebImageExecution struct {
 	response *fhttp.Response
 	headers  http.Header
@@ -190,7 +197,11 @@ func (e *ChatGPTWebExecutor) beginChatGPTWebImage(ctx context.Context, client *c
 		if len(imageInputs) == 0 {
 			return nil, statusErr{code: http.StatusBadRequest, msg: "image mask requires an input image", skipAuthResult: true}
 		}
-		composited, err := compositeChatGPTWebMask(imageInputs[0], imageRequest.MaskURL)
+		maskImageIndex := imageRequest.MaskImageIndex
+		if maskImageIndex < 0 || maskImageIndex >= len(imageInputs) {
+			return nil, statusErr{code: http.StatusBadRequest, msg: "image mask target is invalid", skipAuthResult: true}
+		}
+		composited, err := compositeChatGPTWebMask(imageInputs[maskImageIndex], imageRequest.MaskURL)
 		if err != nil {
 			var unsupportedTool *helps.ChatGPTWebUnsupportedToolError
 			return nil, statusErr{
@@ -200,7 +211,7 @@ func (e *ChatGPTWebExecutor) beginChatGPTWebImage(ctx context.Context, client *c
 				retryOtherAuth: errors.As(err, &unsupportedTool),
 			}
 		}
-		imageInputs[0] = composited
+		imageInputs[maskImageIndex] = composited
 	}
 	uploads := make([]chatGPTWebUploadedImage, 0, len(imageInputs))
 	inputIDs := make(map[string]struct{}, len(imageInputs))
@@ -524,7 +535,7 @@ func (e *ChatGPTWebExecutor) uploadChatGPTWebImage(ctx context.Context, client *
 		"height":    config.Height,
 	})
 	if err != nil {
-		return chatGPTWebUploadedImage{}, err
+		return chatGPTWebUploadedImage{}, chatGPTWebAssetNetworkError(ctx, "signing", err)
 	}
 	var metadata map[string]any
 	if err := json.Unmarshal(metadataData, &metadata); err != nil {
@@ -552,14 +563,18 @@ func (e *ChatGPTWebExecutor) uploadChatGPTWebImage(ctx context.Context, client *
 	}
 	response, finalUploadURL, err := e.doChatGPTWebAssetRequest(ctx, client, credential, http.MethodPut, uploadURL, uploadHeaders, data, true)
 	if err != nil {
-		sanitizedErr := newChatGPTWebAssetTransportError(ctx, "upload")
+		sanitizedErr := newChatGPTWebAssetTransportError(ctx, "upload", err)
 		helps.RecordAPIResponseError(ctx, e.configSnapshot(), sanitizedErr)
 		return chatGPTWebUploadedImage{}, sanitizedErr
 	}
 	payload, errRead := readChatGPTWebErrorBody(response.Body)
 	errClose := response.Body.Close()
 	if errRead != nil || errClose != nil {
-		sanitizedErr := newChatGPTWebAssetTransportError(ctx, "upload response")
+		cause := errRead
+		if cause == nil {
+			cause = errClose
+		}
+		sanitizedErr := newChatGPTWebAssetTransportError(ctx, "upload response", cause)
 		helps.RecordAPIResponseError(ctx, e.configSnapshot(), sanitizedErr)
 		return chatGPTWebUploadedImage{}, sanitizedErr
 	}
@@ -568,7 +583,7 @@ func (e *ChatGPTWebExecutor) uploadChatGPTWebImage(ctx context.Context, client *
 	}
 	confirmPath := "/backend-api/files/" + fileID + "/uploaded"
 	if _, _, err := e.doChatGPTWebJSON(ctx, client, credential, confirmPath, map[string]any{}); err != nil {
-		return chatGPTWebUploadedImage{}, err
+		return chatGPTWebUploadedImage{}, chatGPTWebAssetNetworkError(ctx, "confirmation", err)
 	}
 	return chatGPTWebUploadedImage{
 		FileID: fileID, FileName: fileName, MIMEType: mimeType, Size: len(data), Width: config.Width, Height: config.Height,
@@ -1063,6 +1078,8 @@ func (e *ChatGPTWebExecutor) resolveChatGPTWebImageDownloadURL(ctx context.Conte
 				return downloadURL, nil
 			}
 			err = chatGPTWebImageOutputProtocolError("chatgpt web image output metadata is missing a download URL")
+		} else {
+			err = chatGPTWebAssetNetworkError(ctx, "download URL", err)
 		}
 		lastErr = err
 		delay, retryable := chatGPTWebAssetRetryDelay(err, e.imageSettleWait)
@@ -1105,7 +1122,7 @@ func (e *ChatGPTWebExecutor) downloadChatGPTWebImageAssetOnce(ctx context.Contex
 	downloadHeaders := map[string]string{"accept": chatGPTWebImageDownloadAccept}
 	response, finalDownloadURL, err := e.doChatGPTWebAssetRequest(ctx, client, credential, http.MethodGet, downloadURL, downloadHeaders, nil, false)
 	if err != nil {
-		sanitizedErr := newChatGPTWebAssetTransportError(ctx, "download")
+		sanitizedErr := newChatGPTWebAssetTransportError(ctx, "download", err)
 		helps.RecordAPIResponseError(ctx, e.configSnapshot(), sanitizedErr)
 		return nil, sanitizedErr, true
 	}
@@ -1118,18 +1135,10 @@ func (e *ChatGPTWebExecutor) downloadChatGPTWebImageAssetOnce(ctx context.Contex
 	payload, errRead := readChatGPTWebBoundedBody(response.Body, maxBytes)
 	errClose := response.Body.Close()
 	if errRead != nil {
-		return nil, statusErr{
-			code:           http.StatusBadGateway,
-			msg:            errRead.Error(),
-			skipAuthResult: true,
-		}, false
+		return nil, newChatGPTWebAssetTransportError(ctx, "download response", errRead), false
 	}
 	if errClose != nil {
-		return nil, statusErr{
-			code:           http.StatusBadGateway,
-			msg:            "close chatgpt web image download response",
-			skipAuthResult: true,
-		}, false
+		return nil, newChatGPTWebAssetTransportError(ctx, "download response", errClose), false
 	}
 	if len(payload) == 0 {
 		return nil, chatGPTWebImageOutputProtocolError("chatgpt web image download is empty"), true
@@ -1175,6 +1184,12 @@ func chatGPTWebFinalAssetError(err error) error {
 			skipAuthResult: true,
 		}
 	}
+	var transportErr chatGPTWebAssetTransportError
+	if errors.As(err, &transportErr) {
+		transportErr.skipAuthResult = true
+		transportErr.retryOtherAuth = false
+		return transportErr
+	}
 	var httpErr chatGPTWebHTTPError
 	if errors.As(err, &httpErr) {
 		httpErr.statusErr.skipAuthResult = true
@@ -1187,10 +1202,13 @@ func chatGPTWebFinalAssetError(err error) error {
 		localErr.retryOtherAuth = false
 		return localErr
 	}
-	return statusErr{
-		code:           http.StatusBadGateway,
-		msg:            err.Error(),
-		skipAuthResult: true,
+	return chatGPTWebAssetTransportError{
+		statusErr: statusErr{
+			code:           http.StatusBadGateway,
+			msg:            "chatgpt web image asset request failed",
+			skipAuthResult: true,
+		},
+		cause: sanitizeChatGPTWebAssetTransportCause(err),
 	}
 }
 
@@ -1200,6 +1218,12 @@ func chatGPTWebCommittedRequestError(ctx context.Context, err error) error {
 	}
 	if ctx != nil && ctx.Err() != nil {
 		return ctx.Err()
+	}
+	var transportErr chatGPTWebAssetTransportError
+	if errors.As(err, &transportErr) {
+		transportErr.skipAuthResult = true
+		transportErr.retryOtherAuth = false
+		return transportErr
 	}
 	var httpErr chatGPTWebHTTPError
 	if errors.As(err, &httpErr) {
@@ -1301,15 +1325,37 @@ func (e *ChatGPTWebExecutor) doChatGPTWebGETWithBudget(ctx context.Context, clie
 	return response, data, nil
 }
 
-func newChatGPTWebAssetTransportError(ctx context.Context, action string) error {
+func chatGPTWebAssetNetworkError(ctx context.Context, action string, err error) error {
+	if err == nil || statusCodeFromError(err) != 0 {
+		return err
+	}
+	return newChatGPTWebAssetTransportError(ctx, action, err)
+}
+
+func newChatGPTWebAssetTransportError(ctx context.Context, action string, cause error) error {
 	if ctx != nil && ctx.Err() != nil {
 		return ctx.Err()
 	}
-	return statusErr{
-		code:           http.StatusBadGateway,
-		msg:            "chatgpt web image asset " + strings.TrimSpace(action) + " failed",
-		skipAuthResult: true,
-		retryOtherAuth: true,
+	return chatGPTWebAssetTransportError{
+		statusErr: statusErr{
+			code:           http.StatusBadGateway,
+			msg:            "chatgpt web image asset " + strings.TrimSpace(action) + " failed",
+			skipAuthResult: true,
+			retryOtherAuth: true,
+		},
+		cause: sanitizeChatGPTWebAssetTransportCause(cause),
+	}
+}
+
+func sanitizeChatGPTWebAssetTransportCause(cause error) error {
+	var urlError *url.Error
+	if !errors.As(cause, &urlError) {
+		return cause
+	}
+	return &url.Error{
+		Op:  urlError.Op,
+		URL: "<redacted>",
+		Err: sanitizeChatGPTWebAssetTransportCause(urlError.Err),
 	}
 }
 

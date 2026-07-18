@@ -381,6 +381,42 @@ func MaskProxyURL(raw string) string {
 	return prefix + "********:********@" + rest
 }
 
+// IsMaskedProxyURL reports whether a proxy URL contains a management redaction
+// in either the username or password portion of its user info.
+func IsMaskedProxyURL(raw string) bool {
+	trimmed := strings.TrimSpace(raw)
+	parsed, errParse := url.Parse(trimmed)
+	if errParse == nil {
+		if parsed.User != nil {
+			if parsed.User.Username() == "********" {
+				return true
+			}
+			if password, hasPassword := parsed.User.Password(); hasPassword && password == "********" {
+				return true
+			}
+			return false
+		}
+	}
+
+	at := strings.LastIndexByte(trimmed, '@')
+	if at < 0 {
+		authorityStart, authorityEnd := rawProxyAuthorityBounds(trimmed)
+		authority := trimmed[authorityStart:authorityEnd]
+		return authority == "********" || authority == "********:********"
+	}
+	userinfoStart := rawProxyUserinfoStart(trimmed, at)
+	parts := strings.SplitN(trimmed[userinfoStart:at], ":", 2)
+	username, errUsername := url.PathUnescape(parts[0])
+	if errUsername == nil && username == "********" {
+		return true
+	}
+	if len(parts) != 2 {
+		return false
+	}
+	password, errPassword := url.PathUnescape(parts[1])
+	return errPassword == nil && password == "********"
+}
+
 // MaskedProxyURLMatches accepts both the current full userinfo mask and the
 // previous password-only mask when clients submit an unchanged proxy value.
 func MaskedProxyURLMatches(masked, raw string) bool {
@@ -413,12 +449,7 @@ func hasAmbiguousProxyAuthority(raw string) bool {
 
 func maskRawProxyPassword(raw string) string {
 	if at := strings.LastIndexByte(raw, '@'); at >= 0 {
-		userinfoStart := 0
-		if schemeEnd := strings.Index(raw[:at], "://"); schemeEnd >= 0 {
-			userinfoStart = schemeEnd + 3
-		} else if delimiter := strings.LastIndexAny(raw[:at], "/?#"); delimiter >= 0 {
-			userinfoStart = delimiter + 1
-		}
+		userinfoStart := rawProxyUserinfoStart(raw, at)
 		if colonOffset := strings.IndexByte(raw[userinfoStart:at], ':'); colonOffset >= 0 {
 			colon := userinfoStart + colonOffset
 			return raw[:colon+1] + "********" + raw[at:]
@@ -457,14 +488,12 @@ func maskRawProxyPassword(raw string) string {
 
 func maskRawProxyCredentials(raw string) string {
 	if at := strings.LastIndexByte(raw, '@'); at >= 0 {
-		userinfoStart := 0
-		if schemeEnd := strings.Index(raw[:at], "://"); schemeEnd >= 0 {
-			userinfoStart = schemeEnd + 3
-		} else if delimiter := strings.LastIndexAny(raw[:at], "/?#"); delimiter >= 0 {
-			userinfoStart = delimiter + 1
-		}
+		userinfoStart := rawProxyUserinfoStart(raw, at)
 		if strings.Contains(raw[userinfoStart:at], ":") {
 			return raw[:userinfoStart] + "********:********" + raw[at:]
+		}
+		if userinfoStart < at {
+			return raw[:userinfoStart] + "********" + raw[at:]
 		}
 	}
 
@@ -484,6 +513,53 @@ func maskRawProxyCredentials(raw string) string {
 		return passwordMasked
 	}
 	return passwordMasked[:authorityStart] + "********" + authority[colon:] + passwordMasked[authorityEnd:]
+}
+
+func rawProxyUserinfoStart(raw string, at int) int {
+	if at <= 0 || at > len(raw) {
+		return 0
+	}
+	prefix := raw[:at]
+	if schemeEnd := strings.Index(prefix, "://"); schemeEnd >= 0 {
+		return schemeEnd + 3
+	}
+	if schemeEnd := strings.IndexByte(prefix, ':'); schemeEnd > 0 && isRawProxyScheme(prefix[:schemeEnd]) {
+		start := schemeEnd + 1
+		for start < at && raw[start] == '/' {
+			start++
+		}
+		return start
+	}
+	if delimiter := strings.LastIndexAny(prefix, "/?#"); delimiter >= 0 {
+		return delimiter + 1
+	}
+	return 0
+}
+
+func rawProxyAuthorityBounds(raw string) (int, int) {
+	start := 0
+	if schemeEnd := strings.Index(raw, "://"); schemeEnd >= 0 {
+		start = schemeEnd + 3
+	} else if schemeEnd := strings.IndexByte(raw, ':'); schemeEnd > 0 && isRawProxyScheme(raw[:schemeEnd]) {
+		start = schemeEnd + 1
+		for start < len(raw) && raw[start] == '/' {
+			start++
+		}
+	}
+	end := len(raw)
+	if offset := strings.IndexAny(raw[start:], "/?#"); offset >= 0 {
+		end = start + offset
+	}
+	return start, end
+}
+
+func isRawProxyScheme(value string) bool {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "http", "https", "socks5", "socks5h":
+		return true
+	default:
+		return false
+	}
 }
 
 func maskProxyPasswordOnly(raw string) string {

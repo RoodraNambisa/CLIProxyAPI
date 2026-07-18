@@ -22,5 +22,14 @@ func exchangeFile(root *os.Root, stagedName, targetName string) (string, error) 
 	if !errors.Is(errExchange, unix.ENOSYS) && !errors.Is(errExchange, unix.EINVAL) && !errors.Is(errExchange, unix.EOPNOTSUPP) {
 		return "", errors.Join(errExchange, errClose)
 	}
-	return "", errors.Join(ErrAtomicExchangeUnsupported, errExchange, errClose)
+	displaced, errFallback := exchangeFileByRename(root, stagedName, targetName)
+	if errFallback != nil {
+		return displaced, errors.Join(
+			ErrAtomicExchangeUnsupported,
+			errExchange,
+			errClose,
+			errFallback,
+		)
+	}
+	return displaced, errClose
 }

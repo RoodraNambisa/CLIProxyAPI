@@ -152,6 +152,67 @@ func TestMaskProxyURLMasksUsernameOnlyCredential(t *testing.T) {
 	if strings.Contains(got, "session-token") {
 		t.Fatal("masked URL leaked username-only credential")
 	}
+	if !IsMaskedProxyURL(got) {
+		t.Fatalf("IsMaskedProxyURL(%q) = false", got)
+	}
+}
+
+func TestMaskProxyURLMasksUsernameOnlyTemplateCredential(t *testing.T) {
+	const raw = "http://tenant-secret-{8}@proxy.example:8080"
+	masked := MaskProxyURL(raw)
+	if strings.Contains(masked, "tenant-secret") || masked != "http://********@proxy.example:8080" {
+		t.Fatalf("MaskProxyURL(%q) = %q", raw, masked)
+	}
+	if !IsMaskedProxyURL(masked) || !MaskedProxyURLMatches(masked, raw) {
+		t.Fatalf("template management mask did not round-trip: %q", masked)
+	}
+}
+
+func TestIsMaskedProxyURLRecognizesManagementMasks(t *testing.T) {
+	for _, raw := range []string{
+		"http://%2A%2A%2A%2A%2A%2A%2A%2A@proxy.example:8080",
+		"http://********@proxy.example:8080",
+		"http://user:********@proxy.example:8080",
+		"http://********:********@proxy.example:8080",
+	} {
+		if !IsMaskedProxyURL(raw) {
+			t.Fatalf("IsMaskedProxyURL(%q) = false", raw)
+		}
+	}
+	if IsMaskedProxyURL("http://session-token@proxy.example:8080") {
+		t.Fatal("IsMaskedProxyURL() treated a complete username-only credential as masked")
+	}
+	if IsMaskedProxyURL("http://user:prefix********@proxy.example:8080") {
+		t.Fatal("IsMaskedProxyURL() treated a complete password ending in asterisks as masked")
+	}
+	if IsMaskedProxyURL("http://{8}user%3A********@proxy.example:8080") {
+		t.Fatal("IsMaskedProxyURL() treated an encoded username colon as a password delimiter")
+	}
+	if !IsMaskedProxyURL("http:/********:********@proxy.example:8080") {
+		t.Fatal("IsMaskedProxyURL() missed a raw management mask")
+	}
+	if !IsMaskedProxyURL("http://********:********") || !IsMaskedProxyURL("http:/********:********") {
+		t.Fatal("IsMaskedProxyURL() missed a raw management mask without an at-sign")
+	}
+}
+
+func TestMaskProxyURLDoesNotLeakMalformedPasswordWithSlash(t *testing.T) {
+	const raw = "http:/user:sec/ret@proxy.example:8080"
+	masked := MaskProxyURL(raw)
+	if strings.Contains(masked, "user") || strings.Contains(masked, "sec") || strings.Contains(masked, "ret") {
+		t.Fatalf("MaskProxyURL(%q) leaked credentials: %q", raw, masked)
+	}
+	if !IsMaskedProxyURL(masked) || !MaskedProxyURLMatches(masked, raw) {
+		t.Fatalf("malformed management mask did not round-trip: %q", masked)
+	}
+}
+
+func TestMaskProxyURLWithoutAtSignRoundTrips(t *testing.T) {
+	const raw = "http://user:secret"
+	masked := MaskProxyURL(raw)
+	if masked != "http://********:********" || !IsMaskedProxyURL(masked) || !MaskedProxyURLMatches(masked, raw) {
+		t.Fatalf("MaskProxyURL(%q) = %q and did not round-trip", raw, masked)
+	}
 }
 
 func TestMaskedProxyURLMatchesCurrentAndLegacyMasks(t *testing.T) {

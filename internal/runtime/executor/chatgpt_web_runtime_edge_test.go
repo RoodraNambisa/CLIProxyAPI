@@ -965,11 +965,34 @@ func TestChatGPTWebRequestStatusErrorsSkipCredentialState(t *testing.T) {
 
 func TestChatGPTWebAssetErrorsDoNotCoolCredentialOrLeakURL(t *testing.T) {
 	const signedURL = "https://storage.example/image?sig=secret"
-	transportErr := newChatGPTWebAssetTransportError(context.Background(), "download")
+	cause := &url.Error{Op: http.MethodGet, URL: signedURL, Err: io.ErrUnexpectedEOF}
+	transportErr := newChatGPTWebAssetTransportError(context.Background(), "download", cause)
 	if strings.Contains(transportErr.Error(), signedURL) {
 		t.Fatalf("transport error leaked URL: %v", transportErr)
 	}
 	assertChatGPTWebAssetRetryError(t, transportErr)
+	for name, err := range map[string]error{
+		"transport": transportErr,
+		"final":     chatGPTWebFinalAssetError(transportErr),
+		"committed": chatGPTWebCommittedRequestError(context.Background(), transportErr),
+	} {
+		t.Run(name, func(t *testing.T) {
+			var gotCause *url.Error
+			if !errors.As(err, &gotCause) || gotCause == cause || gotCause.URL != "<redacted>" {
+				t.Fatalf("asset error cause = %#v, want sanitized URL error", gotCause)
+			}
+			if !errors.Is(err, io.ErrUnexpectedEOF) {
+				t.Fatalf("asset error lost network cause: %v", err)
+			}
+			var status interface{ StatusCode() int }
+			if !errors.As(err, &status) || status.StatusCode() != http.StatusBadGateway {
+				t.Fatalf("asset error status = %v, want 502", err)
+			}
+			if strings.Contains(err.Error(), signedURL) {
+				t.Fatalf("asset error leaked URL: %v", err)
+			}
+		})
+	}
 
 	statusError := newChatGPTWebAssetStatusError(http.StatusBadGateway, signedURL,
 		[]byte(`<Error><Message>failed https://storage.example/image?sig=secret</Message></Error>`), nil)
@@ -977,6 +1000,21 @@ func TestChatGPTWebAssetErrorsDoNotCoolCredentialOrLeakURL(t *testing.T) {
 		t.Fatalf("status error leaked URL: %v", statusError)
 	}
 	assertChatGPTWebAssetRetryError(t, statusError)
+}
+
+func TestChatGPTWebAssetTransportErrorSanitizesNestedURLErrors(t *testing.T) {
+	inner := &url.Error{Op: http.MethodGet, URL: "https://storage.example/inner?sig=inner-secret", Err: io.ErrUnexpectedEOF}
+	outer := &url.Error{Op: http.MethodGet, URL: "https://storage.example/outer?sig=outer-secret", Err: inner}
+	err := newChatGPTWebAssetTransportError(context.Background(), "download", outer)
+	for current := err; current != nil; current = errors.Unwrap(current) {
+		message := current.Error()
+		if strings.Contains(message, "inner-secret") || strings.Contains(message, "outer-secret") {
+			t.Fatalf("nested asset error leaked a signed URL: %v", current)
+		}
+	}
+	if !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("nested asset error lost network cause: %v", err)
+	}
 }
 
 func TestChatGPTWebAssetStatusRetriesOnlyRecoverableFailures(t *testing.T) {

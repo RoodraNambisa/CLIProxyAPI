@@ -78,7 +78,7 @@ func TestParseChatGPTWebRequest(t *testing.T) {
 	if len(request.Messages) != 3 || request.Messages[0].Role != "developer" || request.Messages[2].Role != "user" {
 		t.Fatalf("messages = %#v", request.Messages)
 	}
-	if request.Image == nil || request.Image.Prompt != "be concise\n\ndraw" || request.Image.MaskURL != "data:image/png;base64,MASK" || request.Image.Size != "1024x1024" || len(request.Image.Images) != 1 {
+	if request.Image == nil || request.Image.Prompt != "Instructions:\nbe concise\n\nTranscript:\nAssistant: old\nUser: draw" || request.Image.MaskURL != "data:image/png;base64,MASK" || request.Image.Size != "1024x1024" || len(request.Image.Images) != 1 {
 		t.Fatalf("image request = %#v", request.Image)
 	}
 }
@@ -177,11 +177,12 @@ func TestParseChatGPTWebRequestHonorsImageAction(t *testing.T) {
 	}
 }
 
-func TestParseChatGPTWebImageRequestUsesOnlyCurrentUserTurn(t *testing.T) {
+func TestParseChatGPTWebImageRequestPreservesTextAndImageHistory(t *testing.T) {
 	request, err := ParseChatGPTWebRequest([]byte(`{
 		"model":"gpt-image-2",
 		"instructions":"follow style",
 		"input":[
+			{"type":"message","role":"system","content":[{"type":"input_text","text":"keep the logo"}]},
 			{"type":"message","role":"user","content":[
 				{"type":"input_text","text":"old prompt"},
 				{"type":"input_image","image_url":"data:image/png;base64,AAAA"}
@@ -201,14 +202,46 @@ func TestParseChatGPTWebImageRequestUsesOnlyCurrentUserTurn(t *testing.T) {
 	if request.Image == nil {
 		t.Fatal("image request is nil")
 	}
-	if request.Image.Prompt != "follow style\n\ncurrent prompt" {
+	if request.Image.Prompt != "Instructions:\nfollow style\n\nkeep the logo\n\nTranscript:\nUser: old prompt\nAssistant: old answer\nUser: current prompt" {
 		t.Fatalf("image prompt = %q", request.Image.Prompt)
 	}
-	if len(request.Image.Images) != 1 || request.Image.Images[0] != "data:image/png;base64,AQID" {
+	if len(request.Image.Images) != 2 ||
+		request.Image.Images[0] != "data:image/png;base64,AAAA" ||
+		request.Image.Images[1] != "data:image/png;base64,AQID" {
 		t.Fatalf("image inputs = %#v", request.Image.Images)
+	}
+	if request.Image.MaskImageIndex != 1 {
+		t.Fatalf("mask image index = %d, want current image index 1", request.Image.MaskImageIndex)
 	}
 	if request.Image.Action != "edit" {
 		t.Fatalf("image action = %q, want edit", request.Image.Action)
+	}
+}
+
+func TestParseChatGPTWebImageRequestUsesHistoricalImageForFollowUpEdit(t *testing.T) {
+	request, err := ParseChatGPTWebRequest([]byte(`{
+		"model":"gpt-image-2",
+		"input":[
+			{"type":"message","role":"user","content":[
+				{"type":"input_text","text":"make a logo"},
+				{"type":"input_image","image_url":"data:image/png;base64,AAAA"}
+			]},
+			{"type":"message","role":"assistant","content":[{"type":"output_text","text":"logo ready"}]},
+			{"type":"message","role":"user","content":[{"type":"input_text","text":"make it blue"}]}
+		],
+		"tools":[{"type":"image_generation","action":"auto"}],
+		"tool_choice":{"type":"image_generation"}
+	}`))
+	if err != nil {
+		t.Fatalf("ParseChatGPTWebRequest() error = %v", err)
+	}
+	if request.Image == nil || request.Image.Action != "edit" ||
+		len(request.Image.Images) != 1 || request.Image.Images[0] != "data:image/png;base64,AAAA" {
+		t.Fatalf("follow-up image request = %#v", request.Image)
+	}
+	if !strings.Contains(request.Image.Prompt, "User: make a logo") ||
+		!strings.Contains(request.Image.Prompt, "User: make it blue") {
+		t.Fatalf("follow-up image prompt = %q", request.Image.Prompt)
 	}
 }
 
