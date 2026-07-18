@@ -1683,17 +1683,12 @@ func classifyCodexStatusError(statusCode int, body []byte) []byte {
 }
 
 func codexStatusErrorClassification(statusCode int, body []byte) (code string, errType string, ok bool) {
-	errorMessage := strings.ToLower(strings.TrimSpace(gjson.GetBytes(body, "error.message").String()))
-	if errorMessage == "" {
-		errorMessage = strings.ToLower(strings.TrimSpace(gjson.GetBytes(body, "message").String()))
-	}
 	lower := strings.ToLower(strings.TrimSpace(string(body)))
 	upstreamCode := strings.ToLower(strings.TrimSpace(gjson.GetBytes(body, "error.code").String()))
 	upstreamType := strings.ToLower(strings.TrimSpace(gjson.GetBytes(body, "error.type").String()))
-	isInvalidRequest := upstreamType == "" || upstreamType == "invalid_request_error"
 
 	switch {
-	case isCodexContextTooLargeRequestError(statusCode, body) || isInvalidRequest && statusCode != http.StatusTooManyRequests && strings.Contains(errorMessage, "too many tokens"):
+	case isCodexContextTooLargeRequestError(statusCode, body):
 		return "context_too_large", "invalid_request_error", true
 	case strings.Contains(lower, "invalid signature in thinking block") || strings.Contains(lower, "invalid_encrypted_content"):
 		return "thinking_signature_invalid", "invalid_request_error", true
@@ -1724,7 +1719,8 @@ func isCodexContextTooLargeRequestError(statusCode int, body []byte) bool {
 	}
 	return strings.Contains(errorMessage, "context length") ||
 		strings.Contains(errorMessage, "context_length") ||
-		strings.Contains(errorMessage, "maximum context")
+		strings.Contains(errorMessage, "maximum context") ||
+		statusCode != http.StatusTooManyRequests && strings.Contains(errorMessage, "too many tokens")
 }
 
 func normalizeCodexInstructions(body []byte) []byte {

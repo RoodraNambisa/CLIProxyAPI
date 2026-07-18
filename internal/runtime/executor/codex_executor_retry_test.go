@@ -149,6 +149,11 @@ func TestNewCodexStatusErrContextTooLargeIsRequestScoped(t *testing.T) {
 			body:       []byte(`{"error":{"message":"maximum context length exceeded"}}`),
 		},
 		{
+			name:       "bad request too many tokens",
+			statusCode: http.StatusBadRequest,
+			body:       []byte(`{"error":{"message":"too many tokens in request","type":"invalid_request_error"}}`),
+		},
+		{
 			name:       "payload too large code",
 			statusCode: http.StatusRequestEntityTooLarge,
 			body:       []byte(`{"error":{"message":"request too large","code":"context_length_exceeded"}}`),
@@ -221,6 +226,10 @@ func TestCodexStreamStatusErrContextTooLargeIsRequestScoped(t *testing.T) {
 	if terminalErr.StatusCode() != http.StatusBadRequest || !terminalErr.SkipAuthResult() {
 		t.Fatalf("terminal stream error = %#v, want request-scoped status 400", terminalErr)
 	}
+	tokenErr, ok := codexTerminalStreamError([]byte(`{"type":"error","error":{"message":"too many tokens in request","type":"invalid_request_error","code":"invalid_request_error"}}`))
+	if !ok || tokenErr.StatusCode() != http.StatusBadRequest || !tokenErr.SkipAuthResult() {
+		t.Fatalf("too-many-tokens stream error = %#v, %v, want request-scoped status 400", tokenErr, ok)
+	}
 }
 
 func TestCodexContextTooLargeStopsCredentialAndRequestRetry(t *testing.T) {
@@ -237,6 +246,13 @@ func TestCodexContextTooLargeStopsCredentialAndRequestRetry(t *testing.T) {
 			name:          "bad_request",
 			statusCode:    http.StatusBadRequest,
 			body:          `{"error":{"message":"maximum context length exceeded"}}`,
+			wantStatus:    http.StatusBadRequest,
+			wantErrorCode: "context_too_large",
+		},
+		{
+			name:          "bad_request_too_many_tokens",
+			statusCode:    http.StatusBadRequest,
+			body:          `{"error":{"message":"too many tokens in request","type":"invalid_request_error"}}`,
 			wantStatus:    http.StatusBadRequest,
 			wantErrorCode: "context_too_large",
 		},
@@ -262,6 +278,15 @@ func TestCodexContextTooLargeStopsCredentialAndRequestRetry(t *testing.T) {
 			streamOnly:    true,
 			wantStatus:    http.StatusBadRequest,
 			wantErrorCode: "context_length_exceeded",
+		},
+		{
+			name:          "sse_too_many_tokens",
+			statusCode:    http.StatusOK,
+			body:          "data: {\"type\":\"error\",\"error\":{\"message\":\"too many tokens in request\",\"type\":\"invalid_request_error\",\"code\":\"invalid_request_error\"}}\n\n",
+			contentType:   "text/event-stream",
+			streamOnly:    true,
+			wantStatus:    http.StatusBadRequest,
+			wantErrorCode: "invalid_request_error",
 		},
 	}
 
