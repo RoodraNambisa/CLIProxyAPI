@@ -407,9 +407,12 @@ func (h *Handler) persistLocked(c *gin.Context) bool {
 	}
 	if h.proxyPoolManager != nil {
 		if errProxyConfig := h.proxyPoolManager.UpdateConfig(h.cfg); errProxyConfig != nil {
-			h.restorePersistedConfigLocked(previousBody, previousExisted, previousCfg)
-			if errRollbackRuntime := h.proxyPoolManager.UpdateConfig(previousCfg); errRollbackRuntime != nil {
-				log.WithError(errRollbackRuntime).Error("failed to roll back proxy pool runtime configuration")
+			errRollbackFile := h.restorePersistedConfigLocked(previousBody, previousExisted, previousCfg)
+			errRollbackRuntime := h.proxyPoolManager.UpdateConfig(previousCfg)
+			if errRollbackFile != nil || errRollbackRuntime != nil {
+				log.WithError(errors.Join(errProxyConfig, errRollbackFile, errRollbackRuntime)).Error("proxy pool runtime update failed and rollback was incomplete")
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "proxy pool runtime update failed and rollback was incomplete"})
+				return false
 			}
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update proxy pool runtime configuration"})
 			return false
@@ -419,16 +422,16 @@ func (h *Handler) persistLocked(c *gin.Context) bool {
 	return true
 }
 
-func (h *Handler) restorePersistedConfigLocked(previousBody []byte, previousExisted bool, previousCfg *config.Config) {
+func (h *Handler) restorePersistedConfigLocked(previousBody []byte, previousExisted bool, previousCfg *config.Config) error {
 	if h == nil {
-		return
+		return nil
 	}
 	if h.cfg != nil && previousCfg != nil {
 		*h.cfg = *previousCfg
 	} else {
 		h.cfg = previousCfg
 	}
-	h.restorePersistedConfigFileLocked(previousBody, previousExisted)
+	return h.restorePersistedConfigFileLocked(previousBody, previousExisted)
 }
 
 func (h *Handler) readPersistedConfigBodyLocked() ([]byte, bool, error) {
@@ -445,19 +448,17 @@ func (h *Handler) readPersistedConfigBodyLocked() ([]byte, bool, error) {
 	return nil, false, errRead
 }
 
-func (h *Handler) restorePersistedConfigFileLocked(previousBody []byte, previousExisted bool) {
+func (h *Handler) restorePersistedConfigFileLocked(previousBody []byte, previousExisted bool) error {
 	if h == nil {
-		return
+		return nil
 	}
 	if previousExisted {
-		if errRestore := WriteConfig(h.configFilePath, previousBody); errRestore != nil {
-			log.WithError(errRestore).Error("failed to roll back persisted configuration")
-		}
-		return
+		return WriteConfig(h.configFilePath, previousBody)
 	}
 	if errRemove := os.Remove(h.configFilePath); errRemove != nil && !errors.Is(errRemove, os.ErrNotExist) {
-		log.WithError(errRemove).Error("failed to remove rejected configuration")
+		return errRemove
 	}
+	return nil
 }
 
 // Helper methods for simple types

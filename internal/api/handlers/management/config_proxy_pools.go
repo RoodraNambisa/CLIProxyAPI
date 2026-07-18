@@ -2,6 +2,7 @@ package management
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -186,9 +187,13 @@ func (h *Handler) PatchProxyPool(c *gin.Context) {
 	if errRuntime := h.proxyPoolManager.UpdateConfigWithPoolRename(h.cfg, oldName, *body.Name); errRuntime != nil {
 		h.cfg.ProxyPools = previousPools
 		h.cfg.ProxyRules = previousRules
-		h.restorePersistedConfigFileLocked(previousBody, previousExisted)
-		if errRollbackRuntime := h.proxyPoolManager.UpdateConfig(h.cfg); errRollbackRuntime != nil {
-			log.WithError(errRollbackRuntime).Error("failed to roll back proxy pool runtime configuration")
+		errRollbackFile := h.restorePersistedConfigFileLocked(previousBody, previousExisted)
+		errRollbackRuntime := h.proxyPoolManager.UpdateConfig(h.cfg)
+		if errRollbackFile != nil || errRollbackRuntime != nil {
+			log.WithError(errors.Join(errRuntime, errRollbackFile, errRollbackRuntime)).Error("proxy pool rename failed and rollback was incomplete")
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "proxy pool binding migration failed and rollback was incomplete"})
+			h.mu.Unlock()
+			return
 		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to migrate proxy pool bindings"})
 		h.mu.Unlock()

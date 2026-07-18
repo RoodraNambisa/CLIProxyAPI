@@ -181,17 +181,26 @@ func (h *Handler) PutConfigYAML(c *gin.Context) {
 	// Reload into handler to keep memory in sync
 	newCfg, err := config.LoadConfig(h.configFilePath)
 	if err != nil {
-		h.rollbackConfigYAMLLocked(previousBody, previousExisted, previousCfg)
+		errRollback := h.rollbackConfigYAMLLocked(previousBody, previousExisted, previousCfg)
 		h.mu.Unlock()
+		if errRollback != nil {
+			log.WithError(errors.Join(err, errRollback)).Error("config upload reload failed and rollback was incomplete")
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "rollback_failed", "message": "config reload failed and rollback was incomplete"})
+			return
+		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "reload_failed", "message": err.Error()})
 		return
 	}
 	proxyPoolManager := h.proxyPoolManager
 	if proxyPoolManager != nil {
 		if errProxyConfig := proxyPoolManager.UpdateConfig(newCfg); errProxyConfig != nil {
-			h.rollbackConfigYAMLLocked(previousBody, previousExisted, previousCfg)
-			if errRollbackRuntime := proxyPoolManager.UpdateConfig(previousCfg); errRollbackRuntime != nil {
-				log.WithError(errRollbackRuntime).Error("failed to roll back proxy pool runtime after config upload")
+			errRollbackFile := h.rollbackConfigYAMLLocked(previousBody, previousExisted, previousCfg)
+			errRollbackRuntime := proxyPoolManager.UpdateConfig(previousCfg)
+			if errRollbackFile != nil || errRollbackRuntime != nil {
+				log.WithError(errors.Join(errProxyConfig, errRollbackFile, errRollbackRuntime)).Error("config upload runtime update failed and rollback was incomplete")
+				h.mu.Unlock()
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "rollback_failed", "message": "proxy pool runtime update failed and rollback was incomplete"})
+				return
 			}
 			h.mu.Unlock()
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "runtime_update_failed", "message": "failed to update proxy pool runtime"})
@@ -203,17 +212,15 @@ func (h *Handler) PutConfigYAML(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"ok": true, "changed": []string{"config"}})
 }
 
-func (h *Handler) rollbackConfigYAMLLocked(previousBody []byte, previousExisted bool, previousCfg *config.Config) {
+func (h *Handler) rollbackConfigYAMLLocked(previousBody []byte, previousExisted bool, previousCfg *config.Config) error {
 	h.cfg = previousCfg
 	if previousExisted {
-		if errRestore := WriteConfig(h.configFilePath, previousBody); errRestore != nil {
-			log.WithError(errRestore).Error("failed to roll back config upload")
-		}
-		return
+		return WriteConfig(h.configFilePath, previousBody)
 	}
 	if errRemove := os.Remove(h.configFilePath); errRemove != nil && !errors.Is(errRemove, os.ErrNotExist) {
-		log.WithError(errRemove).Error("failed to remove config created by rejected upload")
+		return errRemove
 	}
+	return nil
 }
 
 // GetConfigYAML returns the raw config.yaml file bytes without re-encoding.

@@ -361,6 +361,24 @@ proxy-rules:
 	}
 }
 
+func TestRestorePersistedConfigFileReportsFailure(t *testing.T) {
+	directory := filepath.Join(t.TempDir(), "config.yaml")
+	if errMkdir := os.Mkdir(directory, 0o700); errMkdir != nil {
+		t.Fatalf("create config path directory: %v", errMkdir)
+	}
+	h := &Handler{configFilePath: directory}
+	if errRestore := h.restorePersistedConfigFileLocked([]byte("proxy-pools: []\n"), true); errRestore == nil {
+		t.Fatal("restorePersistedConfigFileLocked() error = nil, want rollback failure")
+	}
+	previous := &config.Config{}
+	if errRollback := h.rollbackConfigYAMLLocked([]byte("proxy-pools: []\n"), true, previous); errRollback == nil {
+		t.Fatal("rollbackConfigYAMLLocked() error = nil, want rollback failure")
+	}
+	if h.cfg != previous {
+		t.Fatal("rollbackConfigYAMLLocked() did not restore the in-memory config")
+	}
+}
+
 func TestDeleteProxyPoolRejectsReferencedPool(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	configPath := filepath.Join(t.TempDir(), "config.yaml")
