@@ -301,6 +301,10 @@ func (w *Watcher) dispatchAuthUpdates(updates []AuthUpdate) bool {
 	}
 	w.dispatchLifecycleMu.Lock()
 	defer w.dispatchLifecycleMu.Unlock()
+	return w.dispatchAuthUpdatesLocked(updates)
+}
+
+func (w *Watcher) dispatchAuthUpdatesLocked(updates []AuthUpdate) bool {
 	queue := w.getAuthQueue()
 	if queue == nil {
 		return false
@@ -334,12 +338,23 @@ func (w *Watcher) WaitForAuthUpdates(ctx context.Context) error {
 		ctx = context.Background()
 	}
 	applied := make(chan struct{})
-	if !w.dispatchAuthUpdates([]AuthUpdate{{Action: AuthUpdateActionBarrier, Applied: applied}}) {
+	w.dispatchLifecycleMu.Lock()
+	dispatchDone := w.dispatchDone
+	enqueued := dispatchDone != nil && w.dispatchAuthUpdatesLocked([]AuthUpdate{{Action: AuthUpdateActionBarrier, Applied: applied}})
+	w.dispatchLifecycleMu.Unlock()
+	if !enqueued {
 		return fmt.Errorf("auth update queue is unavailable")
 	}
 	select {
 	case <-applied:
 		return nil
+	case <-dispatchDone:
+		select {
+		case <-applied:
+			return nil
+		default:
+			return fmt.Errorf("auth update queue stopped before updates were applied")
+		}
 	case <-ctx.Done():
 		return ctx.Err()
 	}

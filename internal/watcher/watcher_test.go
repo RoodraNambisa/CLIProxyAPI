@@ -1321,6 +1321,36 @@ func TestWaitForAuthUpdatesWaitsForPriorUpdatesAndConsumerAck(t *testing.T) {
 	}
 }
 
+func TestWaitForAuthUpdatesReturnsWhenDispatcherStopsBeforeConsumerAck(t *testing.T) {
+	queue := make(chan AuthUpdate, 1)
+	w := &Watcher{}
+	w.SetAuthUpdateQueue(queue)
+
+	waitDone := make(chan error, 1)
+	go func() {
+		waitDone <- w.WaitForAuthUpdates(context.Background())
+	}()
+
+	select {
+	case barrier := <-queue:
+		if barrier.Action != AuthUpdateActionBarrier || barrier.Applied == nil {
+			t.Fatalf("update = %+v, want barrier", barrier)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for barrier")
+	}
+	w.stopDispatch()
+
+	select {
+	case errWait := <-waitDone:
+		if errWait == nil || !strings.Contains(errWait.Error(), "stopped before updates were applied") {
+			t.Fatalf("WaitForAuthUpdates() error = %v, want stopped error", errWait)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("WaitForAuthUpdates() remained blocked after dispatcher stopped")
+	}
+}
+
 func TestDispatchLoopExitsOnContextDoneWhileSending(t *testing.T) {
 	queue := make(chan AuthUpdate) // unbuffered to block sends
 	w := &Watcher{
