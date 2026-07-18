@@ -196,6 +196,29 @@ func TestBuildHTTPTransportSOCKS5HProxy(t *testing.T) {
 	}
 }
 
+func TestBuildHTTPTransportSOCKS5UsesDefaultPort(t *testing.T) {
+	for _, scheme := range []string{"socks5", "socks5h"} {
+		t.Run(scheme, func(t *testing.T) {
+			transport, mode, errBuild := BuildHTTPTransport(scheme + "://127.0.0.1")
+			if errBuild != nil {
+				t.Fatalf("BuildHTTPTransport() error = %v", errBuild)
+			}
+			if mode != ModeProxy || transport == nil || transport.DialContext == nil {
+				t.Fatalf("transport = %#v, mode = %v", transport, mode)
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			connection, errDial := transport.DialContext(ctx, "tcp", "upstream.example:443")
+			if connection != nil {
+				_ = connection.Close()
+			}
+			if errDial != nil && strings.Contains(errDial.Error(), "missing port") {
+				t.Fatalf("DialContext() used a port-less SOCKS endpoint: %v", errDial)
+			}
+		})
+	}
+}
+
 func TestBuildHTTPTransportSOCKS5HDialHonorsContext(t *testing.T) {
 	listener, errListen := net.Listen("tcp", "127.0.0.1:0")
 	if errListen != nil {
