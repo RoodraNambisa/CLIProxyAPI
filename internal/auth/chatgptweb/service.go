@@ -869,9 +869,6 @@ func classifyHTTPResponse(stage string, status int, payload []byte, defaultState
 	if normalized == "" {
 		normalized = normalizeCode(stage + "_failed")
 	}
-	if status == http.StatusTooManyRequests || status >= http.StatusInternalServerError {
-		return newAuthError(normalized, defaultState, status, true, false, safeErrorMessage(message, "upstream authentication service is temporarily unavailable"), nil)
-	}
 	if normalized == "account_deactivated" || strings.Contains(normalized, "account_deactivated") ||
 		strings.Contains(messageLower, "deactivated") || strings.Contains(responseTextLower, "deleted or deactivated") || strings.Contains(responseTextLower, "account deactivated") {
 		return newAuthError("account_deactivated", LifecycleDead, status, false, true, "account is deactivated", nil)
@@ -880,8 +877,17 @@ func classifyHTTPResponse(stage string, status int, payload []byte, defaultState
 		strings.Contains(messageLower, "account has been deleted") || strings.Contains(responseTextLower, "account because it has been deleted") {
 		return newAuthError("account_deleted", LifecycleDead, status, false, true, "account is deleted", nil)
 	}
+	if status == http.StatusTooManyRequests || status >= http.StatusInternalServerError {
+		return newAuthError(normalized, defaultState, status, true, false, "upstream authentication service is temporarily unavailable", nil)
+	}
 	if normalized == "invalid_grant" || normalized == "app_session_terminated" {
-		return newAuthError(normalized, LifecycleReauthRequired, status, false, true, safeErrorMessage(message, "authentication must be renewed"), nil)
+		return newAuthError(normalized, LifecycleReauthRequired, status, false, true, "authentication must be renewed", nil)
+	}
+	if normalized == "interaction_required" {
+		return newAuthError(normalized, LifecycleInteractionRequired, status, false, true, "authentication requires user interaction", nil)
+	}
+	if normalized == "reauth_required" {
+		return newAuthError(normalized, LifecycleReauthRequired, status, false, true, "authentication must be renewed", nil)
 	}
 	if normalized == "invalid_password" || normalized == "invalid_credentials" || normalized == "wrong_password" ||
 		strings.Contains(messageLower, "invalid credentials") || strings.Contains(messageLower, "wrong password") {
@@ -899,7 +905,7 @@ func classifyHTTPResponse(stage string, status int, payload []byte, defaultState
 	if stage == "password_verify" && (status == http.StatusBadRequest || status == http.StatusUnauthorized || status == http.StatusForbidden) {
 		return newAuthError("invalid_password", LifecycleReauthRequired, status, false, true, "password was rejected", nil)
 	}
-	return newAuthError(normalized, defaultState, status, false, true, safeErrorMessage(message, "authentication request was rejected"), nil)
+	return newAuthError(normalized, defaultState, status, false, true, "authentication request was rejected", nil)
 }
 
 func responseError(payload []byte) (string, string) {
@@ -927,17 +933,6 @@ func responseError(payload []byte) (string, string) {
 	return stringValue(decoded["code"]), message
 }
 
-func safeErrorMessage(message, fallback string) string {
-	message = strings.TrimSpace(message)
-	if message == "" {
-		return fallback
-	}
-	if len(message) > 300 {
-		return message[:300]
-	}
-	return message
-}
-
 func normalizeCode(value string) string {
 	value = strings.ToLower(strings.TrimSpace(value))
 	var builder strings.Builder
@@ -963,11 +958,12 @@ func parseOAuthCallback(rawURL, redirectURL, expectedState string) (string, bool
 		return "", true, newAuthError("invalid_state", LifecycleReauthRequired, 0, false, true, "OAuth state did not match", nil)
 	}
 	if oauthCode := strings.TrimSpace(query.Get("error")); oauthCode != "" {
+		normalizedCode := normalizeCode(oauthCode)
 		lifecycleState := LifecycleReauthRequired
-		if oauthCode == "access_denied" {
+		if normalizedCode == "access_denied" || normalizedCode == "interaction_required" {
 			lifecycleState = LifecycleInteractionRequired
 		}
-		return "", true, newAuthError(normalizeCode(oauthCode), lifecycleState, 0, false, true, safeErrorMessage(query.Get("error_description"), "OAuth authorization failed"), nil)
+		return "", true, newAuthError(normalizedCode, lifecycleState, 0, false, true, "OAuth authorization failed", nil)
 	}
 	code := strings.TrimSpace(query.Get("code"))
 	if code == "" {

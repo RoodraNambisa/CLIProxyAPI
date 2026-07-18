@@ -865,6 +865,49 @@ func TestDeletedOrDeactivatedTextIsPermanent(t *testing.T) {
 	if authError == nil || authError.Code != "account_deleted" || authError.State != LifecycleDead {
 		t.Fatalf("classifyPermanentAccountPayload() = %#v, want account_deleted", authError)
 	}
+	authError = classifyHTTPResponse("token_refresh", http.StatusServiceUnavailable, []byte(`{"error":"account_deactivated","error_description":"secret-value"}`), LifecycleActive)
+	if authError == nil || authError.State != LifecycleDead || authError.Retryable || strings.Contains(authError.Error(), "secret-value") {
+		t.Fatalf("classifyHTTPResponse(503 deactivated) = %#v, want safe permanent dead", authError)
+	}
+}
+
+func TestClassifyHTTPResponseMapsLifecycleCodesAndRedactsMessages(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		code      string
+		wantState LifecycleState
+	}{
+		{code: "interaction_required", wantState: LifecycleInteractionRequired},
+		{code: "reauth_required", wantState: LifecycleReauthRequired},
+	}
+	for _, test := range tests {
+		t.Run(test.code, func(t *testing.T) {
+			payload := []byte(`{"error":"` + test.code + `","error_description":"refresh_token=secret-value"}`)
+			authError := classifyHTTPResponse("token_refresh", http.StatusBadRequest, payload, LifecycleActive)
+			if authError == nil || authError.State != test.wantState || !authError.Terminal {
+				t.Fatalf("classifyHTTPResponse() = %#v, want state %q", authError, test.wantState)
+			}
+			if strings.Contains(authError.Error(), "secret-value") {
+				t.Fatalf("classifyHTTPResponse() leaked upstream message: %q", authError.Error())
+			}
+		})
+	}
+
+	temporary := classifyHTTPResponse("token_refresh", http.StatusServiceUnavailable, []byte(`{"error":"temporarily_unavailable","error_description":"access_token=secret-value"}`), LifecycleActive)
+	if temporary == nil || !temporary.Retryable || strings.Contains(temporary.Error(), "secret-value") {
+		t.Fatalf("temporary error = %#v, want safe retryable error", temporary)
+	}
+
+	for _, code := range []string{"access_denied", "interaction_required"} {
+		_, matched, callbackError := parseOAuthCallback(
+			"https://callback.example/callback?state=expected&error="+code+"&error_description=id_token%3Dsecret-value",
+			"https://callback.example/callback",
+			"expected",
+		)
+		if !matched || callbackError == nil || callbackError.State != LifecycleInteractionRequired || strings.Contains(callbackError.Error(), "secret-value") {
+			t.Fatalf("OAuth callback error %q = %#v, want safe interaction-required error", code, callbackError)
+		}
+	}
 }
 
 func TestServiceRefreshRotation(t *testing.T) {

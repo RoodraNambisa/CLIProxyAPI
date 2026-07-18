@@ -81,6 +81,9 @@ func TestCredentialMetadataSanitizesUnknownLifecycleReason(t *testing.T) {
 	if got := SafeLifecycleReason("access_denied"); got != "access_denied" {
 		t.Fatalf("access denied lifecycle reason = %q", got)
 	}
+	if got := SafeLifecycleReason("reauth_required"); got != "reauth_required" {
+		t.Fatalf("reauth required lifecycle reason = %q", got)
+	}
 	for _, reason := range []string{
 		"authorize_network_error",
 		"authorize_continue_network_error",

@@ -105,6 +105,7 @@ func SafeLifecycleReason(value string) string {
 		"turnstile_required",
 		"arkose_required",
 		"interaction_required",
+		"reauth_required",
 		"missing_credentials",
 		"authorization_completion_required",
 		"refresh_token_missing",
