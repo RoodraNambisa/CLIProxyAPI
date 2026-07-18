@@ -802,6 +802,9 @@ func pickSpreadOrdinal(pool runtimePool, counts map[string]int, attempted map[in
 		if key, static := spreadLogicalNodeKey(entry, port); static {
 			load = counts[key]
 		}
+		if load == 0 {
+			return ordinal
+		}
 		if bestOrdinal < 0 || load < bestLoad {
 			bestOrdinal = ordinal
 			bestLoad = load

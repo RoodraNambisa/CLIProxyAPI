@@ -773,6 +773,7 @@ type requestLimitRetryAfterRecoveryExecutor struct {
 	schedulerTestExecutor
 	mu         sync.Mutex
 	calls      int
+	firstErr   error
 	retryAfter time.Duration
 }
 
@@ -782,6 +783,9 @@ func (e *requestLimitRetryAfterRecoveryExecutor) nextError() error {
 	e.calls++
 	if e.calls != 1 {
 		return nil
+	}
+	if e.firstErr != nil {
+		return e.firstErr
 	}
 	return &retryAfterStatusError{
 		status:     http.StatusTooManyRequests,
@@ -812,6 +816,74 @@ func (e *requestLimitRetryAfterRecoveryExecutor) callCount() int {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	return e.calls
+}
+
+type requestLimitRoundRetryError struct{}
+
+func (requestLimitRoundRetryError) Error() string   { return "retry next request round" }
+func (requestLimitRoundRetryError) StatusCode() int { return http.StatusBadGateway }
+
+func TestManagerPerAuthRequestLimitPreservesRetryableErrorWhenFailedAuthHasQuota(t *testing.T) {
+	testCases := []struct {
+		name   string
+		invoke func(*Manager) error
+	}{
+		{
+			name: "execute",
+			invoke: func(manager *Manager) error {
+				_, err := manager.Execute(t.Context(), []string{"test"}, cliproxyexecutor.Request{}, cliproxyexecutor.Options{})
+				return err
+			},
+		},
+		{
+			name: "count",
+			invoke: func(manager *Manager) error {
+				_, err := manager.ExecuteCount(t.Context(), []string{"test"}, cliproxyexecutor.Request{}, cliproxyexecutor.Options{})
+				return err
+			},
+		},
+		{
+			name: "stream",
+			invoke: func(manager *Manager) error {
+				result, err := manager.ExecuteStream(t.Context(), []string{"test"}, cliproxyexecutor.Request{}, cliproxyexecutor.Options{})
+				if err == nil && result != nil {
+					for range result.Chunks {
+					}
+				}
+				return err
+			},
+		},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			executor := &requestLimitRetryAfterRecoveryExecutor{firstErr: requestLimitRoundRetryError{}}
+			manager := NewManager(nil, &FillFirstSelector{}, nil)
+			manager.RegisterExecutor(executor)
+			for _, authID := range []string{"a", "b"} {
+				if _, errRegister := manager.Register(WithSkipPersist(t.Context()), &Auth{ID: authID, Provider: "test", Metadata: map[string]any{"disable_cooling": true}}); errRegister != nil {
+					t.Fatalf("register %s: %v", authID, errRegister)
+				}
+			}
+			manager.SetConfig(&internalconfig.Config{Routing: internalconfig.RoutingConfig{PerAuthRequestLimit: 2, PerAuthRequestWindowMinutes: 5}})
+			manager.SetRetryConfig(1, 0, 0)
+			fixed := time.Date(2026, 7, 18, 12, 0, 10, 0, time.UTC)
+			manager.scheduler.requestLimiter.now = func() time.Time { return fixed }
+			policy := manager.routingAuthRequestLimitPolicyForPriority(0)
+			for index := 0; index < policy.limit; index++ {
+				if acquired, _ := manager.authRequestLimiter().tryAcquireAt("b", policy, fixed); !acquired {
+					t.Fatalf("consume b quota #%d = false, want true", index+1)
+				}
+			}
+
+			if errInvoke := testCase.invoke(manager); errInvoke != nil {
+				t.Fatalf("invocation error = %T %v, want retry through next request round", errInvoke, errInvoke)
+			}
+			if calls := executor.callCount(); calls != 2 {
+				t.Fatalf("upstream calls = %d, want failure plus one request-round retry", calls)
+			}
+		})
+	}
 }
 
 func TestManagerPerAuthRequestLimitPrefersEarlierTriedAuthRecovery(t *testing.T) {

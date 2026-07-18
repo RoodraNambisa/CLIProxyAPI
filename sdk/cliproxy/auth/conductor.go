@@ -1317,6 +1317,11 @@ func (m *Manager) preferEarlierRoundAvailabilityError(selectionErr error, roundS
 			}
 		}
 	}
+	if isAuthRequestLimitedError(selectionErr) {
+		if _, isAvailabilityBlocker := availabilityBlockerResetIn(roundState.lastErr); !isAvailabilityBlocker {
+			return roundState.lastErr
+		}
+	}
 	return earlierAvailabilityBlocker(selectionErr, roundState.lastErr)
 }
 
