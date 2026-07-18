@@ -329,6 +329,9 @@ func (m *Manager) Resolve(ctx context.Context, auth *coreauth.Auth) (coreauth.Re
 		return m.resolveAIStudioRelayProxy(auth)
 	}
 	if explicit := strings.TrimSpace(auth.ProxyURL); explicit != "" {
+		if _, errParse := proxyutil.Parse(explicit); errParse != nil {
+			return coreauth.ResolvedProxy{}, &UnavailableError{Cause: errParse}
+		}
 		return coreauth.ResolvedProxy{URL: explicit, Source: "auth"}, nil
 	}
 	lock, errLock := m.lockBinding(ctx, auth.ID)

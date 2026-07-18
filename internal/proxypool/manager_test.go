@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -176,6 +177,28 @@ func TestResolveProxyPrecedence(t *testing.T) {
 	inherited, errInherited := manager.Resolve(context.Background(), unmatched)
 	if errInherited != nil || inherited.Source != "inherit" || inherited.URL != "" {
 		t.Fatalf("inherited Resolve() = %+v, %v", inherited, errInherited)
+	}
+}
+
+func TestResolveInvalidExplicitProxyFailsClosed(t *testing.T) {
+	t.Parallel()
+
+	manager := newTestManager(t, filepath.Join(t.TempDir(), "config.yaml"), &internalconfig.Config{})
+	auth := proxyPoolTestAuth("invalid-explicit")
+	auth.ProxyURL = "ftp://user:super-secret@proxy.example:21"
+	resolved, errResolve := manager.Resolve(context.Background(), auth)
+	if errResolve == nil {
+		t.Fatal("Resolve() error = nil, want proxy_unavailable")
+	}
+	if resolved.URL != "" || resolved.Source != "" {
+		t.Fatalf("Resolve() = %+v, want no fallback proxy", resolved)
+	}
+	var unavailable *UnavailableError
+	if !errors.As(errResolve, &unavailable) || unavailable.StatusCode() != http.StatusServiceUnavailable {
+		t.Fatalf("Resolve() error = %T %v, want UnavailableError", errResolve, errResolve)
+	}
+	if strings.Contains(errResolve.Error(), "super-secret") {
+		t.Fatalf("Resolve() error leaked proxy credentials: %v", errResolve)
 	}
 }
 
