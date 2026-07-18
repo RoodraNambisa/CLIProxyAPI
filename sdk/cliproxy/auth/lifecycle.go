@@ -126,6 +126,12 @@ func applyLifecycleRuntimeState(auth *Auth) {
 	}
 }
 
+// ApplyLifecycleRuntimeState restores the runtime status represented by
+// persistent provider lifecycle metadata.
+func ApplyLifecycleRuntimeState(auth *Auth) {
+	applyLifecycleRuntimeState(auth)
+}
+
 func activeLifecycleCooldown(auth *Auth, now time.Time) bool {
 	if auth == nil {
 		return false

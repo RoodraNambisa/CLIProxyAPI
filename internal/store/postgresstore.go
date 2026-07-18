@@ -577,6 +577,7 @@ func (s *PostgresStore) List(ctx context.Context) ([]*cliproxyauth.Auth, error) 
 			LastRefreshedAt:  time.Time{},
 			NextRefreshAfter: time.Time{},
 		}
+		cliproxyauth.ApplyLifecycleRuntimeState(auth)
 		cliproxyauth.ApplyFileBackedGeminiAPIKey(auth)
 		if errHash := cliproxyauth.SetCanonicalSourceHashAttribute(auth); errHash != nil {
 			log.WithError(errHash).Warnf("postgres store: skipping auth %s with invalid canonical metadata", id)

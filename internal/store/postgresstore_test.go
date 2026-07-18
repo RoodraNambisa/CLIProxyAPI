@@ -2314,6 +2314,36 @@ func TestPostgresStoreListPreservesDisabledState(t *testing.T) {
 	}
 }
 
+func TestPostgresStoreListRestoresChatGPTWebLifecycle(t *testing.T) {
+	backend := &postgresStoreTestBackend{
+		queryColumns: []string{"id", "content", "created_at", "updated_at"},
+		queryRows: [][]driver.Value{
+			{"auth.json", `{"type":"chatgpt-web","lifecycle_state":"reauth_required","lifecycle_reason":"invalid_password"}`, time.Unix(1711929600, 0), time.Unix(1711929600, 0)},
+		},
+	}
+	db := newPostgresStoreTestSQLDB(t, backend)
+	store := &PostgresStore{
+		db:      db,
+		cfg:     PostgresStoreConfig{AuthTable: defaultAuthTable},
+		authDir: t.TempDir(),
+	}
+
+	auths, errList := store.List(context.Background())
+	if errList != nil {
+		t.Fatalf("List() error = %v", errList)
+	}
+	if len(auths) != 1 || auths[0] == nil {
+		t.Fatalf("expected 1 auth, got %d", len(auths))
+	}
+	auth := auths[0]
+	if auth.Status != cliproxyauth.StatusError || auth.LifecycleState() != cliproxyauth.LifecycleStateReauthRequired {
+		t.Fatalf("restored lifecycle = %q/%q, want reauth_required/error", auth.LifecycleState(), auth.Status)
+	}
+	if auth.StatusMessage != "invalid_password" {
+		t.Fatalf("status message = %q, want invalid_password", auth.StatusMessage)
+	}
+}
+
 func TestPostgresStoreListDoesNotRemarkRetiredPathAfterConcurrentDelete(t *testing.T) {
 	const fileName = "legacy.json"
 	retired := []byte(`{"type":"gemini","access_token":"legacy"}`)

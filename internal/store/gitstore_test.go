@@ -304,6 +304,27 @@ func TestGitTokenStoreReadAuthFilePreservesDisabledState(t *testing.T) {
 	}
 }
 
+func TestGitTokenStoreReadAuthFileRestoresChatGPTWebLifecycle(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "auth.json")
+	data := []byte(`{"type":"chatgpt-web","lifecycle_state":"dead","lifecycle_reason":"account_deleted"}`)
+	if errWrite := os.WriteFile(path, data, 0o600); errWrite != nil {
+		t.Fatalf("write auth file: %v", errWrite)
+	}
+
+	store := NewGitTokenStore("", "", "", "")
+	auth, errRead := store.readAuthFile(path, dir)
+	if errRead != nil {
+		t.Fatalf("readAuthFile() error = %v", errRead)
+	}
+	if auth.Status != cliproxyauth.StatusError || auth.LifecycleState() != cliproxyauth.LifecycleStateDead {
+		t.Fatalf("restored lifecycle = %q/%q, want dead/error", auth.LifecycleState(), auth.Status)
+	}
+	if auth.StatusMessage != "account_deleted" {
+		t.Fatalf("status message = %q, want account_deleted", auth.StatusMessage)
+	}
+}
+
 func TestGitTokenStoreReadAuthFileRejectsUnsafeFiles(t *testing.T) {
 	t.Run("symlink", func(t *testing.T) {
 		parent := t.TempDir()

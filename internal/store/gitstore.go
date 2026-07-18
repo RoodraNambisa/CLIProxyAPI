@@ -1707,6 +1707,7 @@ func (s *GitTokenStore) readAuthFile(path, baseDir string) (*cliproxyauth.Auth, 
 		LastRefreshedAt:  time.Time{},
 		NextRefreshAfter: time.Time{},
 	}
+	cliproxyauth.ApplyLifecycleRuntimeState(auth)
 	cliproxyauth.ApplyFileBackedGeminiAPIKey(auth)
 	if strings.EqualFold(strings.TrimSpace(provider), "codex") {
 		if planType := internalcodex.EffectivePlanType(metadata); planType != "" {

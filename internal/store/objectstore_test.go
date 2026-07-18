@@ -699,6 +699,27 @@ func TestObjectTokenStoreReadAuthFilePreservesDisabledState(t *testing.T) {
 	}
 }
 
+func TestObjectTokenStoreReadAuthFileRestoresChatGPTWebLifecycle(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "auth.json")
+	data := []byte(`{"type":"chatgpt-web","lifecycle_state":"interaction_required","lifecycle_reason":"passkey_required"}`)
+	if errWrite := os.WriteFile(path, data, 0o600); errWrite != nil {
+		t.Fatalf("write auth file: %v", errWrite)
+	}
+
+	store := &ObjectTokenStore{authDir: dir}
+	auth, errRead := store.readAuthFile(path, dir)
+	if errRead != nil {
+		t.Fatalf("readAuthFile() error = %v", errRead)
+	}
+	if auth.Status != cliproxyauth.StatusError || auth.LifecycleState() != cliproxyauth.LifecycleStateInteractionRequired {
+		t.Fatalf("restored lifecycle = %q/%q, want interaction_required/error", auth.LifecycleState(), auth.Status)
+	}
+	if auth.StatusMessage != "passkey_required" {
+		t.Fatalf("status message = %q, want passkey_required", auth.StatusMessage)
+	}
+}
+
 func TestObjectTokenStoreSaveStorageBackedAuthSetsCanonicalSourceHash(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
