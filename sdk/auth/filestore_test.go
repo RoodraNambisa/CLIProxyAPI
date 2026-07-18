@@ -1358,6 +1358,47 @@ func TestJoinFileTokenSaveCleanupErrorMarksDurableWriteCommitted(t *testing.T) {
 	}
 }
 
+func TestFileTokenStoreNoOpSaveMarksTargetUnlockFailureCommitted(t *testing.T) {
+	authDir := t.TempDir()
+	path := filepath.Join(authDir, "auth.json")
+	existing := []byte(`{"type":"codex","access_token":"persisted","disabled":false}`)
+	if errWrite := os.WriteFile(path, existing, 0o600); errWrite != nil {
+		t.Fatalf("write existing auth: %v", errWrite)
+	}
+
+	wantErr := errors.New("unlock failed")
+	store := NewFileTokenStore()
+	store.SetBaseDir(authDir)
+	store.lockTarget = func(ctx context.Context, root *os.Root, relativePath string) (func() error, error) {
+		unlock, errLock := lockRootAuthTarget(ctx, root, relativePath)
+		if errLock != nil {
+			return nil, errLock
+		}
+		return func() error {
+			return errors.Join(unlock(), wantErr)
+		}, nil
+	}
+
+	_, errSave := store.Save(t.Context(), &cliproxyauth.Auth{
+		ID:       "auth.json",
+		FileName: "auth.json",
+		Provider: "codex",
+		Metadata: map[string]any{
+			"access_token": "persisted",
+			"type":         "codex",
+		},
+	})
+	if !errors.Is(errSave, wantErr) {
+		t.Fatalf("Save() error = %v, want unlock failure", errSave)
+	}
+	if outcome, explicit := cliproxyauth.SaveOutcomeFromError(errSave); !explicit || outcome != cliproxyauth.SaveOutcomeCommitted {
+		t.Fatalf("Save() outcome = %v, %t; want committed", outcome, explicit)
+	}
+	if got, errRead := os.ReadFile(path); errRead != nil || !bytes.Equal(got, existing) {
+		t.Fatalf("auth after no-op save = %s, %v; want unchanged %s", got, errRead, existing)
+	}
+}
+
 func TestFileTokenStoreRestoresStorageMetadataWhenMarshalFails(t *testing.T) {
 	authDir := t.TempDir()
 	store := NewFileTokenStore()

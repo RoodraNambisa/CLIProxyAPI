@@ -33,6 +33,7 @@ type FileTokenStore struct {
 	baseDir             string
 	lastResolvedBaseDir string
 	syncDirectory       func(*os.Root, string) error
+	lockTarget          func(context.Context, *os.Root, string) (func() error, error)
 }
 
 type fileTokenSnapshot struct {
@@ -799,7 +800,11 @@ func (s *FileTokenStore) save(ctx context.Context, auth *cliproxyauth.Auth, requ
 		}
 	}
 	persistenceCommitted := false
-	unlockTarget, errLock := lockRootAuthTarget(ctx, root, relativePath)
+	lockTarget := lockRootAuthTarget
+	if s.lockTarget != nil {
+		lockTarget = s.lockTarget
+	}
+	unlockTarget, errLock := lockTarget(ctx, root, relativePath)
 	if errLock != nil {
 		return "", fmt.Errorf("auth filestore: lock auth target for save: %w", errLock)
 	}
@@ -899,6 +904,7 @@ func (s *FileTokenStore) save(ctx context.Context, auth *cliproxyauth.Auth, requ
 		}
 		if errExisting == nil {
 			if jsonEqual(existingData, raw) {
+				persistenceCommitted = true
 				cliproxyauth.SetSourceHashAttribute(auth, raw)
 				return finishFileTokenSave(auth, persistedPath, nil)
 			}
