@@ -91,6 +91,7 @@ type WatcherWrapper struct {
 	seedCurrentFileAuths  func(auths []*coreauth.Auth)
 	setUpdateQueue        func(queue chan<- watcher.AuthUpdate)
 	dispatchRuntimeUpdate func(update watcher.AuthUpdate) watcher.RuntimeAuthUpdateResult
+	waitForAuthUpdates    func(ctx context.Context) error
 }
 
 // Start proxies to the underlying watcher Start implementation.
@@ -160,4 +161,13 @@ func (w *WatcherWrapper) SetAuthUpdateQueue(queue chan<- watcher.AuthUpdate) {
 		return
 	}
 	w.setUpdateQueue(queue)
+}
+
+// WaitForAuthUpdates waits until all previously dispatched watcher updates
+// have been applied by the service.
+func (w *WatcherWrapper) WaitForAuthUpdates(ctx context.Context) error {
+	if w == nil || w.waitForAuthUpdates == nil {
+		return nil
+	}
+	return w.waitForAuthUpdates(ctx)
 }

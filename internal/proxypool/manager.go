@@ -78,6 +78,7 @@ type Manager struct {
 	random    io.Reader
 	now       func() time.Time
 	check     traceChecker
+	syncDir   func(string) error
 
 	lifecycleMu sync.Mutex
 	cancel      context.CancelFunc
@@ -94,6 +95,7 @@ func NewManager(configPath string, cfg *internalconfig.Config) (*Manager, error)
 		random:    rand.Reader,
 		now:       time.Now,
 		check:     checkProxyTrace,
+		syncDir:   syncProxyBindingDirectory,
 	}
 	if errLoad := m.loadBindings(); errLoad != nil {
 		return nil, errLoad
@@ -967,6 +969,29 @@ func (m *Manager) persistBindings(bindings map[string]Binding) error {
 	if errChmod := os.Chmod(directory, 0o700); errChmod != nil {
 		return fmt.Errorf("secure proxy binding directory: %w", errChmod)
 	}
+	previousData, errReadPrevious := os.ReadFile(m.statePath)
+	hadPrevious := errReadPrevious == nil
+	if errReadPrevious != nil && !errors.Is(errReadPrevious, os.ErrNotExist) {
+		return fmt.Errorf("read previous proxy bindings: %w", errReadPrevious)
+	}
+	if errReplace := replaceProxyBindingState(directory, m.statePath, data); errReplace != nil {
+		return errReplace
+	}
+	syncDirectory := m.syncDir
+	if syncDirectory == nil {
+		syncDirectory = syncProxyBindingDirectory
+	}
+	if errSyncDirectory := syncDirectory(directory); errSyncDirectory != nil {
+		errRollback := restoreProxyBindingState(directory, m.statePath, previousData, hadPrevious, syncDirectory)
+		return errors.Join(
+			fmt.Errorf("sync proxy binding directory: %w", errSyncDirectory),
+			errRollback,
+		)
+	}
+	return nil
+}
+
+func replaceProxyBindingState(directory, statePath string, data []byte) error {
 	temp, errCreate := os.CreateTemp(directory, ".proxy-bindings-*")
 	if errCreate != nil {
 		return fmt.Errorf("create proxy binding temporary file: %w", errCreate)
@@ -993,20 +1018,23 @@ func (m *Manager) persistBindings(bindings map[string]Binding) error {
 	if errClose := temp.Close(); errClose != nil {
 		return fmt.Errorf("close proxy bindings: %w", errClose)
 	}
-	if errRename := os.Rename(tempName, m.statePath); errRename != nil {
+	if errRename := os.Rename(tempName, statePath); errRename != nil {
 		return fmt.Errorf("replace proxy bindings: %w", errRename)
 	}
 	removeTemp = false
-	directoryHandle, errOpenDirectory := os.Open(directory)
-	if errOpenDirectory != nil {
-		log.WithError(errOpenDirectory).Warn("failed to open proxy binding directory for sync")
-		return nil
+	return nil
+}
+
+func restoreProxyBindingState(directory, statePath string, previousData []byte, hadPrevious bool, syncDirectory func(string) error) error {
+	if hadPrevious {
+		if errReplace := replaceProxyBindingState(directory, statePath, previousData); errReplace != nil {
+			return fmt.Errorf("restore previous proxy bindings: %w", errReplace)
+		}
+	} else if errRemove := os.Remove(statePath); errRemove != nil && !errors.Is(errRemove, os.ErrNotExist) {
+		return fmt.Errorf("remove uncommitted proxy bindings: %w", errRemove)
 	}
-	if errSyncDirectory := directoryHandle.Sync(); errSyncDirectory != nil {
-		log.WithError(errSyncDirectory).Warn("failed to sync proxy binding directory")
-	}
-	if errCloseDirectory := directoryHandle.Close(); errCloseDirectory != nil {
-		log.WithError(errCloseDirectory).Debug("failed to close proxy binding directory")
+	if errSync := syncDirectory(directory); errSync != nil {
+		return fmt.Errorf("sync restored proxy binding directory: %w", errSync)
 	}
 	return nil
 }

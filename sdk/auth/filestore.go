@@ -236,11 +236,20 @@ func writeRootFileAtomicallyForSnapshotTargetLocked(ctx context.Context, root *o
 	} else if expected != nil {
 		var errExchange error
 		displacedOriginal, errExchange = exchangeExpectedFileTokenSnapshot(root, tempPath, relativePath, *expected, syncDirectory)
-		if displacedOriginal != "" {
+		rollbackConfirmed := fileTokenExchangeRollbackConfirmed(errExchange)
+		if displacedOriginal != "" && !rollbackConfirmed {
 			stagingOwned = false
 		}
 		if errExchange != nil {
-			if displacedOriginal != "" {
+			if rollbackConfirmed {
+				// Cleanup-required does not prove that the displaced path still names
+				// the expected generation. Keep it and only remove our staged path.
+				return cliproxyauth.NewSaveOutcomeError(
+					cliproxyauth.SaveOutcomeRolledBack,
+					fmt.Errorf("auth filestore: exchange auth generation: %w", errExchange),
+				)
+			}
+			if displacedOriginal != "" || errors.Is(errExchange, authfileguard.ErrExchangeOutcomeUncertain) {
 				return cliproxyauth.NewSaveOutcomeError(
 					cliproxyauth.SaveOutcomeUncertain,
 					fmt.Errorf("auth filestore: exchange auth generation: %w", errExchange),
@@ -550,32 +559,11 @@ func captureFileTokenSnapshot(root *os.Root, leaf string) (fileTokenSnapshot, er
 	if errRead != nil {
 		return fileTokenSnapshot{}, errRead
 	}
-	opened, errOpened = hardenChatGPTWebAuthFile(file, opened, data)
+	opened, errOpened = authfileguard.HardenChatGPTWebCredentialFile(file, opened, data)
 	if errOpened != nil {
 		return fileTokenSnapshot{}, errOpened
 	}
 	return fileTokenSnapshot{data: data, mode: opened.Mode().Perm(), info: opened, exists: true}, nil
-}
-
-func hardenChatGPTWebAuthFile(file *os.File, info fs.FileInfo, data []byte) (fs.FileInfo, error) {
-	if file == nil || info == nil || runtime.GOOS == "windows" || info.Mode().Perm() == 0o600 || !isChatGPTWebAuthData(data) {
-		return info, nil
-	}
-	if errChmod := file.Chmod(0o600); errChmod != nil {
-		return nil, fmt.Errorf("auth filestore: restrict chatgpt-web credential permissions: %w", errChmod)
-	}
-	updated, errStat := file.Stat()
-	if errStat != nil {
-		return nil, fmt.Errorf("auth filestore: inspect restricted chatgpt-web credential: %w", errStat)
-	}
-	return updated, nil
-}
-
-func isChatGPTWebAuthData(data []byte) bool {
-	var envelope struct {
-		Type string `json:"type"`
-	}
-	return json.Unmarshal(data, &envelope) == nil && strings.EqualFold(strings.TrimSpace(envelope.Type), "chatgpt-web")
 }
 
 // ReadAuthFileSnapshot reads an auth file through a stable parent and file
@@ -1074,6 +1062,14 @@ func fileTokenSaveCommitted(err error) bool {
 func fileTokenSaveMayHavePersisted(err error) bool {
 	outcome, explicit := cliproxyauth.SaveOutcomeFromError(err)
 	return explicit && outcome != cliproxyauth.SaveOutcomeRolledBack
+}
+
+func fileTokenExchangeRollbackConfirmed(err error) bool {
+	if outcome, explicit := cliproxyauth.SaveOutcomeFromError(err); explicit {
+		return outcome == cliproxyauth.SaveOutcomeRolledBack
+	}
+	return errors.Is(err, authfileguard.ErrExchangeCleanupRequired) &&
+		!errors.Is(err, authfileguard.ErrExchangeOutcomeUncertain)
 }
 
 func mapFileTokenCreateGenerationConflict(requireAbsent bool, err error) error {
@@ -1730,7 +1726,7 @@ func captureFileAuthSnapshot(root *os.Root, relativePath string) (snapshot *file
 	if errRead != nil {
 		return nil, errRead
 	}
-	opened, errOpened = hardenChatGPTWebAuthFile(file, opened, data)
+	opened, errOpened = authfileguard.HardenChatGPTWebCredentialFile(file, opened, data)
 	if errOpened != nil {
 		return nil, errOpened
 	}

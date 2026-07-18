@@ -10,6 +10,7 @@ import (
 
 	chatgptwebauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/chatgptweb"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/auth/codex"
+	sdkAuth "github.com/router-for-me/CLIProxyAPI/v6/sdk/auth"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 )
 
@@ -44,7 +45,7 @@ func (s *FileSynthesizer) Synthesize(ctx *SynthesisContext) ([]*coreauth.Auth, e
 			continue
 		}
 		full := filepath.Join(ctx.AuthDir, name)
-		data, errRead := os.ReadFile(full)
+		data, errRead := sdkAuth.ReadAuthFileSnapshot(full)
 		if errRead != nil || len(data) == 0 {
 			continue
 		}

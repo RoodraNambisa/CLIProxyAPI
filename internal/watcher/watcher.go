@@ -94,16 +94,18 @@ type Watcher struct {
 type AuthUpdateAction string
 
 const (
-	AuthUpdateActionAdd    AuthUpdateAction = "add"
-	AuthUpdateActionModify AuthUpdateAction = "modify"
-	AuthUpdateActionDelete AuthUpdateAction = "delete"
+	AuthUpdateActionAdd     AuthUpdateAction = "add"
+	AuthUpdateActionModify  AuthUpdateAction = "modify"
+	AuthUpdateActionDelete  AuthUpdateAction = "delete"
+	AuthUpdateActionBarrier AuthUpdateAction = "barrier"
 )
 
 // AuthUpdate describes an incremental change to auth configuration.
 type AuthUpdate struct {
-	Action AuthUpdateAction
-	ID     string
-	Auth   *coreauth.Auth
+	Action  AuthUpdateAction
+	ID      string
+	Auth    *coreauth.Auth
+	Applied chan struct{}
 }
 
 // RuntimeAuthUpdateResult describes how a runtime update was handled by the watcher.

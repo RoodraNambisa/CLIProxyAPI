@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1269,6 +1270,54 @@ func TestDispatchAuthUpdatesFlushesQueue(t *testing.T) {
 	}
 	if len(got) != 2 || got[0].ID != "a" || got[1].ID != "b" {
 		t.Fatalf("unexpected updates order/content: %+v", got)
+	}
+}
+
+func TestWaitForAuthUpdatesWaitsForPriorUpdatesAndConsumerAck(t *testing.T) {
+	queue := make(chan AuthUpdate)
+	w := &Watcher{}
+	w.SetAuthUpdateQueue(queue)
+	defer w.stopDispatch()
+
+	if !w.dispatchAuthUpdates([]AuthUpdate{{Action: AuthUpdateActionAdd, ID: "auth-a"}}) {
+		t.Fatal("prior auth update was not accepted")
+	}
+	waitDone := make(chan error, 1)
+	go func() {
+		waitDone <- w.WaitForAuthUpdates(t.Context())
+	}()
+
+	var barrier AuthUpdate
+	for index := 0; index < 2; index++ {
+		select {
+		case update := <-queue:
+			if index == 0 {
+				if update.Action != AuthUpdateActionAdd || update.ID != "auth-a" {
+					t.Fatalf("first update = %+v, want auth-a add", update)
+				}
+				continue
+			}
+			barrier = update
+		case <-time.After(2 * time.Second):
+			t.Fatalf("timed out waiting for update %d", index)
+		}
+	}
+	if barrier.Action != AuthUpdateActionBarrier || barrier.Applied == nil {
+		t.Fatalf("second update = %+v, want barrier", barrier)
+	}
+	select {
+	case errWait := <-waitDone:
+		t.Fatalf("wait returned before consumer acknowledgement: %v", errWait)
+	default:
+	}
+	close(barrier.Applied)
+	select {
+	case errWait := <-waitDone:
+		if errWait != nil {
+			t.Fatal(errWait)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("wait did not return after consumer acknowledgement")
 	}
 }
 
@@ -3518,6 +3567,38 @@ func TestReadAuthFileUnderRootRejectsIntermediateSymlink(t *testing.T) {
 	}
 	if data, errRead := readAuthFileUnderRoot(authDir, filepath.Join(linkPath, "auth.json")); errRead == nil {
 		t.Fatalf("readAuthFileUnderRoot() followed intermediate symlink: %s", data)
+	}
+}
+
+func TestReadAuthFileVersionUnderRootRestrictsChatGPTWebCredentialPermissions(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows does not expose Unix credential permission bits")
+	}
+	authDir := t.TempDir()
+	path := filepath.Join(authDir, "chatgpt-web.json")
+	if errWrite := os.WriteFile(path, []byte(`{"type":"chatgpt-web","access_token":"secret"}`), 0o600); errWrite != nil {
+		t.Fatal(errWrite)
+	}
+	if errChmod := os.Chmod(path, 0o644); errChmod != nil {
+		t.Fatal(errChmod)
+	}
+
+	data, version, errRead := readAuthFileVersionUnderRoot(authDir, path)
+	if errRead != nil {
+		t.Fatal(errRead)
+	}
+	if len(data) == 0 {
+		t.Fatal("read empty credential")
+	}
+	if version.info == nil || version.info.Mode().Perm() != 0o600 {
+		t.Fatalf("version mode = %v, want 600", version.info)
+	}
+	info, errStat := os.Stat(path)
+	if errStat != nil {
+		t.Fatal(errStat)
+	}
+	if got := info.Mode().Perm(); got != 0o600 {
+		t.Fatalf("credential mode = %o, want 600", got)
 	}
 }
 

@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -140,6 +141,40 @@ func TestFileSynthesizer_Synthesize_ValidAuthFile(t *testing.T) {
 	}
 	if rawHash := coreauth.SourceHashFromBytes(data); rawHash == wantHash {
 		t.Fatal("expected canonical source hash to differ from raw file hash")
+	}
+}
+
+func TestFileSynthesizerSynthesizeRestrictsChatGPTWebCredentialPermissions(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows does not expose Unix credential permission bits")
+	}
+	authDir := t.TempDir()
+	path := filepath.Join(authDir, "chatgpt-web.json")
+	if errWrite := os.WriteFile(path, []byte(`{"type":"chatgpt-web","access_token":"secret"}`), 0o600); errWrite != nil {
+		t.Fatal(errWrite)
+	}
+	if errChmod := os.Chmod(path, 0o644); errChmod != nil {
+		t.Fatal(errChmod)
+	}
+
+	auths, errSynthesize := NewFileSynthesizer().Synthesize(&SynthesisContext{
+		Config:      &config.Config{AuthDir: authDir},
+		AuthDir:     authDir,
+		Now:         time.Now(),
+		IDGenerator: NewStableIDGenerator(),
+	})
+	if errSynthesize != nil {
+		t.Fatal(errSynthesize)
+	}
+	if len(auths) != 1 || auths[0].Provider != "chatgpt-web" {
+		t.Fatalf("synthesized auths = %#v, want one chatgpt-web credential", auths)
+	}
+	info, errStat := os.Stat(path)
+	if errStat != nil {
+		t.Fatal(errStat)
+	}
+	if got := info.Mode().Perm(); got != 0o600 {
+		t.Fatalf("credential mode = %o, want 600", got)
 	}
 }
 

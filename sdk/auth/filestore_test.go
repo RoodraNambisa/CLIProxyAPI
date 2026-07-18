@@ -1316,6 +1316,27 @@ func TestMapFileTokenCreateGenerationConflictPreservesRolledBackOutcome(t *testi
 	}
 }
 
+func TestFileTokenExchangeRollbackConfirmedRequiresCertainCleanupFailure(t *testing.T) {
+	cleanupFailure := errors.Join(authfileguard.ErrExchangeCleanupRequired, errors.New("remove backup"))
+	if !fileTokenExchangeRollbackConfirmed(cleanupFailure) {
+		t.Fatal("confirmed cleanup failure was not classified as rolled back")
+	}
+	if fileTokenExchangeRollbackConfirmed(errors.Join(cleanupFailure, authfileguard.ErrExchangeOutcomeUncertain)) {
+		t.Fatal("uncertain cleanup failure was classified as rolled back")
+	}
+	explicitUncertain := cliproxyauth.NewSaveOutcomeError(cliproxyauth.SaveOutcomeUncertain, cleanupFailure)
+	if fileTokenExchangeRollbackConfirmed(explicitUncertain) {
+		t.Fatal("explicitly uncertain cleanup failure was classified as rolled back")
+	}
+	explicitRolledBack := cliproxyauth.NewSaveOutcomeError(cliproxyauth.SaveOutcomeRolledBack, cleanupFailure)
+	if !fileTokenExchangeRollbackConfirmed(explicitRolledBack) {
+		t.Fatal("explicitly rolled-back cleanup failure was not classified as rolled back")
+	}
+	if fileTokenExchangeRollbackConfirmed(errors.New("install failed")) {
+		t.Fatal("generic exchange failure was classified as rolled back")
+	}
+}
+
 func TestJoinFileTokenSaveCleanupErrorMarksDurableWriteCommitted(t *testing.T) {
 	wantErr := errors.New("unlock failed")
 	errSave := joinFileTokenSaveCleanupError(nil, wantErr, true)

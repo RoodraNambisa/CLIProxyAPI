@@ -19,7 +19,7 @@ const (
 	DefaultTraceEndpoint = "https://cloudflare.com/cdn-cgi/trace"
 	// DefaultTraceUserAgent is sent with trace requests.
 	DefaultTraceUserAgent = "Mozilla/5.0"
-	// DefaultTraceTimeout bounds trace connection establishment.
+	// DefaultTraceTimeout bounds the complete trace request.
 	DefaultTraceTimeout = 8 * time.Second
 
 	traceResponseLimit = 64 * 1024
@@ -66,7 +66,9 @@ func CheckTrace(ctx context.Context, proxyURL string, options ...TraceOptions) (
 	}
 
 	traceOptions := resolveTraceOptions(options)
-	req, errRequest := http.NewRequestWithContext(ctx, http.MethodGet, traceOptions.Endpoint, nil)
+	traceCtx, cancelTrace := context.WithTimeout(ctx, traceOptions.Timeout)
+	defer cancelTrace()
+	req, errRequest := http.NewRequestWithContext(traceCtx, http.MethodGet, traceOptions.Endpoint, nil)
 	if errRequest != nil {
 		result.Error = "request_create_failed"
 		result.Message = errRequest.Error()

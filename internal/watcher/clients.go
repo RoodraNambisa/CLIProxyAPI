@@ -104,6 +104,10 @@ func readAuthFileVersionUnderRoot(authDir, path string) ([]byte, authFileVersion
 	if errRead != nil {
 		return nil, authFileVersion{}, errRead
 	}
+	opened, errOpened = authfileguard.HardenChatGPTWebCredentialFile(file, opened, data)
+	if errOpened != nil {
+		return nil, authFileVersion{}, errOpened
+	}
 	sum := sha256.Sum256(data)
 	return data, authFileVersion{hash: hex.EncodeToString(sum[:]), info: opened}, nil
 }

@@ -324,9 +324,33 @@ func (w *Watcher) dispatchAuthUpdates(updates []AuthUpdate) bool {
 	return true
 }
 
+// WaitForAuthUpdates waits until all updates dispatched before this call have
+// been applied by the registered consumer.
+func (w *Watcher) WaitForAuthUpdates(ctx context.Context) error {
+	if w == nil {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	applied := make(chan struct{})
+	if !w.dispatchAuthUpdates([]AuthUpdate{{Action: AuthUpdateActionBarrier, Applied: applied}}) {
+		return fmt.Errorf("auth update queue is unavailable")
+	}
+	select {
+	case <-applied:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
 func (w *Watcher) authUpdateKey(update AuthUpdate, ts int64) string {
 	if update.ID != "" {
 		return update.ID
+	}
+	if update.Action == AuthUpdateActionBarrier && update.Applied != nil {
+		return fmt.Sprintf("%s:%p", update.Action, update.Applied)
 	}
 	return fmt.Sprintf("%s:%d", update.Action, ts)
 }

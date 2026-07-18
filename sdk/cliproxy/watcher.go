@@ -32,5 +32,8 @@ func defaultWatcherFactory(configPath, authDir string, reload func(*config.Confi
 		dispatchRuntimeUpdate: func(update watcher.AuthUpdate) watcher.RuntimeAuthUpdateResult {
 			return w.DispatchRuntimeAuthUpdateResult(update)
 		},
+		waitForAuthUpdates: func(ctx context.Context) error {
+			return w.WaitForAuthUpdates(ctx)
+		},
 	}, nil
 }

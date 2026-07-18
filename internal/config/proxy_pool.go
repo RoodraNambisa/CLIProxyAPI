@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/proxyutil"
 )
@@ -12,6 +13,7 @@ const (
 	DefaultProxyPoolCheckIntervalSeconds = 300
 	DefaultProxyPoolBindAttempts         = 3
 	MaxProxyPoolBindAttempts             = 20
+	maxProxyPoolCheckIntervalSeconds     = (1<<63 - 1) / int64(time.Second)
 )
 
 // NormalizeProxyConfiguration validates and canonicalizes proxy pools and rules.
@@ -40,6 +42,9 @@ func NormalizeProxyConfiguration(pools []ProxyPoolConfig, rules []ProxyRuleConfi
 		pool.PlaceholderCharset = charset
 		if pool.CheckIntervalSeconds < 0 {
 			return nil, nil, fmt.Errorf("proxy-pools[%d].check-interval-seconds cannot be negative", index)
+		}
+		if int64(pool.CheckIntervalSeconds) > maxProxyPoolCheckIntervalSeconds {
+			return nil, nil, fmt.Errorf("proxy-pools[%d].check-interval-seconds must be at most %d", index, maxProxyPoolCheckIntervalSeconds)
 		}
 		if pool.CheckIntervalSeconds == 0 {
 			pool.CheckIntervalSeconds = DefaultProxyPoolCheckIntervalSeconds

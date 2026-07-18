@@ -61,6 +61,87 @@ func TestResolvePersistsStableBindingWithoutExpandingPortRange(t *testing.T) {
 	}
 }
 
+func TestResolveRollsBackBindingWhenDirectorySyncFails(t *testing.T) {
+	t.Parallel()
+
+	manager := newTestManager(t, filepath.Join(t.TempDir(), "config.yaml"), proxyPoolTestConfig("3334"))
+	manager.check = successfulTrace
+	wantErr := errors.New("directory sync failed")
+	syncCalls := 0
+	manager.syncDir = func(string) error {
+		syncCalls++
+		if syncCalls == 1 {
+			return wantErr
+		}
+		return nil
+	}
+
+	if _, errResolve := manager.Resolve(context.Background(), proxyPoolTestAuth("auth-a")); !errors.Is(errResolve, wantErr) {
+		t.Fatalf("Resolve() error = %v, want %v", errResolve, wantErr)
+	}
+	if got := manager.SortedBindings(); len(got) != 0 {
+		t.Fatalf("bindings after directory sync failure = %+v, want none", got)
+	}
+	if _, errStat := os.Stat(manager.statePath); !errors.Is(errStat, os.ErrNotExist) {
+		t.Fatalf("Stat(binding state) error = %v, want not exist", errStat)
+	}
+	if syncCalls != 2 {
+		t.Fatalf("directory sync calls = %d, want failed commit plus rollback sync", syncCalls)
+	}
+}
+
+func TestSaveBindingRestoresPreviousStateWhenDirectorySyncFails(t *testing.T) {
+	t.Parallel()
+
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	manager := newTestManager(t, configPath, proxyPoolTestConfig("3334"))
+	manager.check = successfulTrace
+	if _, errResolve := manager.Resolve(context.Background(), proxyPoolTestAuth("auth-a")); errResolve != nil {
+		t.Fatalf("Resolve() error = %v", errResolve)
+	}
+	before := manager.SortedBindings()[0]
+	beforeData, errReadBefore := os.ReadFile(manager.statePath)
+	if errReadBefore != nil {
+		t.Fatalf("ReadFile(binding state) error = %v", errReadBefore)
+	}
+	wantErr := errors.New("directory sync failed")
+	wantRollbackErr := errors.New("rollback directory sync failed")
+	syncCalls := 0
+	manager.syncDir = func(string) error {
+		syncCalls++
+		if syncCalls == 1 {
+			return wantErr
+		}
+		return wantRollbackErr
+	}
+	replacement := cloneBinding(before)
+	replacement.ID = "replacement-binding"
+
+	errSave := manager.saveBinding(replacement)
+	if !errors.Is(errSave, wantErr) || !errors.Is(errSave, wantRollbackErr) {
+		t.Fatalf("saveBinding() error = %v, want joined %v and %v", errSave, wantErr, wantRollbackErr)
+	}
+	after := manager.SortedBindings()
+	if len(after) != 1 || after[0].ID != before.ID {
+		t.Fatalf("bindings after directory sync failure = %+v, want %+v", after, before)
+	}
+	afterData, errReadAfter := os.ReadFile(manager.statePath)
+	if errReadAfter != nil {
+		t.Fatalf("ReadFile(restored binding state) error = %v", errReadAfter)
+	}
+	if !bytes.Equal(afterData, beforeData) {
+		t.Fatalf("binding state changed after rollback\nbefore: %s\nafter:  %s", beforeData, afterData)
+	}
+	restored := newTestManager(t, configPath, proxyPoolTestConfig("3334"))
+	restoredBindings := restored.SortedBindings()
+	if len(restoredBindings) != 1 || restoredBindings[0].ID != before.ID {
+		t.Fatalf("restored bindings = %+v, want %+v", restoredBindings, before)
+	}
+	if syncCalls != 2 {
+		t.Fatalf("directory sync calls = %d, want failed commit plus rollback sync", syncCalls)
+	}
+}
+
 func TestResolveProxyPrecedence(t *testing.T) {
 	t.Parallel()
 

@@ -73,6 +73,48 @@ func TestCheckTraceDisablesKeepAliveForDedicatedTransport(t *testing.T) {
 	}
 }
 
+func TestCheckTraceTimeoutCoversResponseHeaders(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		select {
+		case <-r.Context().Done():
+		case <-time.After(2 * time.Second):
+		}
+	}))
+	defer server.Close()
+
+	const timeout = 50 * time.Millisecond
+	result := CheckTrace(context.Background(), "direct", TraceOptions{Endpoint: server.URL, Timeout: timeout})
+	if result.OK || result.Error != "request_failed" {
+		t.Fatalf("CheckTrace() = %+v, want request_failed", result)
+	}
+	if result.Elapsed < timeout/2 || result.Elapsed > time.Second {
+		t.Fatalf("elapsed = %s, want complete request timeout near %s", result.Elapsed, timeout)
+	}
+}
+
+func TestCheckTraceTimeoutCoversResponseBody(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("ip=1.2.3.4\n"))
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		select {
+		case <-r.Context().Done():
+		case <-time.After(2 * time.Second):
+		}
+	}))
+	defer server.Close()
+
+	const timeout = 50 * time.Millisecond
+	result := CheckTrace(context.Background(), "direct", TraceOptions{Endpoint: server.URL, Timeout: timeout})
+	if result.OK || result.Error != "read_failed" {
+		t.Fatalf("CheckTrace() = %+v, want read_failed", result)
+	}
+	if result.Elapsed < timeout/2 || result.Elapsed > time.Second {
+		t.Fatalf("elapsed = %s, want complete request timeout near %s", result.Elapsed, timeout)
+	}
+}
+
 func TestCheckTraceSupportsConcreteHTTPProxy(t *testing.T) {
 	type proxyRequest struct {
 		url                string

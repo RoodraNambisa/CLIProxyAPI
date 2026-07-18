@@ -1707,6 +1707,12 @@ func (s *Service) handleAuthUpdate(ctx context.Context, update watcher.AuthUpdat
 	if s == nil {
 		return
 	}
+	if update.Action == watcher.AuthUpdateActionBarrier {
+		if update.Applied != nil {
+			close(update.Applied)
+		}
+		return
+	}
 	s.cfgMu.RLock()
 	cfg := s.cfg
 	s.cfgMu.RUnlock()
@@ -2705,9 +2711,6 @@ func (s *Service) Run(ctx context.Context) error {
 	if errBeforeStart := s.applyBeforeStartConfig(); errBeforeStart != nil {
 		return errBeforeStart
 	}
-	if s.proxyPoolManager != nil {
-		s.proxyPoolManager.Start(ctx)
-	}
 
 	// Register callback for startup and periodic model catalog refresh.
 	// When remote model definitions change, re-register models for affected providers.
@@ -2909,7 +2912,15 @@ func (s *Service) Run(ctx context.Context) error {
 	if err = watcherWrapper.Start(watcherCtx); err != nil {
 		return fmt.Errorf("cliproxy: failed to start watcher: %w", err)
 	}
+	if err = watcherWrapper.WaitForAuthUpdates(ctx); err != nil {
+		return fmt.Errorf("cliproxy: wait for initial auth updates: %w", err)
+	}
 	log.Info("file watcher started for config and auth directory changes")
+	// Start proxy health checks only after file-backed auths are visible, so
+	// restored bindings are not pruned as stale.
+	if s.proxyPoolManager != nil {
+		s.proxyPoolManager.Start(ctx)
+	}
 	s.startUsagePersistenceLoop()
 	s.startAuthMaintenance(context.Background())
 

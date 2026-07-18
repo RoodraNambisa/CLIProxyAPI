@@ -3,7 +3,9 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
+	"time"
 )
 
 func TestNormalizeProxyConfiguration(t *testing.T) {
@@ -66,6 +68,30 @@ func TestNormalizeProxyConfigurationRejectsInvalidReferences(t *testing.T) {
 				t.Fatal("NormalizeProxyConfiguration() error = nil")
 			}
 		})
+	}
+}
+
+func TestNormalizeProxyConfigurationRejectsOverflowingCheckInterval(t *testing.T) {
+	if strconv.IntSize < 64 {
+		t.Skip("an int cannot represent a time.Duration-overflowing seconds value on 32-bit platforms")
+	}
+	maxCheckIntervalSeconds := maxProxyPoolCheckIntervalSeconds
+	pool := ProxyPoolConfig{
+		Name:                 "one",
+		CheckIntervalSeconds: int(maxCheckIntervalSeconds),
+		Entries:              []ProxyPoolEntryConfig{{ID: "node", URLTemplate: "http://proxy.example:8080"}},
+	}
+	pools, _, errMax := NormalizeProxyConfiguration([]ProxyPoolConfig{pool}, nil)
+	if errMax != nil {
+		t.Fatalf("NormalizeProxyConfiguration(max) error = %v", errMax)
+	}
+	if interval := time.Duration(pools[0].CheckIntervalSeconds) * time.Second; interval <= 0 {
+		t.Fatalf("maximum check interval overflowed: %s", interval)
+	}
+
+	pool.CheckIntervalSeconds++
+	if _, _, errOverflow := NormalizeProxyConfiguration([]ProxyPoolConfig{pool}, nil); errOverflow == nil {
+		t.Fatal("NormalizeProxyConfiguration(overflowing check interval) error = nil")
 	}
 }
 

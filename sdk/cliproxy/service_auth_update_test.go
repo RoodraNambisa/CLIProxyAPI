@@ -61,6 +61,31 @@ func TestEmitAuthUpdateHonorsWatcherRuntimeDisposition(t *testing.T) {
 	})
 }
 
+func TestConsumeAuthUpdatesAppliesUpdatesBeforeBarrier(t *testing.T) {
+	manager := coreauth.NewManager(nil, nil, nil)
+	service := &Service{
+		cfg:         &config.Config{},
+		coreManager: manager,
+		authUpdates: make(chan watcher.AuthUpdate, 2),
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	go service.consumeAuthUpdates(ctx)
+
+	auth := &coreauth.Auth{ID: "startup-auth", Provider: "test", Status: coreauth.StatusActive}
+	applied := make(chan struct{})
+	service.authUpdates <- watcher.AuthUpdate{Action: watcher.AuthUpdateActionAdd, ID: auth.ID, Auth: auth}
+	service.authUpdates <- watcher.AuthUpdate{Action: watcher.AuthUpdateActionBarrier, Applied: applied}
+	select {
+	case <-applied:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for auth update barrier")
+	}
+	if current, exists := manager.GetByID(auth.ID); !exists || current == nil {
+		t.Fatal("barrier completed before the prior auth update reached core manager")
+	}
+}
+
 func TestAuthFileUpdateStillCurrentRejectsDeletedAndRewrittenSources(t *testing.T) {
 	authDir := t.TempDir()
 	path := filepath.Join(authDir, "auth.json")
