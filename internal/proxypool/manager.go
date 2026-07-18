@@ -15,6 +15,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strconv"
 	"strings"
@@ -230,6 +231,9 @@ func (m *Manager) updateConfig(cfg *internalconfig.Config, oldPoolName, newPoolN
 		}
 		snapshot.pools[strings.ToLower(poolConfig.Name)] = pool
 	}
+	if !renamePool {
+		oldPoolName, newPoolName, renamePool = inferredPoolRename(previous, snapshot)
+	}
 	if renamePool {
 		if errRename := m.renamePoolBindingsLocked(snapshot, oldPoolName, newPoolName); errRename != nil {
 			return errRename
@@ -237,6 +241,44 @@ func (m *Manager) updateConfig(cfg *internalconfig.Config, oldPoolName, newPoolN
 	}
 	m.config.Store(snapshot)
 	return nil
+}
+
+func inferredPoolRename(previous, next *configSnapshot) (string, string, bool) {
+	if previous == nil || next == nil {
+		return "", "", false
+	}
+	var removed, added *runtimePool
+	for name, pool := range previous.pools {
+		if _, exists := next.pools[name]; exists {
+			continue
+		}
+		if removed != nil {
+			return "", "", false
+		}
+		poolCopy := pool
+		removed = &poolCopy
+	}
+	for name, pool := range next.pools {
+		if _, exists := previous.pools[name]; exists {
+			continue
+		}
+		if added != nil {
+			return "", "", false
+		}
+		poolCopy := pool
+		added = &poolCopy
+	}
+	if removed == nil || added == nil {
+		return "", "", false
+	}
+	removedConfig := removed.config
+	addedConfig := added.config
+	removedConfig.Name = ""
+	addedConfig.Name = ""
+	if !reflect.DeepEqual(removedConfig, addedConfig) {
+		return "", "", false
+	}
+	return removed.config.Name, added.config.Name, true
 }
 
 // renamePoolBindingsLocked expects configMu to be write-locked.

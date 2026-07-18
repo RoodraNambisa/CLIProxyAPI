@@ -341,6 +341,57 @@ func TestUpdateConfigWithPoolRenamePreservesCompatibleBinding(t *testing.T) {
 	}
 }
 
+func TestUpdateConfigInfersEquivalentPoolRename(t *testing.T) {
+	t.Parallel()
+
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	manager := newTestManager(t, configPath, proxyPoolTestConfig("3334"))
+	manager.check = successfulTrace
+	auth := proxyPoolTestAuth("auth-a")
+	if _, errResolve := manager.Resolve(context.Background(), auth); errResolve != nil {
+		t.Fatalf("Resolve() error = %v", errResolve)
+	}
+	before := manager.SortedBindings()[0]
+	renamedConfig := proxyPoolTestConfig("3334")
+	renamedConfig.ProxyPools[0].Name = "primary"
+	renamedConfig.ProxyRules[0].Pool = "primary"
+
+	if errUpdate := manager.UpdateConfig(renamedConfig); errUpdate != nil {
+		t.Fatalf("UpdateConfig() error = %v", errUpdate)
+	}
+	after := manager.SortedBindings()[0]
+	if after.ID != before.ID || after.Pool != "primary" || after.Entry != before.Entry || after.Port != before.Port {
+		t.Fatalf("binding after inferred rename = %+v, want stable binding based on %+v", after, before)
+	}
+	restored := newTestManager(t, configPath, renamedConfig)
+	restoredBindings := restored.SortedBindings()
+	if len(restoredBindings) != 1 || restoredBindings[0].ID != before.ID || restoredBindings[0].Pool != "primary" {
+		t.Fatalf("restored bindings = %+v", restoredBindings)
+	}
+}
+
+func TestUpdateConfigDoesNotInferUnrelatedPoolReplacement(t *testing.T) {
+	t.Parallel()
+
+	manager := newTestManager(t, filepath.Join(t.TempDir(), "config.yaml"), proxyPoolTestConfig("3334"))
+	manager.check = successfulTrace
+	auth := proxyPoolTestAuth("auth-a")
+	if _, errResolve := manager.Resolve(context.Background(), auth); errResolve != nil {
+		t.Fatalf("Resolve() error = %v", errResolve)
+	}
+	replacement := proxyPoolTestConfig("4444")
+	replacement.ProxyPools[0].Name = "primary"
+	replacement.ProxyRules[0].Pool = "primary"
+
+	if errUpdate := manager.UpdateConfig(replacement); errUpdate != nil {
+		t.Fatalf("UpdateConfig() error = %v", errUpdate)
+	}
+	after := manager.SortedBindings()[0]
+	if after.Pool != "residential" || after.Port != 3334 {
+		t.Fatalf("unrelated replacement migrated binding: %+v", after)
+	}
+}
+
 func TestBackgroundCleanupRevalidatesBindingAgainstLatestConfiguration(t *testing.T) {
 	manager := newTestManager(t, filepath.Join(t.TempDir(), "config.yaml"), proxyPoolTestConfig("3334"))
 	manager.check = successfulTrace
