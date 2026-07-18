@@ -2718,7 +2718,7 @@ func TestBuildChatGPTWebImageCompletedEventRejectsOversizedOutput(t *testing.T) 
 	imageData := append(chatGPTWebPNGBytes(t, color.NRGBA{A: 255}), make([]byte, chatGPTWebMaxImageResponseBytes)...)
 	_, err := buildChatGPTWebImageCompletedEvent("gpt-image-2", "png", [][]byte{
 		imageData,
-	})
+	}, nil)
 	if err == nil || !strings.Contains(err.Error(), "image response exceeds") {
 		t.Fatalf("buildChatGPTWebImageCompletedEvent() error = %v", err)
 	}
@@ -2733,12 +2733,16 @@ func TestBuildChatGPTWebImageCompletedEventConvertsJPEGToPNG(t *testing.T) {
 		t.Fatalf("encode JPEG: %v", err)
 	}
 
-	completed, err := buildChatGPTWebImageCompletedEvent("gpt-image-2", "png", [][]byte{jpegData.Bytes()})
+	usage := map[string]any{"input_tokens": int64(7), "output_tokens": int64(0), "total_tokens": int64(7)}
+	completed, err := buildChatGPTWebImageCompletedEvent("gpt-image-2", "png", [][]byte{jpegData.Bytes()}, usage)
 	if err != nil {
 		t.Fatalf("buildChatGPTWebImageCompletedEvent() error = %v", err)
 	}
 	if got := gjson.GetBytes(completed, "response.output.0.output_format").String(); got != "png" {
 		t.Fatalf("output format = %q, want png", got)
+	}
+	if got := gjson.GetBytes(completed, "response.usage.input_tokens").Int(); got != 7 {
+		t.Fatalf("input tokens = %d, want 7", got)
 	}
 	encoded := gjson.GetBytes(completed, "response.output.0.result").String()
 	decoded, err := base64.StdEncoding.DecodeString(encoded)
@@ -2758,7 +2762,7 @@ func TestBuildChatGPTWebImageCompletedEventDefaultsToPNG(t *testing.T) {
 		t.Fatalf("encode JPEG: %v", err)
 	}
 
-	completed, err := buildChatGPTWebImageCompletedEvent("gpt-image-2", "", [][]byte{jpegData.Bytes()})
+	completed, err := buildChatGPTWebImageCompletedEvent("gpt-image-2", "", [][]byte{jpegData.Bytes()}, nil)
 	if err != nil {
 		t.Fatalf("buildChatGPTWebImageCompletedEvent() error = %v", err)
 	}

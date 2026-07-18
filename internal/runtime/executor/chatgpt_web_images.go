@@ -310,7 +310,8 @@ func (e *ChatGPTWebExecutor) finishChatGPTWebImage(ctx context.Context, client *
 	if len(images) == 0 {
 		return nil, statusErr{code: http.StatusBadGateway, msg: "chatgpt web did not return image output"}
 	}
-	completed, err := buildChatGPTWebImageCompletedEvent(prepared.routeModel, imageRequest.OutputFormat, images)
+	usage := estimateChatGPTWebUsage(prepared.routeModel, prepared.request, "")
+	completed, err := buildChatGPTWebImageCompletedEvent(prepared.routeModel, imageRequest.OutputFormat, images, usage)
 	if err != nil {
 		return nil, err
 	}
@@ -326,7 +327,7 @@ func chatGPTWebImageFailureError(status string) error {
 	}
 }
 
-func buildChatGPTWebImageCompletedEvent(routeModel, requestedFormat string, images [][]byte) ([]byte, error) {
+func buildChatGPTWebImageCompletedEvent(routeModel, requestedFormat string, images [][]byte, usage map[string]any) ([]byte, error) {
 	requestedFormat = normalizeChatGPTWebImageOutputFormat(requestedFormat)
 	totalBytes := 0
 	for index, imageData := range images {
@@ -395,7 +396,13 @@ func buildChatGPTWebImageCompletedEvent(routeModel, requestedFormat string, imag
 		writeChatGPTWebJSONString(&output, outputFormat)
 		output.WriteByte('}')
 	}
-	output.WriteString(`]}}`)
+	usageJSON, err := json.Marshal(chatGPTWebUsageOrZero(usage))
+	if err != nil {
+		return nil, fmt.Errorf("encode chatgpt web image usage: %w", err)
+	}
+	output.WriteString(`],"usage":`)
+	_, _ = output.Write(usageJSON)
+	output.WriteString(`}}`)
 	return output.Bytes(), nil
 }
 

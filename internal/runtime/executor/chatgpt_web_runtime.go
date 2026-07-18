@@ -96,7 +96,11 @@ func (e *ChatGPTWebExecutor) executeRuntime(ctx context.Context, auth *cliproxya
 		if errImage != nil {
 			return resp, errImage
 		}
-		reporter.EnsurePublished(ctx)
+		if detail, ok := helps.ParseCodexUsage(completed); ok {
+			reporter.Publish(ctx, detail)
+		} else {
+			reporter.EnsurePublished(ctx)
+		}
 		var param any
 		out := sdktranslator.TranslateNonStream(ctx, sdktranslator.FormatCodex, prepared.responseFormat, prepared.routeModel,
 			prepared.originalPayload, prepared.canonicalBody, completed, &param)
