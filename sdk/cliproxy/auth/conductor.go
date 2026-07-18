@@ -323,7 +323,9 @@ type Manager struct {
 	runtimeConfig atomic.Value
 
 	// Optional HTTP RoundTripper provider injected by host.
-	rtProvider RoundTripperProvider
+	rtProviderMu     sync.RWMutex
+	rtProvider       RoundTripperProvider
+	rtProviderClosed bool
 	// Optional structured proxy resolver injected by the host service.
 	proxyResolver ProxyResolver
 
@@ -787,8 +789,11 @@ func (m *Manager) SetStore(store Store) {
 
 // SetRoundTripperProvider register a provider that returns a per-auth RoundTripper.
 func (m *Manager) SetRoundTripperProvider(p RoundTripperProvider) {
+	m.rtProviderMu.Lock()
+	defer m.rtProviderMu.Unlock()
 	m.mu.Lock()
 	m.rtProvider = p
+	m.rtProviderClosed = false
 	m.mu.Unlock()
 }
 
@@ -2753,6 +2758,8 @@ func (m *Manager) endSessionCleanup(id string) {
 	}
 	if current != nil {
 		m.queueRefreshReschedule(id)
+	} else {
+		m.evictRoundTripperForAuth(id)
 	}
 }
 
@@ -7802,6 +7809,7 @@ func (m *Manager) closeExecutors(executors []ProviderExecutor, done chan struct{
 	}
 	m.executorLifecycleMu.Unlock()
 	m.executorCloseWG.Wait()
+	m.closeRoundTripperProvider()
 	m.executorLifecycleMu.Lock()
 	for m.executorSealedClose > 0 {
 		m.executorCloseCond.Wait()
@@ -9008,6 +9016,11 @@ type roundTripperContextKey struct{}
 
 // roundTripperFor retrieves an HTTP RoundTripper for the given auth if a provider is registered.
 func (m *Manager) roundTripperFor(auth *Auth) http.RoundTripper {
+	m.rtProviderMu.RLock()
+	defer m.rtProviderMu.RUnlock()
+	if m.rtProviderClosed || !m.authInstallationCurrent(auth) {
+		return nil
+	}
 	m.mu.RLock()
 	p := m.rtProvider
 	m.mu.RUnlock()
@@ -9015,6 +9028,32 @@ func (m *Manager) roundTripperFor(auth *Auth) http.RoundTripper {
 		return nil
 	}
 	return p.RoundTripperFor(auth)
+}
+
+func (m *Manager) evictRoundTripperForAuth(authID string) {
+	m.rtProviderMu.Lock()
+	defer m.rtProviderMu.Unlock()
+	m.mu.RLock()
+	provider := m.rtProvider
+	m.mu.RUnlock()
+	if evicter, ok := provider.(interface{ EvictAuth(string) }); ok && evicter != nil {
+		evicter.EvictAuth(authID)
+	}
+}
+
+func (m *Manager) closeRoundTripperProvider() {
+	m.rtProviderMu.Lock()
+	defer m.rtProviderMu.Unlock()
+	if m.rtProviderClosed {
+		return
+	}
+	m.rtProviderClosed = true
+	m.mu.RLock()
+	provider := m.rtProvider
+	m.mu.RUnlock()
+	if closer, ok := provider.(interface{ CloseIdleConnections() }); ok && closer != nil {
+		closer.CloseIdleConnections()
+	}
 }
 
 // RoundTripperProvider defines a minimal provider of per-auth HTTP transports.

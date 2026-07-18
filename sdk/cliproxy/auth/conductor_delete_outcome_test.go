@@ -3,6 +3,7 @@ package auth
 import (
 	"context"
 	"errors"
+	"net/http"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -11,6 +12,55 @@ import (
 type deleteOutcomeStore struct {
 	deleteErr   error
 	deleteCount atomic.Int32
+}
+
+type lifecycleRoundTripperProvider struct {
+	evicted chan string
+	calls   atomic.Int32
+	closed  atomic.Bool
+}
+
+func (p *lifecycleRoundTripperProvider) RoundTripperFor(*Auth) http.RoundTripper {
+	p.calls.Add(1)
+	return nil
+}
+
+func (p *lifecycleRoundTripperProvider) EvictAuth(authID string) { p.evicted <- authID }
+
+func (p *lifecycleRoundTripperProvider) CloseIdleConnections() { p.closed.Store(true) }
+
+func TestManagerReleasesRoundTripperProviderLifecycle(t *testing.T) {
+	manager := NewManager(nil, nil, nil)
+	provider := &lifecycleRoundTripperProvider{evicted: make(chan string, 1)}
+	manager.SetRoundTripperProvider(provider)
+	const authID = "transport-lifecycle-auth"
+	selected, errRegister := manager.Register(t.Context(), &Auth{ID: authID, Provider: "codex"})
+	if errRegister != nil {
+		t.Fatalf("Register() error = %v", errRegister)
+	}
+	if errDelete := manager.Delete(WithSkipPersist(t.Context()), authID); errDelete != nil {
+		t.Fatalf("Delete() error = %v", errDelete)
+	}
+	select {
+	case evicted := <-provider.evicted:
+		if evicted != authID {
+			t.Fatalf("evicted auth = %q, want %q", evicted, authID)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("auth transport was not evicted")
+	}
+	if transport := manager.roundTripperFor(selected); transport != nil {
+		t.Fatal("removed auth received a transport")
+	}
+	if calls := provider.calls.Load(); calls != 0 {
+		t.Fatalf("removed auth reached provider %d times, want 0", calls)
+	}
+	if errClose := manager.CloseExecutors(); errClose != nil {
+		t.Fatalf("CloseExecutors() error = %v", errClose)
+	}
+	if !provider.closed.Load() {
+		t.Fatal("round tripper provider was not closed")
+	}
 }
 
 func TestDeleteWithOperationRollbackUsesLatestRuntimeState(t *testing.T) {

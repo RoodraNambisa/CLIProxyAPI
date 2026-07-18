@@ -739,6 +739,30 @@ func TestChatGPTWebBufferedErrorBodiesAreBounded(t *testing.T) {
 	}
 }
 
+func TestChatGPTWebGETWithoutPollBudget(t *testing.T) {
+	const responseBody = `{"ok":true}`
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		_, _ = io.WriteString(w, responseBody)
+	}))
+	defer origin.Close()
+
+	executor := NewChatGPTWebExecutor(nil, nil)
+	executor.runtimeBaseURL = origin.URL
+	client, credential, err := executor.newRuntimeClient(chatGPTWebRuntimeAuth())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.CloseIdleConnections()
+
+	_, payload, err := executor.doChatGPTWebGET(context.Background(), client, credential, "/backend-api/get", nil)
+	if err != nil {
+		t.Fatalf("GET error = %v", err)
+	}
+	if string(payload) != responseBody {
+		t.Fatalf("GET payload = %q, want %q", payload, responseBody)
+	}
+}
+
 func TestChatGPTWebSuccessfulResponseBodyIsBounded(t *testing.T) {
 	response := &fhttp.Response{
 		StatusCode: http.StatusOK,
