@@ -551,6 +551,24 @@ func TestResponsesSSEFramerImagePassthroughFramesLogicalChunks(t *testing.T) {
 	}
 }
 
+func TestResponsesSSEFramerImagePassthroughBuffersSplitFrame(t *testing.T) {
+	state := &coreexecutor.ImageGenerationStreamPassthroughState{}
+	state.SetEnabled(true)
+	framer := &responsesSSEFramer{passthroughState: state}
+	var output strings.Builder
+
+	framer.WriteChunk(&output, []byte(`data: {"type":"response.output_item.added","item":{"type":"image_`))
+	if output.Len() != 0 {
+		t.Fatalf("partial image frame was emitted: %q", output.String())
+	}
+	framer.WriteChunk(&output, []byte("generation_call\"}}\n\n"))
+
+	want := "data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"image_generation_call\"}}\n\n"
+	if got := output.String(); got != want {
+		t.Fatalf("split image frame output = %q, want %q", got, want)
+	}
+}
+
 func TestResponsesSSEFramerRejectsUnboundedIncompleteFrame(t *testing.T) {
 	framer := &responsesSSEFramer{maxPendingBytes: 32}
 	var output strings.Builder

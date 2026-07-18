@@ -89,14 +89,6 @@ func (f *responsesSSEFramer) WriteChunk(w io.Writer, chunk []byte) {
 		_, _ = w.Write(chunk)
 		return
 	}
-	if f.imagePassthroughEnabled() {
-		if len(f.pending) > 0 {
-			writeResponsesSSEChunk(w, f.pending)
-			f.pending = f.pending[:0]
-		}
-		writeResponsesSSEChunk(w, chunk)
-		return
-	}
 	needsLineBreak := responsesSSENeedsLineBreak(f.pending, chunk)
 	limit := f.maxPendingBytes
 	if limit <= 0 {
@@ -189,13 +181,6 @@ func (f *responsesSSEFramer) Flush(w io.Writer) {
 		}
 		return
 	}
-	if f.imagePassthroughEnabled() {
-		if len(f.pending) > 0 {
-			writeResponsesSSEChunk(w, f.pending)
-			f.pending = f.pending[:0]
-		}
-		return
-	}
 	if len(f.pending) == 0 {
 		return
 	}
@@ -236,6 +221,10 @@ func (f *responsesSSEFramer) imagePassthroughEnabled() bool {
 }
 
 func (f *responsesSSEFramer) writeFrame(w io.Writer, frame []byte) {
+	if f.imagePassthroughEnabled() {
+		writeResponsesSSEChunk(w, frame)
+		return
+	}
 	writeResponsesSSEChunk(w, f.repairFrame(frame))
 }
 
