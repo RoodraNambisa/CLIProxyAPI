@@ -166,6 +166,27 @@ func (l *authRequestWindowLimiter) tryAcquireAt(authID string, policy authReques
 	return true, authRequestLimitBlock{}
 }
 
+func (m *Manager) acquireAdditionalAuthRequest(auth *Auth) error {
+	if m == nil || auth == nil {
+		return nil
+	}
+	limiter := m.authRequestLimiter()
+	if limiter == nil {
+		return nil
+	}
+	for {
+		policy := m.routingAuthRequestLimitPolicyForPriority(authPriority(auth))
+		acquired, block := limiter.tryAcquireAt(auth.ID, policy, limiter.nowTime())
+		if acquired {
+			return nil
+		}
+		if block.stalePolicy {
+			continue
+		}
+		return newAuthRequestLimitedError(block)
+	}
+}
+
 type authRequestLimitBlock struct {
 	limit         int
 	windowMinutes int

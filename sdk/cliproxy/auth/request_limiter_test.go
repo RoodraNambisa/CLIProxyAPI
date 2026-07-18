@@ -1188,6 +1188,139 @@ func (requestLimitRetryError) StatusCode() int      { return http.StatusBadGatew
 func (requestLimitRetryError) SkipAuthResult() bool { return true }
 func (requestLimitRetryError) RetryOtherAuth() bool { return true }
 
+func enableManagerRequestLimitForTest(t *testing.T, manager *Manager, limit int) time.Time {
+	t.Helper()
+	cfg := &internalconfig.Config{}
+	if current := manager.currentConfig(); current != nil {
+		clone := *current
+		cfg = &clone
+	}
+	cfg.Routing.PerAuthRequestLimit = limit
+	cfg.Routing.PerAuthRequestWindowMinutes = 5
+	manager.SetConfig(cfg)
+	fixed := time.Date(2026, 7, 18, 12, 0, 10, 0, time.UTC)
+	manager.scheduler.requestLimiter.now = func() time.Time { return fixed }
+	return fixed
+}
+
+func TestManagerPerAuthRequestLimitCountsSameAuthModelPoolAttempts(t *testing.T) {
+	const alias = "request-limited-model-pool"
+	models := []internalconfig.OpenAICompatibilityModel{
+		{Name: "first-upstream", Alias: alias},
+		{Name: "second-upstream", Alias: alias},
+	}
+
+	t.Run("execute", func(t *testing.T) {
+		executor := &openAICompatPoolExecutor{
+			id:            "pool",
+			executeErrors: map[string]error{"first-upstream": requestLimitRetryError{}},
+		}
+		manager := newOpenAICompatPoolTestManager(t, alias, models, executor)
+		enableManagerRequestLimitForTest(t, manager, 1)
+
+		_, errExecute := manager.Execute(t.Context(), []string{"pool"}, cliproxyexecutor.Request{Model: alias}, cliproxyexecutor.Options{})
+		if !isAuthRequestLimitedError(errExecute) {
+			t.Fatalf("Execute() error = %T %v, want auth_request_limited", errExecute, errExecute)
+		}
+		if got := executor.ExecuteModels(); len(got) != 1 || got[0] != "first-upstream" {
+			t.Fatalf("Execute() models = %v, want only first-upstream", got)
+		}
+	})
+
+	t.Run("count", func(t *testing.T) {
+		executor := &openAICompatPoolExecutor{
+			id:          "pool",
+			countErrors: map[string]error{"first-upstream": requestLimitRetryError{}},
+		}
+		manager := newOpenAICompatPoolTestManager(t, alias, models, executor)
+		enableManagerRequestLimitForTest(t, manager, 1)
+
+		_, errCount := manager.ExecuteCount(t.Context(), []string{"pool"}, cliproxyexecutor.Request{Model: alias}, cliproxyexecutor.Options{})
+		if !isAuthRequestLimitedError(errCount) {
+			t.Fatalf("ExecuteCount() error = %T %v, want auth_request_limited", errCount, errCount)
+		}
+		if got := executor.CountModels(); len(got) != 1 || got[0] != "first-upstream" {
+			t.Fatalf("ExecuteCount() models = %v, want only first-upstream", got)
+		}
+	})
+
+	t.Run("stream", func(t *testing.T) {
+		executor := &openAICompatPoolExecutor{
+			id:                "pool",
+			streamFirstErrors: map[string]error{"first-upstream": requestLimitRetryError{}},
+		}
+		manager := newOpenAICompatPoolTestManager(t, alias, models, executor)
+		enableManagerRequestLimitForTest(t, manager, 1)
+
+		_, errStream := manager.ExecuteStream(t.Context(), []string{"pool"}, cliproxyexecutor.Request{Model: alias}, cliproxyexecutor.Options{})
+		if !isAuthRequestLimitedError(errStream) {
+			t.Fatalf("ExecuteStream() error = %T %v, want auth_request_limited", errStream, errStream)
+		}
+		if got := executor.StreamModels(); len(got) != 1 || got[0] != "first-upstream" {
+			t.Fatalf("ExecuteStream() models = %v, want only first-upstream", got)
+		}
+	})
+}
+
+func TestManagerPerAuthRequestLimitCountsUnauthorizedRefreshRetry(t *testing.T) {
+	tests := []struct {
+		name   string
+		invoke func(context.Context, *Manager, string) error
+		calls  func(*antigravityUnauthorizedRefreshExecutor) []string
+	}{
+		{
+			name: "execute",
+			invoke: func(ctx context.Context, manager *Manager, model string) error {
+				_, errExecute := manager.Execute(ctx, []string{"antigravity"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
+				return errExecute
+			},
+			calls: func(executor *antigravityUnauthorizedRefreshExecutor) []string { return executor.executeCalls },
+		},
+		{
+			name: "count",
+			invoke: func(ctx context.Context, manager *Manager, model string) error {
+				_, errCount := manager.ExecuteCount(ctx, []string{"antigravity"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
+				return errCount
+			},
+			calls: func(executor *antigravityUnauthorizedRefreshExecutor) []string { return executor.countCalls },
+		},
+		{
+			name: "stream",
+			invoke: func(ctx context.Context, manager *Manager, model string) error {
+				_, errStream := manager.ExecuteStream(ctx, []string{"antigravity"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
+				return errStream
+			},
+			calls: func(executor *antigravityUnauthorizedRefreshExecutor) []string { return executor.streamCalls },
+		},
+	}
+
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			manager, executor, primary, backup, model := newAntigravityUnauthorizedFixture(t, false)
+			fixed := enableManagerRequestLimitForTest(t, manager, 1)
+			policy := manager.routingAuthRequestLimitPolicyForPriority(authPriority(backup))
+			if acquired, _ := manager.authRequestLimiter().tryAcquireAt(backup.ID, policy, fixed); !acquired {
+				t.Fatal("failed to consume backup request quota")
+			}
+
+			errInvoke := testCase.invoke(t.Context(), manager, model)
+			if !isAuthRequestLimitedError(errInvoke) {
+				t.Fatalf("request error = %T %v, want auth_request_limited", errInvoke, errInvoke)
+			}
+			executor.mu.Lock()
+			calls := append([]string(nil), testCase.calls(executor)...)
+			refreshCalls := executor.refreshCalls
+			executor.mu.Unlock()
+			if len(calls) != 1 || calls[0] != primary.ID {
+				t.Fatalf("upstream calls = %v, want one primary attempt", calls)
+			}
+			if refreshCalls != 1 {
+				t.Fatalf("refresh calls = %d, want 1", refreshCalls)
+			}
+		})
+	}
+}
+
 type requestLimitRetryExecutor struct {
 	schedulerTestExecutor
 	mu    sync.Mutex

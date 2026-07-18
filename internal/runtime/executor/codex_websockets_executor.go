@@ -336,12 +336,12 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 		}
 		if respHS != nil && respHS.StatusCode == http.StatusUpgradeRequired {
 			if !helps.RequestBodyReplayable(ctx, opts) {
-				return resp, statusErr{code: respHS.StatusCode, msg: string(bodyErr)}
+				return resp, newCodexWebsocketHandshakeStatusErr(respHS.StatusCode, bodyErr, respHS.Header)
 			}
 			return e.CodexExecutor.Execute(ctx, auth, req, opts)
 		}
 		if respHS != nil && respHS.StatusCode > 0 {
-			return resp, statusErr{code: respHS.StatusCode, msg: string(bodyErr)}
+			return resp, newCodexWebsocketHandshakeStatusErr(respHS.StatusCode, bodyErr, respHS.Header)
 		}
 		helps.RecordAPIWebsocketError(ctx, e.cfg, "dial", errDial)
 		return resp, errDial
@@ -591,14 +591,14 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 		if respHS != nil && respHS.StatusCode == http.StatusUpgradeRequired {
 			if !helps.RequestBodyReplayable(ctx, opts) {
 				cleanupBodies()
-				return nil, statusErr{code: respHS.StatusCode, msg: string(bodyErr)}
+				return nil, newCodexWebsocketHandshakeStatusErr(respHS.StatusCode, bodyErr, respHS.Header)
 			}
 			cleanupBodies()
 			return e.CodexExecutor.ExecuteStream(ctx, auth, req, opts)
 		}
 		if respHS != nil && respHS.StatusCode > 0 {
 			cleanupBodies()
-			return nil, statusErr{code: respHS.StatusCode, msg: string(bodyErr)}
+			return nil, newCodexWebsocketHandshakeStatusErr(respHS.StatusCode, bodyErr, respHS.Header)
 		}
 		helps.RecordAPIWebsocketError(ctx, e.cfg, "dial", errDial)
 		cleanupBodies()
@@ -1270,6 +1270,24 @@ type statusErrWithHeaders struct {
 	headers http.Header
 }
 
+func newCodexWebsocketStatusErr(status int, body []byte) statusErr {
+	return statusErr{
+		code:           status,
+		msg:            string(body),
+		skipAuthResult: isCodexContextTooLargeRequestError(status, body),
+	}
+}
+
+func newCodexWebsocketHandshakeStatusErr(status int, body []byte, headers http.Header) statusErrWithHeaders {
+	statusError := newCodexWebsocketStatusErr(status, body)
+	if retryAfter := parseCodexRetryAfter(status, body, time.Now()); retryAfter != nil {
+		statusError.retryAfter = retryAfter
+	} else if status == http.StatusTooManyRequests {
+		statusError.retryAfter = parseXAIRetryAfterHeader(headers.Get("Retry-After"), time.Now())
+	}
+	return statusErrWithHeaders{statusErr: statusError, headers: headers.Clone()}
+}
+
 func (e statusErrWithHeaders) Headers() http.Header {
 	if e.headers == nil {
 		return nil
@@ -1294,7 +1312,7 @@ func parseCodexWebsocketError(payload []byte) (error, bool) {
 
 	out := buildCodexWebsocketErrorPayload(payload, status)
 	headers := parseCodexWebsocketErrorHeaders(payload)
-	statusError := statusErr{code: status, msg: string(out)}
+	statusError := newCodexWebsocketStatusErr(status, out)
 	if retryAfter := parseCodexRetryAfter(status, out, time.Now()); retryAfter != nil {
 		statusError.retryAfter = retryAfter
 	} else if isCodexWebsocketConnectionLimitError(payload) {

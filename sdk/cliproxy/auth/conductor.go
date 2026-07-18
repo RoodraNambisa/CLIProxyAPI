@@ -1887,6 +1887,11 @@ func (m *Manager) executeStreamWithModelPool(ctx, resultCtx context.Context, exe
 			}
 			return nil, &Error{Code: "request_body_released", Message: "request body released; retry disabled"}
 		}
+		if idx > 0 {
+			if errLimit := m.acquireAdditionalAuthRequest(auth); errLimit != nil {
+				return nil, errLimit
+			}
+		}
 		resultModel := m.stateModelForExecution(auth, routeModel, execModel, pooled)
 		execReq := req
 		execReq.Model = execModel
@@ -4118,9 +4123,15 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 		baseReq := sanitizeDownstreamWebsocketFallbackRequest(execCtx, auth, req)
 		var authErr error
 		didRefreshOnUnauthorized := refreshedOnUnauthorized
-		for _, upstreamModel := range models {
+		for modelIndex, upstreamModel := range models {
 			if !requestBodyReplayable(execCtx, opts) {
 				break
+			}
+			if modelIndex > 0 {
+				if errLimit := m.acquireAdditionalAuthRequest(auth); errLimit != nil {
+					authErr = errLimit
+					break
+				}
 			}
 			resultModel := m.stateModelForExecution(auth, routeModel, upstreamModel, pooled)
 			execReq := baseReq
@@ -4181,6 +4192,10 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 					auth = refreshed
 					opts = withSelectedAuthInstanceMetadata(opts, auth)
 					auth.bindExecutorOwner(executor)
+					if errLimit := m.acquireAdditionalAuthRequest(auth); errLimit != nil {
+						authErr = errLimit
+						break
+					}
 					retryCtx, releaseRetry, retryActive := auth.BeginRuntimeExecution(execCtx)
 					if !retryActive {
 						roundState.forgetRetiredAttempt(auth)
@@ -4347,9 +4362,15 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 		baseReq := sanitizeDownstreamWebsocketFallbackRequest(execCtx, auth, req)
 		var authErr error
 		didRefreshOnUnauthorized := refreshedOnUnauthorized
-		for _, upstreamModel := range models {
+		for modelIndex, upstreamModel := range models {
 			if !requestBodyReplayable(execCtx, opts) {
 				break
+			}
+			if modelIndex > 0 {
+				if errLimit := m.acquireAdditionalAuthRequest(auth); errLimit != nil {
+					authErr = errLimit
+					break
+				}
 			}
 			resultModel := m.stateModelForExecution(auth, routeModel, upstreamModel, pooled)
 			execReq := baseReq
@@ -4409,6 +4430,10 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 					auth = refreshed
 					opts = withSelectedAuthInstanceMetadata(opts, auth)
 					auth.bindExecutorOwner(executor)
+					if errLimit := m.acquireAdditionalAuthRequest(auth); errLimit != nil {
+						authErr = errLimit
+						break
+					}
 					retryCtx, releaseRetry, retryActive := auth.BeginRuntimeExecution(execCtx)
 					if !retryActive {
 						roundState.forgetRetiredAttempt(auth)
@@ -4622,29 +4647,34 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 					auth = refreshed
 					opts = withSelectedAuthInstanceMetadata(opts, auth)
 					auth.bindExecutorOwner(executor)
-					retryCtx, releaseRetry, retryActive := auth.BeginRuntimeExecution(execCtx)
-					if !retryActive {
-						roundState.forgetRetiredAttempt(auth)
-						if errWait := waitForRetiredAuthInstanceCleanup(execCtx, auth); errWait != nil {
-							return nil, errWait
+					if errLimit := m.acquireAdditionalAuthRequest(auth); errLimit != nil {
+						errStream = errLimit
+						markDeferredFailure = false
+					} else {
+						retryCtx, releaseRetry, retryActive := auth.BeginRuntimeExecution(execCtx)
+						if !retryActive {
+							roundState.forgetRetiredAttempt(auth)
+							if errWait := waitForRetiredAuthInstanceCleanup(execCtx, auth); errWait != nil {
+								return nil, errWait
+							}
+							continue
 						}
-						continue
-					}
-					streamResult, errStream = m.executeStreamWithModelPool(retryCtx, execCtx, executor, auth, providers, provider, execReq, opts, routeModel, models, pooled, aliasResult, releaseRetry)
-					if errStream == nil {
-						return streamResult, nil
-					}
-					if releaseRetry() {
-						roundState.forgetRetiredAttempt(auth)
-						if errWait := waitForRetiredAuthInstanceCleanup(execCtx, auth); errWait != nil {
-							return nil, errWait
+						streamResult, errStream = m.executeStreamWithModelPool(retryCtx, execCtx, executor, auth, providers, provider, execReq, opts, routeModel, models, pooled, aliasResult, releaseRetry)
+						if errStream == nil {
+							return streamResult, nil
 						}
-						continue
+						if releaseRetry() {
+							roundState.forgetRetiredAttempt(auth)
+							if errWait := waitForRetiredAuthInstanceCleanup(execCtx, auth); errWait != nil {
+								return nil, errWait
+							}
+							continue
+						}
+						if errCtx := execCtx.Err(); errCtx != nil {
+							return nil, errCtx
+						}
+						markDeferredFailure = deferAntigravityUnauthorizedStreamResult(auth, errStream)
 					}
-					if errCtx := execCtx.Err(); errCtx != nil {
-						return nil, errCtx
-					}
-					markDeferredFailure = deferAntigravityUnauthorizedStreamResult(auth, errStream)
 				}
 			}
 			if markDeferredFailure && !skipAuthResultForError(errStream) {

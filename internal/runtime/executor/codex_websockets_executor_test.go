@@ -991,6 +991,52 @@ func TestParseCodexWebsocketErrorPreservesWrappedBodyAndHeaders(t *testing.T) {
 	}
 }
 
+func TestParseCodexWebsocketErrorClassifiesContextErrorsAsRequestScoped(t *testing.T) {
+	tests := []struct {
+		name           string
+		payload        string
+		wantRequestErr bool
+	}{
+		{
+			name:           "explicit context code at 429",
+			payload:        `{"type":"error","status":429,"error":{"code":"context_length_exceeded","message":"maximum context length exceeded"}}`,
+			wantRequestErr: true,
+		},
+		{
+			name:           "strict token count error",
+			payload:        `{"type":"error","status":400,"error":{"type":"invalid_request_error","message":"too many tokens in request"}}`,
+			wantRequestErr: true,
+		},
+		{
+			name:           "token rate limit remains credential retryable",
+			payload:        `{"type":"error","status":429,"error":{"code":"rate_limit_exceeded","message":"too many tokens per minute"}}`,
+			wantRequestErr: false,
+		},
+	}
+
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			err, ok := parseCodexWebsocketError([]byte(testCase.payload))
+			if !ok {
+				t.Fatal("expected websocket error")
+			}
+			classified, ok := err.(interface {
+				SkipAuthResult() bool
+				RetryOtherAuth() bool
+			})
+			if !ok {
+				t.Fatalf("error = %T, want request classification methods", err)
+			}
+			if got := classified.SkipAuthResult(); got != testCase.wantRequestErr {
+				t.Fatalf("SkipAuthResult() = %v, want %v; error=%v", got, testCase.wantRequestErr, err)
+			}
+			if classified.RetryOtherAuth() {
+				t.Fatalf("RetryOtherAuth() = true, want false; error=%v", err)
+			}
+		})
+	}
+}
+
 func TestCodexWebsocketsExecutionPreservesStructured429(t *testing.T) {
 	newServer := func(t *testing.T) *httptest.Server {
 		t.Helper()
@@ -1117,6 +1163,96 @@ func TestCodexWebsocketsExecuteStreamHandshakeFailureReleasesSessionLock(t *test
 		t.Fatal("session request mutex remained locked after handshake rejection")
 	}
 	sess.reqMu.Unlock()
+}
+
+func TestCodexWebsocketsHandshakeContextErrorIsRequestScoped(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error":{"code":"context_too_large","type":"invalid_request_error","message":"maximum context length exceeded"}}`))
+	}))
+	defer server.Close()
+
+	request := cliproxyexecutor.Request{
+		Model:   "gpt-5-codex",
+		Payload: []byte(`{"model":"gpt-5-codex","input":"hi","tools":[]}`),
+	}
+	auth := &cliproxyauth.Auth{ID: "auth-handshake-context", Attributes: map[string]string{"api_key": "sk-test", "base_url": server.URL}}
+	exec := NewCodexWebsocketsExecutor(&config.Config{})
+
+	assertRequestScoped := func(t *testing.T, err error) {
+		t.Helper()
+		if err == nil {
+			t.Fatal("error = nil, want handshake rejection")
+		}
+		classified, ok := err.(interface {
+			SkipAuthResult() bool
+			RetryOtherAuth() bool
+		})
+		if !ok || !classified.SkipAuthResult() || classified.RetryOtherAuth() {
+			t.Fatalf("error = %#v, want request-scoped context error", err)
+		}
+	}
+
+	t.Run("execute", func(t *testing.T) {
+		_, errExecute := exec.Execute(t.Context(), auth, request, cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatCodex})
+		assertRequestScoped(t, errExecute)
+	})
+
+	t.Run("stream", func(t *testing.T) {
+		_, errExecute := exec.ExecuteStream(t.Context(), auth, request, cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatCodex, Stream: true})
+		assertRequestScoped(t, errExecute)
+	})
+}
+
+func TestCodexWebsocketsHandshakeRateLimitPreservesRetryAfter(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Retry-After", "7")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"error":{"code":"rate_limit_exceeded","message":"too many tokens per minute"}}`))
+	}))
+	defer server.Close()
+
+	request := cliproxyexecutor.Request{
+		Model:   "gpt-5-codex",
+		Payload: []byte(`{"model":"gpt-5-codex","input":"hi","tools":[]}`),
+	}
+	auth := &cliproxyauth.Auth{ID: "auth-handshake-rate-limit", Attributes: map[string]string{"api_key": "sk-test", "base_url": server.URL}}
+	exec := NewCodexWebsocketsExecutor(&config.Config{})
+
+	assertRateLimit := func(t *testing.T, err error) {
+		t.Helper()
+		if err == nil {
+			t.Fatal("error = nil, want handshake rejection")
+		}
+		status, ok := err.(interface{ StatusCode() int })
+		if !ok || status.StatusCode() != http.StatusTooManyRequests {
+			t.Fatalf("error = %#v, want status 429", err)
+		}
+		retryable, ok := err.(interface{ RetryAfter() *time.Duration })
+		if !ok || retryable.RetryAfter() == nil || *retryable.RetryAfter() != 7*time.Second {
+			t.Fatalf("RetryAfter() = %#v, want 7s; error=%v", retryable, err)
+		}
+		withHeaders, ok := err.(interface{ Headers() http.Header })
+		if !ok || withHeaders.Headers().Get("Retry-After") != "7" {
+			t.Fatalf("Headers() = %#v, want Retry-After 7; error=%v", withHeaders, err)
+		}
+		classified, ok := err.(interface{ SkipAuthResult() bool })
+		if !ok || classified.SkipAuthResult() {
+			t.Fatalf("SkipAuthResult() = %#v, want false; error=%v", classified, err)
+		}
+	}
+
+	t.Run("execute", func(t *testing.T) {
+		_, errExecute := exec.Execute(t.Context(), auth, request, cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatCodex})
+		assertRateLimit(t, errExecute)
+	})
+
+	t.Run("stream", func(t *testing.T) {
+		_, errExecute := exec.ExecuteStream(t.Context(), auth, request, cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatCodex, Stream: true})
+		assertRateLimit(t, errExecute)
+	})
 }
 
 func TestApplyCodexHeadersUsesConfigUserAgentForOAuth(t *testing.T) {
