@@ -6,12 +6,14 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io/fs"
 	"net/http"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -308,7 +310,7 @@ func TestWriteRootFileAtomicallyForSnapshotRejectsConcurrentReplacement(t *testi
 		data := bytes.Clone(data)
 		go func() {
 			<-start
-			results <- writeRootFileAtomicallyForSnapshot(root, fileName, data, &expected, filepath.Join(dir, fileName))
+			results <- writeRootFileAtomicallyForSnapshot(t.Context(), root, fileName, data, &expected, filepath.Join(dir, fileName), nil)
 		}()
 	}
 	close(start)
@@ -483,6 +485,950 @@ func TestFileTokenStoreSaveCreatesMissingBaseDir(t *testing.T) {
 	}
 	if _, errStat := os.Stat(savedPath); errStat != nil {
 		t.Fatalf("saved auth does not exist: %v", errStat)
+	}
+}
+
+func TestFileTokenStoreSaveIfAbsentDoesNotReplaceExistingFile(t *testing.T) {
+	authDir := t.TempDir()
+	path := filepath.Join(authDir, "existing.json")
+	const existing = `{"type":"codex","access_token":"existing-token"}`
+	if errWrite := os.WriteFile(path, []byte(existing), 0o600); errWrite != nil {
+		t.Fatal(errWrite)
+	}
+	store := NewFileTokenStore()
+	store.SetBaseDir(authDir)
+	_, errSave := store.SaveIfAbsent(t.Context(), &cliproxyauth.Auth{
+		ID:       "existing.json",
+		FileName: "existing.json",
+		Provider: "chatgpt-web",
+		Metadata: map[string]any{"type": "chatgpt-web", "access_token": "replacement-token"},
+	})
+	if !errors.Is(errSave, cliproxyauth.ErrAuthAlreadyExists) {
+		t.Fatalf("SaveIfAbsent() error = %v, want auth already exists", errSave)
+	}
+	data, errRead := os.ReadFile(path)
+	if errRead != nil || string(data) != existing {
+		t.Fatalf("existing file changed: content=%q error=%v", data, errRead)
+	}
+}
+
+func TestFileTokenStoreSaveIfAbsentSerializesIndependentStoresOnFirstCreate(t *testing.T) {
+	authDir := t.TempDir()
+	firstStore := NewFileTokenStore()
+	firstStore.SetBaseDir(authDir)
+	secondStore := NewFileTokenStore()
+	secondStore.SetBaseDir(authDir)
+
+	type saveResult struct {
+		path string
+		err  error
+	}
+	start := make(chan struct{})
+	results := make(chan saveResult, 2)
+	for index, store := range []*FileTokenStore{firstStore, secondStore} {
+		go func(index int, store *FileTokenStore) {
+			<-start
+			path, errSave := store.SaveIfAbsent(context.Background(), &cliproxyauth.Auth{
+				ID:       "first-create.json",
+				FileName: "first-create.json",
+				Provider: "chatgpt-web",
+				Metadata: map[string]any{
+					"type":         "chatgpt-web",
+					"email":        "first-create@example.com",
+					"access_token": fmt.Sprintf("token-%d", index),
+				},
+			})
+			results <- saveResult{path: path, err: errSave}
+		}(index, store)
+	}
+	close(start)
+
+	var successCount int
+	var conflictCount int
+	for range 2 {
+		result := <-results
+		switch {
+		case result.err == nil:
+			successCount++
+			if result.path != filepath.Join(authDir, "first-create.json") {
+				t.Fatalf("saved path = %q", result.path)
+			}
+		case errors.Is(result.err, cliproxyauth.ErrAuthAlreadyExists):
+			conflictCount++
+		default:
+			t.Fatalf("SaveIfAbsent() error = %v", result.err)
+		}
+	}
+	if successCount != 1 || conflictCount != 1 {
+		t.Fatalf("SaveIfAbsent() results = %d success, %d conflict; want 1/1", successCount, conflictCount)
+	}
+}
+
+func TestFileTokenStoreSaveIfAbsentRejectsConcurrentDuplicateChatGPTWebEmail(t *testing.T) {
+	authDir := t.TempDir()
+	firstStore := NewFileTokenStore()
+	firstStore.SetBaseDir(authDir)
+	secondStore := NewFileTokenStore()
+	secondStore.SetBaseDir(authDir)
+
+	start := make(chan struct{})
+	results := make(chan error, 2)
+	for index, store := range []*FileTokenStore{firstStore, secondStore} {
+		go func(index int, store *FileTokenStore) {
+			<-start
+			_, errSave := store.SaveIfAbsent(context.Background(), &cliproxyauth.Auth{
+				ID:       fmt.Sprintf("account-%d.json", index),
+				FileName: fmt.Sprintf("account-%d.json", index),
+				Provider: "chatgpt-web",
+				Metadata: map[string]any{
+					"type":         "chatgpt-web",
+					"email":        "same@example.com",
+					"access_token": fmt.Sprintf("token-%d", index),
+				},
+			})
+			results <- errSave
+		}(index, store)
+	}
+	close(start)
+
+	var successCount int
+	var conflictCount int
+	for range 2 {
+		errSave := <-results
+		switch {
+		case errSave == nil:
+			successCount++
+		case errors.Is(errSave, cliproxyauth.ErrChatGPTWebEmailAlreadyExists):
+			conflictCount++
+		default:
+			t.Fatalf("SaveIfAbsent() error = %v", errSave)
+		}
+	}
+	if successCount != 1 || conflictCount != 1 {
+		t.Fatalf("SaveIfAbsent() results = %d success, %d email conflict; want 1/1", successCount, conflictCount)
+	}
+}
+
+func TestFileTokenStoreSaveIfAbsentRejectsChatGPTWebOutsideBaseDir(t *testing.T) {
+	baseDir := t.TempDir()
+	externalPath := filepath.Join(t.TempDir(), "external.json")
+	store := NewFileTokenStore()
+	store.SetBaseDir(baseDir)
+
+	_, errSave := store.SaveIfAbsent(t.Context(), &cliproxyauth.Auth{
+		ID:       externalPath,
+		FileName: externalPath,
+		Provider: "chatgpt-web",
+		Metadata: map[string]any{"type": "chatgpt-web", "email": "outside@example.com"},
+	})
+	if errSave == nil || !strings.Contains(errSave.Error(), "configured auth directory") {
+		t.Fatalf("SaveIfAbsent() error = %v, want managed-directory rejection", errSave)
+	}
+	if _, errStat := os.Stat(externalPath); !errors.Is(errStat, os.ErrNotExist) {
+		t.Fatalf("external auth was created: %v", errStat)
+	}
+}
+
+func TestSameFileTokenRelativePathUsesFilesystemIdentity(t *testing.T) {
+	dir := t.TempDir()
+	root, errRoot := os.OpenRoot(dir)
+	if errRoot != nil {
+		t.Fatal(errRoot)
+	}
+	defer root.Close()
+	if errWrite := root.WriteFile("Account.json", []byte(`{"type":"chatgpt-web"}`), 0o600); errWrite != nil {
+		t.Fatal(errWrite)
+	}
+	leftInfo, errLeft := root.Lstat("Account.json")
+	rightInfo, errRight := root.Lstat("account.json")
+	wantAlias := errLeft == nil && errRight == nil && os.SameFile(leftInfo, rightInfo)
+	if got := sameFileTokenRelativePath(root, "Account.json", "account.json"); got != wantAlias {
+		t.Fatalf("sameFileTokenRelativePath() = %t, want %t for current filesystem", got, wantAlias)
+	}
+	if !sameFileTokenRelativePath(root, "Account.json", "Account.json") {
+		t.Fatal("identical relative path was not recognized")
+	}
+}
+
+func TestFileTokenStoreSaveIfAbsentCaseAliasReturnsTargetConflict(t *testing.T) {
+	if runtime.GOOS != "darwin" && runtime.GOOS != "windows" {
+		t.Skip("case aliases are platform-specific")
+	}
+	authDir := t.TempDir()
+	if errWrite := os.WriteFile(filepath.Join(authDir, "Account.json"), []byte(`{"type":"chatgpt-web","email":"same@example.com"}`), 0o600); errWrite != nil {
+		t.Fatalf("write existing auth: %v", errWrite)
+	}
+	upperInfo, errUpper := os.Stat(filepath.Join(authDir, "Account.json"))
+	lowerInfo, errLower := os.Stat(filepath.Join(authDir, "account.json"))
+	if errUpper != nil || errLower != nil || !os.SameFile(upperInfo, lowerInfo) {
+		t.Skip("current filesystem is case-sensitive")
+	}
+	store := NewFileTokenStore()
+	store.SetBaseDir(authDir)
+
+	_, errSave := store.SaveIfAbsent(t.Context(), &cliproxyauth.Auth{
+		ID:       "account.json",
+		FileName: "account.json",
+		Provider: "chatgpt-web",
+		Metadata: map[string]any{"type": "chatgpt-web", "email": "same@example.com"},
+	})
+	if !errors.Is(errSave, cliproxyauth.ErrAuthAlreadyExists) {
+		t.Fatalf("SaveIfAbsent() error = %v, want auth target conflict", errSave)
+	}
+	if errors.Is(errSave, cliproxyauth.ErrChatGPTWebEmailAlreadyExists) {
+		t.Fatalf("SaveIfAbsent() error = %v, must not report its own email as a duplicate", errSave)
+	}
+}
+
+func TestFileTokenStoreEmailConflictIsRolledBack(t *testing.T) {
+	authDir := t.TempDir()
+	if errWrite := os.WriteFile(filepath.Join(authDir, "existing.json"), []byte(`{"type":"chatgpt-web","email":"same@example.com"}`), 0o600); errWrite != nil {
+		t.Fatal(errWrite)
+	}
+	store := NewFileTokenStore()
+	store.SetBaseDir(authDir)
+	_, errSave := store.SaveIfAbsent(t.Context(), &cliproxyauth.Auth{
+		ID:       "new.json",
+		FileName: "new.json",
+		Provider: "chatgpt-web",
+		Metadata: map[string]any{"type": "chatgpt-web", "email": "same@example.com"},
+	})
+	if !errors.Is(errSave, cliproxyauth.ErrChatGPTWebEmailAlreadyExists) {
+		t.Fatalf("SaveIfAbsent() error = %v, want email conflict", errSave)
+	}
+	if outcome, explicit := cliproxyauth.SaveOutcomeFromError(errSave); !explicit || outcome != cliproxyauth.SaveOutcomeRolledBack {
+		t.Fatalf("SaveIfAbsent() outcome = %v, %t; want rolled back", outcome, explicit)
+	}
+}
+
+func TestFileTokenStoreEmailConflictUsesFinalStorageData(t *testing.T) {
+	authDir := t.TempDir()
+	if errWrite := os.WriteFile(filepath.Join(authDir, "existing.json"), []byte(`{"type":"chatgpt-web","email":"same@example.com"}`), 0o600); errWrite != nil {
+		t.Fatal(errWrite)
+	}
+	store := NewFileTokenStore()
+	store.SetBaseDir(authDir)
+	storage := &staticMarshaledTokenStorage{data: []byte(`{"type":"chatgpt-web","email":"same@example.com","access_token":"token"}`)}
+	_, errSave := store.SaveIfAbsent(t.Context(), &cliproxyauth.Auth{
+		ID:       "new.json",
+		FileName: "new.json",
+		Provider: "chatgpt-web",
+		Storage:  storage,
+		Metadata: map[string]any{"type": "chatgpt-web", "email": "different@example.com"},
+	})
+	if !errors.Is(errSave, cliproxyauth.ErrChatGPTWebEmailAlreadyExists) {
+		t.Fatalf("SaveIfAbsent() error = %v, want final-data email conflict", errSave)
+	}
+	if _, errStat := os.Stat(filepath.Join(authDir, "new.json")); !errors.Is(errStat, os.ErrNotExist) {
+		t.Fatalf("conflicting auth was installed: %v", errStat)
+	}
+}
+
+func TestFileTokenStoreChatGPTWebCreateRequiresManagedPathAndEmail(t *testing.T) {
+	base := t.TempDir()
+	authDir := filepath.Join(base, "auths")
+	store := NewFileTokenStore()
+	store.SetBaseDir(authDir)
+	outside := filepath.Join(base, "outside.json")
+	_, errSave := store.SaveIfAbsent(t.Context(), &cliproxyauth.Auth{
+		ID:       "outside.json",
+		FileName: outside,
+		Provider: "chatgpt-web",
+		Metadata: map[string]any{"type": "chatgpt-web"},
+	})
+	if errSave == nil || !strings.Contains(errSave.Error(), "configured auth directory") {
+		t.Fatalf("SaveIfAbsent() error = %v, want managed-directory rejection", errSave)
+	}
+	if _, errStat := os.Stat(outside); !errors.Is(errStat, os.ErrNotExist) {
+		t.Fatalf("outside auth was created: %v", errStat)
+	}
+
+	_, errSave = store.SaveIfAbsent(t.Context(), &cliproxyauth.Auth{
+		ID:       "missing-email.json",
+		FileName: "missing-email.json",
+		Provider: "chatgpt-web",
+		Metadata: map[string]any{"type": "chatgpt-web"},
+	})
+	if errSave == nil || !strings.Contains(errSave.Error(), "email is empty") {
+		t.Fatalf("SaveIfAbsent() error = %v, want empty-email rejection", errSave)
+	}
+}
+
+func TestFileTokenStoreRejectsPersistentLockPaths(t *testing.T) {
+	store := NewFileTokenStore()
+	store.SetBaseDir(t.TempDir())
+	auth := &cliproxyauth.Auth{
+		ID:       ".auth-root-lock",
+		FileName: ".auth-root-lock",
+		Provider: "codex",
+		Metadata: map[string]any{"type": "codex"},
+	}
+	if _, errSave := store.Save(t.Context(), auth); errSave == nil || !strings.Contains(errSave.Error(), "reserved lock name") {
+		t.Fatalf("Save() error = %v, want reserved lock rejection", errSave)
+	}
+	if errDelete := store.Delete(t.Context(), auth.ID); errDelete == nil || !strings.Contains(errDelete.Error(), "reserved lock name") {
+		t.Fatalf("Delete() error = %v, want reserved lock rejection", errDelete)
+	}
+}
+
+func TestFileTokenStoreAcceptsPhysicalBaseDirectoryCaseAlias(t *testing.T) {
+	if runtime.GOOS != "darwin" && runtime.GOOS != "windows" {
+		t.Skip("case aliases are platform-specific")
+	}
+	base := t.TempDir()
+	authDir := filepath.Join(base, "Auths")
+	if errMkdir := os.Mkdir(authDir, 0o700); errMkdir != nil {
+		t.Fatal(errMkdir)
+	}
+	aliasDir := filepath.Join(base, "auths")
+	baseInfo, errBase := os.Stat(authDir)
+	aliasInfo, errAlias := os.Stat(aliasDir)
+	if errBase != nil || errAlias != nil || !os.SameFile(baseInfo, aliasInfo) {
+		t.Skip("current filesystem is case-sensitive")
+	}
+	store := NewFileTokenStore()
+	store.SetBaseDir(authDir)
+	path := filepath.Join(aliasDir, "case-alias.json")
+	if _, errSave := store.SaveIfAbsent(t.Context(), &cliproxyauth.Auth{
+		ID:       "case-alias.json",
+		FileName: path,
+		Provider: "chatgpt-web",
+		Metadata: map[string]any{"type": "chatgpt-web", "email": "case-alias@example.com"},
+	}); errSave != nil {
+		t.Fatalf("SaveIfAbsent() error = %v", errSave)
+	}
+	if _, errStat := os.Stat(filepath.Join(authDir, "case-alias.json")); errStat != nil {
+		t.Fatalf("saved auth missing from physical base directory: %v", errStat)
+	}
+}
+
+func TestJoinFileTokenDeleteUnlockMarksSuccessfulDeleteCommitted(t *testing.T) {
+	wantErr := errors.New("unlock failed")
+	errDelete := joinFileTokenDeleteUnlock(nil, wantErr)
+	if !errors.Is(errDelete, wantErr) {
+		t.Fatalf("delete error = %v, want unlock error", errDelete)
+	}
+	if outcome, explicit := cliproxyauth.DeleteOutcomeFromError(errDelete); !explicit || outcome != cliproxyauth.DeleteOutcomeCommitted {
+		t.Fatalf("delete outcome = %v, %t; want committed", outcome, explicit)
+	}
+}
+
+func TestFileTokenStoreSaveIfAbsentStopsWaitingForRebuildAfterCancellation(t *testing.T) {
+	dir := t.TempDir()
+	root, errRoot := os.OpenRoot(dir)
+	if errRoot != nil {
+		t.Fatal(errRoot)
+	}
+	defer root.Close()
+	unlockRebuild, errRebuild := authfileguard.LockRootRebuild(root)
+	if errRebuild != nil {
+		t.Fatal(errRebuild)
+	}
+	defer unlockRebuild()
+
+	store := NewFileTokenStore()
+	store.SetBaseDir(dir)
+	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
+	defer cancel()
+	_, errSave := store.SaveIfAbsent(ctx, &cliproxyauth.Auth{
+		ID:       "canceled.json",
+		FileName: "canceled.json",
+		Provider: "chatgpt-web",
+		Metadata: map[string]any{"type": "chatgpt-web", "access_token": "token"},
+	})
+	if !errors.Is(errSave, context.DeadlineExceeded) {
+		t.Fatalf("SaveIfAbsent() error = %v, want deadline exceeded", errSave)
+	}
+	if _, errStat := os.Stat(filepath.Join(dir, "canceled.json")); !errors.Is(errStat, os.ErrNotExist) {
+		t.Fatalf("canceled auth exists: %v", errStat)
+	}
+}
+
+func TestFileTokenStoreSaveStopsWaitingForInProcessLocksAfterCancellation(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		sameStore  bool
+		secondName string
+	}{
+		{name: "store operation lock", sameStore: true, secondName: "second.json"},
+		{name: "shared path lock", secondName: "first.json"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			dir := t.TempDir()
+			firstStore := NewFileTokenStore()
+			firstStore.SetBaseDir(dir)
+			storage := &blockingMarshaledTokenStorage{
+				started: make(chan struct{}, 1),
+				release: make(chan struct{}),
+				data:    []byte(`{"type":"chatgpt-web","access_token":"first"}`),
+			}
+			firstDone := make(chan error, 1)
+			go func() {
+				_, errSave := firstStore.Save(t.Context(), &cliproxyauth.Auth{
+					ID: "first.json", FileName: "first.json", Provider: "chatgpt-web", Storage: storage,
+				})
+				firstDone <- errSave
+			}()
+			select {
+			case <-storage.started:
+			case <-time.After(time.Second):
+				t.Fatal("first save did not enter marshaling")
+			}
+			var releaseOnce sync.Once
+			release := func() { releaseOnce.Do(func() { close(storage.release) }) }
+			t.Cleanup(release)
+
+			secondStore := NewFileTokenStore()
+			if test.sameStore {
+				secondStore = firstStore
+			} else {
+				secondStore.SetBaseDir(dir)
+			}
+			ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
+			defer cancel()
+			_, errSecond := secondStore.Save(ctx, &cliproxyauth.Auth{
+				ID:       test.secondName,
+				FileName: test.secondName,
+				Provider: "chatgpt-web",
+				Metadata: map[string]any{"type": "chatgpt-web", "access_token": "second"},
+			})
+			if !errors.Is(errSecond, context.DeadlineExceeded) {
+				t.Fatalf("second Save() error = %v, want deadline exceeded", errSecond)
+			}
+
+			release()
+			select {
+			case errFirst := <-firstDone:
+				if errFirst != nil {
+					t.Fatalf("first Save() error: %v", errFirst)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("first save did not finish")
+			}
+		})
+	}
+}
+
+func TestFileTokenStoreSaveIfAbsentPersistsDisabledAuthInMissingDirectory(t *testing.T) {
+	authDir := t.TempDir()
+	store := NewFileTokenStore()
+	store.SetBaseDir(authDir)
+	auth := &cliproxyauth.Auth{
+		ID:       "nested/disabled.json",
+		FileName: "nested/disabled.json",
+		Provider: "chatgpt-web",
+		Disabled: true,
+		Metadata: map[string]any{
+			"type":            "chatgpt-web",
+			"email":           "disabled@example.com",
+			"lifecycle_state": "dead",
+		},
+	}
+
+	savedPath, errSave := store.SaveIfAbsent(t.Context(), auth)
+	if errSave != nil {
+		t.Fatalf("SaveIfAbsent() error = %v", errSave)
+	}
+	wantPath := filepath.Join(authDir, "nested", "disabled.json")
+	if savedPath != wantPath {
+		t.Fatalf("SaveIfAbsent() path = %q, want %q", savedPath, wantPath)
+	}
+	data, errRead := os.ReadFile(wantPath)
+	if errRead != nil {
+		t.Fatalf("ReadFile() error = %v", errRead)
+	}
+	if !bytes.Contains(data, []byte(`"disabled":true`)) {
+		t.Fatalf("persisted auth = %s, want disabled flag", data)
+	}
+	info, errStat := os.Stat(wantPath)
+	if errStat != nil {
+		t.Fatalf("Stat() error = %v", errStat)
+	}
+	if got := info.Mode().Perm(); got != 0o600 {
+		t.Fatalf("persisted mode = %o, want 600", got)
+	}
+	entries, errReadDir := os.ReadDir(filepath.Dir(wantPath))
+	if errReadDir != nil {
+		t.Fatal(errReadDir)
+	}
+	foundAuth := false
+	for _, entry := range entries {
+		switch {
+		case entry.Name() == filepath.Base(wantPath):
+			foundAuth = true
+		case strings.HasPrefix(entry.Name(), ".auth-lock-"):
+			// Cross-process lock files are intentionally persistent.
+		default:
+			t.Fatalf("unexpected persisted directory entry %q", entry.Name())
+		}
+	}
+	if !foundAuth {
+		t.Fatalf("persisted directory entries = %v, want %s", entries, filepath.Base(wantPath))
+	}
+}
+
+func TestFileTokenStoreSaveIfAbsentReportsUncertainDirectorySyncFailure(t *testing.T) {
+	authDir := t.TempDir()
+	store := NewFileTokenStore()
+	store.SetBaseDir(authDir)
+	wantErr := errors.New("sync failed")
+	store.syncDirectory = func(*os.Root, string) error { return wantErr }
+	auth := &cliproxyauth.Auth{
+		ID:       "retry.json",
+		FileName: "retry.json",
+		Provider: "chatgpt-web",
+		Metadata: map[string]any{"type": "chatgpt-web", "email": "retry@example.com"},
+	}
+
+	_, errSave := store.SaveIfAbsent(t.Context(), auth)
+	if !errors.Is(errSave, wantErr) {
+		t.Fatalf("SaveIfAbsent() error = %v, want %v", errSave, wantErr)
+	}
+	if outcome, ok := cliproxyauth.SaveOutcomeFromError(errSave); !ok || outcome != cliproxyauth.SaveOutcomeUncertain {
+		t.Fatalf("SaveIfAbsent() outcome = %v, %t; want uncertain", outcome, ok)
+	}
+	if errors.Is(errSave, cliproxyauth.ErrAuthAlreadyExists) {
+		t.Fatalf("SaveIfAbsent() error = %v, must not classify uncertain persistence as auth already exists", errSave)
+	}
+	path := filepath.Join(authDir, "retry.json")
+	data, errRead := os.ReadFile(path)
+	if errRead != nil || !bytes.Contains(data, []byte(`"email":"retry@example.com"`)) {
+		t.Fatalf("auth after uncertain sync = %s, %v", data, errRead)
+	}
+
+	store.syncDirectory = nil
+	if _, errRetry := store.SaveIfAbsent(t.Context(), auth); !errors.Is(errRetry, cliproxyauth.ErrAuthAlreadyExists) {
+		t.Fatalf("retry SaveIfAbsent() error = %v, want existing auth", errRetry)
+	}
+}
+
+func TestWriteRootFileAtomicallyKeepsInstalledDataAfterUncertainSync(t *testing.T) {
+	dir := t.TempDir()
+	const fileName = "auth.json"
+	path := filepath.Join(dir, fileName)
+	original := []byte(`{"type":"codex","access_token":"old"}`)
+	if errWrite := os.WriteFile(path, original, 0o600); errWrite != nil {
+		t.Fatal(errWrite)
+	}
+	if errChmod := os.Chmod(path, 0o640); errChmod != nil {
+		t.Fatal(errChmod)
+	}
+	root, errRoot := os.OpenRoot(dir)
+	if errRoot != nil {
+		t.Fatal(errRoot)
+	}
+	defer root.Close()
+	snapshot, errSnapshot := captureFileTokenSnapshot(root, fileName)
+	if errSnapshot != nil {
+		t.Fatal(errSnapshot)
+	}
+	wantErr := errors.New("sync failed")
+	syncCalls := 0
+	errWrite := writeRootFileAtomicallyForSnapshot(
+		t.Context(),
+		root,
+		fileName,
+		[]byte(`{"type":"codex","access_token":"new"}`),
+		&snapshot,
+		path,
+		func(*os.Root, string) error {
+			syncCalls++
+			if syncCalls == 1 {
+				return wantErr
+			}
+			return nil
+		},
+	)
+	if !errors.Is(errWrite, wantErr) {
+		t.Fatalf("write error = %v, want %v", errWrite, wantErr)
+	}
+	if outcome, ok := cliproxyauth.SaveOutcomeFromError(errWrite); !ok || outcome != cliproxyauth.SaveOutcomeUncertain {
+		t.Fatalf("write outcome = %v, %t; want uncertain", outcome, ok)
+	}
+	got, errRead := os.ReadFile(path)
+	want := []byte(`{"type":"codex","access_token":"new"}`)
+	if errRead != nil || !bytes.Equal(got, want) {
+		t.Fatalf("auth after uncertain sync = %s, %v; want %s", got, errRead, want)
+	}
+	assertFileMode(t, path, 0o600)
+}
+
+func TestWriteRootFileAtomicallyPreservesConcurrentReplacementOnSyncFailure(t *testing.T) {
+	dir := t.TempDir()
+	const fileName = "auth.json"
+	path := filepath.Join(dir, fileName)
+	original := []byte(`{"type":"codex","access_token":"old"}`)
+	concurrent := []byte(`{"type":"codex","access_token":"concurrent"}`)
+	if errWrite := os.WriteFile(path, original, 0o600); errWrite != nil {
+		t.Fatal(errWrite)
+	}
+	root, errRoot := os.OpenRoot(dir)
+	if errRoot != nil {
+		t.Fatal(errRoot)
+	}
+	defer root.Close()
+	snapshot, errSnapshot := captureFileTokenSnapshot(root, fileName)
+	if errSnapshot != nil {
+		t.Fatal(errSnapshot)
+	}
+	wantErr := errors.New("sync failed")
+	errWrite := writeRootFileAtomicallyForSnapshot(
+		t.Context(),
+		root,
+		fileName,
+		[]byte(`{"type":"codex","access_token":"new"}`),
+		&snapshot,
+		path,
+		func(*os.Root, string) error {
+			if errConcurrent := os.WriteFile(path, concurrent, 0o600); errConcurrent != nil {
+				t.Fatal(errConcurrent)
+			}
+			return wantErr
+		},
+	)
+	if !errors.Is(errWrite, wantErr) {
+		t.Fatalf("write error = %v, want %v", errWrite, wantErr)
+	}
+	if outcome, ok := cliproxyauth.SaveOutcomeFromError(errWrite); !ok || outcome != cliproxyauth.SaveOutcomeUncertain {
+		t.Fatalf("write outcome = %v, %t; want uncertain", outcome, ok)
+	}
+	got, errRead := os.ReadFile(path)
+	if errRead != nil || !bytes.Equal(got, concurrent) {
+		t.Fatalf("auth after concurrent replacement = %s, %v; want %s", got, errRead, concurrent)
+	}
+}
+
+func TestWriteRootFileAtomicallyPreservesConcurrentModeChangeOnSyncFailure(t *testing.T) {
+	dir := t.TempDir()
+	const fileName = "auth.json"
+	path := filepath.Join(dir, fileName)
+	if errWrite := os.WriteFile(path, []byte(`{"type":"codex","access_token":"old"}`), 0o600); errWrite != nil {
+		t.Fatal(errWrite)
+	}
+	root, errRoot := os.OpenRoot(dir)
+	if errRoot != nil {
+		t.Fatal(errRoot)
+	}
+	defer root.Close()
+	snapshot, errSnapshot := captureFileTokenSnapshot(root, fileName)
+	if errSnapshot != nil {
+		t.Fatal(errSnapshot)
+	}
+	newData := []byte(`{"type":"codex","access_token":"new"}`)
+	wantErr := errors.New("sync failed")
+	errWrite := writeRootFileAtomicallyForSnapshot(t.Context(), root, fileName, newData, &snapshot, path, func(*os.Root, string) error {
+		if errChmod := os.Chmod(path, 0o400); errChmod != nil {
+			t.Fatal(errChmod)
+		}
+		return wantErr
+	})
+	if !errors.Is(errWrite, wantErr) {
+		t.Fatalf("write error = %v, want %v", errWrite, wantErr)
+	}
+	if outcome, ok := cliproxyauth.SaveOutcomeFromError(errWrite); !ok || outcome != cliproxyauth.SaveOutcomeUncertain {
+		t.Fatalf("write outcome = %v, %t; want uncertain", outcome, ok)
+	}
+	got, errRead := os.ReadFile(path)
+	if errRead != nil || !bytes.Equal(got, newData) {
+		t.Fatalf("auth after concurrent chmod = %s, %v; want %s", got, errRead, newData)
+	}
+	info, errStat := os.Stat(path)
+	if errStat != nil {
+		t.Fatal(errStat)
+	}
+	if info.Mode().Perm() != 0o400 {
+		t.Fatalf("mode after concurrent chmod = %o, want 400", info.Mode().Perm())
+	}
+}
+
+func TestWriteRootFileAtomicallyDetectsParentReplacementDuringDirectorySync(t *testing.T) {
+	rootDir := t.TempDir()
+	parentDir := filepath.Join(rootDir, "nested")
+	if errMkdir := os.Mkdir(parentDir, 0o700); errMkdir != nil {
+		t.Fatalf("create parent: %v", errMkdir)
+	}
+	const fileName = "auth.json"
+	path := filepath.Join(parentDir, fileName)
+	original := []byte(`{"type":"codex","access_token":"old"}`)
+	if errWrite := os.WriteFile(path, original, 0o600); errWrite != nil {
+		t.Fatalf("write original auth: %v", errWrite)
+	}
+	root, errRoot := os.OpenRoot(parentDir)
+	if errRoot != nil {
+		t.Fatalf("OpenRoot() error = %v", errRoot)
+	}
+	defer root.Close()
+	snapshot, errSnapshot := captureFileTokenSnapshot(root, fileName)
+	if errSnapshot != nil {
+		t.Fatalf("capture snapshot: %v", errSnapshot)
+	}
+
+	movedParent := parentDir + "-moved"
+	replacement := []byte(`{"type":"codex","access_token":"replacement"}`)
+	syncCalls := 0
+	syncDirectory := func(*os.Root, string) error {
+		syncCalls++
+		if syncCalls != 1 {
+			return nil
+		}
+		if errRename := os.Rename(parentDir, movedParent); errRename != nil {
+			return errRename
+		}
+		if errMkdir := os.Mkdir(parentDir, 0o700); errMkdir != nil {
+			return errMkdir
+		}
+		return os.WriteFile(filepath.Join(parentDir, fileName), replacement, 0o600)
+	}
+	errWrite := writeRootFileAtomicallyForSnapshot(
+		t.Context(),
+		root,
+		fileName,
+		[]byte(`{"type":"codex","access_token":"new"}`),
+		&snapshot,
+		path,
+		syncDirectory,
+	)
+	if outcome, explicit := cliproxyauth.SaveOutcomeFromError(errWrite); !explicit || outcome != cliproxyauth.SaveOutcomeUncertain {
+		t.Fatalf("write outcome = %v, %t; want uncertain; error=%v", outcome, explicit, errWrite)
+	}
+	if got, errRead := os.ReadFile(filepath.Join(parentDir, fileName)); errRead != nil || !bytes.Equal(got, replacement) {
+		t.Fatalf("replacement path data = %s, %v; want %s", got, errRead, replacement)
+	}
+}
+
+func TestWriteRootFileAtomicallyDetectsParentReplacementWhenDirectorySyncFails(t *testing.T) {
+	rootDir := t.TempDir()
+	parentDir := filepath.Join(rootDir, "nested")
+	if errMkdir := os.Mkdir(parentDir, 0o700); errMkdir != nil {
+		t.Fatalf("create parent: %v", errMkdir)
+	}
+	const fileName = "auth.json"
+	path := filepath.Join(parentDir, fileName)
+	if errWrite := os.WriteFile(path, []byte(`{"type":"codex","access_token":"old"}`), 0o600); errWrite != nil {
+		t.Fatalf("write original auth: %v", errWrite)
+	}
+	root, errRoot := os.OpenRoot(parentDir)
+	if errRoot != nil {
+		t.Fatalf("OpenRoot() error = %v", errRoot)
+	}
+	defer root.Close()
+	snapshot, errSnapshot := captureFileTokenSnapshot(root, fileName)
+	if errSnapshot != nil {
+		t.Fatalf("capture snapshot: %v", errSnapshot)
+	}
+
+	movedParent := parentDir + "-moved"
+	wantSyncErr := errors.New("sync failed after parent replacement")
+	syncCalls := 0
+	syncDirectory := func(*os.Root, string) error {
+		syncCalls++
+		if syncCalls != 1 {
+			return nil
+		}
+		if errRename := os.Rename(parentDir, movedParent); errRename != nil {
+			return errRename
+		}
+		if errMkdir := os.Mkdir(parentDir, 0o700); errMkdir != nil {
+			return errMkdir
+		}
+		if errWrite := os.WriteFile(filepath.Join(parentDir, fileName), []byte(`{"type":"codex","access_token":"replacement"}`), 0o600); errWrite != nil {
+			return errWrite
+		}
+		return wantSyncErr
+	}
+	errWrite := writeRootFileAtomicallyForSnapshot(
+		t.Context(),
+		root,
+		fileName,
+		[]byte(`{"type":"codex","access_token":"new"}`),
+		&snapshot,
+		path,
+		syncDirectory,
+	)
+	if !errors.Is(errWrite, wantSyncErr) || !errors.Is(errWrite, authfileguard.ErrPersistGenerationStale) {
+		t.Fatalf("write error = %v, want sync failure and stale parent", errWrite)
+	}
+	if outcome, explicit := cliproxyauth.SaveOutcomeFromError(errWrite); !explicit || outcome != cliproxyauth.SaveOutcomeUncertain {
+		t.Fatalf("write outcome = %v, %t; want uncertain; error=%v", outcome, explicit, errWrite)
+	}
+}
+
+func TestWriteRootFileAtomicallyWithoutSnapshotReportsUncertainSync(t *testing.T) {
+	dir := t.TempDir()
+	const fileName = "auth.json"
+	path := filepath.Join(dir, fileName)
+	root, errRoot := os.OpenRoot(dir)
+	if errRoot != nil {
+		t.Fatal(errRoot)
+	}
+	defer root.Close()
+	wantErr := errors.New("sync failed")
+	data := []byte(`{"type":"codex","access_token":"new"}`)
+
+	errWrite := writeRootFileAtomicallyForSnapshot(
+		t.Context(),
+		root,
+		fileName,
+		data,
+		nil,
+		path,
+		func(*os.Root, string) error { return wantErr },
+	)
+	if !errors.Is(errWrite, wantErr) {
+		t.Fatalf("write error = %v, want %v", errWrite, wantErr)
+	}
+	if outcome, ok := cliproxyauth.SaveOutcomeFromError(errWrite); !ok || outcome != cliproxyauth.SaveOutcomeUncertain {
+		t.Fatalf("write outcome = %v, %t; want uncertain", outcome, ok)
+	}
+	got, errRead := os.ReadFile(path)
+	if errRead != nil || !bytes.Equal(got, data) {
+		t.Fatalf("auth after uncertain sync = %s, %v; want %s", got, errRead, data)
+	}
+}
+
+func TestStageRootAuthFilePreservesExplicitZeroMode(t *testing.T) {
+	dir := t.TempDir()
+	root, errRoot := os.OpenRoot(dir)
+	if errRoot != nil {
+		t.Fatal(errRoot)
+	}
+	defer root.Close()
+	if errStage := stageRootAuthFile(root, "auth.json", []byte(`{"type":"codex"}`), 0); errStage != nil {
+		t.Fatal(errStage)
+	}
+	info, errStat := os.Stat(filepath.Join(dir, "auth.json"))
+	if errStat != nil {
+		t.Fatal(errStat)
+	}
+	if mode := info.Mode().Perm(); mode != 0 {
+		t.Fatalf("staged mode = %o, want 0", mode)
+	}
+}
+
+func TestMapFileTokenCreateGenerationConflictPreservesRolledBackOutcome(t *testing.T) {
+	errStale := cliproxyauth.NewSaveOutcomeError(cliproxyauth.SaveOutcomeRolledBack, authfileguard.ErrPersistGenerationStale)
+	errMapped := mapFileTokenCreateGenerationConflict(true, errStale)
+	if !errors.Is(errMapped, cliproxyauth.ErrAuthAlreadyExists) {
+		t.Fatalf("mapped error = %v, want auth already exists", errMapped)
+	}
+	if outcome, explicit := cliproxyauth.SaveOutcomeFromError(errMapped); !explicit || outcome != cliproxyauth.SaveOutcomeRolledBack {
+		t.Fatalf("mapped outcome = %v, %t; want rolled back", outcome, explicit)
+	}
+}
+
+func TestJoinFileTokenSaveCleanupErrorMarksDurableWriteCommitted(t *testing.T) {
+	wantErr := errors.New("unlock failed")
+	errSave := joinFileTokenSaveCleanupError(nil, wantErr, true)
+	if !errors.Is(errSave, wantErr) {
+		t.Fatalf("cleanup error = %v, want %v", errSave, wantErr)
+	}
+	if outcome, ok := cliproxyauth.SaveOutcomeFromError(errSave); !ok || outcome != cliproxyauth.SaveOutcomeCommitted {
+		t.Fatalf("cleanup outcome = %v, %t; want committed", outcome, ok)
+	}
+
+	rolledBack := cliproxyauth.NewSaveOutcomeError(cliproxyauth.SaveOutcomeRolledBack, errors.New("write rolled back"))
+	errSave = joinFileTokenSaveCleanupError(rolledBack, wantErr, false)
+	if outcome, ok := cliproxyauth.SaveOutcomeFromError(errSave); !ok || outcome != cliproxyauth.SaveOutcomeRolledBack {
+		t.Fatalf("rolled-back cleanup outcome = %v, %t; want rolled back", outcome, ok)
+	}
+	errSave = joinFileTokenSaveCleanupError(errors.New("staging failed"), wantErr, false)
+	if outcome, ok := cliproxyauth.SaveOutcomeFromError(errSave); !ok || outcome != cliproxyauth.SaveOutcomeRolledBack {
+		t.Fatalf("pre-install cleanup outcome = %v, %t; want rolled back", outcome, ok)
+	}
+}
+
+func TestFileTokenStoreRestoresStorageMetadataWhenMarshalFails(t *testing.T) {
+	authDir := t.TempDir()
+	store := NewFileTokenStore()
+	store.SetBaseDir(authDir)
+	storage := &testTokenStorage{metadata: map[string]any{"marker": "original"}}
+	auth := &cliproxyauth.Auth{
+		ID:       "marshal-failure.json",
+		FileName: "marshal-failure.json",
+		Provider: "codex",
+		Storage:  storage,
+		Metadata: map[string]any{
+			"type":    "codex",
+			"marker":  "replacement",
+			"invalid": func() {},
+		},
+	}
+	if _, errSave := store.Save(t.Context(), auth); errSave == nil {
+		t.Fatal("Save() error = nil, want marshal failure")
+	}
+	got := storage.MetadataSnapshot()
+	if len(got) != 1 || got["marker"] != "original" {
+		t.Fatalf("storage metadata after failed save = %#v, want original snapshot", got)
+	}
+	if _, errStat := os.Stat(filepath.Join(authDir, auth.FileName)); !errors.Is(errStat, os.ErrNotExist) {
+		t.Fatalf("auth file exists after failed marshal: %v", errStat)
+	}
+}
+
+func TestFileTokenStoreKeepsStorageMetadataAfterUncertainDirectorySync(t *testing.T) {
+	authDir := t.TempDir()
+	path := filepath.Join(authDir, "uncertain-storage.json")
+	if errWrite := os.WriteFile(path, []byte(`{"type":"codex","marker":"original"}`), 0o600); errWrite != nil {
+		t.Fatal(errWrite)
+	}
+	store := NewFileTokenStore()
+	store.SetBaseDir(authDir)
+	wantErr := errors.New("sync failed")
+	store.syncDirectory = func(*os.Root, string) error { return wantErr }
+	storage := &testTokenStorage{metadata: map[string]any{"marker": "original"}}
+	auth := &cliproxyauth.Auth{
+		ID:       filepath.Base(path),
+		FileName: filepath.Base(path),
+		Provider: "codex",
+		Storage:  storage,
+		Metadata: map[string]any{"type": "codex", "marker": "replacement"},
+	}
+
+	_, errSave := store.Save(t.Context(), auth)
+	if !errors.Is(errSave, wantErr) {
+		t.Fatalf("Save() error = %v, want %v", errSave, wantErr)
+	}
+	if outcome, explicit := cliproxyauth.SaveOutcomeFromError(errSave); !explicit || outcome != cliproxyauth.SaveOutcomeUncertain {
+		t.Fatalf("Save() outcome = %v, %t; want uncertain", outcome, explicit)
+	}
+	gotMetadata := storage.MetadataSnapshot()
+	if gotMetadata["marker"] != "replacement" || gotMetadata["type"] != "codex" {
+		t.Fatalf("storage metadata after uncertain save = %#v, want replacement metadata", gotMetadata)
+	}
+	data, errRead := os.ReadFile(path)
+	if errRead != nil || !bytes.Contains(data, []byte(`"marker":"replacement"`)) {
+		t.Fatalf("persisted auth after uncertain save = %s, %v", data, errRead)
+	}
+}
+
+func TestFileTokenStoreUsesSetterOnlyMetadataContract(t *testing.T) {
+	authDir := t.TempDir()
+	store := NewFileTokenStore()
+	store.SetBaseDir(authDir)
+	storage := &setterOnlyTestTokenStorage{metadata: map[string]any{"marker": "original"}}
+	auth := &cliproxyauth.Auth{
+		ID:       "setter-only.json",
+		FileName: "setter-only.json",
+		Provider: "codex",
+		Storage:  storage,
+		Metadata: map[string]any{"type": "codex", "marker": "replacement"},
+	}
+	if _, errSave := store.Save(t.Context(), auth); errSave != nil {
+		t.Fatal(errSave)
+	}
+	if storage.metadata["marker"] != "replacement" || storage.metadata["type"] != "codex" || storage.metadata["disabled"] != false {
+		t.Fatalf("storage metadata = %#v, want injected runtime metadata", storage.metadata)
+	}
+	data, errRead := os.ReadFile(filepath.Join(authDir, auth.FileName))
+	if errRead != nil {
+		t.Fatal(errRead)
+	}
+	var persisted map[string]any
+	if errUnmarshal := json.Unmarshal(data, &persisted); errUnmarshal != nil {
+		t.Fatal(errUnmarshal)
+	}
+	if persisted["marker"] != "replacement" || persisted["type"] != "codex" || persisted["disabled"] != false {
+		t.Fatalf("persisted metadata = %#v", persisted)
 	}
 }
 
@@ -996,6 +1942,42 @@ func TestFileTokenStoreDeleteReportsUncertainAfterDirectorySyncFailure(t *testin
 	}
 }
 
+func TestFileTokenStoreDeleteDetectsParentReplacementDuringDirectorySync(t *testing.T) {
+	baseDir := t.TempDir()
+	parentDir := filepath.Join(baseDir, "nested")
+	if errMkdir := os.Mkdir(parentDir, 0o700); errMkdir != nil {
+		t.Fatalf("create parent: %v", errMkdir)
+	}
+	const relativePath = "nested/auth.json"
+	if errWrite := os.WriteFile(filepath.Join(baseDir, relativePath), []byte(`{"type":"codex"}`), 0o600); errWrite != nil {
+		t.Fatalf("write auth file: %v", errWrite)
+	}
+	replacement := []byte(`{"type":"codex","access_token":"replacement"}`)
+	movedParent := parentDir + "-moved"
+	store := NewFileTokenStore()
+	store.SetBaseDir(baseDir)
+	store.syncDirectory = func(*os.Root, string) error {
+		if errRename := os.Rename(parentDir, movedParent); errRename != nil {
+			return errRename
+		}
+		if errMkdir := os.Mkdir(parentDir, 0o700); errMkdir != nil {
+			return errMkdir
+		}
+		return os.WriteFile(filepath.Join(parentDir, "auth.json"), replacement, 0o600)
+	}
+
+	errDelete := store.Delete(t.Context(), relativePath)
+	if outcome, explicit := cliproxyauth.DeleteOutcomeFromError(errDelete); !explicit || outcome != cliproxyauth.DeleteOutcomeUncertain {
+		t.Fatalf("Delete() outcome = %v, %t; want uncertain; error=%v", outcome, explicit, errDelete)
+	}
+	if !errors.Is(errDelete, authfileguard.ErrPersistGenerationStale) {
+		t.Fatalf("Delete() error = %v, want stale parent", errDelete)
+	}
+	if got, errRead := os.ReadFile(filepath.Join(parentDir, "auth.json")); errRead != nil || !bytes.Equal(got, replacement) {
+		t.Fatalf("replacement auth = %s, %v; want %s", got, errRead, replacement)
+	}
+}
+
 func TestFileTokenStoreDeleteAuthFileAtRootIsIdempotent(t *testing.T) {
 	baseDir := t.TempDir()
 	root, errRoot := os.OpenRoot(baseDir)
@@ -1134,6 +2116,74 @@ func TestFileTokenStoreDeleteAuthFileAtRootPreparedPreservesReplacement(t *testi
 	}
 }
 
+func TestFileTokenStoreDeleteAuthFileAtRootPreparedDetectsParentReplacement(t *testing.T) {
+	baseDir := t.TempDir()
+	parentDir := filepath.Join(baseDir, "nested")
+	if errMkdir := os.Mkdir(parentDir, 0o700); errMkdir != nil {
+		t.Fatalf("create parent: %v", errMkdir)
+	}
+	const relativePath = "nested/auth.json"
+	if errWrite := os.WriteFile(filepath.Join(baseDir, relativePath), []byte(`{"type":"codex"}`), 0o600); errWrite != nil {
+		t.Fatalf("write auth file: %v", errWrite)
+	}
+	root, errRoot := os.OpenRoot(baseDir)
+	if errRoot != nil {
+		t.Fatalf("OpenRoot() error = %v", errRoot)
+	}
+	defer closeFileTokenRoot(root)
+	replacement := []byte(`{"type":"codex","access_token":"replacement"}`)
+	movedParent := parentDir + "-moved"
+	store := NewFileTokenStore()
+	store.syncDirectory = func(*os.Root, string) error {
+		if errRename := os.Rename(parentDir, movedParent); errRename != nil {
+			return errRename
+		}
+		if errMkdir := os.Mkdir(parentDir, 0o700); errMkdir != nil {
+			return errMkdir
+		}
+		return os.WriteFile(filepath.Join(parentDir, "auth.json"), replacement, 0o600)
+	}
+
+	errDelete := store.DeleteAuthFileAtRootPrepared(baseDir, root, relativePath, func(string, []byte) error { return nil })
+	if outcome, explicit := cliproxyauth.DeleteOutcomeFromError(errDelete); !explicit || outcome != cliproxyauth.DeleteOutcomeUncertain {
+		t.Fatalf("DeleteAuthFileAtRootPrepared() outcome = %v, %t; want uncertain; error=%v", outcome, explicit, errDelete)
+	}
+	if !errors.Is(errDelete, authfileguard.ErrPersistGenerationStale) {
+		t.Fatalf("DeleteAuthFileAtRootPrepared() error = %v, want stale parent", errDelete)
+	}
+	if got, errRead := os.ReadFile(filepath.Join(parentDir, "auth.json")); errRead != nil || !bytes.Equal(got, replacement) {
+		t.Fatalf("replacement auth = %s, %v; want %s", got, errRead, replacement)
+	}
+}
+
+func TestRestoreDisplacedFileTokenSnapshotPreservesConflict(t *testing.T) {
+	dir := t.TempDir()
+	root, errRoot := os.OpenRoot(dir)
+	if errRoot != nil {
+		t.Fatalf("OpenRoot() error = %v", errRoot)
+	}
+	defer closeFileTokenRoot(root)
+	displaced := []byte(`{"type":"codex","access_token":"displaced"}`)
+	current := []byte(`{"type":"codex","access_token":"current"}`)
+	if errWrite := os.WriteFile(filepath.Join(dir, ".auth-delete-test"), displaced, 0o600); errWrite != nil {
+		t.Fatalf("write displaced auth: %v", errWrite)
+	}
+	if errWrite := os.WriteFile(filepath.Join(dir, "auth.json"), current, 0o600); errWrite != nil {
+		t.Fatalf("write current auth: %v", errWrite)
+	}
+
+	errRestore := restoreDisplacedFileTokenSnapshot(root, ".auth-delete-test", "auth.json", syncAuthRootDirectory)
+	if !errors.Is(errRestore, authfileguard.ErrPersistGenerationStale) {
+		t.Fatalf("restore error = %v, want stale generation", errRestore)
+	}
+	if got, errRead := os.ReadFile(filepath.Join(dir, "auth.json")); errRead != nil || !bytes.Equal(got, current) {
+		t.Fatalf("current auth = %s, %v; want %s", got, errRead, current)
+	}
+	if got, errRead := os.ReadFile(filepath.Join(dir, ".auth-delete-test")); errRead != nil || !bytes.Equal(got, displaced) {
+		t.Fatalf("displaced auth = %s, %v; want %s", got, errRead, displaced)
+	}
+}
+
 func TestFileTokenStoreDeleteAuthFileAtRootPreparedFailureIsUncertain(t *testing.T) {
 	baseDir := t.TempDir()
 	const fileName = "auth.json"
@@ -1167,7 +2217,7 @@ func TestFileTokenStoreDeleteAuthFileAtRootWaitsForCrossProcessTargetLock(t *tes
 		t.Fatalf("open lock root: %v", errLockRoot)
 	}
 	defer lockRoot.Close()
-	unlockTarget, errLock := lockRootAuthTarget(lockRoot, "auth.json")
+	unlockTarget, errLock := lockRootAuthTarget(t.Context(), lockRoot, "auth.json")
 	if errLock != nil {
 		t.Fatalf("lock auth target: %v", errLock)
 	}
@@ -1821,6 +2871,10 @@ type testTokenStorage struct {
 	metadata map[string]any
 }
 
+type setterOnlyTestTokenStorage struct {
+	metadata map[string]any
+}
+
 type symlinkTokenStorage struct {
 	target string
 	called chan string
@@ -1839,6 +2893,10 @@ type blockingMarshaledTokenStorage struct {
 	started chan struct{}
 	release chan struct{}
 	data    []byte
+}
+
+type staticMarshaledTokenStorage struct {
+	data []byte
 }
 
 type invalidMarshaledTokenStorage struct{}
@@ -1868,6 +2926,17 @@ func (s *testTokenStorage) SetMetadata(meta map[string]any) {
 	s.metadata = cloned
 }
 
+func (s *testTokenStorage) MetadataSnapshot() map[string]any {
+	if s == nil {
+		return nil
+	}
+	cloned := make(map[string]any, len(s.metadata))
+	for key, value := range s.metadata {
+		cloned[key] = value
+	}
+	return cloned
+}
+
 func (s *testTokenStorage) SaveTokenToFile(authFilePath string) error {
 	raw, errMarshal := s.MarshalTokenData()
 	if errMarshal != nil {
@@ -1889,6 +2958,18 @@ func (s *testTokenStorage) MarshalTokenData() ([]byte, error) {
 		return nil, err
 	}
 	return raw, nil
+}
+
+func (s *setterOnlyTestTokenStorage) SetMetadata(meta map[string]any) {
+	s.metadata = cloneFileTokenMetadata(meta)
+}
+
+func (*setterOnlyTestTokenStorage) SaveTokenToFile(string) error {
+	return errors.New("legacy path should not be used")
+}
+
+func (s *setterOnlyTestTokenStorage) MarshalTokenData() ([]byte, error) {
+	return json.Marshal(s.metadata)
 }
 
 func (s *symlinkTokenStorage) SaveTokenToFile(authFilePath string) error {
@@ -1916,6 +2997,14 @@ func (*blockingMarshaledTokenStorage) SaveTokenToFile(string) error {
 	return errors.New("legacy path should not be used")
 }
 
+func (*staticMarshaledTokenStorage) SaveTokenToFile(string) error {
+	return errors.New("legacy path should not be used")
+}
+
+func (s *staticMarshaledTokenStorage) MarshalTokenData() ([]byte, error) {
+	return append([]byte(nil), s.data...), nil
+}
+
 func (s *blockingMarshaledTokenStorage) MarshalTokenData() ([]byte, error) {
 	s.started <- struct{}{}
 	<-s.release
@@ -1936,4 +3025,25 @@ func (*nullMarshaledTokenStorage) SaveTokenToFile(string) error {
 
 func (*nullMarshaledTokenStorage) MarshalTokenData() ([]byte, error) {
 	return []byte(`null`), nil
+}
+
+func TestJSONEqualUsesExactNumbers(t *testing.T) {
+	if jsonEqual(
+		[]byte(`{"generation":9007199254740992}`),
+		[]byte(`{"generation":9007199254740993}`),
+	) {
+		t.Fatal("adjacent large integer generations compared equal")
+	}
+	if !jsonEqual(
+		[]byte(`{"value":1,"exponent":1e3}`),
+		[]byte(`{"exponent":1000.0,"value":1.0}`),
+	) {
+		t.Fatal("mathematically equivalent JSON numbers compared different")
+	}
+	if !jsonEqual(
+		[]byte(`{"value":1e1000000000}`),
+		[]byte(`{"value":10e999999999}`),
+	) {
+		t.Fatal("large exponent equivalence required decimal expansion")
+	}
 }

@@ -1,6 +1,11 @@
 package auth
 
-import "strings"
+import (
+	"strings"
+	"time"
+
+	chatgptwebauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/chatgptweb"
+)
 
 const (
 	LifecycleStateLoginPending        = "login_pending"
@@ -37,8 +42,26 @@ func (a *Auth) LifecycleState() string {
 		return ""
 	}
 	if a.Metadata != nil {
-		state, _ := a.Metadata["lifecycle_state"].(string)
+		rawState, stateExists := a.Metadata["lifecycle_state"]
+		state, stateIsString := rawState.(string)
+		if stateExists && !stateIsString && strings.EqualFold(strings.TrimSpace(a.Provider), "chatgpt-web") {
+			return LifecycleStateReauthRequired
+		}
 		if normalized := strings.ToLower(strings.TrimSpace(state)); normalized != "" {
+			if strings.EqualFold(strings.TrimSpace(a.Provider), "chatgpt-web") {
+				switch normalized {
+				case LifecycleStateLoginPending,
+					LifecycleStateActive,
+					LifecycleStateRefreshing,
+					LifecycleStateReloginPending,
+					LifecycleStateReauthRequired,
+					LifecycleStateInteractionRequired,
+					LifecycleStateDead:
+					return normalized
+				default:
+					return LifecycleStateReauthRequired
+				}
+			}
 			return normalized
 		}
 	}
@@ -71,8 +94,25 @@ func applyLifecycleRuntimeState(auth *Auth) {
 		return
 	}
 	state := auth.LifecycleState()
+	if auth.Disabled {
+		auth.Status = StatusDisabled
+		auth.StatusMessage = ""
+		if state != "" && state != LifecycleStateActive && auth.Metadata != nil {
+			if reason, _ := auth.Metadata["lifecycle_reason"].(string); strings.TrimSpace(reason) != "" {
+				auth.StatusMessage = lifecycleRuntimeReason(auth, reason)
+			}
+		}
+		return
+	}
 	if state == "" {
 		return
+	}
+	if state == LifecycleStateActive {
+		now := time.Now()
+		updateAggregatedAvailability(auth, now)
+		if activeLifecycleCooldown(auth, now) {
+			return
+		}
 	}
 	status := RuntimeStatusForLifecycle(state)
 	if status == StatusUnknown {
@@ -82,6 +122,28 @@ func applyLifecycleRuntimeState(auth *Auth) {
 	auth.StatusMessage = ""
 	if auth.Metadata != nil {
 		reason, _ := auth.Metadata["lifecycle_reason"].(string)
-		auth.StatusMessage = strings.TrimSpace(reason)
+		auth.StatusMessage = lifecycleRuntimeReason(auth, reason)
 	}
+}
+
+func activeLifecycleCooldown(auth *Auth, now time.Time) bool {
+	if auth == nil {
+		return false
+	}
+	if auth.Unavailable && auth.CooldownScope == cooldownScopeAuth && auth.NextRetryAfter.After(now) {
+		return true
+	}
+	for _, state := range auth.ModelStates {
+		if state != nil && state.Status != StatusDisabled && state.Unavailable && state.NextRetryAfter.After(now) {
+			return true
+		}
+	}
+	return false
+}
+
+func lifecycleRuntimeReason(auth *Auth, reason string) string {
+	if auth != nil && strings.EqualFold(strings.TrimSpace(auth.Provider), chatgptwebauth.Provider) {
+		return chatgptwebauth.SafeLifecycleReason(reason)
+	}
+	return strings.TrimSpace(reason)
 }

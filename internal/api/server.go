@@ -728,6 +728,10 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.PATCH("/auth-files/status", s.mgmt.PatchAuthFileStatus)
 		mgmt.PATCH("/auth-files/fields", s.mgmt.PatchAuthFileFields)
 		mgmt.POST("/vertex/import", s.mgmt.ImportVertexCredential)
+		mgmt.POST("/chatgpt-web/login-tasks", s.mgmt.StartChatGPTWebLoginTask)
+		mgmt.GET("/chatgpt-web/login-tasks/:id", s.mgmt.GetChatGPTWebLoginTask)
+		mgmt.DELETE("/chatgpt-web/login-tasks/:id", s.mgmt.CancelChatGPTWebLoginTask)
+		mgmt.POST("/chatgpt-web/auth-files/:name/relogin", s.mgmt.ReloginChatGPTWebAuth)
 
 		mgmt.GET("/anthropic-auth-url", s.mgmt.RequestAnthropicToken)
 		mgmt.GET("/gemini-cli-auth-url", s.mgmt.RequestGeminiCLIToken)
@@ -928,9 +932,26 @@ func (s *Server) Stop(ctx context.Context) error {
 		}
 	}
 
-	// Shutdown the HTTP server.
-	if err := s.server.Shutdown(ctx); err != nil {
-		return fmt.Errorf("failed to shutdown HTTP server: %v", err)
+	// Cancel management-owned work while the HTTP server drains active requests.
+	managementDone := make(chan error, 1)
+	if s.mgmt != nil {
+		go func() {
+			managementDone <- s.mgmt.Shutdown(ctx)
+		}()
+	} else {
+		managementDone <- nil
+	}
+	errShutdown := s.server.Shutdown(ctx)
+	errManagement := <-managementDone
+	var shutdownErrors []error
+	if errShutdown != nil {
+		shutdownErrors = append(shutdownErrors, fmt.Errorf("failed to shutdown HTTP server: %w", errShutdown))
+	}
+	if errManagement != nil {
+		shutdownErrors = append(shutdownErrors, fmt.Errorf("failed to shutdown management tasks: %w", errManagement))
+	}
+	if len(shutdownErrors) > 0 {
+		return errors.Join(shutdownErrors...)
 	}
 
 	log.Debug("API server stopped")

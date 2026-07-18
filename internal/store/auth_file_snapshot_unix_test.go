@@ -3,6 +3,7 @@
 package store
 
 import (
+	"bytes"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -12,9 +13,186 @@ import (
 	"sync/atomic"
 	"syscall"
 	"testing"
+	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/authfileguard"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 )
+
+func TestWriteAuthFileAtomicallyRejectsReplacedParentWhileWaitingForTargetLock(t *testing.T) {
+	dir := t.TempDir()
+	const relativePath = "nested/auth.json"
+	originalPath := filepath.Join(dir, filepath.FromSlash(relativePath))
+	writeAuthSnapshotTestFile(t, originalPath)
+	root, errRoot := os.OpenRoot(dir)
+	if errRoot != nil {
+		t.Fatal(errRoot)
+	}
+	defer root.Close()
+	expected, errExpected := captureAuthFileSnapshot(root, filepath.FromSlash(relativePath))
+	if errExpected != nil {
+		t.Fatal(errExpected)
+	}
+	unlockTarget, errLock := authfileguard.LockRootTarget(root, filepath.FromSlash(relativePath))
+	if errLock != nil {
+		t.Fatal(errLock)
+	}
+	result := make(chan error, 1)
+	go func() {
+		result <- writeAuthFileAtomicallyAtRoot(root, filepath.FromSlash(relativePath), []byte(`{"type":"codex","access_token":"writer"}`), &expected)
+	}()
+
+	oldParent := filepath.Join(dir, "nested")
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		entries, errRead := os.ReadDir(oldParent)
+		if errRead != nil {
+			t.Fatal(errRead)
+		}
+		staged := false
+		for _, entry := range entries {
+			if strings.HasPrefix(entry.Name(), ".auth-write-") {
+				staged = true
+				break
+			}
+		}
+		if staged {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("writer did not stage its replacement")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	displacedParent := filepath.Join(dir, "nested-displaced")
+	if errRename := os.Rename(oldParent, displacedParent); errRename != nil {
+		t.Fatal(errRename)
+	}
+	if errMkdir := os.Mkdir(oldParent, 0o700); errMkdir != nil {
+		t.Fatal(errMkdir)
+	}
+	replacement := []byte(`{"type":"codex","access_token":"replacement"}`)
+	if errWrite := os.WriteFile(originalPath, replacement, 0o600); errWrite != nil {
+		t.Fatal(errWrite)
+	}
+	if errUnlock := unlockTarget(); errUnlock != nil {
+		t.Fatal(errUnlock)
+	}
+
+	select {
+	case errWrite := <-result:
+		if errWrite == nil {
+			t.Fatal("write succeeded after its opened parent was replaced")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("write did not finish after releasing the target lock")
+	}
+	got, errRead := os.ReadFile(originalPath)
+	if errRead != nil || !bytes.Equal(got, replacement) {
+		t.Fatalf("visible auth after parent replacement = %s, %v; want %s", got, errRead, replacement)
+	}
+}
+
+func TestWriteAuthFileAtomicallyRejectsReplacedRootWhileWaitingForTargetLock(t *testing.T) {
+	parentDir := t.TempDir()
+	authDir := filepath.Join(parentDir, "auths")
+	if errMkdir := os.Mkdir(authDir, 0o700); errMkdir != nil {
+		t.Fatal(errMkdir)
+	}
+	const fileName = "auth.json"
+	originalPath := filepath.Join(authDir, fileName)
+	writeAuthSnapshotTestFile(t, originalPath)
+	root, errRoot := os.OpenRoot(authDir)
+	if errRoot != nil {
+		t.Fatal(errRoot)
+	}
+	defer root.Close()
+	expected, errExpected := captureAuthFileSnapshot(root, fileName)
+	if errExpected != nil {
+		t.Fatal(errExpected)
+	}
+	unlockTarget, errLock := authfileguard.LockRootTarget(root, fileName)
+	if errLock != nil {
+		t.Fatal(errLock)
+	}
+	result := make(chan error, 1)
+	go func() {
+		result <- writeAuthFileAtomicallyAtRoot(root, fileName, []byte("{\"type\":\"codex\",\"access_token\":\"writer\"}"), &expected)
+	}()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		entries, errRead := os.ReadDir(authDir)
+		if errRead != nil {
+			t.Fatal(errRead)
+		}
+		staged := false
+		for _, entry := range entries {
+			if strings.HasPrefix(entry.Name(), ".auth-write-") {
+				staged = true
+				break
+			}
+		}
+		if staged {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("writer did not stage its replacement")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	displacedRoot := filepath.Join(parentDir, "auths-displaced")
+	if errRename := os.Rename(authDir, displacedRoot); errRename != nil {
+		t.Fatal(errRename)
+	}
+	if errMkdir := os.Mkdir(authDir, 0o700); errMkdir != nil {
+		t.Fatal(errMkdir)
+	}
+	replacement := []byte("{\"type\":\"codex\",\"access_token\":\"replacement\"}")
+	if errWrite := os.WriteFile(originalPath, replacement, 0o600); errWrite != nil {
+		t.Fatal(errWrite)
+	}
+	if errUnlock := unlockTarget(); errUnlock != nil {
+		t.Fatal(errUnlock)
+	}
+	select {
+	case errWrite := <-result:
+		if errWrite == nil {
+			t.Fatal("write succeeded after its root was replaced")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("write did not finish after releasing the target lock")
+	}
+	got, errRead := os.ReadFile(originalPath)
+	if errRead != nil || !bytes.Equal(got, replacement) {
+		t.Fatalf("visible auth after root replacement = %s, %v; want %s", got, errRead, replacement)
+	}
+}
+
+func TestOpenAuthSnapshotFileDoesNotBlockOnNamedPipe(t *testing.T) {
+	dir := t.TempDir()
+	const fileName = "raced.json"
+	if errFIFO := syscall.Mkfifo(filepath.Join(dir, fileName), 0o600); errFIFO != nil {
+		t.Skipf("named pipes unavailable: %v", errFIFO)
+	}
+	root, errRoot := os.OpenRoot(dir)
+	if errRoot != nil {
+		t.Fatal(errRoot)
+	}
+	defer root.Close()
+	result := make(chan error, 1)
+	go func() {
+		file, errOpen := openAuthSnapshotFile(root, fileName)
+		if file != nil {
+			errOpen = errors.Join(errOpen, file.Close())
+		}
+		result <- errOpen
+	}()
+	select {
+	case <-result:
+	case <-time.After(time.Second):
+		t.Fatal("auth snapshot open blocked on a named pipe")
+	}
+}
 
 type unsafeAuthSnapshotCase struct {
 	name    string

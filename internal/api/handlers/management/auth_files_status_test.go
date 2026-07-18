@@ -159,6 +159,59 @@ func TestPatchAuthFileStatus_DisableSetsMetadataDisabled(t *testing.T) {
 	}
 }
 
+func TestPatchAuthFileStatus_EnablePreservesChatGPTWebLifecycle(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		state  string
+		reason string
+	}{
+		{name: "dead", state: coreauth.LifecycleStateDead, reason: "account_deactivated"},
+		{name: "interaction required", state: coreauth.LifecycleStateInteractionRequired, reason: "passkey_required"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			manager := coreauth.NewManager(nil, nil, nil)
+			record := &coreauth.Auth{
+				ID:       "chatgpt-web-status.json",
+				FileName: "chatgpt-web-status.json",
+				Provider: "chatgpt-web",
+				Status:   coreauth.StatusDisabled,
+				Disabled: true,
+				Metadata: map[string]any{
+					"type":             "chatgpt-web",
+					"disabled":         true,
+					"lifecycle_state":  test.state,
+					"lifecycle_reason": test.reason,
+				},
+			}
+			if _, errRegister := manager.Register(context.Background(), record); errRegister != nil {
+				t.Fatal(errRegister)
+			}
+			h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, manager)
+			recorder := httptest.NewRecorder()
+			ctx, _ := gin.CreateTestContext(recorder)
+			request := httptest.NewRequest(http.MethodPatch, "/v0/management/auth-files/status", bytes.NewBufferString(`{"name":"chatgpt-web-status.json","disabled":false}`))
+			request.Header.Set("Content-Type", "application/json")
+			ctx.Request = request
+
+			h.PatchAuthFileStatus(ctx)
+
+			if recorder.Code != http.StatusOK {
+				t.Fatalf("status = %d, body=%s", recorder.Code, recorder.Body.String())
+			}
+			current, ok := manager.GetByID(record.ID)
+			if !ok || current == nil {
+				t.Fatal("enabled auth is not registered")
+			}
+			if current.Disabled || current.Status != coreauth.StatusError || current.StatusMessage != test.reason {
+				t.Fatalf("enabled lifecycle = disabled:%v status:%q message:%q", current.Disabled, current.Status, current.StatusMessage)
+			}
+			if _, exists := current.Metadata["disabled"]; exists {
+				t.Fatalf("disabled metadata was not cleared: %#v", current.Metadata)
+			}
+		})
+	}
+}
+
 func TestBuildAuthFromFileData_SetsSourceHashAttribute(t *testing.T) {
 	authDir := t.TempDir()
 	manager := coreauth.NewManager(nil, nil, nil)
@@ -249,6 +302,13 @@ func TestBuildAuthFromFileData_MapsChatGPTWebLifecycle(t *testing.T) {
 			reason:      "account_deactivated",
 			wantStatus:  coreauth.StatusError,
 			wantMessage: "account_deactivated",
+		},
+		{
+			name:        "invalid state fails closed",
+			state:       "secret-shaped-invalid-state",
+			reason:      "secret-shaped-invalid-reason",
+			wantStatus:  coreauth.StatusError,
+			wantMessage: "authentication_failed",
 		},
 		{
 			name:         "disabled overrides dead",
@@ -948,6 +1008,17 @@ func (s *managementTestTokenStorage) SetMetadata(meta map[string]any) {
 		cloned[key] = value
 	}
 	s.metadata = cloned
+}
+
+func (s *managementTestTokenStorage) MetadataSnapshot() map[string]any {
+	if s == nil {
+		return nil
+	}
+	cloned := make(map[string]any, len(s.metadata))
+	for key, value := range s.metadata {
+		cloned[key] = value
+	}
+	return cloned
 }
 
 func (s *managementTestTokenStorage) SaveTokenToFile(authFilePath string) error {

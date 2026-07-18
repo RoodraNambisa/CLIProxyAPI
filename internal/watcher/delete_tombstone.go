@@ -480,19 +480,19 @@ func lockAuthDeleteTarget(w *Watcher, path string) (func() error, error) {
 	if errRoot != nil {
 		return nil, errRoot
 	}
+	unlock, errLock := authfileguard.LockRootTarget(root, relativePath)
+	if errLock != nil {
+		return nil, errors.Join(errLock, root.Close())
+	}
 	parentPath := filepath.Dir(relativePath)
 	if parentPath != "." {
 		if errMkdir := root.MkdirAll(parentPath, 0o700); errMkdir != nil {
-			return nil, errors.Join(errMkdir, root.Close())
+			return nil, errors.Join(errMkdir, unlock(), root.Close())
 		}
 	}
-	parentRoot, leaf, closeParent, errParent := openAuthDeleteTargetParent(root, relativePath)
+	_, _, closeParent, errParent := openAuthDeleteTargetParent(root, relativePath)
 	if errParent != nil {
-		return nil, errors.Join(errParent, root.Close())
-	}
-	unlock, errLock := authfileguard.LockRootTarget(parentRoot, leaf)
-	if errLock != nil {
-		return nil, errors.Join(errLock, closeParent(), root.Close())
+		return nil, errors.Join(errParent, unlock(), root.Close())
 	}
 	return func() error {
 		return errors.Join(unlock(), closeParent(), root.Close())

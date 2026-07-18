@@ -8,6 +8,8 @@ import (
 	"net/url"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/sirupsen/logrus"
 )
@@ -181,17 +183,137 @@ func maskTraceMessage(message, proxyURL string) string {
 
 	maskedProxyURL := MaskProxyURL(proxyURL)
 	message = strings.ReplaceAll(message, proxyURL, maskedProxyURL)
+	if rawUserInfo, rawHost := rawProxyAuthorityParts(proxyURL); rawUserInfo != "" {
+		message = maskTraceUserInfoOccurrences(message, rawUserInfo, rawHost, maskedTraceUserInfo(rawUserInfo))
+	}
 
 	parsedURL, errParse := url.Parse(proxyURL)
 	if errParse != nil || parsedURL.User == nil {
 		return message
 	}
-	if _, hasPassword := parsedURL.User.Password(); !hasPassword {
-		return message
-	}
 
 	normalizedProxyURL := parsedURL.String()
 	message = strings.ReplaceAll(message, normalizedProxyURL, MaskProxyURL(normalizedProxyURL))
-	maskedUserInfo := url.User(parsedURL.User.Username()).String() + ":********@"
-	return strings.ReplaceAll(message, parsedURL.User.String()+"@", maskedUserInfo)
+	maskedUserInfo := "********@"
+	if _, hasPassword := parsedURL.User.Password(); hasPassword {
+		maskedUserInfo = "********:********@"
+	}
+	if encodedUserInfo := parsedURL.User.String(); encodedUserInfo != "" {
+		message = maskTraceUserInfoOccurrences(message, encodedUserInfo, parsedURL.Host, maskedUserInfo)
+	}
+	decodedUserInfo := parsedURL.User.Username()
+	if password, hasPassword := parsedURL.User.Password(); hasPassword {
+		decodedUserInfo += ":" + password
+	}
+	if decodedUserInfo != "" {
+		message = maskTraceUserInfoOccurrences(message, decodedUserInfo, parsedURL.Host, maskedUserInfo)
+	}
+	return message
+}
+
+func maskTraceUserInfoOccurrences(message, userInfo, host, masked string) string {
+	if message == "" || userInfo == "" {
+		return message
+	}
+	if host != "" {
+		message = strings.ReplaceAll(message, userInfo+"@"+host, masked+host)
+	}
+	needle := userInfo + "@"
+	var output strings.Builder
+	start := 0
+	changed := false
+	for start < len(message) {
+		relative := strings.Index(message[start:], needle)
+		if relative < 0 {
+			break
+		}
+		index := start + relative
+		after := index + len(needle)
+		if traceCredentialBoundaryBefore(message[:index]) &&
+			(strings.Contains(userInfo, ":") || traceCredentialBoundaryAfter(message[after:]) || traceMessageStartsWithProxyHost(message[after:], host)) {
+			output.WriteString(message[start:index])
+			output.WriteString(masked)
+			start = after
+			changed = true
+			continue
+		}
+		output.WriteString(message[start:after])
+		start = after
+	}
+	if !changed {
+		return message
+	}
+	output.WriteString(message[start:])
+	return output.String()
+}
+
+func traceMessageStartsWithProxyHost(message, host string) bool {
+	host = strings.TrimSpace(host)
+	if message == "" || host == "" {
+		return false
+	}
+	candidates := []string{host}
+	hostname := (&url.URL{Host: host}).Hostname()
+	if hostname != "" && !strings.EqualFold(hostname, host) {
+		candidates = append(candidates, hostname)
+		if strings.Contains(hostname, ":") {
+			candidates = append(candidates, "["+hostname+"]")
+		}
+	}
+	for _, candidate := range candidates {
+		if len(message) < len(candidate) || !strings.EqualFold(message[:len(candidate)], candidate) {
+			continue
+		}
+		remaining := message[len(candidate):]
+		if remaining == "" || remaining[0] == ':' || traceCredentialBoundaryAfter(remaining) {
+			return true
+		}
+	}
+	return false
+}
+
+func traceCredentialBoundaryBefore(prefix string) bool {
+	if prefix == "" {
+		return true
+	}
+	r, _ := utf8.DecodeLastRuneInString(prefix)
+	return !traceAuthorityRune(r)
+}
+
+func traceCredentialBoundaryAfter(suffix string) bool {
+	if suffix == "" {
+		return true
+	}
+	r, _ := utf8.DecodeRuneInString(suffix)
+	return !traceAuthorityRune(r)
+}
+
+func traceAuthorityRune(r rune) bool {
+	if unicode.IsLetter(r) || unicode.IsDigit(r) {
+		return true
+	}
+	return strings.ContainsRune("-._~:%[]", r)
+}
+
+func maskedTraceUserInfo(userInfo string) string {
+	if strings.Contains(userInfo, ":") {
+		return "********:********@"
+	}
+	return "********@"
+}
+
+func rawProxyAuthorityParts(proxyURL string) (userInfo, host string) {
+	schemeEnd := strings.Index(proxyURL, "://")
+	if schemeEnd < 0 {
+		return "", ""
+	}
+	authority := proxyURL[schemeEnd+3:]
+	if authorityEnd := strings.IndexAny(authority, "/?#"); authorityEnd >= 0 {
+		authority = authority[:authorityEnd]
+	}
+	at := strings.LastIndex(authority, "@")
+	if at <= 0 {
+		return "", ""
+	}
+	return authority[:at], authority[at+1:]
 }

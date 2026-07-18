@@ -16,7 +16,6 @@ import (
 
 	"github.com/google/uuid"
 	_ "github.com/jackc/pgx/v5/stdlib"
-	internalauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/authfileguard"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/misc"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
@@ -42,12 +41,28 @@ type PostgresStoreConfig struct {
 // PostgresStore persists configuration and authentication metadata using PostgreSQL as backend
 // while mirroring data to a local workspace so existing file-based workflows continue to operate.
 type PostgresStore struct {
-	db         *sql.DB
-	cfg        PostgresStoreConfig
-	spoolRoot  string
-	configPath string
-	authDir    string
-	mu         sync.Mutex
+	db               *sql.DB
+	cfg              PostgresStoreConfig
+	spoolRoot        string
+	configPath       string
+	authDir          string
+	mu               sync.Mutex
+	lockRootMutation func(context.Context, *os.Root) (func() error, error)
+	lockRootTarget   func(context.Context, *os.Root, string) (func() error, error)
+}
+
+func (s *PostgresStore) acquireRootMutation(ctx context.Context, root *os.Root) (func() error, error) {
+	if s != nil && s.lockRootMutation != nil {
+		return s.lockRootMutation(ctx, root)
+	}
+	return authfileguard.LockRootMutationContext(ctx, root)
+}
+
+func (s *PostgresStore) acquireRootTarget(ctx context.Context, root *os.Root, relativePath string) (func() error, error) {
+	if s != nil && s.lockRootTarget != nil {
+		return s.lockRootTarget(ctx, root, relativePath)
+	}
+	return authfileguard.LockRootTargetContext(ctx, root, relativePath)
 }
 
 // NewPostgresStore establishes a connection to PostgreSQL and prepares the local workspace.
@@ -212,6 +227,15 @@ func (s *PostgresStore) SetBaseDir(string) {}
 
 // Save persists authentication metadata to disk and PostgreSQL.
 func (s *PostgresStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (string, error) {
+	return s.save(ctx, auth, false)
+}
+
+// SaveIfAbsent persists auth only when neither the database nor local mirror contains it.
+func (s *PostgresStore) SaveIfAbsent(ctx context.Context, auth *cliproxyauth.Auth) (string, error) {
+	return s.save(ctx, auth, true)
+}
+
+func (s *PostgresStore) save(ctx context.Context, auth *cliproxyauth.Auth, requireAbsent bool) (savedPath string, resultErr error) {
 	if auth == nil {
 		return "", fmt.Errorf("postgres store: auth is nil")
 	}
@@ -243,21 +267,50 @@ func (s *PostgresStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (stri
 		}
 	}()
 
-	if auth.Disabled {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	committed := false
+	unlockRootMutation, errMutationLock := s.acquireRootMutation(ctx, root)
+	if errMutationLock != nil {
+		return "", fmt.Errorf("postgres store: lock auth root for save: %w", errMutationLock)
+	}
+	defer func() {
+		resultErr = joinAuthSaveCleanupError(resultErr, unlockRootMutation(), committed)
+	}()
+	unlockPath, errPathLock := authfileguard.LockContext(ctx, path)
+	if errPathLock != nil {
+		return "", fmt.Errorf("postgres store: lock auth path for save: %w", errPathLock)
+	}
+	defer unlockPath()
+	if err = mkdirAuthDirectoriesAtRoot(root, filepath.Dir(relativePath), 0o700); err != nil {
+		return "", fmt.Errorf("postgres store: create auth directory: %w", err)
+	}
+	unlockTarget, errTargetLock := s.acquireRootTarget(ctx, root, relativePath)
+	if errTargetLock != nil {
+		return "", fmt.Errorf("postgres store: lock persistent auth target for save: %w", errTargetLock)
+	}
+	defer func() {
+		resultErr = joinAuthSaveCleanupError(resultErr, unlockTarget(), committed)
+	}()
+	if auth.Disabled && !requireAbsent {
 		if _, statErr := root.Lstat(relativePath); errors.Is(statErr, fs.ErrNotExist) {
 			return "", nil
 		}
 	}
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	unlockPath := authfileguard.Lock(path)
-	defer unlockPath()
 	if authfileguard.IsRetired(path) {
 		return "", fmt.Errorf("postgres store: %w", cliproxyauth.ErrRetiredGeminiCLIAuthReadOnly)
 	}
 	if authfileguard.IsQuarantined(path) {
 		return "", fmt.Errorf("postgres store: auth deletion is still pending: %w", authfileguard.ErrDeleteGenerationUncertain)
+	}
+	if requireAbsent {
+		earlySnapshot, errEarlySnapshot := captureAuthFileSnapshot(root, relativePath)
+		if errEarlySnapshot != nil {
+			return "", errEarlySnapshot
+		}
+		if earlySnapshot.exists {
+			return "", cliproxyauth.ErrAuthAlreadyExists
+		}
 	}
 
 	tx, errTx := s.beginAuthRecordMutation(ctx, relID)
@@ -265,9 +318,12 @@ func (s *PostgresStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (stri
 		return "", errTx
 	}
 	defer rollbackAuthRecordMutation(tx)
-	remoteData, _, remoteExists, errRemote := s.readAuthRecordGenerationTx(ctx, tx, relID)
+	remoteData, remoteRevision, remoteExists, errRemote := s.readAuthRecordGenerationTx(ctx, tx, relID)
 	if errRemote != nil {
 		return "", errRemote
+	}
+	if requireAbsent && remoteExists {
+		return "", cliproxyauth.ErrAuthAlreadyExists
 	}
 	if remoteExists {
 		if errRetired := cliproxyauth.RejectRetiredGeminiCLIAuthFileMutation(remoteData); errRetired != nil {
@@ -278,12 +334,12 @@ func (s *PostgresStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (stri
 		}
 	}
 
-	if err = mkdirAuthDirectoriesAtRoot(root, filepath.Dir(relativePath), 0o700); err != nil {
-		return "", fmt.Errorf("postgres store: create auth directory: %w", err)
-	}
 	localSnapshot, errSnapshot := captureAuthFileSnapshot(root, relativePath)
 	if errSnapshot != nil {
 		return "", errSnapshot
+	}
+	if requireAbsent && localSnapshot.exists {
+		return "", cliproxyauth.ErrAuthAlreadyExists
 	}
 	if errRetired := localSnapshot.rejectRetiredGeminiCLIAuthPersistence(); errRetired != nil {
 		authfileguard.MarkRetired(path)
@@ -292,24 +348,39 @@ func (s *PostgresStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (stri
 	runtimeSnapshot := captureAuthRuntimeSnapshot(auth)
 
 	var persistedData []byte
+	installedSnapshot := localSnapshot
 	switch {
 	case auth.Storage != nil:
-		if setter, ok := auth.Storage.(internalauth.MetadataSetter); ok {
-			setter.SetMetadata(cliproxyauth.MetadataWithDisabled(auth))
-		}
-		data, errData := produceAuthStorageData(auth.Storage)
+		data, errData := prepareAuthStorageData(auth, runtimeSnapshot)
 		if errData != nil {
 			return "", fmt.Errorf("postgres store: produce storage auth: %w", errData)
 		}
-		if errWrite := writeAuthFileAtomicallyAtRoot(root, relativePath, data, &localSnapshot); errWrite != nil {
+		writtenSnapshot, errWrite := writeAuthFileAtomicallyAtRootWithReceiptTransactionTargetLockedContext(ctx, root, relativePath, data, &localSnapshot)
+		if errWrite != nil {
+			errWrite = rollBackCommittedAuthFileWriteAtRootTransactionTargetLockedContext(authRollbackContext(ctx), root, relativePath, writtenSnapshot, localSnapshot, errWrite)
+			runtimeSnapshot.restore(auth)
+			errWrite = mapAuthCreateGenerationConflict(requireAbsent, errWrite)
 			if errors.Is(errWrite, cliproxyauth.ErrRetiredGeminiCLIAuthReadOnly) {
 				authfileguard.MarkRetired(path)
 			}
 			return "", fmt.Errorf("postgres store: persist storage auth: %w", errWrite)
 		}
+		installedSnapshot = writtenSnapshot
 		persistedData = data
 		if errSync := cliproxyauth.SyncPersistedMetadataAndSourceHash(auth, data); errSync != nil {
-			return "", fmt.Errorf("postgres store: sync persisted storage auth: %w", errSync)
+			errSync = rollBackCommittedAuthFileWriteAtRootTransactionTargetLockedContext(
+				authRollbackContext(ctx),
+				root,
+				relativePath,
+				installedSnapshot,
+				localSnapshot,
+				cliproxyauth.NewSaveOutcomeError(
+					cliproxyauth.SaveOutcomeCommitted,
+					fmt.Errorf("postgres store: sync persisted storage auth: %w", errSync),
+				),
+			)
+			runtimeSnapshot.restore(auth)
+			return "", errSync
 		}
 	case auth.Metadata != nil:
 		raw, errMarshal := cliproxyauth.CanonicalMetadataBytes(auth)
@@ -321,7 +392,7 @@ func (s *PostgresStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (stri
 		if existing, errRead := root.ReadFile(relativePath); errRead == nil {
 			if jsonEqual(existing, raw) {
 				if !localSnapshot.exists || !bytes.Equal(existing, localSnapshot.data) {
-					return "", authfileguard.ErrPersistGenerationStale
+					return "", mapAuthCreateGenerationConflict(requireAbsent, authfileguard.ErrPersistGenerationStale)
 				}
 				writeLocal = false
 				persistedData = localSnapshot.data
@@ -330,12 +401,17 @@ func (s *PostgresStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (stri
 			return "", fmt.Errorf("postgres store: read existing metadata: %w", errRead)
 		}
 		if writeLocal {
-			if errWrite := writeAuthFileAtomicallyAtRoot(root, relativePath, raw, &localSnapshot); errWrite != nil {
+			writtenSnapshot, errWrite := writeAuthFileAtomicallyAtRootWithReceiptTransactionTargetLockedContext(ctx, root, relativePath, raw, &localSnapshot)
+			if errWrite != nil {
+				errWrite = rollBackCommittedAuthFileWriteAtRootTransactionTargetLockedContext(authRollbackContext(ctx), root, relativePath, writtenSnapshot, localSnapshot, errWrite)
+				runtimeSnapshot.restore(auth)
+				errWrite = mapAuthCreateGenerationConflict(requireAbsent, errWrite)
 				if errors.Is(errWrite, cliproxyauth.ErrRetiredGeminiCLIAuthReadOnly) {
 					authfileguard.MarkRetired(path)
 				}
 				return "", fmt.Errorf("postgres store: persist auth file: %w", errWrite)
 			}
+			installedSnapshot = writtenSnapshot
 		}
 		cliproxyauth.SetSourceHashAttribute(auth, raw)
 	default:
@@ -351,42 +427,72 @@ func (s *PostgresStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (stri
 		auth.FileName = auth.ID
 	}
 
-	if err = s.persistAuth(ctx, tx, relID, persistedData); err != nil {
+	if requireAbsent {
+		err = s.insertAuthIfAbsent(ctx, tx, relID, persistedData)
+	} else {
+		err = s.persistAuth(ctx, tx, relID, persistedData)
+	}
+	if err != nil {
 		if errors.Is(err, cliproxyauth.ErrRetiredGeminiCLIAuthReadOnly) {
 			authfileguard.MarkRetired(path)
 		}
-		errRollback := restoreAuthFileSnapshotAtRoot(root, relativePath, persistedData, localSnapshot)
+		errRollback := restoreAuthFileSnapshotAtRootTransactionTargetLockedContext(authRollbackContext(ctx), root, relativePath, installedSnapshot, localSnapshot)
 		runtimeSnapshot.restore(auth)
-		if errRollback != nil {
-			return "", errors.Join(err, fmt.Errorf("postgres store: roll back local auth after persistence failure: %w", errRollback))
+		errResult := errors.Join(err, wrapOptionalError("postgres store: roll back local auth after persistence failure", errRollback))
+		outcome := cliproxyauth.SaveOutcomeUncertain
+		if authFileRollbackCompleted(errRollback) {
+			outcome = cliproxyauth.SaveOutcomeRolledBack
 		}
-		return "", err
+		return "", cliproxyauth.NewSaveOutcomeError(outcome, errResult)
 	}
 	committedData, committedRevision, committedExists, errRevision := s.readAuthRecordGenerationTx(ctx, tx, relID)
 	if errRevision != nil || !committedExists || !jsonEqual(committedData, persistedData) {
 		if errRevision == nil {
 			errRevision = errors.New("postgres store: persisted auth generation is missing or changed")
 		}
-		errRollback := restoreAuthFileSnapshotAtRoot(root, relativePath, persistedData, localSnapshot)
+		errRollback := restoreAuthFileSnapshotAtRootTransactionTargetLockedContext(authRollbackContext(ctx), root, relativePath, installedSnapshot, localSnapshot)
 		runtimeSnapshot.restore(auth)
-		return "", errors.Join(
+		errResult := errors.Join(
 			errRevision,
 			wrapOptionalError("postgres store: roll back local auth after generation read failure", errRollback),
 		)
+		outcome := cliproxyauth.SaveOutcomeUncertain
+		if authFileRollbackCompleted(errRollback) {
+			outcome = cliproxyauth.SaveOutcomeRolledBack
+		}
+		return "", cliproxyauth.NewSaveOutcomeError(outcome, errResult)
 	}
 	if errCommit := tx.Commit(); errCommit != nil {
-		currentData, currentRevision, currentExists, errProbe := s.readAuthRecordGeneration(ctx, relID)
+		probeCtx := authSaveVerificationContext(ctx)
+		currentData, currentRevision, currentExists, errProbe := s.readAuthRecordGeneration(probeCtx, relID)
 		if errProbe == nil && currentExists && currentRevision == committedRevision && jsonEqual(currentData, persistedData) {
+			committed = true
 			return path, nil
 		}
-		errRollback := restoreAuthFileSnapshotAtRoot(root, relativePath, persistedData, localSnapshot)
+		errRollback := restoreAuthFileSnapshotAtRootTransactionTargetLockedContext(authRollbackContext(ctx), root, relativePath, installedSnapshot, localSnapshot)
 		runtimeSnapshot.restore(auth)
-		return "", errors.Join(
+		errResult := errors.Join(
 			fmt.Errorf("postgres store: commit auth record: %w", errCommit),
 			wrapOptionalError("postgres store: verify auth after commit failure", errProbe),
 			wrapOptionalError("postgres store: roll back local auth after commit failure", errRollback),
 		)
+		outcome := cliproxyauth.SaveOutcomeUncertain
+		explicitOutcome, explicit := cliproxyauth.SaveOutcomeFromError(errCommit)
+		remoteRolledBack := errProbe == nil && currentExists == remoteExists
+		if remoteRolledBack && remoteExists {
+			remoteRolledBack = currentRevision == remoteRevision && jsonEqual(currentData, remoteData)
+		}
+		switch {
+		case !authFileRollbackCompleted(errRollback):
+			outcome = cliproxyauth.SaveOutcomeUncertain
+		case remoteRolledBack && (!explicit || explicitOutcome == cliproxyauth.SaveOutcomeRolledBack):
+			outcome = cliproxyauth.SaveOutcomeRolledBack
+		case explicit && explicitOutcome == cliproxyauth.SaveOutcomeCommitted:
+			outcome = cliproxyauth.SaveOutcomeCommitted
+		}
+		return "", cliproxyauth.NewSaveOutcomeError(outcome, errResult)
 	}
+	committed = true
 	return path, nil
 }
 
@@ -515,13 +621,34 @@ func (s *PostgresStore) FinalizeAuthFileDeletion(ctx context.Context, id string)
 	if id == "" {
 		return fmt.Errorf("postgres store: id is empty")
 	}
+	root, errRoot := os.OpenRoot(s.authDir)
+	if errRoot != nil {
+		return fmt.Errorf("postgres store: open auth root for finalized deletion: %w", errRoot)
+	}
+	defer func() {
+		if errClose := root.Close(); errClose != nil {
+			log.WithError(errClose).Error("postgres store: close auth root after finalized deletion")
+		}
+	}()
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	unlockRootMutation, errMutationLock := authfileguard.LockRootMutationContext(ctx, root)
+	if errMutationLock != nil {
+		return fmt.Errorf("postgres store: lock auth root for finalized deletion: %w", errMutationLock)
+	}
+	defer func() {
+		if errUnlock := unlockRootMutation(); errUnlock != nil {
+			log.WithError(errUnlock).Error("postgres store: unlock auth root after finalized deletion")
+		}
+	}()
 	path, err := s.resolveDeletePath(id)
 	if err != nil {
 		return err
 	}
-	unlockPath := authfileguard.Lock(path)
+	unlockPath, errPathLock := authfileguard.LockContext(ctx, path)
+	if errPathLock != nil {
+		return fmt.Errorf("postgres store: lock auth path for finalized deletion: %w", errPathLock)
+	}
 	defer unlockPath()
 	retiredSnapshot := authfileguard.CaptureRetired(path)
 	relID, err := s.relativeAuthID(path)
@@ -552,13 +679,36 @@ func (s *PostgresStore) DeleteAuthFileAtRoot(ctx context.Context, root *os.Root,
 	return s.deleteAuthFileAtRoot(ctx, root, path, relID)
 }
 
-func (s *PostgresStore) deleteAuthFileAtRoot(ctx context.Context, root *os.Root, path, relID string) error {
+func (s *PostgresStore) deleteAuthFileAtRoot(ctx context.Context, root *os.Root, path, relID string) (resultErr error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	unlockPath := authfileguard.Lock(path)
+	unlockRootMutation, errMutationLock := s.acquireRootMutation(ctx, root)
+	if errMutationLock != nil {
+		return cliproxyauth.NewDeleteOutcomeError(
+			cliproxyauth.DeleteOutcomeRolledBack,
+			fmt.Errorf("postgres store: lock auth root for deletion: %w", errMutationLock),
+		)
+	}
+	defer func() {
+		resultErr = joinAuthDeleteParentClose(resultErr, unlockRootMutation())
+	}()
+	unlockPath, errPathLock := authfileguard.LockContext(ctx, path)
+	if errPathLock != nil {
+		return cliproxyauth.NewDeleteOutcomeError(cliproxyauth.DeleteOutcomeRolledBack, fmt.Errorf("postgres store: lock auth path for deletion: %w", errPathLock))
+	}
 	defer unlockPath()
 	retiredSnapshot := authfileguard.CaptureRetired(path)
 	rootName := filepath.FromSlash(relID)
+	if errMkdir := mkdirAuthDirectoriesAtRoot(root, filepath.Dir(rootName), 0o700); errMkdir != nil {
+		return cliproxyauth.NewDeleteOutcomeError(cliproxyauth.DeleteOutcomeRolledBack, fmt.Errorf("postgres store: create auth target parent for deletion: %w", errMkdir))
+	}
+	unlockTarget, errTargetLock := s.acquireRootTarget(ctx, root, rootName)
+	if errTargetLock != nil {
+		return cliproxyauth.NewDeleteOutcomeError(cliproxyauth.DeleteOutcomeRolledBack, fmt.Errorf("postgres store: lock persistent auth target for deletion: %w", errTargetLock))
+	}
+	defer func() {
+		resultErr = joinAuthDeleteParentClose(resultErr, unlockTarget())
+	}()
 	tx, errTx := s.beginAuthRecordMutation(ctx, relID)
 	if errTx != nil {
 		return cliproxyauth.NewDeleteOutcomeError(cliproxyauth.DeleteOutcomeRolledBack, errTx)
@@ -591,7 +741,8 @@ func (s *PostgresStore) deleteAuthFileAtRoot(ctx context.Context, root *os.Root,
 		originalExists,
 		originalData,
 	)
-	errDelete := deleteAuthFileTransaction(
+	errDelete := deleteAuthFileTransactionTargetLockedContext(
+		ctx,
 		root,
 		rootName,
 		func(original authFileSnapshot) error {
@@ -637,16 +788,24 @@ func (s *PostgresStore) PersistAuthFiles(ctx context.Context, _ string, paths ..
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	cleanAuthDir := filepath.Clean(s.authDir)
-	root, errRoot := os.OpenRoot(filepath.Dir(cleanAuthDir))
-	if errRoot != nil {
-		return fmt.Errorf("postgres store: open auth parent root for persistence: %w", errRoot)
+	authRoot, errAuthRoot := os.OpenRoot(cleanAuthDir)
+	if errAuthRoot != nil {
+		return fmt.Errorf("postgres store: open auth root for persistence: %w", errAuthRoot)
 	}
 	defer func() {
-		if errClose := root.Close(); errClose != nil {
+		if errClose := authRoot.Close(); errClose != nil {
 			log.WithError(errClose).Error("postgres store: close auth root after persistence")
 		}
 	}()
-
+	unlockRootMutation, errMutationLock := authfileguard.LockRootMutationContext(ctx, authRoot)
+	if errMutationLock != nil {
+		return fmt.Errorf("postgres store: lock auth root for persistence: %w", errMutationLock)
+	}
+	defer func() {
+		if errUnlock := unlockRootMutation(); errUnlock != nil {
+			log.WithError(errUnlock).Error("postgres store: unlock auth root after persistence")
+		}
+	}()
 	for _, p := range paths {
 		trimmed := strings.TrimSpace(p)
 		if trimmed == "" {
@@ -669,9 +828,22 @@ func (s *PostgresStore) PersistAuthFiles(ctx context.Context, _ string, paths ..
 		if errPath != nil {
 			return errPath
 		}
-		unlockPath := authfileguard.Lock(path)
-		snapshotPath := filepath.Join(filepath.Base(cleanAuthDir), filepath.FromSlash(relID))
-		errSnapshot := s.persistAuthFileSnapshot(ctx, root, snapshotPath, path, relID)
+		unlockPath, errPathLock := authfileguard.LockContext(ctx, path)
+		if errPathLock != nil {
+			return fmt.Errorf("postgres store: lock auth path for persistence: %w", errPathLock)
+		}
+		snapshotPath := filepath.FromSlash(relID)
+		if errMkdir := mkdirAuthDirectoriesAtRoot(authRoot, filepath.Dir(snapshotPath), 0o700); errMkdir != nil {
+			unlockPath()
+			return fmt.Errorf("postgres store: create auth target parent for persistence: %w", errMkdir)
+		}
+		unlockTarget, errTargetLock := authfileguard.LockRootTargetContext(ctx, authRoot, snapshotPath)
+		if errTargetLock != nil {
+			unlockPath()
+			return fmt.Errorf("postgres store: lock persistent auth target for persistence: %w", errTargetLock)
+		}
+		errSnapshot := s.persistAuthFileSnapshot(ctx, authRoot, snapshotPath, path, relID)
+		errSnapshot = errors.Join(errSnapshot, unlockTarget())
 		unlockPath()
 		if errSnapshot != nil {
 			return errSnapshot
@@ -702,7 +874,7 @@ func (s *PostgresStore) persistAuthFileSnapshot(ctx context.Context, root *os.Ro
 	if errors.Is(errSnapshot, cliproxyauth.ErrRetiredGeminiCLIAuthReadOnly) {
 		authfileguard.MarkRetired(path)
 		if remoteExists && !cliproxyauth.IsRetiredGeminiCLIAuthFileData(remoteData) {
-			return removeAuthFileAtRoot(root, snapshotPath)
+			return removeAuthFileAtRootTransactionTargetLockedContext(ctx, root, snapshotPath)
 		}
 		return errSnapshot
 	}
@@ -730,7 +902,7 @@ func (s *PostgresStore) persistAuthFileSnapshot(ctx context.Context, root *os.Ro
 			return authfileguard.ErrDeleteGenerationUncertain
 		case authDeleteGenerationReplaced:
 			if remoteExists {
-				if errRestore := writeAuthFileAtomicallyAtRoot(root, snapshotPath, remoteData, &snapshot); errRestore != nil {
+				if errRestore := writeAuthFileAtomicallyAtRootTransactionTargetLockedContext(ctx, root, snapshotPath, remoteData, &snapshot); errRestore != nil {
 					return fmt.Errorf("postgres store: restore remote auth replacement %s: %w", relID, errRestore)
 				}
 			}
@@ -844,14 +1016,7 @@ func (s *PostgresStore) syncConfigFromDatabase(ctx context.Context, exampleConfi
 
 // syncAuthFromDatabase populates the local auth directory from PostgreSQL data.
 func (s *PostgresStore) syncAuthFromDatabase(ctx context.Context) error {
-	query := fmt.Sprintf("SELECT id, content FROM %s", s.fullTableName(s.cfg.AuthTable))
-	rows, err := s.db.QueryContext(ctx, query)
-	if err != nil {
-		return fmt.Errorf("postgres store: load auth from database: %w", err)
-	}
-	defer rows.Close()
-
-	if err = os.MkdirAll(s.authDir, 0o700); err != nil {
+	if err := os.MkdirAll(s.authDir, 0o700); err != nil {
 		return fmt.Errorf("postgres store: create auth directory: %w", err)
 	}
 	root, errRoot := os.OpenRoot(s.authDir)
@@ -863,7 +1028,26 @@ func (s *PostgresStore) syncAuthFromDatabase(ctx context.Context) error {
 			log.WithError(errClose).Error("postgres store: close auth mirror root after sync")
 		}
 	}()
-	if err = clearAuthDirectoryAtRoot(root); err != nil {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	unlockRootRebuild, errRebuildLock := authfileguard.LockRootRebuildContext(ctx, root)
+	if errRebuildLock != nil {
+		return fmt.Errorf("postgres store: lock auth root for sync: %w", errRebuildLock)
+	}
+	defer func() {
+		if errUnlock := unlockRootRebuild(); errUnlock != nil {
+			log.WithError(errUnlock).Error("postgres store: unlock auth root after sync")
+		}
+	}()
+
+	query := fmt.Sprintf("SELECT id, content FROM %s", s.fullTableName(s.cfg.AuthTable))
+	rows, err := s.db.QueryContext(ctx, query)
+	if err != nil {
+		return fmt.Errorf("postgres store: load auth from database: %w", err)
+	}
+	defer rows.Close()
+
+	if err = clearAuthDirectoryAtRootLocked(root); err != nil {
 		return fmt.Errorf("postgres store: reset auth directory: %w", err)
 	}
 
@@ -886,6 +1070,10 @@ func (s *PostgresStore) syncAuthFromDatabase(ctx context.Context) error {
 			continue
 		}
 		relativePath := filepath.FromSlash(relID)
+		if errReserved := rejectReservedAuthLockPath(relativePath); errReserved != nil {
+			log.WithError(errReserved).Warnf("postgres store: skipping reserved auth path %s", id)
+			continue
+		}
 		if err = mkdirAuthDirectoriesAtRoot(root, filepath.Dir(relativePath), 0o700); err != nil {
 			return fmt.Errorf("postgres store: create auth subdir: %w", err)
 		}
@@ -893,7 +1081,7 @@ func (s *PostgresStore) syncAuthFromDatabase(ctx context.Context) error {
 		if errSnapshot != nil {
 			return fmt.Errorf("postgres store: inspect auth file before sync: %w", errSnapshot)
 		}
-		if err = writeAuthMirrorFileAtomicallyAtRoot(root, relativePath, []byte(payload), &localSnapshot); err != nil {
+		if err = writeAuthMirrorFileAtomicallyAtRootLockedContext(ctx, root, relativePath, []byte(payload), &localSnapshot); err != nil {
 			return fmt.Errorf("postgres store: write auth file: %w", err)
 		}
 	}
@@ -949,6 +1137,31 @@ func (s *PostgresStore) persistAuth(ctx context.Context, tx *sql.Tx, relID strin
 		return fmt.Errorf("postgres store: %w", cliproxyauth.ErrRetiredGeminiCLIAuthReadOnly)
 	default:
 		return fmt.Errorf("postgres store: auth upsert affected %d rows, want 1", rowsAffected)
+	}
+}
+
+func (s *PostgresStore) insertAuthIfAbsent(ctx context.Context, tx *sql.Tx, relID string, data []byte) error {
+	jsonPayload := json.RawMessage(data)
+	query := fmt.Sprintf(`
+		INSERT INTO %s (id, content, auth_revision, created_at, updated_at)
+		VALUES ($1, $2, $3, NOW(), NOW())
+		ON CONFLICT (id) DO NOTHING
+	`, s.fullTableName(s.cfg.AuthTable))
+	result, errExec := tx.ExecContext(ctx, query, relID, jsonPayload, uuid.NewString())
+	if errExec != nil {
+		return fmt.Errorf("postgres store: insert auth record: %w", errExec)
+	}
+	rowsAffected, errRows := result.RowsAffected()
+	if errRows != nil {
+		return fmt.Errorf("postgres store: inspect auth insert result: %w", errRows)
+	}
+	switch rowsAffected {
+	case 1:
+		return nil
+	case 0:
+		return cliproxyauth.ErrAuthAlreadyExists
+	default:
+		return fmt.Errorf("postgres store: auth insert affected %d rows, want 1", rowsAffected)
 	}
 }
 
@@ -1075,7 +1288,10 @@ func (s *PostgresStore) readAuthRecordGenerationTx(ctx context.Context, tx *sql.
 }
 
 func (s *PostgresStore) markRetiredAuthRecordIfCurrent(ctx context.Context, relID, path string, listedData []byte) (bool, error) {
-	unlockPath := authfileguard.Lock(path)
+	unlockPath, errPathLock := authfileguard.LockContext(ctx, path)
+	if errPathLock != nil {
+		return false, fmt.Errorf("postgres store: lock retired auth path: %w", errPathLock)
+	}
 	defer unlockPath()
 
 	tx, errTx := s.beginAuthRecordMutation(ctx, relID)
@@ -1172,6 +1388,9 @@ func (s *PostgresStore) relativeAuthID(path string) (string, error) {
 	if strings.HasPrefix(rel, "..") {
 		return "", fmt.Errorf("postgres store: path %s outside managed directory", path)
 	}
+	if errReserved := rejectReservedAuthLockPath(rel); errReserved != nil {
+		return "", fmt.Errorf("postgres store: %w", errReserved)
+	}
 	return filepath.ToSlash(rel), nil
 }
 
@@ -1190,6 +1409,9 @@ func (s *PostgresStore) absoluteAuthPath(id string) (string, error) {
 	}
 	if strings.HasPrefix(rel, "..") {
 		return "", fmt.Errorf("postgres store: resolved auth path escapes auth directory")
+	}
+	if errReserved := rejectReservedAuthLockPath(rel); errReserved != nil {
+		return "", fmt.Errorf("postgres store: %w", errReserved)
 	}
 	return path, nil
 }

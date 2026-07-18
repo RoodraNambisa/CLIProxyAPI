@@ -94,6 +94,286 @@ func TestPostgresStoreSyncAuthFromDatabaseRejectsInsertedSymlink(t *testing.T) {
 	}
 }
 
+func TestPostgresStoreSyncAuthFromDatabaseWaitsForMutationLock(t *testing.T) {
+	rowStarted := make(chan struct{}, 1)
+	rowContinue := make(chan struct{})
+	backend := &postgresStoreTestBackend{
+		queryColumns: []string{"id", "content"},
+		queryRows: [][]driver.Value{
+			{"remote.json", `{"type":"codex","access_token":"remote"}`},
+		},
+		listRowStarted:  rowStarted,
+		listRowContinue: rowContinue,
+	}
+	db := newPostgresStoreTestSQLDB(t, backend)
+	authDir := t.TempDir()
+	if errWrite := os.WriteFile(filepath.Join(authDir, "local.json"), []byte(`{"type":"codex"}`), 0o600); errWrite != nil {
+		t.Fatal(errWrite)
+	}
+	mutationRoot, errMutationRoot := os.OpenRoot(authDir)
+	if errMutationRoot != nil {
+		t.Fatal(errMutationRoot)
+	}
+	defer mutationRoot.Close()
+	unlockMutation, errMutation := authfileguard.LockRootMutation(mutationRoot)
+	if errMutation != nil {
+		t.Fatal(errMutation)
+	}
+	mutationLocked := true
+	defer func() {
+		if mutationLocked {
+			_ = unlockMutation()
+		}
+	}()
+
+	store := &PostgresStore{db: db, cfg: PostgresStoreConfig{AuthTable: defaultAuthTable}, authDir: authDir}
+	done := make(chan error, 1)
+	go func() {
+		done <- store.syncAuthFromDatabase(t.Context())
+	}()
+	select {
+	case <-rowStarted:
+		t.Fatal("database snapshot started while mutation lock was held")
+	case errSync := <-done:
+		t.Fatalf("syncAuthFromDatabase() returned while mutation lock was held: %v", errSync)
+	case <-time.After(100 * time.Millisecond):
+	}
+	if _, errStat := os.Stat(filepath.Join(authDir, "local.json")); errStat != nil {
+		t.Fatalf("local auth changed while sync waited: %v", errStat)
+	}
+	if errUnlock := unlockMutation(); errUnlock != nil {
+		t.Fatal(errUnlock)
+	}
+	mutationLocked = false
+	select {
+	case <-rowStarted:
+		close(rowContinue)
+	case errSync := <-done:
+		t.Fatalf("syncAuthFromDatabase() returned before reading rows: %v", errSync)
+	case <-time.After(5 * time.Second):
+		t.Fatal("database snapshot did not start after mutation lock release")
+	}
+	select {
+	case errSync := <-done:
+		if errSync != nil {
+			t.Fatal(errSync)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("syncAuthFromDatabase() did not finish")
+	}
+	if _, errStat := os.Stat(filepath.Join(authDir, "local.json")); !errors.Is(errStat, os.ErrNotExist) {
+		t.Fatalf("stale local auth remains after sync: %v", errStat)
+	}
+	if data, errRead := os.ReadFile(filepath.Join(authDir, "remote.json")); errRead != nil || !bytes.Contains(data, []byte(`"remote"`)) {
+		t.Fatalf("remote auth = %s, %v", data, errRead)
+	}
+}
+
+func TestPostgresStoreSaveWaitsForRebuildLock(t *testing.T) {
+	backend := &postgresStoreTestBackend{}
+	db := newPostgresStoreTestSQLDB(t, backend)
+	authDir := t.TempDir()
+	rebuildRoot, errRebuildRoot := os.OpenRoot(authDir)
+	if errRebuildRoot != nil {
+		t.Fatal(errRebuildRoot)
+	}
+	defer rebuildRoot.Close()
+	unlockRebuild, errRebuild := authfileguard.LockRootRebuild(rebuildRoot)
+	if errRebuild != nil {
+		t.Fatal(errRebuild)
+	}
+	rebuildLocked := true
+	defer func() {
+		if rebuildLocked {
+			_ = unlockRebuild()
+		}
+	}()
+
+	store := &PostgresStore{db: db, cfg: PostgresStoreConfig{AuthTable: defaultAuthTable}, authDir: authDir}
+	saveDone := make(chan error, 1)
+	go func() {
+		_, errSave := store.Save(t.Context(), &cliproxyauth.Auth{
+			ID:       "blocked.json",
+			FileName: "blocked.json",
+			Provider: "codex",
+			Metadata: map[string]any{"type": "codex", "access_token": "token"},
+		})
+		saveDone <- errSave
+	}()
+	select {
+	case errSave := <-saveDone:
+		t.Fatalf("Save() returned while rebuild lock was held: %v", errSave)
+	case <-time.After(100 * time.Millisecond):
+	}
+	if begins, commits, rollbacks := backend.transactionSnapshot(); begins != 0 || commits != 0 || rollbacks != 0 {
+		t.Fatalf("transactions while blocked = begin:%d commit:%d rollback:%d, want 0/0/0", begins, commits, rollbacks)
+	}
+	if _, errStat := os.Stat(filepath.Join(authDir, "blocked.json")); !errors.Is(errStat, os.ErrNotExist) {
+		t.Fatalf("local auth changed while save waited: %v", errStat)
+	}
+	if errUnlock := unlockRebuild(); errUnlock != nil {
+		t.Fatal(errUnlock)
+	}
+	rebuildLocked = false
+	select {
+	case errSave := <-saveDone:
+		if errSave != nil {
+			t.Fatal(errSave)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Save() did not finish after rebuild lock release")
+	}
+}
+
+func TestPostgresStorePersistenceHoldsPersistentTargetThroughMutation(t *testing.T) {
+	for _, testCase := range []struct {
+		name    string
+		persist func(context.Context, *PostgresStore, string) error
+	}{
+		{
+			name: "save",
+			persist: func(ctx context.Context, store *PostgresStore, fileName string) error {
+				_, errSave := store.Save(ctx, &cliproxyauth.Auth{
+					ID:       fileName,
+					FileName: fileName,
+					Provider: "codex",
+					Metadata: map[string]any{"type": "codex", "access_token": "save-token"},
+				})
+				return errSave
+			},
+		},
+		{
+			name: "watcher_persistence",
+			persist: func(ctx context.Context, store *PostgresStore, fileName string) error {
+				path := filepath.Join(store.AuthDir(), fileName)
+				if errWrite := os.WriteFile(path, []byte(`{"type":"codex","access_token":"watcher-token"}`), 0o600); errWrite != nil {
+					return errWrite
+				}
+				return store.PersistAuthFiles(ctx, "", path)
+			},
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			remoteStarted := make(chan struct{}, 1)
+			releaseRemote := make(chan struct{})
+			backend := &postgresStoreTestBackend{
+				authRecords:               make(map[string][]byte),
+				conditionalUpsertStarted:  remoteStarted,
+				conditionalUpsertContinue: releaseRemote,
+			}
+			db := newPostgresStoreTestSQLDB(t, backend)
+			authDir := t.TempDir()
+			store := &PostgresStore{
+				db:      db,
+				cfg:     PostgresStoreConfig{AuthTable: defaultAuthTable},
+				authDir: authDir,
+			}
+
+			const fileName = "persistent-target.json"
+			operationDone := make(chan error, 1)
+			ctx := t.Context()
+			go func() {
+				operationDone <- testCase.persist(ctx, store, fileName)
+			}()
+
+			assertPersistentAuthTargetHeldDuringRemoteOperation(
+				t,
+				authDir,
+				fileName,
+				remoteStarted,
+				releaseRemote,
+				operationDone,
+			)
+		})
+	}
+}
+
+func TestPostgresStoreSaveStopsWaitingForRebuildLockAfterCancellation(t *testing.T) {
+	backend := &postgresStoreTestBackend{}
+	db := newPostgresStoreTestSQLDB(t, backend)
+	authDir := t.TempDir()
+	rebuildRoot, errRebuildRoot := os.OpenRoot(authDir)
+	if errRebuildRoot != nil {
+		t.Fatal(errRebuildRoot)
+	}
+	defer rebuildRoot.Close()
+	unlockRebuild, errRebuild := authfileguard.LockRootRebuild(rebuildRoot)
+	if errRebuild != nil {
+		t.Fatal(errRebuild)
+	}
+	defer unlockRebuild()
+
+	store := &PostgresStore{db: db, cfg: PostgresStoreConfig{AuthTable: defaultAuthTable}, authDir: authDir}
+	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
+	defer cancel()
+	_, errSave := store.Save(ctx, &cliproxyauth.Auth{
+		ID:       "canceled-lock.json",
+		FileName: "canceled-lock.json",
+		Provider: "codex",
+		Metadata: map[string]any{"type": "codex", "access_token": "token"},
+	})
+	if !errors.Is(errSave, context.DeadlineExceeded) {
+		t.Fatalf("Save() error = %v, want deadline exceeded", errSave)
+	}
+	if begins, commits, rollbacks := backend.transactionSnapshot(); begins != 0 || commits != 0 || rollbacks != 0 {
+		t.Fatalf("transactions after cancellation = begin:%d commit:%d rollback:%d, want 0/0/0", begins, commits, rollbacks)
+	}
+	if _, errStat := os.Stat(filepath.Join(authDir, "canceled-lock.json")); !errors.Is(errStat, os.ErrNotExist) {
+		t.Fatalf("local auth changed after cancellation: %v", errStat)
+	}
+}
+
+func TestPostgresStoreDisabledMissingSaveWaitsForRebuildLock(t *testing.T) {
+	backend := &postgresStoreTestBackend{}
+	db := newPostgresStoreTestSQLDB(t, backend)
+	authDir := t.TempDir()
+	rebuildRoot, errRebuildRoot := os.OpenRoot(authDir)
+	if errRebuildRoot != nil {
+		t.Fatal(errRebuildRoot)
+	}
+	defer rebuildRoot.Close()
+	unlockRebuild, errRebuild := authfileguard.LockRootRebuild(rebuildRoot)
+	if errRebuild != nil {
+		t.Fatal(errRebuild)
+	}
+	rebuildLocked := true
+	defer func() {
+		if rebuildLocked {
+			_ = unlockRebuild()
+		}
+	}()
+
+	store := &PostgresStore{db: db, cfg: PostgresStoreConfig{AuthTable: defaultAuthTable}, authDir: authDir}
+	saveDone := make(chan error, 1)
+	go func() {
+		_, errSave := store.Save(t.Context(), &cliproxyauth.Auth{
+			ID:       "disabled-missing.json",
+			FileName: "disabled-missing.json",
+			Provider: "codex",
+			Disabled: true,
+			Metadata: map[string]any{"type": "codex", "disabled": true},
+		})
+		saveDone <- errSave
+	}()
+	select {
+	case errSave := <-saveDone:
+		t.Fatalf("Save() returned while rebuild lock was held: %v", errSave)
+	case <-time.After(100 * time.Millisecond):
+	}
+	if errUnlock := unlockRebuild(); errUnlock != nil {
+		t.Fatal(errUnlock)
+	}
+	rebuildLocked = false
+	select {
+	case errSave := <-saveDone:
+		if errSave != nil {
+			t.Fatal(errSave)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Save() did not finish after rebuild lock release")
+	}
+}
+
 func TestPostgresStoreSaveMetadataOnlyUsesCanonicalPayloadAndSourceHash(t *testing.T) {
 	backend := &postgresStoreTestBackend{}
 	db := newPostgresStoreTestSQLDB(t, backend)
@@ -148,6 +428,220 @@ func TestPostgresStoreSaveMetadataOnlyUsesCanonicalPayloadAndSourceHash(t *testi
 	}
 }
 
+func TestPostgresStoreSaveIfAbsentPreservesExistingLocalRecord(t *testing.T) {
+	backend := &postgresStoreTestBackend{}
+	db := newPostgresStoreTestSQLDB(t, backend)
+	authDir := t.TempDir()
+	store := &PostgresStore{
+		db:      db,
+		cfg:     PostgresStoreConfig{AuthTable: defaultAuthTable},
+		authDir: authDir,
+	}
+	const (
+		fileName = "existing.json"
+		existing = `{"type":"codex","access_token":"existing-token"}`
+	)
+	path := filepath.Join(authDir, fileName)
+	if errWrite := os.WriteFile(path, []byte(existing), 0o600); errWrite != nil {
+		t.Fatal(errWrite)
+	}
+	_, errSave := store.SaveIfAbsent(t.Context(), &cliproxyauth.Auth{
+		ID:       fileName,
+		FileName: fileName,
+		Provider: "chatgpt-web",
+		Metadata: map[string]any{"type": "chatgpt-web", "access_token": "replacement-token"},
+	})
+	if !errors.Is(errSave, cliproxyauth.ErrAuthAlreadyExists) {
+		t.Fatalf("SaveIfAbsent() error = %v, want auth already exists", errSave)
+	}
+	data, errRead := os.ReadFile(path)
+	if errRead != nil || string(data) != existing {
+		t.Fatalf("existing file changed: content=%q error=%v", data, errRead)
+	}
+	if calls := postgresStoreTestExecCallsContaining(backend.execCallsSnapshot(), "INSERT INTO"); len(calls) != 0 {
+		t.Fatalf("auth upsert count = %d, want 0", len(calls))
+	}
+	if calls := backend.execCallsSnapshot(); len(calls) != 0 {
+		t.Fatalf("database calls = %d, want local conflict before transaction", len(calls))
+	}
+}
+
+func TestPostgresStoreSaveIfAbsentDoesNotOverwriteConcurrentInsert(t *testing.T) {
+	insertStarted := make(chan struct{}, 1)
+	insertContinue := make(chan struct{})
+	backend := &postgresStoreTestBackend{
+		authRecords:               make(map[string][]byte),
+		conditionalUpsertStarted:  insertStarted,
+		conditionalUpsertContinue: insertContinue,
+	}
+	db := newPostgresStoreTestSQLDB(t, backend)
+	authDir := t.TempDir()
+	store := &PostgresStore{
+		db:      db,
+		cfg:     PostgresStoreConfig{AuthTable: defaultAuthTable},
+		authDir: authDir,
+	}
+	const fileName = "concurrent.json"
+	saveDone := make(chan error, 1)
+	go func() {
+		_, errSave := store.SaveIfAbsent(t.Context(), &cliproxyauth.Auth{
+			ID:       fileName,
+			FileName: fileName,
+			Provider: "chatgpt-web",
+			Metadata: map[string]any{"type": "chatgpt-web", "access_token": "new-token"},
+		})
+		saveDone <- errSave
+	}()
+	select {
+	case <-insertStarted:
+	case <-time.After(time.Second):
+		t.Fatal("SaveIfAbsent() did not reach the conditional insert")
+	}
+	const concurrent = `{"type":"chatgpt-web","access_token":"concurrent-token"}`
+	backend.stageAuthMutation(nil, fileName, postgresStoreTestAuthMutation{data: []byte(concurrent)})
+	close(insertContinue)
+	if errSave := <-saveDone; !errors.Is(errSave, cliproxyauth.ErrAuthAlreadyExists) {
+		t.Fatalf("SaveIfAbsent() error = %v, want auth already exists", errSave)
+	}
+	if _, errStat := os.Stat(filepath.Join(authDir, fileName)); !errors.Is(errStat, os.ErrNotExist) {
+		t.Fatalf("local auth exists after conflict: %v", errStat)
+	}
+	if data, ok := backend.authRecordSnapshot(fileName); !ok || string(data) != concurrent {
+		t.Fatalf("remote auth = %q, exists=%v, want concurrent record", data, ok)
+	}
+}
+
+func TestPostgresStoreSaveIfAbsentReportsCommitReplacementAsUncertain(t *testing.T) {
+	const (
+		fileName   = "commit-replacement.json"
+		concurrent = `{"type":"chatgpt-web","access_token":"concurrent-token"}`
+	)
+	errCommit := errors.New("commit result lost")
+	backend := &postgresStoreTestBackend{
+		authRecords:            make(map[string][]byte),
+		authRevisions:          make(map[string]int64),
+		commitError:            errCommit,
+		commitErrorReplacement: map[string][]byte{fileName: []byte(concurrent)},
+	}
+	db := newPostgresStoreTestSQLDB(t, backend)
+	authDir := t.TempDir()
+	store := &PostgresStore{
+		db:      db,
+		cfg:     PostgresStoreConfig{AuthTable: defaultAuthTable},
+		authDir: authDir,
+	}
+	_, errSave := store.SaveIfAbsent(t.Context(), &cliproxyauth.Auth{
+		ID:       fileName,
+		FileName: fileName,
+		Provider: "chatgpt-web",
+		Metadata: map[string]any{"type": "chatgpt-web", "access_token": "new-token"},
+	})
+	if errors.Is(errSave, cliproxyauth.ErrAuthAlreadyExists) {
+		t.Fatalf("SaveIfAbsent() error = %v, must not claim a proven create conflict", errSave)
+	}
+	if outcome, ok := cliproxyauth.SaveOutcomeFromError(errSave); !ok || outcome != cliproxyauth.SaveOutcomeUncertain {
+		t.Fatalf("SaveIfAbsent() outcome = %v, %t; want uncertain", outcome, ok)
+	}
+	if _, errStat := os.Stat(filepath.Join(authDir, fileName)); !errors.Is(errStat, os.ErrNotExist) {
+		t.Fatalf("local auth exists after commit conflict: %v", errStat)
+	}
+	if data, ok := backend.authRecordSnapshot(fileName); !ok || string(data) != concurrent {
+		t.Fatalf("remote auth = %q, exists=%v, want concurrent record", data, ok)
+	}
+}
+
+func TestPostgresStoreSaveIfAbsentMapsConcurrentLocalCreateToConflict(t *testing.T) {
+	for _, mode := range []string{"storage", "metadata"} {
+		t.Run(mode, func(t *testing.T) {
+			backend := &postgresStoreTestBackend{}
+			db := newPostgresStoreTestSQLDB(t, backend)
+			authDir := t.TempDir()
+			store := &PostgresStore{
+				db:      db,
+				cfg:     PostgresStoreConfig{AuthTable: defaultAuthTable},
+				authDir: authDir,
+			}
+			const fileName = "local-conflict.json"
+			path := filepath.Join(authDir, fileName)
+			concurrent := []byte(`{"type":"chatgpt-web","access_token":"concurrent-token"}`)
+			writeConcurrent := func() error {
+				return os.WriteFile(path, concurrent, 0o600)
+			}
+			auth := &cliproxyauth.Auth{
+				ID:       fileName,
+				FileName: fileName,
+				Provider: "chatgpt-web",
+			}
+			if mode == "storage" {
+				auth.Storage = &testTokenStorage{afterSave: func() {
+					if errWrite := writeConcurrent(); errWrite != nil {
+						t.Errorf("write concurrent auth: %v", errWrite)
+					}
+				}}
+			} else {
+				auth.Metadata = map[string]any{
+					"type":         "chatgpt-web",
+					"access_token": "new-token",
+					"race": &writeFileOnMarshal{
+						value: "value",
+						write: writeConcurrent,
+					},
+				}
+			}
+
+			_, errSave := store.SaveIfAbsent(t.Context(), auth)
+			if !errors.Is(errSave, cliproxyauth.ErrAuthAlreadyExists) {
+				t.Fatalf("SaveIfAbsent() error = %v, want auth already exists", errSave)
+			}
+			got, errRead := os.ReadFile(path)
+			if errRead != nil || !bytes.Equal(got, concurrent) {
+				t.Fatalf("local auth = %s, %v; want concurrent record", got, errRead)
+			}
+			if calls := postgresStoreTestExecCallsContaining(backend.execCallsSnapshot(), "INSERT INTO"); len(calls) != 0 {
+				t.Fatalf("database inserts = %d, want 0", len(calls))
+			}
+		})
+	}
+}
+
+func TestPostgresStoreSaveIfAbsentConfirmsCommitAfterCallerCancellation(t *testing.T) {
+	errCommit := errors.New("commit acknowledgement lost")
+	ctx, cancel := context.WithCancel(t.Context())
+	backend := &postgresStoreTestBackend{
+		authRecords:        make(map[string][]byte),
+		authRevisions:      make(map[string]int64),
+		commitError:        errCommit,
+		commitErrorApplies: true,
+		commitErrorHook:    cancel,
+	}
+	db := newPostgresStoreTestSQLDB(t, backend)
+	authDir := t.TempDir()
+	store := &PostgresStore{
+		db:      db,
+		cfg:     PostgresStoreConfig{AuthTable: defaultAuthTable},
+		authDir: authDir,
+	}
+	const fileName = "committed-after-cancel.json"
+	path, errSave := store.SaveIfAbsent(ctx, &cliproxyauth.Auth{
+		ID:       fileName,
+		FileName: fileName,
+		Provider: "chatgpt-web",
+		Metadata: map[string]any{"type": "chatgpt-web", "access_token": "new-token"},
+	})
+	if errSave != nil {
+		t.Fatalf("SaveIfAbsent() error = %v", errSave)
+	}
+	if ctx.Err() != context.Canceled {
+		t.Fatalf("caller context error = %v, want canceled", ctx.Err())
+	}
+	if _, exists := backend.authRecordSnapshot(fileName); !exists {
+		t.Fatal("committed database auth is missing")
+	}
+	if got, errRead := os.ReadFile(path); errRead != nil || !bytes.Contains(got, []byte(`"access_token":"new-token"`)) {
+		t.Fatalf("local auth = %s, %v; want committed token", got, errRead)
+	}
+}
+
 func TestPostgresStoreSaveRestoresLocalFileWhenPersistenceFails(t *testing.T) {
 	wantErr := errors.New("upsert failed")
 	backend := &postgresStoreTestBackend{execErrors: []error{nil, wantErr}}
@@ -164,8 +658,12 @@ func TestPostgresStoreSaveRestoresLocalFileWhenPersistenceFails(t *testing.T) {
 		ID: fileName, FileName: fileName, Provider: "codex",
 		Metadata: map[string]any{"type": "codex", "access_token": "new"},
 	}
-	if _, errSave := store.Save(t.Context(), auth); !errors.Is(errSave, wantErr) {
+	_, errSave := store.Save(t.Context(), auth)
+	if !errors.Is(errSave, wantErr) {
 		t.Fatalf("Save() error = %v, want %v", errSave, wantErr)
+	}
+	if outcome, ok := cliproxyauth.SaveOutcomeFromError(errSave); !ok || outcome != cliproxyauth.SaveOutcomeRolledBack {
+		t.Fatalf("Save() outcome = %v, %t; want rolled back", outcome, ok)
 	}
 	got, errRead := os.ReadFile(path)
 	if errRead != nil || !bytes.Equal(got, oldData) {
@@ -189,8 +687,12 @@ func TestPostgresStoreSaveRestoresLocalFileWhenCommitFails(t *testing.T) {
 		ID: fileName, FileName: fileName, Provider: "codex",
 		Metadata: map[string]any{"type": "codex", "access_token": "new"},
 	}
-	if _, errSave := store.Save(t.Context(), auth); !errors.Is(errSave, wantErr) {
+	_, errSave := store.Save(t.Context(), auth)
+	if !errors.Is(errSave, wantErr) {
 		t.Fatalf("Save() error = %v, want %v", errSave, wantErr)
+	}
+	if outcome, ok := cliproxyauth.SaveOutcomeFromError(errSave); !ok || outcome != cliproxyauth.SaveOutcomeRolledBack {
+		t.Fatalf("Save() outcome = %v, %t; want rolled back", outcome, ok)
 	}
 	got, errRead := os.ReadFile(path)
 	if errRead != nil || !bytes.Equal(got, oldData) {
@@ -385,10 +887,11 @@ func TestPostgresStoreSaveProbesCommitErrorsByWrittenRevision(t *testing.T) {
 		commitApplies          bool
 		sameContentReplacement bool
 		wantSuccess            bool
+		wantOutcome            cliproxyauth.SaveOutcome
 	}{
 		{name: "committed", commitApplies: true, wantSuccess: true},
-		{name: "not committed"},
-		{name: "same content replacement", sameContentReplacement: true},
+		{name: "not committed", wantOutcome: cliproxyauth.SaveOutcomeRolledBack},
+		{name: "same content replacement", sameContentReplacement: true, wantOutcome: cliproxyauth.SaveOutcomeUncertain},
 	}
 
 	for _, tt := range tests {
@@ -429,6 +932,11 @@ func TestPostgresStoreSaveProbesCommitErrorsByWrittenRevision(t *testing.T) {
 			} else if !errors.Is(errSave, errCommit) {
 				t.Fatalf("Save() error = %v, want %v", errSave, errCommit)
 			}
+			if !tt.wantSuccess {
+				if gotOutcome, ok := cliproxyauth.SaveOutcomeFromError(errSave); !ok || gotOutcome != tt.wantOutcome {
+					t.Fatalf("save outcome = %v, %t; want %v", gotOutcome, ok, tt.wantOutcome)
+				}
+			}
 
 			wantLocal := oldData
 			wantRemote := oldData
@@ -446,6 +954,126 @@ func TestPostgresStoreSaveProbesCommitErrorsByWrittenRevision(t *testing.T) {
 			}
 			if !tt.wantSuccess && auth.Attributes != nil {
 				t.Fatalf("failed Save() retained runtime attributes = %#v", auth.Attributes)
+			}
+		})
+	}
+}
+
+func TestPostgresStoreSaveReportsPersistentLockReleaseFailure(t *testing.T) {
+	errUnlock := errors.New("release persistent lock")
+	for _, tt := range []struct {
+		name   string
+		inject func(*PostgresStore)
+	}{
+		{
+			name: "root mutation",
+			inject: func(store *PostgresStore) {
+				store.lockRootMutation = func(ctx context.Context, root *os.Root) (func() error, error) {
+					unlock, errLock := authfileguard.LockRootMutationContext(ctx, root)
+					if errLock != nil {
+						return nil, errLock
+					}
+					return func() error { return errors.Join(unlock(), errUnlock) }, nil
+				}
+			},
+		},
+		{
+			name: "target",
+			inject: func(store *PostgresStore) {
+				store.lockRootTarget = func(ctx context.Context, root *os.Root, relativePath string) (func() error, error) {
+					unlock, errLock := authfileguard.LockRootTargetContext(ctx, root, relativePath)
+					if errLock != nil {
+						return nil, errLock
+					}
+					return func() error { return errors.Join(unlock(), errUnlock) }, nil
+				}
+			},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			backend := &postgresStoreTestBackend{authRecords: make(map[string][]byte)}
+			db := newPostgresStoreTestSQLDB(t, backend)
+			store := &PostgresStore{db: db, cfg: PostgresStoreConfig{AuthTable: defaultAuthTable}, authDir: t.TempDir()}
+			tt.inject(store)
+			auth := &cliproxyauth.Auth{
+				ID: "unlock-save.json", FileName: "unlock-save.json", Provider: "codex",
+				Metadata: map[string]any{"type": "codex", "access_token": "token"},
+			}
+
+			savedPath, errSave := store.Save(t.Context(), auth)
+			if !errors.Is(errSave, errUnlock) {
+				t.Fatalf("Save() error = %v, want %v", errSave, errUnlock)
+			}
+			if outcome, ok := cliproxyauth.SaveOutcomeFromError(errSave); !ok || outcome != cliproxyauth.SaveOutcomeCommitted {
+				t.Fatalf("save outcome = %v, %t; want committed", outcome, ok)
+			}
+			if savedPath == "" {
+				t.Fatal("Save() path is empty after committed write")
+			}
+			if _, exists := backend.authRecordSnapshot(auth.ID); !exists {
+				t.Fatal("committed database auth is missing")
+			}
+		})
+	}
+}
+
+func TestPostgresStoreDeleteReportsPersistentLockReleaseFailure(t *testing.T) {
+	errUnlock := errors.New("release persistent lock")
+	for _, tt := range []struct {
+		name   string
+		inject func(*PostgresStore)
+	}{
+		{
+			name: "root mutation",
+			inject: func(store *PostgresStore) {
+				store.lockRootMutation = func(ctx context.Context, root *os.Root) (func() error, error) {
+					unlock, errLock := authfileguard.LockRootMutationContext(ctx, root)
+					if errLock != nil {
+						return nil, errLock
+					}
+					return func() error { return errors.Join(unlock(), errUnlock) }, nil
+				}
+			},
+		},
+		{
+			name: "target",
+			inject: func(store *PostgresStore) {
+				store.lockRootTarget = func(ctx context.Context, root *os.Root, relativePath string) (func() error, error) {
+					unlock, errLock := authfileguard.LockRootTargetContext(ctx, root, relativePath)
+					if errLock != nil {
+						return nil, errLock
+					}
+					return func() error { return errors.Join(unlock(), errUnlock) }, nil
+				}
+			},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			const fileName = "unlock-delete.json"
+			data := []byte(`{"type":"codex","access_token":"token"}`)
+			backend := &postgresStoreTestBackend{authRecords: map[string][]byte{fileName: append([]byte(nil), data...)}}
+			db := newPostgresStoreTestSQLDB(t, backend)
+			authDir := t.TempDir()
+			store := &PostgresStore{db: db, cfg: PostgresStoreConfig{AuthTable: defaultAuthTable}, authDir: authDir}
+			tt.inject(store)
+			if errWrite := os.WriteFile(filepath.Join(authDir, fileName), data, 0o600); errWrite != nil {
+				t.Fatal(errWrite)
+			}
+			root, errRoot := os.OpenRoot(authDir)
+			if errRoot != nil {
+				t.Fatal(errRoot)
+			}
+			defer root.Close()
+
+			errDelete := store.DeleteAuthFileAtRoot(t.Context(), root, fileName)
+			if !errors.Is(errDelete, errUnlock) {
+				t.Fatalf("DeleteAuthFileAtRoot() error = %v, want %v", errDelete, errUnlock)
+			}
+			if outcome, ok := cliproxyauth.DeleteOutcomeFromError(errDelete); !ok || outcome != cliproxyauth.DeleteOutcomeCommitted {
+				t.Fatalf("delete outcome = %v, %t; want committed", outcome, ok)
+			}
+			if _, exists := backend.authRecordSnapshot(fileName); exists {
+				t.Fatal("committed database auth still exists")
 			}
 		})
 	}
@@ -812,7 +1440,7 @@ func TestPostgresPersistAuthFilesProbesCommitErrors(t *testing.T) {
 	}
 }
 
-func TestPostgresDeleteAuthFileAtRootRollsBackTransactionOnLocalFailure(t *testing.T) {
+func TestPostgresDeleteAuthFileAtRootRejectsClosedRootBeforeTransaction(t *testing.T) {
 	const fileName = "local-failure.json"
 	wantData := []byte(`{"type":"codex","access_token":"token"}`)
 	backend := &postgresStoreTestBackend{authRecords: map[string][]byte{fileName: append([]byte(nil), wantData...)}}
@@ -844,8 +1472,8 @@ func TestPostgresDeleteAuthFileAtRootRollsBackTransactionOnLocalFailure(t *testi
 	if gotData, ok := backend.authRecordSnapshot(fileName); !ok || !bytes.Equal(gotData, wantData) {
 		t.Fatalf("database auth = %s, %t; want rolled back %s", gotData, ok, wantData)
 	}
-	if begins, commits, rollbacks := backend.transactionSnapshot(); begins != 1 || commits != 0 || rollbacks != 1 {
-		t.Fatalf("transactions = begin:%d commit:%d rollback:%d, want 1/0/1", begins, commits, rollbacks)
+	if begins, commits, rollbacks := backend.transactionSnapshot(); begins != 0 || commits != 0 || rollbacks != 0 {
+		t.Fatalf("transactions = begin:%d commit:%d rollback:%d, want 0/0/0", begins, commits, rollbacks)
 	}
 }
 
@@ -902,6 +1530,58 @@ func TestPostgresStoreDeleteReportsCommitErrorOutcome(t *testing.T) {
 				t.Fatalf("database auth = %s, want %s", gotRemote, wantData)
 			}
 		})
+	}
+}
+
+func TestPostgresStoreDeleteAcquiresPersistentTargetBeforeDatabaseMutation(t *testing.T) {
+	const fileName = "delete-lock-order.json"
+	wantData := []byte(`{"type":"codex","access_token":"token"}`)
+	backend := &postgresStoreTestBackend{
+		authRecords: map[string][]byte{fileName: append([]byte(nil), wantData...)},
+	}
+	db := newPostgresStoreTestSQLDB(t, backend)
+	authDir := t.TempDir()
+	store := &PostgresStore{db: db, cfg: PostgresStoreConfig{AuthTable: defaultAuthTable}, authDir: authDir}
+	if errWrite := os.WriteFile(filepath.Join(authDir, fileName), wantData, 0o600); errWrite != nil {
+		t.Fatalf("write auth file: %v", errWrite)
+	}
+	root, errRoot := os.OpenRoot(authDir)
+	if errRoot != nil {
+		t.Fatal(errRoot)
+	}
+	defer root.Close()
+	unlockTarget, errTarget := authfileguard.LockRootTarget(root, fileName)
+	if errTarget != nil {
+		t.Fatal(errTarget)
+	}
+	targetLocked := true
+	defer func() {
+		if targetLocked {
+			_ = unlockTarget()
+		}
+	}()
+
+	deleteDone := make(chan error, 1)
+	go func() { deleteDone <- store.Delete(t.Context(), fileName) }()
+	select {
+	case errDelete := <-deleteDone:
+		t.Fatalf("Delete() returned while persistent target was held: %v", errDelete)
+	case <-time.After(100 * time.Millisecond):
+	}
+	if begins, commits, rollbacks := backend.transactionSnapshot(); begins != 0 || commits != 0 || rollbacks != 0 {
+		t.Fatalf("database mutation started before target lock: begin:%d commit:%d rollback:%d", begins, commits, rollbacks)
+	}
+	if errUnlock := unlockTarget(); errUnlock != nil {
+		t.Fatal(errUnlock)
+	}
+	targetLocked = false
+	select {
+	case errDelete := <-deleteDone:
+		if errDelete != nil {
+			t.Fatalf("Delete() error: %v", errDelete)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Delete() did not finish after target lock release")
 	}
 }
 
@@ -1725,6 +2405,7 @@ type postgresStoreTestBackend struct {
 	commitError               error
 	commitErrorApplies        bool
 	commitErrorReplacement    map[string][]byte
+	commitErrorHook           func()
 	normalizeJSONBReads       bool
 }
 
@@ -1942,6 +2623,25 @@ func (c *postgresStoreTestConn) ExecContext(ctx context.Context, query string, a
 		if errArgs != nil {
 			return nil, errArgs
 		}
+		if strings.Contains(query, "DO NOTHING") {
+			started, proceed := c.backend.conditionalUpsertChannels()
+			if started != nil {
+				select {
+				case started <- struct{}{}:
+				default:
+				}
+			}
+			if proceed != nil {
+				select {
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				case <-proceed:
+				}
+			}
+			if handled, affected := c.backend.stageAuthMutationIfAbsent(c.tx, id, data); handled {
+				return driver.RowsAffected(affected), nil
+			}
+		}
 		if strings.Contains(query, "current_auth.content") {
 			started, proceed := c.backend.conditionalUpsertChannels()
 			if started != nil {
@@ -2067,9 +2767,9 @@ func (tx *postgresStoreTestTx) Rollback() error {
 func (tx *postgresStoreTestTx) finish(commit bool) error {
 	backend := tx.conn.backend
 	backend.mu.Lock()
-	defer backend.mu.Unlock()
 
 	if tx.done {
+		backend.mu.Unlock()
 		return fmt.Errorf("postgres store test: transaction already completed")
 	}
 	applyCommit := commit && (backend.commitError == nil || backend.commitErrorApplies)
@@ -2114,8 +2814,14 @@ func (tx *postgresStoreTestTx) finish(commit bool) error {
 	}
 	tx.done = true
 	tx.conn.tx = nil
+	commitError := backend.commitError
+	commitErrorHook := backend.commitErrorHook
+	backend.mu.Unlock()
 	if commit {
-		return backend.commitError
+		if commitError != nil && commitErrorHook != nil {
+			commitErrorHook()
+		}
+		return commitError
 	}
 	return nil
 }
@@ -2204,6 +2910,28 @@ func (b *postgresStoreTestBackend) stageAuthMutationUnlessRetired(tx *postgresSt
 	} else {
 		tx.pendingAuth[id] = mutation
 	}
+	return true, 1
+}
+
+func (b *postgresStoreTestBackend) stageAuthMutationIfAbsent(tx *postgresStoreTestTx, id string, data []byte) (bool, int64) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	if b.authRecords == nil {
+		b.authRecords = make(map[string][]byte)
+	}
+	if _, exists := b.authRecords[id]; exists {
+		return true, 0
+	}
+	if tx != nil {
+		if mutation, exists := tx.pendingAuth[id]; exists && !mutation.deleted {
+			return true, 0
+		}
+		tx.pendingAuth[id] = postgresStoreTestAuthMutation{data: append([]byte(nil), data...)}
+		return true, 1
+	}
+	b.authRecords[id] = append([]byte(nil), data...)
+	b.bumpAuthRevisionLocked(id)
 	return true, 1
 }
 
@@ -2390,5 +3118,17 @@ func execArgumentBytes(t *testing.T, args []driver.NamedValue, index int) []byte
 	default:
 		t.Fatalf("unsupported argument type %T", value)
 		return nil
+	}
+}
+
+func TestPostgresStoreRejectsReservedAuthLockPath(t *testing.T) {
+	authDir := t.TempDir()
+	store := &PostgresStore{authDir: authDir}
+	path := filepath.Join(authDir, ".auth-root-lock")
+	if _, errRelative := store.relativeAuthID(path); !errors.Is(errRelative, errReservedAuthLockPath) {
+		t.Fatalf("relativeAuthID() error = %v, want reserved lock path", errRelative)
+	}
+	if _, errAbsolute := store.absoluteAuthPath("nested/.auth-root-lock"); !errors.Is(errAbsolute, errReservedAuthLockPath) {
+		t.Fatalf("absoluteAuthPath() error = %v, want reserved lock path", errAbsolute)
 	}
 }

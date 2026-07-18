@@ -182,6 +182,24 @@ func TestManagerUnregisterExecutorClosesLifecycle(t *testing.T) {
 	}
 }
 
+func TestManagerUnregisterExecutorAfterShutdownRemovesClosedExecutor(t *testing.T) {
+	manager := NewManager(nil, nil, nil)
+	executor := &lifecycleReplaceAwareExecutor{replaceAwareExecutor: &replaceAwareExecutor{id: "antigravity"}}
+	manager.RegisterExecutor(executor)
+	if errClose := manager.CloseExecutors(); errClose != nil {
+		t.Fatalf("CloseExecutors() error: %v", errClose)
+	}
+
+	manager.UnregisterExecutor("antigravity")
+
+	if _, ok := manager.Executor("antigravity"); ok {
+		t.Fatal("Executor() returned a closed executor after unregister")
+	}
+	if got := executor.CloseCalls(); got != 1 {
+		t.Fatalf("executor Close() calls = %d, want 1", got)
+	}
+}
+
 func TestManagerCloseExecutorsRejectsLateRegistration(t *testing.T) {
 	manager := NewManager(nil, nil, nil)
 	current := &lifecycleReplaceAwareExecutor{replaceAwareExecutor: &replaceAwareExecutor{id: "antigravity"}}
@@ -202,6 +220,20 @@ func TestManagerCloseExecutorsRejectsLateRegistration(t *testing.T) {
 	resolved, ok := manager.Executor("antigravity")
 	if !ok || resolved != current {
 		t.Fatalf("registered executor = %T %p, want current %p", resolved, resolved, current)
+	}
+}
+
+func TestManagerCloseExecutorsIgnoresLateRegistrationOfOwnedExecutor(t *testing.T) {
+	manager := NewManager(nil, nil, nil)
+	current := &lifecycleReplaceAwareExecutor{replaceAwareExecutor: &replaceAwareExecutor{id: "antigravity"}}
+	manager.RegisterExecutor(current)
+	if errClose := manager.CloseExecutors(); errClose != nil {
+		t.Fatalf("CloseExecutors() error: %v", errClose)
+	}
+
+	manager.RegisterExecutor(current)
+	if got := current.CloseCalls(); got != 1 {
+		t.Fatalf("owned executor Close() calls = %d, want 1", got)
 	}
 }
 
@@ -235,6 +267,9 @@ func TestManagerCloseExecutorsWaitsForReplacementClose(t *testing.T) {
 	case errClose := <-shutdownDone:
 		t.Fatalf("CloseExecutors() returned before replacement close completed: %v", errClose)
 	case <-time.After(20 * time.Millisecond):
+	}
+	if got := current.CloseCalls(); got != 1 {
+		t.Fatalf("current Close() calls before old replacement release = %d, want 1", got)
 	}
 	releaseClose()
 	select {
@@ -293,6 +328,202 @@ func TestManagerConcurrentCloseExecutorsWaitsAndReturnsSameError(t *testing.T) {
 		case <-time.After(time.Second):
 			t.Fatalf("CloseExecutors() result %d did not finish", index)
 		}
+	}
+}
+
+func TestManagerCloseExecutorsContextTracksCloseAfterDeadline(t *testing.T) {
+	manager := NewManager(nil, nil, nil)
+	executor := &blockingLifecycleReplaceAwareExecutor{
+		replaceAwareExecutor: &replaceAwareExecutor{id: "antigravity"},
+		closeStart:           make(chan struct{}),
+		closeGate:            make(chan struct{}),
+	}
+	var releaseOnce sync.Once
+	releaseClose := func() { releaseOnce.Do(func() { close(executor.closeGate) }) }
+	t.Cleanup(releaseClose)
+	manager.RegisterExecutor(executor)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
+	defer cancel()
+	if errClose := manager.CloseExecutorsContext(ctx); !errors.Is(errClose, context.DeadlineExceeded) {
+		t.Fatalf("CloseExecutorsContext() error = %v, want deadline exceeded", errClose)
+	}
+
+	late := &lifecycleReplaceAwareExecutor{replaceAwareExecutor: &replaceAwareExecutor{id: "antigravity"}}
+	registerDone := make(chan struct{})
+	go func() {
+		manager.RegisterExecutor(late)
+		close(registerDone)
+	}()
+	select {
+	case <-registerDone:
+	case <-time.After(time.Second):
+		t.Fatal("late registration blocked behind timed-out executor close")
+	}
+	if got := late.CloseCalls(); got != 1 {
+		t.Fatalf("late executor Close() calls = %d, want 1", got)
+	}
+
+	releaseClose()
+	if errClose := manager.CloseExecutors(); errClose != nil {
+		t.Fatalf("tracked CloseExecutors() error: %v", errClose)
+	}
+}
+
+func TestManagerCloseExecutorsWaitsForRejectedLateRegistrationClose(t *testing.T) {
+	manager := NewManager(nil, nil, nil)
+	current := &blockingLifecycleReplaceAwareExecutor{
+		replaceAwareExecutor: &replaceAwareExecutor{id: "antigravity"},
+		closeStart:           make(chan struct{}),
+		closeGate:            make(chan struct{}),
+	}
+	late := &blockingLifecycleReplaceAwareExecutor{
+		replaceAwareExecutor: &replaceAwareExecutor{id: "antigravity"},
+		closeStart:           make(chan struct{}),
+		closeGate:            make(chan struct{}),
+		closeErr:             errors.New("late close failed"),
+	}
+	manager.RegisterExecutor(current)
+
+	shutdownDone := make(chan error, 1)
+	go func() { shutdownDone <- manager.CloseExecutors() }()
+	select {
+	case <-current.closeStart:
+	case <-time.After(time.Second):
+		t.Fatal("registered executor close did not start")
+	}
+
+	lateDone := make(chan struct{})
+	go func() {
+		manager.RegisterExecutor(late)
+		close(lateDone)
+	}()
+	select {
+	case <-late.closeStart:
+	case <-time.After(time.Second):
+		t.Fatal("late executor close did not start")
+	}
+	close(current.closeGate)
+	select {
+	case errClose := <-shutdownDone:
+		t.Fatalf("CloseExecutors() returned before late close completed: %v", errClose)
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(late.closeGate)
+	select {
+	case <-lateDone:
+	case <-time.After(time.Second):
+		t.Fatal("late RegisterExecutor() did not finish")
+	}
+	select {
+	case errClose := <-shutdownDone:
+		if !errors.Is(errClose, late.closeErr) {
+			t.Fatalf("CloseExecutors() error = %v, want %v", errClose, late.closeErr)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("CloseExecutors() did not finish after late close")
+	}
+}
+
+func TestManagerCloseExecutorsWaitsForRegistrationAfterCloseSeal(t *testing.T) {
+	manager := NewManager(nil, nil, nil)
+	done := make(chan struct{})
+	manager.executorLifecycleMu.Lock()
+	manager.executorsClosed = true
+	manager.executorCloseSealed = true
+	manager.executorsCloseDone = done
+	manager.executorLifecycleMu.Unlock()
+	manager.executorCloseWG.Done()
+
+	late := &blockingLifecycleReplaceAwareExecutor{
+		replaceAwareExecutor: &replaceAwareExecutor{id: "antigravity"},
+		closeStart:           make(chan struct{}),
+		closeGate:            make(chan struct{}),
+		closeErr:             errors.New("sealed late close failed"),
+	}
+	registerDone := make(chan struct{})
+	go func() {
+		manager.RegisterExecutor(late)
+		close(registerDone)
+	}()
+	select {
+	case <-late.closeStart:
+	case <-time.After(time.Second):
+		t.Fatal("late executor close did not start")
+	}
+
+	go manager.closeExecutors(nil, done)
+	select {
+	case <-done:
+		t.Fatal("executor shutdown completed before sealed late close")
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(late.closeGate)
+	select {
+	case <-registerDone:
+	case <-time.After(time.Second):
+		t.Fatal("late registration did not finish")
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("executor shutdown did not finish after sealed late close")
+	}
+	manager.executorLifecycleMu.Lock()
+	closeErr := manager.executorsCloseErr
+	manager.executorLifecycleMu.Unlock()
+	if !errors.Is(closeErr, late.closeErr) {
+		t.Fatalf("executor shutdown error = %v, want %v", closeErr, late.closeErr)
+	}
+}
+
+func TestManagerCloseExecutorsClosesRejectedExecutorOnlyOnce(t *testing.T) {
+	manager := NewManager(nil, nil, nil)
+	manager.RegisterExecutor(&lifecycleReplaceAwareExecutor{replaceAwareExecutor: &replaceAwareExecutor{id: "antigravity"}})
+	if errClose := manager.CloseExecutors(); errClose != nil {
+		t.Fatalf("CloseExecutors() error = %v", errClose)
+	}
+
+	rejected := &lifecycleReplaceAwareExecutor{replaceAwareExecutor: &replaceAwareExecutor{id: "antigravity"}}
+	manager.RegisterExecutor(rejected)
+	manager.RegisterExecutor(rejected)
+	if got := rejected.CloseCalls(); got != 1 {
+		t.Fatalf("rejected executor Close() calls = %d, want 1", got)
+	}
+}
+
+func TestManagerUnregisterDuringExecutorShutdownDoesNotCloseTwice(t *testing.T) {
+	manager := NewManager(nil, nil, nil)
+	executor := &blockingLifecycleReplaceAwareExecutor{
+		replaceAwareExecutor: &replaceAwareExecutor{id: "antigravity"},
+		closeStart:           make(chan struct{}),
+		closeGate:            make(chan struct{}),
+	}
+	var releaseOnce sync.Once
+	releaseClose := func() { releaseOnce.Do(func() { close(executor.closeGate) }) }
+	t.Cleanup(releaseClose)
+	manager.RegisterExecutor(executor)
+
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- manager.CloseExecutors() }()
+	select {
+	case <-executor.closeStart:
+	case <-time.After(time.Second):
+		t.Fatal("executor close did not start")
+	}
+
+	manager.UnregisterExecutor("antigravity")
+	releaseClose()
+	select {
+	case errClose := <-closeDone:
+		if errClose != nil {
+			t.Fatalf("CloseExecutors() error: %v", errClose)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("CloseExecutors() did not finish")
+	}
+	if got := len(executor.ClosedSessionIDs()); got != 1 {
+		t.Fatalf("executor close session calls = %d, want 1", got)
 	}
 }
 

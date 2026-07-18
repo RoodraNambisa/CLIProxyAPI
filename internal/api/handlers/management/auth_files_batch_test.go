@@ -3,6 +3,7 @@ package management
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
@@ -218,6 +219,145 @@ func TestUploadAuthFile_InvalidJSONReturnsBadRequestWithoutOverwrite(t *testing.
 				t.Fatalf("existing auth = %s, error=%v", data, errRead)
 			}
 		})
+	}
+}
+
+func TestUploadAuthFile_RejectsChatGPTWebCredentialsWithoutWriting(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		request func(t *testing.T) *http.Request
+	}{
+		{
+			name: "raw",
+			request: func(t *testing.T) *http.Request {
+				t.Helper()
+				return httptest.NewRequest(http.MethodPost, "/v0/management/auth-files?name=account.json", bytes.NewBufferString(`{"type":"chatgpt-web","email":"person@example.com"}`))
+			},
+		},
+		{
+			name: "multipart",
+			request: func(t *testing.T) *http.Request {
+				t.Helper()
+				var body bytes.Buffer
+				writer := multipart.NewWriter(&body)
+				part, errCreate := writer.CreateFormFile("file", "account.json")
+				if errCreate != nil {
+					t.Fatalf("create multipart file: %v", errCreate)
+				}
+				if _, errWrite := part.Write([]byte(`{"type":"chatgpt-web","email":"person@example.com"}`)); errWrite != nil {
+					t.Fatalf("write multipart file: %v", errWrite)
+				}
+				if errClose := writer.Close(); errClose != nil {
+					t.Fatalf("close multipart writer: %v", errClose)
+				}
+				request := httptest.NewRequest(http.MethodPost, "/v0/management/auth-files", &body)
+				request.Header.Set("Content-Type", writer.FormDataContentType())
+				return request
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			authDir := t.TempDir()
+			h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, coreauth.NewManager(nil, nil, nil))
+			recorder := httptest.NewRecorder()
+			ctx, _ := gin.CreateTestContext(recorder)
+			ctx.Request = test.request(t)
+
+			h.UploadAuthFile(ctx)
+
+			if recorder.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want %d; body=%s", recorder.Code, http.StatusBadRequest, recorder.Body.String())
+			}
+			if _, errStat := os.Stat(filepath.Join(authDir, "account.json")); !os.IsNotExist(errStat) {
+				t.Fatalf("chatgpt web auth file was written: %v", errStat)
+			}
+			if auths := h.authManager.List(); len(auths) != 0 {
+				t.Fatalf("registered auths = %#v, want none", auths)
+			}
+		})
+	}
+}
+
+func TestUploadAuthFile_RejectsOverwriteOfChatGPTWebCredential(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		request func(t *testing.T) *http.Request
+	}{
+		{
+			name: "raw",
+			request: func(t *testing.T) *http.Request {
+				t.Helper()
+				return httptest.NewRequest(http.MethodPost, "/v0/management/auth-files?name=account.json", bytes.NewBufferString(`{"type":"codex","email":"replacement@example.com"}`))
+			},
+		},
+		{
+			name: "multipart",
+			request: func(t *testing.T) *http.Request {
+				t.Helper()
+				var body bytes.Buffer
+				writer := multipart.NewWriter(&body)
+				part, errCreate := writer.CreateFormFile("file", "account.json")
+				if errCreate != nil {
+					t.Fatalf("create multipart file: %v", errCreate)
+				}
+				if _, errWrite := part.Write([]byte(`{"type":"codex","email":"replacement@example.com"}`)); errWrite != nil {
+					t.Fatalf("write multipart file: %v", errWrite)
+				}
+				if errClose := writer.Close(); errClose != nil {
+					t.Fatalf("close multipart writer: %v", errClose)
+				}
+				request := httptest.NewRequest(http.MethodPost, "/v0/management/auth-files", &body)
+				request.Header.Set("Content-Type", writer.FormDataContentType())
+				return request
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			authDir := t.TempDir()
+			const existingContent = `{"type":"chatgpt-web","email":"person@example.com","password":"secret"}`
+			path := filepath.Join(authDir, "account.json")
+			if errWrite := os.WriteFile(path, []byte(existingContent), 0o600); errWrite != nil {
+				t.Fatalf("seed existing auth: %v", errWrite)
+			}
+			h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, coreauth.NewManager(nil, nil, nil))
+			recorder := httptest.NewRecorder()
+			ctx, _ := gin.CreateTestContext(recorder)
+			ctx.Request = test.request(t)
+
+			h.UploadAuthFile(ctx)
+
+			if recorder.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want %d; body=%s", recorder.Code, http.StatusBadRequest, recorder.Body.String())
+			}
+			data, errRead := os.ReadFile(path)
+			if errRead != nil || string(data) != existingContent {
+				t.Fatalf("existing auth = %s, error=%v", data, errRead)
+			}
+		})
+	}
+}
+
+func TestWriteAuthFileSafelyRechecksChatGPTWebCredentialUnderTargetLock(t *testing.T) {
+	root, errRoot := os.OpenRoot(t.TempDir())
+	if errRoot != nil {
+		t.Fatal(errRoot)
+	}
+	defer root.Close()
+	const (
+		name            = "account.json"
+		existingContent = `{"type":"chatgpt-web","email":"person@example.com","password":"secret"}`
+	)
+	if errWrite := root.WriteFile(name, []byte(existingContent), 0o600); errWrite != nil {
+		t.Fatal(errWrite)
+	}
+
+	errWrite := writeAuthFileSafely(root, name, []byte(`{"type":"codex","email":"replacement@example.com"}`))
+	if !errors.Is(errWrite, errChatGPTWebAuthUpload) {
+		t.Fatalf("write error = %v, want ChatGPT Web upload rejection", errWrite)
+	}
+	data, errRead := root.ReadFile(name)
+	if errRead != nil || string(data) != existingContent {
+		t.Fatalf("existing auth = %s, error=%v", data, errRead)
 	}
 }
 

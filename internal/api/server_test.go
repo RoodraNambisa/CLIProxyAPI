@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -52,7 +53,15 @@ func newTestServerWithConfig(t *testing.T, mutate func(*proxyconfig.Config)) *Se
 	accessManager := sdkaccess.NewManager()
 
 	configPath := filepath.Join(tmpDir, "config.yaml")
-	return NewServer(cfg, authManager, accessManager, configPath)
+	server := NewServer(cfg, authManager, accessManager, configPath)
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if errShutdown := server.mgmt.Shutdown(ctx); errShutdown != nil {
+			t.Errorf("shutdown management handler: %v", errShutdown)
+		}
+	})
+	return server
 }
 
 func TestHealthz(t *testing.T) {
@@ -121,6 +130,29 @@ func TestLightweightUsageAnalyticsRoutesAreRegistered(t *testing.T) {
 		http.MethodPatch + " /v0/management/usage/prices":         false,
 		http.MethodDelete + " /v0/management/usage/prices":        false,
 		http.MethodDelete + " /v0/management/usage/prices/*model": false,
+	}
+	for _, route := range server.engine.Routes() {
+		key := route.Method + " " + route.Path
+		if _, ok := want[key]; ok {
+			want[key] = true
+		}
+	}
+	for route, registered := range want {
+		if !registered {
+			t.Errorf("route %s is not registered", route)
+		}
+	}
+}
+
+func TestChatGPTWebManagementRoutesAreRegistered(t *testing.T) {
+	server := newTestServerWithConfig(t, func(cfg *proxyconfig.Config) {
+		cfg.RemoteManagement.SecretKey = "secret"
+	})
+	want := map[string]bool{
+		http.MethodPost + " /v0/management/chatgpt-web/login-tasks":              false,
+		http.MethodGet + " /v0/management/chatgpt-web/login-tasks/:id":           false,
+		http.MethodDelete + " /v0/management/chatgpt-web/login-tasks/:id":        false,
+		http.MethodPost + " /v0/management/chatgpt-web/auth-files/:name/relogin": false,
 	}
 	for _, route := range server.engine.Routes() {
 		key := route.Method + " " + route.Path

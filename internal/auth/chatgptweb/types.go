@@ -129,6 +129,8 @@ func DecodeCredential(data []byte) (*Credential, error) {
 	if credential.Cookies == nil {
 		credential.Cookies = []Cookie{}
 	}
+	credential.LifecycleState = normalizedCredentialLifecycleState(&credential)
+	credential.LifecycleReason = SafeLifecycleReason(credential.LifecycleReason)
 	return &credential, nil
 }
 
@@ -156,12 +158,25 @@ func (credential *Credential) ApplyToMetadata(metadata map[string]any) {
 	metadata["persona"] = normalizePersona(credential.Persona)
 	metadata["device_id"] = credential.DeviceID
 	metadata["session_id"] = credential.SessionID
-	metadata["lifecycle_state"] = string(credential.LifecycleState)
-	metadata["lifecycle_reason"] = credential.LifecycleReason
+	metadata["lifecycle_state"] = string(normalizedCredentialLifecycleState(credential))
+	metadata["lifecycle_reason"] = SafeLifecycleReason(credential.LifecycleReason)
 	metadata["lifecycle_updated_at"] = credential.LifecycleUpdatedAt
 	metadata["last_login_at"] = credential.LastLoginAt
 	metadata["last_refresh_at"] = credential.LastRefreshAt
 	metadata["last_relogin_at"] = credential.LastReloginAt
+}
+
+func normalizedCredentialLifecycleState(credential *Credential) LifecycleState {
+	if credential == nil {
+		return LifecycleLoginPending
+	}
+	if strings.TrimSpace(string(credential.LifecycleState)) == "" {
+		if strings.TrimSpace(credential.AccessToken) != "" {
+			return LifecycleActive
+		}
+		return LifecycleLoginPending
+	}
+	return SafeLifecycleState(string(credential.LifecycleState))
 }
 
 type LoginInput struct {

@@ -682,6 +682,20 @@ func TestSynthesizeAuthFileMapsChatGPTWebLifecycle(t *testing.T) {
 			wantMessage: "passkey_required",
 		},
 		{
+			name:        "unknown reason is sanitized",
+			payload:     `{"type":"chatgpt-web","lifecycle_state":"reauth_required","lifecycle_reason":"secret-shaped-reason"}`,
+			wantState:   coreauth.LifecycleStateReauthRequired,
+			wantStatus:  coreauth.StatusError,
+			wantMessage: "authentication_failed",
+		},
+		{
+			name:        "unknown state fails closed",
+			payload:     `{"type":"chatgpt-web","lifecycle_state":"secret-shaped-state","lifecycle_reason":"secret-shaped-reason"}`,
+			wantState:   coreauth.LifecycleStateReauthRequired,
+			wantStatus:  coreauth.StatusError,
+			wantMessage: "authentication_failed",
+		},
+		{
 			name:         "disabled overrides lifecycle",
 			payload:      `{"type":"chatgpt-web","lifecycle_state":"dead","lifecycle_reason":"account_deactivated","disabled":true}`,
 			wantState:    coreauth.LifecycleStateDead,

@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 
+	chatgptwebauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/chatgptweb"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/auth/codex"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 )
@@ -120,7 +121,7 @@ func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) []
 	} else if provider == "chatgpt-web" {
 		state := (&coreauth.Auth{Provider: provider, Metadata: metadata}).LifecycleState()
 		status = coreauth.RuntimeStatusForLifecycle(state)
-		statusMessage = strings.TrimSpace(metadataString(metadata, "lifecycle_reason"))
+		statusMessage = chatgptwebauth.SafeLifecycleReason(metadataString(metadata, "lifecycle_reason"))
 	}
 
 	// Read per-account excluded models from the OAuth JSON file.

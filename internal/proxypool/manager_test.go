@@ -272,6 +272,112 @@ func TestBackgroundCleanupRevalidatesBindingAgainstLatestConfiguration(t *testin
 	}
 }
 
+func TestBackgroundCleanupKeepsPendingBindingWhileLeaseIsHeld(t *testing.T) {
+	manager := newTestManager(t, filepath.Join(t.TempDir(), "config.yaml"), proxyPoolTestConfig("3334"))
+	manager.check = successfulTrace
+	auth := proxyPoolTestAuth("pending-auth")
+	release := manager.HoldBinding(auth.ID)
+	if _, errResolve := manager.Resolve(context.Background(), auth); errResolve != nil {
+		release()
+		t.Fatalf("Resolve() error = %v", errResolve)
+	}
+	manager.SetAuthSource(staticAuthSource{})
+
+	manager.CheckNow(context.Background())
+	if bindings := manager.SortedBindings(); len(bindings) != 1 || bindings[0].AuthID != auth.ID {
+		release()
+		t.Fatalf("bindings while lease is held = %+v, want pending binding", bindings)
+	}
+
+	release()
+	manager.CheckNow(context.Background())
+	if bindings := manager.SortedBindings(); len(bindings) != 0 {
+		t.Fatalf("bindings after lease release = %+v, want none", bindings)
+	}
+}
+
+func TestBackgroundCleanupKeepsDisabledBindingDuringManualReloginLease(t *testing.T) {
+	manager := newTestManager(t, filepath.Join(t.TempDir(), "config.yaml"), proxyPoolTestConfig("3334"))
+	manager.check = successfulTrace
+	auth := proxyPoolTestAuth("disabled-auth")
+	auth.Disabled = true
+	auth.Status = coreauth.StatusDisabled
+	manager.SetAuthSource(staticAuthSource{auth.ID: auth})
+	release := manager.HoldBinding(auth.ID)
+	if _, errResolve := manager.Resolve(context.Background(), auth); errResolve != nil {
+		release()
+		t.Fatalf("Resolve() error = %v", errResolve)
+	}
+
+	manager.CheckNow(context.Background())
+	if bindings := manager.SortedBindings(); len(bindings) != 1 || bindings[0].AuthID != auth.ID {
+		release()
+		t.Fatalf("bindings during manual re-login lease = %+v, want disabled auth binding", bindings)
+	}
+
+	release()
+	manager.CheckNow(context.Background())
+	if bindings := manager.SortedBindings(); len(bindings) != 0 {
+		t.Fatalf("bindings after manual re-login lease = %+v, want none", bindings)
+	}
+}
+
+func TestBindingCleanupAllowsLeaseAcquisitionDuringAuthLookup(t *testing.T) {
+	manager := newTestManager(t, filepath.Join(t.TempDir(), "config.yaml"), proxyPoolTestConfig("3334"))
+	manager.check = successfulTrace
+	auth := proxyPoolTestAuth("lease-delete-race")
+	if _, errResolve := manager.Resolve(context.Background(), auth); errResolve != nil {
+		t.Fatalf("Resolve() error = %v", errResolve)
+	}
+	bindings := manager.SortedBindings()
+	if len(bindings) != 1 {
+		t.Fatalf("bindings before cleanup = %+v, want one", bindings)
+	}
+	source := &blockingGetAuthSource{
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	manager.SetAuthSource(source)
+	removeDone := make(chan error, 1)
+	go func() {
+		removeDone <- manager.removeBindings([]bindingRemovalCandidate{{AuthID: auth.ID, BindingID: bindings[0].ID}})
+	}()
+	select {
+	case <-source.started:
+	case <-time.After(time.Second):
+		t.Fatal("binding cleanup did not reach final validation")
+	}
+
+	holdDone := make(chan func(), 1)
+	go func() {
+		holdDone <- manager.HoldBinding(auth.ID)
+	}()
+	var release func()
+	select {
+	case release = <-holdDone:
+	case <-time.After(time.Second):
+		close(source.release)
+		<-removeDone
+		t.Fatal("HoldBinding blocked behind auth source lookup")
+	}
+	close(source.release)
+	if errRemove := <-removeDone; errRemove != nil {
+		t.Fatalf("removeBindings() error = %v", errRemove)
+	}
+	if bindings = manager.SortedBindings(); len(bindings) != 1 || bindings[0].AuthID != auth.ID {
+		release()
+		t.Fatalf("bindings while lease was acquired = %+v, want original binding", bindings)
+	}
+	release()
+	manager.SetAuthSource(staticAuthSource{})
+	if errRemove := manager.removeBindings([]bindingRemovalCandidate{{AuthID: auth.ID, BindingID: bindings[0].ID}}); errRemove != nil {
+		t.Fatalf("removeBindings() after lease release error = %v", errRemove)
+	}
+	if bindings = manager.SortedBindings(); len(bindings) != 0 {
+		t.Fatalf("bindings after lease release = %+v, want none", bindings)
+	}
+}
+
 func TestResolveStrictPoolFailureDoesNotPersistBinding(t *testing.T) {
 	t.Parallel()
 
@@ -804,6 +910,12 @@ type blockingAuthSource struct {
 	once    sync.Once
 }
 
+type blockingGetAuthSource struct {
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
 type testStatusError struct {
 	status  int
 	message string
@@ -836,4 +948,12 @@ func (s *blockingAuthSource) GetByID(id string) (*coreauth.Auth, bool) {
 		return nil, false
 	}
 	return s.auth, true
+}
+
+func (*blockingGetAuthSource) List() []*coreauth.Auth { return nil }
+
+func (s *blockingGetAuthSource) GetByID(string) (*coreauth.Auth, bool) {
+	s.once.Do(func() { close(s.started) })
+	<-s.release
+	return nil, false
 }

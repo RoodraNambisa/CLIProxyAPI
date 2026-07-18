@@ -19,7 +19,6 @@ import (
 	"github.com/google/uuid"
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
-	internalauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth"
 	internalcodex "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/codex"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/authfileguard"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/misc"
@@ -178,6 +177,15 @@ func (s *ObjectTokenStore) Bootstrap(ctx context.Context, exampleConfigPath stri
 
 // Save persists authentication metadata to disk and uploads it to the object storage backend.
 func (s *ObjectTokenStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (string, error) {
+	return s.save(ctx, auth, false)
+}
+
+// SaveIfAbsent persists auth only when neither object storage nor the local mirror contains it.
+func (s *ObjectTokenStore) SaveIfAbsent(ctx context.Context, auth *cliproxyauth.Auth) (string, error) {
+	return s.save(ctx, auth, true)
+}
+
+func (s *ObjectTokenStore) save(ctx context.Context, auth *cliproxyauth.Auth, requireAbsent bool) (savedPath string, resultErr error) {
 	if auth == nil {
 		return "", fmt.Errorf("object store: auth is nil")
 	}
@@ -208,37 +216,79 @@ func (s *ObjectTokenStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (s
 		}
 	}()
 
-	if auth.Disabled {
-		if _, statErr := root.Lstat(filepath.FromSlash(relativePath)); errors.Is(statErr, fs.ErrNotExist) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	committed := false
+	unlockRootMutation, errMutationLock := authfileguard.LockRootMutationContext(ctx, root)
+	if errMutationLock != nil {
+		return "", fmt.Errorf("object store: lock auth root for save: %w", errMutationLock)
+	}
+	defer func() {
+		resultErr = joinAuthSaveCleanupError(resultErr, unlockRootMutation(), committed)
+	}()
+	unlockPath, errPathLock := authfileguard.LockContext(ctx, path)
+	if errPathLock != nil {
+		return "", fmt.Errorf("object store: lock auth path for save: %w", errPathLock)
+	}
+	defer unlockPath()
+	snapshotPath := filepath.FromSlash(relativePath)
+	if err = mkdirAuthDirectoriesAtRoot(root, filepath.Dir(snapshotPath), 0o700); err != nil {
+		return "", fmt.Errorf("object store: create auth directory: %w", err)
+	}
+	unlockTarget, errTargetLock := authfileguard.LockRootTargetContext(ctx, root, snapshotPath)
+	if errTargetLock != nil {
+		return "", fmt.Errorf("object store: lock persistent auth target for save: %w", errTargetLock)
+	}
+	defer func() {
+		resultErr = joinAuthSaveCleanupError(resultErr, unlockTarget(), committed)
+	}()
+	if auth.Disabled && !requireAbsent {
+		if _, statErr := root.Lstat(snapshotPath); errors.Is(statErr, fs.ErrNotExist) {
 			return "", nil
 		}
 	}
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	unlockPath := authfileguard.Lock(path)
-	defer unlockPath()
 	if authfileguard.IsRetired(path) {
 		return "", fmt.Errorf("object store: %w", cliproxyauth.ErrRetiredGeminiCLIAuthReadOnly)
 	}
 	if authfileguard.IsQuarantined(path) {
 		return "", fmt.Errorf("object store: auth deletion is still pending: %w", authfileguard.ErrDeleteGenerationUncertain)
 	}
-
-	remoteState, errRemote := s.authObjectWritePrecondition(ctx, path)
-	if errRemote != nil {
-		if errors.Is(errRemote, cliproxyauth.ErrRetiredGeminiCLIAuthReadOnly) {
-			authfileguard.MarkRetired(path)
+	if requireAbsent {
+		earlySnapshot, errEarlySnapshot := captureAuthFileSnapshot(root, snapshotPath)
+		if errEarlySnapshot != nil {
+			return "", errEarlySnapshot
 		}
-		return "", errRemote
+		if earlySnapshot.exists {
+			return "", cliproxyauth.ErrAuthAlreadyExists
+		}
 	}
 
-	if err = mkdirAuthDirectoriesAtRoot(root, filepath.Dir(filepath.FromSlash(relativePath)), 0o700); err != nil {
-		return "", fmt.Errorf("object store: create auth directory: %w", err)
+	var remoteState objectAuthWritePrecondition
+	if requireAbsent {
+		remoteExists, errRemoteExists := s.authObjectExists(ctx, path)
+		if errRemoteExists != nil {
+			return "", errRemoteExists
+		}
+		if remoteExists {
+			return "", cliproxyauth.ErrAuthAlreadyExists
+		}
+	} else {
+		var errRemote error
+		remoteState, errRemote = s.authObjectWritePrecondition(ctx, path)
+		if errRemote != nil {
+			if errors.Is(errRemote, cliproxyauth.ErrRetiredGeminiCLIAuthReadOnly) {
+				authfileguard.MarkRetired(path)
+			}
+			return "", errRemote
+		}
 	}
-	localSnapshot, errSnapshot := captureAuthFileSnapshot(root, filepath.FromSlash(relativePath))
+
+	localSnapshot, errSnapshot := captureAuthFileSnapshot(root, snapshotPath)
 	if errSnapshot != nil {
 		return "", errSnapshot
+	}
+	if requireAbsent && localSnapshot.exists {
+		return "", cliproxyauth.ErrAuthAlreadyExists
 	}
 	if errRetired := localSnapshot.rejectRetiredGeminiCLIAuthPersistence(); errRetired != nil {
 		authfileguard.MarkRetired(path)
@@ -247,24 +297,39 @@ func (s *ObjectTokenStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (s
 	runtimeSnapshot := captureAuthRuntimeSnapshot(auth)
 
 	var persistedData []byte
+	installedSnapshot := localSnapshot
 	switch {
 	case auth.Storage != nil:
-		if setter, ok := auth.Storage.(internalauth.MetadataSetter); ok {
-			setter.SetMetadata(cliproxyauth.MetadataWithDisabled(auth))
-		}
-		data, errData := produceAuthStorageData(auth.Storage)
+		data, errData := prepareAuthStorageData(auth, runtimeSnapshot)
 		if errData != nil {
 			return "", fmt.Errorf("object store: produce storage auth: %w", errData)
 		}
-		if errWrite := writeAuthFileAtomicallyAtRoot(root, filepath.FromSlash(relativePath), data, &localSnapshot); errWrite != nil {
+		writtenSnapshot, errWrite := writeAuthFileAtomicallyAtRootWithReceiptTransactionTargetLockedContext(ctx, root, snapshotPath, data, &localSnapshot)
+		if errWrite != nil {
+			errWrite = rollBackCommittedAuthFileWriteAtRootTransactionTargetLockedContext(authRollbackContext(ctx), root, snapshotPath, writtenSnapshot, localSnapshot, errWrite)
+			runtimeSnapshot.restore(auth)
+			errWrite = mapAuthCreateGenerationConflict(requireAbsent, errWrite)
 			if errors.Is(errWrite, cliproxyauth.ErrRetiredGeminiCLIAuthReadOnly) {
 				authfileguard.MarkRetired(path)
 			}
 			return "", fmt.Errorf("object store: persist storage auth: %w", errWrite)
 		}
+		installedSnapshot = writtenSnapshot
 		persistedData = data
 		if errSync := cliproxyauth.SyncPersistedMetadataAndSourceHash(auth, data); errSync != nil {
-			return "", fmt.Errorf("object store: sync persisted storage auth: %w", errSync)
+			errSync = rollBackCommittedAuthFileWriteAtRootTransactionTargetLockedContext(
+				authRollbackContext(ctx),
+				root,
+				snapshotPath,
+				installedSnapshot,
+				localSnapshot,
+				cliproxyauth.NewSaveOutcomeError(
+					cliproxyauth.SaveOutcomeCommitted,
+					fmt.Errorf("object store: sync persisted storage auth: %w", errSync),
+				),
+			)
+			runtimeSnapshot.restore(auth)
+			return "", errSync
 		}
 	case auth.Metadata != nil:
 		raw, errMarshal := cliproxyauth.CanonicalMetadataBytes(auth)
@@ -273,10 +338,10 @@ func (s *ObjectTokenStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (s
 		}
 		writeLocal := true
 		persistedData = raw
-		if existing, errRead := root.ReadFile(filepath.FromSlash(relativePath)); errRead == nil {
+		if existing, errRead := root.ReadFile(snapshotPath); errRead == nil {
 			if jsonEqual(existing, raw) {
 				if !localSnapshot.exists || !bytes.Equal(existing, localSnapshot.data) {
-					return "", authfileguard.ErrPersistGenerationStale
+					return "", mapAuthCreateGenerationConflict(requireAbsent, authfileguard.ErrPersistGenerationStale)
 				}
 				writeLocal = false
 				persistedData = localSnapshot.data
@@ -285,12 +350,17 @@ func (s *ObjectTokenStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (s
 			return "", fmt.Errorf("object store: read existing metadata: %w", errRead)
 		}
 		if writeLocal {
-			if errWrite := writeAuthFileAtomicallyAtRoot(root, filepath.FromSlash(relativePath), raw, &localSnapshot); errWrite != nil {
+			writtenSnapshot, errWrite := writeAuthFileAtomicallyAtRootWithReceiptTransactionTargetLockedContext(ctx, root, snapshotPath, raw, &localSnapshot)
+			if errWrite != nil {
+				errWrite = rollBackCommittedAuthFileWriteAtRootTransactionTargetLockedContext(authRollbackContext(ctx), root, snapshotPath, writtenSnapshot, localSnapshot, errWrite)
+				runtimeSnapshot.restore(auth)
+				errWrite = mapAuthCreateGenerationConflict(requireAbsent, errWrite)
 				if errors.Is(errWrite, cliproxyauth.ErrRetiredGeminiCLIAuthReadOnly) {
 					authfileguard.MarkRetired(path)
 				}
 				return "", fmt.Errorf("object store: persist auth file: %w", errWrite)
 			}
+			installedSnapshot = writtenSnapshot
 		}
 		cliproxyauth.SetSourceHashAttribute(auth, raw)
 	default:
@@ -307,13 +377,22 @@ func (s *ObjectTokenStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (s
 	}
 
 	if err = s.uploadAuthData(ctx, path, persistedData, &remoteState); err != nil {
-		errRollback := restoreAuthFileSnapshotAtRoot(root, filepath.FromSlash(relativePath), persistedData, localSnapshot)
+		errRollback := restoreAuthFileSnapshotAtRootTransactionTargetLockedContext(authRollbackContext(ctx), root, snapshotPath, installedSnapshot, localSnapshot)
 		runtimeSnapshot.restore(auth)
-		if errRollback != nil {
-			return "", errors.Join(err, fmt.Errorf("object store: roll back local auth after upload failure: %w", errRollback))
+		outcome, explicit := cliproxyauth.SaveOutcomeFromError(err)
+		if !explicit {
+			outcome = cliproxyauth.SaveOutcomeUncertain
 		}
-		return "", err
+		errResult := err
+		if !authFileRollbackCompleted(errRollback) {
+			outcome = cliproxyauth.SaveOutcomeUncertain
+			errResult = errors.Join(err, fmt.Errorf("object store: roll back local auth after upload failure: %w", errRollback))
+		} else if errRollback != nil {
+			errResult = errors.Join(err, fmt.Errorf("object store: roll back local auth after upload failure: %w", errRollback))
+		}
+		return "", cliproxyauth.NewSaveOutcomeError(outcome, errResult)
 	}
+	committed = true
 	return path, nil
 }
 
@@ -389,7 +468,10 @@ func (s *ObjectTokenStore) FinalizeAuthFileDeletion(ctx context.Context, id stri
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	unlockPath := authfileguard.Lock(path)
+	unlockPath, errPathLock := authfileguard.LockContext(ctx, path)
+	if errPathLock != nil {
+		return errPathLock
+	}
 	defer unlockPath()
 	retiredSnapshot := authfileguard.CaptureRetired(path)
 	remoteState, data, errInspect := s.inspectAuthObject(ctx, path)
@@ -441,10 +523,20 @@ func (s *ObjectTokenStore) DeleteAuthFileAtRoot(ctx context.Context, root *os.Ro
 	return s.deleteAuthFileAtRoot(ctx, root, path, relativePath)
 }
 
-func (s *ObjectTokenStore) deleteAuthFileAtRoot(ctx context.Context, root *os.Root, path, relativePath string) error {
+func (s *ObjectTokenStore) deleteAuthFileAtRoot(ctx context.Context, root *os.Root, path, relativePath string) (resultErr error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	unlockPath := authfileguard.Lock(path)
+	unlockRootMutation, errMutationLock := authfileguard.LockRootMutationContext(ctx, root)
+	if errMutationLock != nil {
+		return cliproxyauth.NewDeleteOutcomeError(cliproxyauth.DeleteOutcomeRolledBack, fmt.Errorf("object store: lock auth root for deletion: %w", errMutationLock))
+	}
+	defer func() {
+		resultErr = joinAuthDeleteParentClose(resultErr, unlockRootMutation())
+	}()
+	unlockPath, errPathLock := authfileguard.LockContext(ctx, path)
+	if errPathLock != nil {
+		return cliproxyauth.NewDeleteOutcomeError(cliproxyauth.DeleteOutcomeRolledBack, fmt.Errorf("object store: lock auth path for deletion: %w", errPathLock))
+	}
 	defer unlockPath()
 	retiredSnapshot := authfileguard.CaptureRetired(path)
 	remoteState, remoteData, errInspect := s.inspectAuthObject(ctx, path)
@@ -467,7 +559,8 @@ func (s *ObjectTokenStore) deleteAuthFileAtRoot(ctx context.Context, root *os.Ro
 		remoteState.exists,
 		remoteData,
 	)
-	errDelete := deleteAuthFileTransaction(
+	errDelete := deleteAuthFileTransactionLockedContext(
+		ctx,
 		root,
 		relativePath,
 		func(original authFileSnapshot) error {
@@ -499,13 +592,22 @@ func (s *ObjectTokenStore) PersistAuthFiles(ctx context.Context, _ string, paths
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	cleanAuthDir := filepath.Clean(s.authDir)
-	root, errRoot := os.OpenRoot(filepath.Dir(cleanAuthDir))
+	root, errRoot := os.OpenRoot(cleanAuthDir)
 	if errRoot != nil {
 		return fmt.Errorf("object store: open auth parent root for persistence: %w", errRoot)
 	}
 	defer func() {
 		if errClose := root.Close(); errClose != nil {
 			log.WithError(errClose).Error("object store: close auth root after persistence")
+		}
+	}()
+	unlockRootMutation, errMutationLock := authfileguard.LockRootMutationContext(ctx, root)
+	if errMutationLock != nil {
+		return fmt.Errorf("object store: lock auth root for persistence: %w", errMutationLock)
+	}
+	defer func() {
+		if errUnlock := unlockRootMutation(); errUnlock != nil {
+			log.WithError(errUnlock).Error("object store: unlock auth root after persistence")
 		}
 	}()
 
@@ -522,13 +624,29 @@ func (s *ObjectTokenStore) PersistAuthFiles(ctx context.Context, _ string, paths
 		if errRel != nil {
 			return errRel
 		}
-		unlockPath := authfileguard.Lock(abs)
+		unlockPath, errPathLock := authfileguard.LockContext(ctx, abs)
+		if errPathLock != nil {
+			return fmt.Errorf("object store: lock auth path for persistence: %w", errPathLock)
+		}
+		snapshotPath := filepath.FromSlash(relativePath)
+		if errMkdir := mkdirAuthDirectoriesAtRoot(root, filepath.Dir(snapshotPath), 0o700); errMkdir != nil {
+			unlockPath()
+			return fmt.Errorf("object store: create auth target parent for persistence: %w", errMkdir)
+		}
+		unlockTarget, errTargetLock := authfileguard.LockRootTargetContext(ctx, root, snapshotPath)
+		if errTargetLock != nil {
+			unlockPath()
+			return fmt.Errorf("object store: lock persistent auth target for persistence: %w", errTargetLock)
+		}
+		unlockPersistence := func(resultErr error) error {
+			errUnlock := unlockTarget()
+			unlockPath()
+			return errors.Join(resultErr, errUnlock)
+		}
 		remoteState, remoteData, errRemote := s.inspectAuthObject(ctx, abs)
 		if errRemote != nil {
-			unlockPath()
-			return errRemote
+			return unlockPersistence(errRemote)
 		}
-		snapshotPath := filepath.Join(filepath.Base(cleanAuthDir), relativePath)
 		snapshot, errSnapshot := captureAuthFileSnapshot(root, snapshotPath)
 		if errSnapshot == nil {
 			errSnapshot = authfileguard.ValidatePersistSnapshot(ctx, snapshot.data, snapshot.exists)
@@ -539,8 +657,8 @@ func (s *ObjectTokenStore) PersistAuthFiles(ctx context.Context, _ string, paths
 		if errors.Is(errSnapshot, cliproxyauth.ErrRetiredGeminiCLIAuthReadOnly) {
 			authfileguard.MarkRetired(abs)
 			if remoteState.exists && !cliproxyauth.IsRetiredGeminiCLIAuthFileData(remoteData) {
-				errSnapshot = removeAuthFileAtRoot(root, snapshotPath)
-				unlockPath()
+				errSnapshot = removeAuthFileAtRootTransactionTargetLockedContext(ctx, root, snapshotPath)
+				errSnapshot = unlockPersistence(errSnapshot)
 				if errSnapshot != nil {
 					return errSnapshot
 				}
@@ -548,8 +666,7 @@ func (s *ObjectTokenStore) PersistAuthFiles(ctx context.Context, _ string, paths
 			}
 		}
 		if errSnapshot != nil {
-			unlockPath()
-			return errSnapshot
+			return unlockPersistence(errSnapshot)
 		}
 
 		var errPersist error
@@ -573,15 +690,15 @@ func (s *ObjectTokenStore) PersistAuthFiles(ctx context.Context, _ string, paths
 					errPersist = authfileguard.ErrDeleteGenerationUncertain
 				case authDeleteGenerationReplaced:
 					if remoteState.exists {
-						errPersist = writeAuthFileAtomicallyAtRoot(root, snapshotPath, remoteData, &snapshot)
+						errPersist = writeAuthFileAtomicallyAtRootTransactionTargetLockedContext(ctx, root, snapshotPath, remoteData, &snapshot)
 					}
 				}
 			}
 		}
-		unlockPath()
 		if errPersist != nil && deleteOutcomeIsCommitted(errPersist) {
 			errPersist = nil
 		}
+		errPersist = unlockPersistence(errPersist)
 		if errPersist != nil {
 			return errPersist
 		}
@@ -718,6 +835,9 @@ func (s *ObjectTokenStore) syncAuthFromBucket(ctx context.Context) error {
 			log.WithField("key", object.Key).Warn("object store: skip auth outside mirror")
 			continue
 		}
+		if errReserved := rejectReservedAuthLockPath(cleanRel); errReserved != nil {
+			return fmt.Errorf("object store: auth object %s: %w", object.Key, errReserved)
+		}
 		if err := mkdirAuthDirectoriesAtRoot(root, filepath.Dir(cleanRel), 0o700); err != nil {
 			return fmt.Errorf("object store: prepare auth subdir: %w", err)
 		}
@@ -734,7 +854,7 @@ func (s *ObjectTokenStore) syncAuthFromBucket(ctx context.Context) error {
 		if errSnapshot != nil {
 			return fmt.Errorf("object store: inspect auth %s before sync: %w", cleanRel, errSnapshot)
 		}
-		if errWrite := writeAuthMirrorFileAtomicallyAtRoot(root, cleanRel, data, &localSnapshot); errWrite != nil {
+		if errWrite := writeAuthMirrorFileAtomicallyAtRootContext(ctx, root, cleanRel, data, &localSnapshot); errWrite != nil {
 			return fmt.Errorf("object store: write auth %s: %w", cleanRel, errWrite)
 		}
 	}
@@ -830,6 +950,22 @@ func (s *ObjectTokenStore) authObjectWritePrecondition(ctx context.Context, path
 	return state, nil
 }
 
+func (s *ObjectTokenStore) authObjectExists(ctx context.Context, path string) (bool, error) {
+	rel, errRel := filepath.Rel(s.authDir, path)
+	if errRel != nil {
+		return false, fmt.Errorf("object store: resolve auth relative path: %w", errRel)
+	}
+	key := s.prefixedKey(objectStoreAuthPrefix + "/" + filepath.ToSlash(rel))
+	_, errStat := s.client.StatObject(ctx, s.cfg.Bucket, key, minio.StatObjectOptions{})
+	if errStat == nil {
+		return true, nil
+	}
+	if isExplicitObjectNotFound(errStat) {
+		return false, nil
+	}
+	return false, fmt.Errorf("object store: stat existing auth object %s: %w", key, errStat)
+}
+
 func (s *ObjectTokenStore) inspectAuthObject(ctx context.Context, path string) (objectAuthWritePrecondition, []byte, error) {
 	rel, errRel := filepath.Rel(s.authDir, path)
 	if errRel != nil {
@@ -901,17 +1037,32 @@ func (s *ObjectTokenStore) putAuthObjectConditionally(ctx context.Context, key s
 		options.SetMatchETag(remoteState.etag)
 		reader := bytes.NewReader(data)
 		if _, errUpload := s.client.PutObject(ctx, s.cfg.Bucket, fullKey, reader, int64(len(data)), options); errUpload != nil {
-			errPut = fmt.Errorf("object store: conditional put object %s: %w", fullKey, errUpload)
+			if objectStorePreconditionFailed(errUpload) || objectStoreConditionalTargetMissing(errUpload) {
+				errPut = fmt.Errorf("object store: conditional put object %s: %w", fullKey, authfileguard.ErrPersistGenerationStale)
+			} else {
+				errPut = fmt.Errorf("object store: conditional put object %s: %w", fullKey, errUpload)
+			}
 		}
 	}
 	if errPut == nil {
 		return nil
 	}
-	committed, errProbe := s.authObjectWriteCommitted(ctx, fullKey, data, writeID)
+	if errors.Is(errPut, cliproxyauth.ErrAuthAlreadyExists) {
+		return cliproxyauth.NewSaveOutcomeError(cliproxyauth.SaveOutcomeRolledBack, errPut)
+	}
+	if !remoteState.exists && errors.Is(errPut, authfileguard.ErrPersistGenerationStale) {
+		return cliproxyauth.NewSaveOutcomeError(cliproxyauth.SaveOutcomeRolledBack, errPut)
+	}
+	probeCtx := authSaveVerificationContext(ctx)
+	committed, _, errProbe := s.authObjectWriteCommitted(probeCtx, fullKey, data, writeID)
 	if errProbe == nil && committed {
 		return nil
 	}
-	return errors.Join(errPut, wrapOptionalError("object store: verify auth write after failure", errProbe))
+	errResult := errors.Join(errPut, wrapOptionalError("object store: verify auth write after failure", errProbe))
+	if errors.Is(errPut, authfileguard.ErrPersistGenerationStale) && errProbe == nil {
+		return cliproxyauth.NewSaveOutcomeError(cliproxyauth.SaveOutcomeRolledBack, errResult)
+	}
+	return cliproxyauth.NewSaveOutcomeError(cliproxyauth.SaveOutcomeUncertain, errResult)
 }
 
 func (s *ObjectTokenStore) putObjectIfAbsent(ctx context.Context, fullKey string, data []byte, contentType, writeID string) error {
@@ -936,6 +1087,12 @@ func (s *ObjectTokenStore) putObjectIfAbsent(ctx context.Context, fullKey string
 	_, errDrain := io.Copy(io.Discard, io.LimitReader(response.Body, 1<<20))
 	errClose := response.Body.Close()
 	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
+		if response.StatusCode == http.StatusPreconditionFailed {
+			return fmt.Errorf("object store: conditional create object %s: %w", fullKey, cliproxyauth.ErrAuthAlreadyExists)
+		}
+		if response.StatusCode == http.StatusConflict {
+			return fmt.Errorf("object store: conditional create object %s: %w", fullKey, authfileguard.ErrPersistGenerationStale)
+		}
 		return fmt.Errorf("object store: conditional create object %s: status %s", fullKey, response.Status)
 	}
 	if errDrain != nil || errClose != nil {
@@ -944,35 +1101,35 @@ func (s *ObjectTokenStore) putObjectIfAbsent(ctx context.Context, fullKey string
 	return nil
 }
 
-func (s *ObjectTokenStore) authObjectWriteCommitted(ctx context.Context, fullKey string, data []byte, writeID string) (bool, error) {
+func (s *ObjectTokenStore) authObjectWriteCommitted(ctx context.Context, fullKey string, data []byte, writeID string) (committed, exists bool, err error) {
 	info, errStat := s.client.StatObject(ctx, s.cfg.Bucket, fullKey, minio.StatObjectOptions{})
 	if errStat != nil {
 		if isObjectNotFound(errStat) {
-			return false, nil
+			return false, false, nil
 		}
-		return false, fmt.Errorf("stat auth object %s: %w", fullKey, errStat)
+		return false, false, fmt.Errorf("stat auth object %s: %w", fullKey, errStat)
 	}
 	if objectAuthWriteID(info) != strings.TrimSpace(writeID) {
-		return false, nil
+		return false, true, nil
 	}
 	etag := strings.Trim(strings.TrimSpace(info.ETag), `"`)
 	if etag == "" {
-		return false, fmt.Errorf("auth object %s has no ETag", fullKey)
+		return false, true, fmt.Errorf("auth object %s has no ETag", fullKey)
 	}
 	getOptions := minio.GetObjectOptions{}
 	if errMatch := getOptions.SetMatchETag(etag); errMatch != nil {
-		return false, fmt.Errorf("bind auth object verification %s: %w", fullKey, errMatch)
+		return false, true, fmt.Errorf("bind auth object verification %s: %w", fullKey, errMatch)
 	}
 	object, errGet := s.client.GetObject(ctx, s.cfg.Bucket, fullKey, getOptions)
 	if errGet != nil {
-		return false, fmt.Errorf("get auth object %s: %w", fullKey, errGet)
+		return false, true, fmt.Errorf("get auth object %s: %w", fullKey, errGet)
 	}
 	remoteData, errRead := io.ReadAll(object)
 	errClose := object.Close()
 	if errRead != nil || errClose != nil {
-		return false, errors.Join(errRead, errClose)
+		return false, true, errors.Join(errRead, errClose)
 	}
-	return bytes.Equal(remoteData, data), nil
+	return bytes.Equal(remoteData, data), true, nil
 }
 
 func objectAuthWriteID(info minio.ObjectInfo) string {
@@ -1283,6 +1440,9 @@ func (s *ObjectTokenStore) relativeAuthPath(path string) (string, error) {
 	if relativePath == "." || relativePath == ".." || strings.HasPrefix(relativePath, ".."+string(os.PathSeparator)) || filepath.IsAbs(relativePath) {
 		return "", fmt.Errorf("object store: auth path is outside mirror directory")
 	}
+	if errReserved := rejectReservedAuthLockPath(relativePath); errReserved != nil {
+		return "", fmt.Errorf("object store: %w", errReserved)
+	}
 	return relativePath, nil
 }
 
@@ -1374,4 +1534,31 @@ func isObjectNotFound(err error) bool {
 
 func isExplicitObjectNotFound(err error) bool {
 	return err != nil && minio.ToErrorResponse(err).StatusCode == http.StatusNotFound
+}
+
+func objectStorePreconditionFailed(err error) bool {
+	if err == nil {
+		return false
+	}
+	response := minio.ToErrorResponse(err)
+	return response.StatusCode == http.StatusPreconditionFailed ||
+		response.StatusCode == http.StatusConflict ||
+		strings.EqualFold(strings.TrimSpace(response.Code), "PreconditionFailed") ||
+		strings.EqualFold(strings.TrimSpace(response.Code), "ConditionalRequestConflict")
+}
+
+func objectStoreConditionalTargetMissing(err error) bool {
+	if err == nil {
+		return false
+	}
+	response := minio.ToErrorResponse(err)
+	if response.StatusCode != http.StatusNotFound {
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(response.Code)) {
+	case "", "nosuchkey", "notfound":
+		return true
+	default:
+		return false
+	}
 }

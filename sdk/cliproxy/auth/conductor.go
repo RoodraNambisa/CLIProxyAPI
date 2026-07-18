@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	chatgptwebauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/chatgptweb"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/authfileguard"
 	internalconfig "github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
@@ -285,7 +286,15 @@ type Manager struct {
 	scheduler *authScheduler
 	// executorLifecycleMu serializes registry changes with executor shutdown.
 	executorLifecycleMu sync.Mutex
+	executorCloseCond   *sync.Cond
+	executorCloseWG     sync.WaitGroup
+	executorCloseSealed bool
+	executorCloseFinal  bool
+	executorSealedClose int
+	executorShutdownSet []ProviderExecutor
+	executorAsyncErr    error
 	executorsClosed     bool
+	executorsCloseDone  chan struct{}
 	executorsCloseErr   error
 	// sessionCleanups quarantines auth IDs while stale executor sessions are being closed.
 	sessionCleanups map[string]int
@@ -499,6 +508,8 @@ func NewManager(store Store, selector Selector, hook Hook) *Manager {
 		providerOffsets:         make(map[string]int),
 		modelPoolOffsets:        make(map[string]int),
 	}
+	manager.executorCloseWG.Add(1)
+	manager.executorCloseCond = sync.NewCond(&manager.executorLifecycleMu)
 	manager.hookValue.Store(hookState{hook: hook})
 	// atomic.Value requires non-nil initial value.
 	manager.runtimeConfig.Store(&internalconfig.Config{})
@@ -2018,9 +2029,40 @@ func (m *Manager) RegisterExecutor(executor ProviderExecutor) {
 	}
 
 	m.executorLifecycleMu.Lock()
-	defer m.executorLifecycleMu.Unlock()
 	if m.executorsClosed {
-		if errClose := closeProviderExecutor(executor); errClose != nil {
+		m.mu.RLock()
+		current := m.executors[provider]
+		alreadyOwned := sameProviderExecutor(current, executor) || m.executorTrackedForShutdownLocked(executor)
+		m.mu.RUnlock()
+		if alreadyOwned {
+			m.executorLifecycleMu.Unlock()
+			return
+		}
+		m.executorShutdownSet = append(m.executorShutdownSet, executor)
+		trackedClose := !m.executorCloseSealed
+		sealedClose := m.executorCloseSealed && !m.executorCloseFinal
+		if trackedClose {
+			m.executorCloseWG.Add(1)
+		} else if sealedClose {
+			m.executorSealedClose++
+		}
+		m.executorLifecycleMu.Unlock()
+		errClose := closeProviderExecutor(executor)
+		if trackedClose {
+			if errClose != nil {
+				m.recordExecutorAsyncCloseError(errClose)
+			}
+			m.executorCloseWG.Done()
+		} else if sealedClose {
+			m.executorLifecycleMu.Lock()
+			if errClose != nil {
+				m.executorAsyncErr = errors.Join(m.executorAsyncErr, errClose)
+			}
+			m.executorSealedClose--
+			m.executorCloseCond.Broadcast()
+			m.executorLifecycleMu.Unlock()
+		}
+		if errClose != nil {
 			log.Errorf("failed to close provider executor registered after shutdown %s: %v", provider, errClose)
 		}
 		return
@@ -2033,11 +2075,36 @@ func (m *Manager) RegisterExecutor(executor ProviderExecutor) {
 	m.mu.Unlock()
 
 	if replaced == nil || sameProviderExecutor(replaced, executor) {
+		m.executorLifecycleMu.Unlock()
 		return
 	}
+	m.executorCloseWG.Add(1)
+	m.executorLifecycleMu.Unlock()
+	defer m.executorCloseWG.Done()
 	if errClose := closeProviderExecutor(replaced); errClose != nil {
 		log.Errorf("failed to close replaced provider executor %s: %v", provider, errClose)
+		m.recordExecutorAsyncCloseError(errClose)
 	}
+}
+
+func (m *Manager) executorTrackedForShutdownLocked(executor ProviderExecutor) bool {
+	for _, tracked := range m.executorShutdownSet {
+		if sameProviderExecutor(tracked, executor) {
+			return true
+		}
+	}
+	return false
+}
+
+func (m *Manager) recordExecutorAsyncCloseError(errClose error) {
+	if m == nil || errClose == nil {
+		return
+	}
+	m.executorLifecycleMu.Lock()
+	if m.executorsClosed {
+		m.executorAsyncErr = errors.Join(m.executorAsyncErr, errClose)
+	}
+	m.executorLifecycleMu.Unlock()
 }
 
 func sameProviderExecutor(left, right ProviderExecutor) bool {
@@ -2063,13 +2130,24 @@ func (m *Manager) UnregisterExecutor(provider string) {
 		return
 	}
 	m.executorLifecycleMu.Lock()
-	defer m.executorLifecycleMu.Unlock()
 	m.mu.Lock()
 	replaced := m.executors[provider]
 	delete(m.executors, provider)
 	m.mu.Unlock()
+	if m.executorsClosed {
+		m.executorLifecycleMu.Unlock()
+		return
+	}
+	if replaced == nil {
+		m.executorLifecycleMu.Unlock()
+		return
+	}
+	m.executorCloseWG.Add(1)
+	m.executorLifecycleMu.Unlock()
+	defer m.executorCloseWG.Done()
 	if errClose := closeProviderExecutor(replaced); errClose != nil {
 		log.Errorf("failed to close unregistered provider executor %s: %v", provider, errClose)
+		m.recordExecutorAsyncCloseError(errClose)
 	}
 }
 
@@ -2086,12 +2164,35 @@ func closeProviderExecutor(executor ProviderExecutor) error {
 	return nil
 }
 
-// Register inserts a new auth entry into the manager.
+// ErrAuthAlreadyExists reports a conditional registration conflict.
+var ErrAuthAlreadyExists = errors.New("auth already exists")
+
+// ErrChatGPTWebEmailAlreadyExists reports a duplicate ChatGPT Web account.
+var ErrChatGPTWebEmailAlreadyExists = errors.New("chatgpt web email already exists")
+
+// ErrChatGPTWebEmailImmutable reports an attempt to change a persisted account identity.
+var ErrChatGPTWebEmailImmutable = errors.New("chatgpt web email cannot be changed")
+
+// ErrAuthMutationIdentityChanged reports reuse of a mutation lock for another identity.
+var ErrAuthMutationIdentityChanged = errors.New("auth mutation identity changed while locked")
+
+// Register inserts or replaces an auth entry in the manager.
 func (m *Manager) Register(ctx context.Context, auth *Auth) (*Auth, error) {
+	return m.register(ctx, auth, false)
+}
+
+// RegisterIfAbsent inserts an auth entry only when the ID is still unused.
+// The existence check and persistence are serialized with all writes for the ID.
+func (m *Manager) RegisterIfAbsent(ctx context.Context, auth *Auth) (*Auth, error) {
+	return m.register(ctx, auth, true)
+}
+
+func (m *Manager) register(ctx context.Context, auth *Auth, requireAbsent bool) (*Auth, error) {
 	if auth == nil {
 		return nil, nil
 	}
 	auth.requestRefreshFamilyID = ""
+	auth.ID = strings.TrimSpace(auth.ID)
 	if auth.ID == "" {
 		auth.ID = uuid.NewString()
 	}
@@ -2099,7 +2200,51 @@ func (m *Manager) Register(ctx context.Context, auth *Auth) (*Auth, error) {
 		WarnRetiredGeminiCLIAuthIgnored()
 		return nil, retiredGeminiCLIAuthError()
 	}
-	unlockPersist := m.lockPersistKey(auth.ID)
+	if m.canonicalizeNewChatGPTWebAuth(ctx, auth) && !requireAbsent {
+		_, requireAbsent = m.store.(ConditionalCreateStore)
+	}
+	lockedCtx, unlockPersist, errLock := m.lockAuthMutationContext(ctx, auth)
+	if errLock != nil {
+		return nil, errLock
+	}
+	ctx = lockedCtx
+	if requireAbsent {
+		m.mu.RLock()
+		_, exists := m.auths[auth.ID]
+		m.mu.RUnlock()
+		if exists {
+			unlockPersist()
+			return nil, ErrAuthAlreadyExists
+		}
+	}
+	m.mu.RLock()
+	existingIdentity := m.auths[auth.ID]
+	identityChanged := chatGPTWebEmailChanged(existingIdentity, auth)
+	m.mu.RUnlock()
+	if identityChanged && m.shouldPersistAuth(ctx, auth) {
+		unlockPersist()
+		return nil, ErrChatGPTWebEmailImmutable
+	}
+	if email := chatGPTWebRegistrationEmail(auth); email != "" {
+		m.mu.RLock()
+		conflict := m.chatGPTWebEmailConflictLocked(auth.ID, email)
+		m.mu.RUnlock()
+		if conflict {
+			unlockPersist()
+			return nil, ErrChatGPTWebEmailAlreadyExists
+		}
+		if requireAbsent && m.shouldPersistAuth(ctx, auth) {
+			storedConflict, errStored := m.chatGPTWebStoredEmailConflict(ctx, auth.ID, email)
+			if errStored != nil {
+				unlockPersist()
+				return nil, fmt.Errorf("inspect persisted chatgpt web credentials: %w", errStored)
+			}
+			if storedConflict {
+				unlockPersist()
+				return nil, ErrChatGPTWebEmailAlreadyExists
+			}
+		}
+	}
 	skipStateCarryForward := shouldSkipStateCarryForward(ctx)
 	forceRuntimeReplacement := shouldForceRuntimeReplacement(ctx)
 	replacementNow := time.Now()
@@ -2112,9 +2257,15 @@ func (m *Manager) Register(ctx context.Context, auth *Auth) (*Auth, error) {
 	}
 	prepareAuthReplacement(existingBeforePersist, auth, skipStateCarryForward)
 	m.mu.RUnlock()
-	if err := m.persistWithoutLock(ctx, auth, false); err != nil {
+	var errPersist error
+	if requireAbsent {
+		errPersist = m.persistNewWithoutLock(ctx, auth)
+	} else {
+		errPersist = m.persistWithoutLock(ctx, auth, false)
+	}
+	if errPersist != nil {
 		unlockPersist()
-		return nil, err
+		return nil, errPersist
 	}
 	var replaced *Auth
 	m.mu.Lock()
@@ -2177,19 +2328,113 @@ func (m *Manager) Register(ctx context.Context, auth *Auth) (*Auth, error) {
 	return installed, nil
 }
 
+func chatGPTWebRegistrationEmail(auth *Auth) string {
+	if auth == nil || !strings.EqualFold(strings.TrimSpace(auth.Provider), chatgptwebauth.Provider) {
+		return ""
+	}
+	return strings.ToLower(chatGPTWebIdentityMetadataString(auth.Metadata, "email"))
+}
+
+func chatGPTWebEmailChanged(existing, updated *Auth) bool {
+	if existing == nil || updated == nil ||
+		!strings.EqualFold(strings.TrimSpace(existing.Provider), chatgptwebauth.Provider) ||
+		!strings.EqualFold(strings.TrimSpace(updated.Provider), chatgptwebauth.Provider) {
+		return false
+	}
+	return chatGPTWebRegistrationEmail(existing) != chatGPTWebRegistrationEmail(updated)
+}
+
+func (m *Manager) canonicalizeNewChatGPTWebAuth(ctx context.Context, auth *Auth) bool {
+	if auth == nil || !m.shouldPersistAuth(ctx, auth) {
+		return false
+	}
+	email := chatGPTWebRegistrationEmail(auth)
+	if email == "" {
+		return false
+	}
+	authID := strings.TrimSpace(auth.ID)
+	m.mu.RLock()
+	_, exists := m.auths[authID]
+	m.mu.RUnlock()
+	if exists {
+		return false
+	}
+	fileName := chatgptwebauth.CredentialFileName(email)
+	auth.ID = fileName
+	auth.FileName = fileName
+	if auth.Attributes != nil {
+		delete(auth.Attributes, "path")
+	}
+	return true
+}
+
+func (m *Manager) chatGPTWebEmailConflictLocked(authID, email string) bool {
+	for id, candidate := range m.auths {
+		if id == authID || candidate == nil {
+			continue
+		}
+		if chatGPTWebRegistrationEmail(candidate) == email {
+			return true
+		}
+	}
+	return false
+}
+
+func (m *Manager) chatGPTWebStoredEmailConflict(ctx context.Context, authID, email string) (bool, error) {
+	if m == nil || m.store == nil || email == "" {
+		return false, nil
+	}
+	auths, errList := m.store.List(ctx)
+	if errList != nil {
+		return false, errList
+	}
+	for _, candidate := range auths {
+		if candidate == nil || candidate.ID == authID {
+			continue
+		}
+		if chatGPTWebRegistrationEmail(candidate) == email {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 // Update replaces an existing auth entry and notifies hooks.
 func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
-	if auth == nil || auth.ID == "" {
+	if auth == nil || strings.TrimSpace(auth.ID) == "" {
 		return nil, nil
 	}
 	auth = auth.Clone()
+	auth.ID = strings.TrimSpace(auth.ID)
 	clearRuntimeProxy(auth)
 	auth.requestRefreshFamilyID = ""
 	if IsRetiredGeminiCLIAuth(auth) {
 		WarnRetiredGeminiCLIAuthIgnored()
 		return nil, retiredGeminiCLIAuthError()
 	}
-	unlockPersist := m.lockPersistKey(auth.ID)
+	m.canonicalizeNewChatGPTWebAuth(ctx, auth)
+	lockedCtx, unlockPersist, errLock := m.lockAuthMutationContext(ctx, auth)
+	if errLock != nil {
+		return nil, errLock
+	}
+	ctx = lockedCtx
+	m.mu.RLock()
+	existingIdentity := m.auths[auth.ID]
+	identityChanged := chatGPTWebEmailChanged(existingIdentity, auth)
+	m.mu.RUnlock()
+	if identityChanged && m.shouldPersistAuth(ctx, auth) {
+		unlockPersist()
+		return nil, ErrChatGPTWebEmailImmutable
+	}
+	if email := chatGPTWebRegistrationEmail(auth); email != "" {
+		m.mu.RLock()
+		conflict := m.chatGPTWebEmailConflictLocked(auth.ID, email)
+		m.mu.RUnlock()
+		if conflict {
+			unlockPersist()
+			return nil, ErrChatGPTWebEmailAlreadyExists
+		}
+	}
 	skipStateCarryForward := shouldSkipStateCarryForward(ctx)
 	forceRuntimeReplacement := shouldForceRuntimeReplacement(ctx)
 	replacementNow := time.Now()
@@ -2674,7 +2919,10 @@ func (m *Manager) deleteIf(ctx context.Context, id string, predicate func(*Auth)
 		ctx = context.Background()
 	}
 
-	unlockPersist := m.lockPersistKey(id)
+	unlockPersist, errLock := m.lockAuthIDMutationContext(ctx, id)
+	if errLock != nil {
+		return false, errLock
+	}
 
 	var deleted *Auth
 	var deletedRuntime *Auth
@@ -2760,7 +3008,10 @@ func (m *Manager) deleteWithOperation(ctx context.Context, id string, operation 
 		return operation(ctx)
 	}
 
-	unlockPersist := m.lockPersistKey(id)
+	unlockPersist, errLock := m.lockAuthIDMutationContext(ctx, id)
+	if errLock != nil {
+		return errLock
+	}
 	var current *Auth
 	var deleted *Auth
 	m.mu.Lock()
@@ -2854,6 +3105,7 @@ func (m *Manager) Load(ctx context.Context) error {
 		m.persistBarrier.Unlock()
 		return err
 	}
+	items = deduplicateLoadedChatGPTWebAuths(items)
 	previous := m.auths
 	loaded := make(map[string]*Auth, len(items))
 	cfg, _ := m.runtimeConfig.Load().(*internalconfig.Config)
@@ -2874,6 +3126,7 @@ func (m *Manager) Load(ctx context.Context) error {
 		auth.EnsureIndex()
 		loadedAuth := auth.Clone()
 		stampChatGPTWebCredentialGeneration(loadedAuth)
+		applyLifecycleRuntimeState(loadedAuth)
 		loadedAuth.installationID = uuid.NewString()
 		loadedAuth.requestRefreshFamilyID = uuid.NewString()
 		if existing := previous[auth.ID]; existing != nil && authRuntimeInstanceEquivalent(existing, loadedAuth) {
@@ -2924,6 +3177,58 @@ func (m *Manager) Load(ctx context.Context) error {
 		m.finishAuthSessionCleanup(id, auth, "auth_replaced", nil)
 	}
 	return nil
+}
+
+func deduplicateLoadedChatGPTWebAuths(items []*Auth) []*Auth {
+	if len(items) < 2 {
+		return items
+	}
+	selected := make([]*Auth, 0, len(items))
+	byEmail := make(map[string]int)
+	for _, auth := range items {
+		email := chatGPTWebRegistrationEmail(auth)
+		if email == "" {
+			selected = append(selected, auth)
+			continue
+		}
+		index, exists := byEmail[email]
+		if !exists {
+			byEmail[email] = len(selected)
+			selected = append(selected, auth)
+			continue
+		}
+		kept := selected[index]
+		ignored := auth
+		if preferLoadedChatGPTWebAuth(auth, kept, email) {
+			selected[index] = auth
+			kept, ignored = auth, kept
+		}
+		log.WithFields(log.Fields{
+			"kept_auth_id":    strings.TrimSpace(kept.ID),
+			"ignored_auth_id": strings.TrimSpace(ignored.ID),
+		}).Warn("ignoring duplicate ChatGPT Web credential during auth reload")
+	}
+	return selected
+}
+
+func preferLoadedChatGPTWebAuth(candidate, current *Auth, email string) bool {
+	canonicalName := chatgptwebauth.CredentialFileName(email)
+	candidateCanonical := chatGPTWebAuthUsesFileName(candidate, canonicalName)
+	currentCanonical := chatGPTWebAuthUsesFileName(current, canonicalName)
+	if candidateCanonical != currentCanonical {
+		return candidateCanonical
+	}
+	return strings.ToLower(strings.TrimSpace(candidate.ID)) < strings.ToLower(strings.TrimSpace(current.ID))
+}
+
+func chatGPTWebAuthUsesFileName(auth *Auth, fileName string) bool {
+	if auth == nil || fileName == "" {
+		return false
+	}
+	if strings.EqualFold(strings.TrimSpace(auth.ID), fileName) {
+		return true
+	}
+	return strings.EqualFold(filepath.Base(strings.TrimSpace(auth.FileName)), fileName)
 }
 
 func authFilePathQuarantined(auth *Auth, authDir string) bool {
@@ -3299,10 +3604,11 @@ func (m *Manager) installPreparedRequestAuth(ctx context.Context, expected, upda
 	id := expected.ID
 	updated.ID = id
 	forceRuntimeReplacement := shouldForceRuntimeReplacement(ctx)
-	unlockPersist, errLock := m.lockPersistKeyContext(ctx, id)
+	lockedCtx, unlockPersist, errLock := m.lockAuthMutationContext(ctx, updated)
 	if errLock != nil {
 		return nil, errLock
 	}
+	ctx = lockedCtx
 	var unlockOnce sync.Once
 	releasePersist := func() { unlockOnce.Do(unlockPersist) }
 	defer releasePersist()
@@ -3315,6 +3621,10 @@ func (m *Manager) installPreparedRequestAuth(ctx context.Context, expected, upda
 	}
 	candidate := updated.Clone()
 	clearRuntimeProxy(candidate)
+	if chatGPTWebEmailChanged(current, candidate) && m.shouldPersistAuth(ctx, candidate) {
+		m.mu.Unlock()
+		return nil, ErrChatGPTWebEmailImmutable
+	}
 	candidate.requestRefreshFamilyID = current.requestRefreshFamilyID
 	if candidate.requestRefreshFamilyID == "" {
 		candidate.requestRefreshFamilyID = uuid.NewString()
@@ -3322,6 +3632,10 @@ func (m *Manager) installPreparedRequestAuth(ctx context.Context, expected, upda
 	credentialChanged := preparePreparedRequestCredentialReplacement(current, candidate, time.Now(), refreshAware)
 	if !credentialChanged {
 		carryForwardPreparedAuthRuntimeState(current, candidate)
+	}
+	if email := chatGPTWebRegistrationEmail(candidate); email != "" && m.chatGPTWebEmailConflictLocked(id, email) {
+		m.mu.Unlock()
+		return nil, ErrChatGPTWebEmailAlreadyExists
 	}
 	candidate.EnsureIndex()
 	m.mu.Unlock()
@@ -3442,7 +3756,7 @@ func (m *Manager) MutateRuntimeMetadataIfCurrent(ctx context.Context, expected *
 		return snapshot, true, nil
 	}
 	id := expected.ID
-	unlockPersist, errLock := m.lockPersistKeyContext(ctx, id)
+	unlockPersist, errLock := m.lockAuthIDMutationContext(ctx, id)
 	if errLock != nil {
 		return nil, false, errLock
 	}
@@ -7018,12 +7332,41 @@ func (m *Manager) persistWithoutLock(ctx context.Context, auth *Auth, syncCurren
 	}
 	_, err := m.store.Save(ctx, auth)
 	if err != nil {
-		return err
+		if outcome, explicit := SaveOutcomeFromError(err); explicit && outcome == SaveOutcomeCommitted {
+			log.WithField("auth_id", auth.ID).Warn("auth save committed with cleanup warning")
+		} else {
+			return err
+		}
 	}
 	if syncCurrentHash {
 		m.syncRuntimeSourceHash(auth)
 	}
 	return nil
+}
+
+func (m *Manager) persistNewWithoutLock(ctx context.Context, auth *Auth) error {
+	if !m.shouldPersistAuth(ctx, auth) {
+		return nil
+	}
+	store, ok := m.store.(ConditionalCreateStore)
+	if !ok {
+		return errors.New("auth store does not support conditional create")
+	}
+	_, err := store.SaveIfAbsent(ctx, auth)
+	if err == nil {
+		return nil
+	}
+	if outcome, explicit := SaveOutcomeFromError(err); explicit {
+		if outcome == SaveOutcomeCommitted {
+			log.WithField("auth_id", auth.ID).Warn("auth create committed with cleanup warning")
+			return nil
+		}
+		return err
+	}
+	if errors.Is(err, ErrAuthAlreadyExists) {
+		return NewSaveOutcomeError(SaveOutcomeRolledBack, err)
+	}
+	return NewSaveOutcomeError(SaveOutcomeUncertain, err)
 }
 
 func (m *Manager) snapshotCurrentAuthForPersistence(ctx context.Context, current *Auth) (*Auth, error) {
@@ -7056,10 +7399,155 @@ type authPersistLock struct {
 	semaphore chan struct{}
 }
 
+type authMutationLockContextKey struct{}
+
+type authMutationLockToken struct {
+	manager *Manager
+	id      string
+	email   string
+	parent  *authMutationLockToken
+	active  atomic.Bool
+	nested  chan struct{}
+	once    sync.Once
+	release func()
+}
+
+func authMutationTokenForManager(ctx context.Context, manager *Manager) *authMutationLockToken {
+	if ctx == nil || manager == nil {
+		return nil
+	}
+	token, _ := ctx.Value(authMutationLockContextKey{}).(*authMutationLockToken)
+	for token != nil {
+		if token.manager == manager {
+			return token
+		}
+		token = token.parent
+	}
+	return nil
+}
+
+func (token *authMutationLockToken) lockNested(ctx context.Context) (func(), bool, error) {
+	if token == nil || token.nested == nil {
+		return nil, false, nil
+	}
+	select {
+	case <-ctx.Done():
+		return nil, false, ctx.Err()
+	case <-token.nested:
+	}
+	if errContext := ctx.Err(); errContext != nil {
+		token.nested <- struct{}{}
+		return nil, false, errContext
+	}
+	if !token.active.Load() {
+		token.nested <- struct{}{}
+		return nil, false, nil
+	}
+	var once sync.Once
+	return func() {
+		once.Do(func() { token.nested <- struct{}{} })
+	}, true, nil
+}
+
+func (token *authMutationLockToken) unlock() {
+	if token == nil {
+		return
+	}
+	token.once.Do(func() {
+		if token.nested != nil {
+			<-token.nested
+		}
+		token.active.Store(false)
+		if token.release != nil {
+			token.release()
+		}
+		if token.nested != nil {
+			token.nested <- struct{}{}
+		}
+	})
+}
+
 func newAuthPersistLock() *authPersistLock {
 	lock := &authPersistLock{semaphore: make(chan struct{}, 1)}
 	lock.semaphore <- struct{}{}
 	return lock
+}
+
+// LockAuthMutation serializes an auth update by ChatGPT Web email and auth ID.
+// The returned context lets Register and Update reuse the same lock ownership.
+func (m *Manager) LockAuthMutation(ctx context.Context, auth *Auth) (context.Context, func(), error) {
+	return m.lockAuthMutationContext(ctx, auth)
+}
+
+func (m *Manager) lockAuthMutationContext(ctx context.Context, auth *Auth) (context.Context, func(), error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	m.canonicalizeNewChatGPTWebAuth(ctx, auth)
+	id := ""
+	email := ""
+	if auth != nil {
+		auth.ID = strings.TrimSpace(auth.ID)
+		if auth.ID == "" {
+			auth.ID = uuid.NewString()
+		}
+		id = auth.ID
+		email = chatGPTWebRegistrationEmail(auth)
+	}
+	parentToken, _ := ctx.Value(authMutationLockContextKey{}).(*authMutationLockToken)
+	if token := authMutationTokenForManager(ctx, m); token != nil {
+		unlockNested, reused, errNested := token.lockNested(ctx)
+		if errNested != nil {
+			return ctx, nil, errNested
+		}
+		if reused {
+			if token.id != id || token.email != email {
+				unlockNested()
+				return ctx, nil, ErrAuthMutationIdentityChanged
+			}
+			return ctx, unlockNested, nil
+		}
+	}
+	keys := []string{id}
+	if email != "" {
+		keys = append(keys, "\x00chatgpt-web-email:"+email)
+	}
+	unlockPersist, errPersist := m.lockPersistKeysContext(ctx, keys...)
+	if errPersist != nil {
+		return ctx, nil, errPersist
+	}
+	token := &authMutationLockToken{
+		manager: m,
+		id:      id,
+		email:   email,
+		parent:  parentToken,
+		nested:  make(chan struct{}, 1),
+		release: unlockPersist,
+	}
+	token.nested <- struct{}{}
+	token.active.Store(true)
+	return context.WithValue(ctx, authMutationLockContextKey{}, token), token.unlock, nil
+}
+
+func (m *Manager) lockAuthIDMutationContext(ctx context.Context, id string) (func(), error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	id = strings.TrimSpace(id)
+	if token := authMutationTokenForManager(ctx, m); token != nil {
+		unlockNested, reused, errNested := token.lockNested(ctx)
+		if errNested != nil {
+			return nil, errNested
+		}
+		if reused {
+			if token.id != id {
+				unlockNested()
+				return nil, ErrAuthMutationIdentityChanged
+			}
+			return unlockNested, nil
+		}
+	}
+	return m.lockPersistKeyContext(ctx, id)
 }
 
 func (m *Manager) lockPersistKey(id string) func() {
@@ -7071,34 +7559,71 @@ func (m *Manager) lockPersistKey(id string) func() {
 }
 
 func (m *Manager) lockPersistKeyContext(ctx context.Context, id string) (func(), error) {
+	return m.lockPersistKeysContext(ctx, id)
+}
+
+func (m *Manager) lockPersistKeysContext(ctx context.Context, ids ...string) (func(), error) {
 	if m == nil {
 		return func() {}, nil
 	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	unique := make(map[string]struct{}, len(ids))
+	keys := make([]string, 0, len(ids))
+	for _, id := range ids {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			continue
+		}
+		if _, exists := unique[id]; exists {
+			continue
+		}
+		unique[id] = struct{}{}
+		keys = append(keys, id)
+	}
+	sort.Strings(keys)
 	if err := m.lockPersistBarrierRead(ctx); err != nil {
 		return nil, err
 	}
-	id = strings.TrimSpace(id)
-	if id == "" {
-		return m.persistBarrier.RUnlock, nil
+	locks := make([]*authPersistLock, 0, len(keys))
+	for _, key := range keys {
+		raw, _ := m.persistLocks.LoadOrStore(key, newAuthPersistLock())
+		lock, ok := raw.(*authPersistLock)
+		if !ok || lock == nil || lock.semaphore == nil {
+			m.persistBarrier.RUnlock()
+			return nil, errors.New("invalid auth persistence lock")
+		}
+		locks = append(locks, lock)
 	}
-	raw, _ := m.persistLocks.LoadOrStore(id, newAuthPersistLock())
-	lock, ok := raw.(*authPersistLock)
-	if !ok || lock == nil || lock.semaphore == nil {
+	acquired := 0
+	for _, lock := range locks {
+		select {
+		case <-ctx.Done():
+			for index := acquired - 1; index >= 0; index-- {
+				locks[index].semaphore <- struct{}{}
+			}
+			m.persistBarrier.RUnlock()
+			return nil, ctx.Err()
+		case <-lock.semaphore:
+			acquired++
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		for index := len(locks) - 1; index >= 0; index-- {
+			locks[index].semaphore <- struct{}{}
+		}
 		m.persistBarrier.RUnlock()
-		return nil, errors.New("invalid auth persistence lock")
+		return nil, err
 	}
-	select {
-	case <-ctx.Done():
-		m.persistBarrier.RUnlock()
-		return nil, ctx.Err()
-	case <-lock.semaphore:
-	}
+	var once sync.Once
 	return func() {
-		lock.semaphore <- struct{}{}
-		m.persistBarrier.RUnlock()
+		once.Do(func() {
+			for index := len(locks) - 1; index >= 0; index-- {
+				locks[index].semaphore <- struct{}{}
+			}
+			m.persistBarrier.RUnlock()
+		})
 	}, nil
 }
 
@@ -7205,32 +7730,91 @@ func (m *Manager) StopAutoRefresh() {
 	}
 }
 
-// CloseExecutors stops background work owned by registered executors.
-func (m *Manager) CloseExecutors() error {
+// CloseExecutorsContext stops background work owned by registered executors.
+// Callers may stop waiting without abandoning the single manager-owned close task.
+func (m *Manager) CloseExecutorsContext(ctx context.Context) error {
 	if m == nil {
 		return nil
 	}
-	m.executorLifecycleMu.Lock()
-	defer m.executorLifecycleMu.Unlock()
-	if m.executorsClosed {
-		return m.executorsCloseErr
+	if ctx == nil {
+		ctx = context.Background()
 	}
-	m.executorsClosed = true
-	m.mu.RLock()
-	executors := make([]ProviderExecutor, 0, len(m.executors))
-	for _, executor := range m.executors {
-		executors = append(executors, executor)
-	}
-	m.mu.RUnlock()
+	done := m.beginCloseExecutors()
 
+	select {
+	case <-done:
+		m.executorLifecycleMu.Lock()
+		closeErr := m.executorsCloseErr
+		m.executorLifecycleMu.Unlock()
+		return closeErr
+	case <-ctx.Done():
+		select {
+		case <-done:
+			m.executorLifecycleMu.Lock()
+			closeErr := m.executorsCloseErr
+			m.executorLifecycleMu.Unlock()
+			return closeErr
+		default:
+			return ctx.Err()
+		}
+	}
+}
+
+// BeginCloseExecutors starts the manager-owned executor close task without waiting.
+func (m *Manager) BeginCloseExecutors() {
+	if m != nil {
+		m.beginCloseExecutors()
+	}
+}
+
+func (m *Manager) beginCloseExecutors() <-chan struct{} {
+	m.executorLifecycleMu.Lock()
+	if !m.executorsClosed {
+		m.executorsClosed = true
+		m.executorsCloseDone = make(chan struct{})
+		m.mu.RLock()
+		executors := make([]ProviderExecutor, 0, len(m.executors))
+		for _, executor := range m.executors {
+			executors = append(executors, executor)
+			if !m.executorTrackedForShutdownLocked(executor) {
+				m.executorShutdownSet = append(m.executorShutdownSet, executor)
+			}
+		}
+		m.mu.RUnlock()
+		go m.closeExecutors(executors, m.executorsCloseDone)
+	}
+	done := m.executorsCloseDone
+	m.executorLifecycleMu.Unlock()
+	return done
+}
+
+func (m *Manager) closeExecutors(executors []ProviderExecutor, done chan struct{}) {
 	var closeErr error
 	for _, executor := range executors {
 		if errClose := closeProviderExecutor(executor); errClose != nil {
 			closeErr = errors.Join(closeErr, fmt.Errorf("close executor %s: %w", executor.Identifier(), errClose))
 		}
 	}
-	m.executorsCloseErr = closeErr
-	return closeErr
+	m.executorLifecycleMu.Lock()
+	if !m.executorCloseSealed {
+		m.executorCloseSealed = true
+		m.executorCloseWG.Done()
+	}
+	m.executorLifecycleMu.Unlock()
+	m.executorCloseWG.Wait()
+	m.executorLifecycleMu.Lock()
+	for m.executorSealedClose > 0 {
+		m.executorCloseCond.Wait()
+	}
+	m.executorCloseFinal = true
+	m.executorsCloseErr = errors.Join(closeErr, m.executorAsyncErr)
+	close(done)
+	m.executorLifecycleMu.Unlock()
+}
+
+// CloseExecutors stops background work owned by registered executors.
+func (m *Manager) CloseExecutors() error {
+	return m.CloseExecutorsContext(context.Background())
 }
 
 func (m *Manager) queueRefreshReschedule(authID string) {
@@ -7938,9 +8522,10 @@ func newChatGPTWebRefreshStateUnavailableError(auth *Auth) *chatGPTWebRefreshSta
 		reason = strings.TrimSpace(auth.StatusMessage)
 		if auth.Metadata != nil {
 			if value, _ := auth.Metadata["lifecycle_reason"].(string); strings.TrimSpace(value) != "" {
-				reason = strings.TrimSpace(value)
+				reason = chatgptwebauth.SafeLifecycleReason(value)
 			}
 		}
+		reason = chatgptwebauth.SafeLifecycleReason(reason)
 		if auth.Disabled || auth.Status == StatusDisabled {
 			state = "disabled"
 		}

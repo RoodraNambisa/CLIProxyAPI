@@ -69,6 +69,8 @@ type Manager struct {
 	bindings map[string]Binding
 	health   map[string]nodeHealth
 	auths    AuthSource
+	leaseMu  sync.RWMutex
+	leases   map[string]int
 
 	persistMu sync.Mutex
 	bindLocks sync.Map
@@ -87,6 +89,7 @@ func NewManager(configPath string, cfg *internalconfig.Config) (*Manager, error)
 	m := &Manager{
 		bindings:  make(map[string]Binding),
 		health:    make(map[string]nodeHealth),
+		leases:    make(map[string]int),
 		statePath: bindingStatePath(configPath),
 		random:    rand.Reader,
 		now:       time.Now,
@@ -99,6 +102,50 @@ func NewManager(configPath string, cfg *internalconfig.Config) (*Manager, error)
 		return nil, errConfig
 	}
 	return m, nil
+}
+
+// HoldBinding keeps an unregistered credential's binding alive until the
+// caller either registers the credential or abandons the acquisition.
+func (m *Manager) HoldBinding(authID string) func() {
+	if m == nil {
+		return func() {}
+	}
+	authID = strings.TrimSpace(authID)
+	if authID == "" {
+		return func() {}
+	}
+	m.leaseMu.Lock()
+	if m.leases == nil {
+		m.leases = make(map[string]int)
+	}
+	m.leases[authID]++
+	m.leaseMu.Unlock()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			m.leaseMu.Lock()
+			if count := m.leases[authID]; count > 1 {
+				m.leases[authID] = count - 1
+			} else {
+				delete(m.leases, authID)
+			}
+			m.leaseMu.Unlock()
+		})
+	}
+}
+
+func (m *Manager) bindingLeaseActive(authID string) bool {
+	if m == nil {
+		return false
+	}
+	authID = strings.TrimSpace(authID)
+	if authID == "" {
+		return false
+	}
+	m.leaseMu.RLock()
+	active := m.leases[authID] > 0
+	m.leaseMu.RUnlock()
+	return active
 }
 
 func bindingStatePath(configPath string) string {

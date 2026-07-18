@@ -8,11 +8,20 @@ import (
 	"golang.org/x/sys/windows"
 )
 
-func acquireTargetFileLock(file *os.File) (func() error, error) {
+const serializeRootMutationLocks = false
+
+func tryAcquirePersistentFileLock(file *os.File, exclusive bool) (func() error, bool, error) {
 	overlapped := &windows.Overlapped{}
 	handle := windows.Handle(file.Fd())
-	if errLock := windows.LockFileEx(handle, windows.LOCKFILE_EXCLUSIVE_LOCK, 0, 1, 0, overlapped); errLock != nil {
-		return nil, errLock
+	flags := uint32(windows.LOCKFILE_FAIL_IMMEDIATELY)
+	if exclusive {
+		flags |= windows.LOCKFILE_EXCLUSIVE_LOCK
 	}
-	return func() error { return windows.UnlockFileEx(handle, 0, 1, 0, overlapped) }, nil
+	if errLock := windows.LockFileEx(handle, flags, 0, 1, 0, overlapped); errLock != nil {
+		if errLock == windows.ERROR_LOCK_VIOLATION {
+			return nil, false, nil
+		}
+		return nil, false, errLock
+	}
+	return func() error { return windows.UnlockFileEx(handle, 0, 1, 0, overlapped) }, true, nil
 }

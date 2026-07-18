@@ -3,6 +3,7 @@
 package management
 
 import (
+	"context"
 	"crypto/subtle"
 	"errors"
 	"fmt"
@@ -56,6 +57,10 @@ type Handler struct {
 	postAuthHook        coreauth.PostAuthHook
 	authStatusHook      coreauth.AuthStatusHook
 	proxyPoolManager    *proxypool.Manager
+	chatGPTWebTasks     *chatGPTWebLoginTaskManager
+	cleanupCancel       context.CancelFunc
+	cleanupWG           sync.WaitGroup
+	cleanupStopOnce     sync.Once
 }
 
 // NewHandler creates a new management handler instance.
@@ -72,21 +77,61 @@ func NewHandler(cfg *config.Config, configFilePath string, manager *coreauth.Man
 		tokenStore:          sdkAuth.GetTokenStore(),
 		allowRemoteOverride: envSecret != "",
 		envSecret:           envSecret,
+		chatGPTWebTasks:     newChatGPTWebLoginTaskManager(),
 	}
-	h.startAttemptCleanup()
+	cleanupCtx, cleanupCancel := context.WithCancel(context.Background())
+	h.cleanupCancel = cleanupCancel
+	h.startAttemptCleanup(cleanupCtx)
 	return h
 }
 
 // startAttemptCleanup launches a background goroutine that periodically
 // removes stale IP entries from failedAttempts to prevent memory leaks.
-func (h *Handler) startAttemptCleanup() {
+func (h *Handler) startAttemptCleanup(ctx context.Context) {
+	h.cleanupWG.Add(1)
 	go func() {
+		defer h.cleanupWG.Done()
 		ticker := time.NewTicker(attemptCleanupInterval)
 		defer ticker.Stop()
-		for range ticker.C {
-			h.purgeStaleAttempts()
+		for {
+			select {
+			case <-ticker.C:
+				h.purgeStaleAttempts()
+				h.mu.Lock()
+				taskManager := h.chatGPTWebTasks
+				h.mu.Unlock()
+				if taskManager != nil {
+					taskManager.prune()
+				}
+			case <-ctx.Done():
+				return
+			}
 		}
 	}()
+}
+
+// Shutdown cancels and waits for provider-owned management tasks.
+func (h *Handler) Shutdown(ctx context.Context) error {
+	if h == nil {
+		return nil
+	}
+	h.cleanupStopOnce.Do(func() {
+		h.mu.Lock()
+		cancel := h.cleanupCancel
+		h.cleanupCancel = nil
+		h.mu.Unlock()
+		if cancel != nil {
+			cancel()
+		}
+	})
+	h.cleanupWG.Wait()
+	h.mu.Lock()
+	taskManager := h.chatGPTWebTasks
+	h.mu.Unlock()
+	if taskManager == nil {
+		return nil
+	}
+	return taskManager.shutdown(ctx)
 }
 
 // purgeStaleAttempts removes IP entries that have been idle beyond attemptMaxIdleTime

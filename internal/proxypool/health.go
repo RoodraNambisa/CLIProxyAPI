@@ -185,7 +185,21 @@ func (m *Manager) validBindings(snapshot *configSnapshot, bindings []Binding) ([
 }
 
 func (m *Manager) bindingValid(snapshot *configSnapshot, binding Binding, auth *coreauth.Auth) bool {
-	if snapshot == nil || auth == nil || auth.Disabled || auth.Status == coreauth.StatusDisabled || strings.TrimSpace(auth.ProxyURL) != "" {
+	return m.bindingValidWithLease(snapshot, binding, auth, m.bindingLeaseActive(binding.AuthID))
+}
+
+func (m *Manager) bindingValidWithLease(snapshot *configSnapshot, binding Binding, auth *coreauth.Auth, leaseActive bool) bool {
+	if snapshot == nil {
+		return false
+	}
+	if leaseActive {
+		_, valid := m.bindingURL(snapshot, binding)
+		return valid
+	}
+	if auth == nil {
+		return false
+	}
+	if auth.Disabled || auth.Status == coreauth.StatusDisabled || strings.TrimSpace(auth.ProxyURL) != "" {
 		return false
 	}
 	if strings.EqualFold(strings.TrimSpace(auth.Provider), "aistudio") {
@@ -236,19 +250,24 @@ func (m *Manager) removeBindings(candidates []bindingRemovalCandidate) error {
 			unlocks[index]()
 		}
 	}()
+	auths := make(map[string]*coreauth.Auth, len(unique))
+	for _, candidate := range unique {
+		auths[candidate.AuthID], _ = source.GetByID(candidate.AuthID)
+	}
 
 	m.configMu.RLock()
 	defer m.configMu.RUnlock()
 	snapshot := m.snapshot()
 	m.persistMu.Lock()
 	defer m.persistMu.Unlock()
+	m.leaseMu.RLock()
 	m.mu.Lock()
 	previous := cloneBindings(m.bindings)
 	removedBindingIDs := make([]string, 0, len(unique))
 	for _, candidate := range unique {
 		binding, exists := m.bindings[candidate.AuthID]
-		auth, _ := source.GetByID(candidate.AuthID)
-		if !exists || binding.ID != candidate.BindingID || m.bindingValid(snapshot, binding, auth) {
+		leaseActive := m.leases[strings.TrimSpace(candidate.AuthID)] > 0
+		if !exists || binding.ID != candidate.BindingID || m.bindingValidWithLease(snapshot, binding, auths[candidate.AuthID], leaseActive) {
 			continue
 		}
 		removedBindingIDs = append(removedBindingIDs, binding.ID)
@@ -256,10 +275,12 @@ func (m *Manager) removeBindings(candidates []bindingRemovalCandidate) error {
 	}
 	if len(removedBindingIDs) == 0 {
 		m.mu.Unlock()
+		m.leaseMu.RUnlock()
 		return nil
 	}
 	next := cloneBindings(m.bindings)
 	m.mu.Unlock()
+	m.leaseMu.RUnlock()
 	if errPersist := m.persistBindings(next); errPersist != nil {
 		m.mu.Lock()
 		m.bindings = previous

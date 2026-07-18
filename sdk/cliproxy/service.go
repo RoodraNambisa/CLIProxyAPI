@@ -145,8 +145,18 @@ type Service struct {
 	// proxyPoolManager owns stable per-credential proxy bindings and health checks.
 	proxyPoolManager *proxypool.Manager
 
-	// shutdownOnce ensures shutdown is called only once.
+	// chatGPTWebExecutorMu protects shared login coordinator initialization.
+	chatGPTWebExecutorMu sync.Mutex
+
+	// chatGPTWebLoginCoordinator serializes account login operations service-wide.
+	chatGPTWebLoginCoordinator *executor.ChatGPTWebLoginCoordinator
+
+	// shutdownOnce starts the shared shutdown task only once.
 	shutdownOnce sync.Once
+	shutdownDone chan struct{}
+
+	// shutdownErr retains non-executor errors from the one-time shutdown sequence.
+	shutdownErr error
 
 	// wsGateway manages websocket Gemini providers.
 	wsGateway *wsrelay.Manager
@@ -1847,7 +1857,11 @@ func (s *Service) wsOnDisconnected(channelID string, reason error) {
 }
 
 func (s *Service) applyCoreAuthAddOrUpdate(ctx context.Context, auth *coreauth.Auth) {
-	if s == nil || s.coreManager == nil || auth == nil || auth.ID == "" {
+	if s == nil || s.coreManager == nil || auth == nil {
+		return
+	}
+	auth = auth.Clone()
+	if auth.ID == "" {
 		return
 	}
 	if ctx == nil {
@@ -1860,6 +1874,18 @@ func (s *Service) applyCoreAuthAddOrUpdate(ctx context.Context, auth *coreauth.A
 	}
 	s.cfgMu.RUnlock()
 	path := resolveAuthFilePath(auth, authDir)
+	lockedCtx, unlockAuthMutation, errMutationLock := s.coreManager.LockAuthMutation(ctx, auth)
+	if errMutationLock != nil {
+		log.Errorf("failed to lock auth update %s: %v", auth.ID, errMutationLock)
+		return
+	}
+	mutationLocked := true
+	defer func() {
+		if mutationLocked {
+			unlockAuthMutation()
+		}
+	}()
+	ctx = lockedCtx
 	unlockPath := func() {}
 	pathLocked := false
 	if path != "" {
@@ -1876,7 +1902,6 @@ func (s *Service) applyCoreAuthAddOrUpdate(ctx context.Context, auth *coreauth.A
 		log.Debugf("ignoring stale auth file update for %s", auth.ID)
 		return
 	}
-	auth = auth.Clone()
 	unlockTransition := s.lockAuthModelTransition(auth.ID)
 	transitionLocked := true
 	defer func() {
@@ -1915,6 +1940,8 @@ func (s *Service) applyCoreAuthAddOrUpdate(ctx context.Context, auth *coreauth.A
 		unlockPath()
 		pathLocked = false
 	}
+	unlockAuthMutation()
+	mutationLocked = false
 	if err != nil {
 		log.Errorf("failed to %s auth %s: %v", op, auth.ID, err)
 		current, ok := s.coreManager.GetByID(auth.ID)
@@ -2464,15 +2491,7 @@ func (s *Service) ensureExecutorsForAuthWithMode(a *coreauth.Auth, forceReplace 
 		return
 	}
 	if strings.EqualFold(strings.TrimSpace(a.Provider), "chatgpt-web") {
-		if !forceReplace {
-			existingExecutor, hasExecutor := s.coreManager.Executor("chatgpt-web")
-			if hasExecutor {
-				if _, isChatGPTWebExecutor := existingExecutor.(*executor.ChatGPTWebExecutor); isChatGPTWebExecutor {
-					return
-				}
-			}
-		}
-		s.coreManager.RegisterExecutor(executor.NewChatGPTWebExecutor(s.cfg, s.coreManager))
+		s.ensureChatGPTWebExecutor(forceReplace)
 		return
 	}
 	switch strings.ToLower(a.Provider) {
@@ -2502,6 +2521,29 @@ func (s *Service) ensureExecutorsForAuthWithMode(a *coreauth.Auth, forceReplace 
 		}
 		s.coreManager.RegisterExecutor(executor.NewOpenAICompatExecutor(providerKey, s.cfg))
 	}
+}
+
+func (s *Service) ensureChatGPTWebExecutor(forceReplace bool) {
+	if s == nil || s.coreManager == nil {
+		return
+	}
+	cfg := s.currentConfig()
+	s.chatGPTWebExecutorMu.Lock()
+	defer s.chatGPTWebExecutorMu.Unlock()
+	if s.chatGPTWebLoginCoordinator == nil {
+		s.chatGPTWebLoginCoordinator = executor.NewChatGPTWebLoginCoordinator()
+	}
+	coordinator := s.chatGPTWebLoginCoordinator
+	existingExecutor, hasExecutor := s.coreManager.Executor("chatgpt-web")
+	if hasExecutor {
+		if chatGPTWebExecutor, isChatGPTWebExecutor := existingExecutor.(*executor.ChatGPTWebExecutor); isChatGPTWebExecutor {
+			if forceReplace {
+				chatGPTWebExecutor.UpdateConfig(cfg)
+			}
+			return
+		}
+	}
+	s.coreManager.RegisterExecutor(executor.NewChatGPTWebExecutorWithLoginCoordinator(cfg, s.coreManager, coordinator))
 }
 
 func (s *Service) registerResolvedModelsForAuth(a *coreauth.Auth, providerKey string, models []*ModelInfo) {
@@ -2537,7 +2579,7 @@ func (s *Service) rebindExecutors() {
 
 func (s *Service) rebindExecutorsForAuths(auths []*coreauth.Auth) {
 	reboundCodex := false
-	reboundChatGPTWeb := false
+	s.ensureChatGPTWebExecutor(true)
 	for _, auth := range auths {
 		if auth != nil && strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") {
 			if reboundCodex {
@@ -2547,16 +2589,13 @@ func (s *Service) rebindExecutorsForAuths(auths []*coreauth.Auth) {
 		}
 		if auth != nil && strings.EqualFold(strings.TrimSpace(auth.Provider), "chatgpt-web") {
 			if _, _, isCompat := openAICompatInfoFromAuth(auth); !isCompat {
-				if auth.Disabled {
-					continue
-				}
-				if reboundChatGPTWeb {
-					continue
-				}
-				reboundChatGPTWeb = true
+				continue
 			}
 		}
 		s.ensureExecutorsForAuthWithMode(auth, true)
+	}
+	for _, auth := range auths {
+		s.triggerChatGPTWebRelogin(auth)
 	}
 }
 
@@ -2579,10 +2618,8 @@ func (s *Service) Run(ctx context.Context) error {
 
 	sdkusage.StartDefault(ctx)
 
-	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer shutdownCancel()
 	defer func() {
-		if err := s.Shutdown(shutdownCtx); err != nil {
+		if err := s.shutdownOnRunExit(30 * time.Second); err != nil {
 			log.Errorf("service shutdown returned error: %v", err)
 		}
 	}()
@@ -2624,6 +2661,10 @@ func (s *Service) Run(ctx context.Context) error {
 	}
 	_ = apiKeyResult
 	// legacy clients removed; no caches to refresh
+
+	// Management login must be available before the first ChatGPT Web
+	// credential exists, including on a fresh installation.
+	s.ensureChatGPTWebExecutor(false)
 
 	// handlers no longer depend on legacy clients; pass nil slice initially
 	serverOpts := append([]api.ServerOption(nil), s.serverOptions...)
@@ -2888,10 +2929,17 @@ func (s *Service) Run(ctx context.Context) error {
 	}
 }
 
+func (s *Service) shutdownOnRunExit(timeout time.Duration) error {
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), timeout)
+	defer shutdownCancel()
+	return s.Shutdown(shutdownCtx)
+}
+
 func (s *Service) applyBeforeStartConfig() error {
 	if s.hooks.OnBeforeStart != nil {
 		s.hooks.OnBeforeStart(s.cfg)
 	}
+	s.ensureChatGPTWebExecutor(true)
 	if s.proxyPoolManager != nil {
 		if errProxyConfig := s.proxyPoolManager.UpdateConfig(s.cfg); errProxyConfig != nil {
 			return fmt.Errorf("cliproxy: apply proxy configuration after before-start hook: %w", errProxyConfig)
@@ -2913,77 +2961,90 @@ func (s *Service) Shutdown(ctx context.Context) error {
 	if s == nil {
 		return nil
 	}
-	var shutdownErr error
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	s.shutdownOnce.Do(func() {
-		if ctx == nil {
-			ctx = context.Background()
-		}
-
-		// legacy refresh loop removed; only stopping core auth manager below
-
-		if s.watcherCancel != nil {
-			s.watcherCancel()
-		}
-		if s.proxyPoolManager != nil {
-			s.proxyPoolManager.Stop()
-		}
-		if s.coreManager != nil {
-			s.coreManager.StopAutoRefresh()
-			if errCloseExecutors := s.coreManager.CloseExecutors(); errCloseExecutors != nil {
-				log.Errorf("failed to close provider executors: %v", errCloseExecutors)
-				if shutdownErr == nil {
-					shutdownErr = errCloseExecutors
-				}
-			}
-		}
-		if s.watcher != nil {
-			if err := s.watcher.Stop(); err != nil {
-				log.Errorf("failed to stop file watcher: %v", err)
-				shutdownErr = err
-			}
-		}
-		if s.wsGateway != nil {
-			if err := s.wsGateway.Stop(ctx); err != nil {
-				log.Errorf("failed to stop websocket gateway: %v", err)
-				if shutdownErr == nil {
-					shutdownErr = err
-				}
-			}
-		}
-		if s.authQueueStop != nil {
-			s.authQueueStop()
-			s.authQueueStop = nil
-		}
-		s.stopModelSyncLoop()
-		s.stopAuthMaintenance()
-		s.reconcileUsageStatistics("shutdown")
-		s.persistUsageStatistics("shutdown")
-		s.stopUsagePersistenceLoop()
-
-		if errShutdownPprof := s.shutdownPprof(ctx); errShutdownPprof != nil {
-			log.Errorf("failed to stop pprof server: %v", errShutdownPprof)
-			if shutdownErr == nil {
-				shutdownErr = errShutdownPprof
-			}
-		}
-
-		// no legacy clients to persist
-
-		if s.server != nil {
-			shutdownCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-			defer cancel()
-			if err := s.server.Stop(shutdownCtx); err != nil {
-				log.Errorf("error stopping API server: %v", err)
-				if shutdownErr == nil {
-					shutdownErr = err
-				}
-			}
-		}
-
-		sdkusage.StopDefault()
-		executorhelps.CloseAllProxyTransportCaches()
+		s.shutdownDone = make(chan struct{})
+		go s.runShutdown()
 	})
-	return shutdownErr
+	select {
+	case <-s.shutdownDone:
+	case <-ctx.Done():
+		select {
+		case <-s.shutdownDone:
+		default:
+			return ctx.Err()
+		}
+	}
+	return s.shutdownErr
+}
+
+func (s *Service) runShutdown() {
+	defer close(s.shutdownDone)
+	var shutdownErr error
+
+	if s.watcherCancel != nil {
+		s.watcherCancel()
+	}
+	if s.server != nil {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		errStop := s.server.Stop(shutdownCtx)
+		cancel()
+		if errStop != nil {
+			log.Errorf("error stopping API server: %v", errStop)
+			shutdownErr = errors.Join(shutdownErr, errStop)
+		}
+	}
+	if s.coreManager != nil {
+		s.coreManager.StopAutoRefresh()
+		s.coreManager.BeginCloseExecutors()
+	}
+	if s.proxyPoolManager != nil {
+		s.proxyPoolManager.Stop()
+	}
+	if s.watcher != nil {
+		if errStop := s.watcher.Stop(); errStop != nil {
+			log.Errorf("failed to stop file watcher: %v", errStop)
+			shutdownErr = errors.Join(shutdownErr, errStop)
+		}
+	}
+	if s.wsGateway != nil {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		errStop := s.wsGateway.Stop(shutdownCtx)
+		cancel()
+		if errStop != nil {
+			log.Errorf("failed to stop websocket gateway: %v", errStop)
+			shutdownErr = errors.Join(shutdownErr, errStop)
+		}
+	}
+	if s.authQueueStop != nil {
+		s.authQueueStop()
+		s.authQueueStop = nil
+	}
+	s.stopModelSyncLoop()
+	s.stopAuthMaintenance()
+	s.reconcileUsageStatistics("shutdown")
+	s.persistUsageStatistics("shutdown")
+	s.stopUsagePersistenceLoop()
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	errShutdownPprof := s.shutdownPprof(shutdownCtx)
+	cancel()
+	if errShutdownPprof != nil {
+		log.Errorf("failed to stop pprof server: %v", errShutdownPprof)
+		shutdownErr = errors.Join(shutdownErr, errShutdownPprof)
+	}
+	if s.coreManager != nil {
+		if errClose := s.coreManager.CloseExecutors(); errClose != nil {
+			log.Errorf("failed to close provider executors: %v", errClose)
+			shutdownErr = errors.Join(shutdownErr, errClose)
+		}
+	}
+
+	sdkusage.StopDefault()
+	executorhelps.CloseAllProxyTransportCaches()
+	s.shutdownErr = shutdownErr
 }
 
 func (s *Service) ensureAuthDir() error {

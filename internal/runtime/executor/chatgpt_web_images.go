@@ -553,14 +553,14 @@ func (e *ChatGPTWebExecutor) uploadChatGPTWebImage(ctx context.Context, client *
 	response, finalUploadURL, err := e.doChatGPTWebAssetRequest(ctx, client, credential, http.MethodPut, uploadURL, uploadHeaders, data, true)
 	if err != nil {
 		sanitizedErr := newChatGPTWebAssetTransportError(ctx, "upload")
-		helps.RecordAPIResponseError(ctx, e.cfg, sanitizedErr)
+		helps.RecordAPIResponseError(ctx, e.configSnapshot(), sanitizedErr)
 		return chatGPTWebUploadedImage{}, sanitizedErr
 	}
 	payload, errRead := readChatGPTWebErrorBody(response.Body)
 	errClose := response.Body.Close()
 	if errRead != nil || errClose != nil {
 		sanitizedErr := newChatGPTWebAssetTransportError(ctx, "upload response")
-		helps.RecordAPIResponseError(ctx, e.cfg, sanitizedErr)
+		helps.RecordAPIResponseError(ctx, e.configSnapshot(), sanitizedErr)
 		return chatGPTWebUploadedImage{}, sanitizedErr
 	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
@@ -602,7 +602,7 @@ func (e *ChatGPTWebExecutor) doChatGPTWebAssetRequest(
 		if errRequest != nil {
 			return nil, currentURL.String(), errRequest
 		}
-		helps.RecordAPIResponseMetadata(ctx, e.cfg, response.StatusCode, chatGPTWebResponseLogHeaders(response.Header))
+		helps.RecordAPIResponseMetadata(ctx, e.configSnapshot(), response.StatusCode, chatGPTWebResponseLogHeaders(response.Header))
 		if !chatGPTWebAssetRedirectStatus(method, response.StatusCode, signedUpload) {
 			return response, currentURL.String(), nil
 		}
@@ -1106,7 +1106,7 @@ func (e *ChatGPTWebExecutor) downloadChatGPTWebImageAssetOnce(ctx context.Contex
 	response, finalDownloadURL, err := e.doChatGPTWebAssetRequest(ctx, client, credential, http.MethodGet, downloadURL, downloadHeaders, nil, false)
 	if err != nil {
 		sanitizedErr := newChatGPTWebAssetTransportError(ctx, "download")
-		helps.RecordAPIResponseError(ctx, e.cfg, sanitizedErr)
+		helps.RecordAPIResponseError(ctx, e.configSnapshot(), sanitizedErr)
 		return nil, sanitizedErr, true
 	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
@@ -1276,24 +1276,24 @@ func (e *ChatGPTWebExecutor) doChatGPTWebGETWithBudget(ctx context.Context, clie
 	e.recordChatGPTWebRequest(ctx, credential, http.MethodGet, path, headers, nil)
 	response, err := client.DoNoRedirectStream(ctx, http.MethodGet, e.chatGPTWebBaseURL()+path, headers, nil)
 	if err != nil {
-		helps.RecordAPIResponseError(ctx, e.cfg, err)
+		helps.RecordAPIResponseError(ctx, e.configSnapshot(), err)
 		return nil, nil, err
 	}
-	helps.RecordAPIResponseMetadata(ctx, e.cfg, response.StatusCode, chatGPTWebResponseLogHeaders(response.Header))
+	helps.RecordAPIResponseMetadata(ctx, e.configSnapshot(), response.StatusCode, chatGPTWebResponseLogHeaders(response.Header))
 	data, err := readChatGPTWebResponseBody(response, chatGPTWebMaxJSONBodyBytes)
 	if err != nil {
-		helps.RecordAPIResponseError(ctx, e.cfg, err)
+		helps.RecordAPIResponseError(ctx, e.configSnapshot(), err)
 		return response, nil, err
 	}
 	if err = budget.consume(len(data)); err != nil {
-		helps.RecordAPIResponseError(ctx, e.cfg, err)
+		helps.RecordAPIResponseError(ctx, e.configSnapshot(), err)
 		return response, nil, err
 	}
 	sanitizedData := chatGPTWebResponseLogBody(path, data)
 	if logBody {
-		helps.AppendAPIResponseChunk(ctx, e.cfg, sanitizedData)
+		helps.AppendAPIResponseChunk(ctx, e.configSnapshot(), sanitizedData)
 	} else {
-		helps.AppendAPIResponseChunk(ctx, e.cfg, []byte("<chatgpt web polling response body omitted>"))
+		helps.AppendAPIResponseChunk(ctx, e.configSnapshot(), []byte("<chatgpt web polling response body omitted>"))
 	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		return response, nil, newChatGPTWebStatusError(response.StatusCode, path, sanitizedData, response.Header)

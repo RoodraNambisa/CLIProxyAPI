@@ -5,17 +5,22 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/go-git/go-git/v6"
 	gitconfig "github.com/go-git/go-git/v6/config"
 	"github.com/go-git/go-git/v6/plumbing"
+	"github.com/go-git/go-git/v6/plumbing/format/index"
 	"github.com/go-git/go-git/v6/plumbing/object"
+	"github.com/go-git/go-git/v6/plumbing/protocol/packp"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/authfileguard"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 )
@@ -84,6 +89,195 @@ func TestLockGitRepositorySerializesIndependentStoreProcesses(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("second repository lock remained blocked after first lock was released")
+	}
+}
+
+func TestGitTokenStorePersistenceHoldsPersistentTargetThroughPush(t *testing.T) {
+	for _, testCase := range []struct {
+		name    string
+		persist func(context.Context, *GitTokenStore, string) error
+	}{
+		{
+			name: "save",
+			persist: func(ctx context.Context, store *GitTokenStore, fileName string) error {
+				_, errSave := store.Save(ctx, &cliproxyauth.Auth{
+					ID:       fileName,
+					FileName: fileName,
+					Provider: "codex",
+					Metadata: map[string]any{"type": "codex", "access_token": "save-token"},
+				})
+				return errSave
+			},
+		},
+		{
+			name: "watcher_persistence",
+			persist: func(ctx context.Context, store *GitTokenStore, fileName string) error {
+				path := filepath.Join(store.AuthDir(), fileName)
+				if errWrite := os.WriteFile(path, []byte(`{"type":"codex","access_token":"watcher-token"}`), 0o600); errWrite != nil {
+					return errWrite
+				}
+				return store.PersistAuthFiles(ctx, "", path)
+			},
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			root := t.TempDir()
+			remoteDir := filepath.Join(root, "remote.git")
+			if _, errInit := git.PlainInit(remoteDir, true); errInit != nil {
+				t.Fatal(errInit)
+			}
+			repoDir := filepath.Join(root, "workspace")
+			authDir := filepath.Join(repoDir, "auths")
+			store := NewGitTokenStore(remoteDir, "", "", "main")
+			store.SetBaseDir(authDir)
+			store.pushRepoContext = func(context.Context, *git.Repository, *git.PushOptions) error { return nil }
+			if errEnsure := store.EnsureRepository(); errEnsure != nil {
+				t.Fatal(errEnsure)
+			}
+
+			remoteStarted := make(chan struct{}, 1)
+			releaseRemote := make(chan struct{})
+			store.pushRepoContext = func(ctx context.Context, _ *git.Repository, _ *git.PushOptions) error {
+				remoteStarted <- struct{}{}
+				select {
+				case <-releaseRemote:
+					return nil
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+			}
+
+			const fileName = "persistent-target.json"
+			operationDone := make(chan error, 1)
+			ctx := t.Context()
+			go func() {
+				operationDone <- testCase.persist(ctx, store, fileName)
+			}()
+
+			assertPersistentAuthTargetHeldDuringRemoteOperation(
+				t,
+				repoDir,
+				filepath.Join("auths", fileName),
+				remoteStarted,
+				releaseRemote,
+				operationDone,
+			)
+		})
+	}
+}
+
+func TestGitTokenStorePersistenceUsesAuthRootMutationLock(t *testing.T) {
+	for _, testCase := range []struct {
+		name    string
+		persist func(context.Context, *GitTokenStore, string) error
+	}{
+		{
+			name: "save",
+			persist: func(ctx context.Context, store *GitTokenStore, fileName string) error {
+				_, errSave := store.Save(ctx, &cliproxyauth.Auth{
+					ID:       fileName,
+					FileName: fileName,
+					Provider: "codex",
+					Metadata: map[string]any{"type": "codex", "access_token": "token"},
+				})
+				return errSave
+			},
+		},
+		{
+			name: "watcher_persistence",
+			persist: func(ctx context.Context, store *GitTokenStore, fileName string) error {
+				return store.PersistAuthFiles(ctx, "", filepath.Join(store.AuthDir(), fileName))
+			},
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			base := t.TempDir()
+			remoteDir := filepath.Join(base, "remote.git")
+			if _, errInit := git.PlainInit(remoteDir, true); errInit != nil {
+				t.Fatal(errInit)
+			}
+			repoDir := filepath.Join(base, "workspace")
+			authDir := filepath.Join(repoDir, "auths")
+			store := NewGitTokenStore(remoteDir, "", "", "main")
+			store.SetBaseDir(authDir)
+			store.pushRepoContext = func(context.Context, *git.Repository, *git.PushOptions) error { return nil }
+			if errEnsure := store.EnsureRepository(); errEnsure != nil {
+				t.Fatal(errEnsure)
+			}
+			const fileName = "root-lock.json"
+			if testCase.name == "watcher_persistence" {
+				if errWrite := os.WriteFile(filepath.Join(authDir, fileName), []byte(`{"type":"codex"}`), 0o600); errWrite != nil {
+					t.Fatal(errWrite)
+				}
+			}
+			root, errRoot := os.OpenRoot(authDir)
+			if errRoot != nil {
+				t.Fatal(errRoot)
+			}
+			defer root.Close()
+			unlockRebuild, errRebuild := authfileguard.LockRootRebuild(root)
+			if errRebuild != nil {
+				t.Fatal(errRebuild)
+			}
+			defer unlockRebuild()
+
+			ctx, cancel := context.WithTimeout(t.Context(), 300*time.Millisecond)
+			defer cancel()
+			if errPersist := testCase.persist(ctx, store, fileName); !errors.Is(errPersist, context.DeadlineExceeded) {
+				t.Fatalf("persistence error = %v, want auth-root lock timeout", errPersist)
+			}
+		})
+	}
+}
+
+func TestRejectTrackedGitAuthLockFiles(t *testing.T) {
+	repoDir := t.TempDir()
+	repo, errInit := git.PlainInit(repoDir, false)
+	if errInit != nil {
+		t.Fatal(errInit)
+	}
+	authDir := filepath.Join(repoDir, "auths")
+	if errMkdir := os.Mkdir(authDir, 0o700); errMkdir != nil {
+		t.Fatal(errMkdir)
+	}
+	if errWrite := os.WriteFile(filepath.Join(authDir, ".auth-root-lock"), []byte("tracked"), 0o600); errWrite != nil {
+		t.Fatal(errWrite)
+	}
+	worktree, errWorktree := repo.Worktree()
+	if errWorktree != nil {
+		t.Fatal(errWorktree)
+	}
+	if _, errAdd := worktree.Add(filepath.ToSlash(filepath.Join("auths", ".auth-root-lock"))); errAdd != nil {
+		t.Fatal(errAdd)
+	}
+	if _, errCommit := worktree.Commit("track reserved lock", &git.CommitOptions{Author: &object.Signature{Name: "test", Email: "test@example.com", When: time.Now()}}); errCommit != nil {
+		t.Fatal(errCommit)
+	}
+	if errValidate := rejectTrackedGitAuthLockFiles(repoDir, authDir); !errors.Is(errValidate, errUnsafeGitAuthPath) {
+		t.Fatalf("validation error = %v, want unsafe auth path", errValidate)
+	}
+}
+
+func TestGitAuthPersistenceLockTargetsDeduplicateDarwinCaseAliases(t *testing.T) {
+	if runtime.GOOS != "darwin" && runtime.GOOS != "windows" {
+		t.Skip("case-folded target lock identities are platform-specific")
+	}
+	repoDir := t.TempDir()
+	root, errRoot := os.OpenRoot(repoDir)
+	if errRoot != nil {
+		t.Fatal(errRoot)
+	}
+	defer root.Close()
+
+	pathTargets, targetTargets, errTargets := gitAuthPersistenceLockTargets(root, repoDir, []string{"auths/Auth.JSON", "auths/auth.json"})
+	if errTargets != nil {
+		t.Fatalf("gitAuthPersistenceLockTargets() error = %v", errTargets)
+	}
+	if len(pathTargets) == 0 {
+		t.Fatal("path lock targets are empty")
+	}
+	if len(targetTargets) != 1 {
+		t.Fatalf("persistent target lock count = %d, want 1", len(targetTargets))
 	}
 }
 
@@ -193,6 +387,656 @@ func TestGitTokenStoreSaveRejectsSymlinkPathComponent(t *testing.T) {
 	}
 	if _, errStat := os.Stat(filepath.Join(outsideDir, "auth.json")); !errors.Is(errStat, os.ErrNotExist) {
 		t.Fatalf("outside auth was written: %v", errStat)
+	}
+}
+
+func TestGitTokenStoreSaveIfAbsentPreservesExistingLocalRecord(t *testing.T) {
+	root := t.TempDir()
+	remoteDir := setupGitRemoteRepository(t, root, "main", testBranchSpec{name: "main", contents: "remote default branch\n"})
+	authDir := filepath.Join(root, "workspace", "auths")
+	store := NewGitTokenStore(remoteDir, "", "", "main")
+	store.SetBaseDir(authDir)
+	if errEnsure := store.EnsureRepository(); errEnsure != nil {
+		t.Fatal(errEnsure)
+	}
+	const (
+		fileName = "existing.json"
+		existing = `{"type":"codex","access_token":"existing-token"}`
+	)
+	path := filepath.Join(authDir, fileName)
+	if errWrite := os.WriteFile(path, []byte(existing), 0o600); errWrite != nil {
+		t.Fatal(errWrite)
+	}
+	_, errSave := store.SaveIfAbsent(t.Context(), &cliproxyauth.Auth{
+		ID:       fileName,
+		FileName: fileName,
+		Provider: "chatgpt-web",
+		Metadata: map[string]any{"type": "chatgpt-web", "access_token": "replacement-token"},
+	})
+	if !errors.Is(errSave, cliproxyauth.ErrAuthAlreadyExists) {
+		t.Fatalf("SaveIfAbsent() error = %v, want auth already exists", errSave)
+	}
+	data, errRead := os.ReadFile(path)
+	if errRead != nil || string(data) != existing {
+		t.Fatalf("existing file changed: content=%q error=%v", data, errRead)
+	}
+}
+
+func TestGitTokenStoreSaveIfAbsentRejectsLocalRecordCreatedAfterRemoteCheck(t *testing.T) {
+	for _, storageBacked := range []bool{false, true} {
+		name := "metadata"
+		if storageBacked {
+			name = "storage"
+		}
+		t.Run(name, func(t *testing.T) {
+			root := t.TempDir()
+			remoteDir := setupGitRemoteRepository(t, root, "main", testBranchSpec{name: "main", contents: "remote default branch\n"})
+			authDir := filepath.Join(root, "workspace", "auths")
+			store := NewGitTokenStore(remoteDir, "", "", "main")
+			store.SetBaseDir(authDir)
+			if errEnsure := store.EnsureRepository(); errEnsure != nil {
+				t.Fatal(errEnsure)
+			}
+
+			const fileName = "appeared.json"
+			concurrent := []byte(`{"type":"chatgpt-web","access_token":"concurrent-token"}`)
+			store.beforeAuthLocalSnapshot = func(path string) {
+				if errWrite := os.WriteFile(path, concurrent, 0o600); errWrite != nil {
+					t.Fatalf("create concurrent local auth: %v", errWrite)
+				}
+			}
+			auth := &cliproxyauth.Auth{
+				ID:       fileName,
+				FileName: fileName,
+				Provider: "chatgpt-web",
+				Metadata: map[string]any{"type": "chatgpt-web", "access_token": "new-token"},
+			}
+			if storageBacked {
+				auth.Storage = &testTokenStorage{}
+			}
+
+			_, errSave := store.SaveIfAbsent(t.Context(), auth)
+			if !errors.Is(errSave, cliproxyauth.ErrAuthAlreadyExists) {
+				t.Fatalf("SaveIfAbsent() error = %v, want auth already exists", errSave)
+			}
+			got, errRead := os.ReadFile(filepath.Join(authDir, fileName))
+			if errRead != nil || !bytes.Equal(got, concurrent) {
+				t.Fatalf("local auth = %s, %v; want concurrent record", got, errRead)
+			}
+		})
+	}
+}
+
+func TestGitTokenStoreSaveIfAbsentStagesInstalledSnapshotAfterLocalReplacement(t *testing.T) {
+	root := t.TempDir()
+	remoteDir := setupGitRemoteRepository(t, root, "main", testBranchSpec{name: "main", contents: "remote default branch\n"})
+	authDir := filepath.Join(root, "workspace", "auths")
+	store := NewGitTokenStore(remoteDir, "", "", "main")
+	store.SetBaseDir(authDir)
+	if errEnsure := store.EnsureRepository(); errEnsure != nil {
+		t.Fatal(errEnsure)
+	}
+
+	const fileName = "immutable-stage.json"
+	replacement := []byte(`{"type":"chatgpt-web","access_token":"concurrent-local-token"}`)
+	store.beforeAuthCommit = func(path string) {
+		tempPath := filepath.Join(filepath.Dir(path), ".concurrent-replacement.json")
+		if errWrite := os.WriteFile(tempPath, replacement, 0o600); errWrite != nil {
+			t.Fatalf("stage concurrent local replacement: %v", errWrite)
+		}
+		if errRename := os.Rename(tempPath, path); errRename != nil {
+			t.Fatalf("install concurrent local replacement: %v", errRename)
+		}
+	}
+	auth := &cliproxyauth.Auth{
+		ID:       fileName,
+		FileName: fileName,
+		Provider: "chatgpt-web",
+		Metadata: map[string]any{"type": "chatgpt-web", "access_token": "intended-token"},
+	}
+	wantRemote, errCanonical := cliproxyauth.CanonicalMetadataBytes(auth)
+	if errCanonical != nil {
+		t.Fatal(errCanonical)
+	}
+
+	path, errSave := store.SaveIfAbsent(t.Context(), auth)
+	if errSave != nil {
+		t.Fatalf("SaveIfAbsent() error = %v", errSave)
+	}
+	gotLocal, errRead := os.ReadFile(path)
+	if errRead != nil || !bytes.Equal(gotLocal, replacement) {
+		t.Fatalf("local replacement = %s, %v; want concurrent content", gotLocal, errRead)
+	}
+	assertRemoteBranchFileContents(t, remoteDir, "main", filepath.Join("auths", fileName), string(wantRemote))
+}
+
+func TestGitTokenStoreSaveIfAbsentPublishesExistingHeadToEmptyRemote(t *testing.T) {
+	root := t.TempDir()
+	remoteDir := setupGitRemoteRepository(t, root, "main", testBranchSpec{name: "main", contents: "remote default branch\n"})
+	authDir := filepath.Join(root, "workspace", "auths")
+	store := NewGitTokenStore(remoteDir, "", "", "main")
+	store.SetBaseDir(authDir)
+	if errEnsure := store.EnsureRepository(); errEnsure != nil {
+		t.Fatal(errEnsure)
+	}
+	auth := &cliproxyauth.Auth{
+		ID:       "recreated.json",
+		FileName: "recreated.json",
+		Provider: "chatgpt-web",
+		Metadata: map[string]any{"type": "chatgpt-web", "access_token": "same-token"},
+	}
+	if _, errSave := store.Save(t.Context(), auth); errSave != nil {
+		t.Fatalf("initial Save() error = %v", errSave)
+	}
+	wantData, errCanonical := cliproxyauth.CanonicalMetadataBytes(auth)
+	if errCanonical != nil {
+		t.Fatal(errCanonical)
+	}
+	remoteRepo, errRemote := git.PlainOpen(remoteDir)
+	if errRemote != nil {
+		t.Fatal(errRemote)
+	}
+	if errRemoveRef := remoteRepo.Storer.RemoveReference(plumbing.NewBranchReferenceName("main")); errRemoveRef != nil {
+		t.Fatal(errRemoveRef)
+	}
+	if errRemoveLocal := os.Remove(filepath.Join(authDir, auth.FileName)); errRemoveLocal != nil {
+		t.Fatal(errRemoveLocal)
+	}
+
+	if _, errSave := store.SaveIfAbsent(t.Context(), auth); errSave != nil {
+		t.Fatalf("SaveIfAbsent() error = %v", errSave)
+	}
+	assertRemoteBranchFileContents(t, remoteDir, "main", filepath.Join("auths", auth.FileName), string(wantData))
+	head, errHead := remoteRepo.Reference(plumbing.NewBranchReferenceName("main"), true)
+	if errHead != nil {
+		t.Fatal(errHead)
+	}
+	commit, errCommit := remoteRepo.CommitObject(head.Hash())
+	if errCommit != nil {
+		t.Fatal(errCommit)
+	}
+	if commit.NumParents() != 0 {
+		t.Fatalf("recreated remote commit has %d parents, want 0", commit.NumParents())
+	}
+	if !strings.Contains(commit.Message, "CLIProxy-Write-ID: ") {
+		t.Fatalf("recreated remote commit has no write receipt: %q", commit.Message)
+	}
+}
+
+func TestGitCommitMessageWithReceiptIsUnique(t *testing.T) {
+	first := gitCommitMessageWithReceipt("Update auth same.json")
+	second := gitCommitMessageWithReceipt("Update auth same.json")
+	if first == second {
+		t.Fatalf("write receipts collided: %q", first)
+	}
+	for _, message := range []string{first, second} {
+		if !strings.HasPrefix(message, "Update auth same.json\n\nCLIProxy-Write-ID: ") {
+			t.Fatalf("commit message = %q, want write receipt trailer", message)
+		}
+	}
+}
+
+func TestGitTokenStoreSaveIfAbsentCancelsBlockedPush(t *testing.T) {
+	root := t.TempDir()
+	remoteDir := setupGitRemoteRepository(t, root, "main", testBranchSpec{name: "main", contents: "remote default branch\n"})
+	authDir := filepath.Join(root, "workspace", "auths")
+	store := NewGitTokenStore(remoteDir, "", "", "main")
+	store.SetBaseDir(authDir)
+	if errEnsure := store.EnsureRepository(); errEnsure != nil {
+		t.Fatal(errEnsure)
+	}
+
+	pushStarted := make(chan struct{})
+	store.pushRepoContext = func(ctx context.Context, _ *git.Repository, _ *git.PushOptions) error {
+		close(pushStarted)
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	result := make(chan error, 1)
+	const fileName = "cancel-push.json"
+	go func() {
+		_, errSave := store.SaveIfAbsent(ctx, &cliproxyauth.Auth{
+			ID:       fileName,
+			FileName: fileName,
+			Provider: "chatgpt-web",
+			Metadata: map[string]any{"type": "chatgpt-web", "access_token": "new-token"},
+		})
+		result <- errSave
+	}()
+
+	select {
+	case <-pushStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("SaveIfAbsent() did not reach push")
+	}
+	cancel()
+	select {
+	case errSave := <-result:
+		if !errors.Is(errSave, context.Canceled) {
+			t.Fatalf("SaveIfAbsent() error = %v, want context canceled", errSave)
+		}
+		if outcome, ok := cliproxyauth.SaveOutcomeFromError(errSave); !ok || outcome != cliproxyauth.SaveOutcomeUncertain {
+			t.Fatalf("SaveIfAbsent() outcome = %v, %t; want uncertain", outcome, ok)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("SaveIfAbsent() did not return after cancellation")
+	}
+	if _, errStat := os.Stat(filepath.Join(authDir, fileName)); !errors.Is(errStat, os.ErrNotExist) {
+		t.Fatalf("local auth exists after canceled push: %v", errStat)
+	}
+}
+
+func TestGitTokenStoreSaveIfAbsentReportsConcurrentRemoteCreate(t *testing.T) {
+	root := t.TempDir()
+	remoteDir := setupGitRemoteRepository(t, root, "main", testBranchSpec{name: "main", contents: "remote default branch\n"})
+	authDir := filepath.Join(root, "workspace", "auths")
+	store := NewGitTokenStore(remoteDir, "", "", "main")
+	store.SetBaseDir(authDir)
+	if errEnsure := store.EnsureRepository(); errEnsure != nil {
+		t.Fatal(errEnsure)
+	}
+	const fileName = "concurrent.json"
+	concurrent := []byte(`{"type":"chatgpt-web","access_token":"concurrent-token"}`)
+	remoteRepo, errRemote := git.PlainOpen(remoteDir)
+	if errRemote != nil {
+		t.Fatal(errRemote)
+	}
+	initialRemote, errReference := remoteRepo.Reference(plumbing.NewBranchReferenceName("main"), true)
+	if errReference != nil {
+		t.Fatal(errReference)
+	}
+	store.pushRepo = func(repo *git.Repository, options *git.PushOptions) error {
+		advanceRemoteBranchFile(
+			t,
+			filepath.Join(root, "seed"),
+			remoteDir,
+			"main",
+			filepath.Join("auths", fileName),
+			concurrent,
+			"concurrent auth create",
+		)
+		if options == nil || options.ForceWithLease == nil {
+			t.Fatal("conditional create push did not use force-with-lease")
+		}
+		if options.ForceWithLease.RefName != plumbing.NewBranchReferenceName("main") || options.ForceWithLease.Hash != initialRemote.Hash() {
+			t.Fatalf("force-with-lease = %#v, want main@%s", options.ForceWithLease, initialRemote.Hash())
+		}
+		wantRefSpec := gitconfig.RefSpec("refs/heads/main:refs/heads/main")
+		if len(options.RefSpecs) != 1 || options.RefSpecs[0] != wantRefSpec {
+			t.Fatalf("push refspecs = %v, want %s", options.RefSpecs, wantRefSpec)
+		}
+		errPush := repo.Push(options)
+		if !isGitPushDefinitelyRejected(errPush) {
+			t.Fatalf("lease push error = %v, want non-fast-forward", errPush)
+		}
+		return errPush
+	}
+
+	_, errSave := store.SaveIfAbsent(t.Context(), &cliproxyauth.Auth{
+		ID:       fileName,
+		FileName: fileName,
+		Provider: "chatgpt-web",
+		Metadata: map[string]any{"type": "chatgpt-web", "access_token": "new-token"},
+	})
+	if !errors.Is(errSave, cliproxyauth.ErrAuthAlreadyExists) {
+		t.Fatalf("SaveIfAbsent() error = %v, want auth already exists", errSave)
+	}
+	if outcome, ok := cliproxyauth.SaveOutcomeFromError(errSave); !ok || outcome != cliproxyauth.SaveOutcomeRolledBack {
+		t.Fatalf("SaveIfAbsent() outcome = %v, %t; want rolled back", outcome, ok)
+	}
+	if _, errStat := os.Stat(filepath.Join(authDir, fileName)); !errors.Is(errStat, os.ErrNotExist) {
+		t.Fatalf("local auth exists after conflict: %v", errStat)
+	}
+	assertRemoteBranchFileContents(t, remoteDir, "main", filepath.Join("auths", fileName), string(concurrent))
+}
+
+func TestGitTokenStoreSaveIfAbsentReportsUncertainConcurrentRemoteTree(t *testing.T) {
+	root := t.TempDir()
+	remoteDir := setupGitRemoteRepository(t, root, "main", testBranchSpec{name: "main", contents: "remote default branch\n"})
+	authDir := filepath.Join(root, "workspace", "auths")
+	store := NewGitTokenStore(remoteDir, "", "", "main")
+	store.SetBaseDir(authDir)
+	if errEnsure := store.EnsureRepository(); errEnsure != nil {
+		t.Fatal(errEnsure)
+	}
+	const fileName = "concurrent-tree.json"
+	remoteRepo, errRemote := git.PlainOpen(remoteDir)
+	if errRemote != nil {
+		t.Fatal(errRemote)
+	}
+	initialRemote, errReference := remoteRepo.Reference(plumbing.NewBranchReferenceName("main"), true)
+	if errReference != nil {
+		t.Fatal(errReference)
+	}
+	store.pushRepo = func(repo *git.Repository, options *git.PushOptions) error {
+		advanceRemoteBranchFile(
+			t,
+			filepath.Join(root, "seed"),
+			remoteDir,
+			"main",
+			filepath.Join("auths", fileName, "child.json"),
+			[]byte(`{"type":"chatgpt-web"}`),
+			"concurrent auth tree create",
+		)
+		if options == nil || options.ForceWithLease == nil || options.ForceWithLease.Hash != initialRemote.Hash() {
+			t.Fatalf("conditional create force-with-lease = %#v, want initial remote %s", options, initialRemote.Hash())
+		}
+		errPush := repo.Push(options)
+		if !isGitPushDefinitelyRejected(errPush) {
+			t.Fatalf("lease push error = %v, want non-fast-forward", errPush)
+		}
+		return errPush
+	}
+
+	_, errSave := store.SaveIfAbsent(t.Context(), &cliproxyauth.Auth{
+		ID:       fileName,
+		FileName: fileName,
+		Provider: "chatgpt-web",
+		Metadata: map[string]any{"type": "chatgpt-web", "access_token": "new-token"},
+	})
+	if outcome, ok := cliproxyauth.SaveOutcomeFromError(errSave); !ok || outcome != cliproxyauth.SaveOutcomeUncertain {
+		t.Fatalf("SaveIfAbsent() outcome = %v, %t; want uncertain; error=%v", outcome, ok, errSave)
+	}
+	if errors.Is(errSave, cliproxyauth.ErrAuthAlreadyExists) {
+		t.Fatalf("SaveIfAbsent() error = %v, must not classify a remote tree as an existing auth blob", errSave)
+	}
+	if _, errStat := os.Stat(filepath.Join(authDir, fileName)); !errors.Is(errStat, os.ErrNotExist) {
+		t.Fatalf("local auth exists after uncertain remote tree: %v", errStat)
+	}
+}
+
+func TestIsGitPushDefinitelyRejectedRecognizesReportStatusError(t *testing.T) {
+	for _, status := range []string{"failed to update ref", "stale info"} {
+		err := fmt.Errorf("push failed: %w", packp.CommandStatusErr{
+			ReferenceName: plumbing.NewBranchReferenceName("main"),
+			Status:        status,
+		})
+		if !isGitPushDefinitelyRejected(err) {
+			t.Fatalf("isGitPushDefinitelyRejected(%q) = false", status)
+		}
+	}
+	if !isGitPushDefinitelyRejected(fmt.Errorf("push failed: %w", packp.UnpackStatusErr{Status: "unpack failed"})) {
+		t.Fatal("isGitPushDefinitelyRejected() did not recognize unpack rejection")
+	}
+}
+
+func TestGitTokenStoreSaveIfAbsentHandlesServerCASRejectionOnEmptyRemote(t *testing.T) {
+	root := t.TempDir()
+	remoteDir := setupGitRemoteRepository(t, root, "main", testBranchSpec{name: "main", contents: "remote default branch\n"})
+	authDir := filepath.Join(root, "workspace", "auths")
+	store := NewGitTokenStore(remoteDir, "", "", "main")
+	store.SetBaseDir(authDir)
+	if errEnsure := store.EnsureRepository(); errEnsure != nil {
+		t.Fatal(errEnsure)
+	}
+	localRepo, errLocalRepo := git.PlainOpen(filepath.Join(root, "workspace"))
+	if errLocalRepo != nil {
+		t.Fatal(errLocalRepo)
+	}
+	initialHead, errInitialHead := localRepo.Head()
+	if errInitialHead != nil {
+		t.Fatal(errInitialHead)
+	}
+
+	remoteRepo, errRemote := git.PlainOpen(remoteDir)
+	if errRemote != nil {
+		t.Fatal(errRemote)
+	}
+	if errRemoveRef := remoteRepo.Storer.RemoveReference(plumbing.NewBranchReferenceName("main")); errRemoveRef != nil {
+		t.Fatal(errRemoveRef)
+	}
+
+	const fileName = "empty-remote-race.json"
+	concurrent := []byte(`{"type":"chatgpt-web","access_token":"concurrent-token"}`)
+	store.pushRepo = func(_ *git.Repository, _ *git.PushOptions) error {
+		winnerDir := filepath.Join(root, "winner")
+		winnerRepo, errInit := git.PlainInit(winnerDir, false)
+		if errInit != nil {
+			t.Fatalf("init winner repository: %v", errInit)
+		}
+		branch := plumbing.NewBranchReferenceName("main")
+		if errHead := winnerRepo.Storer.SetReference(plumbing.NewSymbolicReference(plumbing.HEAD, branch)); errHead != nil {
+			t.Fatalf("set winner HEAD: %v", errHead)
+		}
+		winnerWorktree, errWorktree := winnerRepo.Worktree()
+		if errWorktree != nil {
+			t.Fatalf("open winner worktree: %v", errWorktree)
+		}
+		winnerPath := filepath.Join(winnerDir, "auths", fileName)
+		if errMkdir := os.MkdirAll(filepath.Dir(winnerPath), 0o700); errMkdir != nil {
+			t.Fatalf("create winner auth directory: %v", errMkdir)
+		}
+		if errWrite := os.WriteFile(winnerPath, concurrent, 0o600); errWrite != nil {
+			t.Fatalf("write winner auth: %v", errWrite)
+		}
+		if _, errAdd := winnerWorktree.Add(filepath.ToSlash(filepath.Join("auths", fileName))); errAdd != nil {
+			t.Fatalf("add winner auth: %v", errAdd)
+		}
+		if _, errCommit := winnerWorktree.Commit("concurrent parentless auth create", &git.CommitOptions{Author: &object.Signature{
+			Name: "CLIProxyAPI", Email: "cliproxy@local", When: time.Now(),
+		}}); errCommit != nil {
+			t.Fatalf("commit winner auth: %v", errCommit)
+		}
+		if _, errCreateRemote := winnerRepo.CreateRemote(&gitconfig.RemoteConfig{Name: "origin", URLs: []string{remoteDir}}); errCreateRemote != nil {
+			t.Fatalf("create winner remote: %v", errCreateRemote)
+		}
+		refSpec := gitconfig.RefSpec(branch.String() + ":" + branch.String())
+		if errPushWinner := winnerRepo.Push(&git.PushOptions{RemoteName: "origin", RefSpecs: []gitconfig.RefSpec{refSpec}}); errPushWinner != nil {
+			t.Fatalf("push winner auth: %v", errPushWinner)
+		}
+
+		return packp.CommandStatusErr{
+			ReferenceName: branch,
+			Status:        "failed to update ref: expected zero object ID",
+		}
+	}
+
+	_, errSave := store.SaveIfAbsent(t.Context(), &cliproxyauth.Auth{
+		ID:       fileName,
+		FileName: fileName,
+		Provider: "chatgpt-web",
+		Metadata: map[string]any{"type": "chatgpt-web", "access_token": "new-token"},
+	})
+	if !errors.Is(errSave, cliproxyauth.ErrAuthAlreadyExists) {
+		t.Fatalf("SaveIfAbsent() error = %v, want auth already exists", errSave)
+	}
+	if outcome, explicit := cliproxyauth.SaveOutcomeFromError(errSave); !explicit || outcome != cliproxyauth.SaveOutcomeRolledBack {
+		t.Fatalf("SaveIfAbsent() outcome = %v, %t; want rolled back", outcome, explicit)
+	}
+	if _, errStat := os.Stat(filepath.Join(authDir, fileName)); !errors.Is(errStat, os.ErrNotExist) {
+		t.Fatalf("local auth exists after losing empty-remote race: %v", errStat)
+	}
+	restoredHead, errRestoredHead := localRepo.Head()
+	if errRestoredHead != nil {
+		t.Fatal(errRestoredHead)
+	}
+	if restoredHead.Name() != initialHead.Name() || restoredHead.Hash() != initialHead.Hash() {
+		t.Fatalf("local HEAD = %s@%s, want %s@%s", restoredHead.Name(), restoredHead.Hash(), initialHead.Name(), initialHead.Hash())
+	}
+	idx, errIndex := localRepo.Storer.Index()
+	if errIndex != nil {
+		t.Fatal(errIndex)
+	}
+	if _, errEntry := idx.Entry(filepath.ToSlash(filepath.Join("auths", fileName))); !errors.Is(errEntry, index.ErrEntryNotFound) {
+		t.Fatalf("local index entry error = %v, want not found", errEntry)
+	}
+	worktree, errWorktree := localRepo.Worktree()
+	if errWorktree != nil {
+		t.Fatal(errWorktree)
+	}
+	status, errStatus := worktree.Status()
+	if errStatus != nil {
+		t.Fatal(errStatus)
+	}
+	if !status.IsClean() {
+		t.Fatalf("local worktree not restored after rejected create: %s", status.String())
+	}
+	assertRemoteBranchFileContents(t, remoteDir, "main", filepath.Join("auths", fileName), string(concurrent))
+}
+
+func TestGitTokenStoreSaveIfAbsentAcceptsRemoteDescendantAfterLostAcknowledgement(t *testing.T) {
+	root := t.TempDir()
+	remoteDir := setupGitRemoteRepository(t, root, "main", testBranchSpec{name: "main", contents: "remote default branch\n"})
+	authDir := filepath.Join(root, "workspace", "auths")
+	store := NewGitTokenStore(remoteDir, "", "", "main")
+	store.SetBaseDir(authDir)
+	if errEnsure := store.EnsureRepository(); errEnsure != nil {
+		t.Fatal(errEnsure)
+	}
+	wantPushErr := errors.New("push acknowledgement lost")
+	store.pushRepo = func(repo *git.Repository, options *git.PushOptions) error {
+		if errPush := repo.Push(options); errPush != nil {
+			return errPush
+		}
+		concurrentDir := filepath.Join(root, "concurrent")
+		concurrentRepo, errClone := git.PlainClone(concurrentDir, &git.CloneOptions{
+			URL:           remoteDir,
+			ReferenceName: plumbing.NewBranchReferenceName("main"),
+			SingleBranch:  true,
+		})
+		if errClone != nil {
+			t.Fatalf("clone committed remote: %v", errClone)
+		}
+		worktree, errWorktree := concurrentRepo.Worktree()
+		if errWorktree != nil {
+			t.Fatalf("open concurrent worktree: %v", errWorktree)
+		}
+		if errWrite := os.WriteFile(filepath.Join(concurrentDir, "after.txt"), []byte("after\n"), 0o600); errWrite != nil {
+			t.Fatalf("write descendant marker: %v", errWrite)
+		}
+		if _, errAdd := worktree.Add("after.txt"); errAdd != nil {
+			t.Fatalf("add descendant marker: %v", errAdd)
+		}
+		if _, errCommit := worktree.Commit("advance after auth create", &git.CommitOptions{Author: &object.Signature{
+			Name: "CLIProxyAPI", Email: "cliproxy@local", When: time.Now(),
+		}}); errCommit != nil {
+			t.Fatalf("commit descendant marker: %v", errCommit)
+		}
+		if errPush := concurrentRepo.Push(&git.PushOptions{}); errPush != nil {
+			t.Fatalf("push descendant marker: %v", errPush)
+		}
+		return wantPushErr
+	}
+
+	const fileName = "lost-ack-descendant.json"
+	path, errSave := store.SaveIfAbsent(t.Context(), &cliproxyauth.Auth{
+		ID:       fileName,
+		FileName: fileName,
+		Provider: "chatgpt-web",
+		Metadata: map[string]any{"type": "chatgpt-web", "access_token": "new-token"},
+	})
+	if errSave != nil {
+		t.Fatalf("SaveIfAbsent() error = %v, want confirmed success", errSave)
+	}
+	data, errRead := os.ReadFile(path)
+	if errRead != nil {
+		t.Fatalf("read saved auth: %v", errRead)
+	}
+	assertRemoteBranchFileContents(t, remoteDir, "main", filepath.Join("auths", fileName), string(data))
+}
+
+func TestGitTokenStoreSaveIfAbsentReportsParentlessReplacementAfterLostAcknowledgementAsUncertain(t *testing.T) {
+	root := t.TempDir()
+	remoteDir := setupGitRemoteRepository(t, root, "main", testBranchSpec{name: "main", contents: "remote default branch\n"})
+	firstAuthDir := filepath.Join(root, "first", "auths")
+	secondAuthDir := filepath.Join(root, "second", "auths")
+	firstStore := NewGitTokenStore(remoteDir, "", "", "main")
+	firstStore.SetBaseDir(firstAuthDir)
+	secondStore := NewGitTokenStore(remoteDir, "", "", "main")
+	secondStore.SetBaseDir(secondAuthDir)
+	if errEnsure := firstStore.EnsureRepository(); errEnsure != nil {
+		t.Fatal(errEnsure)
+	}
+	if errEnsure := secondStore.EnsureRepository(); errEnsure != nil {
+		t.Fatal(errEnsure)
+	}
+
+	const fileName = "lost-ack-parentless.json"
+	concurrent := map[string]any{"type": "chatgpt-web", "access_token": "concurrent-token"}
+	var concurrentPersisted []byte
+	wantPushErr := errors.New("push acknowledgement lost")
+	firstStore.pushRepo = func(repo *git.Repository, options *git.PushOptions) error {
+		if errPush := repo.Push(options); errPush != nil {
+			return errPush
+		}
+		path, errSave := secondStore.Save(t.Context(), &cliproxyauth.Auth{
+			ID:       fileName,
+			FileName: fileName,
+			Provider: "chatgpt-web",
+			Metadata: concurrent,
+		})
+		if errSave != nil {
+			t.Fatalf("concurrent parentless save: %v", errSave)
+		}
+		concurrentPersisted, errSave = os.ReadFile(path)
+		if errSave != nil {
+			t.Fatalf("read concurrent parentless save: %v", errSave)
+		}
+		return wantPushErr
+	}
+
+	_, errSave := firstStore.SaveIfAbsent(t.Context(), &cliproxyauth.Auth{
+		ID:       fileName,
+		FileName: fileName,
+		Provider: "chatgpt-web",
+		Metadata: map[string]any{"type": "chatgpt-web", "access_token": "new-token"},
+	})
+	if !errors.Is(errSave, wantPushErr) {
+		t.Fatalf("SaveIfAbsent() error = %v, want %v", errSave, wantPushErr)
+	}
+	if errors.Is(errSave, cliproxyauth.ErrAuthAlreadyExists) {
+		t.Fatalf("SaveIfAbsent() error = %v, must not claim a proven rejected create", errSave)
+	}
+	if outcome, ok := cliproxyauth.SaveOutcomeFromError(errSave); !ok || outcome != cliproxyauth.SaveOutcomeUncertain {
+		t.Fatalf("SaveIfAbsent() outcome = %v, %t; want uncertain", outcome, ok)
+	}
+	if _, errStat := os.Stat(filepath.Join(firstAuthDir, fileName)); !errors.Is(errStat, os.ErrNotExist) {
+		t.Fatalf("first local auth exists after uncertain save: %v", errStat)
+	}
+	assertRemoteBranchFileContents(t, remoteDir, "main", filepath.Join("auths", fileName), string(concurrentPersisted))
+}
+
+func TestGitTokenStoreSaveIfAbsentReportsUncertainRemoteProbe(t *testing.T) {
+	root := t.TempDir()
+	remoteDir := setupGitRemoteRepository(t, root, "main", testBranchSpec{name: "main", contents: "remote default branch\n"})
+	offlineDir := remoteDir + "-offline"
+	authDir := filepath.Join(root, "workspace", "auths")
+	store := NewGitTokenStore(remoteDir, "", "", "main")
+	store.SetBaseDir(authDir)
+	if errEnsure := store.EnsureRepository(); errEnsure != nil {
+		t.Fatal(errEnsure)
+	}
+	wantPushErr := errors.New("push result lost")
+	store.pushRepo = func(_ *git.Repository, _ *git.PushOptions) error {
+		if errRename := os.Rename(remoteDir, offlineDir); errRename != nil {
+			t.Fatalf("take remote offline: %v", errRename)
+		}
+		return wantPushErr
+	}
+	t.Cleanup(func() {
+		if _, errStat := os.Stat(offlineDir); errStat == nil {
+			if errRename := os.Rename(offlineDir, remoteDir); errRename != nil {
+				t.Errorf("restore remote: %v", errRename)
+			}
+		}
+	})
+
+	const fileName = "uncertain.json"
+	_, errSave := store.SaveIfAbsent(t.Context(), &cliproxyauth.Auth{
+		ID:       fileName,
+		FileName: fileName,
+		Provider: "chatgpt-web",
+		Metadata: map[string]any{"type": "chatgpt-web", "access_token": "new-token"},
+	})
+	if !errors.Is(errSave, wantPushErr) {
+		t.Fatalf("SaveIfAbsent() error = %v, want %v", errSave, wantPushErr)
+	}
+	if outcome, ok := cliproxyauth.SaveOutcomeFromError(errSave); !ok || outcome != cliproxyauth.SaveOutcomeUncertain {
+		t.Fatalf("SaveIfAbsent() outcome = %v, %t; want uncertain", outcome, ok)
+	}
+	if _, errStat := os.Stat(filepath.Join(authDir, fileName)); !errors.Is(errStat, os.ErrNotExist) {
+		t.Fatalf("local auth exists after uncertain push: %v", errStat)
 	}
 }
 
@@ -781,6 +1625,190 @@ func TestGitTokenStoreSaveAcceptsRemoteCommitAfterLostPushAcknowledgement(t *tes
 	assertRemoteBranchFileContents(t, remoteDir, "main", filepath.Join("auths", auth.ID), string(wantData))
 }
 
+func TestGitTokenStoreSaveConfirmsRemoteCommitAfterPushContextCancellation(t *testing.T) {
+	root := t.TempDir()
+	remoteDir := setupGitRemoteRepository(t, root, "main", testBranchSpec{name: "main", contents: "remote default branch\n"})
+	authDir := filepath.Join(root, "workspace", "auths")
+	store := NewGitTokenStore(remoteDir, "", "", "main")
+	store.SetBaseDir(authDir)
+	auth := &cliproxyauth.Auth{
+		ID: "canceled-ack.json", FileName: "canceled-ack.json", Provider: "codex",
+		Metadata: map[string]any{"type": "codex", "access_token": "old"},
+	}
+	if _, errSave := store.Save(t.Context(), auth); errSave != nil {
+		t.Fatalf("initial Save() error = %v", errSave)
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	store.pushRepoContext = func(pushCtx context.Context, repo *git.Repository, options *git.PushOptions) error {
+		if errPush := repo.Push(options); errPush != nil {
+			return errPush
+		}
+		cancel()
+		<-pushCtx.Done()
+		return pushCtx.Err()
+	}
+	auth.Metadata["access_token"] = "new"
+	path, errSave := store.Save(ctx, auth)
+	if errSave != nil {
+		t.Fatalf("Save() after canceled acknowledgement error = %v", errSave)
+	}
+	data, errRead := os.ReadFile(path)
+	if errRead != nil || !bytes.Contains(data, []byte(`"access_token":"new"`)) {
+		t.Fatalf("saved auth = %s, %v; want updated token", data, errRead)
+	}
+	assertRemoteBranchFileContents(t, remoteDir, "main", filepath.Join("auths", auth.ID), string(data))
+}
+
+func TestGitTokenStoreSaveAcceptsRemoteDescendantAfterLostAcknowledgement(t *testing.T) {
+	root := t.TempDir()
+	remoteDir := setupGitRemoteRepository(t, root, "main", testBranchSpec{name: "main", contents: "remote default branch\n"})
+	authDir := filepath.Join(root, "workspace", "auths")
+	store := NewGitTokenStore(remoteDir, "", "", "main")
+	store.SetBaseDir(authDir)
+	auth := &cliproxyauth.Auth{
+		ID: "lost-ack-descendant.json", FileName: "lost-ack-descendant.json", Provider: "codex",
+		Metadata: map[string]any{"type": "codex", "access_token": "old"},
+	}
+	if _, errSave := store.Save(t.Context(), auth); errSave != nil {
+		t.Fatalf("initial Save() error = %v", errSave)
+	}
+
+	wantPushErr := errors.New("push acknowledgement lost")
+	store.pushRepo = func(repo *git.Repository, options *git.PushOptions) error {
+		if errPush := repo.Push(options); errPush != nil {
+			return errPush
+		}
+		concurrentDir := filepath.Join(root, "concurrent-save")
+		concurrentRepo, errClone := git.PlainClone(concurrentDir, &git.CloneOptions{
+			URL:           remoteDir,
+			ReferenceName: plumbing.NewBranchReferenceName("main"),
+			SingleBranch:  true,
+		})
+		if errClone != nil {
+			t.Fatalf("clone committed remote: %v", errClone)
+		}
+		worktree, errWorktree := concurrentRepo.Worktree()
+		if errWorktree != nil {
+			t.Fatalf("open concurrent worktree: %v", errWorktree)
+		}
+		if errWrite := os.WriteFile(filepath.Join(concurrentDir, "after.txt"), []byte("after\n"), 0o600); errWrite != nil {
+			t.Fatalf("write descendant marker: %v", errWrite)
+		}
+		if _, errAdd := worktree.Add("after.txt"); errAdd != nil {
+			t.Fatalf("add descendant marker: %v", errAdd)
+		}
+		if _, errCommit := worktree.Commit("advance after auth save", &git.CommitOptions{Author: &object.Signature{
+			Name: "CLIProxyAPI", Email: "cliproxy@local", When: time.Now(),
+		}}); errCommit != nil {
+			t.Fatalf("commit descendant marker: %v", errCommit)
+		}
+		if errPush := concurrentRepo.Push(&git.PushOptions{}); errPush != nil {
+			t.Fatalf("push descendant marker: %v", errPush)
+		}
+		return wantPushErr
+	}
+
+	auth.Metadata["access_token"] = "new"
+	path, errSave := store.Save(t.Context(), auth)
+	if errSave != nil {
+		t.Fatalf("Save() error = %v, want confirmed success", errSave)
+	}
+	data, errRead := os.ReadFile(path)
+	if errRead != nil {
+		t.Fatalf("read saved auth: %v", errRead)
+	}
+	assertRemoteBranchFileContents(t, remoteDir, "main", filepath.Join("auths", auth.ID), string(data))
+}
+
+func TestGitTokenStoreSaveRejectsRemoteDescendantThatReplacesAuthAfterLostAcknowledgement(t *testing.T) {
+	root := t.TempDir()
+	remoteDir := setupGitRemoteRepository(t, root, "main", testBranchSpec{name: "main", contents: "remote default branch\n"})
+	workspaceDir := filepath.Join(root, "workspace")
+	authDir := filepath.Join(workspaceDir, "auths")
+	store := NewGitTokenStore(remoteDir, "", "", "main")
+	store.SetBaseDir(authDir)
+	auth := &cliproxyauth.Auth{
+		ID: "lost-ack-replaced.json", FileName: "lost-ack-replaced.json", Provider: "codex",
+		Metadata: map[string]any{"type": "codex", "access_token": "old"},
+	}
+	path, errSave := store.Save(t.Context(), auth)
+	if errSave != nil {
+		t.Fatalf("initial Save() error = %v", errSave)
+	}
+	oldData, errRead := os.ReadFile(path)
+	if errRead != nil {
+		t.Fatal(errRead)
+	}
+	workspaceRepo, errOpen := git.PlainOpen(workspaceDir)
+	if errOpen != nil {
+		t.Fatal(errOpen)
+	}
+	oldHead, errHead := workspaceRepo.Head()
+	if errHead != nil {
+		t.Fatal(errHead)
+	}
+
+	replacement := []byte(`{"type":"codex","access_token":"replacement"}`)
+	wantPushErr := errors.New("push acknowledgement lost")
+	store.pushRepo = func(repo *git.Repository, options *git.PushOptions) error {
+		if errPush := repo.Push(options); errPush != nil {
+			return errPush
+		}
+		concurrentDir := filepath.Join(root, "concurrent-replacement")
+		concurrentRepo, errClone := git.PlainClone(concurrentDir, &git.CloneOptions{
+			URL:           remoteDir,
+			ReferenceName: plumbing.NewBranchReferenceName("main"),
+			SingleBranch:  true,
+		})
+		if errClone != nil {
+			t.Fatalf("clone committed remote: %v", errClone)
+		}
+		worktree, errWorktree := concurrentRepo.Worktree()
+		if errWorktree != nil {
+			t.Fatal(errWorktree)
+		}
+		relativePath := filepath.Join("auths", auth.ID)
+		if errWrite := os.WriteFile(filepath.Join(concurrentDir, relativePath), replacement, 0o600); errWrite != nil {
+			t.Fatal(errWrite)
+		}
+		if _, errAdd := worktree.Add(relativePath); errAdd != nil {
+			t.Fatal(errAdd)
+		}
+		if _, errCommit := worktree.Commit("replace auth after acknowledged save", &git.CommitOptions{Author: &object.Signature{
+			Name: "CLIProxyAPI", Email: "cliproxy@local", When: time.Now(),
+		}}); errCommit != nil {
+			t.Fatal(errCommit)
+		}
+		if errPush := concurrentRepo.Push(&git.PushOptions{}); errPush != nil {
+			t.Fatal(errPush)
+		}
+		return wantPushErr
+	}
+
+	auth.Metadata["access_token"] = "new"
+	if _, errSave = store.Save(t.Context(), auth); errSave == nil {
+		t.Fatal("Save() error = nil, want remote replacement conflict")
+	}
+	gotData, errRead := os.ReadFile(path)
+	if errRead != nil || !bytes.Equal(gotData, oldData) {
+		t.Fatalf("local auth after remote replacement = %s, %v; want %s", gotData, errRead, oldData)
+	}
+	gotHead, errHead := workspaceRepo.Head()
+	if errHead != nil || gotHead.Hash() != oldHead.Hash() {
+		t.Fatalf("workspace HEAD after rollback = %v, %v; want %s", gotHead, errHead, oldHead.Hash())
+	}
+	worktree, errWorktree := workspaceRepo.Worktree()
+	if errWorktree != nil {
+		t.Fatal(errWorktree)
+	}
+	status, errStatus := worktree.Status()
+	if errStatus != nil || !status.IsClean() {
+		t.Fatalf("workspace status after rollback = %s, %v; want clean", status, errStatus)
+	}
+	assertRemoteBranchFileContents(t, remoteDir, "main", filepath.Join("auths", auth.ID), string(replacement))
+}
+
 func TestGitTokenStoreSaveRejectsMatchingBlobFromDifferentRemoteTip(t *testing.T) {
 	root := t.TempDir()
 	remoteDir := setupGitRemoteRepository(t, root, "main", testBranchSpec{name: "main", contents: "remote default branch\n"})
@@ -853,10 +1881,46 @@ func TestGitTokenStoreSaveRollsBackWhenPushVerificationFails(t *testing.T) {
 	auth.Metadata["access_token"] = "new"
 	if _, errSave = store.Save(t.Context(), auth); errSave == nil {
 		t.Fatal("Save() error = nil, want push verification failure")
+	} else if outcome, explicit := cliproxyauth.SaveOutcomeFromError(errSave); !explicit || outcome != cliproxyauth.SaveOutcomeUncertain {
+		t.Fatalf("Save() outcome = %v, %t; want uncertain; error=%v", outcome, explicit, errSave)
 	}
 	if gotData, errReadLocal := os.ReadFile(path); errReadLocal != nil || !bytes.Equal(gotData, oldData) {
 		t.Fatalf("local auth after failed verification = %s, %v; want %s", gotData, errReadLocal, oldData)
 	}
+}
+
+func TestGitTokenStoreDeleteConfirmsRemoteCommitAfterPushContextCancellation(t *testing.T) {
+	root := t.TempDir()
+	remoteDir := setupGitRemoteRepository(t, root, "main", testBranchSpec{name: "main", contents: "remote default branch\n"})
+	authDir := filepath.Join(root, "workspace", "auths")
+	store := NewGitTokenStore(remoteDir, "", "", "main")
+	store.SetBaseDir(authDir)
+	auth := &cliproxyauth.Auth{
+		ID: "delete-canceled-ack.json", FileName: "delete-canceled-ack.json", Provider: "codex",
+		Metadata: map[string]any{"type": "codex", "access_token": "token"},
+	}
+	path, errSave := store.Save(t.Context(), auth)
+	if errSave != nil {
+		t.Fatalf("Save() error = %v", errSave)
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	store.pushRepoContext = func(pushCtx context.Context, repo *git.Repository, options *git.PushOptions) error {
+		if errPush := repo.Push(options); errPush != nil {
+			return errPush
+		}
+		cancel()
+		<-pushCtx.Done()
+		return pushCtx.Err()
+	}
+	errDelete := store.Delete(ctx, auth.ID)
+	if outcome, explicit := cliproxyauth.DeleteOutcomeFromError(errDelete); !explicit || outcome != cliproxyauth.DeleteOutcomeCommitted {
+		t.Fatalf("Delete() outcome = %v, %t; want committed; error=%v", outcome, explicit, errDelete)
+	}
+	if _, errStat := os.Stat(path); !errors.Is(errStat, os.ErrNotExist) {
+		t.Fatalf("local auth remains after committed delete: %v", errStat)
+	}
+	assertRemoteBranchFileMissing(t, remoteDir, "main", filepath.Join("auths", auth.ID))
 }
 
 func TestGitTokenStoreNoOpDeletionDoesNotRecreateMissingRemoteBranch(t *testing.T) {
@@ -877,9 +1941,10 @@ func TestGitTokenStoreNoOpDeletionDoesNotRecreateMissingRemoteBranch(t *testing.
 	}
 
 	store.mu.Lock()
-	remoteState, errRemote := store.remoteBranchPreconditionLocked()
+	remoteState, errRemote := store.remoteBranchPreconditionLocked(t.Context())
 	if errRemote == nil {
 		errRemote = store.commitAndPushAgainstRemoteWithSnapshotsLocked(
+			t.Context(),
 			"delete missing auth",
 			remoteState,
 			map[string]authFileSnapshot{"auths/missing.json": {}},
@@ -915,7 +1980,7 @@ func TestGitTokenStoreFinalizeDeletionUsesAndRestoresBaseDirSnapshot(t *testing.
 		t.Fatalf("relativeToRepo() error = %v", errRel)
 	}
 	store.mu.Lock()
-	errSeed := store.commitAndPushLocked("seed retired auth", rel)
+	errSeed := store.commitAndPushLocked(t.Context(), "seed retired auth", rel)
 	store.mu.Unlock()
 	if errSeed != nil {
 		t.Fatalf("seed retired auth: %v", errSeed)
@@ -953,7 +2018,7 @@ func TestGitTokenStoreFinalizeRetiredDeletionAcceptsLostPushAcknowledgement(t *t
 		t.Fatalf("relativeToRepo() error = %v", errRel)
 	}
 	store.mu.Lock()
-	errSeed := store.commitAndPushLocked("seed retired auth", rel)
+	errSeed := store.commitAndPushLocked(t.Context(), "seed retired auth", rel)
 	store.mu.Unlock()
 	if errSeed != nil {
 		t.Fatalf("seed retired auth: %v", errSeed)
@@ -1000,7 +2065,7 @@ func TestGitTokenStoreFinalizeDeletionIgnoresRecreatedLocalFile(t *testing.T) {
 		t.Fatalf("relativeToRepo() error = %v", errRel)
 	}
 	store.mu.Lock()
-	errSeed := store.commitAndPushLocked("seed retired auth", rel)
+	errSeed := store.commitAndPushLocked(t.Context(), "seed retired auth", rel)
 	store.mu.Unlock()
 	if errSeed != nil {
 		t.Fatalf("seed retired auth: %v", errSeed)
@@ -1054,7 +2119,7 @@ func TestGitTokenStoreFinalizeRetiredDeletionPreservesRemoteReplacement(t *testi
 		t.Fatalf("relativeToRepo() error = %v", errRel)
 	}
 	store.mu.Lock()
-	errSeed := store.commitAndPushLocked("seed retired auth", rel)
+	errSeed := store.commitAndPushLocked(t.Context(), "seed retired auth", rel)
 	store.mu.Unlock()
 	if errSeed != nil {
 		t.Fatalf("seed retired auth: %v", errSeed)
@@ -1108,11 +2173,11 @@ func TestGitTokenStoreFinalizeRetiredDeletionPreservesDifferentRetiredGeneration
 		t.Fatalf("relativeToRepo() error = %v", errRel)
 	}
 	store.mu.Lock()
-	if errSeed := store.commitAndPushLocked("seed original retired auth", rel); errSeed != nil {
+	if errSeed := store.commitAndPushLocked(t.Context(), "seed original retired auth", rel); errSeed != nil {
 		store.mu.Unlock()
 		t.Fatalf("seed retired auth: %v", errSeed)
 	}
-	originalState, errState := store.remoteBranchPreconditionLocked()
+	originalState, errState := store.remoteBranchPreconditionLocked(t.Context())
 	store.mu.Unlock()
 	if errState != nil {
 		t.Fatalf("remoteBranchPreconditionLocked() error = %v", errState)
@@ -1194,8 +2259,8 @@ func TestGitRetiredFinalizerLeasePreservesConcurrentRemoteReplacement(t *testing
 		t.Fatalf("relativeToRepo() error = %v", errRel)
 	}
 	store.mu.Lock()
-	errSeed := store.commitAndPushLocked("seed retired auth", rel)
-	remoteState, errRemote := store.remoteBranchPreconditionLocked()
+	errSeed := store.commitAndPushLocked(t.Context(), "seed retired auth", rel)
+	remoteState, errRemote := store.remoteBranchPreconditionLocked(t.Context())
 	store.mu.Unlock()
 	if errSeed != nil {
 		t.Fatalf("seed retired auth: %v", errSeed)
@@ -1267,7 +2332,7 @@ func TestGitPersistAuthFilesRejectsRewritingRetiredHead(t *testing.T) {
 		t.Fatalf("relativeToRepo() error = %v", errRel)
 	}
 	store.mu.Lock()
-	errSeed := store.commitAndPushLocked("seed retired auth", rel)
+	errSeed := store.commitAndPushLocked(t.Context(), "seed retired auth", rel)
 	store.mu.Unlock()
 	if errSeed != nil {
 		t.Fatalf("seed retired auth: %v", errSeed)
@@ -1308,7 +2373,7 @@ func TestGitTokenStoreSaveRejectsRewritingRetiredHead(t *testing.T) {
 		t.Fatalf("relativeToRepo() error = %v", errRel)
 	}
 	store.mu.Lock()
-	errSeed := store.commitAndPushLocked("seed retired auth", rel)
+	errSeed := store.commitAndPushLocked(t.Context(), "seed retired auth", rel)
 	store.mu.Unlock()
 	if errSeed != nil {
 		t.Fatalf("seed retired auth: %v", errSeed)
@@ -1467,7 +2532,7 @@ func TestGitCommitAndPushRejectsRemoteAdvanceAfterPrecondition(t *testing.T) {
 		t.Fatalf("relativeToRepo() error = %v", errRel)
 	}
 	store.mu.Lock()
-	remoteState, errRemote := store.remoteBranchPreconditionLocked()
+	remoteState, errRemote := store.remoteBranchPreconditionLocked(t.Context())
 	store.mu.Unlock()
 	if errRemote != nil {
 		t.Fatalf("remoteBranchPreconditionLocked() error = %v", errRemote)
@@ -1476,7 +2541,7 @@ func TestGitCommitAndPushRejectsRemoteAdvanceAfterPrecondition(t *testing.T) {
 	retired := []byte(`{"type":"gemini","access_token":"concurrent"}`)
 	advanceRemoteBranchFile(t, filepath.Join(root, "seed"), remoteDir, "main", filepath.Join("auths", "concurrent.json"), retired, "concurrent remote retirement")
 	store.mu.Lock()
-	errPush := store.commitAndPushAgainstRemoteLocked("stale conditional push", remoteState, rel)
+	errPush := store.commitAndPushAgainstRemoteLocked(t.Context(), "stale conditional push", remoteState, rel)
 	store.mu.Unlock()
 	if errPush == nil {
 		t.Fatal("commitAndPushAgainstRemoteLocked() error = nil, want lease conflict")
@@ -1590,7 +2655,7 @@ func TestGitPersistAuthFilesPreservesSameContentNewRemoteTip(t *testing.T) {
 		t.Fatalf("EnsureRepository() error = %v", errEnsure)
 	}
 	store.mu.Lock()
-	originalState, errState := store.remoteBranchPreconditionLocked()
+	originalState, errState := store.remoteBranchPreconditionLocked(t.Context())
 	store.mu.Unlock()
 	if errState != nil {
 		t.Fatalf("remoteBranchPreconditionLocked() error = %v", errState)
@@ -1800,7 +2865,7 @@ func TestEnsureRepositoryExistingRepoSwitchesToConfiguredBranch(t *testing.T) {
 	}
 
 	reopened.mu.Lock()
-	err := reopened.commitAndPushLocked("Update develop branch marker", "branch.txt")
+	err := reopened.commitAndPushLocked(t.Context(), "Update develop branch marker", "branch.txt")
 	reopened.mu.Unlock()
 	if err != nil {
 		t.Fatalf("commitAndPushLocked: %v", err)
@@ -1868,7 +2933,7 @@ func TestEnsureRepositoryResetsToRemoteDefaultWhenBranchUnset(t *testing.T) {
 		t.Fatalf("write local master marker: %v", err)
 	}
 	storeDefault.mu.Lock()
-	if err := storeDefault.commitAndPushLocked("Update master marker", "branch.txt"); err != nil {
+	if err := storeDefault.commitAndPushLocked(t.Context(), "Update master marker", "branch.txt"); err != nil {
 		storeDefault.mu.Unlock()
 		t.Fatalf("commitAndPushLocked: %v", err)
 	}
@@ -2423,5 +3488,26 @@ func assertRemoteBranchFileContents(t *testing.T, remoteDir, branch, filePath, w
 	}
 	if contents != want {
 		t.Fatalf("remote branch %s file %s = %q, want %q", branch, filePath, contents, want)
+	}
+}
+
+func TestJSONEqualUsesExactNumbers(t *testing.T) {
+	if jsonEqual(
+		[]byte(`{"generation":9007199254740992}`),
+		[]byte(`{"generation":9007199254740993}`),
+	) {
+		t.Fatal("adjacent large integer generations compared equal")
+	}
+	if !jsonEqual(
+		[]byte(`{"value":1,"exponent":1e3}`),
+		[]byte(`{"exponent":1000.0,"value":1.0}`),
+	) {
+		t.Fatal("mathematically equivalent JSON numbers compared different")
+	}
+	if !jsonEqual(
+		[]byte(`{"value":1e1000000000}`),
+		[]byte(`{"value":10e999999999}`),
+	) {
+		t.Fatal("large exponent equivalence required decimal expansion")
 	}
 }

@@ -19,6 +19,12 @@ type ProxyResolver interface {
 	ReportFailure(ctx context.Context, auth *Auth, err error) error
 }
 
+// ProxyBindingLeaser keeps a binding alive while a credential is being
+// acquired but has not yet been registered with the runtime auth source.
+type ProxyBindingLeaser interface {
+	HoldBinding(authID string) func()
+}
+
 // SetProxyResolver installs the request-time structured proxy resolver.
 func (m *Manager) SetProxyResolver(resolver ProxyResolver) {
 	if m == nil {
@@ -56,6 +62,26 @@ func (m *Manager) ResolveProxyAuth(ctx context.Context, auth *Auth) (*Auth, erro
 	clone.RuntimeProxyURL = strings.TrimSpace(resolved.URL)
 	clone.RuntimeProxyBindingID = strings.TrimSpace(resolved.BindingID)
 	return clone, nil
+}
+
+// HoldProxyBinding prevents background pruning from removing a pending
+// credential's binding. Resolvers without lease support require no cleanup.
+func (m *Manager) HoldProxyBinding(authID string) func() {
+	if m == nil {
+		return func() {}
+	}
+	m.mu.RLock()
+	resolver := m.proxyResolver
+	m.mu.RUnlock()
+	leaser, ok := resolver.(ProxyBindingLeaser)
+	if !ok || leaser == nil {
+		return func() {}
+	}
+	release := leaser.HoldBinding(strings.TrimSpace(authID))
+	if release == nil {
+		return func() {}
+	}
+	return release
 }
 
 func (m *Manager) reportProxyFailure(ctx context.Context, auth *Auth, err error) error {

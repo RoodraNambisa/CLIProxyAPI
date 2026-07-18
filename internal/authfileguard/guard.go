@@ -1,13 +1,14 @@
 package authfileguard
 
 import (
+	"context"
 	"sort"
 	"sync"
 )
 
 type pathLock struct {
-	mu   sync.Mutex
-	refs int
+	token chan struct{}
+	refs  int
 }
 
 var pathLocks = struct {
@@ -43,27 +44,42 @@ var quarantinedPaths = struct {
 // Lock serializes in-process mutations to one auth file path and its current
 // resolved filesystem entity.
 func Lock(path string) func() {
+	unlock, _ := LockContext(context.Background(), path)
+	return unlock
+}
+
+// LockContext is Lock with cancellable in-process lock waiting.
+func LockContext(ctx context.Context, path string) (func(), error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if errContext := ctx.Err(); errContext != nil {
+		return nil, errContext
+	}
 	lexicalKey := pathLexicalKey(path)
 	if lexicalKey == "" {
-		return func() {}
+		return func() {}, nil
 	}
 
 	entityKey := resolvedPathKey(lexicalKey)
 	for {
-		unlock := lockPathKeys([]string{lexicalKey, entityKey})
+		unlock, errLock := lockPathKeysContext(ctx, []string{lexicalKey, entityKey})
+		if errLock != nil {
+			return nil, errLock
+		}
 		refreshedEntityKey := resolvedPathKey(lexicalKey)
 		if refreshedEntityKey == entityKey {
-			return unlock
+			return unlock, nil
 		}
 		unlock()
 		entityKey = refreshedEntityKey
 	}
 }
 
-func lockPathKeys(keys []string) func() {
+func lockPathKeysContext(ctx context.Context, keys []string) (func(), error) {
 	keys = sortedUniqueKeys(keys)
 	if len(keys) == 0 {
-		return func() {}
+		return func() {}, nil
 	}
 
 	pathLocks.Lock()
@@ -71,7 +87,8 @@ func lockPathKeys(keys []string) func() {
 	for i, key := range keys {
 		entry := pathLocks.entries[key]
 		if entry == nil {
-			entry = &pathLock{}
+			entry = &pathLock{token: make(chan struct{}, 1)}
+			entry.token <- struct{}{}
 			pathLocks.entries[key] = entry
 		}
 		entry.refs++
@@ -79,13 +96,7 @@ func lockPathKeys(keys []string) func() {
 	}
 	pathLocks.Unlock()
 
-	for _, entry := range entries {
-		entry.mu.Lock()
-	}
-	return func() {
-		for i := len(entries) - 1; i >= 0; i-- {
-			entries[i].mu.Unlock()
-		}
+	releaseReferences := func() {
 		pathLocks.Lock()
 		for i, entry := range entries {
 			entry.refs--
@@ -95,6 +106,42 @@ func lockPathKeys(keys []string) func() {
 		}
 		pathLocks.Unlock()
 	}
+	acquired := 0
+	for _, entry := range entries {
+		if errContext := ctx.Err(); errContext != nil {
+			for i := acquired - 1; i >= 0; i-- {
+				entries[i].token <- struct{}{}
+			}
+			releaseReferences()
+			return nil, errContext
+		}
+		select {
+		case <-entry.token:
+			acquired++
+		case <-ctx.Done():
+			for i := acquired - 1; i >= 0; i-- {
+				entries[i].token <- struct{}{}
+			}
+			releaseReferences()
+			return nil, ctx.Err()
+		}
+	}
+	if errContext := ctx.Err(); errContext != nil {
+		for i := acquired - 1; i >= 0; i-- {
+			entries[i].token <- struct{}{}
+		}
+		releaseReferences()
+		return nil, errContext
+	}
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			for i := len(entries) - 1; i >= 0; i-- {
+				entries[i].token <- struct{}{}
+			}
+			releaseReferences()
+		})
+	}, nil
 }
 
 // MarkRetired records that a path has held a retired credential. The marker is

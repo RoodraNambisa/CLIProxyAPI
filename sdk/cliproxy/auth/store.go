@@ -53,6 +53,54 @@ func DeleteOutcomeFromError(err error) (DeleteOutcome, bool) {
 	return outcomeErr.Outcome, true
 }
 
+// SaveOutcome describes the durable result of a save operation that returned
+// an error after touching local or external storage.
+type SaveOutcome uint8
+
+const (
+	SaveOutcomeUncertain SaveOutcome = iota
+	SaveOutcomeCommitted
+	SaveOutcomeRolledBack
+)
+
+// SaveOutcomeError preserves the original error while telling the runtime
+// whether the credential is durably saved, durably rolled back, or unknown.
+type SaveOutcomeError struct {
+	Outcome SaveOutcome
+	Err     error
+}
+
+func (e *SaveOutcomeError) Error() string {
+	if e == nil || e.Err == nil {
+		return "auth save outcome error"
+	}
+	return e.Err.Error()
+}
+
+func (e *SaveOutcomeError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Err
+}
+
+// NewSaveOutcomeError attaches a durable save outcome to err.
+func NewSaveOutcomeError(outcome SaveOutcome, err error) error {
+	if err == nil {
+		return nil
+	}
+	return &SaveOutcomeError{Outcome: outcome, Err: err}
+}
+
+// SaveOutcomeFromError returns the durable save outcome carried by err.
+func SaveOutcomeFromError(err error) (SaveOutcome, bool) {
+	var outcomeErr *SaveOutcomeError
+	if !errors.As(err, &outcomeErr) || outcomeErr == nil {
+		return SaveOutcomeUncertain, false
+	}
+	return outcomeErr.Outcome, true
+}
+
 // Store abstracts persistence of Auth state across restarts.
 type Store interface {
 	// List returns all auth records stored in the backend.
@@ -61,6 +109,13 @@ type Store interface {
 	Save(ctx context.Context, auth *Auth) (string, error)
 	// Delete removes the auth record identified by id.
 	Delete(ctx context.Context, id string) error
+}
+
+// ConditionalCreateStore atomically persists a record only when its ID is
+// absent. Errors after a write may have reached durable storage should carry a
+// SaveOutcomeError.
+type ConditionalCreateStore interface {
+	SaveIfAbsent(ctx context.Context, auth *Auth) (string, error)
 }
 
 // SourceConditionalDeleteStore atomically deletes a record only when its

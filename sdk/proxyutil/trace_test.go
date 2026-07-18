@@ -172,15 +172,82 @@ func TestCheckTraceDiagnostics(t *testing.T) {
 func TestCheckTraceMasksProxyPasswordsInErrors(t *testing.T) {
 	const proxyURL = "http://user:s3cret@proxy.example:8080"
 	message := maskTraceMessage("proxy request via "+proxyURL+" failed", proxyURL)
-	if strings.Contains(message, "s3cret") || !strings.Contains(message, "********") {
+	if strings.Contains(message, "user") || strings.Contains(message, "s3cret") || !strings.Contains(message, "********") {
 		t.Fatalf("masked message = %q", message)
 	}
 
-	result := CheckTrace(context.Background(), "http://user:sec%ret@proxy.example:8080")
+	const usernameOnlyProxyURL = "http://session-token@proxy.example:8080"
+	usernameOnlyMessage := maskTraceMessage("proxy userinfo session-token@ failed", usernameOnlyProxyURL)
+	if strings.Contains(usernameOnlyMessage, "session-token") || !strings.Contains(usernameOnlyMessage, "********") {
+		t.Fatalf("masked username-only message = %q", usernameOnlyMessage)
+	}
+
+	const encodedProxyURL = "http://session%2Dtoken:p%40ss@proxy.example:8080"
+	encodedMessage := maskTraceMessage("proxy rejected session%2Dtoken:p%40ss@", encodedProxyURL)
+	if strings.Contains(encodedMessage, "session%2Dtoken") || strings.Contains(encodedMessage, "p%40ss") {
+		t.Fatalf("masked encoded credentials = %q", encodedMessage)
+	}
+	decodedMessage := maskTraceMessage("proxy rejected session-token:p@ss@", encodedProxyURL)
+	if strings.Contains(decodedMessage, "session-token") || strings.Contains(decodedMessage, "p@ss") {
+		t.Fatalf("masked decoded credentials = %q", decodedMessage)
+	}
+	const malformedProxyURL = "http://user:sec%ret@proxy.example:8080"
+	malformedMessage := maskTraceMessage("proxy rejected user:sec%ret@", malformedProxyURL)
+	if strings.Contains(malformedMessage, "user") || strings.Contains(malformedMessage, "sec%ret") {
+		t.Fatalf("masked malformed credentials = %q", malformedMessage)
+	}
+
+	result := CheckTrace(context.Background(), malformedProxyURL)
 	if strings.Contains(result.Message, "sec%ret") {
 		t.Fatalf("CheckTrace() leaked malformed proxy password: %+v", result)
 	}
 	if result.Error != "invalid_proxy" {
 		t.Fatalf("error = %q, want invalid_proxy", result.Error)
+	}
+}
+
+func TestMaskTraceMessageDoesNotReplaceCredentialSubstrings(t *testing.T) {
+	const proxyURL = "http://proxy:dial@proxy.example:8080"
+	message := maskTraceMessage("dial proxy.example failed; proxy connection closed", proxyURL)
+	if message != "dial proxy.example failed; proxy connection closed" {
+		t.Fatalf("masked message corrupted diagnostics: %q", message)
+	}
+	explicitUserInfo := maskTraceMessage("proxy rejected proxy:dial@", proxyURL)
+	if strings.Contains(explicitUserInfo, "proxy:dial@") || !strings.Contains(explicitUserInfo, "********:********@") {
+		t.Fatalf("explicit proxy userinfo was not masked: %q", explicitUserInfo)
+	}
+}
+
+func TestMaskTraceMessageIgnoresEmptyProxyUserInfo(t *testing.T) {
+	const proxyURL = "http://@proxy.example:8080"
+	const diagnostic = "notify ops@example.com about proxy failure"
+	if message := maskTraceMessage(diagnostic, proxyURL); message != diagnostic {
+		t.Fatalf("masked message corrupted diagnostics: %q", message)
+	}
+}
+
+func TestMaskTraceMessagePreservesUnrelatedEmailWithMatchingUsername(t *testing.T) {
+	const proxyURL = "http://ops@proxy.example:8080"
+	const diagnostic = "notify ops@example.com; proxy rejected ops@proxy.example:8080"
+	message := maskTraceMessage(diagnostic, proxyURL)
+	if !strings.Contains(message, "ops@example.com") {
+		t.Fatalf("masked message corrupted unrelated email: %q", message)
+	}
+	if strings.Contains(message, "ops@proxy.example:8080") || !strings.Contains(message, "********@proxy.example:8080") {
+		t.Fatalf("masked message leaked proxy username: %q", message)
+	}
+}
+
+func TestMaskTraceMessageMasksNormalizedProxyAuthority(t *testing.T) {
+	const proxyURL = "http://user:secret@proxy.example:80"
+	message := maskTraceMessage("proxy rejected user:secret@PROXY.EXAMPLE", proxyURL)
+	if strings.Contains(message, "user:secret") || !strings.Contains(message, "********:********@PROXY.EXAMPLE") {
+		t.Fatalf("normalized authority leaked credentials: %q", message)
+	}
+
+	const usernameOnlyProxyURL = "http://ops@proxy.example:80"
+	usernameMessage := maskTraceMessage("notify ops@example.com; proxy rejected ops@PROXY.EXAMPLE", usernameOnlyProxyURL)
+	if !strings.Contains(usernameMessage, "ops@example.com") || strings.Contains(usernameMessage, "ops@PROXY.EXAMPLE") {
+		t.Fatalf("username-only normalized authority masking = %q", usernameMessage)
 	}
 }

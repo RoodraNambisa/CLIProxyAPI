@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"encoding/xml"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -35,6 +36,79 @@ func TestSanitizeObjectStoreRequestErrorRemovesPresignedURL(t *testing.T) {
 	}
 	if strings.Contains(errSanitized.Error(), "X-Amz-Credential") {
 		t.Fatalf("sanitized error leaked presigned URL: %v", errSanitized)
+	}
+}
+
+func TestObjectTokenStorePersistenceHoldsPersistentTargetThroughUpload(t *testing.T) {
+	for _, testCase := range []struct {
+		name    string
+		persist func(context.Context, *ObjectTokenStore, string) error
+	}{
+		{
+			name: "save",
+			persist: func(ctx context.Context, store *ObjectTokenStore, fileName string) error {
+				_, errSave := store.Save(ctx, &cliproxyauth.Auth{
+					ID:       fileName,
+					FileName: fileName,
+					Provider: "codex",
+					Metadata: map[string]any{"type": "codex", "access_token": "save-token"},
+				})
+				return errSave
+			},
+		},
+		{
+			name: "watcher_persistence",
+			persist: func(ctx context.Context, store *ObjectTokenStore, fileName string) error {
+				path := filepath.Join(store.AuthDir(), fileName)
+				if errWrite := os.WriteFile(path, []byte(`{"type":"codex","access_token":"watcher-token"}`), 0o600); errWrite != nil {
+					return errWrite
+				}
+				return store.PersistAuthFiles(ctx, "", path)
+			},
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			remoteStarted := make(chan struct{}, 1)
+			releaseRemote := make(chan struct{})
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch {
+				case r.Method == http.MethodGet && r.URL.RawQuery == "location=":
+					w.Header().Set("Content-Type", "application/xml")
+					_, _ = w.Write([]byte(`<?xml version="1.0" encoding="UTF-8"?><LocationConstraint xmlns="http://s3.amazonaws.com/doc/2006-03-01/"></LocationConstraint>`))
+				case r.Method == http.MethodHead:
+					w.Header().Set("Content-Type", "application/xml")
+					w.WriteHeader(http.StatusNotFound)
+				case r.Method == http.MethodPut:
+					select {
+					case remoteStarted <- struct{}{}:
+					default:
+					}
+					<-releaseRemote
+					w.Header().Set("ETag", `"saved"`)
+					w.WriteHeader(http.StatusOK)
+				default:
+					w.WriteHeader(http.StatusMethodNotAllowed)
+				}
+			}))
+			defer server.Close()
+
+			store := newObjectTokenStoreForServer(t, server.URL)
+			const fileName = "persistent-target.json"
+			operationDone := make(chan error, 1)
+			ctx := t.Context()
+			go func() {
+				operationDone <- testCase.persist(ctx, store, fileName)
+			}()
+
+			assertPersistentAuthTargetHeldDuringRemoteOperation(
+				t,
+				store.AuthDir(),
+				fileName,
+				remoteStarted,
+				releaseRemote,
+				operationDone,
+			)
+		})
 	}
 }
 
@@ -91,6 +165,398 @@ func TestObjectTokenStoreSaveRejectsPathOutsideAuthDirectory(t *testing.T) {
 	}
 	if _, errStat := os.Stat(outsidePath); !errors.Is(errStat, os.ErrNotExist) {
 		t.Fatalf("outside auth path was modified: %v", errStat)
+	}
+}
+
+func TestObjectTokenStoreSaveIfAbsentPreservesExistingLocalRecord(t *testing.T) {
+	var putCalls atomic.Int32
+	var headCalls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.RawQuery == "location=":
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`<?xml version="1.0" encoding="UTF-8"?><LocationConstraint xmlns="http://s3.amazonaws.com/doc/2006-03-01/"></LocationConstraint>`))
+		case r.Method == http.MethodHead:
+			headCalls.Add(1)
+			w.WriteHeader(http.StatusNotFound)
+		case r.Method == http.MethodPut:
+			putCalls.Add(1)
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	defer server.Close()
+	store := newObjectTokenStoreForServer(t, server.URL)
+	const (
+		fileName = "existing.json"
+		existing = `{"type":"codex","access_token":"existing-token"}`
+	)
+	path := filepath.Join(store.AuthDir(), fileName)
+	if errWrite := os.WriteFile(path, []byte(existing), 0o600); errWrite != nil {
+		t.Fatal(errWrite)
+	}
+	_, errSave := store.SaveIfAbsent(t.Context(), &cliproxyauth.Auth{
+		ID:       fileName,
+		FileName: fileName,
+		Provider: "chatgpt-web",
+		Metadata: map[string]any{"type": "chatgpt-web", "access_token": "replacement-token"},
+	})
+	if !errors.Is(errSave, cliproxyauth.ErrAuthAlreadyExists) {
+		t.Fatalf("SaveIfAbsent() error = %v, want auth already exists", errSave)
+	}
+	data, errRead := os.ReadFile(path)
+	if errRead != nil || string(data) != existing {
+		t.Fatalf("existing file changed: content=%q error=%v", data, errRead)
+	}
+	if putCalls.Load() != 0 {
+		t.Fatalf("PUT calls = %d, want 0", putCalls.Load())
+	}
+	if headCalls.Load() != 0 {
+		t.Fatalf("HEAD calls = %d, want 0", headCalls.Load())
+	}
+}
+
+func TestObjectTokenStoreSaveIfAbsentDoesNotInspectExistingRemoteRecord(t *testing.T) {
+	var objectGetCalls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.RawQuery == "location=":
+			w.Header().Set("Content-Type", "application/xml")
+			_, _ = w.Write([]byte(`<?xml version="1.0" encoding="UTF-8"?><LocationConstraint xmlns="http://s3.amazonaws.com/doc/2006-03-01/"></LocationConstraint>`))
+		case r.Method == http.MethodHead:
+			w.Header().Set("Content-Length", "49")
+			w.Header().Set("ETag", `"retired"`)
+			w.Header().Set("Last-Modified", time.Now().UTC().Format(http.TimeFormat))
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodGet:
+			objectGetCalls.Add(1)
+			w.WriteHeader(http.StatusInternalServerError)
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	defer server.Close()
+
+	store := newObjectTokenStoreForServer(t, server.URL)
+	const fileName = "existing-remote.json"
+	_, errSave := store.SaveIfAbsent(t.Context(), &cliproxyauth.Auth{
+		ID:       fileName,
+		FileName: fileName,
+		Provider: "chatgpt-web",
+		Metadata: map[string]any{"type": "chatgpt-web", "access_token": "new-token"},
+	})
+	if !errors.Is(errSave, cliproxyauth.ErrAuthAlreadyExists) {
+		t.Fatalf("SaveIfAbsent() error = %v, want auth already exists", errSave)
+	}
+	if objectGetCalls.Load() != 0 {
+		t.Fatalf("remote object GET calls = %d, want 0", objectGetCalls.Load())
+	}
+	if _, errStat := os.Stat(filepath.Join(store.AuthDir(), fileName)); !errors.Is(errStat, os.ErrNotExist) {
+		t.Fatalf("local auth exists after remote conflict: %v", errStat)
+	}
+}
+
+func TestObjectTokenStoreSaveIfAbsentReportsConcurrentRemoteCreate(t *testing.T) {
+	var headCalls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.RawQuery == "location=":
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`<?xml version="1.0" encoding="UTF-8"?><LocationConstraint xmlns="http://s3.amazonaws.com/doc/2006-03-01/"></LocationConstraint>`))
+		case r.Method == http.MethodHead:
+			if headCalls.Add(1) == 1 {
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+			w.Header().Set("ETag", `"concurrent"`)
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodPut:
+			w.WriteHeader(http.StatusPreconditionFailed)
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	defer server.Close()
+
+	store := newObjectTokenStoreForServer(t, server.URL)
+	const fileName = "concurrent.json"
+	_, errSave := store.SaveIfAbsent(t.Context(), &cliproxyauth.Auth{
+		ID:       fileName,
+		FileName: fileName,
+		Provider: "chatgpt-web",
+		Metadata: map[string]any{"type": "chatgpt-web", "access_token": "new-token"},
+	})
+	if !errors.Is(errSave, cliproxyauth.ErrAuthAlreadyExists) {
+		t.Fatalf("SaveIfAbsent() error = %v, want auth already exists", errSave)
+	}
+	if _, errStat := os.Stat(filepath.Join(store.AuthDir(), fileName)); !errors.Is(errStat, os.ErrNotExist) {
+		t.Fatalf("local auth exists after conflict: %v", errStat)
+	}
+}
+
+func TestObjectTokenStoreSaveIfAbsentReportsConditionalRequestConflictAsRolledBack(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.RawQuery == "location=":
+			w.Header().Set("Content-Type", "application/xml")
+			_, _ = w.Write([]byte(`<?xml version="1.0" encoding="UTF-8"?><LocationConstraint xmlns="http://s3.amazonaws.com/doc/2006-03-01/"></LocationConstraint>`))
+		case r.Method == http.MethodHead:
+			w.Header().Set("Content-Type", "application/xml")
+			w.WriteHeader(http.StatusNotFound)
+		case r.Method == http.MethodPut:
+			w.Header().Set("Content-Type", "application/xml")
+			w.WriteHeader(http.StatusConflict)
+			_, _ = w.Write([]byte(`<Error><Code>ConditionalRequestConflict</Code><Message>conflicting operation</Message></Error>`))
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	defer server.Close()
+
+	store := newObjectTokenStoreForServer(t, server.URL)
+	const fileName = "conditional-request-conflict.json"
+	_, errSave := store.SaveIfAbsent(t.Context(), &cliproxyauth.Auth{
+		ID:       fileName,
+		FileName: fileName,
+		Provider: "chatgpt-web",
+		Metadata: map[string]any{"type": "chatgpt-web", "access_token": "new-token"},
+	})
+	if !errors.Is(errSave, authfileguard.ErrPersistGenerationStale) {
+		t.Fatalf("SaveIfAbsent() error = %v, want stale generation", errSave)
+	}
+	if outcome, ok := cliproxyauth.SaveOutcomeFromError(errSave); !ok || outcome != cliproxyauth.SaveOutcomeRolledBack {
+		t.Fatalf("SaveIfAbsent() outcome = %v, %t; want rolled back", outcome, ok)
+	}
+	if _, errStat := os.Stat(filepath.Join(store.AuthDir(), fileName)); !errors.Is(errStat, os.ErrNotExist) {
+		t.Fatalf("local auth exists after conflict: %v", errStat)
+	}
+}
+
+func TestObjectTokenStoreSaveReportsConditionalReplacementAsRolledBack(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		statusCode int
+		errorCode  string
+	}{
+		{name: "precondition failed", statusCode: http.StatusPreconditionFailed, errorCode: "PreconditionFailed"},
+		{name: "conditional request conflict", statusCode: http.StatusConflict, errorCode: "ConditionalRequestConflict"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			const remoteData = `{"type":"codex","access_token":"existing-token"}`
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch {
+				case r.Method == http.MethodGet && r.URL.RawQuery == "location=":
+					w.Header().Set("Content-Type", "application/xml")
+					_, _ = w.Write([]byte(`<?xml version="1.0" encoding="UTF-8"?><LocationConstraint xmlns="http://s3.amazonaws.com/doc/2006-03-01/"></LocationConstraint>`))
+				case r.Method == http.MethodHead:
+					w.Header().Set("Content-Length", strconv.Itoa(len(remoteData)))
+					w.Header().Set("ETag", `"old"`)
+					w.Header().Set("Last-Modified", time.Now().UTC().Format(http.TimeFormat))
+					w.WriteHeader(http.StatusOK)
+				case r.Method == http.MethodGet:
+					w.Header().Set("Content-Length", strconv.Itoa(len(remoteData)))
+					w.Header().Set("ETag", `"old"`)
+					w.Header().Set("Last-Modified", time.Now().UTC().Format(http.TimeFormat))
+					w.WriteHeader(http.StatusOK)
+					_, _ = w.Write([]byte(remoteData))
+				case r.Method == http.MethodPut:
+					if got := r.Header.Get("If-Match"); got != `"old"` {
+						t.Errorf("If-Match = %q, want %q", got, `"old"`)
+					}
+					w.Header().Set("Content-Type", "application/xml")
+					w.WriteHeader(test.statusCode)
+					_, _ = fmt.Fprintf(w, `<Error><Code>%s</Code><Message>etag changed</Message></Error>`, test.errorCode)
+				default:
+					w.WriteHeader(http.StatusMethodNotAllowed)
+				}
+			}))
+			defer server.Close()
+
+			store := newObjectTokenStoreForServer(t, server.URL)
+			const fileName = "conditional-update.json"
+			_, errSave := store.Save(t.Context(), &cliproxyauth.Auth{
+				ID:       fileName,
+				FileName: fileName,
+				Provider: "codex",
+				Metadata: map[string]any{"type": "codex", "access_token": "replacement-token"},
+			})
+			if !errors.Is(errSave, authfileguard.ErrPersistGenerationStale) {
+				t.Fatalf("Save() error = %v, want stale generation", errSave)
+			}
+			if outcome, ok := cliproxyauth.SaveOutcomeFromError(errSave); !ok || outcome != cliproxyauth.SaveOutcomeRolledBack {
+				t.Fatalf("Save() outcome = %v, %t; want rolled back", outcome, ok)
+			}
+			if _, errStat := os.Stat(filepath.Join(store.AuthDir(), fileName)); !errors.Is(errStat, os.ErrNotExist) {
+				t.Fatalf("local auth exists after rolled-back replacement: %v", errStat)
+			}
+		})
+	}
+}
+
+func TestObjectTokenStoreSaveReportsConditionalReplacementDeletedAsRolledBack(t *testing.T) {
+	const remoteData = `{"type":"codex","access_token":"existing-token"}`
+	var deleted atomic.Bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.RawQuery == "location=":
+			w.Header().Set("Content-Type", "application/xml")
+			_, _ = w.Write([]byte(`<?xml version="1.0" encoding="UTF-8"?><LocationConstraint xmlns="http://s3.amazonaws.com/doc/2006-03-01/"></LocationConstraint>`))
+		case r.Method == http.MethodHead && deleted.Load():
+			w.Header().Set("Content-Type", "application/xml")
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`<Error><Code>NoSuchKey</Code><Message>object was deleted</Message></Error>`))
+		case r.Method == http.MethodHead:
+			w.Header().Set("Content-Length", strconv.Itoa(len(remoteData)))
+			w.Header().Set("ETag", `"old"`)
+			w.Header().Set("Last-Modified", time.Now().UTC().Format(http.TimeFormat))
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodGet:
+			w.Header().Set("Content-Length", strconv.Itoa(len(remoteData)))
+			w.Header().Set("ETag", `"old"`)
+			w.Header().Set("Last-Modified", time.Now().UTC().Format(http.TimeFormat))
+			_, _ = w.Write([]byte(remoteData))
+		case r.Method == http.MethodPut:
+			if got := r.Header.Get("If-Match"); got != `"old"` {
+				t.Errorf("If-Match = %q, want %q", got, `"old"`)
+			}
+			deleted.Store(true)
+			w.Header().Set("Content-Type", "application/xml")
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`<Error><Code>NoSuchKey</Code><Message>object was deleted</Message></Error>`))
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	defer server.Close()
+
+	store := newObjectTokenStoreForServer(t, server.URL)
+	const fileName = "conditional-update-deleted.json"
+	_, errSave := store.Save(t.Context(), &cliproxyauth.Auth{
+		ID:       fileName,
+		FileName: fileName,
+		Provider: "codex",
+		Metadata: map[string]any{"type": "codex", "access_token": "replacement-token"},
+	})
+	if !errors.Is(errSave, authfileguard.ErrPersistGenerationStale) {
+		t.Fatalf("Save() error = %v, want stale generation", errSave)
+	}
+	if outcome, ok := cliproxyauth.SaveOutcomeFromError(errSave); !ok || outcome != cliproxyauth.SaveOutcomeRolledBack {
+		t.Fatalf("Save() outcome = %v, %t; want rolled back", outcome, ok)
+	}
+	if _, errStat := os.Stat(filepath.Join(store.AuthDir(), fileName)); !errors.Is(errStat, os.ErrNotExist) {
+		t.Fatalf("local auth exists after rolled-back replacement: %v", errStat)
+	}
+}
+
+func TestObjectTokenStoreSaveIfAbsentReportsDifferentWriteAfterLostAcknowledgementAsUncertain(t *testing.T) {
+	const concurrentData = `{"type":"chatgpt-web","access_token":"concurrent"}`
+	var remoteExists atomic.Bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.RawQuery == "location=":
+			w.Header().Set("Content-Type", "application/xml")
+			_, _ = w.Write([]byte(`<?xml version="1.0" encoding="UTF-8"?><LocationConstraint xmlns="http://s3.amazonaws.com/doc/2006-03-01/"></LocationConstraint>`))
+		case r.Method == http.MethodHead:
+			if !remoteExists.Load() {
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+			w.Header().Set("ETag", `"concurrent"`)
+			w.Header().Set("Content-Length", strconv.Itoa(len(concurrentData)))
+			w.Header().Set("Last-Modified", time.Date(2026, time.July, 17, 0, 0, 0, 0, time.UTC).Format(http.TimeFormat))
+			w.Header().Set(objectStoreWriteIDMetadata, "different-write")
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodPut:
+			if _, errRead := io.Copy(io.Discard, r.Body); errRead != nil {
+				http.Error(w, errRead.Error(), http.StatusInternalServerError)
+				return
+			}
+			remoteExists.Store(true)
+			hijacker, ok := w.(http.Hijacker)
+			if !ok {
+				t.Error("test server does not support hijacking")
+				return
+			}
+			connection, _, errHijack := hijacker.Hijack()
+			if errHijack != nil {
+				t.Errorf("hijack conditional create: %v", errHijack)
+				return
+			}
+			_ = connection.Close()
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	defer server.Close()
+
+	store := newObjectTokenStoreForServer(t, server.URL)
+	const fileName = "lost-ack-conflict.json"
+	_, errSave := store.SaveIfAbsent(t.Context(), &cliproxyauth.Auth{
+		ID:       fileName,
+		FileName: fileName,
+		Provider: "chatgpt-web",
+		Metadata: map[string]any{"type": "chatgpt-web", "access_token": "new-token"},
+	})
+	if errors.Is(errSave, cliproxyauth.ErrAuthAlreadyExists) {
+		t.Fatalf("SaveIfAbsent() error = %v, must not claim a proven create conflict", errSave)
+	}
+	if outcome, ok := cliproxyauth.SaveOutcomeFromError(errSave); !ok || outcome != cliproxyauth.SaveOutcomeUncertain {
+		t.Fatalf("SaveIfAbsent() outcome = %v, %t; want uncertain", outcome, ok)
+	}
+	if _, errStat := os.Stat(filepath.Join(store.AuthDir(), fileName)); !errors.Is(errStat, os.ErrNotExist) {
+		t.Fatalf("local auth exists after concurrent remote write: %v", errStat)
+	}
+}
+
+func TestObjectTokenStoreSaveIfAbsentReportsUncertainLostAcknowledgement(t *testing.T) {
+	var headCalls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.RawQuery == "location=":
+			w.Header().Set("Content-Type", "application/xml")
+			_, _ = w.Write([]byte(`<?xml version="1.0" encoding="UTF-8"?><LocationConstraint xmlns="http://s3.amazonaws.com/doc/2006-03-01/"></LocationConstraint>`))
+		case r.Method == http.MethodHead:
+			if headCalls.Add(1) == 1 {
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+			w.WriteHeader(http.StatusInternalServerError)
+		case r.Method == http.MethodPut:
+			if _, errRead := io.Copy(io.Discard, r.Body); errRead != nil {
+				http.Error(w, errRead.Error(), http.StatusInternalServerError)
+				return
+			}
+			hijacker, ok := w.(http.Hijacker)
+			if !ok {
+				t.Error("test server does not support hijacking")
+				return
+			}
+			connection, _, errHijack := hijacker.Hijack()
+			if errHijack != nil {
+				t.Errorf("hijack conditional create: %v", errHijack)
+				return
+			}
+			_ = connection.Close()
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	defer server.Close()
+
+	store := newObjectTokenStoreForServer(t, server.URL)
+	const fileName = "lost-ack-uncertain.json"
+	_, errSave := store.SaveIfAbsent(t.Context(), &cliproxyauth.Auth{
+		ID:       fileName,
+		FileName: fileName,
+		Provider: "chatgpt-web",
+		Metadata: map[string]any{"type": "chatgpt-web", "access_token": "new-token"},
+	})
+	if outcome, ok := cliproxyauth.SaveOutcomeFromError(errSave); !ok || outcome != cliproxyauth.SaveOutcomeUncertain {
+		t.Fatalf("SaveIfAbsent() outcome = %v, %t; want uncertain; error=%v", outcome, ok, errSave)
+	}
+	if _, errStat := os.Stat(filepath.Join(store.AuthDir(), fileName)); !errors.Is(errStat, os.ErrNotExist) {
+		t.Fatalf("local auth exists after uncertain remote write: %v", errStat)
 	}
 }
 
@@ -508,9 +974,11 @@ func TestObjectTokenStoreSaveAcceptsCommittedWriteAfterLostAcknowledgement(t *te
 	for _, testCase := range []struct {
 		name            string
 		initiallyExists bool
+		cancelCaller    bool
 	}{
 		{name: "create", initiallyExists: false},
 		{name: "replace", initiallyExists: true},
+		{name: "create_after_caller_cancellation", initiallyExists: false, cancelCaller: true},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
 			committedData, errCommittedData := json.Marshal(map[string]any{
@@ -526,6 +994,13 @@ func TestObjectTokenStoreSaveAcceptsCommittedWriteAfterLostAcknowledgement(t *te
 			remoteWriteID := ""
 			putCalls := 0
 			modified := time.Date(2026, time.July, 13, 0, 0, 0, 0, time.UTC)
+			saveCtx := t.Context()
+			cancelSave := func() {}
+			if testCase.cancelCaller {
+				var cancel context.CancelFunc
+				saveCtx, cancel = context.WithCancel(t.Context())
+				cancelSave = cancel
+			}
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				switch {
 				case r.Method == http.MethodGet && r.URL.RawQuery == "location=":
@@ -589,6 +1064,7 @@ func TestObjectTokenStoreSaveAcceptsCommittedWriteAfterLostAcknowledgement(t *te
 						w.WriteHeader(http.StatusPreconditionFailed)
 						return
 					}
+					cancelSave()
 					if writeID == "" {
 						t.Error("auth PUT omitted write ID metadata")
 					}
@@ -614,14 +1090,9 @@ func TestObjectTokenStoreSaveAcceptsCommittedWriteAfterLostAcknowledgement(t *te
 				ID: "lost-ack.json", FileName: "lost-ack.json", Provider: "codex",
 				Metadata: map[string]any{"type": "codex", "access_token": "new"},
 			}
-			path, errSave := store.Save(t.Context(), auth)
+			path, errSave := store.Save(saveCtx, auth)
 			if errSave != nil {
-				mu.Lock()
-				gotPutCalls := putCalls
-				gotWriteID := remoteWriteID
-				gotRemoteData := bytes.Clone(remoteData)
-				mu.Unlock()
-				t.Fatalf("Save() error = %v; put calls=%d write ID=%q remote=%s", errSave, gotPutCalls, gotWriteID, gotRemoteData)
+				t.Fatalf("Save() error = %v", errSave)
 			}
 			localData, errRead := os.ReadFile(path)
 			if errRead != nil {
@@ -636,6 +1107,9 @@ func TestObjectTokenStoreSaveAcceptsCommittedWriteAfterLostAcknowledgement(t *te
 			}
 			if gotWriteID == "" {
 				t.Fatal("remote auth has no write ID")
+			}
+			if testCase.cancelCaller && !errors.Is(saveCtx.Err(), context.Canceled) {
+				t.Fatalf("save context error = %v, want canceled", saveCtx.Err())
 			}
 		})
 	}
@@ -1959,4 +2433,13 @@ func writeObjectVersionsResponse(w http.ResponseWriter, key string, versions ...
 		IsTruncated: false,
 		Versions:    entries,
 	})
+}
+
+func TestObjectTokenStoreRejectsReservedAuthLockPath(t *testing.T) {
+	authDir := t.TempDir()
+	store := &ObjectTokenStore{authDir: authDir}
+	path := filepath.Join(authDir, ".auth-root-lock")
+	if _, errRelative := store.relativeAuthPath(path); !errors.Is(errRelative, errReservedAuthLockPath) {
+		t.Fatalf("relativeAuthPath() error = %v, want reserved lock path", errRelative)
+	}
 }

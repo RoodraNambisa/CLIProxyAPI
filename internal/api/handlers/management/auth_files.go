@@ -26,6 +26,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/auth/antigravity"
+	chatgptwebauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/chatgptweb"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/auth/claude"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/auth/codex"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/auth/kimi"
@@ -57,14 +58,15 @@ type callbackForwarder struct {
 }
 
 var (
-	callbackForwardersMu   sync.Mutex
-	callbackForwarders     = make(map[int]*callbackForwarder)
-	errAuthFileMustBeJSON  = errors.New("auth file must be .json")
-	errInvalidAuthFileData = errors.New("invalid auth file")
-	errAuthFileNotFound    = errors.New("auth file not found")
-	errInvalidAuthFileName = errors.New("invalid auth file name")
-	errGeminiCLIAuthGone   = errors.New("Gemini CLI credentials are no longer supported")
-	errAuthFileQuarantined = errors.New("auth file deletion is still pending")
+	callbackForwardersMu    sync.Mutex
+	callbackForwarders      = make(map[int]*callbackForwarder)
+	errAuthFileMustBeJSON   = errors.New("auth file must be .json")
+	errInvalidAuthFileData  = errors.New("invalid auth file")
+	errAuthFileNotFound     = errors.New("auth file not found")
+	errInvalidAuthFileName  = errors.New("invalid auth file name")
+	errChatGPTWebAuthUpload = errors.New("chatgpt web credentials must be created through login tasks")
+	errGeminiCLIAuthGone    = errors.New("Gemini CLI credentials are no longer supported")
+	errAuthFileQuarantined  = errors.New("auth file deletion is still pending")
 )
 
 func extractLastRefreshTimestamp(meta map[string]any) (time.Time, bool) {
@@ -91,33 +93,41 @@ func parseLastRefreshValue(v any) (time.Time, bool) {
 		layouts := []string{time.RFC3339, time.RFC3339Nano, "2006-01-02 15:04:05", "2006-01-02T15:04:05Z07:00"}
 		for _, layout := range layouts {
 			if ts, err := time.Parse(layout, s); err == nil {
-				return ts.UTC(), true
+				return jsonSafeTimestamp(ts)
 			}
 		}
 		if unix, err := strconv.ParseInt(s, 10, 64); err == nil && unix > 0 {
-			return time.Unix(unix, 0).UTC(), true
+			return jsonSafeTimestamp(time.Unix(unix, 0))
 		}
 	case float64:
-		if val <= 0 {
+		if val <= 0 || val > 253402300799 {
 			return time.Time{}, false
 		}
-		return time.Unix(int64(val), 0).UTC(), true
+		return jsonSafeTimestamp(time.Unix(int64(val), 0))
 	case int64:
 		if val <= 0 {
 			return time.Time{}, false
 		}
-		return time.Unix(val, 0).UTC(), true
+		return jsonSafeTimestamp(time.Unix(val, 0))
 	case int:
 		if val <= 0 {
 			return time.Time{}, false
 		}
-		return time.Unix(int64(val), 0).UTC(), true
+		return jsonSafeTimestamp(time.Unix(int64(val), 0))
 	case json.Number:
 		if i, err := val.Int64(); err == nil && i > 0 {
-			return time.Unix(i, 0).UTC(), true
+			return jsonSafeTimestamp(time.Unix(i, 0))
 		}
 	}
 	return time.Time{}, false
+}
+
+func jsonSafeTimestamp(timestamp time.Time) (time.Time, bool) {
+	timestamp = timestamp.UTC()
+	if year := timestamp.Year(); year < 0 || year > 9999 {
+		return time.Time{}, false
+	}
+	return timestamp, true
 }
 
 func isWebUIRequest(c *gin.Context) bool {
@@ -254,13 +264,14 @@ func (h *Handler) ListAuthFiles(c *gin.Context) {
 	files := make([]gin.H, 0, len(auths))
 	managedEntryIndexes := make(map[string]int, len(auths))
 	managedEntryNames := make(map[string]int, len(auths))
+	runtimeSummaries := h.authFileRuntimeSummaries()
 	now := time.Now()
 	for _, auth := range auths {
 		managedName, managed := h.managedAuthBackingFileName(auth)
 		if managed && !isTopLevelManagedAuthName(managedName) {
 			continue
 		}
-		if entry := h.buildAuthFileEntryAt(auth, now); entry != nil {
+		if entry := h.buildAuthFileEntryAtWithRuntime(auth, now, runtimeSummaries[auth.ID]); entry != nil {
 			files = append(files, entry)
 			if managed && managedName != "" {
 				managedEntryIndexes[managedAuthNameKey(managedName)] = len(files) - 1
@@ -417,6 +428,8 @@ func (h *Handler) listAuthFilesFromDisk(c *gin.Context) {
 		return
 	}
 	files := make([]gin.H, 0)
+	runtimeSummaries := h.authFileRuntimeSummaries()
+	now := time.Now()
 	for _, diskFile := range diskFiles {
 		fileData := gin.H{
 			"name":                 diskFile.Name,
@@ -454,6 +467,20 @@ func (h *Handler) listAuthFilesFromDisk(c *gin.Context) {
 				fileData["using_api"] = effectiveXAIUsingAPIFromJSON(data)
 				fileData["websockets"] = jsonBoolField(data, "websockets")
 			}
+			if strings.EqualFold(strings.TrimSpace(typeValue), "chatgpt-web") {
+				var metadata map[string]any
+				if errUnmarshal := json.Unmarshal(data, &metadata); errUnmarshal == nil {
+					state := (&coreauth.Auth{Provider: typeValue, Metadata: metadata}).LifecycleState()
+					applyChatGPTWebMetadataSummary(fileData, metadata, state, now)
+					disabled, _ := metadata["disabled"].(bool)
+					fileData["disabled"] = disabled
+					if disabled {
+						fileData["status"] = coreauth.StatusDisabled
+					} else {
+						fileData["status"] = coreauth.RuntimeStatusForLifecycle(state)
+					}
+				}
+			}
 			if strings.EqualFold(strings.TrimSpace(typeValue), "codex") {
 				var metadata map[string]any
 				if errUnmarshal := json.Unmarshal(data, &metadata); errUnmarshal == nil {
@@ -477,6 +504,9 @@ func (h *Handler) listAuthFilesFromDisk(c *gin.Context) {
 					fileData["note"] = trimmed
 				}
 			}
+			if summary := runtimeSummaries[h.authIDForPath(path)]; summary.proxyBinding != nil {
+				fileData["proxy_binding"] = *summary.proxyBinding
+			}
 			unlockPath()
 		}
 
@@ -490,6 +520,13 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
 }
 
 func (h *Handler) buildAuthFileEntryAt(auth *coreauth.Auth, now time.Time) gin.H {
+	if auth == nil {
+		return nil
+	}
+	return h.buildAuthFileEntryAtWithRuntime(auth, now, h.authFileRuntimeSummary(auth.ID))
+}
+
+func (h *Handler) buildAuthFileEntryAtWithRuntime(auth *coreauth.Auth, now time.Time, runtimeSummary authFileRuntimeSummary) gin.H {
 	if auth == nil {
 		return nil
 	}
@@ -535,6 +572,9 @@ func (h *Handler) buildAuthFileEntryAt(auth *coreauth.Auth, now time.Time) gin.H
 		entry["using_api"] = effectiveXAIUsingAPI(auth)
 		entry["websockets"] = authBooleanValue(auth, "websockets")
 	}
+	if runtimeSummary.proxyBinding != nil {
+		entry["proxy_binding"] = *runtimeSummary.proxyBinding
+	}
 	if accountType, account := auth.AccountInfo(); accountType != "" || account != "" {
 		if accountType != "" {
 			entry["account_type"] = accountType
@@ -559,6 +599,7 @@ func (h *Handler) buildAuthFileEntryAt(auth *coreauth.Auth, now time.Time) gin.H
 			entry["last_error_status_code"] = auth.LastError.HTTPStatus
 		}
 	}
+	applyChatGPTWebAuthFileSummary(entry, auth, now)
 	if !auth.NextRetryAfter.IsZero() {
 		entry["next_retry_after"] = auth.NextRetryAfter
 	}
@@ -1541,7 +1582,7 @@ func (h *Handler) UploadAuthFile(c *gin.Context) {
 	}
 	if len(fileHeaders) == 1 {
 		if _, errUpload := h.storeUploadedAuthFile(ctx, fileHeaders[0]); errUpload != nil {
-			if errors.Is(errUpload, errAuthFileMustBeJSON) || errors.Is(errUpload, errInvalidAuthFileName) || errors.Is(errUpload, errInvalidAuthFileData) {
+			if errors.Is(errUpload, errAuthFileMustBeJSON) || errors.Is(errUpload, errInvalidAuthFileName) || errors.Is(errUpload, errInvalidAuthFileData) || errors.Is(errUpload, errChatGPTWebAuthUpload) {
 				message := errUpload.Error()
 				if errors.Is(errUpload, errAuthFileMustBeJSON) {
 					message = "file must be .json"
@@ -1576,7 +1617,7 @@ func (h *Handler) UploadAuthFile(c *gin.Context) {
 					msg = "file must be .json"
 				}
 				failure := gin.H{"name": failureName, "error": msg}
-				if errors.Is(errUpload, errAuthFileMustBeJSON) || errors.Is(errUpload, errInvalidAuthFileName) || errors.Is(errUpload, errInvalidAuthFileData) {
+				if errors.Is(errUpload, errAuthFileMustBeJSON) || errors.Is(errUpload, errInvalidAuthFileName) || errors.Is(errUpload, errInvalidAuthFileData) || errors.Is(errUpload, errChatGPTWebAuthUpload) {
 					failure["status"] = http.StatusBadRequest
 				} else if errors.Is(errUpload, errGeminiCLIAuthGone) {
 					failure["status"] = http.StatusGone
@@ -1620,7 +1661,7 @@ func (h *Handler) UploadAuthFile(c *gin.Context) {
 	}
 	if err = h.writeAuthFile(ctx, filepath.Base(name), data); err != nil {
 		status := http.StatusInternalServerError
-		if errors.Is(err, errInvalidAuthFileName) || errors.Is(err, errInvalidAuthFileData) {
+		if errors.Is(err, errInvalidAuthFileName) || errors.Is(err, errInvalidAuthFileData) || errors.Is(err, errChatGPTWebAuthUpload) {
 			status = http.StatusBadRequest
 		} else if errors.Is(err, errGeminiCLIAuthGone) {
 			status = http.StatusGone
@@ -1793,7 +1834,15 @@ func (h *Handler) writeAuthFile(ctx context.Context, name string, data []byte) e
 	if errBuild != nil {
 		return errBuild
 	}
-	errWrite := func() error {
+	if strings.EqualFold(strings.TrimSpace(auth.Provider), chatgptwebauth.Provider) {
+		return errChatGPTWebAuthUpload
+	}
+	errWrite := func() (err error) {
+		unlockRootMutation, errMutationLock := authfileguard.LockRootMutation(root)
+		if errMutationLock != nil {
+			return fmt.Errorf("lock auth directory for upload: %w", errMutationLock)
+		}
+		defer func() { err = errors.Join(err, unlockRootMutation()) }()
 		unlockPath := authfileguard.Lock(dst)
 		defer unlockPath()
 		if authfileguard.IsRetired(dst) {
@@ -1803,6 +1852,9 @@ func (h *Handler) writeAuthFile(ctx context.Context, name string, data []byte) e
 			return errAuthFileQuarantined
 		}
 		if existingData, errRead := root.ReadFile(relativePath); errRead == nil {
+			if isChatGPTWebAuthFileData(existingData) {
+				return errChatGPTWebAuthUpload
+			}
 			if errRetired := coreauth.RejectRetiredGeminiCLIAuthFileMutation(existingData); errRetired != nil {
 				authfileguard.MarkRetired(dst)
 				return errRetired
@@ -1822,6 +1874,10 @@ func (h *Handler) writeAuthFile(ctx context.Context, name string, data []byte) e
 		return err
 	}
 	return nil
+}
+
+func isChatGPTWebAuthFileData(data []byte) bool {
+	return strings.EqualFold(strings.TrimSpace(gjson.GetBytes(data, "type").String()), chatgptwebauth.Provider)
 }
 
 func writeAuthFileSafely(root *os.Root, relativePath string, data []byte) (err error) {
@@ -1855,6 +1911,9 @@ func writeAuthFileSafely(root *os.Root, relativePath string, data []byte) (err e
 	}
 	defer func() { err = errors.Join(err, unlockTarget()) }()
 	if existing, errRead := root.ReadFile(relativePath); errRead == nil {
+		if isChatGPTWebAuthFileData(existing) {
+			return errChatGPTWebAuthUpload
+		}
 		if errRetired := coreauth.RejectRetiredGeminiCLIAuthFileMutation(existing); errRetired != nil {
 			return errRetired
 		}
@@ -2062,7 +2121,7 @@ func (h *Handler) deleteAuthFileByNameAtRoot(ctx context.Context, root *os.Root,
 		return h.withTokenStore(func(store coreauth.Store) error {
 			switch builtin := store.(type) {
 			case *sdkAuth.FileTokenStore:
-				return h.deleteLocalAuthFileDurably(builtin, root, authDir, filepath.FromSlash(displayName))
+				return h.deleteLocalAuthFileDurably(operationCtx, builtin, root, authDir, filepath.FromSlash(displayName))
 			case *internalstore.GitTokenStore:
 				return builtin.DeleteAuthFileAtRoot(operationCtx, authDir, root, filepath.FromSlash(displayName))
 			case *internalstore.ObjectTokenStore:
@@ -2113,6 +2172,13 @@ func (h *Handler) deleteAuthFileByNameAtRoot(ctx context.Context, root *os.Root,
 }
 
 func removeManagedAuthFileSnapshot(root *os.Root, relativePath string, original managedAuthFileSnapshot) (resultErr error) {
+	unlockTarget, errLock := authfileguard.LockRootTarget(root, relativePath)
+	if errLock != nil {
+		return coreauth.NewDeleteOutcomeError(coreauth.DeleteOutcomeUncertain, fmt.Errorf("lock auth file after store deletion: %w", errLock))
+	}
+	defer func() {
+		resultErr = joinManagedAuthRemovalUnlock(resultErr, unlockTarget())
+	}()
 	parentRoot, leaf, closeParent, errParent := openManagedAuthSnapshotParent(root, relativePath)
 	if errParent != nil {
 		return coreauth.NewDeleteOutcomeError(coreauth.DeleteOutcomeUncertain, fmt.Errorf("open auth parent after store deletion: %w", errParent))
@@ -2130,7 +2196,7 @@ func removeManagedAuthFileSnapshot(root *os.Root, relativePath string, original 
 			resultErr = coreauth.NewDeleteOutcomeError(outcome, errors.Join(resultErr, fmt.Errorf("close auth parent after store deletion: %w", errClose)))
 		}
 	}()
-	return removeManagedAuthFileSnapshotAtParent(parentRoot, leaf, original)
+	return removeManagedAuthFileSnapshotAtParentLocked(parentRoot, leaf, original)
 }
 
 func removeManagedAuthFileSnapshotAtParent(parentRoot *os.Root, leaf string, original managedAuthFileSnapshot) (resultErr error) {
@@ -2138,20 +2204,11 @@ func removeManagedAuthFileSnapshotAtParent(parentRoot *os.Root, leaf string, ori
 	if errLock != nil {
 		return coreauth.NewDeleteOutcomeError(coreauth.DeleteOutcomeUncertain, fmt.Errorf("lock auth file after store deletion: %w", errLock))
 	}
-	defer func() {
-		if errUnlock := unlockTarget(); errUnlock != nil {
-			outcome := coreauth.DeleteOutcomeCommitted
-			if resultErr != nil {
-				if current, explicit := coreauth.DeleteOutcomeFromError(resultErr); explicit {
-					outcome = current
-				} else {
-					outcome = coreauth.DeleteOutcomeUncertain
-				}
-			}
-			resultErr = coreauth.NewDeleteOutcomeError(outcome, errors.Join(resultErr, fmt.Errorf("unlock auth file after store deletion: %w", errUnlock)))
-		}
-	}()
+	defer func() { resultErr = joinManagedAuthRemovalUnlock(resultErr, unlockTarget()) }()
+	return removeManagedAuthFileSnapshotAtParentLocked(parentRoot, leaf, original)
+}
 
+func removeManagedAuthFileSnapshotAtParentLocked(parentRoot *os.Root, leaf string, original managedAuthFileSnapshot) error {
 	current, errCurrent := captureManagedAuthFileSnapshotAtRoot(parentRoot, leaf)
 	if errCurrent != nil {
 		if errors.Is(errCurrent, fs.ErrNotExist) {
@@ -2172,6 +2229,21 @@ func removeManagedAuthFileSnapshotAtParent(parentRoot *os.Root, leaf string, ori
 		return coreauth.NewDeleteOutcomeError(coreauth.DeleteOutcomeUncertain, fmt.Errorf("sync removed auth file: %w", errSync))
 	}
 	return nil
+}
+
+func joinManagedAuthRemovalUnlock(resultErr, errUnlock error) error {
+	if errUnlock == nil {
+		return resultErr
+	}
+	outcome := coreauth.DeleteOutcomeCommitted
+	if resultErr != nil {
+		if current, explicit := coreauth.DeleteOutcomeFromError(resultErr); explicit {
+			outcome = current
+		} else {
+			outcome = coreauth.DeleteOutcomeUncertain
+		}
+	}
+	return coreauth.NewDeleteOutcomeError(outcome, errors.Join(resultErr, fmt.Errorf("unlock auth file after store deletion: %w", errUnlock)))
 }
 
 func (h *Handler) deleteCustomAuthFileDurably(ctx context.Context, store coreauth.SourceConditionalDeleteStore, storeID string, root *os.Root, authDir, relativePath, targetPath string, original managedAuthFileSnapshot) error {
@@ -2209,13 +2281,13 @@ func (h *Handler) deleteCustomAuthFileDurably(ctx context.Context, store coreaut
 	return errDelete
 }
 
-func (h *Handler) deleteLocalAuthFileDurably(store *sdkAuth.FileTokenStore, root *os.Root, authDir, name string) error {
+func (h *Handler) deleteLocalAuthFileDurably(ctx context.Context, store *sdkAuth.FileTokenStore, root *os.Root, authDir, name string) error {
 	if store == nil {
 		return coreauth.NewDeleteOutcomeError(coreauth.DeleteOutcomeRolledBack, errors.New("auth filestore is nil"))
 	}
 	preparedPath := ""
 	var deleteGeneration *authfileguard.DeleteGeneration
-	errDelete := store.DeleteAuthFileAtRootPrepared(authDir, root, name, func(_ string, data []byte) error {
+	errDelete := store.DeleteAuthFileAtRootPreparedContext(ctx, authDir, root, name, func(_ string, data []byte) error {
 		generation := authfileguard.NewDeleteGeneration(coreauth.SourceHashFromBytes(data))
 		path := filepath.Join(authDir, name)
 		if errPersist := watcher.PersistAuthDeleteQuarantine(h.configFilePath, authDir, path, generation); errPersist != nil {
@@ -2644,7 +2716,7 @@ func (h *Handler) buildAuthFromFileData(path string, data []byte) (*coreauth.Aut
 	} else if strings.EqualFold(strings.TrimSpace(provider), "chatgpt-web") {
 		state := (&coreauth.Auth{Provider: provider, Metadata: metadata}).LifecycleState()
 		status = coreauth.RuntimeStatusForLifecycle(state)
-		statusMessage = stringValue(metadata, "lifecycle_reason")
+		statusMessage = chatgptwebauth.SafeLifecycleReason(stringValue(metadata, "lifecycle_reason"))
 	}
 	auth := &coreauth.Auth{
 		ID:            authID,
@@ -2767,6 +2839,10 @@ func (h *Handler) PatchAuthFileStatus(c *gin.Context) {
 					delete(targetAuth.Metadata, key)
 				}
 			}
+		}
+		if strings.EqualFold(strings.TrimSpace(targetAuth.Provider), chatgptwebauth.Provider) {
+			targetAuth.Status = coreauth.RuntimeStatusForLifecycle(targetAuth.LifecycleState())
+			targetAuth.StatusMessage = chatgptwebauth.SafeLifecycleReason(stringValue(targetAuth.Metadata, "lifecycle_reason"))
 		}
 	}
 	targetAuth.UpdatedAt = time.Now()
@@ -3606,7 +3682,7 @@ func (h *Handler) GetAuthStatus(c *gin.Context) {
 func PopulateAuthContext(ctx context.Context, c *gin.Context) context.Context {
 	info := &coreauth.RequestInfo{
 		Query:   c.Request.URL.Query(),
-		Headers: c.Request.Header,
+		Headers: c.Request.Header.Clone(),
 	}
 	return coreauth.WithRequestInfo(ctx, info)
 }

@@ -350,7 +350,7 @@ func (e *ChatGPTWebExecutor) prepareRuntimeRequest(ctx context.Context, auth *cl
 	if err != nil {
 		return nil, err
 	}
-	canonicalBody = helps.ApplyPayloadConfigWithRequest(e.cfg, baseModel, sdktranslator.FormatCodex.String(), opts.SourceFormat.String(), "",
+	canonicalBody = helps.ApplyPayloadConfigWithRequest(e.configSnapshot(), baseModel, sdktranslator.FormatCodex.String(), opts.SourceFormat.String(), "",
 		canonicalBody, originalSource, routeModel, helps.PayloadRequestPath(opts), opts.Headers)
 	forcedTool := ""
 	if chatGPTWebSearchAlias(routeModel) || chatGPTWebOriginalRequestUsesSearch(opts.OriginalRequest) {
@@ -730,12 +730,12 @@ func (e *ChatGPTWebExecutor) FetchModels(ctx context.Context, auth *cliproxyauth
 		bootstrapHeaders,
 	)
 	if err != nil {
-		helps.RecordAPIResponseError(ctx, e.cfg, err)
+		helps.RecordAPIResponseError(ctx, e.configSnapshot(), err)
 		return nil, err
 	}
 	bootstrap, err := readChatGPTWebResponseBody(response, chatGPTWebMaxHTMLBodyBytes)
 	if err != nil {
-		helps.RecordAPIResponseError(ctx, e.cfg, err)
+		helps.RecordAPIResponseError(ctx, e.configSnapshot(), err)
 		return nil, err
 	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
@@ -754,16 +754,16 @@ func (e *ChatGPTWebExecutor) FetchModels(ctx context.Context, auth *cliproxyauth
 		headers,
 	)
 	if err != nil {
-		helps.RecordAPIResponseError(ctx, e.cfg, err)
+		helps.RecordAPIResponseError(ctx, e.configSnapshot(), err)
 		return nil, err
 	}
 	payload, err := readChatGPTWebResponseBody(response, chatGPTWebMaxJSONBodyBytes)
 	if err != nil {
-		helps.RecordAPIResponseError(ctx, e.cfg, err)
+		helps.RecordAPIResponseError(ctx, e.configSnapshot(), err)
 		return nil, err
 	}
 	sanitizedPayload := chatGPTWebResponseLogBody(path, payload)
-	helps.AppendAPIResponseChunk(ctx, e.cfg, sanitizedPayload)
+	helps.AppendAPIResponseChunk(ctx, e.configSnapshot(), sanitizedPayload)
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		return nil, newChatGPTWebStatusError(response.StatusCode, path, sanitizedPayload, response.Header)
 	}
@@ -850,12 +850,12 @@ func (e *ChatGPTWebExecutor) chatGPTWebRequirements(ctx context.Context, client 
 	})
 	response, err := e.doChatGPTWebBootstrapRequest(ctx, client, credential, baseURL+bootstrapPath, bootstrapHeaders)
 	if err != nil {
-		helps.RecordAPIResponseError(ctx, e.cfg, err)
+		helps.RecordAPIResponseError(ctx, e.configSnapshot(), err)
 		return chatGPTWebRequirements{}, err
 	}
 	bootstrap, err := readChatGPTWebResponseBody(response, chatGPTWebMaxHTMLBodyBytes)
 	if err != nil {
-		helps.RecordAPIResponseError(ctx, e.cfg, err)
+		helps.RecordAPIResponseError(ctx, e.configSnapshot(), err)
 		return chatGPTWebRequirements{}, err
 	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
@@ -964,7 +964,7 @@ func (e *ChatGPTWebExecutor) doChatGPTWebBootstrapRequest(
 		if errRequest != nil {
 			return nil, errRequest
 		}
-		helps.RecordAPIResponseMetadata(ctx, e.cfg, response.StatusCode, chatGPTWebResponseLogHeaders(response.Header))
+		helps.RecordAPIResponseMetadata(ctx, e.configSnapshot(), response.StatusCode, chatGPTWebResponseLogHeaders(response.Header))
 		if !chatGPTWebBootstrapRedirectStatus(response.StatusCode) {
 			return response, nil
 		}
@@ -1011,17 +1011,17 @@ func (e *ChatGPTWebExecutor) doChatGPTWebJSONWithHeaders(ctx context.Context, cl
 	e.recordChatGPTWebRequest(ctx, credential, http.MethodPost, path, headers, payload)
 	response, err := client.DoJSONStream(ctx, http.MethodPost, e.chatGPTWebBaseURL()+path, headers, body)
 	if err != nil {
-		helps.RecordAPIResponseError(ctx, e.cfg, err)
+		helps.RecordAPIResponseError(ctx, e.configSnapshot(), err)
 		return nil, nil, err
 	}
-	helps.RecordAPIResponseMetadata(ctx, e.cfg, response.StatusCode, chatGPTWebResponseLogHeaders(response.Header))
+	helps.RecordAPIResponseMetadata(ctx, e.configSnapshot(), response.StatusCode, chatGPTWebResponseLogHeaders(response.Header))
 	data, err := readChatGPTWebResponseBody(response, chatGPTWebMaxJSONBodyBytes)
 	if err != nil {
-		helps.RecordAPIResponseError(ctx, e.cfg, err)
+		helps.RecordAPIResponseError(ctx, e.configSnapshot(), err)
 		return response, nil, err
 	}
 	sanitizedData := chatGPTWebResponseLogBody(path, data)
-	helps.AppendAPIResponseChunk(ctx, e.cfg, sanitizedData)
+	helps.AppendAPIResponseChunk(ctx, e.configSnapshot(), sanitizedData)
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		return response, nil, newChatGPTWebStatusError(response.StatusCode, path, sanitizedData, response.Header)
 	}
@@ -1043,17 +1043,17 @@ func (e *ChatGPTWebExecutor) doChatGPTWebJSONStream(ctx context.Context, client 
 	})
 	response, err := client.DoJSONStream(traceCtx, http.MethodPost, e.chatGPTWebBaseURL()+path, headers, body)
 	if err != nil {
-		helps.RecordAPIResponseError(ctx, e.cfg, err)
+		helps.RecordAPIResponseError(ctx, e.configSnapshot(), err)
 		if requestWritten.Load() {
 			err = chatGPTWebCommittedRequestError(ctx, err)
 		}
 		return nil, err
 	}
-	helps.RecordAPIResponseMetadata(ctx, e.cfg, response.StatusCode, chatGPTWebResponseLogHeaders(response.Header))
+	helps.RecordAPIResponseMetadata(ctx, e.configSnapshot(), response.StatusCode, chatGPTWebResponseLogHeaders(response.Header))
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		data := readAndCloseChatGPTWebErrorBody(response.Body)
 		sanitizedData := chatGPTWebResponseLogBody(path, data)
-		helps.AppendAPIResponseChunk(ctx, e.cfg, sanitizedData)
+		helps.AppendAPIResponseChunk(ctx, e.configSnapshot(), sanitizedData)
 		return nil, newChatGPTWebStatusError(response.StatusCode, path, sanitizedData, response.Header)
 	}
 	return response, nil
@@ -1247,7 +1247,7 @@ func (e *ChatGPTWebExecutor) recordChatGPTWebRequest(ctx context.Context, creden
 		requestURL = e.chatGPTWebBaseURL() + path
 	}
 	requestURL = chatGPTWebRequestLogURL(requestURL)
-	helps.RecordAPIRequest(ctx, e.cfg, helps.UpstreamRequestLog{
+	helps.RecordAPIRequest(ctx, e.configSnapshot(), helps.UpstreamRequestLog{
 		URL:       requestURL,
 		Method:    method,
 		Headers:   httpHeaders,

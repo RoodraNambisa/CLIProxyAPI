@@ -852,7 +852,7 @@ func TestDeleteLocalAuthFileDurablyClearsPriorQuarantineWhenFileIsMissing(t *tes
 	}
 	defer root.Close()
 	h := NewHandler(&config.Config{AuthDir: authDir}, configPath, nil)
-	if errDelete := h.deleteLocalAuthFileDurably(sdkAuth.NewFileTokenStore(), root, authDir, fileName); errDelete != nil {
+	if errDelete := h.deleteLocalAuthFileDurably(t.Context(), sdkAuth.NewFileTokenStore(), root, authDir, fileName); errDelete != nil {
 		t.Fatalf("deleteLocalAuthFileDurably() error = %v", errDelete)
 	}
 	if authfileguard.IsQuarantined(path) {
