@@ -107,69 +107,21 @@ func TestCodexPlanTypeRefreshUpdatesPlanTypeAndListAuthFiles(t *testing.T) {
 	}
 }
 
-type codexUsageCheckProxyResolver struct {
+type codexPlanRefreshProxyResolver struct {
 	url   string
-	err   error
 	calls atomic.Int32
 }
 
-func (r *codexUsageCheckProxyResolver) Resolve(context.Context, *coreauth.Auth) (coreauth.ResolvedProxy, error) {
+func (r *codexPlanRefreshProxyResolver) Resolve(context.Context, *coreauth.Auth) (coreauth.ResolvedProxy, error) {
 	r.calls.Add(1)
-	return coreauth.ResolvedProxy{URL: r.url, Source: "test"}, r.err
+	return coreauth.ResolvedProxy{URL: r.url, Source: "test"}, nil
 }
 
-func (*codexUsageCheckProxyResolver) ReportFailure(_ context.Context, _ *coreauth.Auth, err error) error {
+func (*codexPlanRefreshProxyResolver) ReportFailure(_ context.Context, _ *coreauth.Auth, err error) error {
 	return err
 }
 
-func TestCodexPlanTypeRefreshUsageCheckDefaultsToDirect(t *testing.T) {
-	var directCalls atomic.Int32
-	directServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		directCalls.Add(1)
-		_, _ = w.Write([]byte(`{"plan_type":"team"}`))
-	}))
-	defer directServer.Close()
-
-	var proxyCalls atomic.Int32
-	proxyServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		proxyCalls.Add(1)
-		http.Error(w, "unexpected proxy request", http.StatusBadGateway)
-	}))
-	defer proxyServer.Close()
-
-	restoreUsageURL := codexPlanTypeRefreshUsageURL
-	codexPlanTypeRefreshUsageURL = directServer.URL
-	defer func() { codexPlanTypeRefreshUsageURL = restoreUsageURL }()
-
-	h, manager, _, authID := newCodexPlanRefreshTestHandler(t, map[string]any{
-		"type":         "codex",
-		"account_id":   "acct-direct",
-		"access_token": "access-direct",
-	})
-	resolver := &codexUsageCheckProxyResolver{url: proxyServer.URL}
-	manager.SetProxyResolver(resolver)
-	auth, ok := manager.GetByID(authID)
-	if !ok {
-		t.Fatal("test auth not found")
-	}
-	auth.ProxyURL = proxyServer.URL
-
-	result := h.refreshSingleCodexPlanType(manager, auth)
-	if result.Status != codexPlanTypeRefreshStatusUpdated {
-		t.Fatalf("result = %#v, want updated", result)
-	}
-	if got := resolver.calls.Load(); got != 0 {
-		t.Fatalf("proxy resolutions = %d, want 0", got)
-	}
-	if got := proxyCalls.Load(); got != 0 {
-		t.Fatalf("proxy requests = %d, want 0", got)
-	}
-	if got := directCalls.Load(); got != 1 {
-		t.Fatalf("direct requests = %d, want 1", got)
-	}
-}
-
-func TestCodexPlanTypeRefreshUsageCheckUsesResolvedProxyWhenEnabled(t *testing.T) {
+func TestCodexPlanTypeRefreshUsesResolvedProxy(t *testing.T) {
 	var proxyCalls atomic.Int32
 	proxyServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		proxyCalls.Add(1)
@@ -189,8 +141,7 @@ func TestCodexPlanTypeRefreshUsageCheckUsesResolvedProxyWhenEnabled(t *testing.T
 		"account_id":   "acct-proxy",
 		"access_token": "access-proxy",
 	})
-	h.cfg.CodexUsageCheckUseProxy = true
-	resolver := &codexUsageCheckProxyResolver{url: proxyServer.URL}
+	resolver := &codexPlanRefreshProxyResolver{url: proxyServer.URL}
 	manager.SetProxyResolver(resolver)
 	auth, ok := manager.GetByID(authID)
 	if !ok {
@@ -206,29 +157,6 @@ func TestCodexPlanTypeRefreshUsageCheckUsesResolvedProxyWhenEnabled(t *testing.T
 	}
 	if got := proxyCalls.Load(); got != 1 {
 		t.Fatalf("proxy requests = %d, want 1", got)
-	}
-}
-
-func TestCodexPlanTypeRefreshUsageCheckDoesNotBypassUnavailableProxy(t *testing.T) {
-	h, manager, _, authID := newCodexPlanRefreshTestHandler(t, map[string]any{
-		"type":         "codex",
-		"account_id":   "acct-proxy-failed",
-		"access_token": "access-proxy-failed",
-	})
-	h.cfg.CodexUsageCheckUseProxy = true
-	resolver := &codexUsageCheckProxyResolver{err: fmt.Errorf("proxy pool unavailable")}
-	manager.SetProxyResolver(resolver)
-	auth, ok := manager.GetByID(authID)
-	if !ok {
-		t.Fatal("test auth not found")
-	}
-
-	result := h.refreshSingleCodexPlanType(manager, auth)
-	if result.Status != codexPlanTypeRefreshStatusFailed || result.Error != "proxy unavailable" {
-		t.Fatalf("result = %#v, want strict proxy failure", result)
-	}
-	if got := resolver.calls.Load(); got != 1 {
-		t.Fatalf("proxy resolutions = %d, want 1", got)
 	}
 }
 

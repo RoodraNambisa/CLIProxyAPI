@@ -254,29 +254,7 @@ func (h *Handler) PutUsageStatisticsEnabled(c *gin.Context) {
 	h.updateBoolField(c, func(v bool) { h.cfg.UsageStatisticsEnabled = v })
 }
 
-// CodexUsageCheckUseProxy
-func (h *Handler) GetCodexUsageCheckUseProxy(c *gin.Context) {
-	c.JSON(200, gin.H{"codex-usage-check-use-proxy": h.codexUsageCheckUseProxy()})
-}
-func (h *Handler) PutCodexUsageCheckUseProxy(c *gin.Context) {
-	var body struct {
-		Value *bool `json:"value"`
-	}
-	if err := c.ShouldBindJSON(&body); err != nil || body.Value == nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
-		return
-	}
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	if h.cfg == nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "config not initialized"})
-		return
-	}
-	h.cfg.CodexUsageCheckUseProxy = *body.Value
-	h.persistLocked(c)
-}
-
-// LoggingToFile
+// UsageStatisticsEnabled
 func (h *Handler) GetLoggingToFile(c *gin.Context) {
 	c.JSON(200, gin.H{"logging-to-file": h.cfg.LoggingToFile})
 }
