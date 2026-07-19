@@ -587,6 +587,9 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.GET("/usage-statistics-enabled", s.mgmt.GetUsageStatisticsEnabled)
 		mgmt.PUT("/usage-statistics-enabled", s.mgmt.PutUsageStatisticsEnabled)
 		mgmt.PATCH("/usage-statistics-enabled", s.mgmt.PutUsageStatisticsEnabled)
+		mgmt.GET("/codex-usage-check-use-proxy", s.mgmt.GetCodexUsageCheckUseProxy)
+		mgmt.PUT("/codex-usage-check-use-proxy", s.mgmt.PutCodexUsageCheckUseProxy)
+		mgmt.PATCH("/codex-usage-check-use-proxy", s.mgmt.PutCodexUsageCheckUseProxy)
 
 		mgmt.GET("/proxy-url", s.mgmt.GetProxyURL)
 		mgmt.PUT("/proxy-url", s.mgmt.PutProxyURL)

@@ -262,6 +262,9 @@ type Config struct {
 	// UsageStatisticsEnabled toggles in-memory usage aggregation; when false, usage data is discarded.
 	UsageStatisticsEnabled bool `yaml:"usage-statistics-enabled" json:"usage-statistics-enabled"`
 
+	// CodexUsageCheckUseProxy routes Codex plan-type usage checks through the configured credential proxy chain.
+	CodexUsageCheckUseProxy bool `yaml:"codex-usage-check-use-proxy" json:"codex-usage-check-use-proxy"`
+
 	// UsageStatisticsPersistIntervalSeconds controls how often usage statistics
 	// are flushed to disk automatically. Set to 0 to disable periodic persistence.
 	UsageStatisticsPersistIntervalSeconds int `yaml:"usage-statistics-persist-interval-seconds" json:"usage-statistics-persist-interval-seconds"`

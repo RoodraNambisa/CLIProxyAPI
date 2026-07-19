@@ -42,6 +42,41 @@ func TestPutRequestRetry_ClampsNegativeValues(t *testing.T) {
 	}
 }
 
+func TestCodexUsageCheckUseProxyManagementSetting(t *testing.T) {
+	h := &Handler{
+		cfg:            &config.Config{},
+		configFilePath: writeTestConfigFile(t),
+	}
+
+	putRecorder := httptest.NewRecorder()
+	putContext, _ := gin.CreateTestContext(putRecorder)
+	putContext.Request = httptest.NewRequest(http.MethodPatch, "/v0/management/codex-usage-check-use-proxy", bytes.NewBufferString(`{"value":true}`))
+	putContext.Request.Header.Set("Content-Type", "application/json")
+	h.PutCodexUsageCheckUseProxy(putContext)
+	if putRecorder.Code != http.StatusOK {
+		t.Fatalf("PATCH status = %d, want %d; body=%s", putRecorder.Code, http.StatusOK, putRecorder.Body.String())
+	}
+	if !h.cfg.CodexUsageCheckUseProxy {
+		t.Fatal("codex-usage-check-use-proxy = false, want true")
+	}
+
+	getRecorder := httptest.NewRecorder()
+	getContext, _ := gin.CreateTestContext(getRecorder)
+	getContext.Request = httptest.NewRequest(http.MethodGet, "/v0/management/codex-usage-check-use-proxy", nil)
+	h.GetCodexUsageCheckUseProxy(getContext)
+	if getRecorder.Code != http.StatusOK || !strings.Contains(getRecorder.Body.String(), `"codex-usage-check-use-proxy":true`) {
+		t.Fatalf("GET status/body = %d/%s", getRecorder.Code, getRecorder.Body.String())
+	}
+
+	saved, errRead := os.ReadFile(h.configFilePath)
+	if errRead != nil {
+		t.Fatalf("ReadFile() error = %v", errRead)
+	}
+	if !strings.Contains(string(saved), "codex-usage-check-use-proxy: true") {
+		t.Fatalf("saved config missing enabled setting:\n%s", saved)
+	}
+}
+
 func TestPutRequestRetryPreservesIgnoredAmpConfig(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.yaml")

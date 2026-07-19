@@ -13,6 +13,7 @@ import (
 	"github.com/gin-gonic/gin"
 	internalcodex "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/codex"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
+	"github.com/router-for-me/CLIProxyAPI/v6/sdk/proxyutil"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -484,14 +485,6 @@ func (h *Handler) refreshSingleCodexPlanType(manager *coreauth.Manager, auth *co
 		result.Error = "account_id not found"
 		return result
 	}
-	resolvedAuth, errProxy := manager.ResolveProxyAuth(context.Background(), auth)
-	if errProxy != nil {
-		result.Status = codexPlanTypeRefreshStatusFailed
-		result.Error = "proxy unavailable"
-		return result
-	}
-	auth = resolvedAuth
-
 	accessToken := codexAccessTokenFromMetadata(auth.Metadata)
 	refreshToken := codexRefreshTokenFromMetadata(auth.Metadata)
 	forcePersist := false
@@ -521,7 +514,14 @@ func (h *Handler) refreshSingleCodexPlanType(manager *coreauth.Manager, auth *co
 		return result
 	}
 
-	planType, statusCode, err := h.fetchCodexUsagePlanType(context.Background(), auth, accessToken, accountID)
+	useProxy := h.codexUsageCheckUseProxy()
+	usageAuth, errProxy := resolveCodexUsageCheckAuth(context.Background(), manager, auth, useProxy)
+	if errProxy != nil {
+		result.Status = codexPlanTypeRefreshStatusFailed
+		result.Error = "proxy unavailable"
+		return result
+	}
+	planType, statusCode, err := h.fetchCodexUsagePlanType(context.Background(), usageAuth, accessToken, accountID, useProxy)
 	if (statusCode == http.StatusUnauthorized || statusCode == http.StatusForbidden) && refreshToken != "" {
 		auth, err = refreshCodexPlanTypeAuth(manager, auth)
 		if err != nil {
@@ -553,7 +553,14 @@ func (h *Handler) refreshSingleCodexPlanType(manager *coreauth.Manager, auth *co
 			result.Error = "access_token not found after refresh"
 			return result
 		}
-		planType, statusCode, err = h.fetchCodexUsagePlanType(context.Background(), auth, accessToken, accountID)
+		usageAuth, errProxy = resolveCodexUsageCheckAuth(context.Background(), manager, auth, useProxy)
+		if errProxy != nil {
+			result.Status = codexPlanTypeRefreshStatusFailed
+			result.HTTPStatus = statusCode
+			result.Error = "proxy unavailable"
+			return result
+		}
+		planType, statusCode, err = h.fetchCodexUsagePlanType(context.Background(), usageAuth, accessToken, accountID, useProxy)
 	}
 	if err != nil {
 		if forcePersist {
@@ -656,7 +663,23 @@ func persistCodexPlanTypeRefreshAuth(ctx context.Context, manager *coreauth.Mana
 	return err
 }
 
-func (h *Handler) fetchCodexUsagePlanType(ctx context.Context, auth *coreauth.Auth, accessToken string, accountID string) (string, int, error) {
+func (h *Handler) codexUsageCheckUseProxy() bool {
+	if h == nil {
+		return false
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.cfg != nil && h.cfg.CodexUsageCheckUseProxy
+}
+
+func resolveCodexUsageCheckAuth(ctx context.Context, manager *coreauth.Manager, auth *coreauth.Auth, useProxy bool) (*coreauth.Auth, error) {
+	if !useProxy || manager == nil {
+		return auth, nil
+	}
+	return manager.ResolveProxyAuth(ctx, auth)
+}
+
+func (h *Handler) fetchCodexUsagePlanType(ctx context.Context, auth *coreauth.Auth, accessToken string, accountID string, useProxy bool) (string, int, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -672,13 +695,19 @@ func (h *Handler) fetchCodexUsagePlanType(ctx context.Context, auth *coreauth.Au
 	req.Header.Set("User-Agent", codexPlanTypeRefreshUserAgent)
 	req.Header.Set("Chatgpt-Account-Id", strings.TrimSpace(accountID))
 
+	transport := http.RoundTripper(proxyutil.NewDirectTransport())
+	if useProxy {
+		transport = h.apiCallTransport(auth)
+	}
 	httpClient := &http.Client{
 		Timeout:   defaultAPICallTimeout,
-		Transport: h.apiCallTransport(auth),
+		Transport: transport,
 	}
 	resp, err := httpClient.Do(req)
 	if err != nil {
-		err = h.reportManagementProxyFailure(ctxRequest, auth, err)
+		if useProxy {
+			err = h.reportManagementProxyFailure(ctxRequest, auth, err)
+		}
 		return "", 0, fmt.Errorf("usage request failed: %w", err)
 	}
 	defer func() {
@@ -689,7 +718,9 @@ func (h *Handler) fetchCodexUsagePlanType(ctx context.Context, auth *coreauth.Au
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		err = h.reportManagementProxyFailure(ctxRequest, auth, err)
+		if useProxy {
+			err = h.reportManagementProxyFailure(ctxRequest, auth, err)
+		}
 		return "", resp.StatusCode, fmt.Errorf("read usage response: %w", err)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
