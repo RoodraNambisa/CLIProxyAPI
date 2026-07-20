@@ -2,6 +2,7 @@ package openai
 
 import (
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -12,6 +13,16 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/api/handlers"
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v6/sdk/config"
 )
+
+type trackedOpenAIRequestBody struct {
+	io.Reader
+	closed bool
+}
+
+func (body *trackedOpenAIRequestBody) Close() error {
+	body.closed = true
+	return nil
+}
 
 func TestReadOpenAIJSONRequestBodyWithLimitRejectsChunkedOverflow(t *testing.T) {
 	gin.SetMode(gin.TestMode)
@@ -47,7 +58,8 @@ func TestResponsesRejectsOversizedContentLengthBeforeReading(t *testing.T) {
 func TestReadOpenAIImageJSONRequestBodyUsesPublicImageLimit(t *testing.T) {
 	response := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(response)
-	request := httptest.NewRequest(http.MethodPost, "/v1/images/edits", strings.NewReader(`{}`))
+	trackedBody := &trackedOpenAIRequestBody{Reader: strings.NewReader(`{}`)}
+	request := httptest.NewRequest(http.MethodPost, "/v1/images/edits", trackedBody)
 	request.ContentLength = int64(executorhelps.ChatGPTWebMaxRequestBytes) + 1
 	c.Request = request
 
@@ -57,6 +69,30 @@ func TestReadOpenAIImageJSONRequestBodyUsesPublicImageLimit(t *testing.T) {
 	}
 	if string(body) != `{}` {
 		t.Fatalf("body = %q", body)
+	}
+	if !trackedBody.closed {
+		t.Fatal("parsed request body was not closed")
+	}
+	if request.Body != http.NoBody || request.ContentLength != 0 {
+		t.Fatalf("request body retained after parsing: body=%T contentLength=%d", request.Body, request.ContentLength)
+	}
+}
+
+func TestReadOpenAIJSONRequestBodyReleasesBodyOnOverflow(t *testing.T) {
+	response := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(response)
+	trackedBody := &trackedOpenAIRequestBody{Reader: strings.NewReader("12345")}
+	request := httptest.NewRequest(http.MethodPost, "/v1/responses", trackedBody)
+	request.ContentLength = -1
+	c.Request = request
+
+	_, err := readOpenAIJSONRequestBodyWithLimit(c, 4)
+	var maxBytesErr *http.MaxBytesError
+	if !errors.As(err, &maxBytesErr) {
+		t.Fatalf("read error = %#v, want MaxBytesError", err)
+	}
+	if !trackedBody.closed || request.Body != http.NoBody {
+		t.Fatalf("overflow request body was retained: closed=%t body=%T", trackedBody.closed, request.Body)
 	}
 }
 

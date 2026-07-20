@@ -227,12 +227,12 @@ func (h *OpenAIImagesAPIHandler) handleXAIGenerationIfRequested(c *gin.Context, 
 func (h *OpenAIImagesAPIHandler) handleXAIEditIfRequested(c *gin.Context, rawJSON []byte) bool {
 	contentType, _, _ := mime.ParseMediaType(c.GetHeader("Content-Type"))
 	if strings.EqualFold(contentType, "multipart/form-data") {
-		c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxImageMultipartBytes)
-		if err := c.Request.ParseMultipartForm(maxImageUploadBytes); err != nil {
-			h.writeImagesRequestError(c, fmt.Errorf("invalid multipart request: %w", err))
+		form, err := ensureImageMultipartForm(c)
+		if err != nil {
+			h.writeImagesRequestError(c, err)
 			return true
 		}
-		model := strings.TrimSpace(c.PostForm("model"))
+		model := multipartValue(form, "model")
 		if !isXAIImagesModel(model) {
 			return false
 		}
@@ -263,9 +263,9 @@ func (h *OpenAIImagesAPIHandler) handleXAIEditIfRequested(c *gin.Context, rawJSO
 			return true
 		}
 		responseFormat := normalizeXAIImagesResponseFormat(req.ResponseFormat)
-		aspectRatio := xaiImagesAspectRatio(c.PostForm("aspect_ratio"), "")
+		aspectRatio := xaiImagesAspectRatio(req.XAIAspectRatio, "")
 		aspectRatio = xaiImagesAspectRatioFromSize(req.Size, aspectRatio)
-		resolution := xaiImagesResolution(c.PostForm("resolution"), req.Size, "")
+		resolution := xaiImagesResolution(req.XAIResolution, req.Size, "")
 		var n int64
 		if req.N != nil {
 			n = int64(*req.N)

@@ -25,19 +25,20 @@ import (
 )
 
 type imageCaptureExecutor struct {
-	provider     string
-	calls        int
-	streamCalls  int
-	model        string
-	requested    string
-	override     string
-	payload      []byte
-	stream       bool
-	sourceFormat string
-	alt          string
-	maxResults   int
-	response     []byte
-	streamChunks []coreexecutor.StreamChunk
+	provider      string
+	calls         int
+	streamCalls   int
+	model         string
+	requested     string
+	override      string
+	payload       []byte
+	stream        bool
+	sourceFormat  string
+	alt           string
+	maxResults    int
+	response      []byte
+	streamChunks  []coreexecutor.StreamChunk
+	beforeExecute func()
 }
 
 func (e *imageCaptureExecutor) Identifier() string {
@@ -48,6 +49,9 @@ func (e *imageCaptureExecutor) Identifier() string {
 }
 
 func (e *imageCaptureExecutor) Execute(ctx context.Context, auth *coreauth.Auth, req coreexecutor.Request, opts coreexecutor.Options) (coreexecutor.Response, error) {
+	if e.beforeExecute != nil {
+		e.beforeExecute()
+	}
 	e.calls++
 	e.model = req.Model
 	e.requested = strings.TrimSpace(stringValue(opts.Metadata[coreexecutor.RequestedModelMetadataKey]))
@@ -838,7 +842,11 @@ func TestOpenAIImagesOverrideKeepsUnknownResponseFormatUnsupported(t *testing.T)
 
 func TestOpenAIImagesEditsMultipartBuildsDataURLsAndMask(t *testing.T) {
 	gin.SetMode(gin.TestMode)
-	executor := &imageCaptureExecutor{}
+	releasedBeforeExecute := false
+	var req *http.Request
+	executor := &imageCaptureExecutor{beforeExecute: func() {
+		releasedBeforeExecute = req != nil && req.Body == http.NoBody && req.MultipartForm == nil
+	}}
 	h := newImagesTestHandler(t, executor)
 	router := gin.New()
 	router.POST("/v1/images/edits", h.Edits)
@@ -871,13 +879,16 @@ func TestOpenAIImagesEditsMultipartBuildsDataURLsAndMask(t *testing.T) {
 		t.Fatalf("Close writer: %v", err)
 	}
 
-	req := httptest.NewRequest(http.MethodPost, "/v1/images/edits", &body)
+	req = httptest.NewRequest(http.MethodPost, "/v1/images/edits", &body)
 	req.Header.Set("Content-Type", writer.FormDataContentType())
 	resp := httptest.NewRecorder()
 	router.ServeHTTP(resp, req)
 
 	if resp.Code != http.StatusOK {
 		t.Fatalf("status = %d, want %d, body=%s", resp.Code, http.StatusOK, resp.Body.String())
+	}
+	if !releasedBeforeExecute {
+		t.Fatal("multipart request body and form were retained until executor invocation")
 	}
 	if got := gjson.GetBytes(executor.payload, "tools.0.action").String(); got != "edit" {
 		t.Fatalf("tool action = %q", got)
@@ -894,6 +905,67 @@ func TestOpenAIImagesEditsMultipartBuildsDataURLsAndMask(t *testing.T) {
 	if !strings.HasPrefix(maskURL, "data:image/png;base64,") {
 		t.Fatalf("mask image_url = %q", maskURL)
 	}
+}
+
+func TestDataURLFromFileHeaderStreamsAndEnforcesLimit(t *testing.T) {
+	content := []byte("\x89PNG\r\n\x1a\nimage-data")
+	fileHeader, form := imageFileHeaderForTest(t, "image.png", content)
+	defer func() { _ = form.RemoveAll() }()
+
+	dataURL, err := dataURLFromFileHeaderWithLimit(fileHeader, int64(len(content)))
+	if err != nil {
+		t.Fatalf("dataURLFromFileHeaderWithLimit() error = %v", err)
+	}
+	if !strings.HasPrefix(dataURL, "data:image/png;base64,") {
+		t.Fatalf("data URL prefix = %q", dataURL)
+	}
+	encoded := strings.TrimPrefix(dataURL, "data:image/png;base64,")
+	decoded, err := base64.StdEncoding.DecodeString(encoded)
+	if err != nil {
+		t.Fatalf("decode data URL: %v", err)
+	}
+	if !bytes.Equal(decoded, content) {
+		t.Fatalf("decoded content = %q, want %q", decoded, content)
+	}
+
+	fileHeader.Size = 0
+	if _, err = dataURLFromFileHeaderWithLimit(fileHeader, int64(len(content)-1)); err == nil || !strings.Contains(err.Error(), "exceeds") {
+		t.Fatalf("over-limit error = %v, want exceeds", err)
+	}
+}
+
+func TestDataURLFromFileHeaderRejectsEmptyFile(t *testing.T) {
+	fileHeader, form := imageFileHeaderForTest(t, "empty.png", nil)
+	defer func() { _ = form.RemoveAll() }()
+	if _, err := dataURLFromFileHeaderWithLimit(fileHeader, 1); err == nil || !strings.Contains(err.Error(), "empty") {
+		t.Fatalf("empty file error = %v", err)
+	}
+}
+
+func imageFileHeaderForTest(t *testing.T, name string, content []byte) (*multipart.FileHeader, *multipart.Form) {
+	t.Helper()
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	part, err := writer.CreateFormFile("image", name)
+	if err != nil {
+		t.Fatalf("CreateFormFile() error = %v", err)
+	}
+	if _, err = part.Write(content); err != nil {
+		t.Fatalf("write multipart file: %v", err)
+	}
+	if err = writer.Close(); err != nil {
+		t.Fatalf("close multipart writer: %v", err)
+	}
+	request := httptest.NewRequest(http.MethodPost, "/", &body)
+	request.Header.Set("Content-Type", writer.FormDataContentType())
+	if err = request.ParseMultipartForm(1); err != nil {
+		t.Fatalf("ParseMultipartForm() error = %v", err)
+	}
+	files := request.MultipartForm.File["image"]
+	if len(files) != 1 {
+		t.Fatalf("multipart files = %d, want 1", len(files))
+	}
+	return files[0], request.MultipartForm
 }
 
 func TestOpenAIImagesNativeEditsJSONForwardsFileIDs(t *testing.T) {
@@ -940,8 +1012,13 @@ func TestOpenAIImagesNativeEditsJSONForwardsFileIDs(t *testing.T) {
 
 func TestOpenAIImagesNativeEditsMultipartConvertsToDataURLJSON(t *testing.T) {
 	gin.SetMode(gin.TestMode)
+	releasedBeforeExecute := false
+	var req *http.Request
 	executor := &imageCaptureExecutor{
 		response: []byte(`{"created":1700000000,"data":[{"b64_json":"ZWRpdA=="}]}`),
+		beforeExecute: func() {
+			releasedBeforeExecute = req != nil && req.Body == http.NoBody && req.MultipartForm == nil
+		},
 	}
 	h := newImagesTestHandler(t, executor, "gpt-image-2")
 	h.Cfg.Images.Native.Edits.Enabled = true
@@ -976,13 +1053,16 @@ func TestOpenAIImagesNativeEditsMultipartConvertsToDataURLJSON(t *testing.T) {
 		t.Fatalf("Close writer: %v", err)
 	}
 
-	req := httptest.NewRequest(http.MethodPost, "/v1/images/edits", &body)
+	req = httptest.NewRequest(http.MethodPost, "/v1/images/edits", &body)
 	req.Header.Set("Content-Type", writer.FormDataContentType())
 	resp := httptest.NewRecorder()
 	router.ServeHTTP(resp, req)
 
 	if resp.Code != http.StatusOK {
 		t.Fatalf("status = %d, want %d, body=%s", resp.Code, http.StatusOK, resp.Body.String())
+	}
+	if !releasedBeforeExecute {
+		t.Fatal("native multipart request body and form were retained until executor invocation")
 	}
 	if got := gjson.GetBytes(executor.payload, "tools"); got.Exists() {
 		t.Fatalf("tools exists = %s, want absent", got.Raw)

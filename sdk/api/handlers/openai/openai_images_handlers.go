@@ -106,6 +106,8 @@ type openAIImageRequest struct {
 	ResponseFormat    string           `json:"response_format"`
 	Images            []imageReference `json:"images,omitempty"`
 	Mask              *imageReference  `json:"mask,omitempty"`
+	XAIAspectRatio    string           `json:"-"`
+	XAIResolution     string           `json:"-"`
 }
 
 type imageReference struct {
@@ -713,11 +715,11 @@ func parseJSONImageEditRequest(rawJSON []byte, allowFileID bool) (openAIImageReq
 
 func parseMultipartImageEditRequest(c *gin.Context) (openAIImageRequest, error) {
 	var req openAIImageRequest
-	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxImageMultipartBytes)
-	if err := c.Request.ParseMultipartForm(maxImageUploadBytes); err != nil {
-		return req, fmt.Errorf("invalid multipart request: %w", err)
+	form, err := ensureImageMultipartForm(c)
+	if err != nil {
+		return req, err
 	}
-	form := c.Request.MultipartForm
+	defer releaseOpenAIMultipartRequest(c)
 	req.Model = multipartValue(form, "model")
 	req.Prompt = multipartValue(form, "prompt")
 	req.Size = multipartValue(form, "size")
@@ -727,6 +729,8 @@ func parseMultipartImageEditRequest(c *gin.Context) (openAIImageRequest, error) 
 	req.InputFidelity = multipartValue(form, "input_fidelity")
 	req.Moderation = multipartValue(form, "moderation")
 	req.ResponseFormat = multipartValue(form, "response_format")
+	req.XAIAspectRatio = multipartValue(form, "aspect_ratio")
+	req.XAIResolution = multipartValue(form, "resolution")
 	req.Stream = parseBoolValue(multipartValue(form, "stream"))
 	if n, ok, err := parseOptionalInt(multipartValue(form, "n")); err != nil {
 		return req, err
@@ -764,6 +768,21 @@ func parseMultipartImageEditRequest(c *gin.Context) (openAIImageRequest, error) 
 		req.Mask = &imageReference{ImageURL: maskURL}
 	}
 	return req, nil
+}
+
+func ensureImageMultipartForm(c *gin.Context) (*multipart.Form, error) {
+	if c == nil || c.Request == nil {
+		return nil, errors.New("request is nil")
+	}
+	if c.Request.MultipartForm != nil {
+		return c.Request.MultipartForm, nil
+	}
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxImageMultipartBytes)
+	if err := c.Request.ParseMultipartForm(maxImageUploadBytes); err != nil {
+		releaseOpenAIMultipartRequest(c)
+		return nil, fmt.Errorf("invalid multipart request: %w", err)
+	}
+	return c.Request.MultipartForm, nil
 }
 
 func (h *OpenAIImagesAPIHandler) validateImageRequest(req *openAIImageRequest, op imageOperation) error {
@@ -2031,30 +2050,61 @@ func imageURLFromReference(ref imageReference) (string, error) {
 }
 
 func dataURLFromFileHeader(fh *multipart.FileHeader) (string, error) {
+	return dataURLFromFileHeaderWithLimit(fh, maxImageUploadBytes)
+}
+
+func dataURLFromFileHeaderWithLimit(fh *multipart.FileHeader, maxBytes int64) (string, error) {
 	if fh == nil {
 		return "", errors.New("image file is required")
+	}
+	if maxBytes < 1 {
+		return "", errors.New("image file limit is invalid")
+	}
+	if fh.Size > maxBytes {
+		return "", fmt.Errorf("image file %q exceeds %d bytes", fh.Filename, maxBytes)
 	}
 	file, err := fh.Open()
 	if err != nil {
 		return "", fmt.Errorf("open image file: %w", err)
 	}
 	defer func() { _ = file.Close() }()
-	limited := io.LimitReader(file, maxImageUploadBytes+1)
-	data, err := io.ReadAll(limited)
-	if err != nil {
+	limited := io.LimitReader(file, maxBytes+1)
+	var header [512]byte
+	headerBytes, err := io.ReadFull(limited, header[:])
+	if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
 		return "", fmt.Errorf("read image file: %w", err)
 	}
-	if len(data) == 0 {
+	if headerBytes == 0 {
 		return "", errors.New("image file is empty")
-	}
-	if len(data) > maxImageUploadBytes {
-		return "", fmt.Errorf("image file %q exceeds %d bytes", fh.Filename, maxImageUploadBytes)
 	}
 	mimeType := strings.TrimSpace(fh.Header.Get("Content-Type"))
 	if mimeType == "" || mimeType == "application/octet-stream" {
-		mimeType = http.DetectContentType(data)
+		mimeType = http.DetectContentType(header[:headerBytes])
 	}
-	return "data:" + mimeType + ";base64," + base64.StdEncoding.EncodeToString(data), nil
+	prefix := "data:" + mimeType + ";base64,"
+	var dataURL strings.Builder
+	if fh.Size > 0 {
+		encodedBytes := ((fh.Size + 2) / 3) * 4
+		dataURL.Grow(len(prefix) + int(encodedBytes))
+	}
+	dataURL.WriteString(prefix)
+	encoder := base64.NewEncoder(base64.StdEncoding, &dataURL)
+	if _, err = encoder.Write(header[:headerBytes]); err != nil {
+		_ = encoder.Close()
+		return "", fmt.Errorf("encode image file: %w", err)
+	}
+	copied, copyErr := io.Copy(encoder, limited)
+	closeErr := encoder.Close()
+	if copyErr != nil {
+		return "", fmt.Errorf("read image file: %w", copyErr)
+	}
+	if closeErr != nil {
+		return "", fmt.Errorf("encode image file: %w", closeErr)
+	}
+	if int64(headerBytes)+copied > maxBytes {
+		return "", fmt.Errorf("image file %q exceeds %d bytes", fh.Filename, maxBytes)
+	}
+	return dataURL.String(), nil
 }
 
 func multipartValue(form *multipart.Form, key string) string {

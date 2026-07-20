@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -528,13 +529,15 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
 	body = helps.ApplyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", body, originalTranslated, requestedModel)
 	originalTranslated = nil
-	body, _ = sjson.SetBytes(body, "model", baseModel)
-	body, _ = sjson.SetBytes(body, "stream", true)
-	body, _ = sjson.DeleteBytes(body, "previous_response_id")
-	body, _ = sjson.DeleteBytes(body, "prompt_cache_retention")
-	body, _ = sjson.DeleteBytes(body, "safety_identifier")
-	body, _ = sjson.DeleteBytes(body, "stream_options")
-	body = normalizeCodexInstructions(body)
+	body, err = helps.RewriteCodexRequestEnvelope(body, helps.CodexRequestRewriteOptions{
+		Model:              baseModel,
+		Stream:             helps.CodexStreamForceEnabled,
+		StripResponseState: true,
+		EnsureInstructions: true,
+	})
+	if err != nil {
+		return resp, err
+	}
 	body, err = e.applyDisabledImageGenerationToolPolicy(auth, body)
 	if err != nil {
 		return resp, err
@@ -606,49 +609,69 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 		err = newCodexStatusErr(httpResp.StatusCode, clientBody)
 		return resp, err
 	}
-	data, err := io.ReadAll(httpResp.Body)
-	if err != nil {
-		helps.RecordAPIResponseError(ctx, e.cfg, err)
-		return resp, err
-	}
-	upstreamData := applyCodexIdentityConfuseResponsePayload(data, identityState)
-	helps.AppendAPIResponseChunk(ctx, e.cfg, upstreamData)
-
-	lines := bytes.Split(upstreamData, []byte("\n"))
 	outputItemsByIndex := make(map[int64][]byte)
 	var outputItemsFallback [][]byte
-	for _, line := range lines {
-		if !bytes.HasPrefix(line, dataTag) {
-			continue
+	var completedEvent []byte
+	var terminalErr *statusErr
+	var terminalEvent []byte
+	var lineBuffer helps.SSELineBuffer
+	readBuffer := make([]byte, 64*1024)
+	for {
+		bytesRead, readErr := httpResp.Body.Read(readBuffer)
+		keepReading := lineBuffer.Feed(readBuffer[:bytesRead], errors.Is(readErr, io.EOF), func(rawLine []byte) bool {
+			line := applyCodexIdentityConfuseResponsePayload(rawLine, identityState)
+			helps.AppendAPIResponseChunk(ctx, e.cfg, line)
+			if terminalErr != nil || len(completedEvent) > 0 {
+				return true
+			}
+			line = bytes.TrimSpace(line)
+			if !bytes.HasPrefix(line, dataTag) {
+				return true
+			}
+
+			eventData := bytes.TrimSpace(line[len(dataTag):])
+			eventType := gjson.GetBytes(eventData, "type").String()
+			if eventType == "response.output_item.done" {
+				collectCodexOutputItemDone(eventData, outputItemsByIndex, &outputItemsFallback)
+				return true
+			}
+
+			clientEventData := applyCodexIdentityExposeResponsePayload(eventData, identityState)
+			if eventErr, ok := codexTerminalStreamError(clientEventData); ok {
+				terminalErr = &eventErr
+				terminalEvent = bytes.Clone(clientEventData)
+				return true
+			}
+			eventData = normalizeCodexCompletion(eventData)
+			if gjson.GetBytes(eventData, "type").String() != "response.completed" {
+				return true
+			}
+			completedEvent = bytes.Clone(eventData)
+			return true
+		})
+		if readErr != nil && !errors.Is(readErr, io.EOF) {
+			helps.RecordAPIResponseError(ctx, e.cfg, readErr)
+			return resp, readErr
 		}
-
-		eventData := bytes.TrimSpace(line[5:])
-		eventType := gjson.GetBytes(eventData, "type").String()
-
-		if eventType == "response.output_item.done" {
-			collectCodexOutputItemDone(eventData, outputItemsByIndex, &outputItemsFallback)
-			continue
+		if !keepReading || errors.Is(readErr, io.EOF) {
+			break
 		}
-
-		clientEventData := applyCodexIdentityExposeResponsePayload(eventData, identityState)
-		if terminalErr, ok := codexTerminalStreamError(clientEventData); ok {
-			helps.ClearCodexReasoningReplayOnInvalidSignature(replayScope, terminalErr.code, clientEventData)
-			err = terminalErr
-			return resp, err
-		}
-		eventData = normalizeCodexCompletion(eventData)
-		eventType = gjson.GetBytes(eventData, "type").String()
-
-		if eventType != "response.completed" {
-			continue
-		}
-
-		if detail, ok := helps.ParseCodexUsage(eventData); ok {
+	}
+	if terminalErr != nil {
+		helps.ClearCodexReasoningReplayOnInvalidSignature(replayScope, terminalErr.code, terminalEvent)
+		err = *terminalErr
+		return resp, err
+	}
+	if len(completedEvent) > 0 {
+		if detail, ok := helps.ParseCodexUsage(completedEvent); ok {
 			reporter.Publish(ctx, detail)
 		}
-		publishCodexImageToolUsage(ctx, reporter, bodyRef.Bytes(), eventData)
+		publishCodexImageToolUsage(ctx, reporter, bodyRef.Bytes(), completedEvent)
 
-		completedData := patchCodexCompletedOutput(eventData, outputItemsByIndex, outputItemsFallback)
+		completedData := patchCodexCompletedOutput(completedEvent, outputItemsByIndex, outputItemsFallback)
+		completedEvent = nil
+		outputItemsByIndex = nil
+		outputItemsFallback = nil
 		helps.CacheCodexReasoningReplayFromCompleted(replayScope, completedData)
 
 		var param any
@@ -798,12 +821,15 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
 	body = helps.ApplyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", body, originalTranslated, requestedModel)
 	originalTranslated = nil
-	body, _ = sjson.DeleteBytes(body, "previous_response_id")
-	body, _ = sjson.DeleteBytes(body, "prompt_cache_retention")
-	body, _ = sjson.DeleteBytes(body, "safety_identifier")
-	body, _ = sjson.DeleteBytes(body, "stream_options")
-	body, _ = sjson.SetBytes(body, "model", baseModel)
-	body = normalizeCodexInstructions(body)
+	body, err = helps.RewriteCodexRequestEnvelope(body, helps.CodexRequestRewriteOptions{
+		Model:              baseModel,
+		Stream:             helps.CodexStreamPreserve,
+		StripResponseState: true,
+		EnsureInstructions: true,
+	})
+	if err != nil {
+		return nil, err
+	}
 	body, err = e.applyDisabledImageGenerationToolPolicy(auth, body)
 	if err != nil {
 		return nil, err

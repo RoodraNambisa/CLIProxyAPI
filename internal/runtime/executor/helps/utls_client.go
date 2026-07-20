@@ -284,13 +284,8 @@ func (t *codexNativeTLSHTTP1RoundTripper) RoundTrip(req *http.Request) (*http.Re
 	}
 
 	outReq := cloneRequestForHTTP1(req)
-	body, err := readAndCloseRequestBody(outReq)
-	if err != nil {
-		conn.Close()
-		return nil, err
-	}
 	if errWrite := runConnOperationWithContext(req.Context(), conn, func() error {
-		return writeOrderedHTTP1Request(outReq, conn, body, codexHTTP1HeaderOrder, true)
+		return writeCodexNativeTLSHTTP1Request(outReq, conn)
 	}); errWrite != nil {
 		conn.Close()
 		return nil, errWrite
@@ -374,7 +369,50 @@ func readAndCloseRequestBody(req *http.Request) ([]byte, error) {
 	return body, nil
 }
 
+func writeCodexNativeTLSHTTP1Request(req *http.Request, w io.Writer) error {
+	if req == nil {
+		return fmt.Errorf("codex native tls http1: request is nil")
+	}
+	if req.Body == nil || req.Body == http.NoBody {
+		req.Body = http.NoBody
+		req.ContentLength = 0
+		return writeOrderedHTTP1RequestStream(req, w, nil, 0, codexHTTP1HeaderOrder, true)
+	}
+	if req.ContentLength > 0 {
+		body := req.Body
+		errWrite := writeOrderedHTTP1RequestStream(req, w, body, req.ContentLength, codexHTTP1HeaderOrder, true)
+		errClose := body.Close()
+		req.Body = http.NoBody
+		if errWrite != nil {
+			return errWrite
+		}
+		return errClose
+	}
+
+	body, err := readAndCloseRequestBody(req)
+	if err != nil {
+		return err
+	}
+	errWrite := writeOrderedHTTP1Request(req, w, body, codexHTTP1HeaderOrder, true)
+	errClose := req.Body.Close()
+	req.Body = http.NoBody
+	if errWrite != nil {
+		return errWrite
+	}
+	return errClose
+}
+
 func writeOrderedHTTP1Request(req *http.Request, w io.Writer, body []byte, order []orderedHeaderSpec, includeBody bool) error {
+	bodyLength := req.ContentLength
+	var reader io.Reader
+	if body != nil {
+		bodyLength = int64(len(body))
+		reader = bytes.NewReader(body)
+	}
+	return writeOrderedHTTP1RequestStream(req, w, reader, bodyLength, order, includeBody)
+}
+
+func writeOrderedHTTP1RequestStream(req *http.Request, w io.Writer, body io.Reader, bodyLength int64, order []orderedHeaderSpec, includeBody bool) error {
 	if req == nil || req.URL == nil {
 		return fmt.Errorf("ordered http1: request is nil")
 	}
@@ -388,7 +426,7 @@ func writeOrderedHTTP1Request(req *http.Request, w io.Writer, body []byte, order
 
 	written := make(map[string]bool, len(order))
 	for _, spec := range order {
-		values, ok := orderedHeaderValues(req, body, spec)
+		values, ok := orderedHeaderValues(req, bodyLength, spec)
 		if !ok {
 			continue
 		}
@@ -420,14 +458,14 @@ func writeOrderedHTTP1Request(req *http.Request, w io.Writer, body []byte, order
 	if _, err := io.WriteString(w, "\r\n"); err != nil {
 		return err
 	}
-	if includeBody && len(body) > 0 {
-		_, err := w.Write(body)
+	if includeBody && body != nil && bodyLength > 0 {
+		_, err := io.CopyN(w, body, bodyLength)
 		return err
 	}
 	return nil
 }
 
-func orderedHeaderValues(req *http.Request, body []byte, spec orderedHeaderSpec) ([]string, bool) {
+func orderedHeaderValues(req *http.Request, bodyLength int64, spec orderedHeaderSpec) ([]string, bool) {
 	switch strings.ToLower(spec.wireName) {
 	case "host":
 		host := req.Host
@@ -439,14 +477,10 @@ func orderedHeaderValues(req *http.Request, body []byte, spec orderedHeaderSpec)
 		}
 		return []string{host}, true
 	case "content-length":
-		if body == nil && req.ContentLength < 0 {
+		if bodyLength < 0 {
 			return nil, false
 		}
-		length := len(body)
-		if body == nil {
-			length = int(req.ContentLength)
-		}
-		return []string{fmt.Sprintf("%d", length)}, true
+		return []string{fmt.Sprintf("%d", bodyLength)}, true
 	default:
 		values := headerValuesForOrderedKeys(req.Header, spec.keys)
 		if len(values) == 0 {

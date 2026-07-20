@@ -1,6 +1,7 @@
 package middleware
 
 import (
+	"bytes"
 	"encoding/base64"
 	"io"
 	"net/http"
@@ -151,5 +152,61 @@ func TestShouldAuditRequestBodySkipsRetiredAmpRoutes(t *testing.T) {
 	apiReq := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader("blocked"))
 	if !shouldAuditRequestBody(apiReq) {
 		t.Fatal("shouldAuditRequestBody(/v1/responses) = false, want true")
+	}
+}
+
+func TestRequestBodyAuditMatchedCaseInsensitivePaths(t *testing.T) {
+	tests := []struct {
+		name    string
+		body    []byte
+		keyword []byte
+		want    bool
+	}{
+		{name: "ascii", body: []byte(`{"prompt":"DrAw A Cat"}`), keyword: []byte("draw a cat"), want: true},
+		{name: "unicode", body: []byte(`{"prompt":"STRASSE ÄNDERUNG"}`), keyword: bytes.ToLower([]byte("straße änderung")), want: false},
+		{name: "unicode exact fold", body: []byte(`{"prompt":"ÄNDERUNG"}`), keyword: bytes.ToLower([]byte("änderung")), want: true},
+		{name: "unicode fold to ascii", body: []byte(`{"prompt":"K"}`), keyword: []byte("k"), want: true},
+		{name: "binary", body: []byte{0x00, 'A', 0x01, 'b'}, keyword: []byte{0x00, 'a', 0x01, 'B'}, want: true},
+		{name: "missing", body: []byte("some payload"), keyword: []byte("absent"), want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := requestBodyAuditMatched(tt.body, [][]byte{tt.keyword}, false); got != tt.want {
+				t.Fatalf("requestBodyAuditMatched() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestRequestBodyAuditMatchedASCIIHasNoAllocations(t *testing.T) {
+	body := []byte(`{"model":"gpt-5.5","prompt":"draw a cat"}`)
+	keywords := [][]byte{[]byte("draw a cat"), []byte("blocked")}
+	allocations := testing.AllocsPerRun(1000, func() {
+		if !requestBodyAuditMatched(body, keywords, false) {
+			t.Fatal("expected keyword match")
+		}
+	})
+	if allocations != 0 {
+		t.Fatalf("allocations = %v, want 0", allocations)
+	}
+}
+
+func TestRequestBodyAuditMatchedLongASCIIUsesUnicodeFold(t *testing.T) {
+	keyword := append(bytes.Repeat([]byte("a"), 260), 'k')
+	body := append(bytes.Repeat([]byte("A"), 260), []byte("K")...)
+	if !requestBodyAuditMatched(body, [][]byte{keyword}, false) {
+		t.Fatal("long ASCII keyword did not match Unicode-folded request body")
+	}
+}
+
+func BenchmarkRequestBodyAuditMatchedASCII(b *testing.B) {
+	body := bytes.Repeat([]byte(`{"model":"gpt-5.5","prompt":"draw a cat"}`), 1024)
+	keywords := [][]byte{[]byte("draw a cat")}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		if !requestBodyAuditMatched(body, keywords, false) {
+			b.Fatal("expected keyword match")
+		}
 	}
 }

@@ -4,17 +4,20 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor/helps"
 	_ "github.com/router-for-me/CLIProxyAPI/v6/internal/translator"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
+	cliproxyusage "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/usage"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v6/sdk/translator"
 	"github.com/tidwall/gjson"
 )
@@ -98,6 +101,138 @@ func TestCodexExecutorExecute_EmptyStreamCompletionOutputUsesOutputItemDone(t *t
 		t.Fatalf("choices.0.message.content = %q, want %q; payload=%s", gotContent, "ok", string(resp.Payload))
 	}
 }
+
+func TestCodexExecutorExecuteIncrementallyParsesSSEAndPreservesUsage(t *testing.T) {
+	const authID = "codex-incremental-nonstream-usage"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		flusher, _ := w.(http.Flusher)
+		_, _ = io.WriteString(w, `data: {"type":"response.output_text.delta","delta":"ignored"}`+"\r")
+		flusher.Flush()
+		_, _ = io.WriteString(w, "\n"+`data: {"type":"response.output_item.done","output_index":0,"item":{"type":"image_generation_call","id":"img-1","result":"aW1hZ2U="}}`+"\r")
+		flusher.Flush()
+		_, _ = io.WriteString(w, `data: {"type":"response.completed","response":{"id":"resp-1","status":"completed","output":[],"usage":{"input_tokens":5,"output_tokens":7,"total_tokens":12},"tool_usage":{"image_gen":{"input_tokens":1,"output_tokens":7024,"total_tokens":7025}}}}`+"\r\r")
+	}))
+	defer server.Close()
+
+	usageRecords := make(chan cliproxyusage.Record, 4)
+	cliproxyusage.RegisterPlugin(&streamTerminalUsagePlugin{authID: authID, records: usageRecords})
+	executor := NewCodexExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{ID: authID, Attributes: map[string]string{"base_url": server.URL, "api_key": "test"}}
+	resp, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "gpt-5.4-mini",
+		Payload: []byte(`{"model":"gpt-5.4-mini","input":"draw","tools":[{"type":"image_generation","model":"gpt-image-2"}]}`),
+	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatOpenAIResponse})
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if got := gjson.GetBytes(resp.Payload, "output.0.type").String(); got != "image_generation_call" {
+		t.Fatalf("output type = %q; payload=%s", got, resp.Payload)
+	}
+
+	records := make(map[string]cliproxyusage.Record, 2)
+	deadline := time.After(5 * time.Second)
+	for len(records) < 2 {
+		select {
+		case record := <-usageRecords:
+			records[record.Model] = record
+		case <-deadline:
+			t.Fatalf("timed out waiting for usage records: %#v", records)
+		}
+	}
+	if record := records["gpt-5.4-mini"]; record.Detail.InputTokens != 5 || record.Detail.OutputTokens != 7 || record.Detail.TotalTokens != 12 {
+		t.Fatalf("primary usage = %#v", record)
+	}
+	if record := records["gpt-image-2"]; record.Detail.InputTokens != 1 || record.Detail.OutputTokens != 7024 || record.Detail.TotalTokens != 7025 {
+		t.Fatalf("image tool usage = %#v", record)
+	}
+}
+
+func TestCodexExecutorExecuteDrainsSSEAfterCompletion(t *testing.T) {
+	body := &codexDrainTrackingBody{chunks: [][]byte{
+		[]byte(`data: {"type":"response.completed","response":{"status":"completed","output":[],"usage":{"input_tokens":1,"output_tokens":2,"total_tokens":3}}}` + "\n\n"),
+		[]byte(": trailing comment\n\n"),
+	}}
+	ctx := streamTerminalContext(streamTerminalRoundTripFunc(func(*http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: body}, nil
+	}))
+	executor := NewCodexExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{"base_url": "https://example.test", "api_key": "test"}}
+	if _, err := executor.Execute(ctx, auth, cliproxyexecutor.Request{
+		Model:   "gpt-5.4-mini",
+		Payload: []byte(`{"model":"gpt-5.4-mini","input":"draw"}`),
+	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatOpenAIResponse}); err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if !body.eofObserved {
+		t.Fatal("SSE response was not drained to EOF after response.completed")
+	}
+}
+
+func TestCodexExecutorExecuteReturns408WithoutTerminalSSEEvent(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, `data: {"type":"response.output_text.delta","delta":"partial"}`+"\n")
+	}))
+	defer server.Close()
+
+	executor := NewCodexExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{"base_url": server.URL, "api_key": "test"}}
+	_, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "gpt-5.4-mini",
+		Payload: []byte(`{"model":"gpt-5.4-mini","input":"draw"}`),
+	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatOpenAIResponse})
+	if err == nil {
+		t.Fatal("Execute() error = nil, want missing terminal error")
+	}
+	status, ok := err.(interface{ StatusCode() int })
+	if !ok || status.StatusCode() != http.StatusRequestTimeout {
+		t.Fatalf("Execute() error = %v, want status 408", err)
+	}
+}
+
+func TestCodexExecutorExecutePrefersReadErrorReturnedWithTerminalData(t *testing.T) {
+	upstreamErr := errors.New("upstream read failed")
+	completed := `data: {"type":"response.completed","response":{"status":"completed","output":[],"usage":{"input_tokens":1,"output_tokens":2,"total_tokens":3}}}` + "\n\n"
+	ctx := streamTerminalContext(streamTerminalRoundTripFunc(func(*http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body: &streamTerminalErrorBody{
+				reader:      strings.NewReader(completed),
+				err:         upstreamErr,
+				errWithData: true,
+			},
+		}, nil
+	}))
+	executor := NewCodexExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{"base_url": "https://example.test", "api_key": "test"}}
+	_, err := executor.Execute(ctx, auth, cliproxyexecutor.Request{
+		Model:   "gpt-5.4-mini",
+		Payload: []byte(`{"model":"gpt-5.4-mini","input":"draw"}`),
+	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatOpenAIResponse})
+	if !errors.Is(err, upstreamErr) {
+		t.Fatalf("Execute() error = %v, want upstream read error", err)
+	}
+}
+
+type codexDrainTrackingBody struct {
+	chunks      [][]byte
+	index       int
+	eofObserved bool
+}
+
+func (body *codexDrainTrackingBody) Read(p []byte) (int, error) {
+	if body.index >= len(body.chunks) {
+		body.eofObserved = true
+		return 0, io.EOF
+	}
+	chunk := body.chunks[body.index]
+	body.index++
+	return copy(p, chunk), nil
+}
+
+func (*codexDrainTrackingBody) Close() error { return nil }
 
 func TestCodexExecutorExecute_ResponseFailedReturnsTerminalError(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

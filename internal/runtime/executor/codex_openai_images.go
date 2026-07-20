@@ -1,7 +1,6 @@
 package executor
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -16,7 +15,6 @@ import (
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v6/sdk/translator"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
-	"github.com/tidwall/sjson"
 )
 
 const (
@@ -68,19 +66,23 @@ func codexPrepareOpenAIImageBody(req cliproxyexecutor.Request, stream bool) ([]b
 	if !json.Valid(req.Payload) {
 		return nil, "", statusErr{code: http.StatusBadRequest, msg: "invalid image request JSON"}
 	}
-	body := bytes.Clone(req.Payload)
 	model := strings.TrimSpace(req.Model)
 	if model == "" {
-		model = strings.TrimSpace(gjson.GetBytes(body, "model").String())
+		model = strings.TrimSpace(gjson.GetBytes(req.Payload, "model").String())
 	}
 	if model == "" {
 		return nil, "", statusErr{code: http.StatusBadRequest, msg: "model is required"}
 	}
-	body, _ = sjson.SetBytes(body, "model", model)
+	streamMode := helps.CodexStreamRemove
 	if stream {
-		body, _ = sjson.SetBytes(body, "stream", true)
-	} else {
-		body, _ = sjson.DeleteBytes(body, "stream")
+		streamMode = helps.CodexStreamForceEnabled
+	}
+	body, err := helps.RewriteCodexRequestEnvelope(req.Payload, helps.CodexRequestRewriteOptions{
+		Model:  model,
+		Stream: streamMode,
+	})
+	if err != nil {
+		return nil, "", statusErr{code: http.StatusBadRequest, msg: err.Error()}
 	}
 	return body, model, nil
 }

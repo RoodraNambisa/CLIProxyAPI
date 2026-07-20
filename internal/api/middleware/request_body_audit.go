@@ -6,6 +6,8 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
@@ -104,16 +106,107 @@ func requestBodyAuditMatched(body []byte, keywords [][]byte, caseSensitive bool)
 	if len(body) == 0 || len(keywords) == 0 {
 		return false
 	}
-	haystack := body
-	if !caseSensitive {
-		haystack = bytes.ToLower(body)
+	if caseSensitive {
+		for _, keyword := range keywords {
+			if len(keyword) > 0 && bytes.Contains(body, keyword) {
+				return true
+			}
+		}
+		return false
 	}
+
+	var foldedBody []byte
 	for _, keyword := range keywords {
-		if len(keyword) > 0 && bytes.Contains(haystack, keyword) {
+		if len(keyword) == 0 {
+			continue
+		}
+		if asciiBytes(keyword) {
+			if containsASCIIFold(body, keyword) {
+				return true
+			}
+			continue
+		}
+		if foldedBody == nil {
+			foldedBody = bytes.ToLower(body)
+		}
+		if bytes.Contains(foldedBody, keyword) {
 			return true
 		}
 	}
 	return false
+}
+
+func asciiBytes(value []byte) bool {
+	for _, b := range value {
+		if b >= 0x80 {
+			return false
+		}
+	}
+	return true
+}
+
+func containsASCIIFold(haystack, needle []byte) bool {
+	if len(needle) == 0 {
+		return true
+	}
+	if len(needle) > len(haystack) {
+		return false
+	}
+
+	var stackPrefix [256]int
+	var prefix []int
+	if len(needle) <= len(stackPrefix) {
+		prefix = stackPrefix[:len(needle)]
+	} else {
+		prefix = make([]int, len(needle))
+	}
+
+	for index, matched := 1, 0; index < len(needle); index++ {
+		value := asciiLower(needle[index])
+		for matched > 0 && value != asciiLower(needle[matched]) {
+			matched = prefix[matched-1]
+		}
+		if value == asciiLower(needle[matched]) {
+			matched++
+		}
+		prefix[index] = matched
+	}
+
+	matched := 0
+	for index := 0; index < len(haystack); {
+		var value byte
+		if haystack[index] < utf8.RuneSelf {
+			value = asciiLower(haystack[index])
+			index++
+		} else {
+			r, size := utf8.DecodeRune(haystack[index:])
+			index += size
+			r = unicode.ToLower(r)
+			if r >= utf8.RuneSelf {
+				matched = 0
+				continue
+			}
+			value = byte(r)
+		}
+
+		for matched > 0 && value != asciiLower(needle[matched]) {
+			matched = prefix[matched-1]
+		}
+		if value == asciiLower(needle[matched]) {
+			matched++
+		}
+		if matched == len(needle) {
+			return true
+		}
+	}
+	return false
+}
+
+func asciiLower(value byte) byte {
+	if value >= 'A' && value <= 'Z' {
+		return value + ('a' - 'A')
+	}
+	return value
 }
 
 func writeRequestBodyAuditError(c *gin.Context, errCfg config.RequestBodyAuditErrorConfig) {

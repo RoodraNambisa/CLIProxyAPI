@@ -1,6 +1,7 @@
 package helps
 
 import (
+	"bytes"
 	"reflect"
 	"testing"
 )
@@ -30,5 +31,57 @@ func TestObserveSSELinesRejectsOversizedPartialLine(t *testing.T) {
 	}
 	if pending != nil {
 		t.Fatalf("pending = %q, want released buffer", pending)
+	}
+}
+
+func TestSSELineBufferSupportsChunkedLineEndings(t *testing.T) {
+	var buffer SSELineBuffer
+	var lines []string
+	visit := func(line []byte) bool {
+		lines = append(lines, string(line))
+		return true
+	}
+	for _, chunk := range [][]byte{
+		[]byte("one\r"),
+		[]byte("\ntwo\rthree\n"),
+		[]byte("four"),
+	} {
+		if !buffer.Feed(chunk, false, visit) {
+			t.Fatal("Feed() stopped unexpectedly")
+		}
+	}
+	if !buffer.Feed(nil, true, visit) {
+		t.Fatal("EOF Feed() stopped unexpectedly")
+	}
+	want := []string{"one", "two", "three", "four"}
+	if len(lines) != len(want) {
+		t.Fatalf("lines = %#v, want %#v", lines, want)
+	}
+	for index := range want {
+		if lines[index] != want[index] {
+			t.Fatalf("lines = %#v, want %#v", lines, want)
+		}
+	}
+}
+
+func TestSSELineBufferReleasesLargeCompletedLine(t *testing.T) {
+	var buffer SSELineBuffer
+	large := bytes.Repeat([]byte("x"), retainedSSELineBufferBytes+1)
+	large = append(large, '\n')
+	if !buffer.Feed(large, false, func(line []byte) bool { return len(line) == len(large)-1 }) {
+		t.Fatal("Feed() stopped unexpectedly")
+	}
+	if cap(buffer.pending) != 0 {
+		t.Fatalf("large line capacity retained = %d", cap(buffer.pending))
+	}
+}
+
+func TestSSELineBufferStopsWithoutRetainingPayload(t *testing.T) {
+	var buffer SSELineBuffer
+	if buffer.Feed([]byte("stop\nremaining"), false, func([]byte) bool { return false }) {
+		t.Fatal("Feed() continued after visitor stopped")
+	}
+	if len(buffer.pending) != 0 || cap(buffer.pending) != 0 {
+		t.Fatalf("stopped buffer retained payload: len=%d cap=%d", len(buffer.pending), cap(buffer.pending))
 	}
 }

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"net"
 	"net/http"
 	"reflect"
@@ -22,6 +23,43 @@ type observedCloseConn struct {
 	net.Conn
 	once   sync.Once
 	closed chan struct{}
+}
+
+type trackedNativeTLSBody struct {
+	data      []byte
+	offset    int
+	readCalls int
+	closed    bool
+	closeOnce sync.Once
+	closedCh  chan struct{}
+}
+
+func (body *trackedNativeTLSBody) Read(p []byte) (int, error) {
+	body.readCalls++
+	if body.offset >= len(body.data) {
+		return 0, io.EOF
+	}
+	limit := len(p)
+	if limit > 3 {
+		limit = 3
+	}
+	remaining := len(body.data) - body.offset
+	if limit > remaining {
+		limit = remaining
+	}
+	copy(p, body.data[body.offset:body.offset+limit])
+	body.offset += limit
+	return limit, nil
+}
+
+func (body *trackedNativeTLSBody) Close() error {
+	body.closed = true
+	body.closeOnce.Do(func() {
+		if body.closedCh != nil {
+			close(body.closedCh)
+		}
+	})
+	return nil
 }
 
 func (c *observedCloseConn) Close() error {
@@ -206,6 +244,93 @@ func TestWriteOrderedHTTP1RequestCodexOrder(t *testing.T) {
 	}
 	if strings.Contains(gotHeader, "Connection:") {
 		t.Fatalf("Connection header should be omitted in Codex ordered HTTP request:\n%s", gotHeader)
+	}
+}
+
+func TestWriteCodexNativeTLSHTTP1RequestStreamsKnownLengthAndClosesBody(t *testing.T) {
+	body := &trackedNativeTLSBody{data: []byte(`{"model":"gpt-5.5"}`)}
+	req, err := http.NewRequest(http.MethodPost, "https://chatgpt.com/backend-api/codex/responses", body)
+	if err != nil {
+		t.Fatalf("NewRequest() error = %v", err)
+	}
+	req.ContentLength = int64(len(body.data))
+
+	var out bytes.Buffer
+	if err = writeCodexNativeTLSHTTP1Request(req, &out); err != nil {
+		t.Fatalf("writeCodexNativeTLSHTTP1Request() error = %v", err)
+	}
+	if !body.closed || req.Body != http.NoBody {
+		t.Fatalf("request body retained: closed=%t body=%T", body.closed, req.Body)
+	}
+	if body.readCalls < 2 {
+		t.Fatalf("read calls = %d, want chunked streaming reads", body.readCalls)
+	}
+	if !bytes.HasSuffix(out.Bytes(), body.data) {
+		t.Fatalf("wire body = %q, want suffix %q", out.Bytes(), body.data)
+	}
+	if !strings.Contains(out.String(), "content-length: 19\r\n") {
+		t.Fatalf("missing content length in request:\n%s", out.String())
+	}
+}
+
+func TestWriteCodexNativeTLSHTTP1RequestFallsBackForUnknownLength(t *testing.T) {
+	body := &trackedNativeTLSBody{data: []byte("unknown-length")}
+	req, err := http.NewRequest(http.MethodPost, "https://chatgpt.com/backend-api/codex/responses", body)
+	if err != nil {
+		t.Fatalf("NewRequest() error = %v", err)
+	}
+	req.ContentLength = -1
+
+	var out bytes.Buffer
+	if err = writeCodexNativeTLSHTTP1Request(req, &out); err != nil {
+		t.Fatalf("writeCodexNativeTLSHTTP1Request() error = %v", err)
+	}
+	if !body.closed || req.Body != http.NoBody {
+		t.Fatalf("fallback body retained: closed=%t body=%T", body.closed, req.Body)
+	}
+	if !strings.Contains(out.String(), "content-length: 14\r\n") || !bytes.HasSuffix(out.Bytes(), body.data) {
+		t.Fatalf("unexpected fallback request:\n%s", out.String())
+	}
+}
+
+func TestWriteCodexNativeTLSHTTP1RequestRejectsShortKnownBody(t *testing.T) {
+	body := &trackedNativeTLSBody{data: []byte("short")}
+	req, err := http.NewRequest(http.MethodPost, "https://chatgpt.com/backend-api/codex/responses", body)
+	if err != nil {
+		t.Fatalf("NewRequest() error = %v", err)
+	}
+	req.ContentLength = int64(len(body.data) + 1)
+
+	err = writeCodexNativeTLSHTTP1Request(req, io.Discard)
+	if !errors.Is(err, io.EOF) {
+		t.Fatalf("short body error = %v, want EOF", err)
+	}
+	if !body.closed || req.Body != http.NoBody {
+		t.Fatalf("short body retained: closed=%t body=%T", body.closed, req.Body)
+	}
+}
+
+func TestWriteCodexNativeTLSHTTP1RequestClosesBodyAfterCancellation(t *testing.T) {
+	client, server := net.Pipe()
+	defer func() { _ = server.Close() }()
+	body := &trackedNativeTLSBody{data: bytes.Repeat([]byte("x"), 1<<20), closedCh: make(chan struct{})}
+	req, err := http.NewRequest(http.MethodPost, "https://chatgpt.com/backend-api/codex/responses", body)
+	if err != nil {
+		t.Fatalf("NewRequest() error = %v", err)
+	}
+	req.ContentLength = int64(len(body.data))
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err = runConnOperationWithContext(ctx, client, func() error {
+		return writeCodexNativeTLSHTTP1Request(req, client)
+	})
+	if err == nil {
+		t.Fatal("cancelled write error = nil")
+	}
+	select {
+	case <-body.closedCh:
+	case <-time.After(5 * time.Second):
+		t.Fatal("request body was not closed after cancellation")
 	}
 }
 

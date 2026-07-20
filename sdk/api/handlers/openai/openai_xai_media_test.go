@@ -346,6 +346,9 @@ func TestXAIImagesMultipartEditRejectsCountAboveMaximum(t *testing.T) {
 	if resp.Code != http.StatusBadRequest || !strings.Contains(resp.Body.String(), "n must be at most 10") {
 		t.Fatalf("status = %d, body=%s", resp.Code, resp.Body.String())
 	}
+	if req.Body != http.NoBody || req.MultipartForm != nil {
+		t.Fatalf("rejected multipart request retained body or form: body=%T form=%p", req.Body, req.MultipartForm)
+	}
 	capture.mu.Lock()
 	defer capture.mu.Unlock()
 	if len(capture.payloads) != 0 {
