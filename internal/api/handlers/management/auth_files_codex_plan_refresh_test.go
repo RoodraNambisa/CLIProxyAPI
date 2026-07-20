@@ -540,6 +540,102 @@ func TestCodexPlanTypeRefreshPauseAndResume(t *testing.T) {
 	}
 }
 
+func TestCodexPlanTypeRefreshClearPausedTask(t *testing.T) {
+	firstStarted := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	var firstStartedClosed int32
+	var requestCount int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		count := atomic.AddInt32(&requestCount, 1)
+		if count == 1 {
+			if atomic.CompareAndSwapInt32(&firstStartedClosed, 0, 1) {
+				close(firstStarted)
+			}
+			<-releaseFirst
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"plan_type":"team"}`))
+	}))
+	defer server.Close()
+
+	restoreUsageURL := codexPlanTypeRefreshUsageURL
+	codexPlanTypeRefreshUsageURL = server.URL
+	defer func() { codexPlanTypeRefreshUsageURL = restoreUsageURL }()
+
+	h, manager, _, _ := newCodexPlanRefreshTestHandler(t, map[string]any{
+		"type":         "codex",
+		"email":        "first@example.com",
+		"access_token": "access-first",
+		"id_token":     testManagementCodexJWT("acct-first", "pro"),
+	})
+	addCodexPlanRefreshTestAuth(t, h, manager, "second.json", map[string]any{
+		"type":         "codex",
+		"email":        "second@example.com",
+		"access_token": "access-second",
+		"id_token":     testManagementCodexJWT("acct-second", "pro"),
+	})
+
+	postRec := performManagementRequest(t, http.MethodPost, "/v0/management/auth-files/codex/plan-type-refresh", "", h.StartCodexPlanTypeRefresh)
+	if postRec.Code != http.StatusAccepted {
+		t.Fatalf("POST status = %d, want %d; body=%s", postRec.Code, http.StatusAccepted, postRec.Body.String())
+	}
+	select {
+	case <-firstStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for first request")
+	}
+
+	pauseRec := performManagementRequest(t, http.MethodPatch, "/v0/management/auth-files/codex/plan-type-refresh", `{"action":"pause"}`, h.ControlCodexPlanTypeRefresh)
+	if pauseRec.Code != http.StatusOK {
+		t.Fatalf("pause status = %d, want %d; body=%s", pauseRec.Code, http.StatusOK, pauseRec.Body.String())
+	}
+	close(releaseFirst)
+	paused := waitForCodexPlanTypeRefreshPaused(t, h)
+	if paused.Summary.Processed != 1 {
+		t.Fatalf("processed while paused = %d, want 1", paused.Summary.Processed)
+	}
+
+	deleteRec := performManagementRequest(t, http.MethodDelete, "/v0/management/auth-files/codex/plan-type-refresh", "", h.ClearCodexPlanTypeRefresh)
+	if deleteRec.Code != http.StatusOK {
+		t.Fatalf("DELETE paused status = %d, want %d; body=%s", deleteRec.Code, http.StatusOK, deleteRec.Body.String())
+	}
+	var cleared codexPlanTypeRefreshTask
+	if err := json.Unmarshal(deleteRec.Body.Bytes(), &cleared); err != nil {
+		t.Fatalf("unmarshal DELETE response: %v", err)
+	}
+	if cleared.State != codexPlanTypeRefreshStateIdle || cleared.Running || cleared.Paused {
+		t.Fatalf("cleared state/running/paused = %q/%v/%v, want idle/false/false", cleared.State, cleared.Running, cleared.Paused)
+	}
+	if cleared.Summary.Processed != 0 || len(cleared.Results) != 0 {
+		t.Fatalf("cleared processed/results = %d/%d, want 0/0", cleared.Summary.Processed, len(cleared.Results))
+	}
+	if got := atomic.LoadInt32(&requestCount); got != 1 {
+		t.Fatalf("request count after closing paused task = %d, want 1", got)
+	}
+
+	updatedCredentials := 0
+	for _, auth := range manager.List() {
+		if effectiveCodexPlanType(auth) == "team" {
+			updatedCredentials++
+		}
+	}
+	if updatedCredentials != 1 {
+		t.Fatalf("updated credentials after closing paused task = %d, want 1", updatedCredentials)
+	}
+
+	restartRec := performManagementRequest(t, http.MethodPost, "/v0/management/auth-files/codex/plan-type-refresh", "", h.StartCodexPlanTypeRefresh)
+	if restartRec.Code != http.StatusAccepted {
+		t.Fatalf("restart POST status = %d, want %d; body=%s", restartRec.Code, http.StatusAccepted, restartRec.Body.String())
+	}
+	done := waitForCodexPlanTypeRefreshDone(t, h)
+	if done.State != codexPlanTypeRefreshStateCompleted || done.Summary.Processed != 2 {
+		t.Fatalf("restart state/processed = %q/%d, want completed/2", done.State, done.Summary.Processed)
+	}
+	if got := atomic.LoadInt32(&requestCount); got != 3 {
+		t.Fatalf("request count after restart = %d, want 3", got)
+	}
+}
+
 func TestCodexPlanTypeRefreshDoesNotOverwriteConcurrentRetention(t *testing.T) {
 	h, manager, path, authID := newCodexPlanRefreshTestHandler(t, map[string]any{
 		"type":           "codex",

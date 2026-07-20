@@ -73,9 +73,12 @@ type codexPlanTypeRefreshTask struct {
 
 	CanRetryFailed bool `json:"can_retry_failed"`
 
-	resumeCh      chan struct{}
-	targetAuthIDs []string
-	targetNames   []string
+	resumeCh        chan struct{}
+	cancelCh        chan struct{}
+	doneCh          chan struct{}
+	cancelRequested bool
+	targetAuthIDs   []string
+	targetNames     []string
 }
 
 type codexPlanTypeRefreshStartRequest struct {
@@ -122,19 +125,22 @@ func (h *Handler) StartCodexPlanTypeRefresh(c *gin.Context) {
 			return
 		}
 	}
+	doneCh := make(chan struct{})
 	h.codexPlanRefresh = codexPlanTypeRefreshTask{
 		State:         codexPlanTypeRefreshStateRunning,
 		Running:       true,
 		Mode:          mode,
 		StartedAt:     startedAt,
 		Results:       make([]codexPlanTypeRefreshResult, 0),
+		cancelCh:      make(chan struct{}),
+		doneCh:        doneCh,
 		targetAuthIDs: append([]string(nil), targetAuthIDs...),
 		targetNames:   append([]string(nil), targetNames...),
 	}
 	snapshot := h.codexPlanTypeRefreshSnapshotLocked()
 	h.codexPlanRefreshMu.Unlock()
 
-	go h.runCodexPlanTypeRefresh(manager)
+	go h.runCodexPlanTypeRefresh(manager, doneCh)
 
 	c.JSON(http.StatusAccepted, snapshot)
 }
@@ -154,6 +160,12 @@ func (h *Handler) ControlCodexPlanTypeRefresh(c *gin.Context) {
 
 	h.codexPlanRefreshMu.Lock()
 	if !h.codexPlanRefresh.Running {
+		snapshot := h.codexPlanTypeRefreshSnapshotLocked()
+		h.codexPlanRefreshMu.Unlock()
+		c.JSON(http.StatusConflict, snapshot)
+		return
+	}
+	if h.codexPlanRefresh.cancelRequested {
 		snapshot := h.codexPlanTypeRefreshSnapshotLocked()
 		h.codexPlanRefreshMu.Unlock()
 		c.JSON(http.StatusConflict, snapshot)
@@ -192,6 +204,32 @@ func (h *Handler) ClearCodexPlanTypeRefresh(c *gin.Context) {
 
 	h.codexPlanRefreshMu.Lock()
 	if h.codexPlanRefresh.Running {
+		if h.codexPlanRefresh.Paused && !h.codexPlanRefresh.PauseWanted {
+			doneCh := h.codexPlanRefresh.doneCh
+			if !h.codexPlanRefresh.cancelRequested {
+				h.codexPlanRefresh.cancelRequested = true
+				if h.codexPlanRefresh.cancelCh != nil {
+					close(h.codexPlanRefresh.cancelCh)
+				}
+			}
+			h.codexPlanRefreshMu.Unlock()
+
+			if doneCh != nil {
+				<-doneCh
+			}
+
+			h.codexPlanRefreshMu.Lock()
+			if h.codexPlanRefresh.doneCh == doneCh && h.codexPlanRefresh.cancelRequested {
+				h.codexPlanRefresh = codexPlanTypeRefreshTask{
+					State:   codexPlanTypeRefreshStateIdle,
+					Results: make([]codexPlanTypeRefreshResult, 0),
+				}
+			}
+			snapshot := h.codexPlanTypeRefreshSnapshotLocked()
+			h.codexPlanRefreshMu.Unlock()
+			c.JSON(http.StatusOK, snapshot)
+			return
+		}
 		snapshot := h.codexPlanTypeRefreshSnapshotLocked()
 		h.codexPlanRefreshMu.Unlock()
 		c.JSON(http.StatusConflict, snapshot)
@@ -233,11 +271,19 @@ func (h *Handler) codexPlanTypeRefreshSnapshotLocked() codexPlanTypeRefreshTask 
 	snapshot.targetAuthIDs = nil
 	snapshot.targetNames = nil
 	snapshot.resumeCh = nil
+	snapshot.cancelCh = nil
+	snapshot.doneCh = nil
+	snapshot.cancelRequested = false
 	snapshot.CanRetryFailed = !snapshot.Running && codexPlanTypeRefreshHasFailedResult(snapshot.Results)
 	return snapshot
 }
 
-func (h *Handler) runCodexPlanTypeRefresh(manager *coreauth.Manager) {
+func (h *Handler) runCodexPlanTypeRefresh(manager *coreauth.Manager, doneCh chan struct{}) {
+	defer func() {
+		if doneCh != nil {
+			close(doneCh)
+		}
+	}()
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			log.Errorf("management codex plan type refresh panic: %v", recovered)
@@ -373,6 +419,10 @@ func (h *Handler) waitIfCodexPlanTypeRefreshPaused() bool {
 			h.codexPlanRefreshMu.Unlock()
 			return false
 		}
+		if h.codexPlanRefresh.cancelRequested {
+			h.codexPlanRefreshMu.Unlock()
+			return false
+		}
 		if !h.codexPlanRefresh.PauseWanted && !h.codexPlanRefresh.Paused {
 			h.codexPlanRefreshMu.Unlock()
 			return true
@@ -386,8 +436,17 @@ func (h *Handler) waitIfCodexPlanTypeRefreshPaused() bool {
 			resumeCh = make(chan struct{})
 			h.codexPlanRefresh.resumeCh = resumeCh
 		}
+		cancelCh := h.codexPlanRefresh.cancelCh
 		h.codexPlanRefreshMu.Unlock()
-		<-resumeCh
+		if cancelCh == nil {
+			<-resumeCh
+			continue
+		}
+		select {
+		case <-resumeCh:
+		case <-cancelCh:
+			return false
+		}
 	}
 }
 
@@ -458,6 +517,9 @@ func (h *Handler) recordCodexPlanTypeRefreshResult(result codexPlanTypeRefreshRe
 func (h *Handler) finishCodexPlanTypeRefresh(state string) {
 	h.codexPlanRefreshMu.Lock()
 	defer h.codexPlanRefreshMu.Unlock()
+	if h.codexPlanRefresh.cancelRequested {
+		return
+	}
 	if strings.TrimSpace(state) == "" {
 		state = codexPlanTypeRefreshStateFailed
 	}
