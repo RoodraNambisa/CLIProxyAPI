@@ -138,7 +138,7 @@ func (w *Watcher) dispatchRuntimeAuthUpdate(update AuthUpdate) RuntimeAuthUpdate
 				}
 				w.clientsMutex.Unlock()
 				fallback := AuthUpdate{Action: AuthUpdateActionDelete, ID: update.Auth.ID, Auth: deletedAuth}
-				if w.dispatchAuthUpdates([]AuthUpdate{fallback}) {
+				if w.dispatchAuthUpdatesWithDependencyReconcile([]AuthUpdate{fallback}) {
 					return RuntimeAuthUpdateResult{Enqueued: true, Consumed: true}
 				}
 				return RuntimeAuthUpdateResult{Fallback: &fallback}
@@ -163,7 +163,7 @@ func (w *Watcher) dispatchRuntimeAuthUpdate(update AuthUpdate) RuntimeAuthUpdate
 		}
 	}
 	w.clientsMutex.Unlock()
-	enqueued := w.dispatchAuthUpdates([]AuthUpdate{update})
+	enqueued := w.dispatchAuthUpdatesWithDependencyReconcile([]AuthUpdate{update})
 	return RuntimeAuthUpdateResult{Enqueued: enqueued, Consumed: enqueued}
 }
 
@@ -189,7 +189,7 @@ func (w *Watcher) refreshAuthState(force bool) {
 	auths = w.filterRetiredPathAuthsLocked(auths)
 	updates := w.prepareAuthUpdatesLocked(auths, force)
 	w.clientsMutex.Unlock()
-	w.dispatchAuthUpdates(updates)
+	w.dispatchAuthUpdatesWithDependencyReconcile(updates)
 }
 
 func (w *Watcher) filterRetiredPathAuthsLocked(auths []*coreauth.Auth) []*coreauth.Auth {
@@ -304,6 +304,74 @@ func (w *Watcher) dispatchAuthUpdates(updates []AuthUpdate) bool {
 	return w.dispatchAuthUpdatesLocked(updates)
 }
 
+func (w *Watcher) dispatchAuthUpdatesWithDependencyReconcile(updates []AuthUpdate) bool {
+	if w == nil {
+		return false
+	}
+	w.dispatchLifecycleMu.Lock()
+	defer w.dispatchLifecycleMu.Unlock()
+	if w.dispatchDone == nil {
+		updates = append(updates, AuthUpdate{Action: AuthUpdateActionReconcileChatGPTWebDependencies})
+		return w.dispatchAuthUpdatesLocked(updates)
+	}
+	dispatched := w.dispatchAuthUpdatesLocked(updates)
+	w.scheduleDependencyReconcileLocked()
+	return dispatched || w.dependencyPending
+}
+
+func (w *Watcher) scheduleDependencyReconcileLocked() {
+	delay := w.dependencyDebounce
+	if delay <= 0 {
+		delay = authDependencyDebounce
+	}
+	maxDelay := w.dependencyMaxDelay
+	if maxDelay <= 0 {
+		maxDelay = authDependencyMaxDelay
+	}
+	now := time.Now()
+	if !w.dependencyPending || w.dependencyFirstAt.IsZero() {
+		w.dependencyFirstAt = now
+	}
+	remaining := maxDelay - now.Sub(w.dependencyFirstAt)
+	if remaining <= 0 {
+		w.flushDependencyReconcileLocked()
+		return
+	}
+	if delay > remaining {
+		delay = remaining
+	}
+	if w.dependencyTimer != nil {
+		w.dependencyTimer.Stop()
+	}
+	w.dependencyPending = true
+	w.dependencyGeneration++
+	generation := w.dependencyGeneration
+	w.dependencyTimer = time.AfterFunc(delay, func() {
+		w.dispatchLifecycleMu.Lock()
+		defer w.dispatchLifecycleMu.Unlock()
+		if !w.dependencyPending || w.dependencyGeneration != generation {
+			return
+		}
+		w.dependencyPending = false
+		w.dependencyTimer = nil
+		w.dependencyFirstAt = time.Time{}
+		w.dispatchAuthUpdatesLocked([]AuthUpdate{{Action: AuthUpdateActionReconcileChatGPTWebDependencies}})
+	})
+}
+
+func (w *Watcher) flushDependencyReconcileLocked() {
+	if !w.dependencyPending {
+		return
+	}
+	if w.dependencyTimer != nil {
+		w.dependencyTimer.Stop()
+		w.dependencyTimer = nil
+	}
+	w.dependencyPending = false
+	w.dependencyFirstAt = time.Time{}
+	w.dispatchAuthUpdatesLocked([]AuthUpdate{{Action: AuthUpdateActionReconcileChatGPTWebDependencies}})
+}
+
 func (w *Watcher) dispatchAuthUpdatesLocked(updates []AuthUpdate) bool {
 	queue := w.getAuthQueue()
 	if queue == nil {
@@ -340,6 +408,7 @@ func (w *Watcher) WaitForAuthUpdates(ctx context.Context) error {
 	applied := make(chan struct{})
 	w.dispatchLifecycleMu.Lock()
 	dispatchDone := w.dispatchDone
+	w.flushDependencyReconcileLocked()
 	enqueued := dispatchDone != nil && w.dispatchAuthUpdatesLocked([]AuthUpdate{{Action: AuthUpdateActionBarrier, Applied: applied}})
 	w.dispatchLifecycleMu.Unlock()
 	if !enqueued {
@@ -434,6 +503,12 @@ func (w *Watcher) stopDispatch() {
 }
 
 func (w *Watcher) stopDispatchLoopLocked() {
+	if w.dependencyTimer != nil {
+		w.dependencyTimer.Stop()
+		w.dependencyTimer = nil
+	}
+	w.dependencyPending = false
+	w.dependencyFirstAt = time.Time{}
 	w.clientsMutex.Lock()
 	w.authQueue = nil
 	w.clientsMutex.Unlock()

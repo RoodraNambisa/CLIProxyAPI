@@ -25,6 +25,43 @@ import (
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 )
 
+func TestGitTokenStoreConditionalDeleteRejectsEmptySourceHash(t *testing.T) {
+	errDelete := (&GitTokenStore{}).DeleteIfSourceHashMatches(t.Context(), "auth.json", "  ")
+	if outcome, explicit := cliproxyauth.DeleteOutcomeFromError(errDelete); !explicit || outcome != cliproxyauth.DeleteOutcomeRolledBack {
+		t.Fatalf("delete error = %v, outcome=%v explicit=%t", errDelete, outcome, explicit)
+	}
+}
+
+func TestGitTokenStoreConditionalDeleteRejectsMissingRemoteGeneration(t *testing.T) {
+	root := t.TempDir()
+	remoteDir := setupGitRemoteRepository(t, root, "main", testBranchSpec{name: "main", contents: "remote default branch\n"})
+	authDir := filepath.Join(root, "workspace", "auths")
+	store := NewGitTokenStore(remoteDir, "", "", "main")
+	store.SetBaseDir(authDir)
+	if errEnsure := store.EnsureRepository(); errEnsure != nil {
+		t.Fatal(errEnsure)
+	}
+	const fileName = "missing-remote.json"
+	data := []byte(`{"type":"codex","access_token":"local"}`)
+	if errMkdir := os.MkdirAll(authDir, 0o700); errMkdir != nil {
+		t.Fatal(errMkdir)
+	}
+	path := filepath.Join(authDir, fileName)
+	if errWrite := os.WriteFile(path, data, 0o600); errWrite != nil {
+		t.Fatal(errWrite)
+	}
+	errDelete := store.DeleteIfSourceHashMatches(t.Context(), fileName, cliproxyauth.SourceHashFromBytes(data))
+	if !errors.Is(errDelete, authfileguard.ErrPersistGenerationStale) {
+		t.Fatalf("DeleteIfSourceHashMatches() error = %v, want stale generation", errDelete)
+	}
+	if outcome, explicit := cliproxyauth.DeleteOutcomeFromError(errDelete); !explicit || outcome != cliproxyauth.DeleteOutcomeRolledBack {
+		t.Fatalf("delete outcome = %v, explicit=%t", outcome, explicit)
+	}
+	if got, errRead := os.ReadFile(path); errRead != nil || !bytes.Equal(got, data) {
+		t.Fatalf("local auth = %s, %v; want %s", got, errRead, data)
+	}
+}
+
 func TestGitTokenStoreReadAuthFileSetsCanonicalSourceHash(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "auth.json")
@@ -50,6 +87,35 @@ func TestGitTokenStoreReadAuthFileSetsCanonicalSourceHash(t *testing.T) {
 	}
 	if rawHash := cliproxyauth.SourceHashFromBytes(data); rawHash == auth.Attributes[cliproxyauth.SourceHashAttributeKey] {
 		t.Fatal("expected canonical source hash to differ from raw file hash")
+	}
+}
+
+func TestGitTokenStoreSaveWithSourceHashRejectsRemoteReplacement(t *testing.T) {
+	root := t.TempDir()
+	remoteDir := setupGitRemoteRepository(t, root, "main", testBranchSpec{name: "main", contents: "remote default branch\n"})
+	const fileName = "conditional.json"
+	initial := []byte(`{"type":"codex","access_token":"initial"}`)
+	replacement := []byte(`{"type":"codex","access_token":"replacement"}`)
+	advanceRemoteBranchFile(t, filepath.Join(root, "seed"), remoteDir, "main", filepath.Join("auths", fileName), initial, "seed auth")
+
+	authDir := filepath.Join(root, "workspace", "auths")
+	store := NewGitTokenStore(remoteDir, "", "", "main")
+	store.SetBaseDir(authDir)
+	if errEnsure := store.EnsureRepository(); errEnsure != nil {
+		t.Fatal(errEnsure)
+	}
+	advanceRemoteBranchFile(t, filepath.Join(root, "seed"), remoteDir, "main", filepath.Join("auths", fileName), replacement, "replace auth")
+	auth := &cliproxyauth.Auth{
+		ID: fileName, FileName: fileName, Provider: "codex",
+		Metadata: map[string]any{"type": "codex", "access_token": "updated"},
+	}
+	ctx := cliproxyauth.WithSourceHashSavePrecondition(t.Context(), cliproxyauth.SourceHashFromBytes(initial))
+	if _, errSave := store.Save(ctx, auth); !errors.Is(errSave, authfileguard.ErrPersistGenerationStale) {
+		t.Fatalf("Save() error = %v, want stale generation", errSave)
+	}
+	assertRemoteBranchFileContents(t, remoteDir, "main", filepath.Join("auths", fileName), string(replacement))
+	if got, errRead := os.ReadFile(filepath.Join(authDir, fileName)); errRead != nil || !bytes.Equal(got, initial) {
+		t.Fatalf("local auth = %s, %v; want %s", got, errRead, initial)
 	}
 }
 
@@ -322,6 +388,29 @@ func TestGitTokenStoreReadAuthFileRestoresChatGPTWebLifecycle(t *testing.T) {
 	}
 	if auth.StatusMessage != "account_deleted" {
 		t.Fatalf("status message = %q, want account_deleted", auth.StatusMessage)
+	}
+}
+
+func TestGitTokenStoreReadAuthFileHardensChatGPTWebPermissions(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows does not expose POSIX credential modes")
+	}
+	dir := t.TempDir()
+	path := filepath.Join(dir, "auth.json")
+	data := []byte(`{"type":"chatgpt-web","access_token":"secret","password":"password"}`)
+	if errWrite := os.WriteFile(path, data, 0o644); errWrite != nil {
+		t.Fatal(errWrite)
+	}
+	store := NewGitTokenStore("", "", "", "")
+	if _, errRead := store.readAuthFile(path, dir); errRead != nil {
+		t.Fatal(errRead)
+	}
+	info, errStat := os.Stat(path)
+	if errStat != nil {
+		t.Fatal(errStat)
+	}
+	if got := info.Mode().Perm(); got != 0o600 {
+		t.Fatalf("mode = %o, want 600", got)
 	}
 }
 

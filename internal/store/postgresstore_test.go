@@ -25,6 +25,36 @@ import (
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 )
 
+func TestPostgresStoreConditionalDeleteRejectsEmptySourceHash(t *testing.T) {
+	errDelete := (&PostgresStore{}).DeleteIfSourceHashMatches(t.Context(), "auth.json", "  ")
+	if outcome, explicit := cliproxyauth.DeleteOutcomeFromError(errDelete); !explicit || outcome != cliproxyauth.DeleteOutcomeRolledBack {
+		t.Fatalf("delete error = %v, outcome=%v explicit=%t", errDelete, outcome, explicit)
+	}
+}
+
+func TestPostgresStoreConditionalDeleteRejectsMissingRemoteGeneration(t *testing.T) {
+	const fileName = "missing-remote.json"
+	backend := &postgresStoreTestBackend{authRecords: make(map[string][]byte)}
+	db := newPostgresStoreTestSQLDB(t, backend)
+	authDir := t.TempDir()
+	store := &PostgresStore{db: db, cfg: PostgresStoreConfig{AuthTable: defaultAuthTable}, authDir: authDir}
+	data := []byte(`{"type":"codex","access_token":"local"}`)
+	path := filepath.Join(authDir, fileName)
+	if errWrite := os.WriteFile(path, data, 0o600); errWrite != nil {
+		t.Fatal(errWrite)
+	}
+	errDelete := store.DeleteIfSourceHashMatches(t.Context(), fileName, cliproxyauth.SourceHashFromBytes(data))
+	if !errors.Is(errDelete, authfileguard.ErrPersistGenerationStale) {
+		t.Fatalf("DeleteIfSourceHashMatches() error = %v, want stale generation", errDelete)
+	}
+	if outcome, explicit := cliproxyauth.DeleteOutcomeFromError(errDelete); !explicit || outcome != cliproxyauth.DeleteOutcomeRolledBack {
+		t.Fatalf("delete outcome = %v, explicit=%t", outcome, explicit)
+	}
+	if got, errRead := os.ReadFile(path); errRead != nil || !bytes.Equal(got, data) {
+		t.Fatalf("local auth = %s, %v; want %s", got, errRead, data)
+	}
+}
+
 func TestPostgresStoreEnsureSchemaAddsDurableAuthRevision(t *testing.T) {
 	backend := &postgresStoreTestBackend{}
 	db := newPostgresStoreTestSQLDB(t, backend)
@@ -425,6 +455,37 @@ func TestPostgresStoreSaveMetadataOnlyUsesCanonicalPayloadAndSourceHash(t *testi
 	}
 	if got, want := execArgumentBytes(t, execs[0].args, 1), wantRaw; !bytes.Equal(got, want) {
 		t.Fatalf("persisted db payload = %s, want %s", got, want)
+	}
+}
+
+func TestPostgresStoreSaveWithSourceHashRejectsDatabaseReplacement(t *testing.T) {
+	const fileName = "conditional.json"
+	initial := []byte(`{"type":"codex","access_token":"initial"}`)
+	replacement := []byte(`{"type":"codex","access_token":"replacement"}`)
+	backend := &postgresStoreTestBackend{
+		authRecords:   map[string][]byte{fileName: replacement},
+		authRevisions: map[string]int64{fileName: 2},
+	}
+	db := newPostgresStoreTestSQLDB(t, backend)
+	authDir := t.TempDir()
+	store := &PostgresStore{db: db, cfg: PostgresStoreConfig{AuthTable: defaultAuthTable}, authDir: authDir}
+	path := filepath.Join(authDir, fileName)
+	if errWrite := os.WriteFile(path, initial, 0o600); errWrite != nil {
+		t.Fatal(errWrite)
+	}
+	auth := &cliproxyauth.Auth{
+		ID: fileName, FileName: fileName, Provider: "codex",
+		Metadata: map[string]any{"type": "codex", "access_token": "updated"},
+	}
+	ctx := cliproxyauth.WithSourceHashSavePrecondition(t.Context(), cliproxyauth.SourceHashFromBytes(initial))
+	if _, errSave := store.Save(ctx, auth); !errors.Is(errSave, authfileguard.ErrPersistGenerationStale) {
+		t.Fatalf("Save() error = %v, want stale generation", errSave)
+	}
+	if got, ok := backend.authRecordSnapshot(fileName); !ok || !bytes.Equal(got, replacement) {
+		t.Fatalf("database auth = %s, %t; want %s", got, ok, replacement)
+	}
+	if got, errRead := os.ReadFile(path); errRead != nil || !bytes.Equal(got, initial) {
+		t.Fatalf("local auth = %s, %v; want %s", got, errRead, initial)
 	}
 }
 

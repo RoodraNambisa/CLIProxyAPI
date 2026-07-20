@@ -490,6 +490,146 @@ func TestDispatchRuntimeAuthUpdateResultReturnsDeleteFallbackWithoutQueue(t *tes
 	}
 }
 
+func TestDependencyReconcileWaitsForTransientDeleteAddSnapshots(t *testing.T) {
+	w, errWatcher := NewWatcher(filepath.Join(t.TempDir(), "config.yaml"), t.TempDir(), nil)
+	if errWatcher != nil {
+		t.Fatal(errWatcher)
+	}
+	w.dependencyDebounce = 25 * time.Millisecond
+	queue := make(chan AuthUpdate, 8)
+	w.SetAuthUpdateQueue(queue)
+	defer func() {
+		if errStop := w.Stop(); errStop != nil {
+			t.Errorf("stop watcher: %v", errStop)
+		}
+	}()
+
+	source := &coreauth.Auth{ID: "codex-source", Provider: "codex"}
+	dependent := &coreauth.Auth{ID: "web-dependent", Provider: "chatgpt-web"}
+	w.clientsMutex.Lock()
+	w.currentAuths = map[string]*coreauth.Auth{
+		source.ID:    source.Clone(),
+		dependent.ID: dependent.Clone(),
+	}
+	w.clientsMutex.Unlock()
+
+	originalSnapshot := snapshotCoreAuthsFunc
+	currentSnapshot := []*coreauth.Auth{source.Clone()}
+	snapshotCoreAuthsFunc = func(*config.Config, string) []*coreauth.Auth {
+		return currentSnapshot
+	}
+	defer func() { snapshotCoreAuthsFunc = originalSnapshot }()
+
+	deleteSeen := make(chan struct{})
+	releaseDelete := make(chan struct{})
+	consumerDone := make(chan struct{})
+	consumerCtx, cancelConsumer := context.WithCancel(t.Context())
+	defer cancelConsumer()
+	var stateMu sync.Mutex
+	dependentPresent := true
+	sourceDeleted := false
+	go func() {
+		defer close(consumerDone)
+		for {
+			select {
+			case update := <-queue:
+				switch update.Action {
+				case AuthUpdateActionDelete:
+					if update.ID == dependent.ID {
+						stateMu.Lock()
+						dependentPresent = false
+						stateMu.Unlock()
+						close(deleteSeen)
+						<-releaseDelete
+					}
+				case AuthUpdateActionAdd:
+					if update.ID == dependent.ID {
+						stateMu.Lock()
+						dependentPresent = true
+						stateMu.Unlock()
+					}
+				case AuthUpdateActionReconcileChatGPTWebDependencies:
+					stateMu.Lock()
+					if !dependentPresent {
+						sourceDeleted = true
+					}
+					stateMu.Unlock()
+				case AuthUpdateActionBarrier:
+					if update.Applied != nil {
+						close(update.Applied)
+					}
+				}
+			case <-consumerCtx.Done():
+				return
+			}
+		}
+	}()
+
+	w.refreshAuthState(false)
+	select {
+	case <-deleteSeen:
+	case <-time.After(time.Second):
+		t.Fatal("delete update was not dispatched")
+	}
+	currentSnapshot = []*coreauth.Auth{source.Clone(), dependent.Clone()}
+	w.refreshAuthState(false)
+	close(releaseDelete)
+	if errWait := w.WaitForAuthUpdates(t.Context()); errWait != nil {
+		t.Fatalf("wait for auth updates: %v", errWait)
+	}
+
+	stateMu.Lock()
+	deleted := sourceDeleted
+	present := dependentPresent
+	stateMu.Unlock()
+	if deleted || !present {
+		t.Fatalf("transient snapshot removed source=%t, dependent present=%t", deleted, present)
+	}
+	cancelConsumer()
+	<-consumerDone
+}
+
+func TestDependencyReconcileHasMaximumDebounceDelay(t *testing.T) {
+	w := &Watcher{dependencyDebounce: 40 * time.Millisecond, dependencyMaxDelay: 90 * time.Millisecond}
+	queue := make(chan AuthUpdate, 64)
+	w.SetAuthUpdateQueue(queue)
+	defer w.stopDispatch()
+
+	start := time.Now()
+	updatesDone := make(chan struct{})
+	go func() {
+		defer close(updatesDone)
+		ticker := time.NewTicker(10 * time.Millisecond)
+		defer ticker.Stop()
+		deadline := time.NewTimer(180 * time.Millisecond)
+		defer deadline.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				w.dispatchAuthUpdatesWithDependencyReconcile([]AuthUpdate{{Action: AuthUpdateActionModify, ID: "busy-auth"}})
+			case <-deadline.C:
+				return
+			}
+		}
+	}()
+
+	for {
+		select {
+		case update := <-queue:
+			if update.Action != AuthUpdateActionReconcileChatGPTWebDependencies {
+				continue
+			}
+			if elapsed := time.Since(start); elapsed > 160*time.Millisecond {
+				t.Fatalf("dependency reconcile elapsed = %s, want bounded by maximum delay", elapsed)
+			}
+			<-updatesDone
+			return
+		case <-time.After(170 * time.Millisecond):
+			t.Fatal("continuous auth updates starved dependency reconcile")
+		}
+	}
+}
+
 func TestRetiredPathBlocksRuntimeAuthAdmissionAndRefresh(t *testing.T) {
 	authDir := t.TempDir()
 	path := filepath.Join(authDir, "retired.json")
@@ -525,13 +665,21 @@ func TestRetiredPathBlocksRuntimeAuthAdmissionAndRefresh(t *testing.T) {
 	}
 	w.dispatchMu.Lock()
 	defer w.dispatchMu.Unlock()
-	if len(w.pendingUpdates) != 1 {
-		t.Fatalf("pending updates = %#v, want one delete", w.pendingUpdates)
+	if len(w.pendingUpdates) != 2 {
+		t.Fatalf("pending updates = %#v, want delete followed by dependency reconciliation", w.pendingUpdates)
 	}
+	deleteFound := false
+	reconcileFound := false
 	for _, update := range w.pendingUpdates {
-		if update.Action != AuthUpdateActionDelete || update.ID != auth.ID {
-			t.Fatalf("pending update = %#v, want delete for %s", update, auth.ID)
+		switch update.Action {
+		case AuthUpdateActionDelete:
+			deleteFound = update.ID == auth.ID
+		case AuthUpdateActionReconcileChatGPTWebDependencies:
+			reconcileFound = true
 		}
+	}
+	if !deleteFound || !reconcileFound {
+		t.Fatalf("pending updates = %#v, want delete for %s and dependency reconciliation", w.pendingUpdates, auth.ID)
 	}
 }
 
@@ -713,6 +861,49 @@ func TestAuthFileEventsDoNotInvokeSnapshotCoreAuths(t *testing.T) {
 	if got := atomic.LoadInt32(&snapshotCalls); got != 0 {
 		t.Fatalf("expected auth file events to avoid full snapshot, got %d calls", got)
 	}
+}
+
+func TestIncrementalAuthEventsScheduleDependencyReconcile(t *testing.T) {
+	authDir := t.TempDir()
+	path := filepath.Join(authDir, "incremental.json")
+	write := func(email string) {
+		if errWrite := os.WriteFile(path, []byte(fmt.Sprintf(`{"type":"codex","email":%q,"access_token":%q}`, email, email)), 0o600); errWrite != nil {
+			t.Fatal(errWrite)
+		}
+	}
+	w := &Watcher{
+		authDir:          authDir,
+		authQueue:        make(chan AuthUpdate),
+		lastAuthHashes:   make(map[string]string),
+		lastAuthContents: make(map[string]*coreauth.Auth),
+		fileAuthsByPath:  make(map[string]map[string]*coreauth.Auth),
+	}
+	w.SetConfig(&config.Config{AuthDir: authDir})
+	assertPending := func(wantAction AuthUpdateAction) {
+		t.Helper()
+		w.dispatchMu.Lock()
+		defer w.dispatchMu.Unlock()
+		foundAction := false
+		foundReconcile := false
+		for _, update := range w.pendingUpdates {
+			foundAction = foundAction || update.Action == wantAction
+			foundReconcile = foundReconcile || update.Action == AuthUpdateActionReconcileChatGPTWebDependencies
+		}
+		if !foundAction || !foundReconcile {
+			t.Fatalf("pending updates = %#v, want %s and dependency reconcile", w.pendingUpdates, wantAction)
+		}
+		w.pendingUpdates = nil
+		w.pendingOrder = nil
+	}
+
+	write("first@example.com")
+	w.addOrUpdateClient(path)
+	assertPending(AuthUpdateActionAdd)
+	write("second@example.com")
+	w.addOrUpdateClient(path)
+	assertPending(AuthUpdateActionModify)
+	w.removeClient(path)
+	assertPending(AuthUpdateActionDelete)
 }
 
 func TestAuthSliceToMap(t *testing.T) {
@@ -2140,13 +2331,21 @@ func TestReloadConfigForcesAuthRefreshForAuthModelExclusionsChange(t *testing.T)
 
 	w.dispatchMu.Lock()
 	defer w.dispatchMu.Unlock()
-	if len(w.pendingUpdates) != 1 {
-		t.Fatalf("pending updates = %+v, want one forced modify", w.pendingUpdates)
+	if len(w.pendingUpdates) != 2 {
+		t.Fatalf("pending updates = %+v, want forced modify followed by dependency reconciliation", w.pendingUpdates)
 	}
+	modifyFound := false
+	reconcileFound := false
 	for _, update := range w.pendingUpdates {
-		if update.Action != AuthUpdateActionModify || update.ID != "auth-1" {
-			t.Fatalf("update = %+v, want forced modify for auth-1", update)
+		switch update.Action {
+		case AuthUpdateActionModify:
+			modifyFound = update.ID == "auth-1"
+		case AuthUpdateActionReconcileChatGPTWebDependencies:
+			reconcileFound = true
 		}
+	}
+	if !modifyFound || !reconcileFound {
+		t.Fatalf("pending updates = %+v, want forced modify for auth-1 and dependency reconciliation", w.pendingUpdates)
 	}
 }
 

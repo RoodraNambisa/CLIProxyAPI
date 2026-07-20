@@ -43,18 +43,31 @@ const (
 )
 
 var (
-	errChatGPTWebLoginTaskCapacity  = errors.New("too many retained chatgpt web login tasks")
-	errChatGPTWebLoginTaskClosed    = errors.New("chatgpt web login task manager is closed")
-	errChatGPTWebLoginEmailBusy     = errors.New("chatgpt web account already has an active login operation")
-	errChatGPTWebCredentialChanged  = errors.New("chatgpt web credential changed before persistence")
-	errChatGPTWebCredentialIDOwned  = errors.New("chatgpt web credential ID is already owned")
-	errChatGPTWebCredentialMultiple = errors.New("multiple chatgpt web credentials use this email")
+	errChatGPTWebLoginTaskCapacity       = errors.New("too many retained chatgpt web login tasks")
+	errChatGPTWebLoginTaskClosed         = errors.New("chatgpt web login task manager is closed")
+	errChatGPTWebLoginEmailBusy          = errors.New("chatgpt web account already has an active login operation")
+	errChatGPTWebCredentialChanged       = errors.New("chatgpt web credential changed before persistence")
+	errChatGPTWebCredentialIDOwned       = errors.New("chatgpt web credential ID is already owned")
+	errChatGPTWebCredentialIdentityOwned = errors.New("chatgpt web account identity is already owned")
+	errChatGPTWebCredentialMultiple      = errors.New("multiple chatgpt web credentials use this email")
+	errChatGPTWebCredentialLookup        = errors.New("chatgpt web credential lookup failed")
 )
 
 type chatGPTWebManagementExecutor interface {
 	BeginLoginOperation(context.Context, string) (context.Context, func(), error)
 	Login(context.Context, chatgptwebauth.LoginInput) (*chatgptwebauth.Credential, error)
 	ReloginCurrent(context.Context, *coreauth.Auth) (*coreauth.Auth, bool, error)
+}
+
+type chatGPTWebImportExecutor interface {
+	BeginLoginOperation(context.Context, string) (context.Context, func(), error)
+	NormalizeImportedCredential(context.Context, *chatgptwebauth.Credential, string) (*chatgptwebauth.Credential, error)
+	FetchModels(context.Context, *coreauth.Auth) ([]chatgptwebauth.CatalogModel, error)
+}
+
+type chatGPTWebConversionExecutor interface {
+	BeginLoginOperation(context.Context, string) (context.Context, func(), error)
+	FetchModels(context.Context, *coreauth.Auth) ([]chatgptwebauth.CatalogModel, error)
 }
 
 type chatGPTWebLoginInput struct {
@@ -578,7 +591,12 @@ func (h *Handler) StartChatGPTWebLoginTask(c *gin.Context) {
 
 // GetChatGPTWebLoginTask returns one task snapshot.
 func (h *Handler) GetChatGPTWebLoginTask(c *gin.Context) {
-	task, ok := h.chatGPTWebTaskManager().get(c.Param("id"))
+	taskManager := h.chatGPTWebTaskManager()
+	if taskManager == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "chatgpt web login tasks are unavailable"})
+		return
+	}
+	task, ok := taskManager.get(c.Param("id"))
 	if !ok {
 		c.JSON(http.StatusNotFound, gin.H{"error": "chatgpt web login task not found"})
 		return
@@ -588,7 +606,12 @@ func (h *Handler) GetChatGPTWebLoginTask(c *gin.Context) {
 
 // CancelChatGPTWebLoginTask cancels pending and in-flight login acquisitions.
 func (h *Handler) CancelChatGPTWebLoginTask(c *gin.Context) {
-	task, ok := h.chatGPTWebTaskManager().cancelTask(c.Param("id"))
+	taskManager := h.chatGPTWebTaskManager()
+	if taskManager == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "chatgpt web login tasks are unavailable"})
+		return
+	}
+	task, ok := taskManager.cancelTask(c.Param("id"))
 	if !ok {
 		c.JSON(http.StatusNotFound, gin.H{"error": "chatgpt web login task not found"})
 		return
@@ -699,6 +722,42 @@ func (h *Handler) ReloginChatGPTWebAuth(c *gin.Context) {
 }
 
 func (h *Handler) chatGPTWebManagementExecutor() (chatGPTWebManagementExecutor, *coreauth.Manager, error) {
+	registered, manager, errExecutor := h.registeredChatGPTWebExecutor()
+	if errExecutor != nil {
+		return nil, nil, errExecutor
+	}
+	executor, ok := registered.(chatGPTWebManagementExecutor)
+	if !ok {
+		return nil, nil, errors.New("chatgpt web management login is unavailable")
+	}
+	return executor, manager, nil
+}
+
+func (h *Handler) chatGPTWebImportExecutor() (chatGPTWebImportExecutor, *coreauth.Manager, error) {
+	registered, manager, errExecutor := h.registeredChatGPTWebExecutor()
+	if errExecutor != nil {
+		return nil, nil, errExecutor
+	}
+	executor, ok := registered.(chatGPTWebImportExecutor)
+	if !ok {
+		return nil, nil, errors.New("chatgpt web credential import is unavailable")
+	}
+	return executor, manager, nil
+}
+
+func (h *Handler) chatGPTWebConversionExecutor() (chatGPTWebConversionExecutor, *coreauth.Manager, error) {
+	registered, manager, errExecutor := h.registeredChatGPTWebExecutor()
+	if errExecutor != nil {
+		return nil, nil, errExecutor
+	}
+	executor, ok := registered.(chatGPTWebConversionExecutor)
+	if !ok {
+		return nil, nil, errors.New("chatgpt web credential conversion is unavailable")
+	}
+	return executor, manager, nil
+}
+
+func (h *Handler) registeredChatGPTWebExecutor() (coreauth.ProviderExecutor, *coreauth.Manager, error) {
 	if h == nil {
 		return nil, nil, errors.New("handler not initialized")
 	}
@@ -712,11 +771,7 @@ func (h *Handler) chatGPTWebManagementExecutor() (chatGPTWebManagementExecutor, 
 	if !ok || registered == nil {
 		return nil, nil, errors.New("chatgpt web executor unavailable")
 	}
-	executor, ok := registered.(chatGPTWebManagementExecutor)
-	if !ok {
-		return nil, nil, errors.New("chatgpt web management login is unavailable")
-	}
-	return executor, manager, nil
+	return registered, manager, nil
 }
 
 func (h *Handler) runChatGPTWebLoginTask(ctx context.Context, taskID string, inputs []chatGPTWebLoginInput, executor chatGPTWebManagementExecutor, manager *coreauth.Manager) {
@@ -797,16 +852,22 @@ func (h *Handler) executeChatGPTWebLogin(ctx context.Context, input chatGPTWebLo
 	ctx = operationCtx
 
 	fileName := chatGPTWebCredentialFileName(input.Email)
-	existing, errExisting := findExistingChatGPTWebAuth(manager, fileName, input.Email)
+	existing, errExisting := findExistingChatGPTWebAuth(ctx, manager, fileName, input.Email)
 	if errExisting != nil {
 		if errors.Is(errExisting, errChatGPTWebCredentialIDOwned) {
 			result.ErrorCategory = "credential_id_conflict"
 			result.Error = "credential name is already used by another account"
-		} else {
+			result.HTTPStatus = http.StatusConflict
+		} else if errors.Is(errExisting, errChatGPTWebCredentialMultiple) {
 			result.ErrorCategory = "credential_ambiguous"
 			result.Error = "multiple chatgpt web credentials use this email"
+			result.HTTPStatus = http.StatusConflict
+		} else {
+			result.ErrorCategory, result.Error, result.HTTPStatus, result.LifecycleState = classifyChatGPTWebManagementError(errExisting)
+			if result.ErrorCategory == "canceled" {
+				result.Status = chatGPTWebLoginResultCanceled
+			}
 		}
-		result.HTTPStatus = http.StatusConflict
 		return result
 	}
 	pending := existing
@@ -879,7 +940,15 @@ func (h *Handler) executeChatGPTWebLogin(ctx context.Context, input chatGPTWebLo
 				canceled.LifecycleState = string(chatgptwebauth.SafeLifecycleState(string(credential.LifecycleState)))
 				return canceled
 			}
-			if errors.Is(errPersist, coreauth.ErrChatGPTWebEmailAlreadyExists) {
+			if errors.Is(errPersist, errChatGPTWebCredentialIdentityOwned) {
+				result.ErrorCategory = "identity_conflict"
+				result.Error = "credential identity is already used by another account file"
+				result.HTTPStatus = http.StatusConflict
+			} else if errors.Is(errPersist, errChatGPTWebCredentialLookup) {
+				result.ErrorCategory = "credential_lookup_failed"
+				result.Error = "unable to inspect existing credentials"
+				result.HTTPStatus = http.StatusServiceUnavailable
+			} else if errors.Is(errPersist, coreauth.ErrChatGPTWebEmailAlreadyExists) {
 				result.ErrorCategory = "credential_ambiguous"
 				result.Error = "multiple chatgpt web credentials use this email"
 				result.HTTPStatus = http.StatusConflict
@@ -925,12 +994,46 @@ func (h *Handler) executeChatGPTWebLogin(ctx context.Context, input chatGPTWebLo
 }
 
 func (h *Handler) persistChatGPTWebLoginCredential(ctx context.Context, manager *coreauth.Manager, fileName string, credential *chatgptwebauth.Credential, existing *coreauth.Auth, loginErr error) (*coreauth.Auth, error) {
+	return h.persistChatGPTWebCredential(ctx, manager, fileName, credential, existing, loginErr, false)
+}
+
+func (h *Handler) persistChatGPTWebCredential(ctx context.Context, manager *coreauth.Manager, fileName string, credential *chatgptwebauth.Credential, existing *coreauth.Auth, loginErr error, refreshAware bool) (*coreauth.Auth, error) {
+	h.chatGPTWebDependencyMu.Lock()
+	installed, oldSourceUID, errPersist := h.persistChatGPTWebCredentialLocked(ctx, manager, fileName, credential, existing, loginErr, refreshAware)
+	h.chatGPTWebDependencyMu.Unlock()
+	if errPersist == nil && oldSourceUID != "" && credential != nil && credential.RefreshStrategy != chatgptwebauth.RefreshStrategyCodexSource {
+		h.cleanupRetainedCodexSource(ctx, oldSourceUID)
+	}
+	return installed, errPersist
+}
+
+func (h *Handler) persistChatGPTWebCredentialLocked(ctx context.Context, manager *coreauth.Manager, fileName string, credential *chatgptwebauth.Credential, existing *coreauth.Auth, loginErr error, refreshAware bool) (*coreauth.Auth, string, error) {
 	if credential == nil {
-		return nil, errors.New("chatgpt web credential is nil")
+		return nil, "", errors.New("chatgpt web credential is nil")
 	}
 	if manager == nil {
-		return nil, errors.New("core auth manager unavailable")
+		return nil, "", errors.New("core auth manager unavailable")
 	}
+	excludedID := ""
+	if existing != nil {
+		excludedID = existing.ID
+	}
+	owner, errOwner := chatGPTWebStrongIdentityOwner(ctx, manager, credential, excludedID)
+	if errOwner != nil {
+		return nil, "", errOwner
+	}
+	if owner != nil {
+		return nil, "", errChatGPTWebCredentialIdentityOwned
+	}
+	if strings.TrimSpace(credential.CredentialUID) == "" && existing != nil {
+		if current, errParse := chatgptwebauth.ParseCredential(existing.Metadata); errParse == nil {
+			credential.CredentialUID = strings.TrimSpace(current.CredentialUID)
+		}
+	}
+	if strings.TrimSpace(credential.CredentialUID) == "" {
+		credential.CredentialUID = uuid.NewString()
+	}
+	oldSourceUID := linkedSourceUID(existing)
 	now := time.Now().UTC()
 	lifecycleState := string(chatgptwebauth.SafeLifecycleState(string(credential.LifecycleState)))
 	lifecycleReason := chatgptwebauth.SafeLifecycleReason(credential.LifecycleReason)
@@ -953,14 +1056,25 @@ func (h *Handler) persistChatGPTWebLoginCredential(ctx context.Context, manager 
 		}
 		record.StatusMessage = lifecycleReason
 		record.UpdatedAt = now
-		installed, current, errUpdate := manager.UpdateIfCurrent(ctx, existing, record)
+		var (
+			installed *coreauth.Auth
+			current   bool
+			errUpdate error
+		)
+		if _, runtimeExists := manager.GetByID(existing.ID); !runtimeExists {
+			installed, current, errUpdate = manager.UpdatePersistedIfCurrentSourceHash(ctx, existing, record)
+		} else if refreshAware {
+			installed, current, errUpdate = manager.UpdateRefreshedIfCurrent(ctx, existing, record)
+		} else {
+			installed, current, errUpdate = manager.UpdateIfCurrent(ctx, existing, record)
+		}
 		if errUpdate != nil {
-			return nil, errUpdate
+			return nil, "", errUpdate
 		}
 		if !current {
-			return nil, errChatGPTWebCredentialChanged
+			return nil, "", errChatGPTWebCredentialChanged
 		}
-		return installed, nil
+		return installed, oldSourceUID, nil
 	}
 
 	metadata := make(map[string]any)
@@ -978,28 +1092,33 @@ func (h *Handler) persistChatGPTWebLoginCredential(ctx context.Context, manager 
 	}
 	if h.postAuthHook != nil {
 		if errHook := h.postAuthHook(ctx, record); errHook != nil {
-			return nil, fmt.Errorf("post-auth hook failed: %w", errHook)
+			return nil, "", fmt.Errorf("post-auth hook failed: %w", errHook)
 		}
 	}
-	return manager.RegisterIfAbsent(ctx, record)
+	installed, errRegister := manager.RegisterIfAbsent(ctx, record)
+	return installed, "", errRegister
 }
 
-func findExistingChatGPTWebAuth(manager *coreauth.Manager, fileName, email string) (*coreauth.Auth, error) {
+func findExistingChatGPTWebAuth(ctx context.Context, manager *coreauth.Manager, fileName, email string) (*coreauth.Auth, error) {
 	if manager == nil {
 		return nil, nil
 	}
 	email = normalizeChatGPTWebLoginEmail(email)
 	var match *coreauth.Auth
-	if exact, ok := manager.GetByID(fileName); ok && exact != nil {
-		if !strings.EqualFold(strings.TrimSpace(exact.Provider), chatgptwebauth.Provider) {
-			return nil, fmt.Errorf("%w: another provider", errChatGPTWebCredentialIDOwned)
-		}
-		if normalizeChatGPTWebLoginEmail(authEmail(exact)) != email {
-			return nil, fmt.Errorf("%w: another chatgpt web account", errChatGPTWebCredentialIDOwned)
-		}
-		match = exact
+	auths, errList := manager.CompleteAuthSnapshot(ctx)
+	if errList != nil {
+		return nil, fmt.Errorf("%w: %w", errChatGPTWebCredentialLookup, errList)
 	}
-	for _, candidate := range manager.List() {
+	for _, candidate := range auths {
+		if candidate != nil && candidate.ID == fileName {
+			if !strings.EqualFold(strings.TrimSpace(candidate.Provider), chatgptwebauth.Provider) {
+				return nil, fmt.Errorf("%w: another provider", errChatGPTWebCredentialIDOwned)
+			}
+			if normalizeChatGPTWebLoginEmail(authEmail(candidate)) != email {
+				return nil, fmt.Errorf("%w: another chatgpt web account", errChatGPTWebCredentialIDOwned)
+			}
+			match = candidate
+		}
 		if candidate == nil || !strings.EqualFold(strings.TrimSpace(candidate.Provider), chatgptwebauth.Provider) || normalizeChatGPTWebLoginEmail(authEmail(candidate)) != email {
 			continue
 		}
@@ -1009,6 +1128,34 @@ func findExistingChatGPTWebAuth(manager *coreauth.Manager, fileName, email strin
 		match = candidate
 	}
 	return match, nil
+}
+
+func chatGPTWebStrongIdentityOwner(ctx context.Context, manager *coreauth.Manager, credential *chatgptwebauth.Credential, excludedID string) (*coreauth.Auth, error) {
+	if manager == nil || credential == nil {
+		return nil, nil
+	}
+	metadata := make(map[string]any)
+	credential.ApplyToMetadata(metadata)
+	incoming := &coreauth.Auth{Provider: chatgptwebauth.Provider, Metadata: metadata}
+	if !coreauth.ChatGPTWebCredentialHasStrongIdentity(incoming) {
+		return nil, nil
+	}
+	auths, errSnapshot := manager.CompleteAuthSnapshot(ctx)
+	if errSnapshot != nil {
+		return nil, fmt.Errorf("%w: %w", errChatGPTWebCredentialLookup, errSnapshot)
+	}
+	reference := coreauth.NewChatGPTWebCredentialReference(incoming)
+	for _, candidate := range auths {
+		if candidate == nil || candidate.ID == excludedID ||
+			!strings.EqualFold(strings.TrimSpace(candidate.Provider), chatgptwebauth.Provider) ||
+			!coreauth.ChatGPTWebCredentialHasStrongIdentity(candidate) {
+			continue
+		}
+		if reference.Matches(candidate) {
+			return candidate, nil
+		}
+	}
+	return nil, nil
 }
 
 func shouldPersistChatGPTWebLoginCredential(credential *chatgptwebauth.Credential, errLogin error) bool {
@@ -1049,6 +1196,8 @@ func classifyChatGPTWebManagementError(err error) (category, message string, sta
 		return "canceled", "login canceled", http.StatusRequestTimeout, ""
 	case errors.Is(err, context.DeadlineExceeded):
 		return "timeout", "login timed out", http.StatusGatewayTimeout, ""
+	case errors.Is(err, errChatGPTWebCredentialLookup):
+		return "credential_lookup_failed", "unable to inspect existing credentials", http.StatusServiceUnavailable, ""
 	}
 	var unavailable *proxypool.UnavailableError
 	if errors.As(err, &unavailable) {
@@ -1063,6 +1212,18 @@ func classifyChatGPTWebManagementError(err error) (category, message string, sta
 			state = authError.LifecycleState
 		}
 		return category, message, status, string(chatgptwebauth.SafeLifecycleState(string(state)))
+	}
+	var coded interface{ ChatGPTWebErrorCode() string }
+	if errors.As(err, &coded) {
+		category = safeChatGPTWebErrorCategory(coded.ChatGPTWebErrorCode())
+		status = http.StatusUnprocessableEntity
+		switch category {
+		case "source_auth_missing", "source_auth_disabled", "source_auth_replaced", "source_auth_changed", "source_identity_changed", "source_identity_mismatch":
+			status = http.StatusConflict
+		case "source_refresh_unavailable":
+			status = http.StatusServiceUnavailable
+		}
+		return category, safeChatGPTWebErrorMessage(category), status, string(chatgptwebauth.LifecycleReauthRequired)
 	}
 	return "login_failed", "chatgpt web login failed", http.StatusBadGateway, ""
 }

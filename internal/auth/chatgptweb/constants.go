@@ -5,10 +5,20 @@ import "time"
 const (
 	Provider = "chatgpt-web"
 
-	OAuthClientID = "app_2SKx67EdpoN0G6j64rFvigXD"
-	AuthBaseURL   = "https://auth.openai.com"
-	RedirectURL   = "https://platform.openai.com/auth/callback"
-	AudienceURL   = "https://api.openai.com/v1"
+	CredentialModeNative      = "native"
+	CredentialModeLinkedCodex = "linked_codex"
+	CredentialModeTokenOnly   = "token_only"
+
+	RefreshStrategyWebOAuthRT     RefreshStrategy = "web_oauth_rt"
+	RefreshStrategyChatGPTSession RefreshStrategy = "chatgpt_session"
+	RefreshStrategyCodexSource    RefreshStrategy = "codex_source"
+	RefreshStrategyTokenOnly      RefreshStrategy = "token_only"
+
+	OAuthClientID  = "app_2SKx67EdpoN0G6j64rFvigXD"
+	AuthBaseURL    = "https://auth.openai.com"
+	SessionBaseURL = "https://chatgpt.com"
+	RedirectURL    = "https://platform.openai.com/auth/callback"
+	AudienceURL    = "https://api.openai.com/v1"
 
 	DefaultAcquisitionTimeout = 30 * time.Second
 	DefaultRefreshLead        = 5 * time.Minute

@@ -17,10 +17,12 @@ import (
 )
 
 type fakeChatGPTWebAuthService struct {
-	loginFn      func(context.Context, chatgptwebauth.LoginInput) (*chatgptwebauth.Credential, error)
-	refreshFn    func(context.Context, chatgptwebauth.Credential, string) (*chatgptwebauth.Credential, error)
-	loginCalls   atomic.Int32
-	refreshCalls atomic.Int32
+	loginFn             func(context.Context, chatgptwebauth.LoginInput) (*chatgptwebauth.Credential, error)
+	refreshFn           func(context.Context, chatgptwebauth.Credential, string) (*chatgptwebauth.Credential, error)
+	refreshSessionFn    func(context.Context, chatgptwebauth.Credential, string) (*chatgptwebauth.Credential, error)
+	loginCalls          atomic.Int32
+	refreshCalls        atomic.Int32
+	refreshSessionCalls atomic.Int32
 }
 
 type chatGPTWebLeaseResolver struct {
@@ -62,6 +64,54 @@ func (service *fakeChatGPTWebAuthService) Refresh(ctx context.Context, credentia
 	return service.refreshFn(ctx, credential, proxyURL)
 }
 
+func (service *fakeChatGPTWebAuthService) RefreshSession(ctx context.Context, credential chatgptwebauth.Credential, proxyURL string) (*chatgptwebauth.Credential, error) {
+	service.refreshSessionCalls.Add(1)
+	if service.refreshSessionFn == nil {
+		return nil, errors.New("unexpected session refresh")
+	}
+	return service.refreshSessionFn(ctx, credential, proxyURL)
+}
+
+func TestChatGPTWebExecutorRefreshUsesActualTargetForEnvironmentProxy(t *testing.T) {
+	t.Setenv("HTTP_PROXY", "")
+	t.Setenv("http_proxy", "")
+	t.Setenv("HTTPS_PROXY", "http://proxy.example:8080")
+	t.Setenv("https_proxy", "")
+	t.Setenv("ALL_PROXY", "")
+	t.Setenv("all_proxy", "")
+	t.Setenv("NO_PROXY", "chatgpt.com")
+	t.Setenv("no_proxy", "")
+
+	var oauthProxy, sessionProxy string
+	service := &fakeChatGPTWebAuthService{
+		refreshFn: func(_ context.Context, credential chatgptwebauth.Credential, proxyURL string) (*chatgptwebauth.Credential, error) {
+			oauthProxy = proxyURL
+			return &credential, nil
+		},
+		refreshSessionFn: func(_ context.Context, credential chatgptwebauth.Credential, proxyURL string) (*chatgptwebauth.Credential, error) {
+			sessionProxy = proxyURL
+			return &credential, nil
+		},
+	}
+	executor := NewChatGPTWebExecutor(&config.Config{}, nil)
+	executor.authService = service
+	auth := chatGPTWebTestAuth("environment-proxy-target")
+	credential := &chatgptwebauth.Credential{RefreshStrategy: chatgptwebauth.RefreshStrategyWebOAuthRT}
+	if _, errRefresh, _ := executor.refreshByStrategy(t.Context(), auth, credential); errRefresh != nil {
+		t.Fatal(errRefresh)
+	}
+	credential.RefreshStrategy = chatgptwebauth.RefreshStrategyChatGPTSession
+	if _, errRefresh, _ := executor.refreshByStrategy(t.Context(), auth, credential); errRefresh != nil {
+		t.Fatal(errRefresh)
+	}
+	if oauthProxy != "http://proxy.example:8080" {
+		t.Fatalf("OAuth proxy = %q, want environment proxy", oauthProxy)
+	}
+	if sessionProxy != "" {
+		t.Fatalf("session proxy = %q, want NO_PROXY bypass", sessionProxy)
+	}
+}
+
 func TestChatGPTWebExecutorShouldPrepareExpiringCredential(t *testing.T) {
 	now := time.Date(2026, time.July, 16, 12, 0, 0, 0, time.UTC)
 	executor := NewChatGPTWebExecutor(&config.Config{}, nil)
@@ -83,6 +133,56 @@ func TestChatGPTWebExecutorShouldPrepareExpiringCredential(t *testing.T) {
 	auth.Metadata["lifecycle_state"] = cliproxyauth.LifecycleStateDead
 	if executor.ShouldPrepareRequestAuth(auth) {
 		t.Fatal("dead credential should not be refreshed")
+	}
+}
+
+func TestChatGPTWebExecutorShouldRefreshTokenOnlyAtExpiry(t *testing.T) {
+	now := time.Date(2026, time.July, 19, 12, 0, 0, 0, time.UTC)
+	executor := NewChatGPTWebExecutor(&config.Config{}, nil)
+	auth := chatGPTWebTestAuth("token-only-refresh")
+	auth.Metadata["refresh_strategy"] = string(chatgptwebauth.RefreshStrategyTokenOnly)
+	auth.Metadata["refresh_token"] = ""
+	auth.Metadata["expired"] = now.Add(time.Minute).Format(time.RFC3339)
+	if executor.ShouldRefresh(now, auth) {
+		t.Fatal("token-only credential was refreshed before expiry")
+	}
+	auth.Metadata["expired"] = now.Format(time.RFC3339)
+	if !executor.ShouldRefresh(now, auth) {
+		t.Fatal("expired token-only credential was not refreshed")
+	}
+	auth.Metadata["expired"] = ""
+	auth.Metadata["access_token"] = "opaque-token"
+	if executor.ShouldRefresh(now, auth) {
+		t.Fatal("opaque token-only credential without expiry was refreshed")
+	}
+}
+
+func TestChatGPTWebExecutorPersistsMissingCodexSourceAsReauthRequired(t *testing.T) {
+	manager := cliproxyauth.NewManager(nil, nil, nil)
+	executor := NewChatGPTWebExecutor(&config.Config{}, manager)
+	t.Cleanup(func() { _ = executor.Close() })
+	auth := chatGPTWebTestAuth("missing-source")
+	credential, errParse := chatgptwebauth.ParseCredential(auth.Metadata)
+	if errParse != nil {
+		t.Fatal(errParse)
+	}
+	credential.RefreshStrategy = chatgptwebauth.RefreshStrategyCodexSource
+	credential.SourceAuthID = "missing-codex.json"
+	credential.SourceCredentialUID = "missing-uid"
+	credential.SourceIdentity = "v1:account:user:subject:identity"
+	credential.RefreshToken = ""
+	credential.ApplyToMetadata(auth.Metadata)
+
+	updated, errRefresh := executor.Refresh(t.Context(), auth)
+	if errRefresh == nil || updated == nil {
+		t.Fatalf("Refresh() = %#v, %v", updated, errRefresh)
+	}
+	refreshed, errParse := chatgptwebauth.ParseCredential(updated.Metadata)
+	if errParse != nil {
+		t.Fatal(errParse)
+	}
+	if refreshed.LifecycleState != chatgptwebauth.LifecycleReauthRequired || refreshed.LifecycleReason != "source_auth_missing" {
+		t.Fatalf("credential state = %q/%q", refreshed.LifecycleState, refreshed.LifecycleReason)
 	}
 }
 
@@ -124,13 +224,15 @@ func TestChatGPTWebExecutorRefreshUsesStableLegacyRuntimeIdentity(t *testing.T) 
 
 func TestChatGPTWebExecutorTerminalRefreshLifecycle(t *testing.T) {
 	for _, test := range []struct {
-		name        string
-		autoRelogin bool
-		failure     chatgptwebauth.LifecycleState
-		want        string
+		name            string
+		autoRelogin     bool
+		withoutPassword bool
+		failure         chatgptwebauth.LifecycleState
+		want            string
 	}{
 		{name: "reauth", failure: chatgptwebauth.LifecycleReauthRequired, want: cliproxyauth.LifecycleStateReauthRequired},
 		{name: "auto relogin", autoRelogin: true, failure: chatgptwebauth.LifecycleReauthRequired, want: cliproxyauth.LifecycleStateReloginPending},
+		{name: "imported credential cannot auto relogin", autoRelogin: true, withoutPassword: true, failure: chatgptwebauth.LifecycleReauthRequired, want: cliproxyauth.LifecycleStateReauthRequired},
 		{name: "dead never relogins", autoRelogin: true, failure: chatgptwebauth.LifecycleDead, want: cliproxyauth.LifecycleStateDead},
 		{name: "interaction never relogins", autoRelogin: true, failure: chatgptwebauth.LifecycleInteractionRequired, want: cliproxyauth.LifecycleStateInteractionRequired},
 	} {
@@ -142,7 +244,12 @@ func TestChatGPTWebExecutorTerminalRefreshLifecycle(t *testing.T) {
 			}
 			executor := NewChatGPTWebExecutor(&config.Config{ChatGPTWeb: config.ChatGPTWebConfig{AutoRelogin: test.autoRelogin}}, nil)
 			executor.authService = fake
-			updated, errRefresh := executor.Refresh(t.Context(), chatGPTWebTestAuth(test.name))
+			auth := chatGPTWebTestAuth(test.name)
+			if test.withoutPassword {
+				auth.Metadata["password"] = ""
+				auth.Metadata["totp_secret"] = ""
+			}
+			updated, errRefresh := executor.Refresh(t.Context(), auth)
 			if errRefresh == nil || updated == nil {
 				t.Fatalf("Refresh() = (%v, %v), want persisted terminal update", updated, errRefresh)
 			}

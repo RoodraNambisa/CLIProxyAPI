@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
@@ -90,6 +91,36 @@ func TestAPICallProxyResolutionErrorDoesNotReturnEmptySuccess(t *testing.T) {
 	}
 	if !strings.Contains(recorder.Body.String(), "proxy_resolution_failed") {
 		t.Fatalf("APICall() body = %s, want proxy_resolution_failed", recorder.Body.String())
+	}
+}
+
+func TestAPICallRejectsCodexRetainedForWebDependents(t *testing.T) {
+	var upstreamCalls atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
+		upstreamCalls.Add(1)
+		response.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+	manager := coreauth.NewManager(nil, nil, nil)
+	retained := coreauth.RetainCodexAuthForChatGPTWebDependents(&coreauth.Auth{
+		ID: "retained-codex", Provider: "codex", Status: coreauth.StatusActive,
+		Metadata: map[string]any{"type": "codex", "credential_uid": "uid-a", "access_token": "secret"},
+	}, time.Now())
+	installed, errRegister := manager.Register(coreauth.WithSkipPersist(t.Context()), retained)
+	if errRegister != nil {
+		t.Fatal(errRegister)
+	}
+	h := &Handler{authManager: manager}
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	body := fmt.Sprintf(`{"auth_index":%q,"method":"GET","url":%q}`, installed.EnsureIndex(), upstream.URL)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v0/management/api-call", strings.NewReader(body))
+	ctx.Request.Header.Set("Content-Type", "application/json")
+
+	h.APICall(ctx)
+
+	if recorder.Code != http.StatusConflict || upstreamCalls.Load() != 0 {
+		t.Fatalf("APICall() status=%d calls=%d body=%s", recorder.Code, upstreamCalls.Load(), recorder.Body.String())
 	}
 }
 

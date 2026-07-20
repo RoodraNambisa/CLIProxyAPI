@@ -52,6 +52,7 @@ type serverOptionConfig struct {
 	keepAliveOnTimeout   func()
 	postAuthHook         auth.PostAuthHook
 	authStatusHook       auth.AuthStatusHook
+	dependencyReconcile  func(context.Context, string) ([]string, error)
 	proxyPoolManager     *proxypool.Manager
 }
 
@@ -122,6 +123,13 @@ func WithPostAuthHook(hook auth.PostAuthHook) ServerOption {
 func WithAuthStatusHook(hook auth.AuthStatusHook) ServerOption {
 	return func(cfg *serverOptionConfig) {
 		cfg.authStatusHook = hook
+	}
+}
+
+// WithChatGPTWebDependencyReconcileHook registers dependency cleanup owned by the service.
+func WithChatGPTWebDependencyReconcileHook(hook func(context.Context, string) ([]string, error)) ServerOption {
+	return func(cfg *serverOptionConfig) {
+		cfg.dependencyReconcile = hook
 	}
 }
 
@@ -304,6 +312,9 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 	}
 	if optionState.authStatusHook != nil {
 		s.mgmt.SetAuthStatusHook(optionState.authStatusHook)
+	}
+	if optionState.dependencyReconcile != nil {
+		s.mgmt.SetChatGPTWebDependencyReconcileHook(optionState.dependencyReconcile)
 	}
 	s.localPassword = optionState.localPassword
 
@@ -725,6 +736,7 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.POST("/auth-files/archive", s.mgmt.DownloadAuthFilesArchive)
 		mgmt.POST("/auth-files", s.mgmt.UploadAuthFile)
 		mgmt.DELETE("/auth-files", s.mgmt.DeleteAuthFile)
+		mgmt.POST("/auth-files/restore", s.mgmt.RestoreAuthFile)
 		mgmt.GET("/auth-files/codex/plan-type-refresh", s.mgmt.GetCodexPlanTypeRefreshStatus)
 		mgmt.POST("/auth-files/codex/plan-type-refresh", s.mgmt.StartCodexPlanTypeRefresh)
 		mgmt.PATCH("/auth-files/codex/plan-type-refresh", s.mgmt.ControlCodexPlanTypeRefresh)
@@ -737,6 +749,12 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.POST("/chatgpt-web/login-tasks", s.mgmt.StartChatGPTWebLoginTask)
 		mgmt.GET("/chatgpt-web/login-tasks/:id", s.mgmt.GetChatGPTWebLoginTask)
 		mgmt.DELETE("/chatgpt-web/login-tasks/:id", s.mgmt.CancelChatGPTWebLoginTask)
+		mgmt.POST("/chatgpt-web/import-tasks", s.mgmt.StartChatGPTWebImportTask)
+		mgmt.GET("/chatgpt-web/import-tasks/:id", s.mgmt.GetChatGPTWebImportTask)
+		mgmt.DELETE("/chatgpt-web/import-tasks/:id", s.mgmt.CancelChatGPTWebImportTask)
+		mgmt.POST("/chatgpt-web/conversion-tasks", s.mgmt.StartChatGPTWebConversionTask)
+		mgmt.GET("/chatgpt-web/conversion-tasks/:id", s.mgmt.GetChatGPTWebConversionTask)
+		mgmt.DELETE("/chatgpt-web/conversion-tasks/:id", s.mgmt.CancelChatGPTWebConversionTask)
 		mgmt.POST("/chatgpt-web/auth-files/:name/relogin", s.mgmt.ReloginChatGPTWebAuth)
 
 		mgmt.GET("/anthropic-auth-url", s.mgmt.RequestAnthropicToken)

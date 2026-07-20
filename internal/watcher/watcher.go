@@ -39,65 +39,72 @@ type authDirProvider interface {
 
 // Watcher manages file watching for configuration and authentication files
 type Watcher struct {
-	configPath          string
-	authDir             string
-	config              *config.Config
-	clientsMutex        sync.RWMutex
-	configReloadMu      sync.Mutex
-	configReloadTimer   *time.Timer
-	serverUpdateMu      sync.Mutex
-	serverUpdateTimer   *time.Timer
-	serverUpdateLast    time.Time
-	serverUpdatePend    bool
-	stopped             atomic.Bool
-	reloadCallback      func(*config.Config)
-	watcher             *fsnotify.Watcher
-	lastAuthHashes      map[string]string
-	lastAuthContents    map[string]*coreauth.Auth
-	fileAuthsByPath     map[string]map[string]*coreauth.Auth
-	retiredAuthPaths    map[string]struct{}
-	retiredDeleteHashes map[string]string
-	retiredDeleteStates map[string]*authfileguard.DeleteGeneration
-	retiredDeleteSeq    uint64
-	retiredDeletes      map[string]uint64
-	authRetryBase       time.Duration
-	authRetryMu         sync.Mutex
-	authRetryTimers     map[*time.Timer]struct{}
-	authRetryWG         sync.WaitGroup
-	authWorkMu          sync.Mutex
-	authWorkContext     context.Context
-	authWorkCancel      context.CancelFunc
-	authWorkWG          sync.WaitGroup
-	eventMu             sync.Mutex
-	eventCancel         context.CancelFunc
-	eventDone           chan struct{}
-	eventInitialized    bool
-	eventPathsAdded     bool
-	lastRemoveTimes     map[string]time.Time
-	lastConfigHash      string
-	authQueue           chan<- AuthUpdate
-	currentAuths        map[string]*coreauth.Auth
-	runtimeAuths        map[string]*coreauth.Auth
-	dispatchMu          sync.Mutex
-	dispatchLifecycleMu sync.Mutex
-	dispatchCond        *sync.Cond
-	pendingUpdates      map[string]AuthUpdate
-	pendingOrder        []string
-	dispatchCancel      context.CancelFunc
-	dispatchDone        chan struct{}
-	storePersister      storePersister
-	mirroredAuthDir     string
-	oldConfigYaml       []byte
+	configPath           string
+	authDir              string
+	config               *config.Config
+	clientsMutex         sync.RWMutex
+	configReloadMu       sync.Mutex
+	configReloadTimer    *time.Timer
+	serverUpdateMu       sync.Mutex
+	serverUpdateTimer    *time.Timer
+	serverUpdateLast     time.Time
+	serverUpdatePend     bool
+	stopped              atomic.Bool
+	reloadCallback       func(*config.Config)
+	watcher              *fsnotify.Watcher
+	lastAuthHashes       map[string]string
+	lastAuthContents     map[string]*coreauth.Auth
+	fileAuthsByPath      map[string]map[string]*coreauth.Auth
+	retiredAuthPaths     map[string]struct{}
+	retiredDeleteHashes  map[string]string
+	retiredDeleteStates  map[string]*authfileguard.DeleteGeneration
+	retiredDeleteSeq     uint64
+	retiredDeletes       map[string]uint64
+	authRetryBase        time.Duration
+	authRetryMu          sync.Mutex
+	authRetryTimers      map[*time.Timer]struct{}
+	authRetryWG          sync.WaitGroup
+	authWorkMu           sync.Mutex
+	authWorkContext      context.Context
+	authWorkCancel       context.CancelFunc
+	authWorkWG           sync.WaitGroup
+	eventMu              sync.Mutex
+	eventCancel          context.CancelFunc
+	eventDone            chan struct{}
+	eventInitialized     bool
+	eventPathsAdded      bool
+	lastRemoveTimes      map[string]time.Time
+	lastConfigHash       string
+	authQueue            chan<- AuthUpdate
+	currentAuths         map[string]*coreauth.Auth
+	runtimeAuths         map[string]*coreauth.Auth
+	dispatchMu           sync.Mutex
+	dispatchLifecycleMu  sync.Mutex
+	dispatchCond         *sync.Cond
+	pendingUpdates       map[string]AuthUpdate
+	pendingOrder         []string
+	dispatchCancel       context.CancelFunc
+	dispatchDone         chan struct{}
+	dependencyTimer      *time.Timer
+	dependencyPending    bool
+	dependencyGeneration uint64
+	dependencyDebounce   time.Duration
+	dependencyMaxDelay   time.Duration
+	dependencyFirstAt    time.Time
+	storePersister       storePersister
+	mirroredAuthDir      string
+	oldConfigYaml        []byte
 }
 
 // AuthUpdateAction represents the type of change detected in auth sources.
 type AuthUpdateAction string
 
 const (
-	AuthUpdateActionAdd     AuthUpdateAction = "add"
-	AuthUpdateActionModify  AuthUpdateAction = "modify"
-	AuthUpdateActionDelete  AuthUpdateAction = "delete"
-	AuthUpdateActionBarrier AuthUpdateAction = "barrier"
+	AuthUpdateActionAdd                             AuthUpdateAction = "add"
+	AuthUpdateActionModify                          AuthUpdateAction = "modify"
+	AuthUpdateActionDelete                          AuthUpdateAction = "delete"
+	AuthUpdateActionBarrier                         AuthUpdateAction = "barrier"
+	AuthUpdateActionReconcileChatGPTWebDependencies AuthUpdateAction = "reconcile_chatgpt_web_dependencies"
 )
 
 // AuthUpdate describes an incremental change to auth configuration.
@@ -123,6 +130,8 @@ const (
 	authRemoveDebounceWindow = 1 * time.Second
 	serverUpdateDebounce     = 1 * time.Second
 	authPersistenceRetryBase = 250 * time.Millisecond
+	authDependencyDebounce   = authRemoveDebounceWindow
+	authDependencyMaxDelay   = 5 * authDependencyDebounce
 )
 
 var authPersistenceShutdownWait = 5 * time.Second

@@ -984,6 +984,196 @@ func TestRemoveBindingsRestoresHealthWhenPersistenceFails(t *testing.T) {
 	}
 }
 
+func TestResolveExistingBindingReusesSourceBindingWithoutAllocating(t *testing.T) {
+	manager := newTestManager(t, filepath.Join(t.TempDir(), "config.yaml"), proxyPoolTestConfig("3334"))
+	manager.check = successfulTrace
+	source := proxyPoolTestAuth("source")
+	resolved, errResolve := manager.Resolve(t.Context(), source)
+	if errResolve != nil {
+		t.Fatal(errResolve)
+	}
+	existing, found, errExisting := manager.ResolveExistingBinding(t.Context(), source.ID)
+	if errExisting != nil || !found {
+		t.Fatalf("ResolveExistingBinding() = %#v, %t, %v", existing, found, errExisting)
+	}
+	if existing.URL != resolved.URL || existing.BindingID != resolved.BindingID || len(manager.SortedBindings()) != 1 {
+		t.Fatalf("existing binding = %#v, original = %#v", existing, resolved)
+	}
+}
+
+func TestResolveExistingBindingRequiresCredentialGeneration(t *testing.T) {
+	manager := newTestManager(t, filepath.Join(t.TempDir(), "config.yaml"), proxyPoolTestConfig("3334"))
+	manager.check = successfulTrace
+	source := proxyPoolTestAuth("source-generation")
+	source.Metadata = map[string]any{"credential_uid": "uid-a"}
+	if _, errResolve := manager.Resolve(t.Context(), source); errResolve != nil {
+		t.Fatal(errResolve)
+	}
+	bindings := manager.SortedBindings()
+	if len(bindings) != 1 || bindings[0].CredentialUID != "uid-a" {
+		t.Fatalf("bindings = %+v", bindings)
+	}
+	if _, found, errExisting := manager.ResolveExistingBindingForCredential(t.Context(), source.ID, "uid-a"); errExisting != nil || !found {
+		t.Fatalf("matching binding = found %v, error %v", found, errExisting)
+	}
+	if _, found, errExisting := manager.ResolveExistingBindingForCredential(t.Context(), source.ID, "uid-b"); errExisting != nil || found {
+		t.Fatalf("replacement binding = found %v, error %v", found, errExisting)
+	}
+}
+
+func TestResolveStampsLegacyBindingWithCredentialGeneration(t *testing.T) {
+	manager := newTestManager(t, filepath.Join(t.TempDir(), "config.yaml"), proxyPoolTestConfig("3334"))
+	manager.check = successfulTrace
+	source := proxyPoolTestAuth("legacy-generation")
+	if _, errResolve := manager.Resolve(t.Context(), source); errResolve != nil {
+		t.Fatal(errResolve)
+	}
+	manager.mu.Lock()
+	binding := manager.bindings[source.ID]
+	binding.CredentialUID = ""
+	manager.bindings[source.ID] = binding
+	manager.mu.Unlock()
+	source.Metadata = map[string]any{"credential_uid": "uid-a"}
+	if _, errResolve := manager.Resolve(t.Context(), source); errResolve != nil {
+		t.Fatal(errResolve)
+	}
+	bindings := manager.SortedBindings()
+	if len(bindings) != 1 || bindings[0].CredentialUID != "uid-a" {
+		t.Fatalf("bindings = %+v", bindings)
+	}
+}
+
+func TestResolveDoesNotReuseBindingFromDifferentCredentialGeneration(t *testing.T) {
+	manager := newTestManager(t, filepath.Join(t.TempDir(), "config.yaml"), proxyPoolTestConfig("3334"))
+	var checks atomic.Int32
+	manager.check = func(ctx context.Context, proxyURL string) TraceResult {
+		checks.Add(1)
+		return successfulTrace(ctx, proxyURL)
+	}
+	auth := proxyPoolTestAuth("generation-replacement")
+	auth.Metadata = map[string]any{"credential_uid": "uid-a"}
+	if _, errResolve := manager.Resolve(t.Context(), auth); errResolve != nil {
+		t.Fatal(errResolve)
+	}
+	replacement := proxyPoolTestAuth(auth.ID)
+	if _, errResolve := manager.Resolve(t.Context(), replacement); errResolve != nil {
+		t.Fatal(errResolve)
+	}
+	if got := checks.Load(); got != 2 {
+		t.Fatalf("proxy checks = %d, want a fresh allocation for the replacement", got)
+	}
+	bindings := manager.SortedBindings()
+	if len(bindings) != 1 || bindings[0].CredentialUID != "" {
+		t.Fatalf("replacement binding = %+v", bindings)
+	}
+}
+
+func TestBindingStatusesHideDifferentCredentialGeneration(t *testing.T) {
+	manager := newTestManager(t, filepath.Join(t.TempDir(), "config.yaml"), proxyPoolTestConfig("3334"))
+	manager.check = successfulTrace
+	auth := proxyPoolTestAuth("status-generation")
+	auth.Metadata = map[string]any{"credential_uid": "uid-a"}
+	if _, errResolve := manager.Resolve(t.Context(), auth); errResolve != nil {
+		t.Fatal(errResolve)
+	}
+	replacement := proxyPoolTestAuth(auth.ID)
+	replacement.Metadata = map[string]any{"credential_uid": "uid-b"}
+	manager.SetAuthSource(staticAuthSource{replacement.ID: replacement})
+	if statuses := manager.BindingStatuses(); len(statuses) != 0 {
+		t.Fatalf("binding statuses = %+v, want stale generation hidden", statuses)
+	}
+	pools := manager.PoolStatuses()
+	if len(pools) != 1 || pools[0].BindingCount != 0 || len(pools[0].Bindings) != 0 {
+		t.Fatalf("pool statuses = %+v, want stale generation hidden", pools)
+	}
+}
+
+func TestCheckPoolSkipsDifferentCredentialGeneration(t *testing.T) {
+	manager := newTestManager(t, filepath.Join(t.TempDir(), "config.yaml"), proxyPoolTestConfig("3334"))
+	manager.check = successfulTrace
+	auth := proxyPoolTestAuth("check-generation")
+	auth.Metadata = map[string]any{"credential_uid": "uid-a"}
+	if _, errResolve := manager.Resolve(t.Context(), auth); errResolve != nil {
+		t.Fatal(errResolve)
+	}
+	replacement := proxyPoolTestAuth(auth.ID)
+	replacement.Metadata = map[string]any{"credential_uid": "uid-b"}
+	manager.SetAuthSource(staticAuthSource{replacement.ID: replacement})
+	var checks atomic.Int32
+	manager.check = func(ctx context.Context, proxyURL string) TraceResult {
+		checks.Add(1)
+		return successfulTrace(ctx, proxyURL)
+	}
+	results, errCheck := manager.CheckPool(t.Context(), "residential", 0)
+	if errCheck != nil {
+		t.Fatal(errCheck)
+	}
+	if len(results) != 0 {
+		t.Fatalf("CheckPool() results = %+v, want stale generation skipped", results)
+	}
+	if got := checks.Load(); got != 0 {
+		t.Fatalf("proxy checks = %d, want stale generation skipped", got)
+	}
+}
+
+func TestLinkedWebKeepsMissingSourceProxyBindingLive(t *testing.T) {
+	manager := newTestManager(t, filepath.Join(t.TempDir(), "config.yaml"), proxyPoolTestConfig("3334"))
+	manager.check = successfulTrace
+	source := proxyPoolTestAuth("source")
+	source.Metadata = map[string]any{"credential_uid": "uid-a"}
+	if _, errResolve := manager.Resolve(t.Context(), source); errResolve != nil {
+		t.Fatal(errResolve)
+	}
+	web := &coreauth.Auth{ID: "web", Provider: "chatgpt-web", Attributes: map[string]string{"priority": "99"}, Metadata: map[string]any{
+		"refresh_strategy": "codex_source", "source_auth_id": source.ID, "source_credential_uid": "uid-a",
+	}}
+	manager.SetAuthSource(staticAuthSource{web.ID: web})
+	manager.checkBoundNodes(t.Context())
+	if bindings := manager.SortedBindings(); len(bindings) != 1 || bindings[0].AuthID != source.ID {
+		t.Fatalf("bindings after source removal = %+v", bindings)
+	}
+}
+
+func TestBindingCleanupFinalCheckKeepsNewLinkedDependency(t *testing.T) {
+	manager := newTestManager(t, filepath.Join(t.TempDir(), "config.yaml"), proxyPoolTestConfig("3334"))
+	manager.check = successfulTrace
+	source := proxyPoolTestAuth("late-linked-source")
+	source.Metadata = map[string]any{"credential_uid": "uid-a"}
+	if _, errResolve := manager.Resolve(t.Context(), source); errResolve != nil {
+		t.Fatal(errResolve)
+	}
+	web := &coreauth.Auth{ID: "late-linked-web", Provider: "chatgpt-web", Metadata: map[string]any{
+		"refresh_strategy": "codex_source", "source_auth_id": source.ID, "source_credential_uid": "uid-a",
+	}}
+	manager.SetAuthSource(&sequencedListAuthSource{lists: [][]*coreauth.Auth{{}, {web}}})
+	manager.checkBoundNodes(t.Context())
+	if bindings := manager.SortedBindings(); len(bindings) != 1 || bindings[0].AuthID != source.ID {
+		t.Fatalf("bindings = %+v, want late linked dependency to preserve source binding", bindings)
+	}
+}
+
+func TestLinkedWebKeepsRetainedSourceProxyBindingAtSourcePriority(t *testing.T) {
+	cfg := proxyPoolTestConfig("3334")
+	cfg.ProxyRules[0].Priorities = []int{5}
+	manager := newTestManager(t, filepath.Join(t.TempDir(), "config.yaml"), cfg)
+	manager.check = successfulTrace
+	source := proxyPoolTestAuth("source")
+	source.Metadata = map[string]any{"credential_uid": "uid-a"}
+	source.Attributes["priority"] = "5"
+	if _, errResolve := manager.Resolve(t.Context(), source); errResolve != nil {
+		t.Fatal(errResolve)
+	}
+	retained := coreauth.RetainCodexAuthForChatGPTWebDependents(source, time.Now())
+	web := &coreauth.Auth{ID: "web", Provider: "chatgpt-web", Attributes: map[string]string{"priority": "0"}, Metadata: map[string]any{
+		"refresh_strategy": "codex_source", "source_auth_id": source.ID, "source_credential_uid": "uid-a",
+	}}
+	manager.SetAuthSource(staticAuthSource{source.ID: retained, web.ID: web})
+	manager.checkBoundNodes(t.Context())
+	if bindings := manager.SortedBindings(); len(bindings) != 1 || bindings[0].AuthID != source.ID {
+		t.Fatalf("bindings for retained source = %+v", bindings)
+	}
+}
+
 func TestRebindKeepsCurrentBindingWhenNoHealthyAlternativeExists(t *testing.T) {
 	t.Parallel()
 
@@ -1355,6 +1545,12 @@ type blockingGetAuthSource struct {
 	once    sync.Once
 }
 
+type sequencedListAuthSource struct {
+	mu    sync.Mutex
+	lists [][]*coreauth.Auth
+	calls int
+}
+
 type incrementingReader struct {
 	mu    sync.Mutex
 	value byte
@@ -1404,10 +1600,34 @@ func (s *blockingAuthSource) GetByID(id string) (*coreauth.Auth, bool) {
 	return s.auth, true
 }
 
-func (*blockingGetAuthSource) List() []*coreauth.Auth { return nil }
-
-func (s *blockingGetAuthSource) GetByID(string) (*coreauth.Auth, bool) {
+func (s *blockingGetAuthSource) List() []*coreauth.Auth {
 	s.once.Do(func() { close(s.started) })
 	<-s.release
+	return nil
+}
+
+func (*blockingGetAuthSource) GetByID(string) (*coreauth.Auth, bool) { return nil, false }
+
+func (s *sequencedListAuthSource) List() []*coreauth.Auth {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.lists) == 0 {
+		return nil
+	}
+	index := s.calls
+	if index >= len(s.lists) {
+		index = len(s.lists) - 1
+	}
+	s.calls++
+	return append([]*coreauth.Auth(nil), s.lists[index]...)
+}
+
+func (s *sequencedListAuthSource) GetByID(id string) (*coreauth.Auth, bool) {
+	auths := s.List()
+	for _, auth := range auths {
+		if auth != nil && auth.ID == id {
+			return auth, true
+		}
+	}
 	return nil, false
 }

@@ -449,7 +449,7 @@ func (s *retiringRolledBackDeleteStore) DeleteIfSourceHashMatches(ctx context.Co
 func TestDeleteAuthFileAllContinuesWhenListedFileDisappears(t *testing.T) {
 	authDir := t.TempDir()
 	for _, name := range []string{"alpha.json", "beta.json", "gamma.json"} {
-		if errWrite := os.WriteFile(filepath.Join(authDir, name), []byte(`{"type":"codex"}`), 0o600); errWrite != nil {
+		if errWrite := os.WriteFile(filepath.Join(authDir, name), []byte(`{"type":"gemini"}`), 0o600); errWrite != nil {
 			t.Fatalf("write %s: %v", name, errWrite)
 		}
 	}
@@ -507,7 +507,7 @@ func TestDeleteAuthFileBatchFailureIncludesItemStatus(t *testing.T) {
 			authDir := t.TempDir()
 			names := []string{"alpha.json", "beta.json"}
 			for _, name := range names {
-				if errWrite := os.WriteFile(filepath.Join(authDir, name), []byte(`{"type":"codex"}`), 0o600); errWrite != nil {
+				if errWrite := os.WriteFile(filepath.Join(authDir, name), []byte(`{"type":"gemini"}`), 0o600); errWrite != nil {
 					t.Fatalf("write %s: %v", name, errWrite)
 				}
 			}
@@ -655,7 +655,7 @@ func TestDeleteAuthFile_FallbackToAuthDirPath(t *testing.T) {
 	authDir := t.TempDir()
 	fileName := "fallback-user.json"
 	filePath := filepath.Join(authDir, fileName)
-	if errWrite := os.WriteFile(filePath, []byte(`{"type":"codex"}`), 0o600); errWrite != nil {
+	if errWrite := os.WriteFile(filePath, []byte(`{"type":"gemini"}`), 0o600); errWrite != nil {
 		t.Fatalf("failed to write auth file: %v", errWrite)
 	}
 
@@ -677,7 +677,7 @@ func TestDeleteAuthFile_FallbackToAuthDirPath(t *testing.T) {
 	}
 }
 
-func TestDeleteAuthFile_WithNilManagerDeletesLocalFile(t *testing.T) {
+func TestDeleteAuthFile_WithNilManagerRejectsDependencyProvider(t *testing.T) {
 	authDir := t.TempDir()
 	const fileName = "nil-manager.json"
 	filePath := filepath.Join(authDir, fileName)
@@ -692,11 +692,11 @@ func TestDeleteAuthFile_WithNilManagerDeletesLocalFile(t *testing.T) {
 	ctx.Request = httptest.NewRequest(http.MethodDelete, "/v0/management/auth-files?name="+url.QueryEscape(fileName), nil)
 	h.DeleteAuthFile(ctx)
 
-	if recorder.Code != http.StatusOK {
-		t.Fatalf("delete status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("delete status = %d, want 503; body=%s", recorder.Code, recorder.Body.String())
 	}
-	if _, errStat := os.Stat(filePath); !os.IsNotExist(errStat) {
-		t.Fatalf("auth file still exists: %v", errStat)
+	if _, errStat := os.Stat(filePath); errStat != nil {
+		t.Fatalf("dependency credential was removed: %v", errStat)
 	}
 }
 
@@ -706,7 +706,7 @@ func TestDeleteAuthFile_DirectStoreCommittedOutcomeSucceeds(t *testing.T) {
 		content string
 		manager *coreauth.Manager
 	}{
-		{name: "manager unavailable", content: `{"type":"codex"}`},
+		{name: "manager unavailable", content: `{"type":"gemini"}`},
 		{name: "retired file", content: `{"type":"gemini"}`, manager: coreauth.NewManager(nil, nil, nil)},
 	}
 	for _, test := range tests {
@@ -743,7 +743,7 @@ func TestDeleteAuthFile_ManagerStoreCommittedOutcomeSucceeds(t *testing.T) {
 	authDir := t.TempDir()
 	const fileName = "managed-committed-delete.json"
 	filePath := filepath.Join(authDir, fileName)
-	if errWrite := os.WriteFile(filePath, []byte(`{"type":"codex"}`), 0o600); errWrite != nil {
+	if errWrite := os.WriteFile(filePath, []byte(`{"type":"gemini"}`), 0o600); errWrite != nil {
 		t.Fatalf("write auth file: %v", errWrite)
 	}
 	manager := coreauth.NewManager(nil, nil, nil)
@@ -780,7 +780,7 @@ func TestDeleteAuthFile_CustomStoreKeepsQuarantineWhenLocalCleanupFails(t *testi
 	configPath := filepath.Join(configDir, "config.yaml")
 	const fileName = "custom-cleanup-failure.json"
 	filePath := filepath.Join(authDir, fileName)
-	if errWrite := os.WriteFile(filePath, []byte(`{"type":"codex"}`), 0o600); errWrite != nil {
+	if errWrite := os.WriteFile(filePath, []byte(`{"type":"gemini"}`), 0o600); errWrite != nil {
 		t.Fatalf("write auth file: %v", errWrite)
 	}
 
@@ -812,10 +812,10 @@ func TestDeleteAuthFile_CustomStoreKeepsQuarantineForConcurrentReplacement(t *te
 	configPath := filepath.Join(configDir, "config.yaml")
 	const fileName = "custom-replacement.json"
 	filePath := filepath.Join(authDir, fileName)
-	if errWrite := os.WriteFile(filePath, []byte(`{"type":"codex","generation":"old"}`), 0o600); errWrite != nil {
+	if errWrite := os.WriteFile(filePath, []byte(`{"type":"gemini","generation":"old"}`), 0o600); errWrite != nil {
 		t.Fatalf("write auth file: %v", errWrite)
 	}
-	replacement := []byte(`{"type":"codex","generation":"new"}`)
+	replacement := []byte(`{"type":"gemini","generation":"new"}`)
 	h := NewHandler(&config.Config{AuthDir: authDir}, configPath, nil)
 	h.tokenStore = &committedReplacementStore{path: filePath, replacement: replacement}
 	recorder := httptest.NewRecorder()
@@ -852,7 +852,7 @@ func TestDeleteLocalAuthFileDurablyClearsPriorQuarantineWhenFileIsMissing(t *tes
 	}
 	defer root.Close()
 	h := NewHandler(&config.Config{AuthDir: authDir}, configPath, nil)
-	if errDelete := h.deleteLocalAuthFileDurably(t.Context(), sdkAuth.NewFileTokenStore(), root, authDir, fileName); errDelete != nil {
+	if errDelete := h.deleteLocalAuthFileDurably(t.Context(), sdkAuth.NewFileTokenStore(), root, authDir, fileName, ""); errDelete != nil {
 		t.Fatalf("deleteLocalAuthFileDurably() error = %v", errDelete)
 	}
 	if authfileguard.IsQuarantined(path) {

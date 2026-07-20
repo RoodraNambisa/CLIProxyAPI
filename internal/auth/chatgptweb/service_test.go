@@ -986,6 +986,145 @@ func TestServiceRefreshInvalidGrant(t *testing.T) {
 	}
 }
 
+func TestServiceRefreshRejectsAccountSwitch(t *testing.T) {
+	expiresAt := time.Now().Add(time.Hour).Unix()
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
+		response.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprintf(response, `{"access_token":%q,"refresh_token":"rotated"}`, testIdentityJWT(expiresAt, "account-b", "user-b", "other@example.com"))
+	}))
+	defer server.Close()
+	service := NewService(Options{AuthBaseURL: server.URL, Rand: zeroReader{}})
+	credential, errRefresh := service.Refresh(t.Context(), Credential{
+		Email: "person@example.com", AccountID: "account-a", UserID: "user-a",
+		AccessToken: "old-token", RefreshToken: "refresh", Persona: DefaultPersona(), LifecycleState: LifecycleActive,
+	}, "")
+	if errRefresh == nil {
+		t.Fatal("Refresh() accepted a different account")
+	}
+	authError, ok := AsAuthError(errRefresh)
+	if !ok || authError.Code != "identity_conflict" || !authError.Terminal || authError.State != LifecycleReauthRequired {
+		t.Fatalf("Refresh() error = %#v", errRefresh)
+	}
+	if credential.AccountID != "account-a" || credential.AccessToken != "old-token" || credential.RefreshToken != "refresh" {
+		t.Fatalf("credential changed after identity conflict: %#v", credential)
+	}
+}
+
+func TestCredentialIdentityConflictsRejectsConflictingTokenEvidence(t *testing.T) {
+	expiresAt := time.Now().Add(time.Hour).Unix()
+	existing := &Credential{Email: "person@example.com", AccountID: "account-a", UserID: "user-a"}
+	tests := []struct {
+		name     string
+		incoming *Credential
+	}{
+		{
+			name: "access token conflicts with explicit session identity",
+			incoming: &Credential{
+				Email: "person@example.com", AccountID: "account-a", UserID: "user-a",
+				AccessToken: testIdentityJWT(expiresAt, "account-b", "user-b", "other@example.com"),
+			},
+		},
+		{
+			name: "id token conflicts with access token",
+			incoming: &Credential{
+				AccessToken: testIdentityJWT(expiresAt, "account-a", "user-a", "person@example.com"),
+				IDToken:     testIdentityJWT(expiresAt, "account-b", "user-b", "other@example.com"),
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if !credentialIdentityConflicts(existing, test.incoming) {
+				t.Fatal("credentialIdentityConflicts() = false, want conflicting independent evidence rejected")
+			}
+		})
+	}
+}
+
+func TestServiceRefreshSession(t *testing.T) {
+	fixedNow := time.Date(2026, time.July, 19, 12, 0, 0, 0, time.UTC)
+	expiresAt := fixedNow.Add(2 * time.Hour).Unix()
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		if request.URL.Path == "/set-session" {
+			http.SetCookie(response, &http.Cookie{Name: "next-auth.session-token", Value: "session-value", Path: "/", HttpOnly: true})
+			response.WriteHeader(http.StatusNoContent)
+			return
+		}
+		if request.URL.Path != "/api/auth/session" || request.URL.Query().Get("refresh") != "true" {
+			http.NotFound(response, request)
+			return
+		}
+		if cookie, err := request.Cookie("next-auth.session-token"); err != nil || cookie.Value != "session-value" {
+			t.Errorf("session cookie = %#v, err = %v", cookie, err)
+		}
+		http.SetCookie(response, &http.Cookie{Name: "next-auth.session-token", Value: "rotated", Path: "/", Secure: false})
+		response.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(response, `{"accessToken":"`+testJWT(expiresAt)+`","expires":"ignored","user":{"id":"user-a","email":"person@example.com"},"account":{"id":"account-a","planType":"team"}}`)
+	}))
+	defer server.Close()
+	seedClient, err := NewClient(DefaultPersona(), "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, _, err := seedClient.DoFollow(t.Context(), http.MethodGet, server.URL+"/set-session", nil, nil)
+	if err != nil || response.StatusCode != http.StatusNoContent {
+		t.Fatalf("seed session cookie: status=%v err=%v", response, err)
+	}
+	cookies := seedClient.ExportCookies()
+	seedClient.CloseIdleConnections()
+	service := NewService(Options{SessionBaseURL: server.URL, Rand: zeroReader{}, Now: func() time.Time { return fixedNow }})
+	credential, err := service.RefreshSession(t.Context(), Credential{
+		AccessToken:     "old",
+		RefreshStrategy: RefreshStrategyChatGPTSession,
+		Persona:         DefaultPersona(),
+		Cookies:         cookies,
+	}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if credential.Email != "person@example.com" || credential.AccountID != "account-a" || credential.UserID != "user-a" || credential.PlanType != "team" {
+		t.Fatalf("session identity = %#v", credential)
+	}
+	if credential.RefreshStrategy != RefreshStrategyChatGPTSession || credential.LifecycleState != LifecycleActive {
+		t.Fatalf("session state = %q/%q", credential.RefreshStrategy, credential.LifecycleState)
+	}
+	if credential.Expired != time.Unix(expiresAt, 0).UTC().Format(time.RFC3339) || credential.LastRefreshAt != fixedNow.Format(time.RFC3339) {
+		t.Fatalf("session timestamps = %q/%q", credential.Expired, credential.LastRefreshAt)
+	}
+}
+
+func TestServiceRefreshSessionRejectsAccountSwitch(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/api/auth/session" {
+			http.NotFound(response, request)
+			return
+		}
+		response.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(response, `{"accessToken":"opaque-new-token","user":{"id":"user-b","email":"other@example.com"},"account":{"id":"account-b"}}`)
+	}))
+	defer server.Close()
+	cookies, errCookies := ParseCookieHeader("next-auth.session-token=session-value", server.URL)
+	if errCookies != nil {
+		t.Fatal(errCookies)
+	}
+	service := NewService(Options{SessionBaseURL: server.URL, Rand: zeroReader{}})
+	credential, errRefresh := service.RefreshSession(t.Context(), Credential{
+		Email: "person@example.com", AccountID: "account-a", UserID: "user-a",
+		AccessToken: "old-token", RefreshStrategy: RefreshStrategyChatGPTSession,
+		Persona: DefaultPersona(), Cookies: cookies, LifecycleState: LifecycleActive,
+	}, "")
+	if errRefresh == nil {
+		t.Fatal("RefreshSession() accepted a different account")
+	}
+	authError, ok := AsAuthError(errRefresh)
+	if !ok || authError.Code != "identity_conflict" || !authError.Terminal || authError.State != LifecycleReauthRequired {
+		t.Fatalf("RefreshSession() error = %#v", errRefresh)
+	}
+	if credential.AccountID != "account-a" || credential.Email != "person@example.com" || credential.LifecycleState != LifecycleReauthRequired {
+		t.Fatalf("credential = %#v", credential)
+	}
+}
+
 func TestServiceRefreshMigratesBrowserIdentity(t *testing.T) {
 	expiresAt := time.Date(2026, time.July, 18, 0, 0, 0, 0, time.UTC).Unix()
 	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
@@ -1071,5 +1210,17 @@ func TestOAuthValuesDoNotGenerateUnusedDeviceID(t *testing.T) {
 
 func testJWT(expiresAt int64) string {
 	payload, _ := json.Marshal(map[string]int64{"exp": expiresAt})
+	return "e30." + base64.RawURLEncoding.EncodeToString(payload) + ".signature"
+}
+
+func testIdentityJWT(expiresAt int64, accountID, userID, email string) string {
+	payload, _ := json.Marshal(map[string]any{
+		"exp":   expiresAt,
+		"email": email,
+		"https://api.openai.com/auth": map[string]any{
+			"chatgpt_account_id": accountID,
+			"chatgpt_user_id":    userID,
+		},
+	})
 	return "e30." + base64.RawURLEncoding.EncodeToString(payload) + ".signature"
 }

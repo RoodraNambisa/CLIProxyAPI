@@ -120,6 +120,10 @@ func (h *Handler) APICall(c *gin.Context) {
 	authIndex := firstNonEmptyString(body.AuthIndexSnake, body.AuthIndexCamel, body.AuthIndexPascal)
 	auth := h.authByIndex(authIndex)
 	if auth != nil {
+		if coreauth.ChatGPTWebAuthRetainedForDependents(auth) {
+			c.JSON(http.StatusConflict, gin.H{"error": "credential is retained for Web dependents"})
+			return
+		}
 		retiredFile, errCheck := h.authBackedByRetiredGeminiCLIFile(auth)
 		if errCheck != nil {
 			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "unable to verify auth file"})

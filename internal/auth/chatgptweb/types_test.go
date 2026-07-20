@@ -2,8 +2,68 @@ package chatgptweb
 
 import (
 	"encoding/json"
+	"net/http"
 	"testing"
+	"time"
 )
+
+func TestHasSessionCookieValidatesScopeExpiryAndChunks(t *testing.T) {
+	now := time.Date(2026, time.July, 19, 12, 0, 0, 0, time.UTC)
+	base := Cookie{Name: "__Secure-next-auth.session-token", Value: "session", Domain: "chatgpt.com", Path: "/", Secure: true}
+	if !hasSessionCookieAt([]Cookie{base}, now) {
+		t.Fatal("valid session cookie was rejected")
+	}
+	legacy := base
+	legacy.Domain = ""
+	legacy.Path = ""
+	if hasSessionCookieAt([]Cookie{legacy}, now) {
+		t.Fatal("unscoped session cookie was accepted without normalization")
+	}
+	wrongDomain := base
+	wrongDomain.Domain = "example.com"
+	if hasSessionCookieAt([]Cookie{wrongDomain}, now) {
+		t.Fatal("foreign-domain session cookie was accepted")
+	}
+	wrongPath := base
+	wrongPath.Path = "/other"
+	if hasSessionCookieAt([]Cookie{wrongPath}, now) {
+		t.Fatal("wrong-path session cookie was accepted")
+	}
+	expired := base
+	expired.RawExpires = now.Add(-time.Minute).Format(http.TimeFormat)
+	if hasSessionCookieAt([]Cookie{expired}, now) {
+		t.Fatal("expired session cookie was accepted")
+	}
+	unanchoredMaxAge := base
+	unanchoredMaxAge.MaxAge = 60
+	if hasSessionCookieAt([]Cookie{unanchoredMaxAge}, now) {
+		t.Fatal("persisted positive Max-Age without an absolute expiry was accepted")
+	}
+	firstChunk := base
+	firstChunk.Name += ".0"
+	if hasSessionCookieAt([]Cookie{firstChunk}, now) {
+		t.Fatal("incomplete chunked session cookie was accepted")
+	}
+	secondChunk := base
+	secondChunk.Name += ".1"
+	if !hasSessionCookieAt([]Cookie{firstChunk, secondChunk}, now) {
+		t.Fatal("complete chunked session cookie was rejected")
+	}
+}
+
+func TestDecodeCredentialScopesLegacySessionCookie(t *testing.T) {
+	credential, errDecode := DecodeCredential([]byte(`{"type":"chatgpt-web","cookies":[{"name":"next-auth.session-token","value":"session"}]}`))
+	if errDecode != nil {
+		t.Fatal(errDecode)
+	}
+	if credential.RefreshStrategy != RefreshStrategyChatGPTSession || len(credential.Cookies) != 1 {
+		t.Fatalf("credential = %+v", credential)
+	}
+	cookie := credential.Cookies[0]
+	if cookie.Domain != "chatgpt.com" || cookie.Host != "chatgpt.com" || cookie.Path != "/" || !cookie.Secure {
+		t.Fatalf("scoped cookie = %+v", cookie)
+	}
+}
 
 func TestCredentialMetadataRoundTrip(t *testing.T) {
 	t.Parallel()
@@ -143,5 +203,41 @@ func TestCredentialMetadataInfersLegacyLifecycleState(t *testing.T) {
 				t.Fatalf("persisted lifecycle state = %v, want %q", metadata["lifecycle_state"], test.want)
 			}
 		})
+	}
+}
+
+func TestCredentialMetadataInfersLegacyRefreshStrategy(t *testing.T) {
+	tests := []struct {
+		name     string
+		metadata map[string]any
+		want     RefreshStrategy
+		mode     string
+	}{
+		{name: "oauth refresh token", metadata: map[string]any{"refresh_token": "refresh"}, want: RefreshStrategyWebOAuthRT, mode: CredentialModeNative},
+		{name: "session cookie", metadata: map[string]any{"cookies": []map[string]any{{"name": "__Secure-next-auth.session-token", "value": "session"}}}, want: RefreshStrategyChatGPTSession, mode: CredentialModeNative},
+		{name: "legacy password login", metadata: map[string]any{"access_token": "access", "email": "person@example.com", "password": "secret"}, want: RefreshStrategyWebOAuthRT, mode: CredentialModeNative},
+		{name: "codex source", metadata: map[string]any{"source_auth_id": "codex-a.json", "source_credential_uid": "source-uid"}, want: RefreshStrategyCodexSource, mode: CredentialModeLinkedCodex},
+		{name: "partial codex source with oauth refresh token", metadata: map[string]any{"source_auth_id": "stale-codex.json", "refresh_token": "refresh"}, want: RefreshStrategyWebOAuthRT, mode: CredentialModeNative},
+		{name: "partial codex source without refresh material", metadata: map[string]any{"source_credential_uid": "stale-uid", "access_token": "access"}, want: RefreshStrategyTokenOnly, mode: CredentialModeTokenOnly},
+		{name: "access token only", metadata: map[string]any{"access_token": "access"}, want: RefreshStrategyTokenOnly, mode: CredentialModeTokenOnly},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			test.metadata["type"] = Provider
+			credential, err := ParseCredential(test.metadata)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if credential.RefreshStrategy != test.want || credential.CredentialMode != test.mode {
+				t.Fatalf("strategy/mode = %q/%q, want %q/%q", credential.RefreshStrategy, credential.CredentialMode, test.want, test.mode)
+			}
+		})
+	}
+}
+
+func TestCredentialMetadataRejectsUnknownRefreshStrategy(t *testing.T) {
+	_, err := ParseCredential(map[string]any{"type": Provider, "refresh_strategy": "unknown"})
+	if err == nil {
+		t.Fatal("ParseCredential() succeeded with unknown refresh strategy")
 	}
 }

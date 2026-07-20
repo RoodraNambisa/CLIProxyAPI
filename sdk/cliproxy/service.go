@@ -1707,6 +1707,10 @@ func (s *Service) handleAuthUpdate(ctx context.Context, update watcher.AuthUpdat
 	if s == nil {
 		return
 	}
+	if update.Action == watcher.AuthUpdateActionReconcileChatGPTWebDependencies {
+		_, _ = s.reconcileChatGPTWebDependencies(ctx, "watcher")
+		return
+	}
 	if update.Action == watcher.AuthUpdateActionBarrier {
 		if update.Applied != nil {
 			close(update.Applied)
@@ -1789,6 +1793,43 @@ func (s *Service) handleAuthUpdate(ctx context.Context, update watcher.AuthUpdat
 	default:
 		log.Debugf("received unknown auth update action: %v", update.Action)
 	}
+}
+
+func (s *Service) reconcileChatGPTWebDependencies(ctx context.Context, reason string) ([]string, error) {
+	if s == nil || s.coreManager == nil {
+		return nil, nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	indexesByID := make(map[string]string)
+	for _, auth := range s.coreManager.List() {
+		if auth == nil || !coreauth.ChatGPTWebAuthRetainedForDependents(auth) {
+			continue
+		}
+		indexesByID[auth.ID] = auth.EnsureIndex()
+	}
+	deletedIDs, errReconcile := s.coreManager.ReconcileChatGPTWebDependencies(ctx)
+	if errReconcile != nil {
+		log.WithError(errReconcile).WithField("reason", reason).Warn("failed to reconcile ChatGPT Web credential dependencies")
+	}
+	if len(deletedIDs) == 0 {
+		return nil, errReconcile
+	}
+	indexes := make([]string, 0, len(deletedIDs))
+	for _, id := range deletedIDs {
+		executorhelps.CloseProxyTransportCachesForAuth(id)
+		s.cleanupChatGPTWebModelResourcesAfterDelete(id, "")
+		if index := strings.TrimSpace(indexesByID[id]); index != "" {
+			indexes = append(indexes, index)
+		}
+	}
+	s.removeUsageStatisticsForAuthIndexes(indexes, "chatgpt web dependency reconcile")
+	if s.reconcileUsageStatistics("chatgpt web dependency reconcile") > 0 {
+		s.persistUsageStatistics("chatgpt-web-dependency-reconcile")
+	}
+	log.WithFields(log.Fields{"reason": reason, "deleted": len(deletedIDs)}).Info("removed retained Codex credentials without Web dependents")
+	return deletedIDs, errReconcile
 }
 
 func (s *Service) ensureWebsocketGateway() {
@@ -2645,6 +2686,7 @@ func (s *Service) Run(ctx context.Context) error {
 		}
 	}
 	s.restoreUsageStatistics()
+	_, _ = s.reconcileChatGPTWebDependencies(ctx, "startup")
 	if s.reconcileUsageStatistics("startup") > 0 {
 		s.persistUsageStatistics("startup-reconcile")
 	}
@@ -2675,6 +2717,7 @@ func (s *Service) Run(ctx context.Context) error {
 	// handlers no longer depend on legacy clients; pass nil slice initially
 	serverOpts := append([]api.ServerOption(nil), s.serverOptions...)
 	serverOpts = append(serverOpts, api.WithAuthStatusHook(s.handleManagementAuthStatusChange))
+	serverOpts = append(serverOpts, api.WithChatGPTWebDependencyReconcileHook(s.reconcileChatGPTWebDependencies))
 	serverOpts = append(serverOpts, api.WithProxyPoolManager(s.proxyPoolManager))
 	s.server = api.NewServer(s.cfg, s.coreManager, s.accessManager, s.configPath, serverOpts...)
 

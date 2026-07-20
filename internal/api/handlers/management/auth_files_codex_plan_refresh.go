@@ -3,10 +3,12 @@ package management
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
+	"reflect"
 	"strings"
 	"time"
 
@@ -35,6 +37,8 @@ const (
 )
 
 var codexPlanTypeRefreshUsageURL = "https://chatgpt.com/backend-api/wham/usage"
+
+var errCodexPlanTypeRefreshCredentialChanged = errors.New("credential changed while plan type refresh was running")
 
 type codexPlanTypeRefreshSummary struct {
 	Eligible  int `json:"eligible"`
@@ -394,6 +398,9 @@ func isCodexPlanTypeRefreshEligibleAuth(auth *coreauth.Auth) bool {
 	if !strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") {
 		return false
 	}
+	if auth.Disabled || auth.Status == coreauth.StatusDisabled || coreauth.ChatGPTWebAuthRetainedForDependents(auth) {
+		return false
+	}
 	if isRuntimeOnlyAuth(auth) {
 		return false
 	}
@@ -466,6 +473,15 @@ func (h *Handler) refreshSingleCodexPlanType(manager *coreauth.Manager, auth *co
 		AuthID:         strings.TrimSpace(auth.ID),
 		PlanTypeBefore: effectiveCodexPlanType(auth),
 	}
+	current, ok := manager.GetByID(auth.ID)
+	if !ok || !isCodexPlanTypeRefreshEligibleAuth(current) {
+		result.Status = codexPlanTypeRefreshStatusSkipped
+		result.Error = "credential is no longer eligible"
+		return result
+	}
+	auth = current
+	expected := current.Clone()
+	result.PlanTypeBefore = effectiveCodexPlanType(auth)
 	retired, errRetired := h.authBackedByRetiredGeminiCLIFile(auth)
 	if errRetired != nil {
 		result.Status = codexPlanTypeRefreshStatusFailed
@@ -510,7 +526,7 @@ func (h *Handler) refreshSingleCodexPlanType(manager *coreauth.Manager, auth *co
 	}
 	if accessToken == "" {
 		if forcePersist {
-			if err := persistCodexPlanTypeRefreshAuth(context.Background(), manager, auth, "", accountID, true); err != nil {
+			if err := h.persistCodexPlanTypeRefreshAuth(context.Background(), manager, expected, auth, "", accountID, true); err != nil {
 				result.Status = codexPlanTypeRefreshStatusFailed
 				result.Error = fmt.Sprintf("persist refreshed auth: %v", err)
 				return result
@@ -526,7 +542,7 @@ func (h *Handler) refreshSingleCodexPlanType(manager *coreauth.Manager, auth *co
 		auth, err = refreshCodexPlanTypeAuth(manager, auth)
 		if err != nil {
 			if forcePersist {
-				if errPersist := persistCodexPlanTypeRefreshAuth(context.Background(), manager, auth, "", accountID, true); errPersist != nil {
+				if errPersist := h.persistCodexPlanTypeRefreshAuth(context.Background(), manager, expected, auth, "", accountID, true); errPersist != nil {
 					result.Status = codexPlanTypeRefreshStatusFailed
 					result.HTTPStatus = statusCode
 					result.Error = fmt.Sprintf("persist refreshed auth: %v", errPersist)
@@ -542,7 +558,7 @@ func (h *Handler) refreshSingleCodexPlanType(manager *coreauth.Manager, auth *co
 		accountID = firstNonEmptyValue(internalcodex.EffectiveAccountID(auth.Metadata), accountID)
 		accessToken = codexAccessTokenFromMetadata(auth.Metadata)
 		if accessToken == "" {
-			if errPersist := persistCodexPlanTypeRefreshAuth(context.Background(), manager, auth, "", accountID, true); errPersist != nil {
+			if errPersist := h.persistCodexPlanTypeRefreshAuth(context.Background(), manager, expected, auth, "", accountID, true); errPersist != nil {
 				result.Status = codexPlanTypeRefreshStatusFailed
 				result.HTTPStatus = statusCode
 				result.Error = fmt.Sprintf("persist refreshed auth: %v", errPersist)
@@ -557,7 +573,7 @@ func (h *Handler) refreshSingleCodexPlanType(manager *coreauth.Manager, auth *co
 	}
 	if err != nil {
 		if forcePersist {
-			if errPersist := persistCodexPlanTypeRefreshAuth(context.Background(), manager, auth, "", accountID, true); errPersist != nil {
+			if errPersist := h.persistCodexPlanTypeRefreshAuth(context.Background(), manager, expected, auth, "", accountID, true); errPersist != nil {
 				result.Status = codexPlanTypeRefreshStatusFailed
 				result.HTTPStatus = statusCode
 				result.Error = fmt.Sprintf("persist refreshed auth: %v", errPersist)
@@ -572,7 +588,7 @@ func (h *Handler) refreshSingleCodexPlanType(manager *coreauth.Manager, auth *co
 
 	result.HTTPStatus = statusCode
 	result.PlanTypeAfter = planType
-	if err = persistCodexPlanTypeRefreshAuth(context.Background(), manager, auth, planType, accountID, forcePersist); err != nil {
+	if err = h.persistCodexPlanTypeRefreshAuth(context.Background(), manager, expected, auth, planType, accountID, forcePersist); err != nil {
 		result.Status = codexPlanTypeRefreshStatusFailed
 		result.Error = fmt.Sprintf("persist auth: %v", err)
 		return result
@@ -615,10 +631,28 @@ func refreshCodexPlanTypeAuth(manager *coreauth.Manager, auth *coreauth.Auth) (*
 	return auth, nil
 }
 
-func persistCodexPlanTypeRefreshAuth(ctx context.Context, manager *coreauth.Manager, auth *coreauth.Auth, planType string, accountID string, forcePersist bool) error {
-	if manager == nil || auth == nil {
+func (h *Handler) persistCodexPlanTypeRefreshAuth(ctx context.Context, manager *coreauth.Manager, expected, refreshed *coreauth.Auth, planType string, accountID string, forcePersist bool) error {
+	if h == nil || manager == nil || expected == nil || refreshed == nil {
 		return fmt.Errorf("core auth manager unavailable")
 	}
+	h.chatGPTWebDependencyMu.Lock()
+	lockedCtx, unlockAuth, errLock := manager.LockAuthMutation(ctx, expected)
+	if errLock != nil {
+		h.chatGPTWebDependencyMu.Unlock()
+		return errLock
+	}
+	defer func() {
+		unlockAuth()
+		h.chatGPTWebDependencyMu.Unlock()
+	}()
+	current, ok := manager.GetByID(expected.ID)
+	if !ok || current == nil || !strings.EqualFold(strings.TrimSpace(current.Provider), "codex") || coreauth.ChatGPTWebAuthRetainedForDependents(current) {
+		return errCodexPlanTypeRefreshCredentialChanged
+	}
+	if expectedUID := coreauth.ChatGPTWebCredentialUID(expected); expectedUID != "" && coreauth.ChatGPTWebCredentialUID(current) != expectedUID {
+		return errCodexPlanTypeRefreshCredentialChanged
+	}
+	auth := current.Clone()
 	if auth.Metadata == nil {
 		auth.Metadata = make(map[string]any)
 	}
@@ -629,22 +663,44 @@ func persistCodexPlanTypeRefreshAuth(ctx context.Context, manager *coreauth.Mana
 	changed := forcePersist
 	planType = strings.TrimSpace(planType)
 	accountID = strings.TrimSpace(accountID)
-
 	if planType != "" {
-		if current := strings.TrimSpace(stringValue(auth.Metadata, "plan_type")); current != planType {
-			auth.Metadata["plan_type"] = planType
-			changed = true
-		}
-		if current := strings.TrimSpace(auth.Attributes["plan_type"]); current != planType {
-			auth.Attributes["plan_type"] = planType
-			changed = true
+		currentPlanType := strings.TrimSpace(effectiveCodexPlanType(current))
+		expectedPlanType := strings.TrimSpace(effectiveCodexPlanType(expected))
+		if !strings.EqualFold(currentPlanType, expectedPlanType) && !strings.EqualFold(currentPlanType, planType) {
+			return errCodexPlanTypeRefreshCredentialChanged
 		}
 	}
 	if accountID != "" {
-		if current := strings.TrimSpace(stringValue(auth.Metadata, "account_id")); current != accountID {
-			auth.Metadata["account_id"] = accountID
-			changed = true
+		currentAccountID := strings.TrimSpace(internalcodex.EffectiveAccountID(current.Metadata))
+		expectedAccountID := strings.TrimSpace(internalcodex.EffectiveAccountID(expected.Metadata))
+		if currentAccountID != expectedAccountID && currentAccountID != accountID {
+			return errCodexPlanTypeRefreshCredentialChanged
 		}
+	}
+	if forcePersist {
+		merged, conflict := mergeCodexPlanTypeRefreshMetadata(auth.Metadata, expected.Metadata, refreshed.Metadata)
+		if conflict {
+			return errCodexPlanTypeRefreshCredentialChanged
+		}
+		changed = merged || changed
+	}
+	if planType != "" {
+		metadataChanged, conflict := setCodexPlanTypeRefreshMetadataString(auth.Metadata, current.Metadata, expected.Metadata, "plan_type", planType)
+		if conflict {
+			return errCodexPlanTypeRefreshCredentialChanged
+		}
+		attributeChanged, conflict := setCodexPlanTypeRefreshAttribute(auth.Attributes, current.Attributes, expected.Attributes, "plan_type", planType)
+		if conflict {
+			return errCodexPlanTypeRefreshCredentialChanged
+		}
+		changed = metadataChanged || attributeChanged || changed
+	}
+	if accountID != "" {
+		metadataChanged, conflict := setCodexPlanTypeRefreshMetadataString(auth.Metadata, current.Metadata, expected.Metadata, "account_id", accountID)
+		if conflict {
+			return errCodexPlanTypeRefreshCredentialChanged
+		}
+		changed = metadataChanged || changed
 	}
 
 	if !changed {
@@ -652,8 +708,88 @@ func persistCodexPlanTypeRefreshAuth(ctx context.Context, manager *coreauth.Mana
 	}
 
 	auth.UpdatedAt = time.Now().UTC()
-	_, err := manager.Update(ctx, auth)
-	return err
+	var (
+		currentMatch bool
+		errUpdate    error
+	)
+	if strings.TrimSpace(current.Attributes[coreauth.SourceHashAttributeKey]) != "" && manager.SupportsSourceConditionalSave() {
+		_, currentMatch, errUpdate = manager.UpdateIfCurrentSourceHash(lockedCtx, current, auth)
+	} else {
+		_, currentMatch, errUpdate = manager.UpdateIfCurrent(lockedCtx, current, auth)
+	}
+	if errUpdate != nil {
+		if outcome, explicit := coreauth.SaveOutcomeFromError(errUpdate); explicit && outcome == coreauth.SaveOutcomeRolledBack {
+			return errCodexPlanTypeRefreshCredentialChanged
+		}
+		return errUpdate
+	}
+	if !currentMatch {
+		return errCodexPlanTypeRefreshCredentialChanged
+	}
+	return nil
+}
+
+func setCodexPlanTypeRefreshMetadataString(target, current, before map[string]any, key, value string) (changed, conflict bool) {
+	currentValue, currentExists := current[key]
+	beforeValue, beforeExists := before[key]
+	if currentExists != beforeExists || !reflect.DeepEqual(currentValue, beforeValue) {
+		if strings.EqualFold(strings.TrimSpace(stringValue(current, key)), value) {
+			return false, false
+		}
+		return false, true
+	}
+	if strings.EqualFold(strings.TrimSpace(stringValue(target, key)), value) {
+		return false, false
+	}
+	target[key] = value
+	return true, false
+}
+
+func setCodexPlanTypeRefreshAttribute(target, current, before map[string]string, key, value string) (changed, conflict bool) {
+	currentValue, currentExists := current[key]
+	beforeValue, beforeExists := before[key]
+	if currentExists != beforeExists || currentValue != beforeValue {
+		if strings.EqualFold(strings.TrimSpace(currentValue), value) {
+			return false, false
+		}
+		return false, true
+	}
+	if strings.EqualFold(strings.TrimSpace(target[key]), value) {
+		return false, false
+	}
+	target[key] = value
+	return true, false
+}
+
+func mergeCodexPlanTypeRefreshMetadata(target, before, after map[string]any) (changed, conflict bool) {
+	keys := make(map[string]struct{}, len(before)+len(after))
+	for key := range before {
+		keys[key] = struct{}{}
+	}
+	for key := range after {
+		keys[key] = struct{}{}
+	}
+	for key := range keys {
+		beforeValue, beforeExists := before[key]
+		afterValue, afterExists := after[key]
+		if beforeExists == afterExists && reflect.DeepEqual(beforeValue, afterValue) {
+			continue
+		}
+		currentValue, currentExists := target[key]
+		if currentExists == afterExists && reflect.DeepEqual(currentValue, afterValue) {
+			continue
+		}
+		if currentExists != beforeExists || !reflect.DeepEqual(currentValue, beforeValue) {
+			return changed, true
+		}
+		if afterExists {
+			target[key] = afterValue
+		} else {
+			delete(target, key)
+		}
+		changed = true
+	}
+	return changed, false
 }
 
 func (h *Handler) fetchCodexUsagePlanType(ctx context.Context, auth *coreauth.Auth, accessToken string, accountID string) (string, int, error) {

@@ -3,6 +3,7 @@ package auth
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -338,14 +339,12 @@ type Manager struct {
 	requestRefreshLocksMu sync.Mutex
 	requestRefreshLocks   sync.Map
 	requestRefreshFlights singleflight.Group
-	// requestPrepareLocks serializes request-time auth metadata preparation by auth ID.
-	requestPrepareLocksMu sync.Mutex
-	requestPrepareLocks   sync.Map
 	requestPrepareFlights singleflight.Group
 
 	// persistLocks serializes store operations per auth ID.
-	persistBarrier sync.RWMutex
-	persistLocks   sync.Map
+	persistBarrier               sync.RWMutex
+	persistLocks                 sync.Map
+	chatGPTWebDependencyMutation sync.Mutex
 	// prioritySelectors stores built-in legacy selectors used by per-priority overrides.
 	prioritySelectors sync.Map
 }
@@ -2350,6 +2349,14 @@ func (m *Manager) register(ctx context.Context, auth *Auth, requireAbsent bool) 
 		WarnRetiredGeminiCLIAuthIgnored()
 		return nil, retiredGeminiCLIAuthError()
 	}
+	lockedDependencyCtx, unlockDependency := m.lockChatGPTWebDependencyMutationContext(ctx, auth.ID, auth, false)
+	ctx = lockedDependencyCtx
+	dependencyLocked := true
+	defer func() {
+		if dependencyLocked {
+			unlockDependency()
+		}
+	}()
 	if m.canonicalizeNewChatGPTWebAuth(ctx, auth) && !requireAbsent {
 		_, requireAbsent = m.store.(ConditionalCreateStore)
 	}
@@ -2460,6 +2467,8 @@ func (m *Manager) register(ctx context.Context, auth *Auth, requireAbsent bool) 
 		m.queueRefreshReschedule(auth.ID)
 	}
 	unlockPersist()
+	unlockDependency()
+	dependencyLocked = false
 	hookCtx := withoutChatGPTWebCredentialUpdateMarkers(ctx)
 	if credentialChanged {
 		hookCtx = withChatGPTWebCredentialReplacement(hookCtx)
@@ -2562,6 +2571,14 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 		WarnRetiredGeminiCLIAuthIgnored()
 		return nil, retiredGeminiCLIAuthError()
 	}
+	lockedDependencyCtx, unlockDependency := m.lockChatGPTWebDependencyMutationContext(ctx, auth.ID, auth, false)
+	ctx = lockedDependencyCtx
+	dependencyLocked := true
+	defer func() {
+		if dependencyLocked {
+			unlockDependency()
+		}
+	}()
 	m.canonicalizeNewChatGPTWebAuth(ctx, auth)
 	lockedCtx, unlockPersist, errLock := m.lockAuthMutationContext(ctx, auth)
 	if errLock != nil {
@@ -2644,6 +2661,8 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 		m.queueRefreshReschedule(auth.ID)
 	}
 	unlockPersist()
+	unlockDependency()
+	dependencyLocked = false
 	hookCtx := withoutChatGPTWebCredentialUpdateMarkers(ctx)
 	if credentialChanged {
 		hookCtx = withChatGPTWebCredentialReplacement(hookCtx)
@@ -2952,6 +2971,7 @@ func prepareAuthReplacement(existing *Auth, next *Auth, skipStateCarryForward bo
 	if next == nil {
 		return
 	}
+	normalizeChatGPTWebDependencyState(next)
 	if existing != nil && !next.indexAssigned && next.Index == "" {
 		next.Index = existing.Index
 		next.indexAssigned = existing.indexAssigned
@@ -3070,6 +3090,14 @@ func (m *Manager) deleteIf(ctx context.Context, id string, predicate func(*Auth)
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	lockedDependencyCtx, unlockDependency := m.lockChatGPTWebDependencyMutationContext(ctx, id, nil, false)
+	ctx = lockedDependencyCtx
+	dependencyLocked := true
+	defer func() {
+		if dependencyLocked {
+			unlockDependency()
+		}
+	}()
 
 	unlockPersist, errLock := m.lockAuthIDMutationContext(ctx, id)
 	if errLock != nil {
@@ -3131,6 +3159,8 @@ func (m *Manager) deleteIf(ctx context.Context, id string, predicate func(*Auth)
 	m.cleanupRemovedAuthRuntimeStateAfterQuarantine(id)
 	m.rebuildAPIKeyModelAliasFromRuntimeConfig()
 	unlockPersist()
+	unlockDependency()
+	dependencyLocked = false
 	m.finishAuthSessionCleanup(id, deleted, cleanupReason, nil)
 	return true, deleteErr
 }
@@ -3159,6 +3189,14 @@ func (m *Manager) deleteWithOperation(ctx context.Context, id string, operation 
 	if m == nil || id == "" {
 		return operation(ctx)
 	}
+	lockedDependencyCtx, unlockDependency := m.lockChatGPTWebDependencyMutationContext(ctx, id, nil, false)
+	ctx = lockedDependencyCtx
+	dependencyLocked := true
+	defer func() {
+		if dependencyLocked {
+			unlockDependency()
+		}
+	}()
 
 	unlockPersist, errLock := m.lockAuthIDMutationContext(ctx, id)
 	if errLock != nil {
@@ -3207,6 +3245,8 @@ func (m *Manager) deleteWithOperation(ctx context.Context, id string, operation 
 			m.rebuildAPIKeyModelAliasFromRuntimeConfig()
 		}
 		unlockPersist()
+		unlockDependency()
+		dependencyLocked = false
 		if deleted != nil {
 			reason := "auth_delete_uncertain"
 			if outcome == DeleteOutcomeRolledBack {
@@ -3236,6 +3276,8 @@ func (m *Manager) deleteWithOperation(ctx context.Context, id string, operation 
 		m.rebuildAPIKeyModelAliasFromRuntimeConfig()
 	}
 	unlockPersist()
+	unlockDependency()
+	dependencyLocked = false
 	if deleted != nil {
 		m.finishAuthSessionCleanup(id, deleted, "auth_removed", nil)
 	}
@@ -3244,6 +3286,13 @@ func (m *Manager) deleteWithOperation(ctx context.Context, id string, operation 
 
 // Load resets manager state from the backing store.
 func (m *Manager) Load(ctx context.Context) error {
+	m.chatGPTWebDependencyMutation.Lock()
+	dependencyLocked := true
+	defer func() {
+		if dependencyLocked {
+			m.chatGPTWebDependencyMutation.Unlock()
+		}
+	}()
 	m.persistBarrier.Lock()
 	m.mu.Lock()
 	if m.store == nil {
@@ -3277,6 +3326,7 @@ func (m *Manager) Load(ctx context.Context) error {
 		}
 		auth.EnsureIndex()
 		loadedAuth := auth.Clone()
+		normalizeChatGPTWebDependencyState(loadedAuth)
 		stampChatGPTWebCredentialGeneration(loadedAuth)
 		applyLifecycleRuntimeState(loadedAuth)
 		loadedAuth.installationID = uuid.NewString()
@@ -3322,6 +3372,8 @@ func (m *Manager) Load(ctx context.Context) error {
 		m.cleanupRemovedAuthRuntimeStateAfterQuarantine(id)
 	}
 	m.persistBarrier.Unlock()
+	m.chatGPTWebDependencyMutation.Unlock()
+	dependencyLocked = false
 	for id, auth := range removed {
 		m.finishAuthSessionCleanup(id, auth, "auth_reloaded", nil)
 	}
@@ -3589,11 +3641,6 @@ func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cli
 	return nil, &Error{Code: "auth_not_found", Message: "no auth available"}
 }
 
-type requestAuthPrepareLock struct {
-	semaphore chan struct{}
-	active    int
-}
-
 type requestAuthPersistenceError struct {
 	err error
 }
@@ -3657,18 +3704,13 @@ func (m *Manager) prepareRequestAuthSynchronized(ctx context.Context, executor P
 	if id == "" {
 		return preparer.PrepareRequestAuth(ctx, auth.Clone())
 	}
-	lock := m.acquireRequestPrepareLock(id)
-	if lock == nil || lock.semaphore == nil {
-		return preparer.PrepareRequestAuth(ctx, auth.Clone())
+	lockIDs := authRequestRefreshLockIDs(auth, id)
+	lockedCtx, releaseLocks, errLock := m.lockCredentialRefreshesContext(ctx, lockIDs)
+	if errLock != nil {
+		return auth, errLock
 	}
-	defer m.releaseRequestPrepareLock(id, lock)
-
-	select {
-	case <-ctx.Done():
-		return auth, ctx.Err()
-	case <-lock.semaphore:
-	}
-	defer func() { lock.semaphore <- struct{}{} }()
+	defer releaseLocks()
+	ctx = lockedCtx
 
 	m.mu.RLock()
 	current := m.auths[id]
@@ -3716,46 +3758,19 @@ func (m *Manager) prepareRequestAuthSynchronized(ctx context.Context, executor P
 	return updated, nil
 }
 
-func (m *Manager) acquireRequestPrepareLock(id string) *requestAuthPrepareLock {
-	if m == nil || strings.TrimSpace(id) == "" {
-		return nil
-	}
-	m.requestPrepareLocksMu.Lock()
-	defer m.requestPrepareLocksMu.Unlock()
-	lockValue, ok := m.requestPrepareLocks.Load(id)
-	lock, _ := lockValue.(*requestAuthPrepareLock)
-	if !ok || lock == nil || lock.semaphore == nil {
-		lock = &requestAuthPrepareLock{semaphore: make(chan struct{}, 1)}
-		lock.semaphore <- struct{}{}
-		m.requestPrepareLocks.Store(id, lock)
-	}
-	lock.active++
-	return lock
-}
-
-func (m *Manager) releaseRequestPrepareLock(id string, lock *requestAuthPrepareLock) {
-	if m == nil || lock == nil {
-		return
-	}
-	m.requestPrepareLocksMu.Lock()
-	if lock.active > 0 {
-		lock.active--
-	}
-	if lock.active == 0 {
-		if current, ok := m.requestPrepareLocks.Load(id); ok && current == lock {
-			m.requestPrepareLocks.Delete(id)
-		}
-	}
-	m.requestPrepareLocksMu.Unlock()
-}
-
 func (m *Manager) installPreparedRequestAuth(ctx context.Context, expected, updated *Auth, refreshAware bool) (*Auth, error) {
 	if m == nil || expected == nil || updated == nil || strings.TrimSpace(expected.ID) == "" {
 		return updated, nil
 	}
 	id := expected.ID
 	updated.ID = id
+	lockedDependencyCtx, unlockDependency := m.lockChatGPTWebDependencyMutationContext(ctx, id, updated, false)
+	ctx = lockedDependencyCtx
+	var unlockDependencyOnce sync.Once
+	releaseDependency := func() { unlockDependencyOnce.Do(unlockDependency) }
+	defer releaseDependency()
 	forceRuntimeReplacement := shouldForceRuntimeReplacement(ctx)
+	skipRuntimeStateCarryForward := shouldSkipStateCarryForward(ctx)
 	lockedCtx, unlockPersist, errLock := m.lockAuthMutationContext(ctx, updated)
 	if errLock != nil {
 		return nil, errLock
@@ -3782,17 +3797,23 @@ func (m *Manager) installPreparedRequestAuth(ctx context.Context, expected, upda
 		candidate.requestRefreshFamilyID = uuid.NewString()
 	}
 	credentialChanged := preparePreparedRequestCredentialReplacement(current, candidate, time.Now(), refreshAware)
-	if !credentialChanged {
+	if !credentialChanged && !skipRuntimeStateCarryForward {
 		carryForwardPreparedAuthRuntimeState(current, candidate)
 	}
+	normalizeChatGPTWebDependencyState(candidate)
 	if email := chatGPTWebRegistrationEmail(candidate); email != "" && m.chatGPTWebEmailConflictLocked(id, email) {
 		m.mu.Unlock()
 		return nil, ErrChatGPTWebEmailAlreadyExists
 	}
 	candidate.EnsureIndex()
+	expectedSourceHash := authSourceHash(current)
 	m.mu.Unlock()
 
-	if errPersist := m.persistWithoutLock(ctx, candidate, false); errPersist != nil {
+	persistCtx := ctx
+	if expectedSourceHash != "" && m.SupportsSourceConditionalSave() {
+		persistCtx = WithSourceHashSavePrecondition(persistCtx, expectedSourceHash)
+	}
+	if errPersist := m.persistWithoutLock(persistCtx, candidate, false); errPersist != nil {
 		return nil, requestAuthPersistenceError{err: errPersist}
 	}
 
@@ -3803,9 +3824,10 @@ func (m *Manager) installPreparedRequestAuth(ctx context.Context, expected, upda
 		return nil, runtimeAuthInstanceRetiredError()
 	}
 	credentialChanged = preparePreparedRequestCredentialReplacement(current, candidate, time.Now(), refreshAware)
-	if !credentialChanged {
+	if !credentialChanged && !skipRuntimeStateCarryForward {
 		carryForwardPreparedAuthRuntimeState(current, candidate)
 	}
+	normalizeChatGPTWebDependencyState(candidate)
 	candidate.installationID = uuid.NewString()
 	var replaced *Auth
 	if credentialChanged || forceRuntimeReplacement {
@@ -3833,6 +3855,7 @@ func (m *Manager) installPreparedRequestAuth(ctx context.Context, expected, upda
 	}
 	carryRuntimeProxy(expected, installed)
 	releasePersist()
+	releaseDependency()
 	if replaced != nil {
 		hookCtx := context.Background()
 		if ctx != nil {
@@ -3862,6 +3885,19 @@ func (m *Manager) installPreparedRequestAuth(ctx context.Context, expected, upda
 // or management edit.
 func (m *Manager) UpdateIfCurrent(ctx context.Context, expected, updated *Auth) (*Auth, bool, error) {
 	installed, err := m.installPreparedRequestAuth(ctx, expected, updated, false)
+	if isRuntimeAuthInstanceRetiredError(err) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	return installed, true, nil
+}
+
+// UpdateRefreshedIfCurrent installs a controlled refresh result while treating
+// opaque token rotation as the same credential when account evidence agrees.
+func (m *Manager) UpdateRefreshedIfCurrent(ctx context.Context, expected, updated *Auth) (*Auth, bool, error) {
+	installed, err := m.installPreparedRequestAuth(ctx, expected, updated, true)
 	if isRuntimeAuthInstanceRetiredError(err) {
 		return nil, false, nil
 	}
@@ -3908,6 +3944,9 @@ func (m *Manager) MutateRuntimeMetadataIfCurrent(ctx context.Context, expected *
 		return snapshot, true, nil
 	}
 	id := expected.ID
+	lockedDependencyCtx, unlockDependency := m.lockChatGPTWebDependencyMutationContext(ctx, id, expected, false)
+	ctx = lockedDependencyCtx
+	defer unlockDependency()
 	unlockPersist, errLock := m.lockAuthIDMutationContext(ctx, id)
 	if errLock != nil {
 		return nil, false, errLock
@@ -3922,9 +3961,14 @@ func (m *Manager) MutateRuntimeMetadataIfCurrent(ctx context.Context, expected *
 	}
 	candidate := current.Clone()
 	mutate(candidate)
+	expectedSourceHash := authSourceHash(current)
 	m.mu.Unlock()
 
-	if errPersist := m.persistWithoutLock(ctx, candidate, false); errPersist != nil {
+	persistCtx := ctx
+	if expectedSourceHash != "" && m.SupportsSourceConditionalSave() {
+		persistCtx = WithSourceHashSavePrecondition(persistCtx, expectedSourceHash)
+	}
+	if errPersist := m.persistWithoutLock(persistCtx, candidate, false); errPersist != nil {
 		return nil, false, errPersist
 	}
 
@@ -7805,9 +7849,26 @@ func newAuthPersistLock() *authPersistLock {
 }
 
 // LockAuthMutation serializes an auth update by ChatGPT Web email and auth ID.
-// The returned context lets Register and Update reuse the same lock ownership.
+// The returned context lets Register and Update reuse the dependency and auth
+// lock ownership in their canonical order.
 func (m *Manager) LockAuthMutation(ctx context.Context, auth *Auth) (context.Context, func(), error) {
-	return m.lockAuthMutationContext(ctx, auth)
+	if m == nil {
+		return ctx, func() {}, nil
+	}
+	authID := ""
+	if auth != nil {
+		authID = strings.TrimSpace(auth.ID)
+	}
+	lockedDependencyCtx, unlockDependency := m.lockChatGPTWebDependencyMutationContext(ctx, authID, auth, false)
+	lockedCtx, unlockAuth, errLock := m.lockAuthMutationContext(lockedDependencyCtx, auth)
+	if errLock != nil {
+		unlockDependency()
+		return ctx, nil, errLock
+	}
+	return lockedCtx, func() {
+		unlockAuth()
+		unlockDependency()
+	}, nil
 }
 
 func (m *Manager) lockAuthMutationContext(ctx context.Context, auth *Auth) (context.Context, func(), error) {
@@ -8413,6 +8474,49 @@ type authRequestRefreshLock struct {
 	waiters     map[string]int
 }
 
+type authRequestRefreshLocksContextKey struct{}
+
+type authRequestRefreshLocksContext struct {
+	manager *Manager
+	locks   map[string]*authRequestRefreshLock
+}
+
+func authRequestRefreshLockIDs(auth *Auth, fallbackID string) []string {
+	unique := make(map[string]struct{}, 2)
+	if id := strings.TrimSpace(fallbackID); id != "" {
+		unique[id] = struct{}{}
+	}
+	if auth != nil {
+		if id := strings.TrimSpace(auth.ID); id != "" {
+			unique[id] = struct{}{}
+		}
+		if strings.EqualFold(strings.TrimSpace(auth.Provider), "chatgpt-web") &&
+			strings.EqualFold(chatGPTWebIdentityMetadataString(auth.Metadata, "refresh_strategy"), "codex_source") {
+			if sourceID := chatGPTWebIdentityMetadataString(auth.Metadata, "source_auth_id"); sourceID != "" {
+				unique[sourceID] = struct{}{}
+			}
+		}
+	}
+	ordered := make([]string, 0, len(unique))
+	for id := range unique {
+		ordered = append(ordered, id)
+	}
+	sort.Strings(ordered)
+	return ordered
+}
+
+func sameAuthRequestRefreshLockIDs(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index] != right[index] {
+			return false
+		}
+	}
+	return true
+}
+
 // tryRefreshAfterUnauthorized refreshes one supported credential once before
 // the request falls back to another credential.
 func (m *Manager) tryRefreshAfterUnauthorized(ctx context.Context, auth *Auth, execErr error, alreadyTried bool) (*Auth, bool, error) {
@@ -8465,7 +8569,7 @@ func (m *Manager) refreshProviderForRequest(ctx context.Context, id, failedAcces
 		return nil, errors.New("auth manager is nil")
 	}
 	if !strings.EqualFold(strings.TrimSpace(provider), "chatgpt-web") {
-		return m.refreshProviderForRequestSynchronized(ctx, id, failedAccessToken, provider, expected)
+		return m.refreshProviderForRequestSynchronized(ctx, id, failedAccessToken, provider, expected, nil)
 	}
 	if ctx == nil {
 		ctx = context.Background()
@@ -8475,9 +8579,10 @@ func (m *Manager) refreshProviderForRequest(ctx context.Context, id, failedAcces
 	}
 	// Refresh tokens may rotate, so one shared worker per auth generation must
 	// finish applying its result even when every initiating request stops waiting.
-	workerCtx := context.WithoutCancel(ctx)
 	resultChannel := m.requestRefreshFlights.DoChan(chatGPTWebRequestRefreshFlightKey(id, expected), func() (any, error) {
-		return m.refreshProviderForRequestSynchronized(workerCtx, id, failedAccessToken, "chatgpt-web", expected)
+		workerCtx, cancelWorker := context.WithTimeout(context.WithoutCancel(ctx), chatgptwebauth.DefaultAcquisitionTimeout)
+		defer cancelWorker()
+		return m.refreshProviderForRequestSynchronized(workerCtx, id, failedAccessToken, "chatgpt-web", expected, nil)
 	})
 	select {
 	case <-ctx.Done():
@@ -8502,7 +8607,7 @@ func chatGPTWebRequestRefreshFlightKey(id string, expected *Auth) string {
 	return key
 }
 
-func (m *Manager) refreshProviderForRequestSynchronized(ctx context.Context, id, failedAccessToken, provider string, expected *Auth) (*Auth, error) {
+func (m *Manager) refreshProviderForRequestSynchronized(ctx context.Context, id, failedAccessToken, provider string, expected *Auth, validate func(*Auth) error) (*Auth, error) {
 	if m == nil {
 		return nil, errors.New("auth manager is nil")
 	}
@@ -8518,25 +8623,48 @@ func (m *Manager) refreshProviderForRequestSynchronized(ctx context.Context, id,
 		return nil, errors.New("auth provider is empty")
 	}
 
-	lock := m.acquireRequestRefreshLock(id)
-	if lock == nil || lock.semaphore == nil {
+	lockIDs := []string{id}
+	if provider == "chatgpt-web" {
+		lockSource := expected
+		if lockSource == nil {
+			m.mu.RLock()
+			lockSource = m.auths[id]
+			m.mu.RUnlock()
+		}
+		lockIDs = authRequestRefreshLockIDs(lockSource, id)
+	}
+	lock, alreadyHeld := authRequestRefreshLockFromContext(ctx, m, id)
+	if !alreadyHeld {
+		lockedCtx, releaseLocks, errLock := m.lockCredentialRefreshesContext(ctx, lockIDs)
+		if errLock != nil {
+			return nil, errLock
+		}
+		defer releaseLocks()
+		ctx = lockedCtx
+		lock, alreadyHeld = authRequestRefreshLockFromContext(ctx, m, id)
+	}
+	if !alreadyHeld || lock == nil || lock.semaphore == nil {
 		return nil, errors.New("invalid auth refresh lock")
 	}
-	defer m.releaseRequestRefreshLock(id, lock)
+	for _, lockID := range lockIDs {
+		if _, held := authRequestRefreshLockFromContext(ctx, m, lockID); !held {
+			return nil, errors.New("incomplete auth refresh lock set")
+		}
+	}
 	releaseResultWaiter := lock.track(provider, expected)
 	defer releaseResultWaiter()
-	select {
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	case <-lock.semaphore:
-	}
-	defer func() { lock.semaphore <- struct{}{} }()
 
 	m.mu.Lock()
 	auth := m.auths[id]
 	if auth == nil || m.sessionCleanupPendingLocked(id) || !strings.EqualFold(strings.TrimSpace(auth.Provider), provider) {
 		m.mu.Unlock()
 		return nil, fmt.Errorf("%s auth not available", provider)
+	}
+	if validate != nil {
+		if errValidate := validate(auth); errValidate != nil {
+			m.mu.Unlock()
+			return nil, errValidate
+		}
 	}
 	if provider == "chatgpt-web" && expected != nil {
 		if !runtimeMetadataMutationMatchesCurrent(auth, expected) {
@@ -8611,6 +8739,11 @@ func (m *Manager) refreshProviderForRequestSynchronized(ctx context.Context, id,
 	}
 	if errRefresh != nil {
 		if updated != nil && persistAuthUpdateForError(errRefresh) {
+			if validate != nil {
+				if errValidate := validate(updated); errValidate != nil {
+					return nil, errValidate
+				}
+			}
 			carryRuntimeProxy(refreshInput, updated)
 			if updated.Runtime == nil {
 				updated.Runtime = baseline.Runtime
@@ -8647,6 +8780,11 @@ func (m *Manager) refreshProviderForRequestSynchronized(ctx context.Context, id,
 	}
 	if updated == nil {
 		updated = refreshInput
+	}
+	if validate != nil {
+		if errValidate := validate(updated); errValidate != nil {
+			return nil, errValidate
+		}
 	}
 	carryRuntimeProxy(refreshInput, updated)
 	if updated.Runtime == nil {
@@ -8693,6 +8831,89 @@ func (m *Manager) acquireRequestRefreshLock(id string) *authRequestRefreshLock {
 	}
 	lock.active++
 	return lock
+}
+
+// LockCredentialRefresh serializes an external credential refresh with
+// request-time refreshes for the same auth ID.
+func (m *Manager) LockCredentialRefresh(ctx context.Context, id string) (func(), error) {
+	if strings.TrimSpace(id) == "" {
+		return nil, errors.New("auth id is empty")
+	}
+	return m.LockCredentialRefreshes(ctx, []string{id})
+}
+
+// LockCredentialRefreshes serializes an identity-discovery refresh with
+// request-time refreshes for all supplied auth IDs.
+func (m *Manager) LockCredentialRefreshes(ctx context.Context, ids []string) (func(), error) {
+	_, release, errLock := m.lockCredentialRefreshesContext(ctx, ids)
+	return release, errLock
+}
+
+func (m *Manager) lockCredentialRefreshesContext(ctx context.Context, ids []string) (context.Context, func(), error) {
+	if m == nil {
+		return ctx, func() {}, nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	unique := make(map[string]struct{}, len(ids))
+	for _, rawID := range ids {
+		if id := strings.TrimSpace(rawID); id != "" {
+			unique[id] = struct{}{}
+		}
+	}
+	ordered := make([]string, 0, len(unique))
+	for id := range unique {
+		ordered = append(ordered, id)
+	}
+	sort.Strings(ordered)
+	type heldRefreshLock struct {
+		id   string
+		lock *authRequestRefreshLock
+	}
+	held := make([]heldRefreshLock, 0, len(ordered))
+	releaseHeld := func() {
+		for index := len(held) - 1; index >= 0; index-- {
+			held[index].lock.semaphore <- struct{}{}
+			m.releaseRequestRefreshLock(held[index].id, held[index].lock)
+		}
+	}
+	for _, id := range ordered {
+		lock := m.acquireRequestRefreshLock(id)
+		if lock == nil || lock.semaphore == nil {
+			releaseHeld()
+			return ctx, nil, errors.New("invalid auth refresh lock")
+		}
+		select {
+		case <-ctx.Done():
+			m.releaseRequestRefreshLock(id, lock)
+			releaseHeld()
+			return ctx, nil, ctx.Err()
+		case <-lock.semaphore:
+			held = append(held, heldRefreshLock{id: id, lock: lock})
+		}
+	}
+	locks := make(map[string]*authRequestRefreshLock, len(held))
+	for _, item := range held {
+		locks[item.id] = item.lock
+	}
+	lockedCtx := context.WithValue(ctx, authRequestRefreshLocksContextKey{}, &authRequestRefreshLocksContext{manager: m, locks: locks})
+	var once sync.Once
+	return lockedCtx, func() {
+		once.Do(releaseHeld)
+	}, nil
+}
+
+func authRequestRefreshLockFromContext(ctx context.Context, manager *Manager, id string) (*authRequestRefreshLock, bool) {
+	if ctx == nil || manager == nil {
+		return nil, false
+	}
+	held, _ := ctx.Value(authRequestRefreshLocksContextKey{}).(*authRequestRefreshLocksContext)
+	if held == nil || held.manager != manager {
+		return nil, false
+	}
+	lock := held.locks[strings.TrimSpace(id)]
+	return lock, lock != nil && lock.semaphore != nil
 }
 
 func (m *Manager) releaseRequestRefreshLock(id string, lock *authRequestRefreshLock) {
@@ -8941,6 +9162,138 @@ func (m *Manager) RefreshAntigravityAfterUnauthorized(ctx context.Context, id, f
 	return m.refreshAntigravityForRequest(ctx, id, failedAccessToken)
 }
 
+// LinkedCodexSourceToken is the non-secret subset a linked ChatGPT Web
+// credential may inherit from its Codex source.
+type LinkedCodexSourceToken struct {
+	AccessToken string
+	Expired     string
+	Email       string
+	AccountID   string
+	Identity    string
+}
+
+// RefreshLinkedCodexSource refreshes one Codex source under the same per-auth
+// lock used by request and background refresh paths.
+func (m *Manager) RefreshLinkedCodexSource(ctx context.Context, sourceID, sourceUID, failedAccessToken, expectedIdentity string) (LinkedCodexSourceToken, error) {
+	if m == nil {
+		return LinkedCodexSourceToken{}, newLinkedCodexSourceError("source_auth_missing", "linked codex credential is unavailable")
+	}
+	sourceID = strings.TrimSpace(sourceID)
+	sourceUID = strings.TrimSpace(sourceUID)
+	expectedIdentity = strings.TrimSpace(expectedIdentity)
+	if sourceID == "" || sourceUID == "" || expectedIdentity == "" {
+		return LinkedCodexSourceToken{}, newLinkedCodexSourceError("source_auth_invalid", "linked codex credential reference is incomplete")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	tokenDigest := sha256.Sum256([]byte(strings.TrimSpace(failedAccessToken)))
+	identityDigest := sha256.Sum256([]byte(expectedIdentity))
+	flightKey := fmt.Sprintf("linked-codex\x00%s\x00%s\x00%x\x00%x", sourceID, sourceUID, identityDigest[:8], tokenDigest[:8])
+	resultChannel := m.requestRefreshFlights.DoChan(flightKey, func() (any, error) {
+		workerCtx, cancelWorker := context.WithTimeout(context.WithoutCancel(ctx), chatgptwebauth.DefaultAcquisitionTimeout)
+		defer cancelWorker()
+		validate := func(source *Auth) error {
+			if source == nil || !strings.EqualFold(strings.TrimSpace(source.Provider), "codex") {
+				return newLinkedCodexSourceError("source_auth_missing", "linked codex credential is unavailable")
+			}
+			if (source.Disabled || source.Status == StatusDisabled) && !ChatGPTWebAuthRetainedForDependents(source) {
+				return newLinkedCodexSourceError("source_auth_disabled", "linked codex credential is disabled")
+			}
+			if chatGPTWebIdentityMetadataString(source.Metadata, "credential_uid") != sourceUID {
+				return newLinkedCodexSourceError("source_auth_replaced", "linked codex credential identity changed")
+			}
+			if !linkedCodexSourceIdentityMatches(expectedIdentity, source) {
+				return newLinkedCodexSourceError("source_identity_mismatch", "linked codex account identity changed")
+			}
+			return nil
+		}
+		return m.refreshProviderForRequestSynchronized(workerCtx, sourceID, failedAccessToken, "codex", nil, validate)
+	})
+	select {
+	case <-ctx.Done():
+		return LinkedCodexSourceToken{}, ctx.Err()
+	case flightResult := <-resultChannel:
+		if flightResult.Err != nil {
+			return LinkedCodexSourceToken{}, classifyLinkedCodexSourceRefreshError(flightResult.Err)
+		}
+		source, ok := flightResult.Val.(*Auth)
+		if !ok || source == nil {
+			return LinkedCodexSourceToken{}, newLinkedCodexSourceError("source_refresh_unavailable", "codex refresh returned no credential")
+		}
+		if chatGPTWebIdentityMetadataString(source.Metadata, "credential_uid") != sourceUID {
+			return LinkedCodexSourceToken{}, newLinkedCodexSourceError("source_auth_replaced", "linked codex credential identity changed")
+		}
+		if !linkedCodexSourceIdentityMatches(expectedIdentity, source) {
+			return LinkedCodexSourceToken{}, newLinkedCodexSourceError("source_identity_mismatch", "linked codex account identity changed")
+		}
+		identity := linkedCodexSourceIdentity(source)
+		accessToken := chatGPTWebIdentityMetadataString(source.Metadata, "access_token")
+		if accessToken == "" {
+			return LinkedCodexSourceToken{}, newLinkedCodexSourceError("source_token_unavailable", "linked codex credential has no access token")
+		}
+		return LinkedCodexSourceToken{
+			AccessToken: accessToken,
+			Expired:     chatGPTWebIdentityMetadataString(source.Metadata, "expired"),
+			Email:       chatGPTWebIdentityMetadataString(source.Metadata, "email"),
+			AccountID:   chatGPTWebIdentityMetadataString(source.Metadata, "account_id"),
+			Identity:    identity,
+		}, nil
+	}
+}
+
+func linkedCodexSourceIdentity(source *Auth) string {
+	if source == nil {
+		return ""
+	}
+	candidate := source.Clone()
+	candidate.Provider = "chatgpt-web"
+	return ChatGPTWebCredentialReferenceValue(candidate)
+}
+
+func linkedCodexSourceIdentityMatches(expected string, source *Auth) bool {
+	if source == nil {
+		return false
+	}
+	candidate := source.Clone()
+	candidate.Provider = "chatgpt-web"
+	return ChatGPTWebCredentialReferenceMatches(expected, candidate)
+}
+
+func classifyLinkedCodexSourceRefreshError(err error) error {
+	if err == nil {
+		return nil
+	}
+	var coded interface{ ChatGPTWebErrorCode() string }
+	if errors.As(err, &coded) {
+		return err
+	}
+	if isRuntimeAuthInstanceRetiredError(err) {
+		return newLinkedCodexSourceError("source_auth_replaced", "linked codex credential identity changed")
+	}
+	lower := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(lower, "codex auth not available"):
+		return newLinkedCodexSourceError("source_auth_missing", "linked codex credential is unavailable")
+	case strings.Contains(lower, "invalid_grant"), strings.Contains(lower, "refresh_token_reused"):
+		return newLinkedCodexSourceError("source_auth_invalid", "linked codex credential must be authenticated again")
+	default:
+		return err
+	}
+}
+
+type linkedCodexSourceError struct {
+	code    string
+	message string
+}
+
+func newLinkedCodexSourceError(code, message string) *linkedCodexSourceError {
+	return &linkedCodexSourceError{code: code, message: message}
+}
+
+func (e *linkedCodexSourceError) Error() string               { return e.message }
+func (e *linkedCodexSourceError) ChatGPTWebErrorCode() string { return e.code }
+
 func (m *Manager) refreshAuthJob(ctx context.Context, job authRefreshJob) {
 	m.refreshAuthExpected(ctx, job.authID, job.expected, job.pendingUntil)
 }
@@ -8982,8 +9335,33 @@ func (m *Manager) refreshAuthExpected(ctx context.Context, id string, expected *
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	m.mu.Lock()
-	auth := m.auths[id]
+	var (
+		auth                *Auth
+		lockedCtx           context.Context
+		releaseRequestLocks func()
+	)
+	for {
+		m.mu.RLock()
+		lockIDs := authRequestRefreshLockIDs(m.auths[id], id)
+		m.mu.RUnlock()
+		var errLock error
+		lockedCtx, releaseRequestLocks, errLock = m.lockCredentialRefreshesContext(ctx, lockIDs)
+		if errLock != nil {
+			return
+		}
+		m.mu.Lock()
+		auth = m.auths[id]
+		if sameAuthRequestRefreshLockIDs(lockIDs, authRequestRefreshLockIDs(auth, id)) {
+			break
+		}
+		m.mu.Unlock()
+		releaseRequestLocks()
+		if errContext := ctx.Err(); errContext != nil {
+			return
+		}
+	}
+	defer releaseRequestLocks()
+	ctx = lockedCtx
 	var (
 		exec            ProviderExecutor
 		refreshInput    *Auth
@@ -9168,9 +9546,14 @@ func (m *Manager) applyRefreshedAuth(ctx context.Context, expected, refreshBasel
 		carryForwardConcurrentRefreshRuntimeState(refreshBaseline, current, updated)
 	}
 	clearUnauthorizedRefreshState(updated, time.Now())
+	expectedSourceHash := authSourceHash(current)
 	m.mu.Unlock()
 
-	if errPersist := m.persistWithoutLock(ctx, updated, false); errPersist != nil {
+	persistCtx := ctx
+	if expectedSourceHash != "" && m.SupportsSourceConditionalSave() {
+		persistCtx = WithSourceHashSavePrecondition(persistCtx, expectedSourceHash)
+	}
+	if errPersist := m.persistWithoutLock(persistCtx, updated, false); errPersist != nil {
 		unlockPersist()
 		return nil, errPersist
 	}
@@ -9288,7 +9671,21 @@ func carryForwardConcurrentRefreshMetadata(baseline, current, next *Auth) {
 	if baseline == nil || current == nil || next == nil {
 		return
 	}
-	for _, key := range []string{"cookies", "persona", "device_id", "session_id"} {
+	baselineCredential, errBaseline := chatgptwebauth.ParseCredential(baseline.Metadata)
+	currentCredential, errCurrent := chatgptwebauth.ParseCredential(current.Metadata)
+	nextCredential, errNext := chatgptwebauth.ParseCredential(next.Metadata)
+	if errBaseline == nil && errCurrent == nil && errNext == nil &&
+		!reflect.DeepEqual(currentCredential.Cookies, baselineCredential.Cookies) {
+		if next.Metadata == nil {
+			next.Metadata = make(map[string]any)
+		}
+		if reflect.DeepEqual(nextCredential.Cookies, baselineCredential.Cookies) {
+			next.Metadata["cookies"] = append([]chatgptwebauth.Cookie(nil), currentCredential.Cookies...)
+		} else {
+			next.Metadata["cookies"] = chatgptwebauth.MergeCookieDelta(currentCredential.Cookies, baselineCredential.Cookies, nextCredential.Cookies)
+		}
+	}
+	for _, key := range []string{"persona", "device_id", "session_id"} {
 		baselineValue := authMetadataValue(baseline.Metadata, key)
 		currentValue := authMetadataValue(current.Metadata, key)
 		nextValue := authMetadataValue(next.Metadata, key)

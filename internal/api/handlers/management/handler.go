@@ -39,28 +39,31 @@ const attemptMaxIdleTime = 2 * time.Hour
 
 // Handler aggregates config reference, persistence path and helpers.
 type Handler struct {
-	cfg                 *config.Config
-	configFilePath      string
-	mu                  sync.Mutex
-	codexPlanRefreshMu  sync.Mutex
-	codexPlanRefresh    codexPlanTypeRefreshTask
-	attemptsMu          sync.Mutex
-	failedAttempts      map[string]*attemptInfo // keyed by client IP
-	authManager         *coreauth.Manager
-	usageStats          *usage.RequestStatistics
-	tokenStoreMu        sync.Mutex
-	tokenStore          coreauth.Store
-	localPassword       string
-	allowRemoteOverride bool
-	envSecret           string
-	logDir              string
-	postAuthHook        coreauth.PostAuthHook
-	authStatusHook      coreauth.AuthStatusHook
-	proxyPoolManager    *proxypool.Manager
-	chatGPTWebTasks     *chatGPTWebLoginTaskManager
-	cleanupCancel       context.CancelFunc
-	cleanupWG           sync.WaitGroup
-	cleanupStopOnce     sync.Once
+	cfg                     *config.Config
+	configFilePath          string
+	mu                      sync.Mutex
+	codexPlanRefreshMu      sync.Mutex
+	codexPlanRefresh        codexPlanTypeRefreshTask
+	attemptsMu              sync.Mutex
+	failedAttempts          map[string]*attemptInfo // keyed by client IP
+	authManager             *coreauth.Manager
+	usageStats              *usage.RequestStatistics
+	tokenStoreMu            sync.Mutex
+	tokenStore              coreauth.Store
+	localPassword           string
+	allowRemoteOverride     bool
+	envSecret               string
+	logDir                  string
+	postAuthHook            coreauth.PostAuthHook
+	authStatusHook          coreauth.AuthStatusHook
+	dependencyReconcileHook func(context.Context, string) ([]string, error)
+	proxyPoolManager        *proxypool.Manager
+	chatGPTWebTasks         *chatGPTWebLoginTaskManager
+	chatGPTWebMutationTasks *chatGPTWebMutationTaskManager
+	chatGPTWebDependencyMu  sync.Mutex
+	cleanupCancel           context.CancelFunc
+	cleanupWG               sync.WaitGroup
+	cleanupStopOnce         sync.Once
 }
 
 // NewHandler creates a new management handler instance.
@@ -69,15 +72,16 @@ func NewHandler(cfg *config.Config, configFilePath string, manager *coreauth.Man
 	envSecret = strings.TrimSpace(envSecret)
 
 	h := &Handler{
-		cfg:                 cfg,
-		configFilePath:      configFilePath,
-		failedAttempts:      make(map[string]*attemptInfo),
-		authManager:         manager,
-		usageStats:          usage.GetRequestStatistics(),
-		tokenStore:          sdkAuth.GetTokenStore(),
-		allowRemoteOverride: envSecret != "",
-		envSecret:           envSecret,
-		chatGPTWebTasks:     newChatGPTWebLoginTaskManager(),
+		cfg:                     cfg,
+		configFilePath:          configFilePath,
+		failedAttempts:          make(map[string]*attemptInfo),
+		authManager:             manager,
+		usageStats:              usage.GetRequestStatistics(),
+		tokenStore:              sdkAuth.GetTokenStore(),
+		allowRemoteOverride:     envSecret != "",
+		envSecret:               envSecret,
+		chatGPTWebTasks:         newChatGPTWebLoginTaskManager(),
+		chatGPTWebMutationTasks: newChatGPTWebMutationTaskManager(),
 	}
 	cleanupCtx, cleanupCancel := context.WithCancel(context.Background())
 	h.cleanupCancel = cleanupCancel
@@ -103,6 +107,12 @@ func (h *Handler) startAttemptCleanup(ctx context.Context) {
 				if taskManager != nil {
 					taskManager.prune()
 				}
+				h.mu.Lock()
+				mutationTaskManager := h.chatGPTWebMutationTasks
+				h.mu.Unlock()
+				if mutationTaskManager != nil {
+					mutationTaskManager.prune()
+				}
 			case <-ctx.Done():
 				return
 			}
@@ -127,11 +137,24 @@ func (h *Handler) Shutdown(ctx context.Context) error {
 	h.cleanupWG.Wait()
 	h.mu.Lock()
 	taskManager := h.chatGPTWebTasks
+	mutationTaskManager := h.chatGPTWebMutationTasks
 	h.mu.Unlock()
-	if taskManager == nil {
-		return nil
+	type shutdownResult struct{ err error }
+	results := make(chan shutdownResult, 2)
+	count := 0
+	if taskManager != nil {
+		count++
+		go func() { results <- shutdownResult{err: taskManager.shutdown(ctx)} }()
 	}
-	return taskManager.shutdown(ctx)
+	if mutationTaskManager != nil {
+		count++
+		go func() { results <- shutdownResult{err: mutationTaskManager.shutdown(ctx)} }()
+	}
+	var shutdownErr error
+	for range count {
+		shutdownErr = errors.Join(shutdownErr, (<-results).err)
+	}
+	return shutdownErr
 }
 
 // purgeStaleAttempts removes IP entries that have been idle beyond attemptMaxIdleTime
@@ -240,6 +263,11 @@ func (h *Handler) SetPostAuthHook(hook coreauth.PostAuthHook) {
 // SetAuthStatusHook registers a hook to be called after auth status changes.
 func (h *Handler) SetAuthStatusHook(hook coreauth.AuthStatusHook) {
 	h.authStatusHook = hook
+}
+
+// SetChatGPTWebDependencyReconcileHook registers the service-level dependency cleanup hook.
+func (h *Handler) SetChatGPTWebDependencyReconcileHook(hook func(context.Context, string) ([]string, error)) {
+	h.dependencyReconcileHook = hook
 }
 
 // Middleware enforces access control for management endpoints.

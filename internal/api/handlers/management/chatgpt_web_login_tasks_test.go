@@ -27,10 +27,19 @@ import (
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 )
 
+type chatGPTWebManagementCodedError string
+
+func (err chatGPTWebManagementCodedError) Error() string { return "coded chatgpt web error" }
+
+func (err chatGPTWebManagementCodedError) ChatGPTWebErrorCode() string { return string(err) }
+
 type chatGPTWebManagementTestExecutor struct {
-	mu        sync.Mutex
-	loginFn   func(context.Context, chatgptwebauth.LoginInput) (*chatgptwebauth.Credential, error)
-	reloginFn func(context.Context, *coreauth.Auth) (*coreauth.Auth, bool, error)
+	mu          sync.Mutex
+	loginFn     func(context.Context, chatgptwebauth.LoginInput) (*chatgptwebauth.Credential, error)
+	reloginFn   func(context.Context, *coreauth.Auth) (*coreauth.Auth, bool, error)
+	normalizeFn func(context.Context, *chatgptwebauth.Credential, string) (*chatgptwebauth.Credential, error)
+	fetchFn     func(context.Context, *coreauth.Auth) ([]chatgptwebauth.CatalogModel, error)
+	beginFn     func(context.Context, string) (context.Context, func(), error)
 }
 
 type countingChatGPTWebAuthStore struct {
@@ -42,6 +51,18 @@ type countingChatGPTWebAuthStore struct {
 	saveIfAbsentErr  error
 	entered          chan struct{}
 	release          chan struct{}
+}
+
+type failingListChatGPTWebAuthStore struct {
+	*sdkAuth.FileTokenStore
+	fail atomic.Bool
+}
+
+func (store *failingListChatGPTWebAuthStore) List(ctx context.Context) ([]*coreauth.Auth, error) {
+	if store.fail.Load() {
+		return nil, errors.New("auth snapshot unavailable")
+	}
+	return store.FileTokenStore.List(ctx)
 }
 
 type chatGPTWebManagementLeaseResolver struct {
@@ -138,7 +159,13 @@ func (executor *chatGPTWebManagementTestExecutor) Login(ctx context.Context, inp
 	return loginFn(ctx, input)
 }
 
-func (*chatGPTWebManagementTestExecutor) BeginLoginOperation(ctx context.Context, _ string) (context.Context, func(), error) {
+func (executor *chatGPTWebManagementTestExecutor) BeginLoginOperation(ctx context.Context, key string) (context.Context, func(), error) {
+	executor.mu.Lock()
+	beginFn := executor.beginFn
+	executor.mu.Unlock()
+	if beginFn != nil {
+		return beginFn(ctx, key)
+	}
 	return ctx, func() {}, nil
 }
 
@@ -150,6 +177,26 @@ func (executor *chatGPTWebManagementTestExecutor) ReloginCurrent(ctx context.Con
 		return nil, false, errors.New("unexpected re-login")
 	}
 	return reloginFn(ctx, auth)
+}
+
+func (executor *chatGPTWebManagementTestExecutor) NormalizeImportedCredential(ctx context.Context, credential *chatgptwebauth.Credential, proxyURL string) (*chatgptwebauth.Credential, error) {
+	executor.mu.Lock()
+	normalizeFn := executor.normalizeFn
+	executor.mu.Unlock()
+	if normalizeFn != nil {
+		return normalizeFn(ctx, credential, proxyURL)
+	}
+	return credential, nil
+}
+
+func (executor *chatGPTWebManagementTestExecutor) FetchModels(ctx context.Context, auth *coreauth.Auth) ([]chatgptwebauth.CatalogModel, error) {
+	executor.mu.Lock()
+	fetchFn := executor.fetchFn
+	executor.mu.Unlock()
+	if fetchFn != nil {
+		return fetchFn(ctx, auth)
+	}
+	return nil, nil
 }
 
 func TestParseChatGPTWebLoginInputs(t *testing.T) {
@@ -188,6 +235,37 @@ func TestParseChatGPTWebLoginInputs(t *testing.T) {
 	if got, want := fmt.Sprint(errDuplicate), "line 4 duplicates email from line 2"; got != want {
 		t.Fatalf("parseChatGPTWebLoginInputs() error = %q, want %q", got, want)
 	}
+}
+
+func TestHandlerShutdownCancelsLoginAndMutationManagersBeforeWaiting(t *testing.T) {
+	loginTasks := newChatGPTWebLoginTaskManager()
+	_, loginCtx, errLogin := loginTasks.create([]chatGPTWebLoginInput{{Line: 1, Email: "login@example.com"}})
+	if errLogin != nil {
+		t.Fatal(errLogin)
+	}
+	mutationTasks := newChatGPTWebMutationTaskManager()
+	_, mutationCtx, errMutation := mutationTasks.create(chatGPTWebMutationTaskImport, []chatGPTWebMutationTaskResult{{File: "import.json", Status: chatGPTWebLoginResultQueued}})
+	if errMutation != nil {
+		t.Fatal(errMutation)
+	}
+	h := &Handler{chatGPTWebTasks: loginTasks, chatGPTWebMutationTasks: mutationTasks}
+	shutdownCtx, cancel := context.WithTimeout(t.Context(), 20*time.Millisecond)
+	defer cancel()
+	if errShutdown := h.Shutdown(shutdownCtx); !errors.Is(errShutdown, context.DeadlineExceeded) {
+		t.Fatalf("Shutdown() error = %v, want deadline", errShutdown)
+	}
+	select {
+	case <-loginCtx.Done():
+	default:
+		t.Fatal("login task manager was not canceled")
+	}
+	select {
+	case <-mutationCtx.Done():
+	default:
+		t.Fatal("mutation task manager was not canceled")
+	}
+	loginTasks.taskDone()
+	mutationTasks.workers.Done()
 }
 
 func TestParseChatGPTWebLoginInputsManyBlankLines(t *testing.T) {
@@ -314,7 +392,7 @@ func TestFindExistingChatGPTWebAuthRejectsDeterministicNameOwnedByAnotherAccount
 		t.Fatal(errRegister)
 	}
 
-	if _, errFind := findExistingChatGPTWebAuth(manager, fileName, targetEmail); !errors.Is(errFind, errChatGPTWebCredentialIDOwned) {
+	if _, errFind := findExistingChatGPTWebAuth(t.Context(), manager, fileName, targetEmail); !errors.Is(errFind, errChatGPTWebCredentialIDOwned) {
 		t.Fatalf("findExistingChatGPTWebAuth() error = %v, want credential ID conflict", errFind)
 	}
 }
@@ -389,6 +467,11 @@ func TestChatGPTWebLoginTaskPersistsSafeSuccessAndTerminalFailure(t *testing.T) 
 	auths := manager.List()
 	if len(auths) != 2 {
 		t.Fatalf("registered auth count = %d, want 2", len(auths))
+	}
+	for _, auth := range auths {
+		if uid := coreauth.ChatGPTWebCredentialUID(auth); uid == "" {
+			t.Fatalf("registered auth %q has no credential UID", auth.ID)
+		}
 	}
 	for _, result := range task.Results {
 		path := filepath.Join(authDir, result.Name)
@@ -911,7 +994,7 @@ func TestChatGPTWebLoginTaskDoesNotOverwriteUnloadedCredentialFile(t *testing.T)
 	var task chatGPTWebLoginTask
 	decodeChatGPTWebManagementResponse(t, create, &task)
 	task = waitForChatGPTWebLoginTask(t, router, task.ID)
-	if task.State != chatGPTWebLoginTaskCompletedWithErrors || task.Results[0].ErrorCategory != "credential_changed" || task.Results[0].HTTPStatus != http.StatusConflict {
+	if task.State != chatGPTWebLoginTaskCompletedWithErrors || task.Results[0].ErrorCategory != "credential_id_conflict" || task.Results[0].HTTPStatus != http.StatusConflict {
 		t.Fatalf("task = %+v", task)
 	}
 	if _, exists := manager.GetByID(fileName); exists {
@@ -1107,6 +1190,23 @@ func TestStartChatGPTWebLoginTaskReturnsServiceUnavailableAfterShutdown(t *testi
 	}
 }
 
+func TestChatGPTWebTaskLookupAndCancellationRejectNilHandler(t *testing.T) {
+	router := chatGPTWebManagementTestRouter((*Handler)(nil))
+	paths := []string{
+		"/chatgpt-web/login-tasks/missing",
+		"/chatgpt-web/import-tasks/missing",
+		"/chatgpt-web/conversion-tasks/missing",
+	}
+	for _, path := range paths {
+		for _, method := range []string{http.MethodGet, http.MethodDelete} {
+			recorder := performChatGPTWebManagementRequest(t, router, method, path, "")
+			if recorder.Code != http.StatusServiceUnavailable {
+				t.Fatalf("%s %s status = %d, want %d; body=%s", method, path, recorder.Code, http.StatusServiceUnavailable, recorder.Body.String())
+			}
+		}
+	}
+}
+
 func TestChatGPTWebLoginTaskManagerShutdownCancelsActiveTask(t *testing.T) {
 	started := make(chan struct{}, 1)
 	executor := &chatGPTWebManagementTestExecutor{}
@@ -1223,6 +1323,22 @@ func TestClassifyChatGPTWebManagementErrorUsesFixedMessage(t *testing.T) {
 				t.Fatalf("classification = %q/%q/%d, want %q/%q/%d", category, message, status, test.code, test.message, test.status)
 			}
 		})
+	}
+
+	for _, test := range []struct {
+		code       string
+		wantStatus int
+	}{
+		{code: "token_only_expired", wantStatus: http.StatusUnprocessableEntity},
+		{code: "access_token_missing", wantStatus: http.StatusUnprocessableEntity},
+		{code: "source_auth_missing", wantStatus: http.StatusConflict},
+		{code: "source_identity_changed", wantStatus: http.StatusConflict},
+		{code: "source_refresh_unavailable", wantStatus: http.StatusServiceUnavailable},
+	} {
+		category, message, status, lifecycle := classifyChatGPTWebManagementError(chatGPTWebManagementCodedError(test.code))
+		if category != test.code || message == "" || status != test.wantStatus || lifecycle != string(chatgptwebauth.LifecycleReauthRequired) {
+			t.Fatalf("coded %s classification = %q/%q/%d/%q", test.code, category, message, status, lifecycle)
+		}
 	}
 }
 
@@ -1470,6 +1586,26 @@ func TestReloginChatGPTWebAuthStopsWithHandlerShutdown(t *testing.T) {
 	}
 }
 
+func TestChatGPTWebMutationClassifiesCredentialSnapshotFailure(t *testing.T) {
+	executor := &chatGPTWebManagementTestExecutor{}
+	h, manager, store := newChatGPTWebManagementFailingListTestHandler(t, executor)
+	store.fail.Store(true)
+
+	login := h.executeChatGPTWebLogin(t.Context(), chatGPTWebLoginInput{
+		Line: 1, Email: "login@example.com", Password: "password",
+	}, executor, manager, nil)
+	if login.ErrorCategory != "credential_lookup_failed" || login.HTTPStatus != http.StatusServiceUnavailable {
+		t.Fatalf("login result = %+v", login)
+	}
+
+	imported := h.executeChatGPTWebImport(t.Context(), chatGPTWebImportInput{
+		file: "import.json", data: []byte(`{"email":"import@example.com","access_token":"access"}`),
+	}, executor, manager, nil)
+	if imported.ErrorCategory != "credential_lookup_failed" || imported.HTTPStatus != http.StatusServiceUnavailable {
+		t.Fatalf("import result = %+v", imported)
+	}
+}
+
 func activeChatGPTWebManagementTestCredential(input chatgptwebauth.LoginInput) *chatgptwebauth.Credential {
 	now := time.Now().UTC()
 	return &chatgptwebauth.Credential{
@@ -1536,12 +1672,38 @@ func newChatGPTWebManagementCountingTestHandler(t *testing.T, executor *chatGPTW
 	return h, manager, store
 }
 
+func newChatGPTWebManagementFailingListTestHandler(t *testing.T, executor *chatGPTWebManagementTestExecutor) (*Handler, *coreauth.Manager, *failingListChatGPTWebAuthStore) {
+	t.Helper()
+	authDir := t.TempDir()
+	fileStore := sdkAuth.NewFileTokenStore()
+	fileStore.SetBaseDir(authDir)
+	store := &failingListChatGPTWebAuthStore{FileTokenStore: fileStore}
+	manager := coreauth.NewManager(store, nil, nil)
+	manager.RegisterExecutor(executor)
+	h := NewHandler(&config.Config{AuthDir: authDir}, "", manager)
+	h.tokenStore = store
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if errShutdown := h.Shutdown(ctx); errShutdown != nil {
+			t.Errorf("shutdown management handler: %v", errShutdown)
+		}
+	})
+	return h, manager, store
+}
+
 func chatGPTWebManagementTestRouter(h *Handler) *gin.Engine {
 	gin.SetMode(gin.TestMode)
 	router := gin.New()
 	router.POST("/chatgpt-web/login-tasks", h.StartChatGPTWebLoginTask)
 	router.GET("/chatgpt-web/login-tasks/:id", h.GetChatGPTWebLoginTask)
 	router.DELETE("/chatgpt-web/login-tasks/:id", h.CancelChatGPTWebLoginTask)
+	router.POST("/chatgpt-web/import-tasks", h.StartChatGPTWebImportTask)
+	router.GET("/chatgpt-web/import-tasks/:id", h.GetChatGPTWebImportTask)
+	router.DELETE("/chatgpt-web/import-tasks/:id", h.CancelChatGPTWebImportTask)
+	router.POST("/chatgpt-web/conversion-tasks", h.StartChatGPTWebConversionTask)
+	router.GET("/chatgpt-web/conversion-tasks/:id", h.GetChatGPTWebConversionTask)
+	router.DELETE("/chatgpt-web/conversion-tasks/:id", h.CancelChatGPTWebConversionTask)
 	router.POST("/chatgpt-web/auth-files/:name/relogin", h.ReloginChatGPTWebAuth)
 	return router
 }

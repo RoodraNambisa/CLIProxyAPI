@@ -194,6 +194,8 @@ type Auth struct {
 	// RuntimeProxyBindingID identifies the current proxy-pool binding so cached
 	// transports and long-lived sessions cannot survive a rebind.
 	RuntimeProxyBindingID string `json:"-"`
+	// RuntimeProxyAuthID identifies the credential that owns a borrowed binding.
+	RuntimeProxyAuthID string `json:"-"`
 	// runtimeProxyResolved distinguishes an explicit no-proxy decision from a
 	// clone that has not gone through request-time proxy resolution yet.
 	runtimeProxyResolved bool
@@ -626,6 +628,17 @@ func (a *Auth) EffectiveProxyBindingID() string {
 		return ""
 	}
 	return strings.TrimSpace(a.RuntimeProxyBindingID)
+}
+
+// EffectiveProxyAuthID returns the credential that owns the active binding.
+func (a *Auth) EffectiveProxyAuthID() string {
+	if a == nil {
+		return ""
+	}
+	if owner := strings.TrimSpace(a.RuntimeProxyAuthID); owner != "" {
+		return owner
+	}
+	return strings.TrimSpace(a.ID)
 }
 
 // DisableCoolingOverride returns the auth-file scoped disable_cooling override when present.

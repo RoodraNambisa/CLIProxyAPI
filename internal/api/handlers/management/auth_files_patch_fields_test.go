@@ -192,6 +192,35 @@ func TestPatchAuthFileFields_LegacyUnchangedHeadersReturnNoFields(t *testing.T) 
 	}
 }
 
+func TestPatchAuthFileFieldsFallsBackForStoreWithoutConditionalSave(t *testing.T) {
+	store := &memoryAuthStore{}
+	manager := coreauth.NewManager(store, nil, nil)
+	record := &coreauth.Auth{
+		ID:         "legacy-store.json",
+		FileName:   "legacy-store.json",
+		Provider:   "codex",
+		Attributes: map[string]string{"path": "/tmp/legacy-store.json", coreauth.SourceHashAttributeKey: "source-hash"},
+		Metadata:   map[string]any{"type": "codex"},
+	}
+	if _, errRegister := manager.Register(context.Background(), record); errRegister != nil {
+		t.Fatal(errRegister)
+	}
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, manager)
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	request := httptest.NewRequest(http.MethodPatch, "/v0/management/auth-files/fields", strings.NewReader(`{"name":"legacy-store.json","note":"updated"}`))
+	request.Header.Set("Content-Type", "application/json")
+	ctx.Request = request
+	h.PatchAuthFileFields(ctx)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", recorder.Code, recorder.Body.String())
+	}
+	updated, ok := manager.GetByID(record.ID)
+	if !ok || updated.Attributes["note"] != "updated" {
+		t.Fatalf("updated auth = %#v", updated)
+	}
+}
+
 func TestPatchAuthFileFields_XAIBooleanFields(t *testing.T) {
 	store := &memoryAuthStore{}
 	manager := coreauth.NewManager(store, nil, nil)
@@ -485,6 +514,47 @@ func TestPatchAuthFileFields_BatchReturnsPerTargetFailures(t *testing.T) {
 	unchanged, _ := manager.GetByID("claude.json")
 	if _, exists := unchanged.Metadata["websockets"]; exists {
 		t.Fatalf("unsupported target was mutated: %#v", unchanged.Metadata)
+	}
+}
+
+func TestPatchAuthFileFieldsRejectsExternalReplacement(t *testing.T) {
+	h, manager, authDir, store := newChatGPTWebDependencyRaceManagementHandler(t)
+	record := registerChatGPTWebDependencyManagementAuth(t, manager, &coreauth.Auth{
+		ID: "fields-race.json", FileName: "fields-race.json", Provider: "xai",
+		Attributes: map[string]string{"note": "original"},
+		Metadata:   map[string]any{"type": "xai", "note": "original"},
+	})
+	path := filepath.Join(authDir, record.FileName)
+	store.setBeforeConditionalSave(func() {
+		replaceManagementDependencyAuthFile(t, path, "external fields replacement", "")
+	})
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	request := httptest.NewRequest(http.MethodPatch, "/v0/management/auth-files/fields", strings.NewReader(
+		`{"names":["fields-race.json"],"fields":{"note":"batch update"}}`,
+	))
+	request.Header.Set("Content-Type", "application/json")
+	ctx.Request = request
+	h.PatchAuthFileFields(ctx)
+
+	if recorder.Code != http.StatusMultiStatus {
+		t.Fatalf("status = %d, want %d; body=%s", recorder.Code, http.StatusMultiStatus, recorder.Body.String())
+	}
+	var response struct {
+		Updated int                         `json:"updated"`
+		Failed  []authFileFieldPatchFailure `json:"failed"`
+	}
+	if errDecode := json.Unmarshal(recorder.Body.Bytes(), &response); errDecode != nil {
+		t.Fatal(errDecode)
+	}
+	if response.Updated != 0 || len(response.Failed) != 1 || response.Failed[0].Status != http.StatusConflict {
+		t.Fatalf("response = %#v", response)
+	}
+	assertManagementDependencyAuthNote(t, path, "external fields replacement")
+	current, _ := manager.GetByID(record.ID)
+	if got := current.Attributes["note"]; got != "original" {
+		t.Fatalf("runtime note = %q, want original", got)
 	}
 }
 

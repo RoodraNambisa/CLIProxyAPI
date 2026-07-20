@@ -10,7 +10,6 @@ import (
 	"net/http"
 	"net/url"
 	"reflect"
-	"sort"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -589,7 +588,7 @@ func (e *ChatGPTWebExecutor) newRuntimeClient(auth *cliproxyauth.Auth) (*chatgpt
 	if err = chatgptwebauth.EnsureCredentialRuntimeIDsForURL(credential, chatgptwebauth.CredentialRuntimeIdentityReader(auth.ID, credential), e.chatGPTWebBaseURL()); err != nil {
 		return nil, nil, fmt.Errorf("initialize chatgpt web browser identity: %w", err)
 	}
-	client, err := chatgptwebauth.NewClient(credential.Persona, e.proxyURL(auth), credential.Cookies)
+	client, err := chatgptwebauth.NewClient(credential.Persona, e.proxyURLForTarget(auth, e.chatGPTWebBaseURL()), credential.Cookies)
 	if err != nil {
 		return nil, nil, fmt.Errorf("create chatgpt web browser client: %w", err)
 	}
@@ -641,67 +640,8 @@ func (e *ChatGPTWebExecutor) finishChatGPTWebRuntimeClient(ctx context.Context, 
 	}
 }
 
-type chatGPTWebCookieKey struct {
-	name   string
-	path   string
-	domain string
-	host   string
-}
-
 func mergeChatGPTWebCookieDelta(current, baseline, next []chatgptwebauth.Cookie) []chatgptwebauth.Cookie {
-	currentByKey := chatGPTWebCookiesByKey(current)
-	baselineByKey := chatGPTWebCookiesByKey(baseline)
-	nextByKey := chatGPTWebCookiesByKey(next)
-	for key := range baselineByKey {
-		if _, exists := nextByKey[key]; !exists {
-			delete(currentByKey, key)
-		}
-	}
-	for key, cookie := range nextByKey {
-		if previous, exists := baselineByKey[key]; exists && reflect.DeepEqual(previous, cookie) {
-			continue
-		}
-		currentByKey[key] = cookie
-	}
-	merged := make([]chatgptwebauth.Cookie, 0, len(currentByKey))
-	for _, cookie := range currentByKey {
-		merged = append(merged, cookie)
-	}
-	sort.SliceStable(merged, func(left, right int) bool {
-		leftKey := chatGPTWebCookieIdentity(merged[left])
-		rightKey := chatGPTWebCookieIdentity(merged[right])
-		if leftKey.host != rightKey.host {
-			return leftKey.host < rightKey.host
-		}
-		if leftKey.domain != rightKey.domain {
-			return leftKey.domain < rightKey.domain
-		}
-		if leftKey.path != rightKey.path {
-			return leftKey.path < rightKey.path
-		}
-		return leftKey.name < rightKey.name
-	})
-	return merged
-}
-
-func chatGPTWebCookiesByKey(cookies []chatgptwebauth.Cookie) map[chatGPTWebCookieKey]chatgptwebauth.Cookie {
-	byKey := make(map[chatGPTWebCookieKey]chatgptwebauth.Cookie, len(cookies))
-	for _, cookie := range cookies {
-		if strings.TrimSpace(cookie.Name) == "" {
-			continue
-		}
-		byKey[chatGPTWebCookieIdentity(cookie)] = cookie
-	}
-	return byKey
-}
-
-func chatGPTWebCookieIdentity(cookie chatgptwebauth.Cookie) chatGPTWebCookieKey {
-	return chatGPTWebCookieKey{
-		name:   cookie.Name,
-		path:   cookie.Path,
-		domain: strings.ToLower(strings.TrimSpace(cookie.Domain)),
-		host:   strings.ToLower(strings.TrimSpace(cookie.Host)),
-	}
+	return chatgptwebauth.MergeCookieDelta(current, baseline, next)
 }
 
 func chatGPTWebMetadataString(metadata map[string]any, key string) string {
@@ -1454,6 +1394,7 @@ func chatGPTWebStatusErrorBody(path string, body []byte) []byte {
 type chatGPTWebHTTPError struct {
 	statusErr
 	headers http.Header
+	path    string
 }
 
 func (e chatGPTWebHTTPError) Headers() http.Header {
@@ -1463,9 +1404,14 @@ func (e chatGPTWebHTTPError) Headers() http.Header {
 	return e.headers.Clone()
 }
 
+// ChatGPTWebRequestPath identifies the upstream stage that returned the error.
+func (e chatGPTWebHTTPError) ChatGPTWebRequestPath() string {
+	return e.path
+}
+
 func newChatGPTWebStatusError(code int, path string, body []byte, headers fhttp.Header) chatGPTWebHTTPError {
 	sanitizedBody := chatGPTWebStatusErrorBody(path, body)
-	err := chatGPTWebHTTPError{statusErr: statusErr{code: code, msg: strings.TrimSpace(string(sanitizedBody))}}
+	err := chatGPTWebHTTPError{statusErr: statusErr{code: code, msg: strings.TrimSpace(string(sanitizedBody))}, path: path}
 	switch code {
 	case http.StatusBadRequest, http.StatusNotFound, http.StatusMethodNotAllowed,
 		http.StatusConflict, http.StatusRequestEntityTooLarge,

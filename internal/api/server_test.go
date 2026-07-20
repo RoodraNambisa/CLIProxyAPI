@@ -177,7 +177,14 @@ func TestChatGPTWebManagementRoutesAreRegistered(t *testing.T) {
 		http.MethodPost + " /v0/management/chatgpt-web/login-tasks":              false,
 		http.MethodGet + " /v0/management/chatgpt-web/login-tasks/:id":           false,
 		http.MethodDelete + " /v0/management/chatgpt-web/login-tasks/:id":        false,
+		http.MethodPost + " /v0/management/chatgpt-web/import-tasks":             false,
+		http.MethodGet + " /v0/management/chatgpt-web/import-tasks/:id":          false,
+		http.MethodDelete + " /v0/management/chatgpt-web/import-tasks/:id":       false,
+		http.MethodPost + " /v0/management/chatgpt-web/conversion-tasks":         false,
+		http.MethodGet + " /v0/management/chatgpt-web/conversion-tasks/:id":      false,
+		http.MethodDelete + " /v0/management/chatgpt-web/conversion-tasks/:id":   false,
 		http.MethodPost + " /v0/management/chatgpt-web/auth-files/:name/relogin": false,
+		http.MethodPost + " /v0/management/auth-files/restore":                   false,
 	}
 	for _, route := range server.engine.Routes() {
 		key := route.Method + " " + route.Path

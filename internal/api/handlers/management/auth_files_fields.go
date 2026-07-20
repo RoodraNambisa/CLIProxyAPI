@@ -298,15 +298,50 @@ func validateBatchAuthFileFields(auth *coreauth.Auth, values authFileFieldValues
 }
 
 func (h *Handler) updateAuthFileFields(ctx context.Context, auth *coreauth.Auth, values authFileFieldValues) (*coreauth.Auth, int, string) {
-	h.applyAuthFileFieldValues(auth, values)
-	auth.UpdatedAt = time.Now()
+	h.chatGPTWebDependencyMu.Lock()
+	lockedCtx, unlockAuth, errLock := h.authManager.LockAuthMutation(ctx, auth)
+	if errLock != nil {
+		h.chatGPTWebDependencyMu.Unlock()
+		return nil, http.StatusInternalServerError, fmt.Sprintf("failed to lock auth: %v", errLock)
+	}
+	current, exists := h.authManager.GetByID(auth.ID)
+	if !exists || current == nil {
+		unlockAuth()
+		h.chatGPTWebDependencyMu.Unlock()
+		return nil, http.StatusNotFound, "auth file not found"
+	}
+	if coreauth.ChatGPTWebAuthRetainedForDependents(current) {
+		unlockAuth()
+		h.chatGPTWebDependencyMu.Unlock()
+		return nil, http.StatusConflict, "credential is retained for Web dependents; restore it before editing"
+	}
+	updatedCandidate := current.Clone()
+	h.applyAuthFileFieldValues(updatedCandidate, values)
+	updatedCandidate.UpdatedAt = time.Now()
 
-	updated, errUpdate := h.authManager.Update(ctx, auth)
+	var (
+		updated      *coreauth.Auth
+		currentMatch bool
+		errUpdate    error
+	)
+	if strings.TrimSpace(auth.Attributes[coreauth.SourceHashAttributeKey]) != "" && h.authManager.SupportsSourceConditionalSave() {
+		updated, currentMatch, errUpdate = h.authManager.UpdateIfCurrentSourceHash(lockedCtx, auth, updatedCandidate)
+	} else {
+		updated, currentMatch, errUpdate = h.authManager.UpdateIfCurrent(lockedCtx, auth, updatedCandidate)
+	}
+	unlockAuth()
+	h.chatGPTWebDependencyMu.Unlock()
 	if errUpdate != nil {
 		if errors.Is(errUpdate, coreauth.ErrRetiredGeminiCLIAuthReadOnly) {
 			return nil, http.StatusGone, errGeminiCLIAuthGone.Error()
 		}
+		if outcome, explicit := coreauth.SaveOutcomeFromError(errUpdate); explicit && outcome == coreauth.SaveOutcomeRolledBack {
+			return nil, http.StatusConflict, "auth file changed while fields were being updated"
+		}
 		return nil, http.StatusInternalServerError, fmt.Sprintf("failed to update auth: %v", errUpdate)
+	}
+	if !currentMatch || updated == nil {
+		return nil, http.StatusConflict, "auth file changed while fields were being updated"
 	}
 	if h.authStatusHook != nil {
 		h.authStatusHook(ctx, updated.Clone())
@@ -521,6 +556,9 @@ func dedupeAuthFilePatchNames(names []string) []string {
 func (h *Handler) resolveAuthFileFieldPatchTarget(name string) (*coreauth.Auth, int, string) {
 	auth := h.findManagedAuth(name)
 	if auth != nil {
+		if coreauth.ChatGPTWebAuthRetainedForDependents(auth) {
+			return nil, http.StatusConflict, "credential is retained for Web dependents; restore it before editing"
+		}
 		if !isRuntimeOnlyAuth(auth) {
 			retired, errCheck := h.authBackedByRetiredGeminiCLIFile(auth)
 			if errCheck != nil {

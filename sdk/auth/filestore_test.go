@@ -191,6 +191,40 @@ func TestFileTokenStoreReadAuthFileSetsCanonicalSourceHash(t *testing.T) {
 	}
 }
 
+func TestFileTokenStoreConditionalDeleteRejectsEmptySourceHash(t *testing.T) {
+	errDelete := (&FileTokenStore{}).DeleteIfSourceHashMatches(t.Context(), "auth.json", "  ")
+	if outcome, explicit := cliproxyauth.DeleteOutcomeFromError(errDelete); !explicit || outcome != cliproxyauth.DeleteOutcomeRolledBack {
+		t.Fatalf("delete error = %v, outcome=%v explicit=%t", errDelete, outcome, explicit)
+	}
+	if !strings.Contains(errDelete.Error(), "expected source hash is empty") {
+		t.Fatalf("delete error = %v, want empty source hash message", errDelete)
+	}
+}
+
+func TestFileTokenStoreSaveWithSourceHashRejectsExternalReplacement(t *testing.T) {
+	authDir := t.TempDir()
+	store := NewFileTokenStore()
+	store.SetBaseDir(authDir)
+	const fileName = "conditional.json"
+	initial := []byte(`{"type":"codex","access_token":"initial"}`)
+	replacement := []byte(`{"type":"codex","access_token":"replacement"}`)
+	path := filepath.Join(authDir, fileName)
+	if errWrite := os.WriteFile(path, replacement, 0o600); errWrite != nil {
+		t.Fatal(errWrite)
+	}
+	auth := &cliproxyauth.Auth{
+		ID: fileName, FileName: fileName, Provider: "codex",
+		Metadata: map[string]any{"type": "codex", "access_token": "updated"},
+	}
+	ctx := cliproxyauth.WithSourceHashSavePrecondition(t.Context(), cliproxyauth.SourceHashFromBytes(initial))
+	if _, errSave := store.Save(ctx, auth); !errors.Is(errSave, authfileguard.ErrPersistGenerationStale) {
+		t.Fatalf("Save() error = %v, want stale generation", errSave)
+	}
+	if got, errRead := os.ReadFile(path); errRead != nil || !bytes.Equal(got, replacement) {
+		t.Fatalf("replacement auth = %s, %v; want %s", got, errRead, replacement)
+	}
+}
+
 func TestFileTokenStoreRestrictsExistingChatGPTWebCredentialPermissions(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("Windows does not expose Unix credential permission bits")

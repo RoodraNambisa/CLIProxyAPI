@@ -29,6 +29,7 @@ import (
 type chatGPTWebAuthService interface {
 	Login(context.Context, chatgptwebauth.LoginInput) (*chatgptwebauth.Credential, error)
 	Refresh(context.Context, chatgptwebauth.Credential, string) (*chatgptwebauth.Credential, error)
+	RefreshSession(context.Context, chatgptwebauth.Credential, string) (*chatgptwebauth.Credential, error)
 }
 
 type chatGPTWebLoginGate struct {
@@ -244,7 +245,26 @@ func (e *ChatGPTWebExecutor) ShouldPrepareRequestAuth(auth *cliproxyauth.Auth) b
 		return true
 	}
 	expiresAt, ok := chatGPTWebCredentialExpiry(credential)
+	if credential.RefreshStrategy == chatgptwebauth.RefreshStrategyTokenOnly {
+		return ok && !expiresAt.After(e.currentTime())
+	}
 	return ok && !expiresAt.After(e.currentTime().Add(chatgptwebauth.DefaultRefreshLead))
+}
+
+// ShouldRefresh applies refresh-strategy-aware background scheduling.
+func (e *ChatGPTWebExecutor) ShouldRefresh(now time.Time, auth *cliproxyauth.Auth) bool {
+	if auth == nil || !strings.EqualFold(strings.TrimSpace(auth.Provider), chatgptwebauth.Provider) || !auth.LifecycleRefreshable() {
+		return false
+	}
+	credential, err := chatgptwebauth.ParseCredential(auth.Metadata)
+	if err != nil || strings.TrimSpace(credential.AccessToken) == "" {
+		return true
+	}
+	expiresAt, ok := chatGPTWebCredentialExpiry(credential)
+	if credential.RefreshStrategy == chatgptwebauth.RefreshStrategyTokenOnly {
+		return ok && !expiresAt.After(now)
+	}
+	return ok && !expiresAt.After(now.Add(chatgptwebauth.DefaultRefreshLead))
 }
 
 // PrepareRequestAuth refreshes an expiring token before execution. Terminal
@@ -281,6 +301,41 @@ func (e *ChatGPTWebExecutor) Login(ctx context.Context, input chatgptwebauth.Log
 		return nil, errors.New("chatgpt web authentication service is unavailable")
 	}
 	return e.authService.Login(ctx, input)
+}
+
+// NormalizeImportedCredential validates and refreshes one imported credential
+// before management persists it.
+func (e *ChatGPTWebExecutor) NormalizeImportedCredential(ctx context.Context, credential *chatgptwebauth.Credential, proxyURL string) (*chatgptwebauth.Credential, error) {
+	if e == nil || e.authService == nil || credential == nil {
+		return nil, errors.New("chatgpt web imported credential is unavailable")
+	}
+	result := cloneChatGPTWebCredential(credential)
+	var err error
+	switch result.RefreshStrategy {
+	case chatgptwebauth.RefreshStrategyWebOAuthRT:
+		result, err = e.authService.Refresh(ctx, *result, proxyURL)
+	case chatgptwebauth.RefreshStrategyChatGPTSession:
+		result, err = e.authService.RefreshSession(ctx, *result, proxyURL)
+	case chatgptwebauth.RefreshStrategyCodexSource:
+		result, err, _ = e.refreshFromCodexSource(ctx, result)
+	case chatgptwebauth.RefreshStrategyTokenOnly:
+		if expiresAt, ok := chatGPTWebCredentialExpiry(result); strings.TrimSpace(result.AccessToken) == "" || ok && !expiresAt.After(e.currentTime()) {
+			err = newChatGPTWebRefreshModeError("token_only_expired", "token-only credential requires a new access token")
+		}
+	default:
+		err = newChatGPTWebRefreshModeError("refresh_strategy_invalid", "chatgpt web refresh strategy is invalid")
+	}
+	if err != nil {
+		return result, err
+	}
+	if result == nil || strings.TrimSpace(result.AccessToken) == "" {
+		return result, newChatGPTWebRefreshModeError("access_token_missing", "chatgpt web access token is empty")
+	}
+	now := e.currentTime().UTC().Format(time.RFC3339)
+	result.LifecycleState = chatgptwebauth.LifecycleActive
+	result.LifecycleReason = ""
+	result.LifecycleUpdatedAt = now
+	return result, nil
 }
 
 // BeginLoginOperation serializes an account login through persistence with
@@ -376,6 +431,10 @@ func (e *ChatGPTWebExecutor) AutoReloginEnabled() bool {
 // generation. Duplicate triggers share one background retry loop.
 func (e *ChatGPTWebExecutor) TriggerBackgroundRelogin(expected *cliproxyauth.Auth) {
 	if e == nil || e.manager == nil || !e.AutoReloginEnabled() || expected == nil || expected.LifecycleState() != cliproxyauth.LifecycleStateReloginPending {
+		return
+	}
+	credential, errCredential := chatgptwebauth.ParseCredential(expected.Metadata)
+	if errCredential != nil || !chatGPTWebCredentialCanRelogin(credential) {
 		return
 	}
 	expected = cloneChatGPTWebAuth(expected)
@@ -789,7 +848,7 @@ func (e *ChatGPTWebExecutor) reloginCurrent(ctx context.Context, expected *clipr
 	}
 	result, errLogin := e.authService.Login(ctx, chatgptwebauth.LoginInput{
 		Credential: credential,
-		ProxyURL:   e.proxyURL(resolved),
+		ProxyURL:   e.proxyURLForTarget(resolved, chatgptwebauth.AuthBaseURL),
 		Relogin:    true,
 	})
 	if errContext := ctx.Err(); errContext != nil {
@@ -855,8 +914,8 @@ func (e *ChatGPTWebExecutor) refreshCredential(ctx context.Context, auth *clipro
 			return chatGPTWebRefreshResult{err: context.Canceled}, nil
 		}
 		defer release()
-		result, errRefresh := e.authService.Refresh(acquisitionCtx, *credential, e.proxyURL(auth))
-		return chatGPTWebRefreshResult{credential: result, err: errRefresh}, nil
+		result, errRefresh, terminal := e.refreshByStrategy(acquisitionCtx, auth, credential)
+		return chatGPTWebRefreshResult{credential: result, err: errRefresh, terminal: terminal}, nil
 	})
 	trackedResult := make(chan singleflight.Result, 1)
 	go func() {
@@ -893,7 +952,7 @@ func (e *ChatGPTWebExecutor) refreshCredential(ctx context.Context, auth *clipro
 		}
 		return applyChatGPTWebCredential(auth, result.credential), nil, false
 	}
-	if !chatgptwebauth.IsTerminal(result.err) {
+	if !result.terminal && !chatgptwebauth.IsTerminal(result.err) {
 		return nil, result.err, false
 	}
 	if result.credential == nil {
@@ -903,8 +962,11 @@ func (e *ChatGPTWebExecutor) refreshCredential(ctx context.Context, auth *clipro
 	if authError, okAuthError := chatgptwebauth.AsAuthError(result.err); okAuthError {
 		state = string(authError.State)
 	}
-	if state != cliproxyauth.LifecycleStateDead && state != cliproxyauth.LifecycleStateInteractionRequired {
-		if e.AutoReloginEnabled() {
+	strategy := result.credential.RefreshStrategy
+	if strategy == chatgptwebauth.RefreshStrategyTokenOnly || strategy == chatgptwebauth.RefreshStrategyCodexSource {
+		state = cliproxyauth.LifecycleStateReauthRequired
+	} else if state != cliproxyauth.LifecycleStateDead && state != cliproxyauth.LifecycleStateInteractionRequired {
+		if e.AutoReloginEnabled() && chatGPTWebCredentialCanRelogin(result.credential) {
 			state = cliproxyauth.LifecycleStateReloginPending
 		} else {
 			state = cliproxyauth.LifecycleStateReauthRequired
@@ -930,6 +992,88 @@ func (e *ChatGPTWebExecutor) beginRefreshWait() bool {
 type chatGPTWebRefreshResult struct {
 	credential *chatgptwebauth.Credential
 	err        error
+	terminal   bool
+}
+
+func (e *ChatGPTWebExecutor) refreshByStrategy(ctx context.Context, auth *cliproxyauth.Auth, credential *chatgptwebauth.Credential) (*chatgptwebauth.Credential, error, bool) {
+	if credential == nil {
+		return nil, newChatGPTWebRefreshModeError("credential_invalid", "chatgpt web credential is invalid"), true
+	}
+	switch credential.RefreshStrategy {
+	case chatgptwebauth.RefreshStrategyWebOAuthRT:
+		result, err := e.authService.Refresh(ctx, *credential, e.proxyURLForTarget(auth, chatgptwebauth.AuthBaseURL))
+		return result, err, false
+	case chatgptwebauth.RefreshStrategyChatGPTSession:
+		result, err := e.authService.RefreshSession(ctx, *credential, e.proxyURLForTarget(auth, chatgptwebauth.SessionBaseURL))
+		return result, err, false
+	case chatgptwebauth.RefreshStrategyCodexSource:
+		return e.refreshFromCodexSource(ctx, credential)
+	case chatgptwebauth.RefreshStrategyTokenOnly:
+		return cloneChatGPTWebCredential(credential), newChatGPTWebRefreshModeError("token_only_expired", "token-only credential requires a new access token"), true
+	default:
+		return cloneChatGPTWebCredential(credential), newChatGPTWebRefreshModeError("refresh_strategy_invalid", "chatgpt web refresh strategy is invalid"), true
+	}
+}
+
+func (e *ChatGPTWebExecutor) refreshFromCodexSource(ctx context.Context, credential *chatgptwebauth.Credential) (*chatgptwebauth.Credential, error, bool) {
+	result := cloneChatGPTWebCredential(credential)
+	if e == nil || e.manager == nil {
+		return result, newChatGPTWebRefreshModeError("source_auth_missing", "linked codex credential is unavailable"), true
+	}
+	sourceToken, errRefresh := e.manager.RefreshLinkedCodexSource(
+		ctx,
+		credential.SourceAuthID,
+		credential.SourceCredentialUID,
+		credential.AccessToken,
+		credential.SourceIdentity,
+	)
+	if errRefresh != nil {
+		var coded interface{ ChatGPTWebErrorCode() string }
+		if errors.As(errRefresh, &coded) {
+			return result, errRefresh, true
+		}
+		return result, errRefresh, false
+	}
+	result.AccessToken = sourceToken.AccessToken
+	result.IDToken = ""
+	result.Expired = sourceToken.Expired
+	if email := strings.TrimSpace(sourceToken.Email); email != "" {
+		result.Email = email
+	}
+	result.AccountID = strings.TrimSpace(sourceToken.AccountID)
+	result.SourceIdentity = cliproxyauth.MergeChatGPTWebCredentialReferenceValues(result.SourceIdentity, sourceToken.Identity)
+	result.LastRefreshAt = e.currentTime().UTC().Format(time.RFC3339)
+	result.LifecycleState = chatgptwebauth.LifecycleActive
+	result.LifecycleReason = ""
+	result.LifecycleUpdatedAt = result.LastRefreshAt
+	return result, nil, false
+}
+
+func chatGPTWebCredentialCanRelogin(credential *chatgptwebauth.Credential) bool {
+	return credential != nil && strings.TrimSpace(credential.Email) != "" && strings.TrimSpace(credential.Password) != ""
+}
+
+type chatGPTWebRefreshModeError struct {
+	code    string
+	message string
+}
+
+func newChatGPTWebRefreshModeError(code, message string) *chatGPTWebRefreshModeError {
+	return &chatGPTWebRefreshModeError{code: strings.TrimSpace(code), message: strings.TrimSpace(message)}
+}
+
+func (e *chatGPTWebRefreshModeError) Error() string {
+	if e == nil || e.message == "" {
+		return "chatgpt web credential refresh failed"
+	}
+	return e.message
+}
+
+func (e *chatGPTWebRefreshModeError) ChatGPTWebErrorCode() string {
+	if e == nil {
+		return ""
+	}
+	return e.code
 }
 
 type chatGPTWebReloginResult struct {
@@ -1032,11 +1176,22 @@ func chatGPTWebRefreshKey(auth *cliproxyauth.Auth) string {
 	if auth == nil {
 		return ""
 	}
-	refreshToken := ""
-	if auth.Metadata != nil {
-		refreshToken, _ = auth.Metadata["refresh_token"].(string)
+	material := ""
+	if credential, err := chatgptwebauth.ParseCredential(auth.Metadata); err == nil {
+		material = string(credential.RefreshStrategy) + "\x00"
+		switch credential.RefreshStrategy {
+		case chatgptwebauth.RefreshStrategyWebOAuthRT:
+			material += credential.RefreshToken
+		case chatgptwebauth.RefreshStrategyChatGPTSession:
+			cookies, _ := json.Marshal(credential.Cookies)
+			material += string(cookies)
+		case chatgptwebauth.RefreshStrategyCodexSource:
+			material += credential.SourceAuthID + "\x00" + credential.SourceCredentialUID
+		default:
+			material += credential.AccessToken
+		}
 	}
-	digest := sha256.Sum256([]byte(refreshToken))
+	digest := sha256.Sum256([]byte(material))
 	return auth.ID + ":" + auth.RuntimeInstanceID() + ":" + fmt.Sprintf("%x", digest[:8])
 }
 
@@ -1077,7 +1232,7 @@ func (e *ChatGPTWebExecutor) acquisitionContext() (context.Context, context.Canc
 	return context.WithTimeout(e.lifecycleContext(), chatgptwebauth.DefaultAcquisitionTimeout)
 }
 
-func (e *ChatGPTWebExecutor) proxyURL(auth *cliproxyauth.Auth) string {
+func (e *ChatGPTWebExecutor) proxyURLForTarget(auth *cliproxyauth.Auth, targetURL string) string {
 	if auth != nil {
 		if proxyURL := strings.TrimSpace(auth.EffectiveProxyURL()); proxyURL != "" {
 			return proxyURL
@@ -1088,7 +1243,11 @@ func (e *ChatGPTWebExecutor) proxyURL(auth *cliproxyauth.Auth) string {
 			return proxyURL
 		}
 	}
-	target, errParse := url.Parse(chatgptwebauth.AuthBaseURL)
+	targetURL = strings.TrimSpace(targetURL)
+	if targetURL == "" {
+		targetURL = chatgptwebauth.AuthBaseURL
+	}
+	target, errParse := url.Parse(targetURL)
 	if errParse != nil {
 		return ""
 	}
@@ -1102,6 +1261,10 @@ func (e *ChatGPTWebExecutor) proxyURL(auth *cliproxyauth.Auth) string {
 func chatGPTWebErrorCode(err error) string {
 	if authError, ok := chatgptwebauth.AsAuthError(err); ok && strings.TrimSpace(authError.Code) != "" {
 		return chatgptwebauth.SafeLifecycleReason(authError.Code)
+	}
+	var coded interface{ ChatGPTWebErrorCode() string }
+	if errors.As(err, &coded) {
+		return chatgptwebauth.SafeLifecycleReason(coded.ChatGPTWebErrorCode())
 	}
 	return "authentication_failed"
 }

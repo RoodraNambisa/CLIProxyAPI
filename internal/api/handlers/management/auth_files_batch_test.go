@@ -361,6 +361,30 @@ func TestWriteAuthFileSafelyRechecksChatGPTWebCredentialUnderTargetLock(t *testi
 	}
 }
 
+func TestWriteAuthFileSafelyRechecksRetainedCodexUnderTargetLock(t *testing.T) {
+	root, errRoot := os.OpenRoot(t.TempDir())
+	if errRoot != nil {
+		t.Fatal(errRoot)
+	}
+	defer root.Close()
+	const (
+		name            = "account.json"
+		existingContent = `{"type":"codex","credential_uid":"uid-a","deletion_state":"retained_for_dependents","disabled":true}`
+	)
+	if errWrite := root.WriteFile(name, []byte(existingContent), 0o600); errWrite != nil {
+		t.Fatal(errWrite)
+	}
+
+	errWrite := writeAuthFileSafely(root, name, []byte(`{"type":"codex","email":"replacement@example.com"}`))
+	if !errors.Is(errWrite, errCodexAuthRetained) {
+		t.Fatalf("write error = %v, want retained Codex rejection", errWrite)
+	}
+	data, errRead := root.ReadFile(name)
+	if errRead != nil || string(data) != existingContent {
+		t.Fatalf("existing auth = %s, error=%v", data, errRead)
+	}
+}
+
 func TestUploadAuthFile_BatchMultipart_RetiredItemFailsWithoutBlockingValidItem(t *testing.T) {
 	t.Setenv("MANAGEMENT_PASSWORD", "")
 

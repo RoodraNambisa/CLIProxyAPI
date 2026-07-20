@@ -1367,10 +1367,18 @@ func sanitizeChatGPTWebAssetTransportCause(cause error) error {
 }
 
 func newChatGPTWebAssetStatusError(code int, path string, body []byte, headers fhttp.Header) chatGPTWebHTTPError {
-	err := newChatGPTWebStatusError(code, path, body, headers)
+	err := newChatGPTWebStatusError(code, chatGPTWebAssetErrorPath(path), body, headers)
 	err.statusErr.skipAuthResult = true
 	err.statusErr.retryOtherAuth = chatGPTWebAssetStatusRetryable(code)
 	return err
+}
+
+func chatGPTWebAssetErrorPath(rawURL string) string {
+	parsed, errParse := url.Parse(strings.TrimSpace(rawURL))
+	if errParse != nil || strings.TrimSpace(parsed.Path) == "" {
+		return "/"
+	}
+	return parsed.EscapedPath()
 }
 
 func chatGPTWebAssetStatusRetryable(code int) bool {

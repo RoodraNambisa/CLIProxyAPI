@@ -36,6 +36,28 @@ func (h *Handler) authFileRuntimeSummary(authID string) authFileRuntimeSummary {
 	return h.authFileRuntimeSummaries()[strings.TrimSpace(authID)]
 }
 
+func authFileRuntimeSummaryForAuth(auth *coreauth.Auth, graph *coreauth.ChatGPTWebDependencyGraph, summaries map[string]authFileRuntimeSummary) authFileRuntimeSummary {
+	if auth == nil {
+		return authFileRuntimeSummary{}
+	}
+	if sourceUID := coreauth.ChatGPTWebLinkedSourceUID(auth); sourceUID != "" {
+		source, ambiguous := graph.SourceByUID(sourceUID)
+		if ambiguous {
+			return authFileRuntimeSummary{}
+		}
+		sourceID := coreauth.ChatGPTWebLinkedSourceID(auth)
+		if source != nil && !coreauth.ChatGPTWebLinkedSourceMatches(auth, source) {
+			return authFileRuntimeSummary{}
+		}
+		summary := summaries[sourceID]
+		if summary.proxyBinding == nil || strings.TrimSpace(summary.proxyBinding.CredentialUID) != sourceUID {
+			return authFileRuntimeSummary{}
+		}
+		return summary
+	}
+	return summaries[auth.ID]
+}
+
 func applyChatGPTWebAuthFileSummary(entry gin.H, auth *coreauth.Auth, now time.Time) {
 	if entry == nil || auth == nil || !strings.EqualFold(strings.TrimSpace(auth.Provider), "chatgpt-web") {
 		return
@@ -81,7 +103,45 @@ func applyChatGPTWebMetadataSummary(entry gin.H, metadata map[string]any, lifecy
 		entry["token_expires_at"] = expiresAt
 		entry["token_expired"] = !now.Before(expiresAt)
 	}
-	entry["token_refreshable"] = strings.TrimSpace(stringValue(metadata, "refresh_token")) != ""
+	strategy := strings.TrimSpace(stringValue(metadata, "refresh_strategy"))
+	mode := strings.TrimSpace(stringValue(metadata, "credential_mode"))
+	if credential, errParse := chatgptwebauth.ParseCredential(metadata); errParse == nil {
+		strategy = string(credential.RefreshStrategy)
+		mode = credential.CredentialMode
+	}
+	entry["credential_mode"] = mode
+	entry["refresh_strategy"] = strategy
+	entry["token_only"] = strategy == string(chatgptwebauth.RefreshStrategyTokenOnly)
+	entry["token_refreshable"] = strategy != "" && strategy != string(chatgptwebauth.RefreshStrategyTokenOnly)
+	entry["source_auth_id"] = strings.TrimSpace(stringValue(metadata, "source_auth_id"))
+	entry["source_credential_uid"] = strings.TrimSpace(stringValue(metadata, "source_credential_uid"))
+	if uid := strings.TrimSpace(stringValue(metadata, "credential_uid")); uid != "" {
+		entry["credential_uid"] = uid
+	}
+}
+
+func applyChatGPTWebDependencySummary(entry gin.H, auth *coreauth.Auth, graph *coreauth.ChatGPTWebDependencyGraph) {
+	if entry == nil || auth == nil {
+		return
+	}
+	provider := strings.ToLower(strings.TrimSpace(auth.Provider))
+	switch provider {
+	case "codex":
+		uid := coreauth.ChatGPTWebCredentialUID(auth)
+		entry["credential_uid"] = uid
+		entry["deletion_state"] = strings.TrimSpace(stringValue(auth.Metadata, "deletion_state"))
+		entry["retained_for_dependents"] = coreauth.ChatGPTWebAuthRetainedForDependents(auth)
+		count, names, _ := retainedDependencySummary(auth, graph)
+		entry["dependent_count"] = count
+		entry["dependent_names"] = names
+		if requestedAt := retainedDeletionRequestedAt(auth); requestedAt != "" {
+			if parsed, errParse := time.Parse(time.RFC3339Nano, requestedAt); errParse == nil {
+				entry["deletion_requested_at"] = parsed
+			}
+		}
+	case "chatgpt-web":
+		entry["source_missing"] = retainedSourceMissing(auth, graph)
+	}
 }
 
 func applyChatGPTWebSummaryTime(entry gin.H, metadata map[string]any, responseKey, metadataKey string) {

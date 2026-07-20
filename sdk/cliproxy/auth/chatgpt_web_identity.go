@@ -43,6 +43,7 @@ func withoutChatGPTWebCredentialUpdateMarkers(ctx context.Context) context.Conte
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	ctx = context.WithValue(ctx, chatGPTWebDependencyMutationContextKey{}, (*chatGPTWebDependencyMutationToken)(nil))
 	ctx = context.WithValue(ctx, chatGPTWebCredentialReplacementContextKey{}, false)
 	return context.WithValue(ctx, chatGPTWebCredentialRefreshContextKey{}, false)
 }
@@ -156,6 +157,46 @@ func ChatGPTWebCredentialIdentityChanged(existing, next *Auth) bool {
 	return existingIdentity != nextIdentity
 }
 
+// ChatGPTWebCredentialRefreshIdentityChanged reports whether a controlled
+// refresh produced explicit account evidence that conflicts with the existing
+// credential. Rotated opaque refresh or ID tokens are not account changes.
+func ChatGPTWebCredentialRefreshIdentityChanged(existing, next *Auth) bool {
+	if !ChatGPTWebCredentialIdentityChanged(existing, next) {
+		return false
+	}
+	existingEvidence := collectChatGPTWebCredentialEvidence(existing)
+	nextEvidence := collectChatGPTWebCredentialEvidence(next)
+	if existingEvidence.conflicting() || nextEvidence.conflicting() {
+		return true
+	}
+	strongMatch := false
+	for _, pair := range [][2][]string{
+		{existingEvidence.accountIDs, nextEvidence.accountIDs},
+		{existingEvidence.userIDs, nextEvidence.userIDs},
+		{existingEvidence.subjects, nextEvidence.subjects},
+	} {
+		if len(pair[0]) == 0 || len(pair[1]) == 0 {
+			continue
+		}
+		if pair[0][0] != pair[1][0] {
+			return true
+		}
+		strongMatch = true
+	}
+	if !strongMatch && len(existingEvidence.emails) > 0 && len(nextEvidence.emails) > 0 {
+		return existingEvidence.emails[0] != nextEvidence.emails[0]
+	}
+	return false
+}
+
+// ChatGPTWebCredentialHasStrongIdentity reports whether account, user, or
+// subject evidence is available. Email alone is insufficient for a linked
+// Codex refresh relationship.
+func ChatGPTWebCredentialHasStrongIdentity(auth *Auth) bool {
+	claims := chatGPTWebCredentialIdentityClaims(auth)
+	return claims.accountID != "" || claims.userID != "" || claims.subject != ""
+}
+
 func resetChatGPTWebCredentialReplacementState(auth *Auth, now time.Time) {
 	if auth == nil {
 		return
@@ -261,19 +302,7 @@ func clearCarriedChatGPTWebCredentialMetadata(existing, next *Auth, now time.Tim
 }
 
 func prepareRefreshedChatGPTWebCredentialReplacement(existing, next *Auth, now time.Time) bool {
-	if !ChatGPTWebCredentialIdentityChanged(existing, next) {
-		stampChatGPTWebCredentialGeneration(next)
-		return false
-	}
-	existingEvidence := collectChatGPTWebCredentialEvidence(existing)
-	nextEvidence := collectChatGPTWebCredentialEvidence(next)
-	if existingEvidence.conflicting() || nextEvidence.conflicting() {
-		return prepareChatGPTWebCredentialReplacement(existing, next, now)
-	}
-	existingIdentity := ChatGPTWebCredentialIdentity(existing)
-	nextIdentity := ChatGPTWebCredentialIdentity(next)
-	if (existingIdentity == "" && nextIdentity == "") ||
-		(existingIdentity != "" && existingIdentity == nextIdentity) {
+	if !ChatGPTWebCredentialRefreshIdentityChanged(existing, next) {
 		stampChatGPTWebCredentialGeneration(next)
 		return false
 	}
@@ -345,6 +374,8 @@ type ChatGPTWebCredentialReference struct {
 	conflicting  bool
 }
 
+const chatGPTWebCredentialReferenceVersion = "v1"
+
 // NewChatGPTWebCredentialReference creates a hashed credential reference.
 func NewChatGPTWebCredentialReference(auth *Auth) ChatGPTWebCredentialReference {
 	claims := chatGPTWebCredentialIdentityClaims(auth)
@@ -356,6 +387,68 @@ func NewChatGPTWebCredentialReference(auth *Auth) ChatGPTWebCredentialReference 
 		identityHash: ChatGPTWebCredentialIdentity(auth),
 		conflicting:  evidence.conflicting(),
 	}
+}
+
+// ChatGPTWebCredentialReferenceValue serializes a non-secret identity
+// reference that tolerates optional JWT claims appearing or disappearing.
+func ChatGPTWebCredentialReferenceValue(auth *Auth) string {
+	reference := NewChatGPTWebCredentialReference(auth)
+	if reference.Empty() || reference.conflicting {
+		return ""
+	}
+	return strings.Join([]string{
+		chatGPTWebCredentialReferenceVersion,
+		reference.accountHash,
+		reference.userHash,
+		reference.subjectHash,
+		reference.identityHash,
+	}, ":")
+}
+
+// ChatGPTWebCredentialReferenceMatches validates a serialized reference.
+// Legacy identity hashes remain readable for credentials created by earlier
+// builds of this feature.
+func ChatGPTWebCredentialReferenceMatches(value string, auth *Auth) bool {
+	value = strings.TrimSpace(value)
+	if value == "" || auth == nil {
+		return false
+	}
+	parts := strings.Split(value, ":")
+	if len(parts) != 5 || parts[0] != chatGPTWebCredentialReferenceVersion {
+		return ChatGPTWebCredentialIdentity(auth) == value
+	}
+	reference := ChatGPTWebCredentialReference{
+		accountHash:  parts[1],
+		userHash:     parts[2],
+		subjectHash:  parts[3],
+		identityHash: parts[4],
+	}
+	return reference.Matches(auth)
+}
+
+// MergeChatGPTWebCredentialReferenceValues keeps previously observed identity
+// dimensions when a refreshed token omits optional claims.
+func MergeChatGPTWebCredentialReferenceValues(existing, incoming string) string {
+	existing = strings.TrimSpace(existing)
+	incoming = strings.TrimSpace(incoming)
+	if existing == "" {
+		return incoming
+	}
+	if incoming == "" {
+		return existing
+	}
+	currentParts := strings.Split(incoming, ":")
+	previousParts := strings.Split(existing, ":")
+	if len(currentParts) != 5 || currentParts[0] != chatGPTWebCredentialReferenceVersion ||
+		len(previousParts) != 5 || previousParts[0] != chatGPTWebCredentialReferenceVersion {
+		return incoming
+	}
+	for index := 1; index < len(currentParts); index++ {
+		if currentParts[index] == "" {
+			currentParts[index] = previousParts[index]
+		}
+	}
+	return strings.Join(currentParts, ":")
 }
 
 // Empty reports whether the reference contains no comparable identity.

@@ -408,7 +408,7 @@ func TestManagerChatGPTWebPreparationInstallsRotatedTokenAfterCallerCancellation
 	for {
 		current, ok := manager.GetByID(registered.ID)
 		stored := store.lastAuth()
-		_, lockRetained := manager.requestPrepareLocks.Load(registered.ID)
+		_, lockRetained := manager.requestRefreshLocks.Load(registered.ID)
 		if ok && requestPrepareString(current.Metadata["refresh_token"]) == "rotated-refresh-token" &&
 			stored != nil && requestPrepareString(stored.Metadata["refresh_token"]) == "rotated-refresh-token" &&
 			!lockRetained {
@@ -479,14 +479,14 @@ func TestManagerChatGPTWebPreparationSharesDetachedWorker(t *testing.T) {
 		t.Fatal("second preparation did not join the shared worker")
 	}
 
-	lockValue, ok := manager.requestPrepareLocks.Load(registered.ID)
-	lock, _ := lockValue.(*requestAuthPrepareLock)
+	lockValue, ok := manager.requestRefreshLocks.Load(registered.ID)
+	lock, _ := lockValue.(*authRequestRefreshLock)
 	if !ok || lock == nil {
 		t.Fatal("request preparation lock is missing")
 	}
-	manager.requestPrepareLocksMu.Lock()
+	manager.requestRefreshLocksMu.Lock()
 	active := lock.active
-	manager.requestPrepareLocksMu.Unlock()
+	manager.requestRefreshLocksMu.Unlock()
 	if active != 1 {
 		t.Fatalf("active preparation workers = %d, want one", active)
 	}
@@ -512,6 +512,49 @@ func TestManagerChatGPTWebPreparationSharesDetachedWorker(t *testing.T) {
 	}
 	if got := baseExecutor.prepareCalls.Load(); got != 1 {
 		t.Fatalf("PrepareRequestAuth() calls = %d, want one", got)
+	}
+}
+
+func TestManagerCredentialRefreshLockSerializesRequestAuthPreparation(t *testing.T) {
+	prepareStart := make(chan struct{}, 1)
+	prepareGate := make(chan struct{})
+	baseExecutor := &requestPrepareExecutor{prepareStart: prepareStart, prepareGate: prepareGate}
+	executor := &chatGPTWebRequestPrepareExecutor{requestPrepareExecutor: baseExecutor}
+	manager := NewManager(nil, nil, nil)
+	manager.RegisterExecutor(executor)
+	registered, errRegister := manager.Register(WithSkipPersist(t.Context()), &Auth{
+		ID:       "chatgpt-web-external-refresh-lock",
+		Provider: "chatgpt-web",
+		Metadata: map[string]any{"lifecycle_state": LifecycleStateActive},
+	})
+	if errRegister != nil {
+		t.Fatal(errRegister)
+	}
+	releaseRefresh, errLock := manager.LockCredentialRefresh(t.Context(), registered.ID)
+	if errLock != nil {
+		t.Fatal(errLock)
+	}
+	result := make(chan error, 1)
+	go func() {
+		_, errPrepare := manager.prepareRequestAuth(t.Context(), executor, registered)
+		result <- errPrepare
+	}()
+	select {
+	case <-prepareStart:
+		releaseRefresh()
+		t.Fatal("request preparation bypassed the external credential refresh lock")
+	case <-time.After(50 * time.Millisecond):
+	}
+	releaseRefresh()
+	waitRequestPrepareStarted(t, prepareStart)
+	close(prepareGate)
+	select {
+	case errPrepare := <-result:
+		if errPrepare != nil {
+			t.Fatal(errPrepare)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("request preparation did not resume after the refresh lock was released")
 	}
 }
 

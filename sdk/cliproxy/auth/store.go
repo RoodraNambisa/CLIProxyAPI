@@ -3,6 +3,7 @@ package auth
 import (
 	"context"
 	"errors"
+	"strings"
 )
 
 // DeleteOutcome describes the durable result of a delete operation that
@@ -116,6 +117,34 @@ type Store interface {
 // SaveOutcomeError.
 type ConditionalCreateStore interface {
 	SaveIfAbsent(ctx context.Context, auth *Auth) (string, error)
+}
+
+type sourceHashSavePreconditionContextKey struct{}
+
+// WithSourceHashSavePrecondition requires capable stores to replace an auth
+// only when its current persisted generation matches expectedSourceHash.
+func WithSourceHashSavePrecondition(ctx context.Context, expectedSourceHash string) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, sourceHashSavePreconditionContextKey{}, strings.TrimSpace(expectedSourceHash))
+}
+
+// SourceHashSavePrecondition returns the source generation required by ctx.
+func SourceHashSavePrecondition(ctx context.Context) (string, bool) {
+	if ctx == nil {
+		return "", false
+	}
+	expectedSourceHash, _ := ctx.Value(sourceHashSavePreconditionContextKey{}).(string)
+	expectedSourceHash = strings.TrimSpace(expectedSourceHash)
+	return expectedSourceHash, expectedSourceHash != ""
+}
+
+// SourceConditionalSaveStore atomically replaces a record only when its
+// current source generation matches expectedSourceHash. Implementations must
+// also honor WithSourceHashSavePrecondition when Save is called by Manager.
+type SourceConditionalSaveStore interface {
+	SaveIfSourceHashMatches(ctx context.Context, auth *Auth, expectedSourceHash string) (string, error)
 }
 
 // SourceConditionalDeleteStore atomically deletes a record only when its

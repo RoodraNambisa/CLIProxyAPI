@@ -177,15 +177,25 @@ func (s *ObjectTokenStore) Bootstrap(ctx context.Context, exampleConfigPath stri
 
 // Save persists authentication metadata to disk and uploads it to the object storage backend.
 func (s *ObjectTokenStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (string, error) {
-	return s.save(ctx, auth, false)
+	expectedSourceHash, _ := cliproxyauth.SourceHashSavePrecondition(ctx)
+	return s.save(ctx, auth, false, expectedSourceHash)
 }
 
 // SaveIfAbsent persists auth only when neither object storage nor the local mirror contains it.
 func (s *ObjectTokenStore) SaveIfAbsent(ctx context.Context, auth *cliproxyauth.Auth) (string, error) {
-	return s.save(ctx, auth, true)
+	return s.save(ctx, auth, true, "")
 }
 
-func (s *ObjectTokenStore) save(ctx context.Context, auth *cliproxyauth.Auth, requireAbsent bool) (savedPath string, resultErr error) {
+// SaveIfSourceHashMatches persists auth only when local and object generations match.
+func (s *ObjectTokenStore) SaveIfSourceHashMatches(ctx context.Context, auth *cliproxyauth.Auth, expectedSourceHash string) (string, error) {
+	expectedSourceHash = strings.TrimSpace(expectedSourceHash)
+	if expectedSourceHash == "" {
+		return "", cliproxyauth.NewSaveOutcomeError(cliproxyauth.SaveOutcomeRolledBack, errors.New("object store: expected source hash is empty"))
+	}
+	return s.save(ctx, auth, false, expectedSourceHash)
+}
+
+func (s *ObjectTokenStore) save(ctx context.Context, auth *cliproxyauth.Auth, requireAbsent bool, expectedSourceHash string) (savedPath string, resultErr error) {
 	if auth == nil {
 		return "", fmt.Errorf("object store: auth is nil")
 	}
@@ -242,7 +252,7 @@ func (s *ObjectTokenStore) save(ctx context.Context, auth *cliproxyauth.Auth, re
 	defer func() {
 		resultErr = joinAuthSaveCleanupError(resultErr, unlockTarget(), committed)
 	}()
-	if auth.Disabled && !requireAbsent {
+	if auth.Disabled && !requireAbsent && expectedSourceHash == "" {
 		if _, statErr := root.Lstat(snapshotPath); errors.Is(statErr, fs.ErrNotExist) {
 			return "", nil
 		}
@@ -274,7 +284,19 @@ func (s *ObjectTokenStore) save(ctx context.Context, auth *cliproxyauth.Auth, re
 		}
 	} else {
 		var errRemote error
-		remoteState, errRemote = s.authObjectWritePrecondition(ctx, path)
+		if expectedSourceHash != "" {
+			var remoteData []byte
+			remoteState, remoteData, errRemote = s.inspectAuthObject(ctx, path)
+			if errRemote == nil {
+				if errRetired := cliproxyauth.RejectRetiredGeminiCLIAuthFileMutation(remoteData); errRetired != nil {
+					errRemote = fmt.Errorf("object store: %w", errRetired)
+				} else if !remoteState.exists || !cliproxyauth.SourceHashMatchesBytes(expectedSourceHash, remoteData) {
+					errRemote = cliproxyauth.NewSaveOutcomeError(cliproxyauth.SaveOutcomeRolledBack, authfileguard.ErrPersistGenerationStale)
+				}
+			}
+		} else {
+			remoteState, errRemote = s.authObjectWritePrecondition(ctx, path)
+		}
 		if errRemote != nil {
 			if errors.Is(errRemote, cliproxyauth.ErrRetiredGeminiCLIAuthReadOnly) {
 				authfileguard.MarkRetired(path)
@@ -293,6 +315,9 @@ func (s *ObjectTokenStore) save(ctx context.Context, auth *cliproxyauth.Auth, re
 	if errRetired := localSnapshot.rejectRetiredGeminiCLIAuthPersistence(); errRetired != nil {
 		authfileguard.MarkRetired(path)
 		return "", errRetired
+	}
+	if expectedSourceHash != "" && (!localSnapshot.exists || !cliproxyauth.SourceHashMatchesBytes(expectedSourceHash, localSnapshot.data)) {
+		return "", cliproxyauth.NewSaveOutcomeError(cliproxyauth.SaveOutcomeRolledBack, authfileguard.ErrPersistGenerationStale)
 	}
 	runtimeSnapshot := captureAuthRuntimeSnapshot(auth)
 
@@ -452,7 +477,37 @@ func (s *ObjectTokenStore) Delete(ctx context.Context, id string) error {
 			log.WithError(errClose).Error("object store: close auth root after deletion")
 		}
 	}()
-	return s.deleteAuthFileAtRoot(ctx, root, path, relativePath)
+	return s.deleteAuthFileAtRoot(ctx, root, path, relativePath, "")
+}
+
+// DeleteIfSourceHashMatches deletes an auth only when its local and remote generations match.
+func (s *ObjectTokenStore) DeleteIfSourceHashMatches(ctx context.Context, id, expectedSourceHash string) error {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return cliproxyauth.NewDeleteOutcomeError(cliproxyauth.DeleteOutcomeRolledBack, fmt.Errorf("object store: id is empty"))
+	}
+	expectedSourceHash = strings.TrimSpace(expectedSourceHash)
+	if expectedSourceHash == "" {
+		return cliproxyauth.NewDeleteOutcomeError(cliproxyauth.DeleteOutcomeRolledBack, errors.New("object store: expected source hash is empty"))
+	}
+	path, errResolve := s.resolveDeletePath(id)
+	if errResolve != nil {
+		return cliproxyauth.NewDeleteOutcomeError(cliproxyauth.DeleteOutcomeRolledBack, errResolve)
+	}
+	relativePath, errRel := s.relativeAuthPath(path)
+	if errRel != nil {
+		return cliproxyauth.NewDeleteOutcomeError(cliproxyauth.DeleteOutcomeRolledBack, errRel)
+	}
+	root, errRoot := os.OpenRoot(s.authDir)
+	if errRoot != nil {
+		return cliproxyauth.NewDeleteOutcomeError(cliproxyauth.DeleteOutcomeRolledBack, fmt.Errorf("object store: open auth root: %w", errRoot))
+	}
+	defer func() {
+		if errClose := root.Close(); errClose != nil {
+			log.WithError(errClose).Error("object store: close auth root after conditional deletion")
+		}
+	}()
+	return s.deleteAuthFileAtRoot(ctx, root, path, relativePath, expectedSourceHash)
 }
 
 // FinalizeAuthFileDeletion removes the object-store copy after a caller has
@@ -520,10 +575,30 @@ func (s *ObjectTokenStore) DeleteAuthFileAtRoot(ctx context.Context, root *os.Ro
 	if errRel != nil {
 		return cliproxyauth.NewDeleteOutcomeError(cliproxyauth.DeleteOutcomeRolledBack, errRel)
 	}
-	return s.deleteAuthFileAtRoot(ctx, root, path, relativePath)
+	return s.deleteAuthFileAtRoot(ctx, root, path, relativePath, "")
 }
 
-func (s *ObjectTokenStore) deleteAuthFileAtRoot(ctx context.Context, root *os.Root, path, relativePath string) (resultErr error) {
+// DeleteAuthFileAtRootIfSourceHashMatches removes a managed auth only when its generation matches.
+func (s *ObjectTokenStore) DeleteAuthFileAtRootIfSourceHashMatches(ctx context.Context, root *os.Root, id, expectedSourceHash string) error {
+	if root == nil {
+		return cliproxyauth.NewDeleteOutcomeError(cliproxyauth.DeleteOutcomeRolledBack, fmt.Errorf("object store: root is nil"))
+	}
+	expectedSourceHash = strings.TrimSpace(expectedSourceHash)
+	if expectedSourceHash == "" {
+		return cliproxyauth.NewDeleteOutcomeError(cliproxyauth.DeleteOutcomeRolledBack, errors.New("object store: expected source hash is empty"))
+	}
+	path, errResolve := s.resolveDeletePath(id)
+	if errResolve != nil {
+		return cliproxyauth.NewDeleteOutcomeError(cliproxyauth.DeleteOutcomeRolledBack, errResolve)
+	}
+	relativePath, errRel := s.relativeAuthPath(path)
+	if errRel != nil {
+		return cliproxyauth.NewDeleteOutcomeError(cliproxyauth.DeleteOutcomeRolledBack, errRel)
+	}
+	return s.deleteAuthFileAtRoot(ctx, root, path, relativePath, expectedSourceHash)
+}
+
+func (s *ObjectTokenStore) deleteAuthFileAtRoot(ctx context.Context, root *os.Root, path, relativePath, expectedSourceHash string) (resultErr error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	unlockRootMutation, errMutationLock := authfileguard.LockRootMutationContext(ctx, root)
@@ -546,6 +621,13 @@ func (s *ObjectTokenStore) deleteAuthFileAtRoot(ctx context.Context, root *os.Ro
 	localSnapshot, errLocalSnapshot := captureAuthFileSnapshot(root, relativePath)
 	if errLocalSnapshot != nil {
 		return cliproxyauth.NewDeleteOutcomeError(cliproxyauth.DeleteOutcomeRolledBack, errLocalSnapshot)
+	}
+	if expectedSourceHash != "" {
+		if !cliproxyauth.SourceHashMatchesBytes(expectedSourceHash, localSnapshot.data) ||
+			!remoteState.exists ||
+			!cliproxyauth.SourceHashMatchesBytes(expectedSourceHash, remoteData) {
+			return cliproxyauth.NewDeleteOutcomeError(cliproxyauth.DeleteOutcomeRolledBack, authfileguard.ErrPersistGenerationStale)
+		}
 	}
 	deleteCtx, prepareDelete, clearDelete := durableAuthDelete(
 		ctx,

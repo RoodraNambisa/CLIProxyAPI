@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -16,6 +17,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	internalcodex "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/codex"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	sdkauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/auth"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
@@ -535,6 +537,156 @@ func TestCodexPlanTypeRefreshPauseAndResume(t *testing.T) {
 	}
 	if got := atomic.LoadInt32(&requestCount); got != 2 {
 		t.Fatalf("request count = %d, want 2", got)
+	}
+}
+
+func TestCodexPlanTypeRefreshDoesNotOverwriteConcurrentRetention(t *testing.T) {
+	h, manager, path, authID := newCodexPlanRefreshTestHandler(t, map[string]any{
+		"type":           "codex",
+		"credential_uid": "uid-a",
+		"access_token":   "access-before",
+	})
+	expected, ok := manager.GetByID(authID)
+	if !ok || expected == nil {
+		t.Fatal("expected registered Codex credential")
+	}
+	refreshed := expected.Clone()
+	refreshed.Metadata["access_token"] = "access-after"
+
+	retained := expected.Clone()
+	retained.Disabled = true
+	retained.Status = coreauth.StatusDisabled
+	retained.StatusMessage = coreauth.ChatGPTWebDeletionStateRetained
+	retained.Metadata["disabled"] = true
+	retained.Metadata["deletion_state"] = coreauth.ChatGPTWebDeletionStateRetained
+	retained.Metadata["deletion_requested_at"] = "2026-07-19T00:00:00Z"
+	if _, errUpdate := manager.Update(coreauth.WithSkipStateCarryForward(t.Context()), retained); errUpdate != nil {
+		t.Fatalf("retain credential: %v", errUpdate)
+	}
+
+	errPersist := h.persistCodexPlanTypeRefreshAuth(t.Context(), manager, expected, refreshed, "team", "acct-new", true)
+	if !errors.Is(errPersist, errCodexPlanTypeRefreshCredentialChanged) {
+		t.Fatalf("persist refresh error = %v, want credential changed", errPersist)
+	}
+	current, ok := manager.GetByID(authID)
+	if !ok || current == nil || !coreauth.ChatGPTWebAuthRetainedForDependents(current) || !current.Disabled {
+		t.Fatalf("current credential = %#v, want retained", current)
+	}
+	if got := stringValue(current.Metadata, "access_token"); got != "access-before" {
+		t.Fatalf("access_token = %q, want original token", got)
+	}
+	if got := stringValue(current.Metadata, "plan_type"); got != "" {
+		t.Fatalf("plan_type = %q, want unchanged", got)
+	}
+	data, errRead := os.ReadFile(path)
+	if errRead != nil {
+		t.Fatal(errRead)
+	}
+	if !strings.Contains(string(data), coreauth.ChatGPTWebDeletionStateRetained) || strings.Contains(string(data), "access-after") {
+		t.Fatalf("persisted credential was overwritten: %s", data)
+	}
+}
+
+func TestCodexPlanTypeRefreshMergesConcurrentUnrelatedMetadata(t *testing.T) {
+	h, manager, _, authID := newCodexPlanRefreshTestHandler(t, map[string]any{
+		"type":           "codex",
+		"credential_uid": "uid-a",
+		"access_token":   "access-before",
+		"refresh_token":  "refresh-before",
+	})
+	expected, ok := manager.GetByID(authID)
+	if !ok || expected == nil {
+		t.Fatal("expected registered Codex credential")
+	}
+	refreshed := expected.Clone()
+	refreshed.Metadata["access_token"] = "access-after"
+	refreshed.Metadata["refresh_token"] = "refresh-after"
+
+	concurrent := expected.Clone()
+	concurrent.Metadata["note"] = "keep this edit"
+	if _, errUpdate := manager.Update(t.Context(), concurrent); errUpdate != nil {
+		t.Fatalf("update concurrent metadata: %v", errUpdate)
+	}
+	if errPersist := h.persistCodexPlanTypeRefreshAuth(t.Context(), manager, expected, refreshed, "team", "acct-a", true); errPersist != nil {
+		t.Fatalf("persist refresh: %v", errPersist)
+	}
+	current, ok := manager.GetByID(authID)
+	if !ok || current == nil {
+		t.Fatal("refreshed credential disappeared")
+	}
+	for key, want := range map[string]string{
+		"note":          "keep this edit",
+		"access_token":  "access-after",
+		"refresh_token": "refresh-after",
+		"plan_type":     "team",
+		"account_id":    "acct-a",
+	} {
+		if got := stringValue(current.Metadata, key); got != want {
+			t.Fatalf("%s = %q, want %q", key, got, want)
+		}
+	}
+}
+
+func TestCodexPlanTypeRefreshDoesNotOverwritePlanOrAccountChangedDuringRequest(t *testing.T) {
+	requestStarted := make(chan struct{})
+	releaseRequest := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		close(requestStarted)
+		<-releaseRequest
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"plan_type":"team"}`))
+	}))
+	defer server.Close()
+
+	restoreUsageURL := codexPlanTypeRefreshUsageURL
+	codexPlanTypeRefreshUsageURL = server.URL
+	defer func() { codexPlanTypeRefreshUsageURL = restoreUsageURL }()
+
+	h, manager, _, authID := newCodexPlanRefreshTestHandler(t, map[string]any{
+		"type":           "codex",
+		"credential_uid": "uid-concurrent",
+		"access_token":   "access-before",
+		"account_id":     "account-before",
+		"plan_type":      "pro",
+	})
+	auth, ok := manager.GetByID(authID)
+	if !ok || auth == nil {
+		t.Fatal("expected registered Codex credential")
+	}
+	resultCh := make(chan codexPlanTypeRefreshResult, 1)
+	go func() {
+		resultCh <- h.refreshSingleCodexPlanType(manager, auth)
+	}()
+	select {
+	case <-requestStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("usage request did not start")
+	}
+	current, _ := manager.GetByID(authID)
+	concurrent := current.Clone()
+	concurrent.Metadata = cloneStringAnyMap(current.Metadata)
+	concurrent.Attributes = make(map[string]string, len(current.Attributes))
+	for key, value := range current.Attributes {
+		concurrent.Attributes[key] = value
+	}
+	concurrent.Metadata["plan_type"] = "enterprise"
+	concurrent.Metadata["account_id"] = "account-after"
+	concurrent.Attributes["plan_type"] = "enterprise"
+	if _, currentMatch, errUpdate := manager.UpdateIfCurrentSourceHash(t.Context(), current, concurrent); errUpdate != nil || !currentMatch {
+		t.Fatalf("install concurrent edit: current=%v err=%v", currentMatch, errUpdate)
+	}
+	close(releaseRequest)
+
+	result := <-resultCh
+	if result.Status != codexPlanTypeRefreshStatusFailed || !strings.Contains(result.Error, errCodexPlanTypeRefreshCredentialChanged.Error()) {
+		t.Fatalf("refresh result = %+v", result)
+	}
+	latest, _ := manager.GetByID(authID)
+	if got := effectiveCodexPlanType(latest); got != "enterprise" {
+		t.Fatalf("plan_type = %q, want enterprise", got)
+	}
+	if got := internalcodex.EffectiveAccountID(latest.Metadata); got != "account-after" {
+		t.Fatalf("account_id = %q, want account-after", got)
 	}
 }
 

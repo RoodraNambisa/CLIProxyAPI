@@ -227,15 +227,25 @@ func (s *PostgresStore) SetBaseDir(string) {}
 
 // Save persists authentication metadata to disk and PostgreSQL.
 func (s *PostgresStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (string, error) {
-	return s.save(ctx, auth, false)
+	expectedSourceHash, _ := cliproxyauth.SourceHashSavePrecondition(ctx)
+	return s.save(ctx, auth, false, expectedSourceHash)
 }
 
 // SaveIfAbsent persists auth only when neither the database nor local mirror contains it.
 func (s *PostgresStore) SaveIfAbsent(ctx context.Context, auth *cliproxyauth.Auth) (string, error) {
-	return s.save(ctx, auth, true)
+	return s.save(ctx, auth, true, "")
 }
 
-func (s *PostgresStore) save(ctx context.Context, auth *cliproxyauth.Auth, requireAbsent bool) (savedPath string, resultErr error) {
+// SaveIfSourceHashMatches persists auth only when local and database generations match.
+func (s *PostgresStore) SaveIfSourceHashMatches(ctx context.Context, auth *cliproxyauth.Auth, expectedSourceHash string) (string, error) {
+	expectedSourceHash = strings.TrimSpace(expectedSourceHash)
+	if expectedSourceHash == "" {
+		return "", cliproxyauth.NewSaveOutcomeError(cliproxyauth.SaveOutcomeRolledBack, errors.New("postgres store: expected source hash is empty"))
+	}
+	return s.save(ctx, auth, false, expectedSourceHash)
+}
+
+func (s *PostgresStore) save(ctx context.Context, auth *cliproxyauth.Auth, requireAbsent bool, expectedSourceHash string) (savedPath string, resultErr error) {
 	if auth == nil {
 		return "", fmt.Errorf("postgres store: auth is nil")
 	}
@@ -292,7 +302,7 @@ func (s *PostgresStore) save(ctx context.Context, auth *cliproxyauth.Auth, requi
 	defer func() {
 		resultErr = joinAuthSaveCleanupError(resultErr, unlockTarget(), committed)
 	}()
-	if auth.Disabled && !requireAbsent {
+	if auth.Disabled && !requireAbsent && expectedSourceHash == "" {
 		if _, statErr := root.Lstat(relativePath); errors.Is(statErr, fs.ErrNotExist) {
 			return "", nil
 		}
@@ -344,6 +354,10 @@ func (s *PostgresStore) save(ctx context.Context, auth *cliproxyauth.Auth, requi
 	if errRetired := localSnapshot.rejectRetiredGeminiCLIAuthPersistence(); errRetired != nil {
 		authfileguard.MarkRetired(path)
 		return "", errRetired
+	}
+	if expectedSourceHash != "" && (!remoteExists || !cliproxyauth.SourceHashMatchesBytes(expectedSourceHash, remoteData) ||
+		!localSnapshot.exists || !cliproxyauth.SourceHashMatchesBytes(expectedSourceHash, localSnapshot.data)) {
+		return "", cliproxyauth.NewSaveOutcomeError(cliproxyauth.SaveOutcomeRolledBack, authfileguard.ErrPersistGenerationStale)
 	}
 	runtimeSnapshot := captureAuthRuntimeSnapshot(auth)
 
@@ -612,7 +626,37 @@ func (s *PostgresStore) Delete(ctx context.Context, id string) error {
 			log.WithError(errClose).Error("postgres store: close auth root after deletion")
 		}
 	}()
-	return s.deleteAuthFileAtRoot(ctx, root, path, relID)
+	return s.deleteAuthFileAtRoot(ctx, root, path, relID, "")
+}
+
+// DeleteIfSourceHashMatches deletes an auth only when its local and database generations match.
+func (s *PostgresStore) DeleteIfSourceHashMatches(ctx context.Context, id, expectedSourceHash string) error {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return cliproxyauth.NewDeleteOutcomeError(cliproxyauth.DeleteOutcomeRolledBack, fmt.Errorf("postgres store: id is empty"))
+	}
+	expectedSourceHash = strings.TrimSpace(expectedSourceHash)
+	if expectedSourceHash == "" {
+		return cliproxyauth.NewDeleteOutcomeError(cliproxyauth.DeleteOutcomeRolledBack, errors.New("postgres store: expected source hash is empty"))
+	}
+	path, errPath := s.resolveDeletePath(id)
+	if errPath != nil {
+		return cliproxyauth.NewDeleteOutcomeError(cliproxyauth.DeleteOutcomeRolledBack, errPath)
+	}
+	relID, errRel := s.relativeAuthID(path)
+	if errRel != nil {
+		return cliproxyauth.NewDeleteOutcomeError(cliproxyauth.DeleteOutcomeRolledBack, errRel)
+	}
+	root, errRoot := os.OpenRoot(s.authDir)
+	if errRoot != nil {
+		return cliproxyauth.NewDeleteOutcomeError(cliproxyauth.DeleteOutcomeRolledBack, fmt.Errorf("postgres store: open auth root: %w", errRoot))
+	}
+	defer func() {
+		if errClose := root.Close(); errClose != nil {
+			log.WithError(errClose).Error("postgres store: close auth root after conditional deletion")
+		}
+	}()
+	return s.deleteAuthFileAtRoot(ctx, root, path, relID, expectedSourceHash)
 }
 
 // FinalizeAuthFileDeletion removes the database row after a caller has already
@@ -677,10 +721,30 @@ func (s *PostgresStore) DeleteAuthFileAtRoot(ctx context.Context, root *os.Root,
 	if errRel != nil {
 		return cliproxyauth.NewDeleteOutcomeError(cliproxyauth.DeleteOutcomeRolledBack, errRel)
 	}
-	return s.deleteAuthFileAtRoot(ctx, root, path, relID)
+	return s.deleteAuthFileAtRoot(ctx, root, path, relID, "")
 }
 
-func (s *PostgresStore) deleteAuthFileAtRoot(ctx context.Context, root *os.Root, path, relID string) (resultErr error) {
+// DeleteAuthFileAtRootIfSourceHashMatches removes a managed auth only when its generation matches.
+func (s *PostgresStore) DeleteAuthFileAtRootIfSourceHashMatches(ctx context.Context, root *os.Root, id, expectedSourceHash string) error {
+	if root == nil {
+		return cliproxyauth.NewDeleteOutcomeError(cliproxyauth.DeleteOutcomeRolledBack, fmt.Errorf("postgres store: root is nil"))
+	}
+	expectedSourceHash = strings.TrimSpace(expectedSourceHash)
+	if expectedSourceHash == "" {
+		return cliproxyauth.NewDeleteOutcomeError(cliproxyauth.DeleteOutcomeRolledBack, errors.New("postgres store: expected source hash is empty"))
+	}
+	path, errPath := s.absoluteAuthPath(id)
+	if errPath != nil {
+		return cliproxyauth.NewDeleteOutcomeError(cliproxyauth.DeleteOutcomeRolledBack, errPath)
+	}
+	relID, errRel := s.relativeAuthID(path)
+	if errRel != nil {
+		return cliproxyauth.NewDeleteOutcomeError(cliproxyauth.DeleteOutcomeRolledBack, errRel)
+	}
+	return s.deleteAuthFileAtRoot(ctx, root, path, relID, expectedSourceHash)
+}
+
+func (s *PostgresStore) deleteAuthFileAtRoot(ctx context.Context, root *os.Root, path, relID, expectedSourceHash string) (resultErr error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	unlockRootMutation, errMutationLock := s.acquireRootMutation(ctx, root)
@@ -729,6 +793,13 @@ func (s *PostgresStore) deleteAuthFileAtRoot(ctx context.Context, root *os.Root,
 	localSnapshot, errLocalSnapshot := captureAuthFileSnapshot(root, rootName)
 	if errLocalSnapshot != nil {
 		return cliproxyauth.NewDeleteOutcomeError(cliproxyauth.DeleteOutcomeRolledBack, errLocalSnapshot)
+	}
+	if expectedSourceHash != "" {
+		if !cliproxyauth.SourceHashMatchesBytes(expectedSourceHash, localSnapshot.data) ||
+			!originalExists ||
+			!cliproxyauth.SourceHashMatchesBytes(expectedSourceHash, originalData) {
+			return cliproxyauth.NewDeleteOutcomeError(cliproxyauth.DeleteOutcomeRolledBack, authfileguard.ErrPersistGenerationStale)
+		}
 	}
 	deleteCtx, prepareDelete, clearDelete := durableAuthDelete(
 		ctx,

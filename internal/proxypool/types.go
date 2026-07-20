@@ -17,6 +17,7 @@ const bindingStateVersion = 1
 type Binding struct {
 	ID                string    `json:"id"`
 	AuthID            string    `json:"auth_id"`
+	CredentialUID     string    `json:"credential_uid,omitempty"`
 	Pool              string    `json:"pool"`
 	Entry             string    `json:"entry"`
 	Port              int       `json:"port,omitempty"`
@@ -56,23 +57,24 @@ type nodeHealth struct {
 
 // BindingStatus is the management-safe view of one persisted binding.
 type BindingStatus struct {
-	AuthID       string     `json:"auth_id"`
-	AuthIndex    string     `json:"auth_index,omitempty"`
-	Provider     string     `json:"provider,omitempty"`
-	Pool         string     `json:"pool"`
-	Entry        string     `json:"entry"`
-	Port         int        `json:"port,omitempty"`
-	BindingID    string     `json:"binding_id"`
-	ProxyURL     string     `json:"proxy_url"`
-	BoundAt      time.Time  `json:"bound_at"`
-	Healthy      *bool      `json:"healthy"`
-	LastCheckAt  *time.Time `json:"last_check_at,omitempty"`
-	NextCheckAt  *time.Time `json:"next_check_at,omitempty"`
-	IP           string     `json:"ip,omitempty"`
-	Location     string     `json:"loc,omitempty"`
-	ElapsedMS    int64      `json:"elapsed_ms,omitempty"`
-	Error        string     `json:"error,omitempty"`
-	ErrorMessage string     `json:"error_message,omitempty"`
+	CredentialUID string     `json:"-"`
+	AuthID        string     `json:"auth_id"`
+	AuthIndex     string     `json:"auth_index,omitempty"`
+	Provider      string     `json:"provider,omitempty"`
+	Pool          string     `json:"pool"`
+	Entry         string     `json:"entry"`
+	Port          int        `json:"port,omitempty"`
+	BindingID     string     `json:"binding_id"`
+	ProxyURL      string     `json:"proxy_url"`
+	BoundAt       time.Time  `json:"bound_at"`
+	Healthy       *bool      `json:"healthy"`
+	LastCheckAt   *time.Time `json:"last_check_at,omitempty"`
+	NextCheckAt   *time.Time `json:"next_check_at,omitempty"`
+	IP            string     `json:"ip,omitempty"`
+	Location      string     `json:"loc,omitempty"`
+	ElapsedMS     int64      `json:"elapsed_ms,omitempty"`
+	Error         string     `json:"error,omitempty"`
+	ErrorMessage  string     `json:"error_message,omitempty"`
 }
 
 // PoolStatus summarizes runtime health without exposing proxy credentials.

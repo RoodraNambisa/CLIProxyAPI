@@ -214,6 +214,10 @@ func (s *GitTokenStore) EnsureRepository() error {
 }
 
 func (s *GitTokenStore) ensureRepositoryLocked(ctx context.Context) (resultErr error) {
+	return s.ensureRepositoryLockedWithRemoteSync(ctx, true)
+}
+
+func (s *GitTokenStore) ensureRepositoryLockedWithRemoteSync(ctx context.Context, syncRemote bool) (resultErr error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -326,7 +330,7 @@ func (s *GitTokenStore) ensureRepositoryLocked(ctx context.Context) (resultErr e
 	} else if gitInfo.Mode()&os.ModeSymlink != 0 || !gitInfo.IsDir() {
 		s.dirLock.Unlock()
 		return fmt.Errorf("%w: git metadata path is not a stable directory", errUnsafeGitAuthPath)
-	} else {
+	} else if syncRemote {
 		repo, errOpen := git.PlainOpen(repoDir)
 		if errOpen != nil {
 			s.dirLock.Unlock()
@@ -506,15 +510,25 @@ func ensureGitLocalAuthLockExclusion(repoDir string) (err error) {
 
 // Save persists token storage and metadata to the resolved auth file path.
 func (s *GitTokenStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (string, error) {
-	return s.save(ctx, auth, false)
+	expectedSourceHash, _ := cliproxyauth.SourceHashSavePrecondition(ctx)
+	return s.save(ctx, auth, false, expectedSourceHash)
 }
 
 // SaveIfAbsent persists auth only when neither the remote branch nor local mirror contains it.
 func (s *GitTokenStore) SaveIfAbsent(ctx context.Context, auth *cliproxyauth.Auth) (string, error) {
-	return s.save(ctx, auth, true)
+	return s.save(ctx, auth, true, "")
 }
 
-func (s *GitTokenStore) save(ctx context.Context, auth *cliproxyauth.Auth, requireAbsent bool) (savedPath string, resultErr error) {
+// SaveIfSourceHashMatches persists auth only when local and remote generations match.
+func (s *GitTokenStore) SaveIfSourceHashMatches(ctx context.Context, auth *cliproxyauth.Auth, expectedSourceHash string) (string, error) {
+	expectedSourceHash = strings.TrimSpace(expectedSourceHash)
+	if expectedSourceHash == "" {
+		return "", cliproxyauth.NewSaveOutcomeError(cliproxyauth.SaveOutcomeRolledBack, errors.New("git token store: expected source hash is empty"))
+	}
+	return s.save(ctx, auth, false, expectedSourceHash)
+}
+
+func (s *GitTokenStore) save(ctx context.Context, auth *cliproxyauth.Auth, requireAbsent bool, expectedSourceHash string) (savedPath string, resultErr error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -542,7 +556,7 @@ func (s *GitTokenStore) save(ctx context.Context, auth *cliproxyauth.Auth, requi
 		return "", errValidate
 	}
 
-	if err = s.ensureRepositoryLocked(ctx); err != nil {
+	if err = s.ensureRepositoryLockedWithRemoteSync(ctx, expectedSourceHash == ""); err != nil {
 		return "", err
 	}
 
@@ -621,7 +635,7 @@ func (s *GitTokenStore) save(ctx context.Context, auth *cliproxyauth.Auth, requi
 	defer func() {
 		resultErr = joinAuthSaveCleanupError(resultErr, unlockTarget(), committed)
 	}()
-	if auth.Disabled && !requireAbsent {
+	if auth.Disabled && !requireAbsent && expectedSourceHash == "" {
 		if _, statErr := os.Lstat(path); errors.Is(statErr, fs.ErrNotExist) {
 			return "", nil
 		} else if statErr != nil {
@@ -651,6 +665,16 @@ func (s *GitTokenStore) save(ctx context.Context, auth *cliproxyauth.Auth, requi
 	remoteState, errRemote := s.remoteBranchPreconditionLocked(ctx)
 	if errRemote != nil {
 		return "", errRemote
+	}
+	var expectedRemoteBlob gitRemoteAuthBlob
+	if expectedSourceHash != "" {
+		expectedRemoteBlob, errRemote = readGitRemoteAuthBlob(s.repoDirSnapshot(), remoteState, relExisting)
+		if errRemote != nil {
+			return "", errRemote
+		}
+		if !expectedRemoteBlob.exists || !cliproxyauth.SourceHashMatchesBytes(expectedSourceHash, expectedRemoteBlob.data) {
+			return "", cliproxyauth.NewSaveOutcomeError(cliproxyauth.SaveOutcomeRolledBack, authfileguard.ErrPersistGenerationStale)
+		}
 	}
 	if requireAbsent {
 		remoteBlob, errBlob := readGitRemoteAuthBlob(s.repoDirSnapshot(), remoteState, relExisting)
@@ -685,6 +709,9 @@ func (s *GitTokenStore) save(ctx context.Context, auth *cliproxyauth.Auth, requi
 	if errRetired := localSnapshot.rejectRetiredGeminiCLIAuthPersistence(); errRetired != nil {
 		authfileguard.MarkRetired(path)
 		return "", errRetired
+	}
+	if expectedSourceHash != "" && (!localSnapshot.exists || !cliproxyauth.SourceHashMatchesBytes(expectedSourceHash, localSnapshot.data)) {
+		return "", cliproxyauth.NewSaveOutcomeError(cliproxyauth.SaveOutcomeRolledBack, authfileguard.ErrPersistGenerationStale)
 	}
 	runtimeSnapshot := captureAuthRuntimeSnapshot(auth)
 
@@ -972,12 +999,25 @@ func (s *GitTokenStore) Delete(ctx context.Context, id string) error {
 	if strings.TrimSpace(baseDir) == "" {
 		return cliproxyauth.NewDeleteOutcomeError(cliproxyauth.DeleteOutcomeRolledBack, fmt.Errorf("auth filestore: directory not configured"))
 	}
-	return s.authFileDeletionAtBaseDir(ctx, baseDir, nil, id, true)
+	return s.authFileDeletionAtBaseDir(ctx, baseDir, nil, id, true, "")
+}
+
+// DeleteIfSourceHashMatches deletes an auth only when its persisted source generation matches.
+func (s *GitTokenStore) DeleteIfSourceHashMatches(ctx context.Context, id, expectedSourceHash string) error {
+	expectedSourceHash = strings.TrimSpace(expectedSourceHash)
+	if expectedSourceHash == "" {
+		return cliproxyauth.NewDeleteOutcomeError(cliproxyauth.DeleteOutcomeRolledBack, errors.New("git token store: expected source hash is empty"))
+	}
+	baseDir := s.baseDirSnapshot()
+	if strings.TrimSpace(baseDir) == "" {
+		return cliproxyauth.NewDeleteOutcomeError(cliproxyauth.DeleteOutcomeRolledBack, fmt.Errorf("auth filestore: directory not configured"))
+	}
+	return s.authFileDeletionAtBaseDir(ctx, baseDir, nil, id, true, expectedSourceHash)
 }
 
 // FinalizeAuthFileDeletionAtBaseDir commits and pushes a deletion using an immutable auth directory snapshot.
 func (s *GitTokenStore) FinalizeAuthFileDeletionAtBaseDir(ctx context.Context, baseDir string, id string) error {
-	return s.authFileDeletionAtBaseDir(ctx, baseDir, nil, id, false)
+	return s.authFileDeletionAtBaseDir(ctx, baseDir, nil, id, false, "")
 }
 
 // DeleteAuthFileAtRoot removes, commits, and pushes one auth file while holding
@@ -986,10 +1026,22 @@ func (s *GitTokenStore) DeleteAuthFileAtRoot(ctx context.Context, baseDir string
 	if root == nil {
 		return cliproxyauth.NewDeleteOutcomeError(cliproxyauth.DeleteOutcomeRolledBack, fmt.Errorf("auth filestore: root is nil"))
 	}
-	return s.authFileDeletionAtBaseDir(ctx, baseDir, root, id, true)
+	return s.authFileDeletionAtBaseDir(ctx, baseDir, root, id, true, "")
 }
 
-func (s *GitTokenStore) authFileDeletionAtBaseDir(ctx context.Context, baseDir string, root *os.Root, id string, remove bool) (resultErr error) {
+// DeleteAuthFileAtRootIfSourceHashMatches removes a managed auth only when its generation matches.
+func (s *GitTokenStore) DeleteAuthFileAtRootIfSourceHashMatches(ctx context.Context, baseDir string, root *os.Root, id, expectedSourceHash string) error {
+	if root == nil {
+		return cliproxyauth.NewDeleteOutcomeError(cliproxyauth.DeleteOutcomeRolledBack, fmt.Errorf("auth filestore: root is nil"))
+	}
+	expectedSourceHash = strings.TrimSpace(expectedSourceHash)
+	if expectedSourceHash == "" {
+		return cliproxyauth.NewDeleteOutcomeError(cliproxyauth.DeleteOutcomeRolledBack, errors.New("git token store: expected source hash is empty"))
+	}
+	return s.authFileDeletionAtBaseDir(ctx, baseDir, root, id, true, expectedSourceHash)
+}
+
+func (s *GitTokenStore) authFileDeletionAtBaseDir(ctx context.Context, baseDir string, root *os.Root, id string, remove bool, expectedSourceHash string) (resultErr error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -1070,6 +1122,13 @@ func (s *GitTokenStore) authFileDeletionAtBaseDir(ctx context.Context, baseDir s
 	localSnapshot, errLocalSnapshot := captureAuthFileSnapshot(root, cleanID)
 	if errLocalSnapshot != nil {
 		return cliproxyauth.NewDeleteOutcomeError(cliproxyauth.DeleteOutcomeRolledBack, errLocalSnapshot)
+	}
+	if expectedSourceHash != "" {
+		if !cliproxyauth.SourceHashMatchesBytes(expectedSourceHash, localSnapshot.data) ||
+			!originalRemoteBlob.exists ||
+			!cliproxyauth.SourceHashMatchesBytes(expectedSourceHash, originalRemoteBlob.data) {
+			return cliproxyauth.NewDeleteOutcomeError(cliproxyauth.DeleteOutcomeRolledBack, authfileguard.ErrPersistGenerationStale)
+		}
 	}
 	deleteCtx, prepareDelete, clearDelete := durableAuthDelete(
 		ctx,
@@ -1665,9 +1724,9 @@ func (s *GitTokenStore) readAuthFile(path, baseDir string) (*cliproxyauth.Auth, 
 	if errValidate := validateGitAuthFilesystemPath(repoDir, path, false, false); errValidate != nil {
 		return nil, errValidate
 	}
-	data, err := os.ReadFile(path)
+	data, info, err := readGitAuthFileSnapshot(path)
 	if err != nil {
-		return nil, fmt.Errorf("read file: %w", err)
+		return nil, err
 	}
 	if len(data) == 0 {
 		return nil, nil
@@ -1682,10 +1741,6 @@ func (s *GitTokenStore) readAuthFile(path, baseDir string) (*cliproxyauth.Auth, 
 	provider, _ := metadata["type"].(string)
 	if provider == "" {
 		provider = "unknown"
-	}
-	info, err := os.Lstat(path)
-	if err != nil {
-		return nil, fmt.Errorf("stat file: %w", err)
 	}
 	id := s.idFor(path, baseDir)
 	disabled, _ := metadata["disabled"].(bool)
@@ -1722,6 +1777,40 @@ func (s *GitTokenStore) readAuthFile(path, baseDir string) (*cliproxyauth.Auth, 
 	}
 	cliproxyauth.ApplyCustomHeadersFromMetadata(auth)
 	return auth, nil
+}
+
+func readGitAuthFileSnapshot(path string) ([]byte, fs.FileInfo, error) {
+	before, errBefore := os.Lstat(path)
+	if errBefore != nil {
+		return nil, nil, fmt.Errorf("stat file: %w", errBefore)
+	}
+	if before.Mode()&os.ModeSymlink != 0 || !before.Mode().IsRegular() {
+		return nil, nil, fmt.Errorf("%w: auth path is not a regular file", errUnsafeGitAuthPath)
+	}
+	file, errOpen := os.Open(path)
+	if errOpen != nil {
+		return nil, nil, fmt.Errorf("open file: %w", errOpen)
+	}
+	defer func() {
+		if errClose := file.Close(); errClose != nil {
+			log.WithError(errClose).Error("git token store: close auth file failed")
+		}
+	}()
+	opened, errOpened := file.Stat()
+	after, errAfter := os.Lstat(path)
+	if errOpened != nil || errAfter != nil || after.Mode()&os.ModeSymlink != 0 || !after.Mode().IsRegular() ||
+		!os.SameFile(before, opened) || !os.SameFile(after, opened) {
+		return nil, nil, errors.Join(errOpened, errAfter, fmt.Errorf("%w: auth path changed while opening", errUnsafeGitAuthPath))
+	}
+	data, errRead := io.ReadAll(file)
+	if errRead != nil {
+		return nil, nil, fmt.Errorf("read file: %w", errRead)
+	}
+	opened, errOpened = authfileguard.HardenChatGPTWebCredentialFile(file, opened, data)
+	if errOpened != nil {
+		return nil, nil, errOpened
+	}
+	return data, opened, nil
 }
 
 func (s *GitTokenStore) idFor(path, baseDir string) string {

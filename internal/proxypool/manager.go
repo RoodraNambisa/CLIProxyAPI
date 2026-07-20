@@ -398,11 +398,70 @@ func (m *Manager) Resolve(ctx context.Context, auth *coreauth.Auth) (coreauth.Re
 			}
 			return coreauth.ResolvedProxy{Source: "inherit"}, nil
 		}
-		resolved, errResolve := m.resolvePoolBinding(ctx, snapshot, auth.ID, poolName, false)
+		resolved, errResolve := m.resolvePoolBinding(ctx, snapshot, auth.ID, coreauth.ChatGPTWebCredentialUID(auth), poolName, false)
 		if errors.Is(errResolve, errProxyConfigurationChanged) {
 			continue
 		}
 		return resolved, errResolve
+	}
+}
+
+// ResolveExistingBinding resolves an already persisted binding without
+// allocating a replacement.
+func (m *Manager) ResolveExistingBinding(ctx context.Context, authID string) (coreauth.ResolvedProxy, bool, error) {
+	return m.resolveExistingBinding(ctx, authID, "", false)
+}
+
+// ResolveExistingBindingForCredential resolves a binding only when it belongs
+// to the expected persisted credential generation.
+func (m *Manager) ResolveExistingBindingForCredential(ctx context.Context, authID, credentialUID string) (coreauth.ResolvedProxy, bool, error) {
+	return m.resolveExistingBinding(ctx, authID, strings.TrimSpace(credentialUID), true)
+}
+
+func (m *Manager) resolveExistingBinding(ctx context.Context, authID, credentialUID string, requireCredentialUID bool) (coreauth.ResolvedProxy, bool, error) {
+	if m == nil || strings.TrimSpace(authID) == "" {
+		return coreauth.ResolvedProxy{}, false, nil
+	}
+	if requireCredentialUID && credentialUID == "" {
+		return coreauth.ResolvedProxy{}, false, nil
+	}
+	lock, errLock := m.lockBinding(ctx, authID)
+	if errLock != nil {
+		return coreauth.ResolvedProxy{}, false, errLock
+	}
+	defer lock()
+	for {
+		snapshot := m.snapshot()
+		if snapshot == nil {
+			return coreauth.ResolvedProxy{}, false, nil
+		}
+		m.mu.RLock()
+		binding, exists := m.bindings[authID]
+		m.mu.RUnlock()
+		if !exists {
+			return coreauth.ResolvedProxy{}, false, nil
+		}
+		if requireCredentialUID && strings.TrimSpace(binding.CredentialUID) != credentialUID {
+			return coreauth.ResolvedProxy{}, false, nil
+		}
+		resolvedURL, valid := m.bindingURL(snapshot, binding)
+		if !valid {
+			return coreauth.ResolvedProxy{}, false, nil
+		}
+		usable, errUsable := m.bindingUsable(ctx, snapshot, binding, resolvedURL)
+		if errUsable != nil {
+			return coreauth.ResolvedProxy{}, true, errUsable
+		}
+		if m.snapshot() != snapshot {
+			continue
+		}
+		if usable {
+			return resolvedProxy(binding, resolvedURL), true, nil
+		}
+		m.mu.RLock()
+		health := m.health[binding.ID]
+		m.mu.RUnlock()
+		return coreauth.ResolvedProxy{}, true, &UnavailableError{Pool: binding.Pool, RetryTime: health.RetryAfter}
 	}
 }
 
@@ -455,7 +514,7 @@ func (m *Manager) lockBinding(ctx context.Context, authID string) (func(), error
 	}
 }
 
-func (m *Manager) resolvePoolBinding(ctx context.Context, snapshot *configSnapshot, authID, poolName string, force bool) (coreauth.ResolvedProxy, error) {
+func (m *Manager) resolvePoolBinding(ctx context.Context, snapshot *configSnapshot, authID, credentialUID, poolName string, force bool) (coreauth.ResolvedProxy, error) {
 	pool, exists := snapshot.pools[strings.ToLower(strings.TrimSpace(poolName))]
 	if !exists {
 		return coreauth.ResolvedProxy{}, &UnavailableError{Pool: poolName}
@@ -465,8 +524,19 @@ func (m *Manager) resolvePoolBinding(ctx context.Context, snapshot *configSnapsh
 	current, hasCurrent := m.bindings[authID]
 	m.mu.RUnlock()
 	currentURL := ""
-	if hasCurrent && strings.EqualFold(current.Pool, pool.config.Name) {
+	credentialUID = strings.TrimSpace(credentialUID)
+	currentGenerationMatches := bindingCredentialGenerationMatches(current.CredentialUID, credentialUID)
+	if hasCurrent && currentGenerationMatches && strings.EqualFold(current.Pool, pool.config.Name) {
 		if resolvedURL, valid := resolveBindingURL(pool, current); valid {
+			if credentialUID != "" && strings.TrimSpace(current.CredentialUID) == "" {
+				current.CredentialUID = credentialUID
+				if errSave := m.saveBindingForSnapshot(snapshot, current); errSave != nil {
+					if errors.Is(errSave, errProxyConfigurationChanged) {
+						return coreauth.ResolvedProxy{}, errSave
+					}
+					return coreauth.ResolvedProxy{}, &UnavailableError{Pool: pool.config.Name, Cause: errSave}
+				}
+			}
 			currentURL = resolvedURL
 			if !force {
 				usable, errUsable := m.bindingUsable(ctx, snapshot, current, resolvedURL)
@@ -490,6 +560,7 @@ func (m *Manager) resolvePoolBinding(ctx context.Context, snapshot *configSnapsh
 		}
 		return coreauth.ResolvedProxy{}, &UnavailableError{Pool: pool.config.Name, RetryTime: retryAt, Cause: errAllocate}
 	}
+	binding.CredentialUID = credentialUID
 	defer m.releaseSpreadReservation(binding.ID)
 	if errSave := m.saveBindingForSnapshot(snapshot, binding); errSave != nil {
 		m.deleteHealth(binding.ID)
@@ -1012,8 +1083,9 @@ func (m *Manager) ReportFailure(ctx context.Context, auth *coreauth.Auth, err er
 		return err
 	}
 	bindingID := auth.EffectiveProxyBindingID()
+	bindingAuthID := auth.EffectiveProxyAuthID()
 	m.mu.RLock()
-	binding, exists := m.bindings[auth.ID]
+	binding, exists := m.bindings[bindingAuthID]
 	m.mu.RUnlock()
 	if !exists || binding.ID != bindingID {
 		return err
@@ -1048,7 +1120,7 @@ func (m *Manager) ReportFailure(ctx context.Context, auth *coreauth.Auth, err er
 		return err
 	}
 	log.WithFields(log.Fields{
-		"auth_id": auth.ID,
+		"auth_id": bindingAuthID,
 		"pool":    binding.Pool,
 		"entry":   binding.Entry,
 		"proxy":   proxyutil.MaskProxyURL(resolvedURL),

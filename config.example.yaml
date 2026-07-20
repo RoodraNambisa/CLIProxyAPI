@@ -47,8 +47,12 @@ api-keys:
   - "your-api-key-2"
   - "your-api-key-3"
 
-# ChatGPT Web credentials are stored as JSON files under auth-dir.
-# Automatic password re-login after a terminal token refresh failure is disabled by default.
+# ChatGPT Web credentials are stored as 0600 JSON files under auth-dir.
+# The management API can import Web OAuth refresh tokens, explicit ChatGPT
+# session cookies, or access-token-only credentials. Codex-linked Web copies
+# must be created through the conversion task and never copy the Codex refresh token.
+# Automatic password re-login only applies to native credentials that retain
+# password/TOTP material and is disabled by default.
 chatgpt-web:
   auto-relogin: false
 

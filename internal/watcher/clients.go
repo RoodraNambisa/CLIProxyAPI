@@ -456,7 +456,7 @@ func (w *Watcher) addOrUpdateClientWithPersistedHashLocked(path, persistedHash s
 		updates := w.computePerPathUpdatesLocked(oldByID, map[string]*coreauth.Auth{})
 		w.clientsMutex.Unlock()
 		coreauth.WarnRetiredGeminiCLIAuthIgnored()
-		w.dispatchAuthUpdates(updates)
+		w.dispatchAuthUpdatesWithDependencyReconcile(updates)
 		return
 	}
 
@@ -478,7 +478,7 @@ func (w *Watcher) addOrUpdateClientWithPersistedHashLocked(path, persistedHash s
 		}
 		updates := w.computePerPathUpdatesLocked(oldByID, newByID)
 		w.clientsMutex.Unlock()
-		w.dispatchAuthUpdates(updates)
+		w.dispatchAuthUpdatesWithDependencyReconcile(updates)
 		return
 	}
 
@@ -511,7 +511,7 @@ func (w *Watcher) addOrUpdateClientWithPersistedHashLocked(path, persistedHash s
 	updates := w.computePerPathUpdatesLocked(oldByID, map[string]*coreauth.Auth{})
 	w.clientsMutex.Unlock()
 
-	w.dispatchAuthUpdates(updates)
+	w.dispatchAuthUpdatesWithDependencyReconcile(updates)
 	started := w.persistAuthAsyncWithCompletionContext(fmt.Sprintf("Sync auth %s", filepath.Base(path)), func(ctx context.Context) context.Context {
 		return authfileguard.WithExpectedPersistHash(ctx, fileVersion.hash)
 	}, func(errPersist error) {
@@ -817,7 +817,7 @@ func (w *Watcher) removeClientStateLocked(path string, persist bool) {
 	if persist && !deferPersistence && retiredPath {
 		authfileguard.ClearRetiredSnapshot(retiredSnapshot)
 	}
-	w.dispatchAuthUpdates(updates)
+	w.dispatchAuthUpdatesWithDependencyReconcile(updates)
 	if !deferPersistence {
 		return
 	}

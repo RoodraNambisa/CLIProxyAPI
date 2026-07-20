@@ -692,15 +692,25 @@ func (s *FileTokenStore) SetBaseDir(dir string) {
 
 // Save persists token storage and metadata to the resolved auth file path.
 func (s *FileTokenStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (string, error) {
-	return s.save(ctx, auth, false)
+	expectedSourceHash, _ := cliproxyauth.SourceHashSavePrecondition(ctx)
+	return s.save(ctx, auth, false, expectedSourceHash)
 }
 
 // SaveIfAbsent persists auth only when the target file does not already exist.
 func (s *FileTokenStore) SaveIfAbsent(ctx context.Context, auth *cliproxyauth.Auth) (string, error) {
-	return s.save(ctx, auth, true)
+	return s.save(ctx, auth, true, "")
 }
 
-func (s *FileTokenStore) save(ctx context.Context, auth *cliproxyauth.Auth, requireAbsent bool) (savedPath string, resultErr error) {
+// SaveIfSourceHashMatches persists auth only when the current file generation matches.
+func (s *FileTokenStore) SaveIfSourceHashMatches(ctx context.Context, auth *cliproxyauth.Auth, expectedSourceHash string) (string, error) {
+	expectedSourceHash = strings.TrimSpace(expectedSourceHash)
+	if expectedSourceHash == "" {
+		return "", cliproxyauth.NewSaveOutcomeError(cliproxyauth.SaveOutcomeRolledBack, errors.New("auth filestore: expected source hash is empty"))
+	}
+	return s.save(ctx, auth, false, expectedSourceHash)
+}
+
+func (s *FileTokenStore) save(ctx context.Context, auth *cliproxyauth.Auth, requireAbsent bool, expectedSourceHash string) (savedPath string, resultErr error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -813,7 +823,7 @@ func (s *FileTokenStore) save(ctx context.Context, auth *cliproxyauth.Auth, requ
 	}()
 	parentRoot, leaf, closeParent, errParent := openFileTokenParent(root, relativePath)
 	if errParent != nil {
-		if auth.Disabled && !requireAbsent && os.IsNotExist(errParent) {
+		if auth.Disabled && !requireAbsent && expectedSourceHash == "" && os.IsNotExist(errParent) {
 			return "", nil
 		}
 		return "", fmt.Errorf("auth filestore: open auth parent: %w", errParent)
@@ -833,7 +843,10 @@ func (s *FileTokenStore) save(ctx context.Context, auth *cliproxyauth.Auth, requ
 	} else if !os.IsNotExist(errExisting) {
 		return "", fmt.Errorf("auth filestore: read existing failed: %w", errExisting)
 	}
-	if auth.Disabled && !requireAbsent && os.IsNotExist(errExisting) {
+	if expectedSourceHash != "" && (errExisting != nil || !cliproxyauth.SourceHashMatchesBytes(expectedSourceHash, existingData)) {
+		return "", cliproxyauth.NewSaveOutcomeError(cliproxyauth.SaveOutcomeRolledBack, authfileguard.ErrPersistGenerationStale)
+	}
+	if auth.Disabled && !requireAbsent && expectedSourceHash == "" && os.IsNotExist(errExisting) {
 		return "", nil
 	}
 
@@ -1317,6 +1330,39 @@ func (s *FileTokenStore) Delete(ctx context.Context, id string) (resultErr error
 	}
 	authfileguard.ClearRetiredSnapshot(retiredSnapshot)
 	return nil
+}
+
+// DeleteIfSourceHashMatches deletes a managed auth file only when its current
+// persisted generation still matches expectedSourceHash.
+func (s *FileTokenStore) DeleteIfSourceHashMatches(ctx context.Context, id, expectedSourceHash string) error {
+	expectedSourceHash = strings.TrimSpace(expectedSourceHash)
+	if expectedSourceHash == "" {
+		return cliproxyauth.NewDeleteOutcomeError(cliproxyauth.DeleteOutcomeRolledBack, errors.New("auth filestore: expected source hash is empty"))
+	}
+	lexicalBaseDir, resolvedBaseDir, errBase := resolveFileTokenBaseDir(s.baseDirSnapshot(), false)
+	if errBase != nil {
+		return cliproxyauth.NewDeleteOutcomeError(cliproxyauth.DeleteOutcomeRolledBack, errBase)
+	}
+	s.rememberResolvedBaseDir(resolvedBaseDir)
+	path, _, _, errPath := s.resolveDeletePath(id, lexicalBaseDir, resolvedBaseDir)
+	if errPath != nil {
+		return cliproxyauth.NewDeleteOutcomeError(cliproxyauth.DeleteOutcomeRolledBack, errPath)
+	}
+	cleanID, managed := relativePathWithin(resolvedBaseDir, path)
+	if !managed {
+		return cliproxyauth.NewDeleteOutcomeError(cliproxyauth.DeleteOutcomeRolledBack, errors.New("auth filestore: conditional delete path is outside base dir"))
+	}
+	root, errRoot := os.OpenRoot(resolvedBaseDir)
+	if errRoot != nil {
+		return cliproxyauth.NewDeleteOutcomeError(cliproxyauth.DeleteOutcomeRolledBack, fmt.Errorf("auth filestore: open auth root: %w", errRoot))
+	}
+	defer closeFileTokenRoot(root)
+	return s.DeleteAuthFileAtRootPreparedContext(ctx, lexicalBaseDir, root, cleanID, func(_ string, data []byte) error {
+		if !cliproxyauth.SourceHashMatchesBytes(expectedSourceHash, data) {
+			return authfileguard.ErrPersistGenerationStale
+		}
+		return nil
+	})
 }
 
 // DeleteAuthFileAtRoot removes one managed auth file through a stable root while

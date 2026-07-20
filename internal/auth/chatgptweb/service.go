@@ -25,6 +25,9 @@ func NewService(options Options) *Service {
 	if strings.TrimSpace(options.AuthBaseURL) == "" {
 		options.AuthBaseURL = AuthBaseURL
 	}
+	if strings.TrimSpace(options.SessionBaseURL) == "" {
+		options.SessionBaseURL = SessionBaseURL
+	}
 	if strings.TrimSpace(options.SentinelBaseURL) == "" {
 		options.SentinelBaseURL = defaultSentinelBaseURL
 	}
@@ -46,6 +49,7 @@ func NewService(options Options) *Service {
 	options.Rand = randomReader(options.Rand)
 	options.Persona = normalizePersona(options.Persona)
 	options.AuthBaseURL = strings.TrimRight(strings.TrimSpace(options.AuthBaseURL), "/")
+	options.SessionBaseURL = strings.TrimRight(strings.TrimSpace(options.SessionBaseURL), "/")
 	options.SentinelBaseURL = strings.TrimRight(strings.TrimSpace(options.SentinelBaseURL), "/")
 	return &Service{options: options}
 }
@@ -318,6 +322,16 @@ func (service *Service) Refresh(ctx context.Context, credential Credential, prox
 		service.applyFailure(refreshed, authError, false)
 		return refreshed, authError
 	}
+	incomingIdentity := &Credential{
+		AccessToken: strings.TrimSpace(tokenResponse.AccessToken),
+		IDToken:     strings.TrimSpace(tokenResponse.IDToken),
+	}
+	PopulateCredentialIdentity(incomingIdentity)
+	if credentialIdentityConflicts(&credential, incomingIdentity) {
+		authError := newAuthError("identity_conflict", LifecycleReauthRequired, http.StatusConflict, false, true, "refreshed credential belongs to a different account", nil)
+		service.applyFailure(refreshed, authError, false)
+		return refreshed, authError
+	}
 	refreshed.AccessToken = strings.TrimSpace(tokenResponse.AccessToken)
 	if strings.TrimSpace(tokenResponse.RefreshToken) != "" {
 		refreshed.RefreshToken = strings.TrimSpace(tokenResponse.RefreshToken)
@@ -326,10 +340,206 @@ func (service *Service) Refresh(ctx context.Context, credential Credential, prox
 		refreshed.IDToken = strings.TrimSpace(tokenResponse.IDToken)
 	}
 	refreshed.Expired = tokenExpiryString(refreshed.AccessToken, refreshed.IDToken)
+	PopulateCredentialIdentity(refreshed)
 	refreshed.Cookies = client.ExportCookies()
 	refreshed.LastRefreshAt = service.timestamp()
 	service.updateLifecycle(refreshed, LifecycleActive, "")
 	return refreshed, nil
+}
+
+// RefreshSession exchanges a persisted ChatGPT session cookie for a current
+// access token without changing the browser identity or proxy.
+func (service *Service) RefreshSession(ctx context.Context, credential Credential, proxyURL string) (*Credential, error) {
+	refreshed := cloneCredential(&credential)
+	refreshed.Type = Provider
+	refreshed.RefreshStrategy = RefreshStrategyChatGPTSession
+	refreshed.CredentialMode = CredentialModeNative
+	refreshed.Persona = normalizePersona(refreshed.Persona)
+	refreshed.Cookies = scopeUnscopedCookiesForURL(refreshed.Cookies, service.options.SessionBaseURL)
+	if !HasSessionCookieForURL(refreshed.Cookies, service.options.SessionBaseURL) {
+		authError := newAuthError("session_cookie_missing", LifecycleReauthRequired, 0, false, true, "chatgpt session cookie is required", nil)
+		service.applyFailure(refreshed, authError, false)
+		return refreshed, authError
+	}
+
+	service.updateLifecycle(refreshed, LifecycleRefreshing, "")
+	if err := EnsureCredentialRuntimeIDsForURL(refreshed, service.options.Rand, service.options.SessionBaseURL); err != nil {
+		authError := newAuthError("random_generation_failed", LifecycleActive, 0, false, true, "initialize browser identity", err)
+		service.applyFailure(refreshed, authError, false)
+		return refreshed, authError
+	}
+	acquisitionContext, cancel := service.acquisitionContext(ctx)
+	defer cancel()
+	client, err := NewClient(refreshed.Persona, proxyURL, refreshed.Cookies)
+	if err != nil {
+		authError := newAuthError("client_initialization_failed", LifecycleActive, 0, true, false, "initialize browser client", err)
+		service.applyFailure(refreshed, authError, false)
+		return refreshed, authError
+	}
+	defer client.CloseIdleConnections()
+	if err = client.SetCookie(service.options.SessionBaseURL, "oai-did", refreshed.DeviceID); err != nil {
+		authError := newAuthError("cookie_initialization_failed", LifecycleActive, 0, false, true, "initialize device cookie", err)
+		service.applyFailure(refreshed, authError, false)
+		return refreshed, authError
+	}
+
+	response, payload, err := client.DoNoRedirect(acquisitionContext, http.MethodGet,
+		service.options.SessionBaseURL+"/api/auth/session?refresh=true",
+		map[string]string{
+			"accept":         "application/json",
+			"referer":        service.options.SessionBaseURL + "/",
+			"sec-fetch-dest": "empty",
+			"sec-fetch-mode": "cors",
+			"sec-fetch-site": "same-origin",
+		}, nil)
+	if err != nil {
+		authError := networkAuthError("session_refresh_network_error", LifecycleActive, err)
+		service.applyFailure(refreshed, authError, false)
+		return refreshed, authError
+	}
+	if response.StatusCode == http.StatusUnauthorized || response.StatusCode == http.StatusForbidden ||
+		(response.StatusCode >= http.StatusMultipleChoices && response.StatusCode < http.StatusBadRequest) {
+		authError := newAuthError("session_expired", LifecycleReauthRequired, response.StatusCode, false, true, "chatgpt session must be renewed", nil)
+		service.applyFailure(refreshed, authError, false)
+		return refreshed, authError
+	}
+	if authError := classifyHTTPResponse("session_refresh", response.StatusCode, payload, LifecycleActive); authError != nil {
+		service.applyFailure(refreshed, authError, false)
+		return refreshed, authError
+	}
+	var session sessionPayload
+	if err = json.Unmarshal(payload, &session); err != nil {
+		authError := newAuthError("session_response_invalid", LifecycleActive, response.StatusCode, true, false, "session endpoint returned invalid JSON", err)
+		service.applyFailure(refreshed, authError, false)
+		return refreshed, authError
+	}
+	if strings.TrimSpace(session.AccessToken) == "" {
+		authError := newAuthError("access_token_missing", LifecycleReauthRequired, response.StatusCode, false, true, "session endpoint did not return an access token", nil)
+		service.applyFailure(refreshed, authError, false)
+		return refreshed, authError
+	}
+	incomingIdentity := &Credential{
+		Email:       strings.TrimSpace(session.User.Email),
+		AccountID:   strings.TrimSpace(session.Account.ID),
+		UserID:      strings.TrimSpace(session.User.ID),
+		AccessToken: strings.TrimSpace(session.AccessToken),
+	}
+	PopulateCredentialIdentity(incomingIdentity)
+	if credentialIdentityConflicts(&credential, incomingIdentity) {
+		authError := newAuthError("identity_conflict", LifecycleReauthRequired, http.StatusConflict, false, true, "chatgpt session belongs to a different account", nil)
+		service.applyFailure(refreshed, authError, false)
+		return refreshed, authError
+	}
+	refreshed.AccessToken = strings.TrimSpace(session.AccessToken)
+	refreshed.Expired = tokenExpiryString(refreshed.AccessToken)
+	if refreshed.Expired == "" {
+		refreshed.Expired = strings.TrimSpace(session.Expires)
+	}
+	if email := strings.TrimSpace(session.User.Email); email != "" {
+		refreshed.Email = email
+	}
+	if accountID := strings.TrimSpace(session.Account.ID); accountID != "" {
+		refreshed.AccountID = accountID
+	}
+	if userID := strings.TrimSpace(session.User.ID); userID != "" {
+		refreshed.UserID = userID
+	}
+	if planType := strings.TrimSpace(session.Account.PlanType); planType != "" {
+		refreshed.PlanType = planType
+	}
+	refreshed.Cookies = client.ExportCookies()
+	refreshed.LastRefreshAt = service.timestamp()
+	service.updateLifecycle(refreshed, LifecycleActive, "")
+	return refreshed, nil
+}
+
+type credentialIdentity struct {
+	accountID string
+	userID    string
+	subject   string
+	email     string
+}
+
+func credentialIdentityEvidence(credential *Credential) []credentialIdentity {
+	if credential == nil {
+		return nil
+	}
+	evidence := make([]credentialIdentity, 0, 3)
+	explicit := credentialIdentity{
+		accountID: strings.TrimSpace(credential.AccountID),
+		userID:    strings.TrimSpace(credential.UserID),
+		email:     NormalizeEmail(credential.Email),
+	}
+	if !credentialIdentityEmpty(explicit) {
+		evidence = append(evidence, explicit)
+	}
+	for _, token := range []string{credential.AccessToken, credential.IDToken} {
+		claims := jwtClaims(token)
+		if len(claims) == 0 {
+			continue
+		}
+		authClaims, _ := claims["https://api.openai.com/auth"].(map[string]any)
+		identity := credentialIdentity{
+			accountID: firstStringValue(authClaims, "chatgpt_account_id", "account_id"),
+			userID:    firstStringValue(authClaims, "chatgpt_user_id", "user_id"),
+			subject:   strings.TrimSpace(stringValue(claims["sub"])),
+			email:     NormalizeEmail(stringValue(claims["email"])),
+		}
+		if identity.accountID == "" {
+			identity.accountID = firstStringValue(claims, "chatgpt_account_id", "account_id")
+		}
+		if identity.userID == "" {
+			identity.userID = firstStringValue(claims, "chatgpt_user_id", "user_id")
+		}
+		if !credentialIdentityEmpty(identity) {
+			evidence = append(evidence, identity)
+		}
+	}
+	return evidence
+}
+
+func credentialIdentityEmpty(identity credentialIdentity) bool {
+	return identity.accountID == "" && identity.userID == "" && identity.subject == "" && identity.email == ""
+}
+
+func credentialIdentityEvidenceConflicts(current, next credentialIdentity) bool {
+	if current.accountID != "" && next.accountID != "" {
+		if current.accountID != next.accountID {
+			return true
+		}
+		return (current.userID != "" && next.userID != "" && current.userID != next.userID) ||
+			(current.subject != "" && next.subject != "" && current.subject != next.subject)
+	}
+	return (current.userID != "" && next.userID != "" && current.userID != next.userID) ||
+		(current.subject != "" && next.subject != "" && current.subject != next.subject) ||
+		(current.email != "" && next.email != "" && current.email != next.email)
+}
+
+func credentialIdentitySetConflicts(evidence []credentialIdentity) bool {
+	for i := range evidence {
+		for j := i + 1; j < len(evidence); j++ {
+			if credentialIdentityEvidenceConflicts(evidence[i], evidence[j]) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func credentialIdentityConflicts(existing, incoming *Credential) bool {
+	currentEvidence := credentialIdentityEvidence(existing)
+	nextEvidence := credentialIdentityEvidence(incoming)
+	if credentialIdentitySetConflicts(currentEvidence) || credentialIdentitySetConflicts(nextEvidence) {
+		return true
+	}
+	for _, current := range currentEvidence {
+		for _, next := range nextEvidence {
+			if credentialIdentityEvidenceConflicts(current, next) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // EnsureCredentialRuntimeIDs restores or creates the stable browser identity
@@ -375,7 +585,10 @@ func (service *Service) finishLogin(ctx context.Context, client *Client, credent
 	credential.AccessToken = tokens.AccessToken
 	credential.RefreshToken = tokens.RefreshToken
 	credential.IDToken = tokens.IDToken
+	credential.RefreshStrategy = RefreshStrategyWebOAuthRT
+	credential.CredentialMode = CredentialModeNative
 	credential.Expired = tokenExpiryString(tokens.AccessToken, tokens.IDToken)
+	PopulateCredentialIdentity(credential)
 	credential.Cookies = client.ExportCookies()
 	credential.Persona = client.Persona()
 	now := service.timestamp()
@@ -391,6 +604,19 @@ type tokenPayload struct {
 	AccessToken  string `json:"access_token"`
 	RefreshToken string `json:"refresh_token"`
 	IDToken      string `json:"id_token"`
+}
+
+type sessionPayload struct {
+	AccessToken string `json:"accessToken"`
+	Expires     string `json:"expires"`
+	User        struct {
+		ID    string `json:"id"`
+		Email string `json:"email"`
+	} `json:"user"`
+	Account struct {
+		ID       string `json:"id"`
+		PlanType string `json:"planType"`
+	} `json:"account"`
 }
 
 func (service *Service) exchangeCode(ctx context.Context, client *Client, code, verifier string) (tokenPayload, *AuthError) {
@@ -1092,6 +1318,64 @@ func JWTExpiry(token string) (time.Time, bool) {
 		return time.Time{}, false
 	}
 	return time.Unix(expiresAt, 0).UTC(), true
+}
+
+// PopulateCredentialIdentity fills non-secret account metadata from available
+// JWTs without replacing values already returned by an authenticated endpoint.
+func PopulateCredentialIdentity(credential *Credential) {
+	if credential == nil {
+		return
+	}
+	for _, token := range []string{credential.AccessToken, credential.IDToken} {
+		claims := jwtClaims(token)
+		if len(claims) == 0 {
+			continue
+		}
+		authClaims, _ := claims["https://api.openai.com/auth"].(map[string]any)
+		if credential.Email == "" {
+			credential.Email = strings.TrimSpace(stringValue(claims["email"]))
+		}
+		if credential.AccountID == "" {
+			credential.AccountID = firstStringValue(authClaims, "chatgpt_account_id", "account_id")
+			if credential.AccountID == "" {
+				credential.AccountID = firstStringValue(claims, "chatgpt_account_id", "account_id")
+			}
+		}
+		if credential.UserID == "" {
+			credential.UserID = firstStringValue(authClaims, "chatgpt_user_id", "user_id")
+			if credential.UserID == "" {
+				credential.UserID = firstStringValue(claims, "chatgpt_user_id", "user_id")
+			}
+		}
+		if credential.PlanType == "" {
+			credential.PlanType = firstStringValue(authClaims, "chatgpt_plan_type", "plan_type")
+		}
+	}
+}
+
+func jwtClaims(token string) map[string]any {
+	parts := strings.Split(strings.TrimSpace(token), ".")
+	if len(parts) < 2 {
+		return nil
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return nil
+	}
+	var claims map[string]any
+	if err = json.Unmarshal(payload, &claims); err != nil {
+		return nil
+	}
+	return claims
+}
+
+func firstStringValue(values map[string]any, keys ...string) string {
+	for _, key := range keys {
+		if value := strings.TrimSpace(stringValue(values[key])); value != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 func tokenExpiryString(tokens ...string) string {

@@ -158,6 +158,50 @@ type bindingRemovalCandidate struct {
 	BindingID string
 }
 
+type bindingAuthSnapshot struct {
+	auths            map[string]*coreauth.Auth
+	linkedSourceUIDs map[string]map[string]struct{}
+}
+
+func buildBindingAuthSnapshot(source AuthSource) bindingAuthSnapshot {
+	snapshot := bindingAuthSnapshot{
+		auths:            make(map[string]*coreauth.Auth),
+		linkedSourceUIDs: make(map[string]map[string]struct{}),
+	}
+	if source == nil {
+		return snapshot
+	}
+	auths := source.List()
+	for _, auth := range auths {
+		if auth != nil {
+			snapshot.auths[auth.ID] = auth
+		}
+	}
+	for _, auth := range auths {
+		if auth == nil {
+			continue
+		}
+		sourceID := coreauth.ChatGPTWebLinkedSourceID(auth)
+		sourceUID := coreauth.ChatGPTWebLinkedSourceUID(auth)
+		if sourceID == "" || sourceUID == "" {
+			continue
+		}
+		if snapshot.linkedSourceUIDs[sourceID] == nil {
+			snapshot.linkedSourceUIDs[sourceID] = make(map[string]struct{})
+		}
+		snapshot.linkedSourceUIDs[sourceID][sourceUID] = struct{}{}
+		if existingSource := snapshot.auths[sourceID]; existingSource != nil &&
+			coreauth.ChatGPTWebCredentialUID(existingSource) == sourceUID &&
+			coreauth.ChatGPTWebAuthRetainedForDependents(existingSource) {
+			retainedSource := existingSource.Clone()
+			retainedSource.Disabled = false
+			retainedSource.Status = coreauth.StatusActive
+			snapshot.auths[sourceID] = retainedSource
+		}
+	}
+	return snapshot
+}
+
 func (m *Manager) validBindings(snapshot *configSnapshot, bindings []Binding) ([]Binding, []bindingRemovalCandidate) {
 	m.mu.RLock()
 	source := m.auths
@@ -165,23 +209,32 @@ func (m *Manager) validBindings(snapshot *configSnapshot, bindings []Binding) ([
 	if source == nil {
 		return bindings, nil
 	}
-	auths := make(map[string]*coreauth.Auth)
-	for _, auth := range source.List() {
-		if auth != nil {
-			auths[auth.ID] = auth
-		}
-	}
+	authSnapshot := buildBindingAuthSnapshot(source)
 	valid := make([]Binding, 0, len(bindings))
 	remove := make([]bindingRemovalCandidate, 0)
 	for _, binding := range bindings {
-		auth := auths[binding.AuthID]
-		if !m.bindingValid(snapshot, binding, auth) {
+		if !m.bindingValidInAuthSnapshot(snapshot, binding, authSnapshot, m.bindingLeaseActive(binding.AuthID)) {
 			remove = append(remove, bindingRemovalCandidate{AuthID: binding.AuthID, BindingID: binding.ID})
 			continue
 		}
 		valid = append(valid, binding)
 	}
 	return valid, remove
+}
+
+func (m *Manager) bindingValidInAuthSnapshot(snapshot *configSnapshot, binding Binding, authSnapshot bindingAuthSnapshot, leaseActive bool) bool {
+	auth := authSnapshot.auths[binding.AuthID]
+	if auth == nil {
+		if leaseActive {
+			_, validURL := m.bindingURL(snapshot, binding)
+			return validURL
+		}
+		credentialUID := strings.TrimSpace(binding.CredentialUID)
+		_, linked := authSnapshot.linkedSourceUIDs[binding.AuthID][credentialUID]
+		_, validURL := m.bindingURL(snapshot, binding)
+		return credentialUID != "" && linked && validURL
+	}
+	return m.bindingValidWithLease(snapshot, binding, auth, leaseActive)
 }
 
 func (m *Manager) bindingValid(snapshot *configSnapshot, binding Binding, auth *coreauth.Auth) bool {
@@ -191,6 +244,12 @@ func (m *Manager) bindingValid(snapshot *configSnapshot, binding Binding, auth *
 func (m *Manager) bindingValidWithLease(snapshot *configSnapshot, binding Binding, auth *coreauth.Auth, leaseActive bool) bool {
 	if snapshot == nil {
 		return false
+	}
+	if auth != nil {
+		credentialUID := coreauth.ChatGPTWebCredentialUID(auth)
+		if !bindingCredentialGenerationMatches(binding.CredentialUID, credentialUID) {
+			return false
+		}
 	}
 	if leaseActive {
 		_, valid := m.bindingURL(snapshot, binding)
@@ -211,6 +270,15 @@ func (m *Manager) bindingValidWithLease(snapshot *configSnapshot, binding Bindin
 	}
 	_, valid := m.bindingURL(snapshot, binding)
 	return valid
+}
+
+func bindingCredentialGenerationMatches(bindingUID, credentialUID string) bool {
+	bindingUID = strings.TrimSpace(bindingUID)
+	credentialUID = strings.TrimSpace(credentialUID)
+	if credentialUID == "" {
+		return bindingUID == ""
+	}
+	return bindingUID == "" || bindingUID == credentialUID
 }
 
 func (m *Manager) removeBindings(candidates []bindingRemovalCandidate) error {
@@ -250,10 +318,7 @@ func (m *Manager) removeBindings(candidates []bindingRemovalCandidate) error {
 			unlocks[index]()
 		}
 	}()
-	auths := make(map[string]*coreauth.Auth, len(unique))
-	for _, candidate := range unique {
-		auths[candidate.AuthID], _ = source.GetByID(candidate.AuthID)
-	}
+	authSnapshot := buildBindingAuthSnapshot(source)
 
 	m.configMu.RLock()
 	defer m.configMu.RUnlock()
@@ -267,7 +332,7 @@ func (m *Manager) removeBindings(candidates []bindingRemovalCandidate) error {
 	for _, candidate := range unique {
 		binding, exists := m.bindings[candidate.AuthID]
 		leaseActive := m.leases[strings.TrimSpace(candidate.AuthID)] > 0
-		if !exists || binding.ID != candidate.BindingID || m.bindingValidWithLease(snapshot, binding, auths[candidate.AuthID], leaseActive) {
+		if !exists || binding.ID != candidate.BindingID || m.bindingValidInAuthSnapshot(snapshot, binding, authSnapshot, leaseActive) {
 			continue
 		}
 		removedBindingIDs = append(removedBindingIDs, binding.ID)
@@ -338,7 +403,7 @@ func (m *Manager) PoolStatuses() []PoolStatus {
 	m.mu.RUnlock()
 	for _, binding := range m.SortedBindings() {
 		status := statuses[strings.ToLower(binding.Pool)]
-		if status == nil {
+		if status == nil || !bindingMatchesCurrentAuthGeneration(source, binding) {
 			continue
 		}
 		status.BindingCount++
@@ -386,6 +451,9 @@ func (m *Manager) BindingStatuses() []BindingStatus {
 		if !valid {
 			continue
 		}
+		if !bindingMatchesCurrentAuthGeneration(source, binding) {
+			continue
+		}
 		status := m.bindingStatus(snapshot, binding, resolvedURL, source)
 		statuses = append(statuses, status)
 	}
@@ -393,15 +461,27 @@ func (m *Manager) BindingStatuses() []BindingStatus {
 	return statuses
 }
 
+func bindingMatchesCurrentAuthGeneration(source AuthSource, binding Binding) bool {
+	if source == nil {
+		return true
+	}
+	auth, exists := source.GetByID(binding.AuthID)
+	if !exists || auth == nil {
+		return true
+	}
+	return bindingCredentialGenerationMatches(binding.CredentialUID, coreauth.ChatGPTWebCredentialUID(auth))
+}
+
 func (m *Manager) bindingStatus(snapshot *configSnapshot, binding Binding, resolvedURL string, source AuthSource) BindingStatus {
 	status := BindingStatus{
-		AuthID:    binding.AuthID,
-		Pool:      binding.Pool,
-		Entry:     binding.Entry,
-		Port:      binding.Port,
-		BindingID: binding.ID,
-		ProxyURL:  proxyutil.MaskProxyURL(resolvedURL),
-		BoundAt:   binding.BoundAt,
+		CredentialUID: binding.CredentialUID,
+		AuthID:        binding.AuthID,
+		Pool:          binding.Pool,
+		Entry:         binding.Entry,
+		Port:          binding.Port,
+		BindingID:     binding.ID,
+		ProxyURL:      proxyutil.MaskProxyURL(resolvedURL),
+		BoundAt:       binding.BoundAt,
 	}
 	if source != nil {
 		if auth, ok := source.GetByID(binding.AuthID); ok && auth != nil {
@@ -439,6 +519,9 @@ func (m *Manager) CheckPool(ctx context.Context, poolName string, sample int) ([
 	if !exists {
 		return nil, errors.New("proxy pool not found")
 	}
+	m.mu.RLock()
+	source := m.auths
+	m.mu.RUnlock()
 	type checkItem struct {
 		binding Binding
 		url     string
@@ -448,6 +531,9 @@ func (m *Manager) CheckPool(ctx context.Context, poolName string, sample int) ([
 	seen := make(map[string]struct{})
 	for _, binding := range m.SortedBindings() {
 		if !strings.EqualFold(binding.Pool, pool.config.Name) {
+			continue
+		}
+		if !bindingMatchesCurrentAuthGeneration(source, binding) {
 			continue
 		}
 		resolvedURL, valid := resolveBindingURL(pool, binding)
@@ -572,7 +658,7 @@ func (m *Manager) Rebind(ctx context.Context, authIDs []string) []RebindResult {
 			results = append(results, result)
 			continue
 		}
-		resolved, errResolve := m.resolvePoolBinding(ctx, snapshot, authID, poolName, true)
+		resolved, errResolve := m.resolvePoolBinding(ctx, snapshot, authID, coreauth.ChatGPTWebCredentialUID(auth), poolName, true)
 		unlock()
 		if errResolve != nil {
 			var unavailable *UnavailableError

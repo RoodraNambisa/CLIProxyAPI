@@ -944,6 +944,10 @@ func TestChatGPTWebBrokenErrorBodyPreservesStatusAndRetryAfter(t *testing.T) {
 	if !errors.As(statusErr, &headers) || headers.Headers().Get("Retry-After") != "9" {
 		t.Fatalf("Retry-After error = %v", statusErr)
 	}
+	var requestPath interface{ ChatGPTWebRequestPath() string }
+	if !errors.As(statusErr, &requestPath) || requestPath.ChatGPTWebRequestPath() != "/backend-api/test" {
+		t.Fatalf("request path error = %v", statusErr)
+	}
 	var retrier interface{ RetryAfter() *time.Duration }
 	if !errors.As(statusErr, &retrier) || retrier.RetryAfter() == nil || *retrier.RetryAfter() != 9*time.Second {
 		t.Fatalf("retry duration = %v", statusErr)
@@ -1022,6 +1026,10 @@ func TestChatGPTWebAssetErrorsDoNotCoolCredentialOrLeakURL(t *testing.T) {
 		[]byte(`<Error><Message>failed https://storage.example/image?sig=secret</Message></Error>`), nil)
 	if strings.Contains(statusError.Error(), "sig=secret") {
 		t.Fatalf("status error leaked URL: %v", statusError)
+	}
+	var requestPath interface{ ChatGPTWebRequestPath() string }
+	if !errors.As(statusError, &requestPath) || requestPath.ChatGPTWebRequestPath() != "/image" {
+		t.Fatalf("asset request path = %#v", requestPath)
 	}
 	assertChatGPTWebAssetRetryError(t, statusError)
 }

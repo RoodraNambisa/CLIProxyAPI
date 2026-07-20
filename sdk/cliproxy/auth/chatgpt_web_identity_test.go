@@ -1073,6 +1073,46 @@ func TestApplyRefreshedOpaqueChatGPTWebCredentialPreservesRuntimeState(t *testin
 	}
 }
 
+func TestChatGPTWebCredentialRefreshIdentityAllowsOpaqueTokenRotation(t *testing.T) {
+	existing := &Auth{ID: "refresh-identity", Provider: "chatgpt-web", Metadata: map[string]any{
+		"email": "same@example.com", "access_token": "access-a", "refresh_token": "refresh-a", "id_token": "id-a",
+	}}
+	next := existing.Clone()
+	next.Metadata["access_token"] = "access-b"
+	next.Metadata["refresh_token"] = "refresh-b"
+	next.Metadata["id_token"] = "id-b"
+	if ChatGPTWebCredentialRefreshIdentityChanged(existing, next) {
+		t.Fatal("opaque token rotation was treated as an account replacement during controlled refresh")
+	}
+	if ChatGPTWebCredentialHasStrongIdentity(existing) {
+		t.Fatal("email-only credential was treated as a strong linked-source identity")
+	}
+	next.Metadata["account_id"] = "account-a"
+	if !ChatGPTWebCredentialHasStrongIdentity(next) {
+		t.Fatal("account identity was not recognized as strong")
+	}
+}
+
+func TestChatGPTWebCredentialRefreshIdentityAllowsStrongerEvidence(t *testing.T) {
+	existing := &Auth{ID: "refresh-identity", Provider: "chatgpt-web", Metadata: map[string]any{
+		"email": "same@example.com", "access_token": "opaque-access", "refresh_token": "opaque-refresh",
+	}}
+	next := existing.Clone()
+	next.Metadata["access_token"] = chatGPTWebIdentityTestJWT("account-a", "user-a", "same@example.com")
+	next.Metadata["refresh_token"] = "rotated-refresh"
+
+	if ChatGPTWebCredentialRefreshIdentityChanged(existing, next) {
+		t.Fatal("stronger same-email account evidence was treated as an account replacement")
+	}
+
+	conflicting := next.Clone()
+	conflicting.Metadata["email"] = "other@example.com"
+	conflicting.Metadata["access_token"] = chatGPTWebIdentityTestJWT("account-a", "user-a", "other@example.com")
+	if !ChatGPTWebCredentialRefreshIdentityChanged(existing, conflicting) {
+		t.Fatal("conflicting email without comparable existing strong identity was accepted")
+	}
+}
+
 func TestApplyRefreshedFallbackIdentityPreservesRuntimeStateAcrossRefreshTokenRotation(t *testing.T) {
 	manager := NewManager(nil, &RoundRobinSelector{}, nil)
 	retryAt := time.Now().Add(time.Hour).UTC()

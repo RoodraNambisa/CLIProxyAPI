@@ -24,6 +24,53 @@ import (
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 )
 
+func TestObjectTokenStoreConditionalDeleteRejectsEmptySourceHash(t *testing.T) {
+	errDelete := (&ObjectTokenStore{}).DeleteIfSourceHashMatches(t.Context(), "auth.json", "  ")
+	if outcome, explicit := cliproxyauth.DeleteOutcomeFromError(errDelete); !explicit || outcome != cliproxyauth.DeleteOutcomeRolledBack {
+		t.Fatalf("delete error = %v, outcome=%v explicit=%t", errDelete, outcome, explicit)
+	}
+}
+
+func TestObjectTokenStoreConditionalDeleteRejectsMissingRemoteGeneration(t *testing.T) {
+	var deleteCalls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.RawQuery == "location=":
+			w.Header().Set("Content-Type", "application/xml")
+			_, _ = w.Write([]byte(`<?xml version="1.0" encoding="UTF-8"?><LocationConstraint xmlns="http://s3.amazonaws.com/doc/2006-03-01/"></LocationConstraint>`))
+		case r.Method == http.MethodHead:
+			w.WriteHeader(http.StatusNotFound)
+		case r.Method == http.MethodDelete:
+			deleteCalls.Add(1)
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	defer server.Close()
+
+	store := newObjectTokenStoreForServer(t, server.URL)
+	const fileName = "missing-remote.json"
+	data := []byte(`{"type":"codex","access_token":"local"}`)
+	path := filepath.Join(store.AuthDir(), fileName)
+	if errWrite := os.WriteFile(path, data, 0o600); errWrite != nil {
+		t.Fatal(errWrite)
+	}
+	errDelete := store.DeleteIfSourceHashMatches(t.Context(), fileName, cliproxyauth.SourceHashFromBytes(data))
+	if !errors.Is(errDelete, authfileguard.ErrPersistGenerationStale) {
+		t.Fatalf("DeleteIfSourceHashMatches() error = %v, want stale generation", errDelete)
+	}
+	if outcome, explicit := cliproxyauth.DeleteOutcomeFromError(errDelete); !explicit || outcome != cliproxyauth.DeleteOutcomeRolledBack {
+		t.Fatalf("delete outcome = %v, explicit=%t", outcome, explicit)
+	}
+	if deleteCalls.Load() != 0 {
+		t.Fatalf("DELETE calls = %d, want 0", deleteCalls.Load())
+	}
+	if got, errRead := os.ReadFile(path); errRead != nil || !bytes.Equal(got, data) {
+		t.Fatalf("local auth = %s, %v; want %s", got, errRead, data)
+	}
+}
+
 func TestSanitizeObjectStoreRequestErrorRemovesPresignedURL(t *testing.T) {
 	wantErr := errors.New("transport failed")
 	errSanitized := sanitizeObjectStoreRequestError(&url.Error{
@@ -717,6 +764,57 @@ func TestObjectTokenStoreReadAuthFileRestoresChatGPTWebLifecycle(t *testing.T) {
 	}
 	if auth.StatusMessage != "passkey_required" {
 		t.Fatalf("status message = %q, want passkey_required", auth.StatusMessage)
+	}
+}
+
+func TestObjectTokenStoreSaveWithSourceHashRejectsRemoteReplacement(t *testing.T) {
+	initial := []byte(`{"type":"codex","access_token":"initial"}`)
+	replacement := []byte(`{"type":"codex","access_token":"replacement"}`)
+	var putCalls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.RawQuery == "location=":
+			w.Header().Set("Content-Type", "application/xml")
+			_, _ = w.Write([]byte(`<?xml version="1.0" encoding="UTF-8"?><LocationConstraint xmlns="http://s3.amazonaws.com/doc/2006-03-01/"></LocationConstraint>`))
+		case r.Method == http.MethodHead:
+			w.Header().Set("ETag", `"replacement"`)
+			w.Header().Set("Content-Length", strconv.Itoa(len(replacement)))
+			w.Header().Set("Last-Modified", time.Now().UTC().Format(http.TimeFormat))
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodGet:
+			w.Header().Set("ETag", `"replacement"`)
+			w.Header().Set("Content-Length", strconv.Itoa(len(replacement)))
+			w.Header().Set("Last-Modified", time.Now().UTC().Format(http.TimeFormat))
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(replacement)
+		case r.Method == http.MethodPut:
+			putCalls.Add(1)
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	defer server.Close()
+
+	store := newObjectTokenStoreForServer(t, server.URL)
+	const fileName = "conditional.json"
+	path := filepath.Join(store.AuthDir(), fileName)
+	if errWrite := os.WriteFile(path, initial, 0o600); errWrite != nil {
+		t.Fatal(errWrite)
+	}
+	auth := &cliproxyauth.Auth{
+		ID: fileName, FileName: fileName, Provider: "codex",
+		Metadata: map[string]any{"type": "codex", "access_token": "updated"},
+	}
+	ctx := cliproxyauth.WithSourceHashSavePrecondition(t.Context(), cliproxyauth.SourceHashFromBytes(initial))
+	if _, errSave := store.Save(ctx, auth); !errors.Is(errSave, authfileguard.ErrPersistGenerationStale) {
+		t.Fatalf("Save() error = %v, want stale generation", errSave)
+	}
+	if putCalls.Load() != 0 {
+		t.Fatalf("PUT calls = %d, want 0", putCalls.Load())
+	}
+	if got, errRead := os.ReadFile(path); errRead != nil || !bytes.Equal(got, initial) {
+		t.Fatalf("local auth = %s, %v; want %s", got, errRead, initial)
 	}
 }
 

@@ -165,6 +165,69 @@ func TestApplyChatGPTWebMetadataSummarySanitizesLifecycleReason(t *testing.T) {
 	}
 }
 
+func TestAuthFileRuntimeSummaryForLinkedWebUsesSourceBinding(t *testing.T) {
+	source := &coreauth.Auth{ID: "codex-source.json", Provider: "codex", Metadata: map[string]any{
+		"credential_uid": "uid-a",
+	}}
+	web := &coreauth.Auth{ID: "web.json", Provider: chatgptwebauth.Provider, Metadata: map[string]any{
+		"refresh_strategy": "codex_source", "source_auth_id": source.ID, "source_credential_uid": "uid-a",
+	}}
+	binding := &proxypool.BindingStatus{AuthID: source.ID, CredentialUID: "uid-a", Pool: "residential", BindingID: "binding-a"}
+	summaries := map[string]authFileRuntimeSummary{
+		source.ID: {proxyBinding: binding},
+		web.ID:    {proxyBinding: &proxypool.BindingStatus{AuthID: web.ID, Pool: "wrong", BindingID: "binding-web"}},
+	}
+	graph := coreauth.BuildChatGPTWebDependencyGraph([]*coreauth.Auth{source, web})
+	got := authFileRuntimeSummaryForAuth(web, graph, summaries)
+	if got.proxyBinding == nil || got.proxyBinding.BindingID != "binding-a" || got.proxyBinding.AuthID != source.ID {
+		t.Fatalf("linked runtime summary = %+v", got.proxyBinding)
+	}
+}
+
+func TestAuthFileRuntimeSummaryForLinkedWebRejectsReplacedSourceIdentity(t *testing.T) {
+	original := &coreauth.Auth{ID: "codex-source.json", Provider: "codex", Metadata: map[string]any{
+		"credential_uid": "uid-a", "account_id": "account-a",
+	}}
+	identitySource := original.Clone()
+	identitySource.Provider = chatgptwebauth.Provider
+	web := &coreauth.Auth{ID: "web.json", Provider: chatgptwebauth.Provider, Metadata: map[string]any{
+		"refresh_strategy": "codex_source", "source_auth_id": original.ID, "source_credential_uid": "uid-a",
+		"source_identity": coreauth.ChatGPTWebCredentialReferenceValue(identitySource),
+	}}
+	replacement := original.Clone()
+	replacement.Metadata = map[string]any{"credential_uid": "uid-a", "account_id": "account-b"}
+	graph := coreauth.BuildChatGPTWebDependencyGraph([]*coreauth.Auth{replacement, web})
+	got := authFileRuntimeSummaryForAuth(web, graph, map[string]authFileRuntimeSummary{
+		replacement.ID: {proxyBinding: &proxypool.BindingStatus{AuthID: replacement.ID, CredentialUID: "uid-a", BindingID: "wrong-account"}},
+	})
+	if got.proxyBinding != nil {
+		t.Fatalf("replaced source runtime summary = %+v", got.proxyBinding)
+	}
+	if !retainedSourceMissing(web, graph) {
+		t.Fatal("replaced source identity was not marked missing")
+	}
+}
+
+func TestAuthFileRuntimeSummaryForLinkedWebUsesMissingSourceBindingGeneration(t *testing.T) {
+	web := &coreauth.Auth{ID: "web.json", Provider: chatgptwebauth.Provider, Metadata: map[string]any{
+		"refresh_strategy": "codex_source", "source_auth_id": "missing-source.json", "source_credential_uid": "uid-a",
+	}}
+	matching := &proxypool.BindingStatus{AuthID: "missing-source.json", CredentialUID: "uid-a", BindingID: "binding-a"}
+	graph := coreauth.BuildChatGPTWebDependencyGraph([]*coreauth.Auth{web})
+	got := authFileRuntimeSummaryForAuth(web, graph, map[string]authFileRuntimeSummary{
+		"missing-source.json": {proxyBinding: matching},
+	})
+	if got.proxyBinding == nil || got.proxyBinding.BindingID != "binding-a" {
+		t.Fatalf("missing-source runtime summary = %+v", got.proxyBinding)
+	}
+	wrong := authFileRuntimeSummaryForAuth(web, graph, map[string]authFileRuntimeSummary{
+		"missing-source.json": {proxyBinding: &proxypool.BindingStatus{AuthID: "missing-source.json", CredentialUID: "uid-b"}},
+	})
+	if wrong.proxyBinding != nil {
+		t.Fatalf("mismatched generation runtime summary = %+v", wrong.proxyBinding)
+	}
+}
+
 func TestApplyChatGPTWebAuthFileSummarySanitizesLastError(t *testing.T) {
 	entry := gin.H{
 		"status_message": "secret-token-in-status",
