@@ -709,7 +709,7 @@ func (e *ChatGPTWebExecutor) FetchModels(ctx context.Context, auth *cliproxyauth
 	sanitizedPayload := chatGPTWebResponseLogBody(path, payload)
 	helps.AppendAPIResponseChunk(ctx, e.configSnapshot(), sanitizedPayload)
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		return nil, newChatGPTWebStatusError(response.StatusCode, path, sanitizedPayload, response.Header)
+		return nil, newChatGPTWebStatusError(response.StatusCode, path, payload, response.Header)
 	}
 	return chatgptwebauth.DecodeCatalog(payload)
 }
@@ -831,12 +831,6 @@ func (e *ChatGPTWebExecutor) chatGPTWebRequirements(ctx context.Context, client 
 			"chatgpt web requires an unsupported Arkose challenge",
 		)
 	}
-	if requiredJSONFlag(prepare, "turnstile", "required") {
-		return chatGPTWebRequirements{}, chatGPTWebLocalProtocolError(
-			http.StatusForbidden,
-			"chatgpt web requires an unsupported Turnstile challenge",
-		)
-	}
 	proofToken := ""
 	if requiredJSONFlag(prepare, "proofofwork", "required") {
 		proof, _ := prepare["proofofwork"].(map[string]any)
@@ -856,13 +850,50 @@ func (e *ChatGPTWebExecutor) chatGPTWebRequirements(ctx context.Context, client 
 			)
 		}
 	}
+	turnstileToken := ""
+	if requiredJSONFlag(prepare, "turnstile", "required") {
+		turnstile, _ := prepare["turnstile"].(map[string]any)
+		dx := chatGPTWebAnyString(turnstile["dx"])
+		if dx == "" {
+			return chatGPTWebRequirements{}, chatGPTWebTurnstileProtocolError(
+				"ChatGPT Web Turnstile challenge is missing dx",
+			)
+		}
+		turnstileToken, err = chatgptwebauth.BuildConversationTurnstileTokenWithEnvironment(
+			ctx,
+			dx,
+			pToken,
+			chatgptwebauth.ConversationTurnstileEnvironment{
+				Persona:       credential.Persona,
+				ScriptSources: sources,
+				Location:      strings.TrimRight(baseURL, "/") + "/",
+			},
+			e.runtimeRand,
+			e.now,
+		)
+		if err != nil {
+			if ctx != nil && ctx.Err() != nil {
+				return chatGPTWebRequirements{}, ctx.Err()
+			}
+			log.Warn("chatgpt web executor: Turnstile challenge solve failed")
+			return chatGPTWebRequirements{}, chatGPTWebTurnstileProtocolError(
+				"ChatGPT Web Turnstile challenge could not be solved",
+			)
+		}
+	}
 	finalizePath := "/backend-api/sentinel/chat-requirements/finalize"
 	_, finalizeData, err := e.doChatGPTWebJSON(ctx, client, credential, finalizePath, map[string]any{
 		"prepare_token":   chatGPTWebAnyString(prepare["prepare_token"]),
 		"proof_token":     proofToken,
-		"turnstile_token": "",
+		"turnstile_token": turnstileToken,
 	})
 	if err != nil {
+		if turnstileToken != "" && chatGPTWebTurnstileFinalizeRejection(err) {
+			log.WithError(err).Warn("chatgpt web executor: upstream rejected Turnstile token")
+			return chatGPTWebRequirements{}, chatGPTWebTurnstileProtocolError(
+				"ChatGPT Web rejected the generated Turnstile token",
+			)
+		}
 		return chatGPTWebRequirements{}, err
 	}
 	var finalize map[string]any
@@ -879,12 +910,34 @@ func (e *ChatGPTWebExecutor) chatGPTWebRequirements(ctx context.Context, client 
 			"chatgpt web requirements response is missing token",
 		)
 	}
+	finalizedTurnstileToken := ""
+	if value, ok := finalize["turnstile_token"].(string); ok {
+		finalizedTurnstileToken = strings.TrimSpace(value)
+	}
+	if finalizedTurnstileToken == "" {
+		finalizedTurnstileToken = turnstileToken
+	}
 	return chatGPTWebRequirements{
 		Token:          token,
 		ProofToken:     proofToken,
-		TurnstileToken: chatGPTWebAnyString(finalize["turnstile_token"]),
+		TurnstileToken: finalizedTurnstileToken,
 		SOToken:        chatGPTWebAnyString(finalize["so_token"]),
 	}, nil
+}
+
+func chatGPTWebTurnstileFinalizeRejection(err error) bool {
+	var upstreamErr chatGPTWebHTTPError
+	if errors.As(err, &upstreamErr) && upstreamErr.turnstileFinalizeRejection {
+		return true
+	}
+	var status interface{ StatusCode() int }
+	if !errors.As(err, &status) {
+		return false
+	}
+	if status.StatusCode() != http.StatusBadRequest && status.StatusCode() != http.StatusForbidden {
+		return false
+	}
+	return strings.Contains(strings.ToLower(err.Error()), "turnstile")
 }
 
 func (e *ChatGPTWebExecutor) doChatGPTWebBootstrapRequest(
@@ -967,7 +1020,7 @@ func (e *ChatGPTWebExecutor) doChatGPTWebJSONWithHeaders(ctx context.Context, cl
 	sanitizedData := chatGPTWebResponseLogBody(path, data)
 	helps.AppendAPIResponseChunk(ctx, e.configSnapshot(), sanitizedData)
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		return response, nil, newChatGPTWebStatusError(response.StatusCode, path, sanitizedData, response.Header)
+		return response, nil, newChatGPTWebStatusError(response.StatusCode, path, data, response.Header)
 	}
 	return response, data, nil
 }
@@ -998,7 +1051,7 @@ func (e *ChatGPTWebExecutor) doChatGPTWebJSONStream(ctx context.Context, client 
 		data := readAndCloseChatGPTWebErrorBody(response.Body)
 		sanitizedData := chatGPTWebResponseLogBody(path, data)
 		helps.AppendAPIResponseChunk(ctx, e.configSnapshot(), sanitizedData)
-		return nil, newChatGPTWebStatusError(response.StatusCode, path, sanitizedData, response.Header)
+		return nil, newChatGPTWebStatusError(response.StatusCode, path, data, response.Header)
 	}
 	return response, nil
 }
@@ -1316,8 +1369,9 @@ func chatGPTWebResponseLogBody(path string, body []byte) []byte {
 		return []byte("<redacted-non-json-response-body>")
 	}
 	redactGenericURL := strings.Contains(strings.ToLower(path), "/download")
-	var redact func(any)
-	redact = func(value any) {
+	redactPreparePayload := strings.Contains(strings.ToLower(path), "/chat-requirements/prepare")
+	var redact func(any, bool)
+	redact = func(value any, insideTurnstile bool) {
 		switch typed := value.(type) {
 		case map[string]any:
 			for key, item := range typed {
@@ -1329,6 +1383,10 @@ func chatGPTWebResponseLogBody(path string, body []byte) []byte {
 					typed[key] = "<redacted>"
 					continue
 				}
+				if redactPreparePayload && insideTurnstile && normalized == "dx" {
+					typed[key] = "<redacted>"
+					continue
+				}
 				if normalized == "upload_url" || normalized == "download_url" || (redactGenericURL && normalized == "url") {
 					typed[key] = "<redacted-signed-url>"
 					continue
@@ -1337,7 +1395,7 @@ func chatGPTWebResponseLogBody(path string, body []byte) []byte {
 					typed[key] = redacted
 					continue
 				}
-				redact(item)
+				redact(item, insideTurnstile || normalized == "turnstile")
 			}
 		case []any:
 			for index, item := range typed {
@@ -1345,14 +1403,14 @@ func chatGPTWebResponseLogBody(path string, body []byte) []byte {
 					typed[index] = redacted
 					continue
 				}
-				redact(item)
+				redact(item, insideTurnstile)
 			}
 		}
 	}
 	if redacted, ok := chatGPTWebRedactSignedURL(root); ok {
 		root = redacted
 	} else {
-		redact(root)
+		redact(root, false)
 	}
 	sanitized, err := json.Marshal(root)
 	if err != nil {
@@ -1393,8 +1451,9 @@ func chatGPTWebStatusErrorBody(path string, body []byte) []byte {
 
 type chatGPTWebHTTPError struct {
 	statusErr
-	headers http.Header
-	path    string
+	headers                    http.Header
+	path                       string
+	turnstileFinalizeRejection bool
 }
 
 func (e chatGPTWebHTTPError) Headers() http.Header {
@@ -1411,7 +1470,16 @@ func (e chatGPTWebHTTPError) ChatGPTWebRequestPath() string {
 
 func newChatGPTWebStatusError(code int, path string, body []byte, headers fhttp.Header) chatGPTWebHTTPError {
 	sanitizedBody := chatGPTWebStatusErrorBody(path, body)
-	err := chatGPTWebHTTPError{statusErr: statusErr{code: code, msg: strings.TrimSpace(string(sanitizedBody))}, path: path}
+	turnstileFinalizeRejection := false
+	if path == "/backend-api/sentinel/chat-requirements/finalize" &&
+		(code == http.StatusBadRequest || code == http.StatusForbidden) {
+		turnstileFinalizeRejection = bytes.Contains(bytes.ToLower(body), []byte("turnstile"))
+	}
+	err := chatGPTWebHTTPError{
+		statusErr:                  statusErr{code: code, msg: strings.TrimSpace(string(sanitizedBody))},
+		path:                       path,
+		turnstileFinalizeRejection: turnstileFinalizeRejection,
+	}
 	switch code {
 	case http.StatusBadRequest, http.StatusNotFound, http.StatusMethodNotAllowed,
 		http.StatusConflict, http.StatusRequestEntityTooLarge,
@@ -1438,6 +1506,20 @@ func chatGPTWebLocalProtocolError(code int, message string) statusErr {
 		msg:            strings.TrimSpace(message),
 		skipAuthResult: true,
 	}
+}
+
+func chatGPTWebTurnstileProtocolError(message string) statusErr {
+	payload, err := json.Marshal(map[string]any{
+		"error": map[string]any{
+			"message": strings.TrimSpace(message),
+			"type":    "upstream_protocol_error",
+			"code":    "turnstile_required",
+		},
+	})
+	if err != nil {
+		return chatGPTWebLocalProtocolError(http.StatusBadGateway, message)
+	}
+	return chatGPTWebLocalProtocolError(http.StatusBadGateway, string(payload))
 }
 
 func cloneChatGPTWebHeaders(headers fhttp.Header) http.Header {

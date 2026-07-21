@@ -121,10 +121,14 @@ func (service *Service) Login(ctx context.Context, input LoginInput) (*Credentia
 	if authError := classifyHTTPResponse("authorize", response.StatusCode, payload, pendingState); authError != nil {
 		return service.loginFailure(credential, input.Relogin, authError)
 	}
-	if authError := classifyPagePayload(payload); authError != nil {
+	authorizeEnvelope := parseAuthorizationEnvelope(response, payload)
+	authorizeRequestURL := responseRequestURL(response)
+	if authError := classifyPermanentAccountPayload(payload); authError != nil {
 		return service.loginFailure(credential, input.Relogin, authError)
 	}
-	authorizeRequestURL := responseRequestURL(response)
+	if authError := classifyPageType(authorizeEnvelope.PageType); authError != nil && !isMFAChallenge(authorizeEnvelope.PageType, authorizeEnvelope.ContinueURL) {
+		return service.loginFailure(credential, input.Relogin, authError)
+	}
 	if authorizeRequestURL != "" {
 		if code, matched, callbackError := parseOAuthCallback(authorizeRequestURL, service.options.RedirectURL, state); matched {
 			if callbackError != nil {
@@ -134,6 +138,9 @@ func (service *Service) Login(ctx context.Context, input LoginInput) (*Credentia
 		}
 	}
 	continueAuthorization, navigationError := classifyAuthorizeNavigation(authorizeRequestURL)
+	if navigationError != nil && (isPasswordChallenge(authorizeEnvelope.PageType, authorizeEnvelope.ContinueURL) || isMFAChallenge(authorizeEnvelope.PageType, authorizeEnvelope.ContinueURL)) {
+		navigationError = nil
+	}
 	if navigationError != nil {
 		return service.loginFailure(credential, input.Relogin, navigationError)
 	}
@@ -142,7 +149,7 @@ func (service *Service) Login(ctx context.Context, input LoginInput) (*Credentia
 		if err != nil {
 			return service.loginFailure(credential, input.Relogin, ensureAuthError(err, pendingState))
 		}
-		response, payload, err = client.DoJSON(acquisitionContext, true, http.MethodPost,
+		response, payload, err = client.DoJSON(acquisitionContext, false, http.MethodPost,
 			service.options.AuthBaseURL+"/api/accounts/authorize/continue",
 			service.apiHeaders(deviceID, service.options.AuthBaseURL+"/sign-in", authorizeSentinel),
 			map[string]any{
@@ -151,6 +158,15 @@ func (service *Service) Login(ctx context.Context, input LoginInput) (*Credentia
 			})
 		if err != nil {
 			return service.loginFailure(credential, input.Relogin, networkAuthError("authorize_continue_network_error", pendingState, err))
+		}
+		response, payload, authorizationCode, redirectError := service.followAuthorizationRedirects(
+			acquisitionContext, client, response, payload, state, pendingState,
+		)
+		if redirectError != nil {
+			return service.loginFailure(credential, input.Relogin, ensureAuthError(redirectError, pendingState))
+		}
+		if authorizationCode != "" {
+			return service.finishLogin(acquisitionContext, client, credential, input.Relogin, authorizationCode, pkce.CodeVerifier)
 		}
 		if authError := classifyHTTPResponse("authorize_continue", response.StatusCode, payload, pendingState); authError != nil {
 			return service.loginFailure(credential, input.Relogin, authError)
@@ -164,44 +180,54 @@ func (service *Service) Login(ctx context.Context, input LoginInput) (*Credentia
 			}
 			return service.finishLogin(acquisitionContext, client, credential, input.Relogin, code, pkce.CodeVerifier)
 		}
-		authorizeEnvelope := parseAPIEnvelope(payload)
-		if isMFAChallenge(authorizeEnvelope.PageType, authorizeEnvelope.ContinueURL) {
-			authorizeEnvelope, err = service.verifyTOTPChallenge(acquisitionContext, client, credential, deviceID, authorizeEnvelope)
-			if err != nil {
-				return service.loginFailure(credential, input.Relogin, ensureAuthError(err, pendingState))
-			}
-			if authorizeEnvelope.ContinueURL == "" {
-				authError := newAuthError("authorization_completion_required", LifecycleInteractionRequired, response.StatusCode, false, true, "MFA verification did not return an OAuth continuation", nil)
+		authorizeEnvelope = parseAuthorizationEnvelope(response, payload)
+		if !isMFAChallenge(authorizeEnvelope.PageType, authorizeEnvelope.ContinueURL) {
+			if authError := classifyPageType(authorizeEnvelope.PageType); authError != nil {
 				return service.loginFailure(credential, input.Relogin, authError)
 			}
-			code, followError := service.followOAuthCode(acquisitionContext, client, authorizeEnvelope.ContinueURL, state, pendingState)
-			if followError != nil {
-				return service.loginFailure(credential, input.Relogin, ensureAuthError(followError, pendingState))
+			if authorizeEnvelope.ContinueURL != "" {
+				response, followPayload, authorizationCode, followError := service.openAuthorizationPage(
+					acquisitionContext, client, authorizeEnvelope.ContinueURL, state, pendingState,
+				)
+				if followError != nil {
+					return service.loginFailure(credential, input.Relogin, ensureAuthError(followError, pendingState))
+				}
+				if authorizationCode != "" {
+					return service.finishLogin(acquisitionContext, client, credential, input.Relogin, authorizationCode, pkce.CodeVerifier)
+				}
+				if authError := classifyHTTPResponse("authorize_redirect", response.StatusCode, followPayload, pendingState); authError != nil {
+					return service.loginFailure(credential, input.Relogin, authError)
+				}
+				if authError := classifyPermanentAccountPayload(followPayload); authError != nil {
+					return service.loginFailure(credential, input.Relogin, authError)
+				}
+				authorizeEnvelope = parseAuthorizationEnvelope(response, followPayload)
+				if authError := classifyPageType(authorizeEnvelope.PageType); authError != nil && !isMFAChallenge(authorizeEnvelope.PageType, authorizeEnvelope.ContinueURL) {
+					return service.loginFailure(credential, input.Relogin, authError)
+				}
+				if code, matched, callbackError := parseOAuthCallback(responseRequestURL(response), service.options.RedirectURL, state); matched {
+					if callbackError != nil {
+						return service.loginFailure(credential, input.Relogin, callbackError)
+					}
+					return service.finishLogin(acquisitionContext, client, credential, input.Relogin, code, pkce.CodeVerifier)
+				}
 			}
-			return service.finishLogin(acquisitionContext, client, credential, input.Relogin, code, pkce.CodeVerifier)
-		} else if authError := classifyPageType(authorizeEnvelope.PageType); authError != nil {
+		}
+	}
+	if isMFAChallenge(authorizeEnvelope.PageType, authorizeEnvelope.ContinueURL) {
+		authorizeEnvelope, err = service.verifyTOTPChallenge(acquisitionContext, client, credential, deviceID, authorizeEnvelope)
+		if err != nil {
+			return service.loginFailure(credential, input.Relogin, ensureAuthError(err, pendingState))
+		}
+		if authorizeEnvelope.ContinueURL == "" {
+			authError := newAuthError("authorization_completion_required", LifecycleInteractionRequired, response.StatusCode, false, true, "MFA verification did not return an OAuth continuation", nil)
 			return service.loginFailure(credential, input.Relogin, authError)
 		}
-		if authorizeEnvelope.ContinueURL != "" {
-			response, followPayload, followError := client.DoFollow(acquisitionContext, http.MethodGet,
-				resolveURL(service.options.AuthBaseURL, authorizeEnvelope.ContinueURL),
-				map[string]string{"referer": service.options.AuthBaseURL + "/sign-in"}, nil)
-			if followError != nil {
-				return service.loginFailure(credential, input.Relogin, networkAuthError("authorize_redirect_network_error", pendingState, followError))
-			}
-			if authError := classifyHTTPResponse("authorize_redirect", response.StatusCode, followPayload, pendingState); authError != nil {
-				return service.loginFailure(credential, input.Relogin, authError)
-			}
-			if authError := classifyPagePayload(followPayload); authError != nil {
-				return service.loginFailure(credential, input.Relogin, authError)
-			}
-			if code, matched, callbackError := parseOAuthCallback(responseRequestURL(response), service.options.RedirectURL, state); matched {
-				if callbackError != nil {
-					return service.loginFailure(credential, input.Relogin, callbackError)
-				}
-				return service.finishLogin(acquisitionContext, client, credential, input.Relogin, code, pkce.CodeVerifier)
-			}
+		code, followError := service.followOAuthCode(acquisitionContext, client, authorizeEnvelope.ContinueURL, state, pendingState)
+		if followError != nil {
+			return service.loginFailure(credential, input.Relogin, ensureAuthError(followError, pendingState))
 		}
+		return service.finishLogin(acquisitionContext, client, credential, input.Relogin, code, pkce.CodeVerifier)
 	}
 
 	passwordSentinel, err := sentinel.Token(acquisitionContext, "password_verify")
@@ -239,7 +265,7 @@ func (service *Service) Login(ctx context.Context, input LoginInput) (*Credentia
 	if authError := classifyPermanentAccountPayload(payload); authError != nil {
 		return service.loginFailure(credential, input.Relogin, authError)
 	}
-	passwordEnvelope := parseAPIEnvelope(payload)
+	passwordEnvelope := parseAuthorizationEnvelope(response, payload)
 	if isMFAChallenge(passwordEnvelope.PageType, passwordEnvelope.ContinueURL) {
 		passwordEnvelope, err = service.verifyTOTPChallenge(acquisitionContext, client, credential, deviceID, passwordEnvelope)
 		if err != nil {
@@ -697,6 +723,105 @@ func (service *Service) followOAuthCode(ctx context.Context, client *Client, sta
 	return "", newAuthError("oauth_redirect_limit", transientState, 0, true, false, "OAuth redirect limit exceeded", nil)
 }
 
+func (service *Service) openAuthorizationPage(ctx context.Context, client *Client, startURL, expectedState string, transientState LifecycleState) (*fhttp.Response, []byte, string, error) {
+	targetURL := resolveURL(service.options.AuthBaseURL, startURL)
+	if code, matched, authError := parseOAuthCallback(targetURL, service.options.RedirectURL, expectedState); matched {
+		if authError != nil {
+			return nil, nil, "", authError
+		}
+		return nil, nil, code, nil
+	}
+	if authError := validateOAuthContinuationOrigin(targetURL, service.options.AuthBaseURL); authError != nil {
+		return nil, nil, "", authError
+	}
+	response, payload, err := client.DoNoRedirect(ctx, http.MethodGet, targetURL, map[string]string{
+		"referer": service.options.AuthBaseURL + "/sign-in",
+	}, nil)
+	if err != nil {
+		return nil, nil, "", networkAuthError("authorize_redirect_network_error", transientState, err)
+	}
+	return service.followAuthorizationRedirects(ctx, client, response, payload, expectedState, transientState)
+}
+
+func (service *Service) followAuthorizationRedirects(ctx context.Context, client *Client, response *fhttp.Response, payload []byte, expectedState string, transientState LifecycleState) (*fhttp.Response, []byte, string, error) {
+	var replayBody []byte
+	hasReplayBody := false
+	for redirects := 0; response != nil && isChatGPTWebRedirectStatus(response.StatusCode); redirects++ {
+		if redirects >= 10 {
+			return response, payload, "", newAuthError("oauth_redirect_limit", transientState, response.StatusCode, true, false, "OAuth redirect limit exceeded", nil)
+		}
+		currentURL := responseRequestURL(response)
+		location := strings.TrimSpace(response.Header.Get("Location"))
+		if location == "" {
+			return response, payload, "", newAuthError("authorization_completion_required", LifecycleInteractionRequired, response.StatusCode, false, true, "authorization redirect did not provide a destination", nil)
+		}
+		nextURL := resolveURL(currentURL, location)
+		if code, matched, authError := parseOAuthCallback(nextURL, service.options.RedirectURL, expectedState); matched {
+			if authError != nil {
+				return response, payload, "", authError
+			}
+			return response, payload, code, nil
+		}
+		if authError := validateOAuthContinuationOrigin(nextURL, service.options.AuthBaseURL); authError != nil {
+			return response, payload, "", authError
+		}
+		method := http.MethodGet
+		headers := map[string]string{"referer": currentURL}
+		var body io.Reader
+		if response.StatusCode == http.StatusTemporaryRedirect || response.StatusCode == http.StatusPermanentRedirect {
+			request := response.Request
+			if request != nil && request.Method != "" {
+				method = request.Method
+			}
+			if method != http.MethodGet && method != http.MethodHead {
+				if request != nil && request.GetBody != nil {
+					replayReader, errBody := request.GetBody()
+					if errBody != nil {
+						return response, payload, "", newAuthError("oauth_redirect_body_unavailable", transientState, response.StatusCode, false, true, "authorization redirect could not safely replay its request body", errBody)
+					}
+					replayBody, errBody = io.ReadAll(replayReader)
+					if errClose := replayReader.Close(); errBody == nil {
+						errBody = errClose
+					}
+					if errBody != nil {
+						return response, payload, "", newAuthError("oauth_redirect_body_unavailable", transientState, response.StatusCode, false, true, "authorization redirect could not safely replay its request body", errBody)
+					}
+					hasReplayBody = true
+				} else if !hasReplayBody {
+					return response, payload, "", newAuthError("oauth_redirect_body_unavailable", transientState, response.StatusCode, false, true, "authorization redirect could not safely replay its request body", nil)
+				}
+				body = bytes.NewReader(replayBody)
+				headers = authorizationReplayHeaders(request.Header, currentURL)
+			}
+		}
+		var err error
+		response, payload, err = client.DoNoRedirect(ctx, method, nextURL, headers, body)
+		if err != nil {
+			return response, payload, "", networkAuthError("authorize_redirect_network_error", transientState, err)
+		}
+	}
+	return response, payload, "", nil
+}
+
+func authorizationReplayHeaders(source fhttp.Header, referer string) map[string]string {
+	headers := make(map[string]string, len(source)+1)
+	for key, values := range source {
+		normalized := strings.ToLower(strings.TrimSpace(key))
+		if key == fhttp.HeaderOrderKey {
+			continue
+		}
+		switch normalized {
+		case "", "host", "cookie", "content-length", "transfer-encoding":
+			continue
+		}
+		if len(values) > 0 {
+			headers[key] = values[0]
+		}
+	}
+	headers["referer"] = referer
+	return headers
+}
+
 func (service *Service) followPasswordRedirects(
 	ctx context.Context,
 	client *Client,
@@ -722,7 +847,7 @@ func (service *Service) followPasswordRedirects(
 			}
 			return response, payload, code, nil
 		}
-		if authError := classifyOAuthContinuationURL(nextURL, service.options.AuthBaseURL); authError != nil {
+		if authError := validateOAuthContinuationOrigin(nextURL, service.options.AuthBaseURL); authError != nil {
 			return response, payload, "", authError
 		}
 
@@ -907,17 +1032,93 @@ func parseAPIEnvelope(payload []byte) apiEnvelope {
 	}
 	if envelope.Payload == nil {
 		envelope.Payload = decoded
+	} else {
+		mergeMFAHints(envelope.Payload, decoded)
 	}
 	return envelope
 }
 
-func (service *Service) verifyTOTPChallenge(ctx context.Context, client *Client, credential *Credential, deviceID string, challenge apiEnvelope) (apiEnvelope, error) {
-	if strings.TrimSpace(credential.TOTPSecret) == "" {
-		return apiEnvelope{}, newAuthError("totp_required", LifecycleInteractionRequired, 0, false, true, "authentication requires a TOTP secret", nil)
+func parseAuthorizationEnvelope(response *fhttp.Response, payload []byte) apiEnvelope {
+	envelope := parseAPIEnvelope(payload)
+	if challenge, ok := mfaChallengeFromURL(envelope.ContinueURL); ok {
+		if envelope.Payload == nil {
+			envelope.Payload = make(map[string]any)
+		}
+		mergeMFAHints(envelope.Payload, challenge.Payload)
+		if strings.TrimSpace(envelope.PageType) == "" {
+			envelope.PageType = challenge.PageType
+		}
 	}
+	requestURL := responseRequestURL(response)
+	if challenge, ok := mfaChallengeFromURL(requestURL); ok {
+		if envelope.Payload == nil {
+			envelope.Payload = challenge.Payload
+		} else {
+			mergeMFAHints(envelope.Payload, challenge.Payload)
+		}
+		if strings.TrimSpace(envelope.ContinueURL) == "" {
+			if strings.TrimSpace(envelope.PageType) == "" {
+				envelope.ContinueURL = challenge.ContinueURL
+				envelope.PageType = challenge.PageType
+			} else if isMFAChallenge(envelope.PageType, "") {
+				envelope.ContinueURL = challenge.ContinueURL
+			}
+		}
+		return envelope
+	}
+	if strings.TrimSpace(envelope.PageType) == "" && strings.TrimSpace(envelope.ContinueURL) == "" {
+		parsedURL, err := url.Parse(requestURL)
+		if err != nil {
+			return envelope
+		}
+		if authError := classifyPageType(parsedURL.Path); authError != nil {
+			envelope.PageType = parsedURL.Path
+			envelope.ContinueURL = requestURL
+		}
+	}
+	return envelope
+}
+
+func mergeMFAHints(target, source map[string]any) {
+	if target == nil || source == nil {
+		return
+	}
+	for _, key := range []string{
+		"mfa_request_id", "mfaRequestId", "factor_id", "factorId", "factor_type", "factorType",
+		"factors", "mfa_factors", "mfa_challenge_factors",
+		"oai-client-auth-session", "client_auth_session", "auth_session",
+	} {
+		if _, exists := target[key]; exists {
+			continue
+		}
+		if value, found := source[key]; found {
+			target[key] = value
+		}
+	}
+	factorType := firstNonEmptyString(stringValue(source["factor_type"]), stringValue(source["factorType"]), stringValue(source["type"]))
+	if isMFAFactorType(factorType) {
+		for _, key := range []string{"id", "type"} {
+			if _, exists := target[key]; exists {
+				continue
+			}
+			if value, found := source[key]; found {
+				target[key] = value
+			}
+		}
+	}
+}
+
+func isMFAFactorType(value string) bool {
+	return normalizeMFAFactorType(value) != ""
+}
+
+func (service *Service) verifyTOTPChallenge(ctx context.Context, client *Client, credential *Credential, deviceID string, challenge apiEnvelope) (apiEnvelope, error) {
 	factorID, requestID := selectMFAFactor(challenge.Payload, "totp")
 	if factorID == "" {
 		return apiEnvelope{}, unsupportedMFAError(challenge.Payload)
+	}
+	if strings.TrimSpace(credential.TOTPSecret) == "" {
+		return apiEnvelope{}, newAuthError("totp_required", LifecycleInteractionRequired, 0, false, true, "authentication requires a TOTP secret", nil)
 	}
 	code, err := GenerateTOTP(credential.TOTPSecret, service.options.Now())
 	if err != nil {
@@ -935,21 +1136,42 @@ func (service *Service) verifyTOTPChallenge(ctx context.Context, client *Client,
 	if strings.TrimSpace(challenge.ContinueURL) == "" {
 		referer = service.options.AuthBaseURL + "/mfa-challenge/" + url.PathEscape(factorID)
 	}
-	response, payload, err := client.DoJSON(ctx, false, http.MethodPost,
-		service.options.AuthBaseURL+"/api/accounts/mfa/verify",
-		service.mfaHeaders(deviceID, referer), body)
-	if err != nil {
-		return apiEnvelope{}, networkAuthError("mfa_verify_network_error", LifecycleLoginPending, err)
-	}
-	if response.StatusCode >= http.StatusMultipleChoices && response.StatusCode < http.StatusBadRequest {
-		if location := strings.TrimSpace(response.Header.Get("Location")); location != "" {
-			return apiEnvelope{ContinueURL: resolveURL(service.options.AuthBaseURL, location)}, nil
+	targetURL := service.options.AuthBaseURL + "/api/accounts/mfa/verify"
+	var response *fhttp.Response
+	var payload []byte
+	for redirects := 0; ; redirects++ {
+		response, payload, err = client.DoJSON(ctx, false, http.MethodPost,
+			targetURL, service.mfaHeaders(deviceID, referer), body)
+		if err != nil {
+			return apiEnvelope{}, networkAuthError("mfa_verify_network_error", LifecycleLoginPending, err)
 		}
+		if response.StatusCode < http.StatusMultipleChoices || response.StatusCode >= http.StatusBadRequest {
+			break
+		}
+		location := strings.TrimSpace(response.Header.Get("Location"))
+		if location == "" {
+			break
+		}
+		nextURL := resolveURL(targetURL, location)
+		if response.StatusCode != http.StatusTemporaryRedirect && response.StatusCode != http.StatusPermanentRedirect {
+			return apiEnvelope{ContinueURL: nextURL}, nil
+		}
+		if authError := validateOAuthContinuationOrigin(nextURL, service.options.AuthBaseURL); authError != nil {
+			return apiEnvelope{ContinueURL: nextURL}, nil
+		}
+		if redirects >= 9 {
+			return apiEnvelope{}, newAuthError("oauth_redirect_limit", LifecycleLoginPending, response.StatusCode, true, false, "MFA redirect limit exceeded", nil)
+		}
+		referer = targetURL
+		targetURL = nextURL
 	}
 	if authError := classifyHTTPResponse("mfa_verify", response.StatusCode, payload, LifecycleLoginPending); authError != nil {
 		return apiEnvelope{}, authError
 	}
-	verified := parseAPIEnvelope(payload)
+	if authError := classifyPermanentAccountPayload(payload); authError != nil {
+		return apiEnvelope{}, authError
+	}
+	verified := parseAuthorizationEnvelope(response, payload)
 	if isMFAChallenge(verified.PageType, verified.ContinueURL) {
 		return apiEnvelope{}, newAuthError("invalid_totp", LifecycleReauthRequired, response.StatusCode, false, true, "TOTP was rejected", nil)
 	}
@@ -978,36 +1200,140 @@ func isMFAChallenge(pageType, continueURL string) bool {
 	return normalizedPage == "mfa_challenge" || strings.Contains(normalizedPage, "totp") || strings.Contains(normalizedURL, "/mfa")
 }
 
+func mfaChallengeFromURL(rawURL string) (apiEnvelope, bool) {
+	parsedURL, err := url.Parse(strings.TrimSpace(rawURL))
+	if err != nil {
+		return apiEnvelope{}, false
+	}
+	path := strings.Trim(parsedURL.EscapedPath(), "/")
+	parts := strings.Split(path, "/")
+	if len(parts) != 2 || !strings.EqualFold(parts[0], "mfa-challenge") {
+		return apiEnvelope{}, false
+	}
+	factorID, err := url.PathUnescape(parts[1])
+	if err != nil || strings.TrimSpace(factorID) == "" {
+		return apiEnvelope{}, false
+	}
+	query := parsedURL.Query()
+	factorType := firstNonEmptyString(query.Get("factor_type"), query.Get("factorType"), query.Get("type"))
+	factorType = normalizeMFAFactorType(factorType)
+	if factorType == "" {
+		factorType = mfaFactorTypeFromID(factorID)
+	}
+	payload := map[string]any{
+		"factor_id":   factorID,
+		"factor_type": factorType,
+	}
+	if requestID := strings.TrimSpace(query.Get("mfa_request_id")); requestID != "" {
+		payload["mfa_request_id"] = requestID
+	}
+	return apiEnvelope{
+		ContinueURL: rawURL,
+		PageType:    "mfa_challenge",
+		Payload:     payload,
+	}, true
+}
+
+func mfaFactorTypeFromID(factorID string) string {
+	return normalizeMFAFactorType(factorID)
+}
+
+func normalizeMFAFactorType(value string) string {
+	normalized := normalizeCode(value)
+	switch {
+	case normalized == "email":
+		return "email"
+	case normalized == "email_otp" || strings.HasPrefix(normalized, "email_otp_"):
+		return "email"
+	case normalized == "sms":
+		return "sms"
+	case normalized == "sms_otp" || strings.HasPrefix(normalized, "sms_otp_"):
+		return "sms"
+	case normalized == "phone":
+		return "phone"
+	case normalized == "phone_otp" || strings.HasPrefix(normalized, "phone_otp_"):
+		return "phone"
+	case normalized == "passkey" || strings.HasPrefix(normalized, "passkey_"):
+		return "passkey"
+	case normalized == "webauthn" || strings.HasPrefix(normalized, "webauthn_"):
+		return "webauthn"
+	case normalized == "totp" || strings.HasPrefix(normalized, "totp_") ||
+		normalized == "authenticator" || strings.HasPrefix(normalized, "authenticator_"):
+		return "totp"
+	default:
+		return ""
+	}
+}
+
+func isPasswordChallenge(pageType, continueURL string) bool {
+	normalizedPage := normalizeCode(pageType)
+	normalizedURL := strings.ToLower(strings.TrimSpace(continueURL))
+	return normalizedPage == "login_password" || strings.Contains(normalizedURL, "/log-in/password")
+}
+
 func selectMFAFactor(payload map[string]any, factorType string) (string, string) {
-	wanted := strings.ToLower(strings.TrimSpace(factorType))
+	wanted := normalizeMFAFactorType(factorType)
 	if payload == nil || wanted == "" {
 		return "", ""
 	}
-	requestID := stringValue(payload["mfa_request_id"])
-	topType := strings.ToLower(strings.TrimSpace(stringValue(payload["factor_type"])))
-	factorID := ""
-	if topType == wanted {
-		factorID = firstNonEmptyString(stringValue(payload["factor_id"]), stringValue(payload["id"]))
-	}
-	if factors, ok := payload["factors"].([]any); ok {
-		for _, item := range factors {
-			factor, okFactor := item.(map[string]any)
-			if !okFactor || !strings.EqualFold(strings.TrimSpace(stringValue(factor["factor_type"])), wanted) {
-				continue
-			}
-			factorID = firstNonEmptyString(stringValue(factor["id"]), stringValue(factor["factor_id"]), factorID)
-			if metadata, okMetadata := factor["metadata"].(map[string]any); okMetadata {
-				requestID = firstNonEmptyString(stringValue(metadata["mfa_request_id"]), stringValue(factor["mfa_request_id"]), requestID)
-			} else {
-				requestID = firstNonEmptyString(stringValue(factor["mfa_request_id"]), requestID)
-			}
-			break
+	candidates := []map[string]any{payload}
+	for _, key := range []string{"oai-client-auth-session", "client_auth_session", "auth_session"} {
+		if session, ok := payload[key].(map[string]any); ok {
+			candidates = append(candidates, session)
 		}
 	}
-	if factorID == "" && (topType == wanted || wanted == "totp" && topType == "") {
-		factorID = firstNonEmptyString(stringValue(payload["factor_id"]), stringValue(payload["id"]))
+	fallbackFactorID := ""
+	fallbackRequestID := ""
+	for _, candidate := range candidates {
+		candidateRequestID := firstNonEmptyString(stringValue(candidate["mfa_request_id"]), stringValue(candidate["mfaRequestId"]))
+		for _, factorListKey := range []string{"factors", "mfa_factors", "mfa_challenge_factors"} {
+			factors, ok := candidate[factorListKey].([]any)
+			if !ok {
+				continue
+			}
+			for _, item := range factors {
+				factor, okFactor := item.(map[string]any)
+				if !okFactor {
+					continue
+				}
+				actualType := normalizeMFAFactorType(firstNonEmptyString(stringValue(factor["factor_type"]), stringValue(factor["type"])))
+				if actualType != wanted {
+					continue
+				}
+				factorID := firstNonEmptyString(stringValue(factor["id"]), stringValue(factor["factor_id"]), stringValue(factor["factorId"]))
+				if factorID == "" {
+					continue
+				}
+				requestID := ""
+				if metadata, okMetadata := factor["metadata"].(map[string]any); okMetadata {
+					requestID = firstNonEmptyString(stringValue(metadata["mfa_request_id"]), stringValue(metadata["mfaRequestId"]), stringValue(factor["mfa_request_id"]), stringValue(factor["mfaRequestId"]), candidateRequestID)
+				} else {
+					requestID = firstNonEmptyString(stringValue(factor["mfa_request_id"]), stringValue(factor["mfaRequestId"]), candidateRequestID)
+				}
+				if requestID != "" {
+					return strings.TrimSpace(factorID), strings.TrimSpace(requestID)
+				}
+				if fallbackFactorID == "" {
+					fallbackFactorID = factorID
+					fallbackRequestID = requestID
+				}
+			}
+		}
+		topType := normalizeMFAFactorType(firstNonEmptyString(stringValue(candidate["factor_type"]), stringValue(candidate["factorType"]), stringValue(candidate["type"])))
+		if topType == wanted {
+			factorID := firstNonEmptyString(stringValue(candidate["factor_id"]), stringValue(candidate["factorId"]), stringValue(candidate["id"]))
+			if factorID != "" {
+				if candidateRequestID != "" {
+					return strings.TrimSpace(factorID), strings.TrimSpace(candidateRequestID)
+				}
+				if fallbackFactorID == "" {
+					fallbackFactorID = factorID
+					fallbackRequestID = candidateRequestID
+				}
+			}
+		}
 	}
-	return strings.TrimSpace(factorID), strings.TrimSpace(requestID)
+	return strings.TrimSpace(fallbackFactorID), strings.TrimSpace(fallbackRequestID)
 }
 
 func unsupportedMFAError(payload map[string]any) *AuthError {
@@ -1042,12 +1368,81 @@ func classifyPagePayload(payload []byte) *AuthError {
 }
 
 func classifyPermanentAccountPayload(payload []byte) *AuthError {
-	text := strings.ToLower(string(payload))
-	if strings.Contains(text, "account_deactivated") || strings.Contains(text, "deleted or deactivated") || strings.Contains(text, "account deactivated") {
+	var decoded map[string]any
+	if err := json.Unmarshal(payload, &decoded); err != nil {
+		return nil
+	}
+	code, message := responseError(payload)
+	_, hasStructuredError := decoded["error"]
+	if code != "" || hasStructuredError {
+		if authError := classifyPermanentAccountFields(code, message); authError != nil {
+			return authError
+		}
+	}
+	page, _ := decoded["page"].(map[string]any)
+	pageType := stringValue(page["type"])
+	if authError := classifyPageType(pageType); authError != nil && authError.State == LifecycleDead {
+		return authError
+	}
+	pagePayload, _ := page["payload"].(map[string]any)
+	pageCode := firstNonEmptyString(stringValue(pagePayload["code"]), stringValue(pagePayload["error"]), stringValue(pagePayload["type"]))
+	pageMessage := stringValue(pagePayload["message"])
+	if nestedError, ok := pagePayload["error"].(map[string]any); ok {
+		pageCode = firstNonEmptyString(stringValue(nestedError["code"]), stringValue(nestedError["type"]), pageCode)
+		pageMessage = firstNonEmptyString(stringValue(nestedError["message"]), pageMessage)
+	}
+	if errorList, ok := pagePayload["errors"].([]any); ok {
+		for _, item := range errorList {
+			switch typed := item.(type) {
+			case map[string]any:
+				code := firstNonEmptyString(stringValue(typed["code"]), stringValue(typed["type"]), stringValue(typed["error"]))
+				message := firstNonEmptyString(stringValue(typed["message"]), stringValue(typed["detail"]))
+				if authError := classifyPermanentAccountFields(code, message); authError != nil {
+					return authError
+				}
+			case string:
+				if authError := classifyPermanentAccountFields("", typed); authError != nil {
+					return authError
+				}
+			}
+		}
+	}
+	if authError := classifyPermanentAccountCode(pageCode, 0); authError != nil {
+		return authError
+	}
+	if !strings.Contains(normalizeCode(pageType), "error") {
+		return nil
+	}
+	return classifyPermanentAccountFields(pageCode, pageMessage)
+}
+
+func classifyPermanentAccountFields(code, message string) *AuthError {
+	normalizedCode := normalizeCode(code)
+	if authError := classifyPermanentAccountCode(normalizedCode, 0); authError != nil {
+		return authError
+	}
+	message = strings.ToLower(strings.TrimSpace(message))
+	normalizedMessage := normalizeCode(message)
+	if normalizedMessage == "account_deactivated" ||
+		strings.Contains(message, "deleted or deactivated") || strings.Contains(message, "account deactivated") ||
+		strings.Contains(message, "account has been deactivated") || strings.Contains(message, "account was deactivated") {
 		return newAuthError("account_deactivated", LifecycleDead, 0, false, true, "account is deactivated", nil)
 	}
-	if strings.Contains(text, "account_deleted") || strings.Contains(text, "account has been deleted") || strings.Contains(text, "account because it has been deleted") {
+	if normalizedMessage == "account_deleted" ||
+		strings.Contains(message, "account has been deleted") || strings.Contains(message, "account was deleted") ||
+		strings.Contains(message, "account because it has been deleted") {
 		return newAuthError("account_deleted", LifecycleDead, 0, false, true, "account is deleted", nil)
+	}
+	return nil
+}
+
+func classifyPermanentAccountCode(code string, status int) *AuthError {
+	normalized := normalizeCode(code)
+	if strings.Contains(normalized, "account_deleted") || normalized == "deleted" {
+		return newAuthError("account_deleted", LifecycleDead, status, false, true, "account is deleted", nil)
+	}
+	if strings.Contains(normalized, "account_deactivated") || normalized == "deactivated" {
+		return newAuthError("account_deactivated", LifecycleDead, status, false, true, "account is deactivated", nil)
 	}
 	return nil
 }
@@ -1088,19 +1483,32 @@ func classifyHTTPResponse(stage string, status int, payload []byte, defaultState
 	if status >= 200 && status < 300 {
 		return nil
 	}
+	if authError := classifyPermanentAccountPayload(payload); authError != nil {
+		authError.Status = status
+		authError.StatusCode = status
+		return authError
+	}
 	code, message := responseError(payload)
 	normalized := normalizeCode(code)
+	if authError := classifyPermanentAccountCode(normalized, status); authError != nil {
+		return authError
+	}
+	if normalized == "" && strings.TrimSpace(message) == "" {
+		if authError := classifyPermanentAccountFields(string(payload), string(payload)); authError != nil {
+			authError.Status = status
+			authError.StatusCode = status
+			return authError
+		}
+	}
 	messageLower := strings.ToLower(message)
 	responseTextLower := strings.ToLower(string(payload))
 	if normalized == "" {
 		normalized = normalizeCode(stage + "_failed")
 	}
-	if normalized == "account_deactivated" || strings.Contains(normalized, "account_deactivated") ||
-		strings.Contains(messageLower, "deactivated") || strings.Contains(responseTextLower, "deleted or deactivated") || strings.Contains(responseTextLower, "account deactivated") {
+	if strings.Contains(messageLower, "deactivated") || strings.Contains(responseTextLower, "deleted or deactivated") || strings.Contains(responseTextLower, "account deactivated") {
 		return newAuthError("account_deactivated", LifecycleDead, status, false, true, "account is deactivated", nil)
 	}
-	if normalized == "account_deleted" || strings.Contains(normalized, "account_deleted") ||
-		strings.Contains(messageLower, "account has been deleted") || strings.Contains(responseTextLower, "account because it has been deleted") {
+	if strings.Contains(messageLower, "account has been deleted") || strings.Contains(responseTextLower, "account because it has been deleted") {
 		return newAuthError("account_deleted", LifecycleDead, status, false, true, "account is deleted", nil)
 	}
 	if status == http.StatusTooManyRequests || status >= http.StatusInternalServerError {
@@ -1240,12 +1648,20 @@ func normalizeOAuthPath(value string) string {
 }
 
 func classifyOAuthContinuationURL(rawURL, authBaseURL string) *AuthError {
+	if authError := validateOAuthContinuationOrigin(rawURL, authBaseURL); authError != nil {
+		return authError
+	}
+	parsedURL, _ := url.Parse(strings.TrimSpace(rawURL))
+	return classifyPageType(parsedURL.Path)
+}
+
+func validateOAuthContinuationOrigin(rawURL, authBaseURL string) *AuthError {
 	parsedURL, err := url.Parse(strings.TrimSpace(rawURL))
 	parsedAuthBase, errBase := url.Parse(strings.TrimSpace(authBaseURL))
 	if err != nil || errBase != nil || !sameOAuthOrigin(parsedURL, parsedAuthBase) {
 		return newAuthError("oauth_redirect_untrusted", LifecycleInteractionRequired, 0, false, true, "OAuth continuation left the trusted authentication origin", nil)
 	}
-	return classifyPageType(parsedURL.Path)
+	return nil
 }
 
 func responseRequestURL(response *fhttp.Response) string {

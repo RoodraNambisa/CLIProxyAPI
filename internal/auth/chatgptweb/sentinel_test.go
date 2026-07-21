@@ -174,7 +174,7 @@ func TestSentinelInteractiveChallenges(t *testing.T) {
 		code string
 	}{
 		{name: "turnstile", body: `{"token":"challenge","turnstile":{"required":true,"sitekey":"site"}}`, code: "turnstile_required"},
-		{name: "arkose", body: `{"token":"challenge","arkose":{"required":true}}`, code: "arkose_required"},
+		{name: "arkose without challenge token", body: `{"arkose":{"required":true}}`, code: "arkose_required"},
 	} {
 		t.Run(challenge.name, func(t *testing.T) {
 			server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
@@ -200,6 +200,120 @@ func TestSentinelInteractiveChallenges(t *testing.T) {
 	}
 }
 
+func TestSentinelShortCircuitsBeforeTurnstileVM(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		body     string
+		wantCode string
+	}{
+		{
+			name:     "missing challenge token",
+			body:     `{"turnstile":{"required":true,"dx":"must-not-run"}}`,
+			wantCode: "sentinel_token_missing",
+		},
+		{
+			name:     "unsupported Arkose challenge",
+			body:     `{"token":"challenge","turnstile":{"required":true,"dx":"must-not-run"},"arkose":{"required":true}}`,
+			wantCode: "arkose_required",
+		},
+		{
+			name:     "invalid proof of work",
+			body:     `{"token":"challenge","turnstile":{"required":true,"dx":"must-not-run"},"proofofwork":{"required":true}}`,
+			wantCode: "sentinel_pow_invalid",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
+				response.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(response, test.body)
+			}))
+			defer server.Close()
+			client, err := NewClient(DefaultPersona(), "", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer client.CloseIdleConnections()
+			sentinel, err := NewSentinel(client, server.URL, server.URL, "00000000-0000-4000-8000-000000000001", zeroReader{}, time.Now)
+			if err != nil {
+				t.Fatal(err)
+			}
+			vmCalled := false
+			sentinel.turnstileSolver = func(context.Context, string, string, ConversationTurnstileEnvironment, io.Reader, func() time.Time) (string, error) {
+				vmCalled = true
+				return "", errors.New("Turnstile VM must not run")
+			}
+			_, tokenErr := sentinel.Token(context.Background(), "password_verify")
+			authError, ok := AsAuthError(tokenErr)
+			if !ok || authError.Code != test.wantCode {
+				t.Fatalf("Token() error = %#v, want %s", tokenErr, test.wantCode)
+			}
+			if vmCalled {
+				t.Fatal("Turnstile VM ran before cheap challenge validation")
+			}
+		})
+	}
+}
+
+func TestSentinelSolvesTurnstileChallenge(t *testing.T) {
+	t.Parallel()
+	const deviceID = "00000000-0000-4000-8000-000000000001"
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		var input map[string]any
+		if err := json.NewDecoder(request.Body).Decode(&input); err != nil {
+			t.Errorf("decode sentinel request: %v", err)
+			return
+		}
+		requirementsToken := stringValue(input["p"])
+		dx := encodeConversationTurnstileProgram(t, requirementsToken, []any{
+			[]any{2, 40, "turn"},
+			[]any{2, 41, "stile"},
+			[]any{5, 40, 41},
+			[]any{7, 3, 40},
+		})
+		response.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(response).Encode(map[string]any{
+			"token":       "challenge-token",
+			"proofofwork": map[string]any{"required": false},
+			"turnstile":   map[string]any{"required": true, "dx": dx},
+		})
+	}))
+	defer server.Close()
+
+	client, err := NewClient(DefaultPersona(), "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.CloseIdleConnections()
+	sentinel, err := NewSentinel(client, server.URL, server.URL, deviceID, zeroReader{}, time.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	originalSolver := sentinel.turnstileSolver
+	var solverEnvironment ConversationTurnstileEnvironment
+	sentinel.turnstileSolver = func(ctx context.Context, dx, requirementsToken string, environment ConversationTurnstileEnvironment, reader io.Reader, now func() time.Time) (string, error) {
+		solverEnvironment = environment
+		return originalSolver(ctx, dx, requirementsToken, environment, reader, now)
+	}
+	token, err := sentinel.Token(context.Background(), "password_verify")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var header map[string]any
+	if err = json.Unmarshal([]byte(token), &header); err != nil {
+		t.Fatal(err)
+	}
+	wantTurnstile := base64.StdEncoding.EncodeToString([]byte("turnstile"))
+	if header["t"] != wantTurnstile || header["c"] != "challenge-token" {
+		t.Fatalf("sentinel header turnstile/challenge = %q/%q", header["t"], header["c"])
+	}
+	if solverEnvironment.Location != server.URL+"/backend-api/sentinel/frame.html?sv="+sentinelSDKVersion {
+		t.Fatalf("Turnstile location = %q", solverEnvironment.Location)
+	}
+	if len(solverEnvironment.ScriptSources) != 1 || solverEnvironment.ScriptSources[0] != sentinelSDKURL {
+		t.Fatalf("Turnstile script sources = %#v", solverEnvironment.ScriptSources)
+	}
+}
+
 func TestSentinelIgnoresDisabledInteractiveChallenges(t *testing.T) {
 	t.Parallel()
 	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
@@ -222,5 +336,48 @@ func TestSentinelIgnoresDisabledInteractiveChallenges(t *testing.T) {
 	}
 	if _, err := sentinel.Token(context.Background(), "password_verify"); err != nil {
 		t.Fatalf("Token() error = %v", err)
+	}
+}
+
+func TestSentinelIgnoresTurnstileDXWhenRequiredFlagIsFalse(t *testing.T) {
+	t.Parallel()
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
+		response.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(response, `{
+			"token":"challenge",
+			"turnstile":{"required":false,"dx":"compact-program"}
+		}`)
+	}))
+	defer server.Close()
+	client, err := NewClient(DefaultPersona(), "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.CloseIdleConnections()
+	sentinel, err := NewSentinel(client, server.URL, server.URL, "00000000-0000-4000-8000-000000000001", zeroReader{}, time.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	called := false
+	sentinel.turnstileSolver = func(_ context.Context, dx, _ string, _ ConversationTurnstileEnvironment, _ io.Reader, _ func() time.Time) (string, error) {
+		called = true
+		if dx != "compact-program" {
+			t.Fatalf("dx = %q", dx)
+		}
+		return "solved", nil
+	}
+	token, err := sentinel.Token(context.Background(), "password_verify")
+	if err != nil {
+		t.Fatalf("Token() error = %v", err)
+	}
+	if called {
+		t.Fatal("Turnstile VM was called for a disabled challenge")
+	}
+	var header map[string]any
+	if err = json.Unmarshal([]byte(token), &header); err != nil {
+		t.Fatal(err)
+	}
+	if header["t"] != "" {
+		t.Fatalf("Turnstile token = %#v", header["t"])
 	}
 }

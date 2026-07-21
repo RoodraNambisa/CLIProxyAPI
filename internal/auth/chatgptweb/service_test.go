@@ -15,31 +15,42 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	fhttp "github.com/bogdanfinn/fhttp"
 )
 
 type loginFixture struct {
-	t                      *testing.T
-	passwordStatus         int
-	passwordBody           string
-	passwordCalls          int
-	authorizePath          string
-	authorizeBody          string
-	authorizeContinueCalls int
-	authorizeRedirect      bool
-	passwordPageRedirect   bool
-	passwordRedirect       bool
-	passwordRedirectURL    string
-	passwordRedirectStatus int
-	passwordRedirectMethod string
-	tokenCalls             int
-	mfaVerifyCalls         int
-	mfaStatus              int
-	mfaBody                string
-	wantTOTP               string
-	state                  string
-	codeChallenge          string
-	server                 *httptest.Server
-	mu                     sync.Mutex
+	t                       *testing.T
+	passwordStatus          int
+	passwordBody            string
+	passwordCalls           int
+	authorizePath           string
+	authorizeResponseBody   string
+	authorizeBody           string
+	authorizeContinueCalls  int
+	authorizeRedirect       bool
+	authorizeRedirectURL    string
+	authorizeRedirectStatus int
+	authorizeFollowURL      string
+	authorizeFollowMethod   string
+	authorizeFollowStatus   int
+	passwordPageRedirect    bool
+	passwordRedirect        bool
+	passwordRedirectURL     string
+	passwordRedirectStatus  int
+	passwordRedirectMethod  string
+	tokenCalls              int
+	mfaVerifyCalls          int
+	mfaStatus               int
+	mfaBody                 string
+	mfaContinuationOnly     bool
+	mfaRedirectURL          string
+	mfaRedirectStatus       int
+	wantTOTP                string
+	state                   string
+	codeChallenge           string
+	server                  *httptest.Server
+	mu                      sync.Mutex
 }
 
 func newLoginFixture(t *testing.T, passwordStatus int, passwordBody string) *loginFixture {
@@ -68,17 +79,56 @@ func (fixture *loginFixture) serveHTTP(response http.ResponseWriter, request *ht
 		}
 		response.Header().Set("Content-Type", "text/html")
 		_, _ = io.WriteString(response, "password")
+	case "/authorize-follow", "/authorize-follow-final":
+		if fixture.authorizeFollowMethod != "" && request.Method != fixture.authorizeFollowMethod {
+			fixture.t.Errorf("authorize follow method = %s, want %s", request.Method, fixture.authorizeFollowMethod)
+		}
+		if request.Method == http.MethodPost {
+			if request.Header.Get("OpenAI-Sentinel-Token") == "" {
+				fixture.t.Error("same-origin authorize replay omitted sentinel token")
+			}
+			var body struct {
+				Username struct {
+					Value string `json:"value"`
+					Kind  string `json:"kind"`
+				} `json:"username"`
+			}
+			if err := json.NewDecoder(request.Body).Decode(&body); err != nil {
+				fixture.t.Errorf("decode replayed authorize request: %v", err)
+			} else if body.Username.Value != "person@example.com" || body.Username.Kind != "email" {
+				fixture.t.Errorf("replayed authorize username = %#v", body.Username)
+			}
+		}
+		targetURL := fixture.authorizeFollowURL
+		status := fixture.authorizeFollowStatus
+		if request.URL.Path == "/authorize-follow-final" || targetURL == "" {
+			targetURL = fixture.callbackURL()
+			status = http.StatusFound
+		}
+		if status == 0 {
+			status = http.StatusFound
+		}
+		http.Redirect(response, request, targetURL, status)
 	case "/password-redirect":
 		fixture.handlePasswordRedirect(response, request)
 	case "/auth/callback":
 		_, _ = io.WriteString(response, "callback")
 	case "/api/accounts/password/verify":
 		fixture.handlePassword(response, request)
-	case "/api/accounts/mfa/verify":
+	case "/api/accounts/mfa/verify", "/mfa-verify-follow":
 		fixture.handleMFAVerify(response, request)
 	case "/api/accounts/oauth/token":
 		fixture.handleTokenExchange(response, request)
 	default:
+		if strings.HasPrefix(request.URL.Path, "/mfa-challenge/") {
+			if request.Method == http.MethodPost {
+				fixture.handleMFAVerify(response, request)
+				return
+			}
+			response.Header().Set("Content-Type", "text/html")
+			_, _ = io.WriteString(response, "<html><body>MFA challenge</body></html>")
+			return
+		}
 		fixture.t.Errorf("unexpected request: %s %s", request.Method, request.URL.String())
 		http.NotFound(response, request)
 	}
@@ -128,6 +178,11 @@ func (fixture *loginFixture) handleAuthorize(response http.ResponseWriter, reque
 	fixture.codeChallenge = query.Get("code_challenge")
 	fixture.mu.Unlock()
 	http.SetCookie(response, &http.Cookie{Name: "login_session", Value: "session", Path: "/", HttpOnly: true})
+	if fixture.authorizeResponseBody != "" {
+		response.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(response, fixture.authorizeResponseBody)
+		return
+	}
 	http.Redirect(response, request, fixture.authorizePath, http.StatusFound)
 }
 
@@ -164,6 +219,15 @@ func (fixture *loginFixture) handleAuthorizeContinue(response http.ResponseWrite
 	}
 	if body.Username.Value != "person@example.com" || body.Username.Kind != "email" {
 		fixture.t.Errorf("authorize/continue username = %#v", body.Username)
+	}
+	if fixture.authorizeRedirectURL != "" {
+		status := fixture.authorizeRedirectStatus
+		if status == 0 {
+			status = http.StatusFound
+		}
+		response.Header().Set("Location", fixture.authorizeRedirectURL)
+		response.WriteHeader(status)
+		return
 	}
 	if fixture.authorizeRedirect {
 		http.Redirect(response, request, fixture.callbackURL(), http.StatusFound)
@@ -227,12 +291,21 @@ func (fixture *loginFixture) handleMFAVerify(response http.ResponseWriter, reque
 	if body["id"] != "totp-factor" || body["type"] != "totp" || body["mfa_request_id"] != "mfa-request" || body["code"] != wantTOTP {
 		fixture.t.Errorf("MFA verify body = %#v", body)
 	}
+	if request.URL.Path == "/api/accounts/mfa/verify" && fixture.mfaRedirectURL != "" {
+		response.Header().Set("Location", fixture.mfaRedirectURL)
+		response.WriteHeader(fixture.mfaRedirectStatus)
+		return
+	}
 	response.Header().Set("Content-Type", "application/json")
 	if fixture.mfaStatus != 0 {
 		response.WriteHeader(fixture.mfaStatus)
 	}
 	if fixture.mfaBody != "" {
 		_, _ = io.WriteString(response, fixture.mfaBody)
+		return
+	}
+	if fixture.mfaContinuationOnly {
+		_, _ = fmt.Fprintf(response, `{"continue_url":%q}`, fixture.callbackURL())
 		return
 	}
 	_, _ = fmt.Fprintf(response, `{"continue_url":%q,"page":{"type":"authorized"}}`, fixture.callbackURL())
@@ -459,10 +532,192 @@ func TestServiceLoginFollowsSafePasswordRedirects(t *testing.T) {
 	}
 }
 
+func TestServiceLoginFollowsPasswordRedirectToMFAChallenge(t *testing.T) {
+	fixedNow := time.Date(2026, time.July, 16, 12, 0, 0, 0, time.UTC)
+	const secret = "JBSWY3DPEHPK3PXP"
+	wantTOTP, err := GenerateTOTP(secret, fixedNow)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture := newLoginFixture(t, http.StatusOK, "")
+	fixture.passwordRedirectURL = fixture.server.URL + "/mfa-challenge/totp-factor?factor_type=totp&mfa_request_id=mfa-request"
+	fixture.passwordRedirectStatus = http.StatusFound
+	fixture.wantTOTP = wantTOTP
+	service := NewService(fixture.options(fixedNow))
+	credential, err := service.Login(t.Context(), LoginInput{
+		Email:      "person@example.com",
+		Password:   "correct-password",
+		TOTPSecret: secret,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if credential.LifecycleState != LifecycleActive {
+		t.Fatalf("credential lifecycle = %q", credential.LifecycleState)
+	}
+	fixture.mu.Lock()
+	mfaVerifyCalls := fixture.mfaVerifyCalls
+	fixture.mu.Unlock()
+	if mfaVerifyCalls != 1 {
+		t.Fatalf("MFA verify calls = %d, want 1", mfaVerifyCalls)
+	}
+}
+
+func TestServiceLoginPreservesMFAPOSTAcrossSameOriginRedirects(t *testing.T) {
+	for _, status := range []int{http.StatusTemporaryRedirect, http.StatusPermanentRedirect} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			fixedNow := time.Date(2026, time.July, 16, 12, 0, 0, 0, time.UTC)
+			const secret = "JBSWY3DPEHPK3PXP"
+			wantTOTP, err := GenerateTOTP(secret, fixedNow)
+			if err != nil {
+				t.Fatal(err)
+			}
+			fixture := newLoginFixture(t, http.StatusOK, "")
+			fixture.authorizeResponseBody = `{
+				"continue_url":"/mfa-challenge/totp-factor",
+				"page":{"type":"mfa_challenge","payload":{
+					"mfa_request_id":"mfa-request",
+					"mfa_factors":[{"type":"totp","id":"totp-factor"}]
+				}}
+			}`
+			fixture.mfaRedirectURL = fixture.server.URL + "/mfa-verify-follow"
+			fixture.mfaRedirectStatus = status
+			fixture.wantTOTP = wantTOTP
+			service := NewService(fixture.options(fixedNow))
+			credential, err := service.Login(t.Context(), LoginInput{
+				Email:      "person@example.com",
+				Password:   "correct-password",
+				TOTPSecret: secret,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if credential.LifecycleState != LifecycleActive {
+				t.Fatalf("credential lifecycle = %q", credential.LifecycleState)
+			}
+			fixture.mu.Lock()
+			mfaVerifyCalls := fixture.mfaVerifyCalls
+			fixture.mu.Unlock()
+			if mfaVerifyCalls != 2 {
+				t.Fatalf("MFA verify calls = %d, want 2", mfaVerifyCalls)
+			}
+		})
+	}
+}
+
+func TestServiceLoginPreservesAuthorizedMFAResponseAtChallengeURL(t *testing.T) {
+	for _, status := range []int{http.StatusTemporaryRedirect, http.StatusPermanentRedirect} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			fixedNow := time.Date(2026, time.July, 16, 12, 0, 0, 0, time.UTC)
+			const secret = "JBSWY3DPEHPK3PXP"
+			wantTOTP, err := GenerateTOTP(secret, fixedNow)
+			if err != nil {
+				t.Fatal(err)
+			}
+			fixture := newLoginFixture(t, http.StatusOK, "")
+			fixture.authorizeResponseBody = `{
+				"continue_url":"/mfa-challenge/totp-factor",
+				"page":{"type":"mfa_challenge","payload":{
+					"mfa_request_id":"mfa-request",
+					"mfa_factors":[{"type":"totp","id":"totp-factor"}]
+				}}
+			}`
+			fixture.mfaRedirectURL = fixture.server.URL + "/mfa-challenge/totp-factor?mfa_request_id=mfa-request"
+			fixture.mfaRedirectStatus = status
+			fixture.mfaContinuationOnly = true
+			fixture.wantTOTP = wantTOTP
+			service := NewService(fixture.options(fixedNow))
+			credential, err := service.Login(t.Context(), LoginInput{
+				Email:      "person@example.com",
+				Password:   "correct-password",
+				TOTPSecret: secret,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if credential.LifecycleState != LifecycleActive {
+				t.Fatalf("credential lifecycle = %q", credential.LifecycleState)
+			}
+			fixture.mu.Lock()
+			mfaVerifyCalls := fixture.mfaVerifyCalls
+			fixture.mu.Unlock()
+			if mfaVerifyCalls != 2 {
+				t.Fatalf("MFA verify calls = %d, want 2", mfaVerifyCalls)
+			}
+		})
+	}
+}
+
+func TestServiceLoginPreservesAuthorizePOSTAcrossSameOriginRedirects(t *testing.T) {
+	for _, status := range []int{http.StatusTemporaryRedirect, http.StatusPermanentRedirect} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			fixture := newLoginFixture(t, http.StatusOK, "")
+			fixture.authorizeRedirectURL = fixture.server.URL + "/authorize-follow"
+			fixture.authorizeRedirectStatus = status
+			fixture.authorizeFollowMethod = http.MethodPost
+			service := NewService(fixture.options(time.Date(2026, time.July, 16, 12, 0, 0, 0, time.UTC)))
+			credential, err := service.Login(t.Context(), LoginInput{
+				Email:    "person@example.com",
+				Password: "correct-password",
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if credential.LifecycleState != LifecycleActive || credential.RefreshToken != "refresh-token" {
+				t.Fatalf("credential = state %q refresh token %q", credential.LifecycleState, credential.RefreshToken)
+			}
+		})
+	}
+}
+
+func TestServiceLoginPreservesAuthorizePOSTAcrossConsecutiveSameOriginRedirects(t *testing.T) {
+	fixture := newLoginFixture(t, http.StatusOK, "")
+	fixture.authorizeRedirectURL = fixture.server.URL + "/authorize-follow"
+	fixture.authorizeRedirectStatus = http.StatusTemporaryRedirect
+	fixture.authorizeFollowURL = fixture.server.URL + "/authorize-follow-final"
+	fixture.authorizeFollowMethod = http.MethodPost
+	fixture.authorizeFollowStatus = http.StatusPermanentRedirect
+	service := NewService(fixture.options(time.Date(2026, time.July, 16, 12, 0, 0, 0, time.UTC)))
+	credential, err := service.Login(t.Context(), LoginInput{
+		Email:    "person@example.com",
+		Password: "correct-password",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if credential.LifecycleState != LifecycleActive || credential.RefreshToken != "refresh-token" {
+		t.Fatalf("credential = state %q refresh token %q", credential.LifecycleState, credential.RefreshToken)
+	}
+}
+
 func TestServiceLoginSkipsAuthorizeContinueOnPasswordPage(t *testing.T) {
 	fixedNow := time.Date(2026, time.July, 16, 12, 0, 0, 0, time.UTC)
 	fixture := newLoginFixture(t, http.StatusOK, "")
 	fixture.authorizePath = "/log-in/password"
+	service := NewService(fixture.options(fixedNow))
+	credential, err := service.Login(t.Context(), LoginInput{
+		Email:    "person@example.com",
+		Password: "correct-password",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if credential.LifecycleState != LifecycleActive || credential.RefreshToken != "refresh-token" {
+		t.Fatalf("credential = state %q refresh token %q", credential.LifecycleState, credential.RefreshToken)
+	}
+	fixture.mu.Lock()
+	authorizeContinueCalls := fixture.authorizeContinueCalls
+	passwordCalls := fixture.passwordCalls
+	fixture.mu.Unlock()
+	if authorizeContinueCalls != 0 || passwordCalls != 1 {
+		t.Fatalf("authorize continue/password calls = %d/%d, want 0/1", authorizeContinueCalls, passwordCalls)
+	}
+}
+
+func TestServiceLoginAcceptsPasswordEnvelopeFromAuthorizeAPI(t *testing.T) {
+	fixedNow := time.Date(2026, time.July, 20, 12, 0, 0, 0, time.UTC)
+	fixture := newLoginFixture(t, http.StatusOK, "")
+	fixture.authorizeResponseBody = `{"continue_url":"/log-in/password","page":{"type":"login_password","payload":{}}}`
 	service := NewService(fixture.options(fixedNow))
 	credential, err := service.Login(t.Context(), LoginInput{
 		Email:    "person@example.com",
@@ -581,6 +836,417 @@ func TestServiceLoginWithDirectTOTPChallenge(t *testing.T) {
 	}
 }
 
+func TestServiceLoginNormalizesRedirectedMFAHTML(t *testing.T) {
+	fixedNow := time.Date(2026, time.July, 16, 12, 0, 0, 0, time.UTC)
+	const secret = "JBSWY3DPEHPK3PXP"
+	wantTOTP, errTOTP := GenerateTOTP(secret, fixedNow)
+	if errTOTP != nil {
+		t.Fatal(errTOTP)
+	}
+	for _, test := range []struct {
+		name  string
+		setup func(*loginFixture)
+	}{
+		{
+			name: "authorize continue redirect",
+			setup: func(fixture *loginFixture) {
+				fixture.authorizeRedirectURL = "/mfa-challenge/totp-factor?mfa_request_id=mfa-request"
+			},
+		},
+		{
+			name: "followed continuation redirect",
+			setup: func(fixture *loginFixture) {
+				fixture.authorizeBody = `{"continue_url":"/authorize-follow","page":{"type":"password"}}`
+				fixture.authorizeFollowURL = "/mfa-challenge/totp-factor?mfa_request_id=mfa-request"
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newLoginFixture(t, http.StatusOK, "")
+			test.setup(fixture)
+			fixture.wantTOTP = wantTOTP
+			service := NewService(fixture.options(fixedNow))
+			credential, errLogin := service.Login(t.Context(), LoginInput{
+				Email:      "person@example.com",
+				Password:   "correct-password",
+				TOTPSecret: secret,
+			})
+			if errLogin != nil {
+				t.Fatal(errLogin)
+			}
+			if credential.LifecycleState != LifecycleActive {
+				t.Fatalf("credential lifecycle = %q", credential.LifecycleState)
+			}
+			fixture.mu.Lock()
+			passwordCalls := fixture.passwordCalls
+			mfaVerifyCalls := fixture.mfaVerifyCalls
+			fixture.mu.Unlock()
+			if passwordCalls != 0 || mfaVerifyCalls != 1 {
+				t.Fatalf("password/MFA calls = %d/%d, want 0/1", passwordCalls, mfaVerifyCalls)
+			}
+		})
+	}
+}
+
+func TestServiceLoginAuthorizeContinueDoesNotFollowCrossOriginRedirect(t *testing.T) {
+	for _, status := range []int{http.StatusFound, http.StatusTemporaryRedirect} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			var attackerCalls int
+			attacker := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+				attackerCalls++
+			}))
+			defer attacker.Close()
+
+			fixture := newLoginFixture(t, http.StatusOK, "")
+			fixture.authorizeRedirectURL = attacker.URL + "/capture"
+			fixture.authorizeRedirectStatus = status
+			service := NewService(fixture.options(time.Date(2026, time.July, 16, 12, 0, 0, 0, time.UTC)))
+			credential, errLogin := service.Login(t.Context(), LoginInput{
+				Email:    "person@example.com",
+				Password: "correct-password",
+			})
+			if errLogin == nil {
+				t.Fatal("Login() succeeded, want untrusted redirect error")
+			}
+			authError, ok := AsAuthError(errLogin)
+			if !ok || authError.Code != "oauth_redirect_untrusted" || authError.State != LifecycleInteractionRequired {
+				t.Fatalf("Login() error = %#v", errLogin)
+			}
+			if credential.LifecycleState != LifecycleInteractionRequired {
+				t.Fatalf("credential lifecycle = %q", credential.LifecycleState)
+			}
+			if attackerCalls != 0 {
+				t.Fatalf("cross-origin redirect received %d requests", attackerCalls)
+			}
+		})
+	}
+}
+
+func TestServiceLoginClassifiesRedirectedInteractionHTMLBeforePassword(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		setup func(*loginFixture)
+	}{
+		{
+			name: "authorize continue redirect",
+			setup: func(fixture *loginFixture) {
+				fixture.authorizeRedirectURL = "/email-verification"
+			},
+		},
+		{
+			name: "followed continuation redirect",
+			setup: func(fixture *loginFixture) {
+				fixture.authorizeBody = `{"continue_url":"/authorize-follow","page":{"type":"password"}}`
+				fixture.authorizeFollowURL = "/email-verification"
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newLoginFixture(t, http.StatusOK, "")
+			test.setup(fixture)
+			service := NewService(fixture.options(time.Date(2026, time.July, 16, 12, 0, 0, 0, time.UTC)))
+			credential, errLogin := service.Login(t.Context(), LoginInput{
+				Email:    "person@example.com",
+				Password: "correct-password",
+			})
+			if errLogin == nil {
+				t.Fatal("Login() succeeded, want interaction requirement")
+			}
+			authError, ok := AsAuthError(errLogin)
+			if !ok || authError.Code != "email_otp_required" || authError.State != LifecycleInteractionRequired {
+				t.Fatalf("Login() error = %#v", errLogin)
+			}
+			if credential.LifecycleState != LifecycleInteractionRequired {
+				t.Fatalf("credential lifecycle = %q", credential.LifecycleState)
+			}
+			fixture.mu.Lock()
+			passwordCalls := fixture.passwordCalls
+			fixture.mu.Unlock()
+			if passwordCalls != 0 {
+				t.Fatalf("password calls = %d, want 0", passwordCalls)
+			}
+		})
+	}
+}
+
+func TestServiceLoginDoesNotAssumeOpaqueMFAFactorIsTOTP(t *testing.T) {
+	fixture := newLoginFixture(t, http.StatusOK, "")
+	fixture.authorizePath = "/mfa-challenge/01JY9W8K6F5N4M3P2Q1R"
+	service := NewService(fixture.options(time.Date(2026, time.July, 16, 12, 0, 0, 0, time.UTC)))
+	credential, errLogin := service.Login(t.Context(), LoginInput{
+		Email:      "person@example.com",
+		Password:   "correct-password",
+		TOTPSecret: "JBSWY3DPEHPK3PXP",
+	})
+	if errLogin == nil {
+		t.Fatal("Login() succeeded, want unknown MFA interaction")
+	}
+	authError, ok := AsAuthError(errLogin)
+	if !ok || authError.Code != "totp_factor_missing" || authError.State != LifecycleInteractionRequired {
+		t.Fatalf("Login() error = %#v", errLogin)
+	}
+	if credential.LifecycleState != LifecycleInteractionRequired {
+		t.Fatalf("credential lifecycle = %q", credential.LifecycleState)
+	}
+	fixture.mu.Lock()
+	passwordCalls := fixture.passwordCalls
+	mfaVerifyCalls := fixture.mfaVerifyCalls
+	fixture.mu.Unlock()
+	if passwordCalls != 0 || mfaVerifyCalls != 0 {
+		t.Fatalf("password/MFA calls = %d/%d, want 0/0", passwordCalls, mfaVerifyCalls)
+	}
+}
+
+func TestServiceLoginWithInitialAuthorizeTOTPEnvelope(t *testing.T) {
+	fixedNow := time.Date(2026, time.July, 16, 12, 0, 0, 0, time.UTC)
+	const secret = "JBSWY3DPEHPK3PXP"
+	wantTOTP, errTOTP := GenerateTOTP(secret, fixedNow)
+	if errTOTP != nil {
+		t.Fatal(errTOTP)
+	}
+	fixture := newLoginFixture(t, http.StatusOK, "")
+	fixture.authorizeResponseBody = `{
+		"continue_url":"/mfa-challenge/totp-factor",
+		"page":{"type":"mfa_challenge","payload":{
+			"mfa_factors":[{"type":"totp","id":"totp-factor","metadata":{"mfa_request_id":"mfa-request"}}]
+		}}
+	}`
+	fixture.wantTOTP = wantTOTP
+	service := NewService(fixture.options(fixedNow))
+	credential, errLogin := service.Login(t.Context(), LoginInput{
+		Email:      "person@example.com",
+		Password:   "correct-password",
+		TOTPSecret: secret,
+	})
+	if errLogin != nil {
+		t.Fatal(errLogin)
+	}
+	if credential.LifecycleState != LifecycleActive {
+		t.Fatalf("credential lifecycle = %q", credential.LifecycleState)
+	}
+	fixture.mu.Lock()
+	authorizeContinueCalls := fixture.authorizeContinueCalls
+	passwordCalls := fixture.passwordCalls
+	mfaVerifyCalls := fixture.mfaVerifyCalls
+	fixture.mu.Unlock()
+	if authorizeContinueCalls != 0 || passwordCalls != 0 || mfaVerifyCalls != 1 {
+		t.Fatalf("authorize/password/MFA calls = %d/%d/%d, want 0/0/1", authorizeContinueCalls, passwordCalls, mfaVerifyCalls)
+	}
+}
+
+func TestParseAuthorizationEnvelopePreservesBodyMFAFactorsAtChallengeURL(t *testing.T) {
+	request, err := fhttp.NewRequest(http.MethodGet, "https://auth.openai.com/mfa-challenge/opaque-factor", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	envelope := parseAuthorizationEnvelope(&fhttp.Response{Request: request}, []byte(`{
+		"page":{"type":"mfa_challenge","payload":{
+			"mfa_request_id":"mfa-request",
+			"factors":[{"factor_type":"totp","id":"totp-factor"}]
+		}}
+	}`))
+	factorID, requestID := selectMFAFactor(envelope.Payload, "totp")
+	if factorID != "totp-factor" || requestID != "mfa-request" {
+		t.Fatalf("MFA factor/request = %q/%q", factorID, requestID)
+	}
+	if envelope.ContinueURL != request.URL.String() || envelope.PageType != "mfa_challenge" {
+		t.Fatalf("MFA envelope navigation = %#v", envelope)
+	}
+}
+
+func TestParseAuthorizationEnvelopePreservesTopLevelSessionMFAFactors(t *testing.T) {
+	request, err := fhttp.NewRequest(http.MethodGet, "https://auth.openai.com/mfa-challenge/current-factor", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	envelope := parseAuthorizationEnvelope(&fhttp.Response{Request: request}, []byte(`{
+		"oai-client-auth-session":{
+			"mfa_request_id":"session-request",
+			"mfa_factors":[{"type":"totp","id":"session-totp"}]
+		},
+		"page":{"type":"mfa_challenge","payload":{}}
+	}`))
+	factorID, requestID := selectMFAFactor(envelope.Payload, "totp")
+	if factorID != "session-totp" || requestID != "session-request" {
+		t.Fatalf("MFA factor/request = %q/%q", factorID, requestID)
+	}
+	if envelope.ContinueURL != request.URL.String() || envelope.PageType != "mfa_challenge" {
+		t.Fatalf("MFA envelope navigation = %#v", envelope)
+	}
+}
+
+func TestParseAuthorizationEnvelopeMergesContinueURLAndTopLevelMFAHints(t *testing.T) {
+	request, err := fhttp.NewRequest(http.MethodPost, "https://auth.openai.com/api/accounts/authorize/continue", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	envelope := parseAuthorizationEnvelope(&fhttp.Response{Request: request}, []byte(`{
+		"continue_url":"/mfa-challenge/totp-factor?mfa_request_id=url-request",
+		"mfa_request_id":"body-request",
+		"factor_type":"totp",
+		"factor_id":"body-factor",
+		"page":{"type":"mfa_challenge","payload":{}}
+	}`))
+	factorID, requestID := selectMFAFactor(envelope.Payload, "totp")
+	if factorID != "body-factor" || requestID != "body-request" {
+		t.Fatalf("MFA factor/request = %q/%q", factorID, requestID)
+	}
+	if !isMFAChallenge(envelope.PageType, envelope.ContinueURL) {
+		t.Fatalf("MFA envelope = %#v", envelope)
+	}
+}
+
+func TestParseAuthorizationEnvelopePreservesSuccessfulMFAContinuation(t *testing.T) {
+	request, err := fhttp.NewRequest(http.MethodPost, "https://auth.openai.com/api/accounts/mfa/verify", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	envelope := parseAuthorizationEnvelope(&fhttp.Response{Request: request}, []byte(`{
+		"continue_url":"/api/accounts/authorize/continue"
+	}`))
+	if envelope.PageType != "" || envelope.ContinueURL != "/api/accounts/authorize/continue" {
+		t.Fatalf("MFA success envelope = %#v", envelope)
+	}
+}
+
+func TestServiceLoginWithInitialAuthorizeRedirectToTOTPHTML(t *testing.T) {
+	fixedNow := time.Date(2026, time.July, 16, 12, 0, 0, 0, time.UTC)
+	const secret = "JBSWY3DPEHPK3PXP"
+	wantTOTP, errTOTP := GenerateTOTP(secret, fixedNow)
+	if errTOTP != nil {
+		t.Fatal(errTOTP)
+	}
+	fixture := newLoginFixture(t, http.StatusOK, "")
+	fixture.authorizePath = "/mfa-challenge/totp-factor?mfa_request_id=mfa-request"
+	fixture.wantTOTP = wantTOTP
+	service := NewService(fixture.options(fixedNow))
+	credential, errLogin := service.Login(t.Context(), LoginInput{
+		Email:      "person@example.com",
+		Password:   "correct-password",
+		TOTPSecret: secret,
+	})
+	if errLogin != nil {
+		t.Fatal(errLogin)
+	}
+	if credential.LifecycleState != LifecycleActive {
+		t.Fatalf("credential lifecycle = %q", credential.LifecycleState)
+	}
+	fixture.mu.Lock()
+	authorizeContinueCalls := fixture.authorizeContinueCalls
+	passwordCalls := fixture.passwordCalls
+	mfaVerifyCalls := fixture.mfaVerifyCalls
+	fixture.mu.Unlock()
+	if authorizeContinueCalls != 0 || passwordCalls != 0 || mfaVerifyCalls != 1 {
+		t.Fatalf("authorize/password/MFA calls = %d/%d/%d, want 0/0/1", authorizeContinueCalls, passwordCalls, mfaVerifyCalls)
+	}
+}
+
+func TestServiceLoginInitialAuthorizeRedirectKeepsOtherMFAInteractive(t *testing.T) {
+	for _, path := range []string{
+		"/mfa-challenge/email-factor?factor_type=email&mfa_request_id=email-request",
+		"/mfa-challenge/email-otp",
+	} {
+		t.Run(path, func(t *testing.T) {
+			fixture := newLoginFixture(t, http.StatusOK, "")
+			fixture.authorizePath = path
+			service := NewService(fixture.options(time.Date(2026, time.July, 16, 12, 0, 0, 0, time.UTC)))
+			credential, errLogin := service.Login(t.Context(), LoginInput{
+				Email:      "person@example.com",
+				Password:   "correct-password",
+				TOTPSecret: "JBSWY3DPEHPK3PXP",
+			})
+			if errLogin == nil {
+				t.Fatal("Login() succeeded, want interaction requirement")
+			}
+			authError, ok := AsAuthError(errLogin)
+			if !ok || authError.Code != "email_otp_required" || authError.State != LifecycleInteractionRequired {
+				t.Fatalf("Login() error = %#v", errLogin)
+			}
+			if credential.LifecycleState != LifecycleInteractionRequired {
+				t.Fatalf("credential lifecycle = %q", credential.LifecycleState)
+			}
+			fixture.mu.Lock()
+			mfaVerifyCalls := fixture.mfaVerifyCalls
+			fixture.mu.Unlock()
+			if mfaVerifyCalls != 0 {
+				t.Fatalf("MFA verify calls = %d, want 0", mfaVerifyCalls)
+			}
+		})
+	}
+}
+
+func TestServiceLoginClassifiesMFAFactorBeforeRequiringTOTPSecret(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		factorType string
+		wantCode   string
+	}{
+		{name: "email", factorType: "email", wantCode: "email_otp_required"},
+		{name: "SMS", factorType: "sms", wantCode: "sms_otp_required"},
+		{name: "passkey", factorType: "passkey", wantCode: "passkey_required"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newLoginFixture(t, http.StatusOK, "")
+			fixture.authorizePath = "/mfa-challenge/factor?factor_type=" + url.QueryEscape(test.factorType)
+			service := NewService(fixture.options(time.Date(2026, time.July, 16, 12, 0, 0, 0, time.UTC)))
+			credential, errLogin := service.Login(t.Context(), LoginInput{
+				Email:    "person@example.com",
+				Password: "correct-password",
+			})
+			if errLogin == nil {
+				t.Fatal("Login() succeeded, want interaction requirement")
+			}
+			authError, ok := AsAuthError(errLogin)
+			if !ok || authError.Code != test.wantCode || authError.State != LifecycleInteractionRequired {
+				t.Fatalf("Login() error = %#v, want %s", errLogin, test.wantCode)
+			}
+			if credential.LifecycleState != LifecycleInteractionRequired || credential.LifecycleReason != test.wantCode {
+				t.Fatalf("credential lifecycle = %q/%q", credential.LifecycleState, credential.LifecycleReason)
+			}
+			fixture.mu.Lock()
+			passwordCalls := fixture.passwordCalls
+			mfaVerifyCalls := fixture.mfaVerifyCalls
+			fixture.mu.Unlock()
+			if passwordCalls != 0 || mfaVerifyCalls != 0 {
+				t.Fatalf("password/MFA calls = %d/%d, want 0/0", passwordCalls, mfaVerifyCalls)
+			}
+		})
+	}
+}
+
+func TestServiceLoginPermanentAccountErrorPrecedesInitialMFA(t *testing.T) {
+	fixture := newLoginFixture(t, http.StatusOK, "")
+	fixture.authorizeResponseBody = `{
+		"error":{"code":"account_deactivated","message":"deleted or deactivated"},
+		"continue_url":"/mfa-challenge/totp-factor",
+		"page":{"type":"mfa_challenge","payload":{
+			"factors":[{"factor_type":"totp","id":"totp-factor"}]
+		}}
+	}`
+	service := NewService(fixture.options(time.Date(2026, time.July, 20, 12, 0, 0, 0, time.UTC)))
+	credential, err := service.Login(t.Context(), LoginInput{
+		Email:      "person@example.com",
+		Password:   "correct-password",
+		TOTPSecret: "JBSWY3DPEHPK3PXP",
+	})
+	if err == nil {
+		t.Fatal("Login() succeeded, want permanent account failure")
+	}
+	authError, ok := AsAuthError(err)
+	if !ok || authError.Code != "account_deactivated" || authError.State != LifecycleDead {
+		t.Fatalf("Login() error = %#v", err)
+	}
+	if credential.LifecycleState != LifecycleDead {
+		t.Fatalf("credential lifecycle = %q", credential.LifecycleState)
+	}
+	fixture.mu.Lock()
+	mfaVerifyCalls := fixture.mfaVerifyCalls
+	fixture.mu.Unlock()
+	if mfaVerifyCalls != 0 {
+		t.Fatalf("MFA verify calls = %d, want 0", mfaVerifyCalls)
+	}
+}
+
 func TestServiceLoginTOTPFailureClassifications(t *testing.T) {
 	const challenge = `{
 		"continue_url":"/mfa-challenge/totp-factor",
@@ -600,6 +1266,7 @@ func TestServiceLoginTOTPFailureClassifications(t *testing.T) {
 		{name: "missing secret", wantCode: "totp_required", wantState: LifecycleInteractionRequired},
 		{name: "invalid local secret", secret: "not-base32!", wantCode: "invalid_totp_secret", wantState: LifecycleReauthRequired},
 		{name: "rejected code", secret: "JBSWY3DPEHPK3PXP", mfaStatus: http.StatusBadRequest, mfaBody: `{"error":{"code":"invalid_code"}}`, wantCode: "invalid_totp", wantState: LifecycleReauthRequired, wantCalls: 1},
+		{name: "permanent account error in success envelope", secret: "JBSWY3DPEHPK3PXP", mfaBody: `{"error":{"code":"account_deactivated","message":"deleted or deactivated"},"continue_url":"/mfa-challenge/totp-factor","page":{"type":"mfa_challenge"}}`, wantCode: "account_deactivated", wantState: LifecycleDead, wantCalls: 1},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -642,6 +1309,90 @@ func TestUnsupportedMFAFactorRequiresInteraction(t *testing.T) {
 	})
 	if authError.Code != "passkey_required" || authError.State != LifecycleInteractionRequired {
 		t.Fatalf("unsupportedMFAError() = %#v", authError)
+	}
+}
+
+func TestSelectMFAFactorAcceptsAlternateFactorLists(t *testing.T) {
+	tests := []struct {
+		name      string
+		payload   map[string]any
+		wantID    string
+		wantReqID string
+	}{
+		{
+			name: "mfa factors with type alias",
+			payload: map[string]any{
+				"mfa_request_id": "top-request",
+				"mfa_factors": []any{map[string]any{
+					"type": "totp",
+					"id":   "mfa-factor",
+				}},
+			},
+			wantID:    "mfa-factor",
+			wantReqID: "top-request",
+		},
+		{
+			name: "authenticator factor type",
+			payload: map[string]any{
+				"mfa_request_id": "authenticator-request",
+				"factors": []any{map[string]any{
+					"factor_type": "authenticator",
+					"factor_id":   "authenticator-factor",
+				}},
+			},
+			wantID:    "authenticator-factor",
+			wantReqID: "authenticator-request",
+		},
+		{
+			name: "challenge factors with metadata request",
+			payload: map[string]any{
+				"mfa_challenge_factors": []any{map[string]any{
+					"factor_type": "totp",
+					"factor_id":   "challenge-factor",
+					"metadata":    map[string]any{"mfa_request_id": "metadata-request"},
+				}},
+			},
+			wantID:    "challenge-factor",
+			wantReqID: "metadata-request",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			factorID, requestID := selectMFAFactor(test.payload, "totp")
+			if factorID != test.wantID || requestID != test.wantReqID {
+				t.Fatalf("selectMFAFactor() = (%q, %q), want (%q, %q)", factorID, requestID, test.wantID, test.wantReqID)
+			}
+		})
+	}
+}
+
+func TestMFAChallengeFromURLNormalizesFactorType(t *testing.T) {
+	envelope, ok := mfaChallengeFromURL("https://auth.openai.com/mfa-challenge/factor-id?factor_type=authenticator&mfa_request_id=request-id")
+	if !ok {
+		t.Fatal("mfaChallengeFromURL() did not recognize challenge URL")
+	}
+	if factorType := stringValue(envelope.Payload["factor_type"]); factorType != "totp" {
+		t.Fatalf("factor type = %q, want totp", factorType)
+	}
+	factorID, requestID := selectMFAFactor(envelope.Payload, "totp")
+	if factorID != "factor-id" || requestID != "request-id" {
+		t.Fatalf("selectMFAFactor() = (%q, %q)", factorID, requestID)
+	}
+}
+
+func TestSelectMFAFactorKeepsFactorAndRequestFromSameCandidate(t *testing.T) {
+	factorID, requestID := selectMFAFactor(map[string]any{
+		"mfa_request_id": "page-request",
+		"oai-client-auth-session": map[string]any{
+			"mfa_request_id": "session-request",
+			"mfa_factors": []any{map[string]any{
+				"type": "totp",
+				"id":   "session-factor",
+			}},
+		},
+	}, "totp")
+	if factorID != "session-factor" || requestID != "session-request" {
+		t.Fatalf("selectMFAFactor() = (%q, %q)", factorID, requestID)
 	}
 }
 
@@ -855,6 +1606,8 @@ func TestDeletedOrDeactivatedTextIsPermanent(t *testing.T) {
 	for _, body := range []string{
 		`<html>This account was deleted or deactivated.</html>`,
 		`You do not have an account because it has been deleted.`,
+		`account_deactivated`,
+		`account_deleted`,
 	} {
 		authError := classifyHTTPResponse("password_verify", http.StatusForbidden, []byte(body), LifecycleLoginPending)
 		if authError == nil || authError.State != LifecycleDead || !authError.Terminal {
@@ -868,6 +1621,87 @@ func TestDeletedOrDeactivatedTextIsPermanent(t *testing.T) {
 	authError = classifyHTTPResponse("token_refresh", http.StatusServiceUnavailable, []byte(`{"error":"account_deactivated","error_description":"secret-value"}`), LifecycleActive)
 	if authError == nil || authError.State != LifecycleDead || authError.Retryable || strings.Contains(authError.Error(), "secret-value") {
 		t.Fatalf("classifyHTTPResponse(503 deactivated) = %#v, want safe permanent dead", authError)
+	}
+}
+
+func TestSuccessfulAuthorizePageDoesNotScanPermanentErrorHelpText(t *testing.T) {
+	for _, payload := range [][]byte{
+		[]byte(`<html><body>Contact support if your account was deleted or deactivated.</body></html>`),
+		[]byte(`{"message":"Accounts can be deleted or deactivated from settings","page":{"type":"login_password"}}`),
+	} {
+		if authError := classifyPermanentAccountPayload(payload); authError != nil {
+			t.Fatalf("classifyPermanentAccountPayload() = %#v", authError)
+		}
+	}
+	authError := classifyPermanentAccountPayload([]byte(`{"error":{"code":"account_deactivated","message":"account disabled"}}`))
+	if authError == nil || authError.State != LifecycleDead || authError.Code != "account_deactivated" {
+		t.Fatalf("structured permanent error = %#v", authError)
+	}
+	authError = classifyPermanentAccountPayload([]byte(`{"error":{"message":"This account was deleted or deactivated."}}`))
+	if authError == nil || authError.State != LifecycleDead || authError.Code != "account_deactivated" {
+		t.Fatalf("message-only structured permanent error = %#v", authError)
+	}
+	for _, test := range []struct {
+		name     string
+		payload  string
+		wantCode string
+	}{
+		{name: "top-level deactivated", payload: `{"error":{"message":"Your account has been deactivated"}}`, wantCode: "account_deactivated"},
+		{name: "page deactivated", payload: `{"page":{"type":"error","payload":{"message":"This account was deactivated"}}}`, wantCode: "account_deactivated"},
+		{name: "page deleted", payload: `{"page":{"type":"error","payload":{"message":"This account was deleted"}}}`, wantCode: "account_deleted"},
+		{name: "page errors array deactivated", payload: `{"page":{"type":"error","payload":{"errors":[{"code":"account_deactivated"}]}}}`, wantCode: "account_deactivated"},
+		{name: "page errors array deleted message", payload: `{"page":{"type":"error","payload":{"errors":[{"message":"This account was deleted"}]}}}`, wantCode: "account_deleted"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			authError := classifyPermanentAccountPayload([]byte(test.payload))
+			if authError == nil || authError.State != LifecycleDead || authError.Code != test.wantCode {
+				t.Fatalf("classifyPermanentAccountPayload() = %#v, want %s dead", authError, test.wantCode)
+			}
+		})
+	}
+	if authError := classifyPermanentAccountPayload([]byte(`{"message":"Your account has been deactivated"}`)); authError != nil {
+		t.Fatalf("generic message classified as permanent error: %#v", authError)
+	}
+}
+
+func TestStructuredPermanentAccountCodePrecedesAmbiguousMessage(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		code     string
+		message  string
+		wantCode string
+	}{
+		{name: "deleted code", code: "account_deleted", message: "deleted or deactivated", wantCode: "account_deleted"},
+		{name: "deactivated code", code: "account_deactivated", message: "account was deleted", wantCode: "account_deactivated"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			payload := []byte(fmt.Sprintf(`{"error":{"code":%q,"message":%q}}`, test.code, test.message))
+			for name, authError := range map[string]*AuthError{
+				"success payload": classifyPermanentAccountPayload(payload),
+				"HTTP error":      classifyHTTPResponse("password_verify", http.StatusForbidden, payload, LifecycleLoginPending),
+			} {
+				if authError == nil || authError.Code != test.wantCode || authError.State != LifecycleDead {
+					t.Fatalf("%s classification = %#v, want %s dead", name, authError, test.wantCode)
+				}
+			}
+		})
+	}
+
+	nested := []byte(`{"page":{"type":"error","payload":{"code":"account_deleted","message":"account unavailable"}}}`)
+	authError := classifyHTTPResponse("password_verify", http.StatusForbidden, nested, LifecycleLoginPending)
+	if authError == nil || authError.Code != "account_deleted" || authError.State != LifecycleDead || authError.StatusCode != http.StatusForbidden {
+		t.Fatalf("nested permanent HTTP classification = %#v, want account_deleted dead with status 403", authError)
+	}
+}
+
+func TestStructuredPermanentAccountCodeOnNonErrorPageIsPermanent(t *testing.T) {
+	authError := classifyPermanentAccountPayload([]byte(`{
+		"page":{"type":"mfa_challenge","payload":{
+			"error":{"code":"account_deactivated","message":"account unavailable"}
+		}}
+	}`))
+	if authError == nil || authError.Code != "account_deactivated" || authError.State != LifecycleDead {
+		t.Fatalf("classification = %#v, want account_deactivated dead", authError)
 	}
 }
 

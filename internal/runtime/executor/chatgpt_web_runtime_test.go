@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -792,6 +793,8 @@ func newChatGPTWebImageFixture(t *testing.T) *httptest.Server {
 	t.Helper()
 	imageData := chatGPTWebPNGBytes(t, color.NRGBA{R: 255, A: 255})
 	var server *httptest.Server
+	var mu sync.Mutex
+	turnMessageID := ""
 	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
 		switch request.URL.Path {
 		case "/":
@@ -803,22 +806,26 @@ func newChatGPTWebImageFixture(t *testing.T) *httptest.Server {
 		case "/backend-api/f/conversation/prepare":
 			_ = json.NewEncoder(w).Encode(map[string]any{"conduit_token": "conduit"})
 		case "/backend-api/f/conversation":
+			var body struct {
+				Messages []struct {
+					ID string `json:"id"`
+				} `json:"messages"`
+			}
+			if err := json.NewDecoder(request.Body).Decode(&body); err != nil {
+				t.Errorf("decode image conversation request: %v", err)
+			} else if len(body.Messages) > 0 {
+				mu.Lock()
+				turnMessageID = body.Messages[0].ID
+				mu.Unlock()
+			}
 			w.Header().Set("Content-Type", "text/event-stream")
 			_, _ = io.WriteString(w, "data: {\"conversation_id\":\"image-conversation\",\"message\":{\"author\":{\"role\":\"tool\"},\"metadata\":{\"async_task_type\":\"image_gen\"},\"content\":{\"parts\":[{\"asset_pointer\":\"file-service://generated-image\"}]}}}\n\n")
 			_, _ = io.WriteString(w, "data: [DONE]\n\n")
 		case "/backend-api/conversation/image-conversation":
-			_ = json.NewEncoder(w).Encode(map[string]any{"mapping": map[string]any{
-				"generated": map[string]any{"message": map[string]any{
-					"author":      map[string]any{"role": "tool"},
-					"create_time": 1,
-					"metadata": map[string]any{
-						"async_task_type": "image_gen",
-						"finish_details":  map[string]any{"type": "finished_successfully"},
-						"is_complete":     true,
-					},
-					"content": map[string]any{"parts": []any{map[string]any{"asset_pointer": "file-service://generated-image"}}},
-				}},
-			}})
+			mu.Lock()
+			currentTurnMessageID := turnMessageID
+			mu.Unlock()
+			writeChatGPTWebImageConversationForTurn(w, currentTurnMessageID, true, "generated-image")
 		case "/backend-api/files/generated-image/download":
 			_ = json.NewEncoder(w).Encode(map[string]any{"download_url": server.URL + "/signed-image"})
 		case "/signed-image":
@@ -855,6 +862,8 @@ func disableChatGPTWebImagePollWaits(executor *ChatGPTWebExecutor) {
 		return
 	}
 	executor.imageInitialWait = 0
-	executor.imagePollInterval = 0
-	executor.imageSettleWait = 0
+	// Async task polling needs one scheduler window to deliver completed
+	// requests without turning tests into a busy loop.
+	executor.imagePollInterval = 10 * time.Millisecond
+	executor.imageSettleWait = 10 * time.Millisecond
 }

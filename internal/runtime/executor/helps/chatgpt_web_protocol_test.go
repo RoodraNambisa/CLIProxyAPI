@@ -758,7 +758,7 @@ func TestChatGPTWebImageAccumulatorCapturesPatchRegardlessOfOperationOrder(t *te
 	}
 }
 
-func TestChatGPTWebImageAccumulatorCapturesExplicitStreamTerminalStates(t *testing.T) {
+func TestChatGPTWebImageAccumulatorCapturesExplicitMessageTerminalStates(t *testing.T) {
 	tests := []struct {
 		name          string
 		payload       string
@@ -799,7 +799,7 @@ func TestChatGPTWebImageAccumulatorCapturesExplicitStreamTerminalStates(t *testi
 				t.Fatalf("Apply() error = %v", err)
 			}
 			if done {
-				t.Fatal("explicit terminal event was treated as the SSE [DONE] marker")
+				t.Fatal("single image message ended the complete image SSE phase")
 			}
 			if !accumulator.Terminal || accumulator.FailureStatus != test.wantFailure {
 				t.Fatalf("terminal state = (%t, %q)", accumulator.Terminal, accumulator.FailureStatus)
@@ -808,6 +808,150 @@ func TestChatGPTWebImageAccumulatorCapturesExplicitStreamTerminalStates(t *testi
 				t.Fatalf("file IDs = %v", accumulator.FileIDs)
 			}
 		})
+	}
+}
+
+func TestChatGPTWebImageAccumulatorWaitsForStreamTerminalAcrossImageMessages(t *testing.T) {
+	accumulator := &ChatGPTWebImageAccumulator{}
+	for _, payload := range []string{
+		`{"message":{"author":{"role":"tool"},"metadata":{"async_task_type":"image_gen","finish_details":{"type":"finished_successfully"},"is_complete":true},"content":{"parts":["file-service://first"]}}}`,
+		`{"message":{"author":{"role":"tool"},"metadata":{"async_task_type":"image_gen","finish_details":{"type":"finished_successfully"},"is_complete":true},"content":{"parts":["file-service://second"]}}}`,
+	} {
+		done, err := accumulator.Apply([]byte(payload))
+		if err != nil || done {
+			t.Fatalf("Apply() = done %t, error %v", done, err)
+		}
+	}
+	done, err := accumulator.Apply([]byte(`[DONE]`))
+	if err != nil || !done {
+		t.Fatalf("terminal Apply() = done %t, error %v", done, err)
+	}
+	if !reflect.DeepEqual(accumulator.FileIDs, []string{"first", "second"}) {
+		t.Fatalf("file IDs = %v", accumulator.FileIDs)
+	}
+}
+
+func TestChatGPTWebImageAccumulatorCapturesUnmarkedFailuresOnly(t *testing.T) {
+	tests := []struct {
+		name        string
+		payload     string
+		wantFailure string
+	}{
+		{
+			name:        "explicit error",
+			payload:     `{"message":{"author":{"role":"assistant"},"is_error":true,"content":{"content_type":"text","parts":["image request failed"]}}}`,
+			wantFailure: "image request failed",
+		},
+		{
+			name:        "terminal rejection",
+			payload:     `{"message":{"author":{"role":"assistant"},"end_turn":true,"content":{"content_type":"text","parts":["This image request was blocked"]}}}`,
+			wantFailure: "This image request was blocked",
+		},
+		{
+			name:        "terminal failure status",
+			payload:     `{"message":{"author":{"role":"assistant"},"metadata":{"status":"finished_with_error"},"content":{"content_type":"text","parts":[]}}}`,
+			wantFailure: "finished_with_error",
+		},
+		{
+			name:    "ordinary terminal text",
+			payload: `{"message":{"author":{"role":"assistant"},"end_turn":true,"content":{"content_type":"text","parts":["The request completed normally."]}}}`,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			accumulator := &ChatGPTWebImageAccumulator{}
+			done, err := accumulator.Apply([]byte(test.payload))
+			if err != nil || done {
+				t.Fatalf("Apply() = done %t, error %v", done, err)
+			}
+			if !accumulator.Terminal || accumulator.FailureStatus != test.wantFailure {
+				t.Fatalf("terminal state = (%t, %q), want failure %q", accumulator.Terminal, accumulator.FailureStatus, test.wantFailure)
+			}
+		})
+	}
+}
+
+func TestChatGPTWebImageAccumulatorCapturesEmptyAssistantTerminal(t *testing.T) {
+	accumulator := &ChatGPTWebImageAccumulator{}
+	for _, payload := range []string{
+		`{"message":{"author":{"role":"tool"},"metadata":{"async_task_type":"image_gen"},"content":{"parts":["file-service://generated"]}}}`,
+		`{"message":{"author":{"role":"assistant"},"end_turn":true,"content":{"content_type":"text","parts":[]}}}`,
+	} {
+		if done, err := accumulator.Apply([]byte(payload)); err != nil || done {
+			t.Fatalf("Apply() = done %t, error %v", done, err)
+		}
+	}
+	if !accumulator.Terminal || accumulator.FailureStatus != "" {
+		t.Fatalf("terminal state = (%t, %q)", accumulator.Terminal, accumulator.FailureStatus)
+	}
+	if !reflect.DeepEqual(accumulator.FileIDs, []string{"generated"}) {
+		t.Fatalf("file IDs = %v", accumulator.FileIDs)
+	}
+}
+
+func TestChatGPTWebImageAccumulatorStopsAtStreamComplete(t *testing.T) {
+	accumulator := &ChatGPTWebImageAccumulator{ConversationID: "conversation"}
+	done, err := accumulator.Apply([]byte(`{"type":"message_stream_complete"}`))
+	if err != nil {
+		t.Fatalf("Apply() error = %v", err)
+	}
+	if !done {
+		t.Fatal("message_stream_complete did not end the image SSE phase")
+	}
+	if accumulator.Terminal {
+		t.Fatal("stream completion was treated as image task completion")
+	}
+}
+
+func TestChatGPTWebImageAccumulatorClassifiesOuterFailureEvents(t *testing.T) {
+	tests := []struct {
+		name    string
+		payload string
+		want    string
+	}{
+		{
+			name:    "response failed",
+			payload: `{"type":"response.failed","response":{"error":{"message":"image policy rejected"}}}`,
+			want:    "image policy rejected",
+		},
+		{
+			name:    "response incomplete",
+			payload: `{"type":"response.incomplete","response":{"incomplete_details":{"reason":"max_output_tokens"}}}`,
+			want:    "max_output_tokens",
+		},
+		{
+			name:    "moderation blocked",
+			payload: `{"type":"moderation","moderation_response":{"blocked":true,"reason":"safety policy"}}`,
+			want:    "safety policy",
+		},
+		{
+			name:    "stream completion with nested response error",
+			payload: `{"type":"message_stream_complete","response":{"error":{"message":"image generation failed"}}}`,
+			want:    "image generation failed",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := (&ChatGPTWebImageAccumulator{}).Apply([]byte(test.payload))
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("Apply() error = %v, want detail %q", err, test.want)
+			}
+		})
+	}
+}
+
+func TestChatGPTWebImageAccumulatorIgnoresFalseOuterFailure(t *testing.T) {
+	accumulator := &ChatGPTWebImageAccumulator{}
+	for _, payload := range []string{
+		`{"error":false}`,
+		`{"error":""}`,
+		`{"error":{}}`,
+		`{"error":[]}`,
+		`{"type":"moderation","moderation_response":{"blocked":false}}`,
+	} {
+		if _, err := accumulator.Apply([]byte(payload)); err != nil {
+			t.Fatalf("Apply(%s) error = %v", payload, err)
+		}
 	}
 }
 
@@ -826,6 +970,51 @@ func TestChatGPTWebImageAccumulatorIgnoresReferenceText(t *testing.T) {
 	}
 	if !reflect.DeepEqual(accumulator.FileIDs, []string{"real-output"}) || len(accumulator.SedimentIDs) != 0 {
 		t.Fatalf("captured references = files %v sediment %v", accumulator.FileIDs, accumulator.SedimentIDs)
+	}
+}
+
+func TestChatGPTWebImageAccumulatorCapturesExactStringReferences(t *testing.T) {
+	accumulator := &ChatGPTWebImageAccumulator{}
+	payload := []byte(`{"message":{
+		"author":{"role":"tool"},
+		"metadata":{"async_task_type":"image_gen"},
+		"content":{"parts":["file-service://file-output","sediment://sediment-output"]}
+	}}`)
+	if _, err := accumulator.Apply(payload); err != nil {
+		t.Fatalf("Apply() error = %v", err)
+	}
+	want := []ChatGPTWebImageReference{{Kind: "file", ID: "file-output"}, {Kind: "sediment", ID: "sediment-output"}}
+	if !reflect.DeepEqual(accumulator.References, want) {
+		t.Fatalf("references = %#v, want %#v", accumulator.References, want)
+	}
+}
+
+func TestChatGPTWebImageAccumulatorIgnoresUnstructuredAssistantReference(t *testing.T) {
+	accumulator := &ChatGPTWebImageAccumulator{}
+	payload := []byte(`{"message":{
+		"author":{"role":"assistant"},
+		"content":{"content_type":"text","parts":["file-service://not-an-image-output"]}
+	}}`)
+	if _, err := accumulator.Apply(payload); err != nil {
+		t.Fatalf("Apply() error = %v", err)
+	}
+	if len(accumulator.References) != 0 {
+		t.Fatalf("assistant text references = %#v", accumulator.References)
+	}
+}
+
+func TestChatGPTWebImageAccumulatorIgnoresMetadataReferenceText(t *testing.T) {
+	accumulator := &ChatGPTWebImageAccumulator{}
+	payload := []byte(`{"message":{
+		"author":{"role":"tool"},
+		"metadata":{"async_task_type":"image_gen","diagnostic":"file-service://not-an-image-output"},
+		"content":{"parts":[]}
+	}}`)
+	if _, err := accumulator.Apply(payload); err != nil {
+		t.Fatalf("Apply() error = %v", err)
+	}
+	if len(accumulator.References) != 0 {
+		t.Fatalf("metadata references = %#v", accumulator.References)
 	}
 }
 
@@ -875,6 +1064,19 @@ func TestCaptureChatGPTWebImageConversationUsesExplicitOutputs(t *testing.T) {
 	}
 }
 
+func TestCaptureChatGPTWebImageConversationRecognizesStringPointers(t *testing.T) {
+	payload := []byte(`{"mapping":{
+		"image":{"message":{"author":{"role":"tool"},"metadata":{"is_complete":true,"finish_details":{"type":"finished_successfully"}},"content":{"content_type":"multimodal_text","parts":["file-service://first","sediment://second"]}}}
+	}}`)
+	accumulator := &ChatGPTWebImageAccumulator{}
+	if err := CaptureChatGPTWebImageConversation(payload, accumulator); err != nil {
+		t.Fatalf("CaptureChatGPTWebImageConversation() error = %v", err)
+	}
+	if !reflect.DeepEqual(accumulator.FileIDs, []string{"first"}) || !reflect.DeepEqual(accumulator.SedimentIDs, []string{"second"}) {
+		t.Fatalf("captured IDs = files %v sediment %v", accumulator.FileIDs, accumulator.SedimentIDs)
+	}
+}
+
 func TestCaptureChatGPTWebImageConversationDetectsStructuredTerminalState(t *testing.T) {
 	accumulator := &ChatGPTWebImageAccumulator{}
 	err := CaptureChatGPTWebImageConversation([]byte(`{
@@ -895,6 +1097,415 @@ func TestCaptureChatGPTWebImageConversationDetectsStructuredTerminalState(t *tes
 	}
 	if !accumulator.Terminal {
 		t.Fatal("structured terminal state was not detected")
+	}
+}
+
+func TestCaptureChatGPTWebImageTasksFiltersConversationAndCapturesCompletedOutput(t *testing.T) {
+	payload := []byte(`{"tasks":[
+		{"conversation_id":"other","status":"completed","image_gen_message":{"author":{"role":"tool"},"metadata":{"async_task_type":"image_gen"},"content":{"parts":[{"asset_pointer":"file-service://wrong"}]}}},
+		{"original_conversation_id":"target","status":"completed","image_gen_message":{"author":{"role":"tool"},"status":"finished_successfully","metadata":{"async_task_type":"image_gen"},"content":{"parts":[{"asset_pointer":"file-service://generated"},{"asset_pointer":"sediment://asset"}]}}}
+	]}`)
+	accumulator := &ChatGPTWebImageAccumulator{}
+	state, err := CaptureChatGPTWebImageTasks(payload, "target", accumulator)
+	if err != nil {
+		t.Fatalf("CaptureChatGPTWebImageTasks() error = %v", err)
+	}
+	if !state.AllTerminal() || !accumulator.Terminal {
+		t.Fatalf("task state = %+v, terminal %t", state, accumulator.Terminal)
+	}
+	if !reflect.DeepEqual(accumulator.FileIDs, []string{"generated"}) || !reflect.DeepEqual(accumulator.SedimentIDs, []string{"asset"}) {
+		t.Fatalf("captured task IDs = files %v sediment %v", accumulator.FileIDs, accumulator.SedimentIDs)
+	}
+}
+
+func TestCaptureChatGPTWebImageTasksCapturesFailure(t *testing.T) {
+	payload := []byte(`{"tasks":[{"conversation_id":"target","status":"failed","image_gen_message":{"author":{"role":"tool"},"metadata":{"async_task_type":"image_gen"},"content":{"parts":[]}}}]}`)
+	accumulator := &ChatGPTWebImageAccumulator{}
+	state, err := CaptureChatGPTWebImageTasks(payload, "target", accumulator)
+	if err != nil {
+		t.Fatalf("CaptureChatGPTWebImageTasks() error = %v", err)
+	}
+	if !state.AllTerminal() || !accumulator.Terminal || accumulator.FailureStatus != "failed" {
+		t.Fatalf("task state = %+v, terminal %t, failure %q", state, accumulator.Terminal, accumulator.FailureStatus)
+	}
+}
+
+func TestCaptureChatGPTWebImageTasksReplacesPreviousSnapshot(t *testing.T) {
+	accumulator := &ChatGPTWebImageAccumulator{}
+	state, err := CaptureChatGPTWebImageTasks([]byte(`{"tasks":[{
+		"conversation_id":"target","status":"failed",
+		"image_gen_message":{"author":{"role":"tool"},"metadata":{"async_task_type":"image_gen"},"content":{"parts":[{"asset_pointer":"file-service://old-output"}]}}
+	}]}`), "target", accumulator)
+	if err != nil || !state.AllTerminal() || !accumulator.Terminal || accumulator.FailureStatus == "" {
+		t.Fatalf("initial snapshot = state %+v, accumulator %+v, error %v", state, accumulator, err)
+	}
+	state, err = CaptureChatGPTWebImageTasks([]byte(`{"tasks":[{
+		"conversation_id":"target","status":"running",
+		"image_gen_message":{"author":{"role":"tool"},"metadata":{"async_task_type":"image_gen"},"content":{"parts":[]}}
+	}]}`), "target", accumulator)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !state.HasPending() || accumulator.Terminal || accumulator.FailureStatus != "" || len(accumulator.References) != 0 {
+		t.Fatalf("replacement snapshot = state %+v, accumulator %+v", state, accumulator)
+	}
+}
+
+func TestCaptureChatGPTWebImageTasksRecognizesConversationFailureStatuses(t *testing.T) {
+	for _, status := range []string{"content_filter", "max_tokens", "max_output_tokens", "expired", "interrupted", "incomplete"} {
+		t.Run(status, func(t *testing.T) {
+			payload := []byte(fmt.Sprintf(`{"tasks":[{"conversation_id":"target","type":"image_gen","status":%q}]}`, status))
+			accumulator := &ChatGPTWebImageAccumulator{}
+			state, err := CaptureChatGPTWebImageTasks(payload, "target", accumulator)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !state.AllTerminal() || !accumulator.Terminal || accumulator.FailureStatus != status {
+				t.Fatalf("task state = %+v, terminal %t, failure %q", state, accumulator.Terminal, accumulator.FailureStatus)
+			}
+		})
+	}
+}
+
+func TestCaptureChatGPTWebImageTasksIgnoresNonImageTasks(t *testing.T) {
+	payload := []byte(`{"tasks":[
+		{"conversation_id":"target","type":"file_upload","status":"running"},
+		{"conversation_id":"target","type":"other","status":"failed"},
+		{"conversation_id":"target","status":"completed","image_gen_message":{
+			"author":{"role":"tool"},
+			"metadata":{"async_task_type":"image_gen"},
+			"content":{"parts":[{"asset_pointer":"file-service://generated"}]}
+		}}
+	]}`)
+	accumulator := &ChatGPTWebImageAccumulator{}
+	state, err := CaptureChatGPTWebImageTasks(payload, "target", accumulator)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.Matched != 1 || state.Terminal != 1 || !accumulator.Terminal {
+		t.Fatalf("task state = %+v, terminal %t", state, accumulator.Terminal)
+	}
+	if !reflect.DeepEqual(accumulator.FileIDs, []string{"generated"}) || accumulator.FailureStatus != "" {
+		t.Fatalf("image snapshot = files %v, failure %q", accumulator.FileIDs, accumulator.FailureStatus)
+	}
+}
+
+func TestCaptureChatGPTWebImageTasksCapturesBareReferenceIDs(t *testing.T) {
+	payload := []byte(`{"tasks":[{"conversation_id":"target","status":"completed","image_gen_message":{
+		"author":{"role":"tool"},
+		"metadata":{"async_task_type":"image_gen"},
+		"content":{"parts":[{"file_id":"raw-file","image_id":"raw-image","sediment_id":"raw-sediment"}]}
+	}}]}`)
+	accumulator := &ChatGPTWebImageAccumulator{}
+	state, err := CaptureChatGPTWebImageTasks(payload, "target", accumulator)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !state.AllTerminal() || !reflect.DeepEqual(accumulator.FileIDs, []string{"raw-file", "raw-image"}) ||
+		!reflect.DeepEqual(accumulator.SedimentIDs, []string{"raw-sediment"}) {
+		t.Fatalf("task state = %+v, files %v, sediments %v", state, accumulator.FileIDs, accumulator.SedimentIDs)
+	}
+}
+
+func TestCaptureChatGPTWebImageTasksCapturesStructuredMessageFailure(t *testing.T) {
+	payload := []byte(`{"tasks":[{"conversation_id":"target","status":"completed","image_gen_message":{
+		"author":{"role":"assistant"},
+		"metadata":{"async_task_type":"image_gen","is_error":true},
+		"content":{"content_type":"text","parts":["Your request was blocked"]}
+	}}]}`)
+	accumulator := &ChatGPTWebImageAccumulator{}
+	state, err := CaptureChatGPTWebImageTasks(payload, "target", accumulator)
+	if err != nil {
+		t.Fatalf("CaptureChatGPTWebImageTasks() error = %v", err)
+	}
+	if !state.AllTerminal() || !accumulator.Terminal || accumulator.FailureStatus != "Your request was blocked" {
+		t.Fatalf("task state = %+v, terminal %t, failure %q", state, accumulator.Terminal, accumulator.FailureStatus)
+	}
+}
+
+func TestCaptureChatGPTWebImageTasksTreatsTerminalAssistantTextAsSuccess(t *testing.T) {
+	payload := []byte(`{"tasks":[{"conversation_id":"target","status":"completed","image_gen_message":{
+		"author":{"role":"assistant"},
+		"metadata":{"async_task_type":"image_gen"},
+		"end_turn":true,
+		"content":{"content_type":"text","parts":["The image has been generated."]}
+	}}]}`)
+	accumulator := &ChatGPTWebImageAccumulator{}
+	state, err := CaptureChatGPTWebImageTasks(payload, "target", accumulator)
+	if err != nil {
+		t.Fatalf("CaptureChatGPTWebImageTasks() error = %v", err)
+	}
+	if !state.AllTerminal() || !accumulator.Terminal || accumulator.FailureStatus != "" {
+		t.Fatalf("task state = %+v, terminal %t, failure %q", state, accumulator.Terminal, accumulator.FailureStatus)
+	}
+}
+
+func TestCaptureChatGPTWebImageTasksPrefersSpecificMessageFailure(t *testing.T) {
+	payload := []byte(`{"tasks":[{"conversation_id":"target","status":"failed","image_gen_message":{
+		"author":{"role":"assistant"},
+		"metadata":{"async_task_type":"image_gen","is_error":true},
+		"content":{"content_type":"text","parts":["image request rejected by policy"]}
+	}}]}`)
+	accumulator := &ChatGPTWebImageAccumulator{}
+	state, err := CaptureChatGPTWebImageTasks(payload, "target", accumulator)
+	if err != nil {
+		t.Fatalf("CaptureChatGPTWebImageTasks() error = %v", err)
+	}
+	if !state.AllTerminal() || accumulator.FailureStatus != "image request rejected by policy" {
+		t.Fatalf("task state = %+v, failure %q", state, accumulator.FailureStatus)
+	}
+}
+
+func TestCaptureChatGPTWebImageTasksPrefersSpecificFailureRegardlessOfTaskOrder(t *testing.T) {
+	generic := `{"conversation_id":"target","status":"completed","image_gen_message":{"author":{"role":"tool"},"metadata":{"async_task_type":"image_gen","is_error":true},"content":{"parts":[]}}}`
+	specific := `{"conversation_id":"target","status":"failed","image_gen_message":{"author":{"role":"assistant"},"metadata":{"async_task_type":"image_gen","is_error":true},"content":{"content_type":"text","parts":["image request rejected by policy"]}}}`
+	for _, tasks := range []string{generic + "," + specific, specific + "," + generic} {
+		accumulator := &ChatGPTWebImageAccumulator{}
+		state, err := CaptureChatGPTWebImageTasks([]byte(`{"tasks":[`+tasks+`]}`), "target", accumulator)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !state.AllTerminal() || accumulator.FailureStatus != "image request rejected by policy" {
+			t.Fatalf("task state = %+v, failure %q", state, accumulator.FailureStatus)
+		}
+	}
+}
+
+func TestCaptureChatGPTWebImageTasksChoosesStableSpecificFailure(t *testing.T) {
+	alpha := `{"conversation_id":"target","status":"failed","image_gen_message":{"author":{"role":"assistant"},"metadata":{"async_task_type":"image_gen","is_error":true},"content":{"content_type":"text","parts":["alpha policy failure"]}}}`
+	zeta := `{"conversation_id":"target","status":"failed","image_gen_message":{"author":{"role":"assistant"},"metadata":{"async_task_type":"image_gen","is_error":true},"content":{"content_type":"text","parts":["zeta service failure"]}}}`
+	for _, tasks := range []string{alpha + "," + zeta, zeta + "," + alpha} {
+		accumulator := &ChatGPTWebImageAccumulator{}
+		state, err := CaptureChatGPTWebImageTasks([]byte(`{"tasks":[`+tasks+`]}`), "target", accumulator)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !state.AllTerminal() || accumulator.FailureStatus != "alpha policy failure" {
+			t.Fatalf("task state = %+v, failure %q", state, accumulator.FailureStatus)
+		}
+	}
+}
+
+func TestCaptureChatGPTWebImageTasksWaitsForAllMatchingTasks(t *testing.T) {
+	payload := []byte(`{"tasks":[
+		{"conversation_id":"target","status":"completed","image_gen_message":{"author":{"role":"tool"},"metadata":{"async_task_type":"image_gen"},"content":{"parts":[{"asset_pointer":"file-service://first"}]}}},
+		{"conversation_id":"target","type":"image_gen","status":"running"}
+	]}`)
+	accumulator := &ChatGPTWebImageAccumulator{}
+	state, err := CaptureChatGPTWebImageTasks(payload, "target", accumulator)
+	if err != nil {
+		t.Fatalf("CaptureChatGPTWebImageTasks() error = %v", err)
+	}
+	if state.Matched != 2 || state.Terminal != 1 || !state.HasPending() || accumulator.Terminal {
+		t.Fatalf("task state = %+v, accumulator terminal = %t", state, accumulator.Terminal)
+	}
+	if !reflect.DeepEqual(accumulator.FileIDs, []string{"first"}) {
+		t.Fatalf("task outputs = %v", accumulator.FileIDs)
+	}
+}
+
+func TestCaptureChatGPTWebImageTasksKeepsRunningOuterTaskPending(t *testing.T) {
+	payload := []byte(`{"tasks":[{"conversation_id":"target","status":"running","image_gen_message":{
+		"author":{"role":"tool"},
+		"status":"finished_successfully",
+		"metadata":{"async_task_type":"image_gen","is_complete":true,"finish_details":{"type":"finished_successfully"}},
+		"content":{"parts":[{"asset_pointer":"file-service://early-output"}]}
+	}}]}`)
+	accumulator := &ChatGPTWebImageAccumulator{}
+	state, err := CaptureChatGPTWebImageTasks(payload, "target", accumulator)
+	if err != nil {
+		t.Fatalf("CaptureChatGPTWebImageTasks() error = %v", err)
+	}
+	if state.Matched != 1 || state.Terminal != 0 || !state.HasPending() || accumulator.Terminal {
+		t.Fatalf("task state = %+v, accumulator terminal = %t", state, accumulator.Terminal)
+	}
+	if !reflect.DeepEqual(accumulator.FileIDs, []string{"early-output"}) {
+		t.Fatalf("file IDs = %v", accumulator.FileIDs)
+	}
+}
+
+func TestCaptureChatGPTWebImageTasksFiltersHistoricalConversationTasks(t *testing.T) {
+	payload := []byte(`{"tasks":[
+		{"conversation_id":"target","status":"completed","create_time":99,"image_gen_message":{"author":{"role":"tool"},"metadata":{"async_task_type":"image_gen"},"content":{"parts":[{"asset_pointer":"file-service://historical"}]}}},
+		{"conversation_id":"target","status":"completed","parent_message_id":"current-user","create_time":101,"image_gen_message":{"author":{"role":"tool"},"metadata":{"async_task_type":"image_gen"},"content":{"parts":[{"asset_pointer":"file-service://current"}]}}},
+		{"conversation_id":"target","status":"completed","parent_message_id":"other-user","create_time":102,"image_gen_message":{"author":{"role":"tool"},"metadata":{"async_task_type":"image_gen"},"content":{"parts":[{"asset_pointer":"file-service://unrelated"}]}}}
+	]}`)
+	accumulator := &ChatGPTWebImageAccumulator{Turn: ChatGPTWebImageTurn{MessageID: "current-user", CreatedAt: 100}}
+	state, err := CaptureChatGPTWebImageTasks(payload, "target", accumulator)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.Matched != 1 || !state.AllTerminal() {
+		t.Fatalf("task state = %+v", state)
+	}
+	if !reflect.DeepEqual(accumulator.FileIDs, []string{"current"}) {
+		t.Fatalf("file IDs = %v", accumulator.FileIDs)
+	}
+}
+
+func TestCaptureChatGPTWebImageTasksUsesCurrentMessageRelationWithoutTimestamp(t *testing.T) {
+	payload := []byte(`{"tasks":[
+		{"conversation_id":"target","status":"completed","parent_message_id":"old-user","image_gen_message":{"author":{"role":"tool"},"metadata":{"async_task_type":"image_gen"},"content":{"parts":[{"asset_pointer":"file-service://historical"}]}}},
+		{"conversation_id":"target","status":"completed","parent_message_id":"current-user","image_gen_message":{"author":{"role":"tool"},"metadata":{"async_task_type":"image_gen"},"content":{"parts":[{"asset_pointer":"file-service://current-one"},{"asset_pointer":"file-service://current-two"}]}}}
+	]}`)
+	accumulator := &ChatGPTWebImageAccumulator{Turn: ChatGPTWebImageTurn{MessageID: "current-user", CreatedAt: 100}}
+	state, err := CaptureChatGPTWebImageTasks(payload, "target", accumulator)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.Matched != 1 || !reflect.DeepEqual(accumulator.FileIDs, []string{"current-one", "current-two"}) {
+		t.Fatalf("task state = %+v, file IDs = %v", state, accumulator.FileIDs)
+	}
+}
+
+func TestCaptureChatGPTWebImageTasksUsesCreatedAtWithoutMessageID(t *testing.T) {
+	payload := []byte(`{"tasks":[
+		{"conversation_id":"target","status":"completed","parent_message_id":"old-user","create_time":99,"image_gen_message":{"author":{"role":"tool"},"metadata":{"async_task_type":"image_gen"},"content":{"parts":[{"asset_pointer":"file-service://historical"}]}}},
+		{"conversation_id":"target","status":"completed","parent_message_id":"other-user","create_time":101,"image_gen_message":{"author":{"role":"tool"},"metadata":{"async_task_type":"image_gen"},"content":{"parts":[{"asset_pointer":"file-service://current"}]}}}
+	]}`)
+	accumulator := &ChatGPTWebImageAccumulator{Turn: ChatGPTWebImageTurn{CreatedAt: 100}}
+	state, err := CaptureChatGPTWebImageTasks(payload, "target", accumulator)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.Matched != 1 || !state.AllTerminal() || !reflect.DeepEqual(accumulator.FileIDs, []string{"current"}) {
+		t.Fatalf("task state = %+v, file IDs = %v", state, accumulator.FileIDs)
+	}
+}
+
+func TestCaptureChatGPTWebImageTasksUsesEarliestTimeFallbackWithoutRelation(t *testing.T) {
+	payload := []byte(`{"tasks":[
+		{"conversation_id":"target","status":"completed","create_time":101,"image_gen_message":{"author":{"role":"tool"},"metadata":{"async_task_type":"image_gen"},"content":{"parts":[{"asset_pointer":"file-service://current-one"},{"asset_pointer":"file-service://current-two"}]}}},
+		{"conversation_id":"target","status":"completed","create_time":102,"image_gen_message":{"author":{"role":"tool"},"metadata":{"async_task_type":"image_gen"},"content":{"parts":[{"asset_pointer":"file-service://future"}]}}}
+	]}`)
+	accumulator := &ChatGPTWebImageAccumulator{Turn: ChatGPTWebImageTurn{MessageID: "current-user", CreatedAt: 100}}
+	state, err := CaptureChatGPTWebImageTasks(payload, "target", accumulator)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"current-one", "current-two"}
+	if state.Matched != 1 || !state.AllTerminal() || !reflect.DeepEqual(accumulator.FileIDs, want) {
+		t.Fatalf("task state = %+v, file IDs = %v, want %v", state, accumulator.FileIDs, want)
+	}
+}
+
+func TestCaptureChatGPTWebImageTasksUsesOnlyEarliestTimeFallbackBatchWithoutMessageID(t *testing.T) {
+	payload := []byte(`{"tasks":[
+		{"conversation_id":"target","status":"completed","create_time":99,"image_gen_message":{"author":{"role":"tool"},"metadata":{"async_task_type":"image_gen"},"content":{"parts":[{"asset_pointer":"file-service://historical"}]}}},
+		{"conversation_id":"target","status":"completed","create_time":101,"image_gen_message":{"author":{"role":"tool"},"metadata":{"async_task_type":"image_gen"},"content":{"parts":[{"asset_pointer":"file-service://current-one"},{"asset_pointer":"file-service://current-two"}]}}},
+		{"conversation_id":"target","status":"completed","create_time":101,"image_gen_message":{"author":{"role":"tool"},"metadata":{"async_task_type":"image_gen"},"content":{"parts":[{"asset_pointer":"file-service://current-three"}]}}},
+		{"conversation_id":"target","status":"completed","create_time":102,"image_gen_message":{"author":{"role":"tool"},"metadata":{"async_task_type":"image_gen"},"content":{"parts":[{"asset_pointer":"file-service://future"}]}}}
+	]}`)
+	accumulator := &ChatGPTWebImageAccumulator{Turn: ChatGPTWebImageTurn{CreatedAt: 100}}
+	state, err := CaptureChatGPTWebImageTasks(payload, "target", accumulator)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"current-one", "current-two", "current-three"}
+	if state.Matched != 2 || !state.AllTerminal() || !reflect.DeepEqual(accumulator.FileIDs, want) {
+		t.Fatalf("task state = %+v, file IDs = %v, want %v", state, accumulator.FileIDs, want)
+	}
+}
+
+func TestMergeChatGPTWebImageAccumulatorsEnforcesReferenceLimit(t *testing.T) {
+	primary := &ChatGPTWebImageAccumulator{}
+	secondary := &ChatGPTWebImageAccumulator{}
+	for index := 0; index < chatGPTWebMaxImageOutputReferences; index++ {
+		target := primary
+		if index >= chatGPTWebMaxImageOutputReferences/2 {
+			target = secondary
+		}
+		if err := target.appendReference("file", fmt.Sprintf("image-%d", index)); err != nil {
+			t.Fatalf("append reference %d: %v", index, err)
+		}
+	}
+	merged, err := MergeChatGPTWebImageAccumulators(primary, secondary)
+	if err != nil || len(merged.References) != chatGPTWebMaxImageOutputReferences {
+		t.Fatalf("bounded merge = refs %d, err %v", len(merged.References), err)
+	}
+	if err = secondary.appendReference("file", "overflow"); err != nil {
+		t.Fatalf("append overflow source: %v", err)
+	}
+	if _, err = MergeChatGPTWebImageAccumulators(primary, secondary); err == nil {
+		t.Fatal("MergeChatGPTWebImageAccumulators() accepted too many references")
+	}
+}
+
+func TestMergeChatGPTWebImageAccumulatorsPrefersSpecificFailure(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		primary   string
+		secondary string
+	}{
+		{name: "specific arrives second", primary: "failed", secondary: "image request rejected by policy"},
+		{name: "generic arrives second", primary: "image request rejected by policy", secondary: "failed"},
+		{name: "content filter arrives second", primary: "image request rejected by policy", secondary: "content_filter"},
+		{name: "max tokens arrives first", primary: "max_tokens", secondary: "image request rejected by policy"},
+		{name: "incomplete arrives second", primary: "image request rejected by policy", secondary: "incomplete"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			merged, err := MergeChatGPTWebImageAccumulators(
+				&ChatGPTWebImageAccumulator{Terminal: true, FailureStatus: test.primary},
+				&ChatGPTWebImageAccumulator{Terminal: true, FailureStatus: test.secondary},
+			)
+			if err != nil {
+				t.Fatalf("MergeChatGPTWebImageAccumulators() error = %v", err)
+			}
+			if merged.FailureStatus != "image request rejected by policy" {
+				t.Fatalf("failure = %q", merged.FailureStatus)
+			}
+		})
+	}
+}
+
+func TestChatGPTWebImageRejectionTextHonorsWordBoundariesAndNegation(t *testing.T) {
+	for _, test := range []struct {
+		text string
+		want bool
+	}{
+		{text: "The image request was blocked by policy.", want: true},
+		{text: "The image request was denied.", want: true},
+		{text: "The image request is unblocked.", want: false},
+		{text: "The image request was not blocked.", want: false},
+		{text: "The image request wasn't rejected.", want: false},
+	} {
+		if got := chatGPTWebImageRejectionText(test.text); got != test.want {
+			t.Fatalf("chatGPTWebImageRejectionText(%q) = %t, want %t", test.text, got, test.want)
+		}
+	}
+}
+
+func TestChatGPTWebImageRejectionTextScansRepeatedNegationsLinearly(t *testing.T) {
+	detail := strings.Repeat("not blocked ", 2_000) + "blocked"
+	if !chatGPTWebImageRejectionText(detail) {
+		t.Fatal("final unnegated rejection was not detected")
+	}
+}
+
+func TestChatGPTWebImageConversationStateSelectsDeterministicFailure(t *testing.T) {
+	terminal, failure := chatGPTWebImageConversationState(map[string]any{
+		"author":   map[string]any{"role": "assistant"},
+		"end_turn": true,
+		"metadata": map[string]any{
+			"finish_details": map[string]any{"type": "finished_with_error"},
+		},
+		"content": map[string]any{"content_type": "text", "parts": []any{"Something went wrong."}},
+	})
+	if !terminal || failure != "finished_with_error" {
+		t.Fatalf("terminal text with structured failure = (%t, %q)", terminal, failure)
+	}
+
+	message := map[string]any{
+		"status": "failed",
+		"metadata": map[string]any{
+			"finish_details": map[string]any{"type": "content_filter"},
+		},
+	}
+	for iteration := 0; iteration < 100; iteration++ {
+		terminal, failure = chatGPTWebImageConversationState(message)
+		if !terminal || failure != "content_filter" {
+			t.Fatalf("iteration %d: state = (%t, %q)", iteration, terminal, failure)
+		}
 	}
 }
 
@@ -942,6 +1553,570 @@ func TestCaptureChatGPTWebImageConversationIgnoresUnrelatedTerminalMessage(t *te
 		t.Fatal("unrelated terminal message completed the running image task")
 	}
 	if !reflect.DeepEqual(accumulator.FileIDs, []string{"image-one"}) {
+		t.Fatalf("file IDs = %v", accumulator.FileIDs)
+	}
+}
+
+func TestCaptureChatGPTWebImageConversationCapturesCurrentTerminalTextReply(t *testing.T) {
+	accumulator := &ChatGPTWebImageAccumulator{}
+	err := CaptureChatGPTWebImageConversation([]byte(`{
+		"current_node":"rejected",
+		"mapping":{
+			"history":{"message":{
+				"author":{"role":"assistant"},"create_time":1,"end_turn":true,
+				"content":{"content_type":"text","parts":["old answer"]}
+			}},
+			"rejected":{"message":{
+				"author":{"role":"assistant"},"create_time":2,"end_turn":true,
+				"content":{"content_type":"text","parts":["This image request was blocked by our safety system."]}
+			}}
+		}
+	}`), accumulator)
+	if err != nil {
+		t.Fatalf("CaptureChatGPTWebImageConversation() error = %v", err)
+	}
+	if !accumulator.Terminal || accumulator.FailureStatus != "This image request was blocked by our safety system." {
+		t.Fatalf("terminal = %t, failure = %q", accumulator.Terminal, accumulator.FailureStatus)
+	}
+}
+
+func TestCaptureChatGPTWebImageConversationUsesCurrentNodeAncestry(t *testing.T) {
+	accumulator := &ChatGPTWebImageAccumulator{}
+	err := CaptureChatGPTWebImageConversation([]byte(`{
+		"current_node":"rejected",
+		"mapping":{
+			"old-user":{"message":{"author":{"role":"user"},"create_time":1}},
+			"old-image":{"parent":"old-user","message":{
+				"author":{"role":"tool"},"create_time":2,
+				"metadata":{"async_task_type":"image_gen"},
+				"content":{"parts":[{"asset_pointer":"file-service://historical"}]}
+			}},
+			"newer-branch-image":{"parent":"old-image","message":{
+				"author":{"role":"tool"},"create_time":5,
+				"metadata":{"async_task_type":"image_gen"},
+				"content":{"parts":[{"asset_pointer":"file-service://off-branch"}]}
+			}},
+			"current-user":{"parent":"old-image","message":{"author":{"role":"user"},"create_time":3}},
+			"rejected":{"parent":"current-user","message":{
+				"author":{"role":"assistant"},"create_time":4,"end_turn":true,
+				"content":{"content_type":"text","parts":["Current request was blocked"]}
+			}}
+		}
+	}`), accumulator)
+	if err != nil {
+		t.Fatalf("CaptureChatGPTWebImageConversation() error = %v", err)
+	}
+	if len(accumulator.References) != 0 {
+		t.Fatalf("historical references leaked into current turn: %#v", accumulator.References)
+	}
+	if !accumulator.Terminal || accumulator.FailureStatus != "Current request was blocked" {
+		t.Fatalf("terminal = %t, failure = %q", accumulator.Terminal, accumulator.FailureStatus)
+	}
+}
+
+func TestCaptureChatGPTWebImageConversationReplacesPreviousSnapshot(t *testing.T) {
+	accumulator := &ChatGPTWebImageAccumulator{}
+	for _, snapshot := range []string{
+		`{"current_node":"old","mapping":{"old":{"message":{"author":{"role":"tool"},"metadata":{"async_task_type":"image_gen"},"content":{"parts":[{"asset_pointer":"file-service://old-branch"}]}}}}}`,
+		`{"current_node":"new","mapping":{"new":{"message":{"author":{"role":"tool"},"metadata":{"async_task_type":"image_gen"},"content":{"parts":[{"asset_pointer":"file-service://new-branch"}]}}}}}`,
+	} {
+		if err := CaptureChatGPTWebImageConversation([]byte(snapshot), accumulator); err != nil {
+			t.Fatalf("CaptureChatGPTWebImageConversation() error = %v", err)
+		}
+	}
+	want := []ChatGPTWebImageReference{{Kind: "file", ID: "new-branch"}}
+	if !reflect.DeepEqual(accumulator.References, want) || !reflect.DeepEqual(accumulator.FileIDs, []string{"new-branch"}) {
+		t.Fatalf("snapshot references = %#v, file IDs = %v", accumulator.References, accumulator.FileIDs)
+	}
+}
+
+func TestCaptureChatGPTWebImageConversationFallsBackWithoutGraphMetadata(t *testing.T) {
+	accumulator := &ChatGPTWebImageAccumulator{}
+	err := CaptureChatGPTWebImageConversation([]byte(`{"mapping":{
+		"old-image":{"message":{
+			"author":{"role":"tool"},"create_time":1,
+			"metadata":{"async_task_type":"image_gen"},
+			"content":{"parts":[{"asset_pointer":"file-service://historical"}]}
+		}},
+		"current-user":{"message":{"author":{"role":"user"},"create_time":2}},
+		"current-image":{"message":{
+			"author":{"role":"tool"},"create_time":3,
+			"metadata":{"async_task_type":"image_gen","is_complete":true,"finish_details":{"type":"finished_successfully"}},
+			"content":{"parts":[{"asset_pointer":"file-service://current"}]}
+		}}
+	}}`), accumulator)
+	if err != nil {
+		t.Fatalf("CaptureChatGPTWebImageConversation() error = %v", err)
+	}
+	want := []ChatGPTWebImageReference{{Kind: "file", ID: "current"}}
+	if !reflect.DeepEqual(accumulator.References, want) {
+		t.Fatalf("references = %#v, want %#v", accumulator.References, want)
+	}
+}
+
+func TestCaptureChatGPTWebImageConversationIgnoresAmbiguousUntimestampedImageWithoutGraphMetadata(t *testing.T) {
+	accumulator := &ChatGPTWebImageAccumulator{}
+	err := CaptureChatGPTWebImageConversation([]byte(`{"mapping":{
+		"historical-image":{"message":{
+			"author":{"role":"tool"},"create_time":1,
+			"metadata":{"async_task_type":"image_gen"},
+			"content":{"parts":[{"asset_pointer":"file-service://historical"}]}
+		}},
+		"current-user":{"message":{"author":{"role":"user"},"create_time":"2"}},
+		"current-image":{"message":{
+			"author":{"role":"tool"},
+			"metadata":{"async_task_type":"image_gen","is_complete":true,"finish_details":{"type":"finished_successfully"}},
+			"content":{"parts":[{"asset_pointer":"file-service://current"}]}
+		}}
+	}}`), accumulator)
+	if err != nil {
+		t.Fatalf("CaptureChatGPTWebImageConversation() error = %v", err)
+	}
+	if len(accumulator.References) != 0 {
+		t.Fatalf("ambiguous references leaked into current turn: %#v", accumulator.References)
+	}
+}
+
+func TestCaptureChatGPTWebImageConversationKeepsUntimestampedCurrentDescendant(t *testing.T) {
+	accumulator := &ChatGPTWebImageAccumulator{Turn: ChatGPTWebImageTurn{MessageID: "current-user", CreatedAt: 2}}
+	err := CaptureChatGPTWebImageConversation([]byte(`{"mapping":{
+		"historical-image":{"message":{
+			"author":{"role":"tool"},
+			"metadata":{"async_task_type":"image_gen"},
+			"content":{"parts":[{"asset_pointer":"file-service://historical"}]}
+		}},
+		"current-user":{"message":{"id":"current-user","author":{"role":"user"},"create_time":2}},
+		"current-image":{"parent":"current-user","message":{
+			"author":{"role":"tool"},
+			"metadata":{"async_task_type":"image_gen","is_complete":true,"finish_details":{"type":"finished_successfully"}},
+			"content":{"parts":[{"asset_pointer":"file-service://current"}]}
+		}}
+	}}`), accumulator)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []ChatGPTWebImageReference{{Kind: "file", ID: "current"}}
+	if !reflect.DeepEqual(accumulator.References, want) {
+		t.Fatalf("references = %#v, want %#v", accumulator.References, want)
+	}
+}
+
+func TestCaptureChatGPTWebImageConversationUsesPerCandidateParentFallback(t *testing.T) {
+	accumulator := &ChatGPTWebImageAccumulator{Turn: ChatGPTWebImageTurn{MessageID: "current-user", CreatedAt: 2}}
+	err := CaptureChatGPTWebImageConversation([]byte(`{"mapping":{
+		"historical-user":{"message":{"id":"historical-user","author":{"role":"user"},"create_time":1}},
+		"historical-image":{"parent":"historical-user","message":{"author":{"role":"tool"},"create_time":1.5,"metadata":{"async_task_type":"image_gen"},"content":{"parts":[{"asset_pointer":"file-service://historical"}]}}},
+		"current-user":{"message":{"id":"current-user","author":{"role":"user"},"create_time":2}},
+		"current-image":{"message":{"author":{"role":"tool"},"create_time":3,"metadata":{"async_task_type":"image_gen","is_complete":true,"status":"finished_successfully"},"content":{"parts":[{"asset_pointer":"file-service://current"}]}}}
+	}}`), accumulator)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(accumulator.FileIDs, []string{"current"}) || !accumulator.Terminal {
+		t.Fatalf("current fallback result = terminal %t, files %v", accumulator.Terminal, accumulator.FileIDs)
+	}
+}
+
+func TestCaptureChatGPTWebImageConversationKeepsSameTimestampOutputAfterCurrentUser(t *testing.T) {
+	accumulator := &ChatGPTWebImageAccumulator{Turn: ChatGPTWebImageTurn{MessageID: "z-user", CreatedAt: 2}}
+	err := CaptureChatGPTWebImageConversation([]byte(`{"mapping":{
+		"z-user":{"message":{"id":"z-user","author":{"role":"user"},"create_time":2}},
+		"a-image":{"message":{
+			"author":{"role":"tool"},"create_time":2,
+			"metadata":{"async_task_type":"image_gen","is_complete":true,"finish_details":{"type":"finished_successfully"}},
+			"content":{"parts":[{"asset_pointer":"file-service://current"}]}
+		}}
+	}}`), accumulator)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(accumulator.FileIDs, []string{"current"}) {
+		t.Fatalf("file IDs = %v", accumulator.FileIDs)
+	}
+}
+
+func TestCaptureChatGPTWebImageConversationWaitsForMissingTargetMessage(t *testing.T) {
+	accumulator := &ChatGPTWebImageAccumulator{Turn: ChatGPTWebImageTurn{MessageID: "pending-user", CreatedAt: 10}}
+	err := CaptureChatGPTWebImageConversation([]byte(`{"current_node":"historical-image","mapping":{
+		"historical-user":{"message":{"author":{"role":"user"},"create_time":1}},
+		"historical-image":{"parent":"historical-user","message":{
+			"author":{"role":"tool"},"create_time":2,
+			"metadata":{"async_task_type":"image_gen","is_complete":true},
+			"content":{"parts":[{"asset_pointer":"file-service://historical"}]}
+		}}
+	}}`), accumulator)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if accumulator.Terminal || len(accumulator.References) != 0 {
+		t.Fatalf("missing target captured terminal=%t references=%#v", accumulator.Terminal, accumulator.References)
+	}
+}
+
+func TestCaptureChatGPTWebImageConversationStopsAtNextUser(t *testing.T) {
+	accumulator := &ChatGPTWebImageAccumulator{Turn: ChatGPTWebImageTurn{MessageID: "current-user", CreatedAt: 1}}
+	err := CaptureChatGPTWebImageConversation([]byte(`{"mapping":{
+		"current-user":{"message":{"id":"current-user","author":{"role":"user"},"create_time":1}},
+		"current-image":{"message":{"author":{"role":"tool"},"create_time":2,"metadata":{"async_task_type":"image_gen","is_complete":true},"content":{"parts":[{"asset_pointer":"file-service://current"}]}}},
+		"next-user":{"message":{"id":"next-user","author":{"role":"user"},"create_time":3}},
+		"next-image":{"message":{"author":{"role":"tool"},"create_time":4,"metadata":{"async_task_type":"image_gen","is_complete":true},"content":{"parts":[{"asset_pointer":"file-service://next"}]}}}
+	}}`), accumulator)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(accumulator.FileIDs, []string{"current"}) {
+		t.Fatalf("file IDs = %v", accumulator.FileIDs)
+	}
+}
+
+func TestCaptureChatGPTWebImageConversationExcludesOtherParentBranch(t *testing.T) {
+	accumulator := &ChatGPTWebImageAccumulator{Turn: ChatGPTWebImageTurn{MessageID: "current-user", CreatedAt: 2}}
+	err := CaptureChatGPTWebImageConversation([]byte(`{"mapping":{
+		"old-user":{"message":{"id":"old-user","author":{"role":"user"},"create_time":1}},
+		"current-user":{"parent":"old-user","message":{"id":"current-user","author":{"role":"user"},"create_time":2}},
+		"current-image":{"parent":"current-user","message":{"author":{"role":"tool"},"create_time":3,"metadata":{"async_task_type":"image_gen","is_complete":true},"content":{"parts":[{"asset_pointer":"file-service://current"}]}}},
+		"off-branch":{"parent":"old-user","message":{"author":{"role":"tool"},"create_time":4,"metadata":{"async_task_type":"image_gen","is_complete":true},"content":{"parts":[{"asset_pointer":"file-service://off-branch"}]}}}
+	}}`), accumulator)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(accumulator.FileIDs, []string{"current"}) {
+		t.Fatalf("file IDs = %v", accumulator.FileIDs)
+	}
+}
+
+func TestCaptureChatGPTWebImageConversationExcludesLaterUntimestampedTurn(t *testing.T) {
+	accumulator := &ChatGPTWebImageAccumulator{Turn: ChatGPTWebImageTurn{MessageID: "current-user", CreatedAt: 2}}
+	err := CaptureChatGPTWebImageConversation([]byte(`{"mapping":{
+		"old-user":{"message":{"id":"old-user","author":{"role":"user"},"create_time":1}},
+		"current-user":{"parent":"old-user","message":{"id":"current-user","author":{"role":"user"},"create_time":2}},
+		"current-image":{"parent":"current-user","message":{"author":{"role":"tool"},"metadata":{"async_task_type":"image_gen","is_complete":true},"content":{"parts":[{"asset_pointer":"file-service://current"}]}}},
+		"next-user":{"parent":"current-image","message":{"id":"next-user","author":{"role":"user"},"create_time":3}},
+		"a-next-image":{"parent":"next-user","message":{"author":{"role":"tool"},"metadata":{"async_task_type":"image_gen","is_complete":true},"content":{"parts":[{"asset_pointer":"file-service://next"}]}}}
+	}}`), accumulator)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(accumulator.FileIDs, []string{"current"}) {
+		t.Fatalf("file IDs = %v", accumulator.FileIDs)
+	}
+}
+
+func TestCaptureChatGPTWebImageConversationAcceptsTerminalCodeReply(t *testing.T) {
+	accumulator := &ChatGPTWebImageAccumulator{}
+	err := CaptureChatGPTWebImageConversation([]byte(`{
+		"current_node":"rejected",
+		"mapping":{"rejected":{"message":{
+			"author":{"role":"assistant"},"end_turn":true,
+			"content":{"content_type":"code","text":"image_generation_denied"}
+		}}}
+	}`), accumulator)
+	if err != nil {
+		t.Fatalf("CaptureChatGPTWebImageConversation() error = %v", err)
+	}
+	if !accumulator.Terminal || accumulator.FailureStatus != "image_generation_denied" {
+		t.Fatalf("terminal = %t, failure = %q", accumulator.Terminal, accumulator.FailureStatus)
+	}
+}
+
+func TestCaptureChatGPTWebImageConversationCapturesCurrentEmptyStructuredFailure(t *testing.T) {
+	accumulator := &ChatGPTWebImageAccumulator{}
+	err := CaptureChatGPTWebImageConversation([]byte(`{
+		"current_node":"current-failure",
+		"mapping":{
+			"historical-failure":{"message":{
+				"author":{"role":"assistant"},"create_time":1,"is_error":true,
+				"error":{"message":"historical failure"},
+				"content":{"content_type":"text","parts":[]}
+			}},
+			"current-user":{"message":{"author":{"role":"user"},"create_time":2}},
+			"current-failure":{"parent":"current-user","message":{
+				"author":{"role":"assistant"},"create_time":3,"is_error":true,
+				"error":{"message":"current image request failed"},
+				"content":{"content_type":"text","parts":[]}
+			}}
+		}
+	}`), accumulator)
+	if err != nil {
+		t.Fatalf("CaptureChatGPTWebImageConversation() error = %v", err)
+	}
+	if !accumulator.Terminal || accumulator.FailureStatus != "current image request failed" {
+		t.Fatalf("terminal = %t, failure = %q", accumulator.Terminal, accumulator.FailureStatus)
+	}
+}
+
+func TestCaptureChatGPTWebImageConversationCapturesStatusOnlyFailure(t *testing.T) {
+	accumulator := &ChatGPTWebImageAccumulator{Turn: ChatGPTWebImageTurn{MessageID: "current-user"}}
+	err := CaptureChatGPTWebImageConversation([]byte(`{
+		"mapping":{
+			"current-user":{"message":{"id":"current-user","author":{"role":"user"}}},
+			"current-failure":{"parent":"current-user","message":{
+				"author":{"role":"assistant"},
+				"metadata":{"finish_details":{"type":"content_filter"}},
+				"content":{"content_type":"text","parts":[]}
+			}}
+		}
+	}`), accumulator)
+	if err != nil {
+		t.Fatalf("CaptureChatGPTWebImageConversation() error = %v", err)
+	}
+	if !accumulator.Terminal || accumulator.FailureStatus != "content_filter" {
+		t.Fatalf("terminal = %t, failure = %q", accumulator.Terminal, accumulator.FailureStatus)
+	}
+}
+
+func TestCaptureChatGPTWebImageConversationCapturesNestedStringReference(t *testing.T) {
+	accumulator := &ChatGPTWebImageAccumulator{Turn: ChatGPTWebImageTurn{MessageID: "current-user"}}
+	err := CaptureChatGPTWebImageConversation([]byte(`{
+		"mapping":{
+			"current-user":{"message":{"id":"current-user","author":{"role":"user"}}},
+			"current-image":{"parent":"current-user","message":{
+				"author":{"role":"tool"},
+				"metadata":{
+					"async_task_type":"image_gen",
+					"is_complete":true,
+					"status":"finished_successfully",
+					"nested":{"asset":"file-service://nested-image"}
+				},
+				"content":{"parts":[]}
+			}}
+		}
+	}`), accumulator)
+	if err != nil {
+		t.Fatalf("CaptureChatGPTWebImageConversation() error = %v", err)
+	}
+	if !accumulator.Terminal || !reflect.DeepEqual(accumulator.FileIDs, []string{"nested-image"}) {
+		t.Fatalf("terminal = %t, file IDs = %v", accumulator.Terminal, accumulator.FileIDs)
+	}
+}
+
+func TestCaptureChatGPTWebImageConversationCapturesCurrentRootFailure(t *testing.T) {
+	accumulator := &ChatGPTWebImageAccumulator{Turn: ChatGPTWebImageTurn{MessageID: "current-user"}}
+	err := CaptureChatGPTWebImageConversation([]byte(`{
+		"error":{"message":"current root failure"},
+		"mapping":{"current-user":{"message":{"id":"current-user","author":{"role":"user"}}}}
+	}`), accumulator)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !accumulator.Terminal || accumulator.FailureStatus != "current root failure" {
+		t.Fatalf("root failure = terminal %t, failure %q", accumulator.Terminal, accumulator.FailureStatus)
+	}
+}
+
+func TestCaptureChatGPTWebImageConversationRootFailureOverridesPendingImage(t *testing.T) {
+	accumulator := &ChatGPTWebImageAccumulator{Turn: ChatGPTWebImageTurn{MessageID: "current-user"}}
+	err := CaptureChatGPTWebImageConversation([]byte(`{
+		"error":{"message":"current root failure"},
+		"mapping":{
+			"current-user":{"message":{"id":"current-user","author":{"role":"user"},"create_time":1}},
+			"current-image":{"parent":"current-user","message":{
+				"author":{"role":"tool"},"create_time":2,
+				"metadata":{"async_task_type":"image_gen","status":"running"},
+				"content":{"parts":[{"asset_pointer":"file-service://preview"}]}
+			}}
+		}
+	}`), accumulator)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !accumulator.Terminal || accumulator.FailureStatus != "current root failure" {
+		t.Fatalf("root failure = terminal %t, failure %q", accumulator.Terminal, accumulator.FailureStatus)
+	}
+	if !reflect.DeepEqual(accumulator.FileIDs, []string{"preview"}) {
+		t.Fatalf("file IDs = %v", accumulator.FileIDs)
+	}
+}
+
+func TestCaptureChatGPTWebImageConversationWaitsForAllCurrentImages(t *testing.T) {
+	accumulator := &ChatGPTWebImageAccumulator{Turn: ChatGPTWebImageTurn{MessageID: "current-user"}}
+	err := CaptureChatGPTWebImageConversation([]byte(`{"mapping":{
+		"current-user":{"message":{"id":"current-user","author":{"role":"user"},"create_time":1}},
+		"completed":{"parent":"current-user","message":{"author":{"role":"tool"},"create_time":2,"metadata":{"async_task_type":"image_gen","is_complete":true,"status":"finished_successfully"},"content":{"parts":[{"asset_pointer":"file-service://completed"}]}}},
+		"running":{"parent":"current-user","message":{"author":{"role":"tool"},"create_time":3,"metadata":{"async_task_type":"image_gen","status":"running"},"content":{"parts":[{"asset_pointer":"file-service://preview"}]}}}
+	}}`), accumulator)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if accumulator.Terminal {
+		t.Fatal("one completed image marked a multi-image turn terminal")
+	}
+	if !reflect.DeepEqual(accumulator.FileIDs, []string{"completed", "preview"}) {
+		t.Fatalf("file IDs = %v", accumulator.FileIDs)
+	}
+}
+
+func TestCaptureChatGPTWebImageConversationDoesNotLetTerminalTextOverridePendingImage(t *testing.T) {
+	accumulator := &ChatGPTWebImageAccumulator{Turn: ChatGPTWebImageTurn{MessageID: "current-user"}}
+	err := CaptureChatGPTWebImageConversation([]byte(`{"mapping":{
+		"current-user":{"message":{"id":"current-user","author":{"role":"user"},"create_time":1}},
+		"running":{"parent":"current-user","message":{"author":{"role":"tool"},"create_time":2,"metadata":{"async_task_type":"image_gen","status":"running"},"content":{"parts":[{"asset_pointer":"file-service://preview"}]}}},
+		"assistant":{"parent":"running","message":{"author":{"role":"assistant"},"create_time":3,"end_turn":true,"content":{"content_type":"text","parts":["Still generating"]}}}
+	}}`), accumulator)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if accumulator.Terminal {
+		t.Fatal("terminal assistant text overrode a pending image task")
+	}
+	if !reflect.DeepEqual(accumulator.FileIDs, []string{"preview"}) {
+		t.Fatalf("file IDs = %v", accumulator.FileIDs)
+	}
+}
+
+func TestCaptureChatGPTWebImageConversationWaitsForPendingImageAfterFailure(t *testing.T) {
+	accumulator := &ChatGPTWebImageAccumulator{Turn: ChatGPTWebImageTurn{MessageID: "current-user"}}
+	err := CaptureChatGPTWebImageConversation([]byte(`{"mapping":{
+		"current-user":{"message":{"id":"current-user","author":{"role":"user"},"create_time":1}},
+		"failed":{"parent":"current-user","message":{
+			"author":{"role":"tool"},"create_time":2,
+			"metadata":{"async_task_type":"image_gen","status":"finished_with_error","is_complete":true},
+			"content":{"parts":[]}
+		}},
+		"running":{"parent":"current-user","message":{
+			"author":{"role":"tool"},"create_time":3,
+			"metadata":{"async_task_type":"image_gen","status":"running"},
+			"content":{"parts":[]}
+		}}
+	}}`), accumulator)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if accumulator.Terminal || accumulator.FailureStatus != "finished_with_error" {
+		t.Fatalf("terminal = %t, failure = %q", accumulator.Terminal, accumulator.FailureStatus)
+	}
+}
+
+func TestCaptureChatGPTWebImageConversationDoesNotClearEarlierFailure(t *testing.T) {
+	accumulator := &ChatGPTWebImageAccumulator{}
+	err := CaptureChatGPTWebImageConversation([]byte(`{
+		"current_node":"current-empty",
+		"mapping":{
+			"current-user":{"message":{"author":{"role":"user"}}},
+			"current-failure":{"parent":"current-user","message":{
+				"author":{"role":"assistant"},"is_error":true,
+				"error":{"message":"current image request failed"},
+				"content":{"content_type":"text","parts":[]}
+			}},
+			"current-empty":{"parent":"current-failure","message":{
+				"author":{"role":"assistant"},"end_turn":true,
+				"content":{"content_type":"text","parts":[]}
+			}}
+		}
+	}`), accumulator)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !accumulator.Terminal || accumulator.FailureStatus != "current image request failed" {
+		t.Fatalf("terminal = %t, failure = %q", accumulator.Terminal, accumulator.FailureStatus)
+	}
+}
+
+func TestCaptureChatGPTWebImageConversationCapturesEmptyAssistantTerminal(t *testing.T) {
+	for _, terminalFields := range []string{`"end_turn":true`, `"status":"completed"`} {
+		accumulator := &ChatGPTWebImageAccumulator{}
+		payload := []byte(`{"current_node":"done","mapping":{"done":{"message":{"author":{"role":"assistant"},` + terminalFields + `,"content":{"content_type":"text","parts":[]}}}}}`)
+		if err := CaptureChatGPTWebImageConversation(payload, accumulator); err != nil {
+			t.Fatalf("CaptureChatGPTWebImageConversation() error = %v", err)
+		}
+		if !accumulator.Terminal || accumulator.FailureStatus != "" || len(accumulator.References) != 0 {
+			t.Fatalf("terminal state = (%t, %q), references = %#v", accumulator.Terminal, accumulator.FailureStatus, accumulator.References)
+		}
+	}
+}
+
+func TestChatGPTWebImageMessageFailureUsesTruthyErrorValues(t *testing.T) {
+	for _, field := range []string{"message", "metadata"} {
+		for _, value := range []any{false, "", map[string]any{}, []any{}} {
+			message := map[string]any{}
+			if field == "metadata" {
+				message["metadata"] = map[string]any{"error": value, "is_error": false, "blocked": false}
+			} else {
+				message["error"] = value
+				message["is_error"] = false
+				message["blocked"] = false
+			}
+			failed, detail := chatGPTWebImageMessageFailure(message)
+			if failed || detail != "" {
+				t.Fatalf("%s error value %#v classified as failure %q", field, value, detail)
+			}
+		}
+	}
+	failed, detail := chatGPTWebImageMessageFailure(map[string]any{"error": map[string]any{
+		"message": "image generation blocked",
+		"detail":  "fallback detail",
+		"reason":  "policy",
+		"code":    "image_blocked",
+	}})
+	if !failed || detail != "image generation blocked" {
+		t.Fatalf("non-empty error classified as (%t, %q)", failed, detail)
+	}
+	failed, detail = chatGPTWebImageMessageFailure(map[string]any{"metadata": map[string]any{
+		"error": []any{map[string]any{"detail": "structured detail", "code": "image_failed"}},
+	}})
+	if !failed || detail != "structured detail" {
+		t.Fatalf("array error classified as (%t, %q)", failed, detail)
+	}
+}
+
+func TestChatGPTWebImageFailurePrefersStructuredDetailOverGenericContent(t *testing.T) {
+	message := map[string]any{
+		"author":   map[string]any{"role": "assistant"},
+		"is_error": true,
+		"error":    map[string]any{"message": "image request rejected by policy"},
+		"content":  map[string]any{"content_type": "text", "parts": []any{"failed"}},
+	}
+	failed, detail := chatGPTWebImageMessageFailure(message)
+	if !failed || detail != "image request rejected by policy" {
+		t.Fatalf("message failure = (%t, %q)", failed, detail)
+	}
+
+	statusMessage := map[string]any{
+		"author":   map[string]any{"role": "assistant"},
+		"metadata": map[string]any{"status": "content_filter"},
+		"content":  map[string]any{"content_type": "text", "parts": []any{"failed"}},
+	}
+	failed, detail = chatGPTWebImageStreamMessageFailure(statusMessage)
+	if !failed || detail != "content_filter" {
+		t.Fatalf("stream failure = (%t, %q)", failed, detail)
+	}
+}
+
+func TestChatGPTWebConversationTerminalErrorIsDeterministic(t *testing.T) {
+	event := map[string]any{
+		"first":  map[string]any{"status": "failed"},
+		"second": map[string]any{"finish_details": map[string]any{"type": "content_filter"}},
+	}
+	for index := 0; index < 100; index++ {
+		if status := chatGPTWebConversationTerminalError(event); status != "content_filter" {
+			t.Fatalf("terminal status = %q", status)
+		}
+	}
+}
+
+func TestCaptureChatGPTWebImageConversationKeepsImagesBeforeTerminalAssistantText(t *testing.T) {
+	accumulator := &ChatGPTWebImageAccumulator{}
+	err := CaptureChatGPTWebImageConversation([]byte(`{
+		"current_node":"complete",
+		"mapping":{
+			"image":{"message":{
+				"author":{"role":"tool"},"create_time":1,
+				"metadata":{"async_task_type":"image_gen"},
+				"content":{"parts":[{"asset_pointer":"file-service://generated"}]}
+			}},
+			"complete":{"parent":"image","message":{
+				"author":{"role":"assistant"},"create_time":2,"end_turn":true,
+				"content":{"content_type":"text","parts":["The image has been generated."]}
+			}}
+		}
+	}`), accumulator)
+	if err != nil {
+		t.Fatalf("CaptureChatGPTWebImageConversation() error = %v", err)
+	}
+	if !accumulator.Terminal || accumulator.FailureStatus != "" {
+		t.Fatalf("terminal = %t, failure = %q", accumulator.Terminal, accumulator.FailureStatus)
+	}
+	if !reflect.DeepEqual(accumulator.FileIDs, []string{"generated"}) {
 		t.Fatalf("file IDs = %v", accumulator.FileIDs)
 	}
 }

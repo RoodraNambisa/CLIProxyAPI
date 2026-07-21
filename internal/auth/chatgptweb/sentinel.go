@@ -16,7 +16,8 @@ import (
 
 const (
 	defaultSentinelBaseURL = "https://sentinel.openai.com"
-	sentinelSDKURL         = "https://sentinel.openai.com/sentinel/20260219f9f6/sdk.js"
+	sentinelSDKVersion     = "20260219f9f6"
+	sentinelSDKURL         = "https://sentinel.openai.com/sentinel/" + sentinelSDKVersion + "/sdk.js"
 	sentinelErrorPrefix    = "wQ8Lk5FbGpA2NcR9dShT6gYjU7VxZ4D"
 	defaultPoWMaxAttempts  = 500_000
 )
@@ -218,11 +219,12 @@ func fnv1a32(value string) string {
 }
 
 type Sentinel struct {
-	client    *Client
-	baseURL   string
-	authURL   string
-	deviceID  string
-	generator *SentinelGenerator
+	client          *Client
+	baseURL         string
+	authURL         string
+	deviceID        string
+	generator       *SentinelGenerator
+	turnstileSolver func(context.Context, string, string, ConversationTurnstileEnvironment, io.Reader, func() time.Time) (string, error)
 }
 
 func NewSentinel(client *Client, baseURL, authURL, deviceID string, reader io.Reader, now func() time.Time) (*Sentinel, error) {
@@ -237,11 +239,12 @@ func NewSentinel(client *Client, baseURL, authURL, deviceID string, reader io.Re
 		baseURL = defaultSentinelBaseURL
 	}
 	return &Sentinel{
-		client:    client,
-		baseURL:   strings.TrimRight(strings.TrimSpace(baseURL), "/"),
-		authURL:   strings.TrimRight(strings.TrimSpace(authURL), "/"),
-		deviceID:  strings.TrimSpace(deviceID),
-		generator: generator,
+		client:          client,
+		baseURL:         strings.TrimRight(strings.TrimSpace(baseURL), "/"),
+		authURL:         strings.TrimRight(strings.TrimSpace(authURL), "/"),
+		deviceID:        strings.TrimSpace(deviceID),
+		generator:       generator,
+		turnstileSolver: BuildConversationTurnstileTokenWithEnvironment,
 	}, nil
 }
 
@@ -282,22 +285,27 @@ func (sentinel *Sentinel) Token(ctx context.Context, flow string) (string, error
 	if err := decoder.Decode(&challenge); err != nil {
 		return "", newAuthError("sentinel_response_invalid", LifecycleLoginPending, response.StatusCode, true, false, "sentinel returned invalid JSON", err)
 	}
-	if interaction := sentinelInteraction(challenge); interaction != "" {
+	if interaction := sentinelUnsupportedInteraction(challenge); interaction != "" {
 		return "", newAuthError(interaction, LifecycleInteractionRequired, response.StatusCode, false, true, "interactive challenge is required", nil)
 	}
 	challengeToken := stringValue(challenge["token"])
 	if challengeToken == "" {
 		return "", newAuthError("sentinel_token_missing", LifecycleLoginPending, response.StatusCode, true, false, "sentinel response did not include a challenge token", nil)
 	}
+	proofOfWork, _ := challenge["proofofwork"].(map[string]any)
+	proofRequired := boolValue(proofOfWork["required"])
+	proofSeed := stringValue(proofOfWork["seed"])
+	if proofRequired && proofSeed == "" {
+		return "", newAuthError("sentinel_pow_invalid", LifecycleLoginPending, response.StatusCode, true, false, "sentinel proof-of-work seed is missing", nil)
+	}
+	turnstileToken, err := sentinel.solveTurnstile(ctx, challenge, requirementsToken, response.StatusCode)
+	if err != nil {
+		return "", err
+	}
 
 	proof := ""
-	proofOfWork, _ := challenge["proofofwork"].(map[string]any)
-	if boolValue(proofOfWork["required"]) {
-		seed := stringValue(proofOfWork["seed"])
-		if seed == "" {
-			return "", newAuthError("sentinel_pow_invalid", LifecycleLoginPending, response.StatusCode, true, false, "sentinel proof-of-work seed is missing", nil)
-		}
-		proof, err = sentinel.generator.GenerateProofContext(ctx, seed, stringValue(proofOfWork["difficulty"]))
+	if proofRequired {
+		proof, err = sentinel.generator.GenerateProofContext(ctx, proofSeed, stringValue(proofOfWork["difficulty"]))
 	} else {
 		proof, err = sentinel.generator.GenerateRequirementsToken()
 	}
@@ -309,7 +317,7 @@ func (sentinel *Sentinel) Token(ctx context.Context, flow string) (string, error
 	}
 	headerValue, err := json.Marshal(map[string]any{
 		"p":    proof,
-		"t":    "",
+		"t":    turnstileToken,
 		"c":    challengeToken,
 		"id":   sentinel.deviceID,
 		"flow": flow,
@@ -325,12 +333,61 @@ func (sentinel *Sentinel) Token(ctx context.Context, flow string) (string, error
 	return string(headerValue), nil
 }
 
-func sentinelInteraction(challenge map[string]any) string {
+func (sentinel *Sentinel) solveTurnstile(ctx context.Context, challenge map[string]any, requirementsToken string, status int) (string, error) {
+	required, dx := sentinelTurnstileChallenge(challenge["turnstile"])
+	if !required {
+		return "", nil
+	}
+	if dx == "" {
+		return "", newAuthError("turnstile_required", LifecycleInteractionRequired, status, false, true, "interactive challenge is required", nil)
+	}
+	solver := sentinel.turnstileSolver
+	if solver == nil {
+		solver = BuildConversationTurnstileTokenWithEnvironment
+	}
+	token, err := solver(
+		ctx,
+		dx,
+		requirementsToken,
+		ConversationTurnstileEnvironment{
+			Persona:       sentinel.generator.persona,
+			ScriptSources: []string{sentinelSDKURL},
+			Location:      sentinel.baseURL + "/backend-api/sentinel/frame.html?sv=" + sentinelSDKVersion,
+		},
+		sentinel.generator.random,
+		sentinel.generator.now,
+	)
+	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return "", ctxErr
+		}
+		return "", newAuthError("turnstile_required", LifecycleInteractionRequired, status, false, true, "sentinel Turnstile challenge could not be solved", err)
+	}
+	return token, nil
+}
+
+func sentinelTurnstileChallenge(value any) (bool, string) {
+	switch typed := value.(type) {
+	case bool:
+		return typed, ""
+	case map[string]any:
+		required := len(typed) > 0
+		if configured, exists := typed["required"]; exists {
+			required = boolValue(configured)
+		}
+		return required, stringValue(typed["dx"])
+	case string:
+		return strings.TrimSpace(typed) != "", ""
+	default:
+		return false, ""
+	}
+}
+
+func sentinelUnsupportedInteraction(challenge map[string]any) string {
 	for _, candidate := range []struct {
 		key  string
 		code string
 	}{
-		{key: "turnstile", code: "turnstile_required"},
 		{key: "arkose", code: "arkose_required"},
 		{key: "arkose_labs", code: "arkose_required"},
 	} {
