@@ -169,9 +169,6 @@ func readCodexAgentIdentityConversionInputs(c *gin.Context) ([]codexAgentIdentit
 	if len(request.AccessTokens) > 0 && targetMode != codexauth.AgentIdentityAuthMode {
 		return nil, errors.New("access_tokens only supports target_mode agentIdentity")
 	}
-	if len(request.AccessTokens) > agentIdentityTaskMaxItems || len(request.Names) > agentIdentityTaskMaxItems {
-		return nil, fmt.Errorf("at most %d accounts are allowed", agentIdentityTaskMaxItems)
-	}
 	if len(request.AccessTokens) > 0 {
 		inputs := make([]codexAgentIdentityConversionInput, 0, len(request.AccessTokens))
 		for index := range request.AccessTokens {
@@ -262,10 +259,6 @@ func readCodexAgentIdentityMultipartInputs(c *gin.Context) ([]codexAgentIdentity
 		if part.FormName() != "file" && part.FormName() != "files" {
 			_ = part.Close()
 			continue
-		}
-		if len(inputs) >= agentIdentityTaskMaxItems {
-			_ = part.Close()
-			return nil, fmt.Errorf("at most %d files are allowed", agentIdentityTaskMaxItems)
 		}
 		payload, errRead := io.ReadAll(io.LimitReader(part, agentIdentityConversionMaxFileBytes+1))
 		errClose := part.Close()

@@ -27,7 +27,6 @@ const (
 
 	agentIdentityTaskWorkers     = 4
 	agentIdentityTaskMaxActive   = 4
-	agentIdentityTaskMaxItems    = 100
 	agentIdentityTaskMaxRetained = 32
 	agentIdentityTaskRetention   = 24 * time.Hour
 )
@@ -66,7 +65,8 @@ type codexAgentIdentityTask struct {
 	ProgressPercent int                            `json:"progress_percent"`
 	Results         []codexAgentIdentityTaskResult `json:"results"`
 
-	cancel context.CancelFunc
+	cancel        context.CancelFunc
+	progressTotal int64
 }
 
 type codexAgentIdentityTaskManager struct {
@@ -98,7 +98,7 @@ func (m *codexAgentIdentityTaskManager) create(results []codexAgentIdentityTaskR
 	if m == nil {
 		return nil, nil, errAgentIdentityTaskClosed
 	}
-	if len(results) == 0 || len(results) > agentIdentityTaskMaxItems {
+	if len(results) == 0 {
 		return nil, nil, errAgentIdentityTaskCapacity
 	}
 	m.mu.Lock()
@@ -224,7 +224,9 @@ func (m *codexAgentIdentityTaskManager) setResult(id string, index int, result c
 	if result.Stage == "" || result.Status == agentIdentityItemCreated || result.Status == agentIdentityItemUpdated || result.Status == agentIdentityItemUnchanged {
 		result.Stage = "completed"
 	}
+	previousProgress := task.Results[index].ProgressPercent
 	task.Results[index] = result
+	task.progressTotal += int64(result.ProgressPercent - previousProgress)
 	task.Processed++
 	switch result.Status {
 	case agentIdentityItemCreated, agentIdentityItemUpdated, agentIdentityItemUnchanged:
@@ -249,11 +251,13 @@ func (m *codexAgentIdentityTaskManager) finish(id string, canceled bool) {
 			if task.Results[index].Status != agentIdentityItemQueued && task.Results[index].Status != agentIdentityItemRunning {
 				continue
 			}
+			previousProgress := task.Results[index].ProgressPercent
 			task.Results[index].Status = agentIdentityItemCanceled
 			task.Results[index].Stage = "canceled"
-			task.Results[index].ProgressPercent = 100
 			task.Results[index].ErrorCategory = "canceled"
 			task.Results[index].Error = "conversion canceled"
+			task.progressTotal += int64(100 - previousProgress)
+			task.Results[index].ProgressPercent = 100
 			task.Processed++
 			task.Canceled++
 		}
@@ -359,8 +363,10 @@ func (m *codexAgentIdentityTaskManager) updateStageLocked(task *codexAgentIdenti
 	if progress > 100 {
 		progress = 100
 	}
+	previousProgress := task.Results[index].ProgressPercent
 	task.Results[index].Stage = stage
 	task.Results[index].ProgressPercent = progress
+	task.progressTotal += int64(progress - previousProgress)
 	m.recalculateProgressLocked(task)
 }
 
@@ -368,11 +374,7 @@ func (m *codexAgentIdentityTaskManager) recalculateProgressLocked(task *codexAge
 	if task == nil || task.Total == 0 {
 		return
 	}
-	total := 0
-	for index := range task.Results {
-		total += task.Results[index].ProgressPercent
-	}
-	progress := total / task.Total
+	progress := int(task.progressTotal / int64(task.Total))
 	if progress > task.ProgressPercent {
 		task.ProgressPercent = progress
 	}

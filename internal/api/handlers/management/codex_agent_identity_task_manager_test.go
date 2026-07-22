@@ -84,3 +84,19 @@ func TestCodexAgentIdentityTaskCapacityAndShutdown(t *testing.T) {
 		t.Fatalf("create after shutdown error = %v, want closed", errCreate)
 	}
 }
+
+func TestCodexAgentIdentityTaskHasNoFixedItemLimit(t *testing.T) {
+	manager := newCodexAgentIdentityTaskManager()
+	results := make([]codexAgentIdentityTaskResult, 250)
+	for index := range results {
+		results[index] = codexAgentIdentityTaskResult{SourceName: "source", Stage: "queued", Status: agentIdentityItemQueued}
+	}
+	task, _, errCreate := manager.create(results)
+	if errCreate != nil {
+		t.Fatalf("create() error = %v", errCreate)
+	}
+	if task.Total != len(results) {
+		t.Fatalf("task total = %d, want %d", task.Total, len(results))
+	}
+	manager.finish(task.ID, true)
+}

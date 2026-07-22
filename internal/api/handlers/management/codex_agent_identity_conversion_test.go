@@ -594,6 +594,31 @@ func TestCodexAgentIdentityConversionRejectsOAuthTargetForRawTokens(t *testing.T
 	}
 }
 
+func TestCodexAgentIdentityConversionInputHasNoFixedAccountLimit(t *testing.T) {
+	const accountCount = 250
+	tokens := make([]string, accountCount)
+	for index := range tokens {
+		tokens[index] = fmt.Sprintf("token-%d", index)
+	}
+	payload, errMarshal := json.Marshal(map[string]any{"access_tokens": tokens})
+	if errMarshal != nil {
+		t.Fatalf("marshal conversion request: %v", errMarshal)
+	}
+	recorder := httptest.NewRecorder()
+	requestContext, _ := gin.CreateTestContext(recorder)
+	request := httptest.NewRequest(http.MethodPost, "/v0/management/codex/agent-identity/conversion-tasks", bytes.NewReader(payload))
+	request.Header.Set("Content-Type", "application/json")
+	requestContext.Request = request
+	inputs, errRead := readCodexAgentIdentityConversionInputs(requestContext)
+	if errRead != nil {
+		t.Fatalf("readCodexAgentIdentityConversionInputs() error = %v", errRead)
+	}
+	defer clearCodexAgentIdentityInputs(inputs)
+	if len(inputs) != accountCount {
+		t.Fatalf("input count = %d, want %d", len(inputs), accountCount)
+	}
+}
+
 func TestCodexAgentIdentityConversionRejectsChangedSourceAtCommit(t *testing.T) {
 	handler, manager, _ := newCodexAgentIdentityManagementFixture(t)
 	identityRegistered := make(chan struct{})

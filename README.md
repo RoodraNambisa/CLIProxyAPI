@@ -170,6 +170,8 @@ remote-management:
 - `GET /v0/management/codex/agent-identity/conversion-tasks/:id`：轮询任务及账号级进度。
 - `DELETE /v0/management/codex/agent-identity/conversion-tasks/:id`：取消尚未完成的转换。
 
+单个转换任务不设置账号数量上限，后台始终使用固定数量的 worker 逐步处理；管理请求仍受请求体大小限制，避免一次上传占用无界内存。
+
 OAuth 转为 Agent Identity 后会保留原有 access/refresh token，便于以后切回；切回 OAuth 前必须仍有可用 access token 或 refresh token。账号列表会返回 `auth_mode`、`auth_mode_label`、`can_convert_to_agent_identity` 和 `can_convert_to_oauth`，显示名与 Sub2API 一致使用 `OAuth` / `Agent Identity`。额度检测接口保持不变，并会按照当前模式自动使用 Bearer 或 AgentAssertion。
 
 任务完成后，每个成功结果都会返回 `target_name`；转换已有账号时该名称仍是原文件名。前端可继续调用 `GET /v0/management/auth-files/download?name=<target_name>` 获取包含当前模式完整认证材料的 JSON，用于下载、复制或预览；批量下载仍可使用 `/auth-files/archive`。普通账号列表不会返回 access token、refresh token、`agent_private_key` 或 `task_id`。以上接口均受 Management API 鉴权和可选 `access-path` 前缀保护。
