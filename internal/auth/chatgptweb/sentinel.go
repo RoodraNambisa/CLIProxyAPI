@@ -18,6 +18,7 @@ const (
 	defaultSentinelBaseURL = "https://sentinel.openai.com"
 	sentinelSDKVersion     = "20260219f9f6"
 	sentinelSDKURL         = "https://sentinel.openai.com/sentinel/" + sentinelSDKVersion + "/sdk.js"
+	sentinelSDKSHA256      = "4f8ef8d5870894fd0101fc40ff45ea13c0f8e25c71c2ba28e5df5baf98babbb5"
 	sentinelErrorPrefix    = "wQ8Lk5FbGpA2NcR9dShT6gYjU7VxZ4D"
 	defaultPoWMaxAttempts  = 500_000
 )

@@ -77,6 +77,13 @@ func TestParseConversationSentinelSDKResource(t *testing.T) {
 	}
 }
 
+func TestDefaultConversationSentinelSDKResourceUsesPinnedIntegrity(t *testing.T) {
+	resource := DefaultConversationSentinelSDKResource()
+	if resource.URL != sentinelSDKURL || resource.SHA256 != sentinelSDKSHA256 || !resource.IntegrityRequired {
+		t.Fatalf("resource = %+v", resource)
+	}
+}
+
 func TestBuildConversationRequirementsTokenUsesTwentyFiveItems(t *testing.T) {
 	token, err := BuildConversationRequirementsToken(DefaultPersona(), []string{"/sdk.js"}, "build", zeroReader{}, func() time.Time {
 		return time.Unix(1_700_000_000, 0)

@@ -51,7 +51,7 @@ const (
 	sentinelSDKAdapterVersion          = "exports-v2"
 	sentinelSDKExportMarker            = "t.init=we,t.sessionObserverToken=async function(t){"
 	sentinelSDKExportInjection         = "globalThis.__sentinelInternals={P,_n,Nt,Et,D};"
-	sentinelSDKVerifiedExportsV2SHA256 = "4f8ef8d5870894fd0101fc40ff45ea13c0f8e25c71c2ba28e5df5baf98babbb5"
+	sentinelSDKVerifiedExportsV2SHA256 = sentinelSDKSHA256
 )
 
 type sentinelSDKAdapter struct {
@@ -2720,7 +2720,7 @@ func (observer *SentinelObserver) Snapshot(ctx context.Context) (string, error) 
 	}
 	challengeToken := stringValue(request.Challenge["token"])
 	if challengeToken == "" {
-		return "", newSentinelRuntimeError("sentinel_session_observer_unavailable", 0, errors.New("Sentinel challenge token is empty"))
+		return snapshot, nil
 	}
 	payload, err := json.Marshal(map[string]any{
 		"so":   snapshot,

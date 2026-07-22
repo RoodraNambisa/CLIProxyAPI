@@ -808,6 +808,9 @@ func (e *ChatGPTWebExecutor) chatGPTWebRequirements(ctx context.Context, client 
 	}
 	sources, dataBuild := chatgptwebauth.ParseConversationPoWResources(bootstrap)
 	sdkResource := chatgptwebauth.ParseConversationSentinelSDKResource(bootstrap)
+	if sdkResource.URL == "" {
+		sdkResource = chatgptwebauth.DefaultConversationSentinelSDKResource()
+	}
 	pToken, err := chatgptwebauth.BuildConversationRequirementsToken(credential.Persona, sources, dataBuild, e.runtimeRand, e.now)
 	if err != nil {
 		return chatGPTWebRequirements{}, chatGPTWebLocalProtocolError(

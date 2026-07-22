@@ -70,6 +70,16 @@ type ConversationSentinelSDKResource struct {
 	IntegrityRequired bool
 }
 
+// DefaultConversationSentinelSDKResource returns the pinned SDK used when the
+// ChatGPT bootstrap no longer includes an explicit Sentinel script element.
+func DefaultConversationSentinelSDKResource() ConversationSentinelSDKResource {
+	return ConversationSentinelSDKResource{
+		URL:               sentinelSDKURL,
+		SHA256:            sentinelSDKSHA256,
+		IntegrityRequired: true,
+	}
+}
+
 // ParseConversationSentinelSDKResource finds the exact Sentinel SDK script
 // selected by the bootstrap document without evaluating document JavaScript.
 func ParseConversationSentinelSDKResource(document []byte) ConversationSentinelSDKResource {

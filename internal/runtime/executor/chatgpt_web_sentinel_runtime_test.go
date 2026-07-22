@@ -155,6 +155,58 @@ func TestChatGPTWebRequirementsUsesSentinelSDKCompatibilityFallback(t *testing.T
 	}
 }
 
+func TestChatGPTWebRequirementsUsesPinnedSDKWhenBootstrapOmitsSentinelScript(t *testing.T) {
+	var finalized map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/":
+			_, _ = io.WriteString(w, `<html><script src="/unauth-mweb/assets/client.js"></script></html>`)
+		case "/backend-api/sentinel/chat-requirements/prepare":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"prepare_token": "prepare",
+				"turnstile":     map[string]any{"required": true, "dx": "challenge"},
+			})
+		case "/backend-api/sentinel/chat-requirements/finalize":
+			if err := json.NewDecoder(request.Body).Decode(&finalized); err != nil {
+				t.Errorf("decode finalize body: %v", err)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"token": "requirements"})
+		default:
+			http.NotFound(w, request)
+		}
+	}))
+	defer server.Close()
+
+	executor := NewChatGPTWebExecutor(&config.Config{}, nil)
+	executor.sentinelRuntime.Close()
+	runtime := &fakeChatGPTWebSentinelRuntime{
+		config: chatgptwebauth.SentinelRuntimeConfig{Enabled: true, Workers: 1, QueueSize: 2, CacheVersions: 3},
+	}
+	executor.sentinelRuntime = runtime
+	executor.runtimeBaseURL = server.URL
+	var fetchedURL string
+	executor.sentinelSDKFetcherFactory = func(*chatgptwebauth.Client, *chatgptwebauth.Credential) chatgptwebauth.SentinelSDKFetcher {
+		return func(_ context.Context, targetURL string, _ int64) ([]byte, string, string, error) {
+			fetchedURL = targetURL
+			return []byte(chatGPTWebSentinelRuntimeTestSDK), "application/javascript", targetURL, nil
+		}
+	}
+	defer func() { _ = executor.Close() }()
+
+	requirements := runChatGPTWebSentinelRequirements(t, executor)
+	if requirements.TurnstileToken != "sdk-turnstile-token" {
+		t.Fatalf("Turnstile token = %q", requirements.TurnstileToken)
+	}
+	resource := chatgptwebauth.DefaultConversationSentinelSDKResource()
+	if fetchedURL != resource.URL {
+		t.Fatalf("SDK URL = %q, want %q", fetchedURL, resource.URL)
+	}
+	if got := chatGPTWebAnyString(finalized["turnstile_token"]); got != "sdk-turnstile-token" {
+		t.Fatalf("finalize Turnstile token = %q", got)
+	}
+}
+
 func TestChatGPTWebRequirementsPrefersFinalizeSessionObserverToken(t *testing.T) {
 	brokenSnapshotSDK := strings.Replace(chatGPTWebSentinelRuntimeTestSDK, `async function Nt(){return "sdk-snapshot-token"}`, `async function Nt(){throw new Error("snapshot must not run")}`, 1)
 	server := newChatGPTWebSentinelRequirementsServer(t, brokenSnapshotSDK, func(string) map[string]any {
@@ -344,6 +396,8 @@ func TestChatGPTWebRequirementsClassifiesRequiredObserverInitializationFailure(t
 
 	executor, _ := newChatGPTWebSentinelTestExecutor(server.URL, chatGPTWebSentinelRuntimeTestSDK)
 	defer func() { _ = executor.Close() }()
+	runtime := executor.sentinelRuntime.(*fakeChatGPTWebSentinelRuntime)
+	runtime.beginErr = errors.New("observer initialization failed")
 	client, credential, err := executor.newRuntimeClient(chatGPTWebRuntimeAuth())
 	if err != nil {
 		t.Fatal(err)

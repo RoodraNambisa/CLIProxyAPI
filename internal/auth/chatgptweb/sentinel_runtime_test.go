@@ -1545,6 +1545,26 @@ func TestSentinelRuntimeObserverCollectorAndSnapshot(t *testing.T) {
 	}
 }
 
+func TestSentinelRuntimeObserverReturnsRawSnapshotWithoutChallengeToken(t *testing.T) {
+	manager := newSentinelRuntimeTestManager()
+	defer manager.Close()
+	_, sdkRequest := sentinelRuntimeTestRequests(t, true)
+	delete(sdkRequest.Challenge, "token")
+	sdkRequest.Fetcher = sentinelRuntimeTestFetcher(nil)
+	observer, err := manager.BeginObserver(t.Context(), sdkRequest)
+	if err != nil || observer == nil {
+		t.Fatalf("BeginObserver() = %#v, %v", observer, err)
+	}
+	defer observer.Close()
+	token, err := observer.Snapshot(t.Context())
+	if err != nil {
+		t.Fatalf("Snapshot() error = %v", err)
+	}
+	if token != "sdk-snapshot-token" {
+		t.Fatalf("Snapshot() = %q, want raw SDK snapshot", token)
+	}
+}
+
 func TestSentinelRuntimeObserverCloseCancelsActiveSnapshot(t *testing.T) {
 	manager := newSentinelRuntimeTestManager()
 	defer manager.Close()
