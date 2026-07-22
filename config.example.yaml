@@ -55,6 +55,17 @@ api-keys:
 # password/TOTP material and is disabled by default.
 chatgpt-web:
   auto-relogin: false
+  sentinel:
+    # Keep the Go VM on the hot path and lazily fetch the versioned SDK from the
+    # official OpenAI HTTPS endpoint only when required. Bootstrap SRI is enforced
+    # when present; set false if remote JavaScript execution is not acceptable.
+    sdk-runtime-enabled: true
+    # 0 automatically uses max(1, min(4, (GOMAXPROCS+1)/2)).
+    sdk-workers: 0
+    # 0 disables waiting when every SDK worker is busy.
+    sdk-queue-size: 32
+    # Number of SDK source and bytecode versions retained in memory.
+    sdk-cache-versions: 3
 
 # Optional provider restrictions for client API keys. Keys without a mapping can use all providers.
 # Provider IDs are matched exactly after trimming and lowercasing; use "xai" for Grok credentials.

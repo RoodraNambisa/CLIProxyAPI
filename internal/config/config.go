@@ -40,6 +40,12 @@ const (
 	DefaultDisabledImageGenerationToolMessage    = "image_generation tool is disabled for this credential"
 	DefaultDisabledImageGenerationToolType       = "image_generation_disabled"
 	DefaultDisabledImageGenerationToolCode       = "image_generation_disabled"
+
+	DefaultChatGPTWebSentinelSDKQueueSize     = 32
+	DefaultChatGPTWebSentinelSDKCacheVersions = 3
+	MaxChatGPTWebSentinelSDKWorkers           = 16
+	MaxChatGPTWebSentinelSDKQueueSize         = 1024
+	MaxChatGPTWebSentinelSDKCacheVersions     = 5
 )
 
 var (
@@ -412,10 +418,104 @@ type CodexConfig struct {
 	IdentityConfuse bool `yaml:"identity-confuse" json:"identity-confuse"`
 }
 
-// ChatGPTWebConfig configures ChatGPT Web credential lifecycle behavior.
+// ChatGPTWebConfig configures ChatGPT Web credential and Sentinel behavior.
 type ChatGPTWebConfig struct {
 	// AutoRelogin starts a background password login after a terminal refresh failure.
 	AutoRelogin bool `yaml:"auto-relogin" json:"auto-relogin"`
+
+	Sentinel ChatGPTWebSentinelConfig `yaml:"sentinel" json:"sentinel"`
+}
+
+// ChatGPTWebSentinelConfig preserves whether values were explicitly configured.
+// This matters because disabled and zero-length queue are both valid overrides.
+type ChatGPTWebSentinelConfig struct {
+	SDKRuntimeEnabled *bool `yaml:"sdk-runtime-enabled,omitempty" json:"sdk-runtime-enabled,omitempty"`
+	SDKWorkers        *int  `yaml:"sdk-workers,omitempty" json:"sdk-workers,omitempty"`
+	SDKQueueSize      *int  `yaml:"sdk-queue-size,omitempty" json:"sdk-queue-size,omitempty"`
+	SDKCacheVersions  *int  `yaml:"sdk-cache-versions,omitempty" json:"sdk-cache-versions,omitempty"`
+}
+
+// UnmarshalYAML distinguishes an omitted setting from an explicit null value.
+func (cfg *ChatGPTWebSentinelConfig) UnmarshalYAML(node *yaml.Node) error {
+	if cfg == nil || node == nil {
+		return fmt.Errorf("chatgpt-web.sentinel must be an object")
+	}
+	if err := validateChatGPTWebSentinelMappingFields(node); err != nil {
+		return err
+	}
+	type plainChatGPTWebSentinelConfig ChatGPTWebSentinelConfig
+	var decoded plainChatGPTWebSentinelConfig
+	if err := node.Decode(&decoded); err != nil {
+		return fmt.Errorf("chatgpt-web.sentinel: %w", err)
+	}
+	*cfg = ChatGPTWebSentinelConfig(decoded)
+	return nil
+}
+
+func validateChatGPTWebSentinelMappingFields(node *yaml.Node) error {
+	if node.Kind != yaml.MappingNode && node.Kind != yaml.AliasNode {
+		return fmt.Errorf("chatgpt-web.sentinel must be an object")
+	}
+	var effective map[string]any
+	if err := node.Decode(&effective); err != nil {
+		return fmt.Errorf("chatgpt-web.sentinel: %w", err)
+	}
+	for name, value := range effective {
+		switch name {
+		case "sdk-runtime-enabled", "sdk-workers", "sdk-queue-size", "sdk-cache-versions":
+			if value == nil {
+				return fmt.Errorf("chatgpt-web.sentinel.%s must not be null", name)
+			}
+		default:
+			return fmt.Errorf("chatgpt-web.sentinel.%s is not supported", name)
+		}
+	}
+	return nil
+}
+
+// ResolvedChatGPTWebSentinelConfig contains effective runtime values.
+type ResolvedChatGPTWebSentinelConfig struct {
+	SDKRuntimeEnabled bool `json:"sdk-runtime-enabled"`
+	SDKWorkers        int  `json:"sdk-workers"`
+	SDKQueueSize      int  `json:"sdk-queue-size"`
+	SDKCacheVersions  int  `json:"sdk-cache-versions"`
+}
+
+// Resolved returns the effective Sentinel SDK configuration.
+func (cfg ChatGPTWebSentinelConfig) Resolved() ResolvedChatGPTWebSentinelConfig {
+	out := ResolvedChatGPTWebSentinelConfig{
+		SDKRuntimeEnabled: true,
+		SDKQueueSize:      DefaultChatGPTWebSentinelSDKQueueSize,
+		SDKCacheVersions:  DefaultChatGPTWebSentinelSDKCacheVersions,
+	}
+	if cfg.SDKRuntimeEnabled != nil {
+		out.SDKRuntimeEnabled = *cfg.SDKRuntimeEnabled
+	}
+	if cfg.SDKWorkers != nil {
+		out.SDKWorkers = *cfg.SDKWorkers
+	}
+	if cfg.SDKQueueSize != nil {
+		out.SDKQueueSize = *cfg.SDKQueueSize
+	}
+	if cfg.SDKCacheVersions != nil {
+		out.SDKCacheVersions = *cfg.SDKCacheVersions
+	}
+	return out
+}
+
+// Validate rejects Sentinel SDK values outside their documented bounds.
+func (cfg ChatGPTWebSentinelConfig) Validate() error {
+	resolved := cfg.Resolved()
+	if resolved.SDKWorkers < 0 || resolved.SDKWorkers > MaxChatGPTWebSentinelSDKWorkers {
+		return fmt.Errorf("chatgpt-web.sentinel.sdk-workers must be 0 or between 1 and %d", MaxChatGPTWebSentinelSDKWorkers)
+	}
+	if resolved.SDKQueueSize < 0 || resolved.SDKQueueSize > MaxChatGPTWebSentinelSDKQueueSize {
+		return fmt.Errorf("chatgpt-web.sentinel.sdk-queue-size must be between 0 and %d", MaxChatGPTWebSentinelSDKQueueSize)
+	}
+	if resolved.SDKCacheVersions < 1 || resolved.SDKCacheVersions > MaxChatGPTWebSentinelSDKCacheVersions {
+		return fmt.Errorf("chatgpt-web.sentinel.sdk-cache-versions must be between 1 and %d", MaxChatGPTWebSentinelSDKCacheVersions)
+	}
+	return nil
 }
 
 // CodexFingerprintConfig controls optional Codex upstream fingerprinting.
@@ -1014,6 +1114,9 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	cfg.Images.UnsupportedStatusCode = http.StatusBadRequest
 	if err = yaml.Unmarshal(data, &cfg); err != nil {
 		if optional {
+			if sentinelErr := validateChatGPTWebSentinelYAML(data); sentinelErr != nil {
+				return nil, fmt.Errorf("failed to parse config file: %w", sentinelErr)
+			}
 			// In cloud deploy mode, if YAML parsing fails, return empty config instead of error.
 			return &Config{}, nil
 		}
@@ -1112,6 +1215,9 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 		}
 		return nil, err
 	}
+	if err = cfg.ChatGPTWeb.Sentinel.Validate(); err != nil {
+		return nil, err
+	}
 
 	if cfg.MaxRetryCredentials < 0 {
 		cfg.MaxRetryCredentials = 0
@@ -1204,6 +1310,33 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 
 	// Return the populated configuration struct.
 	return &cfg, nil
+}
+
+func validateChatGPTWebSentinelYAML(data []byte) error {
+	var document yaml.Node
+	if err := yaml.Unmarshal(data, &document); err != nil {
+		return nil
+	}
+	var envelope struct {
+		ChatGPTWeb yaml.Node `yaml:"chatgpt-web"`
+	}
+	if err := document.Decode(&envelope); err != nil {
+		return nil
+	}
+	if envelope.ChatGPTWeb.Kind != yaml.MappingNode && envelope.ChatGPTWeb.Kind != yaml.AliasNode {
+		return nil
+	}
+	var section struct {
+		Sentinel yaml.Node `yaml:"sentinel"`
+	}
+	if err := envelope.ChatGPTWeb.Decode(&section); err != nil || section.Sentinel.Kind == 0 {
+		return nil
+	}
+	var sentinel ChatGPTWebSentinelConfig
+	if err := section.Sentinel.Decode(&sentinel); err != nil {
+		return err
+	}
+	return sentinel.Validate()
 }
 
 func defaultNativeImageModels() []string {
@@ -2705,6 +2838,9 @@ func appendPath(path []string, key string) []string {
 // This prevents non-zero defaults from polluting the config.
 func isKnownDefaultValue(path []string, node *yaml.Node) bool {
 	fullPath := strings.Join(path, ".")
+	if preservesExplicitChatGPTWebSentinelValue(fullPath, node) {
+		return false
+	}
 	if fullPath == "routing.priority-overrides" && node != nil && node.Kind == yaml.SequenceNode && len(node.Content) > 0 {
 		return false
 	}
@@ -2759,6 +2895,26 @@ func isKnownDefaultValue(path []string, node *yaml.Node) bool {
 	}
 
 	return false
+}
+
+func preservesExplicitChatGPTWebSentinelValue(fullPath string, node *yaml.Node) bool {
+	if node == nil {
+		return false
+	}
+	switch fullPath {
+	case "chatgpt-web":
+		index := findMapKeyIndex(node, "sentinel")
+		return index >= 0 && index+1 < len(node.Content) && preservesExplicitChatGPTWebSentinelValue("chatgpt-web.sentinel", node.Content[index+1])
+	case "chatgpt-web.sentinel":
+		return node.Kind == yaml.MappingNode && len(node.Content) > 0
+	case "chatgpt-web.sentinel.sdk-runtime-enabled",
+		"chatgpt-web.sentinel.sdk-workers",
+		"chatgpt-web.sentinel.sdk-queue-size",
+		"chatgpt-web.sentinel.sdk-cache-versions":
+		return true
+	default:
+		return false
+	}
 }
 
 // pruneKnownDefaultsInNewNode removes default-valued descendants from a new node

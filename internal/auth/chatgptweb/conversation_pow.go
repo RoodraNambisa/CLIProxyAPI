@@ -9,11 +9,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/url"
 	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
 	"time"
+
+	"golang.org/x/net/html"
 )
 
 const (
@@ -57,6 +60,102 @@ func ParseConversationPoWResources(document []byte) ([]string, string) {
 		}
 	}
 	return sources, dataBuild
+}
+
+// ConversationSentinelSDKResource identifies the versioned SDK requested by
+// the bootstrap document and its optional SHA-256 subresource integrity value.
+type ConversationSentinelSDKResource struct {
+	URL               string
+	SHA256            string
+	IntegrityRequired bool
+}
+
+// ParseConversationSentinelSDKResource finds the exact Sentinel SDK script
+// selected by the bootstrap document without evaluating document JavaScript.
+func ParseConversationSentinelSDKResource(document []byte) ConversationSentinelSDKResource {
+	tokenizer := html.NewTokenizer(bytes.NewReader(document))
+	for {
+		tokenType := tokenizer.Next()
+		if tokenType == html.ErrorToken {
+			return ConversationSentinelSDKResource{}
+		}
+		if tokenType != html.StartTagToken && tokenType != html.SelfClosingTagToken {
+			continue
+		}
+		token := tokenizer.Token()
+		if !strings.EqualFold(token.Data, "script") {
+			continue
+		}
+		var source, integrity string
+		for _, attribute := range token.Attr {
+			switch strings.ToLower(attribute.Key) {
+			case "src":
+				source = strings.TrimSpace(attribute.Val)
+			case "integrity":
+				integrity = strings.TrimSpace(attribute.Val)
+			}
+		}
+		parsed, err := url.Parse(source)
+		if source == "" || err != nil || parsed == nil || parsed.ForceQuery || parsed.RawQuery != "" || parsed.Fragment != "" || parsed.RawFragment != "" {
+			continue
+		}
+		candidate := parsed
+		if !candidate.IsAbs() {
+			base, _ := url.Parse("https://chatgpt.com/")
+			candidate = base.ResolveReference(candidate)
+		}
+		if validateSentinelSDKURL(candidate) != nil {
+			continue
+		}
+		resource := ConversationSentinelSDKResource{URL: source, IntegrityRequired: integrity != ""}
+		seenHashes := make(map[string]struct{})
+		hashes := make([]string, 0, 2)
+		for _, value := range strings.Fields(integrity) {
+			if strings.HasPrefix(strings.ToLower(value), "sha256-") {
+				key := "sha256-" + value[len("sha256-"):]
+				if _, exists := seenHashes[key]; exists {
+					continue
+				}
+				seenHashes[key] = struct{}{}
+				hashes = append(hashes, value)
+			}
+		}
+		resource.SHA256 = strings.Join(hashes, " ")
+		return resource
+	}
+}
+
+func conversationSentinelSDKVersionFromPath(path string) (version string, backendAPI bool) {
+	if len(path) < 2 || path[0] != '/' || path[len(path)-1] == '/' || strings.Contains(path[1:], "//") {
+		return "", false
+	}
+	parts := strings.Split(path[1:], "/")
+	var escapedVersion string
+	switch {
+	case len(parts) == 3 && parts[0] == "sentinel" && parts[2] == "sdk.js":
+		escapedVersion = parts[1]
+	case len(parts) == 4 && parts[0] == "backend-api" && parts[1] == "sentinel" && parts[3] == "sdk.js":
+		escapedVersion = parts[2]
+		backendAPI = true
+	default:
+		return "", false
+	}
+	version, err := url.PathUnescape(escapedVersion)
+	if err != nil || len(version) < 8 {
+		return "", false
+	}
+	for index, char := range version {
+		if index < 8 {
+			if char < '0' || char > '9' {
+				return "", false
+			}
+			continue
+		}
+		if (char < '0' || char > '9') && (char < 'a' || char > 'z') && (char < 'A' || char > 'Z') && char != '-' && char != '_' && char != '.' {
+			return "", false
+		}
+	}
+	return version, backendAPI
 }
 
 // BuildConversationRequirementsToken creates the browser proof payload used by

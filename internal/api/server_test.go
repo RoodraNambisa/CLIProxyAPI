@@ -184,6 +184,9 @@ func TestChatGPTWebManagementRoutesAreRegistered(t *testing.T) {
 		http.MethodGet + " /v0/management/chatgpt-web/conversion-tasks/:id":      false,
 		http.MethodDelete + " /v0/management/chatgpt-web/conversion-tasks/:id":   false,
 		http.MethodPost + " /v0/management/chatgpt-web/auth-files/:name/relogin": false,
+		http.MethodGet + " /v0/management/chatgpt-web/sentinel":                  false,
+		http.MethodPut + " /v0/management/chatgpt-web/sentinel":                  false,
+		http.MethodPatch + " /v0/management/chatgpt-web/sentinel":                false,
 		http.MethodPost + " /v0/management/auth-files/restore":                   false,
 	}
 	for _, route := range server.engine.Routes() {

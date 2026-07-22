@@ -488,3 +488,17 @@ func (e statusErr) StatusCode() int            { return e.code }
 func (e statusErr) RetryAfter() *time.Duration { return e.retryAfter }
 func (e statusErr) SkipAuthResult() bool       { return e.skipAuthResult }
 func (e statusErr) RetryOtherAuth() bool       { return e.retryOtherAuth }
+func (e statusErr) Headers() http.Header {
+	if e.retryAfter == nil {
+		return nil
+	}
+	delay := *e.retryAfter
+	if delay < 0 {
+		delay = 0
+	}
+	seconds := int64(0)
+	if delay > 0 {
+		seconds = int64((delay + time.Second - 1) / time.Second)
+	}
+	return http.Header{"Retry-After": []string{fmt.Sprintf("%d", seconds)}}
+}

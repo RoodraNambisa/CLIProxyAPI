@@ -460,6 +460,7 @@ func TestChatGPTWebResponseLogBodyRedactsSignedURLs(t *testing.T) {
 func TestChatGPTWebResponseLogBodyRedactsTurnstileDXOnlyForPrepare(t *testing.T) {
 	payload := []byte(`{
 		"turnstile":{"required":true,"dx":"turnstile-secret","challenge":{"dx":"nested-turnstile-secret"}},
+		"so":{"required":true,"collector_dx":"collector-secret","snapshot_dx":"snapshot-secret"},
 		"other":{"dx":"keep-nested"},
 		"dx":"keep-root"
 	}`)
@@ -471,6 +472,12 @@ func TestChatGPTWebResponseLogBodyRedactsTurnstileDXOnlyForPrepare(t *testing.T)
 	if got := gjson.GetBytes(logged, "turnstile.challenge.dx").String(); got != "<redacted>" {
 		t.Fatalf("turnstile.challenge.dx = %q", got)
 	}
+	if got := gjson.GetBytes(logged, "so.collector_dx").String(); got != "<redacted>" {
+		t.Fatalf("so.collector_dx = %q", got)
+	}
+	if got := gjson.GetBytes(logged, "so.snapshot_dx").String(); got != "<redacted>" {
+		t.Fatalf("so.snapshot_dx = %q", got)
+	}
 	if got := gjson.GetBytes(logged, "other.dx").String(); got != "keep-nested" {
 		t.Fatalf("other.dx = %q", got)
 	}
@@ -481,6 +488,12 @@ func TestChatGPTWebResponseLogBodyRedactsTurnstileDXOnlyForPrepare(t *testing.T)
 	nonPrepare := chatGPTWebResponseLogBody("/backend-api/test", payload)
 	if got := gjson.GetBytes(nonPrepare, "turnstile.dx").String(); got != "turnstile-secret" {
 		t.Fatalf("non-prepare turnstile.dx = %q", got)
+	}
+	if got := gjson.GetBytes(nonPrepare, "so.collector_dx").String(); got != "<redacted>" {
+		t.Fatalf("non-prepare so.collector_dx = %q", got)
+	}
+	if got := gjson.GetBytes(nonPrepare, "so.snapshot_dx").String(); got != "<redacted>" {
+		t.Fatalf("non-prepare so.snapshot_dx = %q", got)
 	}
 }
 
@@ -613,6 +626,7 @@ func TestChatGPTWebRequirementsLocalFailuresDoNotRetryOrCoolCredential(t *testin
 		{name: "malformed prepare", prepare: `{"prepare_token":`},
 		{name: "unsupported challenge", prepare: `{"prepare_token":"prepare","turnstile":{"required":true}}`},
 		{name: "missing finalized token", prepare: `{"prepare_token":"prepare"}`, finalize: `{}`},
+		{name: "non-string finalized token", prepare: `{"prepare_token":"prepare"}`, finalize: `{"token":false}`},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -812,6 +826,52 @@ func TestChatGPTWebRequirementsRejectedTurnstileDoesNotCoolCredential(t *testing
 	}
 }
 
+func TestChatGPTWebRequirementsRejectedSessionObserverDoesNotCoolCredential(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/":
+			_, _ = io.WriteString(w, `<html><script src="/sentinel/20260219f9f6/sdk.js"></script></html>`)
+		case "/backend-api/sentinel/chat-requirements/prepare":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"prepare_token": "prepare",
+				"token":         "challenge-token",
+				"so": map[string]any{
+					"required":     true,
+					"collector_dx": "collector",
+					"snapshot_dx":  "snapshot",
+				},
+			})
+		case "/backend-api/sentinel/chat-requirements/finalize":
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = io.WriteString(w, `{"error":{"code":"invalid_sentinel_so_token","message":"session observer token rejected"}}`)
+		default:
+			http.NotFound(w, request)
+		}
+	}))
+	defer server.Close()
+
+	executor := NewChatGPTWebExecutor(nil, nil)
+	defer executor.Close()
+	executor.runtimeBaseURL = server.URL
+	client, credential, err := executor.newRuntimeClient(chatGPTWebRuntimeAuth())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.CloseIdleConnections()
+	_, err = executor.chatGPTWebRequirements(context.Background(), client, credential)
+	if err == nil {
+		t.Fatal("chatGPTWebRequirements() error = nil")
+	}
+	assertChatGPTWebNonAuthNonRetryError(t, err)
+	var status interface{ StatusCode() int }
+	if !errors.As(err, &status) || status.StatusCode() != http.StatusBadGateway {
+		t.Fatalf("Session Observer rejection status = %v, want 502", err)
+	}
+	if !strings.Contains(err.Error(), `"code":"sentinel_session_observer_unavailable"`) || strings.Contains(err.Error(), "insufficient_quota") {
+		t.Fatalf("Session Observer rejection error = %v", err)
+	}
+}
+
 func TestChatGPTWebRequirementsNonJSONTurnstileRejectionDoesNotCoolCredential(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
 		switch request.URL.Path {
@@ -876,6 +936,21 @@ func TestChatGPTWebTurnstileFinalizeRejectionPreservesUnrelatedForbidden(t *test
 	}
 }
 
+func TestChatGPTWebSessionObserverFinalizeRejectionSkipsCredentialState(t *testing.T) {
+	err := newChatGPTWebStatusError(
+		http.StatusForbidden,
+		"/backend-api/sentinel/chat-requirements/finalize",
+		[]byte(`{"error":{"code":"invalid_sentinel_so_token","message":"session observer token rejected"}}`),
+		nil,
+	)
+	if !chatGPTWebSentinelFinalizeRejection(err) || chatGPTWebTurnstileFinalizeRejection(err) {
+		t.Fatalf("Session Observer finalize classification = %#v", err)
+	}
+	if !err.SkipAuthResult() || err.RetryOtherAuth() {
+		t.Fatalf("Session Observer finalize credential behavior = %#v", err)
+	}
+}
+
 func TestChatGPTWebTurnstileFinalizeRejectionRequiresMarkerForBadRequest(t *testing.T) {
 	unrelated := newChatGPTWebStatusError(
 		http.StatusBadRequest,
@@ -934,6 +1009,32 @@ func TestChatGPTWebTurnstileFinalizeRejectionClassifiesRedactedNonJSONBody(t *te
 				t.Fatalf("unmarked finalize body was classified as Turnstile: %v", err)
 			}
 		})
+	}
+}
+
+func TestChatGPTWebConversationSentinelRejectionSkipsCredentialState(t *testing.T) {
+	for _, path := range []string{"/backend-api/conversation", "/backend-api/f/conversation"} {
+		err := newChatGPTWebStatusError(
+			http.StatusForbidden,
+			path,
+			[]byte(`{"error":{"code":"invalid_sentinel_so_token","message":"session observer token rejected"}}`),
+			nil,
+		)
+		if !err.SkipAuthResult() || err.RetryOtherAuth() {
+			t.Fatalf("%s classified error = %#v", path, err)
+		}
+	}
+}
+
+func TestChatGPTWebConversationOrdinaryForbiddenStillMutatesCredentialState(t *testing.T) {
+	err := newChatGPTWebStatusError(
+		http.StatusForbidden,
+		"/backend-api/conversation",
+		[]byte(`{"error":{"code":"account_restricted","message":"access denied"}}`),
+		nil,
+	)
+	if err.SkipAuthResult() || err.RetryOtherAuth() {
+		t.Fatalf("ordinary forbidden classified error = %#v", err)
 	}
 }
 
@@ -4521,6 +4622,45 @@ func TestPrepareChatGPTWebImageMissingConduitSkipsCredentialState(t *testing.T) 
 		t.Fatalf("prepareChatGPTWebImageConversation() error = %v", err)
 	}
 	assertChatGPTWebNonAuthNonRetryError(t, err)
+}
+
+func TestPrepareChatGPTWebImageDoesNotConsumeSessionObserverToken(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/backend-api/f/conversation/prepare" {
+			http.NotFound(w, request)
+			return
+		}
+		if got := request.Header.Get("OpenAI-Sentinel-So-Token"); got != "" {
+			t.Errorf("OpenAI-Sentinel-So-Token = %q, want empty", got)
+		}
+		if got := request.Header.Get("OpenAI-Sentinel-Chat-Requirements-Token"); got != "requirements" {
+			t.Errorf("OpenAI-Sentinel-Chat-Requirements-Token = %q", got)
+		}
+		_, _ = io.WriteString(w, `{"conduit_token":"conduit"}`)
+	}))
+	defer server.Close()
+
+	executor := NewChatGPTWebExecutor(nil, nil)
+	executor.runtimeBaseURL = server.URL
+	client, credential, err := executor.newRuntimeClient(chatGPTWebRuntimeAuth())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.CloseIdleConnections()
+
+	conduit, err := executor.prepareChatGPTWebImageConversation(
+		context.Background(),
+		client,
+		credential,
+		chatGPTWebRequirements{Token: "requirements", SOToken: "one-request-token"},
+		"draw",
+	)
+	if err != nil {
+		t.Fatalf("prepareChatGPTWebImageConversation() error = %v", err)
+	}
+	if conduit != "conduit" {
+		t.Fatalf("conduit = %q", conduit)
+	}
 }
 
 func TestUploadChatGPTWebImageInvalidMetadataSkipsCredentialState(t *testing.T) {

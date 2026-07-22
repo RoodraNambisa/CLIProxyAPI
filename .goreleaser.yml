@@ -27,6 +27,7 @@ archives:
       - README.md
       - README_CN.md
       - config.example.yaml
+      - third_party/fastschema-qjs/*
 
 checksum:
   name_template: 'checksums.txt'

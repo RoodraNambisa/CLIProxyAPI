@@ -25,6 +25,7 @@ COPY --from=builder /usr/local/go /usr/local/go
 
 COPY config.example.yaml /CLIProxyAPI/config.example.yaml
 COPY docker-entrypoint.sh /CLIProxyAPI/docker-entrypoint.sh
+COPY third_party/fastschema-qjs /CLIProxyAPI/third_party/fastschema-qjs
 
 WORKDIR /CLIProxyAPI
 

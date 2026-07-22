@@ -19,6 +19,7 @@ import (
 	chatgptwebauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/chatgptweb"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/proxypool"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor/helps"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 	log "github.com/sirupsen/logrus"
@@ -63,36 +64,38 @@ var errChatGPTWebReloginOwnershipChanged = errors.New("chatgpt web re-login owne
 // ChatGPTWebExecutor manages ChatGPT Web credential refresh and re-login.
 // Request protocol support is added separately from the credential lifecycle.
 type ChatGPTWebExecutor struct {
-	cfg                 atomic.Pointer[config.Config]
-	manager             *cliproxyauth.Manager
-	authService         chatGPTWebAuthService
-	runtimeBaseURL      string
-	runtimeRand         io.Reader
-	imageInitialWait    time.Duration
-	imagePollInterval   time.Duration
-	imageSettleWait     time.Duration
-	imageMaxPolls       int
-	searchPollInterval  time.Duration
-	searchMaxPolls      int
-	streamInitialWait   time.Duration
-	streamHeartbeat     time.Duration
-	now                 func() time.Time
-	reloginBackoff      func(int) time.Duration
-	reloginSlotAcquired func()
-	reloginSlots        chan struct{}
-	refreshGroup        singleflight.Group
-	refreshWG           sync.WaitGroup
-	reloginMu           sync.Mutex
-	reloginFlights      map[string]*chatGPTWebReloginFlight
-	reloginWG           sync.WaitGroup
-	loginCoordinator    *ChatGPTWebLoginCoordinator
-	loginWG             sync.WaitGroup
-	backgroundMu        sync.Mutex
-	backgroundWG        sync.WaitGroup
-	backgroundRunning   map[string]struct{}
-	lifecycleCtx        context.Context
-	lifecycleCancel     context.CancelFunc
-	closed              bool
+	cfg                       atomic.Pointer[config.Config]
+	manager                   *cliproxyauth.Manager
+	authService               chatGPTWebAuthService
+	runtimeBaseURL            string
+	runtimeRand               io.Reader
+	imageInitialWait          time.Duration
+	imagePollInterval         time.Duration
+	imageSettleWait           time.Duration
+	imageMaxPolls             int
+	searchPollInterval        time.Duration
+	searchMaxPolls            int
+	streamInitialWait         time.Duration
+	streamHeartbeat           time.Duration
+	now                       func() time.Time
+	reloginBackoff            func(int) time.Duration
+	reloginSlotAcquired       func()
+	reloginSlots              chan struct{}
+	refreshGroup              singleflight.Group
+	refreshWG                 sync.WaitGroup
+	reloginMu                 sync.Mutex
+	reloginFlights            map[string]*chatGPTWebReloginFlight
+	reloginWG                 sync.WaitGroup
+	loginCoordinator          *ChatGPTWebLoginCoordinator
+	loginWG                   sync.WaitGroup
+	sentinelRuntime           helps.ChatGPTWebSentinelRuntime
+	sentinelSDKFetcherFactory func(*chatgptwebauth.Client, *chatgptwebauth.Credential) chatgptwebauth.SentinelSDKFetcher
+	backgroundMu              sync.Mutex
+	backgroundWG              sync.WaitGroup
+	backgroundRunning         map[string]struct{}
+	lifecycleCtx              context.Context
+	lifecycleCancel           context.CancelFunc
+	closed                    bool
 }
 
 // NewChatGPTWebExecutor creates a lifecycle-aware ChatGPT Web executor.
@@ -125,6 +128,7 @@ func NewChatGPTWebExecutorWithLoginCoordinator(cfg *config.Config, manager *clip
 		reloginSlots:       chatGPTWebBackgroundReloginSlots,
 		reloginFlights:     make(map[string]*chatGPTWebReloginFlight),
 		loginCoordinator:   coordinator,
+		sentinelRuntime:    helps.NewChatGPTWebSentinelRuntime(chatGPTWebSentinelRuntimeConfig(cfg)),
 		backgroundRunning:  make(map[string]struct{}),
 		lifecycleCtx:       lifecycleCtx,
 		lifecycleCancel:    lifecycleCancel,
@@ -151,6 +155,9 @@ func (e *ChatGPTWebExecutor) Close() error {
 	e.backgroundWG.Wait()
 	e.reloginWG.Wait()
 	e.loginWG.Wait()
+	if e.sentinelRuntime != nil {
+		e.sentinelRuntime.Close()
+	}
 	return nil
 }
 
@@ -165,6 +172,9 @@ func (e *ChatGPTWebExecutor) UpdateConfig(cfg *config.Config) {
 	}
 	if cfg == nil {
 		e.cfg.Store(nil)
+		if e.sentinelRuntime != nil {
+			e.sentinelRuntime.UpdateConfig(chatgptwebauth.SentinelRuntimeConfig{})
+		}
 		return
 	}
 	snapshot, errClone := cloneChatGPTWebExecutorConfig(cfg)
@@ -173,6 +183,30 @@ func (e *ChatGPTWebExecutor) UpdateConfig(cfg *config.Config) {
 		return
 	}
 	e.cfg.Store(snapshot)
+	if e.sentinelRuntime != nil {
+		e.sentinelRuntime.UpdateConfig(chatGPTWebSentinelRuntimeConfig(snapshot))
+	}
+}
+
+func chatGPTWebSentinelRuntimeConfig(cfg *config.Config) chatgptwebauth.SentinelRuntimeConfig {
+	if cfg == nil {
+		return chatgptwebauth.SentinelRuntimeConfig{}
+	}
+	resolved := cfg.ChatGPTWeb.Sentinel.Resolved()
+	return chatgptwebauth.SentinelRuntimeConfig{
+		Enabled:       resolved.SDKRuntimeEnabled,
+		Workers:       resolved.SDKWorkers,
+		QueueSize:     resolved.SDKQueueSize,
+		CacheVersions: resolved.SDKCacheVersions,
+	}
+}
+
+// SentinelSnapshot returns the currently applied SDK runtime state.
+func (e *ChatGPTWebExecutor) SentinelSnapshot() chatgptwebauth.SentinelRuntimeSnapshot {
+	if e == nil || e.sentinelRuntime == nil {
+		return chatgptwebauth.SentinelRuntimeSnapshot{}
+	}
+	return e.sentinelRuntime.Snapshot()
 }
 
 func (e *ChatGPTWebExecutor) configSnapshot() *config.Config {

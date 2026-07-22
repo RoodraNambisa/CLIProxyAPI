@@ -3,7 +3,9 @@ package chatgptweb
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -16,6 +18,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 	"unicode/utf16"
 	"unicode/utf8"
 )
@@ -29,6 +32,7 @@ const (
 	conversationTurnstileMaxJSONDepth      = 128
 	conversationTurnstileMaxJSONNodes      = 131_072
 	conversationTurnstileMaxRegexpBytes    = 64 << 10
+	conversationTurnstileRegexpAnalysisMax = conversationTurnstileMaxRegexpBytes * 8
 	conversationTurnstileMaxRuntimeWork    = 64 << 20
 	conversationTurnstileMaxPrototypeDepth = 256
 )
@@ -184,37 +188,86 @@ func (ordered *conversationTurnstileOrderedMap) jsKeys(ctx context.Context, rese
 		if err := charge(len(ordered.keys) * 32); err != nil {
 			return nil, err
 		}
-		for index, key := range ordered.keys {
-			if index&255 == 0 && ctx != nil {
-				if err := ctx.Err(); err != nil {
-					return nil, err
-				}
+	}
+	for index, key := range ordered.keys {
+		if index&255 == 0 && ctx != nil {
+			if err := ctx.Err(); err != nil {
+				return nil, err
 			}
+		}
+		if charge != nil {
 			if err := charge(conversationTurnstileStringStorageSize(key)); err != nil {
 				return nil, err
 			}
 		}
 	}
 	if reserve != nil {
-		if err := reserve(len(ordered.keys) * 16); err != nil {
+		if err := reserve(len(ordered.keys) * 32); err != nil {
 			return nil, err
 		}
 	}
-	keys := append([]any(nil), ordered.keys...)
-	sort.SliceStable(keys, func(left, right int) bool {
-		leftIndex, leftIsIndex := conversationTurnstileArrayIndexKey(keys[left])
-		rightIndex, rightIsIndex := conversationTurnstileArrayIndexKey(keys[right])
-		if leftIsIndex != rightIsIndex {
-			return leftIsIndex
+	keys := make([]any, len(ordered.keys))
+	for index, key := range ordered.keys {
+		if index&255 == 0 && ctx != nil {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
 		}
-		return leftIsIndex && leftIndex < rightIndex
-	})
-	if ctx != nil {
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
+		keys[index] = key
+	}
+	if err := conversationTurnstileStableSortJSKeys(ctx, keys); err != nil {
+		return nil, err
 	}
 	return keys, nil
+}
+
+func conversationTurnstileStableSortJSKeys(ctx context.Context, keys []any) error {
+	if len(keys) < 2 {
+		if ctx != nil {
+			return ctx.Err()
+		}
+		return nil
+	}
+	scratch := make([]any, len(keys))
+	source, destination := keys, scratch
+	for width := 1; width < len(keys); width *= 2 {
+		operations := 0
+		for start := 0; start < len(keys); start += width * 2 {
+			middle := min(start+width, len(keys))
+			end := min(start+width*2, len(keys))
+			left, right, output := start, middle, start
+			for left < middle || right < end {
+				if operations&255 == 0 && ctx != nil {
+					if err := ctx.Err(); err != nil {
+						return err
+					}
+				}
+				operations++
+				if right < end && (left >= middle || conversationTurnstileJSKeyBefore(source[right], source[left])) {
+					destination[output] = source[right]
+					right++
+				} else {
+					destination[output] = source[left]
+					left++
+				}
+				output++
+			}
+		}
+		source, destination = destination, source
+	}
+	if &source[0] != &keys[0] {
+		copy(keys, source)
+	}
+	return nil
+}
+
+func conversationTurnstileJSKeyBefore(left, right any) bool {
+	leftIndex, leftIsIndex := conversationTurnstileArrayIndexKey(left)
+	rightIndex, rightIsIndex := conversationTurnstileArrayIndexKey(right)
+	if leftIsIndex != rightIsIndex {
+		return leftIsIndex
+	}
+	return leftIsIndex && leftIndex < rightIndex
 }
 
 func conversationTurnstileArrayIndexKey(value any) (uint32, bool) {
@@ -325,7 +378,8 @@ func conversationTurnstileFatalInstructionError(ctx context.Context, err error) 
 		return nil
 	}
 	var fatal conversationTurnstileFatalError
-	if errors.As(err, &fatal) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+	var compatibility *SentinelCompatibilityError
+	if errors.As(err, &fatal) || errors.As(err, &compatibility) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return err
 	}
 	if ctx != nil && ctx.Err() != nil {
@@ -380,6 +434,10 @@ type conversationTurnstileVM struct {
 	settled              bool
 	deferred             bool
 	instructionCount     int
+	compatibilityErrors  bool
+	program              []any
+	opcodeSignature      string
+	missingValues        map[string]string
 }
 
 // BuildConversationTurnstileToken executes the compact Sentinel VM challenge
@@ -399,41 +457,81 @@ func buildConversationTurnstileToken(ctx context.Context, dx, requirementsToken 
 }
 
 func buildConversationTurnstileTokenWithEnvironment(ctx context.Context, dx, requirementsToken string, environment ConversationTurnstileEnvironment, reader io.Reader, now func() time.Time, maxSteps, depth int, memoryBudget *conversationTurnstileMemoryBudget, executionBudget *conversationTurnstileExecutionBudget) (string, error) {
+	return buildConversationTurnstileTokenWithEnvironmentMode(ctx, dx, requirementsToken, environment, reader, now, maxSteps, depth, memoryBudget, executionBudget, false)
+}
+
+func solveConversationTurnstileTokenWithEnvironment(ctx context.Context, dx, requirementsToken string, environment ConversationTurnstileEnvironment, reader io.Reader, now func() time.Time) (string, error) {
+	return buildConversationTurnstileTokenWithEnvironmentMode(ctx, dx, requirementsToken, environment, reader, now, defaultConversationTurnstileMaxSteps, 0, nil, nil, true)
+}
+
+type conversationTurnstilePreparedProgram struct {
+	program           []any
+	requirementsToken string
+	memoryBudget      *conversationTurnstileMemoryBudget
+	opcodeSignature   string
+}
+
+func buildConversationTurnstileTokenWithEnvironmentMode(ctx context.Context, dx, requirementsToken string, environment ConversationTurnstileEnvironment, reader io.Reader, now func() time.Time, maxSteps, depth int, memoryBudget *conversationTurnstileMemoryBudget, executionBudget *conversationTurnstileExecutionBudget, compatibilityErrors bool) (string, error) {
+	prepared, err := prepareConversationTurnstileProgram(ctx, dx, requirementsToken, memoryBudget)
+	if err != nil {
+		return "", err
+	}
+	return executeConversationTurnstileProgram(ctx, prepared, environment, reader, now, maxSteps, depth, executionBudget, compatibilityErrors)
+}
+
+func prepareConversationTurnstileProgram(ctx context.Context, dx, requirementsToken string, memoryBudget *conversationTurnstileMemoryBudget) (*conversationTurnstilePreparedProgram, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	if err := ctx.Err(); err != nil {
-		return "", err
+		return nil, err
 	}
 	if len(dx) > base64.StdEncoding.EncodedLen(conversationTurnstileMaxBytes) {
-		return "", fmt.Errorf("decode conversation turnstile challenge: payload exceeds %d bytes", conversationTurnstileMaxBytes)
+		return nil, fmt.Errorf("decode conversation turnstile challenge: payload exceeds %d bytes", conversationTurnstileMaxBytes)
 	}
 	if len(requirementsToken) > conversationTurnstileMaxValueBytes {
-		return "", fmt.Errorf("conversation turnstile requirements token exceeds %d bytes", conversationTurnstileMaxValueBytes)
+		return nil, fmt.Errorf("conversation turnstile requirements token exceeds %d bytes", conversationTurnstileMaxValueBytes)
 	}
 	dx = strings.TrimSpace(dx)
 	requirementsToken = strings.TrimSpace(requirementsToken)
 	if dx == "" || requirementsToken == "" {
-		return "", fmt.Errorf("invalid conversation turnstile challenge")
+		return nil, fmt.Errorf("invalid conversation turnstile challenge")
 	}
 	decoded, err := decodeConversationTurnstileDXContext(ctx, dx)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	if memoryBudget == nil {
 		memoryBudget = &conversationTurnstileMemoryBudget{}
 	}
 	programData, err := xorConversationTurnstileBytesContext(ctx, decoded, []byte(requirementsToken))
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	programValue, err := decodeConversationTurnstileJSONWithContextAndBudget(ctx, programData, memoryBudget)
 	if err != nil {
-		return "", fmt.Errorf("decode conversation turnstile program: %w", err)
+		return nil, fmt.Errorf("decode conversation turnstile program: %w", err)
 	}
 	program, ok := conversationTurnstileSlice(programValue)
 	if !ok {
-		return "", fmt.Errorf("decode conversation turnstile program: root is not an array")
+		return nil, fmt.Errorf("decode conversation turnstile program: root is not an array")
+	}
+	return &conversationTurnstilePreparedProgram{
+		program:           program,
+		requirementsToken: requirementsToken,
+		memoryBudget:      memoryBudget,
+	}, nil
+}
+
+func executeConversationTurnstileProgram(ctx context.Context, prepared *conversationTurnstilePreparedProgram, environment ConversationTurnstileEnvironment, reader io.Reader, now func() time.Time, maxSteps, depth int, executionBudget *conversationTurnstileExecutionBudget, compatibilityErrors bool) (string, error) {
+	if prepared == nil || prepared.memoryBudget == nil {
+		return "", fmt.Errorf("invalid conversation turnstile challenge")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return "", err
 	}
 	if now == nil {
 		now = time.Now
@@ -453,15 +551,18 @@ func buildConversationTurnstileTokenWithEnvironment(ctx context.Context, dx, req
 		now:                  now,
 		startedAt:            now(),
 		depth:                depth,
-		requirementsToken:    requirementsToken,
+		requirementsToken:    prepared.requirementsToken,
 		challengeEnvironment: environment,
-		memoryBudget:         memoryBudget,
+		memoryBudget:         prepared.memoryBudget,
 		executionBudget:      executionBudget,
 		regexpCache:          make(map[string]*regexp.Regexp),
+		compatibilityErrors:  compatibilityErrors,
+		program:              prepared.program,
+		opcodeSignature:      prepared.opcodeSignature,
 	}
 	vm.environment, vm.scriptSources, vm.localStorageKeys = normalizeConversationTurnstileEnvironment(environment, vm.startedAt)
-	vm.initialize(program, requirementsToken)
-	if err = vm.runQueue(); err != nil {
+	vm.initialize(prepared.program, prepared.requirementsToken)
+	if err := vm.runQueue(); err != nil {
 		if fatalErr := conversationTurnstileFatalInstructionError(ctx, err); fatalErr != nil {
 			return "", fatalErr
 		}
@@ -1094,9 +1195,26 @@ func (vm *conversationTurnstileVM) runQueue() error {
 		if len(instruction) > 1 {
 			callArgs = instruction[1:]
 		}
-		callable := vm.get(opcode)
+		callable, opcodeExists := vm.lookup(opcode)
 		if vm.fatalErr != nil {
 			return vm.fatalErr
+		}
+		if vm.compatibilityErrors && !opcodeExists {
+			if opcodeNumber, okOpcode := conversationSentinelOpcodeNumber(opcode); okOpcode &&
+				conversationSentinelReservedOpcode(opcodeNumber) && !conversationSentinelSupportedOpcode(opcodeNumber) {
+				if vm.opcodeSignature == "" {
+					signature, signatureErr := conversationSentinelProgramSignature(vm.ctx, vm.program)
+					if signatureErr != nil {
+						return signatureErr
+					}
+					vm.opcodeSignature = signature
+				}
+				return vm.compatibilityError(
+					SentinelCompatibilityUnknownOpcode,
+					"opcode:"+strconv.FormatInt(opcodeNumber, 10),
+					conversationTurnstileTypeError("value is not callable"),
+				)
+			}
 		}
 		if _, err := vm.call(callable, callArgs); err != nil {
 			if vm.fatalErr != nil {
@@ -1147,15 +1265,35 @@ func (vm *conversationTurnstileVM) chargeStep() error {
 }
 
 func (vm *conversationTurnstileVM) get(key any) any {
+	value, _ := vm.lookup(key)
+	if !vm.compatibilityErrors || vm.fatalErr != nil || vm.missingValues == nil {
+		return value
+	}
+	if missing := vm.missingValues[conversationTurnstileMapKey(key)]; missing != "" {
+		vm.fail(vm.compatibilityError(
+			SentinelCompatibilityMissingEnvironment,
+			missing,
+			conversationTurnstileTypeError("missing browser environment property was used"),
+		))
+	}
+	return value
+}
+
+func (vm *conversationTurnstileVM) getAllowMissing(key any) any {
+	value, _ := vm.lookup(key)
+	return value
+}
+
+func (vm *conversationTurnstileVM) lookup(key any) (any, bool) {
 	mapKey := vm.mapKey(key)
 	if vm.fatalErr != nil {
-		return conversationTurnstileUndefined
+		return conversationTurnstileUndefined, false
 	}
 	value, exists := vm.values[mapKey]
 	if !exists {
-		return conversationTurnstileUndefined
+		return conversationTurnstileUndefined, false
 	}
-	return value
+	return value, true
 }
 
 func (vm *conversationTurnstileVM) set(key, value any) {
@@ -1167,6 +1305,9 @@ func (vm *conversationTurnstileVM) set(key, value any) {
 		vm.values = make(map[string]any)
 	}
 	vm.values[mapKey] = value
+	if vm.compatibilityErrors && vm.missingValues != nil {
+		delete(vm.missingValues, mapKey)
+	}
 }
 
 func (vm *conversationTurnstileVM) chargeRuntimeWork(size int) error {
@@ -1210,6 +1351,105 @@ func (vm *conversationTurnstileVM) fail(err error) {
 	if err != nil && vm.fatalErr == nil {
 		vm.fatalErr = err
 	}
+}
+
+func (vm *conversationTurnstileVM) compatibilityError(kind SentinelCompatibilityKind, operation string, err error) error {
+	return &SentinelCompatibilityError{
+		Kind:            kind,
+		ProgramKind:     SentinelProgramTurnstile,
+		OpcodeSignature: vm.opcodeSignature,
+		Operation:       strings.TrimSpace(operation),
+		Err:             err,
+	}
+}
+
+func (vm *conversationTurnstileVM) setMissingValue(key any, value string) {
+	if value == "" {
+		return
+	}
+	mapKey := conversationTurnstileMapKey(key)
+	workSize := len(mapKey) + len(value)
+	if err := vm.chargeRuntimeWork(workSize); err != nil {
+		vm.fail(err)
+		return
+	}
+	previous := ""
+	exists := false
+	if vm.missingValues != nil {
+		previous, exists = vm.missingValues[mapKey]
+	}
+	allocationSize := len(value) - len(previous)
+	if !exists {
+		allocationSize += len(mapKey) + 64
+	}
+	if allocationSize > 0 {
+		if err := vm.reserveRuntimeBytes(allocationSize); err != nil {
+			vm.fail(err)
+			return
+		}
+	}
+	if vm.missingValues == nil {
+		vm.missingValues = make(map[string]string)
+	}
+	vm.missingValues[mapKey] = value
+}
+
+func (vm *conversationTurnstileVM) callReferenced(key any, args []any) (any, error) {
+	target := vm.get(key)
+	if vm.fatalErr != nil {
+		return nil, vm.fatalErr
+	}
+	if !vm.compatibilityErrors {
+		return vm.call(target, args)
+	}
+	value, err := vm.call(target, args)
+	if err == nil {
+		return value, err
+	}
+	var fatal conversationTurnstileFatalError
+	if errors.As(err, &fatal) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || vm.ctx.Err() != nil {
+		return value, err
+	}
+	if vm.missingValues != nil {
+		if missing := vm.missingValues[conversationTurnstileMapKey(key)]; missing != "" {
+			return nil, vm.compatibilityError(SentinelCompatibilityMissingEnvironment, missing, err)
+		}
+	}
+	return value, err
+}
+
+func (vm *conversationTurnstileVM) missingPropertyBase(objectKey, object any) (string, bool) {
+	if !vm.compatibilityErrors {
+		return "", false
+	}
+	if vm.missingValues != nil {
+		if base := vm.missingValues[conversationTurnstileMapKey(objectKey)]; base != "" {
+			return base, true
+		}
+	}
+	if objectRef, ok := object.(conversationTurnstileObjectRef); ok && strings.HasPrefix(objectRef.path, "window") {
+		return objectRef.path, false
+	}
+	return "", false
+}
+
+func (vm *conversationTurnstileVM) missingPropertyPath(base string, propertyKey any) string {
+	if base == "" {
+		return ""
+	}
+	keyText, err := vm.runtimeString(propertyKey)
+	if err != nil {
+		vm.fail(err)
+		return ""
+	}
+	if keyText == "" {
+		return base
+	}
+	if len(base) > conversationTurnstileMaxValueBytes-len(keyText)-1 {
+		vm.fail(conversationTurnstileFatalError{message: "conversation turnstile missing property path exceeds limit"})
+		return ""
+	}
+	return base + "." + keyText
 }
 
 func (vm *conversationTurnstileVM) mapKey(value any) string {
@@ -1444,6 +1684,7 @@ func (vm *conversationTurnstileVM) primitiveWithHint(value any, stringHint bool)
 }
 
 func (vm *conversationTurnstileVM) compileRegexp(value any) (*regexp.Regexp, error) {
+	hasIsolatedSurrogate := false
 	switch typed := value.(type) {
 	case string:
 		if len(typed) > conversationTurnstileMaxRegexpBytes {
@@ -1453,6 +1694,7 @@ func (vm *conversationTurnstileVM) compileRegexp(value any) (*regexp.Regexp, err
 		if len(typed.units) > conversationTurnstileMaxRegexpBytes {
 			return nil, conversationTurnstileRegexpSizeError()
 		}
+		hasIsolatedSurrogate = conversationTurnstileHasIsolatedSurrogate(typed.units)
 	}
 	pattern, err := conversationTurnstileStringLimited(value, conversationTurnstileMaxRegexpBytes+1)
 	if err != nil {
@@ -1467,21 +1709,997 @@ func (vm *conversationTurnstileVM) compileRegexp(value any) (*regexp.Regexp, err
 	if err = vm.reserveRuntimeBytes(len(pattern)); err != nil {
 		return nil, err
 	}
+	if vm.compatibilityErrors && hasIsolatedSurrogate {
+		patternHash := sha256.Sum256([]byte(pattern))
+		return nil, vm.compatibilityError(
+			SentinelCompatibilityUnsupportedValue,
+			"RegExp:"+hex.EncodeToString(patternHash[:]),
+			errors.New("JavaScript regular expression with an isolated UTF-16 surrogate is not supported by the Go VM"),
+		)
+	}
 	if vm.regexpCache == nil {
 		vm.regexpCache = make(map[string]*regexp.Regexp)
 	}
 	if matcher := vm.regexpCache[pattern]; matcher != nil {
 		return matcher, nil
 	}
+	if conversationTurnstileRegexpHasInvalidECMAScriptExtension(pattern) {
+		return nil, errors.New("invalid JavaScript regular expression")
+	}
 	if err = vm.reserveRuntimeBytes(256 + len(pattern)*8); err != nil {
 		return nil, err
 	}
 	matcher, err := regexp.Compile(pattern)
+	if vm.compatibilityErrors && ((err == nil && conversationTurnstileRegexpHasDifferentRE2Semantics(pattern)) ||
+		(err != nil && conversationTurnstileJavaScriptOnlyRegexp(pattern))) {
+		patternHash := sha256.Sum256([]byte(pattern))
+		return nil, vm.compatibilityError(
+			SentinelCompatibilityUnsupportedValue,
+			"RegExp:"+hex.EncodeToString(patternHash[:]),
+			errors.New("JavaScript regular expression is not supported by the Go VM"),
+		)
+	}
 	if err != nil {
 		return nil, err
 	}
 	vm.regexpCache[pattern] = matcher
 	return matcher, nil
+}
+
+func conversationTurnstileJavaScriptOnlyRegexp(pattern string) bool {
+	transformed, compatible := conversationTurnstileRegexpForRE2Validation(pattern)
+	if !compatible {
+		return false
+	}
+	_, err := regexp.Compile(transformed)
+	return err == nil
+}
+
+func conversationTurnstileRegexpForRE2Validation(pattern string) (string, bool) {
+	type groupKind uint8
+	const (
+		groupCapture groupKind = iota
+		groupLookahead
+		groupLookbehind
+	)
+	_, invalidNamedCapture, patternHasNamedCaptures, _ := conversationTurnstileRegexpNamedCaptureAnalysis(pattern)
+	if invalidNamedCapture {
+		return "", false
+	}
+	var transformed strings.Builder
+	transformed.Grow(len(pattern))
+	groups := make([]groupKind, 0, 8)
+	namedCaptures := make(map[string]struct{})
+	var namedRefs []string
+	bareNamedEscapes := 0
+	javascriptOnly := false
+	inClass := false
+	closedGroup := groupCapture
+	hasClosedGroup := false
+
+	for index := 0; index < len(pattern); {
+		current := pattern[index]
+		if hasClosedGroup {
+			if closedGroup == groupLookbehind {
+				switch current {
+				case '*', '+', '?':
+					return "", false
+				case '{':
+					if _, _, _, validRepeat := conversationTurnstileRegexpRepeat(pattern, index); validRepeat {
+						return "", false
+					}
+				}
+			}
+			hasClosedGroup = false
+		}
+		if inClass {
+			if current == '\\' {
+				if index+1 >= len(pattern) {
+					return "", false
+				}
+				next := pattern[index+1]
+				switch {
+				case next >= utf8.RuneSelf:
+					value, size := utf8.DecodeRuneInString(pattern[index+1:])
+					if value == utf8.RuneError && size == 1 {
+						return "", false
+					}
+					transformed.WriteString(pattern[index+1 : index+1+size])
+					javascriptOnly = true
+					index += 1 + size
+				case next == 'b':
+					transformed.WriteString(`\x08`)
+					javascriptOnly = true
+					index += 2
+				case next == 'B':
+					transformed.WriteByte('B')
+					javascriptOnly = true
+					index += 2
+				case next >= '0' && next <= '9':
+					end := index + 2
+					for end < len(pattern) && pattern[end] >= '0' && pattern[end] <= '9' {
+						end++
+					}
+					transformed.WriteByte('x')
+					javascriptOnly = true
+					index = end
+				case next == 'k':
+					bareNamedEscapes++
+					transformed.WriteByte('k')
+					javascriptOnly = true
+					index += 2
+				case next == 'u':
+					transformed.WriteByte('x')
+					javascriptOnly = true
+					if index+6 <= len(pattern) && conversationTurnstileRegexpHex(pattern[index+2:index+6]) {
+						index += 6
+					} else {
+						index += 2
+					}
+				case next == 'x':
+					if index+4 <= len(pattern) && conversationTurnstileRegexpHexBytes(pattern[index+2:index+4]) {
+						transformed.WriteString(pattern[index : index+4])
+						index += 4
+					} else {
+						transformed.WriteByte('x')
+						javascriptOnly = true
+						index += 2
+					}
+				case next == 'c':
+					transformed.WriteByte('x')
+					javascriptOnly = true
+					if index+2 < len(pattern) && conversationTurnstileRegexpASCIILetter(pattern[index+2]) {
+						index += 3
+					} else {
+						index += 2
+					}
+				case conversationTurnstileRegexpIdentityEscape(next):
+					if next == '-' {
+						transformed.WriteString(`\-`)
+					} else {
+						transformed.WriteByte(next)
+					}
+					javascriptOnly = true
+					index += 2
+				default:
+					transformed.WriteByte(current)
+					transformed.WriteByte(next)
+					index += 2
+				}
+				continue
+			}
+			transformed.WriteByte(current)
+			index++
+			if current == ']' {
+				inClass = false
+			}
+			continue
+		}
+
+		switch current {
+		case '[':
+			if strings.HasPrefix(pattern[index:], "[]") {
+				transformed.WriteByte('x')
+				javascriptOnly = true
+				index += 2
+				continue
+			}
+			if strings.HasPrefix(pattern[index:], "[^]") {
+				transformed.WriteByte('.')
+				javascriptOnly = true
+				index += 3
+				continue
+			}
+			inClass = true
+			transformed.WriteByte(current)
+			index++
+		case '\\':
+			if index+1 >= len(pattern) {
+				return "", false
+			}
+			next := pattern[index+1]
+			if next >= '0' && next <= '9' {
+				end := index + 2
+				for end < len(pattern) && pattern[end] >= '0' && pattern[end] <= '9' {
+					end++
+				}
+				transformed.WriteByte('x')
+				javascriptOnly = true
+				index = end
+				continue
+			}
+			if patternHasNamedCaptures && next == 'k' && index+2 < len(pattern) && pattern[index+2] == '<' {
+				closeIndex := strings.IndexByte(pattern[index+3:], '>')
+				if closeIndex < 0 {
+					return "", false
+				}
+				closeIndex += index + 3
+				name, validName := conversationTurnstileRegexpIdentifierName(pattern[index+3 : closeIndex])
+				if !validName {
+					return "", false
+				}
+				namedRefs = append(namedRefs, name)
+				transformed.WriteByte('x')
+				javascriptOnly = true
+				index = closeIndex + 1
+				continue
+			}
+			if next == 'k' {
+				bareNamedEscapes++
+				transformed.WriteByte('k')
+				javascriptOnly = true
+				index += 2
+				continue
+			}
+			if next == 'u' {
+				transformed.WriteByte('x')
+				javascriptOnly = true
+				if index+6 <= len(pattern) && conversationTurnstileRegexpHex(pattern[index+2:index+6]) {
+					index += 6
+				} else {
+					index += 2
+				}
+				continue
+			}
+			if next == 'x' {
+				if index+4 <= len(pattern) && conversationTurnstileRegexpHexBytes(pattern[index+2:index+4]) {
+					transformed.WriteString(pattern[index : index+4])
+					index += 4
+				} else {
+					transformed.WriteByte('x')
+					javascriptOnly = true
+					index += 2
+				}
+				continue
+			}
+			if next == 'c' {
+				transformed.WriteByte('x')
+				javascriptOnly = true
+				if index+2 < len(pattern) && conversationTurnstileRegexpASCIILetter(pattern[index+2]) {
+					index += 3
+				} else {
+					index += 2
+				}
+				continue
+			}
+			if next >= utf8.RuneSelf {
+				value, size := utf8.DecodeRuneInString(pattern[index+1:])
+				if value == utf8.RuneError && size == 1 {
+					return "", false
+				}
+				transformed.WriteString(pattern[index+1 : index+1+size])
+				javascriptOnly = true
+				index += 1 + size
+				continue
+			}
+			if conversationTurnstileRegexpIdentityEscape(next) {
+				transformed.WriteByte(next)
+				javascriptOnly = true
+				index += 2
+				continue
+			}
+			transformed.WriteByte(current)
+			transformed.WriteByte(next)
+			index += 2
+		case '(':
+			switch {
+			case strings.HasPrefix(pattern[index:], "(?<=") || strings.HasPrefix(pattern[index:], "(?<!"):
+				transformed.WriteByte('(')
+				groups = append(groups, groupLookbehind)
+				javascriptOnly = true
+				index += 4
+			case strings.HasPrefix(pattern[index:], "(?=") || strings.HasPrefix(pattern[index:], "(?!"):
+				transformed.WriteByte('(')
+				groups = append(groups, groupLookahead)
+				javascriptOnly = true
+				index += 3
+			case strings.HasPrefix(pattern[index:], "(?:"):
+				transformed.WriteByte('(')
+				groups = append(groups, groupCapture)
+				javascriptOnly = true
+				index += 3
+			case strings.HasPrefix(pattern[index:], "(?<"):
+				closeIndex := strings.IndexByte(pattern[index+3:], '>')
+				if closeIndex < 0 {
+					return "", false
+				}
+				closeIndex += index + 3
+				name, validName := conversationTurnstileRegexpIdentifierName(pattern[index+3 : closeIndex])
+				if !validName {
+					return "", false
+				}
+				namedCaptures[name] = struct{}{}
+				transformed.WriteByte('(')
+				groups = append(groups, groupCapture)
+				javascriptOnly = true
+				index = closeIndex + 1
+			default:
+				next, validModifier, modifierGroup := conversationTurnstileRegexpModifierGroup(pattern[index:])
+				if modifierGroup {
+					if !validModifier {
+						return "", false
+					}
+					transformed.WriteByte('(')
+					groups = append(groups, groupCapture)
+					javascriptOnly = true
+					index += next
+				} else if strings.HasPrefix(pattern[index:], "(?") {
+					return "", false
+				} else {
+					transformed.WriteByte(current)
+					groups = append(groups, groupCapture)
+					index++
+				}
+			}
+		case ')':
+			if len(groups) == 0 {
+				return "", false
+			}
+			closedGroup = groups[len(groups)-1]
+			hasClosedGroup = true
+			groups = groups[:len(groups)-1]
+			transformed.WriteByte(current)
+			index++
+		case '{':
+			end, replacement, onlyJavaScript, valid := conversationTurnstileRegexpRepeat(pattern, index)
+			if !valid {
+				transformed.WriteByte(current)
+				index++
+				continue
+			}
+			transformed.WriteString(replacement)
+			javascriptOnly = javascriptOnly || onlyJavaScript
+			index = end
+		default:
+			transformed.WriteByte(current)
+			index++
+		}
+	}
+	if inClass || len(groups) != 0 || !javascriptOnly {
+		return "", false
+	}
+	if patternHasNamedCaptures {
+		if bareNamedEscapes > 0 {
+			return "", false
+		}
+		for _, name := range namedRefs {
+			if _, exists := namedCaptures[name]; !exists {
+				return "", false
+			}
+		}
+	}
+	return transformed.String(), true
+}
+
+func conversationTurnstileRegexpHasDifferentRE2Semantics(pattern string) bool {
+	for _, value := range pattern {
+		if value > 0xffff {
+			return true
+		}
+	}
+	if conversationTurnstileRegexpClassRangeCoversSurrogate(pattern) {
+		return true
+	}
+	if duplicateNamedCapture, _, _, analysisLimited := conversationTurnstileRegexpNamedCaptureAnalysis(pattern); duplicateNamedCapture || analysisLimited {
+		return true
+	}
+	inClass := false
+	for index := 0; index < len(pattern); index++ {
+		switch pattern[index] {
+		case '[':
+			if inClass {
+				if strings.HasPrefix(pattern[index:], "[:") {
+					return true
+				}
+			} else {
+				if strings.HasPrefix(pattern[index:], "[[:") || strings.HasPrefix(pattern[index:], "[^") {
+					return true
+				}
+				inClass = true
+			}
+		case ']':
+			if inClass {
+				inClass = false
+			}
+		case '\\':
+			if index+1 >= len(pattern) {
+				return false
+			}
+			next := pattern[index+1]
+			if next >= '0' && next <= '9' {
+				return true
+			}
+			if next == 'p' || next == 'P' || next == 's' || next == 'S' || next == 'D' || next == 'W' ||
+				(next == 'x' && index+2 < len(pattern) && pattern[index+2] == '{') {
+				return true
+			}
+			if (inClass && next == 'b') || conversationTurnstileRegexpHasDifferentEscapeSemantics(next) {
+				return true
+			}
+			index++
+		case '.', '$':
+			if !inClass {
+				return true
+			}
+		case '(':
+			if !inClass {
+				_, validModifier, modifierGroup := conversationTurnstileRegexpModifierGroup(pattern[index:])
+				if modifierGroup && validModifier {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+func conversationTurnstileRegexpClassRangeCoversSurrogate(pattern string) bool {
+	inClass := false
+	var previous rune
+	previousValid := false
+	previousUnknown := false
+	for index := 0; index < len(pattern); {
+		if !inClass {
+			if pattern[index] == '\\' {
+				_, end, _, _ := conversationTurnstileRegexpClassAtom(pattern, index)
+				if end <= index {
+					index++
+				} else {
+					index = end
+				}
+				continue
+			}
+			value, end, valid, _ := conversationTurnstileRegexpClassAtom(pattern, index)
+			if !valid {
+				index++
+				continue
+			}
+			if value == '[' {
+				inClass = true
+				previousValid = false
+				previousUnknown = false
+			}
+			index = end
+			continue
+		}
+		if pattern[index] == ']' {
+			inClass = false
+			previousValid = false
+			previousUnknown = false
+			index++
+			continue
+		}
+		if pattern[index] == '-' && (previousValid || previousUnknown) && index+1 < len(pattern) && pattern[index+1] != ']' {
+			next, end, nextValid, nextUnknown := conversationTurnstileRegexpClassAtom(pattern, index+1)
+			if previousUnknown || nextUnknown {
+				return true
+			}
+			if nextValid && previous <= 0xdfff && next >= 0xd800 {
+				return true
+			}
+			previous = next
+			previousValid = nextValid
+			previousUnknown = false
+			index = end
+			continue
+		}
+		value, end, valid, unknown := conversationTurnstileRegexpClassAtom(pattern, index)
+		previous = value
+		previousValid = valid
+		previousUnknown = unknown
+		if end <= index {
+			index++
+		} else {
+			index = end
+		}
+	}
+	return false
+}
+
+func conversationTurnstileRegexpClassAtom(pattern string, index int) (value rune, end int, valid, unknown bool) {
+	if index >= len(pattern) {
+		return 0, index, false, false
+	}
+	if pattern[index] != '\\' {
+		value, size := utf8.DecodeRuneInString(pattern[index:])
+		if value == utf8.RuneError && size == 1 {
+			return 0, index + 1, false, false
+		}
+		return value, index + size, true, false
+	}
+	if index+1 >= len(pattern) {
+		return 0, index + 1, false, false
+	}
+	next := pattern[index+1]
+	if next >= utf8.RuneSelf {
+		value, size := utf8.DecodeRuneInString(pattern[index+1:])
+		if value == utf8.RuneError && size == 1 {
+			return 0, index + 2, false, false
+		}
+		return value, index + 1 + size, true, false
+	}
+	switch next {
+	case 'b':
+		return '\b', index + 2, true, false
+	case 'f':
+		return '\f', index + 2, true, false
+	case 'n':
+		return '\n', index + 2, true, false
+	case 'r':
+		return '\r', index + 2, true, false
+	case 't':
+		return '\t', index + 2, true, false
+	case 'v':
+		return '\v', index + 2, true, false
+	case 'x':
+		if index+4 <= len(pattern) && conversationTurnstileRegexpHexBytes(pattern[index+2:index+4]) {
+			decoded, _ := strconv.ParseUint(pattern[index+2:index+4], 16, 8)
+			return rune(decoded), index + 4, true, false
+		}
+		return 'x', index + 2, true, false
+	case 'u':
+		if index+6 <= len(pattern) && conversationTurnstileRegexpHex(pattern[index+2:index+6]) {
+			decoded, _ := strconv.ParseUint(pattern[index+2:index+6], 16, 16)
+			return rune(decoded), index + 6, true, false
+		}
+		return 'u', index + 2, true, false
+	case 'c':
+		if index+2 < len(pattern) && conversationTurnstileRegexpASCIILetter(pattern[index+2]) {
+			return rune(pattern[index+2] % 32), index + 3, true, false
+		}
+		return 0, index + 2, false, true
+	case '0':
+		if index+2 >= len(pattern) || pattern[index+2] < '0' || pattern[index+2] > '9' {
+			return 0, index + 2, true, false
+		}
+		return 0, index + 2, false, true
+	case '1', '2', '3', '4', '5', '6', '7', '8', '9', 'd', 'D', 's', 'S', 'w', 'W', 'p', 'P', 'k':
+		return 0, index + 2, false, true
+	default:
+		return rune(next), index + 2, true, false
+	}
+}
+
+func conversationTurnstileRegexpHasInvalidECMAScriptExtension(pattern string) bool {
+	if _, invalidNamedCapture, _, _ := conversationTurnstileRegexpNamedCaptureAnalysis(pattern); invalidNamedCapture {
+		return true
+	}
+	inClass := false
+	for index := 0; index < len(pattern); index++ {
+		switch pattern[index] {
+		case '\\':
+			if index+1 < len(pattern) {
+				index++
+			}
+		case '[':
+			if !inClass {
+				inClass = true
+			}
+		case ']':
+			if inClass {
+				inClass = false
+			}
+		case '(':
+			if inClass || index+1 >= len(pattern) || pattern[index+1] != '?' {
+				continue
+			}
+			if index+2 >= len(pattern) {
+				return true
+			}
+			switch pattern[index+2] {
+			case ':', '=', '!':
+				continue
+			case '<':
+				if index+3 >= len(pattern) {
+					return true
+				}
+				if pattern[index+3] == '=' || pattern[index+3] == '!' {
+					continue
+				}
+				closeIndex := strings.IndexByte(pattern[index+3:], '>')
+				if closeIndex < 0 {
+					return true
+				}
+				if _, validName := conversationTurnstileRegexpIdentifierName(pattern[index+3 : index+3+closeIndex]); !validName {
+					return true
+				}
+			default:
+				_, validModifier, modifierGroup := conversationTurnstileRegexpModifierGroup(pattern[index:])
+				if !modifierGroup || !validModifier {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+func conversationTurnstileRegexpModifierGroup(pattern string) (next int, valid, recognized bool) {
+	if len(pattern) < 3 || pattern[0] != '(' || pattern[1] != '?' {
+		return 0, false, false
+	}
+	if pattern[2] != 'i' && pattern[2] != 'm' && pattern[2] != 's' && pattern[2] != '-' {
+		return 0, false, false
+	}
+	var enabled, disabled uint8
+	negative := false
+	for index := 2; index < len(pattern); index++ {
+		value := pattern[index]
+		if value == ':' {
+			if enabled == 0 && disabled == 0 {
+				return 0, false, true
+			}
+			return index + 1, true, true
+		}
+		if value == '-' {
+			if negative {
+				return 0, false, true
+			}
+			negative = true
+			continue
+		}
+		var flag uint8
+		switch value {
+		case 'i':
+			flag = 1
+		case 'm':
+			flag = 2
+		case 's':
+			flag = 4
+		default:
+			return 0, false, true
+		}
+		if enabled&flag != 0 || disabled&flag != 0 {
+			return 0, false, true
+		}
+		if negative {
+			disabled |= flag
+		} else {
+			enabled |= flag
+		}
+	}
+	return 0, false, true
+}
+
+type conversationTurnstileRegexpBranchPath struct {
+	parent      *conversationTurnstileRegexpBranchPath
+	disjunction int
+	alternative int
+}
+
+type conversationTurnstileRegexpBranchFrame struct {
+	parent      *conversationTurnstileRegexpBranchPath
+	current     *conversationTurnstileRegexpBranchPath
+	disjunction int
+	alternative int
+}
+
+func conversationTurnstileRegexpNamedCaptureAnalysis(pattern string) (duplicateDisjunction, invalid, hasNamedCaptures, workLimitExceeded bool) {
+	inClass := false
+	root := &conversationTurnstileRegexpBranchPath{disjunction: 0}
+	branches := []conversationTurnstileRegexpBranchFrame{{current: root, disjunction: 0}}
+	nextDisjunction := 1
+	analysisWork := 0
+	namedCaptures := make(map[string][]*conversationTurnstileRegexpBranchPath)
+	for index := 0; index < len(pattern); index++ {
+		switch pattern[index] {
+		case '\\':
+			if index+1 < len(pattern) {
+				index++
+			}
+		case '[':
+			if !inClass {
+				inClass = true
+			}
+		case ']':
+			if inClass {
+				inClass = false
+			}
+		case '|':
+			if !inClass {
+				branch := &branches[len(branches)-1]
+				branch.alternative++
+				branch.current = &conversationTurnstileRegexpBranchPath{
+					parent:      branch.parent,
+					disjunction: branch.disjunction,
+					alternative: branch.alternative,
+				}
+			}
+		case '(':
+			if inClass {
+				continue
+			}
+			if strings.HasPrefix(pattern[index:], "(?<") && index+3 < len(pattern) && pattern[index+3] != '=' && pattern[index+3] != '!' {
+				hasNamedCaptures = true
+				closeOffset := strings.IndexByte(pattern[index+3:], '>')
+				if closeOffset < 0 {
+					return false, true, true, false
+				}
+				closeIndex := index + 3 + closeOffset
+				name, validName := conversationTurnstileRegexpIdentifierName(pattern[index+3 : closeIndex])
+				if !validName {
+					return false, true, true, false
+				}
+				path := branches[len(branches)-1].current
+				for _, previous := range namedCaptures[name] {
+					exclusive, work := conversationTurnstileRegexpBranchesAreExclusive(previous, path)
+					analysisWork += work
+					if analysisWork > conversationTurnstileRegexpAnalysisMax {
+						return duplicateDisjunction, false, true, true
+					}
+					if !exclusive {
+						return false, true, true, false
+					}
+					duplicateDisjunction = true
+				}
+				namedCaptures[name] = append(namedCaptures[name], path)
+				index = closeIndex
+			}
+			parent := branches[len(branches)-1].current
+			path := &conversationTurnstileRegexpBranchPath{parent: parent, disjunction: nextDisjunction}
+			branches = append(branches, conversationTurnstileRegexpBranchFrame{
+				parent:      parent,
+				current:     path,
+				disjunction: nextDisjunction,
+			})
+			nextDisjunction++
+		case ')':
+			if !inClass && len(branches) > 1 {
+				branches = branches[:len(branches)-1]
+			}
+		}
+	}
+	return duplicateDisjunction, false, hasNamedCaptures, false
+}
+
+func conversationTurnstileRegexpBranchesAreExclusive(left, right *conversationTurnstileRegexpBranchPath) (exclusive bool, work int) {
+	for left != nil && right != nil {
+		work++
+		switch {
+		case left.disjunction > right.disjunction:
+			left = left.parent
+		case left.disjunction < right.disjunction:
+			right = right.parent
+		default:
+			if left.alternative != right.alternative {
+				return true, work
+			}
+			left = left.parent
+			right = right.parent
+		}
+	}
+	return false, work
+}
+
+func conversationTurnstileRegexpHasDifferentEscapeSemantics(value byte) bool {
+	switch value {
+	case 'A', 'C', 'Q', 'a', 'z':
+		return true
+	default:
+		return false
+	}
+}
+
+func conversationTurnstileRegexpIdentityEscape(value byte) bool {
+	if conversationTurnstileRegexpASCIILetter(value) {
+		switch value {
+		case 'b', 'B', 'd', 'D', 'f', 'n', 'r', 's', 'S', 't', 'v', 'w', 'W', 'x', 'u', 'c', 'k':
+			return false
+		default:
+			return true
+		}
+	}
+	switch value {
+	case '/', '-', ',', '=', '!', '#', '%', '&', ':', ';', '<', '>', '@', '_', '`', '~', '\'', '"':
+		return true
+	default:
+		return false
+	}
+}
+
+func conversationTurnstileRegexpASCIILetter(value byte) bool {
+	return value >= 'a' && value <= 'z' || value >= 'A' && value <= 'Z'
+}
+
+func conversationTurnstileRegexpHex(value string) bool {
+	if len(value) != 4 {
+		return false
+	}
+	for index := 0; index < len(value); index++ {
+		if !((value[index] >= '0' && value[index] <= '9') ||
+			(value[index] >= 'a' && value[index] <= 'f') ||
+			(value[index] >= 'A' && value[index] <= 'F')) {
+			return false
+		}
+	}
+	return true
+}
+
+func conversationTurnstileRegexpHexBytes(value string) bool {
+	if len(value) != 2 {
+		return false
+	}
+	for index := 0; index < len(value); index++ {
+		if !((value[index] >= '0' && value[index] <= '9') ||
+			(value[index] >= 'a' && value[index] <= 'f') ||
+			(value[index] >= 'A' && value[index] <= 'F')) {
+			return false
+		}
+	}
+	return true
+}
+
+func conversationTurnstileRegexpRepeat(pattern string, index int) (int, string, bool, bool) {
+	end := index + 1
+	commaCount := 0
+	for end < len(pattern) && pattern[end] != '}' {
+		if pattern[end] == ',' {
+			commaCount++
+			if commaCount > 1 {
+				return 0, "", false, false
+			}
+		} else if pattern[end] < '0' || pattern[end] > '9' {
+			return 0, "", false, false
+		}
+		end++
+	}
+	if end >= len(pattern) {
+		return 0, "", false, false
+	}
+	end++
+	content := pattern[index+1 : end-1]
+	minimum := content
+	maximum := ""
+	unbounded := false
+	if comma := strings.IndexByte(content, ','); comma >= 0 {
+		minimum = content[:comma]
+		maximum = content[comma+1:]
+		unbounded = maximum == ""
+	}
+	if !conversationTurnstileRegexpDecimal(minimum) || (!unbounded && strings.Contains(content, ",") && !conversationTurnstileRegexpDecimal(maximum)) {
+		return 0, "", false, false
+	}
+	if maximum != "" && conversationTurnstileRegexpDecimalCompare(minimum, maximum) > 0 {
+		return 0, "", false, false
+	}
+	tooLarge := conversationTurnstileRegexpDecimalGreaterThan1000(minimum) ||
+		(maximum != "" && conversationTurnstileRegexpDecimalGreaterThan1000(maximum))
+	if !tooLarge {
+		return end, pattern[index:end], false, true
+	}
+	if !strings.Contains(content, ",") {
+		return end, "{1}", true, true
+	}
+	if unbounded {
+		return end, "{1,}", true, true
+	}
+	if conversationTurnstileRegexpDecimalCompare(minimum, maximum) == 0 {
+		return end, "{1}", true, true
+	}
+	return end, "{1,2}", true, true
+}
+
+func conversationTurnstileRegexpDecimal(value string) bool {
+	if value == "" {
+		return false
+	}
+	for index := 0; index < len(value); index++ {
+		if value[index] < '0' || value[index] > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+func conversationTurnstileRegexpDecimalGreaterThan1000(value string) bool {
+	value = strings.TrimLeft(value, "0")
+	if value == "" {
+		return false
+	}
+	return len(value) > 4 || len(value) == 4 && value > "1000"
+}
+
+func conversationTurnstileRegexpDecimalCompare(left, right string) int {
+	left = strings.TrimLeft(left, "0")
+	right = strings.TrimLeft(right, "0")
+	if left == "" {
+		left = "0"
+	}
+	if right == "" {
+		right = "0"
+	}
+	if len(left) < len(right) {
+		return -1
+	}
+	if len(left) > len(right) {
+		return 1
+	}
+	return strings.Compare(left, right)
+}
+
+func conversationTurnstileRegexpIdentifier(name string) bool {
+	_, valid := conversationTurnstileRegexpIdentifierName(name)
+	return valid
+}
+
+func conversationTurnstileRegexpIdentifierName(name string) (string, bool) {
+	if name == "" {
+		return "", false
+	}
+	var normalized strings.Builder
+	normalized.Grow(len(name))
+	first := true
+	for index := 0; index < len(name); {
+		value, next, valid := conversationTurnstileRegexpIdentifierRune(name, index)
+		if !valid || first && !conversationTurnstileRegexpIdentifierStart(value) || !first && !conversationTurnstileRegexpIdentifierContinue(value) {
+			return "", false
+		}
+		normalized.WriteRune(value)
+		first = false
+		index = next
+	}
+	return normalized.String(), !first
+}
+
+func conversationTurnstileRegexpIdentifierRune(name string, index int) (rune, int, bool) {
+	if index >= len(name) {
+		return 0, index, false
+	}
+	if name[index] != '\\' {
+		value, size := utf8.DecodeRuneInString(name[index:])
+		return value, index + size, value != utf8.RuneError || size > 1
+	}
+	if index+2 > len(name) || name[index+1] != 'u' {
+		return 0, index, false
+	}
+	if index+2 < len(name) && name[index+2] == '{' {
+		closeOffset := strings.IndexByte(name[index+3:], '}')
+		if closeOffset < 0 {
+			return 0, index, false
+		}
+		closeIndex := index + 3 + closeOffset
+		hexValue := name[index+3 : closeIndex]
+		if hexValue == "" || len(hexValue) > 6 {
+			return 0, index, false
+		}
+		decoded, err := strconv.ParseUint(hexValue, 16, 32)
+		value := rune(decoded)
+		if err != nil || value > utf8.MaxRune || value >= 0xd800 && value <= 0xdfff {
+			return 0, index, false
+		}
+		return value, closeIndex + 1, true
+	}
+	if index+6 > len(name) || !conversationTurnstileRegexpHex(name[index+2:index+6]) {
+		return 0, index, false
+	}
+	decoded, _ := strconv.ParseUint(name[index+2:index+6], 16, 16)
+	value := rune(decoded)
+	next := index + 6
+	if value >= 0xd800 && value <= 0xdbff {
+		if next+6 > len(name) || name[next] != '\\' || name[next+1] != 'u' || !conversationTurnstileRegexpHex(name[next+2:next+6]) {
+			return 0, index, false
+		}
+		lowValue, _ := strconv.ParseUint(name[next+2:next+6], 16, 16)
+		low := rune(lowValue)
+		if low < 0xdc00 || low > 0xdfff {
+			return 0, index, false
+		}
+		return utf16.DecodeRune(value, low), next + 6, true
+	}
+	if value >= 0xdc00 && value <= 0xdfff {
+		return 0, index, false
+	}
+	return value, next, true
+}
+
+func conversationTurnstileRegexpIdentifierStart(value rune) bool {
+	return value == '$' || value == '_' || unicode.IsLetter(value) || unicode.Is(unicode.Nl, value) || unicode.Is(unicode.Other_ID_Start, value)
+}
+
+func conversationTurnstileRegexpIdentifierContinue(value rune) bool {
+	return conversationTurnstileRegexpIdentifierStart(value) || value == '\u200c' || value == '\u200d' ||
+		unicode.Is(unicode.Mn, value) || unicode.Is(unicode.Mc, value) || unicode.Is(unicode.Nd, value) ||
+		unicode.Is(unicode.Pc, value) || unicode.Is(unicode.Other_ID_Continue, value)
 }
 
 type conversationTurnstileContextRuneReader struct {
@@ -1767,22 +2985,76 @@ func (vm *conversationTurnstileVM) opAppend(args []any) (any, error) {
 
 func (vm *conversationTurnstileVM) opProperty(args []any) (any, error) {
 	if len(args) >= 3 {
-		value, err := vm.property(vm.get(args[1]), vm.get(args[2]))
+		object := vm.getAllowMissing(args[1])
+		propertyValue := vm.get(args[2])
+		if vm.fatalErr != nil {
+			return nil, vm.fatalErr
+		}
+		propertyKey, err := vm.toPropertyKey(propertyValue)
 		if err != nil {
 			return nil, err
 		}
+		missingBase, propagatedMissing := vm.missingPropertyBase(args[1], object)
+		value, err := vm.propertyWithKey(object, propertyKey)
+		if err != nil {
+			var fatal conversationTurnstileFatalError
+			if propagatedMissing && !errors.As(err, &fatal) && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) && (vm.ctx == nil || vm.ctx.Err() == nil) {
+				missingPath := vm.missingPropertyPath(missingBase, propertyKey)
+				if vm.fatalErr != nil {
+					return nil, vm.fatalErr
+				}
+				if missingPath != "" {
+					return nil, vm.compatibilityError(SentinelCompatibilityMissingEnvironment, missingPath, err)
+				}
+			}
+			return nil, err
+		}
 		vm.set(args[0], value)
+		if missingBase != "" && isConversationTurnstileUndefined(value) {
+			missingPath := vm.missingPropertyPath(missingBase, propertyKey)
+			if vm.fatalErr != nil {
+				return nil, vm.fatalErr
+			}
+			vm.setMissingValue(args[0], missingPath)
+		}
 	}
 	return nil, nil
 }
 
 func (vm *conversationTurnstileVM) opBoundProperty(args []any) (any, error) {
 	if len(args) >= 3 {
-		value, err := vm.bindProperty(vm.get(args[1]), vm.get(args[2]))
+		object := vm.getAllowMissing(args[1])
+		propertyValue := vm.get(args[2])
+		if vm.fatalErr != nil {
+			return nil, vm.fatalErr
+		}
+		propertyKey, err := vm.toPropertyKey(propertyValue)
 		if err != nil {
 			return nil, err
 		}
+		missingBase, propagatedMissing := vm.missingPropertyBase(args[1], object)
+		value, err := vm.bindPropertyWithKey(object, propertyKey)
+		if err != nil {
+			var fatal conversationTurnstileFatalError
+			if propagatedMissing && !errors.As(err, &fatal) && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) && (vm.ctx == nil || vm.ctx.Err() == nil) {
+				missingPath := vm.missingPropertyPath(missingBase, propertyKey)
+				if vm.fatalErr != nil {
+					return nil, vm.fatalErr
+				}
+				if missingPath != "" {
+					return nil, vm.compatibilityError(SentinelCompatibilityMissingEnvironment, missingPath, err)
+				}
+			}
+			return nil, err
+		}
 		vm.set(args[0], value)
+		if missingBase != "" && isConversationTurnstileUndefined(value) {
+			missingPath := vm.missingPropertyPath(missingBase, propertyKey)
+			if vm.fatalErr != nil {
+				return nil, vm.fatalErr
+			}
+			vm.setMissingValue(args[0], missingPath)
+		}
 	}
 	return nil, nil
 }
@@ -1795,13 +3067,20 @@ func (vm *conversationTurnstileVM) opCall(args []any) (any, error) {
 	if err != nil {
 		return nil, err
 	}
-	_, err = vm.call(vm.get(args[0]), resolved)
+	_, err = vm.callReferenced(args[0], resolved)
 	return nil, err
 }
 
 func (vm *conversationTurnstileVM) opCopy(args []any) (any, error) {
 	if len(args) >= 2 {
-		vm.set(args[0], vm.get(args[1]))
+		missing := ""
+		if vm.compatibilityErrors && vm.missingValues != nil {
+			missing = vm.missingValues[conversationTurnstileMapKey(args[1])]
+		}
+		vm.set(args[0], vm.getAllowMissing(args[1]))
+		if missing != "" {
+			vm.setMissingValue(args[0], missing)
+		}
 	}
 	return nil, nil
 }
@@ -1846,7 +3125,7 @@ func (vm *conversationTurnstileVM) opCallRaw(args []any) (any, error) {
 	if len(args) < 2 {
 		return nil, nil
 	}
-	_, err := vm.call(vm.get(args[1]), args[2:])
+	_, err := vm.callReferenced(args[1], args[2:])
 	if err != nil {
 		if fatalErr := conversationTurnstileFatalInstructionError(vm.ctx, err); fatalErr != nil {
 			return nil, fatalErr
@@ -1993,7 +3272,7 @@ func (vm *conversationTurnstileVM) opCallResult(args []any) (any, error) {
 	if err != nil {
 		return nil, err
 	}
-	value, err := vm.call(vm.get(args[1]), resolved)
+	value, err := vm.callReferenced(args[1], resolved)
 	if err != nil {
 		if fatalErr := conversationTurnstileFatalInstructionError(vm.ctx, err); fatalErr != nil {
 			return nil, fatalErr
@@ -2027,14 +3306,27 @@ func (vm *conversationTurnstileVM) opBase64Decode(args []any) (any, error) {
 	if err = vm.chargeRuntimeWork(len(encoded)); err != nil {
 		return nil, err
 	}
-	if remainder := len(encoded) % 4; remainder != 0 {
-		encoded += strings.Repeat("=", 4-remainder)
+	if len(encoded)%4 == 0 {
+		encoded = strings.TrimSuffix(encoded, "=")
+		encoded = strings.TrimSuffix(encoded, "=")
 	}
-	decodedSize := base64.StdEncoding.DecodedLen(len(encoded))
+	if len(encoded)%4 == 1 {
+		return nil, base64.CorruptInputError(len(encoded))
+	}
+	for index := 0; index < len(encoded); index++ {
+		character := encoded[index]
+		if !((character >= 'A' && character <= 'Z') ||
+			(character >= 'a' && character <= 'z') ||
+			(character >= '0' && character <= '9') ||
+			character == '+' || character == '/') {
+			return nil, base64.CorruptInputError(index)
+		}
+	}
+	decodedSize := base64.RawStdEncoding.DecodedLen(len(encoded))
 	if err := vm.reserveRuntimeBytes(decodedSize * 3); err != nil {
 		return nil, err
 	}
-	decoded, err := base64.StdEncoding.DecodeString(encoded)
+	decoded, err := base64.RawStdEncoding.DecodeString(encoded)
 	if err != nil {
 		return nil, err
 	}
@@ -2133,7 +3425,7 @@ func (vm *conversationTurnstileVM) opNestedQueue(args []any) (_ any, err error) 
 }
 
 func (vm *conversationTurnstileVM) opIfDefined(args []any) (any, error) {
-	if len(args) < 2 || isConversationTurnstileUndefined(vm.get(args[0])) {
+	if len(args) < 2 || isConversationTurnstileUndefined(vm.getAllowMissing(args[0])) {
 		return nil, nil
 	}
 	_, err := vm.call(vm.get(args[1]), args[2:])
@@ -2831,18 +4123,63 @@ func (vm *conversationTurnstileVM) bindProperty(object, key any) (any, error) {
 	if err != nil {
 		return conversationTurnstileUndefined, err
 	}
+	return vm.bindPropertyWithKey(object, propertyKey)
+}
+
+func (vm *conversationTurnstileVM) bindPropertyWithKey(object, propertyKey any) (any, error) {
 	keyText, err := vm.runtimeString(propertyKey)
 	if err != nil {
 		return conversationTurnstileUndefined, err
 	}
 	if processMap, ok := object.(*conversationTurnstileProcessMapRef); ok {
-		return processMap.method(keyText), nil
+		return vm.requireSupportedBoundProperty(object, keyText, processMap.method(keyText))
 	}
 	switch object.(type) {
 	case string, conversationTurnstileJSString:
-		return vm.bindStringProperty(object, keyText)
+		value, bindErr := vm.bindStringProperty(object, keyText)
+		if bindErr != nil {
+			return conversationTurnstileUndefined, bindErr
+		}
+		return vm.requireSupportedBoundProperty(object, keyText, value)
 	}
-	return vm.property(object, propertyKey)
+	value, err := vm.propertyWithKey(object, propertyKey)
+	if err != nil {
+		return conversationTurnstileUndefined, err
+	}
+	return vm.requireSupportedBoundProperty(object, keyText, value)
+}
+
+func (vm *conversationTurnstileVM) requireSupportedBoundProperty(object any, keyText string, value any) (any, error) {
+	if !vm.compatibilityErrors || !isConversationTurnstileUndefined(value) {
+		return value, nil
+	}
+	receiver := conversationTurnstileBuiltinReceiverName(object)
+	if receiver == "" {
+		return value, nil
+	}
+	return conversationTurnstileUndefined, vm.compatibilityError(
+		SentinelCompatibilityUnsupportedValue,
+		receiver+"."+keyText,
+		conversationTurnstileTypeError(receiver+" property is not implemented by the Go VM"),
+	)
+}
+
+func conversationTurnstileBuiltinReceiverName(value any) string {
+	switch typed := value.(type) {
+	case string, conversationTurnstileJSString:
+		return "String"
+	case *conversationTurnstileArray, []any:
+		return "Array"
+	case *conversationTurnstileProcessMapRef:
+		return "Map"
+	case *conversationTurnstileLocationRef:
+		return "Location"
+	case *conversationTurnstileBoxedPrimitive:
+		if typed != nil {
+			return conversationTurnstileBuiltinReceiverName(typed.value)
+		}
+	}
+	return ""
 }
 
 func (vm *conversationTurnstileVM) bindStringProperty(value any, keyText string) (any, error) {
@@ -2992,11 +4329,17 @@ func (processMap *conversationTurnstileProcessMapRef) method(name string) any {
 			}
 			_, exists := vm.values[key]
 			delete(vm.values, key)
+			if vm.compatibilityErrors {
+				delete(vm.missingValues, key)
+			}
 			return exists, nil
 		})
 	case "clear":
 		return newConversationTurnstileCallable(func([]any) (any, error) {
 			vm.values = make(map[string]any)
+			if vm.compatibilityErrors {
+				clear(vm.missingValues)
+			}
 			return nil, nil
 		})
 	}
@@ -3011,23 +4354,27 @@ func conversationTurnstileArgument(args []any, index int) any {
 }
 
 func (vm *conversationTurnstileVM) property(object, key any) (any, error) {
+	propertyKey, err := vm.toPropertyKey(key)
+	if err != nil {
+		return conversationTurnstileUndefined, err
+	}
+	return vm.propertyWithKey(object, propertyKey)
+}
+
+func (vm *conversationTurnstileVM) propertyWithKey(object, propertyKey any) (any, error) {
 	switch object.(type) {
 	case nil, conversationTurnstileExplicitNullValue:
-		keyText, err := vm.runtimeString(key)
+		keyText, err := vm.runtimeString(propertyKey)
 		if err != nil {
 			return conversationTurnstileUndefined, err
 		}
 		return conversationTurnstileUndefined, conversationTurnstileTypeError(fmt.Sprintf("Cannot read properties of null (reading '%s')", keyText))
 	case conversationTurnstileUndefinedValue:
-		keyText, err := vm.runtimeString(key)
+		keyText, err := vm.runtimeString(propertyKey)
 		if err != nil {
 			return conversationTurnstileUndefined, err
 		}
 		return conversationTurnstileUndefined, conversationTurnstileTypeError(fmt.Sprintf("Cannot read properties of undefined (reading '%s')", keyText))
-	}
-	propertyKey, err := vm.toPropertyKey(key)
-	if err != nil {
-		return conversationTurnstileUndefined, err
 	}
 	switch value := object.(type) {
 	case *conversationTurnstileOrderedMap:
@@ -3043,7 +4390,7 @@ func (vm *conversationTurnstileVM) property(object, key any) (any, error) {
 			if depth > conversationTurnstileMaxPrototypeDepth {
 				return conversationTurnstileUndefined, conversationTurnstileFatalError{message: fmt.Sprintf("conversation turnstile prototype chain exceeds %d objects", conversationTurnstileMaxPrototypeDepth)}
 			}
-			if err = vm.chargeRuntimeWork(1); err != nil {
+			if err := vm.chargeRuntimeWork(1); err != nil {
 				return conversationTurnstileUndefined, err
 			}
 			if _, seen := visited[value]; seen {
@@ -3058,7 +4405,7 @@ func (vm *conversationTurnstileVM) property(object, key any) (any, error) {
 			}
 			next, ok := value.prototype.(*conversationTurnstileOrderedMap)
 			if !ok {
-				return vm.property(value.prototype, propertyKey)
+				return vm.propertyWithKey(value.prototype, propertyKey)
 			}
 			if next == nil {
 				return conversationTurnstileUndefined, nil
@@ -3148,7 +4495,7 @@ func (vm *conversationTurnstileVM) property(object, key any) (any, error) {
 			return newConversationTurnstileCallable(func([]any) (any, error) { return value.value, nil }), nil
 		}
 		if conversationTurnstileIsString(value.value) {
-			return vm.property(value.value, propertyKey)
+			return vm.propertyWithKey(value.value, propertyKey)
 		}
 	case string:
 		if keyText == "length" {

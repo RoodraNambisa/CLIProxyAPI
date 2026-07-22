@@ -1196,6 +1196,36 @@ func TestConversationTurnstileBase64UsesBrowserBinaryStrings(t *testing.T) {
 	if _, err := vm.opResult([]any{conversationTurnstileJSString{units: []uint16{0xff}}}); err != nil || vm.result != "/w==" {
 		t.Fatalf("result = %q, %v", vm.result, err)
 	}
+
+	for _, test := range []struct {
+		name  string
+		input string
+		valid bool
+	}{
+		{name: "missing padding", input: "YQ", valid: true},
+		{name: "complete padding", input: "YQ==", valid: true},
+		{name: "ascii whitespace", input: "Y Q==\n", valid: true},
+		{name: "partial padding", input: "YQ=", valid: false},
+		{name: "excessive padding", input: "YQ===", valid: false},
+		{name: "embedded padding", input: "Y=Q=", valid: false},
+		{name: "invalid character", input: "YQ$=", valid: false},
+		{name: "invalid remainder", input: "Y", valid: false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			candidate := &conversationTurnstileVM{values: make(map[string]any), memoryBudget: &conversationTurnstileMemoryBudget{}}
+			candidate.set(1, test.input)
+			_, err := candidate.opBase64Decode([]any{1})
+			if test.valid {
+				if err != nil || !reflect.DeepEqual(candidate.get(1), conversationTurnstileJSString{units: []uint16{'a'}}) {
+					t.Fatalf("atob(%q) = %#v, %v", test.input, candidate.get(1), err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("atob(%q) unexpectedly succeeded", test.input)
+			}
+		})
+	}
 }
 
 func TestConversationTurnstileArrayMutationPreservesIdentity(t *testing.T) {
@@ -2007,7 +2037,7 @@ func TestBuildConversationTurnstileTokenRejectsInvalidInstructions(t *testing.T)
 		name    string
 		program []any
 	}{
-		{name: "unknown opcode", program: []any{[]any{99}}},
+		{name: "unknown opcode", program: []any{[]any{36}}},
 		{name: "empty instruction", program: []any{[]any{}}},
 		{name: "non-callable opcode", program: []any{[]any{2, 40, "literal"}, []any{40}}},
 	} {
@@ -2331,7 +2361,7 @@ func (ctx *conversationTurnstileCancelAfterContext) Err() error {
 	return nil
 }
 
-func encodeConversationTurnstileProgram(t *testing.T, requirementsToken string, program []any) string {
+func encodeConversationTurnstileProgram(t testing.TB, requirementsToken string, program []any) string {
 	t.Helper()
 	payload, err := json.Marshal(program)
 	if err != nil {

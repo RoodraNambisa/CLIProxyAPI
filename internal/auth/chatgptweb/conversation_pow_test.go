@@ -21,6 +21,62 @@ func TestParseConversationPoWResources(t *testing.T) {
 	}
 }
 
+func TestParseConversationSentinelSDKResource(t *testing.T) {
+	resource := ParseConversationSentinelSDKResource([]byte(`<html><script src="/c/a.js"></script><script integrity="sha384-ignore sha256-c2VudGluZWw=" src="/sentinel/20260721/sdk.js"></script></html>`))
+	if resource.URL != "/sentinel/20260721/sdk.js" || resource.SHA256 != "sha256-c2VudGluZWw=" || !resource.IntegrityRequired {
+		t.Fatalf("resource = %+v", resource)
+	}
+	resource = ParseConversationSentinelSDKResource([]byte(`<script integrity="sha384-c2VudGluZWw=" src="/sentinel/20260721/sdk.js"></script>`))
+	if resource.URL == "" || resource.SHA256 != "" || !resource.IntegrityRequired {
+		t.Fatalf("unsupported-integrity resource = %+v", resource)
+	}
+	resource = ParseConversationSentinelSDKResource([]byte(`<script integrity="sha256-b2xk sha384-ignore sha256-bmV3 sha256-b2xk" src="/sentinel/20260721/sdk.js"></script>`))
+	if resource.SHA256 != "sha256-b2xk sha256-bmV3" {
+		t.Fatalf("multi-hash resource = %+v", resource)
+	}
+	resource = ParseConversationSentinelSDKResource([]byte(`<script integrity="SHA256-AbCd sha256-aBcD" src="/sentinel/20260721/sdk.js"></script>`))
+	if resource.SHA256 != "SHA256-AbCd sha256-aBcD" {
+		t.Fatalf("case-sensitive hash resource = %+v", resource)
+	}
+	backendResource := ParseConversationSentinelSDKResource([]byte(`<script src="/backend-api/sentinel/20260721f9f6/sdk.js"></script>`))
+	if backendResource.URL != "/backend-api/sentinel/20260721f9f6/sdk.js" {
+		t.Fatalf("backend resource = %+v", backendResource)
+	}
+	if backendResource.IntegrityRequired {
+		t.Fatalf("backend resource unexpectedly requires integrity = %+v", backendResource)
+	}
+	if empty := ParseConversationSentinelSDKResource([]byte(`<script src="/c/a.js"></script>`)); empty != (ConversationSentinelSDKResource{}) {
+		t.Fatalf("unexpected resource = %+v", empty)
+	}
+	if spoofed := ParseConversationSentinelSDKResource([]byte(`<script integrity="sha256-c2VudGluZWw=" src="/assets/sdk.js?next=/sentinel/test/sdk.js"></script>`)); spoofed != (ConversationSentinelSDKResource{}) {
+		t.Fatalf("query-spoofed resource = %+v", spoofed)
+	}
+	if nested := ParseConversationSentinelSDKResource([]byte(`<script src="/backend-api/sentinel/20260721/nested/sdk.js"></script>`)); nested != (ConversationSentinelSDKResource{}) {
+		t.Fatalf("nested resource = %+v", nested)
+	}
+	resource = ParseConversationSentinelSDKResource([]byte(`<script src="https://example.com/sentinel/20260720/sdk.js"></script><script src="https://sentinel.openai.com/sentinel/20260721/sdk.js"></script>`))
+	if resource.URL != "https://sentinel.openai.com/sentinel/20260721/sdk.js" {
+		t.Fatalf("resource after untrusted candidate = %+v", resource)
+	}
+	for _, invalidPath := range []string{
+		"//sentinel/20260721/sdk.js",
+		"http://sentinel.openai.com/sentinel/20260721/sdk.js",
+		"https://user@sentinel.openai.com/sentinel/20260721/sdk.js",
+		"https://sentinel.openai.com:8443/sentinel/20260721/sdk.js",
+		"https://example.com/sentinel/20260721/sdk.js",
+		"/sentinel/20260721/sdk.js/",
+		"/Sentinel/20260721/sdk.js",
+		"/sentinel/20260721/SDK.js",
+		"/sentinel/20260721/sdk.js?cache=1",
+		"/sentinel/20260721/sdk.js#fragment",
+	} {
+		resource := ParseConversationSentinelSDKResource([]byte(`<script src="` + invalidPath + `"></script>`))
+		if resource != (ConversationSentinelSDKResource{}) {
+			t.Fatalf("resource for %q = %+v", invalidPath, resource)
+		}
+	}
+}
+
 func TestBuildConversationRequirementsTokenUsesTwentyFiveItems(t *testing.T) {
 	token, err := BuildConversationRequirementsToken(DefaultPersona(), []string{"/sdk.js"}, "build", zeroReader{}, func() time.Time {
 		return time.Unix(1_700_000_000, 0)

@@ -3,6 +3,7 @@ package executor
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -806,6 +807,7 @@ func (e *ChatGPTWebExecutor) chatGPTWebRequirements(ctx context.Context, client 
 		return chatGPTWebRequirements{}, newChatGPTWebStatusError(response.StatusCode, bootstrapPath, bootstrap, response.Header)
 	}
 	sources, dataBuild := chatgptwebauth.ParseConversationPoWResources(bootstrap)
+	sdkResource := chatgptwebauth.ParseConversationSentinelSDKResource(bootstrap)
 	pToken, err := chatgptwebauth.BuildConversationRequirementsToken(credential.Persona, sources, dataBuild, e.runtimeRand, e.now)
 	if err != nil {
 		return chatGPTWebRequirements{}, chatGPTWebLocalProtocolError(
@@ -830,6 +832,44 @@ func (e *ChatGPTWebExecutor) chatGPTWebRequirements(ctx context.Context, client 
 			http.StatusForbidden,
 			"chatgpt web requires an unsupported Arkose challenge",
 		)
+	}
+	sentinelEnvironment := chatgptwebauth.ConversationTurnstileEnvironment{
+		Persona:       credential.Persona,
+		ScriptSources: sources,
+		Location:      strings.TrimRight(baseURL, "/") + "/",
+	}
+	sdkFetcher := e.chatGPTWebSentinelSDKFetcher(client, credential)
+	if e.sentinelSDKFetcherFactory != nil {
+		sdkFetcher = e.sentinelSDKFetcherFactory(client, credential)
+	}
+	sdkRequest := chatgptwebauth.SentinelSDKRequest{
+		BaseURL:           baseURL,
+		SDKURL:            sdkResource.URL,
+		ScriptSources:     sources,
+		ExpectedSHA256:    sdkResource.SHA256,
+		IntegrityRequired: sdkResource.IntegrityRequired,
+		TransportKey:      chatGPTWebSentinelTransportKey(client),
+		Challenge:         prepare,
+		RequirementsToken: pToken,
+		Environment:       sentinelEnvironment,
+		DeviceID:          credential.DeviceID,
+		Flow:              "conversation",
+		Fetcher:           sdkFetcher,
+	}
+	var observer helps.ChatGPTWebSentinelObserver
+	var observerErr error
+	soRequired := requiredJSONFlag(prepare, "so", "required")
+	if e.sentinelRuntime != nil {
+		observer, err = e.sentinelRuntime.BeginObserver(ctx, sdkRequest)
+		if err != nil {
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || (ctx != nil && ctx.Err() != nil) {
+				return chatGPTWebRequirements{}, err
+			}
+			observerErr = err
+		}
+	}
+	if observer != nil {
+		defer observer.Close()
 	}
 	proofToken := ""
 	if requiredJSONFlag(prepare, "proofofwork", "required") {
@@ -859,21 +899,27 @@ func (e *ChatGPTWebExecutor) chatGPTWebRequirements(ctx context.Context, client 
 				"ChatGPT Web Turnstile challenge is missing dx",
 			)
 		}
-		turnstileToken, err = chatgptwebauth.BuildConversationTurnstileTokenWithEnvironment(
-			ctx,
-			dx,
-			pToken,
-			chatgptwebauth.ConversationTurnstileEnvironment{
-				Persona:       credential.Persona,
-				ScriptSources: sources,
-				Location:      strings.TrimRight(baseURL, "/") + "/",
-			},
-			e.runtimeRand,
-			e.now,
-		)
+		goRequest := chatgptwebauth.ConversationTurnstileSolveRequest{
+			DX:                dx,
+			RequirementsToken: pToken,
+			Environment:       sentinelEnvironment,
+			Reader:            e.runtimeRand,
+			Now:               e.now,
+		}
+		if e.sentinelRuntime == nil {
+			turnstileToken, err = chatgptwebauth.BuildConversationTurnstileTokenWithEnvironment(
+				ctx, dx, pToken, sentinelEnvironment, e.runtimeRand, e.now,
+			)
+		} else {
+			turnstileToken, err = e.sentinelRuntime.SolveTurnstile(ctx, goRequest, sdkRequest, observer)
+		}
 		if err != nil {
 			if ctx != nil && ctx.Err() != nil {
 				return chatGPTWebRequirements{}, ctx.Err()
+			}
+			var runtimeErr *chatgptwebauth.SentinelRuntimeError
+			if errors.As(err, &runtimeErr) {
+				return chatGPTWebRequirements{}, chatGPTWebSentinelRuntimeProtocolError(runtimeErr)
 			}
 			log.Warn("chatgpt web executor: Turnstile challenge solve failed")
 			return chatGPTWebRequirements{}, chatGPTWebTurnstileProtocolError(
@@ -894,6 +940,12 @@ func (e *ChatGPTWebExecutor) chatGPTWebRequirements(ctx context.Context, client 
 				"ChatGPT Web rejected the generated Turnstile token",
 			)
 		}
+		if soRequired && chatGPTWebSentinelFinalizeRejection(err) {
+			log.WithError(err).Warn("chatgpt web executor: upstream rejected Session Observer token")
+			return chatGPTWebRequirements{}, chatGPTWebSentinelObserverProtocolError(
+				errors.New("ChatGPT Web rejected the generated Session Observer token"),
+			)
+		}
 		return chatGPTWebRequirements{}, err
 	}
 	var finalize map[string]any
@@ -903,7 +955,8 @@ func (e *ChatGPTWebExecutor) chatGPTWebRequirements(ctx context.Context, client 
 			"decode chatgpt web requirements finalize: "+err.Error(),
 		)
 	}
-	token := chatGPTWebAnyString(finalize["token"])
+	token, _ := finalize["token"].(string)
+	token = strings.TrimSpace(token)
 	if token == "" {
 		return chatGPTWebRequirements{}, chatGPTWebLocalProtocolError(
 			http.StatusBadGateway,
@@ -917,12 +970,134 @@ func (e *ChatGPTWebExecutor) chatGPTWebRequirements(ctx context.Context, client 
 	if finalizedTurnstileToken == "" {
 		finalizedTurnstileToken = turnstileToken
 	}
+	soToken, _ := finalize["so_token"].(string)
+	soToken = strings.TrimSpace(soToken)
+	if soToken == "" && soRequired {
+		if observer == nil {
+			if observerErr != nil {
+				return chatGPTWebRequirements{}, chatGPTWebSentinelObserverProtocolError(observerErr)
+			}
+			return chatGPTWebRequirements{}, chatGPTWebSentinelObserverProtocolError(&chatgptwebauth.SentinelRuntimeError{
+				Code: "sentinel_session_observer_unavailable",
+				Err:  errors.New("Sentinel Session Observer is unavailable"),
+			})
+		}
+		soToken, err = observer.Snapshot(ctx)
+		if err != nil {
+			if ctx != nil && ctx.Err() != nil {
+				return chatGPTWebRequirements{}, ctx.Err()
+			}
+			return chatGPTWebRequirements{}, chatGPTWebSentinelObserverProtocolError(err)
+		}
+	}
 	return chatGPTWebRequirements{
 		Token:          token,
 		ProofToken:     proofToken,
 		TurnstileToken: finalizedTurnstileToken,
-		SOToken:        chatGPTWebAnyString(finalize["so_token"]),
+		SOToken:        soToken,
 	}, nil
+}
+
+func chatGPTWebSentinelTransportKey(client *chatgptwebauth.Client) string {
+	if client == nil {
+		return "default"
+	}
+	persona, _ := json.Marshal(client.Persona())
+	digest := sha256.Sum256([]byte(client.ProxyURL() + "\x00" + string(persona)))
+	return fmt.Sprintf("%x", digest[:])
+}
+
+func (e *ChatGPTWebExecutor) chatGPTWebSentinelSDKFetcher(client *chatgptwebauth.Client, credential *chatgptwebauth.Credential) chatgptwebauth.SentinelSDKFetcher {
+	return func(ctx context.Context, targetURL string, maxBytes int64) ([]byte, string, string, error) {
+		if client == nil {
+			return nil, "", "", errors.New("chatgpt web SDK client is nil")
+		}
+		sdkClient, errClient := chatgptwebauth.NewClient(client.Persona(), client.ProxyURL(), nil)
+		if errClient != nil {
+			return nil, "", "", fmt.Errorf("create cookie-free Sentinel SDK client: %w", errClient)
+		}
+		defer sdkClient.CloseIdleConnections()
+		headers := map[string]string{
+			"accept":         "text/javascript,application/javascript;q=0.9,*/*;q=0.1",
+			"referer":        e.chatGPTWebBaseURL() + "/",
+			"sec-fetch-dest": "script",
+			"sec-fetch-mode": "no-cors",
+			"sec-fetch-site": "cross-site",
+		}
+		response, err := e.doChatGPTWebBootstrapRequest(ctx, sdkClient, nil, targetURL, headers)
+		if err != nil {
+			return nil, "", "", err
+		}
+		if response.StatusCode < 200 || response.StatusCode >= 300 {
+			body := readAndCloseChatGPTWebErrorBody(response.Body)
+			return nil, "", "", newChatGPTWebStatusError(response.StatusCode, "/sentinel/sdk.js", body, response.Header)
+		}
+		if maxBytes < 1 || maxBytes > int64(^uint(0)>>1) {
+			_ = response.Body.Close()
+			return nil, "", "", errors.New("Sentinel SDK response limit is invalid")
+		}
+		data, err := readChatGPTWebSuccessBody(response.Body, int(maxBytes))
+		contentType := response.Header.Get("Content-Type")
+		finalURL := targetURL
+		if response.Request != nil && response.Request.URL != nil {
+			finalURL = response.Request.URL.String()
+		}
+		if errClose := response.Body.Close(); err == nil && errClose != nil {
+			err = errClose
+		}
+		return data, contentType, finalURL, err
+	}
+}
+
+func chatGPTWebSentinelRuntimeProtocolError(err error) statusErr {
+	code := "sentinel_sdk_unavailable"
+	statusCode := http.StatusServiceUnavailable
+	var runtimeErr *chatgptwebauth.SentinelRuntimeError
+	var retryAfter *time.Duration
+	if errors.As(err, &runtimeErr) {
+		if strings.TrimSpace(runtimeErr.Code) != "" {
+			code = strings.TrimSpace(runtimeErr.Code)
+		}
+		if runtimeErr.RetryAfter > 0 {
+			value := runtimeErr.RetryAfter
+			retryAfter = &value
+		}
+	}
+	if code == "sentinel_session_observer_unavailable" {
+		statusCode = http.StatusBadGateway
+	}
+	payload, marshalErr := json.Marshal(map[string]any{
+		"error": map[string]any{
+			"message": "ChatGPT Web Sentinel SDK is temporarily unavailable",
+			"type":    "upstream_protocol_error",
+			"code":    code,
+		},
+	})
+	if marshalErr != nil {
+		payload = []byte(code)
+	}
+	return statusErr{
+		code:           statusCode,
+		msg:            string(payload),
+		retryAfter:     retryAfter,
+		skipAuthResult: true,
+	}
+}
+
+func chatGPTWebSentinelObserverProtocolError(err error) statusErr {
+	var runtimeErr *chatgptwebauth.SentinelRuntimeError
+	if errors.As(err, &runtimeErr) && strings.TrimSpace(runtimeErr.Code) == "sentinel_sdk_busy" {
+		return chatGPTWebSentinelRuntimeProtocolError(err)
+	}
+	retryAfter := time.Duration(0)
+	if runtimeErr != nil {
+		retryAfter = runtimeErr.RetryAfter
+	}
+	return chatGPTWebSentinelRuntimeProtocolError(&chatgptwebauth.SentinelRuntimeError{
+		Code:       "sentinel_session_observer_unavailable",
+		RetryAfter: retryAfter,
+		Err:        err,
+	})
 }
 
 func chatGPTWebTurnstileFinalizeRejection(err error) bool {
@@ -938,6 +1113,23 @@ func chatGPTWebTurnstileFinalizeRejection(err error) bool {
 		return false
 	}
 	return strings.Contains(strings.ToLower(err.Error()), "turnstile")
+}
+
+func chatGPTWebSentinelFinalizeRejection(err error) bool {
+	var upstreamErr chatGPTWebHTTPError
+	if errors.As(err, &upstreamErr) && upstreamErr.sentinelFinalizeRejection {
+		return true
+	}
+	var status interface{ StatusCode() int }
+	if !errors.As(err, &status) {
+		return false
+	}
+	if status.StatusCode() != http.StatusBadRequest && status.StatusCode() != http.StatusForbidden {
+		return false
+	}
+	lower := strings.ToLower(err.Error())
+	return strings.Contains(lower, "sentinel") || strings.Contains(lower, "session observer") ||
+		strings.Contains(lower, "so_token") || strings.Contains(lower, "so-token")
 }
 
 func (e *ChatGPTWebExecutor) doChatGPTWebBootstrapRequest(
@@ -1371,7 +1563,7 @@ func chatGPTWebResponseLogBody(path string, body []byte) []byte {
 	redactGenericURL := strings.Contains(strings.ToLower(path), "/download")
 	redactPreparePayload := strings.Contains(strings.ToLower(path), "/chat-requirements/prepare")
 	var redact func(any, bool)
-	redact = func(value any, insideTurnstile bool) {
+	redact = func(value any, insideSentinelChallenge bool) {
 		switch typed := value.(type) {
 		case map[string]any:
 			for key, item := range typed {
@@ -1383,7 +1575,7 @@ func chatGPTWebResponseLogBody(path string, body []byte) []byte {
 					typed[key] = "<redacted>"
 					continue
 				}
-				if redactPreparePayload && insideTurnstile && normalized == "dx" {
+				if insideSentinelChallenge && (normalized == "collector_dx" || normalized == "snapshot_dx" || redactPreparePayload && normalized == "dx") {
 					typed[key] = "<redacted>"
 					continue
 				}
@@ -1395,7 +1587,7 @@ func chatGPTWebResponseLogBody(path string, body []byte) []byte {
 					typed[key] = redacted
 					continue
 				}
-				redact(item, insideTurnstile || normalized == "turnstile")
+				redact(item, insideSentinelChallenge || normalized == "turnstile" || normalized == "so")
 			}
 		case []any:
 			for index, item := range typed {
@@ -1403,7 +1595,7 @@ func chatGPTWebResponseLogBody(path string, body []byte) []byte {
 					typed[index] = redacted
 					continue
 				}
-				redact(item, insideTurnstile)
+				redact(item, insideSentinelChallenge)
 			}
 		}
 	}
@@ -1454,6 +1646,7 @@ type chatGPTWebHTTPError struct {
 	headers                    http.Header
 	path                       string
 	turnstileFinalizeRejection bool
+	sentinelFinalizeRejection  bool
 }
 
 func (e chatGPTWebHTTPError) Headers() http.Header {
@@ -1471,20 +1664,36 @@ func (e chatGPTWebHTTPError) ChatGPTWebRequestPath() string {
 func newChatGPTWebStatusError(code int, path string, body []byte, headers fhttp.Header) chatGPTWebHTTPError {
 	sanitizedBody := chatGPTWebStatusErrorBody(path, body)
 	turnstileFinalizeRejection := false
+	sentinelFinalizeRejection := false
 	if path == "/backend-api/sentinel/chat-requirements/finalize" &&
 		(code == http.StatusBadRequest || code == http.StatusForbidden) {
-		turnstileFinalizeRejection = bytes.Contains(bytes.ToLower(body), []byte("turnstile"))
+		lowerBody := bytes.ToLower(body)
+		turnstileFinalizeRejection = bytes.Contains(lowerBody, []byte("turnstile"))
+		sentinelFinalizeRejection = turnstileFinalizeRejection ||
+			bytes.Contains(lowerBody, []byte("sentinel")) ||
+			bytes.Contains(lowerBody, []byte("session observer")) ||
+			bytes.Contains(lowerBody, []byte("so_token")) ||
+			bytes.Contains(lowerBody, []byte("so-token"))
 	}
 	err := chatGPTWebHTTPError{
 		statusErr:                  statusErr{code: code, msg: strings.TrimSpace(string(sanitizedBody))},
 		path:                       path,
 		turnstileFinalizeRejection: turnstileFinalizeRejection,
+		sentinelFinalizeRejection:  sentinelFinalizeRejection,
 	}
 	switch code {
 	case http.StatusBadRequest, http.StatusNotFound, http.StatusMethodNotAllowed,
 		http.StatusConflict, http.StatusRequestEntityTooLarge,
 		http.StatusUnsupportedMediaType, http.StatusUnprocessableEntity:
 		err.statusErr.skipAuthResult = true
+	}
+	if code == http.StatusForbidden && chatGPTWebSentinelConversationRejection(path, body) {
+		err.statusErr.skipAuthResult = true
+		err.statusErr.retryOtherAuth = false
+	}
+	if sentinelFinalizeRejection {
+		err.statusErr.skipAuthResult = true
+		err.statusErr.retryOtherAuth = false
 	}
 	if code == http.StatusNotFound {
 		err.statusErr.retryOtherAuth = true
@@ -1498,6 +1707,30 @@ func newChatGPTWebStatusError(code int, path string, body []byte, headers fhttp.
 		err.headers = http.Header{"Retry-After": []string{retryAfter}}
 	}
 	return err
+}
+
+func chatGPTWebSentinelConversationRejection(path string, body []byte) bool {
+	if path != "/backend-api/conversation" && path != "/backend-api/f/conversation" {
+		return false
+	}
+	lower := bytes.ToLower(body)
+	markers := [][]byte{
+		[]byte("sentinel"),
+		[]byte("turnstile"),
+		[]byte("session observer"),
+		[]byte("so_token"),
+		[]byte("so-token"),
+		[]byte("chat_requirements"),
+		[]byte("chat-requirements"),
+		[]byte("proof_token"),
+		[]byte("proof token"),
+	}
+	for _, marker := range markers {
+		if bytes.Contains(lower, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 func chatGPTWebLocalProtocolError(code int, message string) statusErr {

@@ -483,7 +483,9 @@ func writeChatGPTWebJSONString(output *bytes.Buffer, value string) {
 
 func (e *ChatGPTWebExecutor) prepareChatGPTWebImageConversation(ctx context.Context, client *chatgptwebauth.Client, credential *chatgptwebauth.Credential, requirements chatGPTWebRequirements, prompt string) (string, error) {
 	path := "/backend-api/f/conversation/prepare"
-	headers := chatGPTWebRequirementsHeaders(e.chatGPTWebHeaders(credential, path, nil), requirements)
+	prepareRequirements := requirements
+	prepareRequirements.SOToken = ""
+	headers := chatGPTWebRequirementsHeaders(e.chatGPTWebHeaders(credential, path, nil), prepareRequirements)
 	headers["accept"] = "*/*"
 	headers["content-type"] = "application/json"
 	body := map[string]any{

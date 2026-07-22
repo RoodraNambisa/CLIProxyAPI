@@ -756,6 +756,9 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.GET("/chatgpt-web/conversion-tasks/:id", s.mgmt.GetChatGPTWebConversionTask)
 		mgmt.DELETE("/chatgpt-web/conversion-tasks/:id", s.mgmt.CancelChatGPTWebConversionTask)
 		mgmt.POST("/chatgpt-web/auth-files/:name/relogin", s.mgmt.ReloginChatGPTWebAuth)
+		mgmt.GET("/chatgpt-web/sentinel", s.mgmt.GetChatGPTWebSentinel)
+		mgmt.PUT("/chatgpt-web/sentinel", s.mgmt.PutChatGPTWebSentinel)
+		mgmt.PATCH("/chatgpt-web/sentinel", s.mgmt.PatchChatGPTWebSentinel)
 
 		mgmt.GET("/anthropic-auth-url", s.mgmt.RequestAnthropicToken)
 		mgmt.GET("/gemini-cli-auth-url", s.mgmt.RequestGeminiCLIToken)
