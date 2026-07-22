@@ -162,6 +162,18 @@ remote-management:
 
 设置后管理页面会移动到 `/my-random-path/management.html`，管理 API 会移动到 `/my-random-path/v0/management/...`，OAuth 回调也会使用 `/my-random-path/{provider}/callback`。`access-path` 只是路径隐藏，不替代 `secret-key`，管理 API 仍然需要管理密钥。
 
+### Codex Agent Identity 转换
+
+普通凭证上传接口 `POST /v0/management/auth-files` 保持原有行为；已经包含完整 Agent Identity 字段的 Codex JSON 也可以直接通过该接口上传。Agent Identity 与 OAuth 是同一个 Codex 凭证的两种认证模式，转换已有账号时会原地更新同一个文件，不会复制出第二个账号。原始 Codex access token 需要使用独立的异步转换接口：
+
+- `POST /v0/management/codex/agent-identity/conversion-tasks`：通过 `access_tokens`、已有凭证 `names`，或 multipart `files` 创建转换任务。`names` 可配合 `target_mode: "agentIdentity"` 或 `target_mode: "oauth"` 批量切换；未传时默认转换为 Agent Identity。原始 token 和 multipart 文件只支持转换为 Agent Identity。
+- `GET /v0/management/codex/agent-identity/conversion-tasks/:id`：轮询任务及账号级进度。
+- `DELETE /v0/management/codex/agent-identity/conversion-tasks/:id`：取消尚未完成的转换。
+
+OAuth 转为 Agent Identity 后会保留原有 access/refresh token，便于以后切回；切回 OAuth 前必须仍有可用 access token 或 refresh token。账号列表会返回 `auth_mode`、`auth_mode_label`、`can_convert_to_agent_identity` 和 `can_convert_to_oauth`，显示名与 Sub2API 一致使用 `OAuth` / `Agent Identity`。额度检测接口保持不变，并会按照当前模式自动使用 Bearer 或 AgentAssertion。
+
+任务完成后，每个成功结果都会返回 `target_name`；转换已有账号时该名称仍是原文件名。前端可继续调用 `GET /v0/management/auth-files/download?name=<target_name>` 获取包含当前模式完整认证材料的 JSON，用于下载、复制或预览；批量下载仍可使用 `/auth-files/archive`。普通账号列表不会返回 access token、refresh token、`agent_private_key` 或 `task_id`。以上接口均受 Management API 鉴权和可选 `access-path` 前缀保护。
+
 ## SDK 文档
 
 - 使用文档：[docs/sdk-usage_CN.md](docs/sdk-usage_CN.md)

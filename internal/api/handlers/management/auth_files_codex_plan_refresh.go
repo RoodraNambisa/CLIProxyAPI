@@ -556,7 +556,7 @@ func (h *Handler) refreshSingleCodexPlanType(manager *coreauth.Manager, auth *co
 		return result
 	}
 
-	accountID := internalcodex.EffectiveAccountID(auth.Metadata)
+	accountID := internalcodex.EffectiveRequestAccountID(auth.Metadata)
 	if accountID == "" {
 		result.Status = codexPlanTypeRefreshStatusSkipped
 		result.Error = "account_id not found"
@@ -569,12 +569,24 @@ func (h *Handler) refreshSingleCodexPlanType(manager *coreauth.Manager, auth *co
 		return result
 	}
 	auth = resolvedAuth
+	isAgentIdentity := internalcodex.IsAgentIdentityMetadata(auth.Metadata)
+	if isAgentIdentity {
+		prepared, errPrepare := h.prepareCodexAgentIdentityForPlanRefresh(manager, auth, nil)
+		if errPrepare != nil {
+			result.Status = codexPlanTypeRefreshStatusFailed
+			result.Error = fmt.Sprintf("prepare Agent Identity: %v", errPrepare)
+			return result
+		}
+		auth = prepared
+		expected = prepared.Clone()
+		accountID = firstNonEmptyValue(internalcodex.EffectiveRequestAccountID(auth.Metadata), accountID)
+	}
 
 	accessToken := codexAccessTokenFromMetadata(auth.Metadata)
 	refreshToken := codexRefreshTokenFromMetadata(auth.Metadata)
 	forcePersist := false
 
-	if accessToken == "" && refreshToken != "" {
+	if !isAgentIdentity && accessToken == "" && refreshToken != "" {
 		var refreshErr error
 		auth, refreshErr = refreshCodexPlanTypeAuth(manager, auth)
 		if refreshErr != nil {
@@ -583,10 +595,10 @@ func (h *Handler) refreshSingleCodexPlanType(manager *coreauth.Manager, auth *co
 			return result
 		}
 		forcePersist = true
-		accountID = firstNonEmptyValue(internalcodex.EffectiveAccountID(auth.Metadata), accountID)
+		accountID = firstNonEmptyValue(internalcodex.EffectiveRequestAccountID(auth.Metadata), accountID)
 		accessToken = codexAccessTokenFromMetadata(auth.Metadata)
 	}
-	if accessToken == "" {
+	if accessToken == "" && !isAgentIdentity {
 		if forcePersist {
 			if err := h.persistCodexPlanTypeRefreshAuth(context.Background(), manager, expected, auth, "", accountID, true); err != nil {
 				result.Status = codexPlanTypeRefreshStatusFailed
@@ -600,7 +612,19 @@ func (h *Handler) refreshSingleCodexPlanType(manager *coreauth.Manager, auth *co
 	}
 
 	planType, statusCode, err := h.fetchCodexUsagePlanType(context.Background(), auth, accessToken, accountID)
-	if (statusCode == http.StatusUnauthorized || statusCode == http.StatusForbidden) && refreshToken != "" {
+	if isAgentIdentity && internalcodex.IsAgentTaskUnauthorizedError(err) {
+		recovered, errRecover := h.prepareCodexAgentIdentityForPlanRefresh(manager, auth, err)
+		if errRecover != nil {
+			result.Status = codexPlanTypeRefreshStatusFailed
+			result.HTTPStatus = statusCode
+			result.Error = fmt.Sprintf("recover Agent Identity task: %v", errRecover)
+			return result
+		}
+		auth = recovered
+		expected = recovered.Clone()
+		planType, statusCode, err = h.fetchCodexUsagePlanType(context.Background(), auth, "", accountID)
+	}
+	if !isAgentIdentity && (statusCode == http.StatusUnauthorized || statusCode == http.StatusForbidden) && refreshToken != "" {
 		auth, err = refreshCodexPlanTypeAuth(manager, auth)
 		if err != nil {
 			if forcePersist {
@@ -617,7 +641,7 @@ func (h *Handler) refreshSingleCodexPlanType(manager *coreauth.Manager, auth *co
 			return result
 		}
 		forcePersist = true
-		accountID = firstNonEmptyValue(internalcodex.EffectiveAccountID(auth.Metadata), accountID)
+		accountID = firstNonEmptyValue(internalcodex.EffectiveRequestAccountID(auth.Metadata), accountID)
 		accessToken = codexAccessTokenFromMetadata(auth.Metadata)
 		if accessToken == "" {
 			if errPersist := h.persistCodexPlanTypeRefreshAuth(context.Background(), manager, expected, auth, "", accountID, true); errPersist != nil {
@@ -693,6 +717,93 @@ func refreshCodexPlanTypeAuth(manager *coreauth.Manager, auth *coreauth.Auth) (*
 	return auth, nil
 }
 
+func (h *Handler) prepareCodexAgentIdentityForPlanRefresh(manager *coreauth.Manager, auth *coreauth.Auth, unauthorized error) (*coreauth.Auth, error) {
+	if manager == nil || auth == nil {
+		return auth, errors.New("core auth manager unavailable")
+	}
+	executor, ok := manager.Executor("codex")
+	if !ok || executor == nil {
+		return auth, errors.New("Codex executor unavailable")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), defaultAPICallTimeout)
+	defer cancel()
+	release, errLock := manager.LockCredentialRefresh(ctx, auth.ID)
+	if errLock != nil {
+		return auth, errLock
+	}
+	defer release()
+	current, exists := manager.GetByID(auth.ID)
+	if !exists || current == nil {
+		return auth, errCodexPlanTypeRefreshCredentialChanged
+	}
+	if !sameCodexAgentIdentitySigningMaterial(current, auth) {
+		return auth, errCodexPlanTypeRefreshCredentialChanged
+	}
+	if unauthorized != nil && codexAgentIdentityTaskAdvanced(current, auth) {
+		resolved, errResolve := manager.ResolveProxyAuth(ctx, current)
+		return resolved, errResolve
+	}
+	var updated *coreauth.Auth
+	var errPrepare error
+	if unauthorized == nil {
+		preparer, supported := executor.(coreauth.RequestAuthPreparer)
+		if !supported || !preparer.ShouldPrepareRequestAuth(current) {
+			resolved, errResolve := manager.ResolveProxyAuth(ctx, current)
+			return resolved, errResolve
+		}
+		updated, errPrepare = preparer.PrepareRequestAuth(ctx, current.Clone())
+	} else {
+		recoverer, supported := executor.(coreauth.UnauthorizedAuthRecoverer)
+		if !supported || !recoverer.ShouldRecoverUnauthorized(current, unauthorized) {
+			return auth, unauthorized
+		}
+		updated, errPrepare = recoverer.RecoverUnauthorized(ctx, current.Clone())
+	}
+	if errPrepare != nil {
+		return auth, errPrepare
+	}
+	installed, applied, errUpdate := manager.UpdateIfCurrent(ctx, current, updated)
+	if errUpdate != nil {
+		return auth, errUpdate
+	}
+	if !applied || installed == nil {
+		return auth, errCodexPlanTypeRefreshCredentialChanged
+	}
+	if unauthorized != nil {
+		if closer, supported := executor.(coreauth.AuthExecutionSessionCloser); supported {
+			closer.CloseAuthExecutionSessions(installed.ID, "agent_task_rotated")
+		}
+	}
+	resolved, errResolve := manager.ResolveProxyAuth(ctx, installed)
+	if errResolve != nil {
+		return installed, errResolve
+	}
+	return resolved, nil
+}
+
+func sameCodexAgentIdentitySigningMaterial(left, right *coreauth.Auth) bool {
+	if left == nil || right == nil || left.ID != right.ID ||
+		!internalcodex.IsAgentIdentityMetadata(left.Metadata) ||
+		!internalcodex.IsAgentIdentityMetadata(right.Metadata) {
+		return false
+	}
+	leftRuntimeID := strings.TrimSpace(stringValue(left.Metadata, "agent_runtime_id"))
+	rightRuntimeID := strings.TrimSpace(stringValue(right.Metadata, "agent_runtime_id"))
+	leftPrivateKey := strings.TrimSpace(stringValue(left.Metadata, "agent_private_key"))
+	rightPrivateKey := strings.TrimSpace(stringValue(right.Metadata, "agent_private_key"))
+	return leftRuntimeID != "" && leftRuntimeID == rightRuntimeID &&
+		leftPrivateKey != "" && leftPrivateKey == rightPrivateKey
+}
+
+func codexAgentIdentityTaskAdvanced(current, expected *coreauth.Auth) bool {
+	if !sameCodexAgentIdentitySigningMaterial(current, expected) {
+		return false
+	}
+	currentTaskID := strings.TrimSpace(stringValue(current.Metadata, "task_id"))
+	expectedTaskID := strings.TrimSpace(stringValue(expected.Metadata, "task_id"))
+	return currentTaskID != "" && currentTaskID != expectedTaskID
+}
+
 func (h *Handler) persistCodexPlanTypeRefreshAuth(ctx context.Context, manager *coreauth.Manager, expected, refreshed *coreauth.Auth, planType string, accountID string, forcePersist bool) error {
 	if h == nil || manager == nil || expected == nil || refreshed == nil {
 		return fmt.Errorf("core auth manager unavailable")
@@ -732,9 +843,13 @@ func (h *Handler) persistCodexPlanTypeRefreshAuth(ctx context.Context, manager *
 			return errCodexPlanTypeRefreshCredentialChanged
 		}
 	}
+	accountMetadataKey := "account_id"
+	if internalcodex.IsAgentIdentityMetadata(auth.Metadata) {
+		accountMetadataKey = "chatgpt_account_id"
+	}
 	if accountID != "" {
-		currentAccountID := strings.TrimSpace(internalcodex.EffectiveAccountID(current.Metadata))
-		expectedAccountID := strings.TrimSpace(internalcodex.EffectiveAccountID(expected.Metadata))
+		currentAccountID := strings.TrimSpace(internalcodex.EffectiveRequestAccountID(current.Metadata))
+		expectedAccountID := strings.TrimSpace(internalcodex.EffectiveRequestAccountID(expected.Metadata))
 		if currentAccountID != expectedAccountID && currentAccountID != accountID {
 			return errCodexPlanTypeRefreshCredentialChanged
 		}
@@ -758,7 +873,7 @@ func (h *Handler) persistCodexPlanTypeRefreshAuth(ctx context.Context, manager *
 		changed = metadataChanged || attributeChanged || changed
 	}
 	if accountID != "" {
-		metadataChanged, conflict := setCodexPlanTypeRefreshMetadataString(auth.Metadata, current.Metadata, expected.Metadata, "account_id", accountID)
+		metadataChanged, conflict := setCodexPlanTypeRefreshMetadataString(auth.Metadata, current.Metadata, expected.Metadata, accountMetadataKey, accountID)
 		if conflict {
 			return errCodexPlanTypeRefreshCredentialChanged
 		}
@@ -865,10 +980,17 @@ func (h *Handler) fetchCodexUsagePlanType(ctx context.Context, auth *coreauth.Au
 	if err != nil {
 		return "", 0, fmt.Errorf("build usage request: %w", err)
 	}
-	req.Header.Set("Authorization", "Bearer "+strings.TrimSpace(accessToken))
+	authorization, errAuthorization := internalcodex.AuthorizationHeader(auth.Metadata, accessToken, time.Now())
+	if errAuthorization != nil {
+		return "", 0, fmt.Errorf("build usage authorization: %w", errAuthorization)
+	}
+	req.Header.Set("Authorization", authorization)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("User-Agent", codexPlanTypeRefreshUserAgent)
 	req.Header.Set("Chatgpt-Account-Id", strings.TrimSpace(accountID))
+	if internalcodex.ChatGPTAccountIsFedRAMP(auth.Metadata) {
+		req.Header.Set("X-OpenAI-Fedramp", "true")
+	}
 
 	httpClient := &http.Client{
 		Timeout:   defaultAPICallTimeout,
@@ -891,6 +1013,10 @@ func (h *Handler) fetchCodexUsagePlanType(ctx context.Context, auth *coreauth.Au
 		return "", resp.StatusCode, fmt.Errorf("read usage response: %w", err)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		if internalcodex.IsAgentIdentityMetadata(auth.Metadata) {
+			body = internalcodex.SanitizeAgentIdentityErrorBody(auth.Metadata, body)
+			return "", resp.StatusCode, codexUsageRequestError{statusCode: resp.StatusCode, body: body}
+		}
 		return "", resp.StatusCode, fmt.Errorf("usage request returned %d", resp.StatusCode)
 	}
 
@@ -911,6 +1037,24 @@ func (h *Handler) fetchCodexUsagePlanType(ctx context.Context, auth *coreauth.Au
 	}
 	return planType, resp.StatusCode, nil
 }
+
+type codexUsageRequestError struct {
+	statusCode int
+	body       []byte
+}
+
+func (e codexUsageRequestError) Error() string {
+	body := strings.TrimSpace(string(e.body))
+	if len(body) > 512 {
+		body = body[:512] + "..."
+	}
+	if body == "" {
+		return fmt.Sprintf("usage request returned %d", e.statusCode)
+	}
+	return fmt.Sprintf("usage request returned %d: %s", e.statusCode, body)
+}
+
+func (e codexUsageRequestError) StatusCode() int { return e.statusCode }
 
 func firstNonEmptyValue(values ...string) string {
 	for _, value := range values {

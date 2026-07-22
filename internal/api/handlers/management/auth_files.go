@@ -495,6 +495,7 @@ func (h *Handler) listAuthFilesFromDisk(c *gin.Context) {
 					if planType := codex.EffectivePlanType(dependencyMetadata); planType != "" {
 						fileData["plan_type"] = planType
 					}
+					applyCodexAuthModeSummary(fileData, dependencyMetadata, now)
 				}
 			}
 			if dependencyMetadata != nil {
@@ -595,6 +596,9 @@ func (h *Handler) buildAuthFileEntryAtWithRuntime(auth *coreauth.Auth, now time.
 	}
 	if planType := effectiveCodexPlanType(auth); planType != "" {
 		entry["plan_type"] = planType
+	}
+	if strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") && !codexAuthUsesAPIKeyCredential(auth) {
+		applyCodexAuthModeSummary(entry, auth.Metadata, now)
 	}
 	if strings.EqualFold(strings.TrimSpace(auth.Provider), "xai") {
 		entry["using_api"] = effectiveXAIUsingAPI(auth)
@@ -729,6 +733,36 @@ func effectiveCodexPlanType(auth *coreauth.Auth) string {
 		}
 	}
 	return codex.EffectivePlanType(auth.Metadata)
+}
+
+func applyCodexAuthModeSummary(entry gin.H, metadata map[string]any, now time.Time) {
+	if entry == nil {
+		return
+	}
+	mode := codex.EffectiveAuthMode(metadata)
+	entry["auth_mode"] = mode
+	entry["auth_mode_label"] = codex.AuthModeLabel(metadata)
+	entry["can_convert_to_agent_identity"] = false
+	entry["can_convert_to_oauth"] = false
+	if mode == codex.AgentIdentityAuthMode {
+		entry["can_convert_to_oauth"] = codex.OAuthModeAvailable(metadata, now)
+		return
+	}
+	entry["can_convert_to_agent_identity"] = codex.HasStoredAgentIdentity(metadata) || codex.OAuthModeAvailable(metadata, now)
+}
+
+func codexAuthUsesAPIKeyCredential(auth *coreauth.Auth) bool {
+	if auth == nil {
+		return false
+	}
+	if strings.TrimSpace(authAttribute(auth, "api_key")) != "" {
+		return true
+	}
+	authKind := strings.TrimSpace(authAttribute(auth, "auth_kind"))
+	if authKind == "" {
+		authKind = strings.TrimSpace(stringValue(auth.Metadata, "auth_kind"))
+	}
+	return strings.EqualFold(authKind, "apikey") || strings.EqualFold(authKind, "api_key")
 }
 
 func authEmail(auth *coreauth.Auth) string {
@@ -2802,6 +2836,11 @@ func (h *Handler) buildAuthFromFileData(path string, data []byte) (*coreauth.Aut
 	provider, _ := metadata["type"].(string)
 	if provider == "" {
 		provider = "unknown"
+	}
+	if codex.IsAgentIdentityMetadata(metadata) {
+		if errValidate := codex.ValidateCompleteAgentIdentityMetadata(metadata); errValidate != nil {
+			return nil, fmt.Errorf("%w: invalid Codex Agent Identity: %v", errInvalidAuthFileData, errValidate)
+		}
 	}
 	label := provider
 	if email, ok := metadata["email"].(string); ok && email != "" {

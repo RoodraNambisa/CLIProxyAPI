@@ -54,3 +54,33 @@ func EffectiveAccountID(metadata map[string]any) string {
 	}
 	return strings.TrimSpace(claims.CodexAuthInfo.ChatgptAccountID)
 }
+
+// EffectiveChatGPTAccountID returns the account ID expected by Codex request
+// headers, preferring the explicit ChatGPT account over the root account claim.
+func EffectiveChatGPTAccountID(metadata map[string]any) string {
+	if accountID := metadataString(metadata, "chatgpt_account_id"); accountID != "" {
+		return accountID
+	}
+	claims := IDTokenClaimsFromMetadata(metadata)
+	if claims != nil {
+		if accountID := strings.TrimSpace(claims.CodexAuthInfo.ChatgptAccountID); accountID != "" {
+			return accountID
+		}
+	}
+	return metadataString(metadata, "account_id")
+}
+
+// EffectiveRequestAccountID preserves the existing OAuth account selection
+// while using the explicit ChatGPT account for Agent Identity requests.
+func EffectiveRequestAccountID(metadata map[string]any) string {
+	if IsAgentIdentityMetadata(metadata) {
+		return EffectiveChatGPTAccountID(metadata)
+	}
+	return EffectiveAccountID(metadata)
+}
+
+// ChatGPTAccountIsFedRAMP reports whether the persisted account requires the
+// FedRAMP request header.
+func ChatGPTAccountIsFedRAMP(metadata map[string]any) bool {
+	return metadataBool(metadata, "chatgpt_account_is_fedramp", "chatgptAccountIsFedramp")
+}

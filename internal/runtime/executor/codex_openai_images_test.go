@@ -203,6 +203,39 @@ func TestCodexExecutorOpenAIImageStreamSupportsCROnlySSE(t *testing.T) {
 	}
 }
 
+func TestCodexExecutorOpenAIImageStreamClassifiesAgentTaskErrors(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("event: error\n"))
+		_, _ = w.Write([]byte(`data: {"type":"error","error":{"code":"invalid_task_id","message":"task expired"}}` + "\n\n"))
+	}))
+	defer server.Close()
+
+	executor := NewCodexExecutor(&config.Config{SDKConfig: sdkconfig.SDKConfig{ProxyURL: "direct"}})
+	auth := &cliproxyauth.Auth{Provider: "codex", Attributes: map[string]string{"api_key": "test-key", "base_url": server.URL}}
+	result, err := executor.ExecuteStream(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "gpt-image-2",
+		Payload: []byte(`{"model":"gpt-image-2","prompt":"draw"}`),
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString(codexOpenAIImageSourceFormat),
+		Alt:          codexOpenAIImageGenerations,
+	})
+	if err != nil {
+		t.Fatalf("ExecuteStream() error = %v", err)
+	}
+	chunks := make([]cliproxyexecutor.StreamChunk, 0, 1)
+	for chunk := range result.Chunks {
+		chunks = append(chunks, chunk)
+	}
+	if len(chunks) != 1 || chunks[0].Err == nil || len(chunks[0].Payload) != 0 {
+		t.Fatalf("chunks = %#v, want one error-only chunk", chunks)
+	}
+	var status cliproxyexecutor.StatusError
+	if !errors.As(chunks[0].Err, &status) || status.StatusCode() != http.StatusUnauthorized || !strings.Contains(chunks[0].Err.Error(), "invalid_task_id") {
+		t.Fatalf("stream error = %v, want invalid_task_id 401", chunks[0].Err)
+	}
+}
+
 func TestReadCodexOpenAIImageResponseBodyEnforcesLimit(t *testing.T) {
 	_, err := readCodexOpenAIImageResponseBody(strings.NewReader("12345"), 4)
 	var status statusErr

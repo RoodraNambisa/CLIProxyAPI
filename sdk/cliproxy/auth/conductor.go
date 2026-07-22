@@ -57,6 +57,13 @@ type RequestAuthPreparer interface {
 	PrepareRequestAuth(ctx context.Context, auth *Auth) (*Auth, error)
 }
 
+// UnauthorizedAuthRecoverer lets an executor repair narrowly classified
+// authentication state before the request falls back to another credential.
+type UnauthorizedAuthRecoverer interface {
+	ShouldRecoverUnauthorized(auth *Auth, err error) bool
+	RecoverUnauthorized(ctx context.Context, auth *Auth) (*Auth, error)
+}
+
 // ExecutionSessionCloser allows executors to release per-session runtime resources.
 type ExecutionSessionCloser interface {
 	CloseExecutionSession(sessionID string)
@@ -3657,7 +3664,8 @@ func (m *Manager) prepareRequestAuth(ctx context.Context, executor ProviderExecu
 	if !ok || !preparer.ShouldPrepareRequestAuth(auth) {
 		return auth, nil
 	}
-	if !strings.EqualFold(strings.TrimSpace(auth.Provider), "chatgpt-web") || strings.TrimSpace(auth.ID) == "" {
+	provider := strings.ToLower(strings.TrimSpace(auth.Provider))
+	if provider != "chatgpt-web" && provider != "codex" || strings.TrimSpace(auth.ID) == "" {
 		return m.prepareRequestAuthSynchronized(ctx, executor, preparer, auth)
 	}
 	if ctx == nil {
@@ -3715,6 +3723,12 @@ func (m *Manager) prepareRequestAuthSynchronized(ctx context.Context, executor P
 	m.mu.RLock()
 	current := m.auths[id]
 	if !requestPreparationMatchesCurrent(current, auth) {
+		if agentIdentityTaskAlreadyAdvanced(current, auth) {
+			target := current.Clone()
+			m.mu.RUnlock()
+			carryRuntimeProxy(auth, target)
+			return target, nil
+		}
 		m.mu.RUnlock()
 		return auth, runtimeAuthInstanceRetiredError()
 	}
@@ -4021,6 +4035,32 @@ func requestPreparationMatchesCurrent(current, expected *Auth) bool {
 	return true
 }
 
+func agentIdentityTaskAlreadyAdvanced(current, expected *Auth) bool {
+	if current == nil || expected == nil || current.ID != expected.ID {
+		return false
+	}
+	if !strings.EqualFold(strings.TrimSpace(current.Provider), "codex") ||
+		!strings.EqualFold(strings.TrimSpace(expected.Provider), "codex") {
+		return false
+	}
+	if current.Metadata == nil || expected.Metadata == nil ||
+		!strings.EqualFold(authMetadataString(current, "auth_mode"), "agentIdentity") ||
+		!strings.EqualFold(authMetadataString(expected, "auth_mode"), "agentIdentity") {
+		return false
+	}
+	currentRuntimeID := authMetadataString(current, "agent_runtime_id")
+	expectedRuntimeID := authMetadataString(expected, "agent_runtime_id")
+	currentPrivateKey := authMetadataString(current, "agent_private_key")
+	expectedPrivateKey := authMetadataString(expected, "agent_private_key")
+	if currentRuntimeID == "" || currentRuntimeID != expectedRuntimeID ||
+		currentPrivateKey == "" || currentPrivateKey != expectedPrivateKey {
+		return false
+	}
+	currentTaskID := authMetadataString(current, "task_id")
+	expectedTaskID := authMetadataString(expected, "task_id")
+	return currentTaskID != "" && currentTaskID != expectedTaskID
+}
+
 func runtimeMetadataMutationMatchesCurrent(current, expected *Auth) bool {
 	if current == nil || expected == nil || current.ID != expected.ID {
 		return false
@@ -4059,7 +4099,7 @@ func (m *Manager) prepareRequestAuthWithUnauthorizedRefresh(ctx context.Context,
 	if errPrepare == nil {
 		return prepared, false, nil
 	}
-	refreshed, attemptedRefresh, errRefresh := m.tryRefreshAfterUnauthorized(ctx, auth, errPrepare, false)
+	refreshed, attemptedRefresh, errRefresh := m.tryRefreshAfterUnauthorized(ctx, executor, auth, errPrepare, false)
 	if errRefresh != nil {
 		return prepared, attemptedRefresh, errRefresh
 	}
@@ -4222,7 +4262,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 				return cliproxyexecutor.Response{}, errCtx
 			}
 			if errExec != nil && requestBodyReplayable(execCtx, opts) {
-				refreshed, attemptedRefresh, errRefresh := m.tryRefreshAfterUnauthorized(execCtx, auth, errExec, didRefreshOnUnauthorized)
+				refreshed, attemptedRefresh, errRefresh := m.tryRefreshAfterUnauthorized(execCtx, executor, auth, errExec, didRefreshOnUnauthorized)
 				if attemptedRefresh {
 					didRefreshOnUnauthorized = true
 				}
@@ -4460,7 +4500,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 				return cliproxyexecutor.Response{}, errCtx
 			}
 			if errExec != nil && requestBodyReplayable(execCtx, opts) {
-				refreshed, attemptedRefresh, errRefresh := m.tryRefreshAfterUnauthorized(execCtx, auth, errExec, didRefreshOnUnauthorized)
+				refreshed, attemptedRefresh, errRefresh := m.tryRefreshAfterUnauthorized(execCtx, executor, auth, errExec, didRefreshOnUnauthorized)
 				if attemptedRefresh {
 					didRefreshOnUnauthorized = true
 				}
@@ -4676,7 +4716,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			}
 			markDeferredFailure := deferAntigravityUnauthorizedStreamResult(auth, errStream)
 			if requestBodyReplayable(execCtx, opts) {
-				refreshed, attemptedRefresh, errRefresh := m.tryRefreshAfterUnauthorized(execCtx, auth, errStream, didRefreshOnUnauthorized)
+				refreshed, attemptedRefresh, errRefresh := m.tryRefreshAfterUnauthorized(execCtx, executor, auth, errStream, didRefreshOnUnauthorized)
 				if attemptedRefresh {
 					didRefreshOnUnauthorized = true
 				}
@@ -8519,9 +8559,20 @@ func sameAuthRequestRefreshLockIDs(left, right []string) bool {
 
 // tryRefreshAfterUnauthorized refreshes one supported credential once before
 // the request falls back to another credential.
-func (m *Manager) tryRefreshAfterUnauthorized(ctx context.Context, auth *Auth, execErr error, alreadyTried bool) (*Auth, bool, error) {
+func (m *Manager) tryRefreshAfterUnauthorized(ctx context.Context, executor ProviderExecutor, auth *Auth, execErr error, alreadyTried bool) (*Auth, bool, error) {
 	if m == nil || auth == nil || alreadyTried || execErr == nil {
 		return auth, false, nil
+	}
+	if recoverer, ok := executor.(UnauthorizedAuthRecoverer); ok && recoverer.ShouldRecoverUnauthorized(auth, execErr) {
+		recovered, errRecover := m.recoverUnauthorizedAuth(ctx, executor, recoverer, auth, execErr)
+		if errRecover != nil {
+			return auth, true, errRecover
+		}
+		resolved, errProxy := m.ResolveProxyAuth(ctx, recovered)
+		if errProxy != nil {
+			return auth, true, errProxy
+		}
+		return resolved, true, nil
 	}
 	if !isUnauthorizedError(execErr) {
 		return auth, false, nil
@@ -8558,6 +8609,94 @@ func (m *Manager) tryRefreshAfterUnauthorized(ctx context.Context, auth *Auth, e
 		return auth, true, errProxy
 	}
 	return resolved, true, nil
+}
+
+func (m *Manager) recoverUnauthorizedAuth(ctx context.Context, executor ProviderExecutor, recoverer UnauthorizedAuthRecoverer, auth *Auth, execErr error) (*Auth, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return auth, err
+	}
+	key := requestAuthPrepareFlightKey(auth) + "\x00unauthorized"
+	if taskID := authMetadataString(auth, "task_id"); taskID != "" {
+		key += "\x00" + taskID
+	}
+	workerCtx := context.WithoutCancel(ctx)
+	resultChannel := m.requestPrepareFlights.DoChan(key, func() (any, error) {
+		return m.recoverUnauthorizedAuthSynchronized(workerCtx, executor, recoverer, auth, execErr)
+	})
+	select {
+	case <-ctx.Done():
+		return auth, ctx.Err()
+	case result := <-resultChannel:
+		if result.Err != nil {
+			return auth, result.Err
+		}
+		recovered, ok := result.Val.(*Auth)
+		if !ok && result.Val != nil {
+			return auth, fmt.Errorf("unauthorized auth recovery returned %T", result.Val)
+		}
+		return recovered, nil
+	}
+}
+
+func (m *Manager) recoverUnauthorizedAuthSynchronized(ctx context.Context, executor ProviderExecutor, recoverer UnauthorizedAuthRecoverer, auth *Auth, execErr error) (*Auth, error) {
+	if auth == nil || strings.TrimSpace(auth.ID) == "" {
+		return recoverer.RecoverUnauthorized(ctx, auth)
+	}
+	lockedCtx, releaseLocks, errLock := m.lockCredentialRefreshesContext(ctx, authRequestRefreshLockIDs(auth, auth.ID))
+	if errLock != nil {
+		return auth, errLock
+	}
+	defer releaseLocks()
+	ctx = lockedCtx
+
+	m.mu.RLock()
+	current := m.auths[auth.ID]
+	if !requestPreparationMatchesCurrent(current, auth) {
+		if agentIdentityTaskAlreadyAdvanced(current, auth) {
+			target := current.Clone()
+			m.mu.RUnlock()
+			carryRuntimeProxy(auth, target)
+			return target, nil
+		}
+		m.mu.RUnlock()
+		return auth, runtimeAuthInstanceRetiredError()
+	}
+	target := current.Clone()
+	m.mu.RUnlock()
+	carryRuntimeProxy(auth, target)
+	if !recoverer.ShouldRecoverUnauthorized(target, execErr) {
+		return target, nil
+	}
+	target.bindExecutorOwner(executor)
+	recoveryCtx, releaseRecovery, active := target.BeginRuntimeExecution(ctx)
+	if !active {
+		return auth, runtimeAuthInstanceRetiredError()
+	}
+	updated, errRecover := recoverer.RecoverUnauthorized(recoveryCtx, target.Clone())
+	retiredDuringRecovery := releaseRecovery()
+	if retiredDuringRecovery || runtimeAuthInstanceRetiredContext(recoveryCtx) {
+		return auth, runtimeAuthInstanceRetiredError()
+	}
+	if errRecover != nil {
+		return auth, errRecover
+	}
+	if updated == nil {
+		return target, nil
+	}
+	installed, errInstall := m.installPreparedRequestAuth(ctx, target, updated, false)
+	if errInstall != nil {
+		return updated, errInstall
+	}
+	if closer, ok := executor.(AuthExecutionSessionCloser); ok && installed != nil {
+		closer.CloseAuthExecutionSessions(installed.ID, "agent_task_rotated")
+	}
+	if installed != nil {
+		return installed, nil
+	}
+	return updated, nil
 }
 
 func (m *Manager) refreshAntigravityForRequest(ctx context.Context, id, failedAccessToken string) (*Auth, error) {

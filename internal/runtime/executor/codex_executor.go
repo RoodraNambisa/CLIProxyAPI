@@ -239,7 +239,7 @@ func codexStreamErrorEventError(eventData []byte) statusErr {
 
 func codexStreamErrorStatus(code string, fallback int) int {
 	switch strings.ToLower(strings.TrimSpace(code)) {
-	case "invalid_api_key", "authentication_error", "unauthorized":
+	case "invalid_api_key", "authentication_error", "unauthorized", "invalid_task_id", "task_not_found", "task_expired":
 		return http.StatusUnauthorized
 	case "permission_error", "permission_denied", "forbidden":
 		return http.StatusForbidden
@@ -260,7 +260,7 @@ func codexStreamErrorStatus(code string, fallback int) int {
 
 func codexStreamErrorType(code string) string {
 	switch strings.ToLower(strings.TrimSpace(code)) {
-	case "invalid_api_key", "authentication_error", "unauthorized":
+	case "invalid_api_key", "authentication_error", "unauthorized", "invalid_task_id", "task_not_found", "task_expired":
 		return "authentication_error"
 	case "permission_error", "permission_denied", "forbidden":
 		return "permission_error"
@@ -302,12 +302,71 @@ func codexStreamStatusErr(status int, message, code, errType string, param *gjso
 // CodexExecutor is a stateless executor for Codex (OpenAI Responses API entrypoint).
 // If api_key is unavailable on auth, it falls back to legacy via ClientAdapter.
 type CodexExecutor struct {
-	cfg *config.Config
+	cfg                     *config.Config
+	agentIdentityBaseURL    string
+	agentIdentityHTTPClient func(context.Context, *cliproxyauth.Auth) *http.Client
 }
 
 func NewCodexExecutor(cfg *config.Config) *CodexExecutor { return &CodexExecutor{cfg: cfg} }
 
 func (e *CodexExecutor) Identifier() string { return "codex" }
+
+// ShouldPrepareRequestAuth reports whether an Agent Identity needs a task before use.
+func (e *CodexExecutor) ShouldPrepareRequestAuth(auth *cliproxyauth.Auth) bool {
+	if auth == nil || !codexauth.IsAgentIdentityMetadata(auth.Metadata) {
+		return false
+	}
+	credential, err := codexauth.ParseAgentIdentityCredential(auth.Metadata)
+	return err == nil && strings.TrimSpace(credential.TaskID) == ""
+}
+
+// PrepareRequestAuth registers a missing Agent Identity task before execution.
+func (e *CodexExecutor) PrepareRequestAuth(ctx context.Context, auth *cliproxyauth.Auth) (*cliproxyauth.Auth, error) {
+	return e.registerAgentIdentityTask(ctx, auth)
+}
+
+// ShouldRecoverUnauthorized limits task recovery to explicit upstream task errors.
+func (e *CodexExecutor) ShouldRecoverUnauthorized(auth *cliproxyauth.Auth, err error) bool {
+	return auth != nil && codexauth.IsAgentIdentityMetadata(auth.Metadata) && codexauth.IsAgentTaskUnauthorizedError(err)
+}
+
+// RecoverUnauthorized registers a replacement task for an invalid Agent Identity task.
+func (e *CodexExecutor) RecoverUnauthorized(ctx context.Context, auth *cliproxyauth.Auth) (*cliproxyauth.Auth, error) {
+	return e.registerAgentIdentityTask(ctx, auth)
+}
+
+func (e *CodexExecutor) registerAgentIdentityTask(ctx context.Context, auth *cliproxyauth.Auth) (*cliproxyauth.Auth, error) {
+	if auth == nil {
+		return nil, errors.New("codex executor: auth is nil")
+	}
+	credential, err := codexauth.ParseAgentIdentityCredential(auth.Metadata)
+	if err != nil {
+		return nil, fmt.Errorf("codex executor: parse Agent Identity: %w", err)
+	}
+	client := e.newCodexHTTPClient(ctx, auth, false)
+	if e != nil && e.agentIdentityHTTPClient != nil {
+		client = e.agentIdentityHTTPClient(ctx, auth)
+	}
+	baseURL := ""
+	if e != nil {
+		baseURL = e.agentIdentityBaseURL
+	}
+	var taskID string
+	err = codexauth.RetryAgentIdentityRegistration(ctx, 3, func(registerCtx context.Context) error {
+		var errRegister error
+		taskID, errRegister = codexauth.RegisterAgentTask(registerCtx, client, baseURL, credential)
+		return errRegister
+	})
+	if err != nil {
+		return nil, fmt.Errorf("codex executor: register Agent Identity task: %w", err)
+	}
+	updated := auth.Clone()
+	if updated.Metadata == nil {
+		updated.Metadata = make(map[string]any)
+	}
+	updated.Metadata["task_id"] = taskID
+	return updated, nil
+}
 
 func translateCodexRequestBodies(from, to sdktranslator.Format, baseModel string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, stream bool) ([]byte, []byte, []byte) {
 	originalPayload := req.Payload
@@ -471,14 +530,18 @@ func (e *CodexExecutor) PrepareRequest(req *http.Request, auth *cliproxyauth.Aut
 		return nil
 	}
 	apiKey, _ := codexCreds(auth)
-	if strings.TrimSpace(apiKey) != "" {
-		req.Header.Set("Authorization", "Bearer "+apiKey)
-	}
 	var attrs map[string]string
 	if auth != nil {
 		attrs = auth.Attributes
 	}
 	util.ApplyCustomHeadersFromAttrs(req, attrs)
+	authorization, err := codexauth.AuthorizationHeader(authMetadata(auth), apiKey, time.Now())
+	if err != nil {
+		return fmt.Errorf("codex executor: build authorization: %w", err)
+	}
+	if authorization != "" {
+		req.Header.Set("Authorization", authorization)
+	}
 	return nil
 }
 
@@ -567,7 +630,9 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	originalPayload = nil
 	body = nil
 	dropCodexRawRequestCopies(&req, &opts)
-	applyCodexHeaders(httpReq, auth, apiKey, true, e.cfg)
+	if err = applyCodexHeaders(httpReq, auth, apiKey, true, e.cfg); err != nil {
+		return resp, err
+	}
 	applyCodexIdentityConfuseHeaders(httpReq.Header, &identityState)
 	var authID, authLabel, authType, authValue string
 	if auth != nil {
@@ -602,6 +667,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
 		b, _ := io.ReadAll(httpResp.Body)
 		upstreamBody := applyCodexIdentityConfuseResponsePayload(b, identityState)
+		upstreamBody = codexauth.SanitizeAgentIdentityErrorBody(authMetadata(auth), upstreamBody)
 		helps.AppendAPIResponseChunk(ctx, e.cfg, upstreamBody)
 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), upstreamBody))
 		clientBody := applyCodexIdentityExposeResponsePayload(upstreamBody, identityState)
@@ -620,28 +686,42 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 		bytesRead, readErr := httpResp.Body.Read(readBuffer)
 		keepReading := lineBuffer.Feed(readBuffer[:bytesRead], errors.Is(readErr, io.EOF), func(rawLine []byte) bool {
 			line := applyCodexIdentityConfuseResponsePayload(rawLine, identityState)
-			helps.AppendAPIResponseChunk(ctx, e.cfg, line)
 			if terminalErr != nil || len(completedEvent) > 0 {
+				helps.AppendAPIResponseChunk(ctx, e.cfg, line)
 				return true
 			}
-			line = bytes.TrimSpace(line)
-			if !bytes.HasPrefix(line, dataTag) {
+			trimmedLine := bytes.TrimSpace(line)
+			if !bytes.HasPrefix(trimmedLine, dataTag) {
+				helps.AppendAPIResponseChunk(ctx, e.cfg, line)
 				return true
 			}
 
-			eventData := bytes.TrimSpace(line[len(dataTag):])
+			eventData := bytes.TrimSpace(trimmedLine[len(dataTag):])
 			eventType := gjson.GetBytes(eventData, "type").String()
 			if eventType == "response.output_item.done" {
+				helps.AppendAPIResponseChunk(ctx, e.cfg, line)
 				collectCodexOutputItemDone(eventData, outputItemsByIndex, &outputItemsFallback)
 				return true
 			}
 
 			clientEventData := applyCodexIdentityExposeResponsePayload(eventData, identityState)
-			if eventErr, ok := codexTerminalStreamError(clientEventData); ok {
+			if originalEventErr, ok := codexTerminalStreamError(clientEventData); ok {
+				line = codexauth.SanitizeAgentIdentityErrorBody(authMetadata(auth), line)
+				helps.AppendAPIResponseChunk(ctx, e.cfg, line)
+				trimmedLine = bytes.TrimSpace(line)
+				eventData = bytes.TrimSpace(trimmedLine[len(dataTag):])
+				clientEventData = applyCodexIdentityExposeResponsePayload(eventData, identityState)
+				eventErr := originalEventErr
+				if sanitizedEventErr, parsed := codexTerminalStreamError(clientEventData); parsed {
+					eventErr = sanitizedEventErr
+				} else {
+					eventErr.msg = string(bytes.TrimSpace(line))
+				}
 				terminalErr = &eventErr
 				terminalEvent = bytes.Clone(clientEventData)
 				return true
 			}
+			helps.AppendAPIResponseChunk(ctx, e.cfg, line)
 			eventData = normalizeCodexCompletion(eventData)
 			if gjson.GetBytes(eventData, "type").String() != "response.completed" {
 				return true
@@ -734,7 +814,9 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 	originalPayload = nil
 	body = nil
 	dropCodexRawRequestCopies(&req, &opts)
-	applyCodexHeaders(httpReq, auth, apiKey, false, e.cfg)
+	if err = applyCodexHeaders(httpReq, auth, apiKey, false, e.cfg); err != nil {
+		return resp, err
+	}
 	applyCodexIdentityConfuseHeaders(httpReq.Header, &identityState)
 	var authID, authLabel, authType, authValue string
 	if auth != nil {
@@ -769,6 +851,7 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
 		b, _ := io.ReadAll(httpResp.Body)
 		upstreamBody := applyCodexIdentityConfuseResponsePayload(b, identityState)
+		upstreamBody = codexauth.SanitizeAgentIdentityErrorBody(authMetadata(auth), upstreamBody)
 		helps.AppendAPIResponseChunk(ctx, e.cfg, upstreamBody)
 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), upstreamBody))
 		clientBody := applyCodexIdentityExposeResponsePayload(upstreamBody, identityState)
@@ -863,7 +946,10 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	originalPayload = nil
 	body = nil
 	dropCodexRawRequestCopies(&req, &opts)
-	applyCodexHeaders(httpReq, auth, apiKey, true, e.cfg)
+	if err = applyCodexHeaders(httpReq, auth, apiKey, true, e.cfg); err != nil {
+		cleanupBodies()
+		return nil, err
+	}
 	applyCodexIdentityConfuseHeaders(httpReq.Header, &identityState)
 	var authID, authLabel, authType, authValue string
 	if auth != nil {
@@ -903,6 +989,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 			return nil, readErr
 		}
 		upstreamBody := applyCodexIdentityConfuseResponsePayload(data, identityState)
+		upstreamBody = codexauth.SanitizeAgentIdentityErrorBody(authMetadata(auth), upstreamBody)
 		helps.AppendAPIResponseChunk(ctx, e.cfg, upstreamBody)
 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), upstreamBody))
 		clientBody := applyCodexIdentityExposeResponsePayload(upstreamBody, identityState)
@@ -982,17 +1069,27 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 			if !trustUpstreamSSE {
 				line = applyCodexIdentityConfuseResponsePayload(line, identityState)
 			}
-			helps.AppendAPIResponseChunk(ctx, e.cfg, line)
 			clientLine := applyCodexIdentityExposeResponsePayload(line, identityState)
 			if bytes.HasPrefix(clientLine, dataTag) {
 				clientData := bytes.TrimSpace(clientLine[len(dataTag):])
-				if terminalErr, ok := codexTerminalStreamError(clientData); ok {
+				if originalTerminalErr, ok := codexTerminalStreamError(clientData); ok {
+					line = codexauth.SanitizeAgentIdentityErrorBody(authMetadata(auth), line)
+					clientLine = applyCodexIdentityExposeResponsePayload(line, identityState)
+					clientData = bytes.TrimSpace(clientLine[len(dataTag):])
+					terminalErr := originalTerminalErr
+					if sanitizedTerminalErr, parsed := codexTerminalStreamError(clientData); parsed {
+						terminalErr = sanitizedTerminalErr
+					} else {
+						terminalErr.msg = string(bytes.TrimSpace(line))
+					}
+					helps.AppendAPIResponseChunk(ctx, e.cfg, line)
 					helps.ClearCodexReasoningReplayOnInvalidSignature(replayScope, terminalErr.code, clientData)
 					reporter.PublishFailure(ctx, terminalErr)
 					_ = emit(cliproxyexecutor.StreamChunk{Err: terminalErr})
 					return
 				}
 			}
+			helps.AppendAPIResponseChunk(ctx, e.cfg, line)
 			if trustUpstreamSSE {
 				nextTrustedFrame, errFrame := appendBoundedCodexTrustedSSEFrame(
 					trustedFrame,
@@ -1586,26 +1683,25 @@ func codexIdentityConfuseUUID(authID string, kind string, value string) string {
 	return uuid.NewSHA1(uuid.NameSpaceOID, []byte(name)).String()
 }
 
-func applyCodexHeaders(r *http.Request, auth *cliproxyauth.Auth, token string, stream bool, cfg *config.Config) {
+func applyCodexHeaders(r *http.Request, auth *cliproxyauth.Auth, token string, stream bool, cfg *config.Config) error {
 	var ginHeaders http.Header
 	if ginCtx, ok := r.Context().Value("gin").(*gin.Context); ok && ginCtx != nil && ginCtx.Request != nil {
 		ginHeaders = ginCtx.Request.Header
 	}
-	applyCodexHeadersFromSources(r, auth, token, stream, cfg, ginHeaders)
+	return applyCodexHeadersFromSources(r, auth, token, stream, cfg, ginHeaders)
 }
 
-func applyCodexDirectImageHeaders(r *http.Request, auth *cliproxyauth.Auth, token string, stream bool, cfg *config.Config) {
+func applyCodexDirectImageHeaders(r *http.Request, auth *cliproxyauth.Auth, token string, stream bool, cfg *config.Config) error {
 	var ginHeaders http.Header
 	if ginCtx, ok := r.Context().Value("gin").(*gin.Context); ok && ginCtx != nil && ginCtx.Request != nil {
 		ginHeaders = ginCtx.Request.Header.Clone()
 		ginHeaders.Del("User-Agent")
 	}
-	applyCodexHeadersFromSources(r, auth, token, stream, cfg, ginHeaders)
+	return applyCodexHeadersFromSources(r, auth, token, stream, cfg, ginHeaders)
 }
 
-func applyCodexHeadersFromSources(r *http.Request, auth *cliproxyauth.Auth, token string, stream bool, cfg *config.Config, ginHeaders http.Header) {
+func applyCodexHeadersFromSources(r *http.Request, auth *cliproxyauth.Auth, token string, stream bool, cfg *config.Config, ginHeaders http.Header) error {
 	r.Header.Set("Content-Type", "application/json")
-	r.Header.Set("Authorization", "Bearer "+token)
 
 	if ginHeaders.Get("X-Codex-Beta-Features") != "" {
 		r.Header.Set("X-Codex-Beta-Features", ginHeaders.Get("X-Codex-Beta-Features"))
@@ -1641,10 +1737,12 @@ func applyCodexHeadersFromSources(r *http.Request, auth *cliproxyauth.Auth, toke
 		r.Header.Set("Originator", codexOriginator)
 	}
 	if !isAPIKey {
-		if auth != nil && auth.Metadata != nil {
-			if accountID, ok := auth.Metadata["account_id"].(string); ok {
-				r.Header.Set("Chatgpt-Account-Id", accountID)
-			}
+		metadata := authMetadata(auth)
+		if accountID := codexauth.EffectiveRequestAccountID(metadata); accountID != "" {
+			r.Header.Set("Chatgpt-Account-Id", accountID)
+		}
+		if codexauth.ChatGPTAccountIsFedRAMP(metadata) {
+			r.Header.Set("X-OpenAI-Fedramp", "true")
 		}
 	}
 	var attrs map[string]string
@@ -1652,6 +1750,21 @@ func applyCodexHeadersFromSources(r *http.Request, auth *cliproxyauth.Auth, toke
 		attrs = auth.Attributes
 	}
 	util.ApplyCustomHeadersFromAttrs(r, attrs)
+	authorization, err := codexauth.AuthorizationHeader(authMetadata(auth), token, time.Now())
+	if err != nil {
+		return fmt.Errorf("codex executor: build authorization: %w", err)
+	}
+	if authorization != "" {
+		r.Header.Set("Authorization", authorization)
+	}
+	return nil
+}
+
+func authMetadata(auth *cliproxyauth.Auth) map[string]any {
+	if auth == nil {
+		return nil
+	}
+	return auth.Metadata
 }
 
 func (e *CodexExecutor) newCodexHTTPClient(ctx context.Context, auth *cliproxyauth.Auth, imageRequest bool) *http.Client {
@@ -1710,7 +1823,12 @@ func classifyCodexStatusError(statusCode int, body []byte) []byte {
 
 func codexStatusErrorClassification(statusCode int, body []byte) (code string, errType string, ok bool) {
 	lower := strings.ToLower(strings.TrimSpace(string(body)))
-	upstreamCode := strings.ToLower(strings.TrimSpace(gjson.GetBytes(body, "error.code").String()))
+	upstreamCode := ""
+	for _, path := range []string{"error.code", "response.error.code", "code"} {
+		if upstreamCode = strings.ToLower(strings.TrimSpace(gjson.GetBytes(body, path).String())); upstreamCode != "" {
+			break
+		}
+	}
 	upstreamType := strings.ToLower(strings.TrimSpace(gjson.GetBytes(body, "error.type").String()))
 
 	switch {
@@ -1720,10 +1838,21 @@ func codexStatusErrorClassification(statusCode int, body []byte) (code string, e
 		return "thinking_signature_invalid", "invalid_request_error", true
 	case upstreamCode == "previous_response_not_found" || strings.Contains(lower, "previous_response_not_found") || strings.Contains(lower, "previous_response_id") && strings.Contains(lower, "not found"):
 		return "previous_response_not_found", "invalid_request_error", true
+	case statusCode == http.StatusUnauthorized && isAgentTaskErrorCode(upstreamCode):
+		return upstreamCode, "authentication_error", true
 	case statusCode == http.StatusUnauthorized || upstreamType == "authentication_error" || upstreamCode == "invalid_api_key" || strings.Contains(lower, "invalid or expired token") || strings.Contains(lower, "refresh_token_reused"):
 		return "auth_unavailable", "authentication_error", true
 	default:
 		return "", "", false
+	}
+}
+
+func isAgentTaskErrorCode(code string) bool {
+	switch strings.ToLower(strings.TrimSpace(code)) {
+	case "invalid_task_id", "task_not_found", "task_expired":
+		return true
+	default:
+		return false
 	}
 }
 

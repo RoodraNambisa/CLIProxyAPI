@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"strings"
 
+	codexauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/codex"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor/helps"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
@@ -119,7 +120,9 @@ func (e *CodexExecutor) executeOpenAIImage(ctx context.Context, auth *cliproxyau
 	body = nil
 	originalPayload = nil
 	dropCodexRawRequestCopies(&req, &opts)
-	applyCodexDirectImageHeaders(httpReq, auth, apiKey, false, e.cfg)
+	if err = applyCodexDirectImageHeaders(httpReq, auth, apiKey, false, e.cfg); err != nil {
+		return resp, err
+	}
 	applyCodexIdentityConfuseHeaders(httpReq.Header, &identityState)
 	recordCodexOpenAIImageRequest(ctx, e, auth, url, httpReq.Header.Clone(), upstreamBody)
 	upstreamBody = nil
@@ -145,13 +148,15 @@ func (e *CodexExecutor) executeOpenAIImage(ctx context.Context, auth *cliproxyau
 		return resp, readErr
 	}
 	upstreamData := applyCodexIdentityConfuseResponsePayload(data, identityState)
-	helps.AppendAPIResponseChunk(ctx, e.cfg, upstreamData)
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
+		upstreamData = codexauth.SanitizeAgentIdentityErrorBody(authMetadata(auth), upstreamData)
+		helps.AppendAPIResponseChunk(ctx, e.cfg, upstreamData)
 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), upstreamData))
 		clientBody := applyCodexIdentityExposeResponsePayload(upstreamData, identityState)
 		err = newCodexStatusErr(httpResp.StatusCode, clientBody)
 		return resp, err
 	}
+	helps.AppendAPIResponseChunk(ctx, e.cfg, upstreamData)
 	reporter.Publish(ctx, helps.ParseOpenAIUsage(upstreamData))
 	reporter.EnsurePublished(ctx)
 	clientData := applyCodexIdentityExposeResponsePayload(upstreamData, identityState)
@@ -190,7 +195,9 @@ func (e *CodexExecutor) executeOpenAIImageStream(ctx context.Context, auth *clip
 	body = nil
 	originalPayload = nil
 	dropCodexRawRequestCopies(&req, &opts)
-	applyCodexDirectImageHeaders(httpReq, auth, apiKey, true, e.cfg)
+	if err = applyCodexDirectImageHeaders(httpReq, auth, apiKey, true, e.cfg); err != nil {
+		return nil, err
+	}
 	applyCodexIdentityConfuseHeaders(httpReq.Header, &identityState)
 	recordCodexOpenAIImageRequest(ctx, e, auth, url, httpReq.Header.Clone(), upstreamBody)
 	upstreamBody = nil
@@ -211,6 +218,7 @@ func (e *CodexExecutor) executeOpenAIImageStream(ctx context.Context, auth *clip
 			return nil, readErr
 		}
 		upstreamBody := applyCodexIdentityConfuseResponsePayload(data, identityState)
+		upstreamBody = codexauth.SanitizeAgentIdentityErrorBody(authMetadata(auth), upstreamBody)
 		helps.AppendAPIResponseChunk(ctx, e.cfg, upstreamBody)
 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), upstreamBody))
 		clientBody := applyCodexIdentityExposeResponsePayload(upstreamBody, identityState)
@@ -231,8 +239,6 @@ func (e *CodexExecutor) executeOpenAIImageStream(ctx context.Context, auth *clip
 		readBuffer := make([]byte, 64*1024)
 		var streamUsage helps.StreamUsageBuffer
 		markerRequested := metadataBool(opts.Metadata, cliproxyexecutor.StreamTerminalMarkerMetadataKey)
-		protocolFailed := false
-		var protocolErr error
 		terminalSeen := false
 		for {
 			bytesRead, readErr := httpResp.Body.Read(readBuffer)
@@ -245,24 +251,47 @@ func (e *CodexExecutor) executeOpenAIImageStream(ctx context.Context, auth *clip
 			}
 			for _, frame := range frames {
 				upstreamFrame := applyCodexIdentityConfuseResponsePayload(frame, identityState)
-				helps.AppendAPIResponseChunk(ctx, e.cfg, upstreamFrame)
 				clientFrame := applyCodexIdentityExposeResponsePayload(upstreamFrame, identityState)
+				var frameErr error
+				for _, line := range helps.SplitSSEFrameLines(clientFrame) {
+					payload := helps.JSONPayload(line)
+					if len(payload) == 0 || !helps.IsJSONStreamProtocolError(payload) {
+						continue
+					}
+					if terminalErr, ok := codexTerminalStreamError(payload); ok {
+						frameErr = terminalErr
+					} else {
+						frameErr = helps.JSONStreamProtocolError("codex image", payload)
+					}
+					break
+				}
+				if frameErr != nil {
+					upstreamFrame = codexauth.SanitizeAgentIdentityErrorBody(authMetadata(auth), upstreamFrame)
+					sanitizedClientFrame := applyCodexIdentityExposeResponsePayload(upstreamFrame, identityState)
+					for _, line := range helps.SplitSSEFrameLines(sanitizedClientFrame) {
+						payload := helps.JSONPayload(line)
+						if terminalErr, ok := codexTerminalStreamError(payload); ok {
+							frameErr = terminalErr
+							break
+						}
+					}
+					helps.AppendAPIResponseChunk(ctx, e.cfg, upstreamFrame)
+					helps.RecordAPIResponseError(ctx, e.cfg, frameErr)
+					reporter.PublishFailure(ctx, frameErr)
+					_ = emitCodexOpenAIImageStreamChunk(ctx, out, cliproxyexecutor.StreamChunk{Err: frameErr})
+					return
+				}
+				helps.AppendAPIResponseChunk(ctx, e.cfg, upstreamFrame)
 				terminal := false
 				for _, line := range helps.SplitSSEFrameLines(clientFrame) {
 					streamUsage.ObserveOpenAIStream(line)
-					if payload := helps.JSONPayload(line); len(payload) > 0 && helps.IsJSONStreamProtocolError(payload) {
-						protocolFailed = true
-						if protocolErr == nil {
-							protocolErr = helps.JSONStreamProtocolError("codex image", payload)
-						}
-					}
 					terminal = terminal || helps.IsOpenAIStreamTerminal(line) || codexSSEDataCompletion(line)
 				}
 				terminalSeen = terminalSeen || terminal
 				if !emitCodexOpenAIImageStreamChunk(ctx, out, cliproxyexecutor.StreamChunk{Payload: clientFrame}) {
 					return
 				}
-				if markerRequested && terminal && !protocolFailed && (readErr == nil || errors.Is(readErr, io.EOF)) {
+				if markerRequested && terminal && (readErr == nil || errors.Is(readErr, io.EOF)) {
 					streamUsage.Publish(ctx, reporter)
 					reporter.EnsurePublished(ctx)
 					_ = emitCodexOpenAIImageStreamChunk(ctx, out, cliproxyexecutor.SuccessfulStreamTerminalChunk())
@@ -273,7 +302,7 @@ func (e *CodexExecutor) executeOpenAIImageStream(ctx context.Context, auth *clip
 				continue
 			}
 			if errors.Is(readErr, io.EOF) {
-				if terminalSeen && !protocolFailed {
+				if terminalSeen {
 					streamUsage.Publish(ctx, reporter)
 					reporter.EnsurePublished(ctx)
 					if markerRequested {
@@ -281,10 +310,7 @@ func (e *CodexExecutor) executeOpenAIImageStream(ctx context.Context, auth *clip
 					}
 					return
 				}
-				streamErr := protocolErr
-				if streamErr == nil {
-					streamErr = helps.IncompleteStreamError("codex image")
-				}
+				streamErr := helps.IncompleteStreamError("codex image")
 				helps.RecordAPIResponseError(ctx, e.cfg, streamErr)
 				reporter.PublishFailure(ctx, streamErr)
 				_ = emitCodexOpenAIImageStreamChunk(ctx, out, cliproxyexecutor.StreamChunk{Err: streamErr})

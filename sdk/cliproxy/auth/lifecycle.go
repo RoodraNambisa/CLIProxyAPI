@@ -85,8 +85,19 @@ func (a *Auth) LifecycleSelectable() bool {
 
 // LifecycleRefreshable reports whether the automatic token refresh loop may schedule the credential.
 func (a *Auth) LifecycleRefreshable() bool {
+	if isCodexAgentIdentityAuth(a) {
+		return false
+	}
 	state := a.LifecycleState()
 	return state == "" || state == LifecycleStateActive
+}
+
+func isCodexAgentIdentityAuth(auth *Auth) bool {
+	if auth == nil || !strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") || auth.Metadata == nil {
+		return false
+	}
+	authMode, _ := auth.Metadata["auth_mode"].(string)
+	return strings.EqualFold(strings.TrimSpace(authMode), "agentIdentity")
 }
 
 func applyLifecycleRuntimeState(auth *Auth) {

@@ -60,6 +60,8 @@ type Handler struct {
 	proxyPoolManager        *proxypool.Manager
 	chatGPTWebTasks         *chatGPTWebLoginTaskManager
 	chatGPTWebMutationTasks *chatGPTWebMutationTaskManager
+	agentIdentityTasks      *codexAgentIdentityTaskManager
+	agentIdentityBaseURL    string
 	chatGPTWebDependencyMu  sync.Mutex
 	cleanupCancel           context.CancelFunc
 	cleanupWG               sync.WaitGroup
@@ -82,6 +84,7 @@ func NewHandler(cfg *config.Config, configFilePath string, manager *coreauth.Man
 		envSecret:               envSecret,
 		chatGPTWebTasks:         newChatGPTWebLoginTaskManager(),
 		chatGPTWebMutationTasks: newChatGPTWebMutationTaskManager(),
+		agentIdentityTasks:      newCodexAgentIdentityTaskManager(),
 	}
 	cleanupCtx, cleanupCancel := context.WithCancel(context.Background())
 	h.cleanupCancel = cleanupCancel
@@ -113,6 +116,12 @@ func (h *Handler) startAttemptCleanup(ctx context.Context) {
 				if mutationTaskManager != nil {
 					mutationTaskManager.prune()
 				}
+				h.mu.Lock()
+				agentIdentityTasks := h.agentIdentityTasks
+				h.mu.Unlock()
+				if agentIdentityTasks != nil {
+					agentIdentityTasks.prune()
+				}
 			case <-ctx.Done():
 				return
 			}
@@ -138,9 +147,10 @@ func (h *Handler) Shutdown(ctx context.Context) error {
 	h.mu.Lock()
 	taskManager := h.chatGPTWebTasks
 	mutationTaskManager := h.chatGPTWebMutationTasks
+	agentIdentityTasks := h.agentIdentityTasks
 	h.mu.Unlock()
 	type shutdownResult struct{ err error }
-	results := make(chan shutdownResult, 2)
+	results := make(chan shutdownResult, 3)
 	count := 0
 	if taskManager != nil {
 		count++
@@ -149,6 +159,10 @@ func (h *Handler) Shutdown(ctx context.Context) error {
 	if mutationTaskManager != nil {
 		count++
 		go func() { results <- shutdownResult{err: mutationTaskManager.shutdown(ctx)} }()
+	}
+	if agentIdentityTasks != nil {
+		count++
+		go func() { results <- shutdownResult{err: agentIdentityTasks.shutdown(ctx)} }()
 	}
 	var shutdownErr error
 	for range count {

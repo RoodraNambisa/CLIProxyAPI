@@ -121,6 +121,13 @@ func TestNewCodexStatusErrClassifiesKnownFailures(t *testing.T) {
 			wantCode:   "auth_unavailable",
 			wantType:   "authentication_error",
 		},
+		{
+			name:       "Agent Identity task error",
+			statusCode: http.StatusUnauthorized,
+			body:       []byte(`{"code":"task_expired","message":"task expired"}`),
+			wantCode:   "task_expired",
+			wantType:   "authentication_error",
+		},
 	}
 
 	for _, tc := range testCases {

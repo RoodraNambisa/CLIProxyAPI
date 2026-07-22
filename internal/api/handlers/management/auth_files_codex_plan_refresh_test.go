@@ -109,6 +109,103 @@ func TestCodexPlanTypeRefreshUpdatesPlanTypeAndListAuthFiles(t *testing.T) {
 	}
 }
 
+func TestCodexPlanTypeRefreshUsesAgentAssertion(t *testing.T) {
+	keyMaterial, errKey := internalcodex.GenerateAgentIdentityKeyMaterial()
+	if errKey != nil {
+		t.Fatalf("GenerateAgentIdentityKeyMaterial() error = %v", errKey)
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		authorization := request.Header.Get("Authorization")
+		if !strings.HasPrefix(authorization, "AgentAssertion ") {
+			t.Errorf("Authorization = %q, want AgentAssertion", authorization)
+		}
+		if got := request.Header.Get("Chatgpt-Account-Id"); got != "chatgpt-account-plan" {
+			t.Errorf("Chatgpt-Account-Id = %q, want chatgpt-account-plan", got)
+		}
+		if got := request.Header.Get("X-OpenAI-Fedramp"); got != "true" {
+			t.Errorf("X-OpenAI-Fedramp = %q, want true", got)
+		}
+		writer.Header().Set("Content-Type", "application/json")
+		_, _ = writer.Write([]byte(`{"plan_type":"team"}`))
+	}))
+	defer server.Close()
+
+	restoreUsageURL := codexPlanTypeRefreshUsageURL
+	codexPlanTypeRefreshUsageURL = server.URL
+	defer func() { codexPlanTypeRefreshUsageURL = restoreUsageURL }()
+
+	metadata := internalcodex.AgentIdentityMetadata(internalcodex.AgentIdentityCredential{
+		AgentRuntimeID:          "runtime-plan",
+		PrivateKeyPKCS8Base64:   keyMaterial.PrivateKeyPKCS8Base64,
+		TaskID:                  "task-plan",
+		AccountID:               "root-account-plan",
+		ChatGPTAccountID:        "chatgpt-account-plan",
+		ChatGPTUserID:           "user-plan",
+		Email:                   "plan@example.com",
+		PlanType:                "plus",
+		ChatGPTAccountIsFedRAMP: true,
+	})
+	handler, manager, _, authID := newCodexPlanRefreshTestHandler(t, metadata)
+	manager.RegisterExecutor(codexPlanRefreshTestExecutor{})
+	auth, ok := manager.GetByID(authID)
+	if !ok {
+		t.Fatal("test auth not found")
+	}
+	result := handler.refreshSingleCodexPlanType(manager, auth)
+	if result.Status != codexPlanTypeRefreshStatusUpdated || result.PlanTypeAfter != "team" {
+		t.Fatalf("refresh result = %#v", result)
+	}
+}
+
+func TestCodexPlanTypeRefreshDoesNotOAuthRefreshActiveAgentIdentity(t *testing.T) {
+	keyMaterial, errKey := internalcodex.GenerateAgentIdentityKeyMaterial()
+	if errKey != nil {
+		t.Fatalf("GenerateAgentIdentityKeyMaterial() error = %v", errKey)
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if authorization := request.Header.Get("Authorization"); !strings.HasPrefix(authorization, "AgentAssertion ") {
+			t.Errorf("Authorization = %q, want AgentAssertion", authorization)
+		}
+		writer.Header().Set("Content-Type", "application/json")
+		writer.WriteHeader(http.StatusUnauthorized)
+		_, _ = writer.Write([]byte(`{"error":{"code":"invalid_agent_identity"}}`))
+	}))
+	defer server.Close()
+
+	restoreUsageURL := codexPlanTypeRefreshUsageURL
+	codexPlanTypeRefreshUsageURL = server.URL
+	defer func() { codexPlanTypeRefreshUsageURL = restoreUsageURL }()
+
+	metadata := internalcodex.AgentIdentityMetadata(internalcodex.AgentIdentityCredential{
+		AgentRuntimeID:        "runtime-no-oauth-refresh",
+		PrivateKeyPKCS8Base64: keyMaterial.PrivateKeyPKCS8Base64,
+		TaskID:                "task-no-oauth-refresh",
+		AccountID:             "root-no-oauth-refresh",
+		ChatGPTAccountID:      "team-no-oauth-refresh",
+		ChatGPTUserID:         "user-no-oauth-refresh",
+		Email:                 "no-oauth-refresh@example.com",
+		PlanType:              "plus",
+	})
+	metadata["refresh_token"] = "retained-refresh"
+	handler, manager, _, authID := newCodexPlanRefreshTestHandler(t, metadata)
+	var refreshCalls atomic.Int32
+	manager.RegisterExecutor(codexPlanRefreshTestExecutor{refreshFn: func(auth *coreauth.Auth) (*coreauth.Auth, error) {
+		refreshCalls.Add(1)
+		return auth, nil
+	}})
+	auth, ok := manager.GetByID(authID)
+	if !ok {
+		t.Fatal("test auth not found")
+	}
+	result := handler.refreshSingleCodexPlanType(manager, auth)
+	if result.Status != codexPlanTypeRefreshStatusFailed || result.HTTPStatus != http.StatusUnauthorized {
+		t.Fatalf("refresh result = %#v, want Agent Identity 401 failure", result)
+	}
+	if got := refreshCalls.Load(); got != 0 {
+		t.Fatalf("OAuth refresh calls = %d, want 0 while Agent Identity is active", got)
+	}
+}
+
 type codexPlanRefreshProxyResolver struct {
 	url   string
 	calls atomic.Int32

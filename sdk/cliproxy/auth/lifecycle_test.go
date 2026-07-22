@@ -268,6 +268,17 @@ func TestLifecycleSelectable(t *testing.T) {
 	if !compat.LifecycleSelectable() || !compat.LifecycleRefreshable() {
 		t.Fatal("OpenAI compatibility provider named chatgpt-web must not use native lifecycle gating")
 	}
+	agentIdentity := &Auth{Provider: "codex", Metadata: map[string]any{"auth_mode": "agentIdentity"}}
+	if !agentIdentity.LifecycleSelectable() {
+		t.Fatal("Agent Identity credential should remain selectable")
+	}
+	if agentIdentity.LifecycleRefreshable() {
+		t.Fatal("Agent Identity credential should not enter OAuth auto-refresh")
+	}
+	agentIdentity.Metadata["auth_mode"] = "oauth"
+	if !agentIdentity.LifecycleRefreshable() {
+		t.Fatal("Codex credential switched back to OAuth should re-enter auto-refresh")
+	}
 	invalid := &Auth{
 		Provider: "chatgpt-web",
 		Metadata: map[string]any{"lifecycle_state": "secret-shaped-invalid-state"},
