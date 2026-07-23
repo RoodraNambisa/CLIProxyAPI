@@ -14,11 +14,12 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
-// GetProxyPools returns structured proxy pools with credentials masked.
+// GetProxyPools returns complete structured proxy pools to authenticated management clients.
 func (h *Handler) GetProxyPools(c *gin.Context) {
 	h.mu.Lock()
-	pools := maskProxyPools(h.cfg.ProxyPools)
+	pools := cloneProxyPools(h.cfg.ProxyPools)
 	h.mu.Unlock()
+	c.Header("Cache-Control", "no-store")
 	c.JSON(http.StatusOK, gin.H{"proxy-pools": pools})
 }
 

@@ -16,7 +16,7 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-func TestProxyPoolManagementMasksSecretsAndMigratesRuleOnRename(t *testing.T) {
+func TestProxyPoolManagementReturnsSecretsAndMigratesRuleOnRename(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	configPath := filepath.Join(t.TempDir(), "config.yaml")
 	if errWrite := os.WriteFile(configPath, []byte("proxy-pools: []\nproxy-rules: []\n"), 0o600); errWrite != nil {
@@ -42,8 +42,11 @@ func TestProxyPoolManagementMasksSecretsAndMigratesRuleOnRename(t *testing.T) {
 	}
 
 	get := performProxyConfigRequest(router, http.MethodGet, "/proxy-pools", "")
-	if strings.Contains(get.Body.String(), "secret") || !strings.Contains(get.Body.String(), "********") {
-		t.Fatalf("GET response did not mask password: %s", get.Body.String())
+	if !strings.Contains(get.Body.String(), "http://user:secret@proxy.example") || strings.Contains(get.Body.String(), "********") {
+		t.Fatalf("GET response did not return the complete credential: %s", get.Body.String())
+	}
+	if got := get.Header().Get("Cache-Control"); got != "no-store" {
+		t.Fatalf("Cache-Control = %q, want no-store", got)
 	}
 	if cfg.ProxyPools[0].Entries[0].URLTemplate != "http://user:secret@proxy.example" {
 		t.Fatalf("stored URL was mutated: %q", cfg.ProxyPools[0].Entries[0].URLTemplate)
@@ -583,7 +586,7 @@ func TestPutProxyURLPreservesMaskedMalformedCredential(t *testing.T) {
 	}
 }
 
-func TestProxyPoolPatchPreservesMaskedUsernameOnlyCredential(t *testing.T) {
+func TestProxyPoolGetReturnsCompleteCredentials(t *testing.T) {
 	configPath := filepath.Join(t.TempDir(), "config.yaml")
 	const rawProxyURL = "http://tenant-secret-{8}@proxy.example:8080"
 	cfg := &config.Config{SDKConfig: config.SDKConfig{ProxyPools: []config.ProxyPoolConfig{{
@@ -608,8 +611,17 @@ func TestProxyPoolPatchPreservesMaskedUsernameOnlyCredential(t *testing.T) {
 	if errDecode := json.Unmarshal(get.Body.Bytes(), &body); errDecode != nil {
 		t.Fatalf("decode proxy pools: %v", errDecode)
 	}
-	masked := body.Pools[0].Entries[0].URLTemplate
-	patch := performProxyConfigRequest(router, http.MethodPatch, "/proxy-pools/residential", `{"entries":[{"id":"node","url-template":`+strconv.Quote(masked)+`}]} `)
+	if get.Code != http.StatusOK {
+		t.Fatalf("GET status = %d; body=%s", get.Code, get.Body.String())
+	}
+	if got := get.Header().Get("Cache-Control"); got != "no-store" {
+		t.Fatalf("Cache-Control = %q, want no-store", got)
+	}
+	returnedURL := body.Pools[0].Entries[0].URLTemplate
+	if returnedURL != rawProxyURL {
+		t.Fatalf("URLTemplate = %q, want complete credential", returnedURL)
+	}
+	patch := performProxyConfigRequest(router, http.MethodPatch, "/proxy-pools/residential", `{"entries":[{"id":"node","url-template":`+strconv.Quote(returnedURL)+`}]} `)
 	if patch.Code != http.StatusOK {
 		t.Fatalf("PATCH status = %d; body=%s", patch.Code, patch.Body.String())
 	}
