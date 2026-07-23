@@ -102,8 +102,9 @@ func (*ChatGPTWebResponseLimitError) RetryOtherAuth() bool { return false }
 
 // ChatGPTWebContentPart is a normalized text or image input part.
 type ChatGPTWebContentPart struct {
-	Text     string
-	ImageURL string
+	Text        string
+	ImageURL    string
+	ImageDetail string
 }
 
 // ChatGPTWebMessage is a normalized Responses message used by the web client.
@@ -116,6 +117,7 @@ type ChatGPTWebMessage struct {
 // ChatGPTWebImageRequest describes an image_generation request embedded in a
 // canonical Responses payload.
 type ChatGPTWebImageRequest struct {
+	Model          string
 	Prompt         string
 	Images         []string
 	MaskURL        string
@@ -401,6 +403,13 @@ func ParseChatGPTWebRequestWithForcedTool(payload []byte, forcedTool string) (Ch
 		request.Image, err = imageRequestFromMessages(request.Messages, imageTool)
 		if err != nil {
 			return ChatGPTWebRequest{}, err
+		}
+		if request.Image.Model == "" {
+			if ChatGPTWebModelUsesImageGeneration(request.Model) {
+				request.Image.Model = request.Model
+			} else {
+				request.Image.Model = "gpt-image-2"
+			}
 		}
 	}
 	if len(request.Messages) == 0 {
@@ -825,7 +834,13 @@ func contentPartsFromAny(value any) []ChatGPTWebContentPart {
 				imageURL = imageURLFromAny(typed["url"])
 			}
 			if imageURL != "" {
-				return []ChatGPTWebContentPart{{ImageURL: imageURL}}
+				detail := strings.TrimSpace(stringFromAny(typed["detail"]))
+				if detail == "" {
+					if imageObject, ok := typed["image_url"].(map[string]any); ok {
+						detail = strings.TrimSpace(stringFromAny(imageObject["detail"]))
+					}
+				}
+				return []ChatGPTWebContentPart{{ImageURL: imageURL, ImageDetail: detail}}
 			}
 		default:
 			if text := stringFromAny(typed["text"]); text != "" {
@@ -848,6 +863,7 @@ func imageURLFromAny(value any) string {
 
 func imageRequestFromMessages(messages []ChatGPTWebMessage, tool map[string]any) (*ChatGPTWebImageRequest, error) {
 	request := &ChatGPTWebImageRequest{
+		Model:          strings.TrimSpace(stringFromAny(tool["model"])),
 		Size:           strings.TrimSpace(stringFromAny(tool["size"])),
 		Quality:        strings.TrimSpace(stringFromAny(tool["quality"])),
 		Action:         strings.ToLower(strings.TrimSpace(stringFromAny(tool["action"]))),
@@ -1211,6 +1227,7 @@ type ChatGPTWebImageAccumulator struct {
 	Terminal       bool
 	StreamTerminal bool
 	FailureStatus  string
+	ToolUsage      map[string]any
 	role           string
 	imageTool      bool
 	referenceSet   map[string]struct{}
@@ -1271,6 +1288,9 @@ func MergeChatGPTWebImageAccumulators(primary, secondary *ChatGPTWebImageAccumul
 		merged.Terminal = merged.Terminal || source.Terminal
 		merged.StreamTerminal = merged.StreamTerminal || source.StreamTerminal
 		merged.FailureStatus = chatGPTWebPreferredImageFailure(merged.FailureStatus, source.FailureStatus)
+		if len(merged.ToolUsage) == 0 && len(source.ToolUsage) > 0 {
+			merged.ToolUsage = source.ToolUsage
+		}
 		if merged.role == "" {
 			merged.role = source.role
 		}
@@ -1318,6 +1338,9 @@ func (accumulator *ChatGPTWebImageAccumulator) Apply(payload []byte) (bool, erro
 	if !ok {
 		return false, nil
 	}
+	if usage := chatGPTWebFindImageToolUsage(event, 0); len(usage) > 0 {
+		accumulator.ToolUsage = usage
+	}
 	if failed, detail := chatGPTWebImageOuterFailure(event); failed {
 		if detail == "" {
 			return false, JSONStreamProtocolError("chatgpt web image", trimmed)
@@ -1359,6 +1382,34 @@ func (accumulator *ChatGPTWebImageAccumulator) Apply(payload []byte) (bool, erro
 	streamTerminal := chatGPTWebImageStreamTerminal(event)
 	accumulator.StreamTerminal = accumulator.StreamTerminal || streamTerminal
 	return streamTerminal, nil
+}
+
+func chatGPTWebFindImageToolUsage(value any, depth int) map[string]any {
+	if depth > 10 {
+		return nil
+	}
+	switch typed := value.(type) {
+	case map[string]any:
+		if rawToolUsage, ok := typed["tool_usage"].(map[string]any); ok {
+			for _, key := range []string{"image_gen", "image_generation"} {
+				if usage, okUsage := rawToolUsage[key].(map[string]any); okUsage && len(usage) > 0 {
+					return usage
+				}
+			}
+		}
+		for _, child := range typed {
+			if usage := chatGPTWebFindImageToolUsage(child, depth+1); len(usage) > 0 {
+				return usage
+			}
+		}
+	case []any:
+		for _, child := range typed {
+			if usage := chatGPTWebFindImageToolUsage(child, depth+1); len(usage) > 0 {
+				return usage
+			}
+		}
+	}
+	return nil
 }
 
 func (accumulator *ChatGPTWebImageAccumulator) mergeTerminalState(terminal bool, failureStatus string) {

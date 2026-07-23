@@ -741,6 +741,24 @@ func TestChatGPTWebImageAccumulatorCapturesToolPatch(t *testing.T) {
 	}
 }
 
+func TestChatGPTWebImageAccumulatorCapturesToolUsage(t *testing.T) {
+	accumulator := &ChatGPTWebImageAccumulator{}
+	_, err := accumulator.Apply([]byte(`{
+		"response":{"tool_usage":{"image_gen":{
+			"input_tokens":12,
+			"output_tokens":7024,
+			"total_tokens":7036,
+			"output_tokens_details":{"image_tokens":7024,"text_tokens":0}
+		}}}
+	}`))
+	if err != nil {
+		t.Fatalf("Apply() error = %v", err)
+	}
+	if accumulator.ToolUsage["output_tokens"] != json.Number("7024") {
+		t.Fatalf("ToolUsage = %#v", accumulator.ToolUsage)
+	}
+}
+
 func TestChatGPTWebImageAccumulatorCapturesPatchRegardlessOfOperationOrder(t *testing.T) {
 	accumulator := &ChatGPTWebImageAccumulator{}
 	payload := []byte(`{"o":"patch","v":[

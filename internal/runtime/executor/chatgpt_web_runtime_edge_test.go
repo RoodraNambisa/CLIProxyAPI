@@ -298,24 +298,6 @@ func TestCollectChatGPTWebSearchSourcesOnlyUsesCitationContainers(t *testing.T) 
 	}
 }
 
-func TestChatGPTWebUsageInputDoesNotIncludeImageData(t *testing.T) {
-	input := chatGPTWebUsageInput(helps.ChatGPTWebRequest{
-		Messages: []helps.ChatGPTWebMessage{{
-			Role: "user",
-			Parts: []helps.ChatGPTWebContentPart{{
-				Text:     "describe this",
-				ImageURL: "data:image/png;base64,SECRET_IMAGE_BYTES",
-			}},
-		}},
-	})
-	if strings.Contains(input, "SECRET_IMAGE_BYTES") {
-		t.Fatalf("usage input included image bytes: %q", input)
-	}
-	if !strings.Contains(input, "describe this") || !strings.Contains(input, "[image]") {
-		t.Fatalf("usage input = %q, want text and image marker", input)
-	}
-}
-
 func TestExtractChatGPTWebSearchResultUsesAllStatusFields(t *testing.T) {
 	result, status, complete, err := extractChatGPTWebSearchResult([]byte(`{
 		"mapping":{

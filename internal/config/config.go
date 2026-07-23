@@ -46,6 +46,9 @@ const (
 	MaxChatGPTWebSentinelSDKWorkers           = 16
 	MaxChatGPTWebSentinelSDKQueueSize         = 1024
 	MaxChatGPTWebSentinelSDKCacheVersions     = 5
+	DefaultChatGPTWebUsageCacheThresholdMB    = 1
+	DefaultChatGPTWebUsageCacheMaxDiskSizeMB  = 1024
+	DefaultChatGPTWebAutoOutputQuality        = "medium"
 )
 
 var (
@@ -418,12 +421,107 @@ type CodexConfig struct {
 	IdentityConfuse bool `yaml:"identity-confuse" json:"identity-confuse"`
 }
 
-// ChatGPTWebConfig configures ChatGPT Web credential and Sentinel behavior.
+// ChatGPTWebConfig configures ChatGPT Web credential, usage, and Sentinel behavior.
 type ChatGPTWebConfig struct {
 	// AutoRelogin starts a background password login after a terminal refresh failure.
 	AutoRelogin bool `yaml:"auto-relogin" json:"auto-relogin"`
+	// EstimateTokenUsage controls local tiktoken usage estimation for Web responses.
+	// An omitted value remains enabled for backward compatibility.
+	EstimateTokenUsage *bool                      `yaml:"estimate-token-usage,omitempty" json:"estimate-token-usage,omitempty"`
+	UsageCache         ChatGPTWebUsageCacheConfig `yaml:"usage-cache,omitempty" json:"usage-cache,omitempty"`
+	ImageUsage         ChatGPTWebImageUsageConfig `yaml:"image-usage,omitempty" json:"image-usage,omitempty"`
 
 	Sentinel ChatGPTWebSentinelConfig `yaml:"sentinel" json:"sentinel"`
+}
+
+// TokenUsageEstimationEnabled returns whether Web response usage is estimated locally.
+func (cfg ChatGPTWebConfig) TokenUsageEstimationEnabled() bool {
+	return cfg.EstimateTokenUsage == nil || *cfg.EstimateTokenUsage
+}
+
+// ChatGPTWebUsageCacheConfig controls optional disk spill for compact usage projections.
+type ChatGPTWebUsageCacheConfig struct {
+	Enabled         *bool  `yaml:"enabled,omitempty" json:"enabled,omitempty"`
+	DiskThresholdMB *int64 `yaml:"disk-threshold-mb,omitempty" json:"disk-threshold-mb,omitempty"`
+	MaxDiskSizeMB   *int64 `yaml:"max-disk-size-mb,omitempty" json:"max-disk-size-mb,omitempty"`
+	Path            string `yaml:"path,omitempty" json:"path,omitempty"`
+}
+
+// ResolvedChatGPTWebUsageCacheConfig contains effective usage-cache values.
+type ResolvedChatGPTWebUsageCacheConfig struct {
+	Enabled         bool   `json:"enabled"`
+	DiskThresholdMB int64  `json:"disk-threshold-mb"`
+	MaxDiskSizeMB   int64  `json:"max-disk-size-mb"`
+	Path            string `json:"path"`
+}
+
+// Resolved returns effective usage-cache settings.
+func (cfg ChatGPTWebUsageCacheConfig) Resolved() ResolvedChatGPTWebUsageCacheConfig {
+	resolved := ResolvedChatGPTWebUsageCacheConfig{
+		DiskThresholdMB: DefaultChatGPTWebUsageCacheThresholdMB,
+		MaxDiskSizeMB:   DefaultChatGPTWebUsageCacheMaxDiskSizeMB,
+		Path:            strings.TrimSpace(cfg.Path),
+	}
+	if cfg.Enabled != nil {
+		resolved.Enabled = *cfg.Enabled
+	}
+	if cfg.DiskThresholdMB != nil {
+		resolved.DiskThresholdMB = *cfg.DiskThresholdMB
+	}
+	if cfg.MaxDiskSizeMB != nil {
+		resolved.MaxDiskSizeMB = *cfg.MaxDiskSizeMB
+	}
+	return resolved
+}
+
+// Validate rejects unsafe or internally inconsistent usage-cache settings.
+func (cfg ChatGPTWebUsageCacheConfig) Validate() error {
+	resolved := cfg.Resolved()
+	if resolved.DiskThresholdMB < 1 {
+		return fmt.Errorf("chatgpt-web.usage-cache.disk-threshold-mb must be at least 1")
+	}
+	if resolved.MaxDiskSizeMB < 1 {
+		return fmt.Errorf("chatgpt-web.usage-cache.max-disk-size-mb must be at least 1")
+	}
+	if resolved.DiskThresholdMB > resolved.MaxDiskSizeMB {
+		return fmt.Errorf("chatgpt-web.usage-cache.disk-threshold-mb must not exceed max-disk-size-mb")
+	}
+	return nil
+}
+
+// ChatGPTWebImageUsageConfig controls local image token estimation only.
+type ChatGPTWebImageUsageConfig struct {
+	AutoOutputQuality string `yaml:"auto-output-quality,omitempty" json:"auto-output-quality,omitempty"`
+}
+
+// ResolvedAutoOutputQuality returns the local billing quality used for auto output.
+func (cfg ChatGPTWebImageUsageConfig) ResolvedAutoOutputQuality() string {
+	quality := strings.ToLower(strings.TrimSpace(cfg.AutoOutputQuality))
+	if quality == "" {
+		return DefaultChatGPTWebAutoOutputQuality
+	}
+	return quality
+}
+
+// Validate rejects unsupported automatic output quality mappings.
+func (cfg ChatGPTWebImageUsageConfig) Validate() error {
+	switch cfg.ResolvedAutoOutputQuality() {
+	case "low", "medium", "high":
+		return nil
+	default:
+		return fmt.Errorf("chatgpt-web.image-usage.auto-output-quality must be low, medium, or high")
+	}
+}
+
+// Validate checks all ChatGPT Web runtime configuration.
+func (cfg ChatGPTWebConfig) Validate() error {
+	if err := cfg.UsageCache.Validate(); err != nil {
+		return err
+	}
+	if err := cfg.ImageUsage.Validate(); err != nil {
+		return err
+	}
+	return cfg.Sentinel.Validate()
 }
 
 // ChatGPTWebSentinelConfig preserves whether values were explicitly configured.
@@ -1215,7 +1313,9 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 		}
 		return nil, err
 	}
-	if err = cfg.ChatGPTWeb.Sentinel.Validate(); err != nil {
+	cfg.ChatGPTWeb.UsageCache.Path = strings.TrimSpace(cfg.ChatGPTWeb.UsageCache.Path)
+	cfg.ChatGPTWeb.ImageUsage.AutoOutputQuality = strings.ToLower(strings.TrimSpace(cfg.ChatGPTWeb.ImageUsage.AutoOutputQuality))
+	if err = cfg.ChatGPTWeb.Validate(); err != nil {
 		return nil, err
 	}
 
@@ -2838,7 +2938,7 @@ func appendPath(path []string, key string) []string {
 // This prevents non-zero defaults from polluting the config.
 func isKnownDefaultValue(path []string, node *yaml.Node) bool {
 	fullPath := strings.Join(path, ".")
-	if preservesExplicitChatGPTWebSentinelValue(fullPath, node) {
+	if preservesExplicitChatGPTWebValue(fullPath, node) {
 		return false
 	}
 	if fullPath == "routing.priority-overrides" && node != nil && node.Kind == yaml.SequenceNode && len(node.Content) > 0 {
@@ -2897,14 +2997,25 @@ func isKnownDefaultValue(path []string, node *yaml.Node) bool {
 	return false
 }
 
-func preservesExplicitChatGPTWebSentinelValue(fullPath string, node *yaml.Node) bool {
+func preservesExplicitChatGPTWebValue(fullPath string, node *yaml.Node) bool {
 	if node == nil {
 		return false
 	}
 	switch fullPath {
 	case "chatgpt-web":
-		index := findMapKeyIndex(node, "sentinel")
-		return index >= 0 && index+1 < len(node.Content) && preservesExplicitChatGPTWebSentinelValue("chatgpt-web.sentinel", node.Content[index+1])
+		for _, key := range []string{"estimate-token-usage", "usage-cache", "image-usage", "sentinel"} {
+			if index := findMapKeyIndex(node, key); index >= 0 && index+1 < len(node.Content) &&
+				preservesExplicitChatGPTWebValue("chatgpt-web."+key, node.Content[index+1]) {
+				return true
+			}
+		}
+		return false
+	case "chatgpt-web.estimate-token-usage":
+		return node.Kind == yaml.ScalarNode && node.Tag == "!!bool"
+	case "chatgpt-web.usage-cache.enabled",
+		"chatgpt-web.usage-cache.disk-threshold-mb",
+		"chatgpt-web.usage-cache.max-disk-size-mb":
+		return true
 	case "chatgpt-web.sentinel":
 		return node.Kind == yaml.MappingNode && len(node.Content) > 0
 	case "chatgpt-web.sentinel.sdk-runtime-enabled",

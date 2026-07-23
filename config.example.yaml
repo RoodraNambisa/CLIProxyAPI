@@ -55,6 +55,23 @@ api-keys:
 # password/TOTP material and is disabled by default.
 chatgpt-web:
   auto-relogin: false
+  # ChatGPT Web does not return API token usage. Estimate visible input/output
+  # text and supported image inputs/outputs locally after a successful response.
+  # Disable this to skip the tokenizer work and return zero-valued usage fields.
+  estimate-token-usage: true
+  usage-cache:
+    # Keep compact billing material in memory by default. When enabled, input
+    # below the threshold is tokenized before body release and only numeric
+    # counts remain; input at or above the threshold spills to disk and is
+    # tokenized only after a successful terminal response.
+    enabled: false
+    disk-threshold-mb: 1
+    max-disk-size-mb: 1024
+    # Empty uses an instance-private directory under the system temporary path.
+    path: ""
+  image-usage:
+    # Billing-only fallback for quality=auto; this does not change Web output quality.
+    auto-output-quality: "medium"
   sentinel:
     # Keep the Go VM on the hot path and lazily fetch the versioned SDK from the
     # official OpenAI HTTPS endpoint only when required. Bootstrap SRI is enforced

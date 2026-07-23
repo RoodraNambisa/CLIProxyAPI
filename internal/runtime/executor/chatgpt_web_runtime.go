@@ -20,6 +20,7 @@ import (
 	fhttptrace "github.com/bogdanfinn/fhttp/httptrace"
 	"github.com/google/uuid"
 	chatgptwebauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/chatgptweb"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
@@ -51,6 +52,8 @@ type chatGPTWebPreparedRequest struct {
 	terminalMarker   bool
 	trustUpstreamSSE bool
 	maxImageResults  int
+	usageProjection  *helps.ChatGPTWebUsageProjection
+	bodyRelease      *cliproxyexecutor.RequestBodyReleaseController
 }
 
 type chatGPTWebRequirements struct {
@@ -81,6 +84,7 @@ func (e *ChatGPTWebExecutor) executeRuntime(ctx context.Context, auth *cliproxya
 	if err != nil {
 		return resp, err
 	}
+	defer prepared.discardUsageProjection()
 	reporter := helps.NewExecutorUsageReporter(ctx, e, prepared.routeModel, auth)
 	defer reporter.TrackFailure(ctx, &err)
 	reporter.SetTranslatedReasoningEffort(prepared.canonicalBody, e.Identifier())
@@ -96,11 +100,7 @@ func (e *ChatGPTWebExecutor) executeRuntime(ctx context.Context, auth *cliproxya
 		if errImage != nil {
 			return resp, errImage
 		}
-		if detail, ok := helps.ParseCodexUsage(completed); ok {
-			reporter.Publish(ctx, detail)
-		} else {
-			reporter.EnsurePublished(ctx)
-		}
+		publishChatGPTWebTerminalUsage(ctx, reporter, prepared, completed)
 		var param any
 		out := sdktranslator.TranslateNonStream(ctx, sdktranslator.FormatCodex, prepared.responseFormat, prepared.routeModel,
 			prepared.originalPayload, prepared.canonicalBody, completed, &param)
@@ -111,13 +111,9 @@ func (e *ChatGPTWebExecutor) executeRuntime(ctx context.Context, auth *cliproxya
 	if errText != nil {
 		return resp, errText
 	}
-	result.Usage = estimateChatGPTWebUsage(prepared.routeModel, prepared.request, result.Text)
+	result.Usage = e.completeChatGPTWebUsage(prepared, result.Text, nil)
 	completed := buildChatGPTWebCompletedEvent(prepared.routeModel, result)
-	if detail, ok := helps.ParseCodexUsage(completed); ok {
-		reporter.Publish(ctx, detail)
-	} else {
-		reporter.EnsurePublished(ctx)
-	}
+	publishChatGPTWebTerminalUsage(ctx, reporter, prepared, completed)
 	var param any
 	out := sdktranslator.TranslateNonStream(ctx, sdktranslator.FormatCodex, prepared.responseFormat, prepared.routeModel,
 		prepared.originalPayload, prepared.canonicalBody, completed, &param)
@@ -138,6 +134,7 @@ func (e *ChatGPTWebExecutor) executeRuntimeStream(ctx context.Context, auth *cli
 	}
 	client, credential, err := e.newRuntimeClient(auth)
 	if err != nil {
+		prepared.discardUsageProjection()
 		return nil, err
 	}
 
@@ -145,6 +142,7 @@ func (e *ChatGPTWebExecutor) executeRuntimeStream(ctx context.Context, auth *cli
 		imageStreamPassthrough := metadataBool(opts.Metadata, cliproxyexecutor.ImageGenerationStreamPassthroughMetadataKey)
 		execution, errImage := e.beginChatGPTWebImage(ctx, client, credential, prepared)
 		if errImage != nil {
+			prepared.discardUsageProjection()
 			e.finishChatGPTWebRuntimeClient(ctx, auth, credential, client)
 			return nil, errImage
 		}
@@ -157,6 +155,7 @@ func (e *ChatGPTWebExecutor) executeRuntimeStream(ctx context.Context, auth *cli
 	if chatGPTWebRequestUsesSearch(prepared) {
 		execution, errSearch := e.beginChatGPTWebSearch(ctx, client, credential, prepared)
 		if errSearch != nil {
+			prepared.discardUsageProjection()
 			e.finishChatGPTWebRuntimeClient(ctx, auth, credential, client)
 			return nil, errSearch
 		}
@@ -165,13 +164,14 @@ func (e *ChatGPTWebExecutor) executeRuntimeStream(ctx context.Context, auth *cli
 			if errFinish != nil {
 				return nil, chatGPTWebCommittedRequestError(ctx, errFinish)
 			}
-			result.Usage = estimateChatGPTWebUsage(prepared.routeModel, prepared.request, result.Text)
+			result.Usage = e.completeChatGPTWebUsage(prepared, result.Text, nil)
 			return buildChatGPTWebCompletedEvent(prepared.routeModel, result), nil
 		}), nil
 	}
 
 	response, accumulator, errOpen := e.openChatGPTWebConversation(ctx, client, credential, prepared)
 	if errOpen != nil {
+		prepared.discardUsageProjection()
 		e.finishChatGPTWebRuntimeClient(ctx, auth, credential, client)
 		return nil, errOpen
 	}
@@ -181,6 +181,7 @@ func (e *ChatGPTWebExecutor) executeRuntimeStream(ctx context.Context, auth *cli
 	out := make(chan cliproxyexecutor.StreamChunk, cliproxyexecutor.StreamBufferSize)
 	go func() {
 		defer close(out)
+		defer prepared.discardUsageProjection()
 		defer e.finishChatGPTWebRuntimeClient(ctx, auth, credential, client)
 		defer func() {
 			if errClose := response.Body.Close(); errClose != nil {
@@ -282,18 +283,14 @@ func (e *ChatGPTWebExecutor) executeRuntimeStream(ctx context.Context, auth *cli
 					return
 				}
 				text := accumulator.Text()
-				usage := estimateChatGPTWebUsage(prepared.routeModel, prepared.request, text)
+				usage := e.completeChatGPTWebUsage(prepared, text, nil)
 				terminalEvents := buildChatGPTWebTerminalEvents(responseID, messageID, prepared.routeModel, text, nil, "", false, usage)
 				for _, event := range terminalEvents {
 					if !emit(event) {
 						return
 					}
 				}
-				if detail, ok := helps.ParseCodexUsage(terminalEvents[len(terminalEvents)-1]); ok {
-					reporter.Publish(ctx, detail)
-				} else {
-					reporter.EnsurePublished(ctx)
-				}
+				publishChatGPTWebTerminalUsage(ctx, reporter, prepared, terminalEvents[len(terminalEvents)-1])
 				if metadataBool(opts.Metadata, cliproxyexecutor.StreamTerminalMarkerMetadataKey) {
 					_ = sendChatGPTWebStreamChunk(ctx, out, cliproxyexecutor.SuccessfulStreamTerminalChunk())
 				}
@@ -395,13 +392,31 @@ func (e *ChatGPTWebExecutor) prepareRuntimeRequest(ctx context.Context, auth *cl
 			return nil, err
 		}
 	}
-	var originalPayload []byte
-	if parsed.Image != nil {
-		originalPayload = helps.SlimRequestBodyForTranslation(originalSource)
-		canonicalBody = helps.SlimRequestBodyForTranslation(canonicalBody)
-	} else {
-		originalPayload = bytes.Clone(originalSource)
+	var usageProjection *helps.ChatGPTWebUsageProjection
+	cfg := e.configSnapshot()
+	if cfg == nil || cfg.ChatGPTWeb.TokenUsageEstimationEnabled() {
+		resolvedCache := config.ResolvedChatGPTWebUsageCacheConfig{
+			DiskThresholdMB: config.DefaultChatGPTWebUsageCacheThresholdMB,
+			MaxDiskSizeMB:   config.DefaultChatGPTWebUsageCacheMaxDiskSizeMB,
+		}
+		autoOutputQuality := config.DefaultChatGPTWebAutoOutputQuality
+		if cfg != nil {
+			resolvedCache = cfg.ChatGPTWeb.UsageCache.Resolved()
+			autoOutputQuality = cfg.ChatGPTWeb.ImageUsage.ResolvedAutoOutputQuality()
+		}
+		usageProjection, err = e.usageCache.NewProjection(routeModel, parsed, helps.ChatGPTWebUsageCacheOptions{
+			Enabled:            resolvedCache.Enabled,
+			DiskThresholdBytes: resolvedCache.DiskThresholdMB << 20,
+			MaxDiskBytes:       resolvedCache.MaxDiskSizeMB << 20,
+			Path:               resolvedCache.Path,
+			AutoOutputQuality:  autoOutputQuality,
+		})
+		if err != nil {
+			return nil, chatGPTWebUsageCacheStatusError(err)
+		}
 	}
+	originalPayload := helps.SlimRequestBodyForTranslation(originalSource)
+	canonicalBody = helps.SlimRequestBodyForTranslation(canonicalBody)
 	return &chatGPTWebPreparedRequest{
 		baseModel:       baseModel,
 		routeModel:      routeModel,
@@ -413,7 +428,107 @@ func (e *ChatGPTWebExecutor) prepareRuntimeRequest(ctx context.Context, auth *cl
 		trustUpstreamSSE: metadataBool(opts.Metadata, cliproxyexecutor.TrustUpstreamSSEMetadataKey) &&
 			responseFormat == sdktranslator.FormatOpenAIResponse,
 		maxImageResults: chatGPTWebMaxImageResults(opts.Metadata),
+		usageProjection: usageProjection,
+		bodyRelease:     cliproxyexecutor.RequestBodyReleaseControllerFromOptions(opts),
 	}, nil
+}
+
+func chatGPTWebUsageCacheStatusError(err error) error {
+	code := "chatgpt_web_usage_cache_unavailable"
+	message := "chatgpt web usage cache is unavailable"
+	var cacheErr *helps.ChatGPTWebUsageCacheError
+	if errors.As(err, &cacheErr) && cacheErr != nil {
+		if strings.TrimSpace(cacheErr.Code) != "" {
+			code = strings.TrimSpace(cacheErr.Code)
+		}
+		if strings.TrimSpace(cacheErr.Message) != "" {
+			message = strings.TrimSpace(cacheErr.Message)
+		}
+	}
+	payload, _ := json.Marshal(map[string]any{"error": map[string]any{
+		"message": message,
+		"type":    "server_error",
+		"code":    code,
+	}})
+	return statusErr{code: http.StatusServiceUnavailable, msg: string(payload), skipAuthResult: true}
+}
+
+func (prepared *chatGPTWebPreparedRequest) releaseRequestBody() {
+	if prepared == nil {
+		return
+	}
+	if prepared.usageProjection != nil {
+		for _, estimateErr := range prepared.usageProjection.PrecomputeInput() {
+			log.WithError(estimateErr).Warn("chatgpt web input usage precomputation was incomplete")
+		}
+	}
+	if prepared.bodyRelease != nil {
+		prepared.bodyRelease.ReleaseWithPlaceholder(cliproxyexecutor.RequestBodyReleaseStreamPlaceholder(
+			prepared.bodyRelease.OriginalSize(), prepared.bodyRelease.LogOnly(),
+		))
+	}
+	prepared.request.Messages = nil
+	if prepared.request.Image != nil {
+		prepared.request.Image.Prompt = ""
+		prepared.request.Image.Images = nil
+		prepared.request.Image.MaskURL = ""
+	}
+}
+
+func (prepared *chatGPTWebPreparedRequest) discardUsageProjection() {
+	if prepared == nil || prepared.usageProjection == nil {
+		return
+	}
+	prepared.usageProjection.Discard()
+	prepared.usageProjection = nil
+}
+
+func (e *ChatGPTWebExecutor) completeChatGPTWebUsage(prepared *chatGPTWebPreparedRequest, outputText string, outputImages []helps.ChatGPTWebUsageImage) map[string]any {
+	if prepared == nil || prepared.usageProjection == nil {
+		return nil
+	}
+	usage, estimateErrors := prepared.usageProjection.Estimate(outputText, outputImages)
+	for _, estimateErr := range estimateErrors {
+		log.WithError(estimateErr).Warn("chatgpt web usage estimation was incomplete")
+	}
+	prepared.usageProjection.Complete()
+	prepared.usageProjection = nil
+	return usage
+}
+
+func (e *ChatGPTWebExecutor) completeChatGPTWebUpstreamImageUsage(prepared *chatGPTWebPreparedRequest, toolUsage map[string]any) map[string]any {
+	if len(toolUsage) == 0 {
+		return nil
+	}
+	usage := chatGPTWebUsageOrZero(nil)
+	if prepared != nil && prepared.usageProjection != nil {
+		var estimateErrors []error
+		usage, estimateErrors = prepared.usageProjection.Estimate("", nil)
+		for _, estimateErr := range estimateErrors {
+			log.WithError(estimateErr).Warn("chatgpt web usage estimation was incomplete")
+		}
+		prepared.usageProjection.Complete()
+		prepared.usageProjection = nil
+	}
+	usage["tool_usage"] = map[string]any{"image_gen": toolUsage}
+	return usage
+}
+
+func publishChatGPTWebTerminalUsage(ctx context.Context, reporter *helps.UsageReporter, prepared *chatGPTWebPreparedRequest, completed []byte) {
+	if reporter == nil {
+		return
+	}
+	if detail, ok := helps.ParseCodexUsage(completed); ok {
+		reporter.Publish(ctx, detail)
+	} else {
+		reporter.EnsurePublished(ctx)
+	}
+	if prepared == nil || prepared.request.Image == nil {
+		return
+	}
+	if detail, ok := helps.ParseCodexImageToolUsage(completed); ok {
+		reporter.PublishAdditionalModel(ctx, prepared.request.Image.Model, detail)
+	}
 }
 
 func chatGPTWebRequestHasImageInputs(request helps.ChatGPTWebRequest) bool {
@@ -739,7 +854,7 @@ func (e *ChatGPTWebExecutor) openChatGPTWebConversation(ctx context.Context, cli
 	if err != nil {
 		return nil, nil, err
 	}
-	messages, err := e.buildChatGPTWebConversationMessages(ctx, client, credential, prepared.request.Messages)
+	messages, err := e.buildChatGPTWebConversationMessages(ctx, client, credential, prepared.request.Messages, prepared.usageProjection)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -781,7 +896,9 @@ func (e *ChatGPTWebExecutor) openChatGPTWebConversation(ctx context.Context, cli
 	if err != nil {
 		return nil, nil, err
 	}
-	return response, helps.NewChatGPTWebConversationAccumulator(prepared.request.Messages), nil
+	accumulator := helps.NewChatGPTWebConversationAccumulator(prepared.request.Messages)
+	prepared.releaseRequestBody()
+	return response, accumulator, nil
 }
 
 func (e *ChatGPTWebExecutor) chatGPTWebRequirements(ctx context.Context, client *chatgptwebauth.Client, credential *chatgptwebauth.Credential) (chatGPTWebRequirements, error) {
@@ -1864,6 +1981,7 @@ func (e *ChatGPTWebExecutor) streamDeferredChatGPTWebResponse(
 	reporter := helps.NewExecutorUsageReporter(ctx, e, prepared.routeModel, auth)
 	go func() {
 		defer close(out)
+		defer prepared.discardUsageProjection()
 		if !sendChatGPTWebStreamChunk(ctx, out, cliproxyexecutor.BootstrapCommitStreamChunk()) {
 			e.finishChatGPTWebRuntimeClient(ctx, auth, credential, client)
 			return
@@ -1964,11 +2082,7 @@ func (e *ChatGPTWebExecutor) streamDeferredChatGPTWebResponse(
 			}
 			return
 		}
-		if detail, ok := helps.ParseCodexUsage(completed); ok {
-			reporter.Publish(ctx, detail)
-		} else {
-			reporter.EnsurePublished(ctx)
-		}
+		publishChatGPTWebTerminalUsage(ctx, reporter, prepared, completed)
 		if prepared.terminalMarker {
 			_ = sendChatGPTWebStreamChunk(ctx, out, cliproxyexecutor.SuccessfulStreamTerminalChunk())
 		}
@@ -2165,58 +2279,25 @@ func buildChatGPTWebTerminalEvents(responseID, messageID, model, text string, so
 	return events
 }
 
-func estimateChatGPTWebUsage(model string, request helps.ChatGPTWebRequest, outputText string) map[string]any {
-	var inputTokens, outputTokens int64
-	if encoder, err := helps.TokenizerForModel(model); err == nil {
-		if count, errCount := encoder.Count(chatGPTWebUsageInput(request)); errCount == nil {
-			inputTokens = int64(count)
-		}
-		if count, errCount := encoder.Count(outputText); errCount == nil {
-			outputTokens = int64(count)
-		}
-	}
-	return map[string]any{
-		"input_tokens":  inputTokens,
-		"output_tokens": outputTokens,
-		"total_tokens":  inputTokens + outputTokens,
-		"input_tokens_details": map[string]any{
-			"cached_tokens": 0,
-		},
-		"output_tokens_details": map[string]any{
-			"reasoning_tokens": 0,
-		},
-	}
-}
-
-func chatGPTWebUsageInput(request helps.ChatGPTWebRequest) string {
-	segments := make([]string, 0, len(request.Messages)*2+2)
-	for _, message := range request.Messages {
-		if role := strings.TrimSpace(message.Role); role != "" {
-			segments = append(segments, role)
-		}
-		for _, part := range message.Parts {
-			if text := strings.TrimSpace(part.Text); text != "" {
-				segments = append(segments, text)
-			}
-			if strings.TrimSpace(part.ImageURL) != "" {
-				segments = append(segments, "[image]")
-			}
-		}
-	}
-	if effort := strings.TrimSpace(request.ReasoningEffort); effort != "" {
-		segments = append(segments, effort)
-	}
-	if request.WebSearch {
-		segments = append(segments, "web_search")
-	}
-	return strings.Join(segments, "\n")
-}
-
 func chatGPTWebUsageOrZero(usage map[string]any) map[string]any {
 	if usage != nil {
 		return usage
 	}
-	return estimateChatGPTWebUsage("", helps.ChatGPTWebRequest{}, "")
+	return map[string]any{
+		"input_tokens":  0,
+		"output_tokens": 0,
+		"total_tokens":  0,
+		"input_tokens_details": map[string]any{
+			"cached_tokens": 0,
+			"text_tokens":   0,
+			"image_tokens":  0,
+		},
+		"output_tokens_details": map[string]any{
+			"reasoning_tokens": 0,
+			"text_tokens":      0,
+			"image_tokens":     0,
+		},
+	}
 }
 
 func chatGPTWebSearchAction(query string, sources []chatGPTWebSearchSource) map[string]any {

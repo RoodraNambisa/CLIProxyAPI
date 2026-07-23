@@ -167,7 +167,11 @@ func chatGPTWebSharedPollResponseBudget(budgets []*chatGPTWebPollResponseBudget)
 	return newChatGPTWebPollResponseBudget(chatGPTWebPollResponseMaxBytes)
 }
 
-func (e *ChatGPTWebExecutor) buildChatGPTWebConversationMessages(ctx context.Context, client *chatgptwebauth.Client, credential *chatgptwebauth.Credential, messages []helps.ChatGPTWebMessage) ([]map[string]any, error) {
+func (e *ChatGPTWebExecutor) buildChatGPTWebConversationMessages(ctx context.Context, client *chatgptwebauth.Client, credential *chatgptwebauth.Credential, messages []helps.ChatGPTWebMessage, projections ...*helps.ChatGPTWebUsageProjection) ([]map[string]any, error) {
+	var projection *helps.ChatGPTWebUsageProjection
+	if len(projections) > 0 {
+		projection = projections[0]
+	}
 	output := make([]map[string]any, 0, len(messages))
 	for index := range messages {
 		message := &messages[index]
@@ -188,6 +192,10 @@ func (e *ChatGPTWebExecutor) buildChatGPTWebConversationMessages(ctx context.Con
 				return nil, err
 			}
 			uploads = append(uploads, uploaded)
+			projection.AddImage(helps.ChatGPTWebUsageImage{
+				Model: messageUsageModel(projection), Detail: part.ImageDetail, Use: "input",
+				Width: uploaded.Width, Height: uploaded.Height,
+			})
 			parts = append(parts, map[string]any{
 				"content_type":  "image_asset_pointer",
 				"asset_pointer": "file-service://" + uploaded.FileID,
@@ -216,6 +224,13 @@ func (e *ChatGPTWebExecutor) buildChatGPTWebConversationMessages(ctx context.Con
 		output = append(output, item)
 	}
 	return output, nil
+}
+
+func messageUsageModel(projection *helps.ChatGPTWebUsageProjection) string {
+	if projection == nil {
+		return ""
+	}
+	return projection.Model()
 }
 
 func chatGPTWebTextParts(parts []any) string {
@@ -272,6 +287,10 @@ func (e *ChatGPTWebExecutor) beginChatGPTWebImage(ctx context.Context, client *c
 			return nil, err
 		}
 		uploads = append(uploads, uploaded)
+		prepared.usageProjection.AddImage(helps.ChatGPTWebUsageImage{
+			Model: imageRequest.Model, Detail: "high", Use: "image_generation_input",
+			Width: uploaded.Width, Height: uploaded.Height,
+		})
 		inputIDs[uploaded.FileID] = struct{}{}
 	}
 
@@ -287,6 +306,7 @@ func (e *ChatGPTWebExecutor) beginChatGPTWebImage(ctx context.Context, client *c
 	if err != nil {
 		return nil, err
 	}
+	prepared.releaseRequestBody()
 	return &chatGPTWebImageExecution{
 		response: response,
 		headers:  cloneChatGPTWebHeaders(response.Header),
@@ -361,12 +381,55 @@ func (e *ChatGPTWebExecutor) finishChatGPTWebImage(ctx context.Context, client *
 	if len(images) == 0 {
 		return nil, statusErr{code: http.StatusBadGateway, msg: "chatgpt web did not return image output"}
 	}
-	usage := estimateChatGPTWebUsage(prepared.routeModel, prepared.request, "")
-	completed, err := buildChatGPTWebImageCompletedEvent(prepared.routeModel, imageRequest.OutputFormat, images, usage)
+	outputImages, err := prepareChatGPTWebImageOutputs(imageRequest.OutputFormat, imageRequest.Model, imageRequest.Quality, images)
+	if err != nil {
+		return nil, err
+	}
+	usage := e.completeChatGPTWebUpstreamImageUsage(prepared, accumulator.ToolUsage)
+	if usage == nil {
+		usage = e.completeChatGPTWebUsage(prepared, "", outputImages)
+	}
+	completed, err := buildPreparedChatGPTWebImageCompletedEvent(prepared.routeModel, imageRequest.OutputFormat, images, usage)
 	if err != nil {
 		return nil, err
 	}
 	return completed, nil
+}
+
+func prepareChatGPTWebImageOutputs(requestedFormat, model, quality string, images [][]byte) ([]helps.ChatGPTWebUsageImage, error) {
+	requestedFormat = normalizeChatGPTWebImageOutputFormat(requestedFormat)
+	totalBytes := 0
+	outputs := make([]helps.ChatGPTWebUsageImage, 0, len(images))
+	for index, imageData := range images {
+		outputFormat := chatGPTWebImageOutputFormat(imageData)
+		if outputFormat == "" {
+			return nil, statusErr{code: http.StatusBadGateway, msg: "chatgpt web returned an unrecognized image format", skipAuthResult: true, retryOtherAuth: true}
+		}
+		if requestedFormat == "png" && outputFormat != requestedFormat {
+			converted, errConvert := convertChatGPTWebImageToPNG(imageData, outputFormat)
+			if errConvert != nil {
+				return nil, fmt.Errorf("convert chatgpt web %s image to png: %w", outputFormat, errConvert)
+			}
+			imageData = converted
+			images[index] = converted
+			outputFormat = "png"
+		}
+		if requestedFormat != "" && requestedFormat != outputFormat {
+			return nil, statusErr{code: http.StatusBadGateway, msg: fmt.Sprintf("chatgpt web returned %s image data instead of requested %s", outputFormat, requestedFormat), skipAuthResult: true, retryOtherAuth: true}
+		}
+		if len(imageData) > chatGPTWebMaxImageResponseBytes-totalBytes {
+			return nil, statusErr{code: http.StatusBadGateway, msg: fmt.Sprintf("chatgpt web image response exceeds %d bytes", chatGPTWebMaxImageResponseBytes), skipAuthResult: true}
+		}
+		totalBytes += len(imageData)
+		imageConfig, _, errConfig := image.DecodeConfig(bytes.NewReader(imageData))
+		if errConfig != nil {
+			return nil, statusErr{code: http.StatusBadGateway, msg: "chatgpt web returned an invalid image", skipAuthResult: true, retryOtherAuth: true}
+		}
+		outputs = append(outputs, helps.ChatGPTWebUsageImage{
+			Model: model, Use: "image_generation_output", Width: imageConfig.Width, Height: imageConfig.Height, Quality: quality,
+		})
+	}
+	return outputs, nil
 }
 
 func chatGPTWebImageFailureError(status string) error {
@@ -379,42 +442,16 @@ func chatGPTWebImageFailureError(status string) error {
 }
 
 func buildChatGPTWebImageCompletedEvent(routeModel, requestedFormat string, images [][]byte, usage map[string]any) ([]byte, error) {
+	if _, err := prepareChatGPTWebImageOutputs(requestedFormat, routeModel, "", images); err != nil {
+		return nil, err
+	}
+	return buildPreparedChatGPTWebImageCompletedEvent(routeModel, requestedFormat, images, usage)
+}
+
+func buildPreparedChatGPTWebImageCompletedEvent(routeModel, requestedFormat string, images [][]byte, usage map[string]any) ([]byte, error) {
 	requestedFormat = normalizeChatGPTWebImageOutputFormat(requestedFormat)
 	totalBytes := 0
-	for index, imageData := range images {
-		outputFormat := chatGPTWebImageOutputFormat(imageData)
-		if outputFormat == "" {
-			return nil, statusErr{
-				code:           http.StatusBadGateway,
-				msg:            "chatgpt web returned an unrecognized image format",
-				skipAuthResult: true,
-				retryOtherAuth: true,
-			}
-		}
-		if requestedFormat == "png" && outputFormat != requestedFormat {
-			converted, err := convertChatGPTWebImageToPNG(imageData, outputFormat)
-			if err != nil {
-				return nil, fmt.Errorf("convert chatgpt web %s image to png: %w", outputFormat, err)
-			}
-			imageData = converted
-			images[index] = converted
-			outputFormat = "png"
-		}
-		if requestedFormat != "" && requestedFormat != outputFormat {
-			return nil, statusErr{
-				code:           http.StatusBadGateway,
-				msg:            fmt.Sprintf("chatgpt web returned %s image data instead of requested %s", outputFormat, requestedFormat),
-				skipAuthResult: true,
-				retryOtherAuth: true,
-			}
-		}
-		if len(imageData) > chatGPTWebMaxImageResponseBytes-totalBytes {
-			return nil, statusErr{
-				code:           http.StatusBadGateway,
-				msg:            fmt.Sprintf("chatgpt web image response exceeds %d bytes", chatGPTWebMaxImageResponseBytes),
-				skipAuthResult: true,
-			}
-		}
+	for _, imageData := range images {
 		totalBytes += len(imageData)
 	}
 	var output bytes.Buffer
@@ -447,14 +484,36 @@ func buildChatGPTWebImageCompletedEvent(routeModel, requestedFormat string, imag
 		writeChatGPTWebJSONString(&output, outputFormat)
 		output.WriteByte('}')
 	}
-	usageJSON, err := json.Marshal(chatGPTWebUsageOrZero(usage))
+	responseUsage := chatGPTWebUsageOrZero(usage)
+	toolUsage := responseUsage["tool_usage"]
+	if toolUsage != nil {
+		responseUsage = cloneChatGPTWebUsage(responseUsage)
+		delete(responseUsage, "tool_usage")
+	}
+	usageJSON, err := json.Marshal(responseUsage)
 	if err != nil {
 		return nil, fmt.Errorf("encode chatgpt web image usage: %w", err)
 	}
 	output.WriteString(`],"usage":`)
 	_, _ = output.Write(usageJSON)
+	if toolUsage != nil {
+		toolUsageJSON, errToolUsage := json.Marshal(toolUsage)
+		if errToolUsage != nil {
+			return nil, fmt.Errorf("encode chatgpt web image tool usage: %w", errToolUsage)
+		}
+		output.WriteString(`,"tool_usage":`)
+		_, _ = output.Write(toolUsageJSON)
+	}
 	output.WriteString(`}}`)
 	return output.Bytes(), nil
+}
+
+func cloneChatGPTWebUsage(usage map[string]any) map[string]any {
+	cloned := make(map[string]any, len(usage))
+	for key, value := range usage {
+		cloned[key] = value
+	}
+	return cloned
 }
 
 func convertChatGPTWebImageToPNG(data []byte, outputFormat string) ([]byte, error) {

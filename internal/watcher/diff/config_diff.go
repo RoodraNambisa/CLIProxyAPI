@@ -253,6 +253,26 @@ func BuildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 	if oldCfg.Codex.IdentityConfuse != newCfg.Codex.IdentityConfuse {
 		changes = append(changes, fmt.Sprintf("codex.identity-confuse: %t -> %t", oldCfg.Codex.IdentityConfuse, newCfg.Codex.IdentityConfuse))
 	}
+	if oldCfg.ChatGPTWeb.TokenUsageEstimationEnabled() != newCfg.ChatGPTWeb.TokenUsageEstimationEnabled() {
+		changes = append(changes, fmt.Sprintf("chatgpt-web.estimate-token-usage: %t -> %t", oldCfg.ChatGPTWeb.TokenUsageEstimationEnabled(), newCfg.ChatGPTWeb.TokenUsageEstimationEnabled()))
+	}
+	oldUsageCache := oldCfg.ChatGPTWeb.UsageCache.Resolved()
+	newUsageCache := newCfg.ChatGPTWeb.UsageCache.Resolved()
+	if oldUsageCache.Enabled != newUsageCache.Enabled {
+		changes = append(changes, fmt.Sprintf("chatgpt-web.usage-cache.enabled: %t -> %t", oldUsageCache.Enabled, newUsageCache.Enabled))
+	}
+	if oldUsageCache.DiskThresholdMB != newUsageCache.DiskThresholdMB {
+		changes = append(changes, fmt.Sprintf("chatgpt-web.usage-cache.disk-threshold-mb: %d -> %d", oldUsageCache.DiskThresholdMB, newUsageCache.DiskThresholdMB))
+	}
+	if oldUsageCache.MaxDiskSizeMB != newUsageCache.MaxDiskSizeMB {
+		changes = append(changes, fmt.Sprintf("chatgpt-web.usage-cache.max-disk-size-mb: %d -> %d", oldUsageCache.MaxDiskSizeMB, newUsageCache.MaxDiskSizeMB))
+	}
+	if oldUsageCache.Path != newUsageCache.Path {
+		changes = append(changes, fmt.Sprintf("chatgpt-web.usage-cache.path: %q -> %q", oldUsageCache.Path, newUsageCache.Path))
+	}
+	if oldCfg.ChatGPTWeb.ImageUsage.ResolvedAutoOutputQuality() != newCfg.ChatGPTWeb.ImageUsage.ResolvedAutoOutputQuality() {
+		changes = append(changes, fmt.Sprintf("chatgpt-web.image-usage.auto-output-quality: %s -> %s", oldCfg.ChatGPTWeb.ImageUsage.ResolvedAutoOutputQuality(), newCfg.ChatGPTWeb.ImageUsage.ResolvedAutoOutputQuality()))
+	}
 
 	// Codex keys (do not print key material)
 	if len(oldCfg.CodexKey) != len(newCfg.CodexKey) {

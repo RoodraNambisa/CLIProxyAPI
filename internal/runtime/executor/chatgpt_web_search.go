@@ -74,7 +74,7 @@ func (e *ChatGPTWebExecutor) beginChatGPTWebSearch(ctx context.Context, client *
 	if query == "" {
 		return nil, statusErr{code: http.StatusBadRequest, msg: "web search requires a user query", skipAuthResult: true}
 	}
-	messages, err := e.buildChatGPTWebConversationMessages(ctx, client, credential, prepared.request.Messages)
+	messages, err := e.buildChatGPTWebConversationMessages(ctx, client, credential, prepared.request.Messages, prepared.usageProjection)
 	if err != nil {
 		return nil, err
 	}
@@ -91,6 +91,7 @@ func (e *ChatGPTWebExecutor) beginChatGPTWebSearch(ctx context.Context, client *
 	if err != nil {
 		return nil, err
 	}
+	prepared.releaseRequestBody()
 	return &chatGPTWebSearchExecution{
 		response:      response,
 		headers:       headers,

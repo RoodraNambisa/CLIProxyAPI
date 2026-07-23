@@ -762,6 +762,9 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.GET("/chatgpt-web/sentinel", s.mgmt.GetChatGPTWebSentinel)
 		mgmt.PUT("/chatgpt-web/sentinel", s.mgmt.PutChatGPTWebSentinel)
 		mgmt.PATCH("/chatgpt-web/sentinel", s.mgmt.PatchChatGPTWebSentinel)
+		mgmt.GET("/chatgpt-web/usage-cache", s.mgmt.GetChatGPTWebUsageCache)
+		mgmt.PUT("/chatgpt-web/usage-cache", s.mgmt.PutChatGPTWebUsageCache)
+		mgmt.PATCH("/chatgpt-web/usage-cache", s.mgmt.PatchChatGPTWebUsageCache)
 
 		mgmt.GET("/anthropic-auth-url", s.mgmt.RequestAnthropicToken)
 		mgmt.GET("/gemini-cli-auth-url", s.mgmt.RequestGeminiCLIToken)

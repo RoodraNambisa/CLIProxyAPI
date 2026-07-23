@@ -512,21 +512,24 @@ func requestExecutionMetadata(ctx context.Context) map[string]any {
 	return meta
 }
 
-func (h *BaseAPIHandler) attachRequestBodyRelease(ctx context.Context, rawJSON []byte, meta map[string]any) (context.Context, *coreexecutor.RequestBodyReleaseController) {
-	if h == nil || h.Cfg == nil || len(rawJSON) == 0 {
+func (h *BaseAPIHandler) attachRequestBodyRelease(ctx context.Context, rawJSON []byte, meta map[string]any, force bool) (context.Context, *coreexecutor.RequestBodyReleaseController) {
+	if h == nil || len(rawJSON) == 0 {
 		return ctx, nil
 	}
-	cfg := config.NormalizeRequestBodyRelease(h.Cfg.RequestBodyRelease)
-	if !cfg.Enable || cfg.LogOnly {
+	cfg := config.RequestBodyReleaseConfig{}
+	if h.Cfg != nil {
+		cfg = config.NormalizeRequestBodyRelease(h.Cfg.RequestBodyRelease)
+	}
+	if !force && (!cfg.Enable || cfg.LogOnly) {
 		return ctx, nil
 	}
 	size := int64(len(rawJSON))
-	if cfg.MinBodyBytes > 0 && size < cfg.MinBodyBytes {
+	if !force && cfg.MinBodyBytes > 0 && size < cfg.MinBodyBytes {
 		return ctx, nil
 	}
 	placeholder := coreexecutor.RequestBodyReleaseTimerPlaceholder(size, cfg.AfterSeconds, false)
 	ctrl := requestBodyReleaseControllerFromContext(ctx)
-	if ctrl == nil {
+	if ctrl == nil || force && ctrl.LogOnly() {
 		ctrl = coreexecutor.NewRequestBodyReleaseController(size, placeholder)
 	}
 	if meta != nil {
@@ -536,10 +539,21 @@ func (h *BaseAPIHandler) attachRequestBodyRelease(ctx context.Context, rawJSON [
 		ginCtx.Set(coreexecutor.BodyReleaseControllerMetadataKey, ctrl)
 	}
 	ctx = coreexecutor.WithRequestBodyReleaseController(ctx, ctrl)
-	if cfg.AfterSeconds > 0 {
+	// ChatGPT Web releases the body itself after its upstream session is
+	// committed and its compact billing projection is safe.
+	if cfg.AfterSeconds > 0 && !force {
 		ctrl.StartTimer(time.Duration(cfg.AfterSeconds)*time.Second, ctx.Done())
 	}
 	return ctx, ctrl
+}
+
+func providersContainChatGPTWeb(providers []string) bool {
+	for _, provider := range providers {
+		if strings.EqualFold(strings.TrimSpace(provider), "chatgpt-web") {
+			return true
+		}
+	}
+	return false
 }
 
 func requestBodyReleaseControllerFromContext(ctx context.Context) *coreexecutor.RequestBodyReleaseController {
@@ -830,7 +844,7 @@ func (h *BaseAPIHandler) ExecuteWithAuthManager(ctx context.Context, handlerType
 	}
 	reqMeta := requestExecutionMetadata(ctx)
 	reqMeta[coreexecutor.RequestedModelMetadataKey] = normalizedModel
-	ctx, _ = h.attachRequestBodyRelease(ctx, rawJSON, reqMeta)
+	ctx, _ = h.attachRequestBodyRelease(ctx, rawJSON, reqMeta, providersContainChatGPTWeb(providers))
 	payload := rawJSON
 	if len(payload) == 0 {
 		payload = nil
@@ -885,7 +899,7 @@ func (h *BaseAPIHandler) ExecuteWithProvidersAndExecutionModel(ctx context.Conte
 	if imageStreamPassthrough {
 		reqMeta[coreexecutor.ImageGenerationStreamPassthroughMetadataKey] = true
 	}
-	ctx, _ = h.attachRequestBodyRelease(ctx, rawJSON, reqMeta)
+	ctx, _ = h.attachRequestBodyRelease(ctx, rawJSON, reqMeta, providersContainChatGPTWeb(providers))
 	payload := rawJSON
 	if len(payload) == 0 {
 		payload = nil
@@ -950,7 +964,7 @@ func (h *BaseAPIHandler) ExecuteCountWithAuthManager(ctx context.Context, handle
 	}
 	reqMeta := requestExecutionMetadata(ctx)
 	reqMeta[coreexecutor.RequestedModelMetadataKey] = normalizedModel
-	ctx, _ = h.attachRequestBodyRelease(ctx, rawJSON, reqMeta)
+	ctx, _ = h.attachRequestBodyRelease(ctx, rawJSON, reqMeta, providersContainChatGPTWeb(providers))
 	payload := rawJSON
 	if len(payload) == 0 {
 		payload = nil
@@ -1023,7 +1037,7 @@ func (h *BaseAPIHandler) executeStreamWithResolvedProviders(ctx context.Context,
 	if trustResponsesSSE {
 		reqMeta[coreexecutor.TrustUpstreamSSEMetadataKey] = true
 	}
-	ctx, _ = h.attachRequestBodyRelease(ctx, rawJSON, reqMeta)
+	ctx, _ = h.attachRequestBodyRelease(ctx, rawJSON, reqMeta, providersContainChatGPTWeb(providers))
 	payload := rawJSON
 	if len(payload) == 0 {
 		payload = nil

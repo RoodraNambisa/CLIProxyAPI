@@ -93,6 +93,43 @@ func TestBuildConfigChangeDetails_NoChanges(t *testing.T) {
 	}
 }
 
+func TestBuildConfigChangeDetails_ChatGPTWebTokenUsageEstimation(t *testing.T) {
+	disabled := false
+	enabled := true
+	oldThreshold := int64(1)
+	newThreshold := int64(2)
+	oldMaximum := int64(16)
+	newMaximum := int64(32)
+	details := BuildConfigChangeDetails(&config.Config{}, &config.Config{
+		ChatGPTWeb: config.ChatGPTWebConfig{
+			EstimateTokenUsage: &disabled,
+			UsageCache: config.ChatGPTWebUsageCacheConfig{
+				Enabled: &enabled, DiskThresholdMB: &newThreshold, MaxDiskSizeMB: &newMaximum, Path: "/tmp/usage",
+			},
+			ImageUsage: config.ChatGPTWebImageUsageConfig{AutoOutputQuality: "high"},
+		},
+	})
+	expectContains(t, details, "chatgpt-web.estimate-token-usage: true -> false")
+	oldCfg := &config.Config{ChatGPTWeb: config.ChatGPTWebConfig{UsageCache: config.ChatGPTWebUsageCacheConfig{
+		DiskThresholdMB: &oldThreshold, MaxDiskSizeMB: &oldMaximum,
+	}}}
+	details = BuildConfigChangeDetails(oldCfg, &config.Config{ChatGPTWeb: config.ChatGPTWebConfig{
+		UsageCache: config.ChatGPTWebUsageCacheConfig{
+			Enabled: &enabled, DiskThresholdMB: &newThreshold, MaxDiskSizeMB: &newMaximum, Path: "/tmp/usage",
+		},
+		ImageUsage: config.ChatGPTWebImageUsageConfig{AutoOutputQuality: "high"},
+	}})
+	for _, expected := range []string{
+		"chatgpt-web.usage-cache.enabled: false -> true",
+		"chatgpt-web.usage-cache.disk-threshold-mb: 1 -> 2",
+		"chatgpt-web.usage-cache.max-disk-size-mb: 16 -> 32",
+		`chatgpt-web.usage-cache.path: "" -> "/tmp/usage"`,
+		"chatgpt-web.image-usage.auto-output-quality: medium -> high",
+	} {
+		expectContains(t, details, expected)
+	}
+}
+
 func TestBuildConfigChangeDetails_RoutingPriorityOverrides(t *testing.T) {
 	limit := 2
 	oldCfg := &config.Config{}

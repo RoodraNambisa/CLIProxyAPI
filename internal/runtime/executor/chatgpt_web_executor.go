@@ -89,6 +89,7 @@ type ChatGPTWebExecutor struct {
 	loginCoordinator          *ChatGPTWebLoginCoordinator
 	loginWG                   sync.WaitGroup
 	sentinelRuntime           helps.ChatGPTWebSentinelRuntime
+	usageCache                *helps.ChatGPTWebUsageCache
 	sentinelSDKFetcherFactory func(*chatgptwebauth.Client, *chatgptwebauth.Credential) chatgptwebauth.SentinelSDKFetcher
 	backgroundMu              sync.Mutex
 	backgroundWG              sync.WaitGroup
@@ -129,6 +130,7 @@ func NewChatGPTWebExecutorWithLoginCoordinator(cfg *config.Config, manager *clip
 		reloginFlights:     make(map[string]*chatGPTWebReloginFlight),
 		loginCoordinator:   coordinator,
 		sentinelRuntime:    helps.NewChatGPTWebSentinelRuntime(chatGPTWebSentinelRuntimeConfig(cfg)),
+		usageCache:         helps.NewChatGPTWebUsageCache(),
 		backgroundRunning:  make(map[string]struct{}),
 		lifecycleCtx:       lifecycleCtx,
 		lifecycleCancel:    lifecycleCancel,
@@ -157,6 +159,9 @@ func (e *ChatGPTWebExecutor) Close() error {
 	e.loginWG.Wait()
 	if e.sentinelRuntime != nil {
 		e.sentinelRuntime.Close()
+	}
+	if e.usageCache != nil {
+		e.usageCache.Close()
 	}
 	return nil
 }
@@ -207,6 +212,14 @@ func (e *ChatGPTWebExecutor) SentinelSnapshot() chatgptwebauth.SentinelRuntimeSn
 		return chatgptwebauth.SentinelRuntimeSnapshot{}
 	}
 	return e.sentinelRuntime.Snapshot()
+}
+
+// UsageCacheSnapshot returns active storage and cumulative accounting outcomes.
+func (e *ChatGPTWebExecutor) UsageCacheSnapshot() helps.ChatGPTWebUsageCacheSnapshot {
+	if e == nil || e.usageCache == nil {
+		return helps.ChatGPTWebUsageCacheSnapshot{}
+	}
+	return e.usageCache.Snapshot()
 }
 
 func (e *ChatGPTWebExecutor) configSnapshot() *config.Config {
