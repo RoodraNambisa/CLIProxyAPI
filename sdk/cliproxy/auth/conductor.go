@@ -7792,7 +7792,10 @@ func (m *Manager) snapshotCurrentAuthForPersistence(ctx context.Context, current
 	if id == "" {
 		return nil, nil
 	}
-	unlockPersist := m.lockPersistKey(id)
+	unlockPersist, errLock := m.lockAuthIDMutationContext(ctx, id)
+	if errLock != nil {
+		return nil, errLock
+	}
 	defer unlockPersist()
 
 	m.mu.RLock()
@@ -7804,7 +7807,11 @@ func (m *Manager) snapshotCurrentAuthForPersistence(ctx context.Context, current
 	snapshot := latest.Clone()
 	m.mu.RUnlock()
 
-	if err := m.persistWithoutLock(ctx, snapshot, true); err != nil {
+	persistCtx := ctx
+	if expectedSourceHash := authSourceHash(snapshot); expectedSourceHash != "" && m.SupportsSourceConditionalSave() {
+		persistCtx = WithSourceHashSavePrecondition(persistCtx, expectedSourceHash)
+	}
+	if err := m.persistWithoutLock(persistCtx, snapshot, true); err != nil {
 		return nil, err
 	}
 	return snapshot, nil
