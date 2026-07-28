@@ -46,12 +46,12 @@ type chatGPTWebModelFetcher interface {
 	FetchModels(context.Context, *coreauth.Auth) ([]chatgptwebauth.CatalogModel, error)
 }
 
-func chatGPTWebBuiltinModels() []*registry.ModelInfo {
+func chatGPTWebBuiltinModels(imageModel string) []*registry.ModelInfo {
 	models := make([]*registry.ModelInfo, 0, len(chatGPTWebFallbackModelIDs)+1)
 	for _, modelID := range chatGPTWebFallbackModelIDs {
 		models = append(models, chatGPTWebTextModelInfo(modelID, modelID, 0, "openai"))
 	}
-	return upsertModelInfo(models, chatGPTWebImageModelInfo())
+	return chatGPTWebModelsWithImageModel(models, imageModel)
 }
 
 func chatGPTWebTextModelInfo(modelID, displayName string, created int64, ownedBy string) *registry.ModelInfo {
@@ -69,42 +69,48 @@ func chatGPTWebTextModelInfo(modelID, displayName string, created int64, ownedBy
 		created = 1704067200
 	}
 	return &registry.ModelInfo{
-		ID:                  modelID,
-		UpstreamID:          modelID,
-		Object:              "model",
-		Created:             created,
-		OwnedBy:             ownedBy,
-		Type:                "openai",
-		DisplayName:         displayName,
-		Version:             modelID,
-		SupportedParameters: []string{"tools"},
-		Thinking:            &registry.ThinkingSupport{Levels: []string{"low", "medium", "high", "xhigh"}},
+		ID:          modelID,
+		UpstreamID:  modelID,
+		Object:      "model",
+		Created:     created,
+		OwnedBy:     ownedBy,
+		Type:        "openai",
+		DisplayName: displayName,
+		Version:     modelID,
 	}
 }
 
-func chatGPTWebImageModelInfo() *registry.ModelInfo {
+func chatGPTWebImageModelInfo(modelID string) *registry.ModelInfo {
+	modelID = strings.TrimSpace(modelID)
+	if modelID == "" {
+		modelID = chatgptwebauth.ImageModel
+	}
+	displayName := modelID
+	if strings.EqualFold(modelID, chatgptwebauth.ImageModel) {
+		displayName = "GPT Image 2"
+	}
 	return &registry.ModelInfo{
-		ID:                        "gpt-image-2",
-		UpstreamID:                "gpt-image-2",
+		ID:                        modelID,
+		UpstreamID:                chatgptwebauth.ImageModel,
 		Object:                    "model",
 		Created:                   1704067200,
 		OwnedBy:                   "openai",
 		Type:                      registry.OpenAIImageModelType,
-		DisplayName:               "GPT Image 2",
-		Version:                   "gpt-image-2",
-		SupportedParameters:       []string{"tools"},
+		DisplayName:               displayName,
+		Version:                   modelID,
 		SupportedInputModalities:  []string{"TEXT", "IMAGE"},
 		SupportedOutputModalities: []string{"IMAGE"},
 	}
 }
 
-func chatGPTWebCatalogModelInfos(models []chatgptwebauth.CatalogModel) []*registry.ModelInfo {
+func chatGPTWebCatalogModelInfos(models []chatgptwebauth.CatalogModel, imageModel string) []*registry.ModelInfo {
 	output := make([]*registry.ModelInfo, 0, len(models)+1)
 	seen := make(map[string]struct{}, len(models))
+	imageModelKey := strings.ToLower(strings.TrimSpace(imageModel))
 	for _, model := range models {
 		modelID := strings.TrimSpace(model.Slug)
 		key := strings.ToLower(modelID)
-		if key == "" || key == "gpt-image-2" {
+		if key == "" || key == strings.ToLower(chatgptwebauth.ImageModel) || key == imageModelKey {
 			continue
 		}
 		if _, exists := seen[key]; exists {
@@ -115,7 +121,18 @@ func chatGPTWebCatalogModelInfos(models []chatgptwebauth.CatalogModel) []*regist
 			output = append(output, info)
 		}
 	}
-	return upsertModelInfo(output, chatGPTWebImageModelInfo())
+	return chatGPTWebModelsWithImageModel(output, imageModel)
+}
+
+func chatGPTWebModelsWithImageModel(models []*registry.ModelInfo, imageModel string) []*registry.ModelInfo {
+	filtered := make([]*registry.ModelInfo, 0, len(models)+1)
+	for _, model := range models {
+		if model == nil || model.Type == registry.OpenAIImageModelType {
+			continue
+		}
+		filtered = append(filtered, model)
+	}
+	return upsertModelInfo(filtered, chatGPTWebImageModelInfo(imageModel))
 }
 
 func (s *Service) chatGPTWebModelsForAuth(auth *coreauth.Auth) []*registry.ModelInfo {
@@ -135,12 +152,15 @@ func (s *Service) chatGPTWebModelsForAuth(auth *coreauth.Auth) []*registry.Model
 					Models:              cloneChatGPTWebModelInfos(entry.Models),
 				})
 			}
-			return cloneChatGPTWebModelInfos(entry.Models)
+			return chatGPTWebModelsWithImageModel(
+				cloneChatGPTWebModelInfos(entry.Models),
+				configuredImagesImageModel(s.currentConfig()),
+			)
 		} else if okEntry && entry != nil {
 			s.chatGPTWebModelCatalog.CompareAndDelete(auth.ID, entry)
 		}
 	}
-	return chatGPTWebBuiltinModels()
+	return chatGPTWebBuiltinModels(configuredImagesImageModel(s.currentConfig()))
 }
 
 func chatGPTWebCatalogCredentialIdentity(auth *coreauth.Auth) string {
@@ -256,7 +276,7 @@ func (s *Service) fetchChatGPTWebModelCatalog(ctx context.Context, auth *coreaut
 		log.Warnf("chatgpt web model catalog refresh failed for %s: %v", auth.ID, err)
 		return nil, false
 	}
-	return chatGPTWebCatalogModelInfos(models), true
+	return chatGPTWebCatalogModelInfos(models, configuredImagesImageModel(s.currentConfig())), true
 }
 
 func (s *Service) currentAuthForChatGPTWebCatalog(source *coreauth.Auth) (*coreauth.Auth, bool) {

@@ -324,6 +324,46 @@ func TestAuthMaintenanceIgnoresChatGPTWebImage429(t *testing.T) {
 	}
 }
 
+func TestAuthMaintenanceIgnoresConfiguredChatGPTWebImageModel429(t *testing.T) {
+	auth := &coreauth.Auth{
+		ID:       "chatgpt-web-custom-image-maintenance",
+		Provider: chatgptwebauth.Provider,
+		Status:   coreauth.StatusError,
+		LastError: &coreauth.Error{
+			Message:    "image quota exhausted",
+			HTTPStatus: http.StatusTooManyRequests,
+		},
+	}
+	registry.GetGlobalRegistry().RegisterClient(auth.ID, auth.Provider, []*registry.ModelInfo{{
+		ID:         "custom-web-image",
+		UpstreamID: chatgptwebauth.ImageModel,
+		Type:       registry.OpenAIImageModelType,
+	}})
+	t.Cleanup(func() {
+		registry.GetGlobalRegistry().UnregisterClient(auth.ID)
+	})
+
+	result := coreauth.Result{
+		AuthID:   auth.ID,
+		Provider: chatgptwebauth.Provider,
+		Model:    "custom-web-image",
+		Error: &coreauth.Error{
+			Message:    "image quota exhausted",
+			HTTPStatus: http.StatusTooManyRequests,
+		},
+	}
+	cfg := config.AuthMaintenanceConfig{
+		Enable:            true,
+		DeleteStatusCodes: []int{http.StatusTooManyRequests},
+	}
+	if status := authMaintenanceStatusCode(auth, &result); status != 0 {
+		t.Fatalf("custom image maintenance status = %d, want ignored", status)
+	}
+	if reason, eligible := authEligibleForMaintenanceDelete(auth, &result, cfg); eligible {
+		t.Fatalf("custom image result delete eligibility = %q", reason)
+	}
+}
+
 func TestServiceBindsChatGPTWebExecutorBeforeFirstCredential(t *testing.T) {
 	service := &Service{
 		cfg:         &config.Config{},

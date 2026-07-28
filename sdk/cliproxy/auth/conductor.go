@@ -8062,7 +8062,7 @@ func (m *Manager) pickNextMixedWithImageToolFallback(ctx context.Context, provid
 			return false
 		}
 		if strings.EqualFold(strings.TrimSpace(auth.Provider), "chatgpt-web") {
-			return chatGPTWebImageModelProjection(auth, model) || explicitImageTool
+			return chatGPTWebImageModelProjection(auth, m.selectionModelKeyForAuth(auth, model)) || explicitImageTool
 		}
 		if !isCodexProvider(auth, auth.Provider) {
 			return false

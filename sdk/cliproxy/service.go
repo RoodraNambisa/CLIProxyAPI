@@ -843,7 +843,7 @@ func chatGPTWebImageOnlyMaintenanceResult(auth *coreauth.Auth, result *coreauth.
 		return false
 	}
 	if result != nil {
-		return strings.EqualFold(strings.TrimSpace(result.Model), chatgptwebauth.ImageModel)
+		return chatGPTWebRegisteredImageModel(auth, result.Model)
 	}
 	if auth.LastError == nil {
 		return false
@@ -865,7 +865,7 @@ func chatGPTWebImageOnlyMaintenanceResult(auth *coreauth.Auth, result *coreauth.
 			!authMaintenanceErrorsEqual(state.LastError, auth.LastError) {
 			continue
 		}
-		if strings.EqualFold(strings.TrimSpace(model), chatgptwebauth.ImageModel) {
+		if chatGPTWebRegisteredImageModel(auth, model) {
 			imageMatch = true
 			if state.UpdatedAt.After(imageMatchAt) {
 				imageMatchAt = state.UpdatedAt
@@ -881,6 +881,24 @@ func chatGPTWebImageOnlyMaintenanceResult(auth *coreauth.Auth, result *coreauth.
 		return explicitImageQuota && !nonImageMatch
 	}
 	return !nonImageMatch || imageMatchAt.After(nonImageMatchAt)
+}
+
+func chatGPTWebRegisteredImageModel(auth *coreauth.Auth, model string) bool {
+	if auth == nil {
+		return false
+	}
+	model = strings.TrimSpace(model)
+	if strings.EqualFold(model, chatgptwebauth.ImageModel) {
+		return true
+	}
+	for _, info := range registry.GetGlobalRegistry().GetModelsForClient(auth.ID) {
+		if info != nil &&
+			info.Type == registry.OpenAIImageModelType &&
+			strings.EqualFold(strings.TrimSpace(info.ID), model) {
+			return true
+		}
+	}
+	return false
 }
 
 func authMaintenanceErrorsEqual(first, second *coreauth.Error) bool {
@@ -3014,8 +3032,19 @@ func (s *Service) Run(ctx context.Context) error {
 			s.coreManager.SetOAuthModelAlias(newCfg.OAuthModelAlias)
 		}
 		s.rebindExecutors()
+		authModelExclusionsChanged := authModelExclusionsSignature(previousCfgSnapshot) != authModelExclusionsSignature(newCfg)
+		if s.coreManager != nil &&
+			!authModelExclusionsChanged &&
+			shouldRefreshChatGPTWebRegistrations(previousCfgSnapshot, newCfg) {
+			for _, auth := range s.coreManager.List() {
+				if !isNativeChatGPTWebAuth(auth) {
+					continue
+				}
+				s.refreshChatGPTWebModelRegistration(ctx, auth)
+			}
+		}
 		s.refreshChatGPTWebModelCatalogs(ctx)
-		if s.coreManager != nil && authModelExclusionsSignature(previousCfgSnapshot) != authModelExclusionsSignature(newCfg) {
+		if s.coreManager != nil && authModelExclusionsChanged {
 			for _, auth := range s.coreManager.List() {
 				if isNativeChatGPTWebAuth(auth) {
 					s.refreshChatGPTWebModelRegistration(ctx, auth)
@@ -3768,6 +3797,10 @@ func shouldRefreshCodexRegistrations(previousCfg, nextCfg *config.Config) bool {
 		return true
 	}
 	return codexCustomModelsSignature(previousCfg) != codexCustomModelsSignature(nextCfg)
+}
+
+func shouldRefreshChatGPTWebRegistrations(previousCfg, nextCfg *config.Config) bool {
+	return configuredImagesImageModel(previousCfg) != configuredImagesImageModel(nextCfg)
 }
 
 func freePlanImageModelEnabled(cfg *config.Config) bool {

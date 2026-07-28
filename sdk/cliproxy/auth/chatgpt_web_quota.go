@@ -187,9 +187,21 @@ func chatGPTWebImageModelState(auth *Auth) *ModelState {
 }
 
 func chatGPTWebImageModelProjection(auth *Auth, model string) bool {
-	return auth != nil &&
-		strings.EqualFold(strings.TrimSpace(auth.Provider), chatgptwebauth.Provider) &&
-		strings.EqualFold(canonicalModelKey(model), canonicalModelKey(chatGPTWebImageModel))
+	if auth == nil || !strings.EqualFold(strings.TrimSpace(auth.Provider), chatgptwebauth.Provider) {
+		return false
+	}
+	modelKey := canonicalModelKey(model)
+	if strings.EqualFold(modelKey, canonicalModelKey(chatGPTWebImageModel)) {
+		return true
+	}
+	for _, info := range registry.GetGlobalRegistry().GetModelsForClient(auth.ID) {
+		if info != nil &&
+			info.Type == registry.OpenAIImageModelType &&
+			strings.EqualFold(modelKey, canonicalModelKey(info.ID)) {
+			return true
+		}
+	}
+	return false
 }
 
 func chatGPTWebImageCapabilityStateForAuth(auth *Auth, now time.Time) chatGPTWebImageCapabilityState {
@@ -326,7 +338,7 @@ func chatGPTWebImageQuotaOwnedModelState(auth *Auth, model string, state *ModelS
 }
 
 func chatGPTWebImageQuotaBlocksModel(auth *Auth, model string, now time.Time) (bool, time.Time) {
-	if !strings.EqualFold(canonicalModelKey(model), chatGPTWebImageModel) {
+	if !chatGPTWebImageModelProjection(auth, model) {
 		return false, time.Time{}
 	}
 	return chatGPTWebImageCapabilityUnavailable(auth, now)
@@ -509,7 +521,7 @@ func (m *Manager) preferChatGPTWebImageQuotaErrorForCandidates(
 		}
 		if !imageTool &&
 			(!strings.EqualFold(provider, chatgptwebauth.Provider) ||
-				!strings.EqualFold(m.selectionModelKeyForAuth(candidate, model), chatGPTWebImageModel)) {
+				!chatGPTWebImageModelProjection(candidate, m.selectionModelKeyForAuth(candidate, model))) {
 			preferOriginal = true
 			continue
 		}
@@ -642,7 +654,7 @@ func (m *Manager) triggerDueChatGPTWebImageQuotaRefreshes(
 			candidate.NextRetryAfter.After(now) {
 			continue
 		}
-		if !imageTool && !strings.EqualFold(m.selectionModelKeyForAuth(candidate, model), chatGPTWebImageModel) {
+		if !imageTool && !chatGPTWebImageModelProjection(candidate, m.selectionModelKeyForAuth(candidate, model)) {
 			continue
 		}
 		capability := chatGPTWebImageCapabilityStateForAuth(candidate, now)

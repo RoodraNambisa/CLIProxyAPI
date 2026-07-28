@@ -17,6 +17,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	executorhelps "github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor/helps"
+	sdkaccess "github.com/router-for-me/CLIProxyAPI/v6/sdk/access"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/api/handlers"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	coreexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
@@ -344,6 +345,7 @@ func TestOpenAIImagesGenerationsCanRouteIgnoredParamsToChatGPTWeb(t *testing.T) 
 	h := newImagesTestHandler(t, executor)
 	h.Cfg.Images.ChatGPTWeb.IgnoreUnsupportedParams = true
 	router := gin.New()
+	router.Use(allowedImageProvidersMiddleware(constant.ChatGPTWeb))
 	router.POST("/v1/images/generations", h.Generations)
 
 	request := httptest.NewRequest(http.MethodPost, "/v1/images/generations", strings.NewReader(
@@ -362,6 +364,60 @@ func TestOpenAIImagesGenerationsCanRouteIgnoredParamsToChatGPTWeb(t *testing.T) 
 	if !executor.hasIgnoreUnsupportedImageParams || !executor.ignoreUnsupportedImageParams {
 		t.Fatalf("ignore unsupported image params metadata = (%v, %v), want (true, true)",
 			executor.ignoreUnsupportedImageParams, executor.hasIgnoreUnsupportedImageParams)
+	}
+}
+
+func TestOpenAIImagesWebOnlyKeyRejectsUnsupportedParamsBeforeProviderFiltering(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	executor := &imageCaptureExecutor{provider: "chatgpt-web"}
+	h := newImagesTestHandler(t, executor)
+	h.Cfg.Images.UnsupportedStatusCode = http.StatusUnprocessableEntity
+	router := gin.New()
+	router.Use(allowedImageProvidersMiddleware(constant.ChatGPTWeb))
+	router.POST("/v1/images/generations", h.Generations)
+
+	request := httptest.NewRequest(http.MethodPost, "/v1/images/generations", strings.NewReader(
+		`{"model":"gpt-image-2","prompt":"draw","size":"1024x1024"}`,
+	))
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+
+	if response.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422; body=%s", response.Code, response.Body.String())
+	}
+	if got := gjson.Get(response.Body.String(), "error.code").String(); got != "unsupported_parameter" {
+		t.Fatalf("error code = %q, want unsupported_parameter; body=%s", got, response.Body.String())
+	}
+	if got := gjson.Get(response.Body.String(), "error.param").String(); got != "size" {
+		t.Fatalf("error param = %q, want size; body=%s", got, response.Body.String())
+	}
+	if executor.calls != 0 {
+		t.Fatalf("executor calls = %d, want 0", executor.calls)
+	}
+}
+
+func TestOpenAIImagesMixedKeyRoutesUnsupportedWebParamsToCodex(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	codexExecutor := &imageCaptureExecutor{provider: "codex"}
+	webExecutor := &imageCaptureExecutor{provider: "chatgpt-web"}
+	h := newMixedImagesTestHandler(t, codexExecutor, webExecutor)
+	router := gin.New()
+	router.Use(allowedImageProvidersMiddleware(constant.ChatGPTWeb, constant.Codex))
+	router.POST("/v1/images/generations", h.Generations)
+
+	request := httptest.NewRequest(http.MethodPost, "/v1/images/generations", strings.NewReader(
+		`{"model":"gpt-image-2","prompt":"draw","size":"1024x1024"}`,
+	))
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", response.Code, response.Body.String())
+	}
+	if codexExecutor.calls != 1 || webExecutor.calls != 0 {
+		t.Fatalf("executor calls: codex=%d web=%d, want 1/0", codexExecutor.calls, webExecutor.calls)
 	}
 }
 
@@ -385,6 +441,15 @@ func TestOpenAIImagesPinsDisabledUnsupportedParamPolicy(t *testing.T) {
 	if !executor.hasIgnoreUnsupportedImageParams || executor.ignoreUnsupportedImageParams {
 		t.Fatalf("ignore unsupported image params metadata = (%v, %v), want (false, true)",
 			executor.ignoreUnsupportedImageParams, executor.hasIgnoreUnsupportedImageParams)
+	}
+}
+
+func allowedImageProvidersMiddleware(providers ...string) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		c.Set("accessMetadata", map[string]string{
+			sdkaccess.MetadataAllowedProviders: strings.Join(providers, ","),
+		})
+		c.Next()
 	}
 }
 

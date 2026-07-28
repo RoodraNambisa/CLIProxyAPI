@@ -19,6 +19,7 @@ import (
 	. "github.com/router-for-me/CLIProxyAPI/v6/internal/constant"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/interfaces"
 	executorhelps "github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor/helps"
+	sdkaccess "github.com/router-for-me/CLIProxyAPI/v6/sdk/access"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/api/handlers"
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v6/sdk/config"
 	"github.com/tidwall/gjson"
@@ -189,6 +190,21 @@ type imageUnsupportedError struct {
 	err error
 }
 
+type chatGPTWebImageCompatibilityError struct {
+	parameter string
+	message   string
+}
+
+func (e *chatGPTWebImageCompatibilityError) Error() string {
+	if e == nil {
+		return "chatgpt web does not support this image request"
+	}
+	if strings.TrimSpace(e.message) != "" {
+		return e.message
+	}
+	return fmt.Sprintf("chatgpt web does not support image parameter %q", e.parameter)
+}
+
 func (e imageUnsupportedError) Error() string {
 	return e.err.Error()
 }
@@ -290,6 +306,12 @@ func (h *OpenAIImagesAPIHandler) Edits(c *gin.Context) {
 }
 
 func (h *OpenAIImagesAPIHandler) handleImagesRequest(c *gin.Context, req openAIImageRequest, op imageOperation) {
+	ignoreUnsupportedImageParams := h.chatGPTWebIgnoreUnsupportedImageParams()
+	compatibilityErr := chatGPTWebImageRequestCompatibilityError(req, ignoreUnsupportedImageParams)
+	if compatibilityErr != nil && chatGPTWebAllowedWithoutCodex(c) {
+		h.writeImagesError(c, h.imagesUnsupportedStatusCode(), chatGPTWebUnsupportedParameterError(compatibilityErr))
+		return
+	}
 	codexModel := h.imagesCodexModel()
 	imageModel := h.imagesImageModel()
 	payload, err := buildCodexImageResponsesPayload(req, op, codexModel, imageModel, h.imagesOverrideInputFidelityEnabled())
@@ -308,7 +330,6 @@ func (h *OpenAIImagesAPIHandler) handleImagesRequest(c *gin.Context, req openAII
 		return
 	}
 	responseFormat := strings.ToLower(strings.TrimSpace(req.ResponseFormat))
-	ignoreUnsupportedImageParams := h.chatGPTWebIgnoreUnsupportedImageParams()
 	providers := imageResponsesProviders(req, ignoreUnsupportedImageParams)
 	if req.Stream {
 		h.handleStreamingImagesResponse(c, rawJSON, imageModel, codexModel, op, count, responseFormat, providers, ignoreUnsupportedImageParams)
@@ -1539,39 +1560,63 @@ func (m *imageStreamMapper) writeCompletedSet(w io.Writer, results []imageResult
 }
 
 func chatGPTWebSupportsImageRequest(req openAIImageRequest, ignoreUnsupportedParams bool) bool {
+	return chatGPTWebImageRequestCompatibilityError(req, ignoreUnsupportedParams) == nil
+}
+
+func chatGPTWebImageRequestCompatibilityError(req openAIImageRequest, ignoreUnsupportedParams bool) *chatGPTWebImageCompatibilityError {
 	if !ignoreUnsupportedParams {
-		if strings.TrimSpace(req.Size) != "" ||
-			(strings.TrimSpace(req.Quality) != "" && !strings.EqualFold(strings.TrimSpace(req.Quality), "auto")) ||
-			strings.TrimSpace(req.Background) != "" ||
-			(strings.TrimSpace(req.OutputFormat) != "" && !strings.EqualFold(strings.TrimSpace(req.OutputFormat), "png")) ||
-			strings.TrimSpace(req.InputFidelity) != "" ||
-			strings.TrimSpace(req.Moderation) != "" ||
-			req.OutputCompression != nil ||
-			(req.PartialImages != nil && *req.PartialImages > 0) {
-			return false
+		unsupported := []struct {
+			parameter string
+			present   bool
+		}{
+			{parameter: "size", present: strings.TrimSpace(req.Size) != ""},
+			{parameter: "quality", present: strings.TrimSpace(req.Quality) != "" && !strings.EqualFold(strings.TrimSpace(req.Quality), "auto")},
+			{parameter: "background", present: strings.TrimSpace(req.Background) != ""},
+			{parameter: "output_format", present: strings.TrimSpace(req.OutputFormat) != "" && !strings.EqualFold(strings.TrimSpace(req.OutputFormat), "png")},
+			{parameter: "input_fidelity", present: strings.TrimSpace(req.InputFidelity) != ""},
+			{parameter: "moderation", present: strings.TrimSpace(req.Moderation) != ""},
+			{parameter: "output_compression", present: req.OutputCompression != nil},
+			{parameter: "partial_images", present: req.PartialImages != nil && *req.PartialImages > 0},
+		}
+		for _, candidate := range unsupported {
+			if candidate.present {
+				return &chatGPTWebImageCompatibilityError{parameter: candidate.parameter}
+			}
 		}
 	}
 	references := make([]string, 0, len(req.Images)+1)
 	for _, reference := range req.Images {
 		if !chatGPTWebSupportsImageReference(reference) {
-			return false
+			return &chatGPTWebImageCompatibilityError{
+				parameter: "images",
+				message:   "chatgpt web only supports data URL image inputs",
+			}
 		}
 		imageURL, _ := imageURLFromReference(reference)
 		references = append(references, imageURL)
 	}
 	if req.Mask != nil {
 		if !chatGPTWebSupportsImageReference(*req.Mask) {
-			return false
+			return &chatGPTWebImageCompatibilityError{
+				parameter: "mask",
+				message:   "chatgpt web only supports data URL image masks",
+			}
 		}
 		maskURL, err := imageURLFromReference(*req.Mask)
 		if err != nil || strings.HasPrefix(strings.ToLower(maskURL), "data:image/webp") {
-			return false
+			return &chatGPTWebImageCompatibilityError{
+				parameter: "mask",
+				message:   "chatgpt web does not support WebP masks",
+			}
 		}
 		references = append(references, maskURL)
 		for _, reference := range req.Images {
 			imageURL, errImage := imageURLFromReference(reference)
 			if errImage != nil || strings.HasPrefix(strings.ToLower(imageURL), "data:image/webp") {
-				return false
+				return &chatGPTWebImageCompatibilityError{
+					parameter: "images",
+					message:   "chatgpt web does not support WebP image inputs with a mask",
+				}
 			}
 		}
 	}
@@ -1580,9 +1625,62 @@ func chatGPTWebSupportsImageRequest(req openAIImageRequest, ignoreUnsupportedPar
 		executorhelps.ChatGPTWebMaxImageBytes,
 		executorhelps.ChatGPTWebMaxImageRequestBytes,
 	); err != nil {
+		return &chatGPTWebImageCompatibilityError{
+			parameter: "images",
+			message:   err.Error(),
+		}
+	}
+	return nil
+}
+
+func chatGPTWebAllowedWithoutCodex(c *gin.Context) bool {
+	if c == nil {
 		return false
 	}
-	return true
+	rawMetadata, exists := c.Get("accessMetadata")
+	if !exists {
+		return false
+	}
+	metadata, ok := rawMetadata.(map[string]string)
+	if !ok {
+		return false
+	}
+	rawProviders := strings.TrimSpace(metadata[sdkaccess.MetadataAllowedProviders])
+	if rawProviders == "" {
+		return false
+	}
+	webAllowed := false
+	codexAllowed := false
+	for _, rawProvider := range strings.Split(rawProviders, ",") {
+		switch strings.ToLower(strings.TrimSpace(rawProvider)) {
+		case ChatGPTWeb:
+			webAllowed = true
+		case Codex:
+			codexAllowed = true
+		}
+	}
+	return webAllowed && !codexAllowed
+}
+
+func chatGPTWebUnsupportedParameterError(compatibilityErr *chatGPTWebImageCompatibilityError) error {
+	message := "chatgpt web does not support this image request"
+	parameter := ""
+	if compatibilityErr != nil {
+		message = compatibilityErr.Error()
+		parameter = strings.TrimSpace(compatibilityErr.parameter)
+	}
+	payload, err := json.Marshal(map[string]any{
+		"error": map[string]any{
+			"message": message,
+			"type":    "invalid_request_error",
+			"param":   parameter,
+			"code":    "unsupported_parameter",
+		},
+	})
+	if err != nil {
+		return errors.New(message)
+	}
+	return errors.New(string(payload))
 }
 
 func chatGPTWebSupportsImageReference(reference imageReference) bool {

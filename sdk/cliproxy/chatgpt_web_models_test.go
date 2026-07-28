@@ -155,7 +155,7 @@ func (store *chatGPTWebCatalogBlockingStore) enable() {
 }
 
 func TestChatGPTWebBuiltinModelsAlwaysIncludeImageModel(t *testing.T) {
-	models := chatGPTWebBuiltinModels()
+	models := chatGPTWebBuiltinModels("gpt-image-2")
 	var image *registry.ModelInfo
 	for _, model := range models {
 		if model != nil && model.ID == "gpt-image-2" {
@@ -164,6 +164,61 @@ func TestChatGPTWebBuiltinModelsAlwaysIncludeImageModel(t *testing.T) {
 	}
 	if image == nil || image.Type != registry.OpenAIImageModelType {
 		t.Fatalf("image model = %#v", image)
+	}
+}
+
+func TestChatGPTWebBuiltinModelsUseConfiguredImageModelAndConservativeCapabilities(t *testing.T) {
+	models := chatGPTWebBuiltinModels("custom-web-image")
+	var image *registry.ModelInfo
+	for _, model := range models {
+		if model == nil {
+			continue
+		}
+		if len(model.SupportedParameters) != 0 {
+			t.Fatalf("model %q supported parameters = %v, want none", model.ID, model.SupportedParameters)
+		}
+		if model.Thinking != nil {
+			t.Fatalf("model %q thinking = %#v, want nil", model.ID, model.Thinking)
+		}
+		if model.ID == "custom-web-image" {
+			image = model
+		}
+		if model.ID == "gpt-image-2" {
+			t.Fatal("default image model remained registered after custom configuration")
+		}
+	}
+	if image == nil {
+		t.Fatal("custom image model was not registered")
+	}
+	if image.UpstreamID != "gpt-image-2" || image.Type != registry.OpenAIImageModelType {
+		t.Fatalf("custom image model = %#v", image)
+	}
+}
+
+func TestServiceChatGPTWebModelsRemapCachedImageModelToCurrentConfig(t *testing.T) {
+	manager := coreauth.NewManager(nil, nil, nil)
+	service := &Service{
+		cfg: &config.Config{SDKConfig: config.SDKConfig{
+			Images: config.ImagesConfig{ImageModel: "custom-web-image"},
+		}},
+		coreManager: manager,
+	}
+	auth := registerChatGPTWebCatalogTestAuth(t, manager, "chatgpt-web-custom-image-cache")
+	service.chatGPTWebModelCatalog.Store(auth.ID, &chatGPTWebModelCatalogCacheEntry{
+		RuntimeInstanceID:  auth.RuntimeInstanceID(),
+		CredentialIdentity: chatGPTWebCatalogCredentialIdentity(auth),
+		Models: []*registry.ModelInfo{
+			chatGPTWebTextModelInfo("remote-model", "", 0, ""),
+			chatGPTWebImageModelInfo("gpt-image-2"),
+		},
+	})
+
+	models := service.chatGPTWebModelsForAuth(auth)
+	if !containsRegisteredModel(models, "custom-web-image") {
+		t.Fatalf("custom image model missing: %v", registeredModelIDs(models))
+	}
+	if containsRegisteredModel(models, "gpt-image-2") {
+		t.Fatalf("default image model remained in cached catalog: %v", registeredModelIDs(models))
 	}
 }
 
@@ -177,8 +232,8 @@ func TestServiceChatGPTWebModelsUsesLastCatalog(t *testing.T) {
 		Models:             []*registry.ModelInfo{chatGPTWebTextModelInfo("remote-model", "", 0, "")},
 	})
 	models := service.chatGPTWebModelsForAuth(auth)
-	if len(models) != 1 || models[0].ID != "remote-model" {
-		t.Fatalf("models = %#v", models)
+	if got := registeredModelIDs(models); len(got) != 2 || got[0] != "remote-model" || got[1] != "gpt-image-2" {
+		t.Fatalf("models = %v, want cached remote model and configured image model", got)
 	}
 	models[0].ID = "mutated"
 	again := service.chatGPTWebModelsForAuth(auth)
@@ -659,7 +714,7 @@ func chatGPTWebTestJWT(t *testing.T, accountID, userID, subject, tokenID string)
 }
 
 func TestChatGPTWebCatalogModelInfosKeepsBuiltinImageOnEmptyCatalog(t *testing.T) {
-	models := chatGPTWebCatalogModelInfos(nil)
+	models := chatGPTWebCatalogModelInfos(nil, "gpt-image-2")
 	if len(models) != 1 || models[0].ID != "gpt-image-2" {
 		t.Fatalf("models = %#v", models)
 	}
@@ -669,7 +724,7 @@ func TestChatGPTWebCatalogModelInfosDeduplicatesNormalizedModelIDs(t *testing.T)
 	models := chatGPTWebCatalogModelInfos([]chatgptwebauth.CatalogModel{
 		{Slug: " remote-model ", DisplayName: "Remote"},
 		{Slug: "REMOTE-MODEL", DisplayName: "Duplicate"},
-	})
+	}, "gpt-image-2")
 	if got := registeredModelIDs(models); len(got) != 2 || got[0] != "remote-model" || got[1] != "gpt-image-2" {
 		t.Fatalf("models = %v, want one remote model and the builtin image model", got)
 	}
@@ -680,7 +735,7 @@ func TestServiceReconcileChatGPTWebStatusDisabledUnregistersModels(t *testing.T)
 	service := &Service{cfg: &config.Config{}, coreManager: manager}
 	auth := registerChatGPTWebCatalogTestAuth(t, manager, "chatgpt-web-status-disabled")
 	t.Cleanup(func() { GlobalModelRegistry().UnregisterClient(auth.ID) })
-	GlobalModelRegistry().RegisterClient(auth.ID, auth.Provider, chatGPTWebBuiltinModels())
+	GlobalModelRegistry().RegisterClient(auth.ID, auth.Provider, chatGPTWebBuiltinModels("gpt-image-2"))
 
 	disabled := auth.Clone()
 	disabled.Status = coreauth.StatusDisabled

@@ -89,6 +89,35 @@ func TestChatGPTWebImageQuotaBlocksOnlyImageModel(t *testing.T) {
 	}
 }
 
+func TestChatGPTWebImageQuotaBlocksConfiguredImageModelRegistration(t *testing.T) {
+	now := time.Now()
+	auth := &Auth{
+		ID:       "chatgpt-web-custom-image",
+		Provider: chatgptwebauth.Provider,
+		Status:   StatusActive,
+		Metadata: map[string]any{
+			"lifecycle_state":       LifecycleStateActive,
+			"image_quota_remaining": float64(0),
+			"quota_state":           "exhausted",
+		},
+	}
+	registry.GetGlobalRegistry().RegisterClient(auth.ID, auth.Provider, []*registry.ModelInfo{{
+		ID:         "custom-web-image",
+		UpstreamID: chatgptwebauth.ImageModel,
+		Type:       registry.OpenAIImageModelType,
+	}})
+	t.Cleanup(func() {
+		registry.GetGlobalRegistry().UnregisterClient(auth.ID)
+	})
+
+	if blocked, _, _ := isAuthBlockedForModel(auth, "custom-web-image", now); !blocked {
+		t.Fatal("configured ChatGPT Web image model was not blocked by canonical image quota")
+	}
+	if blocked, _, _ := isAuthBlockedForModel(auth, "text-model", now); blocked {
+		t.Fatal("text model was blocked by ChatGPT Web image quota")
+	}
+}
+
 func TestManagerChatGPTWebImageQuotaFallsBackAndReturnsDedicatedError(t *testing.T) {
 	manager := NewManager(nil, &FillFirstSelector{}, nil)
 	manager.SetRetryConfig(0, 0, 0)
