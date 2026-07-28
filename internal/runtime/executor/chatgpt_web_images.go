@@ -48,6 +48,7 @@ const (
 	chatGPTWebImageStreamMaxBytes       = 128 << 20
 	chatGPTWebImageStreamMaxEvents      = 65_536
 	chatGPTWebPollResponseMaxBytes      = 128 << 20
+	chatGPTWebImagePollConcurrency      = 64
 )
 
 var chatGPTWebAssetHostSuffixes = []string{
@@ -57,6 +58,8 @@ var chatGPTWebAssetHostSuffixes = []string{
 	"oaistatic.com",
 	"openai.com",
 }
+
+var chatGPTWebImagePollSlots = make(chan struct{}, chatGPTWebImagePollConcurrency)
 
 type chatGPTWebUploadedImage struct {
 	FileID   string
@@ -280,10 +283,17 @@ func (e *ChatGPTWebExecutor) handleChatGPTWebImageRequestError(authID string, er
 
 func chatGPTWebImageQuotaErrorEvidence(err error) bool {
 	var upstream chatGPTWebHTTPError
-	if !errors.As(err, &upstream) || !chatGPTWebImageConversationPath(upstream.path) {
-		return false
+	if errors.As(err, &upstream) {
+		if !chatGPTWebImageConversationPath(upstream.path) {
+			return false
+		}
+		return chatGPTWebImageQuotaTextEvidence(upstream.statusErr.msg)
 	}
-	body := strings.ToLower(strings.TrimSpace(upstream.statusErr.msg))
+	return chatGPTWebImageQuotaTextEvidence(err.Error())
+}
+
+func chatGPTWebImageQuotaTextEvidence(value string) bool {
+	body := strings.ToLower(strings.TrimSpace(value))
 	if body == "" {
 		return false
 	}
@@ -309,6 +319,7 @@ func chatGPTWebImageQuotaErrorEvidence(err error) bool {
 	}
 	for _, marker := range []string{
 		"image quota",
+		"image credit",
 		"image generation limit",
 		"image-generation limit",
 		"image_gen limit",
@@ -687,6 +698,13 @@ func prepareChatGPTWebImageOutputs(requestedFormat, model, quality string, image
 }
 
 func chatGPTWebImageFailureError(status string) error {
+	if chatGPTWebImageQuotaTextEvidence(status) {
+		return statusErr{
+			code:           http.StatusTooManyRequests,
+			msg:            "chatgpt web image quota exhausted: " + strings.TrimSpace(status),
+			skipAuthResult: true,
+		}
+	}
 	return statusErr{
 		code:           http.StatusBadGateway,
 		msg:            "chatgpt web image generation failed: " + strings.TrimSpace(status),
@@ -2747,7 +2765,32 @@ func (e *ChatGPTWebExecutor) doChatGPTWebGET(ctx context.Context, client *chatgp
 }
 
 func (e *ChatGPTWebExecutor) doChatGPTWebPollGET(ctx context.Context, client *chatgptwebauth.Client, credential *chatgptwebauth.Credential, path string, extra map[string]string, budget *chatGPTWebPollResponseBudget) (*fhttp.Response, []byte, error) {
+	if err := acquireChatGPTWebImagePollSlot(ctx, chatGPTWebImagePollSlots); err != nil {
+		return nil, nil, err
+	}
+	defer releaseChatGPTWebImagePollSlot(chatGPTWebImagePollSlots)
 	return e.doChatGPTWebGETWithBudget(ctx, client, credential, path, extra, budget, false)
+}
+
+func acquireChatGPTWebImagePollSlot(ctx context.Context, slots chan struct{}) error {
+	if slots == nil {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	select {
+	case slots <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func releaseChatGPTWebImagePollSlot(slots chan struct{}) {
+	if slots != nil {
+		<-slots
+	}
 }
 
 func (e *ChatGPTWebExecutor) doChatGPTWebGETWithBudget(ctx context.Context, client *chatgptwebauth.Client, credential *chatgptwebauth.Credential, path string, extra map[string]string, budget *chatGPTWebPollResponseBudget, logBody bool) (*fhttp.Response, []byte, error) {

@@ -120,6 +120,47 @@ func TestChatGPTWebGenericImageRateLimitPreservesCommittedMarkerWithoutQuotaCode
 	}
 }
 
+func TestChatGPTWebTerminalImageFailureProjectsExplicitQuotaEvidence(t *testing.T) {
+	projected := chatGPTWebImageRequestError(chatGPTWebImageFailureError(
+		"image generation limit reached; no remaining image credits",
+	))
+	var code interface{ ExecutionResultErrorCode() string }
+	if !errors.As(projected, &code) || code.ExecutionResultErrorCode() != "chatgpt_web_image_quota" {
+		t.Fatalf("terminal quota failure was not projected: %v", projected)
+	}
+	var status interface{ StatusCode() int }
+	if !errors.As(projected, &status) || status.StatusCode() != http.StatusTooManyRequests {
+		t.Fatalf("terminal quota status = %v, want 429", projected)
+	}
+
+	generic := chatGPTWebImageRequestError(chatGPTWebImageFailureError("image generation failed"))
+	if errors.As(generic, &code) {
+		t.Fatalf("generic terminal failure received quota projection: %v", generic)
+	}
+	if !errors.As(generic, &status) || status.StatusCode() != http.StatusBadGateway {
+		t.Fatalf("generic terminal status = %v, want 502", generic)
+	}
+}
+
+func TestChatGPTWebImagePollSlotsAreBoundedAndCancelable(t *testing.T) {
+	slots := make(chan struct{}, 1)
+	if err := acquireChatGPTWebImagePollSlot(context.Background(), slots); err != nil {
+		t.Fatalf("acquire first poll slot: %v", err)
+	}
+
+	waitCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := acquireChatGPTWebImagePollSlot(waitCtx, slots); !errors.Is(err, context.Canceled) {
+		t.Fatalf("blocked poll acquire error = %v, want context canceled", err)
+	}
+
+	releaseChatGPTWebImagePollSlot(slots)
+	if err := acquireChatGPTWebImagePollSlot(context.Background(), slots); err != nil {
+		t.Fatalf("reacquire poll slot: %v", err)
+	}
+	releaseChatGPTWebImagePollSlot(slots)
+}
+
 func TestChatGPTWebImageResultErrorsForwardAuthRetryClassification(t *testing.T) {
 	retryAfter := 9 * time.Second
 	cause := statusErr{
