@@ -54,6 +54,10 @@ const (
 	DefaultChatGPTWebAutoReloginJitterPercent = 20
 	MaxChatGPTWebAutoReloginRetries           = 10
 	MaxChatGPTWebAutoReloginJitterPercent     = 100
+	DefaultChatGPTWebTimezone                 = "Asia/Shanghai"
+	DefaultChatGPTWebTimezoneOffsetMinutes    = -480
+	MinChatGPTWebTimezoneOffsetMinutes        = -840
+	MaxChatGPTWebTimezoneOffsetMinutes        = 840
 	DefaultChatGPTWebAccountInfoWorkers       = 4
 	DefaultChatGPTWebAccountInfoQueueSize     = 256
 	DefaultChatGPTWebAccountInfoTTLMinutes    = 15
@@ -69,6 +73,7 @@ const (
 var (
 	deprecatedAmpConfigWarning       sync.Once
 	deprecatedGeminiCLIConfigWarning sync.Once
+	chatGPTWebTimezoneLocations      sync.Map
 )
 
 func warnDeprecatedAmpConfig(data []byte) {
@@ -444,6 +449,10 @@ type ChatGPTWebConfig struct {
 	AutoReloginMaxRetries *int `yaml:"auto-relogin-max-retries,omitempty" json:"auto-relogin-max-retries,omitempty"`
 	// AutoReloginJitterPercent applies symmetric jitter to background retry delays.
 	AutoReloginJitterPercent *int `yaml:"auto-relogin-jitter-percent,omitempty" json:"auto-relogin-jitter-percent,omitempty"`
+	// Timezone is the browser IANA timezone sent to ChatGPT Web.
+	Timezone string `yaml:"timezone,omitempty" json:"timezone,omitempty"`
+	// TimezoneOffsetMinutes overrides the browser offset. Omitted values follow Timezone and DST.
+	TimezoneOffsetMinutes *int `yaml:"timezone-offset-minutes,omitempty" json:"timezone-offset-minutes,omitempty"`
 	// EstimateTokenUsage controls local tiktoken usage estimation for Web responses.
 	// An omitted value remains enabled for backward compatibility.
 	EstimateTokenUsage *bool                       `yaml:"estimate-token-usage,omitempty" json:"estimate-token-usage,omitempty"`
@@ -473,6 +482,34 @@ func (cfg ChatGPTWebConfig) ResolvedAutoRelogin() ResolvedChatGPTWebAutoReloginC
 		resolved.JitterPercent = *cfg.AutoReloginJitterPercent
 	}
 	return resolved
+}
+
+// ResolvedChatGPTWebTimezone contains browser timezone fields sent upstream.
+type ResolvedChatGPTWebTimezone struct {
+	Timezone      string
+	OffsetMinutes int
+}
+
+// ResolvedTimezone returns the configured browser timezone and effective offset.
+func (cfg ChatGPTWebConfig) ResolvedTimezone(at time.Time) ResolvedChatGPTWebTimezone {
+	timezone := strings.TrimSpace(cfg.Timezone)
+	if timezone == "" {
+		timezone = DefaultChatGPTWebTimezone
+	}
+	offset := DefaultChatGPTWebTimezoneOffsetMinutes
+	if cfg.TimezoneOffsetMinutes != nil {
+		offset = *cfg.TimezoneOffsetMinutes
+	} else if location, errLoad := loadChatGPTWebTimezone(timezone); errLoad == nil {
+		if at.IsZero() {
+			at = time.Now()
+		}
+		_, eastOfUTCSeconds := at.In(location).Zone()
+		offset = -eastOfUTCSeconds / 60
+	}
+	return ResolvedChatGPTWebTimezone{
+		Timezone:      timezone,
+		OffsetMinutes: offset,
+	}
 }
 
 // TokenUsageEstimationEnabled returns whether Web response usage is estimated locally.
@@ -563,6 +600,21 @@ func (cfg ChatGPTWebConfig) Validate() error {
 	if relogin.JitterPercent < 0 || relogin.JitterPercent > MaxChatGPTWebAutoReloginJitterPercent {
 		return fmt.Errorf("chatgpt-web.auto-relogin-jitter-percent must be between 0 and %d", MaxChatGPTWebAutoReloginJitterPercent)
 	}
+	timezone := strings.TrimSpace(cfg.Timezone)
+	if timezone != "" {
+		if _, errLoad := loadChatGPTWebTimezone(timezone); errLoad != nil {
+			return fmt.Errorf("chatgpt-web.timezone must be a valid IANA timezone: %w", errLoad)
+		}
+	}
+	if cfg.TimezoneOffsetMinutes != nil &&
+		(*cfg.TimezoneOffsetMinutes < MinChatGPTWebTimezoneOffsetMinutes ||
+			*cfg.TimezoneOffsetMinutes > MaxChatGPTWebTimezoneOffsetMinutes) {
+		return fmt.Errorf(
+			"chatgpt-web.timezone-offset-minutes must be between %d and %d",
+			MinChatGPTWebTimezoneOffsetMinutes,
+			MaxChatGPTWebTimezoneOffsetMinutes,
+		)
+	}
 	if err := cfg.UsageCache.Validate(); err != nil {
 		return err
 	}
@@ -573,6 +625,19 @@ func (cfg ChatGPTWebConfig) Validate() error {
 		return err
 	}
 	return cfg.Sentinel.Validate()
+}
+
+func loadChatGPTWebTimezone(name string) (*time.Location, error) {
+	name = strings.TrimSpace(name)
+	if location, ok := chatGPTWebTimezoneLocations.Load(name); ok {
+		return location.(*time.Location), nil
+	}
+	location, errLoad := time.LoadLocation(name)
+	if errLoad != nil {
+		return nil, errLoad
+	}
+	actual, _ := chatGPTWebTimezoneLocations.LoadOrStore(name, location)
+	return actual.(*time.Location), nil
 }
 
 // ChatGPTWebAccountInfoConfig controls bounded account profile and image quota refreshes.
@@ -3186,6 +3251,8 @@ func preservesExplicitChatGPTWebValue(fullPath string, node *yaml.Node) bool {
 		for _, key := range []string{
 			"auto-relogin-max-retries",
 			"auto-relogin-jitter-percent",
+			"timezone",
+			"timezone-offset-minutes",
 			"estimate-token-usage",
 			"usage-cache",
 			"image-usage",
@@ -3199,7 +3266,9 @@ func preservesExplicitChatGPTWebValue(fullPath string, node *yaml.Node) bool {
 		}
 		return false
 	case "chatgpt-web.auto-relogin-max-retries",
-		"chatgpt-web.auto-relogin-jitter-percent":
+		"chatgpt-web.auto-relogin-jitter-percent",
+		"chatgpt-web.timezone",
+		"chatgpt-web.timezone-offset-minutes":
 		return true
 	case "chatgpt-web.estimate-token-usage":
 		return node.Kind == yaml.ScalarNode && node.Tag == "!!bool"

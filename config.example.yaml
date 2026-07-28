@@ -59,6 +59,10 @@ chatgpt-web:
   auto-relogin-max-retries: 3
   # Apply symmetric jitter to retry delays to avoid synchronized login bursts.
   auto-relogin-jitter-percent: 20
+  # Browser timezone shared by text, search, image, and account-info requests.
+  timezone: "Asia/Shanghai"
+  # Omit this field to derive the current offset, including DST, from timezone.
+  # timezone-offset-minutes: -480
   # ChatGPT Web does not return API token usage. Estimate visible input/output
   # text and supported image inputs/outputs locally after a successful response.
   # Disable this to skip the tokenizer work and return zero-valued usage fields.

@@ -887,6 +887,7 @@ func (e *ChatGPTWebExecutor) openChatGPTWebConversation(ctx context.Context, cli
 		return nil, nil, err
 	}
 	path := "/backend-api/conversation"
+	timezone := e.chatGPTWebTimezone()
 	body := map[string]any{
 		"action":                        "next",
 		"messages":                      messages,
@@ -903,8 +904,8 @@ func (e *ChatGPTWebExecutor) openChatGPTWebConversation(ctx context.Context, cli
 		"suggestions":                   []any{},
 		"supported_encodings":           []any{},
 		"system_hints":                  []any{},
-		"timezone":                      "Asia/Shanghai",
-		"timezone_offset_min":           -480,
+		"timezone":                      timezone.Timezone,
+		"timezone_offset_min":           timezone.OffsetMinutes,
 		"variant_purpose":               "comparison_implicit",
 		"websocket_request_id":          uuid.NewString(),
 		"client_contextual_info":        chatGPTWebClientContext(),

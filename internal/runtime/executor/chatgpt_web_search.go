@@ -133,14 +133,15 @@ func (e *ChatGPTWebExecutor) prepareChatGPTWebSearch(ctx context.Context, client
 		"content-type":    "application/json",
 		"x-conduit-token": "no-token",
 	})
+	timezone := e.chatGPTWebTimezone()
 	body := map[string]any{
 		"action":                 "next",
 		"fork_from_shared_post":  false,
 		"parent_message_id":      "client-created-root",
 		"model":                  chatGPTWebSearchModel,
 		"client_prepare_state":   "success",
-		"timezone_offset_min":    -480,
-		"timezone":               "Asia/Shanghai",
+		"timezone_offset_min":    timezone.OffsetMinutes,
+		"timezone":               timezone.Timezone,
 		"conversation_mode":      map[string]any{"kind": "primary_assistant"},
 		"system_hints":           []string{"search"},
 		"partial_query":          chatGPTWebUserTextMessage(query),
@@ -169,14 +170,15 @@ func (e *ChatGPTWebExecutor) startChatGPTWebSearch(ctx context.Context, client *
 	headers["content-type"] = "application/json"
 	headers["x-conduit-token"] = conduit
 	headers["x-oai-turn-trace-id"] = uuid.NewString()
+	timezone := e.chatGPTWebTimezone()
 	body := map[string]any{
 		"action":                               "next",
 		"messages":                             messages,
 		"parent_message_id":                    "client-created-root",
 		"model":                                chatGPTWebSearchModel,
 		"client_prepare_state":                 "success",
-		"timezone_offset_min":                  -480,
-		"timezone":                             "Asia/Shanghai",
+		"timezone_offset_min":                  timezone.OffsetMinutes,
+		"timezone":                             timezone.Timezone,
 		"conversation_mode":                    map[string]any{"kind": "primary_assistant"},
 		"enable_message_followups":             true,
 		"system_hints":                         []any{},

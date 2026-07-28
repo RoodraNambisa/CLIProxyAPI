@@ -1385,6 +1385,14 @@ func (e *ChatGPTWebExecutor) currentTime() time.Time {
 	return time.Now()
 }
 
+func (e *ChatGPTWebExecutor) chatGPTWebTimezone() config.ResolvedChatGPTWebTimezone {
+	cfg := config.ChatGPTWebConfig{}
+	if snapshot := e.configSnapshot(); snapshot != nil {
+		cfg = snapshot.ChatGPTWeb
+	}
+	return cfg.ResolvedTimezone(e.currentTime())
+}
+
 func (e *ChatGPTWebExecutor) lifecycleContext() context.Context {
 	if e == nil {
 		return context.Background()

@@ -819,14 +819,15 @@ func (e *ChatGPTWebExecutor) prepareChatGPTWebImageConversation(ctx context.Cont
 	headers := chatGPTWebRequirementsHeaders(e.chatGPTWebHeaders(credential, path, nil), prepareRequirements)
 	headers["accept"] = "*/*"
 	headers["content-type"] = "application/json"
+	timezone := e.chatGPTWebTimezone()
 	body := map[string]any{
 		"action":                 "next",
 		"fork_from_shared_post":  false,
 		"parent_message_id":      uuid.NewString(),
 		"model":                  upstreamModel,
 		"client_prepare_state":   "success",
-		"timezone_offset_min":    -480,
-		"timezone":               "Asia/Shanghai",
+		"timezone_offset_min":    timezone.OffsetMinutes,
+		"timezone":               timezone.Timezone,
 		"conversation_mode":      map[string]any{"kind": "primary_assistant"},
 		"system_hints":           []string{"picture_v2"},
 		"partial_query":          chatGPTWebUserTextMessage(prompt),
@@ -886,6 +887,7 @@ func (e *ChatGPTWebExecutor) openChatGPTWebImageConversation(ctx context.Context
 		MessageID: uuid.NewString(),
 		CreatedAt: float64(time.Now().UnixNano()) / 1e9,
 	}
+	timezone := e.chatGPTWebTimezone()
 	body := map[string]any{
 		"action": "next",
 		"messages": []any{map[string]any{
@@ -895,8 +897,8 @@ func (e *ChatGPTWebExecutor) openChatGPTWebImageConversation(ctx context.Context
 		"parent_message_id":                    uuid.NewString(),
 		"model":                                upstreamModel,
 		"client_prepare_state":                 "sent",
-		"timezone_offset_min":                  -480,
-		"timezone":                             "Asia/Shanghai",
+		"timezone_offset_min":                  timezone.OffsetMinutes,
+		"timezone":                             timezone.Timezone,
 		"conversation_mode":                    map[string]any{"kind": "primary_assistant"},
 		"enable_message_followups":             true,
 		"system_hints":                         []string{"picture_v2"},

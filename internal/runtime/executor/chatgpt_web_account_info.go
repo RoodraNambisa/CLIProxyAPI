@@ -3306,13 +3306,14 @@ func (e *ChatGPTWebExecutor) fetchChatGPTWebAccountInfoPair(
 	}
 	profileResults := make(chan profileResult, 1)
 	quotaResults := make(chan quotaResult, 1)
+	timezone := e.chatGPTWebTimezone()
 	accountID := credential.AccountID
 	if strings.TrimSpace(accountID) != accountID {
 		accountID = ""
 	}
 	go func() {
 		path := chatgptwebauth.AccountCheckPath
-		queryPath := path + "?timezone_offset_min=-480"
+		queryPath := fmt.Sprintf("%s?timezone_offset_min=%d", path, timezone.OffsetMinutes)
 		headers := e.chatGPTWebHeaders(credential, path, map[string]string{
 			"chatgpt-account-id": accountID,
 		})
@@ -3357,7 +3358,7 @@ func (e *ChatGPTWebExecutor) fetchChatGPTWebAccountInfoPair(
 			"gizmo_id":                nil,
 			"requested_default_model": nil,
 			"conversation_id":         nil,
-			"timezone_offset_min":     -480,
+			"timezone_offset_min":     timezone.OffsetMinutes,
 			"system_hints":            []string{"picture_v2"},
 		}, chatGPTWebAccountInfoMaxBodyBytes)
 		if errRequest != nil {

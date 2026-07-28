@@ -1410,6 +1410,31 @@ func TestChatGPTWebExecutorUpdateConfigPublishesImmutableSnapshot(t *testing.T) 
 	}
 }
 
+func TestChatGPTWebExecutorTimezoneUsesCurrentConfigAndDST(t *testing.T) {
+	executor := &ChatGPTWebExecutor{
+		now: func() time.Time {
+			return time.Date(2026, time.July, 1, 0, 0, 0, 0, time.UTC)
+		},
+	}
+	executor.cfg.Store(&config.Config{ChatGPTWeb: config.ChatGPTWebConfig{
+		Timezone: "America/New_York",
+	}})
+	resolved := executor.chatGPTWebTimezone()
+	if resolved.Timezone != "America/New_York" || resolved.OffsetMinutes != 240 {
+		t.Fatalf("New York timezone = %#v", resolved)
+	}
+
+	zero := 0
+	executor.cfg.Store(&config.Config{ChatGPTWeb: config.ChatGPTWebConfig{
+		Timezone:              "UTC",
+		TimezoneOffsetMinutes: &zero,
+	}})
+	resolved = executor.chatGPTWebTimezone()
+	if resolved.Timezone != "UTC" || resolved.OffsetMinutes != 0 {
+		t.Fatalf("updated UTC timezone = %#v", resolved)
+	}
+}
+
 func TestChatGPTWebExecutorBackgroundReloginStopsWhenDisabled(t *testing.T) {
 	manager := cliproxyauth.NewManager(nil, nil, nil)
 	expected := registerChatGPTWebPendingAuth(t, manager, "stop-disabled")
