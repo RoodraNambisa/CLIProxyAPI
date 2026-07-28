@@ -58,7 +58,7 @@ type chatGPTWebAccountInfoOutcome struct {
 
 type chatGPTWebImageQuotaObservation struct {
 	quotaUpdatedAt string
-	modelState     *cliproxyauth.ModelState
+	modelStates    map[string]*cliproxyauth.ModelState
 }
 
 type chatGPTWebAccountProfileObservation struct {
@@ -97,7 +97,7 @@ func (observation chatGPTWebAccountProfileObservation) matches(auth *cliproxyaut
 
 func captureChatGPTWebImageQuotaObservation(auth *cliproxyauth.Auth) chatGPTWebImageQuotaObservation {
 	observation := chatGPTWebImageQuotaObservation{
-		modelState: cloneChatGPTWebImageModelState(auth),
+		modelStates: cloneChatGPTWebImageModelStates(auth),
 	}
 	if credential, errParse := chatgptwebauth.ParseCredential(auth.Metadata); errParse == nil {
 		observation.quotaUpdatedAt = strings.TrimSpace(credential.QuotaUpdatedAt)
@@ -111,22 +111,30 @@ func (observation chatGPTWebImageQuotaObservation) matches(auth *cliproxyauth.Au
 		strings.TrimSpace(credential.QuotaUpdatedAt) != observation.quotaUpdatedAt {
 		return false
 	}
-	return reflect.DeepEqual(cloneChatGPTWebImageModelState(auth), observation.modelState)
+	return reflect.DeepEqual(cloneChatGPTWebImageModelStates(auth), observation.modelStates)
 }
 
-func cloneChatGPTWebImageModelState(auth *cliproxyauth.Auth) *cliproxyauth.ModelState {
-	if auth == nil {
+func cloneChatGPTWebImageModelStates(auth *cliproxyauth.Auth) map[string]*cliproxyauth.ModelState {
+	if auth == nil || len(auth.ModelStates) == 0 {
 		return nil
 	}
-	if state := auth.ModelStates[chatgptwebauth.ImageModel]; state != nil {
-		return state.Clone()
-	}
+	targets := cliproxyauth.ChatGPTWebImageModelIDs(auth)
+	var states map[string]*cliproxyauth.ModelState
 	for model, state := range auth.ModelStates {
-		if state != nil && strings.EqualFold(strings.TrimSpace(model), chatgptwebauth.ImageModel) {
-			return state.Clone()
+		if state == nil {
+			continue
+		}
+		for _, target := range targets {
+			if strings.EqualFold(strings.TrimSpace(model), strings.TrimSpace(target)) {
+				if states == nil {
+					states = make(map[string]*cliproxyauth.ModelState)
+				}
+				states[model] = state.Clone()
+				break
+			}
 		}
 	}
-	return nil
+	return states
 }
 
 type chatGPTWebAccountInfoTaskState struct {
@@ -3119,10 +3127,10 @@ func (e *ChatGPTWebExecutor) refreshChatGPTWebAccountInfoForInstance(
 	var current bool
 	var errPersist error
 	if quotaErr == nil && quota.Present && quota.Remaining > 0 {
-		_, current, errPersist = e.manager.MutateRuntimeMetadataAndClearModelCooldownIfCurrent(
+		_, current, errPersist = e.manager.MutateRuntimeMetadataAndClearModelCooldownsIfCurrent(
 			persistContext,
 			auth,
-			chatgptwebauth.ImageModel,
+			cliproxyauth.ChatGPTWebImageModelIDs(auth),
 			"chatgpt_web_image_quota",
 			mutateAccountInfo,
 		)

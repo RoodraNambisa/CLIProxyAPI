@@ -118,6 +118,46 @@ func TestChatGPTWebImageQuotaBlocksConfiguredImageModelRegistration(t *testing.T
 	}
 }
 
+func TestChatGPTWebImageQuotaReadsConfiguredImageModelState(t *testing.T) {
+	now := time.Now()
+	resetAt := now.Add(3 * time.Minute)
+	auth := &Auth{
+		ID:       "chatgpt-web-custom-image-state",
+		Provider: chatgptwebauth.Provider,
+		Status:   StatusActive,
+		Metadata: map[string]any{
+			"lifecycle_state":       LifecycleStateActive,
+			"image_quota_remaining": 4,
+			"quota_state":           string(chatgptwebauth.QuotaStateAvailable),
+		},
+		ModelStates: map[string]*ModelState{
+			"custom-web-image": {
+				Status:         StatusError,
+				Unavailable:    true,
+				NextRetryAfter: resetAt,
+				Quota: QuotaState{
+					Exceeded:      true,
+					Reason:        "chatgpt_web_image_quota",
+					NextRecoverAt: resetAt,
+				},
+			},
+		},
+	}
+	registry.GetGlobalRegistry().RegisterClient(auth.ID, auth.Provider, []*registry.ModelInfo{{
+		ID:         "custom-web-image",
+		UpstreamID: chatgptwebauth.ImageModel,
+		Type:       registry.OpenAIImageModelType,
+	}})
+	t.Cleanup(func() {
+		registry.GetGlobalRegistry().UnregisterClient(auth.ID)
+	})
+
+	blocked, retryAt := ChatGPTWebImageCapabilityUnavailable(auth, now)
+	if !blocked || !retryAt.Equal(resetAt) {
+		t.Fatalf("custom image capability = blocked %v retry %v, want true/%v", blocked, retryAt, resetAt)
+	}
+}
+
 func TestManagerChatGPTWebImageQuotaFallsBackAndReturnsDedicatedError(t *testing.T) {
 	manager := NewManager(nil, &FillFirstSelector{}, nil)
 	manager.SetRetryConfig(0, 0, 0)
@@ -2392,6 +2432,7 @@ func TestMutateRuntimeMetadataAndClearModelCooldownPersistsOnce(t *testing.T) {
 	store := &countingStore{}
 	manager := NewManager(store, &FillFirstSelector{}, nil)
 	authID := "quota-atomic-" + uuid.NewString()
+	customImageModel := "custom-image-" + uuid.NewString()
 	installed, errRegister := manager.Register(context.Background(), &Auth{
 		ID:       authID,
 		Provider: chatgptwebauth.Provider,
@@ -2410,17 +2451,34 @@ func TestMutateRuntimeMetadataAndClearModelCooldownPersistsOnce(t *testing.T) {
 					Reason:   "chatgpt_web_image_quota",
 				},
 			},
+			customImageModel: {
+				Status:         StatusError,
+				Unavailable:    true,
+				NextRetryAfter: time.Now().Add(time.Hour),
+				Quota: QuotaState{
+					Exceeded: true,
+					Reason:   "chatgpt_web_image_quota",
+				},
+			},
 		},
 	})
 	if errRegister != nil {
 		t.Fatalf("Register() error = %v", errRegister)
 	}
+	registry.GetGlobalRegistry().RegisterClient(authID, chatgptwebauth.Provider, []*registry.ModelInfo{{
+		ID:         customImageModel,
+		UpstreamID: chatgptwebauth.ImageModel,
+		Type:       registry.OpenAIImageModelType,
+	}})
+	t.Cleanup(func() {
+		registry.GetGlobalRegistry().UnregisterClient(authID)
+	})
 	baselineSaves := store.saveCount.Load()
 	remaining := 2
-	current, matched, errMutate := manager.MutateRuntimeMetadataAndClearModelCooldownIfCurrent(
+	current, matched, errMutate := manager.MutateRuntimeMetadataAndClearModelCooldownsIfCurrent(
 		context.Background(),
 		installed,
-		chatgptwebauth.ImageModel,
+		ChatGPTWebImageModelIDs(installed),
 		"chatgpt_web_image_quota",
 		func(auth *Auth) {
 			auth.Metadata["quota_state"] = string(chatgptwebauth.QuotaStateAvailable)
@@ -2442,6 +2500,82 @@ func TestMutateRuntimeMetadataAndClearModelCooldownPersistsOnce(t *testing.T) {
 	imageState := current.ModelStates[chatgptwebauth.ImageModel]
 	if imageState == nil || imageState.Status == StatusError || imageState.Unavailable || imageState.Quota.Exceeded {
 		t.Fatalf("image state = %+v", imageState)
+	}
+	customState := current.ModelStates[customImageModel]
+	if customState == nil || customState.Status == StatusError || customState.Unavailable || customState.Quota.Exceeded {
+		t.Fatalf("custom image state = %+v", customState)
+	}
+}
+
+func TestFreshImageQuotaOnlyResumesClearedRegistryModels(t *testing.T) {
+	manager := NewManager(nil, &FillFirstSelector{}, nil)
+	now := time.Now().UTC()
+	authID := "quota-partial-registry-" + uuid.NewString()
+	customImageModel := "custom-image-" + uuid.NewString()
+	installed, errRegister := manager.Register(context.Background(), &Auth{
+		ID:       authID,
+		Provider: chatgptwebauth.Provider,
+		Status:   StatusError,
+		Metadata: map[string]any{
+			"quota_state":      string(chatgptwebauth.QuotaStateAvailable),
+			"quota_stale":      false,
+			"quota_updated_at": now.Format(time.RFC3339Nano),
+		},
+		ModelStates: map[string]*ModelState{
+			customImageModel: {
+				Status:         StatusError,
+				Unavailable:    true,
+				UpdatedAt:      now.Add(-2 * time.Minute),
+				NextRetryAfter: now.Add(-time.Minute),
+				Quota: QuotaState{
+					Exceeded:      true,
+					Reason:        "quota",
+					NextRecoverAt: now.Add(-time.Minute),
+				},
+			},
+			chatgptwebauth.ImageModel: {
+				Status:         StatusError,
+				Unavailable:    true,
+				UpdatedAt:      now.Add(-time.Minute),
+				NextRetryAfter: now.Add(time.Hour),
+				Quota: QuotaState{
+					Exceeded: true,
+					Reason:   "unauthorized",
+				},
+			},
+		},
+	})
+	if errRegister != nil {
+		t.Fatalf("Register() error = %v", errRegister)
+	}
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient(authID, chatgptwebauth.Provider, []*registry.ModelInfo{
+		{ID: customImageModel, UpstreamID: chatgptwebauth.ImageModel, Type: registry.OpenAIImageModelType},
+		{ID: chatgptwebauth.ImageModel, UpstreamID: chatgptwebauth.ImageModel, Type: registry.OpenAIImageModelType},
+	})
+	reg.SetModelQuotaExceeded(authID, customImageModel)
+	reg.SuspendClientModel(authID, customImageModel, "quota")
+	reg.SetModelQuotaExceeded(authID, chatgptwebauth.ImageModel)
+	reg.SuspendClientModel(authID, chatgptwebauth.ImageModel, "unauthorized")
+	t.Cleanup(func() {
+		reg.UnregisterClient(authID)
+	})
+
+	current, matched, errMutate := manager.MutateRuntimeMetadataIfCurrent(
+		context.Background(),
+		installed,
+		func(auth *Auth) {
+			auth.Metadata["quota_updated_at"] = now.Add(time.Second).Format(time.RFC3339Nano)
+		},
+	)
+	if errMutate != nil || !matched || current == nil {
+		t.Fatalf("mutation = current %v matched %v err %v", current, matched, errMutate)
+	}
+	if providers := reg.GetModelProviders(customImageModel); len(providers) != 1 || providers[0] != chatgptwebauth.Provider {
+		t.Fatalf("custom image providers = %v, want resumed chatgpt-web", providers)
+	}
+	if providers := reg.GetModelProviders(chatgptwebauth.ImageModel); len(providers) != 0 {
+		t.Fatalf("canonical image providers = %v, want unauthorized suspension preserved", providers)
 	}
 }
 
@@ -2606,6 +2740,7 @@ func TestManagerProjectsSuccessfulImageToolToImageModel(t *testing.T) {
 			now := time.Now().UTC()
 			model := "image-success-text-" + uuid.NewString()
 			authID := "image-success-" + uuid.NewString()
+			customImageModel := "image-success-custom-" + uuid.NewString()
 			retryAt := now.Add(-time.Minute)
 			registerQuotaTestAuthForModels(t, manager, &Auth{
 				ID:       authID,
@@ -2640,8 +2775,32 @@ func TestManagerProjectsSuccessfulImageToolToImageModel(t *testing.T) {
 							StrikeCount:   5,
 						},
 					},
+					customImageModel: {
+						Status:         StatusError,
+						StatusMessage:  "ordinary image rate limit",
+						Unavailable:    true,
+						UpdatedAt:      now.Add(-2 * time.Minute),
+						NextRetryAfter: retryAt,
+						LastError: &Error{
+							Message:    "ordinary image rate limit",
+							HTTPStatus: http.StatusTooManyRequests,
+						},
+						Quota: QuotaState{
+							Exceeded:      true,
+							Reason:        "quota",
+							NextRecoverAt: retryAt,
+							BackoffLevel:  3,
+							StrikeCount:   4,
+						},
+					},
 				},
 			}, model, chatgptwebauth.ImageModel)
+			registry.GetGlobalRegistry().RegisterClient(authID, chatgptwebauth.Provider, []*registry.ModelInfo{
+				{ID: model},
+				{ID: chatgptwebauth.ImageModel, UpstreamID: chatgptwebauth.ImageModel, Type: registry.OpenAIImageModelType},
+				{ID: customImageModel, UpstreamID: chatgptwebauth.ImageModel, Type: registry.OpenAIImageModelType},
+			})
+			manager.RefreshSchedulerEntry(authID)
 
 			request := cliproxyexecutor.Request{Model: model, Payload: imageToolFallbackPayload(model)}
 			if stream {
@@ -2686,6 +2845,10 @@ func TestManagerProjectsSuccessfulImageToolToImageModel(t *testing.T) {
 			imageState := current.ModelStates[chatgptwebauth.ImageModel]
 			if !modelStateIsClean(imageState) {
 				t.Fatalf("image model state = %+v, want clean", imageState)
+			}
+			customImageState := current.ModelStates[customImageModel]
+			if !modelStateIsClean(customImageState) {
+				t.Fatalf("custom image model state = %+v, want clean", customImageState)
 			}
 			textState := current.ModelStates[model]
 			if !modelStateIsClean(textState) {

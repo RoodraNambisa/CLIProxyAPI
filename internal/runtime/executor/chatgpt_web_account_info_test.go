@@ -19,6 +19,7 @@ import (
 	fhttp "github.com/bogdanfinn/fhttp"
 	chatgptwebauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/chatgptweb"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 )
 
@@ -142,8 +143,18 @@ func TestChatGPTWebAccountInfoRefreshPersistsProfileQuotaAndUsesTTL(t *testing.T
 
 	manager := cliproxyauth.NewManager(nil, nil, nil)
 	auth := chatGPTWebTestAuth("account-info")
+	customImageModel := "custom-web-image"
 	auth.ModelStates = map[string]*cliproxyauth.ModelState{
 		chatgptwebauth.ImageModel: {
+			Status:         cliproxyauth.StatusError,
+			Unavailable:    true,
+			NextRetryAfter: time.Now().Add(time.Hour),
+			Quota: cliproxyauth.QuotaState{
+				Exceeded: true,
+				Reason:   "chatgpt_web_image_quota",
+			},
+		},
+		customImageModel: {
 			Status:         cliproxyauth.StatusError,
 			Unavailable:    true,
 			NextRetryAfter: time.Now().Add(time.Hour),
@@ -156,6 +167,14 @@ func TestChatGPTWebAccountInfoRefreshPersistsProfileQuotaAndUsesTTL(t *testing.T
 	if _, errRegister := manager.Register(cliproxyauth.WithSkipPersist(context.Background()), auth); errRegister != nil {
 		t.Fatalf("register auth: %v", errRegister)
 	}
+	registry.GetGlobalRegistry().RegisterClient(auth.ID, auth.Provider, []*registry.ModelInfo{{
+		ID:         customImageModel,
+		UpstreamID: chatgptwebauth.ImageModel,
+		Type:       registry.OpenAIImageModelType,
+	}})
+	t.Cleanup(func() {
+		registry.GetGlobalRegistry().UnregisterClient(auth.ID)
+	})
 	cfg := &config.Config{ChatGPTWeb: config.ChatGPTWebConfig{AccountInfo: config.ChatGPTWebAccountInfoConfig{
 		RefreshWorkers:    accountInfoTestInt(2),
 		RefreshQueueSize:  accountInfoTestInt(4),
@@ -205,6 +224,11 @@ func TestChatGPTWebAccountInfoRefreshPersistsProfileQuotaAndUsesTTL(t *testing.T
 	if imageState == nil || imageState.Status == cliproxyauth.StatusError ||
 		imageState.Unavailable || imageState.Quota.Exceeded {
 		t.Fatalf("available quota did not clear image quota state: %+v", imageState)
+	}
+	customImageState := current.ModelStates[customImageModel]
+	if customImageState == nil || customImageState.Status == cliproxyauth.StatusError ||
+		customImageState.Unavailable || customImageState.Quota.Exceeded {
+		t.Fatalf("available quota did not clear custom image quota state: %+v", customImageState)
 	}
 
 	second, errStart := executor.StartAccountInfoRefreshTask(targets, false)

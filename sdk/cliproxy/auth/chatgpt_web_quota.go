@@ -32,6 +32,11 @@ type chatGPTWebImageCapabilityCandidate struct {
 	capability chatGPTWebImageCapabilityState
 }
 
+type chatGPTWebImageModelStateEntry struct {
+	model string
+	state *ModelState
+}
+
 type chatGPTWebAccountInfoRuntimeStateReader interface {
 	AccountInfoAuthState(string) chatgptwebauth.AccountInfoAuthRuntimeState
 }
@@ -176,14 +181,58 @@ func ChatGPTWebImageCapabilityUnavailable(auth *Auth, now time.Time) (bool, time
 	return chatGPTWebImageCapabilityUnavailable(auth, now)
 }
 
-func chatGPTWebImageModelState(auth *Auth) *ModelState {
-	if auth == nil {
+// ChatGPTWebImageModelIDs returns the registered image capability model IDs
+// followed by the canonical upstream model used by image tool results.
+func ChatGPTWebImageModelIDs(auth *Auth) []string {
+	models := make([]string, 0, 2)
+	seen := make(map[string]struct{}, 2)
+	add := func(model string) {
+		model = strings.TrimSpace(model)
+		key := strings.ToLower(canonicalModelKey(model))
+		if key == "" {
+			return
+		}
+		if _, ok := seen[key]; ok {
+			return
+		}
+		seen[key] = struct{}{}
+		models = append(models, model)
+	}
+	if auth != nil {
+		for _, info := range registry.GetGlobalRegistry().GetModelsForClient(auth.ID) {
+			if info != nil && info.Type == registry.OpenAIImageModelType {
+				add(info.ID)
+			}
+		}
+	}
+	add(chatGPTWebImageModel)
+	return models
+}
+
+func chatGPTWebImageModelStateEntries(auth *Auth) []chatGPTWebImageModelStateEntry {
+	if auth == nil || len(auth.ModelStates) == 0 {
 		return nil
 	}
-	if state := auth.ModelStates[chatGPTWebImageModel]; state != nil {
-		return state
+	targets := ChatGPTWebImageModelIDs(auth)
+	entries := make([]chatGPTWebImageModelStateEntry, 0, len(targets))
+	seen := make(map[string]struct{}, len(targets))
+	for _, target := range targets {
+		targetKey := canonicalModelKey(target)
+		for stateModel, state := range auth.ModelStates {
+			stateKey := canonicalModelKey(stateModel)
+			if state == nil || !strings.EqualFold(stateKey, targetKey) {
+				continue
+			}
+			dedupeKey := strings.ToLower(stateKey)
+			if _, ok := seen[dedupeKey]; ok {
+				break
+			}
+			seen[dedupeKey] = struct{}{}
+			entries = append(entries, chatGPTWebImageModelStateEntry{model: stateModel, state: state})
+			break
+		}
 	}
-	return auth.ModelStates[canonicalModelKey(chatGPTWebImageModel)]
+	return entries
 }
 
 func chatGPTWebImageModelProjection(auth *Auth, model string) bool {
@@ -214,68 +263,54 @@ func chatGPTWebImageCapabilityStateForAuth(auth *Auth, now time.Time) chatGPTWeb
 		confirmedExhausted: exhausted,
 		nextRetryAt:        futureTime(resetAt, now),
 	}
-	modelState := chatGPTWebImageModelState(auth)
-	if modelState == nil {
-		capability.refreshDue = capability.blocked && capability.nextRetryAt.IsZero()
-		return capability
-	}
-
-	reason := strings.ToLower(strings.TrimSpace(modelState.Quota.Reason))
-	quotaOwned := modelState.Quota.Exceeded && reason == "chatgpt_web_image_quota"
-	quotaRetryAt := modelState.Quota.NextRecoverAt
-	if quotaRetryAt.IsZero() {
-		quotaRetryAt = modelState.NextRetryAfter
-	}
-	retryAt := laterTime(modelState.NextRetryAfter, quotaRetryAt)
-	if quotaOwned {
-		capability.blocked = true
-		capability.confirmedExhausted = true
-		capability.nextRetryAt = laterTime(capability.nextRetryAt, futureTime(retryAt, now))
-		capability.refreshDue = capability.nextRetryAt.IsZero()
-		return capability
-	}
-	if exhausted {
-		capability.nextRetryAt = laterTime(capability.nextRetryAt, futureTime(retryAt, now))
-		capability.refreshDue = capability.nextRetryAt.IsZero()
-		return capability
-	}
-
-	if modelState.Status == StatusDisabled {
-		capability.blocked = true
-		capability.modelCooldown = true
-		return capability
-	}
-	if !modelState.Quota.Exceeded || reason != "quota" || retryAt.IsZero() {
-		if !modelState.Unavailable {
-			capability.refreshDue = capability.blocked && capability.nextRetryAt.IsZero()
-			return capability
+	refreshDue := capability.blocked && capability.nextRetryAt.IsZero()
+	for _, entry := range chatGPTWebImageModelStateEntries(auth) {
+		modelState := entry.state
+		reason := strings.ToLower(strings.TrimSpace(modelState.Quota.Reason))
+		quotaRetryAt := modelState.Quota.NextRecoverAt
+		if quotaRetryAt.IsZero() {
+			quotaRetryAt = modelState.NextRetryAfter
 		}
-		if modelState.NextRetryAfter.After(now) {
+		retryAt := laterTime(modelState.NextRetryAfter, quotaRetryAt)
+		if modelState.Quota.Exceeded && reason == "chatgpt_web_image_quota" {
+			capability.blocked = true
+			capability.confirmedExhausted = true
+			capability.nextRetryAt = laterTime(capability.nextRetryAt, futureTime(retryAt, now))
+			if !retryAt.After(now) {
+				refreshDue = true
+			}
+			continue
+		}
+		if exhausted {
+			capability.nextRetryAt = laterTime(capability.nextRetryAt, futureTime(retryAt, now))
+			continue
+		}
+		if modelState.Status == StatusDisabled {
 			capability.blocked = true
 			capability.modelCooldown = true
-			capability.nextRetryAt = modelState.NextRetryAfter
+			continue
 		}
-		return capability
-	}
-	capability.rateLimited = true
-	if quotaRetryAt.After(now) {
-		if retryAt.After(now) {
+		if modelState.Quota.Exceeded && reason == "quota" {
+			capability.rateLimited = true
+			if retryAt.After(now) {
+				capability.blocked = true
+				capability.nextRetryAt = laterTime(capability.nextRetryAt, retryAt)
+				continue
+			}
+			refreshAfter := laterTime(quotaRetryAt, modelState.UpdatedAt)
+			if !chatGPTWebImageQuotaConfirmedAvailableAfter(auth, refreshAfter) {
+				capability.blocked = true
+				refreshDue = true
+			}
+			continue
+		}
+		if modelState.Unavailable && modelState.NextRetryAfter.After(now) {
 			capability.blocked = true
-			capability.nextRetryAt = retryAt
+			capability.modelCooldown = true
+			capability.nextRetryAt = laterTime(capability.nextRetryAt, modelState.NextRetryAfter)
 		}
-		return capability
 	}
-	refreshAfter := laterTime(quotaRetryAt, modelState.UpdatedAt)
-	if chatGPTWebImageQuotaConfirmedAvailableAfter(auth, refreshAfter) {
-		return capability
-	}
-	if retryAt.After(now) {
-		capability.blocked = true
-		capability.nextRetryAt = retryAt
-		return capability
-	}
-	capability.blocked = true
-	capability.refreshDue = true
+	capability.refreshDue = refreshDue && capability.nextRetryAt.IsZero()
 	return capability
 }
 
@@ -317,17 +352,22 @@ func chatGPTWebImageQuotaConfirmedAvailableAfter(auth *Auth, after time.Time) bo
 	return updatedAt.After(after)
 }
 
-func clearChatGPTWebImageRateLimitAfterFreshQuota(auth *Auth, now time.Time) bool {
-	state := chatGPTWebImageModelState(auth)
-	if state == nil || !state.Quota.Exceeded ||
-		!strings.EqualFold(strings.TrimSpace(state.Quota.Reason), "quota") {
-		return false
+func clearChatGPTWebImageRateLimitsAfterFreshQuota(auth *Auth, now time.Time) []string {
+	var cleared []string
+	for _, entry := range chatGPTWebImageModelStateEntries(auth) {
+		state := entry.state
+		if !state.Quota.Exceeded || !strings.EqualFold(strings.TrimSpace(state.Quota.Reason), "quota") {
+			continue
+		}
+		refreshAfter := laterTime(state.Quota.NextRecoverAt, state.UpdatedAt)
+		if !chatGPTWebImageQuotaConfirmedAvailableAfter(auth, refreshAfter) {
+			continue
+		}
+		if clearModelCooldownByReasonOnAuth(auth, canonicalModelKey(entry.model), "quota", now) {
+			cleared = append(cleared, entry.model)
+		}
 	}
-	refreshAfter := laterTime(state.Quota.NextRecoverAt, state.UpdatedAt)
-	if !chatGPTWebImageQuotaConfirmedAvailableAfter(auth, refreshAfter) {
-		return false
-	}
-	return clearModelCooldownByReasonOnAuth(auth, canonicalModelKey(chatGPTWebImageModel), "quota", now)
+	return cleared
 }
 
 func chatGPTWebImageQuotaOwnedModelState(auth *Auth, model string, state *ModelState) bool {

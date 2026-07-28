@@ -1215,7 +1215,7 @@ func providerHasCatalogAvailability(
 		if clientProviders[clientID] != provider {
 			continue
 		}
-		if strings.EqualFold(reason, "quota") {
+		if modelSuspensionIsQuotaOnly(reason) {
 			unavailableClients[clientID] = struct{}{}
 			hasQuotaUnavailable = true
 			continue
@@ -1229,6 +1229,15 @@ func providerHasCatalogAvailability(
 	}
 	return effectiveClients > 0 ||
 		(availableClients > 0 && hasQuotaUnavailable && !hasOtherUnavailable)
+}
+
+func modelSuspensionIsQuotaOnly(reason string) bool {
+	switch strings.ToLower(strings.TrimSpace(reason)) {
+	case "quota", "chatgpt_web_image_quota":
+		return true
+	default:
+		return false
+	}
 }
 
 // GetModelInfo returns ModelInfo, prioritizing provider-specific definition if available.

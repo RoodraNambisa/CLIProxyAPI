@@ -283,6 +283,18 @@ func TestGetModelProvidersKeepsQuotaOnlyProviderVisible(t *testing.T) {
 	}
 }
 
+func TestGetModelProvidersKeepsChatGPTWebImageQuotaProviderVisible(t *testing.T) {
+	r := newTestModelRegistry()
+	r.RegisterClient("web-client", "chatgpt-web", []*ModelInfo{{ID: "shared"}})
+	r.SetModelQuotaExceeded("web-client", "shared")
+	r.SuspendClientModel("web-client", "shared", "chatgpt_web_image_quota")
+
+	providers := r.GetModelProviders("shared")
+	if len(providers) != 1 || providers[0] != "chatgpt-web" {
+		t.Fatalf("providers = %v, want image-quota-cooled chatgpt-web catalog entry", providers)
+	}
+}
+
 func TestGetModelProvidersExcludesProviderWithoutExecutableClients(t *testing.T) {
 	r := newTestModelRegistry()
 	r.RegisterClient("quota-client", "chatgpt-web", []*ModelInfo{{ID: "shared"}})

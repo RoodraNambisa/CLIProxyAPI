@@ -238,8 +238,8 @@ type Result struct {
 
 type executionResult struct {
 	Result
-	authInstanceID         string
-	additionalSuccessModel string
+	authInstanceID          string
+	additionalSuccessModels []string
 }
 
 func resultForAuth(auth *Auth, provider, model string, success bool) executionResult {
@@ -254,10 +254,12 @@ func resultForAuth(auth *Auth, provider, model string, success bool) executionRe
 func successfulExecutionResultForAuth(auth *Auth, provider, model string, opts cliproxyexecutor.Options) executionResult {
 	result := resultForAuth(auth, provider, model, true)
 	state, _ := opts.Metadata[cliproxyexecutor.ImageGenerationResultStateMetadataKey].(*cliproxyexecutor.ImageGenerationResultState)
-	if state != nil && state.Succeeded() &&
-		strings.EqualFold(strings.TrimSpace(provider), chatgptwebauth.Provider) &&
-		canonicalModelKey(model) != chatGPTWebImageModel {
-		result.additionalSuccessModel = chatGPTWebImageModel
+	if state != nil && state.Succeeded() && strings.EqualFold(strings.TrimSpace(provider), chatgptwebauth.Provider) {
+		for _, imageModel := range ChatGPTWebImageModelIDs(auth) {
+			if canonicalModelKey(model) != canonicalModelKey(imageModel) {
+				result.additionalSuccessModels = append(result.additionalSuccessModels, imageModel)
+			}
+		}
 	}
 	return result
 }
@@ -4073,7 +4075,7 @@ func (m *Manager) UpdateRuntimeMetadataIfCurrent(ctx context.Context, expected *
 // replacing the current auth installation or notifying model-sync hooks.
 // mutate must only update Metadata and must not call back into Manager.
 func (m *Manager) MutateRuntimeMetadataIfCurrent(ctx context.Context, expected *Auth, mutate func(*Auth)) (*Auth, bool, error) {
-	return m.mutateRuntimeMetadataIfCurrent(ctx, expected, mutate, "", "")
+	return m.mutateRuntimeMetadataIfCurrent(ctx, expected, mutate, nil, "")
 }
 
 // MutateRuntimeMetadataAndClearModelCooldownIfCurrent atomically persists
@@ -4090,20 +4092,50 @@ func (m *Manager) MutateRuntimeMetadataAndClearModelCooldownIfCurrent(
 	if model == "" || reason == "" {
 		return m.MutateRuntimeMetadataIfCurrent(ctx, expected, mutate)
 	}
-	return m.mutateRuntimeMetadataIfCurrent(ctx, expected, mutate, model, reason)
+	return m.MutateRuntimeMetadataAndClearModelCooldownsIfCurrent(ctx, expected, []string{model}, reason, mutate)
+}
+
+// MutateRuntimeMetadataAndClearModelCooldownsIfCurrent atomically persists
+// metadata changes and clears matching reason-owned model cooldowns.
+func (m *Manager) MutateRuntimeMetadataAndClearModelCooldownsIfCurrent(
+	ctx context.Context,
+	expected *Auth,
+	models []string,
+	reason string,
+	mutate func(*Auth),
+) (*Auth, bool, error) {
+	reason = strings.TrimSpace(reason)
+	normalizedModels := make([]string, 0, len(models))
+	seen := make(map[string]struct{}, len(models))
+	for _, model := range models {
+		model = strings.TrimSpace(model)
+		key := strings.ToLower(canonicalModelKey(model))
+		if key == "" {
+			continue
+		}
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		normalizedModels = append(normalizedModels, model)
+	}
+	if len(normalizedModels) == 0 || reason == "" {
+		return m.MutateRuntimeMetadataIfCurrent(ctx, expected, mutate)
+	}
+	return m.mutateRuntimeMetadataIfCurrent(ctx, expected, mutate, normalizedModels, reason)
 }
 
 func (m *Manager) mutateRuntimeMetadataIfCurrent(
 	ctx context.Context,
 	expected *Auth,
 	mutate func(*Auth),
-	clearModel string,
+	clearModels []string,
 	clearReason string,
 ) (*Auth, bool, error) {
 	if m == nil || expected == nil || strings.TrimSpace(expected.ID) == "" {
 		return nil, false, nil
 	}
-	if mutate == nil && clearModel == "" {
+	if mutate == nil && len(clearModels) == 0 {
 		m.mu.RLock()
 		current := m.auths[expected.ID]
 		if !runtimeMetadataMutationMatchesCurrent(current, expected) {
@@ -4125,7 +4157,10 @@ func (m *Manager) mutateRuntimeMetadataIfCurrent(
 	defer unlockPersist()
 
 	now := time.Now()
-	modelKey := canonicalModelKey(clearModel)
+	modelKeys := make([]string, 0, len(clearModels))
+	for _, model := range clearModels {
+		modelKeys = append(modelKeys, canonicalModelKey(model))
+	}
 
 	m.mu.Lock()
 	current := m.auths[id]
@@ -4134,18 +4169,22 @@ func (m *Manager) mutateRuntimeMetadataIfCurrent(
 		return nil, false, nil
 	}
 	candidate := current.Clone()
-	clearObservationMatches := modelKey == "" || modelStateObservationMatches(current, expected, modelKey)
-	var clearBaseline *ModelState
+	clearObservationMatches := modelStatesObservationMatch(current, expected, modelKeys)
+	clearBaselines := make(map[string]*ModelState, len(modelKeys))
 	if clearObservationMatches {
-		clearBaseline = cloneReasonOwnedModelState(candidate, modelKey, clearReason)
+		for _, modelKey := range modelKeys {
+			if baseline := cloneReasonOwnedModelState(candidate, modelKey, clearReason); baseline != nil {
+				clearBaselines[modelKey] = baseline
+			}
+		}
 	}
 	if mutate != nil {
 		mutate(candidate)
 		if clearObservationMatches {
-			clearChatGPTWebImageRateLimitAfterFreshQuota(candidate, now)
+			clearChatGPTWebImageRateLimitsAfterFreshQuota(candidate, now)
 		}
 	}
-	if clearBaseline != nil {
+	for modelKey := range clearBaselines {
 		clearModelCooldownByReasonOnAuth(candidate, modelKey, clearReason, now)
 	}
 	expectedSourceHash := authSourceHash(current)
@@ -4166,16 +4205,22 @@ func (m *Manager) mutateRuntimeMetadataIfCurrent(
 		return nil, false, nil
 	}
 	installed := current.Clone()
-	clearedFreshImageRateLimit := false
+	var clearedFreshImageRateLimits []string
 	if mutate != nil {
 		mutate(installed)
 		if clearObservationMatches {
-			clearedFreshImageRateLimit = clearChatGPTWebImageRateLimitAfterFreshQuota(installed, now)
+			clearedFreshImageRateLimits = clearChatGPTWebImageRateLimitsAfterFreshQuota(installed, now)
 		}
 	}
-	clearedModelCooldown := false
-	if clearBaseline != nil && reasonOwnedModelStateMatches(installed, modelKey, clearReason, clearBaseline) {
-		clearedModelCooldown = clearModelCooldownByReasonOnAuth(installed, modelKey, clearReason, now)
+	clearedModels := make([]string, 0, len(clearBaselines))
+	for index, modelKey := range modelKeys {
+		clearBaseline := clearBaselines[modelKey]
+		if clearBaseline == nil || !reasonOwnedModelStateMatches(installed, modelKey, clearReason, clearBaseline) {
+			continue
+		}
+		if clearModelCooldownByReasonOnAuth(installed, modelKey, clearReason, now) {
+			clearedModels = append(clearedModels, clearModels[index])
+		}
 	}
 	if persistedHash := authSourceHash(candidate); persistedHash != "" {
 		if installed.Attributes == nil {
@@ -4186,21 +4231,29 @@ func (m *Manager) mutateRuntimeMetadataIfCurrent(
 	m.auths[id] = installed
 	m.mu.Unlock()
 	snapshot := installed.Clone()
-	if clearedModelCooldown || clearedFreshImageRateLimit {
+	if len(clearedModels) > 0 || len(clearedFreshImageRateLimits) > 0 {
 		if m.scheduler != nil {
 			m.scheduler.upsertAuth(snapshot)
 		}
 	}
-	if clearedModelCooldown {
-		registry.GetGlobalRegistry().ClearModelQuotaExceeded(id, clearModel)
-		registry.GetGlobalRegistry().ResumeClientModel(id, clearModel)
+	for _, model := range clearedModels {
+		registry.GetGlobalRegistry().ClearModelQuotaExceeded(id, model)
+		registry.GetGlobalRegistry().ResumeClientModel(id, model)
 	}
-	if clearedFreshImageRateLimit &&
-		(!clearedModelCooldown || canonicalModelKey(clearModel) != canonicalModelKey(chatGPTWebImageModel)) {
-		registry.GetGlobalRegistry().ClearModelQuotaExceeded(id, chatGPTWebImageModel)
-		registry.GetGlobalRegistry().ResumeClientModel(id, chatGPTWebImageModel)
+	for _, model := range clearedFreshImageRateLimits {
+		registry.GetGlobalRegistry().ClearModelQuotaExceeded(id, model)
+		registry.GetGlobalRegistry().ResumeClientModel(id, model)
 	}
 	return snapshot, true, nil
+}
+
+func modelStatesObservationMatch(current, expected *Auth, modelKeys []string) bool {
+	for _, modelKey := range modelKeys {
+		if !modelStateObservationMatches(current, expected, modelKey) {
+			return false
+		}
+	}
+	return true
 }
 
 func modelStateObservationMatches(current, expected *Auth, modelKey string) bool {
@@ -6411,14 +6464,14 @@ func waitForCooldown(ctx context.Context, wait time.Duration) error {
 
 // MarkResult records an execution result and notifies hooks.
 func (m *Manager) MarkResult(ctx context.Context, result Result) {
-	m.markResult(ctx, result, "", "")
+	m.markResult(ctx, result, "", nil)
 }
 
 func (m *Manager) markExecutionResult(ctx context.Context, result executionResult) {
-	m.markResult(ctx, result.Result, result.authInstanceID, result.additionalSuccessModel)
+	m.markResult(ctx, result.Result, result.authInstanceID, result.additionalSuccessModels)
 }
 
-func (m *Manager) markResult(ctx context.Context, result Result, authInstanceID, additionalSuccessModel string) {
+func (m *Manager) markResult(ctx context.Context, result Result, authInstanceID string, additionalSuccessModels []string) {
 	if result.AuthID == "" {
 		return
 	}
@@ -6444,7 +6497,7 @@ func (m *Manager) markResult(ctx context.Context, result Result, authInstanceID,
 	suspendReason := ""
 	clearModelQuota := false
 	setModelQuota := false
-	additionalSuccessModelApplied := ""
+	var additionalSuccessModelsApplied []string
 	var (
 		authSnapshot *Auth
 		persistAuth  *Auth
@@ -6498,18 +6551,22 @@ func (m *Manager) markResult(ctx context.Context, result Result, authInstanceID,
 					clearModelQuota = true
 				}
 			}
-			additionalModel := strings.TrimSpace(additionalSuccessModel)
-			if additionalModel != "" &&
-				canonicalModelKey(additionalModel) != canonicalModelKey(result.Model) &&
-				strings.EqualFold(strings.TrimSpace(auth.Provider), chatgptwebauth.Provider) &&
-				clientRegistrySupportsExecutionModel(result.AuthID, additionalModel) {
-				state := ensureModelState(auth, additionalModel)
-				if !chatGPTWebImageQuotaOwnedModelState(auth, additionalModel, state) {
-					resetModelState(state, now)
-					additionalSuccessModelApplied = additionalModel
+			if strings.EqualFold(strings.TrimSpace(auth.Provider), chatgptwebauth.Provider) {
+				for _, additionalModel := range additionalSuccessModels {
+					additionalModel = strings.TrimSpace(additionalModel)
+					if additionalModel == "" ||
+						canonicalModelKey(additionalModel) == canonicalModelKey(result.Model) ||
+						!clientRegistrySupportsExecutionModel(result.AuthID, additionalModel) {
+						continue
+					}
+					state := ensureModelState(auth, additionalModel)
+					if !chatGPTWebImageQuotaOwnedModelState(auth, additionalModel, state) {
+						resetModelState(state, now)
+						additionalSuccessModelsApplied = append(additionalSuccessModelsApplied, additionalModel)
+					}
 				}
 			}
-			if result.Model != "" || additionalSuccessModelApplied != "" {
+			if result.Model != "" || len(additionalSuccessModelsApplied) > 0 {
 				updateAggregatedAvailability(auth, now)
 				if !hasModelError(auth, now) && !hasActiveAuthWideCooldown(auth, now) {
 					auth.LastError = nil
@@ -6668,7 +6725,7 @@ func (m *Manager) markResult(ctx context.Context, result Result, authInstanceID,
 			suspendReason = ""
 			clearModelQuota = false
 			setModelQuota = false
-			additionalSuccessModelApplied = ""
+			additionalSuccessModelsApplied = nil
 			staleDynamicModelResult = true
 		}
 		if removedDynamicModelWithAuthCooldown {
@@ -6701,9 +6758,9 @@ func (m *Manager) markResult(ctx context.Context, result Result, authInstanceID,
 		} else if shouldSuspendModel {
 			registry.GetGlobalRegistry().SuspendClientModel(result.AuthID, result.Model, suspendReason)
 		}
-		if additionalSuccessModelApplied != "" {
-			registry.GetGlobalRegistry().ClearModelQuotaExceeded(result.AuthID, additionalSuccessModelApplied)
-			registry.GetGlobalRegistry().ResumeClientModel(result.AuthID, additionalSuccessModelApplied)
+		for _, additionalModel := range additionalSuccessModelsApplied {
+			registry.GetGlobalRegistry().ClearModelQuotaExceeded(result.AuthID, additionalModel)
+			registry.GetGlobalRegistry().ResumeClientModel(result.AuthID, additionalModel)
 		}
 	}
 
