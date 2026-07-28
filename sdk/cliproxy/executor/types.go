@@ -39,6 +39,9 @@ const (
 	// ImageGenerationMaxResultsMetadataKey limits provider-side image result
 	// materialization for compatibility image endpoints.
 	ImageGenerationMaxResultsMetadataKey = "image_generation_max_results"
+	// ImageGenerationResultStateMetadataKey carries provider-confirmed image
+	// generation success back to the auth result recorder.
+	ImageGenerationResultStateMetadataKey = "image_generation_result_state"
 	// TrustUpstreamSSEMetadataKey requests direct forwarding of trusted upstream SSE frames.
 	TrustUpstreamSSEMetadataKey = "trust_upstream_sse"
 	// SelectionAttemptMetadataKey stores the outer retry attempt index for auth selection.
@@ -74,6 +77,24 @@ func (s *ImageGenerationStreamPassthroughState) SetEnabled(enabled bool) {
 // Enabled returns the effective image stream passthrough state.
 func (s *ImageGenerationStreamPassthroughState) Enabled() bool {
 	return s != nil && s.enabled.Load()
+}
+
+// ImageGenerationResultState records whether an upstream provider returned a
+// completed image. Merely accepting a request with an image tool is not success.
+type ImageGenerationResultState struct {
+	succeeded atomic.Bool
+}
+
+// MarkSucceeded records provider-confirmed image output.
+func (s *ImageGenerationResultState) MarkSucceeded() {
+	if s != nil {
+		s.succeeded.Store(true)
+	}
+}
+
+// Succeeded reports whether provider-confirmed image output was produced.
+func (s *ImageGenerationResultState) Succeeded() bool {
+	return s != nil && s.succeeded.Load()
 }
 
 // AuthInstanceRetirement reports whether a selected runtime auth instance was retired.

@@ -3704,8 +3704,10 @@ func TestFinishChatGPTWebImageRejectsDoneWithoutTerminalOrConversation(t *testin
 
 func TestFinishChatGPTWebImageDoesNotMaskTerminalFailureWithPartialOutput(t *testing.T) {
 	executor := NewChatGPTWebExecutor(nil, nil)
+	imageResultState := &cliproxyexecutor.ImageGenerationResultState{}
 	prepared := &chatGPTWebPreparedRequest{
-		routeModel: "gpt-image-2",
+		routeModel:       "gpt-image-2",
+		imageResultState: imageResultState,
 		request: helps.ChatGPTWebRequest{
 			Image: &helps.ChatGPTWebImageRequest{Prompt: "draw"},
 		},
@@ -3722,6 +3724,9 @@ func TestFinishChatGPTWebImageDoesNotMaskTerminalFailureWithPartialOutput(t *tes
 	_, err := executor.finishChatGPTWebImage(context.Background(), nil, nil, prepared, execution)
 	if err == nil || !strings.Contains(err.Error(), "finished_with_error") {
 		t.Fatalf("finishChatGPTWebImage() error = %v", err)
+	}
+	if imageResultState.Succeeded() {
+		t.Fatal("failed image output recorded provider-confirmed success")
 	}
 }
 
@@ -3823,9 +3828,11 @@ func TestFinishChatGPTWebImageDownloadsSedimentWithoutTaskTerminal(t *testing.T)
 		t.Fatal(err)
 	}
 	defer client.CloseIdleConnections()
+	imageResultState := &cliproxyexecutor.ImageGenerationResultState{}
 	prepared := &chatGPTWebPreparedRequest{
-		routeModel:      "gpt-image-2",
-		maxImageResults: 1,
+		routeModel:       "gpt-image-2",
+		maxImageResults:  1,
+		imageResultState: imageResultState,
 		request: helps.ChatGPTWebRequest{
 			Image: &helps.ChatGPTWebImageRequest{Prompt: "draw"},
 		},
@@ -3845,6 +3852,9 @@ func TestFinishChatGPTWebImageDownloadsSedimentWithoutTaskTerminal(t *testing.T)
 	}
 	if got := gjson.GetBytes(payload, "response.output.0.result").String(); got != base64.StdEncoding.EncodeToString(imageData) {
 		t.Fatal("finishChatGPTWebImage() did not return the sediment image")
+	}
+	if !imageResultState.Succeeded() {
+		t.Fatal("successful image output did not record provider-confirmed success")
 	}
 	if got := conversationPolls.Load(); got != 1 {
 		t.Fatalf("conversation polls = %d, want 1 confirming snapshot after streamed sediment", got)
@@ -5531,9 +5541,20 @@ func TestPollChatGPTWebImageConversationTreatsDuplicateConversationReferenceAsNo
 
 func TestPollChatGPTWebImageConversationRetriesAtTaskFallbackDeadline(t *testing.T) {
 	var conversationPolls atomic.Int32
+	var taskPolls atomic.Int32
+	thirdConversationServed := make(chan struct{})
+	var thirdConversationOnce sync.Once
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
 		switch request.URL.Path {
 		case "/backend-api/tasks":
+			if taskPolls.Add(1) >= 3 {
+				select {
+				case <-thirdConversationServed:
+					time.Sleep(25 * time.Millisecond)
+				case <-request.Context().Done():
+					return
+				}
+			}
 			_ = json.NewEncoder(w).Encode(map[string]any{"tasks": []any{map[string]any{
 				"conversation_id": "fallback-final-refresh",
 				"status":          "completed",
@@ -5548,6 +5569,9 @@ func TestPollChatGPTWebImageConversationRetriesAtTaskFallbackDeadline(t *testing
 			poll := conversationPolls.Add(1)
 			if poll < 4 {
 				writeChatGPTWebImageConversation(w, "first")
+				if poll == 3 {
+					thirdConversationOnce.Do(func() { close(thirdConversationServed) })
+				}
 				return
 			}
 			if poll == 4 {

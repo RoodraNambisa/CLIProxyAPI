@@ -84,7 +84,9 @@ func applyAuthCooldownStatus(entry map[string]any, status authCooldownStatus) {
 		return
 	}
 	entry["cooldown_scope"] = status.Scope
-	entry["cooldown_until"] = status.Until
+	if !status.Until.IsZero() {
+		entry["cooldown_until"] = status.Until
+	}
 }
 
 func applyModelCooldownStatus(entry map[string]any, status authCooldownStatus) {
@@ -93,5 +95,7 @@ func applyModelCooldownStatus(entry map[string]any, status authCooldownStatus) {
 		return
 	}
 	entry["scope"] = status.Scope
-	entry["until"] = status.Until
+	if !status.Until.IsZero() {
+		entry["until"] = status.Until
+	}
 }

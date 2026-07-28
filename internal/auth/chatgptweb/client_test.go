@@ -6,9 +6,69 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"sync/atomic"
 	"testing"
+	"time"
 )
+
+func TestAcquisitionClientClosesActiveConnections(t *testing.T) {
+	started := make(chan struct{}, 1)
+	canceled := make(chan struct{}, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, request *http.Request) {
+		started <- struct{}{}
+		<-request.Context().Done()
+		canceled <- struct{}{}
+	}))
+	defer server.Close()
+
+	client, errClient := NewAcquisitionClient(DefaultPersona(), "", nil, time.Second)
+	if errClient != nil {
+		t.Fatalf("NewAcquisitionClient() error = %v", errClient)
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, _, errRequest := client.DoFollow(context.Background(), http.MethodGet, server.URL, nil, nil)
+		done <- errRequest
+	}()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("acquisition request did not start")
+	}
+	client.acquisitionTracker.mu.Lock()
+	activeConnections := len(client.acquisitionTracker.connections)
+	client.acquisitionTracker.mu.Unlock()
+	if activeConnections != 1 {
+		t.Fatalf("tracked acquisition connections = %d, want 1", activeConnections)
+	}
+	client.CloseActiveAcquisitionConnections()
+	select {
+	case <-canceled:
+	case <-time.After(time.Second):
+		t.Fatal("active acquisition connection remained open")
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("acquisition request did not return after closing its connection")
+	}
+}
+
+func TestAcquisitionClientAcceptsConfiguredProxyDialer(t *testing.T) {
+	for _, proxyURL := range []string{
+		"http://user:pass@127.0.0.1:18080",
+		"socks5h://user:pass@127.0.0.1:1080",
+	} {
+		t.Run(proxyURL, func(t *testing.T) {
+			client, errClient := NewAcquisitionClient(DefaultPersona(), proxyURL, nil, time.Second)
+			if errClient != nil {
+				t.Fatalf("NewAcquisitionClient() error = %v", errClient)
+			}
+			client.CloseIdleConnections()
+		})
+	}
+}
 
 func TestCookieRoundTripAcrossClients(t *testing.T) {
 	t.Parallel()
@@ -117,6 +177,61 @@ func TestDoJSONStreamDoesNotFollowRedirects(t *testing.T) {
 	}
 	if calls := targetCalls.Load(); calls != 0 {
 		t.Fatalf("redirect target calls = %d, want 0", calls)
+	}
+}
+
+func TestSameChatGPTWebOriginNormalizesDefaultPorts(t *testing.T) {
+	tests := []struct {
+		name  string
+		left  string
+		right string
+		want  bool
+	}{
+		{
+			name:  "https default port",
+			left:  "https://chatgpt.com/backend-api/accounts/check",
+			right: "https://CHATGPT.com:443/backend-api/accounts/check",
+			want:  true,
+		},
+		{
+			name:  "http default port",
+			left:  "http://chatgpt.com/start",
+			right: "http://chatgpt.com:080/done",
+			want:  true,
+		},
+		{
+			name:  "non-default port",
+			left:  "https://chatgpt.com/start",
+			right: "https://chatgpt.com:8443/done",
+			want:  false,
+		},
+		{
+			name:  "different scheme",
+			left:  "https://chatgpt.com/start",
+			right: "http://chatgpt.com:443/done",
+			want:  false,
+		},
+		{
+			name:  "different host",
+			left:  "https://chatgpt.com/start",
+			right: "https://example.com:443/done",
+			want:  false,
+		},
+	}
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			left, errLeft := url.Parse(testCase.left)
+			if errLeft != nil {
+				t.Fatalf("parse left URL: %v", errLeft)
+			}
+			right, errRight := url.Parse(testCase.right)
+			if errRight != nil {
+				t.Fatalf("parse right URL: %v", errRight)
+			}
+			if got := sameChatGPTWebOrigin(left, right); got != testCase.want {
+				t.Fatalf("sameChatGPTWebOrigin(%q, %q) = %v, want %v", testCase.left, testCase.right, got, testCase.want)
+			}
+		})
 	}
 }
 

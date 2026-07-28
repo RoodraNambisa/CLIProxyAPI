@@ -49,6 +49,16 @@ const (
 	DefaultChatGPTWebUsageCacheThresholdMB    = 1
 	DefaultChatGPTWebUsageCacheMaxDiskSizeMB  = 1024
 	DefaultChatGPTWebAutoOutputQuality        = "medium"
+	DefaultChatGPTWebAccountInfoWorkers       = 4
+	DefaultChatGPTWebAccountInfoQueueSize     = 256
+	DefaultChatGPTWebAccountInfoTTLMinutes    = 15
+	DefaultChatGPTWebAccountInfoJitterSeconds = 30
+	DefaultChatGPTWebAccountInfoMaxRetries    = 3
+	MaxChatGPTWebAccountInfoWorkers           = 32
+	MaxChatGPTWebAccountInfoQueueSize         = 10000
+	MaxChatGPTWebAccountInfoTTLMinutes        = 1440
+	MaxChatGPTWebAccountInfoJitterSeconds     = 300
+	MaxChatGPTWebAccountInfoRetries           = 10
 )
 
 var (
@@ -427,9 +437,10 @@ type ChatGPTWebConfig struct {
 	AutoRelogin bool `yaml:"auto-relogin" json:"auto-relogin"`
 	// EstimateTokenUsage controls local tiktoken usage estimation for Web responses.
 	// An omitted value remains enabled for backward compatibility.
-	EstimateTokenUsage *bool                      `yaml:"estimate-token-usage,omitempty" json:"estimate-token-usage,omitempty"`
-	UsageCache         ChatGPTWebUsageCacheConfig `yaml:"usage-cache,omitempty" json:"usage-cache,omitempty"`
-	ImageUsage         ChatGPTWebImageUsageConfig `yaml:"image-usage,omitempty" json:"image-usage,omitempty"`
+	EstimateTokenUsage *bool                       `yaml:"estimate-token-usage,omitempty" json:"estimate-token-usage,omitempty"`
+	UsageCache         ChatGPTWebUsageCacheConfig  `yaml:"usage-cache,omitempty" json:"usage-cache,omitempty"`
+	ImageUsage         ChatGPTWebImageUsageConfig  `yaml:"image-usage,omitempty" json:"image-usage,omitempty"`
+	AccountInfo        ChatGPTWebAccountInfoConfig `yaml:"account-info,omitempty" json:"account-info,omitempty"`
 
 	Sentinel ChatGPTWebSentinelConfig `yaml:"sentinel" json:"sentinel"`
 }
@@ -521,7 +532,107 @@ func (cfg ChatGPTWebConfig) Validate() error {
 	if err := cfg.ImageUsage.Validate(); err != nil {
 		return err
 	}
+	if err := cfg.AccountInfo.Validate(); err != nil {
+		return err
+	}
 	return cfg.Sentinel.Validate()
+}
+
+// ChatGPTWebAccountInfoConfig controls bounded account profile and image quota refreshes.
+type ChatGPTWebAccountInfoConfig struct {
+	RefreshWorkers        *int `yaml:"refresh-workers,omitempty" json:"refresh-workers,omitempty"`
+	RefreshQueueSize      *int `yaml:"refresh-queue-size,omitempty" json:"refresh-queue-size,omitempty"`
+	RefreshTTLMinutes     *int `yaml:"refresh-ttl-minutes,omitempty" json:"refresh-ttl-minutes,omitempty"`
+	RecoveryJitterSeconds *int `yaml:"recovery-jitter-seconds,omitempty" json:"recovery-jitter-seconds,omitempty"`
+	MaxRetries            *int `yaml:"max-retries,omitempty" json:"max-retries,omitempty"`
+}
+
+// UnmarshalYAML rejects unknown and null account-info settings.
+func (cfg *ChatGPTWebAccountInfoConfig) UnmarshalYAML(node *yaml.Node) error {
+	if cfg == nil || node == nil {
+		return fmt.Errorf("chatgpt-web.account-info must be an object")
+	}
+	if node.Kind != yaml.MappingNode && node.Kind != yaml.AliasNode {
+		return fmt.Errorf("chatgpt-web.account-info must be an object")
+	}
+	var effective map[string]any
+	if err := node.Decode(&effective); err != nil {
+		return fmt.Errorf("chatgpt-web.account-info: %w", err)
+	}
+	for name, value := range effective {
+		switch name {
+		case "refresh-workers", "refresh-queue-size", "refresh-ttl-minutes", "recovery-jitter-seconds", "max-retries":
+			if value == nil {
+				return fmt.Errorf("chatgpt-web.account-info.%s must not be null", name)
+			}
+		default:
+			return fmt.Errorf("chatgpt-web.account-info.%s is not supported", name)
+		}
+	}
+	type plainChatGPTWebAccountInfoConfig ChatGPTWebAccountInfoConfig
+	var decoded plainChatGPTWebAccountInfoConfig
+	if err := node.Decode(&decoded); err != nil {
+		return fmt.Errorf("chatgpt-web.account-info: %w", err)
+	}
+	*cfg = ChatGPTWebAccountInfoConfig(decoded)
+	return nil
+}
+
+// ResolvedChatGPTWebAccountInfoConfig contains effective refresh-pool values.
+type ResolvedChatGPTWebAccountInfoConfig struct {
+	RefreshWorkers        int `json:"refresh-workers"`
+	RefreshQueueSize      int `json:"refresh-queue-size"`
+	RefreshTTLMinutes     int `json:"refresh-ttl-minutes"`
+	RecoveryJitterSeconds int `json:"recovery-jitter-seconds"`
+	MaxRetries            int `json:"max-retries"`
+}
+
+// Resolved returns effective account profile and quota refresh settings.
+func (cfg ChatGPTWebAccountInfoConfig) Resolved() ResolvedChatGPTWebAccountInfoConfig {
+	resolved := ResolvedChatGPTWebAccountInfoConfig{
+		RefreshWorkers:        DefaultChatGPTWebAccountInfoWorkers,
+		RefreshQueueSize:      DefaultChatGPTWebAccountInfoQueueSize,
+		RefreshTTLMinutes:     DefaultChatGPTWebAccountInfoTTLMinutes,
+		RecoveryJitterSeconds: DefaultChatGPTWebAccountInfoJitterSeconds,
+		MaxRetries:            DefaultChatGPTWebAccountInfoMaxRetries,
+	}
+	if cfg.RefreshWorkers != nil {
+		resolved.RefreshWorkers = *cfg.RefreshWorkers
+	}
+	if cfg.RefreshQueueSize != nil {
+		resolved.RefreshQueueSize = *cfg.RefreshQueueSize
+	}
+	if cfg.RefreshTTLMinutes != nil {
+		resolved.RefreshTTLMinutes = *cfg.RefreshTTLMinutes
+	}
+	if cfg.RecoveryJitterSeconds != nil {
+		resolved.RecoveryJitterSeconds = *cfg.RecoveryJitterSeconds
+	}
+	if cfg.MaxRetries != nil {
+		resolved.MaxRetries = *cfg.MaxRetries
+	}
+	return resolved
+}
+
+// Validate rejects account-info pool values outside their documented bounds.
+func (cfg ChatGPTWebAccountInfoConfig) Validate() error {
+	resolved := cfg.Resolved()
+	if resolved.RefreshWorkers < 1 || resolved.RefreshWorkers > MaxChatGPTWebAccountInfoWorkers {
+		return fmt.Errorf("chatgpt-web.account-info.refresh-workers must be between 1 and %d", MaxChatGPTWebAccountInfoWorkers)
+	}
+	if resolved.RefreshQueueSize < 0 || resolved.RefreshQueueSize > MaxChatGPTWebAccountInfoQueueSize {
+		return fmt.Errorf("chatgpt-web.account-info.refresh-queue-size must be between 0 and %d", MaxChatGPTWebAccountInfoQueueSize)
+	}
+	if resolved.RefreshTTLMinutes < 1 || resolved.RefreshTTLMinutes > MaxChatGPTWebAccountInfoTTLMinutes {
+		return fmt.Errorf("chatgpt-web.account-info.refresh-ttl-minutes must be between 1 and %d", MaxChatGPTWebAccountInfoTTLMinutes)
+	}
+	if resolved.RecoveryJitterSeconds < 0 || resolved.RecoveryJitterSeconds > MaxChatGPTWebAccountInfoJitterSeconds {
+		return fmt.Errorf("chatgpt-web.account-info.recovery-jitter-seconds must be between 0 and %d", MaxChatGPTWebAccountInfoJitterSeconds)
+	}
+	if resolved.MaxRetries < 0 || resolved.MaxRetries > MaxChatGPTWebAccountInfoRetries {
+		return fmt.Errorf("chatgpt-web.account-info.max-retries must be between 0 and %d", MaxChatGPTWebAccountInfoRetries)
+	}
+	return nil
 }
 
 // ChatGPTWebSentinelConfig preserves whether values were explicitly configured.
@@ -1212,6 +1323,9 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	cfg.Images.UnsupportedStatusCode = http.StatusBadRequest
 	if err = yaml.Unmarshal(data, &cfg); err != nil {
 		if optional {
+			if accountInfoErr := validateChatGPTWebAccountInfoYAML(data); accountInfoErr != nil {
+				return nil, fmt.Errorf("failed to parse config file: %w", accountInfoErr)
+			}
 			if sentinelErr := validateChatGPTWebSentinelYAML(data); sentinelErr != nil {
 				return nil, fmt.Errorf("failed to parse config file: %w", sentinelErr)
 			}
@@ -1410,6 +1524,33 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 
 	// Return the populated configuration struct.
 	return &cfg, nil
+}
+
+func validateChatGPTWebAccountInfoYAML(data []byte) error {
+	var document yaml.Node
+	if err := yaml.Unmarshal(data, &document); err != nil {
+		return nil
+	}
+	var envelope struct {
+		ChatGPTWeb yaml.Node `yaml:"chatgpt-web"`
+	}
+	if err := document.Decode(&envelope); err != nil {
+		return nil
+	}
+	if envelope.ChatGPTWeb.Kind != yaml.MappingNode && envelope.ChatGPTWeb.Kind != yaml.AliasNode {
+		return nil
+	}
+	var section struct {
+		AccountInfo yaml.Node `yaml:"account-info"`
+	}
+	if err := envelope.ChatGPTWeb.Decode(&section); err != nil || section.AccountInfo.Kind == 0 {
+		return nil
+	}
+	var accountInfo ChatGPTWebAccountInfoConfig
+	if err := section.AccountInfo.Decode(&accountInfo); err != nil {
+		return err
+	}
+	return accountInfo.Validate()
 }
 
 func validateChatGPTWebSentinelYAML(data []byte) error {
@@ -3003,7 +3144,7 @@ func preservesExplicitChatGPTWebValue(fullPath string, node *yaml.Node) bool {
 	}
 	switch fullPath {
 	case "chatgpt-web":
-		for _, key := range []string{"estimate-token-usage", "usage-cache", "image-usage", "sentinel"} {
+		for _, key := range []string{"estimate-token-usage", "usage-cache", "image-usage", "account-info", "sentinel"} {
 			if index := findMapKeyIndex(node, key); index >= 0 && index+1 < len(node.Content) &&
 				preservesExplicitChatGPTWebValue("chatgpt-web."+key, node.Content[index+1]) {
 				return true
@@ -3015,6 +3156,14 @@ func preservesExplicitChatGPTWebValue(fullPath string, node *yaml.Node) bool {
 	case "chatgpt-web.usage-cache.enabled",
 		"chatgpt-web.usage-cache.disk-threshold-mb",
 		"chatgpt-web.usage-cache.max-disk-size-mb":
+		return true
+	case "chatgpt-web.account-info":
+		return node.Kind == yaml.MappingNode && len(node.Content) > 0
+	case "chatgpt-web.account-info.refresh-workers",
+		"chatgpt-web.account-info.refresh-queue-size",
+		"chatgpt-web.account-info.refresh-ttl-minutes",
+		"chatgpt-web.account-info.recovery-jitter-seconds",
+		"chatgpt-web.account-info.max-retries":
 		return true
 	case "chatgpt-web.sentinel":
 		return node.Kind == yaml.MappingNode && len(node.Content) > 0

@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -34,6 +35,27 @@ type shutdownDeadlineExecutor struct {
 	closeRelease chan struct{}
 	closeOnce    sync.Once
 	closeErr     error
+}
+
+type accountInfoTriggerTestExecutor struct {
+	shutdownOrderingChatGPTWebExecutor
+	mu     sync.Mutex
+	authID string
+	calls  int
+}
+
+func (executor *accountInfoTriggerTestExecutor) TriggerAutomaticAccountInfoRefresh(authID string) bool {
+	executor.mu.Lock()
+	defer executor.mu.Unlock()
+	executor.authID = authID
+	executor.calls++
+	return true
+}
+
+func (executor *accountInfoTriggerTestExecutor) snapshot() (string, int) {
+	executor.mu.Lock()
+	defer executor.mu.Unlock()
+	return executor.authID, executor.calls
 }
 
 func (*shutdownOrderingChatGPTWebExecutor) Identifier() string { return chatgptwebauth.Provider }
@@ -135,6 +157,173 @@ func TestServiceBindsChatGPTWebExecutorWithBuiltinModels(t *testing.T) {
 	}
 }
 
+func TestServiceTriggersChatGPTWebAccountInfoRefreshForImage429(t *testing.T) {
+	manager := coreauth.NewManager(nil, nil, nil)
+	trigger := &accountInfoTriggerTestExecutor{}
+	manager.RegisterExecutor(trigger)
+	service := &Service{coreManager: manager}
+
+	service.triggerChatGPTWebAccountInfoRefresh(coreauth.Result{
+		AuthID:   "web-auth",
+		Provider: chatgptwebauth.Provider,
+		Model:    chatgptwebauth.ImageModel,
+		Error:    &coreauth.Error{HTTPStatus: http.StatusTooManyRequests, Message: "quota"},
+	})
+	authID, calls := trigger.snapshot()
+	if authID != "web-auth" || calls != 1 {
+		t.Fatalf("trigger = auth %q calls %d", authID, calls)
+	}
+
+	service.triggerChatGPTWebAccountInfoRefresh(coreauth.Result{
+		AuthID:   "web-auth",
+		Provider: chatgptwebauth.Provider,
+		Model:    "gpt-5.6",
+		Error:    &coreauth.Error{HTTPStatus: http.StatusTooManyRequests},
+	})
+	service.triggerChatGPTWebAccountInfoRefresh(coreauth.Result{
+		AuthID:   "web-auth",
+		Provider: chatgptwebauth.Provider,
+		Model:    chatgptwebauth.ImageModel,
+		Error:    &coreauth.Error{HTTPStatus: http.StatusBadGateway},
+	})
+	_, calls = trigger.snapshot()
+	if calls != 1 {
+		t.Fatalf("non-image/non-429 results triggered refresh: calls = %d", calls)
+	}
+}
+
+func TestAuthMaintenanceIgnoresChatGPTWebImage429(t *testing.T) {
+	authDir := t.TempDir()
+	manager := coreauth.NewManager(nil, nil, nil)
+	auth := &coreauth.Auth{
+		ID:       "chatgpt-web-image-maintenance",
+		Provider: chatgptwebauth.Provider,
+		Status:   coreauth.StatusError,
+		FileName: filepath.Join(authDir, "chatgpt-web-image-maintenance.json"),
+		Attributes: map[string]string{
+			"path": filepath.Join(authDir, "chatgpt-web-image-maintenance.json"),
+		},
+		Metadata: map[string]any{"type": chatgptwebauth.Provider},
+		LastError: &coreauth.Error{
+			Code:       "chatgpt_web_image_quota",
+			Message:    "image quota exhausted",
+			HTTPStatus: http.StatusTooManyRequests,
+		},
+	}
+	if _, errRegister := manager.Register(coreauth.WithSkipPersist(context.Background()), auth); errRegister != nil {
+		t.Fatalf("Register() error = %v", errRegister)
+	}
+	current, _ := manager.GetByID(auth.ID)
+	imageResult := coreauth.Result{
+		AuthID:   auth.ID,
+		Provider: chatgptwebauth.Provider,
+		Model:    chatgptwebauth.ImageModel,
+		Error: &coreauth.Error{
+			Code:       "chatgpt_web_image_quota",
+			Message:    "image quota exhausted",
+			HTTPStatus: http.StatusTooManyRequests,
+		},
+	}
+	deleteConfig := config.AuthMaintenanceConfig{
+		Enable:            true,
+		DeleteStatusCodes: []int{http.StatusTooManyRequests},
+	}
+	disableConfig := config.AuthMaintenanceConfig{
+		Enable:             true,
+		DisableStatusCodes: []int{http.StatusTooManyRequests},
+	}
+	if reason, eligible := authEligibleForMaintenanceDelete(current, &imageResult, deleteConfig); eligible {
+		t.Fatalf("image result delete eligibility = %q", reason)
+	}
+	if reason, eligible := authEligibleForMaintenanceDisable(current, &imageResult, disableConfig); eligible {
+		t.Fatalf("image result disable eligibility = %q", reason)
+	}
+
+	now := time.Now().UTC()
+	genericImageAuth := &coreauth.Auth{
+		ID:        "chatgpt-web-generic-image-maintenance",
+		Provider:  chatgptwebauth.Provider,
+		Status:    coreauth.StatusError,
+		UpdatedAt: now.Add(time.Minute),
+		FileName:  filepath.Join(authDir, "chatgpt-web-generic-image-maintenance.json"),
+		Attributes: map[string]string{
+			"path": filepath.Join(authDir, "chatgpt-web-generic-image-maintenance.json"),
+		},
+		Metadata: map[string]any{"type": chatgptwebauth.Provider},
+		LastError: &coreauth.Error{
+			Message:    "ordinary image rate limit",
+			HTTPStatus: http.StatusTooManyRequests,
+		},
+		ModelStates: map[string]*coreauth.ModelState{
+			chatgptwebauth.ImageModel: {
+				Status:    coreauth.StatusError,
+				UpdatedAt: now,
+				LastError: &coreauth.Error{
+					Message:    "ordinary image rate limit",
+					HTTPStatus: http.StatusTooManyRequests,
+				},
+			},
+		},
+	}
+	if _, errRegister := manager.Register(coreauth.WithSkipPersist(context.Background()), genericImageAuth); errRegister != nil {
+		t.Fatalf("register generic image auth: %v", errRegister)
+	}
+
+	service := &Service{coreManager: manager}
+	if candidates := service.scanAuthMaintenanceCandidates(deleteConfig, authDir); len(candidates) != 0 {
+		t.Fatalf("periodic image delete candidates = %d", len(candidates))
+	}
+	if candidates := service.scanAuthMaintenanceDisableCandidates(disableConfig, authDir); len(candidates) != 0 {
+		t.Fatalf("periodic image disable candidates = %d", len(candidates))
+	}
+	textLimitedAuth := genericImageAuth.Clone()
+	textLimitedAuth.LastError = &coreauth.Error{
+		Message:    "text rate limit",
+		HTTPStatus: http.StatusTooManyRequests,
+	}
+	if statusCode := authMaintenanceStatusCode(textLimitedAuth, nil); statusCode != http.StatusTooManyRequests {
+		t.Fatalf("text limit maintenance status = %d, want 429", statusCode)
+	}
+	sameErrorTextAuth := genericImageAuth.Clone()
+	sameErrorTextAuth.ModelStates["gpt-5.6"] = &coreauth.ModelState{
+		Status:    coreauth.StatusError,
+		UpdatedAt: now.Add(2 * time.Minute),
+		LastError: &coreauth.Error{
+			Message:    "ordinary image rate limit",
+			HTTPStatus: http.StatusTooManyRequests,
+		},
+	}
+	if statusCode := authMaintenanceStatusCode(sameErrorTextAuth, nil); statusCode != http.StatusTooManyRequests {
+		t.Fatalf("same-message text limit maintenance status = %d, want 429", statusCode)
+	}
+	sameErrorImageAuth := sameErrorTextAuth.Clone()
+	sameErrorImageAuth.ModelStates[chatgptwebauth.ImageModel].UpdatedAt = now.Add(3 * time.Minute)
+	if statusCode := authMaintenanceStatusCode(sameErrorImageAuth, nil); statusCode != 0 {
+		t.Fatalf("newer same-message image limit maintenance status = %d, want ignored", statusCode)
+	}
+	explicitQuotaTextAuth := sameErrorTextAuth.Clone()
+	explicitQuotaTextAuth.LastError.Code = "chatgpt_web_image_quota"
+	explicitQuotaTextAuth.ModelStates[chatgptwebauth.ImageModel].LastError.Code = "chatgpt_web_image_quota"
+	explicitQuotaTextAuth.ModelStates["gpt-5.6"].LastError.Code = "chatgpt_web_image_quota"
+	if statusCode := authMaintenanceStatusCode(explicitQuotaTextAuth, nil); statusCode != http.StatusTooManyRequests {
+		t.Fatalf("newer same-code text limit maintenance status = %d, want 429", statusCode)
+	}
+
+	textResult := imageResult
+	textResult.Model = "gpt-5.6"
+	textResult.Error = &coreauth.Error{
+		Code:       "rate_limit_exceeded",
+		Message:    "text rate limit",
+		HTTPStatus: http.StatusTooManyRequests,
+	}
+	if reason, eligible := authEligibleForMaintenanceDelete(current, &textResult, deleteConfig); !eligible || reason != "http_429" {
+		t.Fatalf("text result delete eligibility = %q eligible=%v", reason, eligible)
+	}
+	if reason, eligible := authEligibleForMaintenanceDisable(current, &textResult, disableConfig); !eligible || reason != "http_429" {
+		t.Fatalf("text result disable eligibility = %q eligible=%v", reason, eligible)
+	}
+}
+
 func TestServiceBindsChatGPTWebExecutorBeforeFirstCredential(t *testing.T) {
 	service := &Service{
 		cfg:         &config.Config{},
@@ -149,6 +338,54 @@ func TestServiceBindsChatGPTWebExecutorBeforeFirstCredential(t *testing.T) {
 	}
 	if _, ok = registered.(*executor.ChatGPTWebExecutor); !ok {
 		t.Fatalf("chatgpt web executor type = %T, want *executor.ChatGPTWebExecutor", registered)
+	}
+}
+
+func TestServiceSchedulesRecoveryForChatGPTWebAuthRegisteredAfterExecutor(t *testing.T) {
+	jitterSeconds := 0
+	cfg := &config.Config{}
+	cfg.ChatGPTWeb.AccountInfo.RecoveryJitterSeconds = &jitterSeconds
+	manager := coreauth.NewManager(nil, nil, nil)
+	service := &Service{
+		cfg:         cfg,
+		coreManager: manager,
+	}
+	service.ensureChatGPTWebExecutor(false)
+	registeredExecutor, ok := manager.Executor(chatgptwebauth.Provider)
+	if !ok {
+		t.Fatal("ChatGPT Web executor was not registered")
+	}
+	chatGPTWebExecutor, ok := registeredExecutor.(*executor.ChatGPTWebExecutor)
+	if !ok {
+		t.Fatalf("executor type = %T", registeredExecutor)
+	}
+	t.Cleanup(func() {
+		if errClose := chatGPTWebExecutor.Close(); errClose != nil {
+			t.Errorf("Close() error = %v", errClose)
+		}
+	})
+
+	resetAt := time.Now().UTC().Add(time.Hour).Truncate(time.Second)
+	installed, errRegister := manager.Register(coreauth.WithSkipPersist(context.Background()), &coreauth.Auth{
+		ID:       "chatgpt-web-late-recovery",
+		Provider: chatgptwebauth.Provider,
+		Status:   coreauth.StatusActive,
+		Metadata: map[string]any{
+			"type":                  chatgptwebauth.Provider,
+			"access_token":          "token",
+			"lifecycle_state":       coreauth.LifecycleStateActive,
+			"quota_state":           string(chatgptwebauth.QuotaStateExhausted),
+			"image_quota_remaining": 0,
+			"image_quota_reset_at":  resetAt.Format(time.RFC3339Nano),
+		},
+	})
+	if errRegister != nil {
+		t.Fatalf("Register() error = %v", errRegister)
+	}
+	authMaintenanceHook{service: service}.OnAuthRegistered(context.Background(), installed)
+	state := chatGPTWebExecutor.AccountInfoAuthState(installed.ID)
+	if !state.NextRefreshAt.Equal(resetAt) {
+		t.Fatalf("recovery schedule = %v, want %v", state.NextRefreshAt, resetAt)
 	}
 }
 

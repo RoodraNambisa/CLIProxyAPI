@@ -20,30 +20,57 @@ import (
 )
 
 type Client struct {
-	follow     tls_client.HttpClient
-	noRedirect tls_client.HttpClient
-	jar        tls_client.CookieJar
-	persona    Persona
-	proxyURL   string
+	follow             tls_client.HttpClient
+	noRedirect         tls_client.HttpClient
+	jar                tls_client.CookieJar
+	persona            Persona
+	proxyURL           string
+	acquisitionTracker *acquisitionConnectionTracker
 }
 
 func NewClient(persona Persona, proxyURL string, cookies []Cookie) (*Client, error) {
+	return newClient(persona, proxyURL, cookies, 0)
+}
+
+func NewAcquisitionClient(persona Persona, proxyURL string, cookies []Cookie, timeout time.Duration) (*Client, error) {
+	if timeout <= 0 {
+		timeout = DefaultAcquisitionTimeout
+	}
+	return newClient(persona, proxyURL, cookies, timeout)
+}
+
+func newClient(persona Persona, proxyURL string, cookies []Cookie, timeout time.Duration) (*Client, error) {
 	persona = normalizePersona(persona)
+	proxyURL = strings.TrimSpace(proxyURL)
 	profile, ok := findTLSProfile(persona.Profile)
 	if !ok {
 		return nil, fmt.Errorf("unsupported TLS profile %q", persona.Profile)
 	}
 
 	jar := tls_client.NewCookieJar()
+	var acquisitionTracker *acquisitionConnectionTracker
+	if timeout > 0 {
+		acquisitionTracker = newAcquisitionConnectionTracker()
+	}
 	newHTTPClient := func(followRedirect bool) (tls_client.HttpClient, error) {
+		timeoutMilliseconds := 0
+		if timeout > 0 {
+			timeoutMilliseconds = max(1, int(timeout/time.Millisecond))
+		}
 		options := []tls_client.HttpClientOption{
 			tls_client.WithClientProfile(profile),
 			tls_client.WithCookieJar(jar),
 			tls_client.WithRandomTLSExtensionOrder(),
-			tls_client.WithTimeoutSeconds(0),
+			tls_client.WithTimeoutMilliseconds(timeoutMilliseconds),
 		}
-		if strings.TrimSpace(proxyURL) != "" {
-			options = append(options, tls_client.WithProxyUrl(strings.TrimSpace(proxyURL)))
+		if acquisitionTracker != nil {
+			options = append(
+				options,
+				tls_client.WithProxyDialerFactory(acquisitionTracker.dialerFactory(proxyURL)),
+				tls_client.WithTransportOptions(&tls_client.TransportOptions{DisableKeepAlives: true}),
+			)
+		} else if proxyURL != "" {
+			options = append(options, tls_client.WithProxyUrl(proxyURL))
 		}
 		httpClient, err := tls_client.NewHttpClient(tls_client.NewNoopLogger(), options...)
 		if err != nil {
@@ -63,11 +90,12 @@ func NewClient(persona Persona, proxyURL string, cookies []Cookie) (*Client, err
 		return nil, fmt.Errorf("create no-redirect browser client: %w", err)
 	}
 	client := &Client{
-		follow:     follow,
-		noRedirect: noRedirect,
-		jar:        jar,
-		persona:    persona,
-		proxyURL:   strings.TrimSpace(proxyURL),
+		follow:             follow,
+		noRedirect:         noRedirect,
+		jar:                jar,
+		persona:            persona,
+		proxyURL:           proxyURL,
+		acquisitionTracker: acquisitionTracker,
 	}
 	if err := client.RestoreCookies(cookies); err != nil {
 		client.CloseIdleConnections()
@@ -109,6 +137,13 @@ func (client *Client) CloseIdleConnections() {
 	if client.noRedirect != nil {
 		client.noRedirect.CloseIdleConnections()
 	}
+}
+
+func (client *Client) CloseActiveAcquisitionConnections() {
+	if client == nil || client.acquisitionTracker == nil {
+		return
+	}
+	client.acquisitionTracker.closeAll()
 }
 
 func (client *Client) DoFollow(ctx context.Context, method, targetURL string, headers map[string]string, body io.Reader) (*fhttp.Response, []byte, error) {
@@ -186,7 +221,31 @@ func sameChatGPTWebOrigin(left, right *url.URL) bool {
 	if left == nil || right == nil {
 		return false
 	}
-	return strings.EqualFold(left.Scheme, right.Scheme) && strings.EqualFold(left.Host, right.Host)
+	if !strings.EqualFold(left.Scheme, right.Scheme) ||
+		!strings.EqualFold(left.Hostname(), right.Hostname()) {
+		return false
+	}
+	return chatGPTWebOriginPort(left) == chatGPTWebOriginPort(right)
+}
+
+func chatGPTWebOriginPort(value *url.URL) string {
+	if value == nil {
+		return ""
+	}
+	port := value.Port()
+	if port == "" {
+		switch strings.ToLower(strings.TrimSpace(value.Scheme)) {
+		case "http":
+			return "80"
+		case "https":
+			return "443"
+		}
+		return ""
+	}
+	if number, errPort := strconv.Atoi(port); errPort == nil {
+		return strconv.Itoa(number)
+	}
+	return port
 }
 
 func (client *Client) DoJSON(ctx context.Context, followRedirect bool, method, targetURL string, headers map[string]string, body any) (*fhttp.Response, []byte, error) {

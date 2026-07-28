@@ -79,6 +79,11 @@ type AuthInstanceExecutionSessionCloser interface {
 	CloseAuthInstanceExecutionSessions(authID string, authInstanceID string, reason string)
 }
 
+// PassiveAuthInstanceStateTracker reports auth state created without an execution binding.
+type PassiveAuthInstanceStateTracker interface {
+	HasPassiveAuthInstanceState(authID string, authInstanceID string) bool
+}
+
 const (
 	// CloseAllExecutionSessionsID asks an executor to release all active execution sessions.
 	// Executors that do not support this marker may ignore it.
@@ -233,7 +238,8 @@ type Result struct {
 
 type executionResult struct {
 	Result
-	authInstanceID string
+	authInstanceID         string
+	additionalSuccessModel string
 }
 
 func resultForAuth(auth *Auth, provider, model string, success bool) executionResult {
@@ -243,6 +249,47 @@ func resultForAuth(auth *Auth, provider, model string, success bool) executionRe
 		result.authInstanceID = auth.instanceID
 	}
 	return result
+}
+
+func successfulExecutionResultForAuth(auth *Auth, provider, model string, opts cliproxyexecutor.Options) executionResult {
+	result := resultForAuth(auth, provider, model, true)
+	state, _ := opts.Metadata[cliproxyexecutor.ImageGenerationResultStateMetadataKey].(*cliproxyexecutor.ImageGenerationResultState)
+	if state != nil && state.Succeeded() &&
+		strings.EqualFold(strings.TrimSpace(provider), chatgptwebauth.Provider) &&
+		canonicalModelKey(model) != chatGPTWebImageModel {
+		result.additionalSuccessModel = chatGPTWebImageModel
+	}
+	return result
+}
+
+func executionResultModelForError(model string, err error) string {
+	if err == nil {
+		return model
+	}
+	type modelProvider interface {
+		ExecutionResultModel() string
+	}
+	var target modelProvider
+	if errors.As(err, &target) && target != nil {
+		if override := strings.TrimSpace(target.ExecutionResultModel()); override != "" {
+			return override
+		}
+	}
+	return model
+}
+
+func executionResultErrorCode(err error) string {
+	if err == nil {
+		return ""
+	}
+	type codeProvider interface {
+		ExecutionResultErrorCode() string
+	}
+	var target codeProvider
+	if errors.As(err, &target) && target != nil {
+		return strings.TrimSpace(target.ExecutionResultErrorCode())
+	}
+	return ""
 }
 
 // Selector chooses an auth candidate for execution.
@@ -589,6 +636,70 @@ func (m *Manager) RefreshSchedulerEntry(authID string) {
 	snapshot := auth.Clone()
 	m.mu.RUnlock()
 	m.scheduler.upsertAuth(snapshot)
+}
+
+// ClearModelCooldownByReason resets one model state only when it was created
+// for the supplied quota reason. Other model failures remain untouched.
+func (m *Manager) ClearModelCooldownByReason(ctx context.Context, authID, model, reason string) bool {
+	if m == nil || strings.TrimSpace(authID) == "" || strings.TrimSpace(model) == "" || strings.TrimSpace(reason) == "" {
+		return false
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	unlockMutation, errLock := m.lockAuthIDMutationContext(context.WithoutCancel(ctx), authID)
+	if errLock != nil {
+		logEntryWithRequestID(ctx).WithField("auth_id", authID).Warnf("failed to lock model cooldown mutation: %v", errLock)
+		return false
+	}
+	defer unlockMutation()
+
+	modelKey := canonicalModelKey(model)
+	reason = strings.TrimSpace(reason)
+	var persistAuth *Auth
+	now := time.Now()
+
+	m.mu.Lock()
+	auth := m.auths[authID]
+	if clearModelCooldownByReasonOnAuth(auth, modelKey, reason, now) {
+		persistAuth = auth
+	}
+	m.mu.Unlock()
+	if persistAuth == nil {
+		return false
+	}
+
+	snapshot, errPersist := m.snapshotCurrentAuthForPersistenceLocked(ctx, persistAuth)
+	if errPersist != nil {
+		logEntryWithRequestID(ctx).WithField("auth_id", authID).Warnf("failed to persist cleared model cooldown: %v", errPersist)
+	}
+	if m.scheduler != nil && snapshot != nil {
+		m.scheduler.upsertAuth(snapshot)
+	}
+	registry.GetGlobalRegistry().ClearModelQuotaExceeded(authID, model)
+	registry.GetGlobalRegistry().ResumeClientModel(authID, model)
+	return true
+}
+
+func clearModelCooldownByReasonOnAuth(auth *Auth, modelKey, reason string, now time.Time) bool {
+	if auth == nil {
+		return false
+	}
+	for stateModel, state := range auth.ModelStates {
+		if state == nil || canonicalModelKey(stateModel) != modelKey || !strings.EqualFold(strings.TrimSpace(state.Quota.Reason), reason) {
+			continue
+		}
+		resetModelState(state, now)
+		updateAggregatedAvailability(auth, now)
+		if !hasModelError(auth, now) && !hasActiveAuthWideCooldown(auth, now) {
+			auth.LastError = nil
+			auth.StatusMessage = ""
+			auth.Status = StatusActive
+		}
+		auth.UpdatedAt = now
+		return true
+	}
+	return false
 }
 
 // ReconcileRegistryModelStates aligns per-model runtime state with the current
@@ -1789,7 +1900,8 @@ func (m *Manager) wrapStreamResult(ctx, resultCtx context.Context, auth *Auth, a
 					rerr.HTTPStatus = se.StatusCode()
 				}
 				if !runtimeAuthInstanceRetiredContext(ctx) && !skipAuthResultForError(chunk.Err) {
-					result := resultForAuth(auth, provider, resultModel, false)
+					result := resultForAuth(auth, provider, executionResultModelForError(resultModel, chunk.Err), false)
+					rerr.Code = executionResultErrorCode(chunk.Err)
 					result.Error = rerr
 					result.RetryAfter = retryAfterFromError(chunk.Err)
 					m.markExecutionResult(resultCtx, result)
@@ -1874,7 +1986,7 @@ func (m *Manager) wrapStreamResult(ctx, resultCtx context.Context, auth *Auth, a
 			return
 		}
 		if !failed && !retiredAtFinish && !runtimeAuthInstanceRetiredContext(ctx) {
-			m.markExecutionResult(resultCtx, resultForAuth(auth, provider, resultModel, true))
+			m.markExecutionResult(resultCtx, successfulExecutionResultForAuth(auth, provider, resultModel, opts))
 			m.bindSessionAffinity(resultCtx, affinityProviders, routeModel, opts, auth)
 		}
 	}()
@@ -1930,7 +2042,8 @@ func (m *Manager) executeStreamWithModelPool(ctx, resultCtx context.Context, exe
 			if se, ok := errors.AsType[cliproxyexecutor.StatusError](errStream); ok && se != nil {
 				rerr.HTTPStatus = se.StatusCode()
 			}
-			result := resultForAuth(auth, provider, resultModel, false)
+			result := resultForAuth(auth, provider, executionResultModelForError(resultModel, errStream), false)
+			rerr.Code = executionResultErrorCode(errStream)
 			result.Error = rerr
 			result.RetryAfter = retryAfterFromError(errStream)
 			if !skipAuthResultForError(errStream) && !deferAntigravityUnauthorizedStreamResult(auth, errStream) {
@@ -1962,7 +2075,8 @@ func (m *Manager) executeStreamWithModelPool(ctx, resultCtx context.Context, exe
 				if se, ok := errors.AsType[cliproxyexecutor.StatusError](bootstrapErr); ok && se != nil {
 					rerr.HTTPStatus = se.StatusCode()
 				}
-				result := resultForAuth(auth, provider, resultModel, false)
+				result := resultForAuth(auth, provider, executionResultModelForError(resultModel, bootstrapErr), false)
+				rerr.Code = executionResultErrorCode(bootstrapErr)
 				result.Error = rerr
 				result.RetryAfter = retryAfterFromError(bootstrapErr)
 				if !skipAuthResultForError(bootstrapErr) && !deferAntigravityUnauthorizedStreamResult(auth, bootstrapErr) {
@@ -1976,7 +2090,8 @@ func (m *Manager) executeStreamWithModelPool(ctx, resultCtx context.Context, exe
 				if se, ok := errors.AsType[cliproxyexecutor.StatusError](bootstrapErr); ok && se != nil {
 					rerr.HTTPStatus = se.StatusCode()
 				}
-				result := resultForAuth(auth, provider, resultModel, false)
+				result := resultForAuth(auth, provider, executionResultModelForError(resultModel, bootstrapErr), false)
+				rerr.Code = executionResultErrorCode(bootstrapErr)
 				result.Error = rerr
 				result.RetryAfter = retryAfterFromError(bootstrapErr)
 				if !skipAuthResultForError(bootstrapErr) && !deferAntigravityUnauthorizedStreamResult(auth, bootstrapErr) {
@@ -1990,7 +2105,8 @@ func (m *Manager) executeStreamWithModelPool(ctx, resultCtx context.Context, exe
 			if se, ok := errors.AsType[cliproxyexecutor.StatusError](bootstrapErr); ok && se != nil {
 				rerr.HTTPStatus = se.StatusCode()
 			}
-			result := resultForAuth(auth, provider, resultModel, false)
+			result := resultForAuth(auth, provider, executionResultModelForError(resultModel, bootstrapErr), false)
+			rerr.Code = executionResultErrorCode(bootstrapErr)
 			result.Error = rerr
 			result.RetryAfter = retryAfterFromError(bootstrapErr)
 			if !skipAuthResultForError(bootstrapErr) && !deferAntigravityUnauthorizedStreamResult(auth, bootstrapErr) {
@@ -2760,9 +2876,23 @@ func (m *Manager) finishAuthSessionCleanup(id string, removed *Auth, reason stri
 	}
 	if removed != nil {
 		executorOwners := removed.executorOwners()
+		currentExecutor := m.executorFor(executorKeyFromAuth(removed))
 		if len(executorOwners) == 0 {
-			if providerExecutor := m.executorFor(executorKeyFromAuth(removed)); providerExecutor != nil {
-				executorOwners = append(executorOwners, providerExecutor)
+			if currentExecutor != nil {
+				executorOwners = append(executorOwners, currentExecutor)
+			}
+		} else if tracker, ok := currentExecutor.(PassiveAuthInstanceStateTracker); ok &&
+			tracker != nil &&
+			tracker.HasPassiveAuthInstanceState(id, removed.RuntimeInstanceID()) {
+			tracked := false
+			for _, owner := range executorOwners {
+				if sameProviderExecutor(owner, currentExecutor) {
+					tracked = true
+					break
+				}
+			}
+			if !tracked {
+				executorOwners = append(executorOwners, currentExecutor)
 			}
 		}
 		for _, providerExecutor := range executorOwners {
@@ -3943,10 +4073,37 @@ func (m *Manager) UpdateRuntimeMetadataIfCurrent(ctx context.Context, expected *
 // replacing the current auth installation or notifying model-sync hooks.
 // mutate must only update Metadata and must not call back into Manager.
 func (m *Manager) MutateRuntimeMetadataIfCurrent(ctx context.Context, expected *Auth, mutate func(*Auth)) (*Auth, bool, error) {
+	return m.mutateRuntimeMetadataIfCurrent(ctx, expected, mutate, "", "")
+}
+
+// MutateRuntimeMetadataAndClearModelCooldownIfCurrent atomically persists
+// metadata changes and clears one reason-owned model cooldown.
+func (m *Manager) MutateRuntimeMetadataAndClearModelCooldownIfCurrent(
+	ctx context.Context,
+	expected *Auth,
+	model string,
+	reason string,
+	mutate func(*Auth),
+) (*Auth, bool, error) {
+	model = strings.TrimSpace(model)
+	reason = strings.TrimSpace(reason)
+	if model == "" || reason == "" {
+		return m.MutateRuntimeMetadataIfCurrent(ctx, expected, mutate)
+	}
+	return m.mutateRuntimeMetadataIfCurrent(ctx, expected, mutate, model, reason)
+}
+
+func (m *Manager) mutateRuntimeMetadataIfCurrent(
+	ctx context.Context,
+	expected *Auth,
+	mutate func(*Auth),
+	clearModel string,
+	clearReason string,
+) (*Auth, bool, error) {
 	if m == nil || expected == nil || strings.TrimSpace(expected.ID) == "" {
 		return nil, false, nil
 	}
-	if mutate == nil {
+	if mutate == nil && clearModel == "" {
 		m.mu.RLock()
 		current := m.auths[expected.ID]
 		if !runtimeMetadataMutationMatchesCurrent(current, expected) {
@@ -3967,6 +4124,9 @@ func (m *Manager) MutateRuntimeMetadataIfCurrent(ctx context.Context, expected *
 	}
 	defer unlockPersist()
 
+	now := time.Now()
+	modelKey := canonicalModelKey(clearModel)
+
 	m.mu.Lock()
 	current := m.auths[id]
 	if !runtimeMetadataMutationMatchesCurrent(current, expected) {
@@ -3974,7 +4134,20 @@ func (m *Manager) MutateRuntimeMetadataIfCurrent(ctx context.Context, expected *
 		return nil, false, nil
 	}
 	candidate := current.Clone()
-	mutate(candidate)
+	clearObservationMatches := modelKey == "" || modelStateObservationMatches(current, expected, modelKey)
+	var clearBaseline *ModelState
+	if clearObservationMatches {
+		clearBaseline = cloneReasonOwnedModelState(candidate, modelKey, clearReason)
+	}
+	if mutate != nil {
+		mutate(candidate)
+		if clearObservationMatches {
+			clearChatGPTWebImageRateLimitAfterFreshQuota(candidate, now)
+		}
+	}
+	if clearBaseline != nil {
+		clearModelCooldownByReasonOnAuth(candidate, modelKey, clearReason, now)
+	}
 	expectedSourceHash := authSourceHash(current)
 	m.mu.Unlock()
 
@@ -3993,7 +4166,17 @@ func (m *Manager) MutateRuntimeMetadataIfCurrent(ctx context.Context, expected *
 		return nil, false, nil
 	}
 	installed := current.Clone()
-	mutate(installed)
+	clearedFreshImageRateLimit := false
+	if mutate != nil {
+		mutate(installed)
+		if clearObservationMatches {
+			clearedFreshImageRateLimit = clearChatGPTWebImageRateLimitAfterFreshQuota(installed, now)
+		}
+	}
+	clearedModelCooldown := false
+	if clearBaseline != nil && reasonOwnedModelStateMatches(installed, modelKey, clearReason, clearBaseline) {
+		clearedModelCooldown = clearModelCooldownByReasonOnAuth(installed, modelKey, clearReason, now)
+	}
 	if persistedHash := authSourceHash(candidate); persistedHash != "" {
 		if installed.Attributes == nil {
 			installed.Attributes = make(map[string]string)
@@ -4002,7 +4185,68 @@ func (m *Manager) MutateRuntimeMetadataIfCurrent(ctx context.Context, expected *
 	}
 	m.auths[id] = installed
 	m.mu.Unlock()
-	return installed.Clone(), true, nil
+	snapshot := installed.Clone()
+	if clearedModelCooldown || clearedFreshImageRateLimit {
+		if m.scheduler != nil {
+			m.scheduler.upsertAuth(snapshot)
+		}
+	}
+	if clearedModelCooldown {
+		registry.GetGlobalRegistry().ClearModelQuotaExceeded(id, clearModel)
+		registry.GetGlobalRegistry().ResumeClientModel(id, clearModel)
+	}
+	if clearedFreshImageRateLimit &&
+		(!clearedModelCooldown || canonicalModelKey(clearModel) != canonicalModelKey(chatGPTWebImageModel)) {
+		registry.GetGlobalRegistry().ClearModelQuotaExceeded(id, chatGPTWebImageModel)
+		registry.GetGlobalRegistry().ResumeClientModel(id, chatGPTWebImageModel)
+	}
+	return snapshot, true, nil
+}
+
+func modelStateObservationMatches(current, expected *Auth, modelKey string) bool {
+	return reflect.DeepEqual(
+		cloneModelStateByKey(current, modelKey),
+		cloneModelStateByKey(expected, modelKey),
+	)
+}
+
+func cloneModelStateByKey(auth *Auth, modelKey string) *ModelState {
+	if auth == nil || modelKey == "" {
+		return nil
+	}
+	for stateModel, state := range auth.ModelStates {
+		if state != nil && canonicalModelKey(stateModel) == modelKey {
+			return state.Clone()
+		}
+	}
+	return nil
+}
+
+func cloneReasonOwnedModelState(auth *Auth, modelKey, reason string) *ModelState {
+	if auth == nil || modelKey == "" || reason == "" {
+		return nil
+	}
+	for stateModel, state := range auth.ModelStates {
+		if state == nil || canonicalModelKey(stateModel) != modelKey ||
+			!strings.EqualFold(strings.TrimSpace(state.Quota.Reason), reason) {
+			continue
+		}
+		cloned := *state
+		if state.LastError != nil {
+			lastError := *state.LastError
+			cloned.LastError = &lastError
+		}
+		return &cloned
+	}
+	return nil
+}
+
+func reasonOwnedModelStateMatches(auth *Auth, modelKey, reason string, expected *ModelState) bool {
+	if expected == nil {
+		return false
+	}
+	current := cloneReasonOwnedModelState(auth, modelKey, reason)
+	return current != nil && reflect.DeepEqual(current, expected)
 }
 
 func applyRuntimeMetadataUpdates(auth *Auth, updates map[string]any) {
@@ -4118,6 +4362,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 	routeModel := req.Model
 	opts = ensureRequestedModelMetadata(opts, routeModel)
 	opts = setSelectionAttemptMetadata(opts, requestAttempt)
+	opts = withImageGenerationResultState(req, opts)
 	strictSessionAffinity := m.strictSessionAffinityForRequest(req, opts)
 	pickAllowed := m.roundPickAllowed(roundState, maxRetryCredentials)
 	unregisterRelease := registerRequestBodyReleaseCallback(ctx, opts, func([]byte) {
@@ -4134,6 +4379,9 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 		}
 		auth, executor, provider, errPick := m.pickNextMixedWithImageToolFallback(ctx, providers, routeModel, req, opts, roundState.tried, pickAllowed)
 		if errPick != nil {
+			if chatGPTWebImageQuotaRefreshPendingError(errPick) {
+				return cliproxyexecutor.Response{}, errPick
+			}
 			if _, isAvailabilityBlocker := availabilityBlockerResetIn(errPick); isAvailabilityBlocker {
 				return cliproxyexecutor.Response{}, m.preferEarlierRoundAvailabilityError(errPick, roundState)
 			}
@@ -4244,7 +4492,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			unregisterAttemptRelease()
 			if errExec == nil {
 				if !retiredDuringExecution {
-					m.markExecutionResult(execCtx, resultForAuth(auth, provider, resultModel, true))
+					m.markExecutionResult(execCtx, successfulExecutionResultForAuth(auth, provider, resultModel, opts))
 					m.bindSessionAffinity(ctx, providers, routeModel, opts, auth)
 				}
 				rewriteForceMappedResponse(&resp, aliasResult)
@@ -4293,7 +4541,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 					retiredDuringRetry := releaseRetry()
 					if errExec == nil {
 						if !retiredDuringRetry {
-							m.markExecutionResult(execCtx, resultForAuth(auth, provider, resultModel, true))
+							m.markExecutionResult(execCtx, successfulExecutionResultForAuth(auth, provider, resultModel, opts))
 							m.bindSessionAffinity(ctx, providers, routeModel, opts, auth)
 						}
 						rewriteForceMappedResponse(&resp, aliasResult)
@@ -4313,8 +4561,10 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 				}
 			}
 			errExec = m.reportProxyFailure(execCtx, auth, errExec)
+			resultModel = executionResultModelForError(resultModel, errExec)
 			result := resultForAuth(auth, provider, resultModel, false)
 			result.Error = &Error{Message: errExec.Error()}
+			result.Error.Code = executionResultErrorCode(errExec)
 			if se, ok := errors.AsType[cliproxyexecutor.StatusError](errExec); ok && se != nil {
 				result.Error.HTTPStatus = se.StatusCode()
 			}
@@ -4373,6 +4623,9 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 		}
 		auth, executor, provider, errPick := m.pickNextMixed(ctx, providers, routeModel, opts, roundState.tried, pickAllowed)
 		if errPick != nil {
+			if chatGPTWebImageQuotaRefreshPendingError(errPick) {
+				return cliproxyexecutor.Response{}, errPick
+			}
 			if _, isAvailabilityBlocker := availabilityBlockerResetIn(errPick); isAvailabilityBlocker {
 				return cliproxyexecutor.Response{}, m.preferEarlierRoundAvailabilityError(errPick, roundState)
 			}
@@ -4594,6 +4847,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 	routeModel := req.Model
 	opts = ensureRequestedModelMetadata(opts, routeModel)
 	opts = setSelectionAttemptMetadata(opts, requestAttempt)
+	opts = withImageGenerationResultState(req, opts)
 	strictSessionAffinity := m.strictSessionAffinityForRequest(req, opts)
 	pickAllowed := m.roundPickAllowed(roundState, maxRetryCredentials)
 	unregisterRelease := registerRequestBodyReleaseCallback(ctx, opts, func([]byte) {
@@ -4610,6 +4864,9 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 		}
 		auth, executor, provider, errPick := m.pickNextMixedWithImageToolFallback(ctx, providers, routeModel, req, opts, roundState.tried, pickAllowed)
 		if errPick != nil {
+			if chatGPTWebImageQuotaRefreshPendingError(errPick) {
+				return nil, errPick
+			}
 			if _, isAvailabilityBlocker := availabilityBlockerResetIn(errPick); isAvailabilityBlocker {
 				return nil, m.preferEarlierRoundAvailabilityError(errPick, roundState)
 			}
@@ -4766,8 +5023,10 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 				if len(models) > 0 {
 					resultModel = m.stateModelForExecution(auth, routeModel, models[0], pooled)
 				}
+				resultModel = executionResultModelForError(resultModel, errStream)
 				result := resultForAuth(auth, provider, resultModel, false)
 				result.Error = &Error{Message: errStream.Error()}
+				result.Error.Code = executionResultErrorCode(errStream)
 				if statusErr, ok := errors.AsType[cliproxyexecutor.StatusError](errStream); ok && statusErr != nil {
 					result.Error.HTTPStatus = statusErr.StatusCode()
 				}
@@ -5406,6 +5665,19 @@ func ensureRequestedModelMetadata(opts cliproxyexecutor.Options, requestedModel 
 		meta[k] = v
 	}
 	meta[cliproxyexecutor.RequestedModelMetadataKey] = requestedModel
+	opts.Metadata = meta
+	return opts
+}
+
+func withImageGenerationResultState(req cliproxyexecutor.Request, opts cliproxyexecutor.Options) cliproxyexecutor.Options {
+	if !requestHasImageGenerationToolForFallback(req, opts) {
+		return opts
+	}
+	meta := make(map[string]any, len(opts.Metadata)+1)
+	for key, value := range opts.Metadata {
+		meta[key] = value
+	}
+	meta[cliproxyexecutor.ImageGenerationResultStateMetadataKey] = &cliproxyexecutor.ImageGenerationResultState{}
 	opts.Metadata = meta
 	return opts
 }
@@ -6092,11 +6364,20 @@ func cooldownWaitFromError(err error, maxWait time.Duration) (time.Duration, boo
 	if maxWait <= 0 {
 		return 0, false
 	}
-	var cooldownErr *modelCooldownError
-	if !errors.As(err, &cooldownErr) || cooldownErr == nil {
-		return 0, false
+	var wait time.Duration
+	var imageRateLimitErr *chatGPTWebImageRateLimitError
+	if errors.As(err, &imageRateLimitErr) && imageRateLimitErr != nil {
+		if !imageRateLimitErr.retryKnown || imageRateLimitErr.cooldown == nil {
+			return 0, false
+		}
+		wait = imageRateLimitErr.cooldown.resetIn
+	} else {
+		var cooldownErr *modelCooldownError
+		if !errors.As(err, &cooldownErr) || cooldownErr == nil {
+			return 0, false
+		}
+		wait = cooldownErr.resetIn
 	}
-	wait := cooldownErr.resetIn
 	if wait <= 0 || wait > maxWait {
 		return 0, false
 	}
@@ -6130,23 +6411,40 @@ func waitForCooldown(ctx context.Context, wait time.Duration) error {
 
 // MarkResult records an execution result and notifies hooks.
 func (m *Manager) MarkResult(ctx context.Context, result Result) {
-	m.markResult(ctx, result, "")
+	m.markResult(ctx, result, "", "")
 }
 
 func (m *Manager) markExecutionResult(ctx context.Context, result executionResult) {
-	m.markResult(ctx, result.Result, result.authInstanceID)
+	m.markResult(ctx, result.Result, result.authInstanceID, result.additionalSuccessModel)
 }
 
-func (m *Manager) markResult(ctx context.Context, result Result, authInstanceID string) {
+func (m *Manager) markResult(ctx context.Context, result Result, authInstanceID, additionalSuccessModel string) {
 	if result.AuthID == "" {
 		return
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	unlockMutation, errLock := m.lockAuthIDMutationContext(context.WithoutCancel(ctx), result.AuthID)
+	if errLock != nil {
+		logEntryWithRequestID(ctx).WithField("auth_id", result.AuthID).Warnf("failed to lock result mutation: %v", errLock)
+		return
+	}
+	mutationLocked := true
+	unlockResultMutation := func() {
+		if mutationLocked {
+			mutationLocked = false
+			unlockMutation()
+		}
+	}
+	defer unlockResultMutation()
 
 	shouldResumeModel := false
 	shouldSuspendModel := false
 	suspendReason := ""
 	clearModelQuota := false
 	setModelQuota := false
+	additionalSuccessModelApplied := ""
 	var (
 		authSnapshot *Auth
 		persistAuth  *Auth
@@ -6159,6 +6457,13 @@ func (m *Manager) markResult(ctx context.Context, result Result, authInstanceID 
 		now := time.Now()
 		dynamicFixedCooldown, hasDynamicFixedCooldown := m.fixedErrorCooldownForResult(result.Error)
 		resultStatusCode := statusCodeFromResult(result.Error)
+		chatGPTWebImageQuotaResult := result.Error != nil &&
+			strings.EqualFold(strings.TrimSpace(result.Error.Code), "chatgpt_web_image_quota")
+		chatGPTWebImage429Result := resultStatusCode == http.StatusTooManyRequests &&
+			chatGPTWebImageModelProjection(auth, result.Model)
+		if (chatGPTWebImageQuotaResult || chatGPTWebImage429Result) && hasDynamicFixedCooldown {
+			dynamicFixedCooldown.scope = cooldownScopeModel
+		}
 		chatGPTWebInFlightModelResult := authInstanceID != "" &&
 			result.Model != "" &&
 			strings.EqualFold(strings.TrimSpace(auth.Provider), "chatgpt-web") &&
@@ -6187,7 +6492,24 @@ func (m *Manager) markResult(ctx context.Context, result Result, authInstanceID 
 		} else if result.Success {
 			if result.Model != "" {
 				state := ensureModelState(auth, result.Model)
-				resetModelState(state, now)
+				if !chatGPTWebImageQuotaOwnedModelState(auth, result.Model, state) {
+					resetModelState(state, now)
+					shouldResumeModel = true
+					clearModelQuota = true
+				}
+			}
+			additionalModel := strings.TrimSpace(additionalSuccessModel)
+			if additionalModel != "" &&
+				canonicalModelKey(additionalModel) != canonicalModelKey(result.Model) &&
+				strings.EqualFold(strings.TrimSpace(auth.Provider), chatgptwebauth.Provider) &&
+				clientRegistrySupportsExecutionModel(result.AuthID, additionalModel) {
+				state := ensureModelState(auth, additionalModel)
+				if !chatGPTWebImageQuotaOwnedModelState(auth, additionalModel, state) {
+					resetModelState(state, now)
+					additionalSuccessModelApplied = additionalModel
+				}
+			}
+			if result.Model != "" || additionalSuccessModelApplied != "" {
 				updateAggregatedAvailability(auth, now)
 				if !hasModelError(auth, now) && !hasActiveAuthWideCooldown(auth, now) {
 					auth.LastError = nil
@@ -6195,8 +6517,6 @@ func (m *Manager) markResult(ctx context.Context, result Result, authInstanceID 
 					auth.Status = StatusActive
 				}
 				auth.UpdatedAt = now
-				shouldResumeModel = true
-				clearModelQuota = true
 			} else {
 				clearAuthStateOnSuccess(auth, now)
 			}
@@ -6230,6 +6550,9 @@ func (m *Manager) markResult(ctx context.Context, result Result, authInstanceID 
 
 					statusCode := statusCodeFromResult(result.Error)
 					fixedCooldown, hasFixedCooldown := m.fixedErrorCooldownForResult(result.Error)
+					if (chatGPTWebImageQuotaResult || chatGPTWebImage429Result) && hasFixedCooldown {
+						fixedCooldown.scope = cooldownScopeModel
+					}
 					skipCooling := !hasFixedCooldown && m.cooldownSkippedForStatus(statusCode)
 					disableCooling := quotaCooldownDisabledForAuth(auth)
 					if hasFixedCooldown && fixedCooldown.scope == cooldownScopeAuth && !skipCooling {
@@ -6275,6 +6598,10 @@ func (m *Manager) markResult(ctx context.Context, result Result, authInstanceID 
 							var next time.Time
 							backoffLevel := state.Quota.BackoffLevel
 							strikeCount := state.Quota.StrikeCount + 1
+							quotaReason := "quota"
+							if chatGPTWebImageQuotaResult {
+								quotaReason = "chatgpt_web_image_quota"
+							}
 							if !disableCooling {
 								if hasFixedCooldown {
 									next = cooldownTime(now, 0, fixedCooldown, true, false)
@@ -6291,13 +6618,13 @@ func (m *Manager) markResult(ctx context.Context, result Result, authInstanceID 
 							state.NextRetryAfter = next
 							state.Quota = QuotaState{
 								Exceeded:      true,
-								Reason:        "quota",
+								Reason:        quotaReason,
 								NextRecoverAt: next,
 								BackoffLevel:  backoffLevel,
 								StrikeCount:   strikeCount,
 							}
 							if !disableCooling {
-								suspendReason = "quota"
+								suspendReason = quotaReason
 								shouldSuspendModel = true
 								setModelQuota = true
 							}
@@ -6341,6 +6668,7 @@ func (m *Manager) markResult(ctx context.Context, result Result, authInstanceID 
 			suspendReason = ""
 			clearModelQuota = false
 			setModelQuota = false
+			additionalSuccessModelApplied = ""
 			staleDynamicModelResult = true
 		}
 		if removedDynamicModelWithAuthCooldown {
@@ -6355,7 +6683,7 @@ func (m *Manager) markResult(ctx context.Context, result Result, authInstanceID 
 	}
 	m.mu.Unlock()
 	if persistAuth != nil {
-		authSnapshot, _ = m.snapshotCurrentAuthForPersistence(ctx, persistAuth)
+		authSnapshot, _ = m.snapshotCurrentAuthForPersistenceLocked(ctx, persistAuth)
 	}
 	if m.scheduler != nil && authSnapshot != nil {
 		m.scheduler.upsertAuthState(authSnapshot)
@@ -6373,6 +6701,10 @@ func (m *Manager) markResult(ctx context.Context, result Result, authInstanceID 
 		} else if shouldSuspendModel {
 			registry.GetGlobalRegistry().SuspendClientModel(result.AuthID, result.Model, suspendReason)
 		}
+		if additionalSuccessModelApplied != "" {
+			registry.GetGlobalRegistry().ClearModelQuotaExceeded(result.AuthID, additionalSuccessModelApplied)
+			registry.GetGlobalRegistry().ResumeClientModel(result.AuthID, additionalSuccessModelApplied)
+		}
 	}
 
 	if authInstanceID != "" {
@@ -6383,6 +6715,7 @@ func (m *Manager) markResult(ctx context.Context, result Result, authInstanceID 
 			applyRegistryResult()
 		}
 		m.mu.RUnlock()
+		unlockResultMutation()
 		if !stillCurrent {
 			return
 		}
@@ -6397,6 +6730,7 @@ func (m *Manager) markResult(ctx context.Context, result Result, authInstanceID 
 	}
 
 	applyRegistryResult()
+	unlockResultMutation()
 	if acceptedResult {
 		m.Hook().OnResult(ctx, result)
 	}
@@ -6460,6 +6794,29 @@ func modelStateIsClean(state *ModelState) bool {
 		return false
 	}
 	return true
+}
+
+// HasAccountMaintenanceQuotaExceeded reports whether account-level quota
+// maintenance may act on this auth. ChatGPT Web image quota is model-scoped.
+func (auth *Auth) HasAccountMaintenanceQuotaExceeded() bool {
+	if auth == nil || !auth.Quota.Exceeded {
+		return false
+	}
+	if !strings.EqualFold(strings.TrimSpace(auth.Provider), chatgptwebauth.Provider) ||
+		auth.CooldownScope == cooldownScopeAuth {
+		return true
+	}
+	imageQuotaProjected := false
+	for model, state := range auth.ModelStates {
+		if state == nil || !state.Quota.Exceeded {
+			continue
+		}
+		if !chatGPTWebImageModelProjection(auth, model) {
+			return true
+		}
+		imageQuotaProjected = true
+	}
+	return !imageQuotaProjected
 }
 
 func updateAggregatedAvailability(auth *Auth, now time.Time) {
@@ -6878,6 +7235,10 @@ func isRequestScopedNotFoundResultError(err *Error) bool {
 func isRequestInvalidErrorWithConfig(err error, cfg *internalconfig.Config) bool {
 	if err == nil {
 		return false
+	}
+	var committed interface{ RequestCommitted() bool }
+	if errors.As(err, &committed) && committed.RequestCommitted() {
+		return true
 	}
 	if skipAuthResultForError(err) && !retryOtherAuthForError(err) {
 		return true
@@ -7358,8 +7719,13 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 }
 
 func (m *Manager) pickNext(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, ProviderExecutor, error) {
+	m.triggerDueChatGPTWebImageQuotaRefreshes([]string{provider}, model, opts, tried, nil, false)
 	if !m.useSchedulerFastPath() {
-		return m.pickNextLegacy(ctx, provider, model, opts, tried)
+		auth, executor, errPick := m.pickNextLegacy(ctx, provider, model, opts, tried)
+		if errPick != nil {
+			errPick = m.preferChatGPTWebImageQuotaError(errPick, []string{provider}, model, opts, tried, nil)
+		}
+		return auth, executor, errPick
 	}
 	if strings.TrimSpace(model) != "" {
 		m.mu.RLock()
@@ -7372,7 +7738,11 @@ func (m *Manager) pickNext(ctx context.Context, provider, model string, opts cli
 			}
 			if m.routeAwareSelectionRequired(candidate, model) {
 				m.mu.RUnlock()
-				return m.pickNextLegacy(ctx, provider, model, opts, tried)
+				auth, executor, errPick := m.pickNextLegacy(ctx, provider, model, opts, tried)
+				if errPick != nil {
+					errPick = m.preferChatGPTWebImageQuotaError(errPick, []string{provider}, model, opts, tried, nil)
+				}
+				return auth, executor, errPick
 			}
 		}
 		m.mu.RUnlock()
@@ -7387,7 +7757,7 @@ func (m *Manager) pickNext(ctx context.Context, provider, model string, opts cli
 		selected, errPick = m.scheduler.pickSingle(ctx, provider, model, opts, tried)
 	}
 	if errPick != nil {
-		return nil, nil, errPick
+		return nil, nil, m.preferChatGPTWebImageQuotaError(errPick, []string{provider}, model, opts, tried, nil)
 	}
 	if selected == nil {
 		return nil, nil, &Error{Code: "auth_not_found", Message: "selector returned no auth"}
@@ -7582,8 +7952,13 @@ func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model s
 	if len(pickAllowed) > 0 {
 		allowed = pickAllowed[0]
 	}
+	m.triggerDueChatGPTWebImageQuotaRefreshes(providers, model, opts, tried, allowed, false)
 	if !m.useSchedulerFastPath() {
-		return m.pickNextMixedLegacy(ctx, providers, model, opts, tried, allowed)
+		auth, executor, provider, errPick := m.pickNextMixedLegacy(ctx, providers, model, opts, tried, allowed)
+		if errPick != nil {
+			errPick = m.preferChatGPTWebImageQuotaError(errPick, providers, model, opts, tried, allowed)
+		}
+		return auth, executor, provider, errPick
 	}
 
 	eligibleProviders := make([]string, 0, len(providers))
@@ -7623,7 +7998,11 @@ func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model s
 			}
 			if m.routeAwareSelectionRequired(candidate, model) {
 				m.mu.RUnlock()
-				return m.pickNextMixedLegacy(ctx, providers, model, opts, tried, allowed)
+				auth, executor, selectedProvider, errPick := m.pickNextMixedLegacy(ctx, providers, model, opts, tried, allowed)
+				if errPick != nil {
+					errPick = m.preferChatGPTWebImageQuotaError(errPick, eligibleProviders, model, opts, tried, allowed)
+				}
+				return auth, executor, selectedProvider, errPick
 			}
 		}
 		m.mu.RUnlock()
@@ -7635,7 +8014,7 @@ func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model s
 		selected, providerKey, errPick = m.scheduler.pickMixed(ctx, eligibleProviders, model, opts, tried, allowed)
 	}
 	if errPick != nil {
-		return nil, nil, "", errPick
+		return nil, nil, "", m.preferChatGPTWebImageQuotaError(errPick, eligibleProviders, model, opts, tried, allowed)
 	}
 	if selected == nil {
 		return nil, nil, "", &Error{Code: "auth_not_found", Message: "selector returned no auth"}
@@ -7658,12 +8037,32 @@ func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model s
 
 func (m *Manager) pickNextMixedWithImageToolFallback(ctx context.Context, providers []string, model string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, tried map[string]struct{}, pickAllowed func(*Auth) bool) (*Auth, ProviderExecutor, string, error) {
 	cfg := m.currentConfig()
-	if !disabledImageGenerationToolFallbackEnabled(cfg) || !requestHasImageGenerationToolForFallback(req, opts) {
+	if !requestHasImageGenerationToolForFallback(req, opts) {
 		return m.pickNextMixed(ctx, providers, model, opts, tried, pickAllowed)
 	}
-	imageCapableAllowed := func(auth *Auth) bool {
+	m.triggerDueChatGPTWebImageQuotaRefreshes(providers, model, opts, tried, pickAllowed, true)
+	now := time.Now()
+	quotaAllowed := func(auth *Auth) bool {
 		if pickAllowed != nil && !pickAllowed(auth) {
 			return false
+		}
+		blocked, _ := chatGPTWebImageCapabilityUnavailable(auth, now)
+		return !blocked
+	}
+	if !disabledImageGenerationToolFallbackEnabled(cfg) {
+		auth, executor, provider, errPick := m.pickNextMixed(ctx, providers, model, opts, tried, quotaAllowed)
+		if errPick != nil {
+			errPick = m.preferChatGPTWebImageToolQuotaError(errPick, providers, model, opts, tried, pickAllowed)
+		}
+		return auth, executor, provider, errPick
+	}
+	explicitImageTool := requestExplicitlySelectsImageGenerationTool(req, opts)
+	imageCapableAllowed := func(auth *Auth) bool {
+		if !quotaAllowed(auth) {
+			return false
+		}
+		if strings.EqualFold(strings.TrimSpace(auth.Provider), "chatgpt-web") {
+			return chatGPTWebImageModelProjection(auth, model) || explicitImageTool
 		}
 		if !isCodexProvider(auth, auth.Provider) {
 			return false
@@ -7675,9 +8074,13 @@ func (m *Manager) pickNextMixedWithImageToolFallback(ctx context.Context, provid
 		return auth, executor, provider, nil
 	}
 	if !shouldFallbackToDisabledImageGenerationToolAction(errPick) {
-		return nil, nil, "", errPick
+		return nil, nil, "", m.preferChatGPTWebImageToolQuotaError(errPick, providers, model, opts, tried, pickAllowed)
 	}
-	return m.pickNextMixed(ctx, providers, model, opts, tried, pickAllowed)
+	auth, executor, provider, errPick = m.pickNextMixed(ctx, providers, model, opts, tried, quotaAllowed)
+	if errPick != nil {
+		errPick = m.preferChatGPTWebImageToolQuotaError(errPick, providers, model, opts, tried, pickAllowed)
+	}
+	return auth, executor, provider, errPick
 }
 
 func disabledImageGenerationToolFallbackEnabled(cfg *internalconfig.Config) bool {
@@ -7695,7 +8098,15 @@ func requestHasImageGenerationToolForFallback(req cliproxyexecutor.Request, opts
 	if len(payload) == 0 {
 		payload = opts.OriginalRequest
 	}
-	return PayloadHasImageGenerationTool(payload)
+	return PayloadMaySelectImageGenerationTool(payload)
+}
+
+func requestExplicitlySelectsImageGenerationTool(req cliproxyexecutor.Request, opts cliproxyexecutor.Options) bool {
+	payload := req.Payload
+	if len(payload) == 0 {
+		payload = opts.OriginalRequest
+	}
+	return PayloadExplicitlySelectsImageGenerationTool(payload)
 }
 
 func shouldFallbackToDisabledImageGenerationToolAction(err error) bool {
@@ -7798,6 +8209,17 @@ func (m *Manager) snapshotCurrentAuthForPersistence(ctx context.Context, current
 	}
 	defer unlockPersist()
 
+	return m.snapshotCurrentAuthForPersistenceLocked(ctx, current)
+}
+
+func (m *Manager) snapshotCurrentAuthForPersistenceLocked(ctx context.Context, current *Auth) (*Auth, error) {
+	if m == nil || current == nil {
+		return nil, nil
+	}
+	id := strings.TrimSpace(current.ID)
+	if id == "" {
+		return nil, nil
+	}
 	m.mu.RLock()
 	latest, ok := m.auths[id]
 	if !ok || latest == nil {
@@ -8710,6 +9132,19 @@ func (m *Manager) refreshAntigravityForRequest(ctx context.Context, id, failedAc
 	return m.refreshProviderForRequest(ctx, id, failedAccessToken, "antigravity", nil)
 }
 
+func (m *Manager) beginRequestRefreshFlight() (func(), error) {
+	if m == nil {
+		return nil, errors.New("auth manager is nil")
+	}
+	m.executorLifecycleMu.Lock()
+	defer m.executorLifecycleMu.Unlock()
+	if m.executorsClosed || m.executorCloseSealed {
+		return nil, errors.New("auth manager executors are closed")
+	}
+	m.executorCloseWG.Add(1)
+	return m.executorCloseWG.Done, nil
+}
+
 func (m *Manager) refreshProviderForRequest(ctx context.Context, id, failedAccessToken, provider string, expected *Auth) (*Auth, error) {
 	if m == nil {
 		return nil, errors.New("auth manager is nil")
@@ -8726,6 +9161,11 @@ func (m *Manager) refreshProviderForRequest(ctx context.Context, id, failedAcces
 	// Refresh tokens may rotate, so one shared worker per auth generation must
 	// finish applying its result even when every initiating request stops waiting.
 	resultChannel := m.requestRefreshFlights.DoChan(chatGPTWebRequestRefreshFlightKey(id, expected), func() (any, error) {
+		releaseFlight, errFlight := m.beginRequestRefreshFlight()
+		if errFlight != nil {
+			return nil, errFlight
+		}
+		defer releaseFlight()
 		workerCtx, cancelWorker := context.WithTimeout(context.WithoutCancel(ctx), chatgptwebauth.DefaultAcquisitionTimeout)
 		defer cancelWorker()
 		return m.refreshProviderForRequestSynchronized(workerCtx, id, failedAccessToken, "chatgpt-web", expected, nil)
@@ -9308,6 +9748,24 @@ func (m *Manager) RefreshAntigravityAfterUnauthorized(ctx context.Context, id, f
 	return m.refreshAntigravityForRequest(ctx, id, failedAccessToken)
 }
 
+// RefreshChatGPTWebForRequest refreshes and installs one ChatGPT Web
+// credential through the request-time synchronization path.
+func (m *Manager) RefreshChatGPTWebForRequest(ctx context.Context, expected *Auth) (*Auth, error) {
+	if expected == nil {
+		return nil, errors.New("chatgpt-web credential is nil")
+	}
+	if !strings.EqualFold(strings.TrimSpace(expected.Provider), "chatgpt-web") {
+		return nil, fmt.Errorf("credential provider %q is not chatgpt-web", expected.Provider)
+	}
+	return m.refreshProviderForRequest(
+		ctx,
+		expected.ID,
+		authAccessToken(expected),
+		"chatgpt-web",
+		expected,
+	)
+}
+
 // LinkedCodexSourceToken is the non-secret subset a linked ChatGPT Web
 // credential may inherit from its Codex source.
 type LinkedCodexSourceToken struct {
@@ -9337,6 +9795,11 @@ func (m *Manager) RefreshLinkedCodexSource(ctx context.Context, sourceID, source
 	identityDigest := sha256.Sum256([]byte(expectedIdentity))
 	flightKey := fmt.Sprintf("linked-codex\x00%s\x00%s\x00%x\x00%x", sourceID, sourceUID, identityDigest[:8], tokenDigest[:8])
 	resultChannel := m.requestRefreshFlights.DoChan(flightKey, func() (any, error) {
+		releaseFlight, errFlight := m.beginRequestRefreshFlight()
+		if errFlight != nil {
+			return nil, errFlight
+		}
+		defer releaseFlight()
 		workerCtx, cancelWorker := context.WithTimeout(context.WithoutCancel(ctx), chatgptwebauth.DefaultAcquisitionTimeout)
 		defer cancelWorker()
 		validate := func(source *Auth) error {
@@ -9669,6 +10132,8 @@ func (m *Manager) applyRefreshedAuth(ctx context.Context, expected, refreshBasel
 		}
 		return result, errRetired
 	}
+	refreshOutput := updated.Clone()
+	refreshIdentityChanged := ChatGPTWebCredentialRefreshIdentityChanged(refreshBaseline, refreshOutput)
 	unlockPersist := m.lockPersistKey(id)
 
 	m.mu.Lock()
@@ -9687,6 +10152,9 @@ func (m *Manager) applyRefreshedAuth(ctx context.Context, expected, refreshBasel
 		updated.indexAssigned = current.indexAssigned
 	}
 	updated.EnsureIndex()
+	if !refreshIdentityChanged {
+		carryForwardConcurrentRefreshMetadata(refreshBaseline, current, refreshOutput, updated)
+	}
 	credentialChanged := prepareRefreshedChatGPTWebCredentialReplacement(current, updated, time.Now())
 	if !credentialChanged {
 		carryForwardConcurrentRefreshRuntimeState(refreshBaseline, current, updated)
@@ -9714,6 +10182,9 @@ func (m *Manager) applyRefreshedAuth(ctx context.Context, expected, refreshBasel
 			m.queueRefreshReschedule(id)
 		}
 		return nil, nil
+	}
+	if !refreshIdentityChanged {
+		carryForwardConcurrentRefreshMetadata(refreshBaseline, current, refreshOutput, updated)
 	}
 	credentialChanged = prepareRefreshedChatGPTWebCredentialReplacement(current, updated, time.Now())
 	if !credentialChanged {
@@ -9788,7 +10259,6 @@ func carryForwardConcurrentRefreshRuntimeState(baseline, current, next *Auth) {
 	if baseline == nil || current == nil || next == nil {
 		return
 	}
-	carryForwardConcurrentRefreshMetadata(baseline, current, next)
 	if baseline.Status == current.Status &&
 		baseline.StatusMessage == current.StatusMessage &&
 		baseline.Unavailable == current.Unavailable &&
@@ -9813,43 +10283,131 @@ func carryForwardConcurrentRefreshRuntimeState(baseline, current, next *Auth) {
 	applyLifecycleRuntimeState(next)
 }
 
-func carryForwardConcurrentRefreshMetadata(baseline, current, next *Auth) {
-	if baseline == nil || current == nil || next == nil {
+func carryForwardConcurrentRefreshMetadata(baseline, current, refreshed, next *Auth) {
+	if baseline == nil || current == nil || refreshed == nil || next == nil {
 		return
 	}
 	baselineCredential, errBaseline := chatgptwebauth.ParseCredential(baseline.Metadata)
 	currentCredential, errCurrent := chatgptwebauth.ParseCredential(current.Metadata)
-	nextCredential, errNext := chatgptwebauth.ParseCredential(next.Metadata)
-	if errBaseline == nil && errCurrent == nil && errNext == nil &&
-		!reflect.DeepEqual(currentCredential.Cookies, baselineCredential.Cookies) {
-		if next.Metadata == nil {
-			next.Metadata = make(map[string]any)
-		}
-		if reflect.DeepEqual(nextCredential.Cookies, baselineCredential.Cookies) {
-			next.Metadata["cookies"] = append([]chatgptwebauth.Cookie(nil), currentCredential.Cookies...)
-		} else {
-			next.Metadata["cookies"] = chatgptwebauth.MergeCookieDelta(currentCredential.Cookies, baselineCredential.Cookies, nextCredential.Cookies)
+	refreshedCredential, errRefreshed := chatgptwebauth.ParseCredential(refreshed.Metadata)
+	if errBaseline == nil && errCurrent == nil && errRefreshed == nil {
+		switch {
+		case reflect.DeepEqual(currentCredential.Cookies, baselineCredential.Cookies):
+			value, present := authMetadataEntry(refreshed.Metadata, "cookies")
+			setAuthMetadataEntry(next, "cookies", value, present)
+		case reflect.DeepEqual(refreshedCredential.Cookies, baselineCredential.Cookies):
+			value, present := authMetadataEntry(current.Metadata, "cookies")
+			setAuthMetadataEntry(next, "cookies", value, present)
+		default:
+			cookies := chatgptwebauth.MergeCookieDelta(
+				currentCredential.Cookies,
+				baselineCredential.Cookies,
+				refreshedCredential.Cookies,
+			)
+			setAuthMetadataEntry(next, "cookies", append([]chatgptwebauth.Cookie(nil), cookies...), true)
 		}
 	}
-	for _, key := range []string{"persona", "device_id", "session_id"} {
-		baselineValue := authMetadataValue(baseline.Metadata, key)
-		currentValue := authMetadataValue(current.Metadata, key)
-		nextValue := authMetadataValue(next.Metadata, key)
-		if reflect.DeepEqual(currentValue, baselineValue) || !reflect.DeepEqual(nextValue, baselineValue) {
+
+	for _, key := range []string{
+		"persona",
+		"device_id",
+		"session_id",
+		"account_id",
+		"user_id",
+		"plan_type",
+		"profile_updated_at",
+		"image_quota_remaining",
+		"image_quota_reset_at",
+		"quota_state",
+		"quota_updated_at",
+		"quota_stale",
+		"quota_last_error",
+	} {
+		baselineValue, baselineOK := authMetadataEntry(baseline.Metadata, key)
+		currentValue, currentOK := authMetadataEntry(current.Metadata, key)
+		refreshedValue, refreshedOK := authMetadataEntry(refreshed.Metadata, key)
+		baselineCompareValue, baselineCompareOK := baselineValue, baselineOK
+		currentCompareValue, currentCompareOK := currentValue, currentOK
+		refreshedCompareValue, refreshedCompareOK := refreshedValue, refreshedOK
+		if errBaseline == nil && errCurrent == nil && errRefreshed == nil {
+			baselineCompareValue, baselineCompareOK = chatGPTWebCredentialMetadataEntry(baselineCredential, key)
+			currentCompareValue, currentCompareOK = chatGPTWebCredentialMetadataEntry(currentCredential, key)
+			refreshedCompareValue, refreshedCompareOK = chatGPTWebCredentialMetadataEntry(refreshedCredential, key)
+		}
+		if !authMetadataEntriesEqual(currentCompareValue, currentCompareOK, baselineCompareValue, baselineCompareOK) &&
+			authMetadataEntriesEqual(refreshedCompareValue, refreshedCompareOK, baselineCompareValue, baselineCompareOK) {
+			setAuthMetadataEntry(next, key, currentValue, currentOK)
 			continue
 		}
-		if next.Metadata == nil {
-			next.Metadata = make(map[string]any)
-		}
-		next.Metadata[key] = currentValue
+		setAuthMetadataEntry(next, key, refreshedValue, refreshedOK)
 	}
 }
 
-func authMetadataValue(metadata map[string]any, key string) any {
-	if metadata == nil {
-		return nil
+func chatGPTWebCredentialMetadataEntry(credential *chatgptwebauth.Credential, key string) (any, bool) {
+	if credential == nil {
+		return nil, false
 	}
-	return metadata[key]
+	switch key {
+	case "persona":
+		return credential.Persona, true
+	case "device_id":
+		return strings.TrimSpace(credential.DeviceID), true
+	case "session_id":
+		return strings.TrimSpace(credential.SessionID), true
+	case "account_id":
+		return strings.TrimSpace(credential.AccountID), true
+	case "user_id":
+		return strings.TrimSpace(credential.UserID), true
+	case "plan_type":
+		return strings.TrimSpace(credential.PlanType), true
+	case "profile_updated_at":
+		return strings.TrimSpace(credential.ProfileUpdatedAt), true
+	case "image_quota_remaining":
+		if credential.ImageQuotaRemaining == nil {
+			return nil, false
+		}
+		return *credential.ImageQuotaRemaining, true
+	case "image_quota_reset_at":
+		return strings.TrimSpace(credential.ImageQuotaResetAt), true
+	case "quota_state":
+		return chatgptwebauth.NormalizeQuotaState(credential.QuotaState, credential.ImageQuotaRemaining), true
+	case "quota_updated_at":
+		return strings.TrimSpace(credential.QuotaUpdatedAt), true
+	case "quota_stale":
+		return credential.QuotaStale, true
+	case "quota_last_error":
+		return chatgptwebauth.SafeQuotaError(credential.QuotaLastError), true
+	default:
+		return nil, false
+	}
+}
+
+func authMetadataEntry(metadata map[string]any, key string) (any, bool) {
+	if metadata == nil {
+		return nil, false
+	}
+	value, ok := metadata[key]
+	return value, ok
+}
+
+func authMetadataEntriesEqual(first any, firstOK bool, second any, secondOK bool) bool {
+	return firstOK == secondOK && reflect.DeepEqual(first, second)
+}
+
+func setAuthMetadataEntry(auth *Auth, key string, value any, present bool) {
+	if auth == nil {
+		return
+	}
+	if !present {
+		if auth.Metadata != nil {
+			delete(auth.Metadata, key)
+		}
+		return
+	}
+	if auth.Metadata == nil {
+		auth.Metadata = make(map[string]any)
+	}
+	auth.Metadata[key] = value
 }
 
 func clearRefreshPendingMarker(auth *Auth, pendingUntil time.Time) bool {

@@ -79,6 +79,255 @@ type chatGPTWebImageSettleError struct {
 	headers http.Header
 }
 
+type chatGPTWebImageQuotaResultError struct {
+	cause     error
+	committed bool
+}
+
+type chatGPTWebImageRateLimitResultError struct {
+	cause     error
+	committed bool
+}
+
+func chatGPTWebImageResultStatusCode(err error) int {
+	var provider interface{ StatusCode() int }
+	if errors.As(err, &provider) && provider != nil {
+		return provider.StatusCode()
+	}
+	return 0
+}
+
+func chatGPTWebImageResultHeaders(err error) http.Header {
+	var provider interface{ Headers() http.Header }
+	if !errors.As(err, &provider) || provider == nil {
+		return nil
+	}
+	headers := provider.Headers()
+	if headers == nil {
+		return nil
+	}
+	return headers.Clone()
+}
+
+func chatGPTWebImageResultRetryAfter(err error) *time.Duration {
+	var provider interface{ RetryAfter() *time.Duration }
+	if !errors.As(err, &provider) || provider == nil {
+		return nil
+	}
+	retryAfter := provider.RetryAfter()
+	if retryAfter == nil {
+		return nil
+	}
+	value := *retryAfter
+	return &value
+}
+
+func chatGPTWebImageResultSkipAuthResult(err error) bool {
+	var provider interface{ SkipAuthResult() bool }
+	return errors.As(err, &provider) && provider != nil && provider.SkipAuthResult()
+}
+
+func chatGPTWebImageResultRetryOtherAuth(err error) bool {
+	var provider interface{ RetryOtherAuth() bool }
+	return errors.As(err, &provider) && provider != nil && provider.RetryOtherAuth()
+}
+
+func (e *chatGPTWebImageRateLimitResultError) Error() string {
+	if e == nil || e.cause == nil {
+		return "chatgpt web image request rate limited"
+	}
+	return e.cause.Error()
+}
+
+func (e *chatGPTWebImageRateLimitResultError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.cause
+}
+
+func (*chatGPTWebImageRateLimitResultError) ExecutionResultModel() string {
+	return chatgptwebauth.ImageModel
+}
+
+func (e *chatGPTWebImageRateLimitResultError) RequestCommitted() bool {
+	return e != nil && e.committed
+}
+
+func (e *chatGPTWebImageRateLimitResultError) StatusCode() int {
+	if e == nil {
+		return 0
+	}
+	return chatGPTWebImageResultStatusCode(e.cause)
+}
+
+func (e *chatGPTWebImageRateLimitResultError) Headers() http.Header {
+	if e == nil {
+		return nil
+	}
+	return chatGPTWebImageResultHeaders(e.cause)
+}
+
+func (e *chatGPTWebImageRateLimitResultError) RetryAfter() *time.Duration {
+	if e == nil {
+		return nil
+	}
+	return chatGPTWebImageResultRetryAfter(e.cause)
+}
+
+func (e *chatGPTWebImageRateLimitResultError) SkipAuthResult() bool {
+	return e != nil && chatGPTWebImageResultSkipAuthResult(e.cause)
+}
+
+func (e *chatGPTWebImageRateLimitResultError) RetryOtherAuth() bool {
+	return e != nil && chatGPTWebImageResultRetryOtherAuth(e.cause)
+}
+
+func (e *chatGPTWebImageQuotaResultError) Error() string {
+	if e == nil || e.cause == nil {
+		return "chatgpt web image quota exhausted"
+	}
+	return e.cause.Error()
+}
+
+func (e *chatGPTWebImageQuotaResultError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.cause
+}
+
+func (*chatGPTWebImageQuotaResultError) ExecutionResultModel() string {
+	return chatgptwebauth.ImageModel
+}
+
+func (*chatGPTWebImageQuotaResultError) ExecutionResultErrorCode() string {
+	return "chatgpt_web_image_quota"
+}
+
+func (e *chatGPTWebImageQuotaResultError) RequestCommitted() bool {
+	return e != nil && e.committed
+}
+
+func (e *chatGPTWebImageQuotaResultError) StatusCode() int {
+	if e == nil {
+		return 0
+	}
+	return chatGPTWebImageResultStatusCode(e.cause)
+}
+
+func (e *chatGPTWebImageQuotaResultError) Headers() http.Header {
+	if e == nil {
+		return nil
+	}
+	return chatGPTWebImageResultHeaders(e.cause)
+}
+
+func (e *chatGPTWebImageQuotaResultError) RetryAfter() *time.Duration {
+	if e == nil {
+		return nil
+	}
+	return chatGPTWebImageResultRetryAfter(e.cause)
+}
+
+func (e *chatGPTWebImageQuotaResultError) SkipAuthResult() bool {
+	return e != nil && chatGPTWebImageResultSkipAuthResult(e.cause)
+}
+
+func (e *chatGPTWebImageQuotaResultError) RetryOtherAuth() bool {
+	return e != nil && chatGPTWebImageResultRetryOtherAuth(e.cause)
+}
+
+func chatGPTWebImageRequestError(err error) error {
+	if err == nil {
+		return nil
+	}
+	var projected *chatGPTWebImageQuotaResultError
+	if errors.As(err, &projected) {
+		return err
+	}
+	var rateLimited *chatGPTWebImageRateLimitResultError
+	if errors.As(err, &rateLimited) {
+		return err
+	}
+	var status interface{ StatusCode() int }
+	if !errors.As(err, &status) || status == nil || status.StatusCode() != http.StatusTooManyRequests {
+		return err
+	}
+	if !chatGPTWebImageQuotaErrorEvidence(err) {
+		return &chatGPTWebImageRateLimitResultError{cause: err}
+	}
+	return &chatGPTWebImageQuotaResultError{cause: err}
+}
+
+func chatGPTWebImageRequestErrorWithRefresh(err error, triggerRefresh func()) error {
+	projected := chatGPTWebImageRequestError(err)
+	var rateLimited *chatGPTWebImageRateLimitResultError
+	var quotaExhausted *chatGPTWebImageQuotaResultError
+	if triggerRefresh != nil &&
+		(errors.As(projected, &rateLimited) || errors.As(projected, &quotaExhausted)) {
+		triggerRefresh()
+	}
+	return projected
+}
+
+func (e *ChatGPTWebExecutor) handleChatGPTWebImageRequestError(authID string, err error) error {
+	return chatGPTWebImageRequestErrorWithRefresh(err, func() {
+		e.TriggerAutomaticAccountInfoRefresh(authID)
+	})
+}
+
+func chatGPTWebImageQuotaErrorEvidence(err error) bool {
+	var upstream chatGPTWebHTTPError
+	if !errors.As(err, &upstream) || !chatGPTWebImageConversationPath(upstream.path) {
+		return false
+	}
+	body := strings.ToLower(strings.TrimSpace(upstream.statusErr.msg))
+	if body == "" {
+		return false
+	}
+	for _, marker := range []string{
+		"image_quota_exhausted",
+		"image_generation_quota_exhausted",
+		"image_generation_limit_reached",
+		"image_gen_limit_reached",
+	} {
+		if strings.Contains(body, marker) {
+			return true
+		}
+	}
+	exhausted := false
+	for _, marker := range []string{"exhausted", "depleted", "reached", "no remaining", `"remaining":0`} {
+		if strings.Contains(body, marker) {
+			exhausted = true
+			break
+		}
+	}
+	if !exhausted {
+		return false
+	}
+	for _, marker := range []string{
+		"image quota",
+		"image generation limit",
+		"image-generation limit",
+		"image_gen limit",
+		"limit for creating images",
+	} {
+		if strings.Contains(body, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func chatGPTWebImageConversationPath(path string) bool {
+	path = strings.TrimSpace(path)
+	return path == "/backend-api/conversation" ||
+		strings.HasPrefix(path, "/backend-api/conversation/") ||
+		path == "/backend-api/f/conversation" ||
+		strings.HasPrefix(path, "/backend-api/f/conversation/")
+}
+
 func newChatGPTWebImageSettleError(cause error) chatGPTWebImageSettleError {
 	err := chatGPTWebImageSettleError{
 		statusErr: statusErr{
@@ -249,7 +498,7 @@ func (e *ChatGPTWebExecutor) executeChatGPTWebImage(ctx context.Context, client 
 		return nil, nil, err
 	}
 	completed, err := e.finishChatGPTWebImage(ctx, client, credential, prepared, execution)
-	return completed, execution.headers, chatGPTWebCommittedRequestError(ctx, err)
+	return completed, execution.headers, chatGPTWebCommittedRequestError(ctx, chatGPTWebImageRequestError(err))
 }
 
 func (e *ChatGPTWebExecutor) beginChatGPTWebImage(ctx context.Context, client *chatgptwebauth.Client, credential *chatgptwebauth.Credential, prepared *chatGPTWebPreparedRequest) (*chatGPTWebImageExecution, error) {
@@ -392,6 +641,9 @@ func (e *ChatGPTWebExecutor) finishChatGPTWebImage(ctx context.Context, client *
 	completed, err := buildPreparedChatGPTWebImageCompletedEvent(prepared.routeModel, imageRequest.OutputFormat, images, usage)
 	if err != nil {
 		return nil, err
+	}
+	if prepared.imageResultState != nil {
+		prepared.imageResultState.MarkSucceeded()
 	}
 	return completed, nil
 }
@@ -2405,6 +2657,14 @@ func chatGPTWebCommittedRequestError(ctx context.Context, err error) error {
 	}
 	if ctx != nil && ctx.Err() != nil {
 		return ctx.Err()
+	}
+	var imageQuotaErr *chatGPTWebImageQuotaResultError
+	if errors.As(err, &imageQuotaErr) {
+		return &chatGPTWebImageQuotaResultError{cause: imageQuotaErr.cause, committed: true}
+	}
+	var imageRateLimitErr *chatGPTWebImageRateLimitResultError
+	if errors.As(err, &imageRateLimitErr) {
+		return &chatGPTWebImageRateLimitResultError{cause: imageRateLimitErr.cause, committed: true}
 	}
 	var settleErr chatGPTWebImageSettleError
 	if errors.As(err, &settleErr) {

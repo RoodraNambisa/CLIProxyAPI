@@ -16,6 +16,13 @@ import (
 
 type LifecycleState string
 type RefreshStrategy string
+type QuotaState string
+
+const (
+	QuotaStateUnknown   QuotaState = "unknown"
+	QuotaStateAvailable QuotaState = "available"
+	QuotaStateExhausted QuotaState = "exhausted"
+)
 
 type Persona struct {
 	Profile             string `json:"profile"`
@@ -97,6 +104,13 @@ type Credential struct {
 	AccountID           string          `json:"account_id,omitempty"`
 	UserID              string          `json:"user_id,omitempty"`
 	PlanType            string          `json:"plan_type,omitempty"`
+	ProfileUpdatedAt    string          `json:"profile_updated_at,omitempty"`
+	ImageQuotaRemaining *int            `json:"image_quota_remaining,omitempty"`
+	ImageQuotaResetAt   string          `json:"image_quota_reset_at,omitempty"`
+	QuotaState          QuotaState      `json:"quota_state,omitempty"`
+	QuotaUpdatedAt      string          `json:"quota_updated_at,omitempty"`
+	QuotaStale          bool            `json:"quota_stale,omitempty"`
+	QuotaLastError      string          `json:"quota_last_error,omitempty"`
 	Password            string          `json:"password"`
 	TOTPSecret          string          `json:"totp_secret"`
 	AccessToken         string          `json:"access_token"`
@@ -153,6 +167,8 @@ func DecodeCredential(data []byte) (*Credential, error) {
 	}
 	credential.LifecycleState = normalizedCredentialLifecycleState(&credential)
 	credential.LifecycleReason = SafeLifecycleReason(credential.LifecycleReason)
+	credential.QuotaState = NormalizeQuotaState(credential.QuotaState, credential.ImageQuotaRemaining)
+	credential.QuotaLastError = SafeQuotaError(credential.QuotaLastError)
 	return &credential, nil
 }
 
@@ -177,9 +193,20 @@ func (credential *Credential) ApplyToMetadata(metadata map[string]any) {
 	metadata["source_identity"] = strings.TrimSpace(credential.SourceIdentity)
 	metadata["source_proxy_url"] = strings.TrimSpace(credential.SourceProxyURL)
 	metadata["email"] = credential.Email
-	metadata["account_id"] = strings.TrimSpace(credential.AccountID)
+	metadata["account_id"] = credential.AccountID
 	metadata["user_id"] = strings.TrimSpace(credential.UserID)
 	metadata["plan_type"] = strings.TrimSpace(credential.PlanType)
+	metadata["profile_updated_at"] = strings.TrimSpace(credential.ProfileUpdatedAt)
+	if credential.ImageQuotaRemaining == nil {
+		delete(metadata, "image_quota_remaining")
+	} else {
+		metadata["image_quota_remaining"] = *credential.ImageQuotaRemaining
+	}
+	metadata["image_quota_reset_at"] = strings.TrimSpace(credential.ImageQuotaResetAt)
+	metadata["quota_state"] = string(NormalizeQuotaState(credential.QuotaState, credential.ImageQuotaRemaining))
+	metadata["quota_updated_at"] = strings.TrimSpace(credential.QuotaUpdatedAt)
+	metadata["quota_stale"] = credential.QuotaStale
+	metadata["quota_last_error"] = SafeQuotaError(credential.QuotaLastError)
 	metadata["password"] = credential.Password
 	metadata["totp_secret"] = credential.TOTPSecret
 	metadata["access_token"] = credential.AccessToken
@@ -196,6 +223,33 @@ func (credential *Credential) ApplyToMetadata(metadata map[string]any) {
 	metadata["last_login_at"] = credential.LastLoginAt
 	metadata["last_refresh_at"] = credential.LastRefreshAt
 	metadata["last_relogin_at"] = credential.LastReloginAt
+}
+
+// NormalizeQuotaState derives a safe quota state while preserving unknown data.
+func NormalizeQuotaState(state QuotaState, remaining *int) QuotaState {
+	if remaining != nil {
+		if *remaining > 0 {
+			return QuotaStateAvailable
+		}
+		return QuotaStateExhausted
+	}
+	state = QuotaState(strings.ToLower(strings.TrimSpace(string(state))))
+	switch state {
+	case QuotaStateUnknown, QuotaStateAvailable, QuotaStateExhausted:
+		return state
+	}
+	return QuotaStateUnknown
+}
+
+// SafeQuotaError returns a bounded non-sensitive quota refresh error category.
+func SafeQuotaError(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "", "unauthorized", "rate_limited", "upstream_unavailable", "network_error",
+		"invalid_response", "identity_mismatch", "credential_unavailable", "canceled":
+		return strings.ToLower(strings.TrimSpace(value))
+	default:
+		return "refresh_failed"
+	}
 }
 
 // NormalizeRefreshStrategy validates an explicit strategy or infers one for

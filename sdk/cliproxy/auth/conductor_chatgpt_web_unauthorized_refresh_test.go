@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -27,8 +28,11 @@ type chatGPTWebRequestRefreshError struct {
 }
 
 type chatGPTWebRefreshPersistenceStore struct {
-	mu    sync.Mutex
-	saved *Auth
+	mu          sync.Mutex
+	saved       *Auth
+	saveStarted chan struct{}
+	releaseSave chan struct{}
+	startOnce   sync.Once
 }
 
 type chatGPTWebDoneObservedContext struct {
@@ -56,6 +60,16 @@ func TestChatGPTWebRequestRefreshNilManagerReturnsError(t *testing.T) {
 func (store *chatGPTWebRefreshPersistenceStore) Save(ctx context.Context, auth *Auth) (string, error) {
 	if err := ctx.Err(); err != nil {
 		return "", err
+	}
+	if store.saveStarted != nil {
+		store.startOnce.Do(func() { close(store.saveStarted) })
+	}
+	if store.releaseSave != nil {
+		select {
+		case <-store.releaseSave:
+		case <-ctx.Done():
+			return "", ctx.Err()
+		}
 	}
 	store.mu.Lock()
 	store.saved = auth.Clone()
@@ -803,6 +817,103 @@ func TestChatGPTWebSuccessfulRefreshPersistenceSurvivesRequestCancellation(t *te
 			t.Fatalf("successful refresh was not persisted: runtime=%#v persisted=%#v", current, persisted)
 		}
 		time.Sleep(time.Millisecond)
+	}
+}
+
+func TestCloseExecutorsWaitsForDetachedChatGPTWebRefreshPersistence(t *testing.T) {
+	saveStarted := make(chan struct{})
+	releaseSave := make(chan struct{})
+	released := false
+	defer func() {
+		if !released {
+			close(releaseSave)
+		}
+	}()
+	store := &chatGPTWebRefreshPersistenceStore{
+		saveStarted: saveStarted,
+		releaseSave: releaseSave,
+	}
+	manager := NewManager(store, &FillFirstSelector{}, nil)
+	executor := &chatGPTWebUnauthorizedRefreshExecutor{}
+	manager.RegisterExecutor(executor)
+	registered, errRegister := manager.Register(WithSkipPersist(t.Context()), &Auth{
+		ID:       "chatgpt-web-close-waits-for-refresh",
+		Provider: "chatgpt-web",
+		Status:   StatusActive,
+		Metadata: map[string]any{
+			"access_token":    "stale",
+			"refresh_token":   "refresh",
+			"lifecycle_state": LifecycleStateActive,
+		},
+	})
+	if errRegister != nil {
+		t.Fatalf("Register() error: %v", errRegister)
+	}
+
+	type refreshResult struct {
+		auth *Auth
+		err  error
+	}
+	refreshDone := make(chan refreshResult, 1)
+	go func() {
+		refreshed, errRefresh := manager.refreshProviderForRequest(
+			t.Context(),
+			registered.ID,
+			authAccessToken(registered),
+			"chatgpt-web",
+			registered,
+		)
+		refreshDone <- refreshResult{auth: refreshed, err: errRefresh}
+	}()
+	select {
+	case <-saveStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("request refresh did not reach persistence")
+	}
+
+	closeDone := make(chan error, 1)
+	go func() {
+		closeDone <- manager.CloseExecutors()
+	}()
+	select {
+	case errClose := <-closeDone:
+		t.Fatalf("CloseExecutors() returned before refresh persistence completed: %v", errClose)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(releaseSave)
+	released = true
+	select {
+	case result := <-refreshDone:
+		if result.err != nil {
+			t.Fatalf("refreshProviderForRequest() error: %v", result.err)
+		}
+		if result.auth == nil || authAccessToken(result.auth) != "fresh" {
+			t.Fatalf("refreshed auth = %#v", result.auth)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("request refresh did not finish after persistence was released")
+	}
+	select {
+	case errClose := <-closeDone:
+		if errClose != nil {
+			t.Fatalf("CloseExecutors() error: %v", errClose)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("CloseExecutors() did not wait for and finish the request refresh")
+	}
+	persisted := store.snapshot()
+	if persisted == nil || authAccessToken(persisted) != "fresh" {
+		t.Fatalf("persisted auth = %#v", persisted)
+	}
+	if _, errRefresh := manager.refreshProviderForRequest(
+		t.Context(),
+		registered.ID,
+		authAccessToken(registered),
+		"chatgpt-web",
+		registered,
+	); errRefresh == nil || !strings.Contains(errRefresh.Error(), "executors are closed") {
+		t.Fatalf("post-close refresh error = %v, want closed executor error", errRefresh)
 	}
 }
 

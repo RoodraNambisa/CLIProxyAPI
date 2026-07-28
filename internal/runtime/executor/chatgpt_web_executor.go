@@ -77,6 +77,7 @@ type ChatGPTWebExecutor struct {
 	searchMaxPolls            int
 	streamInitialWait         time.Duration
 	streamHeartbeat           time.Duration
+	accountInfoTimeout        time.Duration
 	now                       func() time.Time
 	reloginBackoff            func(int) time.Duration
 	reloginSlotAcquired       func()
@@ -90,6 +91,7 @@ type ChatGPTWebExecutor struct {
 	loginWG                   sync.WaitGroup
 	sentinelRuntime           helps.ChatGPTWebSentinelRuntime
 	usageCache                *helps.ChatGPTWebUsageCache
+	accountInfo               *chatGPTWebAccountInfoRuntime
 	sentinelSDKFetcherFactory func(*chatgptwebauth.Client, *chatgptwebauth.Credential) chatgptwebauth.SentinelSDKFetcher
 	backgroundMu              sync.Mutex
 	backgroundWG              sync.WaitGroup
@@ -124,6 +126,7 @@ func NewChatGPTWebExecutorWithLoginCoordinator(cfg *config.Config, manager *clip
 		searchMaxPolls:     chatGPTWebSearchMaxPollAttempts,
 		streamInitialWait:  time.Second,
 		streamHeartbeat:    15 * time.Second,
+		accountInfoTimeout: chatgptwebauth.DefaultAcquisitionTimeout,
 		now:                time.Now,
 		reloginBackoff:     chatGPTWebBackgroundReloginBackoff,
 		reloginSlots:       chatGPTWebBackgroundReloginSlots,
@@ -136,6 +139,8 @@ func NewChatGPTWebExecutorWithLoginCoordinator(cfg *config.Config, manager *clip
 		lifecycleCancel:    lifecycleCancel,
 	}
 	executor.UpdateConfig(cfg)
+	executor.accountInfo = newChatGPTWebAccountInfoRuntime(executor, executor.configSnapshot())
+	executor.accountInfo.start()
 	return executor
 }
 
@@ -153,6 +158,9 @@ func (e *ChatGPTWebExecutor) Close() error {
 		}
 	}
 	e.backgroundMu.Unlock()
+	if e.accountInfo != nil {
+		e.accountInfo.close()
+	}
 	e.refreshWG.Wait()
 	e.backgroundWG.Wait()
 	e.reloginWG.Wait()
@@ -164,6 +172,25 @@ func (e *ChatGPTWebExecutor) Close() error {
 		e.usageCache.Close()
 	}
 	return nil
+}
+
+// CloseAuthInstanceExecutionSessions clears account-info work owned by a
+// removed or replaced credential runtime.
+func (e *ChatGPTWebExecutor) CloseAuthInstanceExecutionSessions(authID string, authInstanceID string, reason string) {
+	if e == nil || e.accountInfo == nil {
+		return
+	}
+	switch strings.TrimSpace(reason) {
+	case "auth_runtime_replaced", "auth_refreshed", "auth_delete_rolled_back":
+		authInstanceID = strings.TrimSpace(authInstanceID)
+		if authInstanceID == "" {
+			return
+		}
+		e.accountInfo.removeAuthInstance(authID, authInstanceID)
+	case "auth_removed", "auth_delete_uncertain", "auth_retired", "auth_reloaded",
+		"auth_replaced", "auth_identity_changed":
+		e.accountInfo.removeAuthInstance(authID, authInstanceID)
+	}
 }
 
 // Identifier returns the provider identifier.
@@ -180,6 +207,9 @@ func (e *ChatGPTWebExecutor) UpdateConfig(cfg *config.Config) {
 		if e.sentinelRuntime != nil {
 			e.sentinelRuntime.UpdateConfig(chatgptwebauth.SentinelRuntimeConfig{})
 		}
+		if e.accountInfo != nil {
+			e.accountInfo.updateConfig(nil)
+		}
 		return
 	}
 	snapshot, errClone := cloneChatGPTWebExecutorConfig(cfg)
@@ -190,6 +220,9 @@ func (e *ChatGPTWebExecutor) UpdateConfig(cfg *config.Config) {
 	e.cfg.Store(snapshot)
 	if e.sentinelRuntime != nil {
 		e.sentinelRuntime.UpdateConfig(chatGPTWebSentinelRuntimeConfig(snapshot))
+	}
+	if e.accountInfo != nil {
+		e.accountInfo.updateConfig(snapshot)
 	}
 }
 

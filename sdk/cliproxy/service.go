@@ -8,6 +8,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -16,6 +17,7 @@ import (
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/api"
+	chatgptwebauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/chatgptweb"
 	internalcodex "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/codex"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/authfileguard"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/proxypool"
@@ -274,6 +276,7 @@ func (h authMaintenanceHook) handleAuthChange(ctx context.Context, auth *coreaut
 		}
 		if nativeChatGPTWeb := isNativeChatGPTWebAuth(auth); nativeChatGPTWeb {
 			h.service.ensureExecutorsForAuth(auth)
+			h.service.syncChatGPTWebAccountInfoRecovery(auth)
 		}
 		return
 	}
@@ -291,6 +294,7 @@ func (h authMaintenanceHook) handleAuthChange(ctx context.Context, auth *coreaut
 	registeredProvider := registry.GetGlobalRegistry().GetProviderForClient(auth.ID)
 	if nativeChatGPTWeb {
 		h.service.ensureExecutorsForAuth(auth)
+		h.service.syncChatGPTWebAccountInfoRecovery(auth)
 	}
 	if provider != "antigravity" {
 		h.service.antigravityModelCapabilities.Delete(auth.ID)
@@ -356,8 +360,33 @@ func (h authMaintenanceHook) handleAuthChange(ctx context.Context, auth *coreaut
 
 func (h authMaintenanceHook) OnResult(ctx context.Context, result coreauth.Result) {
 	if h.service != nil {
+		h.service.triggerChatGPTWebAccountInfoRefresh(result)
 		h.service.handleAuthMaintenanceResult(ctx, result)
 	}
+}
+
+func (s *Service) triggerChatGPTWebAccountInfoRefresh(result coreauth.Result) {
+	if s == nil || s.coreManager == nil || result.Success ||
+		!strings.EqualFold(strings.TrimSpace(result.Provider), chatgptwebauth.Provider) ||
+		!strings.EqualFold(strings.TrimSpace(result.Model), chatgptwebauth.ImageModel) ||
+		result.Error == nil || result.Error.StatusCode() != http.StatusTooManyRequests {
+		return
+	}
+	authID := strings.TrimSpace(result.AuthID)
+	if authID == "" {
+		return
+	}
+	registered, ok := s.coreManager.Executor(chatgptwebauth.Provider)
+	if !ok || registered == nil {
+		return
+	}
+	trigger, ok := registered.(interface {
+		TriggerAutomaticAccountInfoRefresh(string) bool
+	})
+	if !ok {
+		return
+	}
+	trigger.TriggerAutomaticAccountInfoRefresh(authID)
 }
 
 func usagePersistenceIntervalForConfig(cfg *config.Config) time.Duration {
@@ -784,27 +813,83 @@ func authMaintenanceReason(auth *coreauth.Auth) string {
 }
 
 func authMaintenanceStatusCode(auth *coreauth.Auth, result *coreauth.Result) int {
+	statusCode := 0
 	if result != nil && result.Error != nil && result.Error.HTTPStatus > 0 {
-		return result.Error.HTTPStatus
+		statusCode = result.Error.HTTPStatus
+	} else if auth != nil {
+		if auth.LastError != nil && auth.LastError.HTTPStatus > 0 {
+			statusCode = auth.LastError.HTTPStatus
+		} else {
+			switch strings.ToLower(strings.TrimSpace(auth.StatusMessage)) {
+			case "unauthorized":
+				statusCode = 401
+			case "payment_required":
+				statusCode = 402
+			case "not_found":
+				statusCode = 404
+			case "quota exhausted":
+				statusCode = 429
+			}
+		}
 	}
-	if auth == nil {
+	if statusCode == http.StatusTooManyRequests && chatGPTWebImageOnlyMaintenanceResult(auth, result) {
 		return 0
 	}
-	if auth.LastError != nil && auth.LastError.HTTPStatus > 0 {
-		return auth.LastError.HTTPStatus
+	return statusCode
+}
+
+func chatGPTWebImageOnlyMaintenanceResult(auth *coreauth.Auth, result *coreauth.Result) bool {
+	if auth == nil || !strings.EqualFold(strings.TrimSpace(auth.Provider), chatgptwebauth.Provider) {
+		return false
 	}
-	switch strings.ToLower(strings.TrimSpace(auth.StatusMessage)) {
-	case "unauthorized":
-		return 401
-	case "payment_required":
-		return 402
-	case "not_found":
-		return 404
-	case "quota exhausted":
-		return 429
-	default:
-		return 0
+	if result != nil {
+		return strings.EqualFold(strings.TrimSpace(result.Model), chatgptwebauth.ImageModel)
 	}
+	if auth.LastError == nil {
+		return false
+	}
+	explicitImageQuota := strings.EqualFold(strings.TrimSpace(auth.LastError.Code), "chatgpt_web_image_quota")
+	if auth.LastError.HTTPStatus != http.StatusTooManyRequests {
+		return explicitImageQuota
+	}
+	var (
+		imageMatch      bool
+		imageMatchAt    time.Time
+		nonImageMatch   bool
+		nonImageMatchAt time.Time
+	)
+	for model, state := range auth.ModelStates {
+		if state == nil ||
+			state.LastError == nil ||
+			state.LastError.HTTPStatus != http.StatusTooManyRequests ||
+			!authMaintenanceErrorsEqual(state.LastError, auth.LastError) {
+			continue
+		}
+		if strings.EqualFold(strings.TrimSpace(model), chatgptwebauth.ImageModel) {
+			imageMatch = true
+			if state.UpdatedAt.After(imageMatchAt) {
+				imageMatchAt = state.UpdatedAt
+			}
+			continue
+		}
+		nonImageMatch = true
+		if state.UpdatedAt.After(nonImageMatchAt) {
+			nonImageMatchAt = state.UpdatedAt
+		}
+	}
+	if !imageMatch {
+		return explicitImageQuota && !nonImageMatch
+	}
+	return !nonImageMatch || imageMatchAt.After(nonImageMatchAt)
+}
+
+func authMaintenanceErrorsEqual(first, second *coreauth.Error) bool {
+	if first == nil || second == nil {
+		return false
+	}
+	return first.HTTPStatus == second.HTTPStatus &&
+		strings.EqualFold(strings.TrimSpace(first.Code), strings.TrimSpace(second.Code)) &&
+		strings.TrimSpace(first.Message) == strings.TrimSpace(second.Message)
 }
 
 func authEligibleForMaintenanceDelete(auth *coreauth.Auth, result *coreauth.Result, cfg config.AuthMaintenanceConfig) (string, bool) {
@@ -820,7 +905,7 @@ func authEligibleForMaintenanceDelete(auth *coreauth.Auth, result *coreauth.Resu
 	if statusCode := authMaintenanceStatusCode(auth, result); containsStatusCode(cfg.DeleteStatusCodes, statusCode) {
 		return fmt.Sprintf("http_%d", statusCode), true
 	}
-	if cfg.DeleteQuotaExceeded && auth.Quota.Exceeded && auth.Quota.StrikeCount >= cfg.QuotaStrikeThreshold {
+	if cfg.DeleteQuotaExceeded && auth.HasAccountMaintenanceQuotaExceeded() && auth.Quota.StrikeCount >= cfg.QuotaStrikeThreshold {
 		return fmt.Sprintf("quota_delete_%d", auth.Quota.StrikeCount), true
 	}
 	return "", false
@@ -840,7 +925,7 @@ func authEligibleForMaintenanceDisable(auth *coreauth.Auth, result *coreauth.Res
 	if cfg.DeleteQuotaExceeded && cfg.DisableQuotaExceeded {
 		return "", false
 	}
-	if cfg.DisableQuotaExceeded && auth.Quota.Exceeded && auth.Quota.StrikeCount >= cfg.DisableQuotaStrikeThreshold {
+	if cfg.DisableQuotaExceeded && auth.HasAccountMaintenanceQuotaExceeded() && auth.Quota.StrikeCount >= cfg.DisableQuotaStrikeThreshold {
 		return fmt.Sprintf("quota_disable_%d", auth.Quota.StrikeCount), true
 	}
 	return "", false
@@ -910,6 +995,21 @@ func (s *Service) triggerChatGPTWebRelogin(auth *coreauth.Auth) {
 		return
 	}
 	chatGPTWebExecutor.TriggerBackgroundRelogin(auth)
+}
+
+func (s *Service) syncChatGPTWebAccountInfoRecovery(auth *coreauth.Auth) {
+	if s == nil || s.coreManager == nil || auth == nil {
+		return
+	}
+	registered, ok := s.coreManager.Executor(chatgptwebauth.Provider)
+	if !ok {
+		return
+	}
+	chatGPTWebExecutor, ok := registered.(*executor.ChatGPTWebExecutor)
+	if !ok {
+		return
+	}
+	chatGPTWebExecutor.SyncAccountInfoRecovery(auth)
 }
 
 func (s *Service) enqueueAuthMaintenanceCandidate(candidate authMaintenanceCandidate) bool {

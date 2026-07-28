@@ -12,22 +12,48 @@ import (
 
 type authFileRuntimeSummary struct {
 	proxyBinding *proxypool.BindingStatus
+	accountInfo  *chatgptwebauth.AccountInfoAuthRuntimeState
 }
 
 func (h *Handler) authFileRuntimeSummaries() map[string]authFileRuntimeSummary {
+	if h == nil {
+		return make(map[string]authFileRuntimeSummary)
+	}
+	h.mu.Lock()
+	authManager := h.authManager
+	h.mu.Unlock()
+	return h.authFileRuntimeSummariesForManager(authManager)
+}
+
+func (h *Handler) authFileRuntimeSummariesForManager(authManager *coreauth.Manager) map[string]authFileRuntimeSummary {
 	summaries := make(map[string]authFileRuntimeSummary)
 	if h == nil {
 		return summaries
 	}
 	h.mu.Lock()
-	manager := h.proxyPoolManager
+	proxyManager := h.proxyPoolManager
 	h.mu.Unlock()
-	if manager == nil {
+	if proxyManager != nil {
+		for _, status := range proxyManager.BindingStatuses() {
+			statusCopy := status
+			summary := summaries[status.AuthID]
+			summary.proxyBinding = &statusCopy
+			summaries[status.AuthID] = summary
+		}
+	}
+	controller, ok := chatGPTWebAccountInfoControllerForManager(authManager)
+	if !ok || authManager == nil {
 		return summaries
 	}
-	for _, status := range manager.BindingStatuses() {
-		statusCopy := status
-		summaries[status.AuthID] = authFileRuntimeSummary{proxyBinding: &statusCopy}
+	for _, auth := range authManager.List() {
+		if auth == nil || !strings.EqualFold(strings.TrimSpace(auth.Provider), chatgptwebauth.Provider) {
+			continue
+		}
+		state := controller.AccountInfoAuthState(auth.ID)
+		stateCopy := state
+		summary := summaries[auth.ID]
+		summary.accountInfo = &stateCopy
+		summaries[auth.ID] = summary
 	}
 	return summaries
 }
@@ -41,28 +67,48 @@ func authFileRuntimeSummaryForAuth(auth *coreauth.Auth, graph *coreauth.ChatGPTW
 		return authFileRuntimeSummary{}
 	}
 	if sourceUID := coreauth.ChatGPTWebLinkedSourceUID(auth); sourceUID != "" {
+		ownSummary := summaries[auth.ID]
 		source, ambiguous := graph.SourceByUID(sourceUID)
 		if ambiguous {
-			return authFileRuntimeSummary{}
+			return ownSummary
 		}
 		sourceID := coreauth.ChatGPTWebLinkedSourceID(auth)
 		if source != nil && !coreauth.ChatGPTWebLinkedSourceMatches(auth, source) {
-			return authFileRuntimeSummary{}
+			return ownSummary
 		}
-		summary := summaries[sourceID]
-		if summary.proxyBinding == nil || strings.TrimSpace(summary.proxyBinding.CredentialUID) != sourceUID {
-			return authFileRuntimeSummary{}
+		sourceSummary := summaries[sourceID]
+		if sourceSummary.proxyBinding == nil || strings.TrimSpace(sourceSummary.proxyBinding.CredentialUID) != sourceUID {
+			return ownSummary
 		}
-		return summary
+		ownSummary.proxyBinding = sourceSummary.proxyBinding
+		return ownSummary
 	}
 	return summaries[auth.ID]
 }
 
-func applyChatGPTWebAuthFileSummary(entry gin.H, auth *coreauth.Auth, now time.Time) {
+func applyChatGPTWebAuthFileSummary(entry gin.H, auth *coreauth.Auth, now time.Time, runtimeSummaries ...authFileRuntimeSummary) {
 	if entry == nil || auth == nil || !strings.EqualFold(strings.TrimSpace(auth.Provider), "chatgpt-web") {
 		return
 	}
+	var runtimeSummary authFileRuntimeSummary
+	if len(runtimeSummaries) > 0 {
+		runtimeSummary = runtimeSummaries[0]
+	}
 	applyChatGPTWebMetadataSummary(entry, auth.Metadata, auth.LifecycleState(), now)
+	entry["account_info_refreshable"] = !auth.Disabled &&
+		auth.Status != coreauth.StatusDisabled &&
+		auth.LifecycleRefreshable()
+	if runtimeSummary.accountInfo != nil {
+		entry["quota_refreshing"] = runtimeSummary.accountInfo.Refreshing
+		if !runtimeSummary.accountInfo.NextRefreshAt.IsZero() {
+			entry["quota_next_refresh_at"] = runtimeSummary.accountInfo.NextRefreshAt
+		}
+		if runtimeSummary.accountInfo.LastError != "" {
+			entry["quota_last_error"] = chatgptwebauth.SafeQuotaError(runtimeSummary.accountInfo.LastError)
+		}
+	}
+	credential, _ := chatgptwebauth.ParseCredential(auth.Metadata)
+	applyAuthCooldownStatus(entry, chatGPTWebQuotaCooldownStatus(auth, credential, runtimeSummary.accountInfo, now))
 	if auth.LastError == nil {
 		return
 	}
@@ -108,6 +154,18 @@ func applyChatGPTWebMetadataSummary(entry gin.H, metadata map[string]any, lifecy
 	if credential, errParse := chatgptwebauth.ParseCredential(metadata); errParse == nil {
 		strategy = string(credential.RefreshStrategy)
 		mode = credential.CredentialMode
+		planType := strings.TrimSpace(credential.PlanType)
+		entry["plan_type"] = planType
+		entry["quota_state"] = string(credential.QuotaState)
+		entry["quota_stale"] = credential.QuotaStale
+		if credential.ImageQuotaRemaining != nil {
+			entry["image_quota_remaining"] = *credential.ImageQuotaRemaining
+		}
+		applyChatGPTWebSummaryTime(entry, metadata, "image_quota_reset_at", "image_quota_reset_at")
+		applyChatGPTWebSummaryTime(entry, metadata, "quota_updated_at", "quota_updated_at")
+		if credential.QuotaLastError != "" {
+			entry["quota_last_error"] = chatgptwebauth.SafeQuotaError(credential.QuotaLastError)
+		}
 	}
 	entry["credential_mode"] = mode
 	entry["refresh_strategy"] = strategy
@@ -118,6 +176,89 @@ func applyChatGPTWebMetadataSummary(entry gin.H, metadata map[string]any, lifecy
 	if uid := strings.TrimSpace(stringValue(metadata, "credential_uid")); uid != "" {
 		entry["credential_uid"] = uid
 	}
+}
+
+func chatGPTWebQuotaCooldownStatus(auth *coreauth.Auth, credential *chatgptwebauth.Credential, runtimeState *chatgptwebauth.AccountInfoAuthRuntimeState, now time.Time) authCooldownStatus {
+	status := summarizeAuthCooldown(auth, now)
+	if status.Active && status.Scope == "auth" {
+		return status
+	}
+	if auth == nil || auth.Disabled || auth.Status == coreauth.StatusDisabled {
+		return status
+	}
+	blocked, blockedUntil := coreauth.ChatGPTWebImageCapabilityUnavailable(auth, now)
+	if !blocked {
+		return status
+	}
+	status.Active = true
+	status.Scope = "model"
+	if !modelCooldownForAuth(auth, now, chatgptwebauth.ImageModel).Active {
+		status.ModelCount++
+	}
+	if blockedUntil.After(status.Until) {
+		status.Until = blockedUntil
+	}
+	if until := chatGPTWebQuotaRecheckAt(credential, runtimeState, now); until.After(status.Until) {
+		status.Until = until
+	}
+	return status
+}
+
+func chatGPTWebImageModelCooldownStatus(auth *coreauth.Auth, credential *chatgptwebauth.Credential, runtimeState *chatgptwebauth.AccountInfoAuthRuntimeState, now time.Time, modelIDs ...string) authCooldownStatus {
+	status := modelCooldownForAuth(auth, now, modelIDs...)
+	if status.Active && status.Scope == "auth" {
+		return status
+	}
+	if auth == nil || auth.Disabled || auth.Status == coreauth.StatusDisabled {
+		return status
+	}
+	if !containsChatGPTWebImageModel(modelIDs) {
+		return status
+	}
+	blocked, blockedUntil := coreauth.ChatGPTWebImageCapabilityUnavailable(auth, now)
+	if !blocked {
+		return status
+	}
+	status.Active = true
+	status.Scope = "model"
+	status.ModelCount = 1
+	if blockedUntil.After(status.Until) {
+		status.Until = blockedUntil
+	}
+	if until := chatGPTWebQuotaRecheckAt(credential, runtimeState, now); until.After(status.Until) {
+		status.Until = until
+	}
+	return status
+}
+
+func chatGPTWebQuotaRecheckAt(credential *chatgptwebauth.Credential, runtimeState *chatgptwebauth.AccountInfoAuthRuntimeState, now time.Time) time.Time {
+	if runtimeState != nil && runtimeState.NextRefreshAt.After(now) {
+		return runtimeState.NextRefreshAt
+	}
+	if credential != nil {
+		if resetAt, errParse := time.Parse(time.RFC3339Nano, strings.TrimSpace(credential.ImageQuotaResetAt)); errParse == nil && resetAt.After(now) {
+			return resetAt
+		}
+	}
+	return time.Time{}
+}
+
+func containsChatGPTWebImageModel(modelIDs []string) bool {
+	for _, modelID := range modelIDs {
+		if strings.EqualFold(strings.TrimSpace(modelID), chatgptwebauth.ImageModel) {
+			return true
+		}
+	}
+	return false
+}
+
+func trimModelsPrefix(modelID string) string {
+	modelID = strings.TrimSpace(modelID)
+	const prefix = "models/"
+	if len(modelID) >= len(prefix) && strings.EqualFold(modelID[:len(prefix)], prefix) {
+		return strings.TrimSpace(modelID[len(prefix):])
+	}
+	return modelID
 }
 
 func applyChatGPTWebDependencySummary(entry gin.H, auth *coreauth.Auth, graph *coreauth.ChatGPTWebDependencyGraph) {

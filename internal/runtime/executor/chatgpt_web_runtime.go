@@ -54,6 +54,7 @@ type chatGPTWebPreparedRequest struct {
 	maxImageResults  int
 	usageProjection  *helps.ChatGPTWebUsageProjection
 	bodyRelease      *cliproxyexecutor.RequestBodyReleaseController
+	imageResultState *cliproxyexecutor.ImageGenerationResultState
 }
 
 type chatGPTWebRequirements struct {
@@ -98,7 +99,7 @@ func (e *ChatGPTWebExecutor) executeRuntime(ctx context.Context, auth *cliproxya
 	if prepared.request.Image != nil {
 		completed, headers, errImage := e.executeChatGPTWebImage(ctx, client, credential, prepared)
 		if errImage != nil {
-			return resp, errImage
+			return resp, e.handleChatGPTWebImageRequestError(auth.ID, errImage)
 		}
 		publishChatGPTWebTerminalUsage(ctx, reporter, prepared, completed)
 		var param any
@@ -144,11 +145,11 @@ func (e *ChatGPTWebExecutor) executeRuntimeStream(ctx context.Context, auth *cli
 		if errImage != nil {
 			prepared.discardUsageProjection()
 			e.finishChatGPTWebRuntimeClient(ctx, auth, credential, client)
-			return nil, errImage
+			return nil, e.handleChatGPTWebImageRequestError(auth.ID, errImage)
 		}
 		return e.streamDeferredChatGPTWebResponse(ctx, auth, credential, prepared, client, execution.headers, passthroughState, imageStreamPassthrough, func() ([]byte, error) {
 			completed, errFinish := e.finishChatGPTWebImage(ctx, client, credential, prepared, execution)
-			return completed, chatGPTWebCommittedRequestError(ctx, errFinish)
+			return completed, chatGPTWebCommittedRequestError(ctx, e.handleChatGPTWebImageRequestError(auth.ID, errFinish))
 		}), nil
 	}
 
@@ -417,6 +418,7 @@ func (e *ChatGPTWebExecutor) prepareRuntimeRequest(ctx context.Context, auth *cl
 	}
 	originalPayload := helps.SlimRequestBodyForTranslation(originalSource)
 	canonicalBody = helps.SlimRequestBodyForTranslation(canonicalBody)
+	imageResultState, _ := opts.Metadata[cliproxyexecutor.ImageGenerationResultStateMetadataKey].(*cliproxyexecutor.ImageGenerationResultState)
 	return &chatGPTWebPreparedRequest{
 		baseModel:       baseModel,
 		routeModel:      routeModel,
@@ -427,9 +429,10 @@ func (e *ChatGPTWebExecutor) prepareRuntimeRequest(ctx context.Context, auth *cl
 		terminalMarker:  metadataBool(opts.Metadata, cliproxyexecutor.StreamTerminalMarkerMetadataKey),
 		trustUpstreamSSE: metadataBool(opts.Metadata, cliproxyexecutor.TrustUpstreamSSEMetadataKey) &&
 			responseFormat == sdktranslator.FormatOpenAIResponse,
-		maxImageResults: chatGPTWebMaxImageResults(opts.Metadata),
-		usageProjection: usageProjection,
-		bodyRelease:     cliproxyexecutor.RequestBodyReleaseControllerFromOptions(opts),
+		maxImageResults:  chatGPTWebMaxImageResults(opts.Metadata),
+		usageProjection:  usageProjection,
+		bodyRelease:      cliproxyexecutor.RequestBodyReleaseControllerFromOptions(opts),
+		imageResultState: imageResultState,
 	}, nil
 }
 
@@ -691,6 +694,10 @@ func chatGPTWebMaxImageResults(metadata map[string]any) int {
 }
 
 func (e *ChatGPTWebExecutor) newRuntimeClient(auth *cliproxyauth.Auth) (*chatgptwebauth.Client, *chatgptwebauth.Credential, error) {
+	return e.newRuntimeClientForAcquisition(auth, false)
+}
+
+func (e *ChatGPTWebExecutor) newRuntimeClientForAcquisition(auth *cliproxyauth.Auth, acquisition bool) (*chatgptwebauth.Client, *chatgptwebauth.Credential, error) {
 	if auth == nil {
 		return nil, nil, errors.New("chatgpt web credential is nil")
 	}
@@ -704,7 +711,17 @@ func (e *ChatGPTWebExecutor) newRuntimeClient(auth *cliproxyauth.Auth) (*chatgpt
 	if err = chatgptwebauth.EnsureCredentialRuntimeIDsForURL(credential, chatgptwebauth.CredentialRuntimeIdentityReader(auth.ID, credential), e.chatGPTWebBaseURL()); err != nil {
 		return nil, nil, fmt.Errorf("initialize chatgpt web browser identity: %w", err)
 	}
-	client, err := chatgptwebauth.NewClient(credential.Persona, e.proxyURLForTarget(auth, e.chatGPTWebBaseURL()), credential.Cookies)
+	var client *chatgptwebauth.Client
+	if acquisition {
+		client, err = chatgptwebauth.NewAcquisitionClient(
+			credential.Persona,
+			e.proxyURLForTarget(auth, e.chatGPTWebBaseURL()),
+			credential.Cookies,
+			e.accountInfoTimeout,
+		)
+	} else {
+		client, err = chatgptwebauth.NewClient(credential.Persona, e.proxyURLForTarget(auth, e.chatGPTWebBaseURL()), credential.Cookies)
+	}
 	if err != nil {
 		return nil, nil, fmt.Errorf("create chatgpt web browser client: %w", err)
 	}
@@ -1308,14 +1325,22 @@ func chatGPTWebBootstrapRedirectStatus(status int) bool {
 }
 
 func (e *ChatGPTWebExecutor) doChatGPTWebJSON(ctx context.Context, client *chatgptwebauth.Client, credential *chatgptwebauth.Credential, path string, body any) (*fhttp.Response, []byte, error) {
+	return e.doChatGPTWebJSONWithMaxBody(ctx, client, credential, path, body, chatGPTWebMaxJSONBodyBytes)
+}
+
+func (e *ChatGPTWebExecutor) doChatGPTWebJSONWithMaxBody(ctx context.Context, client *chatgptwebauth.Client, credential *chatgptwebauth.Credential, path string, body any, maxBodyBytes int) (*fhttp.Response, []byte, error) {
 	headers := e.chatGPTWebHeaders(credential, path, map[string]string{
 		"accept":       "application/json",
 		"content-type": "application/json",
 	})
-	return e.doChatGPTWebJSONWithHeaders(ctx, client, credential, path, headers, body)
+	return e.doChatGPTWebJSONWithHeadersAndMaxBody(ctx, client, credential, path, headers, body, maxBodyBytes)
 }
 
 func (e *ChatGPTWebExecutor) doChatGPTWebJSONWithHeaders(ctx context.Context, client *chatgptwebauth.Client, credential *chatgptwebauth.Credential, path string, headers map[string]string, body any) (*fhttp.Response, []byte, error) {
+	return e.doChatGPTWebJSONWithHeadersAndMaxBody(ctx, client, credential, path, headers, body, chatGPTWebMaxJSONBodyBytes)
+}
+
+func (e *ChatGPTWebExecutor) doChatGPTWebJSONWithHeadersAndMaxBody(ctx context.Context, client *chatgptwebauth.Client, credential *chatgptwebauth.Credential, path string, headers map[string]string, body any, maxBodyBytes int) (*fhttp.Response, []byte, error) {
 	payload, _ := json.Marshal(body)
 	e.recordChatGPTWebRequest(ctx, credential, http.MethodPost, path, headers, payload)
 	response, err := client.DoJSONStream(ctx, http.MethodPost, e.chatGPTWebBaseURL()+path, headers, body)
@@ -1324,7 +1349,7 @@ func (e *ChatGPTWebExecutor) doChatGPTWebJSONWithHeaders(ctx context.Context, cl
 		return nil, nil, err
 	}
 	helps.RecordAPIResponseMetadata(ctx, e.configSnapshot(), response.StatusCode, chatGPTWebResponseLogHeaders(response.Header))
-	data, err := readChatGPTWebResponseBody(response, chatGPTWebMaxJSONBodyBytes)
+	data, err := readChatGPTWebResponseBody(response, maxBodyBytes)
 	if err != nil {
 		helps.RecordAPIResponseError(ctx, e.configSnapshot(), err)
 		return response, nil, err
@@ -1372,6 +1397,11 @@ func readChatGPTWebResponseBody(response *fhttp.Response, maxSuccessBytes int) (
 	if response == nil || response.Body == nil {
 		return nil, errors.New("chatgpt web response body is nil")
 	}
+	if response.StatusCode >= 200 && response.StatusCode < 300 &&
+		response.ContentLength > int64(maxSuccessBytes) {
+		_ = response.Body.Close()
+		return nil, chatGPTWebResponseBodyLimitError(maxSuccessBytes)
+	}
 	var (
 		payload []byte
 		errRead error
@@ -1415,13 +1445,17 @@ func readChatGPTWebSuccessBody(body io.Reader, maxBytes int) ([]byte, error) {
 		return nil, fmt.Errorf("read chatgpt web response body: %w", err)
 	}
 	if len(payload) > maxBytes {
-		return nil, statusErr{
-			code:           http.StatusBadGateway,
-			msg:            fmt.Sprintf("chatgpt web response body exceeds %d bytes", maxBytes),
-			skipAuthResult: true,
-		}
+		return nil, chatGPTWebResponseBodyLimitError(maxBytes)
 	}
 	return payload, nil
+}
+
+func chatGPTWebResponseBodyLimitError(maxBytes int) error {
+	return statusErr{
+		code:           http.StatusBadGateway,
+		msg:            fmt.Sprintf("chatgpt web response body exceeds %d bytes", maxBytes),
+		skipAuthResult: true,
+	}
 }
 
 func readChatGPTWebErrorBody(body io.Reader) ([]byte, error) {

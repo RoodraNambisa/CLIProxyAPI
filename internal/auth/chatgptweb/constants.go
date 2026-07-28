@@ -3,7 +3,8 @@ package chatgptweb
 import "time"
 
 const (
-	Provider = "chatgpt-web"
+	Provider   = "chatgpt-web"
+	ImageModel = "gpt-image-2"
 
 	CredentialModeNative      = "native"
 	CredentialModeLinkedCodex = "linked_codex"

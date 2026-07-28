@@ -60,6 +60,50 @@ func TestPayloadHasImageGenerationToolForms(t *testing.T) {
 	}
 }
 
+func TestManagerImageToolFallbackIgnoresDisabledToolChoice(t *testing.T) {
+	for name, toolChoice := range map[string]string{
+		"string":          `"none"`,
+		"object":          `{"type":"none"}`,
+		"explicit search": `{"type":"web_search_preview"}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			manager := NewManager(nil, &FillFirstSelector{}, nil)
+			manager.SetRetryConfig(0, 0, 0)
+			executor := &authFallbackExecutor{id: "chatgpt-web"}
+			manager.RegisterExecutor(executor)
+			model := "image-tool-choice-none-" + uuid.NewString()
+			authID := "image-tool-choice-none-auth-" + uuid.NewString()
+			registerFallbackAuthForModel(t, manager, &Auth{
+				ID:       authID,
+				Provider: "chatgpt-web",
+				Status:   StatusActive,
+				Metadata: map[string]any{
+					"lifecycle_state": "active",
+					"quota_state":     "exhausted",
+				},
+			}, model)
+			payload := []byte(fmt.Sprintf(
+				`{"model":%q,"tools":[{"type":"image_generation","model":"gpt-image-2"},{"type":"web_search_preview"}],"tool_choice":%s,"input":"text only"}`,
+				model,
+				toolChoice,
+			))
+
+			response, errExecute := manager.Execute(
+				context.Background(),
+				[]string{"chatgpt-web"},
+				cliproxyexecutor.Request{Model: model, Payload: payload},
+				cliproxyexecutor.Options{},
+			)
+			if errExecute != nil {
+				t.Fatalf("Execute() error = %v", errExecute)
+			}
+			if string(response.Payload) != authID {
+				t.Fatalf("selected auth = %q, want %q", string(response.Payload), authID)
+			}
+		})
+	}
+}
+
 func registerFallbackAuthForModel(t *testing.T, manager *Manager, auth *Auth, model string) {
 	t.Helper()
 	if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
@@ -165,6 +209,78 @@ func TestManager_ImageToolFallbackPrefersSamePriorityCapableAuth(t *testing.T) {
 	}
 	if string(resp.Payload) != sameID {
 		t.Fatalf("payload = %q, want %q", string(resp.Payload), sameID)
+	}
+}
+
+func TestManager_ImageToolFallbackSkipsChatGPTWebForAutomaticSelection(t *testing.T) {
+	for _, testCase := range []struct {
+		name         string
+		toolChoice   string
+		wantProvider string
+	}{
+		{
+			name:         "automatic uses Codex",
+			wantProvider: "codex",
+		},
+		{
+			name:         "explicit image uses higher priority Web",
+			toolChoice:   `,"tool_choice":{"type":"image_generation"}`,
+			wantProvider: "chatgpt-web",
+		},
+		{
+			name:         "required allowed image uses Codex",
+			toolChoice:   `,"tool_choice":{"type":"allowed_tools","mode":"required","tools":[{"type":"image_generation"}]}`,
+			wantProvider: "codex",
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			manager := NewManager(nil, nil, nil)
+			manager.SetRetryConfig(0, 0, 0)
+			manager.SetConfig(&internalconfig.Config{DisabledImageGenerationToolFallback: true})
+			manager.RegisterExecutor(&authFallbackExecutor{id: "chatgpt-web"})
+			manager.RegisterExecutor(&authFallbackExecutor{id: "codex"})
+
+			model := "image-tool-fallback-web-selection-" + uuid.NewString()
+			webID := "image-tool-web-high-" + uuid.NewString()
+			codexID := "image-tool-codex-low-" + uuid.NewString()
+			registerFallbackAuthForModel(t, manager, &Auth{
+				ID:       webID,
+				Provider: "chatgpt-web",
+				Status:   StatusActive,
+				Attributes: map[string]string{
+					"priority": "10",
+				},
+				Metadata: map[string]any{"lifecycle_state": "active"},
+			}, model)
+			registerFallbackAuthForModel(t, manager, &Auth{
+				ID:         codexID,
+				Provider:   "codex",
+				Status:     StatusActive,
+				Attributes: map[string]string{"priority": "0"},
+			}, model)
+			payload := []byte(fmt.Sprintf(
+				`{"model":%q,"tools":[{"type":"image_generation","model":"gpt-image-2"}]%s,"input":"draw"}`,
+				model,
+				testCase.toolChoice,
+			))
+
+			response, errExecute := manager.Execute(
+				context.Background(),
+				[]string{"chatgpt-web", "codex"},
+				cliproxyexecutor.Request{Model: model, Payload: payload},
+				cliproxyexecutor.Options{},
+			)
+			if errExecute != nil {
+				t.Fatalf("Execute() error = %v", errExecute)
+			}
+			wantID := codexID
+			if testCase.wantProvider == "chatgpt-web" {
+				wantID = webID
+			}
+			if string(response.Payload) != wantID {
+				t.Fatalf("selected auth = %q, want %q", string(response.Payload), wantID)
+			}
+		})
 	}
 }
 

@@ -257,16 +257,19 @@ func (h *Handler) ListAuthFiles(c *gin.Context) {
 		c.JSON(500, gin.H{"error": "handler not initialized"})
 		return
 	}
-	if h.authManager == nil {
-		h.listAuthFilesFromDisk(c)
+	h.mu.Lock()
+	manager := h.authManager
+	h.mu.Unlock()
+	if manager == nil {
+		h.listAuthFilesFromDisk(c, manager)
 		return
 	}
-	auths := h.authManager.List()
+	auths := manager.List()
 	dependencyGraph := coreauth.BuildChatGPTWebDependencyGraph(auths)
 	files := make([]gin.H, 0, len(auths))
 	managedEntryIndexes := make(map[string]int, len(auths))
 	managedEntryNames := make(map[string]int, len(auths))
-	runtimeSummaries := h.authFileRuntimeSummaries()
+	runtimeSummaries := h.authFileRuntimeSummariesForManager(manager)
 	now := time.Now()
 	for _, auth := range auths {
 		managedName, managed := h.managedAuthBackingFileName(auth)
@@ -381,8 +384,12 @@ func (h *Handler) GetAuthFileModels(c *gin.Context) {
 		return
 	}
 
+	h.mu.Lock()
+	manager := h.authManager
+	h.mu.Unlock()
+
 	var authID string
-	auth := h.findManagedAuth(name)
+	auth := h.findManagedAuthWithManager(name, manager)
 	if auth != nil {
 		authID = auth.ID
 	}
@@ -404,6 +411,16 @@ func (h *Handler) GetAuthFileModels(c *gin.Context) {
 
 	result := make([]gin.H, 0, len(models))
 	now := time.Now()
+	var chatGPTWebCredential *chatgptwebauth.Credential
+	var chatGPTWebAccountInfo *chatgptwebauth.AccountInfoAuthRuntimeState
+	chatGPTWebAuth := auth != nil && strings.EqualFold(strings.TrimSpace(auth.Provider), chatgptwebauth.Provider)
+	if chatGPTWebAuth {
+		chatGPTWebCredential, _ = chatgptwebauth.ParseCredential(auth.Metadata)
+		if controller, ok := chatGPTWebAccountInfoControllerForManager(manager); ok {
+			state := controller.AccountInfoAuthState(auth.ID)
+			chatGPTWebAccountInfo = &state
+		}
+	}
 	for _, m := range models {
 		entry := gin.H{
 			"id": m.ID,
@@ -417,7 +434,26 @@ func (h *Handler) GetAuthFileModels(c *gin.Context) {
 		if m.OwnedBy != "" {
 			entry["owned_by"] = m.OwnedBy
 		}
-		applyModelCooldownStatus(entry, modelCooldownForAuth(auth, now, m.ID, m.UpstreamID, strings.TrimPrefix(m.Name, "models/")))
+		modelIDs := []string{m.ID, m.UpstreamID, trimModelsPrefix(m.Name)}
+		status := modelCooldownForAuth(auth, now, modelIDs...)
+		if chatGPTWebAuth {
+			imageQuotaModel := containsChatGPTWebImageModel(modelIDs)
+			if imageQuotaModel {
+				entry["image_quota_model"] = true
+			}
+			status = chatGPTWebImageModelCooldownStatus(auth, chatGPTWebCredential, chatGPTWebAccountInfo, now, modelIDs...)
+			if chatGPTWebCredential != nil && imageQuotaModel {
+				entry["quota_state"] = string(chatGPTWebCredential.QuotaState)
+				entry["quota_stale"] = chatGPTWebCredential.QuotaStale
+				if chatGPTWebCredential.ImageQuotaRemaining != nil {
+					entry["image_quota_remaining"] = *chatGPTWebCredential.ImageQuotaRemaining
+				}
+				if resetAt, ok := parseLastRefreshValue(chatGPTWebCredential.ImageQuotaResetAt); ok {
+					entry["image_quota_reset_at"] = resetAt
+				}
+			}
+		}
+		applyModelCooldownStatus(entry, status)
 		result = append(result, entry)
 	}
 
@@ -425,7 +461,7 @@ func (h *Handler) GetAuthFileModels(c *gin.Context) {
 }
 
 // List auth files from disk when the auth manager is unavailable.
-func (h *Handler) listAuthFilesFromDisk(c *gin.Context) {
+func (h *Handler) listAuthFilesFromDisk(c *gin.Context, manager *coreauth.Manager) {
 	diskFiles, err := h.listAuthJSONDiskFiles()
 	if err != nil {
 		c.JSON(500, gin.H{"error": fmt.Sprintf("failed to read auth dir: %v", err)})
@@ -434,7 +470,7 @@ func (h *Handler) listAuthFilesFromDisk(c *gin.Context) {
 	files := make([]gin.H, 0)
 	dependencyAuths := make([]*coreauth.Auth, 0)
 	dependencyAuthsByName := make(map[string]*coreauth.Auth)
-	runtimeSummaries := h.authFileRuntimeSummaries()
+	runtimeSummaries := h.authFileRuntimeSummariesForManager(manager)
 	now := time.Now()
 	for _, diskFile := range diskFiles {
 		fileData := gin.H{
@@ -483,6 +519,14 @@ func (h *Handler) listAuthFilesFromDisk(c *gin.Context) {
 					applyChatGPTWebMetadataSummary(fileData, dependencyMetadata, state, now)
 					disabled, _ := dependencyMetadata["disabled"].(bool)
 					fileData["disabled"] = disabled
+					if credential, errParse := chatgptwebauth.ParseCredential(dependencyMetadata); errParse == nil {
+						diskAuth := &coreauth.Auth{
+							Provider: typeValue,
+							Metadata: dependencyMetadata,
+							Disabled: disabled,
+						}
+						applyAuthCooldownStatus(fileData, chatGPTWebQuotaCooldownStatus(diskAuth, credential, nil, now))
+					}
 					if disabled {
 						fileData["status"] = coreauth.StatusDisabled
 					} else {
@@ -631,7 +675,7 @@ func (h *Handler) buildAuthFileEntryAtWithRuntime(auth *coreauth.Auth, now time.
 			entry["last_error_status_code"] = auth.LastError.HTTPStatus
 		}
 	}
-	applyChatGPTWebAuthFileSummary(entry, auth, now)
+	applyChatGPTWebAuthFileSummary(entry, auth, now, runtimeSummary)
 	if !auth.NextRetryAfter.IsZero() {
 		entry["next_retry_after"] = auth.NextRetryAfter
 	}
@@ -2482,7 +2526,17 @@ func authBackedByManagedPath(auth *coreauth.Auth, targetPath, authDir string) bo
 }
 
 func (h *Handler) findManagedFileAuth(name string) *coreauth.Auth {
-	if h == nil || h.authManager == nil {
+	if h == nil {
+		return nil
+	}
+	h.mu.Lock()
+	manager := h.authManager
+	h.mu.Unlock()
+	return h.findManagedFileAuthWithManager(name, manager)
+}
+
+func (h *Handler) findManagedFileAuthWithManager(name string, manager *coreauth.Manager) *coreauth.Auth {
+	if h == nil || manager == nil {
 		return nil
 	}
 	root, lexicalAuthDir, authDir, errRoot := h.openManagedAuthRootSnapshot()
@@ -2494,7 +2548,7 @@ func (h *Handler) findManagedFileAuth(name string) *coreauth.Auth {
 	if errNormalize != nil {
 		return nil
 	}
-	for _, auth := range h.authManager.List() {
+	for _, auth := range manager.List() {
 		if auth == nil || isRuntimeOnlyAuth(auth) {
 			continue
 		}
@@ -2507,30 +2561,40 @@ func (h *Handler) findManagedFileAuth(name string) *coreauth.Auth {
 }
 
 func (h *Handler) findManagedAuth(name string) *coreauth.Auth {
-	if h == nil || h.authManager == nil {
+	if h == nil {
+		return nil
+	}
+	h.mu.Lock()
+	manager := h.authManager
+	h.mu.Unlock()
+	return h.findManagedAuthWithManager(name, manager)
+}
+
+func (h *Handler) findManagedAuthWithManager(name string, manager *coreauth.Manager) *coreauth.Auth {
+	if h == nil || manager == nil {
 		return nil
 	}
 	name = strings.TrimSpace(name)
 	if name == "" {
 		return nil
 	}
-	exactAuth, _ := h.authManager.GetByID(name)
+	exactAuth, _ := manager.GetByID(name)
 	if exactAuth != nil && isRuntimeOnlyAuth(exactAuth) {
 		return exactAuth
 	}
 	if runtime.GOOS == "windows" && exactAuth == nil {
-		exactAuth, _ = h.authManager.GetByID(strings.ToLower(name))
+		exactAuth, _ = manager.GetByID(strings.ToLower(name))
 		if exactAuth != nil && isRuntimeOnlyAuth(exactAuth) {
 			return exactAuth
 		}
 	}
 	if exists, errPresence := h.managedAuthFileExists(name); errPresence == nil && exists {
-		return h.findManagedFileAuth(name)
+		return h.findManagedFileAuthWithManager(name, manager)
 	}
 	if exactAuth != nil {
 		return exactAuth
 	}
-	auths := h.authManager.List()
+	auths := manager.List()
 	for _, auth := range auths {
 		if auth != nil && isRuntimeOnlyAuth(auth) && managedAuthNameEqual(strings.TrimSpace(auth.FileName), name) {
 			return auth
@@ -2544,7 +2608,7 @@ func (h *Handler) findManagedAuth(name string) *coreauth.Auth {
 	if runtime.GOOS == "windows" {
 		lookupID = strings.ToLower(lookupID)
 	}
-	if auth, ok := h.authManager.GetByID(lookupID); ok {
+	if auth, ok := manager.GetByID(lookupID); ok {
 		return auth
 	}
 	for _, auth := range auths {

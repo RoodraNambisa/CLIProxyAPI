@@ -884,6 +884,9 @@ func isAuthBlockedForModel(auth *Auth, model string, now time.Time) (bool, block
 		return true, blockReasonOther, next
 	}
 	if model != "" {
+		if exhausted, resetAt := chatGPTWebImageQuotaBlocksModel(auth, model, now); exhausted {
+			return true, blockReasonCooldown, resetAt
+		}
 		if len(auth.ModelStates) > 0 {
 			state, ok := auth.ModelStates[model]
 			if (!ok || state == nil) && model != "" {
