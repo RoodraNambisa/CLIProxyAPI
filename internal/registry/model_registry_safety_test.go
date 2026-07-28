@@ -260,6 +260,58 @@ func TestGetAvailableModelsByProviderReturnsClones(t *testing.T) {
 	}
 }
 
+func TestGetModelProvidersExcludesProviderWithOnlySuspendedClients(t *testing.T) {
+	r := newTestModelRegistry()
+	r.RegisterClient("web-client", "chatgpt-web", []*ModelInfo{{ID: "shared"}})
+	r.RegisterClient("codex-client", "codex", []*ModelInfo{{ID: "shared"}})
+	r.SuspendClientModel("web-client", "shared", "manual")
+
+	providers := r.GetModelProviders("shared")
+	if len(providers) != 1 || providers[0] != "codex" {
+		t.Fatalf("providers = %v, want only codex", providers)
+	}
+}
+
+func TestGetModelProvidersKeepsQuotaOnlyProviderVisible(t *testing.T) {
+	r := newTestModelRegistry()
+	r.RegisterClient("web-client", "chatgpt-web", []*ModelInfo{{ID: "shared"}})
+	r.SetModelQuotaExceeded("web-client", "shared")
+
+	providers := r.GetModelProviders("shared")
+	if len(providers) != 1 || providers[0] != "chatgpt-web" {
+		t.Fatalf("providers = %v, want quota-cooled chatgpt-web catalog entry", providers)
+	}
+}
+
+func TestGetModelProvidersExcludesProviderWithoutExecutableClients(t *testing.T) {
+	r := newTestModelRegistry()
+	r.RegisterClient("quota-client", "chatgpt-web", []*ModelInfo{{ID: "shared"}})
+	r.RegisterClient("paused-client", "chatgpt-web", []*ModelInfo{{ID: "shared"}})
+	r.RegisterClient("codex-client", "codex", []*ModelInfo{{ID: "shared"}})
+	r.SuspendClientModel("quota-client", "shared", "quota")
+	r.SuspendClientModel("paused-client", "shared", "manual")
+
+	providers := r.GetModelProviders("shared")
+	if len(providers) != 1 || providers[0] != "codex" {
+		t.Fatalf("providers = %v, want only executable codex provider", providers)
+	}
+}
+
+func TestGetModelProvidersKeepsProviderWithExecutableClientAndMixedSuspensions(t *testing.T) {
+	r := newTestModelRegistry()
+	r.RegisterClient("active-client", "chatgpt-web", []*ModelInfo{{ID: "shared"}})
+	r.RegisterClient("quota-client", "chatgpt-web", []*ModelInfo{{ID: "shared"}})
+	r.RegisterClient("paused-client", "chatgpt-web", []*ModelInfo{{ID: "shared"}})
+	r.SetModelQuotaExceeded("quota-client", "shared")
+	r.SuspendClientModel("quota-client", "shared", "quota")
+	r.SuspendClientModel("paused-client", "shared", "manual")
+
+	providers := r.GetModelProviders("shared")
+	if len(providers) != 1 || providers[0] != "chatgpt-web" {
+		t.Fatalf("providers = %v, want executable chatgpt-web provider", providers)
+	}
+}
+
 func TestCleanupExpiredQuotasInvalidatesAvailableModelsCache(t *testing.T) {
 	r := newTestModelRegistry()
 	r.RegisterClient("client-1", "openai", []*ModelInfo{{ID: "m1", Created: 1}})

@@ -141,6 +141,7 @@ type chatGPTWebAccountInfoEpochRef struct {
 
 type chatGPTWebAccountInfoWork struct {
 	target             chatgptwebauth.AccountInfoRefreshTarget
+	sequence           uint64
 	epoch              uint64
 	epochRef           *chatGPTWebAccountInfoEpochRef
 	taskID             string
@@ -229,6 +230,7 @@ type chatGPTWebAccountInfoRuntime struct {
 	cfg               config.ResolvedChatGPTWebAccountInfoConfig
 	queue             []chatGPTWebAccountInfoWork
 	queueHead         int
+	queuedByTarget    map[string]int
 	tasks             map[string]*chatGPTWebAccountInfoTaskState
 	taskReservations  int
 	states            map[string]chatgptwebauth.AccountInfoAuthRuntimeState
@@ -258,13 +260,15 @@ type chatGPTWebAccountInfoRuntime struct {
 	started           bool
 	closed            bool
 
-	refreshCount uint64
-	retryCount   uint64
-	failedCount  uint64
-	lastError    string
-	calls        map[string]*chatGPTWebAccountInfoCall
-	now          func() time.Time
-	random       io.Reader
+	refreshCount      uint64
+	retryCount        uint64
+	failedCount       uint64
+	workSequence      uint64
+	lastErrorSequence uint64
+	lastError         string
+	calls             map[string]*chatGPTWebAccountInfoCall
+	now               func() time.Time
+	random            io.Reader
 
 	beforePersistedRecoveryCommit func()
 	beforeAccountInfoExecution    func(chatGPTWebAccountInfoWork, *chatGPTWebAccountInfoCall, bool)
@@ -276,6 +280,7 @@ func newChatGPTWebAccountInfoRuntime(executor *ChatGPTWebExecutor, cfg *config.C
 		executor:          executor,
 		tasks:             make(map[string]*chatGPTWebAccountInfoTaskState),
 		states:            make(map[string]chatgptwebauth.AccountInfoAuthRuntimeState),
+		queuedByTarget:    make(map[string]int),
 		inflight:          make(map[string]int),
 		inflightForce:     make(map[string]int),
 		inflightTask:      make(map[string]int),
@@ -548,6 +553,7 @@ func (runtime *chatGPTWebAccountInfoRuntime) close() {
 	}
 	runtime.queue = nil
 	runtime.queueHead = 0
+	clear(runtime.queuedByTarget)
 	runtime.schedules = nil
 	clear(runtime.scheduled)
 	for _, call := range runtime.calls {
@@ -779,6 +785,8 @@ func (runtime *chatGPTWebAccountInfoRuntime) dequeueLocked() (chatGPTWebAccountI
 	work := runtime.queue[runtime.queueHead]
 	runtime.queue[runtime.queueHead] = chatGPTWebAccountInfoWork{}
 	runtime.queueHead++
+	runtime.assignWorkSequenceLocked(&work)
+	runtime.removeQueuedTargetLocked(work)
 	if runtime.queueHead == len(runtime.queue) {
 		runtime.queue = nil
 		runtime.queueHead = 0
@@ -801,13 +809,50 @@ func (runtime *chatGPTWebAccountInfoRuntime) replaceQueuedWorkLocked(
 		clear(active)
 		runtime.queue = nil
 		runtime.queueHead = 0
+		clear(runtime.queuedByTarget)
 		runtime.pruneCompletedAccountInfoCallsLocked()
 		return
 	}
 	clear(active[len(work):])
 	runtime.queue = work
 	runtime.queueHead = 0
+	runtime.rebuildQueuedTargetsLocked()
 	runtime.pruneCompletedAccountInfoCallsLocked()
+}
+
+func (runtime *chatGPTWebAccountInfoRuntime) addQueuedTargetLocked(work chatGPTWebAccountInfoWork) {
+	runtimeKey := chatGPTWebAccountInfoTargetKey(work.target)
+	if runtimeKey == "" {
+		return
+	}
+	if runtime.queuedByTarget == nil {
+		runtime.queuedByTarget = make(map[string]int)
+	}
+	runtime.queuedByTarget[runtimeKey]++
+}
+
+func (runtime *chatGPTWebAccountInfoRuntime) removeQueuedTargetLocked(work chatGPTWebAccountInfoWork) {
+	runtimeKey := chatGPTWebAccountInfoTargetKey(work.target)
+	if runtimeKey == "" || runtime.queuedByTarget == nil {
+		return
+	}
+	count := runtime.queuedByTarget[runtimeKey]
+	if count <= 1 {
+		delete(runtime.queuedByTarget, runtimeKey)
+		return
+	}
+	runtime.queuedByTarget[runtimeKey] = count - 1
+}
+
+func (runtime *chatGPTWebAccountInfoRuntime) rebuildQueuedTargetsLocked() {
+	if runtime.queuedByTarget == nil {
+		runtime.queuedByTarget = make(map[string]int)
+	} else {
+		clear(runtime.queuedByTarget)
+	}
+	for _, work := range runtime.queuedWorkLocked() {
+		runtime.addQueuedTargetLocked(work)
+	}
 }
 
 func (runtime *chatGPTWebAccountInfoRuntime) execute(work chatGPTWebAccountInfoWork) chatGPTWebAccountInfoOutcome {
@@ -1254,6 +1299,7 @@ func (runtime *chatGPTWebAccountInfoRuntime) finishWorkLocked(work chatGPTWebAcc
 	if runtime.closed {
 		return
 	}
+	runtime.assignWorkSequenceLocked(&work)
 	runtime.assignWorkEpochLocked(&work)
 	if !runtime.workEpochCurrentLocked(work) {
 		runtime.completeTaskWorkLocked(work, chatGPTWebAccountInfoOutcome{
@@ -1273,10 +1319,10 @@ func (runtime *chatGPTWebAccountInfoRuntime) finishWorkLocked(work chatGPTWebAcc
 	state := runtime.states[runtimeKey]
 	if outcome.errorCode != "" {
 		state.LastError = chatgptwebauth.SafeQuotaError(outcome.errorCode)
-		runtime.lastError = state.LastError
 	} else {
 		state.LastError = ""
 	}
+	runtime.updateLastErrorLocked(work.sequence, outcome.status, state.LastError)
 	runtime.states[runtimeKey] = state
 
 	freshQuotaState := outcome.quotaStateKnown
@@ -1352,6 +1398,32 @@ func (runtime *chatGPTWebAccountInfoRuntime) finishWorkLocked(work chatGPTWebAcc
 	}
 	runtime.completeTaskWorkLocked(work, outcome)
 	runtime.releaseWorkEpochLocked(work)
+}
+
+func (runtime *chatGPTWebAccountInfoRuntime) assignWorkSequenceLocked(work *chatGPTWebAccountInfoWork) {
+	if work == nil || work.sequence != 0 {
+		return
+	}
+	runtime.workSequence++
+	work.sequence = runtime.workSequence
+}
+
+func (runtime *chatGPTWebAccountInfoRuntime) updateLastErrorLocked(sequence uint64, status, errorCode string) {
+	if sequence < runtime.lastErrorSequence {
+		return
+	}
+	if errorCode != "" {
+		runtime.lastErrorSequence = sequence
+		runtime.lastError = errorCode
+		return
+	}
+	switch status {
+	case chatgptwebauth.AccountInfoResultUpdated,
+		chatgptwebauth.AccountInfoResultUnchanged,
+		chatgptwebauth.AccountInfoResultFresh:
+		runtime.lastErrorSequence = sequence
+		runtime.lastError = ""
+	}
 }
 
 func (runtime *chatGPTWebAccountInfoRuntime) retryScheduleKey(work chatGPTWebAccountInfoWork) string {
@@ -1470,6 +1542,7 @@ func (runtime *chatGPTWebAccountInfoRuntime) enqueueForCurrentInstanceLocked(
 		return false, true
 	}
 	runtime.queue = append(runtime.queue, work)
+	runtime.addQueuedTargetLocked(work)
 	runtime.cond.Signal()
 	return true, true
 }
@@ -2530,12 +2603,10 @@ func (runtime *chatGPTWebAccountInfoRuntime) authState(authID string) chatgptweb
 }
 
 func (runtime *chatGPTWebAccountInfoRuntime) targetQueuedLocked(runtimeKey string) bool {
-	for _, work := range runtime.queuedWorkLocked() {
-		if chatGPTWebAccountInfoTargetKey(work.target) == runtimeKey {
-			return true
-		}
+	if runtime.queuedByTarget == nil && runtime.queueLengthLocked() > 0 {
+		runtime.rebuildQueuedTargetsLocked()
 	}
-	return false
+	return runtime.queuedByTarget[runtimeKey] > 0
 }
 
 func (runtime *chatGPTWebAccountInfoRuntime) hasPassiveAuthState(authID, authInstanceID string) bool {

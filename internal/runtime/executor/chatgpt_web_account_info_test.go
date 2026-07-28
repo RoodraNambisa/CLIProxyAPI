@@ -3756,6 +3756,98 @@ func TestChatGPTWebAccountInfoAvailableResultCancelsOldRecoverySchedule(t *testi
 	}
 }
 
+func TestChatGPTWebAccountInfoSuccessfulRefreshClearsLatestGlobalError(t *testing.T) {
+	runtime := newChatGPTWebAccountInfoRuntime(nil, nil)
+	runtime.cfg.RefreshQueueSize = 2
+	runtime.mu.Lock()
+	if !runtime.enqueueLocked(chatGPTWebAccountInfoWork{
+		target: chatgptwebauth.AccountInfoRefreshTarget{AuthID: "failed"},
+	}) || !runtime.enqueueLocked(chatGPTWebAccountInfoWork{
+		target: chatgptwebauth.AccountInfoRefreshTarget{AuthID: "recovered"},
+	}) {
+		runtime.mu.Unlock()
+		t.Fatal("failed to enqueue account-info work")
+	}
+	failed, _ := runtime.dequeueLocked()
+	recovered, _ := runtime.dequeueLocked()
+	runtime.finishWorkLocked(failed, chatGPTWebAccountInfoOutcome{
+		status:    chatgptwebauth.AccountInfoResultFailed,
+		errorCode: "network_error",
+	})
+	runtime.finishWorkLocked(recovered, chatGPTWebAccountInfoOutcome{
+		status: chatgptwebauth.AccountInfoResultUpdated,
+	})
+	runtime.mu.Unlock()
+
+	if snapshot := runtime.snapshot(); snapshot.LastError != "" {
+		t.Fatalf("last error = %q, want cleared after newer success", snapshot.LastError)
+	}
+}
+
+func TestChatGPTWebAccountInfoOlderSuccessDoesNotClearNewerGlobalError(t *testing.T) {
+	runtime := newChatGPTWebAccountInfoRuntime(nil, nil)
+	runtime.cfg.RefreshQueueSize = 2
+	runtime.mu.Lock()
+	if !runtime.enqueueLocked(chatGPTWebAccountInfoWork{
+		target: chatgptwebauth.AccountInfoRefreshTarget{AuthID: "older-success"},
+	}) || !runtime.enqueueLocked(chatGPTWebAccountInfoWork{
+		target: chatgptwebauth.AccountInfoRefreshTarget{AuthID: "newer-failure"},
+	}) {
+		runtime.mu.Unlock()
+		t.Fatal("failed to enqueue account-info work")
+	}
+	olderSuccess, _ := runtime.dequeueLocked()
+	newerFailure, _ := runtime.dequeueLocked()
+	runtime.finishWorkLocked(newerFailure, chatGPTWebAccountInfoOutcome{
+		status:    chatgptwebauth.AccountInfoResultFailed,
+		errorCode: "rate_limited",
+	})
+	runtime.finishWorkLocked(olderSuccess, chatGPTWebAccountInfoOutcome{
+		status: chatgptwebauth.AccountInfoResultUpdated,
+	})
+	runtime.mu.Unlock()
+
+	if snapshot := runtime.snapshot(); snapshot.LastError != "rate_limited" {
+		t.Fatalf("last error = %q, want newer failure preserved", snapshot.LastError)
+	}
+}
+
+func TestChatGPTWebAccountInfoQueuedTargetIndexTracksQueueChanges(t *testing.T) {
+	runtime := newChatGPTWebAccountInfoRuntime(nil, nil)
+	runtime.cfg.RefreshWorkers = 1
+	runtime.cfg.RefreshQueueSize = 4
+
+	runtime.mu.Lock()
+	if !runtime.enqueueLocked(chatGPTWebAccountInfoWork{
+		target: chatgptwebauth.AccountInfoRefreshTarget{AuthID: "first"},
+	}) || !runtime.enqueueLocked(chatGPTWebAccountInfoWork{
+		target: chatgptwebauth.AccountInfoRefreshTarget{AuthID: "second"},
+	}) {
+		runtime.mu.Unlock()
+		t.Fatal("failed to enqueue account-info work")
+	}
+	if !runtime.targetQueuedLocked("first") || !runtime.targetQueuedLocked("second") {
+		runtime.mu.Unlock()
+		t.Fatalf("queued target index = %+v", runtime.queuedByTarget)
+	}
+	if _, ok := runtime.dequeueLocked(); !ok {
+		runtime.mu.Unlock()
+		t.Fatal("failed to dequeue first work")
+	}
+	if runtime.targetQueuedLocked("first") || !runtime.targetQueuedLocked("second") {
+		runtime.mu.Unlock()
+		t.Fatalf("queued target index after dequeue = %+v", runtime.queuedByTarget)
+	}
+	runtime.replaceQueuedWorkLocked([]chatGPTWebAccountInfoWork{{
+		target: chatgptwebauth.AccountInfoRefreshTarget{AuthID: "replacement"},
+	}})
+	if runtime.targetQueuedLocked("second") || !runtime.targetQueuedLocked("replacement") {
+		runtime.mu.Unlock()
+		t.Fatalf("queued target index after replace = %+v", runtime.queuedByTarget)
+	}
+	runtime.mu.Unlock()
+}
+
 func TestChatGPTWebAccountInfoFailedResultPreservesOldRecoverySchedule(t *testing.T) {
 	now := time.Now().UTC()
 	resetAt := now.Add(time.Hour)

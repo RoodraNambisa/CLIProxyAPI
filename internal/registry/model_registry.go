@@ -1097,48 +1097,7 @@ func (r *ModelRegistry) GetAvailableModelsByProvider(provider string) []*ModelIn
 			continue
 		}
 		registration, ok := r.models[modelID]
-
-		expiredClients := 0
-		cooldownSuspended := 0
-		otherSuspended := 0
-		if ok && registration != nil {
-			if registration.QuotaExceededClients != nil {
-				for clientID, quotaTime := range registration.QuotaExceededClients {
-					if clientID == "" {
-						continue
-					}
-					if p, okProvider := r.clientProviders[clientID]; !okProvider || p != provider {
-						continue
-					}
-					if quotaTime != nil && now.Sub(*quotaTime) < modelQuotaExceededWindow {
-						expiredClients++
-					}
-				}
-			}
-			if registration.SuspendedClients != nil {
-				for clientID, reason := range registration.SuspendedClients {
-					if clientID == "" {
-						continue
-					}
-					if p, okProvider := r.clientProviders[clientID]; !okProvider || p != provider {
-						continue
-					}
-					if strings.EqualFold(reason, "quota") {
-						cooldownSuspended++
-						continue
-					}
-					otherSuspended++
-				}
-			}
-		}
-
-		availableClients := entry.count
-		effectiveClients := availableClients - expiredClients - otherSuspended
-		if effectiveClients < 0 {
-			effectiveClients = 0
-		}
-
-		if effectiveClients > 0 || (availableClients > 0 && (expiredClients > 0 || cooldownSuspended > 0) && otherSuspended == 0) {
+		if providerHasCatalogAvailability(registration, provider, entry.count, r.clientProviders, now) {
 			if entry.info != nil {
 				result = append(result, cloneModelInfo(entry.info))
 				continue
@@ -1205,23 +1164,11 @@ func (r *ModelRegistry) GetModelProviders(modelID string) []string {
 		count int
 	}
 	providers := make([]providerCount, 0, len(registration.Providers))
-	// suspendedByProvider := make(map[string]int)
-	// if registration.SuspendedClients != nil {
-	// 	for clientID := range registration.SuspendedClients {
-	// 		if provider, ok := r.clientProviders[clientID]; ok && provider != "" {
-	// 			suspendedByProvider[provider]++
-	// 		}
-	// 	}
-	// }
+	now := time.Now()
 	for name, count := range registration.Providers {
-		if count <= 0 {
+		if !providerHasCatalogAvailability(registration, name, count, r.clientProviders, now) {
 			continue
 		}
-		// adjusted := count - suspendedByProvider[name]
-		// if adjusted <= 0 {
-		// 	continue
-		// }
-		// providers = append(providers, providerCount{name: name, count: adjusted})
 		providers = append(providers, providerCount{name: name, count: count})
 	}
 	if len(providers) == 0 {
@@ -1240,6 +1187,48 @@ func (r *ModelRegistry) GetModelProviders(modelID string) []string {
 		result = append(result, item.name)
 	}
 	return result
+}
+
+func providerHasCatalogAvailability(
+	registration *ModelRegistration,
+	provider string,
+	availableClients int,
+	clientProviders map[string]string,
+	now time.Time,
+) bool {
+	if registration == nil || availableClients <= 0 {
+		return false
+	}
+	unavailableClients := make(map[string]struct{})
+	hasQuotaUnavailable := false
+	for clientID, quotaTime := range registration.QuotaExceededClients {
+		if clientProviders[clientID] != provider {
+			continue
+		}
+		if quotaTime != nil && now.Sub(*quotaTime) < modelQuotaExceededWindow {
+			unavailableClients[clientID] = struct{}{}
+			hasQuotaUnavailable = true
+		}
+	}
+	hasOtherUnavailable := false
+	for clientID, reason := range registration.SuspendedClients {
+		if clientProviders[clientID] != provider {
+			continue
+		}
+		if strings.EqualFold(reason, "quota") {
+			unavailableClients[clientID] = struct{}{}
+			hasQuotaUnavailable = true
+			continue
+		}
+		unavailableClients[clientID] = struct{}{}
+		hasOtherUnavailable = true
+	}
+	effectiveClients := availableClients - len(unavailableClients)
+	if effectiveClients < 0 {
+		effectiveClients = 0
+	}
+	return effectiveClients > 0 ||
+		(availableClients > 0 && hasQuotaUnavailable && !hasOtherUnavailable)
 }
 
 // GetModelInfo returns ModelInfo, prioritizing provider-specific definition if available.
