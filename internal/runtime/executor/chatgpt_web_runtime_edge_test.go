@@ -4608,6 +4608,7 @@ func TestPrepareChatGPTWebImageMissingConduitSkipsCredentialState(t *testing.T) 
 		client,
 		credential,
 		chatGPTWebRequirements{},
+		"gpt-5-5",
 		"draw",
 	)
 	if err == nil || !strings.Contains(err.Error(), "missing conduit token") {
@@ -4645,6 +4646,7 @@ func TestPrepareChatGPTWebImageDoesNotConsumeSessionObserverToken(t *testing.T) 
 		client,
 		credential,
 		chatGPTWebRequirements{Token: "requirements", SOToken: "one-request-token"},
+		"gpt-5-5",
 		"draw",
 	)
 	if err != nil {
@@ -4652,6 +4654,94 @@ func TestPrepareChatGPTWebImageDoesNotConsumeSessionObserverToken(t *testing.T) 
 	}
 	if conduit != "conduit" {
 		t.Fatalf("conduit = %q", conduit)
+	}
+}
+
+func TestChatGPTWebImageKeepsConfiguredUpstreamModelAcrossReload(t *testing.T) {
+	models := make(map[string]string)
+	var modelsMu sync.Mutex
+	var executor *ChatGPTWebExecutor
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/":
+			_, _ = io.WriteString(w, "<html></html>")
+		case "/backend-api/sentinel/chat-requirements/prepare":
+			_ = json.NewEncoder(w).Encode(map[string]any{"prepare_token": "prepare"})
+		case "/backend-api/sentinel/chat-requirements/finalize":
+			_ = json.NewEncoder(w).Encode(map[string]any{"token": "requirements"})
+		case "/backend-api/f/conversation/prepare":
+			var payload map[string]any
+			if err := json.NewDecoder(request.Body).Decode(&payload); err != nil {
+				t.Errorf("decode %s payload: %v", request.URL.Path, err)
+				http.Error(w, "invalid payload", http.StatusBadRequest)
+				return
+			}
+			modelsMu.Lock()
+			models[request.URL.Path] = strings.TrimSpace(fmt.Sprint(payload["model"]))
+			modelsMu.Unlock()
+			executor.UpdateConfig(&config.Config{
+				SDKConfig: config.SDKConfig{Images: config.ImagesConfig{
+					ChatGPTWeb: config.ChatGPTWebImageConfig{UpstreamModel: "gpt-5-5-next"},
+				}},
+			})
+			_, _ = io.WriteString(w, `{"conduit_token":"conduit"}`)
+		case "/backend-api/f/conversation":
+			var payload map[string]any
+			if err := json.NewDecoder(request.Body).Decode(&payload); err != nil {
+				t.Errorf("decode %s payload: %v", request.URL.Path, err)
+				http.Error(w, "invalid payload", http.StatusBadRequest)
+				return
+			}
+			modelsMu.Lock()
+			models[request.URL.Path] = strings.TrimSpace(fmt.Sprint(payload["model"]))
+			modelsMu.Unlock()
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = io.WriteString(w, "data: [DONE]\n\n")
+		default:
+			http.NotFound(w, request)
+		}
+	}))
+	defer server.Close()
+
+	executor = NewChatGPTWebExecutor(&config.Config{
+		SDKConfig: config.SDKConfig{Images: config.ImagesConfig{
+			ChatGPTWeb: config.ChatGPTWebImageConfig{UpstreamModel: "gpt-5-5-custom"},
+		}},
+	}, nil)
+	executor.runtimeBaseURL = server.URL
+	client, credential, err := executor.newRuntimeClient(chatGPTWebRuntimeAuth())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.CloseIdleConnections()
+
+	execution, err := executor.beginChatGPTWebImage(
+		context.Background(),
+		client,
+		credential,
+		&chatGPTWebPreparedRequest{
+			routeModel: "gpt-image-2",
+			request: helps.ChatGPTWebRequest{
+				Image: &helps.ChatGPTWebImageRequest{Prompt: "draw"},
+			},
+		},
+	)
+	if err != nil {
+		t.Fatalf("beginChatGPTWebImage() error = %v", err)
+	}
+	if errClose := execution.response.Body.Close(); errClose != nil {
+		t.Fatalf("close response body: %v", errClose)
+	}
+
+	modelsMu.Lock()
+	defer modelsMu.Unlock()
+	for _, path := range []string{"/backend-api/f/conversation/prepare", "/backend-api/f/conversation"} {
+		if got := models[path]; got != "gpt-5-5-custom" {
+			t.Fatalf("%s model = %q, want gpt-5-5-custom", path, got)
+		}
+	}
+	if got := executor.chatGPTWebImageUpstreamModel(); got != "gpt-5-5-next" {
+		t.Fatalf("reloaded upstream model = %q, want gpt-5-5-next", got)
 	}
 }
 
@@ -6489,6 +6579,128 @@ func TestChatGPTWebExecutorRejectsExactImageSizingBeforeNetwork(t *testing.T) {
 	var retry interface{ RetryOtherAuth() bool }
 	if !errors.As(err, &retry) || !retry.RetryOtherAuth() {
 		t.Fatalf("RetryOtherAuth() error = %v", err)
+	}
+}
+
+func TestChatGPTWebExecutorIgnoresConfiguredUnsupportedImageParams(t *testing.T) {
+	executor := NewChatGPTWebExecutor(&config.Config{
+		SDKConfig: config.SDKConfig{Images: config.ImagesConfig{
+			ChatGPTWeb: config.ChatGPTWebImageConfig{IgnoreUnsupportedParams: true},
+		}},
+	}, nil)
+	prepared, err := executor.prepareRuntimeRequest(
+		context.Background(),
+		chatGPTWebRuntimeAuth(),
+		cliproxyexecutor.Request{
+			Model: "gpt-image-2",
+			Payload: []byte(`{
+				"model":"gpt-5.4",
+				"input":"draw",
+				"tools":[{
+					"type":"image_generation",
+					"size":"1024x1024",
+					"quality":"high",
+					"output_format":"jpeg"
+				}]
+			}`),
+		},
+		cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatCodex, ResponseFormat: sdktranslator.FormatCodex},
+		false,
+	)
+	if err != nil {
+		t.Fatalf("prepareRuntimeRequest() error = %v", err)
+	}
+	defer prepared.discardUsageProjection()
+	if prepared.request.Image == nil {
+		t.Fatal("image request = nil")
+	}
+	if prepared.request.Image.Size != "" {
+		t.Fatalf("image size = %q, want empty", prepared.request.Image.Size)
+	}
+	if prepared.request.Image.Quality != "auto" {
+		t.Fatalf("image quality = %q, want auto", prepared.request.Image.Quality)
+	}
+	if prepared.request.Image.OutputFormat != "png" {
+		t.Fatalf("image output format = %q, want png", prepared.request.Image.OutputFormat)
+	}
+}
+
+func TestChatGPTWebExecutorUsesPinnedUnsupportedImageParamPolicy(t *testing.T) {
+	payload := []byte(`{
+		"model":"gpt-5.4",
+		"input":"draw",
+		"tools":[{
+			"type":"image_generation",
+			"size":"1024x1024",
+			"quality":"high",
+			"output_format":"jpeg"
+		}]
+	}`)
+	tests := []struct {
+		name       string
+		configured bool
+		pinned     bool
+		wantError  bool
+	}{
+		{
+			name:       "request enables policy while executor config is stale",
+			configured: false,
+			pinned:     true,
+		},
+		{
+			name:       "request disables policy while executor config is newer",
+			configured: true,
+			pinned:     false,
+			wantError:  true,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			executor := NewChatGPTWebExecutor(&config.Config{
+				SDKConfig: config.SDKConfig{Images: config.ImagesConfig{
+					ChatGPTWeb: config.ChatGPTWebImageConfig{IgnoreUnsupportedParams: test.configured},
+				}},
+			}, nil)
+			prepared, err := executor.prepareRuntimeRequest(
+				context.Background(),
+				chatGPTWebRuntimeAuth(),
+				cliproxyexecutor.Request{Model: "gpt-image-2", Payload: payload},
+				cliproxyexecutor.Options{
+					SourceFormat:   sdktranslator.FormatCodex,
+					ResponseFormat: sdktranslator.FormatCodex,
+					Metadata: map[string]any{
+						cliproxyexecutor.ChatGPTWebIgnoreUnsupportedImageParamsMetadataKey: test.pinned,
+					},
+				},
+				false,
+			)
+			if test.wantError {
+				if err == nil {
+					t.Fatal("prepareRuntimeRequest() error = nil, want unsupported image parameter error")
+				}
+				var status interface{ StatusCode() int }
+				if !errors.As(err, &status) || status.StatusCode() != http.StatusBadRequest {
+					t.Fatalf("prepareRuntimeRequest() error = %v, want status 400", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("prepareRuntimeRequest() error = %v", err)
+			}
+			defer prepared.discardUsageProjection()
+			if prepared.request.Image == nil {
+				t.Fatal("image request = nil")
+			}
+			if prepared.request.Image.Size != "" {
+				t.Fatalf("image size = %q, want empty", prepared.request.Image.Size)
+			}
+			if prepared.request.Image.Quality != "auto" {
+				t.Fatalf("image quality = %q, want auto", prepared.request.Image.Quality)
+			}
+			if prepared.request.Image.OutputFormat != "png" {
+				t.Fatalf("image output format = %q, want png", prepared.request.Image.OutputFormat)
+			}
+		})
 	}
 }
 

@@ -32,6 +32,47 @@ func TestLoadConfigOptionalImagesStreamFlushSettings(t *testing.T) {
 	}
 }
 
+func TestLoadConfigOptionalChatGPTWebImageSettings(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	data := []byte(`images:
+  chatgpt-web:
+    upstream-model: gpt-5-5-custom
+    ignore-unsupported-params: true
+`)
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, err := LoadConfigOptional(path, false)
+	if err != nil {
+		t.Fatalf("LoadConfigOptional() error = %v", err)
+	}
+	if got := cfg.Images.ChatGPTWeb.ResolvedUpstreamModel(); got != "gpt-5-5-custom" {
+		t.Fatalf("ChatGPTWeb upstream model = %q, want gpt-5-5-custom", got)
+	}
+	if !cfg.Images.ChatGPTWeb.IgnoreUnsupportedParams {
+		t.Fatal("IgnoreUnsupportedParams = false, want true")
+	}
+}
+
+func TestLoadConfigOptionalDefaultsChatGPTWebImageUpstreamModel(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte("images: {}\n"), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, err := LoadConfigOptional(path, false)
+	if err != nil {
+		t.Fatalf("LoadConfigOptional() error = %v", err)
+	}
+	if got := cfg.Images.ChatGPTWeb.ResolvedUpstreamModel(); got != DefaultChatGPTWebImageUpstreamModel {
+		t.Fatalf("ChatGPTWeb upstream model = %q, want %q", got, DefaultChatGPTWebImageUpstreamModel)
+	}
+	if cfg.Images.ChatGPTWeb.IgnoreUnsupportedParams {
+		t.Fatal("IgnoreUnsupportedParams = true, want false")
+	}
+}
+
 func TestLoadConfigOptionalDefaultsImagesStreamFlushEnabled(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.yaml")
 	data := []byte(`images:

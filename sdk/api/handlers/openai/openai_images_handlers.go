@@ -73,8 +73,8 @@ func (h *OpenAIImagesAPIHandler) HandlerType() string {
 	return OpenaiResponse
 }
 
-func imageResponsesProviders(req openAIImageRequest) []string {
-	if !chatGPTWebSupportsImageRequest(req) {
+func imageResponsesProviders(req openAIImageRequest, ignoreUnsupportedParams bool) []string {
+	if !chatGPTWebSupportsImageRequest(req, ignoreUnsupportedParams) {
 		return []string{Codex}
 	}
 	return []string{Codex, ChatGPTWeb}
@@ -308,12 +308,13 @@ func (h *OpenAIImagesAPIHandler) handleImagesRequest(c *gin.Context, req openAII
 		return
 	}
 	responseFormat := strings.ToLower(strings.TrimSpace(req.ResponseFormat))
-	providers := imageResponsesProviders(req)
+	ignoreUnsupportedImageParams := h.chatGPTWebIgnoreUnsupportedImageParams()
+	providers := imageResponsesProviders(req, ignoreUnsupportedImageParams)
 	if req.Stream {
-		h.handleStreamingImagesResponse(c, rawJSON, imageModel, codexModel, op, count, responseFormat, providers)
+		h.handleStreamingImagesResponse(c, rawJSON, imageModel, codexModel, op, count, responseFormat, providers, ignoreUnsupportedImageParams)
 		return
 	}
-	h.handleNonStreamingImagesResponse(c, rawJSON, imageModel, codexModel, count, responseFormat, providers)
+	h.handleNonStreamingImagesResponse(c, rawJSON, imageModel, codexModel, count, responseFormat, providers, ignoreUnsupportedImageParams)
 }
 
 func (h *OpenAIImagesAPIHandler) handleNativeImagesRequest(c *gin.Context, rawJSON []byte, req openAIImageRequest, op imageOperation) {
@@ -397,7 +398,7 @@ func (h *OpenAIImagesAPIHandler) handleNativeStreamingImagesResponse(c *gin.Cont
 	})
 }
 
-func (h *OpenAIImagesAPIHandler) handleNonStreamingImagesResponse(c *gin.Context, rawJSON []byte, imageModel, codexModel string, count int, responseFormat string, providers []string) {
+func (h *OpenAIImagesAPIHandler) handleNonStreamingImagesResponse(c *gin.Context, rawJSON []byte, imageModel, codexModel string, count int, responseFormat string, providers []string, ignoreUnsupportedImageParams bool) {
 	c.Header("Content-Type", "application/json")
 	var combined imagesResponse
 	var upstreamHeaders http.Header
@@ -408,6 +409,7 @@ func (h *OpenAIImagesAPIHandler) handleNonStreamingImagesResponse(c *gin.Context
 		remaining := count - len(combined.Data)
 		cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
 		cliCtx = handlers.WithImageGenerationMaxResults(cliCtx, remaining)
+		cliCtx = handlers.WithChatGPTWebIgnoreUnsupportedImageParams(cliCtx, ignoreUnsupportedImageParams)
 		stopKeepAlive := h.StartNonStreamingKeepAlive(c, cliCtx)
 		resp, headers, errMsg := h.ExecuteWithProvidersAndExecutionModel(cliCtx, providers, h.HandlerType(), imageModel, codexModel, rawJSON, "")
 		stopKeepAlive()
@@ -447,19 +449,20 @@ func (h *OpenAIImagesAPIHandler) handleNonStreamingImagesResponse(c *gin.Context
 	_, _ = c.Writer.Write(imagesPayload)
 }
 
-func (h *OpenAIImagesAPIHandler) handleStreamingImagesResponse(c *gin.Context, rawJSON []byte, imageModel, codexModel string, op imageOperation, count int, responseFormat string, providers []string) {
+func (h *OpenAIImagesAPIHandler) handleStreamingImagesResponse(c *gin.Context, rawJSON []byte, imageModel, codexModel string, op imageOperation, count int, responseFormat string, providers []string, ignoreUnsupportedImageParams bool) {
 	flusher, ok := c.Writer.(http.Flusher)
 	if !ok {
 		h.writeImagesError(c, http.StatusInternalServerError, errors.New("streaming not supported"))
 		return
 	}
 	if count > 1 {
-		h.handleMultiStreamingImagesResponse(c, flusher, rawJSON, imageModel, codexModel, op, count, responseFormat, providers)
+		h.handleMultiStreamingImagesResponse(c, flusher, rawJSON, imageModel, codexModel, op, count, responseFormat, providers, ignoreUnsupportedImageParams)
 		return
 	}
 	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
 	cliCtx = handlers.WithImageGenerationStreamPassthrough(cliCtx, true)
 	cliCtx = handlers.WithImageGenerationMaxResults(cliCtx, 1)
+	cliCtx = handlers.WithChatGPTWebIgnoreUnsupportedImageParams(cliCtx, ignoreUnsupportedImageParams)
 	dataChan, upstreamHeaders, errChan := h.ExecuteStreamWithProvidersAndExecutionModel(cliCtx, providers, h.HandlerType(), imageModel, codexModel, rawJSON, "")
 
 	setSSEHeaders := func() {
@@ -539,7 +542,7 @@ func (h *OpenAIImagesAPIHandler) handleStreamingImagesResponse(c *gin.Context, r
 	}
 }
 
-func (h *OpenAIImagesAPIHandler) handleMultiStreamingImagesResponse(c *gin.Context, flusher http.Flusher, rawJSON []byte, imageModel, codexModel string, op imageOperation, count int, responseFormat string, providers []string) {
+func (h *OpenAIImagesAPIHandler) handleMultiStreamingImagesResponse(c *gin.Context, flusher http.Flusher, rawJSON []byte, imageModel, codexModel string, op imageOperation, count int, responseFormat string, providers []string, ignoreUnsupportedImageParams bool) {
 	c.Header("Content-Type", "text/event-stream")
 	c.Header("Cache-Control", "no-cache")
 	c.Header("Connection", "keep-alive")
@@ -548,6 +551,7 @@ func (h *OpenAIImagesAPIHandler) handleMultiStreamingImagesResponse(c *gin.Conte
 		cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
 		cliCtx = handlers.WithImageGenerationStreamPassthrough(cliCtx, true)
 		cliCtx = handlers.WithImageGenerationMaxResults(cliCtx, 1)
+		cliCtx = handlers.WithChatGPTWebIgnoreUnsupportedImageParams(cliCtx, ignoreUnsupportedImageParams)
 		dataChan, upstreamHeaders, errChan := h.ExecuteStreamWithProvidersAndExecutionModel(cliCtx, providers, h.HandlerType(), imageModel, codexModel, rawJSON, "")
 		if i == 0 {
 			handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
@@ -1534,16 +1538,18 @@ func (m *imageStreamMapper) writeCompletedSet(w io.Writer, results []imageResult
 	}
 }
 
-func chatGPTWebSupportsImageRequest(req openAIImageRequest) bool {
-	if strings.TrimSpace(req.Size) != "" ||
-		(strings.TrimSpace(req.Quality) != "" && !strings.EqualFold(strings.TrimSpace(req.Quality), "auto")) ||
-		strings.TrimSpace(req.Background) != "" ||
-		(strings.TrimSpace(req.OutputFormat) != "" && !strings.EqualFold(strings.TrimSpace(req.OutputFormat), "png")) ||
-		strings.TrimSpace(req.InputFidelity) != "" ||
-		strings.TrimSpace(req.Moderation) != "" ||
-		req.OutputCompression != nil ||
-		(req.PartialImages != nil && *req.PartialImages > 0) {
-		return false
+func chatGPTWebSupportsImageRequest(req openAIImageRequest, ignoreUnsupportedParams bool) bool {
+	if !ignoreUnsupportedParams {
+		if strings.TrimSpace(req.Size) != "" ||
+			(strings.TrimSpace(req.Quality) != "" && !strings.EqualFold(strings.TrimSpace(req.Quality), "auto")) ||
+			strings.TrimSpace(req.Background) != "" ||
+			(strings.TrimSpace(req.OutputFormat) != "" && !strings.EqualFold(strings.TrimSpace(req.OutputFormat), "png")) ||
+			strings.TrimSpace(req.InputFidelity) != "" ||
+			strings.TrimSpace(req.Moderation) != "" ||
+			req.OutputCompression != nil ||
+			(req.PartialImages != nil && *req.PartialImages > 0) {
+			return false
+		}
 	}
 	references := make([]string, 0, len(req.Images)+1)
 	for _, reference := range req.Images {
@@ -1824,6 +1830,10 @@ func (h *OpenAIImagesAPIHandler) imagesOverrideInputFidelityEnabled() bool {
 		return h.Cfg.Images.OverrideUnsupportedParams
 	}
 	return false
+}
+
+func (h *OpenAIImagesAPIHandler) chatGPTWebIgnoreUnsupportedImageParams() bool {
+	return h != nil && h.Cfg != nil && h.Cfg.Images.ChatGPTWeb.IgnoreUnsupportedParams
 }
 
 func (h *OpenAIImagesAPIHandler) imagesNativeEnabled(op imageOperation) bool {

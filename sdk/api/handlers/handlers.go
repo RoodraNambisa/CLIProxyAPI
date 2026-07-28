@@ -63,6 +63,7 @@ type executionSessionContextKey struct{}
 type imageGenerationStreamPassthroughContextKey struct{}
 type imageGenerationStreamPassthroughStateContextKey struct{}
 type imageGenerationMaxResultsContextKey struct{}
+type chatGPTWebIgnoreUnsupportedImageParamsContextKey struct{}
 type interactionsAPIMetadataContextKey struct{}
 
 type interactionsAPIMetadata struct {
@@ -143,6 +144,24 @@ func imageGenerationMaxResults(ctx context.Context) int {
 		return 0
 	}
 	return maxResults
+}
+
+// WithChatGPTWebIgnoreUnsupportedImageParams pins the Images compatibility
+// policy for one execution. False is retained so a config reload cannot change
+// the policy after provider selection.
+func WithChatGPTWebIgnoreUnsupportedImageParams(ctx context.Context, enabled bool) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, chatGPTWebIgnoreUnsupportedImageParamsContextKey{}, enabled)
+}
+
+func chatGPTWebIgnoreUnsupportedImageParams(ctx context.Context) (bool, bool) {
+	if ctx == nil {
+		return false, false
+	}
+	enabled, ok := ctx.Value(chatGPTWebIgnoreUnsupportedImageParamsContextKey{}).(bool)
+	return enabled, ok
 }
 
 func providersSupportImageStreamPassthrough(providers []string) bool {
@@ -498,6 +517,9 @@ func requestExecutionMetadata(ctx context.Context) map[string]any {
 	}
 	if maxResults := imageGenerationMaxResults(ctx); maxResults > 0 {
 		meta[coreexecutor.ImageGenerationMaxResultsMetadataKey] = maxResults
+	}
+	if enabled, ok := chatGPTWebIgnoreUnsupportedImageParams(ctx); ok {
+		meta[coreexecutor.ChatGPTWebIgnoreUnsupportedImageParamsMetadataKey] = enabled
 	}
 	if ctx != nil {
 		if interactions, ok := ctx.Value(interactionsAPIMetadataContextKey{}).(interactionsAPIMetadata); ok {

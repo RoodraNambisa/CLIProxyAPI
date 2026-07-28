@@ -4,6 +4,8 @@
 // debug settings, proxy configuration, and API keys.
 package config
 
+import "strings"
+
 // SDKConfig represents the application's configuration, loaded from a YAML file.
 type SDKConfig struct {
 	// ProxyURL is the URL of an optional proxy server to use for outbound requests.
@@ -151,8 +153,26 @@ type ImagesConfig struct {
 	StreamFlushIntervalMS int `yaml:"stream-flush-interval-ms,omitempty" json:"stream-flush-interval-ms,omitempty"`
 	// StreamFlushMinBytes flushes image streaming output once this many bytes are pending.
 	StreamFlushMinBytes int `yaml:"stream-flush-min-bytes,omitempty" json:"stream-flush-min-bytes,omitempty"`
+	// ChatGPTWeb configures the ChatGPT Web image compatibility path.
+	ChatGPTWeb ChatGPTWebImageConfig `yaml:"chatgpt-web,omitempty" json:"chatgpt-web,omitempty"`
 	// Native configures direct Codex Images API proxying.
 	Native NativeImagesConfig `yaml:"native,omitempty" json:"native,omitempty"`
+}
+
+// ChatGPTWebImageConfig controls the ChatGPT Web image compatibility path.
+type ChatGPTWebImageConfig struct {
+	// UpstreamModel is the ChatGPT Web conversation model that invokes picture_v2.
+	UpstreamModel string `yaml:"upstream-model,omitempty" json:"upstream-model,omitempty"`
+	// IgnoreUnsupportedParams allows Web routing after dropping options that Web cannot express.
+	IgnoreUnsupportedParams bool `yaml:"ignore-unsupported-params,omitempty" json:"ignore-unsupported-params,omitempty"`
+}
+
+// ResolvedUpstreamModel returns the effective ChatGPT Web image conversation model.
+func (cfg ChatGPTWebImageConfig) ResolvedUpstreamModel() string {
+	if model := strings.TrimSpace(cfg.UpstreamModel); model != "" {
+		return model
+	}
+	return DefaultChatGPTWebImageUpstreamModel
 }
 
 // NativeImagesConfig holds direct Codex Images API configuration.

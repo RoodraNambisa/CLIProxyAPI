@@ -39,6 +39,9 @@ const (
 	// ImageGenerationMaxResultsMetadataKey limits provider-side image result
 	// materialization for compatibility image endpoints.
 	ImageGenerationMaxResultsMetadataKey = "image_generation_max_results"
+	// ChatGPTWebIgnoreUnsupportedImageParamsMetadataKey pins the compatibility
+	// endpoint's unsupported image parameter policy for one execution.
+	ChatGPTWebIgnoreUnsupportedImageParamsMetadataKey = "chatgpt_web_ignore_unsupported_image_params"
 	// ImageGenerationResultStateMetadataKey carries provider-confirmed image
 	// generation success back to the auth result recorder.
 	ImageGenerationResultStateMetadataKey = "image_generation_result_state"

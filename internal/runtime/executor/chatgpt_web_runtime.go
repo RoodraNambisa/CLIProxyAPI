@@ -352,13 +352,21 @@ func (e *ChatGPTWebExecutor) prepareRuntimeRequest(ctx context.Context, auth *cl
 	if err != nil {
 		return nil, err
 	}
-	canonicalBody = helps.ApplyPayloadConfigWithRequest(e.configSnapshot(), baseModel, sdktranslator.FormatCodex.String(), opts.SourceFormat.String(), "",
+	cfg := e.configSnapshot()
+	canonicalBody = helps.ApplyPayloadConfigWithRequest(cfg, baseModel, sdktranslator.FormatCodex.String(), opts.SourceFormat.String(), "",
 		canonicalBody, originalSource, routeModel, helps.PayloadRequestPath(opts), opts.Headers)
 	forcedTool := ""
 	if chatGPTWebSearchAlias(routeModel) || chatGPTWebOriginalRequestUsesSearch(opts.OriginalRequest) {
 		forcedTool = "search"
 	}
-	parsed, err := helps.ParseChatGPTWebRequestWithForcedTool(canonicalBody, forcedTool)
+	ignoreUnsupportedImageParams := cfg != nil && cfg.Images.ChatGPTWeb.IgnoreUnsupportedParams
+	if pinned, ok := opts.Metadata[cliproxyexecutor.ChatGPTWebIgnoreUnsupportedImageParamsMetadataKey].(bool); ok {
+		ignoreUnsupportedImageParams = pinned
+	}
+	parsed, err := helps.ParseChatGPTWebRequestWithOptions(canonicalBody, helps.ChatGPTWebParseOptions{
+		ForcedTool:                   forcedTool,
+		IgnoreUnsupportedImageParams: ignoreUnsupportedImageParams,
+	})
 	if err != nil {
 		return nil, statusErr{
 			code:           http.StatusBadRequest,
@@ -385,6 +393,9 @@ func (e *ChatGPTWebExecutor) prepareRuntimeRequest(ctx context.Context, auth *cl
 			retryOtherAuth: true,
 		}
 	}
+	if ignoreUnsupportedImageParams {
+		ignoreUnsupportedChatGPTWebImageParams(parsed.Image)
+	}
 	if err = validateChatGPTWebImageRequest(parsed.Image); err != nil {
 		return nil, err
 	}
@@ -394,7 +405,6 @@ func (e *ChatGPTWebExecutor) prepareRuntimeRequest(ctx context.Context, auth *cl
 		}
 	}
 	var usageProjection *helps.ChatGPTWebUsageProjection
-	cfg := e.configSnapshot()
 	if cfg == nil || cfg.ChatGPTWeb.TokenUsageEstimationEnabled() {
 		resolvedCache := config.ResolvedChatGPTWebUsageCacheConfig{
 			DiskThresholdMB: config.DefaultChatGPTWebUsageCacheThresholdMB,

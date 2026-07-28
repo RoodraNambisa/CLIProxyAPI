@@ -49,6 +49,7 @@ const (
 	DefaultChatGPTWebUsageCacheThresholdMB    = 1
 	DefaultChatGPTWebUsageCacheMaxDiskSizeMB  = 1024
 	DefaultChatGPTWebAutoOutputQuality        = "medium"
+	DefaultChatGPTWebImageUpstreamModel       = "gpt-5-5"
 	DefaultChatGPTWebAccountInfoWorkers       = 4
 	DefaultChatGPTWebAccountInfoQueueSize     = 256
 	DefaultChatGPTWebAccountInfoTTLMinutes    = 15
@@ -1312,6 +1313,7 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	cfg.NonRetryableErrors = DefaultNonRetryableErrorRules()
 	cfg.Images.CodexModel = "gpt-5.4"
 	cfg.Images.ImageModel = "gpt-image-2"
+	cfg.Images.ChatGPTWeb.UpstreamModel = DefaultChatGPTWebImageUpstreamModel
 	cfg.Images.Native.Generations.Models = defaultNativeImageModels()
 	cfg.Images.Native.Generations.UnsupportedModelStatusCode = http.StatusBadRequest
 	cfg.Images.Native.Generations.UnsupportedModelMessage = "Native image generation is not enabled for model {model}"
@@ -1382,6 +1384,7 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	if cfg.Images.ImageModel == "" {
 		cfg.Images.ImageModel = "gpt-image-2"
 	}
+	cfg.Images.ChatGPTWeb.UpstreamModel = cfg.Images.ChatGPTWeb.ResolvedUpstreamModel()
 	if cfg.Images.EnableNAggregation == nil {
 		enableNAggregation := false
 		cfg.Images.EnableNAggregation = &enableNAggregation

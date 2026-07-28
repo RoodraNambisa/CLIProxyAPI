@@ -273,6 +273,12 @@ func BuildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 	if oldCfg.ChatGPTWeb.ImageUsage.ResolvedAutoOutputQuality() != newCfg.ChatGPTWeb.ImageUsage.ResolvedAutoOutputQuality() {
 		changes = append(changes, fmt.Sprintf("chatgpt-web.image-usage.auto-output-quality: %s -> %s", oldCfg.ChatGPTWeb.ImageUsage.ResolvedAutoOutputQuality(), newCfg.ChatGPTWeb.ImageUsage.ResolvedAutoOutputQuality()))
 	}
+	if oldCfg.Images.ChatGPTWeb.ResolvedUpstreamModel() != newCfg.Images.ChatGPTWeb.ResolvedUpstreamModel() {
+		changes = append(changes, fmt.Sprintf("images.chatgpt-web.upstream-model: %s -> %s", oldCfg.Images.ChatGPTWeb.ResolvedUpstreamModel(), newCfg.Images.ChatGPTWeb.ResolvedUpstreamModel()))
+	}
+	if oldCfg.Images.ChatGPTWeb.IgnoreUnsupportedParams != newCfg.Images.ChatGPTWeb.IgnoreUnsupportedParams {
+		changes = append(changes, fmt.Sprintf("images.chatgpt-web.ignore-unsupported-params: %t -> %t", oldCfg.Images.ChatGPTWeb.IgnoreUnsupportedParams, newCfg.Images.ChatGPTWeb.IgnoreUnsupportedParams))
+	}
 
 	// Codex keys (do not print key material)
 	if len(oldCfg.CodexKey) != len(newCfg.CodexKey) {

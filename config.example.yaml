@@ -350,6 +350,9 @@ nonstream-keepalive-interval: 0
 #   enable-stream-flush: true        # Allow image stream flush batching. Uses image or global streaming thresholds.
 #   stream-flush-interval-ms: 0      # Image-specific flush interval. 0 falls back to streaming.stream-flush-interval-ms.
 #   stream-flush-min-bytes: 0        # Image-specific byte threshold. 0 falls back to streaming.stream-flush-min-bytes.
+#   chatgpt-web:
+#     upstream-model: "gpt-5-5"      # Web conversation model used to invoke picture_v2.
+#     ignore-unsupported-params: false # Drop unsupported size/quality/etc. instead of excluding Web routing.
 #   native:
 #     generations:
 #       enabled: false

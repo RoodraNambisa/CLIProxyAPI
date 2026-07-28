@@ -25,20 +25,22 @@ import (
 )
 
 type imageCaptureExecutor struct {
-	provider      string
-	calls         int
-	streamCalls   int
-	model         string
-	requested     string
-	override      string
-	payload       []byte
-	stream        bool
-	sourceFormat  string
-	alt           string
-	maxResults    int
-	response      []byte
-	streamChunks  []coreexecutor.StreamChunk
-	beforeExecute func()
+	provider                        string
+	calls                           int
+	streamCalls                     int
+	model                           string
+	requested                       string
+	override                        string
+	payload                         []byte
+	stream                          bool
+	sourceFormat                    string
+	alt                             string
+	maxResults                      int
+	ignoreUnsupportedImageParams    bool
+	hasIgnoreUnsupportedImageParams bool
+	response                        []byte
+	streamChunks                    []coreexecutor.StreamChunk
+	beforeExecute                   func()
 }
 
 func (e *imageCaptureExecutor) Identifier() string {
@@ -61,6 +63,7 @@ func (e *imageCaptureExecutor) Execute(ctx context.Context, auth *coreauth.Auth,
 	e.sourceFormat = opts.SourceFormat.String()
 	e.alt = opts.Alt
 	e.maxResults, _ = opts.Metadata[coreexecutor.ImageGenerationMaxResultsMetadataKey].(int)
+	e.ignoreUnsupportedImageParams, e.hasIgnoreUnsupportedImageParams = opts.Metadata[coreexecutor.ChatGPTWebIgnoreUnsupportedImageParamsMetadataKey].(bool)
 	if len(e.response) == 0 {
 		e.response = []byte(`{"created_at":1700000000,"output":[{"type":"image_generation_call","result":"aGVsbG8=","revised_prompt":"rev"}],"usage":{"total_tokens":3}}`)
 	}
@@ -77,6 +80,7 @@ func (e *imageCaptureExecutor) ExecuteStream(_ context.Context, _ *coreauth.Auth
 	e.sourceFormat = opts.SourceFormat.String()
 	e.alt = opts.Alt
 	e.maxResults, _ = opts.Metadata[coreexecutor.ImageGenerationMaxResultsMetadataKey].(int)
+	e.ignoreUnsupportedImageParams, e.hasIgnoreUnsupportedImageParams = opts.Metadata[coreexecutor.ChatGPTWebIgnoreUnsupportedImageParamsMetadataKey].(bool)
 	ch := make(chan coreexecutor.StreamChunk, len(e.streamChunks))
 	for _, chunk := range e.streamChunks {
 		ch <- chunk
@@ -302,11 +306,85 @@ func TestImageResponsesProvidersExcludeChatGPTWebForUnsupportedInputs(t *testing
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			got := imageResponsesProviders(test.req)
+			got := imageResponsesProviders(test.req, false)
 			if strings.Join(got, ",") != strings.Join(test.want, ",") {
 				t.Fatalf("providers = %v, want %v", got, test.want)
 			}
 		})
+	}
+}
+
+func TestImageResponsesProvidersCanIgnoreUnsupportedWebParams(t *testing.T) {
+	request := openAIImageRequest{
+		Size:              "1024x1024",
+		Quality:           "high",
+		Background:        "transparent",
+		OutputFormat:      "jpeg",
+		InputFidelity:     "high",
+		Moderation:        "low",
+		OutputCompression: intPointer(90),
+		PartialImages:     intPointer(1),
+	}
+	got := imageResponsesProviders(request, true)
+	want := []string{constant.Codex, constant.ChatGPTWeb}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("providers = %v, want %v", got, want)
+	}
+
+	request.Images = []imageReference{{ImageURL: "https://example.com/image.png"}}
+	got = imageResponsesProviders(request, true)
+	if strings.Join(got, ",") != constant.Codex {
+		t.Fatalf("remote image providers = %v, want Codex only", got)
+	}
+}
+
+func TestOpenAIImagesGenerationsCanRouteIgnoredParamsToChatGPTWeb(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	executor := &imageCaptureExecutor{provider: "chatgpt-web"}
+	h := newImagesTestHandler(t, executor)
+	h.Cfg.Images.ChatGPTWeb.IgnoreUnsupportedParams = true
+	router := gin.New()
+	router.POST("/v1/images/generations", h.Generations)
+
+	request := httptest.NewRequest(http.MethodPost, "/v1/images/generations", strings.NewReader(
+		`{"model":"gpt-image-2","prompt":"draw","size":"1024x1024","quality":"high"}`,
+	))
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", response.Code, response.Body.String())
+	}
+	if executor.calls != 1 {
+		t.Fatalf("executor calls = %d, want 1", executor.calls)
+	}
+	if !executor.hasIgnoreUnsupportedImageParams || !executor.ignoreUnsupportedImageParams {
+		t.Fatalf("ignore unsupported image params metadata = (%v, %v), want (true, true)",
+			executor.ignoreUnsupportedImageParams, executor.hasIgnoreUnsupportedImageParams)
+	}
+}
+
+func TestOpenAIImagesPinsDisabledUnsupportedParamPolicy(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	executor := &imageCaptureExecutor{provider: "chatgpt-web"}
+	h := newImagesTestHandler(t, executor)
+	router := gin.New()
+	router.POST("/v1/images/generations", h.Generations)
+
+	request := httptest.NewRequest(http.MethodPost, "/v1/images/generations", strings.NewReader(
+		`{"model":"gpt-image-2","prompt":"draw"}`,
+	))
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", response.Code, response.Body.String())
+	}
+	if !executor.hasIgnoreUnsupportedImageParams || executor.ignoreUnsupportedImageParams {
+		t.Fatalf("ignore unsupported image params metadata = (%v, %v), want (false, true)",
+			executor.ignoreUnsupportedImageParams, executor.hasIgnoreUnsupportedImageParams)
 	}
 }
 

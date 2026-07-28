@@ -138,6 +138,12 @@ type ChatGPTWebRequest struct {
 	Image           *ChatGPTWebImageRequest
 }
 
+// ChatGPTWebParseOptions controls provider-specific compatibility parsing.
+type ChatGPTWebParseOptions struct {
+	ForcedTool                   string
+	IgnoreUnsupportedImageParams bool
+}
+
 // ChatGPTWebSSEDecoder reconstructs SSE data payloads across arbitrary network
 // chunk boundaries. Event, id, retry and comment fields are ignored.
 type ChatGPTWebSSEDecoder struct {
@@ -217,12 +223,17 @@ func (decoder *ChatGPTWebSSEDecoder) Feed(chunk []byte, flush bool) ([][]byte, e
 
 // ParseChatGPTWebRequest parses a canonical OpenAI Responses request.
 func ParseChatGPTWebRequest(payload []byte) (ChatGPTWebRequest, error) {
-	return ParseChatGPTWebRequestWithForcedTool(payload, "")
+	return ParseChatGPTWebRequestWithOptions(payload, ChatGPTWebParseOptions{})
 }
 
 // ParseChatGPTWebRequestWithForcedTool parses a canonical request while
 // selecting a provider-specific tool required by the route.
 func ParseChatGPTWebRequestWithForcedTool(payload []byte, forcedTool string) (ChatGPTWebRequest, error) {
+	return ParseChatGPTWebRequestWithOptions(payload, ChatGPTWebParseOptions{ForcedTool: forcedTool})
+}
+
+// ParseChatGPTWebRequestWithOptions parses a canonical request with explicit compatibility options.
+func ParseChatGPTWebRequestWithOptions(payload []byte, options ChatGPTWebParseOptions) (ChatGPTWebRequest, error) {
 	var root map[string]any
 	decoder := json.NewDecoder(bytes.NewReader(payload))
 	decoder.UseNumber()
@@ -343,7 +354,7 @@ func ParseChatGPTWebRequestWithForcedTool(payload []byte, forcedTool string) (Ch
 			return ChatGPTWebRequest{}, fmt.Errorf("chatgpt web does not support tool_choice type %T", rawChoice)
 		}
 	}
-	if forced := normalizeChatGPTWebForcedTool(forcedTool); forced != "" {
+	if forced := normalizeChatGPTWebForcedTool(options.ForcedTool); forced != "" {
 		choiceMode = "explicit"
 		selectedTool = forced
 	}
@@ -397,7 +408,7 @@ func ParseChatGPTWebRequestWithForcedTool(payload []byte, forcedTool string) (Ch
 		imageTool = nil
 	}
 	if imageTool != nil {
-		if err := validateChatGPTWebImageTool(imageTool); err != nil {
+		if err := validateChatGPTWebImageTool(imageTool, options.IgnoreUnsupportedImageParams); err != nil {
 			return ChatGPTWebRequest{}, err
 		}
 		request.Image, err = imageRequestFromMessages(request.Messages, imageTool)
@@ -541,23 +552,25 @@ func ChatGPTWebEncodedImageSize(value string, maxBytes int) (int, error) {
 	}
 }
 
-func validateChatGPTWebImageTool(tool map[string]any) error {
-	for _, field := range []string{"background", "input_fidelity", "moderation", "output_compression"} {
-		if value, exists := tool[field]; exists && strings.TrimSpace(stringFromAny(value)) != "" {
-			return &ChatGPTWebUnsupportedToolError{
-				Message: fmt.Sprintf("chatgpt web does not support image_generation field %q", field),
+func validateChatGPTWebImageTool(tool map[string]any, ignoreUnsupportedParams bool) error {
+	if !ignoreUnsupportedParams {
+		for _, field := range []string{"background", "input_fidelity", "moderation", "output_compression"} {
+			if value, exists := tool[field]; exists && strings.TrimSpace(stringFromAny(value)) != "" {
+				return &ChatGPTWebUnsupportedToolError{
+					Message: fmt.Sprintf("chatgpt web does not support image_generation field %q", field),
+				}
 			}
 		}
-	}
-	if value := strings.ToLower(strings.TrimSpace(stringFromAny(tool["output_format"]))); value != "" && value != "png" {
-		return &ChatGPTWebUnsupportedToolError{
-			Message: fmt.Sprintf("chatgpt web cannot guarantee image_generation output_format %q", value),
+		if value := strings.ToLower(strings.TrimSpace(stringFromAny(tool["output_format"]))); value != "" && value != "png" {
+			return &ChatGPTWebUnsupportedToolError{
+				Message: fmt.Sprintf("chatgpt web cannot guarantee image_generation output_format %q", value),
+			}
 		}
-	}
-	if value, exists := tool["partial_images"]; exists && strings.TrimSpace(stringFromAny(value)) != "" &&
-		strings.TrimSpace(stringFromAny(value)) != "0" {
-		return &ChatGPTWebUnsupportedToolError{
-			Message: "chatgpt web does not support image_generation partial_images",
+		if value, exists := tool["partial_images"]; exists && strings.TrimSpace(stringFromAny(value)) != "" &&
+			strings.TrimSpace(stringFromAny(value)) != "0" {
+			return &ChatGPTWebUnsupportedToolError{
+				Message: "chatgpt web does not support image_generation partial_images",
+			}
 		}
 	}
 	switch value := strings.ToLower(strings.TrimSpace(stringFromAny(tool["action"]))); value {

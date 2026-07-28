@@ -27,6 +27,7 @@ import (
 	fhttp "github.com/bogdanfinn/fhttp"
 	"github.com/google/uuid"
 	chatgptwebauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/chatgptweb"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor/helps"
 	log "github.com/sirupsen/logrus"
 	_ "golang.org/x/image/webp"
@@ -547,11 +548,12 @@ func (e *ChatGPTWebExecutor) beginChatGPTWebImage(ctx context.Context, client *c
 	if err != nil {
 		return nil, err
 	}
-	conduit, err := e.prepareChatGPTWebImageConversation(ctx, client, credential, requirements, upstreamPrompt)
+	upstreamModel := e.chatGPTWebImageUpstreamModel()
+	conduit, err := e.prepareChatGPTWebImageConversation(ctx, client, credential, requirements, upstreamModel, upstreamPrompt)
 	if err != nil {
 		return nil, err
 	}
-	response, turn, err := e.openChatGPTWebImageConversation(ctx, client, credential, requirements, conduit, upstreamPrompt, uploads)
+	response, turn, err := e.openChatGPTWebImageConversation(ctx, client, credential, requirements, upstreamModel, conduit, upstreamPrompt, uploads)
 	if err != nil {
 		return nil, err
 	}
@@ -792,7 +794,7 @@ func writeChatGPTWebJSONString(output *bytes.Buffer, value string) {
 	_, _ = output.Write(encoded)
 }
 
-func (e *ChatGPTWebExecutor) prepareChatGPTWebImageConversation(ctx context.Context, client *chatgptwebauth.Client, credential *chatgptwebauth.Credential, requirements chatGPTWebRequirements, prompt string) (string, error) {
+func (e *ChatGPTWebExecutor) prepareChatGPTWebImageConversation(ctx context.Context, client *chatgptwebauth.Client, credential *chatgptwebauth.Credential, requirements chatGPTWebRequirements, upstreamModel, prompt string) (string, error) {
 	path := "/backend-api/f/conversation/prepare"
 	prepareRequirements := requirements
 	prepareRequirements.SOToken = ""
@@ -803,7 +805,7 @@ func (e *ChatGPTWebExecutor) prepareChatGPTWebImageConversation(ctx context.Cont
 		"action":                 "next",
 		"fork_from_shared_post":  false,
 		"parent_message_id":      uuid.NewString(),
-		"model":                  "gpt-5-3",
+		"model":                  upstreamModel,
 		"client_prepare_state":   "success",
 		"timezone_offset_min":    -480,
 		"timezone":               "Asia/Shanghai",
@@ -828,7 +830,7 @@ func (e *ChatGPTWebExecutor) prepareChatGPTWebImageConversation(ctx context.Cont
 	return token, nil
 }
 
-func (e *ChatGPTWebExecutor) openChatGPTWebImageConversation(ctx context.Context, client *chatgptwebauth.Client, credential *chatgptwebauth.Credential, requirements chatGPTWebRequirements, conduit, prompt string, uploads []chatGPTWebUploadedImage) (*fhttp.Response, helps.ChatGPTWebImageTurn, error) {
+func (e *ChatGPTWebExecutor) openChatGPTWebImageConversation(ctx context.Context, client *chatgptwebauth.Client, credential *chatgptwebauth.Credential, requirements chatGPTWebRequirements, upstreamModel, conduit, prompt string, uploads []chatGPTWebUploadedImage) (*fhttp.Response, helps.ChatGPTWebImageTurn, error) {
 	path := "/backend-api/f/conversation"
 	headers := chatGPTWebRequirementsHeaders(e.chatGPTWebHeaders(credential, path, nil), requirements)
 	headers["accept"] = "text/event-stream"
@@ -873,7 +875,7 @@ func (e *ChatGPTWebExecutor) openChatGPTWebImageConversation(ctx context.Context
 			"content": content, "metadata": metadata,
 		}},
 		"parent_message_id":                    uuid.NewString(),
-		"model":                                "gpt-5-3",
+		"model":                                upstreamModel,
 		"client_prepare_state":                 "sent",
 		"timezone_offset_min":                  -480,
 		"timezone":                             "Asia/Shanghai",
@@ -2945,6 +2947,26 @@ func validateChatGPTWebImageRequest(request *helps.ChatGPTWebImageRequest) error
 		}
 	}
 	return nil
+}
+
+func ignoreUnsupportedChatGPTWebImageParams(request *helps.ChatGPTWebImageRequest) {
+	if request == nil {
+		return
+	}
+	request.Size = ""
+	if quality := strings.TrimSpace(request.Quality); quality != "" && !strings.EqualFold(quality, "auto") {
+		request.Quality = "auto"
+	}
+	if outputFormat := normalizeChatGPTWebImageOutputFormat(request.OutputFormat); outputFormat != "" && outputFormat != "png" {
+		request.OutputFormat = "png"
+	}
+}
+
+func (e *ChatGPTWebExecutor) chatGPTWebImageUpstreamModel() string {
+	if cfg := e.configSnapshot(); cfg != nil {
+		return cfg.Images.ChatGPTWeb.ResolvedUpstreamModel()
+	}
+	return config.DefaultChatGPTWebImageUpstreamModel
 }
 
 func chatGPTWebEncodedImageSize(value string, maxBytes int) (int, error) {
