@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/gin-gonic/gin"
@@ -345,6 +346,86 @@ func TestCaptureRequestInfoLogOnlyReleaseUsesLogPlaceholder(t *testing.T) {
 	}
 	if !ctrl.Replayable() {
 		t.Fatal("Replayable() = false after log-only release")
+	}
+}
+
+func TestRequestInfoRebindsFromLogOnlyToRealReleaseController(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	body := `{"model":"test","input":"large"}`
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(body))
+	c.Request.ContentLength = int64(len(body))
+
+	info, err := captureRequestInfo(c, true, config.RequestBodyReleaseConfig{
+		Enable:       true,
+		LogOnly:      true,
+		AfterSeconds: 30,
+		MinBodyBytes: 1,
+	})
+	if err != nil {
+		t.Fatalf("captureRequestInfo() error = %v", err)
+	}
+	oldController := ensureRequestBodyReleaseController(c, config.RequestBodyReleaseConfig{
+		Enable:       true,
+		LogOnly:      true,
+		AfterSeconds: 30,
+		MinBodyBytes: 1,
+	}, int64(len(body)))
+	if oldController == nil {
+		t.Fatal("log-only controller = nil")
+	}
+
+	wrapper := NewResponseWriterWrapper(c.Writer, nil, info)
+	realController := cliproxyexecutor.NewRequestBodyReleaseController(
+		int64(len(body)),
+		[]byte("<web request body released>"),
+	)
+	wrapper.BindRequestBodyReleaseController(realController)
+
+	oldController.Release()
+	if got := string(info.BodyBytes()); got != body {
+		t.Fatalf("old controller changed rebound log body to %q", got)
+	}
+	realController.Release()
+	if got := string(info.BodyBytes()); got != "<web request body released>" {
+		t.Fatalf("real controller changed log body to %q", got)
+	}
+}
+
+func TestRequestInfoIgnoresConcurrentReleaseFromReplacedController(t *testing.T) {
+	for iteration := 0; iteration < 200; iteration++ {
+		info := &RequestInfo{Body: []byte("original")}
+		oldController := cliproxyexecutor.NewRequestBodyReleaseController(
+			int64(len("original")),
+			[]byte("<old release>"),
+		)
+		newController := cliproxyexecutor.NewRequestBodyReleaseController(
+			int64(len("original")),
+			[]byte("<new release>"),
+		)
+		info.BindRequestBodyReleaseController(oldController)
+		info.BindRequestBodyReleaseController(newController)
+
+		start := make(chan struct{})
+		var releases sync.WaitGroup
+		releases.Add(2)
+		go func() {
+			defer releases.Done()
+			<-start
+			oldController.Release()
+		}()
+		go func() {
+			defer releases.Done()
+			<-start
+			newController.Release()
+		}()
+		close(start)
+		releases.Wait()
+
+		if got := string(info.BodyBytes()); got != "<new release>" {
+			t.Fatalf("iteration %d body = %q, want new controller placeholder", iteration, got)
+		}
 	}
 }
 

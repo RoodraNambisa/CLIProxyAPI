@@ -165,9 +165,7 @@ func captureRequestInfo(c *gin.Context, captureBody bool, releaseCfg config.Requ
 			bytes.Contains(body, []byte(`"stream":true`)),
 	}
 	if ctrl := ensureRequestBodyReleaseController(c, releaseCfg, int64(len(body))); ctrl != nil && len(body) > 0 {
-		ctrl.RegisterReleaseCallback(func(placeholder []byte) {
-			requestInfo.SetBody(placeholder)
-		})
+		requestInfo.BindRequestBodyReleaseController(ctrl)
 	}
 	return requestInfo, nil
 }

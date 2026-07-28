@@ -2,12 +2,23 @@ package handlers
 
 import (
 	"context"
+	"net/http/httptest"
 	"testing"
 	"time"
 
+	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	coreexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 )
+
+type requestBodyReleaseBindingWriter struct {
+	gin.ResponseWriter
+	controller *coreexecutor.RequestBodyReleaseController
+}
+
+func (writer *requestBodyReleaseBindingWriter) BindRequestBodyReleaseController(controller *coreexecutor.RequestBodyReleaseController) {
+	writer.controller = controller
+}
 
 func TestChatGPTWebForcedBodyReleaseIgnoresGlobalTimerAndSize(t *testing.T) {
 	t.Parallel()
@@ -31,6 +42,23 @@ func TestChatGPTWebForcedBodyReleaseIgnoresGlobalTimerAndSize(t *testing.T) {
 	}
 	if !controller.Release() || controller.Replayable() {
 		t.Fatal("explicit Web release did not make the request non-replayable")
+	}
+}
+
+func TestChatGPTWebForcedBodyReleaseRebindsRequestLogWriter(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	ginCtx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	bindingWriter := &requestBodyReleaseBindingWriter{ResponseWriter: ginCtx.Writer}
+	ginCtx.Writer = bindingWriter
+
+	handler := &BaseAPIHandler{Cfg: &config.SDKConfig{}}
+	ctx := context.WithValue(context.Background(), "gin", ginCtx)
+	_, controller := handler.attachRequestBodyRelease(ctx, []byte(`{"model":"gpt-5"}`), nil, true)
+	if controller == nil {
+		t.Fatal("forced ChatGPT Web controller = nil")
+	}
+	if bindingWriter.controller != controller {
+		t.Fatal("request log writer was not rebound to the forced controller")
 	}
 }
 

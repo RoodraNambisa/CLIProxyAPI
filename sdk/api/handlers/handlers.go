@@ -559,6 +559,11 @@ func (h *BaseAPIHandler) attachRequestBodyRelease(ctx context.Context, rawJSON [
 	}
 	if ginCtx, ok := ctx.Value("gin").(*gin.Context); ok && ginCtx != nil {
 		ginCtx.Set(coreexecutor.BodyReleaseControllerMetadataKey, ctrl)
+		if binder, okBinder := ginCtx.Writer.(interface {
+			BindRequestBodyReleaseController(*coreexecutor.RequestBodyReleaseController)
+		}); okBinder {
+			binder.BindRequestBodyReleaseController(ctrl)
+		}
 	}
 	ctx = coreexecutor.WithRequestBodyReleaseController(ctx, ctrl)
 	// ChatGPT Web releases the body itself after its upstream session is

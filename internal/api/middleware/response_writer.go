@@ -13,6 +13,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 )
 
 const requestBodyOverrideContextKey = "REQUEST_BODY_OVERRIDE"
@@ -22,14 +23,17 @@ const requestLogContextMutexKey = "REQUEST_LOG_CONTEXT_MUTEX"
 
 // RequestInfo holds essential details of an incoming HTTP request for logging purposes.
 type RequestInfo struct {
-	mu         sync.RWMutex
-	URL        string              // URL is the request URL.
-	Method     string              // Method is the HTTP method (e.g., GET, POST).
-	Headers    map[string][]string // Headers contains the request headers.
-	Body       []byte              // Body is the raw request body.
-	RequestID  string              // RequestID is the unique identifier for the request.
-	Timestamp  time.Time           // Timestamp is when the request was received.
-	StreamHint bool                // StreamHint records whether the original request body asked for streaming.
+	mu                sync.RWMutex
+	releaseMu         sync.Mutex
+	releaseGeneration uint64
+	unregister        func()
+	URL               string              // URL is the request URL.
+	Method            string              // Method is the HTTP method (e.g., GET, POST).
+	Headers           map[string][]string // Headers contains the request headers.
+	Body              []byte              // Body is the raw request body.
+	RequestID         string              // RequestID is the unique identifier for the request.
+	Timestamp         time.Time           // Timestamp is when the request was received.
+	StreamHint        bool                // StreamHint records whether the original request body asked for streaming.
 }
 
 func (r *RequestInfo) BodyBytes() []byte {
@@ -48,6 +52,44 @@ func (r *RequestInfo) SetBody(body []byte) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.Body = bytes.Clone(body)
+}
+
+// BindRequestBodyReleaseController moves the request-log body callback to ctrl.
+// ChatGPT Web may replace a disabled or log-only controller with a real one
+// after provider selection.
+func (r *RequestInfo) BindRequestBodyReleaseController(ctrl *cliproxyexecutor.RequestBodyReleaseController) {
+	if r == nil {
+		return
+	}
+	r.releaseMu.Lock()
+	r.releaseGeneration++
+	generation := r.releaseGeneration
+	unregisterPrevious := r.unregister
+	r.unregister = nil
+	r.releaseMu.Unlock()
+
+	if unregisterPrevious != nil {
+		unregisterPrevious()
+	}
+	if ctrl == nil {
+		return
+	}
+	unregister := ctrl.RegisterReleaseCallback(func(placeholder []byte) {
+		r.releaseMu.Lock()
+		defer r.releaseMu.Unlock()
+		if r.releaseGeneration == generation {
+			r.SetBody(placeholder)
+		}
+	})
+
+	r.releaseMu.Lock()
+	if r.releaseGeneration == generation {
+		r.unregister = unregister
+		r.releaseMu.Unlock()
+		return
+	}
+	r.releaseMu.Unlock()
+	unregister()
 }
 
 // ResponseWriterWrapper wraps the standard gin.ResponseWriter to intercept and log response data.
@@ -85,6 +127,15 @@ func NewResponseWriterWrapper(w gin.ResponseWriter, logger logging.RequestLogger
 		requestInfo:    requestInfo,
 		headers:        make(map[string][]string),
 	}
+}
+
+// BindRequestBodyReleaseController keeps the captured request-log body attached
+// when a handler replaces the request's release controller.
+func (w *ResponseWriterWrapper) BindRequestBodyReleaseController(ctrl *cliproxyexecutor.RequestBodyReleaseController) {
+	if w == nil || w.requestInfo == nil {
+		return
+	}
+	w.requestInfo.BindRequestBodyReleaseController(ctrl)
 }
 
 // Write wraps the underlying ResponseWriter's Write method to capture response data.
