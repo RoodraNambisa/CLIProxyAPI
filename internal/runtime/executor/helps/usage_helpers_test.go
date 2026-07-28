@@ -291,8 +291,34 @@ func TestUsageReporterAdditionalModelSkipsZeroUsage(t *testing.T) {
 	if _, ok := reporter.buildAdditionalModelRecord("gpt-image-2", usage.Detail{}); ok {
 		t.Fatal("expected zero-token additional model usage to be skipped")
 	}
-	if record, ok := reporter.buildAdditionalModelRecord("gpt-image-2", usage.Detail{OutputTokens: 10}); !ok || record.Model != "gpt-image-2" || record.Detail.TotalTokens != 10 {
+	if record, ok := reporter.buildAdditionalModelRecord("gpt-image-2", usage.Detail{OutputTokens: 10}); !ok || record.Model != "gpt-image-2" || record.Detail.TotalTokens != 10 || !record.Auxiliary {
 		t.Fatalf("unexpected additional model record: %#v ok=%v", record, ok)
+	}
+}
+
+func TestUsageReporterObservedAdditionalModelPublishesAuxiliaryRecord(t *testing.T) {
+	const authID = "usage-reporter-observed-additional"
+	records := make(chan usage.Record, 2)
+	usage.RegisterPlugin(&usageReporterTestPlugin{authID: authID, records: records})
+	reporter := NewUsageReporter(context.Background(), "codex", "gpt-5.4", &cliproxyauth.Auth{ID: authID})
+	reporter.ObserveAdditionalModel("gpt-image-2", usage.Detail{OutputTokens: 48})
+	reporter.EnsurePublished(context.Background())
+
+	got := map[string]usage.Record{}
+	deadline := time.After(time.Second)
+	for len(got) < 2 {
+		select {
+		case record := <-records:
+			got[record.Model] = record
+		case <-deadline:
+			t.Fatalf("timed out waiting for usage records: %#v", got)
+		}
+	}
+	if got["gpt-5.4"].Auxiliary {
+		t.Fatalf("primary record marked auxiliary: %#v", got["gpt-5.4"])
+	}
+	if !got["gpt-image-2"].Auxiliary {
+		t.Fatalf("additional record not marked auxiliary: %#v", got["gpt-image-2"])
 	}
 }
 

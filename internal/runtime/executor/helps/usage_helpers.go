@@ -208,7 +208,9 @@ func (r *UsageReporter) buildAdditionalModelRecord(model string, detail usage.De
 	if !hasNonZeroTokenUsage(detail) {
 		return usage.Record{}, false
 	}
-	return r.buildRecordForModel(model, detail, false), true
+	record := r.buildRecordForModel(model, detail, false)
+	record.Auxiliary = true
+	return record, true
 }
 
 func (r *UsageReporter) PublishFailure(ctx context.Context, _ ...error) {
@@ -247,7 +249,9 @@ func (r *UsageReporter) publishWithOutcome(ctx context.Context, detail usage.Det
 		return
 	}
 	for i := range additional {
-		usage.PublishRecord(ctx, r.buildRecordForModel(additional[i].model, additional[i].detail, false))
+		record := r.buildRecordForModel(additional[i].model, additional[i].detail, false)
+		record.Auxiliary = true
+		usage.PublishRecord(ctx, record)
 	}
 }
 

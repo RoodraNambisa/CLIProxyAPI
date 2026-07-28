@@ -285,7 +285,7 @@ func (s *RequestStatistics) fillLegacyRangeMapsLocked(result *SummarySnapshot, t
 		}
 		for _, entry := range stats.Entries {
 			if effective.contains(entry.Timestamp) {
-				addLegacyRangeStats(result, key.Day, key.Hour, 1, entry.Tokens)
+				addLegacyRangeStats(result, key.Day, key.Hour, entry.Requests, entry.Tokens)
 			}
 		}
 	}
@@ -516,7 +516,8 @@ func (s *RequestStatistics) Series(query SeriesQuery) SeriesResult {
 }
 
 func appendSeriesAggregate(items *[]SeriesEntry, bucket time.Time, groupBy string, aggregate *usageAggregateBucket, maxItems int) bool {
-	if items == nil || aggregate == nil || aggregate.Total.TotalRequests == 0 {
+	if items == nil || aggregate == nil ||
+		(aggregate.Total.TotalRequests == 0 && aggregate.Total.TotalTokens == 0) {
 		return false
 	}
 	if groupBy == GroupByFailed {
@@ -564,7 +565,7 @@ func appendSeriesAggregate(items *[]SeriesEntry, bucket time.Time, groupBy strin
 	sort.Strings(keys)
 	for _, group := range keys {
 		stats := groups[group]
-		if stats == nil || stats.TotalRequests == 0 {
+		if stats == nil || (stats.TotalRequests == 0 && stats.TotalTokens == 0) {
 			continue
 		}
 		if len(*items) >= maxItems {

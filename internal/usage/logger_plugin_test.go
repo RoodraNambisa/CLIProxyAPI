@@ -58,6 +58,126 @@ func TestRequestStatisticsNormalizesNegativeRecordTokens(t *testing.T) {
 	assertUsageTokensAreZero(t, stats)
 }
 
+func TestRequestStatisticsAuxiliaryUsageKeepsTokenAndCostAttributionWithoutCountingAnotherRequest(t *testing.T) {
+	stats := NewRequestStatistics()
+	requestedAt := time.Now().UTC().Truncate(time.Minute).Add(-time.Second)
+	primary := coreusage.Record{
+		APIKey:      "test-key",
+		Model:       "gpt-5.4",
+		AuthIndex:   "auth-a",
+		Source:      "chatgpt-web",
+		RequestedAt: requestedAt,
+		Detail: coreusage.Detail{
+			InputTokens:  10,
+			OutputTokens: 2,
+			TotalTokens:  12,
+		},
+	}
+	auxiliary := coreusage.Record{
+		APIKey:      "test-key",
+		Model:       "gpt-image-2",
+		AuthIndex:   "auth-a",
+		Source:      "chatgpt-web",
+		RequestedAt: requestedAt,
+		Auxiliary:   true,
+		Detail: coreusage.Detail{
+			InputTokens:  3,
+			OutputTokens: 48,
+			TotalTokens:  51,
+		},
+	}
+	stats.Record(context.Background(), primary)
+	stats.Record(context.Background(), auxiliary)
+
+	summary := stats.Summary()
+	if summary.TotalRequests != 1 || summary.SuccessCount != 1 || summary.FailureCount != 0 || summary.TotalTokens != 63 {
+		t.Fatalf("summary totals = %+v, want requests=1 success=1 tokens=63", summary)
+	}
+	if model := summary.Models["gpt-5.4"]; model.TotalRequests != 1 || model.TotalTokens != 12 {
+		t.Fatalf("primary model summary = %+v", model)
+	}
+	if model := summary.Models["gpt-image-2"]; model.TotalRequests != 0 || model.SuccessCount != 0 || model.TotalTokens != 51 {
+		t.Fatalf("auxiliary model summary = %+v, want request counters zero and tokens=51", model)
+	}
+	if auth, ok := stats.AuthSummary("auth-a"); !ok || auth.TotalRequests != 1 || auth.TotalTokens != 63 {
+		t.Fatalf("auth summary = %+v, ok=%t", auth, ok)
+	}
+
+	rates := stats.ratesAt(RatesQuery{WindowMinutes: 1, SparklineMinutes: 1}, requestedAt.Add(30*time.Second))
+	if rates.RequestCount != 1 || rates.TokenCount != 63 || rates.RPM != 1 {
+		t.Fatalf("rates = %+v, want one request and all tokens", rates)
+	}
+
+	series := stats.Series(SeriesQuery{
+		TimeRange: TimeRange{From: requestedAt.Add(-time.Second), To: requestedAt.Add(time.Second)},
+		Bucket:    BucketMinute,
+		GroupBy:   GroupByModel,
+	})
+	var imageSeries *SeriesEntry
+	for index := range series.Items {
+		if series.Items[index].Group == "gpt-image-2" {
+			imageSeries = &series.Items[index]
+			break
+		}
+	}
+	if imageSeries == nil || imageSeries.TotalRequests != 0 || imageSeries.TotalTokens != 51 {
+		t.Fatalf("image model series = %+v, want requests=0 tokens=51", imageSeries)
+	}
+
+	costs := stats.Costs(CostQuery{
+		TimeRange: TimeRange{From: requestedAt.Add(-time.Second), To: requestedAt.Add(time.Second)},
+		Bucket:    BucketHour,
+		Prices: map[string]ModelPrice{
+			"gpt-5.4":     {InputPerMillion: 1, OutputPerMillion: 2},
+			"gpt-image-2": {InputPerMillion: 1, OutputPerMillion: 3},
+		},
+	})
+	if costs.Coverage.TotalRequests != 1 || costs.TotalTokens != 63 || costs.Total.AmountMicros != 161 {
+		t.Fatalf("costs = %+v, want requests=1 tokens=63 amount_micros=161", costs)
+	}
+
+	snapshot := stats.Snapshot()
+	imageDetails := snapshot.APIs["test-key"].Models["gpt-image-2"].Details
+	if len(imageDetails) != 1 || !imageDetails[0].Auxiliary {
+		t.Fatalf("image details = %+v, want persisted auxiliary marker", imageDetails)
+	}
+	raw, errMarshal := json.Marshal(snapshot)
+	if errMarshal != nil {
+		t.Fatalf("Marshal(snapshot) error = %v", errMarshal)
+	}
+	if !strings.Contains(string(raw), `"auxiliary":true`) {
+		t.Fatalf("snapshot omitted auxiliary marker: %s", raw)
+	}
+
+	restored := NewRequestStatistics()
+	var decoded StatisticsSnapshot
+	if errUnmarshal := json.Unmarshal(raw, &decoded); errUnmarshal != nil {
+		t.Fatalf("Unmarshal(snapshot) error = %v", errUnmarshal)
+	}
+	if result := restored.MergeSnapshot(decoded); result.Added != 2 {
+		t.Fatalf("MergeSnapshot() = %+v, want two detail rows", result)
+	}
+	if restoredSummary := restored.Summary(); restoredSummary.TotalRequests != 1 || restoredSummary.TotalTokens != 63 {
+		t.Fatalf("restored summary = %+v, want requests=1 tokens=63", restoredSummary)
+	}
+}
+
+func TestRequestStatisticsLegacySnapshotWithoutAuxiliaryFieldStillCountsAsRequest(t *testing.T) {
+	var snapshot StatisticsSnapshot
+	raw := []byte(`{"apis":{"test-key":{"models":{"gpt-image-2":{"details":[{"timestamp":"2026-03-20T12:00:00Z","tokens":{"output_tokens":48,"total_tokens":48},"failed":false}]}}}}}`)
+	if err := json.Unmarshal(raw, &snapshot); err != nil {
+		t.Fatalf("Unmarshal(legacy snapshot) error = %v", err)
+	}
+	stats := NewRequestStatistics()
+	if result := stats.MergeSnapshot(snapshot); result.Added != 1 {
+		t.Fatalf("MergeSnapshot() = %+v, want one detail row", result)
+	}
+	summary := stats.Summary()
+	if summary.TotalRequests != 1 || summary.SuccessCount != 1 || summary.TotalTokens != 48 {
+		t.Fatalf("legacy summary = %+v, want ordinary request semantics", summary)
+	}
+}
+
 func TestMergeSnapshotNormalizesNegativeTokens(t *testing.T) {
 	stats := NewRequestStatistics()
 	result := stats.MergeSnapshot(StatisticsSnapshot{APIs: map[string]APISnapshot{

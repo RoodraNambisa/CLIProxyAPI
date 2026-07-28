@@ -76,7 +76,9 @@ func (a *aggregateStats) addDetail(detail RequestDetail) {
 	}
 	normalizedTokens := normaliseTokenStats(detail.Tokens)
 	if hasCostBreakdown(normalizedTokens) {
-		a.CalculableRequests = saturatingAddInt64(a.CalculableRequests, 1)
+		if !detail.Auxiliary {
+			a.CalculableRequests = saturatingAddInt64(a.CalculableRequests, 1)
+		}
 		a.CalculableTokens = saturatingAddInt64(a.CalculableTokens, nonNegativeInt64(normalizedTokens.TotalTokens))
 		a.NonCachedInput = saturatingAddInt64(a.NonCachedInput, nonCachedInputTokens(normalizedTokens))
 	}
@@ -522,12 +524,17 @@ func (s *RequestStatistics) updateLegacyHourBucketLocked(detail RequestDetail) {
 		stats = &legacyHourStats{}
 		s.legacyHourBuckets[key] = stats
 	}
-	stats.Requests = saturatingAddInt64(stats.Requests, 1)
+	requests := int64(0)
+	if !detail.Auxiliary {
+		requests = 1
+		stats.Requests = saturatingAddInt64(stats.Requests, requests)
+	}
 	totalTokens := normaliseTokenStats(detail.Tokens).TotalTokens
 	stats.Tokens = saturatingAddInt64(stats.Tokens, nonNegativeInt64(totalTokens))
 	stats.Entries = append(stats.Entries, legacyUsageEntry{
 		Timestamp: timestamp,
 		Tokens:    totalTokens,
+		Requests:  requests,
 	})
 }
 

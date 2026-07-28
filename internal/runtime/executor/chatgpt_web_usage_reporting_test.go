@@ -43,8 +43,12 @@ func TestPublishChatGPTWebTerminalUsageIncludesImageToolModel(t *testing.T) {
 	}
 	if outer := got["gpt-5.4"]; outer.Detail.TotalTokens != 13 {
 		t.Fatalf("outer usage = %#v", outer)
+	} else if outer.Auxiliary {
+		t.Fatalf("outer usage marked auxiliary: %#v", outer)
 	}
 	if image := got["gpt-image-2"]; image.Detail.OutputTokens != 7024 || image.Detail.TotalTokens != 7027 {
 		t.Fatalf("image tool usage = %#v", image)
+	} else if !image.Auxiliary {
+		t.Fatalf("image tool usage not marked auxiliary: %#v", image)
 	}
 }

@@ -109,6 +109,7 @@ type legacyHourStats struct {
 type legacyUsageEntry struct {
 	Timestamp time.Time
 	Tokens    int64
+	Requests  int64
 }
 
 // apiStats holds aggregated metrics for a single API key.
@@ -163,6 +164,7 @@ type RequestDetail struct {
 	ResponseServiceTier string     `json:"response_service_tier,omitempty"`
 	Tokens              TokenStats `json:"tokens"`
 	Failed              bool       `json:"failed"`
+	Auxiliary           bool       `json:"auxiliary,omitempty"`
 }
 
 // TokenStats captures the token usage breakdown for a request.
@@ -264,11 +266,13 @@ func (s *RequestStatistics) Record(ctx context.Context, record coreusage.Record)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	s.totalRequests = saturatingAddInt64(s.totalRequests, 1)
-	if success {
-		s.successCount = saturatingAddInt64(s.successCount, 1)
-	} else {
-		s.failureCount = saturatingAddInt64(s.failureCount, 1)
+	if !record.Auxiliary {
+		s.totalRequests = saturatingAddInt64(s.totalRequests, 1)
+		if success {
+			s.successCount = saturatingAddInt64(s.successCount, 1)
+		} else {
+			s.failureCount = saturatingAddInt64(s.failureCount, 1)
+		}
 	}
 	s.totalTokens = saturatingAddInt64(s.totalTokens, totalTokens)
 
@@ -287,6 +291,7 @@ func (s *RequestStatistics) Record(ctx context.Context, record coreusage.Record)
 		ResponseServiceTier: strings.TrimSpace(record.ResponseServiceTier),
 		Tokens:              detail,
 		Failed:              failed,
+		Auxiliary:           record.Auxiliary,
 	}
 	if requestDetail.ResponseServiceTier == "" {
 		requestDetail.ResponseServiceTier = strings.TrimSpace(record.Detail.ResponseServiceTier)
@@ -303,8 +308,10 @@ func (s *RequestStatistics) Record(ctx context.Context, record coreusage.Record)
 	})
 	s.pruneTimeBucketsLocked(now)
 
-	s.requestsByDay[dayKey] = saturatingAddInt64(s.requestsByDay[dayKey], 1)
-	s.requestsByHour[hourKey] = saturatingAddInt64(s.requestsByHour[hourKey], 1)
+	if !requestDetail.Auxiliary {
+		s.requestsByDay[dayKey] = saturatingAddInt64(s.requestsByDay[dayKey], 1)
+		s.requestsByHour[hourKey] = saturatingAddInt64(s.requestsByHour[hourKey], 1)
+	}
 	s.tokensByDay[dayKey] = saturatingAddInt64(s.tokensByDay[dayKey], totalTokens)
 	s.tokensByHour[hourKey] = saturatingAddInt64(s.tokensByHour[hourKey], totalTokens)
 	s.updateLegacyHourBucketLocked(requestDetail)
@@ -356,15 +363,17 @@ func (s *RequestStatistics) updateAuthStats(model string, detail RequestDetail) 
 }
 
 func updateUsageAggregate(totalRequests, successCount, failureCount, totalTokens *int64, tokens *TokenStats, detail RequestDetail) {
-	if totalRequests != nil {
-		*totalRequests = saturatingAddInt64(*totalRequests, 1)
-	}
-	if detail.Failed {
-		if failureCount != nil {
-			*failureCount = saturatingAddInt64(*failureCount, 1)
+	if !detail.Auxiliary {
+		if totalRequests != nil {
+			*totalRequests = saturatingAddInt64(*totalRequests, 1)
 		}
-	} else if successCount != nil {
-		*successCount = saturatingAddInt64(*successCount, 1)
+		if detail.Failed {
+			if failureCount != nil {
+				*failureCount = saturatingAddInt64(*failureCount, 1)
+			}
+		} else if successCount != nil {
+			*successCount = saturatingAddInt64(*successCount, 1)
+		}
 	}
 	normalizedTokens := normaliseTokenStats(detail.Tokens)
 	if totalTokens != nil {
@@ -735,11 +744,13 @@ func (s *RequestStatistics) recordImported(apiName, modelName string, stats *api
 		totalTokens = 0
 	}
 
-	s.totalRequests = saturatingAddInt64(s.totalRequests, 1)
-	if detail.Failed {
-		s.failureCount = saturatingAddInt64(s.failureCount, 1)
-	} else {
-		s.successCount = saturatingAddInt64(s.successCount, 1)
+	if !detail.Auxiliary {
+		s.totalRequests = saturatingAddInt64(s.totalRequests, 1)
+		if detail.Failed {
+			s.failureCount = saturatingAddInt64(s.failureCount, 1)
+		} else {
+			s.successCount = saturatingAddInt64(s.successCount, 1)
+		}
 	}
 	s.totalTokens = saturatingAddInt64(s.totalTokens, totalTokens)
 
@@ -750,8 +761,10 @@ func (s *RequestStatistics) recordImported(apiName, modelName string, stats *api
 	dayKey := detail.Timestamp.Format("2006-01-02")
 	hourKey := detail.Timestamp.Hour()
 
-	s.requestsByDay[dayKey] = saturatingAddInt64(s.requestsByDay[dayKey], 1)
-	s.requestsByHour[hourKey] = saturatingAddInt64(s.requestsByHour[hourKey], 1)
+	if !detail.Auxiliary {
+		s.requestsByDay[dayKey] = saturatingAddInt64(s.requestsByDay[dayKey], 1)
+		s.requestsByHour[hourKey] = saturatingAddInt64(s.requestsByHour[hourKey], 1)
+	}
 	s.tokensByDay[dayKey] = saturatingAddInt64(s.tokensByDay[dayKey], totalTokens)
 	s.tokensByHour[hourKey] = saturatingAddInt64(s.tokensByHour[hourKey], totalTokens)
 	s.updateLegacyHourBucketLocked(detail)
@@ -820,11 +833,13 @@ func (s *RequestStatistics) rebuildLocked() {
 				modelStatsValue.Details[idx] = detail
 
 				totalTokens := nonNegativeInt64(detail.Tokens.TotalTokens)
-				s.totalRequests = saturatingAddInt64(s.totalRequests, 1)
-				if detail.Failed {
-					s.failureCount = saturatingAddInt64(s.failureCount, 1)
-				} else {
-					s.successCount = saturatingAddInt64(s.successCount, 1)
+				if !detail.Auxiliary {
+					s.totalRequests = saturatingAddInt64(s.totalRequests, 1)
+					if detail.Failed {
+						s.failureCount = saturatingAddInt64(s.failureCount, 1)
+					} else {
+						s.successCount = saturatingAddInt64(s.successCount, 1)
+					}
 				}
 				s.totalTokens = saturatingAddInt64(s.totalTokens, totalTokens)
 
@@ -834,8 +849,10 @@ func (s *RequestStatistics) rebuildLocked() {
 
 				dayKey := detail.Timestamp.Format("2006-01-02")
 				hourKey := detail.Timestamp.Hour()
-				s.requestsByDay[dayKey] = saturatingAddInt64(s.requestsByDay[dayKey], 1)
-				s.requestsByHour[hourKey] = saturatingAddInt64(s.requestsByHour[hourKey], 1)
+				if !detail.Auxiliary {
+					s.requestsByDay[dayKey] = saturatingAddInt64(s.requestsByDay[dayKey], 1)
+					s.requestsByHour[hourKey] = saturatingAddInt64(s.requestsByHour[hourKey], 1)
+				}
 				s.tokensByDay[dayKey] = saturatingAddInt64(s.tokensByDay[dayKey], totalTokens)
 				s.tokensByHour[hourKey] = saturatingAddInt64(s.tokensByHour[hourKey], totalTokens)
 				s.updateLegacyHourBucketLocked(detail)
@@ -857,7 +874,7 @@ func dedupKey(apiName, modelName string, detail RequestDetail) string {
 	timestamp := detail.Timestamp.UTC().Format(time.RFC3339Nano)
 	tokens := normaliseTokenStats(detail.Tokens)
 	return fmt.Sprintf(
-		"%s|%s|%s|%s|%s|%s|%s|%s|%t|%d|%d|%d|%d|%d|%d",
+		"%s|%s|%s|%s|%s|%s|%s|%s|%t|%t|%d|%d|%d|%d|%d|%d",
 		apiName,
 		modelName,
 		timestamp,
@@ -867,6 +884,7 @@ func dedupKey(apiName, modelName string, detail RequestDetail) string {
 		strings.TrimSpace(detail.RequestServiceTier),
 		strings.TrimSpace(detail.ResponseServiceTier),
 		detail.Failed,
+		detail.Auxiliary,
 		tokens.InputTokens,
 		tokens.OutputTokens,
 		tokens.ReasoningTokens,

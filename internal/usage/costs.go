@@ -254,7 +254,9 @@ func (a *costAggregateStats) addDetail(detail RequestDetail) {
 	)
 	tokens := normaliseTokenStats(detail.Tokens)
 	if hasCostBreakdown(tokens) {
-		a.CalculableRequests = saturatingAddInt64(a.CalculableRequests, 1)
+		if !detail.Auxiliary {
+			a.CalculableRequests = saturatingAddInt64(a.CalculableRequests, 1)
+		}
 		a.CalculableTokens = saturatingAddInt64(a.CalculableTokens, nonNegativeInt64(tokens.TotalTokens))
 		a.NonCachedInput = saturatingAddInt64(a.NonCachedInput, nonCachedInputTokens(tokens))
 	}

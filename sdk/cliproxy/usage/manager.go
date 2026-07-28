@@ -26,7 +26,10 @@ type Record struct {
 	RequestedAt         time.Time
 	Latency             time.Duration
 	Failed              bool
-	Detail              Detail
+	// Auxiliary marks a secondary model token/cost allocation for the same
+	// downstream request. Auxiliary records do not represent another request.
+	Auxiliary bool
+	Detail    Detail
 }
 
 // Detail holds the token usage breakdown.
