@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -79,6 +80,62 @@ func TestChatGPTWebUsageProjectionSpillsLargeInputUntilSuccess(t *testing.T) {
 	}
 	if matches, errGlob := filepath.Glob(filepath.Join(directory, "usage-*.bin")); errGlob != nil || len(matches) != 0 {
 		t.Fatalf("remaining projection files = %v, error = %v", matches, errGlob)
+	}
+}
+
+func TestChatGPTWebUsageProjectionCountsLargeTextAcrossDiskChunksExactly(t *testing.T) {
+	tests := map[string]string{
+		"continuous word": strings.Repeat("hello", chatGPTWebUsageRecordChunkBytes/len("hello")+100),
+		"whitespace":      strings.Repeat(" ", chatGPTWebUsageRecordChunkBytes*3+17),
+		"unicode":         strings.Repeat("世界🙂abc", chatGPTWebUsageRecordChunkBytes/len("世界🙂abc")+100),
+	}
+	for name, text := range tests {
+		t.Run(name, func(t *testing.T) {
+			cache := NewChatGPTWebUsageCache()
+			t.Cleanup(cache.Close)
+			request := chatGPTWebUsageTestRequest(text)
+			encoder, errEncoder := TokenizerForModel("gpt-5.4")
+			if errEncoder != nil {
+				t.Fatalf("TokenizerForModel() error = %v", errEncoder)
+			}
+			segments := chatGPTWebTextTokenSegments(request)
+			var want int64
+			for index, segment := range segments {
+				if index > 0 {
+					count, errCount := encoder.Count("\n")
+					if errCount != nil {
+						t.Fatalf("Count(newline) error = %v", errCount)
+					}
+					want += int64(count)
+				}
+				count, errCount := encoder.Count(segment)
+				if errCount != nil {
+					t.Fatalf("Count(segment) error = %v", errCount)
+				}
+				want += int64(count)
+			}
+
+			projection, errProjection := cache.NewProjection("gpt-5.4", request, ChatGPTWebUsageCacheOptions{
+				Enabled:            true,
+				DiskThresholdBytes: 1,
+				MaxDiskBytes:       8 << 20,
+				Path:               t.TempDir(),
+			})
+			if errProjection != nil {
+				t.Fatalf("NewProjection() error = %v", errProjection)
+			}
+			if projection.filePath == "" {
+				t.Fatal("projection did not spill to disk")
+			}
+			usage, estimateErrors := projection.Estimate("", nil)
+			if len(estimateErrors) != 0 {
+				t.Fatalf("Estimate() errors = %v", estimateErrors)
+			}
+			if got := usage["input_tokens"].(int64); got != want {
+				t.Fatalf("input tokens = %d, want exact whole-segment count %d", got, want)
+			}
+			projection.Complete()
+		})
 	}
 }
 

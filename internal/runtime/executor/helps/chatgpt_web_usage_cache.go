@@ -10,9 +10,13 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"unicode/utf8"
 )
 
-const chatGPTWebUsageRecordChunkBytes = 64 << 10
+const (
+	chatGPTWebUsageRecordChunkBytes      = 64 << 10
+	chatGPTWebUsageTokenizerOverlapBytes = 8 << 10
+)
 
 // ChatGPTWebUsageCacheOptions is an immutable per-request cache configuration.
 type ChatGPTWebUsageCacheOptions struct {
@@ -183,22 +187,10 @@ func chatGPTWebUsageTextRecords(request ChatGPTWebRequest) []chatGPTWebUsageText
 	segments := chatGPTWebTextTokenSegments(request)
 	records := make([]chatGPTWebUsageTextRecord, 0, len(segments))
 	for segmentIndex, segment := range segments {
-		firstChunk := true
-		for len(segment) > 0 {
-			end := min(len(segment), chatGPTWebUsageRecordChunkBytes)
-			for end < len(segment) && end > 0 && !isUTF8RuneStart(segment[end]) {
-				end--
-			}
-			if end == 0 {
-				end = min(len(segment), chatGPTWebUsageRecordChunkBytes)
-			}
-			records = append(records, chatGPTWebUsageTextRecord{
-				separator: segmentIndex > 0 && firstChunk,
-				text:      segment[:end],
-			})
-			firstChunk = false
-			segment = segment[end:]
-		}
+		records = append(records, chatGPTWebUsageTextRecord{
+			separator: segmentIndex > 0,
+			text:      segment,
+		})
 	}
 	return records
 }
@@ -206,9 +198,34 @@ func chatGPTWebUsageTextRecords(request ChatGPTWebRequest) []chatGPTWebUsageText
 func chatGPTWebUsageRecordSizes(records []chatGPTWebUsageTextRecord) (memoryBytes, diskBytes int64) {
 	for _, record := range records {
 		memoryBytes += int64(len(record.text))
-		diskBytes += int64(5 + len(record.text))
+		_ = forEachChatGPTWebUsageRecordChunk(record, func(_ bool, text string) error {
+			diskBytes += int64(5 + len(text))
+			return nil
+		})
 	}
 	return memoryBytes, diskBytes
+}
+
+func forEachChatGPTWebUsageRecordChunk(record chatGPTWebUsageTextRecord, visit func(bool, string) error) error {
+	if visit == nil {
+		return nil
+	}
+	firstChunk := true
+	for len(record.text) > 0 {
+		end := min(len(record.text), chatGPTWebUsageRecordChunkBytes)
+		for end < len(record.text) && end > 0 && !isUTF8RuneStart(record.text[end]) {
+			end--
+		}
+		if end == 0 {
+			end = min(len(record.text), chatGPTWebUsageRecordChunkBytes)
+		}
+		if err := visit(record.separator && firstChunk, record.text[:end]); err != nil {
+			return err
+		}
+		firstChunk = false
+		record.text = record.text[end:]
+	}
+	return nil
 }
 
 func (cache *ChatGPTWebUsageCache) writeProjectionFile(configuredPath string, records []chatGPTWebUsageTextRecord) (string, error) {
@@ -234,17 +251,22 @@ func (cache *ChatGPTWebUsageCache) writeProjectionFile(configuredPath string, re
 	writer := bufio.NewWriterSize(file, 64<<10)
 	var header [5]byte
 	for _, record := range records {
-		if record.separator {
-			header[0] = 1
-		} else {
-			header[0] = 0
-		}
-		binary.BigEndian.PutUint32(header[1:], uint32(len(record.text)))
-		if _, errWrite := writer.Write(header[:]); errWrite != nil {
-			return "", errWrite
-		}
-		if _, errWrite := io.WriteString(writer, record.text); errWrite != nil {
-			return "", errWrite
+		if errChunk := forEachChatGPTWebUsageRecordChunk(record, func(separator bool, text string) error {
+			if separator {
+				header[0] = 1
+			} else {
+				header[0] = 0
+			}
+			binary.BigEndian.PutUint32(header[1:], uint32(len(text)))
+			if _, errWrite := writer.Write(header[:]); errWrite != nil {
+				return errWrite
+			}
+			if _, errWrite := io.WriteString(writer, text); errWrite != nil {
+				return errWrite
+			}
+			return nil
+		}); errChunk != nil {
+			return "", errChunk
 		}
 	}
 	if errFlush := writer.Flush(); errFlush != nil {
@@ -389,24 +411,87 @@ func (projection *ChatGPTWebUsageProjection) countInputTextTokensLocked() (int64
 	if errEncoder != nil {
 		return 0, []error{errEncoder}
 	}
+	countText := func(text string) (int64, error) {
+		count, errCount := encoder.Count(text)
+		return int64(count), errCount
+	}
 	var inputTextTokens int64
+	if projection.filePath == "" {
+		for _, record := range projection.records {
+			if record.separator {
+				count, errCount := countText("\n")
+				if errCount != nil {
+					return inputTextTokens, []error{errCount}
+				}
+				inputTextTokens += count
+			}
+			count, errCount := countText(record.text)
+			if errCount != nil {
+				return inputTextTokens, []error{errCount}
+			}
+			inputTextTokens += count
+		}
+		return inputTextTokens, nil
+	}
+
+	pending := make([]byte, 0, chatGPTWebUsageRecordChunkBytes+chatGPTWebUsageTokenizerOverlapBytes)
+	countPending := func(final bool) error {
+		if len(pending) == 0 {
+			return nil
+		}
+		ids, tokens, errEncode := encoder.Encode(string(pending))
+		if errEncode != nil {
+			return errEncode
+		}
+		if final {
+			inputTextTokens += int64(len(ids))
+			pending = pending[:0]
+			return nil
+		}
+		cutoff := len(pending) - chatGPTWebUsageTokenizerOverlapBytes
+		if cutoff <= 0 {
+			return nil
+		}
+		safeBytes := 0
+		safeTokens := 0
+		consumedBytes := 0
+		for index, token := range tokens {
+			consumedBytes += len(token)
+			if consumedBytes > cutoff {
+				break
+			}
+			if utf8.Valid(pending[:consumedBytes]) {
+				safeBytes = consumedBytes
+				safeTokens = index + 1
+			}
+		}
+		if safeBytes == 0 {
+			return nil
+		}
+		inputTextTokens += int64(safeTokens)
+		copy(pending, pending[safeBytes:])
+		pending = pending[:len(pending)-safeBytes]
+		return nil
+	}
 	errInput := projection.forEachTextRecord(func(separator bool, text string) error {
 		if separator {
-			count, errCount := encoder.Count("\n")
+			if errFlush := countPending(true); errFlush != nil {
+				return errFlush
+			}
+			count, errCount := countText("\n")
 			if errCount != nil {
 				return errCount
 			}
-			inputTextTokens += int64(count)
+			inputTextTokens += count
 		}
-		count, errCount := encoder.Count(text)
-		if errCount != nil {
-			return errCount
-		}
-		inputTextTokens += int64(count)
-		return nil
+		pending = append(pending, text...)
+		return countPending(false)
 	})
 	if errInput != nil {
 		return inputTextTokens, []error{errInput}
+	}
+	if errFlush := countPending(true); errFlush != nil {
+		return inputTextTokens, []error{errFlush}
 	}
 	return inputTextTokens, nil
 }
