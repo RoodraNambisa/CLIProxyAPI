@@ -1423,28 +1423,112 @@ func classifyPermanentAccountFields(code, message string) *AuthError {
 	}
 	message = strings.ToLower(strings.TrimSpace(message))
 	normalizedMessage := normalizeCode(message)
-	if normalizedMessage == "account_deactivated" ||
-		strings.Contains(message, "deleted or deactivated") || strings.Contains(message, "account deactivated") ||
-		strings.Contains(message, "account has been deactivated") || strings.Contains(message, "account was deactivated") {
+	if normalizedMessage == "account_deactivated" || startsWithPermanentAccountStatement(message,
+		"your account has been deactivated",
+		"your account was deactivated",
+		"this account has been deactivated",
+		"this account was deactivated",
+		"this account was deleted or deactivated",
+		"your account was deleted or deactivated",
+	) {
 		return newAuthError("account_deactivated", LifecycleDead, 0, false, true, "account is deactivated", nil)
 	}
-	if normalizedMessage == "account_deleted" ||
-		strings.Contains(message, "account has been deleted") || strings.Contains(message, "account was deleted") ||
-		strings.Contains(message, "account because it has been deleted") {
+	if normalizedMessage == "account_deleted" || startsWithPermanentAccountStatement(message,
+		"your account has been deleted",
+		"your account was deleted",
+		"this account has been deleted",
+		"this account was deleted",
+		"you do not have an account because it has been deleted",
+	) {
 		return newAuthError("account_deleted", LifecycleDead, 0, false, true, "account is deleted", nil)
 	}
 	return nil
 }
 
+func startsWithPermanentAccountStatement(message string, statements ...string) bool {
+	message = strings.TrimSpace(message)
+	for _, statement := range statements {
+		if message == statement || strings.HasPrefix(message, statement+".") ||
+			strings.HasPrefix(message, statement+",") || strings.HasPrefix(message, statement+";") {
+			return true
+		}
+	}
+	return false
+}
+
 func classifyPermanentAccountCode(code string, status int) *AuthError {
 	normalized := normalizeCode(code)
-	if strings.Contains(normalized, "account_deleted") || normalized == "deleted" {
+	if normalized == "account_deleted" || normalized == "deleted" {
 		return newAuthError("account_deleted", LifecycleDead, status, false, true, "account is deleted", nil)
 	}
-	if strings.Contains(normalized, "account_deactivated") || normalized == "deactivated" {
+	if normalized == "account_deactivated" || normalized == "deactivated" {
 		return newAuthError("account_deactivated", LifecycleDead, status, false, true, "account is deactivated", nil)
 	}
 	return nil
+}
+
+func hasExplicitRuntimeAccountTermination(payload []byte) bool {
+	var decoded map[string]any
+	if err := json.Unmarshal(payload, &decoded); err != nil {
+		return false
+	}
+	if explicitRuntimeAccountTerminationCode(stringValue(decoded["code"])) {
+		return true
+	}
+	if errorValue, ok := decoded["error"]; ok && hasExplicitAccountTerminationValue(errorValue) {
+		return true
+	}
+	page, _ := decoded["page"].(map[string]any)
+	if explicitRuntimeAccountTerminationCode(stringValue(page["type"])) {
+		return true
+	}
+	if !strings.Contains(normalizeCode(stringValue(page["type"])), "error") {
+		return false
+	}
+	return hasExplicitAccountTerminationValue(page["payload"])
+}
+
+func hasExplicitAccountTerminationValue(value any) bool {
+	switch typed := value.(type) {
+	case string:
+		return explicitRuntimeAccountTerminationCode(typed)
+	case map[string]any:
+		for key, nested := range typed {
+			switch normalizeCode(key) {
+			case "code", "type", "error":
+				if text, ok := nested.(string); ok && explicitRuntimeAccountTerminationCode(text) {
+					return true
+				}
+			case "message", "detail":
+				if text, ok := nested.(string); ok &&
+					classifyPermanentAccountFields("", text) != nil {
+					return true
+				}
+			}
+			if nestedMap, ok := nested.(map[string]any); ok && hasExplicitAccountTerminationValue(nestedMap) {
+				return true
+			}
+			if nestedList, ok := nested.([]any); ok && hasExplicitAccountTerminationValue(nestedList) {
+				return true
+			}
+		}
+	case []any:
+		for _, nested := range typed {
+			if hasExplicitAccountTerminationValue(nested) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func explicitRuntimeAccountTerminationCode(value string) bool {
+	switch normalizeCode(value) {
+	case "account_deleted", "account_deactivated":
+		return true
+	default:
+		return false
+	}
 }
 
 func classifyPageType(pageType string) *AuthError {

@@ -55,6 +55,10 @@ api-keys:
 # password/TOTP material and is disabled by default.
 chatgpt-web:
   auto-relogin: false
+  # The initial background login is followed by at most this many retries.
+  auto-relogin-max-retries: 3
+  # Apply symmetric jitter to retry delays to avoid synchronized login bursts.
+  auto-relogin-jitter-percent: 20
   # ChatGPT Web does not return API token usage. Estimate visible input/output
   # text and supported image inputs/outputs locally after a successful response.
   # Disable this to skip the tokenizer work and return zero-valued usage fields.

@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -297,12 +298,49 @@ func restoreChatGPTWebRawPayloadBytes(snapshot, source []config.PayloadRule) {
 // Execute runs a ChatGPT Web request and translates the result to the inbound
 // protocol.
 func (e *ChatGPTWebExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
-	return e.executeRuntime(ctx, auth, req, opts)
+	response, err := e.executeRuntime(ctx, auth, req, opts)
+	return response, e.handleChatGPTWebRuntimeLifecycleError(ctx, auth, err)
 }
 
 // ExecuteStream runs a streaming ChatGPT Web request.
 func (e *ChatGPTWebExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
-	return e.executeRuntimeStream(ctx, auth, req, opts)
+	result, err := e.executeRuntimeStream(ctx, auth, req, opts)
+	return result, e.handleChatGPTWebRuntimeLifecycleError(ctx, auth, err)
+}
+
+func (e *ChatGPTWebExecutor) handleChatGPTWebRuntimeLifecycleError(ctx context.Context, auth *cliproxyauth.Auth, err error) error {
+	if err == nil || e == nil || e.manager == nil || auth == nil {
+		return err
+	}
+	var classified interface {
+		ChatGPTWebLifecycleError() *chatgptwebauth.AuthError
+	}
+	if !errors.As(err, &classified) {
+		return err
+	}
+	authError := classified.ChatGPTWebLifecycleError()
+	if authError == nil || authError.State != chatgptwebauth.LifecycleDead {
+		return err
+	}
+	updated := auth.Clone()
+	setChatGPTWebLifecycle(updated, cliproxyauth.LifecycleStateDead, authError.Code, e.currentTime())
+	persistCtx := context.Background()
+	if ctx != nil {
+		persistCtx = context.WithoutCancel(ctx)
+	}
+	_, current, errUpdate := e.manager.UpdateIfCurrent(persistCtx, auth, updated)
+	if errUpdate != nil {
+		log.WithFields(log.Fields{
+			"auth_id":    auth.ID,
+			"error_code": chatgptwebauth.SafeLifecycleReason(authError.Code),
+		}).WithError(errUpdate).Warn("chatgpt web runtime account termination could not be persisted")
+	} else if current {
+		log.WithFields(log.Fields{
+			"auth_id":    auth.ID,
+			"error_code": chatgptwebauth.SafeLifecycleReason(authError.Code),
+		}).Warn("chatgpt web runtime account is permanently unavailable")
+	}
+	return err
 }
 
 // CountTokens is not exposed by the ChatGPT Web upstream.
@@ -705,7 +743,12 @@ func (e *ChatGPTWebExecutor) runBackgroundRelogin(expected *cliproxyauth.Auth) {
 		return
 	}
 
-	for attempt := 1; ; attempt++ {
+	policy := config.ChatGPTWebConfig{}.ResolvedAutoRelogin()
+	if cfg := e.configSnapshot(); cfg != nil {
+		policy = cfg.ChatGPTWeb.ResolvedAutoRelogin()
+	}
+	maxAttempts := policy.MaxRetries + 1
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		if !e.backgroundReloginPending(expected) {
 			return
 		}
@@ -720,12 +763,43 @@ func (e *ChatGPTWebExecutor) runBackgroundRelogin(expected *cliproxyauth.Auth) {
 			logChatGPTWebBackgroundReloginFailure(expected.ID, errRelogin)
 			return
 		}
+		if attempt == maxAttempts {
+			logChatGPTWebBackgroundReloginFailure(expected.ID, errRelogin)
+			e.markBackgroundReloginExhausted(ctx, expected)
+			return
+		}
 		if attempt%chatGPTWebBackgroundReloginLogInterval == 0 {
 			logChatGPTWebBackgroundReloginFailure(expected.ID, errRelogin)
 		}
-		if !e.waitForBackgroundReloginRetry(ctx, expected, e.backgroundReloginDelay(attempt)) {
+		if !e.waitForBackgroundReloginRetry(ctx, expected, e.backgroundReloginDelay(attempt, policy.JitterPercent)) {
 			return
 		}
+	}
+}
+
+func (e *ChatGPTWebExecutor) markBackgroundReloginExhausted(ctx context.Context, expected *cliproxyauth.Auth) {
+	if e == nil || e.manager == nil || expected == nil {
+		return
+	}
+	updated := expected.Clone()
+	setChatGPTWebLifecycle(updated, cliproxyauth.LifecycleStateReauthRequired, "auto_relogin_exhausted", e.currentTime())
+	persistCtx := context.Background()
+	if ctx != nil {
+		persistCtx = context.WithoutCancel(ctx)
+	}
+	_, current, errUpdate := e.manager.UpdateIfCurrent(persistCtx, expected, updated)
+	if errUpdate != nil {
+		log.WithFields(log.Fields{
+			"auth_id":    expected.ID,
+			"error_code": "auto_relogin_exhausted",
+		}).WithError(errUpdate).Warn("chatgpt web auto re-login exhaustion could not be persisted")
+		return
+	}
+	if current {
+		log.WithFields(log.Fields{
+			"auth_id":    expected.ID,
+			"error_code": "auto_relogin_exhausted",
+		}).Warn("chatgpt web auto re-login retries exhausted")
 	}
 }
 
@@ -840,11 +914,12 @@ func (e *ChatGPTWebExecutor) backgroundReloginPending(expected *cliproxyauth.Aut
 	return ok && current.LifecycleState() == cliproxyauth.LifecycleStateReloginPending && chatGPTWebReloginGenerationKey(current) == chatGPTWebReloginGenerationKey(expected)
 }
 
-func (e *ChatGPTWebExecutor) backgroundReloginDelay(attempt int) time.Duration {
+func (e *ChatGPTWebExecutor) backgroundReloginDelay(attempt, jitterPercent int) time.Duration {
+	delay := chatGPTWebBackgroundReloginBackoff(attempt)
 	if e != nil && e.reloginBackoff != nil {
-		return e.reloginBackoff(attempt)
+		delay = e.reloginBackoff(attempt)
 	}
-	return chatGPTWebBackgroundReloginBackoff(attempt)
+	return chatGPTWebJitterDuration(delay, jitterPercent, rand.Reader)
 }
 
 func chatGPTWebBackgroundReloginBackoff(attempt int) time.Duration {
@@ -859,6 +934,23 @@ func chatGPTWebBackgroundReloginBackoff(attempt int) time.Duration {
 		return chatGPTWebBackgroundReloginMaxBackoff
 	}
 	return delay
+}
+
+func chatGPTWebJitterDuration(delay time.Duration, percent int, source io.Reader) time.Duration {
+	if delay <= 0 || percent <= 0 || source == nil {
+		return delay
+	}
+	maxJitter := delay * time.Duration(percent) / 100
+	if maxJitter <= 0 {
+		return delay
+	}
+	var random [8]byte
+	if _, err := io.ReadFull(source, random[:]); err != nil {
+		return delay
+	}
+	span := uint64(maxJitter)*2 + 1
+	offset := time.Duration(binary.BigEndian.Uint64(random[:])%span) - maxJitter
+	return delay + offset
 }
 
 func chatGPTWebBackgroundReloginRetryable(err error) bool {

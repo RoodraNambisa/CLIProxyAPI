@@ -80,6 +80,22 @@ func IsInteractionRequired(err error) bool {
 	return IsLifecycleState(err, LifecycleInteractionRequired)
 }
 
+// ClassifyPermanentAccountResponse recognizes structured account termination
+// errors returned by ChatGPT Web runtime endpoints.
+func ClassifyPermanentAccountResponse(status int, payload []byte) *AuthError {
+	if !hasExplicitRuntimeAccountTermination(payload) {
+		return nil
+	}
+	classified := classifyPermanentAccountPayload(payload)
+	if classified == nil || classified.State != LifecycleDead {
+		return nil
+	}
+	result := *classified
+	result.Status = status
+	result.StatusCode = status
+	return &result
+}
+
 // SafeLifecycleReason returns a stable, non-sensitive lifecycle error code.
 func SafeLifecycleReason(value string) string {
 	normalized := strings.ToLower(strings.TrimSpace(value))
@@ -106,6 +122,7 @@ func SafeLifecycleReason(value string) string {
 		"arkose_required",
 		"interaction_required",
 		"reauth_required",
+		"auto_relogin_exhausted",
 		"missing_credentials",
 		"authorization_completion_required",
 		"refresh_token_missing",

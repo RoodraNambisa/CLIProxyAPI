@@ -50,6 +50,10 @@ const (
 	DefaultChatGPTWebUsageCacheMaxDiskSizeMB  = 1024
 	DefaultChatGPTWebAutoOutputQuality        = "medium"
 	DefaultChatGPTWebImageUpstreamModel       = "gpt-5-5"
+	DefaultChatGPTWebAutoReloginMaxRetries    = 3
+	DefaultChatGPTWebAutoReloginJitterPercent = 20
+	MaxChatGPTWebAutoReloginRetries           = 10
+	MaxChatGPTWebAutoReloginJitterPercent     = 100
 	DefaultChatGPTWebAccountInfoWorkers       = 4
 	DefaultChatGPTWebAccountInfoQueueSize     = 256
 	DefaultChatGPTWebAccountInfoTTLMinutes    = 15
@@ -436,6 +440,10 @@ type CodexConfig struct {
 type ChatGPTWebConfig struct {
 	// AutoRelogin starts a background password login after a terminal refresh failure.
 	AutoRelogin bool `yaml:"auto-relogin" json:"auto-relogin"`
+	// AutoReloginMaxRetries limits retries after the initial background login attempt.
+	AutoReloginMaxRetries *int `yaml:"auto-relogin-max-retries,omitempty" json:"auto-relogin-max-retries,omitempty"`
+	// AutoReloginJitterPercent applies symmetric jitter to background retry delays.
+	AutoReloginJitterPercent *int `yaml:"auto-relogin-jitter-percent,omitempty" json:"auto-relogin-jitter-percent,omitempty"`
 	// EstimateTokenUsage controls local tiktoken usage estimation for Web responses.
 	// An omitted value remains enabled for backward compatibility.
 	EstimateTokenUsage *bool                       `yaml:"estimate-token-usage,omitempty" json:"estimate-token-usage,omitempty"`
@@ -444,6 +452,27 @@ type ChatGPTWebConfig struct {
 	AccountInfo        ChatGPTWebAccountInfoConfig `yaml:"account-info,omitempty" json:"account-info,omitempty"`
 
 	Sentinel ChatGPTWebSentinelConfig `yaml:"sentinel" json:"sentinel"`
+}
+
+// ResolvedChatGPTWebAutoReloginConfig contains effective background re-login values.
+type ResolvedChatGPTWebAutoReloginConfig struct {
+	MaxRetries    int
+	JitterPercent int
+}
+
+// ResolvedAutoRelogin returns effective background re-login settings.
+func (cfg ChatGPTWebConfig) ResolvedAutoRelogin() ResolvedChatGPTWebAutoReloginConfig {
+	resolved := ResolvedChatGPTWebAutoReloginConfig{
+		MaxRetries:    DefaultChatGPTWebAutoReloginMaxRetries,
+		JitterPercent: DefaultChatGPTWebAutoReloginJitterPercent,
+	}
+	if cfg.AutoReloginMaxRetries != nil {
+		resolved.MaxRetries = *cfg.AutoReloginMaxRetries
+	}
+	if cfg.AutoReloginJitterPercent != nil {
+		resolved.JitterPercent = *cfg.AutoReloginJitterPercent
+	}
+	return resolved
 }
 
 // TokenUsageEstimationEnabled returns whether Web response usage is estimated locally.
@@ -527,6 +556,13 @@ func (cfg ChatGPTWebImageUsageConfig) Validate() error {
 
 // Validate checks all ChatGPT Web runtime configuration.
 func (cfg ChatGPTWebConfig) Validate() error {
+	relogin := cfg.ResolvedAutoRelogin()
+	if relogin.MaxRetries < 0 || relogin.MaxRetries > MaxChatGPTWebAutoReloginRetries {
+		return fmt.Errorf("chatgpt-web.auto-relogin-max-retries must be between 0 and %d", MaxChatGPTWebAutoReloginRetries)
+	}
+	if relogin.JitterPercent < 0 || relogin.JitterPercent > MaxChatGPTWebAutoReloginJitterPercent {
+		return fmt.Errorf("chatgpt-web.auto-relogin-jitter-percent must be between 0 and %d", MaxChatGPTWebAutoReloginJitterPercent)
+	}
 	if err := cfg.UsageCache.Validate(); err != nil {
 		return err
 	}
@@ -3147,13 +3183,24 @@ func preservesExplicitChatGPTWebValue(fullPath string, node *yaml.Node) bool {
 	}
 	switch fullPath {
 	case "chatgpt-web":
-		for _, key := range []string{"estimate-token-usage", "usage-cache", "image-usage", "account-info", "sentinel"} {
+		for _, key := range []string{
+			"auto-relogin-max-retries",
+			"auto-relogin-jitter-percent",
+			"estimate-token-usage",
+			"usage-cache",
+			"image-usage",
+			"account-info",
+			"sentinel",
+		} {
 			if index := findMapKeyIndex(node, key); index >= 0 && index+1 < len(node.Content) &&
 				preservesExplicitChatGPTWebValue("chatgpt-web."+key, node.Content[index+1]) {
 				return true
 			}
 		}
 		return false
+	case "chatgpt-web.auto-relogin-max-retries",
+		"chatgpt-web.auto-relogin-jitter-percent":
+		return true
 	case "chatgpt-web.estimate-token-usage":
 		return node.Kind == yaml.ScalarNode && node.Tag == "!!bool"
 	case "chatgpt-web.usage-cache.enabled",

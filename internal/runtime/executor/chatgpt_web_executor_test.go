@@ -1269,7 +1269,11 @@ func TestChatGPTWebExecutorBackgroundReloginStopsOnClose(t *testing.T) {
 	fake.loginFn = func(context.Context, chatgptwebauth.LoginInput) (*chatgptwebauth.Credential, error) {
 		return nil, &chatgptwebauth.AuthError{Code: "network_error", Retryable: true}
 	}
-	executor := NewChatGPTWebExecutor(&config.Config{ChatGPTWeb: config.ChatGPTWebConfig{AutoRelogin: true}}, manager)
+	maxRetries := 10
+	executor := NewChatGPTWebExecutor(&config.Config{ChatGPTWeb: config.ChatGPTWebConfig{
+		AutoRelogin:           true,
+		AutoReloginMaxRetries: &maxRetries,
+	}}, manager)
 	executor.authService = fake
 	executor.reloginBackoff = func(int) time.Duration { return time.Millisecond }
 	executor.TriggerBackgroundRelogin(expected)

@@ -276,6 +276,7 @@ func (e *ChatGPTWebExecutor) executeRuntimeStream(ctx context.Context, auth *cli
 			case errConsume := <-resultCh:
 				if errConsume != nil {
 					errConsume = chatGPTWebCommittedRequestError(ctx, chatGPTWebUpstreamProtocolError(ctx, errConsume))
+					errConsume = e.handleChatGPTWebRuntimeLifecycleError(ctx, auth, errConsume)
 					reporter.PublishFailure(ctx, errConsume)
 					_ = sendChatGPTWebStreamChunk(ctx, out, cliproxyexecutor.StreamChunk{Err: errConsume})
 					return
@@ -1486,6 +1487,14 @@ func consumeChatGPTWebConversation(ctx context.Context, body io.Reader, accumula
 	decoder := helps.NewChatGPTWebSSEDecoder(chatGPTWebSSEMaxFrameBytes)
 	buffer := make([]byte, 32<<10)
 	applyPayload := func(payload []byte) (bool, error) {
+		eventType := normalizeChatGPTWebErrorClassification(gjson.GetBytes(payload, "type").String())
+		eventCode := normalizeChatGPTWebErrorClassification(gjson.GetBytes(payload, "code").String())
+		if gjson.GetBytes(payload, "error").Exists() || eventType == "error" ||
+			eventCode == "account_deleted" || eventCode == "account_deactivated" {
+			if authError := chatgptwebauth.ClassifyPermanentAccountResponse(http.StatusForbidden, payload); authError != nil {
+				return false, newChatGPTWebStatusError(http.StatusForbidden, "/backend-api/conversation", payload, nil)
+			}
+		}
 		delta, done, err := accumulator.Apply(payload)
 		if err != nil {
 			return false, err
@@ -1809,6 +1818,7 @@ type chatGPTWebHTTPError struct {
 	statusErr
 	headers                    http.Header
 	path                       string
+	lifecycleError             *chatgptwebauth.AuthError
 	turnstileFinalizeRejection bool
 	sentinelFinalizeRejection  bool
 }
@@ -1825,8 +1835,19 @@ func (e chatGPTWebHTTPError) ChatGPTWebRequestPath() string {
 	return e.path
 }
 
+// ChatGPTWebLifecycleError returns a structured lifecycle transition carried by
+// the upstream response.
+func (e chatGPTWebHTTPError) ChatGPTWebLifecycleError() *chatgptwebauth.AuthError {
+	if e.lifecycleError == nil {
+		return nil
+	}
+	result := *e.lifecycleError
+	return &result
+}
+
 func newChatGPTWebStatusError(code int, path string, body []byte, headers fhttp.Header) chatGPTWebHTTPError {
 	sanitizedBody := chatGPTWebStatusErrorBody(path, body)
+	lifecycleError := chatgptwebauth.ClassifyPermanentAccountResponse(code, body)
 	turnstileFinalizeRejection := false
 	sentinelFinalizeRejection := false
 	if path == "/backend-api/sentinel/chat-requirements/finalize" &&
@@ -1842,6 +1863,7 @@ func newChatGPTWebStatusError(code int, path string, body []byte, headers fhttp.
 	err := chatGPTWebHTTPError{
 		statusErr:                  statusErr{code: code, msg: strings.TrimSpace(string(sanitizedBody))},
 		path:                       path,
+		lifecycleError:             lifecycleError,
 		turnstileFinalizeRejection: turnstileFinalizeRejection,
 		sentinelFinalizeRejection:  sentinelFinalizeRejection,
 	}
@@ -1851,13 +1873,18 @@ func newChatGPTWebStatusError(code int, path string, body []byte, headers fhttp.
 		http.StatusUnsupportedMediaType, http.StatusUnprocessableEntity:
 		err.statusErr.skipAuthResult = true
 	}
-	if code == http.StatusForbidden && chatGPTWebSentinelConversationRejection(path, body) {
+	if lifecycleError != nil {
 		err.statusErr.skipAuthResult = true
-		err.statusErr.retryOtherAuth = false
-	}
-	if sentinelFinalizeRejection {
-		err.statusErr.skipAuthResult = true
-		err.statusErr.retryOtherAuth = false
+		err.statusErr.retryOtherAuth = true
+	} else {
+		if code == http.StatusForbidden && chatGPTWebRequestScopedForbidden(path, body) {
+			err.statusErr.skipAuthResult = true
+			err.statusErr.retryOtherAuth = false
+		}
+		if sentinelFinalizeRejection {
+			err.statusErr.skipAuthResult = true
+			err.statusErr.retryOtherAuth = false
+		}
 	}
 	if code == http.StatusNotFound {
 		err.statusErr.retryOtherAuth = true
@@ -1873,28 +1900,96 @@ func newChatGPTWebStatusError(code int, path string, body []byte, headers fhttp.
 	return err
 }
 
-func chatGPTWebSentinelConversationRejection(path string, body []byte) bool {
-	if path != "/backend-api/conversation" && path != "/backend-api/f/conversation" {
-		return false
+func chatGPTWebRequestScopedForbidden(path string, body []byte) bool {
+	classifications := chatGPTWebStructuredErrorClassifications(body)
+	for _, classification := range classifications {
+		switch classification {
+		case "access_denied", "account_restricted", "account_suspended", "account_inactive",
+			"account_unavailable", "insufficient_quota", "permission_error", "unauthorized":
+			return false
+		}
 	}
-	lower := bytes.ToLower(body)
-	markers := [][]byte{
-		[]byte("sentinel"),
-		[]byte("turnstile"),
-		[]byte("session observer"),
-		[]byte("so_token"),
-		[]byte("so-token"),
-		[]byte("chat_requirements"),
-		[]byte("chat-requirements"),
-		[]byte("proof_token"),
-		[]byte("proof token"),
+	if strings.HasPrefix(path, "/backend-api/sentinel/") || path == "/sentinel/sdk.js" {
+		return true
 	}
-	for _, marker := range markers {
-		if bytes.Contains(lower, marker) {
+	if chatGPTWebSentinelConversationRejection(path, body) {
+		return true
+	}
+	for _, classification := range classifications {
+		switch classification {
+		case "bad_request", "content_policy_violation", "invalid_prompt", "invalid_request",
+			"invalid_request_error", "invalid_value", "moderation_blocked", "unsupported_parameter",
+			"unsupported_value", "validation_error":
 			return true
 		}
 	}
 	return false
+}
+
+func chatGPTWebSentinelConversationRejection(path string, body []byte) bool {
+	if path != "/backend-api/conversation" && path != "/backend-api/f/conversation" {
+		return false
+	}
+	for _, classification := range chatGPTWebStructuredErrorClassifications(body) {
+		if chatGPTWebSentinelErrorClassification(classification) {
+			return true
+		}
+	}
+	return false
+}
+
+func chatGPTWebStructuredErrorClassifications(body []byte) []string {
+	paths := [...]string{
+		"error",
+		"error.code",
+		"error.type",
+		"code",
+		"type",
+		"detail.code",
+		"detail.type",
+		"page.payload.code",
+		"page.payload.type",
+		"page.payload.error",
+		"page.payload.error.code",
+		"page.payload.error.type",
+	}
+	values := make([]string, 0, len(paths))
+	seen := make(map[string]struct{}, len(paths))
+	for _, path := range paths {
+		result := gjson.GetBytes(body, path)
+		if result.Type != gjson.String {
+			continue
+		}
+		normalized := normalizeChatGPTWebErrorClassification(result.String())
+		if normalized == "" {
+			continue
+		}
+		if _, ok := seen[normalized]; ok {
+			continue
+		}
+		seen[normalized] = struct{}{}
+		values = append(values, normalized)
+	}
+	return values
+}
+
+func normalizeChatGPTWebErrorClassification(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	value = strings.NewReplacer("-", "_", " ", "_", ".", "_").Replace(value)
+	return strings.Trim(value, "_")
+}
+
+func chatGPTWebSentinelErrorClassification(value string) bool {
+	switch value {
+	case "chat_requirements", "chat_requirements_failed", "invalid_proof_token",
+		"invalid_so_token", "proof_token", "session_observer", "session_observer_failed",
+		"so_token", "turnstile", "turnstile_required":
+		return true
+	}
+	return strings.HasPrefix(value, "sentinel_") ||
+		strings.HasPrefix(value, "invalid_sentinel_") ||
+		strings.HasPrefix(value, "turnstile_") ||
+		strings.HasPrefix(value, "invalid_turnstile_")
 }
 
 func chatGPTWebLocalProtocolError(code int, message string) statusErr {
@@ -2075,6 +2170,7 @@ func (e *ChatGPTWebExecutor) streamDeferredChatGPTWebResponse(
 			select {
 			case result := <-resultCh:
 				if result.err != nil {
+					result.err = e.handleChatGPTWebRuntimeLifecycleError(ctx, auth, result.err)
 					reporter.PublishFailure(ctx, result.err)
 					_ = sendChatGPTWebStreamChunk(ctx, out, cliproxyexecutor.StreamChunk{Err: result.err})
 					return

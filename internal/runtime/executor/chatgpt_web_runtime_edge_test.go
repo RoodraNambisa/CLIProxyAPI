@@ -1020,6 +1020,89 @@ func TestChatGPTWebConversationOrdinaryForbiddenStillMutatesCredentialState(t *t
 	}
 }
 
+func TestChatGPTWebForbiddenClassificationDistinguishesRequestAndCredentialFailures(t *testing.T) {
+	tests := []struct {
+		name     string
+		path     string
+		payload  string
+		wantSkip bool
+	}{
+		{
+			name:     "sentinel endpoint",
+			path:     "/backend-api/sentinel/chat-requirements/prepare",
+			payload:  `{"error":{"code":"forbidden"}}`,
+			wantSkip: true,
+		},
+		{
+			name:    "sentinel endpoint credential restriction",
+			path:    "/backend-api/sentinel/chat-requirements/prepare",
+			payload: `{"error":{"code":"account_restricted"}}`,
+		},
+		{
+			name:    "sentinel endpoint unauthorized",
+			path:    "/backend-api/sentinel/chat-requirements/prepare",
+			payload: `{"error":{"code":"unauthorized"}}`,
+		},
+		{
+			name:     "structured invalid request",
+			path:     "/backend-api/conversation",
+			payload:  `{"error":{"type":"invalid_request_error","message":"unsupported request"}}`,
+			wantSkip: true,
+		},
+		{
+			name:    "permission error",
+			path:    "/backend-api/conversation",
+			payload: `{"error":{"code":"permission_error","type":"invalid_request_error"}}`,
+		},
+		{
+			name:    "account restriction",
+			path:    "/backend-api/conversation",
+			payload: `{"error":{"code":"account_restricted","message":"access denied"}}`,
+		},
+		{
+			name:    "message marker without structured code",
+			path:    "/backend-api/conversation",
+			payload: `{"error":{"message":"sentinel request could not be completed"}}`,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := newChatGPTWebStatusError(http.StatusForbidden, test.path, []byte(test.payload), nil)
+			if got := err.SkipAuthResult(); got != test.wantSkip {
+				t.Fatalf("SkipAuthResult() = %v, want %v; error=%v", got, test.wantSkip, err)
+			}
+			if err.RetryOtherAuth() {
+				t.Fatalf("request-scoped 403 retries another credential: %v", err)
+			}
+		})
+	}
+}
+
+func TestChatGPTWebConversationStreamPreservesPermanentAccountError(t *testing.T) {
+	for _, payload := range []string{
+		`{"error":{"code":"ACCOUNT_DELETED","message":"account unavailable"}}`,
+		`{"type":"error","code":"account_deleted","message":"account unavailable"}`,
+	} {
+		err := consumeChatGPTWebConversation(
+			t.Context(),
+			strings.NewReader("data: "+payload+"\n\n"),
+			helps.NewChatGPTWebConversationAccumulator(nil),
+			nil,
+		)
+		var classified interface {
+			ChatGPTWebLifecycleError() *chatgptwebauth.AuthError
+		}
+		if !errors.As(err, &classified) {
+			t.Fatalf("stream error for %s = %v, want lifecycle classification", payload, err)
+		}
+		authError := classified.ChatGPTWebLifecycleError()
+		if authError == nil || authError.Code != "account_deleted" ||
+			authError.State != chatgptwebauth.LifecycleDead {
+			t.Fatalf("stream lifecycle error for %s = %#v", payload, authError)
+		}
+	}
+}
+
 func chatGPTWebTurnstileTestDX(t *testing.T, requirementsToken string, program []any) string {
 	t.Helper()
 	payload, err := json.Marshal(program)
