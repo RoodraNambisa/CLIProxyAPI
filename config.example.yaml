@@ -328,6 +328,15 @@ routing:
   #     # fill-first-per-auth-rpm: 60 # alternatively, sequentially move to next auth after 60 selections/minute
   #     per-auth-request-limit: 120
   #     per-auth-request-window-minutes: 5
+  #     # Optional provider/plan refinements. Empty providers match every provider.
+  #     # Each field independently inherits from this priority, then from global routing.
+  #     subscription-overrides:
+  #       - providers: [codex]
+  #         plan-types: [pro]
+  #         per-auth-request-limit: 180
+  #       - plan-types: [plus]
+  #         per-auth-request-limit: 60
+  #         per-auth-request-window-minutes: 10
   #     max-retry-credentials: 2
   #   - priority: -1
   #     strategy: random

@@ -5,6 +5,7 @@ import (
 	"math"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -41,6 +42,85 @@ func authRequestLimitPolicyForRouting(routing internalconfig.RoutingConfig, prio
 		break
 	}
 	return normalizeAuthRequestLimitPolicy(policy)
+}
+
+func routingAuthPlanType(auth *Auth) string {
+	if auth == nil {
+		return ""
+	}
+	if auth.Attributes != nil {
+		if planType := internalconfig.NormalizeRoutingPlanType(auth.Attributes["plan_type"]); planType != "" {
+			return planType
+		}
+	}
+	for _, key := range []string{"plan_type", "planType", "account_type", "accountType", "chatgpt_plan_type"} {
+		if value, ok := auth.Metadata[key].(string); ok {
+			if planType := internalconfig.NormalizeRoutingPlanType(value); planType != "" {
+				return planType
+			}
+		}
+	}
+	return ""
+}
+
+func routingSubscriptionOverrideMatches(override internalconfig.RoutingSubscriptionOverride, auth *Auth, planType string) bool {
+	if auth == nil || planType == "" {
+		return false
+	}
+	planMatched := false
+	for _, candidate := range override.PlanTypes {
+		if internalconfig.NormalizeRoutingPlanType(candidate) == planType {
+			planMatched = true
+			break
+		}
+	}
+	if !planMatched {
+		return false
+	}
+	if len(override.Providers) == 0 {
+		return true
+	}
+	provider := strings.ToLower(strings.TrimSpace(auth.Provider))
+	for _, candidate := range override.Providers {
+		if strings.ToLower(strings.TrimSpace(candidate)) == provider {
+			return true
+		}
+	}
+	return false
+}
+
+func applyRoutingSubscriptionRequestLimitPolicy(policy authRequestLimitPolicy, auth *Auth, overrides []internalconfig.RoutingSubscriptionOverride) authRequestLimitPolicy {
+	if len(overrides) == 0 {
+		return normalizeAuthRequestLimitPolicy(policy)
+	}
+	planType := routingAuthPlanType(auth)
+	if planType == "" {
+		return normalizeAuthRequestLimitPolicy(policy)
+	}
+	for _, override := range overrides {
+		if !routingSubscriptionOverrideMatches(override, auth, planType) {
+			continue
+		}
+		if override.PerAuthRequestLimit != nil {
+			policy.limit = internalconfig.NormalizePerAuthRequestLimit(*override.PerAuthRequestLimit)
+		}
+		if override.PerAuthRequestWindowMinutes != nil {
+			policy.windowMinutes = internalconfig.NormalizePerAuthRequestWindowMinutes(*override.PerAuthRequestWindowMinutes)
+		}
+		break
+	}
+	return normalizeAuthRequestLimitPolicy(policy)
+}
+
+func authRequestLimitPolicyForRoutingAuth(routing internalconfig.RoutingConfig, auth *Auth) authRequestLimitPolicy {
+	priority := authPriority(auth)
+	policy := authRequestLimitPolicyForRouting(routing, priority)
+	for _, override := range routing.PriorityOverrides {
+		if override.Priority == priority {
+			return applyRoutingSubscriptionRequestLimitPolicy(policy, auth, override.SubscriptionOverrides)
+		}
+	}
+	return policy
 }
 
 type authRequestWindowCount struct {
@@ -175,7 +255,7 @@ func (m *Manager) acquireAdditionalAuthRequest(auth *Auth) error {
 		return nil
 	}
 	for {
-		policy := m.routingAuthRequestLimitPolicyForPriority(authPriority(auth))
+		policy := m.routingAuthRequestLimitPolicyForAuth(auth)
 		acquired, block := limiter.tryAcquireAt(auth.ID, policy, limiter.nowTime())
 		if acquired {
 			return nil

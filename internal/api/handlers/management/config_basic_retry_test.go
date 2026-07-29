@@ -244,7 +244,7 @@ func TestPutRoutingPriorityOverrides_NormalizesValues(t *testing.T) {
 
 	rec := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(rec)
-	c.Request = httptest.NewRequest(http.MethodPut, "/v0/management/routing/priority-overrides", bytes.NewBufferString(`{"value":[{"priority":0,"strategy":"ff","max-retry-credentials":2,"fill-first-range":5,"fill-first-per-auth-rpm":0,"per-auth-request-limit":120,"per-auth-request-window-minutes":5},{"priority":-1,"max-retry-credentials":-3,"fill-first-range":0,"fill-first-per-auth-rpm":-3,"per-auth-request-limit":-3,"per-auth-request-window-minutes":0}]}`))
+	c.Request = httptest.NewRequest(http.MethodPut, "/v0/management/routing/priority-overrides", bytes.NewBufferString(`{"value":[{"priority":0,"strategy":"ff","max-retry-credentials":2,"fill-first-range":5,"fill-first-per-auth-rpm":0,"per-auth-request-limit":120,"per-auth-request-window-minutes":5,"subscription-overrides":[{"providers":["Codex"],"plan-types":["Pro"],"per-auth-request-limit":180}]},{"priority":-1,"max-retry-credentials":-3,"fill-first-range":0,"fill-first-per-auth-rpm":-3,"per-auth-request-limit":-3,"per-auth-request-window-minutes":0}]}`))
 	c.Request.Header.Set("Content-Type", "application/json")
 
 	h.PutRoutingPriorityOverrides(c)
@@ -271,6 +271,15 @@ func TestPutRoutingPriorityOverrides_NormalizesValues(t *testing.T) {
 	if first.PerAuthRequestWindowMinutes == nil || *first.PerAuthRequestWindowMinutes != 5 {
 		t.Fatalf("first PerAuthRequestWindowMinutes = %v, want 5", first.PerAuthRequestWindowMinutes)
 	}
+	if len(first.SubscriptionOverrides) != 1 {
+		t.Fatalf("first SubscriptionOverrides = %+v, want one rule", first.SubscriptionOverrides)
+	}
+	subscription := first.SubscriptionOverrides[0]
+	if len(subscription.Providers) != 1 || subscription.Providers[0] != "codex" ||
+		len(subscription.PlanTypes) != 1 || subscription.PlanTypes[0] != "pro" ||
+		subscription.PerAuthRequestLimit == nil || *subscription.PerAuthRequestLimit != 180 {
+		t.Fatalf("normalized subscription override = %+v", subscription)
+	}
 	second := h.cfg.Routing.PriorityOverrides[1]
 	if second.MaxRetryCredentials == nil || *second.MaxRetryCredentials != 0 {
 		t.Fatalf("second override = %+v, want limit 0", second)
@@ -286,6 +295,25 @@ func TestPutRoutingPriorityOverrides_NormalizesValues(t *testing.T) {
 	}
 	if second.PerAuthRequestWindowMinutes == nil || *second.PerAuthRequestWindowMinutes != 1 {
 		t.Fatalf("second PerAuthRequestWindowMinutes = %v, want 1", second.PerAuthRequestWindowMinutes)
+	}
+}
+
+func TestPutRoutingPriorityOverrides_RejectsOverlappingSubscriptionRules(t *testing.T) {
+	t.Parallel()
+
+	h := &Handler{
+		cfg:            &config.Config{},
+		configFilePath: writeTestConfigFile(t),
+	}
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPut, "/v0/management/routing/priority-overrides", bytes.NewBufferString(`{"value":[{"priority":0,"subscription-overrides":[{"plan-types":["pro"],"per-auth-request-limit":10},{"providers":["codex"],"plan-types":["pro"],"per-auth-request-limit":20}]}]}`))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	h.PutRoutingPriorityOverrides(c)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusBadRequest, rec.Body.String())
 	}
 }
 
@@ -400,6 +428,42 @@ func TestPutRoutingPriorityOverrides_PersistsExplicitZeroLimit(t *testing.T) {
 	}
 	if len(loaded.Routing.PriorityOverrides) != 1 || loaded.Routing.PriorityOverrides[0].PerAuthRequestLimit == nil || *loaded.Routing.PriorityOverrides[0].PerAuthRequestLimit != 0 {
 		t.Fatalf("persisted overrides = %+v, want explicit zero limit", loaded.Routing.PriorityOverrides)
+	}
+}
+
+func TestPutRoutingPriorityOverrides_PersistsSubscriptionExplicitZeroLimit(t *testing.T) {
+	t.Parallel()
+
+	configPath := writeTestConfigFile(t)
+	if errWrite := os.WriteFile(configPath, []byte("routing:\n  per-auth-request-limit: 60\n"), 0o600); errWrite != nil {
+		t.Fatalf("write config: %v", errWrite)
+	}
+	h := &Handler{
+		cfg: &config.Config{Routing: config.RoutingConfig{
+			PerAuthRequestLimit:         60,
+			PerAuthRequestWindowMinutes: 1,
+		}},
+		configFilePath: configPath,
+	}
+
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPatch, "/v0/management/routing/priority-overrides", bytes.NewBufferString(`{"value":[{"priority":0,"subscription-overrides":[{"providers":["codex"],"plan-types":["plus"],"per-auth-request-limit":0}]}]}`))
+	c.Request.Header.Set("Content-Type", "application/json")
+	h.PutRoutingPriorityOverrides(c)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+
+	loaded, errLoad := config.LoadConfig(configPath)
+	if errLoad != nil {
+		t.Fatalf("load persisted config: %v", errLoad)
+	}
+	if len(loaded.Routing.PriorityOverrides) != 1 ||
+		len(loaded.Routing.PriorityOverrides[0].SubscriptionOverrides) != 1 ||
+		loaded.Routing.PriorityOverrides[0].SubscriptionOverrides[0].PerAuthRequestLimit == nil ||
+		*loaded.Routing.PriorityOverrides[0].SubscriptionOverrides[0].PerAuthRequestLimit != 0 {
+		t.Fatalf("persisted overrides = %+v, want nested explicit zero limit", loaded.Routing.PriorityOverrides)
 	}
 }
 

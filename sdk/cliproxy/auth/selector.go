@@ -668,10 +668,10 @@ func selectFillFirstAuthsForContext(ctx context.Context, auths []*Auth, provider
 		return fillFirstRange
 	}, func(int) int {
 		return fillFirstPerAuthRPM
-	}, rpmLimiter, modelForAuth, pickAllowed)
+	}, rpmLimiter, nil, modelForAuth, pickAllowed)
 }
 
-func selectFillFirstAuthsForContextWithPolicy(ctx context.Context, auths []*Auth, provider, model string, now time.Time, selectionAttempt int, fillFirstRangeForPriority func(int) int, fillFirstPerAuthRPMForPriority func(int) int, rpmLimiter *fillFirstMinuteLimiter, modelForAuth func(*Auth) string, pickAllowed func(*Auth) bool) (*Auth, error) {
+func selectFillFirstAuthsForContextWithPolicy(ctx context.Context, auths []*Auth, provider, model string, now time.Time, selectionAttempt int, fillFirstRangeForPriority func(int) int, fillFirstPerAuthRPMForPriority func(int) int, rpmLimiter *fillFirstMinuteLimiter, genericRequestLimitForAuth func(*Auth) bool, modelForAuth func(*Auth) string, pickAllowed func(*Auth) bool) (*Auth, error) {
 	if shouldPreferCodexWebsocket(ctx, provider) {
 		websocketAuths := make([]*Auth, 0, len(auths))
 		hasReadyWebsocket := false
@@ -690,13 +690,13 @@ func selectFillFirstAuthsForContextWithPolicy(ctx context.Context, auths []*Auth
 			}
 		}
 		if hasReadyWebsocket {
-			picked, errPick := selectFillFirstAuthsForAttemptWithPolicy(websocketAuths, provider, model, now, selectionAttempt, fillFirstRangeForPriority, fillFirstPerAuthRPMForPriority, rpmLimiter, modelForAuth, pickAllowed)
+			picked, errPick := selectFillFirstAuthsForAttemptWithPolicy(websocketAuths, provider, model, now, selectionAttempt, fillFirstRangeForPriority, fillFirstPerAuthRPMForPriority, rpmLimiter, genericRequestLimitForAuth, modelForAuth, pickAllowed)
 			if picked != nil || !shouldFallbackFromWebsocketFillFirstError(errPick) {
 				return picked, errPick
 			}
 		}
 	}
-	return selectFillFirstAuthsForAttemptWithPolicy(auths, provider, model, now, selectionAttempt, fillFirstRangeForPriority, fillFirstPerAuthRPMForPriority, rpmLimiter, modelForAuth, pickAllowed)
+	return selectFillFirstAuthsForAttemptWithPolicy(auths, provider, model, now, selectionAttempt, fillFirstRangeForPriority, fillFirstPerAuthRPMForPriority, rpmLimiter, genericRequestLimitForAuth, modelForAuth, pickAllowed)
 }
 
 func selectFillFirstRangeAuthsForAttempt(auths []*Auth, provider, model string, now time.Time, selectionAttempt int, fillFirstRange int, modelForAuth func(*Auth) string, pickAllowed func(*Auth) bool) (*Auth, error) {
@@ -708,10 +708,10 @@ func selectFillFirstAuthsForAttempt(auths []*Auth, provider, model string, now t
 		return fillFirstRange
 	}, func(int) int {
 		return fillFirstPerAuthRPM
-	}, rpmLimiter, modelForAuth, pickAllowed)
+	}, rpmLimiter, nil, modelForAuth, pickAllowed)
 }
 
-func selectFillFirstAuthsForAttemptWithPolicy(auths []*Auth, provider, model string, now time.Time, selectionAttempt int, fillFirstRangeForPriority func(int) int, fillFirstPerAuthRPMForPriority func(int) int, rpmLimiter *fillFirstMinuteLimiter, modelForAuth func(*Auth) string, pickAllowed func(*Auth) bool) (*Auth, error) {
+func selectFillFirstAuthsForAttemptWithPolicy(auths []*Auth, provider, model string, now time.Time, selectionAttempt int, fillFirstRangeForPriority func(int) int, fillFirstPerAuthRPMForPriority func(int) int, rpmLimiter *fillFirstMinuteLimiter, genericRequestLimitForAuth func(*Auth) bool, modelForAuth func(*Auth) string, pickAllowed func(*Auth) bool) (*Auth, error) {
 	if len(auths) == 0 {
 		return nil, &Error{Code: "auth_not_found", Message: "no auth candidates"}
 	}
@@ -786,6 +786,9 @@ func selectFillFirstAuthsForAttemptWithPolicy(auths []*Auth, provider, model str
 				ready := readyByID[member.ID]
 				if ready == nil {
 					continue
+				}
+				if genericRequestLimitForAuth != nil && genericRequestLimitForAuth(ready) {
+					return ready, nil
 				}
 				if rpmLimiter != nil && !rpmLimiter.tryAcquireAt(ready.ID, fillFirstPerAuthRPM, now) {
 					rpmLimited = true

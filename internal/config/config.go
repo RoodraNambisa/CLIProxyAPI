@@ -996,6 +996,21 @@ type RequestBodyAuditErrorConfig struct {
 	Code       string `yaml:"code,omitempty" json:"code,omitempty"`
 }
 
+// RoutingSubscriptionOverride overrides generic request limits for subscriptions
+// within one credential priority.
+type RoutingSubscriptionOverride struct {
+	// Providers optionally limits this rule to exact runtime provider IDs.
+	// An empty list matches every provider.
+	Providers []string `yaml:"providers,omitempty" json:"providers,omitempty"`
+	// PlanTypes matches normalized credential plan_type values.
+	PlanTypes []string `yaml:"plan-types" json:"plan-types"`
+	// PerAuthRequestLimit optionally overrides the inherited per-auth request limit.
+	// A non-nil zero value disables the generic request limit for matching credentials.
+	PerAuthRequestLimit *int `yaml:"per-auth-request-limit,omitempty" json:"per-auth-request-limit,omitempty"`
+	// PerAuthRequestWindowMinutes optionally overrides the inherited fixed-window size.
+	PerAuthRequestWindowMinutes *int `yaml:"per-auth-request-window-minutes,omitempty" json:"per-auth-request-window-minutes,omitempty"`
+}
+
 // RoutingPriorityOverride overrides routing behavior for one credential priority.
 type RoutingPriorityOverride struct {
 	// Priority is the credential priority this rule applies to.
@@ -1015,6 +1030,8 @@ type RoutingPriorityOverride struct {
 	PerAuthRequestLimit *int `yaml:"per-auth-request-limit,omitempty" json:"per-auth-request-limit,omitempty"`
 	// PerAuthRequestWindowMinutes optionally overrides routing.per-auth-request-window-minutes for this priority.
 	PerAuthRequestWindowMinutes *int `yaml:"per-auth-request-window-minutes,omitempty" json:"per-auth-request-window-minutes,omitempty"`
+	// SubscriptionOverrides optionally refines generic request limits by provider and plan type.
+	SubscriptionOverrides []RoutingSubscriptionOverride `yaml:"subscription-overrides,omitempty" json:"subscription-overrides,omitempty"`
 }
 
 // RoutingConfig configures how credentials are selected for requests.
@@ -2477,6 +2494,116 @@ func NormalizePerAuthRequestWindowMinutes(value int) int {
 	return value
 }
 
+// NormalizeRoutingPlanType canonicalizes subscription values used by routing rules.
+func NormalizeRoutingPlanType(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	if value == "" {
+		return ""
+	}
+	compact := strings.NewReplacer("-", "", "_", "", " ", "").Replace(value)
+	switch compact {
+	case "chatgptfreeplan":
+		return "free"
+	case "chatgptplusplan":
+		return "plus"
+	case "chatgptproplan":
+		return "pro"
+	case "chatgptteamplan", "chatgptbusinessplan", "selfservebusiness", "selfservebusinessusagebased":
+		return "team"
+	case "chatgptenterpriseplan":
+		return "enterprise"
+	default:
+		return value
+	}
+}
+
+func normalizeRoutingPlanTypes(values []string) []string {
+	if len(values) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(values))
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		normalized := NormalizeRoutingPlanType(value)
+		if normalized == "" {
+			continue
+		}
+		if _, exists := seen[normalized]; exists {
+			continue
+		}
+		seen[normalized] = struct{}{}
+		out = append(out, normalized)
+	}
+	return out
+}
+
+func routingProviderScopesOverlap(left, right []string) bool {
+	if len(left) == 0 || len(right) == 0 {
+		return true
+	}
+	rightSet := make(map[string]struct{}, len(right))
+	for _, provider := range right {
+		rightSet[provider] = struct{}{}
+	}
+	for _, provider := range left {
+		if _, ok := rightSet[provider]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+func normalizeRoutingSubscriptionOverrides(priorityIndex, priority int, overrides []RoutingSubscriptionOverride) ([]RoutingSubscriptionOverride, error) {
+	if len(overrides) == 0 {
+		return nil, nil
+	}
+	out := make([]RoutingSubscriptionOverride, 0, len(overrides))
+	for index, override := range overrides {
+		providers := normalizeStringListLower(override.Providers)
+		planTypes := normalizeRoutingPlanTypes(override.PlanTypes)
+		if len(planTypes) == 0 {
+			return nil, fmt.Errorf("routing.priority-overrides[%d] (priority %d).subscription-overrides[%d].plan-types: at least one plan type is required", priorityIndex, priority, index)
+		}
+		if override.PerAuthRequestLimit == nil && override.PerAuthRequestWindowMinutes == nil {
+			return nil, fmt.Errorf("routing.priority-overrides[%d] (priority %d).subscription-overrides[%d]: at least one request limit field is required", priorityIndex, priority, index)
+		}
+
+		var perAuthRequestLimit *int
+		if override.PerAuthRequestLimit != nil {
+			value := NormalizePerAuthRequestLimit(*override.PerAuthRequestLimit)
+			perAuthRequestLimit = &value
+		}
+		var perAuthRequestWindowMinutes *int
+		if override.PerAuthRequestWindowMinutes != nil {
+			value := NormalizePerAuthRequestWindowMinutes(*override.PerAuthRequestWindowMinutes)
+			perAuthRequestWindowMinutes = &value
+		}
+
+		for previousIndex, previous := range out {
+			if !routingProviderScopesOverlap(previous.Providers, providers) {
+				continue
+			}
+			previousPlans := make(map[string]struct{}, len(previous.PlanTypes))
+			for _, planType := range previous.PlanTypes {
+				previousPlans[planType] = struct{}{}
+			}
+			for _, planType := range planTypes {
+				if _, duplicate := previousPlans[planType]; duplicate {
+					return nil, fmt.Errorf("routing.priority-overrides[%d] (priority %d).subscription-overrides: plan type %q has overlapping provider scopes in rules %d and %d", priorityIndex, priority, planType, previousIndex, index)
+				}
+			}
+		}
+
+		out = append(out, RoutingSubscriptionOverride{
+			Providers:                   providers,
+			PlanTypes:                   planTypes,
+			PerAuthRequestLimit:         perAuthRequestLimit,
+			PerAuthRequestWindowMinutes: perAuthRequestWindowMinutes,
+		})
+	}
+	return out, nil
+}
+
 // NormalizeRoutingPriorityOverrides validates and canonicalizes per-priority routing overrides.
 func NormalizeRoutingPriorityOverrides(overrides []RoutingPriorityOverride) ([]RoutingPriorityOverride, error) {
 	if len(overrides) == 0 {
@@ -2484,7 +2611,7 @@ func NormalizeRoutingPriorityOverrides(overrides []RoutingPriorityOverride) ([]R
 	}
 	seen := make(map[int]struct{}, len(overrides))
 	out := make([]RoutingPriorityOverride, 0, len(overrides))
-	for _, override := range overrides {
+	for overrideIndex, override := range overrides {
 		if _, ok := seen[override.Priority]; ok {
 			return nil, fmt.Errorf("routing.priority-overrides: duplicate priority %d", override.Priority)
 		}
@@ -2527,6 +2654,10 @@ func NormalizeRoutingPriorityOverrides(overrides []RoutingPriorityOverride) ([]R
 			value := NormalizePerAuthRequestWindowMinutes(*override.PerAuthRequestWindowMinutes)
 			perAuthRequestWindowMinutes = &value
 		}
+		subscriptionOverrides, errSubscriptionOverrides := normalizeRoutingSubscriptionOverrides(overrideIndex, override.Priority, override.SubscriptionOverrides)
+		if errSubscriptionOverrides != nil {
+			return nil, errSubscriptionOverrides
+		}
 
 		out = append(out, RoutingPriorityOverride{
 			Priority:                    override.Priority,
@@ -2536,6 +2667,7 @@ func NormalizeRoutingPriorityOverrides(overrides []RoutingPriorityOverride) ([]R
 			FillFirstPerAuthRPM:         fillFirstPerAuthRPM,
 			PerAuthRequestLimit:         perAuthRequestLimit,
 			PerAuthRequestWindowMinutes: perAuthRequestWindowMinutes,
+			SubscriptionOverrides:       subscriptionOverrides,
 		})
 	}
 	return out, nil
@@ -3209,6 +3341,9 @@ func isKnownDefaultValue(path []string, node *yaml.Node) bool {
 			return false
 		case "routing.priority-overrides.per-auth-request-limit":
 			// This pointer field uses an explicit zero to disable an inherited limit.
+			return false
+		case "routing.priority-overrides.subscription-overrides.per-auth-request-limit":
+			// Subscription rules also use an explicit zero to disable the inherited limit.
 			return false
 		}
 	}

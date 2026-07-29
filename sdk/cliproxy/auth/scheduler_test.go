@@ -567,14 +567,14 @@ func TestSelectorFillFirstPerAuthRPMReturnsCooldownWhenSooner(t *testing.T) {
 	rpmForPriority := func(int) int { return 1 }
 	rangeForPriority := func(int) int { return 1 }
 
-	got, errPick := selectFillFirstAuthsForAttemptWithPolicy(auths, "gemini", "", fixed, 0, rangeForPriority, rpmForPriority, limiter, nil, nil)
+	got, errPick := selectFillFirstAuthsForAttemptWithPolicy(auths, "gemini", "", fixed, 0, rangeForPriority, rpmForPriority, limiter, nil, nil, nil)
 	if errPick != nil {
 		t.Fatalf("selectFillFirstAuthsForAttemptWithPolicy() #1 error = %v", errPick)
 	}
 	if got == nil || got.ID != "a" {
 		t.Fatalf("selectFillFirstAuthsForAttemptWithPolicy() #1 auth = %v, want a", got)
 	}
-	_, errPick = selectFillFirstAuthsForAttemptWithPolicy(auths, "gemini", "", fixed, 0, rangeForPriority, rpmForPriority, limiter, nil, nil)
+	_, errPick = selectFillFirstAuthsForAttemptWithPolicy(auths, "gemini", "", fixed, 0, rangeForPriority, rpmForPriority, limiter, nil, nil, nil)
 	if _, ok := errPick.(*modelCooldownError); !ok {
 		t.Fatalf("selectFillFirstAuthsForAttemptWithPolicy() #2 error = %T %v, want *modelCooldownError", errPick, errPick)
 	}
@@ -601,14 +601,14 @@ func TestSelectorFillFirstPerAuthRPMFallsBackToHTTPWhenWebsocketRPMFullAndCooldo
 	rangeForPriority := func(int) int { return 1 }
 	ctx := cliproxyexecutor.WithDownstreamWebsocket(context.Background())
 
-	got, errPick := selectFillFirstAuthsForContextWithPolicy(ctx, auths, "codex", "", fixed, 0, rangeForPriority, rpmForPriority, limiter, nil, nil)
+	got, errPick := selectFillFirstAuthsForContextWithPolicy(ctx, auths, "codex", "", fixed, 0, rangeForPriority, rpmForPriority, limiter, nil, nil, nil)
 	if errPick != nil {
 		t.Fatalf("selectFillFirstAuthsForContextWithPolicy() #1 error = %v", errPick)
 	}
 	if got == nil || got.ID != "codex-ws-a" {
 		t.Fatalf("selectFillFirstAuthsForContextWithPolicy() #1 auth = %v, want codex-ws-a", got)
 	}
-	got, errPick = selectFillFirstAuthsForContextWithPolicy(ctx, auths, "codex", "", fixed, 0, rangeForPriority, rpmForPriority, limiter, nil, nil)
+	got, errPick = selectFillFirstAuthsForContextWithPolicy(ctx, auths, "codex", "", fixed, 0, rangeForPriority, rpmForPriority, limiter, nil, nil, nil)
 	if errPick != nil {
 		t.Fatalf("selectFillFirstAuthsForContextWithPolicy() #2 error = %v", errPick)
 	}
@@ -707,6 +707,45 @@ func TestManagerPickLegacyFillFirstRangeAuth_SessionAffinityUsesPerAuthRPM(t *te
 		if got == nil || got.ID != wantID {
 			t.Fatalf("pickLegacyFillFirstRangeAuth() #%d auth = %v, want %s", index, got, wantID)
 		}
+	}
+}
+
+func TestManagerPickLegacyFillFirstRangeAuth_SessionAffinityUsesSubscriptionLimit(t *testing.T) {
+	t.Parallel()
+
+	subscriptionLimit := 10
+	sessionSelector := NewSessionAffinitySelector(&FillFirstSelector{})
+	manager := NewManager(nil, sessionSelector, nil)
+	manager.SetConfig(&internalconfig.Config{
+		Routing: internalconfig.RoutingConfig{
+			FillFirstPerAuthRPM: 1,
+			PriorityOverrides: []internalconfig.RoutingPriorityOverride{{
+				Priority: 0,
+				SubscriptionOverrides: []internalconfig.RoutingSubscriptionOverride{{
+					PlanTypes:           []string{"pro"},
+					PerAuthRequestLimit: &subscriptionLimit,
+				}},
+			}},
+		},
+	})
+	candidates := []*Auth{
+		{ID: "a", Provider: "gemini", Attributes: map[string]string{"plan_type": "plus"}},
+		{ID: "b", Provider: "gemini", Attributes: map[string]string{"plan_type": "pro"}},
+	}
+	opts := cliproxyexecutor.Options{
+		Headers: http.Header{"Session-Id": {"subscription-limit-session"}},
+	}
+	sessionSelector.BindSession(context.Background(), "gemini", "", opts, "b")
+
+	got, handled, errPick := manager.pickLegacyFillFirstRangeAuth(context.Background(), "gemini", "", opts, candidates, nil)
+	if errPick != nil {
+		t.Fatalf("pickLegacyFillFirstRangeAuth() error = %v", errPick)
+	}
+	if !handled {
+		t.Fatalf("pickLegacyFillFirstRangeAuth() handled = false, want true")
+	}
+	if got == nil || got.ID != "b" {
+		t.Fatalf("pickLegacyFillFirstRangeAuth() auth = %v, want b", got)
 	}
 }
 
@@ -1149,6 +1188,96 @@ func TestSchedulerPick_MixedProvidersUsesWeightedProviderRotationOverReadyCandid
 		if got.ID != wantIDs[index] {
 			t.Fatalf("pickMixed() #%d auth.ID = %q, want %q", index, got.ID, wantIDs[index])
 		}
+	}
+}
+
+func TestSchedulerPick_MixedProvidersWindowOnlySubscriptionKeepsWeightedRotation(t *testing.T) {
+	t.Parallel()
+
+	windowMinutes := 5
+	scheduler := newSchedulerForTest(
+		&RoundRobinSelector{},
+		&Auth{ID: "gemini-a", Provider: "gemini", Attributes: map[string]string{"plan_type": "pro"}},
+		&Auth{ID: "gemini-b", Provider: "gemini", Attributes: map[string]string{"plan_type": "pro"}},
+		&Auth{ID: "claude-a", Provider: "claude", Attributes: map[string]string{"plan_type": "pro"}},
+	)
+	scheduler.setRoutingConfig(internalconfig.RoutingConfig{
+		Strategy: "round-robin",
+		PriorityOverrides: []internalconfig.RoutingPriorityOverride{{
+			Priority: 0,
+			SubscriptionOverrides: []internalconfig.RoutingSubscriptionOverride{{
+				PlanTypes:                   []string{"pro"},
+				PerAuthRequestWindowMinutes: &windowMinutes,
+			}},
+		}},
+	})
+
+	wantProviders := []string{"gemini", "gemini", "claude", "gemini"}
+	wantIDs := []string{"gemini-a", "gemini-b", "claude-a", "gemini-a"}
+	for index := range wantProviders {
+		got, provider, errPick := scheduler.pickMixed(context.Background(), []string{"gemini", "claude"}, "", cliproxyexecutor.Options{}, nil)
+		if errPick != nil {
+			t.Fatalf("pickMixed() #%d error = %v", index, errPick)
+		}
+		if got == nil || provider != wantProviders[index] || got.ID != wantIDs[index] {
+			t.Fatalf("pickMixed() #%d = %v/%q, want %s/%q", index, got, provider, wantIDs[index], wantProviders[index])
+		}
+	}
+}
+
+func TestSchedulerPick_MixedProvidersDisabledSubscriptionLimitPreservesShardCursor(t *testing.T) {
+	t.Parallel()
+
+	disabledLimit := 0
+	scheduler := newSchedulerForTest(
+		&RoundRobinSelector{},
+		&Auth{ID: "gemini-a", Provider: "gemini", Attributes: map[string]string{"plan_type": "pro"}},
+		&Auth{ID: "gemini-b", Provider: "gemini", Attributes: map[string]string{"plan_type": "pro"}},
+		&Auth{ID: "claude-a", Provider: "claude", Attributes: map[string]string{"plan_type": "pro"}},
+	)
+	scheduler.setRoutingConfig(internalconfig.RoutingConfig{
+		Strategy:            "round-robin",
+		PerAuthRequestLimit: 1,
+		PriorityOverrides: []internalconfig.RoutingPriorityOverride{{
+			Priority: 0,
+			SubscriptionOverrides: []internalconfig.RoutingSubscriptionOverride{{
+				PlanTypes:           []string{"pro"},
+				PerAuthRequestLimit: &disabledLimit,
+			}},
+		}},
+	})
+
+	got, errPick := scheduler.pickSingle(context.Background(), "gemini", "", cliproxyexecutor.Options{}, nil)
+	if errPick != nil || got == nil || got.ID != "gemini-a" {
+		t.Fatalf("pickSingle() = %v, %v, want gemini-a, nil", got, errPick)
+	}
+	got, provider, errPick := scheduler.pickMixed(context.Background(), []string{"gemini", "claude"}, "", cliproxyexecutor.Options{}, nil)
+	if errPick != nil || got == nil || provider != "gemini" || got.ID != "gemini-b" {
+		t.Fatalf("pickMixed() = %v/%q, %v, want gemini-b/gemini, nil", got, provider, errPick)
+	}
+}
+
+func TestSchedulerPick_MixedProvidersRequestLimitPreservesShardCursor(t *testing.T) {
+	t.Parallel()
+
+	scheduler := newSchedulerForTest(
+		&RoundRobinSelector{},
+		&Auth{ID: "gemini-a", Provider: "gemini"},
+		&Auth{ID: "gemini-b", Provider: "gemini"},
+		&Auth{ID: "claude-a", Provider: "claude"},
+	)
+	scheduler.setRoutingConfig(internalconfig.RoutingConfig{
+		Strategy:            "round-robin",
+		PerAuthRequestLimit: 2,
+	})
+
+	got, errPick := scheduler.pickSingle(context.Background(), "gemini", "", cliproxyexecutor.Options{}, nil)
+	if errPick != nil || got == nil || got.ID != "gemini-a" {
+		t.Fatalf("pickSingle() = %v, %v, want gemini-a, nil", got, errPick)
+	}
+	got, provider, errPick := scheduler.pickMixed(context.Background(), []string{"gemini", "claude"}, "", cliproxyexecutor.Options{}, nil)
+	if errPick != nil || got == nil || provider != "gemini" || got.ID != "gemini-b" {
+		t.Fatalf("pickMixed() = %v/%q, %v, want gemini-b/gemini, nil", got, provider, errPick)
 	}
 }
 

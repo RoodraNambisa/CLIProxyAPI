@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -49,6 +50,11 @@ routing:
       fill-first-per-auth-rpm: 0
       per-auth-request-limit: 120
       per-auth-request-window-minutes: 5
+      subscription-overrides:
+        - providers: [Codex, codex]
+          plan-types: [Pro, ChatGPTPlusPlan, ChatGPTBusinessPlan, pro]
+          per-auth-request-limit: 180
+          per-auth-request-window-minutes: 10
     - priority: -1
       max-retry-credentials: -4
       fill-first-range: -2
@@ -97,6 +103,22 @@ routing:
 	}
 	if first.PerAuthRequestWindowMinutes == nil || *first.PerAuthRequestWindowMinutes != 5 {
 		t.Fatalf("first PerAuthRequestWindowMinutes = %v, want 5", first.PerAuthRequestWindowMinutes)
+	}
+	if len(first.SubscriptionOverrides) != 1 {
+		t.Fatalf("first SubscriptionOverrides length = %d, want 1", len(first.SubscriptionOverrides))
+	}
+	subscription := first.SubscriptionOverrides[0]
+	if len(subscription.Providers) != 1 || subscription.Providers[0] != "codex" {
+		t.Fatalf("subscription Providers = %v, want [codex]", subscription.Providers)
+	}
+	if len(subscription.PlanTypes) != 3 || subscription.PlanTypes[0] != "pro" || subscription.PlanTypes[1] != "plus" || subscription.PlanTypes[2] != "team" {
+		t.Fatalf("subscription PlanTypes = %v, want [pro plus team]", subscription.PlanTypes)
+	}
+	if subscription.PerAuthRequestLimit == nil || *subscription.PerAuthRequestLimit != 180 {
+		t.Fatalf("subscription PerAuthRequestLimit = %v, want 180", subscription.PerAuthRequestLimit)
+	}
+	if subscription.PerAuthRequestWindowMinutes == nil || *subscription.PerAuthRequestWindowMinutes != 10 {
+		t.Fatalf("subscription PerAuthRequestWindowMinutes = %v, want 10", subscription.PerAuthRequestWindowMinutes)
 	}
 	second := cfg.Routing.PriorityOverrides[1]
 	if second.Priority != -1 {
@@ -148,6 +170,89 @@ routing:
 
 	if _, err := LoadConfigOptional(configPath, false); err == nil {
 		t.Fatalf("LoadConfigOptional() error = nil, want duplicate priority error")
+	}
+}
+
+func TestNormalizeRoutingPriorityOverrides_AllowsDisjointProviderPlanRules(t *testing.T) {
+	limitCodex := 120
+	limitWeb := 60
+	normalized, err := NormalizeRoutingPriorityOverrides([]RoutingPriorityOverride{{
+		Priority: 0,
+		SubscriptionOverrides: []RoutingSubscriptionOverride{
+			{Providers: []string{"codex"}, PlanTypes: []string{"pro"}, PerAuthRequestLimit: &limitCodex},
+			{Providers: []string{"chatgpt-web"}, PlanTypes: []string{"pro"}, PerAuthRequestLimit: &limitWeb},
+		},
+	}})
+	if err != nil {
+		t.Fatalf("NormalizeRoutingPriorityOverrides() error = %v", err)
+	}
+	if len(normalized) != 1 || len(normalized[0].SubscriptionOverrides) != 2 {
+		t.Fatalf("normalized overrides = %+v, want two subscription rules", normalized)
+	}
+}
+
+func TestNormalizeRoutingPriorityOverrides_RejectsOverlappingSubscriptionRules(t *testing.T) {
+	limit := 60
+	tests := []struct {
+		name  string
+		rules []RoutingSubscriptionOverride
+	}{
+		{
+			name: "same provider",
+			rules: []RoutingSubscriptionOverride{
+				{Providers: []string{"codex"}, PlanTypes: []string{"pro"}, PerAuthRequestLimit: &limit},
+				{Providers: []string{"codex"}, PlanTypes: []string{"PRO"}, PerAuthRequestLimit: &limit},
+			},
+		},
+		{
+			name: "all providers overlaps exact provider",
+			rules: []RoutingSubscriptionOverride{
+				{PlanTypes: []string{"plus"}, PerAuthRequestLimit: &limit},
+				{Providers: []string{"chatgpt-web"}, PlanTypes: []string{"plus"}, PerAuthRequestLimit: &limit},
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := NormalizeRoutingPriorityOverrides([]RoutingPriorityOverride{{
+				Priority:              0,
+				SubscriptionOverrides: test.rules,
+			}})
+			if err == nil || !strings.Contains(err.Error(), "overlapping provider scopes") {
+				t.Fatalf("NormalizeRoutingPriorityOverrides() error = %v, want overlapping provider scopes", err)
+			}
+		})
+	}
+}
+
+func TestNormalizeRoutingPriorityOverrides_RejectsInvalidSubscriptionRules(t *testing.T) {
+	limit := 60
+	tests := []struct {
+		name string
+		rule RoutingSubscriptionOverride
+		want string
+	}{
+		{
+			name: "missing plan",
+			rule: RoutingSubscriptionOverride{PerAuthRequestLimit: &limit},
+			want: "at least one plan type",
+		},
+		{
+			name: "missing fields",
+			rule: RoutingSubscriptionOverride{PlanTypes: []string{"pro"}},
+			want: "at least one request limit field",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := NormalizeRoutingPriorityOverrides([]RoutingPriorityOverride{{
+				Priority:              0,
+				SubscriptionOverrides: []RoutingSubscriptionOverride{test.rule},
+			}})
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("NormalizeRoutingPriorityOverrides() error = %v, want %q", err, test.want)
+			}
+		})
 	}
 }
 

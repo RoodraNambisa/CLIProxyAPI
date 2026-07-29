@@ -144,6 +144,240 @@ func TestAuthRequestWindowLimiterRejectsStaleDisabledPolicy(t *testing.T) {
 	}
 }
 
+func TestAuthRequestLimitPolicyForRoutingAuthAppliesProviderPlanInheritance(t *testing.T) {
+	priorityLimit := 10
+	priorityWindow := 5
+	proLimit := 3
+	plusWindow := 15
+	teamLimit := 4
+	routing := internalconfig.RoutingConfig{
+		PerAuthRequestLimit:         100,
+		PerAuthRequestWindowMinutes: 60,
+		PriorityOverrides: []internalconfig.RoutingPriorityOverride{{
+			Priority:                    0,
+			PerAuthRequestLimit:         &priorityLimit,
+			PerAuthRequestWindowMinutes: &priorityWindow,
+			SubscriptionOverrides: []internalconfig.RoutingSubscriptionOverride{
+				{Providers: []string{"codex"}, PlanTypes: []string{"pro"}, PerAuthRequestLimit: &proLimit},
+				{PlanTypes: []string{"plus"}, PerAuthRequestWindowMinutes: &plusWindow},
+				{PlanTypes: []string{"team"}, PerAuthRequestLimit: &teamLimit},
+			},
+		}},
+	}
+
+	tests := []struct {
+		name       string
+		auth       *Auth
+		wantLimit  int
+		wantWindow int
+	}{
+		{
+			name:       "provider-specific pro",
+			auth:       &Auth{Provider: "codex", Attributes: map[string]string{"plan_type": "Pro"}},
+			wantLimit:  3,
+			wantWindow: 5,
+		},
+		{
+			name:       "same plan outside provider scope",
+			auth:       &Auth{Provider: "chatgpt-web", Metadata: map[string]any{"plan_type": "pro"}},
+			wantLimit:  10,
+			wantWindow: 5,
+		},
+		{
+			name:       "all-provider plus inherits limit",
+			auth:       &Auth{Provider: "chatgpt-web", Metadata: map[string]any{"plan_type": "ChatGPTPlusPlan"}},
+			wantLimit:  10,
+			wantWindow: 15,
+		},
+		{
+			name:       "unknown plan falls back",
+			auth:       &Auth{Provider: "codex"},
+			wantLimit:  10,
+			wantWindow: 5,
+		},
+		{
+			name:       "business wrapper uses existing team profile",
+			auth:       &Auth{Provider: "chatgpt-web", Metadata: map[string]any{"plan_type": "ChatGPTBusinessPlan"}},
+			wantLimit:  4,
+			wantWindow: 5,
+		},
+		{
+			name:       "codex self serve business uses team profile",
+			auth:       &Auth{Provider: "codex", Attributes: map[string]string{"plan_type": "Self_serve_business_usage_based"}},
+			wantLimit:  4,
+			wantWindow: 5,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			policy := authRequestLimitPolicyForRoutingAuth(routing, test.auth)
+			if policy.limit != test.wantLimit || policy.windowMinutes != test.wantWindow {
+				t.Fatalf("policy = %+v, want limit=%d window=%d", policy, test.wantLimit, test.wantWindow)
+			}
+		})
+	}
+}
+
+func TestSchedulerPerAuthRequestLimitUsesSubscriptionWithinPriority(t *testing.T) {
+	manager := NewManager(nil, &FillFirstSelector{}, nil)
+	manager.RegisterExecutor(schedulerTestExecutor{})
+	proLimit := 1
+	plusLimit := 2
+	manager.SetConfig(&internalconfig.Config{Routing: internalconfig.RoutingConfig{
+		Strategy:                    "fill-first",
+		PerAuthRequestWindowMinutes: 5,
+		PriorityOverrides: []internalconfig.RoutingPriorityOverride{{
+			Priority: 0,
+			SubscriptionOverrides: []internalconfig.RoutingSubscriptionOverride{
+				{PlanTypes: []string{"pro"}, PerAuthRequestLimit: &proLimit},
+				{PlanTypes: []string{"plus"}, PerAuthRequestLimit: &plusLimit},
+			},
+		}},
+	}})
+	fixed := time.Date(2026, 7, 29, 12, 0, 10, 0, time.UTC)
+	manager.scheduler.requestLimiter.now = func() time.Time { return fixed }
+	for _, auth := range []*Auth{
+		{ID: "a-pro", Provider: "test", Attributes: map[string]string{"plan_type": "pro"}},
+		{ID: "b-plus", Provider: "test", Metadata: map[string]any{"plan_type": "plus"}},
+	} {
+		if _, errRegister := manager.Register(WithSkipPersist(t.Context()), auth); errRegister != nil {
+			t.Fatalf("register %s: %v", auth.ID, errRegister)
+		}
+	}
+
+	wantIDs := []string{"a-pro", "b-plus", "b-plus"}
+	for index, wantID := range wantIDs {
+		selected, _, errPick := manager.pickNext(t.Context(), "test", "", cliproxyexecutor.Options{}, nil)
+		if errPick != nil || selected == nil || selected.ID != wantID {
+			t.Fatalf("pick %d = (%v, %v), want %s", index, selected, errPick, wantID)
+		}
+	}
+	if selected, _, errPick := manager.pickNext(t.Context(), "test", "", cliproxyexecutor.Options{}, nil); selected != nil || !isAuthRequestLimitedError(errPick) {
+		t.Fatalf("final pick = (%v, %T %v), want auth_request_limited", selected, errPick, errPick)
+	}
+}
+
+func TestSchedulerPerAuthRequestLimitUsesSubscriptionAcrossStrategies(t *testing.T) {
+	for _, strategy := range []string{"round-robin", "random"} {
+		t.Run(strategy, func(t *testing.T) {
+			manager := NewManager(nil, &RoundRobinSelector{}, nil)
+			manager.RegisterExecutor(schedulerTestExecutor{})
+			proLimit := 1
+			plusLimit := 2
+			manager.SetConfig(&internalconfig.Config{Routing: internalconfig.RoutingConfig{
+				Strategy:                    strategy,
+				PerAuthRequestWindowMinutes: 5,
+				PriorityOverrides: []internalconfig.RoutingPriorityOverride{{
+					Priority: 0,
+					SubscriptionOverrides: []internalconfig.RoutingSubscriptionOverride{
+						{PlanTypes: []string{"pro"}, PerAuthRequestLimit: &proLimit},
+						{PlanTypes: []string{"plus"}, PerAuthRequestLimit: &plusLimit},
+					},
+				}},
+			}})
+			fixed := time.Date(2026, 7, 29, 12, 0, 10, 0, time.UTC)
+			manager.scheduler.requestLimiter.now = func() time.Time { return fixed }
+			for _, auth := range []*Auth{
+				{ID: "a-pro", Provider: "test", Attributes: map[string]string{"plan_type": "pro"}},
+				{ID: "b-plus", Provider: "test", Metadata: map[string]any{"plan_type": "plus"}},
+			} {
+				if _, errRegister := manager.Register(WithSkipPersist(t.Context()), auth); errRegister != nil {
+					t.Fatalf("register %s: %v", auth.ID, errRegister)
+				}
+			}
+
+			counts := make(map[string]int)
+			for index := 0; index < proLimit+plusLimit; index++ {
+				selected, _, errPick := manager.pickNext(t.Context(), "test", "", cliproxyexecutor.Options{}, nil)
+				if errPick != nil || selected == nil {
+					t.Fatalf("pick %d = (%v, %v), want auth", index, selected, errPick)
+				}
+				counts[selected.ID]++
+			}
+			if counts["a-pro"] != proLimit || counts["b-plus"] != plusLimit {
+				t.Fatalf("counts = %#v, want pro=%d plus=%d", counts, proLimit, plusLimit)
+			}
+			if selected, _, errPick := manager.pickNext(t.Context(), "test", "", cliproxyexecutor.Options{}, nil); selected != nil || !isAuthRequestLimitedError(errPick) {
+				t.Fatalf("final pick = (%v, %T %v), want auth_request_limited", selected, errPick, errPick)
+			}
+		})
+	}
+}
+
+func TestLegacySelectorPerAuthRequestLimitUsesSubscription(t *testing.T) {
+	manager := NewManager(nil, &trackingSelector{}, nil)
+	manager.RegisterExecutor(schedulerTestExecutor{})
+	proLimit := 1
+	plusLimit := 2
+	manager.SetConfig(&internalconfig.Config{Routing: internalconfig.RoutingConfig{
+		PerAuthRequestWindowMinutes: 5,
+		PriorityOverrides: []internalconfig.RoutingPriorityOverride{{
+			Priority: 0,
+			SubscriptionOverrides: []internalconfig.RoutingSubscriptionOverride{
+				{PlanTypes: []string{"pro"}, PerAuthRequestLimit: &proLimit},
+				{PlanTypes: []string{"plus"}, PerAuthRequestLimit: &plusLimit},
+			},
+		}},
+	}})
+	fixed := time.Date(2026, 7, 29, 12, 0, 10, 0, time.UTC)
+	manager.scheduler.requestLimiter.now = func() time.Time { return fixed }
+	for _, auth := range []*Auth{
+		{ID: "a-pro", Provider: "test", Attributes: map[string]string{"plan_type": "pro"}},
+		{ID: "b-plus", Provider: "test", Metadata: map[string]any{"plan_type": "plus"}},
+	} {
+		if _, errRegister := manager.Register(WithSkipPersist(t.Context()), auth); errRegister != nil {
+			t.Fatalf("register %s: %v", auth.ID, errRegister)
+		}
+	}
+
+	for index, wantID := range []string{"b-plus", "b-plus", "a-pro"} {
+		selected, _, errPick := manager.pickNext(t.Context(), "test", "", cliproxyexecutor.Options{}, nil)
+		if errPick != nil || selected == nil || selected.ID != wantID {
+			t.Fatalf("pick %d = (%v, %v), want %s", index, selected, errPick, wantID)
+		}
+	}
+	if selected, _, errPick := manager.pickNext(t.Context(), "test", "", cliproxyexecutor.Options{}, nil); selected != nil || !isAuthRequestLimitedError(errPick) {
+		t.Fatalf("final pick = (%v, %T %v), want auth_request_limited", selected, errPick, errPick)
+	}
+}
+
+func TestSchedulerSubscriptionExplicitZeroUsesLegacyFillFirstRPM(t *testing.T) {
+	manager := NewManager(nil, &FillFirstSelector{}, nil)
+	manager.RegisterExecutor(schedulerTestExecutor{})
+	disabled := 0
+	manager.SetConfig(&internalconfig.Config{Routing: internalconfig.RoutingConfig{
+		Strategy:                    "fill-first",
+		FillFirstPerAuthRPM:         1,
+		PerAuthRequestLimit:         1,
+		PerAuthRequestWindowMinutes: 5,
+		PriorityOverrides: []internalconfig.RoutingPriorityOverride{{
+			Priority: 0,
+			SubscriptionOverrides: []internalconfig.RoutingSubscriptionOverride{{
+				PlanTypes:           []string{"plus"},
+				PerAuthRequestLimit: &disabled,
+			}},
+		}},
+	}})
+	fixed := time.Date(2026, 7, 29, 12, 0, 10, 0, time.UTC)
+	manager.scheduler.requestLimiter.now = func() time.Time { return fixed }
+	manager.scheduler.fillFirstLimiter.now = func() time.Time { return fixed }
+	for _, auth := range []*Auth{
+		{ID: "a-plus", Provider: "test", Metadata: map[string]any{"plan_type": "plus"}},
+		{ID: "b-plus", Provider: "test", Metadata: map[string]any{"plan_type": "plus"}},
+	} {
+		if _, errRegister := manager.Register(WithSkipPersist(t.Context()), auth); errRegister != nil {
+			t.Fatalf("register %s: %v", auth.ID, errRegister)
+		}
+	}
+
+	for index, wantID := range []string{"a-plus", "b-plus"} {
+		selected, _, errPick := manager.pickNext(t.Context(), "test", "", cliproxyexecutor.Options{}, nil)
+		if errPick != nil || selected == nil || selected.ID != wantID {
+			t.Fatalf("pick %d = (%v, %v), want %s", index, selected, errPick, wantID)
+		}
+	}
+}
+
 func TestEarlierAvailabilityBlockerUsesEarliestReset(t *testing.T) {
 	later := newAuthRequestLimitedError(authRequestLimitBlock{limit: 1, windowMinutes: 5, resetIn: 2 * time.Minute})
 	earliest := newModelCooldownError("model", "antigravity", 30*time.Second)

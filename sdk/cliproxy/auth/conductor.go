@@ -1361,6 +1361,20 @@ func (m *Manager) routingAuthRequestLimitPolicyForPriority(priority int) authReq
 	return authRequestLimitPolicyForRouting(cfg.Routing, priority)
 }
 
+func (m *Manager) routingAuthRequestLimitPolicyForAuth(auth *Auth) authRequestLimitPolicy {
+	if m == nil {
+		return normalizeAuthRequestLimitPolicy(authRequestLimitPolicy{})
+	}
+	if m.scheduler != nil {
+		return m.scheduler.requestLimitPolicyForAuth(auth)
+	}
+	cfg, _ := m.runtimeConfig.Load().(*internalconfig.Config)
+	if cfg == nil {
+		return normalizeAuthRequestLimitPolicy(authRequestLimitPolicy{})
+	}
+	return authRequestLimitPolicyForRoutingAuth(cfg.Routing, auth)
+}
+
 func (m *Manager) authRequestLimiter() *authRequestWindowLimiter {
 	if m == nil || m.scheduler == nil {
 		return nil
@@ -1430,7 +1444,7 @@ func (m *Manager) preferEarlierRoundAvailabilityError(selectionErr error, roundS
 		limiter := m.authRequestLimiter()
 		if limiter != nil {
 			now := limiter.nowTime()
-			policy := m.routingAuthRequestLimitPolicyForPriority(authPriority(auth))
+			policy := m.routingAuthRequestLimitPolicyForAuth(auth)
 			if available, _ := limiter.availableAt(auth.ID, policy, now); !available {
 				return selectionErr
 			}
@@ -1493,9 +1507,6 @@ func (m *Manager) prioritySelectorForAvailable(available []*Auth) (Selector, boo
 	strategy, ok := m.routingStrategyOverrideForPriority(priority)
 	fillFirstRange := m.routingFillFirstRangeForPriority(priority)
 	fillFirstPerAuthRPM := m.routingFillFirstPerAuthRPMForPriority(priority)
-	if m.routingAuthRequestLimitPolicyForPriority(priority).limit > 0 {
-		fillFirstPerAuthRPM = 0
-	}
 	if !ok {
 		strategy = selectorStrategy(m.selector)
 		if strategy != schedulerStrategyFillFirst || (fillFirstRange <= 1 && fillFirstPerAuthRPM <= 0) {
@@ -1546,9 +1557,6 @@ func (m *Manager) pickLegacyFillFirstRangeAuthWithDeferredBinding(ctx context.Co
 	}
 	fillFirstRange := m.routingFillFirstRangeForPriority(priority)
 	fillFirstPerAuthRPM := m.routingFillFirstPerAuthRPMForPriority(priority)
-	if m.routingAuthRequestLimitPolicyForPriority(priority).limit > 0 {
-		fillFirstPerAuthRPM = 0
-	}
 	if fillFirstRange <= 1 && fillFirstPerAuthRPM <= 0 {
 		return nil, false, nil, nil
 	}
@@ -1562,18 +1570,29 @@ func (m *Manager) pickLegacyFillFirstRangeAuthWithDeferredBinding(ctx context.Co
 		if m.routingStrategyForPriority(priority) != schedulerStrategyFillFirst {
 			return 0
 		}
-		if m.routingAuthRequestLimitPolicyForPriority(priority).limit > 0 {
-			return 0
-		}
 		return m.routingFillFirstPerAuthRPMForPriority(priority)
 	}
 	pickFallback := func() (*Auth, error) {
-		return selectFillFirstAuthsForContextWithPolicy(ctx, candidates, provider, routeModel, time.Now(), selectionAttemptFromMetadata(opts.Metadata), fillFirstRangeForPriority, fillFirstPerAuthRPMForPriority, m.fillFirstLimiter(), func(auth *Auth) string {
+		return selectFillFirstAuthsForContextWithPolicy(ctx, candidates, provider, routeModel, time.Now(), selectionAttemptFromMetadata(opts.Metadata), fillFirstRangeForPriority, fillFirstPerAuthRPMForPriority, m.fillFirstLimiter(), func(auth *Auth) bool {
+			return m.routingAuthRequestLimitPolicyForAuth(auth).limit > 0
+		}, func(auth *Auth) string {
 			return m.selectionModelForAuth(auth, routeModel)
 		}, pickAllowed)
 	}
-	if hasSessionSelector && sessionSelector != nil && fillFirstPerAuthRPM <= 0 {
+	useSessionSelector := hasSessionSelector && sessionSelector != nil
+	if useSessionSelector && fillFirstPerAuthRPM > 0 {
+		if cachedAuthID := sessionSelector.cachedAuthID(provider, routeModel, opts); cachedAuthID != "" {
+			cachedAuth := authFromListByID(available, cachedAuthID)
+			if cachedAuth == nil || m.routingAuthRequestLimitPolicyForAuth(cachedAuth).limit == 0 {
+				useSessionSelector = false
+			}
+		}
+	}
+	if useSessionSelector {
 		selected, bind, errPick := sessionSelector.pickWithPreparedFallbackDeferredBinding(ctx, provider, routeModel, opts, available, pickFallback)
+		if errPick == nil && selected != nil && fillFirstPerAuthRPM > 0 && m.routingAuthRequestLimitPolicyForAuth(selected).limit == 0 {
+			bind = nil
+		}
 		return selected, true, bind, errPick
 	}
 	selected, errPick := pickFallback()
@@ -5362,7 +5381,6 @@ func (m *Manager) pickAntigravityCreditsAtPriority(ctx context.Context, opts cli
 	}
 	opts = setSelectionAttemptMetadata(opts, 0)
 	strategy := m.routingStrategyForPriority(priority)
-	requestPolicy := m.routingAuthRequestLimitPolicyForPriority(priority)
 	requestLimiter := m.authRequestLimiter()
 	requestBlocked := authRequestLimitBlock{}
 	dynamicallyLimited := make(map[string]struct{})
@@ -5375,6 +5393,7 @@ func (m *Manager) pickAntigravityCreditsAtPriority(ctx context.Context, opts cli
 			if _, limited := dynamicallyLimited[auth.ID]; limited {
 				return false
 			}
+			requestPolicy := m.routingAuthRequestLimitPolicyForAuth(auth)
 			available, block := requestLimiter.availableAt(auth.ID, requestPolicy, now)
 			if !available {
 				requestBlocked = earlierAuthRequestLimitBlock(requestBlocked, block)
@@ -5386,10 +5405,13 @@ func (m *Manager) pickAntigravityCreditsAtPriority(ctx context.Context, opts cli
 		if strategy == schedulerStrategyFillFirst {
 			fillFirstRange := m.routingFillFirstRangeForPriority(priority)
 			fillFirstRPM := m.routingFillFirstPerAuthRPMForPriority(priority)
-			if requestPolicy.limit > 0 {
-				fillFirstRPM = 0
-			}
-			selected, errPick = selectFillFirstAuthsForContext(ctx, auths, "antigravity", "", now, 0, fillFirstRange, fillFirstRPM, m.fillFirstLimiter(), nil, combinedAllowed)
+			selected, errPick = selectFillFirstAuthsForContextWithPolicy(ctx, auths, "antigravity", "", now, 0, func(int) int {
+				return fillFirstRange
+			}, func(int) int {
+				return fillFirstRPM
+			}, m.fillFirstLimiter(), func(auth *Auth) bool {
+				return m.routingAuthRequestLimitPolicyForAuth(auth).limit > 0
+			}, nil, combinedAllowed)
 		} else {
 			filtered := make([]*Auth, 0, len(auths))
 			for _, auth := range auths {
@@ -5421,9 +5443,9 @@ func (m *Manager) pickAntigravityCreditsAtPriority(ctx context.Context, opts cli
 		if selected == nil {
 			return nil, preferAuthRequestLimitError(nil, requestBlocked)
 		}
+		requestPolicy := m.routingAuthRequestLimitPolicyForAuth(selected)
 		if acquired, block := requestLimiter.tryAcquireAt(selected.ID, requestPolicy, now); !acquired {
 			if block.stalePolicy {
-				requestPolicy = m.routingAuthRequestLimitPolicyForPriority(priority)
 				requestBlocked = authRequestLimitBlock{}
 				clear(dynamicallyLimited)
 				continue
@@ -7683,7 +7705,7 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 			if blocked, _, _ := isAuthBlockedForModel(candidate, m.selectionModelForAuth(candidate, model), now); blocked {
 				break
 			}
-			policy := m.routingAuthRequestLimitPolicyForPriority(authPriority(candidate))
+			policy := m.routingAuthRequestLimitPolicyForAuth(candidate)
 			if available, block := requestLimiter.availableAt(candidate.ID, policy, now); !available {
 				m.mu.RUnlock()
 				return nil, nil, newAuthRequestLimitedError(block)
@@ -7711,7 +7733,7 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 					return true
 				}
 			}
-			policy := m.routingAuthRequestLimitPolicyForPriority(authPriority(auth))
+			policy := m.routingAuthRequestLimitPolicyForAuth(auth)
 			available, block := requestLimiter.availableAt(auth.ID, policy, now)
 			if !available {
 				requestBlocked = earlierAuthRequestLimitBlock(requestBlocked, block)
@@ -7750,7 +7772,7 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 			m.mu.RUnlock()
 			return nil, nil, preferAuthRequestLimitError(&Error{Code: "auth_not_found", Message: "selector returned no auth"}, requestBlocked)
 		}
-		policy := m.routingAuthRequestLimitPolicyForPriority(authPriority(selected))
+		policy := m.routingAuthRequestLimitPolicyForAuth(selected)
 		if acquired, block := requestLimiter.tryAcquireAt(selected.ID, policy, now); !acquired {
 			if block.stalePolicy {
 				requestBlocked = authRequestLimitBlock{}
@@ -7903,7 +7925,7 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 			if blocked, _, _ := isAuthBlockedForModel(candidate, m.selectionModelForAuth(candidate, model), now); blocked {
 				break
 			}
-			policy := m.routingAuthRequestLimitPolicyForPriority(authPriority(candidate))
+			policy := m.routingAuthRequestLimitPolicyForAuth(candidate)
 			if available, block := requestLimiter.availableAt(candidate.ID, policy, now); !available {
 				m.mu.RUnlock()
 				return nil, nil, "", newAuthRequestLimitedError(block)
@@ -7934,7 +7956,7 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 					return true
 				}
 			}
-			policy := m.routingAuthRequestLimitPolicyForPriority(authPriority(auth))
+			policy := m.routingAuthRequestLimitPolicyForAuth(auth)
 			available, block := requestLimiter.availableAt(auth.ID, policy, now)
 			if !available {
 				requestBlocked = earlierAuthRequestLimitBlock(requestBlocked, block)
@@ -7973,7 +7995,7 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 			m.mu.RUnlock()
 			return nil, nil, "", preferAuthRequestLimitError(&Error{Code: "auth_not_found", Message: "selector returned no auth"}, requestBlocked)
 		}
-		policy := m.routingAuthRequestLimitPolicyForPriority(authPriority(selected))
+		policy := m.routingAuthRequestLimitPolicyForAuth(selected)
 		if acquired, block := requestLimiter.tryAcquireAt(selected.ID, policy, now); !acquired {
 			if block.stalePolicy {
 				requestBlocked = authRequestLimitBlock{}
