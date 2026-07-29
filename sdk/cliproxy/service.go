@@ -186,6 +186,9 @@ type Service struct {
 
 	// maintenanceWake nudges the maintenance worker to wake early.
 	maintenanceWake chan struct{}
+
+	// maintenanceDependencyReconcilePending retries retained Codex cleanup after a transient failure.
+	maintenanceDependencyReconcilePending bool
 }
 
 // RegisterUsagePlugin registers a usage plugin on the global usage manager.
@@ -221,6 +224,7 @@ const (
 	authMaintenanceReasonMetadataKey        = "auth_maintenance_reason"
 	authMaintenanceMarkedAtMetadataKey      = "auth_maintenance_marked_at"
 	authMaintenancePendingDeleteMetadataKey = "auth_maintenance_pending_delete"
+	authMaintenancePreviousDisabledKey      = "auth_maintenance_previous_disabled"
 	authMaintenanceDeleteAction             = "delete"
 	authMaintenanceDisableAction            = "disable"
 )
@@ -234,11 +238,12 @@ var (
 )
 
 type authMaintenanceCandidate struct {
-	Key        string
-	Path       string
-	IDs        []string
-	Reason     string
-	Generation uint64
+	Key           string
+	Path          string
+	IDs           []string
+	Installations map[string]string
+	Reason        string
+	Generation    uint64
 }
 
 type modelSyncTaskState struct {
@@ -265,6 +270,9 @@ func (h authMaintenanceHook) OnAuthUpdated(ctx context.Context, auth *coreauth.A
 func (h authMaintenanceHook) handleAuthChange(ctx context.Context, auth *coreauth.Auth) {
 	if h.service == nil || auth == nil || strings.TrimSpace(auth.ID) == "" {
 		return
+	}
+	if isNativeChatGPTWebAuth(auth) && auth.LifecycleState() == coreauth.LifecycleStateDead {
+		h.service.wakeAuthMaintenance()
 	}
 	if ctx != nil && ctx.Value(modelSyncHookSuppressedContextKey{}) != nil {
 		if h.service.coreManager != nil {
@@ -765,6 +773,49 @@ func (s *Service) snapshotAuthMaintenanceConfig() (config.AuthMaintenanceConfig,
 	return maintenance, strings.TrimSpace(cfg.AuthDir)
 }
 
+type chatGPTWebDeadAuthDeletePolicy struct {
+	enabled    bool
+	priorities []int
+}
+
+func (s *Service) snapshotChatGPTWebDeadAuthDeletePolicy() chatGPTWebDeadAuthDeletePolicy {
+	cfg := s.currentConfig()
+	if cfg == nil {
+		return chatGPTWebDeadAuthDeletePolicy{}
+	}
+	return chatGPTWebDeadAuthDeletePolicy{
+		enabled:    cfg.ChatGPTWeb.AutoDeleteDeadAuths,
+		priorities: append([]int(nil), cfg.ChatGPTWeb.AutoDeleteDeadPriorities...),
+	}
+}
+
+func (policy chatGPTWebDeadAuthDeletePolicy) matchesPriority(priority int) bool {
+	if !policy.enabled {
+		return false
+	}
+	if len(policy.priorities) == 0 {
+		return true
+	}
+	for _, allowed := range policy.priorities {
+		if allowed == priority {
+			return true
+		}
+	}
+	return false
+}
+
+func chatGPTWebDeadAuthDeletePoliciesEqual(first, second chatGPTWebDeadAuthDeletePolicy) bool {
+	if first.enabled != second.enabled || len(first.priorities) != len(second.priorities) {
+		return false
+	}
+	for index := range first.priorities {
+		if first.priorities[index] != second.priorities[index] {
+			return false
+		}
+	}
+	return true
+}
+
 func (s *Service) warnAuthMaintenanceConfig(cfg config.AuthMaintenanceConfig) {
 	if !cfg.Enable {
 		return
@@ -908,6 +959,31 @@ func authMaintenanceErrorsEqual(first, second *coreauth.Error) bool {
 	return first.HTTPStatus == second.HTTPStatus &&
 		strings.EqualFold(strings.TrimSpace(first.Code), strings.TrimSpace(second.Code)) &&
 		strings.TrimSpace(first.Message) == strings.TrimSpace(second.Message)
+}
+
+func authEligibleForChatGPTWebDeadDelete(auth *coreauth.Auth, policy chatGPTWebDeadAuthDeletePolicy) (string, bool) {
+	if !isNativeChatGPTWebAuth(auth) || auth.LifecycleState() != coreauth.LifecycleStateDead {
+		return "", false
+	}
+	priority := 0
+	if auth.Attributes != nil {
+		if parsed, errParse := strconv.Atoi(strings.TrimSpace(auth.Attributes["priority"])); errParse == nil {
+			priority = parsed
+		}
+	}
+	if !policy.matchesPriority(priority) {
+		return "", false
+	}
+	reason := ""
+	if auth.Metadata != nil {
+		if value, ok := auth.Metadata["lifecycle_reason"].(string); ok {
+			reason = chatgptwebauth.SafeLifecycleReason(value)
+		}
+	}
+	if reason == "" {
+		reason = coreauth.LifecycleStateDead
+	}
+	return "chatgpt_web_dead_" + reason, true
 }
 
 func authEligibleForMaintenanceDelete(auth *coreauth.Auth, result *coreauth.Result, cfg config.AuthMaintenanceConfig) (string, bool) {
@@ -1065,6 +1141,55 @@ func (s *Service) dequeueAuthMaintenanceCandidate() (authMaintenanceCandidate, b
 	return candidate, true
 }
 
+func authMaintenanceCandidateEnabled(candidate authMaintenanceCandidate, genericEnabled, webDeadEnabled bool) bool {
+	if genericEnabled {
+		return true
+	}
+	return webDeadEnabled && isChatGPTWebDeadMaintenanceCandidate(candidate)
+}
+
+func isChatGPTWebDeadMaintenanceCandidate(candidate authMaintenanceCandidate) bool {
+	return strings.HasPrefix(strings.TrimSpace(candidate.Reason), "chatgpt_web_dead_")
+}
+
+func (s *Service) dequeueProcessableAuthMaintenanceCandidate(genericEnabled bool) (authMaintenanceCandidate, bool) {
+	if s == nil {
+		return authMaintenanceCandidate{}, false
+	}
+	s.maintenanceMu.Lock()
+	defer s.maintenanceMu.Unlock()
+	for index, candidate := range s.maintenanceQueue {
+		if !genericEnabled && !isChatGPTWebDeadMaintenanceCandidate(candidate) {
+			continue
+		}
+		s.maintenanceQueue = append(s.maintenanceQueue[:index], s.maintenanceQueue[index+1:]...)
+		delete(s.maintenancePending, strings.TrimSpace(candidate.Key))
+		return candidate, true
+	}
+	return authMaintenanceCandidate{}, false
+}
+
+func (s *Service) setAuthMaintenanceDependencyReconcilePending(pending bool) {
+	if s == nil {
+		return
+	}
+	s.maintenanceMu.Lock()
+	s.maintenanceDependencyReconcilePending = pending
+	s.maintenanceMu.Unlock()
+	if pending {
+		s.wakeAuthMaintenance()
+	}
+}
+
+func (s *Service) authMaintenanceDependencyReconcileRequired() bool {
+	if s == nil {
+		return false
+	}
+	s.maintenanceMu.Lock()
+	defer s.maintenanceMu.Unlock()
+	return s.maintenanceDependencyReconcilePending
+}
+
 func (s *Service) hasQueuedAuthMaintenanceCandidates() bool {
 	if s == nil {
 		return false
@@ -1072,6 +1197,20 @@ func (s *Service) hasQueuedAuthMaintenanceCandidates() bool {
 	s.maintenanceMu.Lock()
 	defer s.maintenanceMu.Unlock()
 	return len(s.maintenanceQueue) > 0
+}
+
+func (s *Service) hasEnabledAuthMaintenanceCandidates(genericEnabled, webDeadEnabled bool) bool {
+	if s == nil {
+		return false
+	}
+	s.maintenanceMu.Lock()
+	defer s.maintenanceMu.Unlock()
+	for _, candidate := range s.maintenanceQueue {
+		if authMaintenanceCandidateEnabled(candidate, genericEnabled, webDeadEnabled) {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Service) authMaintenanceCandidateQueued(candidate authMaintenanceCandidate) bool {
@@ -1086,6 +1225,42 @@ func (s *Service) authMaintenanceCandidateQueued(candidate authMaintenanceCandid
 	s.maintenanceMu.Lock()
 	defer s.maintenanceMu.Unlock()
 	_, exists := s.maintenancePending[key]
+	return exists
+}
+
+func (s *Service) authMaintenanceCandidateQueuedForEnabledPolicy(candidate authMaintenanceCandidate, genericEnabled, webDeadEnabled bool) bool {
+	if s == nil {
+		return false
+	}
+	key := strings.TrimSpace(candidate.Key)
+	if key == "" {
+		return false
+	}
+	s.ensureAuthMaintenanceQueue()
+	s.maintenanceMu.Lock()
+	defer s.maintenanceMu.Unlock()
+	for index, queued := range s.maintenanceQueue {
+		if strings.TrimSpace(queued.Key) != key {
+			continue
+		}
+		if isChatGPTWebDeadMaintenanceCandidate(candidate) && !isChatGPTWebDeadMaintenanceCandidate(queued) {
+			s.maintenanceQueue = append(s.maintenanceQueue[:index], s.maintenanceQueue[index+1:]...)
+			delete(s.maintenancePending, key)
+			s.maintenanceGeneration[key]++
+			return false
+		}
+		if authMaintenanceCandidateEnabled(queued, genericEnabled, webDeadEnabled) {
+			return true
+		}
+		s.maintenanceQueue = append(s.maintenanceQueue[:index], s.maintenanceQueue[index+1:]...)
+		delete(s.maintenancePending, key)
+		s.maintenanceGeneration[key]++
+		return false
+	}
+	_, exists := s.maintenancePending[key]
+	if !exists && isChatGPTWebDeadMaintenanceCandidate(candidate) {
+		s.maintenanceGeneration[key]++
+	}
 	return exists
 }
 
@@ -1258,20 +1433,65 @@ func (s *Service) authMaintenanceCandidateForID(id, authDir, reason string) (aut
 	return s.authMaintenanceCandidateForAuth(auth, authDir, reason)
 }
 
+func (s *Service) snapshotAuthMaintenanceCandidateInstallations(candidate authMaintenanceCandidate, authDir string) (authMaintenanceCandidate, bool) {
+	if s == nil || s.coreManager == nil || len(candidate.IDs) == 0 {
+		return authMaintenanceCandidate{}, false
+	}
+	installations := make(map[string]string, len(candidate.IDs))
+	for _, id := range candidate.IDs {
+		id = strings.TrimSpace(id)
+		current, ok := s.coreManager.GetByID(id)
+		if !ok || current == nil || current.RuntimeInstallationID() == "" {
+			return authMaintenanceCandidate{}, false
+		}
+		if path := strings.TrimSpace(candidate.Path); path != "" && resolveAuthFilePath(current, authDir) != path {
+			return authMaintenanceCandidate{}, false
+		}
+		installations[id] = current.RuntimeInstallationID()
+	}
+	candidate.Installations = installations
+	return candidate, true
+}
+
 func (s *Service) scanAuthMaintenanceCandidates(cfg config.AuthMaintenanceConfig, authDir string) []authMaintenanceCandidate {
-	if s == nil || s.coreManager == nil || !cfg.Enable {
+	return s.scanAuthMaintenanceCandidatesWithPolicy(cfg, chatGPTWebDeadAuthDeletePolicy{}, authDir)
+}
+
+func (s *Service) scanAuthMaintenanceCandidatesWithPolicy(cfg config.AuthMaintenanceConfig, webPolicy chatGPTWebDeadAuthDeletePolicy, authDir string) []authMaintenanceCandidate {
+	if s == nil || s.coreManager == nil || (!cfg.Enable && !webPolicy.enabled) {
 		return nil
 	}
 	snapshot := s.coreManager.List()
+	idsByPath := make(map[string][]string)
+	for _, current := range snapshot {
+		path := resolveAuthFilePath(current, authDir)
+		id := ""
+		if current != nil {
+			id = strings.TrimSpace(current.ID)
+		}
+		if path == "" || id == "" {
+			continue
+		}
+		idsByPath[path] = append(idsByPath[path], id)
+	}
 	grouped := make(map[string]authMaintenanceCandidate)
 	for _, auth := range snapshot {
-		reason, ok := authEligibleForMaintenanceDelete(auth, nil, cfg)
+		reason, ok := authEligibleForChatGPTWebDeadDelete(auth, webPolicy)
+		if !ok && cfg.Enable {
+			reason, ok = authEligibleForMaintenanceDelete(auth, nil, cfg)
+		}
 		if !ok {
 			continue
 		}
-		candidate, ok := s.authMaintenanceCandidateForAuth(auth, authDir, reason)
-		if !ok || strings.TrimSpace(candidate.Path) == "" {
+		path := resolveAuthFilePath(auth, authDir)
+		if path == "" {
 			continue
+		}
+		candidate := authMaintenanceCandidate{
+			Key:    path,
+			Path:   path,
+			IDs:    append([]string(nil), idsByPath[path]...),
+			Reason: strings.TrimSpace(reason),
 		}
 		group := grouped[candidate.Key]
 		if group.Key == "" {
@@ -1298,6 +1518,39 @@ func (s *Service) scanAuthMaintenanceCandidates(cfg config.AuthMaintenanceConfig
 		candidates = append(candidates, candidate)
 	}
 	return candidates
+}
+
+func (s *Service) reconcilePersistedChatGPTWebDeadMaintenanceCandidates(ctx context.Context, policy chatGPTWebDeadAuthDeletePolicy, authDir string) bool {
+	if s == nil || s.coreManager == nil {
+		return false
+	}
+	retry := false
+	for _, auth := range s.coreManager.List() {
+		if !authMaintenancePendingDelete(auth) {
+			continue
+		}
+		reason := authMaintenanceReason(auth)
+		candidate, ok := s.authMaintenanceCandidateForAuth(auth, authDir, reason)
+		if !ok || !isChatGPTWebDeadMaintenanceCandidate(candidate) {
+			continue
+		}
+		candidate, ok = s.snapshotAuthMaintenanceCandidateInstallations(candidate, authDir)
+		if !ok {
+			retry = true
+			continue
+		}
+		if _, eligible := authEligibleForChatGPTWebDeadDelete(auth, policy); !eligible {
+			if err := s.clearChatGPTWebDeadMaintenanceCandidate(ctx, candidate); err != nil {
+				log.WithError(err).Warnf("failed to clear stale ChatGPT Web maintenance state for %s", candidate.Path)
+				retry = true
+			}
+			continue
+		}
+		if !s.authMaintenanceCandidateQueued(candidate) {
+			s.enqueueAuthMaintenanceCandidate(candidate)
+		}
+	}
+	return retry
 }
 
 func (s *Service) scanAuthMaintenanceDisableCandidates(cfg config.AuthMaintenanceConfig, authDir string) []authMaintenanceCandidate {
@@ -1364,68 +1617,106 @@ func (s *Service) startAuthMaintenance(parent context.Context) {
 	go func() {
 		defer close(done)
 		var lastDeleteAt time.Time
+		var lastWebPolicy chatGPTWebDeadAuthDeletePolicy
+		var hasLastWebPolicy bool
+		reconcilePersistedWebState := true
+		var nextPersistedWebReconcileAt time.Time
 		for {
 			cfg, authDir := s.snapshotAuthMaintenanceConfig()
+			webPolicy := s.snapshotChatGPTWebDeadAuthDeletePolicy()
 			s.warnAuthMaintenanceConfig(cfg)
+			enabled := cfg.Enable || webPolicy.enabled
+			if !hasLastWebPolicy || !chatGPTWebDeadAuthDeletePoliciesEqual(lastWebPolicy, webPolicy) {
+				lastWebPolicy = webPolicy
+				hasLastWebPolicy = true
+				reconcilePersistedWebState = true
+				nextPersistedWebReconcileAt = time.Time{}
+			}
+			if reconcilePersistedWebState && (nextPersistedWebReconcileAt.IsZero() || !time.Now().Before(nextPersistedWebReconcileAt)) {
+				if s.reconcilePersistedChatGPTWebDeadMaintenanceCandidates(ctx, webPolicy, authDir) {
+					nextPersistedWebReconcileAt = time.Now().Add(authMaintenanceDisabledPollInterval)
+				} else {
+					reconcilePersistedWebState = false
+					nextPersistedWebReconcileAt = time.Time{}
+				}
+			}
 
-			if cfg.Enable {
-				if candidate, ok := s.dequeueAuthMaintenanceCandidate(); ok {
-					if s.authMaintenanceCandidateCanceled(candidate) {
-						continue
-					}
-					deleteInterval := time.Duration(cfg.DeleteIntervalSeconds) * time.Second
-					if deleteInterval <= 0 {
-						deleteInterval = time.Duration(defaultMaintenanceDeleteIntervalSeconds) * time.Second
-					}
-					if !lastDeleteAt.IsZero() {
-						wait := deleteInterval - time.Since(lastDeleteAt)
-						if wait > 0 {
-							timer := time.NewTimer(wait)
-							select {
-							case <-ctx.Done():
-								if !timer.Stop() {
-									select {
-									case <-timer.C:
-									default:
-									}
-								}
-								return
-							case <-timer.C:
-							}
-						}
-					}
-					if s.authMaintenanceCandidateCanceled(candidate) {
-						continue
-					}
-					deleted, err := s.deleteAuthMaintenanceCandidate(ctx, candidate)
-					if err != nil {
-						log.WithError(err).Warnf("auth maintenance delete failed for %s", candidate.Path)
-					} else if deleted {
-						lastDeleteAt = time.Now()
-					}
+			if candidate, ok := s.dequeueProcessableAuthMaintenanceCandidate(cfg.Enable); ok {
+				if s.authMaintenanceCandidateCanceled(candidate) {
 					continue
 				}
-				for _, candidate := range s.scanAuthMaintenanceCandidates(cfg, authDir) {
-					if s.authMaintenanceCandidateQueued(candidate) {
+				deleteInterval := time.Duration(cfg.DeleteIntervalSeconds) * time.Second
+				if deleteInterval <= 0 {
+					deleteInterval = time.Duration(defaultMaintenanceDeleteIntervalSeconds) * time.Second
+				}
+				if !lastDeleteAt.IsZero() {
+					wait := deleteInterval - time.Since(lastDeleteAt)
+					if wait > 0 {
+						timer := time.NewTimer(wait)
+						select {
+						case <-ctx.Done():
+							if !timer.Stop() {
+								select {
+								case <-timer.C:
+								default:
+								}
+							}
+							return
+						case <-timer.C:
+						}
+					}
+				}
+				if s.authMaintenanceCandidateCanceled(candidate) {
+					continue
+				}
+				deleted, err := s.deleteAuthMaintenanceCandidate(ctx, candidate)
+				if err != nil {
+					log.WithError(err).Warnf("auth maintenance delete failed for %s", candidate.Path)
+					lastDeleteAt = time.Now()
+				} else if deleted {
+					lastDeleteAt = time.Now()
+					continue
+				} else {
+					continue
+				}
+			}
+
+			if enabled {
+				for _, candidate := range s.scanAuthMaintenanceCandidatesWithPolicy(cfg, webPolicy, authDir) {
+					if s.authMaintenanceCandidateQueuedForEnabledPolicy(candidate, cfg.Enable, webPolicy.enabled) {
 						continue
 					}
 					if !s.disableAuthMaintenanceCandidate(context.Background(), candidate, true) {
 						continue
 					}
+					if isChatGPTWebDeadMaintenanceCandidate(candidate) {
+						snapshot, snapshotOK := s.snapshotAuthMaintenanceCandidateInstallations(candidate, authDir)
+						if !snapshotOK {
+							continue
+						}
+						candidate = snapshot
+					}
 					if s.enqueueAuthMaintenanceCandidate(candidate) {
 						log.Debugf("auth maintenance queued %s (%s)", candidate.Path, candidate.Reason)
 					}
 				}
-				for _, candidate := range s.scanAuthMaintenanceDisableCandidates(cfg, authDir) {
-					s.disableAuthMaintenanceCandidate(context.Background(), candidate, false)
+				if cfg.Enable {
+					for _, candidate := range s.scanAuthMaintenanceDisableCandidates(cfg, authDir) {
+						s.disableAuthMaintenanceCandidate(context.Background(), candidate, false)
+					}
 				}
-				if s.hasQueuedAuthMaintenanceCandidates() {
+				if s.hasEnabledAuthMaintenanceCandidates(cfg.Enable, webPolicy.enabled) {
 					continue
+				}
+			}
+			if s.authMaintenanceDependencyReconcileRequired() {
+				if _, err := s.reconcileChatGPTWebDependencies(ctx, "auth maintenance retry"); err == nil {
+					s.setAuthMaintenanceDependencyReconcilePending(false)
 				}
 			}
 
 			wait := authMaintenanceDisabledPollInterval
-			if cfg.Enable {
+			if enabled {
 				wait = time.Duration(cfg.ScanIntervalSeconds) * time.Second
 			}
 			timer := time.NewTimer(wait)
@@ -1474,7 +1765,8 @@ func (s *Service) handleAuthMaintenanceResult(_ context.Context, result coreauth
 		return
 	}
 	cfg, authDir := s.snapshotAuthMaintenanceConfig()
-	if !cfg.Enable {
+	webPolicy := s.snapshotChatGPTWebDeadAuthDeletePolicy()
+	if !cfg.Enable && !webPolicy.enabled {
 		return
 	}
 	authID := strings.TrimSpace(result.AuthID)
@@ -1485,7 +1777,11 @@ func (s *Service) handleAuthMaintenanceResult(_ context.Context, result coreauth
 	if !ok || auth == nil {
 		return
 	}
-	if reason, ok := authEligibleForMaintenanceDelete(auth, &result, cfg); ok {
+	reason, deleteEligible := authEligibleForChatGPTWebDeadDelete(auth, webPolicy)
+	if !deleteEligible && cfg.Enable {
+		reason, deleteEligible = authEligibleForMaintenanceDelete(auth, &result, cfg)
+	}
+	if deleteEligible {
 		candidate, candidateOK := s.authMaintenanceCandidateForAuth(auth, authDir, reason)
 		if !candidateOK {
 			return
@@ -1494,8 +1790,17 @@ func (s *Service) handleAuthMaintenanceResult(_ context.Context, result coreauth
 			s.disableAuthMaintenanceCandidate(context.Background(), candidate, false)
 			return
 		}
+		if s.authMaintenanceCandidateQueuedForEnabledPolicy(candidate, cfg.Enable, webPolicy.enabled) {
+			return
+		}
 		if !s.disableAuthMaintenanceCandidate(context.Background(), candidate, true) {
 			return
+		}
+		if isChatGPTWebDeadMaintenanceCandidate(candidate) {
+			candidate, candidateOK = s.snapshotAuthMaintenanceCandidateInstallations(candidate, authDir)
+			if !candidateOK {
+				return
+			}
 		}
 		if s.enqueueAuthMaintenanceCandidate(candidate) {
 			s.wakeAuthMaintenance()
@@ -1525,6 +1830,132 @@ func (s *Service) disableAuthMaintenanceCandidate(ctx context.Context, candidate
 }
 
 func (s *Service) deleteAuthMaintenanceCandidate(ctx context.Context, candidate authMaintenanceCandidate) (bool, error) {
+	if s == nil {
+		return false, nil
+	}
+	webDeadCandidate := isChatGPTWebDeadMaintenanceCandidate(candidate)
+	if s.coreManager == nil || (!webDeadCandidate && !s.authMaintenanceCandidateContainsNativeChatGPTWeb(candidate)) {
+		return s.deleteAuthMaintenanceCandidateUnchecked(ctx, candidate)
+	}
+	var deleted bool
+	err := s.coreManager.WithChatGPTWebDependencyMutation(ctx, func(lockedCtx context.Context) error {
+		if webDeadCandidate {
+			_, authDir := s.snapshotAuthMaintenanceConfig()
+			policy := s.snapshotChatGPTWebDeadAuthDeletePolicy()
+			if !s.chatGPTWebDeadMaintenanceCandidateStillEligible(candidate, policy, authDir) {
+				return s.clearChatGPTWebDeadMaintenanceCandidate(lockedCtx, candidate)
+			}
+		}
+		var errDelete error
+		deleted, errDelete = s.deleteAuthMaintenanceCandidateUnchecked(lockedCtx, candidate)
+		if errDelete == nil && deleted {
+			if _, errReconcile := s.reconcileChatGPTWebDependencies(lockedCtx, "chatgpt web auth maintenance delete"); errReconcile != nil {
+				s.setAuthMaintenanceDependencyReconcilePending(true)
+			}
+		}
+		return errDelete
+	})
+	return deleted, err
+}
+
+func (s *Service) authMaintenanceCandidateContainsNativeChatGPTWeb(candidate authMaintenanceCandidate) bool {
+	if s == nil || s.coreManager == nil {
+		return false
+	}
+	for _, id := range candidate.IDs {
+		auth, ok := s.coreManager.GetByID(strings.TrimSpace(id))
+		if ok && isNativeChatGPTWebAuth(auth) {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *Service) chatGPTWebDeadMaintenanceCandidateStillEligible(candidate authMaintenanceCandidate, policy chatGPTWebDeadAuthDeletePolicy, authDir string) bool {
+	if s == nil || s.coreManager == nil || !policy.enabled || !isChatGPTWebDeadMaintenanceCandidate(candidate) {
+		return false
+	}
+	path := strings.TrimSpace(candidate.Path)
+	if path == "" {
+		return false
+	}
+	expectedIDs := make(map[string]struct{}, len(candidate.IDs))
+	for _, id := range candidate.IDs {
+		if id = strings.TrimSpace(id); id != "" {
+			expectedIDs[id] = struct{}{}
+		}
+	}
+	if len(expectedIDs) == 0 || len(candidate.Installations) != len(expectedIDs) {
+		return false
+	}
+	matched := make(map[string]struct{}, len(expectedIDs))
+	for _, auth := range s.coreManager.List() {
+		if resolveAuthFilePath(auth, authDir) != path {
+			continue
+		}
+		id := ""
+		if auth != nil {
+			id = strings.TrimSpace(auth.ID)
+		}
+		if _, ok := expectedIDs[id]; !ok {
+			return false
+		}
+		if expectedInstallation := strings.TrimSpace(candidate.Installations[id]); expectedInstallation == "" || auth.RuntimeInstallationID() != expectedInstallation {
+			return false
+		}
+		if _, ok := authEligibleForChatGPTWebDeadDelete(auth, policy); !ok {
+			return false
+		}
+		if auth.Attributes == nil || strings.TrimSpace(auth.Attributes[coreauth.SourceHashAttributeKey]) == "" {
+			return false
+		}
+		if !authFileUpdateStillCurrentAtPath(auth, path) {
+			return false
+		}
+		matched[id] = struct{}{}
+	}
+	return len(matched) == len(expectedIDs)
+}
+
+func (s *Service) clearChatGPTWebDeadMaintenanceCandidate(ctx context.Context, candidate authMaintenanceCandidate) error {
+	if s == nil || s.coreManager == nil {
+		return nil
+	}
+	return s.coreManager.WithChatGPTWebDependencyMutation(ctx, func(lockedCtx context.Context) error {
+		for _, id := range candidate.IDs {
+			current, ok := s.coreManager.GetByID(strings.TrimSpace(id))
+			if !ok || current == nil || !authMaintenancePendingDelete(current) {
+				continue
+			}
+			if expected := strings.TrimSpace(candidate.Installations[current.ID]); expected != "" && current.RuntimeInstallationID() != expected {
+				continue
+			}
+			if reason := authMaintenanceReason(current); reason != "" && reason != strings.TrimSpace(candidate.Reason) {
+				continue
+			}
+			previousDisabled, _ := current.Metadata[authMaintenancePreviousDisabledKey].(bool)
+			delete(current.Metadata, authMaintenanceActionMetadataKey)
+			delete(current.Metadata, authMaintenanceReasonMetadataKey)
+			delete(current.Metadata, authMaintenanceMarkedAtMetadataKey)
+			delete(current.Metadata, authMaintenancePendingDeleteMetadataKey)
+			delete(current.Metadata, authMaintenancePreviousDisabledKey)
+			current.Disabled = previousDisabled
+			if previousDisabled {
+				current.Metadata["disabled"] = true
+			} else {
+				delete(current.Metadata, "disabled")
+			}
+			current.Unavailable = false
+			coreauth.ApplyLifecycleRuntimeState(current)
+			if _, err := s.coreManager.Update(lockedCtx, current); err != nil {
+				return fmt.Errorf("clear stale ChatGPT Web maintenance state for %s: %w", current.ID, err)
+			}
+		}
+		return nil
+	})
+}
+
+func (s *Service) deleteAuthMaintenanceCandidateUnchecked(ctx context.Context, candidate authMaintenanceCandidate) (bool, error) {
 	if s == nil {
 		return false, nil
 	}
@@ -2222,6 +2653,7 @@ func (s *Service) applyCoreAuthRemovalWithReason(ctx context.Context, id string,
 	}
 
 	now := time.Now().UTC()
+	previousDisabled := existing.Disabled
 	existing.Disabled = true
 	existing.Unavailable = true
 	existing.Status = coreauth.StatusDisabled
@@ -2241,6 +2673,9 @@ func (s *Service) applyCoreAuthRemovalWithReason(ctx context.Context, id string,
 	}
 	existing.Metadata["disabled"] = true
 	if pendingDelete {
+		if _, exists := existing.Metadata[authMaintenancePreviousDisabledKey]; !exists {
+			existing.Metadata[authMaintenancePreviousDisabledKey] = previousDisabled
+		}
 		existing.Metadata[authMaintenanceActionMetadataKey] = authMaintenanceDeleteAction
 		existing.Metadata[authMaintenancePendingDeleteMetadataKey] = true
 	} else {

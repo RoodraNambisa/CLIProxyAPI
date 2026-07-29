@@ -55,6 +55,10 @@ api-keys:
 # password/TOTP material and is disabled by default.
 chatgpt-web:
   auto-relogin: false
+  # Remove credentials only after ChatGPT Web confirms the account lifecycle is dead.
+  auto-delete-dead-auths: false
+  # Empty matches every priority; otherwise only exact integer priorities are removed.
+  auto-delete-dead-priorities: []
   # The initial background login is followed by at most this many retries.
   auto-relogin-max-retries: 3
   # Apply symmetric jitter to retry delays to avoid synchronized login bursts.

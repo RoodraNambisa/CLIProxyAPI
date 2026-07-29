@@ -445,6 +445,11 @@ type CodexConfig struct {
 type ChatGPTWebConfig struct {
 	// AutoRelogin starts a background password login after a terminal refresh failure.
 	AutoRelogin bool `yaml:"auto-relogin" json:"auto-relogin"`
+	// AutoDeleteDeadAuths removes credentials whose lifecycle is permanently dead.
+	AutoDeleteDeadAuths bool `yaml:"auto-delete-dead-auths" json:"auto-delete-dead-auths"`
+	// AutoDeleteDeadPriorities limits dead credential deletion to these priorities.
+	// An empty list matches every priority.
+	AutoDeleteDeadPriorities []int `yaml:"auto-delete-dead-priorities,omitempty" json:"auto-delete-dead-priorities,omitempty"`
 	// AutoReloginMaxRetries limits retries after the initial background login attempt.
 	AutoReloginMaxRetries *int `yaml:"auto-relogin-max-retries,omitempty" json:"auto-relogin-max-retries,omitempty"`
 	// AutoReloginJitterPercent applies symmetric jitter to background retry delays.
