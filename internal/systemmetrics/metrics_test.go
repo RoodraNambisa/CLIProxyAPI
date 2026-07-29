@@ -18,6 +18,7 @@ func TestCollectFilesystemUsesNearestExistingAncestor(t *testing.T) {
 			totalBytes:     1_000,
 			freeBytes:      400,
 			availableBytes: 350,
+			filesystemID:   "test-filesystem",
 		}, nil
 	}
 
@@ -27,6 +28,9 @@ func TestCollectFilesystemUsesNearestExistingAncestor(t *testing.T) {
 	}
 	if capturedPath != root || snapshot.Path != root {
 		t.Fatalf("probe path = %q, snapshot path = %q, want %q", capturedPath, snapshot.Path, root)
+	}
+	if snapshot.FilesystemID != "test-filesystem" {
+		t.Fatalf("filesystem ID = %q, want test-filesystem", snapshot.FilesystemID)
 	}
 	if snapshot.TotalBytes != 1_000 || snapshot.UsedBytes != 600 ||
 		snapshot.FreeBytes != 400 || snapshot.AvailableBytes != 350 ||

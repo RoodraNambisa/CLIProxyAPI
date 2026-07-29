@@ -56,6 +56,9 @@ func TestGetChatGPTWebUsageCacheReturnsDefaultsAndRuntimeStats(t *testing.T) {
 	if !response.EstimateTokenUsage || response.UsageCache.Enabled ||
 		response.UsageCache.DiskThresholdMB != config.DefaultChatGPTWebUsageCacheThresholdMB ||
 		response.UsageCache.MaxDiskSizeMB != config.DefaultChatGPTWebUsageCacheMaxDiskSizeMB ||
+		!response.UsageCache.ResourceGuardEnabled ||
+		response.UsageCache.MinAvailableDiskMB != config.DefaultChatGPTWebUsageCacheMinAvailableMB ||
+		response.UsageCache.MaxFilesystemUsedPercent != config.DefaultChatGPTWebUsageCacheMaxUsedPercent ||
 		response.ImageUsage.AutoOutputQuality != "medium" {
 		t.Fatalf("GET response config = %#v", response)
 	}
@@ -77,7 +80,15 @@ func TestPatchChatGPTWebUsageCachePersistsAndUpdatesRuntime(t *testing.T) {
 	handler := &Handler{cfg: &config.Config{}, configFilePath: configPath, authManager: manager}
 	body := `{
 		"estimate-token-usage":false,
-		"usage-cache":{"enabled":true,"disk-threshold-mb":2,"max-disk-size-mb":16,"path":"/tmp/web-usage"},
+		"usage-cache":{
+			"enabled":true,
+			"disk-threshold-mb":2,
+			"max-disk-size-mb":16,
+			"resource-guard-enabled":false,
+			"min-available-disk-mb":4,
+			"max-filesystem-used-percent":90,
+			"path":"/tmp/web-usage"
+		},
 		"image-usage":{"auto-output-quality":"high"}
 	}`
 	ctx, recorder := newChatGPTWebUsageCacheRequest(http.MethodPatch, body)
@@ -86,7 +97,12 @@ func TestPatchChatGPTWebUsageCachePersistsAndUpdatesRuntime(t *testing.T) {
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("PATCH status = %d, want 200: %s", recorder.Code, recorder.Body.String())
 	}
-	if executor.updates != 1 || !executor.resolved.Enabled || executor.resolved.DiskThresholdMB != 2 {
+	if executor.updates != 1 ||
+		!executor.resolved.Enabled ||
+		executor.resolved.DiskThresholdMB != 2 ||
+		executor.resolved.ResourceGuardEnabled ||
+		executor.resolved.MinAvailableDiskMB != 4 ||
+		executor.resolved.MaxFilesystemUsedPercent != 90 {
 		t.Fatalf("runtime update = count %d, config %#v", executor.updates, executor.resolved)
 	}
 	reloaded, errLoad := config.LoadConfig(configPath)

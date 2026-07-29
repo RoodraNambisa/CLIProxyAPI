@@ -175,6 +175,34 @@ func TestFinishChatGPTWebSearchWrapsBootstrapProtocolFailure(t *testing.T) {
 	}
 }
 
+func TestChatGPTWebUsageCacheStatusErrorHidesInternalDetails(t *testing.T) {
+	err := chatGPTWebUsageCacheStatusError(&helps.ChatGPTWebUsageCacheError{
+		Code:    "chatgpt_web_usage_cache_disk_pressure",
+		Message: "chatgpt web usage cache disk resource threshold is exceeded",
+	})
+	var status interface{ StatusCode() int }
+	if !errors.As(err, &status) || status.StatusCode() != http.StatusServiceUnavailable {
+		t.Fatalf("status error = %v", err)
+	}
+	var skipper interface{ SkipAuthResult() bool }
+	if !errors.As(err, &skipper) || !skipper.SkipAuthResult() {
+		t.Fatalf("SkipAuthResult() error = %v", err)
+	}
+	if !strings.Contains(err.Error(), `"code":"resource_exhausted"`) ||
+		strings.Contains(err.Error(), "chatgpt_web_usage_cache") {
+		t.Fatalf("client error leaked internal cache details: %v", err)
+	}
+}
+
+func TestChatGPTWebUsageCacheMegabytesToBytesSaturates(t *testing.T) {
+	if got := chatGPTWebUsageCacheMegabytesToBytes(config.MaxChatGPTWebUsageCacheMegabytes); got <= 0 {
+		t.Fatalf("maximum supported conversion = %d", got)
+	}
+	if got := chatGPTWebUsageCacheMegabytesToBytes(config.MaxChatGPTWebUsageCacheMegabytes + 1); got != 1<<63-1 {
+		t.Fatalf("overflow conversion = %d, want MaxInt64", got)
+	}
+}
+
 func TestFinishChatGPTWebSearchClosesBootstrapBeforePolling(t *testing.T) {
 	body := &chatGPTWebTrackedBody{Reader: strings.NewReader(
 		"data: {\"conversation_id\":\"search-closed\"}\n\ndata: [DONE]\n\n",

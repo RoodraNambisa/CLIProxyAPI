@@ -1349,6 +1349,17 @@ func TestOpenAIImagesNonStreamingErrorsWithoutImageOutput(t *testing.T) {
 		response: []byte(`{"created_at":1700000000,"output":[{"type":"message","content":[{"type":"output_text","text":"blocked"}]}],"usage":{"total_tokens":9}}`),
 	}
 	h := newImagesTestHandler(t, executor)
+	replacement := map[string]any{"error": map[string]any{
+		"message": "Your request was rejected by the safety system.",
+		"type":    "image_generation_user_error",
+		"code":    "moderation_blocked",
+	}}
+	h.Cfg.ErrorResponseRewrites = []sdkconfig.ErrorResponseRewriteRule{{
+		StatusCode:         http.StatusBadGateway,
+		MessageContains:    "upstream did not return image output",
+		ResponseStatusCode: http.StatusBadRequest,
+		ResponseBody:       &replacement,
+	}}
 	router := gin.New()
 	router.POST("/v1/images/generations", h.Generations)
 
@@ -1357,11 +1368,12 @@ func TestOpenAIImagesNonStreamingErrorsWithoutImageOutput(t *testing.T) {
 	resp := httptest.NewRecorder()
 	router.ServeHTTP(resp, req)
 
-	if resp.Code != http.StatusBadGateway {
-		t.Fatalf("status = %d, want %d, body=%s", resp.Code, http.StatusBadGateway, resp.Body.String())
+	if resp.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d, body=%s", resp.Code, http.StatusBadRequest, resp.Body.String())
 	}
-	if !strings.Contains(resp.Body.String(), "upstream did not return image output") {
-		t.Fatalf("error message missing: %s", resp.Body.String())
+	if !strings.Contains(resp.Body.String(), "moderation_blocked") ||
+		strings.Contains(resp.Body.String(), "upstream did not return image output") {
+		t.Fatalf("rewritten error missing or leaked original detail: %s", resp.Body.String())
 	}
 }
 

@@ -408,8 +408,11 @@ func (e *ChatGPTWebExecutor) prepareRuntimeRequest(ctx context.Context, auth *cl
 	var usageProjection *helps.ChatGPTWebUsageProjection
 	if cfg == nil || cfg.ChatGPTWeb.TokenUsageEstimationEnabled() {
 		resolvedCache := config.ResolvedChatGPTWebUsageCacheConfig{
-			DiskThresholdMB: config.DefaultChatGPTWebUsageCacheThresholdMB,
-			MaxDiskSizeMB:   config.DefaultChatGPTWebUsageCacheMaxDiskSizeMB,
+			DiskThresholdMB:          config.DefaultChatGPTWebUsageCacheThresholdMB,
+			MaxDiskSizeMB:            config.DefaultChatGPTWebUsageCacheMaxDiskSizeMB,
+			ResourceGuardEnabled:     true,
+			MinAvailableDiskMB:       config.DefaultChatGPTWebUsageCacheMinAvailableMB,
+			MaxFilesystemUsedPercent: config.DefaultChatGPTWebUsageCacheMaxUsedPercent,
 		}
 		autoOutputQuality := config.DefaultChatGPTWebAutoOutputQuality
 		if cfg != nil {
@@ -417,11 +420,14 @@ func (e *ChatGPTWebExecutor) prepareRuntimeRequest(ctx context.Context, auth *cl
 			autoOutputQuality = cfg.ChatGPTWeb.ImageUsage.ResolvedAutoOutputQuality()
 		}
 		usageProjection, err = e.usageCache.NewProjection(routeModel, parsed, helps.ChatGPTWebUsageCacheOptions{
-			Enabled:            resolvedCache.Enabled,
-			DiskThresholdBytes: resolvedCache.DiskThresholdMB << 20,
-			MaxDiskBytes:       resolvedCache.MaxDiskSizeMB << 20,
-			Path:               resolvedCache.Path,
-			AutoOutputQuality:  autoOutputQuality,
+			Enabled:                  resolvedCache.Enabled,
+			DiskThresholdBytes:       chatGPTWebUsageCacheMegabytesToBytes(resolvedCache.DiskThresholdMB),
+			MaxDiskBytes:             chatGPTWebUsageCacheMegabytesToBytes(resolvedCache.MaxDiskSizeMB),
+			ResourceGuardEnabled:     resolvedCache.ResourceGuardEnabled,
+			MinAvailableDiskBytes:    chatGPTWebUsageCacheMegabytesToBytes(resolvedCache.MinAvailableDiskMB),
+			MaxFilesystemUsedPercent: resolvedCache.MaxFilesystemUsedPercent,
+			Path:                     resolvedCache.Path,
+			AutoOutputQuality:        autoOutputQuality,
 		})
 		if err != nil {
 			return nil, chatGPTWebUsageCacheStatusError(err)
@@ -447,22 +453,21 @@ func (e *ChatGPTWebExecutor) prepareRuntimeRequest(ctx context.Context, auth *cl
 	}, nil
 }
 
-func chatGPTWebUsageCacheStatusError(err error) error {
-	code := "chatgpt_web_usage_cache_unavailable"
-	message := "chatgpt web usage cache is unavailable"
-	var cacheErr *helps.ChatGPTWebUsageCacheError
-	if errors.As(err, &cacheErr) && cacheErr != nil {
-		if strings.TrimSpace(cacheErr.Code) != "" {
-			code = strings.TrimSpace(cacheErr.Code)
-		}
-		if strings.TrimSpace(cacheErr.Message) != "" {
-			message = strings.TrimSpace(cacheErr.Message)
-		}
+func chatGPTWebUsageCacheMegabytesToBytes(megabytes int64) int64 {
+	if megabytes <= 0 {
+		return 0
 	}
+	if megabytes > config.MaxChatGPTWebUsageCacheMegabytes {
+		return 1<<63 - 1
+	}
+	return megabytes << 20
+}
+
+func chatGPTWebUsageCacheStatusError(_ error) error {
 	payload, _ := json.Marshal(map[string]any{"error": map[string]any{
-		"message": message,
+		"message": "server resource capacity is temporarily exhausted",
 		"type":    "server_error",
-		"code":    code,
+		"code":    "resource_exhausted",
 	}})
 	return statusErr{code: http.StatusServiceUnavailable, msg: string(payload), skipAuthResult: true}
 }

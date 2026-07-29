@@ -230,6 +230,48 @@ func TestForwardStreamSurfacesErrorCreatedByWriteDone(t *testing.T) {
 	}
 }
 
+func TestForwardStreamRewritesLocalTerminalErrorBeforeFirstPayload(t *testing.T) {
+	body := map[string]any{"error": map[string]any{"code": "moderation_blocked"}}
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodGet, "/stream", nil)
+	h := NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, nil)
+	flusher := &countingFlusher{}
+	h.Cfg.ErrorResponseRewrites = []sdkconfig.ErrorResponseRewriteRule{{
+		StatusCode:         http.StatusBadGateway,
+		MessageContains:    "did not return image output",
+		ResponseStatusCode: http.StatusBadRequest,
+		ResponseBody:       &body,
+	}}
+	data := make(chan []byte)
+	errs := make(chan *interfaces.ErrorMessage)
+	close(data)
+	close(errs)
+	var fatal error
+	terminalCalled := false
+
+	h.ForwardStream(c, flusher, func(error) {}, data, errs, StreamForwardOptions{
+		WriteDone: func() {
+			fatal = errors.New("upstream did not return image output")
+		},
+		ChunkError: func() error {
+			return fatal
+		},
+		WriteTerminalError: func(*interfaces.ErrorMessage) {
+			terminalCalled = true
+		},
+	})
+
+	if terminalCalled {
+		t.Fatal("rewritten preflight error used the committed-stream callback")
+	}
+	if recorder.Code != http.StatusBadRequest ||
+		!strings.Contains(recorder.Body.String(), "moderation_blocked") {
+		t.Fatalf("response = status %d body %q", recorder.Code, recorder.Body.String())
+	}
+}
+
 func TestForwardStreamWritesProjectedErrorAsHTTPBeforeFirstPayload(t *testing.T) {
 	body := map[string]any{"error": map[string]any{"message": "rewritten"}}
 	h, c, flusher := newForwardStreamTestContext(t)
@@ -267,6 +309,37 @@ func TestForwardStreamWritesProjectedErrorAsHTTPBeforeFirstPayload(t *testing.T)
 	}
 	if value := c.Writer.Header().Get("X-Request-Id"); value != "request-1" {
 		t.Fatalf("X-Request-Id = %q", value)
+	}
+}
+
+func TestForwardStreamDoesNotRewriteUnclassifiedTerminalError(t *testing.T) {
+	body := map[string]any{"error": map[string]any{"code": "rewritten"}}
+	h, c, flusher := newForwardStreamTestContext(t)
+	h.Cfg.ErrorResponseRewrites = []sdkconfig.ErrorResponseRewriteRule{{
+		StatusCode:         http.StatusForbidden,
+		MessageContains:    "provider_not_allowed",
+		ResponseStatusCode: http.StatusBadRequest,
+		ResponseBody:       &body,
+	}}
+	data := make(chan []byte)
+	errs := make(chan *interfaces.ErrorMessage, 1)
+	close(data)
+	errs <- &interfaces.ErrorMessage{
+		StatusCode: http.StatusForbidden,
+		Error:      errors.New("provider_not_allowed"),
+	}
+	close(errs)
+	var terminal *interfaces.ErrorMessage
+
+	h.ForwardStream(c, flusher, func(error) {}, data, errs, StreamForwardOptions{
+		WriteTerminalError: func(errMsg *interfaces.ErrorMessage) {
+			terminal = errMsg
+		},
+	})
+
+	if terminal == nil || terminal.StatusCode != http.StatusForbidden ||
+		IsErrorResponseRewritten(terminal) {
+		t.Fatalf("terminal error = %#v, want unmodified 403", terminal)
 	}
 }
 

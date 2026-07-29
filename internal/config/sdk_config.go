@@ -42,7 +42,7 @@ type SDKConfig struct {
 	// Default is false (disabled).
 	PassthroughHeaders bool `yaml:"passthrough-headers" json:"passthrough-headers"`
 
-	// ErrorResponseRewrites changes only the final client-facing representation of runtime execution errors.
+	// ErrorResponseRewrites changes selected final runtime and local-conversion error responses.
 	ErrorResponseRewrites []ErrorResponseRewriteRule `yaml:"error-response-rewrites,omitempty" json:"error-response-rewrites,omitempty"`
 
 	// Streaming configures server-side streaming behavior (keep-alives and safe bootstrap retries).
@@ -87,7 +87,7 @@ type APIKeyGroup struct {
 	Providers []string `yaml:"providers" json:"providers"`
 }
 
-// ErrorResponseRewriteRule projects a matching runtime execution error to a client-facing status or JSON body.
+// ErrorResponseRewriteRule projects a matching final error to a client-facing status or JSON body.
 type ErrorResponseRewriteRule struct {
 	// StatusCode optionally restricts the rule to one original HTTP status code.
 	StatusCode int `yaml:"status-code,omitempty" json:"status-code,omitempty"`

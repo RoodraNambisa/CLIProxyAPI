@@ -626,10 +626,10 @@ func (h *BaseAPIHandler) ForwardStream(c *gin.Context, flusher http.Flusher, can
 				}
 				if opts.ChunkError != nil {
 					if errChunk := opts.ChunkError(); errChunk != nil {
-						writeTerminalError(&interfaces.ErrorMessage{
+						writeTerminalError(h.RewriteExecutionErrorResponse(&interfaces.ErrorMessage{
 							StatusCode: http.StatusBadGateway,
 							Error:      errChunk,
-						})
+						}))
 						cancel(errChunk)
 						return
 					}
@@ -652,10 +652,10 @@ func (h *BaseAPIHandler) ForwardStream(c *gin.Context, flusher http.Flusher, can
 			noteWrite(writtenBytes)
 			if opts.ChunkError != nil {
 				if errChunk := opts.ChunkError(); errChunk != nil {
-					writeTerminalError(&interfaces.ErrorMessage{
+					writeTerminalError(h.RewriteExecutionErrorResponse(&interfaces.ErrorMessage{
 						StatusCode: http.StatusBadGateway,
 						Error:      errChunk,
-					})
+					}))
 					cancel(errChunk)
 					return
 				}

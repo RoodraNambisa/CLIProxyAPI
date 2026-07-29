@@ -17,5 +17,6 @@ func platformFilesystemCapacity(path string) (filesystemCapacity, error) {
 		totalBytes:     saturatingMultiply(stat.F_blocks, blockSize),
 		freeBytes:      saturatingMultiply(stat.F_bfree, blockSize),
 		availableBytes: saturatingMultiply(nonNegativeInt64(stat.F_bavail), blockSize),
+		filesystemID:   filesystemIdentity(path),
 	}, nil
 }

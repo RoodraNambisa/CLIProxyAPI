@@ -264,6 +264,49 @@ func TestResponsesStreamingReturnsBadGatewayForInvalidFirstFrame(t *testing.T) {
 	}
 }
 
+func TestResponsesStreamingRewritesInvalidFirstFrame(t *testing.T) {
+	oversizedFrame := []byte("id: " + strings.Repeat("x", responsesSSEMaxPendingBytes))
+	executor := &responsesMetadataCaptureExecutor{chunks: [][]byte{oversizedFrame}}
+	manager := coreauth.NewManager(nil, nil, nil)
+	manager.RegisterExecutor(executor)
+	model := "responses-invalid-first-frame-rewrite"
+	auth := &coreauth.Auth{ID: model + "-auth", Provider: "codex", Status: coreauth.StatusActive}
+	if _, err := manager.Register(context.Background(), auth); err != nil {
+		t.Fatalf("register auth: %v", err)
+	}
+	registry.GetGlobalRegistry().RegisterClient(auth.ID, auth.Provider, []*registry.ModelInfo{{ID: model}})
+	defer registry.GetGlobalRegistry().UnregisterClient(auth.ID)
+
+	rewriteBody := map[string]any{"error": map[string]any{
+		"message": "stream frame rejected",
+		"code":    "stream_frame_rejected",
+	}}
+	h := NewOpenAIResponsesAPIHandler(handlers.NewBaseAPIHandlers(&sdkconfig.SDKConfig{
+		ErrorResponseRewrites: []sdkconfig.ErrorResponseRewriteRule{{
+			StatusCode:         http.StatusBadGateway,
+			ResponseStatusCode: http.StatusTooManyRequests,
+			ResponseBody:       &rewriteBody,
+		}},
+	}, manager))
+	router := gin.New()
+	router.POST("/v1/responses", h.Responses)
+	request := httptest.NewRequest(
+		http.MethodPost,
+		"/v1/responses",
+		strings.NewReader(fmt.Sprintf(`{"model":%q,"stream":true,"input":"hello"}`, model)),
+	)
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+
+	if response.Code != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want 429; body=%s", response.Code, response.Body.String())
+	}
+	if !strings.Contains(response.Body.String(), "stream_frame_rejected") {
+		t.Fatalf("rewritten response missing custom body: %s", response.Body.String())
+	}
+}
+
 func (e *responsesMetadataCaptureExecutor) Refresh(_ context.Context, auth *coreauth.Auth) (*coreauth.Auth, error) {
 	return auth, nil
 }

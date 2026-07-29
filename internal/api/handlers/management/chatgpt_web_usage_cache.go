@@ -25,10 +25,13 @@ type chatGPTWebUsageCacheRequest struct {
 }
 
 type chatGPTWebUsageCacheSettingsRequest struct {
-	Enabled         json.RawMessage `json:"enabled"`
-	DiskThresholdMB json.RawMessage `json:"disk-threshold-mb"`
-	MaxDiskSizeMB   json.RawMessage `json:"max-disk-size-mb"`
-	Path            json.RawMessage `json:"path"`
+	Enabled                  json.RawMessage `json:"enabled"`
+	DiskThresholdMB          json.RawMessage `json:"disk-threshold-mb"`
+	MaxDiskSizeMB            json.RawMessage `json:"max-disk-size-mb"`
+	ResourceGuardEnabled     json.RawMessage `json:"resource-guard-enabled"`
+	MinAvailableDiskMB       json.RawMessage `json:"min-available-disk-mb"`
+	MaxFilesystemUsedPercent json.RawMessage `json:"max-filesystem-used-percent"`
+	Path                     json.RawMessage `json:"path"`
 }
 
 type chatGPTWebImageUsageRequest struct {
@@ -229,7 +232,10 @@ func decodeChatGPTWebUsageCacheSettings(raw json.RawMessage) (chatGPTWebUsageCac
 }
 
 func (request chatGPTWebUsageCacheSettingsRequest) complete() bool {
-	return len(request.Enabled) > 0 && len(request.DiskThresholdMB) > 0 && len(request.MaxDiskSizeMB) > 0 && len(request.Path) > 0
+	return len(request.Enabled) > 0 &&
+		len(request.DiskThresholdMB) > 0 &&
+		len(request.MaxDiskSizeMB) > 0 &&
+		len(request.Path) > 0
 }
 
 func (request chatGPTWebUsageCacheSettingsRequest) apply(candidate *config.ChatGPTWebUsageCacheConfig) error {
@@ -239,6 +245,13 @@ func (request chatGPTWebUsageCacheSettingsRequest) apply(candidate *config.ChatG
 			return fmt.Errorf("invalid usage-cache.enabled")
 		}
 		candidate.Enabled = &value
+	}
+	if len(request.ResourceGuardEnabled) > 0 {
+		value, errValue := decodeSentinelBool(request.ResourceGuardEnabled)
+		if errValue != nil {
+			return fmt.Errorf("invalid usage-cache.resource-guard-enabled")
+		}
+		candidate.ResourceGuardEnabled = &value
 	}
 	decodeInt64 := func(name string, raw json.RawMessage, target **int64) error {
 		if len(raw) == 0 {
@@ -259,6 +272,19 @@ func (request chatGPTWebUsageCacheSettingsRequest) apply(candidate *config.ChatG
 	}
 	if errMax := decodeInt64("usage-cache.max-disk-size-mb", request.MaxDiskSizeMB, &candidate.MaxDiskSizeMB); errMax != nil {
 		return errMax
+	}
+	if errMinAvailable := decodeInt64("usage-cache.min-available-disk-mb", request.MinAvailableDiskMB, &candidate.MinAvailableDiskMB); errMinAvailable != nil {
+		return errMinAvailable
+	}
+	if len(request.MaxFilesystemUsedPercent) > 0 {
+		if bytes.Equal(bytes.TrimSpace(request.MaxFilesystemUsedPercent), []byte("null")) {
+			return fmt.Errorf("invalid usage-cache.max-filesystem-used-percent")
+		}
+		var value int
+		if errValue := json.Unmarshal(request.MaxFilesystemUsedPercent, &value); errValue != nil {
+			return fmt.Errorf("invalid usage-cache.max-filesystem-used-percent")
+		}
+		candidate.MaxFilesystemUsedPercent = &value
 	}
 	if len(request.Path) > 0 {
 		if bytes.Equal(bytes.TrimSpace(request.Path), []byte("null")) {

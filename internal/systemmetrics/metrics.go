@@ -25,6 +25,7 @@ type filesystemCapacity struct {
 	totalBytes     uint64
 	freeBytes      uint64
 	availableBytes uint64
+	filesystemID   string
 }
 
 type filesystemCapacityReader func(string) (filesystemCapacity, error)
@@ -33,6 +34,7 @@ type filesystemCapacityReader func(string) (filesystemCapacity, error)
 type FilesystemSnapshot struct {
 	Status         string  `json:"status"`
 	Path           string  `json:"path"`
+	FilesystemID   string  `json:"-"`
 	TotalBytes     uint64  `json:"total_bytes"`
 	UsedBytes      uint64  `json:"used_bytes"`
 	FreeBytes      uint64  `json:"free_bytes"`
@@ -86,6 +88,7 @@ func collectFilesystem(path string, readCapacity filesystemCapacityReader) Files
 	return FilesystemSnapshot{
 		Status:         FilesystemStatusOK,
 		Path:           probePath,
+		FilesystemID:   capacity.filesystemID,
 		TotalBytes:     capacity.totalBytes,
 		UsedBytes:      usedBytes,
 		FreeBytes:      capacity.freeBytes,

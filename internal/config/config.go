@@ -48,6 +48,9 @@ const (
 	MaxChatGPTWebSentinelSDKCacheVersions     = 5
 	DefaultChatGPTWebUsageCacheThresholdMB    = 1
 	DefaultChatGPTWebUsageCacheMaxDiskSizeMB  = 1024
+	DefaultChatGPTWebUsageCacheMinAvailableMB = 1024
+	DefaultChatGPTWebUsageCacheMaxUsedPercent = 95
+	MaxChatGPTWebUsageCacheMegabytes          = (1<<63 - 1) >> 20
 	DefaultChatGPTWebAutoOutputQuality        = "medium"
 	DefaultChatGPTWebImageUpstreamModel       = "gpt-5-5"
 	DefaultChatGPTWebAutoReloginMaxRetries    = 3
@@ -524,26 +527,35 @@ func (cfg ChatGPTWebConfig) TokenUsageEstimationEnabled() bool {
 
 // ChatGPTWebUsageCacheConfig controls optional disk spill for compact usage projections.
 type ChatGPTWebUsageCacheConfig struct {
-	Enabled         *bool  `yaml:"enabled,omitempty" json:"enabled,omitempty"`
-	DiskThresholdMB *int64 `yaml:"disk-threshold-mb,omitempty" json:"disk-threshold-mb,omitempty"`
-	MaxDiskSizeMB   *int64 `yaml:"max-disk-size-mb,omitempty" json:"max-disk-size-mb,omitempty"`
-	Path            string `yaml:"path,omitempty" json:"path,omitempty"`
+	Enabled                  *bool  `yaml:"enabled,omitempty" json:"enabled,omitempty"`
+	DiskThresholdMB          *int64 `yaml:"disk-threshold-mb,omitempty" json:"disk-threshold-mb,omitempty"`
+	MaxDiskSizeMB            *int64 `yaml:"max-disk-size-mb,omitempty" json:"max-disk-size-mb,omitempty"`
+	ResourceGuardEnabled     *bool  `yaml:"resource-guard-enabled,omitempty" json:"resource-guard-enabled,omitempty"`
+	MinAvailableDiskMB       *int64 `yaml:"min-available-disk-mb,omitempty" json:"min-available-disk-mb,omitempty"`
+	MaxFilesystemUsedPercent *int   `yaml:"max-filesystem-used-percent,omitempty" json:"max-filesystem-used-percent,omitempty"`
+	Path                     string `yaml:"path,omitempty" json:"path,omitempty"`
 }
 
 // ResolvedChatGPTWebUsageCacheConfig contains effective usage-cache values.
 type ResolvedChatGPTWebUsageCacheConfig struct {
-	Enabled         bool   `json:"enabled"`
-	DiskThresholdMB int64  `json:"disk-threshold-mb"`
-	MaxDiskSizeMB   int64  `json:"max-disk-size-mb"`
-	Path            string `json:"path"`
+	Enabled                  bool   `json:"enabled"`
+	DiskThresholdMB          int64  `json:"disk-threshold-mb"`
+	MaxDiskSizeMB            int64  `json:"max-disk-size-mb"`
+	ResourceGuardEnabled     bool   `json:"resource-guard-enabled"`
+	MinAvailableDiskMB       int64  `json:"min-available-disk-mb"`
+	MaxFilesystemUsedPercent int    `json:"max-filesystem-used-percent"`
+	Path                     string `json:"path"`
 }
 
 // Resolved returns effective usage-cache settings.
 func (cfg ChatGPTWebUsageCacheConfig) Resolved() ResolvedChatGPTWebUsageCacheConfig {
 	resolved := ResolvedChatGPTWebUsageCacheConfig{
-		DiskThresholdMB: DefaultChatGPTWebUsageCacheThresholdMB,
-		MaxDiskSizeMB:   DefaultChatGPTWebUsageCacheMaxDiskSizeMB,
-		Path:            strings.TrimSpace(cfg.Path),
+		DiskThresholdMB:          DefaultChatGPTWebUsageCacheThresholdMB,
+		MaxDiskSizeMB:            DefaultChatGPTWebUsageCacheMaxDiskSizeMB,
+		ResourceGuardEnabled:     true,
+		MinAvailableDiskMB:       DefaultChatGPTWebUsageCacheMinAvailableMB,
+		MaxFilesystemUsedPercent: DefaultChatGPTWebUsageCacheMaxUsedPercent,
+		Path:                     strings.TrimSpace(cfg.Path),
 	}
 	if cfg.Enabled != nil {
 		resolved.Enabled = *cfg.Enabled
@@ -553,6 +565,15 @@ func (cfg ChatGPTWebUsageCacheConfig) Resolved() ResolvedChatGPTWebUsageCacheCon
 	}
 	if cfg.MaxDiskSizeMB != nil {
 		resolved.MaxDiskSizeMB = *cfg.MaxDiskSizeMB
+	}
+	if cfg.ResourceGuardEnabled != nil {
+		resolved.ResourceGuardEnabled = *cfg.ResourceGuardEnabled
+	}
+	if cfg.MinAvailableDiskMB != nil {
+		resolved.MinAvailableDiskMB = *cfg.MinAvailableDiskMB
+	}
+	if cfg.MaxFilesystemUsedPercent != nil {
+		resolved.MaxFilesystemUsedPercent = *cfg.MaxFilesystemUsedPercent
 	}
 	return resolved
 }
@@ -568,6 +589,17 @@ func (cfg ChatGPTWebUsageCacheConfig) Validate() error {
 	}
 	if resolved.DiskThresholdMB > resolved.MaxDiskSizeMB {
 		return fmt.Errorf("chatgpt-web.usage-cache.disk-threshold-mb must not exceed max-disk-size-mb")
+	}
+	if resolved.DiskThresholdMB > MaxChatGPTWebUsageCacheMegabytes ||
+		resolved.MaxDiskSizeMB > MaxChatGPTWebUsageCacheMegabytes ||
+		resolved.MinAvailableDiskMB > MaxChatGPTWebUsageCacheMegabytes {
+		return fmt.Errorf("chatgpt-web.usage-cache size values exceed the supported byte range")
+	}
+	if resolved.MinAvailableDiskMB < 0 {
+		return fmt.Errorf("chatgpt-web.usage-cache.min-available-disk-mb must not be negative")
+	}
+	if resolved.MaxFilesystemUsedPercent < 1 || resolved.MaxFilesystemUsedPercent > 100 {
+		return fmt.Errorf("chatgpt-web.usage-cache.max-filesystem-used-percent must be between 1 and 100")
 	}
 	return nil
 }
@@ -3414,7 +3446,10 @@ func preservesExplicitChatGPTWebValue(fullPath string, node *yaml.Node) bool {
 		return node.Kind == yaml.ScalarNode && node.Tag == "!!bool"
 	case "chatgpt-web.usage-cache.enabled",
 		"chatgpt-web.usage-cache.disk-threshold-mb",
-		"chatgpt-web.usage-cache.max-disk-size-mb":
+		"chatgpt-web.usage-cache.max-disk-size-mb",
+		"chatgpt-web.usage-cache.resource-guard-enabled",
+		"chatgpt-web.usage-cache.min-available-disk-mb",
+		"chatgpt-web.usage-cache.max-filesystem-used-percent":
 		return true
 	case "chatgpt-web.account-info":
 		return node.Kind == yaml.MappingNode && len(node.Content) > 0

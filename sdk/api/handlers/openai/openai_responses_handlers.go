@@ -701,10 +701,10 @@ func (h *OpenAIResponsesAPIHandler) handleStreamingResponse(c *gin.Context, rawJ
 				}
 				framer.Flush(&firstFrame)
 				if errFrame := framer.Err(); errFrame != nil {
-					h.WriteErrorResponse(c, &interfaces.ErrorMessage{
+					h.WriteErrorResponse(c, h.RewriteExecutionErrorResponse(&interfaces.ErrorMessage{
 						StatusCode: http.StatusBadGateway,
 						Error:      errFrame,
-					})
+					}))
 					cliCancel(errFrame)
 					return
 				}
@@ -720,10 +720,10 @@ func (h *OpenAIResponsesAPIHandler) handleStreamingResponse(c *gin.Context, rawJ
 
 			framer.WriteChunk(&firstFrame, chunk)
 			if errFrame := framer.Err(); errFrame != nil {
-				errMsg := &interfaces.ErrorMessage{
+				errMsg := h.RewriteExecutionErrorResponse(&interfaces.ErrorMessage{
 					StatusCode: http.StatusBadGateway,
 					Error:      errFrame,
-				}
+				})
 				h.WriteErrorResponse(c, errMsg)
 				cliCancel(errFrame)
 				return

@@ -79,6 +79,12 @@ chatgpt-web:
     enabled: false
     disk-threshold-mb: 1
     max-disk-size-mb: 1024
+    # Before spilling a large request, reserve enough real filesystem capacity.
+    # The request is rejected with 503 without retrying or cooling a credential
+    # when either projected threshold would be reached.
+    resource-guard-enabled: true
+    min-available-disk-mb: 1024
+    max-filesystem-used-percent: 95
     # Empty uses an instance-private directory under the system temporary path.
     path: ""
   image-usage:
@@ -210,8 +216,10 @@ fixed-error-cooldowns:
     cooldown-seconds: 2592000
     scope: auth
 
-# Rewrite only the final client-facing runtime error after retry and cooldown decisions.
-# Rules are evaluated in order against the original status and message.
+# Rewrite selected final client-facing errors after retry and cooldown decisions.
+# Rules cover runtime, local conversion, and cache errors, but not request validation
+# or provider-key restrictions. Rules are evaluated in order.
+# Omit status-code or set it to 0 when one message can use multiple original statuses.
 # error-response-rewrites:
 #   - status-code: 429
 #     message-contains: "maximum context"

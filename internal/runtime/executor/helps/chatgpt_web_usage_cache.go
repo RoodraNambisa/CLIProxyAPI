@@ -11,20 +11,27 @@ import (
 	"strings"
 	"sync"
 	"unicode/utf8"
+
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/systemmetrics"
+	"golang.org/x/sync/singleflight"
 )
 
 const (
 	chatGPTWebUsageRecordChunkBytes      = 64 << 10
 	chatGPTWebUsageTokenizerOverlapBytes = 8 << 10
+	chatGPTWebUsageResourceProbeAttempts = 3
 )
 
 // ChatGPTWebUsageCacheOptions is an immutable per-request cache configuration.
 type ChatGPTWebUsageCacheOptions struct {
-	Enabled            bool
-	DiskThresholdBytes int64
-	MaxDiskBytes       int64
-	Path               string
-	AutoOutputQuality  string
+	Enabled                  bool
+	DiskThresholdBytes       int64
+	MaxDiskBytes             int64
+	ResourceGuardEnabled     bool
+	MinAvailableDiskBytes    int64
+	MaxFilesystemUsedPercent int
+	Path                     string
+	AutoOutputQuality        string
 }
 
 // ChatGPTWebUsageCacheSnapshot reports active storage and cumulative outcomes.
@@ -37,6 +44,7 @@ type ChatGPTWebUsageCacheSnapshot struct {
 	SuccessfulCalculations uint64 `json:"successful_calculations"`
 	FailedDiscards         uint64 `json:"failed_discards"`
 	CapacityRejections     uint64 `json:"capacity_rejections"`
+	ResourceRejections     uint64 `json:"resource_rejections"`
 	WriteErrors            uint64 `json:"write_errors"`
 }
 
@@ -58,6 +66,18 @@ type chatGPTWebUsageTextRecord struct {
 	text      string
 }
 
+type chatGPTWebUsageResourceState struct {
+	snapshot      systemmetrics.FilesystemSnapshot
+	reservedBytes int64
+	pendingBytes  int64
+}
+
+type chatGPTWebUsageFilesystemProbe struct {
+	snapshot         systemmetrics.FilesystemSnapshot
+	resourceStateKey string
+	generation       uint64
+}
+
 // ChatGPTWebUsageImage describes one decoded image without retaining its payload.
 type ChatGPTWebUsageImage struct {
 	Model   string
@@ -70,12 +90,18 @@ type ChatGPTWebUsageImage struct {
 
 // ChatGPTWebUsageCache owns compact per-request accounting projections.
 type ChatGPTWebUsageCache struct {
-	mu         sync.Mutex
-	createWG   sync.WaitGroup
-	handles    map[*ChatGPTWebUsageProjection]struct{}
-	defaultDir string
-	closed     bool
-	stats      ChatGPTWebUsageCacheSnapshot
+	mu                  sync.Mutex
+	resourceMu          sync.Mutex
+	createWG            sync.WaitGroup
+	handles             map[*ChatGPTWebUsageProjection]struct{}
+	defaultDir          string
+	closed              bool
+	stats               ChatGPTWebUsageCacheSnapshot
+	resourceStates      map[string]*chatGPTWebUsageResourceState
+	resourcePathKeys    map[string]string
+	resourceGenerations map[string]uint64
+	resourceProbeGroup  singleflight.Group
+	collectFilesystem   func(string) systemmetrics.FilesystemSnapshot
 }
 
 // ChatGPTWebUsageProjection retains only data required for hybrid accounting.
@@ -93,6 +119,7 @@ type ChatGPTWebUsageProjection struct {
 	records             []chatGPTWebUsageTextRecord
 	images              []ChatGPTWebUsageImage
 	filePath            string
+	resourceStateKey    string
 	memoryBytes         int64
 	diskBytes           int64
 	closeOnce           sync.Once
@@ -100,7 +127,13 @@ type ChatGPTWebUsageProjection struct {
 
 // NewChatGPTWebUsageCache creates an empty usage projection manager.
 func NewChatGPTWebUsageCache() *ChatGPTWebUsageCache {
-	return &ChatGPTWebUsageCache{handles: make(map[*ChatGPTWebUsageProjection]struct{})}
+	return &ChatGPTWebUsageCache{
+		handles:             make(map[*ChatGPTWebUsageProjection]struct{}),
+		resourceStates:      make(map[string]*chatGPTWebUsageResourceState),
+		resourcePathKeys:    make(map[string]string),
+		resourceGenerations: make(map[string]uint64),
+		collectFilesystem:   systemmetrics.CollectFilesystem,
+	}
 }
 
 // NewProjection captures text records without tokenizing them.
@@ -139,20 +172,13 @@ func (cache *ChatGPTWebUsageCache) NewProjection(model string, request ChatGPTWe
 		return nil, &ChatGPTWebUsageCacheError{Code: "chatgpt_web_usage_cache_full", Message: "chatgpt web usage cache capacity is exhausted"}
 	}
 
-	cache.mu.Lock()
-	if cache.closed {
-		cache.mu.Unlock()
-		return nil, &ChatGPTWebUsageCacheError{Code: "chatgpt_web_usage_cache_unavailable", Message: "chatgpt web usage cache is closed"}
+	resourcePath := chatGPTWebUsageCacheResourcePath(options.Path)
+	resourceStateKey, errReserve := cache.reserveDiskProjectionAtPath(options, resourcePath, diskBytes)
+	if errReserve != nil {
+		return nil, errReserve
 	}
-	if cache.stats.ActiveDiskBytes > options.MaxDiskBytes-diskBytes {
-		cache.stats.CapacityRejections++
-		cache.mu.Unlock()
-		return nil, &ChatGPTWebUsageCacheError{Code: "chatgpt_web_usage_cache_full", Message: "chatgpt web usage cache capacity is exhausted"}
-	}
-	cache.stats.ActiveDiskBytes += diskBytes
-	cache.createWG.Add(1)
-	cache.mu.Unlock()
 	defer cache.createWG.Done()
+	projection.resourceStateKey = resourceStateKey
 
 	path, errWrite := cache.writeProjectionFile(options.Path, records)
 	if errWrite != nil {
@@ -160,6 +186,7 @@ func (cache *ChatGPTWebUsageCache) NewProjection(model string, request ChatGPTWe
 		cache.stats.ActiveDiskBytes -= diskBytes
 		cache.stats.WriteErrors++
 		cache.mu.Unlock()
+		cache.completeDiskReservation(resourceStateKey, diskBytes)
 		return nil, &ChatGPTWebUsageCacheError{Code: "chatgpt_web_usage_cache_unavailable", Message: "chatgpt web usage cache is unavailable"}
 	}
 	projection.filePath = path
@@ -172,6 +199,7 @@ func (cache *ChatGPTWebUsageCache) NewProjection(model string, request ChatGPTWe
 		cache.stats.ActiveDiskBytes -= diskBytes
 		cache.mu.Unlock()
 		_ = os.Remove(path)
+		cache.completeDiskReservation(resourceStateKey, diskBytes)
 		return nil, &ChatGPTWebUsageCacheError{Code: "chatgpt_web_usage_cache_unavailable", Message: "chatgpt web usage cache is closed"}
 	}
 	cache.handles[projection] = struct{}{}
@@ -180,7 +208,275 @@ func (cache *ChatGPTWebUsageCache) NewProjection(model string, request ChatGPTWe
 		cache.stats.PeakDiskBytes = cache.stats.ActiveDiskBytes
 	}
 	cache.mu.Unlock()
+	cache.completeDiskReservation(resourceStateKey, diskBytes)
 	return projection, nil
+}
+
+func (cache *ChatGPTWebUsageCache) reserveDiskProjection(options ChatGPTWebUsageCacheOptions, diskBytes int64) error {
+	_, err := cache.reserveDiskProjectionAtPath(options, chatGPTWebUsageCacheResourcePath(options.Path), diskBytes)
+	return err
+}
+
+func (cache *ChatGPTWebUsageCache) reserveDiskProjectionAtPath(
+	options ChatGPTWebUsageCacheOptions,
+	resourcePath string,
+	diskBytes int64,
+) (string, error) {
+	for range chatGPTWebUsageResourceProbeAttempts {
+		cache.resourceMu.Lock()
+		cache.mu.Lock()
+		if cache.closed {
+			cache.mu.Unlock()
+			cache.resourceMu.Unlock()
+			return "", &ChatGPTWebUsageCacheError{Code: "chatgpt_web_usage_cache_unavailable", Message: "chatgpt web usage cache is closed"}
+		}
+		if cache.stats.ActiveDiskBytes > options.MaxDiskBytes-diskBytes {
+			cache.stats.CapacityRejections++
+			cache.mu.Unlock()
+			cache.resourceMu.Unlock()
+			return "", &ChatGPTWebUsageCacheError{Code: "chatgpt_web_usage_cache_full", Message: "chatgpt web usage cache capacity is exhausted"}
+		}
+		if !options.ResourceGuardEnabled {
+			cache.reserveDiskProjectionLocked(diskBytes)
+			cache.mu.Unlock()
+			cache.resourceMu.Unlock()
+			return "", nil
+		}
+		if cache.resourceStates == nil {
+			cache.resourceStates = make(map[string]*chatGPTWebUsageResourceState)
+		}
+		if cache.resourcePathKeys == nil {
+			cache.resourcePathKeys = make(map[string]string)
+		}
+		if cache.resourceGenerations == nil {
+			cache.resourceGenerations = make(map[string]uint64)
+		}
+		resourceStateKey := cache.resourcePathKeys[resourcePath]
+		state := cache.resourceStates[resourceStateKey]
+		if state != nil &&
+			state.pendingBytes > 0 &&
+			state.snapshot.Status == systemmetrics.FilesystemStatusOK {
+			if errResource := chatGPTWebUsageCacheResourceError(
+				state.snapshot,
+				state.reservedBytes,
+				diskBytes,
+				options.MinAvailableDiskBytes,
+				options.MaxFilesystemUsedPercent,
+			); errResource != nil {
+				cache.stats.ResourceRejections++
+				cache.mu.Unlock()
+				cache.resourceMu.Unlock()
+				return "", errResource
+			}
+			cache.reserveDiskProjectionLocked(diskBytes)
+			state.reservedBytes += diskBytes
+			state.pendingBytes += diskBytes
+			cache.mu.Unlock()
+			cache.resourceMu.Unlock()
+			return resourceStateKey, nil
+		}
+		delete(cache.resourcePathKeys, resourcePath)
+		cache.mu.Unlock()
+		cache.resourceMu.Unlock()
+
+		probe := cache.collectFilesystemSnapshot(resourcePath)
+		snapshot := probe.snapshot
+		resourceStateKey = probe.resourceStateKey
+
+		cache.resourceMu.Lock()
+		cache.mu.Lock()
+		if cache.closed {
+			cache.mu.Unlock()
+			cache.resourceMu.Unlock()
+			return "", &ChatGPTWebUsageCacheError{Code: "chatgpt_web_usage_cache_unavailable", Message: "chatgpt web usage cache is closed"}
+		}
+		if cache.stats.ActiveDiskBytes > options.MaxDiskBytes-diskBytes {
+			cache.stats.CapacityRejections++
+			cache.mu.Unlock()
+			cache.resourceMu.Unlock()
+			return "", &ChatGPTWebUsageCacheError{Code: "chatgpt_web_usage_cache_full", Message: "chatgpt web usage cache capacity is exhausted"}
+		}
+		if state = cache.resourceStates[resourceStateKey]; state != nil &&
+			state.pendingBytes > 0 &&
+			state.snapshot.Status == systemmetrics.FilesystemStatusOK {
+			if errResource := chatGPTWebUsageCacheResourceError(
+				state.snapshot,
+				state.reservedBytes,
+				diskBytes,
+				options.MinAvailableDiskBytes,
+				options.MaxFilesystemUsedPercent,
+			); errResource != nil {
+				cache.stats.ResourceRejections++
+				cache.mu.Unlock()
+				cache.resourceMu.Unlock()
+				return "", errResource
+			}
+			cache.reserveDiskProjectionLocked(diskBytes)
+			state.reservedBytes += diskBytes
+			state.pendingBytes += diskBytes
+			cache.resourcePathKeys[resourcePath] = resourceStateKey
+			cache.mu.Unlock()
+			cache.resourceMu.Unlock()
+			return resourceStateKey, nil
+		}
+		if cache.resourceGenerations[resourceStateKey] != probe.generation {
+			cache.mu.Unlock()
+			cache.resourceMu.Unlock()
+			continue
+		}
+		if errResource := chatGPTWebUsageCacheResourceError(
+			snapshot,
+			0,
+			diskBytes,
+			options.MinAvailableDiskBytes,
+			options.MaxFilesystemUsedPercent,
+		); errResource != nil {
+			cache.stats.ResourceRejections++
+			cache.mu.Unlock()
+			cache.resourceMu.Unlock()
+			return "", errResource
+		}
+		cache.reserveDiskProjectionLocked(diskBytes)
+		cache.resourceStates[resourceStateKey] = &chatGPTWebUsageResourceState{
+			snapshot:      snapshot,
+			reservedBytes: diskBytes,
+			pendingBytes:  diskBytes,
+		}
+		cache.resourcePathKeys[resourcePath] = resourceStateKey
+		cache.mu.Unlock()
+		cache.resourceMu.Unlock()
+		return resourceStateKey, nil
+	}
+	cache.mu.Lock()
+	cache.stats.ResourceRejections++
+	cache.mu.Unlock()
+	return "", &ChatGPTWebUsageCacheError{
+		Code:    "chatgpt_web_usage_cache_storage_unavailable",
+		Message: "chatgpt web usage cache storage capacity changed during validation",
+	}
+}
+
+func (cache *ChatGPTWebUsageCache) collectFilesystemSnapshot(resourcePath string) chatGPTWebUsageFilesystemProbe {
+	probe, _, _ := cache.resourceProbeGroup.Do(resourcePath, func() (any, error) {
+		cache.resourceMu.Lock()
+		generations := make(map[string]uint64, len(cache.resourceGenerations))
+		for resourceStateKey, generation := range cache.resourceGenerations {
+			generations[resourceStateKey] = generation
+		}
+		cache.resourceMu.Unlock()
+		collect := cache.collectFilesystem
+		if collect == nil {
+			collect = systemmetrics.CollectFilesystem
+		}
+		snapshot := collect(resourcePath)
+		resourceStateKey := chatGPTWebUsageCacheResourceStateKey(snapshot, resourcePath)
+		return chatGPTWebUsageFilesystemProbe{
+			snapshot:         snapshot,
+			resourceStateKey: resourceStateKey,
+			generation:       generations[resourceStateKey],
+		}, nil
+	})
+	return probe.(chatGPTWebUsageFilesystemProbe)
+}
+
+func (cache *ChatGPTWebUsageCache) reserveDiskProjectionLocked(diskBytes int64) {
+	cache.stats.ActiveDiskBytes += diskBytes
+	cache.createWG.Add(1)
+}
+
+func (cache *ChatGPTWebUsageCache) completeDiskReservation(resourceStateKey string, diskBytes int64) {
+	if cache == nil || resourceStateKey == "" || diskBytes <= 0 {
+		return
+	}
+	cache.resourceMu.Lock()
+	defer cache.resourceMu.Unlock()
+	state := cache.resourceStates[resourceStateKey]
+	if state == nil {
+		if mappedKey := cache.resourcePathKeys[resourceStateKey]; mappedKey != "" {
+			resourceStateKey = mappedKey
+			state = cache.resourceStates[resourceStateKey]
+		}
+	}
+	if state == nil {
+		return
+	}
+	if cache.resourceGenerations == nil {
+		cache.resourceGenerations = make(map[string]uint64)
+	}
+	cache.resourceGenerations[resourceStateKey]++
+	state.pendingBytes -= diskBytes
+	if state.pendingBytes <= 0 {
+		delete(cache.resourceStates, resourceStateKey)
+		for resourcePath, mappedKey := range cache.resourcePathKeys {
+			if mappedKey == resourceStateKey {
+				delete(cache.resourcePathKeys, resourcePath)
+			}
+		}
+	}
+}
+
+func chatGPTWebUsageCacheResourcePath(configuredPath string) string {
+	path := strings.TrimSpace(configuredPath)
+	if path == "" {
+		path = os.TempDir()
+	}
+	if absolutePath, err := filepath.Abs(path); err == nil {
+		path = absolutePath
+	}
+	return filepath.Clean(path)
+}
+
+func chatGPTWebUsageCacheResourceStateKey(
+	snapshot systemmetrics.FilesystemSnapshot,
+	resourcePath string,
+) string {
+	if filesystemID := strings.TrimSpace(snapshot.FilesystemID); filesystemID != "" {
+		return "filesystem:" + filesystemID
+	}
+	return "path:" + resourcePath
+}
+
+func chatGPTWebUsageCacheResourceError(
+	snapshot systemmetrics.FilesystemSnapshot,
+	pendingBytes int64,
+	requestBytes int64,
+	minAvailableBytes int64,
+	maxUsedPercent int,
+) error {
+	if snapshot.Status != systemmetrics.FilesystemStatusOK || snapshot.TotalBytes == 0 {
+		return &ChatGPTWebUsageCacheError{
+			Code:    "chatgpt_web_usage_cache_storage_unavailable",
+			Message: "chatgpt web usage cache storage capacity is unavailable",
+		}
+	}
+	requiredBytes := nonNegativeUint64(pendingBytes) + nonNegativeUint64(requestBytes)
+	if requiredBytes > snapshot.AvailableBytes ||
+		snapshot.AvailableBytes-requiredBytes < nonNegativeUint64(minAvailableBytes) {
+		return &ChatGPTWebUsageCacheError{
+			Code:    "chatgpt_web_usage_cache_disk_pressure",
+			Message: "chatgpt web usage cache disk resource threshold is exceeded",
+		}
+	}
+	if maxUsedPercent > 0 {
+		predictedUsedBytes := snapshot.UsedBytes + requiredBytes
+		if predictedUsedBytes < snapshot.UsedBytes || predictedUsedBytes > snapshot.TotalBytes {
+			predictedUsedBytes = snapshot.TotalBytes
+		}
+		if float64(predictedUsedBytes)/float64(snapshot.TotalBytes)*100 >= float64(maxUsedPercent) {
+			return &ChatGPTWebUsageCacheError{
+				Code:    "chatgpt_web_usage_cache_disk_pressure",
+				Message: "chatgpt web usage cache disk resource threshold is exceeded",
+			}
+		}
+	}
+	return nil
+}
+
+func nonNegativeUint64(value int64) uint64 {
+	if value <= 0 {
+		return 0
+	}
+	return uint64(value)
 }
 
 func chatGPTWebUsageTextRecords(request ChatGPTWebRequest) []chatGPTWebUsageTextRecord {

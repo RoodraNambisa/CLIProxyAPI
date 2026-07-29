@@ -6,6 +6,9 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/systemmetrics"
 )
 
 func TestChatGPTWebUsageProjectionPrecomputesSmallInput(t *testing.T) {
@@ -172,6 +175,608 @@ func TestChatGPTWebUsageProjectionRejectsDiskCapacityBeforeUpstream(t *testing.T
 	if !errors.As(err, &cacheErr) || cacheErr.Code != "chatgpt_web_usage_cache_full" {
 		t.Fatalf("NewProjection() error = %v", err)
 	}
+}
+
+func TestChatGPTWebUsageProjectionRejectsPredictedDiskPressureBeforeUpstream(t *testing.T) {
+	cache := NewChatGPTWebUsageCache()
+	t.Cleanup(cache.Close)
+	cache.collectFilesystem = func(string) systemmetrics.FilesystemSnapshot {
+		return systemmetrics.FilesystemSnapshot{
+			Status:         systemmetrics.FilesystemStatusOK,
+			TotalBytes:     1000,
+			UsedBytes:      900,
+			AvailableBytes: 100,
+		}
+	}
+	_, err := cache.NewProjection("gpt-5.4", chatGPTWebUsageTestRequest("too large"), ChatGPTWebUsageCacheOptions{
+		Enabled:                  true,
+		DiskThresholdBytes:       1,
+		MaxDiskBytes:             8 << 20,
+		ResourceGuardEnabled:     true,
+		MinAvailableDiskBytes:    80,
+		MaxFilesystemUsedPercent: 95,
+		Path:                     t.TempDir(),
+	})
+	var cacheErr *ChatGPTWebUsageCacheError
+	if !errors.As(err, &cacheErr) || cacheErr.Code != "chatgpt_web_usage_cache_disk_pressure" {
+		t.Fatalf("NewProjection() error = %v", err)
+	}
+	if snapshot := cache.Snapshot(); snapshot.ResourceRejections != 1 || snapshot.ActiveDiskBytes != 0 {
+		t.Fatalf("snapshot after resource rejection = %#v", snapshot)
+	}
+	cache.resourceMu.Lock()
+	defer cache.resourceMu.Unlock()
+	if len(cache.resourcePathKeys) != 0 || len(cache.resourceStates) != 0 {
+		t.Fatalf("resource mappings retained after rejection: paths=%v states=%v", cache.resourcePathKeys, cache.resourceStates)
+	}
+}
+
+func TestChatGPTWebUsageProjectionResourceGuardAllowsReservedWrite(t *testing.T) {
+	cache := NewChatGPTWebUsageCache()
+	t.Cleanup(cache.Close)
+	cache.collectFilesystem = func(string) systemmetrics.FilesystemSnapshot {
+		return systemmetrics.FilesystemSnapshot{
+			Status:         systemmetrics.FilesystemStatusOK,
+			TotalBytes:     100 << 20,
+			UsedBytes:      20 << 20,
+			AvailableBytes: 80 << 20,
+		}
+	}
+	projection, err := cache.NewProjection("gpt-5.4", chatGPTWebUsageTestRequest("allowed"), ChatGPTWebUsageCacheOptions{
+		Enabled:                  true,
+		DiskThresholdBytes:       1,
+		MaxDiskBytes:             8 << 20,
+		ResourceGuardEnabled:     true,
+		MinAvailableDiskBytes:    1 << 20,
+		MaxFilesystemUsedPercent: 95,
+		Path:                     t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("NewProjection() error = %v", err)
+	}
+	projection.Discard()
+	if snapshot := cache.Snapshot(); snapshot.ResourceRejections != 0 || snapshot.ActiveDiskBytes != 0 {
+		t.Fatalf("snapshot after allowed projection = %#v", snapshot)
+	}
+}
+
+func TestChatGPTWebUsageCacheResourceGuardRejectsUnavailableFilesystem(t *testing.T) {
+	err := chatGPTWebUsageCacheResourceError(
+		systemmetrics.FilesystemSnapshot{Status: systemmetrics.FilesystemStatusUnavailable},
+		0,
+		1,
+		0,
+		100,
+	)
+	var cacheErr *ChatGPTWebUsageCacheError
+	if !errors.As(err, &cacheErr) || cacheErr.Code != "chatgpt_web_usage_cache_storage_unavailable" {
+		t.Fatalf("resource error = %v", err)
+	}
+}
+
+func TestChatGPTWebUsageCacheResourceGuardRejectsPredictedFilesystemUsage(t *testing.T) {
+	err := chatGPTWebUsageCacheResourceError(
+		systemmetrics.FilesystemSnapshot{
+			Status:         systemmetrics.FilesystemStatusOK,
+			TotalBytes:     1000,
+			UsedBytes:      899,
+			AvailableBytes: 101,
+		},
+		0,
+		1,
+		0,
+		90,
+	)
+	var cacheErr *ChatGPTWebUsageCacheError
+	if !errors.As(err, &cacheErr) || cacheErr.Code != "chatgpt_web_usage_cache_disk_pressure" {
+		t.Fatalf("resource error = %v", err)
+	}
+}
+
+func TestChatGPTWebUsageCacheResourceProbeDoesNotBlockSnapshots(t *testing.T) {
+	cache := NewChatGPTWebUsageCache()
+	t.Cleanup(cache.Close)
+	started := make(chan struct{})
+	release := make(chan struct{})
+	cache.collectFilesystem = func(string) systemmetrics.FilesystemSnapshot {
+		close(started)
+		<-release
+		return systemmetrics.FilesystemSnapshot{
+			Status:         systemmetrics.FilesystemStatusOK,
+			TotalBytes:     1000,
+			UsedBytes:      100,
+			AvailableBytes: 900,
+		}
+	}
+	reserved := make(chan error, 1)
+	go func() {
+		reserved <- cache.reserveDiskProjection(ChatGPTWebUsageCacheOptions{
+			MaxDiskBytes:             1000,
+			ResourceGuardEnabled:     true,
+			MaxFilesystemUsedPercent: 95,
+		}, 10)
+	}()
+	<-started
+
+	snapshotDone := make(chan struct{})
+	go func() {
+		_ = cache.Snapshot()
+		close(snapshotDone)
+	}()
+	select {
+	case <-snapshotDone:
+	case <-time.After(time.Second):
+		t.Fatal("Snapshot() blocked behind filesystem probe")
+	}
+	close(release)
+	if err := <-reserved; err != nil {
+		t.Fatalf("reserveDiskProjection() error = %v", err)
+	}
+	cache.mu.Lock()
+	cache.stats.ActiveDiskBytes -= 10
+	cache.mu.Unlock()
+	cache.completeDiskReservation(chatGPTWebUsageCacheResourcePath(""), 10)
+	cache.createWG.Done()
+}
+
+func TestChatGPTWebUsageCacheSlowResourceProbeDoesNotBlockOtherPath(t *testing.T) {
+	cache := NewChatGPTWebUsageCache()
+	t.Cleanup(cache.Close)
+	fastPath := t.TempDir()
+	slowPath := t.TempDir()
+	options := ChatGPTWebUsageCacheOptions{
+		MaxDiskBytes:             10_000,
+		ResourceGuardEnabled:     true,
+		MaxFilesystemUsedPercent: 95,
+		Path:                     fastPath,
+	}
+	cache.collectFilesystem = func(path string) systemmetrics.FilesystemSnapshot {
+		return systemmetrics.FilesystemSnapshot{
+			Status:         systemmetrics.FilesystemStatusOK,
+			FilesystemID:   "fast-filesystem",
+			TotalBytes:     10_000,
+			UsedBytes:      100,
+			AvailableBytes: 9_900,
+		}
+	}
+	if err := cache.reserveDiskProjection(options, 100); err != nil {
+		t.Fatalf("initial fast-path reservation: %v", err)
+	}
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	cache.collectFilesystem = func(path string) systemmetrics.FilesystemSnapshot {
+		if path == chatGPTWebUsageCacheResourcePath(slowPath) {
+			select {
+			case <-started:
+			default:
+				close(started)
+			}
+			<-release
+			return systemmetrics.FilesystemSnapshot{
+				Status:         systemmetrics.FilesystemStatusOK,
+				FilesystemID:   "slow-filesystem",
+				TotalBytes:     10_000,
+				UsedBytes:      100,
+				AvailableBytes: 9_900,
+			}
+		}
+		return systemmetrics.FilesystemSnapshot{
+			Status:         systemmetrics.FilesystemStatusOK,
+			FilesystemID:   "fast-filesystem",
+			TotalBytes:     10_000,
+			UsedBytes:      100,
+			AvailableBytes: 9_900,
+		}
+	}
+	slowResult := make(chan error, 1)
+	slowOptions := options
+	slowOptions.Path = slowPath
+	go func() {
+		slowResult <- cache.reserveDiskProjection(slowOptions, 100)
+	}()
+	<-started
+
+	fastResult := make(chan error, 1)
+	fastOptions := options
+	fastOptions.Path = fastPath
+	go func() {
+		fastResult <- cache.reserveDiskProjection(fastOptions, 100)
+	}()
+	select {
+	case err := <-fastResult:
+		if err != nil {
+			t.Fatalf("fast path blocked reservation failed: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("slow filesystem probe blocked another path reservation")
+	}
+
+	completed := make(chan struct{})
+	go func() {
+		cache.completeDiskReservation(chatGPTWebUsageCacheResourcePath(fastPath), 100)
+		close(completed)
+	}()
+	select {
+	case <-completed:
+	case <-time.After(time.Second):
+		t.Fatal("slow filesystem probe blocked another path reservation cleanup")
+	}
+
+	close(release)
+	if err := <-slowResult; err != nil {
+		t.Fatalf("slow-path reservation: %v", err)
+	}
+	cache.mu.Lock()
+	cache.stats.ActiveDiskBytes -= 300
+	cache.mu.Unlock()
+	cache.completeDiskReservation(chatGPTWebUsageCacheResourcePath(fastPath), 100)
+	cache.completeDiskReservation(chatGPTWebUsageCacheResourcePath(slowPath), 100)
+	cache.createWG.Done()
+	cache.createWG.Done()
+	cache.createWG.Done()
+}
+
+func TestChatGPTWebUsageCacheResourceProbeCoalescesSamePath(t *testing.T) {
+	cache := NewChatGPTWebUsageCache()
+	t.Cleanup(cache.Close)
+	path := t.TempDir()
+	probeStarted := make(chan struct{})
+	releaseProbe := make(chan struct{})
+	probeCalls := make(chan struct{}, 2)
+	cache.collectFilesystem = func(string) systemmetrics.FilesystemSnapshot {
+		probeCalls <- struct{}{}
+		select {
+		case <-probeStarted:
+		default:
+			close(probeStarted)
+		}
+		<-releaseProbe
+		return systemmetrics.FilesystemSnapshot{
+			Status:         systemmetrics.FilesystemStatusOK,
+			FilesystemID:   "coalesced-filesystem",
+			TotalBytes:     10_000,
+			UsedBytes:      100,
+			AvailableBytes: 9_900,
+		}
+	}
+	options := ChatGPTWebUsageCacheOptions{
+		MaxDiskBytes:             10_000,
+		ResourceGuardEnabled:     true,
+		MaxFilesystemUsedPercent: 95,
+		Path:                     path,
+	}
+	start := make(chan struct{})
+	results := make(chan error, 2)
+	for range 2 {
+		go func() {
+			<-start
+			results <- cache.reserveDiskProjection(options, 100)
+		}()
+	}
+	close(start)
+	<-probeStarted
+	time.Sleep(20 * time.Millisecond)
+	close(releaseProbe)
+	for range 2 {
+		if err := <-results; err != nil {
+			t.Fatalf("reserveDiskProjection() error = %v", err)
+		}
+	}
+	if got := len(probeCalls); got != 1 {
+		t.Fatalf("filesystem probes = %d, want 1 for concurrent same-path reservations", got)
+	}
+
+	cache.mu.Lock()
+	cache.stats.ActiveDiskBytes -= 200
+	cache.mu.Unlock()
+	cache.completeDiskReservation(chatGPTWebUsageCacheResourcePath(path), 100)
+	cache.completeDiskReservation(chatGPTWebUsageCacheResourcePath(path), 100)
+	cache.createWG.Done()
+	cache.createWG.Done()
+}
+
+func TestChatGPTWebUsageCacheResourceProbeRetriesAcrossCompletedGeneration(t *testing.T) {
+	cache := NewChatGPTWebUsageCache()
+	t.Cleanup(cache.Close)
+	firstPath := t.TempDir()
+	secondPath := t.TempDir()
+	options := ChatGPTWebUsageCacheOptions{
+		MaxDiskBytes:             10_000,
+		ResourceGuardEnabled:     true,
+		MaxFilesystemUsedPercent: 100,
+		Path:                     firstPath,
+	}
+	cache.collectFilesystem = func(string) systemmetrics.FilesystemSnapshot {
+		return systemmetrics.FilesystemSnapshot{
+			Status:         systemmetrics.FilesystemStatusOK,
+			FilesystemID:   "shared-filesystem",
+			TotalBytes:     1000,
+			UsedBytes:      0,
+			AvailableBytes: 1000,
+		}
+	}
+	if err := cache.reserveDiskProjection(options, 400); err != nil {
+		t.Fatalf("initial reservation: %v", err)
+	}
+
+	probeStarted := make(chan struct{})
+	releaseProbe := make(chan struct{})
+	probeCalls := make(chan struct{}, 2)
+	cache.collectFilesystem = func(string) systemmetrics.FilesystemSnapshot {
+		probeCalls <- struct{}{}
+		if len(probeCalls) == 1 {
+			close(probeStarted)
+			<-releaseProbe
+			return systemmetrics.FilesystemSnapshot{
+				Status:         systemmetrics.FilesystemStatusOK,
+				FilesystemID:   "shared-filesystem",
+				TotalBytes:     1000,
+				UsedBytes:      0,
+				AvailableBytes: 1000,
+			}
+		}
+		return systemmetrics.FilesystemSnapshot{
+			Status:         systemmetrics.FilesystemStatusOK,
+			FilesystemID:   "shared-filesystem",
+			TotalBytes:     1000,
+			UsedBytes:      500,
+			AvailableBytes: 500,
+		}
+	}
+	options.Path = secondPath
+	result := make(chan error, 1)
+	go func() {
+		result <- cache.reserveDiskProjection(options, 600)
+	}()
+	<-probeStarted
+	cache.completeDiskReservation(chatGPTWebUsageCacheResourcePath(firstPath), 400)
+	close(releaseProbe)
+
+	var cacheErr *ChatGPTWebUsageCacheError
+	if err := <-result; !errors.As(err, &cacheErr) || cacheErr.Code != "chatgpt_web_usage_cache_disk_pressure" {
+		t.Fatalf("reservation after generation change error = %v", err)
+	}
+	if got := len(probeCalls); got != 2 {
+		t.Fatalf("filesystem probes = %d, want stale snapshot retry", got)
+	}
+	cache.mu.Lock()
+	cache.stats.ActiveDiskBytes -= 400
+	cache.mu.Unlock()
+	cache.createWG.Done()
+}
+
+func TestChatGPTWebUsageCacheResourceProbeSharesLeaderGeneration(t *testing.T) {
+	cache := NewChatGPTWebUsageCache()
+	t.Cleanup(cache.Close)
+	firstPath := t.TempDir()
+	secondPath := t.TempDir()
+	options := ChatGPTWebUsageCacheOptions{
+		MaxDiskBytes:             10_000,
+		ResourceGuardEnabled:     true,
+		MaxFilesystemUsedPercent: 100,
+		Path:                     firstPath,
+	}
+	cache.collectFilesystem = func(string) systemmetrics.FilesystemSnapshot {
+		return systemmetrics.FilesystemSnapshot{
+			Status:         systemmetrics.FilesystemStatusOK,
+			FilesystemID:   "shared-filesystem",
+			TotalBytes:     1000,
+			UsedBytes:      0,
+			AvailableBytes: 1000,
+		}
+	}
+	if err := cache.reserveDiskProjection(options, 400); err != nil {
+		t.Fatalf("initial reservation: %v", err)
+	}
+	successes := 0
+	initialCompleted := false
+	defer func() {
+		if !initialCompleted {
+			cache.completeDiskReservation(chatGPTWebUsageCacheResourcePath(firstPath), 400)
+		}
+		for range successes {
+			cache.completeDiskReservation(chatGPTWebUsageCacheResourcePath(secondPath), 300)
+		}
+		cache.mu.Lock()
+		cache.stats.ActiveDiskBytes -= 400 + int64(successes*300)
+		cache.mu.Unlock()
+		for range 1 + successes {
+			cache.createWG.Done()
+		}
+	}()
+
+	probeStarted := make(chan struct{})
+	releaseProbe := make(chan struct{})
+	probeCalls := make(chan struct{}, 3)
+	cache.collectFilesystem = func(string) systemmetrics.FilesystemSnapshot {
+		probeCalls <- struct{}{}
+		if len(probeCalls) == 1 {
+			close(probeStarted)
+			<-releaseProbe
+			return systemmetrics.FilesystemSnapshot{
+				Status:         systemmetrics.FilesystemStatusOK,
+				FilesystemID:   "shared-filesystem",
+				TotalBytes:     1000,
+				UsedBytes:      0,
+				AvailableBytes: 1000,
+			}
+		}
+		return systemmetrics.FilesystemSnapshot{
+			Status:         systemmetrics.FilesystemStatusOK,
+			FilesystemID:   "shared-filesystem",
+			TotalBytes:     1000,
+			UsedBytes:      500,
+			AvailableBytes: 500,
+		}
+	}
+	options.Path = secondPath
+	results := make(chan error, 2)
+	go func() {
+		results <- cache.reserveDiskProjection(options, 300)
+	}()
+	<-probeStarted
+	cache.completeDiskReservation(chatGPTWebUsageCacheResourcePath(firstPath), 400)
+	initialCompleted = true
+	followerStarted := make(chan struct{})
+	go func() {
+		close(followerStarted)
+		results <- cache.reserveDiskProjection(options, 300)
+	}()
+	<-followerStarted
+	time.Sleep(20 * time.Millisecond)
+	close(releaseProbe)
+
+	failures := 0
+	for range 2 {
+		err := <-results
+		if err == nil {
+			successes++
+			continue
+		}
+		var cacheErr *ChatGPTWebUsageCacheError
+		if !errors.As(err, &cacheErr) || cacheErr.Code != "chatgpt_web_usage_cache_disk_pressure" {
+			t.Fatalf("unexpected reservation error = %v", err)
+		}
+		failures++
+	}
+	if successes != 1 || failures != 1 {
+		t.Fatalf("results = %d successes, %d failures; want one of each", successes, failures)
+	}
+	if got := len(probeCalls); got < 2 || got > 3 {
+		t.Fatalf("filesystem probes = %d, want one stale shared probe and at most two refreshes", got)
+	}
+}
+
+func TestChatGPTWebUsageCacheResourceReservationsShareSnapshotGeneration(t *testing.T) {
+	cache := NewChatGPTWebUsageCache()
+	t.Cleanup(cache.Close)
+	collectCalls := 0
+	cache.collectFilesystem = func(string) systemmetrics.FilesystemSnapshot {
+		collectCalls++
+		return systemmetrics.FilesystemSnapshot{
+			Status:         systemmetrics.FilesystemStatusOK,
+			TotalBytes:     1000,
+			UsedBytes:      100,
+			AvailableBytes: 900,
+		}
+	}
+	options := ChatGPTWebUsageCacheOptions{
+		MaxDiskBytes:             1000,
+		ResourceGuardEnabled:     true,
+		MaxFilesystemUsedPercent: 95,
+	}
+	for range 2 {
+		if err := cache.reserveDiskProjection(options, 100); err != nil {
+			t.Fatalf("reserveDiskProjection() error = %v", err)
+		}
+	}
+	if collectCalls != 1 {
+		t.Fatalf("filesystem probes = %d, want 1 for one reservation generation", collectCalls)
+	}
+	cache.mu.Lock()
+	cache.stats.ActiveDiskBytes -= 200
+	cache.mu.Unlock()
+	cache.completeDiskReservation(chatGPTWebUsageCacheResourcePath(""), 100)
+	cache.completeDiskReservation(chatGPTWebUsageCacheResourcePath(""), 100)
+	cache.createWG.Done()
+	cache.createWG.Done()
+
+	if err := cache.reserveDiskProjection(options, 100); err != nil {
+		t.Fatalf("next reserveDiskProjection() error = %v", err)
+	}
+	if collectCalls != 2 {
+		t.Fatalf("filesystem probes = %d, want fresh probe after pending writes complete", collectCalls)
+	}
+	cache.mu.Lock()
+	cache.stats.ActiveDiskBytes -= 100
+	cache.mu.Unlock()
+	cache.completeDiskReservation(chatGPTWebUsageCacheResourcePath(""), 100)
+	cache.createWG.Done()
+}
+
+func TestChatGPTWebUsageCacheResourceReservationsStayIsolatedAcrossPaths(t *testing.T) {
+	cache := NewChatGPTWebUsageCache()
+	t.Cleanup(cache.Close)
+	cache.collectFilesystem = func(string) systemmetrics.FilesystemSnapshot {
+		return systemmetrics.FilesystemSnapshot{
+			Status:         systemmetrics.FilesystemStatusOK,
+			TotalBytes:     1000,
+			UsedBytes:      0,
+			AvailableBytes: 1000,
+		}
+	}
+	options := ChatGPTWebUsageCacheOptions{
+		MaxDiskBytes:             10_000,
+		ResourceGuardEnabled:     true,
+		MaxFilesystemUsedPercent: 100,
+	}
+	firstPath := filepath.Join(t.TempDir(), "first")
+	secondPath := filepath.Join(t.TempDir(), "second")
+	options.Path = firstPath
+	if err := cache.reserveDiskProjection(options, 400); err != nil {
+		t.Fatalf("reserve first path: %v", err)
+	}
+	cache.completeDiskReservation(chatGPTWebUsageCacheResourcePath(firstPath), 400)
+	cache.createWG.Done()
+
+	options.Path = secondPath
+	if err := cache.reserveDiskProjection(options, 400); err != nil {
+		t.Fatalf("reserve second path: %v", err)
+	}
+
+	cache.mu.Lock()
+	cache.stats.ActiveDiskBytes -= 400
+	cache.mu.Unlock()
+	if err := cache.reserveDiskProjection(options, 700); err == nil {
+		t.Fatal("second path reservation ignored its existing generation")
+	}
+
+	cache.mu.Lock()
+	cache.stats.ActiveDiskBytes -= 400
+	cache.mu.Unlock()
+	cache.completeDiskReservation(chatGPTWebUsageCacheResourcePath(secondPath), 400)
+	cache.createWG.Done()
+}
+
+func TestChatGPTWebUsageCacheResourceReservationsShareFilesystemAcrossPaths(t *testing.T) {
+	cache := NewChatGPTWebUsageCache()
+	t.Cleanup(cache.Close)
+	cache.collectFilesystem = func(string) systemmetrics.FilesystemSnapshot {
+		return systemmetrics.FilesystemSnapshot{
+			Status:         systemmetrics.FilesystemStatusOK,
+			FilesystemID:   "shared-filesystem",
+			TotalBytes:     1000,
+			UsedBytes:      0,
+			AvailableBytes: 1000,
+		}
+	}
+	options := ChatGPTWebUsageCacheOptions{
+		MaxDiskBytes:             10_000,
+		ResourceGuardEnabled:     true,
+		MaxFilesystemUsedPercent: 100,
+	}
+	firstPath := filepath.Join(t.TempDir(), "first")
+	secondPath := filepath.Join(t.TempDir(), "second")
+	options.Path = firstPath
+	if err := cache.reserveDiskProjection(options, 400); err != nil {
+		t.Fatalf("reserve first path: %v", err)
+	}
+	options.Path = secondPath
+	if err := cache.reserveDiskProjection(options, 400); err != nil {
+		t.Fatalf("reserve second path: %v", err)
+	}
+	if err := cache.reserveDiskProjection(options, 300); err == nil {
+		t.Fatal("same-filesystem paths accepted reservations beyond available capacity")
+	}
+
+	cache.mu.Lock()
+	cache.stats.ActiveDiskBytes -= 800
+	cache.mu.Unlock()
+	cache.completeDiskReservation(chatGPTWebUsageCacheResourcePath(firstPath), 400)
+	cache.completeDiskReservation(chatGPTWebUsageCacheResourcePath(secondPath), 400)
+	cache.createWG.Done()
+	cache.createWG.Done()
 }
 
 func TestChatGPTWebUsageProjectionDoesNotRetainImagePayload(t *testing.T) {

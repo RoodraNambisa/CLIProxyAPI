@@ -441,7 +441,10 @@ func (h *OpenAIImagesAPIHandler) handleNonStreamingImagesResponse(c *gin.Context
 		}
 		parsed, err := parseResponsesToImagesResponse(resp, time.Now().Unix())
 		if err != nil {
-			h.writeImagesError(c, http.StatusBadGateway, err)
+			h.WriteErrorResponse(c, h.RewriteExecutionErrorResponse(&interfaces.ErrorMessage{
+				StatusCode: http.StatusBadGateway,
+				Error:      err,
+			}))
 			cliCancel(err)
 			return
 		}
@@ -525,10 +528,10 @@ func (h *OpenAIImagesAPIHandler) handleStreamingImagesResponse(c *gin.Context, r
 				}
 				mapper.flush(&firstFrame)
 				if errMapper := mapper.fatalError(); errMapper != nil {
-					h.WriteErrorResponse(c, &interfaces.ErrorMessage{
+					h.WriteErrorResponse(c, h.RewriteExecutionErrorResponse(&interfaces.ErrorMessage{
 						StatusCode: http.StatusBadGateway,
 						Error:      errMapper,
-					})
+					}))
 					cliCancel(errMapper)
 					return
 				}
@@ -542,10 +545,10 @@ func (h *OpenAIImagesAPIHandler) handleStreamingImagesResponse(c *gin.Context, r
 			}
 			mapper.writeChunk(&firstFrame, chunk)
 			if errMapper := mapper.fatalError(); errMapper != nil {
-				h.WriteErrorResponse(c, &interfaces.ErrorMessage{
+				h.WriteErrorResponse(c, h.RewriteExecutionErrorResponse(&interfaces.ErrorMessage{
 					StatusCode: http.StatusBadGateway,
 					Error:      errMapper,
-				})
+				}))
 				cliCancel(errMapper)
 				return
 			}

@@ -216,6 +216,78 @@ func TestRewriteExecutionErrorResponseUnmatchedAndHTTPWrite(t *testing.T) {
 	}
 }
 
+func TestExplicitLocalProxyErrorsCanBeRewritten(t *testing.T) {
+	for _, test := range []struct {
+		name         string
+		status       int
+		message      string
+		messageMatch string
+		responseCode string
+	}{
+		{
+			name:         "image conversion error",
+			status:       http.StatusBadGateway,
+			message:      "upstream did not return image output",
+			messageMatch: "did not return image output",
+			responseCode: "moderation_blocked",
+		},
+		{
+			name:         "usage cache capacity error",
+			status:       http.StatusServiceUnavailable,
+			message:      `{"error":{"code":"resource_exhausted","message":"server resource capacity is temporarily exhausted"}}`,
+			messageMatch: "resource_exhausted",
+			responseCode: "storage_limited",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			body := map[string]any{"error": map[string]any{"code": test.responseCode}}
+			handler := NewBaseAPIHandlers(&config.SDKConfig{ErrorResponseRewrites: []config.ErrorResponseRewriteRule{{
+				StatusCode:         test.status,
+				MessageContains:    test.messageMatch,
+				ResponseStatusCode: http.StatusBadRequest,
+				ResponseBody:       &body,
+			}}}, nil)
+			gin.SetMode(gin.TestMode)
+			recorder := httptest.NewRecorder()
+			ctx, _ := gin.CreateTestContext(recorder)
+
+			handler.WriteErrorResponse(ctx, handler.RewriteExecutionErrorResponse(&interfaces.ErrorMessage{
+				StatusCode: test.status,
+				Error:      errors.New(test.message),
+			}))
+
+			if recorder.Code != http.StatusBadRequest ||
+				!strings.Contains(recorder.Body.String(), test.responseCode) ||
+				strings.Contains(recorder.Body.String(), test.messageMatch) {
+				t.Fatalf("response = status %d body %q", recorder.Code, recorder.Body.String())
+			}
+		})
+	}
+}
+
+func TestWriteErrorResponseDoesNotRewriteUnclassifiedErrors(t *testing.T) {
+	body := map[string]any{"error": map[string]any{"code": "rewritten"}}
+	handler := NewBaseAPIHandlers(&config.SDKConfig{ErrorResponseRewrites: []config.ErrorResponseRewriteRule{{
+		StatusCode:         http.StatusForbidden,
+		MessageContains:    "provider_not_allowed",
+		ResponseStatusCode: http.StatusBadRequest,
+		ResponseBody:       &body,
+	}}}, nil)
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+
+	handler.WriteErrorResponse(ctx, &interfaces.ErrorMessage{
+		StatusCode: http.StatusForbidden,
+		Error:      errors.New("provider_not_allowed"),
+	})
+
+	if recorder.Code != http.StatusForbidden ||
+		strings.Contains(recorder.Body.String(), "rewritten") {
+		t.Fatalf("response = status %d body %q", recorder.Code, recorder.Body.String())
+	}
+}
+
 func TestRewriteExecutionErrorResponseSkipsInvalidSDKRules(t *testing.T) {
 	body := map[string]any{"valid": true}
 	handler := NewBaseAPIHandlers(&config.SDKConfig{ErrorResponseRewrites: []config.ErrorResponseRewriteRule{
