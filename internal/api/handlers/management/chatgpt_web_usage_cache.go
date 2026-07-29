@@ -11,6 +11,7 @@ import (
 	chatgptwebauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/chatgptweb"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor/helps"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/systemmetrics"
 )
 
 type chatGPTWebUsageCacheSnapshotter interface {
@@ -43,6 +44,7 @@ type chatGPTWebUsageCacheResponse struct {
 	UsageCache         config.ResolvedChatGPTWebUsageCacheConfig `json:"usage-cache"`
 	ImageUsage         chatGPTWebImageUsageResponse              `json:"image-usage"`
 	Stats              helps.ChatGPTWebUsageCacheSnapshot        `json:"stats"`
+	Filesystem         systemmetrics.FilesystemSnapshot          `json:"filesystem"`
 }
 
 // GetChatGPTWebUsageCache returns effective accounting settings and runtime storage statistics.
@@ -72,6 +74,9 @@ func (h *Handler) GetChatGPTWebUsageCache(c *gin.Context) {
 		}
 	}
 	h.mu.Unlock()
+	response.Filesystem = systemmetrics.CollectFilesystem(
+		chatGPTWebUsageCacheFilesystemPath(response.UsageCache.Path),
+	)
 	c.JSON(http.StatusOK, response)
 }
 

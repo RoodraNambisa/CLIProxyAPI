@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -11,6 +13,7 @@ import (
 	chatgptwebauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/chatgptweb"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor/helps"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/systemmetrics"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 )
 
@@ -58,6 +61,11 @@ func TestGetChatGPTWebUsageCacheReturnsDefaultsAndRuntimeStats(t *testing.T) {
 	}
 	if response.Stats.ActiveDiskBytes != 42 || response.Stats.PeakDiskBytes != 84 || response.Stats.SuccessfulCalculations != 3 {
 		t.Fatalf("GET response stats = %#v", response.Stats)
+	}
+	if response.Filesystem.Status != systemmetrics.FilesystemStatusOK ||
+		response.Filesystem.Path != filepath.Clean(os.TempDir()) ||
+		response.Filesystem.TotalBytes == 0 {
+		t.Fatalf("GET response filesystem = %#v", response.Filesystem)
 	}
 }
 

@@ -582,6 +582,7 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.PUT("/pprof/addr", s.mgmt.PutPprofAddr)
 		mgmt.PATCH("/pprof/addr", s.mgmt.PutPprofAddr)
 		mgmt.GET("/pprof/profile/:profile", s.mgmt.GetPprofProfile)
+		mgmt.GET("/system/metrics", s.mgmt.GetSystemMetrics)
 
 		mgmt.GET("/logging-to-file", s.mgmt.GetLoggingToFile)
 		mgmt.PUT("/logging-to-file", s.mgmt.PutLoggingToFile)
