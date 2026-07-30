@@ -368,6 +368,7 @@ func (service *Service) Refresh(ctx context.Context, credential Credential, prox
 	refreshed.Expired = tokenExpiryString(refreshed.AccessToken, refreshed.IDToken)
 	PopulateCredentialIdentity(refreshed)
 	refreshed.Cookies = client.ExportCookies()
+	refreshed.Cookies, refreshed.SessionToken = normalizeSessionCookies(refreshed.Cookies)
 	refreshed.LastRefreshAt = service.timestamp()
 	service.updateLifecycle(refreshed, LifecycleActive, "")
 	return refreshed, nil
@@ -382,6 +383,7 @@ func (service *Service) RefreshSession(ctx context.Context, credential Credentia
 	refreshed.CredentialMode = CredentialModeNative
 	refreshed.Persona = normalizePersona(refreshed.Persona)
 	refreshed.Cookies = scopeUnscopedCookiesForURL(refreshed.Cookies, service.options.SessionBaseURL)
+	refreshed.Cookies, refreshed.SessionToken = normalizeSessionCookies(refreshed.Cookies)
 	if !HasSessionCookieForURL(refreshed.Cookies, service.options.SessionBaseURL) {
 		authError := newAuthError("session_cookie_missing", LifecycleReauthRequired, 0, false, true, "chatgpt session cookie is required", nil)
 		service.applyFailure(refreshed, authError, false)
@@ -474,6 +476,7 @@ func (service *Service) RefreshSession(ctx context.Context, credential Credentia
 		refreshed.PlanType = planType
 	}
 	refreshed.Cookies = client.ExportCookies()
+	refreshed.Cookies, refreshed.SessionToken = normalizeSessionCookies(refreshed.Cookies)
 	refreshed.LastRefreshAt = service.timestamp()
 	service.updateLifecycle(refreshed, LifecycleActive, "")
 	return refreshed, nil
@@ -616,6 +619,7 @@ func (service *Service) finishLogin(ctx context.Context, client *Client, credent
 	credential.Expired = tokenExpiryString(tokens.AccessToken, tokens.IDToken)
 	PopulateCredentialIdentity(credential)
 	credential.Cookies = client.ExportCookies()
+	credential.Cookies, credential.SessionToken = normalizeSessionCookies(credential.Cookies)
 	credential.Persona = client.Persona()
 	now := service.timestamp()
 	credential.LastLoginAt = now

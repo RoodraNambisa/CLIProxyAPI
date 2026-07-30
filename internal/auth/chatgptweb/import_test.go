@@ -32,6 +32,9 @@ func TestDecodeImportCredentialCompatibilityFields(t *testing.T) {
 			if test.name == "token only" && HasSessionCookie(credential.Cookies) {
 				t.Fatal("session_token was interpreted as a browser cookie")
 			}
+			if test.name == "token only" && credential.SessionToken != "" {
+				t.Fatalf("generic session_token was retained as derived session token: %q", credential.SessionToken)
+			}
 			if test.sessionValue != "" {
 				value := ""
 				for _, cookie := range credential.Cookies {
@@ -44,6 +47,33 @@ func TestDecodeImportCredentialCompatibilityFields(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestDecodeImportCredentialPrefersChunkedSessionCookie(t *testing.T) {
+	credential, errDecode := DecodeImportCredential([]byte(`{
+		"access_token":"access",
+		"cookie_header":"__Secure-next-auth.session-token.0=chunk-a; __Secure-next-auth.session-token.1=chunk-b; oai-did=device",
+		"session_cookie":"chunk-achunk-b"
+	}`))
+	if errDecode != nil {
+		t.Fatal(errDecode)
+	}
+	if credential.RefreshStrategy != RefreshStrategyChatGPTSession {
+		t.Fatalf("strategy = %q", credential.RefreshStrategy)
+	}
+	if credential.SessionToken != "chunk-achunk-b" {
+		t.Fatalf("session token = %q", credential.SessionToken)
+	}
+	names := make(map[string]bool)
+	for _, cookie := range credential.Cookies {
+		names[cookie.Name] = true
+	}
+	if names["__Secure-next-auth.session-token"] {
+		t.Fatal("unchunked session cookie was retained beside chunked cookies")
+	}
+	if !names["__Secure-next-auth.session-token.0"] || !names["__Secure-next-auth.session-token.1"] || !names["oai-did"] {
+		t.Fatalf("normalized cookies = %#v", credential.Cookies)
 	}
 }
 

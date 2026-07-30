@@ -42,6 +42,7 @@ func NewAcquisitionClient(persona Persona, proxyURL string, cookies []Cookie, ti
 func newClient(persona Persona, proxyURL string, cookies []Cookie, timeout time.Duration) (*Client, error) {
 	persona = normalizePersona(persona)
 	proxyURL = strings.TrimSpace(proxyURL)
+	cookies, _ = normalizeSessionCookies(cookies)
 	profile, ok := findTLSProfile(persona.Profile)
 	if !ok {
 		return nil, fmt.Errorf("unsupported TLS profile %q", persona.Profile)
@@ -418,6 +419,7 @@ func (client *Client) ExportCookies() []Cookie {
 			})
 		}
 	}
+	result, _ = normalizeSessionCookies(result)
 	return result
 }
 

@@ -1927,6 +1927,58 @@ func TestServiceRefreshSession(t *testing.T) {
 	}
 }
 
+func TestServiceRefreshSessionDoesNotSendDirectCookieBesideChunks(t *testing.T) {
+	expiresAt := time.Now().Add(2 * time.Hour).Unix()
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/api/auth/session" {
+			http.NotFound(response, request)
+			return
+		}
+		if cookie, errCookie := request.Cookie("next-auth.session-token"); errCookie == nil || cookie != nil {
+			t.Errorf("unexpected direct session cookie = %#v, err = %v", cookie, errCookie)
+		}
+		first, errFirst := request.Cookie("next-auth.session-token.0")
+		second, errSecond := request.Cookie("next-auth.session-token.1")
+		if errFirst != nil || errSecond != nil || first.Value != "chunk-a" || second.Value != "chunk-b" {
+			t.Errorf("chunked session cookies = %#v/%#v, errors = %v/%v", first, second, errFirst, errSecond)
+		}
+		response.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(response, `{"accessToken":"`+testJWT(expiresAt)+`","user":{"id":"user-a","email":"person@example.com"},"account":{"id":"account-a"}}`)
+	}))
+	defer server.Close()
+
+	serverURL, errURL := url.Parse(server.URL)
+	if errURL != nil {
+		t.Fatal(errURL)
+	}
+	cookie := func(name, value string) Cookie {
+		return Cookie{Name: name, Value: value, Host: serverURL.Host, Path: "/", HTTPOnly: true}
+	}
+	cookies := []Cookie{
+		cookie("next-auth.session-token.0", "chunk-a"),
+		cookie("next-auth.session-token.1", "chunk-b"),
+		cookie("next-auth.session-token", "chunk-achunk-b"),
+	}
+	service := NewService(Options{SessionBaseURL: server.URL, Rand: zeroReader{}})
+	credential, errRefresh := service.RefreshSession(t.Context(), Credential{
+		AccessToken:     "old",
+		RefreshStrategy: RefreshStrategyChatGPTSession,
+		Persona:         DefaultPersona(),
+		Cookies:         cookies,
+	}, "")
+	if errRefresh != nil {
+		t.Fatal(errRefresh)
+	}
+	if credential.SessionToken != "chunk-achunk-b" {
+		t.Fatalf("session token = %q", credential.SessionToken)
+	}
+	for _, cookie := range credential.Cookies {
+		if cookie.Name == "next-auth.session-token" {
+			t.Fatal("direct session cookie was persisted after refresh")
+		}
+	}
+}
+
 func TestServiceRefreshSessionRejectsAccountSwitch(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
 		if request.URL.Path != "/api/auth/session" {

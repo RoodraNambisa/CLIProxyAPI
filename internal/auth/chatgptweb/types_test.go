@@ -65,6 +65,91 @@ func TestDecodeCredentialScopesLegacySessionCookie(t *testing.T) {
 	}
 }
 
+func TestDecodeCredentialNormalizesPersistedSessionCookieConflict(t *testing.T) {
+	credential, errDecode := DecodeCredential([]byte(`{
+		"type":"chatgpt-web",
+		"session_token":"stale-direct",
+		"cookies":[
+			{"name":"__Secure-next-auth.session-token","value":"stale-direct","host":"chatgpt.com","path":"/","secure":true},
+			{"name":"__Secure-next-auth.session-token.0","value":"chunk-a","domain":"chatgpt.com","path":"/","secure":true},
+			{"name":"__Secure-next-auth.session-token.1","value":"chunk-b","domain":"chatgpt.com","path":"/","secure":true}
+		]
+	}`))
+	if errDecode != nil {
+		t.Fatal(errDecode)
+	}
+	if credential.SessionToken != "chunk-achunk-b" {
+		t.Fatalf("session token = %q", credential.SessionToken)
+	}
+	if len(credential.Cookies) != 2 {
+		t.Fatalf("cookies = %#v", credential.Cookies)
+	}
+	for _, cookie := range credential.Cookies {
+		if cookie.Name == "__Secure-next-auth.session-token" {
+			t.Fatal("unchunked session cookie survived credential normalization")
+		}
+	}
+	metadata := make(map[string]any)
+	credential.ApplyToMetadata(metadata)
+	if metadata["session_token"] != "chunk-achunk-b" {
+		t.Fatalf("persisted session token = %#v", metadata["session_token"])
+	}
+}
+
+func TestNormalizeSessionCookiesKeepsDirectCookieForIncompleteOrDifferentScopeChunks(t *testing.T) {
+	direct := Cookie{
+		Name: "__Secure-next-auth.session-token", Value: "direct", Domain: "chatgpt.com", Path: "/", Secure: true,
+	}
+	tests := []struct {
+		name    string
+		cookies []Cookie
+	}{
+		{
+			name: "incomplete chunks",
+			cookies: []Cookie{
+				direct,
+				{Name: "__Secure-next-auth.session-token.0", Value: "chunk-a", Domain: "chatgpt.com", Path: "/", Secure: true},
+			},
+		},
+		{
+			name: "different scope",
+			cookies: []Cookie{
+				direct,
+				{Name: "__Secure-next-auth.session-token.0", Value: "chunk-a", Domain: "chatgpt.com", Path: "/other", Secure: true},
+				{Name: "__Secure-next-auth.session-token.1", Value: "chunk-b", Domain: "chatgpt.com", Path: "/other", Secure: true},
+			},
+		},
+		{
+			name: "expired chunks",
+			cookies: []Cookie{
+				direct,
+				{
+					Name: "__Secure-next-auth.session-token.0", Value: "chunk-a", Domain: "chatgpt.com", Path: "/",
+					Secure: true, Expires: time.Now().Add(-time.Hour).UTC().Format(time.RFC3339Nano),
+				},
+				{
+					Name: "__Secure-next-auth.session-token.1", Value: "chunk-b", Domain: "chatgpt.com", Path: "/",
+					Secure: true, Expires: time.Now().Add(-time.Hour).UTC().Format(time.RFC3339Nano),
+				},
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			normalized, _ := normalizeSessionCookies(test.cookies)
+			foundDirect := false
+			for _, cookie := range normalized {
+				if cookie.Name == direct.Name && cookie.Path == direct.Path {
+					foundDirect = true
+				}
+			}
+			if !foundDirect {
+				t.Fatalf("direct cookie was removed from %#v", normalized)
+			}
+		})
+	}
+}
+
 func TestCredentialMetadataRoundTrip(t *testing.T) {
 	t.Parallel()
 	original := &Credential{

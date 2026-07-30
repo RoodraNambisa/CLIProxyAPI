@@ -116,6 +116,7 @@ type Credential struct {
 	AccessToken         string          `json:"access_token"`
 	RefreshToken        string          `json:"refresh_token"`
 	IDToken             string          `json:"id_token"`
+	SessionToken        string          `json:"session_token,omitempty"`
 	Expired             string          `json:"expired"`
 	Cookies             []Cookie        `json:"cookies"`
 	Persona             Persona         `json:"persona"`
@@ -155,6 +156,7 @@ func DecodeCredential(data []byte) (*Credential, error) {
 	}
 	credential.Type = Provider
 	credential.Cookies = scopeUnscopedCookiesForURL(credential.Cookies, SessionBaseURL)
+	credential.Cookies, credential.SessionToken = normalizeSessionCookies(credential.Cookies)
 	strategy, errStrategy := NormalizeRefreshStrategy(credential.RefreshStrategy, &credential)
 	if errStrategy != nil {
 		return nil, errStrategy
@@ -212,8 +214,14 @@ func (credential *Credential) ApplyToMetadata(metadata map[string]any) {
 	metadata["access_token"] = credential.AccessToken
 	metadata["refresh_token"] = credential.RefreshToken
 	metadata["id_token"] = credential.IDToken
+	normalizedCookies, sessionToken := normalizeSessionCookies(credential.Cookies)
+	if sessionToken == "" {
+		delete(metadata, "session_token")
+	} else {
+		metadata["session_token"] = sessionToken
+	}
 	metadata["expired"] = credential.Expired
-	metadata["cookies"] = credential.Cookies
+	metadata["cookies"] = normalizedCookies
 	metadata["persona"] = normalizePersona(credential.Persona)
 	metadata["device_id"] = credential.DeviceID
 	metadata["session_id"] = credential.SessionID
