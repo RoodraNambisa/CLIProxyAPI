@@ -60,7 +60,9 @@ func TestGetChatGPTWebUsageCacheReturnsDefaultsAndRuntimeStats(t *testing.T) {
 		response.UsageCache.MinAvailableDiskMB != config.DefaultChatGPTWebUsageCacheMinAvailableMB ||
 		response.UsageCache.MaxFilesystemUsedPercent != config.DefaultChatGPTWebUsageCacheMaxUsedPercent ||
 		response.UsageCache.OrphanRetentionMinutes != 0 ||
-		response.ImageUsage.AutoOutputQuality != "medium" {
+		response.ImageUsage.AutoOutputQuality != "medium" ||
+		response.ImageUsage.FallbackUsage.Enabled ||
+		response.ImageUsage.FallbackUsage.OutputImageTokens != config.DefaultChatGPTWebFallbackOutputImageTokens {
 		t.Fatalf("GET response config = %#v", response)
 	}
 	if response.Stats.ActiveDiskBytes != 42 || response.Stats.PeakDiskBytes != 84 || response.Stats.SuccessfulCalculations != 3 {
@@ -91,7 +93,16 @@ func TestPatchChatGPTWebUsageCachePersistsAndUpdatesRuntime(t *testing.T) {
 			"orphan-retention-minutes":60,
 			"path":"/tmp/web-usage"
 		},
-		"image-usage":{"auto-output-quality":"high"}
+		"image-usage":{
+			"auto-output-quality":"high",
+			"fallback-usage":{
+				"enabled":true,
+				"input-text-tokens":11,
+				"input-image-tokens":12,
+				"output-text-tokens":13,
+				"output-image-tokens":2014
+			}
+		}
 	}`
 	ctx, recorder := newChatGPTWebUsageCacheRequest(http.MethodPatch, body)
 	handler.PatchChatGPTWebUsageCache(ctx)
@@ -116,6 +127,38 @@ func TestPatchChatGPTWebUsageCachePersistsAndUpdatesRuntime(t *testing.T) {
 		reloaded.ChatGPTWeb.UsageCache.Resolved().OrphanRetentionMinutes != 60 ||
 		reloaded.ChatGPTWeb.ImageUsage.ResolvedAutoOutputQuality() != "high" {
 		t.Fatalf("persisted config = %#v", reloaded.ChatGPTWeb)
+	}
+	fallback := reloaded.ChatGPTWeb.ImageUsage.FallbackUsage.Resolved()
+	if !fallback.Enabled || fallback.InputTextTokens != 11 || fallback.InputImageTokens != 12 ||
+		fallback.OutputTextTokens != 13 || fallback.OutputImageTokens != 2014 {
+		t.Fatalf("persisted fallback = %#v", fallback)
+	}
+}
+
+func TestPatchChatGPTWebImageFallbackUsageIsPartialAndStrict(t *testing.T) {
+	handler := &Handler{cfg: &config.Config{}, configFilePath: writeTestConfigFile(t)}
+	ctx, recorder := newChatGPTWebUsageCacheRequest(http.MethodPatch, `{
+		"image-usage":{"fallback-usage":{"enabled":true,"output-image-tokens":2500}}
+	}`)
+	handler.PatchChatGPTWebUsageCache(ctx)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("PATCH status = %d, want 200: %s", recorder.Code, recorder.Body.String())
+	}
+	fallback := handler.cfg.ChatGPTWeb.ImageUsage.FallbackUsage.Resolved()
+	if !fallback.Enabled || fallback.OutputImageTokens != 2500 ||
+		fallback.InputTextTokens != 0 || fallback.InputImageTokens != 0 || fallback.OutputTextTokens != 0 {
+		t.Fatalf("fallback = %#v", fallback)
+	}
+
+	ctx, recorder = newChatGPTWebUsageCacheRequest(http.MethodPatch, `{
+		"image-usage":{"fallback-usage":{"unknown":1}}
+	}`)
+	handler.PatchChatGPTWebUsageCache(ctx)
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("strict PATCH status = %d, want 400: %s", recorder.Code, recorder.Body.String())
+	}
+	if got := handler.cfg.ChatGPTWeb.ImageUsage.FallbackUsage.Resolved(); got != fallback {
+		t.Fatalf("fallback mutated after rejection: %#v", got)
 	}
 }
 

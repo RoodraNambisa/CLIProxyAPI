@@ -28,6 +28,14 @@ func TestChatGPTWebUsageCacheDefaults(t *testing.T) {
 	if quality := (ChatGPTWebImageUsageConfig{}).ResolvedAutoOutputQuality(); quality != "medium" {
 		t.Fatalf("ResolvedAutoOutputQuality() = %q, want medium", quality)
 	}
+	fallback := (ChatGPTWebImageFallbackUsageConfig{}).Resolved()
+	if fallback.Enabled ||
+		fallback.InputTextTokens != 0 ||
+		fallback.InputImageTokens != 0 ||
+		fallback.OutputTextTokens != 0 ||
+		fallback.OutputImageTokens != DefaultChatGPTWebFallbackOutputImageTokens {
+		t.Fatalf("fallback Resolved() = %#v", fallback)
+	}
 }
 
 func TestChatGPTWebUsageConfigValidation(t *testing.T) {
@@ -40,6 +48,7 @@ func TestChatGPTWebUsageConfigValidation(t *testing.T) {
 	overPercent := 101
 	negativeRetention := -1
 	overRetention := MaxChatGPTWebUsageCacheOrphanRetention + 1
+	negativeTokens := int64(-1)
 	for _, test := range []struct {
 		name   string
 		config ChatGPTWebConfig
@@ -54,6 +63,9 @@ func TestChatGPTWebUsageConfigValidation(t *testing.T) {
 		{name: "negative orphan retention", config: ChatGPTWebConfig{UsageCache: ChatGPTWebUsageCacheConfig{OrphanRetentionMinutes: &negativeRetention}}},
 		{name: "orphan retention above maximum", config: ChatGPTWebConfig{UsageCache: ChatGPTWebUsageCacheConfig{OrphanRetentionMinutes: &overRetention}}},
 		{name: "invalid quality", config: ChatGPTWebConfig{ImageUsage: ChatGPTWebImageUsageConfig{AutoOutputQuality: "ultra"}}},
+		{name: "negative fallback", config: ChatGPTWebConfig{ImageUsage: ChatGPTWebImageUsageConfig{
+			FallbackUsage: ChatGPTWebImageFallbackUsageConfig{OutputImageTokens: &negativeTokens},
+		}}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			if err := test.config.Validate(); err == nil {
@@ -169,6 +181,18 @@ func TestSaveConfigPreservesChatGPTWebUsageCacheSettings(t *testing.T) {
 		Path:                     "",
 	}
 	cfg.ChatGPTWeb.ImageUsage.AutoOutputQuality = "high"
+	fallbackEnabled := true
+	inputTextTokens := int64(3)
+	inputImageTokens := int64(4)
+	outputTextTokens := int64(5)
+	outputImageTokens := int64(2000)
+	cfg.ChatGPTWeb.ImageUsage.FallbackUsage = ChatGPTWebImageFallbackUsageConfig{
+		Enabled:           &fallbackEnabled,
+		InputTextTokens:   &inputTextTokens,
+		InputImageTokens:  &inputImageTokens,
+		OutputTextTokens:  &outputTextTokens,
+		OutputImageTokens: &outputImageTokens,
+	}
 	if errSave := SaveConfigPreserveComments(path, cfg); errSave != nil {
 		t.Fatalf("SaveConfigPreserveComments() error = %v", errSave)
 	}
@@ -181,7 +205,8 @@ func TestSaveConfigPreservesChatGPTWebUsageCacheSettings(t *testing.T) {
 		"usage-cache:", "enabled: false", "disk-threshold-mb: 2", "max-disk-size-mb: 16",
 		"resource-guard-enabled: false", "min-available-disk-mb: 4", "max-filesystem-used-percent: 90",
 		"orphan-retention-minutes: 60",
-		"image-usage:", "auto-output-quality: high",
+		"image-usage:", "auto-output-quality: high", "fallback-usage:", "input-text-tokens: 3",
+		"input-image-tokens: 4", "output-text-tokens: 5", "output-image-tokens: 2000",
 	} {
 		if !strings.Contains(string(saved), expected) {
 			t.Fatalf("saved config omitted %q:\n%s", expected, saved)
@@ -192,10 +217,13 @@ func TestSaveConfigPreservesChatGPTWebUsageCacheSettings(t *testing.T) {
 		t.Fatalf("LoadConfig() after save error = %v", errReload)
 	}
 	resolved := reloaded.ChatGPTWeb.UsageCache.Resolved()
+	fallback := reloaded.ChatGPTWeb.ImageUsage.FallbackUsage.Resolved()
 	if resolved.Enabled || resolved.DiskThresholdMB != 2 || resolved.MaxDiskSizeMB != 16 ||
 		resolved.ResourceGuardEnabled || resolved.MinAvailableDiskMB != 4 || resolved.MaxFilesystemUsedPercent != 90 ||
 		resolved.OrphanRetentionMinutes != 60 ||
-		reloaded.ChatGPTWeb.ImageUsage.ResolvedAutoOutputQuality() != "high" {
+		reloaded.ChatGPTWeb.ImageUsage.ResolvedAutoOutputQuality() != "high" ||
+		!fallback.Enabled || fallback.InputTextTokens != 3 || fallback.InputImageTokens != 4 ||
+		fallback.OutputTextTokens != 5 || fallback.OutputImageTokens != 2000 {
 		t.Fatalf("reloaded config = %#v", reloaded.ChatGPTWeb)
 	}
 }

@@ -845,6 +845,29 @@ func TestChatGPTWebImageProjectionSeparatesResponseAndToolUsage(t *testing.T) {
 	projection.Complete()
 }
 
+func TestChatGPTWebImageUsageMapMatchesOfficialShape(t *testing.T) {
+	usage := ChatGPTWebImageUsageMap(15, 0, 0, 229)
+	if usage["input_tokens"].(int64) != 15 ||
+		usage["output_tokens"].(int64) != 229 ||
+		usage["total_tokens"].(int64) != 244 {
+		t.Fatalf("usage = %#v", usage)
+	}
+	inputDetails := usage["input_tokens_details"].(map[string]any)
+	outputDetails := usage["output_tokens_details"].(map[string]any)
+	if inputDetails["text_tokens"].(int64) != 15 ||
+		inputDetails["image_tokens"].(int64) != 0 ||
+		outputDetails["text_tokens"].(int64) != 0 ||
+		outputDetails["image_tokens"].(int64) != 229 {
+		t.Fatalf("usage details = input %#v output %#v", inputDetails, outputDetails)
+	}
+	if _, exists := inputDetails["cached_tokens"]; exists {
+		t.Fatalf("image input details include cached_tokens: %#v", inputDetails)
+	}
+	if _, exists := outputDetails["reasoning_tokens"]; exists {
+		t.Fatalf("image output details include reasoning_tokens: %#v", outputDetails)
+	}
+}
+
 func chatGPTWebUsageTestRequest(text string) ChatGPTWebRequest {
 	return ChatGPTWebRequest{Messages: []ChatGPTWebMessage{{
 		Role:  "user",

@@ -554,11 +554,26 @@ func ChatGPTWebEncodedImageSize(value string, maxBytes int) (int, error) {
 
 func validateChatGPTWebImageTool(tool map[string]any, ignoreUnsupportedParams bool) error {
 	if !ignoreUnsupportedParams {
-		for _, field := range []string{"background", "input_fidelity", "moderation", "output_compression"} {
-			if value, exists := tool[field]; exists && strings.TrimSpace(stringFromAny(value)) != "" {
-				return &ChatGPTWebUnsupportedToolError{
-					Message: fmt.Sprintf("chatgpt web does not support image_generation field %q", field),
+		for _, candidate := range []struct {
+			field        string
+			defaultValue string
+		}{
+			{field: "background", defaultValue: "auto"},
+			{field: "moderation", defaultValue: "auto"},
+			{field: "output_compression", defaultValue: "100"},
+		} {
+			if value, exists := tool[candidate.field]; exists {
+				normalized := strings.ToLower(strings.TrimSpace(stringFromAny(value)))
+				if normalized != "" && normalized != candidate.defaultValue {
+					return &ChatGPTWebUnsupportedToolError{
+						Message: fmt.Sprintf("chatgpt web does not support image_generation field %q", candidate.field),
+					}
 				}
+			}
+		}
+		if value, exists := tool["input_fidelity"]; exists && strings.TrimSpace(stringFromAny(value)) != "" {
+			return &ChatGPTWebUnsupportedToolError{
+				Message: "chatgpt web does not support image_generation field \"input_fidelity\"",
 			}
 		}
 		if value := strings.ToLower(strings.TrimSpace(stringFromAny(tool["output_format"]))); value != "" && value != "png" {

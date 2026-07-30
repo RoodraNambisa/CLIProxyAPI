@@ -889,7 +889,7 @@ func (projection *ChatGPTWebUsageProjection) Estimate(outputText string, outputI
 	usage := chatGPTWebUsageMap(inputTextTokens, inputImageTokens, outputTextTokens, 0)
 	if projection.imageTool {
 		usage["tool_usage"] = map[string]any{
-			"image_gen": chatGPTWebUsageMap(inputTextTokens, inputImageTokens, 0, outputImageTokens),
+			"image_gen": ChatGPTWebImageUsageMap(inputTextTokens, inputImageTokens, 0, outputImageTokens),
 		}
 	}
 	return usage, errorsFound
@@ -1003,6 +1003,39 @@ func chatGPTWebUsageMap(inputText, inputImage, outputText, outputImage int64) ma
 			"image_tokens":     outputImage,
 		},
 	}
+}
+
+// ChatGPTWebImageUsageMap returns the usage shape emitted by the Images API.
+func ChatGPTWebImageUsageMap(inputText, inputImage, outputText, outputImage int64) map[string]any {
+	input := addChatGPTWebImageUsageTokens(inputText, inputImage)
+	output := addChatGPTWebImageUsageTokens(outputText, outputImage)
+	return map[string]any{
+		"input_tokens":  input,
+		"output_tokens": output,
+		"total_tokens":  addChatGPTWebImageUsageTokens(input, output),
+		"input_tokens_details": map[string]any{
+			"text_tokens":  inputText,
+			"image_tokens": inputImage,
+		},
+		"output_tokens_details": map[string]any{
+			"text_tokens":  outputText,
+			"image_tokens": outputImage,
+		},
+	}
+}
+
+func addChatGPTWebImageUsageTokens(left, right int64) int64 {
+	if left < 0 {
+		left = 0
+	}
+	if right < 0 {
+		right = 0
+	}
+	const maxInt64 = int64(^uint64(0) >> 1)
+	if left > maxInt64-right {
+		return maxInt64
+	}
+	return left + right
 }
 
 func (projection *ChatGPTWebUsageProjection) forEachTextRecord(visit func(bool, string) error) error {

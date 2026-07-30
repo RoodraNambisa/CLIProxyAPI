@@ -273,6 +273,23 @@ func BuildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 	if oldCfg.ChatGPTWeb.ImageUsage.ResolvedAutoOutputQuality() != newCfg.ChatGPTWeb.ImageUsage.ResolvedAutoOutputQuality() {
 		changes = append(changes, fmt.Sprintf("chatgpt-web.image-usage.auto-output-quality: %s -> %s", oldCfg.ChatGPTWeb.ImageUsage.ResolvedAutoOutputQuality(), newCfg.ChatGPTWeb.ImageUsage.ResolvedAutoOutputQuality()))
 	}
+	oldFallbackUsage := oldCfg.ChatGPTWeb.ImageUsage.FallbackUsage.Resolved()
+	newFallbackUsage := newCfg.ChatGPTWeb.ImageUsage.FallbackUsage.Resolved()
+	if oldFallbackUsage.Enabled != newFallbackUsage.Enabled {
+		changes = append(changes, fmt.Sprintf("chatgpt-web.image-usage.fallback-usage.enabled: %t -> %t", oldFallbackUsage.Enabled, newFallbackUsage.Enabled))
+	}
+	if oldFallbackUsage.InputTextTokens != newFallbackUsage.InputTextTokens {
+		changes = append(changes, fmt.Sprintf("chatgpt-web.image-usage.fallback-usage.input-text-tokens: %d -> %d", oldFallbackUsage.InputTextTokens, newFallbackUsage.InputTextTokens))
+	}
+	if oldFallbackUsage.InputImageTokens != newFallbackUsage.InputImageTokens {
+		changes = append(changes, fmt.Sprintf("chatgpt-web.image-usage.fallback-usage.input-image-tokens: %d -> %d", oldFallbackUsage.InputImageTokens, newFallbackUsage.InputImageTokens))
+	}
+	if oldFallbackUsage.OutputTextTokens != newFallbackUsage.OutputTextTokens {
+		changes = append(changes, fmt.Sprintf("chatgpt-web.image-usage.fallback-usage.output-text-tokens: %d -> %d", oldFallbackUsage.OutputTextTokens, newFallbackUsage.OutputTextTokens))
+	}
+	if oldFallbackUsage.OutputImageTokens != newFallbackUsage.OutputImageTokens {
+		changes = append(changes, fmt.Sprintf("chatgpt-web.image-usage.fallback-usage.output-image-tokens: %d -> %d", oldFallbackUsage.OutputImageTokens, newFallbackUsage.OutputImageTokens))
+	}
 	if oldCfg.Images.ChatGPTWeb.ResolvedUpstreamModel() != newCfg.Images.ChatGPTWeb.ResolvedUpstreamModel() {
 		changes = append(changes, fmt.Sprintf("images.chatgpt-web.upstream-model: %s -> %s", oldCfg.Images.ChatGPTWeb.ResolvedUpstreamModel(), newCfg.Images.ChatGPTWeb.ResolvedUpstreamModel()))
 	}

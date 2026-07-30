@@ -37,10 +37,20 @@ type chatGPTWebUsageCacheSettingsRequest struct {
 
 type chatGPTWebImageUsageRequest struct {
 	AutoOutputQuality json.RawMessage `json:"auto-output-quality"`
+	FallbackUsage     json.RawMessage `json:"fallback-usage"`
+}
+
+type chatGPTWebImageFallbackUsageRequest struct {
+	Enabled           json.RawMessage `json:"enabled"`
+	InputTextTokens   json.RawMessage `json:"input-text-tokens"`
+	InputImageTokens  json.RawMessage `json:"input-image-tokens"`
+	OutputTextTokens  json.RawMessage `json:"output-text-tokens"`
+	OutputImageTokens json.RawMessage `json:"output-image-tokens"`
 }
 
 type chatGPTWebImageUsageResponse struct {
-	AutoOutputQuality string `json:"auto-output-quality"`
+	AutoOutputQuality string                                            `json:"auto-output-quality"`
+	FallbackUsage     config.ResolvedChatGPTWebImageFallbackUsageConfig `json:"fallback-usage"`
 }
 
 type chatGPTWebUsageCacheResponse struct {
@@ -68,6 +78,7 @@ func (h *Handler) GetChatGPTWebUsageCache(c *gin.Context) {
 		UsageCache:         h.cfg.ChatGPTWeb.UsageCache.Resolved(),
 		ImageUsage: chatGPTWebImageUsageResponse{
 			AutoOutputQuality: h.cfg.ChatGPTWeb.ImageUsage.ResolvedAutoOutputQuality(),
+			FallbackUsage:     h.cfg.ChatGPTWeb.ImageUsage.FallbackUsage.Resolved(),
 		},
 	}
 	if h.authManager != nil {
@@ -217,6 +228,18 @@ func (request chatGPTWebUsageCacheRequest) apply(candidate *config.ChatGPTWebCon
 			}
 			candidate.ImageUsage.AutoOutputQuality = value
 		}
+		if len(decoded.FallbackUsage) > 0 {
+			fallback, errFallback := decodeChatGPTWebImageFallbackUsage(decoded.FallbackUsage)
+			if errFallback != nil {
+				return errFallback
+			}
+			if replace && !fallback.complete() {
+				return fmt.Errorf("all fallback-usage fields are required")
+			}
+			if errApply := fallback.apply(&candidate.ImageUsage.FallbackUsage); errApply != nil {
+				return errApply
+			}
+		}
 	}
 	return nil
 }
@@ -325,4 +348,62 @@ func decodeChatGPTWebImageUsage(raw json.RawMessage) (chatGPTWebImageUsageReques
 
 func (request chatGPTWebImageUsageRequest) complete() bool {
 	return len(request.AutoOutputQuality) > 0
+}
+
+func decodeChatGPTWebImageFallbackUsage(raw json.RawMessage) (chatGPTWebImageFallbackUsageRequest, error) {
+	var request chatGPTWebImageFallbackUsageRequest
+	if bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		return request, fmt.Errorf("fallback-usage must be an object")
+	}
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	if errDecode := decoder.Decode(&request); errDecode != nil {
+		return request, fmt.Errorf("invalid fallback-usage: %w", errDecode)
+	}
+	return request, nil
+}
+
+func (request chatGPTWebImageFallbackUsageRequest) complete() bool {
+	return len(request.Enabled) > 0 &&
+		len(request.InputTextTokens) > 0 &&
+		len(request.InputImageTokens) > 0 &&
+		len(request.OutputTextTokens) > 0 &&
+		len(request.OutputImageTokens) > 0
+}
+
+func (request chatGPTWebImageFallbackUsageRequest) apply(candidate *config.ChatGPTWebImageFallbackUsageConfig) error {
+	if candidate == nil {
+		return fmt.Errorf("configuration unavailable")
+	}
+	if len(request.Enabled) > 0 {
+		value, errValue := decodeSentinelBool(request.Enabled)
+		if errValue != nil {
+			return fmt.Errorf("invalid fallback-usage.enabled")
+		}
+		candidate.Enabled = &value
+	}
+	decodeInt64 := func(name string, raw json.RawMessage, target **int64) error {
+		if len(raw) == 0 {
+			return nil
+		}
+		if bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+			return fmt.Errorf("invalid %s", name)
+		}
+		var value int64
+		if errValue := json.Unmarshal(raw, &value); errValue != nil {
+			return fmt.Errorf("invalid %s", name)
+		}
+		*target = &value
+		return nil
+	}
+	if errValue := decodeInt64("fallback-usage.input-text-tokens", request.InputTextTokens, &candidate.InputTextTokens); errValue != nil {
+		return errValue
+	}
+	if errValue := decodeInt64("fallback-usage.input-image-tokens", request.InputImageTokens, &candidate.InputImageTokens); errValue != nil {
+		return errValue
+	}
+	if errValue := decodeInt64("fallback-usage.output-text-tokens", request.OutputTextTokens, &candidate.OutputTextTokens); errValue != nil {
+		return errValue
+	}
+	return decodeInt64("fallback-usage.output-image-tokens", request.OutputImageTokens, &candidate.OutputImageTokens)
 }

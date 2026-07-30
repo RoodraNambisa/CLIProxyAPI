@@ -7,6 +7,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"image"
+	_ "image/gif"
+	_ "image/jpeg"
+	_ "image/png"
 	"io"
 	"mime"
 	"mime/multipart"
@@ -24,6 +28,7 @@ import (
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v6/sdk/config"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
+	_ "golang.org/x/image/webp"
 )
 
 const (
@@ -862,7 +867,41 @@ func (h *OpenAIImagesAPIHandler) validateImageRequest(req *openAIImageRequest, o
 	if op.action == imageEditOperation.action && len(req.Images) == 0 {
 		return errors.New("at least one image is required")
 	}
+	applyOpenAIImageRequestDefaults(req, op)
 	return nil
+}
+
+func applyOpenAIImageRequestDefaults(req *openAIImageRequest, op imageOperation) {
+	if req == nil {
+		return
+	}
+	if req.N == nil {
+		n := 1
+		req.N = &n
+	}
+	if strings.TrimSpace(req.Size) == "" {
+		if op.action == imageEditOperation.action {
+			req.Size = "1024x1024"
+		} else {
+			req.Size = "auto"
+		}
+	}
+	if strings.TrimSpace(req.Quality) == "" {
+		req.Quality = "auto"
+	}
+	if strings.TrimSpace(req.Background) == "" {
+		req.Background = "auto"
+	}
+	if strings.TrimSpace(req.OutputFormat) == "" {
+		req.OutputFormat = "png"
+	}
+	if req.OutputCompression == nil {
+		compression := 100
+		req.OutputCompression = &compression
+	}
+	if strings.TrimSpace(req.Moderation) == "" {
+		req.Moderation = "auto"
+	}
 }
 
 func validateImageRequestCount(req *openAIImageRequest) error {
@@ -1125,14 +1164,16 @@ func imageResultFromOutputItemResult(item gjson.Result) (imageResult, bool) {
 	if b64 == "" {
 		return imageResult{}, false
 	}
-	return imageResult{
+	result := imageResult{
 		B64JSON:       b64,
 		RevisedPrompt: item.Get("revised_prompt").String(),
 		OutputFormat:  item.Get("output_format").String(),
 		Size:          item.Get("size").String(),
 		Background:    item.Get("background").String(),
 		Quality:       item.Get("quality").String(),
-	}, true
+	}
+	inferImageResultMetadata(&result)
+	return result, true
 }
 
 func imageUsageFromResponseResult(resp gjson.Result) json.RawMessage {
@@ -1201,16 +1242,51 @@ func imageResultsFromOutput(items []imageOutputItem) []imageResult {
 		if items[i].Type != "image_generation_call" || strings.TrimSpace(items[i].Result) == "" {
 			continue
 		}
-		results = append(results, imageResult{
+		result := imageResult{
 			B64JSON:       items[i].Result,
 			RevisedPrompt: items[i].RevisedPrompt,
 			OutputFormat:  items[i].OutputFormat,
 			Size:          items[i].Size,
 			Background:    items[i].Background,
 			Quality:       items[i].Quality,
-		})
+		}
+		inferImageResultMetadata(&result)
+		results = append(results, result)
 	}
 	return results
+}
+
+func inferImageResultMetadata(result *imageResult) {
+	if result == nil || strings.TrimSpace(result.B64JSON) == "" {
+		return
+	}
+	if strings.TrimSpace(result.OutputFormat) != "" && strings.TrimSpace(result.Size) != "" {
+		return
+	}
+	imageConfig, format, errDecode := image.DecodeConfig(base64.NewDecoder(
+		base64.StdEncoding,
+		strings.NewReader(result.B64JSON),
+	))
+	if errDecode != nil {
+		return
+	}
+	if strings.TrimSpace(result.OutputFormat) == "" {
+		result.OutputFormat = normalizeDecodedImageFormat(format)
+	}
+	if strings.TrimSpace(result.Size) == "" && imageConfig.Width > 0 && imageConfig.Height > 0 {
+		result.Size = fmt.Sprintf("%dx%d", imageConfig.Width, imageConfig.Height)
+	}
+}
+
+func normalizeDecodedImageFormat(format string) string {
+	switch strings.ToLower(strings.TrimSpace(format)) {
+	case "jpg":
+		return "jpeg"
+	case "png", "jpeg", "gif", "webp":
+		return strings.ToLower(strings.TrimSpace(format))
+	default:
+		return ""
+	}
 }
 
 func (r *imagesResponse) applyMetadataFromFirstImage() {
@@ -1325,9 +1401,15 @@ func mergeImageUsageMapsForNAggregation(current, next map[string]any) map[string
 	}
 	for key, value := range next {
 		switch key {
-		case "output_tokens", "output_tokens_details":
+		case "output_tokens":
 			if existing, ok := out[key]; ok {
 				out[key] = mergeImageUsageValue(existing, value)
+			} else {
+				out[key] = value
+			}
+		case "output_tokens_details":
+			if existing, ok := out[key]; ok {
+				out[key] = mergeImageOutputTokenDetails(existing, value)
 			} else {
 				out[key] = value
 			}
@@ -1340,11 +1422,38 @@ func mergeImageUsageMapsForNAggregation(current, next map[string]any) map[string
 				out[key] = value
 			}
 		default:
-			if existing, ok := out[key]; ok {
-				out[key] = mergeImageUsageValue(existing, value)
-			} else {
+			if _, ok := out[key]; !ok {
 				out[key] = value
 			}
+		}
+	}
+	return out
+}
+
+func mergeImageOutputTokenDetails(current, next any) any {
+	currentMap, currentOK := current.(map[string]any)
+	nextMap, nextOK := next.(map[string]any)
+	if !currentOK || !nextOK {
+		return current
+	}
+	out := make(map[string]any, len(currentMap)+len(nextMap))
+	for key, value := range currentMap {
+		out[key] = value
+	}
+	for _, key := range []string{"text_tokens", "image_tokens"} {
+		nextValue, exists := nextMap[key]
+		if !exists {
+			continue
+		}
+		if currentValue, ok := out[key]; ok {
+			out[key] = mergeImageUsageValue(currentValue, nextValue)
+		} else {
+			out[key] = nextValue
+		}
+	}
+	for key, value := range nextMap {
+		if _, exists := out[key]; !exists {
+			out[key] = value
 		}
 	}
 	return out
@@ -1568,17 +1677,22 @@ func chatGPTWebSupportsImageRequest(req openAIImageRequest, ignoreUnsupportedPar
 
 func chatGPTWebImageRequestCompatibilityError(req openAIImageRequest, ignoreUnsupportedParams bool) *chatGPTWebImageCompatibilityError {
 	if !ignoreUnsupportedParams {
+		size := strings.ToLower(strings.TrimSpace(req.Size))
+		defaultSize := size == "" || size == "auto" ||
+			(size == "1024x1024" && (len(req.Images) > 0 || req.Mask != nil))
+		background := strings.ToLower(strings.TrimSpace(req.Background))
+		moderation := strings.ToLower(strings.TrimSpace(req.Moderation))
 		unsupported := []struct {
 			parameter string
 			present   bool
 		}{
-			{parameter: "size", present: strings.TrimSpace(req.Size) != ""},
+			{parameter: "size", present: !defaultSize},
 			{parameter: "quality", present: strings.TrimSpace(req.Quality) != "" && !strings.EqualFold(strings.TrimSpace(req.Quality), "auto")},
-			{parameter: "background", present: strings.TrimSpace(req.Background) != ""},
+			{parameter: "background", present: background != "" && background != "auto"},
 			{parameter: "output_format", present: strings.TrimSpace(req.OutputFormat) != "" && !strings.EqualFold(strings.TrimSpace(req.OutputFormat), "png")},
 			{parameter: "input_fidelity", present: strings.TrimSpace(req.InputFidelity) != ""},
-			{parameter: "moderation", present: strings.TrimSpace(req.Moderation) != ""},
-			{parameter: "output_compression", present: req.OutputCompression != nil},
+			{parameter: "moderation", present: moderation != "" && moderation != "auto"},
+			{parameter: "output_compression", present: req.OutputCompression != nil && *req.OutputCompression != 100},
 			{parameter: "partial_images", present: req.PartialImages != nil && *req.PartialImages > 0},
 		}
 		for _, candidate := range unsupported {

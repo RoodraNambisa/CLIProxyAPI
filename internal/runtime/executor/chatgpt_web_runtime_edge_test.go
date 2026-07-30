@@ -6616,6 +6616,12 @@ func TestBuildChatGPTWebImageCompletedEventConvertsJPEGToPNG(t *testing.T) {
 	if got := gjson.GetBytes(completed, "response.output.0.output_format").String(); got != "png" {
 		t.Fatalf("output format = %q, want png", got)
 	}
+	if got := gjson.GetBytes(completed, "response.output.0.size").String(); got != "1x1" {
+		t.Fatalf("output size = %q, want 1x1", got)
+	}
+	if got := gjson.GetBytes(completed, "response.output.0.quality"); got.Exists() {
+		t.Fatalf("unknown output quality should be omitted: %s", got.Raw)
+	}
 	if got := gjson.GetBytes(completed, "response.usage.input_tokens").Int(); got != 7 {
 		t.Fatalf("input tokens = %d, want 7", got)
 	}
@@ -6650,6 +6656,64 @@ func TestBuildChatGPTWebImageCompletedEventDefaultsToPNG(t *testing.T) {
 	}
 	if got := chatGPTWebImageOutputFormat(decoded); got != "png" {
 		t.Fatalf("default image format = %q, want png", got)
+	}
+}
+
+func TestChatGPTWebImageFallbackUsageUsesActualImageCount(t *testing.T) {
+	enabled := true
+	inputText := int64(11)
+	inputImage := int64(12)
+	outputText := int64(13)
+	outputImage := int64(2000)
+	executor := NewChatGPTWebExecutor(nil, nil)
+	prepared := &chatGPTWebPreparedRequest{
+		request: helps.ChatGPTWebRequest{Image: &helps.ChatGPTWebImageRequest{}},
+		imageFallbackUsage: config.ChatGPTWebImageFallbackUsageConfig{
+			Enabled:           &enabled,
+			InputTextTokens:   &inputText,
+			InputImageTokens:  &inputImage,
+			OutputTextTokens:  &outputText,
+			OutputImageTokens: &outputImage,
+		}.Resolved(),
+	}
+	usage := executor.completeChatGPTWebUsage(prepared, "", []helps.ChatGPTWebUsageImage{{}, {}})
+	toolUsage := usage["tool_usage"].(map[string]any)["image_gen"].(map[string]any)
+	if got := toolUsage["input_tokens"].(int64); got != 23 {
+		t.Fatalf("input_tokens = %d, want 23", got)
+	}
+	if got := toolUsage["output_tokens"].(int64); got != 4026 {
+		t.Fatalf("output_tokens = %d, want 4026", got)
+	}
+	if got := toolUsage["total_tokens"].(int64); got != 4049 {
+		t.Fatalf("total_tokens = %d, want 4049", got)
+	}
+	if got := toolUsage["output_tokens_details"].(map[string]any)["image_tokens"].(int64); got != 4000 {
+		t.Fatalf("output image tokens = %d, want 4000", got)
+	}
+}
+
+func TestChatGPTWebDisabledFallbackReturnsOfficialZeroImageUsage(t *testing.T) {
+	executor := NewChatGPTWebExecutor(nil, nil)
+	prepared := &chatGPTWebPreparedRequest{
+		request:            helps.ChatGPTWebRequest{Image: &helps.ChatGPTWebImageRequest{}},
+		imageFallbackUsage: config.ChatGPTWebImageFallbackUsageConfig{}.Resolved(),
+	}
+	usage := executor.completeChatGPTWebUsage(prepared, "", []helps.ChatGPTWebUsageImage{{}})
+	toolUsage := usage["tool_usage"].(map[string]any)["image_gen"].(map[string]any)
+	inputDetails := toolUsage["input_tokens_details"].(map[string]any)
+	outputDetails := toolUsage["output_tokens_details"].(map[string]any)
+	if toolUsage["total_tokens"].(int64) != 0 ||
+		inputDetails["text_tokens"].(int64) != 0 ||
+		inputDetails["image_tokens"].(int64) != 0 ||
+		outputDetails["text_tokens"].(int64) != 0 ||
+		outputDetails["image_tokens"].(int64) != 0 {
+		t.Fatalf("zero image usage = %#v", toolUsage)
+	}
+	if _, exists := inputDetails["cached_tokens"]; exists {
+		t.Fatalf("Images input details contain Responses-only cached_tokens: %#v", inputDetails)
+	}
+	if _, exists := outputDetails["reasoning_tokens"]; exists {
+		t.Fatalf("Images output details contain Responses-only reasoning_tokens: %#v", outputDetails)
 	}
 }
 

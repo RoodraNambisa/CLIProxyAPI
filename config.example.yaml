@@ -96,6 +96,14 @@ chatgpt-web:
   image-usage:
     # Billing-only fallback for quality=auto; this does not change Web output quality.
     auto-output-quality: "medium"
+    # Used only after a successful image request when token estimation is disabled
+    # and the upstream response contains no image usage.
+    fallback-usage:
+      enabled: false
+      input-text-tokens: 0
+      input-image-tokens: 0
+      output-text-tokens: 0
+      output-image-tokens: 2000
   account-info:
     # Disable provider-owned quota refreshes and current-page automatic tasks.
     # Manual force refreshes remain available.

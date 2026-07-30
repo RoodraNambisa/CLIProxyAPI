@@ -41,37 +41,38 @@ const (
 	DefaultDisabledImageGenerationToolType       = "image_generation_disabled"
 	DefaultDisabledImageGenerationToolCode       = "image_generation_disabled"
 
-	DefaultChatGPTWebSentinelSDKQueueSize     = 32
-	DefaultChatGPTWebSentinelSDKCacheVersions = 3
-	MaxChatGPTWebSentinelSDKWorkers           = 16
-	MaxChatGPTWebSentinelSDKQueueSize         = 1024
-	MaxChatGPTWebSentinelSDKCacheVersions     = 5
-	DefaultChatGPTWebUsageCacheThresholdMB    = 1
-	DefaultChatGPTWebUsageCacheMaxDiskSizeMB  = 1024
-	DefaultChatGPTWebUsageCacheMinAvailableMB = 1024
-	DefaultChatGPTWebUsageCacheMaxUsedPercent = 95
-	MaxChatGPTWebUsageCacheOrphanRetention    = 10080
-	MaxChatGPTWebUsageCacheMegabytes          = (1<<63 - 1) >> 20
-	DefaultChatGPTWebAutoOutputQuality        = "medium"
-	DefaultChatGPTWebImageUpstreamModel       = "gpt-5-5"
-	DefaultChatGPTWebAutoReloginMaxRetries    = 3
-	DefaultChatGPTWebAutoReloginJitterPercent = 20
-	MaxChatGPTWebAutoReloginRetries           = 10
-	MaxChatGPTWebAutoReloginJitterPercent     = 100
-	DefaultChatGPTWebTimezone                 = "Asia/Shanghai"
-	DefaultChatGPTWebTimezoneOffsetMinutes    = -480
-	MinChatGPTWebTimezoneOffsetMinutes        = -840
-	MaxChatGPTWebTimezoneOffsetMinutes        = 840
-	DefaultChatGPTWebAccountInfoWorkers       = 4
-	DefaultChatGPTWebAccountInfoQueueSize     = 256
-	DefaultChatGPTWebAccountInfoTTLMinutes    = 15
-	DefaultChatGPTWebAccountInfoJitterSeconds = 30
-	DefaultChatGPTWebAccountInfoMaxRetries    = 3
-	MaxChatGPTWebAccountInfoWorkers           = 32
-	MaxChatGPTWebAccountInfoQueueSize         = 10000
-	MaxChatGPTWebAccountInfoTTLMinutes        = 1440
-	MaxChatGPTWebAccountInfoJitterSeconds     = 300
-	MaxChatGPTWebAccountInfoRetries           = 10
+	DefaultChatGPTWebSentinelSDKQueueSize      = 32
+	DefaultChatGPTWebSentinelSDKCacheVersions  = 3
+	MaxChatGPTWebSentinelSDKWorkers            = 16
+	MaxChatGPTWebSentinelSDKQueueSize          = 1024
+	MaxChatGPTWebSentinelSDKCacheVersions      = 5
+	DefaultChatGPTWebUsageCacheThresholdMB     = 1
+	DefaultChatGPTWebUsageCacheMaxDiskSizeMB   = 1024
+	DefaultChatGPTWebUsageCacheMinAvailableMB  = 1024
+	DefaultChatGPTWebUsageCacheMaxUsedPercent  = 95
+	MaxChatGPTWebUsageCacheOrphanRetention     = 10080
+	MaxChatGPTWebUsageCacheMegabytes           = (1<<63 - 1) >> 20
+	DefaultChatGPTWebAutoOutputQuality         = "medium"
+	DefaultChatGPTWebFallbackOutputImageTokens = 2000
+	DefaultChatGPTWebImageUpstreamModel        = "gpt-5-5"
+	DefaultChatGPTWebAutoReloginMaxRetries     = 3
+	DefaultChatGPTWebAutoReloginJitterPercent  = 20
+	MaxChatGPTWebAutoReloginRetries            = 10
+	MaxChatGPTWebAutoReloginJitterPercent      = 100
+	DefaultChatGPTWebTimezone                  = "Asia/Shanghai"
+	DefaultChatGPTWebTimezoneOffsetMinutes     = -480
+	MinChatGPTWebTimezoneOffsetMinutes         = -840
+	MaxChatGPTWebTimezoneOffsetMinutes         = 840
+	DefaultChatGPTWebAccountInfoWorkers        = 4
+	DefaultChatGPTWebAccountInfoQueueSize      = 256
+	DefaultChatGPTWebAccountInfoTTLMinutes     = 15
+	DefaultChatGPTWebAccountInfoJitterSeconds  = 30
+	DefaultChatGPTWebAccountInfoMaxRetries     = 3
+	MaxChatGPTWebAccountInfoWorkers            = 32
+	MaxChatGPTWebAccountInfoQueueSize          = 10000
+	MaxChatGPTWebAccountInfoTTLMinutes         = 1440
+	MaxChatGPTWebAccountInfoJitterSeconds      = 300
+	MaxChatGPTWebAccountInfoRetries            = 10
 )
 
 var (
@@ -621,9 +622,51 @@ func (cfg ChatGPTWebUsageCacheConfig) Validate() error {
 	return nil
 }
 
-// ChatGPTWebImageUsageConfig controls local image token estimation only.
+// ChatGPTWebImageUsageConfig controls local image token accounting.
 type ChatGPTWebImageUsageConfig struct {
-	AutoOutputQuality string `yaml:"auto-output-quality,omitempty" json:"auto-output-quality,omitempty"`
+	AutoOutputQuality string                             `yaml:"auto-output-quality,omitempty" json:"auto-output-quality,omitempty"`
+	FallbackUsage     ChatGPTWebImageFallbackUsageConfig `yaml:"fallback-usage,omitempty" json:"fallback-usage,omitempty"`
+}
+
+// ChatGPTWebImageFallbackUsageConfig controls fixed image usage returned when estimation is disabled.
+type ChatGPTWebImageFallbackUsageConfig struct {
+	Enabled           *bool  `yaml:"enabled,omitempty" json:"enabled,omitempty"`
+	InputTextTokens   *int64 `yaml:"input-text-tokens,omitempty" json:"input-text-tokens,omitempty"`
+	InputImageTokens  *int64 `yaml:"input-image-tokens,omitempty" json:"input-image-tokens,omitempty"`
+	OutputTextTokens  *int64 `yaml:"output-text-tokens,omitempty" json:"output-text-tokens,omitempty"`
+	OutputImageTokens *int64 `yaml:"output-image-tokens,omitempty" json:"output-image-tokens,omitempty"`
+}
+
+// ResolvedChatGPTWebImageFallbackUsageConfig contains effective fixed image usage values.
+type ResolvedChatGPTWebImageFallbackUsageConfig struct {
+	Enabled           bool  `json:"enabled"`
+	InputTextTokens   int64 `json:"input-text-tokens"`
+	InputImageTokens  int64 `json:"input-image-tokens"`
+	OutputTextTokens  int64 `json:"output-text-tokens"`
+	OutputImageTokens int64 `json:"output-image-tokens"`
+}
+
+// Resolved returns effective fixed image usage values.
+func (cfg ChatGPTWebImageFallbackUsageConfig) Resolved() ResolvedChatGPTWebImageFallbackUsageConfig {
+	resolved := ResolvedChatGPTWebImageFallbackUsageConfig{
+		OutputImageTokens: DefaultChatGPTWebFallbackOutputImageTokens,
+	}
+	if cfg.Enabled != nil {
+		resolved.Enabled = *cfg.Enabled
+	}
+	if cfg.InputTextTokens != nil {
+		resolved.InputTextTokens = *cfg.InputTextTokens
+	}
+	if cfg.InputImageTokens != nil {
+		resolved.InputImageTokens = *cfg.InputImageTokens
+	}
+	if cfg.OutputTextTokens != nil {
+		resolved.OutputTextTokens = *cfg.OutputTextTokens
+	}
+	if cfg.OutputImageTokens != nil {
+		resolved.OutputImageTokens = *cfg.OutputImageTokens
+	}
+	return resolved
 }
 
 // ResolvedAutoOutputQuality returns the local billing quality used for auto output.
@@ -639,10 +682,17 @@ func (cfg ChatGPTWebImageUsageConfig) ResolvedAutoOutputQuality() string {
 func (cfg ChatGPTWebImageUsageConfig) Validate() error {
 	switch cfg.ResolvedAutoOutputQuality() {
 	case "low", "medium", "high":
-		return nil
 	default:
 		return fmt.Errorf("chatgpt-web.image-usage.auto-output-quality must be low, medium, or high")
 	}
+	fallback := cfg.FallbackUsage.Resolved()
+	if fallback.InputTextTokens < 0 ||
+		fallback.InputImageTokens < 0 ||
+		fallback.OutputTextTokens < 0 ||
+		fallback.OutputImageTokens < 0 {
+		return fmt.Errorf("chatgpt-web.image-usage.fallback-usage token values must not be negative")
+	}
+	return nil
 }
 
 // Validate checks all ChatGPT Web runtime configuration.

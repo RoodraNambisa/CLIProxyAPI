@@ -651,7 +651,7 @@ func (e *ChatGPTWebExecutor) finishChatGPTWebImage(ctx context.Context, client *
 	if usage == nil {
 		usage = e.completeChatGPTWebUsage(prepared, "", outputImages)
 	}
-	completed, err := buildPreparedChatGPTWebImageCompletedEvent(prepared.routeModel, imageRequest.OutputFormat, images, usage)
+	completed, err := buildPreparedChatGPTWebImageCompletedEvent(prepared.routeModel, imageRequest.OutputFormat, images, outputImages, usage)
 	if err != nil {
 		return nil, err
 	}
@@ -714,13 +714,14 @@ func chatGPTWebImageFailureError(status string) error {
 }
 
 func buildChatGPTWebImageCompletedEvent(routeModel, requestedFormat string, images [][]byte, usage map[string]any) ([]byte, error) {
-	if _, err := prepareChatGPTWebImageOutputs(requestedFormat, routeModel, "", images); err != nil {
+	outputImages, err := prepareChatGPTWebImageOutputs(requestedFormat, routeModel, "", images)
+	if err != nil {
 		return nil, err
 	}
-	return buildPreparedChatGPTWebImageCompletedEvent(routeModel, requestedFormat, images, usage)
+	return buildPreparedChatGPTWebImageCompletedEvent(routeModel, requestedFormat, images, outputImages, usage)
 }
 
-func buildPreparedChatGPTWebImageCompletedEvent(routeModel, requestedFormat string, images [][]byte, usage map[string]any) ([]byte, error) {
+func buildPreparedChatGPTWebImageCompletedEvent(routeModel, requestedFormat string, images [][]byte, outputImages []helps.ChatGPTWebUsageImage, usage map[string]any) ([]byte, error) {
 	requestedFormat = normalizeChatGPTWebImageOutputFormat(requestedFormat)
 	totalBytes := 0
 	for _, imageData := range images {
@@ -754,6 +755,18 @@ func buildPreparedChatGPTWebImageCompletedEvent(routeModel, requestedFormat stri
 		images[index] = nil
 		output.WriteString(`","output_format":`)
 		writeChatGPTWebJSONString(&output, outputFormat)
+		if index < len(outputImages) {
+			imageOutput := outputImages[index]
+			if imageOutput.Width > 0 && imageOutput.Height > 0 {
+				output.WriteString(`,"size":`)
+				writeChatGPTWebJSONString(&output, fmt.Sprintf("%dx%d", imageOutput.Width, imageOutput.Height))
+			}
+			quality := strings.ToLower(strings.TrimSpace(imageOutput.Quality))
+			if quality != "" && quality != "auto" {
+				output.WriteString(`,"quality":`)
+				writeChatGPTWebJSONString(&output, quality)
+			}
+		}
 		output.WriteByte('}')
 	}
 	responseUsage := chatGPTWebUsageOrZero(usage)
@@ -2953,7 +2966,10 @@ func validateChatGPTWebImageRequest(request *helps.ChatGPTWebImageRequest) error
 	if request == nil {
 		return nil
 	}
-	if strings.TrimSpace(request.Size) != "" {
+	size := strings.ToLower(strings.TrimSpace(request.Size))
+	defaultSize := size == "" || size == "auto" ||
+		(size == "1024x1024" && strings.EqualFold(strings.TrimSpace(request.Action), "edit"))
+	if !defaultSize {
 		return statusErr{
 			code:           http.StatusBadRequest,
 			msg:            "chatgpt web does not support an exact image size",

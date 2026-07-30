@@ -43,18 +43,19 @@ const (
 )
 
 type chatGPTWebPreparedRequest struct {
-	baseModel        string
-	routeModel       string
-	responseFormat   sdktranslator.Format
-	originalPayload  []byte
-	canonicalBody    []byte
-	request          helps.ChatGPTWebRequest
-	terminalMarker   bool
-	trustUpstreamSSE bool
-	maxImageResults  int
-	usageProjection  *helps.ChatGPTWebUsageProjection
-	bodyRelease      *cliproxyexecutor.RequestBodyReleaseController
-	imageResultState *cliproxyexecutor.ImageGenerationResultState
+	baseModel          string
+	routeModel         string
+	responseFormat     sdktranslator.Format
+	originalPayload    []byte
+	canonicalBody      []byte
+	request            helps.ChatGPTWebRequest
+	terminalMarker     bool
+	trustUpstreamSSE   bool
+	maxImageResults    int
+	usageProjection    *helps.ChatGPTWebUsageProjection
+	imageFallbackUsage config.ResolvedChatGPTWebImageFallbackUsageConfig
+	bodyRelease        *cliproxyexecutor.RequestBodyReleaseController
+	imageResultState   *cliproxyexecutor.ImageGenerationResultState
 }
 
 type chatGPTWebRequirements struct {
@@ -406,6 +407,10 @@ func (e *ChatGPTWebExecutor) prepareRuntimeRequest(ctx context.Context, auth *cl
 		}
 	}
 	var usageProjection *helps.ChatGPTWebUsageProjection
+	fallbackUsage := config.ChatGPTWebImageFallbackUsageConfig{}.Resolved()
+	if cfg != nil {
+		fallbackUsage = cfg.ChatGPTWeb.ImageUsage.FallbackUsage.Resolved()
+	}
 	if cfg == nil || cfg.ChatGPTWeb.TokenUsageEstimationEnabled() {
 		resolvedCache := config.ResolvedChatGPTWebUsageCacheConfig{
 			DiskThresholdMB:          config.DefaultChatGPTWebUsageCacheThresholdMB,
@@ -447,10 +452,11 @@ func (e *ChatGPTWebExecutor) prepareRuntimeRequest(ctx context.Context, auth *cl
 		terminalMarker:  metadataBool(opts.Metadata, cliproxyexecutor.StreamTerminalMarkerMetadataKey),
 		trustUpstreamSSE: metadataBool(opts.Metadata, cliproxyexecutor.TrustUpstreamSSEMetadataKey) &&
 			responseFormat == sdktranslator.FormatOpenAIResponse,
-		maxImageResults:  chatGPTWebMaxImageResults(opts.Metadata),
-		usageProjection:  usageProjection,
-		bodyRelease:      cliproxyexecutor.RequestBodyReleaseControllerFromOptions(opts),
-		imageResultState: imageResultState,
+		maxImageResults:    chatGPTWebMaxImageResults(opts.Metadata),
+		usageProjection:    usageProjection,
+		imageFallbackUsage: fallbackUsage,
+		bodyRelease:        cliproxyexecutor.RequestBodyReleaseControllerFromOptions(opts),
+		imageResultState:   imageResultState,
 	}, nil
 }
 
@@ -504,8 +510,27 @@ func (prepared *chatGPTWebPreparedRequest) discardUsageProjection() {
 }
 
 func (e *ChatGPTWebExecutor) completeChatGPTWebUsage(prepared *chatGPTWebPreparedRequest, outputText string, outputImages []helps.ChatGPTWebUsageImage) map[string]any {
-	if prepared == nil || prepared.usageProjection == nil {
+	if prepared == nil {
 		return nil
+	}
+	if prepared.usageProjection == nil {
+		if prepared.request.Image == nil {
+			return nil
+		}
+		imageUsage := helps.ChatGPTWebImageUsageMap(0, 0, 0, 0)
+		fallback := prepared.imageFallbackUsage
+		if fallback.Enabled {
+			outputCount := int64(len(outputImages))
+			imageUsage = helps.ChatGPTWebImageUsageMap(
+				fallback.InputTextTokens,
+				fallback.InputImageTokens,
+				multiplyChatGPTWebUsageTokens(fallback.OutputTextTokens, outputCount),
+				multiplyChatGPTWebUsageTokens(fallback.OutputImageTokens, outputCount),
+			)
+		}
+		usage := chatGPTWebUsageOrZero(nil)
+		usage["tool_usage"] = map[string]any{"image_gen": imageUsage}
+		return usage
 	}
 	usage, estimateErrors := prepared.usageProjection.Estimate(outputText, outputImages)
 	for _, estimateErr := range estimateErrors {
@@ -514,6 +539,17 @@ func (e *ChatGPTWebExecutor) completeChatGPTWebUsage(prepared *chatGPTWebPrepare
 	prepared.usageProjection.Complete()
 	prepared.usageProjection = nil
 	return usage
+}
+
+func multiplyChatGPTWebUsageTokens(tokens, count int64) int64 {
+	if tokens <= 0 || count <= 0 {
+		return 0
+	}
+	const maxInt64 = int64(^uint64(0) >> 1)
+	if tokens > maxInt64/count {
+		return maxInt64
+	}
+	return tokens * count
 }
 
 func (e *ChatGPTWebExecutor) completeChatGPTWebUpstreamImageUsage(prepared *chatGPTWebPreparedRequest, toolUsage map[string]any) map[string]any {

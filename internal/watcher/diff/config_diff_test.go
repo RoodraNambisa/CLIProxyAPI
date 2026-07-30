@@ -100,13 +100,21 @@ func TestBuildConfigChangeDetails_ChatGPTWebTokenUsageEstimation(t *testing.T) {
 	newThreshold := int64(2)
 	oldMaximum := int64(16)
 	newMaximum := int64(32)
+	fallbackEnabled := true
+	fallbackOutputTokens := int64(2500)
 	details := BuildConfigChangeDetails(&config.Config{}, &config.Config{
 		ChatGPTWeb: config.ChatGPTWebConfig{
 			EstimateTokenUsage: &disabled,
 			UsageCache: config.ChatGPTWebUsageCacheConfig{
 				Enabled: &enabled, DiskThresholdMB: &newThreshold, MaxDiskSizeMB: &newMaximum, Path: "/tmp/usage",
 			},
-			ImageUsage: config.ChatGPTWebImageUsageConfig{AutoOutputQuality: "high"},
+			ImageUsage: config.ChatGPTWebImageUsageConfig{
+				AutoOutputQuality: "high",
+				FallbackUsage: config.ChatGPTWebImageFallbackUsageConfig{
+					Enabled:           &fallbackEnabled,
+					OutputImageTokens: &fallbackOutputTokens,
+				},
+			},
 		},
 	})
 	expectContains(t, details, "chatgpt-web.estimate-token-usage: true -> false")
@@ -117,7 +125,13 @@ func TestBuildConfigChangeDetails_ChatGPTWebTokenUsageEstimation(t *testing.T) {
 		UsageCache: config.ChatGPTWebUsageCacheConfig{
 			Enabled: &enabled, DiskThresholdMB: &newThreshold, MaxDiskSizeMB: &newMaximum, Path: "/tmp/usage",
 		},
-		ImageUsage: config.ChatGPTWebImageUsageConfig{AutoOutputQuality: "high"},
+		ImageUsage: config.ChatGPTWebImageUsageConfig{
+			AutoOutputQuality: "high",
+			FallbackUsage: config.ChatGPTWebImageFallbackUsageConfig{
+				Enabled:           &fallbackEnabled,
+				OutputImageTokens: &fallbackOutputTokens,
+			},
+		},
 	}})
 	for _, expected := range []string{
 		"chatgpt-web.usage-cache.enabled: false -> true",
@@ -125,6 +139,8 @@ func TestBuildConfigChangeDetails_ChatGPTWebTokenUsageEstimation(t *testing.T) {
 		"chatgpt-web.usage-cache.max-disk-size-mb: 16 -> 32",
 		`chatgpt-web.usage-cache.path: "" -> "/tmp/usage"`,
 		"chatgpt-web.image-usage.auto-output-quality: medium -> high",
+		"chatgpt-web.image-usage.fallback-usage.enabled: false -> true",
+		"chatgpt-web.image-usage.fallback-usage.output-image-tokens: 2000 -> 2500",
 	} {
 		expectContains(t, details, expected)
 	}

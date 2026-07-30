@@ -281,6 +281,47 @@ func TestOpenAIImagesGenerationsCanUseChatGPTWebProvider(t *testing.T) {
 	if parsed.Image == nil || parsed.Image.OutputFormat != "png" {
 		t.Fatalf("ChatGPT Web image request = %#v", parsed.Image)
 	}
+	if parsed.Image.Size != "auto" || parsed.Image.Quality != "auto" {
+		t.Fatalf("ChatGPT Web image defaults = %#v", parsed.Image)
+	}
+	for path, want := range map[string]string{
+		"tools.0.background":         "auto",
+		"tools.0.moderation":         "auto",
+		"tools.0.output_compression": "100",
+	} {
+		if got := gjson.GetBytes(executor.payload, path).String(); got != want {
+			t.Fatalf("%s = %q, want %q", path, got, want)
+		}
+	}
+}
+
+func TestOpenAIImagesEditsApplyOfficialDefaults(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	executor := &imageCaptureExecutor{provider: "chatgpt-web"}
+	h := newImagesTestHandler(t, executor)
+	router := gin.New()
+	router.POST("/v1/images/edits", h.Edits)
+
+	request := httptest.NewRequest(http.MethodPost, "/v1/images/edits", strings.NewReader(`{
+		"model":"gpt-image-2",
+		"prompt":"edit",
+		"images":[{"image_url":"data:image/png;base64,aGVsbG8="}]
+	}`))
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", response.Code, response.Body.String())
+	}
+	parsed, errParse := executorhelps.ParseChatGPTWebRequest(executor.payload)
+	if errParse != nil {
+		t.Fatalf("ChatGPT Web rejected handler payload: %v; payload=%s", errParse, executor.payload)
+	}
+	if parsed.Image == nil || parsed.Image.Size != "1024x1024" ||
+		parsed.Image.Quality != "auto" || parsed.Image.OutputFormat != "png" {
+		t.Fatalf("ChatGPT Web edit defaults = %#v", parsed.Image)
+	}
 }
 
 func TestImageResponsesProvidersExcludeChatGPTWebForUnsupportedInputs(t *testing.T) {
@@ -743,7 +784,7 @@ func TestOpenAIImagesGenerationsRejectsWhenImageModelIsNotRegistered(t *testing.
 func TestOpenAIImagesGenerationsAggregatesMultipleNonStreamingImages(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	executor := &imageCaptureExecutor{
-		response: []byte(`{"created_at":1700000000,"output":[{"type":"image_generation_call","result":"aGVsbG8=","revised_prompt":"rev"}],"tool_usage":{"image_gen":{"input_tokens":1,"input_tokens_details":{"text_tokens":1,"image_tokens":0},"output_tokens":2,"output_tokens_details":{"image_tokens":2,"text_tokens":0},"total_tokens":3}},"usage":{"input_tokens":99,"output_tokens":99,"total_tokens":198}}`),
+		response: []byte(`{"created_at":1700000000,"output":[{"type":"image_generation_call","result":"aGVsbG8=","revised_prompt":"rev"}],"tool_usage":{"image_gen":{"input_tokens":1,"input_tokens_details":{"text_tokens":1,"image_tokens":0},"output_tokens":2,"output_tokens_details":{"image_tokens":2,"text_tokens":0,"vendor_units":9},"total_tokens":3,"future_count":7,"extension":{"mode":"official"}}},"usage":{"input_tokens":99,"output_tokens":99,"total_tokens":198}}`),
 	}
 	h := newImagesTestHandler(t, executor)
 	enableNAggregation := true
@@ -780,6 +821,15 @@ func TestOpenAIImagesGenerationsAggregatesMultipleNonStreamingImages(t *testing.
 	}
 	if got := gjson.Get(resp.Body.String(), "usage.output_tokens_details.image_tokens").Int(); got != 4 {
 		t.Fatalf("usage.output_tokens_details.image_tokens = %d, want 4", got)
+	}
+	if got := gjson.Get(resp.Body.String(), "usage.output_tokens_details.vendor_units").Int(); got != 9 {
+		t.Fatalf("unknown output detail = %d, want first upstream value 9", got)
+	}
+	if got := gjson.Get(resp.Body.String(), "usage.future_count").Int(); got != 7 {
+		t.Fatalf("unknown usage field = %d, want first upstream value 7", got)
+	}
+	if got := gjson.Get(resp.Body.String(), "usage.extension.mode").String(); got != "official" {
+		t.Fatalf("unknown usage object = %q", got)
 	}
 }
 
@@ -1289,7 +1339,7 @@ func TestOpenAIImagesEditsJSONDoesNotForwardN(t *testing.T) {
 }
 
 func TestConvertResponsesToImagesResponse(t *testing.T) {
-	raw := []byte(`{"created_at":1700000000,"output":[{"type":"message"},{"type":"image_generation_call","result":"ZmluYWw=","revised_prompt":"better","output_format":"webp","size":"1024x1024","background":"auto","quality":"high"}],"tool_usage":{"image_gen":{"input_tokens":3,"input_tokens_details":{"text_tokens":3,"image_tokens":0},"output_tokens":6,"output_tokens_details":{"image_tokens":6,"text_tokens":0},"total_tokens":9}},"usage":{"total_tokens":999}}`)
+	raw := []byte(`{"created_at":1700000000,"output":[{"type":"message"},{"type":"image_generation_call","result":"ZmluYWw=","revised_prompt":"better","output_format":"webp","size":"1024x1024","background":"auto","quality":"high"}],"tool_usage":{"image_gen":{"input_tokens":3,"input_tokens_details":{"text_tokens":3,"image_tokens":0,"cache_tokens":2},"output_tokens":6,"output_tokens_details":{"image_tokens":6,"text_tokens":0},"total_tokens":9,"future_detail":{"source":"official"}}},"usage":{"total_tokens":999}}`)
 	out, err := convertResponsesToImagesResponse(raw, 1)
 	if err != nil {
 		t.Fatalf("convertResponsesToImagesResponse: %v", err)
@@ -1330,6 +1380,12 @@ func TestConvertResponsesToImagesResponse(t *testing.T) {
 	if got := gjson.GetBytes(out, "usage.output_tokens_details.image_tokens").Int(); got != 6 {
 		t.Fatalf("usage.output_tokens_details.image_tokens = %d", got)
 	}
+	if got := gjson.GetBytes(out, "usage.input_tokens_details.cache_tokens").Int(); got != 2 {
+		t.Fatalf("unknown input detail = %d", got)
+	}
+	if got := gjson.GetBytes(out, "usage.future_detail.source").String(); got != "official" {
+		t.Fatalf("unknown usage object = %q", got)
+	}
 }
 
 func TestConvertResponsesToImagesResponseErrorsWithoutImageOutput(t *testing.T) {
@@ -1340,6 +1396,27 @@ func TestConvertResponsesToImagesResponseErrorsWithoutImageOutput(t *testing.T) 
 	}
 	if !strings.Contains(err.Error(), "upstream did not return image output") {
 		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestConvertResponsesToImagesResponseInfersImageMetadata(t *testing.T) {
+	const png1x1 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+	raw := []byte(`{"created_at":1700000000,"output":[{"type":"image_generation_call","result":"` + png1x1 + `"}]}`)
+	out, errConvert := convertResponsesToImagesResponse(raw, 1)
+	if errConvert != nil {
+		t.Fatalf("convertResponsesToImagesResponse() error = %v", errConvert)
+	}
+	if got := gjson.GetBytes(out, "output_format").String(); got != "png" {
+		t.Fatalf("output_format = %q, want png", got)
+	}
+	if got := gjson.GetBytes(out, "size").String(); got != "1x1" {
+		t.Fatalf("size = %q, want 1x1", got)
+	}
+	if got := gjson.GetBytes(out, "quality"); got.Exists() {
+		t.Fatalf("unknown quality should be omitted: %s", got.Raw)
+	}
+	if got := gjson.GetBytes(out, "background"); got.Exists() {
+		t.Fatalf("unknown background should be omitted: %s", got.Raw)
 	}
 }
 
