@@ -400,7 +400,7 @@ type Manager struct {
 	// persistLocks serializes store operations per auth ID.
 	persistBarrier               sync.RWMutex
 	persistLocks                 sync.Map
-	chatGPTWebDependencyMutation sync.Mutex
+	chatGPTWebDependencyMutation contextMutex
 	// prioritySelectors stores built-in legacy selectors used by per-priority overrides.
 	prioritySelectors sync.Map
 }
@@ -2493,7 +2493,10 @@ func (m *Manager) register(ctx context.Context, auth *Auth, requireAbsent bool) 
 		WarnRetiredGeminiCLIAuthIgnored()
 		return nil, retiredGeminiCLIAuthError()
 	}
-	lockedDependencyCtx, unlockDependency := m.lockChatGPTWebDependencyMutationContext(ctx, auth.ID, auth, false)
+	lockedDependencyCtx, unlockDependency, errDependency := m.lockChatGPTWebDependencyMutationContext(ctx, auth.ID, auth, false)
+	if errDependency != nil {
+		return nil, errDependency
+	}
 	ctx = lockedDependencyCtx
 	dependencyLocked := true
 	defer func() {
@@ -2715,7 +2718,10 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 		WarnRetiredGeminiCLIAuthIgnored()
 		return nil, retiredGeminiCLIAuthError()
 	}
-	lockedDependencyCtx, unlockDependency := m.lockChatGPTWebDependencyMutationContext(ctx, auth.ID, auth, false)
+	lockedDependencyCtx, unlockDependency, errDependency := m.lockChatGPTWebDependencyMutationContext(ctx, auth.ID, auth, false)
+	if errDependency != nil {
+		return nil, errDependency
+	}
 	ctx = lockedDependencyCtx
 	dependencyLocked := true
 	defer func() {
@@ -3248,7 +3254,10 @@ func (m *Manager) deleteIf(ctx context.Context, id string, predicate func(*Auth)
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	lockedDependencyCtx, unlockDependency := m.lockChatGPTWebDependencyMutationContext(ctx, id, nil, false)
+	lockedDependencyCtx, unlockDependency, errDependency := m.lockChatGPTWebDependencyMutationContext(ctx, id, nil, false)
+	if errDependency != nil {
+		return false, errDependency
+	}
 	ctx = lockedDependencyCtx
 	dependencyLocked := true
 	defer func() {
@@ -3347,7 +3356,10 @@ func (m *Manager) deleteWithOperation(ctx context.Context, id string, operation 
 	if m == nil || id == "" {
 		return operation(ctx)
 	}
-	lockedDependencyCtx, unlockDependency := m.lockChatGPTWebDependencyMutationContext(ctx, id, nil, false)
+	lockedDependencyCtx, unlockDependency, errDependency := m.lockChatGPTWebDependencyMutationContext(ctx, id, nil, false)
+	if errDependency != nil {
+		return errDependency
+	}
 	ctx = lockedDependencyCtx
 	dependencyLocked := true
 	defer func() {
@@ -3444,11 +3456,13 @@ func (m *Manager) deleteWithOperation(ctx context.Context, id string, operation 
 
 // Load resets manager state from the backing store.
 func (m *Manager) Load(ctx context.Context) error {
-	m.chatGPTWebDependencyMutation.Lock()
+	if errLock := m.chatGPTWebDependencyMutation.lock(ctx); errLock != nil {
+		return errLock
+	}
 	dependencyLocked := true
 	defer func() {
 		if dependencyLocked {
-			m.chatGPTWebDependencyMutation.Unlock()
+			m.chatGPTWebDependencyMutation.unlock()
 		}
 	}()
 	m.persistBarrier.Lock()
@@ -3530,7 +3544,7 @@ func (m *Manager) Load(ctx context.Context) error {
 		m.cleanupRemovedAuthRuntimeStateAfterQuarantine(id)
 	}
 	m.persistBarrier.Unlock()
-	m.chatGPTWebDependencyMutation.Unlock()
+	m.chatGPTWebDependencyMutation.unlock()
 	dependencyLocked = false
 	for id, auth := range removed {
 		m.finishAuthSessionCleanup(id, auth, "auth_reloaded", nil)
@@ -3929,7 +3943,10 @@ func (m *Manager) installPreparedRequestAuth(ctx context.Context, expected, upda
 	}
 	id := expected.ID
 	updated.ID = id
-	lockedDependencyCtx, unlockDependency := m.lockChatGPTWebDependencyMutationContext(ctx, id, updated, false)
+	lockedDependencyCtx, unlockDependency, errDependency := m.lockChatGPTWebDependencyMutationContext(ctx, id, updated, false)
+	if errDependency != nil {
+		return nil, errDependency
+	}
 	ctx = lockedDependencyCtx
 	var unlockDependencyOnce sync.Once
 	releaseDependency := func() { unlockDependencyOnce.Do(unlockDependency) }
@@ -4166,7 +4183,10 @@ func (m *Manager) mutateRuntimeMetadataIfCurrent(
 		return snapshot, true, nil
 	}
 	id := expected.ID
-	lockedDependencyCtx, unlockDependency := m.lockChatGPTWebDependencyMutationContext(ctx, id, expected, false)
+	lockedDependencyCtx, unlockDependency, errDependency := m.lockChatGPTWebDependencyMutationContext(ctx, id, expected, false)
+	if errDependency != nil {
+		return nil, false, errDependency
+	}
 	ctx = lockedDependencyCtx
 	defer unlockDependency()
 	unlockPersist, errLock := m.lockAuthIDMutationContext(ctx, id)
@@ -8407,7 +8427,10 @@ func (m *Manager) LockAuthMutation(ctx context.Context, auth *Auth) (context.Con
 	if auth != nil {
 		authID = strings.TrimSpace(auth.ID)
 	}
-	lockedDependencyCtx, unlockDependency := m.lockChatGPTWebDependencyMutationContext(ctx, authID, auth, false)
+	lockedDependencyCtx, unlockDependency, errDependency := m.lockChatGPTWebDependencyMutationContext(ctx, authID, auth, false)
+	if errDependency != nil {
+		return ctx, nil, errDependency
+	}
 	lockedCtx, unlockAuth, errLock := m.lockAuthMutationContext(lockedDependencyCtx, auth)
 	if errLock != nil {
 		unlockDependency()

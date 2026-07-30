@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -93,11 +94,21 @@ type Service struct {
 	// modelSyncDone is closed when the model sync workers exit.
 	modelSyncDone chan struct{}
 
+	// modelSyncGeneration prevents workers from a stopped pool from completing
+	// tasks retained for a newer pool.
+	modelSyncGeneration uint64
+
+	// modelSyncNextEpoch assigns a unique lifecycle to each auth sync task.
+	modelSyncNextEpoch uint64
+
 	// modelSyncQueue carries auth IDs that need registry and scheduler resync.
 	modelSyncQueue chan string
 
 	// modelSyncPending deduplicates queued or running auth sync tasks.
 	modelSyncPending map[string]modelSyncTaskState
+
+	// modelSyncOverflow retains deduplicated tasks while modelSyncQueue is full.
+	modelSyncOverflow []string
 
 	// antigravityModelCapabilities caches per-auth model discovery results.
 	antigravityModelCapabilities sync.Map
@@ -247,7 +258,13 @@ type authMaintenanceCandidate struct {
 }
 
 type modelSyncTaskState struct {
-	dirty bool
+	epoch              uint64
+	installationID     string
+	nextEpoch          uint64
+	nextInstallationID string
+	queued             bool
+	running            bool
+	dirty              bool
 }
 
 type authModelTransitionLockEntry struct {
@@ -358,9 +375,11 @@ func (h authMaintenanceHook) handleAuthChange(ctx context.Context, auth *coreaut
 		h.service.coreManager.ReconcileRegistryModelStates(ctx, auth.ID)
 		h.service.coreManager.RefreshSchedulerEntry(auth.ID)
 	}
-	if !h.service.enqueueModelSync(auth.ID) {
-		h.service.syncAuthModelsInline(ctx, auth.ID)
-	}
+	h.service.enqueueModelSyncTaskForInstallation(
+		auth.ID,
+		auth.RuntimeInstallationID(),
+		true,
+	)
 	if nativeChatGPTWeb {
 		h.service.triggerChatGPTWebRelogin(auth)
 	}
@@ -2305,8 +2324,13 @@ func (s *Service) handleAuthUpdate(ctx context.Context, update watcher.AuthUpdat
 				}
 				return !authUpdateIsMaintenanceDelete(update.Auth) || authMaintenancePendingDelete(current)
 			}
+			modelSyncEpoch := s.modelSyncTaskEpoch(id)
 			current, ok := s.coreManager.GetByID(id)
-			if !ok || !matchesDelete(current) {
+			if !ok {
+				s.cancelModelSyncTaskIfEpoch(id, modelSyncEpoch)
+				return
+			}
+			if !matchesDelete(current) {
 				return
 			}
 			indexes := s.usageAuthIndexesForIDs([]string{id})
@@ -2315,6 +2339,7 @@ func (s *Service) handleAuthUpdate(ctx context.Context, update watcher.AuthUpdat
 			if errDelete != nil || !deleted {
 				return
 			}
+			s.cancelModelSyncTaskIfEpoch(id, modelSyncEpoch)
 			executorhelps.CloseProxyTransportCachesForAuth(id)
 			s.cleanupChatGPTWebModelResourcesAfterDelete(id, current.RuntimeInstanceID())
 			s.removeUsageStatisticsForAuthIndexes(indexes, "auth delete")
@@ -2352,11 +2377,13 @@ func (s *Service) reconcileChatGPTWebDependencies(ctx context.Context, reason st
 		ctx = context.Background()
 	}
 	indexesByID := make(map[string]string)
+	modelSyncEpochs := make(map[string]uint64)
 	for _, auth := range s.coreManager.List() {
 		if auth == nil || !coreauth.ChatGPTWebAuthRetainedForDependents(auth) {
 			continue
 		}
 		indexesByID[auth.ID] = auth.EnsureIndex()
+		modelSyncEpochs[auth.ID] = s.modelSyncTaskEpoch(auth.ID)
 	}
 	deletedIDs, errReconcile := s.coreManager.ReconcileChatGPTWebDependencies(ctx)
 	if errReconcile != nil {
@@ -2367,6 +2394,7 @@ func (s *Service) reconcileChatGPTWebDependencies(ctx context.Context, reason st
 	}
 	indexes := make([]string, 0, len(deletedIDs))
 	for _, id := range deletedIDs {
+		s.cancelModelSyncTaskIfEpoch(id, modelSyncEpochs[id])
 		executorhelps.CloseProxyTransportCachesForAuth(id)
 		s.cleanupChatGPTWebModelResourcesAfterDelete(id, "")
 		if index := strings.TrimSpace(indexesByID[id]); index != "" {
@@ -2620,6 +2648,7 @@ func (s *Service) deleteCoreAuth(ctx context.Context, id string) error {
 		ctx = context.Background()
 	}
 	removedRuntimeInstanceID := ""
+	modelSyncEpoch := s.modelSyncTaskEpoch(id)
 	if current, ok := s.coreManager.GetByID(id); ok && current != nil {
 		removedRuntimeInstanceID = current.RuntimeInstanceID()
 	}
@@ -2627,6 +2656,7 @@ func (s *Service) deleteCoreAuth(ctx context.Context, id string) error {
 		log.Errorf("failed to delete auth %s: %v", id, err)
 		return err
 	}
+	s.cancelModelSyncTaskIfEpoch(id, modelSyncEpoch)
 	executorhelps.CloseProxyTransportCachesForAuth(id)
 	s.antigravityModelCapabilities.Delete(id)
 	s.cleanupChatGPTWebModelResourcesAfterDelete(id, removedRuntimeInstanceID)
@@ -2720,39 +2750,254 @@ func (s *Service) applyRetryConfig(cfg *config.Config) {
 }
 
 func (s *Service) enqueueModelSync(authID string) bool {
+	return s.enqueueModelSyncTask(authID, false)
+}
+
+func (s *Service) enqueueModelSyncTask(authID string, retainWhenStopped bool) bool {
+	installationID := ""
+	if s != nil && s.coreManager != nil {
+		if current, ok := s.coreManager.GetByID(strings.TrimSpace(authID)); ok && current != nil {
+			installationID = current.RuntimeInstallationID()
+		}
+	}
+	return s.enqueueModelSyncTaskForInstallation(authID, installationID, retainWhenStopped)
+}
+
+func (s *Service) enqueueModelSyncTaskForInstallation(
+	authID string,
+	installationID string,
+	retainWhenStopped bool,
+) bool {
 	if s == nil {
 		return false
 	}
 	authID = strings.TrimSpace(authID)
+	installationID = strings.TrimSpace(installationID)
 	if authID == "" {
 		return false
 	}
 	s.modelSyncMu.Lock()
-	if s.modelSyncQueue == nil || s.modelSyncCancel == nil {
-		s.modelSyncMu.Unlock()
-		return false
-	}
 	if s.modelSyncPending == nil {
 		s.modelSyncPending = make(map[string]modelSyncTaskState)
 	}
-	if state, exists := s.modelSyncPending[authID]; exists {
-		state.dirty = true
-		s.modelSyncPending[authID] = state
+	if s.modelSyncQueue == nil || s.modelSyncCancel == nil {
+		if !retainWhenStopped {
+			s.modelSyncMu.Unlock()
+			return false
+		}
+		if state, exists := s.modelSyncPending[authID]; exists {
+			if installationID != "" && installationID != state.installationID {
+				state = modelSyncTaskState{
+					epoch:          s.nextModelSyncEpochLocked(),
+					installationID: installationID,
+				}
+			}
+			state.running = false
+			state.queued = true
+			state.dirty = false
+			s.modelSyncPending[authID] = state
+			if !modelSyncOverflowContains(s.modelSyncOverflow, authID) {
+				s.modelSyncOverflow = append(s.modelSyncOverflow, authID)
+			}
+		} else {
+			state := modelSyncTaskState{
+				epoch:          s.nextModelSyncEpochLocked(),
+				installationID: installationID,
+				queued:         true,
+			}
+			s.modelSyncPending[authID] = state
+			s.modelSyncOverflow = append(s.modelSyncOverflow, authID)
+		}
 		s.modelSyncMu.Unlock()
 		return true
 	}
+	if state, exists := s.modelSyncPending[authID]; exists {
+		if installationID != "" && installationID != state.installationID {
+			if state.running {
+				if installationID != state.nextInstallationID {
+					state.nextEpoch = s.nextModelSyncEpochLocked()
+					state.nextInstallationID = installationID
+				}
+				state.dirty = true
+				s.modelSyncPending[authID] = state
+				s.modelSyncMu.Unlock()
+				return true
+			}
+			alreadyDispatched := state.queued
+			s.modelSyncPending[authID] = modelSyncTaskState{
+				epoch:          s.nextModelSyncEpochLocked(),
+				installationID: installationID,
+				queued:         true,
+			}
+			if !alreadyDispatched {
+				s.promoteModelSyncOverflowLocked()
+				select {
+				case s.modelSyncQueue <- authID:
+				default:
+					s.modelSyncOverflow = append(s.modelSyncOverflow, authID)
+				}
+			}
+			s.modelSyncMu.Unlock()
+			return true
+		}
+		if state.running {
+			state.dirty = true
+			s.modelSyncPending[authID] = state
+		}
+		s.modelSyncMu.Unlock()
+		return true
+	}
+	s.modelSyncPending[authID] = modelSyncTaskState{
+		epoch:          s.nextModelSyncEpochLocked(),
+		installationID: installationID,
+		queued:         true,
+	}
+	s.promoteModelSyncOverflowLocked()
 	select {
 	case s.modelSyncQueue <- authID:
-		s.modelSyncPending[authID] = modelSyncTaskState{}
 		s.modelSyncMu.Unlock()
 		return true
 	default:
+		s.modelSyncOverflow = append(s.modelSyncOverflow, authID)
 		s.modelSyncMu.Unlock()
-		return false
+		return true
 	}
 }
 
-func (s *Service) finishModelSync(authID string) bool {
+func (s *Service) promoteModelSyncOverflowLocked() {
+	for len(s.modelSyncOverflow) > 0 {
+		authID := s.modelSyncOverflow[0]
+		state, pending := s.modelSyncPending[authID]
+		if !pending || !state.queued {
+			s.modelSyncOverflow = s.modelSyncOverflow[1:]
+			continue
+		}
+		select {
+		case s.modelSyncQueue <- authID:
+			s.modelSyncOverflow = s.modelSyncOverflow[1:]
+		default:
+			return
+		}
+	}
+}
+
+func modelSyncOverflowContains(overflow []string, authID string) bool {
+	for _, pendingID := range overflow {
+		if pendingID == authID {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *Service) nextModelSyncEpochLocked() uint64 {
+	s.modelSyncNextEpoch++
+	if s.modelSyncNextEpoch == 0 {
+		s.modelSyncNextEpoch++
+	}
+	return s.modelSyncNextEpoch
+}
+
+func (s *Service) cancelModelSyncTask(authID string) {
+	s.cancelModelSyncTaskIfEpoch(authID, s.modelSyncTaskEpoch(authID))
+}
+
+func (s *Service) modelSyncTaskEpoch(authID string) uint64 {
+	if s == nil {
+		return 0
+	}
+	authID = strings.TrimSpace(authID)
+	if authID == "" {
+		return 0
+	}
+	s.modelSyncMu.Lock()
+	defer s.modelSyncMu.Unlock()
+	state := s.modelSyncPending[authID]
+	if state.nextEpoch != 0 {
+		return state.nextEpoch
+	}
+	return state.epoch
+}
+
+func (s *Service) cancelModelSyncTaskIfEpoch(authID string, epoch uint64) {
+	if s == nil || epoch == 0 {
+		return
+	}
+	authID = strings.TrimSpace(authID)
+	if authID == "" {
+		return
+	}
+	s.modelSyncMu.Lock()
+	state, pending := s.modelSyncPending[authID]
+	if !pending {
+		s.modelSyncMu.Unlock()
+		return
+	}
+	if state.nextEpoch == epoch {
+		state.nextEpoch = 0
+		state.nextInstallationID = ""
+		s.modelSyncPending[authID] = state
+		s.modelSyncMu.Unlock()
+		return
+	}
+	if state.epoch != epoch || state.nextEpoch != 0 {
+		s.modelSyncMu.Unlock()
+		return
+	}
+	delete(s.modelSyncPending, authID)
+	if len(s.modelSyncOverflow) > 0 {
+		kept := s.modelSyncOverflow[:0]
+		for _, pendingID := range s.modelSyncOverflow {
+			if pendingID != authID {
+				kept = append(kept, pendingID)
+			}
+		}
+		s.modelSyncOverflow = kept
+	}
+	s.promoteModelSyncOverflowLocked()
+	s.modelSyncMu.Unlock()
+}
+
+func (s *Service) beginModelSyncTask(authID string, generation uint64) (uint64, bool) {
+	if s == nil {
+		return 0, false
+	}
+	authID = strings.TrimSpace(authID)
+	if authID == "" {
+		return 0, false
+	}
+	s.modelSyncMu.Lock()
+	defer s.modelSyncMu.Unlock()
+	if generation != s.modelSyncGeneration {
+		return 0, false
+	}
+	state, exists := s.modelSyncPending[authID]
+	if !exists || !state.queued {
+		s.promoteModelSyncOverflowLocked()
+		return 0, false
+	}
+	state.queued = false
+	state.running = true
+	state.dirty = false
+	s.modelSyncPending[authID] = state
+	if len(s.modelSyncOverflow) > 0 {
+		kept := s.modelSyncOverflow[:0]
+		for _, pendingID := range s.modelSyncOverflow {
+			if pendingID != authID {
+				kept = append(kept, pendingID)
+			}
+		}
+		s.modelSyncOverflow = kept
+	}
+	return state.epoch, true
+}
+
+func (s *Service) completeModelSyncTask(
+	authID string,
+	epoch uint64,
+	generation uint64,
+	allowImmediateRetry bool,
+) bool {
 	if s == nil {
 		return false
 	}
@@ -2762,16 +3007,52 @@ func (s *Service) finishModelSync(authID string) bool {
 	}
 	s.modelSyncMu.Lock()
 	defer s.modelSyncMu.Unlock()
-	state, exists := s.modelSyncPending[authID]
-	if !exists {
+	if generation != s.modelSyncGeneration {
 		return false
 	}
-	if state.dirty {
+	state, exists := s.modelSyncPending[authID]
+	if !exists || state.epoch != epoch || !state.running {
+		return false
+	}
+	if state.nextEpoch != 0 {
+		state.epoch = state.nextEpoch
+		state.installationID = state.nextInstallationID
+		state.nextEpoch = 0
+		state.nextInstallationID = ""
+		state.running = false
+		state.queued = true
+		state.dirty = false
+		s.modelSyncPending[authID] = state
+		s.promoteModelSyncOverflowLocked()
+		select {
+		case s.modelSyncQueue <- authID:
+		default:
+			if !modelSyncOverflowContains(s.modelSyncOverflow, authID) {
+				s.modelSyncOverflow = append(s.modelSyncOverflow, authID)
+			}
+		}
+		return false
+	}
+	if state.dirty && allowImmediateRetry {
 		state.dirty = false
 		s.modelSyncPending[authID] = state
 		return true
 	}
+	if state.dirty {
+		state.dirty = false
+		state.running = false
+		state.queued = true
+		s.modelSyncPending[authID] = state
+		s.promoteModelSyncOverflowLocked()
+		select {
+		case s.modelSyncQueue <- authID:
+		default:
+			s.modelSyncOverflow = append(s.modelSyncOverflow, authID)
+		}
+		return false
+	}
 	delete(s.modelSyncPending, authID)
+	s.promoteModelSyncOverflowLocked()
 	return false
 }
 
@@ -2916,9 +3197,20 @@ func (s *Service) syncAuthModelsInline(ctx context.Context, authID string) {
 	if s == nil {
 		return
 	}
-	for {
+	s.syncAuthModels(ctx, authID)
+}
+
+func (s *Service) syncAuthModelsForGeneration(ctx context.Context, authID string, generation uint64) {
+	if s == nil {
+		return
+	}
+	epoch, ok := s.beginModelSyncTask(authID, generation)
+	if !ok {
+		return
+	}
+	for attempt := 0; attempt < 2; attempt++ {
 		s.syncAuthModels(ctx, authID)
-		if !s.finishModelSync(authID) {
+		if !s.completeModelSyncTask(authID, epoch, generation, attempt == 0) {
 			return
 		}
 	}
@@ -2986,10 +3278,35 @@ func (s *Service) startModelSyncLoop(parent context.Context) {
 	ctx, cancel := context.WithCancel(parent)
 	queue := make(chan string, defaultModelSyncQueueSize)
 	done := make(chan struct{})
+	s.modelSyncGeneration++
+	generation := s.modelSyncGeneration
+	if s.modelSyncPending == nil {
+		s.modelSyncPending = make(map[string]modelSyncTaskState)
+	}
+	s.modelSyncOverflow = s.modelSyncOverflow[:0]
+	pendingIDs := make([]string, 0, len(s.modelSyncPending))
+	for authID, state := range s.modelSyncPending {
+		if state.nextEpoch != 0 {
+			state.epoch = state.nextEpoch
+			state.installationID = state.nextInstallationID
+			state.nextEpoch = 0
+			state.nextInstallationID = ""
+		}
+		if state.epoch == 0 {
+			state.epoch = s.nextModelSyncEpochLocked()
+		}
+		state.queued = true
+		state.running = false
+		state.dirty = false
+		s.modelSyncPending[authID] = state
+		pendingIDs = append(pendingIDs, authID)
+	}
+	sort.Strings(pendingIDs)
+	s.modelSyncOverflow = append(s.modelSyncOverflow, pendingIDs...)
 	s.modelSyncCancel = cancel
 	s.modelSyncDone = done
 	s.modelSyncQueue = queue
-	s.modelSyncPending = make(map[string]modelSyncTaskState)
+	s.promoteModelSyncOverflowLocked()
 	s.modelSyncMu.Unlock()
 
 	go func() {
@@ -3004,7 +3321,7 @@ func (s *Service) startModelSyncLoop(parent context.Context) {
 					case <-ctx.Done():
 						return
 					case authID := <-queue:
-						s.syncAuthModelsInline(ctx, authID)
+						s.syncAuthModelsForGeneration(ctx, authID, generation)
 					}
 				}
 			}()
@@ -3020,10 +3337,10 @@ func (s *Service) stopModelSyncLoop() {
 	s.modelSyncMu.Lock()
 	cancel := s.modelSyncCancel
 	done := s.modelSyncDone
+	s.modelSyncGeneration++
 	s.modelSyncCancel = nil
 	s.modelSyncDone = nil
 	s.modelSyncQueue = nil
-	s.modelSyncPending = nil
 	s.modelSyncMu.Unlock()
 	if cancel != nil {
 		cancel()

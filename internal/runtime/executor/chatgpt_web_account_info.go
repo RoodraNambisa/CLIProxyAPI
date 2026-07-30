@@ -191,6 +191,8 @@ type chatGPTWebAccountInfoCall struct {
 	retryAt        time.Time
 }
 
+type chatGPTWebAccountInfoPersistenceContextKey struct{}
+
 type chatGPTWebAccountInfoScheduleHeap []*chatGPTWebAccountInfoSchedule
 
 func (call *chatGPTWebAccountInfoCall) key() string {
@@ -1025,7 +1027,7 @@ func (runtime *chatGPTWebAccountInfoRuntime) acquireAccountInfoCall(work chatGPT
 		if runtime.executor != nil && runtime.executor.accountInfoTimeout > 0 {
 			timeout = runtime.executor.accountInfoTimeout
 		}
-		callContext, cancel := context.WithTimeout(baseContext, timeout)
+		callContext, cancel := newChatGPTWebAccountInfoCallContext(baseContext, timeout)
 		call := &chatGPTWebAccountInfoCall{
 			ctx: callContext,
 		}
@@ -1075,10 +1077,30 @@ func (runtime *chatGPTWebAccountInfoRuntime) acquireOrCreateAccountInfoCallLocke
 	if runtime.executor != nil && runtime.executor.accountInfoTimeout > 0 {
 		timeout = runtime.executor.accountInfoTimeout
 	}
-	callContext, cancel := context.WithTimeout(baseContext, timeout)
+	callContext, cancel := newChatGPTWebAccountInfoCallContext(baseContext, timeout)
 	call = &chatGPTWebAccountInfoCall{ctx: callContext}
 	runtime.initializeAccountInfoCallLocked(call, work, cancel)
 	return call, true
+}
+
+func newChatGPTWebAccountInfoCallContext(
+	baseContext context.Context,
+	timeout time.Duration,
+) (context.Context, context.CancelFunc) {
+	if baseContext == nil {
+		baseContext = context.Background()
+	}
+	persistContext, cancelPersist := context.WithCancel(baseContext)
+	acquisitionBase := context.WithValue(
+		baseContext,
+		chatGPTWebAccountInfoPersistenceContextKey{},
+		persistContext,
+	)
+	acquisitionContext, cancelAcquisition := context.WithTimeout(acquisitionBase, timeout)
+	return acquisitionContext, func() {
+		cancelAcquisition()
+		cancelPersist()
+	}
 }
 
 func (runtime *chatGPTWebAccountInfoRuntime) initializeAccountInfoCallLocked(
@@ -2131,12 +2153,30 @@ func (runtime *chatGPTWebAccountInfoRuntime) persistenceContext(ctx context.Cont
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	if parent, ok := ctx.Value(chatGPTWebAccountInfoPersistenceContextKey{}).(context.Context); ok && parent != nil {
+		return context.WithCancel(parent)
+	}
 	persistContext, cancel := context.WithCancel(context.WithoutCancel(ctx))
+	stopRequestCancellation := context.AfterFunc(ctx, func() {
+		if !errors.Is(context.Cause(ctx), context.DeadlineExceeded) {
+			cancel()
+		}
+	})
+	if ctx.Err() != nil && !errors.Is(context.Cause(ctx), context.DeadlineExceeded) {
+		cancel()
+	}
 	if runtime == nil || runtime.ctx == nil {
-		return persistContext, cancel
+		return persistContext, func() {
+			stopRequestCancellation()
+			cancel()
+		}
 	}
 	stopLifecycleCancellation := context.AfterFunc(runtime.ctx, cancel)
+	if runtime.ctx.Err() != nil {
+		cancel()
+	}
 	return persistContext, func() {
+		stopRequestCancellation()
 		stopLifecycleCancellation()
 		cancel()
 	}

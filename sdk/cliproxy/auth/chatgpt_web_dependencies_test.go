@@ -334,9 +334,15 @@ func TestBuildChatGPTWebDependencyGraphRejectsMismatchedSourceIdentity(t *testin
 
 func TestDependencyMutationStaleContextReacquiresLock(t *testing.T) {
 	manager := NewManager(nil, nil, nil)
-	staleCtx, unlockStale := manager.lockChatGPTWebDependencyMutationContext(t.Context(), "", nil, true)
+	staleCtx, unlockStale, errStale := manager.lockChatGPTWebDependencyMutationContext(t.Context(), "", nil, true)
+	if errStale != nil {
+		t.Fatal(errStale)
+	}
 	unlockStale()
-	_, unlockHeld := manager.lockChatGPTWebDependencyMutationContext(t.Context(), "", nil, true)
+	_, unlockHeld, errHeld := manager.lockChatGPTWebDependencyMutationContext(t.Context(), "", nil, true)
+	if errHeld != nil {
+		t.Fatal(errHeld)
+	}
 	acquired := make(chan struct{})
 	go func() {
 		_ = manager.WithChatGPTWebDependencyMutation(staleCtx, func(context.Context) error {
@@ -355,6 +361,163 @@ func TestDependencyMutationStaleContextReacquiresLock(t *testing.T) {
 	case <-acquired:
 	case <-time.After(time.Second):
 		t.Fatal("stale dependency context did not reacquire after unlock")
+	}
+}
+
+func TestDependencyMutationUpdateMarkersPreserveActiveLock(t *testing.T) {
+	manager := NewManager(nil, nil, nil)
+	lockedCtx, unlock, errLock := manager.lockChatGPTWebDependencyMutationContext(t.Context(), "", nil, true)
+	if errLock != nil {
+		t.Fatal(errLock)
+	}
+	defer unlock()
+
+	hookCtx := withoutChatGPTWebCredentialUpdateMarkers(lockedCtx)
+	called := false
+	if errMutation := manager.WithChatGPTWebDependencyMutation(hookCtx, func(context.Context) error {
+		called = true
+		return nil
+	}); errMutation != nil {
+		t.Fatal(errMutation)
+	}
+	if !called {
+		t.Fatal("nested dependency mutation was not called")
+	}
+}
+
+func TestDependencyMutationSerializesConcurrentNestedUse(t *testing.T) {
+	manager := NewManager(nil, nil, nil)
+	lockedCtx, unlockOuter, errLock := manager.lockChatGPTWebDependencyMutationContext(t.Context(), "", nil, true)
+	if errLock != nil {
+		t.Fatal(errLock)
+	}
+	defer unlockOuter()
+
+	_, unlockFirst, errFirst := manager.lockChatGPTWebDependencyMutationContext(lockedCtx, "", nil, true)
+	if errFirst != nil {
+		t.Fatal(errFirst)
+	}
+	secondAcquired := make(chan func(), 1)
+	go func() {
+		_, unlockSecond, errSecond := manager.lockChatGPTWebDependencyMutationContext(lockedCtx, "", nil, true)
+		if errSecond != nil {
+			secondAcquired <- nil
+			return
+		}
+		secondAcquired <- unlockSecond
+	}()
+	select {
+	case unlockSecond := <-secondAcquired:
+		if unlockSecond != nil {
+			unlockSecond()
+		}
+		unlockFirst()
+		t.Fatal("concurrent nested dependency mutation reused the same ownership")
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	unlockFirst()
+	select {
+	case unlockSecond := <-secondAcquired:
+		if unlockSecond == nil {
+			t.Fatal("second nested dependency mutation failed")
+		}
+		unlockSecond()
+	case <-time.After(time.Second):
+		t.Fatal("second nested dependency mutation did not acquire after the first released")
+	}
+}
+
+func TestDependencyMutationPreservesCrossManagerOwnershipChain(t *testing.T) {
+	first := NewManager(nil, nil, nil)
+	second := NewManager(nil, nil, nil)
+
+	firstCtx, unlockFirst, errFirst := first.lockChatGPTWebDependencyMutationContext(
+		t.Context(),
+		"",
+		nil,
+		true,
+	)
+	if errFirst != nil {
+		t.Fatal(errFirst)
+	}
+	defer unlockFirst()
+	secondCtx, unlockSecond, errSecond := second.lockChatGPTWebDependencyMutationContext(
+		firstCtx,
+		"",
+		nil,
+		true,
+	)
+	if errSecond != nil {
+		t.Fatal(errSecond)
+	}
+	defer unlockSecond()
+	firstNestedCtx, unlockFirstNested, errFirstNested := first.lockChatGPTWebDependencyMutationContext(
+		secondCtx,
+		"",
+		nil,
+		true,
+	)
+	if errFirstNested != nil {
+		t.Fatal(errFirstNested)
+	}
+	defer unlockFirstNested()
+
+	ctx, cancel := context.WithTimeout(firstNestedCtx, time.Second)
+	defer cancel()
+	_, unlockSecondNested, errSecondNested := second.lockChatGPTWebDependencyMutationContext(
+		ctx,
+		"",
+		nil,
+		true,
+	)
+	if errSecondNested != nil {
+		t.Fatalf("second manager ownership was lost from nested context: %v", errSecondNested)
+	}
+	unlockSecondNested()
+}
+
+func TestDependencyMutationWaitHonorsContextCancellation(t *testing.T) {
+	manager := NewManager(nil, nil, nil)
+	_, unlockHeld, errHeld := manager.lockChatGPTWebDependencyMutationContext(t.Context(), "", nil, true)
+	if errHeld != nil {
+		t.Fatal(errHeld)
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	errMutation := manager.WithChatGPTWebDependencyMutation(ctx, func(context.Context) error {
+		t.Fatal("canceled dependency mutation unexpectedly acquired the lock")
+		return nil
+	})
+	if !errors.Is(errMutation, context.Canceled) {
+		t.Fatalf("dependency mutation error = %v, want context.Canceled", errMutation)
+	}
+	unlockHeld()
+
+	if errMutation = manager.WithChatGPTWebDependencyMutation(t.Context(), func(context.Context) error {
+		return nil
+	}); errMutation != nil {
+		t.Fatalf("dependency lock remained unavailable after canceled waiter: %v", errMutation)
+	}
+}
+
+func TestDependencyMutationRejectsCanceledContextWhenLockIsIdle(t *testing.T) {
+	manager := NewManager(nil, nil, nil)
+	for range 100 {
+		ctx, cancel := context.WithCancel(t.Context())
+		cancel()
+		called := false
+		errMutation := manager.WithChatGPTWebDependencyMutation(ctx, func(context.Context) error {
+			called = true
+			return nil
+		})
+		if called {
+			t.Fatal("canceled dependency mutation unexpectedly ran")
+		}
+		if !errors.Is(errMutation, context.Canceled) {
+			t.Fatalf("dependency mutation error = %v, want context.Canceled", errMutation)
+		}
 	}
 }
 

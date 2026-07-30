@@ -427,6 +427,7 @@ func (e *ChatGPTWebExecutor) prepareRuntimeRequest(ctx context.Context, auth *cl
 			MinAvailableDiskBytes:    chatGPTWebUsageCacheMegabytesToBytes(resolvedCache.MinAvailableDiskMB),
 			MaxFilesystemUsedPercent: resolvedCache.MaxFilesystemUsedPercent,
 			Path:                     resolvedCache.Path,
+			OrphanRetention:          time.Duration(resolvedCache.OrphanRetentionMinutes) * time.Minute,
 			AutoOutputQuality:        autoOutputQuality,
 		})
 		if err != nil {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -145,7 +146,192 @@ func TestServiceApplyCoreAuthAddOrUpdate_ModelSyncWorkerEventuallyRegistersModel
 	}
 }
 
-func TestServiceApplyCoreAuthAddOrUpdate_FallsBackToInlineSyncWhenQueueIsFull(t *testing.T) {
+func TestModelSyncLoopDrainsTaskAcceptedBeforeStartup(t *testing.T) {
+	service := &Service{
+		cfg:         &config.Config{},
+		coreManager: coreauth.NewManager(nil, nil, nil),
+	}
+	authID := "service-model-sync-before-start"
+	t.Cleanup(func() {
+		GlobalModelRegistry().UnregisterClient(authID)
+	})
+	auth := &coreauth.Auth{
+		ID:       authID,
+		Provider: "claude",
+		Status:   coreauth.StatusActive,
+	}
+	if _, errRegister := service.coreManager.Register(coreauth.WithSkipPersist(t.Context()), auth); errRegister != nil {
+		t.Fatal(errRegister)
+	}
+	if !service.enqueueModelSyncTask(authID, true) {
+		t.Fatal("model sync task was not retained before worker startup")
+	}
+
+	service.startModelSyncLoop(t.Context())
+	defer service.stopModelSyncLoop()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if models := registry.GetGlobalRegistry().GetModelsForClient(authID); len(models) > 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("startup did not drain the retained model sync task")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestModelSyncStopPreservesTasksFromNewGeneration(t *testing.T) {
+	_, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	close(done)
+	service := &Service{
+		modelSyncCancel:     cancel,
+		modelSyncDone:       done,
+		modelSyncQueue:      make(chan string, 1),
+		modelSyncPending:    map[string]modelSyncTaskState{"same": {epoch: 1, running: true}},
+		modelSyncGeneration: 1,
+		modelSyncNextEpoch:  1,
+	}
+
+	service.stopModelSyncLoop()
+	service.cancelModelSyncTask("same")
+	if !service.enqueueModelSyncTask("same", true) {
+		t.Fatal("new task was not retained while the pool was stopped")
+	}
+	if service.completeModelSyncTask("same", 1, 1, true) {
+		t.Fatal("stopped worker generation requested another sync")
+	}
+
+	service.modelSyncMu.Lock()
+	state, pending := service.modelSyncPending["same"]
+	service.modelSyncMu.Unlock()
+	if !pending {
+		t.Fatal("stopped worker generation removed a newly retained task")
+	}
+	if state.epoch == 1 {
+		t.Fatal("recreated task reused the stopped worker epoch")
+	}
+}
+
+func TestDeleteCoreAuthCancelsPendingModelSync(t *testing.T) {
+	manager := coreauth.NewManager(nil, nil, nil)
+	service := &Service{
+		coreManager: manager,
+		modelSyncPending: map[string]modelSyncTaskState{
+			"deleted": {epoch: 1},
+			"kept":    {epoch: 2},
+		},
+		modelSyncOverflow: []string{"deleted", "kept", "deleted"},
+	}
+	if _, errRegister := manager.Register(coreauth.WithSkipPersist(t.Context()), &coreauth.Auth{
+		ID:       "deleted",
+		Provider: "claude",
+		Status:   coreauth.StatusActive,
+	}); errRegister != nil {
+		t.Fatal(errRegister)
+	}
+
+	if errDelete := service.deleteCoreAuth(coreauth.WithSkipPersist(t.Context()), "deleted"); errDelete != nil {
+		t.Fatal(errDelete)
+	}
+
+	service.modelSyncMu.Lock()
+	defer service.modelSyncMu.Unlock()
+	if _, pending := service.modelSyncPending["deleted"]; pending {
+		t.Fatal("deleted auth remained in pending model sync tasks")
+	}
+	for _, authID := range service.modelSyncOverflow {
+		if authID == "deleted" {
+			t.Fatal("deleted auth remained in model sync overflow")
+		}
+	}
+	if _, pending := service.modelSyncPending["kept"]; !pending {
+		t.Fatal("unrelated pending model sync task was removed")
+	}
+}
+
+func TestModelSyncWorkersAutomaticallyDrainOverflow(t *testing.T) {
+	service := &Service{
+		cfg:         &config.Config{},
+		coreManager: coreauth.NewManager(nil, nil, nil),
+	}
+	blockerUnlocks := make([]func(), 0, defaultModelSyncWorkers)
+	for index := range defaultModelSyncWorkers {
+		blockerUnlocks = append(blockerUnlocks, service.lockAuthModelTransition(fmt.Sprintf("blocked-%d", index)))
+	}
+	blockersReleased := false
+	service.startModelSyncLoop(t.Context())
+	defer service.stopModelSyncLoop()
+	defer func() {
+		if blockersReleased {
+			return
+		}
+		for _, unlock := range blockerUnlocks {
+			unlock()
+		}
+	}()
+	for index := range defaultModelSyncWorkers {
+		if !service.enqueueModelSync(fmt.Sprintf("blocked-%d", index)) {
+			t.Fatal("blocking model sync task was not accepted")
+		}
+	}
+	deadline := time.Now().Add(time.Second)
+	for len(service.modelSyncQueue) != 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("workers did not take the blocking tasks")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	for index := range defaultModelSyncQueueSize {
+		if !service.enqueueModelSync(fmt.Sprintf("queued-%d", index)) {
+			t.Fatal("queued model sync task was not accepted")
+		}
+	}
+
+	authID := "service-model-sync-overflow-target"
+	t.Cleanup(func() {
+		GlobalModelRegistry().UnregisterClient(authID)
+	})
+	if _, errRegister := service.coreManager.Register(coreauth.WithSkipPersist(t.Context()), &coreauth.Auth{
+		ID:       authID,
+		Provider: "claude",
+		Status:   coreauth.StatusActive,
+	}); errRegister != nil {
+		t.Fatal(errRegister)
+	}
+	if !service.enqueueModelSync(authID) {
+		t.Fatal("overflow model sync task was not accepted")
+	}
+	service.modelSyncMu.Lock()
+	overflowed := len(service.modelSyncOverflow) > 0
+	service.modelSyncMu.Unlock()
+	if !overflowed {
+		t.Fatal("target model sync task did not enter overflow")
+	}
+	for _, unlock := range blockerUnlocks {
+		unlock()
+	}
+	blockersReleased = true
+
+	deadline = time.Now().Add(3 * time.Second)
+	for {
+		service.modelSyncMu.Lock()
+		pending := len(service.modelSyncPending)
+		overflow := len(service.modelSyncOverflow)
+		service.modelSyncMu.Unlock()
+		models := registry.GetGlobalRegistry().GetModelsForClient(authID)
+		if len(models) > 0 && pending == 0 && overflow == 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("overflow did not drain: models=%d pending=%d overflow=%d", len(models), pending, overflow)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestServiceApplyCoreAuthAddOrUpdate_QueuesOverflowWhenQueueIsFull(t *testing.T) {
 	service := &Service{
 		cfg:         &config.Config{},
 		coreManager: coreauth.NewManager(nil, nil, nil),
@@ -169,11 +355,40 @@ func TestServiceApplyCoreAuthAddOrUpdate_FallsBackToInlineSyncWhenQueueIsFull(t 
 		Status:   coreauth.StatusActive,
 	})
 
-	if models := registry.GetGlobalRegistry().GetModelsForClient(authID); len(models) == 0 {
-		t.Fatalf("expected inline model sync to register models for %q", authID)
+	if models := registry.GetGlobalRegistry().GetModelsForClient(authID); len(models) != 0 {
+		t.Fatalf("queue-full update unexpectedly synchronized models inline for %q", authID)
 	}
-	if _, exists := service.modelSyncPending[authID]; exists {
-		t.Fatalf("expected inline fallback to clear pending state for %q", authID)
+	if _, exists := service.modelSyncPending[authID]; !exists {
+		t.Fatalf("queue-full update did not retain pending state for %q", authID)
+	}
+	if len(service.modelSyncOverflow) != 1 || service.modelSyncOverflow[0] != authID {
+		t.Fatalf("model sync overflow = %v, want [%q]", service.modelSyncOverflow, authID)
+	}
+}
+
+func TestEnqueueModelSyncPromotesOlderOverflowBeforeNewTask(t *testing.T) {
+	service := &Service{}
+	_, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	service.modelSyncCancel = cancel
+	service.modelSyncQueue = make(chan string, 1)
+	service.modelSyncQueue <- "busy"
+	service.modelSyncPending = make(map[string]modelSyncTaskState)
+
+	if !service.enqueueModelSync("older") {
+		t.Fatal("older task was not accepted")
+	}
+	if queued := <-service.modelSyncQueue; queued != "busy" {
+		t.Fatalf("queued task = %q, want busy", queued)
+	}
+	if !service.enqueueModelSync("newer") {
+		t.Fatal("newer task was not accepted")
+	}
+	if queued := <-service.modelSyncQueue; queued != "older" {
+		t.Fatalf("promoted task = %q, want older", queued)
+	}
+	if len(service.modelSyncOverflow) != 1 || service.modelSyncOverflow[0] != "newer" {
+		t.Fatalf("overflow = %v, want [newer]", service.modelSyncOverflow)
 	}
 }
 
@@ -202,7 +417,7 @@ func TestAuthMaintenanceHookQueuesAntigravityModelSyncAfterAuthUpdate(t *testing
 	}
 }
 
-func TestAuthMaintenanceHookFallsBackInlineWhenModelSyncQueueIsFull(t *testing.T) {
+func TestAuthMaintenanceHookQueuesOverflowWhenModelSyncQueueIsFull(t *testing.T) {
 	service := &Service{
 		cfg:         &config.Config{},
 		coreManager: coreauth.NewManager(nil, nil, nil),
@@ -221,11 +436,14 @@ func TestAuthMaintenanceHookFallsBackInlineWhenModelSyncQueueIsFull(t *testing.T
 
 	authMaintenanceHook{service: service}.OnAuthUpdated(ctx, auth)
 
-	if _, pending := service.modelSyncPending[auth.ID]; pending {
-		t.Fatal("queue-full inline fallback left an unowned pending task")
+	if _, pending := service.modelSyncPending[auth.ID]; !pending {
+		t.Fatal("queue-full hook did not retain pending task")
 	}
-	if models := registry.GetGlobalRegistry().GetModelsForClient(auth.ID); len(models) == 0 {
-		t.Fatal("queue-full hook did not run the inline model sync fallback")
+	if len(service.modelSyncOverflow) != 1 || service.modelSyncOverflow[0] != auth.ID {
+		t.Fatalf("model sync overflow = %v, want [%q]", service.modelSyncOverflow, auth.ID)
+	}
+	if models := registry.GetGlobalRegistry().GetModelsForClient(auth.ID); len(models) != 0 {
+		t.Fatal("queue-full hook unexpectedly ran model sync inline")
 	}
 }
 
@@ -677,38 +895,230 @@ func TestServiceApplyCoreAuthAddOrUpdateQueuesAntigravitySyncOnce(t *testing.T) 
 	}
 }
 
-func TestServiceSyncAuthModelsInlineDrainsDirtyTaskWithFullQueue(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
+func TestModelSyncQueuedUpdatesCoalesceWithoutDirty(t *testing.T) {
+	_, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	const authID = "dirty-model-sync"
+	const authID = "queued-model-sync"
 	service := &Service{
-		modelSyncCancel: cancel,
-		modelSyncQueue:  make(chan string, 1),
-		modelSyncPending: map[string]modelSyncTaskState{
-			authID: {dirty: true},
-		},
+		modelSyncCancel:     cancel,
+		modelSyncQueue:      make(chan string, 2),
+		modelSyncPending:    make(map[string]modelSyncTaskState),
+		modelSyncGeneration: 1,
 	}
-	service.modelSyncQueue <- "occupied"
 
-	done := make(chan struct{})
-	go func() {
-		service.syncAuthModelsInline(ctx, authID)
-		close(done)
-	}()
-
+	if !service.enqueueModelSync(authID) || !service.enqueueModelSync(authID) {
+		t.Fatal("queued model sync update was not accepted")
+	}
+	if queuedID := <-service.modelSyncQueue; queuedID != authID {
+		t.Fatalf("queued auth ID = %q, want %q", queuedID, authID)
+	}
 	select {
-	case <-done:
-	case <-time.After(time.Second):
-		t.Fatal("dirty model sync blocked on a full worker queue")
+	case duplicate := <-service.modelSyncQueue:
+		t.Fatalf("queued update added duplicate task %q", duplicate)
+	default:
 	}
-	service.modelSyncMu.Lock()
-	_, pending := service.modelSyncPending[authID]
-	service.modelSyncMu.Unlock()
-	if pending {
-		t.Fatal("dirty model sync remained pending after inline drain")
+	state := service.modelSyncPending[authID]
+	if !state.queued || state.running || state.dirty {
+		t.Fatalf("queued task state = %#v", state)
 	}
-	if queuedID := <-service.modelSyncQueue; queuedID != "occupied" {
-		t.Fatalf("worker queue item = %q, want occupied", queuedID)
+}
+
+func TestModelSyncRunningUpdatesRetryOnceThenRequeue(t *testing.T) {
+	_, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	const authID = "running-model-sync"
+	service := &Service{
+		modelSyncCancel:     cancel,
+		modelSyncQueue:      make(chan string, 2),
+		modelSyncPending:    make(map[string]modelSyncTaskState),
+		modelSyncGeneration: 1,
+	}
+	if !service.enqueueModelSync(authID) {
+		t.Fatal("model sync task was not accepted")
+	}
+	<-service.modelSyncQueue
+	epoch, ok := service.beginModelSyncTask(authID, 1)
+	if !ok {
+		t.Fatal("queued task did not begin")
+	}
+
+	service.enqueueModelSync(authID)
+	if !service.completeModelSyncTask(authID, epoch, 1, true) {
+		t.Fatal("running update did not receive one immediate retry")
+	}
+	service.enqueueModelSync(authID)
+	if service.completeModelSyncTask(authID, epoch, 1, false) {
+		t.Fatal("second running update incorrectly retained the worker")
+	}
+
+	if queuedID := <-service.modelSyncQueue; queuedID != authID {
+		t.Fatalf("requeued auth ID = %q, want %q", queuedID, authID)
+	}
+	state := service.modelSyncPending[authID]
+	if state.epoch != epoch || !state.queued || state.running || state.dirty {
+		t.Fatalf("requeued task state = %#v", state)
+	}
+}
+
+func TestModelSyncTaskEpochRejectsDeletedAuthCompletion(t *testing.T) {
+	_, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	const authID = "recreated-model-sync"
+	service := &Service{
+		modelSyncCancel:     cancel,
+		modelSyncQueue:      make(chan string, 2),
+		modelSyncPending:    make(map[string]modelSyncTaskState),
+		modelSyncGeneration: 1,
+	}
+	service.enqueueModelSync(authID)
+	<-service.modelSyncQueue
+	oldEpoch, ok := service.beginModelSyncTask(authID, 1)
+	if !ok {
+		t.Fatal("old task did not begin")
+	}
+	service.cancelModelSyncTask(authID)
+	service.enqueueModelSync(authID)
+	newState := service.modelSyncPending[authID]
+	if newState.epoch == oldEpoch {
+		t.Fatal("recreated auth reused the old task epoch")
+	}
+
+	if service.completeModelSyncTask(authID, oldEpoch, 1, true) {
+		t.Fatal("old task completion was accepted for recreated auth")
+	}
+	current := service.modelSyncPending[authID]
+	if current.epoch != newState.epoch || !current.queued {
+		t.Fatalf("old completion changed recreated task: %#v", current)
+	}
+}
+
+func TestModelSyncConditionalCancelPreservesRecreatedTask(t *testing.T) {
+	_, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	const authID = "conditionally-canceled-model-sync"
+	service := &Service{
+		modelSyncCancel:     cancel,
+		modelSyncQueue:      make(chan string, 2),
+		modelSyncPending:    make(map[string]modelSyncTaskState),
+		modelSyncGeneration: 1,
+	}
+	service.enqueueModelSync(authID)
+	oldEpoch := service.modelSyncTaskEpoch(authID)
+	service.cancelModelSyncTaskIfEpoch(authID, oldEpoch)
+	service.enqueueModelSync(authID)
+	newEpoch := service.modelSyncTaskEpoch(authID)
+	if newEpoch == oldEpoch {
+		t.Fatal("recreated task reused old epoch")
+	}
+
+	service.cancelModelSyncTaskIfEpoch(authID, oldEpoch)
+	if currentEpoch := service.modelSyncTaskEpoch(authID); currentEpoch != newEpoch {
+		t.Fatalf("old conditional cancel removed epoch %d, current = %d", newEpoch, currentEpoch)
+	}
+}
+
+func TestModelSyncRecreatedInstallationSupersedesQueuedOrRunningTask(t *testing.T) {
+	for _, running := range []bool{false, true} {
+		name := "queued"
+		if running {
+			name = "running"
+		}
+		t.Run(name, func(t *testing.T) {
+			_, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			const authID = "recreated-installation-model-sync"
+			service := &Service{
+				modelSyncCancel:     cancel,
+				modelSyncQueue:      make(chan string, 2),
+				modelSyncPending:    make(map[string]modelSyncTaskState),
+				modelSyncGeneration: 1,
+			}
+			if !service.enqueueModelSyncTaskForInstallation(authID, "old-installation", false) {
+				t.Fatal("old installation task was not accepted")
+			}
+			oldEpoch := service.modelSyncTaskEpoch(authID)
+			if running {
+				queuedID := <-service.modelSyncQueue
+				if queuedID != authID {
+					t.Fatalf("queued auth ID = %q, want %q", queuedID, authID)
+				}
+				if _, ok := service.beginModelSyncTask(authID, 1); !ok {
+					t.Fatal("old installation task did not begin")
+				}
+			}
+
+			if !service.enqueueModelSyncTaskForInstallation(authID, "new-installation", false) {
+				t.Fatal("new installation task was not accepted")
+			}
+			newState := service.modelSyncPending[authID]
+			newEpoch := service.modelSyncTaskEpoch(authID)
+			if newEpoch == oldEpoch {
+				t.Fatal("new installation reused the old task epoch")
+			}
+			if running {
+				if newState.nextInstallationID != "new-installation" ||
+					newState.nextEpoch != newEpoch ||
+					!newState.running ||
+					newState.queued {
+					t.Fatalf("running installation successor state = %#v", newState)
+				}
+				select {
+				case duplicate := <-service.modelSyncQueue:
+					t.Fatalf("new installation was dispatched while old task was running: %q", duplicate)
+				default:
+				}
+			} else if newState.installationID != "new-installation" || !newState.queued {
+				t.Fatalf("queued installation state = %#v", newState)
+			}
+
+			service.cancelModelSyncTaskIfEpoch(authID, oldEpoch)
+			current := service.modelSyncPending[authID]
+			if service.modelSyncTaskEpoch(authID) != newEpoch {
+				t.Fatalf("old conditional cancel changed new installation task: %#v", current)
+			}
+			if running {
+				if service.completeModelSyncTask(authID, oldEpoch, 1, true) {
+					t.Fatal("superseded running task requested an inline retry")
+				}
+				queuedID := <-service.modelSyncQueue
+				if queuedID != authID {
+					t.Fatalf("successor queued auth ID = %q, want %q", queuedID, authID)
+				}
+				current = service.modelSyncPending[authID]
+				if current.epoch != newEpoch ||
+					current.installationID != "new-installation" ||
+					!current.queued ||
+					current.running {
+					t.Fatalf("successor state after old completion = %#v", current)
+				}
+			} else if current.epoch != newEpoch || current.installationID != "new-installation" {
+				t.Fatalf("old conditional cancel changed queued installation task: %#v", current)
+			}
+		})
+	}
+}
+
+func TestModelSyncCanceledQueuedTaskPromotesOverflow(t *testing.T) {
+	_, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	service := &Service{
+		modelSyncCancel:     cancel,
+		modelSyncQueue:      make(chan string, 1),
+		modelSyncPending:    make(map[string]modelSyncTaskState),
+		modelSyncGeneration: 1,
+	}
+	if !service.enqueueModelSync("canceled") || !service.enqueueModelSync("waiting") {
+		t.Fatal("model sync tasks were not accepted")
+	}
+	service.cancelModelSyncTask("canceled")
+	if queuedID := <-service.modelSyncQueue; queuedID != "canceled" {
+		t.Fatalf("queued auth ID = %q, want canceled", queuedID)
+	}
+	if _, ok := service.beginModelSyncTask("canceled", 1); ok {
+		t.Fatal("canceled channel entry unexpectedly began")
+	}
+	if queuedID := <-service.modelSyncQueue; queuedID != "waiting" {
+		t.Fatalf("promoted auth ID = %q, want waiting", queuedID)
 	}
 }
 

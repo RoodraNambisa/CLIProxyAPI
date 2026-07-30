@@ -610,7 +610,22 @@ func TestChatGPTWebAccountInfoRejectsCrossOriginAccountCheckRedirect(t *testing.
 	}
 }
 
-func TestChatGPTWebAccountInfoPersistenceIgnoresTaskCancellationAndStopsOnClose(t *testing.T) {
+func TestChatGPTWebAccountInfoPersistenceContextStartsCanceled(t *testing.T) {
+	runtimeContext, cancelRuntime := context.WithCancel(context.Background())
+	runtime := &chatGPTWebAccountInfoRuntime{ctx: runtimeContext}
+	requestContext, cancelRequest := context.WithCancel(context.Background())
+	cancelRequest()
+
+	persistContext, cancelPersist := runtime.persistenceContext(requestContext)
+	defer cancelPersist()
+	if !errors.Is(persistContext.Err(), context.Canceled) {
+		t.Fatalf("persistence context error = %v, want context.Canceled", persistContext.Err())
+	}
+
+	cancelRuntime()
+}
+
+func TestChatGPTWebAccountInfoPersistenceCancelsWithTaskAndStopsOnClose(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
 		switch request.URL.Path {
 		case chatgptwebauth.AccountCheckPath, chatgptwebauth.ConversationInitPath:
@@ -642,6 +657,7 @@ func TestChatGPTWebAccountInfoPersistenceIgnoresTaskCancellationAndStopsOnClose(
 		_ = executor.Close()
 	})
 	executor.runtimeBaseURL = server.URL
+	executor.accountInfoTimeout = 250 * time.Millisecond
 
 	task, errStart := executor.StartAccountInfoRefreshTask([]chatgptwebauth.AccountInfoRefreshTarget{{
 		Name: "persistence-lifecycle.json", AuthID: auth.ID,
@@ -669,16 +685,24 @@ func TestChatGPTWebAccountInfoPersistenceIgnoresTaskCancellationAndStopsOnClose(
 	if call == nil {
 		t.Fatal("account-info call disappeared while persistence was blocked")
 	}
+	select {
+	case <-call.ctx.Done():
+		if !errors.Is(call.ctx.Err(), context.DeadlineExceeded) {
+			t.Fatalf("acquisition context error = %v, want deadline exceeded", call.ctx.Err())
+		}
+	case <-time.After(time.Second):
+		t.Fatal("acquisition context deadline did not expire while persistence was blocked")
+	}
 	if _, found := executor.CancelAccountInfoRefreshTask(task.ID); !found {
 		t.Fatal("CancelAccountInfoRefreshTask() did not find task")
 	}
 	select {
-	case <-call.ctx.Done():
+	case <-persistContext.Done():
+		if !errors.Is(persistContext.Err(), context.Canceled) {
+			t.Fatalf("persistence context error = %v, want context canceled", persistContext.Err())
+		}
 	case <-time.After(time.Second):
-		t.Fatal("task cancellation did not cancel the acquisition context")
-	}
-	if errPersistContext := persistContext.Err(); errPersistContext != nil {
-		t.Fatalf("task cancellation reached persistence context: %v", errPersistContext)
+		t.Fatal("task cancellation did not cancel persistence lock wait")
 	}
 
 	closeDone := make(chan error, 1)

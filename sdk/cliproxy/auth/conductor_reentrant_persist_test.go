@@ -133,3 +133,89 @@ func TestUpdateIfCurrentSourceHashReusesOuterMutationLockDuringModelStateReconci
 	}
 	unlockNext()
 }
+
+func TestUpdateIfCurrentSourceHashPreservesOuterDependencyLockDuringModelStateReconciliation(t *testing.T) {
+	const authID = "reentrant-dependency-model-state.json"
+
+	store := newChatGPTWebDependencyTestStore()
+	hook := &reconcileModelStatesHook{}
+	manager := NewManager(store, nil, hook)
+	hook.manager = manager
+
+	registered, errRegister := manager.Register(t.Context(), &Auth{
+		ID:       authID,
+		FileName: authID,
+		Provider: "codex",
+		Status:   StatusActive,
+		Attributes: map[string]string{
+			"priority": "9",
+		},
+		Metadata: map[string]any{
+			"type":     "codex",
+			"priority": 9,
+		},
+		ModelStates: map[string]*ModelState{
+			"removed-model": {
+				Unavailable:    true,
+				NextRetryAfter: time.Now().Add(time.Hour),
+			},
+		},
+	})
+	if errRegister != nil {
+		t.Fatalf("Register() error: %v", errRegister)
+	}
+
+	candidate := registered.Clone()
+	candidate.Attributes["priority"] = "0"
+	candidate.Metadata["priority"] = 0
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	updateDone := make(chan reentrantPersistUpdateResult, 1)
+	go func() {
+		var result reentrantPersistUpdateResult
+		result.err = manager.WithChatGPTWebDependencyMutation(ctx, func(dependencyCtx context.Context) error {
+			lockedCtx, unlockOuter, errLock := manager.LockAuthMutation(dependencyCtx, registered)
+			if errLock != nil {
+				return errLock
+			}
+			defer unlockOuter()
+			result.auth, result.current, result.err = manager.UpdateIfCurrentSourceHash(
+				lockedCtx,
+				registered,
+				candidate,
+			)
+			return result.err
+		})
+		updateDone <- result
+	}()
+
+	var result reentrantPersistUpdateResult
+	select {
+	case result = <-updateDone:
+	case <-time.After(500 * time.Millisecond):
+		cancel()
+		select {
+		case <-updateDone:
+		case <-time.After(time.Second):
+		}
+		t.Fatal("UpdateIfCurrentSourceHash() deadlocked while reusing the dependency lock")
+	}
+	if result.err != nil {
+		t.Fatalf("UpdateIfCurrentSourceHash() error: %v", result.err)
+	}
+	if !result.current || result.auth == nil {
+		t.Fatalf("UpdateIfCurrentSourceHash() result = (%#v, %v), want current auth", result.auth, result.current)
+	}
+
+	current, ok := manager.GetByID(authID)
+	if !ok || current == nil {
+		t.Fatal("updated auth is missing from manager")
+	}
+	if got := current.Attributes["priority"]; got != "0" {
+		t.Fatalf("priority attribute = %q, want 0", got)
+	}
+	if len(current.ModelStates) != 0 {
+		t.Fatalf("runtime model states = %#v, want none", current.ModelStates)
+	}
+}

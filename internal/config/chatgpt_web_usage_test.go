@@ -21,6 +21,7 @@ func TestChatGPTWebUsageCacheDefaults(t *testing.T) {
 		!resolved.ResourceGuardEnabled ||
 		resolved.MinAvailableDiskMB != 1024 ||
 		resolved.MaxFilesystemUsedPercent != 95 ||
+		resolved.OrphanRetentionMinutes != 0 ||
 		resolved.Path != "" {
 		t.Fatalf("Resolved() = %#v", resolved)
 	}
@@ -37,6 +38,8 @@ func TestChatGPTWebUsageConfigValidation(t *testing.T) {
 	tooLarge := int64(MaxChatGPTWebUsageCacheMegabytes + 1)
 	zeroPercent := 0
 	overPercent := 101
+	negativeRetention := -1
+	overRetention := MaxChatGPTWebUsageCacheOrphanRetention + 1
 	for _, test := range []struct {
 		name   string
 		config ChatGPTWebConfig
@@ -48,6 +51,8 @@ func TestChatGPTWebUsageConfigValidation(t *testing.T) {
 		{name: "negative available floor", config: ChatGPTWebConfig{UsageCache: ChatGPTWebUsageCacheConfig{MinAvailableDiskMB: &negative}}},
 		{name: "zero used percent", config: ChatGPTWebConfig{UsageCache: ChatGPTWebUsageCacheConfig{MaxFilesystemUsedPercent: &zeroPercent}}},
 		{name: "used percent above 100", config: ChatGPTWebConfig{UsageCache: ChatGPTWebUsageCacheConfig{MaxFilesystemUsedPercent: &overPercent}}},
+		{name: "negative orphan retention", config: ChatGPTWebConfig{UsageCache: ChatGPTWebUsageCacheConfig{OrphanRetentionMinutes: &negativeRetention}}},
+		{name: "orphan retention above maximum", config: ChatGPTWebConfig{UsageCache: ChatGPTWebUsageCacheConfig{OrphanRetentionMinutes: &overRetention}}},
 		{name: "invalid quality", config: ChatGPTWebConfig{ImageUsage: ChatGPTWebImageUsageConfig{AutoOutputQuality: "ultra"}}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -151,6 +156,7 @@ func TestSaveConfigPreservesChatGPTWebUsageCacheSettings(t *testing.T) {
 	maximum := int64(16)
 	minimumAvailable := int64(4)
 	maximumUsedPercent := 90
+	orphanRetentionMinutes := 60
 	resourceGuardEnabled := false
 	cfg.ChatGPTWeb.UsageCache = ChatGPTWebUsageCacheConfig{
 		Enabled:                  &enabled,
@@ -159,6 +165,7 @@ func TestSaveConfigPreservesChatGPTWebUsageCacheSettings(t *testing.T) {
 		ResourceGuardEnabled:     &resourceGuardEnabled,
 		MinAvailableDiskMB:       &minimumAvailable,
 		MaxFilesystemUsedPercent: &maximumUsedPercent,
+		OrphanRetentionMinutes:   &orphanRetentionMinutes,
 		Path:                     "",
 	}
 	cfg.ChatGPTWeb.ImageUsage.AutoOutputQuality = "high"
@@ -173,6 +180,7 @@ func TestSaveConfigPreservesChatGPTWebUsageCacheSettings(t *testing.T) {
 	for _, expected := range []string{
 		"usage-cache:", "enabled: false", "disk-threshold-mb: 2", "max-disk-size-mb: 16",
 		"resource-guard-enabled: false", "min-available-disk-mb: 4", "max-filesystem-used-percent: 90",
+		"orphan-retention-minutes: 60",
 		"image-usage:", "auto-output-quality: high",
 	} {
 		if !strings.Contains(string(saved), expected) {
@@ -186,6 +194,7 @@ func TestSaveConfigPreservesChatGPTWebUsageCacheSettings(t *testing.T) {
 	resolved := reloaded.ChatGPTWeb.UsageCache.Resolved()
 	if resolved.Enabled || resolved.DiskThresholdMB != 2 || resolved.MaxDiskSizeMB != 16 ||
 		resolved.ResourceGuardEnabled || resolved.MinAvailableDiskMB != 4 || resolved.MaxFilesystemUsedPercent != 90 ||
+		resolved.OrphanRetentionMinutes != 60 ||
 		reloaded.ChatGPTWeb.ImageUsage.ResolvedAutoOutputQuality() != "high" {
 		t.Fatalf("reloaded config = %#v", reloaded.ChatGPTWeb)
 	}

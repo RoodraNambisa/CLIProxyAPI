@@ -59,6 +59,7 @@ func TestGetChatGPTWebUsageCacheReturnsDefaultsAndRuntimeStats(t *testing.T) {
 		!response.UsageCache.ResourceGuardEnabled ||
 		response.UsageCache.MinAvailableDiskMB != config.DefaultChatGPTWebUsageCacheMinAvailableMB ||
 		response.UsageCache.MaxFilesystemUsedPercent != config.DefaultChatGPTWebUsageCacheMaxUsedPercent ||
+		response.UsageCache.OrphanRetentionMinutes != 0 ||
 		response.ImageUsage.AutoOutputQuality != "medium" {
 		t.Fatalf("GET response config = %#v", response)
 	}
@@ -87,6 +88,7 @@ func TestPatchChatGPTWebUsageCachePersistsAndUpdatesRuntime(t *testing.T) {
 			"resource-guard-enabled":false,
 			"min-available-disk-mb":4,
 			"max-filesystem-used-percent":90,
+			"orphan-retention-minutes":60,
 			"path":"/tmp/web-usage"
 		},
 		"image-usage":{"auto-output-quality":"high"}
@@ -102,7 +104,8 @@ func TestPatchChatGPTWebUsageCachePersistsAndUpdatesRuntime(t *testing.T) {
 		executor.resolved.DiskThresholdMB != 2 ||
 		executor.resolved.ResourceGuardEnabled ||
 		executor.resolved.MinAvailableDiskMB != 4 ||
-		executor.resolved.MaxFilesystemUsedPercent != 90 {
+		executor.resolved.MaxFilesystemUsedPercent != 90 ||
+		executor.resolved.OrphanRetentionMinutes != 60 {
 		t.Fatalf("runtime update = count %d, config %#v", executor.updates, executor.resolved)
 	}
 	reloaded, errLoad := config.LoadConfig(configPath)
@@ -110,6 +113,7 @@ func TestPatchChatGPTWebUsageCachePersistsAndUpdatesRuntime(t *testing.T) {
 		t.Fatalf("LoadConfig() error = %v", errLoad)
 	}
 	if reloaded.ChatGPTWeb.TokenUsageEstimationEnabled() || !reloaded.ChatGPTWeb.UsageCache.Resolved().Enabled ||
+		reloaded.ChatGPTWeb.UsageCache.Resolved().OrphanRetentionMinutes != 60 ||
 		reloaded.ChatGPTWeb.ImageUsage.ResolvedAutoOutputQuality() != "high" {
 		t.Fatalf("persisted config = %#v", reloaded.ChatGPTWeb)
 	}
@@ -141,6 +145,37 @@ func TestPutChatGPTWebUsageCacheRequiresCompleteBody(t *testing.T) {
 	handler.PutChatGPTWebUsageCache(ctx)
 	if recorder.Code != http.StatusBadRequest {
 		t.Fatalf("PUT status = %d, want 400: %s", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestPutChatGPTWebUsageCacheOldSchemaPreservesOrphanRetention(t *testing.T) {
+	configPath := writeTestConfigFile(t)
+	retention := 60
+	handler := &Handler{
+		cfg: &config.Config{ChatGPTWeb: config.ChatGPTWebConfig{
+			UsageCache: config.ChatGPTWebUsageCacheConfig{
+				OrphanRetentionMinutes: &retention,
+			},
+		}},
+		configFilePath: configPath,
+	}
+	body := `{
+		"estimate-token-usage":true,
+		"usage-cache":{
+			"enabled":true,
+			"disk-threshold-mb":2,
+			"max-disk-size-mb":16,
+			"path":"/tmp/web-usage"
+		},
+		"image-usage":{"auto-output-quality":"medium"}
+	}`
+	ctx, recorder := newChatGPTWebUsageCacheRequest(http.MethodPut, body)
+	handler.PutChatGPTWebUsageCache(ctx)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("PUT status = %d, want 200: %s", recorder.Code, recorder.Body.String())
+	}
+	if got := handler.cfg.ChatGPTWeb.UsageCache.Resolved().OrphanRetentionMinutes; got != retention {
+		t.Fatalf("orphan retention = %d, want %d", got, retention)
 	}
 }
 

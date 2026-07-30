@@ -6,10 +6,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 	"unicode/utf8"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/systemmetrics"
@@ -31,21 +33,34 @@ type ChatGPTWebUsageCacheOptions struct {
 	MinAvailableDiskBytes    int64
 	MaxFilesystemUsedPercent int
 	Path                     string
+	OrphanRetention          time.Duration
 	AutoOutputQuality        string
 }
 
 // ChatGPTWebUsageCacheSnapshot reports active storage and cumulative outcomes.
 type ChatGPTWebUsageCacheSnapshot struct {
-	ActiveMemoryEntries    int    `json:"active_memory_entries"`
-	ActiveMemoryBytes      int64  `json:"active_memory_bytes"`
-	ActiveDiskEntries      int    `json:"active_disk_entries"`
-	ActiveDiskBytes        int64  `json:"active_disk_bytes"`
-	PeakDiskBytes          int64  `json:"peak_disk_bytes"`
-	SuccessfulCalculations uint64 `json:"successful_calculations"`
-	FailedDiscards         uint64 `json:"failed_discards"`
-	CapacityRejections     uint64 `json:"capacity_rejections"`
-	ResourceRejections     uint64 `json:"resource_rejections"`
-	WriteErrors            uint64 `json:"write_errors"`
+	ActiveMemoryEntries    int        `json:"active_memory_entries"`
+	ActiveMemoryBytes      int64      `json:"active_memory_bytes"`
+	ActiveDiskEntries      int        `json:"active_disk_entries"`
+	ActiveDiskBytes        int64      `json:"active_disk_bytes"`
+	PeakDiskBytes          int64      `json:"peak_disk_bytes"`
+	SuccessfulCalculations uint64     `json:"successful_calculations"`
+	FailedDiscards         uint64     `json:"failed_discards"`
+	CapacityRejections     uint64     `json:"capacity_rejections"`
+	ResourceRejections     uint64     `json:"resource_rejections"`
+	WriteErrors            uint64     `json:"write_errors"`
+	InstanceDirectory      string     `json:"instance_directory"`
+	OwnershipStatus        string     `json:"ownership_status"`
+	OrphanDirectoryCount   int        `json:"orphan_directory_count"`
+	OrphanFileCount        int        `json:"orphan_file_count"`
+	OrphanBytes            int64      `json:"orphan_bytes"`
+	LegacyDirectoryCount   int        `json:"legacy_directory_count"`
+	LegacyFileCount        int        `json:"legacy_file_count"`
+	LegacyBytes            int64      `json:"legacy_bytes"`
+	CleanupCount           uint64     `json:"cleanup_count"`
+	CleanupErrors          uint64     `json:"cleanup_errors"`
+	LastCleanupAt          *time.Time `json:"last_cleanup_at"`
+	RetainedOrphanBytes    int64      `json:"retained_orphan_bytes"`
 }
 
 // ChatGPTWebUsageCacheError identifies a local cache failure before upstream generation starts.
@@ -90,18 +105,31 @@ type ChatGPTWebUsageImage struct {
 
 // ChatGPTWebUsageCache owns compact per-request accounting projections.
 type ChatGPTWebUsageCache struct {
-	mu                  sync.Mutex
-	resourceMu          sync.Mutex
-	createWG            sync.WaitGroup
-	handles             map[*ChatGPTWebUsageProjection]struct{}
-	defaultDir          string
-	closed              bool
-	stats               ChatGPTWebUsageCacheSnapshot
-	resourceStates      map[string]*chatGPTWebUsageResourceState
-	resourcePathKeys    map[string]string
-	resourceGenerations map[string]uint64
-	resourceProbeGroup  singleflight.Group
-	collectFilesystem   func(string) systemmetrics.FilesystemSnapshot
+	mu                   sync.Mutex
+	resourceMu           sync.Mutex
+	createWG             sync.WaitGroup
+	ownershipWG          sync.WaitGroup
+	retireWG             sync.WaitGroup
+	handles              map[*ChatGPTWebUsageProjection]struct{}
+	ownedDirectories     map[string]*chatGPTWebUsageCacheOwnedDirectory
+	activeOwnedBase      string
+	retainedOrphanBytes  map[string]int64
+	inventoryByBase      map[string]chatGPTWebUsageCacheCleanupResult
+	inventoriedBases     map[string]struct{}
+	inventoryBaseInfo    map[string]fs.FileInfo
+	cleanupPrepared      bool
+	startedAt            time.Time
+	closed               bool
+	stats                ChatGPTWebUsageCacheSnapshot
+	resourceStates       map[string]*chatGPTWebUsageResourceState
+	resourcePathKeys     map[string]string
+	resourceGenerations  map[string]uint64
+	resourceProbeGroup   singleflight.Group
+	prepareGroup         singleflight.Group
+	collectFilesystem    func(string) systemmetrics.FilesystemSnapshot
+	removeProjectionFile func(*os.Root, string) error
+	removeOwnedDirectory func(*chatGPTWebUsageCacheOwnedDirectory) error
+	closeOnce            sync.Once
 }
 
 // ChatGPTWebUsageProjection retains only data required for hybrid accounting.
@@ -119,6 +147,9 @@ type ChatGPTWebUsageProjection struct {
 	records             []chatGPTWebUsageTextRecord
 	images              []ChatGPTWebUsageImage
 	filePath            string
+	fileName            string
+	ownedDirectory      *chatGPTWebUsageCacheOwnedDirectory
+	cacheBase           string
 	resourceStateKey    string
 	memoryBytes         int64
 	diskBytes           int64
@@ -129,10 +160,20 @@ type ChatGPTWebUsageProjection struct {
 func NewChatGPTWebUsageCache() *ChatGPTWebUsageCache {
 	return &ChatGPTWebUsageCache{
 		handles:             make(map[*ChatGPTWebUsageProjection]struct{}),
+		ownedDirectories:    make(map[string]*chatGPTWebUsageCacheOwnedDirectory),
+		retainedOrphanBytes: make(map[string]int64),
+		inventoryByBase:     make(map[string]chatGPTWebUsageCacheCleanupResult),
+		inventoriedBases:    make(map[string]struct{}),
+		inventoryBaseInfo:   make(map[string]fs.FileInfo),
+		startedAt:           time.Now(),
 		resourceStates:      make(map[string]*chatGPTWebUsageResourceState),
 		resourcePathKeys:    make(map[string]string),
 		resourceGenerations: make(map[string]uint64),
 		collectFilesystem:   systemmetrics.CollectFilesystem,
+		removeProjectionFile: func(root *os.Root, name string) error {
+			return root.Remove(name)
+		},
+		removeOwnedDirectory: removeChatGPTWebUsageCacheOwnedDirectory,
 	}
 }
 
@@ -171,34 +212,73 @@ func (cache *ChatGPTWebUsageCache) NewProjection(model string, request ChatGPTWe
 		cache.mu.Unlock()
 		return nil, &ChatGPTWebUsageCacheError{Code: "chatgpt_web_usage_cache_full", Message: "chatgpt web usage cache capacity is exhausted"}
 	}
-
-	resourcePath := chatGPTWebUsageCacheResourcePath(options.Path)
-	resourceStateKey, errReserve := cache.reserveDiskProjectionAtPath(options, resourcePath, diskBytes)
+	if !cache.beginUsageCacheOwnershipOperation() {
+		return nil, &ChatGPTWebUsageCacheError{Code: "chatgpt_web_usage_cache_unavailable", Message: "chatgpt web usage cache is closed"}
+	}
+	defer cache.ownershipWG.Done()
+	ownedDirectory, errOwned := cache.acquireOwnedUsageCacheDirectory(options.Path, options.OrphanRetention)
+	if errOwned != nil {
+		cache.mu.Lock()
+		cache.stats.WriteErrors++
+		cache.mu.Unlock()
+		return nil, &ChatGPTWebUsageCacheError{
+			Code:    "chatgpt_web_usage_cache_unavailable",
+			Message: "chatgpt web usage cache is unavailable",
+		}
+	}
+	releaseOwned := true
+	defer func() {
+		if releaseOwned {
+			cache.releaseOwnedUsageCacheDirectory(ownedDirectory)
+		}
+	}()
+	if errInventory := cache.ensureUsageCacheBaseInventoryForOwned(ownedDirectory); errInventory != nil {
+		cache.invalidateOwnedUsageCacheDirectory(ownedDirectory)
+		return nil, &ChatGPTWebUsageCacheError{
+			Code:    "chatgpt_web_usage_cache_storage_unavailable",
+			Message: "chatgpt web usage cache storage changed during inventory",
+		}
+	}
+	resourceStateKey, errReserve := cache.reserveDiskProjectionForOwned(options, ownedDirectory, diskBytes)
 	if errReserve != nil {
+		if !ownedDirectory.pathIdentityCurrent() {
+			cache.invalidateOwnedUsageCacheDirectory(ownedDirectory)
+		}
 		return nil, errReserve
 	}
 	defer cache.createWG.Done()
 	projection.resourceStateKey = resourceStateKey
+	projection.cacheBase = ownedDirectory.base
 
-	path, errWrite := cache.writeProjectionFile(options.Path, records)
+	if !ownedDirectory.pathIdentityCurrent() {
+		cache.rollbackDiskProjection(resourceStateKey, diskBytes)
+		cache.invalidateOwnedUsageCacheDirectory(ownedDirectory)
+		return nil, &ChatGPTWebUsageCacheError{
+			Code:    "chatgpt_web_usage_cache_storage_unavailable",
+			Message: "chatgpt web usage cache storage changed during validation",
+		}
+	}
+	fileName, path, errWrite := cache.writeProjectionFile(ownedDirectory, records, diskBytes)
 	if errWrite != nil {
-		cache.mu.Lock()
-		cache.stats.ActiveDiskBytes -= diskBytes
-		cache.stats.WriteErrors++
-		cache.mu.Unlock()
-		cache.completeDiskReservation(resourceStateKey, diskBytes)
+		cache.rollbackDiskProjection(resourceStateKey, diskBytes)
 		return nil, &ChatGPTWebUsageCacheError{Code: "chatgpt_web_usage_cache_unavailable", Message: "chatgpt web usage cache is unavailable"}
 	}
 	projection.filePath = path
+	projection.fileName = fileName
+	projection.ownedDirectory = ownedDirectory
 	projection.diskBytes = diskBytes
 	projection.records = nil
 	projection.memoryBytes = 0
+	releaseOwned = false
 
 	cache.mu.Lock()
 	if cache.closed {
 		cache.stats.ActiveDiskBytes -= diskBytes
 		cache.mu.Unlock()
-		_ = os.Remove(path)
+		if errRemove := projection.removeDiskFile(); errRemove != nil && !errors.Is(errRemove, os.ErrNotExist) {
+			cache.recordRetainedUsageCacheFile(projection.cacheBase, projection.diskBytes)
+		}
+		cache.releaseOwnedUsageCacheDirectory(ownedDirectory)
 		cache.completeDiskReservation(resourceStateKey, diskBytes)
 		return nil, &ChatGPTWebUsageCacheError{Code: "chatgpt_web_usage_cache_unavailable", Message: "chatgpt web usage cache is closed"}
 	}
@@ -212,17 +292,47 @@ func (cache *ChatGPTWebUsageCache) NewProjection(model string, request ChatGPTWe
 	return projection, nil
 }
 
+func (cache *ChatGPTWebUsageCache) beginUsageCacheOwnershipOperation() bool {
+	cache.mu.Lock()
+	defer cache.mu.Unlock()
+	if cache.closed {
+		return false
+	}
+	cache.ownershipWG.Add(1)
+	return true
+}
+
+func (cache *ChatGPTWebUsageCache) rollbackDiskProjection(resourceStateKey string, diskBytes int64) {
+	cache.mu.Lock()
+	cache.stats.ActiveDiskBytes -= diskBytes
+	if cache.stats.ActiveDiskBytes < 0 {
+		cache.stats.ActiveDiskBytes = 0
+	}
+	cache.stats.WriteErrors++
+	cache.mu.Unlock()
+	cache.completeDiskReservation(resourceStateKey, diskBytes)
+}
+
 func (cache *ChatGPTWebUsageCache) reserveDiskProjection(options ChatGPTWebUsageCacheOptions, diskBytes int64) error {
-	_, err := cache.reserveDiskProjectionAtPath(options, chatGPTWebUsageCacheResourcePath(options.Path), diskBytes)
+	resourcePath := chatGPTWebUsageCacheResourcePath(options.Path)
+	_, err := cache.reserveDiskProjectionAtPath(options, resourcePath, resourcePath, diskBytes, nil)
 	return err
 }
 
 func (cache *ChatGPTWebUsageCache) reserveDiskProjectionAtPath(
 	options ChatGPTWebUsageCacheOptions,
 	resourcePath string,
+	capacityBase string,
 	diskBytes int64,
+	validateIdentity func() bool,
 ) (string, error) {
 	for range chatGPTWebUsageResourceProbeAttempts {
+		if validateIdentity != nil && !validateIdentity() {
+			return "", &ChatGPTWebUsageCacheError{
+				Code:    "chatgpt_web_usage_cache_storage_unavailable",
+				Message: "chatgpt web usage cache storage changed during validation",
+			}
+		}
 		cache.resourceMu.Lock()
 		cache.mu.Lock()
 		if cache.closed {
@@ -230,7 +340,7 @@ func (cache *ChatGPTWebUsageCache) reserveDiskProjectionAtPath(
 			cache.resourceMu.Unlock()
 			return "", &ChatGPTWebUsageCacheError{Code: "chatgpt_web_usage_cache_unavailable", Message: "chatgpt web usage cache is closed"}
 		}
-		if cache.stats.ActiveDiskBytes > options.MaxDiskBytes-diskBytes {
+		if cache.exceedsMaximumLocked(capacityBase, options.MaxDiskBytes, diskBytes) {
 			cache.stats.CapacityRejections++
 			cache.mu.Unlock()
 			cache.resourceMu.Unlock()
@@ -282,6 +392,12 @@ func (cache *ChatGPTWebUsageCache) reserveDiskProjectionAtPath(
 		probe := cache.collectFilesystemSnapshot(resourcePath)
 		snapshot := probe.snapshot
 		resourceStateKey = probe.resourceStateKey
+		if validateIdentity != nil && !validateIdentity() {
+			return "", &ChatGPTWebUsageCacheError{
+				Code:    "chatgpt_web_usage_cache_storage_unavailable",
+				Message: "chatgpt web usage cache storage changed during validation",
+			}
+		}
 
 		cache.resourceMu.Lock()
 		cache.mu.Lock()
@@ -290,7 +406,7 @@ func (cache *ChatGPTWebUsageCache) reserveDiskProjectionAtPath(
 			cache.resourceMu.Unlock()
 			return "", &ChatGPTWebUsageCacheError{Code: "chatgpt_web_usage_cache_unavailable", Message: "chatgpt web usage cache is closed"}
 		}
-		if cache.stats.ActiveDiskBytes > options.MaxDiskBytes-diskBytes {
+		if cache.exceedsMaximumLocked(capacityBase, options.MaxDiskBytes, diskBytes) {
 			cache.stats.CapacityRejections++
 			cache.mu.Unlock()
 			cache.resourceMu.Unlock()
@@ -356,6 +472,26 @@ func (cache *ChatGPTWebUsageCache) reserveDiskProjectionAtPath(
 	}
 }
 
+func (cache *ChatGPTWebUsageCache) reserveDiskProjectionForOwned(
+	options ChatGPTWebUsageCacheOptions,
+	owned *chatGPTWebUsageCacheOwnedDirectory,
+	diskBytes int64,
+) (string, error) {
+	if owned == nil {
+		return "", &ChatGPTWebUsageCacheError{
+			Code:    "chatgpt_web_usage_cache_storage_unavailable",
+			Message: "chatgpt web usage cache storage is unavailable",
+		}
+	}
+	return cache.reserveDiskProjectionAtPath(
+		options,
+		owned.path,
+		owned.base,
+		diskBytes,
+		owned.pathIdentityCurrent,
+	)
+}
+
 func (cache *ChatGPTWebUsageCache) collectFilesystemSnapshot(resourcePath string) chatGPTWebUsageFilesystemProbe {
 	probe, _, _ := cache.resourceProbeGroup.Do(resourcePath, func() (any, error) {
 		cache.resourceMu.Lock()
@@ -382,6 +518,27 @@ func (cache *ChatGPTWebUsageCache) collectFilesystemSnapshot(resourcePath string
 func (cache *ChatGPTWebUsageCache) reserveDiskProjectionLocked(diskBytes int64) {
 	cache.stats.ActiveDiskBytes += diskBytes
 	cache.createWG.Add(1)
+}
+
+func chatGPTWebUsageCacheExceedsMaximum(
+	stats ChatGPTWebUsageCacheSnapshot,
+	maxDiskBytes int64,
+	requestBytes int64,
+) bool {
+	if maxDiskBytes <= 0 || requestBytes < 0 || requestBytes > maxDiskBytes {
+		return true
+	}
+	usedBytes := stats.ActiveDiskBytes + stats.RetainedOrphanBytes
+	if usedBytes < stats.ActiveDiskBytes {
+		return true
+	}
+	return usedBytes > maxDiskBytes-requestBytes
+}
+
+func (cache *ChatGPTWebUsageCache) exceedsMaximumLocked(resourcePath string, maxDiskBytes, requestBytes int64) bool {
+	stats := cache.stats
+	stats.RetainedOrphanBytes = cache.retainedOrphanBytes[filepath.Clean(resourcePath)]
+	return chatGPTWebUsageCacheExceedsMaximum(stats, maxDiskBytes, requestBytes)
 }
 
 func (cache *ChatGPTWebUsageCache) completeDiskReservation(resourceStateKey string, diskBytes int64) {
@@ -524,25 +681,45 @@ func forEachChatGPTWebUsageRecordChunk(record chatGPTWebUsageTextRecord, visit f
 	return nil
 }
 
-func (cache *ChatGPTWebUsageCache) writeProjectionFile(configuredPath string, records []chatGPTWebUsageTextRecord) (string, error) {
-	directory, errDir := cache.cacheDirectory(configuredPath)
-	if errDir != nil {
-		return "", errDir
+func (cache *ChatGPTWebUsageCache) writeProjectionFile(
+	owned *chatGPTWebUsageCacheOwnedDirectory,
+	records []chatGPTWebUsageTextRecord,
+	estimatedDiskBytes int64,
+) (string, string, error) {
+	if owned == nil || owned.root == nil || !owned.pathIdentityCurrent() {
+		return "", "", errors.New("usage cache directory identity changed before write")
 	}
-	file, errCreate := os.CreateTemp(directory, "usage-*.bin")
-	if errCreate != nil {
-		return "", errCreate
+	var (
+		file      *os.File
+		fileName  string
+		errCreate error
+	)
+	for range 4 {
+		randomID, errRandomID := newChatGPTWebUsageCacheRandomID()
+		if errRandomID != nil {
+			return "", "", errRandomID
+		}
+		fileName = "usage-" + randomID + ".bin"
+		file, errCreate = owned.root.OpenFile(fileName, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600)
+		if errCreate == nil {
+			break
+		}
+		if !errors.Is(errCreate, fs.ErrExist) {
+			return "", "", errCreate
+		}
 	}
-	path := file.Name()
+	if file == nil {
+		return "", "", errCreate
+	}
 	cleanup := true
 	defer func() {
 		if cleanup {
 			_ = file.Close()
-			_ = os.Remove(path)
+			cache.cleanupFailedProjectionFile(owned, fileName, estimatedDiskBytes)
 		}
 	}()
 	if errChmod := file.Chmod(0o600); errChmod != nil {
-		return "", errChmod
+		return "", "", errChmod
 	}
 	writer := bufio.NewWriterSize(file, 64<<10)
 	var header [5]byte
@@ -562,45 +739,61 @@ func (cache *ChatGPTWebUsageCache) writeProjectionFile(configuredPath string, re
 			}
 			return nil
 		}); errChunk != nil {
-			return "", errChunk
+			return "", "", errChunk
 		}
 	}
 	if errFlush := writer.Flush(); errFlush != nil {
-		return "", errFlush
+		return "", "", errFlush
 	}
 	if errClose := file.Close(); errClose != nil {
-		return "", errClose
+		return "", "", errClose
 	}
 	cleanup = false
-	return path, nil
+	return fileName, filepath.Join(owned.path, fileName), nil
 }
 
-func (cache *ChatGPTWebUsageCache) cacheDirectory(configuredPath string) (string, error) {
-	configuredPath = strings.TrimSpace(configuredPath)
-	if configuredPath != "" {
-		if err := os.MkdirAll(configuredPath, 0o700); err != nil {
-			return "", err
-		}
-		if err := os.Chmod(configuredPath, 0o700); err != nil {
-			return "", err
-		}
-		return configuredPath, nil
+func (cache *ChatGPTWebUsageCache) cleanupFailedProjectionFile(
+	owned *chatGPTWebUsageCacheOwnedDirectory,
+	fileName string,
+	estimatedDiskBytes int64,
+) {
+	if cache == nil || owned == nil || owned.root == nil || fileName == "" {
+		return
 	}
+	remove := cache.removeProjectionFile
+	if remove == nil {
+		remove = func(root *os.Root, name string) error {
+			return root.Remove(name)
+		}
+	}
+	if errRemove := remove(owned.root, fileName); errRemove == nil || errors.Is(errRemove, os.ErrNotExist) {
+		return
+	}
+	retainedBytes := estimatedDiskBytes
+	if info, errInfo := owned.root.Lstat(fileName); errInfo == nil && info.Mode().IsRegular() && info.Size() >= 0 {
+		retainedBytes = info.Size()
+	}
+	cache.recordRetainedUsageCacheFile(owned.base, retainedBytes)
+}
+
+func (cache *ChatGPTWebUsageCache) recordRetainedUsageCacheFile(base string, bytes int64) {
+	if cache == nil {
+		return
+	}
+	if bytes < 0 {
+		bytes = 0
+	}
+	base = filepath.Clean(base)
 	cache.mu.Lock()
-	defer cache.mu.Unlock()
-	if cache.defaultDir != "" {
-		return cache.defaultDir, nil
-	}
-	directory, err := os.MkdirTemp("", "cli-proxy-api-chatgpt-web-usage-")
-	if err != nil {
-		return "", err
-	}
-	if err = os.Chmod(directory, 0o700); err != nil {
-		_ = os.RemoveAll(directory)
-		return "", err
-	}
-	cache.defaultDir = directory
-	return directory, nil
+	cache.retainedOrphanBytes[base] += bytes
+	inventory := cache.inventoryByBase[base]
+	inventory.orphanDirectories = max(inventory.orphanDirectories, 1)
+	inventory.orphanFiles++
+	inventory.orphanBytes += bytes
+	cache.inventoryByBase[base] = inventory
+	cache.stats.CleanupErrors++
+	cache.recomputeUsageCacheInventoryStatsLocked()
+	cache.mu.Unlock()
 }
 
 // AddImage adds a compact image descriptor after upload or download validation.
@@ -821,7 +1014,7 @@ func (projection *ChatGPTWebUsageProjection) forEachTextRecord(visit func(bool, 
 		}
 		return nil
 	}
-	file, errOpen := os.Open(projection.filePath)
+	file, errOpen := projection.openDiskFile()
 	if errOpen != nil {
 		return errOpen
 	}
@@ -867,13 +1060,34 @@ func (projection *ChatGPTWebUsageProjection) finish(completed bool) {
 	projection.closeOnce.Do(func() {
 		projection.mu.Lock()
 		defer projection.mu.Unlock()
+		var removeErr error
 		if projection.filePath != "" {
-			_ = os.Remove(projection.filePath)
+			removeErr = projection.removeDiskFile()
 		}
 		projection.records = nil
 		projection.images = nil
-		projection.manager.releaseProjection(projection, completed)
+		projection.manager.releaseProjection(projection, completed, removeErr)
 	})
+}
+
+func (projection *ChatGPTWebUsageProjection) openDiskFile() (*os.File, error) {
+	if projection == nil || projection.fileName == "" ||
+		projection.ownedDirectory == nil || projection.ownedDirectory.root == nil {
+		return nil, errors.New("chatgpt web usage cache file is unavailable")
+	}
+	return projection.ownedDirectory.root.Open(projection.fileName)
+}
+
+func (projection *ChatGPTWebUsageProjection) removeDiskFile() error {
+	if projection == nil || projection.fileName == "" ||
+		projection.ownedDirectory == nil || projection.ownedDirectory.root == nil {
+		return errors.New("chatgpt web usage cache file is unavailable")
+	}
+	remove := projection.manager.removeProjectionFile
+	if remove == nil {
+		return projection.ownedDirectory.root.Remove(projection.fileName)
+	}
+	return remove(projection.ownedDirectory.root, projection.fileName)
 }
 
 func (cache *ChatGPTWebUsageCache) reduceProjectionMemory(projection *ChatGPTWebUsageProjection, releasedBytes int64) {
@@ -891,16 +1105,23 @@ func (cache *ChatGPTWebUsageCache) reduceProjectionMemory(projection *ChatGPTWeb
 	}
 }
 
-func (cache *ChatGPTWebUsageCache) releaseProjection(projection *ChatGPTWebUsageProjection, completed bool) {
+func (cache *ChatGPTWebUsageCache) releaseProjection(
+	projection *ChatGPTWebUsageProjection,
+	completed bool,
+	removeErr error,
+) {
 	cache.mu.Lock()
-	defer cache.mu.Unlock()
 	if _, exists := cache.handles[projection]; !exists {
+		cache.mu.Unlock()
 		return
 	}
 	delete(cache.handles, projection)
 	if projection.filePath != "" {
 		cache.stats.ActiveDiskEntries--
 		cache.stats.ActiveDiskBytes -= projection.diskBytes
+		if removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+			cache.recordRetainedUsageCacheFileLocked(projection.cacheBase, projection.diskBytes)
+		}
 	} else {
 		cache.stats.ActiveMemoryEntries--
 		cache.stats.ActiveMemoryBytes -= projection.memoryBytes
@@ -910,6 +1131,23 @@ func (cache *ChatGPTWebUsageCache) releaseProjection(projection *ChatGPTWebUsage
 	} else {
 		cache.stats.FailedDiscards++
 	}
+	cache.mu.Unlock()
+	cache.releaseOwnedUsageCacheDirectory(projection.ownedDirectory)
+}
+
+func (cache *ChatGPTWebUsageCache) recordRetainedUsageCacheFileLocked(base string, bytes int64) {
+	if bytes < 0 {
+		bytes = 0
+	}
+	base = filepath.Clean(base)
+	cache.retainedOrphanBytes[base] += bytes
+	inventory := cache.inventoryByBase[base]
+	inventory.orphanDirectories = max(inventory.orphanDirectories, 1)
+	inventory.orphanFiles++
+	inventory.orphanBytes += bytes
+	cache.inventoryByBase[base] = inventory
+	cache.stats.CleanupErrors++
+	cache.recomputeUsageCacheInventoryStatsLocked()
 }
 
 // Snapshot returns current cache usage and cumulative counters.
@@ -927,23 +1165,34 @@ func (cache *ChatGPTWebUsageCache) Close() {
 	if cache == nil {
 		return
 	}
-	cache.mu.Lock()
-	cache.closed = true
-	cache.mu.Unlock()
-	cache.createWG.Wait()
-	cache.mu.Lock()
-	handles := make([]*ChatGPTWebUsageProjection, 0, len(cache.handles))
-	for handle := range cache.handles {
-		handles = append(handles, handle)
-	}
-	defaultDir := cache.defaultDir
-	cache.mu.Unlock()
-	for _, handle := range handles {
-		handle.Discard()
-	}
-	if defaultDir != "" {
-		_ = os.RemoveAll(filepath.Clean(defaultDir))
-	}
+	cache.closeOnce.Do(func() {
+		cache.mu.Lock()
+		cache.closed = true
+		cache.mu.Unlock()
+		cache.ownershipWG.Wait()
+		cache.createWG.Wait()
+		cache.retireWG.Wait()
+		cache.mu.Lock()
+		handles := make([]*ChatGPTWebUsageProjection, 0, len(cache.handles))
+		for handle := range cache.handles {
+			handles = append(handles, handle)
+		}
+		ownedDirectories := make([]*chatGPTWebUsageCacheOwnedDirectory, 0, len(cache.ownedDirectories))
+		for _, owned := range cache.ownedDirectories {
+			ownedDirectories = append(ownedDirectories, owned)
+		}
+		cache.ownedDirectories = make(map[string]*chatGPTWebUsageCacheOwnedDirectory)
+		cache.activeOwnedBase = ""
+		cache.mu.Unlock()
+		for _, handle := range handles {
+			handle.Discard()
+		}
+		for _, owned := range ownedDirectories {
+			if errRemove := cache.removeOwnedUsageCacheDirectory(owned); errRemove != nil {
+				cache.recordUsageCacheCleanupError()
+			}
+		}
+	})
 }
 
 func normalizeChatGPTWebOutputQuality(value string) string {

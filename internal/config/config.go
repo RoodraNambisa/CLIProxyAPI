@@ -50,6 +50,7 @@ const (
 	DefaultChatGPTWebUsageCacheMaxDiskSizeMB  = 1024
 	DefaultChatGPTWebUsageCacheMinAvailableMB = 1024
 	DefaultChatGPTWebUsageCacheMaxUsedPercent = 95
+	MaxChatGPTWebUsageCacheOrphanRetention    = 10080
 	MaxChatGPTWebUsageCacheMegabytes          = (1<<63 - 1) >> 20
 	DefaultChatGPTWebAutoOutputQuality        = "medium"
 	DefaultChatGPTWebImageUpstreamModel       = "gpt-5-5"
@@ -533,6 +534,7 @@ type ChatGPTWebUsageCacheConfig struct {
 	ResourceGuardEnabled     *bool  `yaml:"resource-guard-enabled,omitempty" json:"resource-guard-enabled,omitempty"`
 	MinAvailableDiskMB       *int64 `yaml:"min-available-disk-mb,omitempty" json:"min-available-disk-mb,omitempty"`
 	MaxFilesystemUsedPercent *int   `yaml:"max-filesystem-used-percent,omitempty" json:"max-filesystem-used-percent,omitempty"`
+	OrphanRetentionMinutes   *int   `yaml:"orphan-retention-minutes,omitempty" json:"orphan-retention-minutes,omitempty"`
 	Path                     string `yaml:"path,omitempty" json:"path,omitempty"`
 }
 
@@ -544,6 +546,7 @@ type ResolvedChatGPTWebUsageCacheConfig struct {
 	ResourceGuardEnabled     bool   `json:"resource-guard-enabled"`
 	MinAvailableDiskMB       int64  `json:"min-available-disk-mb"`
 	MaxFilesystemUsedPercent int    `json:"max-filesystem-used-percent"`
+	OrphanRetentionMinutes   int    `json:"orphan-retention-minutes"`
 	Path                     string `json:"path"`
 }
 
@@ -575,6 +578,9 @@ func (cfg ChatGPTWebUsageCacheConfig) Resolved() ResolvedChatGPTWebUsageCacheCon
 	if cfg.MaxFilesystemUsedPercent != nil {
 		resolved.MaxFilesystemUsedPercent = *cfg.MaxFilesystemUsedPercent
 	}
+	if cfg.OrphanRetentionMinutes != nil {
+		resolved.OrphanRetentionMinutes = *cfg.OrphanRetentionMinutes
+	}
 	return resolved
 }
 
@@ -600,6 +606,9 @@ func (cfg ChatGPTWebUsageCacheConfig) Validate() error {
 	}
 	if resolved.MaxFilesystemUsedPercent < 1 || resolved.MaxFilesystemUsedPercent > 100 {
 		return fmt.Errorf("chatgpt-web.usage-cache.max-filesystem-used-percent must be between 1 and 100")
+	}
+	if resolved.OrphanRetentionMinutes < 0 || resolved.OrphanRetentionMinutes > MaxChatGPTWebUsageCacheOrphanRetention {
+		return fmt.Errorf("chatgpt-web.usage-cache.orphan-retention-minutes must be between 0 and %d", MaxChatGPTWebUsageCacheOrphanRetention)
 	}
 	return nil
 }

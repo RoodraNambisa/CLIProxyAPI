@@ -1372,7 +1372,7 @@ func TestServiceReconcileStaleChatGPTWebCatalogRemovesPostDeleteRegistration(t *
 	}
 }
 
-func TestServiceReconcileStaleChatGPTWebCatalogFallsBackInlineWhenQueueFull(t *testing.T) {
+func TestServiceReconcileStaleChatGPTWebCatalogQueuesOverflowWhenQueueFull(t *testing.T) {
 	service, auth, executor := newChatGPTWebCatalogTestService(t)
 	executor.set([]chatgptwebauth.CatalogModel{{Slug: "remote-after-stale"}}, nil)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -1385,18 +1385,29 @@ func TestServiceReconcileStaleChatGPTWebCatalogFallsBackInlineWhenQueueFull(t *t
 	unlockTransition := service.lockAuthModelTransition(auth.ID)
 	expected, action, syncInline := service.reconcileStaleChatGPTWebCatalogLocked(ctx, auth.ID, auth)
 	unlockTransition()
-	if !syncInline {
-		t.Fatal("full model sync queue did not request inline fallback")
+	if syncInline {
+		t.Fatal("full model sync queue requested inline fallback")
 	}
 	service.applyChatGPTWebRegistryState(ctx, expected, action)
 	service.runChatGPTWebCatalogSyncInline(ctx, expected, syncInline)
 
 	models := registry.GetGlobalRegistry().GetModelsForClient(auth.ID)
-	if !containsRegisteredModel(models, "remote-after-stale") {
-		t.Fatalf("models after inline fallback = %v", registeredModelIDs(models))
+	if containsRegisteredModel(models, "remote-after-stale") {
+		t.Fatalf("models unexpectedly synchronized inline = %v", registeredModelIDs(models))
 	}
 	if queuedID := <-service.modelSyncQueue; queuedID != "occupied" {
 		t.Fatalf("queued auth ID = %q, want occupied", queuedID)
+	}
+	service.modelSyncMu.Lock()
+	service.promoteModelSyncOverflowLocked()
+	service.modelSyncMu.Unlock()
+	if queuedID := <-service.modelSyncQueue; queuedID != auth.ID {
+		t.Fatalf("promoted auth ID = %q, want %q", queuedID, auth.ID)
+	}
+	service.syncAuthModelsInline(ctx, auth.ID)
+	models = registry.GetGlobalRegistry().GetModelsForClient(auth.ID)
+	if !containsRegisteredModel(models, "remote-after-stale") {
+		t.Fatalf("models after overflow sync = %v", registeredModelIDs(models))
 	}
 }
 

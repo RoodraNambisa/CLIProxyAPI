@@ -43,7 +43,6 @@ func withoutChatGPTWebCredentialUpdateMarkers(ctx context.Context) context.Conte
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	ctx = context.WithValue(ctx, chatGPTWebDependencyMutationContextKey{}, (*chatGPTWebDependencyMutationToken)(nil))
 	ctx = context.WithValue(ctx, chatGPTWebCredentialReplacementContextKey{}, false)
 	return context.WithValue(ctx, chatGPTWebCredentialRefreshContextKey{}, false)
 }

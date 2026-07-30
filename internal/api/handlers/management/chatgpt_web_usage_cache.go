@@ -31,6 +31,7 @@ type chatGPTWebUsageCacheSettingsRequest struct {
 	ResourceGuardEnabled     json.RawMessage `json:"resource-guard-enabled"`
 	MinAvailableDiskMB       json.RawMessage `json:"min-available-disk-mb"`
 	MaxFilesystemUsedPercent json.RawMessage `json:"max-filesystem-used-percent"`
+	OrphanRetentionMinutes   json.RawMessage `json:"orphan-retention-minutes"`
 	Path                     json.RawMessage `json:"path"`
 }
 
@@ -117,8 +118,10 @@ func (h *Handler) updateChatGPTWebUsageCache(c *gin.Context, replace bool) {
 	previous := h.cfg.ChatGPTWeb
 	candidate := previous
 	if replace {
+		orphanRetentionMinutes := candidate.UsageCache.OrphanRetentionMinutes
 		candidate.EstimateTokenUsage = nil
 		candidate.UsageCache = config.ChatGPTWebUsageCacheConfig{}
+		candidate.UsageCache.OrphanRetentionMinutes = orphanRetentionMinutes
 		candidate.ImageUsage = config.ChatGPTWebImageUsageConfig{}
 	}
 	if errApply := request.apply(&candidate, replace); errApply != nil {
@@ -285,6 +288,16 @@ func (request chatGPTWebUsageCacheSettingsRequest) apply(candidate *config.ChatG
 			return fmt.Errorf("invalid usage-cache.max-filesystem-used-percent")
 		}
 		candidate.MaxFilesystemUsedPercent = &value
+	}
+	if len(request.OrphanRetentionMinutes) > 0 {
+		if bytes.Equal(bytes.TrimSpace(request.OrphanRetentionMinutes), []byte("null")) {
+			return fmt.Errorf("invalid usage-cache.orphan-retention-minutes")
+		}
+		var value int
+		if errValue := json.Unmarshal(request.OrphanRetentionMinutes, &value); errValue != nil {
+			return fmt.Errorf("invalid usage-cache.orphan-retention-minutes")
+		}
+		candidate.OrphanRetentionMinutes = &value
 	}
 	if len(request.Path) > 0 {
 		if bytes.Equal(bytes.TrimSpace(request.Path), []byte("null")) {

@@ -219,6 +219,13 @@ func (e *ChatGPTWebExecutor) UpdateConfig(cfg *config.Config) {
 		return
 	}
 	e.cfg.Store(snapshot)
+	if e.usageCache != nil {
+		usageCache := snapshot.ChatGPTWeb.UsageCache.Resolved()
+		retention := time.Duration(usageCache.OrphanRetentionMinutes) * time.Minute
+		if errPrepare := e.usageCache.Prepare(usageCache.Path, retention); errPrepare != nil {
+			log.WithError(errPrepare).Warn("chatgpt web executor: usage cache orphan cleanup failed")
+		}
+	}
 	if e.sentinelRuntime != nil {
 		e.sentinelRuntime.UpdateConfig(chatGPTWebSentinelRuntimeConfig(snapshot))
 	}

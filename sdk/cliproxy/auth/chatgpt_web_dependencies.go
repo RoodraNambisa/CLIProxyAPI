@@ -60,7 +60,38 @@ type chatGPTWebDependencyMutationToken struct {
 	manager *Manager
 	parent  *chatGPTWebDependencyMutationToken
 	active  atomic.Bool
+	nested  chan struct{}
 	once    sync.Once
+	release func()
+}
+
+type contextMutex struct {
+	once      sync.Once
+	semaphore chan struct{}
+}
+
+func (lock *contextMutex) lock(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	lock.once.Do(func() {
+		lock.semaphore = make(chan struct{}, 1)
+		lock.semaphore <- struct{}{}
+	})
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-lock.semaphore:
+	}
+	if errContext := ctx.Err(); errContext != nil {
+		lock.semaphore <- struct{}{}
+		return errContext
+	}
+	return nil
+}
+
+func (lock *contextMutex) unlock() {
+	lock.semaphore <- struct{}{}
 }
 
 func chatGPTWebDependencyTokenForManager(ctx context.Context, manager *Manager) *chatGPTWebDependencyMutationToken {
@@ -73,15 +104,80 @@ func chatGPTWebDependencyTokenForManager(ctx context.Context, manager *Manager) 
 	return nil
 }
 
-func (m *Manager) lockChatGPTWebDependencyMutationContext(ctx context.Context, authID string, incoming *Auth, force bool) (context.Context, func()) {
+func (token *chatGPTWebDependencyMutationToken) lockNested(ctx context.Context) (func(), bool, error) {
+	if token == nil || token.nested == nil {
+		return nil, false, nil
+	}
+	select {
+	case <-ctx.Done():
+		return nil, false, ctx.Err()
+	case <-token.nested:
+	}
+	if errContext := ctx.Err(); errContext != nil {
+		token.nested <- struct{}{}
+		return nil, false, errContext
+	}
+	if !token.active.Load() {
+		token.nested <- struct{}{}
+		return nil, false, nil
+	}
+	var once sync.Once
+	return func() {
+		once.Do(func() { token.nested <- struct{}{} })
+	}, true, nil
+}
+
+func (token *chatGPTWebDependencyMutationToken) unlock() {
+	if token == nil {
+		return
+	}
+	token.once.Do(func() {
+		if token.nested != nil {
+			<-token.nested
+		}
+		token.active.Store(false)
+		if token.release != nil {
+			token.release()
+		}
+		if token.nested != nil {
+			token.nested <- struct{}{}
+		}
+	})
+}
+
+func newChatGPTWebDependencyMutationToken(
+	manager *Manager,
+	parent *chatGPTWebDependencyMutationToken,
+	release func(),
+) *chatGPTWebDependencyMutationToken {
+	token := &chatGPTWebDependencyMutationToken{
+		manager: manager,
+		parent:  parent,
+		nested:  make(chan struct{}, 1),
+		release: release,
+	}
+	token.nested <- struct{}{}
+	token.active.Store(true)
+	return token
+}
+
+func (m *Manager) lockChatGPTWebDependencyMutationContext(ctx context.Context, authID string, incoming *Auth, force bool) (context.Context, func(), error) {
 	if m == nil {
-		return ctx, func() {}
+		return ctx, func() {}, nil
 	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if chatGPTWebDependencyTokenForManager(ctx, m) != nil {
-		return ctx, func() {}
+	if token := chatGPTWebDependencyTokenForManager(ctx, m); token != nil {
+		unlockNested, reused, errNested := token.lockNested(ctx)
+		if errNested != nil {
+			return ctx, nil, errNested
+		}
+		if reused {
+			parent, _ := ctx.Value(chatGPTWebDependencyMutationContextKey{}).(*chatGPTWebDependencyMutationToken)
+			child := newChatGPTWebDependencyMutationToken(m, parent, unlockNested)
+			return context.WithValue(ctx, chatGPTWebDependencyMutationContextKey{}, child), child.unlock, nil
+		}
 	}
 	lockRequired := force || isChatGPTWebDependencyProvider(incoming)
 	if !lockRequired && strings.TrimSpace(authID) != "" {
@@ -90,19 +186,15 @@ func (m *Manager) lockChatGPTWebDependencyMutationContext(ctx context.Context, a
 		m.mu.RUnlock()
 	}
 	if !lockRequired {
-		return ctx, func() {}
+		return ctx, func() {}, nil
 	}
-	m.chatGPTWebDependencyMutation.Lock()
+	if errLock := m.chatGPTWebDependencyMutation.lock(ctx); errLock != nil {
+		return ctx, nil, errLock
+	}
 	parent, _ := ctx.Value(chatGPTWebDependencyMutationContextKey{}).(*chatGPTWebDependencyMutationToken)
-	token := &chatGPTWebDependencyMutationToken{manager: m, parent: parent}
-	token.active.Store(true)
+	token := newChatGPTWebDependencyMutationToken(m, parent, m.chatGPTWebDependencyMutation.unlock)
 	lockedCtx := context.WithValue(ctx, chatGPTWebDependencyMutationContextKey{}, token)
-	return lockedCtx, func() {
-		token.once.Do(func() {
-			token.active.Store(false)
-			m.chatGPTWebDependencyMutation.Unlock()
-		})
-	}
+	return lockedCtx, token.unlock, nil
 }
 
 // WithChatGPTWebDependencyMutation serializes a dependency graph decision with
@@ -114,7 +206,10 @@ func (m *Manager) WithChatGPTWebDependencyMutation(ctx context.Context, operatio
 	if m == nil {
 		return operation(ctx)
 	}
-	lockedCtx, unlock := m.lockChatGPTWebDependencyMutationContext(ctx, "", nil, true)
+	lockedCtx, unlock, errLock := m.lockChatGPTWebDependencyMutationContext(ctx, "", nil, true)
+	if errLock != nil {
+		return errLock
+	}
 	defer unlock()
 	return operation(lockedCtx)
 }
@@ -566,7 +661,10 @@ func (m *Manager) DeleteIfCurrentSourceHash(ctx context.Context, expected *Auth)
 	if !ok || store == nil {
 		return false, errors.New("auth store does not support source-conditional deletion")
 	}
-	lockedDependencyCtx, unlockDependency := m.lockChatGPTWebDependencyMutationContext(ctx, expected.ID, expected, false)
+	lockedDependencyCtx, unlockDependency, errDependency := m.lockChatGPTWebDependencyMutationContext(ctx, expected.ID, expected, false)
+	if errDependency != nil {
+		return false, errDependency
+	}
 	ctx = lockedDependencyCtx
 	unlockPersist, errLock := m.lockAuthIDMutationContext(ctx, expected.ID)
 	if errLock != nil {
@@ -766,7 +864,10 @@ func (m *Manager) ReleaseChatGPTWebDependentReservation(ctx context.Context, sou
 }
 
 func (m *Manager) deleteRetainedCodexSourceIfOrphan(ctx context.Context, sourceID, sourceUID string) (bool, error) {
-	lockedCtx, unlockDependency := m.lockChatGPTWebDependencyMutationContext(ctx, sourceID, &Auth{Provider: "codex"}, false)
+	lockedCtx, unlockDependency, errDependency := m.lockChatGPTWebDependencyMutationContext(ctx, sourceID, &Auth{Provider: "codex"}, false)
+	if errDependency != nil {
+		return false, errDependency
+	}
 	ctx = lockedCtx
 	unlockPersist, errLock := m.lockAuthIDMutationContext(ctx, sourceID)
 	if errLock != nil {

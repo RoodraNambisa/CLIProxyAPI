@@ -85,6 +85,9 @@ chatgpt-web:
     resource-guard-enabled: true
     min-available-disk-mb: 1024
     max-filesystem-used-percent: 95
+    # Remove lock-confirmed orphaned v2 instance directories during startup.
+    # 0 deletes immediately; cleanup never scans periodically.
+    orphan-retention-minutes: 0
     # Empty uses an instance-private directory under the system temporary path.
     path: ""
   image-usage:
