@@ -3967,6 +3967,9 @@ func TestFinishChatGPTWebImageDownloadsSedimentWithoutTaskTerminal(t *testing.T)
 	if !imageResultState.Succeeded() {
 		t.Fatal("successful image output did not record provider-confirmed success")
 	}
+	if got := imageResultState.SucceededCount(); got != 1 {
+		t.Fatalf("successful image count = %d, want 1", got)
+	}
 	if got := conversationPolls.Load(); got != 1 {
 		t.Fatalf("conversation polls = %d, want 1 confirming snapshot after streamed sediment", got)
 	}

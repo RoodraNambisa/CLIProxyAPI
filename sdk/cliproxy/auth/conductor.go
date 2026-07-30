@@ -252,6 +252,8 @@ type executionResult struct {
 	Result
 	authInstanceID          string
 	additionalSuccessModels []string
+	imageSuccessCount       int64
+	imageSuccessModels      []string
 }
 
 func resultForAuth(auth *Auth, provider, model string, success bool) executionResult {
@@ -267,7 +269,9 @@ func successfulExecutionResultForAuth(auth *Auth, provider, model string, opts c
 	result := resultForAuth(auth, provider, model, true)
 	state, _ := opts.Metadata[cliproxyexecutor.ImageGenerationResultStateMetadataKey].(*cliproxyexecutor.ImageGenerationResultState)
 	if state != nil && state.Succeeded() && strings.EqualFold(strings.TrimSpace(provider), chatgptwebauth.Provider) {
-		for _, imageModel := range ChatGPTWebImageModelIDs(auth) {
+		result.imageSuccessCount = state.SucceededCount()
+		result.imageSuccessModels = ChatGPTWebImageModelIDs(auth)
+		for _, imageModel := range result.imageSuccessModels {
 			if canonicalModelKey(model) != canonicalModelKey(imageModel) {
 				result.additionalSuccessModels = append(result.additionalSuccessModels, imageModel)
 			}
@@ -6561,14 +6565,28 @@ func waitForCooldown(ctx context.Context, wait time.Duration) error {
 
 // MarkResult records an execution result and notifies hooks.
 func (m *Manager) MarkResult(ctx context.Context, result Result) {
-	m.markResult(ctx, result, "", nil)
+	m.markResult(ctx, result, "", nil, 0, nil)
 }
 
 func (m *Manager) markExecutionResult(ctx context.Context, result executionResult) {
-	m.markResult(ctx, result.Result, result.authInstanceID, result.additionalSuccessModels)
+	m.markResult(
+		ctx,
+		result.Result,
+		result.authInstanceID,
+		result.additionalSuccessModels,
+		result.imageSuccessCount,
+		result.imageSuccessModels,
+	)
 }
 
-func (m *Manager) markResult(ctx context.Context, result Result, authInstanceID string, additionalSuccessModels []string) {
+func (m *Manager) markResult(
+	ctx context.Context,
+	result Result,
+	authInstanceID string,
+	additionalSuccessModels []string,
+	imageSuccessCount int64,
+	imageSuccessModels []string,
+) {
 	if result.AuthID == "" {
 		return
 	}
@@ -6595,6 +6613,7 @@ func (m *Manager) markResult(ctx context.Context, result Result, authInstanceID 
 	clearModelQuota := false
 	setModelQuota := false
 	var additionalSuccessModelsApplied []string
+	var imageQuotaSuspendModels []string
 	var (
 		authSnapshot *Auth
 		persistAuth  *Auth
@@ -6831,6 +6850,9 @@ func (m *Manager) markResult(ctx context.Context, result Result, authInstanceID 
 				auth.ModelStates = nil
 			}
 		}
+		if !staleDynamicModelResult && result.Success && imageSuccessCount > 0 {
+			imageQuotaSuspendModels = projectChatGPTWebImageSuccess(auth, imageSuccessCount, imageSuccessModels, now)
+		}
 		if !staleDynamicModelResult {
 			persistAuth = auth
 		}
@@ -6858,6 +6880,10 @@ func (m *Manager) markResult(ctx context.Context, result Result, authInstanceID 
 		for _, additionalModel := range additionalSuccessModelsApplied {
 			registry.GetGlobalRegistry().ClearModelQuotaExceeded(result.AuthID, additionalModel)
 			registry.GetGlobalRegistry().ResumeClientModel(result.AuthID, additionalModel)
+		}
+		for _, imageModel := range imageQuotaSuspendModels {
+			registry.GetGlobalRegistry().SetModelQuotaExceeded(result.AuthID, imageModel)
+			registry.GetGlobalRegistry().SuspendClientModel(result.AuthID, imageModel, "chatgpt_web_image_quota")
 		}
 	}
 

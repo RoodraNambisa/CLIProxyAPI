@@ -82,22 +82,35 @@ func (s *ImageGenerationStreamPassthroughState) Enabled() bool {
 	return s != nil && s.enabled.Load()
 }
 
-// ImageGenerationResultState records whether an upstream provider returned a
-// completed image. Merely accepting a request with an image tool is not success.
+// ImageGenerationResultState records how many completed images an upstream
+// provider returned. Merely accepting a request with an image tool is not success.
 type ImageGenerationResultState struct {
-	succeeded atomic.Bool
+	succeededCount atomic.Int64
 }
 
 // MarkSucceeded records provider-confirmed image output.
 func (s *ImageGenerationResultState) MarkSucceeded() {
-	if s != nil {
-		s.succeeded.Store(true)
+	s.AddSucceeded(1)
+}
+
+// AddSucceeded records provider-confirmed image output.
+func (s *ImageGenerationResultState) AddSucceeded(count int) {
+	if s != nil && count > 0 {
+		s.succeededCount.Add(int64(count))
 	}
 }
 
 // Succeeded reports whether provider-confirmed image output was produced.
 func (s *ImageGenerationResultState) Succeeded() bool {
-	return s != nil && s.succeeded.Load()
+	return s.SucceededCount() > 0
+}
+
+// SucceededCount returns the number of provider-confirmed image outputs.
+func (s *ImageGenerationResultState) SucceededCount() int64 {
+	if s == nil {
+		return 0
+	}
+	return s.succeededCount.Load()
 }
 
 // AuthInstanceRetirement reports whether a selected runtime auth instance was retired.

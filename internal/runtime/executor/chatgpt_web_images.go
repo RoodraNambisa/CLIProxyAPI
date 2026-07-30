@@ -656,7 +656,7 @@ func (e *ChatGPTWebExecutor) finishChatGPTWebImage(ctx context.Context, client *
 		return nil, err
 	}
 	if prepared.imageResultState != nil {
-		prepared.imageResultState.MarkSucceeded()
+		prepared.imageResultState.AddSucceeded(len(outputImages))
 	}
 	return completed, nil
 }

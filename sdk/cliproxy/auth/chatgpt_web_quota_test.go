@@ -338,6 +338,7 @@ func (executor *chatGPTWebQuotaRefreshTriggerExecutor) AccountInfoAuthState(
 type chatGPTWebImageSuccessProjectionExecutor struct {
 	manager                  *Manager
 	markImageSuccess         bool
+	imageSuccessCount        int
 	confirmExhaustedInFlight bool
 }
 
@@ -377,7 +378,11 @@ func (executor *chatGPTWebImageSuccessProjectionExecutor) recordImageResult(
 	if executor.markImageSuccess {
 		state, _ := opts.Metadata[cliproxyexecutor.ImageGenerationResultStateMetadataKey].(*cliproxyexecutor.ImageGenerationResultState)
 		if state != nil {
-			state.MarkSucceeded()
+			if executor.imageSuccessCount > 0 {
+				state.AddSucceeded(executor.imageSuccessCount)
+			} else {
+				state.MarkSucceeded()
+			}
 		}
 	}
 	return nil
@@ -2862,6 +2867,211 @@ func TestManagerProjectsSuccessfulImageToolToImageModel(t *testing.T) {
 				t.Fatalf("hook results = %+v, want one text-model success", results)
 			}
 		})
+	}
+}
+
+func TestManagerProjectsSuccessfulImageCountIntoKnownQuota(t *testing.T) {
+	hook := &chatGPTWebImageSuccessResultHook{}
+	manager := NewManager(nil, &FillFirstSelector{}, hook)
+	manager.SetRetryConfig(0, 0, 0)
+	executor := &chatGPTWebImageSuccessProjectionExecutor{
+		manager:           manager,
+		markImageSuccess:  true,
+		imageSuccessCount: 2,
+	}
+	manager.RegisterExecutor(executor)
+	authID := "image-count-" + uuid.NewString()
+	textModel := "image-count-text-" + uuid.NewString()
+	customImageModel := "image-count-custom-" + uuid.NewString()
+	quotaUpdatedAt := time.Now().Add(-time.Minute).UTC().Format(time.RFC3339Nano)
+	quotaResetAt := time.Now().Add(time.Hour).UTC().Format(time.RFC3339Nano)
+	registerQuotaTestAuthForModels(t, manager, &Auth{
+		ID:       authID,
+		Provider: chatgptwebauth.Provider,
+		Status:   StatusActive,
+		Metadata: map[string]any{
+			"lifecycle_state":       LifecycleStateActive,
+			"quota_state":           string(chatgptwebauth.QuotaStateAvailable),
+			"image_quota_remaining": 5,
+			"image_quota_reset_at":  quotaResetAt,
+			"quota_updated_at":      quotaUpdatedAt,
+			"quota_stale":           false,
+		},
+	}, textModel, chatgptwebauth.ImageModel)
+	registry.GetGlobalRegistry().RegisterClient(authID, chatgptwebauth.Provider, []*registry.ModelInfo{
+		{ID: textModel},
+		{ID: chatgptwebauth.ImageModel, UpstreamID: chatgptwebauth.ImageModel, Type: registry.OpenAIImageModelType},
+		{ID: customImageModel, UpstreamID: chatgptwebauth.ImageModel, Type: registry.OpenAIImageModelType},
+	})
+	manager.RefreshSchedulerEntry(authID)
+
+	if _, errExecute := manager.Execute(
+		context.Background(),
+		[]string{chatgptwebauth.Provider},
+		cliproxyexecutor.Request{Model: textModel, Payload: imageToolFallbackPayload(textModel)},
+		cliproxyexecutor.Options{},
+	); errExecute != nil {
+		t.Fatalf("Execute() error = %v", errExecute)
+	}
+
+	current, ok := manager.GetByID(authID)
+	if !ok || current == nil {
+		t.Fatal("auth disappeared")
+	}
+	if got := metadataInt(current.Metadata["image_quota_remaining"]); got == nil || *got != 3 {
+		t.Fatalf("image_quota_remaining = %#v, want 3", got)
+	}
+	if got := metadataString(current.Metadata["quota_state"]); got != string(chatgptwebauth.QuotaStateAvailable) {
+		t.Fatalf("quota_state = %q, want available", got)
+	}
+	if got := metadataString(current.Metadata["quota_updated_at"]); got != quotaUpdatedAt {
+		t.Fatalf("quota_updated_at = %q, want unchanged %q", got, quotaUpdatedAt)
+	}
+	if got := metadataString(current.Metadata["image_quota_reset_at"]); got != quotaResetAt {
+		t.Fatalf("image_quota_reset_at = %q, want unchanged %q", got, quotaResetAt)
+	}
+	if results := hook.Results(); len(results) != 1 {
+		t.Fatalf("hook results = %d, want one success result", len(results))
+	}
+}
+
+func TestManagerSuccessfulImageCountExhaustsOnlyImageCapability(t *testing.T) {
+	manager := NewManager(nil, &FillFirstSelector{}, nil)
+	manager.SetRetryConfig(0, 0, 0)
+	executor := &chatGPTWebImageSuccessProjectionExecutor{
+		manager:           manager,
+		markImageSuccess:  true,
+		imageSuccessCount: 2,
+	}
+	manager.RegisterExecutor(executor)
+	authID := "image-count-exhausted-" + uuid.NewString()
+	textModel := "image-count-text-" + uuid.NewString()
+	customImageModel := "image-count-custom-" + uuid.NewString()
+	registerQuotaTestAuthForModels(t, manager, &Auth{
+		ID:       authID,
+		Provider: chatgptwebauth.Provider,
+		Status:   StatusActive,
+		Metadata: map[string]any{
+			"lifecycle_state":       LifecycleStateActive,
+			"quota_state":           string(chatgptwebauth.QuotaStateAvailable),
+			"image_quota_remaining": 1,
+			"image_quota_reset_at":  time.Now().Add(time.Hour).UTC().Format(time.RFC3339Nano),
+			"quota_stale":           false,
+		},
+	}, textModel, chatgptwebauth.ImageModel)
+	registry.GetGlobalRegistry().RegisterClient(authID, chatgptwebauth.Provider, []*registry.ModelInfo{
+		{ID: textModel},
+		{ID: chatgptwebauth.ImageModel, UpstreamID: chatgptwebauth.ImageModel, Type: registry.OpenAIImageModelType},
+		{ID: customImageModel, UpstreamID: chatgptwebauth.ImageModel, Type: registry.OpenAIImageModelType},
+	})
+	manager.RefreshSchedulerEntry(authID)
+
+	if _, errExecute := manager.Execute(
+		context.Background(),
+		[]string{chatgptwebauth.Provider},
+		cliproxyexecutor.Request{Model: textModel, Payload: imageToolFallbackPayload(textModel)},
+		cliproxyexecutor.Options{},
+	); errExecute != nil {
+		t.Fatalf("Execute() error = %v", errExecute)
+	}
+
+	current, ok := manager.GetByID(authID)
+	if !ok || current == nil {
+		t.Fatal("auth disappeared")
+	}
+	if got := metadataInt(current.Metadata["image_quota_remaining"]); got == nil || *got != 0 {
+		t.Fatalf("image_quota_remaining = %#v, want 0", got)
+	}
+	if got := metadataString(current.Metadata["quota_state"]); got != string(chatgptwebauth.QuotaStateExhausted) {
+		t.Fatalf("quota_state = %q, want exhausted", got)
+	}
+	for _, imageModel := range []string{chatgptwebauth.ImageModel, customImageModel} {
+		state := current.ModelStates[imageModel]
+		if state == nil || !state.Quota.Exceeded || state.Quota.Reason != "chatgpt_web_image_quota" {
+			t.Fatalf("image model %q state = %+v", imageModel, state)
+		}
+		if blocked, _, _ := isAuthBlockedForModel(current, imageModel, time.Now()); !blocked {
+			t.Fatalf("image model %q remained schedulable", imageModel)
+		}
+	}
+	if blocked, _, _ := isAuthBlockedForModel(current, textModel, time.Now()); blocked {
+		t.Fatal("image exhaustion blocked the text model")
+	}
+	if count := registry.GetGlobalRegistry().GetModelCount(customImageModel); count != 0 {
+		t.Fatalf("custom image model available clients = %d, want 0", count)
+	}
+	if count := registry.GetGlobalRegistry().GetModelCount(textModel); count != 1 {
+		t.Fatalf("text model available clients = %d, want 1", count)
+	}
+}
+
+func TestManagerSuccessfulImageCountDoesNotInventUnknownQuota(t *testing.T) {
+	manager := NewManager(nil, &FillFirstSelector{}, nil)
+	manager.SetRetryConfig(0, 0, 0)
+	manager.RegisterExecutor(&chatGPTWebImageSuccessProjectionExecutor{
+		manager:           manager,
+		markImageSuccess:  true,
+		imageSuccessCount: 2,
+	})
+	authID := "image-count-unknown-" + uuid.NewString()
+	textModel := "image-count-unknown-text-" + uuid.NewString()
+	registerQuotaTestAuthForModels(t, manager, &Auth{
+		ID:       authID,
+		Provider: chatgptwebauth.Provider,
+		Status:   StatusActive,
+		Metadata: map[string]any{
+			"lifecycle_state": LifecycleStateActive,
+			"quota_state":     string(chatgptwebauth.QuotaStateUnknown),
+		},
+	}, textModel, chatgptwebauth.ImageModel)
+
+	if _, errExecute := manager.Execute(
+		context.Background(),
+		[]string{chatgptwebauth.Provider},
+		cliproxyexecutor.Request{Model: textModel, Payload: imageToolFallbackPayload(textModel)},
+		cliproxyexecutor.Options{},
+	); errExecute != nil {
+		t.Fatalf("Execute() error = %v", errExecute)
+	}
+	current, _ := manager.GetByID(authID)
+	if _, exists := current.Metadata["image_quota_remaining"]; exists {
+		t.Fatalf("unknown quota was invented: %#v", current.Metadata)
+	}
+	if got := metadataString(current.Metadata["quota_state"]); got != string(chatgptwebauth.QuotaStateUnknown) {
+		t.Fatalf("quota_state = %q, want unknown", got)
+	}
+}
+
+func TestManagerDiscardsSuccessfulImageCountFromReplacedInstance(t *testing.T) {
+	manager := NewManager(nil, &FillFirstSelector{}, nil)
+	authID := "image-count-stale-" + uuid.NewString()
+	if _, errRegister := manager.Register(context.Background(), &Auth{
+		ID:       authID,
+		Provider: chatgptwebauth.Provider,
+		Status:   StatusActive,
+		Metadata: map[string]any{
+			"lifecycle_state":       LifecycleStateActive,
+			"access_token":          "old-token",
+			"quota_state":           string(chatgptwebauth.QuotaStateAvailable),
+			"image_quota_remaining": 5,
+		},
+	}); errRegister != nil {
+		t.Fatalf("Register() error = %v", errRegister)
+	}
+	original, _ := manager.GetByID(authID)
+	staleResult := resultForAuth(original, chatgptwebauth.Provider, chatgptwebauth.ImageModel, true)
+	staleResult.imageSuccessCount = 2
+
+	replacement := original.Clone()
+	replacement.Metadata["access_token"] = "new-token"
+	if _, errUpdate := manager.Update(context.Background(), replacement); errUpdate != nil {
+		t.Fatalf("Update() error = %v", errUpdate)
+	}
+	manager.markExecutionResult(context.Background(), staleResult)
+
+	current, _ := manager.GetByID(authID)
+	if got := metadataInt(current.Metadata["image_quota_remaining"]); got == nil || *got != 5 {
+		t.Fatalf("replacement image_quota_remaining = %#v, want 5", got)
 	}
 }
 

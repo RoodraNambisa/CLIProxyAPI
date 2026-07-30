@@ -209,6 +209,52 @@ func ChatGPTWebImageModelIDs(auth *Auth) []string {
 	return models
 }
 
+func projectChatGPTWebImageSuccess(auth *Auth, count int64, imageModels []string, now time.Time) []string {
+	if auth == nil ||
+		count <= 0 ||
+		!strings.EqualFold(strings.TrimSpace(auth.Provider), chatgptwebauth.Provider) ||
+		auth.Metadata == nil {
+		return nil
+	}
+	remaining := metadataInt(auth.Metadata["image_quota_remaining"])
+	if remaining == nil {
+		return nil
+	}
+	nextRemaining := int64(*remaining)
+	if nextRemaining < count {
+		nextRemaining = 0
+	} else {
+		nextRemaining -= count
+	}
+	auth.Metadata["image_quota_remaining"] = int(nextRemaining)
+	if nextRemaining > 0 {
+		auth.Metadata["quota_state"] = string(chatgptwebauth.QuotaStateAvailable)
+		return nil
+	}
+
+	auth.Metadata["quota_state"] = string(chatgptwebauth.QuotaStateExhausted)
+	resetAt := metadataTime(auth.Metadata["image_quota_reset_at"])
+	if !resetAt.After(now) {
+		resetAt = time.Time{}
+	}
+	for _, model := range imageModels {
+		state := ensureModelState(auth, model)
+		state.Status = StatusActive
+		state.StatusMessage = ""
+		state.Unavailable = true
+		state.LastError = nil
+		state.UpdatedAt = now
+		state.NextRetryAfter = resetAt
+		state.Quota = QuotaState{
+			Exceeded:      true,
+			Reason:        "chatgpt_web_image_quota",
+			NextRecoverAt: resetAt,
+		}
+	}
+	updateAggregatedAvailability(auth, now)
+	return imageModels
+}
+
 func chatGPTWebImageModelStateEntries(auth *Auth) []chatGPTWebImageModelStateEntry {
 	if auth == nil || len(auth.ModelStates) == 0 {
 		return nil
