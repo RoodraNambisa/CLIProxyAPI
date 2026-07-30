@@ -452,8 +452,11 @@ func (h *Handler) executeChatGPTWebConversion(ctx context.Context, input chatGPT
 	if !allowed {
 		return canceledChatGPTWebConversionResult(input)
 	}
-	h.chatGPTWebDependencyMu.Lock()
-	defer h.chatGPTWebDependencyMu.Unlock()
+	unlockDependency, errDependencyLock := h.chatGPTWebDependencyMu.lock(commitCtx)
+	if errDependencyLock != nil {
+		return canceledChatGPTWebConversionResult(input)
+	}
+	defer unlockDependency()
 	var installed *coreauth.Auth
 	errMutation := manager.WithChatGPTWebDependencyMutation(commitCtx, func(lockedCtx context.Context) error {
 		currentSource, sourceExists := manager.GetByID(source.ID)

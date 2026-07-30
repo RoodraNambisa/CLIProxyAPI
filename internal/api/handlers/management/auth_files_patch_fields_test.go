@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	xaiauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/xai"
@@ -17,6 +18,57 @@ import (
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v6/sdk/auth"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 )
+
+func TestPatchAuthFileFieldsDependencyLockWaitHonorsCancellation(t *testing.T) {
+	manager := coreauth.NewManager(nil, nil, nil)
+	if _, errRegister := manager.Register(coreauth.WithSkipPersist(t.Context()), &coreauth.Auth{
+		ID:       "dependency-lock-cancel.json",
+		FileName: "dependency-lock-cancel.json",
+		Provider: "codex",
+		Status:   coreauth.StatusActive,
+		Metadata: map[string]any{"type": "codex"},
+	}); errRegister != nil {
+		t.Fatal(errRegister)
+	}
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, manager)
+	unlockDependency, errLock := h.chatGPTWebDependencyMu.lock(t.Context())
+	if errLock != nil {
+		t.Fatal(errLock)
+	}
+	defer unlockDependency()
+
+	requestCtx, cancelRequest := context.WithCancel(t.Context())
+	defer cancelRequest()
+	done := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		recorder := httptest.NewRecorder()
+		ginContext, _ := gin.CreateTestContext(recorder)
+		request := httptest.NewRequest(
+			http.MethodPatch,
+			"/v0/management/auth-files/fields",
+			strings.NewReader(`{"name":"dependency-lock-cancel.json","priority":1}`),
+		).WithContext(requestCtx)
+		request.Header.Set("Content-Type", "application/json")
+		ginContext.Request = request
+		h.PatchAuthFileFields(ginContext)
+		done <- recorder
+	}()
+
+	select {
+	case <-done:
+		t.Fatal("field update returned while the dependency lock was held")
+	case <-time.After(20 * time.Millisecond):
+	}
+	cancelRequest()
+	select {
+	case recorder := <-done:
+		if recorder.Code != http.StatusRequestTimeout {
+			t.Fatalf("status = %d, want %d; body=%s", recorder.Code, http.StatusRequestTimeout, recorder.Body.String())
+		}
+	case <-time.After(time.Second):
+		t.Fatal("field update did not leave the dependency lock wait after cancellation")
+	}
+}
 
 func TestPatchAuthFileFields_MergeHeadersAndDeleteEmptyValues(t *testing.T) {
 	t.Setenv("MANAGEMENT_PASSWORD", "")

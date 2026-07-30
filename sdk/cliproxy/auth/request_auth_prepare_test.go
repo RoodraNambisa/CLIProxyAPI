@@ -403,6 +403,13 @@ func TestManagerChatGPTWebPreparationInstallsRotatedTokenAfterCallerCancellation
 		t.Fatal("canceled ChatGPT Web preparation did not return")
 	}
 
+	closeCtx, cancelClose := context.WithTimeout(t.Context(), 20*time.Millisecond)
+	if errClose := manager.CloseExecutorsContext(closeCtx); !errors.Is(errClose, context.DeadlineExceeded) {
+		cancelClose()
+		t.Fatalf("CloseExecutorsContext error = %v, want deadline exceeded while preparation is active", errClose)
+	}
+	cancelClose()
+
 	close(prepareGate)
 	deadline := time.Now().Add(5 * time.Second)
 	for {
@@ -429,6 +436,9 @@ func TestManagerChatGPTWebPreparationInstallsRotatedTokenAfterCallerCancellation
 	}
 	if got := baseExecutor.prepareCalls.Load(); got != 1 {
 		t.Fatalf("PrepareRequestAuth() calls = %d, want 1", got)
+	}
+	if errClose := manager.CloseExecutorsContext(t.Context()); errClose != nil {
+		t.Fatalf("CloseExecutorsContext error after preparation: %v", errClose)
 	}
 }
 

@@ -56,6 +56,8 @@ func CanonicalSourceHashFromBytes(data []byte) (string, error) {
 	if err := json.Unmarshal(data, &metadata); err != nil {
 		return "", err
 	}
+	disabled, _ := metadata["disabled"].(bool)
+	metadata["disabled"] = disabled
 	canonical, err := json.Marshal(metadata)
 	if err != nil {
 		return "", err

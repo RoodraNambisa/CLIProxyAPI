@@ -88,7 +88,7 @@ func TestRemoveManagedAuthFileSnapshotUsesStableParent(t *testing.T) {
 		t.Skipf("symlink is unavailable: %v", errLink)
 	}
 
-	if errRemove := removeManagedAuthFileSnapshotAtParent(parentRoot, leaf, original); errRemove != nil {
+	if errRemove := removeManagedAuthFileSnapshotAtParent(t.Context(), parentRoot, leaf, original); errRemove != nil {
 		t.Fatalf("remove through stable parent: %v", errRemove)
 	}
 	if _, errStat := os.Stat(filepath.Join(movedDir, "auth.json")); !os.IsNotExist(errStat) {

@@ -29,7 +29,7 @@ type chatGPTWebModelCatalogCacheEntry struct {
 }
 
 type chatGPTWebModelFetchLockEntry struct {
-	mu         sync.Mutex
+	semaphore  chan struct{}
 	references int
 }
 
@@ -303,7 +303,10 @@ func (s *Service) reconcileChatGPTWebAuthState(ctx context.Context, auth *coreau
 	if s == nil || auth == nil {
 		return
 	}
-	unlockTransition := s.lockAuthModelTransition(auth.ID)
+	unlockTransition, errTransition := s.lockAuthModelTransitionContext(ctx, auth.ID)
+	if errTransition != nil {
+		return
+	}
 	if s.coreManager != nil {
 		current, ok := s.coreManager.CurrentAuthInstallation(auth)
 		if !ok {
@@ -397,14 +400,20 @@ func (s *Service) syncChatGPTWebModels(ctx context.Context, source *coreauth.Aut
 	if s == nil || source == nil {
 		return
 	}
-	rawUnlockFetch := s.lockChatGPTWebModelFetch(source.ID)
+	rawUnlockFetch, errFetchLock := s.lockChatGPTWebModelFetchContext(ctx, source.ID)
+	if errFetchLock != nil {
+		return
+	}
 	var unlockFetchOnce sync.Once
 	unlockFetch := func() {
 		unlockFetchOnce.Do(rawUnlockFetch)
 	}
 	defer unlockFetch()
 
-	unlockTransition := s.lockAuthModelTransition(source.ID)
+	unlockTransition, errTransition := s.lockAuthModelTransitionContext(ctx, source.ID)
+	if errTransition != nil {
+		return
+	}
 	current, currentSource := s.currentAuthForChatGPTWebCatalog(source)
 	if !currentSource {
 		action := chatGPTWebRegistryStateNone
@@ -438,7 +447,10 @@ func (s *Service) syncChatGPTWebModels(ctx context.Context, source *coreauth.Aut
 		return
 	}
 
-	unlockTransition = s.lockAuthModelTransition(current.ID)
+	unlockTransition, errTransition = s.lockAuthModelTransitionContext(ctx, current.ID)
+	if errTransition != nil {
+		return
+	}
 	latest, stillCurrent := s.currentAuthForChatGPTWebCatalog(current)
 	if !stillCurrent {
 		expected, staleAction, syncInline := s.reconcileStaleChatGPTWebCatalogLocked(ctx, current.ID, latest)
@@ -479,7 +491,10 @@ func (s *Service) refreshChatGPTWebModelRegistration(ctx context.Context, source
 	if s == nil || source == nil {
 		return
 	}
-	unlockTransition := s.lockAuthModelTransition(source.ID)
+	unlockTransition, errTransition := s.lockAuthModelTransitionContext(ctx, source.ID)
+	if errTransition != nil {
+		return
+	}
 
 	current, stillCurrent := s.currentAuthForChatGPTWebCatalog(source)
 	if !stillCurrent {
@@ -516,11 +531,23 @@ func (s *Service) runChatGPTWebCatalogSyncInline(ctx context.Context, auth *core
 }
 
 func (s *Service) lockChatGPTWebModelFetch(authID string) func() {
+	unlock, err := s.lockChatGPTWebModelFetchContext(context.Background(), authID)
+	if err != nil || unlock == nil {
+		return func() {}
+	}
+	return unlock
+}
+
+func (s *Service) lockChatGPTWebModelFetchContext(ctx context.Context, authID string) (func(), error) {
+	if s == nil {
+		return func() {}, nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	authID = strings.TrimSpace(authID)
 	if authID == "" {
-		var lock sync.Mutex
-		lock.Lock()
-		return lock.Unlock
+		return func() {}, nil
 	}
 	s.chatGPTWebModelFetchMu.Lock()
 	if s.chatGPTWebModelFetchLocks == nil {
@@ -528,21 +555,46 @@ func (s *Service) lockChatGPTWebModelFetch(authID string) func() {
 	}
 	entry := s.chatGPTWebModelFetchLocks[authID]
 	if entry == nil {
-		entry = &chatGPTWebModelFetchLockEntry{}
+		entry = &chatGPTWebModelFetchLockEntry{semaphore: make(chan struct{}, 1)}
+		entry.semaphore <- struct{}{}
 		s.chatGPTWebModelFetchLocks[authID] = entry
+	} else if entry.semaphore == nil {
+		entry.semaphore = make(chan struct{}, 1)
+		entry.semaphore <- struct{}{}
 	}
 	entry.references++
 	s.chatGPTWebModelFetchMu.Unlock()
 
-	entry.mu.Lock()
+	select {
+	case <-ctx.Done():
+		s.releaseChatGPTWebModelFetchReference(authID, entry)
+		return nil, ctx.Err()
+	case <-entry.semaphore:
+	}
+	if errContext := ctx.Err(); errContext != nil {
+		entry.semaphore <- struct{}{}
+		s.releaseChatGPTWebModelFetchReference(authID, entry)
+		return nil, errContext
+	}
+
+	var once sync.Once
 	return func() {
-		entry.mu.Unlock()
-		s.chatGPTWebModelFetchMu.Lock()
-		entry.references--
-		if entry.references == 0 && s.chatGPTWebModelFetchLocks[authID] == entry {
-			delete(s.chatGPTWebModelFetchLocks, authID)
-		}
-		s.chatGPTWebModelFetchMu.Unlock()
+		once.Do(func() {
+			entry.semaphore <- struct{}{}
+			s.releaseChatGPTWebModelFetchReference(authID, entry)
+		})
+	}, nil
+}
+
+func (s *Service) releaseChatGPTWebModelFetchReference(authID string, entry *chatGPTWebModelFetchLockEntry) {
+	if s == nil || entry == nil {
+		return
+	}
+	s.chatGPTWebModelFetchMu.Lock()
+	defer s.chatGPTWebModelFetchMu.Unlock()
+	entry.references--
+	if entry.references == 0 && s.chatGPTWebModelFetchLocks[authID] == entry {
+		delete(s.chatGPTWebModelFetchLocks, authID)
 	}
 }
 
@@ -565,7 +617,7 @@ func (s *Service) retireChatGPTWebModelFetchLock(authID string) {
 	}
 }
 
-func (s *Service) cleanupChatGPTWebModelResourcesAfterDelete(authID, removedRuntimeInstanceID string) {
+func (s *Service) cleanupChatGPTWebModelResourcesAfterDelete(ctx context.Context, authID, removedRuntimeInstanceID string) {
 	if s == nil {
 		return
 	}
@@ -574,7 +626,11 @@ func (s *Service) cleanupChatGPTWebModelResourcesAfterDelete(authID, removedRunt
 		return
 	}
 
-	unlockTransition := s.lockAuthModelTransition(authID)
+	unlockTransition, errTransition := s.lockAuthModelTransitionContext(ctx, authID)
+	if errTransition != nil {
+		s.enqueueModelSyncTaskForInstallation(authID, "", true)
+		return
+	}
 	defer unlockTransition()
 
 	if s.coreManager != nil {

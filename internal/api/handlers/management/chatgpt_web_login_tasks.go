@@ -998,9 +998,12 @@ func (h *Handler) persistChatGPTWebLoginCredential(ctx context.Context, manager 
 }
 
 func (h *Handler) persistChatGPTWebCredential(ctx context.Context, manager *coreauth.Manager, fileName string, credential *chatgptwebauth.Credential, existing *coreauth.Auth, loginErr error, refreshAware bool) (*coreauth.Auth, error) {
-	h.chatGPTWebDependencyMu.Lock()
+	unlockDependency, errDependencyLock := h.chatGPTWebDependencyMu.lock(ctx)
+	if errDependencyLock != nil {
+		return nil, errDependencyLock
+	}
 	installed, oldSourceUID, errPersist := h.persistChatGPTWebCredentialLocked(ctx, manager, fileName, credential, existing, loginErr, refreshAware)
-	h.chatGPTWebDependencyMu.Unlock()
+	unlockDependency()
 	if errPersist == nil && oldSourceUID != "" && credential != nil && credential.RefreshStrategy != chatgptwebauth.RefreshStrategyCodexSource {
 		h.cleanupRetainedCodexSource(ctx, oldSourceUID)
 	}

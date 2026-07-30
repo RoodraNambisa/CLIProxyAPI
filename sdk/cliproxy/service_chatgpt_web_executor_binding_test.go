@@ -749,6 +749,63 @@ func TestServiceConcurrentShutdownHonorsDeadlineAndReturnsExecutorError(t *testi
 	}
 }
 
+func TestServiceShutdownDoesNotCompleteWhileAuthUpdateConsumerIsStillRunning(t *testing.T) {
+	consumerDone := make(chan struct{})
+	consumerCanceled := make(chan struct{})
+	consumerJoinStarted := make(chan struct{})
+	consumerJoined := make(chan struct{})
+	var cancelOnce sync.Once
+	var joinStartedOnce sync.Once
+	var joinedOnce sync.Once
+	service := &Service{
+		cfg: &config.Config{},
+		authQueueStop: func() {
+			cancelOnce.Do(func() { close(consumerCanceled) })
+		},
+		authQueueDone: consumerDone,
+		authQueueWaitObserved: func() {
+			joinStartedOnce.Do(func() { close(consumerJoinStarted) })
+		},
+		authQueueStoppedObserved: func() {
+			joinedOnce.Do(func() { close(consumerJoined) })
+		},
+	}
+
+	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), 25*time.Millisecond)
+	defer cancelShutdown()
+	errShutdown := service.Shutdown(shutdownCtx)
+	if !errors.Is(errShutdown, context.DeadlineExceeded) {
+		t.Fatalf("Shutdown() error = %v, want deadline exceeded", errShutdown)
+	}
+	select {
+	case <-consumerCanceled:
+	case <-time.After(time.Second):
+		t.Fatal("shutdown did not cancel the auth update consumer")
+	}
+	select {
+	case <-consumerJoinStarted:
+	case <-time.After(time.Second):
+		t.Fatal("shutdown did not enter the auth update consumer join")
+	}
+	select {
+	case <-consumerJoined:
+		t.Fatal("shutdown passed the auth update consumer join before it exited")
+	default:
+	}
+
+	close(consumerDone)
+	select {
+	case <-consumerJoined:
+	case <-time.After(time.Second):
+		t.Fatal("shutdown did not pass the auth update consumer join after it exited")
+	}
+	finalCtx, cancelFinal := context.WithTimeout(context.Background(), time.Second)
+	defer cancelFinal()
+	if errFinal := service.Shutdown(finalCtx); errFinal != nil {
+		t.Fatalf("Shutdown() after consumer exit error = %v", errFinal)
+	}
+}
+
 func TestServiceShutdownKeepsProxyTransportUntilExecutorsClose(t *testing.T) {
 	var connections atomic.Int32
 	proxyServer := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {

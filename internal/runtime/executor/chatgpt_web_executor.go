@@ -396,7 +396,7 @@ func (e *ChatGPTWebExecutor) ShouldRefresh(now time.Time, auth *cliproxyauth.Aut
 // failures persist their lifecycle state while the returned error moves the
 // current request to another credential without recording an auth failure.
 func (e *ChatGPTWebExecutor) PrepareRequestAuth(ctx context.Context, auth *cliproxyauth.Auth) (*cliproxyauth.Auth, error) {
-	updated, refreshErr, terminal := e.refreshCredential(ctx, auth)
+	updated, refreshErr, terminal := e.refreshCredential(ctx, auth, false)
 	if refreshErr == nil {
 		return updated, nil
 	}
@@ -410,7 +410,20 @@ func (e *ChatGPTWebExecutor) PrepareRequestAuth(ctx context.Context, auth *clipr
 // installed as lifecycle transitions and therefore return no manager-level
 // refresh error; transient infrastructure errors remain retryable.
 func (e *ChatGPTWebExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*cliproxyauth.Auth, error) {
-	updated, refreshErr, terminal := e.refreshCredential(ctx, auth)
+	updated, refreshErr, terminal := e.refreshCredential(ctx, auth, false)
+	if refreshErr == nil {
+		return updated, nil
+	}
+	if terminal {
+		return updated, newChatGPTWebCredentialUnavailableError(refreshErr, true)
+	}
+	return nil, newChatGPTWebCredentialUnavailableError(refreshErr, false)
+}
+
+// RefreshToCompletion keeps waiting for a provider-owned token exchange after
+// it starts so rotating refresh tokens cannot be discarded by caller timeout.
+func (e *ChatGPTWebExecutor) RefreshToCompletion(ctx context.Context, auth *cliproxyauth.Auth) (*cliproxyauth.Auth, error) {
+	updated, refreshErr, terminal := e.refreshCredential(ctx, auth, true)
 	if refreshErr == nil {
 		return updated, nil
 	}
@@ -1079,12 +1092,15 @@ func (e *ChatGPTWebExecutor) reloginCurrent(ctx context.Context, expected *clipr
 	return cloneChatGPTWebAuth(installed), true, nil
 }
 
-func (e *ChatGPTWebExecutor) refreshCredential(ctx context.Context, auth *cliproxyauth.Auth) (*cliproxyauth.Auth, error, bool) {
+func (e *ChatGPTWebExecutor) refreshCredential(ctx context.Context, auth *cliproxyauth.Auth, waitForCompletion bool) (*cliproxyauth.Auth, error, bool) {
 	if e == nil || e.authService == nil || auth == nil {
 		return nil, errors.New("chatgpt web refresh is unavailable"), false
 	}
 	if ctx == nil {
 		ctx = context.Background()
+	}
+	if errContext := ctx.Err(); errContext != nil {
+		return nil, errContext, false
 	}
 	credential, errCredential := chatgptwebauth.ParseCredential(auth.Metadata)
 	if errCredential != nil {
@@ -1100,7 +1116,13 @@ func (e *ChatGPTWebExecutor) refreshCredential(ctx context.Context, auth *clipro
 		return nil, context.Canceled, false
 	}
 	resultChannel := e.refreshGroup.DoChan(key, func() (any, error) {
-		acquisitionCtx, cancel := e.acquisitionContext()
+		var acquisitionCtx context.Context
+		var cancel context.CancelFunc
+		if credential.RefreshStrategy == chatgptwebauth.RefreshStrategyCodexSource {
+			acquisitionCtx, cancel = e.acquisitionContextWithValues(ctx)
+		} else {
+			acquisitionCtx, cancel = e.acquisitionContext()
+		}
 		defer cancel()
 		acquisitionCtx, release, active := auth.BeginRuntimeExecution(acquisitionCtx)
 		if !active {
@@ -1119,14 +1141,22 @@ func (e *ChatGPTWebExecutor) refreshCredential(ctx context.Context, auth *clipro
 		close(trackedResult)
 	}()
 	var flightResult singleflight.Result
-	select {
-	case <-ctx.Done():
-		return nil, ctx.Err(), false
-	case result, ok := <-trackedResult:
+	if waitForCompletion || credential.RefreshStrategy == chatgptwebauth.RefreshStrategyCodexSource {
+		result, ok := <-trackedResult
 		if !ok {
 			return nil, errors.New("chatgpt web refresh ended without a result"), false
 		}
 		flightResult = result
+	} else {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err(), false
+		case result, ok := <-trackedResult:
+			if !ok {
+				return nil, errors.New("chatgpt web refresh ended without a result"), false
+			}
+			flightResult = result
+		}
 	}
 	if errLifecycle := e.lifecycleContext().Err(); errLifecycle != nil {
 		return nil, errLifecycle, false
@@ -1431,6 +1461,18 @@ func (e *ChatGPTWebExecutor) lifecycleContext() context.Context {
 
 func (e *ChatGPTWebExecutor) acquisitionContext() (context.Context, context.CancelFunc) {
 	return context.WithTimeout(e.lifecycleContext(), chatgptwebauth.DefaultAcquisitionTimeout)
+}
+
+func (e *ChatGPTWebExecutor) acquisitionContextWithValues(ctx context.Context) (context.Context, context.CancelFunc) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	acquisitionCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), chatgptwebauth.DefaultAcquisitionTimeout)
+	stopLifecycleCancel := context.AfterFunc(e.lifecycleContext(), cancel)
+	return acquisitionCtx, func() {
+		stopLifecycleCancel()
+		cancel()
+	}
 }
 
 func (e *ChatGPTWebExecutor) proxyURLForTarget(auth *cliproxyauth.Auth, targetURL string) string {

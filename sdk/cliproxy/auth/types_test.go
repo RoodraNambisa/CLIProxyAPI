@@ -139,3 +139,25 @@ func TestMetadataWithDisabledClonesAndInjectsDisabled(t *testing.T) {
 		t.Fatalf("original metadata mutated = %#v, want %q", auth.Metadata["label"], "vertex-label")
 	}
 }
+
+func TestCanonicalSourceHashTreatsMissingDisabledAsFalse(t *testing.T) {
+	t.Parallel()
+
+	withoutDisabled := []byte(`{"type":"chatgpt-web","access_token":"token"}`)
+	withDisabledFalse := []byte(`{"access_token":"token","disabled":false,"type":"chatgpt-web"}`)
+	expectedHash, errHash := CanonicalSourceHashFromBytes(withoutDisabled)
+	if errHash != nil {
+		t.Fatal(errHash)
+	}
+	if !SourceHashMatchesBytes(expectedHash, withDisabledFalse) {
+		t.Fatal("canonical source hash did not treat missing disabled as false")
+	}
+
+	auth := &Auth{}
+	if errSync := SyncPersistedMetadataAndSourceHash(auth, withoutDisabled); errSync != nil {
+		t.Fatal(errSync)
+	}
+	if !SourceHashMatchesBytes(auth.Attributes[SourceHashAttributeKey], withoutDisabled) {
+		t.Fatal("runtime source hash no longer matches the original payload")
+	}
+}

@@ -298,21 +298,22 @@ func validateBatchAuthFileFields(auth *coreauth.Auth, values authFileFieldValues
 }
 
 func (h *Handler) updateAuthFileFields(ctx context.Context, auth *coreauth.Auth, values authFileFieldValues) (*coreauth.Auth, int, string) {
-	h.chatGPTWebDependencyMu.Lock()
+	unlockDependency, errDependencyLock := h.chatGPTWebDependencyMu.lock(ctx)
+	if errDependencyLock != nil {
+		return nil, http.StatusRequestTimeout, fmt.Sprintf("failed to lock credential dependencies: %v", errDependencyLock)
+	}
+	defer unlockDependency()
 	lockedCtx, unlockAuth, errLock := h.authManager.LockAuthMutation(ctx, auth)
 	if errLock != nil {
-		h.chatGPTWebDependencyMu.Unlock()
 		return nil, http.StatusInternalServerError, fmt.Sprintf("failed to lock auth: %v", errLock)
 	}
 	current, exists := h.authManager.GetByID(auth.ID)
 	if !exists || current == nil {
 		unlockAuth()
-		h.chatGPTWebDependencyMu.Unlock()
 		return nil, http.StatusNotFound, "auth file not found"
 	}
 	if coreauth.ChatGPTWebAuthRetainedForDependents(current) {
 		unlockAuth()
-		h.chatGPTWebDependencyMu.Unlock()
 		return nil, http.StatusConflict, "credential is retained for Web dependents; restore it before editing"
 	}
 	updatedCandidate := current.Clone()
@@ -330,7 +331,7 @@ func (h *Handler) updateAuthFileFields(ctx context.Context, auth *coreauth.Auth,
 		updated, currentMatch, errUpdate = h.authManager.UpdateIfCurrent(lockedCtx, auth, updatedCandidate)
 	}
 	unlockAuth()
-	h.chatGPTWebDependencyMu.Unlock()
+	unlockDependency()
 	if errUpdate != nil {
 		if errors.Is(errUpdate, coreauth.ErrRetiredGeminiCLIAuthReadOnly) {
 			return nil, http.StatusGone, errGeminiCLIAuthGone.Error()

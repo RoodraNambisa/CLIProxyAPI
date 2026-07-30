@@ -423,7 +423,10 @@ func (h *Handler) retainCodexAuthAtRoot(ctx context.Context, root *os.Root, auth
 		return displayName, http.StatusInternalServerError, errLockAuth
 	}
 	defer unlockAuthMutation()
-	unlockOperation := lockManagedAuthFileOperation(targetPath)
+	unlockOperation, errOperationLock := lockManagedAuthFileOperationContext(lockedCtx, targetPath)
+	if errOperationLock != nil {
+		return displayName, http.StatusRequestTimeout, errOperationLock
+	}
 	defer unlockOperation()
 	snapshot, errRead := captureManagedAuthFileSnapshotAtRoot(root, filepath.FromSlash(displayName))
 	if errRead != nil {
@@ -511,8 +514,12 @@ func (h *Handler) RestoreAuthFile(c *gin.Context) {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "auth manager unavailable"})
 		return
 	}
-	h.chatGPTWebDependencyMu.Lock()
-	defer h.chatGPTWebDependencyMu.Unlock()
+	unlockDependency, errDependencyLock := h.chatGPTWebDependencyMu.lock(c.Request.Context())
+	if errDependencyLock != nil {
+		c.JSON(http.StatusRequestTimeout, gin.H{"error": fmt.Sprintf("failed to lock credential dependencies: %v", errDependencyLock)})
+		return
+	}
+	defer unlockDependency()
 	root, lexicalAuthDir, authDir, errRoot := h.openManagedAuthRootSnapshot()
 	if errRoot != nil {
 		status := http.StatusInternalServerError
@@ -558,7 +565,10 @@ func (h *Handler) restoreCodexAuthAtRoot(ctx context.Context, root *os.Root, aut
 		return nil, http.StatusInternalServerError, errLockAuth
 	}
 	defer unlockAuthMutation()
-	unlockOperation := lockManagedAuthFileOperation(targetPath)
+	unlockOperation, errOperationLock := lockManagedAuthFileOperationContext(lockedCtx, targetPath)
+	if errOperationLock != nil {
+		return nil, http.StatusRequestTimeout, errOperationLock
+	}
 	defer unlockOperation()
 	snapshot, errRead := captureManagedAuthFileSnapshotAtRoot(root, filepath.FromSlash(displayName))
 	if errRead != nil {
@@ -598,8 +608,12 @@ func (h *Handler) cleanupRetainedCodexSource(ctx context.Context, sourceUID stri
 	if h == nil || h.authManager == nil || sourceUID == "" {
 		return
 	}
-	h.chatGPTWebDependencyMu.Lock()
-	defer h.chatGPTWebDependencyMu.Unlock()
+	unlockDependency, errDependencyLock := h.chatGPTWebDependencyMu.lock(ctx)
+	if errDependencyLock != nil {
+		log.WithError(errDependencyLock).WithField("source_uid", sourceUID).Debug("credential dependency cleanup canceled")
+		return
+	}
+	defer unlockDependency()
 	deleted, errReconcile := h.reconcileChatGPTWebDependencies(ctx, "management")
 	if errReconcile != nil {
 		log.WithError(errReconcile).WithField("source_uid", sourceUID).Warn("failed to reconcile retained Codex source")

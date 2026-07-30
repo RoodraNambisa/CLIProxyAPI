@@ -1,6 +1,7 @@
 package management
 
 import (
+	"context"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -8,8 +9,8 @@ import (
 )
 
 type managedAuthOperationLock struct {
-	mu   sync.Mutex
-	refs int
+	token chan struct{}
+	refs  int
 }
 
 var managedAuthOperationLocks = struct {
@@ -17,10 +18,13 @@ var managedAuthOperationLocks = struct {
 	entries map[string]*managedAuthOperationLock
 }{entries: make(map[string]*managedAuthOperationLock)}
 
-func lockManagedAuthFileOperation(path string) func() {
+func lockManagedAuthFileOperationContext(ctx context.Context, path string) (func(), error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	key := filepath.Clean(strings.TrimSpace(path))
 	if key == "." || key == "" {
-		return func() {}
+		return func() {}, nil
 	}
 	if runtime.GOOS == "windows" {
 		key = strings.ToLower(key)
@@ -28,14 +32,14 @@ func lockManagedAuthFileOperation(path string) func() {
 	managedAuthOperationLocks.Lock()
 	entry := managedAuthOperationLocks.entries[key]
 	if entry == nil {
-		entry = &managedAuthOperationLock{}
+		entry = &managedAuthOperationLock{token: make(chan struct{}, 1)}
+		entry.token <- struct{}{}
 		managedAuthOperationLocks.entries[key] = entry
 	}
 	entry.refs++
 	managedAuthOperationLocks.Unlock()
-	entry.mu.Lock()
-	return func() {
-		entry.mu.Unlock()
+
+	releaseReference := func() {
 		managedAuthOperationLocks.Lock()
 		entry.refs--
 		if entry.refs == 0 && managedAuthOperationLocks.entries[key] == entry {
@@ -43,4 +47,22 @@ func lockManagedAuthFileOperation(path string) func() {
 		}
 		managedAuthOperationLocks.Unlock()
 	}
+	select {
+	case <-ctx.Done():
+		releaseReference()
+		return nil, ctx.Err()
+	case <-entry.token:
+	}
+	if errContext := ctx.Err(); errContext != nil {
+		entry.token <- struct{}{}
+		releaseReference()
+		return nil, errContext
+	}
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			entry.token <- struct{}{}
+			releaseReference()
+		})
+	}, nil
 }

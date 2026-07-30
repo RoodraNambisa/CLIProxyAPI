@@ -375,9 +375,7 @@ func lockPersistentFileModes(ctx context.Context, root *os.Root, lockPath string
 		timer := time.NewTimer(lockRetryInterval)
 		select {
 		case <-ctx.Done():
-			if !timer.Stop() {
-				<-timer.C
-			}
+			timer.Stop()
 			return nil, closeBeforeProcessUnlock(ctx.Err())
 		case <-timer.C:
 		}

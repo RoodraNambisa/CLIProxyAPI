@@ -808,15 +808,18 @@ func (h *Handler) persistCodexPlanTypeRefreshAuth(ctx context.Context, manager *
 	if h == nil || manager == nil || expected == nil || refreshed == nil {
 		return fmt.Errorf("core auth manager unavailable")
 	}
-	h.chatGPTWebDependencyMu.Lock()
+	unlockDependency, errDependencyLock := h.chatGPTWebDependencyMu.lock(ctx)
+	if errDependencyLock != nil {
+		return errDependencyLock
+	}
 	lockedCtx, unlockAuth, errLock := manager.LockAuthMutation(ctx, expected)
 	if errLock != nil {
-		h.chatGPTWebDependencyMu.Unlock()
+		unlockDependency()
 		return errLock
 	}
 	defer func() {
 		unlockAuth()
-		h.chatGPTWebDependencyMu.Unlock()
+		unlockDependency()
 	}()
 	current, ok := manager.GetByID(expected.ID)
 	if !ok || current == nil || !strings.EqualFold(strings.TrimSpace(current.Provider), "codex") || coreauth.ChatGPTWebAuthRetainedForDependents(current) {

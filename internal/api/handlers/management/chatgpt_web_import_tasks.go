@@ -532,23 +532,24 @@ func (h *Handler) persistImportedChatGPTWebCredential(ctx context.Context, manag
 	if h == nil || manager == nil || credential == nil {
 		return nil, "", false, errors.New("credential persistence is unavailable")
 	}
-	h.chatGPTWebDependencyMu.Lock()
+	unlockDependency, errDependencyLock := h.chatGPTWebDependencyMu.lock(ctx)
+	if errDependencyLock != nil {
+		return nil, "", false, errDependencyLock
+	}
+	defer unlockDependency()
 	existing, errExisting := findExistingChatGPTWebAuth(ctx, manager, fileName, credential.Email)
 	if errExisting != nil {
-		h.chatGPTWebDependencyMu.Unlock()
 		if errors.Is(errExisting, errChatGPTWebCredentialIDOwned) || errors.Is(errExisting, errChatGPTWebCredentialMultiple) {
 			return nil, "", false, errChatGPTWebImportIdentityConflict
 		}
 		return nil, "", false, errExisting
 	}
 	if expected == nil && existing != nil || expected != nil && (existing == nil || existing.ID != expected.ID) {
-		h.chatGPTWebDependencyMu.Unlock()
 		return nil, "", false, errChatGPTWebCredentialChanged
 	}
 	persistExpected := existing
 	if expected != nil && existing != nil && expected.ID == existing.ID {
 		if !chatGPTWebImportCredentialFieldsEqual(expected, existing) {
-			h.chatGPTWebDependencyMu.Unlock()
 			return nil, "", false, errChatGPTWebCredentialChanged
 		}
 		persistExpected = existing
@@ -566,7 +567,6 @@ func (h *Handler) persistImportedChatGPTWebCredential(ctx context.Context, manag
 			identityChanged = coreauth.ChatGPTWebCredentialRefreshIdentityChanged(identityBase, candidate)
 		}
 		if identityChanged {
-			h.chatGPTWebDependencyMu.Unlock()
 			return nil, "", false, errChatGPTWebImportIdentityConflict
 		}
 		if current, errParse := chatgptwebauth.ParseCredential(identityBase.Metadata); errParse == nil {
@@ -583,12 +583,11 @@ func (h *Handler) persistImportedChatGPTWebCredential(ctx context.Context, manag
 	}
 	if unchanged {
 		installed = existing.Clone()
-		h.chatGPTWebDependencyMu.Unlock()
 		return installed, status, true, nil
 	}
 	var oldSourceUID string
 	installed, oldSourceUID, err = h.persistChatGPTWebCredentialLocked(ctx, manager, fileName, credential, persistExpected, nil, refreshAware)
-	h.chatGPTWebDependencyMu.Unlock()
+	unlockDependency()
 	if err == nil && oldSourceUID != "" && credential.RefreshStrategy != chatgptwebauth.RefreshStrategyCodexSource {
 		h.cleanupRetainedCodexSource(ctx, oldSourceUID)
 	}

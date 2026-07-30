@@ -2051,9 +2051,7 @@ func (runtime *chatGPTWebAccountInfoRuntime) syncCanceledWorkRecoveryLocked(
 func (runtime *chatGPTWebAccountInfoRuntime) schedulerLoop() {
 	defer runtime.wg.Done()
 	timer := time.NewTimer(time.Hour)
-	if !timer.Stop() {
-		<-timer.C
-	}
+	timer.Stop()
 	defer timer.Stop()
 	for {
 		runtime.mu.Lock()

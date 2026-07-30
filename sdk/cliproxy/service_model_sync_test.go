@@ -10,10 +10,12 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/authfileguard"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/watcher"
 	sdkauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/auth"
@@ -37,10 +39,69 @@ type serviceDeleteSideEffectStore struct {
 	onDelete    func(id string)
 }
 
+type serviceRecordingStore struct {
+	mu    sync.Mutex
+	saved *coreauth.Auth
+}
+
 type serviceChatGPTWebReplacementHook struct {
 	coreauth.NoopHook
 	replacements atomic.Int32
 	updated      chan struct{}
+}
+
+func waitForModelSyncTaskRunning(t *testing.T, service *Service, authID string) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for {
+		service.modelSyncMu.Lock()
+		state, ok := service.modelSyncPending[authID]
+		running := ok && state.running
+		service.modelSyncMu.Unlock()
+		if running {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("model sync task %q did not enter the running state", authID)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func waitForAuthModelTransitionWaiter(t *testing.T, service *Service, authID string) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for {
+		service.authModelTransitionMu.Lock()
+		entry := service.authModelTransitionLocks[authID]
+		waiting := entry != nil && entry.references >= 2
+		service.authModelTransitionMu.Unlock()
+		if waiting {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("auth model transition waiter for %q was not registered", authID)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func waitForChatGPTWebModelFetchWaiter(t *testing.T, service *Service, authID string) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for {
+		service.chatGPTWebModelFetchMu.Lock()
+		entry := service.chatGPTWebModelFetchLocks[authID]
+		waiting := entry != nil && entry.references >= 2
+		service.chatGPTWebModelFetchMu.Unlock()
+		if waiting {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("ChatGPT Web model fetch waiter for %q was not registered", authID)
+		}
+		time.Sleep(time.Millisecond)
+	}
 }
 
 func (hook *serviceChatGPTWebReplacementHook) OnAuthUpdated(ctx context.Context, _ *coreauth.Auth) {
@@ -113,6 +174,45 @@ func (s *serviceDeleteSideEffectStore) Delete(_ context.Context, id string) erro
 		s.onDelete(id)
 	}
 	return nil
+}
+
+func (s *serviceRecordingStore) List(context.Context) ([]*coreauth.Auth, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.saved == nil {
+		return nil, nil
+	}
+	return []*coreauth.Auth{s.saved.Clone()}, nil
+}
+
+func (s *serviceRecordingStore) Save(_ context.Context, auth *coreauth.Auth) (string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if auth == nil {
+		return "", nil
+	}
+	s.saved = auth.Clone()
+	return auth.ID, nil
+}
+
+func (s *serviceRecordingStore) SaveIfSourceHashMatches(ctx context.Context, auth *coreauth.Auth, _ string) (string, error) {
+	return s.Save(ctx, auth)
+}
+
+func (s *serviceRecordingStore) Delete(context.Context, string) error {
+	s.mu.Lock()
+	s.saved = nil
+	s.mu.Unlock()
+	return nil
+}
+
+func (s *serviceRecordingStore) snapshot() *coreauth.Auth {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.saved == nil {
+		return nil
+	}
+	return s.saved.Clone()
 }
 
 func TestServiceApplyCoreAuthAddOrUpdate_ModelSyncWorkerEventuallyRegistersModels(t *testing.T) {
@@ -212,6 +312,625 @@ func TestModelSyncStopPreservesTasksFromNewGeneration(t *testing.T) {
 	if state.epoch == 1 {
 		t.Fatal("recreated task reused the stopped worker epoch")
 	}
+}
+
+func TestModelSyncStopCancelsTransitionWait(t *testing.T) {
+	manager := coreauth.NewManager(nil, nil, nil)
+	service := &Service{
+		cfg:         &config.Config{},
+		coreManager: manager,
+	}
+	authID := "service-model-sync-cancel-transition"
+	if _, errRegister := manager.Register(coreauth.WithSkipPersist(t.Context()), &coreauth.Auth{
+		ID:       authID,
+		Provider: "claude",
+		Status:   coreauth.StatusActive,
+	}); errRegister != nil {
+		t.Fatal(errRegister)
+	}
+	t.Cleanup(func() { GlobalModelRegistry().UnregisterClient(authID) })
+
+	unlockTransition := service.lockAuthModelTransition(authID)
+	service.startModelSyncLoop(t.Context())
+	if !service.enqueueModelSync(authID) {
+		unlockTransition()
+		t.Fatal("model sync task was not accepted")
+	}
+	waitForAuthModelTransitionWaiter(t, service, authID)
+
+	stopped := make(chan struct{})
+	go func() {
+		service.stopModelSyncLoop()
+		close(stopped)
+	}()
+	select {
+	case <-stopped:
+	case <-time.After(time.Second):
+		unlockTransition()
+		select {
+		case <-stopped:
+		case <-time.After(time.Second):
+			t.Fatal("model sync stop remained blocked after the transition lock was released")
+		}
+		t.Fatal("model sync stop did not cancel the transition lock wait")
+	}
+	unlockTransition()
+}
+
+func TestServiceSyncAuthModelsUsesMutationBeforeTransition(t *testing.T) {
+	manager := coreauth.NewManager(nil, nil, nil)
+	service := &Service{
+		cfg:         &config.Config{},
+		coreManager: manager,
+	}
+	mutationLocked := make(chan struct{}, 1)
+	service.modelSyncMutationLockedObserved = func(*coreauth.Auth) {
+		mutationLocked <- struct{}{}
+	}
+	authID := "service-model-sync-lock-order"
+	_, errRegister := manager.Register(coreauth.WithSkipPersist(t.Context()), &coreauth.Auth{
+		ID:       authID,
+		Provider: "claude",
+		Status:   coreauth.StatusActive,
+		ModelStates: map[string]*coreauth.ModelState{
+			"removed-model": {
+				Quota: coreauth.QuotaState{BackoffLevel: 1},
+			},
+		},
+	})
+	if errRegister != nil {
+		t.Fatal(errRegister)
+	}
+	t.Cleanup(func() { GlobalModelRegistry().UnregisterClient(authID) })
+
+	unlockTransition := service.lockAuthModelTransition(authID)
+	var transitionOnce sync.Once
+	releaseTransition := func() {
+		transitionOnce.Do(unlockTransition)
+	}
+
+	syncCtx, cancelSync := context.WithCancel(t.Context())
+	syncDone := make(chan struct{})
+	go func() {
+		service.syncAuthModels(syncCtx, authID)
+		close(syncDone)
+	}()
+	waitSync := func() bool {
+		select {
+		case <-syncDone:
+			return true
+		case <-time.After(time.Second):
+			return false
+		}
+	}
+	t.Cleanup(func() {
+		cancelSync()
+		releaseTransition()
+		if !waitSync() {
+			t.Errorf("model sync did not stop during test cleanup")
+		}
+	})
+	select {
+	case <-mutationLocked:
+	case <-time.After(time.Second):
+		cancelSync()
+		releaseTransition()
+		if !waitSync() {
+			t.Fatal("model sync did not stop after lock-order observation failed")
+		}
+		t.Fatal("model synchronization did not acquire the auth mutation lock")
+	}
+
+	releaseTransition()
+	if !waitSync() {
+		cancelSync()
+		if !waitSync() {
+			t.Fatal("model sync did not stop after transition lock release timed out")
+		}
+		t.Fatal("model sync did not finish after transition lock release")
+	}
+	current, ok := manager.GetByID(authID)
+	if !ok || current == nil {
+		t.Fatal("auth disappeared during model synchronization")
+	}
+	if _, stale := current.ModelStates["removed-model"]; stale {
+		t.Fatal("model synchronization did not persist stale model-state cleanup")
+	}
+	if models := registry.GetGlobalRegistry().GetModelsForClient(authID); len(models) == 0 {
+		t.Fatal("model synchronization did not update the registry")
+	}
+}
+
+func TestServiceFieldUpdateHookReusesOuterMutationLockDuringModelStateCleanup(t *testing.T) {
+	store := &serviceRecordingStore{}
+	manager := coreauth.NewManager(store, nil, nil)
+	service := &Service{
+		cfg:         &config.Config{},
+		coreManager: manager,
+	}
+
+	authID := "service-field-update-reentrant-model-state"
+	auth := &coreauth.Auth{
+		ID:       authID,
+		FileName: authID,
+		Provider: "codex",
+		Status:   coreauth.StatusActive,
+		Attributes: map[string]string{
+			"priority": "9",
+		},
+		Metadata: map[string]any{
+			"type":     "codex",
+			"priority": 9,
+		},
+		ModelStates: map[string]*coreauth.ModelState{
+			"removed-model": {
+				Unavailable:    true,
+				NextRetryAfter: time.Now().Add(time.Hour),
+			},
+		},
+	}
+	if errSync := coreauth.SyncPersistedMetadataAndSourceHash(auth, []byte(`{"type":"codex","priority":9}`)); errSync != nil {
+		t.Fatal(errSync)
+	}
+	registered, errRegister := manager.Register(t.Context(), auth)
+	if errRegister != nil {
+		t.Fatal(errRegister)
+	}
+	t.Cleanup(func() { GlobalModelRegistry().UnregisterClient(authID) })
+	manager.AddHook(authMaintenanceHook{service: service})
+
+	lockedCtx, unlockMutation, errLock := manager.LockAuthMutation(t.Context(), registered)
+	if errLock != nil {
+		t.Fatal(errLock)
+	}
+	mutationLocked := true
+	defer func() {
+		if mutationLocked {
+			unlockMutation()
+		}
+	}()
+
+	candidate := registered.Clone()
+	candidate.Attributes["priority"] = "0"
+	candidate.Metadata["priority"] = 0
+	type updateResult struct {
+		auth    *coreauth.Auth
+		current bool
+		err     error
+	}
+	updateDone := make(chan updateResult, 1)
+	go func() {
+		updated, current, errUpdate := manager.UpdateIfCurrentSourceHash(lockedCtx, registered, candidate)
+		updateDone <- updateResult{auth: updated, current: current, err: errUpdate}
+	}()
+
+	var result updateResult
+	select {
+	case result = <-updateDone:
+		unlockMutation()
+		mutationLocked = false
+	case <-time.After(500 * time.Millisecond):
+		unlockMutation()
+		mutationLocked = false
+		select {
+		case <-updateDone:
+		case <-time.After(time.Second):
+		}
+		t.Fatal("field update deadlocked while the model-state hook reused the outer mutation lock")
+	}
+	if result.err != nil || !result.current || result.auth == nil {
+		t.Fatalf("field update result = (%#v, %v, %v)", result.auth, result.current, result.err)
+	}
+
+	current, ok := manager.GetByID(authID)
+	if !ok || current == nil {
+		t.Fatal("updated auth is missing")
+	}
+	if current.Attributes["priority"] != "0" {
+		t.Fatalf("runtime priority = %q, want 0", current.Attributes["priority"])
+	}
+	if len(current.ModelStates) != 0 {
+		t.Fatalf("runtime model states = %#v, want none", current.ModelStates)
+	}
+	persisted := store.snapshot()
+	if persisted == nil || persisted.Attributes["priority"] != "0" || len(persisted.ModelStates) != 0 {
+		t.Fatalf("persisted auth = %#v, want priority 0 without stale model states", persisted)
+	}
+	if _, pending := service.modelSyncPending[authID]; pending {
+		t.Fatal("non-Antigravity field update unexpectedly queued model synchronization")
+	}
+}
+
+func TestAuthHookRetainsModelSyncWhenTransitionWaitIsCanceled(t *testing.T) {
+	manager := coreauth.NewManager(nil, nil, nil)
+	service := &Service{
+		cfg:         &config.Config{},
+		coreManager: manager,
+	}
+	authID := "service-hook-canceled-transition"
+	installed, errRegister := manager.Register(coreauth.WithSkipPersist(t.Context()), &coreauth.Auth{
+		ID:       authID,
+		Provider: "claude",
+		Status:   coreauth.StatusActive,
+	})
+	if errRegister != nil {
+		t.Fatal(errRegister)
+	}
+	t.Cleanup(func() { GlobalModelRegistry().UnregisterClient(authID) })
+	service.syncAuthModels(t.Context(), authID)
+	if len(registry.GetGlobalRegistry().GetModelsForClient(authID)) == 0 {
+		t.Fatal("initial models were not registered")
+	}
+	manager.SetHook(authMaintenanceHook{service: service})
+	service.startModelSyncLoop(t.Context())
+	defer service.stopModelSyncLoop()
+
+	unlockTransition := service.lockAuthModelTransition(authID)
+	transitionLocked := true
+	defer func() {
+		if transitionLocked {
+			unlockTransition()
+		}
+	}()
+
+	updated := installed.Clone()
+	updated.Disabled = true
+	updated.Status = coreauth.StatusDisabled
+	updateCtx, cancelUpdate := context.WithCancel(t.Context())
+	defer cancelUpdate()
+	updateDone := make(chan error, 1)
+	go func() {
+		_, errUpdate := manager.Update(coreauth.WithSkipPersist(updateCtx), updated)
+		updateDone <- errUpdate
+	}()
+	waitForAuthModelTransitionWaiter(t, service, authID)
+	cancelUpdate()
+	select {
+	case errUpdate := <-updateDone:
+		if errUpdate != nil {
+			t.Fatalf("Update() error: %v", errUpdate)
+		}
+	case <-time.After(time.Second):
+		unlockTransition()
+		transitionLocked = false
+		select {
+		case <-updateDone:
+		case <-time.After(time.Second):
+		}
+		t.Fatal("canceled auth update did not leave the transition wait")
+	}
+	if updateCtx.Err() == nil {
+		t.Fatal("update context was not canceled")
+	}
+
+	unlockTransition()
+	transitionLocked = false
+	deadline := time.Now().Add(time.Second)
+	for len(registry.GetGlobalRegistry().GetModelsForClient(authID)) != 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("canceled hook lost the committed model synchronization")
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func TestAuthHookCancellationStillResumesChatGPTWebRelogin(t *testing.T) {
+	manager := coreauth.NewManager(nil, nil, nil)
+	service := &Service{
+		cfg:         &config.Config{},
+		coreManager: manager,
+	}
+	authID := "service-hook-canceled-chatgpt-web"
+	installed, errRegister := manager.Register(coreauth.WithSkipPersist(t.Context()), &coreauth.Auth{
+		ID:       authID,
+		Provider: "chatgpt-web",
+		Status:   coreauth.StatusPending,
+		Metadata: map[string]any{
+			"access_token":    "token",
+			"account_id":      "account",
+			"lifecycle_state": coreauth.LifecycleStateReloginPending,
+		},
+	})
+	if errRegister != nil {
+		t.Fatal(errRegister)
+	}
+	t.Cleanup(func() { GlobalModelRegistry().UnregisterClient(authID) })
+
+	reloginObserved := make(chan string, 1)
+	service.chatGPTWebReloginObserved = func(auth *coreauth.Auth) {
+		reloginObserved <- auth.ID
+	}
+	unlockTransition := service.lockAuthModelTransition(authID)
+	transitionLocked := true
+	defer func() {
+		if transitionLocked {
+			unlockTransition()
+		}
+	}()
+
+	hookCtx, cancelHook := context.WithCancel(t.Context())
+	defer cancelHook()
+	hookDone := make(chan struct{})
+	go func() {
+		authMaintenanceHook{service: service}.OnAuthUpdated(hookCtx, installed)
+		close(hookDone)
+	}()
+	waitForAuthModelTransitionWaiter(t, service, authID)
+	cancelHook()
+	select {
+	case <-hookDone:
+	case <-time.After(time.Second):
+		unlockTransition()
+		transitionLocked = false
+		select {
+		case <-hookDone:
+		case <-time.After(time.Second):
+		}
+		t.Fatal("canceled ChatGPT Web hook did not leave the transition wait")
+	}
+
+	select {
+	case observedID := <-reloginObserved:
+		if observedID != authID {
+			t.Fatalf("re-login auth ID = %q, want %q", observedID, authID)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("canceled model transition lost ChatGPT Web re-login scheduling")
+	}
+	service.modelSyncMu.Lock()
+	state, queued := service.modelSyncPending[authID]
+	service.modelSyncMu.Unlock()
+	if !queued || (!state.queued && !state.running) {
+		t.Fatalf("canceled model transition did not retain model sync: %#v", state)
+	}
+
+	unlockTransition()
+	transitionLocked = false
+}
+
+func TestStopAuthUpdateQueueCancelsAuthFileLockWait(t *testing.T) {
+	authDir := t.TempDir()
+	path := filepath.Join(authDir, "auth-file-lock-wait.json")
+	contents := []byte(`{"type":"claude"}`)
+	if errWrite := os.WriteFile(path, contents, 0o600); errWrite != nil {
+		t.Fatal(errWrite)
+	}
+	auth := &coreauth.Auth{
+		ID:         "service-auth-file-lock-wait",
+		Provider:   "claude",
+		Status:     coreauth.StatusActive,
+		FileName:   path,
+		Attributes: map[string]string{"path": path},
+	}
+	if errSync := coreauth.SyncPersistedMetadataAndSourceHash(auth, contents); errSync != nil {
+		t.Fatal(errSync)
+	}
+	service := &Service{
+		cfg:         &config.Config{AuthDir: authDir},
+		coreManager: coreauth.NewManager(nil, nil, nil),
+	}
+	mutationLocked := make(chan struct{}, 1)
+	service.authUpdateMutationLockedObserved = func(*coreauth.Auth) {
+		mutationLocked <- struct{}{}
+	}
+	unlockPath := authfileguard.Lock(path)
+	pathLocked := true
+	defer func() {
+		if pathLocked {
+			unlockPath()
+		}
+	}()
+
+	service.ensureAuthUpdateQueue(t.Context())
+	service.authUpdates <- watcher.AuthUpdate{
+		Action: watcher.AuthUpdateActionAdd,
+		Auth:   auth,
+	}
+	select {
+	case <-mutationLocked:
+	case <-time.After(time.Second):
+		unlockPath()
+		pathLocked = false
+		t.Fatal("auth update did not acquire the auth mutation lock")
+	}
+
+	stopped := make(chan struct{})
+	go func() {
+		if errStop := service.stopAuthUpdateQueue(t.Context()); errStop != nil {
+			t.Errorf("stop auth update queue: %v", errStop)
+		}
+		close(stopped)
+	}()
+	select {
+	case <-stopped:
+	case <-time.After(time.Second):
+		unlockPath()
+		pathLocked = false
+		select {
+		case <-stopped:
+		case <-time.After(time.Second):
+			t.Fatal("auth update queue stop remained blocked after the auth file lock was released")
+		}
+		t.Fatal("auth update queue stop did not cancel the auth file lock wait")
+	}
+	unlockPath()
+	pathLocked = false
+}
+
+func TestStopAuthUpdateQueueTimeoutDoesNotStartConcurrentConsumer(t *testing.T) {
+	done := make(chan struct{})
+	service := &Service{
+		authQueueStop: func() {},
+		authQueueDone: done,
+	}
+
+	stopCtx, cancelStop := context.WithTimeout(t.Context(), 20*time.Millisecond)
+	defer cancelStop()
+	if errStop := service.stopAuthUpdateQueue(stopCtx); !errors.Is(errStop, context.DeadlineExceeded) {
+		t.Fatalf("stop auth update queue error = %v, want deadline exceeded", errStop)
+	}
+
+	service.ensureAuthUpdateQueue(t.Context())
+	service.authQueueMu.Lock()
+	activeDone := service.authQueueDone
+	service.authQueueMu.Unlock()
+	if activeDone != done {
+		t.Fatal("timed-out consumer was replaced before it exited")
+	}
+
+	close(done)
+	service.ensureAuthUpdateQueue(t.Context())
+	service.authQueueMu.Lock()
+	replacementDone := service.authQueueDone
+	service.authQueueMu.Unlock()
+	if replacementDone == nil || replacementDone == done {
+		t.Fatal("exited consumer was not replaced")
+	}
+	if errStop := service.stopAuthUpdateQueue(t.Context()); errStop != nil {
+		t.Fatalf("stop replacement auth update queue: %v", errStop)
+	}
+}
+
+func TestModelSyncStopKeepsStoppingGenerationPublishedUntilWorkersExit(t *testing.T) {
+	canceled := make(chan struct{})
+	var cancelOnce sync.Once
+	oldDone := make(chan struct{})
+	var oldDoneOnce sync.Once
+	releaseOldGeneration := func() {
+		oldDoneOnce.Do(func() { close(oldDone) })
+	}
+	oldQueue := make(chan string, 1)
+	service := &Service{
+		modelSyncCancel: func() {
+			cancelOnce.Do(func() { close(canceled) })
+		},
+		modelSyncDone:  oldDone,
+		modelSyncQueue: oldQueue,
+	}
+
+	stopped := make(chan struct{})
+	go func() {
+		service.stopModelSyncLoop()
+		close(stopped)
+	}()
+	t.Cleanup(func() {
+		releaseOldGeneration()
+		select {
+		case <-stopped:
+		case <-time.After(time.Second):
+			t.Errorf("model sync stop did not finish during test cleanup")
+		}
+		service.stopModelSyncLoop()
+	})
+	select {
+	case <-canceled:
+	case <-time.After(time.Second):
+		t.Fatal("model sync stop did not cancel the active generation")
+	}
+
+	service.startModelSyncLoop(t.Context())
+	service.modelSyncMu.Lock()
+	activeDone := service.modelSyncDone
+	activeQueue := service.modelSyncQueue
+	service.modelSyncMu.Unlock()
+	if activeDone != oldDone || activeQueue != oldQueue {
+		releaseOldGeneration()
+		select {
+		case <-stopped:
+		case <-time.After(time.Second):
+		}
+		t.Fatal("a replacement model sync generation started before the old workers exited")
+	}
+
+	releaseOldGeneration()
+	select {
+	case <-stopped:
+	case <-time.After(time.Second):
+		t.Fatal("model sync stop did not finish after the old workers exited")
+	}
+
+	service.startModelSyncLoop(t.Context())
+	service.modelSyncMu.Lock()
+	replacementDone := service.modelSyncDone
+	replacementQueue := service.modelSyncQueue
+	service.modelSyncMu.Unlock()
+	if replacementDone == nil || replacementDone == oldDone || replacementQueue == nil || replacementQueue == oldQueue {
+		t.Fatal("model sync generation did not restart after the old workers exited")
+	}
+	service.stopModelSyncLoop()
+}
+
+func TestModelSyncStopCancelsChatGPTWebFetchLockWait(t *testing.T) {
+	manager := coreauth.NewManager(nil, nil, nil)
+	service := &Service{
+		cfg:         &config.Config{},
+		coreManager: manager,
+	}
+	authID := "service-model-sync-cancel-web-fetch"
+	if _, errRegister := manager.Register(coreauth.WithSkipPersist(t.Context()), &coreauth.Auth{
+		ID:       authID,
+		Provider: "chatgpt-web",
+		Status:   coreauth.StatusActive,
+		Metadata: map[string]any{
+			"access_token":    "token",
+			"lifecycle_state": coreauth.LifecycleStateActive,
+		},
+	}); errRegister != nil {
+		t.Fatal(errRegister)
+	}
+	t.Cleanup(func() { GlobalModelRegistry().UnregisterClient(authID) })
+
+	unlockFetch := service.lockChatGPTWebModelFetch(authID)
+	service.startModelSyncLoop(t.Context())
+	if !service.enqueueModelSync(authID) {
+		unlockFetch()
+		t.Fatal("model sync task was not accepted")
+	}
+	waitForChatGPTWebModelFetchWaiter(t, service, authID)
+
+	stopped := make(chan struct{})
+	go func() {
+		service.stopModelSyncLoop()
+		close(stopped)
+	}()
+	select {
+	case <-stopped:
+	case <-time.After(time.Second):
+		unlockFetch()
+		select {
+		case <-stopped:
+		case <-time.After(time.Second):
+			t.Fatal("model sync stop remained blocked after the model fetch lock was released")
+		}
+		t.Fatal("model sync stop did not cancel the model fetch lock wait")
+	}
+	unlockFetch()
+}
+
+func TestChatGPTWebDeleteCleanupHonorsCanceledTransitionWait(t *testing.T) {
+	service := &Service{}
+	authID := "service-delete-cleanup-canceled-transition"
+	unlockTransition := service.lockAuthModelTransition(authID)
+	ctx, cancel := context.WithCancel(t.Context())
+	cleanupDone := make(chan struct{})
+	go func() {
+		service.cleanupChatGPTWebModelResourcesAfterDelete(ctx, authID, "")
+		close(cleanupDone)
+	}()
+	waitForAuthModelTransitionWaiter(t, service, authID)
+	cancel()
+	select {
+	case <-cleanupDone:
+	case <-time.After(time.Second):
+		unlockTransition()
+		select {
+		case <-cleanupDone:
+		case <-time.After(time.Second):
+			t.Fatal("delete cleanup remained blocked after the transition lock was released")
+		}
+		t.Fatal("delete cleanup did not honor transition wait cancellation")
+	}
+	unlockTransition()
 }
 
 func TestDeleteCoreAuthCancelsPendingModelSync(t *testing.T) {
@@ -594,6 +1313,7 @@ func TestAuthMaintenanceHookRejectsStaleInstallationAfterModelLockWait(t *testin
 		close(hookDone)
 	}()
 	<-hookStarted
+	waitForAuthModelTransitionWaiter(t, service, authID)
 
 	replacement := oldAuth.Clone()
 	replacement.Provider = "claude"
@@ -647,6 +1367,7 @@ func TestAuthMaintenanceHookRejectsStaleNonChatGPTInstallationAfterTransitionWai
 		close(hookDone)
 	}()
 	<-hookStarted
+	waitForAuthModelTransitionWaiter(t, service, authID)
 
 	replacement := oldAuth.Clone()
 	replacement.Provider = "chatgpt-web"
@@ -677,11 +1398,18 @@ func TestAuthMaintenanceHookRejectsStaleNonChatGPTInstallationAfterTransitionWai
 	}
 }
 
-func TestServiceSyncAuthModelsReReadsProviderAfterTransitionWait(t *testing.T) {
+func TestServiceSyncAuthModelsRequeuesReplacementAfterMutationWait(t *testing.T) {
 	manager := coreauth.NewManager(nil, nil, nil)
 	service := &Service{
 		cfg:         &config.Config{},
 		coreManager: manager,
+	}
+	loadedOldAuth := make(chan *coreauth.Auth, 1)
+	service.modelSyncAuthLoadedObserved = func(auth *coreauth.Auth) {
+		select {
+		case loadedOldAuth <- auth.Clone():
+		default:
+		}
 	}
 	authID := "service-model-sync-provider-transition"
 	t.Cleanup(func() { GlobalModelRegistry().UnregisterClient(authID) })
@@ -695,44 +1423,50 @@ func TestServiceSyncAuthModelsReReadsProviderAfterTransitionWait(t *testing.T) {
 		t.Fatalf("register old auth: %v", err)
 	}
 
-	unlockTransition := service.lockAuthModelTransition(authID)
-	started := make(chan struct{})
-	done := make(chan struct{})
-	go func() {
-		close(started)
-		service.syncAuthModels(context.Background(), authID)
-		close(done)
+	lockedCtx, unlockMutation, errLock := manager.LockAuthMutation(t.Context(), oldAuth)
+	if errLock != nil {
+		t.Fatal(errLock)
+	}
+	mutationLocked := true
+	defer func() {
+		if mutationLocked {
+			unlockMutation()
+		}
 	}()
-	<-started
-
+	service.startModelSyncLoop(t.Context())
+	defer service.stopModelSyncLoop()
+	if !service.enqueueModelSync(authID) {
+		t.Fatal("model sync task was not accepted")
+	}
 	select {
-	case <-done:
-		unlockTransition()
-		t.Fatal("model sync bypassed the provider transition lock")
-	case <-time.After(25 * time.Millisecond):
+	case loaded := <-loadedOldAuth:
+		if loaded.RuntimeInstallationID() != oldAuth.RuntimeInstallationID() {
+			t.Fatalf("model sync loaded installation %q, want old installation %q", loaded.RuntimeInstallationID(), oldAuth.RuntimeInstallationID())
+		}
+	case <-time.After(time.Second):
+		t.Fatal("model sync did not load the old auth before waiting for mutation")
 	}
 
 	replacement := oldAuth.Clone()
 	replacement.Provider = "xai"
-	installed, err := manager.Update(context.Background(), replacement)
+	installed, err := manager.Update(lockedCtx, replacement)
 	if err != nil {
-		unlockTransition()
-		<-done
 		t.Fatalf("install replacement auth: %v", err)
 	}
-	unlockTransition()
+	unlockMutation()
+	mutationLocked = false
 
-	select {
-	case <-done:
-	case <-time.After(5 * time.Second):
-		t.Fatal("model sync did not finish after provider transition")
-	}
-	if provider := registry.GetGlobalRegistry().GetProviderForClient(authID); provider != installed.Provider {
-		t.Fatalf("registered provider = %q, want %q", provider, installed.Provider)
-	}
-	models := registry.GetGlobalRegistry().GetModelsForClient(authID)
-	if len(models) == 0 || !containsRegisteredModel(models, registry.GetXAIModels()[0].ID) {
-		t.Fatalf("provider transition registered stale models: %v", registeredModelIDs(models))
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		provider := registry.GetGlobalRegistry().GetProviderForClient(authID)
+		models := registry.GetGlobalRegistry().GetModelsForClient(authID)
+		if provider == installed.Provider && len(models) > 0 && containsRegisteredModel(models, registry.GetXAIModels()[0].ID) {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("replacement model sync did not converge: provider=%q models=%v", provider, registeredModelIDs(models))
+		}
+		time.Sleep(time.Millisecond)
 	}
 }
 

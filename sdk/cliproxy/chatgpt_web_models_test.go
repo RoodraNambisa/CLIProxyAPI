@@ -1533,7 +1533,7 @@ func TestServiceChatGPTWebDeleteCleanupKeepsReplacementGenerationResources(t *te
 	}
 	GlobalModelRegistry().RegisterClient(auth.ID, chatgptwebauth.Provider, replacementEntry.Models)
 
-	service.cleanupChatGPTWebModelResourcesAfterDelete(auth.ID, removedRuntimeInstanceID)
+	service.cleanupChatGPTWebModelResourcesAfterDelete(t.Context(), auth.ID, removedRuntimeInstanceID)
 
 	cached, exists := service.chatGPTWebModelCatalog.Load(auth.ID)
 	if !exists || cached != replacementEntry {
@@ -1630,7 +1630,7 @@ func TestServiceChatGPTWebDeleteCleanupRemovesStaleGenerationWithoutReplacement(
 	GlobalModelRegistry().RegisterClient(authID, chatgptwebauth.Provider, entry.Models)
 	t.Cleanup(func() { GlobalModelRegistry().UnregisterClient(authID) })
 
-	service.cleanupChatGPTWebModelResourcesAfterDelete(authID, "newer-deleted-generation")
+	service.cleanupChatGPTWebModelResourcesAfterDelete(t.Context(), authID, "newer-deleted-generation")
 
 	if _, exists := service.chatGPTWebModelCatalog.Load(authID); exists {
 		t.Fatal("stale model catalog was retained after auth deletion")

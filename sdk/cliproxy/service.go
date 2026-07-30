@@ -82,8 +82,20 @@ type Service struct {
 	// authUpdates channel for authentication updates.
 	authUpdates chan watcher.AuthUpdate
 
+	// authQueueMu protects the auth update consumer lifecycle.
+	authQueueMu sync.Mutex
+
 	// authQueueStop cancels the auth update queue processing.
 	authQueueStop context.CancelFunc
+
+	// authQueueDone is closed when the auth update consumer exits.
+	authQueueDone chan struct{}
+
+	// authQueueWaitObserved is used by shutdown tests to observe the consumer join.
+	authQueueWaitObserved func()
+
+	// authQueueStoppedObserved is used by shutdown tests to observe a completed join.
+	authQueueStoppedObserved func()
 
 	// modelSyncMu protects the background model sync worker pool state.
 	modelSyncMu sync.Mutex
@@ -110,6 +122,14 @@ type Service struct {
 	// modelSyncOverflow retains deduplicated tasks while modelSyncQueue is full.
 	modelSyncOverflow []string
 
+	// modelSyncMutationLockedObserved is used by concurrency tests to observe
+	// the exact point where model synchronization owns the auth mutation lock.
+	modelSyncMutationLockedObserved func(*coreauth.Auth)
+
+	// authUpdateMutationLockedObserved is used by concurrency tests to observe
+	// the exact point where a watcher update owns the auth mutation lock.
+	authUpdateMutationLockedObserved func(*coreauth.Auth)
+
 	// antigravityModelCapabilities caches per-auth model discovery results.
 	antigravityModelCapabilities sync.Map
 
@@ -121,6 +141,9 @@ type Service struct {
 
 	// chatGPTWebReloginObserved observes re-login scheduling after model state is synchronized.
 	chatGPTWebReloginObserved func(*coreauth.Auth)
+
+	// modelSyncAuthLoadedObserved observes the auth snapshot loaded before mutation serialization.
+	modelSyncAuthLoadedObserved func(*coreauth.Auth)
 
 	// authModelTransitionMu protects per-auth model transition lock lifecycle.
 	authModelTransitionMu sync.Mutex
@@ -268,7 +291,7 @@ type modelSyncTaskState struct {
 }
 
 type authModelTransitionLockEntry struct {
-	mu         sync.Mutex
+	semaphore  chan struct{}
 	references int
 }
 
@@ -305,7 +328,24 @@ func (h authMaintenanceHook) handleAuthChange(ctx context.Context, auth *coreaut
 		}
 		return
 	}
-	unlockTransition := h.service.lockAuthModelTransition(auth.ID)
+	unlockTransition, errTransition := h.service.lockAuthModelTransitionContext(ctx, auth.ID)
+	if errTransition != nil {
+		if h.service.coreManager != nil {
+			if current, ok := h.service.coreManager.CurrentAuthInstallation(auth); ok {
+				if isNativeChatGPTWebAuth(current) {
+					h.service.ensureExecutorsForAuth(current)
+					h.service.syncChatGPTWebAccountInfoRecovery(current)
+					h.service.triggerChatGPTWebRelogin(current)
+				}
+				h.service.enqueueModelSyncTaskForInstallation(
+					current.ID,
+					current.RuntimeInstallationID(),
+					true,
+				)
+			}
+		}
+		return
+	}
 	if h.service.coreManager != nil {
 		current, ok := h.service.coreManager.CurrentAuthInstallation(auth)
 		if !ok {
@@ -355,9 +395,9 @@ func (h authMaintenanceHook) handleAuthChange(ctx context.Context, auth *coreaut
 		unlockTransition()
 		if h.service.coreManager != nil {
 			if preserveTransientState {
-				h.service.coreManager.PruneRegistryModelStates(ctx, auth.ID)
+				h.service.coreManager.PruneRegistryModelStatesIfCurrent(ctx, auth)
 			} else {
-				h.service.coreManager.ReconcileRegistryModelStates(ctx, auth.ID)
+				h.service.coreManager.ReconcileRegistryModelStatesIfCurrent(ctx, auth)
 			}
 			h.service.coreManager.RefreshSchedulerEntry(auth.ID)
 		}
@@ -372,7 +412,7 @@ func (h authMaintenanceHook) handleAuthChange(ctx context.Context, auth *coreaut
 	if nativeChatGPTWeb {
 		h.service.applyChatGPTWebRegistryState(ctx, auth, registryAction)
 	} else if antigravityProviderChanged && h.service.coreManager != nil {
-		h.service.coreManager.ReconcileRegistryModelStates(ctx, auth.ID)
+		h.service.coreManager.ReconcileRegistryModelStatesIfCurrent(ctx, auth)
 		h.service.coreManager.RefreshSchedulerEntry(auth.ID)
 	}
 	h.service.enqueueModelSyncTaskForInstallation(
@@ -2209,15 +2249,31 @@ func (s *Service) ensureAuthUpdateQueue(ctx context.Context) {
 	if s == nil {
 		return
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	s.authQueueMu.Lock()
+	defer s.authQueueMu.Unlock()
 	if s.authUpdates == nil {
 		s.authUpdates = make(chan watcher.AuthUpdate, 256)
 	}
-	if s.authQueueStop != nil {
-		return
+	if s.authQueueDone != nil {
+		select {
+		case <-s.authQueueDone:
+			s.authQueueStop = nil
+			s.authQueueDone = nil
+		default:
+			return
+		}
 	}
 	queueCtx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
 	s.authQueueStop = cancel
-	go s.consumeAuthUpdates(queueCtx)
+	s.authQueueDone = done
+	go func() {
+		defer close(done)
+		s.consumeAuthUpdates(queueCtx)
+	}()
 }
 
 func (s *Service) consumeAuthUpdates(ctx context.Context) {
@@ -2234,7 +2290,12 @@ func (s *Service) consumeAuthUpdates(ctx context.Context) {
 		labelDrain:
 			for {
 				select {
-				case nextUpdate := <-s.authUpdates:
+				case <-ctx.Done():
+					return
+				case nextUpdate, okNext := <-s.authUpdates:
+					if !okNext {
+						return
+					}
 					s.handleAuthUpdate(ctx, nextUpdate)
 				default:
 					break labelDrain
@@ -2341,7 +2402,7 @@ func (s *Service) handleAuthUpdate(ctx context.Context, update watcher.AuthUpdat
 			}
 			s.cancelModelSyncTaskIfEpoch(id, modelSyncEpoch)
 			executorhelps.CloseProxyTransportCachesForAuth(id)
-			s.cleanupChatGPTWebModelResourcesAfterDelete(id, current.RuntimeInstanceID())
+			s.cleanupChatGPTWebModelResourcesAfterDelete(ctx, id, current.RuntimeInstanceID())
 			s.removeUsageStatisticsForAuthIndexes(indexes, "auth delete")
 			if s.reconcileUsageStatistics("auth delete") > 0 {
 				s.persistUsageStatistics("auth-delete-reconcile")
@@ -2396,7 +2457,7 @@ func (s *Service) reconcileChatGPTWebDependencies(ctx context.Context, reason st
 	for _, id := range deletedIDs {
 		s.cancelModelSyncTaskIfEpoch(id, modelSyncEpochs[id])
 		executorhelps.CloseProxyTransportCachesForAuth(id)
-		s.cleanupChatGPTWebModelResourcesAfterDelete(id, "")
+		s.cleanupChatGPTWebModelResourcesAfterDelete(ctx, id, "")
 		if index := strings.TrimSpace(indexesByID[id]); index != "" {
 			indexes = append(indexes, index)
 		}
@@ -2503,6 +2564,9 @@ func (s *Service) applyCoreAuthAddOrUpdate(ctx context.Context, auth *coreauth.A
 		log.Errorf("failed to lock auth update %s: %v", auth.ID, errMutationLock)
 		return
 	}
+	if s.authUpdateMutationLockedObserved != nil {
+		s.authUpdateMutationLockedObserved(auth.Clone())
+	}
 	mutationLocked := true
 	defer func() {
 		if mutationLocked {
@@ -2513,7 +2577,12 @@ func (s *Service) applyCoreAuthAddOrUpdate(ctx context.Context, auth *coreauth.A
 	unlockPath := func() {}
 	pathLocked := false
 	if path != "" {
-		unlockPath = authfileguard.Lock(path)
+		var errPathLock error
+		unlockPath, errPathLock = authfileguard.LockContext(ctx, path)
+		if errPathLock != nil {
+			log.Errorf("failed to lock auth file update %s: %v", auth.ID, errPathLock)
+			return
+		}
 		pathLocked = true
 		ctx = coreauth.WithSkipPersist(ctx)
 	}
@@ -2526,7 +2595,11 @@ func (s *Service) applyCoreAuthAddOrUpdate(ctx context.Context, auth *coreauth.A
 		log.Debugf("ignoring stale auth file update for %s", auth.ID)
 		return
 	}
-	unlockTransition := s.lockAuthModelTransition(auth.ID)
+	unlockTransition, errTransition := s.lockAuthModelTransitionContext(ctx, auth.ID)
+	if errTransition != nil {
+		log.Errorf("failed to lock auth model transition %s: %v", auth.ID, errTransition)
+		return
+	}
 	transitionLocked := true
 	defer func() {
 		if transitionLocked {
@@ -2659,7 +2732,7 @@ func (s *Service) deleteCoreAuth(ctx context.Context, id string) error {
 	s.cancelModelSyncTaskIfEpoch(id, modelSyncEpoch)
 	executorhelps.CloseProxyTransportCachesForAuth(id)
 	s.antigravityModelCapabilities.Delete(id)
-	s.cleanupChatGPTWebModelResourcesAfterDelete(id, removedRuntimeInstanceID)
+	s.cleanupChatGPTWebModelResourcesAfterDelete(ctx, id, removedRuntimeInstanceID)
 	return nil
 }
 
@@ -2678,7 +2751,7 @@ func (s *Service) applyCoreAuthRemovalWithReason(ctx context.Context, id string,
 	if !ok || existing == nil {
 		executorhelps.CloseProxyTransportCachesForAuth(id)
 		s.antigravityModelCapabilities.Delete(id)
-		s.cleanupChatGPTWebModelResourcesAfterDelete(id, "")
+		s.cleanupChatGPTWebModelResourcesAfterDelete(ctx, id, "")
 		return true
 	}
 
@@ -3057,11 +3130,23 @@ func (s *Service) completeModelSyncTask(
 }
 
 func (s *Service) lockAuthModelTransition(authID string) func() {
+	unlock, err := s.lockAuthModelTransitionContext(context.Background(), authID)
+	if err != nil || unlock == nil {
+		return func() {}
+	}
+	return unlock
+}
+
+func (s *Service) lockAuthModelTransitionContext(ctx context.Context, authID string) (func(), error) {
+	if s == nil {
+		return func() {}, nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	authID = strings.TrimSpace(authID)
 	if authID == "" {
-		var lock sync.Mutex
-		lock.Lock()
-		return lock.Unlock
+		return func() {}, nil
 	}
 	s.authModelTransitionMu.Lock()
 	if s.authModelTransitionLocks == nil {
@@ -3069,22 +3154,78 @@ func (s *Service) lockAuthModelTransition(authID string) func() {
 	}
 	entry := s.authModelTransitionLocks[authID]
 	if entry == nil {
-		entry = &authModelTransitionLockEntry{}
+		entry = &authModelTransitionLockEntry{semaphore: make(chan struct{}, 1)}
+		entry.semaphore <- struct{}{}
 		s.authModelTransitionLocks[authID] = entry
 	}
 	entry.references++
 	s.authModelTransitionMu.Unlock()
 
-	entry.mu.Lock()
-	return func() {
-		entry.mu.Unlock()
-		s.authModelTransitionMu.Lock()
-		entry.references--
-		if entry.references == 0 && s.authModelTransitionLocks[authID] == entry {
-			delete(s.authModelTransitionLocks, authID)
-		}
-		s.authModelTransitionMu.Unlock()
+	select {
+	case <-ctx.Done():
+		s.releaseAuthModelTransitionReference(authID, entry)
+		return nil, ctx.Err()
+	case <-entry.semaphore:
 	}
+	if errContext := ctx.Err(); errContext != nil {
+		entry.semaphore <- struct{}{}
+		s.releaseAuthModelTransitionReference(authID, entry)
+		return nil, errContext
+	}
+
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			entry.semaphore <- struct{}{}
+			s.releaseAuthModelTransitionReference(authID, entry)
+		})
+	}, nil
+}
+
+func (s *Service) releaseAuthModelTransitionReference(authID string, entry *authModelTransitionLockEntry) {
+	if s == nil || entry == nil {
+		return
+	}
+	s.authModelTransitionMu.Lock()
+	defer s.authModelTransitionMu.Unlock()
+	entry.references--
+	if entry.references == 0 && s.authModelTransitionLocks[authID] == entry {
+		delete(s.authModelTransitionLocks, authID)
+	}
+}
+
+func (s *Service) stopAuthUpdateQueue(ctx context.Context) error {
+	if s == nil {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	s.authQueueMu.Lock()
+	cancel := s.authQueueStop
+	done := s.authQueueDone
+	if cancel != nil {
+		cancel()
+	}
+	s.authQueueMu.Unlock()
+	if done == nil {
+		return nil
+	}
+	if s.authQueueWaitObserved != nil {
+		s.authQueueWaitObserved()
+	}
+	select {
+	case <-done:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	s.authQueueMu.Lock()
+	if s.authQueueDone == done {
+		s.authQueueStop = nil
+		s.authQueueDone = nil
+	}
+	s.authQueueMu.Unlock()
+	return nil
 }
 
 func (s *Service) syncAuthModels(ctx context.Context, authID string) {
@@ -3098,40 +3239,88 @@ func (s *Service) syncAuthModels(ctx context.Context, authID string) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	unlockTransition := s.lockAuthModelTransition(authID)
 	current, ok := s.coreManager.GetByID(authID)
 	if !ok || current == nil {
+		unlockTransition, errTransition := s.lockAuthModelTransitionContext(ctx, authID)
+		if errTransition != nil {
+			return
+		}
+		if replacement, exists := s.coreManager.GetByID(authID); exists && replacement != nil {
+			unlockTransition()
+			s.enqueueModelSyncTaskForInstallation(
+				replacement.ID,
+				replacement.RuntimeInstallationID(),
+				true,
+			)
+			return
+		}
 		s.antigravityModelCapabilities.Delete(authID)
 		s.chatGPTWebModelCatalog.Delete(authID)
 		GlobalModelRegistry().UnregisterClient(authID)
 		unlockTransition()
 		return
 	}
-	provider := strings.ToLower(strings.TrimSpace(current.Provider))
-	nativeChatGPTWeb := isNativeChatGPTWebAuth(current)
-	if provider != "antigravity" || current.Disabled || current.Status == coreauth.StatusDisabled {
-		s.antigravityModelCapabilities.Delete(authID)
+	if s.modelSyncAuthLoadedObserved != nil {
+		s.modelSyncAuthLoadedObserved(current.Clone())
 	}
-	if !nativeChatGPTWeb {
-		s.chatGPTWebModelCatalog.Delete(authID)
-	}
-	if nativeChatGPTWeb {
-		unlockTransition()
+	if isNativeChatGPTWebAuth(current) {
 		s.syncChatGPTWebModels(ctx, current)
 		return
 	}
+
+	lockedCtx, unlockMutation, errMutation := s.coreManager.LockAuthMutation(ctx, current)
+	if errMutation != nil {
+		return
+	}
+	if s.modelSyncMutationLockedObserved != nil {
+		s.modelSyncMutationLockedObserved(current.Clone())
+	}
+	unlockTransition, errTransition := s.lockAuthModelTransitionContext(lockedCtx, authID)
+	if errTransition != nil {
+		unlockMutation()
+		return
+	}
+	current, ok = s.coreManager.CurrentAuthInstallation(current)
+	if !ok {
+		replacement, exists := s.coreManager.GetByID(authID)
+		unlockTransition()
+		unlockMutation()
+		if exists && replacement != nil {
+			s.enqueueModelSyncTaskForInstallation(
+				replacement.ID,
+				replacement.RuntimeInstallationID(),
+				true,
+			)
+		}
+		return
+	}
+	provider := strings.ToLower(strings.TrimSpace(current.Provider))
+	if isNativeChatGPTWebAuth(current) {
+		unlockTransition()
+		unlockMutation()
+		s.syncChatGPTWebModels(ctx, current)
+		return
+	}
+	if provider != "antigravity" || current.Disabled || current.Status == coreauth.StatusDisabled {
+		s.antigravityModelCapabilities.Delete(authID)
+	}
+	s.chatGPTWebModelCatalog.Delete(authID)
 	preserveTransientState := provider != "antigravity" &&
 		registry.GetGlobalRegistry().GetProviderForClient(current.ID) != "" &&
 		authHasTransientState(current)
 	if preserveTransientState {
 		s.registerModelsForAuthPreservingState(current)
-		s.coreManager.PruneRegistryModelStates(ctx, current.ID)
 	} else {
 		s.registerModelsForAuth(current)
-		s.coreManager.ReconcileRegistryModelStates(ctx, current.ID)
+	}
+	if preserveTransientState {
+		s.coreManager.PruneRegistryModelStatesIfCurrent(lockedCtx, current)
+	} else {
+		s.coreManager.ReconcileRegistryModelStatesIfCurrent(lockedCtx, current)
 	}
 	s.coreManager.RefreshSchedulerEntry(current.ID)
 	unlockTransition()
+	unlockMutation()
 
 	if provider != "antigravity" || current.Disabled || current.Status == coreauth.StatusDisabled {
 		return
@@ -3141,10 +3330,19 @@ func (s *Service) syncAuthModels(ctx context.Context, authID string) {
 	if !okFetch {
 		return
 	}
-	unlockTransition = s.lockAuthModelTransition(authID)
+	lockedCtx, unlockMutation, errMutation = s.coreManager.LockAuthMutation(ctx, source)
+	if errMutation != nil {
+		return
+	}
+	unlockTransition, errTransition = s.lockAuthModelTransitionContext(lockedCtx, authID)
+	if errTransition != nil {
+		unlockMutation()
+		return
+	}
 	latest, currentSource := s.currentAuthForAntigravityCapability(source)
 	if !currentSource {
 		unlockTransition()
+		unlockMutation()
 		return
 	}
 	entry := &antigravityModelCapabilityCacheEntry{
@@ -3153,29 +3351,10 @@ func (s *Service) syncAuthModels(ctx context.Context, authID string) {
 	}
 	s.antigravityModelCapabilities.Store(latest.ID, entry)
 	s.registerModelsForAuth(latest)
-	s.coreManager.ReconcileRegistryModelStates(ctx, latest.ID)
+	s.coreManager.ReconcileRegistryModelStatesIfCurrent(lockedCtx, latest)
 	s.coreManager.RefreshSchedulerEntry(latest.ID)
-
-	finalAuth, stillCurrent := s.currentAuthForAntigravityCapability(latest)
-	if stillCurrent {
-		unlockTransition()
-		return
-	}
-	s.antigravityModelCapabilities.CompareAndDelete(latest.ID, entry)
-	if finalAuth == nil {
-		GlobalModelRegistry().UnregisterClient(latest.ID)
-		unlockTransition()
-		return
-	}
-	s.registerModelsForAuth(finalAuth)
-	s.coreManager.ReconcileRegistryModelStates(ctx, finalAuth.ID)
-	s.coreManager.RefreshSchedulerEntry(finalAuth.ID)
-	requeue := strings.EqualFold(strings.TrimSpace(finalAuth.Provider), "antigravity") &&
-		!finalAuth.Disabled && finalAuth.Status != coreauth.StatusDisabled
 	unlockTransition()
-	if requeue {
-		s.enqueueModelSync(finalAuth.ID)
-	}
+	unlockMutation()
 }
 
 func (s *Service) currentAuthForAntigravityCapability(source *coreauth.Auth) (*coreauth.Auth, bool) {
@@ -3268,6 +3447,18 @@ func (s *Service) startModelSyncLoop(parent context.Context) {
 		return
 	}
 	s.modelSyncMu.Lock()
+	if s.modelSyncDone != nil {
+		select {
+		case <-s.modelSyncDone:
+			if s.modelSyncCancel != nil {
+				s.modelSyncCancel()
+			}
+			s.modelSyncCancel = nil
+			s.modelSyncDone = nil
+			s.modelSyncQueue = nil
+		default:
+		}
+	}
 	if s.modelSyncCancel != nil {
 		s.modelSyncMu.Unlock()
 		return
@@ -3337,10 +3528,9 @@ func (s *Service) stopModelSyncLoop() {
 	s.modelSyncMu.Lock()
 	cancel := s.modelSyncCancel
 	done := s.modelSyncDone
-	s.modelSyncGeneration++
-	s.modelSyncCancel = nil
-	s.modelSyncDone = nil
-	s.modelSyncQueue = nil
+	if cancel != nil {
+		s.modelSyncGeneration++
+	}
 	s.modelSyncMu.Unlock()
 	if cancel != nil {
 		cancel()
@@ -3348,6 +3538,13 @@ func (s *Service) stopModelSyncLoop() {
 	if done != nil {
 		<-done
 	}
+	s.modelSyncMu.Lock()
+	if s.modelSyncDone == done {
+		s.modelSyncCancel = nil
+		s.modelSyncDone = nil
+		s.modelSyncQueue = nil
+	}
+	s.modelSyncMu.Unlock()
 }
 
 func openAICompatInfoFromAuth(a *coreauth.Auth) (providerKey string, compatName string, ok bool) {
@@ -3953,9 +4150,14 @@ func (s *Service) runShutdown() {
 			shutdownErr = errors.Join(shutdownErr, errStop)
 		}
 	}
-	if s.authQueueStop != nil {
-		s.authQueueStop()
-		s.authQueueStop = nil
+	authQueueShutdownCtx, cancelAuthQueueShutdown := context.WithTimeout(context.Background(), 30*time.Second)
+	errStopAuthQueue := s.stopAuthUpdateQueue(authQueueShutdownCtx)
+	cancelAuthQueueShutdown()
+	if errStopAuthQueue != nil {
+		log.WithError(errStopAuthQueue).Error("failed to stop authentication update queue")
+		shutdownErr = errors.Join(shutdownErr, errStopAuthQueue)
+	} else if s.authQueueStoppedObserved != nil {
+		s.authQueueStoppedObserved()
 	}
 	s.stopModelSyncLoop()
 	s.stopAuthMaintenance()
@@ -3971,7 +4173,8 @@ func (s *Service) runShutdown() {
 		shutdownErr = errors.Join(shutdownErr, errShutdownPprof)
 	}
 	if s.coreManager != nil {
-		if errClose := s.coreManager.CloseExecutors(); errClose != nil {
+		errClose := s.coreManager.CloseExecutors()
+		if errClose != nil {
 			log.Errorf("failed to close provider executors: %v", errClose)
 			shutdownErr = errors.Join(shutdownErr, errClose)
 		}

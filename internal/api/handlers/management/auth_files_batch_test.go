@@ -2,6 +2,7 @@ package management
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"mime/multipart"
@@ -11,11 +12,63 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 )
+
+func TestUploadAuthFileOperationLockWaitHonorsCancellation(t *testing.T) {
+	authDir := t.TempDir()
+	manager := coreauth.NewManager(nil, nil, nil)
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, manager)
+	root, _, resolvedAuthDir, errRoot := h.openManagedAuthRootSnapshot()
+	if errRoot != nil {
+		t.Fatal(errRoot)
+	}
+	if errClose := root.Close(); errClose != nil {
+		t.Fatal(errClose)
+	}
+	targetPath := filepath.Join(resolvedAuthDir, "blocked.json")
+	unlockOperation, errLock := lockManagedAuthFileOperationContext(t.Context(), targetPath)
+	if errLock != nil {
+		t.Fatal(errLock)
+	}
+	defer unlockOperation()
+
+	requestCtx, cancelRequest := context.WithCancel(t.Context())
+	defer cancelRequest()
+	done := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		recorder := httptest.NewRecorder()
+		ginContext, _ := gin.CreateTestContext(recorder)
+		request := httptest.NewRequest(
+			http.MethodPost,
+			"/v0/management/auth-files?name=blocked.json",
+			bytes.NewBufferString(`{"type":"codex","email":"blocked@example.com"}`),
+		).WithContext(requestCtx)
+		request.Header.Set("Content-Type", "application/json")
+		ginContext.Request = request
+		h.UploadAuthFile(ginContext)
+		done <- recorder
+	}()
+
+	select {
+	case recorder := <-done:
+		t.Fatalf("upload returned while the per-file operation lock was held: status=%d body=%s", recorder.Code, recorder.Body.String())
+	case <-time.After(20 * time.Millisecond):
+	}
+	cancelRequest()
+	select {
+	case recorder := <-done:
+		if recorder.Code != http.StatusRequestTimeout {
+			t.Fatalf("status = %d, want %d; body=%s", recorder.Code, http.StatusRequestTimeout, recorder.Body.String())
+		}
+	case <-time.After(time.Second):
+		t.Fatal("upload did not leave the per-file operation lock wait after cancellation")
+	}
+}
 
 func TestUploadAuthFile_BatchMultipart(t *testing.T) {
 	t.Setenv("MANAGEMENT_PASSWORD", "")
@@ -351,7 +404,7 @@ func TestWriteAuthFileSafelyRechecksChatGPTWebCredentialUnderTargetLock(t *testi
 		t.Fatal(errWrite)
 	}
 
-	errWrite := writeAuthFileSafely(root, name, []byte(`{"type":"codex","email":"replacement@example.com"}`))
+	errWrite := writeAuthFileSafely(t.Context(), root, name, []byte(`{"type":"codex","email":"replacement@example.com"}`))
 	if !errors.Is(errWrite, errChatGPTWebAuthUpload) {
 		t.Fatalf("write error = %v, want ChatGPT Web upload rejection", errWrite)
 	}
@@ -375,7 +428,7 @@ func TestWriteAuthFileSafelyRechecksRetainedCodexUnderTargetLock(t *testing.T) {
 		t.Fatal(errWrite)
 	}
 
-	errWrite := writeAuthFileSafely(root, name, []byte(`{"type":"codex","email":"replacement@example.com"}`))
+	errWrite := writeAuthFileSafely(t.Context(), root, name, []byte(`{"type":"codex","email":"replacement@example.com"}`))
 	if !errors.Is(errWrite, errCodexAuthRetained) {
 		t.Fatalf("write error = %v, want retained Codex rejection", errWrite)
 	}

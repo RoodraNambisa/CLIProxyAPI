@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net/http"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -13,7 +14,9 @@ import (
 	chatgptwebauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/chatgptweb"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/proxypool"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 )
 
 type fakeChatGPTWebAuthService struct {
@@ -27,6 +30,58 @@ type fakeChatGPTWebAuthService struct {
 
 type chatGPTWebLeaseResolver struct {
 	active atomic.Int32
+}
+
+type linkedCodexRuntimeExecutor struct {
+	refreshCalls atomic.Int32
+}
+
+func (*linkedCodexRuntimeExecutor) Identifier() string { return "codex" }
+
+func (*linkedCodexRuntimeExecutor) Execute(context.Context, *cliproxyauth.Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	return cliproxyexecutor.Response{}, errors.New("unexpected codex execution")
+}
+
+func (*linkedCodexRuntimeExecutor) ExecuteStream(context.Context, *cliproxyauth.Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
+	return nil, errors.New("unexpected codex stream execution")
+}
+
+func (executor *linkedCodexRuntimeExecutor) Refresh(_ context.Context, auth *cliproxyauth.Auth) (*cliproxyauth.Auth, error) {
+	executor.refreshCalls.Add(1)
+	updated := auth.Clone()
+	updated.Metadata["access_token"] = "source-new"
+	updated.Metadata["expired"] = time.Now().Add(time.Hour).UTC().Format(time.RFC3339)
+	return updated, nil
+}
+
+func (*linkedCodexRuntimeExecutor) CountTokens(context.Context, *cliproxyauth.Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	return cliproxyexecutor.Response{}, errors.New("unexpected codex token count")
+}
+
+func (*linkedCodexRuntimeExecutor) HttpRequest(context.Context, *cliproxyauth.Auth, *http.Request) (*http.Response, error) {
+	return nil, errors.New("unexpected codex HTTP request")
+}
+
+type linkedChatGPTWebRuntimeExecutor struct {
+	*ChatGPTWebExecutor
+	unauthorizedOnce bool
+	executeCalls     atomic.Int32
+}
+
+func (executor *linkedChatGPTWebRuntimeExecutor) Execute(_ context.Context, auth *cliproxyauth.Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	call := executor.executeCalls.Add(1)
+	if executor.unauthorizedOnce && call == 1 {
+		return cliproxyexecutor.Response{}, &cliproxyauth.Error{
+			Code:       "unauthorized",
+			Message:    "access token expired",
+			HTTPStatus: http.StatusUnauthorized,
+		}
+	}
+	credential, errCredential := chatgptwebauth.ParseCredential(auth.Metadata)
+	if errCredential != nil {
+		return cliproxyexecutor.Response{}, errCredential
+	}
+	return cliproxyexecutor.Response{Payload: []byte(credential.AccessToken)}, nil
 }
 
 func (resolver *chatGPTWebLeaseResolver) Resolve(context.Context, *cliproxyauth.Auth) (cliproxyauth.ResolvedProxy, error) {
@@ -251,6 +306,154 @@ func TestChatGPTWebExecutorPersistsMissingCodexSourceAsReauthRequired(t *testing
 	if refreshed.LifecycleState != chatgptwebauth.LifecycleReauthRequired || refreshed.LifecycleReason != "source_auth_missing" {
 		t.Fatalf("credential state = %q/%q", refreshed.LifecycleState, refreshed.LifecycleReason)
 	}
+}
+
+func TestChatGPTWebExecutorLinkedCodexRequestPreparationPreservesRefreshLocks(t *testing.T) {
+	manager, codexExecutor, webExecutor, web, model := newLinkedChatGPTWebRuntime(t, true, false)
+
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	response, errExecute := manager.Execute(
+		ctx,
+		[]string{chatgptwebauth.Provider},
+		cliproxyexecutor.Request{Model: model},
+		cliproxyexecutor.Options{},
+	)
+	if errExecute != nil {
+		t.Fatal(errExecute)
+	}
+	if got := string(response.Payload); got != "source-new" {
+		t.Fatalf("response token = %q, want source-new", got)
+	}
+	if got := codexExecutor.refreshCalls.Load(); got != 1 {
+		t.Fatalf("codex refresh calls = %d, want 1", got)
+	}
+	if got := webExecutor.executeCalls.Load(); got != 1 {
+		t.Fatalf("web execute calls = %d, want 1", got)
+	}
+	current, ok := manager.GetByID(web.ID)
+	if !ok || current == nil || current.Metadata["access_token"] != "source-new" {
+		t.Fatalf("current Web credential = %#v, want refreshed source token", current)
+	}
+}
+
+func TestChatGPTWebExecutorLinkedCodexUnauthorizedRefreshPreservesRefreshLocks(t *testing.T) {
+	manager, codexExecutor, webExecutor, _, model := newLinkedChatGPTWebRuntime(t, false, true)
+
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	response, errExecute := manager.Execute(
+		ctx,
+		[]string{chatgptwebauth.Provider},
+		cliproxyexecutor.Request{Model: model},
+		cliproxyexecutor.Options{},
+	)
+	if errExecute != nil {
+		t.Fatal(errExecute)
+	}
+	if got := string(response.Payload); got != "source-new" {
+		t.Fatalf("response token = %q, want source-new", got)
+	}
+	if got := codexExecutor.refreshCalls.Load(); got != 1 {
+		t.Fatalf("codex refresh calls = %d, want 1", got)
+	}
+	if got := webExecutor.executeCalls.Load(); got != 2 {
+		t.Fatalf("web execute calls = %d, want 2", got)
+	}
+}
+
+func TestChatGPTWebExecutorLinkedCodexBackgroundRefreshPreservesRefreshLocks(t *testing.T) {
+	manager, codexExecutor, _, web, _ := newLinkedChatGPTWebRuntime(t, true, false)
+	manager.StartAutoRefresh(t.Context(), 5*time.Millisecond)
+	t.Cleanup(manager.StopAutoRefresh)
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		current, ok := manager.GetByID(web.ID)
+		if ok && current != nil && current.Metadata["access_token"] == "source-new" {
+			if got := codexExecutor.refreshCalls.Load(); got != 1 {
+				t.Fatalf("codex refresh calls = %d, want 1", got)
+			}
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	current, _ := manager.GetByID(web.ID)
+	t.Fatalf("background refresh did not update linked Web credential: %#v", current)
+}
+
+func newLinkedChatGPTWebRuntime(
+	t *testing.T,
+	expired bool,
+	unauthorizedOnce bool,
+) (*cliproxyauth.Manager, *linkedCodexRuntimeExecutor, *linkedChatGPTWebRuntimeExecutor, *cliproxyauth.Auth, string) {
+	t.Helper()
+	manager := cliproxyauth.NewManager(nil, &cliproxyauth.FillFirstSelector{}, nil)
+	codexExecutor := &linkedCodexRuntimeExecutor{}
+	webExecutor := &linkedChatGPTWebRuntimeExecutor{
+		ChatGPTWebExecutor: NewChatGPTWebExecutor(&config.Config{}, manager),
+		unauthorizedOnce:   unauthorizedOnce,
+	}
+	manager.RegisterExecutor(codexExecutor)
+	manager.RegisterExecutor(webExecutor)
+	t.Cleanup(func() {
+		if errClose := manager.CloseExecutors(); errClose != nil {
+			t.Errorf("close executors: %v", errClose)
+		}
+	})
+
+	source, errRegister := manager.Register(cliproxyauth.WithSkipPersist(t.Context()), &cliproxyauth.Auth{
+		ID:       "linked-codex-source.json",
+		FileName: "linked-codex-source.json",
+		Provider: "codex",
+		Status:   cliproxyauth.StatusActive,
+		Metadata: map[string]any{
+			"type":           "codex",
+			"credential_uid": "linked-source-uid",
+			"account_id":     "linked-account",
+			"user_id":        "linked-user",
+			"email":          "linked@example.com",
+			"access_token":   "source-old",
+			"expired":        time.Now().Add(time.Hour).UTC().Format(time.RFC3339),
+		},
+	})
+	if errRegister != nil {
+		t.Fatal(errRegister)
+	}
+	identitySource := source.Clone()
+	identitySource.Provider = chatgptwebauth.Provider
+	expiresAt := time.Now().Add(time.Hour)
+	if expired {
+		expiresAt = time.Now().Add(-time.Minute)
+	}
+	web, errRegister := manager.Register(cliproxyauth.WithSkipPersist(t.Context()), &cliproxyauth.Auth{
+		ID:       "linked-chatgpt-web.json",
+		FileName: "linked-chatgpt-web.json",
+		Provider: chatgptwebauth.Provider,
+		Status:   cliproxyauth.StatusActive,
+		Metadata: map[string]any{
+			"type":                  chatgptwebauth.Provider,
+			"email":                 "linked@example.com",
+			"access_token":          "source-old",
+			"expired":               expiresAt.UTC().Format(time.RFC3339),
+			"refresh_strategy":      string(chatgptwebauth.RefreshStrategyCodexSource),
+			"source_auth_id":        source.ID,
+			"source_credential_uid": "linked-source-uid",
+			"source_identity":       cliproxyauth.ChatGPTWebCredentialReferenceValue(identitySource),
+			"lifecycle_state":       cliproxyauth.LifecycleStateActive,
+		},
+	})
+	if errRegister != nil {
+		t.Fatal(errRegister)
+	}
+	model := "linked-chatgpt-web-model"
+	registry.GetGlobalRegistry().RegisterClient(
+		web.ID,
+		web.Provider,
+		[]*registry.ModelInfo{{ID: model}},
+	)
+	t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(web.ID) })
+	return manager, codexExecutor, webExecutor, web, model
 }
 
 func TestChatGPTWebExecutorRefreshUsesStableLegacyRuntimeIdentity(t *testing.T) {
@@ -632,6 +835,69 @@ func TestChatGPTWebExecutorRefreshSingleflightClonesCredential(t *testing.T) {
 	}
 }
 
+func TestChatGPTWebExecutorRefreshToCompletionOutlivesCallerCancellation(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseRefresh := func() {
+		releaseOnce.Do(func() { close(release) })
+	}
+	t.Cleanup(releaseRefresh)
+
+	fake := &fakeChatGPTWebAuthService{}
+	fake.refreshFn = func(_ context.Context, credential chatgptwebauth.Credential, _ string) (*chatgptwebauth.Credential, error) {
+		close(started)
+		<-release
+		credential.AccessToken = "refreshed-access-token"
+		credential.RefreshToken = "rotated-refresh-token"
+		return &credential, nil
+	}
+	executor := NewChatGPTWebExecutor(&config.Config{}, nil)
+	executor.authService = fake
+	t.Cleanup(func() { _ = executor.Close() })
+
+	ctx, cancel := context.WithCancel(t.Context())
+	type refreshResult struct {
+		auth *cliproxyauth.Auth
+		err  error
+	}
+	result := make(chan refreshResult, 1)
+	go func() {
+		updated, errRefresh := executor.RefreshToCompletion(ctx, chatGPTWebTestAuth("durable-refresh"))
+		result <- refreshResult{auth: updated, err: errRefresh}
+	}()
+
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("durable refresh did not start")
+	}
+	cancel()
+	select {
+	case early := <-result:
+		releaseRefresh()
+		t.Fatalf("durable refresh returned before provider completion: %#v", early)
+	case <-time.After(25 * time.Millisecond):
+	}
+	releaseRefresh()
+
+	select {
+	case completed := <-result:
+		if completed.err != nil || completed.auth == nil {
+			t.Fatalf("RefreshToCompletion() = (%v, %v)", completed.auth, completed.err)
+		}
+		credential, errCredential := chatgptwebauth.ParseCredential(completed.auth.Metadata)
+		if errCredential != nil {
+			t.Fatal(errCredential)
+		}
+		if credential.AccessToken != "refreshed-access-token" || credential.RefreshToken != "rotated-refresh-token" {
+			t.Fatalf("durable credential = access %q refresh %q", credential.AccessToken, credential.RefreshToken)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("durable refresh did not return after provider completion")
+	}
+}
+
 func TestChatGPTWebExecutorRefreshSingleflightSpansInstallationUpdates(t *testing.T) {
 	manager := cliproxyauth.NewManager(nil, nil, nil)
 	auth := chatGPTWebTestAuth("refresh-installation")
@@ -661,7 +927,7 @@ func TestChatGPTWebExecutorRefreshSingleflightSpansInstallationUpdates(t *testin
 	}
 	results := make(chan refreshResult, 2)
 	go func() {
-		updated, errRefresh, _ := executor.refreshCredential(t.Context(), first)
+		updated, errRefresh, _ := executor.refreshCredential(t.Context(), first, false)
 		results <- refreshResult{auth: updated, err: errRefresh}
 	}()
 	<-started
@@ -676,7 +942,7 @@ func TestChatGPTWebExecutorRefreshSingleflightSpansInstallationUpdates(t *testin
 			first.RuntimeInstanceID(), second.RuntimeInstanceID(), first.RuntimeInstallationID(), second.RuntimeInstallationID())
 	}
 	go func() {
-		updated, errRefresh, _ := executor.refreshCredential(t.Context(), second)
+		updated, errRefresh, _ := executor.refreshCredential(t.Context(), second, false)
 		results <- refreshResult{auth: updated, err: errRefresh}
 	}()
 	time.Sleep(20 * time.Millisecond)

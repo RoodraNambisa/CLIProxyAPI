@@ -31,6 +31,34 @@ type attemptInfo struct {
 	lastActivity time.Time // track last activity for cleanup
 }
 
+type managementContextMutex struct {
+	once      sync.Once
+	semaphore chan struct{}
+}
+
+func (lock *managementContextMutex) lock(ctx context.Context) (func(), error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	lock.once.Do(func() {
+		lock.semaphore = make(chan struct{}, 1)
+		lock.semaphore <- struct{}{}
+	})
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-lock.semaphore:
+	}
+	if errContext := ctx.Err(); errContext != nil {
+		lock.semaphore <- struct{}{}
+		return nil, errContext
+	}
+	var unlockOnce sync.Once
+	return func() {
+		unlockOnce.Do(func() { lock.semaphore <- struct{}{} })
+	}, nil
+}
+
 // attemptCleanupInterval controls how often stale IP entries are purged
 const attemptCleanupInterval = 1 * time.Hour
 
@@ -62,7 +90,7 @@ type Handler struct {
 	chatGPTWebMutationTasks *chatGPTWebMutationTaskManager
 	agentIdentityTasks      *codexAgentIdentityTaskManager
 	agentIdentityBaseURL    string
-	chatGPTWebDependencyMu  sync.Mutex
+	chatGPTWebDependencyMu  managementContextMutex
 	cleanupCancel           context.CancelFunc
 	cleanupWG               sync.WaitGroup
 	cleanupStopOnce         sync.Once
