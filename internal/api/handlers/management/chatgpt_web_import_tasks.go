@@ -250,6 +250,7 @@ func (h *Handler) executeChatGPTWebImport(ctx context.Context, input chatGPTWebI
 		result.HTTPStatus = http.StatusBadRequest
 		return result
 	}
+	sessionProbeFallback := h.chatGPTWebSessionImportProbeFallbackEnabled(credential, time.Now())
 	protectedRefresh := credential.RefreshStrategy == chatgptwebauth.RefreshStrategyWebOAuthRT ||
 		credential.RefreshStrategy == chatgptwebauth.RefreshStrategyChatGPTSession
 	commitStarted := false
@@ -403,6 +404,37 @@ func (h *Handler) executeChatGPTWebImport(ctx context.Context, input chatGPTWebI
 		unchanged bool
 	)
 	_, errProbe := executor.FetchModels(ctx, probe)
+	if errProbe != nil && sessionProbeFallback && chatGPTWebProbeRejectsCredential(errProbe) {
+		retryCredential := *credential
+		retryCredential.AccessToken = ""
+		retryCredential.Expired = ""
+		refreshed, errRefresh := executor.NormalizeImportedCredential(ctx, &retryCredential, resolved.EffectiveProxyURL())
+		if errRefresh != nil {
+			return failedChatGPTWebMutationResult(result, errRefresh)
+		}
+		refreshed.Email = chatgptwebauth.NormalizeEmail(refreshed.Email)
+		if refreshed.Email == "" || refreshed.Email != credential.Email {
+			result.ErrorCategory = "identity_conflict"
+			result.Error = "session refresh returned a different account"
+			result.HTTPStatus = http.StatusConflict
+			return result
+		}
+		if existing != nil {
+			candidate := existing.Clone()
+			candidate.Metadata = cloneStringAnyMap(existing.Metadata)
+			refreshed.ApplyToMetadata(candidate.Metadata)
+			if coreauth.ChatGPTWebCredentialRefreshIdentityChanged(existing, candidate) {
+				result.ErrorCategory = "identity_conflict"
+				result.Error = "credential identity conflicts with the existing account"
+				result.HTTPStatus = http.StatusConflict
+				return result
+			}
+		}
+		credential = refreshed
+		probe = chatGPTWebImportProbeAuth(fileName, credential)
+		probe.ProxyURL = resolved.EffectiveProxyURL()
+		_, errProbe = executor.FetchModels(ctx, probe)
+	}
 	if errProbe != nil {
 		if resolved.EffectiveProxyBindingID() != "" {
 			errProbe = manager.ReportProxyFailure(ctx, resolved, errProbe)
@@ -576,6 +608,45 @@ func chatGPTWebProbeRejectsCredential(err error) bool {
 	status := chatGPTWebErrorStatus(err)
 	return (status == http.StatusUnauthorized || status == http.StatusForbidden) &&
 		strings.HasPrefix(chatGPTWebErrorRequestPath(err), "/backend-api/models")
+}
+
+func (h *Handler) chatGPTWebSessionImportProbeFallbackEnabled(
+	credential *chatgptwebauth.Credential,
+	now time.Time,
+) bool {
+	if credential == nil ||
+		credential.RefreshStrategy != chatgptwebauth.RefreshStrategyChatGPTSession ||
+		strings.TrimSpace(credential.AccessToken) == "" {
+		return false
+	}
+	h.mu.Lock()
+	forceRefresh := true
+	if h.cfg != nil {
+		forceRefresh = h.cfg.ChatGPTWeb.ForceSessionRefreshOnImportEnabled()
+	}
+	h.mu.Unlock()
+	if forceRefresh {
+		return false
+	}
+	expiresAt, known := chatGPTWebImportedCredentialExpiry(credential)
+	return !known || expiresAt.After(now)
+}
+
+func chatGPTWebImportedCredentialExpiry(credential *chatgptwebauth.Credential) (time.Time, bool) {
+	if credential == nil {
+		return time.Time{}, false
+	}
+	if value := strings.TrimSpace(credential.Expired); value != "" {
+		parsed, errParse := time.Parse(time.RFC3339, value)
+		if errParse != nil {
+			return time.Time{}, true
+		}
+		return parsed, true
+	}
+	if expiresAt, ok := chatgptwebauth.JWTExpiry(credential.AccessToken); ok {
+		return expiresAt, true
+	}
+	return chatgptwebauth.JWTExpiry(credential.IDToken)
 }
 
 func chatGPTWebImportRefreshLockIDs(manager *coreauth.Manager, email string) []string {

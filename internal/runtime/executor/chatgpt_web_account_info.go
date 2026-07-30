@@ -488,8 +488,13 @@ func (runtime *chatGPTWebAccountInfoRuntime) updateConfig(cfg *config.Config) {
 		runtime.mu.Unlock()
 		return
 	}
+	previousEnabled := runtime.cfg.AutomaticRefreshEnabled()
 	runtime.cfg = resolved
+	resolvedEnabled := resolved.AutomaticRefreshEnabled()
 	if runtime.started {
+		if !resolvedEnabled {
+			runtime.disableAutomaticRefreshLocked()
+		}
 		runtime.resizeWorkersLocked(resolved.RefreshWorkers)
 		runtime.drainPendingTriggersLocked()
 		runtime.cond.Broadcast()
@@ -498,7 +503,77 @@ func (runtime *chatGPTWebAccountInfoRuntime) updateConfig(cfg *config.Config) {
 	runtime.mu.Unlock()
 	if started {
 		runtime.signalScheduler()
+		if !previousEnabled && resolvedEnabled {
+			runtime.restoreRecoverySchedules()
+		}
 	}
+}
+
+func (runtime *chatGPTWebAccountInfoRuntime) disableAutomaticRefreshLocked() {
+	if runtime == nil {
+		return
+	}
+	for _, task := range runtime.tasks {
+		if task == nil || task.snapshot.Force || task.snapshot.CompletedAt != nil {
+			continue
+		}
+		task.snapshot.State = chatgptwebauth.AccountInfoTaskCanceling
+		if task.cancel != nil {
+			task.cancel()
+		}
+	}
+	for key, call := range runtime.calls {
+		if call == nil || call.completed || runtime.inflightTask[key] > 0 {
+			continue
+		}
+		call.accepting = false
+		if call.cancel != nil {
+			call.cancel()
+		}
+	}
+
+	activeQueue := runtime.queuedWorkLocked()
+	filtered := activeQueue[:0]
+	for _, work := range activeQueue {
+		task := runtime.tasks[work.taskID]
+		if work.taskID != "" && task != nil && task.snapshot.Force {
+			filtered = append(filtered, work)
+			continue
+		}
+		if work.taskID != "" {
+			runtime.completeTaskWorkLocked(work, chatGPTWebAccountInfoOutcome{
+				status: chatgptwebauth.AccountInfoResultCanceled,
+			})
+		}
+		runtime.releaseWorkEpochLocked(work)
+	}
+	runtime.replaceQueuedWorkLocked(filtered)
+
+	keys := make([]string, 0, len(runtime.scheduled))
+	for key, entry := range runtime.scheduled {
+		if entry == nil {
+			continue
+		}
+		task := runtime.tasks[entry.work.taskID]
+		if entry.work.taskID != "" && task != nil && task.snapshot.Force {
+			continue
+		}
+		keys = append(keys, key)
+	}
+	for _, key := range keys {
+		entry := runtime.removeScheduleLocked(key)
+		if entry == nil {
+			continue
+		}
+		if entry.work.taskID != "" {
+			runtime.completeTaskWorkLocked(entry.work, chatGPTWebAccountInfoOutcome{
+				status: chatgptwebauth.AccountInfoResultCanceled,
+			})
+		}
+		runtime.releaseWorkEpochLocked(entry.work)
+	}
+	clear(runtime.pendingTriggers)
+	runtime.cond.Broadcast()
 }
 
 func (runtime *chatGPTWebAccountInfoRuntime) resizeWorkersLocked(target int) {
@@ -1345,6 +1420,10 @@ func (runtime *chatGPTWebAccountInfoRuntime) finishWorkLocked(work chatGPTWebAcc
 		outcome.retryable = false
 		runtime.retainIndependentTriggerLocked(work)
 	}
+	if !runtime.cfg.AutomaticRefreshEnabled() && work.taskID == "" {
+		outcome.retryable = false
+		outcome.retryAt = time.Time{}
+	}
 	runtimeKey := chatGPTWebAccountInfoTargetKey(work.target)
 	state := runtime.states[runtimeKey]
 	if outcome.errorCode != "" {
@@ -1836,7 +1915,7 @@ func (runtime *chatGPTWebAccountInfoRuntime) scheduleRecoveryForTargetAtLocked(
 	resetAt time.Time,
 	due time.Time,
 ) bool {
-	if strings.TrimSpace(target.AuthID) == "" {
+	if !runtime.cfg.AutomaticRefreshEnabled() || strings.TrimSpace(target.AuthID) == "" {
 		return false
 	}
 	var current bool
@@ -1930,6 +2009,12 @@ func (runtime *chatGPTWebAccountInfoRuntime) syncRecoveryScheduleForTargetLocked
 		return
 	}
 	key := "recovery:" + chatGPTWebAccountInfoTargetKey(target)
+	if !runtime.cfg.AutomaticRefreshEnabled() {
+		if entry := runtime.removeScheduleLocked(key); entry != nil {
+			runtime.releaseWorkEpochLocked(entry.work)
+		}
+		return
+	}
 	if !exhausted {
 		if entry := runtime.removeScheduleLocked(key); entry != nil {
 			runtime.releaseWorkEpochLocked(entry.work)
@@ -2186,6 +2271,12 @@ func (runtime *chatGPTWebAccountInfoRuntime) restoreRecoverySchedules() {
 	if runtime == nil || runtime.executor == nil || runtime.executor.manager == nil {
 		return
 	}
+	runtime.mu.Lock()
+	enabled := runtime.cfg.AutomaticRefreshEnabled()
+	runtime.mu.Unlock()
+	if !enabled {
+		return
+	}
 	for _, auth := range runtime.executor.manager.List() {
 		runtime.syncPersistedRecovery(auth)
 	}
@@ -2397,6 +2488,10 @@ func (runtime *chatGPTWebAccountInfoRuntime) startTask(targets []chatgptwebauth.
 		runtime.mu.Unlock()
 		return nil, errors.New("chatgpt web account info is unavailable")
 	}
+	if !force && !runtime.cfg.AutomaticRefreshEnabled() {
+		runtime.mu.Unlock()
+		return nil, chatgptwebauth.ErrAccountInfoAutoRefreshDisabled
+	}
 	runtime.pruneTasksLocked()
 	if len(runtime.tasks)+runtime.taskReservations >= chatGPTWebAccountInfoTaskMaxKept {
 		runtime.mu.Unlock()
@@ -2445,6 +2540,12 @@ func (runtime *chatGPTWebAccountInfoRuntime) startTask(targets []chatgptwebauth.
 		reservationHeld = false
 		cancel()
 		return nil, errors.New("chatgpt web account info is unavailable")
+	}
+	if !force && !runtime.cfg.AutomaticRefreshEnabled() {
+		runtime.taskReservations--
+		reservationHeld = false
+		cancel()
+		return nil, chatgptwebauth.ErrAccountInfoAutoRefreshDisabled
 	}
 	runtime.taskReservations--
 	reservationHeld = false
@@ -2766,6 +2867,10 @@ func (runtime *chatGPTWebAccountInfoRuntime) triggerTargetLocked(
 	mode chatGPTWebAccountInfoTriggerMode,
 ) bool {
 	runtimeKey := chatGPTWebAccountInfoTargetKey(target)
+	if mode != chatGPTWebAccountInfoTriggerForce && !runtime.cfg.AutomaticRefreshEnabled() {
+		delete(runtime.pendingTriggers, runtimeKey)
+		return false
+	}
 	if runtime.pendingTriggers == nil {
 		runtime.pendingTriggers = make(map[string]chatGPTWebAccountInfoTriggerMode)
 	}
@@ -2869,6 +2974,10 @@ func (runtime *chatGPTWebAccountInfoRuntime) retainIndependentTriggerLocked(
 	mode := work.independentTrigger
 	runtimeKey := chatGPTWebAccountInfoTargetKey(work.target)
 	if mode == chatGPTWebAccountInfoTriggerNone || runtimeKey == "" {
+		return
+	}
+	if mode != chatGPTWebAccountInfoTriggerForce && !runtime.cfg.AutomaticRefreshEnabled() {
+		delete(runtime.pendingTriggers, runtimeKey)
 		return
 	}
 	if runtime.pendingTriggers == nil {

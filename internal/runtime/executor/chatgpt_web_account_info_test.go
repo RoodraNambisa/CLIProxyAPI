@@ -103,6 +103,114 @@ func TestChatGPTWebAccountInfoRuntimeClampsUnvalidatedConfig(t *testing.T) {
 	}
 }
 
+func TestChatGPTWebAccountInfoAutoRefreshDisabledKeepsManualRefresh(t *testing.T) {
+	enabled := false
+	runtime := newChatGPTWebAccountInfoRuntime(&ChatGPTWebExecutor{}, &config.Config{
+		ChatGPTWeb: config.ChatGPTWebConfig{AccountInfo: config.ChatGPTWebAccountInfoConfig{
+			AutoRefreshEnabled: &enabled,
+		}},
+	})
+	t.Cleanup(runtime.close)
+	target := chatgptwebauth.AccountInfoRefreshTarget{Name: "web.json", AuthID: "web.json"}
+
+	if _, errStart := runtime.startTask([]chatgptwebauth.AccountInfoRefreshTarget{target}, false); !errors.Is(
+		errStart,
+		chatgptwebauth.ErrAccountInfoAutoRefreshDisabled,
+	) {
+		t.Fatalf("automatic start error = %v", errStart)
+	}
+	task, errStart := runtime.startTask([]chatgptwebauth.AccountInfoRefreshTarget{target}, true)
+	if errStart != nil {
+		t.Fatalf("manual start error = %v", errStart)
+	}
+	if task == nil || !task.Force || task.Total != 1 {
+		t.Fatalf("manual task = %+v", task)
+	}
+	if runtime.triggerAutomaticRecheck(target.AuthID) {
+		t.Fatal("automatic trigger was accepted while disabled")
+	}
+}
+
+func TestChatGPTWebAccountInfoDisableClearsQueuedAutomaticWork(t *testing.T) {
+	runtime := newChatGPTWebAccountInfoRuntime(&ChatGPTWebExecutor{}, &config.Config{})
+	t.Cleanup(runtime.close)
+	target := chatgptwebauth.AccountInfoRefreshTarget{Name: "web.json", AuthID: "web.json"}
+	task, errStart := runtime.startTask([]chatgptwebauth.AccountInfoRefreshTarget{target}, false)
+	if errStart != nil {
+		t.Fatalf("start automatic task: %v", errStart)
+	}
+	runtime.mu.Lock()
+	if !runtime.scheduleRecoveryForTargetLocked(target, time.Now().Add(time.Hour)) {
+		runtime.mu.Unlock()
+		t.Fatal("schedule recovery = false")
+	}
+	callContext, cancelCall := context.WithCancel(context.Background())
+	call := &chatGPTWebAccountInfoCall{
+		ctx:        callContext,
+		cancel:     cancelCall,
+		done:       make(chan struct{}),
+		authID:     target.AuthID,
+		runtimeKey: target.AuthID,
+		accepting:  true,
+	}
+	runtime.calls[target.AuthID] = call
+	runtime.inflight[target.AuthID] = 1
+	runtime.started = true
+	runtime.mu.Unlock()
+
+	enabled := false
+	runtime.updateConfig(&config.Config{
+		ChatGPTWeb: config.ChatGPTWebConfig{AccountInfo: config.ChatGPTWebAccountInfoConfig{
+			AutoRefreshEnabled: &enabled,
+		}},
+	})
+
+	snapshot, found := runtime.task(task.ID)
+	if !found || snapshot.State != chatgptwebauth.AccountInfoTaskCanceled ||
+		snapshot.Canceled != 1 || snapshot.Processed != 1 {
+		t.Fatalf("disabled task = %+v found=%v", snapshot, found)
+	}
+	runtime.mu.Lock()
+	queueLength := runtime.queueLengthLocked()
+	scheduled := len(runtime.scheduled)
+	runtime.mu.Unlock()
+	if queueLength != 0 || scheduled != 0 {
+		t.Fatalf("automatic work remains queued=%d scheduled=%d", queueLength, scheduled)
+	}
+	select {
+	case <-callContext.Done():
+	default:
+		t.Fatal("independent automatic call remained active")
+	}
+}
+
+func TestChatGPTWebAccountInfoReenableRestoresPersistedRecovery(t *testing.T) {
+	manager := cliproxyauth.NewManager(nil, nil, nil)
+	auth := chatGPTWebTestAuth("account-info-reenable-recovery")
+	auth.Metadata["quota_state"] = string(chatgptwebauth.QuotaStateExhausted)
+	auth.Metadata["image_quota_remaining"] = 0
+	auth.Metadata["image_quota_reset_at"] = time.Now().Add(time.Hour).Format(time.RFC3339Nano)
+	if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+
+	enabled := false
+	cfg := &config.Config{ChatGPTWeb: config.ChatGPTWebConfig{AccountInfo: config.ChatGPTWebAccountInfoConfig{
+		AutoRefreshEnabled: &enabled,
+	}}}
+	executor := NewChatGPTWebExecutor(cfg, manager)
+	t.Cleanup(func() { _ = executor.Close() })
+	if state := executor.AccountInfoAuthState(auth.ID); !state.NextRefreshAt.IsZero() {
+		t.Fatalf("disabled startup scheduled recovery: %+v", state)
+	}
+
+	enabled = true
+	executor.UpdateConfig(cfg)
+	if state := executor.AccountInfoAuthState(auth.ID); state.NextRefreshAt.IsZero() {
+		t.Fatal("re-enabling automatic refresh did not restore persisted recovery")
+	}
+}
+
 func TestChatGPTWebAccountInfoRefreshPersistsProfileQuotaAndUsesTTL(t *testing.T) {
 	var profileCalls atomic.Int32
 	var quotaCalls atomic.Int32
@@ -3351,6 +3459,39 @@ func TestChatGPTWebAccountInfoIndependentTriggerSurvivesInflightTaskCancellation
 				t.Fatalf("independent trigger after inflight cancellation = %+v", queued)
 			}
 		})
+	}
+}
+
+func TestChatGPTWebAccountInfoDisableDropsInflightAutomaticRecheck(t *testing.T) {
+	taskCtx, cancel := context.WithCancel(context.Background())
+	runtime := newChatGPTWebAccountInfoTaskTestRuntime(taskCtx, cancel)
+	work := chatGPTWebAccountInfoWork{
+		target:  chatgptwebauth.AccountInfoRefreshTarget{Name: "shared.json", AuthID: "shared"},
+		taskID:  "task-a",
+		index:   0,
+		attempt: 1,
+	}
+
+	runtime.mu.Lock()
+	runtime.assignWorkEpochLocked(&work)
+	runtime.beginAccountInfoWorkLocked(work)
+	if !runtime.triggerTargetLocked(work.target, chatGPTWebAccountInfoTriggerAutomaticRecheck) {
+		runtime.mu.Unlock()
+		t.Fatal("automatic recheck was not attached to inflight task")
+	}
+	enabled := false
+	runtime.cfg = (config.ChatGPTWebAccountInfoConfig{AutoRefreshEnabled: &enabled}).Resolved()
+	runtime.disableAutomaticRefreshLocked()
+	runtime.completeAccountInfoWorkLocked(work, false, chatGPTWebAccountInfoOutcome{
+		status: chatgptwebauth.AccountInfoResultUpdated,
+	})
+	state := runtime.states[chatGPTWebAccountInfoTargetKey(work.target)]
+	pending := len(runtime.pendingTriggers)
+	queued := runtime.queueLengthLocked()
+	runtime.mu.Unlock()
+
+	if state.Refreshing || pending != 0 || queued != 0 {
+		t.Fatalf("disabled automatic recheck state=%+v pending=%d queued=%d", state, pending, queued)
 	}
 }
 

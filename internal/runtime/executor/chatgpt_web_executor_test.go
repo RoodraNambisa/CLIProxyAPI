@@ -112,6 +112,73 @@ func TestChatGPTWebExecutorRefreshUsesActualTargetForEnvironmentProxy(t *testing
 	}
 }
 
+func TestChatGPTWebExecutorImportSessionRefreshCanSkipValidAccessToken(t *testing.T) {
+	now := time.Date(2026, time.July, 30, 12, 0, 0, 0, time.UTC)
+	forceRefresh := false
+	cfg := &config.Config{ChatGPTWeb: config.ChatGPTWebConfig{
+		ForceSessionRefreshOnImport: &forceRefresh,
+	}}
+	service := &fakeChatGPTWebAuthService{
+		refreshSessionFn: func(_ context.Context, credential chatgptwebauth.Credential, _ string) (*chatgptwebauth.Credential, error) {
+			credential.AccessToken = "refreshed-access"
+			credential.Expired = now.Add(time.Hour).Format(time.RFC3339)
+			return &credential, nil
+		},
+	}
+	executor := NewChatGPTWebExecutor(cfg, nil)
+	t.Cleanup(func() { _ = executor.Close() })
+	executor.authService = service
+	executor.now = func() time.Time { return now }
+
+	valid := &chatgptwebauth.Credential{
+		AccessToken:     "uploaded-access",
+		Expired:         now.Add(time.Hour).Format(time.RFC3339),
+		RefreshStrategy: chatgptwebauth.RefreshStrategyChatGPTSession,
+	}
+	normalized, errNormalize := executor.NormalizeImportedCredential(t.Context(), valid, "")
+	if errNormalize != nil {
+		t.Fatalf("NormalizeImportedCredential(valid) error = %v", errNormalize)
+	}
+	if normalized.AccessToken != "uploaded-access" || service.refreshSessionCalls.Load() != 0 {
+		t.Fatalf("valid import = %+v calls=%d", normalized, service.refreshSessionCalls.Load())
+	}
+
+	expired := cloneChatGPTWebCredential(valid)
+	expired.Expired = now.Add(-time.Second).Format(time.RFC3339)
+	normalized, errNormalize = executor.NormalizeImportedCredential(t.Context(), expired, "")
+	if errNormalize != nil {
+		t.Fatalf("NormalizeImportedCredential(expired) error = %v", errNormalize)
+	}
+	if normalized.AccessToken != "refreshed-access" || service.refreshSessionCalls.Load() != 1 {
+		t.Fatalf("expired import = %+v calls=%d", normalized, service.refreshSessionCalls.Load())
+	}
+}
+
+func TestChatGPTWebExecutorImportSessionRefreshDefaultsToForced(t *testing.T) {
+	service := &fakeChatGPTWebAuthService{
+		refreshSessionFn: func(_ context.Context, credential chatgptwebauth.Credential, _ string) (*chatgptwebauth.Credential, error) {
+			credential.AccessToken = "refreshed-access"
+			return &credential, nil
+		},
+	}
+	executor := NewChatGPTWebExecutor(&config.Config{}, nil)
+	t.Cleanup(func() { _ = executor.Close() })
+	executor.authService = service
+
+	credential := &chatgptwebauth.Credential{
+		AccessToken:     "uploaded-access",
+		Expired:         time.Now().Add(time.Hour).Format(time.RFC3339),
+		RefreshStrategy: chatgptwebauth.RefreshStrategyChatGPTSession,
+	}
+	normalized, errNormalize := executor.NormalizeImportedCredential(t.Context(), credential, "")
+	if errNormalize != nil {
+		t.Fatalf("NormalizeImportedCredential() error = %v", errNormalize)
+	}
+	if normalized.AccessToken != "refreshed-access" || service.refreshSessionCalls.Load() != 1 {
+		t.Fatalf("default import = %+v calls=%d", normalized, service.refreshSessionCalls.Load())
+	}
+}
+
 func TestChatGPTWebExecutorShouldPrepareExpiringCredential(t *testing.T) {
 	now := time.Date(2026, time.July, 16, 12, 0, 0, 0, time.UTC)
 	executor := NewChatGPTWebExecutor(&config.Config{}, nil)

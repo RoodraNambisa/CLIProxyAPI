@@ -131,7 +131,8 @@ func TestGetChatGPTWebAccountInfoReturnsDefaultsAndRuntime(t *testing.T) {
 	if errDecode := json.Unmarshal(recorder.Body.Bytes(), &response); errDecode != nil {
 		t.Fatalf("decode response: %v", errDecode)
 	}
-	if response.Config.RefreshWorkers != 4 || response.Config.RefreshQueueSize != 256 ||
+	if !response.Config.AutoRefreshEnabled ||
+		response.Config.RefreshWorkers != 4 || response.Config.RefreshQueueSize != 256 ||
 		response.Config.RefreshTTLMinutes != 15 || response.Config.RecoveryJitterSeconds != 30 ||
 		response.Config.MaxRetries != 3 {
 		t.Fatalf("defaults = %+v", response.Config)
@@ -159,13 +160,17 @@ func TestPatchAndStartChatGPTWebAccountInfoRefresh(t *testing.T) {
 	}
 	handler := &Handler{cfg: &config.Config{}, configFilePath: configPath, authManager: manager}
 
-	ctx, recorder := newChatGPTWebAccountInfoRequest(http.MethodPatch, `{"refresh-workers":6,"max-retries":1}`)
+	ctx, recorder := newChatGPTWebAccountInfoRequest(
+		http.MethodPatch,
+		`{"auto-refresh-enabled":false,"refresh-workers":6,"max-retries":1}`,
+	)
 	handler.PatchChatGPTWebAccountInfo(ctx)
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("PATCH status = %d: %s", recorder.Code, recorder.Body.String())
 	}
 	resolved := handler.cfg.ChatGPTWeb.AccountInfo.Resolved()
-	if resolved.RefreshWorkers != 6 || resolved.MaxRetries != 1 || resolved.RefreshQueueSize != 256 {
+	if resolved.AutoRefreshEnabled ||
+		resolved.RefreshWorkers != 6 || resolved.MaxRetries != 1 || resolved.RefreshQueueSize != 256 {
 		t.Fatalf("patched config = %+v", resolved)
 	}
 	executor.mu.Lock()
@@ -188,6 +193,52 @@ func TestPatchAndStartChatGPTWebAccountInfoRefresh(t *testing.T) {
 		targets[0].AuthInstanceID != registered.RuntimeInstanceID() ||
 		targets[0].AuthIndex != registered.EnsureIndex() || !force {
 		t.Fatalf("refresh targets = %+v force=%v", targets, force)
+	}
+}
+
+func TestPutChatGPTWebAccountInfoAcceptsLegacyPayloadWithoutAutoRefresh(t *testing.T) {
+	configPath := writeTestConfigFile(t)
+	manager := coreauth.NewManager(nil, nil, nil)
+	executor := &accountInfoControllerTestExecutor{}
+	manager.RegisterExecutor(executor)
+	handler := &Handler{cfg: &config.Config{}, configFilePath: configPath, authManager: manager}
+
+	ctx, recorder := newChatGPTWebAccountInfoRequest(
+		http.MethodPut,
+		`{"refresh-workers":6,"refresh-queue-size":128,"refresh-ttl-minutes":30,"recovery-jitter-seconds":10,"max-retries":2}`,
+	)
+	handler.PutChatGPTWebAccountInfo(ctx)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("PUT status = %d: %s", recorder.Code, recorder.Body.String())
+	}
+	resolved := handler.cfg.ChatGPTWeb.AccountInfo.Resolved()
+	if !resolved.AutoRefreshEnabled || !resolved.AutomaticRefreshEnabled() {
+		t.Fatalf("legacy PUT disabled automatic refresh: %+v", resolved)
+	}
+}
+
+func TestChatGPTWebAccountInfoAutoRefreshDisabledReturnsConflict(t *testing.T) {
+	manager := coreauth.NewManager(nil, nil, nil)
+	manager.RegisterExecutor(&accountInfoControllerTestExecutor{
+		startErr: chatgptwebauth.ErrAccountInfoAutoRefreshDisabled,
+	})
+	if _, errRegister := manager.Register(context.Background(), &coreauth.Auth{
+		ID:       "web.json",
+		FileName: "web.json",
+		Provider: chatgptwebauth.Provider,
+		Status:   coreauth.StatusActive,
+		Metadata: map[string]any{"lifecycle_state": coreauth.LifecycleStateActive},
+	}); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+	handler := &Handler{cfg: &config.Config{}, authManager: manager}
+	ctx, recorder := newChatGPTWebAccountInfoRequest(http.MethodPost, `{"names":["web.json"]}`)
+
+	handler.StartChatGPTWebAccountInfoRefreshTask(ctx)
+
+	if recorder.Code != http.StatusConflict ||
+		!strings.Contains(recorder.Body.String(), "automatic refresh is disabled") {
+		t.Fatalf("status = %d body = %s", recorder.Code, recorder.Body.String())
 	}
 }
 

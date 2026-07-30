@@ -91,6 +91,53 @@ func TestChatGPTWebImportTaskNormalizesSessionOnlyCredential(t *testing.T) {
 	}
 }
 
+func TestChatGPTWebImportTaskFallsBackToSessionAfterOpaqueTokenRejection(t *testing.T) {
+	var normalizeCalls atomic.Int32
+	var fetchCalls atomic.Int32
+	executor := &chatGPTWebManagementTestExecutor{}
+	executor.normalizeFn = func(_ context.Context, credential *chatgptwebauth.Credential, _ string) (*chatgptwebauth.Credential, error) {
+		normalizeCalls.Add(1)
+		if credential.AccessToken == "" {
+			credential.AccessToken = "session-refreshed-access"
+			credential.Expired = time.Now().Add(time.Hour).UTC().Format(time.RFC3339)
+		}
+		credential.LifecycleState = chatgptwebauth.LifecycleActive
+		return credential, nil
+	}
+	executor.fetchFn = func(_ context.Context, auth *coreauth.Auth) ([]chatgptwebauth.CatalogModel, error) {
+		fetchCalls.Add(1)
+		credential, errParse := chatgptwebauth.ParseCredential(auth.Metadata)
+		if errParse != nil {
+			return nil, errParse
+		}
+		if credential.AccessToken == "opaque-stale-access" {
+			return nil, conversionStatusError{status: http.StatusUnauthorized, path: "/backend-api/models"}
+		}
+		return nil, nil
+	}
+	h, manager, _ := newChatGPTWebManagementTestHandler(t, executor)
+	forceRefresh := false
+	h.cfg.ChatGPTWeb.ForceSessionRefreshOnImport = &forceRefresh
+	router := chatGPTWebManagementTestRouter(h)
+
+	task := startChatGPTWebImportTask(t, router, []chatGPTWebImportTestFile{{
+		field: "files",
+		name:  "session-fallback.json",
+		data:  `{"email":"fallback@example.com","access_token":"opaque-stale-access","session_cookie":"session-secret"}`,
+	}})
+	completed := waitForChatGPTWebMutationTask(t, router, chatGPTWebMutationTaskImport, task.ID)
+	if completed.Succeeded != 1 || completed.Failed != 0 {
+		t.Fatalf("task = %+v", completed)
+	}
+	if normalizeCalls.Load() != 2 || fetchCalls.Load() != 2 {
+		t.Fatalf("normalize calls = %d, fetch calls = %d", normalizeCalls.Load(), fetchCalls.Load())
+	}
+	stored, ok := manager.GetByID(completed.Results[0].Name)
+	if !ok || stored == nil || stringValue(stored.Metadata, "access_token") != "session-refreshed-access" {
+		t.Fatalf("stored fallback credential = %#v", stored)
+	}
+}
+
 func TestChatGPTWebImportTaskPersistsRotatedRefreshTokenAfterCancellation(t *testing.T) {
 	normalizeStarted := make(chan struct{}, 1)
 	releaseNormalize := make(chan struct{})

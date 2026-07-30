@@ -9,10 +9,21 @@ import (
 
 func TestChatGPTWebAccountInfoConfigDefaults(t *testing.T) {
 	resolved := (ChatGPTWebAccountInfoConfig{}).Resolved()
-	if resolved.RefreshWorkers != 4 || resolved.RefreshQueueSize != 256 ||
+	if !resolved.AutoRefreshEnabled ||
+		resolved.RefreshWorkers != 4 || resolved.RefreshQueueSize != 256 ||
 		resolved.RefreshTTLMinutes != 15 || resolved.RecoveryJitterSeconds != 30 ||
 		resolved.MaxRetries != 3 {
 		t.Fatalf("Resolved() = %+v", resolved)
+	}
+}
+
+func TestChatGPTWebImportSessionRefreshDefaultsEnabled(t *testing.T) {
+	if !(ChatGPTWebConfig{}).ForceSessionRefreshOnImportEnabled() {
+		t.Fatal("ForceSessionRefreshOnImportEnabled() = false, want true")
+	}
+	disabled := false
+	if (ChatGPTWebConfig{ForceSessionRefreshOnImport: &disabled}).ForceSessionRefreshOnImportEnabled() {
+		t.Fatal("ForceSessionRefreshOnImportEnabled() = true, want false")
 	}
 }
 
@@ -45,7 +56,7 @@ func TestChatGPTWebAccountInfoConfigValidation(t *testing.T) {
 
 func TestLoadAndSaveChatGPTWebAccountInfoConfig(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.yaml")
-	data := []byte("chatgpt-web:\n  account-info:\n    refresh-workers: 2\n    refresh-queue-size: 0\n    refresh-ttl-minutes: 30\n    recovery-jitter-seconds: 0\n    max-retries: 0\n")
+	data := []byte("chatgpt-web:\n  force-session-refresh-on-import: false\n  account-info:\n    auto-refresh-enabled: false\n    refresh-workers: 2\n    refresh-queue-size: 0\n    refresh-ttl-minutes: 30\n    recovery-jitter-seconds: 0\n    max-retries: 0\n")
 	if err := os.WriteFile(path, data, 0o600); err != nil {
 		t.Fatalf("write config: %v", err)
 	}
@@ -54,10 +65,14 @@ func TestLoadAndSaveChatGPTWebAccountInfoConfig(t *testing.T) {
 		t.Fatalf("LoadConfig() error = %v", errLoad)
 	}
 	resolved := cfg.ChatGPTWeb.AccountInfo.Resolved()
-	if resolved.RefreshWorkers != 2 || resolved.RefreshQueueSize != 0 ||
+	if resolved.AutoRefreshEnabled ||
+		resolved.RefreshWorkers != 2 || resolved.RefreshQueueSize != 0 ||
 		resolved.RefreshTTLMinutes != 30 || resolved.RecoveryJitterSeconds != 0 ||
 		resolved.MaxRetries != 0 {
 		t.Fatalf("resolved = %+v", resolved)
+	}
+	if cfg.ChatGPTWeb.ForceSessionRefreshOnImportEnabled() {
+		t.Fatal("force-session-refresh-on-import was not loaded")
 	}
 	if errSave := SaveConfigPreserveComments(path, cfg); errSave != nil {
 		t.Fatalf("SaveConfigPreserveComments() error = %v", errSave)
@@ -66,7 +81,14 @@ func TestLoadAndSaveChatGPTWebAccountInfoConfig(t *testing.T) {
 	if errRead != nil {
 		t.Fatalf("read saved config: %v", errRead)
 	}
-	for _, expected := range []string{"account-info:", "refresh-queue-size: 0", "recovery-jitter-seconds: 0", "max-retries: 0"} {
+	for _, expected := range []string{
+		"force-session-refresh-on-import: false",
+		"account-info:",
+		"auto-refresh-enabled: false",
+		"refresh-queue-size: 0",
+		"recovery-jitter-seconds: 0",
+		"max-retries: 0",
+	} {
 		if !strings.Contains(string(saved), expected) {
 			t.Fatalf("saved config omitted %q:\n%s", expected, saved)
 		}
@@ -81,6 +103,7 @@ func TestLoadConfigRejectsInvalidChatGPTWebAccountInfoFields(t *testing.T) {
 	}{
 		{name: "unknown", yaml: "chatgpt-web:\n  account-info:\n    refresh-worker: 4\n", want: "refresh-worker"},
 		{name: "null", yaml: "chatgpt-web:\n  account-info:\n    refresh-workers: null\n", want: "refresh-workers"},
+		{name: "null auto refresh", yaml: "chatgpt-web:\n  account-info:\n    auto-refresh-enabled: null\n", want: "auto-refresh-enabled"},
 		{name: "out of range", yaml: "chatgpt-web:\n  account-info:\n    max-retries: 11\n", want: "max-retries"},
 	}
 	for _, test := range tests {

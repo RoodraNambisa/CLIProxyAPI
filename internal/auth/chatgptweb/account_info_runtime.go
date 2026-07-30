@@ -8,6 +8,9 @@ import (
 // ErrAccountInfoTaskLimitReached reports that the bounded task registry is full.
 var ErrAccountInfoTaskLimitReached = errors.New("chatgpt web account info active task limit reached")
 
+// ErrAccountInfoAutoRefreshDisabled reports that a non-forced refresh was rejected by configuration.
+var ErrAccountInfoAutoRefreshDisabled = errors.New("chatgpt web account info automatic refresh is disabled")
+
 const (
 	AccountInfoTaskQueued              = "queued"
 	AccountInfoTaskRunning             = "running"

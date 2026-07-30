@@ -55,6 +55,9 @@ api-keys:
 # password/TOTP material and is disabled by default.
 chatgpt-web:
   auto-relogin: false
+  # Refresh session-backed imports even when the uploaded access token remains valid.
+  # Disable to keep a valid uploaded token; missing or expired tokens still use the session.
+  force-session-refresh-on-import: true
   # Remove credentials only after ChatGPT Web confirms the account lifecycle is dead.
   auto-delete-dead-auths: false
   # Empty matches every priority; otherwise only exact integer priorities are removed.
@@ -94,6 +97,9 @@ chatgpt-web:
     # Billing-only fallback for quality=auto; this does not change Web output quality.
     auto-output-quality: "medium"
   account-info:
+    # Disable provider-owned quota refreshes and current-page automatic tasks.
+    # Manual force refreshes remain available.
+    auto-refresh-enabled: true
     # Bounded workers refresh account plan and image quota only when requested,
     # when a quota recovery is due, or after an image quota error.
     refresh-workers: 4

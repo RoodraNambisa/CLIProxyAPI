@@ -449,6 +449,9 @@ type CodexConfig struct {
 type ChatGPTWebConfig struct {
 	// AutoRelogin starts a background password login after a terminal refresh failure.
 	AutoRelogin bool `yaml:"auto-relogin" json:"auto-relogin"`
+	// ForceSessionRefreshOnImport refreshes session-backed imports even when their access token is still valid.
+	// An omitted value remains enabled for backward compatibility.
+	ForceSessionRefreshOnImport *bool `yaml:"force-session-refresh-on-import,omitempty" json:"force-session-refresh-on-import,omitempty"`
 	// AutoDeleteDeadAuths removes credentials whose lifecycle is permanently dead.
 	AutoDeleteDeadAuths bool `yaml:"auto-delete-dead-auths" json:"auto-delete-dead-auths"`
 	// AutoDeleteDeadPriorities limits dead credential deletion to these priorities.
@@ -524,6 +527,11 @@ func (cfg ChatGPTWebConfig) ResolvedTimezone(at time.Time) ResolvedChatGPTWebTim
 // TokenUsageEstimationEnabled returns whether Web response usage is estimated locally.
 func (cfg ChatGPTWebConfig) TokenUsageEstimationEnabled() bool {
 	return cfg.EstimateTokenUsage == nil || *cfg.EstimateTokenUsage
+}
+
+// ForceSessionRefreshOnImportEnabled reports whether valid session-backed imports are refreshed.
+func (cfg ChatGPTWebConfig) ForceSessionRefreshOnImportEnabled() bool {
+	return cfg.ForceSessionRefreshOnImport == nil || *cfg.ForceSessionRefreshOnImport
 }
 
 // ChatGPTWebUsageCacheConfig controls optional disk spill for compact usage projections.
@@ -688,11 +696,12 @@ func loadChatGPTWebTimezone(name string) (*time.Location, error) {
 
 // ChatGPTWebAccountInfoConfig controls bounded account profile and image quota refreshes.
 type ChatGPTWebAccountInfoConfig struct {
-	RefreshWorkers        *int `yaml:"refresh-workers,omitempty" json:"refresh-workers,omitempty"`
-	RefreshQueueSize      *int `yaml:"refresh-queue-size,omitempty" json:"refresh-queue-size,omitempty"`
-	RefreshTTLMinutes     *int `yaml:"refresh-ttl-minutes,omitempty" json:"refresh-ttl-minutes,omitempty"`
-	RecoveryJitterSeconds *int `yaml:"recovery-jitter-seconds,omitempty" json:"recovery-jitter-seconds,omitempty"`
-	MaxRetries            *int `yaml:"max-retries,omitempty" json:"max-retries,omitempty"`
+	AutoRefreshEnabled    *bool `yaml:"auto-refresh-enabled,omitempty" json:"auto-refresh-enabled,omitempty"`
+	RefreshWorkers        *int  `yaml:"refresh-workers,omitempty" json:"refresh-workers,omitempty"`
+	RefreshQueueSize      *int  `yaml:"refresh-queue-size,omitempty" json:"refresh-queue-size,omitempty"`
+	RefreshTTLMinutes     *int  `yaml:"refresh-ttl-minutes,omitempty" json:"refresh-ttl-minutes,omitempty"`
+	RecoveryJitterSeconds *int  `yaml:"recovery-jitter-seconds,omitempty" json:"recovery-jitter-seconds,omitempty"`
+	MaxRetries            *int  `yaml:"max-retries,omitempty" json:"max-retries,omitempty"`
 }
 
 // UnmarshalYAML rejects unknown and null account-info settings.
@@ -709,7 +718,7 @@ func (cfg *ChatGPTWebAccountInfoConfig) UnmarshalYAML(node *yaml.Node) error {
 	}
 	for name, value := range effective {
 		switch name {
-		case "refresh-workers", "refresh-queue-size", "refresh-ttl-minutes", "recovery-jitter-seconds", "max-retries":
+		case "auto-refresh-enabled", "refresh-workers", "refresh-queue-size", "refresh-ttl-minutes", "recovery-jitter-seconds", "max-retries":
 			if value == nil {
 				return fmt.Errorf("chatgpt-web.account-info.%s must not be null", name)
 			}
@@ -728,21 +737,34 @@ func (cfg *ChatGPTWebAccountInfoConfig) UnmarshalYAML(node *yaml.Node) error {
 
 // ResolvedChatGPTWebAccountInfoConfig contains effective refresh-pool values.
 type ResolvedChatGPTWebAccountInfoConfig struct {
-	RefreshWorkers        int `json:"refresh-workers"`
-	RefreshQueueSize      int `json:"refresh-queue-size"`
-	RefreshTTLMinutes     int `json:"refresh-ttl-minutes"`
-	RecoveryJitterSeconds int `json:"recovery-jitter-seconds"`
-	MaxRetries            int `json:"max-retries"`
+	AutoRefreshEnabled    bool `json:"auto-refresh-enabled"`
+	RefreshWorkers        int  `json:"refresh-workers"`
+	RefreshQueueSize      int  `json:"refresh-queue-size"`
+	RefreshTTLMinutes     int  `json:"refresh-ttl-minutes"`
+	RecoveryJitterSeconds int  `json:"recovery-jitter-seconds"`
+	MaxRetries            int  `json:"max-retries"`
+	autoRefreshConfigured bool
+}
+
+// AutomaticRefreshEnabled reports the effective automatic refresh setting.
+// A zero-value resolved config keeps the historical enabled behavior.
+func (cfg ResolvedChatGPTWebAccountInfoConfig) AutomaticRefreshEnabled() bool {
+	return !cfg.autoRefreshConfigured || cfg.AutoRefreshEnabled
 }
 
 // Resolved returns effective account profile and quota refresh settings.
 func (cfg ChatGPTWebAccountInfoConfig) Resolved() ResolvedChatGPTWebAccountInfoConfig {
 	resolved := ResolvedChatGPTWebAccountInfoConfig{
+		AutoRefreshEnabled:    true,
 		RefreshWorkers:        DefaultChatGPTWebAccountInfoWorkers,
 		RefreshQueueSize:      DefaultChatGPTWebAccountInfoQueueSize,
 		RefreshTTLMinutes:     DefaultChatGPTWebAccountInfoTTLMinutes,
 		RecoveryJitterSeconds: DefaultChatGPTWebAccountInfoJitterSeconds,
 		MaxRetries:            DefaultChatGPTWebAccountInfoMaxRetries,
+	}
+	if cfg.AutoRefreshEnabled != nil {
+		resolved.AutoRefreshEnabled = *cfg.AutoRefreshEnabled
+		resolved.autoRefreshConfigured = true
 	}
 	if cfg.RefreshWorkers != nil {
 		resolved.RefreshWorkers = *cfg.RefreshWorkers
@@ -3432,6 +3454,7 @@ func preservesExplicitChatGPTWebValue(fullPath string, node *yaml.Node) bool {
 		for _, key := range []string{
 			"auto-relogin-max-retries",
 			"auto-relogin-jitter-percent",
+			"force-session-refresh-on-import",
 			"timezone",
 			"timezone-offset-minutes",
 			"estimate-token-usage",
@@ -3448,6 +3471,7 @@ func preservesExplicitChatGPTWebValue(fullPath string, node *yaml.Node) bool {
 		return false
 	case "chatgpt-web.auto-relogin-max-retries",
 		"chatgpt-web.auto-relogin-jitter-percent",
+		"chatgpt-web.force-session-refresh-on-import",
 		"chatgpt-web.timezone",
 		"chatgpt-web.timezone-offset-minutes":
 		return true
@@ -3462,7 +3486,8 @@ func preservesExplicitChatGPTWebValue(fullPath string, node *yaml.Node) bool {
 		return true
 	case "chatgpt-web.account-info":
 		return node.Kind == yaml.MappingNode && len(node.Content) > 0
-	case "chatgpt-web.account-info.refresh-workers",
+	case "chatgpt-web.account-info.auto-refresh-enabled",
+		"chatgpt-web.account-info.refresh-workers",
 		"chatgpt-web.account-info.refresh-queue-size",
 		"chatgpt-web.account-info.refresh-ttl-minutes",
 		"chatgpt-web.account-info.recovery-jitter-seconds",

@@ -34,6 +34,7 @@ type chatGPTWebAccountInfoResponse struct {
 }
 
 type chatGPTWebAccountInfoConfigRequest struct {
+	AutoRefreshEnabled    json.RawMessage `json:"auto-refresh-enabled"`
 	RefreshWorkers        json.RawMessage `json:"refresh-workers"`
 	RefreshQueueSize      json.RawMessage `json:"refresh-queue-size"`
 	RefreshTTLMinutes     json.RawMessage `json:"refresh-ttl-minutes"`
@@ -152,6 +153,10 @@ func (h *Handler) StartChatGPTWebAccountInfoRefreshTask(c *gin.Context) {
 	}
 	task, errStart := controller.StartAccountInfoRefreshTask(targets, request.Force)
 	if errStart != nil {
+		if errors.Is(errStart, chatgptwebauth.ErrAccountInfoAutoRefreshDisabled) {
+			c.JSON(http.StatusConflict, gin.H{"error": errStart.Error()})
+			return
+		}
 		if errors.Is(errStart, chatgptwebauth.ErrAccountInfoTaskLimitReached) {
 			c.JSON(http.StatusTooManyRequests, gin.H{"error": errStart.Error()})
 			return
@@ -311,6 +316,13 @@ func (request chatGPTWebAccountInfoConfigRequest) complete() bool {
 func (request chatGPTWebAccountInfoConfigRequest) apply(candidate *config.ChatGPTWebAccountInfoConfig) error {
 	if candidate == nil {
 		return errors.New("configuration unavailable")
+	}
+	if len(request.AutoRefreshEnabled) > 0 {
+		value, errValue := decodeSentinelBool(request.AutoRefreshEnabled)
+		if errValue != nil {
+			return errors.New("invalid auto-refresh-enabled")
+		}
+		candidate.AutoRefreshEnabled = &value
 	}
 	fields := []struct {
 		name   string

@@ -440,7 +440,9 @@ func (e *ChatGPTWebExecutor) NormalizeImportedCredential(ctx context.Context, cr
 	case chatgptwebauth.RefreshStrategyWebOAuthRT:
 		result, err = e.authService.Refresh(ctx, *result, proxyURL)
 	case chatgptwebauth.RefreshStrategyChatGPTSession:
-		result, err = e.authService.RefreshSession(ctx, *result, proxyURL)
+		if e.shouldRefreshImportedSessionCredential(result) {
+			result, err = e.authService.RefreshSession(ctx, *result, proxyURL)
+		}
 	case chatgptwebauth.RefreshStrategyCodexSource:
 		result, err, _ = e.refreshFromCodexSource(ctx, result)
 	case chatgptwebauth.RefreshStrategyTokenOnly:
@@ -461,6 +463,18 @@ func (e *ChatGPTWebExecutor) NormalizeImportedCredential(ctx context.Context, cr
 	result.LifecycleReason = ""
 	result.LifecycleUpdatedAt = now
 	return result, nil
+}
+
+func (e *ChatGPTWebExecutor) shouldRefreshImportedSessionCredential(credential *chatgptwebauth.Credential) bool {
+	if credential == nil || strings.TrimSpace(credential.AccessToken) == "" {
+		return true
+	}
+	cfg := e.configSnapshot()
+	if cfg == nil || cfg.ChatGPTWeb.ForceSessionRefreshOnImportEnabled() {
+		return true
+	}
+	expiresAt, known := chatGPTWebCredentialExpiry(credential)
+	return known && !expiresAt.After(e.currentTime())
 }
 
 // BeginLoginOperation serializes an account login through persistence with
