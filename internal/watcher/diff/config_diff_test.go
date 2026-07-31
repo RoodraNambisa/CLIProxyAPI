@@ -1,6 +1,7 @@
 package diff
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
@@ -143,6 +144,25 @@ func TestBuildConfigChangeDetails_ChatGPTWebTokenUsageEstimation(t *testing.T) {
 		"chatgpt-web.image-usage.fallback-usage.output-image-tokens: 2000 -> 2500",
 	} {
 		expectContains(t, details, expected)
+	}
+}
+
+func TestBuildConfigChangeDetailsDoesNotExposeLoginProxyTemplate(t *testing.T) {
+	oldConfig := &config.Config{ChatGPTWeb: config.ChatGPTWebConfig{LoginProxy: config.ChatGPTWebLoginProxyConfig{
+		URLTemplate: "http://user:old-secret@old-proxy.example:8080",
+	}}}
+	newConfig := &config.Config{ChatGPTWeb: config.ChatGPTWebConfig{LoginProxy: config.ChatGPTWebLoginProxyConfig{
+		Enabled:     true,
+		URLTemplate: "http://user:new-secret@new-proxy.example:8080",
+	}}}
+	details := BuildConfigChangeDetails(oldConfig, newConfig)
+	expectContains(t, details, "chatgpt-web.login-proxy.enabled: false -> true")
+	expectContains(t, details, "chatgpt-web.login-proxy.url-template: changed")
+	joined := strings.Join(details, "\n")
+	for _, secret := range []string{"old-secret", "new-secret", "old-proxy.example", "new-proxy.example"} {
+		if strings.Contains(joined, secret) {
+			t.Fatalf("config diff exposed login proxy material %q: %s", secret, details)
+		}
 	}
 }
 

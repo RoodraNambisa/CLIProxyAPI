@@ -18,6 +18,8 @@ type AuthError struct {
 	StatusCode     int            `json:"status_code"`
 	Retryable      bool           `json:"retryable"`
 	Terminal       bool           `json:"terminal"`
+	FailureStage   string         `json:"failure_stage,omitempty"`
+	Attempts       int            `json:"attempts,omitempty"`
 	Message        string         `json:"message,omitempty"`
 	Cause          error          `json:"-"`
 }
@@ -125,6 +127,8 @@ func SafeLifecycleReason(value string) string {
 		"auto_relogin_exhausted",
 		"missing_credentials",
 		"authorization_completion_required",
+		"cloudflare_challenge",
+		"login_proxy_invalid",
 		"refresh_token_missing",
 		"session_cookie_missing",
 		"session_expired",

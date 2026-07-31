@@ -13,6 +13,7 @@ import (
 	"time"
 
 	fhttp "github.com/bogdanfinn/fhttp"
+	log "github.com/sirupsen/logrus"
 )
 
 type Service struct {
@@ -59,6 +60,73 @@ func NewLoginService(options Options) *LoginService {
 }
 
 func (service *Service) Login(ctx context.Context, input LoginInput) (*Credential, error) {
+	loginProxy := input.LoginProxy
+	flowAttempts := 1
+	acquisitionTimeout := service.options.AcquisitionTimeout
+	if loginProxy.Enabled {
+		flowAttempts = max(1, loginProxy.FlowAttempts)
+		if loginProxy.AcquisitionTimeout > 0 {
+			acquisitionTimeout = loginProxy.AcquisitionTimeout
+		}
+	}
+	selector, errSelector := newLoginProxySelector(loginProxy, service.options.Rand)
+	if errSelector != nil {
+		credential := service.loginCredential(input)
+		pendingState := LifecycleLoginPending
+		if input.Relogin {
+			pendingState = LifecycleReloginPending
+		}
+		authError := newAuthError(
+			"login_proxy_invalid",
+			pendingState,
+			0,
+			false,
+			true,
+			"login proxy configuration is invalid",
+			errSelector,
+		)
+		authError.FailureStage = "client_initialization"
+		service.applyFailure(credential, authError, input.Relogin)
+		return credential, authError
+	}
+
+	acquisitionContext, cancel := service.acquisitionContextWithTimeout(ctx, acquisitionTimeout)
+	defer cancel()
+	var (
+		credential *Credential
+		errLogin   error
+	)
+	for flowAttempt := 1; flowAttempt <= flowAttempts; flowAttempt++ {
+		credential, errLogin = service.loginOnce(acquisitionContext, input, selector, acquisitionTimeout)
+		if errLogin == nil {
+			return credential, nil
+		}
+		authError := ensureAuthError(errLogin, LifecycleLoginPending)
+		authError.Attempts = flowAttempt
+		if authError.FailureStage == "" {
+			authError.FailureStage = loginFailureStage(authError.Code)
+		}
+		errLogin = authError
+		if !authError.Retryable || flowAttempt >= flowAttempts {
+			return credential, errLogin
+		}
+		log.WithFields(log.Fields{
+			"stage":        authError.FailureStage,
+			"flow_attempt": flowAttempt,
+			"flow_total":   flowAttempts,
+		}).Warn("chatgpt web login flow failed; starting a fresh flow")
+		if errDelay := waitLoginRetry(acquisitionContext, loginProxy.RetryDelay, flowAttempt); errDelay != nil {
+			timeoutError := networkAuthError("authentication_network_error", authError.State, errDelay)
+			timeoutError.Attempts = flowAttempt
+			timeoutError.FailureStage = authError.FailureStage
+			service.applyFailure(credential, timeoutError, input.Relogin)
+			return credential, timeoutError
+		}
+	}
+	return credential, errLogin
+}
+
+func (service *Service) loginOnce(acquisitionContext context.Context, input LoginInput, selector *loginProxySelector, acquisitionTimeout time.Duration) (*Credential, error) {
 	credential := service.loginCredential(input)
 	pendingState := LifecycleLoginPending
 	if input.Relogin {
@@ -76,15 +144,25 @@ func (service *Service) Login(ctx context.Context, input LoginInput) (*Credentia
 		return credential, authError
 	}
 
-	acquisitionContext, cancel := service.acquisitionContext(ctx)
-	defer cancel()
-	client, err := NewClient(credential.Persona, input.ProxyURL, credential.Cookies)
+	var (
+		client *Client
+		err    error
+	)
+	if selector != nil {
+		client, err = newLoginClient(credential.Persona, credential.Cookies, selector, acquisitionTimeout)
+	} else {
+		client, err = NewClient(credential.Persona, input.ProxyURL, credential.Cookies)
+		if err == nil {
+			client.loginRetry = &loginClientRetry{attempts: 1}
+		}
+	}
 	if err != nil {
 		authError := newAuthError("client_initialization_failed", pendingState, 0, true, false, "initialize browser client", err)
 		service.applyFailure(credential, authError, input.Relogin)
 		return credential, authError
 	}
 	defer client.CloseIdleConnections()
+	defer client.CloseActiveAcquisitionConnections()
 
 	pkce, state, nonce, err := service.oauthValues()
 	if err != nil {
@@ -106,7 +184,7 @@ func (service *Service) Login(ctx context.Context, input LoginInput) (*Credentia
 	}
 
 	authorizeURL := service.authorizeURL(credential.Email, deviceID, state, nonce, pkce.CodeChallenge)
-	response, payload, err := client.DoFollow(acquisitionContext, http.MethodGet, authorizeURL, map[string]string{
+	response, payload, err := client.DoFollowOnce(acquisitionContext, http.MethodGet, authorizeURL, map[string]string{
 		"accept":                    "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
 		"referer":                   redirectOrigin(service.options.RedirectURL) + "/",
 		"sec-fetch-dest":            "document",
@@ -650,7 +728,7 @@ type sessionPayload struct {
 }
 
 func (service *Service) exchangeCode(ctx context.Context, client *Client, code, verifier string) (tokenPayload, *AuthError) {
-	response, payload, err := client.DoJSON(ctx, false, http.MethodPost,
+	response, payload, err := client.DoJSONOnce(ctx, false, http.MethodPost,
 		service.options.AuthBaseURL+"/api/accounts/oauth/token",
 		map[string]string{
 			"accept":         "application/json",
@@ -927,13 +1005,17 @@ func (service *Service) oauthValues() (PKCE, string, string, error) {
 }
 
 func (service *Service) acquisitionContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	return service.acquisitionContextWithTimeout(ctx, service.options.AcquisitionTimeout)
+}
+
+func (service *Service) acquisitionContextWithTimeout(ctx context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if service.options.AcquisitionTimeout <= 0 {
+	if timeout <= 0 {
 		return context.WithCancel(ctx)
 	}
-	return context.WithTimeout(ctx, service.options.AcquisitionTimeout)
+	return context.WithTimeout(ctx, timeout)
 }
 
 func (service *Service) loginCredential(input LoginInput) *Credential {
@@ -1003,15 +1085,69 @@ func ensureAuthError(err error, defaultState LifecycleState) *AuthError {
 }
 
 func networkAuthError(code string, state LifecycleState, err error) *AuthError {
-	message := "network request failed"
-	if errors.Is(err, context.DeadlineExceeded) {
-		code = "acquisition_deadline_exceeded"
-		message = "authentication acquisition deadline exceeded"
-	} else if errors.Is(err, context.Canceled) {
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		message := "authentication acquisition was canceled"
 		code = "acquisition_canceled"
-		message = "authentication acquisition was canceled"
+		if errors.Is(err, context.DeadlineExceeded) {
+			code = "acquisition_deadline_exceeded"
+			message = "authentication acquisition deadline exceeded"
+		}
+		authError := newAuthError(code, state, 0, true, false, message, err)
+		if requestError, ok := loginRequestErrorDetails(err); ok {
+			authError.Status = requestError.status
+			authError.StatusCode = requestError.status
+			authError.FailureStage = requestError.stage
+			authError.Attempts = requestError.attempts
+		}
+		return authError
 	}
-	return newAuthError(code, state, 0, true, false, message, err)
+	if requestError, ok := loginRequestErrorDetails(err); ok {
+		if requestError.cloudflare {
+			authError := newAuthError(
+				"cloudflare_challenge",
+				state,
+				requestError.status,
+				true,
+				false,
+				"Cloudflare challenge blocked authentication",
+				err,
+			)
+			authError.FailureStage = requestError.stage
+			authError.Attempts = requestError.attempts
+			return authError
+		}
+		authError := newAuthError(code, state, requestError.status, true, false, "network request failed", err)
+		authError.FailureStage = requestError.stage
+		authError.Attempts = requestError.attempts
+		return authError
+	}
+	return newAuthError(code, state, 0, true, false, "network request failed", err)
+}
+
+func loginFailureStage(code string) string {
+	code = strings.ToLower(strings.TrimSpace(code))
+	switch {
+	case strings.HasPrefix(code, "authorize_continue"):
+		return "authorize_continue"
+	case strings.HasPrefix(code, "authorize_redirect"):
+		return "authorize_redirect"
+	case strings.HasPrefix(code, "authorize"):
+		return "authorize"
+	case strings.HasPrefix(code, "password"):
+		return "password_verify"
+	case strings.HasPrefix(code, "mfa"), strings.Contains(code, "totp"):
+		return "mfa_verify"
+	case strings.HasPrefix(code, "token_exchange"), strings.HasPrefix(code, "token_response"):
+		return "token_exchange"
+	case strings.HasPrefix(code, "oauth_redirect"), strings.HasPrefix(code, "invalid_state"):
+		return "oauth_redirect"
+	case strings.HasPrefix(code, "sentinel"):
+		return "sentinel"
+	case strings.HasPrefix(code, "client_"), strings.HasPrefix(code, "cookie_"), strings.HasPrefix(code, "login_proxy"):
+		return "client_initialization"
+	default:
+		return ""
+	}
 }
 
 type apiEnvelope struct {
@@ -1144,7 +1280,7 @@ func (service *Service) verifyTOTPChallenge(ctx context.Context, client *Client,
 	var response *fhttp.Response
 	var payload []byte
 	for redirects := 0; ; redirects++ {
-		response, payload, err = client.DoJSON(ctx, false, http.MethodPost,
+		response, payload, err = client.DoJSONOnce(ctx, false, http.MethodPost,
 			targetURL, service.mfaHeaders(deviceID, referer), body)
 		if err != nil {
 			return apiEnvelope{}, networkAuthError("mfa_verify_network_error", LifecycleLoginPending, err)
@@ -1567,7 +1703,12 @@ func classifyPageType(pageType string) *AuthError {
 	return newAuthError(reason, LifecycleInteractionRequired, 0, false, true, "authentication requires user interaction", nil)
 }
 
-func classifyHTTPResponse(stage string, status int, payload []byte, defaultState LifecycleState) *AuthError {
+func classifyHTTPResponse(stage string, status int, payload []byte, defaultState LifecycleState) (result *AuthError) {
+	defer func() {
+		if result != nil && result.FailureStage == "" {
+			result.FailureStage = stage
+		}
+	}()
 	if status >= 200 && status < 300 {
 		return nil
 	}

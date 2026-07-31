@@ -20,37 +20,40 @@ import (
 )
 
 type loginFixture struct {
-	t                       *testing.T
-	passwordStatus          int
-	passwordBody            string
-	passwordCalls           int
-	authorizePath           string
-	authorizeResponseBody   string
-	authorizeBody           string
-	authorizeContinueCalls  int
-	authorizeRedirect       bool
-	authorizeRedirectURL    string
-	authorizeRedirectStatus int
-	authorizeFollowURL      string
-	authorizeFollowMethod   string
-	authorizeFollowStatus   int
-	passwordPageRedirect    bool
-	passwordRedirect        bool
-	passwordRedirectURL     string
-	passwordRedirectStatus  int
-	passwordRedirectMethod  string
-	tokenCalls              int
-	mfaVerifyCalls          int
-	mfaStatus               int
-	mfaBody                 string
-	mfaContinuationOnly     bool
-	mfaRedirectURL          string
-	mfaRedirectStatus       int
-	wantTOTP                string
-	state                   string
-	codeChallenge           string
-	server                  *httptest.Server
-	mu                      sync.Mutex
+	t                           *testing.T
+	passwordStatus              int
+	passwordBody                string
+	passwordCalls               int
+	authorizePath               string
+	authorizeCalls              int
+	authorizeResponseBody       string
+	authorizeBody               string
+	authorizeContinueCalls      int
+	authorizeContinueCloudflare bool
+	authorizeRedirect           bool
+	authorizeRedirectURL        string
+	authorizeRedirectStatus     int
+	authorizeFollowURL          string
+	authorizeFollowMethod       string
+	authorizeFollowStatus       int
+	passwordPageRedirect        bool
+	passwordRedirect            bool
+	passwordRedirectURL         string
+	passwordRedirectStatus      int
+	passwordRedirectMethod      string
+	tokenCalls                  int
+	tokenCloudflareRemaining    int
+	mfaVerifyCalls              int
+	mfaStatus                   int
+	mfaBody                     string
+	mfaContinuationOnly         bool
+	mfaRedirectURL              string
+	mfaRedirectStatus           int
+	wantTOTP                    string
+	state                       string
+	codeChallenge               string
+	server                      *httptest.Server
+	mu                          sync.Mutex
 }
 
 func newLoginFixture(t *testing.T, passwordStatus int, passwordBody string) *loginFixture {
@@ -158,6 +161,9 @@ func (fixture *loginFixture) handleAuthorize(response http.ResponseWriter, reque
 	if request.Method != http.MethodGet {
 		fixture.t.Errorf("authorize method = %s", request.Method)
 	}
+	fixture.mu.Lock()
+	fixture.authorizeCalls++
+	fixture.mu.Unlock()
 	query := request.URL.Query()
 	for key, want := range map[string]string{
 		"client_id":             OAuthClientID,
@@ -204,7 +210,15 @@ func (fixture *loginFixture) handleSentinel(response http.ResponseWriter, reques
 func (fixture *loginFixture) handleAuthorizeContinue(response http.ResponseWriter, request *http.Request) {
 	fixture.mu.Lock()
 	fixture.authorizeContinueCalls++
+	cloudflare := fixture.authorizeContinueCloudflare
 	fixture.mu.Unlock()
+	if cloudflare {
+		response.Header().Set("CF-Ray", "challenge-ray")
+		response.Header().Set("Content-Type", "text/html")
+		response.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = io.WriteString(response, `<html><title>Just a moment...</title></html>`)
+		return
+	}
 	if request.Header.Get("OpenAI-Sentinel-Token") == "" || request.Header.Get("Oai-Device-Id") == "" {
 		fixture.t.Errorf("authorize/continue headers missing: %#v", request.Header)
 	}
@@ -321,8 +335,19 @@ func (fixture *loginFixture) callbackURL() string {
 func (fixture *loginFixture) handleTokenExchange(response http.ResponseWriter, request *http.Request) {
 	fixture.mu.Lock()
 	fixture.tokenCalls++
+	cloudflare := fixture.tokenCloudflareRemaining > 0
+	if cloudflare {
+		fixture.tokenCloudflareRemaining--
+	}
 	wantChallenge := fixture.codeChallenge
 	fixture.mu.Unlock()
+	if cloudflare {
+		response.Header().Set("CF-Ray", "challenge-ray")
+		response.Header().Set("Content-Type", "text/html")
+		response.WriteHeader(http.StatusForbidden)
+		_, _ = io.WriteString(response, `<html><script src="/cdn-cgi/challenge-platform/x"></script></html>`)
+		return
+	}
 	var body struct {
 		ClientID     string `json:"client_id"`
 		CodeVerifier string `json:"code_verifier"`
@@ -384,6 +409,77 @@ func TestServiceLogin(t *testing.T) {
 	}
 	if len(credential.Cookies) == 0 || credential.Persona.Profile != "chrome_146" {
 		t.Fatal("login did not persist cookies and persona")
+	}
+}
+
+func TestServiceLoginStartsFreshFlowAfterOneTimeCloudflareChallenge(t *testing.T) {
+	fixedNow := time.Date(2026, time.July, 16, 12, 0, 0, 0, time.UTC)
+	fixture := newLoginFixture(t, http.StatusOK, "")
+	fixture.tokenCloudflareRemaining = 1
+	proxy := newLoginConnectProxy(t, nil)
+	template := strings.Replace(proxy.URL, "http://", "http://session-{1}:secret@", 1)
+
+	service := NewService(fixture.options(fixedNow))
+	credential, errLogin := service.Login(t.Context(), LoginInput{
+		Email:    "person@example.com",
+		Password: "correct-password",
+		LoginProxy: LoginProxyConfig{
+			Enabled:            true,
+			URLTemplate:        template,
+			PlaceholderCharset: "ab",
+			RotateOnRetry:      true,
+			RequestAttempts:    3,
+			FlowAttempts:       2,
+			AcquisitionTimeout: 5 * time.Second,
+		},
+	})
+	if errLogin != nil {
+		t.Fatalf("Login() error = %v", errLogin)
+	}
+	if credential == nil || credential.LifecycleState != LifecycleActive {
+		t.Fatalf("credential = %#v", credential)
+	}
+	fixture.mu.Lock()
+	gotTokenCalls := fixture.tokenCalls
+	authorizeContinueCalls := fixture.authorizeContinueCalls
+	fixture.mu.Unlock()
+	if gotTokenCalls != 2 || authorizeContinueCalls != 2 {
+		t.Fatalf("token proxy calls = %d, authorize flows = %d; want 2 and 2", gotTokenCalls, authorizeContinueCalls)
+	}
+}
+
+func TestServiceLoginReportsCloudflareAfterRequestAndFlowRetries(t *testing.T) {
+	fixture := newLoginFixture(t, http.StatusOK, "")
+	fixture.authorizeContinueCloudflare = true
+	proxy := newLoginConnectProxy(t, nil)
+	template := strings.Replace(proxy.URL, "http://", "http://session-{1}:secret@", 1)
+
+	service := NewService(fixture.options(time.Date(2026, time.July, 16, 12, 0, 0, 0, time.UTC)))
+	credential, errLogin := service.Login(t.Context(), LoginInput{
+		Email:    "person@example.com",
+		Password: "correct-password",
+		LoginProxy: LoginProxyConfig{
+			Enabled:            true,
+			URLTemplate:        template,
+			PlaceholderCharset: "ab",
+			RotateOnRetry:      true,
+			RequestAttempts:    2,
+			FlowAttempts:       2,
+			AcquisitionTimeout: 5 * time.Second,
+		},
+	})
+	authError, ok := AsAuthError(errLogin)
+	if !ok || authError.Code != "cloudflare_challenge" || authError.FailureStage != "authorize_continue" || authError.Attempts != 2 {
+		t.Fatalf("Login() error = %#v", errLogin)
+	}
+	if credential == nil || credential.LifecycleState == LifecycleDead {
+		t.Fatalf("Cloudflare challenge marked credential dead: %#v", credential)
+	}
+	fixture.mu.Lock()
+	gotAuthorizeCalls := fixture.authorizeContinueCalls
+	fixture.mu.Unlock()
+	if gotAuthorizeCalls != 4 {
+		t.Fatalf("authorize calls = %d, want 4", gotAuthorizeCalls)
 	}
 }
 

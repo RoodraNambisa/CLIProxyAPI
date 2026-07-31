@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -17,6 +18,7 @@ import (
 	fhttpcookiejar "github.com/bogdanfinn/fhttp/cookiejar"
 	tls_client "github.com/bogdanfinn/tls-client"
 	"github.com/bogdanfinn/tls-client/profiles"
+	log "github.com/sirupsen/logrus"
 )
 
 type Client struct {
@@ -25,7 +27,9 @@ type Client struct {
 	jar                tls_client.CookieJar
 	persona            Persona
 	proxyURL           string
+	acquisitionTimeout time.Duration
 	acquisitionTracker *acquisitionConnectionTracker
+	loginRetry         *loginClientRetry
 }
 
 func NewClient(persona Persona, proxyURL string, cookies []Cookie) (*Client, error) {
@@ -96,6 +100,7 @@ func newClient(persona Persona, proxyURL string, cookies []Cookie, timeout time.
 		jar:                jar,
 		persona:            persona,
 		proxyURL:           proxyURL,
+		acquisitionTimeout: timeout,
 		acquisitionTracker: acquisitionTracker,
 	}
 	if err := client.RestoreCookies(cookies); err != nil {
@@ -148,7 +153,12 @@ func (client *Client) CloseActiveAcquisitionConnections() {
 }
 
 func (client *Client) DoFollow(ctx context.Context, method, targetURL string, headers map[string]string, body io.Reader) (*fhttp.Response, []byte, error) {
-	return client.do(ctx, client.follow, method, targetURL, headers, body)
+	return client.do(ctx, true, true, method, targetURL, headers, body)
+}
+
+// DoFollowOnce executes a redirect-following request without replaying it.
+func (client *Client) DoFollowOnce(ctx context.Context, method, targetURL string, headers map[string]string, body io.Reader) (*fhttp.Response, []byte, error) {
+	return client.do(ctx, true, false, method, targetURL, headers, body)
 }
 
 // DoFollowStream executes a redirect-following request without buffering or
@@ -158,7 +168,12 @@ func (client *Client) DoFollowStream(ctx context.Context, method, targetURL stri
 }
 
 func (client *Client) DoNoRedirect(ctx context.Context, method, targetURL string, headers map[string]string, body io.Reader) (*fhttp.Response, []byte, error) {
-	return client.do(ctx, client.noRedirect, method, targetURL, headers, body)
+	return client.do(ctx, false, true, method, targetURL, headers, body)
+}
+
+// DoNoRedirectOnce executes one no-redirect request without replaying it.
+func (client *Client) DoNoRedirectOnce(ctx context.Context, method, targetURL string, headers map[string]string, body io.Reader) (*fhttp.Response, []byte, error) {
+	return client.do(ctx, false, false, method, targetURL, headers, body)
 }
 
 // DoNoRedirectStream executes a request without following redirects, buffering,
@@ -250,6 +265,15 @@ func chatGPTWebOriginPort(value *url.URL) string {
 }
 
 func (client *Client) DoJSON(ctx context.Context, followRedirect bool, method, targetURL string, headers map[string]string, body any) (*fhttp.Response, []byte, error) {
+	return client.doJSON(ctx, followRedirect, true, method, targetURL, headers, body)
+}
+
+// DoJSONOnce executes one JSON request without replaying it.
+func (client *Client) DoJSONOnce(ctx context.Context, followRedirect bool, method, targetURL string, headers map[string]string, body any) (*fhttp.Response, []byte, error) {
+	return client.doJSON(ctx, followRedirect, false, method, targetURL, headers, body)
+}
+
+func (client *Client) doJSON(ctx context.Context, followRedirect, replayable bool, method, targetURL string, headers map[string]string, body any) (*fhttp.Response, []byte, error) {
 	var reader io.Reader
 	if body != nil {
 		payload, err := json.Marshal(body)
@@ -258,10 +282,7 @@ func (client *Client) DoJSON(ctx context.Context, followRedirect bool, method, t
 		}
 		reader = bytes.NewReader(payload)
 	}
-	if followRedirect {
-		return client.DoFollow(ctx, method, targetURL, headers, reader)
-	}
-	return client.DoNoRedirect(ctx, method, targetURL, headers, reader)
+	return client.do(ctx, followRedirect, replayable, method, targetURL, headers, reader)
 }
 
 // DoJSONStream executes a JSON request without buffering, closing the response
@@ -279,20 +300,143 @@ func (client *Client) DoJSONStream(ctx context.Context, method, targetURL string
 	return client.doStream(ctx, client.noRedirect, method, targetURL, headers, reader)
 }
 
-func (client *Client) do(ctx context.Context, httpClient tls_client.HttpClient, method, targetURL string, headers map[string]string, body io.Reader) (*fhttp.Response, []byte, error) {
-	response, err := client.doStream(ctx, httpClient, method, targetURL, headers, body)
-	if err != nil {
-		return nil, nil, err
+func (client *Client) do(ctx context.Context, followRedirect, replayable bool, method, targetURL string, headers map[string]string, body io.Reader) (*fhttp.Response, []byte, error) {
+	if client == nil {
+		return nil, nil, fmt.Errorf("browser client is nil")
 	}
-	payload, errRead := io.ReadAll(response.Body)
-	errClose := response.Body.Close()
-	if errRead != nil {
-		return response, nil, fmt.Errorf("read response body: %w", errRead)
+	var bodyBytes []byte
+	if body != nil {
+		var errRead error
+		bodyBytes, errRead = io.ReadAll(body)
+		if errRead != nil {
+			return nil, nil, fmt.Errorf("read request body: %w", errRead)
+		}
 	}
-	if errClose != nil {
-		return response, nil, fmt.Errorf("close response body: %w", errClose)
+	attempts := 1
+	if client.loginRetry != nil && replayable {
+		attempts = max(1, client.loginRetry.attempts)
 	}
-	return response, payload, nil
+	stage := loginRequestStage(targetURL)
+	for attempt := 1; attempt <= attempts; attempt++ {
+		var requestBody io.Reader
+		if bodyBytes != nil {
+			requestBody = bytes.NewReader(bodyBytes)
+		}
+		httpClient := client.noRedirect
+		if followRedirect {
+			httpClient = client.follow
+		}
+		response, errRequest := client.doStream(ctx, httpClient, method, targetURL, headers, requestBody)
+		if errRequest != nil {
+			if client.loginRetry != nil && replayable && attempt < attempts {
+				log.WithFields(loginRequestLogFields(targetURL, stage, 0, attempt, attempts)).
+					Warn("chatgpt web login request failed; rotating proxy")
+				if errRetry := client.prepareLoginRequestRetry(ctx, attempt); errRetry == nil {
+					continue
+				} else {
+					errRequest = errors.Join(errRequest, errRetry)
+				}
+			}
+			if client.loginRetry != nil {
+				return nil, nil, &loginRequestError{
+					stage:    stage,
+					attempts: attempt,
+					cause:    errRequest,
+				}
+			}
+			return nil, nil, errRequest
+		}
+		payload, errRead := io.ReadAll(response.Body)
+		errClose := response.Body.Close()
+		if errRead != nil || errClose != nil {
+			errResponse := errors.Join(errRead, errClose)
+			if client.loginRetry != nil && replayable && attempt < attempts {
+				log.WithFields(loginRequestLogFields(targetURL, stage, response.StatusCode, attempt, attempts)).
+					Warn("chatgpt web login response failed; rotating proxy")
+				if errRetry := client.prepareLoginRequestRetry(ctx, attempt); errRetry == nil {
+					continue
+				} else {
+					errResponse = errors.Join(errResponse, errRetry)
+				}
+			}
+			if client.loginRetry != nil {
+				return response, nil, &loginRequestError{
+					stage:    stage,
+					status:   response.StatusCode,
+					attempts: attempt,
+					cause:    errResponse,
+				}
+			}
+			return response, nil, fmt.Errorf("read or close response body: %w", errResponse)
+		}
+		if client.loginRetry != nil && isCloudflareChallenge(response, payload) {
+			log.WithFields(loginRequestLogFields(targetURL, stage, response.StatusCode, attempt, attempts)).
+				Warn("chatgpt web login request encountered a Cloudflare challenge")
+			if replayable && attempt < attempts {
+				if errRetry := client.prepareLoginRequestRetry(ctx, attempt); errRetry == nil {
+					continue
+				} else {
+					return response, payload, &loginRequestError{
+						stage:      stage,
+						status:     response.StatusCode,
+						attempts:   attempt,
+						cloudflare: true,
+						cause:      errRetry,
+					}
+				}
+			}
+			return response, payload, &loginRequestError{
+				stage:      stage,
+				status:     response.StatusCode,
+				attempts:   attempt,
+				cloudflare: true,
+			}
+		}
+		return response, payload, nil
+	}
+	return nil, nil, &loginRequestError{stage: stage, attempts: attempts}
+}
+
+func (client *Client) prepareLoginRequestRetry(ctx context.Context, retryNumber int) error {
+	if client == nil || client.loginRetry == nil || client.loginRetry.selector == nil {
+		return nil
+	}
+	if errDelay := waitLoginRetry(ctx, client.loginRetry.delay, retryNumber); errDelay != nil {
+		return errDelay
+	}
+	proxyURL, errProxy := client.loginRetry.selector.next()
+	if errProxy != nil {
+		return errProxy
+	}
+	replacement, errClient := newClient(
+		client.persona,
+		proxyURL,
+		client.ExportCookies(),
+		client.acquisitionTimeout,
+	)
+	if errClient != nil {
+		return errClient
+	}
+	oldFollow := client.follow
+	oldNoRedirect := client.noRedirect
+	oldTracker := client.acquisitionTracker
+	client.follow = replacement.follow
+	client.noRedirect = replacement.noRedirect
+	client.jar = replacement.jar
+	client.proxyURL = replacement.proxyURL
+	client.acquisitionTracker = replacement.acquisitionTracker
+	replacement.follow = nil
+	replacement.noRedirect = nil
+	if oldFollow != nil {
+		oldFollow.CloseIdleConnections()
+	}
+	if oldNoRedirect != nil {
+		oldNoRedirect.CloseIdleConnections()
+	}
+	if oldTracker != nil {
+		oldTracker.closeAll()
+	}
+	return nil
 }
 
 func (client *Client) doStream(ctx context.Context, httpClient tls_client.HttpClient, method, targetURL string, headers map[string]string, body io.Reader) (*fhttp.Response, error) {

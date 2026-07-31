@@ -59,6 +59,10 @@ type chatGPTWebManagementExecutor interface {
 	ReloginCurrent(context.Context, *coreauth.Auth) (*coreauth.Auth, bool, error)
 }
 
+type chatGPTWebLoginProxyState interface {
+	LoginProxySnapshot() chatgptwebauth.LoginProxyConfig
+}
+
 type chatGPTWebImportExecutor interface {
 	BeginLoginOperation(context.Context, string) (context.Context, func(), error)
 	NormalizeImportedCredential(context.Context, *chatgptwebauth.Credential, string) (*chatgptwebauth.Credential, error)
@@ -87,6 +91,8 @@ type chatGPTWebLoginTaskResult struct {
 	ErrorCategory  string `json:"error_category,omitempty"`
 	Error          string `json:"error,omitempty"`
 	HTTPStatus     int    `json:"http_status,omitempty"`
+	FailureStage   string `json:"failure_stage,omitempty"`
+	Attempts       int    `json:"attempts,omitempty"`
 }
 
 type chatGPTWebLoginTask struct {
@@ -661,9 +667,11 @@ func (h *Handler) ReloginChatGPTWebAuth(c *gin.Context) {
 		return
 	}
 	defer releaseOperation()
-	releaseProxyBinding := manager.HoldProxyBinding(auth.ID)
-	defer releaseProxyBinding()
-
+	loginProxy, loginProxyResolved := chatGPTWebManagementLoginProxySnapshot(executor)
+	if !loginProxyResolved || !loginProxy.Enabled {
+		releaseProxyBinding := manager.HoldProxyBinding(auth.ID)
+		defer releaseProxyBinding()
+	}
 	updated, current, errRelogin := executor.ReloginCurrent(operationCtx, auth)
 	if updated == nil {
 		updated, _ = manager.GetByID(auth.ID)
@@ -705,6 +713,14 @@ func (h *Handler) ReloginChatGPTWebAuth(c *gin.Context) {
 		response["status"] = "failed"
 		response["error_category"] = category
 		response["error"] = message
+		if failureStage, attempts := chatGPTWebManagementErrorDiagnostics(errRelogin); failureStage != "" || attempts > 0 {
+			if failureStage != "" {
+				response["failure_stage"] = failureStage
+			}
+			if attempts > 0 {
+				response["attempts"] = attempts
+			}
+		}
 		if !current && errors.Is(errRelogin, context.Canceled) {
 			status = http.StatusRequestTimeout
 		}
@@ -883,22 +899,30 @@ func (h *Handler) executeChatGPTWebLogin(ctx context.Context, input chatGPTWebLo
 	} else {
 		existingCredential, _ = chatgptwebauth.ParseCredential(pending.Metadata)
 	}
-	releaseProxyBinding := manager.HoldProxyBinding(pending.ID)
-	defer releaseProxyBinding()
-	resolved, errResolve := manager.ResolveProxyAuth(ctx, pending)
-	if errResolve != nil {
-		result.ErrorCategory, result.Error, result.HTTPStatus, result.LifecycleState = classifyChatGPTWebManagementError(errResolve)
-		if result.ErrorCategory == "canceled" {
-			result.Status = chatGPTWebLoginResultCanceled
+	loginProxy, loginProxyResolved := chatGPTWebManagementLoginProxySnapshot(executor)
+	loginProxyEnabled := loginProxyResolved && loginProxy.Enabled
+	resolved := pending
+	if !loginProxyEnabled {
+		releaseProxyBinding := manager.HoldProxyBinding(pending.ID)
+		defer releaseProxyBinding()
+		var errResolve error
+		resolved, errResolve = manager.ResolveProxyAuth(ctx, pending)
+		if errResolve != nil {
+			result.ErrorCategory, result.Error, result.HTTPStatus, result.LifecycleState = classifyChatGPTWebManagementError(errResolve)
+			if result.ErrorCategory == "canceled" {
+				result.Status = chatGPTWebLoginResultCanceled
+			}
+			return result
 		}
-		return result
 	}
 	credential, errLogin := executor.Login(ctx, chatgptwebauth.LoginInput{
-		Email:      input.Email,
-		Password:   input.Password,
-		TOTPSecret: input.TOTPSecret,
-		ProxyURL:   resolved.EffectiveProxyURL(),
-		Credential: existingCredential,
+		Email:              input.Email,
+		Password:           input.Password,
+		TOTPSecret:         input.TOTPSecret,
+		ProxyURL:           resolved.EffectiveProxyURL(),
+		LoginProxy:         loginProxy,
+		LoginProxyResolved: loginProxyResolved,
+		Credential:         existingCredential,
 	})
 	if errors.Is(ctx.Err(), context.Canceled) {
 		return canceledChatGPTWebLoginTaskResult(input)
@@ -906,7 +930,7 @@ func (h *Handler) executeChatGPTWebLogin(ctx context.Context, input chatGPTWebLo
 	if errors.Is(ctx.Err(), context.DeadlineExceeded) && !errors.Is(errLogin, context.DeadlineExceeded) {
 		errLogin = errors.Join(errLogin, context.DeadlineExceeded)
 	}
-	if errLogin != nil && resolved.EffectiveProxyBindingID() != "" {
+	if errLogin != nil && !loginProxyEnabled && resolved.EffectiveProxyBindingID() != "" {
 		errLogin = manager.ReportProxyFailure(ctx, resolved, errLogin)
 	}
 
@@ -972,6 +996,7 @@ func (h *Handler) executeChatGPTWebLogin(ctx context.Context, input chatGPTWebLo
 	}
 	if errLogin != nil {
 		result.ErrorCategory, result.Error, result.HTTPStatus, result.LifecycleState = classifyChatGPTWebManagementError(errLogin)
+		result.FailureStage, result.Attempts = chatGPTWebManagementErrorDiagnostics(errLogin)
 		if result.ErrorCategory == "canceled" {
 			result.Status = chatGPTWebLoginResultCanceled
 		}
@@ -991,6 +1016,22 @@ func (h *Handler) executeChatGPTWebLogin(ctx context.Context, input chatGPTWebLo
 	result.Error = ""
 	result.HTTPStatus = 0
 	return result
+}
+
+func chatGPTWebManagementLoginProxySnapshot(executor chatGPTWebManagementExecutor) (chatgptwebauth.LoginProxyConfig, bool) {
+	state, ok := executor.(chatGPTWebLoginProxyState)
+	if !ok {
+		return chatgptwebauth.LoginProxyConfig{}, false
+	}
+	return state.LoginProxySnapshot(), true
+}
+
+func chatGPTWebManagementErrorDiagnostics(err error) (string, int) {
+	authError, ok := chatgptwebauth.AsAuthError(err)
+	if !ok {
+		return "", 0
+	}
+	return strings.TrimSpace(authError.FailureStage), max(0, authError.Attempts)
 }
 
 func (h *Handler) persistChatGPTWebLoginCredential(ctx context.Context, manager *coreauth.Manager, fileName string, credential *chatgptwebauth.Credential, existing *coreauth.Auth, loginErr error) (*coreauth.Auth, error) {
@@ -1311,6 +1352,10 @@ func safeChatGPTWebErrorMessage(category string) string {
 		return "credential was rate limited"
 	case "credential_cooldown":
 		return "credential is cooling down"
+	case "cloudflare_challenge":
+		return "Cloudflare challenge blocked authentication"
+	case "login_proxy_invalid":
+		return "login proxy configuration is invalid"
 	default:
 		return "chatgpt web authentication failed"
 	}

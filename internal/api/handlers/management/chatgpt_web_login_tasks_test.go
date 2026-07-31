@@ -40,6 +40,7 @@ type chatGPTWebManagementTestExecutor struct {
 	normalizeFn func(context.Context, *chatgptwebauth.Credential, string) (*chatgptwebauth.Credential, error)
 	fetchFn     func(context.Context, *coreauth.Auth) ([]chatgptwebauth.CatalogModel, error)
 	beginFn     func(context.Context, string) (context.Context, func(), error)
+	loginProxy  chatgptwebauth.LoginProxyConfig
 }
 
 type countingChatGPTWebAuthStore struct {
@@ -68,6 +69,25 @@ func (store *failingListChatGPTWebAuthStore) List(ctx context.Context) ([]*corea
 type chatGPTWebManagementLeaseResolver struct {
 	active atomic.Int32
 	heldID chan string
+}
+
+type rejectingChatGPTWebManagementProxyResolver struct {
+	resolveCalls atomic.Int32
+	holdCalls    atomic.Int32
+}
+
+func (resolver *rejectingChatGPTWebManagementProxyResolver) Resolve(context.Context, *coreauth.Auth) (coreauth.ResolvedProxy, error) {
+	resolver.resolveCalls.Add(1)
+	return coreauth.ResolvedProxy{}, errors.New("normal proxy resolution must be bypassed")
+}
+
+func (*rejectingChatGPTWebManagementProxyResolver) ReportFailure(_ context.Context, _ *coreauth.Auth, err error) error {
+	return err
+}
+
+func (resolver *rejectingChatGPTWebManagementProxyResolver) HoldBinding(string) func() {
+	resolver.holdCalls.Add(1)
+	return func() {}
 }
 
 func (*chatGPTWebManagementLeaseResolver) Resolve(context.Context, *coreauth.Auth) (coreauth.ResolvedProxy, error) {
@@ -157,6 +177,12 @@ func (executor *chatGPTWebManagementTestExecutor) Login(ctx context.Context, inp
 		return nil, errors.New("unexpected login")
 	}
 	return loginFn(ctx, input)
+}
+
+func (executor *chatGPTWebManagementTestExecutor) LoginProxySnapshot() chatgptwebauth.LoginProxyConfig {
+	executor.mu.Lock()
+	defer executor.mu.Unlock()
+	return executor.loginProxy
 }
 
 func (executor *chatGPTWebManagementTestExecutor) BeginLoginOperation(ctx context.Context, key string) (context.Context, func(), error) {
@@ -482,6 +508,48 @@ func TestChatGPTWebLoginTaskPersistsSafeSuccessAndTerminalFailure(t *testing.T) 
 		if runtime.GOOS != "windows" && info.Mode().Perm() != 0o600 {
 			t.Fatalf("%s mode = %o, want 600", path, info.Mode().Perm())
 		}
+	}
+}
+
+func TestExecuteChatGPTWebLoginBypassesNormalProxyResolutionWhenDedicatedProxyEnabled(t *testing.T) {
+	executor := &chatGPTWebManagementTestExecutor{loginProxy: chatgptwebauth.LoginProxyConfig{
+		Enabled:            true,
+		URLTemplate:        "http://session-{8}:secret@proxy.example:8080",
+		RotateOnRetry:      true,
+		RequestAttempts:    3,
+		FlowAttempts:       2,
+		AcquisitionTimeout: 90 * time.Second,
+	}}
+	executor.loginFn = func(_ context.Context, input chatgptwebauth.LoginInput) (*chatgptwebauth.Credential, error) {
+		if !input.LoginProxyResolved || !input.LoginProxy.Enabled || input.ProxyURL != "" {
+			t.Fatalf("login input did not use the fixed dedicated proxy snapshot: %#v", input)
+		}
+		return activeChatGPTWebManagementTestCredential(input), nil
+	}
+	handler, manager, _ := newChatGPTWebManagementTestHandler(t, executor)
+	resolver := &rejectingChatGPTWebManagementProxyResolver{}
+	manager.SetProxyResolver(resolver)
+	input := chatGPTWebLoginInput{
+		Line:     1,
+		Email:    "dedicated-proxy@example.com",
+		Password: "password",
+	}
+	result := handler.executeChatGPTWebLogin(
+		t.Context(),
+		input,
+		executor,
+		manager,
+		func() (context.Context, bool) { return t.Context(), true },
+	)
+	if result.Status != chatGPTWebLoginResultSuccess {
+		t.Fatalf("login result = %+v", result)
+	}
+	if resolver.resolveCalls.Load() != 0 || resolver.holdCalls.Load() != 0 {
+		t.Fatalf(
+			"normal proxy resolver was used: resolve=%d hold=%d",
+			resolver.resolveCalls.Load(),
+			resolver.holdCalls.Load(),
+		)
 	}
 }
 

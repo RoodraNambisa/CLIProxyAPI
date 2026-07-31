@@ -127,6 +127,69 @@ func (service *fakeChatGPTWebAuthService) RefreshSession(ctx context.Context, cr
 	return service.refreshSessionFn(ctx, credential, proxyURL)
 }
 
+func TestChatGPTWebExecutorAppliesDedicatedProxyOnlyToLogin(t *testing.T) {
+	rotate := true
+	requestAttempts := 4
+	flowAttempts := 3
+	retryDelay := 250
+	timeout := 120
+	cfg := &config.Config{ChatGPTWeb: config.ChatGPTWebConfig{LoginProxy: config.ChatGPTWebLoginProxyConfig{
+		Enabled:                   true,
+		URLTemplate:               "http://session-{8}:secret@proxy.example:8080",
+		PlaceholderCharset:        "abc123",
+		RotateOnRetry:             &rotate,
+		RequestAttempts:           &requestAttempts,
+		FlowAttempts:              &flowAttempts,
+		RetryDelayMilliseconds:    &retryDelay,
+		AcquisitionTimeoutSeconds: &timeout,
+	}}}
+	var receivedLogin chatgptwebauth.LoginInput
+	var receivedRefreshProxy string
+	fake := &fakeChatGPTWebAuthService{
+		loginFn: func(_ context.Context, input chatgptwebauth.LoginInput) (*chatgptwebauth.Credential, error) {
+			receivedLogin = input
+			return &chatgptwebauth.Credential{LifecycleState: chatgptwebauth.LifecycleActive}, nil
+		},
+		refreshFn: func(_ context.Context, credential chatgptwebauth.Credential, proxyURL string) (*chatgptwebauth.Credential, error) {
+			receivedRefreshProxy = proxyURL
+			credential.AccessToken = "refreshed"
+			credential.LifecycleState = chatgptwebauth.LifecycleActive
+			return &credential, nil
+		},
+	}
+	executor := NewChatGPTWebExecutor(cfg, nil)
+	defer func() {
+		if errClose := executor.Close(); errClose != nil {
+			t.Fatal(errClose)
+		}
+	}()
+	executor.authService = fake
+	if _, errLogin := executor.Login(t.Context(), chatgptwebauth.LoginInput{
+		Email:    "person@example.com",
+		Password: "secret",
+		ProxyURL: "http://normal-proxy.example:8080",
+	}); errLogin != nil {
+		t.Fatalf("Login() error = %v", errLogin)
+	}
+	if receivedLogin.ProxyURL != "" || !receivedLogin.LoginProxy.Enabled ||
+		receivedLogin.LoginProxy.URLTemplate != cfg.ChatGPTWeb.LoginProxy.URLTemplate ||
+		receivedLogin.LoginProxy.RequestAttempts != requestAttempts ||
+		receivedLogin.LoginProxy.FlowAttempts != flowAttempts ||
+		receivedLogin.LoginProxy.RetryDelay != 250*time.Millisecond ||
+		receivedLogin.LoginProxy.AcquisitionTimeout != 120*time.Second {
+		t.Fatalf("login input = %#v", receivedLogin)
+	}
+
+	auth := chatGPTWebTestAuth("login-proxy-refresh")
+	auth.ProxyURL = "http://credential-proxy.example:8080"
+	if _, errRefresh := executor.Refresh(t.Context(), auth); errRefresh != nil {
+		t.Fatalf("Refresh() error = %v", errRefresh)
+	}
+	if receivedRefreshProxy != auth.ProxyURL {
+		t.Fatalf("refresh proxy = %q, want existing credential proxy %q", receivedRefreshProxy, auth.ProxyURL)
+	}
+}
+
 func TestChatGPTWebExecutorRefreshUsesActualTargetForEnvironmentProxy(t *testing.T) {
 	t.Setenv("HTTP_PROXY", "")
 	t.Setenv("http_proxy", "")

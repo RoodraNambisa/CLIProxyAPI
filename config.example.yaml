@@ -104,6 +104,19 @@ chatgpt-web:
       input-image-tokens: 0
       output-text-tokens: 0
       output-image-tokens: 2000
+  login-proxy:
+    # Use this dynamic proxy only for initial, manual, and background password login.
+    # Token/session refresh, quota refresh, and model requests keep their existing routing.
+    enabled: false
+    url-template: ""
+    # Empty uses the URL-safe alphanumeric default. {N} placeholders are allowed
+    # only inside proxy credentials and are expanded independently.
+    placeholder-charset: ""
+    rotate-on-retry: true
+    request-attempts: 3
+    flow-attempts: 2
+    retry-delay-milliseconds: 800
+    acquisition-timeout-seconds: 90
   account-info:
     # Disable provider-owned quota refreshes and current-page automatic tasks.
     # Manual force refreshes remain available.

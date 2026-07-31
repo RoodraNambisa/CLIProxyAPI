@@ -238,6 +238,8 @@ func TestCredentialMetadataSanitizesUnknownLifecycleReason(t *testing.T) {
 		"token_refresh_network_error",
 		"token_exchange_network_error",
 		"oauth_redirect_network_error",
+		"cloudflare_challenge",
+		"login_proxy_invalid",
 	} {
 		if got := SafeLifecycleReason(reason); got != reason {
 			t.Errorf("network lifecycle reason %q = %q", reason, got)

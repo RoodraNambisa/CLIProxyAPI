@@ -290,6 +290,34 @@ func BuildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 	if oldFallbackUsage.OutputImageTokens != newFallbackUsage.OutputImageTokens {
 		changes = append(changes, fmt.Sprintf("chatgpt-web.image-usage.fallback-usage.output-image-tokens: %d -> %d", oldFallbackUsage.OutputImageTokens, newFallbackUsage.OutputImageTokens))
 	}
+	oldLoginProxy := oldCfg.ChatGPTWeb.LoginProxy.Resolved()
+	newLoginProxy := newCfg.ChatGPTWeb.LoginProxy.Resolved()
+	if oldLoginProxy.Enabled != newLoginProxy.Enabled {
+		changes = append(changes, fmt.Sprintf("chatgpt-web.login-proxy.enabled: %t -> %t", oldLoginProxy.Enabled, newLoginProxy.Enabled))
+	}
+	if (oldLoginProxy.URLTemplate != "") != (newLoginProxy.URLTemplate != "") {
+		changes = append(changes, fmt.Sprintf("chatgpt-web.login-proxy.url-template-configured: %t -> %t", oldLoginProxy.URLTemplate != "", newLoginProxy.URLTemplate != ""))
+	} else if oldLoginProxy.URLTemplate != newLoginProxy.URLTemplate {
+		changes = append(changes, "chatgpt-web.login-proxy.url-template: changed")
+	}
+	if oldLoginProxy.PlaceholderCharset != newLoginProxy.PlaceholderCharset {
+		changes = append(changes, "chatgpt-web.login-proxy.placeholder-charset: changed")
+	}
+	if oldLoginProxy.RotateOnRetry != newLoginProxy.RotateOnRetry {
+		changes = append(changes, fmt.Sprintf("chatgpt-web.login-proxy.rotate-on-retry: %t -> %t", oldLoginProxy.RotateOnRetry, newLoginProxy.RotateOnRetry))
+	}
+	if oldLoginProxy.RequestAttempts != newLoginProxy.RequestAttempts {
+		changes = append(changes, fmt.Sprintf("chatgpt-web.login-proxy.request-attempts: %d -> %d", oldLoginProxy.RequestAttempts, newLoginProxy.RequestAttempts))
+	}
+	if oldLoginProxy.FlowAttempts != newLoginProxy.FlowAttempts {
+		changes = append(changes, fmt.Sprintf("chatgpt-web.login-proxy.flow-attempts: %d -> %d", oldLoginProxy.FlowAttempts, newLoginProxy.FlowAttempts))
+	}
+	if oldLoginProxy.RetryDelayMilliseconds != newLoginProxy.RetryDelayMilliseconds {
+		changes = append(changes, fmt.Sprintf("chatgpt-web.login-proxy.retry-delay-milliseconds: %d -> %d", oldLoginProxy.RetryDelayMilliseconds, newLoginProxy.RetryDelayMilliseconds))
+	}
+	if oldLoginProxy.AcquisitionTimeoutSeconds != newLoginProxy.AcquisitionTimeoutSeconds {
+		changes = append(changes, fmt.Sprintf("chatgpt-web.login-proxy.acquisition-timeout-seconds: %d -> %d", oldLoginProxy.AcquisitionTimeoutSeconds, newLoginProxy.AcquisitionTimeoutSeconds))
+	}
 	if oldCfg.Images.ChatGPTWeb.ResolvedUpstreamModel() != newCfg.Images.ChatGPTWeb.ResolvedUpstreamModel() {
 		changes = append(changes, fmt.Sprintf("images.chatgpt-web.upstream-model: %s -> %s", oldCfg.Images.ChatGPTWeb.ResolvedUpstreamModel(), newCfg.Images.ChatGPTWeb.ResolvedUpstreamModel()))
 	}

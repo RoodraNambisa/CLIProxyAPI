@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
+	"github.com/router-for-me/CLIProxyAPI/v6/sdk/proxyutil"
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/crypto/bcrypt"
 	"gopkg.in/yaml.v3"
@@ -73,6 +74,18 @@ const (
 	MaxChatGPTWebAccountInfoTTLMinutes         = 1440
 	MaxChatGPTWebAccountInfoJitterSeconds      = 300
 	MaxChatGPTWebAccountInfoRetries            = 10
+	DefaultChatGPTWebLoginProxyRequestAttempts = 3
+	DefaultChatGPTWebLoginProxyFlowAttempts    = 2
+	DefaultChatGPTWebLoginProxyRetryDelayMS    = 800
+	DefaultChatGPTWebLoginProxyTimeoutSeconds  = 90
+	MinChatGPTWebLoginProxyRequestAttempts     = 1
+	MaxChatGPTWebLoginProxyRequestAttempts     = 10
+	MinChatGPTWebLoginProxyFlowAttempts        = 1
+	MaxChatGPTWebLoginProxyFlowAttempts        = 5
+	MinChatGPTWebLoginProxyRetryDelayMS        = 0
+	MaxChatGPTWebLoginProxyRetryDelayMS        = 10000
+	MinChatGPTWebLoginProxyTimeoutSeconds      = 30
+	MaxChatGPTWebLoginProxyTimeoutSeconds      = 600
 )
 
 var (
@@ -471,6 +484,7 @@ type ChatGPTWebConfig struct {
 	EstimateTokenUsage *bool                       `yaml:"estimate-token-usage,omitempty" json:"estimate-token-usage,omitempty"`
 	UsageCache         ChatGPTWebUsageCacheConfig  `yaml:"usage-cache,omitempty" json:"usage-cache,omitempty"`
 	ImageUsage         ChatGPTWebImageUsageConfig  `yaml:"image-usage,omitempty" json:"image-usage,omitempty"`
+	LoginProxy         ChatGPTWebLoginProxyConfig  `yaml:"login-proxy,omitempty" json:"login-proxy,omitempty"`
 	AccountInfo        ChatGPTWebAccountInfoConfig `yaml:"account-info,omitempty" json:"account-info,omitempty"`
 
 	Sentinel ChatGPTWebSentinelConfig `yaml:"sentinel" json:"sentinel"`
@@ -695,6 +709,108 @@ func (cfg ChatGPTWebImageUsageConfig) Validate() error {
 	return nil
 }
 
+// ChatGPTWebLoginProxyConfig controls a dynamic proxy used only by password login flows.
+type ChatGPTWebLoginProxyConfig struct {
+	Enabled                   bool   `yaml:"enabled" json:"enabled"`
+	URLTemplate               string `yaml:"url-template,omitempty" json:"url-template,omitempty"`
+	PlaceholderCharset        string `yaml:"placeholder-charset,omitempty" json:"placeholder-charset,omitempty"`
+	RotateOnRetry             *bool  `yaml:"rotate-on-retry,omitempty" json:"rotate-on-retry,omitempty"`
+	RequestAttempts           *int   `yaml:"request-attempts,omitempty" json:"request-attempts,omitempty"`
+	FlowAttempts              *int   `yaml:"flow-attempts,omitempty" json:"flow-attempts,omitempty"`
+	RetryDelayMilliseconds    *int   `yaml:"retry-delay-milliseconds,omitempty" json:"retry-delay-milliseconds,omitempty"`
+	AcquisitionTimeoutSeconds *int   `yaml:"acquisition-timeout-seconds,omitempty" json:"acquisition-timeout-seconds,omitempty"`
+}
+
+// ResolvedChatGPTWebLoginProxyConfig contains effective login-only proxy values.
+type ResolvedChatGPTWebLoginProxyConfig struct {
+	Enabled                   bool   `json:"enabled"`
+	URLTemplate               string `json:"url-template"`
+	PlaceholderCharset        string `json:"placeholder-charset"`
+	RotateOnRetry             bool   `json:"rotate-on-retry"`
+	RequestAttempts           int    `json:"request-attempts"`
+	FlowAttempts              int    `json:"flow-attempts"`
+	RetryDelayMilliseconds    int    `json:"retry-delay-milliseconds"`
+	AcquisitionTimeoutSeconds int    `json:"acquisition-timeout-seconds"`
+}
+
+// Resolved returns the effective login-only proxy configuration.
+func (cfg ChatGPTWebLoginProxyConfig) Resolved() ResolvedChatGPTWebLoginProxyConfig {
+	resolved := ResolvedChatGPTWebLoginProxyConfig{
+		Enabled:                   cfg.Enabled,
+		URLTemplate:               strings.TrimSpace(cfg.URLTemplate),
+		PlaceholderCharset:        strings.TrimSpace(cfg.PlaceholderCharset),
+		RotateOnRetry:             true,
+		RequestAttempts:           DefaultChatGPTWebLoginProxyRequestAttempts,
+		FlowAttempts:              DefaultChatGPTWebLoginProxyFlowAttempts,
+		RetryDelayMilliseconds:    DefaultChatGPTWebLoginProxyRetryDelayMS,
+		AcquisitionTimeoutSeconds: DefaultChatGPTWebLoginProxyTimeoutSeconds,
+	}
+	if cfg.RotateOnRetry != nil {
+		resolved.RotateOnRetry = *cfg.RotateOnRetry
+	}
+	if cfg.RequestAttempts != nil {
+		resolved.RequestAttempts = *cfg.RequestAttempts
+	}
+	if cfg.FlowAttempts != nil {
+		resolved.FlowAttempts = *cfg.FlowAttempts
+	}
+	if cfg.RetryDelayMilliseconds != nil {
+		resolved.RetryDelayMilliseconds = *cfg.RetryDelayMilliseconds
+	}
+	if cfg.AcquisitionTimeoutSeconds != nil {
+		resolved.AcquisitionTimeoutSeconds = *cfg.AcquisitionTimeoutSeconds
+	}
+	return resolved
+}
+
+// Validate rejects invalid login-only proxy templates and retry bounds.
+func (cfg ChatGPTWebLoginProxyConfig) Validate() error {
+	resolved := cfg.Resolved()
+	if _, errCharset := proxyutil.NormalizePlaceholderCharset(resolved.PlaceholderCharset); errCharset != nil {
+		return fmt.Errorf("chatgpt-web.login-proxy.placeholder-charset: %w", errCharset)
+	}
+	if resolved.URLTemplate != "" {
+		if _, _, errTemplate := proxyutil.ValidateURLTemplate(resolved.URLTemplate, "", resolved.PlaceholderCharset); errTemplate != nil {
+			return fmt.Errorf("chatgpt-web.login-proxy.url-template: %w", errTemplate)
+		}
+	} else if resolved.Enabled {
+		return fmt.Errorf("chatgpt-web.login-proxy.url-template is required when enabled")
+	}
+	if resolved.RequestAttempts < MinChatGPTWebLoginProxyRequestAttempts ||
+		resolved.RequestAttempts > MaxChatGPTWebLoginProxyRequestAttempts {
+		return fmt.Errorf(
+			"chatgpt-web.login-proxy.request-attempts must be between %d and %d",
+			MinChatGPTWebLoginProxyRequestAttempts,
+			MaxChatGPTWebLoginProxyRequestAttempts,
+		)
+	}
+	if resolved.FlowAttempts < MinChatGPTWebLoginProxyFlowAttempts ||
+		resolved.FlowAttempts > MaxChatGPTWebLoginProxyFlowAttempts {
+		return fmt.Errorf(
+			"chatgpt-web.login-proxy.flow-attempts must be between %d and %d",
+			MinChatGPTWebLoginProxyFlowAttempts,
+			MaxChatGPTWebLoginProxyFlowAttempts,
+		)
+	}
+	if resolved.RetryDelayMilliseconds < MinChatGPTWebLoginProxyRetryDelayMS ||
+		resolved.RetryDelayMilliseconds > MaxChatGPTWebLoginProxyRetryDelayMS {
+		return fmt.Errorf(
+			"chatgpt-web.login-proxy.retry-delay-milliseconds must be between %d and %d",
+			MinChatGPTWebLoginProxyRetryDelayMS,
+			MaxChatGPTWebLoginProxyRetryDelayMS,
+		)
+	}
+	if resolved.AcquisitionTimeoutSeconds < MinChatGPTWebLoginProxyTimeoutSeconds ||
+		resolved.AcquisitionTimeoutSeconds > MaxChatGPTWebLoginProxyTimeoutSeconds {
+		return fmt.Errorf(
+			"chatgpt-web.login-proxy.acquisition-timeout-seconds must be between %d and %d",
+			MinChatGPTWebLoginProxyTimeoutSeconds,
+			MaxChatGPTWebLoginProxyTimeoutSeconds,
+		)
+	}
+	return nil
+}
+
 // Validate checks all ChatGPT Web runtime configuration.
 func (cfg ChatGPTWebConfig) Validate() error {
 	relogin := cfg.ResolvedAutoRelogin()
@@ -723,6 +839,9 @@ func (cfg ChatGPTWebConfig) Validate() error {
 		return err
 	}
 	if err := cfg.ImageUsage.Validate(); err != nil {
+		return err
+	}
+	if err := cfg.LoginProxy.Validate(); err != nil {
 		return err
 	}
 	if err := cfg.AccountInfo.Validate(); err != nil {
@@ -1668,6 +1787,8 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	}
 	cfg.ChatGPTWeb.UsageCache.Path = strings.TrimSpace(cfg.ChatGPTWeb.UsageCache.Path)
 	cfg.ChatGPTWeb.ImageUsage.AutoOutputQuality = strings.ToLower(strings.TrimSpace(cfg.ChatGPTWeb.ImageUsage.AutoOutputQuality))
+	cfg.ChatGPTWeb.LoginProxy.URLTemplate = strings.TrimSpace(cfg.ChatGPTWeb.LoginProxy.URLTemplate)
+	cfg.ChatGPTWeb.LoginProxy.PlaceholderCharset = strings.TrimSpace(cfg.ChatGPTWeb.LoginProxy.PlaceholderCharset)
 	if err = cfg.ChatGPTWeb.Validate(); err != nil {
 		return nil, err
 	}
@@ -3510,6 +3631,7 @@ func preservesExplicitChatGPTWebValue(fullPath string, node *yaml.Node) bool {
 			"estimate-token-usage",
 			"usage-cache",
 			"image-usage",
+			"login-proxy",
 			"account-info",
 			"sentinel",
 		} {
@@ -3527,6 +3649,17 @@ func preservesExplicitChatGPTWebValue(fullPath string, node *yaml.Node) bool {
 		return true
 	case "chatgpt-web.estimate-token-usage":
 		return node.Kind == yaml.ScalarNode && node.Tag == "!!bool"
+	case "chatgpt-web.login-proxy":
+		return node.Kind == yaml.MappingNode && len(node.Content) > 0
+	case "chatgpt-web.login-proxy.enabled",
+		"chatgpt-web.login-proxy.url-template",
+		"chatgpt-web.login-proxy.placeholder-charset",
+		"chatgpt-web.login-proxy.rotate-on-retry",
+		"chatgpt-web.login-proxy.request-attempts",
+		"chatgpt-web.login-proxy.flow-attempts",
+		"chatgpt-web.login-proxy.retry-delay-milliseconds",
+		"chatgpt-web.login-proxy.acquisition-timeout-seconds":
+		return true
 	case "chatgpt-web.usage-cache.enabled",
 		"chatgpt-web.usage-cache.disk-threshold-mb",
 		"chatgpt-web.usage-cache.max-disk-size-mb",

@@ -438,7 +438,33 @@ func (e *ChatGPTWebExecutor) Login(ctx context.Context, input chatgptwebauth.Log
 	if e == nil || e.authService == nil {
 		return nil, errors.New("chatgpt web authentication service is unavailable")
 	}
+	if !input.LoginProxyResolved {
+		input.LoginProxy = e.LoginProxySnapshot()
+		input.LoginProxyResolved = true
+	}
+	if input.LoginProxy.Enabled {
+		input.ProxyURL = ""
+	}
 	return e.authService.Login(ctx, input)
+}
+
+// LoginProxySnapshot returns one immutable login-only proxy configuration copy.
+func (e *ChatGPTWebExecutor) LoginProxySnapshot() chatgptwebauth.LoginProxyConfig {
+	cfg := e.configSnapshot()
+	if cfg == nil {
+		return chatgptwebauth.LoginProxyConfig{}
+	}
+	resolved := cfg.ChatGPTWeb.LoginProxy.Resolved()
+	return chatgptwebauth.LoginProxyConfig{
+		Enabled:            resolved.Enabled,
+		URLTemplate:        resolved.URLTemplate,
+		PlaceholderCharset: resolved.PlaceholderCharset,
+		RotateOnRetry:      resolved.RotateOnRetry,
+		RequestAttempts:    resolved.RequestAttempts,
+		FlowAttempts:       resolved.FlowAttempts,
+		RetryDelay:         time.Duration(resolved.RetryDelayMilliseconds) * time.Millisecond,
+		AcquisitionTimeout: time.Duration(resolved.AcquisitionTimeoutSeconds) * time.Second,
+	}
 }
 
 // NormalizeImportedCredential validates and refreshes one imported credential
@@ -1042,20 +1068,28 @@ func (e *ChatGPTWebExecutor) reloginCurrent(ctx context.Context, expected *clipr
 		}
 	}
 
-	releaseProxyBinding := e.manager.HoldProxyBinding(expected.ID)
-	defer releaseProxyBinding()
-	resolved, errResolve := e.manager.ResolveProxyAuth(ctx, expected)
-	if errResolve != nil {
-		return nil, false, errResolve
+	loginProxy := e.LoginProxySnapshot()
+	loginProxyEnabled := loginProxy.Enabled
+	resolved := expected
+	if !loginProxyEnabled {
+		releaseProxyBinding := e.manager.HoldProxyBinding(expected.ID)
+		defer releaseProxyBinding()
+		var errResolve error
+		resolved, errResolve = e.manager.ResolveProxyAuth(ctx, expected)
+		if errResolve != nil {
+			return nil, false, errResolve
+		}
 	}
 	credential, errCredential := chatgptwebauth.ParseCredential(resolved.Metadata)
 	if errCredential != nil {
 		return nil, false, fmt.Errorf("parse chatgpt web credential: %w", errCredential)
 	}
-	result, errLogin := e.authService.Login(ctx, chatgptwebauth.LoginInput{
-		Credential: credential,
-		ProxyURL:   e.proxyURLForTarget(resolved, chatgptwebauth.AuthBaseURL),
-		Relogin:    true,
+	result, errLogin := e.Login(ctx, chatgptwebauth.LoginInput{
+		Credential:         credential,
+		ProxyURL:           e.proxyURLForTarget(resolved, chatgptwebauth.AuthBaseURL),
+		LoginProxy:         loginProxy,
+		LoginProxyResolved: true,
+		Relogin:            true,
 	})
 	if errContext := ctx.Err(); errContext != nil {
 		if latest, ok := e.manager.GetByID(expected.ID); ok &&
@@ -1064,7 +1098,7 @@ func (e *ChatGPTWebExecutor) reloginCurrent(ctx context.Context, expected *clipr
 		}
 		return nil, false, errContext
 	}
-	if errLogin != nil && chatgptwebauth.IsRetryable(errLogin) {
+	if errLogin != nil && chatgptwebauth.IsRetryable(errLogin) && !loginProxyEnabled {
 		return nil, false, e.manager.ReportProxyFailure(ctx, resolved, errLogin)
 	}
 	if result == nil {

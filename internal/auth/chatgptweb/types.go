@@ -486,8 +486,23 @@ type LoginInput struct {
 	Password   string
 	TOTPSecret string
 	ProxyURL   string
-	Credential *Credential
-	Relogin    bool
+	LoginProxy LoginProxyConfig
+	// LoginProxyResolved keeps one runtime configuration snapshot fixed for the whole flow.
+	LoginProxyResolved bool
+	Credential         *Credential
+	Relogin            bool
+}
+
+// LoginProxyConfig configures the dynamic proxy used only during password login.
+type LoginProxyConfig struct {
+	Enabled            bool
+	URLTemplate        string
+	PlaceholderCharset string
+	RotateOnRetry      bool
+	RequestAttempts    int
+	FlowAttempts       int
+	RetryDelay         time.Duration
+	AcquisitionTimeout time.Duration
 }
 
 type Options struct {
