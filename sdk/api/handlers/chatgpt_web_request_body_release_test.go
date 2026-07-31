@@ -3,11 +3,13 @@ package handlers
 import (
 	"context"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor/helps"
 	coreexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 )
 
@@ -78,5 +80,73 @@ func TestConfiguredBodyReleaseStillUsesTimerOutsideChatGPTWeb(t *testing.T) {
 	}
 	if !controller.Released() {
 		t.Fatal("non-Web global timer did not release the request body after cancellation")
+	}
+}
+
+func TestConfiguredLogOnlyBodyReleasePropagatesExistingController(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	ginCtx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	bindingWriter := &requestBodyReleaseBindingWriter{ResponseWriter: ginCtx.Writer}
+	ginCtx.Writer = bindingWriter
+
+	body := []byte(`{"model":"gpt-5","input":"keep downstream body"}`)
+	controller := coreexecutor.NewRequestBodyReleaseControllerWithMode(int64(len(body)), []byte("<timer release>"), true)
+	ginCtx.Set(coreexecutor.BodyReleaseControllerMetadataKey, controller)
+
+	handler := &BaseAPIHandler{Cfg: &config.SDKConfig{RequestBodyRelease: config.RequestBodyReleaseConfig{
+		Enable:  true,
+		LogOnly: true,
+	}}}
+	metadata := make(map[string]any)
+	ctx := context.WithValue(context.Background(), "gin", ginCtx)
+	ctx, attached := handler.attachRequestBodyRelease(ctx, body, metadata, false)
+	if attached != controller {
+		t.Fatal("configured log-only controller was not reused")
+	}
+	if coreexecutor.RequestBodyReleaseControllerFromContext(ctx) != controller ||
+		coreexecutor.RequestBodyReleaseControllerFromMetadata(metadata) != controller {
+		t.Fatal("configured log-only controller was not propagated")
+	}
+	if bindingWriter.controller != controller {
+		t.Fatal("request log writer was not bound to the log-only controller")
+	}
+
+	req := coreexecutor.Request{Payload: []byte("keep executor payload")}
+	opts := coreexecutor.Options{
+		OriginalRequest: []byte("keep executor original request"),
+		Metadata:        metadata,
+	}
+	unregister := coreexecutor.RegisterRequestBodyReleaseCleanup(ctx, &req, &opts)
+	defer unregister()
+	loggingCfg := &config.Config{SDKConfig: config.SDKConfig{RequestLog: true}}
+	helps.RecordAPIRequest(ctx, loggingCfg, helps.UpstreamRequestLog{Body: []byte("drop HTTP log body")})
+	helps.RecordAPIWebsocketRequest(ctx, loggingCfg, helps.UpstreamRequestLog{Body: []byte("drop WebSocket log body")})
+
+	if !helps.ReleaseRequestBodyAfterStreamEstablished(ctx, opts) {
+		t.Fatal("stream-established log-only release did not run")
+	}
+	if !controller.Replayable() {
+		t.Fatal("log-only release made the request non-replayable")
+	}
+	if string(req.Payload) != "keep executor payload" || string(opts.OriginalRequest) != "keep executor original request" {
+		t.Fatal("log-only release cleared executor request bodies")
+	}
+
+	for _, key := range []string{"API_REQUEST", "API_WEBSOCKET_TIMELINE"} {
+		raw, exists := ginCtx.Get(key)
+		if !exists {
+			t.Fatalf("%s log missing", key)
+		}
+		logged, ok := raw.([]byte)
+		if !ok {
+			t.Fatalf("%s log type = %T, want []byte", key, raw)
+		}
+		text := string(logged)
+		if !strings.Contains(text, "request body log released after stream established") {
+			t.Fatalf("%s log missing stream-established placeholder: %s", key, text)
+		}
+		if strings.Contains(text, "drop HTTP log body") || strings.Contains(text, "drop WebSocket log body") {
+			t.Fatalf("%s log retained a released request body: %s", key, text)
+		}
 	}
 }

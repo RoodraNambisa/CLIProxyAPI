@@ -542,17 +542,18 @@ func (h *BaseAPIHandler) attachRequestBodyRelease(ctx context.Context, rawJSON [
 	if h.Cfg != nil {
 		cfg = config.NormalizeRequestBodyRelease(h.Cfg.RequestBodyRelease)
 	}
-	if !force && (!cfg.Enable || cfg.LogOnly) {
+	if !force && !cfg.Enable {
 		return ctx, nil
 	}
 	size := int64(len(rawJSON))
 	if !force && cfg.MinBodyBytes > 0 && size < cfg.MinBodyBytes {
 		return ctx, nil
 	}
-	placeholder := coreexecutor.RequestBodyReleaseTimerPlaceholder(size, cfg.AfterSeconds, false)
+	logOnly := !force && cfg.LogOnly
+	placeholder := coreexecutor.RequestBodyReleaseTimerPlaceholder(size, cfg.AfterSeconds, logOnly)
 	ctrl := requestBodyReleaseControllerFromContext(ctx)
-	if ctrl == nil || force && ctrl.LogOnly() {
-		ctrl = coreexecutor.NewRequestBodyReleaseController(size, placeholder)
+	if ctrl == nil || ctrl.LogOnly() != logOnly {
+		ctrl = coreexecutor.NewRequestBodyReleaseControllerWithMode(size, placeholder, logOnly)
 	}
 	if meta != nil {
 		meta[coreexecutor.BodyReleaseControllerMetadataKey] = ctrl
