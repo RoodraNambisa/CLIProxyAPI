@@ -227,3 +227,52 @@ func TestSaveConfigPreservesChatGPTWebUsageCacheSettings(t *testing.T) {
 		t.Fatalf("reloaded config = %#v", reloaded.ChatGPTWeb)
 	}
 }
+
+func TestSaveConfigPreservesZeroChatGPTWebImageFallbackUsage(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte("chatgpt-web:\n  auto-relogin: false\n"), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	cfg, err := LoadConfig(path)
+	if err != nil {
+		t.Fatalf("LoadConfig() error = %v", err)
+	}
+	enabled := true
+	zero := int64(0)
+	cfg.ChatGPTWeb.ImageUsage.FallbackUsage = ChatGPTWebImageFallbackUsageConfig{
+		Enabled:           &enabled,
+		InputTextTokens:   &zero,
+		InputImageTokens:  &zero,
+		OutputTextTokens:  &zero,
+		OutputImageTokens: &zero,
+	}
+	if errSave := SaveConfigPreserveComments(path, cfg); errSave != nil {
+		t.Fatalf("SaveConfigPreserveComments() error = %v", errSave)
+	}
+
+	saved, errRead := os.ReadFile(path)
+	if errRead != nil {
+		t.Fatalf("read saved config: %v", errRead)
+	}
+	for _, expected := range []string{
+		"fallback-usage:", "enabled: true", "input-text-tokens: 0", "input-image-tokens: 0",
+		"output-text-tokens: 0", "output-image-tokens: 0",
+	} {
+		if !strings.Contains(string(saved), expected) {
+			t.Fatalf("saved config omitted %q:\n%s", expected, saved)
+		}
+	}
+
+	reloaded, errReload := LoadConfig(path)
+	if errReload != nil {
+		t.Fatalf("LoadConfig() after save error = %v", errReload)
+	}
+	fallback := reloaded.ChatGPTWeb.ImageUsage.FallbackUsage.Resolved()
+	if !fallback.Enabled ||
+		fallback.InputTextTokens != 0 ||
+		fallback.InputImageTokens != 0 ||
+		fallback.OutputTextTokens != 0 ||
+		fallback.OutputImageTokens != 0 {
+		t.Fatalf("reloaded fallback config = %#v", fallback)
+	}
+}

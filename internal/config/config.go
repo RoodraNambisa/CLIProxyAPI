@@ -3649,6 +3649,18 @@ func preservesExplicitChatGPTWebValue(fullPath string, node *yaml.Node) bool {
 		return true
 	case "chatgpt-web.estimate-token-usage":
 		return node.Kind == yaml.ScalarNode && node.Tag == "!!bool"
+	case "chatgpt-web.image-usage":
+		return node.Kind == yaml.MappingNode && len(node.Content) > 0
+	case "chatgpt-web.image-usage.auto-output-quality":
+		return true
+	case "chatgpt-web.image-usage.fallback-usage":
+		return node.Kind == yaml.MappingNode && len(node.Content) > 0
+	case "chatgpt-web.image-usage.fallback-usage.enabled",
+		"chatgpt-web.image-usage.fallback-usage.input-text-tokens",
+		"chatgpt-web.image-usage.fallback-usage.input-image-tokens",
+		"chatgpt-web.image-usage.fallback-usage.output-text-tokens",
+		"chatgpt-web.image-usage.fallback-usage.output-image-tokens":
+		return true
 	case "chatgpt-web.login-proxy":
 		return node.Kind == yaml.MappingNode && len(node.Content) > 0
 	case "chatgpt-web.login-proxy.enabled",
