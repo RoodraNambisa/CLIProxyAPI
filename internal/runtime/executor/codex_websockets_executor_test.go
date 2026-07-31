@@ -190,6 +190,146 @@ func TestCodexWebsocketsExecuteStreamReleasesRequestBodyAfterFirstEvent(t *testi
 	}
 }
 
+func TestCodexWebsocketsExecuteReleasesRequestBodyAfterFirstEvent(t *testing.T) {
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	eventSent := make(chan struct{})
+	continueResponse := make(chan struct{}, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Errorf("upgrade websocket: %v", err)
+			return
+		}
+		defer func() { _ = conn.Close() }()
+
+		if _, _, errRead := conn.ReadMessage(); errRead != nil {
+			t.Errorf("read upstream websocket message: %v", errRead)
+			return
+		}
+		if errWrite := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.created","response":{"id":"resp-release"}}`)); errWrite != nil {
+			t.Errorf("write created websocket message: %v", errWrite)
+			return
+		}
+		close(eventSent)
+		select {
+		case <-continueResponse:
+		case <-r.Context().Done():
+			return
+		}
+		completed := []byte(`{"type":"response.completed","response":{"id":"resp-release","output":[],"usage":{"input_tokens":0,"output_tokens":0,"total_tokens":0}}}`)
+		if errWrite := conn.WriteMessage(websocket.TextMessage, completed); errWrite != nil {
+			t.Errorf("write completed websocket message: %v", errWrite)
+		}
+	}))
+	defer server.Close()
+	defer func() {
+		select {
+		case continueResponse <- struct{}{}:
+		default:
+		}
+	}()
+
+	ctrl := cliproxyexecutor.NewRequestBodyReleaseController(1024, []byte("<released>"))
+	exec := NewCodexWebsocketsExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{ID: "auth-1", Attributes: map[string]string{"api_key": "sk-test", "base_url": server.URL}}
+	req := cliproxyexecutor.Request{
+		Model:   "gpt-5-codex",
+		Payload: []byte(`{"model":"gpt-5-codex","input":"hi"}`),
+	}
+	opts := cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FormatCodex,
+		Metadata: map[string]any{
+			cliproxyexecutor.BodyReleaseControllerMetadataKey: ctrl,
+		},
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	resultCh := make(chan codexBodyReleaseExecuteResult, 1)
+	go func() {
+		response, errExecute := exec.Execute(ctx, auth, req, opts)
+		resultCh <- codexBodyReleaseExecuteResult{response: response, err: errExecute}
+	}()
+
+	select {
+	case <-eventSent:
+	case <-ctx.Done():
+		t.Fatalf("upstream event was not sent: %v", ctx.Err())
+	}
+	waitForCodexRequestBodyRelease(t, ctrl)
+	if ctrl.Replayable() {
+		t.Fatal("request remained replayable after first upstream websocket event")
+	}
+	select {
+	case result := <-resultCh:
+		t.Fatalf("Execute() completed before the upstream websocket response finished: %v", result.err)
+	default:
+	}
+
+	continueResponse <- struct{}{}
+	select {
+	case result := <-resultCh:
+		if result.err != nil {
+			t.Fatalf("Execute() error = %v", result.err)
+		}
+		if !bytes.Contains(result.response.Payload, []byte("resp-release")) {
+			t.Fatalf("Execute() response = %s, want completed websocket response", result.response.Payload)
+		}
+	case <-ctx.Done():
+		t.Fatalf("Execute() did not finish after websocket completion: %v", ctx.Err())
+	}
+}
+
+func TestCodexWebsocketsExecuteDoesNotReleaseRequestBodyForErrorEvent(t *testing.T) {
+	tests := []struct {
+		name    string
+		payload string
+	}{
+		{name: "error", payload: `{"type":"error","status":429,"error":{"code":"server_error","message":"retry"}}`},
+		{name: "terminal failure", payload: `{"type":"response.failed","response":{"status":"failed","error":{"code":"server_error","message":"retry"}}}`},
+		{name: "malformed event", payload: `not-json`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				conn, err := upgrader.Upgrade(w, r, nil)
+				if err != nil {
+					t.Errorf("upgrade websocket: %v", err)
+					return
+				}
+				defer func() { _ = conn.Close() }()
+				if _, _, errRead := conn.ReadMessage(); errRead != nil {
+					t.Errorf("read upstream websocket message: %v", errRead)
+					return
+				}
+				if errWrite := conn.WriteMessage(websocket.TextMessage, []byte(tt.payload)); errWrite != nil {
+					t.Errorf("write websocket error: %v", errWrite)
+				}
+			}))
+			defer server.Close()
+
+			ctrl := cliproxyexecutor.NewRequestBodyReleaseController(1024, []byte("<released>"))
+			exec := NewCodexWebsocketsExecutor(&config.Config{})
+			auth := &cliproxyauth.Auth{ID: "auth-error", Attributes: map[string]string{"api_key": "sk-test", "base_url": server.URL}}
+			_, err := exec.Execute(context.Background(), auth, cliproxyexecutor.Request{
+				Model:   "gpt-5-codex",
+				Payload: []byte(`{"model":"gpt-5-codex","input":"hi"}`),
+			}, cliproxyexecutor.Options{
+				SourceFormat: sdktranslator.FormatCodex,
+				Metadata: map[string]any{
+					cliproxyexecutor.BodyReleaseControllerMetadataKey: ctrl,
+				},
+			})
+			if err == nil {
+				t.Fatal("Execute() error = nil, want websocket error")
+			}
+			if ctrl.Released() || !ctrl.Replayable() {
+				t.Fatal("websocket error event released the replayable request body")
+			}
+		})
+	}
+}
+
 func TestCodexWebsocketsExecuteStreamMarksCompletionTerminal(t *testing.T) {
 	for _, completionType := range []string{"response.completed", "response.done"} {
 		t.Run(completionType, func(t *testing.T) {

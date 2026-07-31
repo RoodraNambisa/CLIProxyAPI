@@ -421,6 +421,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 	}
 	wsReqBody = nil
 
+	streamEstablished := false
 	for {
 		if ctx != nil && ctx.Err() != nil {
 			return resp, ctx.Err()
@@ -483,6 +484,10 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 		payload = normalizedPayload
 
 		eventType := gjson.GetBytes(payload, "type").String()
+		if !streamEstablished && eventType != "" && eventType != "error" {
+			helps.ReleaseRequestBodyAfterStreamEstablished(ctx, opts)
+			streamEstablished = true
+		}
 		if eventType == "response.completed" {
 			if detail, ok := helps.ParseCodexUsage(payload); ok {
 				reporter.Publish(ctx, detail)
@@ -823,7 +828,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 			payload = normalizedPayload
 
 			eventType := gjson.GetBytes(payload, "type").String()
-			if !streamEstablished && eventType != "error" {
+			if !streamEstablished && eventType != "" && eventType != "error" {
 				helps.ReleaseRequestBodyAfterStreamEstablished(ctx, opts)
 				streamEstablished = true
 			}

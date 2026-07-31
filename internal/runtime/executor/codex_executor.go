@@ -675,6 +675,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 		err = newCodexStatusErr(httpResp.StatusCode, clientBody)
 		return resp, err
 	}
+	helps.ReleaseRequestBodyAfterStreamEstablished(ctx, opts)
 	outputItemsByIndex := make(map[int64][]byte)
 	var outputItemsFallback [][]byte
 	var completedEvent []byte
