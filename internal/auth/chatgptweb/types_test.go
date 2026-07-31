@@ -51,6 +51,25 @@ func TestHasSessionCookieValidatesScopeExpiryAndChunks(t *testing.T) {
 	}
 }
 
+func TestIsSessionCookieName(t *testing.T) {
+	tests := []struct {
+		name string
+		want bool
+	}{
+		{name: "__Secure-next-auth.session-token", want: true},
+		{name: "next-auth.session-token.0", want: true},
+		{name: "__SECURE-AUTHJS.SESSION-TOKEN.1", want: true},
+		{name: "authjs.session-token", want: true},
+		{name: "authjs.session-token.extra", want: false},
+		{name: "oai-did", want: false},
+	}
+	for _, test := range tests {
+		if got := isSessionCookieName(test.name); got != test.want {
+			t.Errorf("isSessionCookieName(%q) = %t, want %t", test.name, got, test.want)
+		}
+	}
+}
+
 func TestDecodeCredentialScopesLegacySessionCookie(t *testing.T) {
 	credential, errDecode := DecodeCredential([]byte(`{"type":"chatgpt-web","cookies":[{"name":"next-auth.session-token","value":"session"}]}`))
 	if errDecode != nil {

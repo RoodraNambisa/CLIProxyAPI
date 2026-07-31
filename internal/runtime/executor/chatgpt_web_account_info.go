@@ -3380,7 +3380,7 @@ func (e *ChatGPTWebExecutor) fetchChatGPTWebAccountInfo(ctx context.Context, aut
 			return
 		}
 		baselineCookies = append(baselineCookies[:0], client.ExportCookies()...)
-		quotaClient, errQuotaClient := chatgptwebauth.NewAcquisitionClient(
+		quotaClient, errQuotaClient := chatgptwebauth.NewAccessTokenAcquisitionClient(
 			client.Persona(),
 			client.ProxyURL(),
 			baselineCookies,

@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -116,6 +117,92 @@ func TestCookieRoundTripAcrossClients(t *testing.T) {
 	}
 	if response.StatusCode != http.StatusOK || string(payload) != "cookie-value" {
 		t.Fatalf("restored cookie response = %d %q", response.StatusCode, payload)
+	}
+}
+
+func TestAccessTokenClientWithholdsAndRetainsSessionCookies(t *testing.T) {
+	t.Parallel()
+	var cookieHeader string
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/seed":
+			http.SetCookie(response, &http.Cookie{Name: "next-auth.session-token", Value: "initial", Path: "/"})
+			http.SetCookie(response, &http.Cookie{Name: "oai-sc", Value: "sentinel", Path: "/"})
+			response.WriteHeader(http.StatusNoContent)
+		case "/check":
+			cookieHeader = request.Header.Get("Cookie")
+			http.SetCookie(response, &http.Cookie{Name: "next-auth.session-token", Value: "rotated", Path: "/"})
+			response.WriteHeader(http.StatusNoContent)
+		default:
+			http.NotFound(response, request)
+		}
+	}))
+	defer server.Close()
+
+	client, errClient := NewAccessTokenClient(DefaultPersona(), "", nil)
+	if errClient != nil {
+		t.Fatal(errClient)
+	}
+	defer client.CloseIdleConnections()
+	for _, path := range []string{"/seed", "/check"} {
+		response, _, errRequest := client.DoFollow(context.Background(), http.MethodGet, server.URL+path, nil, nil)
+		if errRequest != nil {
+			t.Fatal(errRequest)
+		}
+		if response.StatusCode != http.StatusNoContent {
+			t.Fatalf("%s status = %d", path, response.StatusCode)
+		}
+	}
+	if strings.Contains(strings.ToLower(cookieHeader), "session-token") {
+		t.Fatalf("access-token request sent a session cookie: %q", cookieHeader)
+	}
+	if !strings.Contains(cookieHeader, "oai-sc=sentinel") {
+		t.Fatalf("access-token request cookie = %q, want non-session cookie", cookieHeader)
+	}
+	foundRotatedSession := false
+	for _, cookie := range client.ExportCookies() {
+		if isSessionCookieName(cookie.Name) && cookie.Value == "rotated" {
+			foundRotatedSession = true
+		}
+	}
+	if !foundRotatedSession {
+		t.Fatalf("server-issued session cookie was not retained: %#v", client.ExportCookies())
+	}
+}
+
+func TestBrowserClientSendsSessionCookiesForAuthenticationFlows(t *testing.T) {
+	t.Parallel()
+	var cookieHeader string
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/seed":
+			http.SetCookie(response, &http.Cookie{Name: "next-auth.session-token", Value: "persisted", Path: "/"})
+			response.WriteHeader(http.StatusNoContent)
+		case "/check":
+			cookieHeader = request.Header.Get("Cookie")
+			response.WriteHeader(http.StatusNoContent)
+		default:
+			http.NotFound(response, request)
+		}
+	}))
+	defer server.Close()
+	client, errClient := NewClient(DefaultPersona(), "", nil)
+	if errClient != nil {
+		t.Fatal(errClient)
+	}
+	defer client.CloseIdleConnections()
+
+	for _, path := range []string{"/seed", "/check"} {
+		response, _, errRequest := client.DoFollow(context.Background(), http.MethodGet, server.URL+path, nil, nil)
+		if errRequest != nil {
+			t.Fatal(errRequest)
+		}
+		if response.StatusCode != http.StatusNoContent {
+			t.Fatalf("%s status = %d", path, response.StatusCode)
+		}
+	}
+	if !strings.Contains(cookieHeader, "next-auth.session-token=persisted") {
+		t.Fatalf("authentication request cookie = %q", cookieHeader)
 	}
 }
 

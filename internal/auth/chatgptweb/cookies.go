@@ -16,6 +16,11 @@ var sessionCookieBaseNames = [...]string{
 	"authjs.session-token",
 }
 
+func isSessionCookieName(name string) bool {
+	_, _, _, ok := parseSessionCookieName(name)
+	return ok
+}
+
 type cookieKey struct {
 	name   string
 	path   string

@@ -25,11 +25,18 @@ type Client struct {
 	follow             tls_client.HttpClient
 	noRedirect         tls_client.HttpClient
 	jar                tls_client.CookieJar
+	sendSessionCookies bool
 	persona            Persona
 	proxyURL           string
 	acquisitionTimeout time.Duration
 	acquisitionTracker *acquisitionConnectionTracker
 	loginRetry         *loginClientRetry
+}
+
+// accessTokenCookieJar retains all server-issued cookies but withholds browser
+// session cookies from access-token-authenticated requests.
+type accessTokenCookieJar struct {
+	delegate tls_client.CookieJar
 }
 
 func NewClient(persona Persona, proxyURL string, cookies []Cookie) (*Client, error) {
@@ -43,7 +50,32 @@ func NewAcquisitionClient(persona Persona, proxyURL string, cookies []Cookie, ti
 	return newClient(persona, proxyURL, cookies, timeout)
 }
 
+// NewAccessTokenClient creates a runtime client that authenticates with an
+// access token without sending the persisted browser session cookie.
+func NewAccessTokenClient(persona Persona, proxyURL string, cookies []Cookie) (*Client, error) {
+	return newClientWithSessionCookiePolicy(persona, proxyURL, cookies, 0, false)
+}
+
+// NewAccessTokenAcquisitionClient is the bounded-acquisition variant of
+// NewAccessTokenClient.
+func NewAccessTokenAcquisitionClient(persona Persona, proxyURL string, cookies []Cookie, timeout time.Duration) (*Client, error) {
+	if timeout <= 0 {
+		timeout = DefaultAcquisitionTimeout
+	}
+	return newClientWithSessionCookiePolicy(persona, proxyURL, cookies, timeout, false)
+}
+
 func newClient(persona Persona, proxyURL string, cookies []Cookie, timeout time.Duration) (*Client, error) {
+	return newClientWithSessionCookiePolicy(persona, proxyURL, cookies, timeout, true)
+}
+
+func newClientWithSessionCookiePolicy(
+	persona Persona,
+	proxyURL string,
+	cookies []Cookie,
+	timeout time.Duration,
+	sendSessionCookies bool,
+) (*Client, error) {
 	persona = normalizePersona(persona)
 	proxyURL = strings.TrimSpace(proxyURL)
 	cookies, _ = normalizeSessionCookies(cookies)
@@ -52,7 +84,11 @@ func newClient(persona Persona, proxyURL string, cookies []Cookie, timeout time.
 		return nil, fmt.Errorf("unsupported TLS profile %q", persona.Profile)
 	}
 
-	jar := tls_client.NewCookieJar()
+	baseJar := tls_client.NewCookieJar()
+	var jar tls_client.CookieJar = baseJar
+	if !sendSessionCookies {
+		jar = &accessTokenCookieJar{delegate: baseJar}
+	}
 	var acquisitionTracker *acquisitionConnectionTracker
 	if timeout > 0 {
 		acquisitionTracker = newAcquisitionConnectionTracker()
@@ -98,6 +134,7 @@ func newClient(persona Persona, proxyURL string, cookies []Cookie, timeout time.
 		follow:             follow,
 		noRedirect:         noRedirect,
 		jar:                jar,
+		sendSessionCookies: sendSessionCookies,
 		persona:            persona,
 		proxyURL:           proxyURL,
 		acquisitionTimeout: timeout,
@@ -108,6 +145,35 @@ func newClient(persona Persona, proxyURL string, cookies []Cookie, timeout time.
 		return nil, err
 	}
 	return client, nil
+}
+
+func (jar *accessTokenCookieJar) SetCookies(targetURL *url.URL, cookies []*fhttp.Cookie) {
+	if jar == nil || jar.delegate == nil {
+		return
+	}
+	jar.delegate.SetCookies(targetURL, cookies)
+}
+
+func (jar *accessTokenCookieJar) Cookies(targetURL *url.URL) []*fhttp.Cookie {
+	if jar == nil || jar.delegate == nil {
+		return nil
+	}
+	cookies := jar.delegate.Cookies(targetURL)
+	filtered := make([]*fhttp.Cookie, 0, len(cookies))
+	for _, cookie := range cookies {
+		if cookie == nil || isSessionCookieName(cookie.Name) {
+			continue
+		}
+		filtered = append(filtered, cookie)
+	}
+	return filtered
+}
+
+func (jar *accessTokenCookieJar) GetAllCookies() map[string][]*fhttp.Cookie {
+	if jar == nil || jar.delegate == nil {
+		return nil
+	}
+	return jar.delegate.GetAllCookies()
 }
 
 func findTLSProfile(name string) (profiles.ClientProfile, bool) {
@@ -408,11 +474,12 @@ func (client *Client) prepareLoginRequestRetry(ctx context.Context, retryNumber 
 	if errProxy != nil {
 		return errProxy
 	}
-	replacement, errClient := newClient(
+	replacement, errClient := newClientWithSessionCookiePolicy(
 		client.persona,
 		proxyURL,
 		client.ExportCookies(),
 		client.acquisitionTimeout,
+		client.sendSessionCookies,
 	)
 	if errClient != nil {
 		return errClient
@@ -657,5 +724,11 @@ func (client *Client) CloneWithProxy(proxyURL string) (*Client, error) {
 	if client == nil {
 		return nil, fmt.Errorf("browser client is nil")
 	}
-	return NewClient(client.persona, proxyURL, client.ExportCookies())
+	return newClientWithSessionCookiePolicy(
+		client.persona,
+		proxyURL,
+		client.ExportCookies(),
+		0,
+		client.sendSessionCookies,
+	)
 }

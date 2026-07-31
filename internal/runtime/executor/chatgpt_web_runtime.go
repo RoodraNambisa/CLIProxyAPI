@@ -766,14 +766,18 @@ func (e *ChatGPTWebExecutor) newRuntimeClientForAcquisition(auth *cliproxyauth.A
 	}
 	var client *chatgptwebauth.Client
 	if acquisition {
-		client, err = chatgptwebauth.NewAcquisitionClient(
+		client, err = chatgptwebauth.NewAccessTokenAcquisitionClient(
 			credential.Persona,
 			e.proxyURLForTarget(auth, e.chatGPTWebBaseURL()),
 			credential.Cookies,
 			e.accountInfoTimeout,
 		)
 	} else {
-		client, err = chatgptwebauth.NewClient(credential.Persona, e.proxyURLForTarget(auth, e.chatGPTWebBaseURL()), credential.Cookies)
+		client, err = chatgptwebauth.NewAccessTokenClient(
+			credential.Persona,
+			e.proxyURLForTarget(auth, e.chatGPTWebBaseURL()),
+			credential.Cookies,
+		)
 	}
 	if err != nil {
 		return nil, nil, fmt.Errorf("create chatgpt web browser client: %w", err)

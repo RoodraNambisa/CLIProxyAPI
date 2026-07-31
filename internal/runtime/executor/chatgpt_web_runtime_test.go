@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -21,6 +22,15 @@ import (
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v6/sdk/translator"
 	"github.com/tidwall/gjson"
 )
+
+type chatGPTWebRuntimeUpdateHook struct {
+	cliproxyauth.NoopHook
+	updates atomic.Int32
+}
+
+func (hook *chatGPTWebRuntimeUpdateHook) OnAuthUpdated(context.Context, *cliproxyauth.Auth) {
+	hook.updates.Add(1)
+}
 
 func TestChatGPTWebExecutorExecuteTextConversation(t *testing.T) {
 	server := newChatGPTWebRuntimeFixture(t)
@@ -107,6 +117,84 @@ func TestChatGPTWebRuntimeClientPersistsRotatedCookiesAndIdentity(t *testing.T) 
 	}
 	if !found {
 		t.Fatalf("persisted cookies = %#v, want rotated-session", persisted.Cookies)
+	}
+}
+
+func TestChatGPTWebRuntimeClientDoesNotPersistUnchangedSessionCookies(t *testing.T) {
+	manager := cliproxyauth.NewManager(nil, nil, nil)
+	auth := chatGPTWebRuntimeAuth()
+	credential, errCredential := chatgptwebauth.ParseCredential(auth.Metadata)
+	if errCredential != nil {
+		t.Fatal(errCredential)
+	}
+	credential.Cookies = []chatgptwebauth.Cookie{
+		{Name: "__Secure-next-auth.session-token.0", Value: "stored-a", Domain: "chatgpt.com", Host: "chatgpt.com", Path: "/", Secure: true},
+		{Name: "__Secure-next-auth.session-token.1", Value: "stored-b", Domain: "chatgpt.com", Host: "chatgpt.com", Path: "/", Secure: true},
+		{Name: "oai-did", Value: "device-id", Domain: "chatgpt.com", Host: "chatgpt.com", Path: "/", Secure: true},
+	}
+	credential.ApplyToMetadata(auth.Metadata)
+	registered, errRegister := manager.Register(context.Background(), auth)
+	if errRegister != nil {
+		t.Fatal(errRegister)
+	}
+	hook := &chatGPTWebRuntimeUpdateHook{}
+	manager.AddHook(hook)
+	executor := NewChatGPTWebExecutor(nil, manager)
+	client, runtimeCredential, errClient := executor.newRuntimeClient(registered)
+	if errClient != nil {
+		t.Fatal(errClient)
+	}
+	executor.finishChatGPTWebRuntimeClient(context.Background(), registered, runtimeCredential, client)
+	if updates := hook.updates.Load(); updates != 0 {
+		t.Fatalf("unchanged runtime cookies caused %d auth updates", updates)
+	}
+}
+
+func TestChatGPTWebRuntimeClientPersistsReceivedSessionCookies(t *testing.T) {
+	manager := cliproxyauth.NewManager(nil, nil, nil)
+	auth := chatGPTWebRuntimeAuth()
+	credential, errCredential := chatgptwebauth.ParseCredential(auth.Metadata)
+	if errCredential != nil {
+		t.Fatal(errCredential)
+	}
+	credential.Cookies = []chatgptwebauth.Cookie{
+		{Name: "__Secure-next-auth.session-token.0", Value: "stored-a", Domain: "chatgpt.com", Host: "chatgpt.com", Path: "/", Secure: true},
+		{Name: "__Secure-next-auth.session-token.1", Value: "stored-b", Domain: "chatgpt.com", Host: "chatgpt.com", Path: "/", Secure: true},
+		{Name: "oai-did", Value: "device-id", Domain: "chatgpt.com", Host: "chatgpt.com", Path: "/", Secure: true},
+	}
+	credential.ApplyToMetadata(auth.Metadata)
+	registered, errRegister := manager.Register(context.Background(), auth)
+	if errRegister != nil {
+		t.Fatal(errRegister)
+	}
+	executor := NewChatGPTWebExecutor(nil, manager)
+	client, runtimeCredential, errClient := executor.newRuntimeClient(registered)
+	if errClient != nil {
+		t.Fatal(errClient)
+	}
+	if errSet := client.SetCookie("https://chatgpt.com", "__Secure-next-auth.session-token.0", "rotated-a"); errSet != nil {
+		t.Fatal(errSet)
+	}
+	if errSet := client.SetCookie("https://chatgpt.com", "__Secure-next-auth.session-token.1", "rotated-b"); errSet != nil {
+		t.Fatal(errSet)
+	}
+	executor.finishChatGPTWebRuntimeClient(context.Background(), registered, runtimeCredential, client)
+
+	current, ok := manager.GetByID(registered.ID)
+	if !ok || current == nil {
+		t.Fatal("updated auth missing")
+	}
+	persisted, errPersisted := chatgptwebauth.ParseCredential(current.Metadata)
+	if errPersisted != nil {
+		t.Fatal(errPersisted)
+	}
+	values := make(map[string]string, len(persisted.Cookies))
+	for _, cookie := range persisted.Cookies {
+		values[cookie.Name] = cookie.Value
+	}
+	if values["__Secure-next-auth.session-token.0"] != "rotated-a" ||
+		values["__Secure-next-auth.session-token.1"] != "rotated-b" {
+		t.Fatalf("server-issued session cookies were not persisted: %#v", persisted.Cookies)
 	}
 }
 
