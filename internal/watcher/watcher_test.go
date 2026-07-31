@@ -1712,6 +1712,235 @@ func TestHandleEventAuthWriteTriggersUpdate(t *testing.T) {
 	}
 }
 
+func TestWatcherAdoptsManagerOwnedChatGPTWebPersistenceWithoutDispatch(t *testing.T) {
+	authDir := t.TempDir()
+	store := sdkAuth.NewFileTokenStore()
+	store.SetBaseDir(authDir)
+	manager := coreauth.NewManager(store, nil, nil)
+	auth := &coreauth.Auth{
+		ID:       "chatgpt-web.json",
+		Provider: "chatgpt-web",
+		FileName: "chatgpt-web.json",
+		Metadata: map[string]any{
+			"type":            "chatgpt-web",
+			"email":           "person@example.com",
+			"password":        "password",
+			"credential_uid":  "credential-a",
+			"lifecycle_state": coreauth.LifecycleStateActive,
+			"session_token":   "initial",
+		},
+	}
+	registered, errRegister := manager.Register(t.Context(), auth)
+	if errRegister != nil {
+		t.Fatalf("Register() error = %v", errRegister)
+	}
+	authID := registered.ID
+	path := filepath.Join(authDir, authID)
+	initialData, errRead := os.ReadFile(path)
+	if errRead != nil {
+		t.Fatalf("read initial auth: %v", errRead)
+	}
+	if !authfileguard.ConsumeManagerPersistedGeneration(path, coreauth.SourceHashFromBytes(initialData)) {
+		t.Fatal("manager-owned create did not mark its file generation")
+	}
+
+	w := &Watcher{
+		authDir:         authDir,
+		config:          &config.Config{AuthDir: authDir},
+		lastAuthHashes:  make(map[string]string),
+		fileAuthsByPath: make(map[string]map[string]*coreauth.Auth),
+		currentAuths:    make(map[string]*coreauth.Auth),
+	}
+	w.addOrUpdateClient(path)
+	queue := make(chan AuthUpdate, 1)
+	w.SetAuthUpdateQueue(queue)
+	defer w.stopDispatch()
+
+	updated, current, errMutate := manager.MutateRuntimeMetadataIfCurrent(t.Context(), registered, func(candidate *coreauth.Auth) {
+		candidate.Metadata["session_token"] = "rotated"
+	})
+	if errMutate != nil || !current || updated == nil {
+		t.Fatalf("runtime metadata mutation = (%v, %v, %v)", updated, current, errMutate)
+	}
+	if updated.RuntimeInstanceID() != registered.RuntimeInstanceID() {
+		t.Fatal("runtime metadata mutation replaced the runtime instance")
+	}
+	w.handleEvent(fsnotify.Event{Name: path, Op: fsnotify.Create})
+	select {
+	case update := <-queue:
+		t.Fatalf("manager-owned persistence echo dispatched runtime update: %+v", update)
+	case <-time.After(100 * time.Millisecond):
+	}
+	w.clientsMutex.RLock()
+	watcherAuth := w.currentAuths[authID]
+	w.clientsMutex.RUnlock()
+	if watcherAuth == nil || watcherAuth.Metadata["session_token"] != "rotated" {
+		t.Fatalf("watcher snapshot = %#v, want rotated session", watcherAuth)
+	}
+
+	externalMetadata := coreauth.MetadataWithDisabled(updated)
+	externalMetadata["session_token"] = "external"
+	externalData, errMarshal := json.Marshal(externalMetadata)
+	if errMarshal != nil {
+		t.Fatalf("marshal external update: %v", errMarshal)
+	}
+	if errWrite := os.WriteFile(path, externalData, 0o600); errWrite != nil {
+		t.Fatalf("write external update: %v", errWrite)
+	}
+	unchanged, errUnchanged := w.authFileUnchanged(path)
+	if errUnchanged != nil {
+		t.Fatalf("inspect external update: %v", errUnchanged)
+	}
+	if unchanged {
+		t.Fatal("external auth file update was mistaken for a manager-owned persistence echo")
+	}
+}
+
+func TestWatcherAdoptsManagerOwnedPersistenceAfterInitialEventInspection(t *testing.T) {
+	authDir := t.TempDir()
+	path := filepath.Join(authDir, "chatgpt-web.json")
+	writeAuth := func(sessionToken string) []byte {
+		t.Helper()
+		data, errMarshal := json.Marshal(map[string]any{
+			"type":            "chatgpt-web",
+			"email":           "person@example.com",
+			"password":        "password",
+			"credential_uid":  "credential-a",
+			"lifecycle_state": coreauth.LifecycleStateActive,
+			"session_token":   sessionToken,
+		})
+		if errMarshal != nil {
+			t.Fatalf("marshal auth: %v", errMarshal)
+		}
+		if errWrite := os.WriteFile(path, data, 0o600); errWrite != nil {
+			t.Fatalf("write auth: %v", errWrite)
+		}
+		return data
+	}
+	writeAuth("initial")
+	w := &Watcher{
+		authDir:         authDir,
+		config:          &config.Config{AuthDir: authDir},
+		lastAuthHashes:  make(map[string]string),
+		fileAuthsByPath: make(map[string]map[string]*coreauth.Auth),
+		currentAuths:    make(map[string]*coreauth.Auth),
+	}
+	w.addOrUpdateClient(path)
+
+	rotatedData := writeAuth("rotated")
+	unchanged, errUnchanged := w.authFileUnchanged(path)
+	if errUnchanged != nil {
+		t.Fatalf("inspect unmarked persistence: %v", errUnchanged)
+	}
+	if unchanged {
+		t.Fatal("unmarked file generation was skipped before the manager marker existed")
+	}
+	rotatedHash := coreauth.SourceHashFromBytes(rotatedData)
+	authfileguard.MarkManagerPersistedGeneration(path, rotatedHash)
+
+	w.addOrUpdateClient(path)
+
+	if authfileguard.ConsumeManagerPersistedGeneration(path, rotatedHash) {
+		t.Fatal("manager-owned generation marker was not consumed by the locked fallback")
+	}
+	w.clientsMutex.RLock()
+	defer w.clientsMutex.RUnlock()
+	if len(w.currentAuths) != 1 {
+		t.Fatalf("watcher auth count = %d, want 1", len(w.currentAuths))
+	}
+	for _, watcherAuth := range w.currentAuths {
+		if watcherAuth == nil || watcherAuth.Metadata["session_token"] != "rotated" {
+			t.Fatalf("watcher snapshot = %#v, want rotated session", watcherAuth)
+		}
+	}
+}
+
+func TestAuthFileUnchangedWaitsForManagerPersistenceMarker(t *testing.T) {
+	authDir := t.TempDir()
+	path := filepath.Join(authDir, "chatgpt-web.json")
+	initialData := []byte(`{"type":"chatgpt-web","email":"person@example.com","session_token":"initial"}`)
+	if errWrite := os.WriteFile(path, initialData, 0o600); errWrite != nil {
+		t.Fatalf("write initial auth: %v", errWrite)
+	}
+	w := &Watcher{
+		authDir:         authDir,
+		config:          &config.Config{AuthDir: authDir},
+		lastAuthHashes:  make(map[string]string),
+		fileAuthsByPath: make(map[string]map[string]*coreauth.Auth),
+		currentAuths:    make(map[string]*coreauth.Auth),
+	}
+	w.addOrUpdateClient(path)
+
+	unlockPath := authfileguard.Lock(path)
+	pathLocked := true
+	defer func() {
+		if pathLocked {
+			unlockPath()
+		}
+	}()
+	rotatedData := []byte(`{"type":"chatgpt-web","email":"person@example.com","session_token":"rotated"}`)
+	if errWrite := os.WriteFile(path, rotatedData, 0o600); errWrite != nil {
+		t.Fatalf("write rotated auth: %v", errWrite)
+	}
+	type unchangedResult struct {
+		unchanged bool
+		err       error
+	}
+	started := make(chan struct{})
+	result := make(chan unchangedResult, 1)
+	go func() {
+		close(started)
+		unchanged, errUnchanged := w.authFileUnchanged(path)
+		result <- unchangedResult{unchanged: unchanged, err: errUnchanged}
+	}()
+	<-started
+	select {
+	case got := <-result:
+		t.Fatalf("preflight read completed before the persistence marker: %+v", got)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	authfileguard.MarkManagerPersistedGeneration(path, coreauth.SourceHashFromBytes(rotatedData))
+	unlockPath()
+	pathLocked = false
+	select {
+	case got := <-result:
+		if got.err != nil || !got.unchanged {
+			t.Fatalf("marked persistence preflight = (%v, %v), want true", got.unchanged, got.err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("preflight read did not resume after persistence completed")
+	}
+}
+
+func TestWatcherRemovalClearsManagerPersistenceMarker(t *testing.T) {
+	authDir := t.TempDir()
+	path := filepath.Join(authDir, "chatgpt-web.json")
+	data := []byte(`{"type":"chatgpt-web","email":"person@example.com"}`)
+	if errWrite := os.WriteFile(path, data, 0o600); errWrite != nil {
+		t.Fatalf("write auth: %v", errWrite)
+	}
+	w := &Watcher{
+		authDir:         authDir,
+		config:          &config.Config{AuthDir: authDir},
+		lastAuthHashes:  make(map[string]string),
+		fileAuthsByPath: make(map[string]map[string]*coreauth.Auth),
+		currentAuths:    make(map[string]*coreauth.Auth),
+	}
+	w.addOrUpdateClient(path)
+	hash := coreauth.SourceHashFromBytes(data)
+	authfileguard.MarkManagerPersistedGeneration(path, hash)
+	if errRemove := os.Remove(path); errRemove != nil {
+		t.Fatalf("remove auth: %v", errRemove)
+	}
+
+	w.removeClientState(path, false)
+
+	if authfileguard.ConsumeManagerPersistedGeneration(path, hash) {
+		t.Fatal("watcher removal left a stale manager persistence marker")
+	}
+}
+
 func TestHandleEventRemoveDebounceSkips(t *testing.T) {
 	tmpDir := t.TempDir()
 	authDir := filepath.Join(tmpDir, "auth")

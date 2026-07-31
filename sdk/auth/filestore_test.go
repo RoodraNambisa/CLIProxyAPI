@@ -225,6 +225,88 @@ func TestFileTokenStoreSaveWithSourceHashRejectsExternalReplacement(t *testing.T
 	}
 }
 
+func TestFileTokenStoreDirectChatGPTWebSaveDoesNotMarkManagerPersistence(t *testing.T) {
+	authDir := t.TempDir()
+	store := NewFileTokenStore()
+	store.SetBaseDir(authDir)
+	auth := &cliproxyauth.Auth{
+		ID:       "chatgpt-web.json",
+		Provider: "chatgpt-web",
+		FileName: "chatgpt-web.json",
+		Metadata: map[string]any{
+			"type":            "chatgpt-web",
+			"email":           "person@example.com",
+			"password":        "password",
+			"credential_uid":  "credential-a",
+			"lifecycle_state": cliproxyauth.LifecycleStateActive,
+		},
+	}
+	path, errSave := store.Save(t.Context(), auth)
+	if errSave != nil {
+		t.Fatalf("Save() error = %v", errSave)
+	}
+	data, errRead := os.ReadFile(path)
+	if errRead != nil {
+		t.Fatalf("read saved auth: %v", errRead)
+	}
+	if authfileguard.ConsumeManagerPersistedGeneration(path, cliproxyauth.SourceHashFromBytes(data)) {
+		t.Fatal("direct FileTokenStore save was mistaken for manager-owned persistence")
+	}
+}
+
+func TestFileTokenStoreConfirmedDeleteClearsManagerPersistenceMarker(t *testing.T) {
+	authDir := t.TempDir()
+	store := NewFileTokenStore()
+	store.SetBaseDir(authDir)
+	path := filepath.Join(authDir, "chatgpt-web.json")
+	data := []byte(`{"type":"chatgpt-web","email":"person@example.com"}`)
+	if errWrite := os.WriteFile(path, data, 0o600); errWrite != nil {
+		t.Fatalf("write auth: %v", errWrite)
+	}
+	hash := cliproxyauth.SourceHashFromBytes(data)
+	authfileguard.MarkManagerPersistedGeneration(path, hash)
+
+	if errDelete := store.Delete(t.Context(), "chatgpt-web.json"); errDelete != nil {
+		t.Fatalf("Delete() error = %v", errDelete)
+	}
+	if authfileguard.ConsumeManagerPersistedGeneration(path, hash) {
+		t.Fatal("confirmed deletion left a stale manager persistence marker")
+	}
+}
+
+func TestFileTokenStoreRolledBackDeleteRetainsManagerPersistenceMarker(t *testing.T) {
+	authDir := t.TempDir()
+	store := NewFileTokenStore()
+	store.SetBaseDir(authDir)
+	path := filepath.Join(authDir, "chatgpt-web.json")
+	data := []byte(`{"type":"chatgpt-web","email":"person@example.com"}`)
+	if errWrite := os.WriteFile(path, data, 0o600); errWrite != nil {
+		t.Fatalf("write auth: %v", errWrite)
+	}
+	hash := cliproxyauth.SourceHashFromBytes(data)
+	authfileguard.MarkManagerPersistedGeneration(path, hash)
+	root, errRoot := os.OpenRoot(authDir)
+	if errRoot != nil {
+		t.Fatalf("open auth root: %v", errRoot)
+	}
+	defer func() { _ = root.Close() }()
+	errPrepare := errors.New("prepare failed")
+
+	errDelete := store.DeleteAuthFileAtRootPreparedContext(
+		t.Context(),
+		authDir,
+		root,
+		"chatgpt-web.json",
+		func(string, []byte) error { return errPrepare },
+	)
+	if !errors.Is(errDelete, errPrepare) {
+		t.Fatalf("prepared delete error = %v, want %v", errDelete, errPrepare)
+	}
+	if !authfileguard.ConsumeManagerPersistedGeneration(path, hash) {
+		t.Fatal("rolled-back deletion cleared the manager persistence marker")
+	}
+}
+
 func TestFileTokenStoreRestrictsExistingChatGPTWebCredentialPermissions(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("Windows does not expose Unix credential permission bits")

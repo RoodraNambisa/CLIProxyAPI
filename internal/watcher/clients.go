@@ -325,6 +325,61 @@ func (w *Watcher) cacheAuthFileForReload(cfg *config.Config, authDir, path strin
 	w.clientsMutex.Unlock()
 }
 
+func (w *Watcher) adoptManagerPersistedAuthFile(path string, data []byte, hash string) bool {
+	if w == nil || path == "" || len(data) == 0 || hash == "" || authfileguard.IsRetired(path) {
+		return false
+	}
+	normalized := w.normalizeAuthPath(path)
+	w.clientsMutex.Lock()
+	defer w.clientsMutex.Unlock()
+	if _, retired := w.retiredAuthPaths[normalized]; retired {
+		return false
+	}
+	if _, pending := w.retiredDeletes[normalized]; pending {
+		return false
+	}
+	if _, tombstoned := w.retiredDeleteHashes[normalized]; tombstoned {
+		return false
+	}
+	if w.config == nil {
+		return false
+	}
+	if !authfileguard.ConsumeManagerPersistedGeneration(path, hash) {
+		return false
+	}
+	if w.lastAuthHashes == nil {
+		w.lastAuthHashes = make(map[string]string)
+	}
+	w.lastAuthHashes[normalized] = hash
+	sctx := &synthesizer.SynthesisContext{
+		Config:      w.config,
+		AuthDir:     w.authDir,
+		Now:         time.Now(),
+		IDGenerator: synthesizer.NewStableIDGenerator(),
+	}
+	newByID := authSliceToMap(synthesizer.SynthesizeAuthFile(sctx, path, data))
+	if w.fileAuthsByPath == nil {
+		w.fileAuthsByPath = make(map[string]map[string]*coreauth.Auth)
+	}
+	oldByID := cloneAuthMap(w.fileAuthsByPath[normalized])
+	if len(newByID) > 0 {
+		w.fileAuthsByPath[normalized] = cloneAuthMap(newByID)
+	} else {
+		delete(w.fileAuthsByPath, normalized)
+	}
+	if log.IsLevelEnabled(log.DebugLevel) {
+		var cached coreauth.Auth
+		if json.Unmarshal(data, &cached) == nil {
+			if w.lastAuthContents == nil {
+				w.lastAuthContents = make(map[string]*coreauth.Auth)
+			}
+			w.lastAuthContents[normalized] = &cached
+		}
+	}
+	_ = w.computePerPathUpdatesLocked(oldByID, newByID)
+	return true
+}
+
 func (w *Watcher) shouldConfirmAuthDeleteTombstoneReplacement(normalized string, data []byte) bool {
 	w.clientsMutex.RLock()
 	defer w.clientsMutex.RUnlock()
@@ -361,6 +416,9 @@ func (w *Watcher) addOrUpdateClientWithPersistedHashLocked(path, persistedHash s
 
 	curHash := fileVersion.hash
 	normalized := w.normalizeAuthPath(path)
+	if w.adoptManagerPersistedAuthFile(path, data, curHash) {
+		return
+	}
 
 	// Parse new auth content for diff comparison
 	var newAuth coreauth.Auth
@@ -779,6 +837,7 @@ func (w *Watcher) removeClientState(path string, persist bool) {
 
 func (w *Watcher) removeClientStateLocked(path string, persist bool) {
 	normalized := w.normalizeAuthPath(path)
+	authfileguard.ClearManagerPersistedGeneration(path)
 	retiredPath := authfileguard.IsRetired(path)
 	retiredSnapshot := authfileguard.CaptureRetired(path)
 

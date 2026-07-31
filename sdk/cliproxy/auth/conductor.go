@@ -8539,7 +8539,7 @@ func (m *Manager) persistWithoutLock(ctx context.Context, auth *Auth, syncCurren
 	if !m.shouldPersistAuth(ctx, auth) {
 		return nil
 	}
-	_, err := m.store.Save(ctx, auth)
+	_, err := m.store.Save(authfileguard.WithManagerOwnedPersistence(ctx), auth)
 	if err != nil {
 		if outcome, explicit := SaveOutcomeFromError(err); explicit && outcome == SaveOutcomeCommitted {
 			log.WithField("auth_id", auth.ID).Warn("auth save committed with cleanup warning")
@@ -8561,7 +8561,7 @@ func (m *Manager) persistNewWithoutLock(ctx context.Context, auth *Auth) error {
 	if !ok {
 		return errors.New("auth store does not support conditional create")
 	}
-	_, err := store.SaveIfAbsent(ctx, auth)
+	_, err := store.SaveIfAbsent(authfileguard.WithManagerOwnedPersistence(ctx), auth)
 	if err == nil {
 		return nil
 	}

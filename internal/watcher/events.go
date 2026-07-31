@@ -216,6 +216,10 @@ func (w *Watcher) handleEvent(event fsnotify.Event) {
 }
 
 func (w *Watcher) authFileUnchanged(path string) (bool, error) {
+	// Serialize this preflight read with file-store writes so a committed
+	// manager generation is marked before the watcher classifies it.
+	unlockPath := authfileguard.Lock(path)
+	defer unlockPath()
 	if info, errInfo := os.Lstat(path); errInfo == nil && info.Mode()&os.ModeSymlink != 0 {
 		return false, os.ErrInvalid
 	}
@@ -228,6 +232,9 @@ func (w *Watcher) authFileUnchanged(path string) (bool, error) {
 	}
 	sum := sha256.Sum256(data)
 	curHash := hex.EncodeToString(sum[:])
+	if w.adoptManagerPersistedAuthFile(path, data, curHash) {
+		return true, nil
+	}
 
 	normalized := w.normalizeAuthPath(path)
 	w.clientsMutex.RLock()

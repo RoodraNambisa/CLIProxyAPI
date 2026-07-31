@@ -2595,10 +2595,6 @@ func (s *Service) applyCoreAuthAddOrUpdate(ctx context.Context, auth *coreauth.A
 		log.Debugf("ignoring stale auth file update for %s", auth.ID)
 		return
 	}
-	existing, existed := s.coreManager.GetByID(auth.ID)
-	if existed && chatGPTWebAuthFileGenerationAlreadyInstalled(existing, auth, authDir) {
-		return
-	}
 	unlockTransition, errTransition := s.lockAuthModelTransitionContext(ctx, auth.ID)
 	if errTransition != nil {
 		log.Errorf("failed to lock auth model transition %s: %v", auth.ID, errTransition)
@@ -2618,6 +2614,7 @@ func (s *Service) applyCoreAuthAddOrUpdate(ctx context.Context, auth *coreauth.A
 	op := "register"
 	var err error
 	var installed *coreauth.Auth
+	existing, existed := s.coreManager.GetByID(auth.ID)
 	touchesChatGPTWeb := isNativeChatGPTWebAuth(auth) ||
 		(existed && isNativeChatGPTWebAuth(existing))
 	managerCtx := context.WithValue(ctx, modelSyncHookSuppressedContextKey{}, true)
@@ -2679,61 +2676,6 @@ func (s *Service) applyCoreAuthAddOrUpdate(ctx context.Context, auth *coreauth.A
 	if isNativeChatGPTWebAuth(auth) {
 		s.triggerChatGPTWebRelogin(auth)
 	}
-}
-
-func chatGPTWebAuthFileGenerationAlreadyInstalled(current, incoming *coreauth.Auth, authDir string) bool {
-	if !isNativeChatGPTWebAuth(current) || !isNativeChatGPTWebAuth(incoming) ||
-		current.ID == "" || current.ID != incoming.ID {
-		return false
-	}
-	currentPath := resolveAuthFilePath(current, authDir)
-	incomingPath := resolveAuthFilePath(incoming, authDir)
-	if !sameAuthFilePath(currentPath, incomingPath) {
-		return false
-	}
-	if current.Prefix != incoming.Prefix ||
-		current.ProxyURL != incoming.ProxyURL ||
-		current.Disabled != incoming.Disabled ||
-		!authFileDerivedAttributesMatch(current.Attributes, incoming.Attributes) {
-		return false
-	}
-	currentHash := ""
-	if current.Attributes != nil {
-		currentHash = strings.TrimSpace(current.Attributes[coreauth.SourceHashAttributeKey])
-	}
-	incomingHash := ""
-	if incoming.Attributes != nil {
-		incomingHash = strings.TrimSpace(incoming.Attributes[coreauth.SourceHashAttributeKey])
-	}
-	return currentHash != "" && currentHash == incomingHash
-}
-
-func authFileDerivedAttributesMatch(current, incoming map[string]string) bool {
-	ignored := func(key string) bool {
-		switch key {
-		case coreauth.SourceHashAttributeKey, "path", "source":
-			return true
-		default:
-			return false
-		}
-	}
-	for key, value := range current {
-		if ignored(key) {
-			continue
-		}
-		if incomingValue, ok := incoming[key]; !ok || incomingValue != value {
-			return false
-		}
-	}
-	for key := range incoming {
-		if ignored(key) {
-			continue
-		}
-		if _, ok := current[key]; !ok {
-			return false
-		}
-	}
-	return true
 }
 
 func authFileUpdateStillCurrent(auth *coreauth.Auth, authDir string) bool {

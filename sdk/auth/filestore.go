@@ -899,6 +899,7 @@ func (s *FileTokenStore) save(ctx context.Context, auth *cliproxyauth.Auth, requ
 				fmt.Errorf("auth filestore: sync persisted storage auth failed: %w", errSync),
 			)
 		}
+		markManagerOwnedChatGPTWebPersistence(ctx, auth, path, data)
 	case auth.Metadata != nil:
 		raw, errMarshal := cliproxyauth.CanonicalMetadataBytes(auth)
 		if errMarshal != nil {
@@ -934,6 +935,7 @@ func (s *FileTokenStore) save(ctx context.Context, auth *cliproxyauth.Auth, requ
 				persistenceCommitted = true
 			}
 			cliproxyauth.SetSourceHashAttribute(auth, raw)
+			markManagerOwnedChatGPTWebPersistence(ctx, auth, path, raw)
 			return finishFileTokenSave(auth, persistedPath, committedWarning)
 		}
 		if errWrite := writeRootFileAtomicallyForSnapshotTargetLocked(ctx, parentRoot, leaf, raw, &initialSnapshot, path, s.syncRootDirectory); errWrite != nil {
@@ -949,11 +951,20 @@ func (s *FileTokenStore) save(ctx context.Context, auth *cliproxyauth.Auth, requ
 			persistenceCommitted = true
 		}
 		cliproxyauth.SetSourceHashAttribute(auth, raw)
+		markManagerOwnedChatGPTWebPersistence(ctx, auth, path, raw)
 	default:
 		return "", fmt.Errorf("auth filestore: nothing to persist for %s", auth.ID)
 	}
 
 	return finishFileTokenSave(auth, persistedPath, committedWarning)
+}
+
+func markManagerOwnedChatGPTWebPersistence(ctx context.Context, auth *cliproxyauth.Auth, path string, data []byte) {
+	if !authfileguard.ManagerOwnedPersistence(ctx) || auth == nil ||
+		!strings.EqualFold(strings.TrimSpace(auth.Provider), "chatgpt-web") {
+		return
+	}
+	authfileguard.MarkManagerPersistedGeneration(path, cliproxyauth.SourceHashFromBytes(data))
 }
 
 func validateFileTokenChatGPTWebCreate(ctx context.Context, root *os.Root, relativePath string, data []byte) error {
@@ -1081,6 +1092,14 @@ func fileTokenSaveCommitted(err error) bool {
 func fileTokenSaveMayHavePersisted(err error) bool {
 	outcome, explicit := cliproxyauth.SaveOutcomeFromError(err)
 	return explicit && outcome != cliproxyauth.SaveOutcomeRolledBack
+}
+
+func fileTokenDeleteConfirmed(err error) bool {
+	if err == nil {
+		return true
+	}
+	outcome, explicit := cliproxyauth.DeleteOutcomeFromError(err)
+	return explicit && outcome == cliproxyauth.DeleteOutcomeCommitted
 }
 
 func fileTokenExchangeRollbackConfirmed(err error) bool {
@@ -1219,10 +1238,17 @@ func (s *FileTokenStore) Delete(ctx context.Context, id string) (resultErr error
 					defer unlockPath()
 					retiredSnapshot := authfileguard.CaptureRetired(guardPath)
 					authfileguard.ClearRetiredSnapshot(retiredSnapshot)
+					authfileguard.ClearManagerPersistedGeneration(guardPath)
 				}
 				return nil
 			}
 			if !isExplicitOutsideBaseDir(path, lexicalBaseDir, resolvedBaseDir) {
+				unlockPath, errPathLock := authfileguard.LockContext(ctx, path)
+				if errPathLock != nil {
+					return fmt.Errorf("auth filestore: lock auth path for deletion: %w", errPathLock)
+				}
+				defer unlockPath()
+				authfileguard.ClearManagerPersistedGeneration(path)
 				return nil
 			}
 		} else {
@@ -1252,6 +1278,7 @@ func (s *FileTokenStore) Delete(ctx context.Context, id string) (resultErr error
 			defer unlockPath()
 			retiredSnapshot := authfileguard.CaptureRetired(guardPath)
 			authfileguard.ClearRetiredSnapshot(retiredSnapshot)
+			authfileguard.ClearManagerPersistedGeneration(guardPath)
 			return nil
 		}
 		return errRoot
@@ -1277,6 +1304,11 @@ func (s *FileTokenStore) Delete(ctx context.Context, id string) (resultErr error
 		return fmt.Errorf("auth filestore: lock auth path for deletion: %w", errPathLock)
 	}
 	defer unlockPath()
+	defer func() {
+		if fileTokenDeleteConfirmed(resultErr) {
+			authfileguard.ClearManagerPersistedGeneration(guardPath)
+		}
+	}()
 	if errRootIdentity := revalidateFileTokenRootIdentity(root); errRootIdentity != nil {
 		return cliproxyauth.NewDeleteOutcomeError(
 			cliproxyauth.DeleteOutcomeRolledBack,
@@ -1430,6 +1462,11 @@ func (s *FileTokenStore) DeleteAuthFileAtRootPreparedContext(ctx context.Context
 		return cliproxyauth.NewDeleteOutcomeError(cliproxyauth.DeleteOutcomeRolledBack, fmt.Errorf("auth filestore: lock auth path for deletion: %w", errPathLock))
 	}
 	defer unlockPath()
+	defer func() {
+		if fileTokenDeleteConfirmed(resultErr) {
+			authfileguard.ClearManagerPersistedGeneration(guardPath)
+		}
+	}()
 	unlockTarget, errLock := lockRootAuthTarget(ctx, root, cleanID)
 	if errLock != nil {
 		return cliproxyauth.NewDeleteOutcomeError(cliproxyauth.DeleteOutcomeRolledBack, fmt.Errorf("auth filestore: lock auth target for deletion: %w", errLock))
