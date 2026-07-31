@@ -340,7 +340,7 @@ func (h *OpenAIImagesAPIHandler) handleImagesRequest(c *gin.Context, req openAII
 		h.handleStreamingImagesResponse(c, rawJSON, imageModel, codexModel, op, count, responseFormat, providers, ignoreUnsupportedImageParams)
 		return
 	}
-	h.handleNonStreamingImagesResponse(c, rawJSON, imageModel, codexModel, count, responseFormat, providers, ignoreUnsupportedImageParams)
+	h.handleNonStreamingImagesResponse(c, rawJSON, imageModel, codexModel, req, count, responseFormat, providers, ignoreUnsupportedImageParams)
 }
 
 func (h *OpenAIImagesAPIHandler) handleNativeImagesRequest(c *gin.Context, rawJSON []byte, req openAIImageRequest, op imageOperation) {
@@ -424,7 +424,7 @@ func (h *OpenAIImagesAPIHandler) handleNativeStreamingImagesResponse(c *gin.Cont
 	})
 }
 
-func (h *OpenAIImagesAPIHandler) handleNonStreamingImagesResponse(c *gin.Context, rawJSON []byte, imageModel, codexModel string, count int, responseFormat string, providers []string, ignoreUnsupportedImageParams bool) {
+func (h *OpenAIImagesAPIHandler) handleNonStreamingImagesResponse(c *gin.Context, rawJSON []byte, imageModel, codexModel string, req openAIImageRequest, count int, responseFormat string, providers []string, ignoreUnsupportedImageParams bool) {
 	c.Header("Content-Type", "application/json")
 	var combined imagesResponse
 	var upstreamHeaders http.Header
@@ -453,6 +453,7 @@ func (h *OpenAIImagesAPIHandler) handleNonStreamingImagesResponse(c *gin.Context
 			cliCancel(err)
 			return
 		}
+		applyRequestedImageMetadata(&parsed, req)
 		if combined.Created == 0 {
 			combined.Created = parsed.Created
 			combined.Background = parsed.Background
@@ -1298,6 +1299,43 @@ func (r *imagesResponse) applyMetadataFromFirstImage() {
 	r.OutputFormat = first.OutputFormat
 	r.Quality = first.Quality
 	r.Size = first.Size
+}
+
+func applyRequestedImageMetadata(response *imagesResponse, request openAIImageRequest) {
+	if response == nil {
+		return
+	}
+	outputFormat := strings.ToLower(strings.TrimSpace(request.OutputFormat))
+	size := strings.ToLower(strings.TrimSpace(request.Size))
+	quality := strings.ToLower(strings.TrimSpace(request.Quality))
+	background := strings.ToLower(strings.TrimSpace(request.Background))
+	if outputFormat == "auto" {
+		outputFormat = ""
+	}
+	if size == "auto" {
+		size = ""
+	}
+	if quality == "auto" {
+		quality = ""
+	}
+	if background == "auto" {
+		background = ""
+	}
+	for index := range response.Data {
+		if strings.TrimSpace(response.Data[index].OutputFormat) == "" {
+			response.Data[index].OutputFormat = outputFormat
+		}
+		if strings.TrimSpace(response.Data[index].Size) == "" {
+			response.Data[index].Size = size
+		}
+		if strings.TrimSpace(response.Data[index].Quality) == "" {
+			response.Data[index].Quality = quality
+		}
+		if strings.TrimSpace(response.Data[index].Background) == "" {
+			response.Data[index].Background = background
+		}
+	}
+	response.applyMetadataFromFirstImage()
 }
 
 func imageUsageFromToolUsage(toolUsage map[string]json.RawMessage) json.RawMessage {

@@ -1420,6 +1420,29 @@ func TestConvertResponsesToImagesResponseInfersImageMetadata(t *testing.T) {
 	}
 }
 
+func TestApplyRequestedImageMetadataUsesDecodedValuesBeforeExplicitRequest(t *testing.T) {
+	const png1x1 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+	raw := []byte(`{"created_at":1700000000,"output":[{"type":"image_generation_call","result":"` + png1x1 + `"}]}`)
+	response, errConvert := parseResponsesToImagesResponse(raw, 1)
+	if errConvert != nil {
+		t.Fatalf("parseResponsesToImagesResponse() error = %v", errConvert)
+	}
+
+	applyRequestedImageMetadata(&response, openAIImageRequest{
+		OutputFormat: "webp",
+		Size:         "1024x1536",
+		Quality:      "high",
+		Background:   "opaque",
+	})
+
+	if response.OutputFormat != "png" || response.Size != "1x1" {
+		t.Fatalf("decoded metadata was overwritten: format=%q size=%q", response.OutputFormat, response.Size)
+	}
+	if response.Quality != "high" || response.Background != "opaque" {
+		t.Fatalf("explicit request metadata was not applied: quality=%q background=%q", response.Quality, response.Background)
+	}
+}
+
 func TestOpenAIImagesNonStreamingErrorsWithoutImageOutput(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	executor := &imageCaptureExecutor{
