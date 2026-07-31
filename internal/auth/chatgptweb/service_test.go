@@ -27,6 +27,8 @@ type loginFixture struct {
 	authorizePath               string
 	authorizeCalls              int
 	authorizeResponseBody       string
+	authorizeExternalCallback   bool
+	authorizePayloadCallback    bool
 	authorizeBody               string
 	authorizeContinueCalls      int
 	authorizeContinueCloudflare bool
@@ -186,6 +188,16 @@ func (fixture *loginFixture) handleAuthorize(response http.ResponseWriter, reque
 	fixture.codeChallenge = query.Get("code_challenge")
 	fixture.mu.Unlock()
 	http.SetCookie(response, &http.Cookie{Name: "login_session", Value: "session", Path: "/", HttpOnly: true})
+	if fixture.authorizeExternalCallback {
+		response.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprintf(response, `{"continue_url":%q,"page":{"type":"external_url"}}`, fixture.callbackURL())
+		return
+	}
+	if fixture.authorizePayloadCallback {
+		response.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprintf(response, `{"page":{"type":"external_url","payload":{"url":%q}}}`, fixture.callbackURL())
+		return
+	}
 	if fixture.authorizeResponseBody != "" {
 		response.Header().Set("Content-Type", "application/json")
 		_, _ = io.WriteString(response, fixture.authorizeResponseBody)
@@ -422,6 +434,58 @@ func TestServiceLogin(t *testing.T) {
 	}
 	if len(credential.Cookies) == 0 || credential.Persona.Profile != "chrome_146" {
 		t.Fatal("login did not persist cookies and persona")
+	}
+}
+
+func TestServiceLoginConsumesAuthorizeJSONCallback(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		configure func(*loginFixture)
+	}{
+		{name: "top-level continue URL", configure: func(fixture *loginFixture) { fixture.authorizeExternalCallback = true }},
+		{name: "external payload URL", configure: func(fixture *loginFixture) { fixture.authorizePayloadCallback = true }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fixedNow := time.Date(2026, time.July, 16, 12, 0, 0, 0, time.UTC)
+			fixture := newLoginFixture(t, http.StatusOK, "")
+			test.configure(fixture)
+			service := NewService(fixture.options(fixedNow))
+			credential, err := service.Login(t.Context(), LoginInput{
+				Email:    "person@example.com",
+				Password: "correct-password",
+			})
+			if err != nil {
+				t.Fatalf("Login() error = %v", err)
+			}
+			if credential.LifecycleState != LifecycleActive || credential.AccessToken == "" {
+				t.Fatalf("credential = %#v", credential)
+			}
+			fixture.mu.Lock()
+			authorizeContinueCalls := fixture.authorizeContinueCalls
+			passwordCalls := fixture.passwordCalls
+			tokenCalls := fixture.tokenCalls
+			fixture.mu.Unlock()
+			if authorizeContinueCalls != 0 || passwordCalls != 0 || tokenCalls != 1 {
+				t.Fatalf("calls = authorize_continue:%d password:%d token:%d", authorizeContinueCalls, passwordCalls, tokenCalls)
+			}
+		})
+	}
+}
+
+func TestServiceLoginClassifiesInitialEmailVerificationContinuation(t *testing.T) {
+	fixture := newLoginFixture(t, http.StatusOK, "")
+	fixture.authorizeResponseBody = `{"continue_url":"/email-verification","page":{"type":"passwordless_login"}}`
+	service := NewService(fixture.options(time.Date(2026, time.July, 16, 12, 0, 0, 0, time.UTC)))
+	credential, errLogin := service.Login(t.Context(), LoginInput{
+		Email:    "person@example.com",
+		Password: "correct-password",
+	})
+	authError, ok := AsAuthError(errLogin)
+	if !ok || authError.Code != "email_otp_required" || authError.FailureStage != "authorize" {
+		t.Fatalf("Login() error = %#v", errLogin)
+	}
+	if credential == nil || credential.LifecycleState != LifecycleInteractionRequired {
+		t.Fatalf("credential = %#v", credential)
 	}
 }
 

@@ -88,6 +88,20 @@ func TestPutChatGPTWebLoginProxyPersistsAndHotReloads(t *testing.T) {
 	if loaded.ChatGPTWeb.LoginProxy.Resolved() != resolved {
 		t.Fatalf("persisted config = %#v, want %#v", loaded.ChatGPTWeb.LoginProxy.Resolved(), resolved)
 	}
+
+	ctx, recorder = newChatGPTWebLoginProxyRequest(http.MethodPatch, `{"enabled":false,"url-template":""}`)
+	handler.PatchChatGPTWebLoginProxy(ctx)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("clear PATCH status = %d: %s", recorder.Code, recorder.Body.String())
+	}
+	loaded, errLoad = config.LoadConfig(configPath)
+	if errLoad != nil {
+		t.Fatalf("LoadConfig() after clear error = %v", errLoad)
+	}
+	cleared := loaded.ChatGPTWeb.LoginProxy.Resolved()
+	if cleared.Enabled || cleared.URLTemplate != "" {
+		t.Fatalf("cleared persisted config = %#v", cleared)
+	}
 }
 
 func TestPatchChatGPTWebLoginProxyIsStrictAndPreservesOtherFields(t *testing.T) {

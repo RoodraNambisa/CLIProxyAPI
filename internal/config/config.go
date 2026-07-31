@@ -712,7 +712,7 @@ func (cfg ChatGPTWebImageUsageConfig) Validate() error {
 // ChatGPTWebLoginProxyConfig controls a dynamic proxy used only by password login flows.
 type ChatGPTWebLoginProxyConfig struct {
 	Enabled                   bool   `yaml:"enabled" json:"enabled"`
-	URLTemplate               string `yaml:"url-template,omitempty" json:"url-template,omitempty"`
+	URLTemplate               string `yaml:"url-template" json:"url-template,omitempty"`
 	PlaceholderCharset        string `yaml:"placeholder-charset,omitempty" json:"placeholder-charset,omitempty"`
 	RotateOnRetry             *bool  `yaml:"rotate-on-retry,omitempty" json:"rotate-on-retry,omitempty"`
 	RequestAttempts           *int   `yaml:"request-attempts,omitempty" json:"request-attempts,omitempty"`

@@ -215,6 +215,21 @@ func (service *Service) loginOnce(acquisitionContext context.Context, input Logi
 			return service.finishLogin(acquisitionContext, client, credential, input.Relogin, code, pkce.CodeVerifier)
 		}
 	}
+	if authorizeEnvelope.ContinueURL != "" {
+		continueURL := resolveURL(service.options.AuthBaseURL, authorizeEnvelope.ContinueURL)
+		if code, matched, callbackError := parseOAuthCallback(continueURL, service.options.RedirectURL, state); matched {
+			if callbackError != nil {
+				return service.loginFailure(credential, input.Relogin, callbackError)
+			}
+			return service.finishLogin(acquisitionContext, client, credential, input.Relogin, code, pkce.CodeVerifier)
+		}
+		if !isMFAChallenge(authorizeEnvelope.PageType, authorizeEnvelope.ContinueURL) {
+			if authError := classifyOAuthContinuationURL(continueURL, service.options.AuthBaseURL); authError != nil {
+				authError.FailureStage = "authorize"
+				return service.loginFailure(credential, input.Relogin, authError)
+			}
+		}
+	}
 	continueAuthorization, navigationError := classifyAuthorizeNavigation(authorizeRequestURL)
 	if navigationError != nil && (isPasswordChallenge(authorizeEnvelope.PageType, authorizeEnvelope.ContinueURL) || isMFAChallenge(authorizeEnvelope.PageType, authorizeEnvelope.ContinueURL)) {
 		navigationError = nil
@@ -1168,6 +1183,9 @@ func parseAPIEnvelope(payload []byte) apiEnvelope {
 		envelope.PageType = stringValue(page["type"])
 		if payload, okPayload := page["payload"].(map[string]any); okPayload {
 			envelope.Payload = payload
+			if strings.TrimSpace(envelope.ContinueURL) == "" && normalizeCode(envelope.PageType) == "external_url" {
+				envelope.ContinueURL = stringValue(payload["url"])
+			}
 		}
 	}
 	if envelope.Payload == nil {
