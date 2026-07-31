@@ -154,6 +154,112 @@ func TestChatGPTWebSameIdentityTokenRefreshPreservesRuntimeInstanceState(t *test
 	}
 }
 
+func TestUpdateChatGPTWebReloginRejectsConcurrentCredentialMetadataChange(t *testing.T) {
+	manager := NewManager(nil, nil, nil)
+	auth := chatGPTWebRefreshMergeAuth(nil)
+	auth.ID = "chatgpt-web-relogin-credential-change"
+	auth.Metadata["credential_uid"] = "credential-a"
+	registered, errRegister := manager.Register(WithSkipPersist(t.Context()), auth)
+	if errRegister != nil {
+		t.Fatal(errRegister)
+	}
+	relogin := registered.Clone()
+	relogin.Metadata["access_token"] = "relogin-access"
+
+	_, current, errMutate := manager.MutateRuntimeMetadataIfCurrent(t.Context(), registered, func(candidate *Auth) {
+		candidate.Metadata["password"] = "concurrent-password"
+	})
+	if errMutate != nil || !current {
+		t.Fatalf("concurrent credential mutation = current %v error %v", current, errMutate)
+	}
+	installed, current, errRelogin := manager.UpdateChatGPTWebReloginIfCurrent(
+		WithSkipPersist(t.Context()),
+		registered,
+		relogin,
+	)
+	if errRelogin != nil {
+		t.Fatalf("UpdateChatGPTWebReloginIfCurrent() error = %v", errRelogin)
+	}
+	if current || installed != nil {
+		t.Fatalf("UpdateChatGPTWebReloginIfCurrent() = (%v, %v), want superseded", installed, current)
+	}
+	latest, ok := manager.GetByID(registered.ID)
+	if !ok || latest.Metadata["password"] != "concurrent-password" {
+		t.Fatalf("latest credential = %#v", latest)
+	}
+}
+
+func TestUpdateChatGPTWebReloginAllowsConcurrentRuntimeIdentityEnrichment(t *testing.T) {
+	manager := NewManager(nil, nil, nil)
+	auth := chatGPTWebRefreshMergeAuth(nil)
+	auth.ID = "chatgpt-web-relogin-identity-enrichment"
+	auth.Metadata["credential_uid"] = "credential-a"
+	registered, errRegister := manager.Register(WithSkipPersist(t.Context()), auth)
+	if errRegister != nil {
+		t.Fatal(errRegister)
+	}
+	relogin := registered.Clone()
+	relogin.Metadata["access_token"] = "relogin-access"
+
+	_, current, errMutate := manager.MutateRuntimeMetadataIfCurrent(t.Context(), registered, func(candidate *Auth) {
+		candidate.Metadata["account_id"] = "account-a"
+		candidate.Metadata["user_id"] = "user-a"
+		candidate.Metadata["plan_type"] = "plus"
+	})
+	if errMutate != nil || !current {
+		t.Fatalf("concurrent identity enrichment = current %v error %v", current, errMutate)
+	}
+	installed, current, errRelogin := manager.UpdateChatGPTWebReloginIfCurrent(
+		WithSkipPersist(t.Context()),
+		registered,
+		relogin,
+	)
+	if errRelogin != nil {
+		t.Fatalf("UpdateChatGPTWebReloginIfCurrent() error = %v", errRelogin)
+	}
+	if !current || installed == nil {
+		t.Fatalf("UpdateChatGPTWebReloginIfCurrent() = (%v, %v), want current install", installed, current)
+	}
+	if installed.Metadata["account_id"] != "account-a" ||
+		installed.Metadata["user_id"] != "user-a" ||
+		installed.Metadata["plan_type"] != "plus" {
+		t.Fatalf("runtime identity metadata = %#v", installed.Metadata)
+	}
+}
+
+func TestUpdateChatGPTWebReloginRejectsConcurrentRuntimeIdentityConflict(t *testing.T) {
+	manager := NewManager(nil, nil, nil)
+	auth := chatGPTWebRefreshMergeAuth(nil)
+	auth.ID = "chatgpt-web-relogin-identity-conflict"
+	auth.Metadata["credential_uid"] = "credential-a"
+	auth.Metadata["account_id"] = "account-a"
+	auth.Metadata["user_id"] = "user-a"
+	registered, errRegister := manager.Register(WithSkipPersist(t.Context()), auth)
+	if errRegister != nil {
+		t.Fatal(errRegister)
+	}
+	relogin := registered.Clone()
+	relogin.Metadata["access_token"] = "relogin-access"
+
+	_, current, errMutate := manager.MutateRuntimeMetadataIfCurrent(t.Context(), registered, func(candidate *Auth) {
+		candidate.Metadata["account_id"] = "account-b"
+	})
+	if errMutate != nil || !current {
+		t.Fatalf("concurrent identity conflict = current %v error %v", current, errMutate)
+	}
+	installed, current, errRelogin := manager.UpdateChatGPTWebReloginIfCurrent(
+		WithSkipPersist(t.Context()),
+		registered,
+		relogin,
+	)
+	if errRelogin != nil {
+		t.Fatalf("UpdateChatGPTWebReloginIfCurrent() error = %v", errRelogin)
+	}
+	if current || installed != nil {
+		t.Fatalf("UpdateChatGPTWebReloginIfCurrent() = (%v, %v), want superseded", installed, current)
+	}
+}
+
 func assertChatGPTWebRefreshCleanupCall(
 	t *testing.T,
 	executor *replaceAwareExecutor,

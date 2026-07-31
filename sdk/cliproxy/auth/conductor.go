@@ -3997,6 +3997,15 @@ func (m *Manager) installPreparedRequestAuthDurably(ctx context.Context, expecte
 }
 
 func (m *Manager) installPreparedRequestAuth(ctx context.Context, expected, updated *Auth, refreshAware bool) (*Auth, error) {
+	return m.installPreparedRequestAuthWithRuntimeMetadata(ctx, expected, updated, refreshAware, false)
+}
+
+func (m *Manager) installPreparedRequestAuthWithRuntimeMetadata(
+	ctx context.Context,
+	expected, updated *Auth,
+	refreshAware bool,
+	allowRuntimeMetadataChanges bool,
+) (*Auth, error) {
 	if m == nil || expected == nil || updated == nil || strings.TrimSpace(expected.ID) == "" {
 		return updated, nil
 	}
@@ -4023,11 +4032,14 @@ func (m *Manager) installPreparedRequestAuth(ctx context.Context, expected, upda
 
 	m.mu.Lock()
 	current := m.auths[id]
-	if !requestPreparationMatchesCurrent(current, expected) {
+	if !preparedRequestAuthMatchesCurrent(current, expected, allowRuntimeMetadataChanges) {
 		m.mu.Unlock()
 		return nil, runtimeAuthInstanceRetiredError()
 	}
 	candidate := updated.Clone()
+	if allowRuntimeMetadataChanges {
+		carryForwardConcurrentRefreshMetadata(expected, current, updated, candidate)
+	}
 	clearRuntimeProxy(candidate)
 	if chatGPTWebEmailChanged(current, candidate) && m.shouldPersistAuth(ctx, candidate) {
 		m.mu.Unlock()
@@ -4060,7 +4072,7 @@ func (m *Manager) installPreparedRequestAuth(ctx context.Context, expected, upda
 
 	m.mu.Lock()
 	current = m.auths[id]
-	if !requestPreparationMatchesCurrent(current, expected) {
+	if !preparedRequestAuthMatchesCurrent(current, expected, allowRuntimeMetadataChanges) {
 		m.mu.Unlock()
 		return nil, runtimeAuthInstanceRetiredError()
 	}
@@ -4126,6 +4138,27 @@ func (m *Manager) installPreparedRequestAuth(ctx context.Context, expected, upda
 // or management edit.
 func (m *Manager) UpdateIfCurrent(ctx context.Context, expected, updated *Auth) (*Auth, bool, error) {
 	installed, err := m.installPreparedRequestAuth(ctx, expected, updated, false)
+	if isRuntimeAuthInstanceRetiredError(err) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	return installed, true, nil
+}
+
+// UpdateChatGPTWebReloginIfCurrent installs a re-login result while allowing
+// runtime-only metadata, such as rotated session cookies or image quota, to
+// advance on the same installed credential. Management edits and credential
+// replacements still supersede the re-login.
+func (m *Manager) UpdateChatGPTWebReloginIfCurrent(ctx context.Context, expected, updated *Auth) (*Auth, bool, error) {
+	installed, err := m.installPreparedRequestAuthWithRuntimeMetadata(
+		WithForceRuntimeReplacement(ctx),
+		expected,
+		updated,
+		false,
+		true,
+	)
 	if isRuntimeAuthInstanceRetiredError(err) {
 		return nil, false, nil
 	}
@@ -4427,6 +4460,127 @@ func requestPreparationMatchesCurrent(current, expected *Auth) bool {
 	currentHash := authSourceHash(current)
 	if expectedHash != "" || currentHash != "" {
 		return expectedHash != "" && expectedHash == currentHash
+	}
+	return true
+}
+
+func preparedRequestAuthMatchesCurrent(current, expected *Auth, allowRuntimeMetadataChanges bool) bool {
+	if !allowRuntimeMetadataChanges {
+		return requestPreparationMatchesCurrent(current, expected)
+	}
+	if !runtimeMetadataMutationMatchesCurrent(current, expected) ||
+		!isNativeChatGPTWebCredentialAuth(current) ||
+		!isNativeChatGPTWebCredentialAuth(expected) ||
+		!chatGPTWebReloginRuntimeMetadataMatches(expected, current) {
+		return false
+	}
+	expectedUID := chatGPTWebIdentityMetadataString(expected.Metadata, chatGPTWebCredentialUIDKey)
+	currentUID := chatGPTWebIdentityMetadataString(current.Metadata, chatGPTWebCredentialUIDKey)
+	return expectedUID == currentUID
+}
+
+func chatGPTWebReloginRuntimeMetadataMatches(expected, current *Auth) bool {
+	if expected == nil || current == nil {
+		return false
+	}
+	for key, value := range expected.Attributes {
+		if key == SourceHashAttributeKey {
+			continue
+		}
+		currentValue, ok := current.Attributes[key]
+		if !ok || currentValue != value {
+			return false
+		}
+	}
+	for key := range current.Attributes {
+		if key == SourceHashAttributeKey {
+			continue
+		}
+		if _, ok := expected.Attributes[key]; !ok {
+			return false
+		}
+	}
+	expectedCredential, errExpected := chatgptwebauth.ParseCredential(expected.Metadata)
+	currentCredential, errCurrent := chatgptwebauth.ParseCredential(current.Metadata)
+	if errExpected != nil || errCurrent != nil {
+		return false
+	}
+	if !chatGPTWebReloginRuntimeIdentityCompatible(expectedCredential, currentCredential) {
+		return false
+	}
+	expectedComparable := *expectedCredential
+	currentComparable := *currentCredential
+	clearChatGPTWebReloginRuntimeCredentialMetadata(&expectedComparable)
+	clearChatGPTWebReloginRuntimeCredentialMetadata(&currentComparable)
+	if !reflect.DeepEqual(expectedComparable, currentComparable) {
+		return false
+	}
+	knownMetadata := make(map[string]struct{})
+	for _, credential := range []*chatgptwebauth.Credential{expectedCredential, currentCredential} {
+		metadata := make(map[string]any)
+		credential.ApplyToMetadata(metadata)
+		for key := range metadata {
+			knownMetadata[key] = struct{}{}
+		}
+	}
+	return authMetadataMatchesExceptKeys(expected.Metadata, current.Metadata, knownMetadata)
+}
+
+func chatGPTWebReloginRuntimeIdentityCompatible(expected, current *chatgptwebauth.Credential) bool {
+	if expected == nil || current == nil {
+		return false
+	}
+	for _, values := range [][2]string{
+		{expected.AccountID, current.AccountID},
+		{expected.UserID, current.UserID},
+	} {
+		expectedValue := strings.TrimSpace(values[0])
+		currentValue := strings.TrimSpace(values[1])
+		if expectedValue != "" && currentValue != "" && expectedValue != currentValue {
+			return false
+		}
+	}
+	return true
+}
+
+func clearChatGPTWebReloginRuntimeCredentialMetadata(credential *chatgptwebauth.Credential) {
+	if credential == nil {
+		return
+	}
+	credential.Cookies = nil
+	credential.SessionToken = ""
+	credential.Persona = chatgptwebauth.Persona{}
+	credential.DeviceID = ""
+	credential.SessionID = ""
+	credential.AccountID = ""
+	credential.UserID = ""
+	credential.PlanType = ""
+	credential.ProfileUpdatedAt = ""
+	credential.ImageQuotaRemaining = nil
+	credential.ImageQuotaResetAt = ""
+	credential.QuotaState = ""
+	credential.QuotaUpdatedAt = ""
+	credential.QuotaStale = false
+	credential.QuotaLastError = ""
+}
+
+func authMetadataMatchesExceptKeys(expected, current map[string]any, ignored map[string]struct{}) bool {
+	for key, value := range expected {
+		if _, skip := ignored[key]; skip {
+			continue
+		}
+		currentValue, ok := current[key]
+		if !ok || !reflect.DeepEqual(currentValue, value) {
+			return false
+		}
+	}
+	for key := range current {
+		if _, skip := ignored[key]; skip {
+			continue
+		}
+		if _, ok := expected[key]; !ok {
+			return false
+		}
 	}
 	return true
 }

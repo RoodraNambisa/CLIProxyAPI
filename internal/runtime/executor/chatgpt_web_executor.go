@@ -1105,8 +1105,8 @@ func (e *ChatGPTWebExecutor) reloginCurrent(ctx context.Context, expected *clipr
 		return nil, false, firstNonNilError(errLogin, errors.New("chatgpt web re-login returned no credential"))
 	}
 	updated := applyChatGPTWebCredential(expected, result)
-	installed, current, errUpdate := e.manager.UpdateIfCurrent(
-		cliproxyauth.WithForceRuntimeReplacement(ctx),
+	installed, current, errUpdate := e.manager.UpdateChatGPTWebReloginIfCurrent(
+		ctx,
 		expected,
 		updated,
 	)
@@ -1456,11 +1456,26 @@ func chatGPTWebReloginGenerationKey(auth *cliproxyauth.Auth) string {
 	if auth == nil {
 		return ""
 	}
-	sourceGeneration := ""
-	if auth.Attributes != nil {
-		sourceGeneration = strings.TrimSpace(auth.Attributes[cliproxyauth.SourceHashAttributeKey])
+	credentialUID := ""
+	if auth.Metadata != nil {
+		credentialUID, _ = auth.Metadata["credential_uid"].(string)
+		credentialUID = strings.TrimSpace(credentialUID)
 	}
-	return chatGPTWebRefreshKey(auth) + ":" + auth.RuntimeInstallationID() + ":" + sourceGeneration
+	if credentialUID == "" {
+		if credential, err := chatgptwebauth.ParseCredential(auth.Metadata); err == nil {
+			credentialUID = strings.ToLower(strings.TrimSpace(credential.Email))
+		}
+	}
+	if credentialUID == "" {
+		credentialUID = cliproxyauth.ChatGPTWebCredentialIdentity(auth)
+	}
+	digest := sha256.Sum256([]byte(credentialUID))
+	return strings.Join([]string{
+		auth.ID,
+		auth.RuntimeInstanceID(),
+		auth.RuntimeInstallationID(),
+		fmt.Sprintf("%x", digest[:8]),
+	}, ":")
 }
 
 func (e *ChatGPTWebExecutor) currentTime() time.Time {

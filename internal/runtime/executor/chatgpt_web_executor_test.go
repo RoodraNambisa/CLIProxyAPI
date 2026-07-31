@@ -28,6 +28,20 @@ type fakeChatGPTWebAuthService struct {
 	refreshSessionCalls atomic.Int32
 }
 
+type chatGPTWebReloginSourceHashStore struct{}
+
+func (*chatGPTWebReloginSourceHashStore) List(context.Context) ([]*cliproxyauth.Auth, error) {
+	return nil, nil
+}
+
+func (*chatGPTWebReloginSourceHashStore) Save(_ context.Context, auth *cliproxyauth.Auth) (string, error) {
+	return "", cliproxyauth.SetCanonicalSourceHashAttribute(auth)
+}
+
+func (*chatGPTWebReloginSourceHashStore) Delete(context.Context, string) error {
+	return nil
+}
+
 type chatGPTWebLeaseResolver struct {
 	active atomic.Int32
 }
@@ -2211,6 +2225,114 @@ func TestChatGPTWebExecutorReloginUsesConditionalUpdate(t *testing.T) {
 	got, _ := manager.GetByID(auth.ID)
 	if got.Metadata["access_token"] != "manual-token" {
 		t.Fatalf("access token = %v, want manual-token", got.Metadata["access_token"])
+	}
+}
+
+func TestChatGPTWebExecutorReloginMergesConcurrentRuntimeCookieRotation(t *testing.T) {
+	manager := cliproxyauth.NewManager(&chatGPTWebReloginSourceHashStore{}, nil, nil)
+	auth := chatGPTWebTestAuth("relogin-cookie-rotation")
+	credential, errCredential := chatgptwebauth.ParseCredential(auth.Metadata)
+	if errCredential != nil {
+		t.Fatal(errCredential)
+	}
+	remaining := 24
+	credential.ImageQuotaRemaining = &remaining
+	credential.Cookies = []chatgptwebauth.Cookie{
+		{Name: "__Secure-next-auth.session-token.0", Value: "baseline-a", Domain: ".chatgpt.com", Path: "/"},
+		{Name: "__Secure-next-auth.session-token.1", Value: "baseline-b", Domain: ".chatgpt.com", Path: "/"},
+	}
+	credential.LifecycleState = chatgptwebauth.LifecycleReloginPending
+	credential.ApplyToMetadata(auth.Metadata)
+	if _, errRegister := manager.Register(t.Context(), auth); errRegister != nil {
+		t.Fatal(errRegister)
+	}
+	expected, _ := manager.GetByID(auth.ID)
+	expectedSourceHash := expected.Attributes[cliproxyauth.SourceHashAttributeKey]
+	expectedGeneration := chatGPTWebReloginGenerationKey(expected)
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	fake := &fakeChatGPTWebAuthService{}
+	fake.loginFn = func(_ context.Context, input chatgptwebauth.LoginInput) (*chatgptwebauth.Credential, error) {
+		close(started)
+		<-release
+		result := cloneChatGPTWebCredential(input.Credential)
+		result.AccessToken = "fresh-login-token"
+		result.Cookies = []chatgptwebauth.Cookie{
+			{Name: "__Secure-next-auth.session-token.0", Value: "relogin-a", Domain: ".chatgpt.com", Path: "/"},
+			{Name: "__Secure-next-auth.session-token.1", Value: "relogin-b", Domain: ".chatgpt.com", Path: "/"},
+		}
+		result.LifecycleState = chatgptwebauth.LifecycleActive
+		return result, nil
+	}
+	executor := NewChatGPTWebExecutor(&config.Config{}, manager)
+	executor.authService = fake
+
+	type reloginResult struct {
+		auth    *cliproxyauth.Auth
+		current bool
+		err     error
+	}
+	done := make(chan reloginResult, 1)
+	go func() {
+		updated, current, errRelogin := executor.ReloginCurrent(t.Context(), expected)
+		done <- reloginResult{auth: updated, current: current, err: errRelogin}
+	}()
+	<-started
+
+	concurrent, current, errMutate := manager.MutateRuntimeMetadataIfCurrent(t.Context(), expected, func(candidate *cliproxyauth.Auth) {
+		currentCredential, errParse := chatgptwebauth.ParseCredential(candidate.Metadata)
+		if errParse != nil {
+			t.Errorf("parse concurrent credential: %v", errParse)
+			return
+		}
+		concurrentRemaining := 23
+		currentCredential.AccountID = "account-a"
+		currentCredential.UserID = "user-a"
+		currentCredential.ImageQuotaRemaining = &concurrentRemaining
+		currentCredential.Cookies = []chatgptwebauth.Cookie{
+			{Name: "__Secure-next-auth.session-token.0", Value: "runtime-a", Domain: ".chatgpt.com", Path: "/"},
+			{Name: "__Secure-next-auth.session-token.1", Value: "runtime-b", Domain: ".chatgpt.com", Path: "/"},
+			{Name: "concurrent", Value: "kept", Domain: ".chatgpt.com", Path: "/"},
+		}
+		currentCredential.ApplyToMetadata(candidate.Metadata)
+	})
+	if errMutate != nil || !current || concurrent == nil {
+		t.Fatalf("concurrent mutation = (%v, %v, %v)", concurrent, current, errMutate)
+	}
+	if concurrent.Attributes[cliproxyauth.SourceHashAttributeKey] == expectedSourceHash {
+		t.Fatal("concurrent cookie rotation did not advance the persisted source hash")
+	}
+	if got := chatGPTWebReloginGenerationKey(concurrent); got != expectedGeneration {
+		t.Fatalf("re-login generation changed after runtime cookie rotation: %q != %q", got, expectedGeneration)
+	}
+	close(release)
+
+	relogin := <-done
+	if relogin.err != nil || !relogin.current || relogin.auth == nil {
+		t.Fatalf("re-login = (%v, %v, %v)", relogin.auth, relogin.current, relogin.err)
+	}
+	installedCredential, errParse := chatgptwebauth.ParseCredential(relogin.auth.Metadata)
+	if errParse != nil {
+		t.Fatal(errParse)
+	}
+	if installedCredential.AccessToken != "fresh-login-token" {
+		t.Fatalf("access token = %q", installedCredential.AccessToken)
+	}
+	if installedCredential.ImageQuotaRemaining == nil || *installedCredential.ImageQuotaRemaining != 23 {
+		t.Fatalf("image quota remaining = %v, want 23", installedCredential.ImageQuotaRemaining)
+	}
+	if installedCredential.AccountID != "account-a" || installedCredential.UserID != "user-a" {
+		t.Fatalf("runtime identity = (%q, %q)", installedCredential.AccountID, installedCredential.UserID)
+	}
+	cookieValues := make(map[string]string, len(installedCredential.Cookies))
+	for _, cookie := range installedCredential.Cookies {
+		cookieValues[cookie.Name] = cookie.Value
+	}
+	if cookieValues["__Secure-next-auth.session-token.0"] != "relogin-a" ||
+		cookieValues["__Secure-next-auth.session-token.1"] != "relogin-b" ||
+		cookieValues["concurrent"] != "kept" {
+		t.Fatalf("merged cookies = %#v", installedCredential.Cookies)
 	}
 }
 
