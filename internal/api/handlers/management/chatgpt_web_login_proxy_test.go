@@ -182,6 +182,33 @@ func TestChatGPTWebManagementCloudflareDiagnosticsAreSafe(t *testing.T) {
 	}
 }
 
+func TestChatGPTWebManagementAuthorizationCompletionDiagnostics(t *testing.T) {
+	errLogin := &chatgptwebauth.AuthError{
+		Code:           "authorization_completion_required",
+		State:          chatgptwebauth.LifecycleInteractionRequired,
+		LifecycleState: chatgptwebauth.LifecycleInteractionRequired,
+		StatusCode:     http.StatusOK,
+		FailureStage:   "password_verify",
+		Attempts:       1,
+	}
+	category, _, status, lifecycle := classifyChatGPTWebManagementError(errLogin)
+	failureStage, attempts := chatGPTWebManagementErrorDiagnostics(errLogin)
+	if category != "authorization_completion_required" ||
+		status != http.StatusUnprocessableEntity ||
+		lifecycle != string(chatgptwebauth.LifecycleInteractionRequired) ||
+		failureStage != "password_verify" ||
+		attempts != 1 {
+		t.Fatalf(
+			"classification = %q %d %q %q %d",
+			category,
+			status,
+			lifecycle,
+			failureStage,
+			attempts,
+		)
+	}
+}
+
 func newPersistedChatGPTWebLoginProxyHandler(t *testing.T, loginProxy config.ChatGPTWebLoginProxyConfig) (*Handler, string) {
 	t.Helper()
 	configPath := writeTestConfigFile(t)

@@ -298,7 +298,7 @@ func (service *Service) loginOnce(acquisitionContext context.Context, input Logi
 			return service.loginFailure(credential, input.Relogin, ensureAuthError(err, pendingState))
 		}
 		if authorizeEnvelope.ContinueURL == "" {
-			authError := newAuthError("authorization_completion_required", LifecycleInteractionRequired, response.StatusCode, false, true, "MFA verification did not return an OAuth continuation", nil)
+			authError := authorizationCompletionError("mfa_verify", response.StatusCode, "MFA verification did not return an OAuth continuation")
 			return service.loginFailure(credential, input.Relogin, authError)
 		}
 		code, followError := service.followOAuthCode(acquisitionContext, client, authorizeEnvelope.ContinueURL, state, pendingState)
@@ -353,7 +353,7 @@ func (service *Service) loginOnce(acquisitionContext context.Context, input Logi
 		return service.loginFailure(credential, input.Relogin, authError)
 	}
 	if passwordEnvelope.ContinueURL == "" {
-		authError := newAuthError("authorization_completion_required", LifecycleInteractionRequired, response.StatusCode, false, true, "password verification did not return an OAuth continuation", nil)
+		authError := authorizationCompletionError("password_verify", response.StatusCode, "password verification did not return an OAuth continuation")
 		return service.loginFailure(credential, input.Relogin, authError)
 	}
 
@@ -800,7 +800,7 @@ func (service *Service) followOAuthCode(ctx context.Context, client *Client, sta
 			currentURL = resolveURL(currentURL, envelope.ContinueURL)
 			continue
 		}
-		return "", newAuthError("authorization_completion_required", LifecycleInteractionRequired, response.StatusCode, false, true, "OAuth redirect did not reach the callback", nil)
+		return "", authorizationCompletionError("oauth_redirect", response.StatusCode, "OAuth redirect did not reach the callback")
 	}
 	return "", newAuthError("oauth_redirect_limit", transientState, 0, true, false, "OAuth redirect limit exceeded", nil)
 }
@@ -835,7 +835,7 @@ func (service *Service) followAuthorizationRedirects(ctx context.Context, client
 		currentURL := responseRequestURL(response)
 		location := strings.TrimSpace(response.Header.Get("Location"))
 		if location == "" {
-			return response, payload, "", newAuthError("authorization_completion_required", LifecycleInteractionRequired, response.StatusCode, false, true, "authorization redirect did not provide a destination", nil)
+			return response, payload, "", authorizationCompletionError("authorize_redirect", response.StatusCode, "authorization redirect did not provide a destination")
 		}
 		nextURL := resolveURL(currentURL, location)
 		if code, matched, authError := parseOAuthCallback(nextURL, service.options.RedirectURL, expectedState); matched {
@@ -920,7 +920,7 @@ func (service *Service) followPasswordRedirects(
 		currentURL := responseRequestURL(response)
 		location := strings.TrimSpace(response.Header.Get("Location"))
 		if location == "" {
-			return response, payload, "", newAuthError("authorization_completion_required", LifecycleInteractionRequired, response.StatusCode, false, true, "password redirect did not provide a destination", nil)
+			return response, payload, "", authorizationCompletionError("password_verify", response.StatusCode, "password redirect did not provide a destination")
 		}
 		nextURL := resolveURL(currentURL, location)
 		if code, matched, callbackError := parseOAuthCallback(nextURL, service.options.RedirectURL, expectedState); matched {
@@ -1903,7 +1903,9 @@ func responseRequestURL(response *fhttp.Response) string {
 func classifyAuthorizeNavigation(rawURL string) (bool, *AuthError) {
 	parsedURL, err := url.Parse(strings.TrimSpace(rawURL))
 	if err != nil || parsedURL.Path == "" {
-		return false, newAuthError("authorization_completion_required", LifecycleInteractionRequired, 0, false, true, "authorize request did not reach a recognized login page", err)
+		authError := authorizationCompletionError("authorize", 0, "authorize request did not reach a recognized login page")
+		authError.Cause = err
+		return false, authError
 	}
 	path := strings.ToLower(strings.TrimRight(parsedURL.Path, "/"))
 	switch path {
@@ -1915,7 +1917,13 @@ func classifyAuthorizeNavigation(rawURL string) (bool, *AuthError) {
 	if authError := classifyPageType(path); authError != nil {
 		return false, authError
 	}
-	return false, newAuthError("authorization_completion_required", LifecycleInteractionRequired, 0, false, true, "authorize request requires user interaction", nil)
+	return false, authorizationCompletionError("authorize", 0, "authorize request requires user interaction")
+}
+
+func authorizationCompletionError(stage string, status int, message string) *AuthError {
+	authError := newAuthError("authorization_completion_required", LifecycleInteractionRequired, status, false, true, message, nil)
+	authError.FailureStage = strings.TrimSpace(stage)
+	return authError
 }
 
 func resolveURL(baseURL, reference string) string {

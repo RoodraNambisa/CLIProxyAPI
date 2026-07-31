@@ -193,6 +193,9 @@ func isCloudflareChallenge(response *fhttp.Response, payload []byte) bool {
 	if response == nil {
 		return false
 	}
+	if strings.EqualFold(strings.TrimSpace(response.Header.Get("CF-Mitigated")), "challenge") {
+		return true
+	}
 	statusCandidate := response.StatusCode == http.StatusForbidden ||
 		response.StatusCode == http.StatusTooManyRequests ||
 		response.StatusCode == http.StatusServiceUnavailable

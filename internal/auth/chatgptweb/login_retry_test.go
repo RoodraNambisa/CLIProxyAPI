@@ -39,6 +39,22 @@ func TestCloudflareChallengeDetectionDoesNotRejectNormalEdgeResponse(t *testing.
 	}
 }
 
+func TestCloudflareChallengeDetectionUsesMitigatedHeader(t *testing.T) {
+	response := &fhttp.Response{
+		StatusCode: http.StatusOK,
+		Header:     fhttp.Header{},
+	}
+	response.Header.Set("Content-Type", "application/json")
+	response.Header.Set("CF-Mitigated", "challenge")
+	if !isCloudflareChallenge(response, []byte(`{"unexpected":"body"}`)) {
+		t.Fatal("Cloudflare cf-mitigated challenge header was not classified as a challenge")
+	}
+	response.Header.Set("CF-Mitigated", "not-a-challenge")
+	if isCloudflareChallenge(response, []byte(`{"ok":true}`)) {
+		t.Fatal("unknown cf-mitigated value was classified as a challenge")
+	}
+}
+
 func TestLoginClientRotatesProxyAndPreservesCookies(t *testing.T) {
 	var (
 		calls          atomic.Int32

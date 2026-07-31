@@ -425,6 +425,48 @@ func TestServiceLogin(t *testing.T) {
 	}
 }
 
+func TestServiceLoginReportsAuthorizationCompletionStage(t *testing.T) {
+	tests := []struct {
+		name          string
+		configure     func(*loginFixture)
+		expectedStage string
+	}{
+		{
+			name: "authorize",
+			configure: func(fixture *loginFixture) {
+				fixture.authorizeResponseBody = `{}`
+			},
+			expectedStage: "authorize",
+		},
+		{
+			name: "password verify",
+			configure: func(fixture *loginFixture) {
+				fixture.passwordBody = `{}`
+			},
+			expectedStage: "password_verify",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newLoginFixture(t, http.StatusOK, "")
+			test.configure(fixture)
+			service := NewService(fixture.options(time.Date(2026, time.July, 16, 12, 0, 0, 0, time.UTC)))
+			credential, errLogin := service.Login(t.Context(), LoginInput{
+				Email:    "person@example.com",
+				Password: "correct-password",
+			})
+			authError, ok := AsAuthError(errLogin)
+			if !ok || authError.Code != "authorization_completion_required" ||
+				authError.FailureStage != test.expectedStage || authError.Attempts != 1 {
+				t.Fatalf("Login() error = %#v", errLogin)
+			}
+			if credential == nil || credential.LifecycleState != LifecycleInteractionRequired {
+				t.Fatalf("credential = %#v", credential)
+			}
+		})
+	}
+}
+
 func TestServiceLoginStartsFreshFlowAfterOneTimeCloudflareChallenge(t *testing.T) {
 	fixedNow := time.Date(2026, time.July, 16, 12, 0, 0, 0, time.UTC)
 	fixture := newLoginFixture(t, http.StatusOK, "")
@@ -493,6 +535,31 @@ func TestServiceLoginReportsCloudflareAfterRequestAndFlowRetries(t *testing.T) {
 	fixture.mu.Unlock()
 	if gotAuthorizeCalls != 4 {
 		t.Fatalf("authorize calls = %d, want 4", gotAuthorizeCalls)
+	}
+}
+
+func TestServiceLoginReportsCloudflareWithoutLoginProxy(t *testing.T) {
+	fixture := newLoginFixture(t, http.StatusOK, "")
+	fixture.authorizeContinueCloudflare = true
+
+	service := NewService(fixture.options(time.Date(2026, time.July, 16, 12, 0, 0, 0, time.UTC)))
+	credential, errLogin := service.Login(t.Context(), LoginInput{
+		Email:    "person@example.com",
+		Password: "correct-password",
+	})
+	authError, ok := AsAuthError(errLogin)
+	if !ok || authError.Code != "cloudflare_challenge" ||
+		authError.FailureStage != "authorize_continue" || authError.Attempts != 1 {
+		t.Fatalf("Login() error = %#v", errLogin)
+	}
+	if credential == nil || credential.LifecycleState == LifecycleDead {
+		t.Fatalf("Cloudflare challenge marked credential dead: %#v", credential)
+	}
+	fixture.mu.Lock()
+	gotAuthorizeCalls := fixture.authorizeContinueCalls
+	fixture.mu.Unlock()
+	if gotAuthorizeCalls != 1 {
+		t.Fatalf("authorize calls = %d, want 1", gotAuthorizeCalls)
 	}
 }
 
