@@ -271,7 +271,7 @@ func (sentinel *Sentinel) Token(ctx context.Context, flow string) (string, error
 			"sec-fetch-site": "same-origin",
 		}, requestBody)
 	if err != nil {
-		return "", newAuthError("sentinel_network_error", LifecycleLoginPending, 0, true, false, "sentinel request failed", err)
+		return "", networkAuthError("sentinel_network_error", LifecycleLoginPending, err)
 	}
 	if response.StatusCode != http.StatusOK {
 		if response.StatusCode == http.StatusTooManyRequests || response.StatusCode >= http.StatusInternalServerError {

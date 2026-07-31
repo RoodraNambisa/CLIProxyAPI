@@ -30,6 +30,8 @@ type loginFixture struct {
 	authorizeBody               string
 	authorizeContinueCalls      int
 	authorizeContinueCloudflare bool
+	sentinelCalls               int
+	sentinelCloudflare          bool
 	authorizeRedirect           bool
 	authorizeRedirectURL        string
 	authorizeRedirectStatus     int
@@ -195,6 +197,17 @@ func (fixture *loginFixture) handleAuthorize(response http.ResponseWriter, reque
 func (fixture *loginFixture) handleSentinel(response http.ResponseWriter, request *http.Request) {
 	if request.Method != http.MethodPost {
 		fixture.t.Errorf("sentinel method = %s", request.Method)
+	}
+	fixture.mu.Lock()
+	fixture.sentinelCalls++
+	cloudflare := fixture.sentinelCloudflare
+	fixture.mu.Unlock()
+	if cloudflare {
+		response.Header().Set("CF-Ray", "challenge-ray")
+		response.Header().Set("Content-Type", "text/html")
+		response.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = io.WriteString(response, `<html><script src="/cdn-cgi/challenge-platform/x"></script></html>`)
+		return
 	}
 	var body map[string]any
 	if err := json.NewDecoder(request.Body).Decode(&body); err != nil {
@@ -480,6 +493,41 @@ func TestServiceLoginReportsCloudflareAfterRequestAndFlowRetries(t *testing.T) {
 	fixture.mu.Unlock()
 	if gotAuthorizeCalls != 4 {
 		t.Fatalf("authorize calls = %d, want 4", gotAuthorizeCalls)
+	}
+}
+
+func TestServiceLoginReportsCloudflareFromSentinelStage(t *testing.T) {
+	fixture := newLoginFixture(t, http.StatusOK, "")
+	fixture.sentinelCloudflare = true
+	proxy := newLoginConnectProxy(t, nil)
+	template := strings.Replace(proxy.URL, "http://", "http://session-{1}:secret@", 1)
+
+	service := NewService(fixture.options(time.Date(2026, time.July, 16, 12, 0, 0, 0, time.UTC)))
+	credential, errLogin := service.Login(t.Context(), LoginInput{
+		Email:    "person@example.com",
+		Password: "correct-password",
+		LoginProxy: LoginProxyConfig{
+			Enabled:            true,
+			URLTemplate:        template,
+			PlaceholderCharset: "ab",
+			RotateOnRetry:      true,
+			RequestAttempts:    2,
+			FlowAttempts:       2,
+			AcquisitionTimeout: 5 * time.Second,
+		},
+	})
+	authError, ok := AsAuthError(errLogin)
+	if !ok || authError.Code != "cloudflare_challenge" || authError.FailureStage != "sentinel" || authError.Attempts != 2 {
+		t.Fatalf("Login() error = %#v", errLogin)
+	}
+	if credential == nil || credential.LifecycleState == LifecycleDead {
+		t.Fatalf("Cloudflare challenge marked credential dead: %#v", credential)
+	}
+	fixture.mu.Lock()
+	gotSentinelCalls := fixture.sentinelCalls
+	fixture.mu.Unlock()
+	if gotSentinelCalls != 4 {
+		t.Fatalf("sentinel calls = %d, want 4", gotSentinelCalls)
 	}
 }
 
