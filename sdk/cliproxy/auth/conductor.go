@@ -4255,6 +4255,7 @@ func (m *Manager) mutateRuntimeMetadataIfCurrent(
 	defer unlockPersist()
 
 	now := time.Now()
+	imageModels := ChatGPTWebImageModelIDs(expected)
 	modelKeys := make([]string, 0, len(clearModels))
 	for _, model := range clearModels {
 		modelKeys = append(modelKeys, canonicalModelKey(model))
@@ -4279,7 +4280,7 @@ func (m *Manager) mutateRuntimeMetadataIfCurrent(
 	if mutate != nil {
 		mutate(candidate)
 		if clearObservationMatches {
-			clearChatGPTWebImageRateLimitsAfterFreshQuota(candidate, now)
+			clearChatGPTWebImageRateLimitsAfterFreshQuotaForModels(candidate, now, imageModels)
 		}
 	}
 	for modelKey := range clearBaselines {
@@ -4307,7 +4308,7 @@ func (m *Manager) mutateRuntimeMetadataIfCurrent(
 	if mutate != nil {
 		mutate(installed)
 		if clearObservationMatches {
-			clearedFreshImageRateLimits = clearChatGPTWebImageRateLimitsAfterFreshQuota(installed, now)
+			clearedFreshImageRateLimits = clearChatGPTWebImageRateLimitsAfterFreshQuotaForModels(installed, now, imageModels)
 		}
 	}
 	clearedModels := make([]string, 0, len(clearBaselines))
@@ -6607,6 +6608,25 @@ func (m *Manager) markResult(
 	}
 	defer unlockResultMutation()
 
+	registeredModels := registry.GetGlobalRegistry().GetModelsForClient(result.AuthID)
+	registeredExecutionModels := make(map[string]struct{}, len(registeredModels)*2)
+	for _, registeredModel := range registeredModels {
+		if registeredModel == nil {
+			continue
+		}
+		if modelKey := canonicalModelKey(registeredModel.ID); modelKey != "" {
+			registeredExecutionModels[modelKey] = struct{}{}
+		}
+		if modelKey := canonicalModelKey(registeredModel.UpstreamID); modelKey != "" {
+			registeredExecutionModels[modelKey] = struct{}{}
+		}
+	}
+	supportsExecutionModel := func(model string) bool {
+		_, supported := registeredExecutionModels[canonicalModelKey(model)]
+		return supported
+	}
+	registeredImageModels := chatGPTWebImageModelIDs(registeredModels)
+
 	shouldResumeModel := false
 	shouldSuspendModel := false
 	suspendReason := ""
@@ -6619,17 +6639,31 @@ func (m *Manager) markResult(
 		persistAuth  *Auth
 	)
 	acceptedResult := authInstanceID == ""
+	now := time.Time{}
+	dynamicModelResult := false
+	staleDynamicModelResult := false
+	var beforeDynamicModelResult *Auth
+	pendingDynamicFinalize := false
+	finalizeAcceptedResultLocked := func(auth *Auth) {
+		if auth == nil || staleDynamicModelResult {
+			return
+		}
+		if result.Success && imageSuccessCount > 0 {
+			imageQuotaSuspendModels = projectChatGPTWebImageSuccess(auth, imageSuccessCount, imageSuccessModels, now)
+		}
+		persistAuth = auth
+	}
 
 	m.mu.Lock()
 	if auth, ok := m.auths[result.AuthID]; ok && auth != nil && (authInstanceID == "" || authInstanceID == auth.instanceID) {
 		acceptedResult = true
-		now := time.Now()
+		now = time.Now()
 		dynamicFixedCooldown, hasDynamicFixedCooldown := m.fixedErrorCooldownForResult(result.Error)
 		resultStatusCode := statusCodeFromResult(result.Error)
 		chatGPTWebImageQuotaResult := result.Error != nil &&
 			strings.EqualFold(strings.TrimSpace(result.Error.Code), "chatgpt_web_image_quota")
 		chatGPTWebImage429Result := resultStatusCode == http.StatusTooManyRequests &&
-			chatGPTWebImageModelProjection(auth, result.Model)
+			chatGPTWebImageModelProjectionForModels(auth, result.Model, registeredImageModels)
 		if (chatGPTWebImageQuotaResult || chatGPTWebImage429Result) && hasDynamicFixedCooldown {
 			dynamicFixedCooldown.scope = cooldownScopeModel
 		}
@@ -6640,12 +6674,10 @@ func (m *Manager) markResult(
 		authWideDynamicCooldown := chatGPTWebInFlightModelResult &&
 			((hasDynamicFixedCooldown && dynamicFixedCooldown.scope == cooldownScopeAuth) ||
 				(!hasDynamicFixedCooldown && resultStatusCode == http.StatusUnauthorized))
-		dynamicModelResult := chatGPTWebInFlightModelResult && !authWideDynamicCooldown
-		staleDynamicModelResult := dynamicModelResult &&
-			!clientRegistrySupportsExecutionModel(result.AuthID, result.Model)
+		dynamicModelResult = chatGPTWebInFlightModelResult && !authWideDynamicCooldown
+		staleDynamicModelResult = dynamicModelResult && !supportsExecutionModel(result.Model)
 		removedDynamicModelWithAuthCooldown := authWideDynamicCooldown &&
-			!clientRegistrySupportsExecutionModel(result.AuthID, result.Model)
-		var beforeDynamicModelResult *Auth
+			!supportsExecutionModel(result.Model)
 		if dynamicModelResult && !staleDynamicModelResult {
 			beforeDynamicModelResult = auth.Clone()
 		}
@@ -6661,7 +6693,7 @@ func (m *Manager) markResult(
 		} else if result.Success {
 			if result.Model != "" {
 				state := ensureModelState(auth, result.Model)
-				if !chatGPTWebImageQuotaOwnedModelState(auth, result.Model, state) {
+				if !chatGPTWebImageQuotaOwnedModelStateForModels(auth, result.Model, state, registeredImageModels) {
 					resetModelState(state, now)
 					shouldResumeModel = true
 					clearModelQuota = true
@@ -6672,11 +6704,11 @@ func (m *Manager) markResult(
 					additionalModel = strings.TrimSpace(additionalModel)
 					if additionalModel == "" ||
 						canonicalModelKey(additionalModel) == canonicalModelKey(result.Model) ||
-						!clientRegistrySupportsExecutionModel(result.AuthID, additionalModel) {
+						!supportsExecutionModel(additionalModel) {
 						continue
 					}
 					state := ensureModelState(auth, additionalModel)
-					if !chatGPTWebImageQuotaOwnedModelState(auth, additionalModel, state) {
+					if !chatGPTWebImageQuotaOwnedModelStateForModels(auth, additionalModel, state, registeredImageModels) {
 						resetModelState(state, now)
 						additionalSuccessModelsApplied = append(additionalSuccessModelsApplied, additionalModel)
 					}
@@ -6833,31 +6865,38 @@ func (m *Manager) markResult(
 			}
 		}
 
-		if dynamicModelResult && !staleDynamicModelResult &&
-			!clientRegistrySupportsExecutionModel(result.AuthID, result.Model) {
-			*auth = *beforeDynamicModelResult
-			shouldResumeModel = false
-			shouldSuspendModel = false
-			suspendReason = ""
-			clearModelQuota = false
-			setModelQuota = false
-			additionalSuccessModelsApplied = nil
-			staleDynamicModelResult = true
-		}
 		if removedDynamicModelWithAuthCooldown {
 			delete(auth.ModelStates, result.Model)
 			if len(auth.ModelStates) == 0 {
 				auth.ModelStates = nil
 			}
 		}
-		if !staleDynamicModelResult && result.Success && imageSuccessCount > 0 {
-			imageQuotaSuspendModels = projectChatGPTWebImageSuccess(auth, imageSuccessCount, imageSuccessModels, now)
-		}
-		if !staleDynamicModelResult {
-			persistAuth = auth
+		if dynamicModelResult && !staleDynamicModelResult {
+			pendingDynamicFinalize = true
+		} else {
+			finalizeAcceptedResultLocked(auth)
 		}
 	}
 	m.mu.Unlock()
+	if pendingDynamicFinalize {
+		stillSupported := clientRegistrySupportsExecutionModel(result.AuthID, result.Model)
+		m.mu.Lock()
+		auth := m.auths[result.AuthID]
+		if auth != nil && auth.instanceID == authInstanceID {
+			if !stillSupported {
+				*auth = *beforeDynamicModelResult
+				shouldResumeModel = false
+				shouldSuspendModel = false
+				suspendReason = ""
+				clearModelQuota = false
+				setModelQuota = false
+				additionalSuccessModelsApplied = nil
+				staleDynamicModelResult = true
+			}
+			finalizeAcceptedResultLocked(auth)
+		}
+		m.mu.Unlock()
+	}
 	if persistAuth != nil {
 		authSnapshot, _ = m.snapshotCurrentAuthForPersistenceLocked(ctx, persistAuth)
 	}
@@ -6891,10 +6930,10 @@ func (m *Manager) markResult(
 		m.mu.RLock()
 		current := m.auths[result.AuthID]
 		stillCurrent := current != nil && current.instanceID == authInstanceID && !m.sessionCleanupPendingLocked(result.AuthID)
+		m.mu.RUnlock()
 		if stillCurrent {
 			applyRegistryResult()
 		}
-		m.mu.RUnlock()
 		unlockResultMutation()
 		if !stillCurrent {
 			return
@@ -7759,6 +7798,7 @@ func (m *Manager) routeAwareSelectionRequired(auth *Auth, routeModel string) boo
 
 func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, ProviderExecutor, error) {
 	pinnedAuthID := pinnedAuthIDFromMetadata(opts.Metadata)
+	registryRef := registry.GetGlobalRegistry()
 
 	m.mu.RLock()
 	executor, okExecutor := m.executors[provider]
@@ -7775,7 +7815,6 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 			modelKey = strings.TrimSpace(parsed.ModelName)
 		}
 	}
-	registryRef := registry.GetGlobalRegistry()
 	for _, candidate := range m.auths {
 		if candidate.Provider != provider || candidate.Disabled || m.sessionCleanupPendingLocked(candidate.ID) {
 			continue
@@ -7783,13 +7822,19 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 		if pinnedAuthID != "" && candidate.ID != pinnedAuthID {
 			continue
 		}
-		if modelKey != "" && !m.authSupportsRouteModel(registryRef, candidate, model) {
-			continue
+		candidates = append(candidates, candidate.Clone())
+	}
+	m.mu.RUnlock()
+	if modelKey != "" {
+		filtered := candidates[:0]
+		for _, candidate := range candidates {
+			if m.authSupportsRouteModel(registryRef, candidate, model) {
+				filtered = append(filtered, candidate)
+			}
 		}
-		candidates = append(candidates, candidate)
+		candidates = filtered
 	}
 	if len(candidates) == 0 {
-		m.mu.RUnlock()
 		return nil, nil, &Error{Code: "auth_not_found", Message: "no auth available"}
 	}
 	requestLimiter := m.authRequestLimiter()
@@ -7808,7 +7853,6 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 			}
 			policy := m.routingAuthRequestLimitPolicyForAuth(candidate)
 			if available, block := requestLimiter.availableAt(candidate.ID, policy, now); !available {
-				m.mu.RUnlock()
 				return nil, nil, newAuthRequestLimitedError(block)
 			}
 			break
@@ -7845,32 +7889,27 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 		var selected *Auth
 		if picked, handled, _, errPick := m.pickLegacyFillFirstRangeAuthWithDeferredBinding(ctx, provider, model, opts, candidates, pickAllowed); handled {
 			if errPick != nil {
-				m.mu.RUnlock()
 				return nil, nil, preferAuthRequestLimitError(errPick, requestBlocked)
 			}
 			selected = picked
 		} else {
 			available, errAvailable := m.availableAuthsForRouteModelFilteredForContext(ctx, candidates, provider, model, opts, now, pickAllowed)
 			if errAvailable != nil {
-				m.mu.RUnlock()
 				return nil, nil, preferAuthRequestLimitError(errAvailable, requestBlocked)
 			}
 			var errPick error
 			selected, errPick = m.pickAvailableAuthWithPriorityPolicy(ctx, provider, selectionArgForSelector(m.selector, model), opts, available)
 			if errPick != nil {
-				m.mu.RUnlock()
 				return nil, nil, preferAuthRequestLimitError(errPick, requestBlocked)
 			}
 			if selected != nil {
 				selected = authFromListByID(available, selected.ID)
 			}
 			if selected == nil {
-				m.mu.RUnlock()
 				return nil, nil, &Error{Code: "auth_not_found", Message: "selector returned unavailable auth"}
 			}
 		}
 		if selected == nil {
-			m.mu.RUnlock()
 			return nil, nil, preferAuthRequestLimitError(&Error{Code: "auth_not_found", Message: "selector returned no auth"}, requestBlocked)
 		}
 		policy := m.routingAuthRequestLimitPolicyForAuth(selected)
@@ -7885,10 +7924,11 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 			continue
 		}
 		authCopy := selected.Clone()
-		m.mu.RUnlock()
 		if !selected.indexAssigned {
 			m.mu.Lock()
-			if current := m.auths[authCopy.ID]; current != nil && !current.indexAssigned {
+			if current := m.auths[authCopy.ID]; current != nil &&
+				current.instanceID == selected.instanceID &&
+				!current.indexAssigned {
 				current.EnsureIndex()
 				authCopy = current.Clone()
 			}
@@ -7968,9 +8008,16 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 	if len(providerSet) == 0 {
 		return nil, nil, "", &Error{Code: "provider_not_found", Message: "no provider supplied"}
 	}
+	registryRef := registry.GetGlobalRegistry()
 
 	m.mu.RLock()
 	candidates := make([]*Auth, 0, len(m.auths))
+	executors := make(map[string]ProviderExecutor, len(providerSet))
+	for providerKey := range providerSet {
+		if executor := m.executors[providerKey]; executor != nil {
+			executors[providerKey] = executor
+		}
+	}
 	modelKey := strings.TrimSpace(model)
 	// Always use base model name (without thinking suffix) for auth matching.
 	if modelKey != "" {
@@ -7979,7 +8026,6 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 			modelKey = strings.TrimSpace(parsed.ModelName)
 		}
 	}
-	registryRef := registry.GetGlobalRegistry()
 	for _, candidate := range m.auths {
 		if candidate == nil || candidate.Disabled || m.sessionCleanupPendingLocked(candidate.ID) {
 			continue
@@ -7994,16 +8040,22 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 		if _, ok := providerSet[providerKey]; !ok {
 			continue
 		}
-		if _, ok := m.executors[providerKey]; !ok {
+		if _, ok := executors[providerKey]; !ok {
 			continue
 		}
-		if modelKey != "" && !m.authSupportsRouteModel(registryRef, candidate, model) {
-			continue
+		candidates = append(candidates, candidate.Clone())
+	}
+	m.mu.RUnlock()
+	if modelKey != "" {
+		filtered := candidates[:0]
+		for _, candidate := range candidates {
+			if m.authSupportsRouteModel(registryRef, candidate, model) {
+				filtered = append(filtered, candidate)
+			}
 		}
-		candidates = append(candidates, candidate)
+		candidates = filtered
 	}
 	if len(candidates) == 0 {
-		m.mu.RUnlock()
 		return nil, nil, "", &Error{Code: "auth_not_found", Message: "no auth available"}
 	}
 	selectorProvider := "mixed"
@@ -8028,7 +8080,6 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 			}
 			policy := m.routingAuthRequestLimitPolicyForAuth(candidate)
 			if available, block := requestLimiter.availableAt(candidate.ID, policy, now); !available {
-				m.mu.RUnlock()
 				return nil, nil, "", newAuthRequestLimitedError(block)
 			}
 			break
@@ -8068,32 +8119,27 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 		var selected *Auth
 		if picked, handled, _, errPick := m.pickLegacyFillFirstRangeAuthWithDeferredBinding(ctx, selectorProvider, model, opts, candidates, pickAllowedForSelection); handled {
 			if errPick != nil {
-				m.mu.RUnlock()
 				return nil, nil, "", preferAuthRequestLimitError(errPick, requestBlocked)
 			}
 			selected = picked
 		} else {
 			available, errAvailable := m.availableAuthsForRouteModelFilteredForContext(ctx, candidates, selectorProvider, model, opts, now, pickAllowedForSelection)
 			if errAvailable != nil {
-				m.mu.RUnlock()
 				return nil, nil, "", preferAuthRequestLimitError(errAvailable, requestBlocked)
 			}
 			var errPick error
 			selected, errPick = m.pickAvailableAuthWithPriorityPolicy(ctx, selectorProvider, selectionArgForSelector(m.selector, model), opts, available)
 			if errPick != nil {
-				m.mu.RUnlock()
 				return nil, nil, "", preferAuthRequestLimitError(errPick, requestBlocked)
 			}
 			if selected != nil {
 				selected = authFromListByID(available, selected.ID)
 			}
 			if selected == nil {
-				m.mu.RUnlock()
 				return nil, nil, "", &Error{Code: "auth_not_found", Message: "selector returned unavailable auth"}
 			}
 		}
 		if selected == nil {
-			m.mu.RUnlock()
 			return nil, nil, "", preferAuthRequestLimitError(&Error{Code: "auth_not_found", Message: "selector returned no auth"}, requestBlocked)
 		}
 		policy := m.routingAuthRequestLimitPolicyForAuth(selected)
@@ -8108,16 +8154,16 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 			continue
 		}
 		providerKey := strings.TrimSpace(strings.ToLower(selected.Provider))
-		executor, okExecutor := m.executors[providerKey]
+		executor, okExecutor := executors[providerKey]
 		if !okExecutor {
-			m.mu.RUnlock()
 			return nil, nil, "", &Error{Code: "executor_not_found", Message: "executor not registered"}
 		}
 		authCopy := selected.Clone()
-		m.mu.RUnlock()
 		if !selected.indexAssigned {
 			m.mu.Lock()
-			if current := m.auths[authCopy.ID]; current != nil && !current.indexAssigned {
+			if current := m.auths[authCopy.ID]; current != nil &&
+				current.instanceID == selected.instanceID &&
+				!current.indexAssigned {
 				current.EnsureIndex()
 				authCopy = current.Clone()
 			}

@@ -184,6 +184,13 @@ func ChatGPTWebImageCapabilityUnavailable(auth *Auth, now time.Time) (bool, time
 // ChatGPTWebImageModelIDs returns the registered image capability model IDs
 // followed by the canonical upstream model used by image tool results.
 func ChatGPTWebImageModelIDs(auth *Auth) []string {
+	if auth == nil {
+		return chatGPTWebImageModelIDs(nil)
+	}
+	return chatGPTWebImageModelIDs(registry.GetGlobalRegistry().GetModelsForClient(auth.ID))
+}
+
+func chatGPTWebImageModelIDs(registeredModels []*registry.ModelInfo) []string {
 	models := make([]string, 0, 2)
 	seen := make(map[string]struct{}, 2)
 	add := func(model string) {
@@ -198,11 +205,9 @@ func ChatGPTWebImageModelIDs(auth *Auth) []string {
 		seen[key] = struct{}{}
 		models = append(models, model)
 	}
-	if auth != nil {
-		for _, info := range registry.GetGlobalRegistry().GetModelsForClient(auth.ID) {
-			if info != nil && info.Type == registry.OpenAIImageModelType {
-				add(info.ID)
-			}
+	for _, info := range registeredModels {
+		if info != nil && info.Type == registry.OpenAIImageModelType {
+			add(info.ID)
 		}
 	}
 	add(chatGPTWebImageModel)
@@ -256,13 +261,16 @@ func projectChatGPTWebImageSuccess(auth *Auth, count int64, imageModels []string
 }
 
 func chatGPTWebImageModelStateEntries(auth *Auth) []chatGPTWebImageModelStateEntry {
+	return chatGPTWebImageModelStateEntriesForModels(auth, ChatGPTWebImageModelIDs(auth))
+}
+
+func chatGPTWebImageModelStateEntriesForModels(auth *Auth, imageModels []string) []chatGPTWebImageModelStateEntry {
 	if auth == nil || len(auth.ModelStates) == 0 {
 		return nil
 	}
-	targets := ChatGPTWebImageModelIDs(auth)
-	entries := make([]chatGPTWebImageModelStateEntry, 0, len(targets))
-	seen := make(map[string]struct{}, len(targets))
-	for _, target := range targets {
+	entries := make([]chatGPTWebImageModelStateEntry, 0, len(imageModels))
+	seen := make(map[string]struct{}, len(imageModels))
+	for _, target := range imageModels {
 		targetKey := canonicalModelKey(target)
 		for stateModel, state := range auth.ModelStates {
 			stateKey := canonicalModelKey(stateModel)
@@ -282,17 +290,19 @@ func chatGPTWebImageModelStateEntries(auth *Auth) []chatGPTWebImageModelStateEnt
 }
 
 func chatGPTWebImageModelProjection(auth *Auth, model string) bool {
+	if auth == nil {
+		return false
+	}
+	return chatGPTWebImageModelProjectionForModels(auth, model, ChatGPTWebImageModelIDs(auth))
+}
+
+func chatGPTWebImageModelProjectionForModels(auth *Auth, model string, imageModels []string) bool {
 	if auth == nil || !strings.EqualFold(strings.TrimSpace(auth.Provider), chatgptwebauth.Provider) {
 		return false
 	}
 	modelKey := canonicalModelKey(model)
-	if strings.EqualFold(modelKey, canonicalModelKey(chatGPTWebImageModel)) {
-		return true
-	}
-	for _, info := range registry.GetGlobalRegistry().GetModelsForClient(auth.ID) {
-		if info != nil &&
-			info.Type == registry.OpenAIImageModelType &&
-			strings.EqualFold(modelKey, canonicalModelKey(info.ID)) {
+	for _, imageModel := range imageModels {
+		if strings.EqualFold(modelKey, canonicalModelKey(imageModel)) {
 			return true
 		}
 	}
@@ -300,6 +310,10 @@ func chatGPTWebImageModelProjection(auth *Auth, model string) bool {
 }
 
 func chatGPTWebImageCapabilityStateForAuth(auth *Auth, now time.Time) chatGPTWebImageCapabilityState {
+	return chatGPTWebImageCapabilityStateForAuthWithModels(auth, now, ChatGPTWebImageModelIDs(auth))
+}
+
+func chatGPTWebImageCapabilityStateForAuthWithModels(auth *Auth, now time.Time, imageModels []string) chatGPTWebImageCapabilityState {
 	if auth == nil || !strings.EqualFold(strings.TrimSpace(auth.Provider), chatgptwebauth.Provider) {
 		return chatGPTWebImageCapabilityState{}
 	}
@@ -310,7 +324,7 @@ func chatGPTWebImageCapabilityStateForAuth(auth *Auth, now time.Time) chatGPTWeb
 		nextRetryAt:        futureTime(resetAt, now),
 	}
 	refreshDue := capability.blocked && capability.nextRetryAt.IsZero()
-	for _, entry := range chatGPTWebImageModelStateEntries(auth) {
+	for _, entry := range chatGPTWebImageModelStateEntriesForModels(auth, imageModels) {
 		modelState := entry.state
 		reason := strings.ToLower(strings.TrimSpace(modelState.Quota.Reason))
 		quotaRetryAt := modelState.Quota.NextRecoverAt
@@ -399,8 +413,12 @@ func chatGPTWebImageQuotaConfirmedAvailableAfter(auth *Auth, after time.Time) bo
 }
 
 func clearChatGPTWebImageRateLimitsAfterFreshQuota(auth *Auth, now time.Time) []string {
+	return clearChatGPTWebImageRateLimitsAfterFreshQuotaForModels(auth, now, ChatGPTWebImageModelIDs(auth))
+}
+
+func clearChatGPTWebImageRateLimitsAfterFreshQuotaForModels(auth *Auth, now time.Time, imageModels []string) []string {
 	var cleared []string
-	for _, entry := range chatGPTWebImageModelStateEntries(auth) {
+	for _, entry := range chatGPTWebImageModelStateEntriesForModels(auth, imageModels) {
 		state := entry.state
 		if !state.Quota.Exceeded || !strings.EqualFold(strings.TrimSpace(state.Quota.Reason), "quota") {
 			continue
@@ -417,17 +435,23 @@ func clearChatGPTWebImageRateLimitsAfterFreshQuota(auth *Auth, now time.Time) []
 }
 
 func chatGPTWebImageQuotaOwnedModelState(auth *Auth, model string, state *ModelState) bool {
-	return chatGPTWebImageModelProjection(auth, model) &&
+	return chatGPTWebImageQuotaOwnedModelStateForModels(auth, model, state, ChatGPTWebImageModelIDs(auth))
+}
+
+func chatGPTWebImageQuotaOwnedModelStateForModels(auth *Auth, model string, state *ModelState, imageModels []string) bool {
+	return chatGPTWebImageModelProjectionForModels(auth, model, imageModels) &&
 		state != nil &&
 		state.Quota.Exceeded &&
 		strings.EqualFold(strings.TrimSpace(state.Quota.Reason), "chatgpt_web_image_quota")
 }
 
 func chatGPTWebImageQuotaBlocksModel(auth *Auth, model string, now time.Time) (bool, time.Time) {
-	if !chatGPTWebImageModelProjection(auth, model) {
+	imageModels := ChatGPTWebImageModelIDs(auth)
+	if !chatGPTWebImageModelProjectionForModels(auth, model, imageModels) {
 		return false, time.Time{}
 	}
-	return chatGPTWebImageCapabilityUnavailable(auth, now)
+	state := chatGPTWebImageCapabilityStateForAuthWithModels(auth, now, imageModels)
+	return state.blocked, state.nextRetryAt
 }
 
 func futureTime(value, now time.Time) time.Time {
@@ -579,6 +603,7 @@ func (m *Manager) preferChatGPTWebImageQuotaErrorForCandidates(
 	refreshInFlight := false
 	preferOriginal := false
 	blockedCandidates := make([]chatGPTWebImageCapabilityCandidate, 0)
+	authCandidates := make([]*Auth, 0)
 
 	m.mu.RLock()
 	for _, candidate := range m.auths {
@@ -595,9 +620,14 @@ func (m *Manager) preferChatGPTWebImageQuotaErrorForCandidates(
 		if _, alreadyTried := tried[candidate.ID]; alreadyTried {
 			continue
 		}
+		authCandidates = append(authCandidates, candidate.Clone())
+	}
+	m.mu.RUnlock()
+	for _, candidate := range authCandidates {
 		if pickAllowed != nil && !pickAllowed(candidate) {
 			continue
 		}
+		provider := strings.ToLower(strings.TrimSpace(candidate.Provider))
 		if strings.TrimSpace(model) != "" && !m.authSupportsRouteModel(registryRef, candidate, model) {
 			continue
 		}
@@ -605,13 +635,14 @@ func (m *Manager) preferChatGPTWebImageQuotaErrorForCandidates(
 			preferOriginal = true
 			continue
 		}
+		imageModels := ChatGPTWebImageModelIDs(candidate)
 		if !imageTool &&
 			(!strings.EqualFold(provider, chatgptwebauth.Provider) ||
-				!chatGPTWebImageModelProjection(candidate, m.selectionModelKeyForAuth(candidate, model))) {
+				!chatGPTWebImageModelProjectionForModels(candidate, m.selectionModelKeyForAuth(candidate, model), imageModels)) {
 			preferOriginal = true
 			continue
 		}
-		capability := chatGPTWebImageCapabilityStateForAuth(candidate, now)
+		capability := chatGPTWebImageCapabilityStateForAuthWithModels(candidate, now, imageModels)
 		if capability.blocked {
 			blockedCandidates = append(blockedCandidates, chatGPTWebImageCapabilityCandidate{
 				authID:     candidate.ID,
@@ -633,7 +664,6 @@ func (m *Manager) preferChatGPTWebImageQuotaErrorForCandidates(
 		preferOriginal = true
 		continue
 	}
-	m.mu.RUnlock()
 	if len(blockedCandidates) == 0 {
 		return err
 	}
@@ -714,6 +744,7 @@ func (m *Manager) triggerDueChatGPTWebImageQuotaRefreshes(
 	registryRef := registry.GetGlobalRegistry()
 	now := time.Now()
 	dueCandidates := make([]chatGPTWebImageCapabilityCandidate, 0)
+	authCandidates := make([]*Auth, 0)
 	m.mu.RLock()
 	for _, candidate := range m.auths {
 		if candidate == nil ||
@@ -729,6 +760,10 @@ func (m *Manager) triggerDueChatGPTWebImageQuotaRefreshes(
 		if _, alreadyTried := tried[candidate.ID]; alreadyTried {
 			continue
 		}
+		authCandidates = append(authCandidates, candidate.Clone())
+	}
+	m.mu.RUnlock()
+	for _, candidate := range authCandidates {
 		if pickAllowed != nil && !pickAllowed(candidate) {
 			continue
 		}
@@ -740,10 +775,11 @@ func (m *Manager) triggerDueChatGPTWebImageQuotaRefreshes(
 			candidate.NextRetryAfter.After(now) {
 			continue
 		}
-		if !imageTool && !chatGPTWebImageModelProjection(candidate, m.selectionModelKeyForAuth(candidate, model)) {
+		imageModels := ChatGPTWebImageModelIDs(candidate)
+		if !imageTool && !chatGPTWebImageModelProjectionForModels(candidate, m.selectionModelKeyForAuth(candidate, model), imageModels) {
 			continue
 		}
-		capability := chatGPTWebImageCapabilityStateForAuth(candidate, now)
+		capability := chatGPTWebImageCapabilityStateForAuthWithModels(candidate, now, imageModels)
 		if capability.refreshDue {
 			dueCandidates = append(dueCandidates, chatGPTWebImageCapabilityCandidate{
 				authID:     candidate.ID,
@@ -751,7 +787,6 @@ func (m *Manager) triggerDueChatGPTWebImageQuotaRefreshes(
 			})
 		}
 	}
-	m.mu.RUnlock()
 	refreshAuthIDs := make([]string, 0, len(dueCandidates))
 	runtimeReader := m.chatGPTWebAccountInfoRuntimeStateReader()
 	for _, candidate := range dueCandidates {

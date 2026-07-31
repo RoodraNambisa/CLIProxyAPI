@@ -6,6 +6,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 )
 
 type chatGPTWebAutoRefreshCloseExecutor struct {
@@ -15,6 +17,24 @@ type chatGPTWebAutoRefreshCloseExecutor struct {
 }
 
 type chatGPTWebRolledBackRefreshStore struct{}
+
+type reentrantManagerSelector struct {
+	manager  *Manager
+	executor ProviderExecutor
+}
+
+func (selector *reentrantManagerSelector) Pick(
+	_ context.Context,
+	_, _ string,
+	_ cliproxyexecutor.Options,
+	auths []*Auth,
+) (*Auth, error) {
+	selector.manager.RegisterExecutor(selector.executor)
+	if len(auths) == 0 {
+		return nil, nil
+	}
+	return auths[0], nil
+}
 
 func (*chatGPTWebRolledBackRefreshStore) List(context.Context) ([]*Auth, error) {
 	return nil, nil
@@ -37,6 +57,49 @@ func (executor *chatGPTWebAutoRefreshCloseExecutor) Close() error {
 
 func (executor *chatGPTWebAutoRefreshCloseExecutor) RefreshToCompletion(ctx context.Context, auth *Auth) (*Auth, error) {
 	return executor.Refresh(context.WithoutCancel(ctx), auth)
+}
+
+func TestLegacySelectionDoesNotHoldManagerLockAcrossSelector(t *testing.T) {
+	for _, mixed := range []bool{false, true} {
+		name := "single"
+		if mixed {
+			name = "mixed"
+		}
+		t.Run(name, func(t *testing.T) {
+			const provider = "reentrant-selector"
+			executor := &aliasRoutingExecutor{id: provider}
+			selector := &reentrantManagerSelector{executor: executor}
+			manager := NewManager(nil, selector, nil)
+			selector.manager = manager
+			manager.RegisterExecutor(executor)
+			if _, errRegister := manager.Register(WithSkipPersist(t.Context()), &Auth{
+				ID:       "reentrant-selector-" + name,
+				Provider: provider,
+				Status:   StatusActive,
+			}); errRegister != nil {
+				t.Fatal(errRegister)
+			}
+
+			result := make(chan error, 1)
+			go func() {
+				if mixed {
+					_, _, _, errPick := manager.pickNextMixedLegacy(t.Context(), []string{provider}, "", cliproxyexecutor.Options{}, nil, nil)
+					result <- errPick
+					return
+				}
+				_, _, errPick := manager.pickNextLegacy(t.Context(), provider, "", cliproxyexecutor.Options{}, nil)
+				result <- errPick
+			}()
+			select {
+			case errPick := <-result:
+				if errPick != nil {
+					t.Fatalf("selection error = %v", errPick)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("selection deadlocked when selector re-entered the manager")
+			}
+		})
+	}
 }
 
 func TestManagerLoadReleasesDependencyLockWhenPersistBarrierWaitIsCanceled(t *testing.T) {
