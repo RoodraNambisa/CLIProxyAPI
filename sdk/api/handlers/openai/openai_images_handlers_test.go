@@ -1339,7 +1339,7 @@ func TestOpenAIImagesEditsJSONDoesNotForwardN(t *testing.T) {
 }
 
 func TestConvertResponsesToImagesResponse(t *testing.T) {
-	raw := []byte(`{"created_at":1700000000,"output":[{"type":"message"},{"type":"image_generation_call","result":"ZmluYWw=","revised_prompt":"better","output_format":"webp","size":"1024x1024","background":"auto","quality":"high"}],"tool_usage":{"image_gen":{"input_tokens":3,"input_tokens_details":{"text_tokens":3,"image_tokens":0,"cache_tokens":2},"output_tokens":6,"output_tokens_details":{"image_tokens":6,"text_tokens":0},"total_tokens":9,"future_detail":{"source":"official"}}},"usage":{"total_tokens":999}}`)
+	raw := []byte(`{"created_at":1700000000,"output":[{"type":"message"},{"type":"image_generation_call","result":"ZmluYWw=","revised_prompt":"better","output_format":"webp","size":"1024x1024","background":"opaque","quality":"high"}],"tool_usage":{"image_gen":{"input_tokens":3,"input_tokens_details":{"text_tokens":3,"image_tokens":0,"cache_tokens":2},"output_tokens":6,"output_tokens_details":{"image_tokens":6,"text_tokens":0},"total_tokens":9,"future_detail":{"source":"official"}}},"usage":{"total_tokens":999}}`)
 	out, err := convertResponsesToImagesResponse(raw, 1)
 	if err != nil {
 		t.Fatalf("convertResponsesToImagesResponse: %v", err)
@@ -1359,7 +1359,7 @@ func TestConvertResponsesToImagesResponse(t *testing.T) {
 	if got := gjson.GetBytes(out, "size").String(); got != "1024x1024" {
 		t.Fatalf("size = %q", got)
 	}
-	if got := gjson.GetBytes(out, "background").String(); got != "auto" {
+	if got := gjson.GetBytes(out, "background").String(); got != "opaque" {
 		t.Fatalf("background = %q", got)
 	}
 	if got := gjson.GetBytes(out, "quality").String(); got != "high" {
@@ -1401,7 +1401,7 @@ func TestConvertResponsesToImagesResponseErrorsWithoutImageOutput(t *testing.T) 
 
 func TestConvertResponsesToImagesResponseInfersImageMetadata(t *testing.T) {
 	const png1x1 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
-	raw := []byte(`{"created_at":1700000000,"output":[{"type":"image_generation_call","result":"` + png1x1 + `"}]}`)
+	raw := []byte(`{"created_at":1700000000,"output":[{"type":"image_generation_call","result":"` + png1x1 + `","output_format":"auto","size":"auto","quality":"auto","background":"auto"}]}`)
 	out, errConvert := convertResponsesToImagesResponse(raw, 1)
 	if errConvert != nil {
 		t.Fatalf("convertResponsesToImagesResponse() error = %v", errConvert)

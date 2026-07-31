@@ -1261,6 +1261,18 @@ func inferImageResultMetadata(result *imageResult) {
 	if result == nil || strings.TrimSpace(result.B64JSON) == "" {
 		return
 	}
+	if strings.EqualFold(strings.TrimSpace(result.OutputFormat), "auto") {
+		result.OutputFormat = ""
+	}
+	if strings.EqualFold(strings.TrimSpace(result.Size), "auto") {
+		result.Size = ""
+	}
+	if strings.EqualFold(strings.TrimSpace(result.Quality), "auto") {
+		result.Quality = ""
+	}
+	if strings.EqualFold(strings.TrimSpace(result.Background), "auto") {
+		result.Background = ""
+	}
 	if strings.TrimSpace(result.OutputFormat) != "" && strings.TrimSpace(result.Size) != "" {
 		return
 	}
