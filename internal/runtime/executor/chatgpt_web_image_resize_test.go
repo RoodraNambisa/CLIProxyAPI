@@ -148,16 +148,20 @@ func BenchmarkResizeChatGPTWebImage(b *testing.B) {
 				Width: test.targetWidth, Height: test.targetHeight,
 				RatioWidth: test.ratioWidth, RatioHeight: test.ratioHeight,
 			}
-			snapshot := cliproxyexecutor.ChatGPTWebImageConfigSnapshot{
-				AspectRatioMaxErrorPercent: 1,
-				ResizeFilter:               config.ChatGPTWebResizeFilterCatmullRom,
-			}
-			b.ReportAllocs()
-			b.ResetTimer()
-			for range b.N {
-				if _, ok, err := resizeChatGPTWebImageToPNG(data, match, snapshot, chatGPTWebMaxImageResponseBytes); err != nil || !ok {
-					b.Fatalf("resize ok=%v err=%v", ok, err)
-				}
+			for _, filter := range []string{config.ChatGPTWebResizeFilterCatmullRom, config.ChatGPTWebResizeFilterApproxBiLinear} {
+				b.Run(filter, func(b *testing.B) {
+					snapshot := cliproxyexecutor.ChatGPTWebImageConfigSnapshot{
+						AspectRatioMaxErrorPercent: 1,
+						ResizeFilter:               filter,
+					}
+					b.ReportAllocs()
+					b.ResetTimer()
+					for range b.N {
+						if _, ok, err := resizeChatGPTWebImageToPNG(data, match, snapshot, chatGPTWebMaxImageResponseBytes); err != nil || !ok {
+							b.Fatalf("resize ok=%v err=%v", ok, err)
+						}
+					}
+				})
 			}
 		})
 	}

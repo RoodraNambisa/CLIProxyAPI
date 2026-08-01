@@ -826,7 +826,7 @@ func resizeChatGPTWebImageToPNG(
 	if crop.Empty() {
 		return nil, false, errors.New("computed image crop is empty")
 	}
-	destination := image.NewNRGBA(image.Rect(0, 0, match.Width, match.Height))
+	destination := image.NewRGBA(image.Rect(0, 0, match.Width, match.Height))
 	scaler := xdraw.Scaler(xdraw.CatmullRom)
 	if strings.EqualFold(strings.TrimSpace(snapshot.ResizeFilter), config.ChatGPTWebResizeFilterApproxBiLinear) {
 		scaler = xdraw.ApproxBiLinear
