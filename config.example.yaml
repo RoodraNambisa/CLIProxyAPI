@@ -412,6 +412,9 @@ nonstream-keepalive-interval: 0
 #   chatgpt-web:
 #     upstream-model: "gpt-5-5"      # Web conversation model used to invoke picture_v2.
 #     ignore-unsupported-params: false # Drop unsupported size/quality/etc. instead of excluding Web routing.
+#     adapt-size-to-aspect-ratio: false # Map explicit WxH sizes to a supported Web aspect-ratio prompt.
+#     aspect-ratio-max-error-percent: 1 # Maximum relative error for request and output ratio matching.
+#     max-resize-edge-pixels: 3840     # Ignore Web size adaptation when either requested edge exceeds this value.
 #   native:
 #     generations:
 #       enabled: false

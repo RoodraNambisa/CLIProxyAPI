@@ -42,6 +42,9 @@ const (
 	// ChatGPTWebIgnoreUnsupportedImageParamsMetadataKey pins the compatibility
 	// endpoint's unsupported image parameter policy for one execution.
 	ChatGPTWebIgnoreUnsupportedImageParamsMetadataKey = "chatgpt_web_ignore_unsupported_image_params"
+	// ChatGPTWebImageConfigSnapshotMetadataKey pins Web image adaptation settings
+	// after compatibility routing has accepted a request.
+	ChatGPTWebImageConfigSnapshotMetadataKey = "chatgpt_web_image_config_snapshot"
 	// ImageGenerationResultStateMetadataKey carries provider-confirmed image
 	// generation success back to the auth result recorder.
 	ImageGenerationResultStateMetadataKey = "image_generation_result_state"
@@ -63,6 +66,13 @@ const (
 	// ExecutionSessionMetadataKey identifies a long-lived downstream execution session.
 	ExecutionSessionMetadataKey = "execution_session_id"
 )
+
+// ChatGPTWebImageConfigSnapshot contains request-scoped Web image adaptation settings.
+type ChatGPTWebImageConfigSnapshot struct {
+	AdaptSizeToAspectRatio     bool
+	AspectRatioMaxErrorPercent float64
+	MaxResizeEdgePixels        int
+}
 
 // ImageGenerationStreamPassthroughState reports whether the selected upstream request
 // still contains an image generation tool after provider policy is applied.

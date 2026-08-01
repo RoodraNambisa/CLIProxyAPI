@@ -1740,6 +1740,9 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 		cfg.Images.ImageModel = "gpt-image-2"
 	}
 	cfg.Images.ChatGPTWeb.UpstreamModel = cfg.Images.ChatGPTWeb.ResolvedUpstreamModel()
+	if err = cfg.Images.ChatGPTWeb.Validate(); err != nil {
+		return nil, err
+	}
 	if cfg.Images.EnableNAggregation == nil {
 		enableNAggregation := false
 		cfg.Images.EnableNAggregation = &enableNAggregation

@@ -4,7 +4,11 @@
 // debug settings, proxy configuration, and API keys.
 package config
 
-import "strings"
+import (
+	"fmt"
+	"math"
+	"strings"
+)
 
 // SDKConfig represents the application's configuration, loaded from a YAML file.
 type SDKConfig struct {
@@ -165,6 +169,28 @@ type ChatGPTWebImageConfig struct {
 	UpstreamModel string `yaml:"upstream-model,omitempty" json:"upstream-model,omitempty"`
 	// IgnoreUnsupportedParams allows Web routing after dropping options that Web cannot express.
 	IgnoreUnsupportedParams bool `yaml:"ignore-unsupported-params,omitempty" json:"ignore-unsupported-params,omitempty"`
+	// AdaptSizeToAspectRatio maps explicit image sizes to ratios supported by ChatGPT Web.
+	AdaptSizeToAspectRatio bool `yaml:"adapt-size-to-aspect-ratio,omitempty" json:"adapt-size-to-aspect-ratio,omitempty"`
+	// AspectRatioMaxErrorPercent is the maximum relative error accepted for ratio mapping.
+	AspectRatioMaxErrorPercent *float64 `yaml:"aspect-ratio-max-error-percent,omitempty" json:"aspect-ratio-max-error-percent,omitempty"`
+	// MaxResizeEdgePixels limits explicit size adaptation targets.
+	MaxResizeEdgePixels *int `yaml:"max-resize-edge-pixels,omitempty" json:"max-resize-edge-pixels,omitempty"`
+}
+
+const (
+	DefaultChatGPTWebAspectRatioMaxErrorPercent = 1.0
+	MaxChatGPTWebAspectRatioMaxErrorPercent     = 10.0
+	DefaultChatGPTWebMaxResizeEdgePixels        = 3840
+	MaxChatGPTWebMaxResizeEdgePixels            = 3840
+)
+
+// ResolvedChatGPTWebImageConfig contains effective ChatGPT Web image compatibility values.
+type ResolvedChatGPTWebImageConfig struct {
+	UpstreamModel              string
+	IgnoreUnsupportedParams    bool
+	AdaptSizeToAspectRatio     bool
+	AspectRatioMaxErrorPercent float64
+	MaxResizeEdgePixels        int
 }
 
 // ResolvedUpstreamModel returns the effective ChatGPT Web image conversation model.
@@ -173,6 +199,38 @@ func (cfg ChatGPTWebImageConfig) ResolvedUpstreamModel() string {
 		return model
 	}
 	return DefaultChatGPTWebImageUpstreamModel
+}
+
+// Resolved returns the effective ChatGPT Web image compatibility configuration.
+func (cfg ChatGPTWebImageConfig) Resolved() ResolvedChatGPTWebImageConfig {
+	resolved := ResolvedChatGPTWebImageConfig{
+		UpstreamModel:              cfg.ResolvedUpstreamModel(),
+		IgnoreUnsupportedParams:    cfg.IgnoreUnsupportedParams,
+		AdaptSizeToAspectRatio:     cfg.AdaptSizeToAspectRatio,
+		AspectRatioMaxErrorPercent: DefaultChatGPTWebAspectRatioMaxErrorPercent,
+		MaxResizeEdgePixels:        DefaultChatGPTWebMaxResizeEdgePixels,
+	}
+	if cfg.AspectRatioMaxErrorPercent != nil {
+		resolved.AspectRatioMaxErrorPercent = *cfg.AspectRatioMaxErrorPercent
+	}
+	if cfg.MaxResizeEdgePixels != nil {
+		resolved.MaxResizeEdgePixels = *cfg.MaxResizeEdgePixels
+	}
+	return resolved
+}
+
+// Validate rejects invalid ChatGPT Web image compatibility settings.
+func (cfg ChatGPTWebImageConfig) Validate() error {
+	resolved := cfg.Resolved()
+	if math.IsNaN(resolved.AspectRatioMaxErrorPercent) || math.IsInf(resolved.AspectRatioMaxErrorPercent, 0) ||
+		resolved.AspectRatioMaxErrorPercent < 0 ||
+		resolved.AspectRatioMaxErrorPercent > MaxChatGPTWebAspectRatioMaxErrorPercent {
+		return fmt.Errorf("images.chatgpt-web.aspect-ratio-max-error-percent must be between 0 and %.0f", MaxChatGPTWebAspectRatioMaxErrorPercent)
+	}
+	if resolved.MaxResizeEdgePixels < 1 || resolved.MaxResizeEdgePixels > MaxChatGPTWebMaxResizeEdgePixels {
+		return fmt.Errorf("images.chatgpt-web.max-resize-edge-pixels must be between 1 and %d", MaxChatGPTWebMaxResizeEdgePixels)
+	}
+	return nil
 }
 
 // NativeImagesConfig holds direct Codex Images API configuration.

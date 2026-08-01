@@ -17,6 +17,7 @@ type Config = internalconfig.Config
 type StreamingConfig = internalconfig.StreamingConfig
 type ImagesConfig = internalconfig.ImagesConfig
 type ChatGPTWebImageConfig = internalconfig.ChatGPTWebImageConfig
+type ResolvedChatGPTWebImageConfig = internalconfig.ResolvedChatGPTWebImageConfig
 type NativeImagesConfig = internalconfig.NativeImagesConfig
 type NativeImageEndpointConfig = internalconfig.NativeImageEndpointConfig
 type TLSConfig = internalconfig.TLSConfig

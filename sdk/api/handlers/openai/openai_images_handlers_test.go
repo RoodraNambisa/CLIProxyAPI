@@ -39,6 +39,8 @@ type imageCaptureExecutor struct {
 	maxResults                      int
 	ignoreUnsupportedImageParams    bool
 	hasIgnoreUnsupportedImageParams bool
+	imageConfigSnapshot             coreexecutor.ChatGPTWebImageConfigSnapshot
+	hasImageConfigSnapshot          bool
 	response                        []byte
 	streamChunks                    []coreexecutor.StreamChunk
 	beforeExecute                   func()
@@ -65,6 +67,7 @@ func (e *imageCaptureExecutor) Execute(ctx context.Context, auth *coreauth.Auth,
 	e.alt = opts.Alt
 	e.maxResults, _ = opts.Metadata[coreexecutor.ImageGenerationMaxResultsMetadataKey].(int)
 	e.ignoreUnsupportedImageParams, e.hasIgnoreUnsupportedImageParams = opts.Metadata[coreexecutor.ChatGPTWebIgnoreUnsupportedImageParamsMetadataKey].(bool)
+	e.imageConfigSnapshot, e.hasImageConfigSnapshot = opts.Metadata[coreexecutor.ChatGPTWebImageConfigSnapshotMetadataKey].(coreexecutor.ChatGPTWebImageConfigSnapshot)
 	if len(e.response) == 0 {
 		e.response = []byte(`{"created_at":1700000000,"output":[{"type":"image_generation_call","result":"aGVsbG8=","revised_prompt":"rev"}],"usage":{"total_tokens":3}}`)
 	}
@@ -82,6 +85,7 @@ func (e *imageCaptureExecutor) ExecuteStream(_ context.Context, _ *coreauth.Auth
 	e.alt = opts.Alt
 	e.maxResults, _ = opts.Metadata[coreexecutor.ImageGenerationMaxResultsMetadataKey].(int)
 	e.ignoreUnsupportedImageParams, e.hasIgnoreUnsupportedImageParams = opts.Metadata[coreexecutor.ChatGPTWebIgnoreUnsupportedImageParamsMetadataKey].(bool)
+	e.imageConfigSnapshot, e.hasImageConfigSnapshot = opts.Metadata[coreexecutor.ChatGPTWebImageConfigSnapshotMetadataKey].(coreexecutor.ChatGPTWebImageConfigSnapshot)
 	ch := make(chan coreexecutor.StreamChunk, len(e.streamChunks))
 	for _, chunk := range e.streamChunks {
 		ch <- chunk
@@ -117,6 +121,15 @@ func assertImageToolNAbsent(t *testing.T, payload []byte) {
 	t.Helper()
 	if n := gjson.GetBytes(payload, "tools.0.n"); n.Exists() {
 		t.Fatalf("tool n exists = %s, want absent", n.Raw)
+	}
+}
+
+func defaultChatGPTWebImageConfigSnapshot() coreexecutor.ChatGPTWebImageConfigSnapshot {
+	resolved := (sdkconfig.ChatGPTWebImageConfig{}).Resolved()
+	return coreexecutor.ChatGPTWebImageConfigSnapshot{
+		AdaptSizeToAspectRatio:     resolved.AdaptSizeToAspectRatio,
+		AspectRatioMaxErrorPercent: resolved.AspectRatioMaxErrorPercent,
+		MaxResizeEdgePixels:        resolved.MaxResizeEdgePixels,
 	}
 }
 
@@ -389,7 +402,7 @@ func TestImageResponsesProvidersExcludeChatGPTWebForUnsupportedInputs(t *testing
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			got := imageResponsesProviders(test.req, false)
+			got := imageResponsesProviders(test.req, false, defaultChatGPTWebImageConfigSnapshot())
 			if strings.Join(got, ",") != strings.Join(test.want, ",") {
 				t.Fatalf("providers = %v, want %v", got, test.want)
 			}
@@ -408,16 +421,64 @@ func TestImageResponsesProvidersCanIgnoreUnsupportedWebParams(t *testing.T) {
 		OutputCompression: intPointer(90),
 		PartialImages:     intPointer(1),
 	}
-	got := imageResponsesProviders(request, true)
+	got := imageResponsesProviders(request, true, defaultChatGPTWebImageConfigSnapshot())
 	want := []string{constant.Codex, constant.ChatGPTWeb}
 	if strings.Join(got, ",") != strings.Join(want, ",") {
 		t.Fatalf("providers = %v, want %v", got, want)
 	}
 
 	request.Images = []imageReference{{ImageURL: "https://example.com/image.png"}}
-	got = imageResponsesProviders(request, true)
+	got = imageResponsesProviders(request, true, defaultChatGPTWebImageConfigSnapshot())
 	if strings.Join(got, ",") != constant.Codex {
 		t.Fatalf("remote image providers = %v, want Codex only", got)
+	}
+}
+
+func TestImageResponsesProvidersAdaptSupportedAndIgnoredWebSizes(t *testing.T) {
+	imageConfig := defaultChatGPTWebImageConfigSnapshot()
+	imageConfig.AdaptSizeToAspectRatio = true
+	tests := []struct {
+		name string
+		size string
+		want []string
+	}{
+		{name: "matched", size: "941x1672", want: []string{constant.Codex, constant.ChatGPTWeb}},
+		{name: "unsupported ratio ignored", size: "1024x1536", want: []string{constant.Codex, constant.ChatGPTWeb}},
+		{name: "oversize ignored", size: "4000x4000", want: []string{constant.Codex, constant.ChatGPTWeb}},
+		{name: "invalid", size: "square", want: []string{constant.Codex}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got := imageResponsesProviders(openAIImageRequest{Size: test.size}, false, imageConfig)
+			if strings.Join(got, ",") != strings.Join(test.want, ",") {
+				t.Fatalf("providers = %v, want %v", got, test.want)
+			}
+		})
+	}
+}
+
+func TestOpenAIImagesPinsChatGPTWebImageAspectConfig(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	executor := &imageCaptureExecutor{provider: constant.ChatGPTWeb}
+	h := newImagesTestHandler(t, executor)
+	h.Cfg.Images.ChatGPTWeb.AdaptSizeToAspectRatio = true
+	router := gin.New()
+	router.Use(allowedImageProvidersMiddleware(constant.ChatGPTWeb))
+	router.POST("/v1/images/generations", h.Generations)
+
+	request := httptest.NewRequest(http.MethodPost, "/v1/images/generations", strings.NewReader(
+		`{"model":"gpt-image-2","prompt":"draw","size":"941x1672"}`,
+	))
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", response.Code, response.Body.String())
+	}
+	if !executor.hasImageConfigSnapshot || !executor.imageConfigSnapshot.AdaptSizeToAspectRatio ||
+		executor.imageConfigSnapshot.AspectRatioMaxErrorPercent != 1 || executor.imageConfigSnapshot.MaxResizeEdgePixels != 3840 {
+		t.Fatalf("image config snapshot = %#v, present=%v", executor.imageConfigSnapshot, executor.hasImageConfigSnapshot)
 	}
 }
 

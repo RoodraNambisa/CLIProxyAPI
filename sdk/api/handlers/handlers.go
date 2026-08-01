@@ -64,6 +64,7 @@ type imageGenerationStreamPassthroughContextKey struct{}
 type imageGenerationStreamPassthroughStateContextKey struct{}
 type imageGenerationMaxResultsContextKey struct{}
 type chatGPTWebIgnoreUnsupportedImageParamsContextKey struct{}
+type chatGPTWebImageConfigSnapshotContextKey struct{}
 type interactionsAPIMetadataContextKey struct{}
 
 type interactionsAPIMetadata struct {
@@ -162,6 +163,22 @@ func chatGPTWebIgnoreUnsupportedImageParams(ctx context.Context) (bool, bool) {
 	}
 	enabled, ok := ctx.Value(chatGPTWebIgnoreUnsupportedImageParamsContextKey{}).(bool)
 	return enabled, ok
+}
+
+// WithChatGPTWebImageConfigSnapshot pins Web image adaptation settings for one execution.
+func WithChatGPTWebImageConfigSnapshot(ctx context.Context, snapshot coreexecutor.ChatGPTWebImageConfigSnapshot) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, chatGPTWebImageConfigSnapshotContextKey{}, snapshot)
+}
+
+func chatGPTWebImageConfigSnapshot(ctx context.Context) (coreexecutor.ChatGPTWebImageConfigSnapshot, bool) {
+	if ctx == nil {
+		return coreexecutor.ChatGPTWebImageConfigSnapshot{}, false
+	}
+	snapshot, ok := ctx.Value(chatGPTWebImageConfigSnapshotContextKey{}).(coreexecutor.ChatGPTWebImageConfigSnapshot)
+	return snapshot, ok
 }
 
 func providersSupportImageStreamPassthrough(providers []string) bool {
@@ -520,6 +537,9 @@ func requestExecutionMetadata(ctx context.Context) map[string]any {
 	}
 	if enabled, ok := chatGPTWebIgnoreUnsupportedImageParams(ctx); ok {
 		meta[coreexecutor.ChatGPTWebIgnoreUnsupportedImageParamsMetadataKey] = enabled
+	}
+	if snapshot, ok := chatGPTWebImageConfigSnapshot(ctx); ok {
+		meta[coreexecutor.ChatGPTWebImageConfigSnapshotMetadataKey] = snapshot
 	}
 	if ctx != nil {
 		if interactions, ok := ctx.Value(interactionsAPIMetadataContextKey{}).(interactionsAPIMetadata); ok {

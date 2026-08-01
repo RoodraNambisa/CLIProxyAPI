@@ -1,6 +1,7 @@
 package config
 
 import (
+	"math"
 	"os"
 	"path/filepath"
 	"testing"
@@ -70,6 +71,74 @@ func TestLoadConfigOptionalDefaultsChatGPTWebImageUpstreamModel(t *testing.T) {
 	}
 	if cfg.Images.ChatGPTWeb.IgnoreUnsupportedParams {
 		t.Fatal("IgnoreUnsupportedParams = true, want false")
+	}
+}
+
+func TestLoadConfigOptionalChatGPTWebImageAspectSettings(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	data := []byte(`images:
+  chatgpt-web:
+    adapt-size-to-aspect-ratio: true
+    aspect-ratio-max-error-percent: 0.5
+    max-resize-edge-pixels: 2048
+`)
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, err := LoadConfigOptional(path, false)
+	if err != nil {
+		t.Fatalf("LoadConfigOptional() error = %v", err)
+	}
+	resolved := cfg.Images.ChatGPTWeb.Resolved()
+	if !resolved.AdaptSizeToAspectRatio || resolved.AspectRatioMaxErrorPercent != 0.5 || resolved.MaxResizeEdgePixels != 2048 {
+		t.Fatalf("resolved ChatGPT Web image config = %#v", resolved)
+	}
+}
+
+func TestChatGPTWebImageAspectSettingsDefaultsAndValidation(t *testing.T) {
+	resolved := (ChatGPTWebImageConfig{}).Resolved()
+	if resolved.AdaptSizeToAspectRatio ||
+		resolved.AspectRatioMaxErrorPercent != DefaultChatGPTWebAspectRatioMaxErrorPercent ||
+		resolved.MaxResizeEdgePixels != DefaultChatGPTWebMaxResizeEdgePixels {
+		t.Fatalf("resolved defaults = %#v", resolved)
+	}
+
+	negativeTolerance := -0.1
+	tooLargeTolerance := MaxChatGPTWebAspectRatioMaxErrorPercent + 0.1
+	nanTolerance := math.NaN()
+	zeroEdge := 0
+	tooLargeEdge := MaxChatGPTWebMaxResizeEdgePixels + 1
+	tests := []struct {
+		name string
+		cfg  ChatGPTWebImageConfig
+	}{
+		{name: "negative tolerance", cfg: ChatGPTWebImageConfig{AspectRatioMaxErrorPercent: &negativeTolerance}},
+		{name: "large tolerance", cfg: ChatGPTWebImageConfig{AspectRatioMaxErrorPercent: &tooLargeTolerance}},
+		{name: "NaN tolerance", cfg: ChatGPTWebImageConfig{AspectRatioMaxErrorPercent: &nanTolerance}},
+		{name: "zero edge", cfg: ChatGPTWebImageConfig{MaxResizeEdgePixels: &zeroEdge}},
+		{name: "large edge", cfg: ChatGPTWebImageConfig{MaxResizeEdgePixels: &tooLargeEdge}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if err := test.cfg.Validate(); err == nil {
+				t.Fatal("Validate() error = nil, want validation error")
+			}
+		})
+	}
+}
+
+func TestLoadConfigOptionalRejectsInvalidChatGPTWebImageAspectSettings(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	data := []byte(`images:
+  chatgpt-web:
+    aspect-ratio-max-error-percent: 11
+`)
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	if _, err := LoadConfigOptional(path, false); err == nil {
+		t.Fatal("LoadConfigOptional() error = nil, want validation error")
 	}
 }
 

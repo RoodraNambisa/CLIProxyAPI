@@ -43,19 +43,21 @@ const (
 )
 
 type chatGPTWebPreparedRequest struct {
-	baseModel          string
-	routeModel         string
-	responseFormat     sdktranslator.Format
-	originalPayload    []byte
-	canonicalBody      []byte
-	request            helps.ChatGPTWebRequest
-	terminalMarker     bool
-	trustUpstreamSSE   bool
-	maxImageResults    int
-	usageProjection    *helps.ChatGPTWebUsageProjection
-	imageFallbackUsage config.ResolvedChatGPTWebImageFallbackUsageConfig
-	bodyRelease        *cliproxyexecutor.RequestBodyReleaseController
-	imageResultState   *cliproxyexecutor.ImageGenerationResultState
+	baseModel           string
+	routeModel          string
+	responseFormat      sdktranslator.Format
+	originalPayload     []byte
+	canonicalBody       []byte
+	request             helps.ChatGPTWebRequest
+	terminalMarker      bool
+	trustUpstreamSSE    bool
+	maxImageResults     int
+	usageProjection     *helps.ChatGPTWebUsageProjection
+	imageFallbackUsage  config.ResolvedChatGPTWebImageFallbackUsageConfig
+	imageConfigSnapshot cliproxyexecutor.ChatGPTWebImageConfigSnapshot
+	imageSizeMatch      *helps.ChatGPTWebImageSizeMatch
+	bodyRelease         *cliproxyexecutor.RequestBodyReleaseController
+	imageResultState    *cliproxyexecutor.ImageGenerationResultState
 }
 
 type chatGPTWebRequirements struct {
@@ -355,6 +357,18 @@ func (e *ChatGPTWebExecutor) prepareRuntimeRequest(ctx context.Context, auth *cl
 		return nil, err
 	}
 	cfg := e.configSnapshot()
+	resolvedImageConfig := config.ChatGPTWebImageConfig{}.Resolved()
+	if cfg != nil {
+		resolvedImageConfig = cfg.Images.ChatGPTWeb.Resolved()
+	}
+	imageConfigSnapshot := cliproxyexecutor.ChatGPTWebImageConfigSnapshot{
+		AdaptSizeToAspectRatio:     resolvedImageConfig.AdaptSizeToAspectRatio,
+		AspectRatioMaxErrorPercent: resolvedImageConfig.AspectRatioMaxErrorPercent,
+		MaxResizeEdgePixels:        resolvedImageConfig.MaxResizeEdgePixels,
+	}
+	if pinned, ok := opts.Metadata[cliproxyexecutor.ChatGPTWebImageConfigSnapshotMetadataKey].(cliproxyexecutor.ChatGPTWebImageConfigSnapshot); ok {
+		imageConfigSnapshot = pinned
+	}
 	canonicalBody = helps.ApplyPayloadConfigWithRequest(cfg, baseModel, sdktranslator.FormatCodex.String(), opts.SourceFormat.String(), "",
 		canonicalBody, originalSource, routeModel, helps.PayloadRequestPath(opts), opts.Headers)
 	forcedTool := ""
@@ -393,6 +407,21 @@ func (e *ChatGPTWebExecutor) prepareRuntimeRequest(ctx context.Context, auth *cl
 			msg:            "chatgpt web cannot combine web search and image generation in one request",
 			skipAuthResult: true,
 			retryOtherAuth: true,
+		}
+	}
+	var imageSizeMatch *helps.ChatGPTWebImageSizeMatch
+	if parsed.Image != nil && imageConfigSnapshot.AdaptSizeToAspectRatio {
+		match, disposition := helps.ResolveChatGPTWebImageSize(
+			parsed.Image.Size,
+			imageConfigSnapshot.MaxResizeEdgePixels,
+			imageConfigSnapshot.AspectRatioMaxErrorPercent,
+		)
+		switch disposition {
+		case helps.ChatGPTWebImageSizeMatched:
+			imageSizeMatch = &match
+			parsed.Image.Size = ""
+		case helps.ChatGPTWebImageSizeUnspecified, helps.ChatGPTWebImageSizeIgnored:
+			parsed.Image.Size = ""
 		}
 	}
 	if ignoreUnsupportedImageParams {
@@ -452,11 +481,13 @@ func (e *ChatGPTWebExecutor) prepareRuntimeRequest(ctx context.Context, auth *cl
 		terminalMarker:  metadataBool(opts.Metadata, cliproxyexecutor.StreamTerminalMarkerMetadataKey),
 		trustUpstreamSSE: metadataBool(opts.Metadata, cliproxyexecutor.TrustUpstreamSSEMetadataKey) &&
 			responseFormat == sdktranslator.FormatOpenAIResponse,
-		maxImageResults:    chatGPTWebMaxImageResults(opts.Metadata),
-		usageProjection:    usageProjection,
-		imageFallbackUsage: fallbackUsage,
-		bodyRelease:        cliproxyexecutor.RequestBodyReleaseControllerFromOptions(opts),
-		imageResultState:   imageResultState,
+		maxImageResults:     chatGPTWebMaxImageResults(opts.Metadata),
+		usageProjection:     usageProjection,
+		imageFallbackUsage:  fallbackUsage,
+		imageConfigSnapshot: imageConfigSnapshot,
+		imageSizeMatch:      imageSizeMatch,
+		bodyRelease:         cliproxyexecutor.RequestBodyReleaseControllerFromOptions(opts),
+		imageResultState:    imageResultState,
 	}, nil
 }
 

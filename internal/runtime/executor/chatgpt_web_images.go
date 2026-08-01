@@ -518,7 +518,7 @@ func (e *ChatGPTWebExecutor) beginChatGPTWebImage(ctx context.Context, client *c
 	if imageRequest == nil {
 		return nil, errors.New("chatgpt web image request is nil")
 	}
-	upstreamPrompt := strings.TrimSpace(imageRequest.Prompt)
+	upstreamPrompt := chatGPTWebImageUpstreamPrompt(imageRequest.Prompt, prepared.imageSizeMatch)
 	imageInputs := append([]string(nil), imageRequest.Images...)
 	if strings.TrimSpace(imageRequest.MaskURL) != "" {
 		if len(imageInputs) == 0 {
@@ -575,6 +575,14 @@ func (e *ChatGPTWebExecutor) beginChatGPTWebImage(ctx context.Context, client *c
 		inputIDs: inputIDs,
 		turn:     turn,
 	}, nil
+}
+
+func chatGPTWebImageUpstreamPrompt(prompt string, match *helps.ChatGPTWebImageSizeMatch) string {
+	prompt = strings.TrimSpace(prompt)
+	if match == nil || strings.TrimSpace(match.Ratio) == "" {
+		return prompt
+	}
+	return prompt + "\n\nSet the final image aspect ratio to " + match.Ratio + "."
 }
 
 func (e *ChatGPTWebExecutor) finishChatGPTWebImage(ctx context.Context, client *chatgptwebauth.Client, credential *chatgptwebauth.Credential, prepared *chatGPTWebPreparedRequest, execution *chatGPTWebImageExecution) ([]byte, error) {
