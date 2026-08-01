@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -52,6 +53,84 @@ func TestChatGPTWebImportTaskSupportsMultipleFilesAndLegacyField(t *testing.T) {
 	legacyCompleted := waitForChatGPTWebMutationTask(t, router, chatGPTWebMutationTaskImport, legacy.ID)
 	if legacyCompleted.Succeeded != 1 || legacyCompleted.Results[0].Status != "created" {
 		t.Fatalf("legacy task = %+v", legacyCompleted)
+	}
+}
+
+func TestChatGPTWebImportTaskAllowsSameEmailForDistinctNamedWorkspaces(t *testing.T) {
+	executor := &chatGPTWebManagementTestExecutor{}
+	h, manager, _ := newChatGPTWebManagementTestHandler(t, executor)
+	router := chatGPTWebManagementTestRouter(h)
+	files := []chatGPTWebImportTestFile{
+		{field: "files", name: "first.json", data: `{"email":"same@example.com","account_id":"workspace-a","access_token":"first-secret"}`},
+		{field: "files", name: "second.json", data: `{"email":"same@example.com","account_id":"workspace-b","access_token":"second-secret"}`},
+	}
+	task := startChatGPTWebImportTaskWithNames(t, router, files, []string{"workspace-a", "workspace-b.json"})
+	completed := waitForChatGPTWebMutationTask(t, router, chatGPTWebMutationTaskImport, task.ID)
+	if completed.Succeeded != 2 || completed.Failed != 0 {
+		t.Fatalf("task = %+v", completed)
+	}
+	for _, name := range []string{"workspace-a.json", "workspace-b.json"} {
+		if _, ok := manager.GetByID(name); !ok {
+			t.Fatalf("custom-named workspace %q is missing", name)
+		}
+	}
+}
+
+func TestChatGPTWebImportTaskSameCustomNameReplacesWorkspace(t *testing.T) {
+	h, manager, _ := newChatGPTWebManagementTestHandler(t, &chatGPTWebManagementTestExecutor{})
+	router := chatGPTWebManagementTestRouter(h)
+	first := startChatGPTWebImportTaskWithNames(t, router, []chatGPTWebImportTestFile{{
+		field: "files", name: "first.json", data: `{"email":"same@example.com","account_id":"workspace-a","access_token":"first-secret"}`,
+	}}, []string{"shared"})
+	if completed := waitForChatGPTWebMutationTask(t, router, chatGPTWebMutationTaskImport, first.ID); completed.Succeeded != 1 {
+		t.Fatalf("first task = %+v", completed)
+	}
+	firstStored, ok := manager.GetByID("shared.json")
+	if !ok || firstStored == nil || coreauth.ChatGPTWebCredentialUID(firstStored) == "" {
+		t.Fatalf("first stored credential = %#v", firstStored)
+	}
+	firstUID := coreauth.ChatGPTWebCredentialUID(firstStored)
+	secondData, errMarshal := json.Marshal(map[string]string{
+		"email":          "same@example.com",
+		"account_id":     "workspace-b",
+		"access_token":   "second-secret",
+		"credential_uid": firstUID,
+	})
+	if errMarshal != nil {
+		t.Fatal(errMarshal)
+	}
+	second := startChatGPTWebImportTaskWithNames(t, router, []chatGPTWebImportTestFile{{
+		field: "files", name: "second.json", data: string(secondData),
+	}}, []string{"shared.json"})
+	completed := waitForChatGPTWebMutationTask(t, router, chatGPTWebMutationTaskImport, second.ID)
+	if completed.Succeeded != 1 || completed.Results[0].Status != "updated" {
+		t.Fatalf("second task = %+v", completed)
+	}
+	stored, ok := manager.GetByID("shared.json")
+	if !ok || stored == nil || stored.Metadata["account_id"] != "workspace-b" {
+		t.Fatalf("stored credential = %#v", stored)
+	}
+	if secondUID := coreauth.ChatGPTWebCredentialUID(stored); secondUID == "" || secondUID == firstUID {
+		t.Fatalf("replacement credential UID = %q, want a new non-empty value", secondUID)
+	}
+}
+
+func TestChatGPTWebImportTaskRejectsDuplicateCustomNames(t *testing.T) {
+	h, _, _ := newChatGPTWebManagementTestHandler(t, &chatGPTWebManagementTestExecutor{})
+	router := chatGPTWebManagementTestRouter(h)
+	files := []chatGPTWebImportTestFile{
+		{field: "files", name: "first.json", data: `{"email":"first@example.com","access_token":"first-secret"}`},
+		{field: "files", name: "second.json", data: `{"email":"second@example.com","access_token":"second-secret"}`},
+	}
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	writeChatGPTWebImportParts(t, writer, files, []string{"same", "same.json"})
+	request := httptest.NewRequest(http.MethodPost, "/chatgpt-web/import-tasks", &body)
+	request.Header.Set("Content-Type", writer.FormDataContentType())
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusBadRequest || !strings.Contains(recorder.Body.String(), "must be unique") {
+		t.Fatalf("status = %d, body=%s", recorder.Code, recorder.Body.String())
 	}
 }
 
@@ -697,21 +776,14 @@ func (*chatGPTWebImportProxyResolver) ReportFailure(_ context.Context, _ *coreau
 }
 
 func startChatGPTWebImportTask(t *testing.T, router http.Handler, files []chatGPTWebImportTestFile) chatGPTWebMutationTask {
+	return startChatGPTWebImportTaskWithNames(t, router, files, nil)
+}
+
+func startChatGPTWebImportTaskWithNames(t *testing.T, router http.Handler, files []chatGPTWebImportTestFile, targetNames []string) chatGPTWebMutationTask {
 	t.Helper()
 	var body bytes.Buffer
 	writer := multipart.NewWriter(&body)
-	for _, file := range files {
-		part, errPart := writer.CreateFormFile(file.field, file.name)
-		if errPart != nil {
-			t.Fatal(errPart)
-		}
-		if _, errWrite := part.Write([]byte(file.data)); errWrite != nil {
-			t.Fatal(errWrite)
-		}
-	}
-	if errClose := writer.Close(); errClose != nil {
-		t.Fatal(errClose)
-	}
+	writeChatGPTWebImportParts(t, writer, files, targetNames)
 	request := httptest.NewRequest(http.MethodPost, "/chatgpt-web/import-tasks", &body)
 	request.Header.Set("Content-Type", writer.FormDataContentType())
 	recorder := httptest.NewRecorder()
@@ -722,6 +794,27 @@ func startChatGPTWebImportTask(t *testing.T, router http.Handler, files []chatGP
 	var task chatGPTWebMutationTask
 	decodeChatGPTWebManagementResponse(t, recorder, &task)
 	return task
+}
+
+func writeChatGPTWebImportParts(t *testing.T, writer *multipart.Writer, files []chatGPTWebImportTestFile, targetNames []string) {
+	t.Helper()
+	for _, file := range files {
+		part, errPart := writer.CreateFormFile(file.field, file.name)
+		if errPart != nil {
+			t.Fatal(errPart)
+		}
+		if _, errWrite := part.Write([]byte(file.data)); errWrite != nil {
+			t.Fatal(errWrite)
+		}
+	}
+	for _, name := range targetNames {
+		if errField := writer.WriteField("names", name); errField != nil {
+			t.Fatal(errField)
+		}
+	}
+	if errClose := writer.Close(); errClose != nil {
+		t.Fatal(errClose)
+	}
 }
 
 func waitForChatGPTWebMutationTask(t *testing.T, router http.Handler, kind, id string) chatGPTWebMutationTask {

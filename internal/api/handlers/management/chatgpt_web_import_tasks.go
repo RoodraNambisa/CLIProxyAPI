@@ -22,12 +22,14 @@ import (
 const (
 	chatGPTWebImportMaxRequestBytes = 32 << 20
 	chatGPTWebImportMaxFileBytes    = 1 << 20
+	chatGPTWebImportMaxNameBytes    = 1 << 10
 	chatGPTWebImportMaxFiles        = 500
 )
 
 type chatGPTWebImportInput struct {
-	file string
-	data []byte
+	file       string
+	targetName string
+	data       []byte
 }
 
 var errChatGPTWebImportIdentityConflict = errors.New("chatgpt web import identity conflict")
@@ -69,7 +71,11 @@ func (h *Handler) StartChatGPTWebImportTask(c *gin.Context) {
 	}()
 	results := make([]chatGPTWebMutationTaskResult, len(inputs))
 	for index := range inputs {
-		results[index] = chatGPTWebMutationTaskResult{File: inputs[index].file, Status: chatGPTWebLoginResultQueued}
+		results[index] = chatGPTWebMutationTaskResult{
+			File:       inputs[index].file,
+			TargetName: inputs[index].targetName,
+			Status:     chatGPTWebLoginResultQueued,
+		}
 	}
 	taskManager := h.chatGPTWebMutationTaskManager()
 	task, taskCtx, errCreate := taskManager.create(chatGPTWebMutationTaskImport, results)
@@ -127,6 +133,7 @@ func readChatGPTWebImportInputs(c *gin.Context) ([]chatGPTWebImportInput, error)
 		return nil, errors.New("multipart form with file or files fields is required")
 	}
 	inputs := make([]chatGPTWebImportInput, 0)
+	targetNames := make([]string, 0)
 	completed := false
 	defer func() {
 		if !completed {
@@ -142,6 +149,21 @@ func readChatGPTWebImportInputs(c *gin.Context) ([]chatGPTWebImportInput, error)
 			return nil, errPart
 		}
 		field := part.FormName()
+		if (field == "name" || field == "names") && part.FileName() == "" {
+			value, errRead := io.ReadAll(io.LimitReader(part, chatGPTWebImportMaxNameBytes+1))
+			errClose := part.Close()
+			if errRead != nil {
+				return nil, errRead
+			}
+			if errClose != nil {
+				return nil, errClose
+			}
+			if len(value) > chatGPTWebImportMaxNameBytes {
+				return nil, errors.New("custom credential name is too long")
+			}
+			targetNames = append(targetNames, string(value))
+			continue
+		}
 		if field != "file" && field != "files" {
 			_ = part.Close()
 			continue
@@ -175,6 +197,25 @@ func readChatGPTWebImportInputs(c *gin.Context) ([]chatGPTWebImportInput, error)
 	}
 	if len(inputs) == 0 {
 		return nil, errors.New("at least one credential file is required")
+	}
+	if len(targetNames) > 0 && len(targetNames) != len(inputs) {
+		return nil, errors.New("custom credential names must match the uploaded files")
+	}
+	seenTargetNames := make(map[string]struct{}, len(targetNames))
+	for index, value := range targetNames {
+		targetName, errName := normalizeChatGPTWebCredentialTargetName(value)
+		if errName != nil {
+			return nil, fmt.Errorf("custom credential name %d is invalid", index+1)
+		}
+		if targetName == "" {
+			continue
+		}
+		key := strings.ToLower(targetName)
+		if _, exists := seenTargetNames[key]; exists {
+			return nil, errors.New("custom credential names must be unique")
+		}
+		seenTargetNames[key] = struct{}{}
+		inputs[index].targetName = targetName
 	}
 	completed = true
 	return inputs, nil
@@ -242,7 +283,8 @@ sendLoop:
 }
 
 func (h *Handler) executeChatGPTWebImport(ctx context.Context, input chatGPTWebImportInput, executor chatGPTWebImportExecutor, manager *coreauth.Manager, beginCommit func() (context.Context, bool)) chatGPTWebMutationTaskResult {
-	result := chatGPTWebMutationTaskResult{File: input.file, Status: "failed"}
+	result := chatGPTWebMutationTaskResult{File: input.file, TargetName: input.targetName, Status: "failed"}
+	nameScoped := input.targetName != ""
 	credential, errDecode := chatgptwebauth.DecodeImportCredential(input.data)
 	if errDecode != nil {
 		result.ErrorCategory = "invalid_credential"
@@ -278,9 +320,16 @@ func (h *Handler) executeChatGPTWebImport(ctx context.Context, input chatGPTWebI
 	pending := chatGPTWebImportProbeAuth("chatgpt-web-import-"+uuid.NewString(), credential)
 	var earlyExisting *coreauth.Auth
 	if lockedEmail != "" {
-		fileName := chatGPTWebCredentialFileName(lockedEmail)
+		fileName := input.targetName
+		if fileName == "" {
+			fileName = chatGPTWebCredentialFileName(lockedEmail)
+		}
 		var errExisting error
-		earlyExisting, errExisting = findExistingChatGPTWebAuth(ctx, manager, fileName, lockedEmail)
+		if nameScoped {
+			earlyExisting, errExisting = findNamedChatGPTWebAuth(ctx, manager, fileName, lockedEmail)
+		} else {
+			earlyExisting, errExisting = findExistingChatGPTWebAuth(ctx, manager, fileName, lockedEmail)
+		}
 		if errExisting != nil {
 			if errors.Is(errExisting, errChatGPTWebCredentialIDOwned) || errors.Is(errExisting, errChatGPTWebCredentialMultiple) {
 				result.ErrorCategory = "identity_conflict"
@@ -353,8 +402,20 @@ func (h *Handler) executeChatGPTWebImport(ctx context.Context, input chatGPTWebI
 		defer releaseFinalOperation()
 		ctx = finalOperationCtx
 	}
-	fileName := chatGPTWebCredentialFileName(credential.Email)
-	existing, errExisting := findExistingChatGPTWebAuth(ctx, manager, fileName, credential.Email)
+	fileName := input.targetName
+	if fileName == "" {
+		fileName = chatGPTWebCredentialFileName(credential.Email)
+	}
+	result.TargetName = fileName
+	var (
+		existing    *coreauth.Auth
+		errExisting error
+	)
+	if nameScoped {
+		existing, errExisting = findNamedChatGPTWebAuth(ctx, manager, fileName, credential.Email)
+	} else {
+		existing, errExisting = findExistingChatGPTWebAuth(ctx, manager, fileName, credential.Email)
+	}
 	if errExisting != nil {
 		if errors.Is(errExisting, errChatGPTWebCredentialIDOwned) || errors.Is(errExisting, errChatGPTWebCredentialMultiple) {
 			result.ErrorCategory = "identity_conflict"
@@ -383,7 +444,7 @@ func (h *Handler) executeChatGPTWebImport(ctx context.Context, input chatGPTWebI
 	}
 	probe := chatGPTWebImportProbeAuth(fileName, credential)
 	probe.ProxyURL = resolved.EffectiveProxyURL()
-	if existing != nil {
+	if existing != nil && !nameScoped {
 		candidate := existing.Clone()
 		candidate.Metadata = cloneStringAnyMap(existing.Metadata)
 		credential.ApplyToMetadata(candidate.Metadata)
@@ -419,7 +480,7 @@ func (h *Handler) executeChatGPTWebImport(ctx context.Context, input chatGPTWebI
 			result.HTTPStatus = http.StatusConflict
 			return result
 		}
-		if existing != nil {
+		if existing != nil && !nameScoped {
 			candidate := existing.Clone()
 			candidate.Metadata = cloneStringAnyMap(existing.Metadata)
 			refreshed.ApplyToMetadata(candidate.Metadata)
@@ -453,7 +514,7 @@ func (h *Handler) executeChatGPTWebImport(ctx context.Context, input chatGPTWebI
 	}
 	if protectedRefresh {
 		var errPersist error
-		installed, status, unchanged, errPersist = h.persistImportedChatGPTWebCredential(ctx, manager, fileName, credential, existing, true)
+		installed, status, unchanged, errPersist = h.persistImportedChatGPTWebCredential(ctx, manager, fileName, credential, existing, true, nameScoped)
 		if errors.Is(errPersist, errChatGPTWebImportIdentityConflict) || errors.Is(errPersist, errChatGPTWebCredentialIdentityOwned) {
 			result.ErrorCategory = "identity_conflict"
 			result.Error = "credential conflicts with an existing account"
@@ -498,7 +559,7 @@ func (h *Handler) executeChatGPTWebImport(ctx context.Context, input chatGPTWebI
 	commitStarted = true
 	ctx = commitCtx
 	var errPersist error
-	installed, status, unchanged, errPersist = h.persistImportedChatGPTWebCredential(ctx, manager, fileName, credential, existing, false)
+	installed, status, unchanged, errPersist = h.persistImportedChatGPTWebCredential(ctx, manager, fileName, credential, existing, false, nameScoped)
 	if errors.Is(errPersist, errChatGPTWebImportIdentityConflict) || errors.Is(errPersist, errChatGPTWebCredentialIdentityOwned) {
 		result.ErrorCategory = "identity_conflict"
 		result.Error = "credential conflicts with an existing account"
@@ -528,7 +589,7 @@ func (h *Handler) executeChatGPTWebImport(ctx context.Context, input chatGPTWebI
 	return result
 }
 
-func (h *Handler) persistImportedChatGPTWebCredential(ctx context.Context, manager *coreauth.Manager, fileName string, credential *chatgptwebauth.Credential, expected *coreauth.Auth, refreshAware bool) (installed *coreauth.Auth, status string, unchanged bool, err error) {
+func (h *Handler) persistImportedChatGPTWebCredential(ctx context.Context, manager *coreauth.Manager, fileName string, credential *chatgptwebauth.Credential, expected *coreauth.Auth, refreshAware, nameScoped bool) (installed *coreauth.Auth, status string, unchanged bool, err error) {
 	if h == nil || manager == nil || credential == nil {
 		return nil, "", false, errors.New("credential persistence is unavailable")
 	}
@@ -537,7 +598,15 @@ func (h *Handler) persistImportedChatGPTWebCredential(ctx context.Context, manag
 		return nil, "", false, errDependencyLock
 	}
 	defer unlockDependency()
-	existing, errExisting := findExistingChatGPTWebAuth(ctx, manager, fileName, credential.Email)
+	var (
+		existing    *coreauth.Auth
+		errExisting error
+	)
+	if nameScoped {
+		existing, errExisting = findNamedChatGPTWebAuth(ctx, manager, fileName, credential.Email)
+	} else {
+		existing, errExisting = findExistingChatGPTWebAuth(ctx, manager, fileName, credential.Email)
+	}
 	if errExisting != nil {
 		if errors.Is(errExisting, errChatGPTWebCredentialIDOwned) || errors.Is(errExisting, errChatGPTWebCredentialMultiple) {
 			return nil, "", false, errChatGPTWebImportIdentityConflict
@@ -566,11 +635,14 @@ func (h *Handler) persistImportedChatGPTWebCredential(ctx context.Context, manag
 		if refreshAware {
 			identityChanged = coreauth.ChatGPTWebCredentialRefreshIdentityChanged(identityBase, candidate)
 		}
-		if identityChanged {
+		if identityChanged && !nameScoped {
 			return nil, "", false, errChatGPTWebImportIdentityConflict
 		}
-		if current, errParse := chatgptwebauth.ParseCredential(identityBase.Metadata); errParse == nil {
-			credential.CredentialUID = current.CredentialUID
+		if !identityChanged {
+			current, errParse := chatgptwebauth.ParseCredential(identityBase.Metadata)
+			if errParse == nil {
+				credential.CredentialUID = current.CredentialUID
+			}
 		}
 	}
 	if strings.TrimSpace(credential.CredentialUID) == "" {

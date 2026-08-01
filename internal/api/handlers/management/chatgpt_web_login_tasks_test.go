@@ -423,6 +423,49 @@ func TestFindExistingChatGPTWebAuthRejectsDeterministicNameOwnedByAnotherAccount
 	}
 }
 
+func TestFindExistingChatGPTWebAuthPrefersExactNameAcrossSameEmailWorkspaces(t *testing.T) {
+	_, manager, _ := newChatGPTWebManagementTestHandler(t, &chatGPTWebManagementTestExecutor{})
+	const email = "shared@example.com"
+	fileName := chatGPTWebCredentialFileName(email)
+	for _, auth := range []*coreauth.Auth{
+		{ID: fileName, FileName: fileName, Provider: chatgptwebauth.Provider, Metadata: map[string]any{"type": chatgptwebauth.Provider, "email": email, "account_id": "workspace-a"}},
+		{ID: "workspace-b.json", FileName: "workspace-b.json", Provider: chatgptwebauth.Provider, Metadata: map[string]any{"type": chatgptwebauth.Provider, "email": email, "account_id": "workspace-b"}},
+	} {
+		if _, errRegister := manager.Register(coreauth.WithSkipPersist(t.Context()), auth); errRegister != nil {
+			t.Fatal(errRegister)
+		}
+	}
+	found, errFind := findExistingChatGPTWebAuth(t.Context(), manager, fileName, email)
+	if errFind != nil || found == nil || found.ID != fileName {
+		t.Fatalf("findExistingChatGPTWebAuth() = %#v, %v", found, errFind)
+	}
+}
+
+func TestNormalizeChatGPTWebCredentialTargetName(t *testing.T) {
+	tests := []struct {
+		name    string
+		input   string
+		want    string
+		wantErr bool
+	}{
+		{name: "blank", input: "  ", want: ""},
+		{name: "suffix added", input: " workspace-a ", want: "workspace-a.json"},
+		{name: "suffix retained", input: "workspace-a.JSON", want: "workspace-a.JSON"},
+		{name: "slash", input: "../workspace-a", wantErr: true},
+		{name: "backslash", input: `folder\\workspace-a`, wantErr: true},
+		{name: "nul", input: "workspace\x00a", wantErr: true},
+		{name: "too long after suffix", input: strings.Repeat("a", 252), wantErr: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got, errNormalize := normalizeChatGPTWebCredentialTargetName(test.input)
+			if (errNormalize != nil) != test.wantErr || got != test.want {
+				t.Fatalf("normalizeChatGPTWebCredentialTargetName(%q) = %q, %v", test.input, got, errNormalize)
+			}
+		})
+	}
+}
+
 func TestChatGPTWebLoginTaskPersistsSafeSuccessAndTerminalFailure(t *testing.T) {
 	const (
 		passwordSecret = "password-secret"
@@ -721,7 +764,7 @@ func TestChatGPTWebLoginTaskAcceptsMultipartFile(t *testing.T) {
 	executor.loginFn = func(_ context.Context, input chatgptwebauth.LoginInput) (*chatgptwebauth.Credential, error) {
 		return activeChatGPTWebManagementTestCredential(input), nil
 	}
-	h, _, _ := newChatGPTWebManagementTestHandler(t, executor)
+	h, manager, _ := newChatGPTWebManagementTestHandler(t, executor)
 	router := chatGPTWebManagementTestRouter(h)
 	var body bytes.Buffer
 	writer := multipart.NewWriter(&body)
@@ -731,6 +774,9 @@ func TestChatGPTWebLoginTaskAcceptsMultipartFile(t *testing.T) {
 	}
 	if _, errWrite := part.Write([]byte("multipart@example.com---password---JBSWY3DPEHPK3PXP")); errWrite != nil {
 		t.Fatal(errWrite)
+	}
+	if errField := writer.WriteField("name", "workspace-login"); errField != nil {
+		t.Fatal(errField)
 	}
 	if errClose := writer.Close(); errClose != nil {
 		t.Fatal(errClose)
@@ -745,8 +791,21 @@ func TestChatGPTWebLoginTaskAcceptsMultipartFile(t *testing.T) {
 	var task chatGPTWebLoginTask
 	decodeChatGPTWebManagementResponse(t, recorder, &task)
 	task = waitForChatGPTWebLoginTask(t, router, task.ID)
-	if task.Succeeded != 1 {
+	if task.Succeeded != 1 || task.Results[0].Name != "workspace-login.json" {
 		t.Fatalf("task = %+v", task)
+	}
+	if _, ok := manager.GetByID("workspace-login.json"); !ok {
+		t.Fatal("custom-named login credential is missing")
+	}
+}
+
+func TestChatGPTWebLoginTaskCustomNameRequiresOneAccount(t *testing.T) {
+	h, _, _ := newChatGPTWebManagementTestHandler(t, &chatGPTWebManagementTestExecutor{})
+	router := chatGPTWebManagementTestRouter(h)
+	body := "first@example.com---password---\nsecond@example.com---password---"
+	recorder := performChatGPTWebManagementRequest(t, router, http.MethodPost, "/chatgpt-web/login-tasks?name=shared", body)
+	if recorder.Code != http.StatusBadRequest || !strings.Contains(recorder.Body.String(), "exactly one account") {
+		t.Fatalf("status = %d, body=%s", recorder.Code, recorder.Body.String())
 	}
 }
 

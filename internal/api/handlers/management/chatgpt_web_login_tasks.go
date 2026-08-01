@@ -79,6 +79,7 @@ type chatGPTWebLoginInput struct {
 	Email      string
 	Password   string
 	TOTPSecret string
+	TargetName string
 }
 
 type chatGPTWebLoginTaskResult struct {
@@ -557,6 +558,20 @@ func normalizeChatGPTWebLoginEmail(email string) string {
 	return chatgptwebauth.NormalizeEmail(email)
 }
 
+func normalizeChatGPTWebCredentialTargetName(value string) (string, error) {
+	name := strings.TrimSpace(value)
+	if name == "" {
+		return "", nil
+	}
+	if !strings.HasSuffix(strings.ToLower(name), ".json") {
+		name += ".json"
+	}
+	if isUnsafeAuthFileName(name) || strings.ContainsRune(name, 0) || len(name) > 255 {
+		return "", errors.New("custom credential name is invalid")
+	}
+	return name, nil
+}
+
 // StartChatGPTWebLoginTask starts a bounded background login task.
 func (h *Handler) StartChatGPTWebLoginTask(c *gin.Context) {
 	executor, manager, errExecutor := h.chatGPTWebManagementExecutor()
@@ -867,8 +882,19 @@ func (h *Handler) executeChatGPTWebLogin(ctx context.Context, input chatGPTWebLo
 	defer releaseOperation()
 	ctx = operationCtx
 
-	fileName := chatGPTWebCredentialFileName(input.Email)
-	existing, errExisting := findExistingChatGPTWebAuth(ctx, manager, fileName, input.Email)
+	fileName := input.TargetName
+	if fileName == "" {
+		fileName = chatGPTWebCredentialFileName(input.Email)
+	}
+	var (
+		existing    *coreauth.Auth
+		errExisting error
+	)
+	if input.TargetName != "" {
+		existing, errExisting = findNamedChatGPTWebAuth(ctx, manager, fileName, input.Email)
+	} else {
+		existing, errExisting = findExistingChatGPTWebAuth(ctx, manager, fileName, input.Email)
+	}
 	if errExisting != nil {
 		if errors.Is(errExisting, errChatGPTWebCredentialIDOwned) {
 			result.ErrorCategory = "credential_id_conflict"
@@ -1069,7 +1095,20 @@ func (h *Handler) persistChatGPTWebCredentialLocked(ctx context.Context, manager
 	if owner != nil {
 		return nil, "", errChatGPTWebCredentialIdentityOwned
 	}
-	if strings.TrimSpace(credential.CredentialUID) == "" && existing != nil {
+	identityChanged := false
+	if existing != nil {
+		candidate := existing.Clone()
+		candidate.Metadata = cloneStringAnyMap(existing.Metadata)
+		credential.ApplyToMetadata(candidate.Metadata)
+		identityChanged = coreauth.ChatGPTWebCredentialIdentityChanged(existing, candidate)
+		if refreshAware {
+			identityChanged = coreauth.ChatGPTWebCredentialRefreshIdentityChanged(existing, candidate)
+		}
+	}
+	if identityChanged {
+		credential.CredentialUID = ""
+	}
+	if strings.TrimSpace(credential.CredentialUID) == "" && existing != nil && !identityChanged {
 		if current, errParse := chatgptwebauth.ParseCredential(existing.Metadata); errParse == nil {
 			credential.CredentialUID = strings.TrimSpace(current.CredentialUID)
 		}
@@ -1154,15 +1193,18 @@ func findExistingChatGPTWebAuth(ctx context.Context, manager *coreauth.Manager, 
 		return nil, fmt.Errorf("%w: %w", errChatGPTWebCredentialLookup, errList)
 	}
 	for _, candidate := range auths {
-		if candidate != nil && candidate.ID == fileName {
-			if !strings.EqualFold(strings.TrimSpace(candidate.Provider), chatgptwebauth.Provider) {
-				return nil, fmt.Errorf("%w: another provider", errChatGPTWebCredentialIDOwned)
-			}
-			if normalizeChatGPTWebLoginEmail(authEmail(candidate)) != email {
-				return nil, fmt.Errorf("%w: another chatgpt web account", errChatGPTWebCredentialIDOwned)
-			}
-			match = candidate
+		if candidate == nil || candidate.ID != fileName {
+			continue
 		}
+		if !strings.EqualFold(strings.TrimSpace(candidate.Provider), chatgptwebauth.Provider) {
+			return nil, fmt.Errorf("%w: another provider", errChatGPTWebCredentialIDOwned)
+		}
+		if normalizeChatGPTWebLoginEmail(authEmail(candidate)) != email {
+			return nil, fmt.Errorf("%w: another chatgpt web account", errChatGPTWebCredentialIDOwned)
+		}
+		return candidate, nil
+	}
+	for _, candidate := range auths {
 		if candidate == nil || !strings.EqualFold(strings.TrimSpace(candidate.Provider), chatgptwebauth.Provider) || normalizeChatGPTWebLoginEmail(authEmail(candidate)) != email {
 			continue
 		}
@@ -1172,6 +1214,29 @@ func findExistingChatGPTWebAuth(ctx context.Context, manager *coreauth.Manager, 
 		match = candidate
 	}
 	return match, nil
+}
+
+func findNamedChatGPTWebAuth(ctx context.Context, manager *coreauth.Manager, fileName, email string) (*coreauth.Auth, error) {
+	if manager == nil {
+		return nil, nil
+	}
+	auths, errList := manager.CompleteAuthSnapshot(ctx)
+	if errList != nil {
+		return nil, fmt.Errorf("%w: %w", errChatGPTWebCredentialLookup, errList)
+	}
+	for _, candidate := range auths {
+		if candidate == nil || candidate.ID != fileName {
+			continue
+		}
+		if !strings.EqualFold(strings.TrimSpace(candidate.Provider), chatgptwebauth.Provider) {
+			return nil, fmt.Errorf("%w: another provider", errChatGPTWebCredentialIDOwned)
+		}
+		if normalizeChatGPTWebLoginEmail(authEmail(candidate)) != normalizeChatGPTWebLoginEmail(email) {
+			return nil, fmt.Errorf("%w: another chatgpt web account", errChatGPTWebCredentialIDOwned)
+		}
+		return candidate, nil
+	}
+	return nil, nil
 }
 
 func chatGPTWebStrongIdentityOwner(ctx context.Context, manager *coreauth.Manager, credential *chatgptwebauth.Credential, excludedID string) (*coreauth.Auth, error) {
@@ -1373,6 +1438,7 @@ func readChatGPTWebLoginTaskInput(c *gin.Context) ([]chatGPTWebLoginInput, error
 		return nil, errors.New("invalid content type")
 	}
 
+	requestedName := strings.TrimSpace(c.Query("name"))
 	var data []byte
 	var errRead error
 	if mediaType == "multipart/form-data" {
@@ -1388,13 +1454,34 @@ func readChatGPTWebLoginTaskInput(c *gin.Context) ([]chatGPTWebLoginInput, error
 		if errClose := file.Close(); errRead == nil && errClose != nil {
 			errRead = errClose
 		}
+		formName := strings.TrimSpace(c.PostForm("name"))
+		if requestedName != "" && formName != "" && requestedName != formName {
+			return nil, errors.New("custom credential name is ambiguous")
+		}
+		if formName != "" {
+			requestedName = formName
+		}
 	} else {
 		data, errRead = readLimitedChatGPTWebLoginInput(c.Request.Body)
 	}
 	if errRead != nil {
 		return nil, errRead
 	}
-	return parseChatGPTWebLoginInputs(data)
+	inputs, errParse := parseChatGPTWebLoginInputs(data)
+	if errParse != nil {
+		return nil, errParse
+	}
+	targetName, errName := normalizeChatGPTWebCredentialTargetName(requestedName)
+	if errName != nil {
+		return nil, errName
+	}
+	if targetName != "" {
+		if len(inputs) != 1 {
+			return nil, errors.New("custom credential name requires exactly one account")
+		}
+		inputs[0].TargetName = targetName
+	}
+	return inputs, nil
 }
 
 func readLimitedChatGPTWebLoginInput(reader io.Reader) ([]byte, error) {
