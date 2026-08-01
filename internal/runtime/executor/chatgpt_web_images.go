@@ -751,12 +751,12 @@ func prepareChatGPTWebImageOutputsWithConfig(
 				images[index] = resized
 			}
 		}
-		imageConfig, _, errConfig := image.DecodeConfig(bytes.NewReader(imageData))
+		decodedConfig, _, errConfig := image.DecodeConfig(bytes.NewReader(imageData))
 		if errConfig != nil {
 			return nil, statusErr{code: http.StatusBadGateway, msg: "chatgpt web returned an invalid image", skipAuthResult: true, retryOtherAuth: true}
 		}
 		outputs = append(outputs, helps.ChatGPTWebUsageImage{
-			Model: model, Use: "image_generation_output", Width: imageConfig.Width, Height: imageConfig.Height, Quality: quality,
+			Model: model, Use: "image_generation_output", Width: decodedConfig.Width, Height: decodedConfig.Height, Quality: quality,
 		})
 	}
 	return outputs, nil

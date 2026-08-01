@@ -1591,6 +1591,24 @@ func TestApplyRequestedImageMetadataUsesDecodedValuesBeforeExplicitRequest(t *te
 	}
 }
 
+func TestApplyRequestedImageMetadataDoesNotInventFormatOrSize(t *testing.T) {
+	response := imagesResponse{Data: []imageResult{{B64JSON: "bm90LWFuLWltYWdl"}}}
+
+	applyRequestedImageMetadata(&response, openAIImageRequest{
+		OutputFormat: "webp",
+		Size:         "1024x1536",
+		Quality:      "high",
+		Background:   "opaque",
+	})
+
+	if response.OutputFormat != "" || response.Size != "" {
+		t.Fatalf("unknown metadata was invented: format=%q size=%q", response.OutputFormat, response.Size)
+	}
+	if response.Quality != "high" || response.Background != "opaque" {
+		t.Fatalf("confirmed request metadata was not applied: quality=%q background=%q", response.Quality, response.Background)
+	}
+}
+
 func TestOpenAIImagesNonStreamingErrorsWithoutImageOutput(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	executor := &imageCaptureExecutor{

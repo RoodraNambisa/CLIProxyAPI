@@ -1377,16 +1377,8 @@ func applyRequestedImageMetadata(response *imagesResponse, request openAIImageRe
 	if response == nil {
 		return
 	}
-	outputFormat := strings.ToLower(strings.TrimSpace(request.OutputFormat))
-	size := strings.ToLower(strings.TrimSpace(request.Size))
 	quality := strings.ToLower(strings.TrimSpace(request.Quality))
 	background := strings.ToLower(strings.TrimSpace(request.Background))
-	if outputFormat == "auto" {
-		outputFormat = ""
-	}
-	if size == "auto" {
-		size = ""
-	}
 	if quality == "auto" {
 		quality = ""
 	}
@@ -1394,12 +1386,7 @@ func applyRequestedImageMetadata(response *imagesResponse, request openAIImageRe
 		background = ""
 	}
 	for index := range response.Data {
-		if strings.TrimSpace(response.Data[index].OutputFormat) == "" {
-			response.Data[index].OutputFormat = outputFormat
-		}
-		if strings.TrimSpace(response.Data[index].Size) == "" {
-			response.Data[index].Size = size
-		}
+		inferImageResultMetadata(&response.Data[index])
 		if strings.TrimSpace(response.Data[index].Quality) == "" {
 			response.Data[index].Quality = quality
 		}
