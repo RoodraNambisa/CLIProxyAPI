@@ -515,6 +515,31 @@ func TestManagerRegisterIfAbsentRejectsConcurrentDuplicateChatGPTWebEmail(t *tes
 	}
 }
 
+func TestManagerRegisterIfAbsentAllowsSameEmailForDistinctChatGPTWebWorkspaces(t *testing.T) {
+	manager := NewManager(nil, nil, nil)
+	for _, auth := range []*Auth{
+		{
+			ID:       "workspace-a.json",
+			FileName: "workspace-a.json",
+			Provider: "chatgpt-web",
+			Metadata: map[string]any{"type": "chatgpt-web", "email": "same@example.com", "account_id": "workspace-a"},
+		},
+		{
+			ID:       "workspace-b.json",
+			FileName: "workspace-b.json",
+			Provider: "chatgpt-web",
+			Metadata: map[string]any{"type": "chatgpt-web", "email": "same@example.com", "account_id": "workspace-b"},
+		},
+	} {
+		if _, errRegister := manager.RegisterIfAbsent(t.Context(), auth); errRegister != nil {
+			t.Fatalf("RegisterIfAbsent(%q) error = %v", auth.ID, errRegister)
+		}
+	}
+	if got := len(manager.List()); got != 2 {
+		t.Fatalf("registered credentials = %d, want 2", got)
+	}
+}
+
 func TestManagerRegisterIfAbsentRejectsDuplicateChatGPTWebEmailAcrossManagers(t *testing.T) {
 	store := newSharedRegisterIfAbsentTestStore()
 	first := NewManager(store, nil, nil)
@@ -565,13 +590,52 @@ func TestManagerRegisterIfAbsentRejectsDuplicateChatGPTWebEmailAcrossManagers(t 
 	}
 }
 
-func TestManagerRegisterCanonicalizesNewPersistedChatGPTWebAuth(t *testing.T) {
+func TestManagerRegisterPreservesExplicitChatGPTWebFileName(t *testing.T) {
+	store := newSharedRegisterIfAbsentTestStore()
+	manager := NewManager(store, nil, nil)
+	auth := &Auth{
+		ID:       "custom-name.json",
+		Provider: "chatgpt-web",
+		FileName: "custom-name.json",
+		Metadata: map[string]any{"type": "chatgpt-web", "email": " Person@Example.com "},
+	}
+	registered, errRegister := manager.Register(t.Context(), auth)
+	if errRegister != nil {
+		t.Fatalf("Register() error = %v", errRegister)
+	}
+	if registered == nil || registered.ID != auth.ID || registered.FileName != auth.FileName {
+		t.Fatalf("registered auth = %#v, want explicit name %q", registered, auth.ID)
+	}
+	if auths, errList := store.List(t.Context()); errList != nil || len(auths) != 1 || auths[0].ID != auth.ID {
+		t.Fatalf("stored auths = %#v, error = %v", auths, errList)
+	}
+}
+
+func TestManagerRegisterCanonicalizesChatGPTWebAuthWithoutExplicitFileName(t *testing.T) {
+	store := newSharedRegisterIfAbsentTestStore()
+	manager := NewManager(store, nil, nil)
+	auth := &Auth{
+		ID:       "temporary-id",
+		Provider: "chatgpt-web",
+		Metadata: map[string]any{"type": "chatgpt-web", "email": " Person@Example.com "},
+	}
+	wantID := chatgptwebauth.CredentialFileName("person@example.com")
+	registered, errRegister := manager.Register(t.Context(), auth)
+	if errRegister != nil {
+		t.Fatalf("Register() error = %v", errRegister)
+	}
+	if registered == nil || registered.ID != wantID || registered.FileName != wantID {
+		t.Fatalf("registered auth = %#v, want canonical ID %q", registered, wantID)
+	}
+}
+
+func TestManagerRegisterCanonicalizesNestedChatGPTWebFileName(t *testing.T) {
 	store := newSharedRegisterIfAbsentTestStore()
 	manager := NewManager(store, nil, nil)
 	auth := &Auth{
 		ID:         "custom-name.json",
 		Provider:   "chatgpt-web",
-		FileName:   "custom-name.json",
+		FileName:   "nested/custom-name.json",
 		Attributes: map[string]string{"path": "nested/custom-name.json"},
 		Metadata:   map[string]any{"type": "chatgpt-web", "email": " Person@Example.com "},
 	}
@@ -586,8 +650,23 @@ func TestManagerRegisterCanonicalizesNewPersistedChatGPTWebAuth(t *testing.T) {
 	if _, exists := registered.Attributes["path"]; exists {
 		t.Fatalf("registered auth retained a non-canonical path: %#v", registered.Attributes)
 	}
-	if auths, errList := store.List(t.Context()); errList != nil || len(auths) != 1 || auths[0].ID != wantID {
-		t.Fatalf("stored auths = %#v, error = %v", auths, errList)
+}
+
+func TestManagerRegisterCanonicalizesCaseMismatchedChatGPTWebFileName(t *testing.T) {
+	manager := NewManager(newSharedRegisterIfAbsentTestStore(), nil, nil)
+	auth := &Auth{
+		ID:       "custom-name.json",
+		Provider: "chatgpt-web",
+		FileName: "Custom-Name.json",
+		Metadata: map[string]any{"type": "chatgpt-web", "email": "person@example.com"},
+	}
+	wantID := chatgptwebauth.CredentialFileName("person@example.com")
+	registered, errRegister := manager.Register(t.Context(), auth)
+	if errRegister != nil {
+		t.Fatalf("Register() error = %v", errRegister)
+	}
+	if registered == nil || registered.ID != wantID || registered.FileName != wantID {
+		t.Fatalf("registered auth = %#v, want canonical ID %q", registered, wantID)
 	}
 }
 
@@ -631,6 +710,25 @@ func TestManagerLoadPrefersCanonicalChatGPTWebCredential(t *testing.T) {
 	auths := manager.List()
 	if len(auths) != 1 || auths[0].ID != wantID {
 		t.Fatalf("loaded auths = %#v, want canonical %q", auths, wantID)
+	}
+}
+
+func TestManagerLoadKeepsDistinctChatGPTWebWorkspacesWithSameEmail(t *testing.T) {
+	store := newSharedRegisterIfAbsentTestStore()
+	for _, auth := range []*Auth{
+		{ID: "workspace-a.json", Provider: "chatgpt-web", FileName: "workspace-a.json", Metadata: map[string]any{"type": "chatgpt-web", "email": "same@example.com", "account_id": "workspace-a"}},
+		{ID: "workspace-b.json", Provider: "chatgpt-web", FileName: "workspace-b.json", Metadata: map[string]any{"type": "chatgpt-web", "email": "same@example.com", "account_id": "workspace-b"}},
+	} {
+		if _, errSave := store.Save(t.Context(), auth); errSave != nil {
+			t.Fatalf("Save(%q) error = %v", auth.ID, errSave)
+		}
+	}
+	manager := NewManager(store, nil, nil)
+	if errLoad := manager.Load(t.Context()); errLoad != nil {
+		t.Fatalf("Load() error = %v", errLoad)
+	}
+	if got := len(manager.List()); got != 2 {
+		t.Fatalf("loaded credentials = %d, want 2", got)
 	}
 }
 

@@ -968,25 +968,25 @@ func markManagerOwnedChatGPTWebPersistence(ctx context.Context, auth *cliproxyau
 }
 
 func validateFileTokenChatGPTWebCreate(ctx context.Context, root *os.Root, relativePath string, data []byte) error {
-	var envelope struct {
-		Type  string `json:"type"`
-		Email string `json:"email"`
-	}
-	if errJSON := json.Unmarshal(data, &envelope); errJSON != nil {
+	var metadata map[string]any
+	if errJSON := json.Unmarshal(data, &metadata); errJSON != nil {
 		return cliproxyauth.NewSaveOutcomeError(cliproxyauth.SaveOutcomeRolledBack, fmt.Errorf("auth filestore: decode chatgpt web credential: %w", errJSON))
 	}
-	if !strings.EqualFold(strings.TrimSpace(envelope.Type), "chatgpt-web") {
+	typeName, _ := metadata["type"].(string)
+	if !strings.EqualFold(strings.TrimSpace(typeName), "chatgpt-web") {
 		return cliproxyauth.NewSaveOutcomeError(cliproxyauth.SaveOutcomeRolledBack, errors.New("auth filestore: chatgpt web credential has an invalid type"))
 	}
-	email := strings.ToLower(strings.TrimSpace(envelope.Email))
+	emailValue, _ := metadata["email"].(string)
+	email := strings.ToLower(strings.TrimSpace(emailValue))
 	if email == "" {
 		return cliproxyauth.NewSaveOutcomeError(cliproxyauth.SaveOutcomeRolledBack, errors.New("auth filestore: chatgpt web credential email is empty"))
 	}
-	conflict, errConflict := fileTokenRootHasChatGPTWebEmail(ctx, root, relativePath, email)
+	incoming := &cliproxyauth.Auth{Provider: "chatgpt-web", Metadata: metadata}
+	conflict, errConflict := fileTokenRootHasChatGPTWebCredentialConflict(ctx, root, relativePath, incoming)
 	if errConflict != nil {
 		return cliproxyauth.NewSaveOutcomeError(
 			cliproxyauth.SaveOutcomeRolledBack,
-			fmt.Errorf("auth filestore: inspect chatgpt web email uniqueness: %w", errConflict),
+			fmt.Errorf("auth filestore: inspect chatgpt web credential uniqueness: %w", errConflict),
 		)
 	}
 	if conflict {
@@ -995,8 +995,8 @@ func validateFileTokenChatGPTWebCreate(ctx context.Context, root *os.Root, relat
 	return nil
 }
 
-func fileTokenRootHasChatGPTWebEmail(ctx context.Context, root *os.Root, skipRelativePath, email string) (bool, error) {
-	if root == nil || email == "" {
+func fileTokenRootHasChatGPTWebCredentialConflict(ctx context.Context, root *os.Root, skipRelativePath string, incoming *cliproxyauth.Auth) (bool, error) {
+	if root == nil || incoming == nil {
 		return false, nil
 	}
 	if ctx == nil {
@@ -1029,14 +1029,16 @@ func fileTokenRootHasChatGPTWebEmail(ctx context.Context, root *os.Root, skipRel
 		if errSnapshot != nil {
 			return errSnapshot
 		}
-		var envelope struct {
-			Type  string `json:"type"`
-			Email string `json:"email"`
-		}
-		if errJSON := json.Unmarshal(snapshot.data, &envelope); errJSON != nil || !strings.EqualFold(strings.TrimSpace(envelope.Type), "chatgpt-web") {
+		var metadata map[string]any
+		if errJSON := json.Unmarshal(snapshot.data, &metadata); errJSON != nil {
 			return nil
 		}
-		if strings.EqualFold(strings.TrimSpace(envelope.Email), email) {
+		typeName, _ := metadata["type"].(string)
+		if !strings.EqualFold(strings.TrimSpace(typeName), "chatgpt-web") {
+			return nil
+		}
+		candidate := &cliproxyauth.Auth{Provider: "chatgpt-web", Metadata: metadata}
+		if cliproxyauth.ChatGPTWebCredentialIdentityConflict(candidate, incoming) {
 			conflict = true
 			return fs.SkipAll
 		}

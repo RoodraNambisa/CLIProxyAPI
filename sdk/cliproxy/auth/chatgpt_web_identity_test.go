@@ -100,6 +100,34 @@ func (hook *chatGPTWebReentrantRefreshMarkerHook) OnAuthRegistered(ctx context.C
 	}
 }
 
+func TestChatGPTWebCredentialIdentityConflictAllowsDistinctWorkspacesWithSameEmail(t *testing.T) {
+	first := &Auth{Provider: "chatgpt-web", Metadata: map[string]any{
+		"type": "chatgpt-web", "email": "same@example.com", "account_id": "workspace-a",
+	}}
+	second := &Auth{Provider: "chatgpt-web", Metadata: map[string]any{
+		"type": "chatgpt-web", "email": "same@example.com", "account_id": "workspace-b",
+	}}
+	if ChatGPTWebCredentialIdentityConflict(first, second) {
+		t.Fatal("distinct workspace identities were treated as duplicates")
+	}
+	second.Metadata["account_id"] = "workspace-a"
+	if !ChatGPTWebCredentialIdentityConflict(first, second) {
+		t.Fatal("the same workspace identity was not treated as a duplicate")
+	}
+}
+
+func TestChatGPTWebCredentialIdentityConflictKeepsOpaqueCredentialsEmailScoped(t *testing.T) {
+	first := &Auth{Provider: "chatgpt-web", Metadata: map[string]any{
+		"type": "chatgpt-web", "email": "Same@Example.com",
+	}}
+	second := &Auth{Provider: "chatgpt-web", Metadata: map[string]any{
+		"type": "chatgpt-web", "email": "same@example.com",
+	}}
+	if !ChatGPTWebCredentialIdentityConflict(first, second) {
+		t.Fatal("opaque credentials with the same email were not treated as duplicates")
+	}
+}
+
 func TestChatGPTWebCredentialIdentityStableAcrossTokenRotation(t *testing.T) {
 	first := chatGPTWebIdentityTestAuth("identity", "account-a", "user-a")
 	second := chatGPTWebIdentityTestAuth("identity", "account-a", "user-a")

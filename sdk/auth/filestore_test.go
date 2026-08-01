@@ -829,6 +829,35 @@ func TestFileTokenStoreEmailConflictIsRolledBack(t *testing.T) {
 	}
 }
 
+func TestFileTokenStoreAllowsSameEmailForDistinctChatGPTWebWorkspaces(t *testing.T) {
+	authDir := t.TempDir()
+	store := NewFileTokenStore()
+	store.SetBaseDir(authDir)
+	for _, auth := range []*cliproxyauth.Auth{
+		{
+			ID:       "workspace-a.json",
+			FileName: "workspace-a.json",
+			Provider: "chatgpt-web",
+			Metadata: map[string]any{"type": "chatgpt-web", "email": "same@example.com", "account_id": "workspace-a"},
+		},
+		{
+			ID:       "workspace-b.json",
+			FileName: "workspace-b.json",
+			Provider: "chatgpt-web",
+			Metadata: map[string]any{"type": "chatgpt-web", "email": "same@example.com", "account_id": "workspace-b"},
+		},
+	} {
+		if _, errSave := store.SaveIfAbsent(t.Context(), auth); errSave != nil {
+			t.Fatalf("SaveIfAbsent(%q) error = %v", auth.ID, errSave)
+		}
+	}
+	for _, name := range []string{"workspace-a.json", "workspace-b.json"} {
+		if _, errStat := os.Stat(filepath.Join(authDir, name)); errStat != nil {
+			t.Fatalf("stat %q: %v", name, errStat)
+		}
+	}
+}
+
 func TestFileTokenStoreEmailConflictUsesFinalStorageData(t *testing.T) {
 	authDir := t.TempDir()
 	if errWrite := os.WriteFile(filepath.Join(authDir, "existing.json"), []byte(`{"type":"chatgpt-web","email":"same@example.com"}`), 0o600); errWrite != nil {

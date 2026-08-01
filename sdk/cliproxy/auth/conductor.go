@@ -2496,6 +2496,8 @@ func closeProviderExecutor(executor ProviderExecutor) error {
 var ErrAuthAlreadyExists = errors.New("auth already exists")
 
 // ErrChatGPTWebEmailAlreadyExists reports a duplicate ChatGPT Web account.
+// The legacy name is retained for compatibility; strong identities may share
+// an email when they belong to different workspaces.
 var ErrChatGPTWebEmailAlreadyExists = errors.New("chatgpt web email already exists")
 
 // ErrChatGPTWebEmailImmutable reports an attempt to change a persisted account identity.
@@ -2564,16 +2566,16 @@ func (m *Manager) register(ctx context.Context, auth *Auth, requireAbsent bool) 
 		unlockPersist()
 		return nil, ErrChatGPTWebEmailImmutable
 	}
-	if email := chatGPTWebRegistrationEmail(auth); email != "" {
+	if chatGPTWebRegistrationEmail(auth) != "" {
 		m.mu.RLock()
-		conflict := m.chatGPTWebEmailConflictLocked(auth.ID, email)
+		conflict := m.chatGPTWebCredentialConflictLocked(auth.ID, auth)
 		m.mu.RUnlock()
 		if conflict {
 			unlockPersist()
 			return nil, ErrChatGPTWebEmailAlreadyExists
 		}
 		if requireAbsent && m.shouldPersistAuth(ctx, auth) {
-			storedConflict, errStored := m.chatGPTWebStoredEmailConflict(ctx, auth.ID, email)
+			storedConflict, errStored := m.chatGPTWebStoredCredentialConflict(ctx, auth.ID, auth)
 			if errStored != nil {
 				unlockPersist()
 				return nil, fmt.Errorf("inspect persisted chatgpt web credentials: %w", errStored)
@@ -2701,6 +2703,13 @@ func (m *Manager) canonicalizeNewChatGPTWebAuth(ctx context.Context, auth *Auth)
 		return false
 	}
 	fileName := chatgptwebauth.CredentialFileName(email)
+	requestedFileName := strings.TrimSpace(auth.FileName)
+	if requestedFileName != "" && filepath.Base(requestedFileName) == requestedFileName &&
+		!strings.ContainsAny(requestedFileName, "/\\") && !strings.ContainsRune(requestedFileName, 0) &&
+		strings.HasSuffix(strings.ToLower(requestedFileName), ".json") && requestedFileName == authID &&
+		!strings.EqualFold(requestedFileName, fileName) {
+		return false
+	}
 	auth.ID = fileName
 	auth.FileName = fileName
 	if auth.Attributes != nil {
@@ -2709,20 +2718,20 @@ func (m *Manager) canonicalizeNewChatGPTWebAuth(ctx context.Context, auth *Auth)
 	return true
 }
 
-func (m *Manager) chatGPTWebEmailConflictLocked(authID, email string) bool {
+func (m *Manager) chatGPTWebCredentialConflictLocked(authID string, auth *Auth) bool {
 	for id, candidate := range m.auths {
 		if id == authID || candidate == nil {
 			continue
 		}
-		if chatGPTWebRegistrationEmail(candidate) == email {
+		if ChatGPTWebCredentialIdentityConflict(candidate, auth) {
 			return true
 		}
 	}
 	return false
 }
 
-func (m *Manager) chatGPTWebStoredEmailConflict(ctx context.Context, authID, email string) (bool, error) {
-	if m == nil || m.store == nil || email == "" {
+func (m *Manager) chatGPTWebStoredCredentialConflict(ctx context.Context, authID string, auth *Auth) (bool, error) {
+	if m == nil || m.store == nil || auth == nil {
 		return false, nil
 	}
 	auths, errList := m.store.List(ctx)
@@ -2733,7 +2742,7 @@ func (m *Manager) chatGPTWebStoredEmailConflict(ctx context.Context, authID, ema
 		if candidate == nil || candidate.ID == authID {
 			continue
 		}
-		if chatGPTWebRegistrationEmail(candidate) == email {
+		if ChatGPTWebCredentialIdentityConflict(candidate, auth) {
 			return true, nil
 		}
 	}
@@ -2778,9 +2787,9 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 		unlockPersist()
 		return nil, ErrChatGPTWebEmailImmutable
 	}
-	if email := chatGPTWebRegistrationEmail(auth); email != "" {
+	if chatGPTWebRegistrationEmail(auth) != "" {
 		m.mu.RLock()
-		conflict := m.chatGPTWebEmailConflictLocked(auth.ID, email)
+		conflict := m.chatGPTWebCredentialConflictLocked(auth.ID, auth)
 		m.mu.RUnlock()
 		if conflict {
 			unlockPersist()
@@ -3600,16 +3609,22 @@ func deduplicateLoadedChatGPTWebAuths(items []*Auth) []*Auth {
 		return items
 	}
 	selected := make([]*Auth, 0, len(items))
-	byEmail := make(map[string]int)
+	byEmail := make(map[string][]int)
 	for _, auth := range items {
 		email := chatGPTWebRegistrationEmail(auth)
 		if email == "" {
 			selected = append(selected, auth)
 			continue
 		}
-		index, exists := byEmail[email]
-		if !exists {
-			byEmail[email] = len(selected)
+		index := -1
+		for _, candidateIndex := range byEmail[email] {
+			if ChatGPTWebCredentialIdentityConflict(selected[candidateIndex], auth) {
+				index = candidateIndex
+				break
+			}
+		}
+		if index < 0 {
+			byEmail[email] = append(byEmail[email], len(selected))
 			selected = append(selected, auth)
 			continue
 		}
@@ -4054,7 +4069,7 @@ func (m *Manager) installPreparedRequestAuthWithRuntimeMetadata(
 		carryForwardPreparedAuthRuntimeState(current, candidate)
 	}
 	normalizeChatGPTWebDependencyState(candidate)
-	if email := chatGPTWebRegistrationEmail(candidate); email != "" && m.chatGPTWebEmailConflictLocked(id, email) {
+	if chatGPTWebRegistrationEmail(candidate) != "" && m.chatGPTWebCredentialConflictLocked(id, candidate) {
 		m.mu.Unlock()
 		return nil, ErrChatGPTWebEmailAlreadyExists
 	}

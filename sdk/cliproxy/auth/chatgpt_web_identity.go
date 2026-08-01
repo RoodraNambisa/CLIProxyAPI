@@ -196,6 +196,27 @@ func ChatGPTWebCredentialHasStrongIdentity(auth *Auth) bool {
 	return claims.accountID != "" || claims.userID != "" || claims.subject != ""
 }
 
+// ChatGPTWebCredentialIdentityConflict reports whether two native ChatGPT Web
+// credentials represent the same account. Distinct strong identities may
+// share an email because one ChatGPT login can expose multiple workspaces.
+// Credentials without strong identity evidence remain email-scoped.
+func ChatGPTWebCredentialIdentityConflict(first, second *Auth) bool {
+	if !isNativeChatGPTWebCredentialAuth(first) || !isNativeChatGPTWebCredentialAuth(second) {
+		return false
+	}
+	firstEmail := strings.ToLower(strings.TrimSpace(chatGPTWebIdentityMetadataString(first.Metadata, "email")))
+	secondEmail := strings.ToLower(strings.TrimSpace(chatGPTWebIdentityMetadataString(second.Metadata, "email")))
+	if ChatGPTWebCredentialHasStrongIdentity(first) && ChatGPTWebCredentialHasStrongIdentity(second) {
+		reference := NewChatGPTWebCredentialReference(first)
+		current := NewChatGPTWebCredentialReference(second)
+		if reference.conflicting || current.conflicting {
+			return firstEmail != "" && firstEmail == secondEmail
+		}
+		return reference.Matches(second)
+	}
+	return firstEmail != "" && firstEmail == secondEmail
+}
+
 func resetChatGPTWebCredentialReplacementState(auth *Auth, now time.Time) {
 	if auth == nil {
 		return
