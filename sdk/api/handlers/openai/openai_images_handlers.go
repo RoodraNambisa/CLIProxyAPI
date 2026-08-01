@@ -868,24 +868,17 @@ func (h *OpenAIImagesAPIHandler) validateImageRequest(req *openAIImageRequest, o
 	if op.action == imageEditOperation.action && len(req.Images) == 0 {
 		return errors.New("at least one image is required")
 	}
-	applyOpenAIImageRequestDefaults(req, op)
+	applyOpenAIImageRequestDefaults(req)
 	return nil
 }
 
-func applyOpenAIImageRequestDefaults(req *openAIImageRequest, op imageOperation) {
+func applyOpenAIImageRequestDefaults(req *openAIImageRequest) {
 	if req == nil {
 		return
 	}
 	if req.N == nil {
 		n := 1
 		req.N = &n
-	}
-	if strings.TrimSpace(req.Size) == "" {
-		if op.action == imageEditOperation.action {
-			req.Size = "1024x1024"
-		} else {
-			req.Size = "auto"
-		}
 	}
 	if strings.TrimSpace(req.Quality) == "" {
 		req.Quality = "auto"

@@ -241,6 +241,9 @@ func TestOpenAIImagesGenerationsNonStreamingUsesCodexImageTool(t *testing.T) {
 	if got := gjson.GetBytes(executor.payload, "tools.0.action").String(); got != "generate" {
 		t.Fatalf("tool action = %q", got)
 	}
+	if got := gjson.GetBytes(executor.payload, "tools.0.size").String(); got != "1024x1024" {
+		t.Fatalf("tool size = %q, want 1024x1024", got)
+	}
 	assertImageToolNAbsent(t, executor.payload)
 	if got := gjson.GetBytes(executor.payload, "tool_choice.type").String(); got != "image_generation" {
 		t.Fatalf("tool_choice.type = %q, want image_generation", got)
@@ -281,8 +284,11 @@ func TestOpenAIImagesGenerationsCanUseChatGPTWebProvider(t *testing.T) {
 	if parsed.Image == nil || parsed.Image.OutputFormat != "png" {
 		t.Fatalf("ChatGPT Web image request = %#v", parsed.Image)
 	}
-	if parsed.Image.Size != "auto" || parsed.Image.Quality != "auto" {
+	if parsed.Image.Size != "" || parsed.Image.Quality != "auto" {
 		t.Fatalf("ChatGPT Web image defaults = %#v", parsed.Image)
+	}
+	if size := gjson.GetBytes(executor.payload, "tools.0.size"); size.Exists() {
+		t.Fatalf("tool size exists = %s, want omitted", size.Raw)
 	}
 	for path, want := range map[string]string{
 		"tools.0.background":         "auto",
@@ -318,9 +324,44 @@ func TestOpenAIImagesEditsApplyOfficialDefaults(t *testing.T) {
 	if errParse != nil {
 		t.Fatalf("ChatGPT Web rejected handler payload: %v; payload=%s", errParse, executor.payload)
 	}
-	if parsed.Image == nil || parsed.Image.Size != "1024x1024" ||
+	if parsed.Image == nil || parsed.Image.Size != "" ||
 		parsed.Image.Quality != "auto" || parsed.Image.OutputFormat != "png" {
 		t.Fatalf("ChatGPT Web edit defaults = %#v", parsed.Image)
+	}
+	if size := gjson.GetBytes(executor.payload, "tools.0.size"); size.Exists() {
+		t.Fatalf("tool size exists = %s, want omitted", size.Raw)
+	}
+}
+
+func TestBuildNativeImageRequestJSONForwardsSizeOnlyWhenExplicit(t *testing.T) {
+	tests := []struct {
+		name       string
+		size       string
+		wantExists bool
+		want       string
+	}{
+		{name: "omitted"},
+		{name: "auto", size: "auto", wantExists: true, want: "auto"},
+		{name: "exact", size: "1024x1536", wantExists: true, want: "1024x1536"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			payload, err := buildNativeImageRequestJSON(openAIImageRequest{
+				Model:  "gpt-image-2",
+				Prompt: "draw",
+				Size:   test.size,
+			})
+			if err != nil {
+				t.Fatalf("buildNativeImageRequestJSON() error = %v", err)
+			}
+			got := gjson.GetBytes(payload, "size")
+			if got.Exists() != test.wantExists {
+				t.Fatalf("size exists = %v, want %v; payload=%s", got.Exists(), test.wantExists, payload)
+			}
+			if test.wantExists && got.String() != test.want {
+				t.Fatalf("size = %q, want %q", got.String(), test.want)
+			}
+		})
 	}
 }
 
