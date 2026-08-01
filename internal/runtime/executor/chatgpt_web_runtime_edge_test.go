@@ -3709,6 +3709,43 @@ func TestDownloadChatGPTWebImagesPreservesDuplicateResolvedURLs(t *testing.T) {
 	}
 }
 
+func TestDownloadChatGPTWebImagesUsesRequestResponseBudget(t *testing.T) {
+	imageData := append(chatGPTWebPNGBytes(t, color.NRGBA{A: 255}), make([]byte, 1<<20)...)
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/backend-api/files/output/download":
+			_ = json.NewEncoder(w).Encode(map[string]any{"download_url": server.URL + "/asset"})
+		case "/asset":
+			w.Header().Set("Content-Type", "image/png")
+			_, _ = w.Write(imageData)
+		default:
+			http.NotFound(w, request)
+		}
+	}))
+	defer server.Close()
+
+	executor := NewChatGPTWebExecutor(nil, nil)
+	executor.runtimeBaseURL = server.URL
+	client, credential, err := executor.newRuntimeClient(chatGPTWebRuntimeAuth())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.CloseIdleConnections()
+	_, err = executor.downloadChatGPTWebImagesLimitedWithBudget(
+		context.Background(),
+		client,
+		credential,
+		&helps.ChatGPTWebImageAccumulator{References: []helps.ChatGPTWebImageReference{{Kind: "file", ID: "output"}}},
+		1,
+		1<<20,
+	)
+	if err == nil || !strings.Contains(err.Error(), "image response exceeds 1048576 bytes") {
+		t.Fatalf("download error = %v", err)
+	}
+	assertChatGPTWebNonAuthNonRetryError(t, err)
+}
+
 func TestDownloadChatGPTWebImagesLimitsResultsBeforeResolvingAssets(t *testing.T) {
 	imageData := chatGPTWebPNGBytes(t, color.NRGBA{R: 255, A: 255})
 	var metadataHits atomic.Int32
@@ -6593,10 +6630,15 @@ func TestChatGPTWebExecutorRejectsUnenforceableImageFormatBeforeUpstream(t *test
 }
 
 func TestBuildChatGPTWebImageCompletedEventRejectsOversizedOutput(t *testing.T) {
-	imageData := append(chatGPTWebPNGBytes(t, color.NRGBA{A: 255}), make([]byte, chatGPTWebMaxImageResponseBytes)...)
-	_, err := buildChatGPTWebImageCompletedEvent("gpt-image-2", "png", [][]byte{
-		imageData,
-	}, nil)
+	imageData := append(chatGPTWebPNGBytes(t, color.NRGBA{A: 255}), make([]byte, 1<<20)...)
+	_, err := prepareChatGPTWebImageOutputsWithConfig(
+		"png",
+		"gpt-image-2",
+		"",
+		[][]byte{imageData},
+		nil,
+		cliproxyexecutor.ChatGPTWebImageConfigSnapshot{MaxImageResponseBytes: 1 << 20},
+	)
 	if err == nil || !strings.Contains(err.Error(), "image response exceeds") {
 		t.Fatalf("buildChatGPTWebImageCompletedEvent() error = %v", err)
 	}
@@ -6897,6 +6939,15 @@ func TestValidateChatGPTWebImageConfigRejectsPixelLimit(t *testing.T) {
 	}
 	if err := validateChatGPTWebImageConfig(image.Config{Width: 4096, Height: 3072}); err != nil {
 		t.Fatalf("valid image config error = %v", err)
+	}
+}
+
+func TestValidateChatGPTWebOutputImageConfigAllows3840Square(t *testing.T) {
+	if err := validateChatGPTWebOutputImageConfig(image.Config{Width: 3841, Height: 3840}); err == nil {
+		t.Fatal("expected output edge limit error")
+	}
+	if err := validateChatGPTWebOutputImageConfig(image.Config{Width: 3840, Height: 3840}); err != nil {
+		t.Fatalf("valid output image config error = %v", err)
 	}
 }
 

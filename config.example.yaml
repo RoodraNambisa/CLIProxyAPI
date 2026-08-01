@@ -415,6 +415,9 @@ nonstream-keepalive-interval: 0
 #     adapt-size-to-aspect-ratio: false # Map explicit WxH sizes to a supported Web aspect-ratio prompt.
 #     aspect-ratio-max-error-percent: 1 # Maximum relative error for request and output ratio matching.
 #     max-resize-edge-pixels: 3840     # Ignore Web size adaptation when either requested edge exceeds this value.
+#     resize-to-requested-size: false  # Center-crop and resize matched Web results to the requested WxH.
+#     resize-filter: "catmull-rom"     # catmull-rom for quality, or approx-bilinear for throughput.
+#     max-image-response-megabytes: 128 # Maximum compressed image bytes returned by one request.
 #   native:
 #     generations:
 #       enabled: false

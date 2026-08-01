@@ -175,6 +175,12 @@ type ChatGPTWebImageConfig struct {
 	AspectRatioMaxErrorPercent *float64 `yaml:"aspect-ratio-max-error-percent,omitempty" json:"aspect-ratio-max-error-percent,omitempty"`
 	// MaxResizeEdgePixels limits explicit size adaptation targets.
 	MaxResizeEdgePixels *int `yaml:"max-resize-edge-pixels,omitempty" json:"max-resize-edge-pixels,omitempty"`
+	// ResizeToRequestedSize resizes matched Web image results to the explicit target.
+	ResizeToRequestedSize bool `yaml:"resize-to-requested-size,omitempty" json:"resize-to-requested-size,omitempty"`
+	// ResizeFilter selects the local image resampling filter.
+	ResizeFilter string `yaml:"resize-filter,omitempty" json:"resize-filter,omitempty"`
+	// MaxImageResponseMegabytes limits final compressed image bytes per request.
+	MaxImageResponseMegabytes *int `yaml:"max-image-response-megabytes,omitempty" json:"max-image-response-megabytes,omitempty"`
 }
 
 const (
@@ -182,6 +188,12 @@ const (
 	MaxChatGPTWebAspectRatioMaxErrorPercent     = 10.0
 	DefaultChatGPTWebMaxResizeEdgePixels        = 3840
 	MaxChatGPTWebMaxResizeEdgePixels            = 3840
+	ChatGPTWebResizeFilterCatmullRom            = "catmull-rom"
+	ChatGPTWebResizeFilterApproxBiLinear        = "approx-bilinear"
+	DefaultChatGPTWebResizeFilter               = ChatGPTWebResizeFilterCatmullRom
+	DefaultChatGPTWebMaxImageResponseMegabytes  = 128
+	MinChatGPTWebMaxImageResponseMegabytes      = 1
+	MaxChatGPTWebMaxImageResponseMegabytes      = 256
 )
 
 // ResolvedChatGPTWebImageConfig contains effective ChatGPT Web image compatibility values.
@@ -191,6 +203,9 @@ type ResolvedChatGPTWebImageConfig struct {
 	AdaptSizeToAspectRatio     bool
 	AspectRatioMaxErrorPercent float64
 	MaxResizeEdgePixels        int
+	ResizeToRequestedSize      bool
+	ResizeFilter               string
+	MaxImageResponseMegabytes  int
 }
 
 // ResolvedUpstreamModel returns the effective ChatGPT Web image conversation model.
@@ -209,12 +224,21 @@ func (cfg ChatGPTWebImageConfig) Resolved() ResolvedChatGPTWebImageConfig {
 		AdaptSizeToAspectRatio:     cfg.AdaptSizeToAspectRatio,
 		AspectRatioMaxErrorPercent: DefaultChatGPTWebAspectRatioMaxErrorPercent,
 		MaxResizeEdgePixels:        DefaultChatGPTWebMaxResizeEdgePixels,
+		ResizeToRequestedSize:      cfg.ResizeToRequestedSize,
+		ResizeFilter:               DefaultChatGPTWebResizeFilter,
+		MaxImageResponseMegabytes:  DefaultChatGPTWebMaxImageResponseMegabytes,
 	}
 	if cfg.AspectRatioMaxErrorPercent != nil {
 		resolved.AspectRatioMaxErrorPercent = *cfg.AspectRatioMaxErrorPercent
 	}
 	if cfg.MaxResizeEdgePixels != nil {
 		resolved.MaxResizeEdgePixels = *cfg.MaxResizeEdgePixels
+	}
+	if filter := strings.ToLower(strings.TrimSpace(cfg.ResizeFilter)); filter != "" {
+		resolved.ResizeFilter = filter
+	}
+	if cfg.MaxImageResponseMegabytes != nil {
+		resolved.MaxImageResponseMegabytes = *cfg.MaxImageResponseMegabytes
 	}
 	return resolved
 }
@@ -229,6 +253,16 @@ func (cfg ChatGPTWebImageConfig) Validate() error {
 	}
 	if resolved.MaxResizeEdgePixels < 1 || resolved.MaxResizeEdgePixels > MaxChatGPTWebMaxResizeEdgePixels {
 		return fmt.Errorf("images.chatgpt-web.max-resize-edge-pixels must be between 1 and %d", MaxChatGPTWebMaxResizeEdgePixels)
+	}
+	if resolved.ResizeToRequestedSize && !resolved.AdaptSizeToAspectRatio {
+		return fmt.Errorf("images.chatgpt-web.resize-to-requested-size requires adapt-size-to-aspect-ratio")
+	}
+	if resolved.ResizeFilter != ChatGPTWebResizeFilterCatmullRom && resolved.ResizeFilter != ChatGPTWebResizeFilterApproxBiLinear {
+		return fmt.Errorf("images.chatgpt-web.resize-filter must be %s or %s", ChatGPTWebResizeFilterCatmullRom, ChatGPTWebResizeFilterApproxBiLinear)
+	}
+	if resolved.MaxImageResponseMegabytes < MinChatGPTWebMaxImageResponseMegabytes ||
+		resolved.MaxImageResponseMegabytes > MaxChatGPTWebMaxImageResponseMegabytes {
+		return fmt.Errorf("images.chatgpt-web.max-image-response-megabytes must be between %d and %d", MinChatGPTWebMaxImageResponseMegabytes, MaxChatGPTWebMaxImageResponseMegabytes)
 	}
 	return nil
 }

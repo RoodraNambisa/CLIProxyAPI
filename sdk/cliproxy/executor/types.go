@@ -72,6 +72,9 @@ type ChatGPTWebImageConfigSnapshot struct {
 	AdaptSizeToAspectRatio     bool
 	AspectRatioMaxErrorPercent float64
 	MaxResizeEdgePixels        int
+	ResizeToRequestedSize      bool
+	ResizeFilter               string
+	MaxImageResponseBytes      int
 }
 
 // ImageGenerationStreamPassthroughState reports whether the selected upstream request

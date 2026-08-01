@@ -37,7 +37,8 @@ const (
 	defaultImagesImageModel = "gpt-image-2"
 	maxImageUploadBytes     = 50 << 20
 	maxImageMultipartBytes  = 220 << 20
-	maxImageSSEPendingBytes = ((maxImageUploadBytes + 2) / 3 * 4) + (8 << 20)
+	imageSSEFrameOverhead   = 8 << 20
+	maxImageSSEPendingBytes = (((sdkconfig.DefaultChatGPTWebMaxImageResponseMegabytes << 20) + 2) / 3 * 4) + imageSSEFrameOverhead
 	maxImageRequestCount    = 10
 	nativeImagesHandlerType = "openai-image"
 	nativeImagesGenerations = "images/generations"
@@ -430,15 +431,29 @@ func (h *OpenAIImagesAPIHandler) handleNonStreamingImagesResponse(c *gin.Context
 	c.Header("Content-Type", "application/json")
 	var combined imagesResponse
 	var upstreamHeaders http.Header
+	responseByteLimit := 0
+	remainingResponseBytes := 0
+	if imageProvidersContain(providers, ChatGPTWeb) {
+		responseByteLimit = imageResponseByteLimit(imageConfig)
+		remainingResponseBytes = responseByteLimit
+	}
 	if count < 1 {
 		count = 1
 	}
 	for i := 0; i < count && len(combined.Data) < count; i++ {
 		remaining := count - len(combined.Data)
+		iterationImageConfig := imageConfig
+		if responseByteLimit > 0 {
+			if remainingResponseBytes <= 0 {
+				h.writeImagesError(c, http.StatusBadGateway, imageResponseBudgetError(responseByteLimit))
+				return
+			}
+			iterationImageConfig.MaxImageResponseBytes = remainingResponseBytes
+		}
 		cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
 		cliCtx = handlers.WithImageGenerationMaxResults(cliCtx, remaining)
 		cliCtx = handlers.WithChatGPTWebIgnoreUnsupportedImageParams(cliCtx, ignoreUnsupportedImageParams)
-		cliCtx = handlers.WithChatGPTWebImageConfigSnapshot(cliCtx, imageConfig)
+		cliCtx = handlers.WithChatGPTWebImageConfigSnapshot(cliCtx, iterationImageConfig)
 		stopKeepAlive := h.StartNonStreamingKeepAlive(c, cliCtx)
 		resp, headers, errMsg := h.ExecuteWithProvidersAndExecutionModel(cliCtx, providers, h.HandlerType(), imageModel, codexModel, rawJSON, "")
 		stopKeepAlive()
@@ -467,6 +482,18 @@ func (h *OpenAIImagesAPIHandler) handleNonStreamingImagesResponse(c *gin.Context
 		}
 		if len(parsed.Data) > remaining {
 			parsed.Data = parsed.Data[:remaining]
+		}
+		if responseByteLimit > 0 {
+			parsedBytes, errSize := imageResultsBinaryBytes(parsed.Data)
+			if errSize != nil || parsedBytes > remainingResponseBytes {
+				if errSize == nil {
+					errSize = imageResponseBudgetError(responseByteLimit)
+				}
+				h.writeImagesError(c, http.StatusBadGateway, errSize)
+				cliCancel(errSize)
+				return
+			}
+			remainingResponseBytes -= parsedBytes
 		}
 		combined.Data = append(combined.Data, parsed.Data...)
 		combined.Usage = mergeImageUsageForNAggregation(combined.Usage, parsed.Usage)
@@ -506,7 +533,17 @@ func (h *OpenAIImagesAPIHandler) handleStreamingImagesResponse(c *gin.Context, r
 		c.Header("Access-Control-Allow-Origin", "*")
 	}
 
-	mapper := &imageStreamMapper{operation: op, responseFormat: responseFormat, maxResults: 1}
+	responseByteLimit := 0
+	if imageProvidersContain(providers, ChatGPTWeb) {
+		responseByteLimit = imageResponseByteLimit(imageConfig)
+	}
+	mapper := &imageStreamMapper{
+		operation:      op,
+		responseFormat: responseFormat,
+		maxResults:     1,
+		parser:         imageSSEParser{maxPendingBytes: imageSSEPendingByteLimit(imageConfig)},
+		maxBinaryBytes: responseByteLimit,
+	}
 	var firstFrame bytes.Buffer
 	for {
 		select {
@@ -581,17 +618,39 @@ func (h *OpenAIImagesAPIHandler) handleMultiStreamingImagesResponse(c *gin.Conte
 	c.Header("Cache-Control", "no-cache")
 	c.Header("Connection", "keep-alive")
 	c.Header("Access-Control-Allow-Origin", "*")
+	responseByteLimit := 0
+	remainingResponseBytes := 0
+	if imageProvidersContain(providers, ChatGPTWeb) {
+		responseByteLimit = imageResponseByteLimit(imageConfig)
+		remainingResponseBytes = responseByteLimit
+	}
 	for i := 0; i < count; i++ {
+		iterationImageConfig := imageConfig
+		if responseByteLimit > 0 {
+			if remainingResponseBytes <= 0 {
+				_, _ = fmt.Fprintf(c.Writer, "\nevent: error\ndata: %s\n\n", string(handlers.BuildErrorResponseBody(http.StatusBadGateway, imageResponseBudgetError(responseByteLimit).Error())))
+				flusher.Flush()
+				return
+			}
+			iterationImageConfig.MaxImageResponseBytes = remainingResponseBytes
+		}
 		cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
 		cliCtx = handlers.WithImageGenerationStreamPassthrough(cliCtx, true)
 		cliCtx = handlers.WithImageGenerationMaxResults(cliCtx, 1)
 		cliCtx = handlers.WithChatGPTWebIgnoreUnsupportedImageParams(cliCtx, ignoreUnsupportedImageParams)
-		cliCtx = handlers.WithChatGPTWebImageConfigSnapshot(cliCtx, imageConfig)
+		cliCtx = handlers.WithChatGPTWebImageConfigSnapshot(cliCtx, iterationImageConfig)
 		dataChan, upstreamHeaders, errChan := h.ExecuteStreamWithProvidersAndExecutionModel(cliCtx, providers, h.HandlerType(), imageModel, codexModel, rawJSON, "")
 		if i == 0 {
 			handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
 		}
-		mapper := &imageStreamMapper{operation: op, omitInputUsage: i > 0, responseFormat: responseFormat, maxResults: 1}
+		mapper := &imageStreamMapper{
+			operation:      op,
+			omitInputUsage: i > 0,
+			responseFormat: responseFormat,
+			maxResults:     1,
+			parser:         imageSSEParser{maxPendingBytes: imageSSEPendingByteLimit(iterationImageConfig)},
+			maxBinaryBytes: remainingResponseBytes,
+		}
 		var streamErr error
 		h.ForwardStream(c, flusher, func(err error) {
 			streamErr = err
@@ -630,6 +689,9 @@ func (h *OpenAIImagesAPIHandler) handleMultiStreamingImagesResponse(c *gin.Conte
 		}
 		if streamErr != nil {
 			return
+		}
+		if responseByteLimit > 0 {
+			remainingResponseBytes -= mapper.completedBinaryBytes
 		}
 	}
 	_, _ = c.Writer.Write([]byte("\n"))
@@ -1582,16 +1644,18 @@ func mergeImageUsageValue(current, next any) any {
 }
 
 type imageStreamMapper struct {
-	operation      imageOperation
-	parser         imageSSEParser
-	finals         []imageResult
-	finalUsage     json.RawMessage
-	omitInputUsage bool
-	responseFormat string
-	maxResults     int
-	completed      bool
-	forceFlush     bool
-	fatalErr       error
+	operation            imageOperation
+	parser               imageSSEParser
+	finals               []imageResult
+	finalUsage           json.RawMessage
+	omitInputUsage       bool
+	responseFormat       string
+	maxResults           int
+	maxBinaryBytes       int
+	completedBinaryBytes int
+	completed            bool
+	forceFlush           bool
+	fatalErr             error
 }
 
 func (m *imageStreamMapper) writeChunk(w io.Writer, chunk []byte) {
@@ -1710,13 +1774,65 @@ func imagePartialIndexFromResult(result gjson.Result) *int {
 }
 
 func (m *imageStreamMapper) writeCompletedSet(w io.Writer, results []imageResult, usage json.RawMessage) {
-	m.completed = true
 	if m.maxResults > 0 && len(results) > m.maxResults {
 		results = results[:m.maxResults]
 	}
+	resultBytes, err := imageResultsBinaryBytes(results)
+	if err != nil {
+		m.completed = true
+		m.fatalErr = err
+		return
+	}
+	if m.maxBinaryBytes > 0 && resultBytes > m.maxBinaryBytes-m.completedBinaryBytes {
+		m.completed = true
+		m.fatalErr = imageResponseBudgetError(m.maxBinaryBytes)
+		return
+	}
+	m.completed = true
+	m.completedBinaryBytes += resultBytes
 	for i := range results {
 		m.writeCompleted(w, results[i], usage)
 	}
+}
+
+func imageResultsBinaryBytes(results []imageResult) (int, error) {
+	total := int64(0)
+	for i := range results {
+		encoded := strings.TrimSpace(results[i].B64JSON)
+		if encoded == "" {
+			continue
+		}
+		decoded, err := io.Copy(io.Discard, base64.NewDecoder(base64.StdEncoding, strings.NewReader(encoded)))
+		if err != nil {
+			return 0, fmt.Errorf("decode image result %d: %w", i, err)
+		}
+		if decoded > int64(^uint(0)>>1)-total {
+			return 0, errors.New("image response byte count overflows int")
+		}
+		total += decoded
+	}
+	return int(total), nil
+}
+
+func imageProvidersContain(providers []string, provider string) bool {
+	for _, candidate := range providers {
+		if strings.EqualFold(strings.TrimSpace(candidate), strings.TrimSpace(provider)) {
+			return true
+		}
+	}
+	return false
+}
+
+func imageResponseByteLimit(snapshot coreexecutor.ChatGPTWebImageConfigSnapshot) int {
+	maxBytes := sdkconfig.MaxChatGPTWebMaxImageResponseMegabytes << 20
+	if snapshot.MaxImageResponseBytes <= 0 || snapshot.MaxImageResponseBytes > maxBytes {
+		return sdkconfig.DefaultChatGPTWebMaxImageResponseMegabytes << 20
+	}
+	return snapshot.MaxImageResponseBytes
+}
+
+func imageResponseBudgetError(limit int) error {
+	return fmt.Errorf("image response exceeds %d bytes", limit)
 }
 
 func chatGPTWebSupportsImageRequest(req openAIImageRequest, ignoreUnsupportedParams bool, imageConfig coreexecutor.ChatGPTWebImageConfigSnapshot) bool {
@@ -2112,7 +2228,15 @@ func (h *OpenAIImagesAPIHandler) chatGPTWebImageConfigSnapshot() coreexecutor.Ch
 		AdaptSizeToAspectRatio:     resolved.AdaptSizeToAspectRatio,
 		AspectRatioMaxErrorPercent: resolved.AspectRatioMaxErrorPercent,
 		MaxResizeEdgePixels:        resolved.MaxResizeEdgePixels,
+		ResizeToRequestedSize:      resolved.ResizeToRequestedSize,
+		ResizeFilter:               resolved.ResizeFilter,
+		MaxImageResponseBytes:      resolved.MaxImageResponseMegabytes << 20,
 	}
+}
+
+func imageSSEPendingByteLimit(snapshot coreexecutor.ChatGPTWebImageConfigSnapshot) int {
+	responseBytes := imageResponseByteLimit(snapshot)
+	return ((responseBytes + 2) / 3 * 4) + imageSSEFrameOverhead
 }
 
 func (h *OpenAIImagesAPIHandler) imagesNativeEnabled(op imageOperation) bool {

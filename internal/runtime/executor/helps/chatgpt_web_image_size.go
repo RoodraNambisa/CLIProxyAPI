@@ -58,8 +58,7 @@ func ResolveChatGPTWebImageSize(size string, maxEdge int, maxErrorPercent float6
 	bestIndex := -1
 	bestError := math.MaxFloat64
 	for index, ratio := range chatGPTWebSupportedImageRatios {
-		errorPercent := math.Abs(float64(width)*float64(ratio.height)-float64(height)*float64(ratio.width)) /
-			(float64(height) * float64(ratio.width)) * 100
+		errorPercent := ChatGPTWebImageRatioErrorPercent(width, height, ratio.width, ratio.height)
 		if errorPercent < bestError {
 			bestIndex = index
 			bestError = errorPercent
@@ -76,6 +75,23 @@ func ResolveChatGPTWebImageSize(size string, maxEdge int, maxErrorPercent float6
 		RatioHeight: ratio.height,
 		Ratio:       strconv.Itoa(ratio.width) + ":" + strconv.Itoa(ratio.height),
 	}, ChatGPTWebImageSizeMatched
+}
+
+// ChatGPTWebImageRatioErrorPercent returns the relative cross-product error for two ratios.
+func ChatGPTWebImageRatioErrorPercent(width, height, ratioWidth, ratioHeight int) float64 {
+	if width <= 0 || height <= 0 || ratioWidth <= 0 || ratioHeight <= 0 {
+		return math.Inf(1)
+	}
+	return math.Abs(float64(width)*float64(ratioHeight)-float64(height)*float64(ratioWidth)) /
+		(float64(height) * float64(ratioWidth)) * 100
+}
+
+// ChatGPTWebImageRatioMatches reports whether dimensions fit a ratio within tolerance.
+func ChatGPTWebImageRatioMatches(width, height, ratioWidth, ratioHeight int, maxErrorPercent float64) bool {
+	if math.IsNaN(maxErrorPercent) || maxErrorPercent < 0 {
+		return false
+	}
+	return ChatGPTWebImageRatioErrorPercent(width, height, ratioWidth, ratioHeight) <= maxErrorPercent
 }
 
 func parsePositiveImageDimension(value string) (int, bool) {

@@ -39,3 +39,15 @@ func TestResolveChatGPTWebImageSize(t *testing.T) {
 		})
 	}
 }
+
+func TestChatGPTWebImageRatioMatches(t *testing.T) {
+	if !ChatGPTWebImageRatioMatches(901, 1600, 9, 16, 1) {
+		t.Fatal("rounded 9:16 result should match")
+	}
+	if ChatGPTWebImageRatioMatches(920, 1600, 9, 16, 1) {
+		t.Fatal("out-of-tolerance result should not match")
+	}
+	if ChatGPTWebImageRatioMatches(0, 1600, 9, 16, 1) {
+		t.Fatal("invalid dimensions should not match")
+	}
+}

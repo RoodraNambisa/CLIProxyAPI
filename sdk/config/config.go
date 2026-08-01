@@ -47,7 +47,13 @@ type OpenAICompatibilityModel = internalconfig.OpenAICompatibilityModel
 type TLS = internalconfig.TLSConfig
 
 const (
-	DefaultPanelGitHubRepository = internalconfig.DefaultPanelGitHubRepository
+	DefaultPanelGitHubRepository               = internalconfig.DefaultPanelGitHubRepository
+	ChatGPTWebResizeFilterCatmullRom           = internalconfig.ChatGPTWebResizeFilterCatmullRom
+	ChatGPTWebResizeFilterApproxBiLinear       = internalconfig.ChatGPTWebResizeFilterApproxBiLinear
+	DefaultChatGPTWebResizeFilter              = internalconfig.DefaultChatGPTWebResizeFilter
+	DefaultChatGPTWebMaxImageResponseMegabytes = internalconfig.DefaultChatGPTWebMaxImageResponseMegabytes
+	MinChatGPTWebMaxImageResponseMegabytes     = internalconfig.MinChatGPTWebMaxImageResponseMegabytes
+	MaxChatGPTWebMaxImageResponseMegabytes     = internalconfig.MaxChatGPTWebMaxImageResponseMegabytes
 )
 
 func LoadConfig(configFile string) (*Config, error) { return internalconfig.LoadConfig(configFile) }

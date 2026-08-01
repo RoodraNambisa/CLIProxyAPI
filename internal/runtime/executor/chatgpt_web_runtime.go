@@ -365,6 +365,9 @@ func (e *ChatGPTWebExecutor) prepareRuntimeRequest(ctx context.Context, auth *cl
 		AdaptSizeToAspectRatio:     resolvedImageConfig.AdaptSizeToAspectRatio,
 		AspectRatioMaxErrorPercent: resolvedImageConfig.AspectRatioMaxErrorPercent,
 		MaxResizeEdgePixels:        resolvedImageConfig.MaxResizeEdgePixels,
+		ResizeToRequestedSize:      resolvedImageConfig.ResizeToRequestedSize,
+		ResizeFilter:               resolvedImageConfig.ResizeFilter,
+		MaxImageResponseBytes:      resolvedImageConfig.MaxImageResponseMegabytes << 20,
 	}
 	if pinned, ok := opts.Metadata[cliproxyexecutor.ChatGPTWebImageConfigSnapshotMetadataKey].(cliproxyexecutor.ChatGPTWebImageConfigSnapshot); ok {
 		imageConfigSnapshot = pinned

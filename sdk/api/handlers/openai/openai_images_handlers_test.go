@@ -40,6 +40,7 @@ type imageCaptureExecutor struct {
 	ignoreUnsupportedImageParams    bool
 	hasIgnoreUnsupportedImageParams bool
 	imageConfigSnapshot             coreexecutor.ChatGPTWebImageConfigSnapshot
+	imageConfigSnapshots            []coreexecutor.ChatGPTWebImageConfigSnapshot
 	hasImageConfigSnapshot          bool
 	response                        []byte
 	streamChunks                    []coreexecutor.StreamChunk
@@ -68,6 +69,9 @@ func (e *imageCaptureExecutor) Execute(ctx context.Context, auth *coreauth.Auth,
 	e.maxResults, _ = opts.Metadata[coreexecutor.ImageGenerationMaxResultsMetadataKey].(int)
 	e.ignoreUnsupportedImageParams, e.hasIgnoreUnsupportedImageParams = opts.Metadata[coreexecutor.ChatGPTWebIgnoreUnsupportedImageParamsMetadataKey].(bool)
 	e.imageConfigSnapshot, e.hasImageConfigSnapshot = opts.Metadata[coreexecutor.ChatGPTWebImageConfigSnapshotMetadataKey].(coreexecutor.ChatGPTWebImageConfigSnapshot)
+	if e.hasImageConfigSnapshot {
+		e.imageConfigSnapshots = append(e.imageConfigSnapshots, e.imageConfigSnapshot)
+	}
 	if len(e.response) == 0 {
 		e.response = []byte(`{"created_at":1700000000,"output":[{"type":"image_generation_call","result":"aGVsbG8=","revised_prompt":"rev"}],"usage":{"total_tokens":3}}`)
 	}
@@ -86,6 +90,9 @@ func (e *imageCaptureExecutor) ExecuteStream(_ context.Context, _ *coreauth.Auth
 	e.maxResults, _ = opts.Metadata[coreexecutor.ImageGenerationMaxResultsMetadataKey].(int)
 	e.ignoreUnsupportedImageParams, e.hasIgnoreUnsupportedImageParams = opts.Metadata[coreexecutor.ChatGPTWebIgnoreUnsupportedImageParamsMetadataKey].(bool)
 	e.imageConfigSnapshot, e.hasImageConfigSnapshot = opts.Metadata[coreexecutor.ChatGPTWebImageConfigSnapshotMetadataKey].(coreexecutor.ChatGPTWebImageConfigSnapshot)
+	if e.hasImageConfigSnapshot {
+		e.imageConfigSnapshots = append(e.imageConfigSnapshots, e.imageConfigSnapshot)
+	}
 	ch := make(chan coreexecutor.StreamChunk, len(e.streamChunks))
 	for _, chunk := range e.streamChunks {
 		ch <- chunk
@@ -130,6 +137,9 @@ func defaultChatGPTWebImageConfigSnapshot() coreexecutor.ChatGPTWebImageConfigSn
 		AdaptSizeToAspectRatio:     resolved.AdaptSizeToAspectRatio,
 		AspectRatioMaxErrorPercent: resolved.AspectRatioMaxErrorPercent,
 		MaxResizeEdgePixels:        resolved.MaxResizeEdgePixels,
+		ResizeToRequestedSize:      resolved.ResizeToRequestedSize,
+		ResizeFilter:               resolved.ResizeFilter,
+		MaxImageResponseBytes:      resolved.MaxImageResponseMegabytes << 20,
 	}
 }
 
@@ -477,7 +487,9 @@ func TestOpenAIImagesPinsChatGPTWebImageAspectConfig(t *testing.T) {
 		t.Fatalf("status = %d, body=%s", response.Code, response.Body.String())
 	}
 	if !executor.hasImageConfigSnapshot || !executor.imageConfigSnapshot.AdaptSizeToAspectRatio ||
-		executor.imageConfigSnapshot.AspectRatioMaxErrorPercent != 1 || executor.imageConfigSnapshot.MaxResizeEdgePixels != 3840 {
+		executor.imageConfigSnapshot.AspectRatioMaxErrorPercent != 1 || executor.imageConfigSnapshot.MaxResizeEdgePixels != 3840 ||
+		executor.imageConfigSnapshot.ResizeFilter != sdkconfig.DefaultChatGPTWebResizeFilter ||
+		executor.imageConfigSnapshot.MaxImageResponseBytes != sdkconfig.DefaultChatGPTWebMaxImageResponseMegabytes<<20 {
 		t.Fatalf("image config snapshot = %#v, present=%v", executor.imageConfigSnapshot, executor.hasImageConfigSnapshot)
 	}
 }
@@ -932,6 +944,40 @@ func TestOpenAIImagesGenerationsAggregatesMultipleNonStreamingImages(t *testing.
 	}
 	if got := gjson.Get(resp.Body.String(), "usage.extension.mode").String(); got != "official" {
 		t.Fatalf("unknown usage object = %q", got)
+	}
+}
+
+func TestOpenAIImagesGenerationsEnforcesAggregateWebResponseBudget(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	encoded := base64.StdEncoding.EncodeToString(make([]byte, 700<<10))
+	executor := &imageCaptureExecutor{
+		provider: constant.ChatGPTWeb,
+		response: []byte(`{"created_at":1700000000,"output":[{"type":"image_generation_call","result":"` + encoded + `"}]}`),
+	}
+	h := newImagesTestHandler(t, executor)
+	enableNAggregation := true
+	oneMegabyte := 1
+	h.Cfg.Images.EnableNAggregation = &enableNAggregation
+	h.Cfg.Images.ChatGPTWeb.MaxImageResponseMegabytes = &oneMegabyte
+	router := gin.New()
+	router.POST("/v1/images/generations", h.Generations)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/images/generations", strings.NewReader(`{"model":"gpt-image-2","prompt":"draw","n":2}`))
+	req.Header.Set("Content-Type", "application/json")
+	resp := httptest.NewRecorder()
+	router.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusBadGateway || !strings.Contains(resp.Body.String(), "image response exceeds 1048576 bytes") {
+		t.Fatalf("status=%d body=%s", resp.Code, resp.Body.String())
+	}
+	if executor.calls != 2 || len(executor.imageConfigSnapshots) != 2 {
+		t.Fatalf("calls=%d snapshots=%d", executor.calls, len(executor.imageConfigSnapshots))
+	}
+	if got := executor.imageConfigSnapshots[0].MaxImageResponseBytes; got != 1<<20 {
+		t.Fatalf("first response budget = %d", got)
+	}
+	if got := executor.imageConfigSnapshots[1].MaxImageResponseBytes; got != (1<<20)-(700<<10) {
+		t.Fatalf("second response budget = %d", got)
 	}
 }
 
@@ -1718,6 +1764,43 @@ func TestOpenAIImagesStreamingSupportsMultipleCompletedImages(t *testing.T) {
 	}
 }
 
+func TestOpenAIImagesStreamingEnforcesAggregateWebResponseBudget(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	encoded := base64.StdEncoding.EncodeToString(make([]byte, 700<<10))
+	executor := &imageCaptureExecutor{
+		provider: constant.ChatGPTWeb,
+		streamChunks: []coreexecutor.StreamChunk{{Payload: []byte(
+			`data: {"type":"response.completed","response":{"output":[{"type":"image_generation_call","result":"` + encoded + `"}]}}` + "\n\n",
+		)}},
+	}
+	h := newImagesTestHandler(t, executor)
+	enableNAggregation := true
+	oneMegabyte := 1
+	h.Cfg.Images.EnableNAggregation = &enableNAggregation
+	h.Cfg.Images.ChatGPTWeb.MaxImageResponseMegabytes = &oneMegabyte
+	router := gin.New()
+	router.POST("/v1/images/generations", h.Generations)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/images/generations", strings.NewReader(`{"model":"gpt-image-2","prompt":"draw","stream":true,"n":2}`))
+	req.Header.Set("Content-Type", "application/json")
+	resp := httptest.NewRecorder()
+	router.ServeHTTP(resp, req)
+
+	body := resp.Body.String()
+	if count := strings.Count(body, "event: image_generation.completed"); count != 1 {
+		t.Fatalf("completed event count = %d, want 1", count)
+	}
+	if count := strings.Count(body, "event: error"); count != 1 || !strings.Contains(body, "image response exceeds") {
+		t.Fatalf("stream budget error missing: %s", body)
+	}
+	if executor.streamCalls != 2 || len(executor.imageConfigSnapshots) != 2 {
+		t.Fatalf("stream calls=%d snapshots=%d", executor.streamCalls, len(executor.imageConfigSnapshots))
+	}
+	if got := executor.imageConfigSnapshots[1].MaxImageResponseBytes; got != (1<<20)-(700<<10) {
+		t.Fatalf("second stream response budget = %d", got)
+	}
+}
+
 func TestOpenAIImagesStreamingStopsMultiImageRequestAfterIncompleteStream(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	executor := &imageCaptureExecutor{
@@ -1812,13 +1895,13 @@ func TestImageStreamMapperPreservesHeartbeatAndCapsResults(t *testing.T) {
 func TestImageSSEParserWaitsForValidJSON(t *testing.T) {
 	mapper := &imageStreamMapper{operation: imageGenerationOperation, maxResults: 1}
 	var output bytes.Buffer
-	mapper.writeChunk(&output, []byte(`data: {"type":"response.completed","response":{"output":[{"type":"image_generation_call","result":"Zm9v}`))
+	mapper.writeChunk(&output, []byte(`data: {"type":"response.completed","response":{"output":[{"type":"image_generation_call","result":"Zm`))
 	if output.Len() != 0 {
 		t.Fatalf("truncated JSON was emitted: %q", output.String())
 	}
-	mapper.writeChunk(&output, []byte(`"}]}}`+"\n\n"))
+	mapper.writeChunk(&output, []byte(`9v"}]}}`+"\n\n"))
 	if !strings.Contains(output.String(), "event: image_generation.completed") ||
-		!strings.Contains(output.String(), `Zm9v}`) {
+		!strings.Contains(output.String(), `Zm9v`) {
 		t.Fatalf("completed split JSON missing: %s", output.String())
 	}
 }
@@ -1883,10 +1966,33 @@ func TestImageSSEParserAllowsMultipleBoundedFramesInOneChunk(t *testing.T) {
 	}
 }
 
+func TestImageStreamMapperRejectsCompletedImageOverBinaryBudget(t *testing.T) {
+	mapper := &imageStreamMapper{operation: imageGenerationOperation, maxBinaryBytes: 4}
+	var output bytes.Buffer
+	mapper.writeChunk(&output, []byte(`data: {"type":"response.completed","response":{"output":[{"type":"image_generation_call","result":"aGVsbG8="}]}}`+"\n\n"))
+	if output.Len() != 0 {
+		t.Fatalf("oversized completed image was written: %q", output.String())
+	}
+	if err := mapper.fatalError(); err == nil || !strings.Contains(err.Error(), "image response exceeds 4 bytes") {
+		t.Fatalf("mapper error = %v", err)
+	}
+}
+
 func TestDefaultImageSSEPendingLimitCoversMaximumEncodedImage(t *testing.T) {
-	encodedBytes := base64.StdEncoding.EncodedLen(maxImageUploadBytes)
+	encodedBytes := base64.StdEncoding.EncodedLen(sdkconfig.DefaultChatGPTWebMaxImageResponseMegabytes << 20)
 	if maxImageSSEPendingBytes <= encodedBytes {
 		t.Fatalf("SSE pending limit = %d, encoded image bytes = %d", maxImageSSEPendingBytes, encodedBytes)
+	}
+}
+
+func TestImageSSEPendingLimitUsesRequestSnapshot(t *testing.T) {
+	responseBytes := 7 << 20
+	want := base64.StdEncoding.EncodedLen(responseBytes) + imageSSEFrameOverhead
+	if got := imageSSEPendingByteLimit(coreexecutor.ChatGPTWebImageConfigSnapshot{MaxImageResponseBytes: responseBytes}); got != want {
+		t.Fatalf("SSE pending limit = %d, want %d", got, want)
+	}
+	if got := imageSSEPendingByteLimit(coreexecutor.ChatGPTWebImageConfigSnapshot{}); got != maxImageSSEPendingBytes {
+		t.Fatalf("default SSE pending limit = %d, want %d", got, maxImageSSEPendingBytes)
 	}
 }
 
