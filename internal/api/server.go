@@ -53,6 +53,7 @@ type serverOptionConfig struct {
 	postAuthHook         auth.PostAuthHook
 	authStatusHook       auth.AuthStatusHook
 	dependencyReconcile  func(context.Context, string) ([]string, error)
+	deadAuthDeleteCount  func() uint64
 	proxyPoolManager     *proxypool.Manager
 }
 
@@ -130,6 +131,13 @@ func WithAuthStatusHook(hook auth.AuthStatusHook) ServerOption {
 func WithChatGPTWebDependencyReconcileHook(hook func(context.Context, string) ([]string, error)) ServerOption {
 	return func(cfg *serverOptionConfig) {
 		cfg.dependencyReconcile = hook
+	}
+}
+
+// WithChatGPTWebDeadAuthDeleteCountProvider exposes the process-local automatic deletion count.
+func WithChatGPTWebDeadAuthDeleteCountProvider(provider func() uint64) ServerOption {
+	return func(cfg *serverOptionConfig) {
+		cfg.deadAuthDeleteCount = provider
 	}
 }
 
@@ -315,6 +323,9 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 	}
 	if optionState.dependencyReconcile != nil {
 		s.mgmt.SetChatGPTWebDependencyReconcileHook(optionState.dependencyReconcile)
+	}
+	if optionState.deadAuthDeleteCount != nil {
+		s.mgmt.SetChatGPTWebDeadAuthDeleteCountProvider(optionState.deadAuthDeleteCount)
 	}
 	s.localPassword = optionState.localPassword
 
@@ -760,6 +771,7 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.GET("/chatgpt-web/conversion-tasks/:id", s.mgmt.GetChatGPTWebConversionTask)
 		mgmt.DELETE("/chatgpt-web/conversion-tasks/:id", s.mgmt.CancelChatGPTWebConversionTask)
 		mgmt.POST("/chatgpt-web/auth-files/:name/relogin", s.mgmt.ReloginChatGPTWebAuth)
+		mgmt.GET("/chatgpt-web/auto-delete-dead/stats", s.mgmt.GetChatGPTWebAutoDeleteDeadStats)
 		mgmt.GET("/chatgpt-web/sentinel", s.mgmt.GetChatGPTWebSentinel)
 		mgmt.PUT("/chatgpt-web/sentinel", s.mgmt.PutChatGPTWebSentinel)
 		mgmt.PATCH("/chatgpt-web/sentinel", s.mgmt.PatchChatGPTWebSentinel)

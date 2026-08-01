@@ -268,6 +268,60 @@ func TestServiceAuthMaintenanceWorkerClearsQueuedWebDeleteAfterPolicyDisabled(t 
 	t.Fatal("maintenance worker did not clear stale Web pending-delete state")
 }
 
+func TestServiceAuthMaintenanceWorkerCountsSuccessfulWebDeadDeletes(t *testing.T) {
+	authDir := t.TempDir()
+	store := sdkauth.NewFileTokenStore()
+	store.SetBaseDir(authDir)
+	cfg := &config.Config{AuthDir: authDir}
+	cfg.ChatGPTWeb.AutoDeleteDeadAuths = true
+	cfg.ChatGPTWeb.AutoDeleteDeadPriorities = []int{-1}
+	service := &Service{
+		cfg:         cfg,
+		coreManager: coreauth.NewManager(store, nil, nil),
+	}
+	dead := chatGPTWebAutoDeleteTestAuth("counted.json", -1, coreauth.LifecycleStateDead)
+	dead.FileName = filepath.Join(authDir, dead.ID)
+	dead.Attributes["path"] = dead.FileName
+	if err := os.WriteFile(dead.FileName, []byte(`{"type":"chatgpt-web"}`), 0o600); err != nil {
+		t.Fatalf("write auth file: %v", err)
+	}
+	installed, err := service.coreManager.Register(context.Background(), dead)
+	if err != nil {
+		t.Fatalf("register auth: %v", err)
+	}
+	candidate, ok := service.authMaintenanceCandidateForAuth(installed, authDir, "chatgpt_web_dead_account_deactivated")
+	if !ok || !service.disableAuthMaintenanceCandidate(context.Background(), candidate, true) {
+		t.Fatal("failed to stage dead auth candidate")
+	}
+	candidate = snapshotChatGPTWebAutoDeleteCandidate(t, service, candidate, authDir)
+	if !service.enqueueAuthMaintenanceCandidate(candidate) {
+		t.Fatal("failed to enqueue dead auth candidate")
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	service.startAuthMaintenance(ctx)
+	defer func() {
+		cancel()
+		service.stopAuthMaintenance()
+	}()
+	service.wakeAuthMaintenance()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if service.chatGPTWebDeadAuthDeletedCount.Load() == 1 {
+			if _, exists := service.coreManager.GetByID(dead.ID); exists {
+				t.Fatal("count advanced before the runtime credential was removed")
+			}
+			if _, errStat := os.Stat(dead.FileName); !os.IsNotExist(errStat) {
+				t.Fatalf("count advanced before the auth file was removed: %v", errStat)
+			}
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("successful deletion count = %d, want 1", service.chatGPTWebDeadAuthDeletedCount.Load())
+}
+
 func TestServiceChatGPTWebDeadDeleteDoesNotDeleteReplacementGeneration(t *testing.T) {
 	authDir := t.TempDir()
 	store := sdkauth.NewFileTokenStore()

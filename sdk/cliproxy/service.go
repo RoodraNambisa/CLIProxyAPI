@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/api"
@@ -223,6 +224,9 @@ type Service struct {
 
 	// maintenanceDependencyReconcilePending retries retained Codex cleanup after a transient failure.
 	maintenanceDependencyReconcilePending bool
+
+	// chatGPTWebDeadAuthDeletedCount tracks successful automatic dead credential deletions for this process.
+	chatGPTWebDeadAuthDeletedCount atomic.Uint64
 }
 
 // RegisterUsagePlugin registers a usage plugin on the global usage manager.
@@ -1733,6 +1737,9 @@ func (s *Service) startAuthMaintenance(parent context.Context) {
 					log.WithError(err).Warnf("auth maintenance delete failed for %s", candidate.Path)
 					lastDeleteAt = time.Now()
 				} else if deleted {
+					if isChatGPTWebDeadMaintenanceCandidate(candidate) {
+						s.chatGPTWebDeadAuthDeletedCount.Add(1)
+					}
 					lastDeleteAt = time.Now()
 					continue
 				} else {
@@ -3785,6 +3792,7 @@ func (s *Service) Run(ctx context.Context) error {
 	serverOpts := append([]api.ServerOption(nil), s.serverOptions...)
 	serverOpts = append(serverOpts, api.WithAuthStatusHook(s.handleManagementAuthStatusChange))
 	serverOpts = append(serverOpts, api.WithChatGPTWebDependencyReconcileHook(s.reconcileChatGPTWebDependencies))
+	serverOpts = append(serverOpts, api.WithChatGPTWebDeadAuthDeleteCountProvider(s.chatGPTWebDeadAuthDeletedCount.Load))
 	serverOpts = append(serverOpts, api.WithProxyPoolManager(s.proxyPoolManager))
 	s.server = api.NewServer(s.cfg, s.coreManager, s.accessManager, s.configPath, serverOpts...)
 

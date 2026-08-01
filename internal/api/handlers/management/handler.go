@@ -85,6 +85,7 @@ type Handler struct {
 	postAuthHook            coreauth.PostAuthHook
 	authStatusHook          coreauth.AuthStatusHook
 	dependencyReconcileHook func(context.Context, string) ([]string, error)
+	deadAuthDeleteCount     func() uint64
 	proxyPoolManager        *proxypool.Manager
 	chatGPTWebTasks         *chatGPTWebLoginTaskManager
 	chatGPTWebMutationTasks *chatGPTWebMutationTaskManager
@@ -310,6 +311,11 @@ func (h *Handler) SetAuthStatusHook(hook coreauth.AuthStatusHook) {
 // SetChatGPTWebDependencyReconcileHook registers the service-level dependency cleanup hook.
 func (h *Handler) SetChatGPTWebDependencyReconcileHook(hook func(context.Context, string) ([]string, error)) {
 	h.dependencyReconcileHook = hook
+}
+
+// SetChatGPTWebDeadAuthDeleteCountProvider registers the process-local deletion count provider.
+func (h *Handler) SetChatGPTWebDeadAuthDeleteCountProvider(provider func() uint64) {
+	h.deadAuthDeleteCount = provider
 }
 
 // Middleware enforces access control for management endpoints.
