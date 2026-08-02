@@ -86,6 +86,7 @@ func TestLoadConfigOptionalChatGPTWebImageAspectSettings(t *testing.T) {
     resize-to-requested-size: true
     resize-filter: approx-bilinear
     max-image-response-megabytes: 64
+    max-n: 2
 `)
 	if err := os.WriteFile(path, data, 0o600); err != nil {
 		t.Fatalf("write config: %v", err)
@@ -98,7 +99,7 @@ func TestLoadConfigOptionalChatGPTWebImageAspectSettings(t *testing.T) {
 	resolved := cfg.Images.ChatGPTWeb.Resolved()
 	if !resolved.AdaptSizeToAspectRatio || !resolved.StrictSize || resolved.AspectRatioMaxErrorPercent != 0.5 || resolved.MaxResizeEdgePixels != 2048 ||
 		!resolved.ResizeToRequestedSize || resolved.ResizeFilter != ChatGPTWebResizeFilterApproxBiLinear ||
-		resolved.MaxImageResponseMegabytes != responseBudget {
+		resolved.MaxImageResponseMegabytes != responseBudget || resolved.MaxN != 2 {
 		t.Fatalf("resolved ChatGPT Web image config = %#v", resolved)
 	}
 }
@@ -110,7 +111,8 @@ func TestChatGPTWebImageAspectSettingsDefaultsAndValidation(t *testing.T) {
 		resolved.AspectRatioMaxErrorPercent != DefaultChatGPTWebAspectRatioMaxErrorPercent ||
 		resolved.MaxResizeEdgePixels != DefaultChatGPTWebMaxResizeEdgePixels ||
 		resolved.ResizeToRequestedSize || resolved.ResizeFilter != DefaultChatGPTWebResizeFilter ||
-		resolved.MaxImageResponseMegabytes != DefaultChatGPTWebMaxImageResponseMegabytes {
+		resolved.MaxImageResponseMegabytes != DefaultChatGPTWebMaxImageResponseMegabytes ||
+		resolved.MaxN != DefaultChatGPTWebMaxN {
 		t.Fatalf("resolved defaults = %#v", resolved)
 	}
 
@@ -121,6 +123,8 @@ func TestChatGPTWebImageAspectSettingsDefaultsAndValidation(t *testing.T) {
 	tooLargeEdge := MaxChatGPTWebMaxResizeEdgePixels + 1
 	zeroResponseBudget := 0
 	tooLargeResponseBudget := MaxChatGPTWebMaxImageResponseMegabytes + 1
+	zeroN := 0
+	tooLargeN := MaxChatGPTWebMaxN + 1
 	tests := []struct {
 		name string
 		cfg  ChatGPTWebImageConfig
@@ -135,6 +139,8 @@ func TestChatGPTWebImageAspectSettingsDefaultsAndValidation(t *testing.T) {
 		{name: "unknown filter", cfg: ChatGPTWebImageConfig{ResizeFilter: "nearest"}},
 		{name: "zero response budget", cfg: ChatGPTWebImageConfig{MaxImageResponseMegabytes: &zeroResponseBudget}},
 		{name: "large response budget", cfg: ChatGPTWebImageConfig{MaxImageResponseMegabytes: &tooLargeResponseBudget}},
+		{name: "zero max n", cfg: ChatGPTWebImageConfig{MaxN: &zeroN}},
+		{name: "large max n", cfg: ChatGPTWebImageConfig{MaxN: &tooLargeN}},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -166,6 +172,7 @@ func TestLoadConfigOptionalRejectsInvalidChatGPTWebImageAspectSettings(t *testin
 		{name: "strict size dependency", body: "strict-size: true"},
 		{name: "resize filter", body: "resize-filter: nearest"},
 		{name: "response budget", body: "max-image-response-megabytes: 257"},
+		{name: "max n", body: "max-n: 11"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

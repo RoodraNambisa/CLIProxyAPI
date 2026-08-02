@@ -369,6 +369,7 @@ func (e *ChatGPTWebExecutor) prepareRuntimeRequest(ctx context.Context, auth *cl
 		ResizeToRequestedSize:      resolvedImageConfig.ResizeToRequestedSize,
 		ResizeFilter:               resolvedImageConfig.ResizeFilter,
 		MaxImageResponseBytes:      resolvedImageConfig.MaxImageResponseMegabytes << 20,
+		MaxN:                       resolvedImageConfig.MaxN,
 	}
 	if pinned, ok := opts.Metadata[cliproxyexecutor.ChatGPTWebImageConfigSnapshotMetadataKey].(cliproxyexecutor.ChatGPTWebImageConfigSnapshot); ok {
 		imageConfigSnapshot = pinned
@@ -415,11 +416,7 @@ func (e *ChatGPTWebExecutor) prepareRuntimeRequest(ctx context.Context, auth *cl
 	}
 	var imageSizeMatch *helps.ChatGPTWebImageSizeMatch
 	if parsed.Image != nil && imageConfigSnapshot.AdaptSizeToAspectRatio {
-		match, disposition := helps.ResolveChatGPTWebImageSize(
-			parsed.Image.Size,
-			imageConfigSnapshot.MaxResizeEdgePixels,
-			imageConfigSnapshot.AspectRatioMaxErrorPercent,
-		)
+		match, disposition := helps.ResolveChatGPTWebImageSize(parsed.Image.Size, imageConfigSnapshot.MaxResizeEdgePixels)
 		switch disposition {
 		case helps.ChatGPTWebImageSizeMatched:
 			imageSizeMatch = &match
@@ -430,12 +427,29 @@ func (e *ChatGPTWebExecutor) prepareRuntimeRequest(ctx context.Context, auth *cl
 			if imageConfigSnapshot.StrictSize {
 				return nil, statusErr{
 					code:           http.StatusBadRequest,
-					msg:            string(helps.ChatGPTWebStrictImageSizeErrorPayload(parsed.Image.Size, imageConfigSnapshot.MaxResizeEdgePixels, imageConfigSnapshot.AspectRatioMaxErrorPercent)),
+					msg:            string(helps.ChatGPTWebStrictImageSizeErrorPayload(parsed.Image.Size, imageConfigSnapshot.MaxResizeEdgePixels)),
 					skipAuthResult: true,
 				}
 			}
 			if disposition == helps.ChatGPTWebImageSizeIgnored {
 				parsed.Image.Size = ""
+			}
+		}
+	}
+	if parsed.Image != nil {
+		requestedCount := parsed.Image.N
+		if maxResults := chatGPTWebMaxImageResults(opts.Metadata); maxResults > requestedCount {
+			requestedCount = maxResults
+		}
+		maxN := imageConfigSnapshot.MaxN
+		if maxN <= 0 {
+			maxN = config.DefaultChatGPTWebMaxN
+		}
+		if requestedCount > maxN {
+			return nil, statusErr{
+				code:           http.StatusBadRequest,
+				msg:            string(helps.ChatGPTWebImageNErrorPayload(requestedCount, maxN)),
+				skipAuthResult: true,
 			}
 		}
 	}

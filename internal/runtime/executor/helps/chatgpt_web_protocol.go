@@ -117,6 +117,7 @@ type ChatGPTWebMessage struct {
 type ChatGPTWebImageRequest struct {
 	Model          string
 	Prompt         string
+	N              int
 	Images         []string
 	MaskURL        string
 	MaskImageIndex int
@@ -551,6 +552,14 @@ func ChatGPTWebEncodedImageSize(value string, maxBytes int) (int, error) {
 }
 
 func validateChatGPTWebImageTool(tool map[string]any, ignoreUnsupportedParams bool) error {
+	if value, exists := tool["n"]; exists && value != nil {
+		n, ok := integerFromAny(value)
+		if !ok || n < 1 {
+			return &ChatGPTWebUnsupportedToolError{
+				Message: "chatgpt web image_generation field \"n\" must be a positive integer",
+			}
+		}
+	}
 	if !ignoreUnsupportedParams {
 		for _, candidate := range []struct {
 			field        string
@@ -890,11 +899,15 @@ func imageURLFromAny(value any) string {
 func imageRequestFromMessages(messages []ChatGPTWebMessage, tool map[string]any) (*ChatGPTWebImageRequest, error) {
 	request := &ChatGPTWebImageRequest{
 		Model:          strings.TrimSpace(stringFromAny(tool["model"])),
+		N:              1,
 		Size:           strings.TrimSpace(stringFromAny(tool["size"])),
 		Quality:        strings.TrimSpace(stringFromAny(tool["quality"])),
 		Action:         strings.ToLower(strings.TrimSpace(stringFromAny(tool["action"]))),
 		OutputFormat:   strings.ToLower(strings.TrimSpace(stringFromAny(tool["output_format"]))),
 		MaskImageIndex: -1,
+	}
+	if n, ok := integerFromAny(tool["n"]); ok && n > 0 {
+		request.N = n
 	}
 	if mask, ok := tool["input_image_mask"].(map[string]any); ok {
 		request.MaskURL = imageURLFromAny(mask["image_url"])
@@ -2975,5 +2988,22 @@ func numberFromAny(value any) float64 {
 		return number
 	default:
 		return 0
+	}
+}
+
+func integerFromAny(value any) (int, bool) {
+	switch typed := value.(type) {
+	case int:
+		return typed, true
+	case float64:
+		if math.IsNaN(typed) || math.IsInf(typed, 0) || typed != math.Trunc(typed) || typed > float64(^uint(0)>>1) || typed < -float64(^uint(0)>>1)-1 {
+			return 0, false
+		}
+		return int(typed), true
+	case json.Number:
+		parsed, err := strconv.ParseInt(string(typed), 10, strconv.IntSize)
+		return int(parsed), err == nil
+	default:
+		return 0, false
 	}
 }

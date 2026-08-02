@@ -3,6 +3,7 @@ package executor
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 	"testing"
@@ -23,7 +24,7 @@ func TestPrepareRuntimeRequestAdaptsPinnedChatGPTWebImageSize(t *testing.T) {
 			Payload: []byte(`{
 				"model":"gpt-5.4",
 				"input":"draw a cat",
-				"tools":[{"type":"image_generation","size":"941x1672"}]
+				"tools":[{"type":"image_generation","size":"1200x800"}]
 			}`),
 		},
 		cliproxyexecutor.Options{
@@ -46,16 +47,17 @@ func TestPrepareRuntimeRequestAdaptsPinnedChatGPTWebImageSize(t *testing.T) {
 	if prepared.request.Image == nil || prepared.request.Image.Size != "" {
 		t.Fatalf("prepared image request = %#v", prepared.request.Image)
 	}
-	if prepared.imageSizeMatch == nil || prepared.imageSizeMatch.Ratio != "9:16" ||
-		prepared.imageSizeMatch.Width != 941 || prepared.imageSizeMatch.Height != 1672 {
+	if prepared.imageSizeMatch == nil || prepared.imageSizeMatch.Ratio != "3:2" ||
+		prepared.imageSizeMatch.Width != 1200 || prepared.imageSizeMatch.Height != 800 {
 		t.Fatalf("image size match = %#v", prepared.imageSizeMatch)
 	}
 	originalPrompt := prepared.request.Image.Prompt
-	upstreamPrompt := chatGPTWebImageUpstreamPrompt(originalPrompt, prepared.imageSizeMatch)
+	upstreamPrompt := chatGPTWebImageUpstreamPrompt(originalPrompt, "generate", prepared.imageSizeMatch)
 	if originalPrompt != "draw a cat" || prepared.request.Image.Prompt != originalPrompt {
 		t.Fatalf("original prompt changed: before=%q after=%q", originalPrompt, prepared.request.Image.Prompt)
 	}
-	if !strings.HasSuffix(upstreamPrompt, "Set the final image aspect ratio to 9:16.") {
+	wantSuffix := "Set the final image canvas to exactly 1200×800 pixels (width × height), with an aspect ratio of 3:2. If exact pixel dimensions are unavailable, preserve the 3:2 aspect ratio exactly."
+	if !strings.HasSuffix(upstreamPrompt, wantSuffix) {
 		t.Fatalf("upstream prompt = %q", upstreamPrompt)
 	}
 }
@@ -66,7 +68,7 @@ func TestPrepareRuntimeRequestIgnoresUnmappedChatGPTWebImageSizes(t *testing.T) 
 		size      string
 		wantError bool
 	}{
-		{name: "unsupported ratio", size: "1024x1536"},
+		{name: "below minimum pixels", size: "1024x512"},
 		{name: "oversize", size: "4000x4000"},
 		{name: "invalid", size: "square", wantError: true},
 	}
@@ -109,7 +111,7 @@ func TestPrepareRuntimeRequestIgnoresUnmappedChatGPTWebImageSizes(t *testing.T) 
 }
 
 func TestPrepareRuntimeRequestStrictSizeRejectsBeforeNetwork(t *testing.T) {
-	for _, size := range []string{"1024x1536", "4000x4000", "square"} {
+	for _, size := range []string{"1024x512", "4000x4000", "square"} {
 		t.Run(size, func(t *testing.T) {
 			executor := NewChatGPTWebExecutor(nil, nil)
 			payload := []byte(`{"model":"gpt-5.4","input":"draw","tools":[{"type":"image_generation","size":"` + size + `"}]}`)
@@ -155,11 +157,63 @@ func TestPrepareRuntimeRequestStrictSizeRejectsBeforeNetwork(t *testing.T) {
 
 func TestChatGPTWebImageUpstreamPromptWithoutMatch(t *testing.T) {
 	prompt := " draw "
-	if got := chatGPTWebImageUpstreamPrompt(prompt, nil); got != "draw" {
+	if got := chatGPTWebImageUpstreamPrompt(prompt, "generate", nil); got != "draw" {
 		t.Fatalf("prompt = %q, want draw", got)
 	}
 	match := &helps.ChatGPTWebImageSizeMatch{}
-	if got := chatGPTWebImageUpstreamPrompt(prompt, match); got != "draw" {
+	if got := chatGPTWebImageUpstreamPrompt(prompt, "generate", match); got != "draw" {
 		t.Fatalf("empty ratio prompt = %q, want draw", got)
+	}
+}
+
+func TestChatGPTWebImageUpstreamPromptForEdit(t *testing.T) {
+	match := &helps.ChatGPTWebImageSizeMatch{Width: 1200, Height: 800, RatioWidth: 3, RatioHeight: 2, Ratio: "3:2"}
+	got := chatGPTWebImageUpstreamPrompt("edit this", "edit", match)
+	want := "edit this\n\nRecompose, crop, or extend the edited image so the final canvas is exactly 1200×800 pixels (width × height), with an aspect ratio of 3:2. Preserve the subject's natural proportions; do not stretch or distort the subject. If exact pixel dimensions are unavailable, preserve the 3:2 aspect ratio exactly."
+	if got != want {
+		t.Fatalf("prompt = %q, want %q", got, want)
+	}
+}
+
+func TestPrepareRuntimeRequestEnforcesChatGPTWebMaxN(t *testing.T) {
+	tests := []struct {
+		name       string
+		toolN      int
+		maxResults int
+		maxN       int
+		wantError  bool
+	}{
+		{name: "tool count rejected", toolN: 2, maxN: 1, wantError: true},
+		{name: "aggregation count rejected", toolN: 1, maxResults: 2, maxN: 1, wantError: true},
+		{name: "configured count accepted", toolN: 2, maxResults: 2, maxN: 2},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			executor := NewChatGPTWebExecutor(nil, nil)
+			metadata := map[string]any{
+				cliproxyexecutor.ChatGPTWebImageConfigSnapshotMetadataKey: cliproxyexecutor.ChatGPTWebImageConfigSnapshot{MaxN: test.maxN},
+			}
+			if test.maxResults > 0 {
+				metadata[cliproxyexecutor.ImageGenerationMaxResultsMetadataKey] = test.maxResults
+			}
+			payload := []byte(fmt.Sprintf(`{"model":"gpt-5.4","input":"draw","tools":[{"type":"image_generation","n":%d}]}`, test.toolN))
+			prepared, err := executor.prepareRuntimeRequest(
+				context.Background(),
+				chatGPTWebRuntimeAuth(),
+				cliproxyexecutor.Request{Model: "gpt-image-2", Payload: payload},
+				cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatCodex, ResponseFormat: sdktranslator.FormatCodex, Metadata: metadata},
+				false,
+			)
+			if test.wantError {
+				if err == nil || gjson.Get(err.Error(), "error.param").String() != "n" || !strings.Contains(err.Error(), "chatgpt web") {
+					t.Fatalf("prepareRuntimeRequest() error = %v, want chatgpt web n error", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("prepareRuntimeRequest() error = %v", err)
+			}
+			defer prepared.discardUsageProjection()
+		})
 	}
 }

@@ -415,13 +415,14 @@ nonstream-keepalive-interval: 0
 #   chatgpt-web:
 #     upstream-model: "gpt-5-5"      # Web conversation model used to invoke picture_v2.
 #     ignore-unsupported-params: false # Drop unsupported size/quality/etc. instead of excluding Web routing.
-#     adapt-size-to-aspect-ratio: false # Map explicit WxH sizes to a supported Web aspect-ratio prompt.
+#     adapt-size-to-aspect-ratio: false # Map compatible explicit WxH sizes to an exact canvas/aspect-ratio prompt.
 #     strict-size: false                # Exclude Web when an explicit size cannot be adapted; requires adaptation.
-#     aspect-ratio-max-error-percent: 1 # Maximum relative error for request and output ratio matching.
+#     aspect-ratio-max-error-percent: 1 # Maximum relative error accepted for the generated output ratio.
 #     max-resize-edge-pixels: 3840     # Ignore Web size adaptation when either requested edge exceeds this value.
 #     resize-to-requested-size: false  # Center-crop and resize matched Web results to the requested WxH.
 #     resize-filter: "catmull-rom"     # catmull-rom for quality, or approx-bilinear for throughput.
 #     max-image-response-megabytes: 128 # Maximum compressed image bytes returned by one request.
+#     max-n: 1                          # Maximum images in one logical ChatGPT Web image request (1-10).
 #   native:
 #     generations:
 #       enabled: false

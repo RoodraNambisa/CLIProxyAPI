@@ -141,6 +141,7 @@ func defaultChatGPTWebImageConfigSnapshot() coreexecutor.ChatGPTWebImageConfigSn
 		ResizeToRequestedSize:      resolved.ResizeToRequestedSize,
 		ResizeFilter:               resolved.ResizeFilter,
 		MaxImageResponseBytes:      resolved.MaxImageResponseMegabytes << 20,
+		MaxN:                       resolved.MaxN,
 	}
 }
 
@@ -453,8 +454,8 @@ func TestImageResponsesProvidersAdaptSupportedAndIgnoredWebSizes(t *testing.T) {
 		size string
 		want []string
 	}{
-		{name: "matched", size: "941x1672", want: []string{constant.Codex, constant.ChatGPTWeb}},
-		{name: "unsupported ratio ignored", size: "1024x1536", want: []string{constant.Codex, constant.ChatGPTWeb}},
+		{name: "arbitrary ratio matched", size: "1200x800", want: []string{constant.Codex, constant.ChatGPTWeb}},
+		{name: "native constraint ignored", size: "1024x512", want: []string{constant.Codex, constant.ChatGPTWeb}},
 		{name: "oversize ignored", size: "4000x4000", want: []string{constant.Codex, constant.ChatGPTWeb}},
 		{name: "invalid", size: "square", want: []string{constant.Codex}},
 	}
@@ -472,12 +473,22 @@ func TestImageResponsesProvidersKeepsStrictSizesForRequestFiltering(t *testing.T
 	imageConfig := defaultChatGPTWebImageConfigSnapshot()
 	imageConfig.AdaptSizeToAspectRatio = true
 	imageConfig.StrictSize = true
-	for _, size := range []string{"1024x1536", "4000x4000", "square"} {
+	for _, size := range []string{"1024x512", "4000x4000", "square"} {
 		got := imageResponsesProviders(openAIImageRequest{Size: size}, false, imageConfig)
 		want := []string{constant.Codex, constant.ChatGPTWeb}
 		if strings.Join(got, ",") != strings.Join(want, ",") {
 			t.Fatalf("size %q providers = %v, want %v", size, got, want)
 		}
+	}
+}
+
+func TestImageResponsesProvidersKeepsExcessNForRequestFiltering(t *testing.T) {
+	imageConfig := defaultChatGPTWebImageConfigSnapshot()
+	request := openAIImageRequest{N: intPointer(2)}
+	got := imageResponsesProviders(request, false, imageConfig)
+	want := []string{constant.Codex, constant.ChatGPTWeb}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("providers = %v, want %v", got, want)
 	}
 }
 
@@ -492,7 +503,7 @@ func TestOpenAIImagesPinsChatGPTWebImageAspectConfig(t *testing.T) {
 	router.POST("/v1/images/generations", h.Generations)
 
 	request := httptest.NewRequest(http.MethodPost, "/v1/images/generations", strings.NewReader(
-		`{"model":"gpt-image-2","prompt":"draw","size":"941x1672"}`,
+		`{"model":"gpt-image-2","prompt":"draw","size":"1200x800"}`,
 	))
 	request.Header.Set("Content-Type", "application/json")
 	response := httptest.NewRecorder()
@@ -504,7 +515,8 @@ func TestOpenAIImagesPinsChatGPTWebImageAspectConfig(t *testing.T) {
 	if !executor.hasImageConfigSnapshot || !executor.imageConfigSnapshot.AdaptSizeToAspectRatio || !executor.imageConfigSnapshot.StrictSize ||
 		executor.imageConfigSnapshot.AspectRatioMaxErrorPercent != 1 || executor.imageConfigSnapshot.MaxResizeEdgePixels != 3840 ||
 		executor.imageConfigSnapshot.ResizeFilter != sdkconfig.DefaultChatGPTWebResizeFilter ||
-		executor.imageConfigSnapshot.MaxImageResponseBytes != sdkconfig.DefaultChatGPTWebMaxImageResponseMegabytes<<20 {
+		executor.imageConfigSnapshot.MaxImageResponseBytes != sdkconfig.DefaultChatGPTWebMaxImageResponseMegabytes<<20 ||
+		executor.imageConfigSnapshot.MaxN != sdkconfig.DefaultChatGPTWebMaxN {
 		t.Fatalf("image config snapshot = %#v, present=%v", executor.imageConfigSnapshot, executor.hasImageConfigSnapshot)
 	}
 }
@@ -602,7 +614,7 @@ func TestOpenAIImagesStrictSizeRoutesIncompatibleRequestToCodex(t *testing.T) {
 	router.POST("/v1/images/generations", h.Generations)
 
 	request := httptest.NewRequest(http.MethodPost, "/v1/images/generations", strings.NewReader(
-		`{"model":"gpt-image-2","prompt":"draw","size":"1024x1536"}`,
+		`{"model":"gpt-image-2","prompt":"draw","size":"1025x1024"}`,
 	))
 	request.Header.Set("Content-Type", "application/json")
 	response := httptest.NewRecorder()
@@ -626,7 +638,7 @@ func TestOpenAIImagesStrictSizeRejectsWebOnlyBeforeExecution(t *testing.T) {
 		{
 			name: "generation",
 			path: "/v1/images/generations",
-			body: `{"model":"gpt-image-2","prompt":"draw","size":"1024x1536"}`,
+			body: `{"model":"gpt-image-2","prompt":"draw","size":"1025x1024"}`,
 		},
 		{
 			name: "streaming generation",
@@ -669,6 +681,66 @@ func TestOpenAIImagesStrictSizeRejectsWebOnlyBeforeExecution(t *testing.T) {
 				t.Fatalf("executor calls = %d stream calls = %d, want none", executor.calls, executor.streamCalls)
 			}
 		})
+	}
+}
+
+func TestOpenAIImagesMaxNRoutesRequestToCodex(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	codexExecutor := &imageCaptureExecutor{provider: constant.Codex}
+	webExecutor := &imageCaptureExecutor{provider: constant.ChatGPTWeb}
+	h := newMixedImagesTestHandler(t, codexExecutor, webExecutor)
+	enabled := true
+	h.Cfg.Images.EnableNAggregation = &enabled
+	router := gin.New()
+	router.Use(allowedImageProvidersMiddleware(constant.ChatGPTWeb, constant.Codex))
+	router.POST("/v1/images/generations", h.Generations)
+
+	request := httptest.NewRequest(http.MethodPost, "/v1/images/generations", strings.NewReader(
+		`{"model":"gpt-image-2","prompt":"draw","n":2}`,
+	))
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", response.Code, response.Body.String())
+	}
+	if codexExecutor.calls != 2 || webExecutor.calls != 0 {
+		t.Fatalf("executor calls: codex=%d web=%d, want 2/0", codexExecutor.calls, webExecutor.calls)
+	}
+}
+
+func TestOpenAIImagesMaxNRejectsWebOnlyBeforeExecution(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	executor := &imageCaptureExecutor{provider: constant.ChatGPTWeb}
+	h := newImagesTestHandler(t, executor)
+	enabled := true
+	h.Cfg.Images.EnableNAggregation = &enabled
+	router := gin.New()
+	router.Use(allowedImageProvidersMiddleware(constant.ChatGPTWeb))
+	router.POST("/v1/images/generations", h.Generations)
+
+	request := httptest.NewRequest(http.MethodPost, "/v1/images/generations", strings.NewReader(
+		`{"model":"gpt-image-2","prompt":"draw","n":2}`,
+	))
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body=%s", response.Code, response.Body.String())
+	}
+	if got := gjson.Get(response.Body.String(), "error.param").String(); got != "n" {
+		t.Fatalf("error param = %q; body=%s", got, response.Body.String())
+	}
+	if got := gjson.Get(response.Body.String(), "error.code").String(); got != "invalid_value" {
+		t.Fatalf("error code = %q; body=%s", got, response.Body.String())
+	}
+	if !strings.Contains(gjson.Get(response.Body.String(), "error.message").String(), "chatgpt web") {
+		t.Fatalf("error does not contain chatgpt web: %s", response.Body.String())
+	}
+	if executor.calls != 0 || executor.streamCalls != 0 {
+		t.Fatalf("executor calls = %d stream calls = %d, want none", executor.calls, executor.streamCalls)
 	}
 }
 
@@ -1053,8 +1125,10 @@ func TestOpenAIImagesGenerationsEnforcesAggregateWebResponseBudget(t *testing.T)
 	h := newImagesTestHandler(t, executor)
 	enableNAggregation := true
 	oneMegabyte := 1
+	maxN := 2
 	h.Cfg.Images.EnableNAggregation = &enableNAggregation
 	h.Cfg.Images.ChatGPTWeb.MaxImageResponseMegabytes = &oneMegabyte
+	h.Cfg.Images.ChatGPTWeb.MaxN = &maxN
 	router := gin.New()
 	router.POST("/v1/images/generations", h.Generations)
 
@@ -1927,8 +2001,10 @@ func TestOpenAIImagesStreamingEnforcesAggregateWebResponseBudget(t *testing.T) {
 	h := newImagesTestHandler(t, executor)
 	enableNAggregation := true
 	oneMegabyte := 1
+	maxN := 2
 	h.Cfg.Images.EnableNAggregation = &enableNAggregation
 	h.Cfg.Images.ChatGPTWeb.MaxImageResponseMegabytes = &oneMegabyte
+	h.Cfg.Images.ChatGPTWeb.MaxN = &maxN
 	router := gin.New()
 	router.POST("/v1/images/generations", h.Generations)
 

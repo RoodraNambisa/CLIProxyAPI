@@ -259,6 +259,21 @@ func TestParseChatGPTWebRequestReportsImageCapabilityMismatch(t *testing.T) {
 	}
 }
 
+func TestParseChatGPTWebImageRequestCount(t *testing.T) {
+	request, err := ParseChatGPTWebRequest([]byte(`{"model":"gpt-image-2","input":"draw","tools":[{"type":"image_generation","n":2}],"tool_choice":{"type":"image_generation"}}`))
+	if err != nil {
+		t.Fatalf("ParseChatGPTWebRequest() error = %v", err)
+	}
+	if request.Image == nil || request.Image.N != 2 {
+		t.Fatalf("image request = %#v, want n=2", request.Image)
+	}
+	_, err = ParseChatGPTWebRequest([]byte(`{"model":"gpt-image-2","input":"draw","tools":[{"type":"image_generation","n":1.5}],"tool_choice":{"type":"image_generation"}}`))
+	var unsupported *ChatGPTWebUnsupportedToolError
+	if !errors.As(err, &unsupported) {
+		t.Fatalf("fractional n error = %v, want unsupported tool", err)
+	}
+}
+
 func TestParseChatGPTWebRequestRejectsUnsupportedInputHistory(t *testing.T) {
 	_, err := ParseChatGPTWebRequest([]byte(`{
 		"model":"gpt-5",

@@ -169,11 +169,11 @@ type ChatGPTWebImageConfig struct {
 	UpstreamModel string `yaml:"upstream-model,omitempty" json:"upstream-model,omitempty"`
 	// IgnoreUnsupportedParams allows Web routing after dropping options that Web cannot express.
 	IgnoreUnsupportedParams bool `yaml:"ignore-unsupported-params,omitempty" json:"ignore-unsupported-params,omitempty"`
-	// AdaptSizeToAspectRatio maps explicit image sizes to ratios supported by ChatGPT Web.
+	// AdaptSizeToAspectRatio maps compatible explicit image sizes to an upstream canvas prompt.
 	AdaptSizeToAspectRatio bool `yaml:"adapt-size-to-aspect-ratio,omitempty" json:"adapt-size-to-aspect-ratio,omitempty"`
 	// StrictSize excludes ChatGPT Web when an explicit image size cannot be adapted.
 	StrictSize bool `yaml:"strict-size,omitempty" json:"strict-size,omitempty"`
-	// AspectRatioMaxErrorPercent is the maximum relative error accepted for ratio mapping.
+	// AspectRatioMaxErrorPercent is the maximum relative error accepted for generated output.
 	AspectRatioMaxErrorPercent *float64 `yaml:"aspect-ratio-max-error-percent,omitempty" json:"aspect-ratio-max-error-percent,omitempty"`
 	// MaxResizeEdgePixels limits explicit size adaptation targets.
 	MaxResizeEdgePixels *int `yaml:"max-resize-edge-pixels,omitempty" json:"max-resize-edge-pixels,omitempty"`
@@ -183,6 +183,8 @@ type ChatGPTWebImageConfig struct {
 	ResizeFilter string `yaml:"resize-filter,omitempty" json:"resize-filter,omitempty"`
 	// MaxImageResponseMegabytes limits final compressed image bytes per request.
 	MaxImageResponseMegabytes *int `yaml:"max-image-response-megabytes,omitempty" json:"max-image-response-megabytes,omitempty"`
+	// MaxN limits the number of images requested from ChatGPT Web in one logical request.
+	MaxN *int `yaml:"max-n,omitempty" json:"max-n,omitempty"`
 }
 
 const (
@@ -196,6 +198,9 @@ const (
 	DefaultChatGPTWebMaxImageResponseMegabytes  = 128
 	MinChatGPTWebMaxImageResponseMegabytes      = 1
 	MaxChatGPTWebMaxImageResponseMegabytes      = 256
+	DefaultChatGPTWebMaxN                       = 1
+	MinChatGPTWebMaxN                           = 1
+	MaxChatGPTWebMaxN                           = 10
 )
 
 // ResolvedChatGPTWebImageConfig contains effective ChatGPT Web image compatibility values.
@@ -209,6 +214,7 @@ type ResolvedChatGPTWebImageConfig struct {
 	ResizeToRequestedSize      bool
 	ResizeFilter               string
 	MaxImageResponseMegabytes  int
+	MaxN                       int
 }
 
 // ResolvedUpstreamModel returns the effective ChatGPT Web image conversation model.
@@ -231,6 +237,7 @@ func (cfg ChatGPTWebImageConfig) Resolved() ResolvedChatGPTWebImageConfig {
 		ResizeToRequestedSize:      cfg.ResizeToRequestedSize,
 		ResizeFilter:               DefaultChatGPTWebResizeFilter,
 		MaxImageResponseMegabytes:  DefaultChatGPTWebMaxImageResponseMegabytes,
+		MaxN:                       DefaultChatGPTWebMaxN,
 	}
 	if cfg.AspectRatioMaxErrorPercent != nil {
 		resolved.AspectRatioMaxErrorPercent = *cfg.AspectRatioMaxErrorPercent
@@ -243,6 +250,9 @@ func (cfg ChatGPTWebImageConfig) Resolved() ResolvedChatGPTWebImageConfig {
 	}
 	if cfg.MaxImageResponseMegabytes != nil {
 		resolved.MaxImageResponseMegabytes = *cfg.MaxImageResponseMegabytes
+	}
+	if cfg.MaxN != nil {
+		resolved.MaxN = *cfg.MaxN
 	}
 	return resolved
 }
@@ -270,6 +280,9 @@ func (cfg ChatGPTWebImageConfig) Validate() error {
 	if resolved.MaxImageResponseMegabytes < MinChatGPTWebMaxImageResponseMegabytes ||
 		resolved.MaxImageResponseMegabytes > MaxChatGPTWebMaxImageResponseMegabytes {
 		return fmt.Errorf("images.chatgpt-web.max-image-response-megabytes must be between %d and %d", MinChatGPTWebMaxImageResponseMegabytes, MaxChatGPTWebMaxImageResponseMegabytes)
+	}
+	if resolved.MaxN < MinChatGPTWebMaxN || resolved.MaxN > MaxChatGPTWebMaxN {
+		return fmt.Errorf("images.chatgpt-web.max-n must be between %d and %d", MinChatGPTWebMaxN, MaxChatGPTWebMaxN)
 	}
 	return nil
 }

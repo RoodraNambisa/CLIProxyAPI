@@ -71,12 +71,13 @@ func TestFilterChatGPTWebStrictImageSize(t *testing.T) {
 		payload       string
 		wantProviders []string
 		wantError     bool
+		wantParam     string
 	}{
 		{
 			name:          "matched keeps web",
 			providers:     []string{constant.Codex, constant.ChatGPTWeb},
 			handlerType:   constant.OpenaiResponse,
-			payload:       `{"tools":[{"type":"image_generation","size":"1920x1080"}]}`,
+			payload:       `{"tools":[{"type":"image_generation","size":"1200x800"}]}`,
 			wantProviders: []string{constant.Codex, constant.ChatGPTWeb},
 		},
 		{
@@ -87,10 +88,10 @@ func TestFilterChatGPTWebStrictImageSize(t *testing.T) {
 			wantProviders: []string{constant.ChatGPTWeb},
 		},
 		{
-			name:          "unsupported ratio excludes web",
+			name:          "unsupported native size excludes web",
 			providers:     []string{constant.Codex, constant.ChatGPTWeb},
 			handlerType:   constant.OpenaiResponse,
-			payload:       `{"tools":[{"type":"image_generation","size":"1024x1536"}]}`,
+			payload:       `{"tools":[{"type":"image_generation","size":"1024x512"}]}`,
 			wantProviders: []string{constant.Codex},
 		},
 		{
@@ -106,6 +107,15 @@ func TestFilterChatGPTWebStrictImageSize(t *testing.T) {
 			handlerType: constant.OpenaiResponse,
 			payload:     `{"tools":[{"type":"image_generation","size":"square"}]}`,
 			wantError:   true,
+			wantParam:   "size",
+		},
+		{
+			name:        "excess n web only errors",
+			providers:   []string{constant.ChatGPTWeb},
+			handlerType: constant.OpenaiResponse,
+			payload:     `{"tools":[{"type":"image_generation","n":2}]}`,
+			wantError:   true,
+			wantParam:   "n",
 		},
 		{
 			name:          "codex only is unaffected",
@@ -136,7 +146,7 @@ func TestFilterChatGPTWebStrictImageSize(t *testing.T) {
 					t.Fatalf("error = %#v, want HTTP 400", errMsg)
 				}
 				body := BuildErrorResponseBodyForMessage(errMsg.StatusCode, errMsg.Error.Error(), errMsg)
-				if got := gjson.GetBytes(body, "error.param").String(); got != "size" {
+				if got := gjson.GetBytes(body, "error.param").String(); got != test.wantParam {
 					t.Fatalf("error param = %q; body=%s", got, body)
 				}
 				if got := gjson.GetBytes(body, "error.code").String(); got != "invalid_value" {
@@ -163,7 +173,7 @@ func TestFilterChatGPTWebStrictImageSizeDisabledPreservesProviders(t *testing.T)
 		context.Background(),
 		providers,
 		constant.OpenaiResponse,
-		[]byte(`{"tools":[{"type":"image_generation","size":"1024x1536"}]}`),
+		[]byte(`{"tools":[{"type":"image_generation","size":"1024x512"}]}`),
 	)
 	if errMsg != nil || !reflect.DeepEqual(got, providers) {
 		t.Fatalf("providers, error = %#v, %#v; want unchanged", got, errMsg)
@@ -185,7 +195,7 @@ func TestResponsesStrictImageSizeRoutesInvalidWebSizeToCodex(t *testing.T) {
 			StrictSize:             true,
 		},
 	}}, manager)
-	payload := []byte(`{"model":"strict-image-size-responses-model","tools":[{"type":"image_generation","size":"1024x1536"}]}`)
+	payload := []byte(`{"model":"strict-image-size-responses-model","tools":[{"type":"image_generation","size":"1025x1024"}]}`)
 
 	if _, _, errMsg := handler.ExecuteWithProviders(
 		context.Background(),
@@ -221,6 +231,38 @@ func TestResponsesStrictImageSizeRoutesInvalidWebSizeToCodex(t *testing.T) {
 	}
 }
 
+func TestResponsesMaxNRoutesRequestToCodex(t *testing.T) {
+	const model = "chatgpt-web-max-n-responses-model"
+	manager := coreauth.NewManager(nil, nil, nil)
+	codexExecutor := &strictImageSizeRecordingExecutor{provider: constant.Codex}
+	webExecutor := &strictImageSizeRecordingExecutor{provider: constant.ChatGPTWeb}
+	manager.RegisterExecutor(codexExecutor)
+	manager.RegisterExecutor(webExecutor)
+	registerStrictImageSizeAuth(t, manager, constant.Codex, "max-n-codex", model)
+	registerStrictImageSizeAuth(t, manager, constant.ChatGPTWeb, "max-n-web", model)
+	handler := NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, manager)
+	payload := []byte(`{"model":"chatgpt-web-max-n-responses-model","tools":[{"type":"image_generation","n":2}]}`)
+
+	if _, _, errMsg := handler.ExecuteWithProviders(
+		context.Background(), []string{constant.ChatGPTWeb, constant.Codex}, constant.OpenaiResponse, model, payload, "",
+	); errMsg != nil {
+		t.Fatalf("non-stream execution error = %#v", errMsg)
+	}
+	data, _, errors := handler.ExecuteStreamWithProviders(
+		context.Background(), []string{constant.ChatGPTWeb, constant.Codex}, constant.OpenaiResponse, model, payload, "",
+	)
+	for range data {
+	}
+	for errMsg := range errors {
+		if errMsg != nil {
+			t.Fatalf("stream execution error = %#v", errMsg)
+		}
+	}
+	if codexExecutor.executeCalls != 1 || codexExecutor.streamCalls != 1 || webExecutor.executeCalls != 0 || webExecutor.streamCalls != 0 {
+		t.Fatalf("calls codex=%d/%d web=%d/%d, want 1/1 and 0/0", codexExecutor.executeCalls, codexExecutor.streamCalls, webExecutor.executeCalls, webExecutor.streamCalls)
+	}
+}
+
 func TestResponsesStrictImageSizeReturns400WithoutCompatibleAuth(t *testing.T) {
 	const model = "strict-image-size-web-only-model"
 	manager := coreauth.NewManager(nil, nil, nil)
@@ -233,7 +275,7 @@ func TestResponsesStrictImageSizeReturns400WithoutCompatibleAuth(t *testing.T) {
 			StrictSize:             true,
 		},
 	}}, manager)
-	payload := []byte(`{"model":"strict-image-size-web-only-model","tools":[{"type":"image_generation","size":"1024x1536"}]}`)
+	payload := []byte(`{"model":"strict-image-size-web-only-model","tools":[{"type":"image_generation","size":"1025x1024"}]}`)
 	providers := []string{constant.ChatGPTWeb, constant.Codex}
 
 	_, _, errMsg := handler.ExecuteWithProviders(
@@ -292,7 +334,7 @@ func TestResponsesStrictImageSizePreservesSelectedCodexErrors(t *testing.T) {
 					StrictSize:             true,
 				},
 			}}, manager)
-			payload := []byte(`{"model":"strict-image-size-codex-error-model","tools":[{"type":"image_generation","size":"1024x1536"}]}`)
+			payload := []byte(`{"model":"strict-image-size-codex-error-model","tools":[{"type":"image_generation","size":"1025x1024"}]}`)
 			providers := []string{constant.ChatGPTWeb, constant.Codex}
 
 			var errMsg *interfaces.ErrorMessage

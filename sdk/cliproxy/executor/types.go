@@ -76,6 +76,7 @@ type ChatGPTWebImageConfigSnapshot struct {
 	ResizeToRequestedSize      bool
 	ResizeFilter               string
 	MaxImageResponseBytes      int
+	MaxN                       int
 }
 
 // ImageGenerationStreamPassthroughState reports whether the selected upstream request

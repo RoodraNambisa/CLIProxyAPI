@@ -557,7 +557,7 @@ func (e *ChatGPTWebExecutor) beginChatGPTWebImage(ctx context.Context, client *c
 	if imageRequest == nil {
 		return nil, errors.New("chatgpt web image request is nil")
 	}
-	upstreamPrompt := chatGPTWebImageUpstreamPrompt(imageRequest.Prompt, prepared.imageSizeMatch)
+	upstreamPrompt := chatGPTWebImageUpstreamPrompt(imageRequest.Prompt, imageRequest.Action, prepared.imageSizeMatch)
 	imageInputs := append([]string(nil), imageRequest.Images...)
 	if strings.TrimSpace(imageRequest.MaskURL) != "" {
 		if len(imageInputs) == 0 {
@@ -616,12 +616,21 @@ func (e *ChatGPTWebExecutor) beginChatGPTWebImage(ctx context.Context, client *c
 	}, nil
 }
 
-func chatGPTWebImageUpstreamPrompt(prompt string, match *helps.ChatGPTWebImageSizeMatch) string {
+func chatGPTWebImageUpstreamPrompt(prompt, action string, match *helps.ChatGPTWebImageSizeMatch) string {
 	prompt = strings.TrimSpace(prompt)
 	if match == nil || strings.TrimSpace(match.Ratio) == "" {
 		return prompt
 	}
-	return prompt + "\n\nSet the final image aspect ratio to " + match.Ratio + "."
+	if strings.EqualFold(strings.TrimSpace(action), "edit") {
+		return prompt + "\n\n" + fmt.Sprintf(
+			"Recompose, crop, or extend the edited image so the final canvas is exactly %d×%d pixels (width × height), with an aspect ratio of %s. Preserve the subject's natural proportions; do not stretch or distort the subject. If exact pixel dimensions are unavailable, preserve the %s aspect ratio exactly.",
+			match.Width, match.Height, match.Ratio, match.Ratio,
+		)
+	}
+	return prompt + "\n\n" + fmt.Sprintf(
+		"Set the final image canvas to exactly %d×%d pixels (width × height), with an aspect ratio of %s. If exact pixel dimensions are unavailable, preserve the %s aspect ratio exactly.",
+		match.Width, match.Height, match.Ratio, match.Ratio,
+	)
 }
 
 func (e *ChatGPTWebExecutor) finishChatGPTWebImage(ctx context.Context, client *chatgptwebauth.Client, credential *chatgptwebauth.Credential, prepared *chatGPTWebPreparedRequest, execution *chatGPTWebImageExecution) ([]byte, error) {

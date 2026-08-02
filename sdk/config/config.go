@@ -54,6 +54,9 @@ const (
 	DefaultChatGPTWebMaxImageResponseMegabytes = internalconfig.DefaultChatGPTWebMaxImageResponseMegabytes
 	MinChatGPTWebMaxImageResponseMegabytes     = internalconfig.MinChatGPTWebMaxImageResponseMegabytes
 	MaxChatGPTWebMaxImageResponseMegabytes     = internalconfig.MaxChatGPTWebMaxImageResponseMegabytes
+	DefaultChatGPTWebMaxN                      = internalconfig.DefaultChatGPTWebMaxN
+	MinChatGPTWebMaxN                          = internalconfig.MinChatGPTWebMaxN
+	MaxChatGPTWebMaxN                          = internalconfig.MaxChatGPTWebMaxN
 )
 
 func LoadConfig(configFile string) (*Config, error) { return internalconfig.LoadConfig(configFile) }

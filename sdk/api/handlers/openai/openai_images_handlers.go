@@ -82,7 +82,8 @@ func (h *OpenAIImagesAPIHandler) HandlerType() string {
 }
 
 func imageResponsesProviders(req openAIImageRequest, ignoreUnsupportedParams bool, imageConfig coreexecutor.ChatGPTWebImageConfigSnapshot) []string {
-	if !chatGPTWebSupportsImageRequest(req, ignoreUnsupportedParams, imageConfig) {
+	compatibilityErr := chatGPTWebImageRequestCompatibilityError(req, ignoreUnsupportedParams, imageConfig)
+	if compatibilityErr != nil && !compatibilityErr.providerFiltered {
 		return []string{Codex}
 	}
 	return []string{Codex, ChatGPTWeb}
@@ -198,8 +199,10 @@ type imageUnsupportedError struct {
 }
 
 type chatGPTWebImageCompatibilityError struct {
-	parameter string
-	message   string
+	parameter        string
+	message          string
+	payload          []byte
+	providerFiltered bool
 }
 
 func (e *chatGPTWebImageCompatibilityError) Error() string {
@@ -317,7 +320,11 @@ func (h *OpenAIImagesAPIHandler) handleImagesRequest(c *gin.Context, req openAII
 	imageConfig := h.chatGPTWebImageConfigSnapshot()
 	compatibilityErr := chatGPTWebImageRequestCompatibilityError(req, ignoreUnsupportedImageParams, imageConfig)
 	if compatibilityErr != nil && chatGPTWebAllowedWithoutCodex(c) {
-		h.writeImagesError(c, h.imagesUnsupportedStatusCode(), chatGPTWebUnsupportedParameterError(compatibilityErr))
+		statusCode := h.imagesUnsupportedStatusCode()
+		if compatibilityErr.providerFiltered {
+			statusCode = http.StatusBadRequest
+		}
+		h.writeImagesError(c, statusCode, chatGPTWebUnsupportedParameterError(compatibilityErr))
 		return
 	}
 	codexModel := h.imagesCodexModel()
@@ -451,6 +458,7 @@ func (h *OpenAIImagesAPIHandler) handleNonStreamingImagesResponse(c *gin.Context
 			iterationImageConfig.MaxImageResponseBytes = remainingResponseBytes
 		}
 		cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
+		cliCtx = handlers.WithChatGPTWebImageRequestCount(cliCtx, count)
 		cliCtx = handlers.WithImageGenerationMaxResults(cliCtx, remaining)
 		cliCtx = handlers.WithChatGPTWebIgnoreUnsupportedImageParams(cliCtx, ignoreUnsupportedImageParams)
 		cliCtx = handlers.WithChatGPTWebImageConfigSnapshot(cliCtx, iterationImageConfig)
@@ -517,6 +525,7 @@ func (h *OpenAIImagesAPIHandler) handleStreamingImagesResponse(c *gin.Context, r
 		return
 	}
 	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
+	cliCtx = handlers.WithChatGPTWebImageRequestCount(cliCtx, count)
 	cliCtx = handlers.WithImageGenerationStreamPassthrough(cliCtx, true)
 	cliCtx = handlers.WithImageGenerationMaxResults(cliCtx, 1)
 	cliCtx = handlers.WithChatGPTWebIgnoreUnsupportedImageParams(cliCtx, ignoreUnsupportedImageParams)
@@ -626,6 +635,7 @@ func (h *OpenAIImagesAPIHandler) handleMultiStreamingImagesResponse(c *gin.Conte
 			iterationImageConfig.MaxImageResponseBytes = remainingResponseBytes
 		}
 		cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
+		cliCtx = handlers.WithChatGPTWebImageRequestCount(cliCtx, count)
 		cliCtx = handlers.WithImageGenerationStreamPassthrough(cliCtx, true)
 		cliCtx = handlers.WithImageGenerationMaxResults(cliCtx, 1)
 		cliCtx = handlers.WithChatGPTWebIgnoreUnsupportedImageParams(cliCtx, ignoreUnsupportedImageParams)
@@ -1904,18 +1914,38 @@ func imageResponseBudgetError(limit int) error {
 	return fmt.Errorf("image response exceeds %d bytes", limit)
 }
 
-func chatGPTWebSupportsImageRequest(req openAIImageRequest, ignoreUnsupportedParams bool, imageConfig coreexecutor.ChatGPTWebImageConfigSnapshot) bool {
-	return chatGPTWebImageRequestCompatibilityError(req, ignoreUnsupportedParams, imageConfig) == nil
-}
-
 func chatGPTWebImageRequestCompatibilityError(req openAIImageRequest, ignoreUnsupportedParams bool, imageConfig coreexecutor.ChatGPTWebImageConfigSnapshot) *chatGPTWebImageCompatibilityError {
+	maxN := imageConfig.MaxN
+	if maxN <= 0 {
+		maxN = sdkconfig.DefaultChatGPTWebMaxN
+	}
+	if count := imageRequestCount(req); count > maxN {
+		return &chatGPTWebImageCompatibilityError{
+			parameter:        "n",
+			message:          fmt.Sprintf("Invalid value for 'n': %d exceeds the chatgpt web image generation limit of %d.", count, maxN),
+			payload:          executorhelps.ChatGPTWebImageNErrorPayload(count, maxN),
+			providerFiltered: true,
+		}
+	}
+	size := strings.ToLower(strings.TrimSpace(req.Size))
+	if imageConfig.AdaptSizeToAspectRatio && imageConfig.StrictSize {
+		_, disposition := executorhelps.ResolveChatGPTWebImageSize(size, imageConfig.MaxResizeEdgePixels)
+		if disposition != executorhelps.ChatGPTWebImageSizeUnspecified && disposition != executorhelps.ChatGPTWebImageSizeMatched {
+			payload := executorhelps.ChatGPTWebStrictImageSizeErrorPayload(size, imageConfig.MaxResizeEdgePixels)
+			return &chatGPTWebImageCompatibilityError{
+				parameter:        "size",
+				message:          string(payload),
+				payload:          payload,
+				providerFiltered: true,
+			}
+		}
+	}
 	if !ignoreUnsupportedParams {
-		size := strings.ToLower(strings.TrimSpace(req.Size))
 		defaultSize := size == "" || size == "auto" ||
 			(size == "1024x1024" && (len(req.Images) > 0 || req.Mask != nil))
 		if imageConfig.AdaptSizeToAspectRatio {
-			_, disposition := executorhelps.ResolveChatGPTWebImageSize(size, imageConfig.MaxResizeEdgePixels, imageConfig.AspectRatioMaxErrorPercent)
-			defaultSize = imageConfig.StrictSize || disposition != executorhelps.ChatGPTWebImageSizeInvalid
+			_, disposition := executorhelps.ResolveChatGPTWebImageSize(size, imageConfig.MaxResizeEdgePixels)
+			defaultSize = disposition != executorhelps.ChatGPTWebImageSizeInvalid
 		}
 		background := strings.ToLower(strings.TrimSpace(req.Background))
 		moderation := strings.ToLower(strings.TrimSpace(req.Moderation))
@@ -2020,6 +2050,9 @@ func chatGPTWebUnsupportedParameterError(compatibilityErr *chatGPTWebImageCompat
 	message := "chatgpt web does not support this image request"
 	parameter := ""
 	if compatibilityErr != nil {
+		if len(compatibilityErr.payload) > 0 {
+			return errors.New(string(compatibilityErr.payload))
+		}
 		message = compatibilityErr.Error()
 		parameter = strings.TrimSpace(compatibilityErr.parameter)
 	}
@@ -2301,6 +2334,7 @@ func (h *OpenAIImagesAPIHandler) chatGPTWebImageConfigSnapshot() coreexecutor.Ch
 		ResizeToRequestedSize:      resolved.ResizeToRequestedSize,
 		ResizeFilter:               resolved.ResizeFilter,
 		MaxImageResponseBytes:      resolved.MaxImageResponseMegabytes << 20,
+		MaxN:                       resolved.MaxN,
 	}
 }
 

@@ -63,6 +63,7 @@ type executionSessionContextKey struct{}
 type imageGenerationStreamPassthroughContextKey struct{}
 type imageGenerationStreamPassthroughStateContextKey struct{}
 type imageGenerationMaxResultsContextKey struct{}
+type chatGPTWebImageRequestCountContextKey struct{}
 type chatGPTWebIgnoreUnsupportedImageParamsContextKey struct{}
 type chatGPTWebImageConfigSnapshotContextKey struct{}
 type chatGPTWebStrictImageSizeErrorContextKey struct{}
@@ -146,6 +147,29 @@ func imageGenerationMaxResults(ctx context.Context) int {
 		return 0
 	}
 	return maxResults
+}
+
+// WithChatGPTWebImageRequestCount preserves the logical Images API count while
+// n aggregation executes one provider request at a time.
+func WithChatGPTWebImageRequestCount(ctx context.Context, count int) context.Context {
+	if count <= 0 {
+		return ctx
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, chatGPTWebImageRequestCountContextKey{}, count)
+}
+
+func chatGPTWebImageRequestCount(ctx context.Context) int {
+	if ctx == nil {
+		return 0
+	}
+	count, _ := ctx.Value(chatGPTWebImageRequestCountContextKey{}).(int)
+	if count < 0 {
+		return 0
+	}
+	return count
 }
 
 // WithChatGPTWebIgnoreUnsupportedImageParams pins the Images compatibility
@@ -305,9 +329,6 @@ func (h *BaseAPIHandler) filterChatGPTWebStrictImageSize(
 		if h != nil && h.Cfg != nil {
 			resolved = h.Cfg.Images.ChatGPTWeb.Resolved()
 		}
-		if !resolved.StrictSize {
-			return ctx, providers, nil
-		}
 		snapshot = coreexecutor.ChatGPTWebImageConfigSnapshot{
 			AdaptSizeToAspectRatio:     resolved.AdaptSizeToAspectRatio,
 			StrictSize:                 resolved.StrictSize,
@@ -316,23 +337,31 @@ func (h *BaseAPIHandler) filterChatGPTWebStrictImageSize(
 			ResizeToRequestedSize:      resolved.ResizeToRequestedSize,
 			ResizeFilter:               resolved.ResizeFilter,
 			MaxImageResponseBytes:      resolved.MaxImageResponseMegabytes << 20,
+			MaxN:                       resolved.MaxN,
 		}
 		ctx = WithChatGPTWebImageConfigSnapshot(ctx, snapshot)
 	}
-	if !snapshot.StrictSize {
-		return ctx, providers, nil
-	}
-
-	size, hasImageTool := executorhelps.ChatGPTWebImageSizeFromResponsesPayload(rawJSON)
+	size, requestCount, hasImageTool := executorhelps.ChatGPTWebImageControlsFromResponsesPayload(rawJSON)
 	if !hasImageTool {
 		return ctx, providers, nil
 	}
-	_, disposition := executorhelps.ResolveChatGPTWebImageSize(
-		size,
-		snapshot.MaxResizeEdgePixels,
-		snapshot.AspectRatioMaxErrorPercent,
-	)
-	if disposition == executorhelps.ChatGPTWebImageSizeUnspecified || disposition == executorhelps.ChatGPTWebImageSizeMatched {
+	if count := chatGPTWebImageRequestCount(ctx); count > 0 {
+		requestCount = count
+	}
+	maxN := snapshot.MaxN
+	if maxN <= 0 {
+		maxN = config.DefaultChatGPTWebMaxN
+	}
+	var payload []byte
+	if requestCount > maxN {
+		payload = executorhelps.ChatGPTWebImageNErrorPayload(requestCount, maxN)
+	} else if snapshot.StrictSize {
+		_, disposition := executorhelps.ResolveChatGPTWebImageSize(size, snapshot.MaxResizeEdgePixels)
+		if disposition != executorhelps.ChatGPTWebImageSizeUnspecified && disposition != executorhelps.ChatGPTWebImageSizeMatched {
+			payload = executorhelps.ChatGPTWebStrictImageSizeErrorPayload(size, snapshot.MaxResizeEdgePixels)
+		}
+	}
+	if len(payload) == 0 {
 		return ctx, providers, nil
 	}
 
@@ -341,20 +370,12 @@ func (h *BaseAPIHandler) filterChatGPTWebStrictImageSize(
 		return context.WithValue(
 			ctx,
 			chatGPTWebStrictImageSizeErrorContextKey{},
-			executorhelps.ChatGPTWebStrictImageSizeErrorPayload(
-				size,
-				snapshot.MaxResizeEdgePixels,
-				snapshot.AspectRatioMaxErrorPercent,
-			),
+			payload,
 		), filtered, nil
 	}
 	return ctx, nil, &interfaces.ErrorMessage{
 		StatusCode: http.StatusBadRequest,
-		Error: errors.New(string(executorhelps.ChatGPTWebStrictImageSizeErrorPayload(
-			size,
-			snapshot.MaxResizeEdgePixels,
-			snapshot.AspectRatioMaxErrorPercent,
-		))),
+		Error:      errors.New(string(payload)),
 	}
 }
 
