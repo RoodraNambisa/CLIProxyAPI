@@ -45,6 +45,10 @@ type chatGPTWebAccountInfoAutomaticRefreshTrigger interface {
 	TriggerAutomaticAccountInfoRefresh(string) bool
 }
 
+type chatGPTWebAccountInfoQuotaEvidenceRefreshTrigger interface {
+	TriggerImageQuotaEvidenceAccountInfoRefresh(string, string) bool
+}
+
 type chatGPTWebImageQuotaExhaustedError struct {
 	resetAt        time.Time
 	now            time.Time
@@ -214,16 +218,16 @@ func chatGPTWebImageModelIDs(registeredModels []*registry.ModelInfo) []string {
 	return models
 }
 
-func projectChatGPTWebImageSuccess(auth *Auth, count int64, imageModels []string, now time.Time) []string {
+func projectChatGPTWebImageSuccess(auth *Auth, count int64, imageModels []string, now time.Time) ([]string, bool) {
 	if auth == nil ||
 		count <= 0 ||
 		!strings.EqualFold(strings.TrimSpace(auth.Provider), chatgptwebauth.Provider) ||
 		auth.Metadata == nil {
-		return nil
+		return nil, false
 	}
 	remaining := metadataInt(auth.Metadata["image_quota_remaining"])
 	if remaining == nil {
-		return nil
+		return nil, false
 	}
 	nextRemaining := int64(*remaining)
 	if nextRemaining < count {
@@ -234,9 +238,9 @@ func projectChatGPTWebImageSuccess(auth *Auth, count int64, imageModels []string
 	auth.Metadata["image_quota_remaining"] = int(nextRemaining)
 	if nextRemaining > 0 {
 		auth.Metadata["quota_state"] = string(chatgptwebauth.QuotaStateAvailable)
-		return nil
+		return nil, false
 	}
-	return projectChatGPTWebImageQuotaExhausted(auth, imageModels, now)
+	return projectChatGPTWebImageQuotaExhausted(auth, imageModels, now), *remaining > 0
 }
 
 func projectChatGPTWebImageQuotaExhausted(auth *Auth, imageModels []string, now time.Time) []string {
@@ -831,6 +835,21 @@ func (m *Manager) triggerChatGPTWebAccountInfoRefresh(authIDs []string) {
 	for _, authID := range authIDs {
 		trigger.TriggerAutomaticAccountInfoRefresh(authID)
 	}
+}
+
+func (m *Manager) triggerChatGPTWebImageQuotaEvidenceRefresh(authID, authInstanceID string) {
+	if m == nil || strings.TrimSpace(authID) == "" || strings.TrimSpace(authInstanceID) == "" {
+		return
+	}
+	registered, ok := m.Executor(chatgptwebauth.Provider)
+	if !ok || registered == nil {
+		return
+	}
+	trigger, ok := registered.(chatGPTWebAccountInfoQuotaEvidenceRefreshTrigger)
+	if !ok {
+		return
+	}
+	trigger.TriggerImageQuotaEvidenceAccountInfoRefresh(authID, authInstanceID)
 }
 
 func (m *Manager) chatGPTWebAccountInfoRuntimeStateReader() chatGPTWebAccountInfoRuntimeStateReader {

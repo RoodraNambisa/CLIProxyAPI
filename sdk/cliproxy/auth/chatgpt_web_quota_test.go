@@ -340,10 +340,41 @@ type chatGPTWebImageSuccessProjectionExecutor struct {
 	markImageSuccess         bool
 	imageSuccessCount        int
 	confirmExhaustedInFlight bool
+	quotaEvidenceMu          sync.Mutex
+	quotaEvidenceTargets     []chatGPTWebQuotaEvidenceRefreshTarget
+	onQuotaEvidenceRefresh   func(string, string) bool
+}
+
+type chatGPTWebQuotaEvidenceRefreshTarget struct {
+	authID         string
+	authInstanceID string
 }
 
 func (*chatGPTWebImageSuccessProjectionExecutor) Identifier() string {
 	return chatgptwebauth.Provider
+}
+
+func (executor *chatGPTWebImageSuccessProjectionExecutor) TriggerImageQuotaEvidenceAccountInfoRefresh(
+	authID string,
+	authInstanceID string,
+) bool {
+	executor.quotaEvidenceMu.Lock()
+	executor.quotaEvidenceTargets = append(executor.quotaEvidenceTargets, chatGPTWebQuotaEvidenceRefreshTarget{
+		authID:         authID,
+		authInstanceID: authInstanceID,
+	})
+	callback := executor.onQuotaEvidenceRefresh
+	executor.quotaEvidenceMu.Unlock()
+	if callback != nil {
+		return callback(authID, authInstanceID)
+	}
+	return true
+}
+
+func (executor *chatGPTWebImageSuccessProjectionExecutor) quotaEvidenceRefreshes() []chatGPTWebQuotaEvidenceRefreshTarget {
+	executor.quotaEvidenceMu.Lock()
+	defer executor.quotaEvidenceMu.Unlock()
+	return append([]chatGPTWebQuotaEvidenceRefreshTarget(nil), executor.quotaEvidenceTargets...)
 }
 
 func (executor *chatGPTWebImageSuccessProjectionExecutor) recordImageResult(
@@ -2967,11 +2998,12 @@ func TestManagerProjectsCompatibilityImageSuccessIntoKnownQuota(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			manager := NewManager(nil, &FillFirstSelector{}, nil)
 			manager.SetRetryConfig(0, 0, 0)
-			manager.RegisterExecutor(&chatGPTWebImageSuccessProjectionExecutor{
+			executor := &chatGPTWebImageSuccessProjectionExecutor{
 				manager:           manager,
 				markImageSuccess:  true,
 				imageSuccessCount: 1,
-			})
+			}
+			manager.RegisterExecutor(executor)
 			authID := "compat-image-count-" + uuid.NewString()
 			executionModel := "compat-image-text-" + uuid.NewString()
 			registerQuotaTestAuthForModels(t, manager, &Auth{
@@ -3033,6 +3065,9 @@ func TestManagerProjectsCompatibilityImageSuccessIntoKnownQuota(t *testing.T) {
 			}
 			if got := metadataString(current.Metadata["quota_state"]); got != string(chatgptwebauth.QuotaStateAvailable) {
 				t.Fatalf("quota_state = %q, want available", got)
+			}
+			if refreshes := executor.quotaEvidenceRefreshes(); len(refreshes) != 0 {
+				t.Fatalf("quota evidence refreshes = %+v, want none", refreshes)
 			}
 		})
 	}
@@ -3101,6 +3136,9 @@ func TestManagerProjectsSuccessfulImageCountIntoKnownQuota(t *testing.T) {
 	if results := hook.Results(); len(results) != 1 {
 		t.Fatalf("hook results = %d, want one success result", len(results))
 	}
+	if refreshes := executor.quotaEvidenceRefreshes(); len(refreshes) != 0 {
+		t.Fatalf("quota evidence refreshes = %+v, want none", refreshes)
+	}
 }
 
 func TestManagerSuccessfulImageCountExhaustsOnlyImageCapability(t *testing.T) {
@@ -3110,6 +3148,21 @@ func TestManagerSuccessfulImageCountExhaustsOnlyImageCapability(t *testing.T) {
 		manager:           manager,
 		markImageSuccess:  true,
 		imageSuccessCount: 2,
+	}
+	executor.onQuotaEvidenceRefresh = func(authID, _ string) bool {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		unlock, errLock := manager.lockAuthIDMutationContext(ctx, authID)
+		if errLock != nil {
+			t.Errorf("quota evidence refresh ran while auth mutation lock was held: %v", errLock)
+			return false
+		}
+		unlock()
+		if _, ok := manager.GetByID(authID); !ok {
+			t.Errorf("quota evidence refresh could not re-enter manager for %q", authID)
+			return false
+		}
+		return true
 	}
 	manager.RegisterExecutor(executor)
 	authID := "image-count-exhausted-" + uuid.NewString()
@@ -3171,16 +3224,73 @@ func TestManagerSuccessfulImageCountExhaustsOnlyImageCapability(t *testing.T) {
 	if count := registry.GetGlobalRegistry().GetModelCount(textModel); count != 1 {
 		t.Fatalf("text model available clients = %d, want 1", count)
 	}
+	refreshes := executor.quotaEvidenceRefreshes()
+	if len(refreshes) != 1 || refreshes[0].authID != authID ||
+		refreshes[0].authInstanceID != current.RuntimeInstanceID() {
+		t.Fatalf("quota evidence refreshes = %+v, want current instance %q", refreshes, current.RuntimeInstanceID())
+	}
+}
+
+func TestManagerSuccessfulStreamImageCountTriggersQuotaEvidenceRefresh(t *testing.T) {
+	manager := NewManager(nil, &FillFirstSelector{}, nil)
+	manager.SetRetryConfig(0, 0, 0)
+	executor := &chatGPTWebImageSuccessProjectionExecutor{
+		manager:           manager,
+		markImageSuccess:  true,
+		imageSuccessCount: 1,
+	}
+	manager.RegisterExecutor(executor)
+	authID := "image-count-stream-exhausted-" + uuid.NewString()
+	textModel := "image-count-stream-text-" + uuid.NewString()
+	registerQuotaTestAuthForModels(t, manager, &Auth{
+		ID:       authID,
+		Provider: chatgptwebauth.Provider,
+		Status:   StatusActive,
+		Metadata: map[string]any{
+			"lifecycle_state":       LifecycleStateActive,
+			"quota_state":           string(chatgptwebauth.QuotaStateAvailable),
+			"image_quota_remaining": 1,
+		},
+	}, textModel, chatgptwebauth.ImageModel)
+
+	result, errExecute := manager.ExecuteStream(
+		context.Background(),
+		[]string{chatgptwebauth.Provider},
+		cliproxyexecutor.Request{Model: textModel, Payload: imageToolFallbackPayload(textModel)},
+		cliproxyexecutor.Options{},
+	)
+	if errExecute != nil {
+		t.Fatalf("ExecuteStream() error = %v", errExecute)
+	}
+	for chunk := range result.Chunks {
+		if chunk.Err != nil {
+			t.Fatalf("stream chunk error = %v", chunk.Err)
+		}
+	}
+
+	current, ok := manager.GetByID(authID)
+	if !ok || current == nil {
+		t.Fatal("auth disappeared")
+	}
+	if got := metadataInt(current.Metadata["image_quota_remaining"]); got == nil || *got != 0 {
+		t.Fatalf("image_quota_remaining = %#v, want 0", got)
+	}
+	refreshes := executor.quotaEvidenceRefreshes()
+	if len(refreshes) != 1 || refreshes[0].authID != authID ||
+		refreshes[0].authInstanceID != current.RuntimeInstanceID() {
+		t.Fatalf("quota evidence refreshes = %+v, want current instance %q", refreshes, current.RuntimeInstanceID())
+	}
 }
 
 func TestManagerSuccessfulImageCountDoesNotInventUnknownQuota(t *testing.T) {
 	manager := NewManager(nil, &FillFirstSelector{}, nil)
 	manager.SetRetryConfig(0, 0, 0)
-	manager.RegisterExecutor(&chatGPTWebImageSuccessProjectionExecutor{
+	executor := &chatGPTWebImageSuccessProjectionExecutor{
 		manager:           manager,
 		markImageSuccess:  true,
 		imageSuccessCount: 2,
-	})
+	}
+	manager.RegisterExecutor(executor)
 	authID := "image-count-unknown-" + uuid.NewString()
 	textModel := "image-count-unknown-text-" + uuid.NewString()
 	registerQuotaTestAuthForModels(t, manager, &Auth{
@@ -3208,10 +3318,15 @@ func TestManagerSuccessfulImageCountDoesNotInventUnknownQuota(t *testing.T) {
 	if got := metadataString(current.Metadata["quota_state"]); got != string(chatgptwebauth.QuotaStateUnknown) {
 		t.Fatalf("quota_state = %q, want unknown", got)
 	}
+	if refreshes := executor.quotaEvidenceRefreshes(); len(refreshes) != 0 {
+		t.Fatalf("quota evidence refreshes = %+v, want none", refreshes)
+	}
 }
 
 func TestManagerDiscardsSuccessfulImageCountFromReplacedInstance(t *testing.T) {
 	manager := NewManager(nil, &FillFirstSelector{}, nil)
+	executor := &chatGPTWebImageSuccessProjectionExecutor{manager: manager}
+	manager.RegisterExecutor(executor)
 	authID := "image-count-stale-" + uuid.NewString()
 	if _, errRegister := manager.Register(context.Background(), &Auth{
 		ID:       authID,
@@ -3240,6 +3355,9 @@ func TestManagerDiscardsSuccessfulImageCountFromReplacedInstance(t *testing.T) {
 	current, _ := manager.GetByID(authID)
 	if got := metadataInt(current.Metadata["image_quota_remaining"]); got == nil || *got != 5 {
 		t.Fatalf("replacement image_quota_remaining = %#v, want 5", got)
+	}
+	if refreshes := executor.quotaEvidenceRefreshes(); len(refreshes) != 0 {
+		t.Fatalf("quota evidence refreshes = %+v, want none for replaced instance", refreshes)
 	}
 }
 
@@ -3299,6 +3417,9 @@ func TestImageToolSuccessDoesNotOverrideConcurrentExhaustedQuota(t *testing.T) {
 			if imageState == nil || !imageState.Quota.Exceeded ||
 				imageState.Quota.Reason != "chatgpt_web_image_quota" {
 				t.Fatalf("success cleared the remote quota model state: %+v", imageState)
+			}
+			if refreshes := executor.quotaEvidenceRefreshes(); len(refreshes) != 0 {
+				t.Fatalf("quota evidence refreshes = %+v, want none for already exhausted quota", refreshes)
 			}
 		})
 	}

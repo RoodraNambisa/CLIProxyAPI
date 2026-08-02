@@ -132,6 +132,9 @@ func TestChatGPTWebAccountInfoAutoRefreshDisabledKeepsManualRefresh(t *testing.T
 	if runtime.triggerImageQuotaEvidenceRecheck(target.AuthID) {
 		t.Fatal("explicit image quota trigger was accepted while disabled")
 	}
+	if runtime.triggerImageQuotaEvidenceRecheckForInstance(target.AuthID, "instance-a") {
+		t.Fatal("instance-bound image quota trigger was accepted while disabled")
+	}
 	if runtime.triggerAmbiguousImageRecheck(target.AuthID) {
 		t.Fatal("ambiguous image recheck was accepted while disabled")
 	}
@@ -175,6 +178,46 @@ func TestChatGPTWebAmbiguousImageRecheckUsesPerCredentialCooldown(t *testing.T) 
 
 	if !runtime.triggerAutomaticRecheck("web-a.json") {
 		t.Fatal("explicit quota recheck was blocked by ambiguous-error cooldown")
+	}
+}
+
+func TestChatGPTWebImageQuotaEvidenceRecheckRejectsReplacedInstance(t *testing.T) {
+	manager := cliproxyauth.NewManager(nil, nil, nil)
+	auth := chatGPTWebTestAuth("quota-evidence-instance")
+	installed, errRegister := manager.Register(cliproxyauth.WithSkipPersist(context.Background()), auth)
+	if errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+	oldInstanceID := installed.RuntimeInstanceID()
+
+	replacementCandidate := installed.Clone()
+	replacementCandidate.Metadata["access_token"] = "replacement-access-token"
+	replacement, current, errUpdate := manager.UpdateIfCurrent(
+		cliproxyauth.WithForceRuntimeReplacement(cliproxyauth.WithSkipPersist(context.Background())),
+		installed,
+		replacementCandidate,
+	)
+	if errUpdate != nil || !current || replacement == nil || replacement.RuntimeInstanceID() == oldInstanceID {
+		t.Fatalf("replace auth = (%+v, current=%v, err=%v)", replacement, current, errUpdate)
+	}
+
+	executor := &ChatGPTWebExecutor{manager: manager}
+	runtime := newChatGPTWebAccountInfoRuntime(executor, &config.Config{})
+	executor.accountInfo = runtime
+	t.Cleanup(runtime.close)
+
+	if executor.TriggerImageQuotaEvidenceAccountInfoRefresh(auth.ID, oldInstanceID) {
+		t.Fatal("quota evidence refresh accepted the replaced runtime instance")
+	}
+	if !executor.TriggerImageQuotaEvidenceAccountInfoRefresh(auth.ID, replacement.RuntimeInstanceID()) {
+		t.Fatal("quota evidence refresh rejected the current runtime instance")
+	}
+	runtime.mu.Lock()
+	defer runtime.mu.Unlock()
+	queued := runtime.queuedWorkLocked()
+	if len(queued) != 1 || !queued[0].force ||
+		queued[0].target.AuthInstanceID != replacement.RuntimeInstanceID() {
+		t.Fatalf("queued quota evidence refresh = %+v", queued)
 	}
 }
 
@@ -1928,6 +1971,83 @@ func TestChatGPTWebAccountInfoForceTriggerPromotesScheduledAndInflightWork(t *te
 	if runtime.pendingTriggers["running"] != chatGPTWebAccountInfoTriggerNone || len(runtime.queue) != 1 ||
 		runtime.queue[0].target.AuthID != "running" || !runtime.queue[0].force {
 		t.Fatalf("pending forced follow-up = pending:%v queue:%+v", runtime.pendingTriggers, runtime.queue)
+	}
+}
+
+func TestChatGPTWebImageQuotaEvidenceRecheckReusesInstanceWork(t *testing.T) {
+	now := time.Now().UTC()
+	runtime := newChatGPTWebAccountInfoRuntime(&ChatGPTWebExecutor{}, &config.Config{
+		ChatGPTWeb: config.ChatGPTWebConfig{AccountInfo: config.ChatGPTWebAccountInfoConfig{
+			RecoveryJitterSeconds: accountInfoTestInt(0),
+		}},
+	})
+	runtime.now = func() time.Time { return now }
+	t.Cleanup(runtime.close)
+
+	scheduledTarget := chatgptwebauth.AccountInfoRefreshTarget{
+		Name:           "scheduled.json",
+		AuthID:         "scheduled",
+		AuthInstanceID: "scheduled-instance",
+	}
+	resetAt := now.Add(time.Hour)
+	runtime.mu.Lock()
+	if !runtime.scheduleRecoveryForTargetLocked(scheduledTarget, resetAt) {
+		runtime.mu.Unlock()
+		t.Fatal("failed to schedule recovery")
+	}
+	runtime.mu.Unlock()
+	if !runtime.triggerImageQuotaEvidenceRecheckForInstance(scheduledTarget.AuthID, scheduledTarget.AuthInstanceID) {
+		t.Fatal("quota evidence trigger did not reuse scheduled recovery")
+	}
+	runtime.mu.Lock()
+	scheduled := runtime.scheduled["recovery:"+chatGPTWebAccountInfoTargetKey(scheduledTarget)]
+	runtime.mu.Unlock()
+	if scheduled == nil || !scheduled.work.force || !scheduled.due.Equal(now) {
+		t.Fatalf("promoted recovery = %+v, want forced work due now", scheduled)
+	}
+
+	queuedTarget := chatgptwebauth.AccountInfoRefreshTarget{
+		Name:           "queued.json",
+		AuthID:         "queued",
+		AuthInstanceID: "queued-instance",
+	}
+	runtime.mu.Lock()
+	enqueued, _ := runtime.enqueueForCurrentInstanceLocked(chatGPTWebAccountInfoWork{target: queuedTarget, attempt: 1})
+	runtime.mu.Unlock()
+	if !enqueued || !runtime.triggerImageQuotaEvidenceRecheckForInstance(queuedTarget.AuthID, queuedTarget.AuthInstanceID) {
+		t.Fatal("quota evidence trigger did not reuse queued work")
+	}
+	runtime.mu.Lock()
+	queued := runtime.queuedWorkLocked()
+	var queuedForce bool
+	for index := range queued {
+		if chatGPTWebAccountInfoTargetKey(queued[index].target) == chatGPTWebAccountInfoTargetKey(queuedTarget) {
+			queuedForce = queued[index].force
+		}
+	}
+	runtime.mu.Unlock()
+	if !queuedForce {
+		t.Fatal("quota evidence trigger did not upgrade queued work to force")
+	}
+
+	inflightTarget := chatgptwebauth.AccountInfoRefreshTarget{
+		Name:           "inflight.json",
+		AuthID:         "inflight",
+		AuthInstanceID: "inflight-instance",
+	}
+	inflightKey := chatGPTWebAccountInfoTargetKey(inflightTarget)
+	runtime.mu.Lock()
+	runtime.authInstances[inflightTarget.AuthID] = inflightTarget.AuthInstanceID
+	runtime.inflight[inflightKey] = 1
+	runtime.mu.Unlock()
+	if !runtime.triggerImageQuotaEvidenceRecheckForInstance(inflightTarget.AuthID, inflightTarget.AuthInstanceID) {
+		t.Fatal("quota evidence trigger did not reuse in-flight work")
+	}
+	runtime.mu.Lock()
+	pending := runtime.pendingTriggers[inflightKey]
+	runtime.mu.Unlock()
+	if pending != chatGPTWebAccountInfoTriggerNone {
+		t.Fatalf("in-flight quota evidence trigger queued duplicate mode %v", pending)
 	}
 }
 

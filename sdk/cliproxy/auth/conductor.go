@@ -6804,6 +6804,7 @@ func (m *Manager) markResult(
 	setModelQuota := false
 	var additionalSuccessModelsApplied []string
 	var imageQuotaSuspendModels []string
+	imageQuotaEvidenceRefresh := false
 	var (
 		authSnapshot *Auth
 		persistAuth  *Auth
@@ -6819,7 +6820,9 @@ func (m *Manager) markResult(
 			return
 		}
 		if result.Success && imageSuccessCount > 0 {
-			imageQuotaSuspendModels = projectChatGPTWebImageSuccess(auth, imageSuccessCount, imageSuccessModels, now)
+			var newlyExhausted bool
+			imageQuotaSuspendModels, newlyExhausted = projectChatGPTWebImageSuccess(auth, imageSuccessCount, imageSuccessModels, now)
+			imageQuotaEvidenceRefresh = imageQuotaEvidenceRefresh || newlyExhausted
 		}
 		persistAuth = auth
 	}
@@ -7116,6 +7119,9 @@ func (m *Manager) markResult(
 		stillCurrent = current != nil && current.instanceID == authInstanceID && !m.sessionCleanupPendingLocked(result.AuthID)
 		m.mu.RUnlock()
 		if stillCurrent {
+			if imageQuotaEvidenceRefresh {
+				m.triggerChatGPTWebImageQuotaEvidenceRefresh(result.AuthID, authInstanceID)
+			}
 			m.Hook().OnResult(ctx, result)
 		}
 		return
@@ -7124,6 +7130,9 @@ func (m *Manager) markResult(
 	applyRegistryResult()
 	unlockResultMutation()
 	if acceptedResult {
+		if imageQuotaEvidenceRefresh {
+			m.triggerChatGPTWebImageQuotaEvidenceRefresh(result.AuthID, authInstanceID)
+		}
 		m.Hook().OnResult(ctx, result)
 	}
 }

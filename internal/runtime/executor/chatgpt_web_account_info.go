@@ -2865,12 +2865,20 @@ func (runtime *chatGPTWebAccountInfoRuntime) triggerAutomaticRecheck(authID stri
 }
 
 func (runtime *chatGPTWebAccountInfoRuntime) triggerImageQuotaEvidenceRecheck(authID string) bool {
+	return runtime.triggerImageQuotaEvidenceRecheckForInstance(authID, "")
+}
+
+func (runtime *chatGPTWebAccountInfoRuntime) triggerImageQuotaEvidenceRecheckForInstance(
+	authID string,
+	authInstanceID string,
+) bool {
 	if runtime == nil || strings.TrimSpace(authID) == "" {
 		return false
 	}
 	target, current := runtime.resolveCurrentTarget(chatgptwebauth.AccountInfoRefreshTarget{
-		Name:   strings.TrimSpace(authID),
-		AuthID: strings.TrimSpace(authID),
+		Name:           strings.TrimSpace(authID),
+		AuthID:         strings.TrimSpace(authID),
+		AuthInstanceID: strings.TrimSpace(authInstanceID),
 	})
 	if !current {
 		return false
@@ -3184,7 +3192,13 @@ func (e *ChatGPTWebExecutor) TriggerAutomaticAccountInfoRefresh(authID string) b
 }
 
 func (e *ChatGPTWebExecutor) triggerImageQuotaEvidenceAccountInfoRefresh(authID string) bool {
-	return e != nil && e.accountInfo != nil && e.accountInfo.triggerImageQuotaEvidenceRecheck(authID)
+	return e.TriggerImageQuotaEvidenceAccountInfoRefresh(authID, "")
+}
+
+// TriggerImageQuotaEvidenceAccountInfoRefresh schedules an authoritative quota recheck scoped to the supplied instance when present.
+func (e *ChatGPTWebExecutor) TriggerImageQuotaEvidenceAccountInfoRefresh(authID, authInstanceID string) bool {
+	return e != nil && e.accountInfo != nil &&
+		e.accountInfo.triggerImageQuotaEvidenceRecheckForInstance(authID, authInstanceID)
 }
 
 func (e *ChatGPTWebExecutor) triggerAmbiguousImageAccountInfoRefresh(authID string) bool {
