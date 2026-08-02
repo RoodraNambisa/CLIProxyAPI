@@ -6896,6 +6896,9 @@ func (m *Manager) markResult(
 				clearAuthStateOnSuccess(auth, now)
 			}
 		} else {
+			if chatGPTWebImageQuotaResult {
+				imageQuotaSuspendModels = projectChatGPTWebImageQuotaExhausted(auth, registeredImageModels, now)
+			}
 			if result.Model != "" {
 				if authWideDynamicCooldown {
 					skipCooling := !hasDynamicFixedCooldown && m.cooldownSkippedForStatus(resultStatusCode)

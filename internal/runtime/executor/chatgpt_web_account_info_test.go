@@ -129,6 +129,79 @@ func TestChatGPTWebAccountInfoAutoRefreshDisabledKeepsManualRefresh(t *testing.T
 	if runtime.triggerAutomaticRecheck(target.AuthID) {
 		t.Fatal("automatic trigger was accepted while disabled")
 	}
+	if runtime.triggerAmbiguousImageRecheck(target.AuthID) {
+		t.Fatal("ambiguous image recheck was accepted while disabled")
+	}
+}
+
+func TestChatGPTWebAmbiguousImageRecheckUsesPerCredentialCooldown(t *testing.T) {
+	now := time.Now().UTC()
+	runtime := newChatGPTWebAccountInfoRuntime(&ChatGPTWebExecutor{}, &config.Config{})
+	runtime.now = func() time.Time { return now }
+	t.Cleanup(runtime.close)
+
+	drainQueue := func() {
+		runtime.mu.Lock()
+		defer runtime.mu.Unlock()
+		for {
+			work, ok := runtime.dequeueLocked()
+			if !ok {
+				return
+			}
+			runtime.releaseWorkEpochLocked(work)
+		}
+	}
+
+	if !runtime.triggerAmbiguousImageRecheck("web-a.json") {
+		t.Fatal("first ambiguous image recheck was rejected")
+	}
+	drainQueue()
+	if runtime.triggerAmbiguousImageRecheck("web-a.json") {
+		t.Fatal("ambiguous image recheck bypassed its cooldown")
+	}
+	if !runtime.triggerAmbiguousImageRecheck("web-b.json") {
+		t.Fatal("cooldown from another credential blocked recheck")
+	}
+	drainQueue()
+
+	now = now.Add(chatGPTWebAmbiguousImageRecheckCooldown)
+	if !runtime.triggerAmbiguousImageRecheck("web-a.json") {
+		t.Fatal("ambiguous image recheck remained blocked after cooldown")
+	}
+	drainQueue()
+
+	if !runtime.triggerAutomaticRecheck("web-a.json") {
+		t.Fatal("explicit quota recheck was blocked by ambiguous-error cooldown")
+	}
+}
+
+func TestChatGPTWebAmbiguousImageRecheckConcurrentTriggersOnlyOnce(t *testing.T) {
+	now := time.Now().UTC()
+	runtime := newChatGPTWebAccountInfoRuntime(&ChatGPTWebExecutor{}, &config.Config{})
+	runtime.now = func() time.Time { return now }
+	t.Cleanup(runtime.close)
+
+	var accepted atomic.Int32
+	var wait sync.WaitGroup
+	for index := 0; index < 32; index++ {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			if runtime.triggerAmbiguousImageRecheck("web-concurrent.json") {
+				accepted.Add(1)
+			}
+		}()
+	}
+	wait.Wait()
+	if got := accepted.Load(); got != 1 {
+		t.Fatalf("accepted ambiguous image rechecks = %d, want 1", got)
+	}
+	runtime.mu.Lock()
+	queued := runtime.queueLengthLocked()
+	runtime.mu.Unlock()
+	if queued != 1 {
+		t.Fatalf("queued ambiguous image rechecks = %d, want 1", queued)
+	}
 }
 
 func TestChatGPTWebAccountInfoDisableClearsQueuedAutomaticWork(t *testing.T) {
@@ -1319,6 +1392,7 @@ func TestChatGPTWebAccountInfoCloseReleasesRuntimeIndexes(t *testing.T) {
 	runtime.tasks["task"] = &chatGPTWebAccountInfoTaskState{}
 	runtime.states["auth"] = chatgptwebauth.AccountInfoAuthRuntimeState{Refreshing: true}
 	runtime.pendingTriggers["auth"] = chatGPTWebAccountInfoTriggerForce
+	runtime.ambiguousImageRecheckAfter["auth"] = time.Now().Add(time.Minute)
 	runtime.scheduled["retry:auth"] = &chatGPTWebAccountInfoSchedule{}
 	runtime.scheduledByTarget["auth"] = map[string]*chatGPTWebAccountInfoSchedule{
 		"retry:auth": runtime.scheduled["retry:auth"],
@@ -1330,12 +1404,14 @@ func TestChatGPTWebAccountInfoCloseReleasesRuntimeIndexes(t *testing.T) {
 	runtime.mu.Lock()
 	defer runtime.mu.Unlock()
 	if len(runtime.tasks) != 0 || len(runtime.states) != 0 || len(runtime.pendingTriggers) != 0 ||
+		len(runtime.ambiguousImageRecheckAfter) != 0 ||
 		len(runtime.scheduled) != 0 || len(runtime.scheduledByTarget) != 0 || len(runtime.calls) != 0 {
 		t.Fatalf(
-			"runtime indexes after close: tasks=%d states=%d pending=%d scheduled=%d reverse=%d calls=%d",
+			"runtime indexes after close: tasks=%d states=%d pending=%d ambiguous=%d scheduled=%d reverse=%d calls=%d",
 			len(runtime.tasks),
 			len(runtime.states),
 			len(runtime.pendingTriggers),
+			len(runtime.ambiguousImageRecheckAfter),
 			len(runtime.scheduled),
 			len(runtime.scheduledByTarget),
 			len(runtime.calls),
@@ -4263,7 +4339,22 @@ func TestChatGPTWebAccountInfoCookiePersistenceMergesConcurrentChanges(t *testin
 	}
 }
 
-func TestChatGPTWebAccountInfoDoesNotOverwriteConcurrentImageQuotaResult(t *testing.T) {
+func TestChatGPTWebImageQuotaObservationDetectsLaterRemainingProjection(t *testing.T) {
+	auth := chatGPTWebTestAuth("account-info-quota-observation")
+	auth.Metadata["image_quota_remaining"] = 3
+	auth.Metadata["quota_state"] = string(chatgptwebauth.QuotaStateAvailable)
+	auth.Metadata["quota_updated_at"] = time.Now().UTC().Add(-time.Minute).Format(time.RFC3339Nano)
+	observation := captureChatGPTWebImageQuotaObservation(auth)
+	if !observation.matches(auth) {
+		t.Fatal("unchanged quota observation did not match")
+	}
+	auth.Metadata["image_quota_remaining"] = 2
+	if observation.matches(auth) {
+		t.Fatal("later projected image success was not detected")
+	}
+}
+
+func TestChatGPTWebAccountInfoAuthoritativeQuotaOverridesEarlierImageQuotaResult(t *testing.T) {
 	manager := cliproxyauth.NewManager(nil, nil, nil)
 	auth := chatGPTWebTestAuth("account-info-stale-quota")
 	auth.Metadata["account_id"] = "account-1"
@@ -4328,9 +4419,8 @@ func TestChatGPTWebAccountInfoDoesNotOverwriteConcurrentImageQuotaResult(t *test
 	executor.runtimeBaseURL = server.URL
 
 	outcome := executor.refreshChatGPTWebAccountInfo(context.Background(), auth.ID, true)
-	if outcome.status != chatgptwebauth.AccountInfoResultFailed ||
-		outcome.errorCode != "stale_quota_observation" ||
-		!outcome.retryable {
+	if outcome.status != chatgptwebauth.AccountInfoResultUpdated ||
+		outcome.errorCode != "" || outcome.retryable {
 		t.Fatalf("account info outcome = %+v", outcome)
 	}
 	current, ok := manager.GetByID(auth.ID)
@@ -4344,15 +4434,14 @@ func TestChatGPTWebAccountInfoDoesNotOverwriteConcurrentImageQuotaResult(t *test
 	if credential.PlanType != "plus" || credential.AccountID != "account-1" {
 		t.Fatalf("profile = plan %q account %q", credential.PlanType, credential.AccountID)
 	}
-	if credential.ImageQuotaRemaining != nil ||
-		credential.QuotaState != chatgptwebauth.QuotaStateUnknown ||
-		credential.QuotaUpdatedAt != "" {
-		t.Fatalf("stale quota response was persisted: %+v", credential)
+	if credential.ImageQuotaRemaining == nil || *credential.ImageQuotaRemaining != 7 ||
+		credential.QuotaState != chatgptwebauth.QuotaStateAvailable ||
+		credential.QuotaUpdatedAt == "" {
+		t.Fatalf("authoritative quota response was not applied: %+v", credential)
 	}
 	imageState := current.ModelStates[chatgptwebauth.ImageModel]
-	if imageState == nil || !imageState.Unavailable || !imageState.Quota.Exceeded ||
-		imageState.Quota.Reason != "chatgpt_web_image_quota" {
-		t.Fatalf("concurrent image quota result was cleared: %+v", imageState)
+	if imageState != nil && (imageState.Unavailable || imageState.Quota.Exceeded || imageState.Quota.Reason != "") {
+		t.Fatalf("authoritative positive quota did not clear the image cooldown: %+v", imageState)
 	}
 }
 

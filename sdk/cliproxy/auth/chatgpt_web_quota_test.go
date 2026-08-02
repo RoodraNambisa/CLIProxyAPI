@@ -1297,6 +1297,94 @@ func TestCommittedImageQuotaRequestIsNotReplayedOnAnotherAuth(t *testing.T) {
 	}
 }
 
+func TestExplicitImageQuotaResultMarksCredentialExhausted(t *testing.T) {
+	manager := NewManager(nil, &FillFirstSelector{}, nil)
+	executor := &authFallbackExecutor{id: chatgptwebauth.Provider}
+	manager.RegisterExecutor(executor)
+	authID := "explicit-image-quota-" + uuid.NewString()
+	textModel := "explicit-image-quota-text-" + uuid.NewString()
+	customImageModel := "explicit-image-quota-custom-" + uuid.NewString()
+	quotaUpdatedAt := time.Now().Add(-time.Hour).UTC().Format(time.RFC3339Nano)
+	quotaResetAt := time.Now().Add(time.Hour).UTC().Format(time.RFC3339Nano)
+	if _, errRegister := manager.Register(WithSkipPersist(context.Background()), &Auth{
+		ID:       authID,
+		Provider: chatgptwebauth.Provider,
+		Status:   StatusActive,
+		Metadata: map[string]any{
+			"lifecycle_state":       LifecycleStateActive,
+			"quota_state":           string(chatgptwebauth.QuotaStateAvailable),
+			"image_quota_remaining": 1,
+			"image_quota_reset_at":  quotaResetAt,
+			"quota_updated_at":      quotaUpdatedAt,
+			"quota_stale":           false,
+		},
+	}); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+	registry.GetGlobalRegistry().RegisterClient(authID, chatgptwebauth.Provider, []*registry.ModelInfo{
+		{ID: textModel},
+		{ID: chatgptwebauth.ImageModel, UpstreamID: chatgptwebauth.ImageModel, Type: registry.OpenAIImageModelType},
+		{ID: customImageModel, UpstreamID: chatgptwebauth.ImageModel, Type: registry.OpenAIImageModelType},
+	})
+	manager.RefreshSchedulerEntry(authID)
+	t.Cleanup(func() {
+		registry.GetGlobalRegistry().UnregisterClient(authID)
+	})
+
+	manager.MarkResult(context.Background(), Result{
+		AuthID:   authID,
+		Provider: chatgptwebauth.Provider,
+		Model:    chatgptwebauth.ImageModel,
+		Error: &Error{
+			Code:       "chatgpt_web_image_quota",
+			Message:    "Image generation rate limit exceeded. Please try again later.",
+			HTTPStatus: http.StatusTooManyRequests,
+		},
+	})
+
+	response, errExecute := manager.Execute(
+		context.Background(),
+		[]string{chatgptwebauth.Provider},
+		cliproxyexecutor.Request{Model: textModel},
+		cliproxyexecutor.Options{},
+	)
+	if errExecute != nil {
+		t.Fatalf("text request after image quota exhaustion: %v", errExecute)
+	}
+	if string(response.Payload) != authID {
+		t.Fatalf("text request selected %q, want %q", response.Payload, authID)
+	}
+
+	current, ok := manager.GetByID(authID)
+	if !ok || current == nil {
+		t.Fatal("auth disappeared")
+	}
+	if remaining := metadataInt(current.Metadata["image_quota_remaining"]); remaining == nil || *remaining != 0 {
+		t.Fatalf("image_quota_remaining = %#v, want 0", remaining)
+	}
+	if state := metadataString(current.Metadata["quota_state"]); state != string(chatgptwebauth.QuotaStateExhausted) {
+		t.Fatalf("quota_state = %q, want exhausted", state)
+	}
+	if got := metadataString(current.Metadata["quota_updated_at"]); got != quotaUpdatedAt {
+		t.Fatalf("quota_updated_at = %q, want unchanged %q", got, quotaUpdatedAt)
+	}
+	if got := metadataString(current.Metadata["image_quota_reset_at"]); got != quotaResetAt {
+		t.Fatalf("image_quota_reset_at = %q, want unchanged %q", got, quotaResetAt)
+	}
+	for _, imageModel := range []string{chatgptwebauth.ImageModel, customImageModel} {
+		state := current.ModelStates[imageModel]
+		if state == nil || !state.Unavailable || !state.Quota.Exceeded || state.Quota.Reason != "chatgpt_web_image_quota" {
+			t.Fatalf("image model %q state = %+v", imageModel, state)
+		}
+		if blocked, _, _ := isAuthBlockedForModel(current, imageModel, time.Now()); !blocked {
+			t.Fatalf("image model %q remained schedulable", imageModel)
+		}
+	}
+	if blocked, _, _ := isAuthBlockedForModel(current, textModel, time.Now()); blocked {
+		t.Fatal("image quota exhaustion blocked the text model")
+	}
+}
+
 func TestAccountInfoCooldownClearSerializesConcurrentImageQuotaResult(t *testing.T) {
 	store := &chatGPTWebQuotaMutationBlockingStore{
 		started: make(chan struct{}),

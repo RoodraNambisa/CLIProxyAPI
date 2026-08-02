@@ -4,11 +4,13 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
 	fhttp "github.com/bogdanfinn/fhttp"
 	chatgptwebauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/chatgptweb"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 )
 
 func TestChatGPTWebImageRequestErrorRequiresExplicitQuotaEvidence(t *testing.T) {
@@ -28,6 +30,12 @@ func TestChatGPTWebImageRequestErrorRequiresExplicitQuotaEvidence(t *testing.T) 
 			name:      "explicit quota code",
 			path:      "/backend-api/conversation",
 			body:      `{"error":{"code":"image_generation_limit_reached"}}`,
+			wantQuota: true,
+		},
+		{
+			name:      "chatgpt image limit message",
+			path:      "/backend-api/f/conversation",
+			body:      `{"error":{"message":"You've hit your limit. Please try again later."}}`,
 			wantQuota: true,
 		},
 		{
@@ -140,6 +148,71 @@ func TestChatGPTWebTerminalImageFailureProjectsExplicitQuotaEvidence(t *testing.
 	if !errors.As(generic, &status) || status.StatusCode() != http.StatusBadGateway {
 		t.Fatalf("generic terminal status = %v, want 502", generic)
 	}
+
+	limitMessage := "You've hit your limit. Please try again later."
+	limit := chatGPTWebImageRequestError(chatGPTWebImageFailureError(limitMessage))
+	if !errors.As(limit, &code) || code.ExecutionResultErrorCode() != "chatgpt_web_image_quota" {
+		t.Fatalf("ChatGPT limit failure was not projected as image quota: %v", limit)
+	}
+	if !errors.As(limit, &status) || status.StatusCode() != http.StatusTooManyRequests {
+		t.Fatalf("ChatGPT limit status = %v, want 429", limit)
+	}
+	if strings.Contains(limit.Error(), limitMessage) {
+		t.Fatalf("projected quota error exposed upstream text: %v", limit)
+	}
+	var skip interface{ SkipAuthResult() bool }
+	if !errors.As(limit, &skip) || skip.SkipAuthResult() {
+		t.Fatalf("terminal quota result skipped immediate credential cooldown: %v", limit)
+	}
+}
+
+func TestChatGPTWebEmptyImageResultKeeps502AndSchedulesCooledQuotaRecheck(t *testing.T) {
+	now := time.Now().UTC()
+	executor := &ChatGPTWebExecutor{}
+	runtime := newChatGPTWebAccountInfoRuntime(executor, &config.Config{})
+	runtime.now = func() time.Time { return now }
+	executor.accountInfo = runtime
+	t.Cleanup(runtime.close)
+
+	projected := executor.handleChatGPTWebImageRequestError(
+		"web-empty.json",
+		newChatGPTWebImageNoOutputResultError(),
+	)
+	var status interface{ StatusCode() int }
+	if !errors.As(projected, &status) || status.StatusCode() != http.StatusBadGateway {
+		t.Fatalf("empty image result status = %v, want 502", projected)
+	}
+	var code interface{ ExecutionResultErrorCode() string }
+	if errors.As(projected, &code) {
+		t.Fatalf("empty image result received quota code %q", code.ExecutionResultErrorCode())
+	}
+	if projected.Error() != chatGPTWebImageNoOutputMessage {
+		t.Fatalf("empty image result = %q, want %q", projected.Error(), chatGPTWebImageNoOutputMessage)
+	}
+	var skip interface{ SkipAuthResult() bool }
+	if !errors.As(projected, &skip) || !skip.SkipAuthResult() {
+		t.Fatalf("empty image result was allowed to cool the credential directly: %v", projected)
+	}
+
+	runtime.mu.Lock()
+	queued := runtime.queueLengthLocked()
+	deadline := runtime.ambiguousImageRecheckAfter["web-empty.json"]
+	runtime.mu.Unlock()
+	if queued != 1 {
+		t.Fatalf("queued quota rechecks = %d, want 1", queued)
+	}
+	if want := now.Add(chatGPTWebAmbiguousImageRecheckCooldown); !deadline.Equal(want) {
+		t.Fatalf("quota recheck cooldown = %v, want %v", deadline, want)
+	}
+
+	executor.handleChatGPTWebImageRequestError("web-empty.json", newChatGPTWebImageNoOutputResultError())
+	runtime.mu.Lock()
+	queued = runtime.queueLengthLocked()
+	secondDeadline := runtime.ambiguousImageRecheckAfter["web-empty.json"]
+	runtime.mu.Unlock()
+	if queued != 1 || !secondDeadline.Equal(deadline) {
+		t.Fatalf("repeated empty result changed queue/deadline: queued=%d deadline=%v", queued, secondDeadline)
+	}
 }
 
 func TestChatGPTWebImagePollSlotsAreBoundedAndCancelable(t *testing.T) {
@@ -161,7 +234,7 @@ func TestChatGPTWebImagePollSlotsAreBoundedAndCancelable(t *testing.T) {
 	releaseChatGPTWebImagePollSlot(slots)
 }
 
-func TestChatGPTWebImageResultErrorsForwardAuthRetryClassification(t *testing.T) {
+func TestChatGPTWebImageResultErrorsPreserveQuotaCredentialUpdate(t *testing.T) {
 	retryAfter := 9 * time.Second
 	cause := statusErr{
 		code:           http.StatusTooManyRequests,
@@ -169,14 +242,15 @@ func TestChatGPTWebImageResultErrorsForwardAuthRetryClassification(t *testing.T)
 		skipAuthResult: true,
 		retryOtherAuth: true,
 	}
-	for _, projected := range []error{
-		&chatGPTWebImageRateLimitResultError{cause: cause},
-		&chatGPTWebImageQuotaResultError{cause: cause},
-	} {
-		skip, okSkip := projected.(interface{ SkipAuthResult() bool })
-		if !okSkip || !skip.SkipAuthResult() {
-			t.Fatalf("%T SkipAuthResult() was not forwarded", projected)
-		}
+	rateLimited := &chatGPTWebImageRateLimitResultError{cause: cause}
+	if !rateLimited.SkipAuthResult() {
+		t.Fatal("ordinary image rate limit did not preserve SkipAuthResult")
+	}
+	quotaExhausted := &chatGPTWebImageQuotaResultError{cause: cause}
+	if quotaExhausted.SkipAuthResult() {
+		t.Fatal("explicit image quota result skipped immediate credential cooldown")
+	}
+	for _, projected := range []error{rateLimited, quotaExhausted} {
 		retry, okRetry := projected.(interface{ RetryOtherAuth() bool })
 		if !okRetry || !retry.RetryOtherAuth() {
 			t.Fatalf("%T RetryOtherAuth() was not forwarded", projected)

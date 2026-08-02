@@ -2,6 +2,7 @@ package executor
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -51,7 +52,7 @@ func (*chatGPTWebHandlerRateLimitExecutor) HttpRequest(context.Context, *coreaut
 	return nil, errors.New("not implemented")
 }
 
-func newChatGPTWebImageHandlerManager(t *testing.T, err error, models ...string) *coreauth.Manager {
+func newChatGPTWebImageHandlerManager(t *testing.T, err error, models ...string) (*coreauth.Manager, string) {
 	t.Helper()
 	manager := coreauth.NewManager(nil, &coreauth.FillFirstSelector{}, nil)
 	manager.SetRetryConfig(0, 0, 0)
@@ -77,7 +78,7 @@ func newChatGPTWebImageHandlerManager(t *testing.T, err error, models ...string)
 	t.Cleanup(func() {
 		registry.GetGlobalRegistry().UnregisterClient(authID)
 	})
-	return manager
+	return manager, authID
 }
 
 func newCommittedChatGPTWebImageHandlerError(body string) error {
@@ -100,12 +101,35 @@ func assertChatGPTWebImageHandlerRateLimit(t *testing.T, response *httptest.Resp
 	}
 }
 
+func assertChatGPTWebImageHandlerOpenAIRateLimit(t *testing.T, response *httptest.ResponseRecorder) {
+	t.Helper()
+	assertChatGPTWebImageHandlerRateLimit(t, response)
+	var payload struct {
+		Error struct {
+			Message string `json:"message"`
+			Type    string `json:"type"`
+			Code    string `json:"code"`
+		} `json:"error"`
+	}
+	if errDecode := json.Unmarshal(response.Body.Bytes(), &payload); errDecode != nil {
+		t.Fatalf("decode error response: %v; body=%s", errDecode, response.Body.String())
+	}
+	if payload.Error.Message != "Image generation rate limit exceeded. Please try again later." ||
+		payload.Error.Type != "rate_limit_error" ||
+		payload.Error.Code != "rate_limit_exceeded" {
+		t.Fatalf("error response = %+v; body=%s", payload.Error, response.Body.String())
+	}
+	if strings.Contains(response.Body.String(), "You've hit your limit") {
+		t.Fatalf("error response exposed upstream text: %s", response.Body.String())
+	}
+}
+
 func TestChatGPTWebImageErrorsReachHTTPHandlersAsRateLimits(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
 	t.Run("direct image", func(t *testing.T) {
 		errImage := newCommittedChatGPTWebImageHandlerError(`{"error":{"code":"image_generation_limit_reached"}}`)
-		manager := newChatGPTWebImageHandlerManager(t, errImage, "gpt-image-2", "gpt-5.4-mini")
+		manager, _ := newChatGPTWebImageHandlerManager(t, errImage, "gpt-image-2", "gpt-5.4-mini")
 		base := handlers.NewBaseAPIHandlers(&sdkconfig.SDKConfig{
 			Images: sdkconfig.ImagesConfig{CodexModel: "gpt-5.4-mini"},
 		}, manager)
@@ -124,10 +148,39 @@ func TestChatGPTWebImageErrorsReachHTTPHandlersAsRateLimits(t *testing.T) {
 		assertChatGPTWebImageHandlerRateLimit(t, response)
 	})
 
+	t.Run("image quota message uses OpenAI error format", func(t *testing.T) {
+		errImage := newCommittedChatGPTWebImageHandlerError(`{"error":{"message":"You've hit your limit. Please try again later."}}`)
+		manager, authID := newChatGPTWebImageHandlerManager(t, errImage, "gpt-image-2", "gpt-5.4-mini")
+		base := handlers.NewBaseAPIHandlers(&sdkconfig.SDKConfig{
+			Images: sdkconfig.ImagesConfig{CodexModel: "gpt-5.4-mini"},
+		}, manager)
+		handler := openaihandlers.NewOpenAIImagesAPIHandler(base)
+		router := gin.New()
+		router.POST("/v1/images/generations", handler.Generations)
+
+		request := httptest.NewRequest(
+			http.MethodPost,
+			"/v1/images/generations",
+			strings.NewReader(`{"model":"gpt-image-2","prompt":"draw"}`),
+		)
+		request.Header.Set("Content-Type", "application/json")
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, request)
+		assertChatGPTWebImageHandlerOpenAIRateLimit(t, response)
+		current, ok := manager.GetByID(authID)
+		if !ok || current == nil || current.Metadata["quota_state"] != "exhausted" {
+			t.Fatalf("explicit image quota did not immediately exhaust credential: %+v", current)
+		}
+		state := current.ModelStates["gpt-image-2"]
+		if state == nil || !state.Unavailable || !state.Quota.Exceeded || state.Quota.Reason != "chatgpt_web_image_quota" {
+			t.Fatalf("explicit image quota did not immediately suspend image model: %+v", state)
+		}
+	})
+
 	t.Run("image tool", func(t *testing.T) {
 		const model = "chatgpt-web-image-tool-handler"
-		errImage := newCommittedChatGPTWebImageHandlerError(`{"error":{"code":"rate_limit_exceeded","message":"Too many requests"}}`)
-		manager := newChatGPTWebImageHandlerManager(t, errImage, model, "gpt-image-2")
+		errImage := newCommittedChatGPTWebImageHandlerError(`{"error":{"message":"You've hit your limit. Please try again later."}}`)
+		manager, _ := newChatGPTWebImageHandlerManager(t, errImage, model, "gpt-image-2")
 		handler := openaihandlers.NewOpenAIResponsesAPIHandler(
 			handlers.NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, manager),
 		)
@@ -142,13 +195,13 @@ func TestChatGPTWebImageErrorsReachHTTPHandlersAsRateLimits(t *testing.T) {
 		request.Header.Set("Content-Type", "application/json")
 		response := httptest.NewRecorder()
 		router.ServeHTTP(response, request)
-		assertChatGPTWebImageHandlerRateLimit(t, response)
+		assertChatGPTWebImageHandlerOpenAIRateLimit(t, response)
 	})
 
 	t.Run("stream bootstrap", func(t *testing.T) {
 		const model = "chatgpt-web-image-tool-stream-handler"
-		errImage := newCommittedChatGPTWebImageHandlerError(`{"error":{"code":"rate_limit_exceeded","message":"Too many requests"}}`)
-		manager := newChatGPTWebImageHandlerManager(t, errImage, model, "gpt-image-2")
+		errImage := newCommittedChatGPTWebImageHandlerError(`{"error":{"message":"You've hit your limit. Please try again later."}}`)
+		manager, _ := newChatGPTWebImageHandlerManager(t, errImage, model, "gpt-image-2")
 		handler := openaihandlers.NewOpenAIResponsesAPIHandler(
 			handlers.NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, manager),
 		)
@@ -163,6 +216,6 @@ func TestChatGPTWebImageErrorsReachHTTPHandlersAsRateLimits(t *testing.T) {
 		request.Header.Set("Content-Type", "application/json")
 		response := httptest.NewRecorder()
 		router.ServeHTTP(response, request)
-		assertChatGPTWebImageHandlerRateLimit(t, response)
+		assertChatGPTWebImageHandlerOpenAIRateLimit(t, response)
 	})
 }

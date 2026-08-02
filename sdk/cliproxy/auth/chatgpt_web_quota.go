@@ -236,7 +236,17 @@ func projectChatGPTWebImageSuccess(auth *Auth, count int64, imageModels []string
 		auth.Metadata["quota_state"] = string(chatgptwebauth.QuotaStateAvailable)
 		return nil
 	}
+	return projectChatGPTWebImageQuotaExhausted(auth, imageModels, now)
+}
 
+func projectChatGPTWebImageQuotaExhausted(auth *Auth, imageModels []string, now time.Time) []string {
+	if auth == nil || !strings.EqualFold(strings.TrimSpace(auth.Provider), chatgptwebauth.Provider) {
+		return nil
+	}
+	if auth.Metadata == nil {
+		auth.Metadata = make(map[string]any)
+	}
+	auth.Metadata["image_quota_remaining"] = 0
 	auth.Metadata["quota_state"] = string(chatgptwebauth.QuotaStateExhausted)
 	resetAt := metadataTime(auth.Metadata["image_quota_reset_at"])
 	if !resetAt.After(now) {

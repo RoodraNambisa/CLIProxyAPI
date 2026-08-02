@@ -29,6 +29,7 @@ const (
 	chatGPTWebAccountInfoMaxRetryAfter          = 5 * time.Minute
 	chatGPTWebAccountInfoMaxBodyBytes           = 1 << 20
 	chatGPTWebAccountInfoMaxRedirects           = 5
+	chatGPTWebAmbiguousImageRecheckCooldown     = 5 * time.Minute
 )
 
 type chatGPTWebAccountInfoTriggerMode uint8
@@ -57,7 +58,12 @@ type chatGPTWebAccountInfoOutcome struct {
 }
 
 type chatGPTWebImageQuotaObservation struct {
+	remaining      *int
+	quotaState     chatgptwebauth.QuotaState
+	quotaResetAt   string
 	quotaUpdatedAt string
+	quotaStale     bool
+	quotaLastError string
 	modelStates    map[string]*cliproxyauth.ModelState
 }
 
@@ -100,18 +106,31 @@ func captureChatGPTWebImageQuotaObservation(auth *cliproxyauth.Auth) chatGPTWebI
 		modelStates: cloneChatGPTWebImageModelStates(auth),
 	}
 	if credential, errParse := chatgptwebauth.ParseCredential(auth.Metadata); errParse == nil {
+		if credential.ImageQuotaRemaining != nil {
+			remaining := *credential.ImageQuotaRemaining
+			observation.remaining = &remaining
+		}
+		observation.quotaState = credential.QuotaState
+		observation.quotaResetAt = strings.TrimSpace(credential.ImageQuotaResetAt)
 		observation.quotaUpdatedAt = strings.TrimSpace(credential.QuotaUpdatedAt)
+		observation.quotaStale = credential.QuotaStale
+		observation.quotaLastError = strings.TrimSpace(credential.QuotaLastError)
 	}
 	return observation
 }
 
 func (observation chatGPTWebImageQuotaObservation) matches(auth *cliproxyauth.Auth) bool {
 	credential, errParse := chatgptwebauth.ParseCredential(auth.Metadata)
-	if errParse != nil ||
-		strings.TrimSpace(credential.QuotaUpdatedAt) != observation.quotaUpdatedAt {
+	if errParse != nil {
 		return false
 	}
-	return reflect.DeepEqual(cloneChatGPTWebImageModelStates(auth), observation.modelStates)
+	return equalOptionalInt(credential.ImageQuotaRemaining, observation.remaining) &&
+		credential.QuotaState == observation.quotaState &&
+		strings.TrimSpace(credential.ImageQuotaResetAt) == observation.quotaResetAt &&
+		strings.TrimSpace(credential.QuotaUpdatedAt) == observation.quotaUpdatedAt &&
+		credential.QuotaStale == observation.quotaStale &&
+		strings.TrimSpace(credential.QuotaLastError) == observation.quotaLastError &&
+		reflect.DeepEqual(cloneChatGPTWebImageModelStates(auth), observation.modelStates)
 }
 
 func cloneChatGPTWebImageModelStates(auth *cliproxyauth.Auth) map[string]*cliproxyauth.ModelState {
@@ -235,40 +254,41 @@ func (h *chatGPTWebAccountInfoScheduleHeap) Pop() any {
 type chatGPTWebAccountInfoRuntime struct {
 	executor *ChatGPTWebExecutor
 
-	mu                sync.Mutex
-	cond              *sync.Cond
-	cfg               config.ResolvedChatGPTWebAccountInfoConfig
-	queue             []chatGPTWebAccountInfoWork
-	queueHead         int
-	queuedByTarget    map[string]int
-	tasks             map[string]*chatGPTWebAccountInfoTaskState
-	taskReservations  int
-	states            map[string]chatgptwebauth.AccountInfoAuthRuntimeState
-	inflight          map[string]int
-	inflightForce     map[string]int
-	inflightTask      map[string]int
-	inflightRecovery  map[string]time.Time
-	pendingTriggers   map[string]chatGPTWebAccountInfoTriggerMode
-	workers           map[int]chan struct{}
-	retiringWorkers   map[int]struct{}
-	desiredWorkers    int
-	nextID            int
-	busy              int
-	waiting           int
-	authInstances     map[string]string
-	authEpoch         map[string]uint64
-	authEpochRefs     map[string]int
-	schedules         chatGPTWebAccountInfoScheduleHeap
-	scheduled         map[string]*chatGPTWebAccountInfoSchedule
-	scheduledByTarget map[string]map[string]*chatGPTWebAccountInfoSchedule
-	delayedTasks      int
-	schedule          uint64
-	wake              chan struct{}
-	ctx               context.Context
-	cancel            context.CancelFunc
-	wg                sync.WaitGroup
-	started           bool
-	closed            bool
+	mu                         sync.Mutex
+	cond                       *sync.Cond
+	cfg                        config.ResolvedChatGPTWebAccountInfoConfig
+	queue                      []chatGPTWebAccountInfoWork
+	queueHead                  int
+	queuedByTarget             map[string]int
+	tasks                      map[string]*chatGPTWebAccountInfoTaskState
+	taskReservations           int
+	states                     map[string]chatgptwebauth.AccountInfoAuthRuntimeState
+	inflight                   map[string]int
+	inflightForce              map[string]int
+	inflightTask               map[string]int
+	inflightRecovery           map[string]time.Time
+	pendingTriggers            map[string]chatGPTWebAccountInfoTriggerMode
+	ambiguousImageRecheckAfter map[string]time.Time
+	workers                    map[int]chan struct{}
+	retiringWorkers            map[int]struct{}
+	desiredWorkers             int
+	nextID                     int
+	busy                       int
+	waiting                    int
+	authInstances              map[string]string
+	authEpoch                  map[string]uint64
+	authEpochRefs              map[string]int
+	schedules                  chatGPTWebAccountInfoScheduleHeap
+	scheduled                  map[string]*chatGPTWebAccountInfoSchedule
+	scheduledByTarget          map[string]map[string]*chatGPTWebAccountInfoSchedule
+	delayedTasks               int
+	schedule                   uint64
+	wake                       chan struct{}
+	ctx                        context.Context
+	cancel                     context.CancelFunc
+	wg                         sync.WaitGroup
+	started                    bool
+	closed                     bool
 
 	refreshCount      uint64
 	retryCount        uint64
@@ -287,28 +307,29 @@ type chatGPTWebAccountInfoRuntime struct {
 func newChatGPTWebAccountInfoRuntime(executor *ChatGPTWebExecutor, cfg *config.Config) *chatGPTWebAccountInfoRuntime {
 	ctx, cancel := context.WithCancel(context.Background())
 	runtime := &chatGPTWebAccountInfoRuntime{
-		executor:          executor,
-		tasks:             make(map[string]*chatGPTWebAccountInfoTaskState),
-		states:            make(map[string]chatgptwebauth.AccountInfoAuthRuntimeState),
-		queuedByTarget:    make(map[string]int),
-		inflight:          make(map[string]int),
-		inflightForce:     make(map[string]int),
-		inflightTask:      make(map[string]int),
-		inflightRecovery:  make(map[string]time.Time),
-		pendingTriggers:   make(map[string]chatGPTWebAccountInfoTriggerMode),
-		authInstances:     make(map[string]string),
-		authEpoch:         make(map[string]uint64),
-		authEpochRefs:     make(map[string]int),
-		workers:           make(map[int]chan struct{}),
-		retiringWorkers:   make(map[int]struct{}),
-		scheduled:         make(map[string]*chatGPTWebAccountInfoSchedule),
-		scheduledByTarget: make(map[string]map[string]*chatGPTWebAccountInfoSchedule),
-		calls:             make(map[string]*chatGPTWebAccountInfoCall),
-		wake:              make(chan struct{}, 1),
-		ctx:               ctx,
-		cancel:            cancel,
-		now:               time.Now,
-		random:            rand.Reader,
+		executor:                   executor,
+		tasks:                      make(map[string]*chatGPTWebAccountInfoTaskState),
+		states:                     make(map[string]chatgptwebauth.AccountInfoAuthRuntimeState),
+		queuedByTarget:             make(map[string]int),
+		inflight:                   make(map[string]int),
+		inflightForce:              make(map[string]int),
+		inflightTask:               make(map[string]int),
+		inflightRecovery:           make(map[string]time.Time),
+		pendingTriggers:            make(map[string]chatGPTWebAccountInfoTriggerMode),
+		ambiguousImageRecheckAfter: make(map[string]time.Time),
+		authInstances:              make(map[string]string),
+		authEpoch:                  make(map[string]uint64),
+		authEpochRefs:              make(map[string]int),
+		workers:                    make(map[int]chan struct{}),
+		retiringWorkers:            make(map[int]struct{}),
+		scheduled:                  make(map[string]*chatGPTWebAccountInfoSchedule),
+		scheduledByTarget:          make(map[string]map[string]*chatGPTWebAccountInfoSchedule),
+		calls:                      make(map[string]*chatGPTWebAccountInfoCall),
+		wake:                       make(chan struct{}, 1),
+		ctx:                        ctx,
+		cancel:                     cancel,
+		now:                        time.Now,
+		random:                     rand.Reader,
 	}
 	runtime.cond = sync.NewCond(&runtime.mu)
 	runtime.cfg = accountInfoConfigSnapshot(cfg)
@@ -573,6 +594,7 @@ func (runtime *chatGPTWebAccountInfoRuntime) disableAutomaticRefreshLocked() {
 		runtime.releaseWorkEpochLocked(entry.work)
 	}
 	clear(runtime.pendingTriggers)
+	clear(runtime.ambiguousImageRecheckAfter)
 	runtime.cond.Broadcast()
 }
 
@@ -659,6 +681,7 @@ func (runtime *chatGPTWebAccountInfoRuntime) close() {
 	clear(runtime.inflightTask)
 	clear(runtime.inflightRecovery)
 	clear(runtime.pendingTriggers)
+	clear(runtime.ambiguousImageRecheckAfter)
 	clear(runtime.authInstances)
 	clear(runtime.authEpoch)
 	clear(runtime.authEpochRefs)
@@ -2373,6 +2396,9 @@ func (runtime *chatGPTWebAccountInfoRuntime) removeAuthInstance(authID, authInst
 	for runtimeKey := range runtime.pendingTriggers {
 		collectRuntimeKey(runtimeKey)
 	}
+	for runtimeKey := range runtime.ambiguousImageRecheckAfter {
+		collectRuntimeKey(runtimeKey)
+	}
 	for runtimeKey := range runtime.authEpoch {
 		collectRuntimeKey(runtimeKey)
 	}
@@ -2455,6 +2481,7 @@ func (runtime *chatGPTWebAccountInfoRuntime) removeAuthInstance(authID, authInst
 	}
 	for runtimeKey := range affectedRuntimeKeys {
 		delete(runtime.pendingTriggers, runtimeKey)
+		delete(runtime.ambiguousImageRecheckAfter, runtimeKey)
 		delete(runtime.inflight, runtimeKey)
 		delete(runtime.inflightForce, runtimeKey)
 		delete(runtime.inflightTask, runtimeKey)
@@ -2837,6 +2864,38 @@ func (runtime *chatGPTWebAccountInfoRuntime) triggerAutomaticRecheck(authID stri
 	return runtime.triggerWithMode(authID, chatGPTWebAccountInfoTriggerAutomaticRecheck)
 }
 
+func (runtime *chatGPTWebAccountInfoRuntime) triggerAmbiguousImageRecheck(authID string) bool {
+	if runtime == nil || strings.TrimSpace(authID) == "" {
+		return false
+	}
+	target, current := runtime.resolveCurrentTarget(chatgptwebauth.AccountInfoRefreshTarget{
+		Name:   strings.TrimSpace(authID),
+		AuthID: strings.TrimSpace(authID),
+	})
+	if !current {
+		return false
+	}
+	runtime.mu.Lock()
+	defer runtime.mu.Unlock()
+	target, current = runtime.resolveCurrentTargetLocked(target)
+	if !current {
+		return false
+	}
+	runtimeKey := chatGPTWebAccountInfoTargetKey(target)
+	now := runtime.currentTime()
+	if next := runtime.ambiguousImageRecheckAfter[runtimeKey]; next.After(now) {
+		return false
+	}
+	if !runtime.triggerTargetLocked(target, chatGPTWebAccountInfoTriggerAutomaticRecheck) {
+		return false
+	}
+	if runtime.ambiguousImageRecheckAfter == nil {
+		runtime.ambiguousImageRecheckAfter = make(map[string]time.Time)
+	}
+	runtime.ambiguousImageRecheckAfter[runtimeKey] = now.Add(chatGPTWebAmbiguousImageRecheckCooldown)
+	return true
+}
+
 func (runtime *chatGPTWebAccountInfoRuntime) triggerWithMode(
 	authID string,
 	mode chatGPTWebAccountInfoTriggerMode,
@@ -3097,6 +3156,10 @@ func (e *ChatGPTWebExecutor) TriggerAutomaticAccountInfoRefresh(authID string) b
 	return e != nil && e.accountInfo != nil && e.accountInfo.triggerAutomaticRecheck(authID)
 }
 
+func (e *ChatGPTWebExecutor) triggerAmbiguousImageAccountInfoRefresh(authID string) bool {
+	return e != nil && e.accountInfo != nil && e.accountInfo.triggerAmbiguousImageRecheck(authID)
+}
+
 // SyncAccountInfoRecovery reconciles one persisted image quota reset schedule.
 func (e *ChatGPTWebExecutor) SyncAccountInfoRecovery(auth *cliproxyauth.Auth) {
 	if e == nil || e.accountInfo == nil {
@@ -3161,6 +3224,23 @@ func (e *ChatGPTWebExecutor) refreshChatGPTWebAccountInfoForInstance(
 		credential, _ = chatgptwebauth.ParseCredential(auth.Metadata)
 	}
 	profileObservation := captureChatGPTWebAccountProfileObservation(auth)
+	observedAuth, observed := e.manager.GetByID(auth.ID)
+	if !observed || observedAuth == nil ||
+		!strings.EqualFold(strings.TrimSpace(observedAuth.Provider), chatgptwebauth.Provider) ||
+		strings.TrimSpace(observedAuth.RuntimeInstanceID()) != strings.TrimSpace(auth.RuntimeInstanceID()) {
+		outcome.errorCode = "credential_unavailable"
+		return outcome
+	}
+	if authInstanceID != "" && strings.TrimSpace(observedAuth.RuntimeInstanceID()) != authInstanceID {
+		outcome.errorCode = "credential_unavailable"
+		return outcome
+	}
+	auth = observedAuth
+	credential, errCredential = chatgptwebauth.ParseCredential(auth.Metadata)
+	if errCredential != nil {
+		outcome.errorCode = "credential_unavailable"
+		return outcome
+	}
 	quotaObservation := captureChatGPTWebImageQuotaObservation(auth)
 	if errors.Is(ctx.Err(), context.Canceled) {
 		outcome.status = chatgptwebauth.AccountInfoResultCanceled

@@ -52,6 +52,8 @@ const (
 	chatGPTWebImageStreamMaxEvents      = 65_536
 	chatGPTWebPollResponseMaxBytes      = 128 << 20
 	chatGPTWebImagePollConcurrency      = 64
+	chatGPTWebImageQuotaClientMessage   = "Image generation rate limit exceeded. Please try again later."
+	chatGPTWebImageNoOutputMessage      = "chatgpt web image generation completed without an image"
 )
 
 var chatGPTWebAssetHostSuffixes = []string{
@@ -102,6 +104,10 @@ type chatGPTWebImageQuotaResultError struct {
 type chatGPTWebImageRateLimitResultError struct {
 	cause     error
 	committed bool
+}
+
+type chatGPTWebImageNoOutputResultError struct {
+	statusErr
 }
 
 func chatGPTWebImageResultStatusCode(err error) int {
@@ -199,10 +205,7 @@ func (e *chatGPTWebImageRateLimitResultError) RetryOtherAuth() bool {
 }
 
 func (e *chatGPTWebImageQuotaResultError) Error() string {
-	if e == nil || e.cause == nil {
-		return "chatgpt web image quota exhausted"
-	}
-	return e.cause.Error()
+	return chatGPTWebImageQuotaClientMessage
 }
 
 func (e *chatGPTWebImageQuotaResultError) Unwrap() error {
@@ -246,7 +249,7 @@ func (e *chatGPTWebImageQuotaResultError) RetryAfter() *time.Duration {
 }
 
 func (e *chatGPTWebImageQuotaResultError) SkipAuthResult() bool {
-	return e != nil && chatGPTWebImageResultSkipAuthResult(e.cause)
+	return false
 }
 
 func (e *chatGPTWebImageQuotaResultError) RetryOtherAuth() bool {
@@ -287,9 +290,23 @@ func chatGPTWebImageRequestErrorWithRefresh(err error, triggerRefresh func()) er
 }
 
 func (e *ChatGPTWebExecutor) handleChatGPTWebImageRequestError(authID string, err error) error {
-	return chatGPTWebImageRequestErrorWithRefresh(err, func() {
+	projected := chatGPTWebImageRequestErrorWithRefresh(err, func() {
 		e.TriggerAutomaticAccountInfoRefresh(authID)
 	})
+	var noOutput *chatGPTWebImageNoOutputResultError
+	if errors.As(projected, &noOutput) {
+		e.triggerAmbiguousImageAccountInfoRefresh(authID)
+	}
+	return projected
+}
+
+func newChatGPTWebImageNoOutputResultError() error {
+	return &chatGPTWebImageNoOutputResultError{statusErr: statusErr{
+		code:           http.StatusBadGateway,
+		msg:            chatGPTWebImageNoOutputMessage,
+		skipAuthResult: true,
+		retryOtherAuth: true,
+	}}
 }
 
 func chatGPTWebImageQuotaErrorEvidence(err error) bool {
@@ -313,6 +330,8 @@ func chatGPTWebImageQuotaTextEvidence(value string) bool {
 		"image_generation_quota_exhausted",
 		"image_generation_limit_reached",
 		"image_gen_limit_reached",
+		"you've hit your limit",
+		"you’ve hit your limit",
 	} {
 		if strings.Contains(body, marker) {
 			return true
@@ -628,12 +647,7 @@ func (e *ChatGPTWebExecutor) finishChatGPTWebImage(ctx context.Context, client *
 			}
 		}
 		if !hasStreamOutput {
-			return nil, statusErr{
-				code:           http.StatusBadGateway,
-				msg:            "chatgpt web image generation completed without an image",
-				skipAuthResult: true,
-				retryOtherAuth: true,
-			}
+			return nil, newChatGPTWebImageNoOutputResultError()
 		}
 	} else if streamIncomplete || !hasTerminal || !hasStreamOutput {
 		if err := e.pollChatGPTWebImageConversation(ctx, client, credential, accumulator, execution.inputIDs, hasStreamOutput, pollBudget); err != nil {
@@ -2463,12 +2477,7 @@ func (e *ChatGPTWebExecutor) pollChatGPTWebImageConversation(ctx context.Context
 						if lastTaskFailure != "" {
 							return chatGPTWebImageFailureError(lastTaskFailure)
 						}
-						return statusErr{
-							code:           http.StatusBadGateway,
-							msg:            "chatgpt web image generation completed without an image",
-							skipAuthResult: true,
-							retryOtherAuth: true,
-						}
+						return newChatGPTWebImageNoOutputResultError()
 					}
 				}
 				if taskFallbackNeedsConversationRefresh {
