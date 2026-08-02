@@ -101,7 +101,7 @@ func TestChatGPTWebImageRequestErrorRequiresExplicitQuotaEvidence(t *testing.T) 
 	}
 }
 
-func TestChatGPTWebExplicitImageQuotaErrorForcesRefreshWhenAutomaticRefreshDisabled(t *testing.T) {
+func TestChatGPTWebExplicitImageQuotaErrorDoesNotRefreshWhenAutomaticRefreshDisabled(t *testing.T) {
 	enabled := false
 	executor := &ChatGPTWebExecutor{}
 	runtime := newChatGPTWebAccountInfoRuntime(executor, &config.Config{
@@ -123,9 +123,33 @@ func TestChatGPTWebExplicitImageQuotaErrorForcesRefreshWhenAutomaticRefreshDisab
 
 	runtime.mu.Lock()
 	queued := runtime.queuedWorkLocked()
+	scheduled := len(runtime.scheduled)
+	pending := len(runtime.pendingTriggers)
 	runtime.mu.Unlock()
-	if len(queued) != 1 || !queued[0].force || !queued[0].automatic {
-		t.Fatalf("forced quota refresh queue = %+v, want one forced automatic work item", queued)
+	if len(queued) != 0 || scheduled != 0 || pending != 0 {
+		t.Fatalf("disabled quota refresh work: queue=%+v scheduled=%d pending=%d", queued, scheduled, pending)
+	}
+}
+
+func TestChatGPTWebExplicitImageQuotaErrorQueuesOneRefreshWhenEnabled(t *testing.T) {
+	const authID = "web-limit-queued.json"
+	executor := &ChatGPTWebExecutor{}
+	runtime := newChatGPTWebAccountInfoRuntime(executor, &config.Config{})
+	executor.accountInfo = runtime
+	t.Cleanup(runtime.close)
+
+	for range 2 {
+		executor.handleChatGPTWebImageRequestError(
+			authID,
+			chatGPTWebImageFailureError("You've hit your limit. Please try again later."),
+		)
+	}
+
+	runtime.mu.Lock()
+	queued := runtime.queuedWorkLocked()
+	runtime.mu.Unlock()
+	if len(queued) != 1 || !queued[0].force || !queued[0].automatic || queued[0].target.AuthID != authID {
+		t.Fatalf("enabled quota refresh queue = %+v, want one forced automatic work item", queued)
 	}
 }
 

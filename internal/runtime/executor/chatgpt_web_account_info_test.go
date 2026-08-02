@@ -129,6 +129,9 @@ func TestChatGPTWebAccountInfoAutoRefreshDisabledKeepsManualRefresh(t *testing.T
 	if runtime.triggerAutomaticRecheck(target.AuthID) {
 		t.Fatal("automatic trigger was accepted while disabled")
 	}
+	if runtime.triggerImageQuotaEvidenceRecheck(target.AuthID) {
+		t.Fatal("explicit image quota trigger was accepted while disabled")
+	}
 	if runtime.triggerAmbiguousImageRecheck(target.AuthID) {
 		t.Fatal("ambiguous image recheck was accepted while disabled")
 	}
@@ -204,7 +207,7 @@ func TestChatGPTWebAmbiguousImageRecheckConcurrentTriggersOnlyOnce(t *testing.T)
 	}
 }
 
-func TestChatGPTWebAccountInfoDisableClearsPeriodicWorkAndKeepsKnownResetRecovery(t *testing.T) {
+func TestChatGPTWebAccountInfoDisableClearsQueuedAutomaticWork(t *testing.T) {
 	runtime := newChatGPTWebAccountInfoRuntime(&ChatGPTWebExecutor{}, &config.Config{})
 	t.Cleanup(runtime.close)
 	target := chatgptwebauth.AccountInfoRefreshTarget{Name: "web.json", AuthID: "web.json"}
@@ -245,11 +248,10 @@ func TestChatGPTWebAccountInfoDisableClearsPeriodicWorkAndKeepsKnownResetRecover
 	}
 	runtime.mu.Lock()
 	queueLength := runtime.queueLengthLocked()
-	recovery := runtime.scheduled["recovery:"+target.AuthID]
 	scheduled := len(runtime.scheduled)
 	runtime.mu.Unlock()
-	if queueLength != 0 || scheduled != 1 || recovery == nil {
-		t.Fatalf("disabled work queue=%d scheduled=%d recovery=%+v", queueLength, scheduled, recovery)
+	if queueLength != 0 || scheduled != 0 {
+		t.Fatalf("automatic work remains queued=%d scheduled=%d", queueLength, scheduled)
 	}
 	select {
 	case <-callContext.Done():
@@ -258,7 +260,7 @@ func TestChatGPTWebAccountInfoDisableClearsPeriodicWorkAndKeepsKnownResetRecover
 	}
 }
 
-func TestChatGPTWebAccountInfoDisabledStartupRestoresPersistedRecovery(t *testing.T) {
+func TestChatGPTWebAccountInfoReenableRestoresPersistedRecovery(t *testing.T) {
 	manager := cliproxyauth.NewManager(nil, nil, nil)
 	auth := chatGPTWebTestAuth("account-info-reenable-recovery")
 	auth.Metadata["quota_state"] = string(chatgptwebauth.QuotaStateExhausted)
@@ -274,16 +276,14 @@ func TestChatGPTWebAccountInfoDisabledStartupRestoresPersistedRecovery(t *testin
 	}}}
 	executor := NewChatGPTWebExecutor(cfg, manager)
 	t.Cleanup(func() { _ = executor.Close() })
-	before := executor.AccountInfoAuthState(auth.ID)
-	if before.NextRefreshAt.IsZero() {
-		t.Fatalf("disabled startup did not schedule recovery: %+v", before)
+	if state := executor.AccountInfoAuthState(auth.ID); !state.NextRefreshAt.IsZero() {
+		t.Fatalf("disabled startup scheduled recovery: %+v", state)
 	}
 
 	enabled = true
 	executor.UpdateConfig(cfg)
-	after := executor.AccountInfoAuthState(auth.ID)
-	if !after.NextRefreshAt.Equal(before.NextRefreshAt) {
-		t.Fatalf("re-enabling automatic refresh duplicated or moved recovery: before=%+v after=%+v", before, after)
+	if state := executor.AccountInfoAuthState(auth.ID); state.NextRefreshAt.IsZero() {
+		t.Fatal("re-enabling automatic refresh did not restore persisted recovery")
 	}
 }
 
@@ -306,7 +306,7 @@ func TestChatGPTWebAccountInfoDisabledAutomaticRefreshDoesNotPollUnknownReset(t 
 	}
 }
 
-func TestChatGPTWebAccountInfoDisabledAutomaticRefreshQueriesAtKnownReset(t *testing.T) {
+func TestChatGPTWebAccountInfoDisabledAutomaticRefreshRequiresManualRecovery(t *testing.T) {
 	var profileCalls atomic.Int32
 	var quotaCalls atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
@@ -369,27 +369,38 @@ func TestChatGPTWebAccountInfoDisabledAutomaticRefreshQueriesAtKnownReset(t *tes
 	t.Cleanup(func() { _ = executor.Close() })
 	executor.SyncAccountInfoRecovery(auth)
 
-	waitForChatGPTWebCondition(t, 3*time.Second, func() bool {
-		current, ok := manager.GetByID(auth.ID)
-		if !ok || current == nil {
-			return false
-		}
-		credential, errCredential := chatgptwebauth.ParseCredential(current.Metadata)
-		return errCredential == nil && credential.ImageQuotaRemaining != nil &&
-			*credential.ImageQuotaRemaining == 3 &&
-			credential.QuotaState == chatgptwebauth.QuotaStateAvailable
-	})
-	if profileCalls.Load() != 1 || quotaCalls.Load() != 1 {
-		t.Fatalf("known reset refresh calls = profile:%d quota:%d, want one each", profileCalls.Load(), quotaCalls.Load())
+	if state := executor.AccountInfoAuthState(auth.ID); !state.NextRefreshAt.IsZero() {
+		t.Fatalf("disabled automatic refresh scheduled reset recovery: %+v", state)
+	}
+	if profileCalls.Load() != 0 || quotaCalls.Load() != 0 {
+		t.Fatalf("disabled automatic refresh queried account info: profile:%d quota:%d", profileCalls.Load(), quotaCalls.Load())
 	}
 	current, _ := manager.GetByID(auth.ID)
+	credential, errCredential := chatgptwebauth.ParseCredential(current.Metadata)
+	if errCredential != nil || credential.ImageQuotaRemaining == nil ||
+		*credential.ImageQuotaRemaining != 0 || credential.QuotaState != chatgptwebauth.QuotaStateExhausted {
+		t.Fatalf("disabled automatic refresh changed exhausted quota: credential=%+v error=%v", credential, errCredential)
+	}
+
+	task, errStart := executor.StartAccountInfoRefreshTask([]chatgptwebauth.AccountInfoRefreshTarget{{
+		Name:   auth.ID,
+		AuthID: auth.ID,
+	}}, true)
+	if errStart != nil {
+		t.Fatalf("start manual refresh: %v", errStart)
+	}
+	waitForAccountInfoTask(t, executor, task.ID)
+	if profileCalls.Load() != 1 || quotaCalls.Load() != 1 {
+		t.Fatalf("manual recovery calls = profile:%d quota:%d, want one each", profileCalls.Load(), quotaCalls.Load())
+	}
+	current, _ = manager.GetByID(auth.ID)
 	imageState := current.ModelStates[chatgptwebauth.ImageModel]
 	if imageState == nil || imageState.Status == cliproxyauth.StatusError ||
 		imageState.Unavailable || imageState.Quota.Exceeded {
-		t.Fatalf("known reset refresh did not restore image capability: %+v", imageState)
+		t.Fatalf("manual refresh did not restore image capability: %+v", imageState)
 	}
 	if state := executor.AccountInfoAuthState(auth.ID); !state.NextRefreshAt.IsZero() {
-		t.Fatalf("successful one-shot recovery left another schedule: %+v", state)
+		t.Fatalf("manual recovery left an automatic schedule while disabled: %+v", state)
 	}
 }
 
