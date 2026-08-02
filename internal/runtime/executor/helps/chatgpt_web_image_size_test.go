@@ -1,6 +1,47 @@
 package helps
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/tidwall/gjson"
+)
+
+func TestChatGPTWebImageSizeFromResponsesPayload(t *testing.T) {
+	tests := []struct {
+		name      string
+		payload   string
+		wantSize  string
+		wantImage bool
+	}{
+		{name: "no tool", payload: `{"tools":[{"type":"web_search"}]}`},
+		{name: "missing size", payload: `{"tools":[{"type":"image_generation"}]}`, wantImage: true},
+		{name: "auto", payload: `{"tools":[{"type":"image_generation","size":"auto"}]}`, wantSize: "auto", wantImage: true},
+		{name: "explicit", payload: `{"tools":[{"type":"image_generation","size":"1920x1080"}]}`, wantSize: "1920x1080", wantImage: true},
+		{name: "non string", payload: `{"tools":[{"type":"image_generation","size":1024}]}`, wantSize: "1024", wantImage: true},
+		{name: "invalid json", payload: `{`},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			gotSize, gotImage := ChatGPTWebImageSizeFromResponsesPayload([]byte(test.payload))
+			if gotSize != test.wantSize || gotImage != test.wantImage {
+				t.Fatalf("size, image = %q, %v; want %q, %v", gotSize, gotImage, test.wantSize, test.wantImage)
+			}
+		})
+	}
+}
+
+func TestChatGPTWebStrictImageSizeErrorPayload(t *testing.T) {
+	payload := ChatGPTWebStrictImageSizeErrorPayload("1024x1536", 3840, 1)
+	if got := gjson.GetBytes(payload, "error.type").String(); got != "invalid_request_error" {
+		t.Fatalf("error type = %q; payload=%s", got, payload)
+	}
+	if got := gjson.GetBytes(payload, "error.param").String(); got != "size" {
+		t.Fatalf("error param = %q; payload=%s", got, payload)
+	}
+	if got := gjson.GetBytes(payload, "error.code").String(); got != "invalid_value" {
+		t.Fatalf("error code = %q; payload=%s", got, payload)
+	}
+}
 
 func TestResolveChatGPTWebImageSize(t *testing.T) {
 	tests := []struct {

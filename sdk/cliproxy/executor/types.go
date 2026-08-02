@@ -70,6 +70,7 @@ const (
 // ChatGPTWebImageConfigSnapshot contains request-scoped Web image adaptation settings.
 type ChatGPTWebImageConfigSnapshot struct {
 	AdaptSizeToAspectRatio     bool
+	StrictSize                 bool
 	AspectRatioMaxErrorPercent float64
 	MaxResizeEdgePixels        int
 	ResizeToRequestedSize      bool

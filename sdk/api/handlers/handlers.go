@@ -65,6 +65,7 @@ type imageGenerationStreamPassthroughStateContextKey struct{}
 type imageGenerationMaxResultsContextKey struct{}
 type chatGPTWebIgnoreUnsupportedImageParamsContextKey struct{}
 type chatGPTWebImageConfigSnapshotContextKey struct{}
+type chatGPTWebStrictImageSizeErrorContextKey struct{}
 type interactionsAPIMetadataContextKey struct{}
 
 type interactionsAPIMetadata struct {
@@ -286,6 +287,97 @@ func restrictExecutionProviders(ctx context.Context, providers []string) ([]stri
 		return filtered, nil
 	}
 	return nil, providerNotAllowedError()
+}
+
+func (h *BaseAPIHandler) filterChatGPTWebStrictImageSize(
+	ctx context.Context,
+	providers []string,
+	handlerType string,
+	rawJSON []byte,
+) (context.Context, []string, *interfaces.ErrorMessage) {
+	if handlerType != constant.OpenaiResponse || !providersContainChatGPTWeb(providers) {
+		return ctx, providers, nil
+	}
+
+	snapshot, pinned := chatGPTWebImageConfigSnapshot(ctx)
+	if !pinned {
+		resolved := config.ChatGPTWebImageConfig{}.Resolved()
+		if h != nil && h.Cfg != nil {
+			resolved = h.Cfg.Images.ChatGPTWeb.Resolved()
+		}
+		if !resolved.StrictSize {
+			return ctx, providers, nil
+		}
+		snapshot = coreexecutor.ChatGPTWebImageConfigSnapshot{
+			AdaptSizeToAspectRatio:     resolved.AdaptSizeToAspectRatio,
+			StrictSize:                 resolved.StrictSize,
+			AspectRatioMaxErrorPercent: resolved.AspectRatioMaxErrorPercent,
+			MaxResizeEdgePixels:        resolved.MaxResizeEdgePixels,
+			ResizeToRequestedSize:      resolved.ResizeToRequestedSize,
+			ResizeFilter:               resolved.ResizeFilter,
+			MaxImageResponseBytes:      resolved.MaxImageResponseMegabytes << 20,
+		}
+		ctx = WithChatGPTWebImageConfigSnapshot(ctx, snapshot)
+	}
+	if !snapshot.StrictSize {
+		return ctx, providers, nil
+	}
+
+	size, hasImageTool := executorhelps.ChatGPTWebImageSizeFromResponsesPayload(rawJSON)
+	if !hasImageTool {
+		return ctx, providers, nil
+	}
+	_, disposition := executorhelps.ResolveChatGPTWebImageSize(
+		size,
+		snapshot.MaxResizeEdgePixels,
+		snapshot.AspectRatioMaxErrorPercent,
+	)
+	if disposition == executorhelps.ChatGPTWebImageSizeUnspecified || disposition == executorhelps.ChatGPTWebImageSizeMatched {
+		return ctx, providers, nil
+	}
+
+	filtered := excludeExecutionProvider(providers, constant.ChatGPTWeb)
+	if len(filtered) > 0 {
+		return context.WithValue(
+			ctx,
+			chatGPTWebStrictImageSizeErrorContextKey{},
+			executorhelps.ChatGPTWebStrictImageSizeErrorPayload(
+				size,
+				snapshot.MaxResizeEdgePixels,
+				snapshot.AspectRatioMaxErrorPercent,
+			),
+		), filtered, nil
+	}
+	return ctx, nil, &interfaces.ErrorMessage{
+		StatusCode: http.StatusBadRequest,
+		Error: errors.New(string(executorhelps.ChatGPTWebStrictImageSizeErrorPayload(
+			size,
+			snapshot.MaxResizeEdgePixels,
+			snapshot.AspectRatioMaxErrorPercent,
+		))),
+	}
+}
+
+func chatGPTWebStrictImageSizeUnavailableError(ctx context.Context, err error) *interfaces.ErrorMessage {
+	if ctx == nil || err == nil {
+		return nil
+	}
+	payload, _ := ctx.Value(chatGPTWebStrictImageSizeErrorContextKey{}).([]byte)
+	if len(payload) == 0 {
+		return nil
+	}
+	var authErr *coreauth.Error
+	if !errors.As(err, &authErr) || authErr == nil {
+		return nil
+	}
+	code := strings.TrimSpace(authErr.Code)
+	if code != "auth_not_found" && code != "auth_unavailable" {
+		return nil
+	}
+	return &interfaces.ErrorMessage{
+		StatusCode: http.StatusBadRequest,
+		Error:      errors.New(string(payload)),
+	}
 }
 
 // ValidateModelProviderAccess checks a model route without selecting or executing an auth.
@@ -890,6 +982,10 @@ func (h *BaseAPIHandler) ExecuteWithAuthManager(ctx context.Context, handlerType
 	if errMsg != nil {
 		return nil, nil, errMsg
 	}
+	ctx, providers, errMsg = h.filterChatGPTWebStrictImageSize(ctx, providers, handlerType, rawJSON)
+	if errMsg != nil {
+		return nil, nil, errMsg
+	}
 	reqMeta := requestExecutionMetadata(ctx)
 	reqMeta[coreexecutor.RequestedModelMetadataKey] = normalizedModel
 	ctx, _ = h.attachRequestBodyRelease(ctx, rawJSON, reqMeta, providersContainChatGPTWeb(providers))
@@ -910,6 +1006,9 @@ func (h *BaseAPIHandler) ExecuteWithAuthManager(ctx context.Context, handlerType
 	opts.Metadata = reqMeta
 	resp, err := h.AuthManager.Execute(ctx, providers, req, opts)
 	if err != nil {
+		if strictErr := chatGPTWebStrictImageSizeUnavailableError(ctx, err); strictErr != nil {
+			return nil, nil, strictErr
+		}
 		return nil, nil, h.RewriteExecutionErrorResponse(executionErrorMessage(err, providers, normalizedModel))
 	}
 	if !PassthroughHeadersEnabled(h.Cfg) {
@@ -935,6 +1034,10 @@ func (h *BaseAPIHandler) ExecuteWithProvidersAndExecutionModel(ctx context.Conte
 		return nil, nil, &interfaces.ErrorMessage{StatusCode: http.StatusBadGateway, Error: fmt.Errorf("no provider configured for model %s", normalizedRouteModel)}
 	}
 	providers, errRestricted := restrictExecutionProviders(ctx, providers)
+	if errRestricted != nil {
+		return nil, nil, errRestricted
+	}
+	ctx, providers, errRestricted = h.filterChatGPTWebStrictImageSize(ctx, providers, handlerType, rawJSON)
 	if errRestricted != nil {
 		return nil, nil, errRestricted
 	}
@@ -965,6 +1068,9 @@ func (h *BaseAPIHandler) ExecuteWithProvidersAndExecutionModel(ctx context.Conte
 	opts.Metadata = reqMeta
 	resp, err := h.AuthManager.Execute(ctx, providers, req, opts)
 	if err != nil {
+		if strictErr := chatGPTWebStrictImageSizeUnavailableError(ctx, err); strictErr != nil {
+			return nil, nil, strictErr
+		}
 		return nil, nil, h.RewriteExecutionErrorResponse(executionErrorMessage(err, providers, normalizedRouteModel))
 	}
 	if !PassthroughHeadersEnabled(h.Cfg) {
@@ -1010,6 +1116,10 @@ func (h *BaseAPIHandler) ExecuteCountWithAuthManager(ctx context.Context, handle
 	if errMsg != nil {
 		return nil, nil, errMsg
 	}
+	ctx, providers, errMsg = h.filterChatGPTWebStrictImageSize(ctx, providers, handlerType, rawJSON)
+	if errMsg != nil {
+		return nil, nil, errMsg
+	}
 	reqMeta := requestExecutionMetadata(ctx)
 	reqMeta[coreexecutor.RequestedModelMetadataKey] = normalizedModel
 	ctx, _ = h.attachRequestBodyRelease(ctx, rawJSON, reqMeta, providersContainChatGPTWeb(providers))
@@ -1030,6 +1140,9 @@ func (h *BaseAPIHandler) ExecuteCountWithAuthManager(ctx context.Context, handle
 	opts.Metadata = reqMeta
 	resp, err := h.AuthManager.ExecuteCount(ctx, providers, req, opts)
 	if err != nil {
+		if strictErr := chatGPTWebStrictImageSizeUnavailableError(ctx, err); strictErr != nil {
+			return nil, nil, strictErr
+		}
 		return nil, nil, h.RewriteExecutionErrorResponse(executionErrorMessage(err, providers, normalizedModel))
 	}
 	if !PassthroughHeadersEnabled(h.Cfg) {
@@ -1056,6 +1169,13 @@ func (h *BaseAPIHandler) ExecuteStreamWithAuthManager(ctx context.Context, handl
 func (h *BaseAPIHandler) executeStreamWithResolvedProviders(ctx context.Context, providers []string, handlerType, normalizedRouteModel, executionModelName string, rawJSON []byte, alt string) (<-chan []byte, http.Header, <-chan *interfaces.ErrorMessage) {
 	var errRestricted *interfaces.ErrorMessage
 	providers, errRestricted = restrictExecutionProviders(ctx, providers)
+	if errRestricted != nil {
+		errChan := make(chan *interfaces.ErrorMessage, 1)
+		errChan <- errRestricted
+		close(errChan)
+		return nil, nil, errChan
+	}
+	ctx, providers, errRestricted = h.filterChatGPTWebStrictImageSize(ctx, providers, handlerType, rawJSON)
 	if errRestricted != nil {
 		errChan := make(chan *interfaces.ErrorMessage, 1)
 		errChan <- errRestricted
@@ -1104,7 +1224,11 @@ func (h *BaseAPIHandler) executeStreamWithResolvedProviders(ctx context.Context,
 	streamResult, err := h.AuthManager.ExecuteStream(ctx, providers, req, opts)
 	if err != nil {
 		errChan := make(chan *interfaces.ErrorMessage, 1)
-		errChan <- h.RewriteExecutionErrorResponse(executionErrorMessage(err, providers, normalizedRouteModel))
+		if strictErr := chatGPTWebStrictImageSizeUnavailableError(ctx, err); strictErr != nil {
+			errChan <- strictErr
+		} else {
+			errChan <- h.RewriteExecutionErrorResponse(executionErrorMessage(err, providers, normalizedRouteModel))
+		}
 		close(errChan)
 		return nil, nil, errChan
 	}

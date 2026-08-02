@@ -1833,7 +1833,7 @@ func chatGPTWebImageRequestCompatibilityError(req openAIImageRequest, ignoreUnsu
 			(size == "1024x1024" && (len(req.Images) > 0 || req.Mask != nil))
 		if imageConfig.AdaptSizeToAspectRatio {
 			_, disposition := executorhelps.ResolveChatGPTWebImageSize(size, imageConfig.MaxResizeEdgePixels, imageConfig.AspectRatioMaxErrorPercent)
-			defaultSize = disposition != executorhelps.ChatGPTWebImageSizeInvalid
+			defaultSize = imageConfig.StrictSize || disposition != executorhelps.ChatGPTWebImageSizeInvalid
 		}
 		background := strings.ToLower(strings.TrimSpace(req.Background))
 		moderation := strings.ToLower(strings.TrimSpace(req.Moderation))
@@ -2213,6 +2213,7 @@ func (h *OpenAIImagesAPIHandler) chatGPTWebImageConfigSnapshot() coreexecutor.Ch
 	}
 	return coreexecutor.ChatGPTWebImageConfigSnapshot{
 		AdaptSizeToAspectRatio:     resolved.AdaptSizeToAspectRatio,
+		StrictSize:                 resolved.StrictSize,
 		AspectRatioMaxErrorPercent: resolved.AspectRatioMaxErrorPercent,
 		MaxResizeEdgePixels:        resolved.MaxResizeEdgePixels,
 		ResizeToRequestedSize:      resolved.ResizeToRequestedSize,

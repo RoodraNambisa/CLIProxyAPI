@@ -135,6 +135,7 @@ func defaultChatGPTWebImageConfigSnapshot() coreexecutor.ChatGPTWebImageConfigSn
 	resolved := (sdkconfig.ChatGPTWebImageConfig{}).Resolved()
 	return coreexecutor.ChatGPTWebImageConfigSnapshot{
 		AdaptSizeToAspectRatio:     resolved.AdaptSizeToAspectRatio,
+		StrictSize:                 resolved.StrictSize,
 		AspectRatioMaxErrorPercent: resolved.AspectRatioMaxErrorPercent,
 		MaxResizeEdgePixels:        resolved.MaxResizeEdgePixels,
 		ResizeToRequestedSize:      resolved.ResizeToRequestedSize,
@@ -467,11 +468,25 @@ func TestImageResponsesProvidersAdaptSupportedAndIgnoredWebSizes(t *testing.T) {
 	}
 }
 
+func TestImageResponsesProvidersKeepsStrictSizesForRequestFiltering(t *testing.T) {
+	imageConfig := defaultChatGPTWebImageConfigSnapshot()
+	imageConfig.AdaptSizeToAspectRatio = true
+	imageConfig.StrictSize = true
+	for _, size := range []string{"1024x1536", "4000x4000", "square"} {
+		got := imageResponsesProviders(openAIImageRequest{Size: size}, false, imageConfig)
+		want := []string{constant.Codex, constant.ChatGPTWeb}
+		if strings.Join(got, ",") != strings.Join(want, ",") {
+			t.Fatalf("size %q providers = %v, want %v", size, got, want)
+		}
+	}
+}
+
 func TestOpenAIImagesPinsChatGPTWebImageAspectConfig(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	executor := &imageCaptureExecutor{provider: constant.ChatGPTWeb}
 	h := newImagesTestHandler(t, executor)
 	h.Cfg.Images.ChatGPTWeb.AdaptSizeToAspectRatio = true
+	h.Cfg.Images.ChatGPTWeb.StrictSize = true
 	router := gin.New()
 	router.Use(allowedImageProvidersMiddleware(constant.ChatGPTWeb))
 	router.POST("/v1/images/generations", h.Generations)
@@ -486,7 +501,7 @@ func TestOpenAIImagesPinsChatGPTWebImageAspectConfig(t *testing.T) {
 	if response.Code != http.StatusOK {
 		t.Fatalf("status = %d, body=%s", response.Code, response.Body.String())
 	}
-	if !executor.hasImageConfigSnapshot || !executor.imageConfigSnapshot.AdaptSizeToAspectRatio ||
+	if !executor.hasImageConfigSnapshot || !executor.imageConfigSnapshot.AdaptSizeToAspectRatio || !executor.imageConfigSnapshot.StrictSize ||
 		executor.imageConfigSnapshot.AspectRatioMaxErrorPercent != 1 || executor.imageConfigSnapshot.MaxResizeEdgePixels != 3840 ||
 		executor.imageConfigSnapshot.ResizeFilter != sdkconfig.DefaultChatGPTWebResizeFilter ||
 		executor.imageConfigSnapshot.MaxImageResponseBytes != sdkconfig.DefaultChatGPTWebMaxImageResponseMegabytes<<20 {
@@ -573,6 +588,87 @@ func TestOpenAIImagesMixedKeyRoutesUnsupportedWebParamsToCodex(t *testing.T) {
 	}
 	if codexExecutor.calls != 1 || webExecutor.calls != 0 {
 		t.Fatalf("executor calls: codex=%d web=%d, want 1/0", codexExecutor.calls, webExecutor.calls)
+	}
+}
+
+func TestOpenAIImagesStrictSizeRoutesIncompatibleRequestToCodex(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	executor := &imageCaptureExecutor{provider: constant.Codex}
+	h := newImagesTestHandler(t, executor)
+	h.Cfg.Images.ChatGPTWeb.AdaptSizeToAspectRatio = true
+	h.Cfg.Images.ChatGPTWeb.StrictSize = true
+	h.Cfg.Images.ChatGPTWeb.IgnoreUnsupportedParams = true
+	router := gin.New()
+	router.POST("/v1/images/generations", h.Generations)
+
+	request := httptest.NewRequest(http.MethodPost, "/v1/images/generations", strings.NewReader(
+		`{"model":"gpt-image-2","prompt":"draw","size":"1024x1536"}`,
+	))
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", response.Code, response.Body.String())
+	}
+	if executor.calls != 1 {
+		t.Fatalf("executor calls = %d, want 1", executor.calls)
+	}
+}
+
+func TestOpenAIImagesStrictSizeRejectsWebOnlyBeforeExecution(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	tests := []struct {
+		name string
+		path string
+		body string
+	}{
+		{
+			name: "generation",
+			path: "/v1/images/generations",
+			body: `{"model":"gpt-image-2","prompt":"draw","size":"1024x1536"}`,
+		},
+		{
+			name: "streaming generation",
+			path: "/v1/images/generations",
+			body: `{"model":"gpt-image-2","prompt":"draw","size":"4000x4000","stream":true}`,
+		},
+		{
+			name: "edit",
+			path: "/v1/images/edits",
+			body: `{"model":"gpt-image-2","prompt":"edit","size":"square","images":[{"image_url":"data:image/png;base64,aGVsbG8="}]}`,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			executor := &imageCaptureExecutor{provider: constant.ChatGPTWeb}
+			h := newImagesTestHandler(t, executor)
+			h.Cfg.Images.ChatGPTWeb.AdaptSizeToAspectRatio = true
+			h.Cfg.Images.ChatGPTWeb.StrictSize = true
+			h.Cfg.Images.ChatGPTWeb.IgnoreUnsupportedParams = true
+			router := gin.New()
+			router.Use(allowedImageProvidersMiddleware(constant.ChatGPTWeb))
+			router.POST("/v1/images/generations", h.Generations)
+			router.POST("/v1/images/edits", h.Edits)
+
+			request := httptest.NewRequest(http.MethodPost, test.path, strings.NewReader(test.body))
+			request.Header.Set("Content-Type", "application/json")
+			response := httptest.NewRecorder()
+			router.ServeHTTP(response, request)
+
+			if response.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400; body=%s", response.Code, response.Body.String())
+			}
+			if got := gjson.Get(response.Body.String(), "error.param").String(); got != "size" {
+				t.Fatalf("error param = %q; body=%s", got, response.Body.String())
+			}
+			if got := gjson.Get(response.Body.String(), "error.code").String(); got != "invalid_value" {
+				t.Fatalf("error code = %q; body=%s", got, response.Body.String())
+			}
+			if executor.calls != 0 || executor.streamCalls != 0 {
+				t.Fatalf("executor calls = %d stream calls = %d, want none", executor.calls, executor.streamCalls)
+			}
+		})
 	}
 }
 

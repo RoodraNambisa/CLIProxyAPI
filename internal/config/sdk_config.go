@@ -171,6 +171,8 @@ type ChatGPTWebImageConfig struct {
 	IgnoreUnsupportedParams bool `yaml:"ignore-unsupported-params,omitempty" json:"ignore-unsupported-params,omitempty"`
 	// AdaptSizeToAspectRatio maps explicit image sizes to ratios supported by ChatGPT Web.
 	AdaptSizeToAspectRatio bool `yaml:"adapt-size-to-aspect-ratio,omitempty" json:"adapt-size-to-aspect-ratio,omitempty"`
+	// StrictSize excludes ChatGPT Web when an explicit image size cannot be adapted.
+	StrictSize bool `yaml:"strict-size,omitempty" json:"strict-size,omitempty"`
 	// AspectRatioMaxErrorPercent is the maximum relative error accepted for ratio mapping.
 	AspectRatioMaxErrorPercent *float64 `yaml:"aspect-ratio-max-error-percent,omitempty" json:"aspect-ratio-max-error-percent,omitempty"`
 	// MaxResizeEdgePixels limits explicit size adaptation targets.
@@ -201,6 +203,7 @@ type ResolvedChatGPTWebImageConfig struct {
 	UpstreamModel              string
 	IgnoreUnsupportedParams    bool
 	AdaptSizeToAspectRatio     bool
+	StrictSize                 bool
 	AspectRatioMaxErrorPercent float64
 	MaxResizeEdgePixels        int
 	ResizeToRequestedSize      bool
@@ -222,6 +225,7 @@ func (cfg ChatGPTWebImageConfig) Resolved() ResolvedChatGPTWebImageConfig {
 		UpstreamModel:              cfg.ResolvedUpstreamModel(),
 		IgnoreUnsupportedParams:    cfg.IgnoreUnsupportedParams,
 		AdaptSizeToAspectRatio:     cfg.AdaptSizeToAspectRatio,
+		StrictSize:                 cfg.StrictSize,
 		AspectRatioMaxErrorPercent: DefaultChatGPTWebAspectRatioMaxErrorPercent,
 		MaxResizeEdgePixels:        DefaultChatGPTWebMaxResizeEdgePixels,
 		ResizeToRequestedSize:      cfg.ResizeToRequestedSize,
@@ -256,6 +260,9 @@ func (cfg ChatGPTWebImageConfig) Validate() error {
 	}
 	if resolved.ResizeToRequestedSize && !resolved.AdaptSizeToAspectRatio {
 		return fmt.Errorf("images.chatgpt-web.resize-to-requested-size requires adapt-size-to-aspect-ratio")
+	}
+	if resolved.StrictSize && !resolved.AdaptSizeToAspectRatio {
+		return fmt.Errorf("images.chatgpt-web.strict-size requires adapt-size-to-aspect-ratio")
 	}
 	if resolved.ResizeFilter != ChatGPTWebResizeFilterCatmullRom && resolved.ResizeFilter != ChatGPTWebResizeFilterApproxBiLinear {
 		return fmt.Errorf("images.chatgpt-web.resize-filter must be %s or %s", ChatGPTWebResizeFilterCatmullRom, ChatGPTWebResizeFilterApproxBiLinear)

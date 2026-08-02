@@ -2,12 +2,15 @@ package executor
 
 import (
 	"context"
+	"errors"
+	"net/http"
 	"strings"
 	"testing"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor/helps"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v6/sdk/translator"
+	"github.com/tidwall/gjson"
 )
 
 func TestPrepareRuntimeRequestAdaptsPinnedChatGPTWebImageSize(t *testing.T) {
@@ -100,6 +103,51 @@ func TestPrepareRuntimeRequestIgnoresUnmappedChatGPTWebImageSizes(t *testing.T) 
 			defer prepared.discardUsageProjection()
 			if prepared.request.Image == nil || prepared.request.Image.Size != "" || prepared.imageSizeMatch != nil {
 				t.Fatalf("prepared image request=%#v match=%#v", prepared.request.Image, prepared.imageSizeMatch)
+			}
+		})
+	}
+}
+
+func TestPrepareRuntimeRequestStrictSizeRejectsBeforeNetwork(t *testing.T) {
+	for _, size := range []string{"1024x1536", "4000x4000", "square"} {
+		t.Run(size, func(t *testing.T) {
+			executor := NewChatGPTWebExecutor(nil, nil)
+			payload := []byte(`{"model":"gpt-5.4","input":"draw","tools":[{"type":"image_generation","size":"` + size + `"}]}`)
+			_, err := executor.prepareRuntimeRequest(
+				context.Background(),
+				chatGPTWebRuntimeAuth(),
+				cliproxyexecutor.Request{Model: "gpt-image-2", Payload: payload},
+				cliproxyexecutor.Options{
+					SourceFormat:   sdktranslator.FormatCodex,
+					ResponseFormat: sdktranslator.FormatCodex,
+					Metadata: map[string]any{
+						cliproxyexecutor.ChatGPTWebImageConfigSnapshotMetadataKey: cliproxyexecutor.ChatGPTWebImageConfigSnapshot{
+							AdaptSizeToAspectRatio:     true,
+							StrictSize:                 true,
+							AspectRatioMaxErrorPercent: 1,
+							MaxResizeEdgePixels:        3840,
+						},
+					},
+				},
+				false,
+			)
+			if err == nil {
+				t.Fatal("prepareRuntimeRequest() error = nil, want strict size error")
+			}
+			var status interface{ StatusCode() int }
+			if !errors.As(err, &status) || status.StatusCode() != http.StatusBadRequest {
+				t.Fatalf("status error = %v, want 400", err)
+			}
+			var skipper interface{ SkipAuthResult() bool }
+			if !errors.As(err, &skipper) || !skipper.SkipAuthResult() {
+				t.Fatalf("SkipAuthResult() = false; error=%v", err)
+			}
+			var retrier interface{ RetryOtherAuth() bool }
+			if !errors.As(err, &retrier) || retrier.RetryOtherAuth() {
+				t.Fatalf("RetryOtherAuth() = true; error=%v", err)
+			}
+			if got := gjson.Get(err.Error(), "error.code").String(); got != "invalid_value" {
+				t.Fatalf("error code = %q; error=%v", got, err)
 			}
 		})
 	}

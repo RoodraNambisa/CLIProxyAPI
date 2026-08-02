@@ -80,6 +80,7 @@ func TestLoadConfigOptionalChatGPTWebImageAspectSettings(t *testing.T) {
 	data := []byte(`images:
   chatgpt-web:
     adapt-size-to-aspect-ratio: true
+    strict-size: true
     aspect-ratio-max-error-percent: 0.5
     max-resize-edge-pixels: 2048
     resize-to-requested-size: true
@@ -95,7 +96,7 @@ func TestLoadConfigOptionalChatGPTWebImageAspectSettings(t *testing.T) {
 		t.Fatalf("LoadConfigOptional() error = %v", err)
 	}
 	resolved := cfg.Images.ChatGPTWeb.Resolved()
-	if !resolved.AdaptSizeToAspectRatio || resolved.AspectRatioMaxErrorPercent != 0.5 || resolved.MaxResizeEdgePixels != 2048 ||
+	if !resolved.AdaptSizeToAspectRatio || !resolved.StrictSize || resolved.AspectRatioMaxErrorPercent != 0.5 || resolved.MaxResizeEdgePixels != 2048 ||
 		!resolved.ResizeToRequestedSize || resolved.ResizeFilter != ChatGPTWebResizeFilterApproxBiLinear ||
 		resolved.MaxImageResponseMegabytes != responseBudget {
 		t.Fatalf("resolved ChatGPT Web image config = %#v", resolved)
@@ -105,6 +106,7 @@ func TestLoadConfigOptionalChatGPTWebImageAspectSettings(t *testing.T) {
 func TestChatGPTWebImageAspectSettingsDefaultsAndValidation(t *testing.T) {
 	resolved := (ChatGPTWebImageConfig{}).Resolved()
 	if resolved.AdaptSizeToAspectRatio ||
+		resolved.StrictSize ||
 		resolved.AspectRatioMaxErrorPercent != DefaultChatGPTWebAspectRatioMaxErrorPercent ||
 		resolved.MaxResizeEdgePixels != DefaultChatGPTWebMaxResizeEdgePixels ||
 		resolved.ResizeToRequestedSize || resolved.ResizeFilter != DefaultChatGPTWebResizeFilter ||
@@ -129,6 +131,7 @@ func TestChatGPTWebImageAspectSettingsDefaultsAndValidation(t *testing.T) {
 		{name: "zero edge", cfg: ChatGPTWebImageConfig{MaxResizeEdgePixels: &zeroEdge}},
 		{name: "large edge", cfg: ChatGPTWebImageConfig{MaxResizeEdgePixels: &tooLargeEdge}},
 		{name: "resize without adaptation", cfg: ChatGPTWebImageConfig{ResizeToRequestedSize: true}},
+		{name: "strict size without adaptation", cfg: ChatGPTWebImageConfig{StrictSize: true}},
 		{name: "unknown filter", cfg: ChatGPTWebImageConfig{ResizeFilter: "nearest"}},
 		{name: "zero response budget", cfg: ChatGPTWebImageConfig{MaxImageResponseMegabytes: &zeroResponseBudget}},
 		{name: "large response budget", cfg: ChatGPTWebImageConfig{MaxImageResponseMegabytes: &tooLargeResponseBudget}},
@@ -160,6 +163,7 @@ func TestLoadConfigOptionalRejectsInvalidChatGPTWebImageAspectSettings(t *testin
 	}{
 		{name: "ratio tolerance", body: "aspect-ratio-max-error-percent: 11"},
 		{name: "resize dependency", body: "resize-to-requested-size: true"},
+		{name: "strict size dependency", body: "strict-size: true"},
 		{name: "resize filter", body: "resize-filter: nearest"},
 		{name: "response budget", body: "max-image-response-megabytes: 257"},
 	}

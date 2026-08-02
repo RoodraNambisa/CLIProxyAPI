@@ -363,6 +363,7 @@ func (e *ChatGPTWebExecutor) prepareRuntimeRequest(ctx context.Context, auth *cl
 	}
 	imageConfigSnapshot := cliproxyexecutor.ChatGPTWebImageConfigSnapshot{
 		AdaptSizeToAspectRatio:     resolvedImageConfig.AdaptSizeToAspectRatio,
+		StrictSize:                 resolvedImageConfig.StrictSize,
 		AspectRatioMaxErrorPercent: resolvedImageConfig.AspectRatioMaxErrorPercent,
 		MaxResizeEdgePixels:        resolvedImageConfig.MaxResizeEdgePixels,
 		ResizeToRequestedSize:      resolvedImageConfig.ResizeToRequestedSize,
@@ -423,8 +424,19 @@ func (e *ChatGPTWebExecutor) prepareRuntimeRequest(ctx context.Context, auth *cl
 		case helps.ChatGPTWebImageSizeMatched:
 			imageSizeMatch = &match
 			parsed.Image.Size = ""
-		case helps.ChatGPTWebImageSizeUnspecified, helps.ChatGPTWebImageSizeIgnored:
+		case helps.ChatGPTWebImageSizeUnspecified:
 			parsed.Image.Size = ""
+		case helps.ChatGPTWebImageSizeIgnored, helps.ChatGPTWebImageSizeInvalid:
+			if imageConfigSnapshot.StrictSize {
+				return nil, statusErr{
+					code:           http.StatusBadRequest,
+					msg:            string(helps.ChatGPTWebStrictImageSizeErrorPayload(parsed.Image.Size, imageConfigSnapshot.MaxResizeEdgePixels, imageConfigSnapshot.AspectRatioMaxErrorPercent)),
+					skipAuthResult: true,
+				}
+			}
+			if disposition == helps.ChatGPTWebImageSizeIgnored {
+				parsed.Image.Size = ""
+			}
 		}
 	}
 	if ignoreUnsupportedImageParams {

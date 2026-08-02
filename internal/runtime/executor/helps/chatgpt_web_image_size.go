@@ -1,6 +1,7 @@
 package helps
 
 import (
+	"encoding/json"
 	"math"
 	"strconv"
 	"strings"
@@ -34,6 +35,53 @@ var chatGPTWebSupportedImageRatios = [...]struct {
 	{width: 9, height: 16},
 	{width: 4, height: 3},
 	{width: 16, height: 9},
+}
+
+// ChatGPTWebImageSizeFromResponsesPayload returns the first image_generation size.
+func ChatGPTWebImageSizeFromResponsesPayload(payload []byte) (string, bool) {
+	var request struct {
+		Tools []json.RawMessage `json:"tools"`
+	}
+	if len(payload) == 0 || json.Unmarshal(payload, &request) != nil {
+		return "", false
+	}
+	for _, rawTool := range request.Tools {
+		var tool struct {
+			Type string          `json:"type"`
+			Size json.RawMessage `json:"size"`
+		}
+		if json.Unmarshal(rawTool, &tool) != nil || !strings.EqualFold(strings.TrimSpace(tool.Type), "image_generation") {
+			continue
+		}
+		if len(tool.Size) == 0 || string(tool.Size) == "null" {
+			return "", true
+		}
+		var size string
+		if json.Unmarshal(tool.Size, &size) == nil {
+			return size, true
+		}
+		return string(tool.Size), true
+	}
+	return "", false
+}
+
+// ChatGPTWebStrictImageSizeErrorPayload builds an OpenAI-compatible size error.
+func ChatGPTWebStrictImageSizeErrorPayload(size string, maxEdge int, maxErrorPercent float64) []byte {
+	message := "Invalid value for 'size': " + strconv.Quote(strings.TrimSpace(size)) +
+		" cannot be handled by ChatGPT Web strict size mode. Use auto or a positive WxH size matching " +
+		"one of 1:1, 3:4, 9:16, 4:3, or 16:9 within " +
+		strconv.FormatFloat(maxErrorPercent, 'f', -1, 64) + "% and with each edge no greater than " +
+		strconv.Itoa(maxEdge) + " pixels."
+	payload, err := json.Marshal(map[string]any{"error": map[string]any{
+		"message": message,
+		"type":    "invalid_request_error",
+		"param":   "size",
+		"code":    "invalid_value",
+	}})
+	if err != nil {
+		return []byte(`{"error":{"message":"Invalid image size","type":"invalid_request_error","param":"size","code":"invalid_value"}}`)
+	}
+	return payload
 }
 
 // ResolveChatGPTWebImageSize maps an explicit WxH target to the nearest supported ratio.
