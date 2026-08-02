@@ -126,6 +126,9 @@ chatgpt-web:
     refresh-workers: 4
     refresh-queue-size: 256
     refresh-ttl-minutes: 15
+    # 0 disables periodic scans. Positive values scan every eligible ChatGPT Web
+    # credential while still respecting the refresh TTL.
+    periodic-refresh-minutes: 0
     recovery-jitter-seconds: 30
     # Number of retries after the initial failed refresh.
     max-retries: 3

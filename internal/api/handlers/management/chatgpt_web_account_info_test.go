@@ -133,7 +133,8 @@ func TestGetChatGPTWebAccountInfoReturnsDefaultsAndRuntime(t *testing.T) {
 	}
 	if !response.Config.AutoRefreshEnabled ||
 		response.Config.RefreshWorkers != 4 || response.Config.RefreshQueueSize != 256 ||
-		response.Config.RefreshTTLMinutes != 15 || response.Config.RecoveryJitterSeconds != 30 ||
+		response.Config.RefreshTTLMinutes != 15 || response.Config.PeriodicRefreshMinutes != 0 ||
+		response.Config.RecoveryJitterSeconds != 30 ||
 		response.Config.MaxRetries != 3 {
 		t.Fatalf("defaults = %+v", response.Config)
 	}
@@ -162,7 +163,7 @@ func TestPatchAndStartChatGPTWebAccountInfoRefresh(t *testing.T) {
 
 	ctx, recorder := newChatGPTWebAccountInfoRequest(
 		http.MethodPatch,
-		`{"auto-refresh-enabled":false,"refresh-workers":6,"max-retries":1}`,
+		`{"auto-refresh-enabled":false,"refresh-workers":6,"periodic-refresh-minutes":60,"max-retries":1}`,
 	)
 	handler.PatchChatGPTWebAccountInfo(ctx)
 	if recorder.Code != http.StatusOK {
@@ -170,7 +171,8 @@ func TestPatchAndStartChatGPTWebAccountInfoRefresh(t *testing.T) {
 	}
 	resolved := handler.cfg.ChatGPTWeb.AccountInfo.Resolved()
 	if resolved.AutoRefreshEnabled ||
-		resolved.RefreshWorkers != 6 || resolved.MaxRetries != 1 || resolved.RefreshQueueSize != 256 {
+		resolved.RefreshWorkers != 6 || resolved.PeriodicRefreshMinutes != 60 ||
+		resolved.MaxRetries != 1 || resolved.RefreshQueueSize != 256 {
 		t.Fatalf("patched config = %+v", resolved)
 	}
 	executor.mu.Lock()
@@ -214,6 +216,26 @@ func TestPutChatGPTWebAccountInfoAcceptsLegacyPayloadWithoutAutoRefresh(t *testi
 	resolved := handler.cfg.ChatGPTWeb.AccountInfo.Resolved()
 	if !resolved.AutoRefreshEnabled || !resolved.AutomaticRefreshEnabled() {
 		t.Fatalf("legacy PUT disabled automatic refresh: %+v", resolved)
+	}
+	if resolved.PeriodicRefreshMinutes != 0 {
+		t.Fatalf("legacy PUT periodic refresh = %d, want disabled", resolved.PeriodicRefreshMinutes)
+	}
+}
+
+func TestPatchChatGPTWebAccountInfoRejectsNullPeriodicRefresh(t *testing.T) {
+	manager := coreauth.NewManager(nil, nil, nil)
+	manager.RegisterExecutor(&accountInfoControllerTestExecutor{})
+	handler := &Handler{cfg: &config.Config{}, authManager: manager}
+	ctx, recorder := newChatGPTWebAccountInfoRequest(
+		http.MethodPatch,
+		`{"periodic-refresh-minutes":null}`,
+	)
+
+	handler.PatchChatGPTWebAccountInfo(ctx)
+
+	if recorder.Code != http.StatusBadRequest ||
+		!strings.Contains(recorder.Body.String(), "invalid periodic-refresh-minutes") {
+		t.Fatalf("status = %d body = %s", recorder.Code, recorder.Body.String())
 	}
 }
 

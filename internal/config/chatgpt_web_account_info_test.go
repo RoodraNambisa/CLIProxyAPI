@@ -11,7 +11,8 @@ func TestChatGPTWebAccountInfoConfigDefaults(t *testing.T) {
 	resolved := (ChatGPTWebAccountInfoConfig{}).Resolved()
 	if !resolved.AutoRefreshEnabled ||
 		resolved.RefreshWorkers != 4 || resolved.RefreshQueueSize != 256 ||
-		resolved.RefreshTTLMinutes != 15 || resolved.RecoveryJitterSeconds != 30 ||
+		resolved.RefreshTTLMinutes != 15 || resolved.PeriodicRefreshMinutes != 0 ||
+		resolved.RecoveryJitterSeconds != 30 ||
 		resolved.MaxRetries != 3 {
 		t.Fatalf("Resolved() = %+v", resolved)
 	}
@@ -39,6 +40,8 @@ func TestChatGPTWebAccountInfoConfigValidation(t *testing.T) {
 		{name: "large queue", config: ChatGPTWebAccountInfoConfig{RefreshQueueSize: intPointer(10001)}, message: "refresh-queue-size"},
 		{name: "zero ttl", config: ChatGPTWebAccountInfoConfig{RefreshTTLMinutes: intPointer(0)}, message: "refresh-ttl-minutes"},
 		{name: "large ttl", config: ChatGPTWebAccountInfoConfig{RefreshTTLMinutes: intPointer(1441)}, message: "refresh-ttl-minutes"},
+		{name: "negative periodic refresh", config: ChatGPTWebAccountInfoConfig{PeriodicRefreshMinutes: intPointer(-1)}, message: "periodic-refresh-minutes"},
+		{name: "large periodic refresh", config: ChatGPTWebAccountInfoConfig{PeriodicRefreshMinutes: intPointer(10081)}, message: "periodic-refresh-minutes"},
 		{name: "negative jitter", config: ChatGPTWebAccountInfoConfig{RecoveryJitterSeconds: intPointer(-1)}, message: "recovery-jitter-seconds"},
 		{name: "large jitter", config: ChatGPTWebAccountInfoConfig{RecoveryJitterSeconds: intPointer(301)}, message: "recovery-jitter-seconds"},
 		{name: "negative retries", config: ChatGPTWebAccountInfoConfig{MaxRetries: intPointer(-1)}, message: "max-retries"},
@@ -56,7 +59,7 @@ func TestChatGPTWebAccountInfoConfigValidation(t *testing.T) {
 
 func TestLoadAndSaveChatGPTWebAccountInfoConfig(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.yaml")
-	data := []byte("chatgpt-web:\n  force-session-refresh-on-import: false\n  account-info:\n    auto-refresh-enabled: false\n    refresh-workers: 2\n    refresh-queue-size: 0\n    refresh-ttl-minutes: 30\n    recovery-jitter-seconds: 0\n    max-retries: 0\n")
+	data := []byte("chatgpt-web:\n  force-session-refresh-on-import: false\n  account-info:\n    auto-refresh-enabled: false\n    refresh-workers: 2\n    refresh-queue-size: 0\n    refresh-ttl-minutes: 30\n    periodic-refresh-minutes: 0\n    recovery-jitter-seconds: 0\n    max-retries: 0\n")
 	if err := os.WriteFile(path, data, 0o600); err != nil {
 		t.Fatalf("write config: %v", err)
 	}
@@ -67,7 +70,8 @@ func TestLoadAndSaveChatGPTWebAccountInfoConfig(t *testing.T) {
 	resolved := cfg.ChatGPTWeb.AccountInfo.Resolved()
 	if resolved.AutoRefreshEnabled ||
 		resolved.RefreshWorkers != 2 || resolved.RefreshQueueSize != 0 ||
-		resolved.RefreshTTLMinutes != 30 || resolved.RecoveryJitterSeconds != 0 ||
+		resolved.RefreshTTLMinutes != 30 || resolved.PeriodicRefreshMinutes != 0 ||
+		resolved.RecoveryJitterSeconds != 0 ||
 		resolved.MaxRetries != 0 {
 		t.Fatalf("resolved = %+v", resolved)
 	}
@@ -86,6 +90,7 @@ func TestLoadAndSaveChatGPTWebAccountInfoConfig(t *testing.T) {
 		"account-info:",
 		"auto-refresh-enabled: false",
 		"refresh-queue-size: 0",
+		"periodic-refresh-minutes: 0",
 		"recovery-jitter-seconds: 0",
 		"max-retries: 0",
 	} {
@@ -104,7 +109,9 @@ func TestLoadConfigRejectsInvalidChatGPTWebAccountInfoFields(t *testing.T) {
 		{name: "unknown", yaml: "chatgpt-web:\n  account-info:\n    refresh-worker: 4\n", want: "refresh-worker"},
 		{name: "null", yaml: "chatgpt-web:\n  account-info:\n    refresh-workers: null\n", want: "refresh-workers"},
 		{name: "null auto refresh", yaml: "chatgpt-web:\n  account-info:\n    auto-refresh-enabled: null\n", want: "auto-refresh-enabled"},
+		{name: "null periodic refresh", yaml: "chatgpt-web:\n  account-info:\n    periodic-refresh-minutes: null\n", want: "periodic-refresh-minutes"},
 		{name: "out of range", yaml: "chatgpt-web:\n  account-info:\n    max-retries: 11\n", want: "max-retries"},
+		{name: "periodic refresh out of range", yaml: "chatgpt-web:\n  account-info:\n    periodic-refresh-minutes: 10081\n", want: "periodic-refresh-minutes"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

@@ -67,11 +67,13 @@ const (
 	DefaultChatGPTWebAccountInfoWorkers        = 4
 	DefaultChatGPTWebAccountInfoQueueSize      = 256
 	DefaultChatGPTWebAccountInfoTTLMinutes     = 15
+	DefaultChatGPTWebAccountInfoPeriodMinutes  = 0
 	DefaultChatGPTWebAccountInfoJitterSeconds  = 30
 	DefaultChatGPTWebAccountInfoMaxRetries     = 3
 	MaxChatGPTWebAccountInfoWorkers            = 32
 	MaxChatGPTWebAccountInfoQueueSize          = 10000
 	MaxChatGPTWebAccountInfoTTLMinutes         = 1440
+	MaxChatGPTWebAccountInfoPeriodMinutes      = 10080
 	MaxChatGPTWebAccountInfoJitterSeconds      = 300
 	MaxChatGPTWebAccountInfoRetries            = 10
 	DefaultChatGPTWebLoginProxyRequestAttempts = 3
@@ -865,12 +867,13 @@ func loadChatGPTWebTimezone(name string) (*time.Location, error) {
 
 // ChatGPTWebAccountInfoConfig controls bounded account profile and image quota refreshes.
 type ChatGPTWebAccountInfoConfig struct {
-	AutoRefreshEnabled    *bool `yaml:"auto-refresh-enabled,omitempty" json:"auto-refresh-enabled,omitempty"`
-	RefreshWorkers        *int  `yaml:"refresh-workers,omitempty" json:"refresh-workers,omitempty"`
-	RefreshQueueSize      *int  `yaml:"refresh-queue-size,omitempty" json:"refresh-queue-size,omitempty"`
-	RefreshTTLMinutes     *int  `yaml:"refresh-ttl-minutes,omitempty" json:"refresh-ttl-minutes,omitempty"`
-	RecoveryJitterSeconds *int  `yaml:"recovery-jitter-seconds,omitempty" json:"recovery-jitter-seconds,omitempty"`
-	MaxRetries            *int  `yaml:"max-retries,omitempty" json:"max-retries,omitempty"`
+	AutoRefreshEnabled     *bool `yaml:"auto-refresh-enabled,omitempty" json:"auto-refresh-enabled,omitempty"`
+	RefreshWorkers         *int  `yaml:"refresh-workers,omitempty" json:"refresh-workers,omitempty"`
+	RefreshQueueSize       *int  `yaml:"refresh-queue-size,omitempty" json:"refresh-queue-size,omitempty"`
+	RefreshTTLMinutes      *int  `yaml:"refresh-ttl-minutes,omitempty" json:"refresh-ttl-minutes,omitempty"`
+	PeriodicRefreshMinutes *int  `yaml:"periodic-refresh-minutes,omitempty" json:"periodic-refresh-minutes,omitempty"`
+	RecoveryJitterSeconds  *int  `yaml:"recovery-jitter-seconds,omitempty" json:"recovery-jitter-seconds,omitempty"`
+	MaxRetries             *int  `yaml:"max-retries,omitempty" json:"max-retries,omitempty"`
 }
 
 // UnmarshalYAML rejects unknown and null account-info settings.
@@ -887,7 +890,7 @@ func (cfg *ChatGPTWebAccountInfoConfig) UnmarshalYAML(node *yaml.Node) error {
 	}
 	for name, value := range effective {
 		switch name {
-		case "auto-refresh-enabled", "refresh-workers", "refresh-queue-size", "refresh-ttl-minutes", "recovery-jitter-seconds", "max-retries":
+		case "auto-refresh-enabled", "refresh-workers", "refresh-queue-size", "refresh-ttl-minutes", "periodic-refresh-minutes", "recovery-jitter-seconds", "max-retries":
 			if value == nil {
 				return fmt.Errorf("chatgpt-web.account-info.%s must not be null", name)
 			}
@@ -906,13 +909,14 @@ func (cfg *ChatGPTWebAccountInfoConfig) UnmarshalYAML(node *yaml.Node) error {
 
 // ResolvedChatGPTWebAccountInfoConfig contains effective refresh-pool values.
 type ResolvedChatGPTWebAccountInfoConfig struct {
-	AutoRefreshEnabled    bool `json:"auto-refresh-enabled"`
-	RefreshWorkers        int  `json:"refresh-workers"`
-	RefreshQueueSize      int  `json:"refresh-queue-size"`
-	RefreshTTLMinutes     int  `json:"refresh-ttl-minutes"`
-	RecoveryJitterSeconds int  `json:"recovery-jitter-seconds"`
-	MaxRetries            int  `json:"max-retries"`
-	autoRefreshConfigured bool
+	AutoRefreshEnabled     bool `json:"auto-refresh-enabled"`
+	RefreshWorkers         int  `json:"refresh-workers"`
+	RefreshQueueSize       int  `json:"refresh-queue-size"`
+	RefreshTTLMinutes      int  `json:"refresh-ttl-minutes"`
+	PeriodicRefreshMinutes int  `json:"periodic-refresh-minutes"`
+	RecoveryJitterSeconds  int  `json:"recovery-jitter-seconds"`
+	MaxRetries             int  `json:"max-retries"`
+	autoRefreshConfigured  bool
 }
 
 // AutomaticRefreshEnabled reports the effective automatic refresh setting.
@@ -924,12 +928,13 @@ func (cfg ResolvedChatGPTWebAccountInfoConfig) AutomaticRefreshEnabled() bool {
 // Resolved returns effective account profile and quota refresh settings.
 func (cfg ChatGPTWebAccountInfoConfig) Resolved() ResolvedChatGPTWebAccountInfoConfig {
 	resolved := ResolvedChatGPTWebAccountInfoConfig{
-		AutoRefreshEnabled:    true,
-		RefreshWorkers:        DefaultChatGPTWebAccountInfoWorkers,
-		RefreshQueueSize:      DefaultChatGPTWebAccountInfoQueueSize,
-		RefreshTTLMinutes:     DefaultChatGPTWebAccountInfoTTLMinutes,
-		RecoveryJitterSeconds: DefaultChatGPTWebAccountInfoJitterSeconds,
-		MaxRetries:            DefaultChatGPTWebAccountInfoMaxRetries,
+		AutoRefreshEnabled:     true,
+		RefreshWorkers:         DefaultChatGPTWebAccountInfoWorkers,
+		RefreshQueueSize:       DefaultChatGPTWebAccountInfoQueueSize,
+		RefreshTTLMinutes:      DefaultChatGPTWebAccountInfoTTLMinutes,
+		PeriodicRefreshMinutes: DefaultChatGPTWebAccountInfoPeriodMinutes,
+		RecoveryJitterSeconds:  DefaultChatGPTWebAccountInfoJitterSeconds,
+		MaxRetries:             DefaultChatGPTWebAccountInfoMaxRetries,
 	}
 	if cfg.AutoRefreshEnabled != nil {
 		resolved.AutoRefreshEnabled = *cfg.AutoRefreshEnabled
@@ -943,6 +948,9 @@ func (cfg ChatGPTWebAccountInfoConfig) Resolved() ResolvedChatGPTWebAccountInfoC
 	}
 	if cfg.RefreshTTLMinutes != nil {
 		resolved.RefreshTTLMinutes = *cfg.RefreshTTLMinutes
+	}
+	if cfg.PeriodicRefreshMinutes != nil {
+		resolved.PeriodicRefreshMinutes = *cfg.PeriodicRefreshMinutes
 	}
 	if cfg.RecoveryJitterSeconds != nil {
 		resolved.RecoveryJitterSeconds = *cfg.RecoveryJitterSeconds
@@ -964,6 +972,9 @@ func (cfg ChatGPTWebAccountInfoConfig) Validate() error {
 	}
 	if resolved.RefreshTTLMinutes < 1 || resolved.RefreshTTLMinutes > MaxChatGPTWebAccountInfoTTLMinutes {
 		return fmt.Errorf("chatgpt-web.account-info.refresh-ttl-minutes must be between 1 and %d", MaxChatGPTWebAccountInfoTTLMinutes)
+	}
+	if resolved.PeriodicRefreshMinutes < 0 || resolved.PeriodicRefreshMinutes > MaxChatGPTWebAccountInfoPeriodMinutes {
+		return fmt.Errorf("chatgpt-web.account-info.periodic-refresh-minutes must be between 0 and %d", MaxChatGPTWebAccountInfoPeriodMinutes)
 	}
 	if resolved.RecoveryJitterSeconds < 0 || resolved.RecoveryJitterSeconds > MaxChatGPTWebAccountInfoJitterSeconds {
 		return fmt.Errorf("chatgpt-web.account-info.recovery-jitter-seconds must be between 0 and %d", MaxChatGPTWebAccountInfoJitterSeconds)
@@ -3691,6 +3702,7 @@ func preservesExplicitChatGPTWebValue(fullPath string, node *yaml.Node) bool {
 		"chatgpt-web.account-info.refresh-workers",
 		"chatgpt-web.account-info.refresh-queue-size",
 		"chatgpt-web.account-info.refresh-ttl-minutes",
+		"chatgpt-web.account-info.periodic-refresh-minutes",
 		"chatgpt-web.account-info.recovery-jitter-seconds",
 		"chatgpt-web.account-info.max-retries":
 		return true

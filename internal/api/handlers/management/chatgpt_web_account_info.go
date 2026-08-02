@@ -34,12 +34,13 @@ type chatGPTWebAccountInfoResponse struct {
 }
 
 type chatGPTWebAccountInfoConfigRequest struct {
-	AutoRefreshEnabled    json.RawMessage `json:"auto-refresh-enabled"`
-	RefreshWorkers        json.RawMessage `json:"refresh-workers"`
-	RefreshQueueSize      json.RawMessage `json:"refresh-queue-size"`
-	RefreshTTLMinutes     json.RawMessage `json:"refresh-ttl-minutes"`
-	RecoveryJitterSeconds json.RawMessage `json:"recovery-jitter-seconds"`
-	MaxRetries            json.RawMessage `json:"max-retries"`
+	AutoRefreshEnabled     json.RawMessage `json:"auto-refresh-enabled"`
+	RefreshWorkers         json.RawMessage `json:"refresh-workers"`
+	RefreshQueueSize       json.RawMessage `json:"refresh-queue-size"`
+	RefreshTTLMinutes      json.RawMessage `json:"refresh-ttl-minutes"`
+	PeriodicRefreshMinutes json.RawMessage `json:"periodic-refresh-minutes"`
+	RecoveryJitterSeconds  json.RawMessage `json:"recovery-jitter-seconds"`
+	MaxRetries             json.RawMessage `json:"max-retries"`
 }
 
 type chatGPTWebAccountInfoRefreshRequest struct {
@@ -332,6 +333,7 @@ func (request chatGPTWebAccountInfoConfigRequest) apply(candidate *config.ChatGP
 		{name: "refresh-workers", raw: request.RefreshWorkers, target: &candidate.RefreshWorkers},
 		{name: "refresh-queue-size", raw: request.RefreshQueueSize, target: &candidate.RefreshQueueSize},
 		{name: "refresh-ttl-minutes", raw: request.RefreshTTLMinutes, target: &candidate.RefreshTTLMinutes},
+		{name: "periodic-refresh-minutes", raw: request.PeriodicRefreshMinutes, target: &candidate.PeriodicRefreshMinutes},
 		{name: "recovery-jitter-seconds", raw: request.RecoveryJitterSeconds, target: &candidate.RecoveryJitterSeconds},
 		{name: "max-retries", raw: request.MaxRetries, target: &candidate.MaxRetries},
 	}
