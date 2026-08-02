@@ -118,8 +118,8 @@ chatgpt-web:
     retry-delay-milliseconds: 800
     acquisition-timeout-seconds: 90
   account-info:
-    # Disable provider-owned quota refreshes and current-page automatic tasks.
-    # Manual force refreshes remain available.
+    # Disable periodic quota refreshes and current-page automatic tasks.
+    # Manual force refreshes and one-shot checks at known image quota reset times remain available.
     auto-refresh-enabled: true
     # Bounded workers refresh account plan and image quota only when requested,
     # when a quota recovery is due, or after an image quota error.

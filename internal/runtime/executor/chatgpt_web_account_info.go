@@ -547,6 +547,9 @@ func (runtime *chatGPTWebAccountInfoRuntime) disableAutomaticRefreshLocked() {
 		if call == nil || call.completed || runtime.inflightTask[key] > 0 {
 			continue
 		}
+		if resetAt, recovery := runtime.inflightRecovery[key]; recovery && !resetAt.IsZero() {
+			continue
+		}
 		call.accepting = false
 		if call.cancel != nil {
 			call.cancel()
@@ -556,6 +559,10 @@ func (runtime *chatGPTWebAccountInfoRuntime) disableAutomaticRefreshLocked() {
 	activeQueue := runtime.queuedWorkLocked()
 	filtered := activeQueue[:0]
 	for _, work := range activeQueue {
+		if chatGPTWebAccountInfoKnownResetRecoveryWork(work) {
+			filtered = append(filtered, work)
+			continue
+		}
 		task := runtime.tasks[work.taskID]
 		if work.taskID != "" && task != nil && task.snapshot.Force {
 			filtered = append(filtered, work)
@@ -573,6 +580,9 @@ func (runtime *chatGPTWebAccountInfoRuntime) disableAutomaticRefreshLocked() {
 	keys := make([]string, 0, len(runtime.scheduled))
 	for key, entry := range runtime.scheduled {
 		if entry == nil {
+			continue
+		}
+		if chatGPTWebAccountInfoKnownResetRecoveryWork(entry.work) {
 			continue
 		}
 		task := runtime.tasks[entry.work.taskID]
@@ -1938,7 +1948,8 @@ func (runtime *chatGPTWebAccountInfoRuntime) scheduleRecoveryForTargetAtLocked(
 	resetAt time.Time,
 	due time.Time,
 ) bool {
-	if !runtime.cfg.AutomaticRefreshEnabled() || strings.TrimSpace(target.AuthID) == "" {
+	if strings.TrimSpace(target.AuthID) == "" ||
+		(!runtime.cfg.AutomaticRefreshEnabled() && resetAt.IsZero()) {
 		return false
 	}
 	var current bool
@@ -1981,6 +1992,13 @@ func chatGPTWebAccountInfoRecoveryWorkMatches(
 		work.exhausted &&
 		chatGPTWebAccountInfoTargetKey(work.target) == chatGPTWebAccountInfoTargetKey(target) &&
 		work.quotaResetAt.Equal(resetAt)
+}
+
+func chatGPTWebAccountInfoKnownResetRecoveryWork(work chatGPTWebAccountInfoWork) bool {
+	return work.automatic &&
+		work.quotaStateKnown &&
+		work.exhausted &&
+		!work.quotaResetAt.IsZero()
 }
 
 func (runtime *chatGPTWebAccountInfoRuntime) hasRecoveryWorkLocked(
@@ -2032,7 +2050,7 @@ func (runtime *chatGPTWebAccountInfoRuntime) syncRecoveryScheduleForTargetLocked
 		return
 	}
 	key := "recovery:" + chatGPTWebAccountInfoTargetKey(target)
-	if !runtime.cfg.AutomaticRefreshEnabled() {
+	if !runtime.cfg.AutomaticRefreshEnabled() && resetAt.IsZero() {
 		if entry := runtime.removeScheduleLocked(key); entry != nil {
 			runtime.releaseWorkEpochLocked(entry.work)
 		}
@@ -2290,12 +2308,6 @@ func (runtime *chatGPTWebAccountInfoRuntime) persistenceContext(ctx context.Cont
 
 func (runtime *chatGPTWebAccountInfoRuntime) restoreRecoverySchedules() {
 	if runtime == nil || runtime.executor == nil || runtime.executor.manager == nil {
-		return
-	}
-	runtime.mu.Lock()
-	enabled := runtime.cfg.AutomaticRefreshEnabled()
-	runtime.mu.Unlock()
-	if !enabled {
 		return
 	}
 	for _, auth := range runtime.executor.manager.List() {

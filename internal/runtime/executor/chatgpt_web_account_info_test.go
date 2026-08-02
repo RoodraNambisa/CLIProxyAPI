@@ -204,7 +204,7 @@ func TestChatGPTWebAmbiguousImageRecheckConcurrentTriggersOnlyOnce(t *testing.T)
 	}
 }
 
-func TestChatGPTWebAccountInfoDisableClearsQueuedAutomaticWork(t *testing.T) {
+func TestChatGPTWebAccountInfoDisableClearsPeriodicWorkAndKeepsKnownResetRecovery(t *testing.T) {
 	runtime := newChatGPTWebAccountInfoRuntime(&ChatGPTWebExecutor{}, &config.Config{})
 	t.Cleanup(runtime.close)
 	target := chatgptwebauth.AccountInfoRefreshTarget{Name: "web.json", AuthID: "web.json"}
@@ -245,10 +245,11 @@ func TestChatGPTWebAccountInfoDisableClearsQueuedAutomaticWork(t *testing.T) {
 	}
 	runtime.mu.Lock()
 	queueLength := runtime.queueLengthLocked()
+	recovery := runtime.scheduled["recovery:"+target.AuthID]
 	scheduled := len(runtime.scheduled)
 	runtime.mu.Unlock()
-	if queueLength != 0 || scheduled != 0 {
-		t.Fatalf("automatic work remains queued=%d scheduled=%d", queueLength, scheduled)
+	if queueLength != 0 || scheduled != 1 || recovery == nil {
+		t.Fatalf("disabled work queue=%d scheduled=%d recovery=%+v", queueLength, scheduled, recovery)
 	}
 	select {
 	case <-callContext.Done():
@@ -257,7 +258,7 @@ func TestChatGPTWebAccountInfoDisableClearsQueuedAutomaticWork(t *testing.T) {
 	}
 }
 
-func TestChatGPTWebAccountInfoReenableRestoresPersistedRecovery(t *testing.T) {
+func TestChatGPTWebAccountInfoDisabledStartupRestoresPersistedRecovery(t *testing.T) {
 	manager := cliproxyauth.NewManager(nil, nil, nil)
 	auth := chatGPTWebTestAuth("account-info-reenable-recovery")
 	auth.Metadata["quota_state"] = string(chatgptwebauth.QuotaStateExhausted)
@@ -273,14 +274,122 @@ func TestChatGPTWebAccountInfoReenableRestoresPersistedRecovery(t *testing.T) {
 	}}}
 	executor := NewChatGPTWebExecutor(cfg, manager)
 	t.Cleanup(func() { _ = executor.Close() })
-	if state := executor.AccountInfoAuthState(auth.ID); !state.NextRefreshAt.IsZero() {
-		t.Fatalf("disabled startup scheduled recovery: %+v", state)
+	before := executor.AccountInfoAuthState(auth.ID)
+	if before.NextRefreshAt.IsZero() {
+		t.Fatalf("disabled startup did not schedule recovery: %+v", before)
 	}
 
 	enabled = true
 	executor.UpdateConfig(cfg)
-	if state := executor.AccountInfoAuthState(auth.ID); state.NextRefreshAt.IsZero() {
-		t.Fatal("re-enabling automatic refresh did not restore persisted recovery")
+	after := executor.AccountInfoAuthState(auth.ID)
+	if !after.NextRefreshAt.Equal(before.NextRefreshAt) {
+		t.Fatalf("re-enabling automatic refresh duplicated or moved recovery: before=%+v after=%+v", before, after)
+	}
+}
+
+func TestChatGPTWebAccountInfoDisabledAutomaticRefreshDoesNotPollUnknownReset(t *testing.T) {
+	enabled := false
+	runtime := newChatGPTWebAccountInfoRuntime(&ChatGPTWebExecutor{}, &config.Config{
+		ChatGPTWeb: config.ChatGPTWebConfig{AccountInfo: config.ChatGPTWebAccountInfoConfig{
+			AutoRefreshEnabled: &enabled,
+		}},
+	})
+	t.Cleanup(runtime.close)
+	target := chatgptwebauth.AccountInfoRefreshTarget{Name: "unknown-reset.json", AuthID: "unknown-reset"}
+
+	runtime.mu.Lock()
+	runtime.syncRecoveryScheduleForTargetLocked(target, true, time.Time{}, 0)
+	scheduled := len(runtime.scheduled)
+	runtime.mu.Unlock()
+	if scheduled != 0 {
+		t.Fatalf("disabled automatic refresh scheduled unknown reset polling: %d", scheduled)
+	}
+}
+
+func TestChatGPTWebAccountInfoDisabledAutomaticRefreshQueriesAtKnownReset(t *testing.T) {
+	var profileCalls atomic.Int32
+	var quotaCalls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if request.Header.Get("Authorization") != "Bearer access-token" {
+			t.Errorf("Authorization = %q", request.Header.Get("Authorization"))
+		}
+		switch request.URL.Path {
+		case chatgptwebauth.AccountCheckPath:
+			profileCalls.Add(1)
+			_ = json.NewEncoder(w).Encode(map[string]any{"accounts": map[string]any{
+				"default": map[string]any{"account": map[string]any{
+					"account_id": "account-1",
+					"plan_type":  "free",
+				}},
+			}})
+		case chatgptwebauth.ConversationInitPath:
+			quotaCalls.Add(1)
+			_ = json.NewEncoder(w).Encode(map[string]any{"limits_progress": []any{
+				map[string]any{
+					"feature_name": "image_gen",
+					"remaining":    3,
+					"reset_after":  time.Now().UTC().Add(time.Hour).Format(time.RFC3339),
+				},
+			}})
+		default:
+			http.NotFound(w, request)
+		}
+	}))
+	defer server.Close()
+
+	manager := cliproxyauth.NewManager(nil, nil, nil)
+	auth := chatGPTWebTestAuth("disabled-reset-recovery")
+	auth.Metadata["account_id"] = "account-1"
+	auth.Metadata["quota_state"] = string(chatgptwebauth.QuotaStateExhausted)
+	auth.Metadata["image_quota_remaining"] = 0
+	auth.Metadata["image_quota_reset_at"] = time.Now().UTC().Add(-time.Minute).Format(time.RFC3339Nano)
+	auth.ModelStates = map[string]*cliproxyauth.ModelState{
+		chatgptwebauth.ImageModel: {
+			Status:      cliproxyauth.StatusError,
+			Unavailable: true,
+			Quota: cliproxyauth.QuotaState{
+				Exceeded: true,
+				Reason:   "chatgpt_web_image_quota",
+			},
+		},
+	}
+	if _, errRegister := manager.Register(cliproxyauth.WithSkipPersist(context.Background()), auth); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+
+	enabled := false
+	cfg := &config.Config{ChatGPTWeb: config.ChatGPTWebConfig{AccountInfo: config.ChatGPTWebAccountInfoConfig{
+		AutoRefreshEnabled:    &enabled,
+		RecoveryJitterSeconds: accountInfoTestInt(0),
+		MaxRetries:            accountInfoTestInt(0),
+	}}}
+	executor := NewChatGPTWebExecutor(cfg, nil)
+	executor.manager = manager
+	executor.runtimeBaseURL = server.URL
+	t.Cleanup(func() { _ = executor.Close() })
+	executor.SyncAccountInfoRecovery(auth)
+
+	waitForChatGPTWebCondition(t, 3*time.Second, func() bool {
+		current, ok := manager.GetByID(auth.ID)
+		if !ok || current == nil {
+			return false
+		}
+		credential, errCredential := chatgptwebauth.ParseCredential(current.Metadata)
+		return errCredential == nil && credential.ImageQuotaRemaining != nil &&
+			*credential.ImageQuotaRemaining == 3 &&
+			credential.QuotaState == chatgptwebauth.QuotaStateAvailable
+	})
+	if profileCalls.Load() != 1 || quotaCalls.Load() != 1 {
+		t.Fatalf("known reset refresh calls = profile:%d quota:%d, want one each", profileCalls.Load(), quotaCalls.Load())
+	}
+	current, _ := manager.GetByID(auth.ID)
+	imageState := current.ModelStates[chatgptwebauth.ImageModel]
+	if imageState == nil || imageState.Status == cliproxyauth.StatusError ||
+		imageState.Unavailable || imageState.Quota.Exceeded {
+		t.Fatalf("known reset refresh did not restore image capability: %+v", imageState)
+	}
+	if state := executor.AccountInfoAuthState(auth.ID); !state.NextRefreshAt.IsZero() {
+		t.Fatalf("successful one-shot recovery left another schedule: %+v", state)
 	}
 }
 
