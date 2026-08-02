@@ -34,13 +34,14 @@ func (err chatGPTWebManagementCodedError) Error() string { return "coded chatgpt
 func (err chatGPTWebManagementCodedError) ChatGPTWebErrorCode() string { return string(err) }
 
 type chatGPTWebManagementTestExecutor struct {
-	mu          sync.Mutex
-	loginFn     func(context.Context, chatgptwebauth.LoginInput) (*chatgptwebauth.Credential, error)
-	reloginFn   func(context.Context, *coreauth.Auth) (*coreauth.Auth, bool, error)
-	normalizeFn func(context.Context, *chatgptwebauth.Credential, string) (*chatgptwebauth.Credential, error)
-	fetchFn     func(context.Context, *coreauth.Auth) ([]chatgptwebauth.CatalogModel, error)
-	beginFn     func(context.Context, string) (context.Context, func(), error)
-	loginProxy  chatgptwebauth.LoginProxyConfig
+	mu                   sync.Mutex
+	loginFn              func(context.Context, chatgptwebauth.LoginInput) (*chatgptwebauth.Credential, error)
+	reloginFn            func(context.Context, *coreauth.Auth) (*coreauth.Auth, bool, error)
+	normalizeFn          func(context.Context, *chatgptwebauth.Credential, string) (*chatgptwebauth.Credential, error)
+	fetchFn              func(context.Context, *coreauth.Auth) ([]chatgptwebauth.CatalogModel, error)
+	beginFn              func(context.Context, string) (context.Context, func(), error)
+	accountInfoTriggerFn func(string, bool) bool
+	loginProxy           chatgptwebauth.LoginProxyConfig
 }
 
 type countingChatGPTWebAuthStore struct {
@@ -223,6 +224,13 @@ func (executor *chatGPTWebManagementTestExecutor) FetchModels(ctx context.Contex
 		return fetchFn(ctx, auth)
 	}
 	return nil, nil
+}
+
+func (executor *chatGPTWebManagementTestExecutor) TriggerAccountInfoRefresh(authID string, force bool) bool {
+	executor.mu.Lock()
+	triggerFn := executor.accountInfoTriggerFn
+	executor.mu.Unlock()
+	return triggerFn != nil && triggerFn(authID, force)
 }
 
 func TestParseChatGPTWebLoginInputs(t *testing.T) {

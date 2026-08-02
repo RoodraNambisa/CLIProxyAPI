@@ -32,6 +32,10 @@ type chatGPTWebImportInput struct {
 	data       []byte
 }
 
+type chatGPTWebAccountInfoTrigger interface {
+	TriggerAccountInfoRefresh(string, bool) bool
+}
+
 var errChatGPTWebImportIdentityConflict = errors.New("chatgpt web import identity conflict")
 
 func (h *Handler) chatGPTWebMutationTaskManager() *chatGPTWebMutationTaskManager {
@@ -263,6 +267,7 @@ func (h *Handler) runChatGPTWebImportTask(ctx context.Context, taskID string, in
 					}
 					return commitCtx, true
 				})
+				triggerChatGPTWebAccountInfoRefreshAfterImport(executor, result)
 				tasks.setResult(chatGPTWebMutationTaskImport, taskID, index, result)
 				tasks.releaseSlot()
 			}
@@ -280,6 +285,22 @@ sendLoop:
 	close(jobs)
 	workers.Wait()
 	tasks.finish(chatGPTWebMutationTaskImport, taskID, ctx.Err() != nil)
+}
+
+func triggerChatGPTWebAccountInfoRefreshAfterImport(executor chatGPTWebImportExecutor, result chatGPTWebMutationTaskResult) {
+	switch result.Status {
+	case "created", "updated", "unchanged":
+	default:
+		return
+	}
+	authID := strings.TrimSpace(result.Name)
+	trigger, ok := executor.(chatGPTWebAccountInfoTrigger)
+	if !ok || authID == "" {
+		return
+	}
+	// The account-info runtime applies the automatic-refresh switch, TTL,
+	// instance isolation, and queue deduplication to this best-effort trigger.
+	trigger.TriggerAccountInfoRefresh(authID, false)
 }
 
 func (h *Handler) executeChatGPTWebImport(ctx context.Context, input chatGPTWebImportInput, executor chatGPTWebImportExecutor, manager *coreauth.Manager, beginCommit func() (context.Context, bool)) chatGPTWebMutationTaskResult {

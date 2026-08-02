@@ -56,6 +56,69 @@ func TestChatGPTWebImportTaskSupportsMultipleFilesAndLegacyField(t *testing.T) {
 	}
 }
 
+func TestChatGPTWebImportTaskTriggersNonForcedAccountInfoRefresh(t *testing.T) {
+	type triggerCall struct {
+		authID string
+		force  bool
+	}
+	triggered := make(chan triggerCall, 2)
+	executor := &chatGPTWebManagementTestExecutor{}
+	executor.accountInfoTriggerFn = func(authID string, force bool) bool {
+		triggered <- triggerCall{authID: authID, force: force}
+		return true
+	}
+	h, _, _ := newChatGPTWebManagementTestHandler(t, executor)
+	router := chatGPTWebManagementTestRouter(h)
+	task := startChatGPTWebImportTask(t, router, []chatGPTWebImportTestFile{{
+		field: "files",
+		name:  "initial-quota.json",
+		data:  `{"email":"quota@example.com","access_token":"quota-secret"}`,
+	}})
+	completed := waitForChatGPTWebMutationTask(t, router, chatGPTWebMutationTaskImport, task.ID)
+	if completed.Succeeded != 1 || len(completed.Results) != 1 {
+		t.Fatalf("task = %+v", completed)
+	}
+	select {
+	case call := <-triggered:
+		if call.authID != completed.Results[0].Name || call.force {
+			t.Fatalf("account-info trigger = %+v, result = %+v", call, completed.Results[0])
+		}
+	default:
+		t.Fatal("successful upload did not trigger account-info refresh")
+	}
+	select {
+	case call := <-triggered:
+		t.Fatalf("unexpected duplicate account-info trigger: %+v", call)
+	default:
+	}
+}
+
+func TestChatGPTWebImportTaskDoesNotRefreshAccountInfoAfterFailedUpload(t *testing.T) {
+	var triggerCalls atomic.Int32
+	executor := &chatGPTWebManagementTestExecutor{}
+	executor.fetchFn = func(context.Context, *coreauth.Auth) ([]chatgptwebauth.CatalogModel, error) {
+		return nil, errors.New("probe failed")
+	}
+	executor.accountInfoTriggerFn = func(string, bool) bool {
+		triggerCalls.Add(1)
+		return true
+	}
+	h, _, _ := newChatGPTWebManagementTestHandler(t, executor)
+	router := chatGPTWebManagementTestRouter(h)
+	task := startChatGPTWebImportTask(t, router, []chatGPTWebImportTestFile{{
+		field: "files",
+		name:  "invalid.json",
+		data:  `{"email":"invalid@example.com","access_token":"invalid-secret"}`,
+	}})
+	completed := waitForChatGPTWebMutationTask(t, router, chatGPTWebMutationTaskImport, task.ID)
+	if completed.Failed != 1 {
+		t.Fatalf("task = %+v", completed)
+	}
+	if got := triggerCalls.Load(); got != 0 {
+		t.Fatalf("account-info trigger calls = %d, want 0", got)
+	}
+}
+
 func TestChatGPTWebImportTaskAllowsSameEmailForDistinctNamedWorkspaces(t *testing.T) {
 	executor := &chatGPTWebManagementTestExecutor{}
 	h, manager, _ := newChatGPTWebManagementTestHandler(t, executor)
