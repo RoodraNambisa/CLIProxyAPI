@@ -278,19 +278,27 @@ func chatGPTWebImageRequestError(err error) error {
 	return &chatGPTWebImageQuotaResultError{cause: err}
 }
 
-func chatGPTWebImageRequestErrorWithRefresh(err error, triggerRefresh func()) error {
+func chatGPTWebImageRequestErrorWithRefresh(err error, triggerRefresh func(force bool)) error {
 	projected := chatGPTWebImageRequestError(err)
 	var rateLimited *chatGPTWebImageRateLimitResultError
 	var quotaExhausted *chatGPTWebImageQuotaResultError
-	if triggerRefresh != nil &&
-		(errors.As(projected, &rateLimited) || errors.As(projected, &quotaExhausted)) {
-		triggerRefresh()
+	if triggerRefresh != nil {
+		switch {
+		case errors.As(projected, &quotaExhausted):
+			triggerRefresh(true)
+		case errors.As(projected, &rateLimited):
+			triggerRefresh(false)
+		}
 	}
 	return projected
 }
 
 func (e *ChatGPTWebExecutor) handleChatGPTWebImageRequestError(authID string, err error) error {
-	projected := chatGPTWebImageRequestErrorWithRefresh(err, func() {
+	projected := chatGPTWebImageRequestErrorWithRefresh(err, func(force bool) {
+		if force {
+			e.triggerImageQuotaEvidenceAccountInfoRefresh(authID)
+			return
+		}
 		e.TriggerAutomaticAccountInfoRefresh(authID)
 	})
 	var noOutput *chatGPTWebImageNoOutputResultError

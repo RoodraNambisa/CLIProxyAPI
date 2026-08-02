@@ -2864,6 +2864,30 @@ func (runtime *chatGPTWebAccountInfoRuntime) triggerAutomaticRecheck(authID stri
 	return runtime.triggerWithMode(authID, chatGPTWebAccountInfoTriggerAutomaticRecheck)
 }
 
+func (runtime *chatGPTWebAccountInfoRuntime) triggerImageQuotaEvidenceRecheck(authID string) bool {
+	if runtime == nil || strings.TrimSpace(authID) == "" {
+		return false
+	}
+	target, current := runtime.resolveCurrentTarget(chatgptwebauth.AccountInfoRefreshTarget{
+		Name:   strings.TrimSpace(authID),
+		AuthID: strings.TrimSpace(authID),
+	})
+	if !current {
+		return false
+	}
+	runtime.mu.Lock()
+	defer runtime.mu.Unlock()
+	target, current = runtime.resolveCurrentTargetLocked(target)
+	if !current {
+		return false
+	}
+	runtimeKey := chatGPTWebAccountInfoTargetKey(target)
+	if runtime.inflight[runtimeKey] > 0 {
+		return true
+	}
+	return runtime.triggerTargetLocked(target, chatGPTWebAccountInfoTriggerForce)
+}
+
 func (runtime *chatGPTWebAccountInfoRuntime) triggerAmbiguousImageRecheck(authID string) bool {
 	if runtime == nil || strings.TrimSpace(authID) == "" {
 		return false
@@ -3154,6 +3178,10 @@ func (e *ChatGPTWebExecutor) TriggerAccountInfoRefresh(authID string, force bool
 // TriggerAutomaticAccountInfoRefresh schedules a quota recheck without advancing a pending retry.
 func (e *ChatGPTWebExecutor) TriggerAutomaticAccountInfoRefresh(authID string) bool {
 	return e != nil && e.accountInfo != nil && e.accountInfo.triggerAutomaticRecheck(authID)
+}
+
+func (e *ChatGPTWebExecutor) triggerImageQuotaEvidenceAccountInfoRefresh(authID string) bool {
+	return e != nil && e.accountInfo != nil && e.accountInfo.triggerImageQuotaEvidenceRecheck(authID)
 }
 
 func (e *ChatGPTWebExecutor) triggerAmbiguousImageAccountInfoRefresh(authID string) bool {

@@ -64,8 +64,10 @@ func TestChatGPTWebImageRequestErrorRequiresExplicitQuotaEvidence(t *testing.T) 
 				fhttp.Header{"Retry-After": {"17"}},
 			)
 			refreshes := 0
-			projected := chatGPTWebImageRequestErrorWithRefresh(upstream, func() {
+			forcedRefresh := false
+			projected := chatGPTWebImageRequestErrorWithRefresh(upstream, func(force bool) {
 				refreshes++
+				forcedRefresh = force
 			})
 
 			var model interface{ ExecutionResultModel() string }
@@ -80,6 +82,9 @@ func TestChatGPTWebImageRequestErrorRequiresExplicitQuotaEvidence(t *testing.T) 
 			if refreshes != 1 {
 				t.Fatalf("account info refreshes = %d, want 1", refreshes)
 			}
+			if forcedRefresh != test.wantQuota {
+				t.Fatalf("forced account info refresh = %v, want %v", forcedRefresh, test.wantQuota)
+			}
 			status, okStatus := projected.(interface{ StatusCode() int })
 			if !okStatus || status.StatusCode() != http.StatusTooManyRequests {
 				t.Fatalf("status projection missing: %v", projected)
@@ -93,6 +98,98 @@ func TestChatGPTWebImageRequestErrorRequiresExplicitQuotaEvidence(t *testing.T) 
 				t.Fatalf("RetryAfter() was not preserved: %v", projected)
 			}
 		})
+	}
+}
+
+func TestChatGPTWebExplicitImageQuotaErrorForcesRefreshWhenAutomaticRefreshDisabled(t *testing.T) {
+	enabled := false
+	executor := &ChatGPTWebExecutor{}
+	runtime := newChatGPTWebAccountInfoRuntime(executor, &config.Config{
+		ChatGPTWeb: config.ChatGPTWebConfig{AccountInfo: config.ChatGPTWebAccountInfoConfig{
+			AutoRefreshEnabled: &enabled,
+		}},
+	})
+	executor.accountInfo = runtime
+	t.Cleanup(runtime.close)
+
+	projected := executor.handleChatGPTWebImageRequestError(
+		"web-limit.json",
+		chatGPTWebImageFailureError("You've hit your limit. Please try again later."),
+	)
+	var code interface{ ExecutionResultErrorCode() string }
+	if !errors.As(projected, &code) || code.ExecutionResultErrorCode() != "chatgpt_web_image_quota" {
+		t.Fatalf("explicit quota failure was not projected: %v", projected)
+	}
+
+	runtime.mu.Lock()
+	queued := runtime.queuedWorkLocked()
+	runtime.mu.Unlock()
+	if len(queued) != 1 || !queued[0].force || !queued[0].automatic {
+		t.Fatalf("forced quota refresh queue = %+v, want one forced automatic work item", queued)
+	}
+}
+
+func TestChatGPTWebExplicitImageQuotaErrorPromotesScheduledRefreshWithoutDuplicating(t *testing.T) {
+	now := time.Now().UTC()
+	const authID = "web-limit-scheduled.json"
+	executor := &ChatGPTWebExecutor{}
+	runtime := newChatGPTWebAccountInfoRuntime(executor, &config.Config{})
+	runtime.now = func() time.Time { return now }
+	executor.accountInfo = runtime
+	t.Cleanup(runtime.close)
+
+	retryAt := now.Add(10 * time.Minute)
+	runtime.mu.Lock()
+	scheduled := runtime.scheduleLocked("retry:"+authID, retryAt, chatGPTWebAccountInfoWork{
+		target:    chatgptwebauth.AccountInfoRefreshTarget{Name: authID, AuthID: authID},
+		attempt:   2,
+		automatic: true,
+	})
+	runtime.mu.Unlock()
+	if !scheduled {
+		t.Fatal("failed to schedule automatic refresh")
+	}
+
+	executor.handleChatGPTWebImageRequestError(
+		authID,
+		chatGPTWebImageFailureError("You've hit your limit. Please try again later."),
+	)
+
+	runtime.mu.Lock()
+	retry := runtime.scheduled["retry:"+authID]
+	queued := runtime.queueLengthLocked()
+	scheduledCount := len(runtime.scheduledByTarget[authID])
+	runtime.mu.Unlock()
+	if retry == nil || !retry.due.Equal(now) || !retry.work.force {
+		t.Fatalf("scheduled quota refresh = %+v, want forced refresh due now", retry)
+	}
+	if queued != 0 || scheduledCount != 1 {
+		t.Fatalf("quota refresh was duplicated: queued=%d scheduled=%d", queued, scheduledCount)
+	}
+}
+
+func TestChatGPTWebExplicitImageQuotaErrorReusesInflightRefresh(t *testing.T) {
+	const authID = "web-limit-inflight.json"
+	executor := &ChatGPTWebExecutor{}
+	runtime := newChatGPTWebAccountInfoRuntime(executor, &config.Config{})
+	executor.accountInfo = runtime
+	t.Cleanup(runtime.close)
+
+	runtime.mu.Lock()
+	runtime.inflight[authID] = 1
+	runtime.mu.Unlock()
+	executor.handleChatGPTWebImageRequestError(
+		authID,
+		chatGPTWebImageFailureError("You've hit your limit. Please try again later."),
+	)
+
+	runtime.mu.Lock()
+	queued := runtime.queueLengthLocked()
+	pending := runtime.pendingTriggers[authID]
+	scheduled := len(runtime.scheduledByTarget[authID])
+	runtime.mu.Unlock()
+	if queued != 0 || pending != chatGPTWebAccountInfoTriggerNone || scheduled != 0 {
+		t.Fatalf("inflight quota refresh was duplicated: queued=%d pending=%d scheduled=%d", queued, pending, scheduled)
 	}
 }
 
