@@ -58,11 +58,12 @@ func TestChatGPTWebAccountInfoRuntimeStartsAfterExecutorPublication(t *testing.T
 func TestChatGPTWebAccountInfoRuntimeClampsUnvalidatedConfig(t *testing.T) {
 	maxInt := int(^uint(0) >> 1)
 	cfg := &config.Config{ChatGPTWeb: config.ChatGPTWebConfig{AccountInfo: config.ChatGPTWebAccountInfoConfig{
-		RefreshWorkers:        accountInfoTestInt(maxInt),
-		RefreshQueueSize:      accountInfoTestInt(maxInt),
-		RefreshTTLMinutes:     accountInfoTestInt(-1),
-		RecoveryJitterSeconds: accountInfoTestInt(maxInt),
-		MaxRetries:            accountInfoTestInt(-1),
+		RefreshWorkers:         accountInfoTestInt(maxInt),
+		RefreshQueueSize:       accountInfoTestInt(maxInt),
+		RefreshTTLMinutes:      accountInfoTestInt(-1),
+		PeriodicRefreshMinutes: accountInfoTestInt(maxInt),
+		RecoveryJitterSeconds:  accountInfoTestInt(maxInt),
+		MaxRetries:             accountInfoTestInt(-1),
 	}}}
 	executor := NewChatGPTWebExecutor(cfg, nil)
 	t.Cleanup(func() { _ = executor.Close() })
@@ -75,6 +76,7 @@ func TestChatGPTWebAccountInfoRuntimeClampsUnvalidatedConfig(t *testing.T) {
 	if resolved.RefreshWorkers != config.MaxChatGPTWebAccountInfoWorkers ||
 		resolved.RefreshQueueSize != config.MaxChatGPTWebAccountInfoQueueSize ||
 		resolved.RefreshTTLMinutes != 1 ||
+		resolved.PeriodicRefreshMinutes != config.MaxChatGPTWebAccountInfoPeriodMinutes ||
 		resolved.RecoveryJitterSeconds != config.MaxChatGPTWebAccountInfoJitterSeconds ||
 		resolved.MaxRetries != 0 {
 		t.Fatalf("clamped config = %+v", resolved)
@@ -84,11 +86,12 @@ func TestChatGPTWebAccountInfoRuntimeClampsUnvalidatedConfig(t *testing.T) {
 	}
 
 	cfg.ChatGPTWeb.AccountInfo = config.ChatGPTWebAccountInfoConfig{
-		RefreshWorkers:        accountInfoTestInt(-1),
-		RefreshQueueSize:      accountInfoTestInt(-1),
-		RefreshTTLMinutes:     accountInfoTestInt(maxInt),
-		RecoveryJitterSeconds: accountInfoTestInt(-1),
-		MaxRetries:            accountInfoTestInt(maxInt),
+		RefreshWorkers:         accountInfoTestInt(-1),
+		RefreshQueueSize:       accountInfoTestInt(-1),
+		RefreshTTLMinutes:      accountInfoTestInt(maxInt),
+		PeriodicRefreshMinutes: accountInfoTestInt(-1),
+		RecoveryJitterSeconds:  accountInfoTestInt(-1),
+		MaxRetries:             accountInfoTestInt(maxInt),
 	}
 	executor.UpdateConfig(cfg)
 	runtime.mu.Lock()
@@ -97,9 +100,326 @@ func TestChatGPTWebAccountInfoRuntimeClampsUnvalidatedConfig(t *testing.T) {
 	if resolved.RefreshWorkers != 1 ||
 		resolved.RefreshQueueSize != 0 ||
 		resolved.RefreshTTLMinutes != config.MaxChatGPTWebAccountInfoTTLMinutes ||
+		resolved.PeriodicRefreshMinutes != 0 ||
 		resolved.RecoveryJitterSeconds != 0 ||
 		resolved.MaxRetries != config.MaxChatGPTWebAccountInfoRetries {
 		t.Fatalf("updated clamped config = %+v", resolved)
+	}
+}
+
+func TestChatGPTWebAccountInfoPeriodicScheduleLifecycle(t *testing.T) {
+	start := time.Date(2026, time.August, 2, 8, 0, 0, 0, time.UTC)
+	var clock atomic.Int64
+	clock.Store(start.UnixNano())
+	period := 60
+	runtime := newChatGPTWebAccountInfoRuntime(&ChatGPTWebExecutor{}, &config.Config{
+		ChatGPTWeb: config.ChatGPTWebConfig{AccountInfo: config.ChatGPTWebAccountInfoConfig{
+			PeriodicRefreshMinutes: &period,
+		}},
+	})
+	runtime.now = func() time.Time { return time.Unix(0, clock.Load()).UTC() }
+	runtime.start()
+	t.Cleanup(runtime.close)
+
+	runtime.mu.Lock()
+	firstDue := runtime.periodicNextAt
+	runtime.mu.Unlock()
+	if want := start.Add(time.Hour); !firstDue.Equal(want) {
+		t.Fatalf("first periodic due = %s, want %s", firstDue, want)
+	}
+
+	clock.Store(start.Add(5 * time.Minute).UnixNano())
+	ttl := 30
+	runtime.updateConfig(&config.Config{ChatGPTWeb: config.ChatGPTWebConfig{
+		AccountInfo: config.ChatGPTWebAccountInfoConfig{
+			PeriodicRefreshMinutes: &period,
+			RefreshTTLMinutes:      &ttl,
+		},
+	}})
+	runtime.mu.Lock()
+	unchangedDue := runtime.periodicNextAt
+	runtime.mu.Unlock()
+	if !unchangedDue.Equal(firstDue) {
+		t.Fatalf("unrelated update moved periodic due from %s to %s", firstDue, unchangedDue)
+	}
+
+	period = 30
+	runtime.updateConfig(&config.Config{ChatGPTWeb: config.ChatGPTWebConfig{
+		AccountInfo: config.ChatGPTWebAccountInfoConfig{PeriodicRefreshMinutes: &period},
+	}})
+	runtime.mu.Lock()
+	changedDue := runtime.periodicNextAt
+	runtime.mu.Unlock()
+	if want := start.Add(35 * time.Minute); !changedDue.Equal(want) {
+		t.Fatalf("changed periodic due = %s, want %s", changedDue, want)
+	}
+	runtime.mu.Lock()
+	runtime.schedulePeriodicTargetsLocked([]chatgptwebauth.AccountInfoRefreshTarget{{
+		AuthID: "pending-periodic", AuthInstanceID: "pending-instance",
+	}}, time.Now().Add(24*time.Hour))
+	if count := accountInfoPeriodicScheduleCountLocked(runtime); count != 1 {
+		runtime.mu.Unlock()
+		t.Fatalf("periodic schedules before disable = %d, want 1", count)
+	}
+	runtime.mu.Unlock()
+
+	period = 0
+	runtime.updateConfig(&config.Config{ChatGPTWeb: config.ChatGPTWebConfig{
+		AccountInfo: config.ChatGPTWebAccountInfoConfig{PeriodicRefreshMinutes: &period},
+	}})
+	runtime.mu.Lock()
+	disabledDue := runtime.periodicNextAt
+	pending := accountInfoPeriodicScheduleCountLocked(runtime)
+	runtime.mu.Unlock()
+	if !disabledDue.IsZero() || pending != 0 {
+		t.Fatalf("disabled periodic state = due %s pending %d", disabledDue, pending)
+	}
+
+	period = 30
+	autoRefresh := false
+	runtime.updateConfig(&config.Config{ChatGPTWeb: config.ChatGPTWebConfig{
+		AccountInfo: config.ChatGPTWebAccountInfoConfig{
+			AutoRefreshEnabled:     &autoRefresh,
+			PeriodicRefreshMinutes: &period,
+		},
+	}})
+	runtime.mu.Lock()
+	autoDisabledDue := runtime.periodicNextAt
+	runtime.mu.Unlock()
+	if !autoDisabledDue.IsZero() {
+		t.Fatalf("automatic refresh disabled periodic due = %s", autoDisabledDue)
+	}
+
+	clock.Store(start.Add(10 * time.Minute).UnixNano())
+	autoRefresh = true
+	runtime.updateConfig(&config.Config{ChatGPTWeb: config.ChatGPTWebConfig{
+		AccountInfo: config.ChatGPTWebAccountInfoConfig{
+			AutoRefreshEnabled:     &autoRefresh,
+			PeriodicRefreshMinutes: &period,
+		},
+	}})
+	runtime.mu.Lock()
+	reenabledDue := runtime.periodicNextAt
+	runtime.mu.Unlock()
+	if want := start.Add(40 * time.Minute); !reenabledDue.Equal(want) {
+		t.Fatalf("re-enabled periodic due = %s, want %s", reenabledDue, want)
+	}
+}
+
+func TestChatGPTWebAccountInfoPeriodicTargetsAreEligibleAndSorted(t *testing.T) {
+	manager := cliproxyauth.NewManager(nil, nil, nil)
+	register := func(auth *cliproxyauth.Auth) {
+		t.Helper()
+		if _, errRegister := manager.Register(cliproxyauth.WithSkipPersist(t.Context()), auth); errRegister != nil {
+			t.Fatalf("register %q: %v", auth.ID, errRegister)
+		}
+	}
+	validB := chatGPTWebTestAuth("periodic-b")
+	validA := chatGPTWebTestAuth("periodic-a")
+	disabled := chatGPTWebTestAuth("periodic-disabled")
+	disabled.Disabled = true
+	dead := chatGPTWebTestAuth("periodic-dead")
+	dead.Metadata["lifecycle_state"] = string(chatgptwebauth.LifecycleDead)
+	malformed := chatGPTWebTestAuth("periodic-malformed")
+	malformed.Metadata["refresh_strategy"] = "unsupported"
+	wrongProvider := chatGPTWebTestAuth("periodic-codex")
+	wrongProvider.Provider = "codex"
+	for _, auth := range []*cliproxyauth.Auth{validB, disabled, malformed, validA, dead, wrongProvider} {
+		register(auth)
+	}
+
+	runtime := newChatGPTWebAccountInfoRuntime(&ChatGPTWebExecutor{manager: manager}, &config.Config{})
+	targets := runtime.periodicRefreshTargets()
+	if len(targets) != 2 || targets[0].AuthID != validA.ID || targets[1].AuthID != validB.ID {
+		t.Fatalf("periodic targets = %+v", targets)
+	}
+}
+
+func TestChatGPTWebAccountInfoPeriodicSchedulesBeyondQueueCapacity(t *testing.T) {
+	runtime := newChatGPTWebAccountInfoRuntime(nil, nil)
+	runtime.started = true
+	runtime.cfg = config.ResolvedChatGPTWebAccountInfoConfig{
+		RefreshWorkers:         1,
+		RefreshQueueSize:       2,
+		PeriodicRefreshMinutes: 1,
+	}
+	targets := make([]chatgptwebauth.AccountInfoRefreshTarget, 300)
+	for index := range targets {
+		targets[index] = chatgptwebauth.AccountInfoRefreshTarget{
+			AuthID:         fmt.Sprintf("periodic-%03d", index),
+			AuthInstanceID: fmt.Sprintf("instance-%03d", index),
+		}
+	}
+
+	runtime.mu.Lock()
+	runtime.schedulePeriodicTargetsLocked(targets, time.Now())
+	if got := accountInfoPeriodicScheduleCountLocked(runtime); got != len(targets) {
+		runtime.mu.Unlock()
+		t.Fatalf("periodic schedules = %d, want %d", got, len(targets))
+	}
+	for key, entry := range runtime.scheduled {
+		if !strings.HasPrefix(key, chatGPTWebAccountInfoPeriodicSchedulePrefix) {
+			continue
+		}
+		if entry.work.force || !entry.work.automatic {
+			runtime.mu.Unlock()
+			t.Fatalf("periodic work flags = force %v automatic %v", entry.work.force, entry.work.automatic)
+		}
+	}
+	runtime.mu.Unlock()
+}
+
+func TestChatGPTWebAccountInfoPeriodicScanDoesNotDuplicateExistingWork(t *testing.T) {
+	now := time.Now().UTC()
+	runtime := newChatGPTWebAccountInfoRuntime(nil, nil)
+	runtime.started = true
+	runtime.cfg = config.ResolvedChatGPTWebAccountInfoConfig{
+		RefreshWorkers:         1,
+		RefreshQueueSize:       4,
+		PeriodicRefreshMinutes: 1,
+	}
+	inflight := chatgptwebauth.AccountInfoRefreshTarget{AuthID: "inflight", AuthInstanceID: "one"}
+	scheduled := chatgptwebauth.AccountInfoRefreshTarget{AuthID: "scheduled", AuthInstanceID: "two"}
+	queued := chatgptwebauth.AccountInfoRefreshTarget{AuthID: "queued", AuthInstanceID: "three"}
+	newTarget := chatgptwebauth.AccountInfoRefreshTarget{AuthID: "new", AuthInstanceID: "four"}
+
+	runtime.mu.Lock()
+	runtime.inflight[chatGPTWebAccountInfoTargetKey(inflight)] = 1
+	if !runtime.scheduleLocked("retry:"+chatGPTWebAccountInfoTargetKey(scheduled), now.Add(time.Hour), chatGPTWebAccountInfoWork{
+		target: scheduled, attempt: 2, automatic: true,
+	}) {
+		t.Fatal("schedule existing retry")
+	}
+	if !runtime.enqueueLocked(chatGPTWebAccountInfoWork{target: queued, attempt: 1}) {
+		t.Fatal("queue existing work")
+	}
+	dueBefore := runtime.scheduled["retry:"+chatGPTWebAccountInfoTargetKey(scheduled)].due
+	runtime.schedulePeriodicTargetsLocked([]chatgptwebauth.AccountInfoRefreshTarget{
+		inflight, scheduled, queued, newTarget,
+	}, now)
+	periodicPending := accountInfoPeriodicScheduleCountLocked(runtime)
+	queuedWork := append([]chatGPTWebAccountInfoWork(nil), runtime.queuedWorkLocked()...)
+	dueAfter := runtime.scheduled["retry:"+chatGPTWebAccountInfoTargetKey(scheduled)].due
+	periodic := runtime.scheduled[chatGPTWebAccountInfoPeriodicSchedulePrefix+chatGPTWebAccountInfoTargetKey(newTarget)]
+	runtime.mu.Unlock()
+
+	if periodicPending != 1 || !dueAfter.Equal(dueBefore) {
+		t.Fatalf("periodic overlap = scheduled %d due %s, want 1/%s", periodicPending, dueAfter, dueBefore)
+	}
+	if periodic == nil || chatGPTWebAccountInfoTargetKey(periodic.work.target) != chatGPTWebAccountInfoTargetKey(newTarget) {
+		t.Fatalf("new periodic schedule = %+v", periodic)
+	}
+	if len(queuedWork) != 1 || chatGPTWebAccountInfoTargetKey(queuedWork[0].target) != chatGPTWebAccountInfoTargetKey(queued) {
+		t.Fatalf("queued periodic work = %+v", queuedWork)
+	}
+}
+
+func TestChatGPTWebAccountInfoPeriodicPendingDropsRetiredInstance(t *testing.T) {
+	runtime := newChatGPTWebAccountInfoRuntime(nil, nil)
+	runtime.started = true
+	runtime.cfg = config.ResolvedChatGPTWebAccountInfoConfig{
+		RefreshWorkers:         1,
+		RefreshQueueSize:       0,
+		PeriodicRefreshMinutes: 1,
+	}
+	target := chatgptwebauth.AccountInfoRefreshTarget{AuthID: "retired", AuthInstanceID: "old"}
+	runtime.mu.Lock()
+	runtime.schedulePeriodicTargetsLocked([]chatgptwebauth.AccountInfoRefreshTarget{target}, time.Now())
+	if accountInfoPeriodicScheduleCountLocked(runtime) != 1 {
+		runtime.mu.Unlock()
+		t.Fatal("retired target was not scheduled")
+	}
+	runtime.mu.Unlock()
+	runtime.removeAuthInstance(target.AuthID, target.AuthInstanceID)
+	runtime.mu.Lock()
+	pending := accountInfoPeriodicScheduleCountLocked(runtime)
+	runtime.mu.Unlock()
+	if pending != 0 {
+		t.Fatalf("retired periodic pending = %d", pending)
+	}
+}
+
+func TestChatGPTWebAccountInfoPeriodicScanRespectsTTL(t *testing.T) {
+	var profileCalls atomic.Int32
+	var quotaCalls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case chatgptwebauth.AccountCheckPath:
+			profileCalls.Add(1)
+			_ = json.NewEncoder(w).Encode(map[string]any{"accounts": map[string]any{
+				"default": map[string]any{"account": map[string]any{
+					"account_id": "periodic-stale-account",
+					"plan_type":  "plus",
+				}},
+			}})
+		case chatgptwebauth.ConversationInitPath:
+			quotaCalls.Add(1)
+			_ = json.NewEncoder(w).Encode(map[string]any{"limits_progress": []any{
+				map[string]any{"feature_name": "image_gen", "remaining": 5},
+			}})
+		default:
+			http.NotFound(w, request)
+		}
+	}))
+	defer server.Close()
+
+	manager := cliproxyauth.NewManager(nil, nil, nil)
+	now := time.Now().UTC()
+	register := func(id string, updatedAt time.Time) {
+		t.Helper()
+		auth := chatGPTWebTestAuth(id)
+		credential, errCredential := chatgptwebauth.ParseCredential(auth.Metadata)
+		if errCredential != nil {
+			t.Fatalf("parse %q: %v", id, errCredential)
+		}
+		remaining := 5
+		credential.PlanType = "plus"
+		credential.ProfileUpdatedAt = updatedAt.Format(time.RFC3339Nano)
+		credential.ImageQuotaRemaining = &remaining
+		credential.QuotaState = chatgptwebauth.QuotaStateAvailable
+		credential.QuotaUpdatedAt = updatedAt.Format(time.RFC3339Nano)
+		credential.QuotaStale = false
+		credential.ApplyToMetadata(auth.Metadata)
+		if _, errRegister := manager.Register(cliproxyauth.WithSkipPersist(t.Context()), auth); errRegister != nil {
+			t.Fatalf("register %q: %v", id, errRegister)
+		}
+	}
+	register("periodic-fresh", now.Add(-time.Minute))
+	register("periodic-stale", now.Add(-time.Hour))
+
+	period := 1
+	ttl := 15
+	workers := 2
+	queueSize := 4
+	maxRetries := 0
+	executor := NewChatGPTWebExecutor(&config.Config{ChatGPTWeb: config.ChatGPTWebConfig{
+		AccountInfo: config.ChatGPTWebAccountInfoConfig{
+			PeriodicRefreshMinutes: &period,
+			RefreshTTLMinutes:      &ttl,
+			RefreshWorkers:         &workers,
+			RefreshQueueSize:       &queueSize,
+			MaxRetries:             &maxRetries,
+		},
+	}}, manager)
+	t.Cleanup(func() { _ = executor.Close() })
+	executor.runtimeBaseURL = server.URL
+	runtime := executor.accountInfo
+
+	expected := time.Now().Add(-time.Second)
+	runtime.mu.Lock()
+	runtime.periodicNextAt = expected
+	runtime.mu.Unlock()
+	runtime.runPeriodicScan(expected)
+
+	waitForChatGPTWebCondition(t, 5*time.Second, func() bool {
+		runtime.mu.Lock()
+		idle := runtime.busy == 0 && runtime.waiting == 0 && runtime.queueLengthLocked() == 0 &&
+			accountInfoPeriodicScheduleCountLocked(runtime) == 0 && len(runtime.inflight) == 0
+		runtime.mu.Unlock()
+		return idle && profileCalls.Load() == 1 && quotaCalls.Load() == 1
+	})
+	if profileCalls.Load() != 1 || quotaCalls.Load() != 1 {
+		t.Fatalf("periodic upstream calls = profile %d quota %d, want one stale credential", profileCalls.Load(), quotaCalls.Load())
 	}
 }
 
@@ -4902,6 +5222,19 @@ func waitForAccountInfoTask(t *testing.T, executor *ChatGPTWebExecutor, id strin
 
 func accountInfoTestInt(value int) *int {
 	return &value
+}
+
+func accountInfoPeriodicScheduleCountLocked(runtime *chatGPTWebAccountInfoRuntime) int {
+	if runtime == nil {
+		return 0
+	}
+	count := 0
+	for key := range runtime.scheduled {
+		if strings.HasPrefix(key, chatGPTWebAccountInfoPeriodicSchedulePrefix) {
+			count++
+		}
+	}
+	return count
 }
 
 type accountInfoTestProxyResolver struct {

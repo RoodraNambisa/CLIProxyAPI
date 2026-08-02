@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"reflect"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -30,6 +31,7 @@ const (
 	chatGPTWebAccountInfoMaxBodyBytes           = 1 << 20
 	chatGPTWebAccountInfoMaxRedirects           = 5
 	chatGPTWebAmbiguousImageRecheckCooldown     = 5 * time.Minute
+	chatGPTWebAccountInfoPeriodicSchedulePrefix = "periodic:"
 )
 
 type chatGPTWebAccountInfoTriggerMode uint8
@@ -269,6 +271,8 @@ type chatGPTWebAccountInfoRuntime struct {
 	inflightRecovery           map[string]time.Time
 	pendingTriggers            map[string]chatGPTWebAccountInfoTriggerMode
 	ambiguousImageRecheckAfter map[string]time.Time
+	periodicNextAt             time.Time
+	periodicGeneration         uint64
 	workers                    map[int]chan struct{}
 	retiringWorkers            map[int]struct{}
 	desiredWorkers             int
@@ -284,6 +288,7 @@ type chatGPTWebAccountInfoRuntime struct {
 	delayedTasks               int
 	schedule                   uint64
 	wake                       chan struct{}
+	periodicWake               chan struct{}
 	ctx                        context.Context
 	cancel                     context.CancelFunc
 	wg                         sync.WaitGroup
@@ -326,6 +331,7 @@ func newChatGPTWebAccountInfoRuntime(executor *ChatGPTWebExecutor, cfg *config.C
 		scheduledByTarget:          make(map[string]map[string]*chatGPTWebAccountInfoSchedule),
 		calls:                      make(map[string]*chatGPTWebAccountInfoCall),
 		wake:                       make(chan struct{}, 1),
+		periodicWake:               make(chan struct{}, 1),
 		ctx:                        ctx,
 		cancel:                     cancel,
 		now:                        time.Now,
@@ -347,9 +353,12 @@ func (runtime *chatGPTWebAccountInfoRuntime) start() {
 	}
 	runtime.started = true
 	runtime.resizeWorkersLocked(runtime.cfg.RefreshWorkers)
-	runtime.wg.Add(1)
+	runtime.resetPeriodicScheduleLocked()
+	runtime.wg.Add(2)
 	runtime.mu.Unlock()
 	go runtime.schedulerLoop()
+	go runtime.periodicLoop()
+	runtime.signalPeriodic()
 	runtime.restoreRecoverySchedules()
 }
 
@@ -374,6 +383,11 @@ func accountInfoConfigSnapshot(cfg *config.Config) config.ResolvedChatGPTWebAcco
 		resolved.RefreshTTLMinutes,
 		1,
 		config.MaxChatGPTWebAccountInfoTTLMinutes,
+	)
+	resolved.PeriodicRefreshMinutes = clampChatGPTWebAccountInfoValue(
+		resolved.PeriodicRefreshMinutes,
+		0,
+		config.MaxChatGPTWebAccountInfoPeriodMinutes,
 	)
 	resolved.RecoveryJitterSeconds = clampChatGPTWebAccountInfoValue(
 		resolved.RecoveryJitterSeconds,
@@ -510,11 +524,16 @@ func (runtime *chatGPTWebAccountInfoRuntime) updateConfig(cfg *config.Config) {
 		return
 	}
 	previousEnabled := runtime.cfg.AutomaticRefreshEnabled()
+	previousPeriod := runtime.cfg.PeriodicRefreshMinutes
 	runtime.cfg = resolved
 	resolvedEnabled := resolved.AutomaticRefreshEnabled()
+	periodicChanged := previousEnabled != resolvedEnabled || previousPeriod != resolved.PeriodicRefreshMinutes
 	if runtime.started {
 		if !resolvedEnabled {
 			runtime.disableAutomaticRefreshLocked()
+		}
+		if periodicChanged {
+			runtime.resetPeriodicScheduleLocked()
 		}
 		runtime.resizeWorkersLocked(resolved.RefreshWorkers)
 		runtime.drainPendingTriggersLocked()
@@ -524,6 +543,9 @@ func (runtime *chatGPTWebAccountInfoRuntime) updateConfig(cfg *config.Config) {
 	runtime.mu.Unlock()
 	if started {
 		runtime.signalScheduler()
+		if periodicChanged {
+			runtime.signalPeriodic()
+		}
 		if !previousEnabled && resolvedEnabled {
 			runtime.restoreRecoverySchedules()
 		}
@@ -595,6 +617,9 @@ func (runtime *chatGPTWebAccountInfoRuntime) disableAutomaticRefreshLocked() {
 	}
 	clear(runtime.pendingTriggers)
 	clear(runtime.ambiguousImageRecheckAfter)
+	runtime.removePeriodicSchedulesLocked()
+	runtime.periodicNextAt = time.Time{}
+	runtime.periodicGeneration++
 	runtime.cond.Broadcast()
 }
 
@@ -661,6 +686,7 @@ func (runtime *chatGPTWebAccountInfoRuntime) close() {
 	runtime.queue = nil
 	runtime.queueHead = 0
 	clear(runtime.queuedByTarget)
+	runtime.periodicNextAt = time.Time{}
 	runtime.schedules = nil
 	clear(runtime.scheduled)
 	for _, call := range runtime.calls {
@@ -672,6 +698,7 @@ func (runtime *chatGPTWebAccountInfoRuntime) close() {
 	runtime.mu.Unlock()
 	runtime.cancel()
 	runtime.signalScheduler()
+	runtime.signalPeriodic()
 	runtime.wg.Wait()
 	runtime.mu.Lock()
 	clear(runtime.tasks)
@@ -877,6 +904,81 @@ func (runtime *chatGPTWebAccountInfoRuntime) queueLengthLocked() int {
 		return 0
 	}
 	return len(runtime.queue) - runtime.queueHead
+}
+
+func (runtime *chatGPTWebAccountInfoRuntime) periodicEnabledLocked() bool {
+	return runtime != nil && runtime.started && !runtime.closed &&
+		runtime.cfg.AutomaticRefreshEnabled() && runtime.cfg.PeriodicRefreshMinutes > 0
+}
+
+func (runtime *chatGPTWebAccountInfoRuntime) resetPeriodicScheduleLocked() {
+	if runtime == nil {
+		return
+	}
+	runtime.periodicGeneration++
+	runtime.removePeriodicSchedulesLocked()
+	if !runtime.periodicEnabledLocked() {
+		runtime.periodicNextAt = time.Time{}
+		return
+	}
+	runtime.periodicNextAt = runtime.currentTime().Add(
+		time.Duration(runtime.cfg.PeriodicRefreshMinutes) * time.Minute,
+	)
+}
+
+func (runtime *chatGPTWebAccountInfoRuntime) removePeriodicSchedulesLocked() {
+	if runtime == nil {
+		return
+	}
+	keys := make([]string, 0)
+	for key := range runtime.scheduled {
+		if strings.HasPrefix(key, chatGPTWebAccountInfoPeriodicSchedulePrefix) {
+			keys = append(keys, key)
+		}
+	}
+	for _, key := range keys {
+		if entry := runtime.removeScheduleLocked(key); entry != nil {
+			runtime.releaseWorkEpochLocked(entry.work)
+		}
+	}
+}
+
+func (runtime *chatGPTWebAccountInfoRuntime) schedulePeriodicTargetsLocked(
+	targets []chatgptwebauth.AccountInfoRefreshTarget,
+	due time.Time,
+) {
+	if runtime == nil || !runtime.periodicEnabledLocked() {
+		return
+	}
+	for _, target := range targets {
+		runtimeKey := chatGPTWebAccountInfoTargetKey(target)
+		if runtimeKey == "" || runtime.periodicTargetCoveredLocked(target) {
+			continue
+		}
+		runtime.scheduleLocked(
+			chatGPTWebAccountInfoPeriodicSchedulePrefix+runtimeKey,
+			due,
+			chatGPTWebAccountInfoWork{
+				target:    target,
+				force:     false,
+				attempt:   1,
+				automatic: true,
+			},
+		)
+	}
+}
+
+func (runtime *chatGPTWebAccountInfoRuntime) periodicTargetCoveredLocked(
+	target chatgptwebauth.AccountInfoRefreshTarget,
+) bool {
+	runtimeKey := chatGPTWebAccountInfoTargetKey(target)
+	if runtimeKey == "" {
+		return true
+	}
+	return runtime.inflight[runtimeKey] > 0 ||
+		runtime.pendingTriggers[runtimeKey] != chatGPTWebAccountInfoTriggerNone ||
+		runtime.targetQueuedLocked(runtimeKey) ||
+		len(runtime.scheduledByTarget[runtimeKey]) > 0
 }
 
 func (runtime *chatGPTWebAccountInfoRuntime) queuedWorkLocked() []chatGPTWebAccountInfoWork {
@@ -2164,6 +2266,109 @@ func (runtime *chatGPTWebAccountInfoRuntime) schedulerLoop() {
 	}
 }
 
+func (runtime *chatGPTWebAccountInfoRuntime) periodicLoop() {
+	defer runtime.wg.Done()
+	timer := time.NewTimer(time.Hour)
+	timer.Stop()
+	defer timer.Stop()
+	for {
+		runtime.mu.Lock()
+		next := runtime.periodicNextAt
+		enabled := runtime.periodicEnabledLocked() && !next.IsZero()
+		runtime.mu.Unlock()
+		if !enabled {
+			select {
+			case <-runtime.ctx.Done():
+				return
+			case <-runtime.periodicWake:
+				continue
+			}
+		}
+		delay := next.Sub(runtime.currentTime())
+		if delay < 0 {
+			delay = 0
+		}
+		timer.Reset(delay)
+		select {
+		case <-runtime.ctx.Done():
+			return
+		case <-runtime.periodicWake:
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			continue
+		case <-timer.C:
+			runtime.runPeriodicScan(next)
+		}
+	}
+}
+
+func (runtime *chatGPTWebAccountInfoRuntime) runPeriodicScan(expected time.Time) {
+	if runtime == nil {
+		return
+	}
+	runtime.mu.Lock()
+	now := runtime.currentTime()
+	if !runtime.periodicEnabledLocked() || runtime.periodicNextAt.IsZero() ||
+		!runtime.periodicNextAt.Equal(expected) || now.Before(expected) {
+		runtime.mu.Unlock()
+		return
+	}
+	generation := runtime.periodicGeneration
+	interval := time.Duration(runtime.cfg.PeriodicRefreshMinutes) * time.Minute
+	runtime.periodicNextAt = now.Add(interval)
+	runtime.mu.Unlock()
+	runtime.signalPeriodic()
+
+	targets := runtime.periodicRefreshTargets()
+	runtime.mu.Lock()
+	if !runtime.periodicEnabledLocked() || runtime.periodicGeneration != generation {
+		runtime.mu.Unlock()
+		return
+	}
+	if now = runtime.currentTime(); !runtime.periodicNextAt.After(now) {
+		runtime.periodicNextAt = now.Add(interval)
+	}
+	runtime.schedulePeriodicTargetsLocked(targets, now)
+	runtime.mu.Unlock()
+	runtime.signalPeriodic()
+}
+
+func (runtime *chatGPTWebAccountInfoRuntime) periodicRefreshTargets() []chatgptwebauth.AccountInfoRefreshTarget {
+	if runtime == nil || runtime.executor == nil || runtime.executor.manager == nil {
+		return nil
+	}
+	auths := runtime.executor.manager.List()
+	targets := make([]chatgptwebauth.AccountInfoRefreshTarget, 0, len(auths))
+	for _, auth := range auths {
+		if auth == nil || strings.TrimSpace(auth.ID) == "" ||
+			!strings.EqualFold(strings.TrimSpace(auth.Provider), chatgptwebauth.Provider) ||
+			auth.Disabled || auth.Status == cliproxyauth.StatusDisabled ||
+			!auth.LifecycleRefreshable() {
+			continue
+		}
+		if _, errCredential := chatgptwebauth.ParseCredential(auth.Metadata); errCredential != nil {
+			continue
+		}
+		name := strings.TrimSpace(auth.FileName)
+		if name == "" {
+			name = strings.TrimSpace(auth.ID)
+		}
+		targets = append(targets, chatgptwebauth.AccountInfoRefreshTarget{
+			Name:           name,
+			AuthID:         strings.TrimSpace(auth.ID),
+			AuthInstanceID: strings.TrimSpace(auth.RuntimeInstanceID()),
+		})
+	}
+	sort.Slice(targets, func(i, j int) bool {
+		return chatGPTWebAccountInfoTargetKey(targets[i]) < chatGPTWebAccountInfoTargetKey(targets[j])
+	})
+	return targets
+}
+
 func (runtime *chatGPTWebAccountInfoRuntime) nextScheduleLocked() (*chatGPTWebAccountInfoSchedule, bool) {
 	for len(runtime.schedules) > 0 {
 		entry := runtime.schedules[0]
@@ -2178,6 +2383,13 @@ func (runtime *chatGPTWebAccountInfoRuntime) nextScheduleLocked() (*chatGPTWebAc
 func (runtime *chatGPTWebAccountInfoRuntime) signalScheduler() {
 	select {
 	case runtime.wake <- struct{}{}:
+	default:
+	}
+}
+
+func (runtime *chatGPTWebAccountInfoRuntime) signalPeriodic() {
+	select {
+	case runtime.periodicWake <- struct{}{}:
 	default:
 	}
 }
