@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -236,6 +237,39 @@ func TestPatchChatGPTWebAccountInfoRejectsNullPeriodicRefresh(t *testing.T) {
 	if recorder.Code != http.StatusBadRequest ||
 		!strings.Contains(recorder.Body.String(), "invalid periodic-refresh-minutes") {
 		t.Fatalf("status = %d body = %s", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestPatchChatGPTWebAccountInfoRollsBackPeriodicRefreshOnPersistFailure(t *testing.T) {
+	periodic := 15
+	manager := coreauth.NewManager(nil, nil, nil)
+	executor := &accountInfoControllerTestExecutor{}
+	manager.RegisterExecutor(executor)
+	handler := &Handler{
+		cfg: &config.Config{ChatGPTWeb: config.ChatGPTWebConfig{
+			AccountInfo: config.ChatGPTWebAccountInfoConfig{PeriodicRefreshMinutes: &periodic},
+		}},
+		configFilePath: filepath.Join(t.TempDir(), "missing", "config.yaml"),
+		authManager:    manager,
+	}
+	ctx, recorder := newChatGPTWebAccountInfoRequest(
+		http.MethodPatch,
+		`{"periodic-refresh-minutes":60}`,
+	)
+
+	handler.PatchChatGPTWebAccountInfo(ctx)
+
+	if recorder.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d body = %s", recorder.Code, recorder.Body.String())
+	}
+	if got := handler.cfg.ChatGPTWeb.AccountInfo.Resolved().PeriodicRefreshMinutes; got != periodic {
+		t.Fatalf("periodic refresh after persistence failure = %d, want %d", got, periodic)
+	}
+	executor.mu.Lock()
+	updates := executor.updates
+	executor.mu.Unlock()
+	if updates != 0 {
+		t.Fatalf("runtime updates after persistence failure = %d, want 0", updates)
 	}
 }
 
