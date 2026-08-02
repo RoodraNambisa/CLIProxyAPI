@@ -2,9 +2,11 @@ package executor
 
 import (
 	"bytes"
+	"errors"
 	"image"
 	"image/color"
 	"image/png"
+	"net/http"
 	"strings"
 	"testing"
 
@@ -72,6 +74,193 @@ func TestPrepareChatGPTWebImageOutputsKeepsRatioMismatch(t *testing.T) {
 	if len(outputs) != 1 || outputs[0].Width != 16 || outputs[0].Height != 16 {
 		t.Fatalf("outputs = %#v", outputs)
 	}
+}
+
+func TestPrepareChatGPTWebImageOutputsRejectsStrictRatioMismatch(t *testing.T) {
+	original := chatGPTWebResizeTestPNG(t, 16, 16, false)
+	images := [][]byte{append([]byte(nil), original...)}
+	_, err := prepareChatGPTWebImageOutputsWithConfig(
+		"png",
+		"gpt-image-2",
+		"auto",
+		images,
+		&helps.ChatGPTWebImageSizeMatch{Width: 32, Height: 18, RatioWidth: 16, RatioHeight: 9, Ratio: "16:9"},
+		cliproxyexecutor.ChatGPTWebImageConfigSnapshot{
+			AspectRatioMaxErrorPercent: 1,
+			ResizeToRequestedSize:      true,
+			StrictSize:                 true,
+			ResizeFilter:               config.ChatGPTWebResizeFilterCatmullRom,
+			MaxImageResponseBytes:      1 << 20,
+		},
+	)
+	if err == nil || !strings.Contains(err.Error(), `"code":"image_size_mismatch"`) ||
+		!strings.Contains(err.Error(), "chatgpt web") {
+		t.Fatalf("prepareChatGPTWebImageOutputsWithConfig() error = %v", err)
+	}
+	if !bytes.Equal(images[0], original) {
+		t.Fatal("strict ratio failure modified the original image")
+	}
+	var status interface{ StatusCode() int }
+	if !errors.As(err, &status) || status.StatusCode() != http.StatusBadGateway {
+		t.Fatalf("strict ratio status error = %v", err)
+	}
+	assertChatGPTWebNonAuthNonRetryError(t, err)
+}
+
+func TestPrepareChatGPTWebImageOutputsConvertsPNGToJPEGAndWebP(t *testing.T) {
+	source := image.NewNRGBA(image.Rect(0, 0, 16, 16))
+	for y := range 16 {
+		for x := range 16 {
+			source.SetNRGBA(x, y, color.NRGBA{R: 200, G: 40, B: 20, A: 255})
+		}
+	}
+	for y := 8; y < 16; y++ {
+		for x := 8; x < 16; x++ {
+			source.SetNRGBA(x, y, color.NRGBA{R: 255, A: 0})
+		}
+	}
+	var encodedSource bytes.Buffer
+	if err := png.Encode(&encodedSource, source); err != nil {
+		t.Fatalf("encode source PNG: %v", err)
+	}
+
+	t.Run("JPEG flattens transparency on white", func(t *testing.T) {
+		images := [][]byte{append([]byte(nil), encodedSource.Bytes()...)}
+		outputs, err := prepareChatGPTWebImageOutputsWithConfigAndCompression(
+			"jpeg", 90, "gpt-image-2", "medium", images, nil,
+			cliproxyexecutor.ChatGPTWebImageConfigSnapshot{MaxImageResponseBytes: 1 << 20},
+		)
+		if err != nil {
+			t.Fatalf("prepare JPEG error = %v", err)
+		}
+		if got := chatGPTWebImageOutputFormat(images[0]); got != "jpeg" {
+			t.Fatalf("output format = %q, want jpeg", got)
+		}
+		if len(outputs) != 1 || outputs[0].Width != 16 || outputs[0].Height != 16 {
+			t.Fatalf("outputs = %#v", outputs)
+		}
+		decoded, _, errDecode := image.Decode(bytes.NewReader(images[0]))
+		if errDecode != nil {
+			t.Fatalf("decode JPEG: %v", errDecode)
+		}
+		pixel := color.NRGBAModel.Convert(decoded.At(14, 14)).(color.NRGBA)
+		if pixel.A != 255 || pixel.R < 220 || pixel.G < 220 || pixel.B < 220 {
+			t.Fatalf("transparent pixel = %#v, want opaque white background", pixel)
+		}
+	})
+
+	t.Run("JPEG accepts the lowest API compression value", func(t *testing.T) {
+		images := [][]byte{append([]byte(nil), encodedSource.Bytes()...)}
+		_, err := prepareChatGPTWebImageOutputsWithConfigAndCompression(
+			"jpeg", 0, "gpt-image-2", "medium", images, nil,
+			cliproxyexecutor.ChatGPTWebImageConfigSnapshot{MaxImageResponseBytes: 1 << 20},
+		)
+		if err != nil {
+			t.Fatalf("prepare JPEG with zero compression error = %v", err)
+		}
+		if got := chatGPTWebImageOutputFormat(images[0]); got != "jpeg" {
+			t.Fatalf("output format = %q, want jpeg", got)
+		}
+	})
+
+	t.Run("WebP preserves transparency", func(t *testing.T) {
+		images := [][]byte{append([]byte(nil), encodedSource.Bytes()...)}
+		outputs, err := prepareChatGPTWebImageOutputsWithConfigAndCompression(
+			"webp", 0, "gpt-image-2", "medium", images, nil,
+			cliproxyexecutor.ChatGPTWebImageConfigSnapshot{MaxImageResponseBytes: 1 << 20},
+		)
+		if err != nil {
+			t.Fatalf("prepare WebP error = %v", err)
+		}
+		if got := chatGPTWebImageOutputFormat(images[0]); got != "webp" {
+			t.Fatalf("output format = %q, want webp", got)
+		}
+		if len(outputs) != 1 || outputs[0].Width != 16 || outputs[0].Height != 16 {
+			t.Fatalf("outputs = %#v", outputs)
+		}
+		decoded, _, errDecode := image.Decode(bytes.NewReader(images[0]))
+		if errDecode != nil {
+			t.Fatalf("decode WebP: %v", errDecode)
+		}
+		if got := color.NRGBAModel.Convert(decoded.At(14, 14)).(color.NRGBA).A; got != 0 {
+			t.Fatalf("transparent pixel alpha = %d, want 0", got)
+		}
+	})
+
+	t.Run("WebP applies compression to an existing WebP", func(t *testing.T) {
+		original, errEncode := encodeChatGPTWebOutputImage(source, "webp", 90, 1<<20)
+		if errEncode != nil {
+			t.Fatalf("encode original WebP: %v", errEncode)
+		}
+		images := [][]byte{append([]byte(nil), original...)}
+		_, err := prepareChatGPTWebImageOutputsWithConfigAndCompression(
+			"webp", 1, "gpt-image-2", "medium", images, nil,
+			cliproxyexecutor.ChatGPTWebImageConfigSnapshot{MaxImageResponseBytes: 1 << 20},
+		)
+		if err != nil {
+			t.Fatalf("re-encode WebP error = %v", err)
+		}
+		if bytes.Equal(images[0], original) {
+			t.Fatal("existing WebP was returned without applying output_compression")
+		}
+	})
+}
+
+func TestPrepareChatGPTWebImageOutputsUsesTransactionalBudgetFallback(t *testing.T) {
+	original := chatGPTWebResizeTestPNG(t, 16, 16, true)
+	decoded, _, errDecode := image.Decode(bytes.NewReader(original))
+	if errDecode != nil {
+		t.Fatalf("decode source PNG: %v", errDecode)
+	}
+	jpegCandidate, errEncode := encodeChatGPTWebOutputImage(decoded, "jpeg", 90, 1<<20)
+	if errEncode != nil {
+		t.Fatalf("encode candidate JPEG: %v", errEncode)
+	}
+	if len(jpegCandidate) <= len(original) {
+		t.Fatalf("candidate length = %d, original = %d; fixture cannot exercise budget fallback", len(jpegCandidate), len(original))
+	}
+	limit := len(jpegCandidate) + len(original)
+
+	t.Run("non-strict returns the complete original batch", func(t *testing.T) {
+		images := [][]byte{append([]byte(nil), original...), append([]byte(nil), original...)}
+		outputs, err := prepareChatGPTWebImageOutputsWithConfigAndCompression(
+			"jpeg", 90, "gpt-image-2", "medium", images, nil,
+			cliproxyexecutor.ChatGPTWebImageConfigSnapshot{MaxImageResponseBytes: limit},
+		)
+		if err != nil {
+			t.Fatalf("prepare non-strict batch error = %v", err)
+		}
+		if len(outputs) != 2 || outputs[0].Width != 16 || outputs[1].Height != 16 {
+			t.Fatalf("outputs = %#v", outputs)
+		}
+		for index := range images {
+			if !bytes.Equal(images[index], original) || chatGPTWebImageOutputFormat(images[index]) != "png" {
+				t.Fatalf("image %d was partially converted", index)
+			}
+		}
+	})
+
+	t.Run("strict rejects the complete batch", func(t *testing.T) {
+		images := [][]byte{append([]byte(nil), original...), append([]byte(nil), original...)}
+		_, err := prepareChatGPTWebImageOutputsWithConfigAndCompression(
+			"jpeg", 90, "gpt-image-2", "medium", images, nil,
+			cliproxyexecutor.ChatGPTWebImageConfigSnapshot{StrictSize: true, MaxImageResponseBytes: limit},
+		)
+		if err == nil || !strings.Contains(err.Error(), `"code":"image_response_budget_exceeded"`) ||
+			!strings.Contains(err.Error(), "chatgpt web") {
+			t.Fatalf("prepare strict batch error = %v", err)
+		}
+		for index := range images {
+			if !bytes.Equal(images[index], original) {
+				t.Fatalf("strict failure modified image %d", index)
+			}
+		}
+		var status interface{ StatusCode() int }
+		if !errors.As(err, &status) || status.StatusCode() != http.StatusBadGateway {
+			t.Fatalf("strict batch status error = %v", err)
+		}
+		assertChatGPTWebNonAuthNonRetryError(t, err)
+	})
 }
 
 func TestResizeChatGPTWebImageFallsBackWhenEncodingExceedsBudget(t *testing.T) {

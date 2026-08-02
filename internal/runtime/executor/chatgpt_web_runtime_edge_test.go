@@ -3746,6 +3746,51 @@ func TestDownloadChatGPTWebImagesUsesRequestResponseBudget(t *testing.T) {
 	assertChatGPTWebNonAuthNonRetryError(t, err)
 }
 
+func TestDownloadChatGPTWebImagesReturnsDownloadedPrefixWhenBatchExceedsBudget(t *testing.T) {
+	imageData := chatGPTWebPNGBytes(t, color.NRGBA{R: 255, A: 255})
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/backend-api/files/first/download":
+			_ = json.NewEncoder(w).Encode(map[string]any{"download_url": server.URL + "/asset/first"})
+		case "/backend-api/files/second/download":
+			_ = json.NewEncoder(w).Encode(map[string]any{"download_url": server.URL + "/asset/second"})
+		case "/asset/first", "/asset/second":
+			w.Header().Set("Content-Type", "image/png")
+			_, _ = w.Write(imageData)
+		default:
+			http.NotFound(w, request)
+		}
+	}))
+	defer server.Close()
+
+	executor := NewChatGPTWebExecutor(nil, nil)
+	executor.runtimeBaseURL = server.URL
+	client, credential, err := executor.newRuntimeClient(chatGPTWebRuntimeAuth())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.CloseIdleConnections()
+	images, err := executor.downloadChatGPTWebImagesLimitedWithBudget(
+		context.Background(),
+		client,
+		credential,
+		&helps.ChatGPTWebImageAccumulator{References: []helps.ChatGPTWebImageReference{
+			{Kind: "file", ID: "first"},
+			{Kind: "file", ID: "second"},
+		}},
+		2,
+		len(imageData)*2-1,
+	)
+	if err == nil || !strings.Contains(err.Error(), "image response exceeds") {
+		t.Fatalf("download error = %v", err)
+	}
+	if len(images) != 1 || !bytes.Equal(images[0], imageData) {
+		t.Fatalf("downloaded prefix = %d images, want the first completed image", len(images))
+	}
+	assertChatGPTWebNonAuthNonRetryError(t, err)
+}
+
 func TestDownloadChatGPTWebImagesLimitsResultsBeforeResolvingAssets(t *testing.T) {
 	imageData := chatGPTWebPNGBytes(t, color.NRGBA{R: 255, A: 255})
 	var metadataHits atomic.Int32
@@ -6608,7 +6653,7 @@ func TestChatGPTWebExecutorDoesNotEnableUnrequestedImagePassthrough(t *testing.T
 	}
 }
 
-func TestChatGPTWebExecutorRejectsUnenforceableImageFormatBeforeUpstream(t *testing.T) {
+func TestChatGPTWebExecutorRejectsUnsupportedImageFormatBeforeUpstream(t *testing.T) {
 	executor := NewChatGPTWebExecutor(nil, nil)
 
 	_, err := executor.Execute(context.Background(), chatGPTWebRuntimeAuth(), cliproxyexecutor.Request{
@@ -6616,10 +6661,10 @@ func TestChatGPTWebExecutorRejectsUnenforceableImageFormatBeforeUpstream(t *test
 		Payload: []byte(`{
 			"model":"gpt-5.4",
 			"input":"draw",
-			"tools":[{"type":"image_generation","output_format":"webp"}]
+			"tools":[{"type":"image_generation","output_format":"gif"}]
 		}`),
 	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatCodex, ResponseFormat: sdktranslator.FormatCodex})
-	if err == nil || !strings.Contains(err.Error(), `output_format "webp"`) {
+	if err == nil || !strings.Contains(err.Error(), `output_format "gif"`) {
 		t.Fatalf("Execute() error = %v", err)
 	}
 	var status interface{ StatusCode() int }
@@ -6840,8 +6885,8 @@ func TestChatGPTWebExecutorIgnoresConfiguredUnsupportedImageParams(t *testing.T)
 	if prepared.request.Image.Quality != "auto" {
 		t.Fatalf("image quality = %q, want auto", prepared.request.Image.Quality)
 	}
-	if prepared.request.Image.OutputFormat != "png" {
-		t.Fatalf("image output format = %q, want png", prepared.request.Image.OutputFormat)
+	if prepared.request.Image.OutputFormat != "jpeg" {
+		t.Fatalf("image output format = %q, want jpeg", prepared.request.Image.OutputFormat)
 	}
 }
 
@@ -6917,8 +6962,8 @@ func TestChatGPTWebExecutorUsesPinnedUnsupportedImageParamPolicy(t *testing.T) {
 			if prepared.request.Image.Quality != "auto" {
 				t.Fatalf("image quality = %q, want auto", prepared.request.Image.Quality)
 			}
-			if prepared.request.Image.OutputFormat != "png" {
-				t.Fatalf("image output format = %q, want png", prepared.request.Image.OutputFormat)
+			if prepared.request.Image.OutputFormat != "jpeg" {
+				t.Fatalf("image output format = %q, want jpeg", prepared.request.Image.OutputFormat)
 			}
 		})
 	}

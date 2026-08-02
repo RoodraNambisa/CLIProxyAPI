@@ -115,16 +115,17 @@ type ChatGPTWebMessage struct {
 // ChatGPTWebImageRequest describes an image_generation request embedded in a
 // canonical Responses payload.
 type ChatGPTWebImageRequest struct {
-	Model          string
-	Prompt         string
-	N              int
-	Images         []string
-	MaskURL        string
-	MaskImageIndex int
-	Size           string
-	Quality        string
-	Action         string
-	OutputFormat   string
+	Model             string
+	Prompt            string
+	N                 int
+	Images            []string
+	MaskURL           string
+	MaskImageIndex    int
+	Size              string
+	Quality           string
+	Action            string
+	OutputFormat      string
+	OutputCompression int
 }
 
 // ChatGPTWebRequest is the subset of canonical Responses understood by the
@@ -567,7 +568,6 @@ func validateChatGPTWebImageTool(tool map[string]any, ignoreUnsupportedParams bo
 		}{
 			{field: "background", defaultValue: "auto"},
 			{field: "moderation", defaultValue: "auto"},
-			{field: "output_compression", defaultValue: "100"},
 		} {
 			if value, exists := tool[candidate.field]; exists {
 				normalized := strings.ToLower(strings.TrimSpace(stringFromAny(value)))
@@ -583,9 +583,18 @@ func validateChatGPTWebImageTool(tool map[string]any, ignoreUnsupportedParams bo
 				Message: "chatgpt web does not support image_generation field \"input_fidelity\"",
 			}
 		}
-		if value := strings.ToLower(strings.TrimSpace(stringFromAny(tool["output_format"]))); value != "" && value != "png" {
+		outputFormat := normalizeChatGPTWebToolOutputFormat(stringFromAny(tool["output_format"]))
+		if outputFormat == "" {
 			return &ChatGPTWebUnsupportedToolError{
-				Message: fmt.Sprintf("chatgpt web cannot guarantee image_generation output_format %q", value),
+				Message: fmt.Sprintf("chatgpt web cannot guarantee image_generation output_format %q", stringFromAny(tool["output_format"])),
+			}
+		}
+		if value, exists := tool["output_compression"]; exists && value != nil {
+			compression, ok := integerFromAny(value)
+			if !ok || compression < 0 || compression > 100 || (outputFormat == "png" && compression != 100) {
+				return &ChatGPTWebUnsupportedToolError{
+					Message: "chatgpt web does not support this image_generation output_compression",
+				}
 			}
 		}
 		if value, exists := tool["partial_images"]; exists && strings.TrimSpace(stringFromAny(value)) != "" &&
@@ -898,16 +907,20 @@ func imageURLFromAny(value any) string {
 
 func imageRequestFromMessages(messages []ChatGPTWebMessage, tool map[string]any) (*ChatGPTWebImageRequest, error) {
 	request := &ChatGPTWebImageRequest{
-		Model:          strings.TrimSpace(stringFromAny(tool["model"])),
-		N:              1,
-		Size:           strings.TrimSpace(stringFromAny(tool["size"])),
-		Quality:        strings.TrimSpace(stringFromAny(tool["quality"])),
-		Action:         strings.ToLower(strings.TrimSpace(stringFromAny(tool["action"]))),
-		OutputFormat:   strings.ToLower(strings.TrimSpace(stringFromAny(tool["output_format"]))),
-		MaskImageIndex: -1,
+		Model:             strings.TrimSpace(stringFromAny(tool["model"])),
+		N:                 1,
+		Size:              strings.TrimSpace(stringFromAny(tool["size"])),
+		Quality:           strings.TrimSpace(stringFromAny(tool["quality"])),
+		Action:            strings.ToLower(strings.TrimSpace(stringFromAny(tool["action"]))),
+		OutputFormat:      strings.ToLower(strings.TrimSpace(stringFromAny(tool["output_format"]))),
+		OutputCompression: 100,
+		MaskImageIndex:    -1,
 	}
 	if n, ok := integerFromAny(tool["n"]); ok && n > 0 {
 		request.N = n
+	}
+	if compression, ok := integerFromAny(tool["output_compression"]); ok && compression >= 0 && compression <= 100 {
+		request.OutputCompression = compression
 	}
 	if mask, ok := tool["input_image_mask"].(map[string]any); ok {
 		request.MaskURL = imageURLFromAny(mask["image_url"])
@@ -996,6 +1009,19 @@ func imageRequestFromMessages(messages []ChatGPTWebMessage, tool map[string]any)
 		request.Quality = "auto"
 	}
 	return request, nil
+}
+
+func normalizeChatGPTWebToolOutputFormat(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "", "png":
+		return "png"
+	case "jpg", "jpeg":
+		return "jpeg"
+	case "webp":
+		return "webp"
+	default:
+		return ""
+	}
 }
 
 // ChatGPTWebConversationAccumulator turns web conversation full-message and

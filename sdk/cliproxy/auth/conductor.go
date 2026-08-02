@@ -254,6 +254,7 @@ type executionResult struct {
 	additionalSuccessModels []string
 	imageSuccessCount       int64
 	imageSuccessModels      []string
+	quotaProjectionOnly     bool
 }
 
 func resultForAuth(auth *Auth, provider, model string, success bool) executionResult {
@@ -268,8 +269,13 @@ func resultForAuth(auth *Auth, provider, model string, success bool) executionRe
 func successfulExecutionResultForAuth(auth *Auth, provider, model string, opts cliproxyexecutor.Options) executionResult {
 	result := resultForAuth(auth, provider, model, true)
 	state, _ := opts.Metadata[cliproxyexecutor.ImageGenerationResultStateMetadataKey].(*cliproxyexecutor.ImageGenerationResultState)
-	if state != nil && state.Succeeded() && strings.EqualFold(strings.TrimSpace(provider), chatgptwebauth.Provider) {
-		result.imageSuccessCount = state.SucceededCount()
+	if state != nil && strings.EqualFold(strings.TrimSpace(provider), chatgptwebauth.Provider) {
+		result.imageSuccessCount = state.TakeProducedCount()
+		if result.imageSuccessCount == 0 && state.Succeeded() {
+			result.imageSuccessCount = state.SucceededCount()
+		}
+	}
+	if result.imageSuccessCount > 0 {
 		result.imageSuccessModels = ChatGPTWebImageModelIDs(auth)
 		for _, imageModel := range result.imageSuccessModels {
 			if canonicalModelKey(model) != canonicalModelKey(imageModel) {
@@ -278,6 +284,28 @@ func successfulExecutionResultForAuth(auth *Auth, provider, model string, opts c
 		}
 	}
 	return result
+}
+
+func imageQuotaProjectionResultForAuth(auth *Auth, provider, model string, opts cliproxyexecutor.Options) (executionResult, bool) {
+	if !strings.EqualFold(strings.TrimSpace(provider), chatgptwebauth.Provider) {
+		return executionResult{}, false
+	}
+	state, _ := opts.Metadata[cliproxyexecutor.ImageGenerationResultStateMetadataKey].(*cliproxyexecutor.ImageGenerationResultState)
+	count := state.TakeProducedCount()
+	if count <= 0 {
+		return executionResult{}, false
+	}
+	result := resultForAuth(auth, provider, model, false)
+	result.imageSuccessCount = count
+	result.imageSuccessModels = ChatGPTWebImageModelIDs(auth)
+	result.quotaProjectionOnly = true
+	return result, true
+}
+
+func (m *Manager) projectFailedImageGenerationQuota(ctx context.Context, auth *Auth, provider, model string, opts cliproxyexecutor.Options) {
+	if result, ok := imageQuotaProjectionResultForAuth(auth, provider, model, opts); ok {
+		m.markExecutionResult(ctx, result)
+	}
 }
 
 func executionResultModelForError(model string, err error) string {
@@ -1955,6 +1983,13 @@ func (m *Manager) wrapStreamResult(ctx, resultCtx context.Context, auth *Auth, a
 				if se, ok := errors.AsType[cliproxyexecutor.StatusError](chunk.Err); ok && se != nil {
 					rerr.HTTPStatus = se.StatusCode()
 				}
+				m.projectFailedImageGenerationQuota(
+					resultCtx,
+					auth,
+					provider,
+					executionResultModelForError(resultModel, chunk.Err),
+					opts,
+				)
 				if !runtimeAuthInstanceRetiredContext(ctx) && !skipAuthResultForError(chunk.Err) {
 					result := resultForAuth(auth, provider, executionResultModelForError(resultModel, chunk.Err), false)
 					rerr.Code = executionResultErrorCode(chunk.Err)
@@ -2094,6 +2129,7 @@ func (m *Manager) executeStreamWithModelPool(ctx, resultCtx context.Context, exe
 				return nil, errCtx
 			}
 			errStream = m.reportProxyFailure(ctx, auth, errStream)
+			m.projectFailedImageGenerationQuota(ctx, auth, provider, executionResultModelForError(resultModel, errStream), opts)
 			rerr := &Error{Message: errStream.Error()}
 			if se, ok := errors.AsType[cliproxyexecutor.StatusError](errStream); ok && se != nil {
 				rerr.HTTPStatus = se.StatusCode()
@@ -2126,6 +2162,7 @@ func (m *Manager) executeStreamWithModelPool(ctx, resultCtx context.Context, exe
 				return nil, errCtx
 			}
 			bootstrapErr = m.reportProxyFailure(ctx, auth, bootstrapErr)
+			m.projectFailedImageGenerationQuota(ctx, auth, provider, executionResultModelForError(resultModel, bootstrapErr), opts)
 			if m.isRequestInvalidError(bootstrapErr) {
 				rerr := &Error{Message: bootstrapErr.Error()}
 				if se, ok := errors.AsType[cliproxyexecutor.StatusError](bootstrapErr); ok && se != nil {
@@ -4883,6 +4920,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			}
 			errExec = m.reportProxyFailure(execCtx, auth, errExec)
 			resultModel = executionResultModelForError(resultModel, errExec)
+			m.projectFailedImageGenerationQuota(execCtx, auth, provider, resultModel, opts)
 			result := resultForAuth(auth, provider, resultModel, false)
 			result.Error = &Error{Message: errExec.Error()}
 			result.Error.Code = executionResultErrorCode(errExec)
@@ -6736,7 +6774,7 @@ func waitForCooldown(ctx context.Context, wait time.Duration) error {
 
 // MarkResult records an execution result and notifies hooks.
 func (m *Manager) MarkResult(ctx context.Context, result Result) {
-	m.markResult(ctx, result, "", nil, 0, nil)
+	m.markResult(ctx, result, "", nil, 0, nil, false)
 }
 
 func (m *Manager) markExecutionResult(ctx context.Context, result executionResult) {
@@ -6747,6 +6785,7 @@ func (m *Manager) markExecutionResult(ctx context.Context, result executionResul
 		result.additionalSuccessModels,
 		result.imageSuccessCount,
 		result.imageSuccessModels,
+		result.quotaProjectionOnly,
 	)
 }
 
@@ -6757,6 +6796,7 @@ func (m *Manager) markResult(
 	additionalSuccessModels []string,
 	imageSuccessCount int64,
 	imageSuccessModels []string,
+	quotaProjectionOnly bool,
 ) {
 	if result.AuthID == "" {
 		return
@@ -6809,6 +6849,51 @@ func (m *Manager) markResult(
 		authSnapshot *Auth
 		persistAuth  *Auth
 	)
+	if quotaProjectionOnly {
+		newlyExhausted := false
+		m.mu.Lock()
+		if auth, ok := m.auths[result.AuthID]; ok && auth != nil &&
+			(authInstanceID == "" || authInstanceID == auth.instanceID) {
+			knownQuota := metadataInt(auth.Metadata["image_quota_remaining"]) != nil
+			imageQuotaSuspendModels, newlyExhausted = projectChatGPTWebImageSuccess(
+				auth,
+				imageSuccessCount,
+				imageSuccessModels,
+				time.Now(),
+			)
+			if knownQuota {
+				persistAuth = auth
+			}
+		}
+		m.mu.Unlock()
+		if persistAuth != nil {
+			authSnapshot, _ = m.snapshotCurrentAuthForPersistenceLocked(ctx, persistAuth)
+		}
+		if m.scheduler != nil && authSnapshot != nil {
+			m.scheduler.upsertAuthState(authSnapshot)
+		}
+		applyProjection := func() {
+			for _, imageModel := range imageQuotaSuspendModels {
+				registry.GetGlobalRegistry().SetModelQuotaExceeded(result.AuthID, imageModel)
+				registry.GetGlobalRegistry().SuspendClientModel(result.AuthID, imageModel, "chatgpt_web_image_quota")
+			}
+		}
+		stillCurrent := persistAuth != nil
+		if stillCurrent && authInstanceID != "" {
+			m.mu.RLock()
+			current := m.auths[result.AuthID]
+			stillCurrent = current != nil && current.instanceID == authInstanceID && !m.sessionCleanupPendingLocked(result.AuthID)
+			m.mu.RUnlock()
+		}
+		if stillCurrent {
+			applyProjection()
+		}
+		unlockResultMutation()
+		if stillCurrent && newlyExhausted {
+			m.triggerChatGPTWebImageQuotaEvidenceRefresh(result.AuthID, authInstanceID)
+		}
+		return
+	}
 	acceptedResult := authInstanceID == ""
 	now := time.Time{}
 	dynamicModelResult := false

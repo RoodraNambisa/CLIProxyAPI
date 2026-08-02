@@ -101,6 +101,7 @@ func (s *ImageGenerationStreamPassthroughState) Enabled() bool {
 // provider returned. Merely accepting a request with an image tool is not success.
 type ImageGenerationResultState struct {
 	succeededCount atomic.Int64
+	producedCount  atomic.Int64
 }
 
 // MarkSucceeded records provider-confirmed image output.
@@ -126,6 +127,30 @@ func (s *ImageGenerationResultState) SucceededCount() int64 {
 		return 0
 	}
 	return s.succeededCount.Load()
+}
+
+// AddProduced records images that were generated and downloaded even if local
+// post-processing later prevents them from reaching the client.
+func (s *ImageGenerationResultState) AddProduced(count int) {
+	if s != nil && count > 0 {
+		s.producedCount.Add(int64(count))
+	}
+}
+
+// ProducedCount returns the number of generated and downloaded images.
+func (s *ImageGenerationResultState) ProducedCount() int64 {
+	if s == nil {
+		return 0
+	}
+	return s.producedCount.Load()
+}
+
+// TakeProducedCount atomically consumes generated images for quota projection.
+func (s *ImageGenerationResultState) TakeProducedCount() int64 {
+	if s == nil {
+		return 0
+	}
+	return s.producedCount.Swap(0)
 }
 
 // AuthInstanceRetirement reports whether a selected runtime auth instance was retired.

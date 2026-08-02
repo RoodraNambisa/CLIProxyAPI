@@ -10,8 +10,9 @@ import (
 	"fmt"
 	"image"
 	"image/color"
+	stddraw "image/draw"
 	_ "image/gif"
-	_ "image/jpeg"
+	"image/jpeg"
 	"image/png"
 	"io"
 	"mime"
@@ -25,6 +26,7 @@ import (
 	"time"
 
 	fhttp "github.com/bogdanfinn/fhttp"
+	imagewebp "github.com/gen2brain/webp"
 	"github.com/google/uuid"
 	chatgptwebauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/chatgptweb"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
@@ -695,14 +697,22 @@ func (e *ChatGPTWebExecutor) finishChatGPTWebImage(ctx context.Context, client *
 	}
 	responseByteLimit := chatGPTWebImageResponseByteLimit(prepared.imageConfigSnapshot)
 	images, err := e.downloadChatGPTWebImagesLimitedWithBudget(ctx, client, credential, accumulator, prepared.maxImageResults, responseByteLimit)
+	if prepared.imageResultState != nil && len(images) > 0 {
+		prepared.imageResultState.AddProduced(len(images))
+	}
 	if err != nil {
 		return nil, err
 	}
 	if len(images) == 0 {
 		return nil, statusErr{code: http.StatusBadGateway, msg: "chatgpt web did not return image output"}
 	}
-	outputImages, err := prepareChatGPTWebImageOutputsWithConfig(
+	outputCompression := imageRequest.OutputCompression
+	if normalizeChatGPTWebImageOutputFormat(imageRequest.OutputFormat) == "png" && outputCompression == 0 {
+		outputCompression = 100
+	}
+	outputImages, err := prepareChatGPTWebImageOutputsWithConfigAndCompression(
 		imageRequest.OutputFormat,
+		outputCompression,
 		imageRequest.Model,
 		imageRequest.Quality,
 		images,
@@ -743,61 +753,144 @@ func prepareChatGPTWebImageOutputsWithConfig(
 	imageSizeMatch *helps.ChatGPTWebImageSizeMatch,
 	imageConfig cliproxyexecutor.ChatGPTWebImageConfigSnapshot,
 ) ([]helps.ChatGPTWebUsageImage, error) {
+	return prepareChatGPTWebImageOutputsWithConfigAndCompression(
+		requestedFormat,
+		100,
+		model,
+		quality,
+		images,
+		imageSizeMatch,
+		imageConfig,
+	)
+}
+
+func prepareChatGPTWebImageOutputsWithConfigAndCompression(
+	requestedFormat string,
+	outputCompression int,
+	model, quality string,
+	images [][]byte,
+	imageSizeMatch *helps.ChatGPTWebImageSizeMatch,
+	imageConfig cliproxyexecutor.ChatGPTWebImageConfigSnapshot,
+) ([]helps.ChatGPTWebUsageImage, error) {
 	requestedFormat = normalizeChatGPTWebImageOutputFormat(requestedFormat)
+	if requestedFormat != "png" && requestedFormat != "jpeg" && requestedFormat != "webp" {
+		return nil, statusErr{code: http.StatusBadRequest, msg: "chatgpt web does not support the requested image output format", skipAuthResult: true, retryOtherAuth: true}
+	}
+	if outputCompression < 0 || outputCompression > 100 || (requestedFormat == "png" && outputCompression != 100) {
+		return nil, statusErr{code: http.StatusBadRequest, msg: "chatgpt web does not support the requested image output compression", skipAuthResult: true, retryOtherAuth: true}
+	}
 	responseByteLimit := chatGPTWebImageResponseByteLimit(imageConfig)
-	totalBytes := 0
-	for index, imageData := range images {
-		if len(imageData) > responseByteLimit-totalBytes {
+	originalOutputs := make([]helps.ChatGPTWebUsageImage, 0, len(images))
+	originalTotalBytes := 0
+	for _, imageData := range images {
+		if len(imageData) > responseByteLimit-originalTotalBytes {
 			return nil, chatGPTWebImageResponseLimitError(responseByteLimit)
 		}
 		outputFormat := chatGPTWebImageOutputFormat(imageData)
 		if outputFormat == "" {
 			return nil, statusErr{code: http.StatusBadGateway, msg: "chatgpt web returned an unrecognized image format", skipAuthResult: true, retryOtherAuth: true}
 		}
-		if requestedFormat == "png" && outputFormat != requestedFormat {
-			converted, errConvert := convertChatGPTWebImageToPNGWithLimit(imageData, outputFormat, responseByteLimit)
-			if errConvert != nil {
-				if errors.Is(errConvert, errChatGPTWebImageResponseBudgetExceeded) {
-					return nil, chatGPTWebImageResponseLimitError(responseByteLimit)
-				}
-				return nil, fmt.Errorf("convert chatgpt web %s image to png: %w", outputFormat, errConvert)
-			}
-			imageData = converted
-			images[index] = converted
-			outputFormat = "png"
-		}
-		if requestedFormat != "" && requestedFormat != outputFormat {
-			return nil, statusErr{code: http.StatusBadGateway, msg: fmt.Sprintf("chatgpt web returned %s image data instead of requested %s", outputFormat, requestedFormat), skipAuthResult: true, retryOtherAuth: true}
-		}
-		if len(imageData) > responseByteLimit-totalBytes {
-			return nil, chatGPTWebImageResponseLimitError(responseByteLimit)
-		}
-		totalBytes += len(imageData)
-	}
-
-	outputs := make([]helps.ChatGPTWebUsageImage, 0, len(images))
-	for index, imageData := range images {
-		if requestedFormat == "png" && imageConfig.ResizeToRequestedSize && imageSizeMatch != nil {
-			maxCandidateBytes := responseByteLimit - (totalBytes - len(imageData))
-			resized, okResize, errResize := resizeChatGPTWebImageToPNG(imageData, imageSizeMatch, imageConfig, maxCandidateBytes)
-			if errResize != nil {
-				return nil, fmt.Errorf("resize chatgpt web image: %w", errResize)
-			}
-			if okResize {
-				totalBytes += len(resized) - len(imageData)
-				imageData = resized
-				images[index] = resized
-			}
-		}
 		decodedConfig, _, errConfig := image.DecodeConfig(bytes.NewReader(imageData))
 		if errConfig != nil {
 			return nil, statusErr{code: http.StatusBadGateway, msg: "chatgpt web returned an invalid image", skipAuthResult: true, retryOtherAuth: true}
 		}
-		outputs = append(outputs, helps.ChatGPTWebUsageImage{
+		originalOutputs = append(originalOutputs, helps.ChatGPTWebUsageImage{
 			Model: model, Use: "image_generation_output", Width: decodedConfig.Width, Height: decodedConfig.Height, Quality: quality,
 		})
+		originalTotalBytes += len(imageData)
 	}
-	return outputs, nil
+
+	resizeEnabled := imageConfig.ResizeToRequestedSize && imageSizeMatch != nil
+	if resizeEnabled {
+		for _, output := range originalOutputs {
+			if !helps.ChatGPTWebImageRatioMatches(
+				output.Width,
+				output.Height,
+				imageSizeMatch.RatioWidth,
+				imageSizeMatch.RatioHeight,
+				imageConfig.AspectRatioMaxErrorPercent,
+			) {
+				if imageConfig.StrictSize {
+					return nil, chatGPTWebImageSizeMismatchError()
+				}
+				return originalOutputs, nil
+			}
+		}
+	}
+
+	candidates := make([][]byte, len(images))
+	candidateOutputs := make([]helps.ChatGPTWebUsageImage, 0, len(images))
+	candidateTotalBytes := 0
+	changed := false
+	for index, imageData := range images {
+		originalFormat := chatGPTWebImageOutputFormat(imageData)
+		needsResize := resizeEnabled &&
+			(originalOutputs[index].Width != imageSizeMatch.Width || originalOutputs[index].Height != imageSizeMatch.Height)
+		needsEncoding := originalFormat != requestedFormat || requestedFormat == "jpeg" || requestedFormat == "webp"
+		if !needsResize && !needsEncoding {
+			if len(imageData) > responseByteLimit-candidateTotalBytes {
+				if imageConfig.StrictSize {
+					return nil, chatGPTWebImagePostProcessingBudgetError()
+				}
+				return originalOutputs, nil
+			}
+			candidates[index] = imageData
+			candidateOutputs = append(candidateOutputs, originalOutputs[index])
+			candidateTotalBytes += len(imageData)
+			continue
+		}
+
+		decoded, _, errDecode := decodeAndValidateChatGPTWebOutputImage(imageData, "image/"+originalFormat)
+		if errDecode != nil {
+			return nil, fmt.Errorf("decode chatgpt web %s image for post-processing: %w", originalFormat, errDecode)
+		}
+		processed := image.Image(decoded)
+		if needsResize {
+			crop := chatGPTWebImageCenterCrop(decoded.Bounds(), imageSizeMatch.Width, imageSizeMatch.Height)
+			if crop.Empty() {
+				return nil, errors.New("computed chatgpt web image crop is empty")
+			}
+			destination := image.NewRGBA(image.Rect(0, 0, imageSizeMatch.Width, imageSizeMatch.Height))
+			scaler := xdraw.Scaler(xdraw.CatmullRom)
+			if strings.EqualFold(strings.TrimSpace(imageConfig.ResizeFilter), config.ChatGPTWebResizeFilterApproxBiLinear) {
+				scaler = xdraw.ApproxBiLinear
+			}
+			scaler.Scale(destination, destination.Bounds(), decoded, crop, xdraw.Src, nil)
+			processed = destination
+		}
+
+		encoded, errEncode := encodeChatGPTWebOutputImage(
+			processed,
+			requestedFormat,
+			outputCompression,
+			responseByteLimit-candidateTotalBytes,
+		)
+		if errors.Is(errEncode, errChatGPTWebImageResponseBudgetExceeded) {
+			if imageConfig.StrictSize {
+				return nil, chatGPTWebImagePostProcessingBudgetError()
+			}
+			return originalOutputs, nil
+		}
+		if errEncode != nil {
+			return nil, fmt.Errorf("encode chatgpt web image as %s: %w", requestedFormat, errEncode)
+		}
+		if len(encoded) > responseByteLimit-candidateTotalBytes {
+			if imageConfig.StrictSize {
+				return nil, chatGPTWebImagePostProcessingBudgetError()
+			}
+			return originalOutputs, nil
+		}
+		candidates[index] = encoded
+		candidateTotalBytes += len(encoded)
+		candidateOutputs = append(candidateOutputs, helps.ChatGPTWebUsageImage{
+			Model: model, Use: "image_generation_output", Width: processed.Bounds().Dx(), Height: processed.Bounds().Dy(), Quality: quality,
+		})
+		changed = true
+	}
+	if changed {
+		copy(images, candidates)
+	}
+	return candidateOutputs, nil
 }
 
 var errChatGPTWebImageResponseBudgetExceeded = errors.New("chatgpt web image response budget exceeded")
@@ -814,6 +907,42 @@ func (buffer *chatGPTWebBoundedBuffer) Write(data []byte) (int, error) {
 	return buffer.Buffer.Write(data)
 }
 
+func encodeChatGPTWebOutputImage(source image.Image, outputFormat string, outputCompression, maxBytes int) ([]byte, error) {
+	if source == nil {
+		return nil, errors.New("chatgpt web image to encode is nil")
+	}
+	output := &chatGPTWebBoundedBuffer{maxBytes: maxBytes}
+	var err error
+	switch outputFormat {
+	case "png":
+		err = png.Encode(output, source)
+	case "jpeg":
+		// The standard JPEG encoder accepts qualities from 1 through 100, so map
+		// the API's lowest quality value to its lowest effective encoder value.
+		jpegQuality := max(outputCompression, 1)
+		err = jpeg.Encode(output, flattenChatGPTWebImageOnWhite(source), &jpeg.Options{Quality: jpegQuality})
+	case "webp":
+		// The encoder treats zero as an omitted quality, so map the API's lowest
+		// quality value to its lowest effective encoder value instead.
+		webPQuality := max(outputCompression, 1)
+		err = imagewebp.Encode(output, source, imagewebp.Options{Quality: webPQuality, Exact: true})
+	default:
+		return nil, fmt.Errorf("unsupported chatgpt web image output format %q", outputFormat)
+	}
+	if err != nil {
+		return nil, err
+	}
+	return output.Bytes(), nil
+}
+
+func flattenChatGPTWebImageOnWhite(source image.Image) image.Image {
+	bounds := source.Bounds()
+	destination := image.NewRGBA(image.Rect(0, 0, bounds.Dx(), bounds.Dy()))
+	stddraw.Draw(destination, destination.Bounds(), &image.Uniform{C: color.White}, image.Point{}, stddraw.Src)
+	stddraw.Draw(destination, destination.Bounds(), source, bounds.Min, stddraw.Over)
+	return destination
+}
+
 func chatGPTWebImageResponseByteLimit(snapshot cliproxyexecutor.ChatGPTWebImageConfigSnapshot) int {
 	maxBytes := config.MaxChatGPTWebMaxImageResponseMegabytes << 20
 	if snapshot.MaxImageResponseBytes <= 0 || snapshot.MaxImageResponseBytes > maxBytes {
@@ -826,6 +955,22 @@ func chatGPTWebImageResponseLimitError(limit int) error {
 	return statusErr{
 		code:           http.StatusBadGateway,
 		msg:            fmt.Sprintf("chatgpt web image response exceeds %d bytes", limit),
+		skipAuthResult: true,
+	}
+}
+
+func chatGPTWebImageSizeMismatchError() error {
+	return statusErr{
+		code:           http.StatusBadGateway,
+		msg:            `{"error":{"message":"chatgpt web image aspect ratio exceeds the configured tolerance for the requested size.","type":"server_error","code":"image_size_mismatch"}}`,
+		skipAuthResult: true,
+	}
+}
+
+func chatGPTWebImagePostProcessingBudgetError() error {
+	return statusErr{
+		code:           http.StatusBadGateway,
+		msg:            `{"error":{"message":"chatgpt web image post-processing exceeds the configured response budget.","type":"server_error","code":"image_response_budget_exceeded"}}`,
 		skipAuthResult: true,
 	}
 }
@@ -2784,18 +2929,18 @@ func (e *ChatGPTWebExecutor) downloadChatGPTWebImagesLimitedWithBudget(
 	for _, downloadURL := range urls {
 		remainingBytes := responseByteLimit - totalBytes
 		if remainingBytes <= 0 {
-			return nil, chatGPTWebImageResponseLimitError(responseByteLimit)
+			return images, chatGPTWebImageResponseLimitError(responseByteLimit)
 		}
 		payload, err := e.downloadChatGPTWebImageAsset(ctx, client, credential, downloadURL, remainingBytes)
 		if err != nil {
 			var limitErr *chatGPTWebImageBodyLimitError
 			if errors.As(err, &limitErr) {
-				return nil, chatGPTWebImageResponseLimitError(responseByteLimit)
+				return images, chatGPTWebImageResponseLimitError(responseByteLimit)
 			}
-			return nil, err
+			return images, err
 		}
 		if totalBytes > responseByteLimit-len(payload) {
-			return nil, chatGPTWebImageResponseLimitError(responseByteLimit)
+			return images, chatGPTWebImageResponseLimitError(responseByteLimit)
 		}
 		totalBytes += len(payload)
 		images = append(images, payload)
@@ -3245,6 +3390,24 @@ func validateChatGPTWebImageRequest(request *helps.ChatGPTWebImageRequest) error
 			retryOtherAuth: true,
 		}
 	}
+	outputFormat := normalizeChatGPTWebImageOutputFormat(request.OutputFormat)
+	if outputFormat != "png" && outputFormat != "jpeg" && outputFormat != "webp" {
+		return statusErr{
+			code:           http.StatusBadRequest,
+			msg:            "chatgpt web does not support the requested image output format",
+			skipAuthResult: true,
+			retryOtherAuth: true,
+		}
+	}
+	if request.OutputCompression < 0 || request.OutputCompression > 100 ||
+		(outputFormat == "png" && request.OutputCompression != 100) {
+		return statusErr{
+			code:           http.StatusBadRequest,
+			msg:            "chatgpt web does not support the requested image output compression",
+			skipAuthResult: true,
+			retryOtherAuth: true,
+		}
+	}
 	references := append([]string(nil), request.Images...)
 	if mask := strings.TrimSpace(request.MaskURL); mask != "" {
 		references = append(references, mask)
@@ -3278,8 +3441,11 @@ func ignoreUnsupportedChatGPTWebImageParams(request *helps.ChatGPTWebImageReques
 	if quality := strings.TrimSpace(request.Quality); quality != "" && !strings.EqualFold(quality, "auto") {
 		request.Quality = "auto"
 	}
-	if outputFormat := normalizeChatGPTWebImageOutputFormat(request.OutputFormat); outputFormat != "" && outputFormat != "png" {
+	if outputFormat := normalizeChatGPTWebImageOutputFormat(request.OutputFormat); outputFormat != "png" && outputFormat != "jpeg" && outputFormat != "webp" {
 		request.OutputFormat = "png"
+		request.OutputCompression = 100
+	} else if outputFormat == "png" && request.OutputCompression != 100 {
+		request.OutputCompression = 100
 	}
 }
 

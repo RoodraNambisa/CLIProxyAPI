@@ -1949,6 +1949,8 @@ func chatGPTWebImageRequestCompatibilityError(req openAIImageRequest, ignoreUnsu
 		}
 		background := strings.ToLower(strings.TrimSpace(req.Background))
 		moderation := strings.ToLower(strings.TrimSpace(req.Moderation))
+		outputFormat := normalizeChatGPTWebRequestedOutputFormat(req.OutputFormat)
+		validOutputFormat := outputFormat == "png" || outputFormat == "jpeg" || outputFormat == "webp"
 		unsupported := []struct {
 			parameter string
 			present   bool
@@ -1956,10 +1958,10 @@ func chatGPTWebImageRequestCompatibilityError(req openAIImageRequest, ignoreUnsu
 			{parameter: "size", present: !defaultSize},
 			{parameter: "quality", present: strings.TrimSpace(req.Quality) != "" && !strings.EqualFold(strings.TrimSpace(req.Quality), "auto")},
 			{parameter: "background", present: background != "" && background != "auto"},
-			{parameter: "output_format", present: strings.TrimSpace(req.OutputFormat) != "" && !strings.EqualFold(strings.TrimSpace(req.OutputFormat), "png")},
+			{parameter: "output_format", present: !validOutputFormat},
 			{parameter: "input_fidelity", present: strings.TrimSpace(req.InputFidelity) != ""},
 			{parameter: "moderation", present: moderation != "" && moderation != "auto"},
-			{parameter: "output_compression", present: req.OutputCompression != nil && *req.OutputCompression != 100},
+			{parameter: "output_compression", present: outputFormat == "png" && req.OutputCompression != nil && *req.OutputCompression != 100},
 			{parameter: "partial_images", present: req.PartialImages != nil && *req.PartialImages > 0},
 		}
 		for _, candidate := range unsupported {
@@ -2015,6 +2017,19 @@ func chatGPTWebImageRequestCompatibilityError(req openAIImageRequest, ignoreUnsu
 		}
 	}
 	return nil
+}
+
+func normalizeChatGPTWebRequestedOutputFormat(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "", "png":
+		return "png"
+	case "jpg", "jpeg":
+		return "jpeg"
+	case "webp":
+		return "webp"
+	default:
+		return ""
+	}
 }
 
 func chatGPTWebAllowedWithoutCodex(c *gin.Context) bool {

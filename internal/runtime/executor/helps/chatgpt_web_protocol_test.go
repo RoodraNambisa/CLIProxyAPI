@@ -120,17 +120,28 @@ func TestParseChatGPTWebRequestRejectsUnsupportedTool(t *testing.T) {
 	}
 }
 
-func TestParseChatGPTWebRequestAcceptsPNGAndRejectsUnsupportedImageFormat(t *testing.T) {
-	if _, err := ParseChatGPTWebRequest([]byte(`{"model":"gpt-image-2","input":"draw","tools":[{"type":"image_generation","output_format":"png"}]}`)); err != nil {
-		t.Fatalf("ParseChatGPTWebRequest() PNG error = %v", err)
+func TestParseChatGPTWebRequestAcceptsSupportedImageFormatsAndCompression(t *testing.T) {
+	for _, outputFormat := range []string{"png", "jpeg", "webp"} {
+		payload := fmt.Sprintf(`{"model":"gpt-image-2","input":"draw","tools":[{"type":"image_generation","output_format":%q,"output_compression":75}]}`, outputFormat)
+		if outputFormat == "png" {
+			payload = `{"model":"gpt-image-2","input":"draw","tools":[{"type":"image_generation","output_format":"png","output_compression":100}]}`
+		}
+		if _, err := ParseChatGPTWebRequest([]byte(payload)); err != nil {
+			t.Fatalf("ParseChatGPTWebRequest() %s error = %v", outputFormat, err)
+		}
 	}
-	_, err := ParseChatGPTWebRequest([]byte(`{"model":"gpt-image-2","input":"draw","tools":[{"type":"image_generation","output_format":"webp"}]}`))
-	if err == nil || !strings.Contains(err.Error(), `output_format "webp"`) {
+	_, err := ParseChatGPTWebRequest([]byte(`{"model":"gpt-image-2","input":"draw","tools":[{"type":"image_generation","output_format":"gif"}]}`))
+	if err == nil || !strings.Contains(err.Error(), `output_format "gif"`) {
 		t.Fatalf("ParseChatGPTWebRequest() error = %v", err)
 	}
 	var unsupported *ChatGPTWebUnsupportedToolError
 	if !errors.As(err, &unsupported) {
 		t.Fatalf("unsupported image format error type = %T", err)
+	}
+
+	_, err = ParseChatGPTWebRequest([]byte(`{"model":"gpt-image-2","input":"draw","tools":[{"type":"image_generation","output_format":"png","output_compression":90}]}`))
+	if err == nil || !strings.Contains(err.Error(), "output_compression") {
+		t.Fatalf("ParseChatGPTWebRequest() PNG compression error = %v", err)
 	}
 }
 
