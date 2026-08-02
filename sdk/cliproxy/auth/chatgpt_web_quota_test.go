@@ -2870,6 +2870,86 @@ func TestManagerProjectsSuccessfulImageToolToImageModel(t *testing.T) {
 	}
 }
 
+func TestManagerProjectsCompatibilityImageSuccessIntoKnownQuota(t *testing.T) {
+	for _, stream := range []bool{false, true} {
+		name := "execute"
+		if stream {
+			name = "stream"
+		}
+		t.Run(name, func(t *testing.T) {
+			manager := NewManager(nil, &FillFirstSelector{}, nil)
+			manager.SetRetryConfig(0, 0, 0)
+			manager.RegisterExecutor(&chatGPTWebImageSuccessProjectionExecutor{
+				manager:           manager,
+				markImageSuccess:  true,
+				imageSuccessCount: 1,
+			})
+			authID := "compat-image-count-" + uuid.NewString()
+			executionModel := "compat-image-text-" + uuid.NewString()
+			registerQuotaTestAuthForModels(t, manager, &Auth{
+				ID:       authID,
+				Provider: chatgptwebauth.Provider,
+				Status:   StatusActive,
+				Metadata: map[string]any{
+					"lifecycle_state":       LifecycleStateActive,
+					"quota_state":           string(chatgptwebauth.QuotaStateAvailable),
+					"image_quota_remaining": 2,
+				},
+			}, chatgptwebauth.ImageModel, executionModel)
+
+			request := cliproxyexecutor.Request{
+				Model:   chatgptwebauth.ImageModel,
+				Payload: imageToolFallbackPayload(executionModel),
+			}
+			options := cliproxyexecutor.Options{
+				SourceFormat: "openai-response",
+				Metadata: map[string]any{
+					cliproxyexecutor.ExecutionModelOverrideMetadataKey:    executionModel,
+					cliproxyexecutor.ImageGenerationMaxResultsMetadataKey: 1,
+				},
+			}
+			if requestHasImageGenerationToolForFallback(request, options) {
+				t.Fatal("compatibility Images request unexpectedly enabled image tool fallback")
+			}
+
+			if stream {
+				result, errExecute := manager.ExecuteStream(
+					context.Background(),
+					[]string{chatgptwebauth.Provider},
+					request,
+					options,
+				)
+				if errExecute != nil {
+					t.Fatalf("ExecuteStream() error = %v", errExecute)
+				}
+				for chunk := range result.Chunks {
+					if chunk.Err != nil {
+						t.Fatalf("stream chunk error = %v", chunk.Err)
+					}
+				}
+			} else if _, errExecute := manager.Execute(
+				context.Background(),
+				[]string{chatgptwebauth.Provider},
+				request,
+				options,
+			); errExecute != nil {
+				t.Fatalf("Execute() error = %v", errExecute)
+			}
+
+			current, ok := manager.GetByID(authID)
+			if !ok || current == nil {
+				t.Fatal("auth disappeared")
+			}
+			if got := metadataInt(current.Metadata["image_quota_remaining"]); got == nil || *got != 1 {
+				t.Fatalf("image_quota_remaining = %#v, want 1", got)
+			}
+			if got := metadataString(current.Metadata["quota_state"]); got != string(chatgptwebauth.QuotaStateAvailable) {
+				t.Fatalf("quota_state = %q, want available", got)
+			}
+		})
+	}
+}
+
 func TestManagerProjectsSuccessfulImageCountIntoKnownQuota(t *testing.T) {
 	hook := &chatGPTWebImageSuccessResultHook{}
 	manager := NewManager(nil, &FillFirstSelector{}, hook)

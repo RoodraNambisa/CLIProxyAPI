@@ -5994,7 +5994,8 @@ func ensureRequestedModelMetadata(opts cliproxyexecutor.Options, requestedModel 
 }
 
 func withImageGenerationResultState(req cliproxyexecutor.Request, opts cliproxyexecutor.Options) cliproxyexecutor.Options {
-	if !requestHasImageGenerationToolForFallback(req, opts) {
+	maxResults, compatibilityImageRequest := opts.Metadata[cliproxyexecutor.ImageGenerationMaxResultsMetadataKey].(int)
+	if (!compatibilityImageRequest || maxResults <= 0) && !requestHasImageGenerationToolForFallback(req, opts) {
 		return opts
 	}
 	meta := make(map[string]any, len(opts.Metadata)+1)
