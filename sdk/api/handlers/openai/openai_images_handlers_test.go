@@ -1632,14 +1632,32 @@ func TestConvertResponsesToImagesResponse(t *testing.T) {
 	}
 }
 
-func TestConvertResponsesToImagesResponseErrorsWithoutImageOutput(t *testing.T) {
-	raw := []byte(`{"created_at":1700000000,"output":[{"type":"message","content":[{"type":"output_text","text":"blocked"}]}],"usage":{"total_tokens":9}}`)
+func TestConvertResponsesToImagesResponseClassifiesCompletedTextWithoutImage(t *testing.T) {
+	raw := []byte(`{"created_at":1700000000,"status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Any non-empty response"}]}],"usage":{"total_tokens":9}}`)
 	_, err := convertResponsesToImagesResponse(raw, 1)
 	if err == nil {
 		t.Fatal("convertResponsesToImagesResponse succeeded, want error")
 	}
-	if !strings.Contains(err.Error(), "upstream did not return image output") {
-		t.Fatalf("error = %v", err)
+	var status interface{ StatusCode() int }
+	if !errors.As(err, &status) || status.StatusCode() != http.StatusBadRequest || err.Error() != executorhelps.OpenAIImageModerationErrorBody {
+		t.Fatalf("moderation error = %v", err)
+	}
+}
+
+func TestConvertResponsesToImagesResponseKeepsAmbiguousNoOutputErrors(t *testing.T) {
+	for _, raw := range []string{
+		`{"status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"   "}]}]}`,
+		`{"status":"failed","output":[{"type":"message","content":[{"type":"output_text","text":"failure detail"}]}]}`,
+		`{"status":"completed","output":[]}`,
+	} {
+		_, err := convertResponsesToImagesResponse([]byte(raw), 1)
+		if err == nil || !strings.Contains(err.Error(), "upstream did not return image output") {
+			t.Fatalf("ambiguous response error = %v for %s", err, raw)
+		}
+		var status interface{ StatusCode() int }
+		if errors.As(err, &status) {
+			t.Fatalf("ambiguous response received status %d", status.StatusCode())
+		}
 	}
 }
 
@@ -1705,23 +1723,12 @@ func TestApplyRequestedImageMetadataDoesNotInventFormatOrSize(t *testing.T) {
 	}
 }
 
-func TestOpenAIImagesNonStreamingErrorsWithoutImageOutput(t *testing.T) {
+func TestOpenAIImagesNonStreamingReturnsModerationForCompletedTextWithoutImage(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	executor := &imageCaptureExecutor{
-		response: []byte(`{"created_at":1700000000,"output":[{"type":"message","content":[{"type":"output_text","text":"blocked"}]}],"usage":{"total_tokens":9}}`),
+		response: []byte(`{"created_at":1700000000,"status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"Any non-empty response"}]}],"usage":{"total_tokens":9}}`),
 	}
 	h := newImagesTestHandler(t, executor)
-	replacement := map[string]any{"error": map[string]any{
-		"message": "Your request was rejected by the safety system.",
-		"type":    "image_generation_user_error",
-		"code":    "moderation_blocked",
-	}}
-	h.Cfg.ErrorResponseRewrites = []sdkconfig.ErrorResponseRewriteRule{{
-		StatusCode:         http.StatusBadGateway,
-		MessageContains:    "upstream did not return image output",
-		ResponseStatusCode: http.StatusBadRequest,
-		ResponseBody:       &replacement,
-	}}
 	router := gin.New()
 	router.POST("/v1/images/generations", h.Generations)
 
@@ -1735,7 +1742,7 @@ func TestOpenAIImagesNonStreamingErrorsWithoutImageOutput(t *testing.T) {
 	}
 	if !strings.Contains(resp.Body.String(), "moderation_blocked") ||
 		strings.Contains(resp.Body.String(), "upstream did not return image output") {
-		t.Fatalf("rewritten error missing or leaked original detail: %s", resp.Body.String())
+		t.Fatalf("moderation error missing or leaked generic detail: %s", resp.Body.String())
 	}
 }
 
@@ -1805,12 +1812,12 @@ func TestOpenAIImagesStreamingCanReturnDataURLForURLResponseFormat(t *testing.T)
 	}
 }
 
-func TestOpenAIImagesStreamingEmitsErrorWhenCompletedWithoutImage(t *testing.T) {
+func TestOpenAIImagesStreamingReturnsModerationWhenCompletedWithTextWithoutImage(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	executor := &imageCaptureExecutor{
 		streamChunks: []coreexecutor.StreamChunk{
 			{Payload: []byte(`data: {"type":"response.completed","response":{"created_at":1700000000,`)},
-			{Payload: []byte(`"output":[{"type":"message","content":[{"type":"output_text","text":"blocked"}]}],"usage":{"total_tokens":7}}}`)},
+			{Payload: []byte(`"status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"Any non-empty response"}]}],"usage":{"total_tokens":7}}}`)},
 		},
 	}
 	h := newImagesTestHandler(t, executor)
@@ -1822,18 +1829,48 @@ func TestOpenAIImagesStreamingEmitsErrorWhenCompletedWithoutImage(t *testing.T) 
 	resp := httptest.NewRecorder()
 	router.ServeHTTP(resp, req)
 
-	if resp.Code != http.StatusBadGateway {
-		t.Fatalf("status = %d, want %d, body=%s", resp.Code, http.StatusBadGateway, resp.Body.String())
+	if resp.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d, body=%s", resp.Code, http.StatusBadRequest, resp.Body.String())
 	}
 	body := resp.Body.String()
 	if strings.Contains(body, "event: error") {
 		t.Fatalf("preflight failure should use a JSON error response: %s", body)
 	}
-	if !strings.Contains(body, "upstream did not return image output") {
-		t.Fatalf("error message missing: %s", body)
+	if !strings.Contains(body, "moderation_blocked") || strings.Contains(body, "upstream did not return image output") {
+		t.Fatalf("moderation error missing: %s", body)
 	}
 	if strings.Contains(body, "event: image_generation.completed") {
 		t.Fatalf("completed event should not be emitted: %s", body)
+	}
+}
+
+func TestOpenAIImagesStreamingReturnsModerationAfterPartialImage(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	executor := &imageCaptureExecutor{
+		streamChunks: []coreexecutor.StreamChunk{
+			{Payload: []byte(`data: {"type":"response.image_generation_call.partial_image","partial_image_b64":"cGFydA=="}` + "\n\n")},
+			{Payload: []byte(`data: {"type":"response.output_text.delta","delta":"Any response"}` + "\n\n")},
+			{Payload: []byte(`data: {"type":"response.completed","response":{"status":"completed","output":[]}}` + "\n\n")},
+		},
+	}
+	h := newImagesTestHandler(t, executor)
+	router := gin.New()
+	router.POST("/v1/images/generations", h.Generations)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/images/generations", strings.NewReader(`{"model":"gpt-image-2","prompt":"draw","stream":true}`))
+	req.Header.Set("Content-Type", "application/json")
+	resp := httptest.NewRecorder()
+	router.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body=%s", resp.Code, resp.Body.String())
+	}
+	body := resp.Body.String()
+	if !strings.Contains(body, "image_generation.partial_image") || !strings.Contains(body, "event: error") || !strings.Contains(body, "moderation_blocked") {
+		t.Fatalf("stream moderation sequence missing: %s", body)
+	}
+	if strings.Contains(body, "upstream did not return image output") {
+		t.Fatalf("generic no-output error leaked: %s", body)
 	}
 }
 
@@ -2132,6 +2169,30 @@ func TestImageStreamMapperErrorsOnCompletedResponseWithoutImage(t *testing.T) {
 	}
 	if err := mapper.fatalError(); err == nil || !strings.Contains(err.Error(), "upstream did not return image output") {
 		t.Fatalf("missing image output error = %v", err)
+	}
+}
+
+func TestImageStreamMapperClassifiesCompletedTextWithoutImage(t *testing.T) {
+	for _, events := range [][]string{
+		{`data: {"type":"response.completed","response":{"status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"Any response"}]}]}}` + "\n\n"},
+		{
+			`data: {"type":"response.output_text.delta","delta":"Any response"}` + "\n\n",
+			`data: {"type":"response.completed","response":{"status":"completed","output":[]}}` + "\n\n",
+		},
+	} {
+		mapper := &imageStreamMapper{operation: imageGenerationOperation}
+		var output bytes.Buffer
+		for _, event := range events {
+			mapper.writeChunk(&output, []byte(event))
+		}
+		err := mapper.fatalError()
+		var status interface{ StatusCode() int }
+		if !errors.As(err, &status) || status.StatusCode() != http.StatusBadRequest || err.Error() != executorhelps.OpenAIImageModerationErrorBody {
+			t.Fatalf("moderation error = %v", err)
+		}
+		if output.Len() != 0 {
+			t.Fatalf("text-only response emitted image events: %q", output.String())
+		}
 	}
 }
 

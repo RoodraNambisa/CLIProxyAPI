@@ -13,8 +13,6 @@ import (
 	"strconv"
 	"strings"
 	"time"
-	"unicode"
-	"unicode/utf8"
 )
 
 var (
@@ -1244,21 +1242,25 @@ func CleanChatGPTWebText(value string) string {
 	return strings.ReplaceAll(value, annotationEnd, "")
 }
 
-// ChatGPTWebImageAccumulator captures generated image IDs only from explicit
-// tool output messages or tool-role patch operations.
+// ChatGPTWebImageAccumulator captures generated image IDs from explicit tool
+// output and tracks whether the current turn ended with assistant text.
 type ChatGPTWebImageAccumulator struct {
-	ConversationID string
-	Turn           ChatGPTWebImageTurn
-	FileIDs        []string
-	SedimentIDs    []string
-	References     []ChatGPTWebImageReference
-	Terminal       bool
-	StreamTerminal bool
-	FailureStatus  string
-	ToolUsage      map[string]any
-	role           string
-	imageTool      bool
-	referenceSet   map[string]struct{}
+	ConversationID        string
+	Turn                  ChatGPTWebImageTurn
+	FileIDs               []string
+	SedimentIDs           []string
+	References            []ChatGPTWebImageReference
+	Terminal              bool
+	StreamTerminal        bool
+	FailureStatus         string
+	ToolUsage             map[string]any
+	role                  string
+	imageTool             bool
+	assistantTextSeen     bool
+	assistantTextPatch    bool
+	assistantTerminalSeen bool
+	terminalAssistantText bool
+	referenceSet          map[string]struct{}
 }
 
 // ChatGPTWebImageTurn identifies the user message that started one image
@@ -1323,13 +1325,28 @@ func MergeChatGPTWebImageAccumulators(primary, secondary *ChatGPTWebImageAccumul
 			merged.role = source.role
 		}
 		merged.imageTool = merged.imageTool || source.imageTool
+		merged.assistantTextSeen = merged.assistantTextSeen || source.assistantTextSeen
+		merged.assistantTerminalSeen = merged.assistantTerminalSeen || source.assistantTerminalSeen
+		merged.terminalAssistantText = merged.terminalAssistantText || source.terminalAssistantText
 		for _, reference := range chatGPTWebImageAccumulatorReferences(source) {
 			if err := merged.appendReference(reference.Kind, reference.ID); err != nil {
 				return nil, err
 			}
 		}
 	}
+	if merged.FailureStatus != "" {
+		merged.assistantTerminalSeen = false
+		merged.terminalAssistantText = false
+	} else {
+		merged.updateTerminalAssistantText()
+	}
 	return merged, nil
+}
+
+// HasTerminalAssistantText reports whether the current image turn completed
+// successfully with non-empty assistant text.
+func (accumulator *ChatGPTWebImageAccumulator) HasTerminalAssistantText() bool {
+	return accumulator != nil && accumulator.terminalAssistantText
 }
 
 func chatGPTWebImageAccumulatorReferences(accumulator *ChatGPTWebImageAccumulator) []ChatGPTWebImageReference {
@@ -1353,6 +1370,7 @@ func chatGPTWebImageAccumulatorReferences(accumulator *ChatGPTWebImageAccumulato
 func (accumulator *ChatGPTWebImageAccumulator) Apply(payload []byte) (bool, error) {
 	trimmed := bytes.TrimSpace(payload)
 	if bytes.Equal(trimmed, []byte("[DONE]")) {
+		accumulator.updateTerminalAssistantText()
 		accumulator.StreamTerminal = true
 		return true, nil
 	}
@@ -1369,6 +1387,10 @@ func (accumulator *ChatGPTWebImageAccumulator) Apply(payload []byte) (bool, erro
 	if usage := chatGPTWebFindImageToolUsage(event, 0); len(usage) > 0 {
 		accumulator.ToolUsage = usage
 	}
+	if chatGPTWebImageOuterModeration(event) {
+		accumulator.mergeTerminalState(true, "content_filter")
+		return chatGPTWebImageStreamTerminal(event), nil
+	}
 	if failed, detail := chatGPTWebImageOuterFailure(event); failed {
 		if detail == "" {
 			return false, JSONStreamProtocolError("chatgpt web image", trimmed)
@@ -1380,9 +1402,18 @@ func (accumulator *ChatGPTWebImageAccumulator) Apply(payload []byte) (bool, erro
 		role, imageTool := webMessageImageContext(message)
 		accumulator.role = role
 		accumulator.imageTool = imageTool
+		accumulator.assistantTextPatch = false
+		if role == "assistant" && !imageTool {
+			accumulator.assistantTextSeen = accumulator.assistantTextSeen || strings.TrimSpace(chatGPTWebImageMessageText(message)) != ""
+		}
 		streamTerminal := chatGPTWebImageStreamTerminal(event)
 		accumulator.StreamTerminal = accumulator.StreamTerminal || streamTerminal
 		explicitFailure, failureStatus := chatGPTWebImageStreamMessageFailure(message)
+		if role == "assistant" && !imageTool && !explicitFailure {
+			terminal, _ := chatGPTWebImageTerminalTextReply(message)
+			accumulator.assistantTerminalSeen = accumulator.assistantTerminalSeen || terminal
+			accumulator.updateTerminalAssistantText()
+		}
 		if webMessageCanContainGeneratedImage(role) && (imageTool || explicitFailure) {
 			if explicitFailure {
 				accumulator.mergeTerminalState(true, failureStatus)
@@ -1408,8 +1439,97 @@ func (accumulator *ChatGPTWebImageAccumulator) Apply(payload []byte) (bool, erro
 		return false, err
 	}
 	streamTerminal := chatGPTWebImageStreamTerminal(event)
+	if streamTerminal {
+		accumulator.updateTerminalAssistantText()
+	}
 	accumulator.StreamTerminal = accumulator.StreamTerminal || streamTerminal
 	return streamTerminal, nil
+}
+
+func (accumulator *ChatGPTWebImageAccumulator) captureAssistantPatchState(event map[string]any) {
+	if accumulator == nil {
+		return
+	}
+	if operations, ok := event["v"].([]any); ok && strings.EqualFold(stringFromAny(event["o"]), "patch") {
+		for _, rawOperation := range operations {
+			if operation, okOperation := rawOperation.(map[string]any); okOperation {
+				accumulator.captureAssistantPatchState(operation)
+			}
+		}
+		return
+	}
+	if accumulator.role != "assistant" || accumulator.imageTool {
+		accumulator.assistantTextPatch = false
+		return
+	}
+
+	path := strings.ToLower(strings.TrimSpace(stringFromAny(event["p"])))
+	if path == "/message/content/parts/0" || path == "/message/content/text" {
+		accumulator.assistantTextPatch = true
+		if value, ok := event["v"].(string); ok && strings.TrimSpace(value) != "" {
+			accumulator.assistantTextSeen = true
+		}
+	} else if path != "" {
+		accumulator.assistantTextPatch = false
+	} else if event["p"] == nil && event["o"] == nil && accumulator.assistantTextPatch {
+		if value, ok := event["v"].(string); ok && strings.TrimSpace(value) != "" {
+			accumulator.assistantTextSeen = true
+		}
+	}
+
+	if strings.HasSuffix(path, "/status") {
+		status := strings.TrimSpace(stringFromAny(event["v"]))
+		switch {
+		case chatGPTWebFailureMessageStatus(status):
+			accumulator.mergeTerminalState(true, status)
+		case chatGPTWebTerminalMessageStatus(status):
+			accumulator.assistantTerminalSeen = true
+		}
+	}
+	if strings.Contains(path, "/finish_details") {
+		finishType := strings.TrimSpace(stringFromAny(event["v"]))
+		if details, ok := event["v"].(map[string]any); ok {
+			finishType = strings.TrimSpace(stringFromAny(details["type"]))
+		}
+		switch {
+		case chatGPTWebFailureMessageStatus(finishType):
+			accumulator.mergeTerminalState(true, finishType)
+		case chatGPTWebTerminalMessageStatus(finishType):
+			accumulator.assistantTerminalSeen = true
+		}
+	}
+	if strings.HasSuffix(path, "/end_turn") && event["v"] == true {
+		accumulator.assistantTerminalSeen = true
+	}
+	if strings.Contains(path, "/metadata") {
+		if metadata, ok := event["v"].(map[string]any); ok {
+			if failure := chatGPTWebConversationTerminalError(map[string]any{"metadata": metadata}); failure != "" {
+				accumulator.mergeTerminalState(true, failure)
+			} else if chatGPTWebImageCompletionMetadata(metadata) {
+				accumulator.assistantTerminalSeen = true
+			}
+		}
+	}
+	accumulator.updateTerminalAssistantText()
+}
+
+func (accumulator *ChatGPTWebImageAccumulator) updateTerminalAssistantText() {
+	if accumulator == nil || accumulator.FailureStatus != "" {
+		return
+	}
+	if accumulator.assistantTextSeen && accumulator.assistantTerminalSeen {
+		accumulator.terminalAssistantText = true
+		accumulator.Terminal = true
+	}
+}
+
+func chatGPTWebImageCompletionMetadata(metadata map[string]any) bool {
+	if metadata == nil || metadata["is_complete"] != true {
+		return false
+	}
+	finishDetails, _ := metadata["finish_details"].(map[string]any)
+	finishType := strings.ToLower(strings.TrimSpace(stringFromAny(finishDetails["type"])))
+	return finishType == "stop" || chatGPTWebTerminalMessageStatus(finishType)
 }
 
 func chatGPTWebFindImageToolUsage(value any, depth int) map[string]any {
@@ -1443,6 +1563,8 @@ func chatGPTWebFindImageToolUsage(value any, depth int) map[string]any {
 func (accumulator *ChatGPTWebImageAccumulator) mergeTerminalState(terminal bool, failureStatus string) {
 	if failureStatus != "" {
 		accumulator.FailureStatus = chatGPTWebPreferredImageFailure(accumulator.FailureStatus, failureStatus)
+		accumulator.assistantTerminalSeen = false
+		accumulator.terminalAssistantText = false
 		accumulator.Terminal = true
 		return
 	}
@@ -1456,6 +1578,22 @@ func chatGPTWebPreferredImageFailure(current, incoming string) string {
 	incoming = strings.TrimSpace(incoming)
 	if incoming == "" {
 		return current
+	}
+	currentQuota := strings.EqualFold(current, "image_generation_limit_reached")
+	incomingQuota := strings.EqualFold(incoming, "image_generation_limit_reached")
+	if incomingQuota {
+		return "image_generation_limit_reached"
+	}
+	if currentQuota {
+		return "image_generation_limit_reached"
+	}
+	currentModeration := chatGPTWebImageModerationStatus(current)
+	incomingModeration := chatGPTWebImageModerationStatus(incoming)
+	if incomingModeration && !currentModeration {
+		return "content_filter"
+	}
+	if currentModeration {
+		return "content_filter"
 	}
 	if current == "" || (chatGPTWebGenericImageFailure(current) && !chatGPTWebGenericImageFailure(incoming)) {
 		return incoming
@@ -1506,6 +1644,7 @@ func (accumulator *ChatGPTWebImageAccumulator) applyImagePatch(event map[string]
 				accumulator.applyImageContextPatch(operation)
 			}
 		}
+		accumulator.captureAssistantPatchState(event)
 		if webMessageCanContainGeneratedImage(accumulator.role) &&
 			(accumulator.imageTool || chatGPTWebRelevantImageReference(accumulator.role, accumulator.imageTool, event)) {
 			accumulator.mergeTerminalState(chatGPTWebImageConversationState(event))
@@ -1514,6 +1653,7 @@ func (accumulator *ChatGPTWebImageAccumulator) applyImagePatch(event map[string]
 		return nil
 	}
 	accumulator.applyImageContextPatch(event)
+	accumulator.captureAssistantPatchState(event)
 	if webMessageCanContainGeneratedImage(accumulator.role) &&
 		(accumulator.imageTool || chatGPTWebRelevantImageReference(accumulator.role, accumulator.imageTool, event)) {
 		accumulator.mergeTerminalState(chatGPTWebImageConversationState(event))
@@ -1811,7 +1951,7 @@ func CaptureChatGPTWebImageConversation(payload []byte, accumulator *ChatGPTWebI
 	rootFailureDetected := false
 	for _, message := range messages {
 		role, imageTool := webMessageImageContext(message)
-		terminalText, _ := chatGPTWebImageTerminalTextReply(message)
+		terminalText, terminalTextValue := chatGPTWebImageTerminalTextReply(message)
 		terminal, failureStatus := chatGPTWebImageConversationState(message)
 		if !webMessageCanContainGeneratedImage(role) || (!imageTool && !terminalText && failureStatus == "") {
 			continue
@@ -1830,6 +1970,11 @@ func CaptureChatGPTWebImageConversation(payload []byte, accumulator *ChatGPTWebI
 			hasPendingImage = hasPendingImage || chatGPTWebImageConversationPending(message)
 		} else if terminalText {
 			turnTerminal = turnTerminal || terminal
+			if strings.TrimSpace(terminalTextValue) != "" {
+				snapshot.assistantTextSeen = true
+				snapshot.assistantTerminalSeen = snapshot.assistantTerminalSeen || terminal
+				snapshot.updateTerminalAssistantText()
+			}
 		}
 	}
 	if len(mapping) == 0 || turnPresent {
@@ -1848,6 +1993,8 @@ func CaptureChatGPTWebImageConversation(payload []byte, accumulator *ChatGPTWebI
 		}
 	}
 	if snapshot.FailureStatus != "" {
+		snapshot.assistantTerminalSeen = false
+		snapshot.terminalAssistantText = false
 		snapshot.Terminal = rootFailureDetected || !hasPendingImage
 	} else if hasRelevantMessage {
 		snapshot.Terminal = !hasPendingImage && (turnTerminal || hasImageMessage && imageTurnTerminal)
@@ -1858,6 +2005,9 @@ func CaptureChatGPTWebImageConversation(payload []byte, accumulator *ChatGPTWebI
 	accumulator.referenceSet = snapshot.referenceSet
 	accumulator.Terminal = snapshot.Terminal
 	accumulator.FailureStatus = snapshot.FailureStatus
+	accumulator.assistantTextSeen = snapshot.assistantTextSeen
+	accumulator.assistantTerminalSeen = snapshot.assistantTerminalSeen
+	accumulator.terminalAssistantText = snapshot.terminalAssistantText
 	return nil
 }
 
@@ -2148,19 +2298,27 @@ func chatGPTWebImageOuterFailure(event map[string]any) (bool, string) {
 		}
 		return true, strings.ReplaceAll(eventType, ".", " ")
 	}
-	if eventType == "moderation" {
-		moderation, _ := event["moderation_response"].(map[string]any)
-		if moderation["blocked"] == true {
-			if detail := chatGPTWebStructuredFailureText(moderation); detail != "" {
-				return true, detail
-			}
-			return true, "image request blocked by moderation"
-		}
-	}
 	if eventType == "error" {
 		return true, chatGPTWebStructuredFailureText(event["error"])
 	}
 	return false, ""
+}
+
+func chatGPTWebImageOuterModeration(event map[string]any) bool {
+	eventType := strings.ToLower(strings.TrimSpace(stringFromAny(event["type"])))
+	if eventType == "moderation" {
+		moderation, _ := event["moderation_response"].(map[string]any)
+		if moderation["blocked"] == true {
+			return true
+		}
+	}
+	response, _ := event["response"].(map[string]any)
+	for _, value := range []any{event["error"], response["error"], event["incomplete_details"], response["incomplete_details"]} {
+		if chatGPTWebImageStructuredModeration(value, 0) {
+			return true
+		}
+	}
+	return false
 }
 
 func chatGPTWebStructuredFailureText(value any) string {
@@ -2469,10 +2627,7 @@ func chatGPTWebImageConversationState(root map[string]any) (bool, string) {
 	if failureStatus != "" {
 		return true, failureStatus
 	}
-	if terminal, message := chatGPTWebImageTerminalTextReply(root); terminal {
-		if chatGPTWebImageRejectionText(message) {
-			return true, message
-		}
+	if terminal, _ := chatGPTWebImageTerminalTextReply(root); terminal {
 		return true, ""
 	}
 	return hasCompletionMarker && hasTerminalStatus, ""
@@ -2518,6 +2673,15 @@ func chatGPTWebImageMessageFailure(message map[string]any) (bool, string) {
 	if message == nil {
 		return false, ""
 	}
+	if chatGPTWebImageToolQuotaFailure(message) {
+		return true, "image_generation_limit_reached"
+	}
+	if chatGPTWebImageMessageModeration(message) {
+		return true, "content_filter"
+	}
+	if chatGPTWebImageAssistantTextFailure(message) {
+		return true, "content_filter"
+	}
 	metadata, _ := message["metadata"].(map[string]any)
 	isError := message["is_error"] == true || metadata["is_error"] == true ||
 		message["blocked"] == true || metadata["blocked"] == true ||
@@ -2554,95 +2718,108 @@ func chatGPTWebImageMessageFailure(message map[string]any) (bool, string) {
 	return true, detail
 }
 
+func chatGPTWebImageToolQuotaFailure(message map[string]any) bool {
+	author, _ := message["author"].(map[string]any)
+	if !strings.EqualFold(strings.TrimSpace(stringFromAny(author["role"])), "tool") {
+		return false
+	}
+	content, _ := message["content"].(map[string]any)
+	return strings.EqualFold(strings.TrimSpace(stringFromAny(content["content_type"])), "system_error") &&
+		strings.EqualFold(strings.TrimSpace(stringFromAny(content["name"])), "ChatGPTAgentToolRateLimitException")
+}
+
 func chatGPTWebImageStreamMessageFailure(message map[string]any) (bool, string) {
 	if failed, detail := chatGPTWebImageMessageFailure(message); failed {
 		return true, detail
 	}
 	if status := chatGPTWebConversationTerminalError(message); status != "" {
+		if chatGPTWebImageModerationStatus(status) {
+			return true, "content_filter"
+		}
 		if detail := chatGPTWebImageMessageText(message); detail != "" && !chatGPTWebGenericImageFailure(detail) {
 			return true, detail
 		}
 		return true, status
 	}
-	terminal, detail := chatGPTWebImageTerminalTextReply(message)
-	if terminal && chatGPTWebImageRejectionText(detail) {
-		return true, detail
-	}
 	return false, ""
 }
 
-func chatGPTWebImageRejectionText(detail string) bool {
-	detail = strings.ToLower(strings.TrimSpace(detail))
-	for _, marker := range []string{"blocked", "denied", "rejected", "refused"} {
-		if chatGPTWebContainsUnnegatedRejectionWord(detail, marker) {
+func chatGPTWebImageMessageModeration(message map[string]any) bool {
+	metadata, _ := message["metadata"].(map[string]any)
+	for _, source := range []map[string]any{message, metadata} {
+		if source == nil {
+			continue
+		}
+		if source["blocked"] == true {
 			return true
 		}
-	}
-	for _, marker := range []string{
-		"can't generate", "cannot generate", "couldn't generate",
-		"unable to generate", "not able to generate", "image generation failed",
-	} {
-		if strings.Contains(detail, marker) {
-			return true
-		}
-	}
-	return false
-}
-
-func chatGPTWebContainsUnnegatedRejectionWord(detail, marker string) bool {
-	offset := 0
-	for offset < len(detail) {
-		index := strings.Index(detail[offset:], marker)
-		if index < 0 {
-			return false
-		}
-		index += offset
-		end := index + len(marker)
-		leftBoundary := index == 0
-		if !leftBoundary {
-			left, _ := utf8.DecodeLastRuneInString(detail[:index])
-			leftBoundary = !unicode.IsLetter(left)
-		}
-		rightBoundary := end == len(detail)
-		if !rightBoundary {
-			right, _ := utf8.DecodeRuneInString(detail[end:])
-			rightBoundary = !unicode.IsLetter(right)
-		}
-		if leftBoundary && rightBoundary {
-			negated := false
-			if previous := chatGPTWebPreviousWord(detail, index); previous != "" {
-				switch previous {
-				case "not", "no", "never", "isn't", "wasn't", "aren't", "weren't":
-					negated = true
-				}
-			}
-			if !negated {
+		for _, key := range []string{"status", "state", "code", "type", "reason", "finish_reason"} {
+			if chatGPTWebImageModerationStatus(stringFromAny(source[key])) {
 				return true
 			}
 		}
-		offset = end
+		for _, key := range []string{"error", "finish_details", "incomplete_details"} {
+			if chatGPTWebImageStructuredModeration(source[key], 0) {
+				return true
+			}
+		}
 	}
 	return false
 }
 
-func chatGPTWebPreviousWord(value string, before int) string {
-	end := before
-	for end > 0 {
-		current, size := utf8.DecodeLastRuneInString(value[:end])
-		if unicode.IsLetter(current) || current == '\'' {
-			break
-		}
-		end -= size
+func chatGPTWebImageAssistantTextFailure(message map[string]any) bool {
+	author, _ := message["author"].(map[string]any)
+	if !strings.EqualFold(strings.TrimSpace(stringFromAny(author["role"])), "assistant") {
+		return false
 	}
-	start := end
-	for start > 0 {
-		current, size := utf8.DecodeLastRuneInString(value[:start])
-		if !unicode.IsLetter(current) && current != '\'' {
-			break
-		}
-		start -= size
+	metadata, _ := message["metadata"].(map[string]any)
+	if chatGPTWebTruthy(message["error"]) || chatGPTWebTruthy(metadata["error"]) {
+		return false
 	}
-	return value[start:end]
+	explicitFailure := message["is_error"] == true || metadata["is_error"] == true
+	return explicitFailure && strings.TrimSpace(chatGPTWebImageMessageText(message)) != ""
+}
+
+func chatGPTWebImageStructuredModeration(value any, depth int) bool {
+	if depth > 8 {
+		return false
+	}
+	switch typed := value.(type) {
+	case map[string]any:
+		if typed["blocked"] == true {
+			return true
+		}
+		for key, item := range typed {
+			switch strings.ToLower(strings.TrimSpace(key)) {
+			case "status", "state", "code", "type", "reason", "finish_reason":
+				if chatGPTWebImageModerationStatus(stringFromAny(item)) {
+					return true
+				}
+			}
+			switch item.(type) {
+			case map[string]any, []any:
+				if chatGPTWebImageStructuredModeration(item, depth+1) {
+					return true
+				}
+			}
+		}
+	case []any:
+		for _, item := range typed {
+			if chatGPTWebImageStructuredModeration(item, depth+1) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func chatGPTWebImageModerationStatus(value string) bool {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "blocked", "content_filter", "moderation_blocked":
+		return true
+	default:
+		return false
+	}
 }
 
 func chatGPTWebImageMessageText(message map[string]any) string {
@@ -2672,9 +2849,7 @@ func chatGPTWebImageTerminalTextReply(message map[string]any) (bool, string) {
 		chatGPTWebTerminalMessageStatus(stringFromAny(message["status"])) ||
 		chatGPTWebTerminalMessageStatus(stringFromAny(metadata["status"]))
 	if !terminal {
-		finishDetails, _ := metadata["finish_details"].(map[string]any)
-		terminal = chatGPTWebTerminalMessageStatus(stringFromAny(finishDetails["type"])) &&
-			(metadata["is_complete"] == true || message["end_turn"] == true)
+		terminal = chatGPTWebImageCompletionMetadata(metadata)
 	}
 	if !terminal {
 		return false, ""

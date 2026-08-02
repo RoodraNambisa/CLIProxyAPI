@@ -3,6 +3,7 @@ package executor
 import (
 	"context"
 	"errors"
+	"io"
 	"net/http"
 	"strings"
 	"testing"
@@ -11,6 +12,7 @@ import (
 	fhttp "github.com/bogdanfinn/fhttp"
 	chatgptwebauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/chatgptweb"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor/helps"
 )
 
 func TestChatGPTWebImageRequestErrorRequiresExplicitQuotaEvidence(t *testing.T) {
@@ -78,6 +80,9 @@ func TestChatGPTWebImageRequestErrorRequiresExplicitQuotaEvidence(t *testing.T) 
 			hasQuotaCode := errors.As(projected, &code) && code.ExecutionResultErrorCode() == "chatgpt_web_image_quota"
 			if hasQuotaCode != test.wantQuota {
 				t.Fatalf("quota projection = %v, want %v: %v", hasQuotaCode, test.wantQuota, projected)
+			}
+			if projected.Error() != chatGPTWebImageRateLimitClientBody {
+				t.Fatalf("client rate limit body = %q", projected.Error())
 			}
 			if refreshes != 1 {
 				t.Fatalf("account info refreshes = %d, want 1", refreshes)
@@ -287,6 +292,108 @@ func TestChatGPTWebTerminalImageFailureProjectsExplicitQuotaEvidence(t *testing.
 	}
 }
 
+func TestChatGPTWebStructuredToolRateLimitReturnsQuotaError(t *testing.T) {
+	executor := &ChatGPTWebExecutor{}
+	prepared := &chatGPTWebPreparedRequest{
+		routeModel: "gpt-image-2",
+		request: helps.ChatGPTWebRequest{
+			Image: &helps.ChatGPTWebImageRequest{Prompt: "draw"},
+		},
+	}
+	execution := &chatGPTWebImageExecution{response: &fhttp.Response{
+		StatusCode: http.StatusOK,
+		Body: io.NopCloser(strings.NewReader(
+			"data: {\"o\":\"add\",\"v\":{\"message\":{\"author\":{\"role\":\"tool\"},\"content\":{\"content_type\":\"system_error\",\"name\":\"ChatGPTAgentToolRateLimitException\",\"text\":\"localized upstream instruction\"},\"status\":\"finished_successfully\"}}}\n\n" +
+				"data: {\"v\":{\"message\":{\"author\":{\"role\":\"assistant\"},\"content\":{\"content_type\":\"text\",\"parts\":[\"localized assistant response\"]},\"status\":\"finished_successfully\",\"end_turn\":true}}}\n\n" +
+				"data: {\"type\":\"message_stream_complete\"}\n\n" +
+				"data: [DONE]\n\n",
+		)),
+	}}
+
+	_, err := executor.finishChatGPTWebImage(context.Background(), nil, nil, prepared, execution)
+	projected := chatGPTWebImageRequestError(err)
+	var code interface{ ExecutionResultErrorCode() string }
+	if !errors.As(projected, &code) || code.ExecutionResultErrorCode() != "chatgpt_web_image_quota" {
+		t.Fatalf("structured tool rate limit was not projected as quota: %v", projected)
+	}
+	var status interface{ StatusCode() int }
+	if !errors.As(projected, &status) || status.StatusCode() != http.StatusTooManyRequests {
+		t.Fatalf("structured tool rate limit status = %v, want 429", projected)
+	}
+	if projected.Error() != chatGPTWebImageRateLimitClientBody || strings.Contains(projected.Error(), "ChatGPTAgentToolRateLimitException") {
+		t.Fatalf("structured tool rate limit leaked upstream detail: %v", projected)
+	}
+}
+
+func TestChatGPTWebStructuredModerationReturnsOpenAIError(t *testing.T) {
+	executor := &ChatGPTWebExecutor{}
+	prepared := &chatGPTWebPreparedRequest{
+		routeModel: "gpt-image-2",
+		request: helps.ChatGPTWebRequest{
+			Image: &helps.ChatGPTWebImageRequest{Prompt: "draw"},
+		},
+	}
+	execution := &chatGPTWebImageExecution{response: &fhttp.Response{
+		StatusCode: http.StatusOK,
+		Body: io.NopCloser(strings.NewReader(
+			"data: {\"message\":{\"author\":{\"role\":\"assistant\"},\"is_error\":true,\"content\":{\"content_type\":\"text\",\"parts\":[\"We’re so sorry, but the prompt may violate our guardrails around illicit or illegal activities.\"]}}}\n\n" +
+				"data: {\"type\":\"message_stream_complete\"}\n\n" +
+				"data: [DONE]\n\n",
+		)),
+	}}
+
+	_, err := executor.finishChatGPTWebImage(context.Background(), nil, nil, prepared, execution)
+	var status interface{ StatusCode() int }
+	if !errors.As(err, &status) || status.StatusCode() != http.StatusBadRequest {
+		t.Fatalf("structured moderation status = %v, want 400", err)
+	}
+	if err.Error() != helps.OpenAIImageModerationErrorBody {
+		t.Fatalf("structured moderation body = %q", err.Error())
+	}
+}
+
+func TestChatGPTWebTerminalImageModerationFailureReturnsOpenAIError(t *testing.T) {
+	err := chatGPTWebCommittedRequestError(context.Background(), newChatGPTWebImageModerationResultError())
+	var status interface{ StatusCode() int }
+	if !errors.As(err, &status) || status.StatusCode() != http.StatusBadRequest {
+		t.Fatalf("moderation status = %v, want 400", err)
+	}
+	if err.Error() != helps.OpenAIImageModerationErrorBody {
+		t.Fatalf("moderation body = %q", err.Error())
+	}
+	var skip interface{ SkipAuthResult() bool }
+	if !errors.As(err, &skip) || !skip.SkipAuthResult() {
+		t.Fatalf("moderation failure affected credential health: %v", err)
+	}
+	var retry interface{ RetryOtherAuth() bool }
+	if !errors.As(err, &retry) || retry.RetryOtherAuth() {
+		t.Fatalf("moderation failure retried another credential: %v", err)
+	}
+}
+
+func TestChatGPTWebTerminalImageModerationDoesNotRefreshQuota(t *testing.T) {
+	executor := &ChatGPTWebExecutor{}
+	runtime := newChatGPTWebAccountInfoRuntime(executor, &config.Config{})
+	executor.accountInfo = runtime
+	t.Cleanup(runtime.close)
+
+	projected := executor.handleChatGPTWebImageRequestError(
+		"web-moderation.json",
+		newChatGPTWebImageModerationResultError(),
+	)
+	var status interface{ StatusCode() int }
+	if !errors.As(projected, &status) || status.StatusCode() != http.StatusBadRequest {
+		t.Fatalf("moderation status = %v, want 400", projected)
+	}
+	runtime.mu.Lock()
+	queued := runtime.queueLengthLocked()
+	_, cooled := runtime.ambiguousImageRecheckAfter["web-moderation.json"]
+	runtime.mu.Unlock()
+	if queued != 0 || cooled {
+		t.Fatalf("moderation scheduled quota work: queued=%d cooled=%t", queued, cooled)
+	}
+}
+
 func TestChatGPTWebEmptyImageResultKeeps502AndSchedulesCooledQuotaRecheck(t *testing.T) {
 	now := time.Now().UTC()
 	executor := &ChatGPTWebExecutor{}
@@ -372,6 +479,9 @@ func TestChatGPTWebImageResultErrorsPreserveQuotaCredentialUpdate(t *testing.T) 
 		t.Fatal("explicit image quota result skipped immediate credential cooldown")
 	}
 	for _, projected := range []error{rateLimited, quotaExhausted} {
+		if projected.Error() != chatGPTWebImageRateLimitClientBody {
+			t.Fatalf("%T client error = %q", projected, projected.Error())
+		}
 		retry, okRetry := projected.(interface{ RetryOtherAuth() bool })
 		if !okRetry || !retry.RetryOtherAuth() {
 			t.Fatalf("%T RetryOtherAuth() was not forwarded", projected)

@@ -464,10 +464,7 @@ func (h *OpenAIImagesAPIHandler) handleNonStreamingImagesResponse(c *gin.Context
 		}
 		parsed, err := parseResponsesToImagesResponse(resp, time.Now().Unix())
 		if err != nil {
-			h.WriteErrorResponse(c, h.RewriteExecutionErrorResponse(&interfaces.ErrorMessage{
-				StatusCode: http.StatusBadGateway,
-				Error:      err,
-			}))
+			h.WriteErrorResponse(c, h.RewriteExecutionErrorResponse(imageConversionErrorMessage(err)))
 			cliCancel(err)
 			return
 		}
@@ -575,10 +572,7 @@ func (h *OpenAIImagesAPIHandler) handleStreamingImagesResponse(c *gin.Context, r
 				}
 				mapper.flush(&firstFrame)
 				if errMapper := mapper.fatalError(); errMapper != nil {
-					h.WriteErrorResponse(c, h.RewriteExecutionErrorResponse(&interfaces.ErrorMessage{
-						StatusCode: http.StatusBadGateway,
-						Error:      errMapper,
-					}))
+					h.WriteErrorResponse(c, h.RewriteExecutionErrorResponse(imageConversionErrorMessage(errMapper)))
 					cliCancel(errMapper)
 					return
 				}
@@ -592,10 +586,7 @@ func (h *OpenAIImagesAPIHandler) handleStreamingImagesResponse(c *gin.Context, r
 			}
 			mapper.writeChunk(&firstFrame, chunk)
 			if errMapper := mapper.fatalError(); errMapper != nil {
-				h.WriteErrorResponse(c, h.RewriteExecutionErrorResponse(&interfaces.ErrorMessage{
-					StatusCode: http.StatusBadGateway,
-					Error:      errMapper,
-				}))
+				h.WriteErrorResponse(c, h.RewriteExecutionErrorResponse(imageConversionErrorMessage(errMapper)))
 				cliCancel(errMapper)
 				return
 			}
@@ -1171,6 +1162,15 @@ func convertResponsesToImagesResponse(raw []byte, fallbackCreated int64) ([]byte
 	return json.Marshal(out)
 }
 
+func imageConversionErrorMessage(err error) *interfaces.ErrorMessage {
+	status := http.StatusBadGateway
+	var statusError interface{ StatusCode() int }
+	if errors.As(err, &statusError) && statusError != nil && statusError.StatusCode() > 0 {
+		status = statusError.StatusCode()
+	}
+	return &interfaces.ErrorMessage{StatusCode: status, Error: err}
+}
+
 func parseResponsesToImagesResponse(raw []byte, fallbackCreated int64) (imagesResponse, error) {
 	respObj := responsesImageResult(raw)
 	if !respObj.Exists() || !respObj.IsObject() {
@@ -1185,6 +1185,9 @@ func parseResponsesToImagesResponse(raw []byte, fallbackCreated int64) (imagesRe
 		Data:    imageResultsFromOutputResult(respObj.Get("output")),
 	}
 	if len(out.Data) == 0 {
+		if responsesImageCompletedWithText(respObj) {
+			return imagesResponse{}, executorhelps.NewOpenAIImageModerationError()
+		}
 		return imagesResponse{}, errors.New("upstream did not return image output")
 	}
 	out.applyMetadataFromFirstImage()
@@ -1200,6 +1203,67 @@ func responsesImageResult(raw []byte) gjson.Result {
 		return response
 	}
 	return root
+}
+
+func responsesImageCompletedWithText(response gjson.Result) bool {
+	if !response.Exists() || !response.IsObject() || !responsesImageCompletedSuccessfully(response) {
+		return false
+	}
+	return responsesOutputHasAssistantText(response.Get("output"))
+}
+
+func responsesImageCompletedSuccessfully(response gjson.Result) bool {
+	if responseError := response.Get("error"); responseError.Exists() && responseError.Type != gjson.Null {
+		raw := strings.TrimSpace(responseError.Raw)
+		if raw != "" && raw != "null" && raw != "{}" {
+			return false
+		}
+	}
+	status := strings.ToLower(strings.TrimSpace(response.Get("status").String()))
+	if status == "" {
+		return true
+	}
+	switch status {
+	case "complete", "completed", "done", "finished", "finished_successfully", "success", "succeeded":
+		return true
+	default:
+		return false
+	}
+}
+
+func responsesOutputHasAssistantText(output gjson.Result) bool {
+	if !output.IsArray() {
+		return false
+	}
+	for _, item := range output.Array() {
+		if responseMessageHasAssistantText(item) {
+			return true
+		}
+	}
+	return false
+}
+
+func responseMessageHasAssistantText(item gjson.Result) bool {
+	if !strings.EqualFold(strings.TrimSpace(item.Get("type").String()), "message") {
+		return false
+	}
+	role := strings.TrimSpace(item.Get("role").String())
+	if role != "" && !strings.EqualFold(role, "assistant") {
+		return false
+	}
+	for _, content := range item.Get("content").Array() {
+		switch strings.ToLower(strings.TrimSpace(content.Get("type").String())) {
+		case "output_text":
+			if strings.TrimSpace(content.Get("text").String()) != "" {
+				return true
+			}
+		case "refusal":
+			if strings.TrimSpace(content.Get("refusal").String()) != "" || strings.TrimSpace(content.Get("text").String()) != "" {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func imageResultsFromOutputResult(output gjson.Result) []imageResult {
@@ -1642,6 +1706,7 @@ type imageStreamMapper struct {
 	completedBinaryBytes int
 	completed            bool
 	forceFlush           bool
+	assistantTextSeen    bool
 	fatalErr             error
 }
 
@@ -1707,6 +1772,18 @@ func (m *imageStreamMapper) writePayload(w io.Writer, payload []byte) {
 	}
 	eventType := responseEventType(payload)
 	switch eventType {
+	case "response.output_text.delta", "response.refusal.delta":
+		if strings.TrimSpace(gjson.GetBytes(payload, "delta").String()) != "" {
+			m.assistantTextSeen = true
+		}
+	case "response.output_text.done":
+		if strings.TrimSpace(gjson.GetBytes(payload, "text").String()) != "" {
+			m.assistantTextSeen = true
+		}
+	case "response.refusal.done":
+		if strings.TrimSpace(gjson.GetBytes(payload, "refusal").String()) != "" {
+			m.assistantTextSeen = true
+		}
 	case "response.image_generation_call.partial_image":
 		event := gjson.ParseBytes(payload)
 		b64 := strings.TrimSpace(event.Get("partial_image_b64").String())
@@ -1722,6 +1799,7 @@ func (m *imageStreamMapper) writePayload(w io.Writer, payload []byte) {
 		m.writeSSE(w, m.operation.partialEvent, streamEvent)
 	case "response.output_item.done":
 		item := gjson.GetBytes(payload, "item")
+		m.assistantTextSeen = m.assistantTextSeen || responseMessageHasAssistantText(item)
 		result, ok := imageResultFromOutputItemResult(item)
 		if !ok {
 			return
@@ -1741,6 +1819,10 @@ func (m *imageStreamMapper) writePayload(w io.Writer, payload []byte) {
 			return
 		}
 		m.completed = true
+		if responsesImageCompletedSuccessfully(response) && (m.assistantTextSeen || responsesOutputHasAssistantText(response.Get("output"))) {
+			m.fatalErr = executorhelps.NewOpenAIImageModerationError()
+			return
+		}
 		m.fatalErr = errors.New("upstream did not return image output")
 	}
 }

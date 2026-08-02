@@ -52,7 +52,7 @@ const (
 	chatGPTWebImageStreamMaxEvents      = 65_536
 	chatGPTWebPollResponseMaxBytes      = 128 << 20
 	chatGPTWebImagePollConcurrency      = 64
-	chatGPTWebImageQuotaClientMessage   = "Image generation rate limit exceeded. Please try again later."
+	chatGPTWebImageRateLimitClientBody  = `{"error":{"message":"Rate limit reached for requests. Please try again later.","type":"rate_limit_error","code":"rate_limit_exceeded"}}`
 	chatGPTWebImageNoOutputMessage      = "chatgpt web image generation completed without an image"
 )
 
@@ -154,10 +154,7 @@ func chatGPTWebImageResultRetryOtherAuth(err error) bool {
 }
 
 func (e *chatGPTWebImageRateLimitResultError) Error() string {
-	if e == nil || e.cause == nil {
-		return "chatgpt web image request rate limited"
-	}
-	return e.cause.Error()
+	return chatGPTWebImageRateLimitClientBody
 }
 
 func (e *chatGPTWebImageRateLimitResultError) Unwrap() error {
@@ -205,7 +202,7 @@ func (e *chatGPTWebImageRateLimitResultError) RetryOtherAuth() bool {
 }
 
 func (e *chatGPTWebImageQuotaResultError) Error() string {
-	return chatGPTWebImageQuotaClientMessage
+	return chatGPTWebImageRateLimitClientBody
 }
 
 func (e *chatGPTWebImageQuotaResultError) Unwrap() error {
@@ -315,6 +312,10 @@ func newChatGPTWebImageNoOutputResultError() error {
 		skipAuthResult: true,
 		retryOtherAuth: true,
 	}}
+}
+
+func newChatGPTWebImageModerationResultError() error {
+	return helps.NewOpenAIImageModerationError()
 }
 
 func chatGPTWebImageQuotaErrorEvidence(err error) bool {
@@ -643,6 +644,9 @@ func (e *ChatGPTWebExecutor) finishChatGPTWebImage(ctx context.Context, client *
 	if accumulator.FailureStatus != "" {
 		return nil, chatGPTWebImageFailureError(accumulator.FailureStatus)
 	}
+	if !hasStreamOutput && accumulator.HasTerminalAssistantText() {
+		return nil, newChatGPTWebImageModerationResultError()
+	}
 	hasTerminal := accumulator.Terminal
 	hasDownloadableSediment := strings.TrimSpace(accumulator.ConversationID) != "" && len(accumulator.SedimentIDs) > 0
 	if strings.TrimSpace(accumulator.ConversationID) == "" {
@@ -668,6 +672,9 @@ func (e *ChatGPTWebExecutor) finishChatGPTWebImage(ctx context.Context, client *
 	hasDownloadableSediment = strings.TrimSpace(accumulator.ConversationID) != "" && len(accumulator.SedimentIDs) > 0
 	if accumulator.FailureStatus != "" {
 		return nil, chatGPTWebImageFailureError(accumulator.FailureStatus)
+	}
+	if chatGPTWebImageOutputCount(accumulator) == 0 && accumulator.HasTerminalAssistantText() {
+		return nil, newChatGPTWebImageModerationResultError()
 	}
 	if !accumulator.Terminal && !hasDownloadableSediment {
 		return nil, statusErr{
@@ -887,6 +894,9 @@ func chatGPTWebImageCenterCrop(bounds image.Rectangle, targetWidth, targetHeight
 }
 
 func chatGPTWebImageFailureError(status string) error {
+	if chatGPTWebImageModerationFailure(status) {
+		return newChatGPTWebImageModerationResultError()
+	}
 	if chatGPTWebImageQuotaTextEvidence(status) {
 		return statusErr{
 			code:           http.StatusTooManyRequests,
@@ -899,6 +909,15 @@ func chatGPTWebImageFailureError(status string) error {
 		msg:            "chatgpt web image generation failed: " + strings.TrimSpace(status),
 		skipAuthResult: true,
 		retryOtherAuth: true,
+	}
+}
+
+func chatGPTWebImageModerationFailure(status string) bool {
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "blocked", "content_filter", "moderation_blocked":
+		return true
+	default:
+		return false
 	}
 }
 

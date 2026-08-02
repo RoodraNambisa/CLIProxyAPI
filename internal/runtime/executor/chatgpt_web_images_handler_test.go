@@ -114,7 +114,7 @@ func assertChatGPTWebImageHandlerOpenAIRateLimit(t *testing.T, response *httptes
 	if errDecode := json.Unmarshal(response.Body.Bytes(), &payload); errDecode != nil {
 		t.Fatalf("decode error response: %v; body=%s", errDecode, response.Body.String())
 	}
-	if payload.Error.Message != "Image generation rate limit exceeded. Please try again later." ||
+	if payload.Error.Message != "Rate limit reached for requests. Please try again later." ||
 		payload.Error.Type != "rate_limit_error" ||
 		payload.Error.Code != "rate_limit_exceeded" {
 		t.Fatalf("error response = %+v; body=%s", payload.Error, response.Body.String())
@@ -145,7 +145,28 @@ func TestChatGPTWebImageErrorsReachHTTPHandlersAsRateLimits(t *testing.T) {
 		request.Header.Set("Content-Type", "application/json")
 		response := httptest.NewRecorder()
 		router.ServeHTTP(response, request)
-		assertChatGPTWebImageHandlerRateLimit(t, response)
+		assertChatGPTWebImageHandlerOpenAIRateLimit(t, response)
+	})
+
+	t.Run("generic upstream image rate limit uses OpenAI error format", func(t *testing.T) {
+		errImage := newCommittedChatGPTWebImageHandlerError(`{"error":{"code":"rate_limit_exceeded","message":"Too many requests"}}`)
+		manager, _ := newChatGPTWebImageHandlerManager(t, errImage, "gpt-image-2", "gpt-5.4-mini")
+		base := handlers.NewBaseAPIHandlers(&sdkconfig.SDKConfig{
+			Images: sdkconfig.ImagesConfig{CodexModel: "gpt-5.4-mini"},
+		}, manager)
+		handler := openaihandlers.NewOpenAIImagesAPIHandler(base)
+		router := gin.New()
+		router.POST("/v1/images/generations", handler.Generations)
+
+		request := httptest.NewRequest(
+			http.MethodPost,
+			"/v1/images/generations",
+			strings.NewReader(`{"model":"gpt-image-2","prompt":"draw"}`),
+		)
+		request.Header.Set("Content-Type", "application/json")
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, request)
+		assertChatGPTWebImageHandlerOpenAIRateLimit(t, response)
 	})
 
 	t.Run("image quota message uses OpenAI error format", func(t *testing.T) {

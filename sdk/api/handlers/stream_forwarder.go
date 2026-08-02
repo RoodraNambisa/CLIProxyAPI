@@ -554,6 +554,16 @@ func (h *BaseAPIHandler) ForwardStream(c *gin.Context, flusher http.Flusher, can
 		}
 		flusher.Flush()
 	}
+	chunkErrorMessage := func(err error) *interfaces.ErrorMessage {
+		status := statusFromError(err)
+		if status == 0 {
+			status = http.StatusBadGateway
+		}
+		return h.RewriteExecutionErrorResponse(&interfaces.ErrorMessage{
+			StatusCode: status,
+			Error:      err,
+		})
+	}
 
 	refreshFlushPolicy := func() {
 		nextInterval, nextMinBytes := resolveFlushPolicy()
@@ -626,10 +636,7 @@ func (h *BaseAPIHandler) ForwardStream(c *gin.Context, flusher http.Flusher, can
 				}
 				if opts.ChunkError != nil {
 					if errChunk := opts.ChunkError(); errChunk != nil {
-						writeTerminalError(h.RewriteExecutionErrorResponse(&interfaces.ErrorMessage{
-							StatusCode: http.StatusBadGateway,
-							Error:      errChunk,
-						}))
+						writeTerminalError(chunkErrorMessage(errChunk))
 						cancel(errChunk)
 						return
 					}
@@ -652,10 +659,7 @@ func (h *BaseAPIHandler) ForwardStream(c *gin.Context, flusher http.Flusher, can
 			noteWrite(writtenBytes)
 			if opts.ChunkError != nil {
 				if errChunk := opts.ChunkError(); errChunk != nil {
-					writeTerminalError(h.RewriteExecutionErrorResponse(&interfaces.ErrorMessage{
-						StatusCode: http.StatusBadGateway,
-						Error:      errChunk,
-					}))
+					writeTerminalError(chunkErrorMessage(errChunk))
 					cancel(errChunk)
 					return
 				}

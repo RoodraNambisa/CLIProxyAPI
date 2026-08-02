@@ -851,19 +851,20 @@ func TestChatGPTWebImageAccumulatorWaitsForStreamTerminalAcrossImageMessages(t *
 
 func TestChatGPTWebImageAccumulatorCapturesUnmarkedFailuresOnly(t *testing.T) {
 	tests := []struct {
-		name        string
-		payload     string
-		wantFailure string
+		name             string
+		payload          string
+		wantFailure      string
+		wantTerminalText bool
 	}{
 		{
 			name:        "explicit error",
-			payload:     `{"message":{"author":{"role":"assistant"},"is_error":true,"content":{"content_type":"text","parts":["image request failed"]}}}`,
+			payload:     `{"message":{"author":{"role":"tool"},"is_error":true,"content":{"content_type":"text","parts":["image request failed"]}}}`,
 			wantFailure: "image request failed",
 		},
 		{
-			name:        "terminal rejection",
-			payload:     `{"message":{"author":{"role":"assistant"},"end_turn":true,"content":{"content_type":"text","parts":["This image request was blocked"]}}}`,
-			wantFailure: "This image request was blocked",
+			name:             "terminal text",
+			payload:          `{"message":{"author":{"role":"assistant"},"end_turn":true,"content":{"content_type":"text","parts":["Any non-empty response"]}}}`,
+			wantTerminalText: true,
 		},
 		{
 			name:        "terminal failure status",
@@ -871,8 +872,14 @@ func TestChatGPTWebImageAccumulatorCapturesUnmarkedFailuresOnly(t *testing.T) {
 			wantFailure: "finished_with_error",
 		},
 		{
-			name:    "ordinary terminal text",
-			payload: `{"message":{"author":{"role":"assistant"},"end_turn":true,"content":{"content_type":"text","parts":["The request completed normally."]}}}`,
+			name:             "ordinary terminal text",
+			payload:          `{"message":{"author":{"role":"assistant"},"end_turn":true,"content":{"content_type":"text","parts":["The request completed normally."]}}}`,
+			wantTerminalText: true,
+		},
+		{
+			name:             "metadata terminal text",
+			payload:          `{"message":{"author":{"role":"assistant"},"metadata":{"is_complete":true,"finish_details":{"type":"stop"}},"content":{"content_type":"text","parts":["Completed response"]}}}`,
+			wantTerminalText: true,
 		},
 	}
 	for _, test := range tests {
@@ -885,7 +892,84 @@ func TestChatGPTWebImageAccumulatorCapturesUnmarkedFailuresOnly(t *testing.T) {
 			if !accumulator.Terminal || accumulator.FailureStatus != test.wantFailure {
 				t.Fatalf("terminal state = (%t, %q), want failure %q", accumulator.Terminal, accumulator.FailureStatus, test.wantFailure)
 			}
+			if got := accumulator.HasTerminalAssistantText(); got != test.wantTerminalText {
+				t.Fatalf("terminal assistant text = %t, want %t", got, test.wantTerminalText)
+			}
 		})
+	}
+}
+
+func TestChatGPTWebImageAccumulatorCanonicalizesStructuredModerationFailures(t *testing.T) {
+	const guardrailDetail = "We’re so sorry, but the prompt may violate our guardrails around illicit or illegal activities."
+	tests := []struct {
+		name    string
+		payload string
+	}{
+		{
+			name: "message blocked flag",
+			payload: `{"message":{"author":{"role":"assistant"},"blocked":true,"is_error":true,` +
+				`"content":{"content_type":"text","parts":["` + guardrailDetail + `"]}}}`,
+		},
+		{
+			name: "metadata blocked flag",
+			payload: `{"message":{"author":{"role":"assistant"},"metadata":{"blocked":true,"is_error":true},` +
+				`"content":{"content_type":"text","parts":["` + guardrailDetail + `"]}}}`,
+		},
+		{
+			name: "content filter finish status",
+			payload: `{"message":{"author":{"role":"assistant"},"metadata":{"finish_details":{"type":"content_filter"}},` +
+				`"content":{"content_type":"text","parts":["` + guardrailDetail + `"]}}}`,
+		},
+		{
+			name: "assistant explicit textual failure",
+			payload: `{"message":{"author":{"role":"assistant"},"is_error":true,` +
+				`"content":{"content_type":"text","parts":["` + guardrailDetail + `"]}}}`,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			accumulator := &ChatGPTWebImageAccumulator{}
+			if _, err := accumulator.Apply([]byte(test.payload)); err != nil {
+				t.Fatalf("Apply() error = %v", err)
+			}
+			if !accumulator.Terminal || accumulator.FailureStatus != "content_filter" {
+				t.Fatalf("terminal = %t, failure = %q", accumulator.Terminal, accumulator.FailureStatus)
+			}
+		})
+	}
+}
+
+func TestChatGPTWebImageAccumulatorDoesNotInferModerationFromFailureText(t *testing.T) {
+	accumulator := &ChatGPTWebImageAccumulator{}
+	payload := []byte(`{"message":{"author":{"role":"tool"},"is_error":true,"content":{"content_type":"text","parts":["We’re so sorry, but the prompt may violate our guardrails around illicit or illegal activities."]}}}`)
+	if _, err := accumulator.Apply(payload); err != nil {
+		t.Fatalf("Apply() error = %v", err)
+	}
+	if accumulator.FailureStatus == "content_filter" {
+		t.Fatal("unstructured failure text was classified as moderation")
+	}
+}
+
+func TestChatGPTWebImageAccumulatorTracksPatchedTerminalAssistantText(t *testing.T) {
+	accumulator := &ChatGPTWebImageAccumulator{}
+	for index, payload := range []string{
+		`{"v":{"message":{"author":{"role":"assistant"},"content":{"content_type":"text","parts":[""]},"status":"in_progress"}}}`,
+		`{"o":"append","p":"/message/content/parts/0","v":"first"}`,
+		`{"c":1,"v":" second"}`,
+		`{"c":1,"v":" third"}`,
+		`{"o":"patch","v":[{"p":"/message/content/parts/0","o":"append","v":" fourth"},{"p":"/message/status","o":"replace","v":"finished_successfully"},{"p":"/message/end_turn","o":"replace","v":true},{"p":"/message/metadata","o":"append","v":{"is_complete":true,"finish_details":{"type":"stop"}}}]}`,
+		`{"type":"message_stream_complete"}`,
+	} {
+		done, err := accumulator.Apply([]byte(payload))
+		if err != nil {
+			t.Fatalf("Apply(%d) error = %v", index, err)
+		}
+		if done != (index == 5) {
+			t.Fatalf("Apply(%d) done = %t", index, done)
+		}
+	}
+	if !accumulator.Terminal || accumulator.FailureStatus != "" || !accumulator.HasTerminalAssistantText() {
+		t.Fatalf("terminal state = (%t, %q), terminal text %t", accumulator.Terminal, accumulator.FailureStatus, accumulator.HasTerminalAssistantText())
 	}
 }
 
@@ -905,6 +989,9 @@ func TestChatGPTWebImageAccumulatorCapturesEmptyAssistantTerminal(t *testing.T) 
 	if !reflect.DeepEqual(accumulator.FileIDs, []string{"generated"}) {
 		t.Fatalf("file IDs = %v", accumulator.FileIDs)
 	}
+	if accumulator.HasTerminalAssistantText() {
+		t.Fatal("empty assistant response was classified as terminal text")
+	}
 }
 
 func TestChatGPTWebImageAccumulatorStopsAtStreamComplete(t *testing.T) {
@@ -918,6 +1005,75 @@ func TestChatGPTWebImageAccumulatorStopsAtStreamComplete(t *testing.T) {
 	}
 	if accumulator.Terminal {
 		t.Fatal("stream completion was treated as image task completion")
+	}
+}
+
+func TestChatGPTWebImageAccumulatorRequiresSuccessfulTextTerminal(t *testing.T) {
+	accumulator := &ChatGPTWebImageAccumulator{}
+	for _, payload := range []string{
+		`{"v":{"message":{"author":{"role":"assistant"},"content":{"content_type":"text","parts":[""]},"status":"in_progress"}}}`,
+		`{"o":"append","p":"/message/content/parts/0","v":"non-empty text"}`,
+		`{"type":"message_stream_complete"}`,
+	} {
+		if _, err := accumulator.Apply([]byte(payload)); err != nil {
+			t.Fatalf("Apply() error = %v", err)
+		}
+	}
+	if accumulator.HasTerminalAssistantText() {
+		t.Fatal("stream completion without a successful message terminal was classified as moderation")
+	}
+}
+
+func TestChatGPTWebImageAccumulatorStructuredFailureOverridesTextTerminal(t *testing.T) {
+	accumulator := &ChatGPTWebImageAccumulator{}
+	for _, payload := range []string{
+		`{"v":{"message":{"author":{"role":"assistant"},"content":{"content_type":"text","parts":[""]},"status":"in_progress"}}}`,
+		`{"o":"append","p":"/message/content/parts/0","v":"failure detail"}`,
+		`{"o":"patch","v":[{"p":"/message/end_turn","o":"replace","v":true},{"p":"/message/metadata/finish_details","o":"replace","v":{"type":"finished_with_error"}}]}`,
+		`{"type":"message_stream_complete"}`,
+	} {
+		if _, err := accumulator.Apply([]byte(payload)); err != nil {
+			t.Fatalf("Apply() error = %v", err)
+		}
+	}
+	if accumulator.FailureStatus != "finished_with_error" || accumulator.HasTerminalAssistantText() {
+		t.Fatalf("failure = %q, terminal text = %t", accumulator.FailureStatus, accumulator.HasTerminalAssistantText())
+	}
+}
+
+func TestChatGPTWebImageAccumulatorClassifiesStructuredToolRateLimitBeforeAssistantText(t *testing.T) {
+	accumulator := &ChatGPTWebImageAccumulator{}
+	for index, payload := range []string{
+		`{"o":"add","v":{"message":{"author":{"role":"tool"},"content":{"content_type":"system_error","name":"ChatGPTAgentToolRateLimitException","text":"localized upstream instruction"},"status":"finished_successfully"}}}`,
+		`{"v":{"message":{"author":{"role":"assistant"},"content":{"content_type":"text","parts":[""]},"status":"in_progress"}}}`,
+		`{"o":"append","p":"/message/content/parts/0","v":"localized assistant response"}`,
+		`{"o":"patch","v":[{"p":"/message/status","o":"replace","v":"finished_successfully"},{"p":"/message/end_turn","o":"replace","v":true}]}`,
+		`{"type":"message_stream_complete"}`,
+	} {
+		if _, err := accumulator.Apply([]byte(payload)); err != nil {
+			t.Fatalf("Apply(%d) error = %v", index, err)
+		}
+	}
+	if accumulator.FailureStatus != "image_generation_limit_reached" {
+		t.Fatalf("failure = %q, want structured quota failure", accumulator.FailureStatus)
+	}
+	if !accumulator.Terminal || accumulator.HasTerminalAssistantText() {
+		t.Fatalf("terminal = %t, terminal assistant text = %t", accumulator.Terminal, accumulator.HasTerminalAssistantText())
+	}
+}
+
+func TestChatGPTWebImageAccumulatorKeepsImageWhenTerminalTextAlsoExists(t *testing.T) {
+	accumulator := &ChatGPTWebImageAccumulator{}
+	for _, payload := range []string{
+		`{"message":{"author":{"role":"tool"},"metadata":{"async_task_type":"image_gen"},"content":{"parts":["file-service://generated"]}}}`,
+		`{"message":{"author":{"role":"assistant"},"end_turn":true,"content":{"content_type":"text","parts":["Additional text"]}}}`,
+	} {
+		if _, err := accumulator.Apply([]byte(payload)); err != nil {
+			t.Fatalf("Apply() error = %v", err)
+		}
+	}
+	if !accumulator.HasTerminalAssistantText() || !reflect.DeepEqual(accumulator.FileIDs, []string{"generated"}) {
+		t.Fatalf("terminal text = %t, file IDs = %v", accumulator.HasTerminalAssistantText(), accumulator.FileIDs)
 	}
 }
 
@@ -938,11 +1094,6 @@ func TestChatGPTWebImageAccumulatorClassifiesOuterFailureEvents(t *testing.T) {
 			want:    "max_output_tokens",
 		},
 		{
-			name:    "moderation blocked",
-			payload: `{"type":"moderation","moderation_response":{"blocked":true,"reason":"safety policy"}}`,
-			want:    "safety policy",
-		},
-		{
 			name:    "stream completion with nested response error",
 			payload: `{"type":"message_stream_complete","response":{"error":{"message":"image generation failed"}}}`,
 			want:    "image generation failed",
@@ -955,6 +1106,23 @@ func TestChatGPTWebImageAccumulatorClassifiesOuterFailureEvents(t *testing.T) {
 				t.Fatalf("Apply() error = %v, want detail %q", err, test.want)
 			}
 		})
+	}
+}
+
+func TestChatGPTWebImageAccumulatorCanonicalizesOuterModeration(t *testing.T) {
+	for _, payload := range []string{
+		`{"type":"moderation","moderation_response":{"blocked":true,"reason":"safety policy"}}`,
+		`{"type":"response.failed","response":{"error":{"code":"moderation_blocked","message":"localized detail"}}}`,
+		`{"type":"response.incomplete","response":{"incomplete_details":{"reason":"content_filter"}}}`,
+	} {
+		accumulator := &ChatGPTWebImageAccumulator{}
+		done, err := accumulator.Apply([]byte(payload))
+		if err != nil {
+			t.Fatalf("Apply(%s) error = %v", payload, err)
+		}
+		if done || !accumulator.Terminal || accumulator.FailureStatus != "content_filter" {
+			t.Fatalf("payload = %s, done = %t, terminal = %t, failure = %q", payload, done, accumulator.Terminal, accumulator.FailureStatus)
+		}
 	}
 }
 
@@ -1236,7 +1404,7 @@ func TestCaptureChatGPTWebImageTasksCapturesStructuredMessageFailure(t *testing.
 	if err != nil {
 		t.Fatalf("CaptureChatGPTWebImageTasks() error = %v", err)
 	}
-	if !state.AllTerminal() || !accumulator.Terminal || accumulator.FailureStatus != "Your request was blocked" {
+	if !state.AllTerminal() || !accumulator.Terminal || accumulator.FailureStatus != "content_filter" {
 		t.Fatalf("task state = %+v, terminal %t, failure %q", state, accumulator.Terminal, accumulator.FailureStatus)
 	}
 }
@@ -1260,7 +1428,7 @@ func TestCaptureChatGPTWebImageTasksTreatsTerminalAssistantTextAsSuccess(t *test
 
 func TestCaptureChatGPTWebImageTasksPrefersSpecificMessageFailure(t *testing.T) {
 	payload := []byte(`{"tasks":[{"conversation_id":"target","status":"failed","image_gen_message":{
-		"author":{"role":"assistant"},
+		"author":{"role":"tool"},
 		"metadata":{"async_task_type":"image_gen","is_error":true},
 		"content":{"content_type":"text","parts":["image request rejected by policy"]}
 	}}]}`)
@@ -1276,7 +1444,7 @@ func TestCaptureChatGPTWebImageTasksPrefersSpecificMessageFailure(t *testing.T) 
 
 func TestCaptureChatGPTWebImageTasksPrefersSpecificFailureRegardlessOfTaskOrder(t *testing.T) {
 	generic := `{"conversation_id":"target","status":"completed","image_gen_message":{"author":{"role":"tool"},"metadata":{"async_task_type":"image_gen","is_error":true},"content":{"parts":[]}}}`
-	specific := `{"conversation_id":"target","status":"failed","image_gen_message":{"author":{"role":"assistant"},"metadata":{"async_task_type":"image_gen","is_error":true},"content":{"content_type":"text","parts":["image request rejected by policy"]}}}`
+	specific := `{"conversation_id":"target","status":"failed","image_gen_message":{"author":{"role":"tool"},"metadata":{"async_task_type":"image_gen","is_error":true},"content":{"content_type":"text","parts":["image request rejected by policy"]}}}`
 	for _, tasks := range []string{generic + "," + specific, specific + "," + generic} {
 		accumulator := &ChatGPTWebImageAccumulator{}
 		state, err := CaptureChatGPTWebImageTasks([]byte(`{"tasks":[`+tasks+`]}`), "target", accumulator)
@@ -1290,8 +1458,8 @@ func TestCaptureChatGPTWebImageTasksPrefersSpecificFailureRegardlessOfTaskOrder(
 }
 
 func TestCaptureChatGPTWebImageTasksChoosesStableSpecificFailure(t *testing.T) {
-	alpha := `{"conversation_id":"target","status":"failed","image_gen_message":{"author":{"role":"assistant"},"metadata":{"async_task_type":"image_gen","is_error":true},"content":{"content_type":"text","parts":["alpha policy failure"]}}}`
-	zeta := `{"conversation_id":"target","status":"failed","image_gen_message":{"author":{"role":"assistant"},"metadata":{"async_task_type":"image_gen","is_error":true},"content":{"content_type":"text","parts":["zeta service failure"]}}}`
+	alpha := `{"conversation_id":"target","status":"failed","image_gen_message":{"author":{"role":"tool"},"metadata":{"async_task_type":"image_gen","is_error":true},"content":{"content_type":"text","parts":["alpha policy failure"]}}}`
+	zeta := `{"conversation_id":"target","status":"failed","image_gen_message":{"author":{"role":"tool"},"metadata":{"async_task_type":"image_gen","is_error":true},"content":{"content_type":"text","parts":["zeta service failure"]}}}`
 	for _, tasks := range []string{alpha + "," + zeta, zeta + "," + alpha} {
 		accumulator := &ChatGPTWebImageAccumulator{}
 		state, err := CaptureChatGPTWebImageTasks([]byte(`{"tasks":[`+tasks+`]}`), "target", accumulator)
@@ -1454,12 +1622,16 @@ func TestMergeChatGPTWebImageAccumulatorsPrefersSpecificFailure(t *testing.T) {
 		name      string
 		primary   string
 		secondary string
+		want      string
 	}{
-		{name: "specific arrives second", primary: "failed", secondary: "image request rejected by policy"},
-		{name: "generic arrives second", primary: "image request rejected by policy", secondary: "failed"},
-		{name: "content filter arrives second", primary: "image request rejected by policy", secondary: "content_filter"},
-		{name: "max tokens arrives first", primary: "max_tokens", secondary: "image request rejected by policy"},
-		{name: "incomplete arrives second", primary: "image request rejected by policy", secondary: "incomplete"},
+		{name: "specific arrives second", primary: "failed", secondary: "image request rejected by policy", want: "image request rejected by policy"},
+		{name: "generic arrives second", primary: "image request rejected by policy", secondary: "failed", want: "image request rejected by policy"},
+		{name: "content filter arrives second", primary: "image request rejected by policy", secondary: "content_filter", want: "content_filter"},
+		{name: "content filter arrives first", primary: "content_filter", secondary: "image request rejected by policy", want: "content_filter"},
+		{name: "quota arrives before content filter", primary: "image_generation_limit_reached", secondary: "content_filter", want: "image_generation_limit_reached"},
+		{name: "quota arrives after content filter", primary: "content_filter", secondary: "image_generation_limit_reached", want: "image_generation_limit_reached"},
+		{name: "max tokens arrives first", primary: "max_tokens", secondary: "image request rejected by policy", want: "image request rejected by policy"},
+		{name: "incomplete arrives second", primary: "image request rejected by policy", secondary: "incomplete", want: "image request rejected by policy"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			merged, err := MergeChatGPTWebImageAccumulators(
@@ -1469,34 +1641,10 @@ func TestMergeChatGPTWebImageAccumulatorsPrefersSpecificFailure(t *testing.T) {
 			if err != nil {
 				t.Fatalf("MergeChatGPTWebImageAccumulators() error = %v", err)
 			}
-			if merged.FailureStatus != "image request rejected by policy" {
-				t.Fatalf("failure = %q", merged.FailureStatus)
+			if merged.FailureStatus != test.want {
+				t.Fatalf("failure = %q, want %q", merged.FailureStatus, test.want)
 			}
 		})
-	}
-}
-
-func TestChatGPTWebImageRejectionTextHonorsWordBoundariesAndNegation(t *testing.T) {
-	for _, test := range []struct {
-		text string
-		want bool
-	}{
-		{text: "The image request was blocked by policy.", want: true},
-		{text: "The image request was denied.", want: true},
-		{text: "The image request is unblocked.", want: false},
-		{text: "The image request was not blocked.", want: false},
-		{text: "The image request wasn't rejected.", want: false},
-	} {
-		if got := chatGPTWebImageRejectionText(test.text); got != test.want {
-			t.Fatalf("chatGPTWebImageRejectionText(%q) = %t, want %t", test.text, got, test.want)
-		}
-	}
-}
-
-func TestChatGPTWebImageRejectionTextScansRepeatedNegationsLinearly(t *testing.T) {
-	detail := strings.Repeat("not blocked ", 2_000) + "blocked"
-	if !chatGPTWebImageRejectionText(detail) {
-		t.Fatal("final unnegated rejection was not detected")
 	}
 }
 
@@ -1586,15 +1734,42 @@ func TestCaptureChatGPTWebImageConversationCapturesCurrentTerminalTextReply(t *t
 			}},
 			"rejected":{"message":{
 				"author":{"role":"assistant"},"create_time":2,"end_turn":true,
-				"content":{"content_type":"text","parts":["This image request was blocked by our safety system."]}
+				"content":{"content_type":"text","parts":["Any non-empty response"]}
 			}}
 		}
 	}`), accumulator)
 	if err != nil {
 		t.Fatalf("CaptureChatGPTWebImageConversation() error = %v", err)
 	}
-	if !accumulator.Terminal || accumulator.FailureStatus != "This image request was blocked by our safety system." {
-		t.Fatalf("terminal = %t, failure = %q", accumulator.Terminal, accumulator.FailureStatus)
+	if !accumulator.Terminal || accumulator.FailureStatus != "" || !accumulator.HasTerminalAssistantText() {
+		t.Fatalf("terminal = %t, failure = %q, terminal text = %t", accumulator.Terminal, accumulator.FailureStatus, accumulator.HasTerminalAssistantText())
+	}
+}
+
+func TestCaptureChatGPTWebImageConversationPrioritizesStructuredToolRateLimit(t *testing.T) {
+	accumulator := &ChatGPTWebImageAccumulator{}
+	err := CaptureChatGPTWebImageConversation([]byte(`{
+		"current_node":"assistant",
+		"mapping":{
+			"user":{"children":["tool"],"message":{"author":{"role":"user"},"content":{"content_type":"text","parts":["draw"]}}},
+			"tool":{"parent":"user","children":["assistant"],"message":{
+				"author":{"role":"tool"},"status":"finished_successfully",
+				"content":{"content_type":"system_error","name":"ChatGPTAgentToolRateLimitException","text":"localized upstream instruction"}
+			}},
+			"assistant":{"parent":"tool","message":{
+				"author":{"role":"assistant"},"status":"finished_successfully","end_turn":true,
+				"content":{"content_type":"text","parts":["localized assistant response"]}
+			}}
+		}
+	}`), accumulator)
+	if err != nil {
+		t.Fatalf("CaptureChatGPTWebImageConversation() error = %v", err)
+	}
+	if accumulator.FailureStatus != "image_generation_limit_reached" || !accumulator.Terminal {
+		t.Fatalf("failure = %q, terminal = %t", accumulator.FailureStatus, accumulator.Terminal)
+	}
+	if accumulator.HasTerminalAssistantText() {
+		t.Fatal("structured quota failure was overwritten by terminal assistant text")
 	}
 }
 
@@ -1617,7 +1792,7 @@ func TestCaptureChatGPTWebImageConversationUsesCurrentNodeAncestry(t *testing.T)
 			"current-user":{"parent":"old-image","message":{"author":{"role":"user"},"create_time":3}},
 			"rejected":{"parent":"current-user","message":{
 				"author":{"role":"assistant"},"create_time":4,"end_turn":true,
-				"content":{"content_type":"text","parts":["Current request was blocked"]}
+				"content":{"content_type":"text","parts":["Current response text"]}
 			}}
 		}
 	}`), accumulator)
@@ -1627,8 +1802,8 @@ func TestCaptureChatGPTWebImageConversationUsesCurrentNodeAncestry(t *testing.T)
 	if len(accumulator.References) != 0 {
 		t.Fatalf("historical references leaked into current turn: %#v", accumulator.References)
 	}
-	if !accumulator.Terminal || accumulator.FailureStatus != "Current request was blocked" {
-		t.Fatalf("terminal = %t, failure = %q", accumulator.Terminal, accumulator.FailureStatus)
+	if !accumulator.Terminal || accumulator.FailureStatus != "" || !accumulator.HasTerminalAssistantText() {
+		t.Fatalf("terminal = %t, failure = %q, terminal text = %t", accumulator.Terminal, accumulator.FailureStatus, accumulator.HasTerminalAssistantText())
 	}
 }
 
@@ -1820,7 +1995,7 @@ func TestCaptureChatGPTWebImageConversationExcludesLaterUntimestampedTurn(t *tes
 	}
 }
 
-func TestCaptureChatGPTWebImageConversationAcceptsTerminalCodeReply(t *testing.T) {
+func TestCaptureChatGPTWebImageConversationTreatsTerminalCodeReplyAsText(t *testing.T) {
 	accumulator := &ChatGPTWebImageAccumulator{}
 	err := CaptureChatGPTWebImageConversation([]byte(`{
 		"current_node":"rejected",
@@ -1832,8 +2007,8 @@ func TestCaptureChatGPTWebImageConversationAcceptsTerminalCodeReply(t *testing.T
 	if err != nil {
 		t.Fatalf("CaptureChatGPTWebImageConversation() error = %v", err)
 	}
-	if !accumulator.Terminal || accumulator.FailureStatus != "image_generation_denied" {
-		t.Fatalf("terminal = %t, failure = %q", accumulator.Terminal, accumulator.FailureStatus)
+	if !accumulator.Terminal || accumulator.FailureStatus != "" || !accumulator.HasTerminalAssistantText() {
+		t.Fatalf("terminal = %t, failure = %q, terminal text = %t", accumulator.Terminal, accumulator.FailureStatus, accumulator.HasTerminalAssistantText())
 	}
 }
 
