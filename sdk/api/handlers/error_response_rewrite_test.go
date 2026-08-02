@@ -143,6 +143,25 @@ func TestRewriteExecutionErrorResponseUsesFirstMatchingRule(t *testing.T) {
 	}
 }
 
+func TestUpdateClientsRemovesErrorResponseRewritesImmediately(t *testing.T) {
+	handler := NewBaseAPIHandlers(&config.SDKConfig{ErrorResponseRewrites: []config.ErrorResponseRewriteRule{{
+		MessageContains:    "upstream unavailable",
+		ResponseStatusCode: http.StatusBadRequest,
+	}}}, nil)
+	original := &interfaces.ErrorMessage{
+		StatusCode: http.StatusBadGateway,
+		Error:      errors.New("upstream unavailable"),
+	}
+	if projected := handler.RewriteExecutionErrorResponse(original); projected == original {
+		t.Fatal("configured rule did not rewrite the error")
+	}
+
+	handler.UpdateClients(&config.SDKConfig{})
+	if projected := handler.RewriteExecutionErrorResponse(original); projected != original {
+		t.Fatalf("deleted rule still rewrote the error: %#v", projected)
+	}
+}
+
 func TestRewriteExecutionErrorResponsePreservesOmittedBodyAndRetryHeader(t *testing.T) {
 	handler := NewBaseAPIHandlers(&config.SDKConfig{ErrorResponseRewrites: []config.ErrorResponseRewriteRule{
 		{MessageContains: "quota", ResponseStatusCode: http.StatusServiceUnavailable},

@@ -134,3 +134,89 @@ func TestLoadConfigPreservesExplicitEmptyErrorRewriteBody(t *testing.T) {
 		t.Fatalf("loaded rules = %#v, want explicit empty response body", cfg.ErrorResponseRewrites)
 	}
 }
+
+func TestSaveConfigPreserveCommentsRemovesDeletedErrorResponseRewrites(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	data := []byte(`# keep this comment
+debug: true
+error-response-rewrites:
+  - message-contains: "upstream unavailable"
+    response-status-code: 400
+`)
+	if errWrite := os.WriteFile(path, data, 0o600); errWrite != nil {
+		t.Fatalf("write config: %v", errWrite)
+	}
+	cfg, errLoad := LoadConfig(path)
+	if errLoad != nil {
+		t.Fatalf("LoadConfig() error = %v", errLoad)
+	}
+	cfg.ErrorResponseRewrites = nil
+	if errSave := SaveConfigPreserveComments(path, cfg); errSave != nil {
+		t.Fatalf("SaveConfigPreserveComments() error = %v", errSave)
+	}
+
+	saved, errRead := os.ReadFile(path)
+	if errRead != nil {
+		t.Fatalf("read saved config: %v", errRead)
+	}
+	if strings.Contains(string(saved), "error-response-rewrites:") {
+		t.Fatalf("deleted error response rewrites survived save:\n%s", saved)
+	}
+	if !strings.Contains(string(saved), "# keep this comment") {
+		t.Fatalf("unrelated comment was not preserved:\n%s", saved)
+	}
+	reloaded, errReload := LoadConfig(path)
+	if errReload != nil {
+		t.Fatalf("reload config: %v", errReload)
+	}
+	if len(reloaded.ErrorResponseRewrites) != 0 {
+		t.Fatalf("reloaded rules = %#v, want none", reloaded.ErrorResponseRewrites)
+	}
+	if errSave := SaveConfigPreserveComments(path, reloaded); errSave != nil {
+		t.Fatalf("second SaveConfigPreserveComments() error = %v", errSave)
+	}
+	savedAgain, errReadAgain := os.ReadFile(path)
+	if errReadAgain != nil {
+		t.Fatalf("read config after second save: %v", errReadAgain)
+	}
+	if strings.Contains(string(savedAgain), "error-response-rewrites:") {
+		t.Fatalf("deleted error response rewrites returned after reload and save:\n%s", savedAgain)
+	}
+}
+
+func TestSaveConfigPreserveCommentsReplacesErrorResponseRewriteFields(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	data := []byte(`error-response-rewrites:
+  - status-code: 429
+    message-contains: "old matcher"
+    response-status-code: 400
+    response-body:
+      error: old body
+`)
+	if errWrite := os.WriteFile(path, data, 0o600); errWrite != nil {
+		t.Fatalf("write config: %v", errWrite)
+	}
+	cfg, errLoad := LoadConfig(path)
+	if errLoad != nil {
+		t.Fatalf("LoadConfig() error = %v", errLoad)
+	}
+	cfg.ErrorResponseRewrites = []ErrorResponseRewriteRule{{
+		MessageContains:    "new matcher",
+		ResponseStatusCode: 503,
+	}}
+	if errSave := SaveConfigPreserveComments(path, cfg); errSave != nil {
+		t.Fatalf("SaveConfigPreserveComments() error = %v", errSave)
+	}
+
+	reloaded, errReload := LoadConfig(path)
+	if errReload != nil {
+		t.Fatalf("reload config: %v", errReload)
+	}
+	if len(reloaded.ErrorResponseRewrites) != 1 {
+		t.Fatalf("reloaded rules = %#v, want one", reloaded.ErrorResponseRewrites)
+	}
+	rule := reloaded.ErrorResponseRewrites[0]
+	if rule.StatusCode != 0 || rule.MessageContains != "new matcher" || rule.ResponseStatusCode != 503 || rule.ResponseBody != nil {
+		t.Fatalf("reloaded rule retained deleted fields: %#v", rule)
+	}
+}

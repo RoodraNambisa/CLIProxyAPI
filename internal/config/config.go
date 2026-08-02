@@ -3298,6 +3298,9 @@ func SaveConfigPreserveComments(configFile string, cfg *Config) error {
 
 	pruneMappingToGeneratedKeys(original.Content[0], generated.Content[0], "oauth-excluded-models")
 	pruneMappingToGeneratedKeys(original.Content[0], generated.Content[0], "oauth-model-alias")
+	if findMapKeyIndex(generated.Content[0], "error-response-rewrites") < 0 {
+		removeMapKey(original.Content[0], "error-response-rewrites")
+	}
 	normalizeUsagePricingModelKeys(original.Content[0])
 	pruneNestedMappingToGeneratedKeys(original.Content[0], generated.Content[0], "usage-pricing", "models")
 
