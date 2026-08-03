@@ -5,6 +5,42 @@
   const asString = (value, fallback = "") => value == null ? fallback : String(value);
   const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
+  function defineValue(target, key, value, options = {}) {
+    Object.defineProperty(target, key, {
+      configurable: options.configurable !== false,
+      enumerable: options.enumerable === true,
+      writable: options.writable !== false,
+      value,
+    });
+    return value;
+  }
+
+  function defineReadonly(target, key, value, enumerable = true) {
+    Object.defineProperty(target, key, {
+      configurable: true,
+      enumerable,
+      get() { return value; },
+    });
+  }
+
+  function setObjectTag(target, tag) {
+    if (typeof Symbol === "function" && Symbol.toStringTag) {
+      Object.defineProperty(target, Symbol.toStringTag, {
+        configurable: true,
+        value: tag,
+      });
+    }
+  }
+
+  function hideHostProperty(target, key) {
+    const descriptor = Object.getOwnPropertyDescriptor(target, key);
+    if (descriptor && descriptor.configurable) {
+      Object.defineProperty(target, key, { ...descriptor, enumerable: false });
+    }
+  }
+
+  hideHostProperty(host, "__sentinelBootstrap");
+
   function invalidBase64Error() {
     const error = new Error("The string to be decoded is not correctly encoded.");
     error.name = "InvalidCharacterError";
@@ -85,7 +121,7 @@
 
   class MemoryStorage {
     constructor(keys) {
-      this.values = new Map();
+      defineValue(this, "values", new Map(), { enumerable: false });
       for (const key of Array.isArray(keys) ? keys : []) this.values.set(asString(key), "");
     }
     get length() { return this.values.size; }
@@ -95,6 +131,7 @@
     removeItem(key) { this.values.delete(asString(key)); }
     setItem(key, value) { this.values.set(asString(key), asString(value)); }
   }
+  setObjectTag(MemoryStorage.prototype, "Storage");
 
   class MinimalSearchParams {
     constructor(query) {
@@ -209,25 +246,169 @@
     toString() { return this.href; }
   }
 
+  const elementState = new WeakMap();
+  const contextState = new WeakMap();
+  const elementPrototype = {};
+  const htmlElementPrototype = Object.create(elementPrototype);
+  const canvasElementPrototype = Object.create(htmlElementPrototype);
+  const canvas2DPrototype = {};
+  const webGLPrototype = {};
+  const webGLDebugRendererInfo = {};
+  setObjectTag(elementPrototype, "Element");
+  setObjectTag(htmlElementPrototype, "HTMLElement");
+  setObjectTag(canvasElementPrototype, "HTMLCanvasElement");
+  setObjectTag(canvas2DPrototype, "CanvasRenderingContext2D");
+  setObjectTag(webGLPrototype, "WebGLRenderingContext");
+
+  const elementData = (element) => elementState.get(element) || {
+    tagName: "DIV",
+    attributes: new Map(),
+    children: [],
+    style: {},
+    src: "",
+    width: 0,
+    height: 0,
+    contexts: new Map(),
+  };
+  defineReadonly(elementPrototype, "nodeType", 1);
+  for (const key of ["nodeName", "tagName"]) {
+    Object.defineProperty(elementPrototype, key, {
+      configurable: true,
+      enumerable: true,
+      get() { return elementData(this).tagName; },
+    });
+  }
+  for (const key of ["style", "children", "childNodes"]) {
+    Object.defineProperty(elementPrototype, key, {
+      configurable: true,
+      enumerable: true,
+      get() { return key === "style" ? elementData(this).style : elementData(this).children; },
+    });
+  }
+  Object.defineProperty(elementPrototype, "src", {
+    configurable: true,
+    enumerable: true,
+    get() { return elementData(this).src; },
+    set(value) { elementData(this).src = asString(value); },
+  });
+  defineValue(elementPrototype, "appendChild", function appendChild(child) {
+    elementData(this).children.push(child);
+    return child;
+  }, { enumerable: true });
+  defineValue(elementPrototype, "removeChild", function removeChild(child) {
+    const children = elementData(this).children;
+    const index = children.indexOf(child);
+    if (index >= 0) children.splice(index, 1);
+    return child;
+  }, { enumerable: true });
+  defineValue(elementPrototype, "setAttribute", function setAttribute(key, value) {
+    const name = asString(key);
+    const text = asString(value);
+    elementData(this).attributes.set(name, text);
+    if (name === "src") this.src = text;
+  }, { enumerable: true });
+  defineValue(elementPrototype, "getAttribute", function getAttribute(key) {
+    const name = asString(key);
+    if (name === "src" && this.src) return this.src;
+    return elementData(this).attributes.get(name) ?? null;
+  }, { enumerable: true });
+  defineValue(elementPrototype, "addEventListener", noop, { enumerable: true });
+  defineValue(elementPrototype, "removeEventListener", noop, { enumerable: true });
+  defineValue(elementPrototype, "dispatchEvent", function dispatchEvent() { return true; }, { enumerable: true });
+  defineValue(elementPrototype, "getBoundingClientRect", function getBoundingClientRect() {
+    const state = elementData(this);
+    const elementWidth = state.width || 0;
+    const elementHeight = state.height || 0;
+    return { x: 0, y: 0, width: elementWidth, height: elementHeight, top: 0, right: elementWidth, bottom: elementHeight, left: 0 };
+  }, { enumerable: true });
+
+  for (const key of ["width", "height"]) {
+    Object.defineProperty(canvasElementPrototype, key, {
+      configurable: true,
+      enumerable: true,
+      get() { return elementData(this)[key]; },
+      set(value) {
+        const number = Number(value);
+        elementData(this)[key] = Number.isFinite(number) && number >= 0 ? Math.floor(number) : 0;
+      },
+    });
+  }
+  defineValue(canvasElementPrototype, "getContext", function getContext(kind) {
+    const normalized = asString(kind, "2d").toLowerCase();
+    if (!["2d", "webgl", "experimental-webgl", "webgl2"].includes(normalized)) return null;
+    const state = elementData(this);
+    if (state.contexts.has(normalized)) return state.contexts.get(normalized);
+    const context = Object.create(normalized === "2d" ? canvas2DPrototype : webGLPrototype);
+    contextState.set(context, { canvas: this, kind: normalized });
+    state.contexts.set(normalized, context);
+    return context;
+  }, { enumerable: true });
+  defineValue(canvasElementPrototype, "toDataURL", function toDataURL(type) {
+    const mime = asString(type, "image/png") || "image/png";
+    const state = elementData(this);
+    const renderProfile = Number(config.fingerprint_slot) & 15;
+    const fingerprint = `sentinel-canvas-v1:${renderProfile}:${state.width}x${state.height}`;
+    return `data:${mime};base64,${encodeBase64(utf8Encode(fingerprint))}`;
+  }, { enumerable: true });
+
+  for (const name of ["fillRect", "clearRect", "drawImage", "save", "restore"]) {
+    defineValue(canvas2DPrototype, name, noop, { enumerable: true });
+  }
+  defineValue(canvas2DPrototype, "measureText", function measureText(value) {
+    return { width: asString(value).length * 7.5 };
+  }, { enumerable: true });
+  Object.defineProperty(canvas2DPrototype, "canvas", {
+    configurable: true,
+    enumerable: true,
+    get() { return (contextState.get(this) || {}).canvas || null; },
+  });
+
+  defineReadonly(webGLDebugRendererInfo, "UNMASKED_VENDOR_WEBGL", 0x9245);
+  defineReadonly(webGLDebugRendererInfo, "UNMASKED_RENDERER_WEBGL", 0x9246);
+  defineValue(webGLPrototype, "getExtension", function getExtension(name) {
+    return asString(name).toLowerCase() === "webgl_debug_renderer_info" ? webGLDebugRendererInfo : null;
+  }, { enumerable: true });
+  defineValue(webGLPrototype, "getParameter", function getParameter(parameter) {
+    switch (Number(parameter)) {
+      case 0x1f00: return "WebKit";
+      case 0x1f01: return "WebKit WebGL";
+      case 0x1f02: return "WebGL 1.0 (OpenGL ES 2.0 Chromium)";
+      case 0x8b8c: return "WebGL GLSL ES 1.0 (OpenGL ES GLSL ES 1.0 Chromium)";
+      case 0x9245: return asString(config.webgl_vendor, "Google Inc.");
+      case 0x9246: return asString(config.webgl_renderer, "ANGLE (Google, Vulkan, Vulkan)");
+      default: return 0;
+    }
+  }, { enumerable: true });
+  defineValue(webGLPrototype, "getSupportedExtensions", function getSupportedExtensions() {
+    return ["WEBGL_debug_renderer_info"];
+  }, { enumerable: true });
+  Object.defineProperty(webGLPrototype, "canvas", {
+    configurable: true,
+    enumerable: true,
+    get() { return (contextState.get(this) || {}).canvas || null; },
+  });
+  for (const [key, value] of Object.entries({
+    VENDOR: 0x1f00,
+    RENDERER: 0x1f01,
+    VERSION: 0x1f02,
+    SHADING_LANGUAGE_VERSION: 0x8b8c,
+  })) defineReadonly(webGLPrototype, key, value);
+
   function makeElement(name) {
     const upperName = asString(name, "div").toUpperCase();
-    const children = [];
-    return {
-      nodeType: 1,
-      nodeName: upperName,
+    const canvas = upperName === "CANVAS";
+    const element = Object.create(canvas ? canvasElementPrototype : htmlElementPrototype);
+    elementState.set(element, {
       tagName: upperName,
+      attributes: new Map(),
+      children: [],
       style: {},
-      children,
       src: "",
-      appendChild(child) { children.push(child); return child; },
-      removeChild(child) { const index = children.indexOf(child); if (index >= 0) children.splice(index, 1); return child; },
-      setAttribute(key, value) { this[asString(key)] = asString(value); },
-      getAttribute(key) { const value = this[asString(key)]; return value == null ? null : asString(value); },
-      addEventListener: noop,
-      removeEventListener: noop,
-      dispatchEvent() { return true; },
-      getBoundingClientRect() { return { x: 0, y: 0, width: 0, height: 0, top: 0, right: 0, bottom: 0, left: 0 }; },
-    };
+      width: canvas ? 300 : 0,
+      height: canvas ? 150 : 0,
+      contexts: new Map(),
+    });
+    return element;
   }
 
   const URLImplementation = typeof host.URL === "function" ? host.URL : MinimalURL;
@@ -247,30 +428,42 @@
     scriptNodes.push(sdkNode);
   }
   const rootElement = makeElement("html");
-  rootElement.clientWidth = width;
-  rootElement.clientHeight = height;
-  const document = {
-    readyState: "complete",
-    hidden: false,
-    visibilityState: "visible",
-    referrer: "https://chatgpt.com/",
-    URL: location.href,
-    cookie: `oai-did=${encodeURIComponent(asString(config.device_id))}`,
-    scripts: scriptNodes,
-    currentScript: sdkNode || null,
-    documentElement: rootElement,
-    head: makeElement("head"),
-    body: makeElement("body"),
-    createElement(name) { const node = makeElement(name); if (node.tagName === "SCRIPT") scriptNodes.push(node); return node; },
-    createElementNS(_namespace, name) { return this.createElement(name); },
-    querySelector() { return null; },
-    querySelectorAll(selector) { return asString(selector).toLowerCase().includes("script") ? scriptNodes.slice() : []; },
-    getElementById() { return null; },
-    getElementsByTagName(name) { return asString(name).toLowerCase() === "script" ? scriptNodes.slice() : []; },
-    addEventListener: noop,
-    removeEventListener: noop,
-    dispatchEvent() { return true; },
-  };
+  defineValue(rootElement, "clientWidth", width, { enumerable: true });
+  defineValue(rootElement, "clientHeight", height, { enumerable: true });
+  const documentPrototype = {};
+  setObjectTag(documentPrototype, "HTMLDocument");
+  const document = Object.create(documentPrototype);
+  defineReadonly(document, "readyState", "complete", false);
+  defineReadonly(document, "hidden", false, false);
+  defineReadonly(document, "visibilityState", "visible", false);
+  defineReadonly(document, "referrer", "https://chatgpt.com/", false);
+  defineReadonly(document, "URL", location.href, false);
+  defineReadonly(document, "location", location, false);
+  defineValue(document, "cookie", `oai-did=${encodeURIComponent(asString(config.device_id))}`, { enumerable: false });
+  defineReadonly(document, "scripts", scriptNodes, false);
+  defineReadonly(document, "currentScript", sdkNode || null, false);
+  defineReadonly(document, "documentElement", rootElement, false);
+  defineReadonly(document, "head", makeElement("head"), false);
+  defineReadonly(document, "body", makeElement("body"), false);
+  defineValue(documentPrototype, "createElement", function createElement(name) {
+    const node = makeElement(name);
+    if (node.tagName === "SCRIPT") scriptNodes.push(node);
+    return node;
+  }, { enumerable: true });
+  defineValue(documentPrototype, "createElementNS", function createElementNS(_namespace, name) {
+    return this.createElement(name);
+  }, { enumerable: true });
+  defineValue(documentPrototype, "querySelector", function querySelector() { return null; }, { enumerable: true });
+  defineValue(documentPrototype, "querySelectorAll", function querySelectorAll(selector) {
+    return asString(selector).toLowerCase().includes("script") ? scriptNodes.slice() : [];
+  }, { enumerable: true });
+  defineValue(documentPrototype, "getElementById", function getElementById() { return null; }, { enumerable: true });
+  defineValue(documentPrototype, "getElementsByTagName", function getElementsByTagName(name) {
+    return asString(name).toLowerCase() === "script" ? scriptNodes.slice() : [];
+  }, { enumerable: true });
+  defineValue(documentPrototype, "addEventListener", noop, { enumerable: true });
+  defineValue(documentPrototype, "removeEventListener", noop, { enumerable: true });
+  defineValue(documentPrototype, "dispatchEvent", function dispatchEvent() { return true; }, { enumerable: true });
 
   const entropy = decodeBase64(config.random_b64);
   let entropyPosition = 0;
@@ -295,6 +488,14 @@
     return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
   }
 
+  function randomBase36(length) {
+    const symbols = "abcdefghijklmnopqrstuvwxyz0123456789";
+    const bytes = getRandomValues(new Uint8Array(length));
+    return Array.from(bytes, (byte) => symbols[byte % symbols.length]).join("");
+  }
+  const reactDocumentKey = `__reactContainer$${randomBase36(11)}`;
+  defineValue(document, reactDocumentKey, reactDocumentKey, { enumerable: true });
+
   const fallbackTimeout = (callback) => { if (typeof callback === "function") callback(); return 1; };
   const schedule = typeof host.setTimeout === "function" ? host.setTimeout.bind(host) : fallbackTimeout;
   const cancelScheduled = typeof host.clearTimeout === "function" ? host.clearTimeout.bind(host) : noop;
@@ -303,25 +504,123 @@
   delete host.os;
   host.std = undefined;
   host.os = undefined;
-  host.window = host;
-  host.self = host;
-  host.top = host;
-  host.parent = host;
-  host.document = document;
-  host.location = location;
-  host.navigator = {
-    userAgent: asString(config.user_agent, "Mozilla/5.0"),
+  defineReadonly(host, "window", host, false);
+  defineReadonly(host, "self", host, false);
+  defineReadonly(host, "top", host, false);
+  defineReadonly(host, "parent", host, false);
+  defineReadonly(host, "document", document, false);
+  defineReadonly(host, "location", location, false);
+
+  const navigatorPrototype = {};
+  setObjectTag(navigatorPrototype, "Navigator");
+  const navigator = Object.create(navigatorPrototype);
+  const pluginArray = {};
+  const mimeTypeArray = {};
+  setObjectTag(pluginArray, "PluginArray");
+  setObjectTag(mimeTypeArray, "MimeTypeArray");
+  defineReadonly(pluginArray, "length", 0, false);
+  defineReadonly(mimeTypeArray, "length", 0, false);
+  const userAgent = asString(config.user_agent, "Mozilla/5.0");
+  const navigatorValues = {
+    userAgent,
+    appVersion: userAgent.replace(/^Mozilla\//, ""),
+    appCodeName: "Mozilla",
+    appName: "Netscape",
     language: asString(config.language, "en-US"),
-    languages: Array.isArray(config.languages) ? config.languages.map(asString) : ["en-US", "en"],
+    languages: Array.isArray(config.languages) ? config.languages.map((value) => asString(value)) : ["en-US", "en"],
     hardwareConcurrency: Number(config.hardware_concurrency) || 8,
+    deviceMemory: Number(config.device_memory) || 8,
+    maxTouchPoints: Number(config.max_touch_points) || 0,
     platform: asString(config.platform, "MacIntel"),
     vendor: "Google Inc.",
+    vendorSub: "",
+    product: "Gecko",
+    productSub: "20030107",
     webdriver: false,
+    cookieEnabled: true,
+    onLine: true,
+    pdfViewerEnabled: true,
+    plugins: pluginArray,
+    mimeTypes: mimeTypeArray,
   };
-  host.screen = { width, height, availWidth: width, availHeight: height, colorDepth: 24, pixelDepth: 24 };
-  host.performance = { now: () => Date.now() % 50000, timeOrigin: Date.now() - (Date.now() % 50000), memory: { jsHeapSizeLimit: 4294967296 } };
-  host.localStorage = new MemoryStorage(config.local_storage_keys);
-  host.sessionStorage = new MemoryStorage([]);
+  for (const [key, value] of Object.entries(navigatorValues)) defineReadonly(navigatorPrototype, key, value);
+  defineReadonly(host, "navigator", navigator, false);
+
+  const screenPrototype = {};
+  setObjectTag(screenPrototype, "Screen");
+  const screen = Object.create(screenPrototype);
+  const screenValues = {
+    width,
+    height,
+    availLeft: Number(config.screen_avail_left) || 0,
+    availTop: Number(config.screen_avail_top) || 0,
+    availWidth: Number(config.screen_avail_width) || width,
+    availHeight: Number(config.screen_avail_height) || height,
+    colorDepth: Number(config.screen_color_depth) || 24,
+    pixelDepth: Number(config.screen_color_depth) || 24,
+  };
+  for (const [key, value] of Object.entries(screenValues)) defineReadonly(screenPrototype, key, value);
+  defineReadonly(host, "screen", screen, false);
+
+  const pageStartedAt = Number(config.page_started_at_ms);
+  const timeOrigin = Number.isFinite(pageStartedAt) && pageStartedAt > 0 ? pageStartedAt : Date.now();
+  const performancePrototype = {};
+  setObjectTag(performancePrototype, "Performance");
+  const performance = Object.create(performancePrototype);
+  defineReadonly(performance, "timeOrigin", timeOrigin, false);
+  defineReadonly(performance, "memory", { jsHeapSizeLimit: Number(config.js_heap_size_limit) || 4294967296 }, false);
+  defineValue(performancePrototype, "now", function now() { return Math.max(0, Date.now() - timeOrigin); }, { enumerable: true });
+  defineReadonly(host, "performance", performance, false);
+  defineReadonly(host, "devicePixelRatio", Number(config.device_pixel_ratio) || 1, false);
+  defineReadonly(host, "innerWidth", Number(config.inner_width) || width, false);
+  defineReadonly(host, "innerHeight", Number(config.inner_height) || height, false);
+
+  const localStorage = new MemoryStorage(config.local_storage_keys);
+  const sessionStorage = new MemoryStorage([]);
+  defineReadonly(host, "localStorage", localStorage, false);
+  defineReadonly(host, "sessionStorage", sessionStorage, false);
+  defineValue(host, "__reactRouterContext", {
+    basename: "/",
+    future: {},
+    isSpaMode: true,
+    routeDiscovery: {},
+    ssr: false,
+    state: undefined,
+  }, { enumerable: false });
+
+  const ElementConstructor = function Element() {};
+  const HTMLElementConstructor = function HTMLElement() {};
+  const HTMLCanvasElementConstructor = function HTMLCanvasElement() {};
+  const DocumentConstructor = function Document() {};
+  const NavigatorConstructor = function Navigator() {};
+  const ScreenConstructor = function Screen() {};
+  const CanvasRenderingContext2DConstructor = function CanvasRenderingContext2D() {};
+  const WebGLRenderingContextConstructor = function WebGLRenderingContext() {};
+  ElementConstructor.prototype = elementPrototype;
+  HTMLElementConstructor.prototype = htmlElementPrototype;
+  HTMLCanvasElementConstructor.prototype = canvasElementPrototype;
+  DocumentConstructor.prototype = documentPrototype;
+  NavigatorConstructor.prototype = navigatorPrototype;
+  ScreenConstructor.prototype = screenPrototype;
+  CanvasRenderingContext2DConstructor.prototype = canvas2DPrototype;
+  WebGLRenderingContextConstructor.prototype = webGLPrototype;
+  defineValue(elementPrototype, "constructor", ElementConstructor, { enumerable: false });
+  defineValue(htmlElementPrototype, "constructor", HTMLElementConstructor, { enumerable: false });
+  defineValue(canvasElementPrototype, "constructor", HTMLCanvasElementConstructor, { enumerable: false });
+  defineValue(documentPrototype, "constructor", DocumentConstructor, { enumerable: false });
+  defineValue(navigatorPrototype, "constructor", NavigatorConstructor, { enumerable: false });
+  defineValue(screenPrototype, "constructor", ScreenConstructor, { enumerable: false });
+  defineValue(canvas2DPrototype, "constructor", CanvasRenderingContext2DConstructor, { enumerable: false });
+  defineValue(webGLPrototype, "constructor", WebGLRenderingContextConstructor, { enumerable: false });
+  defineValue(host, "Element", ElementConstructor, { enumerable: false });
+  defineValue(host, "HTMLElement", HTMLElementConstructor, { enumerable: false });
+  defineValue(host, "HTMLCanvasElement", HTMLCanvasElementConstructor, { enumerable: false });
+  defineValue(host, "Document", DocumentConstructor, { enumerable: false });
+  defineValue(host, "Navigator", NavigatorConstructor, { enumerable: false });
+  defineValue(host, "Screen", ScreenConstructor, { enumerable: false });
+  defineValue(host, "Storage", MemoryStorage, { enumerable: false });
+  defineValue(host, "CanvasRenderingContext2D", CanvasRenderingContext2DConstructor, { enumerable: false });
+  defineValue(host, "WebGLRenderingContext", WebGLRenderingContextConstructor, { enumerable: false });
   host.URL = URLImplementation;
   host.URLSearchParams = typeof host.URLSearchParams === "function" ? host.URLSearchParams : MinimalSearchParams;
   host.TextEncoder = class TextEncoder { encode(value) { return utf8Encode(value); } };
@@ -364,8 +663,8 @@
   host.CSS = { supports() { return true; } };
   host.indexedDB = { open() { return { onerror: null, onsuccess: null, onupgradeneeded: null, result: {}, error: null }; }, deleteDatabase() { return {}; } };
   host.fetch = async () => { throw new Error("Sentinel SDK network access is disabled"); };
-  host.__sentinel_init_pending = [];
-  host.__sentinel_token_pending = [];
+  defineValue(host, "__sentinel_init_pending", [], { enumerable: false });
+  defineValue(host, "__sentinel_token_pending", [], { enumerable: false });
   Math.random = randomNumber;
 })(globalThis.__sentinelBootstrap || {}, globalThis);
 
@@ -377,7 +676,11 @@
   if (!sdk || typeof sdk.D !== "function" || typeof sdk._n !== "function" || typeof sdk.Et !== "function" || typeof sdk.Nt !== "function") {
     throw new Error("Sentinel SDK export adapter is unavailable");
   }
-  host.__sentinelBridge = Object.freeze({
+  for (const key of ["__sentinelBootstrap", "__sentinelInternals", "__sentinel_init_pending", "__sentinel_token_pending"]) {
+    const descriptor = Object.getOwnPropertyDescriptor(host, key);
+    if (descriptor && descriptor.configurable) Object.defineProperty(host, key, { ...descriptor, enumerable: false });
+  }
+  const bridge = Object.freeze({
     async solveTurnstile(input) {
       const challenge = input && input.challenge ? input.challenge : {};
       sdk.D(challenge, asString(input && input.requirements_token));
@@ -416,6 +719,12 @@
       const result = await sdk.Nt(dx);
       return result == null ? "" : String(result);
     },
+  });
+  Object.defineProperty(host, "__sentinelBridge", {
+    configurable: true,
+    enumerable: false,
+    writable: false,
+    value: bridge,
   });
 
   function asString(value) {

@@ -687,6 +687,99 @@ func TestSentinelSDKEnvironmentCurrentScriptUsesExactSDKNode(t *testing.T) {
 	}
 }
 
+func TestSentinelSDKEnvironmentMatchesStableBrowserSnapshot(t *testing.T) {
+	manager := newSentinelRuntimeTestManager()
+	defer manager.Close()
+	request, sdkRequest := sentinelRuntimeTestRequests(t, false)
+	sdkSource := strings.Replace(
+		sentinelRuntimeTestSDK,
+		`async function _n(){return "sdk-turnstile-token"}`,
+		`async function _n(){
+const canvas=document.createElement("canvas");
+const webgl=canvas.getContext("webgl");
+const extension=webgl.getExtension("WEBGL_debug_renderer_info");
+localStorage.setItem("sentinel-test","stored");
+const navigatorDescriptor=Object.getOwnPropertyDescriptor(Object.getPrototypeOf(navigator),"userAgent");
+return JSON.stringify({
+navigatorTag:Object.prototype.toString.call(navigator),
+documentTag:Object.prototype.toString.call(document),
+elementTag:Object.prototype.toString.call(document.createElement("div")),
+canvasTag:Object.prototype.toString.call(canvas),
+webglTag:Object.prototype.toString.call(webgl),
+storageTag:Object.prototype.toString.call(localStorage),
+screenTag:Object.prototype.toString.call(screen),
+vendor:webgl.getParameter(extension.UNMASKED_VENDOR_WEBGL),
+renderer:webgl.getParameter(extension.UNMASKED_RENDERER_WEBGL),
+stored:localStorage.getItem("sentinel-test"),
+availLeft:screen.availLeft,
+deviceMemory:navigator.deviceMemory,
+heap:performance.memory.jsHeapSizeLimit,
+routerState:typeof __reactRouterContext.state,
+readonlyNavigator:!!navigatorDescriptor&&typeof navigatorDescriptor.get==="function"&&!navigatorDescriptor.set,
+internalEnumerable:Object.keys(globalThis).filter((key)=>key.startsWith("__sentinel")),
+reactDocumentKeys:Object.keys(document).filter((key)=>key.startsWith("__reactContainer$")),
+timeOrigin:performance.timeOrigin,
+nowNonnegative:performance.now()>=0,
+sameContext:canvas.getContext("webgl")===webgl,
+canvasInstance:canvas instanceof HTMLCanvasElement,
+elementInstance:canvas instanceof Element
+})}`,
+		1,
+	)
+	sdkRequest.Fetcher = func(_ context.Context, target string, _ int64) ([]byte, string, string, error) {
+		return []byte(sdkSource), "application/javascript", target, nil
+	}
+	token, err := manager.SolveTurnstile(t.Context(), request, sdkRequest, nil)
+	if err != nil {
+		t.Fatalf("SolveTurnstile() error = %v", err)
+	}
+	var result struct {
+		NavigatorTag       string   `json:"navigatorTag"`
+		DocumentTag        string   `json:"documentTag"`
+		ElementTag         string   `json:"elementTag"`
+		CanvasTag          string   `json:"canvasTag"`
+		WebGLTag           string   `json:"webglTag"`
+		StorageTag         string   `json:"storageTag"`
+		ScreenTag          string   `json:"screenTag"`
+		Vendor             string   `json:"vendor"`
+		Renderer           string   `json:"renderer"`
+		Stored             string   `json:"stored"`
+		AvailLeft          int      `json:"availLeft"`
+		DeviceMemory       float64  `json:"deviceMemory"`
+		Heap               float64  `json:"heap"`
+		RouterState        string   `json:"routerState"`
+		ReadonlyNavigator  bool     `json:"readonlyNavigator"`
+		InternalEnumerable []string `json:"internalEnumerable"`
+		ReactDocumentKeys  []string `json:"reactDocumentKeys"`
+		TimeOrigin         float64  `json:"timeOrigin"`
+		NowNonnegative     bool     `json:"nowNonnegative"`
+		SameContext        bool     `json:"sameContext"`
+		CanvasInstance     bool     `json:"canvasInstance"`
+		ElementInstance    bool     `json:"elementInstance"`
+	}
+	if err = json.Unmarshal([]byte(token), &result); err != nil {
+		t.Fatalf("decode SDK browser environment: %v", err)
+	}
+	profileEnvironment := sdkRequest.Environment
+	profileEnvironment.DeviceID = sdkRequest.DeviceID
+	profile := resolveSentinelBrowserProfile(profileEnvironment)
+	if result.NavigatorTag != "[object Navigator]" || result.DocumentTag != "[object HTMLDocument]" ||
+		result.ElementTag != "[object HTMLElement]" || result.CanvasTag != "[object HTMLCanvasElement]" ||
+		result.WebGLTag != "[object WebGLRenderingContext]" || result.StorageTag != "[object Storage]" ||
+		result.ScreenTag != "[object Screen]" {
+		t.Fatalf("browser object tags = %+v", result)
+	}
+	if result.Vendor != profile.webGLVendor || result.Renderer != profile.webGLRenderer || result.AvailLeft != profile.availLeft ||
+		result.DeviceMemory != profile.deviceMemory || result.Heap != profile.jsHeapSizeLimit {
+		t.Fatalf("SDK fingerprint = %+v, profile = %+v", result, profile)
+	}
+	if result.Stored != "stored" || result.RouterState != "undefined" || !result.ReadonlyNavigator ||
+		len(result.InternalEnumerable) != 0 || len(result.ReactDocumentKeys) != 1 || result.TimeOrigin <= 0 ||
+		!result.NowNonnegative || !result.SameContext || !result.CanvasInstance || !result.ElementInstance {
+		t.Fatalf("SDK browser behavior = %+v", result)
+	}
+}
+
 func TestSentinelSDKEnvironmentURLAndBase64Compatibility(t *testing.T) {
 	manager := newSentinelRuntimeTestManager()
 	defer manager.Close()
