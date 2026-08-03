@@ -105,6 +105,9 @@ func TestSentinelBrowserFingerprintIsBoundToDeviceID(t *testing.T) {
 	if first != second {
 		t.Fatalf("same device profile changed: %#v != %#v", first, second)
 	}
+	if first.slot != 0xb14 {
+		t.Fatalf("v1 device fingerprint slot changed: %#x", first.slot)
+	}
 	environment.DeviceID = "11111111-2222-4333-8444-666666666666"
 	third := resolveSentinelBrowserProfile(environment)
 	if third.slot == first.slot {
