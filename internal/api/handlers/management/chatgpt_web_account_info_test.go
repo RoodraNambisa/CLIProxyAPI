@@ -21,13 +21,14 @@ import (
 
 type accountInfoControllerTestExecutor struct {
 	coreauth.ProviderExecutor
-	mu       sync.Mutex
-	snapshot chatgptwebauth.AccountInfoRuntimeSnapshot
-	tasks    map[string]*chatgptwebauth.AccountInfoRefreshTask
-	targets  []chatgptwebauth.AccountInfoRefreshTarget
-	force    bool
-	updates  int
-	startErr error
+	mu          sync.Mutex
+	snapshot    chatgptwebauth.AccountInfoRuntimeSnapshot
+	diagnostics chatgptwebauth.AccountInfoDiagnosticsSnapshot
+	tasks       map[string]*chatgptwebauth.AccountInfoRefreshTask
+	targets     []chatgptwebauth.AccountInfoRefreshTarget
+	force       bool
+	updates     int
+	startErr    error
 
 	expectedAuthID     string
 	invalidAuthIDCount int
@@ -41,6 +42,22 @@ func (executor *accountInfoControllerTestExecutor) AccountInfoSnapshot() chatgpt
 	executor.mu.Lock()
 	defer executor.mu.Unlock()
 	return executor.snapshot
+}
+
+func (executor *accountInfoControllerTestExecutor) AccountInfoDiagnosticsSnapshot() chatgptwebauth.AccountInfoDiagnosticsSnapshot {
+	executor.mu.Lock()
+	defer executor.mu.Unlock()
+	return executor.diagnostics
+}
+
+func (executor *accountInfoControllerTestExecutor) ClearAccountInfoDiagnostics() chatgptwebauth.AccountInfoDiagnosticsSnapshot {
+	executor.mu.Lock()
+	defer executor.mu.Unlock()
+	executor.diagnostics.UniqueCount = 0
+	executor.diagnostics.TotalCount = 0
+	executor.diagnostics.EvictedCount = 0
+	executor.diagnostics.Records = nil
+	return executor.diagnostics
 }
 
 func (executor *accountInfoControllerTestExecutor) AccountInfoAuthState(authID string) chatgptwebauth.AccountInfoAuthRuntimeState {
@@ -132,7 +149,7 @@ func TestGetChatGPTWebAccountInfoReturnsDefaultsAndRuntime(t *testing.T) {
 	if errDecode := json.Unmarshal(recorder.Body.Bytes(), &response); errDecode != nil {
 		t.Fatalf("decode response: %v", errDecode)
 	}
-	if !response.Config.AutoRefreshEnabled ||
+	if !response.Config.AutoRefreshEnabled || response.Config.DiagnosticsEnabled ||
 		response.Config.RefreshWorkers != 4 || response.Config.RefreshQueueSize != 256 ||
 		response.Config.RefreshTTLMinutes != 15 || response.Config.PeriodicRefreshMinutes != 0 ||
 		response.Config.RecoveryJitterSeconds != 30 ||
@@ -142,6 +159,49 @@ func TestGetChatGPTWebAccountInfoReturnsDefaultsAndRuntime(t *testing.T) {
 	if response.Runtime.Busy != 2 || response.Runtime.Queued != 3 ||
 		response.Runtime.Scheduled != 4 || response.Runtime.RefreshCount != 7 {
 		t.Fatalf("runtime = %+v", response.Runtime)
+	}
+}
+
+func TestGetAndClearChatGPTWebAccountInfoDiagnostics(t *testing.T) {
+	executor := &accountInfoControllerTestExecutor{diagnostics: chatgptwebauth.AccountInfoDiagnosticsSnapshot{
+		Enabled:      true,
+		Capacity:     chatgptwebauth.AccountInfoDiagnosticsCapacity,
+		UniqueCount:  1,
+		TotalCount:   3,
+		EvictedCount: 2,
+		Records: []chatgptwebauth.AccountInfoDiagnosticRecord{{
+			ID: "diagnostic", Phase: "quota", Stage: "parse", Reason: "quota_remaining_invalid", Count: 3,
+		}},
+	}}
+	manager := coreauth.NewManager(nil, nil, nil)
+	manager.RegisterExecutor(executor)
+	handler := &Handler{cfg: &config.Config{}, authManager: manager}
+
+	ctx, recorder := newChatGPTWebAccountInfoRequest(http.MethodGet, "")
+	handler.GetChatGPTWebAccountInfoDiagnostics(ctx)
+	if recorder.Code != http.StatusOK || recorder.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("GET status = %d cache-control = %q body = %s", recorder.Code, recorder.Header().Get("Cache-Control"), recorder.Body.String())
+	}
+	var before chatgptwebauth.AccountInfoDiagnosticsSnapshot
+	if errDecode := json.Unmarshal(recorder.Body.Bytes(), &before); errDecode != nil {
+		t.Fatalf("decode GET diagnostics: %v", errDecode)
+	}
+	if before.UniqueCount != 1 || before.TotalCount != 3 || before.EvictedCount != 2 || len(before.Records) != 1 {
+		t.Fatalf("GET diagnostics = %+v", before)
+	}
+
+	ctx, recorder = newChatGPTWebAccountInfoRequest(http.MethodDelete, "")
+	handler.ClearChatGPTWebAccountInfoDiagnostics(ctx)
+	if recorder.Code != http.StatusOK || recorder.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("DELETE status = %d cache-control = %q body = %s", recorder.Code, recorder.Header().Get("Cache-Control"), recorder.Body.String())
+	}
+	var after chatgptwebauth.AccountInfoDiagnosticsSnapshot
+	if errDecode := json.Unmarshal(recorder.Body.Bytes(), &after); errDecode != nil {
+		t.Fatalf("decode DELETE diagnostics: %v", errDecode)
+	}
+	if !after.Enabled || after.Capacity != chatgptwebauth.AccountInfoDiagnosticsCapacity ||
+		after.UniqueCount != 0 || after.TotalCount != 0 || after.EvictedCount != 0 || len(after.Records) != 0 {
+		t.Fatalf("cleared diagnostics = %+v", after)
 	}
 }
 
@@ -164,14 +224,14 @@ func TestPatchAndStartChatGPTWebAccountInfoRefresh(t *testing.T) {
 
 	ctx, recorder := newChatGPTWebAccountInfoRequest(
 		http.MethodPatch,
-		`{"auto-refresh-enabled":false,"refresh-workers":6,"periodic-refresh-minutes":60,"max-retries":1}`,
+		`{"auto-refresh-enabled":false,"diagnostics-enabled":true,"refresh-workers":6,"periodic-refresh-minutes":60,"max-retries":1}`,
 	)
 	handler.PatchChatGPTWebAccountInfo(ctx)
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("PATCH status = %d: %s", recorder.Code, recorder.Body.String())
 	}
 	resolved := handler.cfg.ChatGPTWeb.AccountInfo.Resolved()
-	if resolved.AutoRefreshEnabled ||
+	if resolved.AutoRefreshEnabled || !resolved.DiagnosticsEnabled ||
 		resolved.RefreshWorkers != 6 || resolved.PeriodicRefreshMinutes != 60 ||
 		resolved.MaxRetries != 1 || resolved.RefreshQueueSize != 256 {
 		t.Fatalf("patched config = %+v", resolved)
@@ -221,6 +281,26 @@ func TestPutChatGPTWebAccountInfoAcceptsLegacyPayloadWithoutAutoRefresh(t *testi
 	if resolved.PeriodicRefreshMinutes != 0 {
 		t.Fatalf("legacy PUT periodic refresh = %d, want disabled", resolved.PeriodicRefreshMinutes)
 	}
+	if resolved.DiagnosticsEnabled {
+		t.Fatal("legacy PUT enabled diagnostics")
+	}
+}
+
+func TestPatchChatGPTWebAccountInfoRejectsNullDiagnostics(t *testing.T) {
+	manager := coreauth.NewManager(nil, nil, nil)
+	manager.RegisterExecutor(&accountInfoControllerTestExecutor{})
+	handler := &Handler{cfg: &config.Config{}, authManager: manager}
+	ctx, recorder := newChatGPTWebAccountInfoRequest(
+		http.MethodPatch,
+		`{"diagnostics-enabled":null}`,
+	)
+
+	handler.PatchChatGPTWebAccountInfo(ctx)
+
+	if recorder.Code != http.StatusBadRequest ||
+		!strings.Contains(recorder.Body.String(), "invalid diagnostics-enabled") {
+		t.Fatalf("status = %d body = %s", recorder.Code, recorder.Body.String())
+	}
 }
 
 func TestPatchChatGPTWebAccountInfoRejectsNullPeriodicRefresh(t *testing.T) {
@@ -240,21 +320,25 @@ func TestPatchChatGPTWebAccountInfoRejectsNullPeriodicRefresh(t *testing.T) {
 	}
 }
 
-func TestPatchChatGPTWebAccountInfoRollsBackPeriodicRefreshOnPersistFailure(t *testing.T) {
+func TestPatchChatGPTWebAccountInfoRollsBackOnPersistFailure(t *testing.T) {
 	periodic := 15
+	diagnostics := false
 	manager := coreauth.NewManager(nil, nil, nil)
 	executor := &accountInfoControllerTestExecutor{}
 	manager.RegisterExecutor(executor)
 	handler := &Handler{
 		cfg: &config.Config{ChatGPTWeb: config.ChatGPTWebConfig{
-			AccountInfo: config.ChatGPTWebAccountInfoConfig{PeriodicRefreshMinutes: &periodic},
+			AccountInfo: config.ChatGPTWebAccountInfoConfig{
+				DiagnosticsEnabled:     &diagnostics,
+				PeriodicRefreshMinutes: &periodic,
+			},
 		}},
 		configFilePath: filepath.Join(t.TempDir(), "missing", "config.yaml"),
 		authManager:    manager,
 	}
 	ctx, recorder := newChatGPTWebAccountInfoRequest(
 		http.MethodPatch,
-		`{"periodic-refresh-minutes":60}`,
+		`{"diagnostics-enabled":true,"periodic-refresh-minutes":60}`,
 	)
 
 	handler.PatchChatGPTWebAccountInfo(ctx)
@@ -264,6 +348,9 @@ func TestPatchChatGPTWebAccountInfoRollsBackPeriodicRefreshOnPersistFailure(t *t
 	}
 	if got := handler.cfg.ChatGPTWeb.AccountInfo.Resolved().PeriodicRefreshMinutes; got != periodic {
 		t.Fatalf("periodic refresh after persistence failure = %d, want %d", got, periodic)
+	}
+	if handler.cfg.ChatGPTWeb.AccountInfo.Resolved().DiagnosticsEnabled {
+		t.Fatal("diagnostics remained enabled after persistence failure")
 	}
 	executor.mu.Lock()
 	updates := executor.updates
@@ -569,7 +656,7 @@ func TestChatGPTWebQuotaCooldownSummaryIsModelScopedAndDoesNotAutoRecover(t *tes
 		Metadata: map[string]any{
 			"lifecycle_state":       coreauth.LifecycleStateActive,
 			"quota_state":           string(chatgptwebauth.QuotaStateExhausted),
-			"image_quota_remaining": 0,
+			"image_quota_remaining": -2,
 			"image_quota_reset_at":  now.Add(-time.Minute).Format(time.RFC3339Nano),
 		},
 	}
@@ -581,6 +668,9 @@ func TestChatGPTWebQuotaCooldownSummaryIsModelScopedAndDoesNotAutoRecover(t *tes
 	if entry["cooldown_active"] != true || entry["cooldown_scope"] != "model" ||
 		entry["cooldown_model_count"] != 1 {
 		t.Fatalf("quota cooldown summary = %+v", entry)
+	}
+	if entry["image_quota_remaining"] != -2 {
+		t.Fatalf("image quota remaining = %#v, want -2", entry["image_quota_remaining"])
 	}
 	if _, exists := entry["cooldown_until"]; exists {
 		t.Fatalf("past reset time was exposed as active cooldown deadline: %+v", entry)

@@ -121,6 +121,9 @@ chatgpt-web:
     # Disable event-triggered account/profile and image quota refreshes.
     # Manual force refreshes remain available; TTL only controls reuse after a refresh is triggered.
     auto-refresh-enabled: true
+    # Keep up to 100 de-duplicated, safe account-info failures in memory.
+    # Response bodies, credentials, cookies, account identity, and proxy URLs are never retained.
+    diagnostics-enabled: false
     # Bounded workers refresh account plan and image quota only when requested,
     # when a quota recovery is due, or after an image quota error.
     refresh-workers: 4

@@ -10,6 +10,7 @@ import (
 func TestChatGPTWebAccountInfoConfigDefaults(t *testing.T) {
 	resolved := (ChatGPTWebAccountInfoConfig{}).Resolved()
 	if !resolved.AutoRefreshEnabled ||
+		resolved.DiagnosticsEnabled ||
 		resolved.RefreshWorkers != 4 || resolved.RefreshQueueSize != 256 ||
 		resolved.RefreshTTLMinutes != 15 || resolved.PeriodicRefreshMinutes != 0 ||
 		resolved.RecoveryJitterSeconds != 30 ||
@@ -59,7 +60,7 @@ func TestChatGPTWebAccountInfoConfigValidation(t *testing.T) {
 
 func TestLoadAndSaveChatGPTWebAccountInfoConfig(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.yaml")
-	data := []byte("chatgpt-web:\n  force-session-refresh-on-import: false\n  account-info:\n    auto-refresh-enabled: false\n    refresh-workers: 2\n    refresh-queue-size: 0\n    refresh-ttl-minutes: 30\n    periodic-refresh-minutes: 0\n    recovery-jitter-seconds: 0\n    max-retries: 0\n")
+	data := []byte("chatgpt-web:\n  force-session-refresh-on-import: false\n  account-info:\n    auto-refresh-enabled: false\n    diagnostics-enabled: true\n    refresh-workers: 2\n    refresh-queue-size: 0\n    refresh-ttl-minutes: 30\n    periodic-refresh-minutes: 0\n    recovery-jitter-seconds: 0\n    max-retries: 0\n")
 	if err := os.WriteFile(path, data, 0o600); err != nil {
 		t.Fatalf("write config: %v", err)
 	}
@@ -68,7 +69,7 @@ func TestLoadAndSaveChatGPTWebAccountInfoConfig(t *testing.T) {
 		t.Fatalf("LoadConfig() error = %v", errLoad)
 	}
 	resolved := cfg.ChatGPTWeb.AccountInfo.Resolved()
-	if resolved.AutoRefreshEnabled ||
+	if resolved.AutoRefreshEnabled || !resolved.DiagnosticsEnabled ||
 		resolved.RefreshWorkers != 2 || resolved.RefreshQueueSize != 0 ||
 		resolved.RefreshTTLMinutes != 30 || resolved.PeriodicRefreshMinutes != 0 ||
 		resolved.RecoveryJitterSeconds != 0 ||
@@ -89,6 +90,7 @@ func TestLoadAndSaveChatGPTWebAccountInfoConfig(t *testing.T) {
 		"force-session-refresh-on-import: false",
 		"account-info:",
 		"auto-refresh-enabled: false",
+		"diagnostics-enabled: true",
 		"refresh-queue-size: 0",
 		"periodic-refresh-minutes: 0",
 		"recovery-jitter-seconds: 0",
@@ -109,6 +111,7 @@ func TestLoadConfigRejectsInvalidChatGPTWebAccountInfoFields(t *testing.T) {
 		{name: "unknown", yaml: "chatgpt-web:\n  account-info:\n    refresh-worker: 4\n", want: "refresh-worker"},
 		{name: "null", yaml: "chatgpt-web:\n  account-info:\n    refresh-workers: null\n", want: "refresh-workers"},
 		{name: "null auto refresh", yaml: "chatgpt-web:\n  account-info:\n    auto-refresh-enabled: null\n", want: "auto-refresh-enabled"},
+		{name: "null diagnostics", yaml: "chatgpt-web:\n  account-info:\n    diagnostics-enabled: null\n", want: "diagnostics-enabled"},
 		{name: "null periodic refresh", yaml: "chatgpt-web:\n  account-info:\n    periodic-refresh-minutes: null\n", want: "periodic-refresh-minutes"},
 		{name: "out of range", yaml: "chatgpt-web:\n  account-info:\n    max-retries: 11\n", want: "max-retries"},
 		{name: "periodic refresh out of range", yaml: "chatgpt-web:\n  account-info:\n    periodic-refresh-minutes: 10081\n", want: "periodic-refresh-minutes"},

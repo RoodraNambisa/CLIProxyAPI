@@ -1,20 +1,25 @@
 package executor
 
 import (
+	"bytes"
 	"container/heap"
 	"context"
 	"crypto/rand"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"reflect"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	fhttp "github.com/bogdanfinn/fhttp"
 	"github.com/google/uuid"
 	chatgptwebauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/chatgptweb"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
@@ -214,6 +219,13 @@ type chatGPTWebAccountInfoCall struct {
 
 type chatGPTWebAccountInfoPersistenceContextKey struct{}
 
+type chatGPTWebAccountInfoDiagnosticContextKey struct{}
+
+type chatGPTWebAccountInfoDiagnosticContext struct {
+	authIndex string
+	attempt   int
+}
+
 type chatGPTWebAccountInfoScheduleHeap []*chatGPTWebAccountInfoSchedule
 
 func (call *chatGPTWebAccountInfoCall) key() string {
@@ -254,7 +266,8 @@ func (h *chatGPTWebAccountInfoScheduleHeap) Pop() any {
 }
 
 type chatGPTWebAccountInfoRuntime struct {
-	executor *ChatGPTWebExecutor
+	executor    *ChatGPTWebExecutor
+	diagnostics *helps.ChatGPTWebAccountInfoDiagnostics
 
 	mu                         sync.Mutex
 	cond                       *sync.Cond
@@ -311,8 +324,10 @@ type chatGPTWebAccountInfoRuntime struct {
 
 func newChatGPTWebAccountInfoRuntime(executor *ChatGPTWebExecutor, cfg *config.Config) *chatGPTWebAccountInfoRuntime {
 	ctx, cancel := context.WithCancel(context.Background())
+	resolved := accountInfoConfigSnapshot(cfg)
 	runtime := &chatGPTWebAccountInfoRuntime{
 		executor:                   executor,
+		diagnostics:                helps.NewChatGPTWebAccountInfoDiagnostics(resolved.DiagnosticsEnabled),
 		tasks:                      make(map[string]*chatGPTWebAccountInfoTaskState),
 		states:                     make(map[string]chatgptwebauth.AccountInfoAuthRuntimeState),
 		queuedByTarget:             make(map[string]int),
@@ -338,7 +353,7 @@ func newChatGPTWebAccountInfoRuntime(executor *ChatGPTWebExecutor, cfg *config.C
 		random:                     rand.Reader,
 	}
 	runtime.cond = sync.NewCond(&runtime.mu)
-	runtime.cfg = accountInfoConfigSnapshot(cfg)
+	runtime.cfg = resolved
 	return runtime
 }
 
@@ -410,6 +425,347 @@ func clampChatGPTWebAccountInfoValue(value, minimum, maximum int) int {
 		return maximum
 	}
 	return value
+}
+
+func withChatGPTWebAccountInfoDiagnosticContext(
+	ctx context.Context,
+	authIndex string,
+	attempt int,
+) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	diagnostic, _ := ctx.Value(chatGPTWebAccountInfoDiagnosticContextKey{}).(chatGPTWebAccountInfoDiagnosticContext)
+	if trimmed := strings.TrimSpace(authIndex); trimmed != "" {
+		diagnostic.authIndex = trimmed
+	}
+	if attempt > 0 {
+		diagnostic.attempt = attempt
+	}
+	return context.WithValue(ctx, chatGPTWebAccountInfoDiagnosticContextKey{}, diagnostic)
+}
+
+func (e *ChatGPTWebExecutor) recordChatGPTWebAccountInfoDiagnostic(
+	ctx context.Context,
+	phase string,
+	stage string,
+	response *fhttp.Response,
+	payload []byte,
+	err error,
+) {
+	if e == nil || e.accountInfo == nil || e.accountInfo.diagnostics == nil ||
+		!e.accountInfo.diagnostics.Enabled() {
+		return
+	}
+	event := e.chatGPTWebAccountInfoDiagnosticEvent(ctx, phase, stage, response, payload, err)
+	e.accountInfo.diagnostics.Record(event)
+}
+
+func (e *ChatGPTWebExecutor) chatGPTWebAccountInfoDiagnosticEvent(
+	ctx context.Context,
+	phase string,
+	stage string,
+	response *fhttp.Response,
+	payload []byte,
+	err error,
+) chatgptwebauth.AccountInfoDiagnosticEvent {
+	event := chatgptwebauth.AccountInfoDiagnosticEvent{
+		OccurredAt: e.currentTime().UTC(),
+		Phase:      strings.TrimSpace(phase),
+		Stage:      strings.TrimSpace(stage),
+	}
+	if ctx != nil {
+		diagnostic, _ := ctx.Value(chatGPTWebAccountInfoDiagnosticContextKey{}).(chatGPTWebAccountInfoDiagnosticContext)
+		event.AuthIndex = diagnostic.authIndex
+		event.Attempt = diagnostic.attempt
+	}
+	if response != nil {
+		event.HTTPStatus = response.StatusCode
+		event.ContentType = safeChatGPTWebAccountInfoContentType(response.Header.Get("content-type"))
+		event.ContentLength = max(0, response.ContentLength)
+		event.Cloudflare = strings.TrimSpace(response.Header.Get("cf-ray")) != "" ||
+			strings.Contains(strings.ToLower(response.Header.Get("server")), "cloudflare")
+	} else if err != nil {
+		var status interface{ StatusCode() int }
+		if errors.As(err, &status) {
+			event.HTTPStatus = status.StatusCode()
+		}
+	}
+	chatGPTWebAccountInfoBodyDiagnosticEvent(payload, &event)
+	if err != nil {
+		event.ErrorType = safeChatGPTWebAccountInfoDiagnosticErrorType(err)
+		errorCode, _ := classifyChatGPTWebAccountInfoError(err)
+		event.Reason = safeChatGPTWebAccountInfoDiagnosticReason(err)
+		if event.Reason == "" {
+			event.Reason = safeChatGPTWebAccountInfoDiagnosticCode(errorCode)
+		}
+	}
+	if event.Reason == "" {
+		event.Reason = safeChatGPTWebAccountInfoDiagnosticCode(event.Stage + "_failed")
+	}
+	return event
+}
+
+func safeChatGPTWebAccountInfoContentType(value string) string {
+	value = strings.ToLower(strings.TrimSpace(strings.SplitN(value, ";", 2)[0]))
+	if value == "" {
+		return "unknown"
+	}
+	if len(value) > 80 {
+		return "other"
+	}
+	for _, character := range value {
+		if (character >= 'a' && character <= 'z') ||
+			(character >= '0' && character <= '9') ||
+			strings.ContainsRune("/+.-", character) {
+			continue
+		}
+		return "other"
+	}
+	return value
+}
+
+func chatGPTWebAccountInfoBodyDiagnosticEvent(payload []byte, event *chatgptwebauth.AccountInfoDiagnosticEvent) {
+	if event == nil {
+		return
+	}
+	event.ResponseBytes = len(payload)
+	trimmed := bytes.TrimSpace(payload)
+	if len(trimmed) == 0 {
+		event.BodyKind = "empty"
+		return
+	}
+	var document map[string]json.RawMessage
+	if errDecode := json.Unmarshal(trimmed, &document); errDecode != nil {
+		lower := bytes.ToLower(trimmed)
+		if bytes.HasPrefix(lower, []byte("<!doctype html")) || bytes.HasPrefix(lower, []byte("<html")) {
+			event.BodyKind = "html"
+		} else if trimmed[0] == '[' {
+			event.BodyKind = "json_array"
+		} else {
+			event.BodyKind = "non_json"
+		}
+		return
+	}
+	event.BodyKind = "json_object"
+	if raw, ok := document["accounts"]; ok {
+		event.AccountsKind = chatGPTWebAccountInfoJSONKind(raw)
+	}
+	if raw, ok := document["limits_progress"]; ok {
+		event.LimitsProgressKind = chatGPTWebAccountInfoJSONKind(raw)
+		var limits []map[string]json.RawMessage
+		if errLimits := json.Unmarshal(raw, &limits); errLimits == nil {
+			event.LimitsProgressCount = len(limits)
+			featurePresent := false
+			event.ImageQuotaFeaturePresent = &featurePresent
+			for _, limit := range limits {
+				var featureName string
+				if errFeature := json.Unmarshal(limit["feature_name"], &featureName); errFeature != nil ||
+					!strings.EqualFold(strings.TrimSpace(featureName), "image_gen") {
+					continue
+				}
+				featurePresent = true
+				event.ImageQuotaFeaturePresent = &featurePresent
+				event.ImageQuotaRemainingKind = chatGPTWebAccountInfoJSONKind(limit["remaining"])
+				if remaining, okRemaining := chatGPTWebAccountInfoDiagnosticInteger(limit["remaining"]); okRemaining {
+					event.ImageQuotaRemaining = &remaining
+				}
+				event.ImageQuotaResetAfter = safeChatGPTWebAccountInfoDiagnosticResetAfter(limit["reset_after"])
+				break
+			}
+		}
+	}
+	if raw, ok := document["error"]; ok {
+		event.ErrorEnvelopeKind = chatGPTWebAccountInfoJSONKind(raw)
+		var envelope struct {
+			Code json.RawMessage `json:"code"`
+		}
+		if errEnvelope := json.Unmarshal(raw, &envelope); errEnvelope == nil {
+			var code string
+			if errCode := json.Unmarshal(envelope.Code, &code); errCode == nil {
+				if safeCode := safeChatGPTWebAccountInfoDiagnosticUpstreamCode(code); safeCode != "" {
+					event.UpstreamErrorCode = safeCode
+				}
+			}
+		}
+	}
+	if event.UpstreamErrorCode == "" {
+		var code string
+		if errCode := json.Unmarshal(document["code"], &code); errCode == nil {
+			event.UpstreamErrorCode = safeChatGPTWebAccountInfoDiagnosticUpstreamCode(code)
+		}
+	}
+}
+
+func chatGPTWebAccountInfoJSONKind(raw json.RawMessage) string {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 {
+		return "missing"
+	}
+	switch trimmed[0] {
+	case '{':
+		return "object"
+	case '[':
+		return "array"
+	case '"':
+		return "string"
+	case 'n':
+		return "null"
+	case 't', 'f':
+		return "bool"
+	default:
+		return "number"
+	}
+}
+
+func chatGPTWebAccountInfoDiagnosticInteger(raw json.RawMessage) (int64, bool) {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 {
+		return 0, false
+	}
+	var number json.Number
+	if errNumber := json.Unmarshal(trimmed, &number); errNumber == nil {
+		value, errValue := strconv.ParseInt(number.String(), 10, 64)
+		return value, errValue == nil
+	}
+	var text string
+	if errText := json.Unmarshal(trimmed, &text); errText != nil {
+		return 0, false
+	}
+	value, errValue := strconv.ParseInt(strings.TrimSpace(text), 10, 64)
+	return value, errValue == nil
+}
+
+func safeChatGPTWebAccountInfoDiagnosticResetAfter(raw json.RawMessage) string {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return ""
+	}
+	var text string
+	if errText := json.Unmarshal(trimmed, &text); errText == nil {
+		text = strings.TrimSpace(text)
+		if parsed, errParse := time.Parse(time.RFC3339Nano, text); errParse == nil {
+			return parsed.UTC().Format(time.RFC3339Nano)
+		}
+		if parsed, errParse := time.Parse(time.RFC3339, text); errParse == nil {
+			return parsed.UTC().Format(time.RFC3339Nano)
+		}
+		seconds, errSeconds := strconv.ParseFloat(text, 64)
+		if errSeconds != nil {
+			return ""
+		}
+		return safeChatGPTWebAccountInfoDiagnosticUnixTime(seconds)
+	}
+	var number json.Number
+	if errNumber := json.Unmarshal(trimmed, &number); errNumber != nil {
+		return ""
+	}
+	seconds, errSeconds := strconv.ParseFloat(number.String(), 64)
+	if errSeconds != nil {
+		return ""
+	}
+	return safeChatGPTWebAccountInfoDiagnosticUnixTime(seconds)
+}
+
+func safeChatGPTWebAccountInfoDiagnosticUnixTime(seconds float64) string {
+	if math.IsNaN(seconds) || math.IsInf(seconds, 0) || seconds <= 0 {
+		return ""
+	}
+	if seconds >= 1e12 {
+		seconds /= 1000
+	}
+	whole, fraction := math.Modf(seconds)
+	if whole <= 0 || whole > float64(math.MaxInt64) {
+		return ""
+	}
+	parsed := time.Unix(int64(whole), int64(fraction*float64(time.Second))).UTC()
+	if parsed.Year() > 9999 {
+		return ""
+	}
+	return parsed.Format(time.RFC3339Nano)
+}
+
+func safeChatGPTWebAccountInfoDiagnosticCode(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" || len(value) > 80 {
+		return ""
+	}
+	for _, character := range value {
+		if (character >= 'a' && character <= 'z') ||
+			(character >= 'A' && character <= 'Z') ||
+			(character >= '0' && character <= '9') ||
+			strings.ContainsRune("._-", character) {
+			continue
+		}
+		return ""
+	}
+	return value
+}
+
+func safeChatGPTWebAccountInfoDiagnosticUpstreamCode(value string) string {
+	value = strings.ToLower(safeChatGPTWebAccountInfoDiagnosticCode(value))
+	switch value {
+	case "account_deactivated",
+		"authentication_error",
+		"authorization_completion_required",
+		"cloudflare_challenge",
+		"credential_unavailable",
+		"identity_mismatch",
+		"internal_server_error",
+		"invalid_grant",
+		"invalid_response",
+		"invalid_token",
+		"rate_limit_exceeded",
+		"rate_limited",
+		"refresh_failed",
+		"server_error",
+		"service_unavailable",
+		"temporarily_unavailable",
+		"token_expired",
+		"unauthorized",
+		"upstream_unavailable":
+		return value
+	default:
+		return ""
+	}
+}
+
+func safeChatGPTWebAccountInfoDiagnosticErrorType(err error) string {
+	if err == nil {
+		return ""
+	}
+	value := fmt.Sprintf("%T", err)
+	if len(value) > 160 {
+		return "error"
+	}
+	return value
+}
+
+func safeChatGPTWebAccountInfoDiagnosticReason(err error) string {
+	if err == nil {
+		return ""
+	}
+	message := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(message, "image quota remaining is missing"):
+		return "quota_remaining_missing"
+	case strings.Contains(message, "image quota remaining is invalid"):
+		return "quota_remaining_invalid"
+	case strings.Contains(message, "image quota reset_after is invalid"):
+		return "quota_reset_invalid"
+	case strings.Contains(message, "image quota is missing from conversation init"):
+		return "quota_feature_missing"
+	case strings.Contains(message, "decode conversation limits"):
+		return "quota_json_invalid"
+	case strings.Contains(message, "decode account profile"):
+		return "profile_json_invalid"
+	case strings.Contains(message, "account profile identity mismatch"):
+		return "profile_identity_mismatch"
+	case strings.Contains(message, "account profile"):
+		return "profile_structure_invalid"
+	default:
+		return ""
+	}
 }
 
 func chatGPTWebAccountInfoAuthInstanceKey(authID, authInstanceID string) string {
@@ -518,6 +874,9 @@ func (runtime *chatGPTWebAccountInfoRuntime) updateConfig(cfg *config.Config) {
 		return
 	}
 	resolved := accountInfoConfigSnapshot(cfg)
+	if runtime.diagnostics != nil {
+		runtime.diagnostics.SetEnabled(resolved.DiagnosticsEnabled)
+	}
 	runtime.mu.Lock()
 	if runtime.closed {
 		runtime.mu.Unlock()
@@ -1365,8 +1724,12 @@ func (runtime *chatGPTWebAccountInfoRuntime) runAccountInfoCall(call *chatGPTWeb
 			runtime.mu.Unlock()
 		}
 	}
+	runtime.mu.Lock()
+	attempt := call.retryAttempt
+	runtime.mu.Unlock()
+	callContext := withChatGPTWebAccountInfoDiagnosticContext(call.ctx, "", attempt)
 	outcome := runtime.executor.refreshChatGPTWebAccountInfoForInstance(
-		call.ctx,
+		callContext,
 		call.authID,
 		call.authInstanceID,
 		true,
@@ -3356,6 +3719,22 @@ func (e *ChatGPTWebExecutor) AccountInfoSnapshot() chatgptwebauth.AccountInfoRun
 	return e.accountInfo.snapshot()
 }
 
+// AccountInfoDiagnosticsSnapshot returns the bounded in-memory failures.
+func (e *ChatGPTWebExecutor) AccountInfoDiagnosticsSnapshot() chatgptwebauth.AccountInfoDiagnosticsSnapshot {
+	if e == nil || e.accountInfo == nil || e.accountInfo.diagnostics == nil {
+		return chatgptwebauth.AccountInfoDiagnosticsSnapshot{Capacity: chatgptwebauth.AccountInfoDiagnosticsCapacity}
+	}
+	return e.accountInfo.diagnostics.Snapshot()
+}
+
+// ClearAccountInfoDiagnostics removes all in-memory failures.
+func (e *ChatGPTWebExecutor) ClearAccountInfoDiagnostics() chatgptwebauth.AccountInfoDiagnosticsSnapshot {
+	if e == nil || e.accountInfo == nil || e.accountInfo.diagnostics == nil {
+		return chatgptwebauth.AccountInfoDiagnosticsSnapshot{Capacity: chatgptwebauth.AccountInfoDiagnosticsCapacity}
+	}
+	return e.accountInfo.diagnostics.Clear()
+}
+
 // HasPassiveAuthInstanceState reports account-info state created outside request execution.
 func (e *ChatGPTWebExecutor) HasPassiveAuthInstanceState(authID string, authInstanceID string) bool {
 	return e != nil && e.accountInfo != nil && e.accountInfo.hasPassiveAuthState(authID, authInstanceID)
@@ -3454,6 +3833,7 @@ func (e *ChatGPTWebExecutor) refreshChatGPTWebAccountInfoForInstance(
 		outcome.errorCode = "credential_unavailable"
 		return outcome
 	}
+	ctx = withChatGPTWebAccountInfoDiagnosticContext(ctx, auth.Index, 0)
 	credential, errCredential := chatgptwebauth.ParseCredential(auth.Metadata)
 	if errCredential != nil || !auth.LifecycleRefreshable() {
 		outcome.errorCode = "credential_unavailable"
@@ -3525,6 +3905,7 @@ func (e *ChatGPTWebExecutor) refreshChatGPTWebAccountInfoForInstance(
 	if quotaErr == nil && !quota.FeaturePresent && credential != nil &&
 		credential.QuotaState != chatgptwebauth.QuotaStateUnknown {
 		quotaErr = errors.New("image quota is missing from conversation init")
+		e.recordChatGPTWebAccountInfoDiagnostic(ctx, "quota", "missing_feature", nil, nil, quotaErr)
 	}
 
 	now := e.currentTime().UTC()
@@ -3818,18 +4199,22 @@ func (e *ChatGPTWebExecutor) fetchChatGPTWebAccountInfoPair(
 			chatGPTWebAccountInfoMaxRedirects,
 		)
 		if errRequest != nil {
+			e.recordChatGPTWebAccountInfoDiagnostic(ctx, "profile", "request", nil, nil, errRequest)
 			profileResults <- profileResult{err: errRequest}
 			return
 		}
 		payload, errRead := readChatGPTWebResponseBody(response, chatGPTWebAccountInfoMaxBodyBytes)
 		if errRead != nil {
+			e.recordChatGPTWebAccountInfoDiagnostic(ctx, "profile", "response_body", response, payload, errRead)
 			profileResults <- profileResult{err: errRead}
 			return
 		}
 		helps.RecordAPIResponseMetadata(ctx, e.configSnapshot(), response.StatusCode, chatGPTWebResponseLogHeaders(response.Header))
 		helps.AppendAPIResponseChunk(ctx, e.configSnapshot(), chatGPTWebResponseLogBody(path, payload))
 		if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
-			profileResults <- profileResult{err: newChatGPTWebStatusError(response.StatusCode, path, payload, response.Header)}
+			errStatus := newChatGPTWebStatusError(response.StatusCode, path, payload, response.Header)
+			e.recordChatGPTWebAccountInfoDiagnostic(ctx, "profile", "http_status", response, payload, errStatus)
+			profileResults <- profileResult{err: errStatus}
 			return
 		}
 		preferredAccountID := credential.AccountID
@@ -3837,6 +4222,9 @@ func (e *ChatGPTWebExecutor) fetchChatGPTWebAccountInfoPair(
 			preferredAccountID = ""
 		}
 		profile, errParse := chatgptwebauth.ParseAccountProfileForAccount(payload, preferredAccountID)
+		if errParse != nil {
+			e.recordChatGPTWebAccountInfoDiagnostic(ctx, "profile", "parse", response, payload, errParse)
+		}
 		profileResults <- profileResult{profile: profile, err: errParse}
 	}()
 	go func() {
@@ -3854,6 +4242,15 @@ func (e *ChatGPTWebExecutor) fetchChatGPTWebAccountInfoPair(
 			"system_hints":            []string{"picture_v2"},
 		}, chatGPTWebAccountInfoMaxBodyBytes)
 		if errRequest != nil {
+			stage := "request"
+			if response != nil {
+				if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
+					stage = "http_status"
+				} else {
+					stage = "response_body"
+				}
+			}
+			e.recordChatGPTWebAccountInfoDiagnostic(ctx, "quota", stage, response, payload, errRequest)
 			quotaResults <- quotaResult{err: errRequest}
 			return
 		}
@@ -3862,6 +4259,9 @@ func (e *ChatGPTWebExecutor) fetchChatGPTWebAccountInfoPair(
 			return
 		}
 		quota, errParse := chatgptwebauth.ParseImageQuota(payload)
+		if errParse != nil {
+			e.recordChatGPTWebAccountInfoDiagnostic(ctx, "quota", "parse", response, payload, errParse)
+		}
 		quotaResults <- quotaResult{quota: quota, err: errParse}
 	}()
 

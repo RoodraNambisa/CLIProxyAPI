@@ -190,6 +190,8 @@ func TestChatGPTWebManagementRoutesAreRegistered(t *testing.T) {
 		http.MethodGet + " /v0/management/chatgpt-web/account-info":                      false,
 		http.MethodPut + " /v0/management/chatgpt-web/account-info":                      false,
 		http.MethodPatch + " /v0/management/chatgpt-web/account-info":                    false,
+		http.MethodGet + " /v0/management/chatgpt-web/account-info/diagnostics":          false,
+		http.MethodDelete + " /v0/management/chatgpt-web/account-info/diagnostics":       false,
 		http.MethodPost + " /v0/management/chatgpt-web/account-info/refresh-tasks":       false,
 		http.MethodGet + " /v0/management/chatgpt-web/account-info/refresh-tasks/:id":    false,
 		http.MethodDelete + " /v0/management/chatgpt-web/account-info/refresh-tasks/:id": false,

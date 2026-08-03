@@ -778,6 +778,8 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.GET("/chatgpt-web/account-info", s.mgmt.GetChatGPTWebAccountInfo)
 		mgmt.PUT("/chatgpt-web/account-info", s.mgmt.PutChatGPTWebAccountInfo)
 		mgmt.PATCH("/chatgpt-web/account-info", s.mgmt.PatchChatGPTWebAccountInfo)
+		mgmt.GET("/chatgpt-web/account-info/diagnostics", s.mgmt.GetChatGPTWebAccountInfoDiagnostics)
+		mgmt.DELETE("/chatgpt-web/account-info/diagnostics", s.mgmt.ClearChatGPTWebAccountInfoDiagnostics)
 		mgmt.POST("/chatgpt-web/account-info/refresh-tasks", s.mgmt.StartChatGPTWebAccountInfoRefreshTask)
 		mgmt.GET("/chatgpt-web/account-info/refresh-tasks/:id", s.mgmt.GetChatGPTWebAccountInfoRefreshTask)
 		mgmt.DELETE("/chatgpt-web/account-info/refresh-tasks/:id", s.mgmt.CancelChatGPTWebAccountInfoRefreshTask)

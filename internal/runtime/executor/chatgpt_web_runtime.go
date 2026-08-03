@@ -1477,7 +1477,7 @@ func (e *ChatGPTWebExecutor) doChatGPTWebJSONWithHeadersAndMaxBody(ctx context.C
 	sanitizedData := chatGPTWebResponseLogBody(path, data)
 	helps.AppendAPIResponseChunk(ctx, e.configSnapshot(), sanitizedData)
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		return response, nil, newChatGPTWebStatusError(response.StatusCode, path, data, response.Header)
+		return response, data, newChatGPTWebStatusError(response.StatusCode, path, data, response.Header)
 	}
 	return response, data, nil
 }

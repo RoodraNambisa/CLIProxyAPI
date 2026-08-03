@@ -1307,9 +1307,12 @@ func TestChatGPTWebBufferedErrorBodiesAreBounded(t *testing.T) {
 	}
 	defer client.CloseIdleConnections()
 
-	_, _, err = executor.doChatGPTWebJSON(context.Background(), client, credential, "/backend-api/json", map[string]any{"input": "hello"})
+	_, payload, err := executor.doChatGPTWebJSON(context.Background(), client, credential, "/backend-api/json", map[string]any{"input": "hello"})
 	if err == nil || err.Error() != "<upstream-error-body-truncated>" {
 		t.Fatalf("JSON error = %v", err)
+	}
+	if string(payload) != "<upstream-error-body-truncated>" {
+		t.Fatalf("JSON error payload = %q", payload)
 	}
 	_, _, err = executor.doChatGPTWebGET(context.Background(), client, credential, "/backend-api/get", nil)
 	if err == nil || err.Error() != "<upstream-error-body-truncated>" {

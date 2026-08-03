@@ -107,6 +107,118 @@ func TestChatGPTWebAccountInfoRuntimeClampsUnvalidatedConfig(t *testing.T) {
 	}
 }
 
+func TestChatGPTWebAccountInfoDiagnosticsAreSafeAndDetailed(t *testing.T) {
+	enabled := true
+	executor := NewChatGPTWebExecutor(&config.Config{ChatGPTWeb: config.ChatGPTWebConfig{
+		AccountInfo: config.ChatGPTWebAccountInfoConfig{DiagnosticsEnabled: &enabled},
+	}}, nil)
+	t.Cleanup(func() { _ = executor.Close() })
+	payload := []byte(`{
+		"limits_progress":[{"feature_name":"image_gen","remaining":-1,"reset_after":"2026-08-03T13:23:29Z"}],
+		"error":{"code":"secret-token"},
+		"access_token":"secret-token",
+		"email":"person@example.com",
+		"cookie":"secret-cookie"
+	}`)
+	response := &fhttp.Response{
+		StatusCode:    http.StatusOK,
+		Header:        fhttp.Header{"Content-Type": {"application/json; charset=utf-8"}, "Cf-Ray": {"ray-id"}},
+		ContentLength: int64(len(payload)),
+	}
+	ctx := withChatGPTWebAccountInfoDiagnosticContext(context.Background(), "safe-auth-index", 3)
+	executor.recordChatGPTWebAccountInfoDiagnostic(
+		ctx,
+		"quota",
+		"parse",
+		response,
+		payload,
+		errors.New("image quota remaining is invalid"),
+	)
+	snapshot := executor.AccountInfoDiagnosticsSnapshot()
+	if !snapshot.Enabled || snapshot.UniqueCount != 1 || snapshot.TotalCount != 1 || len(snapshot.Records) != 1 {
+		t.Fatalf("diagnostics snapshot = %+v", snapshot)
+	}
+	record := snapshot.Records[0]
+	if record.LastAuthIndex != "safe-auth-index" || record.LastAttempt != 3 ||
+		record.HTTPStatus != http.StatusOK || record.ContentType != "application/json" ||
+		record.BodyKind != "json_object" || record.LimitsProgressCount != 1 ||
+		record.LastRemaining == nil || *record.LastRemaining != int64(-1) ||
+		record.ImageQuotaResetAfter != "2026-08-03T13:23:29Z" ||
+		record.Reason != "quota_remaining_invalid" || record.UpstreamErrorCode != "" || !record.Cloudflare {
+		t.Fatalf("diagnostic record = %#v", record)
+	}
+	encoded, errMarshal := json.Marshal(snapshot)
+	if errMarshal != nil {
+		t.Fatalf("marshal diagnostic fields: %v", errMarshal)
+	}
+	for _, secret := range []string{"secret-token", "person@example.com", "secret-cookie"} {
+		if bytes.Contains(encoded, []byte(secret)) {
+			t.Fatalf("diagnostics leaked %q: %s", secret, encoded)
+		}
+	}
+}
+
+func TestSafeChatGPTWebAccountInfoDiagnosticUpstreamCodeUsesAllowlist(t *testing.T) {
+	if got := safeChatGPTWebAccountInfoDiagnosticUpstreamCode("RATE_LIMIT_EXCEEDED"); got != "rate_limit_exceeded" {
+		t.Fatalf("safe upstream code = %q, want rate_limit_exceeded", got)
+	}
+	for _, value := range []string{"secret-token", "unknown_error", strings.Repeat("a", 40)} {
+		if got := safeChatGPTWebAccountInfoDiagnosticUpstreamCode(value); got != "" {
+			t.Fatalf("safe upstream code %q = %q, want empty", value, got)
+		}
+	}
+}
+
+func TestChatGPTWebAccountInfoDiagnosticsDefaultDisabledAndHotUpdated(t *testing.T) {
+	executor := NewChatGPTWebExecutor(&config.Config{}, nil)
+	t.Cleanup(func() { _ = executor.Close() })
+	executor.recordChatGPTWebAccountInfoDiagnostic(
+		context.Background(),
+		"quota",
+		"parse",
+		nil,
+		[]byte(`{"limits_progress":[]}`),
+		errors.New("image quota remaining is invalid"),
+	)
+	if snapshot := executor.AccountInfoDiagnosticsSnapshot(); snapshot.Enabled || snapshot.TotalCount != 0 {
+		t.Fatalf("disabled diagnostics = %+v", snapshot)
+	}
+	enabled := true
+	executor.UpdateConfig(&config.Config{ChatGPTWeb: config.ChatGPTWebConfig{
+		AccountInfo: config.ChatGPTWebAccountInfoConfig{DiagnosticsEnabled: &enabled},
+	}})
+	executor.recordChatGPTWebAccountInfoDiagnostic(
+		context.Background(),
+		"quota",
+		"parse",
+		nil,
+		[]byte(`{"limits_progress":[]}`),
+		errors.New("image quota remaining is invalid"),
+	)
+	if snapshot := executor.AccountInfoDiagnosticsSnapshot(); !snapshot.Enabled || snapshot.TotalCount != 1 {
+		t.Fatalf("enabled diagnostics = %+v", snapshot)
+	}
+}
+
+func TestSafeChatGPTWebAccountInfoDiagnosticResetAfter(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		raw  string
+		want string
+	}{
+		{name: "RFC3339", raw: `"2026-08-03T13:23:29Z"`, want: "2026-08-03T13:23:29Z"},
+		{name: "numeric string", raw: `"1785763409000"`, want: "2026-08-03T13:23:29Z"},
+		{name: "milliseconds", raw: `1785763409000`, want: "2026-08-03T13:23:29Z"},
+		{name: "invalid", raw: `"tomorrow"`, want: ""},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := safeChatGPTWebAccountInfoDiagnosticResetAfter(json.RawMessage(test.raw)); got != test.want {
+				t.Fatalf("reset_after = %q, want %q", got, test.want)
+			}
+		})
+	}
+}
+
 func TestChatGPTWebAccountInfoPeriodicScheduleLifecycle(t *testing.T) {
 	start := time.Date(2026, time.August, 2, 8, 0, 0, 0, time.UTC)
 	var clock atomic.Int64
@@ -627,7 +739,7 @@ func TestChatGPTWebAccountInfoReenableRestoresPersistedRecovery(t *testing.T) {
 	manager := cliproxyauth.NewManager(nil, nil, nil)
 	auth := chatGPTWebTestAuth("account-info-reenable-recovery")
 	auth.Metadata["quota_state"] = string(chatgptwebauth.QuotaStateExhausted)
-	auth.Metadata["image_quota_remaining"] = 0
+	auth.Metadata["image_quota_remaining"] = -1
 	auth.Metadata["image_quota_reset_at"] = time.Now().Add(time.Hour).Format(time.RFC3339Nano)
 	if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
 		t.Fatalf("register auth: %v", errRegister)
@@ -704,7 +816,7 @@ func TestChatGPTWebAccountInfoDisabledAutomaticRefreshRequiresManualRecovery(t *
 	auth := chatGPTWebTestAuth("disabled-reset-recovery")
 	auth.Metadata["account_id"] = "account-1"
 	auth.Metadata["quota_state"] = string(chatgptwebauth.QuotaStateExhausted)
-	auth.Metadata["image_quota_remaining"] = 0
+	auth.Metadata["image_quota_remaining"] = -2
 	auth.Metadata["image_quota_reset_at"] = time.Now().UTC().Add(-time.Minute).Format(time.RFC3339Nano)
 	auth.ModelStates = map[string]*cliproxyauth.ModelState{
 		chatgptwebauth.ImageModel: {
@@ -741,7 +853,7 @@ func TestChatGPTWebAccountInfoDisabledAutomaticRefreshRequiresManualRecovery(t *
 	current, _ := manager.GetByID(auth.ID)
 	credential, errCredential := chatgptwebauth.ParseCredential(current.Metadata)
 	if errCredential != nil || credential.ImageQuotaRemaining == nil ||
-		*credential.ImageQuotaRemaining != 0 || credential.QuotaState != chatgptwebauth.QuotaStateExhausted {
+		*credential.ImageQuotaRemaining != -2 || credential.QuotaState != chatgptwebauth.QuotaStateExhausted {
 		t.Fatalf("disabled automatic refresh changed exhausted quota: credential=%+v error=%v", credential, errCredential)
 	}
 
@@ -4918,6 +5030,9 @@ func TestChatGPTWebAccountInfoAuthoritativeQuotaOverridesEarlierImageQuotaResult
 	manager := cliproxyauth.NewManager(nil, nil, nil)
 	auth := chatGPTWebTestAuth("account-info-stale-quota")
 	auth.Metadata["account_id"] = "account-1"
+	auth.Metadata["image_quota_remaining"] = -2
+	auth.Metadata["quota_state"] = string(chatgptwebauth.QuotaStateExhausted)
+	auth.Metadata["image_quota_reset_at"] = time.Now().UTC().Add(time.Hour).Format(time.RFC3339Nano)
 	if _, errRegister := manager.Register(cliproxyauth.WithSkipPersist(context.Background()), auth); errRegister != nil {
 		t.Fatalf("register auth: %v", errRegister)
 	}

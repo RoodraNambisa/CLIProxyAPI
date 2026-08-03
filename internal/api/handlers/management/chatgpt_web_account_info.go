@@ -21,6 +21,8 @@ const (
 
 type chatGPTWebAccountInfoController interface {
 	AccountInfoSnapshot() chatgptwebauth.AccountInfoRuntimeSnapshot
+	AccountInfoDiagnosticsSnapshot() chatgptwebauth.AccountInfoDiagnosticsSnapshot
+	ClearAccountInfoDiagnostics() chatgptwebauth.AccountInfoDiagnosticsSnapshot
 	AccountInfoAuthState(string) chatgptwebauth.AccountInfoAuthRuntimeState
 	StartAccountInfoRefreshTask([]chatgptwebauth.AccountInfoRefreshTarget, bool) (*chatgptwebauth.AccountInfoRefreshTask, error)
 	AccountInfoRefreshTask(string) (*chatgptwebauth.AccountInfoRefreshTask, bool)
@@ -35,6 +37,7 @@ type chatGPTWebAccountInfoResponse struct {
 
 type chatGPTWebAccountInfoConfigRequest struct {
 	AutoRefreshEnabled     json.RawMessage `json:"auto-refresh-enabled"`
+	DiagnosticsEnabled     json.RawMessage `json:"diagnostics-enabled"`
 	RefreshWorkers         json.RawMessage `json:"refresh-workers"`
 	RefreshQueueSize       json.RawMessage `json:"refresh-queue-size"`
 	RefreshTTLMinutes      json.RawMessage `json:"refresh-ttl-minutes"`
@@ -78,6 +81,28 @@ func (h *Handler) PutChatGPTWebAccountInfo(c *gin.Context) {
 // PatchChatGPTWebAccountInfo updates supplied account profile refresh settings.
 func (h *Handler) PatchChatGPTWebAccountInfo(c *gin.Context) {
 	h.updateChatGPTWebAccountInfo(c, false)
+}
+
+// GetChatGPTWebAccountInfoDiagnostics returns the bounded in-memory failures.
+func (h *Handler) GetChatGPTWebAccountInfoDiagnostics(c *gin.Context) {
+	c.Header("Cache-Control", "no-store")
+	controller, ok := h.chatGPTWebAccountInfoController()
+	if !ok {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "chatgpt web account info diagnostics are unavailable"})
+		return
+	}
+	c.JSON(http.StatusOK, controller.AccountInfoDiagnosticsSnapshot())
+}
+
+// ClearChatGPTWebAccountInfoDiagnostics removes all in-memory failures.
+func (h *Handler) ClearChatGPTWebAccountInfoDiagnostics(c *gin.Context) {
+	c.Header("Cache-Control", "no-store")
+	controller, ok := h.chatGPTWebAccountInfoController()
+	if !ok {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "chatgpt web account info diagnostics are unavailable"})
+		return
+	}
+	c.JSON(http.StatusOK, controller.ClearAccountInfoDiagnostics())
 }
 
 func (h *Handler) updateChatGPTWebAccountInfo(c *gin.Context, replace bool) {
@@ -324,6 +349,13 @@ func (request chatGPTWebAccountInfoConfigRequest) apply(candidate *config.ChatGP
 			return errors.New("invalid auto-refresh-enabled")
 		}
 		candidate.AutoRefreshEnabled = &value
+	}
+	if len(request.DiagnosticsEnabled) > 0 {
+		value, errValue := decodeSentinelBool(request.DiagnosticsEnabled)
+		if errValue != nil {
+			return errors.New("invalid diagnostics-enabled")
+		}
+		candidate.DiagnosticsEnabled = &value
 	}
 	fields := []struct {
 		name   string

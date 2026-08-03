@@ -868,6 +868,7 @@ func loadChatGPTWebTimezone(name string) (*time.Location, error) {
 // ChatGPTWebAccountInfoConfig controls bounded account profile and image quota refreshes.
 type ChatGPTWebAccountInfoConfig struct {
 	AutoRefreshEnabled     *bool `yaml:"auto-refresh-enabled,omitempty" json:"auto-refresh-enabled,omitempty"`
+	DiagnosticsEnabled     *bool `yaml:"diagnostics-enabled,omitempty" json:"diagnostics-enabled,omitempty"`
 	RefreshWorkers         *int  `yaml:"refresh-workers,omitempty" json:"refresh-workers,omitempty"`
 	RefreshQueueSize       *int  `yaml:"refresh-queue-size,omitempty" json:"refresh-queue-size,omitempty"`
 	RefreshTTLMinutes      *int  `yaml:"refresh-ttl-minutes,omitempty" json:"refresh-ttl-minutes,omitempty"`
@@ -890,7 +891,7 @@ func (cfg *ChatGPTWebAccountInfoConfig) UnmarshalYAML(node *yaml.Node) error {
 	}
 	for name, value := range effective {
 		switch name {
-		case "auto-refresh-enabled", "refresh-workers", "refresh-queue-size", "refresh-ttl-minutes", "periodic-refresh-minutes", "recovery-jitter-seconds", "max-retries":
+		case "auto-refresh-enabled", "diagnostics-enabled", "refresh-workers", "refresh-queue-size", "refresh-ttl-minutes", "periodic-refresh-minutes", "recovery-jitter-seconds", "max-retries":
 			if value == nil {
 				return fmt.Errorf("chatgpt-web.account-info.%s must not be null", name)
 			}
@@ -910,6 +911,7 @@ func (cfg *ChatGPTWebAccountInfoConfig) UnmarshalYAML(node *yaml.Node) error {
 // ResolvedChatGPTWebAccountInfoConfig contains effective refresh-pool values.
 type ResolvedChatGPTWebAccountInfoConfig struct {
 	AutoRefreshEnabled     bool `json:"auto-refresh-enabled"`
+	DiagnosticsEnabled     bool `json:"diagnostics-enabled"`
 	RefreshWorkers         int  `json:"refresh-workers"`
 	RefreshQueueSize       int  `json:"refresh-queue-size"`
 	RefreshTTLMinutes      int  `json:"refresh-ttl-minutes"`
@@ -939,6 +941,9 @@ func (cfg ChatGPTWebAccountInfoConfig) Resolved() ResolvedChatGPTWebAccountInfoC
 	if cfg.AutoRefreshEnabled != nil {
 		resolved.AutoRefreshEnabled = *cfg.AutoRefreshEnabled
 		resolved.autoRefreshConfigured = true
+	}
+	if cfg.DiagnosticsEnabled != nil {
+		resolved.DiagnosticsEnabled = *cfg.DiagnosticsEnabled
 	}
 	if cfg.RefreshWorkers != nil {
 		resolved.RefreshWorkers = *cfg.RefreshWorkers
@@ -3699,6 +3704,7 @@ func preservesExplicitChatGPTWebValue(fullPath string, node *yaml.Node) bool {
 	case "chatgpt-web.account-info":
 		return node.Kind == yaml.MappingNode && len(node.Content) > 0
 	case "chatgpt-web.account-info.auto-refresh-enabled",
+		"chatgpt-web.account-info.diagnostics-enabled",
 		"chatgpt-web.account-info.refresh-workers",
 		"chatgpt-web.account-info.refresh-queue-size",
 		"chatgpt-web.account-info.refresh-ttl-minutes",
