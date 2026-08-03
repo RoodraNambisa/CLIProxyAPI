@@ -705,6 +705,7 @@ navigatorTag:Object.prototype.toString.call(navigator),
 documentTag:Object.prototype.toString.call(document),
 elementTag:Object.prototype.toString.call(document.createElement("div")),
 canvasTag:Object.prototype.toString.call(canvas),
+canvasDataURL:canvas.toDataURL(),
 webglTag:Object.prototype.toString.call(webgl),
 storageTag:Object.prototype.toString.call(localStorage),
 screenTag:Object.prototype.toString.call(screen),
@@ -738,6 +739,7 @@ elementInstance:canvas instanceof Element
 		DocumentTag        string   `json:"documentTag"`
 		ElementTag         string   `json:"elementTag"`
 		CanvasTag          string   `json:"canvasTag"`
+		CanvasDataURL      string   `json:"canvasDataURL"`
 		WebGLTag           string   `json:"webglTag"`
 		StorageTag         string   `json:"storageTag"`
 		ScreenTag          string   `json:"screenTag"`
@@ -763,6 +765,8 @@ elementInstance:canvas instanceof Element
 	profileEnvironment := sdkRequest.Environment
 	profileEnvironment.DeviceID = sdkRequest.DeviceID
 	profile := resolveSentinelBrowserProfile(profileEnvironment)
+	canvasPayload := fmt.Sprintf("sentinel-canvas-v1:%d:300x150", profile.slot&0x0f)
+	wantCanvasDataURL := "data:image/png;base64," + base64.StdEncoding.EncodeToString([]byte(canvasPayload))
 	if result.NavigatorTag != "[object Navigator]" || result.DocumentTag != "[object HTMLDocument]" ||
 		result.ElementTag != "[object HTMLElement]" || result.CanvasTag != "[object HTMLCanvasElement]" ||
 		result.WebGLTag != "[object WebGLRenderingContext]" || result.StorageTag != "[object Storage]" ||
@@ -770,7 +774,7 @@ elementInstance:canvas instanceof Element
 		t.Fatalf("browser object tags = %+v", result)
 	}
 	if result.Vendor != profile.webGLVendor || result.Renderer != profile.webGLRenderer || result.AvailLeft != profile.availLeft ||
-		result.DeviceMemory != profile.deviceMemory || result.Heap != profile.jsHeapSizeLimit {
+		result.DeviceMemory != profile.deviceMemory || result.Heap != profile.jsHeapSizeLimit || result.CanvasDataURL != wantCanvasDataURL {
 		t.Fatalf("SDK fingerprint = %+v, profile = %+v", result, profile)
 	}
 	if result.Stored != "stored" || result.RouterState != "undefined" || !result.ReadonlyNavigator ||

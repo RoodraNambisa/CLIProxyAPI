@@ -1,6 +1,8 @@
 package chatgptweb
 
 import (
+	"encoding/base64"
+	"fmt"
 	"math"
 	"strings"
 )
@@ -24,6 +26,9 @@ type conversationTurnstileDOMElement struct {
 	attributes map[string]string
 	children   []any
 	style      *conversationTurnstileOrderedMap
+	width      int
+	height     int
+	contexts   map[string]*conversationTurnstileCanvasContext
 }
 
 func (element *conversationTurnstileDOMElement) conversationTurnstileBrowserPath() string {
@@ -85,6 +90,9 @@ func (vm *conversationTurnstileVM) newDOMElement(name string) (*conversationTurn
 		tagName:    name,
 		attributes: make(map[string]string),
 		style:      newConversationTurnstileOrderedMap(),
+		width:      300,
+		height:     150,
+		contexts:   make(map[string]*conversationTurnstileCanvasContext),
 	}, nil
 }
 
@@ -245,11 +253,11 @@ func (vm *conversationTurnstileVM) browserProperty(object any, key string) (any,
 			return conversationTurnstileArrayValue(append([]any(nil), value.children...)), true, nil
 		case "width":
 			if value.tagName == "CANVAS" {
-				return 300, true, nil
+				return value.width, true, nil
 			}
 		case "height":
 			if value.tagName == "CANVAS" {
-				return 150, true, nil
+				return value.height, true, nil
 			}
 		case "getContext":
 			callable, err := vm.browserCallable(func(args []any) (any, error) {
@@ -263,13 +271,38 @@ func (vm *conversationTurnstileVM) browserProperty(object any, key string) (any,
 				}
 				switch kind {
 				case "2d", "webgl", "experimental-webgl", "webgl2":
+					if context := value.contexts[kind]; context != nil {
+						return context, nil
+					}
 					if err := vm.reserveRuntimeBytes(128 + len(kind)); err != nil {
 						return nil, err
 					}
-					return &conversationTurnstileCanvasContext{vm: vm, canvas: value, kind: kind}, nil
+					context := &conversationTurnstileCanvasContext{vm: vm, canvas: value, kind: kind}
+					value.contexts[kind] = context
+					return context, nil
 				default:
 					return conversationTurnstileExplicitNull, nil
 				}
+			})
+			return callable, true, err
+		case "toDataURL":
+			callable, err := vm.browserCallable(func(args []any) (any, error) {
+				mime := "image/png"
+				if len(args) > 0 {
+					parsed, parseErr := vm.runtimeString(args[0])
+					if parseErr != nil {
+						return nil, parseErr
+					}
+					if strings.TrimSpace(parsed) != "" {
+						mime = parsed
+					}
+				}
+				fingerprint := fmt.Sprintf("sentinel-canvas-v1:%d:%dx%d", vm.browserProfile.slot&0x0f, value.width, value.height)
+				encoded := base64.StdEncoding.EncodeToString([]byte(fingerprint))
+				if err := vm.reserveRuntimeBytes(len(mime) + len(encoded) + 13); err != nil {
+					return nil, err
+				}
+				return "data:" + mime + ";base64," + encoded, nil
 			})
 			return callable, true, err
 		case "appendChild":
@@ -402,6 +435,22 @@ func (vm *conversationTurnstileVM) browserProperty(object any, key string) (any,
 				}
 			})
 			return callable, true, err
+		case "getSupportedExtensions":
+			callable, err := vm.browserCallable(func([]any) (any, error) {
+				if err := vm.reserveRuntimeBytes(64); err != nil {
+					return nil, err
+				}
+				return conversationTurnstileArrayValue([]any{"WEBGL_debug_renderer_info"}), nil
+			})
+			return callable, true, err
+		case "VENDOR":
+			return conversationTurnstileWebGLVendor, true, nil
+		case "RENDERER":
+			return conversationTurnstileWebGLRenderer, true, nil
+		case "VERSION":
+			return conversationTurnstileWebGLVersion, true, nil
+		case "SHADING_LANGUAGE_VERSION":
+			return conversationTurnstileWebGLShadingLanguageVersion, true, nil
 		case "fillRect", "clearRect", "drawImage", "save", "restore":
 			callable, err := vm.browserCallable(func([]any) (any, error) { return conversationTurnstileUndefined, nil })
 			return callable, true, err
