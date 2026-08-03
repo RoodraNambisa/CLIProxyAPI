@@ -253,13 +253,30 @@ func (h *Handler) managementCallbackURL(path string) (string, error) {
 }
 
 func (h *Handler) ListAuthFiles(c *gin.Context) {
+	c.Header("Cache-Control", "no-store")
 	if h == nil {
 		c.JSON(500, gin.H{"error": "handler not initialized"})
 		return
 	}
+	paged, errPaged := parseAuthFilesPagedFlag(c)
+	if errPaged != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": errPaged.Error()})
+		return
+	}
+	if paged {
+		if _, errQuery := parseAuthFilesListQuery(c, true); errQuery != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": errQuery.Error()})
+			return
+		}
+	}
 	h.mu.Lock()
 	manager := h.authManager
+	paginationEnabled := h.cfg != nil && h.cfg.RemoteManagement.AuthFilesPagination.Enabled
 	h.mu.Unlock()
+	if paged && paginationEnabled && manager != nil {
+		h.listAuthFilesPaged(c, manager)
+		return
+	}
 	if manager == nil {
 		h.listAuthFilesFromDisk(c, manager)
 		return
@@ -314,11 +331,21 @@ func (h *Handler) ListAuthFiles(c *gin.Context) {
 		nameJ, _ := files[j]["name"].(string)
 		return strings.ToLower(nameI) < strings.ToLower(nameJ)
 	})
-	c.JSON(200, gin.H{"files": files})
+	writeLegacyAuthFilesResponse(c, files, paged)
 }
 
 func (h *Handler) listRetiredGeminiCLIAuthFiles() ([]gin.H, error) {
-	if h == nil || h.cfg == nil || strings.TrimSpace(h.cfg.AuthDir) == "" {
+	return h.listRetiredGeminiCLIAuthFilesExcluding(nil)
+}
+
+func (h *Handler) listRetiredGeminiCLIAuthFilesExcluding(managedNames map[string]struct{}) ([]gin.H, error) {
+	if h == nil {
+		return nil, nil
+	}
+	h.mu.Lock()
+	hasAuthDir := h.cfg != nil && strings.TrimSpace(h.cfg.AuthDir) != ""
+	h.mu.Unlock()
+	if !hasAuthDir {
 		return nil, nil
 	}
 	root, _, authDir, errRoot := h.openManagedAuthRootSnapshot()
@@ -329,7 +356,7 @@ func (h *Handler) listRetiredGeminiCLIAuthFiles() ([]gin.H, error) {
 		return nil, errRoot
 	}
 	defer closeManagedAuthRoot(root)
-	diskFiles, errList := listAuthJSONDiskFilesAtRoot(root)
+	diskFiles, errList := listAuthJSONDiskFilesExcludingAtRoot(root, managedNames)
 	if errList != nil {
 		return nil, errList
 	}
@@ -585,7 +612,7 @@ func (h *Handler) listAuthFilesFromDisk(c *gin.Context, manager *coreauth.Manage
 			applyChatGPTWebDependencySummary(fileData, auth, dependencyGraph)
 		}
 	}
-	c.JSON(200, gin.H{"files": files})
+	writeLegacyAuthFilesResponse(c, files, authFilesPagedRequested(c))
 }
 
 func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
@@ -1216,6 +1243,10 @@ func (h *Handler) listAuthJSONDiskFiles() ([]authDiskFile, error) {
 }
 
 func listAuthJSONDiskFilesAtRoot(root *os.Root) ([]authDiskFile, error) {
+	return listAuthJSONDiskFilesExcludingAtRoot(root, nil)
+}
+
+func listAuthJSONDiskFilesExcludingAtRoot(root *os.Root, excludedNames map[string]struct{}) ([]authDiskFile, error) {
 	if root == nil {
 		return nil, errors.New("auth root is nil")
 	}
@@ -1231,6 +1262,9 @@ func listAuthJSONDiskFilesAtRoot(root *os.Root) ([]authDiskFile, error) {
 	files := make([]authDiskFile, 0, len(entries))
 	for _, entry := range entries {
 		if entry == nil || entry.IsDir() || entry.Type()&os.ModeSymlink != 0 || !strings.HasSuffix(strings.ToLower(entry.Name()), ".json") {
+			continue
+		}
+		if _, excluded := excludedNames[managedAuthNameKey(entry.Name())]; excluded {
 			continue
 		}
 		info, errInfo := entry.Info()

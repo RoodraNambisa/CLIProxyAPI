@@ -26,6 +26,15 @@ func (h *Handler) authFileRuntimeSummaries() map[string]authFileRuntimeSummary {
 }
 
 func (h *Handler) authFileRuntimeSummariesForManager(authManager *coreauth.Manager) map[string]authFileRuntimeSummary {
+	if authManager == nil {
+		return h.authFileRuntimeSummariesForAuths(nil, nil)
+	}
+	return h.authFileRuntimeSummariesForAuths(authManager, authManager.List())
+}
+
+// authFileRuntimeSummariesForAuths collects account-info state only for the supplied
+// auths while retaining proxy bindings for dependency resolution across the full pool.
+func (h *Handler) authFileRuntimeSummariesForAuths(authManager *coreauth.Manager, auths []*coreauth.Auth) map[string]authFileRuntimeSummary {
 	summaries := make(map[string]authFileRuntimeSummary)
 	if h == nil {
 		return summaries
@@ -45,7 +54,7 @@ func (h *Handler) authFileRuntimeSummariesForManager(authManager *coreauth.Manag
 	if !ok || authManager == nil {
 		return summaries
 	}
-	for _, auth := range authManager.List() {
+	for _, auth := range auths {
 		if auth == nil || !strings.EqualFold(strings.TrimSpace(auth.Provider), chatgptwebauth.Provider) {
 			continue
 		}

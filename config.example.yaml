@@ -38,6 +38,11 @@ remote-management:
   # GitHub repository for the management control panel. Accepts a repository URL or releases API URL.
   panel-github-repository: "https://github.com/RoodraNambisa/Cli-Proxy-API-Management-Center"
 
+  # Opt in to server-side filtering and pagination for the auth files management page.
+  # This does not change startup loading or runtime scheduling of credentials.
+  auth-files-pagination:
+    enabled: false
+
 # Authentication directory (supports ~ for home directory)
 auth-dir: "~/.cli-proxy-api"
 

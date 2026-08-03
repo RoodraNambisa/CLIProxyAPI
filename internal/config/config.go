@@ -1123,6 +1123,68 @@ type RemoteManagement struct {
 	// PanelGitHubRepository overrides the GitHub repository used to fetch the management panel asset.
 	// Accepts either a repository URL (https://github.com/org/repo) or an API releases endpoint.
 	PanelGitHubRepository string `yaml:"panel-github-repository"`
+	// AuthFilesPagination controls opt-in server-side pagination for the auth files management page.
+	AuthFilesPagination AuthFilesPaginationConfig `yaml:"auth-files-pagination" json:"auth-files-pagination"`
+}
+
+// UnmarshalYAML preserves existing remote-management compatibility while rejecting
+// an explicit null auth-files-pagination object.
+func (cfg *RemoteManagement) UnmarshalYAML(node *yaml.Node) error {
+	if cfg == nil || node == nil {
+		return fmt.Errorf("remote-management must be an object")
+	}
+	if node.Kind == yaml.ScalarNode && node.Tag == "!!null" {
+		*cfg = RemoteManagement{}
+		return nil
+	}
+	if node.Kind != yaml.MappingNode && node.Kind != yaml.AliasNode {
+		return fmt.Errorf("remote-management must be an object")
+	}
+	var effective map[string]any
+	if err := node.Decode(&effective); err != nil {
+		return fmt.Errorf("remote-management: %w", err)
+	}
+	if value, present := effective["auth-files-pagination"]; present && value == nil {
+		return fmt.Errorf("remote-management.auth-files-pagination must be an object")
+	}
+	type plainRemoteManagement RemoteManagement
+	decoded := plainRemoteManagement(*cfg)
+	if err := node.Decode(&decoded); err != nil {
+		return fmt.Errorf("remote-management: %w", err)
+	}
+	*cfg = RemoteManagement(decoded)
+	return nil
+}
+
+// AuthFilesPaginationConfig controls server-side pagination for auth file listings.
+type AuthFilesPaginationConfig struct {
+	Enabled bool `yaml:"enabled" json:"enabled"`
+}
+
+// UnmarshalYAML rejects null, scalar, and unknown auth-files-pagination settings.
+func (cfg *AuthFilesPaginationConfig) UnmarshalYAML(node *yaml.Node) error {
+	if cfg == nil || node == nil || (node.Kind != yaml.MappingNode && node.Kind != yaml.AliasNode) {
+		return fmt.Errorf("remote-management.auth-files-pagination must be an object")
+	}
+	var effective map[string]any
+	if err := node.Decode(&effective); err != nil {
+		return fmt.Errorf("remote-management.auth-files-pagination: %w", err)
+	}
+	for name, value := range effective {
+		if name != "enabled" {
+			return fmt.Errorf("remote-management.auth-files-pagination.%s is not supported", name)
+		}
+		if value == nil {
+			return fmt.Errorf("remote-management.auth-files-pagination.enabled must not be null")
+		}
+	}
+	type plainAuthFilesPaginationConfig AuthFilesPaginationConfig
+	var decoded plainAuthFilesPaginationConfig
+	if err := node.Decode(&decoded); err != nil {
+		return fmt.Errorf("remote-management.auth-files-pagination: %w", err)
+	}
+	*cfg = AuthFilesPaginationConfig(decoded)
+	return nil
 }
 
 // QuotaExceeded defines the behavior when API quota limits are exceeded.
