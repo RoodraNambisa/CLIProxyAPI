@@ -64,6 +64,48 @@ func TestChatGPTWebForcedBodyReleaseRebindsRequestLogWriter(t *testing.T) {
 	}
 }
 
+func TestChatGPTWebForcedBodyReleaseReplacesGlobalTimedController(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	ginCtx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	bindingWriter := &requestBodyReleaseBindingWriter{ResponseWriter: ginCtx.Writer}
+	ginCtx.Writer = bindingWriter
+
+	body := []byte(`{"model":"gpt-5","input":"keep until upstream commit"}`)
+	globalController := coreexecutor.NewRequestBodyReleaseController(int64(len(body)), []byte("<global timer release>"))
+	globalController.StartTimer(10*time.Millisecond, nil)
+	ginCtx.Set(coreexecutor.BodyReleaseControllerMetadataKey, globalController)
+
+	handler := &BaseAPIHandler{Cfg: &config.SDKConfig{RequestBodyRelease: config.RequestBodyReleaseConfig{
+		Enable:       true,
+		AfterSeconds: 1,
+	}}}
+	metadata := make(map[string]any)
+	ctx := context.WithValue(context.Background(), "gin", ginCtx)
+	ctx, controller := handler.attachRequestBodyRelease(ctx, body, metadata, true)
+	if controller == nil || controller == globalController {
+		t.Fatal("forced ChatGPT Web release reused the global timed controller")
+	}
+	if coreexecutor.RequestBodyReleaseControllerFromContext(ctx) != controller ||
+		coreexecutor.RequestBodyReleaseControllerFromMetadata(metadata) != controller ||
+		bindingWriter.controller != controller {
+		t.Fatal("replacement controller was not propagated to every request-body consumer")
+	}
+
+	deadline := time.Now().Add(time.Second)
+	for !globalController.Released() && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if !globalController.Released() {
+		t.Fatal("global controller timer did not fire")
+	}
+	if controller.Released() || !controller.Replayable() {
+		t.Fatal("global timer made the forced ChatGPT Web request non-replayable")
+	}
+	if !controller.Release() || controller.Replayable() {
+		t.Fatal("replacement controller did not release at the explicit upstream commit point")
+	}
+}
+
 func TestConfiguredBodyReleaseStillUsesTimerOutsideChatGPTWeb(t *testing.T) {
 	t.Parallel()
 	handler := &BaseAPIHandler{Cfg: &config.SDKConfig{RequestBodyRelease: config.RequestBodyReleaseConfig{

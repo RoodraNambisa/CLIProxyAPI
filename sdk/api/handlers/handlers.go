@@ -685,7 +685,8 @@ func (h *BaseAPIHandler) attachRequestBodyRelease(ctx context.Context, rawJSON [
 	logOnly := !force && cfg.LogOnly
 	placeholder := coreexecutor.RequestBodyReleaseTimerPlaceholder(size, cfg.AfterSeconds, logOnly)
 	ctrl := requestBodyReleaseControllerFromContext(ctx)
-	if ctrl == nil || ctrl.LogOnly() != logOnly {
+	// A forced ChatGPT Web controller must not inherit the global release timer.
+	if force || ctrl == nil || ctrl.LogOnly() != logOnly {
 		ctrl = coreexecutor.NewRequestBodyReleaseControllerWithMode(size, placeholder, logOnly)
 	}
 	if meta != nil {
