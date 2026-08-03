@@ -39,9 +39,10 @@ func (element *conversationTurnstileDOMElement) conversationTurnstileBrowserPath
 }
 
 type conversationTurnstileCanvasContext struct {
-	vm     *conversationTurnstileVM
-	canvas *conversationTurnstileDOMElement
-	kind   string
+	vm             *conversationTurnstileVM
+	canvas         *conversationTurnstileDOMElement
+	kind           string
+	debugExtension *conversationTurnstileWebGLExtension
 }
 
 func (canvas *conversationTurnstileCanvasContext) conversationTurnstileBrowserPath() string {
@@ -85,15 +86,18 @@ func (vm *conversationTurnstileVM) newDOMElement(name string) (*conversationTurn
 	if err := vm.reserveRuntimeBytes(512 + len(name)); err != nil {
 		return nil, err
 	}
-	return &conversationTurnstileDOMElement{
+	element := &conversationTurnstileDOMElement{
 		vm:         vm,
 		tagName:    name,
 		attributes: make(map[string]string),
 		style:      newConversationTurnstileOrderedMap(),
-		width:      300,
-		height:     150,
 		contexts:   make(map[string]*conversationTurnstileCanvasContext),
-	}, nil
+	}
+	if name == "CANVAS" {
+		element.width = 300
+		element.height = 150
+	}
+	return element, nil
 }
 
 func (vm *conversationTurnstileVM) callBrowserObjectRef(name string, args []any) (any, bool, error) {
@@ -246,7 +250,7 @@ func (vm *conversationTurnstileVM) browserProperty(object any, key string) (any,
 			return value.tagName, true, nil
 		case "style":
 			return value.style, true, nil
-		case "children":
+		case "children", "childNodes":
 			if err := vm.reserveRuntimeBytes(24 + len(value.children)*16); err != nil {
 				return nil, true, err
 			}
@@ -374,9 +378,14 @@ func (vm *conversationTurnstileVM) browserProperty(object any, key string) (any,
 					return nil, err
 				}
 				rectangle := newConversationTurnstileOrderedMap()
-				for _, property := range []string{"x", "y", "width", "height", "top", "right", "bottom", "left"} {
-					rectangle.set(property, 0)
-				}
+				rectangle.set("x", 0)
+				rectangle.set("y", 0)
+				rectangle.set("width", value.width)
+				rectangle.set("height", value.height)
+				rectangle.set("top", 0)
+				rectangle.set("right", value.width)
+				rectangle.set("bottom", value.height)
+				rectangle.set("left", 0)
 				return rectangle, nil
 			})
 			return callable, true, err
@@ -399,10 +408,14 @@ func (vm *conversationTurnstileVM) browserProperty(object any, key string) (any,
 					return nil, parseErr
 				}
 				if strings.EqualFold(strings.TrimSpace(name), "WEBGL_debug_renderer_info") {
+					if value.debugExtension != nil {
+						return value.debugExtension, nil
+					}
 					if err := vm.reserveRuntimeBytes(64); err != nil {
 						return nil, err
 					}
-					return &conversationTurnstileWebGLExtension{}, nil
+					value.debugExtension = &conversationTurnstileWebGLExtension{}
+					return value.debugExtension, nil
 				}
 				return conversationTurnstileExplicitNull, nil
 			})
@@ -540,6 +553,12 @@ func conversationTurnstileBrowserObjectValueString(object conversationTurnstileB
 		return "[object Object]"
 	}
 	path := object.conversationTurnstileBrowserPath()
+	if element, ok := object.(*conversationTurnstileDOMElement); ok && element != nil {
+		if element.tagName == "CANVAS" {
+			return "[object HTMLCanvasElement]"
+		}
+		return "[object HTMLElement]"
+	}
 	switch {
 	case strings.Contains(path, "CanvasRenderingContext2D"):
 		return "[object CanvasRenderingContext2D]"
@@ -548,6 +567,6 @@ func conversationTurnstileBrowserObjectValueString(object conversationTurnstileB
 	case strings.Contains(path, "WEBGL_debug_renderer_info"):
 		return "[object Object]"
 	default:
-		return "[object HTMLElement]"
+		return "[object Object]"
 	}
 }

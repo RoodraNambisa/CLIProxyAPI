@@ -29,6 +29,38 @@ func TestGoConversationTurnstileCanvasMatchesBrowserSemantics(t *testing.T) {
 	if err != nil || !equal {
 		t.Fatalf("getContext() identity equal=%v error=%v", equal, err)
 	}
+	if got := conversationTurnstileBrowserObjectValueString(canvas); got != "[object HTMLCanvasElement]" {
+		t.Fatalf("canvas object string = %q", got)
+	}
+	getBoundingClientRect, handled, err := vm.browserProperty(canvas, "getBoundingClientRect")
+	if err != nil || !handled {
+		t.Fatalf("getBoundingClientRect property = %#v, handled=%v, error=%v", getBoundingClientRect, handled, err)
+	}
+	rectangleValue, err := vm.call(getBoundingClientRect, nil)
+	if err != nil {
+		t.Fatalf("getBoundingClientRect() error = %v", err)
+	}
+	rectangle, ok := rectangleValue.(*conversationTurnstileOrderedMap)
+	if !ok || rectangle.values[conversationTurnstileMapKey("width")] != 300 || rectangle.values[conversationTurnstileMapKey("height")] != 150 {
+		t.Fatalf("getBoundingClientRect() = %#v", rectangleValue)
+	}
+
+	getExtension, handled, err := vm.browserProperty(first, "getExtension")
+	if err != nil || !handled {
+		t.Fatalf("getExtension property = %#v, handled=%v, error=%v", getExtension, handled, err)
+	}
+	firstExtension, err := vm.call(getExtension, []any{"WEBGL_debug_renderer_info"})
+	if err != nil {
+		t.Fatalf("first getExtension() error = %v", err)
+	}
+	secondExtension, err := vm.call(getExtension, []any{"WEBGL_debug_renderer_info"})
+	if err != nil {
+		t.Fatalf("second getExtension() error = %v", err)
+	}
+	equal, err = vm.strictEqual(firstExtension, secondExtension)
+	if err != nil || !equal {
+		t.Fatalf("getExtension() identity equal=%v error=%v", equal, err)
+	}
 
 	getSupportedExtensions, handled, err := vm.browserProperty(first, "getSupportedExtensions")
 	if err != nil || !handled {
