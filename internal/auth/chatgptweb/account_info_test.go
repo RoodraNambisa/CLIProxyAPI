@@ -334,10 +334,34 @@ func TestParseImageQuotaAcceptsNumericStringAndUnixMilliseconds(t *testing.T) {
 	}
 }
 
+func TestParseImageQuotaPreservesNegativeRemaining(t *testing.T) {
+	tests := []struct {
+		name      string
+		remaining string
+		want      int
+	}{
+		{name: "number", remaining: `-1`, want: -1},
+		{name: "numeric string", remaining: `"-2"`, want: -2},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			quota, err := ParseImageQuota([]byte(`{
+				"limits_progress":[{"feature_name":"image_gen","remaining":` + test.remaining + `,"reset_after":"2026-08-04T00:00:00Z"}]
+			}`))
+			if err != nil {
+				t.Fatalf("ParseImageQuota() error = %v", err)
+			}
+			if !quota.FeaturePresent || !quota.Present || quota.Remaining != test.want ||
+				!quota.ResetAt.Equal(time.Date(2026, 8, 4, 0, 0, 0, 0, time.UTC)) {
+				t.Fatalf("quota = %+v, want remaining %d", quota, test.want)
+			}
+		})
+	}
+}
+
 func TestParseImageQuotaRejectsMalformedMatchedFeature(t *testing.T) {
 	for _, payload := range []string{
 		`{"limits_progress":[{"feature_name":"image_gen"}]}`,
-		`{"limits_progress":[{"feature_name":"image_gen","remaining":-1}]}`,
 		`{"limits_progress":[{"feature_name":"image_gen","remaining":1,"reset_after":"tomorrow"}]}`,
 		`{"limits_progress":[{"feature_name":"image_gen","remaining":1,"reset_after":253402300800}]}`,
 		`{"limits_progress":[{"feature_name":"image_gen","remaining":1,"reset_after":253402300800000}]}`,

@@ -229,6 +229,10 @@ func projectChatGPTWebImageSuccess(auth *Auth, count int64, imageModels []string
 	if remaining == nil {
 		return nil, false
 	}
+	if *remaining <= 0 {
+		auth.Metadata["quota_state"] = string(chatgptwebauth.QuotaStateExhausted)
+		return nil, false
+	}
 	nextRemaining := int64(*remaining)
 	if nextRemaining < count {
 		nextRemaining = 0
@@ -250,7 +254,10 @@ func projectChatGPTWebImageQuotaExhausted(auth *Auth, imageModels []string, now 
 	if auth.Metadata == nil {
 		auth.Metadata = make(map[string]any)
 	}
-	auth.Metadata["image_quota_remaining"] = 0
+	remaining := metadataInt(auth.Metadata["image_quota_remaining"])
+	if remaining == nil || *remaining > 0 {
+		auth.Metadata["image_quota_remaining"] = 0
+	}
 	auth.Metadata["quota_state"] = string(chatgptwebauth.QuotaStateExhausted)
 	resetAt := metadataTime(auth.Metadata["image_quota_reset_at"])
 	if !resetAt.After(now) {

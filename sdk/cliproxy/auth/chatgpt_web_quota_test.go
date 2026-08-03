@@ -89,6 +89,51 @@ func TestChatGPTWebImageQuotaBlocksOnlyImageModel(t *testing.T) {
 	}
 }
 
+func TestProjectChatGPTWebImageSuccessPreservesAuthoritativeNegativeQuota(t *testing.T) {
+	auth := &Auth{
+		ID:       "negative-success-projection",
+		Provider: chatgptwebauth.Provider,
+		Status:   StatusActive,
+		Metadata: map[string]any{
+			"image_quota_remaining": -2,
+			"quota_state":           string(chatgptwebauth.QuotaStateAvailable),
+		},
+	}
+	models, crossedZero := projectChatGPTWebImageSuccess(
+		auth,
+		1,
+		[]string{chatgptwebauth.ImageModel},
+		time.Now(),
+	)
+	if len(models) != 0 || crossedZero {
+		t.Fatalf("projection result = models %v crossed zero %v, want no new projection", models, crossedZero)
+	}
+	if remaining := metadataInt(auth.Metadata["image_quota_remaining"]); remaining == nil || *remaining != -2 {
+		t.Fatalf("image_quota_remaining = %#v, want -2", remaining)
+	}
+	if state := metadataString(auth.Metadata["quota_state"]); state != string(chatgptwebauth.QuotaStateExhausted) {
+		t.Fatalf("quota_state = %q, want exhausted", state)
+	}
+}
+
+func TestProjectChatGPTWebImageQuotaExhaustedPreservesAuthoritativeNegativeQuota(t *testing.T) {
+	auth := &Auth{
+		ID:       "negative-explicit-exhaustion",
+		Provider: chatgptwebauth.Provider,
+		Status:   StatusActive,
+		Metadata: map[string]any{
+			"image_quota_remaining": -1,
+		},
+	}
+	projectChatGPTWebImageQuotaExhausted(auth, []string{chatgptwebauth.ImageModel}, time.Now())
+	if remaining := metadataInt(auth.Metadata["image_quota_remaining"]); remaining == nil || *remaining != -1 {
+		t.Fatalf("image_quota_remaining = %#v, want -1", remaining)
+	}
+	if state := metadataString(auth.Metadata["quota_state"]); state != string(chatgptwebauth.QuotaStateExhausted) {
+		t.Fatalf("quota_state = %q, want exhausted", state)
+	}
+}
+
 func TestChatGPTWebImageQuotaBlocksConfiguredImageModelRegistration(t *testing.T) {
 	now := time.Now()
 	auth := &Auth{

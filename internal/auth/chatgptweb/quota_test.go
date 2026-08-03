@@ -34,6 +34,33 @@ func TestCredentialQuotaRoundTripPreservesZero(t *testing.T) {
 	}
 }
 
+func TestCredentialQuotaRoundTripPreservesNegative(t *testing.T) {
+	remaining := -2
+	credential := &Credential{
+		Type:                Provider,
+		ImageQuotaRemaining: &remaining,
+		ImageQuotaResetAt:   "2026-08-04T00:00:00Z",
+		QuotaState:          QuotaStateExhausted,
+		QuotaUpdatedAt:      "2026-08-03T17:00:00Z",
+	}
+	metadata := map[string]any{}
+	credential.ApplyToMetadata(metadata)
+	payload, errMarshal := json.Marshal(metadata)
+	if errMarshal != nil {
+		t.Fatalf("marshal metadata: %v", errMarshal)
+	}
+	decoded, errDecode := DecodeCredential(payload)
+	if errDecode != nil {
+		t.Fatalf("DecodeCredential() error = %v", errDecode)
+	}
+	if decoded.ImageQuotaRemaining == nil || *decoded.ImageQuotaRemaining != -2 {
+		t.Fatalf("ImageQuotaRemaining = %#v, want -2", decoded.ImageQuotaRemaining)
+	}
+	if decoded.QuotaState != QuotaStateExhausted {
+		t.Fatalf("QuotaState = %q, want exhausted", decoded.QuotaState)
+	}
+}
+
 func TestNormalizeQuotaStateKeepsMissingQuotaUnknown(t *testing.T) {
 	if got := NormalizeQuotaState("", nil); got != QuotaStateUnknown {
 		t.Fatalf("NormalizeQuotaState() = %q, want unknown", got)
@@ -41,6 +68,10 @@ func TestNormalizeQuotaStateKeepsMissingQuotaUnknown(t *testing.T) {
 	zero := 0
 	if got := NormalizeQuotaState("", &zero); got != QuotaStateExhausted {
 		t.Fatalf("zero NormalizeQuotaState() = %q, want exhausted", got)
+	}
+	negative := -1
+	if got := NormalizeQuotaState("", &negative); got != QuotaStateExhausted {
+		t.Fatalf("negative NormalizeQuotaState() = %q, want exhausted", got)
 	}
 	remaining := 4
 	if got := NormalizeQuotaState("", &remaining); got != QuotaStateAvailable {

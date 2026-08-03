@@ -326,7 +326,7 @@ func parseQuotaRemaining(raw json.RawMessage) (int, error) {
 	var number json.Number
 	if err := json.Unmarshal(raw, &number); err == nil {
 		value, errValue := strconv.ParseInt(number.String(), 10, 64)
-		if errValue != nil || value < 0 || value > math.MaxInt {
+		if errValue != nil || value < math.MinInt || value > math.MaxInt {
 			return 0, fmt.Errorf("image quota remaining is invalid")
 		}
 		return int(value), nil
@@ -336,7 +336,7 @@ func parseQuotaRemaining(raw json.RawMessage) (int, error) {
 		return 0, fmt.Errorf("image quota remaining is invalid")
 	}
 	value, errValue := strconv.ParseInt(strings.TrimSpace(text), 10, 64)
-	if errValue != nil || value < 0 || value > math.MaxInt {
+	if errValue != nil || value < math.MinInt || value > math.MaxInt {
 		return 0, fmt.Errorf("image quota remaining is invalid")
 	}
 	return int(value), nil
