@@ -57,3 +57,23 @@ func TestGoConversationTurnstileCanvasMatchesBrowserSemantics(t *testing.T) {
 		t.Fatalf("toDataURL() = %q, want %q", dataURL, want)
 	}
 }
+
+func TestGoConversationTurnstileLocalStorageModelsMissingNamedProperties(t *testing.T) {
+	vm := &conversationTurnstileVM{}
+	vm.initializeLocalStorage()
+
+	value, handled, err := vm.browserObjectRefProperty("window.localStorage", "missing")
+	if err != nil || !handled || !isConversationTurnstileUndefined(value) {
+		t.Fatalf("missing localStorage property = %#v, handled=%v, error=%v", value, handled, err)
+	}
+	if !vm.knownEnvironmentProperty(conversationTurnstileObjectRef{path: "window.localStorage"}, "missing") {
+		t.Fatal("missing localStorage named property was classified as unimplemented")
+	}
+	if _, handled, err = vm.callBrowserObjectRef("window.localStorage.setItem", []any{"stored", "value"}); err != nil || !handled {
+		t.Fatalf("localStorage.setItem() handled=%v error=%v", handled, err)
+	}
+	value, handled, err = vm.browserObjectRefProperty("window.localStorage", "stored")
+	if err != nil || !handled || value != "value" {
+		t.Fatalf("stored localStorage property = %#v, handled=%v, error=%v", value, handled, err)
+	}
+}

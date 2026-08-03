@@ -712,6 +712,8 @@ screenTag:Object.prototype.toString.call(screen),
 vendor:webgl.getParameter(extension.UNMASKED_VENDOR_WEBGL),
 renderer:webgl.getParameter(extension.UNMASKED_RENDERER_WEBGL),
 stored:localStorage.getItem("sentinel-test"),
+namedStored:localStorage["sentinel-test"],
+storageKeys:Object.keys(localStorage),
 availLeft:screen.availLeft,
 deviceMemory:navigator.deviceMemory,
 heap:performance.memory.jsHeapSizeLimit,
@@ -746,6 +748,8 @@ elementInstance:canvas instanceof Element
 		Vendor             string   `json:"vendor"`
 		Renderer           string   `json:"renderer"`
 		Stored             string   `json:"stored"`
+		NamedStored        string   `json:"namedStored"`
+		StorageKeys        []string `json:"storageKeys"`
 		AvailLeft          int      `json:"availLeft"`
 		DeviceMemory       float64  `json:"deviceMemory"`
 		Heap               float64  `json:"heap"`
@@ -777,7 +781,8 @@ elementInstance:canvas instanceof Element
 		result.DeviceMemory != profile.deviceMemory || result.Heap != profile.jsHeapSizeLimit || result.CanvasDataURL != wantCanvasDataURL {
 		t.Fatalf("SDK fingerprint = %+v, profile = %+v", result, profile)
 	}
-	if result.Stored != "stored" || result.RouterState != "undefined" || !result.ReadonlyNavigator ||
+	if result.Stored != "stored" || result.NamedStored != "stored" || len(result.StorageKeys) != 1 || result.StorageKeys[0] != "sentinel-test" ||
+		result.RouterState != "undefined" || !result.ReadonlyNavigator ||
 		len(result.InternalEnumerable) != 0 || len(result.ReactDocumentKeys) != 1 || result.TimeOrigin <= 0 ||
 		!result.NowNonnegative || !result.SameContext || !result.CanvasInstance || !result.ElementInstance {
 		t.Fatalf("SDK browser behavior = %+v", result)

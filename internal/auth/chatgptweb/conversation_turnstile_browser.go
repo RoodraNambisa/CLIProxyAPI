@@ -227,7 +227,7 @@ func (vm *conversationTurnstileVM) browserObjectRefProperty(path, key string) (a
 	default:
 		value, exists := vm.localStorageValues[key]
 		if !exists {
-			return nil, false, nil
+			return conversationTurnstileUndefined, true, nil
 		}
 		return value, true, nil
 	}
@@ -491,6 +491,9 @@ func (vm *conversationTurnstileVM) knownEnvironmentProperty(object, propertyKey 
 	objectRef, ok := object.(conversationTurnstileObjectRef)
 	if !ok {
 		return false
+	}
+	if objectRef.path == "window.localStorage" {
+		return true
 	}
 	key, err := vm.runtimeString(propertyKey)
 	if err != nil {

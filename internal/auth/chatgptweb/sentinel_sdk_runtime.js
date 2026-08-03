@@ -122,14 +122,36 @@
   class MemoryStorage {
     constructor(keys) {
       defineValue(this, "values", new Map(), { enumerable: false });
-      for (const key of Array.isArray(keys) ? keys : []) this.values.set(asString(key), "");
+      for (const key of Array.isArray(keys) ? keys : []) this.setItem(key, "");
     }
     get length() { return this.values.size; }
-    clear() { this.values.clear(); }
+    clear() {
+      for (const key of this.values.keys()) this.removeNamedProperty(key);
+      this.values.clear();
+    }
     getItem(key) { return this.values.has(asString(key)) ? this.values.get(asString(key)) : null; }
     key(index) { return Array.from(this.values.keys())[Number(index)] ?? null; }
-    removeItem(key) { this.values.delete(asString(key)); }
-    setItem(key, value) { this.values.set(asString(key), asString(value)); }
+    removeItem(key) {
+      const name = asString(key);
+      this.values.delete(name);
+      this.removeNamedProperty(name);
+    }
+    setItem(key, value) {
+      const name = asString(key);
+      this.values.set(name, asString(value));
+      if (name === "values" || name in MemoryStorage.prototype) return;
+      if (!Object.prototype.hasOwnProperty.call(this, name)) {
+        Object.defineProperty(this, name, {
+          configurable: true,
+          enumerable: true,
+          get: () => this.values.get(name),
+          set: (next) => this.values.set(name, asString(next)),
+        });
+      }
+    }
+    removeNamedProperty(name) {
+      if (name !== "values" && Object.prototype.hasOwnProperty.call(this, name)) delete this[name];
+    }
   }
   setObjectTag(MemoryStorage.prototype, "Storage");
 
