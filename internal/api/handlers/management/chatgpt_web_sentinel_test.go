@@ -86,25 +86,28 @@ func TestGetChatGPTWebSentinelReturnsDefaultsWithoutExecutor(t *testing.T) {
 func TestGetChatGPTWebSentinelReturnsRuntimeSnapshot(t *testing.T) {
 	manager := coreauth.NewManager(nil, nil, nil)
 	manager.RegisterExecutor(sentinelSnapshotTestExecutor{snapshot: chatgptwebauth.SentinelRuntimeSnapshot{
-		SDKRuntimeEnabled:    true,
-		SDKWorkers:           3,
-		SDKQueueSize:         8,
-		SDKCacheVersions:     2,
-		Initialized:          true,
-		Available:            true,
-		WorkerLimit:          3,
-		Busy:                 2,
-		Queued:               4,
-		SourcePending:        2,
-		SourceWaiters:        5,
-		BytecodeWaiters:      3,
-		ObserverSessions:     1,
-		SDKVersion:           "20260721",
-		SDKSHA256:            "abcdef",
-		SourceCacheEntries:   2,
-		BytecodeCacheEntries: 1,
-		FallbackCount:        7,
-		LastError:            "previous failure",
+		SDKRuntimeEnabled:      true,
+		SDKWorkers:             3,
+		SDKQueueSize:           8,
+		SDKCacheVersions:       2,
+		Initialized:            true,
+		Available:              true,
+		WorkerLimit:            3,
+		Busy:                   2,
+		Queued:                 4,
+		SourcePending:          2,
+		SourceWaiters:          5,
+		BytecodeWaiters:        3,
+		ObserverSessions:       1,
+		SDKVersion:             "20260721",
+		SDKSHA256:              "abcdef",
+		SourceCacheEntries:     2,
+		BytecodeCacheEntries:   1,
+		CompatibilityFallbacks: 5,
+		SDKPreferredHits:       2,
+		SessionObserverCount:   6,
+		FallbackCount:          7,
+		LastError:              "previous failure",
 	}})
 	handler := &Handler{cfg: &config.Config{}, authManager: manager}
 	ctx, recorder := newChatGPTWebSentinelRequest(http.MethodGet, "")
@@ -121,7 +124,7 @@ func TestGetChatGPTWebSentinelReturnsRuntimeSnapshot(t *testing.T) {
 	if response.SourcePending != 2 || response.SourceWaiters != 5 || response.BytecodeWaiters != 3 {
 		t.Fatalf("runtime admission counters = %#v", response)
 	}
-	if response.SDKVersion != "20260721" || response.SDKSHA256 != "abcdef" || response.SourceCacheEntries != 2 || response.BytecodeCacheEntries != 1 || response.FallbackCount != 7 || response.LastError != "previous failure" {
+	if response.SDKVersion != "20260721" || response.SDKSHA256 != "abcdef" || response.SourceCacheEntries != 2 || response.BytecodeCacheEntries != 1 || response.CompatibilityFallbacks != 5 || response.SDKPreferredHits != 2 || response.SessionObserverCount != 6 || response.FallbackCount != 7 || response.LastError != "previous failure" {
 		t.Fatalf("runtime details = %#v", response)
 	}
 }

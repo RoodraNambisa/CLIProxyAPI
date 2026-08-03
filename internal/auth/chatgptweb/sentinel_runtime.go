@@ -120,25 +120,28 @@ type SentinelRuntimeConfig struct {
 
 // SentinelRuntimeSnapshot is safe to expose through the management API.
 type SentinelRuntimeSnapshot struct {
-	SDKRuntimeEnabled    bool   `json:"sdk-runtime-enabled"`
-	SDKWorkers           int    `json:"sdk-workers"`
-	SDKQueueSize         int    `json:"sdk-queue-size"`
-	SDKCacheVersions     int    `json:"sdk-cache-versions"`
-	Initialized          bool   `json:"initialized"`
-	Available            bool   `json:"available"`
-	WorkerLimit          int    `json:"worker_limit"`
-	Busy                 int    `json:"busy"`
-	Queued               int    `json:"queued"`
-	SourcePending        int    `json:"source_pending"`
-	SourceWaiters        int    `json:"source_waiters"`
-	BytecodeWaiters      int    `json:"bytecode_waiters"`
-	ObserverSessions     int    `json:"observer_sessions"`
-	SDKVersion           string `json:"sdk_version,omitempty"`
-	SDKSHA256            string `json:"sdk_sha256,omitempty"`
-	SourceCacheEntries   int    `json:"source_cache_entries"`
-	BytecodeCacheEntries int    `json:"bytecode_cache_entries"`
-	FallbackCount        uint64 `json:"fallback_count"`
-	LastError            string `json:"last_error,omitempty"`
+	SDKRuntimeEnabled      bool   `json:"sdk-runtime-enabled"`
+	SDKWorkers             int    `json:"sdk-workers"`
+	SDKQueueSize           int    `json:"sdk-queue-size"`
+	SDKCacheVersions       int    `json:"sdk-cache-versions"`
+	Initialized            bool   `json:"initialized"`
+	Available              bool   `json:"available"`
+	WorkerLimit            int    `json:"worker_limit"`
+	Busy                   int    `json:"busy"`
+	Queued                 int    `json:"queued"`
+	SourcePending          int    `json:"source_pending"`
+	SourceWaiters          int    `json:"source_waiters"`
+	BytecodeWaiters        int    `json:"bytecode_waiters"`
+	ObserverSessions       int    `json:"observer_sessions"`
+	SDKVersion             string `json:"sdk_version,omitempty"`
+	SDKSHA256              string `json:"sdk_sha256,omitempty"`
+	SourceCacheEntries     int    `json:"source_cache_entries"`
+	BytecodeCacheEntries   int    `json:"bytecode_cache_entries"`
+	CompatibilityFallbacks uint64 `json:"compatibility_fallback_count"`
+	SDKPreferredHits       uint64 `json:"sdk_preferred_hit_count"`
+	SessionObserverCount   uint64 `json:"session_observer_count"`
+	FallbackCount          uint64 `json:"fallback_count"`
+	LastError              string `json:"last_error,omitempty"`
 }
 
 // SentinelRuntimeError is a local SDK scheduling or availability failure.
@@ -286,29 +289,38 @@ type sentinelPreferredHintEntry struct {
 	candidate bool
 }
 
+type sentinelSDKTurnstileReason uint8
+
+const (
+	sentinelSDKCompatibilityFallback sentinelSDKTurnstileReason = iota
+	sentinelSDKPreferredHit
+)
+
 // SentinelRuntimeManager owns the lazy SDK scheduler and in-memory caches.
 // It starts no goroutine and creates no QJS runtime until an SDK task is used.
 type SentinelRuntimeManager struct {
 	mu          sync.Mutex
 	lifecycleMu sync.Mutex
 
-	config           SentinelRuntimeConfig
-	workerLimit      int
-	busy             int
-	observerBusy     int
-	queued           int
-	queues           [sentinelPriorityCount][]*sentinelRuntimeWaiter
-	closed           bool
-	initialized      bool
-	observerSessions int
-	activeTasks      int
-	sourcePending    int
-	sourceWaiters    int
-	bytecodeWaiters  int
-	fallbackCount    uint64
-	lastError        string
-	latestVersion    string
-	latestHash       string
+	config                 SentinelRuntimeConfig
+	workerLimit            int
+	busy                   int
+	observerBusy           int
+	queued                 int
+	queues                 [sentinelPriorityCount][]*sentinelRuntimeWaiter
+	closed                 bool
+	initialized            bool
+	observerSessions       int
+	activeTasks            int
+	sourcePending          int
+	sourceWaiters          int
+	bytecodeWaiters        int
+	compatibilityFallbacks uint64
+	sdkPreferredHits       uint64
+	sessionObserverCount   uint64
+	lastError              string
+	latestVersion          string
+	latestHash             string
 
 	sourceCache     map[string]*list.Element
 	sourceLRU       *list.List
@@ -499,25 +511,28 @@ func (manager *SentinelRuntimeManager) Snapshot() SentinelRuntimeSnapshot {
 		available = false
 	}
 	return SentinelRuntimeSnapshot{
-		SDKRuntimeEnabled:    manager.config.Enabled,
-		SDKWorkers:           manager.config.Workers,
-		SDKQueueSize:         manager.config.QueueSize,
-		SDKCacheVersions:     manager.config.CacheVersions,
-		Initialized:          manager.initialized,
-		Available:            available,
-		WorkerLimit:          manager.workerLimit,
-		Busy:                 manager.busy,
-		Queued:               manager.queued,
-		SourcePending:        manager.sourcePending,
-		SourceWaiters:        manager.sourceWaiters,
-		BytecodeWaiters:      manager.bytecodeWaiters,
-		ObserverSessions:     manager.observerSessions,
-		SDKVersion:           manager.latestVersion,
-		SDKSHA256:            manager.latestHash,
-		SourceCacheEntries:   len(manager.sourceCache),
-		BytecodeCacheEntries: len(manager.bytecodeCache),
-		FallbackCount:        manager.fallbackCount,
-		LastError:            manager.lastError,
+		SDKRuntimeEnabled:      manager.config.Enabled,
+		SDKWorkers:             manager.config.Workers,
+		SDKQueueSize:           manager.config.QueueSize,
+		SDKCacheVersions:       manager.config.CacheVersions,
+		Initialized:            manager.initialized,
+		Available:              available,
+		WorkerLimit:            manager.workerLimit,
+		Busy:                   manager.busy,
+		Queued:                 manager.queued,
+		SourcePending:          manager.sourcePending,
+		SourceWaiters:          manager.sourceWaiters,
+		BytecodeWaiters:        manager.bytecodeWaiters,
+		ObserverSessions:       manager.observerSessions,
+		SDKVersion:             manager.latestVersion,
+		SDKSHA256:              manager.latestHash,
+		SourceCacheEntries:     len(manager.sourceCache),
+		BytecodeCacheEntries:   len(manager.bytecodeCache),
+		CompatibilityFallbacks: manager.compatibilityFallbacks,
+		SDKPreferredHits:       manager.sdkPreferredHits,
+		SessionObserverCount:   manager.sessionObserverCount,
+		FallbackCount:          manager.compatibilityFallbacks + manager.sdkPreferredHits,
+		LastError:              manager.lastError,
 	}
 }
 
@@ -817,10 +832,15 @@ func (manager *SentinelRuntimeManager) recordError(generation uint64, code strin
 	manager.mu.Unlock()
 }
 
-func (manager *SentinelRuntimeManager) recordFallbackSuccess(generation uint64) {
+func (manager *SentinelRuntimeManager) recordSDKTurnstileSuccess(generation uint64, reason sentinelSDKTurnstileReason) {
 	manager.mu.Lock()
 	if manager.generationActiveLocked(generation) {
-		manager.fallbackCount++
+		switch reason {
+		case sentinelSDKPreferredHit:
+			manager.sdkPreferredHits++
+		default:
+			manager.compatibilityFallbacks++
+		}
 		manager.lastError = ""
 	}
 	manager.mu.Unlock()
@@ -965,7 +985,8 @@ func (manager *SentinelRuntimeManager) markPreferred(generation uint64, hash str
 		}
 	}
 	key := sentinelPreferredKey{hash: hash, program: program, signature: signature}
-	if _, exists := manager.preferred[key]; !exists && len(manager.preferred) >= sentinelSDKPreferredMax {
+	_, exists := manager.preferred[key]
+	if !exists && len(manager.preferred) >= sentinelSDKPreferredMax {
 		var oldestKey sentinelPreferredKey
 		var oldest time.Time
 		oldestSet := false
@@ -978,7 +999,9 @@ func (manager *SentinelRuntimeManager) markPreferred(generation uint64, hash str
 		}
 		delete(manager.preferred, oldestKey)
 	}
-	manager.preferred[key] = now.Add(sentinelSDKPreferredTTL)
+	if !exists {
+		manager.preferred[key] = now.Add(sentinelSDKPreferredTTL)
+	}
 	for hint, entry := range manager.preferredHints {
 		if entry.signature == signature {
 			entry.candidate = true
@@ -1036,7 +1059,8 @@ func (manager *SentinelRuntimeManager) cacheChallengeSignature(generation uint64
 			delete(manager.preferredHints, key)
 		}
 	}
-	if _, exists := manager.preferredHints[hint]; !exists && len(manager.preferredHints) >= sentinelSDKPreferredMax {
+	entry, exists := manager.preferredHints[hint]
+	if !exists && len(manager.preferredHints) >= sentinelSDKPreferredMax {
 		var oldestKey sentinelPreferredHintKey
 		var oldest time.Time
 		oldestSet := false
@@ -1049,10 +1073,16 @@ func (manager *SentinelRuntimeManager) cacheChallengeSignature(generation uint64
 		}
 		delete(manager.preferredHints, oldestKey)
 	}
-	manager.preferredHints[hint] = sentinelPreferredHintEntry{
-		signature: signature,
-		expiresAt: now.Add(sentinelSDKPreferredTTL),
-		candidate: candidate,
+	if exists {
+		entry.signature = signature
+		entry.candidate = entry.candidate || candidate
+		manager.preferredHints[hint] = entry
+	} else {
+		manager.preferredHints[hint] = sentinelPreferredHintEntry{
+			signature: signature,
+			expiresAt: now.Add(sentinelSDKPreferredTTL),
+			candidate: candidate,
+		}
 	}
 	manager.mu.Unlock()
 }
@@ -2336,7 +2366,7 @@ func (manager *SentinelRuntimeManager) SolveTurnstile(
 					if cached := manager.latestSourceForURL(sourceURL, expectedHashes); cached != nil {
 						preferred = manager.isPreferred(cached.hash, SentinelProgramTurnstile, signature)
 						if preferred {
-							return manager.solveTurnstileWithSDK(ctx, sdkRequest, cached, signature, true, observer, goRequest.DX, goRequest.RequirementsToken)
+							return manager.solveTurnstileWithSDK(ctx, sdkRequest, cached, signature, sentinelSDKPreferredHit, observer, goRequest.DX, goRequest.RequirementsToken)
 						}
 					}
 				}
@@ -2374,7 +2404,7 @@ func (manager *SentinelRuntimeManager) SolveTurnstile(
 		}
 	}
 	signature = conversationSentinelCompatibilitySignature(signature, compatibility)
-	return manager.solveTurnstileWithSDK(ctx, sdkRequest, nil, signature, signature != "", observer, goRequest.DX, goRequest.RequirementsToken)
+	return manager.solveTurnstileWithSDK(ctx, sdkRequest, nil, signature, sentinelSDKCompatibilityFallback, observer, goRequest.DX, goRequest.RequirementsToken)
 }
 
 func (manager *SentinelRuntimeManager) solveTurnstileWithSDK(
@@ -2382,7 +2412,7 @@ func (manager *SentinelRuntimeManager) solveTurnstileWithSDK(
 	request SentinelSDKRequest,
 	source *sentinelSourceCacheEntry,
 	signature string,
-	cachePreferred bool,
+	reason sentinelSDKTurnstileReason,
 	observer *SentinelObserver,
 	dx string,
 	requirementsToken string,
@@ -2406,10 +2436,10 @@ func (manager *SentinelRuntimeManager) solveTurnstileWithSDK(
 				generation = observer.source.generation
 			}
 			observer.mu.Unlock()
-			if cachePreferred {
+			if signature != "" {
 				manager.markPreferredForChallenge(generation, hash, SentinelProgramTurnstile, signature, dx, requirementsToken)
 			}
-			manager.recordFallbackSuccess(generation)
+			manager.recordSDKTurnstileSuccess(generation, reason)
 			return token, nil
 		} else {
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
@@ -2487,10 +2517,10 @@ func (manager *SentinelRuntimeManager) solveTurnstileWithSDK(
 		recordSentinelCircuitForError(manager, ctx, source.generation, source.hash, err)
 		return "", newSentinelRuntimeError("sentinel_sdk_unavailable", 0, err)
 	}
-	if cachePreferred {
+	if signature != "" {
 		manager.markPreferredForChallenge(source.generation, source.hash, SentinelProgramTurnstile, signature, dx, requirementsToken)
 	}
-	manager.recordFallbackSuccess(source.generation)
+	manager.recordSDKTurnstileSuccess(source.generation, reason)
 	return token, nil
 }
 
@@ -2636,6 +2666,7 @@ func (observer *SentinelObserver) initialize() {
 	keepLease = true
 	observer.mu.Unlock()
 	observer.manager.observerSessions++
+	observer.manager.sessionObserverCount++
 	observer.manager.lastError = ""
 	observer.manager.mu.Unlock()
 }

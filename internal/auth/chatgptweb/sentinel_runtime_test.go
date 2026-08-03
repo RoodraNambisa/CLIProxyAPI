@@ -653,7 +653,7 @@ func TestSentinelRuntimeManagerSolvesCompatibilityFallback(t *testing.T) {
 		t.Fatalf("SDK fetches = %d", fetches.Load())
 	}
 	snapshot := manager.Snapshot()
-	if !snapshot.Initialized || snapshot.FallbackCount != 1 || snapshot.SourceCacheEntries != 1 || snapshot.BytecodeCacheEntries != 1 {
+	if !snapshot.Initialized || snapshot.CompatibilityFallbacks != 1 || snapshot.SDKPreferredHits != 0 || snapshot.FallbackCount != 1 || snapshot.SourceCacheEntries != 1 || snapshot.BytecodeCacheEntries != 1 {
 		t.Fatalf("snapshot = %+v", snapshot)
 	}
 	if manager.maxActiveQJS.Load() > int64(snapshot.WorkerLimit) {
@@ -957,6 +957,75 @@ func TestSentinelRuntimeManagerPrefersTypedCompatibilityFallback(t *testing.T) {
 	}
 	if token, err := manager.SolveTurnstile(t.Context(), request, sdkRequest, nil); err != nil || token != "sdk-turnstile-token" {
 		t.Fatalf("preferred SolveTurnstile() = %q, %v", token, err)
+	}
+	if snapshot := manager.Snapshot(); snapshot.CompatibilityFallbacks != 1 || snapshot.SDKPreferredHits != 1 || snapshot.FallbackCount != 2 {
+		t.Fatalf("split SDK counters = %+v", snapshot)
+	}
+}
+
+func TestSentinelRuntimeSDKPreferredExpiryDoesNotSlideOnHit(t *testing.T) {
+	manager := newSentinelRuntimeTestManager()
+	defer manager.Close()
+	var nowUnix atomic.Int64
+	nowUnix.Store(4000)
+	manager.now = func() time.Time { return time.Unix(nowUnix.Load(), 0) }
+	request, sdkRequest := sentinelRuntimeTestRequests(t, false)
+	request.DX = encodeConversationTurnstileProgram(t, request.RequirementsToken, []any{
+		[]any{2, 40, "navigator"},
+		[]any{6, 41, 10, 40},
+		[]any{2, 42, "futureCapability"},
+		[]any{6, 43, 41, 42},
+		[]any{7, 43},
+	})
+	sdkRequest.Challenge["turnstile"] = map[string]any{"required": true, "dx": request.DX}
+	var fetches atomic.Int64
+	sdkRequest.Fetcher = sentinelRuntimeTestFetcher(&fetches)
+
+	if _, err := manager.SolveTurnstile(t.Context(), request, sdkRequest, nil); err != nil {
+		t.Fatalf("initial compatibility fallback error = %v", err)
+	}
+	manager.mu.Lock()
+	var initialExpiry time.Time
+	for _, expiresAt := range manager.preferred {
+		initialExpiry = expiresAt
+	}
+	var initialHintExpiry time.Time
+	for _, entry := range manager.preferredHints {
+		initialHintExpiry = entry.expiresAt
+	}
+	manager.mu.Unlock()
+	if initialExpiry.IsZero() || initialHintExpiry.IsZero() {
+		t.Fatal("initial SDK preferred expiry was not recorded")
+	}
+
+	nowUnix.Add(int64((sentinelSDKPreferredTTL / 2) / time.Second))
+	if _, err := manager.SolveTurnstile(t.Context(), request, sdkRequest, nil); err != nil {
+		t.Fatalf("SDK preferred hit error = %v", err)
+	}
+	manager.mu.Lock()
+	var expiryAfterHit time.Time
+	for _, expiresAt := range manager.preferred {
+		expiryAfterHit = expiresAt
+	}
+	var hintExpiryAfterHit time.Time
+	for _, entry := range manager.preferredHints {
+		hintExpiryAfterHit = entry.expiresAt
+	}
+	manager.mu.Unlock()
+	if !expiryAfterHit.Equal(initialExpiry) || !hintExpiryAfterHit.Equal(initialHintExpiry) {
+		t.Fatalf("SDK preferred expiry slid from %s/%s to %s/%s", initialExpiry, initialHintExpiry, expiryAfterHit, hintExpiryAfterHit)
+	}
+
+	nowUnix.Store(initialExpiry.Unix())
+	if _, err := manager.SolveTurnstile(t.Context(), request, sdkRequest, nil); err != nil {
+		t.Fatalf("post-expiry compatibility fallback error = %v", err)
+	}
+	snapshot := manager.Snapshot()
+	if snapshot.CompatibilityFallbacks != 2 || snapshot.SDKPreferredHits != 1 || snapshot.FallbackCount != 3 {
+		t.Fatalf("post-expiry split SDK counters = %+v", snapshot)
+	}
+	if fetches.Load() != 1 {
+		t.Fatalf("SDK source fetches = %d, want cached source reuse at preferred expiry", fetches.Load())
 	}
 }
 
@@ -1371,7 +1440,7 @@ func TestSentinelRuntimePreservesBusyErrorFromQJSCapacity(t *testing.T) {
 	t.Run("turnstile fallback", func(t *testing.T) {
 		manager, sdkRequest, source := newCachedRuntime(t, false)
 		manager.activeQJS.Store(1)
-		_, err := manager.solveTurnstileWithSDK(t.Context(), sdkRequest, source, "signature", false, nil, "dx", "requirements")
+		_, err := manager.solveTurnstileWithSDK(t.Context(), sdkRequest, source, "signature", sentinelSDKCompatibilityFallback, nil, "dx", "requirements")
 		assertBusy(t, err)
 		manager.activeQJS.Store(0)
 		manager.Close()
@@ -1418,7 +1487,7 @@ func TestSentinelRuntimeCloseWaitsForIndependentFallbackAfterObserverFailure(t *
 	solveDone := make(chan error, 1)
 	go func() {
 		_, solveErr := manager.solveTurnstileWithSDK(
-			context.Background(), sdkRequest, nil, "signature", false, observer, "dx", "requirements",
+			context.Background(), sdkRequest, nil, "signature", sentinelSDKCompatibilityFallback, observer, "dx", "requirements",
 		)
 		solveDone <- solveErr
 	}()
@@ -1535,13 +1604,13 @@ func TestSentinelRuntimeObserverCollectorAndSnapshot(t *testing.T) {
 		observer.Close()
 		t.Fatalf("SO token = %#v", payload)
 	}
-	if manager.Snapshot().ObserverSessions != 1 {
+	if snapshot := manager.Snapshot(); snapshot.ObserverSessions != 1 || snapshot.SessionObserverCount != 1 {
 		observer.Close()
-		t.Fatalf("snapshot = %+v", manager.Snapshot())
+		t.Fatalf("snapshot = %+v", snapshot)
 	}
 	observer.Close()
-	if manager.Snapshot().ObserverSessions != 0 {
-		t.Fatalf("snapshot after close = %+v", manager.Snapshot())
+	if snapshot := manager.Snapshot(); snapshot.ObserverSessions != 0 || snapshot.SessionObserverCount != 1 {
+		t.Fatalf("snapshot after close = %+v", snapshot)
 	}
 }
 
