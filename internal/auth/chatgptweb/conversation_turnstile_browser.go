@@ -102,6 +102,10 @@ func (vm *conversationTurnstileVM) newDOMElement(name string) (*conversationTurn
 
 func (vm *conversationTurnstileVM) callBrowserObjectRef(name string, args []any) (any, bool, error) {
 	switch name {
+	case "window.addEventListener", "window.removeEventListener":
+		return conversationTurnstileUndefined, true, nil
+	case "window.dispatchEvent":
+		return true, true, nil
 	case "window.document.createElement":
 		tagName := "div"
 		if len(args) > 0 {
@@ -519,7 +523,8 @@ func (vm *conversationTurnstileVM) knownEnvironmentProperty(object, propertyKey 
 
 func conversationTurnstileBrowserNativeObjectPath(path string) bool {
 	switch path {
-	case "window.document.createElement", "window.document.createElementNS",
+	case "window.addEventListener", "window.removeEventListener", "window.dispatchEvent",
+		"window.document.createElement", "window.document.createElementNS",
 		"window.document.querySelector", "window.document.querySelectorAll",
 		"window.document.getElementById", "window.document.getElementsByTagName",
 		"window.document.addEventListener", "window.document.removeEventListener", "window.document.dispatchEvent",

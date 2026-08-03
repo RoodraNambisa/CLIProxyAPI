@@ -1309,6 +1309,7 @@ func (e *ChatGPTWebExecutor) chatGPTWebSentinelSDKFetcher(client *chatgptwebauth
 func chatGPTWebSentinelRuntimeProtocolError(err error) statusErr {
 	code := "sentinel_sdk_unavailable"
 	statusCode := http.StatusServiceUnavailable
+	message := "ChatGPT Web Sentinel SDK is temporarily unavailable"
 	var runtimeErr *chatgptwebauth.SentinelRuntimeError
 	var retryAfter *time.Duration
 	if errors.As(err, &runtimeErr) {
@@ -1322,10 +1323,11 @@ func chatGPTWebSentinelRuntimeProtocolError(err error) statusErr {
 	}
 	if code == "sentinel_session_observer_unavailable" {
 		statusCode = http.StatusBadGateway
+		message = "ChatGPT Web Sentinel Session Observer is temporarily unavailable"
 	}
 	payload, marshalErr := json.Marshal(map[string]any{
 		"error": map[string]any{
-			"message": "ChatGPT Web Sentinel SDK is temporarily unavailable",
+			"message": message,
 			"type":    "upstream_protocol_error",
 			"code":    code,
 		},

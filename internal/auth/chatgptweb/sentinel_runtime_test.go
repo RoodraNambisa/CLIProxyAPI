@@ -1716,6 +1716,323 @@ func TestSentinelRuntimeObserverCollectorAndSnapshot(t *testing.T) {
 	}
 }
 
+func TestSentinelRuntimeObserverUsesGoVMWithoutSDKWork(t *testing.T) {
+	for _, enabled := range []bool{true, false} {
+		t.Run("enabled="+strconv.FormatBool(enabled), func(t *testing.T) {
+			manager := newSentinelRuntimeTestManagerWithConfig(SentinelRuntimeConfig{Enabled: enabled, Workers: 1, QueueSize: 1, CacheVersions: 3})
+			manager.random = zeroReader{}
+			defer manager.Close()
+			_, sdkRequest := sentinelRuntimeGoObserverRequests(t,
+				[]any{[]any{2, 40, "collector-state"}},
+				[]any{[]any{7, 3, 40}},
+			)
+			var fetches atomic.Int64
+			sdkRequest.Fetcher = sentinelRuntimeTestFetcher(&fetches)
+			observer, err := manager.BeginObserver(t.Context(), sdkRequest)
+			if err != nil || observer == nil {
+				t.Fatalf("BeginObserver() = %#v, %v", observer, err)
+			}
+			token, err := observer.Snapshot(t.Context())
+			if err != nil {
+				observer.Close()
+				t.Fatalf("Snapshot() error = %v", err)
+			}
+			var payload map[string]any
+			if err = json.Unmarshal([]byte(token), &payload); err != nil || payload["so"] != "Y29sbGVjdG9yLXN0YXRl" {
+				observer.Close()
+				t.Fatalf("Observer token = %q, %v", token, err)
+			}
+			snapshot := manager.Snapshot()
+			if fetches.Load() != 0 || snapshot.Initialized || snapshot.Busy != 0 || snapshot.Queued != 0 || snapshot.CompatibilityFallbacks != 0 || snapshot.SessionObserverCount != 1 {
+				observer.Close()
+				t.Fatalf("Go Observer runtime state: fetches=%d snapshot=%+v", fetches.Load(), snapshot)
+			}
+			if manager.activeQJS.Load() != 0 {
+				observer.Close()
+				t.Fatalf("active QJS runtimes = %d", manager.activeQJS.Load())
+			}
+			observer.Close()
+		})
+	}
+}
+
+func TestSentinelRuntimeObserverSnapshotCompatibilityFallsBackToSDK(t *testing.T) {
+	manager := newSentinelRuntimeTestManager()
+	defer manager.Close()
+	_, sdkRequest := sentinelRuntimeGoObserverRequests(t,
+		[]any{[]any{2, 40, "collector-state"}},
+		[]any{[]any{36, "unsupported"}},
+	)
+	var fetches atomic.Int64
+	sdkRequest.Fetcher = sentinelRuntimeTestFetcher(&fetches)
+	observer, err := manager.BeginObserver(t.Context(), sdkRequest)
+	if err != nil || observer == nil {
+		t.Fatalf("BeginObserver() = %#v, %v", observer, err)
+	}
+	defer observer.Close()
+	if fetches.Load() != 0 || manager.Snapshot().Initialized {
+		t.Fatalf("SDK initialized before snapshot: fetches=%d snapshot=%+v", fetches.Load(), manager.Snapshot())
+	}
+	token, err := observer.Snapshot(t.Context())
+	if err != nil || !strings.Contains(token, "sdk-snapshot-token") {
+		t.Fatalf("Snapshot() = %q, %v", token, err)
+	}
+	snapshot := manager.Snapshot()
+	if fetches.Load() != 1 || !snapshot.Initialized || snapshot.CompatibilityFallbacks != 1 || snapshot.FallbackCount != 1 || snapshot.SessionObserverCount != 1 {
+		t.Fatalf("SDK fallback state: fetches=%d snapshot=%+v", fetches.Load(), snapshot)
+	}
+}
+
+func TestSentinelRuntimeObserverFatalSnapshotDoesNotFetchSDK(t *testing.T) {
+	manager := newSentinelRuntimeTestManager()
+	defer manager.Close()
+	_, sdkRequest := sentinelRuntimeGoObserverRequests(t,
+		[]any{[]any{2, 40, "collector-state"}},
+		[]any{[]any{4}},
+	)
+	var fetches atomic.Int64
+	sdkRequest.Fetcher = sentinelRuntimeTestFetcher(&fetches)
+	observer, err := manager.BeginObserver(t.Context(), sdkRequest)
+	if err != nil || observer == nil {
+		t.Fatalf("BeginObserver() = %#v, %v", observer, err)
+	}
+	defer observer.Close()
+	_, err = observer.Snapshot(t.Context())
+	var runtimeErr *SentinelRuntimeError
+	if !errors.As(err, &runtimeErr) || runtimeErr.Code != "sentinel_session_observer_unavailable" {
+		t.Fatalf("Snapshot() error = %#v", err)
+	}
+	if fetches.Load() != 0 || manager.Snapshot().Initialized {
+		t.Fatalf("fatal Go snapshot used SDK: fetches=%d snapshot=%+v", fetches.Load(), manager.Snapshot())
+	}
+}
+
+func TestSentinelRuntimeObserverFatalCollectorDoesNotFetchSDK(t *testing.T) {
+	manager := newSentinelRuntimeTestManager()
+	defer manager.Close()
+	_, sdkRequest := sentinelRuntimeGoObserverRequests(t,
+		[]any{[]any{4}},
+		[]any{[]any{2, 40, "snapshot"}, []any{7, 3, 40}},
+	)
+	var fetches atomic.Int64
+	sdkRequest.Fetcher = sentinelRuntimeTestFetcher(&fetches)
+	observer, err := manager.BeginObserver(t.Context(), sdkRequest)
+	if err != nil || observer == nil {
+		t.Fatalf("BeginObserver() = %#v, %v", observer, err)
+	}
+	defer observer.Close()
+	_, err = observer.Snapshot(t.Context())
+	var runtimeErr *SentinelRuntimeError
+	if !errors.As(err, &runtimeErr) || runtimeErr.Code != "sentinel_session_observer_unavailable" {
+		t.Fatalf("Snapshot() error = %#v", err)
+	}
+	if fetches.Load() != 0 || manager.Snapshot().Initialized || manager.Snapshot().SessionObserverCount != 0 {
+		t.Fatalf("fatal Go collector used SDK: fetches=%d snapshot=%+v", fetches.Load(), manager.Snapshot())
+	}
+}
+
+func TestSentinelRuntimeDisabledObserverDoesNotFallbackToSDK(t *testing.T) {
+	manager := newSentinelRuntimeTestManagerWithConfig(SentinelRuntimeConfig{Enabled: false, Workers: 1, QueueSize: 1, CacheVersions: 3})
+	manager.random = zeroReader{}
+	defer manager.Close()
+	_, sdkRequest := sentinelRuntimeGoObserverRequests(t,
+		[]any{[]any{2, 40, "collector-state"}},
+		[]any{[]any{36, "unsupported"}},
+	)
+	var fetches atomic.Int64
+	sdkRequest.Fetcher = sentinelRuntimeTestFetcher(&fetches)
+	observer, err := manager.BeginObserver(t.Context(), sdkRequest)
+	if err != nil || observer == nil {
+		t.Fatalf("BeginObserver() = %#v, %v", observer, err)
+	}
+	defer observer.Close()
+	_, err = observer.Snapshot(t.Context())
+	var runtimeErr *SentinelRuntimeError
+	if !errors.As(err, &runtimeErr) || runtimeErr.Code != "sentinel_session_observer_unavailable" {
+		t.Fatalf("Snapshot() error = %#v", err)
+	}
+	if fetches.Load() != 0 || manager.Snapshot().Initialized {
+		t.Fatalf("disabled runtime used SDK: fetches=%d snapshot=%+v", fetches.Load(), manager.Snapshot())
+	}
+}
+
+func TestSentinelRuntimeObserverCreatedDuringSDKDrainDoesNotFallback(t *testing.T) {
+	manager := newSentinelRuntimeTestManagerWithConfig(SentinelRuntimeConfig{Enabled: true, Workers: 1, QueueSize: 1, CacheVersions: 3})
+	manager.random = zeroReader{}
+	defer manager.Close()
+	_, compatibleRequest := sentinelRuntimeGoObserverRequests(t,
+		[]any{[]any{2, 40, "collector-state"}},
+		[]any{[]any{7, 3, 40}},
+	)
+	activeObserver, err := manager.BeginObserver(t.Context(), compatibleRequest)
+	if err != nil || activeObserver == nil {
+		t.Fatalf("BeginObserver() = %#v, %v", activeObserver, err)
+	}
+	defer activeObserver.Close()
+
+	manager.UpdateConfig(SentinelRuntimeConfig{Enabled: false, Workers: 1, QueueSize: 1, CacheVersions: 3})
+	_, incompatibleRequest := sentinelRuntimeGoObserverRequests(t,
+		[]any{[]any{36, "unsupported"}},
+		[]any{[]any{2, 40, "snapshot"}, []any{7, 3, 40}},
+	)
+	var fetches atomic.Int64
+	incompatibleRequest.Fetcher = sentinelRuntimeTestFetcher(&fetches)
+	drainingObserver, err := manager.BeginObserver(t.Context(), incompatibleRequest)
+	if err != nil || drainingObserver == nil {
+		t.Fatalf("BeginObserver() = %#v, %v", drainingObserver, err)
+	}
+	defer drainingObserver.Close()
+	_, err = drainingObserver.Snapshot(t.Context())
+	var runtimeErr *SentinelRuntimeError
+	if !errors.As(err, &runtimeErr) || runtimeErr.Code != "sentinel_session_observer_unavailable" {
+		t.Fatalf("Snapshot() error = %#v", err)
+	}
+	if fetches.Load() != 0 || manager.Snapshot().Initialized {
+		t.Fatalf("draining runtime used SDK: fetches=%d snapshot=%+v", fetches.Load(), manager.Snapshot())
+	}
+}
+
+func TestSentinelRuntimeDisabledObserverIgnoresOldSDKPreferredHint(t *testing.T) {
+	manager := newSentinelRuntimeTestManagerWithConfig(SentinelRuntimeConfig{Enabled: true, Workers: 1, QueueSize: 1, CacheVersions: 3})
+	manager.random = zeroReader{}
+	defer manager.Close()
+	goRequest, sdkRequest := sentinelRuntimeGoObserverRequests(t,
+		[]any{[]any{2, 40, "collector-state"}},
+		[]any{[]any{7, 3, 40}},
+	)
+	goRequest.DX = encodeConversationTurnstileProgram(t, goRequest.RequirementsToken, []any{
+		[]any{2, 40, "go-token"},
+		[]any{7, 3, 40},
+	})
+	sdkRequest.Challenge["turnstile"] = map[string]any{"required": true, "dx": goRequest.DX}
+	var fetches atomic.Int64
+	sdkRequest.Fetcher = sentinelRuntimeTestFetcher(&fetches)
+	source, err := manager.sourceForTask(t.Context(), sdkRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, signature, err := prepareConversationSentinelProgramSignature(t.Context(), goRequest.DX, goRequest.RequirementsToken)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager.markPreferredForChallenge(source.generation, source.hash, SentinelProgramTurnstile, signature, goRequest.DX, goRequest.RequirementsToken)
+
+	activeObserver, err := manager.BeginObserver(t.Context(), sdkRequest)
+	if err != nil || activeObserver == nil {
+		t.Fatalf("BeginObserver() = %#v, %v", activeObserver, err)
+	}
+	defer activeObserver.Close()
+	manager.UpdateConfig(SentinelRuntimeConfig{Enabled: false, Workers: 1, QueueSize: 1, CacheVersions: 3})
+	disabledObserver, err := manager.BeginObserver(t.Context(), sdkRequest)
+	if err != nil || disabledObserver == nil {
+		t.Fatalf("BeginObserver() = %#v, %v", disabledObserver, err)
+	}
+	defer disabledObserver.Close()
+	token, err := manager.SolveTurnstile(t.Context(), goRequest, sdkRequest, disabledObserver)
+	if err != nil || token != "Z28tdG9rZW4=" {
+		t.Fatalf("SolveTurnstile() = %q, %v", token, err)
+	}
+	if fetches.Load() != 1 || manager.Snapshot().SDKPreferredHits != 0 {
+		t.Fatalf("disabled runtime used preferred SDK: fetches=%d snapshot=%+v", fetches.Load(), manager.Snapshot())
+	}
+}
+
+func TestSentinelRuntimeGoObserverCloseCancelsSnapshot(t *testing.T) {
+	manager := newSentinelRuntimeTestManager()
+	defer manager.Close()
+	_, sdkRequest := sentinelRuntimeGoObserverRequests(t,
+		[]any{[]any{2, 40, "collector-state"}},
+		[]any{[]any{7, 3, 40}},
+	)
+	observer, err := manager.BeginObserver(t.Context(), sdkRequest)
+	if err != nil || observer == nil {
+		t.Fatalf("BeginObserver() = %#v, %v", observer, err)
+	}
+	observer.mu.Lock()
+	goVM := observer.goVM
+	observer.mu.Unlock()
+	if goVM == nil {
+		observer.Close()
+		t.Fatal("Go Observer VM is nil")
+	}
+	blockingDX := encodeConversationTurnstileProgram(t, sdkRequest.RequirementsToken, []any{
+		[]any{7, 40},
+	})
+	started := make(chan struct{})
+	goVM.mu.Lock()
+	blockingProgram, prepareErr := prepareConversationTurnstileProgram(t.Context(), blockingDX, sdkRequest.RequirementsToken, goVM.vm.memoryBudget)
+	if prepareErr != nil {
+		goVM.mu.Unlock()
+		observer.Close()
+		t.Fatal(prepareErr)
+	}
+	goVM.snapshot = blockingProgram
+	goVM.vm.set(40, newConversationTurnstileCallable(func([]any) (any, error) {
+		close(started)
+		<-goVM.vm.ctx.Done()
+		return nil, goVM.vm.ctx.Err()
+	}))
+	goVM.mu.Unlock()
+
+	snapshotResult := make(chan error, 1)
+	go func() {
+		_, snapshotErr := observer.Snapshot(context.Background())
+		snapshotResult <- snapshotErr
+	}()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		observer.Close()
+		t.Fatal("Go snapshot did not start")
+	}
+	closed := make(chan struct{})
+	go func() {
+		observer.Close()
+		close(closed)
+	}()
+	select {
+	case <-closed:
+	case <-time.After(time.Second):
+		t.Fatal("Observer.Close() did not cancel the Go snapshot")
+	}
+	select {
+	case snapshotErr := <-snapshotResult:
+		if snapshotErr == nil {
+			t.Fatal("Snapshot() error = nil after Observer.Close()")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Go snapshot did not return after Observer.Close()")
+	}
+}
+
+func TestSentinelRuntimeTurnstileFallbackPromotesGoObserverOnce(t *testing.T) {
+	manager := newSentinelRuntimeTestManager()
+	defer manager.Close()
+	goRequest, sdkRequest := sentinelRuntimeGoObserverRequests(t,
+		[]any{[]any{2, 40, "collector-state"}},
+		[]any{[]any{7, 3, 40}},
+	)
+	var fetches atomic.Int64
+	sdkRequest.Fetcher = sentinelRuntimeTestFetcher(&fetches)
+	observer, err := manager.BeginObserver(t.Context(), sdkRequest)
+	if err != nil || observer == nil {
+		t.Fatalf("BeginObserver() = %#v, %v", observer, err)
+	}
+	defer observer.Close()
+	token, err := manager.SolveTurnstile(t.Context(), goRequest, sdkRequest, observer)
+	if err != nil || token != "sdk-turnstile-token" {
+		t.Fatalf("SolveTurnstile() = %q, %v", token, err)
+	}
+	observerToken, err := observer.Snapshot(t.Context())
+	if err != nil || !strings.Contains(observerToken, "sdk-snapshot-token") {
+		t.Fatalf("Snapshot() = %q, %v", observerToken, err)
+	}
+	snapshot := manager.Snapshot()
+	if fetches.Load() != 1 || snapshot.CompatibilityFallbacks != 1 || snapshot.FallbackCount != 1 || snapshot.SessionObserverCount != 1 {
+		t.Fatalf("promoted Observer state: fetches=%d snapshot=%+v", fetches.Load(), snapshot)
+	}
+}
+
 func TestSentinelRuntimeObserverReturnsRawSnapshotWithoutChallengeToken(t *testing.T) {
 	manager := newSentinelRuntimeTestManager()
 	defer manager.Close()
@@ -2998,6 +3315,15 @@ func sentinelRuntimeTestRequests(t *testing.T, observer bool) (ConversationTurns
 			DeviceID:          "device-id",
 			Flow:              "conversation",
 		}
+}
+
+func sentinelRuntimeGoObserverRequests(t *testing.T, collectorProgram, snapshotProgram []any) (ConversationTurnstileSolveRequest, SentinelSDKRequest) {
+	t.Helper()
+	goRequest, sdkRequest := sentinelRuntimeTestRequests(t, true)
+	observerConfig, _ := sdkRequest.Challenge["so"].(map[string]any)
+	observerConfig["collector_dx"] = encodeConversationTurnstileProgram(t, sdkRequest.RequirementsToken, collectorProgram)
+	observerConfig["snapshot_dx"] = encodeConversationTurnstileProgram(t, sdkRequest.RequirementsToken, snapshotProgram)
+	return goRequest, sdkRequest
 }
 
 func sentinelRuntimeTestFetcher(counter *atomic.Int64) SentinelSDKFetcher {

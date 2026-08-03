@@ -2,7 +2,9 @@ package chatgptweb
 
 import (
 	"encoding/base64"
+	"errors"
 	"testing"
+	"time"
 )
 
 func TestGoConversationTurnstileCanvasMatchesBrowserSemantics(t *testing.T) {
@@ -107,5 +109,51 @@ func TestGoConversationTurnstileLocalStorageModelsMissingNamedProperties(t *test
 	value, handled, err = vm.browserObjectRefProperty("window.localStorage", "stored")
 	if err != nil || !handled || value != "value" {
 		t.Fatalf("stored localStorage property = %#v, handled=%v, error=%v", value, handled, err)
+	}
+}
+
+func TestGoConversationTurnstileDocumentBodyAndDateNow(t *testing.T) {
+	current := time.UnixMilli(1_725_000_123_456)
+	vm := &conversationTurnstileVM{
+		environment:  make(map[string]any),
+		memoryBudget: &conversationTurnstileMemoryBudget{},
+		now:          func() time.Time { return current },
+	}
+	body, err := vm.newDOMElement("body")
+	if err != nil {
+		t.Fatal(err)
+	}
+	vm.environment["window.document.body"] = body
+
+	documentBody, err := vm.propertyWithKey(conversationTurnstileObjectRef{path: "window.document"}, "body")
+	if err != nil || documentBody != body {
+		t.Fatalf("document.body = %#v, %v", documentBody, err)
+	}
+	appendChild, err := vm.propertyWithKey(documentBody, "appendChild")
+	if err != nil {
+		t.Fatal(err)
+	}
+	child, err := vm.newDOMElement("canvas")
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := vm.call(appendChild, []any{child})
+	if err != nil || result != child || len(body.children) != 1 || body.children[0] != child {
+		t.Fatalf("appendChild() = %#v, %v; children = %#v", result, err, body.children)
+	}
+
+	dateNow, err := vm.call(conversationTurnstileObjectRef{path: "window.Date.now"}, nil)
+	if err != nil || dateNow != float64(current.UnixMilli()) {
+		t.Fatalf("Date.now() = %#v, %v", dateNow, err)
+	}
+	if _, handled, err := vm.callBrowserObjectRef("window.addEventListener", []any{"load", conversationTurnstileUndefined}); err != nil || !handled {
+		t.Fatalf("addEventListener() handled=%v error=%v", handled, err)
+	}
+	vm.compatibilityErrors = true
+	vm.programKind = SentinelProgramObserverCollect
+	_, err = vm.call(conversationTurnstileObjectRef{path: "window.Date"}, nil)
+	var compatibility *SentinelCompatibilityError
+	if !errors.As(err, &compatibility) || compatibility.ProgramKind != SentinelProgramObserverCollect {
+		t.Fatalf("Date() compatibility error = %#v", err)
 	}
 }

@@ -439,6 +439,7 @@ type conversationTurnstileVM struct {
 	deferred             bool
 	instructionCount     int
 	compatibilityErrors  bool
+	programKind          SentinelProgramKind
 	program              []any
 	opcodeSignature      string
 	missingValues        map[string]string
@@ -528,14 +529,22 @@ func prepareConversationTurnstileProgram(ctx context.Context, dx, requirementsTo
 }
 
 func executeConversationTurnstileProgram(ctx context.Context, prepared *conversationTurnstilePreparedProgram, environment ConversationTurnstileEnvironment, reader io.Reader, now func() time.Time, maxSteps, depth int, executionBudget *conversationTurnstileExecutionBudget, compatibilityErrors bool) (string, error) {
+	vm, err := newConversationTurnstileVM(ctx, prepared, environment, reader, now, maxSteps, depth, executionBudget, compatibilityErrors, SentinelProgramTurnstile)
+	if err != nil {
+		return "", err
+	}
+	return vm.runPreparedProgram()
+}
+
+func newConversationTurnstileVM(ctx context.Context, prepared *conversationTurnstilePreparedProgram, environment ConversationTurnstileEnvironment, reader io.Reader, now func() time.Time, maxSteps, depth int, executionBudget *conversationTurnstileExecutionBudget, compatibilityErrors bool, programKind SentinelProgramKind) (*conversationTurnstileVM, error) {
 	if prepared == nil || prepared.memoryBudget == nil {
-		return "", fmt.Errorf("invalid conversation turnstile challenge")
+		return nil, fmt.Errorf("invalid conversation turnstile challenge")
 	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	if err := ctx.Err(); err != nil {
-		return "", err
+		return nil, err
 	}
 	if now == nil {
 		now = time.Now
@@ -565,15 +574,28 @@ func executeConversationTurnstileProgram(ctx context.Context, prepared *conversa
 		executionBudget:      executionBudget,
 		regexpCache:          make(map[string]*regexp.Regexp),
 		compatibilityErrors:  compatibilityErrors,
+		programKind:          programKind,
 		program:              prepared.program,
 		opcodeSignature:      prepared.opcodeSignature,
 	}
 	vm.browserProfile = resolveSentinelBrowserProfile(environment)
 	vm.environment, vm.scriptSources, vm.localStorageKeys = normalizeConversationTurnstileEnvironment(environment, vm.startedAt)
+	documentBody, err := vm.newDOMElement("body")
+	if err != nil {
+		return nil, err
+	}
+	vm.environment["window.document.body"] = documentBody
 	vm.initializeLocalStorage()
 	vm.initialize(prepared.program, prepared.requirementsToken)
+	return vm, nil
+}
+
+func (vm *conversationTurnstileVM) runPreparedProgram() (string, error) {
+	if vm == nil {
+		return "", fmt.Errorf("invalid conversation turnstile challenge")
+	}
 	if err := vm.runQueue(); err != nil {
-		if fatalErr := conversationTurnstileFatalInstructionError(ctx, err); fatalErr != nil {
+		if fatalErr := conversationTurnstileFatalInstructionError(vm.ctx, err); fatalErr != nil {
 			return "", fatalErr
 		}
 		message := strconv.Itoa(vm.instructionCount) + ": " + conversationTurnstileErrorString(err)
@@ -587,6 +609,31 @@ func executeConversationTurnstileProgram(ctx context.Context, prepared *conversa
 		return strconv.Itoa(vm.instructionCount), nil
 	}
 	return vm.result, nil
+}
+
+func (vm *conversationTurnstileVM) continuePreparedProgram(ctx context.Context, prepared *conversationTurnstilePreparedProgram, programKind SentinelProgramKind) (string, error) {
+	if vm == nil || prepared == nil || prepared.memoryBudget == nil || prepared.memoryBudget != vm.memoryBudget || prepared.requirementsToken != vm.requirementsToken {
+		return "", fmt.Errorf("invalid conversation turnstile continuation")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	vm.ctx = ctx
+	vm.result = ""
+	vm.settled = false
+	vm.deferred = false
+	vm.fatalErr = nil
+	vm.program = prepared.program
+	vm.opcodeSignature = prepared.opcodeSignature
+	vm.programKind = programKind
+	vm.set(9, prepared.program)
+	if vm.fatalErr != nil {
+		return "", vm.fatalErr
+	}
+	return vm.runPreparedProgram()
 }
 
 func normalizeConversationTurnstileEnvironment(environment ConversationTurnstileEnvironment, startedAt time.Time) (map[string]any, []string, []string) {
@@ -1377,9 +1424,13 @@ func (vm *conversationTurnstileVM) fail(err error) {
 }
 
 func (vm *conversationTurnstileVM) compatibilityError(kind SentinelCompatibilityKind, operation string, err error) error {
+	programKind := vm.programKind
+	if programKind == "" {
+		programKind = SentinelProgramTurnstile
+	}
 	return &SentinelCompatibilityError{
 		Kind:            kind,
-		ProgramKind:     SentinelProgramTurnstile,
+		ProgramKind:     programKind,
 		OpcodeSignature: vm.opcodeSignature,
 		Operation:       strings.TrimSpace(operation),
 		Err:             err,
@@ -3710,6 +3761,14 @@ func (vm *conversationTurnstileVM) call(target any, args []any) (any, error) {
 		default:
 			return args[0], nil
 		}
+	case "window.Date":
+		return nil, vm.compatibilityError(
+			SentinelCompatibilityUnsupportedValue,
+			"window.Date()",
+			conversationTurnstileTypeError("Date constructor is not modeled by the Go VM"),
+		)
+	case "window.Date.now":
+		return float64(vm.now().UnixMilli()), nil
 	case "window.performance.now":
 		randomValue, err := randomFloat64(vm.reader)
 		if err != nil {
@@ -4571,10 +4630,10 @@ func conversationTurnstileNativeObjectPath(path string) bool {
 		return true
 	}
 	switch path {
-	case "window", "window.Array", "window.Math", "window.Reflect", "window.performance",
+	case "window", "window.Array", "window.Date", "window.Math", "window.Reflect", "window.performance",
 		"window.localStorage", "window.Object", "window.String",
 		"window.Array.isArray", "window.Array.from",
-		"window.Reflect.set", "window.performance.now", "window.Object.create",
+		"window.Date.now", "window.Reflect.set", "window.performance.now", "window.Object.create",
 		"window.Object.keys", "window.Math.random", "window.Math.abs",
 		"window.String.fromCharCode":
 		return true
@@ -4763,6 +4822,10 @@ func conversationTurnstileGlobalObjectString(path string) (string, bool) {
 		return "function isArray() { [native code] }", true
 	case "window.Array.from":
 		return "function from() { [native code] }", true
+	case "window.Date":
+		return "function Date() { [native code] }", true
+	case "window.Date.now":
+		return "function now() { [native code] }", true
 	case "window.Reflect.set":
 		return "function set() { [native code] }", true
 	case "window.performance.now":
@@ -5588,9 +5651,9 @@ func conversationTurnstileCallableObjectPath(path string) bool {
 		return true
 	}
 	switch path {
-	case "window.Array", "window.Object", "window.String", "window.Reflect.set",
+	case "window.Array", "window.Date", "window.Object", "window.String", "window.Reflect.set",
 		"window.Array.isArray", "window.Array.from",
-		"window.performance.now", "window.Object.create", "window.Object.keys",
+		"window.Date.now", "window.performance.now", "window.Object.create", "window.Object.keys",
 		"window.Math.random", "window.Math.abs", "window.String.fromCharCode":
 		return true
 	default:

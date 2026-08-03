@@ -350,7 +350,43 @@ func TestChatGPTWebImageEntrySendsSessionObserverToken(t *testing.T) {
 	assertChatGPTWebSentinelExecution(t, executor, receivedToken)
 }
 
-func TestChatGPTWebRequirementsRejectsRequiredObserverWhenSDKDisabled(t *testing.T) {
+func TestChatGPTWebRequirementsUsesGoObserverWhenSDKDisabled(t *testing.T) {
+	server := newChatGPTWebSentinelRequirementsServer(t, chatGPTWebSentinelRuntimeTestSDK, func(pToken string) map[string]any {
+		return map[string]any{
+			"prepare_token": "prepare",
+			"token":         "challenge-token",
+			"so": map[string]any{
+				"required":     true,
+				"collector_dx": chatGPTWebTurnstileTestDX(t, pToken, []any{[]any{2, 40, "collector-state"}}),
+				"snapshot_dx":  chatGPTWebTurnstileTestDX(t, pToken, []any{[]any{7, 3, 40}}),
+			},
+		}
+	}, func(map[string]any) map[string]any {
+		return map[string]any{"token": "requirements"}
+	})
+	defer server.Close()
+
+	enabled := false
+	executor := NewChatGPTWebExecutor(&config.Config{ChatGPTWeb: config.ChatGPTWebConfig{
+		Sentinel: config.ChatGPTWebSentinelConfig{SDKRuntimeEnabled: &enabled},
+	}}, nil)
+	executor.runtimeBaseURL = server.URL
+	defer func() { _ = executor.Close() }()
+	requirements := runChatGPTWebSentinelRequirements(t, executor)
+	var soToken map[string]any
+	if err := json.Unmarshal([]byte(requirements.SOToken), &soToken); err != nil {
+		t.Fatalf("decode Go SO token: %v", err)
+	}
+	if soToken["so"] != "Y29sbGVjdG9yLXN0YXRl" || soToken["c"] != "challenge-token" || soToken["flow"] != "conversation" {
+		t.Fatalf("Go SO token = %#v", soToken)
+	}
+	snapshot := executor.SentinelSnapshot()
+	if snapshot.Initialized || snapshot.CompatibilityFallbacks != 0 || snapshot.SessionObserverCount != 1 {
+		t.Fatalf("Go Observer runtime state = %+v", snapshot)
+	}
+}
+
+func TestChatGPTWebRequirementsRejectsIncompatibleRequiredObserverWhenSDKDisabled(t *testing.T) {
 	server := newChatGPTWebSentinelRequirementsServer(t, chatGPTWebSentinelRuntimeTestSDK, func(string) map[string]any {
 		return chatGPTWebSentinelObserverPrepare()
 	}, func(map[string]any) map[string]any {
@@ -478,6 +514,9 @@ func TestChatGPTWebSentinelObserverUnavailablePreservesRetryAfter(t *testing.T) 
 	}
 	if !strings.Contains(err.msg, "sentinel_session_observer_unavailable") {
 		t.Fatalf("classified error body = %q", err.msg)
+	}
+	if !strings.Contains(err.msg, "Sentinel Session Observer") || strings.Contains(err.msg, "Sentinel SDK is") {
+		t.Fatalf("classified error message = %q", err.msg)
 	}
 	if err.RetryAfter() == nil || *err.RetryAfter() != 37*time.Second {
 		t.Fatalf("RetryAfter = %v", err.RetryAfter())

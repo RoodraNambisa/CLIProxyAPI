@@ -548,24 +548,6 @@ func (manager *SentinelRuntimeManager) beginSDKTask() (func(), error) {
 	return manager.finishSDKTask, nil
 }
 
-func (manager *SentinelRuntimeManager) reserveObserver(observer *SentinelObserver) error {
-	if manager == nil || observer == nil {
-		return newSentinelRuntimeError("sentinel_sdk_unavailable", 0, errors.New("Sentinel SDK Observer is unavailable"))
-	}
-	manager.mu.Lock()
-	defer manager.mu.Unlock()
-	if manager.closed || !manager.config.Enabled || manager.clearWhenIdle {
-		return newSentinelRuntimeError("sentinel_sdk_unavailable", 0, errors.New("Sentinel SDK runtime is disabled"))
-	}
-	reservation, err := manager.reserveLocked(sentinelPriorityObserverCollector)
-	if err != nil {
-		return err
-	}
-	observer.reservation = reservation
-	manager.observers[observer] = struct{}{}
-	return nil
-}
-
 func (manager *SentinelRuntimeManager) finishSDKTask() {
 	if manager == nil {
 		return
@@ -1178,18 +1160,6 @@ func (manager *SentinelRuntimeManager) latestSourceForGeneration(sourceURL strin
 		return entry, nil
 	}
 	return nil, nil
-}
-
-func (manager *SentinelRuntimeManager) cachedSourceForRequest(request SentinelSDKRequest) (*sentinelSourceCacheEntry, error) {
-	sourceURL, _, err := resolveSentinelSDKRequestSource(request)
-	if err != nil {
-		return nil, err
-	}
-	expectedHashes, err := expectedSentinelHashes(request)
-	if err != nil {
-		return nil, err
-	}
-	return manager.latestSourceForURL(sourceURL, expectedHashes), nil
 }
 
 func (manager *SentinelRuntimeManager) sourceForTask(ctx context.Context, request SentinelSDKRequest) (*sentinelSourceCacheEntry, error) {
@@ -2372,9 +2342,13 @@ func (manager *SentinelRuntimeManager) SolveTurnstile(
 	manager.mu.Lock()
 	generation := manager.cacheGeneration
 	manager.mu.Unlock()
+	sdkFallbackAllowed := manager.enabled.Load()
+	if observer != nil {
+		sdkFallbackAllowed = observer.sdkFallbackAllowed
+	}
 
 	var prepared *conversationTurnstilePreparedProgram
-	if manager.hasActivePreferred() {
+	if sdkFallbackAllowed && manager.hasActivePreferred() {
 		signature, candidate, exactHint := manager.preferredChallengeSignature(SentinelProgramTurnstile, goRequest.DX, goRequest.RequirementsToken)
 		if exactHint && !candidate {
 			signature = ""
@@ -2475,7 +2449,7 @@ func (manager *SentinelRuntimeManager) solveTurnstileWithSDK(
 				return "", err
 			}
 			observer.mu.Lock()
-			hasInstance := observer.instance != nil && observer.lease != nil
+			hasObserverRuntime := observer.goVM != nil || observer.instance != nil || observer.lease != nil
 			hash := ""
 			generation := uint64(0)
 			if observer.source != nil {
@@ -2483,8 +2457,12 @@ func (manager *SentinelRuntimeManager) solveTurnstileWithSDK(
 				generation = observer.source.generation
 			}
 			observer.mu.Unlock()
-			if hasInstance {
+			if hasObserverRuntime {
 				recordSentinelCircuitForError(manager, ctx, generation, hash, err)
+				var runtimeErr *SentinelRuntimeError
+				if errors.As(err, &runtimeErr) {
+					return "", err
+				}
 				return "", newSentinelRuntimeError("sentinel_sdk_unavailable", 0, errors.New("Sentinel SDK Turnstile solve failed"))
 			}
 		}
@@ -2553,29 +2531,32 @@ func (manager *SentinelRuntimeManager) solveTurnstileWithSDK(
 	return token, nil
 }
 
-// SentinelObserver retains one isolated SDK instance for a single request.
+// SentinelObserver retains one request-scoped Go VM or SDK instance.
 type SentinelObserver struct {
-	manager *SentinelRuntimeManager
-	request SentinelSDKRequest
-	ctx     context.Context
-	cancel  context.CancelFunc
-	ready   chan struct{}
+	manager            *SentinelRuntimeManager
+	request            SentinelSDKRequest
+	ctx                context.Context
+	cancel             context.CancelFunc
+	ready              chan struct{}
+	sdkFallbackAllowed bool
 
-	initialSource *sentinelSourceCacheEntry
-
-	mu          sync.Mutex
-	reservation *sentinelRuntimeReservation
-	lease       *sentinelRuntimeLease
-	source      *sentinelSourceCacheEntry
-	instance    *sentinelQJSInstance
-	err         error
-	closed      bool
-	counted     bool
-	closeOnce   sync.Once
+	mu              sync.Mutex
+	fallbackMu      sync.Mutex
+	reservation     *sentinelRuntimeReservation
+	lease           *sentinelRuntimeLease
+	source          *sentinelSourceCacheEntry
+	instance        *sentinelQJSInstance
+	goVM            *conversationSentinelObserverVM
+	err             error
+	closed          bool
+	counted         bool
+	fallbackCounted bool
+	closeOnce       sync.Once
 }
 
-// BeginObserver starts collector work only when the challenge requires both
-// collector and snapshot programs. It returns immediately.
+// BeginObserver initializes collector work only when the challenge requires
+// both collector and snapshot programs. Compatible Go work finishes before
+// return; an SDK compatibility fallback continues asynchronously.
 func (manager *SentinelRuntimeManager) BeginObserver(ctx context.Context, request SentinelSDKRequest) (*SentinelObserver, error) {
 	if manager == nil || !sentinelObserverRequired(request.Challenge) {
 		return nil, nil
@@ -2584,28 +2565,61 @@ func (manager *SentinelRuntimeManager) BeginObserver(ctx context.Context, reques
 		ctx = context.Background()
 	}
 	observerCtx, cancel := context.WithCancel(ctx)
-	initialSource, err := manager.cachedSourceForRequest(request)
-	if err != nil {
-		cancel()
-		return nil, err
-	}
 	observer := &SentinelObserver{
-		manager:       manager,
-		request:       request,
-		ctx:           observerCtx,
-		cancel:        cancel,
-		ready:         make(chan struct{}),
-		initialSource: initialSource,
+		manager: manager,
+		request: request,
+		ctx:     observerCtx,
+		cancel:  cancel,
+		ready:   make(chan struct{}),
 	}
-	if err = manager.reserveObserver(observer); err != nil {
+	manager.mu.Lock()
+	if manager.closed {
+		manager.mu.Unlock()
 		cancel()
+		return nil, newSentinelRuntimeError("sentinel_sdk_unavailable", 0, errors.New("Sentinel runtime is closed"))
+	}
+	observer.sdkFallbackAllowed = manager.config.Enabled && !manager.clearWhenIdle
+	manager.observers[observer] = struct{}{}
+	manager.mu.Unlock()
+	observerConfig, _ := request.Challenge["so"].(map[string]any)
+	goVM, err := newConversationSentinelObserverVM(
+		observerCtx,
+		stringValue(observerConfig["collector_dx"]),
+		stringValue(observerConfig["snapshot_dx"]),
+		request.RequirementsToken,
+		request.Environment,
+		manager.random,
+		manager.now,
+	)
+	if err == nil {
+		observer.installGoVM(goVM)
+		close(observer.ready)
+		return observer, nil
+	}
+	var compatibility *SentinelCompatibilityError
+	if !errors.As(err, &compatibility) {
+		observer.setError(err)
+		close(observer.ready)
+		return observer, nil
+	}
+	if !observer.sdkFallbackAllowed {
+		observer.setError(newSentinelRuntimeError("sentinel_sdk_unavailable", 0, errors.New("Sentinel SDK runtime is disabled")))
+		close(observer.ready)
+		return observer, nil
+	}
+	reservation, reserveErr := manager.reserve(observerCtx, sentinelPriorityObserverCollector)
+	if reserveErr != nil {
+		observer.setError(reserveErr)
+		close(observer.ready)
+		observer.Close()
 		var runtimeErr *SentinelRuntimeError
-		if errors.As(err, &runtimeErr) && runtimeErr.Code == "sentinel_sdk_unavailable" {
+		if errors.As(reserveErr, &runtimeErr) && runtimeErr.Code == "sentinel_sdk_unavailable" {
 			return nil, nil
 		}
-		return nil, err
+		return nil, reserveErr
 	}
-	go observer.initialize()
+	observer.reservation = reservation
+	go observer.initializeSDK()
 	return observer, nil
 }
 
@@ -2614,7 +2628,7 @@ func sentinelObserverRequired(challenge map[string]any) bool {
 	return boolValue(observer["required"]) && stringValue(observer["collector_dx"]) != "" && stringValue(observer["snapshot_dx"]) != ""
 }
 
-func (observer *SentinelObserver) initialize() {
+func (observer *SentinelObserver) initializeSDK() {
 	defer close(observer.ready)
 	lease, err := observer.reservation.wait(observer.ctx)
 	if err != nil {
@@ -2627,77 +2641,183 @@ func (observer *SentinelObserver) initialize() {
 			lease.release()
 		}
 	}()
-	source := observer.initialSource
-	if source == nil {
-		source, err = observer.manager.sourceForTask(observer.ctx, observer.request)
-		if err != nil {
-			var runtimeErr *SentinelRuntimeError
-			if errors.As(err, &runtimeErr) {
-				observer.setError(err)
-				return
-			}
-			observer.setError(newSentinelRuntimeError("sentinel_sdk_unavailable", 0, errors.New("Sentinel SDK source is unavailable")))
-			return
-		}
-	}
-	if retryAfter, open := observer.manager.circuitRetryAfter(source.hash); open {
-		observer.setError(newSentinelRuntimeError("sentinel_sdk_unavailable", retryAfter, errors.New("Sentinel SDK circuit breaker is open")))
-		return
-	}
-	bytecode, err := observer.manager.bytecodeWithLease(observer.ctx, source, sentinelPriorityObserverCollector, lease)
+	instance, source, err := observer.startSDK(observer.ctx, lease)
 	if err != nil {
-		var runtimeErr *SentinelRuntimeError
-		if errors.As(err, &runtimeErr) {
-			observer.setError(err)
-			return
-		}
-		observer.setError(newSentinelRuntimeError("sentinel_sdk_unavailable", 0, errors.New("Sentinel SDK bytecode is unavailable")))
+		observer.setError(err)
 		return
 	}
-	instance, err := observer.manager.newSDKInstance(observer.ctx, lease, observer.request, source, bytecode)
-	if err != nil {
-		recordSentinelCircuitForError(observer.manager, observer.ctx, source.generation, source.hash, err)
-		var runtimeErr *SentinelRuntimeError
-		if errors.As(err, &runtimeErr) {
-			observer.setError(err)
-			return
-		}
-		observer.setError(newSentinelRuntimeError("sentinel_sdk_unavailable", 0, errors.New("Sentinel SDK Observer initialization failed")))
-		return
-	}
-	if _, err = instance.call(observer.ctx, "startObserver", map[string]any{
-		"challenge":          observer.request.Challenge,
-		"requirements_token": observer.request.RequirementsToken,
-	}); err != nil {
-		recordSentinelCircuitForError(observer.manager, observer.ctx, source.generation, source.hash, err)
+	if !observer.installSDK(lease, source, instance, true) {
 		instance.close()
-		observer.setError(newSentinelRuntimeError("sentinel_sdk_unavailable", 0, errors.New("Sentinel SDK collector failed")))
+		observer.setError(newSentinelRuntimeError("sentinel_sdk_unavailable", 0, errors.New("Sentinel SDK Observer was closed during initialization")))
 		return
 	}
+	keepLease = true
+}
+
+func (observer *SentinelObserver) installGoVM(goVM *conversationSentinelObserverVM) bool {
 	observer.manager.mu.Lock()
-	if !observer.manager.generationActiveLocked(source.generation) {
+	if observer.manager.closed {
 		observer.manager.mu.Unlock()
-		instance.close()
-		observer.setError(newSentinelRuntimeError("sentinel_sdk_unavailable", 0, errors.New("Sentinel SDK Observer belongs to a stale runtime generation")))
-		return
+		goVM.Close()
+		observer.setError(newSentinelRuntimeError("sentinel_session_observer_unavailable", 0, errors.New("Sentinel Observer runtime is closed")))
+		return false
 	}
 	observer.mu.Lock()
 	if observer.closed {
 		observer.mu.Unlock()
 		observer.manager.mu.Unlock()
-		instance.close()
-		return
+		goVM.Close()
+		return false
 	}
+	observer.goVM = goVM
+	observer.counted = true
+	observer.mu.Unlock()
+	observer.manager.observerSessions++
+	observer.manager.sessionObserverCount++
+	observer.manager.mu.Unlock()
+	return true
+}
+
+func (observer *SentinelObserver) startSDK(ctx context.Context, lease *sentinelRuntimeLease) (*sentinelQJSInstance, *sentinelSourceCacheEntry, error) {
+	if observer == nil || observer.manager == nil || lease == nil {
+		return nil, nil, newSentinelRuntimeError("sentinel_sdk_unavailable", 0, errors.New("Sentinel SDK Observer is unavailable"))
+	}
+	source, err := observer.manager.sourceForTask(ctx, observer.request)
+	if err != nil {
+		var runtimeErr *SentinelRuntimeError
+		if errors.As(err, &runtimeErr) {
+			return nil, nil, err
+		}
+		return nil, nil, newSentinelRuntimeError("sentinel_sdk_unavailable", 0, errors.New("Sentinel SDK source is unavailable"))
+	}
+	if retryAfter, open := observer.manager.circuitRetryAfter(source.hash); open {
+		return nil, nil, newSentinelRuntimeError("sentinel_sdk_unavailable", retryAfter, errors.New("Sentinel SDK circuit breaker is open"))
+	}
+	bytecode, err := observer.manager.bytecodeWithLease(ctx, source, sentinelPriorityObserverCollector, lease)
+	if err != nil {
+		var runtimeErr *SentinelRuntimeError
+		if errors.As(err, &runtimeErr) {
+			return nil, nil, err
+		}
+		return nil, nil, newSentinelRuntimeError("sentinel_sdk_unavailable", 0, errors.New("Sentinel SDK bytecode is unavailable"))
+	}
+	instance, err := observer.manager.newSDKInstance(ctx, lease, observer.request, source, bytecode)
+	if err != nil {
+		recordSentinelCircuitForError(observer.manager, ctx, source.generation, source.hash, err)
+		var runtimeErr *SentinelRuntimeError
+		if errors.As(err, &runtimeErr) {
+			return nil, nil, err
+		}
+		return nil, nil, newSentinelRuntimeError("sentinel_sdk_unavailable", 0, errors.New("Sentinel SDK Observer initialization failed"))
+	}
+	instance.ctx = observer.ctx
+	if _, err = instance.call(ctx, "startObserver", map[string]any{
+		"challenge":          observer.request.Challenge,
+		"requirements_token": observer.request.RequirementsToken,
+	}); err != nil {
+		instance.close()
+		recordSentinelCircuitForError(observer.manager, ctx, source.generation, source.hash, err)
+		return nil, nil, newSentinelRuntimeError("sentinel_sdk_unavailable", 0, errors.New("Sentinel SDK collector failed"))
+	}
+	return instance, source, nil
+}
+
+func (observer *SentinelObserver) promoteToSDK(ctx context.Context, countObserverFallback bool) error {
+	callCtx, cancel := observer.callContext(ctx)
+	defer cancel()
+	lease, err := observer.manager.acquire(callCtx, sentinelPriorityObserverCollector)
+	if err != nil {
+		return err
+	}
+	keepLease := false
+	defer func() {
+		if !keepLease {
+			lease.release()
+		}
+	}()
+	instance, source, err := observer.startSDK(callCtx, lease)
+	if err != nil {
+		return err
+	}
+	if !observer.installSDK(lease, source, instance, countObserverFallback) {
+		instance.close()
+		return newSentinelRuntimeError("sentinel_sdk_unavailable", 0, errors.New("Sentinel SDK Observer was closed during initialization"))
+	}
+	keepLease = true
+	return nil
+}
+
+func (observer *SentinelObserver) installSDK(lease *sentinelRuntimeLease, source *sentinelSourceCacheEntry, instance *sentinelQJSInstance, countObserverFallback bool) bool {
+	if observer == nil || observer.manager == nil || lease == nil || source == nil || instance == nil {
+		return false
+	}
+	observer.manager.mu.Lock()
+	if !observer.manager.generationActiveLocked(source.generation) {
+		observer.manager.mu.Unlock()
+		return false
+	}
+	observer.mu.Lock()
+	if observer.closed {
+		observer.mu.Unlock()
+		observer.manager.mu.Unlock()
+		return false
+	}
+	oldGoVM := observer.goVM
+	wasCounted := observer.counted
+	observer.goVM = nil
 	observer.lease = lease
 	observer.source = source
 	observer.instance = instance
 	observer.counted = true
-	keepLease = true
+	if countObserverFallback && !observer.fallbackCounted {
+		observer.fallbackCounted = true
+		observer.manager.compatibilityFallbacks++
+	}
 	observer.mu.Unlock()
-	observer.manager.observerSessions++
-	observer.manager.sessionObserverCount++
+	if !wasCounted {
+		observer.manager.observerSessions++
+		observer.manager.sessionObserverCount++
+	}
 	observer.manager.lastError = ""
 	observer.manager.mu.Unlock()
+	if oldGoVM != nil {
+		oldGoVM.Close()
+	}
+	return true
+}
+
+func (observer *SentinelObserver) ensureSDK(ctx context.Context, countObserverFallback bool) error {
+	observer.fallbackMu.Lock()
+	defer observer.fallbackMu.Unlock()
+	if !observer.sdkFallbackAllowed {
+		return newSentinelRuntimeError("sentinel_sdk_unavailable", 0, errors.New("Sentinel SDK runtime is disabled"))
+	}
+	observer.mu.Lock()
+	if observer.closed {
+		observer.mu.Unlock()
+		return errors.New("Sentinel Observer is closed")
+	}
+	if observer.instance != nil && observer.lease != nil {
+		observer.mu.Unlock()
+		return nil
+	}
+	observer.mu.Unlock()
+	return observer.promoteToSDK(ctx, countObserverFallback)
+}
+
+func (observer *SentinelObserver) callContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	callCtx, cancel := context.WithCancel(ctx)
+	if observer == nil || observer.ctx == nil {
+		return callCtx, cancel
+	}
+	stopLifetimeCancellation := context.AfterFunc(observer.ctx, cancel)
+	return callCtx, func() {
+		stopLifetimeCancellation()
+		cancel()
+	}
 }
 
 func (observer *SentinelObserver) setError(err error) {
@@ -2720,7 +2840,7 @@ func (observer *SentinelObserver) wait(ctx context.Context) error {
 		if observer.err != nil {
 			return observer.err
 		}
-		if observer.closed || observer.instance == nil {
+		if observer.closed || (observer.instance == nil && observer.goVM == nil) {
 			return errors.New("Sentinel Observer is closed")
 		}
 		return nil
@@ -2733,11 +2853,16 @@ func (observer *SentinelObserver) solveTurnstile(ctx context.Context) (string, e
 	if err := observer.wait(ctx); err != nil {
 		return "", err
 	}
+	if err := observer.ensureSDK(ctx, false); err != nil {
+		return "", err
+	}
 	observer.mu.Lock()
 	instance := observer.instance
 	request := observer.request
 	observer.mu.Unlock()
-	return instance.call(ctx, "solveTurnstile", map[string]any{
+	callCtx, cancel := observer.callContext(ctx)
+	defer cancel()
+	return instance.call(callCtx, "solveTurnstile", map[string]any{
 		"challenge":          request.Challenge,
 		"requirements_token": request.RequirementsToken,
 	})
@@ -2754,29 +2879,60 @@ func (observer *SentinelObserver) Snapshot(ctx context.Context) (string, error) 
 			if runtimeErr.Code == "sentinel_sdk_busy" {
 				return "", err
 			}
-			return "", newSentinelRuntimeError("sentinel_session_observer_unavailable", runtimeErr.RetryAfter, errors.New("Sentinel SDK Observer is unavailable"))
+			return "", newSentinelRuntimeError("sentinel_session_observer_unavailable", runtimeErr.RetryAfter, errors.New("Sentinel Session Observer is unavailable"))
 		}
-		return "", newSentinelRuntimeError("sentinel_session_observer_unavailable", 0, errors.New("Sentinel SDK Observer is unavailable"))
+		return "", newSentinelRuntimeError("sentinel_session_observer_unavailable", 0, errors.New("Sentinel Session Observer is unavailable"))
 	}
+	callCtx, cancel := observer.callContext(ctx)
+	defer cancel()
 	observer.mu.Lock()
+	goVM := observer.goVM
 	instance := observer.instance
-	hash := ""
-	generation := uint64(0)
-	if observer.source != nil {
-		hash = observer.source.hash
-		generation = observer.source.generation
-	}
 	request := observer.request
 	observer.mu.Unlock()
-	snapshot, err := instance.call(ctx, "snapshotObserver", map[string]any{"challenge": request.Challenge})
-	if err != nil {
-		recordSentinelCircuitForError(observer.manager, ctx, generation, hash, err)
-		return "", newSentinelRuntimeError("sentinel_session_observer_unavailable", 0, errors.New("Sentinel SDK snapshot failed"))
+	var snapshot string
+	var err error
+	useSDK := goVM == nil
+	if goVM != nil {
+		snapshot, err = goVM.Snapshot(callCtx)
+		if err != nil {
+			var compatibility *SentinelCompatibilityError
+			if !errors.As(err, &compatibility) {
+				if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+					return "", err
+				}
+				return "", newSentinelRuntimeError("sentinel_session_observer_unavailable", 0, errors.New("Sentinel Go VM snapshot failed"))
+			}
+			if err = observer.ensureSDK(callCtx, true); err != nil {
+				return "", observer.snapshotRuntimeError(err)
+			}
+			observer.mu.Lock()
+			instance = observer.instance
+			observer.mu.Unlock()
+			useSDK = true
+		}
+	}
+	if useSDK {
+		if instance == nil {
+			return "", newSentinelRuntimeError("sentinel_session_observer_unavailable", 0, errors.New("Sentinel SDK Observer is unavailable"))
+		}
+		observer.mu.Lock()
+		hash := ""
+		generation := uint64(0)
+		if observer.source != nil {
+			hash = observer.source.hash
+			generation = observer.source.generation
+		}
+		observer.mu.Unlock()
+		snapshot, err = instance.call(callCtx, "snapshotObserver", map[string]any{"challenge": request.Challenge})
+		if err != nil {
+			recordSentinelCircuitForError(observer.manager, callCtx, generation, hash, err)
+			return "", newSentinelRuntimeError("sentinel_session_observer_unavailable", 0, errors.New("Sentinel SDK snapshot failed"))
+		}
 	}
 	snapshot = strings.TrimSpace(snapshot)
 	if snapshot == "" {
-		recordSentinelCircuitForError(observer.manager, ctx, generation, hash, errors.New("Sentinel SDK snapshot is empty"))
-		return "", newSentinelRuntimeError("sentinel_session_observer_unavailable", 0, errors.New("Sentinel SDK snapshot is empty"))
+		return "", newSentinelRuntimeError("sentinel_session_observer_unavailable", 0, errors.New("Sentinel Observer snapshot is empty"))
 	}
 	challengeToken := stringValue(request.Challenge["token"])
 	if challengeToken == "" {
@@ -2794,6 +2950,20 @@ func (observer *SentinelObserver) Snapshot(ctx context.Context) (string, error) 
 	return string(payload), nil
 }
 
+func (observer *SentinelObserver) snapshotRuntimeError(err error) error {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return err
+	}
+	var runtimeErr *SentinelRuntimeError
+	if errors.As(err, &runtimeErr) {
+		if runtimeErr.Code == "sentinel_sdk_busy" {
+			return err
+		}
+		return newSentinelRuntimeError("sentinel_session_observer_unavailable", runtimeErr.RetryAfter, errors.New("Sentinel SDK Observer is unavailable"))
+	}
+	return newSentinelRuntimeError("sentinel_session_observer_unavailable", 0, errors.New("Sentinel Observer is unavailable"))
+}
+
 // Close cancels and releases a request-scoped Observer instance.
 func (observer *SentinelObserver) Close() {
 	if observer == nil {
@@ -2804,17 +2974,24 @@ func (observer *SentinelObserver) Close() {
 			observer.cancel()
 		}
 		<-observer.ready
+		observer.fallbackMu.Lock()
+		defer observer.fallbackMu.Unlock()
 		observer.mu.Lock()
 		observer.closed = true
 		instance := observer.instance
+		goVM := observer.goVM
 		lease := observer.lease
 		counted := observer.counted
 		observer.instance = nil
+		observer.goVM = nil
 		observer.lease = nil
 		observer.counted = false
 		observer.mu.Unlock()
 		if instance != nil {
 			instance.close()
+		}
+		if goVM != nil {
+			goVM.Close()
 		}
 		if lease != nil {
 			lease.release()
