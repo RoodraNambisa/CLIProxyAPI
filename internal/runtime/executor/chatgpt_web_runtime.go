@@ -1090,6 +1090,8 @@ func (e *ChatGPTWebExecutor) chatGPTWebRequirements(ctx context.Context, client 
 	}
 	sentinelEnvironment := chatgptwebauth.ConversationTurnstileEnvironment{
 		Persona:       credential.Persona,
+		DeviceID:      credential.DeviceID,
+		PageStartedAt: e.now(),
 		ScriptSources: sources,
 		Location:      strings.TrimRight(baseURL, "/") + "/",
 	}

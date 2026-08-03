@@ -3,12 +3,104 @@ package chatgptweb
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 )
+
+func TestGoConversationTurnstileSolverSupportsCurrentBrowserEnvironment(t *testing.T) {
+	const requirementsToken = "requirements"
+	environment := ConversationTurnstileEnvironment{
+		Persona:  DefaultPersona(),
+		DeviceID: "11111111-2222-4333-8444-555555555555",
+	}
+	program := []any{
+		[]any{2, 40, "document"},
+		[]any{6, 41, 10, 40},
+		[]any{2, 42, "createElement"},
+		[]any{24, 43, 41, 42},
+		[]any{2, 44, "canvas"},
+		[]any{17, 45, 43, 44},
+		[]any{2, 46, "getContext"},
+		[]any{24, 47, 45, 46},
+		[]any{2, 48, "webgl"},
+		[]any{17, 49, 47, 48},
+		[]any{2, 50, "getExtension"},
+		[]any{24, 51, 49, 50},
+		[]any{2, 52, "WEBGL_debug_renderer_info"},
+		[]any{17, 53, 51, 52},
+		[]any{2, 54, "UNMASKED_RENDERER_WEBGL"},
+		[]any{6, 55, 53, 54},
+		[]any{2, 56, "getParameter"},
+		[]any{24, 57, 49, 56},
+		[]any{17, 58, 57, 55},
+		[]any{2, 59, "localStorage"},
+		[]any{6, 60, 10, 59},
+		[]any{2, 61, "setItem"},
+		[]any{24, 62, 60, 61},
+		[]any{2, 63, "sentinel-test"},
+		[]any{2, 64, "stored"},
+		[]any{17, 65, 62, 63, 64},
+		[]any{2, 66, "getItem"},
+		[]any{24, 67, 60, 66},
+		[]any{17, 68, 67, 63},
+		[]any{2, 69, "screen"},
+		[]any{6, 70, 10, 69},
+		[]any{2, 71, "availLeft"},
+		[]any{6, 72, 70, 71},
+		[]any{2, 73, "|"},
+		[]any{5, 58, 73},
+		[]any{5, 58, 68},
+		[]any{5, 58, 73},
+		[]any{5, 58, 72},
+		[]any{7, 3, 58},
+	}
+	dx := encodeConversationTurnstileProgram(t, requirementsToken, program)
+	token, err := (GoConversationTurnstileSolver{}).Solve(t.Context(), ConversationTurnstileSolveRequest{
+		DX:                dx,
+		RequirementsToken: requirementsToken,
+		Environment:       environment,
+		Reader:            zeroReader{},
+		Now:               time.Now,
+	})
+	if err != nil {
+		t.Fatalf("Solve() error = %v", err)
+	}
+	profile := resolveSentinelBrowserProfile(environment)
+	want := base64.StdEncoding.EncodeToString([]byte(profile.webGLRenderer + "|stored|" + strconv.Itoa(profile.availLeft)))
+	if token != want {
+		t.Fatalf("token = %q, want %q", token, want)
+	}
+}
+
+func TestGoConversationTurnstileSolverTreatsKnownUndefinedAsModeled(t *testing.T) {
+	const requirementsToken = "requirements"
+	dx := encodeConversationTurnstileProgram(t, requirementsToken, []any{
+		[]any{2, 40, "__reactRouterContext"},
+		[]any{6, 41, 10, 40},
+		[]any{2, 42, "state"},
+		[]any{6, 43, 41, 42},
+		[]any{23, 43, 99},
+	})
+	_, err := (GoConversationTurnstileSolver{}).Solve(t.Context(), ConversationTurnstileSolveRequest{
+		DX:                dx,
+		RequirementsToken: requirementsToken,
+		Environment:       ConversationTurnstileEnvironment{Persona: DefaultPersona()},
+		Reader:            zeroReader{},
+		Now:               time.Now,
+	})
+	var compatibility *SentinelCompatibilityError
+	if errors.As(err, &compatibility) {
+		t.Fatalf("known undefined state was classified as missing: %v", err)
+	}
+	if err != nil {
+		t.Fatalf("Solve() error = %v", err)
+	}
+}
 
 func TestGoConversationTurnstileSolverClassifiesUnknownOpcode(t *testing.T) {
 	const requirementsToken = "requirements"

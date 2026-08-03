@@ -129,6 +129,8 @@ type conversationTurnstileLocationRef struct {
 // document used to create the requirements token.
 type ConversationTurnstileEnvironment struct {
 	Persona          Persona
+	DeviceID         string
+	PageStartedAt    time.Time
 	ScriptSources    []string
 	Location         string
 	LocalStorageKeys []string
@@ -424,8 +426,10 @@ type conversationTurnstileVM struct {
 	environment          map[string]any
 	scriptSources        []string
 	localStorageKeys     []string
+	localStorageValues   map[string]string
 	requirementsToken    string
 	challengeEnvironment ConversationTurnstileEnvironment
+	browserProfile       sentinelBrowserProfile
 	memoryBudget         *conversationTurnstileMemoryBudget
 	executionBudget      *conversationTurnstileExecutionBudget
 	regexpCache          map[string]*regexp.Regexp
@@ -544,12 +548,16 @@ func executeConversationTurnstileProgram(ctx context.Context, prepared *conversa
 	} else if executionBudget.maxSteps <= 0 {
 		executionBudget.maxSteps = maxSteps
 	}
+	startedAt := now()
+	if !environment.PageStartedAt.IsZero() {
+		startedAt = environment.PageStartedAt
+	}
 	vm := &conversationTurnstileVM{
 		ctx:                  ctx,
 		values:               make(map[string]any),
 		reader:               randomReader(reader),
 		now:                  now,
-		startedAt:            now(),
+		startedAt:            startedAt,
 		depth:                depth,
 		requirementsToken:    prepared.requirementsToken,
 		challengeEnvironment: environment,
@@ -560,7 +568,9 @@ func executeConversationTurnstileProgram(ctx context.Context, prepared *conversa
 		program:              prepared.program,
 		opcodeSignature:      prepared.opcodeSignature,
 	}
+	vm.browserProfile = resolveSentinelBrowserProfile(environment)
 	vm.environment, vm.scriptSources, vm.localStorageKeys = normalizeConversationTurnstileEnvironment(environment, vm.startedAt)
+	vm.initializeLocalStorage()
 	vm.initialize(prepared.program, prepared.requirementsToken)
 	if err := vm.runQueue(); err != nil {
 		if fatalErr := conversationTurnstileFatalInstructionError(ctx, err); fatalErr != nil {
@@ -581,6 +591,7 @@ func executeConversationTurnstileProgram(ctx context.Context, prepared *conversa
 
 func normalizeConversationTurnstileEnvironment(environment ConversationTurnstileEnvironment, startedAt time.Time) (map[string]any, []string, []string) {
 	persona := normalizePersona(environment.Persona)
+	profile := resolveSentinelBrowserProfile(environment)
 	location := strings.TrimSpace(environment.Location)
 	if location == "" {
 		location = "https://chatgpt.com/"
@@ -602,39 +613,51 @@ func normalizeConversationTurnstileEnvironment(environment ConversationTurnstile
 	}
 	languages := conversationTurnstileArrayValue([]any{persona.Language})
 	values := map[string]any{
-		"window.navigator.userAgent":                persona.UserAgent,
-		"window.navigator.language":                 persona.Language,
-		"window.navigator.languages":                languages,
-		"window.navigator.hardwareConcurrency":      persona.HardwareConcurrency,
-		"window.navigator.platform":                 persona.Platform,
-		"window.navigator.vendor":                   "Google Inc.",
-		"window.navigator.webdriver":                false,
-		"window.navigator.cookieEnabled":            true,
-		"window.navigator.onLine":                   true,
-		"window.screen.width":                       persona.ScreenWidth,
-		"window.screen.height":                      persona.ScreenHeight,
-		"window.screen.availWidth":                  persona.ScreenWidth,
-		"window.screen.availHeight":                 persona.ScreenHeight,
-		"window.screen.colorDepth":                  24,
-		"window.screen.pixelDepth":                  24,
-		"window.innerWidth":                         persona.ScreenWidth,
-		"window.innerHeight":                        persona.ScreenHeight,
-		"window.devicePixelRatio":                   2,
-		"window.location":                           locationRef,
-		"window.location.href":                      location,
-		"window.location.origin":                    locationOrigin,
-		"window.location.pathname":                  locationPath,
-		"window.location.search":                    locationSearch,
-		"window.document.URL":                       location,
-		"window.document.location":                  locationRef,
-		"window.document.referrer":                  "https://auth.openai.com/",
-		"window.document.readyState":                "complete",
-		"window.document.hidden":                    false,
-		"window.document.visibilityState":           "visible",
-		"window.history.length":                     1,
-		"window.localStorage.length":                len(storageKeys),
-		"window.performance.timeOrigin":             float64(startedAt.UnixNano()) / float64(time.Millisecond),
-		"window.performance.memory.jsHeapSizeLimit": float64(4_294_967_296),
+		"window.navigator.userAgent":                 persona.UserAgent,
+		"window.navigator.language":                  persona.Language,
+		"window.navigator.languages":                 languages,
+		"window.navigator.hardwareConcurrency":       persona.HardwareConcurrency,
+		"window.navigator.platform":                  persona.Platform,
+		"window.navigator.vendor":                    "Google Inc.",
+		"window.navigator.webdriver":                 false,
+		"window.navigator.cookieEnabled":             true,
+		"window.navigator.onLine":                    true,
+		"window.navigator.deviceMemory":              profile.deviceMemory,
+		"window.navigator.maxTouchPoints":            profile.maxTouchPoints,
+		"window.navigator.pdfViewerEnabled":          true,
+		"window.navigator.product":                   "Gecko",
+		"window.screen.width":                        persona.ScreenWidth,
+		"window.screen.height":                       persona.ScreenHeight,
+		"window.screen.availLeft":                    profile.availLeft,
+		"window.screen.availTop":                     profile.availTop,
+		"window.screen.availWidth":                   profile.availWidth,
+		"window.screen.availHeight":                  profile.availHeight,
+		"window.screen.colorDepth":                   profile.colorDepth,
+		"window.screen.pixelDepth":                   profile.colorDepth,
+		"window.innerWidth":                          profile.innerWidth,
+		"window.innerHeight":                         profile.innerHeight,
+		"window.devicePixelRatio":                    profile.devicePixelRatio,
+		"window.location":                            locationRef,
+		"window.location.href":                       location,
+		"window.location.origin":                     locationOrigin,
+		"window.location.pathname":                   locationPath,
+		"window.location.search":                     locationSearch,
+		"window.document.URL":                        location,
+		"window.document.location":                   locationRef,
+		"window.document.referrer":                   "https://auth.openai.com/",
+		"window.document.readyState":                 "complete",
+		"window.document.hidden":                     false,
+		"window.document.visibilityState":            "visible",
+		"window.__reactRouterContext.basename":       "/",
+		"window.__reactRouterContext.future":         map[string]any{},
+		"window.__reactRouterContext.isSpaMode":      true,
+		"window.__reactRouterContext.routeDiscovery": map[string]any{},
+		"window.__reactRouterContext.ssr":            false,
+		"window.__reactRouterContext.state":          conversationTurnstileUndefined,
+		"window.history.length":                      1,
+		"window.localStorage.length":                 len(storageKeys),
+		"window.performance.timeOrigin":              float64(startedAt.UnixNano()) / float64(time.Millisecond),
+		"window.performance.memory.jsHeapSizeLimit":  profile.jsHeapSizeLimit,
 	}
 	return values, sources, storageKeys
 }
@@ -1429,6 +1452,9 @@ func (vm *conversationTurnstileVM) missingPropertyBase(objectKey, object any) (s
 	}
 	if objectRef, ok := object.(conversationTurnstileObjectRef); ok && strings.HasPrefix(objectRef.path, "window") {
 		return objectRef.path, false
+	}
+	if browserObject, ok := object.(conversationTurnstileBrowserObject); ok {
+		return browserObject.conversationTurnstileBrowserPath(), false
 	}
 	return "", false
 }
@@ -3010,7 +3036,7 @@ func (vm *conversationTurnstileVM) opProperty(args []any) (any, error) {
 			return nil, err
 		}
 		vm.set(args[0], value)
-		if missingBase != "" && isConversationTurnstileUndefined(value) {
+		if missingBase != "" && isConversationTurnstileUndefined(value) && !vm.knownEnvironmentProperty(object, propertyKey) {
 			missingPath := vm.missingPropertyPath(missingBase, propertyKey)
 			if vm.fatalErr != nil {
 				return nil, vm.fatalErr
@@ -3048,7 +3074,7 @@ func (vm *conversationTurnstileVM) opBoundProperty(args []any) (any, error) {
 			return nil, err
 		}
 		vm.set(args[0], value)
-		if missingBase != "" && isConversationTurnstileUndefined(value) {
+		if missingBase != "" && isConversationTurnstileUndefined(value) && !vm.knownEnvironmentProperty(object, propertyKey) {
 			missingPath := vm.missingPropertyPath(missingBase, propertyKey)
 			if vm.fatalErr != nil {
 				return nil, vm.fatalErr
@@ -3620,6 +3646,9 @@ func (vm *conversationTurnstileVM) call(target any, args []any) (any, error) {
 		name = typed.path
 	default:
 		return nil, conversationTurnstileTypeError("value is not callable")
+	}
+	if value, handled, err := vm.callBrowserObjectRef(name, args); handled {
+		return value, err
 	}
 	switch name {
 	case "window.String":
@@ -4426,6 +4455,9 @@ func (vm *conversationTurnstileVM) propertyWithKey(object, propertyKey any) (any
 		if err := vm.reserveRuntimeBytes(len(path)); err != nil {
 			return conversationTurnstileUndefined, err
 		}
+		if browserValue, handled, browserErr := vm.browserObjectRefProperty(value.path, keyText); handled {
+			return browserValue, browserErr
+		}
 		if environmentValue, exists := vm.environment[path]; exists {
 			return environmentValue, nil
 		}
@@ -4520,6 +4552,9 @@ func (vm *conversationTurnstileVM) propertyWithKey(object, propertyKey any) (any
 			return conversationTurnstileJSString{units: []uint16{value.units[int(index)]}}, nil
 		}
 	}
+	if browserValue, handled, browserErr := vm.browserProperty(object, keyText); handled {
+		return browserValue, browserErr
+	}
 	return conversationTurnstileUndefined, nil
 }
 
@@ -4532,6 +4567,9 @@ func conversationTurnstileStrings(values []string) *conversationTurnstileArray {
 }
 
 func conversationTurnstileNativeObjectPath(path string) bool {
+	if conversationTurnstileBrowserNativeObjectPath(path) {
+		return true
+	}
 	switch path {
 	case "window", "window.Array", "window.Math", "window.Reflect", "window.performance",
 		"window.localStorage", "window.Object", "window.String",
@@ -4690,6 +4728,8 @@ func writeConversationTurnstileString(buffer *conversationTurnstileLimitedBuffer
 		_, _ = buffer.WriteString("[object Object]")
 	case *conversationTurnstileProcessMapRef:
 		_, _ = buffer.WriteString("[object Map]")
+	case conversationTurnstileBrowserObject:
+		_, _ = buffer.WriteString(conversationTurnstileBrowserObjectValueString(typed))
 	case conversationTurnstileCallable:
 		_, _ = buffer.WriteString("function () { [native code] }")
 	case map[string]any:
@@ -4701,6 +4741,9 @@ func writeConversationTurnstileString(buffer *conversationTurnstileLimitedBuffer
 }
 
 func conversationTurnstileGlobalObjectString(path string) (string, bool) {
+	if value, ok := conversationTurnstileBrowserObjectString(path); ok {
+		return value, true
+	}
 	switch path {
 	case "window.Array":
 		return "function Array() { [native code] }", true
@@ -4906,6 +4949,15 @@ func conversationTurnstileStrictEqual(left, right any) bool {
 		return ok && leftValue == rightValue
 	case *conversationTurnstileBoxedPrimitive:
 		rightValue, ok := right.(*conversationTurnstileBoxedPrimitive)
+		return ok && leftValue == rightValue
+	case *conversationTurnstileDOMElement:
+		rightValue, ok := right.(*conversationTurnstileDOMElement)
+		return ok && leftValue == rightValue
+	case *conversationTurnstileCanvasContext:
+		rightValue, ok := right.(*conversationTurnstileCanvasContext)
+		return ok && leftValue == rightValue
+	case *conversationTurnstileWebGLExtension:
+		rightValue, ok := right.(*conversationTurnstileWebGLExtension)
 		return ok && leftValue == rightValue
 	case conversationTurnstileCallable:
 		rightValue, ok := right.(conversationTurnstileCallable)
@@ -5334,6 +5386,9 @@ func writeConversationTurnstileJSON(buffer *conversationTurnstileLimitedBuffer, 
 	case conversationTurnstileObjectRef:
 		buffer.WriteString("{}")
 		return nil
+	case conversationTurnstileBrowserObject:
+		buffer.WriteString("{}")
+		return nil
 	case *conversationTurnstileArray:
 		if typed == nil {
 			buffer.WriteString("null")
@@ -5529,6 +5584,9 @@ func conversationTurnstileJSONUnsupported(value any) bool {
 }
 
 func conversationTurnstileCallableObjectPath(path string) bool {
+	if conversationTurnstileBrowserNativeObjectPath(path) {
+		return true
+	}
 	switch path {
 	case "window.Array", "window.Object", "window.String", "window.Reflect.set",
 		"window.Array.isArray", "window.Array.from",

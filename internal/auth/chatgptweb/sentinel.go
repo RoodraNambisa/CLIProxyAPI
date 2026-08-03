@@ -352,6 +352,8 @@ func (sentinel *Sentinel) solveTurnstile(ctx context.Context, challenge map[stri
 		requirementsToken,
 		ConversationTurnstileEnvironment{
 			Persona:       sentinel.generator.persona,
+			DeviceID:      sentinel.deviceID,
+			PageStartedAt: sentinel.generator.now(),
 			ScriptSources: []string{sentinelSDKURL},
 			Location:      sentinel.baseURL + "/backend-api/sentinel/frame.html?sv=" + sentinelSDKVersion,
 		},

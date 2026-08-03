@@ -2282,6 +2282,19 @@ func patchSentinelSDK(source []byte, adapter sentinelSDKAdapter) ([]byte, error)
 
 func (manager *SentinelRuntimeManager) runtimeBootstrap(request SentinelSDKRequest, source *sentinelSourceCacheEntry) (string, error) {
 	persona := normalizePersona(request.Environment.Persona)
+	profileEnvironment := request.Environment
+	if strings.TrimSpace(profileEnvironment.DeviceID) == "" {
+		profileEnvironment.DeviceID = strings.TrimSpace(request.DeviceID)
+	}
+	effectiveDeviceID := strings.TrimSpace(profileEnvironment.DeviceID)
+	profile := resolveSentinelBrowserProfile(profileEnvironment)
+	pageStartedAt := request.Environment.PageStartedAt
+	if pageStartedAt.IsZero() {
+		pageStartedAt = time.Now()
+		if manager != nil && manager.now != nil {
+			pageStartedAt = manager.now()
+		}
+	}
 	randomBytes := make([]byte, sentinelSDKRandomBytes)
 	reader := manager.random
 	if reader == nil {
@@ -2301,7 +2314,7 @@ func (manager *SentinelRuntimeManager) runtimeBootstrap(request SentinelSDKReque
 	payload, err := json.Marshal(map[string]any{
 		"sdk_url":              source.url,
 		"location":             strings.TrimSpace(request.Environment.Location),
-		"device_id":            strings.TrimSpace(request.DeviceID),
+		"device_id":            effectiveDeviceID,
 		"user_agent":           persona.UserAgent,
 		"language":             persona.Language,
 		"languages":            languages,
@@ -2309,6 +2322,22 @@ func (manager *SentinelRuntimeManager) runtimeBootstrap(request SentinelSDKReque
 		"hardware_concurrency": persona.HardwareConcurrency,
 		"screen_width":         persona.ScreenWidth,
 		"screen_height":        persona.ScreenHeight,
+		"screen_avail_left":    profile.availLeft,
+		"screen_avail_top":     profile.availTop,
+		"screen_avail_width":   profile.availWidth,
+		"screen_avail_height":  profile.availHeight,
+		"screen_color_depth":   profile.colorDepth,
+		"inner_width":          profile.innerWidth,
+		"inner_height":         profile.innerHeight,
+		"device_pixel_ratio":   profile.devicePixelRatio,
+		"device_memory":        profile.deviceMemory,
+		"max_touch_points":     profile.maxTouchPoints,
+		"js_heap_size_limit":   profile.jsHeapSizeLimit,
+		"webgl_vendor":         profile.webGLVendor,
+		"webgl_renderer":       profile.webGLRenderer,
+		"fingerprint_version":  profile.version,
+		"fingerprint_slot":     profile.slot,
+		"page_started_at_ms":   float64(pageStartedAt.UnixNano()) / float64(time.Millisecond),
 		"random_b64":           base64.StdEncoding.EncodeToString(randomBytes),
 		"script_sources":       append([]string(nil), request.Environment.ScriptSources...),
 		"local_storage_keys":   append([]string(nil), request.Environment.LocalStorageKeys...),
