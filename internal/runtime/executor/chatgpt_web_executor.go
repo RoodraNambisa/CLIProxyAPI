@@ -1425,6 +1425,11 @@ func cloneChatGPTWebCredential(credential *chatgptwebauth.Credential) *chatgptwe
 	if credential.Cookies != nil {
 		clone.Cookies = append(make([]chatgptwebauth.Cookie, 0, len(credential.Cookies)), credential.Cookies...)
 	}
+	if credential.WebAuthn != nil {
+		webAuthn := *credential.WebAuthn
+		webAuthn.Transports = append([]string(nil), credential.WebAuthn.Transports...)
+		clone.WebAuthn = &webAuthn
+	}
 	return &clone
 }
 

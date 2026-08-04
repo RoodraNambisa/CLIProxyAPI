@@ -180,6 +180,7 @@ func TestChatGPTWebManagementRoutesAreRegistered(t *testing.T) {
 		http.MethodPost + " /v0/management/chatgpt-web/import-tasks":                     false,
 		http.MethodGet + " /v0/management/chatgpt-web/import-tasks/:id":                  false,
 		http.MethodDelete + " /v0/management/chatgpt-web/import-tasks/:id":               false,
+		http.MethodGet + " /v0/management/chatgpt-web/capabilities":                      false,
 		http.MethodPost + " /v0/management/chatgpt-web/conversion-tasks":                 false,
 		http.MethodGet + " /v0/management/chatgpt-web/conversion-tasks/:id":              false,
 		http.MethodDelete + " /v0/management/chatgpt-web/conversion-tasks/:id":           false,

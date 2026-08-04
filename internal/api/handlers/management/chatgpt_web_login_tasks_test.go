@@ -1836,6 +1836,7 @@ func chatGPTWebManagementTestRouter(h *Handler) *gin.Engine {
 	router.POST("/chatgpt-web/import-tasks", h.StartChatGPTWebImportTask)
 	router.GET("/chatgpt-web/import-tasks/:id", h.GetChatGPTWebImportTask)
 	router.DELETE("/chatgpt-web/import-tasks/:id", h.CancelChatGPTWebImportTask)
+	router.GET("/chatgpt-web/capabilities", h.GetChatGPTWebCapabilities)
 	router.POST("/chatgpt-web/conversion-tasks", h.StartChatGPTWebConversionTask)
 	router.GET("/chatgpt-web/conversion-tasks/:id", h.GetChatGPTWebConversionTask)
 	router.DELETE("/chatgpt-web/conversion-tasks/:id", h.CancelChatGPTWebConversionTask)

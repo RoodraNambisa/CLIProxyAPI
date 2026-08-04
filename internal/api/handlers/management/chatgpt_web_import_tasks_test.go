@@ -56,6 +56,110 @@ func TestChatGPTWebImportTaskSupportsMultipleFilesAndLegacyField(t *testing.T) {
 	}
 }
 
+func TestChatGPTWebImportTaskPersistsWebAuthnV1AndConfirmsCapability(t *testing.T) {
+	executor := &chatGPTWebManagementTestExecutor{}
+	h, manager, authDir := newChatGPTWebManagementTestHandler(t, executor)
+	router := chatGPTWebManagementTestRouter(h)
+	payload, privateKey, credentialID, userHandle := chatGPTWebImportWebAuthnFixture(t)
+
+	capabilities := performChatGPTWebManagementRequest(t, router, http.MethodGet, "/chatgpt-web/capabilities", "")
+	if capabilities.Code != http.StatusOK || capabilities.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("capabilities status = %d headers=%v body=%s", capabilities.Code, capabilities.Header(), capabilities.Body.String())
+	}
+	if got := capabilities.Body.String(); !strings.Contains(got, `"credential_schema_versions":[1,2]`) || !strings.Contains(got, `"webauthn_v1"`) {
+		t.Fatalf("capabilities body = %s", got)
+	}
+
+	task := startChatGPTWebImportTask(t, router, []chatGPTWebImportTestFile{{
+		field: "files",
+		name:  "passkey.json",
+		data:  payload,
+	}})
+	completed := waitForChatGPTWebMutationTask(t, router, chatGPTWebMutationTaskImport, task.ID)
+	if completed.Succeeded != 1 || completed.Failed != 0 || len(completed.Results) != 1 {
+		t.Fatalf("task = %+v", completed)
+	}
+	result := completed.Results[0]
+	if result.CredentialSchemaVersion != 2 || !result.WebAuthnV1Persisted || len(result.PersistedFeatures) != 1 || result.PersistedFeatures[0] != "webauthn_v1" {
+		t.Fatalf("import result = %+v", result)
+	}
+	assertChatGPTWebManagementSecretsAbsent(t, mustMarshalChatGPTWebMutationTask(t, completed), privateKey, credentialID)
+	installed, ok := manager.GetByID(result.Name)
+	if !ok {
+		t.Fatal("persisted credential was not registered")
+	}
+	credential, errParse := chatgptwebauth.ParseCredential(installed.Metadata)
+	if errParse != nil || credential.WebAuthn == nil || credential.WebAuthn.PrivateKeyPKCS8 != privateKey {
+		t.Fatalf("persisted credential = %#v error=%v", credential, errParse)
+	}
+	listEntry, errMarshalEntry := json.Marshal(h.buildAuthFileEntry(installed))
+	if errMarshalEntry != nil {
+		t.Fatal(errMarshalEntry)
+	}
+	assertChatGPTWebManagementSecretsAbsent(t, string(listEntry), privateKey, credentialID, userHandle)
+	raw, errRead := os.ReadFile(filepath.Join(authDir, result.Name))
+	if errRead != nil {
+		t.Fatal(errRead)
+	}
+	if !bytes.Contains(raw, []byte(privateKey)) {
+		t.Fatal("persisted auth file omitted WebAuthn private key")
+	}
+}
+
+func TestChatGPTWebImportTaskDoesNotRollBackWebAuthnRuntimeState(t *testing.T) {
+	executor := &chatGPTWebManagementTestExecutor{}
+	h, manager, _ := newChatGPTWebManagementTestHandler(t, executor)
+	router := chatGPTWebManagementTestRouter(h)
+	payload, _, _, _ := chatGPTWebImportWebAuthnFixture(t)
+
+	firstTask := startChatGPTWebImportTask(t, router, []chatGPTWebImportTestFile{{
+		field: "files",
+		name:  "passkey.json",
+		data:  payload,
+	}})
+	first := waitForChatGPTWebMutationTask(t, router, chatGPTWebMutationTaskImport, firstTask.ID)
+	if first.Succeeded != 1 || len(first.Results) != 1 {
+		t.Fatalf("first task = %+v", first)
+	}
+	installed, ok := manager.GetByID(first.Results[0].Name)
+	if !ok {
+		t.Fatal("persisted credential was not registered")
+	}
+	advanced, errParse := chatgptwebauth.ParseCredential(installed.Metadata)
+	if errParse != nil || advanced.WebAuthn == nil {
+		t.Fatalf("ParseCredential() credential=%#v error=%v", advanced, errParse)
+	}
+	advanced.WebAuthn.SignCount = 9
+	advanced.WebAuthn.LastUsedAt = "2026-08-05T12:00:00Z"
+	updated, current, errUpdate := manager.MutateRuntimeMetadataIfCurrent(t.Context(), installed, func(candidate *coreauth.Auth) {
+		advanced.ApplyToMetadata(candidate.Metadata)
+	})
+	if errUpdate != nil || !current {
+		t.Fatalf("MutateRuntimeMetadataIfCurrent() current=%t error=%v", current, errUpdate)
+	}
+
+	secondTask := startChatGPTWebImportTask(t, router, []chatGPTWebImportTestFile{{
+		field: "files",
+		name:  "old-passkey-copy.json",
+		data:  payload,
+	}})
+	second := waitForChatGPTWebMutationTask(t, router, chatGPTWebMutationTaskImport, secondTask.ID)
+	if second.Succeeded != 1 || len(second.Results) != 1 || !second.Results[0].WebAuthnV1Persisted {
+		t.Fatalf("second task = %+v", second)
+	}
+	currentAuth, ok := manager.GetByID(updated.ID)
+	if !ok {
+		t.Fatal("reimported credential is missing")
+	}
+	currentCredential, errCurrent := chatgptwebauth.ParseCredential(currentAuth.Metadata)
+	if errCurrent != nil || currentCredential.WebAuthn == nil {
+		t.Fatalf("ParseCredential() credential=%#v error=%v", currentCredential, errCurrent)
+	}
+	if currentCredential.WebAuthn.SignCount != 9 || currentCredential.WebAuthn.LastUsedAt != "2026-08-05T12:00:00Z" {
+		t.Fatalf("WebAuthn runtime state = %+v", currentCredential.WebAuthn)
+	}
+}
+
 func TestChatGPTWebImportTaskTriggersNonForcedAccountInfoRefresh(t *testing.T) {
 	type triggerCall struct {
 		authID string
@@ -819,6 +923,19 @@ type chatGPTWebImportTestFile struct {
 	field string
 	name  string
 	data  string
+}
+
+func chatGPTWebImportWebAuthnFixture(t *testing.T) (payload, privateKeyPKCS8, credentialID, userHandle string) {
+	t.Helper()
+	raw, errRead := os.ReadFile("testdata/chatgpt-web-webauthn-v1.json")
+	if errRead != nil {
+		t.Fatal(errRead)
+	}
+	credential, errDecode := chatgptwebauth.DecodeImportCredential(raw)
+	if errDecode != nil || credential.WebAuthn == nil {
+		t.Fatalf("DecodeImportCredential() credential=%#v error=%v", credential, errDecode)
+	}
+	return string(raw), credential.WebAuthn.PrivateKeyPKCS8, credential.WebAuthn.CredentialID, credential.WebAuthn.UserHandle
 }
 
 type chatGPTWebImportProxyResolver struct {

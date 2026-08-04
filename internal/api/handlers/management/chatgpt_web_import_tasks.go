@@ -557,6 +557,9 @@ func (h *Handler) executeChatGPTWebImport(ctx context.Context, input chatGPTWebI
 		result.Name = installed.FileName
 		result.AuthIndex = installed.EnsureIndex()
 		result.CredentialMode = credential.CredentialMode
+		if errConfirm := confirmChatGPTWebImportPersistence(&result, installed, credential); errConfirm != nil {
+			return failedChatGPTWebPersistenceResult(result, errConfirm, "persisted credential could not be verified")
+		}
 		if errProbe != nil {
 			return failedChatGPTWebProbeResult(result, errProbe)
 		}
@@ -607,7 +610,31 @@ func (h *Handler) executeChatGPTWebImport(ctx context.Context, input chatGPTWebI
 	result.Name = installed.FileName
 	result.AuthIndex = installed.EnsureIndex()
 	result.CredentialMode = credential.CredentialMode
+	if errConfirm := confirmChatGPTWebImportPersistence(&result, installed, credential); errConfirm != nil {
+		return failedChatGPTWebPersistenceResult(result, errConfirm, "persisted credential could not be verified")
+	}
 	return result
+}
+
+func confirmChatGPTWebImportPersistence(result *chatGPTWebMutationTaskResult, installed *coreauth.Auth, imported *chatgptwebauth.Credential) error {
+	if result == nil || installed == nil || imported == nil {
+		return errors.New("persisted credential is unavailable")
+	}
+	persisted, errParse := chatgptwebauth.ParseCredential(installed.Metadata)
+	if errParse != nil {
+		return errors.New("persisted credential is invalid")
+	}
+	result.CredentialSchemaVersion = persisted.CredentialSchemaVersion
+	if imported.CredentialSchemaVersion != chatgptwebauth.CredentialSchemaVersionWebAuthn {
+		return nil
+	}
+	if persisted.CredentialSchemaVersion != chatgptwebauth.CredentialSchemaVersionWebAuthn ||
+		persisted.WebAuthn == nil || !reflect.DeepEqual(imported.WebAuthn, persisted.WebAuthn) {
+		return errors.New("persisted WebAuthn credential does not match the imported credential")
+	}
+	result.PersistedFeatures = []string{"webauthn_v1"}
+	result.WebAuthnV1Persisted = true
+	return nil
 }
 
 func (h *Handler) persistImportedChatGPTWebCredential(ctx context.Context, manager *coreauth.Manager, fileName string, credential *chatgptwebauth.Credential, expected *coreauth.Auth, refreshAware, nameScoped bool) (installed *coreauth.Auth, status string, unchanged bool, err error) {

@@ -1066,6 +1066,7 @@ func cloneCredential(source *Credential) *Credential {
 	}
 	clone := *source
 	clone.Cookies = append([]Cookie(nil), source.Cookies...)
+	clone.WebAuthn = cloneWebAuthnCredential(source.WebAuthn)
 	return &clone
 }
 

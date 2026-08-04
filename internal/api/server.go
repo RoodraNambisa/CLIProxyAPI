@@ -768,6 +768,7 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.POST("/chatgpt-web/import-tasks", s.mgmt.StartChatGPTWebImportTask)
 		mgmt.GET("/chatgpt-web/import-tasks/:id", s.mgmt.GetChatGPTWebImportTask)
 		mgmt.DELETE("/chatgpt-web/import-tasks/:id", s.mgmt.CancelChatGPTWebImportTask)
+		mgmt.GET("/chatgpt-web/capabilities", s.mgmt.GetChatGPTWebCapabilities)
 		mgmt.POST("/chatgpt-web/conversion-tasks", s.mgmt.StartChatGPTWebConversionTask)
 		mgmt.GET("/chatgpt-web/conversion-tasks/:id", s.mgmt.GetChatGPTWebConversionTask)
 		mgmt.DELETE("/chatgpt-web/conversion-tasks/:id", s.mgmt.CancelChatGPTWebConversionTask)

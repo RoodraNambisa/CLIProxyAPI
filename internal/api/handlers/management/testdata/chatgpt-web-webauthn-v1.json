@@ -1,0 +1,39 @@
+{
+  "type": "chatgpt-web",
+  "credential_schema_version": 2,
+  "credential_mode": "session",
+  "refresh_strategy": "chatgpt_session",
+  "email": "passkey@example.com",
+  "access_token": "passkey-access-token",
+  "cookies": [
+    {
+      "name": "__Secure-next-auth.session-token",
+      "value": "passkey-session-cookie",
+      "domain": "chatgpt.com",
+      "host": "chatgpt.com",
+      "path": "/",
+      "secure": true,
+      "http_only": true
+    }
+  ],
+  "webauthn": {
+    "version": 1,
+    "credential_id": "cmVnaXN0cmFyLWNyZWRlbnRpYWwtaWQ",
+    "user_handle": "cmVnaXN0cmFyLXVzZXItaGFuZGxl",
+    "rp_id": "openai.com",
+    "origin": "https://auth.openai.com",
+    "algorithm": -7,
+    "private_key_pkcs8": "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg7o/OIxGYOSrSGXr87ZuM2OvszLn2yD9qQbO33FTXJUehRANCAARkWu4/f/LDigYCvJ4o+BDiSBEvNA+QSFLuORPKDxvdMb23CdvDXKCpzEA9O6G7BxdA05hBqH6X+qgkolBPrWlJ",
+    "sign_count": 0,
+    "mfa_factor_id": "factor-1",
+    "transports": [
+      "internal"
+    ],
+    "user_present": true,
+    "user_verified": true,
+    "backup_eligible": false,
+    "backup_state": false,
+    "created_at": "2026-08-05T00:00:00Z",
+    "last_used_at": "2026-08-05T00:00:00Z"
+  }
+}
