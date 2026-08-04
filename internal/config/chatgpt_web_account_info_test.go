@@ -10,7 +10,7 @@ import (
 func TestChatGPTWebAccountInfoConfigDefaults(t *testing.T) {
 	resolved := (ChatGPTWebAccountInfoConfig{}).Resolved()
 	if !resolved.AutoRefreshEnabled ||
-		resolved.DiagnosticsEnabled ||
+		resolved.DiagnosticsEnabled || resolved.RawQuotaResponseEnabled ||
 		resolved.RefreshWorkers != 4 || resolved.RefreshQueueSize != 256 ||
 		resolved.RefreshTTLMinutes != 15 || resolved.PeriodicRefreshMinutes != 0 ||
 		resolved.RecoveryJitterSeconds != 30 ||
@@ -60,7 +60,7 @@ func TestChatGPTWebAccountInfoConfigValidation(t *testing.T) {
 
 func TestLoadAndSaveChatGPTWebAccountInfoConfig(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.yaml")
-	data := []byte("chatgpt-web:\n  force-session-refresh-on-import: false\n  account-info:\n    auto-refresh-enabled: false\n    diagnostics-enabled: true\n    refresh-workers: 2\n    refresh-queue-size: 0\n    refresh-ttl-minutes: 30\n    periodic-refresh-minutes: 0\n    recovery-jitter-seconds: 0\n    max-retries: 0\n")
+	data := []byte("chatgpt-web:\n  session-cookie-refresh-on-token-failure: true\n  force-session-refresh-on-import: false\n  account-info:\n    auto-refresh-enabled: false\n    diagnostics-enabled: true\n    raw-quota-response-enabled: true\n    refresh-workers: 2\n    refresh-queue-size: 0\n    refresh-ttl-minutes: 30\n    periodic-refresh-minutes: 0\n    recovery-jitter-seconds: 0\n    max-retries: 0\n")
 	if err := os.WriteFile(path, data, 0o600); err != nil {
 		t.Fatalf("write config: %v", err)
 	}
@@ -69,7 +69,7 @@ func TestLoadAndSaveChatGPTWebAccountInfoConfig(t *testing.T) {
 		t.Fatalf("LoadConfig() error = %v", errLoad)
 	}
 	resolved := cfg.ChatGPTWeb.AccountInfo.Resolved()
-	if resolved.AutoRefreshEnabled || !resolved.DiagnosticsEnabled ||
+	if resolved.AutoRefreshEnabled || !resolved.DiagnosticsEnabled || !resolved.RawQuotaResponseEnabled ||
 		resolved.RefreshWorkers != 2 || resolved.RefreshQueueSize != 0 ||
 		resolved.RefreshTTLMinutes != 30 || resolved.PeriodicRefreshMinutes != 0 ||
 		resolved.RecoveryJitterSeconds != 0 ||
@@ -79,6 +79,9 @@ func TestLoadAndSaveChatGPTWebAccountInfoConfig(t *testing.T) {
 	if cfg.ChatGPTWeb.ForceSessionRefreshOnImportEnabled() {
 		t.Fatal("force-session-refresh-on-import was not loaded")
 	}
+	if !cfg.ChatGPTWeb.SessionCookieRefreshOnTokenFailure {
+		t.Fatal("session-cookie-refresh-on-token-failure was not loaded")
+	}
 	if errSave := SaveConfigPreserveComments(path, cfg); errSave != nil {
 		t.Fatalf("SaveConfigPreserveComments() error = %v", errSave)
 	}
@@ -87,10 +90,12 @@ func TestLoadAndSaveChatGPTWebAccountInfoConfig(t *testing.T) {
 		t.Fatalf("read saved config: %v", errRead)
 	}
 	for _, expected := range []string{
+		"session-cookie-refresh-on-token-failure: true",
 		"force-session-refresh-on-import: false",
 		"account-info:",
 		"auto-refresh-enabled: false",
 		"diagnostics-enabled: true",
+		"raw-quota-response-enabled: true",
 		"refresh-queue-size: 0",
 		"periodic-refresh-minutes: 0",
 		"recovery-jitter-seconds: 0",
@@ -112,6 +117,7 @@ func TestLoadConfigRejectsInvalidChatGPTWebAccountInfoFields(t *testing.T) {
 		{name: "null", yaml: "chatgpt-web:\n  account-info:\n    refresh-workers: null\n", want: "refresh-workers"},
 		{name: "null auto refresh", yaml: "chatgpt-web:\n  account-info:\n    auto-refresh-enabled: null\n", want: "auto-refresh-enabled"},
 		{name: "null diagnostics", yaml: "chatgpt-web:\n  account-info:\n    diagnostics-enabled: null\n", want: "diagnostics-enabled"},
+		{name: "null raw quota response", yaml: "chatgpt-web:\n  account-info:\n    raw-quota-response-enabled: null\n", want: "raw-quota-response-enabled"},
 		{name: "null periodic refresh", yaml: "chatgpt-web:\n  account-info:\n    periodic-refresh-minutes: null\n", want: "periodic-refresh-minutes"},
 		{name: "out of range", yaml: "chatgpt-web:\n  account-info:\n    max-retries: 11\n", want: "max-retries"},
 		{name: "periodic refresh out of range", yaml: "chatgpt-web:\n  account-info:\n    periodic-refresh-minutes: 10081\n", want: "periodic-refresh-minutes"},

@@ -24,6 +24,7 @@ type accountInfoControllerTestExecutor struct {
 	mu          sync.Mutex
 	snapshot    chatgptwebauth.AccountInfoRuntimeSnapshot
 	diagnostics chatgptwebauth.AccountInfoDiagnosticsSnapshot
+	rawQuota    chatgptwebauth.AccountInfoRawQuotaResponsesSnapshot
 	tasks       map[string]*chatgptwebauth.AccountInfoRefreshTask
 	targets     []chatgptwebauth.AccountInfoRefreshTarget
 	force       bool
@@ -58,6 +59,21 @@ func (executor *accountInfoControllerTestExecutor) ClearAccountInfoDiagnostics()
 	executor.diagnostics.EvictedCount = 0
 	executor.diagnostics.Records = nil
 	return executor.diagnostics
+}
+
+func (executor *accountInfoControllerTestExecutor) AccountInfoRawQuotaResponsesSnapshot() chatgptwebauth.AccountInfoRawQuotaResponsesSnapshot {
+	executor.mu.Lock()
+	defer executor.mu.Unlock()
+	return executor.rawQuota
+}
+
+func (executor *accountInfoControllerTestExecutor) ClearAccountInfoRawQuotaResponses() chatgptwebauth.AccountInfoRawQuotaResponsesSnapshot {
+	executor.mu.Lock()
+	defer executor.mu.Unlock()
+	executor.rawQuota.TotalBytes = 0
+	executor.rawQuota.EvictedCount = 0
+	executor.rawQuota.Records = nil
+	return executor.rawQuota
 }
 
 func (executor *accountInfoControllerTestExecutor) AccountInfoAuthState(authID string) chatgptwebauth.AccountInfoAuthRuntimeState {
@@ -149,7 +165,7 @@ func TestGetChatGPTWebAccountInfoReturnsDefaultsAndRuntime(t *testing.T) {
 	if errDecode := json.Unmarshal(recorder.Body.Bytes(), &response); errDecode != nil {
 		t.Fatalf("decode response: %v", errDecode)
 	}
-	if !response.Config.AutoRefreshEnabled || response.Config.DiagnosticsEnabled ||
+	if !response.Config.AutoRefreshEnabled || response.Config.DiagnosticsEnabled || response.Config.RawQuotaResponseEnabled ||
 		response.Config.RefreshWorkers != 4 || response.Config.RefreshQueueSize != 256 ||
 		response.Config.RefreshTTLMinutes != 15 || response.Config.PeriodicRefreshMinutes != 0 ||
 		response.Config.RecoveryJitterSeconds != 30 ||
@@ -159,6 +175,48 @@ func TestGetChatGPTWebAccountInfoReturnsDefaultsAndRuntime(t *testing.T) {
 	if response.Runtime.Busy != 2 || response.Runtime.Queued != 3 ||
 		response.Runtime.Scheduled != 4 || response.Runtime.RefreshCount != 7 {
 		t.Fatalf("runtime = %+v", response.Runtime)
+	}
+}
+
+func TestGetAndClearChatGPTWebAccountInfoRawQuotaResponses(t *testing.T) {
+	executor := &accountInfoControllerTestExecutor{rawQuota: chatgptwebauth.AccountInfoRawQuotaResponsesSnapshot{
+		Enabled:      true,
+		Capacity:     chatgptwebauth.AccountInfoRawQuotaResponseCapacity,
+		MaxBytes:     chatgptwebauth.AccountInfoRawQuotaResponseMaxBytes,
+		TotalBytes:   17,
+		EvictedCount: 2,
+		Records: []chatgptwebauth.AccountInfoRawQuotaResponseRecord{{
+			AuthIndex: "credential", HTTPStatus: 200, Body: `{"remaining":17}`, ResponseBytes: 17,
+		}},
+	}}
+	manager := coreauth.NewManager(nil, nil, nil)
+	manager.RegisterExecutor(executor)
+	handler := &Handler{cfg: &config.Config{}, authManager: manager}
+
+	ctx, recorder := newChatGPTWebAccountInfoRequest(http.MethodGet, "")
+	handler.GetChatGPTWebAccountInfoRawQuotaResponses(ctx)
+	if recorder.Code != http.StatusOK || recorder.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("GET status = %d cache-control = %q body = %s", recorder.Code, recorder.Header().Get("Cache-Control"), recorder.Body.String())
+	}
+	var before chatgptwebauth.AccountInfoRawQuotaResponsesSnapshot
+	if errDecode := json.Unmarshal(recorder.Body.Bytes(), &before); errDecode != nil {
+		t.Fatal(errDecode)
+	}
+	if len(before.Records) != 1 || before.Records[0].Body != `{"remaining":17}` || before.EvictedCount != 2 {
+		t.Fatalf("GET raw quota = %+v", before)
+	}
+
+	ctx, recorder = newChatGPTWebAccountInfoRequest(http.MethodDelete, "")
+	handler.ClearChatGPTWebAccountInfoRawQuotaResponses(ctx)
+	if recorder.Code != http.StatusOK || recorder.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("DELETE status = %d cache-control = %q body = %s", recorder.Code, recorder.Header().Get("Cache-Control"), recorder.Body.String())
+	}
+	var after chatgptwebauth.AccountInfoRawQuotaResponsesSnapshot
+	if errDecode := json.Unmarshal(recorder.Body.Bytes(), &after); errDecode != nil {
+		t.Fatal(errDecode)
+	}
+	if !after.Enabled || len(after.Records) != 0 || after.TotalBytes != 0 || after.EvictedCount != 0 {
+		t.Fatalf("cleared raw quota = %+v", after)
 	}
 }
 
@@ -224,14 +282,14 @@ func TestPatchAndStartChatGPTWebAccountInfoRefresh(t *testing.T) {
 
 	ctx, recorder := newChatGPTWebAccountInfoRequest(
 		http.MethodPatch,
-		`{"auto-refresh-enabled":false,"diagnostics-enabled":true,"refresh-workers":6,"periodic-refresh-minutes":60,"max-retries":1}`,
+		`{"auto-refresh-enabled":false,"diagnostics-enabled":true,"raw-quota-response-enabled":true,"refresh-workers":6,"periodic-refresh-minutes":60,"max-retries":1}`,
 	)
 	handler.PatchChatGPTWebAccountInfo(ctx)
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("PATCH status = %d: %s", recorder.Code, recorder.Body.String())
 	}
 	resolved := handler.cfg.ChatGPTWeb.AccountInfo.Resolved()
-	if resolved.AutoRefreshEnabled || !resolved.DiagnosticsEnabled ||
+	if resolved.AutoRefreshEnabled || !resolved.DiagnosticsEnabled || !resolved.RawQuotaResponseEnabled ||
 		resolved.RefreshWorkers != 6 || resolved.PeriodicRefreshMinutes != 60 ||
 		resolved.MaxRetries != 1 || resolved.RefreshQueueSize != 256 {
 		t.Fatalf("patched config = %+v", resolved)
@@ -284,6 +342,9 @@ func TestPutChatGPTWebAccountInfoAcceptsLegacyPayloadWithoutAutoRefresh(t *testi
 	if resolved.DiagnosticsEnabled {
 		t.Fatal("legacy PUT enabled diagnostics")
 	}
+	if resolved.RawQuotaResponseEnabled {
+		t.Fatal("legacy PUT enabled raw quota response capture")
+	}
 }
 
 func TestPatchChatGPTWebAccountInfoRejectsNullDiagnostics(t *testing.T) {
@@ -299,6 +360,23 @@ func TestPatchChatGPTWebAccountInfoRejectsNullDiagnostics(t *testing.T) {
 
 	if recorder.Code != http.StatusBadRequest ||
 		!strings.Contains(recorder.Body.String(), "invalid diagnostics-enabled") {
+		t.Fatalf("status = %d body = %s", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestPatchChatGPTWebAccountInfoRejectsNullRawQuotaResponse(t *testing.T) {
+	manager := coreauth.NewManager(nil, nil, nil)
+	manager.RegisterExecutor(&accountInfoControllerTestExecutor{})
+	handler := &Handler{cfg: &config.Config{}, authManager: manager}
+	ctx, recorder := newChatGPTWebAccountInfoRequest(
+		http.MethodPatch,
+		`{"raw-quota-response-enabled":null}`,
+	)
+
+	handler.PatchChatGPTWebAccountInfo(ctx)
+
+	if recorder.Code != http.StatusBadRequest ||
+		!strings.Contains(recorder.Body.String(), "invalid raw-quota-response-enabled") {
 		t.Fatalf("status = %d body = %s", recorder.Code, recorder.Body.String())
 	}
 }

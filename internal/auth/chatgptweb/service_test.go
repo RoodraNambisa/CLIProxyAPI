@@ -2254,6 +2254,73 @@ func TestServiceRefreshSessionDoesNotSendDirectCookieBesideChunks(t *testing.T) 
 	}
 }
 
+func TestServiceRefreshSessionCloudflareChallengeIsTransient(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/api/auth/session" {
+			http.NotFound(response, request)
+			return
+		}
+		response.Header().Set("Content-Type", "text/html")
+		response.Header().Set("CF-Mitigated", "challenge")
+		response.WriteHeader(http.StatusForbidden)
+		_, _ = io.WriteString(response, `<html><title>Just a moment...</title><script src="/cdn-cgi/challenge-platform/x"></script></html>`)
+	}))
+	defer server.Close()
+	cookies, errCookies := ParseCookieHeader("next-auth.session-token=session-value", server.URL)
+	if errCookies != nil {
+		t.Fatal(errCookies)
+	}
+	service := NewService(Options{SessionBaseURL: server.URL, Rand: zeroReader{}})
+	credential, errRefresh := service.RefreshSession(t.Context(), Credential{
+		AccessToken: "old-token", RefreshStrategy: RefreshStrategyChatGPTSession,
+		Persona: DefaultPersona(), Cookies: cookies, LifecycleState: LifecycleActive,
+	}, "")
+	if errRefresh == nil {
+		t.Fatal("RefreshSession() error = nil")
+	}
+	authError, ok := AsAuthError(errRefresh)
+	if !ok || authError.Code != "cloudflare_challenge" || authError.State != LifecycleActive ||
+		!authError.Retryable || authError.Terminal {
+		t.Fatalf("RefreshSession() error = %#v", errRefresh)
+	}
+	if credential == nil || credential.LifecycleState == LifecycleDead {
+		t.Fatalf("Cloudflare challenge marked credential dead: %#v", credential)
+	}
+}
+
+func TestServiceRefreshSessionForbiddenWithoutChallengeIsExpired(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/api/auth/session" {
+			http.NotFound(response, request)
+			return
+		}
+		response.Header().Set("Content-Type", "application/json")
+		response.WriteHeader(http.StatusForbidden)
+		_, _ = io.WriteString(response, `{"error":"session expired"}`)
+	}))
+	defer server.Close()
+	cookies, errCookies := ParseCookieHeader("next-auth.session-token=session-value", server.URL)
+	if errCookies != nil {
+		t.Fatal(errCookies)
+	}
+	service := NewService(Options{SessionBaseURL: server.URL, Rand: zeroReader{}})
+	credential, errRefresh := service.RefreshSession(t.Context(), Credential{
+		AccessToken: "old-token", RefreshStrategy: RefreshStrategyChatGPTSession,
+		Persona: DefaultPersona(), Cookies: cookies, LifecycleState: LifecycleActive,
+	}, "")
+	if errRefresh == nil {
+		t.Fatal("RefreshSession() error = nil")
+	}
+	authError, ok := AsAuthError(errRefresh)
+	if !ok || authError.Code != "session_expired" || authError.State != LifecycleReauthRequired ||
+		authError.Retryable || !authError.Terminal {
+		t.Fatalf("RefreshSession() error = %#v", errRefresh)
+	}
+	if credential == nil || credential.LifecycleState != LifecycleReauthRequired {
+		t.Fatalf("credential = %#v", credential)
+	}
+}
+
 func TestServiceRefreshSessionRejectsAccountSwitch(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
 		if request.URL.Path != "/api/auth/session" {

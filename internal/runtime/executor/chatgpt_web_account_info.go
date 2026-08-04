@@ -266,8 +266,9 @@ func (h *chatGPTWebAccountInfoScheduleHeap) Pop() any {
 }
 
 type chatGPTWebAccountInfoRuntime struct {
-	executor    *ChatGPTWebExecutor
-	diagnostics *helps.ChatGPTWebAccountInfoDiagnostics
+	executor          *ChatGPTWebExecutor
+	diagnostics       *helps.ChatGPTWebAccountInfoDiagnostics
+	rawQuotaResponses *helps.ChatGPTWebAccountInfoRawQuotaResponses
 
 	mu                         sync.Mutex
 	cond                       *sync.Cond
@@ -328,6 +329,7 @@ func newChatGPTWebAccountInfoRuntime(executor *ChatGPTWebExecutor, cfg *config.C
 	runtime := &chatGPTWebAccountInfoRuntime{
 		executor:                   executor,
 		diagnostics:                helps.NewChatGPTWebAccountInfoDiagnostics(resolved.DiagnosticsEnabled),
+		rawQuotaResponses:          helps.NewChatGPTWebAccountInfoRawQuotaResponses(resolved.RawQuotaResponseEnabled),
 		tasks:                      make(map[string]*chatGPTWebAccountInfoTaskState),
 		states:                     make(map[string]chatgptwebauth.AccountInfoAuthRuntimeState),
 		queuedByTarget:             make(map[string]int),
@@ -459,6 +461,37 @@ func (e *ChatGPTWebExecutor) recordChatGPTWebAccountInfoDiagnostic(
 	}
 	event := e.chatGPTWebAccountInfoDiagnosticEvent(ctx, phase, stage, response, payload, err)
 	e.accountInfo.diagnostics.Record(event)
+}
+
+func (e *ChatGPTWebExecutor) recordChatGPTWebAccountInfoRawQuotaResponse(
+	ctx context.Context,
+	response *fhttp.Response,
+	payload []byte,
+	quota *chatgptwebauth.ImageQuota,
+	err error,
+) {
+	if e == nil || e.accountInfo == nil || e.accountInfo.rawQuotaResponses == nil {
+		return
+	}
+	event := chatgptwebauth.AccountInfoRawQuotaResponseEvent{
+		CapturedAt:  e.currentTime().UTC(),
+		Body:        payload,
+		ParsedQuota: quota,
+	}
+	if ctx != nil {
+		diagnostic, _ := ctx.Value(chatGPTWebAccountInfoDiagnosticContextKey{}).(chatGPTWebAccountInfoDiagnosticContext)
+		event.AuthIndex = diagnostic.authIndex
+		event.Attempt = diagnostic.attempt
+	}
+	if response != nil {
+		event.HTTPStatus = response.StatusCode
+		event.ContentType = safeChatGPTWebAccountInfoContentType(response.Header.Get("content-type"))
+	}
+	if err != nil {
+		event.ParseError, _ = classifyChatGPTWebAccountInfoError(err)
+		event.Truncated = len(payload) >= chatGPTWebAccountInfoMaxBodyBytes
+	}
+	e.accountInfo.rawQuotaResponses.Record(event)
 }
 
 func (e *ChatGPTWebExecutor) chatGPTWebAccountInfoDiagnosticEvent(
@@ -876,6 +909,9 @@ func (runtime *chatGPTWebAccountInfoRuntime) updateConfig(cfg *config.Config) {
 	resolved := accountInfoConfigSnapshot(cfg)
 	if runtime.diagnostics != nil {
 		runtime.diagnostics.SetEnabled(resolved.DiagnosticsEnabled)
+	}
+	if runtime.rawQuotaResponses != nil {
+		runtime.rawQuotaResponses.SetEnabled(resolved.RawQuotaResponseEnabled)
 	}
 	runtime.mu.Lock()
 	if runtime.closed {
@@ -3735,6 +3771,28 @@ func (e *ChatGPTWebExecutor) ClearAccountInfoDiagnostics() chatgptwebauth.Accoun
 	return e.accountInfo.diagnostics.Clear()
 }
 
+// AccountInfoRawQuotaResponsesSnapshot returns bounded raw conversation/init responses.
+func (e *ChatGPTWebExecutor) AccountInfoRawQuotaResponsesSnapshot() chatgptwebauth.AccountInfoRawQuotaResponsesSnapshot {
+	if e == nil || e.accountInfo == nil || e.accountInfo.rawQuotaResponses == nil {
+		return chatgptwebauth.AccountInfoRawQuotaResponsesSnapshot{
+			Capacity: chatgptwebauth.AccountInfoRawQuotaResponseCapacity,
+			MaxBytes: chatgptwebauth.AccountInfoRawQuotaResponseMaxBytes,
+		}
+	}
+	return e.accountInfo.rawQuotaResponses.Snapshot()
+}
+
+// ClearAccountInfoRawQuotaResponses removes all captured raw quota responses.
+func (e *ChatGPTWebExecutor) ClearAccountInfoRawQuotaResponses() chatgptwebauth.AccountInfoRawQuotaResponsesSnapshot {
+	if e == nil || e.accountInfo == nil || e.accountInfo.rawQuotaResponses == nil {
+		return chatgptwebauth.AccountInfoRawQuotaResponsesSnapshot{
+			Capacity: chatgptwebauth.AccountInfoRawQuotaResponseCapacity,
+			MaxBytes: chatgptwebauth.AccountInfoRawQuotaResponseMaxBytes,
+		}
+	}
+	return e.accountInfo.rawQuotaResponses.Clear()
+}
+
 // HasPassiveAuthInstanceState reports account-info state created outside request execution.
 func (e *ChatGPTWebExecutor) HasPassiveAuthInstanceState(authID string, authInstanceID string) bool {
 	return e != nil && e.accountInfo != nil && e.accountInfo.hasPassiveAuthState(authID, authInstanceID)
@@ -4242,6 +4300,7 @@ func (e *ChatGPTWebExecutor) fetchChatGPTWebAccountInfoPair(
 			"system_hints":            []string{"picture_v2"},
 		}, chatGPTWebAccountInfoMaxBodyBytes)
 		if errRequest != nil {
+			e.recordChatGPTWebAccountInfoRawQuotaResponse(ctx, response, payload, nil, errRequest)
 			stage := "request"
 			if response != nil {
 				if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
@@ -4255,10 +4314,17 @@ func (e *ChatGPTWebExecutor) fetchChatGPTWebAccountInfoPair(
 			return
 		}
 		if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
-			quotaResults <- quotaResult{err: newChatGPTWebStatusError(response.StatusCode, path, payload, response.Header)}
+			errStatus := newChatGPTWebStatusError(response.StatusCode, path, payload, response.Header)
+			e.recordChatGPTWebAccountInfoRawQuotaResponse(ctx, response, payload, nil, errStatus)
+			quotaResults <- quotaResult{err: errStatus}
 			return
 		}
 		quota, errParse := chatgptwebauth.ParseImageQuota(payload)
+		var parsedQuota *chatgptwebauth.ImageQuota
+		if errParse == nil {
+			parsedQuota = &quota
+		}
+		e.recordChatGPTWebAccountInfoRawQuotaResponse(ctx, response, payload, parsedQuota, errParse)
 		if errParse != nil {
 			e.recordChatGPTWebAccountInfoDiagnostic(ctx, "quota", "parse", response, payload, errParse)
 		}

@@ -200,6 +200,73 @@ func TestChatGPTWebAccountInfoDiagnosticsDefaultDisabledAndHotUpdated(t *testing
 	}
 }
 
+func TestChatGPTWebAccountInfoRawQuotaResponseCapturesSuccessfulConversationInit(t *testing.T) {
+	enabled := true
+	quotaBody := `{"limits_progress":[{"feature_name":"image_gen","remaining":17,"reset_after":"2026-08-05T00:00:00Z"}]}`
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "application/json; charset=utf-8")
+		switch request.URL.Path {
+		case chatgptwebauth.AccountCheckPath:
+			_, _ = io.WriteString(writer, `{"accounts":{"default":{"account":{"account_id":"account-1","plan_type":"free"}}}}`)
+		case chatgptwebauth.ConversationInitPath:
+			_, _ = io.WriteString(writer, quotaBody)
+		default:
+			http.NotFound(writer, request)
+		}
+	}))
+	defer server.Close()
+
+	executor := NewChatGPTWebExecutor(&config.Config{ChatGPTWeb: config.ChatGPTWebConfig{
+		AccountInfo: config.ChatGPTWebAccountInfoConfig{RawQuotaResponseEnabled: &enabled},
+	}}, nil)
+	t.Cleanup(func() { _ = executor.Close() })
+	executor.runtimeBaseURL = server.URL
+	credential, errCredential := chatgptwebauth.ParseCredential(chatGPTWebTestAuth("raw-quota-success").Metadata)
+	if errCredential != nil {
+		t.Fatal(errCredential)
+	}
+	profileClient, errClient := chatgptwebauth.NewAcquisitionClient(credential.Persona, "", credential.Cookies, time.Second)
+	if errClient != nil {
+		t.Fatal(errClient)
+	}
+	defer profileClient.CloseIdleConnections()
+	quotaClient, errClient := chatgptwebauth.NewAcquisitionClient(credential.Persona, "", credential.Cookies, time.Second)
+	if errClient != nil {
+		t.Fatal(errClient)
+	}
+	defer quotaClient.CloseIdleConnections()
+
+	ctx := withChatGPTWebAccountInfoDiagnosticContext(t.Context(), "raw-quota-auth", 2)
+	_, quota, profileErr, quotaErr := executor.fetchChatGPTWebAccountInfoPair(ctx, profileClient, quotaClient, credential)
+	if profileErr != nil || quotaErr != nil || quota.Remaining != 17 {
+		t.Fatalf("fetch pair = quota %+v profileErr=%v quotaErr=%v", quota, profileErr, quotaErr)
+	}
+	snapshot := executor.AccountInfoRawQuotaResponsesSnapshot()
+	if !snapshot.Enabled || len(snapshot.Records) != 1 {
+		t.Fatalf("raw quota snapshot = %+v", snapshot)
+	}
+	record := snapshot.Records[0]
+	if record.AuthIndex != "raw-quota-auth" || record.Attempt != 2 || record.HTTPStatus != http.StatusOK ||
+		record.ContentType != "application/json" || record.Body != quotaBody || record.ParsedQuota == nil ||
+		record.ParsedQuota.Remaining != 17 {
+		t.Fatalf("raw quota record = %+v", record)
+	}
+
+	enabled = false
+	executor.UpdateConfig(&config.Config{ChatGPTWeb: config.ChatGPTWebConfig{
+		AccountInfo: config.ChatGPTWebAccountInfoConfig{RawQuotaResponseEnabled: &enabled},
+	}})
+	executor.recordChatGPTWebAccountInfoRawQuotaResponse(ctx, nil, []byte(`{"new":true}`), nil, errors.New("ignored"))
+	disabled := executor.AccountInfoRawQuotaResponsesSnapshot()
+	if disabled.Enabled || len(disabled.Records) != 1 || disabled.Records[0].Body != quotaBody {
+		t.Fatalf("disabled raw quota snapshot = %+v", disabled)
+	}
+	cleared := executor.ClearAccountInfoRawQuotaResponses()
+	if cleared.Enabled || len(cleared.Records) != 0 || cleared.TotalBytes != 0 {
+		t.Fatalf("cleared raw quota snapshot = %+v", cleared)
+	}
+}
+
 func TestSafeChatGPTWebAccountInfoDiagnosticResetAfter(t *testing.T) {
 	for _, test := range []struct {
 		name string

@@ -465,6 +465,8 @@ type CodexConfig struct {
 type ChatGPTWebConfig struct {
 	// AutoRelogin starts a background password login after a terminal refresh failure.
 	AutoRelogin bool `yaml:"auto-relogin" json:"auto-relogin"`
+	// SessionCookieRefreshOnTokenFailure allows incomplete password credentials to refresh access tokens with a complete session cookie.
+	SessionCookieRefreshOnTokenFailure bool `yaml:"session-cookie-refresh-on-token-failure" json:"session-cookie-refresh-on-token-failure"`
 	// ForceSessionRefreshOnImport refreshes session-backed imports even when their access token is still valid.
 	// An omitted value remains enabled for backward compatibility.
 	ForceSessionRefreshOnImport *bool `yaml:"force-session-refresh-on-import,omitempty" json:"force-session-refresh-on-import,omitempty"`
@@ -867,14 +869,15 @@ func loadChatGPTWebTimezone(name string) (*time.Location, error) {
 
 // ChatGPTWebAccountInfoConfig controls bounded account profile and image quota refreshes.
 type ChatGPTWebAccountInfoConfig struct {
-	AutoRefreshEnabled     *bool `yaml:"auto-refresh-enabled,omitempty" json:"auto-refresh-enabled,omitempty"`
-	DiagnosticsEnabled     *bool `yaml:"diagnostics-enabled,omitempty" json:"diagnostics-enabled,omitempty"`
-	RefreshWorkers         *int  `yaml:"refresh-workers,omitempty" json:"refresh-workers,omitempty"`
-	RefreshQueueSize       *int  `yaml:"refresh-queue-size,omitempty" json:"refresh-queue-size,omitempty"`
-	RefreshTTLMinutes      *int  `yaml:"refresh-ttl-minutes,omitempty" json:"refresh-ttl-minutes,omitempty"`
-	PeriodicRefreshMinutes *int  `yaml:"periodic-refresh-minutes,omitempty" json:"periodic-refresh-minutes,omitempty"`
-	RecoveryJitterSeconds  *int  `yaml:"recovery-jitter-seconds,omitempty" json:"recovery-jitter-seconds,omitempty"`
-	MaxRetries             *int  `yaml:"max-retries,omitempty" json:"max-retries,omitempty"`
+	AutoRefreshEnabled      *bool `yaml:"auto-refresh-enabled,omitempty" json:"auto-refresh-enabled,omitempty"`
+	DiagnosticsEnabled      *bool `yaml:"diagnostics-enabled,omitempty" json:"diagnostics-enabled,omitempty"`
+	RawQuotaResponseEnabled *bool `yaml:"raw-quota-response-enabled,omitempty" json:"raw-quota-response-enabled,omitempty"`
+	RefreshWorkers          *int  `yaml:"refresh-workers,omitempty" json:"refresh-workers,omitempty"`
+	RefreshQueueSize        *int  `yaml:"refresh-queue-size,omitempty" json:"refresh-queue-size,omitempty"`
+	RefreshTTLMinutes       *int  `yaml:"refresh-ttl-minutes,omitempty" json:"refresh-ttl-minutes,omitempty"`
+	PeriodicRefreshMinutes  *int  `yaml:"periodic-refresh-minutes,omitempty" json:"periodic-refresh-minutes,omitempty"`
+	RecoveryJitterSeconds   *int  `yaml:"recovery-jitter-seconds,omitempty" json:"recovery-jitter-seconds,omitempty"`
+	MaxRetries              *int  `yaml:"max-retries,omitempty" json:"max-retries,omitempty"`
 }
 
 // UnmarshalYAML rejects unknown and null account-info settings.
@@ -891,7 +894,7 @@ func (cfg *ChatGPTWebAccountInfoConfig) UnmarshalYAML(node *yaml.Node) error {
 	}
 	for name, value := range effective {
 		switch name {
-		case "auto-refresh-enabled", "diagnostics-enabled", "refresh-workers", "refresh-queue-size", "refresh-ttl-minutes", "periodic-refresh-minutes", "recovery-jitter-seconds", "max-retries":
+		case "auto-refresh-enabled", "diagnostics-enabled", "raw-quota-response-enabled", "refresh-workers", "refresh-queue-size", "refresh-ttl-minutes", "periodic-refresh-minutes", "recovery-jitter-seconds", "max-retries":
 			if value == nil {
 				return fmt.Errorf("chatgpt-web.account-info.%s must not be null", name)
 			}
@@ -910,15 +913,16 @@ func (cfg *ChatGPTWebAccountInfoConfig) UnmarshalYAML(node *yaml.Node) error {
 
 // ResolvedChatGPTWebAccountInfoConfig contains effective refresh-pool values.
 type ResolvedChatGPTWebAccountInfoConfig struct {
-	AutoRefreshEnabled     bool `json:"auto-refresh-enabled"`
-	DiagnosticsEnabled     bool `json:"diagnostics-enabled"`
-	RefreshWorkers         int  `json:"refresh-workers"`
-	RefreshQueueSize       int  `json:"refresh-queue-size"`
-	RefreshTTLMinutes      int  `json:"refresh-ttl-minutes"`
-	PeriodicRefreshMinutes int  `json:"periodic-refresh-minutes"`
-	RecoveryJitterSeconds  int  `json:"recovery-jitter-seconds"`
-	MaxRetries             int  `json:"max-retries"`
-	autoRefreshConfigured  bool
+	AutoRefreshEnabled      bool `json:"auto-refresh-enabled"`
+	DiagnosticsEnabled      bool `json:"diagnostics-enabled"`
+	RawQuotaResponseEnabled bool `json:"raw-quota-response-enabled"`
+	RefreshWorkers          int  `json:"refresh-workers"`
+	RefreshQueueSize        int  `json:"refresh-queue-size"`
+	RefreshTTLMinutes       int  `json:"refresh-ttl-minutes"`
+	PeriodicRefreshMinutes  int  `json:"periodic-refresh-minutes"`
+	RecoveryJitterSeconds   int  `json:"recovery-jitter-seconds"`
+	MaxRetries              int  `json:"max-retries"`
+	autoRefreshConfigured   bool
 }
 
 // AutomaticRefreshEnabled reports the effective automatic refresh setting.
@@ -944,6 +948,9 @@ func (cfg ChatGPTWebAccountInfoConfig) Resolved() ResolvedChatGPTWebAccountInfoC
 	}
 	if cfg.DiagnosticsEnabled != nil {
 		resolved.DiagnosticsEnabled = *cfg.DiagnosticsEnabled
+	}
+	if cfg.RawQuotaResponseEnabled != nil {
+		resolved.RawQuotaResponseEnabled = *cfg.RawQuotaResponseEnabled
 	}
 	if cfg.RefreshWorkers != nil {
 		resolved.RefreshWorkers = *cfg.RefreshWorkers

@@ -999,6 +999,110 @@ func TestChatGPTWebImageAccumulatorTracksPatchedTerminalAssistantText(t *testing
 	}
 }
 
+func TestChatGPTWebImageAccumulatorIgnoresSkippedMainlineControlReply(t *testing.T) {
+	accumulator := &ChatGPTWebImageAccumulator{ConversationID: "conversation"}
+	payload := []byte(`{"message":{"author":{"role":"assistant"},"status":"finished_successfully","content":{"content_type":"code","text":"{\"skipped_mainline\":true}"}}}`)
+	if _, err := accumulator.Apply(payload); err != nil {
+		t.Fatalf("Apply() error = %v", err)
+	}
+	if accumulator.Terminal {
+		t.Fatal("skipped_mainline control reply terminated image processing")
+	}
+	if accumulator.HasTerminalAssistantText() {
+		t.Fatal("skipped_mainline control reply was classified as terminal assistant text")
+	}
+}
+
+func TestChatGPTWebImageAccumulatorIgnoresPatchedSkippedMainlineControlReply(t *testing.T) {
+	accumulator := &ChatGPTWebImageAccumulator{}
+	for index, payload := range []string{
+		`{"v":{"message":{"author":{"role":"assistant"},"content":{"content_type":"code","text":""},"status":"in_progress"}}}`,
+		`{"o":"append","p":"/message/content/text","v":"{\"skipped_"}`,
+		`{"c":1,"v":"mainline\":true}"}`,
+		`{"o":"patch","v":[{"p":"/message/status","o":"replace","v":"finished_successfully"},{"p":"/message/end_turn","o":"replace","v":true}]}`,
+	} {
+		if _, err := accumulator.Apply([]byte(payload)); err != nil {
+			t.Fatalf("Apply(%d) error = %v", index, err)
+		}
+	}
+	if accumulator.Terminal || accumulator.HasTerminalAssistantText() {
+		t.Fatalf("control patch = terminal %t, terminal text %t", accumulator.Terminal, accumulator.HasTerminalAssistantText())
+	}
+}
+
+func TestChatGPTWebImageAccumulatorReplaceClearsEarlierTextForSkippedMainlineControl(t *testing.T) {
+	accumulator := &ChatGPTWebImageAccumulator{}
+	for index, payload := range []string{
+		`{"v":{"message":{"author":{"role":"assistant"},"content":{"content_type":"text","parts":["temporary reply"]},"status":"in_progress"}}}`,
+		`{"o":"replace","p":"/message/content/parts/0","v":"{\"skipped_mainline\":true}"}`,
+		`{"o":"patch","v":[{"p":"/message/status","o":"replace","v":"finished_successfully"},{"p":"/message/end_turn","o":"replace","v":true}]}`,
+	} {
+		if _, err := accumulator.Apply([]byte(payload)); err != nil {
+			t.Fatalf("Apply(%d) error = %v", index, err)
+		}
+	}
+	if accumulator.Terminal || accumulator.HasTerminalAssistantText() {
+		t.Fatalf("replaced control = terminal %t, terminal text %t", accumulator.Terminal, accumulator.HasTerminalAssistantText())
+	}
+}
+
+func TestMergeChatGPTWebImageAccumulatorsPreservesPatchedAssistantText(t *testing.T) {
+	accumulator := &ChatGPTWebImageAccumulator{}
+	for index, payload := range []string{
+		`{"v":{"message":{"author":{"role":"assistant"},"content":{"content_type":"text","parts":[""]},"status":"in_progress"}}}`,
+		`{"o":"append","p":"/message/content/parts/0","v":"assistant reply"}`,
+	} {
+		if _, err := accumulator.Apply([]byte(payload)); err != nil {
+			t.Fatalf("Apply(%d) error = %v", index, err)
+		}
+	}
+	merged, err := MergeChatGPTWebImageAccumulators(nil, accumulator)
+	if err != nil {
+		t.Fatalf("MergeChatGPTWebImageAccumulators() error = %v", err)
+	}
+	if _, err = merged.Apply([]byte(`{"o":"patch","v":[{"p":"/message/status","o":"replace","v":"finished_successfully"},{"p":"/message/end_turn","o":"replace","v":true}]}`)); err != nil {
+		t.Fatalf("Apply(terminal) error = %v", err)
+	}
+	if !merged.Terminal || !merged.HasTerminalAssistantText() {
+		t.Fatalf("merged state = terminal %t, terminal text %t", merged.Terminal, merged.HasTerminalAssistantText())
+	}
+}
+
+func TestMergeChatGPTWebImageAccumulatorsPrefersAssistantTextOverSkippedMainlineControl(t *testing.T) {
+	realReply := &ChatGPTWebImageAccumulator{}
+	if _, err := realReply.Apply([]byte(`{"message":{"author":{"role":"assistant"},"status":"finished_successfully","end_turn":true,"content":{"content_type":"text","parts":["retry later"]}}}`)); err != nil {
+		t.Fatalf("Apply(real reply) error = %v", err)
+	}
+	control := &ChatGPTWebImageAccumulator{}
+	if _, err := control.Apply([]byte(`{"message":{"author":{"role":"assistant"},"status":"finished_successfully","end_turn":true,"content":{"content_type":"code","text":"{\"skipped_mainline\":true}"}}}`)); err != nil {
+		t.Fatalf("Apply(control) error = %v", err)
+	}
+	for _, sources := range [][2]*ChatGPTWebImageAccumulator{{realReply, control}, {control, realReply}} {
+		merged, err := MergeChatGPTWebImageAccumulators(sources[0], sources[1])
+		if err != nil {
+			t.Fatalf("MergeChatGPTWebImageAccumulators() error = %v", err)
+		}
+		if !merged.Terminal || !merged.HasTerminalAssistantText() || merged.assistantTextValue != "retry later" {
+			t.Fatalf("merged = terminal %t, terminal text %t, value %q", merged.Terminal, merged.HasTerminalAssistantText(), merged.assistantTextValue)
+		}
+	}
+}
+
+func TestChatGPTWebSkippedMainlineControlRequiresExactTrueEnvelope(t *testing.T) {
+	tests := map[string]bool{
+		`{"skipped_mainline":true}`:                  true,
+		` { "skipped_mainline" : true } `:            true,
+		`{"skipped_mainline":false}`:                 false,
+		`{"skipped_mainline":true,"message":"stop"}`: false,
+		`skipped_mainline`:                           false,
+	}
+	for value, want := range tests {
+		if got := chatGPTWebSkippedMainlineControl(value); got != want {
+			t.Errorf("chatGPTWebSkippedMainlineControl(%q) = %t, want %t", value, got, want)
+		}
+	}
+}
+
 func TestChatGPTWebImageAccumulatorCapturesEmptyAssistantTerminal(t *testing.T) {
 	accumulator := &ChatGPTWebImageAccumulator{}
 	for _, payload := range []string{
@@ -2035,6 +2139,26 @@ func TestCaptureChatGPTWebImageConversationTreatsTerminalCodeReplyAsText(t *test
 	}
 	if !accumulator.Terminal || accumulator.FailureStatus != "" || !accumulator.HasTerminalAssistantText() {
 		t.Fatalf("terminal = %t, failure = %q, terminal text = %t", accumulator.Terminal, accumulator.FailureStatus, accumulator.HasTerminalAssistantText())
+	}
+}
+
+func TestCaptureChatGPTWebImageConversationIgnoresSkippedMainlineControlReply(t *testing.T) {
+	accumulator := &ChatGPTWebImageAccumulator{}
+	err := CaptureChatGPTWebImageConversation([]byte(`{
+		"current_node":"control",
+		"mapping":{"control":{"message":{
+			"author":{"role":"assistant"},"end_turn":true,
+			"content":{"content_type":"code","text":"{\"skipped_mainline\": true}"}
+		}}}
+	}`), accumulator)
+	if err != nil {
+		t.Fatalf("CaptureChatGPTWebImageConversation() error = %v", err)
+	}
+	if accumulator.Terminal || accumulator.FailureStatus != "" {
+		t.Fatalf("terminal = %t, failure = %q", accumulator.Terminal, accumulator.FailureStatus)
+	}
+	if accumulator.HasTerminalAssistantText() {
+		t.Fatal("skipped_mainline conversation control was classified as terminal assistant text")
 	}
 }
 

@@ -1295,6 +1295,7 @@ type ChatGPTWebImageAccumulator struct {
 	ToolUsage             map[string]any
 	role                  string
 	imageTool             bool
+	assistantTextValue    string
 	assistantTextSeen     bool
 	assistantTextPatch    bool
 	assistantTerminalSeen bool
@@ -1364,9 +1365,18 @@ func MergeChatGPTWebImageAccumulators(primary, secondary *ChatGPTWebImageAccumul
 			merged.role = source.role
 		}
 		merged.imageTool = merged.imageTool || source.imageTool
-		merged.assistantTextSeen = merged.assistantTextSeen || source.assistantTextSeen
+		if source.assistantTextSeen {
+			if !merged.assistantTextSeen || len(source.assistantTextValue) > len(merged.assistantTextValue) {
+				merged.assistantTextValue = source.assistantTextValue
+			}
+			merged.assistantTextSeen = true
+		} else if merged.assistantTextValue == "" {
+			// Preserve a control envelope only when no user-visible assistant
+			// text has been observed. A longer control payload must never hide
+			// a shorter real reply while task and conversation snapshots merge.
+			merged.assistantTextValue = source.assistantTextValue
+		}
 		merged.assistantTerminalSeen = merged.assistantTerminalSeen || source.assistantTerminalSeen
-		merged.terminalAssistantText = merged.terminalAssistantText || source.terminalAssistantText
 		for _, reference := range chatGPTWebImageAccumulatorReferences(source) {
 			if err := merged.appendReference(reference.Kind, reference.ID); err != nil {
 				return nil, err
@@ -1377,6 +1387,7 @@ func MergeChatGPTWebImageAccumulators(primary, secondary *ChatGPTWebImageAccumul
 		merged.assistantTerminalSeen = false
 		merged.terminalAssistantText = false
 	} else {
+		merged.terminalAssistantText = false
 		merged.updateTerminalAssistantText()
 	}
 	return merged, nil
@@ -1443,7 +1454,8 @@ func (accumulator *ChatGPTWebImageAccumulator) Apply(payload []byte) (bool, erro
 		accumulator.imageTool = imageTool
 		accumulator.assistantTextPatch = false
 		if role == "assistant" && !imageTool {
-			accumulator.assistantTextSeen = accumulator.assistantTextSeen || strings.TrimSpace(chatGPTWebImageMessageText(message)) != ""
+			text := chatGPTWebImageMessageText(message)
+			accumulator.replaceAssistantText(text)
 		}
 		streamTerminal := chatGPTWebImageStreamTerminal(event)
 		accumulator.StreamTerminal = accumulator.StreamTerminal || streamTerminal
@@ -1505,14 +1517,18 @@ func (accumulator *ChatGPTWebImageAccumulator) captureAssistantPatchState(event 
 	path := strings.ToLower(strings.TrimSpace(stringFromAny(event["p"])))
 	if path == "/message/content/parts/0" || path == "/message/content/text" {
 		accumulator.assistantTextPatch = true
-		if value, ok := event["v"].(string); ok && strings.TrimSpace(value) != "" {
-			accumulator.assistantTextSeen = true
+		if value, ok := event["v"].(string); ok {
+			if strings.EqualFold(strings.TrimSpace(stringFromAny(event["o"])), "replace") {
+				accumulator.replaceAssistantText(value)
+			} else {
+				accumulator.appendAssistantText(value)
+			}
 		}
 	} else if path != "" {
 		accumulator.assistantTextPatch = false
 	} else if event["p"] == nil && event["o"] == nil && accumulator.assistantTextPatch {
-		if value, ok := event["v"].(string); ok && strings.TrimSpace(value) != "" {
-			accumulator.assistantTextSeen = true
+		if value, ok := event["v"].(string); ok {
+			accumulator.appendAssistantText(value)
 		}
 	}
 
@@ -1556,10 +1572,37 @@ func (accumulator *ChatGPTWebImageAccumulator) updateTerminalAssistantText() {
 	if accumulator == nil || accumulator.FailureStatus != "" {
 		return
 	}
+	if accumulator.assistantTerminalSeen {
+		accumulator.recordAssistantText(accumulator.assistantTextValue)
+	}
 	if accumulator.assistantTextSeen && accumulator.assistantTerminalSeen {
 		accumulator.terminalAssistantText = true
 		accumulator.Terminal = true
 	}
+}
+
+func (accumulator *ChatGPTWebImageAccumulator) replaceAssistantText(value string) {
+	if accumulator == nil {
+		return
+	}
+	accumulator.assistantTextValue = value
+	accumulator.recordAssistantText(value)
+}
+
+func (accumulator *ChatGPTWebImageAccumulator) appendAssistantText(value string) {
+	if accumulator == nil {
+		return
+	}
+	accumulator.assistantTextValue += value
+	accumulator.recordAssistantText(accumulator.assistantTextValue)
+}
+
+func (accumulator *ChatGPTWebImageAccumulator) recordAssistantText(value string) {
+	if accumulator == nil {
+		return
+	}
+	value = strings.TrimSpace(value)
+	accumulator.assistantTextSeen = value != "" && !chatGPTWebSkippedMainlineControl(value)
 }
 
 func chatGPTWebImageCompletionMetadata(metadata map[string]any) bool {
@@ -2010,7 +2053,7 @@ func CaptureChatGPTWebImageConversation(payload []byte, accumulator *ChatGPTWebI
 		} else if terminalText {
 			turnTerminal = turnTerminal || terminal
 			if strings.TrimSpace(terminalTextValue) != "" {
-				snapshot.assistantTextSeen = true
+				snapshot.replaceAssistantText(terminalTextValue)
 				snapshot.assistantTerminalSeen = snapshot.assistantTerminalSeen || terminal
 				snapshot.updateTerminalAssistantText()
 			}
@@ -2044,6 +2087,7 @@ func CaptureChatGPTWebImageConversation(payload []byte, accumulator *ChatGPTWebI
 	accumulator.referenceSet = snapshot.referenceSet
 	accumulator.Terminal = snapshot.Terminal
 	accumulator.FailureStatus = snapshot.FailureStatus
+	accumulator.assistantTextValue = snapshot.assistantTextValue
 	accumulator.assistantTextSeen = snapshot.assistantTextSeen
 	accumulator.assistantTerminalSeen = snapshot.assistantTerminalSeen
 	accumulator.terminalAssistantText = snapshot.terminalAssistantText
@@ -2893,7 +2937,28 @@ func chatGPTWebImageTerminalTextReply(message map[string]any) (bool, string) {
 	if !terminal {
 		return false, ""
 	}
-	return true, chatGPTWebImageMessageText(message)
+	text := chatGPTWebImageMessageText(message)
+	if chatGPTWebSkippedMainlineControl(text) {
+		return false, ""
+	}
+	return true, text
+}
+
+func chatGPTWebSkippedMainlineControl(value string) bool {
+	value = strings.TrimSpace(value)
+	if value == "" || !strings.Contains(value, "skipped_mainline") {
+		return false
+	}
+	var document map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(value), &document); err != nil || len(document) != 1 {
+		return false
+	}
+	raw, ok := document["skipped_mainline"]
+	if !ok {
+		return false
+	}
+	var skipped bool
+	return json.Unmarshal(raw, &skipped) == nil && skipped
 }
 
 func chatGPTWebTerminalMessageStatus(value string) bool {

@@ -630,6 +630,208 @@ func TestChatGPTWebExecutorTransientRefreshDoesNotPersist(t *testing.T) {
 	}
 }
 
+func TestChatGPTWebExecutorSessionCookieFallbackEligibility(t *testing.T) {
+	tests := []struct {
+		name             string
+		enabled          bool
+		completePassword bool
+		cookies          []chatgptwebauth.Cookie
+		wantSessionCalls int32
+		wantOAuthCalls   int32
+	}{
+		{
+			name:             "disabled preserves configured refresh strategy",
+			completePassword: false,
+			cookies:          chatGPTWebCompleteSessionCookies(),
+			wantOAuthCalls:   1,
+		},
+		{
+			name:             "incomplete login uses session cookie",
+			enabled:          true,
+			completePassword: false,
+			cookies:          chatGPTWebCompleteSessionCookies(),
+			wantSessionCalls: 1,
+		},
+		{
+			name:             "complete password login preserves oauth refresh",
+			enabled:          true,
+			completePassword: true,
+			cookies:          chatGPTWebCompleteSessionCookies(),
+			wantOAuthCalls:   1,
+		},
+		{
+			name:             "incomplete cookie chunks do not enter session fallback",
+			enabled:          true,
+			completePassword: false,
+			cookies: []chatgptwebauth.Cookie{{
+				Name:   "__Secure-next-auth.session-token.0",
+				Value:  "first-half",
+				Domain: "chatgpt.com",
+				Path:   "/",
+				Secure: true,
+			}},
+			wantOAuthCalls: 1,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			service := &fakeChatGPTWebAuthService{
+				refreshFn: func(_ context.Context, credential chatgptwebauth.Credential, _ string) (*chatgptwebauth.Credential, error) {
+					credential.AccessToken = "oauth-token"
+					return &credential, nil
+				},
+				refreshSessionFn: func(_ context.Context, credential chatgptwebauth.Credential, _ string) (*chatgptwebauth.Credential, error) {
+					credential.RefreshStrategy = chatgptwebauth.RefreshStrategyChatGPTSession
+					credential.AccessToken = "session-token"
+					return &credential, nil
+				},
+			}
+			executor := NewChatGPTWebExecutor(&config.Config{ChatGPTWeb: config.ChatGPTWebConfig{
+				SessionCookieRefreshOnTokenFailure: test.enabled,
+			}}, nil)
+			t.Cleanup(func() { _ = executor.Close() })
+			executor.authService = service
+			auth := chatGPTWebTestAuth("session-eligibility-" + strings.ReplaceAll(test.name, " ", "-"))
+			credential, errCredential := chatgptwebauth.ParseCredential(auth.Metadata)
+			if errCredential != nil {
+				t.Fatal(errCredential)
+			}
+			credential.Cookies = test.cookies
+			if !test.completePassword {
+				credential.TOTPSecret = ""
+			}
+			credential.RefreshStrategy = chatgptwebauth.RefreshStrategyWebOAuthRT
+			credential.ApplyToMetadata(auth.Metadata)
+
+			updated, errRefresh := executor.Refresh(t.Context(), auth)
+			if errRefresh != nil || updated == nil {
+				t.Fatalf("Refresh() = (%v, %v)", updated, errRefresh)
+			}
+			if got := service.refreshSessionCalls.Load(); got != test.wantSessionCalls {
+				t.Fatalf("session refresh calls = %d, want %d", got, test.wantSessionCalls)
+			}
+			if got := service.refreshCalls.Load(); got != test.wantOAuthCalls {
+				t.Fatalf("OAuth refresh calls = %d, want %d", got, test.wantOAuthCalls)
+			}
+		})
+	}
+}
+
+func TestChatGPTWebExecutorSessionCookieFallbackPreservesCodexSource(t *testing.T) {
+	executor := NewChatGPTWebExecutor(&config.Config{ChatGPTWeb: config.ChatGPTWebConfig{
+		SessionCookieRefreshOnTokenFailure: true,
+	}}, nil)
+	t.Cleanup(func() { _ = executor.Close() })
+	credential := &chatgptwebauth.Credential{
+		RefreshStrategy: chatgptwebauth.RefreshStrategyCodexSource,
+		SourceAuthID:    "source-auth",
+		Cookies:         chatGPTWebCompleteSessionCookies(),
+	}
+	if executor.sessionCookieRefreshEligible(credential) {
+		t.Fatal("linked Codex source was replaced by Session Cookie fallback")
+	}
+}
+
+func TestChatGPTWebExecutorSessionCookieFallbackLifecycle(t *testing.T) {
+	tests := []struct {
+		name        string
+		errorCode   string
+		state       chatgptwebauth.LifecycleState
+		retryable   bool
+		terminal    bool
+		wantUpdate  bool
+		wantState   string
+		wantPersist bool
+	}{
+		{
+			name:        "expired session is dead",
+			errorCode:   "session_expired",
+			state:       chatgptwebauth.LifecycleReauthRequired,
+			terminal:    true,
+			wantUpdate:  true,
+			wantState:   cliproxyauth.LifecycleStateDead,
+			wantPersist: true,
+		},
+		{
+			name:        "valid session without token is dead",
+			errorCode:   "access_token_missing",
+			state:       chatgptwebauth.LifecycleReauthRequired,
+			terminal:    true,
+			wantUpdate:  true,
+			wantState:   cliproxyauth.LifecycleStateDead,
+			wantPersist: true,
+		},
+		{
+			name:      "network failure remains transient",
+			errorCode: "session_refresh_network_error",
+			state:     chatgptwebauth.LifecycleActive,
+			retryable: true,
+		},
+		{
+			name:      "Cloudflare challenge remains transient",
+			errorCode: "cloudflare_challenge",
+			state:     chatgptwebauth.LifecycleActive,
+			retryable: true,
+		},
+		{
+			name:        "identity conflict requires reauthentication but is not dead",
+			errorCode:   "identity_conflict",
+			state:       chatgptwebauth.LifecycleReauthRequired,
+			terminal:    true,
+			wantUpdate:  true,
+			wantState:   cliproxyauth.LifecycleStateReauthRequired,
+			wantPersist: true,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			service := &fakeChatGPTWebAuthService{
+				refreshSessionFn: func(_ context.Context, credential chatgptwebauth.Credential, _ string) (*chatgptwebauth.Credential, error) {
+					credential.RefreshStrategy = chatgptwebauth.RefreshStrategyChatGPTSession
+					credential.LifecycleState = test.state
+					return &credential, &chatgptwebauth.AuthError{
+						Code:           test.errorCode,
+						State:          test.state,
+						LifecycleState: test.state,
+						Retryable:      test.retryable,
+						Terminal:       test.terminal,
+					}
+				},
+			}
+			executor := NewChatGPTWebExecutor(&config.Config{ChatGPTWeb: config.ChatGPTWebConfig{
+				SessionCookieRefreshOnTokenFailure: true,
+			}}, nil)
+			t.Cleanup(func() { _ = executor.Close() })
+			executor.authService = service
+			auth := chatGPTWebTestAuth("session-lifecycle-" + strings.ReplaceAll(test.name, " ", "-"))
+			credential, errCredential := chatgptwebauth.ParseCredential(auth.Metadata)
+			if errCredential != nil {
+				t.Fatal(errCredential)
+			}
+			credential.Password = ""
+			credential.TOTPSecret = ""
+			credential.RefreshStrategy = chatgptwebauth.RefreshStrategyTokenOnly
+			credential.Cookies = chatGPTWebCompleteSessionCookies()
+			credential.ApplyToMetadata(auth.Metadata)
+
+			updated, errRefresh := executor.Refresh(t.Context(), auth)
+			if errRefresh == nil {
+				t.Fatal("Refresh() error = nil")
+			}
+			if (updated != nil) != test.wantUpdate {
+				t.Fatalf("Refresh() update = %v, want update %t", updated, test.wantUpdate)
+			}
+			if updated != nil && updated.LifecycleState() != test.wantState {
+				t.Fatalf("lifecycle = %q, want %q", updated.LifecycleState(), test.wantState)
+			}
+			persist, okPersist := errRefresh.(interface{ PersistAuthUpdateOnError() bool })
+			if got := okPersist && persist.PersistAuthUpdateOnError(); got != test.wantPersist {
+				t.Fatalf("PersistAuthUpdateOnError() = %t, want %t", got, test.wantPersist)
+			}
+		})
+	}
+}
+
 func TestChatGPTWebExecutorRefreshSingleflight(t *testing.T) {
 	started := make(chan struct{})
 	release := make(chan struct{})
@@ -2427,6 +2629,27 @@ func chatGPTWebTestAuth(id string) *cliproxyauth.Auth {
 		Status:     cliproxyauth.StatusActive,
 		Attributes: map[string]string{cliproxyauth.SourceHashAttributeKey: "source-" + id},
 		Metadata:   metadata,
+	}
+}
+
+func chatGPTWebCompleteSessionCookies() []chatgptwebauth.Cookie {
+	return []chatgptwebauth.Cookie{
+		{
+			Name:     "__Secure-next-auth.session-token.0",
+			Value:    "first-half",
+			Domain:   "chatgpt.com",
+			Path:     "/",
+			Secure:   true,
+			HTTPOnly: true,
+		},
+		{
+			Name:     "__Secure-next-auth.session-token.1",
+			Value:    "second-half",
+			Domain:   "chatgpt.com",
+			Path:     "/",
+			Secure:   true,
+			HTTPOnly: true,
+		},
 	}
 }
 

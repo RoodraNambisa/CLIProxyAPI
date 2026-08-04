@@ -518,6 +518,11 @@ func (service *Service) RefreshSession(ctx context.Context, credential Credentia
 		service.applyFailure(refreshed, authError, false)
 		return refreshed, authError
 	}
+	if isCloudflareChallenge(response, payload) {
+		authError := newAuthError("cloudflare_challenge", LifecycleActive, response.StatusCode, true, false, "Cloudflare challenge blocked session refresh", nil)
+		service.applyFailure(refreshed, authError, false)
+		return refreshed, authError
+	}
 	if response.StatusCode == http.StatusUnauthorized || response.StatusCode == http.StatusForbidden ||
 		(response.StatusCode >= http.StatusMultipleChoices && response.StatusCode < http.StatusBadRequest) {
 		authError := newAuthError("session_expired", LifecycleReauthRequired, response.StatusCode, false, true, "chatgpt session must be renewed", nil)

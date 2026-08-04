@@ -60,6 +60,11 @@ api-keys:
 # password/TOTP material and is disabled by default.
 chatgpt-web:
   auto-relogin: false
+  # For credentials without complete password/TOTP material, allow a complete
+  # ChatGPT session cookie to refresh an expired or rejected access token.
+  # Definitive session expiry can mark the credential dead; network and
+  # transient upstream failures never do.
+  session-cookie-refresh-on-token-failure: false
   # Refresh session-backed imports even when the uploaded access token remains valid.
   # Disable to keep a valid uploaded token; missing or expired tokens still use the session.
   force-session-refresh-on-import: true
@@ -129,6 +134,9 @@ chatgpt-web:
     # Keep up to 100 de-duplicated, safe account-info failures in memory.
     # Response bodies, credentials, cookies, account identity, and proxy URLs are never retained.
     diagnostics-enabled: false
+    # Keep the latest raw conversation/init quota response per credential in
+    # bounded memory for debugging. Never written to logs or credential files.
+    raw-quota-response-enabled: false
     # Bounded workers refresh account plan and image quota only when requested,
     # when a quota recovery is due, or after an image quota error.
     refresh-workers: 4

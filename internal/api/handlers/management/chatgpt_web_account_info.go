@@ -30,20 +30,26 @@ type chatGPTWebAccountInfoController interface {
 	UpdateConfig(*config.Config)
 }
 
+type chatGPTWebAccountInfoRawQuotaController interface {
+	AccountInfoRawQuotaResponsesSnapshot() chatgptwebauth.AccountInfoRawQuotaResponsesSnapshot
+	ClearAccountInfoRawQuotaResponses() chatgptwebauth.AccountInfoRawQuotaResponsesSnapshot
+}
+
 type chatGPTWebAccountInfoResponse struct {
 	Config  config.ResolvedChatGPTWebAccountInfoConfig `json:"config"`
 	Runtime chatgptwebauth.AccountInfoRuntimeSnapshot  `json:"runtime"`
 }
 
 type chatGPTWebAccountInfoConfigRequest struct {
-	AutoRefreshEnabled     json.RawMessage `json:"auto-refresh-enabled"`
-	DiagnosticsEnabled     json.RawMessage `json:"diagnostics-enabled"`
-	RefreshWorkers         json.RawMessage `json:"refresh-workers"`
-	RefreshQueueSize       json.RawMessage `json:"refresh-queue-size"`
-	RefreshTTLMinutes      json.RawMessage `json:"refresh-ttl-minutes"`
-	PeriodicRefreshMinutes json.RawMessage `json:"periodic-refresh-minutes"`
-	RecoveryJitterSeconds  json.RawMessage `json:"recovery-jitter-seconds"`
-	MaxRetries             json.RawMessage `json:"max-retries"`
+	AutoRefreshEnabled      json.RawMessage `json:"auto-refresh-enabled"`
+	DiagnosticsEnabled      json.RawMessage `json:"diagnostics-enabled"`
+	RawQuotaResponseEnabled json.RawMessage `json:"raw-quota-response-enabled"`
+	RefreshWorkers          json.RawMessage `json:"refresh-workers"`
+	RefreshQueueSize        json.RawMessage `json:"refresh-queue-size"`
+	RefreshTTLMinutes       json.RawMessage `json:"refresh-ttl-minutes"`
+	PeriodicRefreshMinutes  json.RawMessage `json:"periodic-refresh-minutes"`
+	RecoveryJitterSeconds   json.RawMessage `json:"recovery-jitter-seconds"`
+	MaxRetries              json.RawMessage `json:"max-retries"`
 }
 
 type chatGPTWebAccountInfoRefreshRequest struct {
@@ -103,6 +109,38 @@ func (h *Handler) ClearChatGPTWebAccountInfoDiagnostics(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, controller.ClearAccountInfoDiagnostics())
+}
+
+// GetChatGPTWebAccountInfoRawQuotaResponses returns bounded in-memory conversation/init bodies.
+func (h *Handler) GetChatGPTWebAccountInfoRawQuotaResponses(c *gin.Context) {
+	c.Header("Cache-Control", "no-store")
+	controller, ok := h.chatGPTWebAccountInfoController()
+	if !ok {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "chatgpt web raw quota responses are unavailable"})
+		return
+	}
+	rawController, ok := controller.(chatGPTWebAccountInfoRawQuotaController)
+	if !ok {
+		c.JSON(http.StatusNotImplemented, gin.H{"error": "chatgpt web raw quota responses are unsupported"})
+		return
+	}
+	c.JSON(http.StatusOK, rawController.AccountInfoRawQuotaResponsesSnapshot())
+}
+
+// ClearChatGPTWebAccountInfoRawQuotaResponses removes captured conversation/init bodies.
+func (h *Handler) ClearChatGPTWebAccountInfoRawQuotaResponses(c *gin.Context) {
+	c.Header("Cache-Control", "no-store")
+	controller, ok := h.chatGPTWebAccountInfoController()
+	if !ok {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "chatgpt web raw quota responses are unavailable"})
+		return
+	}
+	rawController, ok := controller.(chatGPTWebAccountInfoRawQuotaController)
+	if !ok {
+		c.JSON(http.StatusNotImplemented, gin.H{"error": "chatgpt web raw quota responses are unsupported"})
+		return
+	}
+	c.JSON(http.StatusOK, rawController.ClearAccountInfoRawQuotaResponses())
 }
 
 func (h *Handler) updateChatGPTWebAccountInfo(c *gin.Context, replace bool) {
@@ -356,6 +394,13 @@ func (request chatGPTWebAccountInfoConfigRequest) apply(candidate *config.ChatGP
 			return errors.New("invalid diagnostics-enabled")
 		}
 		candidate.DiagnosticsEnabled = &value
+	}
+	if len(request.RawQuotaResponseEnabled) > 0 {
+		value, errValue := decodeSentinelBool(request.RawQuotaResponseEnabled)
+		if errValue != nil {
+			return errors.New("invalid raw-quota-response-enabled")
+		}
+		candidate.RawQuotaResponseEnabled = &value
 	}
 	fields := []struct {
 		name   string

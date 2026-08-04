@@ -5828,6 +5828,100 @@ func TestPollChatGPTWebImageConversationTreatsDuplicateConversationReferenceAsNo
 	}
 }
 
+func writeSkippedMainlineConversation(w http.ResponseWriter) {
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"current_node": "control",
+		"mapping": map[string]any{"control": map[string]any{"message": map[string]any{
+			"author":   map[string]any{"role": "assistant"},
+			"end_turn": true,
+			"status":   "finished_successfully",
+			"content":  map[string]any{"content_type": "code", "text": `{"skipped_mainline":true}`},
+		}}},
+	})
+}
+
+func TestPollChatGPTWebImageConversationContinuesAfterSkippedMainlineControl(t *testing.T) {
+	var taskPolls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/backend-api/tasks":
+			if taskPolls.Add(1) == 1 {
+				_ = json.NewEncoder(w).Encode(map[string]any{"tasks": []any{}})
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"tasks": []any{map[string]any{
+				"conversation_id": "skipped-mainline-control",
+				"status":          "completed",
+				"image_gen_message": map[string]any{
+					"author":   map[string]any{"role": "tool"},
+					"status":   "finished_successfully",
+					"metadata": map[string]any{"async_task_type": "image_gen"},
+					"content":  map[string]any{"parts": []any{map[string]any{"asset_pointer": "file-service://generated"}}},
+				},
+			}}})
+		case "/backend-api/conversation/skipped-mainline-control":
+			writeSkippedMainlineConversation(w)
+		default:
+			http.NotFound(w, request)
+		}
+	}))
+	defer server.Close()
+
+	executor := NewChatGPTWebExecutor(nil, nil)
+	executor.runtimeBaseURL = server.URL
+	executor.imageInitialWait = 0
+	executor.imagePollInterval = time.Millisecond
+	executor.imageSettleWait = 0
+	executor.imageMaxPolls = 6
+	client, credential, err := executor.newRuntimeClient(chatGPTWebRuntimeAuth())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.CloseIdleConnections()
+	accumulator := &helps.ChatGPTWebImageAccumulator{ConversationID: "skipped-mainline-control"}
+	if err = executor.pollChatGPTWebImageConversation(context.Background(), client, credential, accumulator, nil, false); err != nil {
+		t.Fatalf("pollChatGPTWebImageConversation() error = %v", err)
+	}
+	if !accumulator.Terminal || !reflect.DeepEqual(accumulator.FileIDs, []string{"generated"}) {
+		t.Fatalf("task output = terminal %t, files %v", accumulator.Terminal, accumulator.FileIDs)
+	}
+	if taskPolls.Load() < 2 {
+		t.Fatalf("task polls = %d, want at least 2", taskPolls.Load())
+	}
+}
+
+func TestPollChatGPTWebImageConversationBoundsEmptySkippedMainlineControl(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/backend-api/tasks":
+			_ = json.NewEncoder(w).Encode(map[string]any{"tasks": []any{}})
+		case "/backend-api/conversation/skipped-mainline-empty":
+			writeSkippedMainlineConversation(w)
+		default:
+			http.NotFound(w, request)
+		}
+	}))
+	defer server.Close()
+
+	executor := NewChatGPTWebExecutor(nil, nil)
+	executor.runtimeBaseURL = server.URL
+	executor.imageMaxPolls = 2
+	disableChatGPTWebImagePollWaits(executor)
+	client, credential, err := executor.newRuntimeClient(chatGPTWebRuntimeAuth())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.CloseIdleConnections()
+	accumulator := &helps.ChatGPTWebImageAccumulator{ConversationID: "skipped-mainline-empty"}
+	err = executor.pollChatGPTWebImageConversation(context.Background(), client, credential, accumulator, nil, false)
+	if err == nil || !strings.Contains(err.Error(), "remained incomplete after 2 polls") {
+		t.Fatalf("pollChatGPTWebImageConversation() error = %v", err)
+	}
+	if accumulator.Terminal || chatGPTWebImageOutputCount(accumulator) != 0 {
+		t.Fatalf("empty task output = terminal %t, count %d", accumulator.Terminal, chatGPTWebImageOutputCount(accumulator))
+	}
+}
+
 func TestPollChatGPTWebImageConversationRetriesAtTaskFallbackDeadline(t *testing.T) {
 	var conversationPolls atomic.Int32
 	var taskPolls atomic.Int32

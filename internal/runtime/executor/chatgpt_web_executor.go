@@ -605,6 +605,11 @@ func (e *ChatGPTWebExecutor) AutoReloginEnabled() bool {
 	return cfg != nil && cfg.ChatGPTWeb.AutoRelogin
 }
 
+func (e *ChatGPTWebExecutor) sessionCookieRefreshOnTokenFailureEnabled() bool {
+	cfg := e.configSnapshot()
+	return cfg != nil && cfg.ChatGPTWeb.SessionCookieRefreshOnTokenFailure
+}
+
 // TriggerBackgroundRelogin starts a bounded re-login task for the current auth
 // generation. Duplicate triggers share one background retry loop.
 func (e *ChatGPTWebExecutor) TriggerBackgroundRelogin(expected *cliproxyauth.Auth) {
@@ -1256,12 +1261,23 @@ func (e *ChatGPTWebExecutor) refreshByStrategy(ctx context.Context, auth *clipro
 	if credential == nil {
 		return nil, newChatGPTWebRefreshModeError("credential_invalid", "chatgpt web credential is invalid"), true
 	}
+	if e.sessionCookieRefreshEligible(credential) {
+		result, errRefresh := e.authService.RefreshSession(
+			ctx,
+			*credential,
+			e.proxyURLForTarget(auth, chatgptwebauth.SessionBaseURL),
+		)
+		return classifyChatGPTWebSessionCookieRefresh(result, errRefresh)
+	}
 	switch credential.RefreshStrategy {
 	case chatgptwebauth.RefreshStrategyWebOAuthRT:
 		result, err := e.authService.Refresh(ctx, *credential, e.proxyURLForTarget(auth, chatgptwebauth.AuthBaseURL))
 		return result, err, false
 	case chatgptwebauth.RefreshStrategyChatGPTSession:
 		result, err := e.authService.RefreshSession(ctx, *credential, e.proxyURLForTarget(auth, chatgptwebauth.SessionBaseURL))
+		if e.sessionCookieRefreshOnTokenFailureEnabled() && !chatGPTWebCredentialHasCompletePasswordLogin(credential) {
+			return classifyChatGPTWebSessionCookieRefresh(result, err)
+		}
 		return result, err, false
 	case chatgptwebauth.RefreshStrategyCodexSource:
 		return e.refreshFromCodexSource(ctx, credential)
@@ -1270,6 +1286,46 @@ func (e *ChatGPTWebExecutor) refreshByStrategy(ctx context.Context, auth *clipro
 	default:
 		return cloneChatGPTWebCredential(credential), newChatGPTWebRefreshModeError("refresh_strategy_invalid", "chatgpt web refresh strategy is invalid"), true
 	}
+}
+
+func (e *ChatGPTWebExecutor) sessionCookieRefreshEligible(credential *chatgptwebauth.Credential) bool {
+	return e.sessionCookieRefreshOnTokenFailureEnabled() &&
+		credential != nil &&
+		credential.RefreshStrategy != chatgptwebauth.RefreshStrategyChatGPTSession &&
+		credential.RefreshStrategy != chatgptwebauth.RefreshStrategyCodexSource &&
+		!chatGPTWebCredentialHasCompletePasswordLogin(credential) &&
+		chatgptwebauth.HasSessionCookie(credential.Cookies)
+}
+
+func chatGPTWebCredentialHasCompletePasswordLogin(credential *chatgptwebauth.Credential) bool {
+	return credential != nil &&
+		strings.TrimSpace(credential.Email) != "" &&
+		strings.TrimSpace(credential.Password) != "" &&
+		strings.TrimSpace(credential.TOTPSecret) != ""
+}
+
+func classifyChatGPTWebSessionCookieRefresh(
+	credential *chatgptwebauth.Credential,
+	err error,
+) (*chatgptwebauth.Credential, error, bool) {
+	if err == nil {
+		return credential, nil, false
+	}
+	authError, ok := chatgptwebauth.AsAuthError(err)
+	if !ok || (authError.Code != "session_expired" && authError.Code != "access_token_missing") {
+		return credential, err, false
+	}
+	promoted := *authError
+	promoted.State = chatgptwebauth.LifecycleDead
+	promoted.LifecycleState = chatgptwebauth.LifecycleDead
+	promoted.Retryable = false
+	promoted.Terminal = true
+	if credential != nil {
+		credential = cloneChatGPTWebCredential(credential)
+		credential.LifecycleState = chatgptwebauth.LifecycleDead
+		credential.LifecycleReason = chatgptwebauth.SafeLifecycleReason(promoted.Code)
+	}
+	return credential, &promoted, true
 }
 
 func (e *ChatGPTWebExecutor) refreshFromCodexSource(ctx context.Context, credential *chatgptwebauth.Credential) (*chatgptwebauth.Credential, error, bool) {
