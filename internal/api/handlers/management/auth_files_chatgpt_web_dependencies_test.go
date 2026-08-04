@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
@@ -12,6 +13,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -238,6 +240,43 @@ func TestDeleteAuthFileCascadeRemovesCodexSourceAndAllLinkedWebCredentials(t *te
 		if _, errStat := os.Stat(filepath.Join(authDir, auth.FileName)); !os.IsNotExist(errStat) {
 			t.Fatalf("file %s still exists: %v", auth.FileName, errStat)
 		}
+	}
+}
+
+func TestDeleteAuthFilesWithDependenciesLoadsPersistedSnapshotOncePerBatch(t *testing.T) {
+	h, manager, _, store := newCountingChatGPTWebDependencyManagementHandler(t)
+	source := registerChatGPTWebDependencyManagementAuth(t, manager, managementDependencyCodexAuth("codex-source.json", "uid-a", false))
+	webs := make([]*coreauth.Auth, 0, 9)
+	for index := 0; index < 9; index++ {
+		name := fmt.Sprintf("web-%02d.json", index)
+		webs = append(webs, registerChatGPTWebDependencyManagementAuth(t, manager, managementDependencyWebAuth(name, source.ID, "uid-a")))
+	}
+	router := chatGPTWebDependencyManagementRouter(h)
+	if retained := performChatGPTWebDependencyManagementRequest(router, http.MethodDelete, "/auth-files?name=codex-source.json", ""); retained.Code != http.StatusAccepted {
+		t.Fatalf("retain status = %d, body=%s", retained.Code, retained.Body.String())
+	}
+	store.listCalls.Store(0)
+
+	names := make([]string, 0, len(webs)-1)
+	for _, web := range webs[:len(webs)-1] {
+		names = append(names, web.FileName)
+	}
+	payload, errMarshal := json.Marshal(map[string]any{"names": names})
+	if errMarshal != nil {
+		t.Fatal(errMarshal)
+	}
+	response := performChatGPTWebDependencyManagementRequest(router, http.MethodDelete, "/auth-files", string(payload))
+	if response.Code != http.StatusOK {
+		t.Fatalf("batch delete status = %d, body=%s", response.Code, response.Body.String())
+	}
+	if got := store.listCalls.Load(); got != 1 {
+		t.Fatalf("persisted auth snapshot loads = %d, want 1", got)
+	}
+	if _, ok := manager.GetByID(source.ID); !ok {
+		t.Fatal("retained source was removed while one dependent remained")
+	}
+	if _, ok := manager.GetByID(webs[len(webs)-1].ID); !ok {
+		t.Fatal("undeleted Web dependent was removed")
 	}
 }
 
@@ -674,6 +713,16 @@ type dependencyConditionalSaveRaceStore struct {
 	afterSave               func(string)
 }
 
+type countingDependencyFileStore struct {
+	*sdkAuth.FileTokenStore
+	listCalls atomic.Int64
+}
+
+func (store *countingDependencyFileStore) List(ctx context.Context) ([]*coreauth.Auth, error) {
+	store.listCalls.Add(1)
+	return store.FileTokenStore.List(ctx)
+}
+
 func (store *dependencyConditionalSaveRaceStore) Save(ctx context.Context, auth *coreauth.Auth) (string, error) {
 	if _, conditional := coreauth.SourceHashSavePrecondition(ctx); conditional {
 		store.mu.Lock()
@@ -745,6 +794,25 @@ func newChatGPTWebDependencyRaceManagementHandler(t *testing.T) (*Handler, *core
 	baseStore := sdkAuth.NewFileTokenStore()
 	baseStore.SetBaseDir(authDir)
 	store := &dependencyConditionalSaveRaceStore{FileTokenStore: baseStore}
+	manager := coreauth.NewManager(store, nil, nil)
+	h := NewHandler(&config.Config{AuthDir: authDir}, "", manager)
+	h.tokenStore = store
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if errShutdown := h.Shutdown(ctx); errShutdown != nil {
+			t.Errorf("shutdown management handler: %v", errShutdown)
+		}
+	})
+	return h, manager, authDir, store
+}
+
+func newCountingChatGPTWebDependencyManagementHandler(t *testing.T) (*Handler, *coreauth.Manager, string, *countingDependencyFileStore) {
+	t.Helper()
+	authDir := t.TempDir()
+	baseStore := sdkAuth.NewFileTokenStore()
+	baseStore.SetBaseDir(authDir)
+	store := &countingDependencyFileStore{FileTokenStore: baseStore}
 	manager := coreauth.NewManager(store, nil, nil)
 	h := NewHandler(&config.Config{AuthDir: authDir}, "", manager)
 	h.tokenStore = store

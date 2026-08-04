@@ -2250,10 +2250,10 @@ func (h *Handler) deleteAuthFileByName(ctx context.Context, name string) (string
 }
 
 func (h *Handler) deleteAuthFileByNameAtRoot(ctx context.Context, root *os.Root, lexicalAuthDir, authDir, name string) (string, int, error) {
-	return h.deleteAuthFileByNameAtRootExpected(ctx, root, lexicalAuthDir, authDir, name, "", "")
+	return h.deleteAuthFileByNameAtRootExpected(ctx, root, lexicalAuthDir, authDir, name, nil, false, "", "")
 }
 
-func (h *Handler) deleteAuthFileByNameAtRootExpected(ctx context.Context, root *os.Root, lexicalAuthDir, authDir, name, expectedSourceHash, expectedSourceUID string) (string, int, error) {
+func (h *Handler) deleteAuthFileByNameAtRootExpected(ctx context.Context, root *os.Root, lexicalAuthDir, authDir, name string, targetAuth *coreauth.Auth, runtimeAuthResolved bool, expectedSourceHash, expectedSourceUID string) (string, int, error) {
 	targetPath, displayName, errResolve := resolveManagedAuthFilePathAtRoot(root, authDir, name)
 	if errResolve != nil {
 		return "", managedAuthPathErrorStatus(errResolve), errResolve
@@ -2264,8 +2264,13 @@ func (h *Handler) deleteAuthFileByNameAtRootExpected(ctx context.Context, root *
 	}
 	displayName = actualName
 	targetPath = filepath.Join(authDir, filepath.FromSlash(displayName))
-	var targetAuth *coreauth.Auth
-	if h.authManager != nil {
+	if targetAuth != nil {
+		managedName, managed := managedAuthBackingFileNameAtRoot(root, lexicalAuthDir, authDir, targetAuth)
+		if isRuntimeOnlyAuth(targetAuth) || !managed || !managedAuthNameEqual(managedName, displayName) {
+			targetAuth = nil
+		}
+	}
+	if targetAuth == nil && !runtimeAuthResolved && h.authManager != nil {
 		for _, auth := range h.authManager.List() {
 			if auth == nil || isRuntimeOnlyAuth(auth) {
 				continue
@@ -2379,7 +2384,7 @@ func (h *Handler) deleteAuthFileByNameAtRootExpected(ctx context.Context, root *
 		return displayName, http.StatusInternalServerError, errDelete
 	}
 	authfileguard.ClearRetiredSnapshot(retiredSnapshot)
-	if targetID == "" && h.authManager != nil {
+	if targetID == "" && !runtimeAuthResolved && h.authManager != nil {
 		for _, auth := range h.authManager.List() {
 			if !authBackedByManagedPath(auth, targetPath, authDir) {
 				continue
