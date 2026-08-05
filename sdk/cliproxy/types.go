@@ -90,6 +90,7 @@ type WatcherWrapper struct {
 	snapshotAuths         func() []*coreauth.Auth
 	seedCurrentFileAuths  func(auths []*coreauth.Auth)
 	setUpdateQueue        func(queue chan<- watcher.AuthUpdate)
+	setUpdateObserver     func(observer func(watcher.AuthUpdate))
 	dispatchRuntimeUpdate func(update watcher.AuthUpdate) watcher.RuntimeAuthUpdateResult
 	waitForAuthUpdates    func(ctx context.Context) error
 }
@@ -161,6 +162,15 @@ func (w *WatcherWrapper) SetAuthUpdateQueue(queue chan<- watcher.AuthUpdate) {
 		return
 	}
 	w.setUpdateQueue(queue)
+}
+
+// SetAuthUpdateObserver registers a callback that runs before watcher updates
+// are queued for asynchronous application.
+func (w *WatcherWrapper) SetAuthUpdateObserver(observer func(watcher.AuthUpdate)) {
+	if w == nil || w.setUpdateObserver == nil {
+		return
+	}
+	w.setUpdateObserver(observer)
 }
 
 // WaitForAuthUpdates waits until all previously dispatched watcher updates

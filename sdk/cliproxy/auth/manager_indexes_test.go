@@ -135,6 +135,31 @@ func TestManagerDependencyIndexTracksDuplicateUIDAndRuntimeChanges(t *testing.T)
 	assertManagerAuthIndexesConsistent(t, manager)
 }
 
+func TestManagerSkipPersistDeleteMarksDependencyIndexDirtyAndRestoresPersistedEntry(t *testing.T) {
+	source := dependencyTestCodexAuth("source", "persisted-uid")
+	store := newChatGPTWebDependencyTestStore(source)
+	manager := NewManager(store, nil, nil)
+	if errLoad := manager.Load(t.Context()); errLoad != nil {
+		t.Fatal(errLoad)
+	}
+	if _, complete := manager.ChatGPTWebDependencyIndexSnapshot(); !complete {
+		t.Fatal("loaded dependency index is incomplete")
+	}
+	if errDelete := manager.Delete(WithSkipPersist(t.Context()), source.ID); errDelete != nil {
+		t.Fatal(errDelete)
+	}
+	if _, complete := manager.ChatGPTWebDependencyIndexSnapshot(); complete {
+		t.Fatal("skip-persist removal left the dependency index complete")
+	}
+	if _, errSnapshot := manager.PersistedAuthSnapshot(t.Context()); errSnapshot != nil {
+		t.Fatal(errSnapshot)
+	}
+	restored, ambiguous, complete := manager.ChatGPTWebSourceByCredentialUID("persisted-uid")
+	if !complete || ambiguous || restored == nil || restored.ID != source.ID {
+		t.Fatalf("restored source = %#v, ambiguous=%v, complete=%v", restored, ambiguous, complete)
+	}
+}
+
 func assertAuthIDsForPath(t *testing.T, manager *Manager, path string, want ...string) {
 	t.Helper()
 	auths := manager.AuthsForBackingPath(path)

@@ -86,6 +86,25 @@ func TestConsumeAuthUpdatesAppliesUpdatesBeforeBarrier(t *testing.T) {
 	}
 }
 
+func TestObserveAuthUpdateQueuedMarksDependencyIndexDirty(t *testing.T) {
+	store := &serviceRecordingStore{}
+	manager := coreauth.NewManager(store, nil, nil)
+	if errLoad := manager.Load(t.Context()); errLoad != nil {
+		t.Fatal(errLoad)
+	}
+	if _, complete := manager.ChatGPTWebDependencyIndexSnapshot(); !complete {
+		t.Fatal("initial persisted dependency index is incomplete")
+	}
+	service := &Service{coreManager: manager}
+	service.observeAuthUpdateQueued(watcher.AuthUpdate{
+		Action: watcher.AuthUpdateActionModify,
+		ID:     "external-auth",
+	})
+	if _, complete := manager.ChatGPTWebDependencyIndexSnapshot(); complete {
+		t.Fatal("queued external update left the dependency index complete")
+	}
+}
+
 func TestAuthFileUpdateStillCurrentRejectsDeletedAndRewrittenSources(t *testing.T) {
 	authDir := t.TempDir()
 	path := filepath.Join(authDir, "auth.json")

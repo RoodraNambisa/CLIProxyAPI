@@ -373,6 +373,14 @@ func (w *Watcher) flushDependencyReconcileLocked() {
 }
 
 func (w *Watcher) dispatchAuthUpdatesLocked(updates []AuthUpdate) bool {
+	if observer := w.authUpdateObserver; observer != nil {
+		for _, update := range updates {
+			switch update.Action {
+			case AuthUpdateActionAdd, AuthUpdateActionModify, AuthUpdateActionDelete:
+				observer(update)
+			}
+		}
+	}
 	queue := w.getAuthQueue()
 	if queue == nil {
 		return false

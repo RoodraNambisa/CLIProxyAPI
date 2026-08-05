@@ -2527,6 +2527,16 @@ func (s *Service) emitAuthUpdate(ctx context.Context, update watcher.AuthUpdate)
 	s.handleAuthUpdate(ctx, update)
 }
 
+func (s *Service) observeAuthUpdateQueued(update watcher.AuthUpdate) {
+	if s == nil || s.coreManager == nil {
+		return
+	}
+	switch update.Action {
+	case watcher.AuthUpdateActionAdd, watcher.AuthUpdateActionModify, watcher.AuthUpdateActionDelete:
+		s.coreManager.MarkChatGPTWebDependencyIndexDirty()
+	}
+}
+
 func (s *Service) handleAuthUpdate(ctx context.Context, update watcher.AuthUpdate) {
 	if s == nil {
 		return
@@ -2541,6 +2551,7 @@ func (s *Service) handleAuthUpdate(ctx context.Context, update watcher.AuthUpdat
 		}
 		return
 	}
+	s.observeAuthUpdateQueued(update)
 	s.cfgMu.RLock()
 	cfg := s.cfg
 	s.cfgMu.RUnlock()
@@ -4219,6 +4230,7 @@ func (s *Service) Run(ctx context.Context) error {
 	s.watcher = watcherWrapper
 	s.ensureAuthUpdateQueue(ctx)
 	if s.authUpdates != nil {
+		watcherWrapper.SetAuthUpdateObserver(s.observeAuthUpdateQueued)
 		watcherWrapper.SetAuthUpdateQueue(s.authUpdates)
 	}
 	watcherWrapper.SetConfig(s.cfg)

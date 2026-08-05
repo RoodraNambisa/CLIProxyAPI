@@ -3455,6 +3455,9 @@ func (m *Manager) deleteIf(ctx context.Context, id string, predicate func(*Auth)
 	if current, ok := m.auths[id]; ok && current == deletedRuntime {
 		m.beginAuthInstanceCleanupLocked(id)
 		m.removeAuthLocked(id)
+		if !shouldPersistDelete && authRelevantToChatGPTWebDependencyIndex(deleted) {
+			m.dependencyIndexComplete = false
+		}
 		removed = true
 	}
 	m.mu.Unlock()

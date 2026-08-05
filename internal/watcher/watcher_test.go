@@ -344,12 +344,21 @@ func TestStartFailsWhenConfigMissing(t *testing.T) {
 func TestDispatchRuntimeAuthUpdateEnqueuesAndUpdatesState(t *testing.T) {
 	queue := make(chan AuthUpdate, 4)
 	w := &Watcher{}
+	observed := false
+	w.SetAuthUpdateObserver(func(update AuthUpdate) {
+		if update.Action == AuthUpdateActionAdd && update.Auth != nil && update.Auth.ID == "auth-1" {
+			observed = true
+		}
+	})
 	w.SetAuthUpdateQueue(queue)
 	defer w.stopDispatch()
 
 	auth := &coreauth.Auth{ID: "auth-1", Provider: "test"}
 	if ok := w.DispatchRuntimeAuthUpdate(AuthUpdate{Action: AuthUpdateActionAdd, Auth: auth}); !ok {
 		t.Fatal("expected DispatchRuntimeAuthUpdate to enqueue")
+	}
+	if !observed {
+		t.Fatal("auth update observer was not invoked before enqueue returned")
 	}
 
 	select {

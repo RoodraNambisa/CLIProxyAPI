@@ -76,6 +76,7 @@ type Watcher struct {
 	lastRemoveTimes      map[string]time.Time
 	lastConfigHash       string
 	authQueue            chan<- AuthUpdate
+	authUpdateObserver   func(AuthUpdate)
 	currentAuths         map[string]*coreauth.Auth
 	runtimeAuths         map[string]*coreauth.Auth
 	dispatchMu           sync.Mutex
@@ -196,6 +197,17 @@ func (w *Watcher) SetConfig(cfg *config.Config) {
 // SetAuthUpdateQueue sets the queue used to emit auth updates.
 func (w *Watcher) SetAuthUpdateQueue(queue chan<- AuthUpdate) {
 	w.setAuthUpdateQueue(queue)
+}
+
+// SetAuthUpdateObserver registers a callback invoked before a file or runtime
+// auth update becomes visible to the asynchronous consumer.
+func (w *Watcher) SetAuthUpdateObserver(observer func(AuthUpdate)) {
+	if w == nil {
+		return
+	}
+	w.dispatchLifecycleMu.Lock()
+	w.authUpdateObserver = observer
+	w.dispatchLifecycleMu.Unlock()
 }
 
 // DispatchRuntimeAuthUpdate allows external runtime providers (e.g., websocket-driven auths)
