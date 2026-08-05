@@ -123,7 +123,11 @@ type Service struct {
 	modelSyncPending map[string]modelSyncTaskState
 
 	// modelSyncOverflow retains deduplicated tasks while modelSyncQueue is full.
-	modelSyncOverflow []string
+	modelSyncOverflow          []string
+	modelSyncOverflowTokens    []uint64
+	modelSyncOverflowSet       map[string]struct{}
+	modelSyncOverflowToken     map[string]uint64
+	modelSyncOverflowNextToken uint64
 
 	// modelSyncMutationLockedObserved is used by concurrency tests to observe
 	// the exact point where model synchronization owns the auth mutation lock.
@@ -347,7 +351,13 @@ func (h authMaintenanceHook) handleAuthChange(ctx context.Context, auth *coreaut
 		}
 		if nativeChatGPTWeb := isNativeChatGPTWebAuth(auth); nativeChatGPTWeb {
 			h.service.ensureExecutorsForAuth(auth)
-			h.service.syncChatGPTWebAccountInfoRecovery(auth)
+			if auth.Disabled || auth.Status == coreauth.StatusDisabled || !auth.LifecycleSelectable() ||
+				coreauth.ChatGPTWebImportIntent(auth, coreauth.ChatGPTWebImportSessionIntent) {
+				h.service.cancelChatGPTWebBackgroundMaintenance(auth, "auth_lifecycle_unavailable")
+			} else {
+				h.service.syncChatGPTWebAccountInfoRecovery(auth)
+				h.service.restoreChatGPTWebImportAccountInfoIntent(auth)
+			}
 		}
 		return
 	}
@@ -357,14 +367,23 @@ func (h authMaintenanceHook) handleAuthChange(ctx context.Context, auth *coreaut
 			if current, ok := h.service.coreManager.CurrentAuthInstallation(auth); ok {
 				if isNativeChatGPTWebAuth(current) {
 					h.service.ensureExecutorsForAuth(current)
-					h.service.syncChatGPTWebAccountInfoRecovery(current)
+					if current.Disabled || current.Status == coreauth.StatusDisabled || !current.LifecycleSelectable() ||
+						coreauth.ChatGPTWebImportIntent(current, coreauth.ChatGPTWebImportSessionIntent) {
+						h.service.cancelChatGPTWebBackgroundMaintenance(current, "auth_lifecycle_unavailable")
+					} else {
+						h.service.syncChatGPTWebAccountInfoRecovery(current)
+						h.service.restoreChatGPTWebImportAccountInfoIntent(current)
+					}
 					h.service.triggerChatGPTWebRelogin(current)
 				}
-				h.service.enqueueModelSyncTaskForInstallation(
-					current.ID,
-					current.RuntimeInstallationID(),
-					true,
-				)
+				if !isNativeChatGPTWebAuth(current) ||
+					(current.LifecycleSelectable() && !coreauth.ChatGPTWebImportIntent(current, coreauth.ChatGPTWebImportSessionIntent)) {
+					h.service.enqueueModelSyncTaskForInstallation(
+						current.ID,
+						current.RuntimeInstallationID(),
+						true,
+					)
+				}
 			}
 		}
 		return
@@ -382,7 +401,13 @@ func (h authMaintenanceHook) handleAuthChange(ctx context.Context, auth *coreaut
 	registeredProvider := registry.GetGlobalRegistry().GetProviderForClient(auth.ID)
 	if nativeChatGPTWeb {
 		h.service.ensureExecutorsForAuth(auth)
-		h.service.syncChatGPTWebAccountInfoRecovery(auth)
+		if auth.Disabled || auth.Status == coreauth.StatusDisabled || !auth.LifecycleSelectable() ||
+			coreauth.ChatGPTWebImportIntent(auth, coreauth.ChatGPTWebImportSessionIntent) {
+			h.service.cancelChatGPTWebBackgroundMaintenance(auth, "auth_lifecycle_unavailable")
+		} else {
+			h.service.syncChatGPTWebAccountInfoRecovery(auth)
+			h.service.restoreChatGPTWebImportAccountInfoIntent(auth)
+		}
 	}
 	if provider != "antigravity" {
 		h.service.antigravityModelCapabilities.Delete(auth.ID)
@@ -438,13 +463,60 @@ func (h authMaintenanceHook) handleAuthChange(ctx context.Context, auth *coreaut
 		h.service.coreManager.ReconcileRegistryModelStatesIfCurrent(ctx, auth)
 		h.service.coreManager.RefreshSchedulerEntry(auth.ID)
 	}
-	h.service.enqueueModelSyncTaskForInstallation(
-		auth.ID,
-		auth.RuntimeInstallationID(),
-		true,
-	)
+	importPolicy, imported := coreauth.ChatGPTWebImportPolicyFromContext(ctx)
+	modelSyncReady := !nativeChatGPTWeb ||
+		(auth.LifecycleSelectable() && !coreauth.ChatGPTWebImportIntent(auth, coreauth.ChatGPTWebImportSessionIntent))
+	if modelSyncReady && (!imported || importPolicy.ValidateModels) {
+		h.service.enqueueModelSyncTaskForInstallation(
+			auth.ID,
+			auth.RuntimeInstallationID(),
+			true,
+		)
+	}
 	if nativeChatGPTWeb {
 		h.service.triggerChatGPTWebRelogin(auth)
+	}
+}
+
+func (s *Service) cancelChatGPTWebBackgroundMaintenance(auth *coreauth.Auth, reason string) {
+	if s == nil || auth == nil || strings.TrimSpace(auth.ID) == "" {
+		return
+	}
+	s.cancelModelSyncTask(auth.ID)
+	if s.coreManager == nil {
+		return
+	}
+	registered, ok := s.coreManager.Executor(chatgptwebauth.Provider)
+	if !ok || registered == nil {
+		return
+	}
+	closer, ok := registered.(coreauth.AuthInstanceExecutionSessionCloser)
+	if !ok {
+		return
+	}
+	closer.CloseAuthInstanceExecutionSessions(auth.ID, auth.RuntimeInstanceID(), reason)
+}
+
+func (s *Service) restoreChatGPTWebImportAccountInfoIntent(auth *coreauth.Auth) {
+	if s == nil || s.coreManager == nil || auth == nil || auth.Disabled ||
+		auth.Status == coreauth.StatusDisabled || !auth.LifecycleSelectable() ||
+		!coreauth.ChatGPTWebImportIntent(auth, coreauth.ChatGPTWebImportAccountInfoIntent) {
+		return
+	}
+	cfg := s.currentConfig()
+	if cfg == nil || !cfg.ChatGPTWeb.AccountInfo.Resolved().AutomaticRefreshEnabled() ||
+		!cfg.ChatGPTWeb.Import.Resolved().RefreshAccountInfoAfterUpload {
+		return
+	}
+	registered, ok := s.coreManager.Executor(chatgptwebauth.Provider)
+	if !ok || registered == nil {
+		return
+	}
+	trigger, ok := registered.(interface {
+		TriggerAccountInfoRefreshState(string, bool) string
+	})
+	if ok {
+		trigger.TriggerAccountInfoRefreshState(auth.ID, false)
 	}
 }
 
@@ -1183,7 +1255,7 @@ func (s *Service) installAuthMaintenanceHook(ctx context.Context) {
 	}
 	hook := authMaintenanceHook{service: s}
 	s.coreManager.AddHook(hook)
-	for _, auth := range s.coreManager.List() {
+	for _, auth := range s.coreManager.ChatGPTWebAuths() {
 		if isNativeChatGPTWebAuth(auth) {
 			hook.OnAuthUpdated(ctx, auth)
 		}
@@ -3135,6 +3207,9 @@ func (s *Service) enqueueModelSyncTaskForInstallation(
 	if s.modelSyncPending == nil {
 		s.modelSyncPending = make(map[string]modelSyncTaskState)
 	}
+	if s.modelSyncOverflowSet == nil {
+		s.modelSyncOverflowSet = make(map[string]struct{})
+	}
 	if s.modelSyncQueue == nil || s.modelSyncCancel == nil {
 		if !retainWhenStopped {
 			s.modelSyncMu.Unlock()
@@ -3151,9 +3226,7 @@ func (s *Service) enqueueModelSyncTaskForInstallation(
 			state.queued = true
 			state.dirty = false
 			s.modelSyncPending[authID] = state
-			if !modelSyncOverflowContains(s.modelSyncOverflow, authID) {
-				s.modelSyncOverflow = append(s.modelSyncOverflow, authID)
-			}
+			s.enqueueModelSyncOverflowLocked(authID)
 		} else {
 			state := modelSyncTaskState{
 				epoch:          s.nextModelSyncEpochLocked(),
@@ -3161,7 +3234,7 @@ func (s *Service) enqueueModelSyncTaskForInstallation(
 				queued:         true,
 			}
 			s.modelSyncPending[authID] = state
-			s.modelSyncOverflow = append(s.modelSyncOverflow, authID)
+			s.enqueueModelSyncOverflowLocked(authID)
 		}
 		s.modelSyncMu.Unlock()
 		return true
@@ -3189,7 +3262,7 @@ func (s *Service) enqueueModelSyncTaskForInstallation(
 				select {
 				case s.modelSyncQueue <- authID:
 				default:
-					s.modelSyncOverflow = append(s.modelSyncOverflow, authID)
+					s.enqueueModelSyncOverflowLocked(authID)
 				}
 			}
 			s.modelSyncMu.Unlock()
@@ -3213,36 +3286,103 @@ func (s *Service) enqueueModelSyncTaskForInstallation(
 		s.modelSyncMu.Unlock()
 		return true
 	default:
-		s.modelSyncOverflow = append(s.modelSyncOverflow, authID)
+		s.enqueueModelSyncOverflowLocked(authID)
 		s.modelSyncMu.Unlock()
 		return true
 	}
 }
 
 func (s *Service) promoteModelSyncOverflowLocked() {
+	s.ensureModelSyncOverflowTokensLocked()
 	for len(s.modelSyncOverflow) > 0 {
 		authID := s.modelSyncOverflow[0]
+		token := s.modelSyncOverflowTokens[0]
+		currentToken, current := s.modelSyncOverflowToken[authID]
+		if !current || currentToken != token {
+			s.popModelSyncOverflowLocked()
+			continue
+		}
 		state, pending := s.modelSyncPending[authID]
 		if !pending || !state.queued {
-			s.modelSyncOverflow = s.modelSyncOverflow[1:]
+			s.popModelSyncOverflowLocked()
 			continue
 		}
 		select {
 		case s.modelSyncQueue <- authID:
-			s.modelSyncOverflow = s.modelSyncOverflow[1:]
+			s.popModelSyncOverflowLocked()
 		default:
 			return
 		}
 	}
 }
 
-func modelSyncOverflowContains(overflow []string, authID string) bool {
-	for _, pendingID := range overflow {
-		if pendingID == authID {
-			return true
+func (s *Service) enqueueModelSyncOverflowLocked(authID string) {
+	if authID == "" {
+		return
+	}
+	if s.modelSyncOverflowSet == nil {
+		s.modelSyncOverflowSet = make(map[string]struct{})
+	}
+	if s.modelSyncOverflowToken == nil {
+		s.modelSyncOverflowToken = make(map[string]uint64)
+	}
+	if _, exists := s.modelSyncOverflowSet[authID]; exists {
+		return
+	}
+	s.modelSyncOverflowNextToken++
+	if s.modelSyncOverflowNextToken == 0 {
+		s.modelSyncOverflowNextToken++
+	}
+	token := s.modelSyncOverflowNextToken
+	s.modelSyncOverflowSet[authID] = struct{}{}
+	s.modelSyncOverflowToken[authID] = token
+	s.modelSyncOverflow = append(s.modelSyncOverflow, authID)
+	s.modelSyncOverflowTokens = append(s.modelSyncOverflowTokens, token)
+}
+
+func (s *Service) popModelSyncOverflowLocked() {
+	if len(s.modelSyncOverflow) == 0 {
+		return
+	}
+	authID := s.modelSyncOverflow[0]
+	token := uint64(0)
+	if len(s.modelSyncOverflowTokens) > 0 {
+		token = s.modelSyncOverflowTokens[0]
+		s.modelSyncOverflowTokens = s.modelSyncOverflowTokens[1:]
+	}
+	s.modelSyncOverflow = s.modelSyncOverflow[1:]
+	if current, ok := s.modelSyncOverflowToken[authID]; ok && current == token {
+		delete(s.modelSyncOverflowToken, authID)
+		delete(s.modelSyncOverflowSet, authID)
+	}
+}
+
+func (s *Service) invalidateModelSyncOverflowLocked(authID string) {
+	delete(s.modelSyncOverflowSet, authID)
+	delete(s.modelSyncOverflowToken, authID)
+}
+
+func (s *Service) ensureModelSyncOverflowTokensLocked() {
+	if len(s.modelSyncOverflowTokens) == len(s.modelSyncOverflow) {
+		return
+	}
+	s.modelSyncOverflowTokens = s.modelSyncOverflowTokens[:0]
+	if s.modelSyncOverflowToken == nil {
+		s.modelSyncOverflowToken = make(map[string]uint64)
+	} else {
+		clear(s.modelSyncOverflowToken)
+	}
+	for _, authID := range s.modelSyncOverflow {
+		s.modelSyncOverflowNextToken++
+		if s.modelSyncOverflowNextToken == 0 {
+			s.modelSyncOverflowNextToken++
+		}
+		token := s.modelSyncOverflowNextToken
+		s.modelSyncOverflowTokens = append(s.modelSyncOverflowTokens, token)
+		if _, active := s.modelSyncOverflowSet[authID]; active {
+			s.modelSyncOverflowToken[authID] = token
 		}
 	}
-	return false
 }
 
 func (s *Service) nextModelSyncEpochLocked() uint64 {
@@ -3300,15 +3440,7 @@ func (s *Service) cancelModelSyncTaskIfEpoch(authID string, epoch uint64) {
 		return
 	}
 	delete(s.modelSyncPending, authID)
-	if len(s.modelSyncOverflow) > 0 {
-		kept := s.modelSyncOverflow[:0]
-		for _, pendingID := range s.modelSyncOverflow {
-			if pendingID != authID {
-				kept = append(kept, pendingID)
-			}
-		}
-		s.modelSyncOverflow = kept
-	}
+	s.invalidateModelSyncOverflowLocked(authID)
 	s.promoteModelSyncOverflowLocked()
 	s.modelSyncMu.Unlock()
 }
@@ -3335,15 +3467,6 @@ func (s *Service) beginModelSyncTask(authID string, generation uint64) (uint64, 
 	state.running = true
 	state.dirty = false
 	s.modelSyncPending[authID] = state
-	if len(s.modelSyncOverflow) > 0 {
-		kept := s.modelSyncOverflow[:0]
-		for _, pendingID := range s.modelSyncOverflow {
-			if pendingID != authID {
-				kept = append(kept, pendingID)
-			}
-		}
-		s.modelSyncOverflow = kept
-	}
 	return state.epoch, true
 }
 
@@ -3382,9 +3505,7 @@ func (s *Service) completeModelSyncTask(
 		select {
 		case s.modelSyncQueue <- authID:
 		default:
-			if !modelSyncOverflowContains(s.modelSyncOverflow, authID) {
-				s.modelSyncOverflow = append(s.modelSyncOverflow, authID)
-			}
+			s.enqueueModelSyncOverflowLocked(authID)
 		}
 		return false
 	}
@@ -3402,7 +3523,7 @@ func (s *Service) completeModelSyncTask(
 		select {
 		case s.modelSyncQueue <- authID:
 		default:
-			s.modelSyncOverflow = append(s.modelSyncOverflow, authID)
+			s.enqueueModelSyncOverflowLocked(authID)
 		}
 		return false
 	}
@@ -3714,7 +3835,7 @@ func (s *Service) refreshChatGPTWebModelCatalogs(ctx context.Context) {
 	if s == nil || s.coreManager == nil {
 		return
 	}
-	for _, auth := range s.coreManager.List() {
+	for _, auth := range s.coreManager.ChatGPTWebAuths() {
 		if !isNativeChatGPTWebAuth(auth) || auth.Disabled || auth.Status == coreauth.StatusDisabled || !auth.LifecycleSelectable() {
 			continue
 		}
@@ -3757,6 +3878,9 @@ func (s *Service) startModelSyncLoop(parent context.Context) {
 		s.modelSyncPending = make(map[string]modelSyncTaskState)
 	}
 	s.modelSyncOverflow = s.modelSyncOverflow[:0]
+	s.modelSyncOverflowTokens = s.modelSyncOverflowTokens[:0]
+	clear(s.modelSyncOverflowSet)
+	clear(s.modelSyncOverflowToken)
 	pendingIDs := make([]string, 0, len(s.modelSyncPending))
 	for authID, state := range s.modelSyncPending {
 		if state.nextEpoch != 0 {
@@ -3775,7 +3899,9 @@ func (s *Service) startModelSyncLoop(parent context.Context) {
 		pendingIDs = append(pendingIDs, authID)
 	}
 	sort.Strings(pendingIDs)
-	s.modelSyncOverflow = append(s.modelSyncOverflow, pendingIDs...)
+	for _, authID := range pendingIDs {
+		s.enqueueModelSyncOverflowLocked(authID)
+	}
 	s.modelSyncCancel = cancel
 	s.modelSyncDone = done
 	s.modelSyncQueue = queue
@@ -4079,6 +4205,7 @@ func (s *Service) Run(ctx context.Context) error {
 		s.authManager = newDefaultAuthManager()
 	}
 	s.startModelSyncLoop(ctx)
+	s.restoreChatGPTWebImportModelIntents(ctx)
 	s.installAuthMaintenanceHook(ctx)
 	if cfg, _ := s.snapshotAuthMaintenanceConfig(); cfg.Enable {
 		s.warnAuthMaintenanceConfig(cfg)
@@ -4280,6 +4407,11 @@ func (s *Service) Run(ctx context.Context) error {
 			}
 		}
 		s.refreshChatGPTWebModelCatalogs(ctx)
+		previousImportModels := previousCfgSnapshot != nil && previousCfgSnapshot.ChatGPTWeb.Import.Resolved().ValidateModelsAfterUpload
+		nextImportModels := newCfg.ChatGPTWeb.Import.Resolved().ValidateModelsAfterUpload
+		if !previousImportModels && nextImportModels {
+			s.restoreChatGPTWebImportModelIntents(ctx)
+		}
 		if s.coreManager != nil && authModelExclusionsChanged {
 			for _, auth := range s.coreManager.List() {
 				if isNativeChatGPTWebAuth(auth) {

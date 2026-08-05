@@ -60,6 +60,8 @@ const (
 	DefaultChatGPTWebAutoReloginJitterPercent  = 20
 	MaxChatGPTWebAutoReloginRetries            = 10
 	MaxChatGPTWebAutoReloginJitterPercent      = 100
+	DefaultChatGPTWebImportWorkers             = 4
+	MaxChatGPTWebImportWorkers                 = 32
 	DefaultChatGPTWebTimezone                  = "Asia/Shanghai"
 	DefaultChatGPTWebTimezoneOffsetMinutes     = -480
 	MinChatGPTWebTimezoneOffsetMinutes         = -840
@@ -467,9 +469,11 @@ type ChatGPTWebConfig struct {
 	AutoRelogin bool `yaml:"auto-relogin" json:"auto-relogin"`
 	// SessionCookieRefreshOnTokenFailure allows incomplete password credentials to refresh access tokens with a complete session cookie.
 	SessionCookieRefreshOnTokenFailure bool `yaml:"session-cookie-refresh-on-token-failure" json:"session-cookie-refresh-on-token-failure"`
-	// ForceSessionRefreshOnImport refreshes session-backed imports even when their access token is still valid.
+	// ForceSessionRefreshOnImport queues a background refresh for session-backed imports even when their access token is still valid.
 	// An omitted value remains enabled for backward compatibility.
 	ForceSessionRefreshOnImport *bool `yaml:"force-session-refresh-on-import,omitempty" json:"force-session-refresh-on-import,omitempty"`
+	// Import controls the shared local import pool and optional post-upload maintenance.
+	Import ChatGPTWebImportConfig `yaml:"import,omitempty" json:"import,omitempty"`
 	// AutoDeleteDeadAuths removes credentials whose lifecycle is permanently dead.
 	AutoDeleteDeadAuths bool `yaml:"auto-delete-dead-auths" json:"auto-delete-dead-auths"`
 	// AutoDeleteDeadPriorities limits dead credential deletion to these priorities.
@@ -551,6 +555,72 @@ func (cfg ChatGPTWebConfig) TokenUsageEstimationEnabled() bool {
 // ForceSessionRefreshOnImportEnabled reports whether valid session-backed imports are refreshed.
 func (cfg ChatGPTWebConfig) ForceSessionRefreshOnImportEnabled() bool {
 	return cfg.ForceSessionRefreshOnImport == nil || *cfg.ForceSessionRefreshOnImport
+}
+
+// ChatGPTWebImportConfig controls fast local imports and optional background maintenance.
+type ChatGPTWebImportConfig struct {
+	Workers                       *int  `yaml:"workers,omitempty" json:"workers,omitempty"`
+	ValidateModelsAfterUpload     *bool `yaml:"validate-models-after-upload,omitempty" json:"validate-models-after-upload,omitempty"`
+	RefreshAccountInfoAfterUpload *bool `yaml:"refresh-account-info-after-upload,omitempty" json:"refresh-account-info-after-upload,omitempty"`
+}
+
+// ResolvedChatGPTWebImportConfig contains effective import settings.
+type ResolvedChatGPTWebImportConfig struct {
+	Workers                       int  `json:"workers"`
+	ValidateModelsAfterUpload     bool `json:"validate-models-after-upload"`
+	RefreshAccountInfoAfterUpload bool `json:"refresh-account-info-after-upload"`
+}
+
+// UnmarshalYAML rejects unknown and null import settings.
+func (cfg *ChatGPTWebImportConfig) UnmarshalYAML(node *yaml.Node) error {
+	if cfg == nil || node == nil || node.Kind != yaml.MappingNode && node.Kind != yaml.AliasNode {
+		return fmt.Errorf("chatgpt-web.import must be an object")
+	}
+	var effective map[string]any
+	if err := node.Decode(&effective); err != nil {
+		return fmt.Errorf("chatgpt-web.import: %w", err)
+	}
+	for name, value := range effective {
+		switch name {
+		case "workers", "validate-models-after-upload", "refresh-account-info-after-upload":
+			if value == nil {
+				return fmt.Errorf("chatgpt-web.import.%s must not be null", name)
+			}
+		default:
+			return fmt.Errorf("chatgpt-web.import.%s is not supported", name)
+		}
+	}
+	type plainChatGPTWebImportConfig ChatGPTWebImportConfig
+	var decoded plainChatGPTWebImportConfig
+	if err := node.Decode(&decoded); err != nil {
+		return fmt.Errorf("chatgpt-web.import: %w", err)
+	}
+	*cfg = ChatGPTWebImportConfig(decoded)
+	return nil
+}
+
+// Resolved returns effective upload and maintenance settings.
+func (cfg ChatGPTWebImportConfig) Resolved() ResolvedChatGPTWebImportConfig {
+	resolved := ResolvedChatGPTWebImportConfig{Workers: DefaultChatGPTWebImportWorkers}
+	if cfg.Workers != nil {
+		resolved.Workers = *cfg.Workers
+	}
+	if cfg.ValidateModelsAfterUpload != nil {
+		resolved.ValidateModelsAfterUpload = *cfg.ValidateModelsAfterUpload
+	}
+	if cfg.RefreshAccountInfoAfterUpload != nil {
+		resolved.RefreshAccountInfoAfterUpload = *cfg.RefreshAccountInfoAfterUpload
+	}
+	return resolved
+}
+
+// Validate rejects unsupported import worker counts.
+func (cfg ChatGPTWebImportConfig) Validate() error {
+	workers := cfg.Resolved().Workers
+	if workers < 1 || workers > MaxChatGPTWebImportWorkers {
+		return fmt.Errorf("chatgpt-web.import.workers must be between 1 and %d", MaxChatGPTWebImportWorkers)
+	}
+	return nil
 }
 
 // ChatGPTWebUsageCacheConfig controls optional disk spill for compact usage projections.
@@ -846,6 +916,9 @@ func (cfg ChatGPTWebConfig) Validate() error {
 		return err
 	}
 	if err := cfg.LoginProxy.Validate(); err != nil {
+		return err
+	}
+	if err := cfg.Import.Validate(); err != nil {
 		return err
 	}
 	if err := cfg.AccountInfo.Validate(); err != nil {
@@ -3717,6 +3790,7 @@ func preservesExplicitChatGPTWebValue(fullPath string, node *yaml.Node) bool {
 			"auto-relogin-max-retries",
 			"auto-relogin-jitter-percent",
 			"force-session-refresh-on-import",
+			"import",
 			"timezone",
 			"timezone-offset-minutes",
 			"estimate-token-usage",
@@ -3740,6 +3814,12 @@ func preservesExplicitChatGPTWebValue(fullPath string, node *yaml.Node) bool {
 		return true
 	case "chatgpt-web.estimate-token-usage":
 		return node.Kind == yaml.ScalarNode && node.Tag == "!!bool"
+	case "chatgpt-web.import":
+		return node.Kind == yaml.MappingNode && len(node.Content) > 0
+	case "chatgpt-web.import.workers",
+		"chatgpt-web.import.validate-models-after-upload",
+		"chatgpt-web.import.refresh-account-info-after-upload":
+		return true
 	case "chatgpt-web.image-usage":
 		return node.Kind == yaml.MappingNode && len(node.Content) > 0
 	case "chatgpt-web.image-usage.auto-output-quality":

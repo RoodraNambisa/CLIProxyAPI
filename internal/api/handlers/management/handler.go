@@ -103,6 +103,10 @@ func NewHandler(cfg *config.Config, configFilePath string, manager *coreauth.Man
 	envSecret, _ := os.LookupEnv("MANAGEMENT_PASSWORD")
 	envSecret = strings.TrimSpace(envSecret)
 
+	mutationTasks := newChatGPTWebMutationTaskManager()
+	if cfg != nil {
+		mutationTasks.updateWorkerLimit(cfg.ChatGPTWeb.Import.Resolved().Workers)
+	}
 	h := &Handler{
 		cfg:                     cfg,
 		configFilePath:          configFilePath,
@@ -113,7 +117,7 @@ func NewHandler(cfg *config.Config, configFilePath string, manager *coreauth.Man
 		allowRemoteOverride:     envSecret != "",
 		envSecret:               envSecret,
 		chatGPTWebTasks:         newChatGPTWebLoginTaskManager(),
-		chatGPTWebMutationTasks: newChatGPTWebMutationTaskManager(),
+		chatGPTWebMutationTasks: mutationTasks,
 		agentIdentityTasks:      newCodexAgentIdentityTaskManager(),
 	}
 	cleanupCtx, cleanupCancel := context.WithCancel(context.Background())
@@ -238,7 +242,15 @@ func (h *Handler) SetConfig(cfg *config.Config) {
 		}
 	}
 	h.cfg = cfg
+	mutationTasks := h.chatGPTWebMutationTasks
+	workers := config.DefaultChatGPTWebImportWorkers
+	if cfg != nil {
+		workers = cfg.ChatGPTWeb.Import.Resolved().Workers
+	}
 	h.mu.Unlock()
+	if mutationTasks != nil {
+		mutationTasks.updateWorkerLimit(workers)
+	}
 }
 
 // SetAuthManager updates the auth manager reference used by management endpoints.

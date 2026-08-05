@@ -485,6 +485,11 @@ func (s *Service) syncChatGPTWebModels(ctx context.Context, source *coreauth.Aut
 	}
 	unlockTransition()
 	s.applyChatGPTWebRegistryState(ctx, latest, chatGPTWebRegistryStatePrune)
+	if coreauth.ChatGPTWebImportIntent(latest, coreauth.ChatGPTWebImportModelsIntent) {
+		if _, errClear := s.coreManager.ClearChatGPTWebImportIntentIfCurrent(ctx, latest, coreauth.ChatGPTWebImportModelsIntent); errClear != nil {
+			log.WithError(errClear).WithField("auth_id", latest.ID).Warn("failed to clear ChatGPT Web import model intent")
+		}
+	}
 }
 
 func (s *Service) refreshChatGPTWebModelRegistration(ctx context.Context, source *coreauth.Auth) {
@@ -507,6 +512,24 @@ func (s *Service) refreshChatGPTWebModelRegistration(ctx context.Context, source
 	s.registerModelsForAuthPreservingState(current)
 	unlockTransition()
 	s.applyChatGPTWebRegistryState(ctx, current, chatGPTWebRegistryStatePrune)
+}
+
+func (s *Service) restoreChatGPTWebImportModelIntents(ctx context.Context) {
+	if s == nil || s.coreManager == nil {
+		return
+	}
+	cfg := s.currentConfig()
+	if cfg == nil || !cfg.ChatGPTWeb.Import.Resolved().ValidateModelsAfterUpload {
+		return
+	}
+	for _, auth := range s.coreManager.ChatGPTWebAuths() {
+		if auth == nil || auth.Disabled || auth.Status == coreauth.StatusDisabled || !auth.LifecycleSelectable() ||
+			!coreauth.ChatGPTWebImportIntent(auth, coreauth.ChatGPTWebImportModelsIntent) {
+			continue
+		}
+		s.refreshChatGPTWebModelRegistration(ctx, auth)
+		s.enqueueModelSyncTaskForInstallation(auth.ID, auth.RuntimeInstallationID(), true)
+	}
 }
 
 func (s *Service) reconcileStaleChatGPTWebCatalogLocked(ctx context.Context, authID string, latest *coreauth.Auth) (*coreauth.Auth, chatGPTWebRegistryStateAction, bool) {

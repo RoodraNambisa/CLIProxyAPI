@@ -65,9 +65,18 @@ chatgpt-web:
   # Definitive session expiry can mark the credential dead; network and
   # transient upstream failures never do.
   session-cookie-refresh-on-token-failure: false
-  # Refresh session-backed imports even when the uploaded access token remains valid.
-  # Disable to keep a valid uploaded token; missing or expired tokens still use the session.
+  # Queue a background refresh for session-backed imports even when the uploaded
+  # access token remains valid. Upload completion never waits for this refresh.
   force-session-refresh-on-import: true
+  import:
+    # Shared across all concurrent import tasks.
+    workers: 4
+    # Credentials use the built-in model catalog immediately. Enable this to
+    # validate and replace it from /backend-api/models in the background.
+    validate-models-after-upload: false
+    # Requires account-info.auto-refresh-enabled; never performs a hidden query
+    # when automatic account-info refresh is disabled.
+    refresh-account-info-after-upload: false
   # Remove credentials only after ChatGPT Web confirms the account lifecycle is dead.
   auto-delete-dead-auths: false
   # Empty matches every priority; otherwise only exact integer priorities are removed.

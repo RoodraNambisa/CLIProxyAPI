@@ -41,6 +41,7 @@ type chatGPTWebManagementTestExecutor struct {
 	fetchFn              func(context.Context, *coreauth.Auth) ([]chatgptwebauth.CatalogModel, error)
 	beginFn              func(context.Context, string) (context.Context, func(), error)
 	accountInfoTriggerFn func(string, bool) bool
+	accountInfoStateFn   func(string, bool) string
 	loginProxy           chatgptwebauth.LoginProxyConfig
 }
 
@@ -231,6 +232,20 @@ func (executor *chatGPTWebManagementTestExecutor) TriggerAccountInfoRefresh(auth
 	triggerFn := executor.accountInfoTriggerFn
 	executor.mu.Unlock()
 	return triggerFn != nil && triggerFn(authID, force)
+}
+
+func (executor *chatGPTWebManagementTestExecutor) TriggerAccountInfoRefreshState(authID string, force bool) string {
+	executor.mu.Lock()
+	stateFn := executor.accountInfoStateFn
+	triggerFn := executor.accountInfoTriggerFn
+	executor.mu.Unlock()
+	if stateFn != nil {
+		return stateFn(authID, force)
+	}
+	if triggerFn != nil && triggerFn(authID, force) {
+		return "queued"
+	}
+	return "canceled"
 }
 
 func TestParseChatGPTWebLoginInputs(t *testing.T) {

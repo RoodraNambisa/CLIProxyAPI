@@ -93,44 +93,47 @@ type Cookie struct {
 }
 
 type Credential struct {
-	CredentialSchemaVersion int                 `json:"credential_schema_version,omitempty"`
-	WebAuthn                *WebAuthnCredential `json:"webauthn,omitempty"`
-	Type                    string              `json:"type"`
-	CredentialUID           string              `json:"credential_uid,omitempty"`
-	CredentialMode          string              `json:"credential_mode,omitempty"`
-	RefreshStrategy         RefreshStrategy     `json:"refresh_strategy,omitempty"`
-	SourceAuthID            string              `json:"source_auth_id,omitempty"`
-	SourceCredentialUID     string              `json:"source_credential_uid,omitempty"`
-	SourceIdentity          string              `json:"source_identity,omitempty"`
-	SourceProxyURL          string              `json:"source_proxy_url,omitempty"`
-	Email                   string              `json:"email"`
-	AccountID               string              `json:"account_id,omitempty"`
-	UserID                  string              `json:"user_id,omitempty"`
-	PlanType                string              `json:"plan_type,omitempty"`
-	ProfileUpdatedAt        string              `json:"profile_updated_at,omitempty"`
-	ImageQuotaRemaining     *int                `json:"image_quota_remaining,omitempty"`
-	ImageQuotaResetAt       string              `json:"image_quota_reset_at,omitempty"`
-	QuotaState              QuotaState          `json:"quota_state,omitempty"`
-	QuotaUpdatedAt          string              `json:"quota_updated_at,omitempty"`
-	QuotaStale              bool                `json:"quota_stale,omitempty"`
-	QuotaLastError          string              `json:"quota_last_error,omitempty"`
-	Password                string              `json:"password"`
-	TOTPSecret              string              `json:"totp_secret"`
-	AccessToken             string              `json:"access_token"`
-	RefreshToken            string              `json:"refresh_token"`
-	IDToken                 string              `json:"id_token"`
-	SessionToken            string              `json:"session_token,omitempty"`
-	Expired                 string              `json:"expired"`
-	Cookies                 []Cookie            `json:"cookies"`
-	Persona                 Persona             `json:"persona"`
-	DeviceID                string              `json:"device_id,omitempty"`
-	SessionID               string              `json:"session_id,omitempty"`
-	LifecycleState          LifecycleState      `json:"lifecycle_state"`
-	LifecycleReason         string              `json:"lifecycle_reason"`
-	LifecycleUpdatedAt      string              `json:"lifecycle_updated_at"`
-	LastLoginAt             string              `json:"last_login_at"`
-	LastRefreshAt           string              `json:"last_refresh_at"`
-	LastReloginAt           string              `json:"last_relogin_at"`
+	CredentialSchemaVersion  int                 `json:"credential_schema_version,omitempty"`
+	WebAuthn                 *WebAuthnCredential `json:"webauthn,omitempty"`
+	Type                     string              `json:"type"`
+	CredentialUID            string              `json:"credential_uid,omitempty"`
+	CredentialMode           string              `json:"credential_mode,omitempty"`
+	RefreshStrategy          RefreshStrategy     `json:"refresh_strategy,omitempty"`
+	SourceAuthID             string              `json:"source_auth_id,omitempty"`
+	SourceCredentialUID      string              `json:"source_credential_uid,omitempty"`
+	SourceIdentity           string              `json:"source_identity,omitempty"`
+	SourceProxyURL           string              `json:"source_proxy_url,omitempty"`
+	Email                    string              `json:"email"`
+	AccountID                string              `json:"account_id,omitempty"`
+	UserID                   string              `json:"user_id,omitempty"`
+	PlanType                 string              `json:"plan_type,omitempty"`
+	ProfileUpdatedAt         string              `json:"profile_updated_at,omitempty"`
+	ImageQuotaRemaining      *int                `json:"image_quota_remaining,omitempty"`
+	ImageQuotaResetAt        string              `json:"image_quota_reset_at,omitempty"`
+	QuotaState               QuotaState          `json:"quota_state,omitempty"`
+	QuotaUpdatedAt           string              `json:"quota_updated_at,omitempty"`
+	QuotaStale               bool                `json:"quota_stale,omitempty"`
+	QuotaLastError           string              `json:"quota_last_error,omitempty"`
+	Password                 string              `json:"password"`
+	TOTPSecret               string              `json:"totp_secret"`
+	AccessToken              string              `json:"access_token"`
+	RefreshToken             string              `json:"refresh_token"`
+	IDToken                  string              `json:"id_token"`
+	SessionToken             string              `json:"session_token,omitempty"`
+	Expired                  string              `json:"expired"`
+	Cookies                  []Cookie            `json:"cookies"`
+	Persona                  Persona             `json:"persona"`
+	DeviceID                 string              `json:"device_id,omitempty"`
+	SessionID                string              `json:"session_id,omitempty"`
+	LifecycleState           LifecycleState      `json:"lifecycle_state"`
+	LifecycleReason          string              `json:"lifecycle_reason"`
+	LifecycleUpdatedAt       string              `json:"lifecycle_updated_at"`
+	LastLoginAt              string              `json:"last_login_at"`
+	LastRefreshAt            string              `json:"last_refresh_at"`
+	LastReloginAt            string              `json:"last_relogin_at"`
+	ImportSessionPending     bool                `json:"import_session_refresh_pending,omitempty"`
+	ImportModelsPending      bool                `json:"import_model_validation_pending,omitempty"`
+	ImportAccountInfoPending bool                `json:"import_account_info_refresh_pending,omitempty"`
 }
 
 // CredentialRuntimeIdentityReader derives stable runtime identity bytes for
@@ -252,6 +255,21 @@ func (credential *Credential) ApplyToMetadata(metadata map[string]any) {
 	metadata["last_login_at"] = credential.LastLoginAt
 	metadata["last_refresh_at"] = credential.LastRefreshAt
 	metadata["last_relogin_at"] = credential.LastReloginAt
+	if credential.ImportSessionPending {
+		metadata["import_session_refresh_pending"] = true
+	} else {
+		delete(metadata, "import_session_refresh_pending")
+	}
+	if credential.ImportModelsPending {
+		metadata["import_model_validation_pending"] = true
+	} else {
+		delete(metadata, "import_model_validation_pending")
+	}
+	if credential.ImportAccountInfoPending {
+		metadata["import_account_info_refresh_pending"] = true
+	} else {
+		delete(metadata, "import_account_info_refresh_pending")
+	}
 }
 
 // NormalizeQuotaState derives a safe quota state while preserving unknown data.

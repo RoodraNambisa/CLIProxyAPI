@@ -1187,15 +1187,7 @@ func findExistingChatGPTWebAuth(ctx context.Context, manager *coreauth.Manager, 
 		return nil, nil
 	}
 	email = normalizeChatGPTWebLoginEmail(email)
-	var match *coreauth.Auth
-	auths, errList := manager.CompleteAuthSnapshot(ctx)
-	if errList != nil {
-		return nil, fmt.Errorf("%w: %w", errChatGPTWebCredentialLookup, errList)
-	}
-	for _, candidate := range auths {
-		if candidate == nil || candidate.ID != fileName {
-			continue
-		}
+	if candidate, ok := manager.GetByID(fileName); ok && candidate != nil {
 		if !strings.EqualFold(strings.TrimSpace(candidate.Provider), chatgptwebauth.Provider) {
 			return nil, fmt.Errorf("%w: another provider", errChatGPTWebCredentialIDOwned)
 		}
@@ -1204,6 +1196,37 @@ func findExistingChatGPTWebAuth(ctx context.Context, manager *coreauth.Manager, 
 		}
 		return candidate, nil
 	}
+	if persisted, complete := manager.PersistedAuthByID(fileName); persisted != nil {
+		if !strings.EqualFold(strings.TrimSpace(persisted.Provider), chatgptwebauth.Provider) {
+			return nil, fmt.Errorf("%w: another provider", errChatGPTWebCredentialIDOwned)
+		}
+		if normalizeChatGPTWebLoginEmail(authEmail(persisted)) != email {
+			return nil, fmt.Errorf("%w: another chatgpt web account", errChatGPTWebCredentialIDOwned)
+		}
+		return persisted, nil
+	} else if !complete {
+		if _, errSnapshot := manager.PersistedAuthSnapshot(ctx); errSnapshot != nil {
+			return nil, fmt.Errorf("%w: %w", errChatGPTWebCredentialLookup, errSnapshot)
+		}
+		if persisted, _ = manager.PersistedAuthByID(fileName); persisted != nil {
+			if !strings.EqualFold(strings.TrimSpace(persisted.Provider), chatgptwebauth.Provider) {
+				return nil, fmt.Errorf("%w: another provider", errChatGPTWebCredentialIDOwned)
+			}
+			if normalizeChatGPTWebLoginEmail(authEmail(persisted)) != email {
+				return nil, fmt.Errorf("%w: another chatgpt web account", errChatGPTWebCredentialIDOwned)
+			}
+			return persisted, nil
+		}
+	}
+	auths, complete := manager.ChatGPTWebAuthsByEmail(email)
+	if !complete {
+		var errList error
+		auths, errList = manager.CompleteAuthSnapshot(ctx)
+		if errList != nil {
+			return nil, fmt.Errorf("%w: %w", errChatGPTWebCredentialLookup, errList)
+		}
+	}
+	var match *coreauth.Auth
 	for _, candidate := range auths {
 		if candidate == nil || !strings.EqualFold(strings.TrimSpace(candidate.Provider), chatgptwebauth.Provider) || normalizeChatGPTWebLoginEmail(authEmail(candidate)) != email {
 			continue
@@ -1220,14 +1243,23 @@ func findNamedChatGPTWebAuth(ctx context.Context, manager *coreauth.Manager, fil
 	if manager == nil {
 		return nil, nil
 	}
-	auths, errList := manager.CompleteAuthSnapshot(ctx)
-	if errList != nil {
-		return nil, fmt.Errorf("%w: %w", errChatGPTWebCredentialLookup, errList)
-	}
-	for _, candidate := range auths {
-		if candidate == nil || candidate.ID != fileName {
-			continue
+	if candidate, ok := manager.GetByID(fileName); ok && candidate != nil {
+		if !strings.EqualFold(strings.TrimSpace(candidate.Provider), chatgptwebauth.Provider) {
+			return nil, fmt.Errorf("%w: another provider", errChatGPTWebCredentialIDOwned)
 		}
+		if normalizeChatGPTWebLoginEmail(authEmail(candidate)) != normalizeChatGPTWebLoginEmail(email) {
+			return nil, fmt.Errorf("%w: another chatgpt web account", errChatGPTWebCredentialIDOwned)
+		}
+		return candidate, nil
+	}
+	candidate, complete := manager.PersistedAuthByID(fileName)
+	if !complete {
+		if _, errSnapshot := manager.PersistedAuthSnapshot(ctx); errSnapshot != nil {
+			return nil, fmt.Errorf("%w: %w", errChatGPTWebCredentialLookup, errSnapshot)
+		}
+		candidate, _ = manager.PersistedAuthByID(fileName)
+	}
+	if candidate != nil {
 		if !strings.EqualFold(strings.TrimSpace(candidate.Provider), chatgptwebauth.Provider) {
 			return nil, fmt.Errorf("%w: another provider", errChatGPTWebCredentialIDOwned)
 		}
@@ -1249,18 +1281,24 @@ func chatGPTWebStrongIdentityOwner(ctx context.Context, manager *coreauth.Manage
 	if !coreauth.ChatGPTWebCredentialHasStrongIdentity(incoming) {
 		return nil, nil
 	}
-	auths, errSnapshot := manager.CompleteAuthSnapshot(ctx)
-	if errSnapshot != nil {
-		return nil, fmt.Errorf("%w: %w", errChatGPTWebCredentialLookup, errSnapshot)
-	}
-	reference := coreauth.NewChatGPTWebCredentialReference(incoming)
-	for _, candidate := range auths {
-		if candidate == nil || candidate.ID == excludedID ||
-			!strings.EqualFold(strings.TrimSpace(candidate.Provider), chatgptwebauth.Provider) ||
-			!coreauth.ChatGPTWebCredentialHasStrongIdentity(candidate) {
-			continue
+	conflicts, complete := manager.ChatGPTWebIdentityConflicts(incoming, excludedID)
+	if !complete {
+		auths, errSnapshot := manager.CompleteAuthSnapshot(ctx)
+		if errSnapshot != nil {
+			return nil, fmt.Errorf("%w: %w", errChatGPTWebCredentialLookup, errSnapshot)
 		}
-		if reference.Matches(candidate) {
+		reference := coreauth.NewChatGPTWebCredentialReference(incoming)
+		for _, candidate := range auths {
+			if candidate != nil && candidate.ID != excludedID &&
+				strings.EqualFold(strings.TrimSpace(candidate.Provider), chatgptwebauth.Provider) &&
+				coreauth.ChatGPTWebCredentialHasStrongIdentity(candidate) && reference.Matches(candidate) {
+				return candidate, nil
+			}
+		}
+		return nil, nil
+	}
+	for _, candidate := range conflicts {
+		if coreauth.ChatGPTWebCredentialHasStrongIdentity(candidate) {
 			return candidate, nil
 		}
 	}

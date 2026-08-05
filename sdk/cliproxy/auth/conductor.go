@@ -10803,6 +10803,11 @@ func (m *Manager) refreshAuthExpected(ctx context.Context, id string, expected *
 	if auth == nil || exec == nil {
 		return
 	}
+	if ChatGPTWebImportIntent(auth, ChatGPTWebImportSessionIntent) {
+		ctx = WithChatGPTWebImportPolicy(ctx, ChatGPTWebImportPolicy{
+			ValidateModels: ChatGPTWebImportIntent(auth, ChatGPTWebImportModelsIntent),
+		})
+	}
 	defer releaseRefresh()
 	resolvedRefreshInput, errProxy := m.ResolveProxyAuth(refreshCtx, refreshInput)
 	if errProxy != nil {

@@ -208,7 +208,12 @@ func (h *Handler) PutConfigYAML(c *gin.Context) {
 		}
 	}
 	h.cfg = newCfg
+	mutationTasks := h.chatGPTWebMutationTasks
+	workers := newCfg.ChatGPTWeb.Import.Resolved().Workers
 	h.mu.Unlock()
+	if mutationTasks != nil {
+		mutationTasks.updateWorkerLimit(workers)
+	}
 	c.JSON(http.StatusOK, gin.H{"ok": true, "changed": []string{"config"}})
 }
 

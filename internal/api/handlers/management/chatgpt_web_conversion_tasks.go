@@ -173,18 +173,18 @@ func (h *Handler) runChatGPTWebConversionTask(ctx context.Context, taskID string
 	}
 	jobs := make(chan int)
 	var workers sync.WaitGroup
-	workerCount := min(chatGPTWebMutationTaskWorkers, len(inputs))
+	workerCount := min(chatGPTWebConversionTaskWorkers, len(inputs))
 	workers.Add(workerCount)
 	for range workerCount {
 		go func() {
 			defer workers.Done()
 			for index := range jobs {
-				if !tasks.acquireSlot(ctx) {
+				if !tasks.acquireConversionSlot(ctx) {
 					tasks.setResult(chatGPTWebMutationTaskConversion, taskID, index, canceledChatGPTWebConversionResult(inputs[index]))
 					continue
 				}
 				if !tasks.markRunning(chatGPTWebMutationTaskConversion, taskID, index) {
-					tasks.releaseSlot()
+					tasks.releaseConversionSlot()
 					continue
 				}
 				result := h.executeChatGPTWebConversion(ctx, inputs[index], executor, manager, func() (context.Context, bool) {
@@ -198,7 +198,7 @@ func (h *Handler) runChatGPTWebConversionTask(ctx context.Context, taskID string
 					return commitCtx, true
 				})
 				tasks.setResult(chatGPTWebMutationTaskConversion, taskID, index, result)
-				tasks.releaseSlot()
+				tasks.releaseConversionSlot()
 			}
 		}()
 	}

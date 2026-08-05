@@ -2,7 +2,6 @@ package management
 
 import (
 	"context"
-	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
@@ -16,6 +15,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	chatgptwebauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/chatgptweb"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 )
 
@@ -36,6 +36,10 @@ type chatGPTWebAccountInfoTrigger interface {
 	TriggerAccountInfoRefresh(string, bool) bool
 }
 
+type chatGPTWebAccountInfoStateTrigger interface {
+	TriggerAccountInfoRefreshState(string, bool) string
+}
+
 var errChatGPTWebImportIdentityConflict = errors.New("chatgpt web import identity conflict")
 
 func (h *Handler) chatGPTWebMutationTaskManager() *chatGPTWebMutationTaskManager {
@@ -47,6 +51,11 @@ func (h *Handler) chatGPTWebMutationTaskManager() *chatGPTWebMutationTaskManager
 	if h.chatGPTWebMutationTasks == nil {
 		h.chatGPTWebMutationTasks = newChatGPTWebMutationTaskManager()
 	}
+	workers := config.DefaultChatGPTWebImportWorkers
+	if h.cfg != nil {
+		workers = h.cfg.ChatGPTWeb.Import.Resolved().Workers
+	}
+	h.chatGPTWebMutationTasks.updateWorkerLimit(workers)
 	return h.chatGPTWebMutationTasks
 }
 
@@ -243,18 +252,18 @@ func (h *Handler) runChatGPTWebImportTask(ctx context.Context, taskID string, in
 	}
 	jobs := make(chan int)
 	var workers sync.WaitGroup
-	workerCount := min(chatGPTWebMutationTaskWorkers, len(inputs))
+	workerCount := min(config.MaxChatGPTWebImportWorkers, len(inputs))
 	workers.Add(workerCount)
 	for range workerCount {
 		go func() {
 			defer workers.Done()
 			for index := range jobs {
-				if !tasks.acquireSlot(ctx) {
+				if !tasks.acquireImportSlot(ctx) {
 					tasks.setResult(chatGPTWebMutationTaskImport, taskID, index, canceledChatGPTWebImportResult(inputs[index]))
 					continue
 				}
 				if !tasks.markRunning(chatGPTWebMutationTaskImport, taskID, index) {
-					tasks.releaseSlot()
+					tasks.releaseImportSlot()
 					continue
 				}
 				result := h.executeChatGPTWebImport(ctx, inputs[index], executor, manager, func() (context.Context, bool) {
@@ -267,9 +276,9 @@ func (h *Handler) runChatGPTWebImportTask(ctx context.Context, taskID string, in
 					}
 					return commitCtx, true
 				})
-				triggerChatGPTWebAccountInfoRefreshAfterImport(executor, result)
+				triggerChatGPTWebAccountInfoRefreshAfterImport(executor, &result)
 				tasks.setResult(chatGPTWebMutationTaskImport, taskID, index, result)
-				tasks.releaseSlot()
+				tasks.releaseImportSlot()
 			}
 		}()
 	}
@@ -287,23 +296,32 @@ sendLoop:
 	tasks.finish(chatGPTWebMutationTaskImport, taskID, ctx.Err() != nil)
 }
 
-func triggerChatGPTWebAccountInfoRefreshAfterImport(executor chatGPTWebImportExecutor, result chatGPTWebMutationTaskResult) {
+func triggerChatGPTWebAccountInfoRefreshAfterImport(executor chatGPTWebImportExecutor, result *chatGPTWebMutationTaskResult) {
+	if result == nil || result.AccountInfoRefreshState != "queued" {
+		return
+	}
 	switch result.Status {
 	case "created", "updated", "unchanged":
 	default:
 		return
 	}
 	authID := strings.TrimSpace(result.Name)
-	trigger, ok := executor.(chatGPTWebAccountInfoTrigger)
-	if !ok || authID == "" {
+	if authID == "" {
 		return
 	}
 	// The account-info runtime applies the automatic-refresh switch, TTL,
 	// instance isolation, and queue deduplication to this best-effort trigger.
-	trigger.TriggerAccountInfoRefresh(authID, false)
+	if trigger, ok := executor.(chatGPTWebAccountInfoStateTrigger); ok {
+		result.AccountInfoRefreshState = trigger.TriggerAccountInfoRefreshState(authID, false)
+		return
+	}
+	trigger, ok := executor.(chatGPTWebAccountInfoTrigger)
+	if !ok || !trigger.TriggerAccountInfoRefresh(authID, false) {
+		result.AccountInfoRefreshState = "canceled"
+	}
 }
 
-func (h *Handler) executeChatGPTWebImport(ctx context.Context, input chatGPTWebImportInput, executor chatGPTWebImportExecutor, manager *coreauth.Manager, beginCommit func() (context.Context, bool)) chatGPTWebMutationTaskResult {
+func (h *Handler) executeChatGPTWebImport(ctx context.Context, input chatGPTWebImportInput, _ chatGPTWebImportExecutor, manager *coreauth.Manager, beginCommit func() (context.Context, bool)) chatGPTWebMutationTaskResult {
 	result := chatGPTWebMutationTaskResult{File: input.file, TargetName: input.targetName, Status: "failed"}
 	nameScoped := input.targetName != ""
 	credential, errDecode := chatgptwebauth.DecodeImportCredential(input.data)
@@ -313,88 +331,6 @@ func (h *Handler) executeChatGPTWebImport(ctx context.Context, input chatGPTWebI
 		result.HTTPStatus = http.StatusBadRequest
 		return result
 	}
-	sessionProbeFallback := h.chatGPTWebSessionImportProbeFallbackEnabled(credential, time.Now())
-	protectedRefresh := credential.RefreshStrategy == chatgptwebauth.RefreshStrategyWebOAuthRT ||
-		credential.RefreshStrategy == chatgptwebauth.RefreshStrategyChatGPTSession
-	commitStarted := false
-	var commitCtx context.Context
-	lockedEmail := chatgptwebauth.NormalizeEmail(credential.Email)
-	baseCtx := ctx
-	if protectedRefresh {
-		releaseRefresh, errRefreshLock := manager.LockCredentialRefreshes(baseCtx, chatGPTWebImportRefreshLockIDs(manager, lockedEmail))
-		if errRefreshLock != nil {
-			return failedChatGPTWebMutationResult(result, errRefreshLock)
-		}
-		defer releaseRefresh()
-	}
-	operationCtx, releaseOperation, errOperation := executor.BeginLoginOperation(baseCtx, chatGPTWebImportOperationKey(credential))
-	if errOperation != nil {
-		return failedChatGPTWebMutationResult(result, errOperation)
-	}
-	operationReleased := false
-	defer func() {
-		if !operationReleased {
-			releaseOperation()
-		}
-	}()
-	ctx = operationCtx
-	pending := chatGPTWebImportProbeAuth("chatgpt-web-import-"+uuid.NewString(), credential)
-	var earlyExisting *coreauth.Auth
-	if lockedEmail != "" {
-		fileName := input.targetName
-		if fileName == "" {
-			fileName = chatGPTWebCredentialFileName(lockedEmail)
-		}
-		var errExisting error
-		if nameScoped {
-			earlyExisting, errExisting = findNamedChatGPTWebAuth(ctx, manager, fileName, lockedEmail)
-		} else {
-			earlyExisting, errExisting = findExistingChatGPTWebAuth(ctx, manager, fileName, lockedEmail)
-		}
-		if errExisting != nil {
-			if errors.Is(errExisting, errChatGPTWebCredentialIDOwned) || errors.Is(errExisting, errChatGPTWebCredentialMultiple) {
-				result.ErrorCategory = "identity_conflict"
-				result.Error = "credential conflicts with an existing account"
-				result.HTTPStatus = http.StatusConflict
-				return result
-			}
-			return failedChatGPTWebMutationResult(result, errExisting)
-		}
-		if earlyExisting != nil {
-			pending = earlyExisting
-		} else {
-			pending.ID = fileName
-			pending.FileName = fileName
-		}
-	}
-	releaseProxyBinding := manager.HoldProxyBinding(pending.ID)
-	defer releaseProxyBinding()
-	resolved, errResolve := manager.ResolveProxyAuth(ctx, pending)
-	if errResolve != nil {
-		return failedChatGPTWebMutationResult(result, errResolve)
-	}
-	if protectedRefresh {
-		if beginCommit == nil {
-			result.ErrorCategory = "persist_failed"
-			result.Error = "credential persistence is unavailable"
-			result.HTTPStatus = http.StatusInternalServerError
-			return result
-		}
-		var allowed bool
-		commitCtx, allowed = beginCommit()
-		if !allowed {
-			return canceledChatGPTWebImportResult(input)
-		}
-		commitStarted = true
-		ctx = commitCtx
-	}
-	credential, errNormalize := executor.NormalizeImportedCredential(ctx, credential, resolved.EffectiveProxyURL())
-	if errNormalize != nil {
-		if resolved.EffectiveProxyBindingID() != "" {
-			errNormalize = manager.ReportProxyFailure(ctx, resolved, errNormalize)
-		}
-		return failedChatGPTWebMutationResult(result, errNormalize)
-	}
 	credential.Email = chatgptwebauth.NormalizeEmail(credential.Email)
 	if credential.Email == "" {
 		result.ErrorCategory = "identity_missing"
@@ -403,26 +339,15 @@ func (h *Handler) executeChatGPTWebImport(ctx context.Context, input chatGPTWebI
 		return result
 	}
 	result.Email = credential.Email
-	if protectedRefresh && earlyExisting != nil && lockedEmail != credential.Email {
-		result.ErrorCategory = "identity_conflict"
-		result.Error = "credential identity changed while refreshing an existing account"
-		result.HTTPStatus = http.StatusConflict
+	needsInitialRefresh, errUsable := prepareImportedChatGPTWebCredentialForBackground(credential, time.Now())
+	if errUsable != nil {
+		result.ErrorCategory = "credential_unavailable"
+		result.Error = errUsable.Error()
+		result.HTTPStatus = http.StatusUnprocessableEntity
 		return result
 	}
-	if lockedEmail != credential.Email {
-		releaseOperation()
-		operationReleased = true
-		finalOperationBaseCtx := baseCtx
-		if commitStarted {
-			finalOperationBaseCtx = commitCtx
-		}
-		finalOperationCtx, releaseFinalOperation, errFinalOperation := executor.BeginLoginOperation(finalOperationBaseCtx, credential.Email)
-		if errFinalOperation != nil {
-			return failedChatGPTWebMutationResult(result, errFinalOperation)
-		}
-		defer releaseFinalOperation()
-		ctx = finalOperationCtx
-	}
+	maintenance := h.chatGPTWebImportMaintenancePlan(credential, needsInitialRefresh)
+	maintenance.apply(credential)
 	fileName := input.targetName
 	if fileName == "" {
 		fileName = chatGPTWebCredentialFileName(credential.Email)
@@ -446,33 +371,11 @@ func (h *Handler) executeChatGPTWebImport(ctx context.Context, input chatGPTWebI
 		}
 		return failedChatGPTWebMutationResult(result, errExisting)
 	}
-	finalProxyAuth := chatGPTWebImportProbeAuth(fileName, credential)
-	if existing != nil {
-		finalProxyAuth = existing.Clone()
-		if finalProxyAuth.Metadata == nil {
-			finalProxyAuth.Metadata = make(map[string]any)
-		}
-		credential.ApplyToMetadata(finalProxyAuth.Metadata)
-	}
-	if !protectedRefresh && finalProxyAuth.ID != pending.ID {
-		releaseFinalBinding := manager.HoldProxyBinding(finalProxyAuth.ID)
-		defer releaseFinalBinding()
-		finalResolved, errFinalResolve := manager.ResolveProxyAuth(ctx, finalProxyAuth)
-		if errFinalResolve != nil {
-			return failedChatGPTWebMutationResult(result, errFinalResolve)
-		}
-		resolved = finalResolved
-	}
-	probe := chatGPTWebImportProbeAuth(fileName, credential)
-	probe.ProxyURL = resolved.EffectiveProxyURL()
 	if existing != nil && !nameScoped {
 		candidate := existing.Clone()
 		candidate.Metadata = cloneStringAnyMap(existing.Metadata)
 		credential.ApplyToMetadata(candidate.Metadata)
-		identityChanged := coreauth.ChatGPTWebCredentialIdentityChanged(existing, candidate)
-		if protectedRefresh {
-			identityChanged = coreauth.ChatGPTWebCredentialRefreshIdentityChanged(existing, candidate)
-		}
+		identityChanged := coreauth.ChatGPTWebCredentialRefreshIdentityChanged(existing, candidate)
 		if identityChanged {
 			result.ErrorCategory = "identity_conflict"
 			result.Error = "credential identity conflicts with the existing account"
@@ -480,95 +383,27 @@ func (h *Handler) executeChatGPTWebImport(ctx context.Context, input chatGPTWebI
 			return result
 		}
 	}
-	var (
-		installed *coreauth.Auth
-		status    string
-		unchanged bool
-	)
-	_, errProbe := executor.FetchModels(ctx, probe)
-	if errProbe != nil && sessionProbeFallback && chatGPTWebProbeRejectsCredential(errProbe) {
-		retryCredential := *credential
-		retryCredential.AccessToken = ""
-		retryCredential.Expired = ""
-		refreshed, errRefresh := executor.NormalizeImportedCredential(ctx, &retryCredential, resolved.EffectiveProxyURL())
-		if errRefresh != nil {
-			return failedChatGPTWebMutationResult(result, errRefresh)
-		}
-		refreshed.Email = chatgptwebauth.NormalizeEmail(refreshed.Email)
-		if refreshed.Email == "" || refreshed.Email != credential.Email {
+	reservationMetadata := make(map[string]any)
+	credential.ApplyToMetadata(reservationMetadata)
+	releaseReservation, reservationConflict := h.chatGPTWebMutationTaskManager().reserveImport(fileName, &coreauth.Auth{
+		ID:       fileName,
+		Provider: chatgptwebauth.Provider,
+		Metadata: reservationMetadata,
+	})
+	if reservationConflict != "" {
+		result.HTTPStatus = http.StatusConflict
+		if reservationConflict == "identity" {
 			result.ErrorCategory = "identity_conflict"
-			result.Error = "session refresh returned a different account"
-			result.HTTPStatus = http.StatusConflict
-			return result
-		}
-		if existing != nil && !nameScoped {
-			candidate := existing.Clone()
-			candidate.Metadata = cloneStringAnyMap(existing.Metadata)
-			refreshed.ApplyToMetadata(candidate.Metadata)
-			if coreauth.ChatGPTWebCredentialRefreshIdentityChanged(existing, candidate) {
-				result.ErrorCategory = "identity_conflict"
-				result.Error = "credential identity conflicts with the existing account"
-				result.HTTPStatus = http.StatusConflict
-				return result
-			}
-		}
-		credential = refreshed
-		probe = chatGPTWebImportProbeAuth(fileName, credential)
-		probe.ProxyURL = resolved.EffectiveProxyURL()
-		_, errProbe = executor.FetchModels(ctx, probe)
-	}
-	if errProbe != nil {
-		if resolved.EffectiveProxyBindingID() != "" {
-			errProbe = manager.ReportProxyFailure(ctx, resolved, errProbe)
-		}
-		if !protectedRefresh {
-			return failedChatGPTWebProbeResult(result, errProbe)
-		}
-		if chatGPTWebProbeRejectsCredential(errProbe) {
-			credential.LifecycleState = chatgptwebauth.LifecycleReauthRequired
-			credential.LifecycleReason = "reauth_required"
-			credential.LifecycleUpdatedAt = time.Now().UTC().Format(time.RFC3339)
-		}
-	}
-	if errContext := ctx.Err(); errContext != nil {
-		return canceledChatGPTWebImportResult(input)
-	}
-	if protectedRefresh {
-		var errPersist error
-		installed, status, unchanged, errPersist = h.persistImportedChatGPTWebCredential(ctx, manager, fileName, credential, existing, true, nameScoped)
-		if errors.Is(errPersist, errChatGPTWebImportIdentityConflict) || errors.Is(errPersist, errChatGPTWebCredentialIdentityOwned) {
-			result.ErrorCategory = "identity_conflict"
-			result.Error = "credential conflicts with an existing account"
-			result.HTTPStatus = http.StatusConflict
-			return result
-		}
-		if errors.Is(errPersist, errChatGPTWebCredentialChanged) || errors.Is(errPersist, coreauth.ErrAuthAlreadyExists) {
-			result.ErrorCategory = "credential_changed"
-			result.Error = "credential changed while import was running"
-			result.HTTPStatus = http.StatusConflict
-			return result
-		}
-		if errors.Is(errPersist, errChatGPTWebCredentialLookup) {
-			return failedChatGPTWebMutationResult(result, errPersist)
-		}
-		if errPersist != nil {
-			return failedChatGPTWebPersistenceResult(result, errPersist, "failed to save chatgpt web credential")
-		}
-		result.Name = installed.FileName
-		result.AuthIndex = installed.EnsureIndex()
-		result.CredentialMode = credential.CredentialMode
-		if errConfirm := confirmChatGPTWebImportPersistence(&result, installed, credential); errConfirm != nil {
-			return failedChatGPTWebPersistenceResult(result, errConfirm, "persisted credential could not be verified")
-		}
-		if errProbe != nil {
-			return failedChatGPTWebProbeResult(result, errProbe)
-		}
-		if unchanged {
-			result.Status = "unchanged"
+			result.Error = "credential conflicts with an in-flight account import"
 		} else {
-			result.Status = status
+			result.ErrorCategory = "credential_changed"
+			result.Error = "credential target is being changed by another import"
 		}
 		return result
+	}
+	defer releaseReservation()
+	if errContext := ctx.Err(); errContext != nil {
+		return canceledChatGPTWebImportResult(input)
 	}
 	if beginCommit == nil {
 		result.ErrorCategory = "persist_failed"
@@ -580,10 +415,11 @@ func (h *Handler) executeChatGPTWebImport(ctx context.Context, input chatGPTWebI
 	if !allowed {
 		return canceledChatGPTWebImportResult(input)
 	}
-	commitStarted = true
 	ctx = commitCtx
-	var errPersist error
-	installed, status, unchanged, errPersist = h.persistImportedChatGPTWebCredential(ctx, manager, fileName, credential, existing, false, nameScoped)
+	ctx = coreauth.WithChatGPTWebImportPolicy(ctx, coreauth.ChatGPTWebImportPolicy{
+		ValidateModels: maintenance.validateModels,
+	})
+	installed, status, unchanged, errPersist := h.persistImportedChatGPTWebCredential(ctx, manager, fileName, credential, existing, true, nameScoped)
 	if errors.Is(errPersist, errChatGPTWebImportIdentityConflict) || errors.Is(errPersist, errChatGPTWebCredentialIdentityOwned) {
 		result.ErrorCategory = "identity_conflict"
 		result.Error = "credential conflicts with an existing account"
@@ -613,7 +449,87 @@ func (h *Handler) executeChatGPTWebImport(ctx context.Context, input chatGPTWebI
 	if errConfirm := confirmChatGPTWebImportPersistence(&result, installed, credential); errConfirm != nil {
 		return failedChatGPTWebPersistenceResult(result, errConfirm, "persisted credential could not be verified")
 	}
+	maintenance.assign(&result)
 	return result
+}
+
+type chatGPTWebImportMaintenancePlan struct {
+	refreshSession bool
+	validateModels bool
+	refreshAccount bool
+}
+
+func (plan chatGPTWebImportMaintenancePlan) apply(credential *chatgptwebauth.Credential) {
+	if credential == nil {
+		return
+	}
+	credential.ImportSessionPending = plan.refreshSession
+	credential.ImportModelsPending = plan.validateModels
+	credential.ImportAccountInfoPending = plan.refreshAccount
+}
+
+func (plan chatGPTWebImportMaintenancePlan) assign(result *chatGPTWebMutationTaskResult) {
+	if result == nil {
+		return
+	}
+	result.SessionRefreshState = "skipped"
+	if plan.refreshSession {
+		result.SessionRefreshState = "queued"
+	}
+	result.ModelValidationState = "skipped"
+	if plan.validateModels {
+		result.ModelValidationState = "queued"
+	}
+	result.AccountInfoRefreshState = "skipped"
+	if plan.refreshAccount {
+		result.AccountInfoRefreshState = "queued"
+	}
+}
+
+func prepareImportedChatGPTWebCredentialForBackground(credential *chatgptwebauth.Credential, now time.Time) (bool, error) {
+	if credential == nil {
+		return false, errors.New("credential is unavailable")
+	}
+	hasAccessToken := strings.TrimSpace(credential.AccessToken) != ""
+	accessTokenUsable := hasAccessToken
+	if expiresAt, known := chatGPTWebImportedCredentialExpiry(credential); known {
+		accessTokenUsable = hasAccessToken && expiresAt.After(now)
+	}
+	refreshable := strings.TrimSpace(credential.RefreshToken) != "" ||
+		chatgptwebauth.HasSessionCookieForURL(credential.Cookies, chatgptwebauth.SessionBaseURL)
+	if !accessTokenUsable && !refreshable {
+		return false, errors.New("credential has no usable access token or complete refresh material")
+	}
+	credential.LifecycleUpdatedAt = now.UTC().Format(time.RFC3339Nano)
+	if accessTokenUsable {
+		credential.LifecycleState = chatgptwebauth.LifecycleActive
+		credential.LifecycleReason = ""
+		return false, nil
+	}
+	credential.LifecycleState = chatgptwebauth.LifecycleRefreshing
+	credential.LifecycleReason = "import_refresh_pending"
+	return true, nil
+}
+
+func (h *Handler) chatGPTWebImportMaintenancePlan(credential *chatgptwebauth.Credential, needsInitialRefresh bool) chatGPTWebImportMaintenancePlan {
+	if credential == nil {
+		return chatGPTWebImportMaintenancePlan{}
+	}
+	h.mu.Lock()
+	forceSessionRefresh := true
+	importConfig := config.ResolvedChatGPTWebImportConfig{Workers: config.DefaultChatGPTWebImportWorkers}
+	autoAccountInfo := true
+	if h.cfg != nil {
+		forceSessionRefresh = h.cfg.ChatGPTWeb.ForceSessionRefreshOnImportEnabled()
+		importConfig = h.cfg.ChatGPTWeb.Import.Resolved()
+		autoAccountInfo = h.cfg.ChatGPTWeb.AccountInfo.Resolved().AutomaticRefreshEnabled()
+	}
+	h.mu.Unlock()
+	return chatGPTWebImportMaintenancePlan{
+		refreshSession: needsInitialRefresh || credential.RefreshStrategy == chatgptwebauth.RefreshStrategyChatGPTSession && forceSessionRefresh,
+		validateModels: importConfig.ValidateModelsAfterUpload,
+		refreshAccount: importConfig.RefreshAccountInfoAfterUpload && autoAccountInfo,
+	}
 }
 
 func confirmChatGPTWebImportPersistence(result *chatGPTWebMutationTaskResult, installed *coreauth.Auth, imported *chatgptwebauth.Credential) error {
@@ -641,9 +557,14 @@ func (h *Handler) persistImportedChatGPTWebCredential(ctx context.Context, manag
 	if h == nil || manager == nil || credential == nil {
 		return nil, "", false, errors.New("credential persistence is unavailable")
 	}
-	unlockDependency, errDependencyLock := h.chatGPTWebDependencyMu.lock(ctx)
-	if errDependencyLock != nil {
-		return nil, "", false, errDependencyLock
+	unlockDependency := func() {}
+	dependencyLocked := expected != nil || credential.RefreshStrategy == chatgptwebauth.RefreshStrategyCodexSource
+	if dependencyLocked {
+		var errDependencyLock error
+		unlockDependency, errDependencyLock = h.chatGPTWebDependencyMu.lock(ctx)
+		if errDependencyLock != nil {
+			return nil, "", false, errDependencyLock
+		}
 	}
 	defer unlockDependency()
 	var (
@@ -708,7 +629,9 @@ func (h *Handler) persistImportedChatGPTWebCredential(ctx context.Context, manag
 	}
 	var oldSourceUID string
 	installed, oldSourceUID, err = h.persistChatGPTWebCredentialLocked(ctx, manager, fileName, credential, persistExpected, nil, refreshAware)
-	unlockDependency()
+	if dependencyLocked {
+		unlockDependency()
+	}
 	if err == nil && oldSourceUID != "" && credential.RefreshStrategy != chatgptwebauth.RefreshStrategyCodexSource {
 		h.cleanupRetainedCodexSource(ctx, oldSourceUID)
 	}
@@ -741,34 +664,6 @@ func chatGPTWebImportCredentialFieldsEqual(first, second *coreauth.Auth) bool {
 	return firstErr == nil && secondErr == nil && reflect.DeepEqual(firstCredential, secondCredential)
 }
 
-func chatGPTWebProbeRejectsCredential(err error) bool {
-	status := chatGPTWebErrorStatus(err)
-	return (status == http.StatusUnauthorized || status == http.StatusForbidden) &&
-		strings.HasPrefix(chatGPTWebErrorRequestPath(err), "/backend-api/models")
-}
-
-func (h *Handler) chatGPTWebSessionImportProbeFallbackEnabled(
-	credential *chatgptwebauth.Credential,
-	now time.Time,
-) bool {
-	if credential == nil ||
-		credential.RefreshStrategy != chatgptwebauth.RefreshStrategyChatGPTSession ||
-		strings.TrimSpace(credential.AccessToken) == "" {
-		return false
-	}
-	h.mu.Lock()
-	forceRefresh := true
-	if h.cfg != nil {
-		forceRefresh = h.cfg.ChatGPTWeb.ForceSessionRefreshOnImportEnabled()
-	}
-	h.mu.Unlock()
-	if forceRefresh {
-		return false
-	}
-	expiresAt, known := chatGPTWebImportedCredentialExpiry(credential)
-	return !known || expiresAt.After(now)
-}
-
 func chatGPTWebImportedCredentialExpiry(credential *chatgptwebauth.Credential) (time.Time, bool) {
 	if credential == nil {
 		return time.Time{}, false
@@ -784,56 +679,6 @@ func chatGPTWebImportedCredentialExpiry(credential *chatgptwebauth.Credential) (
 		return expiresAt, true
 	}
 	return chatgptwebauth.JWTExpiry(credential.IDToken)
-}
-
-func chatGPTWebImportRefreshLockIDs(manager *coreauth.Manager, email string) []string {
-	if manager == nil {
-		return nil
-	}
-	email = chatgptwebauth.NormalizeEmail(email)
-	ids := make([]string, 0)
-	if email != "" {
-		ids = append(ids, chatGPTWebCredentialFileName(email))
-	}
-	for _, candidate := range manager.List() {
-		if candidate == nil || !strings.EqualFold(strings.TrimSpace(candidate.Provider), chatgptwebauth.Provider) {
-			continue
-		}
-		if email == "" || chatgptwebauth.NormalizeEmail(authEmail(candidate)) == email {
-			ids = append(ids, candidate.ID)
-		}
-	}
-	return ids
-}
-
-func chatGPTWebImportOperationKey(credential *chatgptwebauth.Credential) string {
-	if credential == nil {
-		return "chatgpt-web-import:empty"
-	}
-	if email := chatgptwebauth.NormalizeEmail(credential.Email); email != "" {
-		return email
-	}
-	hash := sha256.New()
-	_, _ = hash.Write([]byte(credential.RefreshStrategy))
-	_, _ = hash.Write([]byte{0})
-	_, _ = hash.Write([]byte(credential.RefreshToken))
-	_, _ = hash.Write([]byte{0})
-	_, _ = hash.Write([]byte(credential.AccessToken))
-	for index := range credential.Cookies {
-		_, _ = hash.Write([]byte{0})
-		_, _ = hash.Write([]byte(credential.Cookies[index].Name))
-		_, _ = hash.Write([]byte{'='})
-		_, _ = hash.Write([]byte(credential.Cookies[index].Value))
-	}
-	return fmt.Sprintf("chatgpt-web-import:%x", hash.Sum(nil))
-}
-
-func chatGPTWebImportProbeAuth(id string, credential *chatgptwebauth.Credential) *coreauth.Auth {
-	auth := &coreauth.Auth{ID: id, Provider: chatgptwebauth.Provider, FileName: id, Metadata: make(map[string]any)}
-	if credential != nil {
-		credential.ApplyToMetadata(auth.Metadata)
-	}
-	return auth
 }
 
 func importedChatGPTWebCredentialUnchanged(existing *coreauth.Auth, credential *chatgptwebauth.Credential) bool {

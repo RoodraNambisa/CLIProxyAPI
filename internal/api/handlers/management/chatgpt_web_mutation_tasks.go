@@ -3,17 +3,20 @@ package management
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 )
 
 const (
 	chatGPTWebMutationTaskImport     = "import"
 	chatGPTWebMutationTaskConversion = "conversion"
-	chatGPTWebMutationTaskWorkers    = 4
 	chatGPTWebMutationTaskMaxActive  = 4
+	chatGPTWebConversionTaskWorkers  = 4
 )
 
 type chatGPTWebMutationTaskResult struct {
@@ -31,6 +34,9 @@ type chatGPTWebMutationTaskResult struct {
 	ErrorCategory           string   `json:"error_category,omitempty"`
 	Error                   string   `json:"error,omitempty"`
 	HTTPStatus              int      `json:"http_status,omitempty"`
+	SessionRefreshState     string   `json:"session_refresh_state,omitempty"`
+	ModelValidationState    string   `json:"model_validation_state,omitempty"`
+	AccountInfoRefreshState string   `json:"account_info_refresh_state,omitempty"`
 }
 
 type chatGPTWebMutationTask struct {
@@ -50,32 +56,88 @@ type chatGPTWebMutationTask struct {
 	cancel context.CancelFunc
 }
 
+type chatGPTWebImportRuntimeSnapshot struct {
+	QueuedEntries  int `json:"queued_entries"`
+	RunningEntries int `json:"running_entries"`
+	ActiveWorkers  int `json:"active_workers"`
+	WorkerLimit    int `json:"worker_limit"`
+}
+
+type chatGPTWebImportReservation struct {
+	target string
+	auth   *coreauth.Auth
+}
+
 type chatGPTWebMutationTaskManager struct {
-	mu           sync.Mutex
-	tasks        map[string]map[string]*chatGPTWebMutationTask
-	slots        chan struct{}
-	now          func() time.Time
-	rootCtx      context.Context
-	rootCancel   context.CancelFunc
-	workers      sync.WaitGroup
-	shutdownOnce sync.Once
-	shutdownDone chan struct{}
-	closed       bool
+	mu              sync.Mutex
+	tasks           map[string]map[string]*chatGPTWebMutationTask
+	slotMu          sync.Mutex
+	slotCond        *sync.Cond
+	workerLimit     int
+	activeSlots     int
+	nextTicket      uint64
+	servingTicket   uint64
+	canceledTickets map[uint64]struct{}
+	conversionSlots chan struct{}
+	reservationSeq  uint64
+	reservations    map[uint64]chatGPTWebImportReservation
+	now             func() time.Time
+	rootCtx         context.Context
+	rootCancel      context.CancelFunc
+	workers         sync.WaitGroup
+	shutdownOnce    sync.Once
+	shutdownDone    chan struct{}
+	closed          bool
 }
 
 func newChatGPTWebMutationTaskManager() *chatGPTWebMutationTaskManager {
 	rootCtx, rootCancel := context.WithCancel(context.Background())
-	return &chatGPTWebMutationTaskManager{
+	manager := &chatGPTWebMutationTaskManager{
 		tasks: map[string]map[string]*chatGPTWebMutationTask{
 			chatGPTWebMutationTaskImport:     {},
 			chatGPTWebMutationTaskConversion: {},
 		},
-		slots:        make(chan struct{}, chatGPTWebMutationTaskWorkers),
-		now:          time.Now,
-		rootCtx:      rootCtx,
-		rootCancel:   rootCancel,
-		shutdownDone: make(chan struct{}),
+		workerLimit:     config.DefaultChatGPTWebImportWorkers,
+		canceledTickets: make(map[uint64]struct{}),
+		conversionSlots: make(chan struct{}, chatGPTWebConversionTaskWorkers),
+		reservations:    make(map[uint64]chatGPTWebImportReservation),
+		now:             time.Now,
+		rootCtx:         rootCtx,
+		rootCancel:      rootCancel,
+		shutdownDone:    make(chan struct{}),
 	}
+	manager.slotCond = sync.NewCond(&manager.slotMu)
+	return manager
+}
+
+func (m *chatGPTWebMutationTaskManager) reserveImport(target string, auth *coreauth.Auth) (func(), string) {
+	if m == nil || auth == nil {
+		return func() {}, ""
+	}
+	target = strings.TrimSpace(target)
+	m.mu.Lock()
+	for _, current := range m.reservations {
+		if target != "" && strings.EqualFold(target, current.target) {
+			m.mu.Unlock()
+			return nil, "target"
+		}
+		if current.auth != nil && coreauth.ChatGPTWebCredentialIdentityConflict(current.auth, auth) {
+			m.mu.Unlock()
+			return nil, "identity"
+		}
+	}
+	m.reservationSeq++
+	reservationID := m.reservationSeq
+	m.reservations[reservationID] = chatGPTWebImportReservation{target: target, auth: auth.Clone()}
+	m.mu.Unlock()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			m.mu.Lock()
+			delete(m.reservations, reservationID)
+			m.mu.Unlock()
+		})
+	}, ""
 }
 
 func (m *chatGPTWebMutationTaskManager) create(kind string, results []chatGPTWebMutationTaskResult) (*chatGPTWebMutationTask, context.Context, error) {
@@ -247,16 +309,137 @@ func (m *chatGPTWebMutationTaskManager) cancel(kind, id string) (*chatGPTWebMuta
 	return cloneChatGPTWebMutationTask(task), true
 }
 
-func (m *chatGPTWebMutationTaskManager) acquireSlot(ctx context.Context) bool {
+func (m *chatGPTWebMutationTaskManager) acquireImportSlot(ctx context.Context) bool {
+	if m == nil {
+		return false
+	}
+	m.slotMu.Lock()
+	ticket := m.nextTicket
+	m.nextTicket++
+	stopCancel := context.AfterFunc(ctx, func() {
+		m.slotMu.Lock()
+		if ticket >= m.servingTicket {
+			m.canceledTickets[ticket] = struct{}{}
+		}
+		m.advanceCanceledTicketsLocked()
+		m.slotCond.Broadcast()
+		m.slotMu.Unlock()
+	})
+	defer stopCancel()
+	for {
+		m.advanceCanceledTicketsLocked()
+		if ctx.Err() != nil {
+			m.canceledTickets[ticket] = struct{}{}
+			m.advanceCanceledTicketsLocked()
+			m.slotCond.Broadcast()
+			m.slotMu.Unlock()
+			return false
+		}
+		if ticket == m.servingTicket && m.activeSlots < m.workerLimit {
+			m.servingTicket++
+			m.activeSlots++
+			m.advanceCanceledTicketsLocked()
+			m.slotCond.Broadcast()
+			m.slotMu.Unlock()
+			return true
+		}
+		m.slotCond.Wait()
+	}
+}
+
+func (m *chatGPTWebMutationTaskManager) releaseImportSlot() {
+	if m == nil {
+		return
+	}
+	m.slotMu.Lock()
+	if m.activeSlots > 0 {
+		m.activeSlots--
+	}
+	m.slotCond.Broadcast()
+	m.slotMu.Unlock()
+}
+
+func (m *chatGPTWebMutationTaskManager) acquireConversionSlot(ctx context.Context) bool {
+	if m == nil {
+		return false
+	}
 	select {
-	case m.slots <- struct{}{}:
+	case m.conversionSlots <- struct{}{}:
 		return true
 	case <-ctx.Done():
 		return false
 	}
 }
 
-func (m *chatGPTWebMutationTaskManager) releaseSlot() { <-m.slots }
+func (m *chatGPTWebMutationTaskManager) releaseConversionSlot() {
+	if m == nil {
+		return
+	}
+	select {
+	case <-m.conversionSlots:
+	default:
+	}
+}
+
+func (m *chatGPTWebMutationTaskManager) advanceCanceledTicketsLocked() {
+	for {
+		if _, canceled := m.canceledTickets[m.servingTicket]; !canceled {
+			return
+		}
+		delete(m.canceledTickets, m.servingTicket)
+		m.servingTicket++
+	}
+}
+
+func (m *chatGPTWebMutationTaskManager) updateWorkerLimit(workers int) {
+	if m == nil {
+		return
+	}
+	if workers < 1 {
+		workers = config.DefaultChatGPTWebImportWorkers
+	}
+	m.slotMu.Lock()
+	m.workerLimit = workers
+	m.slotCond.Broadcast()
+	m.slotMu.Unlock()
+}
+
+func (m *chatGPTWebMutationTaskManager) workerLimitSnapshot() int {
+	if m == nil {
+		return config.DefaultChatGPTWebImportWorkers
+	}
+	m.slotMu.Lock()
+	workers := m.workerLimit
+	m.slotMu.Unlock()
+	return workers
+}
+
+func (m *chatGPTWebMutationTaskManager) importRuntimeSnapshot() chatGPTWebImportRuntimeSnapshot {
+	if m == nil {
+		return chatGPTWebImportRuntimeSnapshot{}
+	}
+	m.mu.Lock()
+	snapshot := chatGPTWebImportRuntimeSnapshot{}
+	for _, task := range m.tasks[chatGPTWebMutationTaskImport] {
+		if task == nil || isTerminalChatGPTWebLoginTaskState(task.State) {
+			continue
+		}
+		for index := range task.Results {
+			switch task.Results[index].Status {
+			case chatGPTWebLoginResultQueued:
+				snapshot.QueuedEntries++
+			case chatGPTWebLoginResultRunning, chatGPTWebLoginResultCommit:
+				snapshot.RunningEntries++
+			}
+		}
+	}
+	m.mu.Unlock()
+	m.slotMu.Lock()
+	snapshot.ActiveWorkers = m.activeSlots
+	snapshot.WorkerLimit = m.workerLimit
+	m.slotMu.Unlock()
+	return snapshot
+}
 
 func (m *chatGPTWebMutationTaskManager) lifecycleContext() context.Context {
 	if m == nil || m.rootCtx == nil {

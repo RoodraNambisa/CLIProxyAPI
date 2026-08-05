@@ -3,6 +3,7 @@ package auth
 import (
 	"context"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -15,6 +16,31 @@ type autoRefreshShutdownExecutor struct {
 	schedulerProviderTestExecutor
 	started chan struct{}
 	stopped chan struct{}
+}
+
+type importRefreshPolicyHook struct {
+	NoopHook
+	mu       sync.Mutex
+	policies []ChatGPTWebImportPolicy
+	imports  []bool
+}
+
+func (hook *importRefreshPolicyHook) OnAuthUpdated(ctx context.Context, _ *Auth) {
+	policy, imported := ChatGPTWebImportPolicyFromContext(ctx)
+	hook.mu.Lock()
+	hook.policies = append(hook.policies, policy)
+	hook.imports = append(hook.imports, imported)
+	hook.mu.Unlock()
+}
+
+func (hook *importRefreshPolicyHook) last() (ChatGPTWebImportPolicy, bool) {
+	hook.mu.Lock()
+	defer hook.mu.Unlock()
+	if len(hook.policies) == 0 {
+		return ChatGPTWebImportPolicy{}, false
+	}
+	index := len(hook.policies) - 1
+	return hook.policies[index], hook.imports[index]
 }
 
 func (e *autoRefreshShutdownExecutor) Refresh(ctx context.Context, _ *Auth) (*Auth, error) {
@@ -63,6 +89,50 @@ func TestStopAutoRefreshWaitsForWorkers(t *testing.T) {
 	}
 	if !loop.wait(time.Millisecond) {
 		t.Fatal("StopAutoRefresh() returned before refresh loop exited")
+	}
+}
+
+func TestChatGPTWebImportRefreshCarriesModelValidationPolicy(t *testing.T) {
+	for _, testCase := range []struct {
+		name           string
+		validateModels bool
+	}{
+		{name: "disabled", validateModels: false},
+		{name: "enabled", validateModels: true},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			hook := &importRefreshPolicyHook{}
+			manager := NewManager(nil, nil, hook)
+			manager.RegisterExecutor(schedulerProviderTestExecutor{provider: "chatgpt-web"})
+			metadata := map[string]any{
+				"access_token":                "access",
+				"lifecycle_state":             LifecycleStateActive,
+				ChatGPTWebImportSessionIntent: true,
+				ChatGPTWebImportModelsIntent:  testCase.validateModels,
+			}
+			registered, errRegister := manager.Register(WithSkipPersist(t.Context()), &Auth{
+				ID:       "import-refresh-policy-" + testCase.name,
+				Provider: "chatgpt-web",
+				Status:   StatusActive,
+				Metadata: metadata,
+			})
+			if errRegister != nil {
+				t.Fatalf("Register() error = %v", errRegister)
+			}
+
+			manager.mu.RLock()
+			expected := manager.auths[registered.ID]
+			manager.mu.RUnlock()
+			manager.refreshAuthExpected(WithSkipPersist(t.Context()), registered.ID, expected, time.Time{})
+
+			policy, imported := hook.last()
+			if !imported {
+				t.Fatal("refresh hook did not receive the import policy")
+			}
+			if policy.ValidateModels != testCase.validateModels {
+				t.Fatalf("ValidateModels = %v, want %v", policy.ValidateModels, testCase.validateModels)
+			}
+		})
 	}
 }
 

@@ -189,7 +189,7 @@ func (e *ChatGPTWebExecutor) CloseAuthInstanceExecutionSessions(authID string, a
 		}
 		e.accountInfo.removeAuthInstance(authID, authInstanceID)
 	case "auth_removed", "auth_delete_uncertain", "auth_retired", "auth_reloaded",
-		"auth_replaced", "auth_identity_changed":
+		"auth_replaced", "auth_identity_changed", "auth_lifecycle_unavailable":
 		e.accountInfo.removeAuthInstance(authID, authInstanceID)
 	}
 }
@@ -231,6 +231,7 @@ func (e *ChatGPTWebExecutor) UpdateConfig(cfg *config.Config) {
 	}
 	if e.accountInfo != nil {
 		e.accountInfo.updateConfig(snapshot)
+		e.accountInfo.restoreImportAccountInfoIntents()
 	}
 }
 
@@ -383,6 +384,9 @@ func (e *ChatGPTWebExecutor) ShouldRefresh(now time.Time, auth *cliproxyauth.Aut
 	}
 	credential, err := chatgptwebauth.ParseCredential(auth.Metadata)
 	if err != nil || strings.TrimSpace(credential.AccessToken) == "" {
+		return true
+	}
+	if credential.ImportSessionPending {
 		return true
 	}
 	expiresAt, ok := chatGPTWebCredentialExpiry(credential)
@@ -1276,6 +1280,10 @@ func (e *ChatGPTWebExecutor) refreshCredential(ctx context.Context, auth *clipro
 		if result.credential == nil {
 			return nil, errors.New("chatgpt web refresh returned no credential"), false
 		}
+		// The Manager persists the returned credential as the refresh result.
+		// Clearing the import intent here prevents a successful background refresh
+		// from being scheduled repeatedly after the returned auth is installed.
+		result.credential.ImportSessionPending = false
 		return applyChatGPTWebCredential(auth, result.credential), nil, false
 	}
 	if !result.terminal && !chatgptwebauth.IsTerminal(result.err) {

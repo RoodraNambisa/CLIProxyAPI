@@ -636,7 +636,7 @@ func TestAuthHookRetainsModelSyncWhenTransitionWaitIsCanceled(t *testing.T) {
 	}
 }
 
-func TestAuthHookCancellationStillResumesChatGPTWebRelogin(t *testing.T) {
+func TestAuthHookCancellationResumesReloginWithoutStaleModelSync(t *testing.T) {
 	manager := coreauth.NewManager(nil, nil, nil)
 	service := &Service{
 		cfg:         &config.Config{},
@@ -702,8 +702,8 @@ func TestAuthHookCancellationStillResumesChatGPTWebRelogin(t *testing.T) {
 	service.modelSyncMu.Lock()
 	state, queued := service.modelSyncPending[authID]
 	service.modelSyncMu.Unlock()
-	if !queued || (!state.queued && !state.running) {
-		t.Fatalf("canceled model transition did not retain model sync: %#v", state)
+	if queued {
+		t.Fatalf("re-login pending auth retained stale model sync: %#v", state)
 	}
 
 	unlockTransition()
@@ -960,10 +960,11 @@ func TestDeleteCoreAuthCancelsPendingModelSync(t *testing.T) {
 	service := &Service{
 		coreManager: manager,
 		modelSyncPending: map[string]modelSyncTaskState{
-			"deleted": {epoch: 1},
-			"kept":    {epoch: 2},
+			"deleted": {epoch: 1, queued: true},
+			"kept":    {epoch: 2, queued: true},
 		},
-		modelSyncOverflow: []string{"deleted", "kept", "deleted"},
+		modelSyncOverflow:    []string{"deleted", "kept"},
+		modelSyncOverflowSet: map[string]struct{}{"deleted": {}, "kept": {}},
 	}
 	if _, errRegister := manager.Register(coreauth.WithSkipPersist(t.Context()), &coreauth.Auth{
 		ID:       "deleted",
@@ -989,6 +990,151 @@ func TestDeleteCoreAuthCancelsPendingModelSync(t *testing.T) {
 	}
 	if _, pending := service.modelSyncPending["kept"]; !pending {
 		t.Fatal("unrelated pending model sync task was removed")
+	}
+}
+
+func TestCanceledModelSyncOverflowEntryCanRepresentRequeuedTask(t *testing.T) {
+	service := &Service{}
+	_, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	service.modelSyncCancel = cancel
+	service.modelSyncQueue = make(chan string, 1)
+	service.modelSyncQueue <- "busy"
+	service.modelSyncPending = map[string]modelSyncTaskState{
+		"older":  {epoch: 1, queued: true},
+		"reused": {epoch: 2, queued: true},
+	}
+	service.modelSyncOverflow = []string{"older", "reused"}
+	service.modelSyncOverflowSet = map[string]struct{}{"older": {}, "reused": {}}
+
+	service.cancelModelSyncTaskIfEpoch("reused", 2)
+	if !service.enqueueModelSync("reused") {
+		t.Fatal("requeued task was rejected")
+	}
+	if _, active := service.modelSyncOverflowSet["reused"]; !active {
+		t.Fatal("requeued task is not represented by an active overflow generation")
+	}
+
+	if queued := <-service.modelSyncQueue; queued != "busy" {
+		t.Fatalf("queued task = %q, want busy", queued)
+	}
+	service.modelSyncMu.Lock()
+	service.promoteModelSyncOverflowLocked()
+	service.modelSyncMu.Unlock()
+	if queued := <-service.modelSyncQueue; queued != "older" {
+		t.Fatalf("first promoted task = %q, want older", queued)
+	}
+	service.modelSyncMu.Lock()
+	service.promoteModelSyncOverflowLocked()
+	service.modelSyncMu.Unlock()
+	if queued := <-service.modelSyncQueue; queued != "reused" {
+		t.Fatalf("second promoted task = %q, want reused", queued)
+	}
+}
+
+func TestCanceledModelSyncOverflowDoesNotDuplicateDirectRequeue(t *testing.T) {
+	service := &Service{}
+	_, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	service.modelSyncCancel = cancel
+	service.modelSyncQueue = make(chan string, 1)
+	service.modelSyncQueue <- "busy"
+	service.modelSyncPending = map[string]modelSyncTaskState{
+		"reused": {epoch: 1, queued: true},
+	}
+	service.modelSyncOverflow = []string{"reused"}
+	service.modelSyncOverflowSet = map[string]struct{}{"reused": {}}
+
+	service.cancelModelSyncTaskIfEpoch("reused", 1)
+	if queued := <-service.modelSyncQueue; queued != "busy" {
+		t.Fatalf("queued task = %q, want busy", queued)
+	}
+	if !service.enqueueModelSync("reused") {
+		t.Fatal("requeued task was rejected")
+	}
+	queued := <-service.modelSyncQueue
+	if queued != "reused" {
+		t.Fatalf("queued task = %q, want reused", queued)
+	}
+	if _, ok := service.beginModelSyncTask(queued, service.modelSyncGeneration); !ok {
+		t.Fatal("requeued task could not start")
+	}
+	service.modelSyncMu.Lock()
+	service.promoteModelSyncOverflowLocked()
+	overflow := len(service.modelSyncOverflow)
+	service.modelSyncMu.Unlock()
+	if overflow != 0 || len(service.modelSyncQueue) != 0 {
+		t.Fatalf("stale overflow duplicated direct requeue: overflow=%d queued=%d", overflow, len(service.modelSyncQueue))
+	}
+}
+
+func TestChatGPTWebImportPolicyRegistersBuiltinModelsWithoutRemoteSync(t *testing.T) {
+	manager := coreauth.NewManager(nil, nil, nil)
+	service := &Service{
+		cfg:              &config.Config{},
+		coreManager:      manager,
+		modelSyncQueue:   make(chan string, 1),
+		modelSyncPending: make(map[string]modelSyncTaskState),
+	}
+	_, cancel := context.WithCancel(context.Background())
+	service.modelSyncCancel = cancel
+	defer cancel()
+	authID := "chatgpt-web-import-builtins"
+	t.Cleanup(func() { GlobalModelRegistry().UnregisterClient(authID) })
+	installed, errRegister := manager.Register(coreauth.WithSkipPersist(t.Context()), &coreauth.Auth{
+		ID: authID, Provider: "chatgpt-web", Status: coreauth.StatusActive,
+		Metadata: map[string]any{"access_token": "access", "lifecycle_state": coreauth.LifecycleStateActive},
+	})
+	if errRegister != nil {
+		t.Fatal(errRegister)
+	}
+
+	hook := authMaintenanceHook{service: service}
+	hook.OnAuthRegistered(coreauth.WithChatGPTWebImportPolicy(t.Context(), coreauth.ChatGPTWebImportPolicy{}), installed)
+	if models := registry.GetGlobalRegistry().GetModelsForClient(authID); !containsRegisteredModel(models, "gpt-image-2") {
+		t.Fatalf("registered models = %v, want builtin image model", models)
+	}
+	service.modelSyncMu.Lock()
+	_, pending := service.modelSyncPending[authID]
+	service.modelSyncMu.Unlock()
+	if pending || len(service.modelSyncQueue) != 0 {
+		t.Fatal("import with model validation disabled queued remote model synchronization")
+	}
+}
+
+func TestChatGPTWebImportPolicyQueuesOneRemoteModelSyncWhenEnabled(t *testing.T) {
+	manager := coreauth.NewManager(nil, nil, nil)
+	service := &Service{
+		cfg:              &config.Config{},
+		coreManager:      manager,
+		modelSyncQueue:   make(chan string, 2),
+		modelSyncPending: make(map[string]modelSyncTaskState),
+	}
+	_, cancel := context.WithCancel(context.Background())
+	service.modelSyncCancel = cancel
+	defer cancel()
+	authID := "chatgpt-web-import-remote-models"
+	t.Cleanup(func() { GlobalModelRegistry().UnregisterClient(authID) })
+	installed, errRegister := manager.Register(coreauth.WithSkipPersist(t.Context()), &coreauth.Auth{
+		ID: authID, Provider: "chatgpt-web", Status: coreauth.StatusActive,
+		Metadata: map[string]any{"access_token": "access", "lifecycle_state": coreauth.LifecycleStateActive},
+	})
+	if errRegister != nil {
+		t.Fatal(errRegister)
+	}
+
+	hook := authMaintenanceHook{service: service}
+	ctx := coreauth.WithChatGPTWebImportPolicy(t.Context(), coreauth.ChatGPTWebImportPolicy{ValidateModels: true})
+	hook.OnAuthRegistered(ctx, installed)
+	hook.OnAuthUpdated(ctx, installed)
+	if got := len(service.modelSyncQueue); got != 1 {
+		t.Fatalf("queued model sync entries = %d, want 1", got)
+	}
+	service.modelSyncMu.Lock()
+	state, pending := service.modelSyncPending[authID]
+	service.modelSyncMu.Unlock()
+	if !pending || !state.queued {
+		t.Fatalf("model sync state = %#v, pending=%v", state, pending)
 	}
 }
 

@@ -414,6 +414,30 @@ func TestChatGPTWebAccountInfoPeriodicTargetsAreEligibleAndSorted(t *testing.T) 
 	}
 }
 
+func TestChatGPTWebAccountInfoDetailedTriggerReportsQueueReuse(t *testing.T) {
+	manager := cliproxyauth.NewManager(nil, nil, nil)
+	auth := chatGPTWebTestAuth("import-account-info")
+	if _, errRegister := manager.Register(cliproxyauth.WithSkipPersist(t.Context()), auth); errRegister != nil {
+		t.Fatal(errRegister)
+	}
+	runtime := newChatGPTWebAccountInfoRuntime(&ChatGPTWebExecutor{manager: manager}, &config.Config{})
+
+	accepted, reused := runtime.triggerDetailed(auth.ID, false)
+	if !accepted || reused {
+		t.Fatalf("first trigger accepted=%t reused=%t", accepted, reused)
+	}
+	accepted, reused = runtime.triggerDetailed(auth.ID, false)
+	if !accepted || !reused {
+		t.Fatalf("second trigger accepted=%t reused=%t", accepted, reused)
+	}
+	runtime.mu.Lock()
+	queued := runtime.queueLengthLocked()
+	runtime.mu.Unlock()
+	if queued != 1 {
+		t.Fatalf("queued work = %d, want 1", queued)
+	}
+}
+
 func TestChatGPTWebAccountInfoPeriodicSchedulesBeyondQueueCapacity(t *testing.T) {
 	runtime := newChatGPTWebAccountInfoRuntime(nil, nil)
 	runtime.started = true
@@ -3255,6 +3279,41 @@ func TestChatGPTWebAccountInfoRecoverySkipsDisabledAndCleansRemovedAuth(t *testi
 	executor.accountInfo.mu.Unlock()
 	if scheduled {
 		t.Fatal("removed auth retained recovery schedule")
+	}
+}
+
+func TestChatGPTWebAccountInfoInstanceCleanupUsesTargetedQueueIndex(t *testing.T) {
+	runtime := newChatGPTWebAccountInfoRuntime(nil, &config.Config{})
+	t.Cleanup(runtime.close)
+	removedTarget := chatgptwebauth.AccountInfoRefreshTarget{
+		AuthID:         "removed-auth",
+		AuthInstanceID: "removed-instance",
+	}
+	retainedTarget := chatgptwebauth.AccountInfoRefreshTarget{
+		AuthID:         "retained-auth",
+		AuthInstanceID: "retained-instance",
+	}
+
+	runtime.mu.Lock()
+	if !runtime.enqueueLocked(chatGPTWebAccountInfoWork{target: removedTarget, attempt: 1}) ||
+		!runtime.enqueueLocked(chatGPTWebAccountInfoWork{target: retainedTarget, attempt: 1}) {
+		runtime.mu.Unlock()
+		t.Fatal("failed to enqueue account-info work")
+	}
+	runtime.mu.Unlock()
+
+	runtime.removeAuthInstance(removedTarget.AuthID, removedTarget.AuthInstanceID)
+	runtime.mu.Lock()
+	defer runtime.mu.Unlock()
+	if runtime.queuedCount != 1 || runtime.queueLengthLocked() != 1 {
+		t.Fatalf("queued work count = %d/%d, want 1", runtime.queuedCount, runtime.queueLengthLocked())
+	}
+	if work := runtime.queuedWorkForTargetLocked(chatGPTWebAccountInfoTargetKey(removedTarget)); work != nil {
+		t.Fatalf("removed target retained queued work: %+v", work)
+	}
+	work, ok := runtime.dequeueLocked()
+	if !ok || chatGPTWebAccountInfoTargetKey(work.target) != chatGPTWebAccountInfoTargetKey(retainedTarget) {
+		t.Fatalf("dequeued work = %+v, ok=%v", work, ok)
 	}
 }
 

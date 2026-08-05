@@ -29,6 +29,25 @@ func TestChatGPTWebImportSessionRefreshDefaultsEnabled(t *testing.T) {
 	}
 }
 
+func TestChatGPTWebImportConfigDefaultsAndValidation(t *testing.T) {
+	resolved := (ChatGPTWebImportConfig{}).Resolved()
+	if resolved.Workers != 4 || resolved.ValidateModelsAfterUpload || resolved.RefreshAccountInfoAfterUpload {
+		t.Fatalf("Resolved() = %+v", resolved)
+	}
+	for _, workers := range []int{0, 33} {
+		cfg := ChatGPTWebImportConfig{Workers: intPointer(workers)}
+		if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "workers") {
+			t.Fatalf("Validate() workers=%d error = %v", workers, err)
+		}
+	}
+	for _, workers := range []int{1, 32} {
+		cfg := ChatGPTWebImportConfig{Workers: intPointer(workers)}
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("Validate() workers=%d error = %v", workers, err)
+		}
+	}
+}
+
 func TestChatGPTWebAccountInfoConfigValidation(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -60,7 +79,7 @@ func TestChatGPTWebAccountInfoConfigValidation(t *testing.T) {
 
 func TestLoadAndSaveChatGPTWebAccountInfoConfig(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.yaml")
-	data := []byte("chatgpt-web:\n  session-cookie-refresh-on-token-failure: true\n  force-session-refresh-on-import: false\n  account-info:\n    auto-refresh-enabled: false\n    diagnostics-enabled: true\n    raw-quota-response-enabled: true\n    refresh-workers: 2\n    refresh-queue-size: 0\n    refresh-ttl-minutes: 30\n    periodic-refresh-minutes: 0\n    recovery-jitter-seconds: 0\n    max-retries: 0\n")
+	data := []byte("chatgpt-web:\n  session-cookie-refresh-on-token-failure: true\n  force-session-refresh-on-import: false\n  import:\n    workers: 6\n    validate-models-after-upload: true\n    refresh-account-info-after-upload: true\n  account-info:\n    auto-refresh-enabled: false\n    diagnostics-enabled: true\n    raw-quota-response-enabled: true\n    refresh-workers: 2\n    refresh-queue-size: 0\n    refresh-ttl-minutes: 30\n    periodic-refresh-minutes: 0\n    recovery-jitter-seconds: 0\n    max-retries: 0\n")
 	if err := os.WriteFile(path, data, 0o600); err != nil {
 		t.Fatalf("write config: %v", err)
 	}
@@ -82,6 +101,10 @@ func TestLoadAndSaveChatGPTWebAccountInfoConfig(t *testing.T) {
 	if !cfg.ChatGPTWeb.SessionCookieRefreshOnTokenFailure {
 		t.Fatal("session-cookie-refresh-on-token-failure was not loaded")
 	}
+	importConfig := cfg.ChatGPTWeb.Import.Resolved()
+	if importConfig.Workers != 6 || !importConfig.ValidateModelsAfterUpload || !importConfig.RefreshAccountInfoAfterUpload {
+		t.Fatalf("import config = %+v", importConfig)
+	}
 	if errSave := SaveConfigPreserveComments(path, cfg); errSave != nil {
 		t.Fatalf("SaveConfigPreserveComments() error = %v", errSave)
 	}
@@ -92,6 +115,10 @@ func TestLoadAndSaveChatGPTWebAccountInfoConfig(t *testing.T) {
 	for _, expected := range []string{
 		"session-cookie-refresh-on-token-failure: true",
 		"force-session-refresh-on-import: false",
+		"import:",
+		"workers: 6",
+		"validate-models-after-upload: true",
+		"refresh-account-info-after-upload: true",
 		"account-info:",
 		"auto-refresh-enabled: false",
 		"diagnostics-enabled: true",
@@ -121,6 +148,10 @@ func TestLoadConfigRejectsInvalidChatGPTWebAccountInfoFields(t *testing.T) {
 		{name: "null periodic refresh", yaml: "chatgpt-web:\n  account-info:\n    periodic-refresh-minutes: null\n", want: "periodic-refresh-minutes"},
 		{name: "out of range", yaml: "chatgpt-web:\n  account-info:\n    max-retries: 11\n", want: "max-retries"},
 		{name: "periodic refresh out of range", yaml: "chatgpt-web:\n  account-info:\n    periodic-refresh-minutes: 10081\n", want: "periodic-refresh-minutes"},
+		{name: "unknown import field", yaml: "chatgpt-web:\n  import:\n    worker: 4\n", want: "worker"},
+		{name: "null import workers", yaml: "chatgpt-web:\n  import:\n    workers: null\n", want: "workers"},
+		{name: "null import flag", yaml: "chatgpt-web:\n  import:\n    validate-models-after-upload: null\n", want: "validate-models-after-upload"},
+		{name: "import workers out of range", yaml: "chatgpt-web:\n  import:\n    workers: 33\n", want: "workers"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

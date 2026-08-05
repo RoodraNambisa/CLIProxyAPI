@@ -160,7 +160,7 @@ func TestChatGPTWebImportTaskDoesNotRollBackWebAuthnRuntimeState(t *testing.T) {
 	}
 }
 
-func TestChatGPTWebImportTaskTriggersNonForcedAccountInfoRefresh(t *testing.T) {
+func TestChatGPTWebImportTaskQueuesConfiguredAccountInfoRefresh(t *testing.T) {
 	type triggerCall struct {
 		authID string
 		force  bool
@@ -172,6 +172,8 @@ func TestChatGPTWebImportTaskTriggersNonForcedAccountInfoRefresh(t *testing.T) {
 		return true
 	}
 	h, _, _ := newChatGPTWebManagementTestHandler(t, executor)
+	enabled := true
+	h.cfg.ChatGPTWeb.Import.RefreshAccountInfoAfterUpload = &enabled
 	router := chatGPTWebManagementTestRouter(h)
 	task := startChatGPTWebImportTask(t, router, []chatGPTWebImportTestFile{{
 		field: "files",
@@ -181,6 +183,9 @@ func TestChatGPTWebImportTaskTriggersNonForcedAccountInfoRefresh(t *testing.T) {
 	completed := waitForChatGPTWebMutationTask(t, router, chatGPTWebMutationTaskImport, task.ID)
 	if completed.Succeeded != 1 || len(completed.Results) != 1 {
 		t.Fatalf("task = %+v", completed)
+	}
+	if completed.Results[0].AccountInfoRefreshState != "queued" {
+		t.Fatalf("account-info state = %q, want queued", completed.Results[0].AccountInfoRefreshState)
 	}
 	select {
 	case call := <-triggered:
@@ -197,11 +202,40 @@ func TestChatGPTWebImportTaskTriggersNonForcedAccountInfoRefresh(t *testing.T) {
 	}
 }
 
-func TestChatGPTWebImportTaskDoesNotRefreshAccountInfoAfterFailedUpload(t *testing.T) {
-	var triggerCalls atomic.Int32
+func TestChatGPTWebImportTaskReportsReusedAccountInfoRefresh(t *testing.T) {
 	executor := &chatGPTWebManagementTestExecutor{}
+	executor.accountInfoStateFn = func(string, bool) string { return "reused" }
+	h, _, _ := newChatGPTWebManagementTestHandler(t, executor)
+	enabled := true
+	h.cfg.ChatGPTWeb.Import.RefreshAccountInfoAfterUpload = &enabled
+	task := startChatGPTWebImportTask(t, chatGPTWebManagementTestRouter(h), []chatGPTWebImportTestFile{{
+		field: "files",
+		name:  "reused-quota.json",
+		data:  `{"email":"reused-quota@example.com","access_token":"quota-secret"}`,
+	}})
+	completed := waitForChatGPTWebMutationTask(t, chatGPTWebManagementTestRouter(h), chatGPTWebMutationTaskImport, task.ID)
+	if completed.Succeeded != 1 || len(completed.Results) != 1 || completed.Results[0].AccountInfoRefreshState != "reused" {
+		t.Fatalf("task = %+v", completed)
+	}
+}
+
+func TestChatGPTWebImportTaskDoesNotCallUpstreamByDefault(t *testing.T) {
+	var normalizeCalls atomic.Int32
+	var fetchCalls atomic.Int32
+	var triggerCalls atomic.Int32
+	var loginOperationCalls atomic.Int32
+	executor := &chatGPTWebManagementTestExecutor{}
+	executor.beginFn = func(ctx context.Context, _ string) (context.Context, func(), error) {
+		loginOperationCalls.Add(1)
+		return ctx, func() {}, nil
+	}
+	executor.normalizeFn = func(context.Context, *chatgptwebauth.Credential, string) (*chatgptwebauth.Credential, error) {
+		normalizeCalls.Add(1)
+		return nil, errors.New("unexpected normalization")
+	}
 	executor.fetchFn = func(context.Context, *coreauth.Auth) ([]chatgptwebauth.CatalogModel, error) {
-		return nil, errors.New("probe failed")
+		fetchCalls.Add(1)
+		return nil, errors.New("unexpected model probe")
 	}
 	executor.accountInfoTriggerFn = func(string, bool) bool {
 		triggerCalls.Add(1)
@@ -215,11 +249,24 @@ func TestChatGPTWebImportTaskDoesNotRefreshAccountInfoAfterFailedUpload(t *testi
 		data:  `{"email":"invalid@example.com","access_token":"invalid-secret"}`,
 	}})
 	completed := waitForChatGPTWebMutationTask(t, router, chatGPTWebMutationTaskImport, task.ID)
-	if completed.Failed != 1 {
+	if completed.Succeeded != 1 || completed.Failed != 0 {
 		t.Fatalf("task = %+v", completed)
+	}
+	if got := normalizeCalls.Load(); got != 0 {
+		t.Fatalf("normalize calls = %d, want 0", got)
+	}
+	if got := fetchCalls.Load(); got != 0 {
+		t.Fatalf("model probe calls = %d, want 0", got)
 	}
 	if got := triggerCalls.Load(); got != 0 {
 		t.Fatalf("account-info trigger calls = %d, want 0", got)
+	}
+	if got := loginOperationCalls.Load(); got != 0 {
+		t.Fatalf("login operation calls = %d, want 0", got)
+	}
+	result := completed.Results[0]
+	if result.ModelValidationState != "skipped" || result.AccountInfoRefreshState != "skipped" {
+		t.Fatalf("background states = %+v", result)
 	}
 }
 
@@ -301,269 +348,82 @@ func TestChatGPTWebImportTaskRejectsDuplicateCustomNames(t *testing.T) {
 	}
 }
 
-func TestChatGPTWebImportTaskNormalizesSessionOnlyCredential(t *testing.T) {
-	const sessionSecret = "session-secret"
+func TestChatGPTWebImportTaskRejectsSessionOnlyCredentialWithoutLocalIdentity(t *testing.T) {
+	var normalizeCalls atomic.Int32
 	executor := &chatGPTWebManagementTestExecutor{}
-	executor.normalizeFn = func(_ context.Context, credential *chatgptwebauth.Credential, _ string) (*chatgptwebauth.Credential, error) {
-		credential.Email = "session@example.com"
-		credential.AccessToken = "session-access-secret"
-		credential.Expired = time.Now().Add(time.Hour).UTC().Format(time.RFC3339)
-		credential.LifecycleState = chatgptwebauth.LifecycleActive
-		return credential, nil
+	executor.normalizeFn = func(context.Context, *chatgptwebauth.Credential, string) (*chatgptwebauth.Credential, error) {
+		normalizeCalls.Add(1)
+		return nil, errors.New("unexpected normalization")
 	}
 	h, manager, _ := newChatGPTWebManagementTestHandler(t, executor)
-	router := chatGPTWebManagementTestRouter(h)
-
-	task := startChatGPTWebImportTask(t, router, []chatGPTWebImportTestFile{{
-		field: "files",
-		name:  "session.json",
-		data:  `{"session_cookie":"` + sessionSecret + `"}`,
+	task := startChatGPTWebImportTask(t, chatGPTWebManagementTestRouter(h), []chatGPTWebImportTestFile{{
+		field: "files", name: "session.json", data: `{"session_cookie":"session-secret"}`,
 	}})
-	completed := waitForChatGPTWebMutationTask(t, router, chatGPTWebMutationTaskImport, task.ID)
-	if completed.Succeeded != 1 || completed.Results[0].CredentialMode != chatgptwebauth.CredentialModeNative {
+	completed := waitForChatGPTWebMutationTask(t, chatGPTWebManagementTestRouter(h), chatGPTWebMutationTaskImport, task.ID)
+	if completed.Failed != 1 || completed.Results[0].ErrorCategory != "identity_missing" ||
+		completed.Results[0].HTTPStatus != http.StatusUnprocessableEntity {
 		t.Fatalf("task = %+v", completed)
 	}
-	assertChatGPTWebManagementSecretsAbsent(t, mustMarshalChatGPTWebMutationTask(t, completed), sessionSecret, "session-access-secret")
-	stored, ok := manager.GetByID(completed.Results[0].Name)
-	if !ok || stored == nil {
-		t.Fatal("imported session credential is missing")
-	}
-	credential, errParse := chatgptwebauth.ParseCredential(stored.Metadata)
-	if errParse != nil {
-		t.Fatal(errParse)
-	}
-	if credential.RefreshStrategy != chatgptwebauth.RefreshStrategyChatGPTSession || !chatgptwebauth.HasSessionCookie(credential.Cookies) {
-		t.Fatalf("credential = %+v", credential)
+	if normalizeCalls.Load() != 0 || len(manager.List()) != 0 {
+		t.Fatalf("normalize calls = %d, auths = %d", normalizeCalls.Load(), len(manager.List()))
 	}
 }
 
-func TestChatGPTWebImportTaskFallsBackToSessionAfterOpaqueTokenRejection(t *testing.T) {
+func TestChatGPTWebImportTaskPersistsRefreshableCredentialAndQueuesSessionRefresh(t *testing.T) {
 	var normalizeCalls atomic.Int32
 	var fetchCalls atomic.Int32
 	executor := &chatGPTWebManagementTestExecutor{}
-	executor.normalizeFn = func(_ context.Context, credential *chatgptwebauth.Credential, _ string) (*chatgptwebauth.Credential, error) {
+	executor.normalizeFn = func(context.Context, *chatgptwebauth.Credential, string) (*chatgptwebauth.Credential, error) {
 		normalizeCalls.Add(1)
-		if credential.AccessToken == "" {
-			credential.AccessToken = "session-refreshed-access"
-			credential.Expired = time.Now().Add(time.Hour).UTC().Format(time.RFC3339)
-		}
-		credential.LifecycleState = chatgptwebauth.LifecycleActive
-		return credential, nil
+		return nil, errors.New("unexpected normalization")
 	}
-	executor.fetchFn = func(_ context.Context, auth *coreauth.Auth) ([]chatgptwebauth.CatalogModel, error) {
+	executor.fetchFn = func(context.Context, *coreauth.Auth) ([]chatgptwebauth.CatalogModel, error) {
 		fetchCalls.Add(1)
-		credential, errParse := chatgptwebauth.ParseCredential(auth.Metadata)
-		if errParse != nil {
-			return nil, errParse
-		}
-		if credential.AccessToken == "opaque-stale-access" {
-			return nil, conversionStatusError{status: http.StatusUnauthorized, path: "/backend-api/models"}
-		}
-		return nil, nil
+		return nil, errors.New("unexpected model probe")
+	}
+	h, manager, _ := newChatGPTWebManagementTestHandler(t, executor)
+	task := startChatGPTWebImportTask(t, chatGPTWebManagementTestRouter(h), []chatGPTWebImportTestFile{{
+		field: "files", name: "session.json",
+		data: `{"email":"session@example.com","session_cookie":"session-secret"}`,
+	}})
+	completed := waitForChatGPTWebMutationTask(t, chatGPTWebManagementTestRouter(h), chatGPTWebMutationTaskImport, task.ID)
+	if completed.Succeeded != 1 || completed.Results[0].SessionRefreshState != "queued" {
+		t.Fatalf("task = %+v", completed)
+	}
+	if normalizeCalls.Load() != 0 || fetchCalls.Load() != 0 {
+		t.Fatalf("normalize calls = %d, fetch calls = %d", normalizeCalls.Load(), fetchCalls.Load())
+	}
+	stored, ok := manager.GetByID(completed.Results[0].Name)
+	if !ok || stored == nil || stored.LifecycleState() != coreauth.LifecycleStateRefreshing ||
+		!coreauth.ChatGPTWebImportIntent(stored, coreauth.ChatGPTWebImportSessionIntent) {
+		t.Fatalf("stored credential = %#v", stored)
+	}
+}
+
+func TestChatGPTWebImportTaskDoesNotProbeOpaqueValidAccessToken(t *testing.T) {
+	var fetchCalls atomic.Int32
+	executor := &chatGPTWebManagementTestExecutor{}
+	executor.fetchFn = func(context.Context, *coreauth.Auth) ([]chatgptwebauth.CatalogModel, error) {
+		fetchCalls.Add(1)
+		return nil, conversionStatusError{status: http.StatusUnauthorized, path: "/backend-api/models"}
 	}
 	h, manager, _ := newChatGPTWebManagementTestHandler(t, executor)
 	forceRefresh := false
 	h.cfg.ChatGPTWeb.ForceSessionRefreshOnImport = &forceRefresh
-	router := chatGPTWebManagementTestRouter(h)
-
-	task := startChatGPTWebImportTask(t, router, []chatGPTWebImportTestFile{{
-		field: "files",
-		name:  "session-fallback.json",
-		data:  `{"email":"fallback@example.com","access_token":"opaque-stale-access","session_cookie":"session-secret"}`,
+	task := startChatGPTWebImportTask(t, chatGPTWebManagementTestRouter(h), []chatGPTWebImportTestFile{{
+		field: "files", name: "opaque.json",
+		data: `{"email":"opaque@example.com","access_token":"opaque-access","session_cookie":"session-secret"}`,
 	}})
-	completed := waitForChatGPTWebMutationTask(t, router, chatGPTWebMutationTaskImport, task.ID)
-	if completed.Succeeded != 1 || completed.Failed != 0 {
+	completed := waitForChatGPTWebMutationTask(t, chatGPTWebManagementTestRouter(h), chatGPTWebMutationTaskImport, task.ID)
+	if completed.Succeeded != 1 || completed.Results[0].SessionRefreshState != "skipped" {
 		t.Fatalf("task = %+v", completed)
 	}
-	if normalizeCalls.Load() != 2 || fetchCalls.Load() != 2 {
-		t.Fatalf("normalize calls = %d, fetch calls = %d", normalizeCalls.Load(), fetchCalls.Load())
+	if fetchCalls.Load() != 0 {
+		t.Fatalf("fetch calls = %d, want 0", fetchCalls.Load())
 	}
-	stored, ok := manager.GetByID(completed.Results[0].Name)
-	if !ok || stored == nil || stringValue(stored.Metadata, "access_token") != "session-refreshed-access" {
-		t.Fatalf("stored fallback credential = %#v", stored)
-	}
-}
-
-func TestChatGPTWebImportTaskPersistsRotatedRefreshTokenAfterCancellation(t *testing.T) {
-	normalizeStarted := make(chan struct{}, 1)
-	releaseNormalize := make(chan struct{})
-	var fetchCalls atomic.Int32
-	executor := &chatGPTWebManagementTestExecutor{}
-	executor.normalizeFn = func(ctx context.Context, credential *chatgptwebauth.Credential, _ string) (*chatgptwebauth.Credential, error) {
-		normalizeStarted <- struct{}{}
-		<-releaseNormalize
-		if errContext := ctx.Err(); errContext != nil {
-			return nil, errContext
-		}
-		credential.AccessToken = "rotated-access"
-		credential.RefreshToken = "rotated-refresh"
-		credential.Expired = time.Now().Add(time.Hour).UTC().Format(time.RFC3339)
-		credential.LifecycleState = chatgptwebauth.LifecycleActive
-		return credential, nil
-	}
-	executor.fetchFn = func(context.Context, *coreauth.Auth) ([]chatgptwebauth.CatalogModel, error) {
-		fetchCalls.Add(1)
-		return nil, nil
-	}
-	h, manager, _ := newChatGPTWebManagementTestHandler(t, executor)
-	router := chatGPTWebManagementTestRouter(h)
-	task := startChatGPTWebImportTask(t, router, []chatGPTWebImportTestFile{{
-		field: "files", name: "rotating.json",
-		data: `{"email":"rotate@example.com","refresh_strategy":"web_oauth_rt","refresh_token":"old-refresh"}`,
-	}})
-	select {
-	case <-normalizeStarted:
-	case <-time.After(time.Second):
-		t.Fatal("refresh normalization did not start")
-	}
-	canceled := performChatGPTWebManagementRequest(t, router, http.MethodDelete, "/chatgpt-web/import-tasks/"+task.ID, "")
-	if canceled.Code != http.StatusOK {
-		t.Fatalf("cancel status = %d, body=%s", canceled.Code, canceled.Body.String())
-	}
-	close(releaseNormalize)
-	completed := waitForChatGPTWebMutationTask(t, router, chatGPTWebMutationTaskImport, task.ID)
-	if completed.Succeeded != 1 || completed.Results[0].Status != "created" || fetchCalls.Load() != 1 {
-		t.Fatalf("task = %+v, fetch calls = %d", completed, fetchCalls.Load())
-	}
-	stored, ok := manager.GetByID(completed.Results[0].Name)
-	if !ok || stored == nil || stringValue(stored.Metadata, "refresh_token") != "rotated-refresh" {
-		t.Fatalf("stored rotated credential = %#v", stored)
-	}
-}
-
-func TestChatGPTWebImportTaskPersistsRotatedSecretWhenProbeRejectsToken(t *testing.T) {
-	executor := &chatGPTWebManagementTestExecutor{}
-	executor.normalizeFn = func(_ context.Context, credential *chatgptwebauth.Credential, _ string) (*chatgptwebauth.Credential, error) {
-		credential.AccessToken = "rotated-access"
-		credential.RefreshToken = "rotated-refresh"
-		credential.Expired = time.Now().Add(time.Hour).UTC().Format(time.RFC3339)
-		credential.LifecycleState = chatgptwebauth.LifecycleActive
-		return credential, nil
-	}
-	executor.fetchFn = func(context.Context, *coreauth.Auth) ([]chatgptwebauth.CatalogModel, error) {
-		return nil, conversionStatusError{status: http.StatusUnauthorized, path: "/backend-api/models"}
-	}
-	h, manager, store := newChatGPTWebManagementCountingTestHandler(t, executor)
-	router := chatGPTWebManagementTestRouter(h)
-	task := startChatGPTWebImportTask(t, router, []chatGPTWebImportTestFile{{
-		field: "files", name: "rotating.json",
-		data: `{"email":"rejected@example.com","refresh_strategy":"web_oauth_rt","refresh_token":"old-refresh"}`,
-	}})
-	completed := waitForChatGPTWebMutationTask(t, router, chatGPTWebMutationTaskImport, task.ID)
-	if completed.Failed != 1 || completed.Results[0].ErrorCategory != "token_incompatible" || completed.Results[0].Name == "" {
-		t.Fatalf("task = %+v", completed)
-	}
-	stored, ok := manager.GetByID(completed.Results[0].Name)
-	if !ok || stored == nil || stringValue(stored.Metadata, "refresh_token") != "rotated-refresh" ||
-		stored.LifecycleState() != coreauth.LifecycleStateReauthRequired {
-		t.Fatalf("stored rejected credential = %#v", stored)
-	}
-	if got := store.saves.Load(); got != 1 {
-		t.Fatalf("save calls = %d, want 1 final-state write", got)
-	}
-}
-
-func TestChatGPTWebImportTaskKeepsRotatedCredentialActiveOnTemporaryProbeFailure(t *testing.T) {
-	executor := &chatGPTWebManagementTestExecutor{}
-	executor.normalizeFn = func(_ context.Context, credential *chatgptwebauth.Credential, _ string) (*chatgptwebauth.Credential, error) {
-		credential.AccessToken = "rotated-access"
-		credential.RefreshToken = "rotated-refresh"
-		credential.Expired = time.Now().Add(time.Hour).UTC().Format(time.RFC3339)
-		credential.LifecycleState = chatgptwebauth.LifecycleActive
-		return credential, nil
-	}
-	executor.fetchFn = func(context.Context, *coreauth.Auth) ([]chatgptwebauth.CatalogModel, error) {
-		return nil, conversionStatusError{status: http.StatusServiceUnavailable, path: "/backend-api/models"}
-	}
-	h, manager, _ := newChatGPTWebManagementTestHandler(t, executor)
-	router := chatGPTWebManagementTestRouter(h)
-	task := startChatGPTWebImportTask(t, router, []chatGPTWebImportTestFile{{
-		field: "files", name: "rotating.json",
-		data: `{"email":"temporary@example.com","refresh_strategy":"web_oauth_rt","refresh_token":"old-refresh"}`,
-	}})
-	completed := waitForChatGPTWebMutationTask(t, router, chatGPTWebMutationTaskImport, task.ID)
-	if completed.Failed != 1 || completed.Results[0].ErrorCategory != "probe_unavailable" || completed.Results[0].Name == "" {
-		t.Fatalf("task = %+v", completed)
-	}
-	stored, ok := manager.GetByID(completed.Results[0].Name)
-	if !ok || stored == nil || stringValue(stored.Metadata, "refresh_token") != "rotated-refresh" ||
-		stored.LifecycleState() != coreauth.LifecycleStateActive {
-		t.Fatalf("stored credential after temporary probe failure = %#v", stored)
-	}
-}
-
-func TestChatGPTWebTokenOnlyImportCancelsDuringProbeWithoutPersistence(t *testing.T) {
-	probeStarted := make(chan struct{}, 1)
-	executor := &chatGPTWebManagementTestExecutor{}
-	executor.fetchFn = func(ctx context.Context, _ *coreauth.Auth) ([]chatgptwebauth.CatalogModel, error) {
-		probeStarted <- struct{}{}
-		<-ctx.Done()
-		return nil, ctx.Err()
-	}
-	h, manager, _ := newChatGPTWebManagementTestHandler(t, executor)
-	router := chatGPTWebManagementTestRouter(h)
-	task := startChatGPTWebImportTask(t, router, []chatGPTWebImportTestFile{{
-		field: "files", name: "token-only.json",
-		data: `{"email":"cancel-token@example.com","access_token":"token-only-access"}`,
-	}})
-	select {
-	case <-probeStarted:
-	case <-time.After(time.Second):
-		t.Fatal("token-only probe did not start")
-	}
-	if canceled := performChatGPTWebManagementRequest(t, router, http.MethodDelete, "/chatgpt-web/import-tasks/"+task.ID, ""); canceled.Code != http.StatusOK {
-		t.Fatalf("cancel status = %d, body=%s", canceled.Code, canceled.Body.String())
-	}
-	completed := waitForChatGPTWebMutationTask(t, router, chatGPTWebMutationTaskImport, task.ID)
-	if completed.Canceled != 1 || completed.Results[0].Status != chatGPTWebLoginResultCanceled {
-		t.Fatalf("task = %+v", completed)
-	}
-	if _, exists := manager.GetByID(chatGPTWebCredentialFileName("cancel-token@example.com")); exists {
-		t.Fatal("canceled token-only import persisted a credential")
-	}
-}
-
-func TestChatGPTWebImportTaskAllowsOpaqueRefreshTokenRotationForExistingAccount(t *testing.T) {
-	executor := &chatGPTWebManagementTestExecutor{}
-	executor.normalizeFn = func(_ context.Context, credential *chatgptwebauth.Credential, _ string) (*chatgptwebauth.Credential, error) {
-		credential.AccessToken = "access-b"
-		credential.RefreshToken = "refresh-b"
-		credential.Expired = time.Now().Add(time.Hour).UTC().Format(time.RFC3339)
-		credential.LifecycleState = chatgptwebauth.LifecycleActive
-		return credential, nil
-	}
-	h, manager, _ := newChatGPTWebManagementTestHandler(t, executor)
-	router := chatGPTWebManagementTestRouter(h)
-	existingCredential := &chatgptwebauth.Credential{
-		Type: chatgptwebauth.Provider, CredentialUID: "web-uid", RefreshStrategy: chatgptwebauth.RefreshStrategyWebOAuthRT,
-		Email: "rotate-existing@example.com", AccessToken: "access-a", RefreshToken: "refresh-a",
-		Cookies: []chatgptwebauth.Cookie{}, LifecycleState: chatgptwebauth.LifecycleActive,
-	}
-	metadata := make(map[string]any)
-	existingCredential.ApplyToMetadata(metadata)
-	fileName := chatGPTWebCredentialFileName(existingCredential.Email)
-	installedExisting, errRegister := manager.Register(t.Context(), &coreauth.Auth{
-		ID: fileName, FileName: fileName, Provider: chatgptwebauth.Provider, Metadata: metadata, Status: coreauth.StatusActive,
-	})
-	if errRegister != nil {
-		t.Fatal(errRegister)
-	}
-	originalRuntimeInstance := installedExisting.RuntimeInstanceID()
-
-	task := startChatGPTWebImportTask(t, router, []chatGPTWebImportTestFile{{
-		field: "files", name: "rotate.json",
-		data: `{"email":"rotate-existing@example.com","refresh_strategy":"web_oauth_rt","refresh_token":"refresh-a"}`,
-	}})
-	completed := waitForChatGPTWebMutationTask(t, router, chatGPTWebMutationTaskImport, task.ID)
-	if completed.Succeeded != 1 || completed.Results[0].Status != "updated" {
-		t.Fatalf("task = %+v", completed)
-	}
-	current, _ := manager.GetByID(fileName)
-	if got := stringValue(current.Metadata, "refresh_token"); got != "refresh-b" {
-		t.Fatalf("refresh token = %q, want refresh-b", got)
-	}
-	if current.RuntimeInstanceID() != originalRuntimeInstance {
-		t.Fatal("controlled opaque token refresh replaced the runtime credential instance")
+	stored, _ := manager.GetByID(completed.Results[0].Name)
+	if stored == nil || stringValue(stored.Metadata, "access_token") != "opaque-access" || !stored.LifecycleSelectable() {
+		t.Fatalf("stored credential = %#v", stored)
 	}
 }
 
@@ -605,7 +465,7 @@ func TestChatGPTWebImportTaskRejectsStrongIdentityOwnedByAnotherEmail(t *testing
 	}
 }
 
-func TestChatGPTWebImportTaskSerializesExistingCredentialRefresh(t *testing.T) {
+func TestChatGPTWebImportTaskDoesNotWaitForExistingCredentialRefresh(t *testing.T) {
 	beginStarted := make(chan struct{}, 2)
 	normalizeStarted := make(chan struct{}, 1)
 	executor := &chatGPTWebManagementTestExecutor{}
@@ -644,134 +504,17 @@ func TestChatGPTWebImportTaskSerializesExistingCredentialRefresh(t *testing.T) {
 		field: "files", name: "serialized.json",
 		data: `{"email":"serialized@example.com","refresh_strategy":"web_oauth_rt","refresh_token":"old-refresh"}`,
 	}})
-	select {
-	case <-beginStarted:
-		releaseRefresh()
-		t.Fatal("import entered the login operation while the credential refresh lock was held")
-	case <-normalizeStarted:
-		releaseRefresh()
-		t.Fatal("import refreshed while the credential refresh lock was held")
-	case <-time.After(50 * time.Millisecond):
-	}
-	releaseRefresh()
 	completed := waitForChatGPTWebMutationTask(t, router, chatGPTWebMutationTaskImport, task.ID)
+	releaseRefresh()
 	if completed.Succeeded != 1 || completed.Results[0].Status != "updated" {
 		t.Fatalf("task = %+v", completed)
 	}
-}
-
-func TestChatGPTWebImportTaskDoesNotRefreshAgainAfterIdentityResolution(t *testing.T) {
-	var normalizeCalls atomic.Int32
-	executor := &chatGPTWebManagementTestExecutor{}
-	executor.normalizeFn = func(_ context.Context, credential *chatgptwebauth.Credential, proxyURL string) (*chatgptwebauth.Credential, error) {
-		if proxyURL != "socks5h://staging.example:1080" {
-			return nil, errors.New("credential was refreshed through a second proxy")
-		}
-		normalizeCalls.Add(1)
-		credential.Email = "resolved-once@example.com"
-		credential.AccessToken = "resolved-access"
-		credential.Expired = time.Now().Add(time.Hour).UTC().Format(time.RFC3339)
-		credential.LifecycleState = chatgptwebauth.LifecycleActive
-		return credential, nil
-	}
-	h, manager, _ := newChatGPTWebManagementTestHandler(t, executor)
-	resolver := &chatGPTWebImportProxyResolver{finalID: chatGPTWebCredentialFileName("resolved-once@example.com")}
-	manager.SetProxyResolver(resolver)
-	router := chatGPTWebManagementTestRouter(h)
-	task := startChatGPTWebImportTask(t, router, []chatGPTWebImportTestFile{{
-		field: "files", name: "session.json", data: `{"session_cookie":"session-secret"}`,
-	}})
-	completed := waitForChatGPTWebMutationTask(t, router, chatGPTWebMutationTaskImport, task.ID)
-	if completed.Succeeded != 1 || completed.Results[0].Status != "created" {
-		t.Fatalf("task = %+v", completed)
-	}
-	if got := normalizeCalls.Load(); got != 1 {
-		t.Fatalf("normalize calls = %d, want 1", got)
-	}
-	if got := resolver.calls.Load(); got != 1 {
-		t.Fatalf("proxy resolve calls = %d, want one non-destructive staging resolution", got)
-	}
-}
-
-func TestChatGPTWebImportTaskSerializesUnknownIdentityWithExistingRefresh(t *testing.T) {
-	beginStarted := make(chan struct{}, 2)
-	normalizeStarted := make(chan struct{}, 1)
-	executor := &chatGPTWebManagementTestExecutor{}
-	executor.beginFn = func(ctx context.Context, _ string) (context.Context, func(), error) {
-		beginStarted <- struct{}{}
-		return ctx, func() {}, nil
-	}
-	executor.normalizeFn = func(_ context.Context, credential *chatgptwebauth.Credential, _ string) (*chatgptwebauth.Credential, error) {
-		normalizeStarted <- struct{}{}
-		credential.Email = "unknown-existing@example.com"
-		credential.AccessToken = "fresh-session-access"
-		credential.Expired = time.Now().Add(time.Hour).UTC().Format(time.RFC3339)
-		credential.LifecycleState = chatgptwebauth.LifecycleActive
-		return credential, nil
-	}
-	h, manager, _ := newChatGPTWebManagementTestHandler(t, executor)
-	router := chatGPTWebManagementTestRouter(h)
-	existingCredential := &chatgptwebauth.Credential{
-		Type: chatgptwebauth.Provider, CredentialUID: "unknown-existing-uid", Email: "unknown-existing@example.com",
-		AccessToken: "old-session-access", RefreshStrategy: chatgptwebauth.RefreshStrategyChatGPTSession,
-		Cookies:        []chatgptwebauth.Cookie{{Name: "__Secure-next-auth.session-token", Value: "old-session"}},
-		LifecycleState: chatgptwebauth.LifecycleActive,
-	}
-	metadata := make(map[string]any)
-	existingCredential.ApplyToMetadata(metadata)
-	fileName := chatGPTWebCredentialFileName(existingCredential.Email)
-	if _, errRegister := manager.Register(t.Context(), &coreauth.Auth{
-		ID: fileName, FileName: fileName, Provider: chatgptwebauth.Provider, Metadata: metadata,
-	}); errRegister != nil {
-		t.Fatal(errRegister)
-	}
-	releaseRefresh, errLock := manager.LockCredentialRefresh(t.Context(), fileName)
-	if errLock != nil {
-		t.Fatal(errLock)
-	}
-	task := startChatGPTWebImportTask(t, router, []chatGPTWebImportTestFile{{
-		field: "files", name: "session.json", data: `{"session_cookie":"new-session"}`,
-	}})
 	select {
 	case <-beginStarted:
-		releaseRefresh()
-		t.Fatal("unknown-identity import entered login while an existing credential refresh lock was held")
+		t.Fatal("import entered the login operation")
 	case <-normalizeStarted:
-		releaseRefresh()
-		t.Fatal("unknown-identity import bypassed an existing credential refresh lock")
-	case <-time.After(50 * time.Millisecond):
-	}
-	releaseRefresh()
-	completed := waitForChatGPTWebMutationTask(t, router, chatGPTWebMutationTaskImport, task.ID)
-	if completed.Succeeded != 1 || completed.Results[0].Status != "updated" {
-		t.Fatalf("task = %+v", completed)
-	}
-}
-
-func TestChatGPTWebImportTaskReleasesDeclaredIdentityBeforeLockingResolvedIdentity(t *testing.T) {
-	executor := &chatGPTWebManagementTestExecutor{}
-	beginCalls := 0
-	declaredReleased := false
-	executor.beginFn = func(ctx context.Context, _ string) (context.Context, func(), error) {
-		beginCalls++
-		if beginCalls == 2 && !declaredReleased {
-			return nil, nil, errors.New("resolved identity lock acquired while declared identity remained locked")
-		}
-		return ctx, func() { declaredReleased = true }, nil
-	}
-	executor.normalizeFn = func(_ context.Context, credential *chatgptwebauth.Credential, _ string) (*chatgptwebauth.Credential, error) {
-		credential.Email = "resolved@example.com"
-		return credential, nil
-	}
-	h, _, _ := newChatGPTWebManagementTestHandler(t, executor)
-	task := startChatGPTWebImportTask(t, chatGPTWebManagementTestRouter(h), []chatGPTWebImportTestFile{{
-		field: "files",
-		name:  "identity.json",
-		data:  `{"email":"declared@example.com","access_token":"identity-access"}`,
-	}})
-	completed := waitForChatGPTWebMutationTask(t, chatGPTWebManagementTestRouter(h), chatGPTWebMutationTaskImport, task.ID)
-	if completed.Succeeded != 1 || completed.Results[0].Email != "resolved@example.com" || beginCalls != 2 {
-		t.Fatalf("task = %+v, begin calls = %d", completed, beginCalls)
+		t.Fatal("import performed a synchronous credential refresh")
+	default:
 	}
 }
 
@@ -839,42 +582,100 @@ func TestChatGPTWebImportTaskReportsUnchangedAndPreservesLocalFieldsOnUpdate(t *
 	}
 }
 
-func TestChatGPTWebImportTaskRejectsConcurrentCredentialUpdate(t *testing.T) {
-	executor := &chatGPTWebManagementTestExecutor{}
-	h, manager, _ := newChatGPTWebManagementTestHandler(t, executor)
-	credential := &chatgptwebauth.Credential{
-		Type: chatgptwebauth.Provider, CredentialUID: "web-uid", RefreshStrategy: chatgptwebauth.RefreshStrategyTokenOnly,
-		Email: "stale@example.com", AccessToken: "old-access", Expired: time.Now().Add(time.Hour).UTC().Format(time.RFC3339),
-		Cookies: []chatgptwebauth.Cookie{}, Persona: chatgptwebauth.DefaultPersona(), LifecycleState: chatgptwebauth.LifecycleActive,
+func TestChatGPTWebImportTaskSerializesConcurrentCreatesForSameIdentity(t *testing.T) {
+	h, manager, store := newChatGPTWebManagementCountingTestHandler(t, &chatGPTWebManagementTestExecutor{})
+	store.block.Store(true)
+	router := chatGPTWebManagementTestRouter(h)
+	first := startChatGPTWebImportTask(t, router, []chatGPTWebImportTestFile{{
+		field: "files", name: "first.json", data: `{"email":"same-concurrent@example.com","access_token":"first-access"}`,
+	}})
+	select {
+	case <-store.entered:
+	case <-time.After(time.Second):
+		t.Fatal("first import did not reach persistence")
 	}
-	metadata := make(map[string]any)
-	credential.ApplyToMetadata(metadata)
-	fileName := chatGPTWebCredentialFileName(credential.Email)
-	installed, errRegister := manager.Register(t.Context(), &coreauth.Auth{
-		ID: fileName, FileName: fileName, Provider: chatgptwebauth.Provider, Metadata: metadata, Status: coreauth.StatusActive,
-	})
-	if errRegister != nil {
-		t.Fatal(errRegister)
+	second := startChatGPTWebImportTask(t, router, []chatGPTWebImportTestFile{{
+		field: "files", name: "second.json", data: `{"email":"same-concurrent@example.com","access_token":"second-access"}`,
+	}})
+	close(store.release)
+	store.block.Store(false)
+	firstResult := waitForChatGPTWebMutationTask(t, router, chatGPTWebMutationTaskImport, first.ID)
+	secondResult := waitForChatGPTWebMutationTask(t, router, chatGPTWebMutationTaskImport, second.ID)
+	if firstResult.Succeeded != 1 {
+		t.Fatalf("first task = %+v", firstResult)
 	}
-	executor.fetchFn = func(context.Context, *coreauth.Auth) ([]chatgptwebauth.CatalogModel, error) {
-		changed := installed.Clone()
-		changed.Metadata = cloneStringAnyMap(installed.Metadata)
-		changed.Metadata["access_token"] = "concurrent-access"
-		_, errUpdate := manager.Update(coreauth.WithSkipPersist(t.Context()), changed)
-		return nil, errUpdate
+	if secondResult.Failed != 1 || secondResult.Results[0].ErrorCategory != "credential_changed" {
+		t.Fatalf("second task = %+v", secondResult)
 	}
-	payload, errMarshal := json.Marshal(credential)
-	if errMarshal != nil {
-		t.Fatal(errMarshal)
+	if got := len(manager.List()); got != 1 {
+		t.Fatalf("registered credentials = %d, want 1", got)
 	}
-	task := startChatGPTWebImportTask(t, chatGPTWebManagementTestRouter(h), []chatGPTWebImportTestFile{{field: "files", name: "same.json", data: string(payload)}})
-	completed := waitForChatGPTWebMutationTask(t, chatGPTWebManagementTestRouter(h), chatGPTWebMutationTaskImport, task.ID)
-	if completed.Failed != 1 || completed.Results[0].ErrorCategory != "credential_changed" {
+	stored, ok := manager.GetByID(firstResult.Results[0].Name)
+	if !ok || stringValue(stored.Metadata, "access_token") != "first-access" {
+		t.Fatalf("stored credential = %#v", stored)
+	}
+}
+
+func TestChatGPTWebImportTaskReservesStrongIdentityAcrossDistinctNames(t *testing.T) {
+	h, manager, store := newChatGPTWebManagementCountingTestHandler(t, &chatGPTWebManagementTestExecutor{})
+	store.block.Store(true)
+	router := chatGPTWebManagementTestRouter(h)
+	first := startChatGPTWebImportTaskWithNames(t, router, []chatGPTWebImportTestFile{{
+		field: "files", name: "first.json",
+		data: `{"email":"shared@example.com","account_id":"shared-account","user_id":"shared-user","access_token":"first-access"}`,
+	}}, []string{"first-workspace"})
+	select {
+	case <-store.entered:
+	case <-time.After(time.Second):
+		t.Fatal("first import did not reach persistence")
+	}
+
+	second := startChatGPTWebImportTaskWithNames(t, router, []chatGPTWebImportTestFile{{
+		field: "files", name: "second.json",
+		data: `{"email":"shared@example.com","account_id":"shared-account","user_id":"shared-user","access_token":"second-access"}`,
+	}}, []string{"second-workspace"})
+	secondResult := waitForChatGPTWebMutationTask(t, router, chatGPTWebMutationTaskImport, second.ID)
+	if secondResult.Failed != 1 || secondResult.Results[0].ErrorCategory != "identity_conflict" {
+		t.Fatalf("second task = %+v", secondResult)
+	}
+
+	close(store.release)
+	store.block.Store(false)
+	firstResult := waitForChatGPTWebMutationTask(t, router, chatGPTWebMutationTaskImport, first.ID)
+	if firstResult.Succeeded != 1 {
+		t.Fatalf("first task = %+v", firstResult)
+	}
+	if _, exists := manager.GetByID("second-workspace.json"); exists {
+		t.Fatal("conflicting strong identity was persisted under a second name")
+	}
+}
+
+func TestChatGPTWebImportTaskCancellationAfterCommitKeepsPersistedCredential(t *testing.T) {
+	h, manager, store := newChatGPTWebManagementCountingTestHandler(t, &chatGPTWebManagementTestExecutor{})
+	store.block.Store(true)
+	router := chatGPTWebManagementTestRouter(h)
+	task := startChatGPTWebImportTask(t, router, []chatGPTWebImportTestFile{{
+		field: "files", name: "committed.json",
+		data: `{"email":"committed@example.com","access_token":"committed-access"}`,
+	}})
+	select {
+	case <-store.entered:
+	case <-time.After(time.Second):
+		t.Fatal("import did not reach persistence")
+	}
+	if canceled := performChatGPTWebManagementRequest(t, router, http.MethodDelete, "/chatgpt-web/import-tasks/"+task.ID, ""); canceled.Code != http.StatusOK {
+		t.Fatalf("cancel status = %d, body=%s", canceled.Code, canceled.Body.String())
+	}
+	close(store.release)
+	store.block.Store(false)
+
+	completed := waitForChatGPTWebMutationTask(t, router, chatGPTWebMutationTaskImport, task.ID)
+	if completed.Succeeded != 1 || completed.Canceled != 0 || completed.Results[0].Status != "created" {
 		t.Fatalf("task = %+v", completed)
 	}
-	current, ok := manager.GetByID(installed.ID)
-	if !ok || stringValue(current.Metadata, "access_token") != "concurrent-access" {
-		t.Fatalf("concurrent credential update was overwritten: %#v", current)
+	stored, ok := manager.GetByID(completed.Results[0].Name)
+	if !ok || stored == nil || stringValue(stored.Metadata, "access_token") != "committed-access" {
+		t.Fatalf("persisted credential = %#v", stored)
 	}
 }
 
@@ -936,23 +737,6 @@ func chatGPTWebImportWebAuthnFixture(t *testing.T) (payload, privateKeyPKCS8, cr
 		t.Fatalf("DecodeImportCredential() credential=%#v error=%v", credential, errDecode)
 	}
 	return string(raw), credential.WebAuthn.PrivateKeyPKCS8, credential.WebAuthn.CredentialID, credential.WebAuthn.UserHandle
-}
-
-type chatGPTWebImportProxyResolver struct {
-	finalID string
-	calls   atomic.Int32
-}
-
-func (resolver *chatGPTWebImportProxyResolver) Resolve(_ context.Context, auth *coreauth.Auth) (coreauth.ResolvedProxy, error) {
-	resolver.calls.Add(1)
-	if auth != nil && auth.ID == resolver.finalID {
-		return coreauth.ResolvedProxy{URL: "socks5h://final.example:1080"}, nil
-	}
-	return coreauth.ResolvedProxy{URL: "socks5h://staging.example:1080"}, nil
-}
-
-func (*chatGPTWebImportProxyResolver) ReportFailure(_ context.Context, _ *coreauth.Auth, err error) error {
-	return err
 }
 
 func startChatGPTWebImportTask(t *testing.T, router http.Handler, files []chatGPTWebImportTestFile) chatGPTWebMutationTask {

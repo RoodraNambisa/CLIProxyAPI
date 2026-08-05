@@ -569,6 +569,56 @@ func TestChatGPTWebExecutorRefreshUsesStableLegacyRuntimeIdentity(t *testing.T) 
 	}
 }
 
+func TestChatGPTWebExecutorSuccessfulRefreshClearsImportSessionIntent(t *testing.T) {
+	fake := &fakeChatGPTWebAuthService{
+		refreshSessionFn: func(_ context.Context, credential chatgptwebauth.Credential, _ string) (*chatgptwebauth.Credential, error) {
+			credential.AccessToken = "refreshed-token"
+			credential.Expired = time.Now().Add(time.Hour).UTC().Format(time.RFC3339)
+			credential.LifecycleState = chatgptwebauth.LifecycleActive
+			return &credential, nil
+		},
+	}
+	executor := NewChatGPTWebExecutor(&config.Config{}, nil)
+	executor.authService = fake
+	auth := chatGPTWebTestAuth("import-session-intent")
+	auth.Metadata["refresh_strategy"] = string(chatgptwebauth.RefreshStrategyChatGPTSession)
+	auth.Metadata["import_session_refresh_pending"] = true
+	auth.Metadata["cookies"] = []any{map[string]any{
+		"name": "__Secure-next-auth.session-token", "value": "session-token",
+		"domain": ".chatgpt.com", "path": "/", "secure": true, "http_only": true,
+	}}
+
+	updated, errRefresh := executor.Refresh(t.Context(), auth)
+	if errRefresh != nil {
+		t.Fatalf("Refresh() error = %v", errRefresh)
+	}
+	credential, errParse := chatgptwebauth.ParseCredential(updated.Metadata)
+	if errParse != nil {
+		t.Fatal(errParse)
+	}
+	if credential.ImportSessionPending {
+		t.Fatal("successful refresh retained import session intent")
+	}
+	if executor.ShouldRefresh(time.Now(), updated) {
+		t.Fatal("successful refresh remained immediately eligible only because of the import intent")
+	}
+}
+
+func TestChatGPTWebExecutorImportSessionIntentDoesNotBlockUsableAccessToken(t *testing.T) {
+	executor := NewChatGPTWebExecutor(&config.Config{}, nil)
+	auth := chatGPTWebTestAuth("import-session-background")
+	auth.Metadata["refresh_strategy"] = string(chatgptwebauth.RefreshStrategyChatGPTSession)
+	auth.Metadata["import_session_refresh_pending"] = true
+	auth.Metadata["expired"] = time.Now().Add(time.Hour).UTC().Format(time.RFC3339)
+
+	if executor.ShouldPrepareRequestAuth(auth) {
+		t.Fatal("usable access token was synchronously blocked by background import maintenance")
+	}
+	if !executor.ShouldRefresh(time.Now(), auth) {
+		t.Fatal("background import maintenance was not scheduled")
+	}
+}
+
 func TestChatGPTWebExecutorTerminalRefreshLifecycle(t *testing.T) {
 	for _, test := range []struct {
 		name            string
