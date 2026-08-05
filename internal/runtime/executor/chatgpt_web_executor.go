@@ -66,6 +66,7 @@ var errChatGPTWebReloginOwnershipChanged = errors.New("chatgpt web re-login owne
 // Request protocol support is added separately from the credential lifecycle.
 type ChatGPTWebExecutor struct {
 	cfg                       atomic.Pointer[config.Config]
+	configUpdateMu            sync.Mutex
 	manager                   *cliproxyauth.Manager
 	authService               chatGPTWebAuthService
 	runtimeBaseURL            string
@@ -203,6 +204,8 @@ func (e *ChatGPTWebExecutor) UpdateConfig(cfg *config.Config) {
 	if e == nil {
 		return
 	}
+	e.configUpdateMu.Lock()
+	defer e.configUpdateMu.Unlock()
 	if cfg == nil {
 		e.cfg.Store(nil)
 		if e.sentinelRuntime != nil {
