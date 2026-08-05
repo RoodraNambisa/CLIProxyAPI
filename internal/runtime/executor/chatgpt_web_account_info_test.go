@@ -3648,6 +3648,53 @@ func TestChatGPTWebAccountInfoReplacementCleansPassiveNonExhaustedInstanceMappin
 	}
 }
 
+func TestChatGPTWebAccountInfoPassiveStateUsesInstanceIndexes(t *testing.T) {
+	const (
+		authID     = "indexed-passive"
+		instanceID = "instance-a"
+	)
+	runtimeKey := chatGPTWebAccountInfoAuthInstanceKey(authID, instanceID)
+	runtime := &chatGPTWebAccountInfoRuntime{
+		states:                make(map[string]chatgptwebauth.AccountInfoAuthRuntimeState),
+		inflight:              make(map[string]int),
+		pendingTriggers:       make(map[string]chatGPTWebAccountInfoTriggerMode),
+		authEpochRefs:         make(map[string]int),
+		calls:                 make(map[string]*chatGPTWebAccountInfoCall),
+		queuedByTarget:        make(map[string]int),
+		queuedIndicesByTarget: make(map[string]map[int]struct{}),
+		scheduledByTarget:     make(map[string]map[string]*chatGPTWebAccountInfoSchedule),
+		authInstances:         make(map[string]string),
+		runtimeKeysByAuth: map[string]map[string]struct{}{
+			authID: {runtimeKey: {}},
+		},
+	}
+	work := chatGPTWebAccountInfoWork{target: chatgptwebauth.AccountInfoRefreshTarget{
+		AuthID:         authID,
+		AuthInstanceID: instanceID,
+	}}
+	runtime.queue = append(runtime.queue, work)
+	runtime.queuedCount = 1
+	runtime.addQueuedTargetLocked(work, 0)
+
+	if !runtime.hasPassiveAuthState(authID, instanceID) {
+		t.Fatal("indexed queued work was not reported as passive state")
+	}
+	if runtime.hasPassiveAuthState(authID, "different-instance") {
+		t.Fatal("queued work matched a different runtime instance")
+	}
+
+	runtime.queue = nil
+	runtime.queuedCount = 0
+	clear(runtime.queuedByTarget)
+	clear(runtime.queuedIndicesByTarget)
+	runtime.scheduledByTarget[runtimeKey] = map[string]*chatGPTWebAccountInfoSchedule{
+		"retry:" + runtimeKey: {key: "retry:" + runtimeKey, work: work},
+	}
+	if !runtime.hasPassiveAuthState(authID, instanceID) {
+		t.Fatal("indexed scheduled work was not reported as passive state")
+	}
+}
+
 func TestChatGPTWebAccountInfoPersistedRecoveryCannotReviveReplacedInstance(t *testing.T) {
 	manager := cliproxyauth.NewManager(nil, nil, nil)
 	executor := NewChatGPTWebExecutor(&config.Config{}, manager)

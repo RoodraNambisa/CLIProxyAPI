@@ -853,24 +853,6 @@ func chatGPTWebAccountInfoTargetKey(target chatgptwebauth.AccountInfoRefreshTarg
 	return chatGPTWebAccountInfoAuthInstanceKey(target.AuthID, target.AuthInstanceID)
 }
 
-func chatGPTWebAccountInfoTargetsMatch(
-	target chatgptwebauth.AccountInfoRefreshTarget,
-	authID string,
-	authInstanceID string,
-) bool {
-	if strings.TrimSpace(target.AuthID) != strings.TrimSpace(authID) {
-		return false
-	}
-	authInstanceID = strings.TrimSpace(authInstanceID)
-	return authInstanceID == "" || strings.TrimSpace(target.AuthInstanceID) == authInstanceID
-}
-
-func chatGPTWebAccountInfoRuntimeKeyMatchesAuth(runtimeKey, authID string) bool {
-	runtimeKey = strings.TrimSpace(runtimeKey)
-	authID = strings.TrimSpace(authID)
-	return runtimeKey == authID || strings.HasPrefix(runtimeKey, authID+"\x00")
-}
-
 func (runtime *chatGPTWebAccountInfoRuntime) resolveCurrentTarget(
 	target chatgptwebauth.AccountInfoRefreshTarget,
 ) (chatgptwebauth.AccountInfoRefreshTarget, bool) {
@@ -3560,57 +3542,32 @@ func (runtime *chatGPTWebAccountInfoRuntime) hasPassiveAuthState(authID, authIns
 		if runtime.authInstances[authID] == authInstanceID {
 			return true
 		}
-		if _, ok := runtime.states[runtimeKey]; ok {
-			return true
-		}
-		if runtime.inflight[runtimeKey] > 0 ||
-			runtime.pendingTriggers[runtimeKey] != chatGPTWebAccountInfoTriggerNone ||
-			runtime.authEpochRefs[runtimeKey] > 0 ||
-			runtime.calls[runtimeKey] != nil {
-			return true
-		}
-	} else {
-		if _, ok := runtime.authInstances[authID]; ok {
-			return true
-		}
-		for stateKey := range runtime.states {
-			if chatGPTWebAccountInfoRuntimeKeyMatchesAuth(stateKey, authID) {
-				return true
-			}
-		}
-		for stateKey, count := range runtime.inflight {
-			if count > 0 && chatGPTWebAccountInfoRuntimeKeyMatchesAuth(stateKey, authID) {
-				return true
-			}
-		}
-		for stateKey, pending := range runtime.pendingTriggers {
-			if pending != chatGPTWebAccountInfoTriggerNone &&
-				chatGPTWebAccountInfoRuntimeKeyMatchesAuth(stateKey, authID) {
-				return true
-			}
-		}
-		for stateKey, references := range runtime.authEpochRefs {
-			if references > 0 && chatGPTWebAccountInfoRuntimeKeyMatchesAuth(stateKey, authID) {
-				return true
-			}
-		}
-		for _, call := range runtime.calls {
-			if call != nil && strings.TrimSpace(call.authID) == authID {
-				return true
-			}
-		}
+		return runtime.hasPassiveRuntimeKeyLocked(runtimeKey)
 	}
-	for _, work := range runtime.queuedWorkLocked() {
-		if chatGPTWebAccountInfoTargetsMatch(work.target, authID, authInstanceID) {
+	if _, ok := runtime.authInstances[authID]; ok {
+		return true
+	}
+	for key := range runtime.runtimeKeysByAuth[authID] {
+		if runtime.hasPassiveRuntimeKeyLocked(key) {
 			return true
 		}
 	}
-	for _, entry := range runtime.scheduled {
-		if entry != nil && chatGPTWebAccountInfoTargetsMatch(entry.work.target, authID, authInstanceID) {
-			return true
-		}
+	return runtime.hasPassiveRuntimeKeyLocked(authID)
+}
+
+func (runtime *chatGPTWebAccountInfoRuntime) hasPassiveRuntimeKeyLocked(runtimeKey string) bool {
+	if runtime == nil || strings.TrimSpace(runtimeKey) == "" {
+		return false
 	}
-	return false
+	if _, ok := runtime.states[runtimeKey]; ok {
+		return true
+	}
+	return runtime.inflight[runtimeKey] > 0 ||
+		runtime.pendingTriggers[runtimeKey] != chatGPTWebAccountInfoTriggerNone ||
+		runtime.authEpochRefs[runtimeKey] > 0 ||
+		runtime.calls[runtimeKey] != nil ||
+		runtime.targetQueuedLocked(runtimeKey) ||
+		len(runtime.scheduledByTarget[runtimeKey]) > 0
 }
 
 func (runtime *chatGPTWebAccountInfoRuntime) trigger(authID string, force bool) bool {
