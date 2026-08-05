@@ -52,6 +52,7 @@ type serverOptionConfig struct {
 	keepAliveOnTimeout   func()
 	postAuthHook         auth.PostAuthHook
 	authStatusHook       auth.AuthStatusHook
+	authDeleteHook       func(context.Context, []*auth.Auth)
 	dependencyReconcile  func(context.Context, string) ([]string, error)
 	deadAuthDeleteCount  func() uint64
 	proxyPoolManager     *proxypool.Manager
@@ -124,6 +125,13 @@ func WithPostAuthHook(hook auth.PostAuthHook) ServerOption {
 func WithAuthStatusHook(hook auth.AuthStatusHook) ServerOption {
 	return func(cfg *serverOptionConfig) {
 		cfg.authStatusHook = hook
+	}
+}
+
+// WithAuthDeleteHook registers service-owned cleanup after management deletes credentials.
+func WithAuthDeleteHook(hook func(context.Context, []*auth.Auth)) ServerOption {
+	return func(cfg *serverOptionConfig) {
+		cfg.authDeleteHook = hook
 	}
 }
 
@@ -320,6 +328,9 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 	}
 	if optionState.authStatusHook != nil {
 		s.mgmt.SetAuthStatusHook(optionState.authStatusHook)
+	}
+	if optionState.authDeleteHook != nil {
+		s.mgmt.SetAuthDeleteHook(optionState.authDeleteHook)
 	}
 	if optionState.dependencyReconcile != nil {
 		s.mgmt.SetChatGPTWebDependencyReconcileHook(optionState.dependencyReconcile)

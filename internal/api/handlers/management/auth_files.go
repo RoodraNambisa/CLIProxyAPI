@@ -2384,6 +2384,15 @@ func (h *Handler) deleteAuthFileByNameAtRootExpected(ctx context.Context, root *
 		return displayName, http.StatusInternalServerError, errDelete
 	}
 	authfileguard.ClearRetiredSnapshot(retiredSnapshot)
+	deletedAuthsByID := make(map[string]*coreauth.Auth, len(runtimeAuths)+1)
+	if targetAuth != nil && strings.TrimSpace(targetAuth.ID) != "" {
+		deletedAuthsByID[targetAuth.ID] = targetAuth.Clone()
+	}
+	for _, auth := range runtimeAuths {
+		if auth != nil && strings.TrimSpace(auth.ID) != "" {
+			deletedAuthsByID[auth.ID] = auth.Clone()
+		}
+	}
 	if h.authManager != nil {
 		remainingByID := make(map[string]*coreauth.Auth, len(runtimeAuths))
 		for _, auth := range runtimeAuths {
@@ -2414,7 +2423,29 @@ func (h *Handler) deleteAuthFileByNameAtRootExpected(ctx context.Context, root *
 			}
 		}
 	}
+	h.notifyManagedAuthDeleted(lockedCtx, deletedAuthsByID)
 	return displayName, http.StatusOK, nil
+}
+
+func (h *Handler) notifyManagedAuthDeleted(ctx context.Context, authsByID map[string]*coreauth.Auth) {
+	if h == nil || h.authDeleteHook == nil || len(authsByID) == 0 {
+		return
+	}
+	auths := make([]*coreauth.Auth, 0, len(authsByID))
+	for _, auth := range authsByID {
+		if auth != nil {
+			auths = append(auths, auth.Clone())
+		}
+	}
+	if len(auths) == 0 {
+		return
+	}
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			log.Errorf("managed auth delete cleanup hook panicked: %v", recovered)
+		}
+	}()
+	h.authDeleteHook(ctx, auths)
 }
 
 func managedAuthFileProviderAtRoot(root *os.Root, authDir, name string) string {

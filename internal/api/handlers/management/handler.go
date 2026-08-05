@@ -84,6 +84,7 @@ type Handler struct {
 	logDir                  string
 	postAuthHook            coreauth.PostAuthHook
 	authStatusHook          coreauth.AuthStatusHook
+	authDeleteHook          func(context.Context, []*coreauth.Auth)
 	dependencyReconcileHook func(context.Context, string) ([]string, error)
 	deadAuthDeleteCount     func() uint64
 	proxyPoolManager        *proxypool.Manager
@@ -306,6 +307,11 @@ func (h *Handler) SetPostAuthHook(hook coreauth.PostAuthHook) {
 // SetAuthStatusHook registers a hook to be called after auth status changes.
 func (h *Handler) SetAuthStatusHook(hook coreauth.AuthStatusHook) {
 	h.authStatusHook = hook
+}
+
+// SetAuthDeleteHook registers service-owned cleanup after managed credentials are deleted.
+func (h *Handler) SetAuthDeleteHook(hook func(context.Context, []*coreauth.Auth)) {
+	h.authDeleteHook = hook
 }
 
 // SetChatGPTWebDependencyReconcileHook registers the service-level dependency cleanup hook.

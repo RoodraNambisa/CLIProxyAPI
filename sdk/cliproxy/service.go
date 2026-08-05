@@ -821,6 +821,39 @@ func (s *Service) removeUsageStatisticsForAuthIDs(ids []string, reason string) i
 	return s.removeUsageStatisticsForAuthIndexes(s.usageAuthIndexesForIDs(ids), reason)
 }
 
+func (s *Service) handleManagementAuthDelete(ctx context.Context, auths []*coreauth.Auth) {
+	if s == nil || s.coreManager == nil || len(auths) == 0 {
+		return
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	for _, deleted := range auths {
+		if deleted == nil || strings.TrimSpace(deleted.ID) == "" {
+			continue
+		}
+		deleted = deleted.Clone()
+		lockedCtx, unlockMutation, errLock := s.coreManager.LockAuthMutation(ctx, deleted)
+		if errLock != nil {
+			log.WithError(errLock).WithField("auth_id", deleted.ID).Warn("failed to lock management delete cleanup")
+			continue
+		}
+		if _, exists := s.coreManager.GetByID(deleted.ID); exists {
+			unlockMutation()
+			continue
+		}
+		s.cancelModelSyncTask(deleted.ID)
+		executorhelps.CloseProxyTransportCachesForAuth(deleted.ID)
+		s.antigravityModelCapabilities.Delete(deleted.ID)
+		s.cleanupChatGPTWebModelResourcesAfterDelete(lockedCtx, deleted.ID, deleted.RuntimeInstanceID())
+		index := strings.TrimSpace(deleted.EnsureIndex())
+		if index != "" {
+			s.removeUsageStatisticsForAuthIndexes([]string{index}, "management auth delete")
+		}
+		unlockMutation()
+	}
+}
+
 func (s *Service) snapshotAuthMaintenanceConfig() (config.AuthMaintenanceConfig, string) {
 	if s == nil {
 		return config.AuthMaintenanceConfig{
@@ -4036,6 +4069,7 @@ func (s *Service) Run(ctx context.Context) error {
 	// handlers no longer depend on legacy clients; pass nil slice initially
 	serverOpts := append([]api.ServerOption(nil), s.serverOptions...)
 	serverOpts = append(serverOpts, api.WithAuthStatusHook(s.handleManagementAuthStatusChange))
+	serverOpts = append(serverOpts, api.WithAuthDeleteHook(s.handleManagementAuthDelete))
 	serverOpts = append(serverOpts, api.WithChatGPTWebDependencyReconcileHook(s.reconcileChatGPTWebDependencies))
 	serverOpts = append(serverOpts, api.WithChatGPTWebDeadAuthDeleteCountProvider(s.chatGPTWebDeadAuthDeletedCount.Load))
 	serverOpts = append(serverOpts, api.WithProxyPoolManager(s.proxyPoolManager))

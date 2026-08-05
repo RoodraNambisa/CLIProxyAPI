@@ -1266,6 +1266,14 @@ func TestDeleteAuthFileRemovesAllRuntimeAuthsSharingBackingPath(t *testing.T) {
 	}
 	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, manager)
 	h.tokenStore = &memoryAuthStore{items: storeItems}
+	deletedByHook := make(map[string]struct{})
+	h.SetAuthDeleteHook(func(_ context.Context, auths []*coreauth.Auth) {
+		for _, auth := range auths {
+			if auth != nil {
+				deletedByHook[auth.ID] = struct{}{}
+			}
+		}
+	})
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 		defer cancel()
@@ -1289,6 +1297,9 @@ func TestDeleteAuthFileRemovesAllRuntimeAuthsSharingBackingPath(t *testing.T) {
 	for _, id := range []string{"shared-first", "shared-second"} {
 		if auth, exists := manager.GetByID(id); exists || auth != nil {
 			t.Fatalf("shared runtime auth %s remained: %#v", id, auth)
+		}
+		if _, notified := deletedByHook[id]; !notified {
+			t.Fatalf("shared runtime auth %s was not sent to the delete cleanup hook", id)
 		}
 	}
 }

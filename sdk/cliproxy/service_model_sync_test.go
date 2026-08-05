@@ -17,9 +17,11 @@ import (
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/authfileguard"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
+	internalusage "github.com/router-for-me/CLIProxyAPI/v6/internal/usage"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/watcher"
 	sdkauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/auth"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
+	coreusage "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/usage"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/config"
 )
 
@@ -987,6 +989,95 @@ func TestDeleteCoreAuthCancelsPendingModelSync(t *testing.T) {
 	}
 	if _, pending := service.modelSyncPending["kept"]; !pending {
 		t.Fatal("unrelated pending model sync task was removed")
+	}
+}
+
+func TestManagementAuthDeleteCleansExactServiceState(t *testing.T) {
+	manager := coreauth.NewManager(nil, nil, nil)
+	stats := internalusage.NewRequestStatistics()
+	authDir := t.TempDir()
+	service := &Service{
+		cfg:         &config.Config{AuthDir: authDir, UsageStatisticsEnabled: true},
+		coreManager: manager,
+		usageStats:  stats,
+		modelSyncPending: map[string]modelSyncTaskState{
+			"deleted": {epoch: 1},
+		},
+	}
+	installed, errRegister := manager.Register(coreauth.WithSkipPersist(t.Context()), &coreauth.Auth{
+		ID:       "deleted",
+		Provider: "chatgpt-web",
+		Status:   coreauth.StatusActive,
+	})
+	if errRegister != nil {
+		t.Fatal(errRegister)
+	}
+	service.chatGPTWebModelCatalog.Store(installed.ID, []string{"gpt-image-2"})
+	stats.Record(t.Context(), coreusage.Record{
+		APIKey:      "test-key",
+		Model:       "gpt-image-2",
+		AuthIndex:   installed.EnsureIndex(),
+		RequestedAt: time.Now(),
+	})
+	if errDelete := manager.Delete(coreauth.WithSkipPersist(t.Context()), installed.ID); errDelete != nil {
+		t.Fatal(errDelete)
+	}
+
+	service.handleManagementAuthDelete(t.Context(), []*coreauth.Auth{installed})
+
+	service.modelSyncMu.Lock()
+	_, pending := service.modelSyncPending[installed.ID]
+	service.modelSyncMu.Unlock()
+	if pending {
+		t.Fatal("deleted auth remained in pending model sync tasks")
+	}
+	if _, cached := service.chatGPTWebModelCatalog.Load(installed.ID); cached {
+		t.Fatal("deleted auth remained in the ChatGPT Web model catalog")
+	}
+	if got := stats.Snapshot().TotalRequests; got != 0 {
+		t.Fatalf("usage requests after exact auth cleanup = %d, want 0", got)
+	}
+}
+
+func TestManagementAuthDeleteDoesNotCleanReplacementState(t *testing.T) {
+	manager := coreauth.NewManager(nil, nil, nil)
+	service := &Service{
+		cfg:         &config.Config{},
+		coreManager: manager,
+		modelSyncPending: map[string]modelSyncTaskState{
+			"shared-id": {epoch: 1},
+		},
+	}
+	removed, errRegister := manager.Register(coreauth.WithSkipPersist(t.Context()), &coreauth.Auth{
+		ID:       "shared-id",
+		Provider: "chatgpt-web",
+		Status:   coreauth.StatusActive,
+	})
+	if errRegister != nil {
+		t.Fatal(errRegister)
+	}
+	if errDelete := manager.Delete(coreauth.WithSkipPersist(t.Context()), removed.ID); errDelete != nil {
+		t.Fatal(errDelete)
+	}
+	if _, errRegister = manager.Register(coreauth.WithSkipPersist(t.Context()), &coreauth.Auth{
+		ID:       removed.ID,
+		Provider: "chatgpt-web",
+		Status:   coreauth.StatusActive,
+	}); errRegister != nil {
+		t.Fatal(errRegister)
+	}
+	service.chatGPTWebModelCatalog.Store(removed.ID, []string{"replacement-model"})
+
+	service.handleManagementAuthDelete(t.Context(), []*coreauth.Auth{removed})
+
+	service.modelSyncMu.Lock()
+	_, pending := service.modelSyncPending[removed.ID]
+	service.modelSyncMu.Unlock()
+	if !pending {
+		t.Fatal("replacement model sync task was removed by stale delete cleanup")
+	}
+	if _, cached := service.chatGPTWebModelCatalog.Load(removed.ID); !cached {
+		t.Fatal("replacement model catalog was removed by stale delete cleanup")
 	}
 }
 
