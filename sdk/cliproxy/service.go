@@ -130,6 +130,11 @@ type Service struct {
 	modelSyncOverflowToken     map[string]uint64
 	modelSyncOverflowNextToken uint64
 
+	// chatGPTWebImportModelsEnabled tracks the last model-validation setting
+	// applied by the Service. Management endpoints mutate the shared config
+	// before the file watcher reloads it, so pointer comparison is insufficient.
+	chatGPTWebImportModelsEnabled atomic.Bool
+
 	// modelSyncMutationLockedObserved is used by concurrency tests to observe
 	// the exact point where model synchronization owns the auth mutation lock.
 	modelSyncMutationLockedObserved func(*coreauth.Auth)
@@ -3676,6 +3681,21 @@ func (s *Service) cancelQueuedImportModelSyncTasks() {
 	s.modelSyncMu.Unlock()
 }
 
+func (s *Service) applyChatGPTWebImportModelValidationConfig(ctx context.Context, enabled bool) {
+	if s == nil {
+		return
+	}
+	previous := s.chatGPTWebImportModelsEnabled.Swap(enabled)
+	if previous == enabled {
+		return
+	}
+	if enabled {
+		s.restoreChatGPTWebImportModelIntents(ctx)
+		return
+	}
+	s.cancelQueuedImportModelSyncTasks()
+}
+
 func (s *Service) beginModelSyncTask(authID string, generation uint64) (uint64, bool) {
 	epoch, _, ok := s.beginModelSyncTaskWithKind(authID, generation)
 	return epoch, ok
@@ -4384,6 +4404,9 @@ func (s *Service) Run(ctx context.Context) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	s.chatGPTWebImportModelsEnabled.Store(
+		s.cfg != nil && s.cfg.ChatGPTWeb.Import.Resolved().ValidateModelsAfterUpload,
+	)
 
 	sdkusage.StartDefault(ctx)
 
@@ -4650,13 +4673,8 @@ func (s *Service) Run(ctx context.Context) error {
 				s.refreshChatGPTWebModelRegistration(ctx, auth)
 			}
 		}
-		previousImportModels := previousCfgSnapshot != nil && previousCfgSnapshot.ChatGPTWeb.Import.Resolved().ValidateModelsAfterUpload
 		nextImportModels := newCfg.ChatGPTWeb.Import.Resolved().ValidateModelsAfterUpload
-		if !previousImportModels && nextImportModels {
-			s.restoreChatGPTWebImportModelIntents(ctx)
-		} else if previousImportModels && !nextImportModels {
-			s.cancelQueuedImportModelSyncTasks()
-		}
+		s.applyChatGPTWebImportModelValidationConfig(ctx, nextImportModels)
 		if s.coreManager != nil && authModelExclusionsChanged {
 			for _, auth := range s.coreManager.List() {
 				if isNativeChatGPTWebAuth(auth) {

@@ -1165,6 +1165,52 @@ func TestDisablingImportModelValidationCancelsOnlyQueuedImportTasks(t *testing.T
 	}
 }
 
+func TestImportModelValidationTransitionDoesNotDependOnSharedConfigPointer(t *testing.T) {
+	enabled := true
+	cfg := &config.Config{}
+	cfg.ChatGPTWeb.Import.ValidateModelsAfterUpload = &enabled
+	manager := coreauth.NewManager(nil, nil, nil)
+	service := &Service{
+		cfg:              cfg,
+		coreManager:      manager,
+		modelSyncQueue:   make(chan string, 2),
+		modelSyncPending: make(map[string]modelSyncTaskState),
+	}
+	_, cancel := context.WithCancel(context.Background())
+	service.modelSyncCancel = cancel
+	defer cancel()
+	installed, errRegister := manager.Register(coreauth.WithSkipPersist(t.Context()), &coreauth.Auth{
+		ID:       "shared-config-import-models",
+		Provider: "chatgpt-web",
+		Status:   coreauth.StatusActive,
+		Metadata: map[string]any{
+			"access_token":                        "access",
+			"lifecycle_state":                     coreauth.LifecycleStateActive,
+			coreauth.ChatGPTWebImportModelsIntent: true,
+		},
+	})
+	if errRegister != nil {
+		t.Fatal(errRegister)
+	}
+
+	service.applyChatGPTWebImportModelValidationConfig(t.Context(), true)
+	service.modelSyncMu.Lock()
+	state, pending := service.modelSyncPending[installed.ID]
+	service.modelSyncMu.Unlock()
+	if !pending || !state.queued || !state.importOnly {
+		t.Fatalf("enabled transition did not restore import intent: state=%#v pending=%v", state, pending)
+	}
+
+	enabled = false
+	service.applyChatGPTWebImportModelValidationConfig(t.Context(), false)
+	service.modelSyncMu.Lock()
+	_, pending = service.modelSyncPending[installed.ID]
+	service.modelSyncMu.Unlock()
+	if pending {
+		t.Fatal("disabled transition retained restored import-only work")
+	}
+}
+
 func TestDisabledImportModelValidationSkipsRetainedTaskBeforeNetwork(t *testing.T) {
 	service := &Service{
 		cfg:                 &config.Config{},
