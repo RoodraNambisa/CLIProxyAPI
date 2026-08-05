@@ -98,6 +98,32 @@ func (m *Manager) installPersistedAuthIndexLocked(auth *Auth) {
 	m.persistedAuthsByID[strings.TrimSpace(auth.ID)] = auth.Clone()
 }
 
+// recordPersistedAuthSave updates the indexed store view after a successful
+// save. Runtime records remain authoritative for dependency and identity
+// lookups, while persisted-only records must update those indexes immediately.
+func (m *Manager) recordPersistedAuthSave(auth *Auth) {
+	if m == nil || auth == nil || strings.TrimSpace(auth.ID) == "" {
+		return
+	}
+	id := strings.TrimSpace(auth.ID)
+	m.mu.Lock()
+	m.installPersistedAuthIndexLocked(auth)
+	if m.auths[id] == nil {
+		if authRelevantToChatGPTWebDependencyIndex(auth) {
+			m.addDependencyAuthIndexLocked(auth)
+		} else {
+			m.removeDependencyAuthIndexLocked(id)
+		}
+		if strings.EqualFold(strings.TrimSpace(auth.Provider), chatgptwebauth.Provider) {
+			m.addChatGPTWebIdentityIndexLocked(auth)
+		} else {
+			m.removeChatGPTWebIdentityIndexLocked(id)
+		}
+	}
+	m.authIndexRevision++
+	m.mu.Unlock()
+}
+
 func (m *Manager) removePersistedAuthIndexLocked(id string) {
 	if m == nil {
 		return

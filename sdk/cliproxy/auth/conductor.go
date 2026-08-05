@@ -8851,6 +8851,7 @@ func (m *Manager) persistWithoutLock(ctx context.Context, auth *Auth, syncCurren
 	if syncCurrentHash {
 		m.syncRuntimeSourceHash(auth)
 	}
+	m.recordPersistedAuthSave(auth)
 	return nil
 }
 
@@ -8864,11 +8865,13 @@ func (m *Manager) persistNewWithoutLock(ctx context.Context, auth *Auth) error {
 	}
 	_, err := store.SaveIfAbsent(authfileguard.WithManagerOwnedPersistence(ctx), auth)
 	if err == nil {
+		m.recordPersistedAuthSave(auth)
 		return nil
 	}
 	if outcome, explicit := SaveOutcomeFromError(err); explicit {
 		if outcome == SaveOutcomeCommitted {
 			log.WithField("auth_id", auth.ID).Warn("auth create committed with cleanup warning")
+			m.recordPersistedAuthSave(auth)
 			return nil
 		}
 		return err

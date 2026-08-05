@@ -211,6 +211,36 @@ func TestManagerPersistedAuthSnapshotSharesConcurrentRefresh(t *testing.T) {
 	}
 }
 
+func TestManagerPersistedAuthSnapshotTracksDurableRuntimeMetadataMutation(t *testing.T) {
+	auth := dependencyTestWebAuth("persisted-metadata", "source-uid")
+	store := newChatGPTWebDependencyTestStore(auth)
+	manager := NewManager(store, nil, nil)
+	if errLoad := manager.Load(t.Context()); errLoad != nil {
+		t.Fatal(errLoad)
+	}
+	expected, ok := manager.GetByID(auth.ID)
+	if !ok || expected == nil {
+		t.Fatal("loaded auth not found")
+	}
+	_, matched, errMutate := manager.MutateRuntimeMetadataIfCurrent(t.Context(), expected, func(candidate *Auth) {
+		candidate.Metadata["persisted_marker"] = "updated"
+	})
+	if errMutate != nil {
+		t.Fatal(errMutate)
+	}
+	if !matched {
+		t.Fatal("runtime metadata mutation did not match current auth")
+	}
+	persisted, errSnapshot := manager.PersistedAuthSnapshot(t.Context())
+	if errSnapshot != nil {
+		t.Fatal(errSnapshot)
+	}
+	if len(persisted) != 1 || persisted[0].Metadata["persisted_marker"] != "updated" {
+		t.Fatalf("persisted snapshot = %#v, want updated metadata", persisted)
+	}
+	assertManagerAuthIndexesConsistent(t, manager)
+}
+
 func TestManagerDependencyIndexTracksDuplicateUIDAndRuntimeChanges(t *testing.T) {
 	manager := NewManager(nil, nil, nil)
 	first := dependencyTestCodexAuth("source-a", "duplicate")
