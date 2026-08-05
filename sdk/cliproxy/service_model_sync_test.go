@@ -2002,6 +2002,56 @@ func TestModelSyncRunningUpdatesRetryOnceThenRequeue(t *testing.T) {
 	}
 }
 
+func TestImportModelSyncReusesRunningTask(t *testing.T) {
+	for _, existingImportOnly := range []bool{false, true} {
+		name := "regular"
+		if existingImportOnly {
+			name = "import"
+		}
+		t.Run(name, func(t *testing.T) {
+			_, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			const authID = "running-import-model-sync"
+			service := &Service{
+				modelSyncCancel:     cancel,
+				modelSyncQueue:      make(chan string, 2),
+				modelSyncPending:    make(map[string]modelSyncTaskState),
+				modelSyncGeneration: 1,
+			}
+			enqueue := service.enqueueModelSyncTaskForInstallation
+			if existingImportOnly {
+				enqueue = service.enqueueImportModelSyncTaskForInstallation
+			}
+			if !enqueue(authID, "installation", false) {
+				t.Fatal("initial model sync was not accepted")
+			}
+			<-service.modelSyncQueue
+			epoch, _, ok := service.beginModelSyncTaskWithKind(authID, 1)
+			if !ok {
+				t.Fatal("initial model sync did not begin")
+			}
+
+			if !service.enqueueImportModelSyncTaskForInstallation(authID, "installation", false) {
+				t.Fatal("duplicate import model sync was not reused")
+			}
+			if state := service.modelSyncPending[authID]; state.dirty {
+				t.Fatalf("duplicate import model sync marked running work dirty: %#v", state)
+			}
+			if service.completeModelSyncTask(authID, epoch, 1, true) {
+				t.Fatal("duplicate import model sync requested an inline retry")
+			}
+			if _, pending := service.modelSyncPending[authID]; pending {
+				t.Fatal("completed reused import model sync remained pending")
+			}
+			select {
+			case duplicate := <-service.modelSyncQueue:
+				t.Fatalf("duplicate import model sync queued another request for %q", duplicate)
+			default:
+			}
+		})
+	}
+}
+
 func TestModelSyncTaskEpochRejectsDeletedAuthCompletion(t *testing.T) {
 	_, cancel := context.WithCancel(context.Background())
 	defer cancel()

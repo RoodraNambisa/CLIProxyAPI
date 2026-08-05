@@ -3472,8 +3472,8 @@ func (s *Service) enqueueModelSyncTaskForInstallationKind(
 		if state.running {
 			if !importOnly {
 				state.importOnly = false
+				state.dirty = true
 			}
-			state.dirty = true
 			s.modelSyncPending[authID] = state
 		} else if !importOnly && state.importOnly {
 			state.importOnly = false
