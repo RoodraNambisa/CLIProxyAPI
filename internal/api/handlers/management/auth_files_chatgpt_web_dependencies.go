@@ -32,29 +32,30 @@ type authDependencyDeleteResult struct {
 }
 
 type authDependencyDeleteContext struct {
-	h                 *Handler
-	ctx               context.Context
-	root              *os.Root
-	lexicalAuthDir    string
-	authDir           string
-	requested         map[string]struct{}
-	forceCascade      bool
-	suppressCleanup   map[string]struct{}
-	processed         map[string]struct{}
-	result            authDependencyDeleteResult
-	ignoreMissingFile bool
-	runtimeByID       map[string]*coreauth.Auth
-	runtimeByName     map[string]*coreauth.Auth
-	runtimeLookupDone map[string]struct{}
-	authByName        map[string]*coreauth.Auth
-	authLookupDone    map[string]struct{}
-	dependencyByID    map[string]*coreauth.Auth
-	dependencyNameIDs map[string]string
-	cachedGraph       *coreauth.ChatGPTWebDependencyGraph
-	dependencyLoaded  bool
-	dependencyIndexed bool
-	dependencyDirty   bool
-	dependencyErr     error
+	h                       *Handler
+	ctx                     context.Context
+	root                    *os.Root
+	lexicalAuthDir          string
+	authDir                 string
+	requested               map[string]struct{}
+	forceCascade            bool
+	suppressCleanup         map[string]struct{}
+	processed               map[string]struct{}
+	result                  authDependencyDeleteResult
+	ignoreMissingFile       bool
+	runtimeByID             map[string]*coreauth.Auth
+	runtimeByName           map[string]*coreauth.Auth
+	runtimeLookupDone       map[string]struct{}
+	authByName              map[string]*coreauth.Auth
+	authLookupDone          map[string]struct{}
+	dependencyByID          map[string]*coreauth.Auth
+	dependencyNameIDs       map[string]string
+	cachedGraph             *coreauth.ChatGPTWebDependencyGraph
+	dependencyLoaded        bool
+	dependencyIndexed       bool
+	dependencyAuthoritative bool
+	dependencyDirty         bool
+	dependencyErr           error
 }
 
 func (h *Handler) deleteAuthFilesWithDependencies(ctx context.Context, root *os.Root, lexicalAuthDir, authDir string, names []string, forceCascade, ignoreMissing bool) authDependencyDeleteResult {
@@ -262,6 +263,10 @@ func (operation *authDependencyDeleteContext) delete(name string, dependencyDele
 	auth := operation.managedAuth(name)
 	if auth == nil || !strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") {
 		operation.deletePhysical(name, auth, dependencyDelete)
+		return
+	}
+	if errSnapshot := operation.ensureAuthoritativeDependencySnapshot(); errSnapshot != nil {
+		operation.fail(name, http.StatusConflict, fmt.Errorf("cannot verify credential dependencies: %w", errSnapshot))
 		return
 	}
 
@@ -486,7 +491,7 @@ func (operation *authDependencyDeleteContext) dependencyGraph() (*coreauth.ChatG
 		return nil, errors.New("managed auth root is unavailable")
 	}
 	if !operation.dependencyLoaded {
-		operation.loadDependencySnapshot()
+		operation.loadDependencySnapshot(false)
 	}
 	if operation.dependencyErr != nil {
 		return nil, operation.dependencyErr
@@ -500,7 +505,7 @@ func (operation *authDependencyDeleteContext) dependencyGraph() (*coreauth.ChatG
 		}
 		operation.dependencyIndexed = false
 		operation.dependencyLoaded = false
-		operation.loadDependencySnapshot()
+		operation.loadDependencySnapshot(false)
 		if operation.dependencyErr != nil {
 			return nil, operation.dependencyErr
 		}
@@ -517,7 +522,7 @@ func (operation *authDependencyDeleteContext) dependencyGraph() (*coreauth.ChatG
 }
 
 func (operation *authDependencyDeleteContext) sourceByUID(uid string) (*coreauth.Auth, bool, error) {
-	if operation != nil && operation.h != nil && operation.h.authManager != nil {
+	if operation != nil && !operation.dependencyAuthoritative && operation.h != nil && operation.h.authManager != nil {
 		source, ambiguous, complete := operation.h.authManager.ChatGPTWebSourceByCredentialUID(uid)
 		if complete {
 			return source, ambiguous, nil
@@ -532,7 +537,7 @@ func (operation *authDependencyDeleteContext) sourceByUID(uid string) (*coreauth
 }
 
 func (operation *authDependencyDeleteContext) dependentsForSource(source *coreauth.Auth) ([]*coreauth.Auth, bool, error) {
-	if operation != nil && operation.h != nil && operation.h.authManager != nil {
+	if operation != nil && !operation.dependencyAuthoritative && operation.h != nil && operation.h.authManager != nil {
 		dependents, ambiguous, complete := operation.h.authManager.ChatGPTWebDependentsForSource(source)
 		if complete {
 			return dependents, ambiguous, nil
@@ -546,16 +551,27 @@ func (operation *authDependencyDeleteContext) dependentsForSource(source *coreau
 	return dependents, ambiguous, nil
 }
 
-func (operation *authDependencyDeleteContext) loadDependencySnapshot() {
+func (operation *authDependencyDeleteContext) ensureAuthoritativeDependencySnapshot() error {
+	if operation == nil || operation.h == nil || operation.root == nil {
+		return errors.New("managed auth root is unavailable")
+	}
+	if !operation.dependencyLoaded || !operation.dependencyAuthoritative {
+		operation.loadDependencySnapshot(true)
+	}
+	return operation.dependencyErr
+}
+
+func (operation *authDependencyDeleteContext) loadDependencySnapshot(authoritative bool) {
 	operation.dependencyLoaded = true
 	operation.dependencyIndexed = false
+	operation.dependencyAuthoritative = authoritative
 	operation.cachedGraph = nil
 	operation.dependencyErr = nil
 	operation.dependencyByID = make(map[string]*coreauth.Auth)
 	operation.dependencyNameIDs = make(map[string]string)
 	operation.indexRuntimeAuths()
 	if operation.h.authManager != nil {
-		if graph, complete := operation.h.authManager.ChatGPTWebDependencyIndexSnapshot(); complete {
+		if graph, complete := operation.h.authManager.ChatGPTWebDependencyIndexSnapshot(); complete && !authoritative {
 			operation.cachedGraph = graph
 			operation.dependencyIndexed = true
 			operation.dependencyDirty = false
@@ -566,7 +582,7 @@ func (operation *authDependencyDeleteContext) loadDependencySnapshot() {
 			operation.dependencyErr = errList
 			return
 		}
-		if graph, complete := operation.h.authManager.ChatGPTWebDependencyIndexSnapshot(); complete {
+		if graph, complete := operation.h.authManager.ChatGPTWebDependencyIndexSnapshot(); complete && !authoritative {
 			operation.cachedGraph = graph
 			operation.dependencyIndexed = true
 			operation.dependencyDirty = false

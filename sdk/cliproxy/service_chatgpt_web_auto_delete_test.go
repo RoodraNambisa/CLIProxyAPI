@@ -22,6 +22,13 @@ type serviceUncertainConditionalDeleteStore struct {
 	conditionalDeleteCalls atomic.Int32
 }
 
+type serviceRollbackThenSuccessConditionalDeleteStore struct {
+	path                 string
+	conditionalCalls     atomic.Int32
+	secondAttempt        atomic.Int32
+	secondBindingAllowed atomic.Bool
+}
+
 func (*serviceUncertainConditionalDeleteStore) List(context.Context) ([]*coreauth.Auth, error) {
 	return nil, nil
 }
@@ -40,6 +47,30 @@ func (*serviceUncertainConditionalDeleteStore) Delete(context.Context, string) e
 func (store *serviceUncertainConditionalDeleteStore) DeleteIfSourceHashMatches(context.Context, string, string) error {
 	store.conditionalDeleteCalls.Add(1)
 	return coreauth.NewDeleteOutcomeError(coreauth.DeleteOutcomeUncertain, errors.New("conditional delete result unavailable"))
+}
+
+func (*serviceRollbackThenSuccessConditionalDeleteStore) List(context.Context) ([]*coreauth.Auth, error) {
+	return nil, nil
+}
+
+func (*serviceRollbackThenSuccessConditionalDeleteStore) Save(_ context.Context, auth *coreauth.Auth) (string, error) {
+	if auth == nil {
+		return "", nil
+	}
+	return auth.ID, nil
+}
+
+func (*serviceRollbackThenSuccessConditionalDeleteStore) Delete(context.Context, string) error {
+	return errors.New("ordinary delete must not be used")
+}
+
+func (store *serviceRollbackThenSuccessConditionalDeleteStore) DeleteIfSourceHashMatches(ctx context.Context, _ string, _ string) error {
+	if store.conditionalCalls.Add(1) == 1 {
+		return coreauth.NewDeleteOutcomeError(coreauth.DeleteOutcomeRolledBack, errors.New("backend was not reached"))
+	}
+	store.secondAttempt.Store(int32(authfileguard.DeleteAttempt(ctx)))
+	store.secondBindingAllowed.Store(authfileguard.DeleteIdentityBindingAllowed(ctx))
+	return os.Remove(store.path)
 }
 
 func TestAuthEligibleForChatGPTWebDeadDelete(t *testing.T) {
@@ -204,6 +235,29 @@ func TestServiceDequeueEnabledAuthMaintenanceCandidateKeepsDisabledGenericPolicy
 	}
 }
 
+func TestServiceDequeueAuthMaintenanceCandidatePrioritizesWebDeadDeletion(t *testing.T) {
+	service := &Service{}
+	generic := authMaintenanceCandidate{Key: "generic", IDs: []string{"generic"}, Reason: "http_401"}
+	webDead := authMaintenanceCandidate{
+		Key:    "web-dead",
+		IDs:    []string{"web-dead"},
+		Reason: "chatgpt_web_dead_account_deleted",
+	}
+	if !service.enqueueAuthMaintenanceCandidate(generic) || !service.enqueueAuthMaintenanceCandidate(webDead) {
+		t.Fatal("failed to enqueue test candidates")
+	}
+
+	got, ok := service.dequeueProcessableAuthMaintenanceCandidate(true)
+	if !ok || got.Key != webDead.Key {
+		t.Fatalf("dequeueProcessableAuthMaintenanceCandidate() = %#v, %v; want Web dead candidate", got, ok)
+	}
+	service.maintenanceMu.Lock()
+	defer service.maintenanceMu.Unlock()
+	if len(service.maintenanceQueue) != 1 || service.maintenanceQueue[0].Key != generic.Key {
+		t.Fatalf("remaining queue = %#v, want generic candidate", service.maintenanceQueue)
+	}
+}
+
 func TestServiceAuthMaintenanceRetryUsesBackoffAndRetainsDeleteGeneration(t *testing.T) {
 	service := &Service{}
 	candidate := authMaintenanceCandidate{
@@ -219,9 +273,12 @@ func TestServiceAuthMaintenanceRetryUsesBackoffAndRetainsDeleteGeneration(t *tes
 	if !ok {
 		t.Fatal("dequeue initial candidate")
 	}
-	generation, errGeneration := service.authMaintenanceDeleteGeneration(dequeued, "source-hash")
+	generation, created, errGeneration := service.authMaintenanceDeleteGeneration(dequeued, "source-hash")
 	if errGeneration != nil {
 		t.Fatal(errGeneration)
+	}
+	if !created {
+		t.Fatal("initial delete generation was not reported as new")
 	}
 	if !service.requeueAuthMaintenanceCandidate(dequeued) {
 		t.Fatal("requeue failed candidate")
@@ -240,15 +297,126 @@ func TestServiceAuthMaintenanceRetryUsesBackoffAndRetainsDeleteGeneration(t *tes
 	if !ok || retry.Attempts != 1 {
 		t.Fatalf("retry candidate = %#v, ok=%v", retry, ok)
 	}
-	reused, errGeneration := service.authMaintenanceDeleteGeneration(retry, "source-hash")
-	if errGeneration != nil || reused != generation {
-		t.Fatalf("retry generation = %p, want %p, err=%v", reused, generation, errGeneration)
+	reused, created, errGeneration := service.authMaintenanceDeleteGeneration(retry, "source-hash")
+	if errGeneration != nil || reused != generation || created {
+		t.Fatalf("retry generation = %p, want %p, created=%v, err=%v", reused, generation, created, errGeneration)
 	}
 	wantDelays := []time.Duration{time.Second, 5 * time.Second, 30 * time.Second, time.Minute, 5 * time.Minute, 5 * time.Minute}
 	for index, want := range wantDelays {
 		if got := authMaintenanceDeleteRetryDelay(index + 1); got != want {
 			t.Fatalf("retry delay %d = %v, want %v", index+1, got, want)
 		}
+	}
+}
+
+func TestServiceAuthMaintenanceRolledBackDeleteStartsRetryWithFreshGeneration(t *testing.T) {
+	root := t.TempDir()
+	authDir := filepath.Join(root, "auths")
+	path := filepath.Join(authDir, "rolled-back.json")
+	if errMkdir := os.MkdirAll(authDir, 0o700); errMkdir != nil {
+		t.Fatal(errMkdir)
+	}
+	raw := []byte(`{"type":"chatgpt-web","access_token":"test-token"}`)
+	if errWrite := os.WriteFile(path, raw, 0o600); errWrite != nil {
+		t.Fatal(errWrite)
+	}
+	store := &serviceRollbackThenSuccessConditionalDeleteStore{path: path}
+	service := &Service{
+		cfg:         &config.Config{AuthDir: authDir},
+		configPath:  filepath.Join(root, "config.yaml"),
+		coreManager: coreauth.NewManager(store, nil, nil),
+	}
+	auth := chatGPTWebAutoDeleteTestAuth("rolled-back.json", -1, coreauth.LifecycleStateDead)
+	auth.FileName = path
+	auth.Attributes["path"] = path
+	if errSync := coreauth.SyncPersistedMetadataAndSourceHash(auth, raw); errSync != nil {
+		t.Fatal(errSync)
+	}
+	installed, errRegister := service.coreManager.Register(t.Context(), auth)
+	if errRegister != nil {
+		t.Fatal(errRegister)
+	}
+	candidate, ok := service.authMaintenanceCandidateForAuth(installed, authDir, "chatgpt_web_dead_account_deactivated")
+	if !ok {
+		t.Fatal("build maintenance candidate")
+	}
+	candidate.Installations = map[string]string{installed.ID: installed.RuntimeInstallationID()}
+
+	deleted, errDelete := service.deleteAuthMaintenanceCandidateUnchecked(t.Context(), candidate)
+	if deleted || errDelete == nil {
+		t.Fatalf("first delete = (%v, %v), want rolled back", deleted, errDelete)
+	}
+	service.maintenanceMu.Lock()
+	retainedGeneration := service.maintenanceDeleteGenerations[candidate.Key]
+	service.maintenanceMu.Unlock()
+	if retainedGeneration != nil || authfileguard.IsQuarantined(path) {
+		t.Fatal("rolled-back delete retained its quarantine generation")
+	}
+	if _, exists := service.coreManager.GetByID(installed.ID); !exists {
+		t.Fatal("rolled-back delete removed the runtime credential")
+	}
+
+	candidate.Attempts = 1
+	deleted, errDelete = service.deleteAuthMaintenanceCandidateUnchecked(t.Context(), candidate)
+	if errDelete != nil || !deleted {
+		t.Fatalf("retry delete = (%v, %v), want success", deleted, errDelete)
+	}
+	if got := store.secondAttempt.Load(); got != 0 {
+		t.Fatalf("fresh retry backend attempt = %d, want 0", got)
+	}
+	if !store.secondBindingAllowed.Load() {
+		t.Fatal("fresh retry could not bind its backend identity")
+	}
+}
+
+func TestServiceCancelDoesNotClearInFlightDeleteQuarantine(t *testing.T) {
+	root := t.TempDir()
+	authDir := filepath.Join(root, "auths")
+	path := filepath.Join(authDir, "in-flight.json")
+	if errMkdir := os.MkdirAll(authDir, 0o700); errMkdir != nil {
+		t.Fatal(errMkdir)
+	}
+	service := &Service{cfg: &config.Config{AuthDir: authDir}, configPath: filepath.Join(root, "config.yaml")}
+	candidate := authMaintenanceCandidate{Key: path, Path: path, IDs: []string{"in-flight"}}
+	generation, created, errGeneration := service.authMaintenanceDeleteGeneration(candidate, "source-hash")
+	if errGeneration != nil || !created {
+		t.Fatalf("create generation: created=%v err=%v", created, errGeneration)
+	}
+	if errPersist := watcher.PersistAuthDeleteQuarantine(service.configPath, authDir, path, generation); errPersist != nil {
+		t.Fatal(errPersist)
+	}
+	service.cancelAuthMaintenanceCandidate(candidate)
+	service.maintenanceMu.Lock()
+	retained := service.maintenanceDeleteGenerations[candidate.Key]
+	service.maintenanceMu.Unlock()
+	if retained != generation || !authfileguard.IsQuarantined(path) {
+		t.Fatal("cancel cleared an in-flight delete quarantine")
+	}
+
+	if !service.enqueueAuthMaintenanceCandidate(candidate) {
+		t.Fatal("enqueue retry candidate")
+	}
+	service.cancelAuthMaintenanceCandidate(candidate)
+	service.maintenanceMu.Lock()
+	retained = service.maintenanceDeleteGenerations[candidate.Key]
+	service.maintenanceMu.Unlock()
+	if retained != nil || authfileguard.IsQuarantined(path) {
+		t.Fatal("cancel did not clear an idle queued retry quarantine")
+	}
+}
+
+func TestServiceDeleteGenerationWaitsForCanceledQuarantineClear(t *testing.T) {
+	service := &Service{}
+	candidate := authMaintenanceCandidate{Key: "clearing", Path: "clearing.json"}
+	generation := authfileguard.NewDeleteGeneration("source-hash")
+	service.ensureAuthMaintenanceQueue()
+	service.maintenanceMu.Lock()
+	service.maintenanceDeleteClearing[candidate.Key] = generation
+	service.maintenanceMu.Unlock()
+
+	got, created, errGeneration := service.authMaintenanceDeleteGeneration(candidate, "source-hash")
+	if got != nil || created || !errors.Is(errGeneration, authfileguard.ErrDeleteGenerationUncertain) {
+		t.Fatalf("delete generation while clearing = (%p, %v, %v)", got, created, errGeneration)
 	}
 }
 

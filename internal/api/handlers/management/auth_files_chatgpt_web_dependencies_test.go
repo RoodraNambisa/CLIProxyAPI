@@ -280,6 +280,44 @@ func TestDeleteAuthFilesWithDependenciesUsesCompleteIndexWithoutPersistedSnapsho
 	}
 }
 
+func TestDeleteCodexSourceRefreshesAuthoritativeDependencies(t *testing.T) {
+	h, manager, authDir, store := newCountingChatGPTWebDependencyManagementHandler(t)
+	source := registerChatGPTWebDependencyManagementAuth(t, manager, managementDependencyCodexAuth("codex-source.json", "uid-a", false))
+	if _, errSnapshot := manager.PersistedAuthSnapshot(t.Context()); errSnapshot != nil {
+		t.Fatal(errSnapshot)
+	}
+	if _, complete := manager.ChatGPTWebDependencyIndexSnapshot(); !complete {
+		t.Fatal("dependency index was not complete before external file update")
+	}
+
+	dependent := managementDependencyWebAuth("external-web.json", source.ID, "uid-a")
+	if _, errSave := store.Save(t.Context(), dependent); errSave != nil {
+		t.Fatal(errSave)
+	}
+	store.listCalls.Store(0)
+
+	response := performChatGPTWebDependencyManagementRequest(
+		chatGPTWebDependencyManagementRouter(h),
+		http.MethodDelete,
+		"/auth-files?name=codex-source.json",
+		"",
+	)
+	if response.Code != http.StatusAccepted {
+		t.Fatalf("retain status = %d, body=%s", response.Code, response.Body.String())
+	}
+	if got := store.listCalls.Load(); got == 0 {
+		t.Fatal("Codex source deletion did not refresh the persisted dependency snapshot")
+	}
+	if _, ok := manager.GetByID(source.ID); !ok {
+		t.Fatal("Codex source was removed despite an externally persisted dependent")
+	}
+	for _, name := range []string{source.FileName, dependent.FileName} {
+		if _, errStat := os.Stat(filepath.Join(authDir, name)); errStat != nil {
+			t.Fatalf("expected %s to remain: %v", name, errStat)
+		}
+	}
+}
+
 func TestDeleteAuthFileWithoutCredentialUIDUsesSourceGeneration(t *testing.T) {
 	h, manager, authDir := newChatGPTWebDependencyManagementHandler(t)
 	source := registerChatGPTWebDependencyManagementAuth(t, manager, managementDependencyCodexAuth("legacy-codex.json", "", false))

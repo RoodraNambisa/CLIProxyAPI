@@ -224,6 +224,10 @@ type Service struct {
 	// maintenanceDeleteGenerations retains durable deletion identities across safe retries.
 	maintenanceDeleteGenerations map[string]*authfileguard.DeleteGeneration
 
+	// maintenanceDeleteClearing prevents a replacement delete generation from
+	// starting while a canceled queued generation clears its durable quarantine.
+	maintenanceDeleteClearing map[string]*authfileguard.DeleteGeneration
+
 	// maintenanceWake nudges the maintenance worker to wake early.
 	maintenanceWake chan struct{}
 
@@ -1121,6 +1125,9 @@ func (s *Service) ensureAuthMaintenanceQueue() {
 	if s.maintenanceDeleteGenerations == nil {
 		s.maintenanceDeleteGenerations = make(map[string]*authfileguard.DeleteGeneration)
 	}
+	if s.maintenanceDeleteClearing == nil {
+		s.maintenanceDeleteClearing = make(map[string]*authfileguard.DeleteGeneration)
+	}
 	if s.maintenanceWake == nil {
 		s.maintenanceWake = make(chan struct{}, 1)
 	}
@@ -1240,18 +1247,26 @@ func (s *Service) dequeueProcessableAuthMaintenanceCandidate(genericEnabled bool
 	s.maintenanceMu.Lock()
 	defer s.maintenanceMu.Unlock()
 	now := time.Now()
+	selected := -1
 	for index, candidate := range s.maintenanceQueue {
-		if !genericEnabled && !isChatGPTWebDeadMaintenanceCandidate(candidate) {
-			continue
-		}
 		if !candidate.NextAttemptAt.IsZero() && now.Before(candidate.NextAttemptAt) {
 			continue
 		}
-		s.maintenanceQueue = append(s.maintenanceQueue[:index], s.maintenanceQueue[index+1:]...)
-		delete(s.maintenancePending, strings.TrimSpace(candidate.Key))
-		return candidate, true
+		if isChatGPTWebDeadMaintenanceCandidate(candidate) {
+			selected = index
+			break
+		}
+		if genericEnabled && selected < 0 {
+			selected = index
+		}
 	}
-	return authMaintenanceCandidate{}, false
+	if selected < 0 {
+		return authMaintenanceCandidate{}, false
+	}
+	candidate := s.maintenanceQueue[selected]
+	s.maintenanceQueue = append(s.maintenanceQueue[:selected], s.maintenanceQueue[selected+1:]...)
+	delete(s.maintenancePending, strings.TrimSpace(candidate.Key))
+	return candidate, true
 }
 
 func (s *Service) nextAuthMaintenanceRetryDelay(genericEnabled, webDeadEnabled bool, now time.Time) (time.Duration, bool) {
@@ -1435,11 +1450,13 @@ func (s *Service) cancelAuthMaintenanceKey(key string) bool {
 
 	removed := false
 	var canceled authMaintenanceCandidate
+	queued := false
 	filtered := s.maintenanceQueue[:0]
 	for _, candidate := range s.maintenanceQueue {
 		if strings.TrimSpace(candidate.Key) == key {
 			removed = true
 			canceled = candidate
+			queued = true
 			continue
 		}
 		filtered = append(filtered, candidate)
@@ -1451,11 +1468,27 @@ func (s *Service) cancelAuthMaintenanceKey(key string) bool {
 	}
 	s.maintenanceGeneration[key]++
 	generation := s.maintenanceDeleteGenerations[key]
-	delete(s.maintenanceDeleteGenerations, key)
+	if generation != nil && queued {
+		delete(s.maintenanceDeleteGenerations, key)
+		s.maintenanceDeleteClearing[key] = generation
+	}
 	s.maintenanceMu.Unlock()
-	if generation != nil {
+	// A queued retry is not mutating persistence, so its quarantine can be
+	// cleared immediately. An in-flight delete owns its generation until it
+	// observes cancellation or finishes, preventing a crash-recovery gap.
+	if generation != nil && queued {
 		canceled.Key = key
-		if errClear := s.clearAuthMaintenanceDeleteQuarantine(canceled, generation); errClear != nil {
+		errClear := s.clearAuthMaintenanceDeleteQuarantine(canceled, generation)
+		s.maintenanceMu.Lock()
+		if s.maintenanceDeleteClearing[key] == generation {
+			delete(s.maintenanceDeleteClearing, key)
+			if errClear != nil && s.maintenanceDeleteGenerations[key] == nil {
+				s.maintenanceDeleteGenerations[key] = generation
+			}
+		}
+		s.maintenanceMu.Unlock()
+		s.wakeAuthMaintenance()
+		if errClear != nil {
 			log.WithError(errClear).Warnf("failed to clear canceled auth maintenance quarantine for %s", canceled.Path)
 		}
 	}
@@ -1475,27 +1508,30 @@ func (s *Service) authMaintenanceCandidateCanceled(candidate authMaintenanceCand
 	return s.maintenanceGeneration[key] != candidate.Generation
 }
 
-func (s *Service) authMaintenanceDeleteGeneration(candidate authMaintenanceCandidate, expectedHash string) (*authfileguard.DeleteGeneration, error) {
+func (s *Service) authMaintenanceDeleteGeneration(candidate authMaintenanceCandidate, expectedHash string) (*authfileguard.DeleteGeneration, bool, error) {
 	if s == nil {
-		return nil, errors.New("auth maintenance service is unavailable")
+		return nil, false, errors.New("auth maintenance service is unavailable")
 	}
 	key := strings.TrimSpace(candidate.Key)
 	expectedHash = strings.TrimSpace(expectedHash)
 	if key == "" || expectedHash == "" {
-		return nil, errors.New("auth maintenance deletion identity is incomplete")
+		return nil, false, errors.New("auth maintenance deletion identity is incomplete")
 	}
 	s.ensureAuthMaintenanceQueue()
 	s.maintenanceMu.Lock()
 	defer s.maintenanceMu.Unlock()
+	if s.maintenanceDeleteClearing[key] != nil {
+		return nil, false, authfileguard.ErrDeleteGenerationUncertain
+	}
 	if generation := s.maintenanceDeleteGenerations[key]; generation != nil {
 		if generation.ExpectedHash() != expectedHash {
-			return nil, authfileguard.ErrPersistGenerationStale
+			return nil, false, authfileguard.ErrPersistGenerationStale
 		}
-		return generation, nil
+		return generation, false, nil
 	}
 	generation := authfileguard.NewDeleteGeneration(expectedHash)
 	s.maintenanceDeleteGenerations[key] = generation
-	return generation, nil
+	return generation, true, nil
 }
 
 func (s *Service) forgetAuthMaintenanceDeleteGeneration(candidate authMaintenanceCandidate, generation *authfileguard.DeleteGeneration) {
@@ -2254,7 +2290,7 @@ func (s *Service) deleteAuthMaintenanceCandidateUnchecked(ctx context.Context, c
 		return false, coreauth.NewDeleteOutcomeError(coreauth.DeleteOutcomeRolledBack, errors.New("auth maintenance requires source-conditional persistence"))
 	}
 	expectedHash := authMaintenanceExpectedSourceHash(contents)
-	generation, errGeneration := s.authMaintenanceDeleteGeneration(candidate, expectedHash)
+	generation, generationCreated, errGeneration := s.authMaintenanceDeleteGeneration(candidate, expectedHash)
 	if errGeneration != nil {
 		return false, errGeneration
 	}
@@ -2272,6 +2308,9 @@ func (s *Service) deleteAuthMaintenanceCandidateUnchecked(ctx context.Context, c
 		authDir = strings.TrimSpace(cfg.AuthDir)
 	}
 	if errPersist := watcher.PersistAuthDeleteQuarantine(s.configPath, authDir, path, generation); errPersist != nil {
+		if errClear := clearQuarantine(); errClear != nil {
+			return false, coreauth.NewDeleteOutcomeError(coreauth.DeleteOutcomeUncertain, errors.Join(errPersist, fmt.Errorf("clear failed auth maintenance quarantine: %w", errClear)))
+		}
 		return false, fmt.Errorf("persist auth maintenance delete quarantine: %w", errPersist)
 	}
 
@@ -2285,10 +2324,12 @@ func (s *Service) deleteAuthMaintenanceCandidateUnchecked(ctx context.Context, c
 	}
 
 	deleteCtx := authfileguard.WithDeleteGeneration(ctx, generation)
-	deleteCtx = authfileguard.WithDeleteAttempt(deleteCtx, candidate.Attempts)
-	if candidate.Attempts == 0 {
+	deleteAttempt := candidate.Attempts
+	if generationCreated {
+		deleteAttempt = 0
 		deleteCtx = authfileguard.WithDeleteIdentityBinding(deleteCtx)
 	}
+	deleteCtx = authfileguard.WithDeleteAttempt(deleteCtx, deleteAttempt)
 	indexes := s.usageAuthIndexesForIDs(candidate.IDs)
 	persisted := false
 	var uncertainDeleteErr error
@@ -2319,6 +2360,9 @@ func (s *Service) deleteAuthMaintenanceCandidateUnchecked(ctx context.Context, c
 			if !explicitOutcome || outcome == coreauth.DeleteOutcomeRolledBack {
 				if persisted {
 					return false, coreauth.NewDeleteOutcomeError(coreauth.DeleteOutcomeUncertain, errors.Join(uncertainDeleteErr, errDelete))
+				}
+				if errClear := clearQuarantine(); errClear != nil {
+					return false, coreauth.NewDeleteOutcomeError(coreauth.DeleteOutcomeUncertain, errors.Join(errDelete, fmt.Errorf("clear rolled-back auth maintenance quarantine: %w", errClear)))
 				}
 				return false, errDelete
 			}

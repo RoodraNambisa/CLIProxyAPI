@@ -665,7 +665,9 @@ func (m *Manager) SupportsSourceConditionalDelete() bool {
 	if m == nil {
 		return false
 	}
+	m.mu.RLock()
 	_, supported := m.store.(SourceConditionalDeleteStore)
+	m.mu.RUnlock()
 	return supported
 }
 
@@ -683,7 +685,9 @@ func (m *Manager) DeleteIfCurrentSourceHash(ctx context.Context, expected *Auth)
 	if expectedHash == "" {
 		return false, fmt.Errorf("auth %s has no source generation", expected.ID)
 	}
+	m.mu.RLock()
 	store, ok := m.store.(SourceConditionalDeleteStore)
+	m.mu.RUnlock()
 	if !ok || store == nil {
 		return false, errors.New("auth store does not support source-conditional deletion")
 	}
