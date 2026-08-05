@@ -158,6 +158,11 @@ func DecodeCredential(data []byte) (*Credential, error) {
 		return nil, fmt.Errorf("credential type %q is not %q", credential.Type, Provider)
 	}
 	credential.Type = Provider
+	if credential.CredentialSchemaVersion == CredentialSchemaVersionWebAuthn {
+		if err := validateCredentialWebAuthnJSON(data); err != nil {
+			return nil, err
+		}
+	}
 	if err := ValidateCredentialWebAuthn(&credential); err != nil {
 		return nil, err
 	}

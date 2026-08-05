@@ -696,6 +696,7 @@ func (h *Handler) persistImportedChatGPTWebCredential(ctx context.Context, manag
 	if strings.TrimSpace(credential.CredentialUID) == "" {
 		credential.CredentialUID = uuid.NewString()
 	}
+	preserveImportedChatGPTWebAuthnRuntimeState(credential, persistExpected)
 	unchanged = existing != nil && importedChatGPTWebCredentialUnchanged(existing, credential)
 	status = "created"
 	if existing != nil {
@@ -712,6 +713,23 @@ func (h *Handler) persistImportedChatGPTWebCredential(ctx context.Context, manag
 		h.cleanupRetainedCodexSource(ctx, oldSourceUID)
 	}
 	return installed, status, false, err
+}
+
+func preserveImportedChatGPTWebAuthnRuntimeState(imported *chatgptwebauth.Credential, current *coreauth.Auth) {
+	if imported == nil || imported.WebAuthn == nil || current == nil {
+		return
+	}
+	currentCredential, errParse := chatgptwebauth.ParseCredential(current.Metadata)
+	if errParse != nil || currentCredential.WebAuthn == nil ||
+		!chatgptwebauth.WebAuthnAuthenticatorMatches(imported.WebAuthn, currentCredential.WebAuthn) {
+		return
+	}
+	if currentCredential.WebAuthn.SignCount > imported.WebAuthn.SignCount {
+		imported.WebAuthn.SignCount = currentCredential.WebAuthn.SignCount
+	}
+	if chatgptwebauth.CompareWebAuthnLastUsedAt(currentCredential.WebAuthn.LastUsedAt, imported.WebAuthn.LastUsedAt) > 0 {
+		imported.WebAuthn.LastUsedAt = currentCredential.WebAuthn.LastUsedAt
+	}
 }
 
 func chatGPTWebImportCredentialFieldsEqual(first, second *coreauth.Auth) bool {

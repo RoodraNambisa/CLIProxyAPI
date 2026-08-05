@@ -4200,9 +4200,9 @@ func (m *Manager) UpdateIfCurrent(ctx context.Context, expected, updated *Auth) 
 }
 
 // UpdateChatGPTWebReloginIfCurrent installs a re-login result while allowing
-// runtime-only metadata, such as rotated session cookies or image quota, to
-// advance on the same installed credential. Management edits and credential
-// replacements still supersede the re-login.
+// runtime-only metadata, such as rotated session cookies, Passkey counters, or
+// image quota, to advance on the same installed credential. Management edits
+// and credential replacements still supersede the re-login.
 func (m *Manager) UpdateChatGPTWebReloginIfCurrent(ctx context.Context, expected, updated *Auth) (*Auth, bool, error) {
 	installed, err := m.installPreparedRequestAuthWithRuntimeMetadata(
 		WithForceRuntimeReplacement(ctx),
@@ -4614,6 +4614,13 @@ func clearChatGPTWebReloginRuntimeCredentialMetadata(credential *chatgptwebauth.
 	credential.QuotaUpdatedAt = ""
 	credential.QuotaStale = false
 	credential.QuotaLastError = ""
+	if credential.WebAuthn != nil {
+		webAuthn := *credential.WebAuthn
+		webAuthn.Transports = append([]string(nil), credential.WebAuthn.Transports...)
+		credential.WebAuthn = &webAuthn
+		credential.WebAuthn.SignCount = 0
+		credential.WebAuthn.LastUsedAt = ""
+	}
 }
 
 func authMetadataMatchesExceptKeys(expected, current map[string]any, ignored map[string]struct{}) bool {
@@ -11066,6 +11073,7 @@ func carryForwardConcurrentRefreshMetadata(baseline, current, refreshed, next *A
 			)
 			setAuthMetadataEntry(next, "cookies", append([]chatgptwebauth.Cookie(nil), cookies...), true)
 		}
+		carryForwardConcurrentWebAuthnMetadata(baselineCredential, currentCredential, refreshedCredential, next)
 	}
 
 	for _, key := range []string{
@@ -11101,6 +11109,27 @@ func carryForwardConcurrentRefreshMetadata(baseline, current, refreshed, next *A
 		}
 		setAuthMetadataEntry(next, key, refreshedValue, refreshedOK)
 	}
+}
+
+func carryForwardConcurrentWebAuthnMetadata(
+	baseline, current, refreshed *chatgptwebauth.Credential,
+	next *Auth,
+) {
+	if baseline == nil || current == nil || refreshed == nil || next == nil ||
+		baseline.WebAuthn == nil || current.WebAuthn == nil || refreshed.WebAuthn == nil ||
+		!chatgptwebauth.WebAuthnAuthenticatorMatches(baseline.WebAuthn, current.WebAuthn) ||
+		!chatgptwebauth.WebAuthnAuthenticatorMatches(baseline.WebAuthn, refreshed.WebAuthn) {
+		return
+	}
+	merged := *refreshed.WebAuthn
+	merged.Transports = append([]string(nil), refreshed.WebAuthn.Transports...)
+	if current.WebAuthn.SignCount > merged.SignCount {
+		merged.SignCount = current.WebAuthn.SignCount
+	}
+	if chatgptwebauth.CompareWebAuthnLastUsedAt(current.WebAuthn.LastUsedAt, merged.LastUsedAt) > 0 {
+		merged.LastUsedAt = current.WebAuthn.LastUsedAt
+	}
+	setAuthMetadataEntry(next, "webauthn", &merged, true)
 }
 
 func chatGPTWebCredentialMetadataEntry(credential *chatgptwebauth.Credential, key string) (any, bool) {

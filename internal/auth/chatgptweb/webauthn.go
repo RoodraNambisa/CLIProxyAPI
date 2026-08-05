@@ -1,14 +1,36 @@
 package chatgptweb
 
 import (
+	"bytes"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/x509"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 )
+
+var requiredWebAuthnV1JSONFields = [...]string{
+	"version",
+	"credential_id",
+	"user_handle",
+	"rp_id",
+	"origin",
+	"algorithm",
+	"private_key_pkcs8",
+	"sign_count",
+	"mfa_factor_id",
+	"transports",
+	"user_present",
+	"user_verified",
+	"backup_eligible",
+	"backup_state",
+	"created_at",
+	"last_used_at",
+}
 
 const (
 	CredentialSchemaVersionWebAuthn = 2
@@ -63,6 +85,28 @@ func ValidateCredentialWebAuthn(credential *Credential) error {
 	return ValidateWebAuthnCredential(credential.WebAuthn)
 }
 
+func validateCredentialWebAuthnJSON(data []byte) error {
+	var root map[string]json.RawMessage
+	if err := json.Unmarshal(data, &root); err != nil {
+		return fmt.Errorf("decode chatgpt web credential: %w", err)
+	}
+	raw, ok := root["webauthn"]
+	if !ok || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		return errors.New("chatgpt web credential schema 2 requires webauthn")
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil || fields == nil {
+		return errors.New("chatgpt web WebAuthn credential is invalid")
+	}
+	for _, field := range requiredWebAuthnV1JSONFields {
+		value, exists := fields[field]
+		if !exists || bytes.Equal(bytes.TrimSpace(value), []byte("null")) {
+			return fmt.Errorf("chatgpt web WebAuthn %s is required", field)
+		}
+	}
+	return nil
+}
+
 // ValidateWebAuthnCredential verifies the software key and the fixed OpenAI
 // relying-party contract used by WebAuthn v1.
 func ValidateWebAuthnCredential(credential *WebAuthnCredential) error {
@@ -114,8 +158,17 @@ func ValidateWebAuthnCredential(credential *WebAuthnCredential) error {
 	if credential.BackupState && !credential.BackupEligible {
 		return errors.New("chatgpt web WebAuthn backup state is inconsistent")
 	}
-	if strings.TrimSpace(credential.CreatedAt) == "" {
+	createdAt := strings.TrimSpace(credential.CreatedAt)
+	if createdAt == "" {
 		return errors.New("chatgpt web WebAuthn created_at is required")
+	}
+	if _, err := time.Parse(time.RFC3339Nano, createdAt); err != nil {
+		return errors.New("chatgpt web WebAuthn created_at is invalid")
+	}
+	if lastUsedAt := strings.TrimSpace(credential.LastUsedAt); lastUsedAt != "" {
+		if _, err := time.Parse(time.RFC3339Nano, lastUsedAt); err != nil {
+			return errors.New("chatgpt web WebAuthn last_used_at is invalid")
+		}
 	}
 	if len(credential.Transports) == 0 || len(credential.Transports) > 8 {
 		return errors.New("chatgpt web WebAuthn transports are invalid")
@@ -138,6 +191,25 @@ func ValidateWebAuthnCredential(credential *WebAuthnCredential) error {
 		return errors.New("chatgpt web WebAuthn private key must be P-256")
 	}
 	return nil
+}
+
+// CompareWebAuthnLastUsedAt compares RFC3339 timestamps while treating an
+// empty value as older than a valid timestamp.
+func CompareWebAuthnLastUsedAt(left, right string) int {
+	left = strings.TrimSpace(left)
+	right = strings.TrimSpace(right)
+	leftTime, leftErr := time.Parse(time.RFC3339Nano, left)
+	rightTime, rightErr := time.Parse(time.RFC3339Nano, right)
+	switch {
+	case leftErr == nil && rightErr == nil:
+		return leftTime.Compare(rightTime)
+	case leftErr == nil:
+		return 1
+	case rightErr == nil:
+		return -1
+	default:
+		return 0
+	}
 }
 
 func cloneWebAuthnCredential(source *WebAuthnCredential) *WebAuthnCredential {

@@ -72,6 +72,10 @@ func DecodeImportCredential(data []byte) (*Credential, error) {
 		return nil, fmt.Errorf("chatgpt web import contains conflicting account identity")
 	}
 	PopulateCredentialIdentity(credential)
+	if credential.CredentialSchemaVersion == CredentialSchemaVersionWebAuthn &&
+		strings.TrimSpace(credential.AccessToken) == "" && !HasSessionCookieForURL(credential.Cookies, SessionBaseURL) {
+		return nil, fmt.Errorf("chatgpt web WebAuthn import requires a current access token or session cookie")
+	}
 	switch credential.RefreshStrategy {
 	case RefreshStrategyWebOAuthRT:
 		if strings.TrimSpace(credential.RefreshToken) == "" {

@@ -58,8 +58,11 @@ func TestDecodeCredentialRejectsInvalidWebAuthnSchemas(t *testing.T) {
 		{name: "noncanonical_credential_id", schema: 2, key: valid, mutate: func(key *WebAuthnCredential) { key.CredentialID += " " }},
 		{name: "noncanonical_user_handle", schema: 2, key: valid, mutate: func(key *WebAuthnCredential) { key.UserHandle += " " }},
 		{name: "wrong_algorithm", schema: 2, key: valid, mutate: func(key *WebAuthnCredential) { key.Algorithm = -257 }},
+		{name: "bad_user_handle", schema: 2, key: valid, mutate: func(key *WebAuthnCredential) { key.UserHandle = "not base64url" }},
 		{name: "bad_private_key", schema: 2, key: valid, mutate: func(key *WebAuthnCredential) { key.PrivateKeyPKCS8 = "not-base64" }},
 		{name: "missing_factor", schema: 2, key: valid, mutate: func(key *WebAuthnCredential) { key.MFAFactorID = "" }},
+		{name: "bad_created_at", schema: 2, key: valid, mutate: func(key *WebAuthnCredential) { key.CreatedAt = "yesterday" }},
+		{name: "bad_last_used_at", schema: 2, key: valid, mutate: func(key *WebAuthnCredential) { key.LastUsedAt = "tomorrow" }},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -84,6 +87,50 @@ func TestDecodeCredentialRejectsInvalidWebAuthnSchemas(t *testing.T) {
 				t.Fatalf("DecodeCredential() error = %v", errDecode)
 			}
 		})
+	}
+}
+
+func TestDecodeCredentialRejectsIncompleteWebAuthnV1(t *testing.T) {
+	keyPayload, errMarshal := json.Marshal(testWebAuthnCredential(t))
+	if errMarshal != nil {
+		t.Fatal(errMarshal)
+	}
+	var key map[string]any
+	if errUnmarshal := json.Unmarshal(keyPayload, &key); errUnmarshal != nil {
+		t.Fatal(errUnmarshal)
+	}
+	for _, missing := range []string{"sign_count", "backup_eligible", "backup_state", "last_used_at"} {
+		t.Run(missing, func(t *testing.T) {
+			incomplete := make(map[string]any, len(key))
+			for field, value := range key {
+				incomplete[field] = value
+			}
+			delete(incomplete, missing)
+			payload, errEncode := json.Marshal(map[string]any{
+				"type":                      Provider,
+				"credential_schema_version": CredentialSchemaVersionWebAuthn,
+				"email":                     "person@example.com",
+				"access_token":              "access-token",
+				"webauthn":                  incomplete,
+			})
+			if errEncode != nil {
+				t.Fatal(errEncode)
+			}
+			if _, errDecode := DecodeCredential(payload); errDecode == nil {
+				t.Fatalf("DecodeCredential() accepted WebAuthn without %s", missing)
+			}
+		})
+	}
+}
+
+func TestCompareWebAuthnLastUsedAtUsesTimeSemantics(t *testing.T) {
+	earlierWithOffset := "2026-08-05T10:00:00+08:00"
+	laterUTC := "2026-08-05T03:00:00Z"
+	if CompareWebAuthnLastUsedAt(laterUTC, earlierWithOffset) <= 0 {
+		t.Fatal("later UTC timestamp was not ordered after an earlier offset timestamp")
+	}
+	if CompareWebAuthnLastUsedAt("", earlierWithOffset) >= 0 {
+		t.Fatal("empty timestamp was not ordered before a valid timestamp")
 	}
 }
 

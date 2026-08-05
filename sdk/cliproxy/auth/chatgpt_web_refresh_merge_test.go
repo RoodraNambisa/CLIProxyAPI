@@ -2,6 +2,11 @@ package auth
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"encoding/base64"
 	"sync"
 	"testing"
 	"time"
@@ -227,6 +232,51 @@ func TestUpdateChatGPTWebReloginAllowsConcurrentRuntimeIdentityEnrichment(t *tes
 	}
 }
 
+func TestUpdateChatGPTWebReloginAllowsConcurrentPasskeyCounterAdvance(t *testing.T) {
+	manager := NewManager(nil, nil, nil)
+	auth := chatGPTWebRefreshMergeAuth(nil)
+	auth.ID = "chatgpt-web-relogin-passkey-counter"
+	addChatGPTWebRefreshMergePasskey(t, auth, 4, "2026-08-05T00:00:00Z")
+	registered, errRegister := manager.Register(WithSkipPersist(t.Context()), auth)
+	if errRegister != nil {
+		t.Fatal(errRegister)
+	}
+	relogin := registered.Clone()
+	relogin.Metadata["access_token"] = "relogin-access"
+
+	_, current, errMutate := manager.MutateRuntimeMetadataIfCurrent(t.Context(), registered, func(candidate *Auth) {
+		credential, errParse := chatgptwebauth.ParseCredential(candidate.Metadata)
+		if errParse != nil {
+			t.Errorf("parse credential: %v", errParse)
+			return
+		}
+		credential.WebAuthn.SignCount = 5
+		credential.WebAuthn.LastUsedAt = "2026-08-05T01:00:00Z"
+		credential.ApplyToMetadata(candidate.Metadata)
+	})
+	if errMutate != nil || !current {
+		t.Fatalf("concurrent Passkey mutation = current %v error %v", current, errMutate)
+	}
+	installed, current, errRelogin := manager.UpdateChatGPTWebReloginIfCurrent(
+		WithSkipPersist(t.Context()),
+		registered,
+		relogin,
+	)
+	if errRelogin != nil {
+		t.Fatalf("UpdateChatGPTWebReloginIfCurrent() error = %v", errRelogin)
+	}
+	if !current || installed == nil {
+		t.Fatalf("UpdateChatGPTWebReloginIfCurrent() = (%v, %v), want current install", installed, current)
+	}
+	credential, errParse := chatgptwebauth.ParseCredential(installed.Metadata)
+	if errParse != nil {
+		t.Fatal(errParse)
+	}
+	if credential.WebAuthn.SignCount != 5 || credential.WebAuthn.LastUsedAt != "2026-08-05T01:00:00Z" {
+		t.Fatalf("installed Passkey state = %+v", credential.WebAuthn)
+	}
+}
+
 func TestUpdateChatGPTWebReloginRejectsConcurrentRuntimeIdentityConflict(t *testing.T) {
 	manager := NewManager(nil, nil, nil)
 	auth := chatGPTWebRefreshMergeAuth(nil)
@@ -333,6 +383,37 @@ func TestCarryForwardConcurrentRefreshMetadataPreservesCurrentOnlyCookies(t *tes
 	}
 	if len(merged.Cookies) != 2 || merged.Cookies[1].Name != "runtime" || merged.Cookies[1].Value != "current" {
 		t.Fatalf("cookies = %+v", merged.Cookies)
+	}
+}
+
+func TestCarryForwardConcurrentRefreshMetadataPreservesNewestPasskeyState(t *testing.T) {
+	baseline := chatGPTWebRefreshMergeAuth(nil)
+	addChatGPTWebRefreshMergePasskey(t, baseline, 2, "2026-08-05T00:00:00Z")
+	current := baseline.Clone()
+	currentCredential, errParse := chatgptwebauth.ParseCredential(current.Metadata)
+	if errParse != nil {
+		t.Fatal(errParse)
+	}
+	currentCredential.WebAuthn.SignCount = 4
+	currentCredential.WebAuthn.LastUsedAt = "2026-08-05T02:00:00Z"
+	currentCredential.ApplyToMetadata(current.Metadata)
+	refreshed := baseline.Clone()
+	refreshedCredential, errParse := chatgptwebauth.ParseCredential(refreshed.Metadata)
+	if errParse != nil {
+		t.Fatal(errParse)
+	}
+	refreshedCredential.WebAuthn.SignCount = 3
+	refreshedCredential.WebAuthn.LastUsedAt = "2026-08-05T01:00:00Z"
+	refreshedCredential.ApplyToMetadata(refreshed.Metadata)
+	next := refreshed.Clone()
+
+	carryForwardConcurrentRefreshMetadata(baseline, current, refreshed, next)
+	merged, errParse := chatgptwebauth.ParseCredential(next.Metadata)
+	if errParse != nil {
+		t.Fatal(errParse)
+	}
+	if merged.WebAuthn.SignCount != 4 || merged.WebAuthn.LastUsedAt != "2026-08-05T02:00:00Z" {
+		t.Fatalf("merged Passkey state = %+v", merged.WebAuthn)
 	}
 }
 
@@ -541,4 +622,38 @@ func chatGPTWebRefreshMergeAuth(cookies []chatgptwebauth.Cookie) *Auth {
 	metadata := make(map[string]any)
 	credential.ApplyToMetadata(metadata)
 	return &Auth{ID: "web.json", Provider: chatgptwebauth.Provider, Metadata: metadata}
+}
+
+func addChatGPTWebRefreshMergePasskey(t *testing.T, auth *Auth, signCount uint32, lastUsedAt string) {
+	t.Helper()
+	credential, errCredential := chatgptwebauth.ParseCredential(auth.Metadata)
+	if errCredential != nil {
+		t.Fatal(errCredential)
+	}
+	privateKey, errGenerate := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if errGenerate != nil {
+		t.Fatal(errGenerate)
+	}
+	privateDER, errMarshal := x509.MarshalPKCS8PrivateKey(privateKey)
+	if errMarshal != nil {
+		t.Fatal(errMarshal)
+	}
+	credential.CredentialSchemaVersion = chatgptwebauth.CredentialSchemaVersionWebAuthn
+	credential.WebAuthn = &chatgptwebauth.WebAuthnCredential{
+		Version:         chatgptwebauth.WebAuthnCredentialVersion,
+		CredentialID:    base64.RawURLEncoding.EncodeToString([]byte("refresh-merge-credential")),
+		UserHandle:      base64.RawURLEncoding.EncodeToString([]byte("refresh-merge-user")),
+		RPID:            chatgptwebauth.WebAuthnRPID,
+		Origin:          chatgptwebauth.WebAuthnOrigin,
+		Algorithm:       chatgptwebauth.WebAuthnES256Algorithm,
+		PrivateKeyPKCS8: base64.StdEncoding.EncodeToString(privateDER),
+		SignCount:       signCount,
+		MFAFactorID:     "refresh-merge-factor",
+		Transports:      []string{"internal"},
+		UserPresent:     true,
+		UserVerified:    true,
+		CreatedAt:       "2026-08-05T00:00:00Z",
+		LastUsedAt:      lastUsedAt,
+	}
+	credential.ApplyToMetadata(auth.Metadata)
 }

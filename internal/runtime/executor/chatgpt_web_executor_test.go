@@ -734,22 +734,56 @@ func TestChatGPTWebExecutorSessionCookieFallbackPreservesCodexSource(t *testing.
 
 func TestChatGPTWebExecutorSessionCookieFallbackLifecycle(t *testing.T) {
 	tests := []struct {
-		name        string
-		errorCode   string
-		state       chatgptwebauth.LifecycleState
-		retryable   bool
-		terminal    bool
-		wantUpdate  bool
-		wantState   string
-		wantPersist bool
+		name         string
+		errorCode    string
+		state        chatgptwebauth.LifecycleState
+		retryable    bool
+		terminal     bool
+		withPassword bool
+		withPasskey  bool
+		autoRelogin  bool
+		wantUpdate   bool
+		wantState    string
+		wantPersist  bool
 	}{
 		{
-			name:        "expired session is dead",
+			name:        "expired session without recovery is dead",
 			errorCode:   "session_expired",
 			state:       chatgptwebauth.LifecycleReauthRequired,
 			terminal:    true,
 			wantUpdate:  true,
 			wantState:   cliproxyauth.LifecycleStateDead,
+			wantPersist: true,
+		},
+		{
+			name:         "expired session with password requires reauthentication",
+			errorCode:    "session_expired",
+			state:        chatgptwebauth.LifecycleReauthRequired,
+			terminal:     true,
+			withPassword: true,
+			wantUpdate:   true,
+			wantState:    cliproxyauth.LifecycleStateReauthRequired,
+			wantPersist:  true,
+		},
+		{
+			name:        "expired session with Passkey requires reauthentication",
+			errorCode:   "session_expired",
+			state:       chatgptwebauth.LifecycleReauthRequired,
+			terminal:    true,
+			withPasskey: true,
+			wantUpdate:  true,
+			wantState:   cliproxyauth.LifecycleStateReauthRequired,
+			wantPersist: true,
+		},
+		{
+			name:        "expired session with Passkey schedules automatic re-login",
+			errorCode:   "session_expired",
+			state:       chatgptwebauth.LifecycleReauthRequired,
+			terminal:    true,
+			withPasskey: true,
+			autoRelogin: true,
+			wantUpdate:  true,
+			wantState:   cliproxyauth.LifecycleStateReloginPending,
 			wantPersist: true,
 		},
 		{
@@ -800,15 +834,22 @@ func TestChatGPTWebExecutorSessionCookieFallbackLifecycle(t *testing.T) {
 			}
 			executor := NewChatGPTWebExecutor(&config.Config{ChatGPTWeb: config.ChatGPTWebConfig{
 				SessionCookieRefreshOnTokenFailure: true,
+				AutoRelogin:                        test.autoRelogin,
 			}}, nil)
 			t.Cleanup(func() { _ = executor.Close() })
 			executor.authService = service
-			auth := chatGPTWebTestAuth("session-lifecycle-" + strings.ReplaceAll(test.name, " ", "-"))
+			authID := "session-lifecycle-" + strings.ReplaceAll(test.name, " ", "-")
+			auth := chatGPTWebTestAuth(authID)
+			if test.withPasskey {
+				auth = chatGPTWebPasskeyTestAuth(t, authID, 0)
+			}
 			credential, errCredential := chatgptwebauth.ParseCredential(auth.Metadata)
 			if errCredential != nil {
 				t.Fatal(errCredential)
 			}
-			credential.Password = ""
+			if !test.withPassword {
+				credential.Password = ""
+			}
 			credential.TOTPSecret = ""
 			credential.RefreshStrategy = chatgptwebauth.RefreshStrategyTokenOnly
 			credential.Cookies = chatGPTWebCompleteSessionCookies()

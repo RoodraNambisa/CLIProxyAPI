@@ -3,9 +3,40 @@ package chatgptweb
 import (
 	"encoding/json"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 )
+
+func TestDecodeImportCredentialRejectsWebAuthnWithoutCurrentSession(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		cookies []map[string]any
+	}{
+		{name: "missing"},
+		{name: "wrong domain", cookies: []map[string]any{{
+			"name": "__Secure-next-auth.session-token", "value": "session", "domain": "example.com", "path": "/", "secure": true,
+		}}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			payload, errMarshal := json.Marshal(map[string]any{
+				"type":                      Provider,
+				"credential_schema_version": CredentialSchemaVersionWebAuthn,
+				"email":                     "person@example.com",
+				"refresh_strategy":          RefreshStrategyWebOAuthRT,
+				"refresh_token":             "refresh-token",
+				"cookies":                   test.cookies,
+				"webauthn":                  testWebAuthnCredential(t),
+			})
+			if errMarshal != nil {
+				t.Fatal(errMarshal)
+			}
+			if _, errDecode := DecodeImportCredential(payload); errDecode == nil || !strings.Contains(errDecode.Error(), "current access token or session cookie") {
+				t.Fatalf("DecodeImportCredential() error = %v", errDecode)
+			}
+		})
+	}
+}
 
 func TestDecodeImportCredentialCompatibilityFields(t *testing.T) {
 	tests := []struct {

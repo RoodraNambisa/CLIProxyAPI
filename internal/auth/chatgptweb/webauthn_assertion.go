@@ -102,7 +102,7 @@ func createWebAuthnAssertion(
 		return nil, fmt.Errorf("%w: %w", errWebAuthnStatePersistence, errPersist)
 	}
 	if errValidate := ValidateWebAuthnCredential(&persisted); errValidate != nil ||
-		persisted.SignCount != credential.SignCount || !sameWebAuthnAuthenticator(&persisted, credential) {
+		persisted.SignCount != credential.SignCount || !WebAuthnAuthenticatorMatches(&persisted, credential) {
 		return nil, errors.New("persisted WebAuthn signature counter did not match the credential")
 	}
 	*credential = *cloneWebAuthnCredential(&persisted)
@@ -148,7 +148,9 @@ func createWebAuthnAssertion(
 	return result, nil
 }
 
-func sameWebAuthnAuthenticator(left, right *WebAuthnCredential) bool {
+// WebAuthnAuthenticatorMatches compares immutable authenticator material while
+// ignoring the monotonic counter and last-used timestamp.
+func WebAuthnAuthenticatorMatches(left, right *WebAuthnCredential) bool {
 	if left == nil || right == nil {
 		return left == right
 	}

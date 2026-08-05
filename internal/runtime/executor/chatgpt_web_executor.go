@@ -1095,6 +1095,9 @@ func (e *ChatGPTWebExecutor) reloginCurrent(ctx context.Context, expected *clipr
 		LoginProxy:         loginProxy,
 		LoginProxyResolved: true,
 		Relogin:            true,
+		PersistWebAuthn: func(persistCtx context.Context, updated chatgptwebauth.WebAuthnCredential) (chatgptwebauth.WebAuthnCredential, error) {
+			return e.persistWebAuthnReloginState(persistCtx, expected, updated)
+		},
 	})
 	if errContext := ctx.Err(); errContext != nil {
 		if latest, ok := e.manager.GetByID(expected.ID); ok &&
@@ -1103,7 +1106,12 @@ func (e *ChatGPTWebExecutor) reloginCurrent(ctx context.Context, expected *clipr
 		}
 		return nil, false, errContext
 	}
-	if errLogin != nil && chatgptwebauth.IsRetryable(errLogin) && !loginProxyEnabled {
+	if errors.Is(errLogin, chatgptwebauth.ErrCredentialSuperseded) {
+		latest, _ = e.manager.GetByID(expected.ID)
+		return cloneChatGPTWebAuth(latest), false, chatgptwebauth.ErrCredentialSuperseded
+	}
+	if errLogin != nil && chatgptwebauth.IsRetryable(errLogin) && !loginProxyEnabled &&
+		chatGPTWebErrorCode(errLogin) != "passkey_state_persist_failed" {
 		return nil, false, e.manager.ReportProxyFailure(ctx, resolved, errLogin)
 	}
 	if result == nil {
@@ -1129,6 +1137,62 @@ func (e *ChatGPTWebExecutor) reloginCurrent(ctx context.Context, expected *clipr
 		return cloneChatGPTWebAuth(installed), true, errLogin
 	}
 	return cloneChatGPTWebAuth(installed), true, nil
+}
+
+func (e *ChatGPTWebExecutor) persistWebAuthnReloginState(
+	ctx context.Context,
+	expected *cliproxyauth.Auth,
+	updated chatgptwebauth.WebAuthnCredential,
+) (chatgptwebauth.WebAuthnCredential, error) {
+	if e == nil || e.manager == nil || expected == nil {
+		return chatgptwebauth.WebAuthnCredential{}, chatgptwebauth.ErrCredentialSuperseded
+	}
+	if errValidate := chatgptwebauth.ValidateWebAuthnCredential(&updated); errValidate != nil {
+		return chatgptwebauth.WebAuthnCredential{}, errValidate
+	}
+	var mutationErr error
+	installed, current, errMutate := e.manager.MutateRuntimeMetadataIfCurrent(ctx, expected, func(candidate *cliproxyauth.Auth) {
+		if mutationErr != nil || candidate == nil {
+			return
+		}
+		credential, errParse := chatgptwebauth.ParseCredential(candidate.Metadata)
+		if errParse != nil || credential.WebAuthn == nil ||
+			!chatgptwebauth.WebAuthnAuthenticatorMatches(credential.WebAuthn, &updated) {
+			mutationErr = chatgptwebauth.ErrCredentialSuperseded
+			return
+		}
+		currentCount := credential.WebAuthn.SignCount
+		if updated.SignCount < currentCount || updated.SignCount-currentCount > 1 {
+			mutationErr = errors.New("chatgpt web Passkey signature counter is not monotonic")
+			return
+		}
+		if chatgptwebauth.CompareWebAuthnLastUsedAt(updated.LastUsedAt, credential.WebAuthn.LastUsedAt) < 0 {
+			mutationErr = errors.New("chatgpt web Passkey last-used timestamp moved backwards")
+			return
+		}
+		webAuthn := updated
+		webAuthn.Transports = append([]string(nil), updated.Transports...)
+		credential.WebAuthn = &webAuthn
+		credential.ApplyToMetadata(candidate.Metadata)
+	})
+	if errMutate != nil {
+		return chatgptwebauth.WebAuthnCredential{}, errMutate
+	}
+	if !current || mutationErr != nil {
+		if mutationErr != nil {
+			return chatgptwebauth.WebAuthnCredential{}, mutationErr
+		}
+		return chatgptwebauth.WebAuthnCredential{}, chatgptwebauth.ErrCredentialSuperseded
+	}
+	persisted, errParse := chatgptwebauth.ParseCredential(installed.Metadata)
+	if errParse != nil || persisted.WebAuthn == nil ||
+		!chatgptwebauth.WebAuthnAuthenticatorMatches(persisted.WebAuthn, &updated) ||
+		persisted.WebAuthn.SignCount != updated.SignCount {
+		return chatgptwebauth.WebAuthnCredential{}, errors.New("persisted chatgpt web Passkey state is invalid")
+	}
+	result := *persisted.WebAuthn
+	result.Transports = append([]string(nil), persisted.WebAuthn.Transports...)
+	return result, nil
 }
 
 func (e *ChatGPTWebExecutor) refreshCredential(ctx context.Context, auth *cliproxyauth.Auth, waitForCompletion bool) (*cliproxyauth.Auth, error, bool) {
@@ -1225,7 +1289,8 @@ func (e *ChatGPTWebExecutor) refreshCredential(ctx context.Context, auth *clipro
 		state = string(authError.State)
 	}
 	strategy := result.credential.RefreshStrategy
-	if strategy == chatgptwebauth.RefreshStrategyTokenOnly || strategy == chatgptwebauth.RefreshStrategyCodexSource {
+	if strategy == chatgptwebauth.RefreshStrategyCodexSource ||
+		strategy == chatgptwebauth.RefreshStrategyTokenOnly && !chatGPTWebCredentialCanRelogin(result.credential) {
 		state = cliproxyauth.LifecycleStateReauthRequired
 	} else if state != cliproxyauth.LifecycleStateDead && state != cliproxyauth.LifecycleStateInteractionRequired {
 		if e.AutoReloginEnabled() && chatGPTWebCredentialCanRelogin(result.credential) {
@@ -1316,13 +1381,17 @@ func classifyChatGPTWebSessionCookieRefresh(
 		return credential, err, false
 	}
 	promoted := *authError
-	promoted.State = chatgptwebauth.LifecycleDead
-	promoted.LifecycleState = chatgptwebauth.LifecycleDead
+	targetState := chatgptwebauth.LifecycleDead
+	if chatGPTWebCredentialCanRelogin(credential) {
+		targetState = chatgptwebauth.LifecycleReauthRequired
+	}
+	promoted.State = targetState
+	promoted.LifecycleState = targetState
 	promoted.Retryable = false
 	promoted.Terminal = true
 	if credential != nil {
 		credential = cloneChatGPTWebCredential(credential)
-		credential.LifecycleState = chatgptwebauth.LifecycleDead
+		credential.LifecycleState = targetState
 		credential.LifecycleReason = chatgptwebauth.SafeLifecycleReason(promoted.Code)
 	}
 	return credential, &promoted, true
@@ -1363,7 +1432,13 @@ func (e *ChatGPTWebExecutor) refreshFromCodexSource(ctx context.Context, credent
 }
 
 func chatGPTWebCredentialCanRelogin(credential *chatgptwebauth.Credential) bool {
-	return credential != nil && strings.TrimSpace(credential.Email) != "" && strings.TrimSpace(credential.Password) != ""
+	if credential == nil || strings.TrimSpace(credential.Email) == "" {
+		return false
+	}
+	if credential.WebAuthn != nil && chatgptwebauth.ValidateWebAuthnCredential(credential.WebAuthn) == nil {
+		return true
+	}
+	return strings.TrimSpace(credential.Password) != ""
 }
 
 type chatGPTWebRefreshModeError struct {
