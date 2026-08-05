@@ -529,10 +529,10 @@ func (s *Service) restoreChatGPTWebImportAccountInfoIntent(auth *coreauth.Auth) 
 		return
 	}
 	trigger, ok := registered.(interface {
-		TriggerAccountInfoRefreshState(string, bool) string
+		TriggerImportAccountInfoRefreshState(string) string
 	})
 	if ok {
-		trigger.TriggerAccountInfoRefreshState(auth.ID, false)
+		trigger.TriggerImportAccountInfoRefreshState(auth.ID)
 	}
 }
 

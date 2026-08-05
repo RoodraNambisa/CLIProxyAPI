@@ -40,6 +40,10 @@ type chatGPTWebAccountInfoStateTrigger interface {
 	TriggerAccountInfoRefreshState(string, bool) string
 }
 
+type chatGPTWebImportAccountInfoStateTrigger interface {
+	TriggerImportAccountInfoRefreshState(string) string
+}
+
 var errChatGPTWebImportIdentityConflict = errors.New("chatgpt web import identity conflict")
 
 func (h *Handler) chatGPTWebMutationTaskManager() *chatGPTWebMutationTaskManager {
@@ -316,6 +320,10 @@ func triggerChatGPTWebAccountInfoRefreshAfterImport(executor chatGPTWebImportExe
 	}
 	// The account-info runtime applies the automatic-refresh switch, TTL,
 	// instance isolation, and queue deduplication to this best-effort trigger.
+	if trigger, ok := executor.(chatGPTWebImportAccountInfoStateTrigger); ok {
+		result.AccountInfoRefreshState = trigger.TriggerImportAccountInfoRefreshState(authID)
+		return
+	}
 	if trigger, ok := executor.(chatGPTWebAccountInfoStateTrigger); ok {
 		result.AccountInfoRefreshState = trigger.TriggerAccountInfoRefreshState(authID, false)
 		return

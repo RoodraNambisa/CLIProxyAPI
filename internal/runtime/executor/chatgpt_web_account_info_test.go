@@ -385,6 +385,87 @@ func TestChatGPTWebAccountInfoPeriodicScheduleLifecycle(t *testing.T) {
 	}
 }
 
+func TestChatGPTWebAccountInfoDisablingImportRefreshRemovesOnlyUploadWork(t *testing.T) {
+	enabled := true
+	runtime := newChatGPTWebAccountInfoRuntime(nil, &config.Config{ChatGPTWeb: config.ChatGPTWebConfig{
+		Import: config.ChatGPTWebImportConfig{RefreshAccountInfoAfterUpload: &enabled},
+	}})
+	if accepted, reused := runtime.triggerImportDetailed("import-only"); !accepted || reused {
+		t.Fatalf("import trigger = accepted %v reused %v", accepted, reused)
+	}
+	if accepted, reused := runtime.triggerDetailed("regular", false); !accepted || reused {
+		t.Fatalf("regular trigger = accepted %v reused %v", accepted, reused)
+	}
+
+	enabled = false
+	runtime.updateConfig(&config.Config{ChatGPTWeb: config.ChatGPTWebConfig{
+		Import: config.ChatGPTWebImportConfig{RefreshAccountInfoAfterUpload: &enabled},
+	}})
+
+	runtime.mu.Lock()
+	defer runtime.mu.Unlock()
+	if runtime.queueLengthLocked() != 1 || runtime.targetQueuedLocked("import-only") || !runtime.targetQueuedLocked("regular") {
+		t.Fatalf("queue after disabling import refresh = length %d targets %+v", runtime.queueLengthLocked(), runtime.queuedByTarget)
+	}
+}
+
+func TestChatGPTWebAccountInfoRegularTriggerUpgradesUploadWork(t *testing.T) {
+	enabled := true
+	runtime := newChatGPTWebAccountInfoRuntime(nil, &config.Config{ChatGPTWeb: config.ChatGPTWebConfig{
+		Import: config.ChatGPTWebImportConfig{RefreshAccountInfoAfterUpload: &enabled},
+	}})
+	if accepted, reused := runtime.triggerImportDetailed("shared"); !accepted || reused {
+		t.Fatalf("import trigger = accepted %v reused %v", accepted, reused)
+	}
+	if accepted, reused := runtime.triggerDetailed("shared", false); !accepted || !reused {
+		t.Fatalf("regular trigger = accepted %v reused %v", accepted, reused)
+	}
+
+	runtime.mu.Lock()
+	work := runtime.queuedWorkForTargetLocked("shared")
+	if work == nil || work.importOnly {
+		runtime.mu.Unlock()
+		t.Fatalf("upgraded work = %+v", work)
+	}
+	runtime.mu.Unlock()
+
+	enabled = false
+	runtime.updateConfig(&config.Config{ChatGPTWeb: config.ChatGPTWebConfig{
+		Import: config.ChatGPTWebImportConfig{RefreshAccountInfoAfterUpload: &enabled},
+	}})
+	runtime.mu.Lock()
+	queued := runtime.targetQueuedLocked("shared")
+	runtime.mu.Unlock()
+	if !queued {
+		t.Fatal("regular trigger was removed with upload-only work")
+	}
+}
+
+func TestChatGPTWebAccountInfoPeriodicRefreshUpgradesUploadWork(t *testing.T) {
+	enabled := true
+	period := 60
+	runtime := newChatGPTWebAccountInfoRuntime(nil, &config.Config{ChatGPTWeb: config.ChatGPTWebConfig{
+		Import: config.ChatGPTWebImportConfig{RefreshAccountInfoAfterUpload: &enabled},
+		AccountInfo: config.ChatGPTWebAccountInfoConfig{
+			PeriodicRefreshMinutes: &period,
+		},
+	}})
+	if accepted, reused := runtime.triggerImportDetailed("shared"); !accepted || reused {
+		t.Fatalf("import trigger = accepted %v reused %v", accepted, reused)
+	}
+
+	runtime.mu.Lock()
+	runtime.started = true
+	runtime.schedulePeriodicTargetsLocked([]chatgptwebauth.AccountInfoRefreshTarget{{AuthID: "shared"}}, time.Now().Add(time.Hour))
+	work := runtime.queuedWorkForTargetLocked("shared")
+	scheduled := len(runtime.scheduledByTarget["shared"])
+	runtime.started = false
+	runtime.mu.Unlock()
+	if work == nil || work.importOnly || scheduled != 0 {
+		t.Fatalf("periodic coverage = work %+v scheduled %d", work, scheduled)
+	}
+}
+
 func TestChatGPTWebAccountInfoPeriodicTargetsAreEligibleAndSorted(t *testing.T) {
 	manager := cliproxyauth.NewManager(nil, nil, nil)
 	register := func(auth *cliproxyauth.Auth) {

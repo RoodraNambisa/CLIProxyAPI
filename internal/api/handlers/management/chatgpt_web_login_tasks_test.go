@@ -248,6 +248,10 @@ func (executor *chatGPTWebManagementTestExecutor) TriggerAccountInfoRefreshState
 	return "canceled"
 }
 
+func (executor *chatGPTWebManagementTestExecutor) TriggerImportAccountInfoRefreshState(authID string) string {
+	return executor.TriggerAccountInfoRefreshState(authID, false)
+}
+
 func TestParseChatGPTWebLoginInputs(t *testing.T) {
 	inputs, errParse := parseChatGPTWebLoginInputs([]byte("\r\n person@example.com---pass---segment---JBSWY3DPEHPK3PXP\r\n"))
 	if errParse != nil {

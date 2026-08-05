@@ -189,6 +189,7 @@ type chatGPTWebAccountInfoWork struct {
 	exhausted          bool
 	quotaResetAt       time.Time
 	partialApplied     bool
+	importOnly         bool
 }
 
 type chatGPTWebAccountInfoSchedule struct {
@@ -273,6 +274,7 @@ type chatGPTWebAccountInfoRuntime struct {
 	mu                         sync.Mutex
 	cond                       *sync.Cond
 	cfg                        config.ResolvedChatGPTWebAccountInfoConfig
+	importRefreshEnabled       bool
 	queue                      []chatGPTWebAccountInfoWork
 	queueHead                  int
 	queuedCount                int
@@ -361,6 +363,7 @@ func newChatGPTWebAccountInfoRuntime(executor *ChatGPTWebExecutor, cfg *config.C
 	}
 	runtime.cond = sync.NewCond(&runtime.mu)
 	runtime.cfg = resolved
+	runtime.importRefreshEnabled = chatGPTWebImportAccountInfoRefreshEnabled(cfg)
 	return runtime
 }
 
@@ -403,8 +406,12 @@ func (runtime *chatGPTWebAccountInfoRuntime) restoreImportAccountInfoIntents() {
 		if errCredential != nil || !credential.ImportAccountInfoPending {
 			continue
 		}
-		runtime.triggerWithMode(auth.ID, chatGPTWebAccountInfoTriggerDefault)
+		runtime.triggerImportDetailed(auth.ID)
 	}
+}
+
+func chatGPTWebImportAccountInfoRefreshEnabled(cfg *config.Config) bool {
+	return cfg != nil && cfg.ChatGPTWeb.Import.Resolved().RefreshAccountInfoAfterUpload
 }
 
 func accountInfoConfigSnapshot(cfg *config.Config) config.ResolvedChatGPTWebAccountInfoConfig {
@@ -972,9 +979,14 @@ func (runtime *chatGPTWebAccountInfoRuntime) updateConfig(cfg *config.Config) {
 	}
 	previousEnabled := runtime.cfg.AutomaticRefreshEnabled()
 	previousPeriod := runtime.cfg.PeriodicRefreshMinutes
+	previousImportRefresh := runtime.importRefreshEnabled
 	runtime.cfg = resolved
+	runtime.importRefreshEnabled = chatGPTWebImportAccountInfoRefreshEnabled(cfg)
 	resolvedEnabled := resolved.AutomaticRefreshEnabled()
 	periodicChanged := previousEnabled != resolvedEnabled || previousPeriod != resolved.PeriodicRefreshMinutes
+	if previousImportRefresh && !runtime.importRefreshEnabled {
+		runtime.disableImportRefreshLocked()
+	}
 	if runtime.started {
 		if !resolvedEnabled {
 			runtime.disableAutomaticRefreshLocked()
@@ -996,7 +1008,36 @@ func (runtime *chatGPTWebAccountInfoRuntime) updateConfig(cfg *config.Config) {
 		if !previousEnabled && resolvedEnabled {
 			runtime.restoreRecoverySchedules()
 		}
+		if !previousImportRefresh && runtime.importRefreshEnabled && resolvedEnabled {
+			runtime.restoreImportAccountInfoIntents()
+		}
 	}
+}
+
+func (runtime *chatGPTWebAccountInfoRuntime) disableImportRefreshLocked() {
+	activeQueue := runtime.queuedWorkLocked()
+	filtered := activeQueue[:0]
+	for _, work := range activeQueue {
+		if work.importOnly {
+			runtime.releaseWorkEpochLocked(work)
+			continue
+		}
+		filtered = append(filtered, work)
+	}
+	runtime.replaceQueuedWorkLocked(filtered)
+
+	keys := make([]string, 0)
+	for key, entry := range runtime.scheduled {
+		if entry != nil && entry.work.importOnly {
+			keys = append(keys, key)
+		}
+	}
+	for _, key := range keys {
+		if entry := runtime.removeScheduleLocked(key); entry != nil {
+			runtime.releaseWorkEpochLocked(entry.work)
+		}
+	}
+	runtime.cond.Broadcast()
 }
 
 func (runtime *chatGPTWebAccountInfoRuntime) disableAutomaticRefreshLocked() {
@@ -1193,6 +1234,12 @@ func (runtime *chatGPTWebAccountInfoRuntime) worker(id int, stop <-chan struct{}
 		}
 		work, ok := runtime.dequeueLocked()
 		if !ok {
+			runtime.mu.Unlock()
+			continue
+		}
+		if work.importOnly && !runtime.importRefreshEnabled {
+			runtime.releaseWorkEpochLocked(work)
+			runtime.cond.Broadcast()
 			runtime.mu.Unlock()
 			continue
 		}
@@ -1425,10 +1472,21 @@ func (runtime *chatGPTWebAccountInfoRuntime) periodicTargetCoveredLocked(
 	if runtimeKey == "" {
 		return true
 	}
-	return runtime.inflight[runtimeKey] > 0 ||
-		runtime.pendingTriggers[runtimeKey] != chatGPTWebAccountInfoTriggerNone ||
-		runtime.targetQueuedLocked(runtimeKey) ||
-		len(runtime.scheduledByTarget[runtimeKey]) > 0
+	if runtime.inflight[runtimeKey] > 0 ||
+		runtime.pendingTriggers[runtimeKey] != chatGPTWebAccountInfoTriggerNone {
+		return true
+	}
+	if work := runtime.queuedWorkForTargetLocked(runtimeKey); work != nil {
+		work.importOnly = false
+		return true
+	}
+	for _, entry := range runtime.scheduledByTarget[runtimeKey] {
+		if entry != nil {
+			entry.work.importOnly = false
+			return true
+		}
+	}
+	return false
 }
 
 func (runtime *chatGPTWebAccountInfoRuntime) queuedWorkLocked() []chatGPTWebAccountInfoWork {
@@ -3565,6 +3623,40 @@ func (runtime *chatGPTWebAccountInfoRuntime) triggerDetailed(authID string, forc
 	return runtime.triggerWithModeDetailed(authID, mode)
 }
 
+func (runtime *chatGPTWebAccountInfoRuntime) triggerImportDetailed(authID string) (accepted bool, reused bool) {
+	if runtime == nil || strings.TrimSpace(authID) == "" {
+		return false, false
+	}
+	target, current := runtime.resolveCurrentTarget(chatgptwebauth.AccountInfoRefreshTarget{
+		Name:   strings.TrimSpace(authID),
+		AuthID: strings.TrimSpace(authID),
+	})
+	if !current {
+		return false, false
+	}
+	runtime.mu.Lock()
+	defer runtime.mu.Unlock()
+	if !runtime.cfg.AutomaticRefreshEnabled() || !runtime.importRefreshEnabled {
+		return false, false
+	}
+	target, current = runtime.resolveCurrentTargetLocked(target)
+	if !current {
+		return false, false
+	}
+	runtimeKey := chatGPTWebAccountInfoTargetKey(target)
+	if runtime.targetHasRefreshWorkLocked(runtimeKey) {
+		return true, true
+	}
+	work := chatGPTWebAccountInfoWork{
+		target:     target,
+		attempt:    1,
+		automatic:  true,
+		importOnly: true,
+	}
+	enqueued, _ := runtime.enqueueForCurrentInstanceLocked(work)
+	return enqueued, false
+}
+
 func (runtime *chatGPTWebAccountInfoRuntime) triggerAutomaticRecheck(authID string) bool {
 	return runtime.triggerWithMode(authID, chatGPTWebAccountInfoTriggerAutomaticRecheck)
 }
@@ -3708,6 +3800,7 @@ func (runtime *chatGPTWebAccountInfoRuntime) triggerTargetLocked(
 		return true
 	}
 	if work := runtime.queuedWorkForTargetLocked(runtimeKey); work != nil {
+		work.importOnly = false
 		runtime.trackIndependentTriggerLocked(work, mode)
 		work.force = work.force || mode.forced()
 		return true
@@ -3739,12 +3832,14 @@ func (runtime *chatGPTWebAccountInfoRuntime) handleScheduledTriggerLocked(
 	if mode == chatGPTWebAccountInfoTriggerAutomaticRecheck {
 		if retry := runtime.scheduled["retry:"+runtimeKey]; retry != nil &&
 			chatGPTWebAccountInfoTargetKey(retry.work.target) == runtimeKey {
+			retry.work.importOnly = false
 			retry.work.force = true
 			runtime.refreshNextScheduleStateForTargetLocked(target)
 			return true
 		}
 		for _, scheduled := range scheduledForTarget {
 			if scheduled != nil && scheduled.work.taskID != "" {
+				scheduled.work.importOnly = false
 				runtime.trackIndependentTriggerLocked(&scheduled.work, mode)
 				scheduled.work.force = true
 				runtime.refreshNextScheduleStateForTargetLocked(target)
@@ -3754,6 +3849,7 @@ func (runtime *chatGPTWebAccountInfoRuntime) handleScheduledTriggerLocked(
 		for _, key := range []string{"recovery:" + runtimeKey, "force:" + runtimeKey} {
 			if scheduled := runtime.scheduled[key]; scheduled != nil &&
 				chatGPTWebAccountInfoTargetKey(scheduled.work.target) == runtimeKey {
+				scheduled.work.importOnly = false
 				runtime.promoteAccountInfoScheduleLocked(scheduled, target, now)
 				return true
 			}
@@ -3761,6 +3857,7 @@ func (runtime *chatGPTWebAccountInfoRuntime) handleScheduledTriggerLocked(
 	}
 	for _, scheduled := range scheduledForTarget {
 		if scheduled != nil {
+			scheduled.work.importOnly = false
 			runtime.trackIndependentTriggerLocked(&scheduled.work, mode)
 			if mode.forced() && mode != chatGPTWebAccountInfoTriggerAutomaticRecheck {
 				runtime.promoteAccountInfoScheduleLocked(scheduled, target, now)
@@ -3954,6 +4051,22 @@ func (e *ChatGPTWebExecutor) TriggerAccountInfoRefreshState(authID string, force
 		return "canceled"
 	}
 	accepted, reused := e.accountInfo.triggerDetailed(authID, force)
+	if !accepted {
+		return "canceled"
+	}
+	if reused {
+		return "reused"
+	}
+	return "queued"
+}
+
+// TriggerImportAccountInfoRefreshState schedules upload-only account-info work
+// that can be canceled if the post-upload setting is disabled before execution.
+func (e *ChatGPTWebExecutor) TriggerImportAccountInfoRefreshState(authID string) string {
+	if e == nil || e.accountInfo == nil {
+		return "canceled"
+	}
+	accepted, reused := e.accountInfo.triggerImportDetailed(authID)
 	if !accepted {
 		return "canceled"
 	}
