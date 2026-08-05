@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -235,6 +236,12 @@ type Service struct {
 	// maintenanceWake nudges the maintenance worker to wake early.
 	maintenanceWake chan struct{}
 
+	// maintenanceDirtyQueue stores changed auth IDs that need an indexed policy check.
+	maintenanceDirtyQueue []string
+
+	// maintenanceDirtySet deduplicates changed auth IDs waiting for policy checks.
+	maintenanceDirtySet map[string]struct{}
+
 	// maintenanceDependencyReconcilePending retries retained Codex cleanup after a transient failure.
 	maintenanceDependencyReconcilePending bool
 
@@ -269,6 +276,7 @@ const (
 	defaultMaintenanceQuotaStrikeThreshold  = 6
 	authMaintenanceStagedIgnoreWindow       = 200 * time.Millisecond
 	authMaintenanceCheckpointDeletes        = 64
+	authMaintenanceDirtyBatchSize           = 256
 	defaultModelSyncWorkers                 = 4
 	defaultModelSyncQueueSize               = 256
 	authMaintenanceMetadataPrefix           = "auth_maintenance_"
@@ -338,9 +346,7 @@ func (h authMaintenanceHook) handleAuthChange(ctx context.Context, auth *coreaut
 	if h.service == nil || auth == nil || strings.TrimSpace(auth.ID) == "" {
 		return
 	}
-	if isNativeChatGPTWebAuth(auth) && auth.LifecycleState() == coreauth.LifecycleStateDead {
-		h.service.wakeAuthMaintenance()
-	}
+	h.service.markAuthMaintenanceChange(auth.ID)
 	if ctx != nil && ctx.Value(modelSyncHookSuppressedContextKey{}) != nil {
 		if h.service.coreManager != nil {
 			current, ok := h.service.coreManager.CurrentAuthInstallation(auth)
@@ -1003,6 +1009,18 @@ func chatGPTWebDeadAuthDeletePoliciesEqual(first, second chatGPTWebDeadAuthDelet
 	return true
 }
 
+func authMaintenanceConfigsEqual(first, second config.AuthMaintenanceConfig) bool {
+	return first.Enable == second.Enable &&
+		first.ScanIntervalSeconds == second.ScanIntervalSeconds &&
+		first.DeleteIntervalSeconds == second.DeleteIntervalSeconds &&
+		slices.Equal(first.DeleteStatusCodes, second.DeleteStatusCodes) &&
+		slices.Equal(first.DisableStatusCodes, second.DisableStatusCodes) &&
+		first.DeleteQuotaExceeded == second.DeleteQuotaExceeded &&
+		first.QuotaStrikeThreshold == second.QuotaStrikeThreshold &&
+		first.DisableQuotaExceeded == second.DisableQuotaExceeded &&
+		first.DisableQuotaStrikeThreshold == second.DisableQuotaStrikeThreshold
+}
+
 func (s *Service) warnAuthMaintenanceConfig(cfg config.AuthMaintenanceConfig) {
 	if !cfg.Enable {
 		return
@@ -1236,6 +1254,9 @@ func (s *Service) ensureAuthMaintenanceQueue() {
 	if s.maintenanceWake == nil {
 		s.maintenanceWake = make(chan struct{}, 1)
 	}
+	if s.maintenanceDirtySet == nil {
+		s.maintenanceDirtySet = make(map[string]struct{})
+	}
 }
 
 func (s *Service) wakeAuthMaintenance() {
@@ -1247,6 +1268,71 @@ func (s *Service) wakeAuthMaintenance() {
 	case s.maintenanceWake <- struct{}{}:
 	default:
 	}
+}
+
+func (s *Service) markAuthMaintenanceChange(authID string) {
+	if s == nil {
+		return
+	}
+	cfg := s.currentConfig()
+	if cfg == nil || (!cfg.AuthMaintenance.Enable && !cfg.ChatGPTWeb.AutoDeleteDeadAuths) {
+		return
+	}
+	s.markAuthMaintenanceDirty(authID)
+}
+
+func (s *Service) markAuthMaintenanceDirty(authID string) bool {
+	if s == nil {
+		return false
+	}
+	authID = strings.TrimSpace(authID)
+	if authID == "" {
+		return false
+	}
+	s.ensureAuthMaintenanceQueue()
+	s.maintenanceMu.Lock()
+	if _, exists := s.maintenanceDirtySet[authID]; exists {
+		s.maintenanceMu.Unlock()
+		return false
+	}
+	s.maintenanceDirtySet[authID] = struct{}{}
+	s.maintenanceDirtyQueue = append(s.maintenanceDirtyQueue, authID)
+	s.maintenanceMu.Unlock()
+	s.wakeAuthMaintenance()
+	return true
+}
+
+func (s *Service) takeAuthMaintenanceDirtyIDs(limit int) []string {
+	if s == nil || limit <= 0 {
+		return nil
+	}
+	s.maintenanceMu.Lock()
+	defer s.maintenanceMu.Unlock()
+	if len(s.maintenanceDirtyQueue) == 0 {
+		return nil
+	}
+	if limit > len(s.maintenanceDirtyQueue) {
+		limit = len(s.maintenanceDirtyQueue)
+	}
+	ids := append([]string(nil), s.maintenanceDirtyQueue[:limit]...)
+	clear(s.maintenanceDirtyQueue[:limit])
+	s.maintenanceDirtyQueue = s.maintenanceDirtyQueue[limit:]
+	if len(s.maintenanceDirtyQueue) == 0 {
+		s.maintenanceDirtyQueue = nil
+	}
+	for _, id := range ids {
+		delete(s.maintenanceDirtySet, id)
+	}
+	return ids
+}
+
+func (s *Service) hasAuthMaintenanceDirtyIDs() bool {
+	if s == nil {
+		return false
+	}
+	s.maintenanceMu.Lock()
+	defer s.maintenanceMu.Unlock()
+	return len(s.maintenanceDirtyQueue) > 0
 }
 
 func (s *Service) installAuthMaintenanceHook(ctx context.Context) {
@@ -1964,6 +2050,59 @@ func (s *Service) scanAuthMaintenanceDisableCandidates(cfg config.AuthMaintenanc
 	return candidates
 }
 
+func (s *Service) processDirtyAuthMaintenanceIDs(cfg config.AuthMaintenanceConfig, webPolicy chatGPTWebDeadAuthDeletePolicy, authDir string, limit int) int {
+	if s == nil || s.coreManager == nil {
+		return 0
+	}
+	ids := s.takeAuthMaintenanceDirtyIDs(limit)
+	for _, id := range ids {
+		auth, ok := s.coreManager.GetByID(id)
+		if !ok || auth == nil {
+			continue
+		}
+		reason, deleteEligible := authEligibleForChatGPTWebDeadDelete(auth, webPolicy)
+		if !deleteEligible && cfg.Enable {
+			reason, deleteEligible = authEligibleForMaintenanceDelete(auth, nil, cfg)
+		}
+		if deleteEligible {
+			candidate, candidateOK := s.authMaintenanceCandidateForAuth(auth, authDir, reason)
+			if !candidateOK {
+				continue
+			}
+			if strings.TrimSpace(candidate.Path) == "" {
+				s.disableAuthMaintenanceCandidate(context.Background(), candidate, false)
+				continue
+			}
+			if s.authMaintenanceCandidateQueuedForEnabledPolicy(candidate, cfg.Enable, webPolicy.enabled) {
+				continue
+			}
+			if !s.disableAuthMaintenanceCandidate(context.Background(), candidate, true) {
+				continue
+			}
+			if isChatGPTWebDeadMaintenanceCandidate(candidate) {
+				candidate, candidateOK = s.snapshotAuthMaintenanceCandidateInstallations(candidate, authDir)
+				if !candidateOK {
+					continue
+				}
+			}
+			if s.enqueueAuthMaintenanceCandidate(candidate) {
+				log.Debugf("auth maintenance queued %s (%s)", candidate.Path, candidate.Reason)
+			}
+			continue
+		}
+		if !cfg.Enable {
+			continue
+		}
+		if reason, disableEligible := authEligibleForMaintenanceDisable(auth, nil, cfg); disableEligible {
+			candidate, candidateOK := s.authMaintenanceCandidateForAuth(auth, authDir, reason)
+			if candidateOK {
+				s.disableAuthMaintenanceCandidate(context.Background(), candidate, false)
+			}
+		}
+	}
+	return len(ids)
+}
+
 func (s *Service) startAuthMaintenance(parent context.Context) {
 	if s == nil {
 		return
@@ -1987,8 +2126,12 @@ func (s *Service) startAuthMaintenance(parent context.Context) {
 		defer close(done)
 		var lastGenericDeleteAt time.Time
 		deletesSinceCheckpoint := 0
+		var lastMaintenanceConfig config.AuthMaintenanceConfig
+		var lastMaintenanceAuthDir string
+		var hasLastMaintenanceConfig bool
 		var lastWebPolicy chatGPTWebDeadAuthDeletePolicy
 		var hasLastWebPolicy bool
+		var nextFullScanAt time.Time
 		reconcilePersistedWebState := true
 		var nextPersistedWebReconcileAt time.Time
 		for {
@@ -1996,9 +2139,16 @@ func (s *Service) startAuthMaintenance(parent context.Context) {
 			webPolicy := s.snapshotChatGPTWebDeadAuthDeletePolicy()
 			s.warnAuthMaintenanceConfig(cfg)
 			enabled := cfg.Enable || webPolicy.enabled
+			if !hasLastMaintenanceConfig || lastMaintenanceAuthDir != authDir || !authMaintenanceConfigsEqual(lastMaintenanceConfig, cfg) {
+				lastMaintenanceConfig = cfg
+				lastMaintenanceAuthDir = authDir
+				hasLastMaintenanceConfig = true
+				nextFullScanAt = time.Time{}
+			}
 			if !hasLastWebPolicy || !chatGPTWebDeadAuthDeletePoliciesEqual(lastWebPolicy, webPolicy) {
 				lastWebPolicy = webPolicy
 				hasLastWebPolicy = true
+				nextFullScanAt = time.Time{}
 				reconcilePersistedWebState = true
 				nextPersistedWebReconcileAt = time.Time{}
 			}
@@ -2075,7 +2225,19 @@ func (s *Service) startAuthMaintenance(parent context.Context) {
 				}
 			}
 
-			if enabled {
+			processedDirty := s.processDirtyAuthMaintenanceIDs(cfg, webPolicy, authDir, authMaintenanceDirtyBatchSize)
+			if processedDirty == authMaintenanceDirtyBatchSize && s.hasAuthMaintenanceDirtyIDs() {
+				continue
+			}
+
+			now := time.Now()
+			fullScanDue := enabled && (nextFullScanAt.IsZero() || !now.Before(nextFullScanAt))
+			if fullScanDue {
+				scanInterval := time.Duration(cfg.ScanIntervalSeconds) * time.Second
+				if scanInterval <= 0 {
+					scanInterval = time.Duration(defaultMaintenanceScanIntervalSeconds) * time.Second
+				}
+				nextFullScanAt = now.Add(scanInterval)
 				for _, candidate := range s.scanAuthMaintenanceCandidatesWithPolicy(cfg, webPolicy, authDir) {
 					if s.authMaintenanceCandidateQueuedForEnabledPolicy(candidate, cfg.Enable, webPolicy.enabled) {
 						continue
@@ -2099,9 +2261,9 @@ func (s *Service) startAuthMaintenance(parent context.Context) {
 						s.disableAuthMaintenanceCandidate(context.Background(), candidate, false)
 					}
 				}
-				if s.hasReadyAuthMaintenanceCandidates(cfg.Enable, webPolicy.enabled, time.Now()) {
-					continue
-				}
+			}
+			if s.hasReadyAuthMaintenanceCandidates(cfg.Enable, webPolicy.enabled, time.Now()) {
+				continue
 			}
 			if deletesSinceCheckpoint > 0 && !s.hasEnabledAuthMaintenanceCandidates(cfg.Enable, webPolicy.enabled) {
 				s.runAuthMaintenanceCheckpoint(ctx, "auth maintenance queue drained")
@@ -2112,7 +2274,11 @@ func (s *Service) startAuthMaintenance(parent context.Context) {
 
 			wait := authMaintenanceDisabledPollInterval
 			if enabled {
-				wait = time.Duration(cfg.ScanIntervalSeconds) * time.Second
+				if nextFullScanAt.IsZero() {
+					wait = 0
+				} else {
+					wait = time.Until(nextFullScanAt)
+				}
 			}
 			if retryWait, hasRetry := s.nextAuthMaintenanceRetryDelay(cfg.Enable, webPolicy.enabled, time.Now()); hasRetry && retryWait < wait {
 				wait = retryWait
