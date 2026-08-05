@@ -318,8 +318,10 @@ type authMaintenanceCandidate struct {
 type modelSyncTaskState struct {
 	epoch              uint64
 	installationID     string
+	importOnly         bool
 	nextEpoch          uint64
 	nextInstallationID string
+	nextImportOnly     bool
 	queued             bool
 	running            bool
 	dirty              bool
@@ -473,11 +475,19 @@ func (h authMaintenanceHook) handleAuthChange(ctx context.Context, auth *coreaut
 	modelSyncReady := !nativeChatGPTWeb ||
 		(auth.LifecycleSelectable() && !coreauth.ChatGPTWebImportIntent(auth, coreauth.ChatGPTWebImportSessionIntent))
 	if modelSyncReady && (!imported || importPolicy.ValidateModels) {
-		h.service.enqueueModelSyncTaskForInstallation(
-			auth.ID,
-			auth.RuntimeInstallationID(),
-			true,
-		)
+		if imported {
+			h.service.enqueueImportModelSyncTaskForInstallation(
+				auth.ID,
+				auth.RuntimeInstallationID(),
+				true,
+			)
+		} else {
+			h.service.enqueueModelSyncTaskForInstallation(
+				auth.ID,
+				auth.RuntimeInstallationID(),
+				true,
+			)
+		}
 	}
 	if nativeChatGPTWeb {
 		h.service.triggerChatGPTWebRelogin(auth)
@@ -3361,6 +3371,23 @@ func (s *Service) enqueueModelSyncTaskForInstallation(
 	installationID string,
 	retainWhenStopped bool,
 ) bool {
+	return s.enqueueModelSyncTaskForInstallationKind(authID, installationID, retainWhenStopped, false)
+}
+
+func (s *Service) enqueueImportModelSyncTaskForInstallation(
+	authID string,
+	installationID string,
+	retainWhenStopped bool,
+) bool {
+	return s.enqueueModelSyncTaskForInstallationKind(authID, installationID, retainWhenStopped, true)
+}
+
+func (s *Service) enqueueModelSyncTaskForInstallationKind(
+	authID string,
+	installationID string,
+	retainWhenStopped bool,
+	importOnly bool,
+) bool {
 	if s == nil {
 		return false
 	}
@@ -3386,7 +3413,10 @@ func (s *Service) enqueueModelSyncTaskForInstallation(
 				state = modelSyncTaskState{
 					epoch:          s.nextModelSyncEpochLocked(),
 					installationID: installationID,
+					importOnly:     importOnly,
 				}
+			} else if !importOnly {
+				state.importOnly = false
 			}
 			state.running = false
 			state.queued = true
@@ -3397,6 +3427,7 @@ func (s *Service) enqueueModelSyncTaskForInstallation(
 			state := modelSyncTaskState{
 				epoch:          s.nextModelSyncEpochLocked(),
 				installationID: installationID,
+				importOnly:     importOnly,
 				queued:         true,
 			}
 			s.modelSyncPending[authID] = state
@@ -3411,6 +3442,9 @@ func (s *Service) enqueueModelSyncTaskForInstallation(
 				if installationID != state.nextInstallationID {
 					state.nextEpoch = s.nextModelSyncEpochLocked()
 					state.nextInstallationID = installationID
+					state.nextImportOnly = importOnly
+				} else if !importOnly {
+					state.nextImportOnly = false
 				}
 				state.dirty = true
 				s.modelSyncPending[authID] = state
@@ -3421,6 +3455,7 @@ func (s *Service) enqueueModelSyncTaskForInstallation(
 			s.modelSyncPending[authID] = modelSyncTaskState{
 				epoch:          s.nextModelSyncEpochLocked(),
 				installationID: installationID,
+				importOnly:     importOnly,
 				queued:         true,
 			}
 			if !alreadyDispatched {
@@ -3435,7 +3470,13 @@ func (s *Service) enqueueModelSyncTaskForInstallation(
 			return true
 		}
 		if state.running {
+			if !importOnly {
+				state.importOnly = false
+			}
 			state.dirty = true
+			s.modelSyncPending[authID] = state
+		} else if !importOnly && state.importOnly {
+			state.importOnly = false
 			s.modelSyncPending[authID] = state
 		}
 		s.modelSyncMu.Unlock()
@@ -3444,6 +3485,7 @@ func (s *Service) enqueueModelSyncTaskForInstallation(
 	s.modelSyncPending[authID] = modelSyncTaskState{
 		epoch:          s.nextModelSyncEpochLocked(),
 		installationID: installationID,
+		importOnly:     importOnly,
 		queued:         true,
 	}
 	s.promoteModelSyncOverflowLocked()
@@ -3611,29 +3653,57 @@ func (s *Service) cancelModelSyncTaskIfEpoch(authID string, epoch uint64) {
 	s.modelSyncMu.Unlock()
 }
 
-func (s *Service) beginModelSyncTask(authID string, generation uint64) (uint64, bool) {
+func (s *Service) cancelQueuedImportModelSyncTasks() {
 	if s == nil {
-		return 0, false
+		return
+	}
+	s.modelSyncMu.Lock()
+	for authID, state := range s.modelSyncPending {
+		if state.queued && state.importOnly {
+			delete(s.modelSyncPending, authID)
+			s.invalidateModelSyncOverflowLocked(authID)
+			continue
+		}
+		if state.nextEpoch != 0 && state.nextImportOnly {
+			state.nextEpoch = 0
+			state.nextInstallationID = ""
+			state.nextImportOnly = false
+			state.dirty = false
+			s.modelSyncPending[authID] = state
+		}
+	}
+	s.promoteModelSyncOverflowLocked()
+	s.modelSyncMu.Unlock()
+}
+
+func (s *Service) beginModelSyncTask(authID string, generation uint64) (uint64, bool) {
+	epoch, _, ok := s.beginModelSyncTaskWithKind(authID, generation)
+	return epoch, ok
+}
+
+func (s *Service) beginModelSyncTaskWithKind(authID string, generation uint64) (uint64, bool, bool) {
+	if s == nil {
+		return 0, false, false
 	}
 	authID = strings.TrimSpace(authID)
 	if authID == "" {
-		return 0, false
+		return 0, false, false
 	}
 	s.modelSyncMu.Lock()
 	defer s.modelSyncMu.Unlock()
 	if generation != s.modelSyncGeneration {
-		return 0, false
+		return 0, false, false
 	}
 	state, exists := s.modelSyncPending[authID]
 	if !exists || !state.queued {
 		s.promoteModelSyncOverflowLocked()
-		return 0, false
+		return 0, false, false
 	}
 	state.queued = false
 	state.running = true
 	state.dirty = false
 	s.modelSyncPending[authID] = state
-	return state.epoch, true
+	return state.epoch, state.importOnly, true
 }
 
 func (s *Service) completeModelSyncTask(
@@ -3661,8 +3731,10 @@ func (s *Service) completeModelSyncTask(
 	if state.nextEpoch != 0 {
 		state.epoch = state.nextEpoch
 		state.installationID = state.nextInstallationID
+		state.importOnly = state.nextImportOnly
 		state.nextEpoch = 0
 		state.nextInstallationID = ""
+		state.nextImportOnly = false
 		state.running = false
 		state.queued = true
 		state.dirty = false
@@ -3952,9 +4024,16 @@ func (s *Service) syncAuthModelsForGeneration(ctx context.Context, authID string
 	if s == nil {
 		return
 	}
-	epoch, ok := s.beginModelSyncTask(authID, generation)
+	epoch, importOnly, ok := s.beginModelSyncTaskWithKind(authID, generation)
 	if !ok {
 		return
+	}
+	if importOnly {
+		cfg := s.currentConfig()
+		if cfg == nil || !cfg.ChatGPTWeb.Import.Resolved().ValidateModelsAfterUpload {
+			s.completeModelSyncTask(authID, epoch, generation, false)
+			return
+		}
 	}
 	for attempt := 0; attempt < 2; attempt++ {
 		s.syncAuthModels(ctx, authID)
@@ -4052,8 +4131,10 @@ func (s *Service) startModelSyncLoop(parent context.Context) {
 		if state.nextEpoch != 0 {
 			state.epoch = state.nextEpoch
 			state.installationID = state.nextInstallationID
+			state.importOnly = state.nextImportOnly
 			state.nextEpoch = 0
 			state.nextInstallationID = ""
+			state.nextImportOnly = false
 		}
 		if state.epoch == 0 {
 			state.epoch = s.nextModelSyncEpochLocked()
@@ -4573,6 +4654,8 @@ func (s *Service) Run(ctx context.Context) error {
 		nextImportModels := newCfg.ChatGPTWeb.Import.Resolved().ValidateModelsAfterUpload
 		if !previousImportModels && nextImportModels {
 			s.restoreChatGPTWebImportModelIntents(ctx)
+		} else if previousImportModels && !nextImportModels {
+			s.cancelQueuedImportModelSyncTasks()
 		}
 		if s.coreManager != nil && authModelExclusionsChanged {
 			for _, auth := range s.coreManager.List() {

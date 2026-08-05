@@ -1133,8 +1133,59 @@ func TestChatGPTWebImportPolicyQueuesOneRemoteModelSyncWhenEnabled(t *testing.T)
 	service.modelSyncMu.Lock()
 	state, pending := service.modelSyncPending[authID]
 	service.modelSyncMu.Unlock()
-	if !pending || !state.queued {
+	if !pending || !state.queued || !state.importOnly {
 		t.Fatalf("model sync state = %#v, pending=%v", state, pending)
+	}
+}
+
+func TestDisablingImportModelValidationCancelsOnlyQueuedImportTasks(t *testing.T) {
+	service := &Service{
+		modelSyncQueue: make(chan string, 4),
+		modelSyncPending: map[string]modelSyncTaskState{
+			"import":  {epoch: 1, queued: true, importOnly: true},
+			"regular": {epoch: 2, queued: true},
+		},
+		modelSyncOverflowSet:   make(map[string]struct{}),
+		modelSyncOverflowToken: make(map[string]uint64),
+	}
+	service.enqueueModelSyncOverflowLocked("import")
+	service.enqueueModelSyncOverflowLocked("regular")
+
+	service.cancelQueuedImportModelSyncTasks()
+
+	service.modelSyncMu.Lock()
+	_, importPending := service.modelSyncPending["import"]
+	regular, regularPending := service.modelSyncPending["regular"]
+	service.modelSyncMu.Unlock()
+	if importPending {
+		t.Fatal("disabled upload model validation retained its queued task")
+	}
+	if !regularPending || !regular.queued || regular.importOnly {
+		t.Fatalf("ordinary model synchronization was canceled: %#v", regular)
+	}
+}
+
+func TestDisabledImportModelValidationSkipsRetainedTaskBeforeNetwork(t *testing.T) {
+	service := &Service{
+		cfg:                 &config.Config{},
+		modelSyncGeneration: 1,
+		modelSyncPending: map[string]modelSyncTaskState{
+			"import": {epoch: 1, queued: true, importOnly: true},
+		},
+	}
+	loaded := false
+	service.modelSyncAuthLoadedObserved = func(*coreauth.Auth) { loaded = true }
+
+	service.syncAuthModelsForGeneration(t.Context(), "import", 1)
+
+	if loaded {
+		t.Fatal("disabled upload model validation reached the remote model sync path")
+	}
+	service.modelSyncMu.Lock()
+	_, pending := service.modelSyncPending["import"]
+	service.modelSyncMu.Unlock()
+	if pending {
+		t.Fatal("skipped upload model validation remained pending")
 	}
 }
 

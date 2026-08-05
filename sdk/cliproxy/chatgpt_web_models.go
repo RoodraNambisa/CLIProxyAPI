@@ -528,7 +528,7 @@ func (s *Service) restoreChatGPTWebImportModelIntents(ctx context.Context) {
 			continue
 		}
 		s.refreshChatGPTWebModelRegistration(ctx, auth)
-		s.enqueueModelSyncTaskForInstallation(auth.ID, auth.RuntimeInstallationID(), true)
+		s.enqueueImportModelSyncTaskForInstallation(auth.ID, auth.RuntimeInstallationID(), true)
 	}
 }
 
