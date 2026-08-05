@@ -159,6 +159,12 @@ func loginRequestStage(targetURL string) string {
 		return "authorize_continue"
 	case strings.HasSuffix(path, "/password/verify"):
 		return "password_verify"
+	case strings.HasSuffix(path, passkeyVerifyPath):
+		return "passkey_verify"
+	case strings.HasSuffix(path, "/api/auth/csrf"), strings.HasSuffix(path, "/api/auth/signin/openai"):
+		return "passkey_challenge"
+	case strings.HasSuffix(path, "/api/auth/session"):
+		return "passkey_session"
 	case strings.Contains(path, "/mfa/") || strings.Contains(path, "/otp/"):
 		return "mfa_verify"
 	case strings.HasSuffix(path, "/oauth/token"):

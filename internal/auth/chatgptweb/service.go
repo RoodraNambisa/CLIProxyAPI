@@ -101,6 +101,9 @@ func (service *Service) Login(ctx context.Context, input LoginInput) (*Credentia
 		if errLogin == nil {
 			return credential, nil
 		}
+		if credential != nil {
+			input.Credential = credential
+		}
 		authError := ensureAuthError(errLogin, LifecycleLoginPending)
 		authError.Attempts = flowAttempt
 		if authError.FailureStage == "" {
@@ -133,8 +136,8 @@ func (service *Service) loginOnce(acquisitionContext context.Context, input Logi
 		pendingState = LifecycleReloginPending
 	}
 	service.updateLifecycle(credential, pendingState, "")
-	if credential.Email == "" || credential.Password == "" {
-		authError := newAuthError("missing_credentials", LifecycleReauthRequired, 0, false, true, "email and password are required", nil)
+	if credential.Email == "" || credential.WebAuthn == nil && credential.Password == "" {
+		authError := newAuthError("missing_credentials", LifecycleReauthRequired, 0, false, true, "email and a Passkey or password are required", nil)
 		service.applyFailure(credential, authError, input.Relogin)
 		return credential, authError
 	}
@@ -164,15 +167,24 @@ func (service *Service) loginOnce(acquisitionContext context.Context, input Logi
 	defer client.CloseIdleConnections()
 	defer client.CloseActiveAcquisitionConnections()
 
-	pkce, state, nonce, err := service.oauthValues()
-	if err != nil {
-		authError := newAuthError("random_generation_failed", pendingState, 0, false, true, "initialize OAuth request", err)
-		service.applyFailure(credential, authError, input.Relogin)
-		return credential, authError
-	}
 	deviceID := strings.TrimSpace(credential.DeviceID)
 	if err := client.SetCookie(service.options.AuthBaseURL, "oai-did", deviceID); err != nil {
 		authError := newAuthError("cookie_initialization_failed", pendingState, 0, false, true, "initialize device cookie", err)
+		service.applyFailure(credential, authError, input.Relogin)
+		return credential, authError
+	}
+	if credential.WebAuthn != nil {
+		if err := client.SetCookie(service.options.SessionBaseURL, "oai-did", deviceID); err != nil {
+			authError := newAuthError("cookie_initialization_failed", pendingState, 0, false, true, "initialize Passkey device cookie", err)
+			service.applyFailure(credential, authError, input.Relogin)
+			return credential, authError
+		}
+		return service.loginWithPasskey(acquisitionContext, client, credential, input, pendingState)
+	}
+
+	pkce, state, nonce, err := service.oauthValues()
+	if err != nil {
+		authError := newAuthError("random_generation_failed", pendingState, 0, false, true, "initialize OAuth request", err)
 		service.applyFailure(credential, authError, input.Relogin)
 		return credential, authError
 	}
@@ -736,6 +748,7 @@ type tokenPayload struct {
 
 type sessionPayload struct {
 	AccessToken string `json:"accessToken"`
+	IDToken     string `json:"idToken"`
 	Expires     string `json:"expires"`
 	User        struct {
 		ID    string `json:"id"`
@@ -1158,6 +1171,12 @@ func loginFailureStage(code string) string {
 		return "password_verify"
 	case strings.HasPrefix(code, "mfa"), strings.Contains(code, "totp"):
 		return "mfa_verify"
+	case strings.HasPrefix(code, "passkey_challenge"):
+		return "passkey_challenge"
+	case strings.HasPrefix(code, "passkey_credential"), strings.HasPrefix(code, "passkey_verification"):
+		return "passkey_verify"
+	case strings.HasPrefix(code, "passkey_session"):
+		return "passkey_session"
 	case strings.HasPrefix(code, "token_exchange"), strings.HasPrefix(code, "token_response"):
 		return "token_exchange"
 	case strings.HasPrefix(code, "oauth_redirect"), strings.HasPrefix(code, "invalid_state"):

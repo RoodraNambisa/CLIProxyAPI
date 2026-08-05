@@ -2,6 +2,7 @@ package chatgptweb
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
@@ -497,18 +498,19 @@ func normalizedCredentialLifecycleState(credential *Credential) LifecycleState {
 }
 
 type LoginInput struct {
-	Email      string
-	Password   string
-	TOTPSecret string
-	ProxyURL   string
-	LoginProxy LoginProxyConfig
+	Email           string
+	Password        string
+	TOTPSecret      string
+	ProxyURL        string
+	LoginProxy      LoginProxyConfig
+	PersistWebAuthn func(context.Context, WebAuthnCredential) (WebAuthnCredential, error)
 	// LoginProxyResolved keeps one runtime configuration snapshot fixed for the whole flow.
 	LoginProxyResolved bool
 	Credential         *Credential
 	Relogin            bool
 }
 
-// LoginProxyConfig configures the dynamic proxy used only during password login.
+// LoginProxyConfig configures the dynamic proxy used only during interactive login.
 type LoginProxyConfig struct {
 	Enabled            bool
 	URLTemplate        string
