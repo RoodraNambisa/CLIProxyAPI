@@ -2594,7 +2594,14 @@ func (runtime *chatGPTWebAccountInfoRuntime) hasRecoveryWorkLocked(
 	if inflightResetAt, ok := runtime.inflightRecovery[runtimeKey]; ok && inflightResetAt.Equal(resetAt) {
 		return true
 	}
-	for _, work := range runtime.queuedWorkLocked() {
+	if (runtime.queuedByTarget == nil || runtime.queuedIndicesByTarget == nil) && runtime.queueLengthLocked() > 0 {
+		runtime.rebuildQueuedTargetsLocked()
+	}
+	for index := range runtime.queuedIndicesByTarget[runtimeKey] {
+		if index < runtime.queueHead || index >= len(runtime.queue) {
+			continue
+		}
+		work := runtime.queue[index]
 		if chatGPTWebAccountInfoRecoveryWorkMatches(work, target, resetAt) {
 			return true
 		}

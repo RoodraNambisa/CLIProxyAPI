@@ -4953,6 +4953,43 @@ func TestChatGPTWebAccountInfoCompletedCallUsesTargetedQueueIndex(t *testing.T) 
 	runtime.mu.Unlock()
 }
 
+func TestChatGPTWebAccountInfoRecoveryLookupUsesTargetedQueueIndex(t *testing.T) {
+	runtime := newChatGPTWebAccountInfoRuntime(nil, nil)
+	runtime.cfg.RefreshWorkers = 1
+	runtime.cfg.RefreshQueueSize = 2048
+	resetAt := time.Now().UTC().Add(time.Hour)
+	target := chatgptwebauth.AccountInfoRefreshTarget{AuthID: "target"}
+
+	runtime.mu.Lock()
+	for index := range 1024 {
+		if !runtime.enqueueLocked(chatGPTWebAccountInfoWork{
+			target: chatgptwebauth.AccountInfoRefreshTarget{AuthID: fmt.Sprintf("unrelated-%d", index)},
+		}) {
+			runtime.mu.Unlock()
+			t.Fatalf("failed to enqueue unrelated work %d", index)
+		}
+	}
+	if !runtime.enqueueLocked(chatGPTWebAccountInfoWork{
+		target:          target,
+		automatic:       true,
+		quotaStateKnown: true,
+		exhausted:       true,
+		quotaResetAt:    resetAt,
+	}) {
+		runtime.mu.Unlock()
+		t.Fatal("failed to enqueue recovery work")
+	}
+	if !runtime.hasRecoveryWorkLocked(target, resetAt) {
+		runtime.mu.Unlock()
+		t.Fatal("targeted recovery work was not found")
+	}
+	if runtime.hasRecoveryWorkLocked(target, resetAt.Add(time.Minute)) {
+		runtime.mu.Unlock()
+		t.Fatal("recovery lookup matched a different reset time")
+	}
+	runtime.mu.Unlock()
+}
+
 func TestChatGPTWebAccountInfoFailedResultPreservesOldRecoverySchedule(t *testing.T) {
 	now := time.Now().UTC()
 	resetAt := now.Add(time.Hour)
