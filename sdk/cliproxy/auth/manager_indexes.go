@@ -5,6 +5,7 @@ import (
 	"sort"
 	"strings"
 
+	chatgptwebauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/chatgptweb"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/authfileguard"
 	internalconfig "github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 )
@@ -37,6 +38,70 @@ func authRelevantToChatGPTWebDependencyIndex(auth *Auth) bool {
 		return ChatGPTWebCredentialUID(auth) != ""
 	}
 	return ChatGPTWebLinkedSourceUID(auth) != ""
+}
+
+func chatGPTWebIdentityIndexKeys(auth *Auth) []string {
+	if auth == nil || !strings.EqualFold(strings.TrimSpace(auth.Provider), chatgptwebauth.Provider) {
+		return nil
+	}
+	reference := NewChatGPTWebCredentialReference(auth)
+	keys := make([]string, 0, 5)
+	for prefix, value := range map[string]string{
+		"account:":  reference.accountHash,
+		"user:":     reference.userHash,
+		"subject:":  reference.subjectHash,
+		"identity:": reference.identityHash,
+	} {
+		if value != "" {
+			keys = append(keys, prefix+value)
+		}
+	}
+	if email := chatGPTWebRegistrationEmail(auth); email != "" {
+		keys = append(keys, "email:"+email)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+func (m *Manager) removeChatGPTWebIdentityIndexLocked(id string) {
+	for _, key := range m.chatGPTWebIdentityKeysByID[id] {
+		ids := m.chatGPTWebIdentityIDs[key]
+		delete(ids, id)
+		if len(ids) == 0 {
+			delete(m.chatGPTWebIdentityIDs, key)
+		}
+	}
+	delete(m.chatGPTWebIdentityKeysByID, id)
+}
+
+func (m *Manager) addChatGPTWebIdentityIndexLocked(auth *Auth) {
+	if auth == nil || strings.TrimSpace(auth.ID) == "" {
+		return
+	}
+	id := strings.TrimSpace(auth.ID)
+	m.removeChatGPTWebIdentityIndexLocked(id)
+	keys := chatGPTWebIdentityIndexKeys(auth)
+	if len(keys) == 0 {
+		return
+	}
+	m.chatGPTWebIdentityKeysByID[id] = keys
+	for _, key := range keys {
+		addIDToDependencySet(m.chatGPTWebIdentityIDs, key, id)
+	}
+}
+
+func (m *Manager) installPersistedAuthIndexLocked(auth *Auth) {
+	if m == nil || auth == nil || strings.TrimSpace(auth.ID) == "" {
+		return
+	}
+	m.persistedAuthsByID[strings.TrimSpace(auth.ID)] = auth.Clone()
+}
+
+func (m *Manager) removePersistedAuthIndexLocked(id string) {
+	if m == nil {
+		return
+	}
+	delete(m.persistedAuthsByID, strings.TrimSpace(id))
 }
 
 func addIDToDependencySet(index map[string]map[string]struct{}, key, id string) {
@@ -103,7 +168,18 @@ func (m *Manager) removeAuthIndexesLocked(id string) {
 		}
 		delete(m.backingPathByAuthID, id)
 	}
+	if providerKey := m.providerByAuthID[id]; providerKey != "" {
+		if ids := m.providerAuthIDs[providerKey]; ids != nil {
+			delete(ids, id)
+			if len(ids) == 0 {
+				delete(m.providerAuthIDs, providerKey)
+			}
+		}
+		delete(m.providerByAuthID, id)
+	}
+	delete(m.authIndexesByID, id)
 	m.removeDependencyAuthIndexLocked(id)
+	m.removeChatGPTWebIdentityIndexLocked(id)
 }
 
 func (m *Manager) addAuthIndexesLocked(auth *Auth, cfg *internalconfig.Config) {
@@ -111,6 +187,18 @@ func (m *Manager) addAuthIndexesLocked(auth *Auth, cfg *internalconfig.Config) {
 		return
 	}
 	id := strings.TrimSpace(auth.ID)
+	if index := strings.TrimSpace(auth.Index); index != "" {
+		m.authIndexesByID[id] = index
+	}
+	if providerKey := strings.ToLower(strings.TrimSpace(auth.Provider)); providerKey != "" {
+		ids := m.providerAuthIDs[providerKey]
+		if ids == nil {
+			ids = make(map[string]struct{})
+			m.providerAuthIDs[providerKey] = ids
+		}
+		ids[id] = struct{}{}
+		m.providerByAuthID[id] = providerKey
+	}
 	if pathKey := authBackingPathKey(auth, cfg); pathKey != "" {
 		ids := m.backingPathAuthIDs[pathKey]
 		if ids == nil {
@@ -122,6 +210,9 @@ func (m *Manager) addAuthIndexesLocked(auth *Auth, cfg *internalconfig.Config) {
 	}
 	if authRelevantToChatGPTWebDependencyIndex(auth) {
 		m.addDependencyAuthIndexLocked(auth)
+	}
+	if strings.EqualFold(strings.TrimSpace(auth.Provider), chatgptwebauth.Provider) {
+		m.addChatGPTWebIdentityIndexLocked(auth)
 	}
 }
 
@@ -165,10 +256,14 @@ func (m *Manager) installPersistedDependencyAuthLocked(auth *Auth) {
 	if m == nil || auth == nil || strings.TrimSpace(auth.ID) == "" || m.auths[auth.ID] != nil {
 		return
 	}
+	m.installPersistedAuthIndexLocked(auth)
 	if authRelevantToChatGPTWebDependencyIndex(auth) {
 		m.addDependencyAuthIndexLocked(auth)
 	} else {
 		m.removeDependencyAuthIndexLocked(auth.ID)
+	}
+	if strings.EqualFold(strings.TrimSpace(auth.Provider), chatgptwebauth.Provider) {
+		m.addChatGPTWebIdentityIndexLocked(auth)
 	}
 	m.authIndexRevision++
 }
@@ -177,7 +272,9 @@ func (m *Manager) removePersistedDependencyAuthLocked(id string) {
 	if m == nil || strings.TrimSpace(id) == "" || m.auths[id] != nil {
 		return
 	}
+	m.removePersistedAuthIndexLocked(id)
 	m.removeDependencyAuthIndexLocked(id)
+	m.removeChatGPTWebIdentityIndexLocked(id)
 	m.authIndexRevision++
 }
 
@@ -211,14 +308,26 @@ func (m *Manager) rebuildBackingPathIndexLocked(cfg *internalconfig.Config) {
 func (m *Manager) rebuildAuthIndexesLocked(persisted []*Auth, complete bool) {
 	m.backingPathAuthIDs = make(map[string]map[string]struct{})
 	m.backingPathByAuthID = make(map[string]string)
+	m.providerAuthIDs = make(map[string]map[string]struct{})
+	m.providerByAuthID = make(map[string]string)
+	m.authIndexesByID = make(map[string]string)
 	m.dependencyAuthsByID = make(map[string]*Auth)
 	m.dependencySourceIDs = make(map[string]map[string]struct{})
 	m.dependencyDependentIDs = make(map[string]map[string]struct{})
+	m.chatGPTWebIdentityIDs = make(map[string]map[string]struct{})
+	m.chatGPTWebIdentityKeysByID = make(map[string][]string)
+	m.persistedAuthsByID = make(map[string]*Auth, len(persisted))
 	for _, auth := range persisted {
-		if auth == nil || strings.TrimSpace(auth.ID) == "" || !authRelevantToChatGPTWebDependencyIndex(auth) {
+		if auth == nil || strings.TrimSpace(auth.ID) == "" {
 			continue
 		}
-		m.addDependencyAuthIndexLocked(auth)
+		m.installPersistedAuthIndexLocked(auth)
+		if authRelevantToChatGPTWebDependencyIndex(auth) {
+			m.addDependencyAuthIndexLocked(auth)
+		}
+		if strings.EqualFold(strings.TrimSpace(auth.Provider), chatgptwebauth.Provider) {
+			m.addChatGPTWebIdentityIndexLocked(auth)
+		}
 	}
 	cfg := m.currentConfig()
 	m.backingPathAuthDir = ""
@@ -235,6 +344,7 @@ func (m *Manager) rebuildAuthIndexesLocked(persisted []*Auth, complete bool) {
 		}
 	}
 	m.dependencyIndexComplete = complete
+	m.chatGPTWebIdentityComplete = complete
 	m.authIndexRevision++
 }
 
@@ -354,6 +464,180 @@ func (m *Manager) MarkChatGPTWebDependencyIndexDirty() {
 	}
 	m.mu.Lock()
 	m.dependencyIndexComplete = false
+	m.chatGPTWebIdentityComplete = false
 	m.authIndexRevision++
 	m.mu.Unlock()
+}
+
+// ChatGPTWebAuthsByEmail returns runtime ChatGPT Web auths for one normalized
+// email. The completeness flag is false when a persisted-only candidate exists
+// or the persistence index is stale.
+func (m *Manager) ChatGPTWebAuthsByEmail(email string) ([]*Auth, bool) {
+	if m == nil {
+		return nil, false
+	}
+	email = strings.ToLower(strings.TrimSpace(email))
+	if email == "" {
+		m.mu.RLock()
+		complete := m.chatGPTWebIdentityComplete
+		m.mu.RUnlock()
+		return nil, complete
+	}
+	m.mu.RLock()
+	ids := m.chatGPTWebIdentityIDs["email:"+email]
+	ordered := make([]string, 0, len(ids))
+	complete := m.chatGPTWebIdentityComplete
+	for id := range ids {
+		ordered = append(ordered, id)
+		if m.auths[id] == nil {
+			complete = false
+		}
+	}
+	sort.Strings(ordered)
+	auths := make([]*Auth, 0, len(ordered))
+	for _, id := range ordered {
+		if auth := m.auths[id]; auth != nil {
+			auths = append(auths, auth.Clone())
+		}
+	}
+	m.mu.RUnlock()
+	return auths, complete
+}
+
+// PersistedAuthByID resolves an auth from the latest complete persistence
+// index without cloning unrelated records. The completeness flag is false
+// after an external mutation has invalidated the index.
+func (m *Manager) PersistedAuthByID(id string) (*Auth, bool) {
+	if m == nil || strings.TrimSpace(id) == "" {
+		return nil, false
+	}
+	id = strings.TrimSpace(id)
+	m.mu.RLock()
+	auth := m.persistedAuthsByID[id]
+	complete := m.chatGPTWebIdentityComplete
+	if auth != nil {
+		auth = auth.Clone()
+	}
+	m.mu.RUnlock()
+	return auth, complete
+}
+
+func (m *Manager) persistedAuthIndexSnapshot() ([]*Auth, bool) {
+	if m == nil {
+		return nil, false
+	}
+	m.mu.RLock()
+	complete := m.chatGPTWebIdentityComplete && m.dependencyIndexComplete
+	ids := make([]string, 0, len(m.persistedAuthsByID))
+	for id := range m.persistedAuthsByID {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	auths := make([]*Auth, 0, len(ids))
+	for _, id := range ids {
+		if auth := m.persistedAuthsByID[id]; auth != nil {
+			auths = append(auths, auth.Clone())
+		}
+	}
+	m.mu.RUnlock()
+	return auths, complete
+}
+
+// ChatGPTWebIdentityConflicts returns runtime candidates that represent the
+// same account as incoming. It avoids cloning unrelated credentials.
+func (m *Manager) ChatGPTWebIdentityConflicts(incoming *Auth, excludedID string) ([]*Auth, bool) {
+	if m == nil || incoming == nil {
+		return nil, false
+	}
+	keys := chatGPTWebIdentityIndexKeys(incoming)
+	m.mu.RLock()
+	candidateIDs := make(map[string]struct{})
+	complete := m.chatGPTWebIdentityComplete
+	for _, key := range keys {
+		for id := range m.chatGPTWebIdentityIDs[key] {
+			if id == excludedID {
+				continue
+			}
+			candidateIDs[id] = struct{}{}
+			if m.auths[id] == nil {
+				complete = false
+			}
+		}
+	}
+	ordered := make([]string, 0, len(candidateIDs))
+	for id := range candidateIDs {
+		ordered = append(ordered, id)
+	}
+	sort.Strings(ordered)
+	conflicts := make([]*Auth, 0, len(ordered))
+	for _, id := range ordered {
+		if candidate := m.auths[id]; candidate != nil && ChatGPTWebCredentialIdentityConflict(candidate, incoming) {
+			conflicts = append(conflicts, candidate.Clone())
+		}
+	}
+	m.mu.RUnlock()
+	return conflicts, complete
+}
+
+// ChatGPTWebAuthIDsByEmail returns only matching runtime IDs for refresh-lock
+// coordination. The operation is proportional to the matching accounts.
+func (m *Manager) ChatGPTWebAuthIDsByEmail(email string) []string {
+	auths, _ := m.ChatGPTWebAuthsByEmail(email)
+	ids := make([]string, 0, len(auths))
+	for _, auth := range auths {
+		if auth != nil {
+			ids = append(ids, auth.ID)
+		}
+	}
+	return ids
+}
+
+// ChatGPTWebAuths returns only runtime ChatGPT Web credentials in stable ID
+// order. It avoids cloning unrelated providers for provider-owned maintenance.
+func (m *Manager) ChatGPTWebAuths() []*Auth {
+	return m.AuthsForProviders(chatgptwebauth.Provider)
+}
+
+// AuthsForProviders returns runtime credentials for the requested providers in
+// stable ID order without cloning unrelated credentials.
+func (m *Manager) AuthsForProviders(providers ...string) []*Auth {
+	if m == nil {
+		return nil
+	}
+	m.mu.RLock()
+	uniqueIDs := make(map[string]struct{})
+	for _, provider := range providers {
+		providerKey := strings.ToLower(strings.TrimSpace(provider))
+		for id := range m.providerAuthIDs[providerKey] {
+			uniqueIDs[id] = struct{}{}
+		}
+	}
+	ids := make([]string, 0, len(uniqueIDs))
+	for id := range uniqueIDs {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	auths := make([]*Auth, 0, len(ids))
+	for _, id := range ids {
+		if auth := m.auths[id]; auth != nil {
+			auths = append(auths, auth.Clone())
+		}
+	}
+	m.mu.RUnlock()
+	return auths
+}
+
+// AuthIndexSnapshot returns the immutable public auth indexes without cloning
+// credential metadata.
+func (m *Manager) AuthIndexSnapshot() map[string]string {
+	if m == nil {
+		return map[string]string{}
+	}
+	m.mu.RLock()
+	indexes := make(map[string]string, len(m.authIndexesByID))
+	for id, index := range m.authIndexesByID {
+		indexes[id] = index
+	}
+	m.mu.RUnlock()
+	return indexes
 }

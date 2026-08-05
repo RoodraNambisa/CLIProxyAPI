@@ -764,9 +764,14 @@ func (s *FileTokenStore) save(ctx context.Context, auth *cliproxyauth.Auth, requ
 		)
 	}
 
-	unlockOperation, errOperationLock := s.lockOperation(ctx)
-	if errOperationLock != nil {
-		return "", errOperationLock
+	managerValidatedCreate := createChatGPTWeb && authfileguard.ManagerValidatedChatGPTWebIdentity(ctx)
+	unlockOperation := func() {}
+	if !managerValidatedCreate {
+		var errOperationLock error
+		unlockOperation, errOperationLock = s.lockOperation(ctx)
+		if errOperationLock != nil {
+			return "", errOperationLock
+		}
 	}
 	defer unlockOperation()
 	if errContext := ctx.Err(); errContext != nil {
@@ -775,7 +780,7 @@ func (s *FileTokenStore) save(ctx context.Context, auth *cliproxyauth.Auth, requ
 	if managed || createChatGPTWeb {
 		var unlockRootMutation func() error
 		var errMutationLock error
-		if createChatGPTWeb {
+		if createChatGPTWeb && !managerValidatedCreate {
 			unlockRootMutation, errMutationLock = authfileguard.LockRootRebuildContext(ctx, root)
 		} else {
 			unlockRootMutation, errMutationLock = authfileguard.LockRootMutationContext(ctx, root)
@@ -980,6 +985,9 @@ func validateFileTokenChatGPTWebCreate(ctx context.Context, root *os.Root, relat
 	email := strings.ToLower(strings.TrimSpace(emailValue))
 	if email == "" {
 		return cliproxyauth.NewSaveOutcomeError(cliproxyauth.SaveOutcomeRolledBack, errors.New("auth filestore: chatgpt web credential email is empty"))
+	}
+	if authfileguard.ManagerValidatedChatGPTWebIdentity(ctx) {
+		return nil
 	}
 	incoming := &cliproxyauth.Auth{Provider: "chatgpt-web", Metadata: metadata}
 	conflict, errConflict := fileTokenRootHasChatGPTWebCredentialConflict(ctx, root, relativePath, incoming)

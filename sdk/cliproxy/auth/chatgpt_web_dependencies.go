@@ -46,14 +46,6 @@ type ChatGPTWebDependencyGraph struct {
 	dependentsByUID map[string][]*Auth
 }
 
-func isChatGPTWebDependencyProvider(auth *Auth) bool {
-	if auth == nil {
-		return false
-	}
-	provider := strings.ToLower(strings.TrimSpace(auth.Provider))
-	return provider == "codex" || provider == "chatgpt-web"
-}
-
 type chatGPTWebDependencyMutationContextKey struct{}
 
 type chatGPTWebDependencyMutationToken struct {
@@ -179,10 +171,10 @@ func (m *Manager) lockChatGPTWebDependencyMutationContext(ctx context.Context, a
 			return context.WithValue(ctx, chatGPTWebDependencyMutationContextKey{}, child), child.unlock, nil
 		}
 	}
-	lockRequired := force || isChatGPTWebDependencyProvider(incoming)
+	lockRequired := force || authRelevantToChatGPTWebDependencyIndex(incoming)
 	if !lockRequired && strings.TrimSpace(authID) != "" {
 		m.mu.RLock()
-		lockRequired = isChatGPTWebDependencyProvider(m.auths[strings.TrimSpace(authID)])
+		lockRequired = authRelevantToChatGPTWebDependencyIndex(m.auths[strings.TrimSpace(authID)])
 		m.mu.RUnlock()
 	}
 	if !lockRequired {
@@ -539,6 +531,16 @@ func (m *Manager) PersistedAuthSnapshot(ctx context.Context) ([]*Auth, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	if auths, complete := m.persistedAuthIndexSnapshot(); complete {
+		return auths, nil
+	}
+	if errLock := m.persistedSnapshotRefresh.lock(ctx); errLock != nil {
+		return nil, errLock
+	}
+	defer m.persistedSnapshotRefresh.unlock()
+	if auths, complete := m.persistedAuthIndexSnapshot(); complete {
+		return auths, nil
+	}
 	m.mu.RLock()
 	store := m.store
 	revision := m.authIndexRevision
@@ -563,6 +565,7 @@ func (m *Manager) PersistedAuthSnapshot(ctx context.Context) ([]*Auth, error) {
 		m.rebuildAuthIndexesLocked(auths, true)
 	} else {
 		m.dependencyIndexComplete = false
+		m.chatGPTWebIdentityComplete = false
 	}
 	m.mu.Unlock()
 	return auths, nil

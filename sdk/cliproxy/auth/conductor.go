@@ -387,16 +387,23 @@ type Manager struct {
 	// backingPathAuthIDs indexes runtime auths by their normalized backing path.
 	// All fields in this block are protected by mu and are updated atomically
 	// with auths through installAuthLocked and removeAuthLocked.
-	backingPathAuthIDs      map[string]map[string]struct{}
-	backingPathByAuthID     map[string]string
-	backingPathAuthDir      string
-	dependencyAuthsByID     map[string]*Auth
-	dependencySourceIDs     map[string]map[string]struct{}
-	dependencyDependentIDs  map[string]map[string]struct{}
-	dependencyIndexComplete bool
-	authIndexRevision       uint64
-	storeRevision           uint64
-	scheduler               *authScheduler
+	backingPathAuthIDs         map[string]map[string]struct{}
+	backingPathByAuthID        map[string]string
+	backingPathAuthDir         string
+	providerAuthIDs            map[string]map[string]struct{}
+	providerByAuthID           map[string]string
+	authIndexesByID            map[string]string
+	dependencyAuthsByID        map[string]*Auth
+	dependencySourceIDs        map[string]map[string]struct{}
+	dependencyDependentIDs     map[string]map[string]struct{}
+	dependencyIndexComplete    bool
+	chatGPTWebIdentityIDs      map[string]map[string]struct{}
+	chatGPTWebIdentityKeysByID map[string][]string
+	persistedAuthsByID         map[string]*Auth
+	chatGPTWebIdentityComplete bool
+	authIndexRevision          uint64
+	storeRevision              uint64
+	scheduler                  *authScheduler
 	// executorLifecycleMu serializes registry changes with executor shutdown.
 	executorLifecycleMu sync.Mutex
 	executorCloseCond   *sync.Cond
@@ -462,6 +469,9 @@ type Manager struct {
 	persistBarrierReadObserved   func()
 	persistLocks                 sync.Map
 	chatGPTWebDependencyMutation contextMutex
+	// persistedSnapshotRefresh serializes authoritative store enumeration. The
+	// first waiter refreshes the incremental indexes; later waiters reuse them.
+	persistedSnapshotRefresh contextMutex
 	// refreshApplyObserved is used by refresh tests to pause before durable commit.
 	refreshApplyObserved func(string)
 	// refreshCommitAttemptTimeout and refreshCommitMaxAttempts override commit policy in tests.
@@ -642,9 +652,15 @@ func NewManager(store Store, selector Selector, hook Hook) *Manager {
 		auths:                       make(map[string]*Auth),
 		backingPathAuthIDs:          make(map[string]map[string]struct{}),
 		backingPathByAuthID:         make(map[string]string),
+		providerAuthIDs:             make(map[string]map[string]struct{}),
+		providerByAuthID:            make(map[string]string),
+		authIndexesByID:             make(map[string]string),
 		dependencyAuthsByID:         make(map[string]*Auth),
 		dependencySourceIDs:         make(map[string]map[string]struct{}),
 		dependencyDependentIDs:      make(map[string]map[string]struct{}),
+		chatGPTWebIdentityIDs:       make(map[string]map[string]struct{}),
+		chatGPTWebIdentityKeysByID:  make(map[string][]string),
+		persistedAuthsByID:          make(map[string]*Auth),
 		storeRevision:               1,
 		sessionCleanups:             make(map[string]int),
 		sessionCleanupInstances:     make(map[string]map[*authInstanceState]struct{}),
@@ -2652,12 +2668,13 @@ func (m *Manager) register(ctx context.Context, auth *Auth, requireAbsent bool) 
 	if chatGPTWebRegistrationEmail(auth) != "" {
 		m.mu.RLock()
 		conflict := m.chatGPTWebCredentialConflictLocked(auth.ID, auth)
+		identityIndexComplete := m.chatGPTWebIdentityComplete
 		m.mu.RUnlock()
 		if conflict {
 			unlockPersist()
 			return nil, ErrChatGPTWebEmailAlreadyExists
 		}
-		if requireAbsent && m.shouldPersistAuth(ctx, auth) {
+		if requireAbsent && m.shouldPersistAuth(ctx, auth) && !identityIndexComplete {
 			storedConflict, errStored := m.chatGPTWebStoredCredentialConflict(ctx, auth.ID, auth)
 			if errStored != nil {
 				unlockPersist()
@@ -2667,6 +2684,9 @@ func (m *Manager) register(ctx context.Context, auth *Auth, requireAbsent bool) 
 				unlockPersist()
 				return nil, ErrChatGPTWebEmailAlreadyExists
 			}
+		}
+		if requireAbsent && identityIndexComplete {
+			ctx = authfileguard.WithManagerValidatedChatGPTWebIdentity(ctx)
 		}
 	}
 	skipStateCarryForward := shouldSkipStateCarryForward(ctx)
@@ -2693,6 +2713,9 @@ func (m *Manager) register(ctx context.Context, auth *Auth, requireAbsent bool) 
 	}
 	var replaced *Auth
 	m.mu.Lock()
+	if m.shouldPersistAuth(ctx, auth) {
+		m.installPersistedAuthIndexLocked(auth)
+	}
 	existing := m.auths[auth.ID]
 	credentialChanged = prepareChatGPTWebCredentialReplacement(existing, auth, replacementNow)
 	if credentialChanged {
@@ -2726,7 +2749,9 @@ func (m *Manager) register(ctx context.Context, auth *Auth, requireAbsent bool) 
 	cleanupPending := m.sessionCleanupPendingLocked(auth.ID)
 	installed := authClone.Clone()
 	m.mu.Unlock()
-	m.rebuildAPIKeyModelAliasFromRuntimeConfig()
+	if isAPIKeyAuth(existingBeforePersist) || isAPIKeyAuth(auth) {
+		m.rebuildAPIKeyModelAliasFromRuntimeConfig()
+	}
 	if m.scheduler != nil {
 		m.scheduler.upsertAuth(installed.Clone())
 	}
@@ -2802,11 +2827,16 @@ func (m *Manager) canonicalizeNewChatGPTWebAuth(ctx context.Context, auth *Auth)
 }
 
 func (m *Manager) chatGPTWebCredentialConflictLocked(authID string, auth *Auth) bool {
-	for id, candidate := range m.auths {
-		if id == authID || candidate == nil {
-			continue
+	candidateIDs := make(map[string]struct{})
+	for _, key := range chatGPTWebIdentityIndexKeys(auth) {
+		for id := range m.chatGPTWebIdentityIDs[key] {
+			if id != authID {
+				candidateIDs[id] = struct{}{}
+			}
 		}
-		if ChatGPTWebCredentialIdentityConflict(candidate, auth) {
+	}
+	for id := range candidateIDs {
+		if candidate := m.auths[id]; candidate != nil && ChatGPTWebCredentialIdentityConflict(candidate, auth) {
 			return true
 		}
 	}
@@ -2897,6 +2927,9 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 	}
 	var replaced *Auth
 	m.mu.Lock()
+	if m.shouldPersistAuth(ctx, auth) {
+		m.installPersistedAuthIndexLocked(auth)
+	}
 	existing := m.auths[auth.ID]
 	credentialChanged = prepareChatGPTWebCredentialReplacement(existing, auth, replacementNow)
 	if credentialChanged {
@@ -2930,7 +2963,9 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 	cleanupPending := m.sessionCleanupPendingLocked(auth.ID)
 	installed := authClone.Clone()
 	m.mu.Unlock()
-	m.rebuildAPIKeyModelAliasFromRuntimeConfig()
+	if isAPIKeyAuth(existingBeforePersist) || isAPIKeyAuth(auth) {
+		m.rebuildAPIKeyModelAliasFromRuntimeConfig()
+	}
 	if m.scheduler != nil {
 		m.scheduler.upsertAuth(installed.Clone())
 	}
@@ -3455,8 +3490,19 @@ func (m *Manager) deleteIf(ctx context.Context, id string, predicate func(*Auth)
 	if current, ok := m.auths[id]; ok && current == deletedRuntime {
 		m.beginAuthInstanceCleanupLocked(id)
 		m.removeAuthLocked(id)
+		if shouldPersistDelete {
+			if deleteErr == nil {
+				m.removePersistedAuthIndexLocked(id)
+			} else {
+				m.dependencyIndexComplete = false
+				m.chatGPTWebIdentityComplete = false
+			}
+		}
 		if !shouldPersistDelete && authRelevantToChatGPTWebDependencyIndex(deleted) {
 			m.dependencyIndexComplete = false
+		}
+		if !shouldPersistDelete && strings.EqualFold(strings.TrimSpace(deleted.Provider), "chatgpt-web") {
+			m.chatGPTWebIdentityComplete = false
 		}
 		removed = true
 	}
@@ -8035,6 +8081,73 @@ func (m *Manager) List() []*Auth {
 	return list
 }
 
+// ListMetadataSummaries returns lightweight runtime auth snapshots containing
+// only the requested metadata keys. It is intended for management indexes that
+// must inspect every credential without cloning tokens, cookies, or model maps.
+func (m *Manager) ListMetadataSummaries(metadataKeys ...string) []*Auth {
+	if m == nil {
+		return nil
+	}
+	keySet := make(map[string]struct{}, len(metadataKeys))
+	for _, key := range metadataKeys {
+		if key = strings.TrimSpace(key); key != "" {
+			keySet[key] = struct{}{}
+		}
+	}
+	m.mu.RLock()
+	ids := make([]string, 0, len(m.auths))
+	for id := range m.auths {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	list := make([]*Auth, 0, len(ids))
+	for _, id := range ids {
+		auth := m.auths[id]
+		if auth == nil {
+			continue
+		}
+		summary := &Auth{
+			ID:               auth.ID,
+			Index:            auth.Index,
+			Provider:         auth.Provider,
+			Prefix:           auth.Prefix,
+			FileName:         auth.FileName,
+			Label:            auth.Label,
+			Status:           auth.Status,
+			StatusMessage:    auth.StatusMessage,
+			Disabled:         auth.Disabled,
+			Unavailable:      auth.Unavailable,
+			CreatedAt:        auth.CreatedAt,
+			UpdatedAt:        auth.UpdatedAt,
+			LastRefreshedAt:  auth.LastRefreshedAt,
+			NextRefreshAfter: auth.NextRefreshAfter,
+			NextRetryAfter:   auth.NextRetryAfter,
+			CooldownScope:    auth.CooldownScope,
+		}
+		if len(auth.Attributes) > 0 {
+			summary.Attributes = make(map[string]string, len(auth.Attributes))
+			for key, value := range auth.Attributes {
+				summary.Attributes[key] = value
+			}
+		}
+		if len(keySet) > 0 && len(auth.Metadata) > 0 {
+			summary.Metadata = make(map[string]any, len(keySet))
+			for key := range keySet {
+				if value, ok := auth.Metadata[key]; ok {
+					summary.Metadata[key] = value
+				}
+			}
+		}
+		if auth.LastError != nil {
+			lastError := *auth.LastError
+			summary.LastError = &lastError
+		}
+		list = append(list, summary)
+	}
+	m.mu.RUnlock()
+	return list
+}
+
 // GetByID retrieves an auth entry by its ID.
 
 func (m *Manager) GetByID(id string) (*Auth, bool) {
@@ -8934,6 +9047,11 @@ func (m *Manager) lockAuthMutationContext(ctx context.Context, auth *Auth) (cont
 	keys := []string{id}
 	if email != "" {
 		keys = append(keys, "\x00chatgpt-web-email:"+email)
+	}
+	if auth != nil && strings.EqualFold(strings.TrimSpace(auth.Provider), "chatgpt-web") {
+		for _, identityKey := range chatGPTWebIdentityIndexKeys(auth) {
+			keys = append(keys, "\x00chatgpt-web-identity:"+identityKey)
+		}
 	}
 	unlockPersist, errPersist := m.lockPersistKeysContext(ctx, keys...)
 	if errPersist != nil {
@@ -11049,7 +11167,9 @@ func (m *Manager) applyRefreshedAuth(ctx context.Context, expected, refreshBasel
 	}
 	m.mu.Unlock()
 
-	m.rebuildAPIKeyModelAliasFromRuntimeConfig()
+	if isAPIKeyAuth(current) || isAPIKeyAuth(updatedClone) {
+		m.rebuildAPIKeyModelAliasFromRuntimeConfig()
+	}
 	if m.scheduler != nil {
 		m.scheduler.upsertAuth(updatedClone)
 	}

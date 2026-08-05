@@ -737,6 +737,42 @@ func TestFileTokenStoreSaveIfAbsentRejectsConcurrentDuplicateChatGPTWebEmail(t *
 	}
 }
 
+func TestFileTokenStoreManagerValidatedCreateBypassesGlobalOperationLock(t *testing.T) {
+	authDir := t.TempDir()
+	store := NewFileTokenStore()
+	store.SetBaseDir(authDir)
+	unlockOperation, errLock := store.lockOperation(t.Context())
+	if errLock != nil {
+		t.Fatal(errLock)
+	}
+	defer unlockOperation()
+
+	ctx := authfileguard.WithManagerValidatedChatGPTWebIdentity(t.Context())
+	done := make(chan error, 1)
+	go func() {
+		_, errSave := store.SaveIfAbsent(ctx, &cliproxyauth.Auth{
+			ID:       "manager-validated.json",
+			FileName: "manager-validated.json",
+			Provider: "chatgpt-web",
+			Metadata: map[string]any{
+				"type":         "chatgpt-web",
+				"email":        "manager-validated@example.com",
+				"access_token": "token",
+			},
+		})
+		done <- errSave
+	}()
+
+	select {
+	case errSave := <-done:
+		if errSave != nil {
+			t.Fatal(errSave)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("manager-validated create waited for the store-wide operation lock")
+	}
+}
+
 func TestFileTokenStoreSaveIfAbsentRejectsChatGPTWebOutsideBaseDir(t *testing.T) {
 	baseDir := t.TempDir()
 	externalPath := filepath.Join(t.TempDir(), "external.json")

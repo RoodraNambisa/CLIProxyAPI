@@ -577,6 +577,11 @@ func (operation *authDependencyDeleteContext) loadDependencySnapshot(authoritati
 			operation.dependencyDirty = false
 			return
 		}
+		if authoritative {
+			// Destructive dependency checks must observe direct persistence-store
+			// mutations made after the latest indexed snapshot.
+			operation.h.authManager.MarkChatGPTWebDependencyIndexDirty()
+		}
 		auths, errList := operation.h.authManager.PersistedAuthSnapshot(operation.ctx)
 		if errList != nil {
 			operation.dependencyErr = errList

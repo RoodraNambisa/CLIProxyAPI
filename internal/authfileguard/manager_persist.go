@@ -7,6 +7,7 @@ import (
 )
 
 type managerOwnedPersistenceContextKey struct{}
+type managerValidatedChatGPTWebIdentityContextKey struct{}
 
 type managerPersistedGeneration struct {
 	id   uint64
@@ -35,6 +36,26 @@ func ManagerOwnedPersistence(ctx context.Context) bool {
 	}
 	owned, _ := ctx.Value(managerOwnedPersistenceContextKey{}).(bool)
 	return owned
+}
+
+// WithManagerValidatedChatGPTWebIdentity marks a create whose account identity
+// was checked against a complete Manager persistence index while the Manager's
+// dependency mutation lock was held.
+func WithManagerValidatedChatGPTWebIdentity(ctx context.Context) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, managerValidatedChatGPTWebIdentityContextKey{}, true)
+}
+
+// ManagerValidatedChatGPTWebIdentity reports whether the FileTokenStore may
+// skip its defensive full-directory identity scan for this create.
+func ManagerValidatedChatGPTWebIdentity(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+	validated, _ := ctx.Value(managerValidatedChatGPTWebIdentityContextKey{}).(bool)
+	return validated
 }
 
 // MarkManagerPersistedGeneration records one file generation written by the
