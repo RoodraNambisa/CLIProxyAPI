@@ -300,6 +300,11 @@ func triggerChatGPTWebAccountInfoRefreshAfterImport(executor chatGPTWebImportExe
 	if result == nil || result.AccountInfoRefreshState != "queued" {
 		return
 	}
+	// Keep the persisted account-info intent queued until the higher-priority
+	// import Session refresh installs a current credential instance.
+	if result.SessionRefreshState == "queued" || result.SessionRefreshState == "reused" {
+		return
+	}
 	switch result.Status {
 	case "created", "updated", "unchanged":
 	default:

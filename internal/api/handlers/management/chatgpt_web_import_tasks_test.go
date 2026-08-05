@@ -219,6 +219,40 @@ func TestChatGPTWebImportTaskReportsReusedAccountInfoRefresh(t *testing.T) {
 	}
 }
 
+func TestChatGPTWebImportTaskDefersAccountInfoRefreshUntilSessionRefresh(t *testing.T) {
+	var triggerCalls atomic.Int32
+	executor := &chatGPTWebManagementTestExecutor{}
+	executor.accountInfoTriggerFn = func(string, bool) bool {
+		triggerCalls.Add(1)
+		return true
+	}
+	h, manager, _ := newChatGPTWebManagementTestHandler(t, executor)
+	enabled := true
+	h.cfg.ChatGPTWeb.Import.RefreshAccountInfoAfterUpload = &enabled
+	task := startChatGPTWebImportTask(t, chatGPTWebManagementTestRouter(h), []chatGPTWebImportTestFile{{
+		field: "files",
+		name:  "session-priority.json",
+		data:  `{"email":"session-priority@example.com","access_token":"access-secret","session_cookie":"session-secret"}`,
+	}})
+	completed := waitForChatGPTWebMutationTask(t, chatGPTWebManagementTestRouter(h), chatGPTWebMutationTaskImport, task.ID)
+	if completed.Succeeded != 1 || len(completed.Results) != 1 {
+		t.Fatalf("task = %+v", completed)
+	}
+	result := completed.Results[0]
+	if result.SessionRefreshState != "queued" || result.AccountInfoRefreshState != "queued" {
+		t.Fatalf("background states = session %q, account info %q", result.SessionRefreshState, result.AccountInfoRefreshState)
+	}
+	if triggerCalls.Load() != 0 {
+		t.Fatalf("account-info trigger calls = %d, want 0 before Session refresh", triggerCalls.Load())
+	}
+	stored, ok := manager.GetByID(result.Name)
+	if !ok || stored == nil ||
+		!coreauth.ChatGPTWebImportIntent(stored, coreauth.ChatGPTWebImportSessionIntent) ||
+		!coreauth.ChatGPTWebImportIntent(stored, coreauth.ChatGPTWebImportAccountInfoIntent) {
+		t.Fatalf("stored credential = %#v, want both deferred intents", stored)
+	}
+}
+
 func TestChatGPTWebImportTaskDoesNotCallUpstreamByDefault(t *testing.T) {
 	var normalizeCalls atomic.Int32
 	var fetchCalls atomic.Int32
