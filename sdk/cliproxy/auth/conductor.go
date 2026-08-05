@@ -384,7 +384,19 @@ type Manager struct {
 	hookValue atomic.Value
 	mu        sync.RWMutex
 	auths     map[string]*Auth
-	scheduler *authScheduler
+	// backingPathAuthIDs indexes runtime auths by their normalized backing path.
+	// All fields in this block are protected by mu and are updated atomically
+	// with auths through installAuthLocked and removeAuthLocked.
+	backingPathAuthIDs      map[string]map[string]struct{}
+	backingPathByAuthID     map[string]string
+	backingPathAuthDir      string
+	dependencyAuthsByID     map[string]*Auth
+	dependencySourceIDs     map[string]map[string]struct{}
+	dependencyDependentIDs  map[string]map[string]struct{}
+	dependencyIndexComplete bool
+	authIndexRevision       uint64
+	storeRevision           uint64
+	scheduler               *authScheduler
 	// executorLifecycleMu serializes registry changes with executor shutdown.
 	executorLifecycleMu sync.Mutex
 	executorCloseCond   *sync.Cond
@@ -628,6 +640,12 @@ func NewManager(store Store, selector Selector, hook Hook) *Manager {
 		executors:                   make(map[string]ProviderExecutor),
 		selector:                    selector,
 		auths:                       make(map[string]*Auth),
+		backingPathAuthIDs:          make(map[string]map[string]struct{}),
+		backingPathByAuthID:         make(map[string]string),
+		dependencyAuthsByID:         make(map[string]*Auth),
+		dependencySourceIDs:         make(map[string]map[string]struct{}),
+		dependencyDependentIDs:      make(map[string]map[string]struct{}),
+		storeRevision:               1,
 		sessionCleanups:             make(map[string]int),
 		sessionCleanupInstances:     make(map[string]map[*authInstanceState]struct{}),
 		refreshExecutions:           make(map[*authInstanceState]map[chan struct{}]struct{}),
@@ -979,6 +997,8 @@ func (m *Manager) SetStore(store Store) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.store = store
+	m.storeRevision++
+	m.rebuildAuthIndexesLocked(nil, false)
 }
 
 // SetRoundTripperProvider register a provider that returns a per-auth RoundTripper.
@@ -1004,6 +1024,11 @@ func (m *Manager) SetConfig(cfg *internalconfig.Config) {
 		m.scheduler.setRoutingConfig(cfg.Routing)
 	}
 	m.runtimeConfig.Store(cfg)
+	m.mu.Lock()
+	if m.backingPathAuthDir != strings.TrimSpace(cfg.AuthDir) {
+		m.rebuildBackingPathIndexLocked(cfg)
+	}
+	m.mu.Unlock()
 	m.rebuildAPIKeyModelAliasFromRuntimeConfig()
 }
 
@@ -2676,7 +2701,7 @@ func (m *Manager) register(ctx context.Context, auth *Auth, requireAbsent bool) 
 	authClone.requestRefreshFamilyID = uuid.NewString()
 	authClone.instanceID = instanceID
 	authClone.instanceState = instanceState
-	m.auths[auth.ID] = authClone
+	m.installAuthLocked(auth.ID, authClone)
 	cleanupPending := m.sessionCleanupPendingLocked(auth.ID)
 	installed := authClone.Clone()
 	m.mu.Unlock()
@@ -2880,7 +2905,7 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 	authClone.requestRefreshFamilyID = uuid.NewString()
 	authClone.instanceID = instanceID
 	authClone.instanceState = instanceState
-	m.auths[auth.ID] = authClone
+	m.installAuthLocked(auth.ID, authClone)
 	cleanupPending := m.sessionCleanupPendingLocked(auth.ID)
 	installed := authClone.Clone()
 	m.mu.Unlock()
@@ -2938,7 +2963,7 @@ func (m *Manager) handleRetiredAuth(ctx context.Context, auth, expected *Auth) (
 	if current != nil {
 		m.beginAuthInstanceCleanupLocked(auth.ID)
 		removed = current.Clone()
-		delete(m.auths, auth.ID)
+		m.removeAuthLocked(auth.ID)
 	}
 	m.mu.Unlock()
 	if removed != nil {
@@ -3398,7 +3423,7 @@ func (m *Manager) deleteIf(ctx context.Context, id string, predicate func(*Auth)
 	m.mu.Lock()
 	if current, ok := m.auths[id]; ok && current == deletedRuntime {
 		m.beginAuthInstanceCleanupLocked(id)
-		delete(m.auths, id)
+		m.removeAuthLocked(id)
 		removed = true
 	}
 	m.mu.Unlock()
@@ -3481,7 +3506,7 @@ func (m *Manager) deleteWithOperation(ctx context.Context, id string, operation 
 				restored.instanceID = uuid.NewString()
 				restored.instanceState = &authInstanceState{}
 				restored.bindExecutorOwner(m.executors[executorKeyFromAuth(restored)])
-				m.auths[id] = restored
+				m.installAuthLocked(id, restored)
 			}
 			m.mu.Unlock()
 		}
@@ -3489,7 +3514,7 @@ func (m *Manager) deleteWithOperation(ctx context.Context, id string, operation 
 		if (outcome != DeleteOutcomeRolledBack || !restoreOnRollback) && deleted != nil {
 			m.mu.Lock()
 			if m.auths[id] == current {
-				delete(m.auths, id)
+				m.removeAuthLocked(id)
 				removed = true
 			}
 			m.mu.Unlock()
@@ -3520,7 +3545,7 @@ func (m *Manager) deleteWithOperation(ctx context.Context, id string, operation 
 	if deleted != nil {
 		m.mu.Lock()
 		if m.auths[id] == current {
-			delete(m.auths, id)
+			m.removeAuthLocked(id)
 			removed = true
 		}
 		m.mu.Unlock()
@@ -3618,7 +3643,7 @@ func (m *Manager) Load(ctx context.Context) error {
 	for id := range replaced {
 		m.beginAuthInstanceCleanupLocked(id)
 	}
-	m.auths = loaded
+	m.replaceAuthsLocked(loaded, items, true)
 	m.rebuildAPIKeyModelAliasLocked(cfg)
 	schedulerAuths := make([]*Auth, 0, len(loaded))
 	for _, auth := range loaded {
@@ -4147,7 +4172,7 @@ func (m *Manager) installPreparedRequestAuthWithRuntimeMetadata(
 		candidate.instanceState = current.instanceState
 	}
 	installedAuth := candidate.Clone()
-	m.auths[id] = installedAuth
+	m.installAuthLocked(id, installedAuth)
 	installed := installedAuth.Clone()
 	cleanupPending := m.sessionCleanupPendingLocked(id)
 	m.mu.Unlock()
@@ -4412,7 +4437,7 @@ func (m *Manager) mutateRuntimeMetadataIfCurrent(
 		}
 		installed.Attributes[SourceHashAttributeKey] = persistedHash
 	}
-	m.auths[id] = installed
+	m.installAuthLocked(id, installed)
 	m.mu.Unlock()
 	snapshot := installed.Clone()
 	if len(clearedModels) > 0 || len(clearedFreshImageRateLimits) > 0 {
@@ -9500,7 +9525,7 @@ func (m *Manager) markRefreshPending(id string, now time.Time) (authRefreshJob, 
 	}
 	pendingUntil := now.Add(refreshPendingBackoff)
 	auth.NextRefreshAfter = pendingUntil
-	m.auths[id] = auth
+	m.installAuthLocked(id, auth)
 	job := authRefreshJob{authID: id, expected: auth, pendingUntil: pendingUntil}
 	m.mu.Unlock()
 
@@ -10674,7 +10699,7 @@ func (m *Manager) refreshAuthExpected(ctx context.Context, id string, expected *
 		if current := m.auths[id]; runtimeMetadataMutationMatchesCurrent(current, auth) {
 			current.NextRefreshAfter = now.Add(refreshFailureBackoff)
 			current.LastError = &Error{Message: err.Error()}
-			m.auths[id] = current
+			m.installAuthLocked(id, current)
 			shouldReschedule = true
 			if m.scheduler != nil {
 				m.scheduler.upsertAuthState(current.Clone())
@@ -10983,7 +11008,7 @@ func (m *Manager) applyRefreshedAuth(ctx context.Context, expected, refreshBasel
 			updatedClone.requestRefreshFamilyID = uuid.NewString()
 		}
 	}
-	m.auths[id] = updatedClone
+	m.installAuthLocked(id, updatedClone)
 	if strings.EqualFold(strings.TrimSpace(updatedClone.Provider), "chatgpt-web") {
 		if lockValue, ok := m.requestRefreshLocks.Load(id); ok {
 			if requestLock, _ := lockValue.(*authRequestRefreshLock); requestLock != nil {

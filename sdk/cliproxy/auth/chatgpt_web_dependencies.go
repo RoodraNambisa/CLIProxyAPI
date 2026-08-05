@@ -539,11 +539,17 @@ func (m *Manager) PersistedAuthSnapshot(ctx context.Context) ([]*Auth, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if m.store == nil {
+	m.mu.RLock()
+	store := m.store
+	revision := m.authIndexRevision
+	storeRevision := m.storeRevision
+	m.mu.RUnlock()
+	if store == nil {
 		return nil, nil
 	}
-	persistedAuths, errList := m.store.List(ctx)
+	persistedAuths, errList := store.List(ctx)
 	if errList != nil {
+		m.MarkChatGPTWebDependencyIndexDirty()
 		return nil, errList
 	}
 	auths := make([]*Auth, 0, len(persistedAuths))
@@ -552,6 +558,13 @@ func (m *Manager) PersistedAuthSnapshot(ctx context.Context) ([]*Auth, error) {
 			auths = append(auths, auth.Clone())
 		}
 	}
+	m.mu.Lock()
+	if m.authIndexRevision == revision && m.storeRevision == storeRevision {
+		m.rebuildAuthIndexesLocked(auths, true)
+	} else {
+		m.dependencyIndexComplete = false
+	}
+	m.mu.Unlock()
 	return auths, nil
 }
 
@@ -630,6 +643,9 @@ func (m *Manager) UpdatePersistedIfCurrentSourceHash(ctx context.Context, expect
 	if errPersist := m.persistWithoutLock(WithSourceHashSavePrecondition(ctx, expectedHash), updated, false); errPersist != nil {
 		return nil, false, errPersist
 	}
+	m.mu.Lock()
+	m.installPersistedDependencyAuthLocked(updated)
+	m.mu.Unlock()
 	return updated.Clone(), true, nil
 }
 
@@ -686,6 +702,7 @@ func (m *Manager) DeleteIfCurrentSourceHash(ctx context.Context, expected *Auth)
 	errDelete := store.DeleteIfSourceHashMatches(ctx, expected.ID, expectedHash)
 	if errDelete != nil {
 		if outcome, explicit := DeleteOutcomeFromError(errDelete); !explicit || outcome != DeleteOutcomeCommitted {
+			m.MarkChatGPTWebDependencyIndexDirty()
 			unlockPersist()
 			unlockDependency()
 			return false, errDelete
@@ -696,9 +713,13 @@ func (m *Manager) DeleteIfCurrentSourceHash(ctx context.Context, expected *Auth)
 		m.mu.Lock()
 		if m.auths[expected.ID] == currentRuntime {
 			m.beginAuthInstanceCleanupLocked(expected.ID)
-			delete(m.auths, expected.ID)
+			m.removeAuthLocked(expected.ID)
 			removedRuntime = true
 		}
+		m.mu.Unlock()
+	} else {
+		m.mu.Lock()
+		m.removePersistedDependencyAuthLocked(expected.ID)
 		m.mu.Unlock()
 	}
 	if removedRuntime {
@@ -958,6 +979,7 @@ func (m *Manager) deleteRetainedCodexSourceIfOrphan(ctx context.Context, sourceI
 	errDelete := store.DeleteIfSourceHashMatches(ctx, sourceID, expectedHash)
 	if errDelete != nil {
 		if outcome, explicit := DeleteOutcomeFromError(errDelete); !explicit || outcome != DeleteOutcomeCommitted {
+			m.MarkChatGPTWebDependencyIndexDirty()
 			unlockPersist()
 			unlockDependency()
 			return false, errDelete
@@ -968,8 +990,11 @@ func (m *Manager) deleteRetainedCodexSourceIfOrphan(ctx context.Context, sourceI
 	m.mu.Lock()
 	if m.auths[sourceID] == currentRuntime {
 		m.beginAuthInstanceCleanupLocked(sourceID)
-		delete(m.auths, sourceID)
+		m.removeAuthLocked(sourceID)
 		removed = true
+	}
+	if currentRuntime == nil {
+		m.removePersistedDependencyAuthLocked(sourceID)
 	}
 	m.mu.Unlock()
 	if removed {
