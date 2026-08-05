@@ -2,17 +2,45 @@ package cliproxy
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strconv"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	chatgptwebauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/chatgptweb"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/authfileguard"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/watcher"
 	sdkauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/auth"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/config"
 )
+
+type serviceUncertainConditionalDeleteStore struct {
+	conditionalDeleteCalls atomic.Int32
+}
+
+func (*serviceUncertainConditionalDeleteStore) List(context.Context) ([]*coreauth.Auth, error) {
+	return nil, nil
+}
+
+func (*serviceUncertainConditionalDeleteStore) Save(_ context.Context, auth *coreauth.Auth) (string, error) {
+	if auth == nil {
+		return "", nil
+	}
+	return auth.ID, nil
+}
+
+func (*serviceUncertainConditionalDeleteStore) Delete(context.Context, string) error {
+	return errors.New("ordinary delete must not be used")
+}
+
+func (store *serviceUncertainConditionalDeleteStore) DeleteIfSourceHashMatches(context.Context, string, string) error {
+	store.conditionalDeleteCalls.Add(1)
+	return coreauth.NewDeleteOutcomeError(coreauth.DeleteOutcomeUncertain, errors.New("conditional delete result unavailable"))
+}
 
 func TestAuthEligibleForChatGPTWebDeadDelete(t *testing.T) {
 	policy := chatGPTWebDeadAuthDeletePolicy{enabled: true, priorities: []int{0, -1}}
@@ -176,6 +204,54 @@ func TestServiceDequeueEnabledAuthMaintenanceCandidateKeepsDisabledGenericPolicy
 	}
 }
 
+func TestServiceAuthMaintenanceRetryUsesBackoffAndRetainsDeleteGeneration(t *testing.T) {
+	service := &Service{}
+	candidate := authMaintenanceCandidate{
+		Key:    "retry-key",
+		Path:   filepath.Join(t.TempDir(), "retry.json"),
+		IDs:    []string{"retry.json"},
+		Reason: "chatgpt_web_dead_account_deleted",
+	}
+	if !service.enqueueAuthMaintenanceCandidate(candidate) {
+		t.Fatal("enqueue initial candidate")
+	}
+	dequeued, ok := service.dequeueProcessableAuthMaintenanceCandidate(false)
+	if !ok {
+		t.Fatal("dequeue initial candidate")
+	}
+	generation, errGeneration := service.authMaintenanceDeleteGeneration(dequeued, "source-hash")
+	if errGeneration != nil {
+		t.Fatal(errGeneration)
+	}
+	if !service.requeueAuthMaintenanceCandidate(dequeued) {
+		t.Fatal("requeue failed candidate")
+	}
+	if _, ok = service.dequeueProcessableAuthMaintenanceCandidate(false); ok {
+		t.Fatal("retry became runnable before its one-second backoff")
+	}
+	service.maintenanceMu.Lock()
+	if len(service.maintenanceQueue) != 1 {
+		service.maintenanceMu.Unlock()
+		t.Fatalf("retry queue length = %d, want 1", len(service.maintenanceQueue))
+	}
+	service.maintenanceQueue[0].NextAttemptAt = time.Now().Add(-time.Millisecond)
+	service.maintenanceMu.Unlock()
+	retry, ok := service.dequeueProcessableAuthMaintenanceCandidate(false)
+	if !ok || retry.Attempts != 1 {
+		t.Fatalf("retry candidate = %#v, ok=%v", retry, ok)
+	}
+	reused, errGeneration := service.authMaintenanceDeleteGeneration(retry, "source-hash")
+	if errGeneration != nil || reused != generation {
+		t.Fatalf("retry generation = %p, want %p, err=%v", reused, generation, errGeneration)
+	}
+	wantDelays := []time.Duration{time.Second, 5 * time.Second, 30 * time.Second, time.Minute, 5 * time.Minute, 5 * time.Minute}
+	for index, want := range wantDelays {
+		if got := authMaintenanceDeleteRetryDelay(index + 1); got != want {
+			t.Fatalf("retry delay %d = %v, want %v", index+1, got, want)
+		}
+	}
+}
+
 func TestServiceChatGPTWebDeadDeleteRechecksDisabledPolicyBeforeDeleting(t *testing.T) {
 	authDir := t.TempDir()
 	store := sdkauth.NewFileTokenStore()
@@ -320,6 +396,158 @@ func TestServiceAuthMaintenanceWorkerCountsSuccessfulWebDeadDeletes(t *testing.T
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatalf("successful deletion count = %d, want 1", service.chatGPTWebDeadAuthDeletedCount.Load())
+}
+
+func TestServiceAuthMaintenanceWorkerDeletesWebDeadQueueWithoutGenericInterval(t *testing.T) {
+	authDir := t.TempDir()
+	store := sdkauth.NewFileTokenStore()
+	store.SetBaseDir(authDir)
+	cfg := &config.Config{
+		AuthDir: authDir,
+		AuthMaintenance: config.AuthMaintenanceConfig{
+			DeleteIntervalSeconds: 60,
+			ScanIntervalSeconds:   60,
+		},
+	}
+	cfg.ChatGPTWeb.AutoDeleteDeadAuths = true
+	cfg.ChatGPTWeb.AutoDeleteDeadPriorities = []int{-1}
+	service := &Service{cfg: cfg, coreManager: coreauth.NewManager(store, nil, nil)}
+
+	const candidateCount = 100
+	for index := range candidateCount {
+		id := "web-dead-immediate-" + strconv.Itoa(index) + ".json"
+		dead := chatGPTWebAutoDeleteTestAuth(id, -1, coreauth.LifecycleStateDead)
+		dead.FileName = filepath.Join(authDir, id)
+		dead.Attributes["path"] = dead.FileName
+		installed, errRegister := service.coreManager.Register(t.Context(), dead)
+		if errRegister != nil {
+			t.Fatalf("register auth %d: %v", index, errRegister)
+		}
+		candidate, ok := service.authMaintenanceCandidateForAuth(installed, authDir, "chatgpt_web_dead_account_deactivated")
+		if !ok || !service.disableAuthMaintenanceCandidate(t.Context(), candidate, true) {
+			t.Fatalf("stage candidate %d", index)
+		}
+		candidate = snapshotChatGPTWebAutoDeleteCandidate(t, service, candidate, authDir)
+		if !service.enqueueAuthMaintenanceCandidate(candidate) {
+			t.Fatalf("enqueue candidate %d", index)
+		}
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	service.startAuthMaintenance(ctx)
+	defer func() {
+		cancel()
+		service.stopAuthMaintenance()
+	}()
+	service.wakeAuthMaintenance()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if service.chatGPTWebDeadAuthDeletedCount.Load() == candidateCount {
+			if service.hasEnabledAuthMaintenanceCandidates(false, true) {
+				t.Fatal("delete count completed while Web candidates remained queued")
+			}
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("deleted %d/%d Web credentials; generic 60-second interval leaked into automatic deletion", service.chatGPTWebDeadAuthDeletedCount.Load(), candidateCount)
+}
+
+func TestServiceAuthMaintenanceWorkerRetainsUncertainDeleteQuarantineWithoutResend(t *testing.T) {
+	root := t.TempDir()
+	authDir := filepath.Join(root, "auths")
+	store := &serviceUncertainConditionalDeleteStore{}
+	cfg := &config.Config{
+		AuthDir: authDir,
+		AuthMaintenance: config.AuthMaintenanceConfig{
+			DeleteIntervalSeconds: 60,
+			ScanIntervalSeconds:   1,
+		},
+	}
+	cfg.ChatGPTWeb.AutoDeleteDeadAuths = true
+	cfg.ChatGPTWeb.AutoDeleteDeadPriorities = []int{-1}
+	service := &Service{
+		cfg:         cfg,
+		configPath:  filepath.Join(root, "config.yaml"),
+		coreManager: coreauth.NewManager(store, nil, nil),
+	}
+
+	dead := chatGPTWebAutoDeleteTestAuth("web-dead-uncertain.json", -1, coreauth.LifecycleStateDead)
+	dead.FileName = filepath.Join(authDir, dead.ID)
+	dead.Attributes["path"] = dead.FileName
+	raw := []byte(`{"type":"chatgpt-web","lifecycle_state":"dead","lifecycle_reason":"account_deactivated","access_token":"test-token"}`)
+	if errMkdir := os.MkdirAll(authDir, 0o700); errMkdir != nil {
+		t.Fatal(errMkdir)
+	}
+	if errWrite := os.WriteFile(dead.FileName, raw, 0o600); errWrite != nil {
+		t.Fatal(errWrite)
+	}
+	if errSync := coreauth.SyncPersistedMetadataAndSourceHash(dead, raw); errSync != nil {
+		t.Fatal(errSync)
+	}
+	installed, errRegister := service.coreManager.Register(t.Context(), dead)
+	if errRegister != nil {
+		t.Fatal(errRegister)
+	}
+	shadow := chatGPTWebAutoDeleteTestAuth("web-dead-uncertain-shadow", -1, coreauth.LifecycleStateDead)
+	shadow.FileName = dead.FileName
+	shadow.Attributes["path"] = dead.FileName
+	shadow.Attributes[coreauth.SourceHashAttributeKey] = installed.Attributes[coreauth.SourceHashAttributeKey]
+	if _, errRegister = service.coreManager.Register(coreauth.WithSkipPersist(t.Context()), shadow); errRegister != nil {
+		t.Fatal(errRegister)
+	}
+	candidate, ok := service.authMaintenanceCandidateForAuth(installed, authDir, "chatgpt_web_dead_account_deactivated")
+	if !ok || !service.disableAuthMaintenanceCandidate(t.Context(), candidate, true) {
+		t.Fatal("stage uncertain delete candidate")
+	}
+	candidate = snapshotChatGPTWebAutoDeleteCandidate(t, service, candidate, authDir)
+	if !service.chatGPTWebDeadMaintenanceCandidateStillEligible(candidate, service.snapshotChatGPTWebDeadAuthDeletePolicy(), authDir) {
+		t.Fatalf("shared uncertain candidate is not eligible: candidate=%#v auths=%#v", candidate, service.coreManager.AuthsForBackingPath(dead.FileName))
+	}
+	if !service.enqueueAuthMaintenanceCandidate(candidate) {
+		t.Fatal("enqueue uncertain delete candidate")
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	service.startAuthMaintenance(ctx)
+	defer func() {
+		cancel()
+		service.stopAuthMaintenance()
+		service.maintenanceMu.Lock()
+		generation := service.maintenanceDeleteGenerations[candidate.Key]
+		service.maintenanceMu.Unlock()
+		if generation != nil {
+			_ = watcher.ClearAuthDeleteQuarantine(service.configPath, authDir, candidate.Path, generation)
+		}
+		authfileguard.ClearQuarantined(candidate.Path)
+	}()
+	service.wakeAuthMaintenance()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for store.conditionalDeleteCalls.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if calls := store.conditionalDeleteCalls.Load(); calls != 1 {
+		t.Fatalf("conditional delete calls = %d, want 1", calls)
+	}
+	if _, exists := service.coreManager.GetByID(dead.ID); exists {
+		t.Fatal("uncertain delete left the credential schedulable")
+	}
+	if _, exists := service.coreManager.GetByID(shadow.ID); exists {
+		t.Fatal("uncertain shared-file delete left a sibling runtime credential schedulable")
+	}
+	if !authfileguard.IsQuarantined(candidate.Path) {
+		t.Fatal("uncertain delete did not retain the credential quarantine")
+	}
+	tombstones, errReadDir := os.ReadDir(filepath.Join(root, ".cliproxy-delete-quarantine"))
+	if errReadDir != nil || len(tombstones) != 1 {
+		t.Fatalf("delete tombstones = %d, err=%v; want 1", len(tombstones), errReadDir)
+	}
+
+	time.Sleep(1200 * time.Millisecond)
+	if calls := store.conditionalDeleteCalls.Load(); calls != 1 {
+		t.Fatalf("uncertain delete was resent %d times", calls)
+	}
 }
 
 func TestServiceChatGPTWebDeadDeleteDoesNotDeleteReplacementGeneration(t *testing.T) {
@@ -586,6 +814,7 @@ func testServiceChatGPTWebDeleteReconcilesRetainedCodexSource(t *testing.T, reas
 	if !deleted {
 		t.Fatal("dependent auth was not deleted")
 	}
+	service.runAuthMaintenanceCheckpoint(context.Background(), "test queue drained")
 	if _, exists := service.coreManager.GetByID(installedSource.ID); exists {
 		t.Fatal("orphaned retained Codex source remained after dependent deletion")
 	}

@@ -3424,7 +3424,18 @@ func (m *Manager) deleteIf(ctx context.Context, id string, predicate func(*Auth)
 	var deleteErr error
 	cleanupReason := "auth_removed"
 	if shouldPersistDelete {
-		deleteErr = m.store.Delete(ctx, id)
+		deleteStore := m.store.Delete
+		if generation := authfileguard.DeleteGenerationFromContext(ctx); generation != nil && strings.TrimSpace(generation.ExpectedHash()) != "" {
+			conditionalStore, ok := m.store.(SourceConditionalDeleteStore)
+			if !ok || conditionalStore == nil {
+				unlockPersist()
+				return false, NewDeleteOutcomeError(DeleteOutcomeRolledBack, errors.New("auth store does not support source-conditional deletion"))
+			}
+			deleteStore = func(deleteCtx context.Context, deleteID string) error {
+				return conditionalStore.DeleteIfSourceHashMatches(deleteCtx, deleteID, generation.ExpectedHash())
+			}
+		}
+		deleteErr = deleteStore(ctx, id)
 		if deleteErr != nil {
 			outcome, explicitOutcome := DeleteOutcomeFromError(deleteErr)
 			if !explicitOutcome || outcome == DeleteOutcomeRolledBack {

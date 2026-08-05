@@ -659,6 +659,16 @@ func (m *Manager) SupportsSourceConditionalSave() bool {
 	return supported
 }
 
+// SupportsSourceConditionalDelete reports whether the configured auth store
+// can reject deletion when the persisted credential generation changed.
+func (m *Manager) SupportsSourceConditionalDelete() bool {
+	if m == nil {
+		return false
+	}
+	_, supported := m.store.(SourceConditionalDeleteStore)
+	return supported
+}
+
 // DeleteIfCurrentSourceHash removes exactly the persisted credential version
 // represented by expected. It is used to compensate a conversion whose source
 // reservation could not be finalized without deleting a concurrent replacement.

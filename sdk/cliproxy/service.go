@@ -6,8 +6,10 @@ package cliproxy
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -216,8 +218,11 @@ type Service struct {
 	// maintenanceGeneration tracks cancellation generations for auth maintenance keys.
 	maintenanceGeneration map[string]uint64
 
-	// maintenanceStaged tracks auth paths temporarily moved out of the way by maintenance.
+	// maintenanceStaged tracks paths whose watcher events belong to maintenance deletion.
 	maintenanceStaged map[string]int
+
+	// maintenanceDeleteGenerations retains durable deletion identities across safe retries.
+	maintenanceDeleteGenerations map[string]*authfileguard.DeleteGeneration
 
 	// maintenanceWake nudges the maintenance worker to wake early.
 	maintenanceWake chan struct{}
@@ -255,6 +260,7 @@ const (
 	defaultMaintenanceDeleteIntervalSeconds = 5
 	defaultMaintenanceQuotaStrikeThreshold  = 6
 	authMaintenanceStagedIgnoreWindow       = 200 * time.Millisecond
+	authMaintenanceCheckpointDeletes        = 64
 	defaultModelSyncWorkers                 = 4
 	defaultModelSyncQueueSize               = 256
 	authMaintenanceMetadataPrefix           = "auth_maintenance_"
@@ -267,12 +273,19 @@ const (
 	authMaintenanceDisableAction            = "disable"
 )
 
+var authMaintenanceDeleteRetryDelays = [...]time.Duration{
+	time.Second,
+	5 * time.Second,
+	30 * time.Second,
+	time.Minute,
+	5 * time.Minute,
+}
+
 var (
-	readAuthMaintenanceFile                    = os.ReadFile
-	statAuthMaintenanceFile                    = os.Stat
-	removeAuthMaintenanceFile                  = os.Remove
-	renameAuthMaintenanceFile                  = os.Rename
-	removeAuthMaintenanceFileIfSnapshotMatches = stageAuthMaintenanceFileIfSnapshotMatches
+	readAuthMaintenanceFile   = os.ReadFile
+	statAuthMaintenanceFile   = os.Stat
+	removeAuthMaintenanceFile = os.Remove
+	renameAuthMaintenanceFile = os.Rename
 )
 
 type authMaintenanceCandidate struct {
@@ -282,6 +295,8 @@ type authMaintenanceCandidate struct {
 	Installations map[string]string
 	Reason        string
 	Generation    uint64
+	Attempts      int
+	NextAttemptAt time.Time
 }
 
 type modelSyncTaskState struct {
@@ -1103,6 +1118,9 @@ func (s *Service) ensureAuthMaintenanceQueue() {
 	if s.maintenanceStaged == nil {
 		s.maintenanceStaged = make(map[string]int)
 	}
+	if s.maintenanceDeleteGenerations == nil {
+		s.maintenanceDeleteGenerations = make(map[string]*authfileguard.DeleteGeneration)
+	}
 	if s.maintenanceWake == nil {
 		s.maintenanceWake = make(chan struct{}, 1)
 	}
@@ -1221,8 +1239,12 @@ func (s *Service) dequeueProcessableAuthMaintenanceCandidate(genericEnabled bool
 	}
 	s.maintenanceMu.Lock()
 	defer s.maintenanceMu.Unlock()
+	now := time.Now()
 	for index, candidate := range s.maintenanceQueue {
 		if !genericEnabled && !isChatGPTWebDeadMaintenanceCandidate(candidate) {
+			continue
+		}
+		if !candidate.NextAttemptAt.IsZero() && now.Before(candidate.NextAttemptAt) {
 			continue
 		}
 		s.maintenanceQueue = append(s.maintenanceQueue[:index], s.maintenanceQueue[index+1:]...)
@@ -1230,6 +1252,44 @@ func (s *Service) dequeueProcessableAuthMaintenanceCandidate(genericEnabled bool
 		return candidate, true
 	}
 	return authMaintenanceCandidate{}, false
+}
+
+func (s *Service) nextAuthMaintenanceRetryDelay(genericEnabled, webDeadEnabled bool, now time.Time) (time.Duration, bool) {
+	if s == nil {
+		return 0, false
+	}
+	s.maintenanceMu.Lock()
+	defer s.maintenanceMu.Unlock()
+	var earliest time.Time
+	for _, candidate := range s.maintenanceQueue {
+		if !authMaintenanceCandidateEnabled(candidate, genericEnabled, webDeadEnabled) || candidate.NextAttemptAt.IsZero() || !now.Before(candidate.NextAttemptAt) {
+			continue
+		}
+		if earliest.IsZero() || candidate.NextAttemptAt.Before(earliest) {
+			earliest = candidate.NextAttemptAt
+		}
+	}
+	if earliest.IsZero() {
+		return 0, false
+	}
+	return earliest.Sub(now), true
+}
+
+func authMaintenanceDeleteRetryDelay(attempt int) time.Duration {
+	if attempt < 1 {
+		attempt = 1
+	}
+	index := attempt - 1
+	if index >= len(authMaintenanceDeleteRetryDelays) {
+		index = len(authMaintenanceDeleteRetryDelays) - 1
+	}
+	return authMaintenanceDeleteRetryDelays[index]
+}
+
+func (s *Service) requeueAuthMaintenanceCandidate(candidate authMaintenanceCandidate) bool {
+	candidate.Attempts++
+	candidate.NextAttemptAt = time.Now().Add(authMaintenanceDeleteRetryDelay(candidate.Attempts))
+	return s.enqueueAuthMaintenanceCandidate(candidate)
 }
 
 func (s *Service) setAuthMaintenanceDependencyReconcilePending(pending bool) {
@@ -1274,6 +1334,37 @@ func (s *Service) hasEnabledAuthMaintenanceCandidates(genericEnabled, webDeadEna
 		}
 	}
 	return false
+}
+
+func (s *Service) hasReadyAuthMaintenanceCandidates(genericEnabled, webDeadEnabled bool, now time.Time) bool {
+	if s == nil {
+		return false
+	}
+	s.maintenanceMu.Lock()
+	defer s.maintenanceMu.Unlock()
+	for _, candidate := range s.maintenanceQueue {
+		if !authMaintenanceCandidateEnabled(candidate, genericEnabled, webDeadEnabled) {
+			continue
+		}
+		if candidate.NextAttemptAt.IsZero() || !now.Before(candidate.NextAttemptAt) {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *Service) runAuthMaintenanceCheckpoint(ctx context.Context, reason string) {
+	if s == nil {
+		return
+	}
+	if _, errReconcile := s.reconcileChatGPTWebDependencies(ctx, reason); errReconcile != nil {
+		s.setAuthMaintenanceDependencyReconcilePending(true)
+	} else {
+		s.setAuthMaintenanceDependencyReconcilePending(false)
+	}
+	if s.reconcileUsageStatistics(reason) > 0 {
+		s.persistUsageStatistics("auth-maintenance-checkpoint")
+	}
 }
 
 func (s *Service) authMaintenanceCandidateQueued(candidate authMaintenanceCandidate) bool {
@@ -1341,13 +1432,14 @@ func (s *Service) cancelAuthMaintenanceKey(key string) bool {
 	}
 	s.ensureAuthMaintenanceQueue()
 	s.maintenanceMu.Lock()
-	defer s.maintenanceMu.Unlock()
 
 	removed := false
+	var canceled authMaintenanceCandidate
 	filtered := s.maintenanceQueue[:0]
 	for _, candidate := range s.maintenanceQueue {
 		if strings.TrimSpace(candidate.Key) == key {
 			removed = true
+			canceled = candidate
 			continue
 		}
 		filtered = append(filtered, candidate)
@@ -1358,6 +1450,15 @@ func (s *Service) cancelAuthMaintenanceKey(key string) bool {
 		removed = true
 	}
 	s.maintenanceGeneration[key]++
+	generation := s.maintenanceDeleteGenerations[key]
+	delete(s.maintenanceDeleteGenerations, key)
+	s.maintenanceMu.Unlock()
+	if generation != nil {
+		canceled.Key = key
+		if errClear := s.clearAuthMaintenanceDeleteQuarantine(canceled, generation); errClear != nil {
+			log.WithError(errClear).Warnf("failed to clear canceled auth maintenance quarantine for %s", canceled.Path)
+		}
+	}
 	return removed
 }
 
@@ -1372,6 +1473,63 @@ func (s *Service) authMaintenanceCandidateCanceled(candidate authMaintenanceCand
 	s.maintenanceMu.Lock()
 	defer s.maintenanceMu.Unlock()
 	return s.maintenanceGeneration[key] != candidate.Generation
+}
+
+func (s *Service) authMaintenanceDeleteGeneration(candidate authMaintenanceCandidate, expectedHash string) (*authfileguard.DeleteGeneration, error) {
+	if s == nil {
+		return nil, errors.New("auth maintenance service is unavailable")
+	}
+	key := strings.TrimSpace(candidate.Key)
+	expectedHash = strings.TrimSpace(expectedHash)
+	if key == "" || expectedHash == "" {
+		return nil, errors.New("auth maintenance deletion identity is incomplete")
+	}
+	s.ensureAuthMaintenanceQueue()
+	s.maintenanceMu.Lock()
+	defer s.maintenanceMu.Unlock()
+	if generation := s.maintenanceDeleteGenerations[key]; generation != nil {
+		if generation.ExpectedHash() != expectedHash {
+			return nil, authfileguard.ErrPersistGenerationStale
+		}
+		return generation, nil
+	}
+	generation := authfileguard.NewDeleteGeneration(expectedHash)
+	s.maintenanceDeleteGenerations[key] = generation
+	return generation, nil
+}
+
+func (s *Service) forgetAuthMaintenanceDeleteGeneration(candidate authMaintenanceCandidate, generation *authfileguard.DeleteGeneration) {
+	if s == nil || generation == nil {
+		return
+	}
+	key := strings.TrimSpace(candidate.Key)
+	s.maintenanceMu.Lock()
+	if s.maintenanceDeleteGenerations[key] == generation {
+		delete(s.maintenanceDeleteGenerations, key)
+	}
+	s.maintenanceMu.Unlock()
+}
+
+func (s *Service) clearAuthMaintenanceDeleteQuarantine(candidate authMaintenanceCandidate, generation *authfileguard.DeleteGeneration) error {
+	if s == nil || generation == nil || strings.TrimSpace(candidate.Path) == "" {
+		return nil
+	}
+	authDir := ""
+	if cfg := s.currentConfig(); cfg != nil {
+		authDir = strings.TrimSpace(cfg.AuthDir)
+	}
+	if errClear := watcher.ClearAuthDeleteQuarantine(s.configPath, authDir, candidate.Path, generation); errClear != nil {
+		return errClear
+	}
+	s.forgetAuthMaintenanceDeleteGeneration(candidate, generation)
+	return nil
+}
+
+func authMaintenanceExpectedSourceHash(contents []byte) string {
+	if hash, errHash := coreauth.CanonicalSourceHashFromBytes(contents); errHash == nil && strings.TrimSpace(hash) != "" {
+		return hash
+	}
+	return coreauth.SourceHashFromBytes(contents)
 }
 
 func (s *Service) markAuthMaintenanceStagedPath(path string) {
@@ -1433,6 +1591,12 @@ func (s *Service) authMaintenancePathStaged(path string) bool {
 	return s.maintenanceStaged[path] > 0
 }
 
+func authMaintenancePathsEqual(first, second string) bool {
+	first = authfileguard.PathIdentity(first)
+	second = authfileguard.PathIdentity(second)
+	return first != "" && first == second
+}
+
 func (s *Service) authMaintenanceCandidateForAuth(auth *coreauth.Auth, authDir string, reason string) (authMaintenanceCandidate, bool) {
 	if s == nil || s.coreManager == nil || auth == nil {
 		return authMaintenanceCandidate{}, false
@@ -1450,10 +1614,11 @@ func (s *Service) authMaintenanceCandidateForAuth(auth *coreauth.Auth, authDir s
 		}, true
 	}
 
-	ids := make([]string, 0, 1)
-	seen := make(map[string]struct{})
-	for _, current := range s.coreManager.List() {
-		if resolveAuthFilePath(current, authDir) != path {
+	backedAuths := s.coreManager.AuthsForBackingPath(path)
+	ids := make([]string, 0, len(backedAuths))
+	seen := make(map[string]struct{}, len(backedAuths))
+	for _, current := range backedAuths {
+		if !authMaintenancePathsEqual(resolveAuthFilePath(current, authDir), path) {
 			continue
 		}
 		id := strings.TrimSpace(current.ID)
@@ -1507,7 +1672,7 @@ func (s *Service) snapshotAuthMaintenanceCandidateInstallations(candidate authMa
 		if !ok || current == nil || current.RuntimeInstallationID() == "" {
 			return authMaintenanceCandidate{}, false
 		}
-		if path := strings.TrimSpace(candidate.Path); path != "" && resolveAuthFilePath(current, authDir) != path {
+		if path := strings.TrimSpace(candidate.Path); path != "" && !authMaintenancePathsEqual(resolveAuthFilePath(current, authDir), path) {
 			return authMaintenanceCandidate{}, false
 		}
 		installations[id] = current.RuntimeInstallationID()
@@ -1679,7 +1844,8 @@ func (s *Service) startAuthMaintenance(parent context.Context) {
 
 	go func() {
 		defer close(done)
-		var lastDeleteAt time.Time
+		var lastGenericDeleteAt time.Time
+		deletesSinceCheckpoint := 0
 		var lastWebPolicy chatGPTWebDeadAuthDeletePolicy
 		var hasLastWebPolicy bool
 		reconcilePersistedWebState := true
@@ -1708,24 +1874,27 @@ func (s *Service) startAuthMaintenance(parent context.Context) {
 				if s.authMaintenanceCandidateCanceled(candidate) {
 					continue
 				}
-				deleteInterval := time.Duration(cfg.DeleteIntervalSeconds) * time.Second
-				if deleteInterval <= 0 {
-					deleteInterval = time.Duration(defaultMaintenanceDeleteIntervalSeconds) * time.Second
-				}
-				if !lastDeleteAt.IsZero() {
-					wait := deleteInterval - time.Since(lastDeleteAt)
-					if wait > 0 {
-						timer := time.NewTimer(wait)
-						select {
-						case <-ctx.Done():
-							if !timer.Stop() {
-								select {
-								case <-timer.C:
-								default:
+				webDeadCandidate := isChatGPTWebDeadMaintenanceCandidate(candidate)
+				if !webDeadCandidate {
+					deleteInterval := time.Duration(cfg.DeleteIntervalSeconds) * time.Second
+					if deleteInterval <= 0 {
+						deleteInterval = time.Duration(defaultMaintenanceDeleteIntervalSeconds) * time.Second
+					}
+					if !lastGenericDeleteAt.IsZero() {
+						wait := deleteInterval - time.Since(lastGenericDeleteAt)
+						if wait > 0 {
+							timer := time.NewTimer(wait)
+							select {
+							case <-ctx.Done():
+								if !timer.Stop() {
+									select {
+									case <-timer.C:
+									default:
+									}
 								}
+								return
+							case <-timer.C:
 							}
-							return
-						case <-timer.C:
 						}
 					}
 				}
@@ -1733,16 +1902,34 @@ func (s *Service) startAuthMaintenance(parent context.Context) {
 					continue
 				}
 				deleted, err := s.deleteAuthMaintenanceCandidate(ctx, candidate)
+				if !webDeadCandidate {
+					lastGenericDeleteAt = time.Now()
+				}
 				if err != nil {
-					log.WithError(err).Warnf("auth maintenance delete failed for %s", candidate.Path)
-					lastDeleteAt = time.Now()
-				} else if deleted {
-					if isChatGPTWebDeadMaintenanceCandidate(candidate) {
+					outcome, explicitOutcome := coreauth.DeleteOutcomeFromError(err)
+					if deleted && explicitOutcome && outcome == coreauth.DeleteOutcomeCommitted {
+						log.WithError(err).Warnf("auth maintenance delete completed with cleanup warning for %s", candidate.Path)
+					} else if explicitOutcome && outcome == coreauth.DeleteOutcomeUncertain {
+						log.WithError(err).Errorf("auth maintenance delete outcome is uncertain for %s; leaving quarantine for persistent recovery", candidate.Path)
+						continue
+					} else if ctx.Err() != nil {
+						return
+					} else if s.requeueAuthMaintenanceCandidate(candidate) {
+						log.WithError(err).Warnf("auth maintenance delete failed for %s; retry %d scheduled", candidate.Path, candidate.Attempts+1)
+					}
+				}
+				if deleted {
+					if webDeadCandidate {
 						s.chatGPTWebDeadAuthDeletedCount.Add(1)
 					}
-					lastDeleteAt = time.Now()
+					deletesSinceCheckpoint++
+					if deletesSinceCheckpoint >= authMaintenanceCheckpointDeletes {
+						s.runAuthMaintenanceCheckpoint(ctx, "auth maintenance delete checkpoint")
+						deletesSinceCheckpoint = 0
+					}
 					continue
-				} else {
+				}
+				if err == nil {
 					continue
 				}
 			}
@@ -1771,19 +1958,26 @@ func (s *Service) startAuthMaintenance(parent context.Context) {
 						s.disableAuthMaintenanceCandidate(context.Background(), candidate, false)
 					}
 				}
-				if s.hasEnabledAuthMaintenanceCandidates(cfg.Enable, webPolicy.enabled) {
+				if s.hasReadyAuthMaintenanceCandidates(cfg.Enable, webPolicy.enabled, time.Now()) {
 					continue
 				}
 			}
-			if s.authMaintenanceDependencyReconcileRequired() {
-				if _, err := s.reconcileChatGPTWebDependencies(ctx, "auth maintenance retry"); err == nil {
-					s.setAuthMaintenanceDependencyReconcilePending(false)
-				}
+			if deletesSinceCheckpoint > 0 && !s.hasEnabledAuthMaintenanceCandidates(cfg.Enable, webPolicy.enabled) {
+				s.runAuthMaintenanceCheckpoint(ctx, "auth maintenance queue drained")
+				deletesSinceCheckpoint = 0
+			} else if s.authMaintenanceDependencyReconcileRequired() {
+				s.runAuthMaintenanceCheckpoint(ctx, "auth maintenance retry")
 			}
 
 			wait := authMaintenanceDisabledPollInterval
 			if enabled {
 				wait = time.Duration(cfg.ScanIntervalSeconds) * time.Second
+			}
+			if retryWait, hasRetry := s.nextAuthMaintenanceRetryDelay(cfg.Enable, webPolicy.enabled, time.Now()); hasRetry && retryWait < wait {
+				wait = retryWait
+			}
+			if wait < 0 {
+				wait = 0
 			}
 			timer := time.NewTimer(wait)
 			select {
@@ -1914,11 +2108,6 @@ func (s *Service) deleteAuthMaintenanceCandidate(ctx context.Context, candidate 
 		}
 		var errDelete error
 		deleted, errDelete = s.deleteAuthMaintenanceCandidateUnchecked(lockedCtx, candidate)
-		if errDelete == nil && deleted {
-			if _, errReconcile := s.reconcileChatGPTWebDependencies(lockedCtx, "chatgpt web auth maintenance delete"); errReconcile != nil {
-				s.setAuthMaintenanceDependencyReconcilePending(true)
-			}
-		}
 		return errDelete
 	})
 	return deleted, err
@@ -1955,8 +2144,8 @@ func (s *Service) chatGPTWebDeadMaintenanceCandidateStillEligible(candidate auth
 		return false
 	}
 	matched := make(map[string]struct{}, len(expectedIDs))
-	for _, auth := range s.coreManager.List() {
-		if resolveAuthFilePath(auth, authDir) != path {
+	for _, auth := range s.coreManager.AuthsForBackingPath(path) {
+		if !authMaintenancePathsEqual(resolveAuthFilePath(auth, authDir), path) {
 			continue
 		}
 		id := ""
@@ -2041,6 +2230,9 @@ func (s *Service) deleteAuthMaintenanceCandidateUnchecked(ctx context.Context, c
 		}
 		return false, fmt.Errorf("stat auth file before maintenance delete: %w", err)
 	}
+	if !info.Mode().IsRegular() {
+		return false, errors.New("auth maintenance target is not a regular file")
+	}
 	contents, err := readAuthMaintenanceFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -2055,148 +2247,101 @@ func (s *Service) deleteAuthMaintenanceCandidateUnchecked(ctx context.Context, c
 	if !unchanged {
 		return false, nil
 	}
-
-	restoreIfNeeded := func() error {
-		if _, statErr := statAuthMaintenanceFile(path); statErr == nil {
-			return nil
-		} else if !os.IsNotExist(statErr) {
-			return fmt.Errorf("stat auth file during maintenance restore: %w", statErr)
-		}
-		if s.restoreCurrentAuthMaintenanceFile(context.WithoutCancel(ctx), candidate, path) {
-			return nil
-		}
-		if errWrite := os.WriteFile(path, contents, info.Mode().Perm()); errWrite != nil {
-			return fmt.Errorf("restore auth file after canceled delete: %w", errWrite)
-		}
-		return nil
-	}
-	skipDeleteUpdate := func() (bool, error) {
-		if s.authMaintenanceCandidateCanceled(candidate) {
-			if errRestore := restoreIfNeeded(); errRestore != nil {
-				return false, errRestore
-			}
-			return true, nil
-		}
-		if _, statErr := statAuthMaintenanceFile(path); statErr == nil {
-			return true, nil
-		} else if statErr != nil && !os.IsNotExist(statErr) {
-			return false, fmt.Errorf("stat auth file after maintenance delete: %w", statErr)
-		}
+	if s.authMaintenanceCandidateCanceled(candidate) {
 		return false, nil
 	}
-
-	s.markAuthMaintenanceStagedPath(path)
-	defer s.releaseAuthMaintenanceStagedPath(path)
-
-	stagedPath, removed, err := removeAuthMaintenanceFileIfSnapshotMatches(path, contents)
-	if err != nil {
-		return false, err
+	if s.coreManager == nil || !s.coreManager.SupportsSourceConditionalDelete() {
+		return false, coreauth.NewDeleteOutcomeError(coreauth.DeleteOutcomeRolledBack, errors.New("auth maintenance requires source-conditional persistence"))
 	}
-	if !removed {
-		return false, nil
+	expectedHash := authMaintenanceExpectedSourceHash(contents)
+	generation, errGeneration := s.authMaintenanceDeleteGeneration(candidate, expectedHash)
+	if errGeneration != nil {
+		return false, errGeneration
 	}
-	cleanupStaged := func() error {
-		if strings.TrimSpace(stagedPath) == "" {
-			return nil
-		}
-		if errRemove := removeAuthMaintenanceFile(stagedPath); errRemove != nil && !os.IsNotExist(errRemove) {
-			return fmt.Errorf("remove staged auth file: %w", errRemove)
-		}
-		return nil
+	clearQuarantine := func() error {
+		return s.clearAuthMaintenanceDeleteQuarantine(candidate, generation)
 	}
-	restoreStaged := func() error {
-		if strings.TrimSpace(stagedPath) == "" {
-			return nil
-		}
-		if _, statErr := statAuthMaintenanceFile(path); statErr == nil {
-			return cleanupStaged()
-		} else if !os.IsNotExist(statErr) {
-			return fmt.Errorf("stat auth file during staged restore: %w", statErr)
-		}
-		if errRename := renameAuthMaintenanceFile(stagedPath, path); errRename != nil {
-			if os.IsNotExist(errRename) {
-				return nil
-			}
-			return fmt.Errorf("restore staged auth file: %w", errRename)
-		}
-		return nil
-	}
-
-	skip, err := skipDeleteUpdate()
-	if err != nil {
-		return false, err
-	}
-	if skip {
-		if errRestore := restoreStaged(); errRestore != nil {
-			return false, errRestore
+	if s.authMaintenanceCandidateCanceled(candidate) {
+		if errClear := clearQuarantine(); errClear != nil {
+			return false, coreauth.NewDeleteOutcomeError(coreauth.DeleteOutcomeUncertain, fmt.Errorf("clear canceled auth maintenance quarantine: %w", errClear))
 		}
 		return false, nil
-	}
-
-	if errCleanup := cleanupStaged(); errCleanup != nil {
-		return false, errCleanup
-	}
-	skip, err = skipDeleteUpdate()
-	if err != nil {
-		return false, err
-	}
-	if skip {
-		return false, nil
-	}
-
-	indexes := s.usageAuthIndexesForIDs(candidate.IDs)
-	for _, id := range candidate.IDs {
-		skip, err = skipDeleteUpdate()
-		if err != nil {
-			return false, err
-		}
-		if skip {
-			return false, nil
-		}
-		if errDelete := s.deleteCoreAuth(ctx, strings.TrimSpace(id)); errDelete != nil {
-			if errRestore := restoreIfNeeded(); errRestore != nil {
-				return false, errRestore
-			}
-			return false, errDelete
-		}
-	}
-	s.removeUsageStatisticsForAuthIndexes(indexes, "auth maintenance delete")
-	if s.reconcileUsageStatistics("auth maintenance delete") > 0 {
-		s.persistUsageStatistics("auth-maintenance-delete-reconcile")
-	}
-	return true, nil
-}
-
-func (s *Service) restoreCurrentAuthMaintenanceFile(ctx context.Context, candidate authMaintenanceCandidate, path string) bool {
-	if s == nil || s.coreManager == nil {
-		return false
-	}
-	path = strings.TrimSpace(path)
-	if path == "" {
-		return false
 	}
 	authDir := ""
 	if cfg := s.currentConfig(); cfg != nil {
 		authDir = strings.TrimSpace(cfg.AuthDir)
 	}
-	for _, id := range candidate.IDs {
-		auth, ok := s.coreManager.GetByID(strings.TrimSpace(id))
-		if !ok || auth == nil || authMaintenancePendingDelete(auth) {
-			continue
-		}
-		if resolveAuthFilePath(auth, authDir) != path {
-			continue
-		}
-		if _, err := s.coreManager.Update(ctx, auth.Clone()); err != nil {
-			log.WithError(err).Debugf("auth maintenance restore persist failed for %s", path)
-			return false
-		}
-		if _, err := statAuthMaintenanceFile(path); err == nil {
-			return true
-		}
-		return false
+	if errPersist := watcher.PersistAuthDeleteQuarantine(s.configPath, authDir, path, generation); errPersist != nil {
+		return false, fmt.Errorf("persist auth maintenance delete quarantine: %w", errPersist)
 	}
-	return false
+
+	s.markAuthMaintenanceStagedPath(path)
+	defer s.releaseAuthMaintenanceStagedPath(path)
+	if s.authMaintenanceCandidateCanceled(candidate) {
+		if errClear := clearQuarantine(); errClear != nil {
+			return false, coreauth.NewDeleteOutcomeError(coreauth.DeleteOutcomeUncertain, fmt.Errorf("clear canceled auth maintenance quarantine: %w", errClear))
+		}
+		return false, nil
+	}
+
+	deleteCtx := authfileguard.WithDeleteGeneration(ctx, generation)
+	deleteCtx = authfileguard.WithDeleteAttempt(deleteCtx, candidate.Attempts)
+	if candidate.Attempts == 0 {
+		deleteCtx = authfileguard.WithDeleteIdentityBinding(deleteCtx)
+	}
+	indexes := s.usageAuthIndexesForIDs(candidate.IDs)
+	persisted := false
+	var uncertainDeleteErr error
+	for _, id := range candidate.IDs {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			continue
+		}
+		current, exists := s.coreManager.GetByID(id)
+		if !exists || current == nil || !authMaintenancePathsEqual(resolveAuthFilePath(current, authDir), path) {
+			continue
+		}
+		if expectedInstallation := strings.TrimSpace(candidate.Installations[id]); expectedInstallation != "" && current.RuntimeInstallationID() != expectedInstallation {
+			continue
+		}
+		currentCtx := coreauth.WithSkipPersist(deleteCtx)
+		if !persisted {
+			currentCtx = deleteCtx
+		}
+		if errDelete := s.deleteCoreAuth(currentCtx, id); errDelete != nil {
+			if errors.Is(errDelete, authfileguard.ErrPersistGenerationStale) {
+				if errClear := clearQuarantine(); errClear != nil {
+					return false, coreauth.NewDeleteOutcomeError(coreauth.DeleteOutcomeUncertain, fmt.Errorf("clear stale auth maintenance quarantine: %w", errClear))
+				}
+				return false, nil
+			}
+			outcome, explicitOutcome := coreauth.DeleteOutcomeFromError(errDelete)
+			if !explicitOutcome || outcome == coreauth.DeleteOutcomeRolledBack {
+				if persisted {
+					return false, coreauth.NewDeleteOutcomeError(coreauth.DeleteOutcomeUncertain, errors.Join(uncertainDeleteErr, errDelete))
+				}
+				return false, errDelete
+			}
+			persisted = true
+			uncertainDeleteErr = errors.Join(uncertainDeleteErr, errDelete)
+			continue
+		}
+		persisted = true
+	}
+	if !persisted {
+		if errClear := clearQuarantine(); errClear != nil {
+			return false, coreauth.NewDeleteOutcomeError(coreauth.DeleteOutcomeUncertain, fmt.Errorf("clear unused auth maintenance quarantine: %w", errClear))
+		}
+		return false, nil
+	}
+	s.removeUsageStatisticsForAuthIndexes(indexes, "auth maintenance delete")
+	if uncertainDeleteErr != nil {
+		return false, coreauth.NewDeleteOutcomeError(coreauth.DeleteOutcomeUncertain, uncertainDeleteErr)
+	}
+	if errClear := clearQuarantine(); errClear != nil {
+		return true, coreauth.NewDeleteOutcomeError(coreauth.DeleteOutcomeCommitted, fmt.Errorf("clear completed auth maintenance quarantine: %w", errClear))
+	}
+	return true, nil
 }
 
 func authMaintenanceFileMatchesSnapshot(path string, contents []byte) (bool, error) {
@@ -2213,43 +2358,86 @@ func authMaintenanceFileMatchesSnapshot(path string, contents []byte) (bool, err
 	return bytes.Equal(current, contents), nil
 }
 
-func stageAuthMaintenanceFileIfSnapshotMatches(path string, contents []byte) (string, bool, error) {
-	unchanged, err := authMaintenanceFileMatchesSnapshot(path, contents)
-	if err != nil {
-		return "", false, err
+func legacyAuthMaintenanceOriginalPath(path string) (string, bool) {
+	const marker = ".auth-maintenance."
+	index := strings.LastIndex(path, marker)
+	if index <= 0 || index+len(marker) >= len(path) {
+		return "", false
 	}
-	if !unchanged {
-		return "", false, nil
-	}
-	stagedPath := fmt.Sprintf("%s.auth-maintenance.%d", path, time.Now().UnixNano())
-	if err := renameAuthMaintenanceFile(path, stagedPath); err != nil {
-		if os.IsNotExist(err) {
-			return "", false, nil
+	for _, character := range path[index+len(marker):] {
+		if character < '0' || character > '9' {
+			return "", false
 		}
-		return "", false, fmt.Errorf("stage auth file: %w", err)
 	}
-	stagedContents, err := readAuthMaintenanceFile(stagedPath)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return "", false, nil
+	return path[:index], true
+}
+
+func validLegacyAuthMaintenanceFile(contents []byte) bool {
+	var object map[string]any
+	return json.Unmarshal(contents, &object) == nil && object != nil
+}
+
+func migrateLegacyAuthMaintenanceFiles(authDir string) error {
+	authDir = strings.TrimSpace(authDir)
+	if authDir == "" {
+		return nil
+	}
+	var migrationErrors []error
+	errWalk := filepath.WalkDir(authDir, func(path string, entry fs.DirEntry, errWalkEntry error) error {
+		if errWalkEntry != nil {
+			migrationErrors = append(migrationErrors, fmt.Errorf("inspect legacy auth maintenance path %s: %w", path, errWalkEntry))
+			return nil
 		}
-		return "", false, fmt.Errorf("read staged auth file: %w", err)
-	}
-	if !bytes.Equal(stagedContents, contents) {
-		if _, statErr := statAuthMaintenanceFile(path); statErr == nil {
-			if errRemove := removeAuthMaintenanceFile(stagedPath); errRemove != nil && !os.IsNotExist(errRemove) {
-				return "", false, fmt.Errorf("cleanup staged auth file after mismatch: %w", errRemove)
+		if entry.IsDir() {
+			if entry.Name() == ".cliproxy-delete-quarantine" {
+				return filepath.SkipDir
 			}
-		} else if os.IsNotExist(statErr) {
-			if errRename := renameAuthMaintenanceFile(stagedPath, path); errRename != nil && !os.IsNotExist(errRename) {
-				return "", false, fmt.Errorf("restore staged auth file after mismatch: %w", errRename)
-			}
-		} else {
-			return "", false, fmt.Errorf("stat auth file after staged mismatch: %w", statErr)
+			return nil
 		}
-		return "", false, nil
+		if entry.Type()&os.ModeSymlink != 0 {
+			return nil
+		}
+		originalPath, legacy := legacyAuthMaintenanceOriginalPath(path)
+		if !legacy {
+			return nil
+		}
+		stagedContents, errRead := readAuthMaintenanceFile(path)
+		if errRead != nil {
+			migrationErrors = append(migrationErrors, fmt.Errorf("read legacy auth maintenance file %s: %w", path, errRead))
+			authfileguard.MarkQuarantined(path)
+			return nil
+		}
+		if !validLegacyAuthMaintenanceFile(stagedContents) {
+			migrationErrors = append(migrationErrors, fmt.Errorf("legacy auth maintenance file %s is not a valid JSON credential", path))
+			authfileguard.MarkQuarantined(path)
+			return nil
+		}
+		originalContents, errOriginal := readAuthMaintenanceFile(originalPath)
+		switch {
+		case os.IsNotExist(errOriginal):
+			if errRename := renameAuthMaintenanceFile(path, originalPath); errRename != nil {
+				migrationErrors = append(migrationErrors, fmt.Errorf("restore legacy auth maintenance file %s: %w", path, errRename))
+				authfileguard.MarkQuarantined(path)
+			}
+		case errOriginal != nil:
+			migrationErrors = append(migrationErrors, fmt.Errorf("read legacy auth maintenance target %s: %w", originalPath, errOriginal))
+			authfileguard.MarkQuarantined(path)
+			authfileguard.MarkQuarantined(originalPath)
+		case bytes.Equal(originalContents, stagedContents):
+			if errRemove := removeAuthMaintenanceFile(path); errRemove != nil && !os.IsNotExist(errRemove) {
+				migrationErrors = append(migrationErrors, fmt.Errorf("remove duplicate legacy auth maintenance file %s: %w", path, errRemove))
+			}
+		default:
+			authfileguard.MarkQuarantined(path)
+			authfileguard.MarkQuarantined(originalPath)
+			migrationErrors = append(migrationErrors, fmt.Errorf("legacy auth maintenance file %s conflicts with %s", path, originalPath))
+		}
+		return nil
+	})
+	if errWalk != nil {
+		migrationErrors = append(migrationErrors, fmt.Errorf("scan legacy auth maintenance files: %w", errWalk))
 	}
-	return stagedPath, true, nil
+	return errors.Join(migrationErrors...)
 }
 
 func (s *Service) ensureAuthUpdateQueue(ctx context.Context) {
@@ -2726,15 +2914,20 @@ func (s *Service) deleteCoreAuth(ctx context.Context, id string) error {
 	if current, ok := s.coreManager.GetByID(id); ok && current != nil {
 		removedRuntimeInstanceID = current.RuntimeInstanceID()
 	}
-	if err := s.coreManager.Delete(ctx, id); err != nil {
-		log.Errorf("failed to delete auth %s: %v", id, err)
-		return err
+	errDelete := s.coreManager.Delete(ctx, id)
+	_, stillInstalled := s.coreManager.GetByID(id)
+	if errDelete != nil && stillInstalled {
+		log.Errorf("failed to delete auth %s: %v", id, errDelete)
+		return errDelete
 	}
 	s.cancelModelSyncTaskIfEpoch(id, modelSyncEpoch)
 	executorhelps.CloseProxyTransportCachesForAuth(id)
 	s.antigravityModelCapabilities.Delete(id)
 	s.cleanupChatGPTWebModelResourcesAfterDelete(ctx, id, removedRuntimeInstanceID)
-	return nil
+	if errDelete != nil {
+		log.WithError(errDelete).Warnf("auth %s was quarantined after an uncertain persistent deletion", id)
+	}
+	return errDelete
 }
 
 func (s *Service) applyCoreAuthRemovalWithReason(ctx context.Context, id string, reason string, pendingDelete bool) bool {
@@ -3741,6 +3934,9 @@ func (s *Service) Run(ctx context.Context) error {
 
 	if err := s.ensureAuthDir(); err != nil {
 		return err
+	}
+	if errMigration := migrateLegacyAuthMaintenanceFiles(s.cfg.AuthDir); errMigration != nil {
+		log.WithError(errMigration).Warn("legacy auth maintenance files require attention after migration")
 	}
 
 	s.applyRetryConfig(s.cfg)

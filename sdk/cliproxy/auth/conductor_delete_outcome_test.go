@@ -7,11 +7,19 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/authfileguard"
 )
 
 type deleteOutcomeStore struct {
 	deleteErr   error
 	deleteCount atomic.Int32
+}
+
+type conditionalGenerationDeleteStore struct {
+	deleteOutcomeStore
+	conditionalCount atomic.Int32
+	expectedHash     atomic.Value
 }
 
 type lifecycleRoundTripperProvider struct {
@@ -162,6 +170,50 @@ func (*deleteOutcomeStore) Save(context.Context, *Auth) (string, error) { return
 func (s *deleteOutcomeStore) Delete(context.Context, string) error {
 	s.deleteCount.Add(1)
 	return s.deleteErr
+}
+
+func (s *conditionalGenerationDeleteStore) DeleteIfSourceHashMatches(_ context.Context, _ string, expectedHash string) error {
+	s.conditionalCount.Add(1)
+	s.expectedHash.Store(expectedHash)
+	return s.deleteErr
+}
+
+func TestManagerDeleteUsesGenerationSourcePrecondition(t *testing.T) {
+	store := &conditionalGenerationDeleteStore{}
+	manager := NewManager(store, nil, nil)
+	const authID = "generation-delete-auth"
+	if _, errRegister := manager.Register(t.Context(), &Auth{ID: authID, Provider: "codex"}); errRegister != nil {
+		t.Fatal(errRegister)
+	}
+	generation := authfileguard.NewDeleteGeneration("expected-source-hash")
+	if errDelete := manager.Delete(authfileguard.WithDeleteGeneration(t.Context(), generation), authID); errDelete != nil {
+		t.Fatal(errDelete)
+	}
+	if got := store.conditionalCount.Load(); got != 1 {
+		t.Fatalf("conditional delete calls = %d, want 1", got)
+	}
+	if got := store.deleteCount.Load(); got != 0 {
+		t.Fatalf("ordinary delete calls = %d, want 0", got)
+	}
+	if got, _ := store.expectedHash.Load().(string); got != generation.ExpectedHash() {
+		t.Fatalf("expected source hash = %q, want %q", got, generation.ExpectedHash())
+	}
+}
+
+func TestManagerDeleteRejectsGenerationWithoutConditionalStore(t *testing.T) {
+	store := &deleteOutcomeStore{}
+	manager := NewManager(store, nil, nil)
+	const authID = "unsupported-generation-delete-auth"
+	if _, errRegister := manager.Register(t.Context(), &Auth{ID: authID, Provider: "codex"}); errRegister != nil {
+		t.Fatal(errRegister)
+	}
+	errDelete := manager.Delete(authfileguard.WithExpectedDeleteHash(t.Context(), "expected-source-hash"), authID)
+	if outcome, explicit := DeleteOutcomeFromError(errDelete); !explicit || outcome != DeleteOutcomeRolledBack {
+		t.Fatalf("Delete() error = %v, outcome = %v, explicit = %v", errDelete, outcome, explicit)
+	}
+	if _, exists := manager.GetByID(authID); !exists {
+		t.Fatal("unsupported conditional delete removed runtime auth")
+	}
 }
 
 func TestDeleteHandlesStoreDeleteOutcomes(t *testing.T) {

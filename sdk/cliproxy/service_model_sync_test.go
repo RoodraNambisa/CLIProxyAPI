@@ -128,6 +128,10 @@ func (s *serviceFailingDeleteStore) Delete(context.Context, string) error {
 	return errors.New("delete failed")
 }
 
+func (s *serviceFailingDeleteStore) DeleteIfSourceHashMatches(ctx context.Context, id, _ string) error {
+	return s.Delete(ctx, id)
+}
+
 func (s *serviceCountingDeleteStore) List(context.Context) ([]*coreauth.Auth, error) { return nil, nil }
 
 func (s *serviceCountingDeleteStore) Save(_ context.Context, auth *coreauth.Auth) (string, error) {
@@ -140,6 +144,10 @@ func (s *serviceCountingDeleteStore) Save(_ context.Context, auth *coreauth.Auth
 func (s *serviceCountingDeleteStore) Delete(context.Context, string) error {
 	s.deleteCount.Add(1)
 	return nil
+}
+
+func (s *serviceCountingDeleteStore) DeleteIfSourceHashMatches(ctx context.Context, id, _ string) error {
+	return s.Delete(ctx, id)
 }
 
 func (s *serviceToggleSaveStore) List(context.Context) ([]*coreauth.Auth, error) { return nil, nil }
@@ -156,6 +164,10 @@ func (s *serviceToggleSaveStore) Save(_ context.Context, auth *coreauth.Auth) (s
 }
 
 func (s *serviceToggleSaveStore) Delete(context.Context, string) error { return nil }
+
+func (s *serviceToggleSaveStore) DeleteIfSourceHashMatches(ctx context.Context, id, _ string) error {
+	return s.Delete(ctx, id)
+}
 
 func (s *serviceDeleteSideEffectStore) List(context.Context) ([]*coreauth.Auth, error) {
 	return nil, nil
@@ -174,6 +186,10 @@ func (s *serviceDeleteSideEffectStore) Delete(_ context.Context, id string) erro
 		s.onDelete(id)
 	}
 	return nil
+}
+
+func (s *serviceDeleteSideEffectStore) DeleteIfSourceHashMatches(ctx context.Context, id, _ string) error {
+	return s.Delete(ctx, id)
 }
 
 func (s *serviceRecordingStore) List(context.Context) ([]*coreauth.Auth, error) {
@@ -204,6 +220,10 @@ func (s *serviceRecordingStore) Delete(context.Context, string) error {
 	s.saved = nil
 	s.mu.Unlock()
 	return nil
+}
+
+func (s *serviceRecordingStore) DeleteIfSourceHashMatches(ctx context.Context, id, _ string) error {
+	return s.Delete(ctx, id)
 }
 
 func (s *serviceRecordingStore) snapshot() *coreauth.Auth {
@@ -2783,7 +2803,7 @@ func TestServiceDeleteAuthMaintenanceCandidate_DeleteFailureRestoresFile(t *test
 	}
 }
 
-func TestServiceDeleteAuthMaintenanceCandidate_RechecksBetweenAuthDeletes(t *testing.T) {
+func TestServiceDeleteAuthMaintenanceCandidate_PersistsSharedFileOnce(t *testing.T) {
 	authDir := t.TempDir()
 	path := filepath.Join(authDir, "service-maintenance-recheck-between-deletes.json")
 	raw := []byte(`{"type":"claude","email":"persist@example.com"}`)
@@ -2792,13 +2812,11 @@ func TestServiceDeleteAuthMaintenanceCandidate_RechecksBetweenAuthDeletes(t *tes
 	}
 
 	var recreated atomic.Bool
-	firstDeletedID := ""
 	store := &serviceDeleteSideEffectStore{
 		onDelete: func(id string) {
 			if recreated.Swap(true) {
 				return
 			}
-			firstDeletedID = id
 			if err := os.WriteFile(path, raw, 0o600); err != nil {
 				t.Errorf("recreate auth file: %v", err)
 			}
@@ -2845,31 +2863,17 @@ func TestServiceDeleteAuthMaintenanceCandidate_RechecksBetweenAuthDeletes(t *tes
 	if err != nil {
 		t.Fatalf("deleteAuthMaintenanceCandidate returned error: %v", err)
 	}
-	if deleted {
-		t.Fatal("expected recreated auth file to stop stale maintenance delete")
+	if !deleted {
+		t.Fatal("expected shared-path maintenance delete to complete")
 	}
 	if got := store.deleteCount.Load(); got != 1 {
 		t.Fatalf("delete count = %d, want 1", got)
 	}
-	if firstDeletedID == "" {
-		t.Fatal("expected one auth delete before file recreation")
+	if _, ok := service.coreManager.GetByID(authA.ID); ok {
+		t.Fatal("expected first shared runtime auth to be removed")
 	}
-	if firstDeletedID == authA.ID {
-		if _, ok := service.coreManager.GetByID(authA.ID); ok {
-			t.Fatal("expected first deleted auth to be removed before file recreation")
-		}
-		if _, ok := service.coreManager.GetByID(authB.ID); !ok {
-			t.Fatal("expected remaining auth to stay after file recreation")
-		}
-	} else if firstDeletedID == authB.ID {
-		if _, ok := service.coreManager.GetByID(authB.ID); ok {
-			t.Fatal("expected first deleted auth to be removed before file recreation")
-		}
-		if _, ok := service.coreManager.GetByID(authA.ID); !ok {
-			t.Fatal("expected remaining auth to stay after file recreation")
-		}
-	} else {
-		t.Fatalf("unexpected deleted auth id %q", firstDeletedID)
+	if _, ok := service.coreManager.GetByID(authB.ID); ok {
+		t.Fatal("expected second shared runtime auth to be removed without another store delete")
 	}
 	if _, err := os.Stat(path); err != nil {
 		t.Fatalf("expected recreated auth file to remain, stat err=%v", err)
@@ -3166,22 +3170,18 @@ func TestServiceDeleteAuthMaintenanceCandidate_CancelAfterStartRestoresFile(t *t
 	if !ok {
 		t.Fatal("expected auth maintenance candidate")
 	}
-
-	originalRemove := removeAuthMaintenanceFile
-	t.Cleanup(func() {
-		removeAuthMaintenanceFile = originalRemove
-	})
-
+	originalRead := readAuthMaintenanceFile
+	t.Cleanup(func() { readAuthMaintenanceFile = originalRead })
 	started := make(chan struct{})
-	releaseRemove := make(chan struct{})
+	releaseRead := make(chan struct{})
 	var blocked atomic.Bool
-	removeAuthMaintenanceFile = func(targetPath string) error {
-		err := originalRemove(targetPath)
-		if err == nil && blocked.CompareAndSwap(false, true) {
+	var reads atomic.Int32
+	readAuthMaintenanceFile = func(targetPath string) ([]byte, error) {
+		if targetPath == path && reads.Add(1) == 2 && blocked.CompareAndSwap(false, true) {
 			close(started)
-			<-releaseRemove
+			<-releaseRead
 		}
-		return err
+		return originalRead(targetPath)
 	}
 
 	type deleteResult struct {
@@ -3199,7 +3199,7 @@ func TestServiceDeleteAuthMaintenanceCandidate_CancelAfterStartRestoresFile(t *t
 	if !service.authMaintenanceCandidateCanceled(candidate) {
 		t.Fatal("expected cancel to advance maintenance generation after delete started")
 	}
-	close(releaseRemove)
+	close(releaseRead)
 
 	result := <-done
 	if result.err != nil {
@@ -3253,21 +3253,18 @@ func TestServiceDeleteAuthMaintenanceCandidate_CancelAfterStartRestoresCurrentRu
 		t.Fatal("expected auth maintenance candidate")
 	}
 
-	originalRemove := removeAuthMaintenanceFile
-	t.Cleanup(func() {
-		removeAuthMaintenanceFile = originalRemove
-	})
-
+	originalRead := readAuthMaintenanceFile
+	t.Cleanup(func() { readAuthMaintenanceFile = originalRead })
 	started := make(chan struct{})
-	releaseRemove := make(chan struct{})
+	releaseRead := make(chan struct{})
 	var blocked atomic.Bool
-	removeAuthMaintenanceFile = func(targetPath string) error {
-		err := originalRemove(targetPath)
-		if err == nil && blocked.CompareAndSwap(false, true) {
+	var reads atomic.Int32
+	readAuthMaintenanceFile = func(targetPath string) ([]byte, error) {
+		if targetPath == path && reads.Add(1) == 2 && blocked.CompareAndSwap(false, true) {
 			close(started)
-			<-releaseRemove
+			<-releaseRead
 		}
-		return err
+		return originalRead(targetPath)
 	}
 
 	type deleteResult struct {
@@ -3287,8 +3284,11 @@ func TestServiceDeleteAuthMaintenanceCandidate_CancelAfterStartRestoresCurrentRu
 	if _, errUpdate := service.coreManager.Update(coreauth.WithSkipPersist(context.Background()), repaired); errUpdate != nil {
 		t.Fatalf("update runtime auth: %v", errUpdate)
 	}
+	if errWrite := os.WriteFile(path, repairedContents, 0o644); errWrite != nil {
+		t.Fatalf("write repaired auth file: %v", errWrite)
+	}
 	service.cancelAuthMaintenanceCandidate(candidate)
-	close(releaseRemove)
+	close(releaseRead)
 
 	result := <-done
 	if result.err != nil {
@@ -3344,22 +3344,17 @@ func TestServiceDeleteAuthMaintenanceCandidate_RepairBeforeDeleteKeepsNewContent
 	}
 
 	originalRead := readAuthMaintenanceFile
-	originalRemoveIfMatches := removeAuthMaintenanceFileIfSnapshotMatches
-	t.Cleanup(func() {
-		readAuthMaintenanceFile = originalRead
-		removeAuthMaintenanceFileIfSnapshotMatches = originalRemoveIfMatches
-	})
+	t.Cleanup(func() { readAuthMaintenanceFile = originalRead })
 
 	var reads atomic.Int32
 	readAuthMaintenanceFile = func(targetPath string) ([]byte, error) {
-		if targetPath == path && reads.Add(1) == 3 {
+		if targetPath == path && reads.Add(1) == 2 {
 			if err := os.WriteFile(path, repairedContents, 0o644); err != nil {
 				return nil, err
 			}
 		}
 		return originalRead(targetPath)
 	}
-	removeAuthMaintenanceFileIfSnapshotMatches = originalRemoveIfMatches
 
 	deleted, err := service.deleteAuthMaintenanceCandidate(context.Background(), candidate)
 	if err != nil {
