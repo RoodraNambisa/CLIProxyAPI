@@ -200,6 +200,49 @@ func TestChatGPTWebImportWorkerLimitHotUpdateUnblocksWaitingEntry(t *testing.T) 
 	}
 }
 
+func TestCanceledChatGPTWebImportWaiterDoesNotLeakTicket(t *testing.T) {
+	tasks := newChatGPTWebMutationTaskManager()
+	tasks.updateWorkerLimit(1)
+	t.Cleanup(func() { shutdownChatGPTWebMutationTasks(t, tasks) })
+	if !tasks.acquireImportSlot(t.Context()) {
+		t.Fatal("failed to acquire the blocking import worker")
+	}
+	defer tasks.releaseImportSlot()
+
+	waiterCtx, cancelWaiter := context.WithCancel(t.Context())
+	done := make(chan bool, 1)
+	go func() { done <- tasks.acquireImportSlot(waiterCtx) }()
+	deadline := time.Now().Add(time.Second)
+	for {
+		tasks.slotMu.Lock()
+		queued := tasks.nextTicket >= 2
+		tasks.slotMu.Unlock()
+		if queued {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("import waiter did not enter the ticket queue")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	cancelWaiter()
+	select {
+	case acquired := <-done:
+		if acquired {
+			t.Fatal("canceled import waiter acquired a worker")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("canceled import waiter did not leave the ticket queue")
+	}
+	tasks.slotMu.Lock()
+	deferredTickets := len(tasks.canceledTickets)
+	servingTicket := tasks.servingTicket
+	tasks.slotMu.Unlock()
+	if deferredTickets != 0 || servingTicket != 2 {
+		t.Fatalf("canceled ticket state leaked: deferred=%d serving=%d", deferredTickets, servingTicket)
+	}
+}
+
 func TestHandlerSetConfigHotUpdatesChatGPTWebImportWorkers(t *testing.T) {
 	handler := NewHandler(&config.Config{}, "", nil)
 	t.Cleanup(func() {

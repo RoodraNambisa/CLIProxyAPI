@@ -329,7 +329,9 @@ func (m *chatGPTWebMutationTaskManager) acquireImportSlot(ctx context.Context) b
 	for {
 		m.advanceCanceledTicketsLocked()
 		if ctx.Err() != nil {
-			m.canceledTickets[ticket] = struct{}{}
+			if ticket >= m.servingTicket {
+				m.canceledTickets[ticket] = struct{}{}
+			}
 			m.advanceCanceledTicketsLocked()
 			m.slotCond.Broadcast()
 			m.slotMu.Unlock()
