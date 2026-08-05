@@ -333,13 +333,15 @@ func TestChatGPTWebAccountInfoPeriodicScheduleLifecycle(t *testing.T) {
 		t.Fatalf("changed periodic due = %s, want %s", changedDue, want)
 	}
 	runtime.mu.Lock()
-	runtime.schedulePeriodicTargetsLocked([]chatgptwebauth.AccountInfoRefreshTarget{{
+	runtime.busy = runtime.accountInfoCapacityLocked()
+	runtime.enqueuePeriodicTargetsLocked([]chatgptwebauth.AccountInfoRefreshTarget{{
 		AuthID: "pending-periodic", AuthInstanceID: "pending-instance",
-	}}, time.Now().Add(24*time.Hour))
-	if count := accountInfoPeriodicScheduleCountLocked(runtime); count != 1 {
+	}})
+	if count := len(runtime.periodicPendingByTarget); count != 1 {
 		runtime.mu.Unlock()
-		t.Fatalf("periodic schedules before disable = %d, want 1", count)
+		t.Fatalf("periodic pending before disable = %d, want 1", count)
 	}
+	runtime.busy = 0
 	runtime.mu.Unlock()
 
 	period = 0
@@ -348,7 +350,7 @@ func TestChatGPTWebAccountInfoPeriodicScheduleLifecycle(t *testing.T) {
 	}})
 	runtime.mu.Lock()
 	disabledDue := runtime.periodicNextAt
-	pending := accountInfoPeriodicScheduleCountLocked(runtime)
+	pending := len(runtime.periodicPendingByTarget)
 	runtime.mu.Unlock()
 	if !disabledDue.IsZero() || pending != 0 {
 		t.Fatalf("disabled periodic state = due %s pending %d", disabledDue, pending)
@@ -456,7 +458,7 @@ func TestChatGPTWebAccountInfoPeriodicRefreshUpgradesUploadWork(t *testing.T) {
 
 	runtime.mu.Lock()
 	runtime.started = true
-	runtime.schedulePeriodicTargetsLocked([]chatgptwebauth.AccountInfoRefreshTarget{{AuthID: "shared"}}, time.Now().Add(time.Hour))
+	runtime.enqueuePeriodicTargetsLocked([]chatgptwebauth.AccountInfoRefreshTarget{{AuthID: "shared"}})
 	work := runtime.queuedWorkForTargetLocked("shared")
 	scheduled := len(runtime.scheduledByTarget["shared"])
 	runtime.started = false
@@ -519,7 +521,7 @@ func TestChatGPTWebAccountInfoDetailedTriggerReportsQueueReuse(t *testing.T) {
 	}
 }
 
-func TestChatGPTWebAccountInfoPeriodicSchedulesBeyondQueueCapacity(t *testing.T) {
+func TestChatGPTWebAccountInfoPeriodicPendingUsesSingleFIFOAtScale(t *testing.T) {
 	runtime := newChatGPTWebAccountInfoRuntime(nil, nil)
 	runtime.started = true
 	runtime.cfg = config.ResolvedChatGPTWebAccountInfoConfig{
@@ -527,7 +529,7 @@ func TestChatGPTWebAccountInfoPeriodicSchedulesBeyondQueueCapacity(t *testing.T)
 		RefreshQueueSize:       2,
 		PeriodicRefreshMinutes: 1,
 	}
-	targets := make([]chatgptwebauth.AccountInfoRefreshTarget, 300)
+	targets := make([]chatgptwebauth.AccountInfoRefreshTarget, 10_000)
 	for index := range targets {
 		targets[index] = chatgptwebauth.AccountInfoRefreshTarget{
 			AuthID:         fmt.Sprintf("periodic-%03d", index),
@@ -536,21 +538,71 @@ func TestChatGPTWebAccountInfoPeriodicSchedulesBeyondQueueCapacity(t *testing.T)
 	}
 
 	runtime.mu.Lock()
-	runtime.schedulePeriodicTargetsLocked(targets, time.Now())
-	if got := accountInfoPeriodicScheduleCountLocked(runtime); got != len(targets) {
+	runtime.enqueuePeriodicTargetsLocked(targets)
+	queued := runtime.queueLengthLocked()
+	pending := len(runtime.periodicPendingByTarget)
+	if got := queued + pending; got != len(targets) {
 		runtime.mu.Unlock()
-		t.Fatalf("periodic schedules = %d, want %d", got, len(targets))
+		t.Fatalf("periodic work = %d, want %d", got, len(targets))
 	}
-	for key, entry := range runtime.scheduled {
-		if !strings.HasPrefix(key, chatGPTWebAccountInfoPeriodicSchedulePrefix) {
-			continue
-		}
-		if entry.work.force || !entry.work.automatic {
+	if queued != runtime.accountInfoCapacityLocked() || pending != len(targets)-queued {
+		runtime.mu.Unlock()
+		t.Fatalf("periodic queue/pending = %d/%d", queued, pending)
+	}
+	if count := accountInfoPeriodicScheduleCountLocked(runtime); count != 0 {
+		runtime.mu.Unlock()
+		t.Fatalf("periodic heap schedules = %d, want 0", count)
+	}
+	for _, work := range runtime.queuedWorkLocked() {
+		if work.force || !work.automatic {
 			runtime.mu.Unlock()
-			t.Fatalf("periodic work flags = force %v automatic %v", entry.work.force, entry.work.automatic)
+			t.Fatalf("periodic work flags = force %v automatic %v", work.force, work.automatic)
 		}
 	}
 	runtime.mu.Unlock()
+}
+
+func TestChatGPTWebAccountInfoPeriodicPendingDrainsAndAcceptsPriorityUpgrade(t *testing.T) {
+	runtime := newChatGPTWebAccountInfoRuntime(nil, nil)
+	runtime.started = true
+	runtime.cfg = config.ResolvedChatGPTWebAccountInfoConfig{
+		RefreshWorkers:         1,
+		RefreshQueueSize:       0,
+		PeriodicRefreshMinutes: 1,
+	}
+	first := chatgptwebauth.AccountInfoRefreshTarget{AuthID: "periodic-first", AuthInstanceID: "one"}
+	second := chatgptwebauth.AccountInfoRefreshTarget{AuthID: "periodic-second", AuthInstanceID: "two"}
+
+	runtime.mu.Lock()
+	runtime.busy = runtime.accountInfoCapacityLocked()
+	runtime.enqueuePeriodicTargetsLocked([]chatgptwebauth.AccountInfoRefreshTarget{first, second})
+	if len(runtime.periodicPendingByTarget) != 2 {
+		runtime.mu.Unlock()
+		t.Fatalf("periodic pending = %d, want 2", len(runtime.periodicPendingByTarget))
+	}
+	runtime.busy = 0
+	if !runtime.triggerTargetLocked(first, chatGPTWebAccountInfoTriggerForce) {
+		runtime.mu.Unlock()
+		t.Fatal("priority trigger did not reuse periodic pending")
+	}
+	if len(runtime.periodicPendingByTarget) != 1 || runtime.queueLengthLocked() != 1 {
+		runtime.mu.Unlock()
+		t.Fatalf("after priority trigger pending/queued = %d/%d", len(runtime.periodicPendingByTarget), runtime.queueLengthLocked())
+	}
+	firstWork := runtime.queuedWorkForTargetLocked(chatGPTWebAccountInfoTargetKey(first))
+	if firstWork == nil || !firstWork.force {
+		runtime.mu.Unlock()
+		t.Fatalf("priority work = %+v", firstWork)
+	}
+	runtime.cfg.RefreshQueueSize = 1
+	runtime.drainPeriodicPendingLocked()
+	secondWork := runtime.queuedWorkForTargetLocked(chatGPTWebAccountInfoTargetKey(second))
+	pending := len(runtime.periodicPendingByTarget)
+	queued := runtime.queueLengthLocked()
+	runtime.mu.Unlock()
+	if secondWork == nil || secondWork.force || pending != 0 || queued != 2 {
+		t.Fatalf("drained periodic work = %+v pending=%d queued=%d", secondWork, pending, queued)
+	}
 }
 
 func TestChatGPTWebAccountInfoPeriodicScanDoesNotDuplicateExistingWork(t *testing.T) {
@@ -578,23 +630,28 @@ func TestChatGPTWebAccountInfoPeriodicScanDoesNotDuplicateExistingWork(t *testin
 		t.Fatal("queue existing work")
 	}
 	dueBefore := runtime.scheduled["retry:"+chatGPTWebAccountInfoTargetKey(scheduled)].due
-	runtime.schedulePeriodicTargetsLocked([]chatgptwebauth.AccountInfoRefreshTarget{
+	runtime.enqueuePeriodicTargetsLocked([]chatgptwebauth.AccountInfoRefreshTarget{
 		inflight, scheduled, queued, newTarget,
-	}, now)
-	periodicPending := accountInfoPeriodicScheduleCountLocked(runtime)
+	})
+	periodicPending := len(runtime.periodicPendingByTarget)
 	queuedWork := append([]chatGPTWebAccountInfoWork(nil), runtime.queuedWorkLocked()...)
 	dueAfter := runtime.scheduled["retry:"+chatGPTWebAccountInfoTargetKey(scheduled)].due
-	periodic := runtime.scheduled[chatGPTWebAccountInfoPeriodicSchedulePrefix+chatGPTWebAccountInfoTargetKey(newTarget)]
 	runtime.mu.Unlock()
 
-	if periodicPending != 1 || !dueAfter.Equal(dueBefore) {
-		t.Fatalf("periodic overlap = scheduled %d due %s, want 1/%s", periodicPending, dueAfter, dueBefore)
+	if periodicPending != 0 || !dueAfter.Equal(dueBefore) {
+		t.Fatalf("periodic overlap = pending %d due %s, want 0/%s", periodicPending, dueAfter, dueBefore)
 	}
-	if periodic == nil || chatGPTWebAccountInfoTargetKey(periodic.work.target) != chatGPTWebAccountInfoTargetKey(newTarget) {
-		t.Fatalf("new periodic schedule = %+v", periodic)
+	queuedKeys := make(map[string]struct{}, len(queuedWork))
+	for _, work := range queuedWork {
+		queuedKeys[chatGPTWebAccountInfoTargetKey(work.target)] = struct{}{}
 	}
-	if len(queuedWork) != 1 || chatGPTWebAccountInfoTargetKey(queuedWork[0].target) != chatGPTWebAccountInfoTargetKey(queued) {
+	if len(queuedWork) != 2 {
 		t.Fatalf("queued periodic work = %+v", queuedWork)
+	}
+	for _, target := range []chatgptwebauth.AccountInfoRefreshTarget{queued, newTarget} {
+		if _, exists := queuedKeys[chatGPTWebAccountInfoTargetKey(target)]; !exists {
+			t.Fatalf("queued periodic work missing %q: %+v", target.AuthID, queuedWork)
+		}
 	}
 }
 
@@ -608,15 +665,16 @@ func TestChatGPTWebAccountInfoPeriodicPendingDropsRetiredInstance(t *testing.T) 
 	}
 	target := chatgptwebauth.AccountInfoRefreshTarget{AuthID: "retired", AuthInstanceID: "old"}
 	runtime.mu.Lock()
-	runtime.schedulePeriodicTargetsLocked([]chatgptwebauth.AccountInfoRefreshTarget{target}, time.Now())
-	if accountInfoPeriodicScheduleCountLocked(runtime) != 1 {
+	runtime.busy = runtime.accountInfoCapacityLocked()
+	runtime.enqueuePeriodicTargetsLocked([]chatgptwebauth.AccountInfoRefreshTarget{target})
+	if len(runtime.periodicPendingByTarget) != 1 {
 		runtime.mu.Unlock()
-		t.Fatal("retired target was not scheduled")
+		t.Fatal("retired target was not retained in periodic pending")
 	}
 	runtime.mu.Unlock()
 	runtime.removeAuthInstance(target.AuthID, target.AuthInstanceID)
 	runtime.mu.Lock()
-	pending := accountInfoPeriodicScheduleCountLocked(runtime)
+	pending := len(runtime.periodicPendingByTarget)
 	runtime.mu.Unlock()
 	if pending != 0 {
 		t.Fatalf("retired periodic pending = %d", pending)

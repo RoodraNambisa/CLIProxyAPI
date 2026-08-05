@@ -291,6 +291,9 @@ type chatGPTWebAccountInfoRuntime struct {
 	pendingTriggerQueue        []string
 	pendingTriggerQueueHead    int
 	pendingTriggerQueued       map[string]struct{}
+	periodicPendingQueue       []chatgptwebauth.AccountInfoRefreshTarget
+	periodicPendingQueueHead   int
+	periodicPendingByTarget    map[string]chatgptwebauth.AccountInfoRefreshTarget
 	ambiguousImageRecheckAfter map[string]time.Time
 	periodicNextAt             time.Time
 	periodicGeneration         uint64
@@ -348,6 +351,7 @@ func newChatGPTWebAccountInfoRuntime(executor *ChatGPTWebExecutor, cfg *config.C
 		inflightRecovery:           make(map[string]time.Time),
 		pendingTriggers:            make(map[string]chatGPTWebAccountInfoTriggerMode),
 		pendingTriggerQueued:       make(map[string]struct{}),
+		periodicPendingByTarget:    make(map[string]chatgptwebauth.AccountInfoRefreshTarget),
 		ambiguousImageRecheckAfter: make(map[string]time.Time),
 		authInstances:              make(map[string]string),
 		runtimeKeysByAuth:          make(map[string]map[string]struct{}),
@@ -982,6 +986,7 @@ func (runtime *chatGPTWebAccountInfoRuntime) updateConfig(cfg *config.Config) {
 		}
 		runtime.resizeWorkersLocked(resolved.RefreshWorkers)
 		runtime.drainPendingTriggersLocked()
+		runtime.drainPeriodicPendingLocked()
 		runtime.cond.Broadcast()
 	}
 	started := runtime.started
@@ -1090,6 +1095,7 @@ func (runtime *chatGPTWebAccountInfoRuntime) disableAutomaticRefreshLocked() {
 		runtime.releaseWorkEpochLocked(entry.work)
 	}
 	runtime.clearPendingTriggersLocked()
+	runtime.clearPeriodicPendingLocked()
 	clear(runtime.ambiguousImageRecheckAfter)
 	runtime.removePeriodicSchedulesLocked()
 	runtime.periodicNextAt = time.Time{}
@@ -1184,6 +1190,7 @@ func (runtime *chatGPTWebAccountInfoRuntime) close() {
 	clear(runtime.inflightTask)
 	clear(runtime.inflightRecovery)
 	runtime.clearPendingTriggersLocked()
+	runtime.clearPeriodicPendingLocked()
 	clear(runtime.ambiguousImageRecheckAfter)
 	clear(runtime.authInstances)
 	clear(runtime.runtimeKeysByAuth)
@@ -1314,6 +1321,8 @@ func (runtime *chatGPTWebAccountInfoRuntime) completeAccountInfoWorkLocked(
 	runtime.clearInflightRecoveryLocked(work)
 	if !runtime.workEpochCurrentLocked(work) {
 		runtime.finishWorkLocked(work, outcome)
+		runtime.drainPendingTriggersLocked()
+		runtime.drainPeriodicPendingLocked()
 		runtime.cond.Broadcast()
 		return
 	}
@@ -1348,6 +1357,7 @@ func (runtime *chatGPTWebAccountInfoRuntime) completeAccountInfoWorkLocked(
 	}
 	runtime.finishWorkLocked(work, outcome)
 	runtime.enqueuePendingTriggerForTargetLocked(work.target)
+	runtime.drainPeriodicPendingLocked()
 	runtime.cond.Broadcast()
 }
 
@@ -1399,6 +1409,7 @@ func (runtime *chatGPTWebAccountInfoRuntime) resetPeriodicScheduleLocked() {
 	}
 	runtime.periodicGeneration++
 	runtime.removePeriodicSchedulesLocked()
+	runtime.clearPeriodicPendingLocked()
 	if !runtime.periodicEnabledLocked() {
 		runtime.periodicNextAt = time.Time{}
 		return
@@ -1425,28 +1436,31 @@ func (runtime *chatGPTWebAccountInfoRuntime) removePeriodicSchedulesLocked() {
 	}
 }
 
-func (runtime *chatGPTWebAccountInfoRuntime) schedulePeriodicTargetsLocked(
+func (runtime *chatGPTWebAccountInfoRuntime) enqueuePeriodicTargetsLocked(
 	targets []chatgptwebauth.AccountInfoRefreshTarget,
-	due time.Time,
 ) {
 	if runtime == nil || !runtime.periodicEnabledLocked() {
 		return
 	}
 	for _, target := range targets {
+		var current bool
+		target, current = runtime.resolveCurrentTargetLocked(target)
+		if !current {
+			continue
+		}
 		runtimeKey := chatGPTWebAccountInfoTargetKey(target)
 		if runtimeKey == "" || runtime.periodicTargetCoveredLocked(target) {
 			continue
 		}
-		runtime.scheduleLocked(
-			chatGPTWebAccountInfoPeriodicSchedulePrefix+runtimeKey,
-			due,
-			chatGPTWebAccountInfoWork{
-				target:    target,
-				force:     false,
-				attempt:   1,
-				automatic: true,
-			},
-		)
+		enqueued, current := runtime.enqueueForCurrentInstanceLocked(chatGPTWebAccountInfoWork{
+			target:    target,
+			attempt:   1,
+			automatic: true,
+		})
+		if enqueued || !current {
+			continue
+		}
+		runtime.addPeriodicPendingLocked(target)
 	}
 }
 
@@ -1458,7 +1472,8 @@ func (runtime *chatGPTWebAccountInfoRuntime) periodicTargetCoveredLocked(
 		return true
 	}
 	if runtime.inflight[runtimeKey] > 0 ||
-		runtime.pendingTriggers[runtimeKey] != chatGPTWebAccountInfoTriggerNone {
+		runtime.pendingTriggers[runtimeKey] != chatGPTWebAccountInfoTriggerNone ||
+		runtime.periodicTargetPendingLocked(runtimeKey) {
 		return true
 	}
 	if work := runtime.queuedWorkForTargetLocked(runtimeKey); work != nil {
@@ -1472,6 +1487,105 @@ func (runtime *chatGPTWebAccountInfoRuntime) periodicTargetCoveredLocked(
 		}
 	}
 	return false
+}
+
+func (runtime *chatGPTWebAccountInfoRuntime) addPeriodicPendingLocked(
+	target chatgptwebauth.AccountInfoRefreshTarget,
+) {
+	if runtime == nil {
+		return
+	}
+	runtimeKey := chatGPTWebAccountInfoTargetKey(target)
+	if runtimeKey == "" {
+		return
+	}
+	if runtime.periodicPendingByTarget == nil {
+		runtime.periodicPendingByTarget = make(map[string]chatgptwebauth.AccountInfoRefreshTarget)
+	}
+	if _, exists := runtime.periodicPendingByTarget[runtimeKey]; exists {
+		return
+	}
+	runtime.trackRuntimeTargetLocked(target)
+	runtime.periodicPendingByTarget[runtimeKey] = target
+	runtime.periodicPendingQueue = append(runtime.periodicPendingQueue, target)
+}
+
+func (runtime *chatGPTWebAccountInfoRuntime) periodicTargetPendingLocked(runtimeKey string) bool {
+	if runtime == nil || strings.TrimSpace(runtimeKey) == "" {
+		return false
+	}
+	_, exists := runtime.periodicPendingByTarget[strings.TrimSpace(runtimeKey)]
+	return exists
+}
+
+func (runtime *chatGPTWebAccountInfoRuntime) deletePeriodicPendingLocked(runtimeKey string) {
+	if runtime == nil || strings.TrimSpace(runtimeKey) == "" {
+		return
+	}
+	delete(runtime.periodicPendingByTarget, strings.TrimSpace(runtimeKey))
+}
+
+func (runtime *chatGPTWebAccountInfoRuntime) drainPeriodicPendingLocked() {
+	for runtime.periodicPendingQueueHead < len(runtime.periodicPendingQueue) {
+		if !runtime.periodicEnabledLocked() || !runtime.hasAccountInfoCapacityLocked() {
+			return
+		}
+		target := runtime.periodicPendingQueue[runtime.periodicPendingQueueHead]
+		runtimeKey := chatGPTWebAccountInfoTargetKey(target)
+		stored, exists := runtime.periodicPendingByTarget[runtimeKey]
+		runtime.advancePeriodicPendingQueueLocked()
+		if !exists || chatGPTWebAccountInfoTargetKey(stored) != runtimeKey {
+			continue
+		}
+		delete(runtime.periodicPendingByTarget, runtimeKey)
+		resolved, current := runtime.resolveCurrentTargetLocked(stored)
+		if !current || runtime.periodicTargetCoveredLocked(resolved) {
+			continue
+		}
+		enqueued, current := runtime.enqueueForCurrentInstanceLocked(chatGPTWebAccountInfoWork{
+			target:    resolved,
+			attempt:   1,
+			automatic: true,
+		})
+		if enqueued || !current {
+			continue
+		}
+		runtime.addPeriodicPendingLocked(resolved)
+		return
+	}
+}
+
+func (runtime *chatGPTWebAccountInfoRuntime) advancePeriodicPendingQueueLocked() {
+	if runtime == nil || runtime.periodicPendingQueueHead >= len(runtime.periodicPendingQueue) {
+		return
+	}
+	runtime.periodicPendingQueue[runtime.periodicPendingQueueHead] = chatgptwebauth.AccountInfoRefreshTarget{}
+	runtime.periodicPendingQueueHead++
+	if runtime.periodicPendingQueueHead == len(runtime.periodicPendingQueue) {
+		runtime.periodicPendingQueue = nil
+		runtime.periodicPendingQueueHead = 0
+		return
+	}
+	if runtime.periodicPendingQueueHead >= 1024 &&
+		runtime.periodicPendingQueueHead*2 >= len(runtime.periodicPendingQueue) {
+		remaining := copy(
+			runtime.periodicPendingQueue,
+			runtime.periodicPendingQueue[runtime.periodicPendingQueueHead:],
+		)
+		clear(runtime.periodicPendingQueue[remaining:])
+		runtime.periodicPendingQueue = runtime.periodicPendingQueue[:remaining]
+		runtime.periodicPendingQueueHead = 0
+	}
+}
+
+func (runtime *chatGPTWebAccountInfoRuntime) clearPeriodicPendingLocked() {
+	if runtime == nil {
+		return
+	}
+	clear(runtime.periodicPendingQueue)
+	runtime.periodicPendingQueue = nil
+	runtime.periodicPendingQueueHead = 0
+	clear(runtime.periodicPendingByTarget)
 }
 
 func (runtime *chatGPTWebAccountInfoRuntime) queuedWorkLocked() []chatGPTWebAccountInfoWork {
@@ -2318,6 +2432,7 @@ func (runtime *chatGPTWebAccountInfoRuntime) enqueueForCurrentInstanceLocked(
 		}
 		return false, true
 	}
+	runtime.deletePeriodicPendingLocked(chatGPTWebAccountInfoTargetKey(work.target))
 	runtime.queue = append(runtime.queue, work)
 	runtime.queuedCount++
 	runtime.addQueuedTargetLocked(work, len(runtime.queue)-1)
@@ -2351,6 +2466,7 @@ func (runtime *chatGPTWebAccountInfoRuntime) scheduleLocked(key string, due time
 			}
 			return false
 		}
+		runtime.deletePeriodicPendingLocked(chatGPTWebAccountInfoTargetKey(work.target))
 		previousTarget := entry.work.target
 		previousWork := entry.work
 		runtime.unindexScheduleTargetLocked(entry)
@@ -2386,6 +2502,7 @@ func (runtime *chatGPTWebAccountInfoRuntime) scheduleLocked(key string, due time
 		}
 		return false
 	}
+	runtime.deletePeriodicPendingLocked(chatGPTWebAccountInfoTargetKey(work.target))
 	entry := &chatGPTWebAccountInfoSchedule{key: key, due: due, work: work, seq: runtime.schedule, index: -1}
 	runtime.scheduled[key] = entry
 	runtime.indexScheduleTargetLocked(entry)
@@ -2883,7 +3000,7 @@ func (runtime *chatGPTWebAccountInfoRuntime) runPeriodicScan(expected time.Time)
 	if now = runtime.currentTime(); !runtime.periodicNextAt.After(now) {
 		runtime.periodicNextAt = now.Add(interval)
 	}
-	runtime.schedulePeriodicTargetsLocked(targets, now)
+	runtime.enqueuePeriodicTargetsLocked(targets)
 	runtime.mu.Unlock()
 	runtime.signalPeriodic()
 }
@@ -3187,6 +3304,7 @@ func (runtime *chatGPTWebAccountInfoRuntime) removeAuthInstance(authID, authInst
 			}
 		}
 		runtime.deletePendingTriggerLocked(runtimeKey)
+		runtime.deletePeriodicPendingLocked(runtimeKey)
 		delete(runtime.ambiguousImageRecheckAfter, runtimeKey)
 		delete(runtime.inflight, runtimeKey)
 		delete(runtime.inflightForce, runtimeKey)
@@ -3213,6 +3331,8 @@ func (runtime *chatGPTWebAccountInfoRuntime) removeAuthInstance(authID, authInst
 			delete(runtime.runtimeKeysByAuth, authID)
 		}
 	}
+	runtime.drainPendingTriggersLocked()
+	runtime.drainPeriodicPendingLocked()
 	runtime.cond.Broadcast()
 	runtime.mu.Unlock()
 	runtime.signalScheduler()
@@ -3402,6 +3522,7 @@ func (runtime *chatGPTWebAccountInfoRuntime) cancelTask(id string) (*chatgptweba
 		runtime.releaseWorkEpochLocked(entry.work)
 	}
 	runtime.drainPendingTriggersLocked()
+	runtime.drainPeriodicPendingLocked()
 	runtime.finishTaskIfDoneLocked(task)
 	return cloneChatGPTWebAccountInfoTask(&task.snapshot), true
 }
@@ -3464,6 +3585,7 @@ func (runtime *chatGPTWebAccountInfoRuntime) snapshot() chatgptwebauth.AccountIn
 			queued++
 		}
 	}
+	queued += len(runtime.periodicPendingByTarget)
 	return chatgptwebauth.AccountInfoRuntimeSnapshot{
 		Busy:         runtime.busy,
 		Queued:       queued,
@@ -3564,6 +3686,7 @@ func (runtime *chatGPTWebAccountInfoRuntime) hasPassiveRuntimeKeyLocked(runtimeK
 	}
 	return runtime.inflight[runtimeKey] > 0 ||
 		runtime.pendingTriggers[runtimeKey] != chatGPTWebAccountInfoTriggerNone ||
+		runtime.periodicTargetPendingLocked(runtimeKey) ||
 		runtime.authEpochRefs[runtimeKey] > 0 ||
 		runtime.calls[runtimeKey] != nil ||
 		runtime.targetQueuedLocked(runtimeKey) ||
@@ -3727,7 +3850,8 @@ func (runtime *chatGPTWebAccountInfoRuntime) targetHasRefreshWorkLocked(runtimeK
 		return false
 	}
 	if runtime.inflight[runtimeKey] > 0 || runtime.pendingTriggers[runtimeKey] != chatGPTWebAccountInfoTriggerNone ||
-		runtime.targetQueuedLocked(runtimeKey) || len(runtime.scheduledByTarget[runtimeKey]) > 0 {
+		runtime.periodicTargetPendingLocked(runtimeKey) || runtime.targetQueuedLocked(runtimeKey) ||
+		len(runtime.scheduledByTarget[runtimeKey]) > 0 {
 		return true
 	}
 	return runtime.calls[runtimeKey] != nil
@@ -3741,6 +3865,12 @@ func (runtime *chatGPTWebAccountInfoRuntime) triggerTargetLocked(
 	if mode != chatGPTWebAccountInfoTriggerForce && !runtime.cfg.AutomaticRefreshEnabled() {
 		runtime.deletePendingTriggerLocked(runtimeKey)
 		return false
+	}
+	if runtime.periodicTargetPendingLocked(runtimeKey) {
+		runtime.deletePeriodicPendingLocked(runtimeKey)
+		runtime.setPendingTriggerLocked(runtimeKey, mode)
+		runtime.drainPendingTriggersLocked()
+		return true
 	}
 	if runtime.pendingTriggers == nil {
 		runtime.pendingTriggers = make(map[string]chatGPTWebAccountInfoTriggerMode)
