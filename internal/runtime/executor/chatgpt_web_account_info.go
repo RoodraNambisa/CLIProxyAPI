@@ -1909,9 +1909,17 @@ func (runtime *chatGPTWebAccountInfoRuntime) queuedAccountInfoWorkCanJoinCallLoc
 	if runtime == nil || call == nil {
 		return false
 	}
+	callKey := call.key()
+	if (runtime.queuedByTarget == nil || runtime.queuedIndicesByTarget == nil) && runtime.queueLengthLocked() > 0 {
+		runtime.rebuildQueuedTargetsLocked()
+	}
 	canJoin := false
-	for _, work := range runtime.queuedWorkLocked() {
-		if chatGPTWebAccountInfoTargetKey(work.target) == call.key() &&
+	for index := range runtime.queuedIndicesByTarget[callKey] {
+		if index < runtime.queueHead || index >= len(runtime.queue) {
+			continue
+		}
+		work := runtime.queue[index]
+		if chatGPTWebAccountInfoTargetKey(work.target) == callKey &&
 			work.epoch == call.epoch &&
 			accountInfoCallSatisfiesWork(call, work) {
 			call.includeRetryAttempt(work.attempt)

@@ -4911,6 +4911,48 @@ func TestChatGPTWebAccountInfoQueuedTargetIndexTracksQueueChanges(t *testing.T) 
 	runtime.mu.Unlock()
 }
 
+func TestChatGPTWebAccountInfoCompletedCallUsesTargetedQueueIndex(t *testing.T) {
+	runtime := newChatGPTWebAccountInfoRuntime(nil, nil)
+	runtime.cfg.RefreshWorkers = 1
+	runtime.cfg.RefreshQueueSize = 2048
+
+	runtime.mu.Lock()
+	for index := range 1024 {
+		if !runtime.enqueueLocked(chatGPTWebAccountInfoWork{
+			target: chatgptwebauth.AccountInfoRefreshTarget{AuthID: fmt.Sprintf("unrelated-%d", index)},
+		}) {
+			runtime.mu.Unlock()
+			t.Fatalf("failed to enqueue unrelated work %d", index)
+		}
+	}
+	targetWork := chatGPTWebAccountInfoWork{
+		target:  chatgptwebauth.AccountInfoRefreshTarget{AuthID: "target"},
+		attempt: 3,
+	}
+	if !runtime.enqueueLocked(targetWork) {
+		runtime.mu.Unlock()
+		t.Fatal("failed to enqueue target work")
+	}
+	targetWork = runtime.queue[len(runtime.queue)-1]
+	call := &chatGPTWebAccountInfoCall{
+		authID:       "target",
+		runtimeKey:   "target",
+		epoch:        targetWork.epoch,
+		accepting:    true,
+		completed:    true,
+		retryAttempt: 1,
+	}
+	if !runtime.queuedAccountInfoWorkCanJoinCallLocked(call) {
+		runtime.mu.Unlock()
+		t.Fatal("targeted queued work did not retain the completed call")
+	}
+	if call.retryAttempt != targetWork.attempt {
+		runtime.mu.Unlock()
+		t.Fatalf("retry attempt = %d, want %d", call.retryAttempt, targetWork.attempt)
+	}
+	runtime.mu.Unlock()
+}
+
 func TestChatGPTWebAccountInfoFailedResultPreservesOldRecoverySchedule(t *testing.T) {
 	now := time.Now().UTC()
 	resetAt := now.Add(time.Hour)
