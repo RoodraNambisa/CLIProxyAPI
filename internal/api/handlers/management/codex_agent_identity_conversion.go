@@ -875,7 +875,7 @@ func findUniqueManagedCodexAuthByAccount(manager *coreauth.Manager, accountID st
 		return nil, nil
 	}
 	var match *coreauth.Auth
-	for _, candidate := range manager.List() {
+	for _, candidate := range manager.AuthsForProviders("codex") {
 		if candidate == nil || !strings.EqualFold(strings.TrimSpace(candidate.Provider), "codex") ||
 			strings.TrimSpace(candidate.Attributes[coreauth.SourceHashAttributeKey]) == "" ||
 			!strings.EqualFold(agentIdentityAccountKey(candidate.Metadata), accountID) {

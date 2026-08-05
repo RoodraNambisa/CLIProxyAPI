@@ -57,25 +57,7 @@ func (h *Handler) liveAuthIndexByID() map[string]string {
 	if manager == nil {
 		return out
 	}
-	// authManager.List() returns clones, so EnsureIndex only affects these copies.
-	for _, auth := range manager.List() {
-		if auth == nil {
-			continue
-		}
-		id := strings.TrimSpace(auth.ID)
-		if id == "" {
-			continue
-		}
-		idx := strings.TrimSpace(auth.Index)
-		if idx == "" {
-			idx = auth.EnsureIndex()
-		}
-		if idx == "" {
-			continue
-		}
-		out[id] = idx
-	}
-	return out
+	return manager.AuthIndexSnapshot()
 }
 
 func (h *Handler) geminiKeysWithAuthIndex() []geminiKeyWithAuthIndex {

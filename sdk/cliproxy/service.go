@@ -4250,7 +4250,7 @@ func (s *Service) Run(ctx context.Context) error {
 			providerSet[strings.ToLower(strings.TrimSpace(p))] = true
 		}
 
-		auths := s.coreManager.List()
+		auths := s.coreManager.AuthsForProviders(changedProviders...)
 		refreshed := 0
 		for _, item := range auths {
 			if item == nil || item.ID == "" {
@@ -4399,14 +4399,10 @@ func (s *Service) Run(ctx context.Context) error {
 		if s.coreManager != nil &&
 			!authModelExclusionsChanged &&
 			shouldRefreshChatGPTWebRegistrations(previousCfgSnapshot, newCfg) {
-			for _, auth := range s.coreManager.List() {
-				if !isNativeChatGPTWebAuth(auth) {
-					continue
-				}
+			for _, auth := range s.coreManager.ChatGPTWebAuths() {
 				s.refreshChatGPTWebModelRegistration(ctx, auth)
 			}
 		}
-		s.refreshChatGPTWebModelCatalogs(ctx)
 		previousImportModels := previousCfgSnapshot != nil && previousCfgSnapshot.ChatGPTWeb.Import.Resolved().ValidateModelsAfterUpload
 		nextImportModels := newCfg.ChatGPTWeb.Import.Resolved().ValidateModelsAfterUpload
 		if !previousImportModels && nextImportModels {
@@ -4421,10 +4417,7 @@ func (s *Service) Run(ctx context.Context) error {
 				s.refreshModelRegistrationForAuth(auth)
 			}
 		} else if s.coreManager != nil && shouldRefreshCodexRegistrations(previousCfgSnapshot, newCfg) {
-			for _, auth := range s.coreManager.List() {
-				if auth == nil || !strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") {
-					continue
-				}
+			for _, auth := range s.coreManager.AuthsForProviders("codex") {
 				s.refreshModelRegistrationForAuth(auth)
 			}
 		}

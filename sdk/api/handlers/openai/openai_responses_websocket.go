@@ -629,7 +629,7 @@ func (h *OpenAIResponsesAPIHandler) websocketUpstreamSupportsIncrementalInputFor
 	}
 	registryRef := registry.GetGlobalRegistry()
 	now := time.Now()
-	auths := h.AuthManager.List()
+	auths := h.AuthManager.AuthsForProviders(providers...)
 	for i := 0; i < len(auths); i++ {
 		auth := auths[i]
 		if auth == nil {

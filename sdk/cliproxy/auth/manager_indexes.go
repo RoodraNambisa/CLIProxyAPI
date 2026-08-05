@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	chatgptwebauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/chatgptweb"
+	internalcodex "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/codex"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/authfileguard"
 	internalconfig "github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 )
@@ -178,6 +179,7 @@ func (m *Manager) removeAuthIndexesLocked(id string) {
 		delete(m.providerByAuthID, id)
 	}
 	delete(m.authIndexesByID, id)
+	delete(m.authPlanTypesByID, id)
 	m.removeDependencyAuthIndexLocked(id)
 	m.removeChatGPTWebIdentityIndexLocked(id)
 }
@@ -189,6 +191,9 @@ func (m *Manager) addAuthIndexesLocked(auth *Auth, cfg *internalconfig.Config) {
 	id := strings.TrimSpace(auth.ID)
 	if index := strings.TrimSpace(auth.Index); index != "" {
 		m.authIndexesByID[id] = index
+	}
+	if planType := strings.TrimSpace(internalcodex.EffectivePlanType(auth.Metadata)); planType != "" {
+		m.authPlanTypesByID[id] = planType
 	}
 	if providerKey := strings.ToLower(strings.TrimSpace(auth.Provider)); providerKey != "" {
 		ids := m.providerAuthIDs[providerKey]
@@ -311,6 +316,7 @@ func (m *Manager) rebuildAuthIndexesLocked(persisted []*Auth, complete bool) {
 	m.providerAuthIDs = make(map[string]map[string]struct{})
 	m.providerByAuthID = make(map[string]string)
 	m.authIndexesByID = make(map[string]string)
+	m.authPlanTypesByID = make(map[string]string)
 	m.dependencyAuthsByID = make(map[string]*Auth)
 	m.dependencySourceIDs = make(map[string]map[string]struct{})
 	m.dependencyDependentIDs = make(map[string]map[string]struct{})

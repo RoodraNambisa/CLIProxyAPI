@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"path/filepath"
 	"reflect"
@@ -13,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	internalcodex "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/codex"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/authfileguard"
 	internalconfig "github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 )
@@ -352,6 +354,33 @@ func TestManagerListMetadataSummariesIncludesOnlyRequestedMetadata(t *testing.T)
 	}
 }
 
+func TestManagerListMetadataSummariesUsesIndexedPlanWithoutReturningToken(t *testing.T) {
+	manager := NewManager(nil, nil, nil)
+	claims := base64.RawURLEncoding.EncodeToString([]byte(`{"https://api.openai.com/auth":{"chatgpt_plan_type":"pro"}}`))
+	auth := &Auth{
+		ID:       "codex-summary-auth",
+		Provider: "codex",
+		Metadata: map[string]any{
+			"id_token":     "e30." + claims + ".signature",
+			"access_token": "secret-access-token",
+		},
+	}
+	if _, errRegister := manager.Register(WithSkipPersist(t.Context()), auth); errRegister != nil {
+		t.Fatal(errRegister)
+	}
+
+	summaries := manager.ListMetadataSummaries("plan_type")
+	if len(summaries) != 1 || summaries[0].Metadata["plan_type"] != "pro" {
+		t.Fatalf("summaries = %#v", summaries)
+	}
+	if _, leaked := summaries[0].Metadata["id_token"]; leaked {
+		t.Fatal("summary leaked ID token")
+	}
+	if _, leaked := summaries[0].Metadata["access_token"]; leaked {
+		t.Fatal("summary leaked access token")
+	}
+}
+
 func assertAuthIDsForPath(t *testing.T, manager *Manager, path string, want ...string) {
 	t.Helper()
 	auths := manager.AuthsForBackingPath(path)
@@ -381,11 +410,15 @@ func assertManagerAuthIndexesConsistent(t *testing.T, manager *Manager) {
 	expectedProviders := make(map[string]map[string]struct{})
 	expectedProviderByID := make(map[string]string)
 	expectedAuthIndexes := make(map[string]string)
+	expectedPlanTypes := make(map[string]string)
 	expectedDependencies := make(map[string]*Auth)
 	expectedIdentityKeys := make(map[string][]string)
 	for id, auth := range manager.auths {
 		if index := strings.TrimSpace(auth.Index); index != "" {
 			expectedAuthIndexes[id] = index
+		}
+		if planType := strings.TrimSpace(internalcodex.EffectivePlanType(auth.Metadata)); planType != "" {
+			expectedPlanTypes[id] = planType
 		}
 		if providerKey := strings.ToLower(strings.TrimSpace(auth.Provider)); providerKey != "" {
 			ids := expectedProviders[providerKey]
@@ -420,6 +453,9 @@ func assertManagerAuthIndexesConsistent(t *testing.T, manager *Manager) {
 	}
 	if !reflect.DeepEqual(manager.authIndexesByID, expectedAuthIndexes) {
 		t.Fatalf("auth index map is inconsistent: got=%v want=%v", manager.authIndexesByID, expectedAuthIndexes)
+	}
+	if !reflect.DeepEqual(manager.authPlanTypesByID, expectedPlanTypes) {
+		t.Fatalf("auth plan type map is inconsistent: got=%v want=%v", manager.authPlanTypesByID, expectedPlanTypes)
 	}
 	for id, auth := range expectedDependencies {
 		indexed := manager.dependencyAuthsByID[id]

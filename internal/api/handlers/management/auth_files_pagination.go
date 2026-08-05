@@ -278,7 +278,12 @@ func (h *Handler) listAuthFilesPaged(c *gin.Context, manager *coreauth.Manager) 
 	pageAuths := make([]*coreauth.Auth, 0, len(pageRecords))
 	for _, record := range pageRecords {
 		if record.auth != nil {
-			pageAuths = append(pageAuths, record.auth)
+			if current, ok := manager.GetByID(record.id); ok && current != nil {
+				record.auth = current
+				pageAuths = append(pageAuths, current)
+			} else {
+				record.auth = nil
+			}
 		}
 	}
 	runtimeSummaries := h.authFileRuntimeSummariesForAuths(manager, pageAuths)
@@ -340,6 +345,11 @@ func (h *Handler) ListAuthFileSelection(c *gin.Context) {
 		if record.auth == nil || record.runtimeOnly || record.retired {
 			continue
 		}
+		current, ok := manager.GetByID(record.id)
+		if !ok || current == nil {
+			continue
+		}
+		record.auth = current
 		files = append(files, buildAuthFileSelectionEntry(record, graph, now))
 	}
 	c.JSON(http.StatusOK, gin.H{"files": files, "total": len(files)})
@@ -349,8 +359,21 @@ func (h *Handler) authFileListRecords(manager *coreauth.Manager) ([]*authFileLis
 	if manager == nil {
 		return nil, coreauth.BuildChatGPTWebDependencyGraph(nil)
 	}
-	auths := manager.List()
-	graph := coreauth.BuildChatGPTWebDependencyGraph(auths)
+	auths := manager.ListMetadataSummaries(
+		"auth_kind",
+		"credential_uid",
+		"deletion_state",
+		"email",
+		"lifecycle_reason",
+		"lifecycle_state",
+		"note",
+		"plan_type",
+		"priority",
+		"refresh_strategy",
+		"source_auth_id",
+		"source_credential_uid",
+	)
+	graph, _ := manager.ChatGPTWebDependencyIndexSnapshot()
 	records := make([]*authFileListRecord, 0, len(auths))
 	managedNames := make(map[string]struct{}, len(auths))
 
@@ -358,7 +381,6 @@ func (h *Handler) authFileListRecords(manager *coreauth.Manager) ([]*authFileLis
 	if errRoot == nil {
 		defer closeManagedAuthRoot(root)
 	}
-	now := time.Now()
 	for _, auth := range auths {
 		if auth == nil {
 			continue
@@ -389,7 +411,7 @@ func (h *Handler) authFileListRecords(manager *coreauth.Manager) ([]*authFileLis
 		if name == "" {
 			name = auth.ID
 		}
-		record := authFileRecordForAuth(auth, name, runtimeOnly, now)
+		record := authFileRecordForAuth(auth, name, runtimeOnly)
 		records = append(records, record)
 		if managed && managedName != "" {
 			managedNames[managedAuthNameKey(managedName)] = struct{}{}
@@ -404,17 +426,13 @@ func (h *Handler) authFileListRecords(manager *coreauth.Manager) ([]*authFileLis
 	return records, graph
 }
 
-func authFileRecordForAuth(auth *coreauth.Auth, name string, runtimeOnly bool, now time.Time) *authFileListRecord {
+func authFileRecordForAuth(auth *coreauth.Auth, name string, runtimeOnly bool) *authFileListRecord {
 	provider := normalizeAuthFilesProvider(auth.Provider)
 	statusMessage := strings.TrimSpace(auth.StatusMessage)
 	plan := effectiveCodexPlanType(auth)
-	light := gin.H{"status_message": statusMessage}
 	if strings.EqualFold(provider, chatgptwebauth.Provider) {
-		applyChatGPTWebMetadataSummary(light, auth.Metadata, auth.LifecycleState(), now)
-		statusMessage, _ = light["status_message"].(string)
-		if value, ok := light["plan_type"].(string); ok {
-			plan = strings.TrimSpace(value)
-		}
+		statusMessage = chatgptwebauth.SafeLifecycleReason(stringValue(auth.Metadata, "lifecycle_reason"))
+		plan = strings.TrimSpace(stringValue(auth.Metadata, "plan_type"))
 	} else if plan == "" {
 		plan = strings.TrimSpace(stringValue(auth.Metadata, "plan_type"))
 	}

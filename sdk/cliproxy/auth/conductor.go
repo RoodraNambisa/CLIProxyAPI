@@ -393,6 +393,7 @@ type Manager struct {
 	providerAuthIDs            map[string]map[string]struct{}
 	providerByAuthID           map[string]string
 	authIndexesByID            map[string]string
+	authPlanTypesByID          map[string]string
 	dependencyAuthsByID        map[string]*Auth
 	dependencySourceIDs        map[string]map[string]struct{}
 	dependencyDependentIDs     map[string]map[string]struct{}
@@ -655,6 +656,7 @@ func NewManager(store Store, selector Selector, hook Hook) *Manager {
 		providerAuthIDs:             make(map[string]map[string]struct{}),
 		providerByAuthID:            make(map[string]string),
 		authIndexesByID:             make(map[string]string),
+		authPlanTypesByID:           make(map[string]string),
 		dependencyAuthsByID:         make(map[string]*Auth),
 		dependencySourceIDs:         make(map[string]map[string]struct{}),
 		dependencyDependentIDs:      make(map[string]map[string]struct{}),
@@ -8135,6 +8137,16 @@ func (m *Manager) ListMetadataSummaries(metadataKeys ...string) []*Auth {
 			for key := range keySet {
 				if value, ok := auth.Metadata[key]; ok {
 					summary.Metadata[key] = value
+				}
+			}
+		}
+		if _, requested := keySet["plan_type"]; requested {
+			if summary.Metadata == nil {
+				summary.Metadata = make(map[string]any, 1)
+			}
+			if _, explicit := summary.Metadata["plan_type"]; !explicit {
+				if planType := strings.TrimSpace(m.authPlanTypesByID[id]); planType != "" {
+					summary.Metadata["plan_type"] = planType
 				}
 			}
 		}
