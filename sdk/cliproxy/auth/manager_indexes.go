@@ -154,8 +154,10 @@ func (m *Manager) removeAuthLocked(id string) {
 	if id == "" {
 		return
 	}
+	removed := m.auths[id]
 	delete(m.auths, id)
 	m.removeAuthIndexesLocked(id)
+	m.removeAPIKeyModelAliasForAuthLocked(removed)
 	m.authIndexRevision++
 }
 

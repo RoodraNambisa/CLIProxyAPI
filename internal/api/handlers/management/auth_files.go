@@ -1829,12 +1829,6 @@ func (h *Handler) DeleteAuthFile(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": errAction.Error()})
 		return
 	}
-	unlockDependency, errDependencyLock := h.chatGPTWebDependencyMu.lock(ctx)
-	if errDependencyLock != nil {
-		c.JSON(http.StatusRequestTimeout, gin.H{"error": fmt.Sprintf("failed to lock credential dependencies: %v", errDependencyLock)})
-		return
-	}
-	defer unlockDependency()
 	root, lexicalAuthDir, authDir, errRoot := h.openManagedAuthRootSnapshot()
 	if errRoot != nil {
 		status := http.StatusInternalServerError
@@ -2270,16 +2264,22 @@ func (h *Handler) deleteAuthFileByNameAtRootExpected(ctx context.Context, root *
 			targetAuth = nil
 		}
 	}
-	if targetAuth == nil && !runtimeAuthResolved && h.authManager != nil {
-		for _, auth := range h.authManager.List() {
+	runtimeAuths := make([]*coreauth.Auth, 0, 1)
+	if h.authManager != nil {
+		for _, auth := range h.authManager.AuthsForBackingPath(targetPath) {
 			if auth == nil || isRuntimeOnlyAuth(auth) {
 				continue
 			}
 			managedName, managed := managedAuthBackingFileNameAtRoot(root, lexicalAuthDir, authDir, auth)
-			if managed && managedAuthNameEqual(managedName, displayName) {
-				targetAuth = auth
-				break
+			if !managed || !managedAuthNameEqual(managedName, displayName) {
+				continue
 			}
+			runtimeAuths = append(runtimeAuths, auth)
+		}
+	}
+	if targetAuth == nil && !runtimeAuthResolved && h.authManager != nil {
+		if len(runtimeAuths) > 0 {
+			targetAuth = runtimeAuths[0]
 		}
 	}
 	lockedCtx := ctx
@@ -2384,13 +2384,33 @@ func (h *Handler) deleteAuthFileByNameAtRootExpected(ctx context.Context, root *
 		return displayName, http.StatusInternalServerError, errDelete
 	}
 	authfileguard.ClearRetiredSnapshot(retiredSnapshot)
-	if targetID == "" && !runtimeAuthResolved && h.authManager != nil {
-		for _, auth := range h.authManager.List() {
-			if !authBackedByManagedPath(auth, targetPath, authDir) {
+	if h.authManager != nil {
+		remainingByID := make(map[string]*coreauth.Auth, len(runtimeAuths))
+		for _, auth := range runtimeAuths {
+			if auth != nil {
+				remainingByID[auth.ID] = auth
+			}
+		}
+		for _, auth := range h.authManager.AuthsForBackingPath(targetPath) {
+			if auth != nil {
+				remainingByID[auth.ID] = auth
+			}
+		}
+		for _, auth := range remainingByID {
+			if auth == nil || auth.ID == targetID {
 				continue
 			}
-			if errRuntimeDelete := h.authManager.Delete(coreauth.WithSkipPersist(ctx), auth.ID); errRuntimeDelete != nil {
+			expectedInstallationID := auth.RuntimeInstallationID()
+			deletedRuntime, errRuntimeDelete := h.authManager.DeleteIf(coreauth.WithSkipPersist(ctx), auth.ID, func(current *coreauth.Auth) bool {
+				return current != nil && current.RuntimeInstallationID() == expectedInstallationID && authBackedByManagedPath(current, targetPath, authDir)
+			})
+			if errRuntimeDelete != nil {
 				return displayName, http.StatusInternalServerError, fmt.Errorf("remove deleted auth from runtime: %w", errRuntimeDelete)
+			}
+			if !deletedRuntime {
+				if current, exists := h.authManager.GetByID(auth.ID); exists && authBackedByManagedPath(current, targetPath, authDir) {
+					return displayName, http.StatusConflict, errors.New("auth runtime changed while its backing file was deleted")
+				}
 			}
 		}
 	}
@@ -2570,17 +2590,9 @@ func authBackedByManagedPath(auth *coreauth.Auth, targetPath, authDir string) bo
 	if !filepath.IsAbs(path) {
 		path = filepath.Join(authDir, filepath.FromSlash(path))
 	}
-	pathAbs, errPath := filepath.Abs(path)
-	targetAbs, errTarget := filepath.Abs(targetPath)
-	if errPath != nil || errTarget != nil {
-		return false
-	}
-	pathAbs = filepath.Clean(pathAbs)
-	targetAbs = filepath.Clean(targetAbs)
-	if runtime.GOOS == "windows" {
-		return strings.EqualFold(pathAbs, targetAbs)
-	}
-	return pathAbs == targetAbs
+	pathIdentity := authfileguard.PathIdentity(path)
+	targetIdentity := authfileguard.PathIdentity(targetPath)
+	return pathIdentity != "" && pathIdentity == targetIdentity
 }
 
 func (h *Handler) findManagedFileAuth(name string) *coreauth.Auth {
@@ -2606,7 +2618,11 @@ func (h *Handler) findManagedFileAuthWithManager(name string, manager *coreauth.
 	if errNormalize != nil {
 		return nil
 	}
-	for _, auth := range manager.List() {
+	if actualName, errActual := actualManagedAuthFileNameAtRoot(root, normalizedName); errActual == nil {
+		normalizedName = actualName
+	}
+	targetPath := filepath.Join(authDir, filepath.FromSlash(normalizedName))
+	for _, auth := range manager.AuthsForBackingPath(targetPath) {
 		if auth == nil || isRuntimeOnlyAuth(auth) {
 			continue
 		}

@@ -45,12 +45,14 @@ type authDependencyDeleteContext struct {
 	ignoreMissingFile bool
 	runtimeByID       map[string]*coreauth.Auth
 	runtimeByName     map[string]*coreauth.Auth
+	runtimeLookupDone map[string]struct{}
 	authByName        map[string]*coreauth.Auth
 	authLookupDone    map[string]struct{}
 	dependencyByID    map[string]*coreauth.Auth
 	dependencyNameIDs map[string]string
 	cachedGraph       *coreauth.ChatGPTWebDependencyGraph
 	dependencyLoaded  bool
+	dependencyIndexed bool
 	dependencyDirty   bool
 	dependencyErr     error
 }
@@ -70,7 +72,6 @@ func (h *Handler) deleteAuthFilesWithDependencies(ctx context.Context, root *os.
 	}
 	run := func(lockedCtx context.Context) error {
 		operation.ctx = lockedCtx
-		operation.indexRuntimeAuths()
 		for _, name := range names {
 			operation.requested[managedAuthNameKey(name)] = struct{}{}
 			if auth := operation.managedAuth(name); auth != nil && strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") {
@@ -103,8 +104,33 @@ func (h *Handler) deleteAuthFilesWithDependencies(ctx context.Context, root *os.
 			}
 		}
 		_ = run(ctx)
-	} else if errMutation := h.authManager.WithChatGPTWebDependencyMutation(ctx, run); errMutation != nil {
-		operation.fail("", http.StatusInternalServerError, errMutation)
+	} else {
+		dependencySensitive := false
+		for _, name := range names {
+			auth := operation.managedAuth(name)
+			provider := ""
+			if auth != nil {
+				provider = strings.ToLower(strings.TrimSpace(auth.Provider))
+			}
+			if provider == "codex" || provider == "chatgpt-web" || coreauth.ChatGPTWebLinkedSourceUID(auth) != "" {
+				dependencySensitive = true
+				break
+			}
+		}
+		if !dependencySensitive {
+			_ = run(ctx)
+		} else {
+			unlockDependency, errDependencyLock := h.chatGPTWebDependencyMu.lock(ctx)
+			if errDependencyLock != nil {
+				operation.fail("", http.StatusRequestTimeout, errDependencyLock)
+				return operation.result
+			}
+			errMutation := h.authManager.WithChatGPTWebDependencyMutation(ctx, run)
+			unlockDependency()
+			if errMutation != nil {
+				operation.fail("", http.StatusInternalServerError, errMutation)
+			}
+		}
 	}
 	return operation.result
 }
@@ -117,10 +143,29 @@ func (operation *authDependencyDeleteContext) indexRuntimeAuths() {
 	operation.runtimeByID = make(map[string]*coreauth.Auth)
 	operation.authByName = make(map[string]*coreauth.Auth)
 	operation.authLookupDone = make(map[string]struct{})
+	operation.runtimeLookupDone = make(map[string]struct{})
+}
+
+func (operation *authDependencyDeleteContext) indexRuntimeAuthForName(name string) {
+	operation.indexRuntimeAuths()
+	key := managedAuthNameKey(name)
+	if _, done := operation.runtimeLookupDone[key]; done {
+		return
+	}
+	operation.runtimeLookupDone[key] = struct{}{}
 	if operation.h == nil || operation.h.authManager == nil {
 		return
 	}
-	for _, auth := range operation.h.authManager.List() {
+	_, displayName, errResolve := resolveManagedAuthFilePathAtRoot(operation.root, operation.authDir, name)
+	if errResolve != nil {
+		return
+	}
+	actualName, errActual := actualManagedAuthFileNameAtRoot(operation.root, displayName)
+	if errActual == nil {
+		displayName = actualName
+	}
+	targetPath := filepath.Join(operation.authDir, filepath.FromSlash(displayName))
+	for _, auth := range operation.h.authManager.AuthsForBackingPath(targetPath) {
 		if auth == nil {
 			continue
 		}
@@ -130,11 +175,10 @@ func (operation *authDependencyDeleteContext) indexRuntimeAuths() {
 		if isRuntimeOnlyAuth(auth) {
 			continue
 		}
-		name, managed := operation.h.managedAuthNameForAuthAtRoot(operation.root, operation.lexicalAuthDir, operation.authDir, auth)
-		if !managed {
+		managedName, managed := operation.h.managedAuthNameForAuthAtRoot(operation.root, operation.lexicalAuthDir, operation.authDir, auth)
+		if !managed || !managedAuthNameEqual(managedName, displayName) {
 			continue
 		}
-		key := managedAuthNameKey(name)
 		if _, exists := operation.runtimeByName[key]; exists {
 			continue
 		}
@@ -152,6 +196,12 @@ func (operation *authDependencyDeleteContext) managedAuth(name string) *coreauth
 	key := managedAuthNameKey(name)
 	if _, done := operation.authLookupDone[key]; done {
 		return operation.authByName[key]
+	}
+	operation.indexRuntimeAuthForName(name)
+	if auth := operation.runtimeByName[key]; auth != nil {
+		operation.authByName[key] = auth
+		operation.authLookupDone[key] = struct{}{}
+		return auth
 	}
 	operation.authLookupDone[key] = struct{}{}
 	data, _, path, errRead := readManagedAuthFileAtRoot(operation.root, operation.authDir, name)
@@ -172,6 +222,7 @@ func (operation *authDependencyDeleteContext) currentRuntimeAuth(name string) *c
 		return nil
 	}
 	operation.indexRuntimeAuths()
+	operation.indexRuntimeAuthForName(name)
 	expected := operation.runtimeByName[managedAuthNameKey(name)]
 	if expected == nil {
 		return nil
@@ -214,19 +265,22 @@ func (operation *authDependencyDeleteContext) delete(name string, dependencyDele
 		return
 	}
 
-	graph, errGraph := operation.dependencyGraph()
+	dependents, ambiguous, errGraph := operation.dependentsForSource(auth)
 	if errGraph != nil {
 		operation.fail(name, http.StatusConflict, fmt.Errorf("cannot verify credential dependencies: %w", errGraph))
 		return
 	}
-	dependents, ambiguous := graph.DependentsForSource(auth)
 	if ambiguous {
 		operation.fail(name, http.StatusConflict, errors.New("codex credential UID is duplicated; dependency deletion is ambiguous"))
 		return
 	}
 	reservationSource := auth
 	if uid := coreauth.ChatGPTWebCredentialUID(auth); uid != "" {
-		persistedSource, sourceAmbiguous := graph.SourceByUID(uid)
+		persistedSource, sourceAmbiguous, errSource := operation.sourceByUID(uid)
+		if errSource != nil {
+			operation.fail(name, http.StatusConflict, fmt.Errorf("cannot verify credential source: %w", errSource))
+			return
+		}
 		if sourceAmbiguous {
 			operation.fail(name, http.StatusConflict, errors.New("codex credential UID is duplicated; dependency deletion is ambiguous"))
 			return
@@ -284,12 +338,11 @@ func (operation *authDependencyDeleteContext) delete(name string, dependencyDele
 	}
 	operation.updateManagedAuth(name, current)
 	if len(operation.result.failed) > failuresBeforeCascade {
-		currentGraph, errGraph := operation.dependencyGraph()
+		remaining, stillAmbiguous, errGraph := operation.dependentsForSource(current)
 		if errGraph != nil {
 			operation.fail(name, http.StatusConflict, fmt.Errorf("cannot verify remaining dependencies: %w", errGraph))
 			return
 		}
-		remaining, stillAmbiguous := currentGraph.DependentsForSource(current)
 		if stillAmbiguous {
 			operation.fail(name, http.StatusConflict, errors.New("codex credential UID became ambiguous during cascade deletion"))
 			return
@@ -297,12 +350,11 @@ func (operation *authDependencyDeleteContext) delete(name string, dependencyDele
 		operation.retain(name, current, remaining)
 		return
 	}
-	currentGraph, errGraph := operation.dependencyGraph()
+	remaining, stillAmbiguous, errGraph := operation.dependentsForSource(current)
 	if errGraph != nil {
 		operation.fail(name, http.StatusConflict, fmt.Errorf("cannot verify remaining dependencies: %w", errGraph))
 		return
 	}
-	remaining, stillAmbiguous := currentGraph.DependentsForSource(current)
 	if stillAmbiguous || len(remaining) > 0 {
 		operation.retain(name, current, remaining)
 		return
@@ -327,7 +379,7 @@ func (operation *authDependencyDeleteContext) allDependentsRequested(dependents 
 }
 
 func (operation *authDependencyDeleteContext) deletePhysical(name string, auth *coreauth.Auth, dependencyDelete bool) {
-	operation.deletePhysicalExpected(name, auth, dependencyDelete, "", "")
+	operation.deletePhysicalExpected(name, auth, dependencyDelete, "", dependencySourceHash(auth))
 }
 
 func (operation *authDependencyDeleteContext) deleteExpected(name string, auth *coreauth.Auth, dependencyDelete bool, expectedSourceHash string) {
@@ -341,13 +393,17 @@ func (operation *authDependencyDeleteContext) deleteExpected(name string, auth *
 
 func (operation *authDependencyDeleteContext) deletePhysicalExpected(name string, auth *coreauth.Auth, dependencyDelete bool, expectedSourceUID, expectedSourceHash string) {
 	linkedSourceUID := coreauth.ChatGPTWebLinkedSourceUID(auth)
+	targetAuth := operation.currentRuntimeAuth(name)
+	if targetAuth == nil {
+		targetAuth = auth
+	}
 	deletedName, status, errDelete := operation.h.deleteAuthFileByNameAtRootExpected(
 		operation.ctx,
 		operation.root,
 		operation.lexicalAuthDir,
 		operation.authDir,
 		name,
-		operation.currentRuntimeAuth(name),
+		targetAuth,
 		true,
 		expectedSourceHash,
 		expectedSourceUID,
@@ -390,16 +446,19 @@ func (operation *authDependencyDeleteContext) validateSourceDecision(name, expec
 }
 
 func (operation *authDependencyDeleteContext) cleanupRetainedSource(sourceUID string) {
-	graph, errGraph := operation.dependencyGraph()
+	source, ambiguous, errGraph := operation.sourceByUID(sourceUID)
 	if errGraph != nil {
 		operation.fail("", http.StatusConflict, fmt.Errorf("cannot verify credential dependencies: %w", errGraph))
 		return
 	}
-	source, ambiguous := graph.SourceByUID(sourceUID)
 	if ambiguous || source == nil || !coreauth.ChatGPTWebAuthRetainedForDependents(source) {
 		return
 	}
-	dependents, dependentAmbiguous := graph.DependentsForSource(source)
+	dependents, dependentAmbiguous, errDependents := operation.dependentsForSource(source)
+	if errDependents != nil {
+		operation.fail("", http.StatusConflict, fmt.Errorf("cannot verify credential dependencies: %w", errDependents))
+		return
+	}
 	if dependentAmbiguous || len(dependents) != 0 {
 		return
 	}
@@ -432,6 +491,20 @@ func (operation *authDependencyDeleteContext) dependencyGraph() (*coreauth.ChatG
 	if operation.dependencyErr != nil {
 		return nil, operation.dependencyErr
 	}
+	if operation.dependencyIndexed && (operation.cachedGraph == nil || operation.dependencyDirty) {
+		graph, complete := operation.h.authManager.ChatGPTWebDependencyIndexSnapshot()
+		if complete {
+			operation.cachedGraph = graph
+			operation.dependencyDirty = false
+			return graph, nil
+		}
+		operation.dependencyIndexed = false
+		operation.dependencyLoaded = false
+		operation.loadDependencySnapshot()
+		if operation.dependencyErr != nil {
+			return nil, operation.dependencyErr
+		}
+	}
 	if operation.cachedGraph == nil || operation.dependencyDirty {
 		auths := make([]*coreauth.Auth, 0, len(operation.dependencyByID))
 		for _, auth := range operation.dependencyByID {
@@ -443,15 +516,60 @@ func (operation *authDependencyDeleteContext) dependencyGraph() (*coreauth.ChatG
 	return operation.cachedGraph, nil
 }
 
+func (operation *authDependencyDeleteContext) sourceByUID(uid string) (*coreauth.Auth, bool, error) {
+	if operation != nil && operation.h != nil && operation.h.authManager != nil {
+		source, ambiguous, complete := operation.h.authManager.ChatGPTWebSourceByCredentialUID(uid)
+		if complete {
+			return source, ambiguous, nil
+		}
+	}
+	graph, errGraph := operation.dependencyGraph()
+	if errGraph != nil {
+		return nil, false, errGraph
+	}
+	source, ambiguous := graph.SourceByUID(uid)
+	return source, ambiguous, nil
+}
+
+func (operation *authDependencyDeleteContext) dependentsForSource(source *coreauth.Auth) ([]*coreauth.Auth, bool, error) {
+	if operation != nil && operation.h != nil && operation.h.authManager != nil {
+		dependents, ambiguous, complete := operation.h.authManager.ChatGPTWebDependentsForSource(source)
+		if complete {
+			return dependents, ambiguous, nil
+		}
+	}
+	graph, errGraph := operation.dependencyGraph()
+	if errGraph != nil {
+		return nil, false, errGraph
+	}
+	dependents, ambiguous := graph.DependentsForSource(source)
+	return dependents, ambiguous, nil
+}
+
 func (operation *authDependencyDeleteContext) loadDependencySnapshot() {
 	operation.dependencyLoaded = true
+	operation.dependencyIndexed = false
+	operation.cachedGraph = nil
+	operation.dependencyErr = nil
 	operation.dependencyByID = make(map[string]*coreauth.Auth)
 	operation.dependencyNameIDs = make(map[string]string)
 	operation.indexRuntimeAuths()
 	if operation.h.authManager != nil {
+		if graph, complete := operation.h.authManager.ChatGPTWebDependencyIndexSnapshot(); complete {
+			operation.cachedGraph = graph
+			operation.dependencyIndexed = true
+			operation.dependencyDirty = false
+			return
+		}
 		auths, errList := operation.h.authManager.PersistedAuthSnapshot(operation.ctx)
 		if errList != nil {
 			operation.dependencyErr = errList
+			return
+		}
+		if graph, complete := operation.h.authManager.ChatGPTWebDependencyIndexSnapshot(); complete {
+			operation.cachedGraph = graph
+			operation.dependencyIndexed = true
+			operation.dependencyDirty = false
 			return
 		}
 		for _, auth := range auths {
@@ -459,7 +577,7 @@ func (operation *authDependencyDeleteContext) loadDependencySnapshot() {
 				operation.addDependencyAuth(auth, true)
 			}
 		}
-		for _, auth := range operation.runtimeByID {
+		for _, auth := range operation.h.authManager.List() {
 			if auth == nil || strings.TrimSpace(auth.ID) == "" {
 				continue
 			}
@@ -678,13 +796,20 @@ func (h *Handler) managedAuthForNameAtRoot(root *os.Root, lexicalAuthDir, authDi
 		return nil
 	}
 	if h.authManager != nil {
-		for _, auth := range h.authManager.List() {
-			if auth == nil || isRuntimeOnlyAuth(auth) {
-				continue
+		_, displayName, errResolve := resolveManagedAuthFilePathAtRoot(root, authDir, name)
+		if errResolve == nil {
+			if actualName, errActual := actualManagedAuthFileNameAtRoot(root, displayName); errActual == nil {
+				displayName = actualName
 			}
-			managedName, managed := managedAuthBackingFileNameAtRoot(root, lexicalAuthDir, authDir, auth)
-			if managed && managedAuthNameEqual(managedName, name) {
-				return auth
+			targetPath := filepath.Join(authDir, filepath.FromSlash(displayName))
+			for _, auth := range h.authManager.AuthsForBackingPath(targetPath) {
+				if auth == nil || isRuntimeOnlyAuth(auth) {
+					continue
+				}
+				managedName, managed := managedAuthBackingFileNameAtRoot(root, lexicalAuthDir, authDir, auth)
+				if managed && managedAuthNameEqual(managedName, name) {
+					return auth
+				}
 			}
 		}
 	}

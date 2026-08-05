@@ -2411,9 +2411,6 @@ func (s *Service) handleAuthUpdate(ctx context.Context, update watcher.AuthUpdat
 			executorhelps.CloseProxyTransportCachesForAuth(id)
 			s.cleanupChatGPTWebModelResourcesAfterDelete(ctx, id, current.RuntimeInstanceID())
 			s.removeUsageStatisticsForAuthIndexes(indexes, "auth delete")
-			if s.reconcileUsageStatistics("auth delete") > 0 {
-				s.persistUsageStatistics("auth-delete-reconcile")
-			}
 			return
 		}
 		candidate, ok := s.authMaintenanceCandidateForID(id, strings.TrimSpace(cfg.AuthDir), "file_removed")
@@ -2429,9 +2426,6 @@ func (s *Service) handleAuthUpdate(ctx context.Context, update watcher.AuthUpdat
 			}
 		}
 		s.removeUsageStatisticsForAuthIndexes(indexes, "auth delete")
-		if s.reconcileUsageStatistics("auth delete") > 0 {
-			s.persistUsageStatistics("auth-delete-reconcile")
-		}
 	default:
 		log.Debugf("received unknown auth update action: %v", update.Action)
 	}

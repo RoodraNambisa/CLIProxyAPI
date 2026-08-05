@@ -2343,6 +2343,27 @@ func (m *Manager) rebuildAPIKeyModelAliasLocked(cfg *internalconfig.Config) {
 	m.apiKeyModelAlias.Store(out)
 }
 
+func (m *Manager) removeAPIKeyModelAliasForAuthLocked(auth *Auth) {
+	if m == nil || auth == nil || strings.TrimSpace(auth.ID) == "" {
+		return
+	}
+	kind, _ := auth.AccountInfo()
+	if !strings.EqualFold(strings.TrimSpace(kind), "api_key") {
+		return
+	}
+	current, _ := m.apiKeyModelAlias.Load().(apiKeyModelAliasTable)
+	if len(current) == 0 {
+		return
+	}
+	next := make(apiKeyModelAliasTable, len(current))
+	for id, aliases := range current {
+		if id != auth.ID {
+			next[id] = aliases
+		}
+	}
+	m.apiKeyModelAlias.Store(next)
+}
+
 func compileAPIKeyModelAliasForModels[T interface {
 	GetName() string
 	GetAlias() string
@@ -2969,7 +2990,6 @@ func (m *Manager) handleRetiredAuth(ctx context.Context, auth, expected *Auth) (
 	if removed != nil {
 		m.cleanupRemovedAuthRuntimeStateAfterQuarantine(auth.ID)
 	}
-	m.rebuildAPIKeyModelAliasFromRuntimeConfig()
 	result := auth.Clone()
 	unlockPersist()
 	if removed != nil {
@@ -3433,7 +3453,6 @@ func (m *Manager) deleteIf(ctx context.Context, id string, predicate func(*Auth)
 	}
 
 	m.cleanupRemovedAuthRuntimeStateAfterQuarantine(id)
-	m.rebuildAPIKeyModelAliasFromRuntimeConfig()
 	unlockPersist()
 	unlockDependency()
 	dependencyLocked = false
@@ -3521,7 +3540,6 @@ func (m *Manager) deleteWithOperation(ctx context.Context, id string, operation 
 		}
 		if removed {
 			m.cleanupRemovedAuthRuntimeStateAfterQuarantine(id)
-			m.rebuildAPIKeyModelAliasFromRuntimeConfig()
 		}
 		unlockPersist()
 		unlockDependency()
@@ -3552,7 +3570,6 @@ func (m *Manager) deleteWithOperation(ctx context.Context, id string, operation 
 	}
 	if removed {
 		m.cleanupRemovedAuthRuntimeStateAfterQuarantine(id)
-		m.rebuildAPIKeyModelAliasFromRuntimeConfig()
 	}
 	unlockPersist()
 	unlockDependency()

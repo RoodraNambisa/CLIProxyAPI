@@ -724,7 +724,6 @@ func (m *Manager) DeleteIfCurrentSourceHash(ctx context.Context, expected *Auth)
 	}
 	if removedRuntime {
 		m.cleanupRemovedAuthRuntimeStateAfterQuarantine(expected.ID)
-		m.rebuildAPIKeyModelAliasFromRuntimeConfig()
 	}
 	unlockPersist()
 	unlockDependency()
@@ -999,7 +998,6 @@ func (m *Manager) deleteRetainedCodexSourceIfOrphan(ctx context.Context, sourceI
 	m.mu.Unlock()
 	if removed {
 		m.cleanupRemovedAuthRuntimeStateAfterQuarantine(sourceID)
-		m.rebuildAPIKeyModelAliasFromRuntimeConfig()
 	}
 	unlockPersist()
 	unlockDependency()

@@ -243,7 +243,7 @@ func TestDeleteAuthFileCascadeRemovesCodexSourceAndAllLinkedWebCredentials(t *te
 	}
 }
 
-func TestDeleteAuthFilesWithDependenciesLoadsPersistedSnapshotOncePerBatch(t *testing.T) {
+func TestDeleteAuthFilesWithDependenciesUsesCompleteIndexWithoutPersistedSnapshot(t *testing.T) {
 	h, manager, _, store := newCountingChatGPTWebDependencyManagementHandler(t)
 	source := registerChatGPTWebDependencyManagementAuth(t, manager, managementDependencyCodexAuth("codex-source.json", "uid-a", false))
 	webs := make([]*coreauth.Auth, 0, 9)
@@ -269,8 +269,8 @@ func TestDeleteAuthFilesWithDependenciesLoadsPersistedSnapshotOncePerBatch(t *te
 	if response.Code != http.StatusOK {
 		t.Fatalf("batch delete status = %d, body=%s", response.Code, response.Body.String())
 	}
-	if got := store.listCalls.Load(); got != 1 {
-		t.Fatalf("persisted auth snapshot loads = %d, want 1", got)
+	if got := store.listCalls.Load(); got != 0 {
+		t.Fatalf("persisted auth snapshot loads = %d, want 0", got)
 	}
 	if _, ok := manager.GetByID(source.ID); !ok {
 		t.Fatal("retained source was removed while one dependent remained")

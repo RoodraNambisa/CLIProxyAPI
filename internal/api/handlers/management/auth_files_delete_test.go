@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -12,6 +13,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -90,6 +92,16 @@ type logicalIDDeleteStore struct {
 	expectedID string
 	gotID      string
 	source     []byte
+}
+
+type largeDeleteCountingStore struct {
+	*memoryAuthStore
+	listCalls atomic.Int64
+}
+
+func (store *largeDeleteCountingStore) List(ctx context.Context) ([]*coreauth.Auth, error) {
+	store.listCalls.Add(1)
+	return store.memoryAuthStore.List(ctx)
 }
 
 func (s *conditionalDeletePathStore) SetBaseDir(baseDir string) {
@@ -1199,6 +1211,7 @@ func TestDeleteAuthFile_RemovesFileNameOnlyRuntimeAuth(t *testing.T) {
 		t.Fatalf("write auth file: %v", errWrite)
 	}
 	manager := coreauth.NewManager(nil, nil, nil)
+	manager.SetConfig(&config.Config{AuthDir: authDir})
 	if _, errRegister := manager.Register(t.Context(), &coreauth.Auth{
 		ID:       "custom-filename-only",
 		FileName: fileName,
@@ -1224,6 +1237,130 @@ func TestDeleteAuthFile_RemovesFileNameOnlyRuntimeAuth(t *testing.T) {
 	current, exists := manager.GetByID("custom-filename-only")
 	if exists || current != nil {
 		t.Fatalf("FileName-only auth remained after delete: %#v", current)
+	}
+}
+
+func TestDeleteAuthFileRemovesAllRuntimeAuthsSharingBackingPath(t *testing.T) {
+	authDir := t.TempDir()
+	const fileName = "shared-runtime.json"
+	filePath := filepath.Join(authDir, fileName)
+	if errWrite := os.WriteFile(filePath, []byte(`{"type":"claude"}`), 0o600); errWrite != nil {
+		t.Fatal(errWrite)
+	}
+	manager := coreauth.NewManager(nil, nil, nil)
+	manager.SetConfig(&config.Config{AuthDir: authDir})
+	storeItems := make(map[string]*coreauth.Auth, 2)
+	for _, id := range []string{"shared-first", "shared-second"} {
+		auth := &coreauth.Auth{
+			ID:         id,
+			FileName:   fileName,
+			Provider:   "claude",
+			Status:     coreauth.StatusActive,
+			Attributes: map[string]string{"path": filePath},
+			Metadata:   map[string]any{"type": "claude"},
+		}
+		if _, errRegister := manager.Register(coreauth.WithSkipPersist(t.Context()), auth); errRegister != nil {
+			t.Fatal(errRegister)
+		}
+		storeItems[id] = auth.Clone()
+	}
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, manager)
+	h.tokenStore = &memoryAuthStore{items: storeItems}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		if errShutdown := h.Shutdown(ctx); errShutdown != nil {
+			t.Errorf("shutdown management handler: %v", errShutdown)
+		}
+	})
+	if indexed := manager.AuthsForBackingPath(filePath); len(indexed) != 2 {
+		t.Fatalf("shared path index = %#v, want two auths", indexed)
+	} else if !authBackedByManagedPath(indexed[1], filePath, authDir) {
+		t.Fatalf("shared auth path was not recognized: %#v", indexed[1])
+	}
+
+	recorder := httptest.NewRecorder()
+	requestContext, _ := gin.CreateTestContext(recorder)
+	requestContext.Request = httptest.NewRequest(http.MethodDelete, "/v0/management/auth-files?name="+url.QueryEscape(fileName), nil)
+	h.DeleteAuthFile(requestContext)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("delete status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
+	}
+	for _, id := range []string{"shared-first", "shared-second"} {
+		if auth, exists := manager.GetByID(id); exists || auth != nil {
+			t.Fatalf("shared runtime auth %s remained: %#v", id, auth)
+		}
+	}
+}
+
+func TestDeleteOrdinaryAuthUsesPathIndexWithTenThousandCredentials(t *testing.T) {
+	authDir := t.TempDir()
+	const targetIndex = 4321
+	items := make(map[string]*coreauth.Auth, 10_000)
+	for index := 0; index < 10_000; index++ {
+		name := fmt.Sprintf("auth-%05d.json", index)
+		items[name] = &coreauth.Auth{
+			ID:         name,
+			FileName:   name,
+			Provider:   "claude",
+			Status:     coreauth.StatusActive,
+			Attributes: map[string]string{"path": filepath.Join(authDir, name)},
+			Metadata:   map[string]any{"type": "claude"},
+		}
+	}
+	store := &largeDeleteCountingStore{memoryAuthStore: &memoryAuthStore{items: items}}
+	manager := coreauth.NewManager(store, nil, nil)
+	manager.SetConfig(&config.Config{AuthDir: authDir})
+	if errLoad := manager.Load(t.Context()); errLoad != nil {
+		t.Fatal(errLoad)
+	}
+	store.listCalls.Store(0)
+
+	targetName := fmt.Sprintf("auth-%05d.json", targetIndex)
+	targetPath := filepath.Join(authDir, targetName)
+	if errWrite := os.WriteFile(targetPath, []byte(`{"type":"claude"}`), 0o600); errWrite != nil {
+		t.Fatal(errWrite)
+	}
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, manager)
+	h.tokenStore = store
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		if errShutdown := h.Shutdown(ctx); errShutdown != nil {
+			t.Errorf("shutdown management handler: %v", errShutdown)
+		}
+	})
+
+	root, lexicalAuthDir, resolvedAuthDir, errRoot := h.openManagedAuthRootSnapshot()
+	if errRoot != nil {
+		t.Fatal(errRoot)
+	}
+	allocations := testing.AllocsPerRun(5, func() {
+		auth := h.managedAuthForNameAtRoot(root, lexicalAuthDir, resolvedAuthDir, targetName)
+		if auth == nil || auth.ID != targetName {
+			t.Fatalf("indexed auth = %#v", auth)
+		}
+	})
+	closeManagedAuthRoot(root)
+	if allocations >= 1_000 {
+		t.Fatalf("indexed lookup allocations = %.0f, want < 1000", allocations)
+	}
+
+	recorder := httptest.NewRecorder()
+	requestContext, _ := gin.CreateTestContext(recorder)
+	requestContext.Request = httptest.NewRequest(http.MethodDelete, "/v0/management/auth-files?name="+url.QueryEscape(targetName), nil)
+	h.DeleteAuthFile(requestContext)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("delete status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
+	}
+	if got := store.listCalls.Load(); got != 0 {
+		t.Fatalf("store List calls after initial load = %d, want 0", got)
+	}
+	if _, exists := manager.GetByID(targetName); exists {
+		t.Fatal("deleted target remained in runtime")
+	}
+	if _, errStat := os.Stat(targetPath); !os.IsNotExist(errStat) {
+		t.Fatalf("target file remained: %v", errStat)
 	}
 }
 

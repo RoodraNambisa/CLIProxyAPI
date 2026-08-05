@@ -66,6 +66,54 @@ func TestLookupAPIKeyUpstreamModel(t *testing.T) {
 	}
 }
 
+func TestDeleteUpdatesAPIKeyModelAliasIncrementally(t *testing.T) {
+	cfg := &internalconfig.Config{
+		GeminiKey: []internalconfig.GeminiKey{{
+			APIKey: "api-key",
+			Models: []internalconfig.GeminiModel{{Name: "gemini-upstream", Alias: "gemini-alias"}},
+		}},
+	}
+	manager := NewManager(nil, nil, nil)
+	manager.SetConfig(cfg)
+	if _, errRegister := manager.Register(WithSkipPersist(t.Context()), &Auth{
+		ID: "api-key-auth", Provider: "gemini", Attributes: map[string]string{"api_key": "api-key"},
+	}); errRegister != nil {
+		t.Fatal(errRegister)
+	}
+	if _, errRegister := manager.Register(WithSkipPersist(t.Context()), &Auth{
+		ID: "oauth-auth", Provider: "claude", Metadata: map[string]any{"email": "oauth@example.com"},
+	}); errRegister != nil {
+		t.Fatal(errRegister)
+	}
+
+	table, _ := manager.apiKeyModelAlias.Load().(apiKeyModelAliasTable)
+	withSentinel := make(apiKeyModelAliasTable, len(table)+1)
+	for id, aliases := range table {
+		withSentinel[id] = aliases
+	}
+	withSentinel["sentinel"] = map[string]string{"sentinel": "sentinel"}
+	manager.apiKeyModelAlias.Store(withSentinel)
+
+	if errDelete := manager.Delete(WithSkipPersist(t.Context()), "oauth-auth"); errDelete != nil {
+		t.Fatal(errDelete)
+	}
+	afterOAuth, _ := manager.apiKeyModelAlias.Load().(apiKeyModelAliasTable)
+	if afterOAuth["sentinel"] == nil || afterOAuth["api-key-auth"] == nil {
+		t.Fatalf("non-API-key deletion rebuilt aliases: %#v", afterOAuth)
+	}
+
+	if errDelete := manager.Delete(WithSkipPersist(t.Context()), "api-key-auth"); errDelete != nil {
+		t.Fatal(errDelete)
+	}
+	afterAPIKey, _ := manager.apiKeyModelAlias.Load().(apiKeyModelAliasTable)
+	if afterAPIKey["sentinel"] == nil {
+		t.Fatalf("API-key deletion rebuilt the full alias table: %#v", afterAPIKey)
+	}
+	if _, exists := afterAPIKey["api-key-auth"]; exists {
+		t.Fatalf("deleted API-key alias remained: %#v", afterAPIKey)
+	}
+}
+
 func TestLookupAPIKeyUpstreamModelInteractionsKey(t *testing.T) {
 	cfg := &internalconfig.Config{
 		InteractionsKey: []internalconfig.GeminiKey{
