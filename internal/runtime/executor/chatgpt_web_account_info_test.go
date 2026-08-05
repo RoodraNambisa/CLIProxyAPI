@@ -2703,7 +2703,7 @@ func TestChatGPTWebAccountInfoConfigExpansionDrainsPendingTrigger(t *testing.T) 
 		states:          make(map[string]chatgptwebauth.AccountInfoAuthRuntimeState),
 		inflight:        make(map[string]int),
 		inflightForce:   make(map[string]int),
-		pendingTriggers: map[string]chatGPTWebAccountInfoTriggerMode{authID: chatGPTWebAccountInfoTriggerForce},
+		pendingTriggers: make(map[string]chatGPTWebAccountInfoTriggerMode),
 		workers:         map[int]chan struct{}{1: make(chan struct{})},
 		retiringWorkers: make(map[int]struct{}),
 		scheduled:       make(map[string]*chatGPTWebAccountInfoSchedule),
@@ -2714,6 +2714,7 @@ func TestChatGPTWebAccountInfoConfigExpansionDrainsPendingTrigger(t *testing.T) 
 		now:             time.Now,
 	}
 	runtime.cond = sync.NewCond(&runtime.mu)
+	runtime.setPendingTriggerLocked(authID, chatGPTWebAccountInfoTriggerForce)
 
 	runtime.updateConfig(&config.Config{ChatGPTWeb: config.ChatGPTWebConfig{
 		AccountInfo: config.ChatGPTWebAccountInfoConfig{
@@ -2730,6 +2731,54 @@ func TestChatGPTWebAccountInfoConfigExpansionDrainsPendingTrigger(t *testing.T) 
 	}
 	if len(runtime.pendingTriggers) != 0 {
 		t.Fatalf("drained trigger remained pending: %+v", runtime.pendingTriggers)
+	}
+}
+
+func TestChatGPTWebAccountInfoPendingDrainOnlyVisitsReadyTargets(t *testing.T) {
+	const targetCount = 10_000
+	runtime := &chatGPTWebAccountInfoRuntime{
+		cfg: config.ResolvedChatGPTWebAccountInfoConfig{
+			RefreshWorkers:   1,
+			RefreshQueueSize: targetCount,
+		},
+		states:               make(map[string]chatgptwebauth.AccountInfoAuthRuntimeState),
+		inflight:             make(map[string]int),
+		inflightForce:        make(map[string]int),
+		pendingTriggers:      make(map[string]chatGPTWebAccountInfoTriggerMode),
+		pendingTriggerQueued: make(map[string]struct{}),
+		scheduled:            make(map[string]*chatGPTWebAccountInfoSchedule),
+		wake:                 make(chan struct{}, 1),
+		now:                  time.Now,
+	}
+	runtime.cond = sync.NewCond(&runtime.mu)
+
+	for index := 0; index < targetCount; index++ {
+		authID := fmt.Sprintf("pending-%05d", index)
+		runtime.inflight[authID] = 1
+		runtime.setPendingTriggerLocked(authID, chatGPTWebAccountInfoTriggerForce)
+	}
+	if len(runtime.pendingTriggerQueue) != 0 {
+		t.Fatalf("in-flight pending targets entered ready queue: %d", len(runtime.pendingTriggerQueue))
+	}
+
+	const readyID = "pending-05000"
+	delete(runtime.inflight, readyID)
+	runtime.markPendingTriggerReadyLocked(readyID)
+	runtime.drainPendingTriggersLocked()
+
+	queued := runtime.queuedWorkLocked()
+	if len(queued) != 1 || queued[0].target.AuthID != readyID || !queued[0].force {
+		t.Fatalf("ready pending work = %+v, want forced %q", queued, readyID)
+	}
+	if len(runtime.pendingTriggers) != targetCount-1 {
+		t.Fatalf("remaining pending triggers = %d, want %d", len(runtime.pendingTriggers), targetCount-1)
+	}
+	if len(runtime.pendingTriggerQueue) != 0 || len(runtime.pendingTriggerQueued) != 0 {
+		t.Fatalf(
+			"ready queue after targeted drain = queue:%d index:%d",
+			len(runtime.pendingTriggerQueue),
+			len(runtime.pendingTriggerQueued),
+		)
 	}
 }
 

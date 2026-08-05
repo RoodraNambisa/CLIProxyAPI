@@ -288,6 +288,9 @@ type chatGPTWebAccountInfoRuntime struct {
 	inflightTask               map[string]int
 	inflightRecovery           map[string]time.Time
 	pendingTriggers            map[string]chatGPTWebAccountInfoTriggerMode
+	pendingTriggerQueue        []string
+	pendingTriggerQueueHead    int
+	pendingTriggerQueued       map[string]struct{}
 	ambiguousImageRecheckAfter map[string]time.Time
 	periodicNextAt             time.Time
 	periodicGeneration         uint64
@@ -344,6 +347,7 @@ func newChatGPTWebAccountInfoRuntime(executor *ChatGPTWebExecutor, cfg *config.C
 		inflightTask:               make(map[string]int),
 		inflightRecovery:           make(map[string]time.Time),
 		pendingTriggers:            make(map[string]chatGPTWebAccountInfoTriggerMode),
+		pendingTriggerQueued:       make(map[string]struct{}),
 		ambiguousImageRecheckAfter: make(map[string]time.Time),
 		authInstances:              make(map[string]string),
 		runtimeKeysByAuth:          make(map[string]map[string]struct{}),
@@ -1103,7 +1107,7 @@ func (runtime *chatGPTWebAccountInfoRuntime) disableAutomaticRefreshLocked() {
 		}
 		runtime.releaseWorkEpochLocked(entry.work)
 	}
-	clear(runtime.pendingTriggers)
+	runtime.clearPendingTriggersLocked()
 	clear(runtime.ambiguousImageRecheckAfter)
 	runtime.removePeriodicSchedulesLocked()
 	runtime.periodicNextAt = time.Time{}
@@ -1197,7 +1201,7 @@ func (runtime *chatGPTWebAccountInfoRuntime) close() {
 	clear(runtime.inflightForce)
 	clear(runtime.inflightTask)
 	clear(runtime.inflightRecovery)
-	clear(runtime.pendingTriggers)
+	runtime.clearPendingTriggersLocked()
 	clear(runtime.ambiguousImageRecheckAfter)
 	clear(runtime.authInstances)
 	clear(runtime.runtimeKeysByAuth)
@@ -1358,11 +1362,10 @@ func (runtime *chatGPTWebAccountInfoRuntime) completeAccountInfoWorkLocked(
 		if work.taskID != "" && pendingMode > work.independentTrigger {
 			work.independentTrigger = pendingMode
 		}
-		delete(runtime.pendingTriggers, runtimeKey)
+		runtime.deletePendingTriggerLocked(runtimeKey)
 	}
 	runtime.finishWorkLocked(work, outcome)
 	runtime.enqueuePendingTriggerForTargetLocked(work.target)
-	runtime.drainPendingTriggersLocked()
 	runtime.cond.Broadcast()
 }
 
@@ -3201,7 +3204,7 @@ func (runtime *chatGPTWebAccountInfoRuntime) removeAuthInstance(authID, authInst
 				call.cancel()
 			}
 		}
-		delete(runtime.pendingTriggers, runtimeKey)
+		runtime.deletePendingTriggerLocked(runtimeKey)
 		delete(runtime.ambiguousImageRecheckAfter, runtimeKey)
 		delete(runtime.inflight, runtimeKey)
 		delete(runtime.inflightForce, runtimeKey)
@@ -3779,7 +3782,7 @@ func (runtime *chatGPTWebAccountInfoRuntime) triggerTargetLocked(
 ) bool {
 	runtimeKey := chatGPTWebAccountInfoTargetKey(target)
 	if mode != chatGPTWebAccountInfoTriggerForce && !runtime.cfg.AutomaticRefreshEnabled() {
-		delete(runtime.pendingTriggers, runtimeKey)
+		runtime.deletePendingTriggerLocked(runtimeKey)
 		return false
 	}
 	if runtime.pendingTriggers == nil {
@@ -3794,8 +3797,8 @@ func (runtime *chatGPTWebAccountInfoRuntime) triggerTargetLocked(
 	if runtime.inflight[runtimeKey] > 0 {
 		needsPending := runtime.inflightTask[runtimeKey] > 0 ||
 			(mode.forced() && runtime.inflightForce[runtimeKey] == 0)
-		if needsPending && mode > runtime.pendingTriggers[runtimeKey] {
-			runtime.pendingTriggers[runtimeKey] = mode
+		if needsPending {
+			runtime.setPendingTriggerLocked(runtimeKey, mode)
 		}
 		return true
 	}
@@ -3889,15 +3892,10 @@ func (runtime *chatGPTWebAccountInfoRuntime) retainIndependentTriggerLocked(
 		return
 	}
 	if mode != chatGPTWebAccountInfoTriggerForce && !runtime.cfg.AutomaticRefreshEnabled() {
-		delete(runtime.pendingTriggers, runtimeKey)
+		runtime.deletePendingTriggerLocked(runtimeKey)
 		return
 	}
-	if runtime.pendingTriggers == nil {
-		runtime.pendingTriggers = make(map[string]chatGPTWebAccountInfoTriggerMode)
-	}
-	if mode > runtime.pendingTriggers[runtimeKey] {
-		runtime.pendingTriggers[runtimeKey] = mode
-	}
+	runtime.setPendingTriggerLocked(runtimeKey, mode)
 }
 
 func (runtime *chatGPTWebAccountInfoRuntime) promoteAccountInfoScheduleLocked(
@@ -3924,20 +3922,20 @@ func (runtime *chatGPTWebAccountInfoRuntime) enqueuePendingTriggerForTargetLocke
 	target chatgptwebauth.AccountInfoRefreshTarget,
 ) {
 	runtimeKey := chatGPTWebAccountInfoTargetKey(target)
-	mode := runtime.pendingTriggers[runtimeKey]
-	if runtimeKey == "" || runtime.inflight[runtimeKey] > 0 ||
-		mode == chatGPTWebAccountInfoTriggerNone {
-		return
-	}
-	if runtime.triggerTargetLocked(target, mode) {
-		delete(runtime.pendingTriggers, runtimeKey)
-	}
+	runtime.markPendingTriggerReadyLocked(runtimeKey)
+	runtime.drainPendingTriggersLocked()
 }
 
 func (runtime *chatGPTWebAccountInfoRuntime) drainPendingTriggersLocked() {
-	for runtimeKey, mode := range runtime.pendingTriggers {
-		if runtimeKey == "" || mode == chatGPTWebAccountInfoTriggerNone ||
-			runtime.inflight[runtimeKey] > 0 {
+	for runtime.pendingTriggerQueueHead < len(runtime.pendingTriggerQueue) {
+		runtimeKey := runtime.pendingTriggerQueue[runtime.pendingTriggerQueueHead]
+		mode := runtime.pendingTriggers[runtimeKey]
+		if runtimeKey == "" || mode == chatGPTWebAccountInfoTriggerNone {
+			runtime.advancePendingTriggerQueueLocked()
+			continue
+		}
+		if runtime.inflight[runtimeKey] > 0 {
+			runtime.advancePendingTriggerQueueLocked()
 			continue
 		}
 		authID, authInstanceID, _ := strings.Cut(runtimeKey, "\x00")
@@ -3947,13 +3945,97 @@ func (runtime *chatGPTWebAccountInfoRuntime) drainPendingTriggersLocked() {
 			AuthInstanceID: authInstanceID,
 		})
 		if !current {
-			delete(runtime.pendingTriggers, runtimeKey)
+			runtime.deletePendingTriggerLocked(runtimeKey)
+			runtime.advancePendingTriggerQueueLocked()
 			continue
 		}
 		if runtime.triggerTargetLocked(target, mode) {
-			delete(runtime.pendingTriggers, runtimeKey)
+			runtime.deletePendingTriggerLocked(runtimeKey)
+			runtime.advancePendingTriggerQueueLocked()
+			continue
 		}
+		if runtime.pendingTriggers[runtimeKey] == chatGPTWebAccountInfoTriggerNone {
+			runtime.advancePendingTriggerQueueLocked()
+			continue
+		}
+		break
 	}
+}
+
+func (runtime *chatGPTWebAccountInfoRuntime) setPendingTriggerLocked(
+	runtimeKey string,
+	mode chatGPTWebAccountInfoTriggerMode,
+) {
+	runtimeKey = strings.TrimSpace(runtimeKey)
+	if runtimeKey == "" || mode == chatGPTWebAccountInfoTriggerNone {
+		return
+	}
+	if runtime.pendingTriggers == nil {
+		runtime.pendingTriggers = make(map[string]chatGPTWebAccountInfoTriggerMode)
+	}
+	if mode > runtime.pendingTriggers[runtimeKey] {
+		runtime.pendingTriggers[runtimeKey] = mode
+	}
+	runtime.markPendingTriggerReadyLocked(runtimeKey)
+}
+
+func (runtime *chatGPTWebAccountInfoRuntime) deletePendingTriggerLocked(runtimeKey string) {
+	if runtime == nil || runtimeKey == "" {
+		return
+	}
+	delete(runtime.pendingTriggers, runtimeKey)
+}
+
+func (runtime *chatGPTWebAccountInfoRuntime) markPendingTriggerReadyLocked(runtimeKey string) {
+	if runtime == nil || runtimeKey == "" ||
+		runtime.pendingTriggers[runtimeKey] == chatGPTWebAccountInfoTriggerNone ||
+		runtime.inflight[runtimeKey] > 0 {
+		return
+	}
+	if runtime.pendingTriggerQueued == nil {
+		runtime.pendingTriggerQueued = make(map[string]struct{})
+	}
+	if _, exists := runtime.pendingTriggerQueued[runtimeKey]; exists {
+		return
+	}
+	runtime.pendingTriggerQueued[runtimeKey] = struct{}{}
+	runtime.pendingTriggerQueue = append(runtime.pendingTriggerQueue, runtimeKey)
+}
+
+func (runtime *chatGPTWebAccountInfoRuntime) advancePendingTriggerQueueLocked() {
+	if runtime == nil || runtime.pendingTriggerQueueHead >= len(runtime.pendingTriggerQueue) {
+		return
+	}
+	runtimeKey := runtime.pendingTriggerQueue[runtime.pendingTriggerQueueHead]
+	delete(runtime.pendingTriggerQueued, runtimeKey)
+	runtime.pendingTriggerQueue[runtime.pendingTriggerQueueHead] = ""
+	runtime.pendingTriggerQueueHead++
+	if runtime.pendingTriggerQueueHead == len(runtime.pendingTriggerQueue) {
+		runtime.pendingTriggerQueue = nil
+		runtime.pendingTriggerQueueHead = 0
+		return
+	}
+	if runtime.pendingTriggerQueueHead >= 1024 &&
+		runtime.pendingTriggerQueueHead*2 >= len(runtime.pendingTriggerQueue) {
+		remaining := copy(
+			runtime.pendingTriggerQueue,
+			runtime.pendingTriggerQueue[runtime.pendingTriggerQueueHead:],
+		)
+		clear(runtime.pendingTriggerQueue[remaining:])
+		runtime.pendingTriggerQueue = runtime.pendingTriggerQueue[:remaining]
+		runtime.pendingTriggerQueueHead = 0
+	}
+}
+
+func (runtime *chatGPTWebAccountInfoRuntime) clearPendingTriggersLocked() {
+	if runtime == nil {
+		return
+	}
+	clear(runtime.pendingTriggers)
+	clear(runtime.pendingTriggerQueue)
+	runtime.pendingTriggerQueue = nil
+	runtime.pendingTriggerQueueHead = 0
+	clear(runtime.pendingTriggerQueued)
 }
 
 // AccountInfoSnapshot returns bounded refresh runtime state.
