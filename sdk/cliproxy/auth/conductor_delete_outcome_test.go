@@ -296,3 +296,31 @@ func TestDeleteHandlesStoreDeleteOutcomes(t *testing.T) {
 		})
 	}
 }
+
+func TestManagerDeleteInvalidatesPersistedIndexOnStaleRollback(t *testing.T) {
+	store := &deleteOutcomeStore{
+		deleteErr: NewDeleteOutcomeError(DeleteOutcomeRolledBack, authfileguard.ErrPersistGenerationStale),
+	}
+	manager := NewManager(store, nil, nil)
+	if errLoad := manager.Load(t.Context()); errLoad != nil {
+		t.Fatal(errLoad)
+	}
+	const authID = "stale-delete-auth.json"
+	if _, errRegister := manager.Register(t.Context(), &Auth{
+		ID:       authID,
+		FileName: authID,
+		Provider: "chatgpt-web",
+		Metadata: map[string]any{"type": "chatgpt-web", "email": "stale@example.com"},
+	}); errRegister != nil {
+		t.Fatal(errRegister)
+	}
+	if _, complete := manager.PersistedAuthByID(authID); !complete {
+		t.Fatal("persisted index is incomplete before delete")
+	}
+	if errDelete := manager.Delete(t.Context(), authID); !errors.Is(errDelete, authfileguard.ErrPersistGenerationStale) {
+		t.Fatalf("Delete() error = %v, want stale generation", errDelete)
+	}
+	if _, complete := manager.PersistedAuthByID(authID); complete {
+		t.Fatal("persisted index remained complete after stale delete rollback")
+	}
+}

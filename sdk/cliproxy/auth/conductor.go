@@ -403,8 +403,12 @@ type Manager struct {
 	persistedAuthsByID         map[string]*Auth
 	chatGPTWebIdentityComplete bool
 	authIndexRevision          uint64
-	storeRevision              uint64
-	scheduler                  *authScheduler
+	// persistedAuthRevision changes only when the authoritative store view is
+	// mutated or invalidated. Runtime-only status updates must not force an
+	// expensive full-store refresh of the ChatGPT Web identity index.
+	persistedAuthRevision uint64
+	storeRevision         uint64
+	scheduler             *authScheduler
 	// executorLifecycleMu serializes registry changes with executor shutdown.
 	executorLifecycleMu sync.Mutex
 	executorCloseCond   *sync.Cond
@@ -2686,6 +2690,9 @@ func (m *Manager) register(ctx context.Context, auth *Auth, requireAbsent bool) 
 				unlockPersist()
 				return nil, ErrChatGPTWebEmailAlreadyExists
 			}
+			m.mu.RLock()
+			identityIndexComplete = m.chatGPTWebIdentityComplete
+			m.mu.RUnlock()
 		}
 		if requireAbsent && identityIndexComplete {
 			ctx = authfileguard.WithManagerValidatedChatGPTWebIdentity(ctx)
@@ -2838,7 +2845,11 @@ func (m *Manager) chatGPTWebCredentialConflictLocked(authID string, auth *Auth) 
 		}
 	}
 	for id := range candidateIDs {
-		if candidate := m.auths[id]; candidate != nil && ChatGPTWebCredentialIdentityConflict(candidate, auth) {
+		candidate := m.auths[id]
+		if candidate == nil {
+			candidate = m.persistedAuthsByID[id]
+		}
+		if candidate != nil && ChatGPTWebCredentialIdentityConflict(candidate, auth) {
 			return true
 		}
 	}
@@ -2849,7 +2860,7 @@ func (m *Manager) chatGPTWebStoredCredentialConflict(ctx context.Context, authID
 	if m == nil || m.store == nil || auth == nil {
 		return false, nil
 	}
-	auths, errList := m.store.List(ctx)
+	auths, errList := m.PersistedAuthSnapshot(ctx)
 	if errList != nil {
 		return false, errList
 	}
@@ -3397,6 +3408,12 @@ func quotaStateEmpty(state QuotaState) bool {
 		state.StrikeCount == 0
 }
 
+func persistedAuthIndexConflict(err error) bool {
+	return errors.Is(err, ErrAuthAlreadyExists) ||
+		errors.Is(err, ErrChatGPTWebEmailAlreadyExists) ||
+		errors.Is(err, authfileguard.ErrPersistGenerationStale)
+}
+
 // Delete removes an auth entry from runtime state and optionally from the backing store.
 func (m *Manager) Delete(ctx context.Context, id string) error {
 	_, err := m.deleteIf(ctx, id, nil)
@@ -3476,6 +3493,9 @@ func (m *Manager) deleteIf(ctx context.Context, id string, predicate func(*Auth)
 		if deleteErr != nil {
 			outcome, explicitOutcome := DeleteOutcomeFromError(deleteErr)
 			if !explicitOutcome || outcome == DeleteOutcomeRolledBack {
+				if persistedAuthIndexConflict(deleteErr) {
+					m.MarkChatGPTWebDependencyIndexDirty()
+				}
 				unlockPersist()
 				return false, deleteErr
 			}
@@ -3492,14 +3512,6 @@ func (m *Manager) deleteIf(ctx context.Context, id string, predicate func(*Auth)
 	if current, ok := m.auths[id]; ok && current == deletedRuntime {
 		m.beginAuthInstanceCleanupLocked(id)
 		m.removeAuthLocked(id)
-		if shouldPersistDelete {
-			if deleteErr == nil {
-				m.removePersistedAuthIndexLocked(id)
-			} else {
-				m.dependencyIndexComplete = false
-				m.chatGPTWebIdentityComplete = false
-			}
-		}
 		if !shouldPersistDelete && authRelevantToChatGPTWebDependencyIndex(deleted) {
 			m.dependencyIndexComplete = false
 		}
@@ -3507,6 +3519,13 @@ func (m *Manager) deleteIf(ctx context.Context, id string, predicate func(*Auth)
 			m.chatGPTWebIdentityComplete = false
 		}
 		removed = true
+	}
+	if shouldPersistDelete {
+		if deleteErr == nil {
+			m.recordPersistedAuthDeleteLocked(id)
+		} else {
+			m.markChatGPTWebDependencyIndexDirtyLocked()
+		}
 	}
 	m.mu.Unlock()
 	if !removed {
@@ -3592,14 +3611,31 @@ func (m *Manager) deleteWithOperation(ctx context.Context, id string, operation 
 			m.mu.Unlock()
 		}
 		removed := false
+		m.mu.Lock()
 		if (outcome != DeleteOutcomeRolledBack || !restoreOnRollback) && deleted != nil {
-			m.mu.Lock()
 			if m.auths[id] == current {
 				m.removeAuthLocked(id)
 				removed = true
 			}
-			m.mu.Unlock()
 		}
+		switch outcome {
+		case DeleteOutcomeCommitted:
+			m.recordPersistedAuthDeleteLocked(id)
+		case DeleteOutcomeUncertain:
+			m.markChatGPTWebDependencyIndexDirtyLocked()
+		case DeleteOutcomeRolledBack:
+			if persistedAuthIndexConflict(errOperation) {
+				m.markChatGPTWebDependencyIndexDirtyLocked()
+			} else if !restoreOnRollback && deleted != nil {
+				if authRelevantToChatGPTWebDependencyIndex(deleted) {
+					m.dependencyIndexComplete = false
+				}
+				if strings.EqualFold(strings.TrimSpace(deleted.Provider), "chatgpt-web") {
+					m.chatGPTWebIdentityComplete = false
+				}
+			}
+		}
+		m.mu.Unlock()
 		if removed {
 			m.cleanupRemovedAuthRuntimeStateAfterQuarantine(id)
 		}
@@ -3622,14 +3658,15 @@ func (m *Manager) deleteWithOperation(ctx context.Context, id string, operation 
 	}
 
 	removed := false
+	m.mu.Lock()
 	if deleted != nil {
-		m.mu.Lock()
 		if m.auths[id] == current {
 			m.removeAuthLocked(id)
 			removed = true
 		}
-		m.mu.Unlock()
 	}
+	m.recordPersistedAuthDeleteLocked(id)
+	m.mu.Unlock()
 	if removed {
 		m.cleanupRemovedAuthRuntimeStateAfterQuarantine(id)
 	}
@@ -8842,9 +8879,13 @@ func (m *Manager) persistWithoutLock(ctx context.Context, auth *Auth, syncCurren
 	}
 	_, err := m.store.Save(authfileguard.WithManagerOwnedPersistence(ctx), auth)
 	if err != nil {
-		if outcome, explicit := SaveOutcomeFromError(err); explicit && outcome == SaveOutcomeCommitted {
+		outcome, explicit := SaveOutcomeFromError(err)
+		if explicit && outcome == SaveOutcomeCommitted {
 			log.WithField("auth_id", auth.ID).Warn("auth save committed with cleanup warning")
 		} else {
+			if !explicit || outcome == SaveOutcomeUncertain || persistedAuthIndexConflict(err) {
+				m.MarkChatGPTWebDependencyIndexDirty()
+			}
 			return err
 		}
 	}
@@ -8874,11 +8915,16 @@ func (m *Manager) persistNewWithoutLock(ctx context.Context, auth *Auth) error {
 			m.recordPersistedAuthSave(auth)
 			return nil
 		}
+		if outcome == SaveOutcomeUncertain || persistedAuthIndexConflict(err) {
+			m.MarkChatGPTWebDependencyIndexDirty()
+		}
 		return err
 	}
 	if errors.Is(err, ErrAuthAlreadyExists) {
+		m.MarkChatGPTWebDependencyIndexDirty()
 		return NewSaveOutcomeError(SaveOutcomeRolledBack, err)
 	}
+	m.MarkChatGPTWebDependencyIndexDirty()
 	return NewSaveOutcomeError(SaveOutcomeUncertain, err)
 }
 

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	chatgptwebauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/chatgptweb"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/authfileguard"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -385,18 +386,22 @@ func TestManagerUpdateRejectsWhitespaceID(t *testing.T) {
 type registerIfAbsentTestStore struct {
 	saveIfAbsentErr error
 	saveCalls       atomic.Int32
+	listCalls       atomic.Int32
+	validatedSave   atomic.Bool
 	listAuths       []*Auth
 	listErr         error
 }
 
 func (s *registerIfAbsentTestStore) List(context.Context) ([]*Auth, error) {
+	s.listCalls.Add(1)
 	return s.listAuths, s.listErr
 }
 
 func (*registerIfAbsentTestStore) Save(context.Context, *Auth) (string, error) { return "", nil }
 
-func (s *registerIfAbsentTestStore) SaveIfAbsent(context.Context, *Auth) (string, error) {
+func (s *registerIfAbsentTestStore) SaveIfAbsent(ctx context.Context, _ *Auth) (string, error) {
 	s.saveCalls.Add(1)
+	s.validatedSave.Store(authfileguard.ManagerValidatedChatGPTWebIdentity(ctx))
 	return "", s.saveIfAbsentErr
 }
 
@@ -739,16 +744,80 @@ func TestManagerRegisterIfAbsentRejectsPersistedDuplicateChatGPTWebEmail(t *test
 		Metadata: map[string]any{"type": "chatgpt-web", "email": "same@example.com"},
 	}}}
 	manager := NewManager(store, nil, nil)
-	_, errRegister := manager.RegisterIfAbsent(t.Context(), &Auth{
-		ID:       "chatgpt-web-deterministic.json",
-		Provider: "chatgpt-web",
-		Metadata: map[string]any{"type": "chatgpt-web", "email": "same@example.com"},
-	})
-	if !errors.Is(errRegister, ErrChatGPTWebEmailAlreadyExists) {
-		t.Fatalf("RegisterIfAbsent() error = %v, want duplicate email", errRegister)
+	for range 2 {
+		_, errRegister := manager.RegisterIfAbsent(t.Context(), &Auth{
+			ID:       "chatgpt-web-deterministic.json",
+			Provider: "chatgpt-web",
+			Metadata: map[string]any{"type": "chatgpt-web", "email": "same@example.com"},
+		})
+		if !errors.Is(errRegister, ErrChatGPTWebEmailAlreadyExists) {
+			t.Fatalf("RegisterIfAbsent() error = %v, want duplicate email", errRegister)
+		}
 	}
 	if calls := store.saveCalls.Load(); calls != 0 {
 		t.Fatalf("SaveIfAbsent() calls = %d, want 0", calls)
+	}
+	if calls := store.listCalls.Load(); calls != 1 {
+		t.Fatalf("List() calls = %d, want one shared persisted-index refresh", calls)
+	}
+}
+
+func TestManagerRegisterIfAbsentMarksCreateValidatedAfterPersistedIndexRefresh(t *testing.T) {
+	store := &registerIfAbsentTestStore{}
+	manager := NewManager(store, nil, nil)
+	installed, errRegister := manager.RegisterIfAbsent(t.Context(), &Auth{
+		ID:       "account.json",
+		Provider: "chatgpt-web",
+		Metadata: map[string]any{"type": "chatgpt-web", "email": "account@example.com"},
+	})
+	if errRegister != nil {
+		t.Fatalf("RegisterIfAbsent() error = %v", errRegister)
+	}
+	if installed == nil {
+		t.Fatal("RegisterIfAbsent() auth is nil")
+	}
+	if calls := store.listCalls.Load(); calls != 1 {
+		t.Fatalf("List() calls = %d, want one shared persisted-index refresh", calls)
+	}
+	if calls := store.saveCalls.Load(); calls != 1 {
+		t.Fatalf("SaveIfAbsent() calls = %d, want 1", calls)
+	}
+	if !store.validatedSave.Load() {
+		t.Fatal("SaveIfAbsent() did not receive the manager-validated identity marker")
+	}
+}
+
+func TestManagerRegisterIfAbsentInvalidatesPersistedIndexOnCreateConflict(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+	}{
+		{name: "auth ID conflict", err: ErrAuthAlreadyExists},
+		{name: "identity conflict", err: NewSaveOutcomeError(SaveOutcomeRolledBack, ErrChatGPTWebEmailAlreadyExists)},
+		{name: "stale generation", err: NewSaveOutcomeError(SaveOutcomeRolledBack, authfileguard.ErrPersistGenerationStale)},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store := &registerIfAbsentTestStore{saveIfAbsentErr: tt.err}
+			manager := NewManager(store, nil, nil)
+			if errLoad := manager.Load(t.Context()); errLoad != nil {
+				t.Fatal(errLoad)
+			}
+			if _, complete := manager.PersistedAuthByID("missing.json"); !complete {
+				t.Fatal("persisted index is incomplete before the create conflict")
+			}
+			_, errRegister := manager.RegisterIfAbsent(t.Context(), &Auth{
+				ID:       "account.json",
+				Provider: "chatgpt-web",
+				Metadata: map[string]any{"type": "chatgpt-web", "email": "account@example.com"},
+			})
+			if errRegister == nil {
+				t.Fatal("RegisterIfAbsent() error = nil, want create conflict")
+			}
+			if _, complete := manager.PersistedAuthByID("missing.json"); complete {
+				t.Fatal("persisted index remained complete after the create conflict")
+			}
+		})
 	}
 }
 
@@ -811,6 +880,12 @@ func TestManagerUpdateRejectsChatGPTWebEmailChange(t *testing.T) {
 func TestManagerRegisterIfAbsentMarksUnknownStoreErrorUncertain(t *testing.T) {
 	wantErr := errors.New("store result unknown")
 	manager := NewManager(&registerIfAbsentTestStore{saveIfAbsentErr: wantErr}, nil, nil)
+	if errLoad := manager.Load(t.Context()); errLoad != nil {
+		t.Fatal(errLoad)
+	}
+	if _, complete := manager.ChatGPTWebDependencyIndexSnapshot(); !complete {
+		t.Fatal("loaded persistence index is incomplete before create")
+	}
 	_, errRegister := manager.RegisterIfAbsent(t.Context(), &Auth{
 		ID:       "uncertain",
 		Provider: "chatgpt-web",
@@ -824,6 +899,9 @@ func TestManagerRegisterIfAbsentMarksUnknownStoreErrorUncertain(t *testing.T) {
 	}
 	if _, exists := manager.GetByID("uncertain"); exists {
 		t.Fatal("uncertain auth was installed")
+	}
+	if _, complete := manager.ChatGPTWebDependencyIndexSnapshot(); complete {
+		t.Fatal("uncertain create left the persistence index authoritative")
 	}
 }
 

@@ -212,6 +212,9 @@ func TestManagerDependencyReservationBlocksOrphanCleanupUntilReleased(t *testing
 	if store.has(source.ID) {
 		t.Fatal("orphaned retained source remained after reservation release")
 	}
+	if persisted, _ := manager.PersistedAuthByID(source.ID); persisted != nil {
+		t.Fatalf("persisted orphan after deletion = %#v", persisted)
+	}
 }
 
 func TestManagerDependencyReservationRenewsAndFinalizesExactLease(t *testing.T) {
@@ -284,6 +287,26 @@ func TestManagerDeleteIfCurrentSourceHashDoesNotDeleteReplacement(t *testing.T) 
 	}
 	if !store.has(target.ID) {
 		t.Fatal("conditional rollback deleted a replacement credential")
+	}
+}
+
+func TestManagerDeleteIfCurrentSourceHashRemovesPersistedSnapshotIndex(t *testing.T) {
+	auth := dependencyTestWebAuth("web", "uid-a")
+	store := newChatGPTWebDependencyTestStore(auth)
+	manager := NewManager(store, nil, nil)
+	if errLoad := manager.Load(t.Context()); errLoad != nil {
+		t.Fatal(errLoad)
+	}
+	target, ok := manager.GetByID(auth.ID)
+	if !ok || target == nil {
+		t.Fatal("loaded auth not found")
+	}
+	deleted, errDelete := manager.DeleteIfCurrentSourceHash(t.Context(), target)
+	if errDelete != nil || !deleted {
+		t.Fatalf("DeleteIfCurrentSourceHash() = %v, %v", deleted, errDelete)
+	}
+	if persisted, complete := manager.PersistedAuthByID(auth.ID); persisted != nil || !complete {
+		t.Fatalf("persisted auth after conditional delete = %#v, complete=%v", persisted, complete)
 	}
 }
 

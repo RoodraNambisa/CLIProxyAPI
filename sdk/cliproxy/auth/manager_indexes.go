@@ -108,6 +108,7 @@ func (m *Manager) recordPersistedAuthSave(auth *Auth) {
 	id := strings.TrimSpace(auth.ID)
 	m.mu.Lock()
 	m.installPersistedAuthIndexLocked(auth)
+	m.persistedAuthRevision++
 	if m.auths[id] == nil {
 		if authRelevantToChatGPTWebDependencyIndex(auth) {
 			m.addDependencyAuthIndexLocked(auth)
@@ -128,7 +129,27 @@ func (m *Manager) removePersistedAuthIndexLocked(id string) {
 	if m == nil {
 		return
 	}
-	delete(m.persistedAuthsByID, strings.TrimSpace(id))
+	id = strings.TrimSpace(id)
+	delete(m.persistedAuthsByID, id)
+}
+
+// recordPersistedAuthDeleteLocked removes one record from the authoritative
+// store view and drops persisted-only dependency indexes when no runtime record
+// remains. The caller must hold m.mu for writing.
+func (m *Manager) recordPersistedAuthDeleteLocked(id string) {
+	if m == nil {
+		return
+	}
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return
+	}
+	m.persistedAuthRevision++
+	if m.auths[id] == nil {
+		m.removePersistedDependencyAuthLocked(id)
+		return
+	}
+	m.removePersistedAuthIndexLocked(id)
 }
 
 func addIDToDependencySet(index map[string]map[string]struct{}, key, id string) {
@@ -349,11 +370,12 @@ func (m *Manager) rebuildAuthIndexesLocked(persisted []*Auth, complete bool) {
 	m.chatGPTWebIdentityIDs = make(map[string]map[string]struct{})
 	m.chatGPTWebIdentityKeysByID = make(map[string][]string)
 	m.persistedAuthsByID = make(map[string]*Auth, len(persisted))
+	m.persistedAuthRevision++
 	for _, auth := range persisted {
 		if auth == nil || strings.TrimSpace(auth.ID) == "" {
 			continue
 		}
-		m.installPersistedAuthIndexLocked(auth)
+		m.persistedAuthsByID[strings.TrimSpace(auth.ID)] = auth.Clone()
 		if authRelevantToChatGPTWebDependencyIndex(auth) {
 			m.addDependencyAuthIndexLocked(auth)
 		}
@@ -488,6 +510,16 @@ func (m *Manager) ChatGPTWebDependentsForSource(source *Auth) ([]*Auth, bool, bo
 	return dependents, false, complete
 }
 
+// markChatGPTWebDependencyIndexDirtyLocked invalidates the authoritative store
+// view after a persistence outcome becomes uncertain. The caller must hold
+// m.mu for writing.
+func (m *Manager) markChatGPTWebDependencyIndexDirtyLocked() {
+	m.dependencyIndexComplete = false
+	m.chatGPTWebIdentityComplete = false
+	m.authIndexRevision++
+	m.persistedAuthRevision++
+}
+
 // MarkChatGPTWebDependencyIndexDirty forces dependency-sensitive operations to
 // refresh from persistence before making destructive decisions.
 func (m *Manager) MarkChatGPTWebDependencyIndexDirty() {
@@ -495,9 +527,7 @@ func (m *Manager) MarkChatGPTWebDependencyIndexDirty() {
 		return
 	}
 	m.mu.Lock()
-	m.dependencyIndexComplete = false
-	m.chatGPTWebIdentityComplete = false
-	m.authIndexRevision++
+	m.markChatGPTWebDependencyIndexDirtyLocked()
 	m.mu.Unlock()
 }
 

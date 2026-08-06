@@ -538,37 +538,45 @@ func (m *Manager) PersistedAuthSnapshot(ctx context.Context) ([]*Auth, error) {
 		return nil, errLock
 	}
 	defer m.persistedSnapshotRefresh.unlock()
-	if auths, complete := m.persistedAuthIndexSnapshot(); complete {
-		return auths, nil
-	}
-	m.mu.RLock()
-	store := m.store
-	revision := m.authIndexRevision
-	storeRevision := m.storeRevision
-	m.mu.RUnlock()
-	if store == nil {
-		return nil, nil
-	}
-	persistedAuths, errList := store.List(ctx)
-	if errList != nil {
-		m.MarkChatGPTWebDependencyIndexDirty()
-		return nil, errList
-	}
-	auths := make([]*Auth, 0, len(persistedAuths))
-	for _, auth := range persistedAuths {
-		if auth != nil && strings.TrimSpace(auth.ID) != "" {
-			auths = append(auths, auth.Clone())
+	for {
+		if auths, complete := m.persistedAuthIndexSnapshot(); complete {
+			return auths, nil
+		}
+		m.mu.RLock()
+		store := m.store
+		persistedRevision := m.persistedAuthRevision
+		storeRevision := m.storeRevision
+		m.mu.RUnlock()
+		if store == nil {
+			return nil, nil
+		}
+		persistedAuths, errList := store.List(ctx)
+		if errList != nil {
+			m.MarkChatGPTWebDependencyIndexDirty()
+			return nil, errList
+		}
+		auths := make([]*Auth, 0, len(persistedAuths))
+		for _, auth := range persistedAuths {
+			if auth != nil && strings.TrimSpace(auth.ID) != "" {
+				auths = append(auths, auth.Clone())
+			}
+		}
+		m.mu.Lock()
+		stable := m.persistedAuthRevision == persistedRevision && m.storeRevision == storeRevision
+		if stable {
+			m.rebuildAuthIndexesLocked(auths, true)
+		} else {
+			m.dependencyIndexComplete = false
+			m.chatGPTWebIdentityComplete = false
+		}
+		m.mu.Unlock()
+		if stable {
+			return auths, nil
+		}
+		if errContext := ctx.Err(); errContext != nil {
+			return nil, errContext
 		}
 	}
-	m.mu.Lock()
-	if m.authIndexRevision == revision && m.storeRevision == storeRevision {
-		m.rebuildAuthIndexesLocked(auths, true)
-	} else {
-		m.dependencyIndexComplete = false
-		m.chatGPTWebIdentityComplete = false
-	}
-	m.mu.Unlock()
-	return auths, nil
 }
 
 // CompleteAuthSnapshot returns current runtime credentials plus persisted-only
@@ -726,19 +734,16 @@ func (m *Manager) DeleteIfCurrentSourceHash(ctx context.Context, expected *Auth)
 		}
 	}
 	removedRuntime := false
+	m.mu.Lock()
 	if currentRuntime != nil {
-		m.mu.Lock()
 		if m.auths[expected.ID] == currentRuntime {
 			m.beginAuthInstanceCleanupLocked(expected.ID)
 			m.removeAuthLocked(expected.ID)
 			removedRuntime = true
 		}
-		m.mu.Unlock()
-	} else {
-		m.mu.Lock()
-		m.removePersistedDependencyAuthLocked(expected.ID)
-		m.mu.Unlock()
 	}
+	m.recordPersistedAuthDeleteLocked(expected.ID)
+	m.mu.Unlock()
 	if removedRuntime {
 		m.cleanupRemovedAuthRuntimeStateAfterQuarantine(expected.ID)
 	}
@@ -1009,9 +1014,7 @@ func (m *Manager) deleteRetainedCodexSourceIfOrphan(ctx context.Context, sourceI
 		m.removeAuthLocked(sourceID)
 		removed = true
 	}
-	if currentRuntime == nil {
-		m.removePersistedDependencyAuthLocked(sourceID)
-	}
+	m.recordPersistedAuthDeleteLocked(sourceID)
 	m.mu.Unlock()
 	if removed {
 		m.cleanupRemovedAuthRuntimeStateAfterQuarantine(sourceID)
