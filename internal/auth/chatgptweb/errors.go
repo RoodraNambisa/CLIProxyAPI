@@ -132,6 +132,7 @@ func SafeLifecycleReason(value string) string {
 		"passkey_credential_not_allowed",
 		"passkey_state_persist_failed",
 		"passkey_verification_failed",
+		"invalid_passkey_response",
 		"passkey_session_invalid",
 		"browser_confirmation_required",
 		"turnstile_required",

@@ -84,6 +84,9 @@ chatgpt-web:
     refresh-account-info-after-upload: false
   # Remove credentials only after ChatGPT Web confirms the account lifecycle is dead.
   auto-delete-dead-auths: false
+  # Treat an exhausted Passkey-only recovery as permanently dead only when the
+  # access token and every other refresh or login path are already unavailable.
+  invalid-passkey-response-as-dead: false
   # Empty matches every priority; otherwise only exact integer priorities are removed.
   auto-delete-dead-priorities: []
   # The initial background login is followed by at most this many retries.

@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -32,6 +33,36 @@ chatgpt-web:
 		if cfg.ChatGPTWeb.AutoDeleteDeadPriorities[index] != want[index] {
 			t.Fatalf("AutoDeleteDeadPriorities = %v, want %v", cfg.ChatGPTWeb.AutoDeleteDeadPriorities, want)
 		}
+	}
+}
+
+func TestLoadConfigChatGPTWebInvalidPasskeyResponseAsDead(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte("chatgpt-web:\n  invalid-passkey-response-as-dead: true\n"), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	cfg, err := LoadConfig(path)
+	if err != nil {
+		t.Fatalf("LoadConfig() error = %v", err)
+	}
+	if !cfg.ChatGPTWeb.InvalidPasskeyResponseAsDead {
+		t.Fatal("InvalidPasskeyResponseAsDead = false, want true")
+	}
+}
+
+func TestLoadConfigRejectsInvalidPasskeyResponseAsDeadNullOrWrongType(t *testing.T) {
+	for _, value := range []string{"null", `"true"`, "1"} {
+		t.Run(value, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.yaml")
+			raw := []byte("chatgpt-web:\n  invalid-passkey-response-as-dead: " + value + "\n")
+			if err := os.WriteFile(path, raw, 0o600); err != nil {
+				t.Fatalf("write config: %v", err)
+			}
+			_, err := LoadConfig(path)
+			if err == nil || !strings.Contains(err.Error(), "invalid-passkey-response-as-dead") {
+				t.Fatalf("LoadConfig() error = %v", err)
+			}
+		})
 	}
 }
 

@@ -526,6 +526,8 @@ type ChatGPTWebConfig struct {
 	Import ChatGPTWebImportConfig `yaml:"import,omitempty" json:"import,omitempty"`
 	// AutoDeleteDeadAuths removes credentials whose lifecycle is permanently dead.
 	AutoDeleteDeadAuths bool `yaml:"auto-delete-dead-auths" json:"auto-delete-dead-auths"`
+	// InvalidPasskeyResponseAsDead allows exhausted Passkey-only recovery to mark the credential dead.
+	InvalidPasskeyResponseAsDead bool `yaml:"invalid-passkey-response-as-dead" json:"invalid-passkey-response-as-dead"`
 	// AutoDeleteDeadPriorities limits dead credential deletion to these priorities.
 	// An empty list matches every priority.
 	AutoDeleteDeadPriorities []int `yaml:"auto-delete-dead-priorities,omitempty" json:"auto-delete-dead-priorities,omitempty"`
@@ -1922,6 +1924,9 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	defaultImagesNAggregation := false
 	cfg.Images.EnableNAggregation = &defaultImagesNAggregation
 	cfg.Images.UnsupportedStatusCode = http.StatusBadRequest
+	if lifecycleErr := validateChatGPTWebLifecycleOptionsYAML(data); lifecycleErr != nil {
+		return nil, fmt.Errorf("failed to parse config file: %w", lifecycleErr)
+	}
 	if err = yaml.Unmarshal(data, &cfg); err != nil {
 		if optional {
 			if accountInfoErr := validateChatGPTWebAccountInfoYAML(data); accountInfoErr != nil {
@@ -2158,6 +2163,36 @@ func validateChatGPTWebAccountInfoYAML(data []byte) error {
 		return err
 	}
 	return accountInfo.Validate()
+}
+
+func validateChatGPTWebLifecycleOptionsYAML(data []byte) error {
+	var document yaml.Node
+	if err := yaml.Unmarshal(data, &document); err != nil {
+		return nil
+	}
+	var envelope struct {
+		ChatGPTWeb yaml.Node `yaml:"chatgpt-web"`
+	}
+	if err := document.Decode(&envelope); err != nil {
+		return nil
+	}
+	if envelope.ChatGPTWeb.Kind != yaml.MappingNode && envelope.ChatGPTWeb.Kind != yaml.AliasNode {
+		return nil
+	}
+	var section struct {
+		InvalidPasskeyResponseAsDead yaml.Node `yaml:"invalid-passkey-response-as-dead"`
+	}
+	if err := envelope.ChatGPTWeb.Decode(&section); err != nil || section.InvalidPasskeyResponseAsDead.Kind == 0 {
+		return nil
+	}
+	if section.InvalidPasskeyResponseAsDead.Tag == "!!null" {
+		return fmt.Errorf("chatgpt-web.invalid-passkey-response-as-dead must not be null")
+	}
+	var enabled bool
+	if err := section.InvalidPasskeyResponseAsDead.Decode(&enabled); err != nil {
+		return fmt.Errorf("chatgpt-web.invalid-passkey-response-as-dead must be a boolean: %w", err)
+	}
+	return nil
 }
 
 func validateChatGPTWebSentinelYAML(data []byte) error {

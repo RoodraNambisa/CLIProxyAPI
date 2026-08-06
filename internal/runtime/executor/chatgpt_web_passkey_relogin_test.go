@@ -8,7 +8,9 @@ import (
 	"crypto/x509"
 	"encoding/base64"
 	"errors"
+	"net/http"
 	"testing"
+	"time"
 
 	chatgptwebauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/chatgptweb"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
@@ -169,6 +171,149 @@ func TestChatGPTWebExecutorTokenOnlyPasskeySchedulesAutomaticRelogin(t *testing.
 	}
 	if state := updated.LifecycleState(); state != cliproxyauth.LifecycleStateReloginPending {
 		t.Fatalf("lifecycle = %q, want %q", state, cliproxyauth.LifecycleStateReloginPending)
+	}
+}
+
+func TestChatGPTWebExecutorPromotesExhaustedInvalidPasskeyResponseToDead(t *testing.T) {
+	manager := cliproxyauth.NewManager(nil, nil, nil)
+	auth := chatGPTWebPasskeyOnlyReloginAuth(t, "invalid-passkey-dead")
+	auth.Unavailable = true
+	auth.NextRetryAfter = time.Now().Add(30 * 24 * time.Hour)
+	auth.CooldownScope = "auth"
+	auth.ModelStates = map[string]*cliproxyauth.ModelState{
+		"gpt-5": {
+			Status:         cliproxyauth.StatusError,
+			Unavailable:    true,
+			NextRetryAfter: time.Now().Add(30 * 24 * time.Hour),
+			LastError:      &cliproxyauth.Error{Code: "unauthorized", HTTPStatus: http.StatusUnauthorized, Message: "unauthorized"},
+		},
+	}
+	registered, errRegister := manager.Register(cliproxyauth.WithSkipPersist(t.Context()), auth)
+	if errRegister != nil {
+		t.Fatal(errRegister)
+	}
+	fake := &fakeChatGPTWebAuthService{loginFn: invalidPasskeyResponseLogin}
+	executor := NewChatGPTWebExecutor(&config.Config{ChatGPTWeb: config.ChatGPTWebConfig{
+		InvalidPasskeyResponseAsDead: true,
+	}}, manager)
+	executor.authService = fake
+	t.Cleanup(func() { _ = executor.Close() })
+
+	installed, current, errRelogin := executor.ReloginCurrent(t.Context(), registered)
+	if errRelogin == nil || !current || installed == nil {
+		t.Fatalf("ReloginCurrent() = (%v, %v, %v)", installed, current, errRelogin)
+	}
+	if installed.LifecycleState() != cliproxyauth.LifecycleStateDead || chatGPTWebLifecycleReason(installed) != "invalid_passkey_response" {
+		t.Fatalf("installed lifecycle = %q/%q", installed.LifecycleState(), chatGPTWebLifecycleReason(installed))
+	}
+	if installed.Unavailable || !installed.NextRetryAfter.IsZero() || installed.CooldownScope != "" {
+		t.Fatalf("auth cooldown was not cleared: unavailable=%v next=%v scope=%q", installed.Unavailable, installed.NextRetryAfter, installed.CooldownScope)
+	}
+	if state := installed.ModelStates["gpt-5"]; state == nil || state.Unavailable || !state.NextRetryAfter.IsZero() || state.LastError != nil {
+		t.Fatalf("model cooldown was not cleared: %#v", state)
+	}
+	authError, ok := chatgptwebauth.AsAuthError(errRelogin)
+	if !ok || authError.State != chatgptwebauth.LifecycleDead {
+		t.Fatalf("re-login error = %#v", errRelogin)
+	}
+}
+
+func TestChatGPTWebExecutorInvalidPasskeyResponseDeadGuards(t *testing.T) {
+	tests := []struct {
+		name       string
+		configure  func(*config.ChatGPTWebConfig)
+		mutateAuth func(*cliproxyauth.Auth, *chatgptwebauth.Credential)
+		mutateErr  func(*chatgptwebauth.AuthError)
+		proxy      chatgptwebauth.LoginProxyConfig
+	}{
+		{name: "disabled", configure: func(cfg *config.ChatGPTWebConfig) { cfg.InvalidPasskeyResponseAsDead = false }},
+		{name: "password remains", mutateAuth: func(_ *cliproxyauth.Auth, credential *chatgptwebauth.Credential) { credential.Password = "recoverable" }},
+		{name: "totp remains", mutateAuth: func(_ *cliproxyauth.Auth, credential *chatgptwebauth.Credential) {
+			credential.TOTPSecret = "recoverable"
+		}},
+		{name: "linked source remains", mutateAuth: func(_ *cliproxyauth.Auth, credential *chatgptwebauth.Credential) {
+			credential.SourceAuthID = "codex-source"
+			credential.SourceCredentialUID = "uid"
+		}},
+		{name: "network failure", mutateErr: func(authError *chatgptwebauth.AuthError) {
+			authError.Status = http.StatusServiceUnavailable
+			authError.StatusCode = http.StatusServiceUnavailable
+			authError.DiagnosticCode = ""
+			authError.Retryable = true
+			authError.Terminal = false
+		}},
+		{name: "flow attempts remain", proxy: chatgptwebauth.LoginProxyConfig{Enabled: true, FlowAttempts: 2}},
+		{name: "active lifecycle", mutateAuth: func(auth *cliproxyauth.Auth, _ *chatgptwebauth.Credential) {
+			auth.Metadata["lifecycle_state"] = cliproxyauth.LifecycleStateActive
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := config.ChatGPTWebConfig{InvalidPasskeyResponseAsDead: true}
+			if test.configure != nil {
+				test.configure(&cfg)
+			}
+			executor := NewChatGPTWebExecutor(&config.Config{ChatGPTWeb: cfg}, nil)
+			t.Cleanup(func() { _ = executor.Close() })
+			auth := chatGPTWebPasskeyOnlyReloginAuth(t, "guard-"+test.name)
+			credential, errCredential := chatgptwebauth.ParseCredential(auth.Metadata)
+			if errCredential != nil {
+				t.Fatal(errCredential)
+			}
+			if test.mutateAuth != nil {
+				test.mutateAuth(auth, credential)
+			}
+			authError := invalidPasskeyResponseError()
+			if test.mutateErr != nil {
+				test.mutateErr(authError)
+			}
+			promoted, promotedErr := executor.promoteExhaustedInvalidPasskeyResponse(auth, credential, authError, test.proxy)
+			if promoted.LifecycleState == chatgptwebauth.LifecycleDead {
+				t.Fatalf("guard promoted credential to dead: %#v / %v", promoted, promotedErr)
+			}
+		})
+	}
+}
+
+func chatGPTWebPasskeyOnlyReloginAuth(t *testing.T, id string) *cliproxyauth.Auth {
+	t.Helper()
+	auth := chatGPTWebPasskeyTestAuth(t, id, 0)
+	credential, errCredential := chatgptwebauth.ParseCredential(auth.Metadata)
+	if errCredential != nil {
+		t.Fatal(errCredential)
+	}
+	credential.Password = ""
+	credential.TOTPSecret = ""
+	credential.RefreshToken = ""
+	credential.RefreshStrategy = chatgptwebauth.RefreshStrategyTokenOnly
+	credential.Cookies = nil
+	credential.SessionToken = ""
+	credential.LifecycleState = chatgptwebauth.LifecycleReloginPending
+	credential.LifecycleReason = "token_only_expired"
+	credential.ApplyToMetadata(auth.Metadata)
+	auth.Status = cliproxyauth.StatusPending
+	return auth
+}
+
+func invalidPasskeyResponseLogin(_ context.Context, input chatgptwebauth.LoginInput) (*chatgptwebauth.Credential, error) {
+	credential := cloneChatGPTWebCredential(input.Credential)
+	credential.LifecycleState = chatgptwebauth.LifecycleReauthRequired
+	credential.LifecycleReason = "passkey_verification_failed"
+	return credential, invalidPasskeyResponseError()
+}
+
+func invalidPasskeyResponseError() *chatgptwebauth.AuthError {
+	return &chatgptwebauth.AuthError{
+		Code:           "passkey_verification_failed",
+		DiagnosticCode: "invalid_passkey_response",
+		State:          chatgptwebauth.LifecycleReauthRequired,
+		LifecycleState: chatgptwebauth.LifecycleReauthRequired,
+		Status:         http.StatusBadRequest,
+		StatusCode:     http.StatusBadRequest,
+		FailureStage:   "passkey_verify",
+		Attempts:       1,
+		Message:        "Passkey credential was rejected",
+		Terminal:       true,
 	}
 }
 
