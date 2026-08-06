@@ -88,14 +88,67 @@ type Handler struct {
 	dependencyReconcileHook func(context.Context, string) ([]string, error)
 	deadAuthDeleteCount     func() uint64
 	proxyPoolManager        *proxypool.Manager
+	runtimeConfigApplier    func(context.Context, *config.Config) (config.RuntimeApplyResult, error)
 	chatGPTWebTasks         *chatGPTWebLoginTaskManager
 	chatGPTWebMutationTasks *chatGPTWebMutationTaskManager
 	agentIdentityTasks      *codexAgentIdentityTaskManager
 	agentIdentityBaseURL    string
+	configMutationMu        managementContextMutex
 	chatGPTWebDependencyMu  managementContextMutex
 	cleanupCancel           context.CancelFunc
 	cleanupWG               sync.WaitGroup
 	cleanupStopOnce         sync.Once
+}
+
+// ConfigMutationMiddleware serializes management writes that replace runtime
+// configuration. Operational mutations such as auth imports, deletes and
+// refresh tasks intentionally remain outside this transaction.
+func (h *Handler) ConfigMutationMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if h == nil || !isManagementConfigMutation(c.Request.Method, c.FullPath()) {
+			c.Next()
+			return
+		}
+		unlock, errLock := h.configMutationMu.lock(c.Request.Context())
+		if errLock != nil {
+			c.AbortWithStatusJSON(http.StatusRequestTimeout, gin.H{"error": "configuration update canceled"})
+			return
+		}
+		defer unlock()
+		c.Next()
+	}
+}
+
+func isManagementConfigMutation(method, fullPath string) bool {
+	const marker = "/v0/management"
+	if index := strings.Index(fullPath, marker); index >= 0 {
+		fullPath = fullPath[index+len(marker):]
+	}
+	switch method {
+	case http.MethodPut, http.MethodPatch:
+		switch fullPath {
+		case "/auth-files/codex/plan-type-refresh", "/auth-files/status", "/auth-files/fields":
+			return false
+		default:
+			return true
+		}
+	case http.MethodPost:
+		return fullPath == "/proxy-pools"
+	case http.MethodDelete:
+		if fullPath == "/usage/prices" || strings.HasPrefix(fullPath, "/usage/prices/") {
+			return true
+		}
+		switch fullPath {
+		case "/proxy-url", "/api-keys", "/api-key-groups", "/gemini-api-key",
+			"/interactions-api-key", "/claude-api-key", "/codex-api-key",
+			"/openai-compatibility", "/vertex-api-key", "/oauth-excluded-models",
+			"/oauth-model-alias":
+			return true
+		}
+		return strings.HasPrefix(fullPath, "/proxy-pools/")
+	default:
+		return false
+	}
 }
 
 // NewHandler creates a new management handler instance.
@@ -229,28 +282,43 @@ func NewHandlerWithoutConfigFilePath(cfg *config.Config, manager *coreauth.Manag
 }
 
 // SetConfig updates the in-memory config reference when the server hot-reloads.
-func (h *Handler) SetConfig(cfg *config.Config) {
+func (h *Handler) SetConfig(cfg *config.Config) error {
 	if h == nil {
-		return
+		return nil
+	}
+	snapshot, errClone := config.Clone(cfg)
+	if errClone != nil {
+		return errClone
 	}
 	h.mu.Lock()
 	if h.proxyPoolManager != nil {
-		if errProxyConfig := h.proxyPoolManager.UpdateConfig(cfg); errProxyConfig != nil {
-			log.WithError(errProxyConfig).Error("failed to update proxy pool runtime configuration")
+		if errProxyConfig := h.proxyPoolManager.UpdateConfig(snapshot); errProxyConfig != nil {
 			h.mu.Unlock()
-			return
+			return errProxyConfig
 		}
 	}
-	h.cfg = cfg
+	h.cfg = snapshot
 	mutationTasks := h.chatGPTWebMutationTasks
 	workers := config.DefaultChatGPTWebImportWorkers
-	if cfg != nil {
-		workers = cfg.ChatGPTWeb.Import.Resolved().Workers
+	if snapshot != nil {
+		workers = snapshot.ChatGPTWeb.Import.Resolved().Workers
 	}
 	h.mu.Unlock()
 	if mutationTasks != nil {
 		mutationTasks.updateWorkerLimit(workers)
 	}
+	return nil
+}
+
+// SetRuntimeConfigApplier registers the service-owned runtime configuration
+// transaction. The callback is always invoked without the handler mutex held.
+func (h *Handler) SetRuntimeConfigApplier(apply func(context.Context, *config.Config) (config.RuntimeApplyResult, error)) {
+	if h == nil {
+		return
+	}
+	h.mu.Lock()
+	h.runtimeConfigApplier = apply
+	h.mu.Unlock()
 }
 
 // SetAuthManager updates the auth manager reference used by management endpoints.
@@ -499,21 +567,68 @@ func (h *Handler) persistLocked(c *gin.Context) bool {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to save config: %v", err)})
 		return false
 	}
-	if h.proxyPoolManager != nil {
-		if errProxyConfig := h.proxyPoolManager.UpdateConfig(h.cfg); errProxyConfig != nil {
-			errRollbackFile := h.restorePersistedConfigLocked(previousBody, previousExisted, previousCfg)
-			errRollbackRuntime := h.proxyPoolManager.UpdateConfig(previousCfg)
-			if errRollbackFile != nil || errRollbackRuntime != nil {
-				log.WithError(errors.Join(errProxyConfig, errRollbackFile, errRollbackRuntime)).Error("proxy pool runtime update failed and rollback was incomplete")
-				c.JSON(http.StatusInternalServerError, gin.H{"error": "proxy pool runtime update failed and rollback was incomplete"})
-				return false
-			}
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update proxy pool runtime configuration"})
+	candidate, errCandidate := config.Clone(h.cfg)
+	if errCandidate != nil {
+		_ = h.restorePersistedConfigLocked(previousBody, previousExisted, previousCfg)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to snapshot runtime configuration"})
+		return false
+	}
+
+	// Runtime application can rebuild executors, logging and background workers.
+	// Release the handler lock before invoking it to preserve the global lock order.
+	h.mu.Unlock()
+	result, errApply := h.applyRuntimeConfig(c.Request.Context(), candidate)
+	h.mu.Lock()
+	if errApply != nil {
+		errRollbackFile := h.restorePersistedConfigLocked(previousBody, previousExisted, previousCfg)
+		h.mu.Unlock()
+		var errRollbackRuntime error
+		if previousCfg != nil {
+			_, errRollbackRuntime = h.applyRuntimeConfig(context.WithoutCancel(c.Request.Context()), previousCfg)
+		}
+		h.mu.Lock()
+		if errRollbackFile != nil || errRollbackRuntime != nil {
+			log.WithError(errors.Join(errApply, errRollbackFile, errRollbackRuntime)).Error("runtime configuration update failed and rollback was incomplete")
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "runtime configuration update failed and rollback was incomplete"})
 			return false
 		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "runtime_update_failed", "message": errApply.Error()})
+		return false
 	}
-	c.JSON(http.StatusOK, gin.H{"status": "ok"})
+	response := gin.H{"status": "ok", "applied": result.Applied}
+	if result.RestartRequired {
+		response["restart_required"] = true
+		response["restart_fields"] = result.RestartFields
+	}
+	c.JSON(http.StatusOK, response)
 	return true
+}
+
+func (h *Handler) applyRuntimeConfig(ctx context.Context, candidate *config.Config) (config.RuntimeApplyResult, error) {
+	if h == nil || candidate == nil {
+		return config.RuntimeApplyResult{}, errors.New("runtime configuration is unavailable")
+	}
+	h.mu.Lock()
+	applier := h.runtimeConfigApplier
+	proxyPoolManager := h.proxyPoolManager
+	authManager := h.authManager
+	mutationTasks := h.chatGPTWebMutationTasks
+	h.mu.Unlock()
+	if applier != nil {
+		return applier(ctx, candidate)
+	}
+	if proxyPoolManager != nil {
+		if errProxyConfig := proxyPoolManager.UpdateConfig(candidate); errProxyConfig != nil {
+			return config.RuntimeApplyResult{}, errProxyConfig
+		}
+	}
+	if authManager != nil {
+		authManager.SetConfig(candidate)
+	}
+	if mutationTasks != nil {
+		mutationTasks.updateWorkerLimit(candidate.ChatGPTWeb.Import.Resolved().Workers)
+	}
+	return config.RuntimeApplyResult{Applied: true}, nil
 }
 
 func (h *Handler) restorePersistedConfigLocked(previousBody []byte, previousExisted bool, previousCfg *config.Config) error {

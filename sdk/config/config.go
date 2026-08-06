@@ -13,6 +13,7 @@ type ProxyPoolEntryConfig = internalconfig.ProxyPoolEntryConfig
 type ProxyRuleConfig = internalconfig.ProxyRuleConfig
 
 type Config = internalconfig.Config
+type RuntimeApplyResult = internalconfig.RuntimeApplyResult
 
 type StreamingConfig = internalconfig.StreamingConfig
 type ImagesConfig = internalconfig.ImagesConfig
@@ -64,6 +65,8 @@ func LoadConfig(configFile string) (*Config, error) { return internalconfig.Load
 func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	return internalconfig.LoadConfigOptional(configFile, optional)
 }
+
+func Clone(input *Config) (*Config, error) { return internalconfig.Clone(input) }
 
 func SaveConfigPreserveComments(configFile string, cfg *Config) error {
 	return internalconfig.SaveConfigPreserveComments(configFile, cfg)

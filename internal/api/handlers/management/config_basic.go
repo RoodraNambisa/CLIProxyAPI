@@ -1,6 +1,7 @@
 package management
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -172,7 +173,12 @@ func (h *Handler) PutConfigYAML(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "read_failed", "message": "failed to read current config"})
 		return
 	}
-	previousCfg := h.cfg
+	previousCfg, errPreviousConfig := config.LoadConfigOptional(h.configFilePath, true)
+	if errPreviousConfig != nil {
+		h.mu.Unlock()
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "read_failed", "message": "failed to load current config"})
+		return
+	}
 	if WriteConfig(h.configFilePath, body) != nil {
 		h.mu.Unlock()
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "write_failed", "message": "failed to write config"})
@@ -191,30 +197,31 @@ func (h *Handler) PutConfigYAML(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "reload_failed", "message": err.Error()})
 		return
 	}
-	proxyPoolManager := h.proxyPoolManager
-	if proxyPoolManager != nil {
-		if errProxyConfig := proxyPoolManager.UpdateConfig(newCfg); errProxyConfig != nil {
-			errRollbackFile := h.rollbackConfigYAMLLocked(previousBody, previousExisted, previousCfg)
-			errRollbackRuntime := proxyPoolManager.UpdateConfig(previousCfg)
-			if errRollbackFile != nil || errRollbackRuntime != nil {
-				log.WithError(errors.Join(errProxyConfig, errRollbackFile, errRollbackRuntime)).Error("config upload runtime update failed and rollback was incomplete")
-				h.mu.Unlock()
-				c.JSON(http.StatusInternalServerError, gin.H{"error": "rollback_failed", "message": "proxy pool runtime update failed and rollback was incomplete"})
-				return
-			}
-			h.mu.Unlock()
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "runtime_update_failed", "message": "failed to update proxy pool runtime"})
+	h.cfg = newCfg
+	h.mu.Unlock()
+	result, errApply := h.applyRuntimeConfig(c.Request.Context(), newCfg)
+	if errApply != nil {
+		h.mu.Lock()
+		errRollbackFile := h.rollbackConfigYAMLLocked(previousBody, previousExisted, previousCfg)
+		h.mu.Unlock()
+		var errRollbackRuntime error
+		if previousCfg != nil {
+			_, errRollbackRuntime = h.applyRuntimeConfig(context.WithoutCancel(c.Request.Context()), previousCfg)
+		}
+		if errRollbackFile != nil || errRollbackRuntime != nil {
+			log.WithError(errors.Join(errApply, errRollbackFile, errRollbackRuntime)).Error("config upload runtime update failed and rollback was incomplete")
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "rollback_failed", "message": "runtime update failed and rollback was incomplete"})
 			return
 		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "runtime_update_failed", "message": errApply.Error()})
+		return
 	}
-	h.cfg = newCfg
-	mutationTasks := h.chatGPTWebMutationTasks
-	workers := newCfg.ChatGPTWeb.Import.Resolved().Workers
-	h.mu.Unlock()
-	if mutationTasks != nil {
-		mutationTasks.updateWorkerLimit(workers)
+	response := gin.H{"ok": true, "changed": []string{"config"}, "applied": result.Applied}
+	if result.RestartRequired {
+		response["restart_required"] = true
+		response["restart_fields"] = result.RestartFields
 	}
-	c.JSON(http.StatusOK, gin.H{"ok": true, "changed": []string{"config"}})
+	c.JSON(http.StatusOK, response)
 }
 
 func (h *Handler) rollbackConfigYAMLLocked(previousBody []byte, previousExisted bool, previousCfg *config.Config) error {

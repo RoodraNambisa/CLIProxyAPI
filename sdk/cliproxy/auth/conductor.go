@@ -8120,6 +8120,17 @@ func (m *Manager) List() []*Auth {
 	return list
 }
 
+// Count returns the number of runtime credentials without cloning them.
+func (m *Manager) Count() int {
+	if m == nil {
+		return 0
+	}
+	m.mu.RLock()
+	count := len(m.auths)
+	m.mu.RUnlock()
+	return count
+}
+
 // ListMetadataSummaries returns lightweight runtime auth snapshots containing
 // only the requested metadata keys. It is intended for management indexes that
 // must inspect every credential without cloning tokens, cookies, or model maps.

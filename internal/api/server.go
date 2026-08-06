@@ -56,6 +56,7 @@ type serverOptionConfig struct {
 	dependencyReconcile  func(context.Context, string) ([]string, error)
 	deadAuthDeleteCount  func() uint64
 	proxyPoolManager     *proxypool.Manager
+	runtimeConfigApply   func(context.Context, *config.Config) (config.RuntimeApplyResult, error)
 }
 
 // ServerOption customises HTTP server construction.
@@ -153,6 +154,14 @@ func WithChatGPTWebDeadAuthDeleteCountProvider(provider func() uint64) ServerOpt
 func WithProxyPoolManager(manager *proxypool.Manager) ServerOption {
 	return func(cfg *serverOptionConfig) {
 		cfg.proxyPoolManager = manager
+	}
+}
+
+// WithRuntimeConfigApply registers the service-owned runtime configuration
+// transaction used by both management writes and file-watcher reloads.
+func WithRuntimeConfigApply(apply func(context.Context, *config.Config) (config.RuntimeApplyResult, error)) ServerOption {
+	return func(cfg *serverOptionConfig) {
+		cfg.runtimeConfigApply = apply
 	}
 }
 
@@ -315,9 +324,25 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 	managementasset.SetCurrentConfig(cfg)
 	auth.SetQuotaCooldownDisabled(cfg.DisableCooling)
 	applySignatureCacheConfig(nil, cfg)
-	// Initialize management handler
-	s.mgmt = managementHandlers.NewHandler(cfg, configFilePath, authManager)
+	// Initialize management with an isolated snapshot so handler mutations do
+	// not change the live service configuration before the runtime transaction.
+	managementCfg, errManagementClone := config.Clone(cfg)
+	if errManagementClone != nil {
+		log.WithError(errManagementClone).Error("failed to isolate management configuration snapshot")
+		managementCfg = cfg
+	}
+	s.mgmt = managementHandlers.NewHandler(managementCfg, configFilePath, authManager)
 	s.mgmt.SetProxyPoolManager(optionState.proxyPoolManager)
+	runtimeConfigApply := optionState.runtimeConfigApply
+	if runtimeConfigApply == nil {
+		runtimeConfigApply = func(_ context.Context, candidate *config.Config) (config.RuntimeApplyResult, error) {
+			if errUpdate := s.UpdateClients(candidate); errUpdate != nil {
+				return config.RuntimeApplyResult{}, errUpdate
+			}
+			return config.RuntimeApplyResult{Applied: true}, nil
+		}
+	}
+	s.mgmt.SetRuntimeConfigApplier(runtimeConfigApply)
 	if optionState.localPassword != "" {
 		s.mgmt.SetLocalPassword(optionState.localPassword)
 	}
@@ -561,7 +586,7 @@ func (s *Server) registerManagementRoutes() {
 	log.Infof("management routes registered at %s", apiPrefix)
 
 	mgmt := s.engine.Group(apiPrefix)
-	mgmt.Use(s.activeManagementPrefixMiddleware(prefix), s.managementAvailabilityMiddleware(), s.mgmt.Middleware())
+	mgmt.Use(s.activeManagementPrefixMiddleware(prefix), s.managementAvailabilityMiddleware(), s.mgmt.Middleware(), s.mgmt.ConfigMutationMiddleware())
 	{
 		mgmt.GET("/usage", s.mgmt.GetUsageStatistics)
 		mgmt.DELETE("/usage", s.mgmt.ClearUsageStatistics)
@@ -1053,13 +1078,14 @@ func corsMiddleware() gin.HandlerFunc {
 	}
 }
 
-func (s *Server) applyAccessConfig(oldCfg, newCfg *config.Config) {
+func (s *Server) applyAccessConfig(oldCfg, newCfg *config.Config) error {
 	if s == nil || s.accessManager == nil || newCfg == nil {
-		return
+		return nil
 	}
-	if _, err := access.ApplyAccessProviders(s.accessManager, oldCfg, newCfg); err != nil {
-		return
+	if _, errApply := access.ApplyAccessProviders(s.accessManager, oldCfg, newCfg); errApply != nil {
+		return errApply
 	}
+	return nil
 }
 
 // UpdateClients updates the server's client list and configuration.
@@ -1068,7 +1094,14 @@ func (s *Server) applyAccessConfig(oldCfg, newCfg *config.Config) {
 // Parameters:
 //   - clients: The new slice of AI service clients
 //   - cfg: The new application configuration
-func (s *Server) UpdateClients(cfg *config.Config) {
+func (s *Server) UpdateClients(cfg *config.Config) error {
+	if s == nil || cfg == nil {
+		return errors.New("runtime configuration is unavailable")
+	}
+	runtimeCfg, errClone := config.Clone(cfg)
+	if errClone != nil {
+		return errClone
+	}
 	// Reconstruct old config from YAML snapshot to avoid reference sharing issues
 	var oldCfg *config.Config
 	if len(s.oldConfigYaml) > 0 {
@@ -1080,54 +1113,54 @@ func (s *Server) UpdateClients(cfg *config.Config) {
 	if oldCfg != nil {
 		previousRequestLog = oldCfg.RequestLog
 	}
-	if s.requestLogger != nil && (oldCfg == nil || previousRequestLog != cfg.RequestLog) {
+	if s.requestLogger != nil && (oldCfg == nil || previousRequestLog != runtimeCfg.RequestLog) {
 		if s.loggerToggle != nil {
-			s.loggerToggle(cfg.RequestLog)
+			s.loggerToggle(runtimeCfg.RequestLog)
 		} else if toggler, ok := s.requestLogger.(interface{ SetEnabled(bool) }); ok {
-			toggler.SetEnabled(cfg.RequestLog)
+			toggler.SetEnabled(runtimeCfg.RequestLog)
 		}
 	}
 
-	if oldCfg == nil || oldCfg.LoggingToFile != cfg.LoggingToFile || oldCfg.LogsMaxTotalSizeMB != cfg.LogsMaxTotalSizeMB {
-		if err := logging.ConfigureLogOutput(cfg); err != nil {
-			log.Errorf("failed to reconfigure log output: %v", err)
+	if oldCfg == nil || oldCfg.LoggingToFile != runtimeCfg.LoggingToFile || oldCfg.LogsMaxTotalSizeMB != runtimeCfg.LogsMaxTotalSizeMB {
+		if errLogOutput := logging.ConfigureLogOutput(runtimeCfg); errLogOutput != nil {
+			return errLogOutput
 		}
 	}
 
-	if oldCfg == nil || oldCfg.UsageStatisticsEnabled != cfg.UsageStatisticsEnabled {
-		usage.SetStatisticsEnabled(cfg.UsageStatisticsEnabled)
+	if oldCfg == nil || oldCfg.UsageStatisticsEnabled != runtimeCfg.UsageStatisticsEnabled {
+		usage.SetStatisticsEnabled(runtimeCfg.UsageStatisticsEnabled)
 	}
 
-	if s.requestLogger != nil && (oldCfg == nil || oldCfg.ErrorLogsMaxFiles != cfg.ErrorLogsMaxFiles) {
+	if s.requestLogger != nil && (oldCfg == nil || oldCfg.ErrorLogsMaxFiles != runtimeCfg.ErrorLogsMaxFiles) {
 		if setter, ok := s.requestLogger.(interface{ SetErrorLogsMaxFiles(int) }); ok {
-			setter.SetErrorLogsMaxFiles(cfg.ErrorLogsMaxFiles)
+			setter.SetErrorLogsMaxFiles(runtimeCfg.ErrorLogsMaxFiles)
 		}
 	}
 
-	if oldCfg == nil || oldCfg.DisableCooling != cfg.DisableCooling {
-		auth.SetQuotaCooldownDisabled(cfg.DisableCooling)
+	if oldCfg == nil || oldCfg.DisableCooling != runtimeCfg.DisableCooling {
+		auth.SetQuotaCooldownDisabled(runtimeCfg.DisableCooling)
 	}
 
-	applySignatureCacheConfig(oldCfg, cfg)
+	applySignatureCacheConfig(oldCfg, runtimeCfg)
 
 	if s.handlers != nil && s.handlers.AuthManager != nil {
-		s.handlers.AuthManager.SetRetryConfig(cfg.RequestRetry, time.Duration(cfg.MaxRetryInterval)*time.Second, cfg.MaxRetryCredentials)
-		s.handlers.AuthManager.SetConfig(cfg)
+		s.handlers.AuthManager.SetRetryConfig(runtimeCfg.RequestRetry, time.Duration(runtimeCfg.MaxRetryInterval)*time.Second, runtimeCfg.MaxRetryCredentials)
+		s.handlers.AuthManager.SetConfig(runtimeCfg)
 	}
 
 	// Update log level dynamically when debug flag changes
-	if oldCfg == nil || oldCfg.Debug != cfg.Debug {
-		util.SetLogLevel(cfg)
+	if oldCfg == nil || oldCfg.Debug != runtimeCfg.Debug {
+		util.SetLogLevel(runtimeCfg)
 	}
 
-	s.cfg = cfg
+	s.cfg = runtimeCfg
 	s.registerManagementSurfaceRoutes()
 
 	prevSecretEmpty := true
 	if oldCfg != nil {
 		prevSecretEmpty = oldCfg.RemoteManagement.SecretKey == ""
 	}
-	newSecretEmpty := cfg.RemoteManagement.SecretKey == ""
+	newSecretEmpty := runtimeCfg.RemoteManagement.SecretKey == ""
 	if s.envManagementSecret {
 		s.registerManagementRoutes()
 		if s.managementRoutesEnabled.CompareAndSwap(false, true) {
@@ -1158,36 +1191,43 @@ func (s *Server) UpdateClients(cfg *config.Config) {
 		s.registerManagementRoutes()
 	}
 
-	s.applyAccessConfig(oldCfg, cfg)
-	s.wsAuthEnabled.Store(cfg.WebsocketAuth)
-	if oldCfg != nil && s.wsAuthChanged != nil && oldCfg.WebsocketAuth != cfg.WebsocketAuth {
-		s.wsAuthChanged(oldCfg.WebsocketAuth, cfg.WebsocketAuth)
+	if errAccess := s.applyAccessConfig(oldCfg, runtimeCfg); errAccess != nil {
+		return fmt.Errorf("update access providers: %w", errAccess)
 	}
-	managementasset.SetCurrentConfig(cfg)
+	s.wsAuthEnabled.Store(runtimeCfg.WebsocketAuth)
+	if oldCfg != nil && s.wsAuthChanged != nil && oldCfg.WebsocketAuth != runtimeCfg.WebsocketAuth {
+		s.wsAuthChanged(oldCfg.WebsocketAuth, runtimeCfg.WebsocketAuth)
+	}
+	managementasset.SetCurrentConfig(runtimeCfg)
 	// Save YAML snapshot for next comparison
-	s.oldConfigYaml, _ = yaml.Marshal(cfg)
+	s.oldConfigYaml, _ = yaml.Marshal(runtimeCfg)
 
-	s.handlers.UpdateClients(&cfg.SDKConfig)
+	s.handlers.UpdateClients(&runtimeCfg.SDKConfig)
 
 	if s.mgmt != nil {
-		s.mgmt.SetConfig(cfg)
+		if errManagement := s.mgmt.SetConfig(runtimeCfg); errManagement != nil {
+			return fmt.Errorf("update management runtime configuration: %w", errManagement)
+		}
 		s.mgmt.SetAuthManager(s.handlers.AuthManager)
 	}
 
 	// Count client sources from configuration and auth store.
 	tokenStore := sdkAuth.GetTokenStore()
 	if dirSetter, ok := tokenStore.(interface{ SetBaseDir(string) }); ok {
-		dirSetter.SetBaseDir(cfg.AuthDir)
+		dirSetter.SetBaseDir(runtimeCfg.AuthDir)
 	}
-	authEntries := util.CountAuthFiles(context.Background(), tokenStore)
-	geminiAPIKeyCount := len(cfg.GeminiKey)
-	interactionsAPIKeyCount := len(cfg.InteractionsKey)
-	claudeAPIKeyCount := len(cfg.ClaudeKey)
-	codexAPIKeyCount := len(cfg.CodexKey)
-	vertexAICompatCount := len(cfg.VertexCompatAPIKey)
+	authEntries := 0
+	if s.handlers != nil && s.handlers.AuthManager != nil {
+		authEntries = s.handlers.AuthManager.Count()
+	}
+	geminiAPIKeyCount := len(runtimeCfg.GeminiKey)
+	interactionsAPIKeyCount := len(runtimeCfg.InteractionsKey)
+	claudeAPIKeyCount := len(runtimeCfg.ClaudeKey)
+	codexAPIKeyCount := len(runtimeCfg.CodexKey)
+	vertexAICompatCount := len(runtimeCfg.VertexCompatAPIKey)
 	openAICompatCount := 0
-	for i := range cfg.OpenAICompatibility {
-		entry := cfg.OpenAICompatibility[i]
+	for i := range runtimeCfg.OpenAICompatibility {
+		entry := runtimeCfg.OpenAICompatibility[i]
 		if entry.Disabled {
 			continue
 		}
@@ -1205,6 +1245,16 @@ func (s *Server) UpdateClients(cfg *config.Config) {
 		vertexAICompatCount,
 		openAICompatCount,
 	)
+	return nil
+}
+
+// SetManagementConfig updates the management handler's persisted configuration
+// snapshot after a service-owned runtime transaction succeeds.
+func (s *Server) SetManagementConfig(cfg *config.Config) error {
+	if s == nil || s.mgmt == nil {
+		return nil
+	}
+	return s.mgmt.SetConfig(cfg)
 }
 
 func (s *Server) SetWebsocketAuthChangeHandler(fn func(bool, bool)) {

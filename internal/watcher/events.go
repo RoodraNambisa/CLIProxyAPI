@@ -90,7 +90,7 @@ func (w *Watcher) start(ctx context.Context) (err error) {
 		close(done)
 	}()
 
-	w.reloadClientsWithOptions(true, nil, false, true)
+	w.reloadClientsWithOptions(true, nil, false, true, true)
 	return nil
 }
 

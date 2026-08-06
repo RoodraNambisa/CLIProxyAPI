@@ -434,6 +434,56 @@ type Config struct {
 	legacyMigrationPending bool `yaml:"-" json:"-"`
 }
 
+// RuntimeApplyResult describes whether a persisted configuration was fully
+// applied to the running process. RestartFields contains settings that were
+// saved but intentionally left unchanged until the next process start.
+type RuntimeApplyResult struct {
+	RestartRequired bool     `json:"restart_required"`
+	RestartFields   []string `json:"restart_fields,omitempty"`
+	Applied         bool     `json:"applied"`
+	Deduplicated    bool     `json:"deduplicated,omitempty"`
+}
+
+// Clone creates an independent configuration snapshot. Configuration holders
+// use this before crossing subsystem boundaries so management edits cannot
+// mutate a live runtime configuration through a shared pointer.
+func Clone(input *Config) (*Config, error) {
+	if input == nil {
+		return nil, nil
+	}
+	// Use YAML rather than JSON because startup and management-only fields such
+	// as host, port, auth-dir and remote-management are intentionally excluded
+	// from JSON responses but still belong to a complete runtime snapshot.
+	data, errMarshal := yaml.Marshal(input)
+	if errMarshal != nil {
+		return nil, fmt.Errorf("clone config: marshal: %w", errMarshal)
+	}
+	var snapshot Config
+	if errDecode := yaml.Unmarshal(data, &snapshot); errDecode != nil {
+		return nil, fmt.Errorf("clone config: decode: %w", errDecode)
+	}
+	snapshot.legacyMigrationPending = input.legacyMigrationPending
+	clonePayloadRawValues(snapshot.Payload.DefaultRaw, input.Payload.DefaultRaw)
+	clonePayloadRawValues(snapshot.Payload.OverrideRaw, input.Payload.OverrideRaw)
+	return &snapshot, nil
+}
+
+func clonePayloadRawValues(snapshot, source []PayloadRule) {
+	for ruleIndex := range source {
+		if ruleIndex >= len(snapshot) || snapshot[ruleIndex].Params == nil {
+			continue
+		}
+		for key, value := range source[ruleIndex].Params {
+			switch typed := value.(type) {
+			case json.RawMessage:
+				snapshot[ruleIndex].Params[key] = append(json.RawMessage(nil), typed...)
+			case []byte:
+				snapshot[ruleIndex].Params[key] = append([]byte(nil), typed...)
+			}
+		}
+	}
+}
+
 // ClaudeHeaderDefaults configures default header values injected into Claude API requests.
 // In legacy mode, UserAgent/PackageVersion/RuntimeVersion/Timeout act as fallbacks when
 // the client omits them, while OS/Arch remain runtime-derived. When stabilized device

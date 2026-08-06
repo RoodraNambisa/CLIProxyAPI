@@ -97,11 +97,30 @@ func (w *Watcher) reloadConfig() bool {
 		}
 	}
 
-	w.clientsMutex.Lock()
+	w.clientsMutex.RLock()
+	oldRuntimeConfig := w.config
+	configApply := w.configApply
 	var oldConfig *config.Config
 	_ = yaml.Unmarshal(w.oldConfigYaml, &oldConfig)
+	w.clientsMutex.RUnlock()
+
+	appliedConfig := newConfig
+	if configApply != nil {
+		var errApply error
+		appliedConfig, errApply = configApply(newConfig)
+		if errApply != nil {
+			log.WithError(errApply).Error("failed to apply reloaded config; previous runtime retained")
+			return false
+		}
+		if appliedConfig == nil {
+			log.Error("config apply returned no runtime snapshot; previous runtime retained")
+			return false
+		}
+	}
+
+	w.clientsMutex.Lock()
 	w.oldConfigYaml, _ = yaml.Marshal(newConfig)
-	w.config = newConfig
+	w.config = appliedConfig
 	w.clientsMutex.Unlock()
 
 	var affectedOAuthProviders []string
@@ -109,9 +128,9 @@ func (w *Watcher) reloadConfig() bool {
 		_, affectedOAuthProviders = diff.DiffOAuthExcludedModelChanges(oldConfig.OAuthExcludedModels, newConfig.OAuthExcludedModels)
 	}
 
-	util.SetLogLevel(newConfig)
-	if oldConfig != nil && oldConfig.Debug != newConfig.Debug {
-		log.Debugf("log level updated - debug mode changed from %t to %t", oldConfig.Debug, newConfig.Debug)
+	util.SetLogLevel(appliedConfig)
+	if oldRuntimeConfig != nil && oldRuntimeConfig.Debug != appliedConfig.Debug {
+		log.Debugf("log level updated - debug mode changed from %t to %t", oldRuntimeConfig.Debug, appliedConfig.Debug)
 	}
 
 	if oldConfig != nil {
@@ -126,11 +145,11 @@ func (w *Watcher) reloadConfig() bool {
 		}
 	}
 
-	authDirChanged := oldConfig == nil || oldConfig.AuthDir != newConfig.AuthDir
-	retryConfigChanged := oldConfig != nil && (oldConfig.RequestRetry != newConfig.RequestRetry || oldConfig.MaxRetryInterval != newConfig.MaxRetryInterval || oldConfig.MaxRetryCredentials != newConfig.MaxRetryCredentials)
-	forceAuthRefresh := oldConfig != nil && (oldConfig.ForceModelPrefix != newConfig.ForceModelPrefix || !reflect.DeepEqual(oldConfig.OAuthModelAlias, newConfig.OAuthModelAlias) || !reflect.DeepEqual(oldConfig.AuthModelExclusions, newConfig.AuthModelExclusions) || retryConfigChanged)
+	authDirChanged := oldRuntimeConfig == nil || oldRuntimeConfig.AuthDir != appliedConfig.AuthDir
+	retryConfigChanged := oldRuntimeConfig != nil && (oldRuntimeConfig.RequestRetry != appliedConfig.RequestRetry || oldRuntimeConfig.MaxRetryInterval != appliedConfig.MaxRetryInterval || oldRuntimeConfig.MaxRetryCredentials != appliedConfig.MaxRetryCredentials)
+	forceAuthRefresh := oldRuntimeConfig != nil && (oldRuntimeConfig.ForceModelPrefix != appliedConfig.ForceModelPrefix || !reflect.DeepEqual(oldRuntimeConfig.OAuthModelAlias, appliedConfig.OAuthModelAlias) || !reflect.DeepEqual(oldRuntimeConfig.AuthModelExclusions, appliedConfig.AuthModelExclusions) || retryConfigChanged)
 
 	log.Infof("config successfully reloaded, triggering client reload")
-	w.reloadClients(authDirChanged, affectedOAuthProviders, forceAuthRefresh)
+	w.reloadClientsWithOptions(authDirChanged, affectedOAuthProviders, forceAuthRefresh, false, configApply == nil)
 	return true
 }

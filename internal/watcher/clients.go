@@ -141,10 +141,10 @@ func (w *Watcher) authRootDir() string {
 }
 
 func (w *Watcher) reloadClients(rescanAuth bool, affectedOAuthProviders []string, forceAuthRefresh bool) {
-	w.reloadClientsWithOptions(rescanAuth, affectedOAuthProviders, forceAuthRefresh, false)
+	w.reloadClientsWithOptions(rescanAuth, affectedOAuthProviders, forceAuthRefresh, false, true)
 }
 
-func (w *Watcher) reloadClientsWithOptions(rescanAuth bool, affectedOAuthProviders []string, forceAuthRefresh, resolveTombstoneReplacements bool) {
+func (w *Watcher) reloadClientsWithOptions(rescanAuth bool, affectedOAuthProviders []string, forceAuthRefresh, resolveTombstoneReplacements, notifyRuntime bool) {
 	log.Debugf("starting full client load process")
 
 	w.clientsMutex.RLock()
@@ -154,6 +154,22 @@ func (w *Watcher) reloadClientsWithOptions(rescanAuth bool, affectedOAuthProvide
 	if cfg == nil {
 		log.Error("config is nil, cannot reload clients")
 		return
+	}
+
+	// Let the service apply or reject the candidate before rebuilding clients.
+	// The callback may replace the watcher snapshot with the last valid runtime
+	// configuration when application fails, or with a startup-safe snapshot when
+	// the file contains settings that require a restart.
+	if notifyRuntime && w.reloadCallback != nil {
+		log.Debugf("triggering server update callback before client reload")
+		w.reloadCallback(cfg)
+		w.clientsMutex.RLock()
+		cfg = w.config
+		w.clientsMutex.RUnlock()
+		if cfg == nil {
+			log.Error("runtime config is nil after reload callback")
+			return
+		}
 	}
 
 	if len(affectedOAuthProviders) > 0 {
@@ -231,11 +247,6 @@ func (w *Watcher) reloadClientsWithOptions(rescanAuth bool, affectedOAuthProvide
 	}
 
 	totalNewClients := authFileCount + geminiAPIKeyCount + vertexCompatAPIKeyCount + claudeAPIKeyCount + codexAPIKeyCount + openAICompatCount
-
-	if w.reloadCallback != nil {
-		log.Debugf("triggering server update callback before auth refresh")
-		w.reloadCallback(cfg)
-	}
 
 	w.refreshAuthState(forceAuthRefresh)
 

@@ -87,6 +87,7 @@ type WatcherWrapper struct {
 	stop  func() error
 
 	setConfig             func(cfg *config.Config)
+	setConfigApply        func(func(*config.Config) (*config.Config, error))
 	snapshotAuths         func() []*coreauth.Auth
 	seedCurrentFileAuths  func(auths []*coreauth.Auth)
 	setUpdateQueue        func(queue chan<- watcher.AuthUpdate)
@@ -117,6 +118,15 @@ func (w *WatcherWrapper) SetConfig(cfg *config.Config) {
 		return
 	}
 	w.setConfig(cfg)
+}
+
+// SetConfigApply registers a transactional runtime configuration callback when
+// the underlying watcher supports it.
+func (w *WatcherWrapper) SetConfigApply(apply func(*config.Config) (*config.Config, error)) {
+	if w == nil || w.setConfigApply == nil {
+		return
+	}
+	w.setConfigApply(apply)
 }
 
 // SeedCurrentFileAuths lets the first watcher refresh reconcile credentials

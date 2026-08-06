@@ -51,6 +51,7 @@ type Watcher struct {
 	serverUpdatePend     bool
 	stopped              atomic.Bool
 	reloadCallback       func(*config.Config)
+	configApply          func(*config.Config) (*config.Config, error)
 	watcher              *fsnotify.Watcher
 	lastAuthHashes       map[string]string
 	lastAuthContents     map[string]*coreauth.Auth
@@ -192,6 +193,18 @@ func (w *Watcher) SetConfig(cfg *config.Config) {
 	defer w.clientsMutex.Unlock()
 	w.config = cfg
 	w.oldConfigYaml, _ = yaml.Marshal(cfg)
+}
+
+// SetConfigApply registers a transactional runtime configuration callback.
+// The returned snapshot is the configuration that the running process actually
+// accepted; returning an error keeps the previous watcher snapshot intact.
+func (w *Watcher) SetConfigApply(apply func(*config.Config) (*config.Config, error)) {
+	if w == nil {
+		return
+	}
+	w.clientsMutex.Lock()
+	w.configApply = apply
+	w.clientsMutex.Unlock()
 }
 
 // SetAuthUpdateQueue sets the queue used to emit auth updates.

@@ -6,6 +6,7 @@ package cliproxy
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -38,6 +39,7 @@ import (
 	sdkusage "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/usage"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/config"
 	log "github.com/sirupsen/logrus"
+	"gopkg.in/yaml.v3"
 )
 
 // Service wraps the proxy server lifecycle so external programs can embed the CLI proxy.
@@ -49,6 +51,12 @@ type Service struct {
 
 	// cfgMu protects concurrent access to the configuration.
 	cfgMu sync.RWMutex
+
+	// runtimeConfigApplyMu serializes complete runtime configuration updates
+	// from management writes and file watcher reloads.
+	runtimeConfigApplyMu sync.Mutex
+	runtimeConfigDigest  [sha256.Size]byte
+	runtimeConfigHashed  bool
 
 	// configPath is the path to the configuration file.
 	configPath string
@@ -4388,6 +4396,230 @@ func (s *Service) rebindExecutorsForAuths(auths []*coreauth.Auth) {
 	}
 }
 
+func normalizeRuntimeRoutingStrategy(strategy string) string {
+	switch strings.ToLower(strings.TrimSpace(strategy)) {
+	case "fill-first", "fillfirst", "ff":
+		return "fill-first"
+	case "random", "rand", "r":
+		return "random"
+	default:
+		return "round-robin"
+	}
+}
+
+func runtimeRestartFields(previous, requested *config.Config) []string {
+	if previous == nil || requested == nil {
+		return nil
+	}
+	fields := make([]string, 0, 5)
+	if previous.Host != requested.Host {
+		fields = append(fields, "host")
+	}
+	if previous.Port != requested.Port {
+		fields = append(fields, "port")
+	}
+	if previous.TLS != requested.TLS {
+		fields = append(fields, "tls")
+	}
+	if previous.AuthDir != requested.AuthDir {
+		fields = append(fields, "auth-dir")
+	}
+	if previous.CommercialMode != requested.CommercialMode {
+		fields = append(fields, "commercial-mode")
+	}
+	return fields
+}
+
+func preserveRuntimeStartupFields(runtimeCfg, previous *config.Config) {
+	if runtimeCfg == nil || previous == nil {
+		return
+	}
+	runtimeCfg.Host = previous.Host
+	runtimeCfg.Port = previous.Port
+	runtimeCfg.TLS = previous.TLS
+	runtimeCfg.AuthDir = previous.AuthDir
+	runtimeCfg.CommercialMode = previous.CommercialMode
+}
+
+func runtimeConfigHash(cfg *config.Config) ([sha256.Size]byte, error) {
+	if cfg == nil {
+		return [sha256.Size]byte{}, nil
+	}
+	payload, errMarshal := yaml.Marshal(cfg)
+	if errMarshal != nil {
+		return [sha256.Size]byte{}, errMarshal
+	}
+	return sha256.Sum256(payload), nil
+}
+
+// ApplyRuntimeConfig atomically serializes configuration changes from both
+// management writes and the file watcher. Startup-only fields remain persisted
+// but are held at their current runtime values until process restart.
+func (s *Service) ApplyRuntimeConfig(ctx context.Context, requested *config.Config) (config.RuntimeApplyResult, error) {
+	result := config.RuntimeApplyResult{}
+	if s == nil || requested == nil {
+		return result, errors.New("runtime configuration is unavailable")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	requestedSnapshot, errClone := config.Clone(requested)
+	if errClone != nil {
+		return result, errClone
+	}
+	s.runtimeConfigApplyMu.Lock()
+	defer s.runtimeConfigApplyMu.Unlock()
+
+	previous, errPrevious := config.Clone(s.currentConfig())
+	if errPrevious != nil {
+		return result, errPrevious
+	}
+	runtimeCfg, errRuntime := config.Clone(requestedSnapshot)
+	if errRuntime != nil {
+		return result, errRuntime
+	}
+	result.RestartFields = runtimeRestartFields(previous, requestedSnapshot)
+	result.RestartRequired = len(result.RestartFields) > 0
+	preserveRuntimeStartupFields(runtimeCfg, previous)
+	digest, errDigest := runtimeConfigHash(runtimeCfg)
+	if errDigest != nil {
+		return result, fmt.Errorf("hash runtime configuration: %w", errDigest)
+	}
+	if !s.runtimeConfigHashed && previous != nil {
+		if previousDigest, errPreviousDigest := runtimeConfigHash(previous); errPreviousDigest == nil {
+			s.runtimeConfigDigest = previousDigest
+			s.runtimeConfigHashed = true
+		}
+	}
+	if s.runtimeConfigHashed && digest == s.runtimeConfigDigest {
+		if s.server != nil {
+			if errManagement := s.server.SetManagementConfig(requestedSnapshot); errManagement != nil {
+				return result, errManagement
+			}
+		}
+		if s.watcher != nil {
+			s.watcher.SetConfig(runtimeCfg)
+		}
+		result.Applied = true
+		result.Deduplicated = true
+		return result, nil
+	}
+
+	if errApply := s.applyRuntimeConfigState(ctx, previous, runtimeCfg); errApply != nil {
+		var errRollback error
+		if previous != nil {
+			errRollback = s.applyRuntimeConfigState(context.WithoutCancel(ctx), runtimeCfg, previous)
+			if s.watcher != nil {
+				s.watcher.SetConfig(previous)
+			}
+		}
+		if errRollback != nil {
+			return result, errors.Join(errApply, fmt.Errorf("rollback runtime configuration: %w", errRollback))
+		}
+		return result, errApply
+	}
+	if s.server != nil {
+		if errManagement := s.server.SetManagementConfig(requestedSnapshot); errManagement != nil {
+			errRollback := s.applyRuntimeConfigState(context.WithoutCancel(ctx), runtimeCfg, previous)
+			if previous != nil && s.watcher != nil {
+				s.watcher.SetConfig(previous)
+			}
+			if errRollback != nil {
+				return result, errors.Join(errManagement, fmt.Errorf("rollback runtime configuration: %w", errRollback))
+			}
+			return result, errManagement
+		}
+	}
+	if s.watcher != nil {
+		s.watcher.SetConfig(runtimeCfg)
+	}
+	s.runtimeConfigDigest = digest
+	s.runtimeConfigHashed = true
+	result.Applied = true
+	return result, nil
+}
+
+func (s *Service) applyRuntimeConfigState(ctx context.Context, previousCfg, nextCfg *config.Config) error {
+	if s == nil || nextCfg == nil {
+		return errors.New("runtime configuration is unavailable")
+	}
+	previousUsageEnabled := previousCfg != nil && previousCfg.UsageStatisticsEnabled
+	previousUsageInterval := usagePersistenceIntervalForConfig(previousCfg)
+
+	if s.coreManager != nil {
+		var selector coreauth.Selector
+		switch normalizeRuntimeRoutingStrategy(nextCfg.Routing.Strategy) {
+		case "fill-first":
+			selector = &coreauth.FillFirstSelector{Range: normalizedRoutingFillFirstRange(nextCfg)}
+		case "random":
+			selector = &coreauth.RandomSelector{}
+		default:
+			selector = &coreauth.RoundRobinSelector{}
+		}
+		if nextCfg.Routing.ClaudeCodeSessionAffinity || nextCfg.Routing.SessionAffinity {
+			ttl := time.Hour
+			if ttlText := strings.TrimSpace(nextCfg.Routing.SessionAffinityTTL); ttlText != "" {
+				if parsed, errParse := time.ParseDuration(ttlText); errParse == nil && parsed > 0 {
+					ttl = parsed
+				}
+			}
+			failover := routingSessionAffinityFailoverEnabled(nextCfg)
+			selector = coreauth.NewSessionAffinitySelectorWithConfig(coreauth.SessionAffinityConfig{
+				Fallback: selector,
+				TTL:      ttl,
+				Failover: &failover,
+			})
+		}
+		s.coreManager.SetSelector(selector)
+	}
+
+	s.applyRetryConfig(nextCfg)
+	s.applyPprofConfig(nextCfg)
+	executorhelps.CloseUnscopedProxyTransportCaches()
+	if s.proxyPoolManager != nil {
+		if errProxyConfig := s.proxyPoolManager.UpdateConfig(nextCfg); errProxyConfig != nil {
+			return fmt.Errorf("update proxy pool runtime: %w", errProxyConfig)
+		}
+	}
+	if s.server != nil {
+		if errServer := s.server.UpdateClients(nextCfg); errServer != nil {
+			return fmt.Errorf("update API server runtime: %w", errServer)
+		}
+	}
+	s.cfgMu.Lock()
+	s.cfg = nextCfg
+	s.cfgMu.Unlock()
+	if s.coreManager != nil {
+		s.coreManager.SetConfig(nextCfg)
+		s.coreManager.SetOAuthModelAlias(nextCfg.OAuthModelAlias)
+	}
+	s.rebindExecutors()
+	authModelExclusionsChanged := authModelExclusionsSignature(previousCfg) != authModelExclusionsSignature(nextCfg)
+	if s.coreManager != nil && !authModelExclusionsChanged && shouldRefreshChatGPTWebRegistrations(previousCfg, nextCfg) {
+		for _, auth := range s.coreManager.ChatGPTWebAuths() {
+			s.refreshChatGPTWebModelRegistration(ctx, auth)
+		}
+	}
+	s.applyChatGPTWebImportModelValidationConfig(ctx, nextCfg.ChatGPTWeb.Import.Resolved().ValidateModelsAfterUpload)
+	if s.coreManager != nil && authModelExclusionsChanged {
+		for _, auth := range s.coreManager.ListMetadataSummaries("type", "provider_key", "compat_name") {
+			if isNativeChatGPTWebAuth(auth) {
+				s.refreshChatGPTWebModelRegistration(ctx, auth)
+				continue
+			}
+			s.refreshModelRegistrationForAuth(auth)
+		}
+	} else if s.coreManager != nil && shouldRefreshCodexRegistrations(previousCfg, nextCfg) {
+		for _, auth := range s.coreManager.AuthsForProviders("codex") {
+			s.refreshModelRegistrationForAuth(auth)
+		}
+	}
+	s.applyUsagePersistenceConfigChange(previousUsageEnabled, previousUsageInterval, nextCfg)
+	s.warnAuthMaintenanceConfig(nextCfg.AuthMaintenance)
+	s.wakeAuthMaintenance()
+	return nil
+}
+
 // Run starts the service and blocks until the context is cancelled or the server stops.
 // It initializes all components including authentication, file watching, HTTP server,
 // and starts processing requests. The method blocks until the context is cancelled.
@@ -4469,6 +4701,7 @@ func (s *Service) Run(ctx context.Context) error {
 	serverOpts = append(serverOpts, api.WithChatGPTWebDependencyReconcileHook(s.reconcileChatGPTWebDependencies))
 	serverOpts = append(serverOpts, api.WithChatGPTWebDeadAuthDeleteCountProvider(s.chatGPTWebDeadAuthDeletedCount.Load))
 	serverOpts = append(serverOpts, api.WithProxyPoolManager(s.proxyPoolManager))
+	serverOpts = append(serverOpts, api.WithRuntimeConfigApply(s.ApplyRuntimeConfig))
 	s.server = api.NewServer(s.cfg, s.coreManager, s.accessManager, s.configPath, serverOpts...)
 
 	if s.authManager == nil {
@@ -4563,134 +4796,28 @@ func (s *Service) Run(ctx context.Context) error {
 	}
 
 	var watcherWrapper *WatcherWrapper
-	reloadCallback := func(newCfg *config.Config) {
-		previousStrategy := ""
-		previousUsageEnabled := false
-		previousUsageInterval := time.Duration(0)
-		var previousSessionAffinity bool
-		var previousSessionAffinityTTL string
-		var previousSessionAffinityFailover bool
-		var previousFillFirstRange int
-		var previousCfgSnapshot *config.Config
-		s.cfgMu.RLock()
-		if s.cfg != nil {
-			previousStrategy = strings.ToLower(strings.TrimSpace(s.cfg.Routing.Strategy))
-			previousUsageEnabled = s.cfg.UsageStatisticsEnabled
-			previousUsageInterval = usagePersistenceIntervalForConfig(s.cfg)
-			previousSessionAffinity = s.cfg.Routing.ClaudeCodeSessionAffinity || s.cfg.Routing.SessionAffinity
-			previousSessionAffinityTTL = s.cfg.Routing.SessionAffinityTTL
-			previousSessionAffinityFailover = routingSessionAffinityFailoverEnabled(s.cfg)
-			previousFillFirstRange = normalizedRoutingFillFirstRange(s.cfg)
-			previousCfgSnapshot = s.cfg
-		}
-		s.cfgMu.RUnlock()
-
+	applyReloadedConfig := func(newCfg *config.Config) (config.RuntimeApplyResult, error) {
 		if newCfg == nil {
 			s.cfgMu.RLock()
 			newCfg = s.cfg
 			s.cfgMu.RUnlock()
 		}
 		if newCfg == nil {
-			return
+			return config.RuntimeApplyResult{}, errors.New("reloaded configuration is unavailable")
 		}
-
-		nextStrategy := strings.ToLower(strings.TrimSpace(newCfg.Routing.Strategy))
-		normalizeStrategy := func(strategy string) string {
-			switch strategy {
-			case "fill-first", "fillfirst", "ff":
-				return "fill-first"
-			case "random", "rand", "r":
-				return "random"
-			default:
-				return "round-robin"
-			}
+		result, errApply := s.ApplyRuntimeConfig(ctx, newCfg)
+		if errApply != nil {
+			return result, errApply
 		}
-		previousStrategy = normalizeStrategy(previousStrategy)
-		nextStrategy = normalizeStrategy(nextStrategy)
-
-		nextSessionAffinity := newCfg.Routing.ClaudeCodeSessionAffinity || newCfg.Routing.SessionAffinity
-		nextSessionAffinityTTL := newCfg.Routing.SessionAffinityTTL
-		nextSessionAffinityFailover := routingSessionAffinityFailoverEnabled(newCfg)
-		nextFillFirstRange := normalizedRoutingFillFirstRange(newCfg)
-
-		selectorChanged := previousStrategy != nextStrategy ||
-			previousSessionAffinity != nextSessionAffinity ||
-			previousSessionAffinityTTL != nextSessionAffinityTTL ||
-			previousSessionAffinityFailover != nextSessionAffinityFailover ||
-			(previousStrategy == "fill-first" || nextStrategy == "fill-first") && previousFillFirstRange != nextFillFirstRange
-
-		if s.coreManager != nil && selectorChanged {
-			var selector coreauth.Selector
-			switch nextStrategy {
-			case "fill-first":
-				selector = &coreauth.FillFirstSelector{Range: nextFillFirstRange}
-			case "random":
-				selector = &coreauth.RandomSelector{}
-			default:
-				selector = &coreauth.RoundRobinSelector{}
-			}
-
-			if nextSessionAffinity {
-				ttl := time.Hour
-				if ttlStr := strings.TrimSpace(nextSessionAffinityTTL); ttlStr != "" {
-					if parsed, err := time.ParseDuration(ttlStr); err == nil && parsed > 0 {
-						ttl = parsed
-					}
-				}
-				selector = coreauth.NewSessionAffinitySelectorWithConfig(coreauth.SessionAffinityConfig{
-					Fallback: selector,
-					TTL:      ttl,
-					Failover: &nextSessionAffinityFailover,
-				})
-			}
-
-			s.coreManager.SetSelector(selector)
+		if result.RestartRequired {
+			log.WithField("fields", result.RestartFields).Warn("configuration saved with startup-only changes; restart required")
 		}
-
-		s.applyRetryConfig(newCfg)
-		s.applyPprofConfig(newCfg)
-		executorhelps.CloseUnscopedProxyTransportCaches()
-		if s.server != nil {
-			s.server.UpdateClients(newCfg)
-		} else if s.proxyPoolManager != nil {
-			if errProxyConfig := s.proxyPoolManager.UpdateConfig(newCfg); errProxyConfig != nil {
-				log.WithError(errProxyConfig).Error("failed to update proxy pool runtime configuration")
-			}
+		return result, nil
+	}
+	reloadCallback := func(newCfg *config.Config) {
+		if _, errApply := applyReloadedConfig(newCfg); errApply != nil {
+			log.WithError(errApply).Error("failed to apply reloaded runtime configuration; previous runtime retained")
 		}
-		s.cfgMu.Lock()
-		s.cfg = newCfg
-		s.cfgMu.Unlock()
-		if s.coreManager != nil {
-			s.coreManager.SetConfig(newCfg)
-			s.coreManager.SetOAuthModelAlias(newCfg.OAuthModelAlias)
-		}
-		s.rebindExecutors()
-		authModelExclusionsChanged := authModelExclusionsSignature(previousCfgSnapshot) != authModelExclusionsSignature(newCfg)
-		if s.coreManager != nil &&
-			!authModelExclusionsChanged &&
-			shouldRefreshChatGPTWebRegistrations(previousCfgSnapshot, newCfg) {
-			for _, auth := range s.coreManager.ChatGPTWebAuths() {
-				s.refreshChatGPTWebModelRegistration(ctx, auth)
-			}
-		}
-		nextImportModels := newCfg.ChatGPTWeb.Import.Resolved().ValidateModelsAfterUpload
-		s.applyChatGPTWebImportModelValidationConfig(ctx, nextImportModels)
-		if s.coreManager != nil && authModelExclusionsChanged {
-			for _, auth := range s.coreManager.List() {
-				if isNativeChatGPTWebAuth(auth) {
-					s.refreshChatGPTWebModelRegistration(ctx, auth)
-					continue
-				}
-				s.refreshModelRegistrationForAuth(auth)
-			}
-		} else if s.coreManager != nil && shouldRefreshCodexRegistrations(previousCfgSnapshot, newCfg) {
-			for _, auth := range s.coreManager.AuthsForProviders("codex") {
-				s.refreshModelRegistrationForAuth(auth)
-			}
-		}
-		s.applyUsagePersistenceConfigChange(previousUsageEnabled, previousUsageInterval, newCfg)
-		s.warnAuthMaintenanceConfig(newCfg.AuthMaintenance)
-		s.wakeAuthMaintenance()
 	}
 
 	watcherWrapper, err = s.watcherFactory(s.configPath, s.cfg.AuthDir, reloadCallback)
@@ -4698,6 +4825,12 @@ func (s *Service) Run(ctx context.Context) error {
 		return fmt.Errorf("cliproxy: failed to create watcher: %w", err)
 	}
 	s.watcher = watcherWrapper
+	watcherWrapper.SetConfigApply(func(newCfg *config.Config) (*config.Config, error) {
+		if _, errApply := applyReloadedConfig(newCfg); errApply != nil {
+			return nil, errApply
+		}
+		return config.Clone(s.currentConfig())
+	})
 	s.ensureAuthUpdateQueue(ctx)
 	if s.authUpdates != nil {
 		watcherWrapper.SetAuthUpdateObserver(s.observeAuthUpdateQueued)

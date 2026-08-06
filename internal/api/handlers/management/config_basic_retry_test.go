@@ -2,7 +2,10 @@ package management
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -10,9 +13,13 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 )
 
 func init() {
@@ -428,6 +435,218 @@ func TestPutRoutingPriorityOverrides_PersistsExplicitZeroLimit(t *testing.T) {
 	}
 	if len(loaded.Routing.PriorityOverrides) != 1 || loaded.Routing.PriorityOverrides[0].PerAuthRequestLimit == nil || *loaded.Routing.PriorityOverrides[0].PerAuthRequestLimit != 0 {
 		t.Fatalf("persisted overrides = %+v, want explicit zero limit", loaded.Routing.PriorityOverrides)
+	}
+}
+
+func TestRoutingManagementUpdatesRequestLimiterImmediately(t *testing.T) {
+	tests := []struct {
+		name          string
+		prepareUpdate func(*config.Config)
+		request       func() *http.Request
+		update        func(*Handler, *gin.Context)
+	}{
+		{
+			name: "priority override endpoint",
+			request: func() *http.Request {
+				request := httptest.NewRequest(http.MethodPatch, "/v0/management/routing/priority-overrides", strings.NewReader(`{"value":[{"priority":4,"per-auth-request-limit":100,"per-auth-request-window-minutes":1}]}`))
+				request.Header.Set("Content-Type", "application/json")
+				return request
+			},
+			update: func(handler *Handler, requestContext *gin.Context) {
+				handler.PutRoutingPriorityOverrides(requestContext)
+			},
+		},
+		{
+			name: "full YAML endpoint",
+			request: func() *http.Request {
+				request := httptest.NewRequest(http.MethodPut, "/v0/management/config.yaml", strings.NewReader("routing:\n  per-auth-request-limit: 0\n  per-auth-request-window-minutes: 1\n"))
+				request.Header.Set("Content-Type", "application/yaml")
+				return request
+			},
+			update: func(handler *Handler, requestContext *gin.Context) {
+				handler.PutConfigYAML(requestContext)
+			},
+		},
+		{
+			name: "unrelated field endpoint",
+			prepareUpdate: func(cfg *config.Config) {
+				limit := 100
+				window := 1
+				cfg.Routing.PriorityOverrides = []config.RoutingPriorityOverride{{
+					Priority:                    4,
+					PerAuthRequestLimit:         &limit,
+					PerAuthRequestWindowMinutes: &window,
+				}}
+			},
+			request: func() *http.Request {
+				request := httptest.NewRequest(http.MethodPut, "/v0/management/debug", strings.NewReader(`{"value":true}`))
+				request.Header.Set("Content-Type", "application/json")
+				return request
+			},
+			update: func(handler *Handler, requestContext *gin.Context) {
+				handler.PutDebug(requestContext)
+			},
+		},
+	}
+
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			authID := "routing-runtime-sync-" + strings.NewReplacer("/", "-", " ", "-").Replace(t.Name())
+			model := authID + "-model"
+			cfg := &config.Config{Routing: config.RoutingConfig{
+				PerAuthRequestLimit:         1,
+				PerAuthRequestWindowMinutes: 1,
+			}}
+			manager := coreauth.NewManager(nil, nil, nil)
+			manager.RegisterExecutor(&chatGPTWebManagementTestExecutor{})
+			manager.SetConfig(cfg)
+			registry.GetGlobalRegistry().RegisterClient(authID, "chatgpt-web", []*registry.ModelInfo{{ID: model}})
+			t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(authID) })
+			if _, errRegister := manager.Register(coreauth.WithSkipPersist(t.Context()), &coreauth.Auth{
+				ID:         authID,
+				Provider:   "chatgpt-web",
+				Status:     coreauth.StatusActive,
+				Metadata:   map[string]any{"access_token": "test-token"},
+				Attributes: map[string]string{"priority": "4"},
+			}); errRegister != nil {
+				t.Fatalf("register auth: %v", errRegister)
+			}
+
+			request := cliproxyexecutor.Request{Model: model}
+			options := cliproxyexecutor.Options{}
+			if _, errExecute := manager.Execute(t.Context(), []string{"chatgpt-web"}, request, options); errExecute != nil {
+				t.Fatalf("first execution: %v", errExecute)
+			}
+			if _, errExecute := manager.Execute(t.Context(), []string{"chatgpt-web"}, request, options); errExecute == nil || !strings.Contains(errExecute.Error(), "auth_request_limited") {
+				t.Fatalf("second execution error = %v, want auth_request_limited", errExecute)
+			}
+			if testCase.prepareUpdate != nil {
+				testCase.prepareUpdate(cfg)
+			}
+
+			configPath := writeTestConfigFile(t)
+			handler := &Handler{cfg: cfg, configFilePath: configPath, authManager: manager}
+			recorder := httptest.NewRecorder()
+			requestContext, _ := gin.CreateTestContext(recorder)
+			requestContext.Request = testCase.request()
+			testCase.update(handler, requestContext)
+			if recorder.Code != http.StatusOK {
+				t.Fatalf("update status = %d, body = %s", recorder.Code, recorder.Body.String())
+			}
+
+			if _, errExecute := manager.Execute(t.Context(), []string{"chatgpt-web"}, request, options); errExecute != nil {
+				t.Fatalf("execution after management update = %v, want immediate success", errExecute)
+			}
+		})
+	}
+}
+
+func TestManagementRuntimeApplyFailureRollsBackFileAndRuntimeOutsideHandlerLock(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	if errWrite := os.WriteFile(configPath, []byte("request-retry: 1\n"), 0o600); errWrite != nil {
+		t.Fatalf("write config: %v", errWrite)
+	}
+	handler := NewHandler(&config.Config{RequestRetry: 1}, configPath, nil)
+	var applied []int
+	handler.SetRuntimeConfigApplier(func(_ context.Context, candidate *config.Config) (config.RuntimeApplyResult, error) {
+		applied = append(applied, candidate.RequestRetry)
+		if candidate.RequestRetry == 9 {
+			return config.RuntimeApplyResult{}, errors.New("synthetic runtime failure")
+		}
+		if errSet := handler.SetConfig(candidate); errSet != nil {
+			return config.RuntimeApplyResult{}, errSet
+		}
+		return config.RuntimeApplyResult{Applied: true}, nil
+	})
+
+	recorder := httptest.NewRecorder()
+	requestContext, _ := gin.CreateTestContext(recorder)
+	requestContext.Request = httptest.NewRequest(http.MethodPut, "/v0/management/request-retry", strings.NewReader(`{"value":9}`))
+	requestContext.Request.Header.Set("Content-Type", "application/json")
+	handler.PutRequestRetry(requestContext)
+	if recorder.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500; body=%s", recorder.Code, recorder.Body.String())
+	}
+	if len(applied) != 2 || strings.Join([]string{strconv.Itoa(applied[0]), strconv.Itoa(applied[1])}, ",") != "9,1" {
+		t.Fatalf("runtime apply sequence = %#v, want [9 1]", applied)
+	}
+	loaded, errLoad := config.LoadConfig(configPath)
+	if errLoad != nil {
+		t.Fatalf("load rolled back config: %v", errLoad)
+	}
+	if loaded.RequestRetry != 1 || handler.cfg.RequestRetry != 1 {
+		t.Fatalf("rollback state: file=%d handler=%d", loaded.RequestRetry, handler.cfg.RequestRetry)
+	}
+}
+
+func TestConfigMutationMiddlewareSerializesRuntimeTransactions(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	if errWrite := os.WriteFile(configPath, []byte("request-retry: 1\n"), 0o600); errWrite != nil {
+		t.Fatalf("write config: %v", errWrite)
+	}
+	handler := NewHandler(&config.Config{RequestRetry: 1}, configPath, nil)
+	firstEntered := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	applyValues := make(chan int, 2)
+	handler.SetRuntimeConfigApplier(func(_ context.Context, candidate *config.Config) (config.RuntimeApplyResult, error) {
+		applyValues <- candidate.RequestRetry
+		if candidate.RequestRetry == 2 {
+			close(firstEntered)
+			<-releaseFirst
+		}
+		if errSet := handler.SetConfig(candidate); errSet != nil {
+			return config.RuntimeApplyResult{}, errSet
+		}
+		return config.RuntimeApplyResult{Applied: true}, nil
+	})
+
+	router := gin.New()
+	router.Use(handler.ConfigMutationMiddleware())
+	router.PUT("/v0/management/request-retry", handler.PutRequestRetry)
+	type response struct {
+		code int
+		body string
+	}
+	request := func(value int, result chan<- response) {
+		recorder := httptest.NewRecorder()
+		body := strings.NewReader(fmt.Sprintf(`{"value":%d}`, value))
+		httpRequest := httptest.NewRequest(http.MethodPut, "/v0/management/request-retry", body)
+		httpRequest.Header.Set("Content-Type", "application/json")
+		router.ServeHTTP(recorder, httpRequest)
+		result <- response{code: recorder.Code, body: recorder.Body.String()}
+	}
+	results := make(chan response, 2)
+	go request(2, results)
+	select {
+	case <-firstEntered:
+	case <-time.After(time.Second):
+		t.Fatal("first runtime transaction did not start")
+	}
+	if firstValue := <-applyValues; firstValue != 2 {
+		t.Fatalf("first runtime apply = %d, want 2", firstValue)
+	}
+	go request(3, results)
+	select {
+	case value := <-applyValues:
+		t.Fatalf("second runtime transaction started before first completed: %d", value)
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(releaseFirst)
+	for range 2 {
+		result := <-results
+		if result.code != http.StatusOK {
+			t.Fatalf("config update status = %d, body=%s", result.code, result.body)
+		}
+	}
+	if secondValue := <-applyValues; secondValue != 3 {
+		t.Fatalf("second runtime apply = %d, want 3", secondValue)
+	}
+	loaded, errLoad := config.LoadConfig(configPath)
+	if errLoad != nil {
+		t.Fatalf("load config: %v", errLoad)
+	}
+	if loaded.RequestRetry != 3 || handler.cfg.RequestRetry != 3 {
+		t.Fatalf("final config: file=%d handler=%d, want 3", loaded.RequestRetry, handler.cfg.RequestRetry)
 	}
 }
 
