@@ -8995,7 +8995,7 @@ func authMutationTokenForManager(ctx context.Context, manager *Manager) *authMut
 	}
 	token, _ := ctx.Value(authMutationLockContextKey{}).(*authMutationLockToken)
 	for token != nil {
-		if token.manager == manager {
+		if token.manager == manager && token.active.Load() {
 			return token
 		}
 		token = token.parent

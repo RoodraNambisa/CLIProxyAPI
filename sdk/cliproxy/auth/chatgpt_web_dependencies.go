@@ -534,6 +534,28 @@ func (m *Manager) PersistedAuthSnapshot(ctx context.Context) ([]*Auth, error) {
 	if auths, complete := m.persistedAuthIndexSnapshot(); complete {
 		return auths, nil
 	}
+	// A store enumeration can be comparatively expensive for large file-backed
+	// credential sets. Hold the persistence writer turnstile while it runs so new
+	// auth mutations wait and existing readers drain. This prevents durable saves
+	// and deletes from changing the store revision after the scan starts; otherwise
+	// a busy refresh loop can invalidate every completed walk and force a restart.
+	//
+	// A caller already inside an auth mutation owns a persistence read lock and
+	// cannot upgrade it to the write barrier. Such callers still share the
+	// serialized refresh below; the first ordinary caller establishes the writer
+	// turnstile so existing readers drain without admitting new persistence work.
+	unlockBarrier := func() {}
+	if authMutationTokenForManager(ctx, m) == nil {
+		var errBarrier error
+		unlockBarrier, errBarrier = m.lockPersistBarrierWrite(ctx)
+		if errBarrier != nil {
+			return nil, errBarrier
+		}
+		defer unlockBarrier()
+		if auths, complete := m.persistedAuthIndexSnapshot(); complete {
+			return auths, nil
+		}
+	}
 	if errLock := m.persistedSnapshotRefresh.lock(ctx); errLock != nil {
 		return nil, errLock
 	}

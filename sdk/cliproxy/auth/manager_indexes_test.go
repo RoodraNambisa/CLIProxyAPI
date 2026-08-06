@@ -223,7 +223,7 @@ func TestManagerPersistedAuthSnapshotSharesConcurrentRefresh(t *testing.T) {
 	}
 }
 
-func TestManagerPersistedAuthSnapshotIgnoresConcurrentRuntimeOnlyRevision(t *testing.T) {
+func TestManagerPersistedAuthSnapshotSerializesConcurrentRuntimeOnlyMutation(t *testing.T) {
 	store := &blockingPersistedSnapshotStore{
 		chatGPTWebDependencyTestStore: newChatGPTWebDependencyTestStore(
 			dependencyTestWebAuth("persisted", "source-uid"),
@@ -244,22 +244,89 @@ func TestManagerPersistedAuthSnapshotIgnoresConcurrentRuntimeOnlyRevision(t *tes
 		t.Fatal("persisted snapshot enumeration did not start")
 	}
 
-	if _, errRegister := manager.Register(WithSkipPersist(t.Context()), &Auth{
-		ID:       "runtime-only",
-		Provider: "claude",
-		Status:   StatusActive,
-	}); errRegister != nil {
-		t.Fatal(errRegister)
+	registerResult := make(chan error, 1)
+	go func() {
+		_, errRegister := manager.Register(WithSkipPersist(t.Context()), &Auth{
+			ID:       "runtime-only",
+			Provider: "claude",
+			Status:   StatusActive,
+		})
+		registerResult <- errRegister
+	}()
+	select {
+	case errRegister := <-registerResult:
+		t.Fatalf("runtime mutation completed during persisted snapshot refresh: %v", errRegister)
+	case <-time.After(50 * time.Millisecond):
 	}
 	close(store.release)
 	if errSnapshot := <-result; errSnapshot != nil {
 		t.Fatal(errSnapshot)
+	}
+	if errRegister := <-registerResult; errRegister != nil {
+		t.Fatal(errRegister)
 	}
 	if calls := store.listCalls.Load(); calls != 1 {
 		t.Fatalf("store List calls = %d, want 1", calls)
 	}
 	if _, complete := manager.ChatGPTWebDependencyIndexSnapshot(); !complete {
 		t.Fatal("runtime-only mutation invalidated the refreshed persistence index")
+	}
+	assertManagerAuthIndexesConsistent(t, manager)
+}
+
+func TestManagerPersistedAuthSnapshotDoesNotReuseReleasedMutationBarrier(t *testing.T) {
+	store := &blockingPersistedSnapshotStore{
+		chatGPTWebDependencyTestStore: newChatGPTWebDependencyTestStore(
+			dependencyTestWebAuth("persisted", "source-uid"),
+		),
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	manager := NewManager(store, nil, nil)
+	lockedCtx, unlockMutation, errLock := manager.LockAuthMutation(t.Context(), &Auth{
+		ID:       "released-mutation",
+		Provider: "claude",
+	})
+	if errLock != nil {
+		t.Fatal(errLock)
+	}
+	unlockMutation()
+
+	snapshotResult := make(chan error, 1)
+	go func() {
+		_, errSnapshot := manager.PersistedAuthSnapshot(lockedCtx)
+		snapshotResult <- errSnapshot
+	}()
+	select {
+	case <-store.started:
+	case <-time.After(time.Second):
+		t.Fatal("persisted snapshot enumeration did not start")
+	}
+
+	registerResult := make(chan error, 1)
+	go func() {
+		_, errRegister := manager.Register(t.Context(), &Auth{
+			ID:       "durable",
+			Provider: "claude",
+			Metadata: map[string]any{"marker": "saved"},
+		})
+		registerResult <- errRegister
+	}()
+	select {
+	case errRegister := <-registerResult:
+		t.Fatalf("durable mutation bypassed the snapshot barrier through a released context: %v", errRegister)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(store.release)
+	if errSnapshot := <-snapshotResult; errSnapshot != nil {
+		t.Fatal(errSnapshot)
+	}
+	if errRegister := <-registerResult; errRegister != nil {
+		t.Fatal(errRegister)
+	}
+	if calls := store.listCalls.Load(); calls != 1 {
+		t.Fatalf("store List calls = %d, want one stable refresh", calls)
 	}
 	assertManagerAuthIndexesConsistent(t, manager)
 }
@@ -290,6 +357,67 @@ func TestManagerPersistedAuthSnapshotTracksDurableRuntimeMetadataMutation(t *tes
 	}
 	if len(persisted) != 1 || persisted[0].Metadata["persisted_marker"] != "updated" {
 		t.Fatalf("persisted snapshot = %#v, want updated metadata", persisted)
+	}
+	assertManagerAuthIndexesConsistent(t, manager)
+}
+
+func TestManagerPersistedAuthSnapshotSerializesConcurrentDurableSave(t *testing.T) {
+	auth := dependencyTestWebAuth("concurrent-save", "source-uid")
+	baseStore := newChatGPTWebDependencyTestStore(auth)
+	manager := NewManager(baseStore, nil, nil)
+	if errLoad := manager.Load(t.Context()); errLoad != nil {
+		t.Fatal(errLoad)
+	}
+	store := &blockingPersistedSnapshotStore{
+		chatGPTWebDependencyTestStore: baseStore,
+		started:                       make(chan struct{}),
+		release:                       make(chan struct{}),
+	}
+	manager.SetStore(store)
+
+	snapshotResult := make(chan error, 1)
+	go func() {
+		_, errSnapshot := manager.PersistedAuthSnapshot(t.Context())
+		snapshotResult <- errSnapshot
+	}()
+	select {
+	case <-store.started:
+	case <-time.After(time.Second):
+		t.Fatal("persisted snapshot enumeration did not start")
+	}
+
+	current, ok := manager.GetByID(auth.ID)
+	if !ok || current == nil {
+		t.Fatal("loaded auth not found")
+	}
+	current.Metadata["persisted_marker"] = "updated"
+	updateResult := make(chan error, 1)
+	go func() {
+		_, errUpdate := manager.Update(t.Context(), current)
+		updateResult <- errUpdate
+	}()
+	select {
+	case errUpdate := <-updateResult:
+		t.Fatalf("durable save completed during persisted snapshot refresh: %v", errUpdate)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(store.release)
+	if errSnapshot := <-snapshotResult; errSnapshot != nil {
+		t.Fatal(errSnapshot)
+	}
+	if errUpdate := <-updateResult; errUpdate != nil {
+		t.Fatal(errUpdate)
+	}
+	persisted, errSnapshot := manager.PersistedAuthSnapshot(t.Context())
+	if errSnapshot != nil {
+		t.Fatal(errSnapshot)
+	}
+	if len(persisted) != 1 || persisted[0].Metadata["persisted_marker"] != "updated" {
+		t.Fatalf("persisted snapshot = %#v, want updated metadata", persisted)
+	}
+	if calls := store.listCalls.Load(); calls != 1 {
+		t.Fatalf("store List calls = %d, want one stable refresh", calls)
 	}
 	assertManagerAuthIndexesConsistent(t, manager)
 }
@@ -368,19 +496,28 @@ func TestManagerPersistedAuthSnapshotRejectsConcurrentUncertainDelete(t *testing
 	}
 
 	storeErr := errors.New("delete outcome unavailable")
-	if errDelete := manager.DeleteWithOperation(t.Context(), auth.ID, func(context.Context) error {
-		return NewDeleteOutcomeError(DeleteOutcomeUncertain, storeErr)
-	}); !errors.Is(errDelete, storeErr) {
-		t.Fatalf("DeleteWithOperation() error = %v, want %v", errDelete, storeErr)
+	deleteResult := make(chan error, 1)
+	go func() {
+		deleteResult <- manager.DeleteWithOperation(t.Context(), auth.ID, func(context.Context) error {
+			return NewDeleteOutcomeError(DeleteOutcomeUncertain, storeErr)
+		})
+	}()
+	select {
+	case errDelete := <-deleteResult:
+		t.Fatalf("uncertain delete completed during persisted snapshot refresh: %v", errDelete)
+	case <-time.After(50 * time.Millisecond):
 	}
 	close(store.release)
 	if errSnapshot := <-result; errSnapshot != nil {
 		t.Fatal(errSnapshot)
 	}
-	if calls := store.listCalls.Load(); calls != 2 {
-		t.Fatalf("store List calls = %d, want one retry after uncertain delete", calls)
+	if errDelete := <-deleteResult; !errors.Is(errDelete, storeErr) {
+		t.Fatalf("DeleteWithOperation() error = %v, want %v", errDelete, storeErr)
 	}
-	if persisted, complete := manager.PersistedAuthByID(auth.ID); persisted == nil || !complete {
+	if calls := store.listCalls.Load(); calls != 1 {
+		t.Fatalf("store List calls = %d, want one stable refresh", calls)
+	}
+	if persisted, complete := manager.PersistedAuthByID(auth.ID); persisted == nil || complete {
 		t.Fatalf("persisted auth after uncertain delete = %#v, complete=%v", persisted, complete)
 	}
 }
@@ -410,17 +547,26 @@ func TestManagerPersistedAuthSnapshotRejectsConcurrentCommittedDelete(t *testing
 		t.Fatal("persisted snapshot enumeration did not start")
 	}
 
-	if errDelete := manager.DeleteWithOperation(t.Context(), auth.ID, func(ctx context.Context) error {
-		return baseStore.Delete(ctx, auth.ID)
-	}); errDelete != nil {
-		t.Fatal(errDelete)
+	deleteResult := make(chan error, 1)
+	go func() {
+		deleteResult <- manager.DeleteWithOperation(t.Context(), auth.ID, func(ctx context.Context) error {
+			return baseStore.Delete(ctx, auth.ID)
+		})
+	}()
+	select {
+	case errDelete := <-deleteResult:
+		t.Fatalf("committed delete completed during persisted snapshot refresh: %v", errDelete)
+	case <-time.After(50 * time.Millisecond):
 	}
 	close(store.release)
 	if errSnapshot := <-result; errSnapshot != nil {
 		t.Fatal(errSnapshot)
 	}
-	if calls := store.listCalls.Load(); calls != 2 {
-		t.Fatalf("store List calls = %d, want one retry after committed delete", calls)
+	if errDelete := <-deleteResult; errDelete != nil {
+		t.Fatal(errDelete)
+	}
+	if calls := store.listCalls.Load(); calls != 1 {
+		t.Fatalf("store List calls = %d, want one stable refresh", calls)
 	}
 	if persisted, complete := manager.PersistedAuthByID(auth.ID); persisted != nil || !complete {
 		t.Fatalf("persisted auth after committed delete = %#v, complete=%v", persisted, complete)
