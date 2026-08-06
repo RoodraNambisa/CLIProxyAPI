@@ -1299,7 +1299,7 @@ func (e *ChatGPTWebExecutor) uploadChatGPTWebImage(ctx context.Context, client *
 	if err != nil {
 		return chatGPTWebUploadedImage{}, statusErr{code: http.StatusBadRequest, msg: err.Error(), skipAuthResult: true}
 	}
-	_, config, err := decodeAndValidateChatGPTWebImage(data, mimeType)
+	config, err := chatGPTWebReferenceImageConfig(data, mimeType)
 	if err != nil {
 		return chatGPTWebUploadedImage{}, statusErr{code: http.StatusBadRequest, msg: "decode image: " + err.Error(), skipAuthResult: true}
 	}
@@ -1562,6 +1562,17 @@ func chatGPTWebImageConfig(data []byte, mimeType string) (image.Config, error) {
 	return imageConfig, validateChatGPTWebImageConfig(imageConfig)
 }
 
+func chatGPTWebReferenceImageConfig(data []byte, mimeType string) (image.Config, error) {
+	imageConfig, err := decodeChatGPTWebImageConfig(data, mimeType)
+	if err != nil {
+		return image.Config{}, err
+	}
+	if imageConfig.Width <= 0 || imageConfig.Height <= 0 {
+		return image.Config{}, errors.New("image dimensions must be positive")
+	}
+	return imageConfig, nil
+}
+
 func chatGPTWebOutputImageConfig(data []byte, mimeType string) (image.Config, error) {
 	imageConfig, err := decodeChatGPTWebImageConfig(data, mimeType)
 	if err != nil {
@@ -1571,8 +1582,11 @@ func chatGPTWebOutputImageConfig(data []byte, mimeType string) (image.Config, er
 }
 
 func decodeChatGPTWebImageConfig(data []byte, mimeType string) (image.Config, error) {
-	imageConfig, _, err := image.DecodeConfig(bytes.NewReader(data))
+	imageConfig, format, err := image.DecodeConfig(bytes.NewReader(data))
 	if err == nil {
+		if !chatGPTWebImageFormatMatchesMIME(format, mimeType) {
+			return image.Config{}, fmt.Errorf("image content does not match MIME type %q", mimeType)
+		}
 		return imageConfig, nil
 	}
 	if !strings.EqualFold(strings.TrimSpace(mimeType), "image/webp") {
@@ -1585,8 +1599,19 @@ func decodeChatGPTWebImageConfig(data []byte, mimeType string) (image.Config, er
 	return image.Config{Width: width, Height: height}, nil
 }
 
-func decodeAndValidateChatGPTWebImage(data []byte, mimeType string) (image.Image, image.Config, error) {
-	return decodeAndValidateChatGPTWebImageWithConfig(data, mimeType, chatGPTWebImageConfig)
+func chatGPTWebImageFormatMatchesMIME(format, mimeType string) bool {
+	mediaType, _, errParse := mime.ParseMediaType(strings.ToLower(strings.TrimSpace(mimeType)))
+	if errParse != nil {
+		mediaType = strings.ToLower(strings.TrimSpace(strings.SplitN(mimeType, ";", 2)[0]))
+	}
+	switch mediaType {
+	case "image/jpeg", "image/jpg":
+		return strings.EqualFold(strings.TrimSpace(format), "jpeg")
+	case "image/png", "image/gif", "image/webp":
+		return strings.EqualFold(strings.TrimSpace(format), strings.TrimPrefix(mediaType, "image/"))
+	default:
+		return false
+	}
 }
 
 func decodeAndValidateChatGPTWebOutputImage(data []byte, mimeType string) (image.Image, image.Config, error) {

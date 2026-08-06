@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/crc32"
 	"image"
 	"image/color"
 	"image/jpeg"
@@ -4236,23 +4238,79 @@ func TestValidateChatGPTWebDownloadedImageRejectsTruncatedPayload(t *testing.T) 
 	}
 }
 
-func TestUploadChatGPTWebImageRejectsTruncatedPayloadBeforeUpload(t *testing.T) {
-	valid := chatGPTWebPNGBytes(t, color.NRGBA{R: 255, A: 255})
-	truncated := valid[:len(valid)-8]
+func TestUploadChatGPTWebImageUsesHeaderOnlyForOrdinaryReference(t *testing.T) {
+	const width = 4096
+	const height = 4096
+	headerOnly := chatGPTWebPNGHeaderOnly(width, height)
+	if _, _, errDecode := image.Decode(bytes.NewReader(headerOnly)); errDecode == nil {
+		t.Fatal("header-only PNG unexpectedly completed a full decode")
+	}
+	if _, errConfig := chatGPTWebImageConfig(headerOnly, "image/png"); errConfig == nil {
+		t.Fatal("mask/full-decode configuration accepted an image above its memory budget")
+	}
+
+	var server *httptest.Server
+	var signedWidth, signedHeight int
+	var uploaded []byte
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/backend-api/files":
+			var body struct {
+				Width  int `json:"width"`
+				Height int `json:"height"`
+			}
+			if errDecode := json.NewDecoder(request.Body).Decode(&body); errDecode != nil {
+				t.Errorf("decode signing request: %v", errDecode)
+			}
+			signedWidth, signedHeight = body.Width, body.Height
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"file_id":    "header-only-input",
+				"upload_url": server.URL + "/signed-upload",
+			})
+		case "/signed-upload":
+			var errRead error
+			uploaded, errRead = io.ReadAll(request.Body)
+			if errRead != nil {
+				t.Errorf("read uploaded image: %v", errRead)
+			}
+			w.WriteHeader(http.StatusCreated)
+		case "/backend-api/files/header-only-input/uploaded":
+			_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
+		default:
+			http.NotFound(w, request)
+		}
+	}))
+	defer server.Close()
+
 	executor := NewChatGPTWebExecutor(nil, nil)
-	_, err := executor.uploadChatGPTWebImage(
-		context.Background(),
-		nil,
-		nil,
-		"data:image/png;base64,"+base64.StdEncoding.EncodeToString(truncated),
+	executor.runtimeBaseURL = server.URL
+	client, credential, errClient := executor.newRuntimeClient(chatGPTWebRuntimeAuth())
+	if errClient != nil {
+		t.Fatal(errClient)
+	}
+	defer client.CloseIdleConnections()
+	uploadedImage, err := executor.uploadChatGPTWebImage(
+		t.Context(),
+		client,
+		credential,
+		"data:image/png;base64,"+base64.StdEncoding.EncodeToString(headerOnly),
 		"input.png",
 	)
-	if err == nil || !strings.Contains(err.Error(), "decode image") {
+	if err != nil {
 		t.Fatalf("uploadChatGPTWebImage() error = %v", err)
 	}
-	var status interface{ StatusCode() int }
-	if !errors.As(err, &status) || status.StatusCode() != http.StatusBadRequest {
-		t.Fatalf("upload status error = %v", err)
+	if signedWidth != width || signedHeight != height || uploadedImage.Width != width || uploadedImage.Height != height {
+		t.Fatalf("dimensions signed=%dx%d uploaded=%dx%d", signedWidth, signedHeight, uploadedImage.Width, uploadedImage.Height)
+	}
+	if !bytes.Equal(uploaded, headerOnly) {
+		t.Fatal("ordinary reference image bytes were modified before upload")
+	}
+}
+
+func TestChatGPTWebReferenceImageConfigRejectsMIMEMismatch(t *testing.T) {
+	_, err := chatGPTWebReferenceImageConfig(chatGPTWebPNGBytes(t), "image/jpeg")
+	if err == nil || !strings.Contains(err.Error(), "does not match MIME type") {
+		t.Fatalf("chatGPTWebReferenceImageConfig() error = %v", err)
 	}
 }
 
@@ -7614,6 +7672,29 @@ func writeChatGPTWebImageConversationState(w http.ResponseWriter, terminal bool,
 func chatGPTWebPNGDataURL(t *testing.T, pixels ...color.NRGBA) string {
 	t.Helper()
 	return "data:image/png;base64," + base64.StdEncoding.EncodeToString(chatGPTWebPNGBytes(t, pixels...))
+}
+
+func chatGPTWebPNGHeaderOnly(width, height uint32) []byte {
+	var output bytes.Buffer
+	output.Write([]byte{0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n'})
+	writeChunk := func(chunkType string, payload []byte) {
+		_ = binary.Write(&output, binary.BigEndian, uint32(len(payload)))
+		output.WriteString(chunkType)
+		output.Write(payload)
+		checksum := crc32.NewIEEE()
+		_, _ = checksum.Write([]byte(chunkType))
+		_, _ = checksum.Write(payload)
+		_ = binary.Write(&output, binary.BigEndian, checksum.Sum32())
+	}
+
+	ihdr := make([]byte, 13)
+	binary.BigEndian.PutUint32(ihdr[0:4], width)
+	binary.BigEndian.PutUint32(ihdr[4:8], height)
+	ihdr[8] = 8
+	ihdr[9] = 6
+	writeChunk("IHDR", ihdr)
+	writeChunk("IEND", nil)
+	return output.Bytes()
 }
 
 func chatGPTWebPNGBytes(t *testing.T, pixels ...color.NRGBA) []byte {
