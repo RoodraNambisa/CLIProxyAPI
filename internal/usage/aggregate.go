@@ -38,6 +38,11 @@ type usageAggregateBucket struct {
 	Sources     map[string]*aggregateStats
 }
 
+type usageAggregateProjection struct {
+	add   func(*usageAggregateBucket, string, string, RequestDetail)
+	merge func(*usageAggregateBucket, *usageAggregateBucket)
+}
+
 type usageDetailRef struct {
 	Timestamp time.Time
 	API       string
@@ -388,6 +393,145 @@ func (s *RequestStatistics) aggregateRangeLocked(timeRange TimeRange) *usageAggr
 		s.addIndexedDetailsLocked(result, TimeRange{From: edgeFrom, To: to}, nil)
 	}
 	return result
+}
+
+func (s *RequestStatistics) aggregateProjectedRangeLocked(timeRange TimeRange, projection usageAggregateProjection) *usageAggregateBucket {
+	result := newUsageAggregateBucket()
+	if projection.add == nil || projection.merge == nil {
+		return result
+	}
+	if timeRange.IsZero() {
+		for _, bucket := range s.dayBuckets {
+			projection.merge(result, bucket)
+		}
+		return result
+	}
+	if s.oldestAt.IsZero() || s.newestAt.IsZero() {
+		return result
+	}
+	now := time.Now().UTC()
+	buckets, step := s.bucketsForRangeLocked(timeRange, now)
+	timeRange = clampUsageRangeToBucketBounds(timeRange, s.oldestAt, s.newestAt, step)
+	if timeRange.From.IsZero() || timeRange.To.IsZero() || !timeRange.From.Before(timeRange.To) {
+		return result
+	}
+	from := timeRange.From.UTC()
+	to := timeRange.To.UTC()
+	fullFrom := ceilAggregateTime(from, step)
+	fullTo := truncateAggregateTime(to, step)
+	if !fullFrom.Before(fullTo) {
+		s.addIndexedDetailsProjectedLocked(result, timeRange, projection)
+		return result
+	}
+	if from.Before(fullFrom) {
+		edgeTo := fullFrom
+		if to.Before(edgeTo) {
+			edgeTo = to
+		}
+		s.addIndexedDetailsProjectedLocked(result, TimeRange{From: from, To: edgeTo}, projection)
+	}
+	s.mergeAggregateBucketsProjectedLocked(result, buckets, fullFrom, fullTo, step, projection)
+	if fullTo.Before(to) {
+		edgeFrom := fullTo
+		if edgeFrom.Before(from) {
+			edgeFrom = from
+		}
+		s.addIndexedDetailsProjectedLocked(result, TimeRange{From: edgeFrom, To: to}, projection)
+	}
+	return result
+}
+
+func (s *RequestStatistics) mergeAggregateBucketsProjectedLocked(result *usageAggregateBucket, buckets map[int64]*usageAggregateBucket, from, to time.Time, step time.Duration, projection usageAggregateProjection) {
+	if result == nil || !from.Before(to) {
+		return
+	}
+	steps := int64(to.Sub(from) / step)
+	if steps <= int64(len(buckets))+32 {
+		for bucketTime := from; bucketTime.Before(to); bucketTime = bucketTime.Add(step) {
+			projection.merge(result, buckets[bucketTime.Unix()])
+		}
+		return
+	}
+	for key, bucket := range buckets {
+		bucketTime := time.Unix(key, 0).UTC()
+		if bucketTime.Before(from) || !bucketTime.Before(to) {
+			continue
+		}
+		projection.merge(result, bucket)
+	}
+}
+
+func (s *RequestStatistics) addIndexedDetailsProjectedLocked(target *usageAggregateBucket, timeRange TimeRange, projection usageAggregateProjection) {
+	s.forEachIndexedDetailLocked(timeRange, func(apiName, modelName string, detail RequestDetail) {
+		projection.add(target, apiName, modelName, detail)
+	})
+}
+
+func summaryAggregateProjection(includeSources bool) usageAggregateProjection {
+	return usageAggregateProjection{
+		add: func(target *usageAggregateBucket, apiName, modelName string, detail RequestDetail) {
+			target.Total.addDetail(detail)
+			ensureAggregate(target.APIs, apiName).addDetail(detail)
+			ensureAggregate(target.Models, modelName).addDetail(detail)
+			ensureNestedAggregate(target.APIModels, apiName, modelName).addDetail(detail)
+			if includeSources {
+				source := strings.TrimSpace(detail.Source)
+				if source == "" {
+					source = "unknown"
+				}
+				ensureAggregate(target.Sources, source).addDetail(detail)
+			}
+		},
+		merge: func(target, source *usageAggregateBucket) {
+			if target == nil || source == nil {
+				return
+			}
+			target.Total.merge(source.Total)
+			mergeAggregateMap(target.APIs, source.APIs)
+			mergeAggregateMap(target.Models, source.Models)
+			mergeNestedAggregateMap(target.APIModels, source.APIModels)
+			if includeSources {
+				mergeAggregateMap(target.Sources, source.Sources)
+			}
+		},
+	}
+}
+
+func authAggregateProjection() usageAggregateProjection {
+	return usageAggregateProjection{
+		add: func(target *usageAggregateBucket, _ string, modelName string, detail RequestDetail) {
+			authIndex := strings.TrimSpace(detail.AuthIndex)
+			if authIndex == "" {
+				authIndex = "unknown"
+			}
+			ensureAggregate(target.Auths, authIndex).addDetail(detail)
+			ensureNestedAggregate(target.AuthModels, authIndex, modelName).addDetail(detail)
+		},
+		merge: func(target, source *usageAggregateBucket) {
+			if target == nil || source == nil {
+				return
+			}
+			mergeAggregateMap(target.Auths, source.Auths)
+			mergeNestedAggregateMap(target.AuthModels, source.AuthModels)
+		},
+	}
+}
+
+func sourceAggregateProjection() usageAggregateProjection {
+	return usageAggregateProjection{
+		add: func(target *usageAggregateBucket, _, _ string, detail RequestDetail) {
+			source := strings.TrimSpace(detail.Source)
+			if source == "" {
+				source = "unknown"
+			}
+			ensureAggregate(target.Sources, source).addDetail(detail)
+		},
+		merge: func(target, source *usageAggregateBucket) {
+			if target != nil && source != nil {
+				mergeAggregateMap(target.Sources, source.Sources)
+			}
+		},
+	}
 }
 
 func (s *RequestStatistics) mergeAggregateBucketsLocked(result *usageAggregateBucket, buckets map[int64]*usageAggregateBucket, from, to time.Time, step time.Duration) {

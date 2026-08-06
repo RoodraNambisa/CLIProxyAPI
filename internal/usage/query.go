@@ -136,6 +136,14 @@ type AuthUsageQuery struct {
 	AuthIndexes []string
 }
 
+// SourceFacet summarises one usage source for remote filter suggestions.
+type SourceFacet struct {
+	Value         string     `json:"value"`
+	TotalRequests int64      `json:"total_requests"`
+	TotalTokens   int64      `json:"total_tokens"`
+	LastUsedAt    *time.Time `json:"last_used_at"`
+}
+
 // DetailQuery filters usage request details.
 type DetailQuery struct {
 	API       string
@@ -220,6 +228,16 @@ func (s *RequestStatistics) Meta() MetaSnapshot {
 
 // Summary returns aggregated usage statistics without request details.
 func (s *RequestStatistics) Summary() SummarySnapshot {
+	return s.summary(true)
+}
+
+// SummaryWithoutSources returns a compact summary for clients that load source
+// facets independently.
+func (s *RequestStatistics) SummaryWithoutSources() SummarySnapshot {
+	return s.summary(false)
+}
+
+func (s *RequestStatistics) summary(includeSources bool) SummarySnapshot {
 	result := newSummarySnapshot(0)
 	if s == nil {
 		return result
@@ -228,7 +246,7 @@ func (s *RequestStatistics) Summary() SummarySnapshot {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	result = summarySnapshotFromAggregate(s.changeCount, s.allTimeAggregateLocked())
+	result = summarySnapshotFromAggregate(s.changeCount, s.aggregateProjectedRangeLocked(TimeRange{}, summaryAggregateProjection(includeSources)), includeSources)
 	result.RequestsByDay = cloneStringIntMap(s.requestsByDay)
 	result.RequestsByHour = cloneHourIntMap(s.requestsByHour)
 	result.TokensByDay = cloneStringIntMap(s.tokensByDay)
@@ -238,8 +256,18 @@ func (s *RequestStatistics) Summary() SummarySnapshot {
 
 // SummaryForRange returns aggregated usage statistics within a time range.
 func (s *RequestStatistics) SummaryForRange(timeRange TimeRange) SummarySnapshot {
+	return s.summaryForRange(timeRange, true)
+}
+
+// SummaryForRangeWithoutSources returns a compact ranged summary for clients
+// that load source facets independently.
+func (s *RequestStatistics) SummaryForRangeWithoutSources(timeRange TimeRange) SummarySnapshot {
+	return s.summaryForRange(timeRange, false)
+}
+
+func (s *RequestStatistics) summaryForRange(timeRange TimeRange, includeSources bool) SummarySnapshot {
 	if timeRange.IsZero() {
-		return s.Summary()
+		return s.summary(includeSources)
 	}
 	result := newSummarySnapshot(0)
 	if s == nil {
@@ -248,10 +276,53 @@ func (s *RequestStatistics) SummaryForRange(timeRange TimeRange) SummarySnapshot
 
 	s.pruneExpiredBuckets(time.Now().UTC())
 	s.mu.RLock()
-	result = summarySnapshotFromAggregate(s.changeCount, s.aggregateRangeLocked(timeRange))
+	result = summarySnapshotFromAggregate(s.changeCount, s.aggregateProjectedRangeLocked(timeRange, summaryAggregateProjection(includeSources)), includeSources)
 	s.fillLegacyRangeMapsLocked(&result, timeRange)
 	s.mu.RUnlock()
 	return result
+}
+
+// SourceFacets returns filtered source suggestions without serialising the
+// complete source map into the main usage summary.
+func (s *RequestStatistics) SourceFacets(timeRange TimeRange, query string, limit int) ([]SourceFacet, int) {
+	if s == nil {
+		return []SourceFacet{}, 0
+	}
+	query = strings.ToLower(strings.TrimSpace(query))
+	if limit <= 0 {
+		limit = 100
+	}
+	s.pruneExpiredBuckets(time.Now().UTC())
+	s.mu.RLock()
+	sources := s.sources
+	if !timeRange.IsZero() {
+		sources = s.aggregateProjectedRangeLocked(timeRange, sourceAggregateProjection()).Sources
+	}
+	items := make([]SourceFacet, 0, min(len(sources), limit))
+	total := 0
+	for source, stats := range sources {
+		if stats == nil || (query != "" && !strings.Contains(strings.ToLower(source), query)) {
+			continue
+		}
+		total++
+		items = append(items, SourceFacet{
+			Value:         source,
+			TotalRequests: stats.TotalRequests,
+			TotalTokens:   stats.TotalTokens,
+			LastUsedAt:    usageTimePointer(stats.LastUsedAt),
+		})
+	}
+	s.mu.RUnlock()
+	sort.Slice(items, func(i, j int) bool {
+		if items[i].TotalRequests != items[j].TotalRequests {
+			return items[i].TotalRequests > items[j].TotalRequests
+		}
+		return items[i].Value < items[j].Value
+	})
+	if len(items) > limit {
+		items = items[:limit]
+	}
+	return items, total
 }
 
 func (s *RequestStatistics) fillLegacyRangeMapsLocked(result *SummarySnapshot, timeRange TimeRange) {
@@ -348,7 +419,7 @@ func (s *RequestStatistics) AuthSummariesForQuery(query AuthUsageQuery) []AuthUs
 
 	s.pruneExpiredBuckets(time.Now().UTC())
 	s.mu.RLock()
-	aggregates := s.aggregateRangeLocked(query.TimeRange)
+	aggregates := s.aggregateProjectedRangeLocked(query.TimeRange, authAggregateProjection())
 	out := make([]AuthUsageSnapshot, 0, len(aggregates.Auths))
 	for authIndex, stats := range aggregates.Auths {
 		if stats == nil || authIndex == "unknown" {
@@ -640,7 +711,7 @@ func newSummarySnapshot(version uint64) SummarySnapshot {
 	}
 }
 
-func summarySnapshotFromAggregate(version uint64, aggregate *usageAggregateBucket) SummarySnapshot {
+func summarySnapshotFromAggregate(version uint64, aggregate *usageAggregateBucket, includeSources bool) SummarySnapshot {
 	result := newSummarySnapshot(version)
 	if aggregate == nil {
 		return result
@@ -675,9 +746,11 @@ func summarySnapshotFromAggregate(version uint64, aggregate *usageAggregateBucke
 			result.Models[modelName] = modelSummarySnapshotFromAggregate(stats)
 		}
 	}
-	for source, stats := range aggregate.Sources {
-		if stats != nil {
-			result.Sources[source] = modelSummarySnapshotFromAggregate(stats)
+	if includeSources {
+		for source, stats := range aggregate.Sources {
+			if stats != nil {
+				result.Sources[source] = modelSummarySnapshotFromAggregate(stats)
+			}
 		}
 	}
 	return result

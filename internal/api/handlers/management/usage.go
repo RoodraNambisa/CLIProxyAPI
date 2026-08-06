@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -118,12 +117,29 @@ func (h *Handler) GetUsageSummary(c *gin.Context) {
 	if !ok {
 		return
 	}
+	includeSources := true
+	if raw := strings.TrimSpace(c.Query("include_sources")); raw != "" {
+		var err error
+		includeSources, err = strconv.ParseBool(raw)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid include_sources"})
+			return
+		}
+	}
 	var summary usage.SummarySnapshot
 	if h != nil && h.usageStats != nil {
 		if timeRange.IsZero() {
-			summary = h.usageStats.Summary()
+			if includeSources {
+				summary = h.usageStats.Summary()
+			} else {
+				summary = h.usageStats.SummaryWithoutSources()
+			}
 		} else {
-			summary = h.usageStats.SummaryForRange(timeRange)
+			if includeSources {
+				summary = h.usageStats.SummaryForRange(timeRange)
+			} else {
+				summary = h.usageStats.SummaryForRangeWithoutSources(timeRange)
+			}
 		}
 	}
 	c.JSON(http.StatusOK, gin.H{
@@ -153,6 +169,10 @@ func (h *Handler) GetUsageAuthSummaries(c *gin.Context) {
 	if !ok {
 		return
 	}
+	pageQuery, ok := parseUsageAuthPageQuery(c)
+	if !ok {
+		return
+	}
 	authIndexes := parseUsageAuthIndexList(c)
 	infoByIndex := h.usageAuthInfoByIndex()
 	summaries := map[string]usage.AuthUsageSnapshot{}
@@ -166,39 +186,71 @@ func (h *Handler) GetUsageAuthSummaries(c *gin.Context) {
 		}
 	}
 
-	seen := make(map[string]struct{}, len(infoByIndex)+len(summaries))
-	auths := make([]gin.H, 0, len(infoByIndex)+len(summaries))
-	if len(authIndexes) > 0 {
-		for _, authIndex := range authIndexes {
-			summary, hasUsage := summaries[authIndex]
-			info, current := infoByIndex[authIndex]
-			if !hasUsage && !current {
-				continue
-			}
-			if summary.AuthIndex == "" {
-				summary.AuthIndex = authIndex
-			}
-			auths = append(auths, buildUsageAuthResponse(summary, info, !current))
+	rows := mergeUsageAuthRows(authIndexes, infoByIndex, summaries)
+	if !pageQuery.Enabled {
+		auths := make([]gin.H, 0, len(rows))
+		for _, row := range rows {
+			auths = append(auths, buildUsageAuthResponse(row.Summary, row.Info, row.Stale))
 		}
 		c.JSON(http.StatusOK, gin.H{"auths": auths})
 		return
 	}
-	for authIndex, info := range infoByIndex {
-		summary := summaries[authIndex]
-		if summary.AuthIndex == "" {
-			summary.AuthIndex = authIndex
-		}
-		auths = append(auths, buildUsageAuthResponse(summary, info, false))
-		seen[authIndex] = struct{}{}
+	rows = filterUsageAuthRows(rows, pageQuery)
+	sortUsageAuthRows(rows, pageQuery)
+	total := len(rows)
+	pageRows, page, totalPages := paginateUsageAuthRows(rows, pageQuery.Page, pageQuery.PageSize)
+	auths := make([]gin.H, 0, len(pageRows))
+	for _, row := range pageRows {
+		auths = append(auths, buildUsageAuthResponse(row.Summary, row.Info, row.Stale))
 	}
-	for authIndex, summary := range summaries {
-		if _, ok := seen[authIndex]; ok {
-			continue
-		}
-		auths = append(auths, buildUsageAuthResponse(summary, usageAuthInfo{AuthIndex: authIndex}, true))
+	c.Header("Cache-Control", "no-store")
+	c.JSON(http.StatusOK, gin.H{
+		"auths": auths,
+		"total": total,
+		"pagination": gin.H{
+			"enabled":     true,
+			"page":        page,
+			"page_size":   pageQuery.PageSize,
+			"total_pages": totalPages,
+		},
+	})
+}
+
+// GetUsageFacets returns bounded remote suggestions for high-cardinality usage filters.
+func (h *Handler) GetUsageFacets(c *gin.Context) {
+	timeRange, ok := parseUsageTimeRange(c)
+	if !ok {
+		return
 	}
-	sortUsageAuthResponses(auths)
-	c.JSON(http.StatusOK, gin.H{"auths": auths})
+	kind := strings.TrimSpace(c.Query("kind"))
+	if kind == "" {
+		kind = "source"
+	}
+	if kind != "source" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid kind"})
+		return
+	}
+	query := strings.TrimSpace(c.Query("q"))
+	if len(query) > maxUsageAuthSearchBytes {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid q"})
+		return
+	}
+	limit := 100
+	if raw := strings.TrimSpace(c.Query("limit")); raw != "" {
+		value, err := strconv.Atoi(raw)
+		if err != nil || value < 1 || value > 100 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid limit"})
+			return
+		}
+		limit = value
+	}
+	items := []usage.SourceFacet{}
+	total := 0
+	if h != nil && h.usageStats != nil {
+		items, total = h.usageStats.SourceFacets(timeRange, query, limit)
+	}
+	c.Header("Cache-Control", "no-store")
+	c.JSON(http.StatusOK, gin.H{"kind": kind, "items": items, "total": total})
 }
 
 // GetUsageSeries returns grouped time-series usage aggregates.
@@ -314,7 +366,7 @@ func (h *Handler) GetUsageAuthSummary(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "auth_index is required"})
 		return
 	}
-	info, current := h.usageAuthInfoByIndex()[authIndex]
+	info, current := h.usageAuthInfoByAuthIndex(authIndex)
 	summary, hasUsage := usage.AuthUsageSnapshot{AuthIndex: authIndex}, false
 	if h != nil && h.usageStats != nil {
 		summary, hasUsage = h.usageStats.AuthSummary(authIndex)
@@ -333,7 +385,7 @@ func (h *Handler) GetUsageAuthModelSummaries(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "auth_index is required"})
 		return
 	}
-	info, current := h.usageAuthInfoByIndex()[authIndex]
+	info, current := h.usageAuthInfoByAuthIndex(authIndex)
 	models := []usage.AuthModelUsageSnapshot{}
 	hasUsage := false
 	if h != nil && h.usageStats != nil {
@@ -770,36 +822,21 @@ func (h *Handler) usageAuthInfoByIndex() map[string]usageAuthInfo {
 	if h == nil || h.authManager == nil {
 		return out
 	}
-	for _, auth := range h.authManager.List() {
-		if auth == nil {
-			continue
-		}
-		authIndex := strings.TrimSpace(auth.Index)
-		if authIndex == "" {
-			authIndex = auth.EnsureIndex()
-		}
-		if authIndex == "" {
-			continue
-		}
-		name := strings.TrimSpace(auth.FileName)
-		if name == "" {
-			name = auth.ID
-		}
-		accountType, account := auth.AccountInfo()
-		out[authIndex] = usageAuthInfo{
-			AuthIndex:   authIndex,
-			ID:          strings.TrimSpace(auth.ID),
-			Name:        name,
-			Provider:    strings.TrimSpace(auth.Provider),
-			Label:       strings.TrimSpace(auth.Label),
-			Status:      string(auth.Status),
-			Disabled:    auth.Disabled,
-			AccountType: accountType,
-			Account:     account,
-			Email:       authEmail(auth),
-		}
+	for _, info := range h.authManager.ListUsageAuthInfos() {
+		out[info.AuthIndex] = usageAuthInfoFromCore(info)
 	}
 	return out
+}
+
+func (h *Handler) usageAuthInfoByAuthIndex(authIndex string) (usageAuthInfo, bool) {
+	if h == nil || h.authManager == nil {
+		return usageAuthInfo{}, false
+	}
+	info, ok := h.authManager.UsageAuthInfoByIndex(authIndex)
+	if !ok {
+		return usageAuthInfo{}, false
+	}
+	return usageAuthInfoFromCore(info), true
 }
 
 func buildUsageAuthResponse(summary usage.AuthUsageSnapshot, info usageAuthInfo, stale bool) gin.H {
@@ -846,12 +883,4 @@ func buildUsageAuthResponse(summary usage.AuthUsageSnapshot, info usageAuthInfo,
 		item["email"] = info.Email
 	}
 	return item
-}
-
-func sortUsageAuthResponses(items []gin.H) {
-	sort.Slice(items, func(i, j int) bool {
-		left, _ := items[i]["auth_index"].(string)
-		right, _ := items[j]["auth_index"].(string)
-		return left < right
-	})
 }

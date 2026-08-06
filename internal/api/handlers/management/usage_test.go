@@ -65,6 +65,67 @@ func TestUsageMetaAndSummaryHandlers(t *testing.T) {
 	}
 }
 
+func TestUsageSummaryOmitsSourcesAndProvidesRemoteFacets(t *testing.T) {
+	handler, stats, _ := newUsageHandlerForTest(t)
+	base := time.Date(2026, 3, 20, 12, 0, 0, 0, time.UTC)
+	for _, source := range []string{"tenant-alpha", "tenant-alpha", "tenant-beta"} {
+		stats.Record(context.Background(), coreusage.Record{
+			APIKey:      "api-a",
+			Model:       "model-a",
+			Source:      source,
+			RequestedAt: base,
+			Detail:      coreusage.Detail{TotalTokens: 10},
+		})
+	}
+
+	ctx, recorder := newUsageRequestContext("/v0/management/usage/summary?include_sources=false")
+	handler.GetUsageSummary(ctx)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("summary status = %d: %s", recorder.Code, recorder.Body.String())
+	}
+	if strings.Contains(recorder.Body.String(), "tenant-alpha") || strings.Contains(recorder.Body.String(), "tenant-beta") {
+		t.Fatalf("compact summary leaked source facets: %s", recorder.Body.String())
+	}
+	var summary struct {
+		Usage usage.SummarySnapshot `json:"usage"`
+	}
+	decodeUsageResponse(t, recorder, &summary)
+	if len(summary.Usage.Sources) != 0 || summary.Usage.TotalRequests != 3 {
+		t.Fatalf("compact summary = %+v, want totals without sources", summary.Usage)
+	}
+
+	ctx, recorder = newUsageRequestContext("/v0/management/usage/facets?kind=source&q=alpha&limit=10")
+	handler.GetUsageFacets(ctx)
+	var facets struct {
+		Kind  string              `json:"kind"`
+		Items []usage.SourceFacet `json:"items"`
+		Total int                 `json:"total"`
+	}
+	decodeUsageResponse(t, recorder, &facets)
+	if facets.Kind != "source" || facets.Total != 1 || len(facets.Items) != 1 || facets.Items[0].Value != "tenant-alpha" || facets.Items[0].TotalRequests != 2 {
+		t.Fatalf("facets = %+v, want tenant-alpha with two requests", facets)
+	}
+	if got := recorder.Header().Get("Cache-Control"); got != "no-store" {
+		t.Fatalf("Cache-Control = %q, want no-store", got)
+	}
+
+	for _, target := range []string{
+		"/v0/management/usage/summary?include_sources=invalid",
+		"/v0/management/usage/facets?kind=model",
+		"/v0/management/usage/facets?limit=101",
+	} {
+		ctx, recorder = newUsageRequestContext(target)
+		if strings.Contains(target, "/facets") {
+			handler.GetUsageFacets(ctx)
+		} else {
+			handler.GetUsageSummary(ctx)
+		}
+		if recorder.Code != http.StatusBadRequest {
+			t.Fatalf("%s status = %d, want 400: %s", target, recorder.Code, recorder.Body.String())
+		}
+	}
+}
+
 func TestUsageHealthRatesAndTokensHandlers(t *testing.T) {
 	handler, stats, _ := newUsageHandlerForTest(t)
 	now := time.Now().UTC()
@@ -530,6 +591,89 @@ func TestUsageAuthSummariesIncludesCurrentZeroUsageAndStale(t *testing.T) {
 	}
 }
 
+func TestUsageAuthSummariesServerPaginationFilteringAndSorting(t *testing.T) {
+	handler, stats, manager := newUsageHandlerForTest(t)
+	firstIndex := registerUsageAuthForTest(t, manager, "first-auth", "first.json", "codex", "First", "first@example.com")
+	secondIndex := registerUsageAuthForTest(t, manager, "second-auth", "second.json", "chatgpt-web", "Second", "second@example.com")
+	thirdIndex := registerUsageAuthForTest(t, manager, "third-auth", "third.json", "codex", "Third", "third@example.com")
+	var second *coreauth.Auth
+	for _, auth := range manager.List() {
+		if auth != nil && auth.Index == secondIndex {
+			second = auth
+			break
+		}
+	}
+	if second == nil {
+		t.Fatal("second auth not found")
+	}
+	second.Disabled = true
+	if _, err := manager.Update(coreauth.WithSkipPersist(t.Context()), second); err != nil {
+		t.Fatal(err)
+	}
+	base := time.Date(2026, 3, 20, 12, 0, 0, 0, time.UTC)
+	for authIndex, tokens := range map[string]int64{firstIndex: 10, secondIndex: 30, thirdIndex: 20} {
+		stats.Record(context.Background(), coreusage.Record{
+			APIKey:      "api-a",
+			Model:       "model-a",
+			AuthIndex:   authIndex,
+			RequestedAt: base,
+			Detail:      coreusage.Detail{TotalTokens: tokens},
+		})
+	}
+
+	target := "/v0/management/usage/auths?paged=true&page=1&page_size=2&sort_by=total_tokens&sort_order=desc"
+	ctx, recorder := newUsageRequestContext(target)
+	handler.GetUsageAuthSummaries(ctx)
+	var page struct {
+		Auths      []usageAuthSummaryForTest `json:"auths"`
+		Total      int                       `json:"total"`
+		Pagination struct {
+			Enabled    bool `json:"enabled"`
+			Page       int  `json:"page"`
+			PageSize   int  `json:"page_size"`
+			TotalPages int  `json:"total_pages"`
+		} `json:"pagination"`
+	}
+	decodeUsageResponse(t, recorder, &page)
+	if page.Total != 3 || !page.Pagination.Enabled || page.Pagination.Page != 1 || page.Pagination.PageSize != 2 || page.Pagination.TotalPages != 2 {
+		t.Fatalf("pagination = %+v total=%d", page.Pagination, page.Total)
+	}
+	if len(page.Auths) != 2 || page.Auths[0].TotalTokens != 30 || page.Auths[1].TotalTokens != 20 {
+		t.Fatalf("sorted auths = %+v, want 30 then 20 tokens", page.Auths)
+	}
+	if got := recorder.Header().Get("Cache-Control"); got != "no-store" {
+		t.Fatalf("Cache-Control = %q, want no-store", got)
+	}
+
+	ctx, recorder = newUsageRequestContext("/v0/management/usage/auths?paged=true&page=99&page_size=1&provider=codex&sort_by=auth_index")
+	handler.GetUsageAuthSummaries(ctx)
+	decodeUsageResponse(t, recorder, &page)
+	if page.Total != 2 || page.Pagination.Page != 2 || len(page.Auths) != 1 {
+		t.Fatalf("clamped provider page = %+v auths=%+v", page.Pagination, page.Auths)
+	}
+
+	ctx, recorder = newUsageRequestContext("/v0/management/usage/auths?paged=true&q=second%40example.com&status=disabled")
+	handler.GetUsageAuthSummaries(ctx)
+	decodeUsageResponse(t, recorder, &page)
+	if page.Total != 1 || len(page.Auths) != 1 || page.Auths[0].AuthIndex != secondIndex || !page.Auths[0].Disabled {
+		t.Fatalf("filtered auths = %+v, want disabled second auth", page.Auths)
+	}
+
+	for _, invalid := range []string{
+		"/v0/management/usage/auths?paged=maybe",
+		"/v0/management/usage/auths?paged=true&page=0",
+		"/v0/management/usage/auths?paged=true&page_size=101",
+		"/v0/management/usage/auths?paged=true&sort_by=unknown",
+		"/v0/management/usage/auths?paged=true&sort_order=unknown",
+	} {
+		ctx, recorder = newUsageRequestContext(invalid)
+		handler.GetUsageAuthSummaries(ctx)
+		if recorder.Code != http.StatusBadRequest {
+			t.Fatalf("%s status = %d, want 400: %s", invalid, recorder.Code, recorder.Body.String())
+		}
+	}
+}
+
 func TestUsageAuthSummaryNotFound(t *testing.T) {
 	handler, _, _ := newUsageHandlerForTest(t)
 	ctx, recorder := newUsageRequestContext("/v0/management/usage/auths/missing")
@@ -829,4 +973,28 @@ func usageAuthsByIndexForTest(items []usageAuthSummaryForTest) map[string]usageA
 		out[item.AuthIndex] = item
 	}
 	return out
+}
+
+func BenchmarkUsageAuthSummariesPaged10000(b *testing.B) {
+	gin.SetMode(gin.TestMode)
+	manager := coreauth.NewManager(nil, nil, nil)
+	stats := usage.NewRequestStatistics()
+	handler := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: b.TempDir()}, manager)
+	handler.SetUsageStatistics(stats)
+	for index := 0; index < 10_000; index++ {
+		id := "usage-benchmark-" + strconv.Itoa(index)
+		auth := &coreauth.Auth{ID: id, FileName: id + ".json", Provider: "codex", Status: coreauth.StatusActive}
+		auth.EnsureIndex()
+		if _, err := manager.Register(coreauth.WithSkipPersist(context.Background()), auth); err != nil {
+			b.Fatal(err)
+		}
+	}
+	b.ResetTimer()
+	for index := 0; index < b.N; index++ {
+		ctx, recorder := newUsageRequestContext("/v0/management/usage/auths?paged=true&page=1&page_size=50")
+		handler.GetUsageAuthSummaries(ctx)
+		if recorder.Code != http.StatusOK {
+			b.Fatalf("status = %d: %s", recorder.Code, recorder.Body.String())
+		}
+	}
 }
