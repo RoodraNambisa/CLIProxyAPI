@@ -87,6 +87,7 @@ func SetupBaseLogger() {
 		log.SetOutput(os.Stdout)
 		log.SetReportCaller(true)
 		log.SetFormatter(&LogFormatter{})
+		log.AddHook(globalLiveLogBroker)
 
 		ginInfoWriter = log.StandardLogger().Writer()
 		gin.DefaultWriter = ginInfoWriter
@@ -147,6 +148,9 @@ func ResolveLogDirectory(cfg *config.Config) string {
 // until the total size is within the limit.
 func ConfigureLogOutput(cfg *config.Config) error {
 	SetupBaseLogger()
+	if cfg == nil {
+		return fmt.Errorf("logging: configuration unavailable")
+	}
 
 	writerMu.Lock()
 	defer writerMu.Unlock()
@@ -179,6 +183,7 @@ func ConfigureLogOutput(cfg *config.Config) error {
 	}
 
 	configureLogDirCleanerLocked(logDir, cfg.LogsMaxTotalSizeMB, protectedPath)
+	ConfigureLiveLogs(cfg.RemoteManagement.LiveLogs.Enabled)
 	return nil
 }
 

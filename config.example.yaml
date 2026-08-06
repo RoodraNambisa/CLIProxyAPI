@@ -43,6 +43,11 @@ remote-management:
   auth-files-pagination:
     enabled: false
 
+  # Keep a redacted in-memory log ring and expose it through the authenticated
+  # management SSE endpoint. This is independent of logging-to-file.
+  live-logs:
+    enabled: false
+
 # Authentication directory (supports ~ for home directory)
 auth-dir: "~/.cli-proxy-api"
 

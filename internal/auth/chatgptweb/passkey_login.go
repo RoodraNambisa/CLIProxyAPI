@@ -6,10 +6,13 @@ import (
 	"encoding/json"
 	"errors"
 	"html"
-	"net/http"
+	"mime"
 	"net/url"
 	"regexp"
 	"strings"
+	"unicode/utf8"
+
+	http "github.com/bogdanfinn/fhttp"
 )
 
 const passkeyVerifyPath = "/api/accounts/passkey/verify"
@@ -83,15 +86,16 @@ func (service *Service) loginWithPasskey(
 	if isCloudflareChallenge(response, payload) {
 		authError := newAuthError("cloudflare_challenge", pendingState, response.StatusCode, true, false, "Cloudflare challenge blocked Passkey verification", nil)
 		authError.FailureStage = "passkey_verify"
-		return service.loginFailure(credential, input.Relogin, authError)
+		return service.loginFailure(credential, input.Relogin, attachPasskeyHTTPDiagnostic(authError, response, payload, service.options.AuthBaseURL+passkeyVerifyPath))
 	}
 	if response.StatusCode != http.StatusOK {
-		authError := classifyPasskeyVerificationResponse(response.StatusCode, payload, pendingState)
+		authError := attachPasskeyHTTPDiagnostic(classifyPasskeyVerificationResponse(response.StatusCode, payload, pendingState), response, payload, service.options.AuthBaseURL+passkeyVerifyPath)
 		return service.loginFailure(credential, input.Relogin, authError)
 	}
 	continueURL := parseAPIEnvelope(payload).ContinueURL
 	if strings.TrimSpace(continueURL) == "" {
-		return service.loginFailure(credential, input.Relogin, passkeyCredentialError("passkey_verification_failed", "Passkey verification did not return a callback", nil))
+		authError := passkeyCredentialError("passkey_verification_failed", "Passkey verification did not return a callback", nil)
+		return service.loginFailure(credential, input.Relogin, attachPasskeyHTTPDiagnostic(authError, response, payload, service.options.AuthBaseURL+passkeyVerifyPath))
 	}
 	if errCallback := service.consumePasskeyCallback(ctx, client, continueURL, pendingState); errCallback != nil {
 		return service.loginFailure(credential, input.Relogin, ensureAuthError(errCallback, pendingState))
@@ -109,10 +113,10 @@ func (service *Service) beginPasskeyLogin(ctx context.Context, client *Client, c
 	if isCloudflareChallenge(response, payload) {
 		authError := newAuthError("cloudflare_challenge", pendingState, response.StatusCode, true, false, "Cloudflare challenge blocked Passkey login", nil)
 		authError.FailureStage = "passkey_challenge"
-		return nil, authError
+		return nil, attachPasskeyHTTPDiagnostic(authError, response, payload, service.options.SessionBaseURL+"/api/auth/csrf")
 	}
 	if authError := classifyPasskeyChallengeResponse(response.StatusCode, payload, pendingState); authError != nil {
-		return nil, authError
+		return nil, attachPasskeyHTTPDiagnostic(authError, response, payload, service.options.SessionBaseURL+"/api/auth/csrf")
 	}
 	csrfToken := passkeyCSRFToken(payload, client.ExportCookies(), service.options.SessionBaseURL)
 	if csrfToken == "" {
@@ -146,10 +150,10 @@ func (service *Service) beginPasskeyLogin(ctx context.Context, client *Client, c
 	if isCloudflareChallenge(response, payload) {
 		authError := newAuthError("cloudflare_challenge", pendingState, response.StatusCode, true, false, "Cloudflare challenge blocked Passkey login", nil)
 		authError.FailureStage = "passkey_challenge"
-		return nil, authError
+		return nil, attachPasskeyHTTPDiagnostic(authError, response, payload, service.options.SessionBaseURL+"/api/auth/signin/openai")
 	}
 	if authError := classifyPasskeyChallengeResponse(response.StatusCode, payload, pendingState); authError != nil {
-		return nil, authError
+		return nil, attachPasskeyHTTPDiagnostic(authError, response, payload, service.options.SessionBaseURL+"/api/auth/signin/openai")
 	}
 	var signin map[string]any
 	if errDecode := json.Unmarshal(payload, &signin); errDecode != nil {
@@ -174,10 +178,10 @@ func (service *Service) beginPasskeyLogin(ctx context.Context, client *Client, c
 	if isCloudflareChallenge(response, payload) {
 		authError := newAuthError("cloudflare_challenge", pendingState, response.StatusCode, true, false, "Cloudflare challenge blocked Passkey login", nil)
 		authError.FailureStage = "passkey_challenge"
-		return nil, authError
+		return nil, attachPasskeyHTTPDiagnostic(authError, response, payload, authURL)
 	}
 	if authError := classifyPasskeyChallengeResponse(response.StatusCode, payload, pendingState); authError != nil {
-		return nil, authError
+		return nil, attachPasskeyHTTPDiagnostic(authError, response, payload, authURL)
 	}
 	if deviceID, errCookie := credentialCookieValueForURL(client.ExportCookies(), service.options.AuthBaseURL, "oai-did"); errCookie == nil && strings.TrimSpace(deviceID) != "" {
 		credential.DeviceID = strings.TrimSpace(deviceID)
@@ -212,10 +216,10 @@ func (service *Service) beginPasskeyLogin(ctx context.Context, client *Client, c
 	if isCloudflareChallenge(response, payload) {
 		authError := newAuthError("cloudflare_challenge", pendingState, response.StatusCode, true, false, "Cloudflare challenge blocked Passkey login", nil)
 		authError.FailureStage = "passkey_challenge"
-		return nil, authError
+		return nil, attachPasskeyHTTPDiagnostic(authError, response, payload, service.options.AuthBaseURL+"/api/accounts/authorize/continue")
 	}
 	if authError := classifyPasskeyChallengeResponse(response.StatusCode, payload, pendingState); authError != nil {
-		return nil, authError
+		return nil, attachPasskeyHTTPDiagnostic(authError, response, payload, service.options.AuthBaseURL+"/api/accounts/authorize/continue")
 	}
 	return payload, nil
 }
@@ -250,17 +254,17 @@ func (service *Service) consumePasskeyCallback(ctx context.Context, client *Clie
 		if isCloudflareChallenge(response, payload) {
 			authError := newAuthError("cloudflare_challenge", pendingState, response.StatusCode, true, false, "Cloudflare challenge blocked Passkey callback", nil)
 			authError.FailureStage = "passkey_callback"
-			return authError
+			return attachPasskeyHTTPDiagnostic(authError, response, payload, targetURL)
 		}
 		if response.StatusCode >= http.StatusBadRequest {
-			return classifyPasskeyProtocolResponse(
+			return attachPasskeyHTTPDiagnostic(classifyPasskeyProtocolResponse(
 				"passkey_callback",
 				"passkey_verification_failed",
 				"Passkey callback was rejected",
 				response.StatusCode,
 				payload,
 				pendingState,
-			)
+			), response, payload, targetURL)
 		}
 		if isChatGPTWebRedirectStatus(response.StatusCode) {
 			location := strings.TrimSpace(response.Header.Get("Location"))
@@ -347,17 +351,17 @@ func (service *Service) finishPasskeyLogin(ctx context.Context, client *Client, 
 	if isCloudflareChallenge(response, payload) {
 		authError := newAuthError("cloudflare_challenge", pendingState, response.StatusCode, true, false, "Cloudflare challenge blocked Passkey session", nil)
 		authError.FailureStage = "passkey_session"
-		return service.loginFailure(credential, input.Relogin, authError)
+		return service.loginFailure(credential, input.Relogin, attachPasskeyHTTPDiagnostic(authError, response, payload, service.options.SessionBaseURL+"/api/auth/session"))
 	}
 	if response.StatusCode != http.StatusOK {
-		return service.loginFailure(credential, input.Relogin, classifyPasskeyProtocolResponse(
+		return service.loginFailure(credential, input.Relogin, attachPasskeyHTTPDiagnostic(classifyPasskeyProtocolResponse(
 			"passkey_session",
 			"passkey_session_invalid",
 			"Passkey session is invalid",
 			response.StatusCode,
 			payload,
 			pendingState,
-		))
+		), response, payload, service.options.SessionBaseURL+"/api/auth/session"))
 	}
 	var session sessionPayload
 	if errDecode := json.Unmarshal(payload, &session); errDecode != nil || strings.TrimSpace(session.AccessToken) == "" {
@@ -557,6 +561,90 @@ func classifyPasskeyVerificationResponse(status int, payload []byte, pendingStat
 	authError.StatusCode = status
 	authError.FailureStage = "passkey_verify"
 	return authError
+}
+
+func attachPasskeyHTTPDiagnostic(authError *AuthError, response *http.Response, payload []byte, fallbackURL string) *AuthError {
+	if authError == nil {
+		return nil
+	}
+	authError.ResponseBytes = int64(len(payload))
+	if code, _ := responseError(payload); code != "" {
+		authError.DiagnosticCode = SafeDiagnosticCode(code)
+	}
+	if authError.DiagnosticCode == "" {
+		authError.DiagnosticCode = SafeDiagnosticCode(authError.Code)
+	}
+	if json.Valid(payload) {
+		authError.ResponseType = "json"
+	} else if len(payload) == 0 {
+		authError.ResponseType = "empty"
+	} else if utf8.Valid(payload) {
+		authError.ResponseType = "text"
+	} else {
+		authError.ResponseType = "binary"
+	}
+	rawURL := strings.TrimSpace(fallbackURL)
+	if response != nil {
+		if response.StatusCode > 0 {
+			authError.Status = response.StatusCode
+			authError.StatusCode = response.StatusCode
+		}
+		if response.Header != nil {
+			authError.ContentType = safePasskeyDiagnosticContentType(response.Header.Get("Content-Type"))
+			authError.CFRay = safePasskeyDiagnosticToken(response.Header.Get("cf-ray"), 128)
+		}
+		if response.Request != nil && response.Request.URL != nil {
+			rawURL = response.Request.URL.String()
+		}
+		authError.Cloudflare = isCloudflareChallenge(response, payload)
+	}
+	if authError.ResponseType == "text" && authError.ContentType == "text/html" {
+		authError.ResponseType = "html"
+	}
+	authError.TargetHost, authError.TargetPath = safePasskeyDiagnosticTarget(rawURL)
+	return authError
+}
+
+func safePasskeyDiagnosticContentType(value string) string {
+	mediaType, _, errParse := mime.ParseMediaType(strings.TrimSpace(value))
+	if errParse != nil {
+		mediaType = strings.TrimSpace(strings.SplitN(value, ";", 2)[0])
+	}
+	return safePasskeyDiagnosticToken(strings.ToLower(mediaType), 128)
+}
+
+func safePasskeyDiagnosticToken(value string, limit int) string {
+	value = strings.TrimSpace(value)
+	if limit > 0 && len(value) > limit {
+		value = value[:limit]
+	}
+	for _, character := range value {
+		if character >= 'a' && character <= 'z' || character >= 'A' && character <= 'Z' ||
+			character >= '0' && character <= '9' || strings.ContainsRune("._-/", character) {
+			continue
+		}
+		return ""
+	}
+	return value
+}
+
+func safePasskeyDiagnosticTarget(rawURL string) (string, string) {
+	parsed, errParse := url.Parse(strings.TrimSpace(rawURL))
+	if errParse != nil || parsed == nil {
+		return "", ""
+	}
+	host := strings.ToLower(strings.TrimSpace(parsed.Hostname()))
+	if host != "auth.openai.com" && host != "chatgpt.com" {
+		return "", ""
+	}
+	path := parsed.EscapedPath()
+	if path == "" {
+		path = "/"
+	}
+	if len(path) > 128 {
+		path = path[:128]
+	}
+	return host, path
 }
 
 func classifyPasskeyChallengeResponse(status int, payload []byte, pendingState LifecycleState) *AuthError {

@@ -1366,6 +1366,48 @@ func TestChatGPTWebExecutorManualAndBackgroundReloginSingleflight(t *testing.T) 
 	})
 }
 
+func TestChatGPTWebExecutorReloginPersistsSafePasskeyDiagnostic(t *testing.T) {
+	manager := cliproxyauth.NewManager(nil, nil, nil)
+	expected := registerChatGPTWebPendingAuth(t, manager, "passkey-diagnostic")
+	fake := &fakeChatGPTWebAuthService{loginFn: func(_ context.Context, input chatgptwebauth.LoginInput) (*chatgptwebauth.Credential, error) {
+		credential := *input.Credential
+		credential.LifecycleState = chatgptwebauth.LifecycleReauthRequired
+		credential.LifecycleReason = "passkey_verification_failed"
+		return &credential, &chatgptwebauth.AuthError{
+			Code:           "passkey_verification_failed",
+			DiagnosticCode: "invalid_passkey_response",
+			State:          chatgptwebauth.LifecycleReauthRequired,
+			LifecycleState: chatgptwebauth.LifecycleReauthRequired,
+			Status:         http.StatusBadRequest,
+			StatusCode:     http.StatusBadRequest,
+			FailureStage:   "passkey_verify",
+			Attempts:       2,
+			ResponseType:   "json",
+			ContentType:    "application/json",
+			TargetHost:     "auth.openai.com",
+			TargetPath:     "/api/accounts/passkey/verify",
+			Message:        "Passkey credential was rejected",
+			Terminal:       true,
+		}
+	}}
+	executor := NewChatGPTWebExecutor(&config.Config{}, manager)
+	executor.authService = fake
+	t.Cleanup(func() { _ = executor.Close() })
+
+	updated, current, errRelogin := executor.ReloginCurrent(t.Context(), expected)
+	if errRelogin == nil || !current || updated == nil {
+		t.Fatalf("ReloginCurrent() = (%v, %v, %v)", updated, current, errRelogin)
+	}
+	installed, ok := manager.GetByID(expected.ID)
+	if !ok || installed.LastError == nil || installed.LastError.Diagnostic == nil {
+		t.Fatalf("installed auth = %#v", installed)
+	}
+	diagnostic := installed.LastError.Diagnostic
+	if diagnostic.Code != "invalid_passkey_response" || diagnostic.Stage != "passkey_verify" || diagnostic.Attempts != 2 || diagnostic.HTTPStatus != http.StatusBadRequest {
+		t.Fatalf("diagnostic = %#v", diagnostic)
+	}
+}
+
 func TestChatGPTWebExecutorManualPromotesQueuedBackgroundRelogin(t *testing.T) {
 	manager := cliproxyauth.NewManager(nil, nil, nil)
 	expected := registerChatGPTWebPendingAuth(t, manager, "manual-promotes-background")

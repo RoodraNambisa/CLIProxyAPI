@@ -695,6 +695,7 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.DELETE("/interactions-api-key", s.mgmt.DeleteInteractionsKey)
 
 		mgmt.GET("/logs", s.mgmt.GetLogs)
+		mgmt.GET("/logs/stream", s.mgmt.StreamLogs)
 		mgmt.DELETE("/logs", s.mgmt.DeleteLogs)
 		mgmt.GET("/request-error-logs", s.mgmt.GetRequestErrorLogs)
 		mgmt.GET("/request-error-logs/:name", s.mgmt.DownloadRequestErrorLog)
@@ -1122,7 +1123,9 @@ func (s *Server) UpdateClients(cfg *config.Config) error {
 		}
 	}
 
-	if oldCfg == nil || oldCfg.LoggingToFile != runtimeCfg.LoggingToFile || oldCfg.LogsMaxTotalSizeMB != runtimeCfg.LogsMaxTotalSizeMB {
+	if oldCfg == nil || oldCfg.LoggingToFile != runtimeCfg.LoggingToFile ||
+		oldCfg.LogsMaxTotalSizeMB != runtimeCfg.LogsMaxTotalSizeMB ||
+		oldCfg.RemoteManagement.LiveLogs.Enabled != runtimeCfg.RemoteManagement.LiveLogs.Enabled {
 		if errLogOutput := logging.ConfigureLogOutput(runtimeCfg); errLogOutput != nil {
 			return errLogOutput
 		}

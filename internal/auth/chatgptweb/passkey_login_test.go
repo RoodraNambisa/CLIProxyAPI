@@ -25,6 +25,7 @@ type passkeyLoginFixture struct {
 	credentialID   string
 	direct         bool
 	verifyStatus   int
+	verifyCode     string
 	verifyFailures int
 	intermediate   bool
 	callbackURL    string
@@ -96,8 +97,14 @@ func (fixture *passkeyLoginFixture) serveHTTP(response http.ResponseWriter, requ
 			fixture.t.Errorf("Passkey verify body = %#v", body)
 		}
 		if status != 0 {
+			code := fixture.verifyCode
+			if code == "" {
+				code = "temporarily_unavailable"
+			}
+			response.Header().Set("Content-Type", "application/json")
+			response.Header().Set("Cf-Ray", "safe-ray-SJC")
 			response.WriteHeader(status)
-			_, _ = io.WriteString(response, `{"error":{"code":"temporarily_unavailable"}}`)
+			_, _ = fmt.Fprintf(response, `{"error":{"code":%q}}`, code)
 			return
 		}
 		callbackURL := fixture.callbackURL
@@ -416,7 +423,8 @@ func TestClassifyPasskeyChallengeResponseUsesSafeLifecycleStates(t *testing.T) {
 func TestServicePasskeyLoginNeverFallsBackToPassword(t *testing.T) {
 	webAuthn := testWebAuthnCredential(t)
 	fixture := newPasskeyLoginFixture(t, webAuthn.CredentialID, true)
-	fixture.verifyStatus = http.StatusUnauthorized
+	fixture.verifyStatus = http.StatusBadRequest
+	fixture.verifyCode = "invalid_passkey_response"
 	service := NewService(fixture.options(time.Now()))
 	credential, errLogin := service.Login(t.Context(), LoginInput{
 		Credential: &Credential{
@@ -437,7 +445,9 @@ func TestServicePasskeyLoginNeverFallsBackToPassword(t *testing.T) {
 	fixture.mu.Lock()
 	passwordCalls := fixture.passwordCalls
 	fixture.mu.Unlock()
-	if !ok || authError.Code != "passkey_verification_failed" || passwordCalls != 0 {
+	if !ok || authError.Code != "passkey_verification_failed" || authError.DiagnosticCode != "invalid_passkey_response" ||
+		authError.FailureStage != "passkey_verify" || authError.StatusCode != http.StatusBadRequest || authError.Attempts != 1 ||
+		authError.ResponseType != "json" || authError.ContentType != "application/json" || authError.CFRay != "safe-ray-SJC" || passwordCalls != 0 {
 		t.Fatalf("credential=%#v error=%#v password_calls=%d", credential, errLogin, passwordCalls)
 	}
 }

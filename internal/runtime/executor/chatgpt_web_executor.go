@@ -832,16 +832,16 @@ func (e *ChatGPTWebExecutor) runBackgroundRelogin(expected *cliproxyauth.Auth) {
 			return
 		}
 		if !chatGPTWebBackgroundReloginRetryable(errRelogin) {
-			logChatGPTWebBackgroundReloginFailure(expected.ID, errRelogin)
+			logChatGPTWebBackgroundReloginFailure(expected, errRelogin)
 			return
 		}
 		if attempt == maxAttempts {
-			logChatGPTWebBackgroundReloginFailure(expected.ID, errRelogin)
+			logChatGPTWebBackgroundReloginFailure(expected, errRelogin)
 			e.markBackgroundReloginExhausted(ctx, expected)
 			return
 		}
 		if attempt%chatGPTWebBackgroundReloginLogInterval == 0 {
-			logChatGPTWebBackgroundReloginFailure(expected.ID, errRelogin)
+			logChatGPTWebBackgroundReloginFailure(expected, errRelogin)
 		}
 		if !e.waitForBackgroundReloginRetry(ctx, expected, e.backgroundReloginDelay(attempt, policy.JitterPercent)) {
 			return
@@ -1036,9 +1036,18 @@ func chatGPTWebBackgroundReloginRetryable(err error) bool {
 	return errors.As(err, &unavailable)
 }
 
-func logChatGPTWebBackgroundReloginFailure(authID string, err error) {
+func logChatGPTWebBackgroundReloginFailure(auth *cliproxyauth.Auth, err error) {
 	code := chatGPTWebErrorCode(err)
-	log.WithFields(log.Fields{"auth_id": authID, "error_code": code}).Warn("chatgpt web background re-login failed")
+	fields := log.Fields{"error_code": code}
+	if auth != nil {
+		fields["auth_id"] = auth.ID
+		if resultError := cliproxyauth.NewProviderError(auth, err); resultError != nil && resultError.Diagnostic != nil {
+			for key, value := range helps.ChatGPTWebDiagnosticLogFields(resultError.Diagnostic) {
+				fields[key] = value
+			}
+		}
+	}
+	log.WithFields(fields).Warn("chatgpt web background re-login failed")
 }
 
 func (e *ChatGPTWebExecutor) reloginCurrent(ctx context.Context, expected *cliproxyauth.Auth, flight *chatGPTWebReloginFlight) (*cliproxyauth.Auth, bool, error) {
@@ -1125,6 +1134,11 @@ func (e *ChatGPTWebExecutor) reloginCurrent(ctx context.Context, expected *clipr
 		return nil, false, firstNonNilError(errLogin, errors.New("chatgpt web re-login returned no credential"))
 	}
 	updated := applyChatGPTWebCredential(expected, result)
+	if errLogin != nil {
+		updated.LastError = cliproxyauth.NewProviderError(updated, errLogin)
+	} else {
+		updated.LastError = nil
+	}
 	installed, current, errUpdate := e.manager.UpdateChatGPTWebReloginIfCurrent(
 		ctx,
 		expected,

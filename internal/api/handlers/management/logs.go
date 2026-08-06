@@ -2,6 +2,8 @@ package management
 
 import (
 	"bufio"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"net/http"
@@ -21,6 +23,153 @@ const (
 	logScannerInitialBuffer = 64 * 1024
 	logScannerMaxBuffer     = 8 * 1024 * 1024
 )
+
+// StreamLogs streams filtered, redacted in-memory log events over SSE.
+func (h *Handler) StreamLogs(c *gin.Context) {
+	if h == nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "handler unavailable"})
+		return
+	}
+	filter, cursor, errFilter := parseLiveLogFilter(c)
+	if errFilter != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": errFilter.Error()})
+		return
+	}
+	subscription, errSubscribe := logging.GlobalLiveLogBroker().Subscribe(filter, cursor)
+	if errSubscribe != nil {
+		switch {
+		case errors.Is(errSubscribe, logging.ErrLiveLogsDisabled):
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "live logs disabled"})
+		case errors.Is(errSubscribe, logging.ErrLiveLogConnectionLimit):
+			c.JSON(http.StatusTooManyRequests, gin.H{"error": "live log connection limit reached"})
+		default:
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to open live log stream"})
+		}
+		return
+	}
+	defer subscription.Close()
+
+	flusher, ok := c.Writer.(http.Flusher)
+	if !ok {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "streaming unsupported"})
+		return
+	}
+	c.Header("Content-Type", "text/event-stream")
+	c.Header("Cache-Control", "no-store")
+	c.Header("Connection", "keep-alive")
+	c.Header("X-Accel-Buffering", "no")
+	c.Status(http.StatusOK)
+	if _, errWrite := c.Writer.Write([]byte("retry: 1000\n\n")); errWrite != nil {
+		return
+	}
+	flusher.Flush()
+
+	heartbeat := time.NewTicker(15 * time.Second)
+	defer heartbeat.Stop()
+	for {
+		select {
+		case <-c.Request.Context().Done():
+			return
+		case <-heartbeat.C:
+			if _, errWrite := c.Writer.Write([]byte(": heartbeat\n\n")); errWrite != nil {
+				return
+			}
+			flusher.Flush()
+		case frame, open := <-subscription.Frames:
+			if !open {
+				return
+			}
+			if errWrite := writeLiveLogFrame(c, frame); errWrite != nil {
+				return
+			}
+			flusher.Flush()
+		}
+	}
+}
+
+func parseLiveLogFilter(c *gin.Context) (logging.LiveLogFilter, uint64, error) {
+	filter := logging.LiveLogFilter{
+		Contains:  c.Query("contains"),
+		RequestID: c.Query("request_id"),
+		Provider:  c.Query("provider"),
+		AuthIndex: c.Query("auth_index"),
+		Stage:     c.Query("stage"),
+		Code:      c.Query("code"),
+		Method:    c.Query("method"),
+		Path:      c.Query("path"),
+	}
+	if rawLevel := strings.TrimSpace(c.Query("level")); rawLevel != "" {
+		filter.Levels = make(map[string]struct{})
+		for _, level := range strings.Split(rawLevel, ",") {
+			level = strings.ToLower(strings.TrimSpace(level))
+			switch level {
+			case "panic", "fatal", "error", "warn", "warning", "info", "debug", "trace":
+				if level == "warning" {
+					level = "warn"
+				}
+				filter.Levels[level] = struct{}{}
+			default:
+				return logging.LiveLogFilter{}, 0, fmt.Errorf("invalid level %q", level)
+			}
+		}
+	}
+	if rawStatus := strings.TrimSpace(c.Query("status")); rawStatus != "" {
+		status, errStatus := strconv.Atoi(rawStatus)
+		if errStatus != nil || status < 100 || status > 599 {
+			return logging.LiveLogFilter{}, 0, errors.New("invalid status")
+		}
+		filter.Status = status
+	}
+	if rawHideManagement := strings.TrimSpace(c.Query("hide_management")); rawHideManagement != "" {
+		hideManagement, errBool := strconv.ParseBool(rawHideManagement)
+		if errBool != nil {
+			return logging.LiveLogFilter{}, 0, errors.New("invalid hide_management")
+		}
+		filter.HideManagement = hideManagement
+	}
+	rawCursor := strings.TrimSpace(c.Query("cursor"))
+	if rawCursor == "" {
+		rawCursor = strings.TrimSpace(c.GetHeader("Last-Event-ID"))
+	}
+	var cursor uint64
+	if rawCursor != "" {
+		parsed, errCursor := strconv.ParseUint(rawCursor, 10, 64)
+		if errCursor != nil {
+			return logging.LiveLogFilter{}, 0, errors.New("invalid cursor")
+		}
+		cursor = parsed
+	}
+	return filter, cursor, nil
+}
+
+func writeLiveLogFrame(c *gin.Context, frame logging.LiveLogFrame) error {
+	eventType := "log"
+	var cursor uint64
+	var payload any
+	if frame.Event != nil {
+		cursor = frame.Event.Cursor
+		payload = frame.Event
+	} else if frame.Gap != nil {
+		eventType = "gap"
+		cursor = frame.Gap.To
+		payload = frame.Gap
+	} else {
+		return nil
+	}
+	encoded, errMarshal := json.Marshal(payload)
+	if errMarshal != nil {
+		return errMarshal
+	}
+	if cursor > 0 {
+		if _, errWrite := fmt.Fprintf(c.Writer, "id: %d\n", cursor); errWrite != nil {
+			return errWrite
+		}
+	}
+	if _, errWrite := fmt.Fprintf(c.Writer, "event: %s\ndata: %s\n\n", eventType, encoded); errWrite != nil {
+		return errWrite
+	}
+	return nil
+}
 
 // GetLogs returns log lines with optional incremental loading.
 func (h *Handler) GetLogs(c *gin.Context) {

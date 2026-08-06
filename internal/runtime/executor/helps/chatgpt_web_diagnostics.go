@@ -1,0 +1,301 @@
+package helps
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"mime"
+	"net"
+	"net/http"
+	"net/url"
+	"regexp"
+	"strings"
+	"unicode/utf8"
+
+	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
+	"github.com/tidwall/gjson"
+)
+
+const maxChatGPTWebDiagnosticValueBytes = 128
+
+var chatGPTWebDiagnosticCodePattern = regexp.MustCompile(`^[a-zA-Z0-9._-]{1,128}$`)
+
+// ChatGPTWebHeaderGetter is implemented by standard and fingerprinted HTTP headers.
+type ChatGPTWebHeaderGetter interface {
+	Get(string) string
+}
+
+// ClassifyChatGPTWebTransportDiagnostic extracts a safe transport failure class without retaining the error text.
+func ClassifyChatGPTWebTransportDiagnostic(err error, path string) *cliproxyauth.ErrorDiagnostic {
+	code := "network_error"
+	retryable := true
+	switch {
+	case err == nil:
+		code = "network_error"
+	case errors.Is(err, context.Canceled):
+		code = "request_canceled"
+		retryable = false
+	case errors.Is(err, context.DeadlineExceeded):
+		code = "network_timeout"
+	default:
+		var dnsError *net.DNSError
+		var networkError net.Error
+		lower := strings.ToLower(err.Error())
+		switch {
+		case errors.As(err, &dnsError):
+			code = "dns_error"
+		case errors.As(err, &networkError) && networkError.Timeout():
+			code = "network_timeout"
+		case strings.Contains(lower, "tls") || strings.Contains(lower, "x509") || strings.Contains(lower, "certificate"):
+			code = "tls_error"
+		case strings.Contains(lower, "proxyconnect") || strings.Contains(lower, "proxy connection"):
+			code = "proxy_error"
+		}
+	}
+	targetHost, targetPath := chatGPTWebDiagnosticTarget(path)
+	return &cliproxyauth.ErrorDiagnostic{
+		Provider:   "chatgpt-web",
+		Stage:      ChatGPTWebDiagnosticStage(targetPath),
+		Code:       code,
+		TargetHost: targetHost,
+		TargetPath: targetPath,
+		Retryable:  retryable,
+	}
+}
+
+// ClassifyChatGPTWebHTTPDiagnostic extracts only safe structural details from an upstream response.
+func ClassifyChatGPTWebHTTPDiagnostic(status int, path string, body []byte, headers ChatGPTWebHeaderGetter) *cliproxyauth.ErrorDiagnostic {
+	contentType := ""
+	cfRay := ""
+	cfMitigated := ""
+	server := ""
+	if headers != nil {
+		contentType = normalizeChatGPTWebDiagnosticContentType(headers.Get("Content-Type"))
+		cfRay = safeChatGPTWebDiagnosticValue(headers.Get("cf-ray"))
+		cfMitigated = strings.ToLower(strings.TrimSpace(headers.Get("cf-mitigated")))
+		server = strings.ToLower(strings.TrimSpace(headers.Get("server")))
+	}
+	responseType := chatGPTWebDiagnosticResponseType(contentType, body)
+	cloudflare := chatGPTWebDiagnosticCloudflare(status, cfMitigated, server, responseType, body)
+	code := chatGPTWebDiagnosticErrorCode(status, responseType, cloudflare, body)
+	retryable := cloudflare || status == http.StatusRequestTimeout || status == http.StatusTooEarly ||
+		status == http.StatusTooManyRequests || status >= http.StatusInternalServerError
+	return &cliproxyauth.ErrorDiagnostic{
+		Provider:      "chatgpt-web",
+		Stage:         ChatGPTWebDiagnosticStage(path),
+		Code:          code,
+		ResponseType:  responseType,
+		ContentType:   contentType,
+		CFRay:         cfRay,
+		TargetHost:    chatGPTWebDiagnosticHost(path),
+		TargetPath:    safeChatGPTWebDiagnosticPath(path),
+		ResponseBytes: int64(len(body)),
+		HTTPStatus:    status,
+		Cloudflare:    cloudflare,
+		Retryable:     retryable,
+	}
+}
+
+// ChatGPTWebDiagnosticStage maps trusted upstream paths to a stable troubleshooting stage.
+func ChatGPTWebDiagnosticStage(path string) string {
+	path = strings.ToLower(safeChatGPTWebDiagnosticPath(path))
+	switch {
+	case strings.Contains(path, "/passkey/verify"):
+		return "passkey_verify"
+	case strings.Contains(path, "/api/auth/session"):
+		return "session"
+	case strings.Contains(path, "/chat-requirements/prepare"):
+		return "sentinel_prepare"
+	case strings.Contains(path, "/chat-requirements/finalize"):
+		return "sentinel_finalize"
+	case strings.Contains(path, "/sentinel/sdk"):
+		return "sentinel_sdk"
+	case strings.HasSuffix(path, "/backend-api/files"):
+		return "file_sign"
+	case strings.Contains(path, "/backend-api/files/") && strings.HasSuffix(path, "/uploaded"):
+		return "file_confirm"
+	case strings.Contains(path, "/backend-api/files/") && strings.HasSuffix(path, "/download"):
+		return "image_download"
+	case strings.Contains(path, "/backend-api/models"):
+		return "models"
+	case strings.Contains(path, "/accounts/check") || strings.Contains(path, "/limits"):
+		return "quota_refresh"
+	case strings.Contains(path, "/conversation"):
+		return "conversation"
+	default:
+		return "upstream_request"
+	}
+}
+
+func chatGPTWebDiagnosticErrorCode(status int, responseType string, cloudflare bool, body []byte) string {
+	if cloudflare {
+		return "cloudflare_challenge"
+	}
+	if upstreamCode := chatGPTWebStructuredDiagnosticCode(body); upstreamCode != "" {
+		return upstreamCode
+	}
+	switch status {
+	case http.StatusUnauthorized:
+		return "unauthorized"
+	case http.StatusForbidden:
+		return "forbidden"
+	case http.StatusTooManyRequests:
+		return "rate_limited"
+	}
+	if responseType != "json" && status >= http.StatusBadRequest {
+		return "upstream_non_json"
+	}
+	if status >= http.StatusInternalServerError {
+		return "upstream_server_error"
+	}
+	if status >= http.StatusBadRequest {
+		return "upstream_request_error"
+	}
+	return "upstream_challenge"
+}
+
+func chatGPTWebStructuredDiagnosticCode(body []byte) string {
+	if !json.Valid(body) {
+		return ""
+	}
+	for _, path := range []string{
+		"error.code", "error.type", "code", "type", "detail.code", "detail.type",
+		"page.payload.error.code", "page.payload.error.type", "page.payload.code", "page.payload.type",
+	} {
+		value := strings.TrimSpace(gjson.GetBytes(body, path).String())
+		if chatGPTWebDiagnosticCodePattern.MatchString(value) {
+			return strings.ToLower(value)
+		}
+	}
+	return ""
+}
+
+func chatGPTWebDiagnosticResponseType(contentType string, body []byte) string {
+	if len(body) == 0 {
+		return "empty"
+	}
+	if json.Valid(body) {
+		return "json"
+	}
+	lower := bytes.ToLower(bytes.TrimSpace(body))
+	if contentType == "text/html" || bytes.HasPrefix(lower, []byte("<!doctype html")) || bytes.HasPrefix(lower, []byte("<html")) {
+		return "html"
+	}
+	if strings.HasPrefix(contentType, "text/") || utf8.Valid(body) {
+		return "text"
+	}
+	return "binary"
+}
+
+func chatGPTWebDiagnosticCloudflare(status int, cfMitigated, server, responseType string, body []byte) bool {
+	if cfMitigated != "" && cfMitigated != "none" {
+		return true
+	}
+	lower := bytes.ToLower(body)
+	bodyChallenge := bytes.Contains(lower, []byte("/cdn-cgi/challenge-platform")) ||
+		bytes.Contains(lower, []byte("cf-chl-")) ||
+		bytes.Contains(lower, []byte("challenge-platform")) ||
+		bytes.Contains(lower, []byte("just a moment")) ||
+		bytes.Contains(lower, []byte("attention required! | cloudflare"))
+	serverChallenge := responseType == "html" && strings.Contains(server, "cloudflare") &&
+		(status == http.StatusForbidden || status == http.StatusTooManyRequests || status == http.StatusServiceUnavailable)
+	return bodyChallenge || serverChallenge
+}
+
+func normalizeChatGPTWebDiagnosticContentType(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	mediaType, _, errParse := mime.ParseMediaType(value)
+	if errParse != nil {
+		if index := strings.IndexByte(value, ';'); index >= 0 {
+			value = value[:index]
+		}
+		return safeChatGPTWebDiagnosticValue(strings.ToLower(strings.TrimSpace(value)))
+	}
+	return safeChatGPTWebDiagnosticValue(strings.ToLower(mediaType))
+}
+
+func safeChatGPTWebDiagnosticValue(value string) string {
+	value = strings.TrimSpace(value)
+	if len(value) > maxChatGPTWebDiagnosticValueBytes {
+		value = value[:maxChatGPTWebDiagnosticValueBytes]
+	}
+	return value
+}
+
+func safeChatGPTWebDiagnosticPath(path string) string {
+	_, safePath := chatGPTWebDiagnosticTarget(path)
+	return safePath
+}
+
+func chatGPTWebDiagnosticHost(path string) string {
+	host, _ := chatGPTWebDiagnosticTarget(path)
+	return host
+}
+
+func chatGPTWebDiagnosticTarget(raw string) (string, string) {
+	raw = strings.TrimSpace(raw)
+	if parsed, errParse := url.Parse(raw); errParse == nil && parsed.IsAbs() {
+		host := strings.ToLower(strings.TrimSpace(parsed.Hostname()))
+		if !trustedChatGPTWebDiagnosticHost(host) {
+			host = "external_asset"
+		}
+		path := parsed.EscapedPath()
+		if path == "" {
+			path = "/"
+		}
+		return host, safeChatGPTWebDiagnosticValue(path)
+	}
+	if index := strings.IndexByte(raw, '?'); index >= 0 {
+		raw = raw[:index]
+	}
+	if raw == "" || raw[0] != '/' {
+		raw = "/"
+	}
+	host := "chatgpt.com"
+	if strings.Contains(strings.ToLower(raw), "/passkey/") {
+		host = "auth.openai.com"
+	}
+	return host, safeChatGPTWebDiagnosticValue(raw)
+}
+
+func trustedChatGPTWebDiagnosticHost(host string) bool {
+	for _, suffix := range []string{"chatgpt.com", "openai.com", "oaiusercontent.com", "oaistatic.com", "blob.core.windows.net"} {
+		if host == suffix || strings.HasSuffix(host, "."+suffix) {
+			return true
+		}
+	}
+	return false
+}
+
+// ChatGPTWebDiagnosticLogFields returns the structured log whitelist for one diagnostic.
+func ChatGPTWebDiagnosticLogFields(diagnostic *cliproxyauth.ErrorDiagnostic) map[string]any {
+	if diagnostic == nil {
+		return nil
+	}
+	fields := map[string]any{
+		"provider":       diagnostic.Provider,
+		"auth_index":     diagnostic.AuthIndex,
+		"stage":          diagnostic.Stage,
+		"code":           diagnostic.Code,
+		"status":         diagnostic.HTTPStatus,
+		"retryable":      diagnostic.Retryable,
+		"target_host":    diagnostic.TargetHost,
+		"target_path":    diagnostic.TargetPath,
+		"persona":        diagnostic.Persona,
+		"ua_major":       diagnostic.UAMajor,
+		"platform":       diagnostic.Platform,
+		"response_type":  diagnostic.ResponseType,
+		"content_type":   diagnostic.ContentType,
+		"response_bytes": diagnostic.ResponseBytes,
+		"attempts":       diagnostic.Attempts,
+		"cloudflare":     diagnostic.Cloudflare,
+	}
+	if diagnostic.CFRay != "" {
+		fields["cf_ray"] = diagnostic.CFRay
+	}
+	return fields
+}

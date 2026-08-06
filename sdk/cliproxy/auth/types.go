@@ -593,6 +593,7 @@ func (m *ModelState) Clone() *ModelState {
 			Message:    m.LastError.Message,
 			Retryable:  m.LastError.Retryable,
 			HTTPStatus: m.LastError.HTTPStatus,
+			Diagnostic: m.LastError.Diagnostic.Clone(),
 		}
 	}
 	return &copyState

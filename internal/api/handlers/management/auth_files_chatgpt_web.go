@@ -131,12 +131,92 @@ func applyChatGPTWebAuthFileSummary(entry gin.H, auth *coreauth.Auth, now time.T
 			category = reason
 		}
 	}
+	safeDiagnostic := safeChatGPTWebErrorDiagnostic(auth.LastError.Diagnostic, auth.EnsureIndex())
 	entry["last_error"] = &coreauth.Error{
 		Code:       category,
 		Message:    safeChatGPTWebErrorMessage(category),
 		Retryable:  auth.LastError.Retryable,
 		HTTPStatus: auth.LastError.HTTPStatus,
+		Diagnostic: safeDiagnostic,
 	}
+	if safeDiagnostic != nil {
+		entry["last_diagnostic"] = safeDiagnostic
+	}
+}
+
+func safeChatGPTWebErrorDiagnostic(diagnostic *coreauth.ErrorDiagnostic, authIndex string) *coreauth.ErrorDiagnostic {
+	if diagnostic == nil {
+		return nil
+	}
+	safe := &coreauth.ErrorDiagnostic{
+		Provider:      "chatgpt-web",
+		AuthIndex:     safeChatGPTWebDiagnosticToken(authIndex, 64),
+		Stage:         safeChatGPTWebDiagnosticToken(diagnostic.Stage, 64),
+		Code:          safeChatGPTWebDiagnosticToken(diagnostic.Code, 128),
+		ResponseType:  safeChatGPTWebDiagnosticToken(diagnostic.ResponseType, 32),
+		ContentType:   safeChatGPTWebDiagnosticToken(diagnostic.ContentType, 128),
+		CFRay:         safeChatGPTWebDiagnosticToken(diagnostic.CFRay, 128),
+		Persona:       safeChatGPTWebDiagnosticToken(diagnostic.Persona, 64),
+		UAMajor:       safeChatGPTWebDiagnosticToken(diagnostic.UAMajor, 16),
+		Platform:      safeChatGPTWebDiagnosticToken(diagnostic.Platform, 64),
+		ResponseBytes: diagnostic.ResponseBytes,
+		Attempts:      diagnostic.Attempts,
+		HTTPStatus:    diagnostic.HTTPStatus,
+		Cloudflare:    diagnostic.Cloudflare,
+		Retryable:     diagnostic.Retryable,
+	}
+	if safe.Attempts < 0 || safe.Attempts > 100 {
+		safe.Attempts = 0
+	}
+	if host := strings.ToLower(strings.TrimSpace(diagnostic.TargetHost)); safeChatGPTWebDiagnosticHost(host) {
+		safe.TargetHost = host
+	}
+	if path := strings.TrimSpace(diagnostic.TargetPath); strings.HasPrefix(path, "/") {
+		if index := strings.IndexByte(path, '?'); index >= 0 {
+			path = path[:index]
+		}
+		for _, character := range path {
+			if character < 0x20 || character == 0x7f {
+				path = ""
+				break
+			}
+		}
+		if len(path) > 128 {
+			path = path[:128]
+		}
+		safe.TargetPath = path
+	}
+	if safe.Stage == "" && safe.Code == "" && safe.HTTPStatus == 0 {
+		return nil
+	}
+	return safe
+}
+
+func safeChatGPTWebDiagnosticHost(host string) bool {
+	if host == "external_asset" {
+		return true
+	}
+	for _, suffix := range []string{"chatgpt.com", "openai.com", "oaiusercontent.com", "oaistatic.com", "blob.core.windows.net"} {
+		if host == suffix || strings.HasSuffix(host, "."+suffix) {
+			return true
+		}
+	}
+	return false
+}
+
+func safeChatGPTWebDiagnosticToken(value string, limit int) string {
+	value = strings.TrimSpace(value)
+	if limit > 0 && len(value) > limit {
+		value = value[:limit]
+	}
+	for _, character := range value {
+		if (character >= 'a' && character <= 'z') || (character >= 'A' && character <= 'Z') ||
+			(character >= '0' && character <= '9') || strings.ContainsRune("._-/ :()", character) {
+			continue
+		}
+		return ""
+	}
+	return value
 }
 
 func applyChatGPTWebMetadataSummary(entry gin.H, metadata map[string]any, lifecycleState string, now time.Time) {

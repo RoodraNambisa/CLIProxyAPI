@@ -165,6 +165,57 @@ func TestApplyChatGPTWebMetadataSummarySanitizesLifecycleReason(t *testing.T) {
 	}
 }
 
+func TestSafeChatGPTWebErrorDiagnosticKeepsOnlyAllowlistedStructure(t *testing.T) {
+	source := &coreauth.ErrorDiagnostic{
+		Provider:      "attacker-provider",
+		AuthIndex:     "attacker-auth-index",
+		Stage:         "file_sign",
+		Code:          "cloudflare_challenge",
+		ResponseType:  "html",
+		ContentType:   "text/html",
+		CFRay:         "abc-SJC",
+		TargetHost:    "evil.example.com",
+		TargetPath:    "/backend-api/files?token=secret",
+		Persona:       "chrome_146",
+		UAMajor:       "146",
+		Platform:      "MacIntel",
+		ResponseBytes: 123,
+		HTTPStatus:    http.StatusForbidden,
+		Cloudflare:    true,
+		Retryable:     true,
+	}
+	safe := safeChatGPTWebErrorDiagnostic(source, "trusted-index")
+	if safe == nil {
+		t.Fatal("safe diagnostic is nil")
+	}
+	if safe.Provider != chatgptwebauth.Provider || safe.AuthIndex != "trusted-index" || safe.TargetHost != "" {
+		t.Fatalf("safe diagnostic identity = %#v", safe)
+	}
+	if safe.TargetPath != "/backend-api/files" || safe.Stage != "file_sign" || safe.Code != "cloudflare_challenge" {
+		t.Fatalf("safe diagnostic structure = %#v", safe)
+	}
+	encoded, errMarshal := json.Marshal(safe)
+	if errMarshal != nil {
+		t.Fatal(errMarshal)
+	}
+	for _, unsafe := range []string{"attacker-provider", "attacker-auth-index", "evil.example.com", "token=secret"} {
+		if strings.Contains(string(encoded), unsafe) {
+			t.Fatalf("safe diagnostic leaked %q: %s", unsafe, encoded)
+		}
+	}
+}
+
+func TestSafeChatGPTWebErrorDiagnosticRejectsUnsafeTokens(t *testing.T) {
+	safe := safeChatGPTWebErrorDiagnostic(&coreauth.ErrorDiagnostic{
+		Stage:      "file_sign\nsecret",
+		Code:       "secret@example.com",
+		HTTPStatus: http.StatusBadGateway,
+	}, "trusted-index")
+	if safe == nil || safe.Stage != "" || safe.Code != "" || safe.HTTPStatus != http.StatusBadGateway {
+		t.Fatalf("safe diagnostic = %#v", safe)
+	}
+}
+
 func TestAuthFileRuntimeSummaryForLinkedWebUsesSourceBinding(t *testing.T) {
 	source := &coreauth.Auth{ID: "codex-source.json", Provider: "codex", Metadata: map[string]any{
 		"credential_uid": "uid-a",
@@ -245,6 +296,7 @@ func TestApplyChatGPTWebAuthFileSummarySanitizesLastError(t *testing.T) {
 			Code:       "upstream-secret-code",
 			Message:    "secret-token-in-error",
 			HTTPStatus: http.StatusUnauthorized,
+			Diagnostic: &coreauth.ErrorDiagnostic{Stage: "passkey_verify", Code: "invalid_passkey_response", Attempts: 2, TargetHost: "auth.openai.com", TargetPath: "/api/accounts/passkey/verify?secret=true"},
 		},
 	}
 
@@ -260,6 +312,9 @@ func TestApplyChatGPTWebAuthFileSummarySanitizesLastError(t *testing.T) {
 	}
 	if lastError.Code != "account_deleted" || lastError.Message != "account is deleted" || lastError.HTTPStatus != http.StatusUnauthorized {
 		t.Fatalf("last_error = %+v", lastError)
+	}
+	if lastError.Diagnostic == nil || lastError.Diagnostic.Attempts != 2 || lastError.Diagnostic.TargetPath != "/api/accounts/passkey/verify" {
+		t.Fatalf("last_error diagnostic = %+v", lastError.Diagnostic)
 	}
 	raw, errMarshal := json.Marshal(entry)
 	if errMarshal != nil {

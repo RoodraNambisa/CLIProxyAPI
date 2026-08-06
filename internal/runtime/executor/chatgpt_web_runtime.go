@@ -40,7 +40,35 @@ const (
 	chatGPTWebMaxJSONBodyBytes      = 32 << 20
 	chatGPTWebMaxHTMLBodyBytes      = 16 << 20
 	chatGPTWebMaxBootstrapRedirects = 5
+	chatGPTWebChallengeInspectBytes = 64 << 10
 )
+
+type chatGPTWebChallengeInspectingBody struct {
+	io.ReadCloser
+	status  int
+	path    string
+	headers fhttp.Header
+	prefix  []byte
+}
+
+func (body *chatGPTWebChallengeInspectingBody) Read(payload []byte) (int, error) {
+	read, errRead := body.ReadCloser.Read(payload)
+	if read > 0 && len(body.prefix) < chatGPTWebChallengeInspectBytes {
+		remaining := chatGPTWebChallengeInspectBytes - len(body.prefix)
+		if read < remaining {
+			remaining = read
+		}
+		body.prefix = append(body.prefix, payload[:remaining]...)
+	}
+	return read, errRead
+}
+
+func (body *chatGPTWebChallengeInspectingBody) challengeError() error {
+	if body == nil {
+		return nil
+	}
+	return newChatGPTWebChallengeResponseError(body.status, body.path, body.prefix, body.headers)
+}
 
 type chatGPTWebPreparedRequest struct {
 	baseModel           string
@@ -81,6 +109,7 @@ type chatGPTWebSearchSource struct {
 }
 
 func (e *ChatGPTWebExecutor) executeRuntime(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (resp cliproxyexecutor.Response, err error) {
+	defer func() { logChatGPTWebSafeDiagnostic(ctx, auth, err) }()
 	if selectedAuthInstanceRetired(opts) {
 		return resp, errXAIWebsocketSessionTerminated
 	}
@@ -125,6 +154,7 @@ func (e *ChatGPTWebExecutor) executeRuntime(ctx context.Context, auth *cliproxya
 }
 
 func (e *ChatGPTWebExecutor) executeRuntimeStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (_ *cliproxyexecutor.StreamResult, err error) {
+	defer func() { logChatGPTWebSafeDiagnostic(ctx, auth, err) }()
 	if selectedAuthInstanceRetired(opts) {
 		return nil, errXAIWebsocketSessionTerminated
 	}
@@ -277,9 +307,13 @@ func (e *ChatGPTWebExecutor) executeRuntimeStream(ctx context.Context, auth *cli
 					return
 				}
 			case errConsume := <-resultCh:
+				if challengeErr := chatGPTWebStreamChallengeError(response); challengeErr != nil {
+					errConsume = challengeErr
+				}
 				if errConsume != nil {
 					errConsume = chatGPTWebCommittedRequestError(ctx, chatGPTWebUpstreamProtocolError(ctx, errConsume))
 					errConsume = e.handleChatGPTWebRuntimeLifecycleError(ctx, auth, errConsume)
+					logChatGPTWebSafeDiagnostic(ctx, auth, errConsume)
 					reporter.PublishFailure(ctx, errConsume)
 					_ = sendChatGPTWebStreamChunk(ctx, out, cliproxyexecutor.StreamChunk{Err: errConsume})
 					return
@@ -977,7 +1011,11 @@ func (e *ChatGPTWebExecutor) executeChatGPTWebText(ctx context.Context, client *
 			log.Errorf("chatgpt web executor: close response body: %v", errClose)
 		}
 	}()
-	if err := consumeChatGPTWebConversation(ctx, response.Body, accumulator, nil); err != nil {
+	err = consumeChatGPTWebConversation(ctx, response.Body, accumulator, nil)
+	if challengeErr := chatGPTWebStreamChallengeError(response); challengeErr != nil {
+		return chatGPTWebTextResult{}, nil, challengeErr
+	}
+	if err != nil {
 		return chatGPTWebTextResult{}, nil, chatGPTWebCommittedRequestError(ctx, chatGPTWebUpstreamProtocolError(ctx, err))
 	}
 	return chatGPTWebTextResult{Text: accumulator.Text()}, cloneChatGPTWebHeaders(response.Header), nil
@@ -1410,7 +1448,7 @@ func (e *ChatGPTWebExecutor) doChatGPTWebBootstrapRequest(
 		e.recordChatGPTWebRequest(ctx, credential, http.MethodGet, currentURL.String(), headers, nil)
 		response, errRequest := client.DoNoRedirectStream(ctx, http.MethodGet, currentURL.String(), headers, nil)
 		if errRequest != nil {
-			return nil, errRequest
+			return nil, chatGPTWebTransportDiagnosticError(errRequest, currentURL.String())
 		}
 		helps.RecordAPIResponseMetadata(ctx, e.configSnapshot(), response.StatusCode, chatGPTWebResponseLogHeaders(response.Header))
 		if !chatGPTWebBootstrapRedirectStatus(response.StatusCode) {
@@ -1468,16 +1506,19 @@ func (e *ChatGPTWebExecutor) doChatGPTWebJSONWithHeadersAndMaxBody(ctx context.C
 	response, err := client.DoJSONStream(ctx, http.MethodPost, e.chatGPTWebBaseURL()+path, headers, body)
 	if err != nil {
 		helps.RecordAPIResponseError(ctx, e.configSnapshot(), err)
-		return nil, nil, err
+		return nil, nil, chatGPTWebTransportDiagnosticError(err, path)
 	}
 	helps.RecordAPIResponseMetadata(ctx, e.configSnapshot(), response.StatusCode, chatGPTWebResponseLogHeaders(response.Header))
 	data, err := readChatGPTWebResponseBody(response, maxBodyBytes)
 	if err != nil {
 		helps.RecordAPIResponseError(ctx, e.configSnapshot(), err)
-		return response, nil, err
+		return response, nil, chatGPTWebTransportDiagnosticError(err, path)
 	}
 	sanitizedData := chatGPTWebResponseLogBody(path, data)
 	helps.AppendAPIResponseChunk(ctx, e.configSnapshot(), sanitizedData)
+	if challengeErr := newChatGPTWebChallengeResponseError(response.StatusCode, path, data, response.Header); challengeErr != nil {
+		return response, data, challengeErr
+	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		return response, data, newChatGPTWebStatusError(response.StatusCode, path, data, response.Header)
 	}
@@ -1503,16 +1544,50 @@ func (e *ChatGPTWebExecutor) doChatGPTWebJSONStream(ctx context.Context, client 
 		if requestWritten.Load() {
 			err = chatGPTWebCommittedRequestError(ctx, err)
 		}
-		return nil, err
+		return nil, chatGPTWebTransportDiagnosticError(err, path)
 	}
 	helps.RecordAPIResponseMetadata(ctx, e.configSnapshot(), response.StatusCode, chatGPTWebResponseLogHeaders(response.Header))
+	if challengeErr := newChatGPTWebChallengeResponseError(response.StatusCode, path, nil, response.Header); challengeErr != nil {
+		data := readAndCloseChatGPTWebErrorBody(response.Body)
+		challengeErr = newChatGPTWebChallengeResponseError(response.StatusCode, path, data, response.Header)
+		return nil, challengeErr
+	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		data := readAndCloseChatGPTWebErrorBody(response.Body)
 		sanitizedData := chatGPTWebResponseLogBody(path, data)
 		helps.AppendAPIResponseChunk(ctx, e.configSnapshot(), sanitizedData)
 		return nil, newChatGPTWebStatusError(response.StatusCode, path, data, response.Header)
 	}
+	wrapChatGPTWebChallengeInspectingBody(response, path)
 	return response, nil
+}
+
+func wrapChatGPTWebChallengeInspectingBody(response *fhttp.Response, path string) {
+	if response == nil || response.Body == nil || response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
+		return
+	}
+	contentType := strings.ToLower(strings.TrimSpace(response.Header.Get("Content-Type")))
+	cfMitigated := strings.ToLower(strings.TrimSpace(response.Header.Get("cf-mitigated")))
+	if !strings.Contains(contentType, "text/html") && (cfMitigated == "" || cfMitigated == "none") {
+		return
+	}
+	response.Body = &chatGPTWebChallengeInspectingBody{
+		ReadCloser: response.Body,
+		status:     response.StatusCode,
+		path:       path,
+		headers:    response.Header,
+	}
+}
+
+func chatGPTWebStreamChallengeError(response *fhttp.Response) error {
+	if response == nil {
+		return nil
+	}
+	body, ok := response.Body.(*chatGPTWebChallengeInspectingBody)
+	if !ok {
+		return nil
+	}
+	return body.challengeError()
 }
 
 func readChatGPTWebResponseBody(response *fhttp.Response, maxSuccessBytes int) ([]byte, error) {
@@ -1932,6 +2007,47 @@ type chatGPTWebHTTPError struct {
 	lifecycleError             *chatgptwebauth.AuthError
 	turnstileFinalizeRejection bool
 	sentinelFinalizeRejection  bool
+	diagnostic                 *cliproxyauth.ErrorDiagnostic
+}
+
+type chatGPTWebDiagnosticError struct {
+	cause      error
+	diagnostic *cliproxyauth.ErrorDiagnostic
+}
+
+func (e chatGPTWebDiagnosticError) Error() string {
+	if e.cause == nil {
+		return "chatgpt web upstream request failed"
+	}
+	return e.cause.Error()
+}
+
+func (e chatGPTWebDiagnosticError) Unwrap() error { return e.cause }
+
+func (e chatGPTWebDiagnosticError) AuthErrorDiagnostic() *cliproxyauth.ErrorDiagnostic {
+	return e.diagnostic.Clone()
+}
+
+func chatGPTWebTransportDiagnosticError(err error, path string) error {
+	if err == nil {
+		return nil
+	}
+	type diagnosticProvider interface {
+		AuthErrorDiagnostic() *cliproxyauth.ErrorDiagnostic
+	}
+	var existing diagnosticProvider
+	if errors.As(err, &existing) && existing != nil {
+		return err
+	}
+	return chatGPTWebDiagnosticError{
+		cause:      err,
+		diagnostic: helps.ClassifyChatGPTWebTransportDiagnostic(err, path),
+	}
+}
+
+// AuthErrorDiagnostic returns a redacted diagnostic safe for management views.
+func (e chatGPTWebHTTPError) AuthErrorDiagnostic() *cliproxyauth.ErrorDiagnostic {
+	return e.diagnostic.Clone()
 }
 
 func (e chatGPTWebHTTPError) Headers() http.Header {
@@ -1977,6 +2093,7 @@ func newChatGPTWebStatusError(code int, path string, body []byte, headers fhttp.
 		lifecycleError:             lifecycleError,
 		turnstileFinalizeRejection: turnstileFinalizeRejection,
 		sentinelFinalizeRejection:  sentinelFinalizeRejection,
+		diagnostic:                 helps.ClassifyChatGPTWebHTTPDiagnostic(code, path, body, headers),
 	}
 	switch code {
 	case http.StatusBadRequest, http.StatusNotFound, http.StatusMethodNotAllowed,
@@ -2009,6 +2126,64 @@ func newChatGPTWebStatusError(code int, path string, body []byte, headers fhttp.
 		err.headers = http.Header{"Retry-After": []string{retryAfter}}
 	}
 	return err
+}
+
+func newChatGPTWebChallengeResponseError(status int, path string, body []byte, headers fhttp.Header) error {
+	if status < http.StatusOK || status >= http.StatusMultipleChoices {
+		return nil
+	}
+	diagnostic := helps.ClassifyChatGPTWebHTTPDiagnostic(status, path, body, headers)
+	if diagnostic == nil || !diagnostic.Cloudflare {
+		return nil
+	}
+	err := newChatGPTWebStatusError(http.StatusBadGateway, path, body, headers)
+	err.statusErr.msg = "chatgpt web upstream returned a Cloudflare challenge"
+	err.statusErr.skipAuthResult = true
+	err.statusErr.retryOtherAuth = true
+	err.diagnostic = diagnostic
+	return err
+}
+
+func logChatGPTWebSafeDiagnostic(ctx context.Context, auth *cliproxyauth.Auth, err error) {
+	if err == nil {
+		return
+	}
+	type diagnosticProvider interface {
+		AuthErrorDiagnostic() *cliproxyauth.ErrorDiagnostic
+	}
+	var provider diagnosticProvider
+	if !errors.As(err, &provider) || provider == nil {
+		return
+	}
+	diagnostic := provider.AuthErrorDiagnostic()
+	if diagnostic == nil {
+		return
+	}
+	if auth != nil {
+		diagnostic.AuthIndex = auth.EnsureIndex()
+		if credential, errCredential := chatgptwebauth.ParseCredential(auth.Metadata); errCredential == nil && credential != nil {
+			diagnostic.Persona = strings.TrimSpace(credential.Persona.Profile)
+			diagnostic.Platform = strings.TrimSpace(credential.Persona.Platform)
+			diagnostic.UAMajor = chatGPTWebUserAgentMajor(credential.Persona.UserAgent)
+		}
+	}
+	fields := helps.ChatGPTWebDiagnosticLogFields(diagnostic)
+	helps.LogWithRequestID(ctx).WithFields(log.Fields(fields)).Warn("chatgpt web upstream request failed")
+}
+
+func chatGPTWebUserAgentMajor(userAgent string) string {
+	for _, marker := range []string{"Chrome/", "CriOS/", "Firefox/", "Version/"} {
+		index := strings.Index(userAgent, marker)
+		if index < 0 {
+			continue
+		}
+		version := userAgent[index+len(marker):]
+		if end := strings.IndexAny(version, ". ;)"); end >= 0 {
+			version = version[:end]
+		}
+		return strings.TrimSpace(version)
+	}
+	return ""
 }
 
 func chatGPTWebRequestScopedForbidden(path string, body []byte) bool {
@@ -2282,6 +2457,7 @@ func (e *ChatGPTWebExecutor) streamDeferredChatGPTWebResponse(
 			case result := <-resultCh:
 				if result.err != nil {
 					result.err = e.handleChatGPTWebRuntimeLifecycleError(ctx, auth, result.err)
+					logChatGPTWebSafeDiagnostic(ctx, auth, result.err)
 					reporter.PublishFailure(ctx, result.err)
 					_ = sendChatGPTWebStreamChunk(ctx, out, cliproxyexecutor.StreamChunk{Err: result.err})
 					return

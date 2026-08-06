@@ -1255,10 +1255,12 @@ type RemoteManagement struct {
 	PanelGitHubRepository string `yaml:"panel-github-repository"`
 	// AuthFilesPagination controls opt-in server-side pagination for the auth files management page.
 	AuthFilesPagination AuthFilesPaginationConfig `yaml:"auth-files-pagination" json:"auth-files-pagination"`
+	// LiveLogs controls the in-memory management log stream.
+	LiveLogs LiveLogsConfig `yaml:"live-logs" json:"live-logs"`
 }
 
 // UnmarshalYAML preserves existing remote-management compatibility while rejecting
-// an explicit null auth-files-pagination object.
+// explicit null nested configuration objects.
 func (cfg *RemoteManagement) UnmarshalYAML(node *yaml.Node) error {
 	if cfg == nil || node == nil {
 		return fmt.Errorf("remote-management must be an object")
@@ -1277,12 +1279,46 @@ func (cfg *RemoteManagement) UnmarshalYAML(node *yaml.Node) error {
 	if value, present := effective["auth-files-pagination"]; present && value == nil {
 		return fmt.Errorf("remote-management.auth-files-pagination must be an object")
 	}
+	if value, present := effective["live-logs"]; present && value == nil {
+		return fmt.Errorf("remote-management.live-logs must be an object")
+	}
 	type plainRemoteManagement RemoteManagement
 	decoded := plainRemoteManagement(*cfg)
 	if err := node.Decode(&decoded); err != nil {
 		return fmt.Errorf("remote-management: %w", err)
 	}
 	*cfg = RemoteManagement(decoded)
+	return nil
+}
+
+// LiveLogsConfig controls the authenticated in-memory management log stream.
+type LiveLogsConfig struct {
+	Enabled bool `yaml:"enabled" json:"enabled"`
+}
+
+// UnmarshalYAML rejects null, scalar, and unknown live-logs settings.
+func (cfg *LiveLogsConfig) UnmarshalYAML(node *yaml.Node) error {
+	if cfg == nil || node == nil || (node.Kind != yaml.MappingNode && node.Kind != yaml.AliasNode) {
+		return fmt.Errorf("remote-management.live-logs must be an object")
+	}
+	var effective map[string]any
+	if err := node.Decode(&effective); err != nil {
+		return fmt.Errorf("remote-management.live-logs: %w", err)
+	}
+	for name, value := range effective {
+		if name != "enabled" {
+			return fmt.Errorf("remote-management.live-logs.%s is not supported", name)
+		}
+		if value == nil {
+			return fmt.Errorf("remote-management.live-logs.enabled must not be null")
+		}
+	}
+	type plainLiveLogsConfig LiveLogsConfig
+	var decoded plainLiveLogsConfig
+	if err := node.Decode(&decoded); err != nil {
+		return fmt.Errorf("remote-management.live-logs: %w", err)
+	}
+	*cfg = LiveLogsConfig(decoded)
 	return nil
 }
 

@@ -27,6 +27,7 @@ import (
 	chatgptwebauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/chatgptweb"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor/helps"
+	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v6/sdk/translator"
 	"github.com/tidwall/gjson"
@@ -1223,6 +1224,152 @@ func TestChatGPTWebRuntimeJSONDoesNotFollowRedirects(t *testing.T) {
 	}
 	if targetHits != 0 {
 		t.Fatalf("redirect target hits = %d", targetHits)
+	}
+}
+
+func TestChatGPTWebJSONDetectsSuccessfulCloudflareChallenge(t *testing.T) {
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Header().Set("Server", "cloudflare")
+		w.Header().Set("cf-ray", "safe-ray")
+		_, _ = io.WriteString(w, `<!doctype html><title>Just a moment...</title><script src="/cdn-cgi/challenge-platform/h/g/orchestrate/chl_page/v1"></script>`)
+	}))
+	defer origin.Close()
+
+	executor := NewChatGPTWebExecutor(nil, nil)
+	executor.runtimeBaseURL = origin.URL
+	client, credential, err := executor.newRuntimeClient(chatGPTWebRuntimeAuth())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.CloseIdleConnections()
+
+	_, _, err = executor.doChatGPTWebJSON(context.Background(), client, credential, "/backend-api/test", map[string]any{"input": "hello"})
+	if err == nil {
+		t.Fatal("expected Cloudflare challenge error")
+	}
+	var status interface{ StatusCode() int }
+	if !errors.As(err, &status) || status.StatusCode() != http.StatusBadGateway {
+		t.Fatalf("challenge status = %v, want 502", err)
+	}
+	var provider interface {
+		AuthErrorDiagnostic() *cliproxyauth.ErrorDiagnostic
+	}
+	if !errors.As(err, &provider) {
+		t.Fatalf("challenge diagnostic missing: %v", err)
+	}
+	diagnostic := provider.AuthErrorDiagnostic()
+	if diagnostic == nil || diagnostic.HTTPStatus != http.StatusOK || diagnostic.Code != "cloudflare_challenge" ||
+		!diagnostic.Cloudflare || diagnostic.CFRay != "safe-ray" {
+		t.Fatalf("challenge diagnostic = %#v", diagnostic)
+	}
+	assertChatGPTWebAssetRetryError(t, err)
+}
+
+func TestChatGPTWebJSONDoesNotTreatSuccessfulCloudflareHTMLAsChallenge(t *testing.T) {
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Header().Set("Server", "cloudflare")
+		w.Header().Set("cf-ray", "safe-ray")
+		_, _ = io.WriteString(w, `<!doctype html><title>ChatGPT</title><main>ok</main>`)
+	}))
+	defer origin.Close()
+
+	executor := NewChatGPTWebExecutor(nil, nil)
+	executor.runtimeBaseURL = origin.URL
+	client, credential, err := executor.newRuntimeClient(chatGPTWebRuntimeAuth())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.CloseIdleConnections()
+
+	_, payload, err := executor.doChatGPTWebJSON(context.Background(), client, credential, "/backend-api/test", map[string]any{"input": "hello"})
+	if err != nil {
+		t.Fatalf("ordinary Cloudflare HTML error = %v", err)
+	}
+	if !bytes.Contains(payload, []byte("<main>ok</main>")) {
+		t.Fatalf("payload = %q", payload)
+	}
+}
+
+func TestChatGPTWebJSONStreamDetectsSuccessfulChallengeHeader(t *testing.T) {
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Header().Set("cf-mitigated", "challenge")
+		_, _ = io.WriteString(w, `<!doctype html><title>Challenge</title>`)
+	}))
+	defer origin.Close()
+
+	executor := NewChatGPTWebExecutor(nil, nil)
+	executor.runtimeBaseURL = origin.URL
+	client, credential, err := executor.newRuntimeClient(chatGPTWebRuntimeAuth())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.CloseIdleConnections()
+
+	headers := executor.chatGPTWebHeaders(credential, "/backend-api/test", map[string]string{
+		"accept":       "text/event-stream",
+		"content-type": "application/json",
+	})
+	_, err = executor.doChatGPTWebJSONStream(context.Background(), client, credential, "/backend-api/test", headers, map[string]any{"input": "hello"})
+	if err == nil {
+		t.Fatal("expected Cloudflare challenge error")
+	}
+	var provider interface {
+		AuthErrorDiagnostic() *cliproxyauth.ErrorDiagnostic
+	}
+	if !errors.As(err, &provider) {
+		t.Fatalf("challenge diagnostic missing: %v", err)
+	}
+	diagnostic := provider.AuthErrorDiagnostic()
+	if diagnostic == nil || diagnostic.HTTPStatus != http.StatusOK || diagnostic.Code != "cloudflare_challenge" || !diagnostic.Cloudflare {
+		t.Fatalf("challenge diagnostic = %#v", diagnostic)
+	}
+}
+
+func TestChatGPTWebJSONStreamDetectsSuccessfulChallengeBodyWithoutBlockingHeaders(t *testing.T) {
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Header().Set("Server", "cloudflare")
+		_, _ = io.WriteString(w, `<!doctype html><title>Just a moment...</title><script src="/cdn-cgi/challenge-platform/h/g/orchestrate/chl_page/v1"></script>`)
+	}))
+	defer origin.Close()
+
+	executor := NewChatGPTWebExecutor(nil, nil)
+	executor.runtimeBaseURL = origin.URL
+	client, credential, err := executor.newRuntimeClient(chatGPTWebRuntimeAuth())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.CloseIdleConnections()
+
+	headers := executor.chatGPTWebHeaders(credential, "/backend-api/test", map[string]string{
+		"accept":       "text/event-stream",
+		"content-type": "application/json",
+	})
+	response, err := executor.doChatGPTWebJSONStream(context.Background(), client, credential, "/backend-api/test", headers, map[string]any{"input": "hello"})
+	if err != nil {
+		t.Fatalf("stream headers error = %v", err)
+	}
+	if _, errRead := io.Copy(io.Discard, response.Body); errRead != nil {
+		t.Fatalf("read stream body: %v", errRead)
+	}
+	defer response.Body.Close()
+
+	err = chatGPTWebStreamChallengeError(response)
+	if err == nil {
+		t.Fatal("expected body-based Cloudflare challenge error")
+	}
+	var provider interface {
+		AuthErrorDiagnostic() *cliproxyauth.ErrorDiagnostic
+	}
+	if !errors.As(err, &provider) {
+		t.Fatalf("challenge diagnostic missing: %v", err)
+	}
+	diagnostic := provider.AuthErrorDiagnostic()
+	if diagnostic == nil || diagnostic.HTTPStatus != http.StatusOK || diagnostic.Code != "cloudflare_challenge" || !diagnostic.Cloudflare {
+		t.Fatalf("challenge diagnostic = %#v", diagnostic)
 	}
 }
 
@@ -3219,7 +3366,7 @@ func TestChatGPTWebAssetErrorsDoNotCoolCredentialOrLeakURL(t *testing.T) {
 	}
 
 	statusError := newChatGPTWebAssetStatusError(http.StatusBadGateway, signedURL,
-		[]byte(`<Error><Message>failed https://storage.example/image?sig=secret</Message></Error>`), nil)
+		[]byte(`<Error><Message>failed https://storage.example/image?sig=secret</Message></Error>`), nil, "file_upload")
 	if strings.Contains(statusError.Error(), "sig=secret") {
 		t.Fatalf("status error leaked URL: %v", statusError)
 	}
@@ -3257,7 +3404,7 @@ func TestChatGPTWebAssetStatusRetriesOnlyRecoverableFailures(t *testing.T) {
 		http.StatusTooManyRequests,
 		http.StatusBadGateway,
 	} {
-		err := newChatGPTWebAssetStatusError(statusCode, "https://storage.example/image?sig=secret", nil, nil)
+		err := newChatGPTWebAssetStatusError(statusCode, "https://storage.example/image?sig=secret", nil, nil, "image_download")
 		assertChatGPTWebAssetRetryError(t, err)
 	}
 	for _, statusCode := range []int{
@@ -3267,7 +3414,7 @@ func TestChatGPTWebAssetStatusRetriesOnlyRecoverableFailures(t *testing.T) {
 		http.StatusUnsupportedMediaType,
 		http.StatusUnprocessableEntity,
 	} {
-		err := newChatGPTWebAssetStatusError(statusCode, "https://storage.example/image?sig=secret", nil, nil)
+		err := newChatGPTWebAssetStatusError(statusCode, "https://storage.example/image?sig=secret", nil, nil, "image_download")
 		assertChatGPTWebNonAuthNonRetryError(t, err)
 	}
 }

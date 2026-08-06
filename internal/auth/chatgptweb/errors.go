@@ -22,6 +22,14 @@ type AuthError struct {
 	Attempts       int            `json:"attempts,omitempty"`
 	Message        string         `json:"message,omitempty"`
 	Cause          error          `json:"-"`
+	DiagnosticCode string         `json:"-"`
+	ResponseType   string         `json:"-"`
+	ContentType    string         `json:"-"`
+	CFRay          string         `json:"-"`
+	TargetHost     string         `json:"-"`
+	TargetPath     string         `json:"-"`
+	ResponseBytes  int64          `json:"-"`
+	Cloudflare     bool           `json:"-"`
 }
 
 func (authError *AuthError) Error() string {
@@ -196,6 +204,19 @@ func SafeLifecycleReason(value string) string {
 	default:
 		return "authentication_failed"
 	}
+}
+
+// SafeDiagnosticCode returns a stable, non-sensitive upstream or lifecycle code.
+func SafeDiagnosticCode(value string) string {
+	normalized := normalizeCode(value)
+	if normalized == "invalid_passkey_response" {
+		return normalized
+	}
+	safe := SafeLifecycleReason(normalized)
+	if safe == "authentication_failed" && normalized != "authentication_failed" {
+		return ""
+	}
+	return safe
 }
 
 // SafeLifecycleState returns a known lifecycle state and fails closed for

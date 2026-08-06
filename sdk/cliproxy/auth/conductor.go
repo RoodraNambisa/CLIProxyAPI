@@ -4190,7 +4190,7 @@ func (m *Manager) installPreparedRequestAuthDurably(ctx context.Context, expecte
 }
 
 func (m *Manager) installPreparedRequestAuth(ctx context.Context, expected, updated *Auth, refreshAware bool) (*Auth, error) {
-	return m.installPreparedRequestAuthWithRuntimeMetadata(ctx, expected, updated, refreshAware, false)
+	return m.installPreparedRequestAuthWithRuntimeMetadata(ctx, expected, updated, refreshAware, false, false)
 }
 
 func (m *Manager) installPreparedRequestAuthWithRuntimeMetadata(
@@ -4198,6 +4198,7 @@ func (m *Manager) installPreparedRequestAuthWithRuntimeMetadata(
 	expected, updated *Auth,
 	refreshAware bool,
 	allowRuntimeMetadataChanges bool,
+	applyUpdatedLastError bool,
 ) (*Auth, error) {
 	if m == nil || expected == nil || updated == nil || strings.TrimSpace(expected.ID) == "" {
 		return updated, nil
@@ -4246,6 +4247,9 @@ func (m *Manager) installPreparedRequestAuthWithRuntimeMetadata(
 	if !credentialChanged && !skipRuntimeStateCarryForward {
 		carryForwardPreparedAuthRuntimeState(current, candidate)
 	}
+	if applyUpdatedLastError {
+		candidate.LastError = cloneError(updated.LastError)
+	}
 	normalizeChatGPTWebDependencyState(candidate)
 	if chatGPTWebRegistrationEmail(candidate) != "" && m.chatGPTWebCredentialConflictLocked(id, candidate) {
 		m.mu.Unlock()
@@ -4272,6 +4276,9 @@ func (m *Manager) installPreparedRequestAuthWithRuntimeMetadata(
 	credentialChanged = preparePreparedRequestCredentialReplacement(current, candidate, time.Now(), refreshAware)
 	if !credentialChanged && !skipRuntimeStateCarryForward {
 		carryForwardPreparedAuthRuntimeState(current, candidate)
+	}
+	if applyUpdatedLastError {
+		candidate.LastError = cloneError(updated.LastError)
 	}
 	normalizeChatGPTWebDependencyState(candidate)
 	candidate.installationID = uuid.NewString()
@@ -4350,6 +4357,7 @@ func (m *Manager) UpdateChatGPTWebReloginIfCurrent(ctx context.Context, expected
 		expected,
 		updated,
 		false,
+		true,
 		true,
 	)
 	if isRuntimeAuthInstanceRetiredError(err) {
@@ -4611,8 +4619,7 @@ func cloneReasonOwnedModelState(auth *Auth, modelKey, reason string) *ModelState
 		}
 		cloned := *state
 		if state.LastError != nil {
-			lastError := *state.LastError
-			cloned.LastError = &lastError
+			cloned.LastError = cloneError(state.LastError)
 		}
 		return &cloned
 	}
@@ -4933,7 +4940,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			errPrepare = m.reportProxyFailure(execCtx, auth, errPrepare)
 			roundState.markAttempted(auth)
 			result := resultForAuth(auth, provider, routeModel, false)
-			result.Error = &Error{Message: errPrepare.Error()}
+			result.Error = executionResultError(auth, errPrepare)
 			if statusErr, ok := errors.AsType[cliproxyexecutor.StatusError](errPrepare); ok && statusErr != nil {
 				result.Error.HTTPStatus = statusErr.StatusCode()
 			}
@@ -5070,7 +5077,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			resultModel = executionResultModelForError(resultModel, errExec)
 			m.projectFailedImageGenerationQuota(execCtx, auth, provider, resultModel, opts)
 			result := resultForAuth(auth, provider, resultModel, false)
-			result.Error = &Error{Message: errExec.Error()}
+			result.Error = executionResultError(auth, errExec)
 			result.Error.Code = executionResultErrorCode(errExec)
 			if se, ok := errors.AsType[cliproxyexecutor.StatusError](errExec); ok && se != nil {
 				result.Error.HTTPStatus = se.StatusCode()
@@ -5178,7 +5185,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 			errPrepare = m.reportProxyFailure(execCtx, auth, errPrepare)
 			roundState.markAttempted(auth)
 			result := resultForAuth(auth, provider, routeModel, false)
-			result.Error = &Error{Message: errPrepare.Error()}
+			result.Error = executionResultError(auth, errPrepare)
 			if statusErr, ok := errors.AsType[cliproxyexecutor.StatusError](errPrepare); ok && statusErr != nil {
 				result.Error.HTTPStatus = statusErr.StatusCode()
 			}
@@ -5311,7 +5318,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 			}
 			errExec = m.reportProxyFailure(execCtx, auth, errExec)
 			result := resultForAuth(auth, provider, resultModel, false)
-			result.Error = &Error{Message: errExec.Error()}
+			result.Error = executionResultError(auth, errExec)
 			if se, ok := errors.AsType[cliproxyexecutor.StatusError](errExec); ok && se != nil {
 				result.Error.HTTPStatus = se.StatusCode()
 			}
@@ -5419,7 +5426,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			errPrepare = m.reportProxyFailure(execCtx, auth, errPrepare)
 			roundState.markAttempted(auth)
 			result := resultForAuth(auth, provider, routeModel, false)
-			result.Error = &Error{Message: errPrepare.Error()}
+			result.Error = executionResultError(auth, errPrepare)
 			if statusErr, ok := errors.AsType[cliproxyexecutor.StatusError](errPrepare); ok && statusErr != nil {
 				result.Error.HTTPStatus = statusErr.StatusCode()
 			}
@@ -5532,7 +5539,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 				}
 				resultModel = executionResultModelForError(resultModel, errStream)
 				result := resultForAuth(auth, provider, resultModel, false)
-				result.Error = &Error{Message: errStream.Error()}
+				result.Error = executionResultError(auth, errStream)
 				result.Error.Code = executionResultErrorCode(errStream)
 				if statusErr, ok := errors.AsType[cliproxyexecutor.StatusError](errStream); ok && statusErr != nil {
 					result.Error.HTTPStatus = statusErr.StatusCode()
@@ -6022,7 +6029,7 @@ func (m *Manager) tryAntigravityCreditsExecute(ctx context.Context, req cliproxy
 			if !isRuntimeAuthInstanceRetiredError(errPrepare) {
 				errPrepare = m.reportProxyFailure(creditsCtx, c.auth, errPrepare)
 				result := resultForAuth(c.auth, c.provider, routeModel, false)
-				result.Error = &Error{Message: errPrepare.Error(), HTTPStatus: statusCodeFromError(errPrepare)}
+				result.Error = executionResultError(c.auth, errPrepare)
 				result.RetryAfter = retryAfterFromError(errPrepare)
 				if !skipAuthResultForError(errPrepare) {
 					m.markExecutionResult(creditsCtx, result)
@@ -6068,7 +6075,7 @@ func (m *Manager) tryAntigravityCreditsExecute(ctx context.Context, req cliproxy
 			}
 			errExec = m.reportProxyFailure(creditsCtx, c.auth, errExec)
 			result := resultForAuth(c.auth, c.provider, resultModel, false)
-			result.Error = &Error{Message: errExec.Error()}
+			result.Error = executionResultError(c.auth, errExec)
 			if se, ok := errors.AsType[cliproxyexecutor.StatusError](errExec); ok && se != nil {
 				result.Error.HTTPStatus = se.StatusCode()
 			}
@@ -6123,7 +6130,7 @@ func (m *Manager) tryAntigravityCreditsExecuteStream(ctx context.Context, req cl
 			if !isRuntimeAuthInstanceRetiredError(errPrepare) {
 				errPrepare = m.reportProxyFailure(creditsCtx, c.auth, errPrepare)
 				result := resultForAuth(c.auth, c.provider, routeModel, false)
-				result.Error = &Error{Message: errPrepare.Error(), HTTPStatus: statusCodeFromError(errPrepare)}
+				result.Error = executionResultError(c.auth, errPrepare)
 				result.RetryAfter = retryAfterFromError(errPrepare)
 				if !skipAuthResultForError(errPrepare) {
 					m.markExecutionResult(creditsCtx, result)
@@ -7609,7 +7616,110 @@ func cloneError(err *Error) *Error {
 		Message:    err.Message,
 		Retryable:  err.Retryable,
 		HTTPStatus: err.HTTPStatus,
+		Diagnostic: err.Diagnostic.Clone(),
 	}
+}
+
+func executionResultError(auth *Auth, err error) *Error {
+	if err == nil {
+		return nil
+	}
+	result := &Error{
+		Code:       executionResultErrorCode(err),
+		Message:    err.Error(),
+		HTTPStatus: statusCodeFromError(err),
+	}
+	result.Diagnostic = providerErrorDiagnostic(err)
+	if result.Diagnostic != nil {
+		if result.HTTPStatus == 0 {
+			result.HTTPStatus = result.Diagnostic.HTTPStatus
+		}
+		result.Retryable = result.Diagnostic.Retryable
+		enrichExecutionErrorDiagnostic(result.Diagnostic, auth)
+	}
+	return result
+}
+
+// NewProviderError converts a provider failure into the manager's safe error shape.
+func NewProviderError(auth *Auth, err error) *Error {
+	return executionResultError(auth, err)
+}
+
+func providerErrorDiagnostic(err error) *ErrorDiagnostic {
+	if err == nil {
+		return nil
+	}
+	type diagnosticProvider interface {
+		AuthErrorDiagnostic() *ErrorDiagnostic
+	}
+	var provider diagnosticProvider
+	if errors.As(err, &provider) && provider != nil {
+		return provider.AuthErrorDiagnostic().Clone()
+	}
+	authError, ok := chatgptwebauth.AsAuthError(err)
+	if !ok || authError == nil {
+		return nil
+	}
+	code := chatgptwebauth.SafeDiagnosticCode(authError.DiagnosticCode)
+	if code == "" {
+		code = chatgptwebauth.SafeDiagnosticCode(authError.Code)
+	}
+	return &ErrorDiagnostic{
+		Provider:      chatgptwebauth.Provider,
+		Stage:         strings.TrimSpace(authError.FailureStage),
+		Code:          code,
+		ResponseType:  strings.TrimSpace(authError.ResponseType),
+		ContentType:   strings.TrimSpace(authError.ContentType),
+		CFRay:         strings.TrimSpace(authError.CFRay),
+		TargetHost:    strings.TrimSpace(authError.TargetHost),
+		TargetPath:    strings.TrimSpace(authError.TargetPath),
+		ResponseBytes: authError.ResponseBytes,
+		Attempts:      authError.Attempts,
+		HTTPStatus:    authError.StatusCode,
+		Cloudflare:    authError.Cloudflare,
+		Retryable:     authError.Retryable,
+	}
+}
+
+func enrichExecutionErrorDiagnostic(diagnostic *ErrorDiagnostic, auth *Auth) {
+	if diagnostic == nil || auth == nil {
+		return
+	}
+	if diagnostic.Provider == "" {
+		diagnostic.Provider = executorKeyFromAuth(auth)
+	}
+	diagnostic.AuthIndex = auth.EnsureIndex()
+	if !strings.EqualFold(diagnostic.Provider, chatgptwebauth.Provider) || len(auth.Metadata) == 0 {
+		return
+	}
+	credential, errCredential := chatgptwebauth.ParseCredential(auth.Metadata)
+	if errCredential != nil || credential == nil {
+		return
+	}
+	if diagnostic.Persona == "" {
+		diagnostic.Persona = strings.TrimSpace(credential.Persona.Profile)
+	}
+	if diagnostic.Platform == "" {
+		diagnostic.Platform = strings.TrimSpace(credential.Persona.Platform)
+	}
+	if diagnostic.UAMajor == "" {
+		diagnostic.UAMajor = userAgentMajorVersion(credential.Persona.UserAgent)
+	}
+}
+
+func userAgentMajorVersion(userAgent string) string {
+	for _, marker := range []string{"Chrome/", "CriOS/", "Firefox/", "Version/"} {
+		index := strings.Index(userAgent, marker)
+		if index < 0 {
+			continue
+		}
+		version := userAgent[index+len(marker):]
+		if end := strings.IndexAny(version, ". ;)"); end >= 0 {
+			version = version[:end]
+		}
+		return strings.TrimSpace(version)
+	}
+	return ""
 }
 
 func statusCodeFromError(err error) int {
@@ -8199,8 +8309,7 @@ func (m *Manager) ListMetadataSummaries(metadataKeys ...string) []*Auth {
 			}
 		}
 		if auth.LastError != nil {
-			lastError := *auth.LastError
-			summary.LastError = &lastError
+			summary.LastError = cloneError(auth.LastError)
 		}
 		list = append(list, summary)
 	}
@@ -10924,7 +11033,7 @@ func (m *Manager) refreshAuthExpected(ctx context.Context, id string, expected *
 		m.mu.Lock()
 		if current := m.auths[id]; runtimeMetadataMutationMatchesCurrent(current, auth) {
 			current.NextRefreshAfter = now.Add(refreshFailureBackoff)
-			current.LastError = &Error{Message: err.Error()}
+			current.LastError = executionResultError(current, err)
 			m.installAuthLocked(id, current)
 			shouldReschedule = true
 			if m.scheduler != nil {
