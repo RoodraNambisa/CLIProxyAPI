@@ -81,7 +81,7 @@ func TestUploadAuthFile_BatchMultipart(t *testing.T) {
 		name    string
 		content string
 	}{
-		{name: "alpha.json", content: `{"type":"codex","email":"alpha@example.com"}`},
+		{name: "alpha.json", content: `{"type":"codex","email":"alpha@example.com","priority":4}`},
 		{name: "beta.json", content: `{"type":"claude","email":"beta@example.com"}`},
 	}
 
@@ -134,6 +134,11 @@ func TestUploadAuthFile_BatchMultipart(t *testing.T) {
 	auths := manager.List()
 	if len(auths) != len(files) {
 		t.Fatalf("expected %d auth entries, got %d", len(files), len(auths))
+	}
+	for _, auth := range auths {
+		if auth != nil && auth.FileName == "alpha.json" && auth.Attributes["priority"] != "4" {
+			t.Fatalf("uploaded auth runtime priority = %q, want 4", auth.Attributes["priority"])
+		}
 	}
 }
 

@@ -3025,6 +3025,17 @@ func (h *Handler) buildAuthFromFileData(path string, data []byte) (*coreauth.Aut
 		"path":   path,
 		"source": path,
 	}
+	if rawPriority, ok := metadata["priority"]; ok {
+		switch value := rawPriority.(type) {
+		case float64:
+			attr["priority"] = strconv.Itoa(int(value))
+		case string:
+			priority := strings.TrimSpace(value)
+			if _, errPriority := strconv.Atoi(priority); errPriority == nil {
+				attr["priority"] = priority
+			}
+		}
+	}
 	if strings.EqualFold(strings.TrimSpace(provider), "codex") {
 		if planType := codex.EffectivePlanType(metadata); planType != "" {
 			attr["plan_type"] = planType
