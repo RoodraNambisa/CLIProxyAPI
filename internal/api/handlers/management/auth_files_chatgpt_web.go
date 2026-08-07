@@ -152,7 +152,7 @@ func safeChatGPTWebErrorDiagnostic(diagnostic *coreauth.ErrorDiagnostic, authInd
 		Provider:      "chatgpt-web",
 		AuthIndex:     safeChatGPTWebDiagnosticToken(authIndex, 64),
 		Stage:         safeChatGPTWebDiagnosticToken(diagnostic.Stage, 64),
-		Code:          safeChatGPTWebDiagnosticToken(diagnostic.Code, 128),
+		Code:          chatgptwebauth.SafeDiagnosticCode(diagnostic.Code),
 		ResponseType:  safeChatGPTWebDiagnosticToken(diagnostic.ResponseType, 32),
 		ContentType:   safeChatGPTWebDiagnosticToken(diagnostic.ContentType, 128),
 		CFRay:         safeChatGPTWebDiagnosticToken(diagnostic.CFRay, 128),

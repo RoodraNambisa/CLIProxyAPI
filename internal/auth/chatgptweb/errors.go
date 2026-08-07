@@ -210,7 +210,34 @@ func SafeLifecycleReason(value string) string {
 // SafeDiagnosticCode returns a stable, non-sensitive upstream or lifecycle code.
 func SafeDiagnosticCode(value string) string {
 	normalized := normalizeCode(value)
-	if normalized == "invalid_passkey_response" {
+	switch normalized {
+	case "cloudflare_challenge",
+		"credential_unavailable",
+		"dns_error",
+		"forbidden",
+		"identity_mismatch",
+		"internal_server_error",
+		"invalid_passkey_response",
+		"invalid_response",
+		"invalid_token",
+		"network_error",
+		"network_timeout",
+		"proxy_error",
+		"rate_limit_exceeded",
+		"rate_limited",
+		"refresh_failed",
+		"request_canceled",
+		"server_error",
+		"service_unavailable",
+		"temporarily_unavailable",
+		"tls_error",
+		"token_expired",
+		"unauthorized",
+		"upstream_challenge",
+		"upstream_non_json",
+		"upstream_request_error",
+		"upstream_server_error",
+		"upstream_unavailable":
 		return normalized
 	}
 	safe := SafeLifecycleReason(normalized)

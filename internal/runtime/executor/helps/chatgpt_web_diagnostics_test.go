@@ -95,14 +95,16 @@ func TestClassifyChatGPTWebHTTPDiagnostic(t *testing.T) {
 }
 
 func TestClassifyChatGPTWebHTTPDiagnosticRejectsUnsafeUpstreamCode(t *testing.T) {
-	diagnostic := ClassifyChatGPTWebHTTPDiagnostic(
-		http.StatusBadRequest,
-		"/backend-api/models",
-		[]byte(`{"error":{"code":"unsafe token=secret@example.com"}}`),
-		http.Header{"Content-Type": {"application/json"}},
-	)
-	if diagnostic.Code != "upstream_request_error" {
-		t.Fatalf("code = %q, want upstream_request_error", diagnostic.Code)
+	for _, upstreamCode := range []string{"unsafe token=secret@example.com", "sk-abcdefgh12345678"} {
+		diagnostic := ClassifyChatGPTWebHTTPDiagnostic(
+			http.StatusBadRequest,
+			"/backend-api/models",
+			[]byte(`{"error":{"code":"`+upstreamCode+`"}}`),
+			http.Header{"Content-Type": {"application/json"}},
+		)
+		if diagnostic.Code != "upstream_request_error" {
+			t.Fatalf("code for %q = %q, want upstream_request_error", upstreamCode, diagnostic.Code)
+		}
 	}
 }
 

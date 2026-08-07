@@ -216,6 +216,17 @@ func TestSafeChatGPTWebErrorDiagnosticRejectsUnsafeTokens(t *testing.T) {
 	}
 }
 
+func TestSafeChatGPTWebErrorDiagnosticRejectsUnrecognizedCode(t *testing.T) {
+	safe := safeChatGPTWebErrorDiagnostic(&coreauth.ErrorDiagnostic{
+		Stage:      "models",
+		Code:       "sk-abcdefgh12345678",
+		HTTPStatus: http.StatusBadRequest,
+	}, "trusted-index")
+	if safe == nil || safe.Code != "" || safe.HTTPStatus != http.StatusBadRequest {
+		t.Fatalf("safe diagnostic = %#v", safe)
+	}
+}
+
 func TestAuthFileRuntimeSummaryForLinkedWebUsesSourceBinding(t *testing.T) {
 	source := &coreauth.Auth{ID: "codex-source.json", Provider: "codex", Metadata: map[string]any{
 		"credential_uid": "uid-a",

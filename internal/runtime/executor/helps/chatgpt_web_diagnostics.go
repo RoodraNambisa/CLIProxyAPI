@@ -13,6 +13,7 @@ import (
 	"strings"
 	"unicode/utf8"
 
+	chatgptwebauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/chatgptweb"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	"github.com/tidwall/gjson"
 )
@@ -165,7 +166,7 @@ func chatGPTWebStructuredDiagnosticCode(body []byte) string {
 	} {
 		value := strings.TrimSpace(gjson.GetBytes(body, path).String())
 		if chatGPTWebDiagnosticCodePattern.MatchString(value) {
-			return strings.ToLower(value)
+			return chatgptwebauth.SafeDiagnosticCode(value)
 		}
 	}
 	return ""
