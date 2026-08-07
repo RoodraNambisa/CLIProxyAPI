@@ -720,6 +720,7 @@ func EnsureCredentialRuntimeIDsForURL(credential *Credential, reader io.Reader, 
 			return err
 		}
 	}
+	resolveCredentialPersona(credential, "")
 	return nil
 }
 

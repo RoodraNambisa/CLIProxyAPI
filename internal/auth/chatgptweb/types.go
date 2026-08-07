@@ -26,6 +26,8 @@ const (
 )
 
 type Persona struct {
+	CatalogVersion      string `json:"catalog_version,omitempty"`
+	CatalogID           string `json:"catalog_id,omitempty"`
 	Profile             string `json:"profile"`
 	UserAgent           string `json:"user_agent"`
 	AcceptLanguage      string `json:"accept_language"`
@@ -50,7 +52,16 @@ func DefaultPersona() Persona {
 }
 
 func normalizePersona(persona Persona) Persona {
+	if entry, ok := personaCatalogEntryForPersona(persona); ok {
+		return entry.persona
+	}
+	return normalizeLegacyPersona(persona)
+}
+
+func normalizeLegacyPersona(persona Persona) Persona {
 	defaults := DefaultPersona()
+	persona.CatalogVersion = ""
+	persona.CatalogID = ""
 	if strings.TrimSpace(persona.Profile) == "" {
 		persona.Profile = defaults.Profile
 	}
@@ -177,7 +188,7 @@ func DecodeCredential(data []byte) (*Credential, error) {
 	}
 	credential.RefreshStrategy = strategy
 	credential.CredentialMode = credentialModeForStrategy(strategy)
-	credential.Persona = normalizePersona(credential.Persona)
+	resolveCredentialPersona(&credential, "")
 	if credential.Cookies == nil {
 		credential.Cookies = []Cookie{}
 	}
@@ -246,7 +257,8 @@ func (credential *Credential) ApplyToMetadata(metadata map[string]any) {
 	}
 	metadata["expired"] = credential.Expired
 	metadata["cookies"] = normalizedCookies
-	metadata["persona"] = normalizePersona(credential.Persona)
+	resolveCredentialPersona(credential, "")
+	metadata["persona"] = credential.Persona
 	metadata["device_id"] = credential.DeviceID
 	metadata["session_id"] = credential.SessionID
 	metadata["lifecycle_state"] = string(normalizedCredentialLifecycleState(credential))

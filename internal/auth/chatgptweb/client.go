@@ -76,7 +76,7 @@ func newClientWithSessionCookiePolicy(
 	timeout time.Duration,
 	sendSessionCookies bool,
 ) (*Client, error) {
-	persona = normalizePersona(persona)
+	persona = canonicalPersona(persona)
 	proxyURL = strings.TrimSpace(proxyURL)
 	cookies, _ = normalizeSessionCookies(cookies)
 	profile, ok := findTLSProfile(persona.Profile)
@@ -177,10 +177,8 @@ func (jar *accessTokenCookieJar) GetAllCookies() map[string][]*fhttp.Cookie {
 }
 
 func findTLSProfile(name string) (profiles.ClientProfile, bool) {
-	for profileName, profile := range profiles.MappedTLSClients {
-		if strings.EqualFold(profileName, strings.TrimSpace(name)) {
-			return profile, true
-		}
+	if strings.EqualFold(strings.TrimSpace(name), "chrome_146") {
+		return profiles.Chrome_146, true
 	}
 	return profiles.ClientProfile{}, false
 }
