@@ -1227,15 +1227,30 @@ func chatGPTWebPasskeyRecoveryExhausted(expected *cliproxyauth.Auth, credential 
 	reason := chatGPTWebLifecycleReason(expected)
 	switch expected.LifecycleState() {
 	case cliproxyauth.LifecycleStateReloginPending:
-		// This state is only reached after the selected refresh strategy returned
-		// a terminal credential failure; transient network, CF, 429, and 5xx
-		// failures remain retryable and never enter re-login.
-		return true
+		return chatGPTWebRefreshRecoveryExhausted(credential, reason)
 	case cliproxyauth.LifecycleStateReauthRequired:
-		return reason == "passkey_verification_failed" || reason == "invalid_passkey_response" || reason == "auto_relogin_exhausted"
+		return (reason == "passkey_verification_failed" || reason == "invalid_passkey_response" || reason == "auto_relogin_exhausted") &&
+			strings.TrimSpace(credential.RefreshToken) == "" && !chatgptwebauth.HasSessionCookie(credential.Cookies)
 	default:
 		return false
 	}
+}
+
+func chatGPTWebRefreshRecoveryExhausted(credential *chatgptwebauth.Credential, reason string) bool {
+	if credential == nil {
+		return false
+	}
+	hasRefreshToken := strings.TrimSpace(credential.RefreshToken) != ""
+	hasSessionCookie := chatgptwebauth.HasSessionCookie(credential.Cookies)
+	if hasRefreshToken && (credential.RefreshStrategy != chatgptwebauth.RefreshStrategyWebOAuthRT || reason != "invalid_grant") {
+		return false
+	}
+	if hasSessionCookie && reason != "session_expired" && reason != "access_token_missing" {
+		return false
+	}
+	// A single lifecycle reason cannot prove that both independent recovery
+	// materials were rejected. Keep the credential for manual inspection.
+	return !hasRefreshToken || !hasSessionCookie
 }
 
 func chatGPTWebInvalidAccessTokenEvidence(auth *cliproxyauth.Auth) bool {

@@ -241,6 +241,16 @@ func TestChatGPTWebExecutorInvalidPasskeyResponseDeadGuards(t *testing.T) {
 			credential.SourceAuthID = "codex-source"
 			credential.SourceCredentialUID = "uid"
 		}},
+		{name: "unverified oauth refresh remains", mutateAuth: func(_ *cliproxyauth.Auth, credential *chatgptwebauth.Credential) {
+			credential.RefreshStrategy = chatgptwebauth.RefreshStrategyWebOAuthRT
+			credential.RefreshToken = "recoverable"
+		}},
+		{name: "unverified session cookie remains", mutateAuth: func(_ *cliproxyauth.Auth, credential *chatgptwebauth.Credential) {
+			credential.RefreshStrategy = chatgptwebauth.RefreshStrategyTokenOnly
+			credential.Cookies = []chatgptwebauth.Cookie{{
+				Name: "__Secure-next-auth.session-token", Value: "recoverable", Domain: "chatgpt.com", Path: "/", Secure: true,
+			}}
+		}},
 		{name: "network failure", mutateErr: func(authError *chatgptwebauth.AuthError) {
 			authError.Status = http.StatusServiceUnavailable
 			authError.StatusCode = http.StatusServiceUnavailable
@@ -276,6 +286,60 @@ func TestChatGPTWebExecutorInvalidPasskeyResponseDeadGuards(t *testing.T) {
 			promoted, promotedErr := executor.promoteExhaustedInvalidPasskeyResponse(auth, credential, authError, test.proxy)
 			if promoted.LifecycleState == chatgptwebauth.LifecycleDead {
 				t.Fatalf("guard promoted credential to dead: %#v / %v", promoted, promotedErr)
+			}
+		})
+	}
+}
+
+func TestChatGPTWebPasskeyRecoveryExhaustedRequiresEvidenceForEveryRefreshMaterial(t *testing.T) {
+	tests := []struct {
+		name      string
+		configure func(*cliproxyauth.Auth, *chatgptwebauth.Credential)
+		want      bool
+	}{
+		{
+			name: "invalid oauth refresh token",
+			configure: func(auth *cliproxyauth.Auth, credential *chatgptwebauth.Credential) {
+				credential.RefreshStrategy = chatgptwebauth.RefreshStrategyWebOAuthRT
+				credential.RefreshToken = "rejected"
+				auth.Metadata["lifecycle_reason"] = "invalid_grant"
+			},
+			want: true,
+		},
+		{
+			name: "expired session cookie",
+			configure: func(auth *cliproxyauth.Auth, credential *chatgptwebauth.Credential) {
+				credential.RefreshStrategy = chatgptwebauth.RefreshStrategyChatGPTSession
+				credential.Cookies = []chatgptwebauth.Cookie{{
+					Name: "__Secure-next-auth.session-token", Value: "rejected", Domain: "chatgpt.com", Path: "/", Secure: true,
+				}}
+				auth.Metadata["lifecycle_reason"] = "session_expired"
+			},
+			want: true,
+		},
+		{
+			name: "session failed but oauth refresh remains",
+			configure: func(auth *cliproxyauth.Auth, credential *chatgptwebauth.Credential) {
+				credential.RefreshStrategy = chatgptwebauth.RefreshStrategyWebOAuthRT
+				credential.RefreshToken = "unverified"
+				credential.Cookies = []chatgptwebauth.Cookie{{
+					Name: "__Secure-next-auth.session-token", Value: "rejected", Domain: "chatgpt.com", Path: "/", Secure: true,
+				}}
+				auth.Metadata["lifecycle_reason"] = "session_expired"
+			},
+			want: false,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			auth := chatGPTWebPasskeyOnlyReloginAuth(t, "refresh-evidence-"+test.name)
+			credential, errCredential := chatgptwebauth.ParseCredential(auth.Metadata)
+			if errCredential != nil {
+				t.Fatal(errCredential)
+			}
+			test.configure(auth, credential)
+			if got := chatGPTWebPasskeyRecoveryExhausted(auth, credential); got != test.want {
+				t.Fatalf("chatGPTWebPasskeyRecoveryExhausted() = %t, want %t", got, test.want)
 			}
 		})
 	}
