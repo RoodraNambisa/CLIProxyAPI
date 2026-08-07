@@ -527,6 +527,7 @@ func TestChatGPTWebRefreshCommitFailureMarksCredentialUnavailable(t *testing.T) 
 	if errRegister != nil {
 		t.Fatal(errRegister)
 	}
+	catalogRevision := manager.ManagementAuthCatalogRevision()
 	unlockPersist, errLock := manager.lockPersistKeyContext(t.Context(), installed.ID)
 	if errLock != nil {
 		t.Fatal(errLock)
@@ -568,6 +569,15 @@ func TestChatGPTWebRefreshCommitFailureMarksCredentialUnavailable(t *testing.T) 
 	}
 	if current.LastError == nil || current.LastError.Code != "refresh_persist_failed" || current.LastError.Retryable {
 		t.Fatalf("credential error after commit failure = %#v", current.LastError)
+	}
+	if revision := manager.ManagementAuthCatalogRevision(); revision <= catalogRevision {
+		t.Fatalf("management catalog revision = %d, want greater than %d", revision, catalogRevision)
+	}
+	_, catalog := manager.ManagementAuthCatalogSnapshot()
+	if len(catalog) != 1 ||
+		catalog[0].LifecycleState() != LifecycleStateReauthRequired ||
+		catalog[0].LastError == nil || catalog[0].LastError.Code != "refresh_persist_failed" {
+		t.Fatalf("management catalog did not reflect refresh failure: %#v", catalog)
 	}
 }
 

@@ -3,6 +3,7 @@ package auth
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"path/filepath"
 	"reflect"
@@ -176,6 +177,107 @@ func TestManagerDirectLookupIndexesTrackReplacementAndDelete(t *testing.T) {
 	}
 	assertAuthIDs(t, manager.AuthsForManagedFileName("auth-b.json"))
 	assertManagerAuthIndexesConsistent(t, manager)
+}
+
+func TestManagerManagementCatalogIsSafeAndOnlyRevisesForVisibleChanges(t *testing.T) {
+	manager := NewManager(nil, nil, nil)
+	auth := &Auth{
+		ID:       "catalog-auth",
+		Provider: "codex",
+		FileName: "catalog.json",
+		Label:    "Catalog",
+		Status:   StatusActive,
+		Attributes: map[string]string{
+			"path":    "catalog.json",
+			"api_key": "attribute-secret",
+		},
+		Metadata: map[string]any{
+			"access_token":   "metadata-secret",
+			"session_cookie": "cookie-secret",
+			"email":          "catalog@example.com",
+			"plan_type":      "plus",
+			"note":           map[string]any{"secret": "nested-secret"},
+		},
+		LastError: &Error{Code: "unsafe code with spaces", Message: "error-message-secret"},
+	}
+	auth.EnsureIndex()
+	if _, errRegister := manager.Register(WithSkipPersist(t.Context()), auth); errRegister != nil {
+		t.Fatal(errRegister)
+	}
+
+	revision, catalog := manager.ManagementAuthCatalogSnapshot()
+	if revision == 0 || len(catalog) != 1 {
+		t.Fatalf("catalog revision=%d entries=%d", revision, len(catalog))
+	}
+	payload, errMarshal := json.Marshal(catalog)
+	if errMarshal != nil {
+		t.Fatal(errMarshal)
+	}
+	for _, secret := range []string{"attribute-secret", "metadata-secret", "cookie-secret", "nested-secret", "error-message-secret", "access_token", "session_cookie", "api_key"} {
+		if strings.Contains(string(payload), secret) {
+			t.Fatalf("management catalog leaked %q: %s", secret, payload)
+		}
+	}
+	if got := catalog[0].Metadata["email"]; got != "catalog@example.com" {
+		t.Fatalf("safe email = %#v", got)
+	}
+
+	tokenOnly, _ := manager.GetByID(auth.ID)
+	tokenOnly.Metadata["access_token"] = "rotated-secret"
+	tokenOnly.Metadata["session_cookie"] = "rotated-cookie"
+	if _, errUpdate := manager.Update(WithSkipPersist(t.Context()), tokenOnly); errUpdate != nil {
+		t.Fatal(errUpdate)
+	}
+	if got := manager.ManagementAuthCatalogRevision(); got != revision {
+		t.Fatalf("token-only update changed catalog revision from %d to %d", revision, got)
+	}
+
+	visible, _ := manager.GetByID(auth.ID)
+	visible.Label = "Updated Catalog"
+	if _, errUpdate := manager.Update(WithSkipPersist(t.Context()), visible); errUpdate != nil {
+		t.Fatal(errUpdate)
+	}
+	if got := manager.ManagementAuthCatalogRevision(); got <= revision {
+		t.Fatalf("visible update did not advance catalog revision: before=%d after=%d", revision, got)
+	}
+	usageRevision, usageCatalog := manager.UsageAuthCatalogSnapshot()
+	if usageRevision != manager.ManagementAuthCatalogRevision() || len(usageCatalog) != 1 || usageCatalog[0].Label != "Updated Catalog" {
+		t.Fatalf("usage catalog revision=%d entries=%#v", usageRevision, usageCatalog)
+	}
+	assertManagerAuthIndexesConsistent(t, manager)
+}
+
+func TestManagerDependencyGraphForAuthsExcludesUnrelatedCredentials(t *testing.T) {
+	manager := NewManager(nil, nil, nil)
+	source := dependencyTestCodexAuth("source", "source-uid")
+	dependent := dependencyTestWebAuth("dependent", "source-uid")
+	unrelatedSource := dependencyTestCodexAuth("unrelated-source", "unrelated-uid")
+	unrelatedDependent := dependencyTestWebAuth("unrelated-dependent", "unrelated-uid")
+	for _, auth := range []*Auth{source, dependent, unrelatedSource, unrelatedDependent} {
+		if _, errRegister := manager.Register(WithSkipPersist(t.Context()), auth); errRegister != nil {
+			t.Fatal(errRegister)
+		}
+	}
+
+	target, ok := manager.GetByID(source.ID)
+	if !ok {
+		t.Fatal("source auth not found")
+	}
+	graph, complete := manager.ChatGPTWebDependencyGraphForAuths([]*Auth{target})
+	if complete {
+		t.Fatal("runtime-only dependency graph unexpectedly reported complete")
+	}
+	resolved, ambiguous := graph.SourceByUID("source-uid")
+	if ambiguous || resolved == nil || resolved.ID != source.ID {
+		t.Fatalf("source = %#v, ambiguous = %v", resolved, ambiguous)
+	}
+	dependents, ambiguous := graph.DependentsForSource(target)
+	if ambiguous || len(dependents) != 1 || dependents[0].ID != dependent.ID {
+		t.Fatalf("dependents = %#v, ambiguous = %v", dependents, ambiguous)
+	}
+	if unrelated, ambiguousUnrelated := graph.SourceByUID("unrelated-uid"); unrelated != nil || ambiguousUnrelated {
+		t.Fatalf("unrelated source leaked into page graph: %#v, ambiguous = %v", unrelated, ambiguousUnrelated)
+	}
 }
 
 func TestManagerLoadDoesNotHoldMainLockDuringStoreList(t *testing.T) {
@@ -917,6 +1019,8 @@ func assertManagerAuthIndexesConsistent(t *testing.T, manager *Manager) {
 	expectedPlanTypes := make(map[string]string)
 	expectedDependencies := make(map[string]*Auth)
 	expectedIdentityKeys := make(map[string][]string)
+	expectedManagementCatalog := make(map[string]*Auth)
+	expectedUsageCatalog := make(map[string]UsageAuthInfo)
 	for id, auth := range manager.auths {
 		if index := strings.TrimSpace(auth.Index); index != "" {
 			expectedAuthIndexes[id] = index
@@ -955,6 +1059,9 @@ func assertManagerAuthIndexesConsistent(t *testing.T, manager *Manager) {
 		if keys := chatGPTWebIdentityIndexKeys(auth); len(keys) > 0 {
 			expectedIdentityKeys[id] = keys
 		}
+		planType := strings.TrimSpace(internalcodex.EffectivePlanType(auth.Metadata))
+		expectedManagementCatalog[id] = managementAuthCatalogSummary(auth, planType)
+		expectedUsageCatalog[id] = usageAuthInfoLocked(auth, strings.TrimSpace(auth.Index))
 	}
 	if !reflect.DeepEqual(manager.backingPathAuthIDs, expectedPaths) || !reflect.DeepEqual(manager.backingPathByAuthID, expectedByID) {
 		t.Fatalf("backing path index is inconsistent: paths=%v byID=%v", manager.backingPathAuthIDs, manager.backingPathByAuthID)
@@ -973,6 +1080,12 @@ func assertManagerAuthIndexesConsistent(t *testing.T, manager *Manager) {
 	}
 	if !reflect.DeepEqual(manager.authPlanTypesByID, expectedPlanTypes) {
 		t.Fatalf("auth plan type map is inconsistent: got=%v want=%v", manager.authPlanTypesByID, expectedPlanTypes)
+	}
+	if !reflect.DeepEqual(manager.managementAuthCatalog, expectedManagementCatalog) {
+		t.Fatalf("management catalog is inconsistent: got=%v want=%v", manager.managementAuthCatalog, expectedManagementCatalog)
+	}
+	if !reflect.DeepEqual(manager.usageAuthCatalog, expectedUsageCatalog) {
+		t.Fatalf("usage catalog is inconsistent: got=%v want=%v", manager.usageAuthCatalog, expectedUsageCatalog)
 	}
 	for id, auth := range expectedDependencies {
 		indexed := manager.dependencyAuthsByID[id]

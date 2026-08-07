@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"sort"
 	"strings"
 )
 
@@ -27,14 +28,37 @@ func (m *Manager) ListUsageAuthInfos() []UsageAuthInfo {
 		return nil
 	}
 	m.mu.RLock()
-	items := make([]UsageAuthInfo, 0, len(m.authIndexesByID))
-	for id, authIndex := range m.authIndexesByID {
-		if auth := m.auths[id]; auth != nil {
-			items = append(items, usageAuthInfoLocked(auth, authIndex))
-		}
+	ids := make([]string, 0, len(m.usageAuthCatalog))
+	for id := range m.usageAuthCatalog {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	items := make([]UsageAuthInfo, 0, len(ids))
+	for _, id := range ids {
+		items = append(items, m.usageAuthCatalog[id])
 	}
 	m.mu.RUnlock()
 	return items
+}
+
+// UsageAuthCatalogSnapshot returns the revision and lightweight usage metadata.
+func (m *Manager) UsageAuthCatalogSnapshot() (uint64, []UsageAuthInfo) {
+	if m == nil {
+		return 0, nil
+	}
+	m.mu.RLock()
+	revision := m.managementCatalogRevision
+	ids := make([]string, 0, len(m.usageAuthCatalog))
+	for id := range m.usageAuthCatalog {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	items := make([]UsageAuthInfo, 0, len(ids))
+	for _, id := range ids {
+		items = append(items, m.usageAuthCatalog[id])
+	}
+	m.mu.RUnlock()
+	return revision, items
 }
 
 // UsageAuthInfoByIndex returns one lightweight runtime credential summary.
@@ -50,8 +74,8 @@ func (m *Manager) UsageAuthInfoByIndex(authIndex string) (UsageAuthInfo, bool) {
 	var result UsageAuthInfo
 	found := false
 	for id := range m.authIDsByIndex[authIndex] {
-		if auth := m.auths[id]; auth != nil && (!found || id < result.ID) {
-			result = usageAuthInfoLocked(auth, authIndex)
+		if info, ok := m.usageAuthCatalog[id]; ok && (!found || id < result.ID) {
+			result = info
 			found = true
 		}
 	}

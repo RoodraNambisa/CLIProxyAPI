@@ -1,14 +1,17 @@
 package management
 
 import (
+	"container/list"
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
 	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -20,7 +23,27 @@ const (
 	defaultAuthFilesPageSize = 20
 	maxAuthFilesPageSize     = 100
 	maxAuthFilesFilterLength = 512
+	maxAuthFilesQueryCache   = 32
 )
+
+type authFilesPaginationCache struct {
+	mu             sync.Mutex
+	manager        *coreauth.Manager
+	revision       uint64
+	authDir        string
+	directoryStamp string
+	records        []*authFileListRecord
+	retiredRecords []*authFileListRecord
+	managedNames   map[string]struct{}
+	queries        map[string]*list.Element
+	lru            *list.List
+}
+
+type authFilesCachedQuery struct {
+	key     string
+	matched []*authFileListRecord
+	facets  authFilesFacetsResponse
+}
 
 type authFilesListQuery struct {
 	page         int
@@ -68,6 +91,133 @@ type authFilesFacetsResponse struct {
 	Providers  []authFilesFacetValue `json:"providers"`
 	Priorities []authFilesFacetValue `json:"priorities"`
 	Plans      []authFilesFacetValue `json:"plans"`
+}
+
+func authFilesManagedDirectoryStamp(authDir string) string {
+	authDir = strings.TrimSpace(authDir)
+	if authDir == "" {
+		return ""
+	}
+	info, err := os.Stat(authDir)
+	if err != nil {
+		return "error:" + err.Error()
+	}
+	return fmt.Sprintf("%d:%d:%d", info.ModTime().UnixNano(), info.Size(), info.Mode())
+}
+
+func authFilesQueryCacheKey(query authFilesListQuery) string {
+	return strings.Join([]string{
+		query.provider,
+		query.plan,
+		query.priority,
+		strconv.FormatBool(query.problemOnly),
+		strconv.FormatBool(query.enabledOnly),
+		strconv.FormatBool(query.disabledOnly),
+		query.search,
+		query.sort,
+	}, "\x00")
+}
+
+func (cache *authFilesPaginationCache) resetLocked(manager *coreauth.Manager, revision uint64, authDir, directoryStamp string, records, retiredRecords []*authFileListRecord, managedNames map[string]struct{}) {
+	cache.manager = manager
+	cache.revision = revision
+	cache.authDir = authDir
+	cache.directoryStamp = directoryStamp
+	cache.records = records
+	cache.retiredRecords = retiredRecords
+	cache.managedNames = managedNames
+	cache.queries = make(map[string]*list.Element)
+	cache.lru = list.New()
+}
+
+func (cache *authFilesPaginationCache) queryLocked(query authFilesListQuery) authFilesCachedQuery {
+	key := authFilesQueryCacheKey(query)
+	if element := cache.queries[key]; element != nil {
+		cache.lru.MoveToFront(element)
+		return element.Value.(authFilesCachedQuery)
+	}
+	result := buildAuthFilesCachedQuery(cache.records, query)
+	element := cache.lru.PushFront(result)
+	cache.queries[key] = element
+	if cache.lru.Len() > maxAuthFilesQueryCache {
+		oldest := cache.lru.Back()
+		delete(cache.queries, oldest.Value.(authFilesCachedQuery).key)
+		cache.lru.Remove(oldest)
+	}
+	return result
+}
+
+func buildAuthFilesCachedQuery(records []*authFileListRecord, query authFilesListQuery) authFilesCachedQuery {
+	statusRecords := filterAuthFileStatusRecords(records, query)
+	result := authFilesCachedQuery{
+		key:    authFilesQueryCacheKey(query),
+		facets: buildAuthFilesFacets(statusRecords, query.priority),
+	}
+	result.matched = filterAuthFileRecords(statusRecords, query)
+	sortAuthFileRecords(result.matched, query.sort)
+	return result
+}
+
+func (h *Handler) cachedAuthFileRecords(manager *coreauth.Manager, query authFilesListQuery) authFilesCachedQuery {
+	if h == nil || manager == nil {
+		return authFilesCachedQuery{}
+	}
+	cache := &h.authFilesPagination
+	for attempt := 0; attempt < 3; attempt++ {
+		cfg := h.currentConfig()
+		authDir := ""
+		if cfg != nil {
+			authDir = strings.TrimSpace(cfg.AuthDir)
+		}
+		directoryStamp := authFilesManagedDirectoryStamp(authDir)
+		revision := manager.ManagementAuthCatalogRevision()
+
+		cache.mu.Lock()
+		if cache.manager == manager && cache.revision == revision && cache.authDir == authDir && cache.directoryStamp == directoryStamp && cache.retiredRecords != nil {
+			result := cache.queryLocked(query)
+			cache.mu.Unlock()
+			return result
+		}
+		cache.mu.Unlock()
+
+		revision, summaries := manager.ManagementAuthCatalogSnapshot()
+		records, managedNames := h.authFileListRecordsFromSummaries(summaries)
+		var retiredRecords []*authFileListRecord
+		cache.mu.Lock()
+		if cache.authDir == authDir && cache.directoryStamp == directoryStamp && authFilesNameSetsEqual(cache.managedNames, managedNames) && cache.retiredRecords != nil {
+			retiredRecords = cache.retiredRecords
+		}
+		cache.mu.Unlock()
+		if retiredRecords == nil {
+			retiredRecords = h.retiredAuthFileListRecords(managedNames)
+		}
+		records = append(records, retiredRecords...)
+		latestCfg := h.currentConfig()
+		latestAuthDir := ""
+		if latestCfg != nil {
+			latestAuthDir = strings.TrimSpace(latestCfg.AuthDir)
+		}
+		if latestAuthDir != authDir || manager.ManagementAuthCatalogRevision() != revision || authFilesManagedDirectoryStamp(authDir) != directoryStamp {
+			if attempt < 2 {
+				continue
+			}
+			return buildAuthFilesCachedQuery(records, query)
+		}
+
+		cache.mu.Lock()
+		if cache.manager == manager && cache.revision > revision && cache.authDir == authDir && cache.directoryStamp == directoryStamp && cache.retiredRecords != nil {
+			result := cache.queryLocked(query)
+			cache.mu.Unlock()
+			return result
+		}
+		if cache.manager != manager || cache.revision <= revision || cache.authDir != authDir || cache.directoryStamp != directoryStamp {
+			cache.resetLocked(manager, revision, authDir, directoryStamp, records, retiredRecords, managedNames)
+		}
+		result := cache.queryLocked(query)
+		cache.mu.Unlock()
+		return result
+	}
+	return authFilesCachedQuery{}
 }
 
 func parseAuthFilesPagedFlag(c *gin.Context) (bool, error) {
@@ -258,11 +408,8 @@ func (h *Handler) listAuthFilesPaged(c *gin.Context, manager *coreauth.Manager) 
 		c.JSON(http.StatusBadRequest, gin.H{"error": errQuery.Error()})
 		return
 	}
-	records, graph := h.authFileListRecords(manager)
-	statusRecords := filterAuthFileStatusRecords(records, query)
-	facets := buildAuthFilesFacets(statusRecords, query.priority)
-	matched := filterAuthFileRecords(statusRecords, query)
-	sortAuthFileRecords(matched, query.sort)
+	cached := h.cachedAuthFileRecords(manager, query)
+	matched := cached.matched
 
 	total := len(matched)
 	totalPages := max(1, (total+query.pageSize-1)/query.pageSize)
@@ -275,33 +422,35 @@ func (h *Handler) listAuthFilesPaged(c *gin.Context, manager *coreauth.Manager) 
 	}
 	end := min(total, start+query.pageSize)
 	pageRecords := matched[start:end]
-	pageAuths := make([]*coreauth.Auth, 0, len(pageRecords))
+	pageIDs := make([]string, 0, len(pageRecords))
 	for _, record := range pageRecords {
 		if record.auth != nil {
-			if current, ok := manager.GetByID(record.id); ok && current != nil {
-				record.auth = current
-				pageAuths = append(pageAuths, current)
-			} else {
-				record.auth = nil
-			}
+			pageIDs = append(pageIDs, record.id)
 		}
+	}
+	pageAuths := manager.GetByIDs(pageIDs)
+	graph, _ := manager.ChatGPTWebDependencyGraphForAuths(pageAuths)
+	pageAuthByID := make(map[string]*coreauth.Auth, len(pageAuths))
+	for _, auth := range pageAuths {
+		pageAuthByID[auth.ID] = auth
 	}
 	runtimeSummaries := h.authFileRuntimeSummariesForAuths(manager, pageAuths)
 	now := time.Now()
 	files := make([]gin.H, 0, len(pageRecords))
 	for _, record := range pageRecords {
-		if record.auth == nil {
+		auth := pageAuthByID[record.id]
+		if auth == nil {
 			if record.retiredEntry != nil {
 				files = append(files, record.retiredEntry)
 			}
 			continue
 		}
-		runtimeSummary := authFileRuntimeSummaryForAuth(record.auth, graph, runtimeSummaries)
-		entry := h.buildAuthFileEntryAtWithRuntime(record.auth, now, runtimeSummary)
+		runtimeSummary := authFileRuntimeSummaryForAuth(auth, graph, runtimeSummaries)
+		entry := h.buildAuthFileEntryAtWithRuntime(auth, now, runtimeSummary)
 		if entry == nil {
 			continue
 		}
-		applyChatGPTWebDependencySummary(entry, record.auth, graph)
+		applyChatGPTWebDependencySummary(entry, auth, graph)
 		files = append(files, entry)
 	}
 	c.JSON(http.StatusOK, gin.H{
@@ -313,7 +462,7 @@ func (h *Handler) listAuthFilesPaged(c *gin.Context, manager *coreauth.Manager) 
 			PageSize:   query.pageSize,
 			TotalPages: totalPages,
 		},
-		"facets": facets,
+		"facets": cached.facets,
 	})
 }
 
@@ -336,44 +485,35 @@ func (h *Handler) ListAuthFileSelection(c *gin.Context) {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "auth manager is unavailable"})
 		return
 	}
-	records, graph := h.authFileListRecords(manager)
-	matched := filterAuthFileRecords(filterAuthFileStatusRecords(records, query), query)
-	sortAuthFileRecords(matched, query.sort)
+	cached := h.cachedAuthFileRecords(manager, query)
+	matched := cached.matched
 	files := make([]gin.H, 0, len(matched))
 	now := time.Now()
+	ids := make([]string, 0, len(matched))
 	for _, record := range matched {
-		if record.auth == nil || record.runtimeOnly || record.retired {
+		if record.auth != nil && !record.runtimeOnly && !record.retired {
+			ids = append(ids, record.id)
+		}
+	}
+	selectedAuths := manager.GetByIDs(ids)
+	graph, _ := manager.ChatGPTWebDependencyGraphForAuths(selectedAuths)
+	authByID := make(map[string]*coreauth.Auth, len(ids))
+	for _, auth := range selectedAuths {
+		authByID[auth.ID] = auth
+	}
+	for _, record := range matched {
+		current := authByID[record.id]
+		if current == nil || record.runtimeOnly || record.retired {
 			continue
 		}
-		current, ok := manager.GetByID(record.id)
-		if !ok || current == nil {
-			continue
-		}
-		record.auth = current
-		files = append(files, buildAuthFileSelectionEntry(record, graph, now))
+		currentRecord := *record
+		currentRecord.auth = current
+		files = append(files, buildAuthFileSelectionEntry(&currentRecord, graph, now))
 	}
 	c.JSON(http.StatusOK, gin.H{"files": files, "total": len(files)})
 }
 
-func (h *Handler) authFileListRecords(manager *coreauth.Manager) ([]*authFileListRecord, *coreauth.ChatGPTWebDependencyGraph) {
-	if manager == nil {
-		return nil, coreauth.BuildChatGPTWebDependencyGraph(nil)
-	}
-	auths := manager.ListMetadataSummaries(
-		"auth_kind",
-		"credential_uid",
-		"deletion_state",
-		"email",
-		"lifecycle_reason",
-		"lifecycle_state",
-		"note",
-		"plan_type",
-		"priority",
-		"refresh_strategy",
-		"source_auth_id",
-		"source_credential_uid",
-	)
-	graph, _ := manager.ChatGPTWebDependencyIndexSnapshot()
+func (h *Handler) authFileListRecordsFromSummaries(auths []*coreauth.Auth) ([]*authFileListRecord, map[string]struct{}) {
 	records := make([]*authFileListRecord, 0, len(auths))
 	managedNames := make(map[string]struct{}, len(auths))
 
@@ -417,13 +557,31 @@ func (h *Handler) authFileListRecords(manager *coreauth.Manager) ([]*authFileLis
 			managedNames[managedAuthNameKey(managedName)] = struct{}{}
 		}
 	}
-	retiredFiles, errRetired := h.listRetiredGeminiCLIAuthFilesExcluding(managedNames)
-	if errRetired == nil {
-		for _, entry := range retiredFiles {
-			records = append(records, authFileRecordForRetiredEntry(entry))
+	return records, managedNames
+}
+
+func (h *Handler) retiredAuthFileListRecords(managedNames map[string]struct{}) []*authFileListRecord {
+	entries, errRetired := h.listRetiredGeminiCLIAuthFilesExcluding(managedNames)
+	if errRetired != nil {
+		return nil
+	}
+	records := make([]*authFileListRecord, 0, len(entries))
+	for _, entry := range entries {
+		records = append(records, authFileRecordForRetiredEntry(entry))
+	}
+	return records
+}
+
+func authFilesNameSetsEqual(left, right map[string]struct{}) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for name := range left {
+		if _, ok := right[name]; !ok {
+			return false
 		}
 	}
-	return records, graph
+	return true
 }
 
 func authFileRecordForAuth(auth *coreauth.Auth, name string, runtimeOnly bool) *authFileListRecord {

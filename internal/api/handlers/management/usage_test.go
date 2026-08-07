@@ -598,6 +598,144 @@ func TestUsageAuthSummariesIncludesCurrentZeroUsageAndStale(t *testing.T) {
 	}
 }
 
+func TestUsageAuthCatalogCacheIgnoresOpaqueRotationAndRefreshesVisibleFields(t *testing.T) {
+	handler, _, manager := newUsageHandlerForTest(t)
+	authIndex := registerUsageAuthForTest(t, manager, "cached-auth", "cached.json", "codex", "Cached", "cached@example.com")
+
+	infos := handler.usageAuthInfoByIndex()
+	if info := infos[authIndex]; info.Label != "Cached" || info.Email != "cached@example.com" {
+		t.Fatalf("initial usage info = %#v", info)
+	}
+	handler.usageAuthCatalog.mu.Lock()
+	revision := handler.usageAuthCatalog.revision
+	handler.usageAuthCatalog.mu.Unlock()
+
+	auth, ok := manager.GetByAuthIndex(authIndex)
+	if !ok {
+		t.Fatal("cached auth not found")
+	}
+	if auth.Metadata == nil {
+		auth.Metadata = make(map[string]any)
+	}
+	auth.Metadata["access_token"] = "rotated-secret"
+	auth.Metadata["session_cookie"] = "rotated-cookie"
+	if _, errUpdate := manager.Update(coreauth.WithSkipPersist(t.Context()), auth); errUpdate != nil {
+		t.Fatal(errUpdate)
+	}
+	if got := manager.ManagementAuthCatalogRevision(); got != revision {
+		t.Fatalf("opaque rotation changed usage catalog revision from %d to %d", revision, got)
+	}
+	infos = handler.usageAuthInfoByIndex()
+	handler.usageAuthCatalog.mu.Lock()
+	if handler.usageAuthCatalog.revision != revision {
+		t.Fatalf("opaque rotation rebuilt usage catalog at revision %d", handler.usageAuthCatalog.revision)
+	}
+	handler.usageAuthCatalog.mu.Unlock()
+	if info := infos[authIndex]; info.Label != "Cached" {
+		t.Fatalf("opaque rotation changed visible info = %#v", info)
+	}
+
+	auth, _ = manager.GetByAuthIndex(authIndex)
+	auth.Label = "Updated"
+	if _, errUpdate := manager.Update(coreauth.WithSkipPersist(t.Context()), auth); errUpdate != nil {
+		t.Fatal(errUpdate)
+	}
+	infos = handler.usageAuthInfoByIndex()
+	if info := infos[authIndex]; info.Label != "Updated" {
+		t.Fatalf("visible update not reflected = %#v", info)
+	}
+	handler.usageAuthCatalog.mu.Lock()
+	if handler.usageAuthCatalog.revision <= revision {
+		t.Fatalf("visible update did not advance cache revision: before=%d after=%d", revision, handler.usageAuthCatalog.revision)
+	}
+	handler.usageAuthCatalog.mu.Unlock()
+}
+
+func TestUsageAuthPaginationCacheReusesPagesAndInvalidatesOnUsageChange(t *testing.T) {
+	handler, stats, manager := newUsageHandlerForTest(t)
+	firstIndex := registerUsageAuthForTest(t, manager, "cache-first", "cache-first.json", "codex", "First", "first@example.com")
+	registerUsageAuthForTest(t, manager, "cache-second", "cache-second.json", "codex", "Second", "second@example.com")
+	stats.Record(t.Context(), coreusage.Record{
+		APIKey:      "api-a",
+		Model:       "model-a",
+		AuthIndex:   firstIndex,
+		RequestedAt: time.Date(2026, 3, 20, 12, 0, 0, 0, time.UTC),
+		Detail:      coreusage.Detail{TotalTokens: 10},
+	})
+
+	requestPage := func(page int, search string) *httptest.ResponseRecorder {
+		t.Helper()
+		target := "/v0/management/usage/auths?paged=true&page=" + strconv.Itoa(page) + "&page_size=1&sort_by=total_tokens&sort_order=desc&q=" + search
+		ctx, recorder := newUsageRequestContext(target)
+		handler.GetUsageAuthSummaries(ctx)
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("usage page status=%d body=%s", recorder.Code, recorder.Body.String())
+		}
+		return recorder
+	}
+
+	requestPage(1, "")
+	handler.usageAuthPagination.mu.Lock()
+	if handler.usageAuthPagination.lru == nil || handler.usageAuthPagination.lru.Len() != 1 {
+		handler.usageAuthPagination.mu.Unlock()
+		t.Fatal("initial usage query was not cached")
+	}
+	version := handler.usageAuthPagination.usageVersion
+	revision := handler.usageAuthPagination.catalogRevision
+	handler.usageAuthPagination.mu.Unlock()
+
+	requestPage(2, "")
+	handler.usageAuthPagination.mu.Lock()
+	if handler.usageAuthPagination.lru.Len() != 1 || handler.usageAuthPagination.usageVersion != version {
+		t.Fatalf("page change rebuilt usage query: queries=%d version=%d", handler.usageAuthPagination.lru.Len(), handler.usageAuthPagination.usageVersion)
+	}
+	handler.usageAuthPagination.mu.Unlock()
+
+	auth, ok := manager.GetByAuthIndex(firstIndex)
+	if !ok {
+		t.Fatal("first auth not found")
+	}
+	if auth.Metadata == nil {
+		auth.Metadata = make(map[string]any)
+	}
+	auth.Metadata["access_token"] = "rotated-secret"
+	if _, errUpdate := manager.Update(coreauth.WithSkipPersist(t.Context()), auth); errUpdate != nil {
+		t.Fatal(errUpdate)
+	}
+	requestPage(1, "")
+	handler.usageAuthPagination.mu.Lock()
+	if handler.usageAuthPagination.catalogRevision != revision || handler.usageAuthPagination.lru.Len() != 1 {
+		t.Fatalf("opaque rotation invalidated usage query: revision=%d queries=%d", handler.usageAuthPagination.catalogRevision, handler.usageAuthPagination.lru.Len())
+	}
+	handler.usageAuthPagination.mu.Unlock()
+
+	stats.Record(t.Context(), coreusage.Record{
+		APIKey:      "api-a",
+		Model:       "model-a",
+		AuthIndex:   firstIndex,
+		RequestedAt: time.Date(2026, 3, 20, 12, 1, 0, 0, time.UTC),
+		Detail:      coreusage.Detail{TotalTokens: 20},
+	})
+	updated := requestPage(1, "")
+	if !strings.Contains(updated.Body.String(), `"total_tokens":30`) {
+		t.Fatalf("usage change not reflected: %s", updated.Body.String())
+	}
+	handler.usageAuthPagination.mu.Lock()
+	if handler.usageAuthPagination.usageVersion <= version || handler.usageAuthPagination.lru.Len() != 1 {
+		t.Fatalf("usage change did not replace cache: before=%d after=%d queries=%d", version, handler.usageAuthPagination.usageVersion, handler.usageAuthPagination.lru.Len())
+	}
+	handler.usageAuthPagination.mu.Unlock()
+
+	for index := 0; index < maxUsageAuthQueryCache+8; index++ {
+		requestPage(1, "query-"+strconv.Itoa(index))
+	}
+	handler.usageAuthPagination.mu.Lock()
+	if got := handler.usageAuthPagination.lru.Len(); got != maxUsageAuthQueryCache {
+		t.Fatalf("usage query LRU size=%d want=%d", got, maxUsageAuthQueryCache)
+	}
+	handler.usageAuthPagination.mu.Unlock()
+}
+
 func TestUsageAuthSummariesServerPaginationFilteringAndSorting(t *testing.T) {
 	handler, stats, manager := newUsageHandlerForTest(t)
 	firstIndex := registerUsageAuthForTest(t, manager, "first-auth", "first.json", "codex", "First", "first@example.com")

@@ -1,10 +1,12 @@
 package management
 
 import (
+	"container/list"
 	"net/http"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -16,6 +18,8 @@ const (
 	defaultUsageAuthPageSize = 50
 	maxUsageAuthPageSize     = 100
 	maxUsageAuthSearchBytes  = 256
+	maxUsageAuthQueryCache   = 32
+	maxUsageAuthCachedRows   = 100_000
 )
 
 type usageAuthRow struct {
@@ -33,6 +37,159 @@ type usageAuthPageQuery struct {
 	Statuses  map[string]struct{}
 	SortBy    string
 	SortOrder string
+}
+
+type usageAuthPaginationCache struct {
+	mu              sync.Mutex
+	manager         *coreauth.Manager
+	catalogRevision uint64
+	stats           *usage.RequestStatistics
+	usageVersion    uint64
+	queries         map[string]*list.Element
+	lru             *list.List
+	rowCount        int
+}
+
+type usageAuthCachedQuery struct {
+	key  string
+	rows []usageAuthRow
+}
+
+func usageAuthQueryCacheKey(query usageAuthPageQuery, timeRange usage.TimeRange, authIndexes []string) string {
+	return strings.Join([]string{
+		strings.Join(authIndexes, ","),
+		timeRange.From.UTC().Format(time.RFC3339Nano),
+		timeRange.To.UTC().Format(time.RFC3339Nano),
+		query.Search,
+		strings.Join(sortedUsageAuthFilterValues(query.Providers), ","),
+		strings.Join(sortedUsageAuthFilterValues(query.Statuses), ","),
+		query.SortBy,
+		query.SortOrder,
+	}, "\x00")
+}
+
+func sortedUsageAuthFilterValues(values map[string]struct{}) []string {
+	if len(values) == 0 {
+		return nil
+	}
+	result := make([]string, 0, len(values))
+	for value := range values {
+		result = append(result, value)
+	}
+	sort.Strings(result)
+	return result
+}
+
+func (cache *usageAuthPaginationCache) resetLocked(manager *coreauth.Manager, catalogRevision uint64, stats *usage.RequestStatistics, usageVersion uint64) {
+	cache.manager = manager
+	cache.catalogRevision = catalogRevision
+	cache.stats = stats
+	cache.usageVersion = usageVersion
+	cache.queries = make(map[string]*list.Element)
+	cache.lru = list.New()
+	cache.rowCount = 0
+}
+
+func (cache *usageAuthPaginationCache) lookupLocked(key string) ([]usageAuthRow, bool) {
+	if element := cache.queries[key]; element != nil {
+		cache.lru.MoveToFront(element)
+		return element.Value.(usageAuthCachedQuery).rows, true
+	}
+	return nil, false
+}
+
+func (cache *usageAuthPaginationCache) storeLocked(key string, rows []usageAuthRow) {
+	entry := usageAuthCachedQuery{key: key, rows: rows}
+	element := cache.lru.PushFront(entry)
+	cache.queries[key] = element
+	cache.rowCount += len(rows)
+	for cache.lru.Len() > maxUsageAuthQueryCache || (cache.rowCount > maxUsageAuthCachedRows && cache.lru.Len() > 1) {
+		oldest := cache.lru.Back()
+		cached := oldest.Value.(usageAuthCachedQuery)
+		delete(cache.queries, cached.key)
+		cache.rowCount -= len(cached.rows)
+		cache.lru.Remove(oldest)
+	}
+}
+
+func (h *Handler) cachedUsageAuthRows(timeRange usage.TimeRange, authIndexes []string, query usageAuthPageQuery) []usageAuthRow {
+	if h == nil {
+		return nil
+	}
+	manager := h.authManager
+	stats := h.usageStatisticsSnapshot()
+	cache := &h.usageAuthPagination
+	key := usageAuthQueryCacheKey(query, timeRange, authIndexes)
+	for attempt := 0; attempt < 3; attempt++ {
+		catalogRevision := uint64(0)
+		if manager != nil {
+			catalogRevision = manager.ManagementAuthCatalogRevision()
+		}
+		usageVersion := uint64(0)
+		if stats != nil {
+			usageVersion = stats.Meta().Version
+		}
+
+		cache.mu.Lock()
+		if cache.manager == manager && cache.catalogRevision == catalogRevision && cache.stats == stats && cache.usageVersion == usageVersion {
+			if rows, ok := cache.lookupLocked(key); ok {
+				cache.mu.Unlock()
+				return rows
+			}
+		}
+		cache.mu.Unlock()
+
+		infos := h.usageAuthInfoByIndex()
+		summaries := make(map[string]usage.AuthUsageSnapshot)
+		if stats != nil {
+			usageQuery := usage.AuthUsageQuery{TimeRange: timeRange, AuthIndexes: authIndexes}
+			for _, summary := range stats.AuthSummariesForQuery(usageQuery) {
+				summaries[summary.AuthIndex] = summary
+			}
+		}
+		rows := mergeUsageAuthRows(authIndexes, infos, summaries)
+		rows = filterUsageAuthRows(rows, query)
+		sortUsageAuthRows(rows, query)
+
+		latestCatalogRevision := uint64(0)
+		if manager != nil {
+			latestCatalogRevision = manager.ManagementAuthCatalogRevision()
+		}
+		latestStats := h.usageStatisticsSnapshot()
+		latestUsageVersion := uint64(0)
+		if latestStats != nil {
+			latestUsageVersion = latestStats.Meta().Version
+		}
+		if latestCatalogRevision != catalogRevision || latestStats != stats || latestUsageVersion != usageVersion {
+			stats = latestStats
+			if attempt < 2 {
+				continue
+			}
+			return rows
+		}
+
+		cache.mu.Lock()
+		if cache.manager == manager && cache.stats == stats &&
+			(cache.catalogRevision > catalogRevision || cache.usageVersion > usageVersion) {
+			if cached, ok := cache.lookupLocked(key); ok {
+				cache.mu.Unlock()
+				return cached
+			}
+			cache.mu.Unlock()
+			return rows
+		}
+		if cache.manager != manager || cache.catalogRevision != catalogRevision || cache.stats != stats || cache.usageVersion != usageVersion {
+			cache.resetLocked(manager, catalogRevision, stats, usageVersion)
+		}
+		if cached, ok := cache.lookupLocked(key); ok {
+			cache.mu.Unlock()
+			return cached
+		}
+		cache.storeLocked(key, rows)
+		cache.mu.Unlock()
+		return rows
+	}
+	return nil
 }
 
 func parseUsageAuthPageQuery(c *gin.Context) (usageAuthPageQuery, bool) {

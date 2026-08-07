@@ -179,6 +179,98 @@ func TestAuthFilesPaginationKeepsDependencySummariesAcrossSelection(t *testing.T
 	}
 }
 
+func TestAuthFilesPaginationReusesQueriesAndIgnoresOpaqueCredentialRotation(t *testing.T) {
+	h, manager, authDir := newAuthFilesPaginationTestHandler(t, true)
+	registerAuthFilesPaginationTestAuth(t, manager, authDir, "alpha.json", "codex", false, "", 1, true, "plus")
+	registerAuthFilesPaginationTestAuth(t, manager, authDir, "bravo.json", "codex", false, "", 1, true, "plus")
+	if errWrite := os.WriteFile(filepath.Join(authDir, "retired.json"), []byte(`{"type":"gemini","email":"legacy@example.com"}`), 0o600); errWrite != nil {
+		t.Fatal(errWrite)
+	}
+	router := gin.New()
+	router.GET("/auth-files", h.ListAuthFiles)
+
+	first := performAuthFilesPaginationRequest(router, "/auth-files?paged=true&page=1&page_size=1&sort=az")
+	if first.Code != http.StatusOK {
+		t.Fatalf("first page status=%d body=%s", first.Code, first.Body.String())
+	}
+	h.authFilesPagination.mu.Lock()
+	if h.authFilesPagination.lru == nil {
+		h.authFilesPagination.mu.Unlock()
+		t.Fatal("pagination query cache was not initialized")
+	}
+	queryCount := h.authFilesPagination.lru.Len()
+	recordCount := len(h.authFilesPagination.records)
+	records := h.authFilesPagination.records
+	retiredRecords := h.authFilesPagination.retiredRecords
+	revision := h.authFilesPagination.revision
+	h.authFilesPagination.mu.Unlock()
+	if queryCount != 1 || recordCount != 3 || len(retiredRecords) != 1 {
+		t.Fatalf("initial cache queries=%d records=%d", queryCount, recordCount)
+	}
+
+	second := performAuthFilesPaginationRequest(router, "/auth-files?paged=true&page=2&page_size=1&sort=az")
+	if second.Code != http.StatusOK {
+		t.Fatalf("second page status=%d body=%s", second.Code, second.Body.String())
+	}
+	h.authFilesPagination.mu.Lock()
+	if h.authFilesPagination.lru.Len() != 1 || &h.authFilesPagination.records[0] != &records[0] {
+		t.Fatalf("page change rebuilt cached query: queries=%d", h.authFilesPagination.lru.Len())
+	}
+	h.authFilesPagination.mu.Unlock()
+
+	alpha, ok := manager.GetByID("alpha.json")
+	if !ok {
+		t.Fatal("alpha auth not found")
+	}
+	alpha.Metadata["access_token"] = "rotated-access-token"
+	alpha.Metadata["session_cookie"] = "rotated-session-cookie"
+	if _, errUpdate := manager.Update(coreauth.WithSkipPersist(t.Context()), alpha); errUpdate != nil {
+		t.Fatal(errUpdate)
+	}
+	if got := manager.ManagementAuthCatalogRevision(); got != revision {
+		t.Fatalf("opaque rotation changed catalog revision from %d to %d", revision, got)
+	}
+	rotated := performAuthFilesPaginationRequest(router, "/auth-files?paged=true&page=1&page_size=1&sort=az")
+	if rotated.Code != http.StatusOK {
+		t.Fatalf("rotated page status=%d body=%s", rotated.Code, rotated.Body.String())
+	}
+	h.authFilesPagination.mu.Lock()
+	if &h.authFilesPagination.records[0] != &records[0] {
+		t.Fatal("opaque credential rotation rebuilt the pagination directory")
+	}
+	h.authFilesPagination.mu.Unlock()
+
+	alpha, _ = manager.GetByID("alpha.json")
+	alpha.StatusMessage = "temporary failure"
+	if _, errUpdate := manager.Update(coreauth.WithSkipPersist(t.Context()), alpha); errUpdate != nil {
+		t.Fatal(errUpdate)
+	}
+	problem := performAuthFilesPaginationRequest(router, "/auth-files?paged=true&page=1&page_size=10&problem_only=true")
+	if problem.Code != http.StatusOK || !strings.Contains(problem.Body.String(), "alpha.json") {
+		t.Fatalf("visible update was not reflected: status=%d body=%s", problem.Code, problem.Body.String())
+	}
+	h.authFilesPagination.mu.Lock()
+	if h.authFilesPagination.revision != manager.ManagementAuthCatalogRevision() || h.authFilesPagination.revision == revision {
+		t.Fatalf("visible update did not invalidate cache: cache=%d manager=%d", h.authFilesPagination.revision, manager.ManagementAuthCatalogRevision())
+	}
+	if len(h.authFilesPagination.retiredRecords) != 1 || h.authFilesPagination.retiredRecords[0] != retiredRecords[0] {
+		t.Fatal("visible runtime update rescanned the retired credential directory")
+	}
+	h.authFilesPagination.mu.Unlock()
+
+	for index := 0; index < maxAuthFilesQueryCache+8; index++ {
+		response := performAuthFilesPaginationRequest(router, "/auth-files?paged=true&page=1&page_size=1&search=query-"+strconv.Itoa(index))
+		if response.Code != http.StatusOK {
+			t.Fatalf("query %d status=%d body=%s", index, response.Code, response.Body.String())
+		}
+	}
+	h.authFilesPagination.mu.Lock()
+	if got := h.authFilesPagination.lru.Len(); got != maxAuthFilesQueryCache {
+		t.Fatalf("query LRU size=%d want=%d", got, maxAuthFilesQueryCache)
+	}
+	h.authFilesPagination.mu.Unlock()
+}
+
 func BenchmarkAuthFilesPaginationFilterAndSort10000(b *testing.B) {
 	records := make([]*authFileListRecord, 10_000)
 	for index := range records {

@@ -397,6 +397,9 @@ type Manager struct {
 	authIDsByIndex             map[string]map[string]struct{}
 	managedFileAuthIDs         map[string]map[string]struct{}
 	managedFileKeysByAuthID    map[string][]string
+	managementAuthCatalog      map[string]*Auth
+	usageAuthCatalog           map[string]UsageAuthInfo
+	managementCatalogRevision  uint64
 	authPlanTypesByID          map[string]string
 	dependencyAuthsByID        map[string]*Auth
 	dependencySourceIDs        map[string]map[string]struct{}
@@ -667,6 +670,9 @@ func NewManager(store Store, selector Selector, hook Hook) *Manager {
 		authIDsByIndex:              make(map[string]map[string]struct{}),
 		managedFileAuthIDs:          make(map[string]map[string]struct{}),
 		managedFileKeysByAuthID:     make(map[string][]string),
+		managementAuthCatalog:       make(map[string]*Auth),
+		usageAuthCatalog:            make(map[string]UsageAuthInfo),
+		managementCatalogRevision:   1,
 		authPlanTypesByID:           make(map[string]string),
 		dependencyAuthsByID:         make(map[string]*Auth),
 		dependencySourceIDs:         make(map[string]map[string]struct{}),
@@ -772,6 +778,7 @@ func (m *Manager) ClearModelCooldownByReason(ctx context.Context, authID, model,
 	auth := m.auths[authID]
 	if clearModelCooldownByReasonOnAuth(auth, modelKey, reason, now) {
 		persistAuth = auth
+		m.updateManagementAuthCatalogLocked(auth)
 	}
 	m.mu.Unlock()
 	if persistAuth == nil {
@@ -912,6 +919,7 @@ func (m *Manager) reconcileRegistryModelStates(ctx context.Context, authID strin
 			}
 			auth.UpdatedAt = now
 			persistAuth = auth
+			m.updateManagementAuthCatalogLocked(auth)
 		}
 	}
 	m.mu.Unlock()
@@ -7415,6 +7423,7 @@ func (m *Manager) markResult(
 		} else {
 			finalizeAcceptedResultLocked(auth)
 		}
+		m.updateManagementAuthCatalogLocked(auth)
 	}
 	m.mu.Unlock()
 	if pendingDynamicFinalize {
@@ -7433,6 +7442,7 @@ func (m *Manager) markResult(
 				staleDynamicModelResult = true
 			}
 			finalizeAcceptedResultLocked(auth)
+			m.updateManagementAuthCatalogLocked(auth)
 		}
 		m.mu.Unlock()
 	}
@@ -11315,6 +11325,7 @@ func (m *Manager) markChatGPTWebRefreshCommitFailure(expected, updated *Auth, pe
 			clearRefreshPendingMarker(current, pendingUntil)
 			applyLifecycleRuntimeState(current)
 		}
+		m.updateManagementAuthCatalogLocked(current)
 		snapshot = current.Clone()
 	}
 	m.mu.Unlock()

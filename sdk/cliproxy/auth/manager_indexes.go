@@ -1,7 +1,9 @@
 package auth
 
 import (
+	"encoding/json"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strings"
 
@@ -10,6 +12,172 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/authfileguard"
 	internalconfig "github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 )
+
+var managementCatalogAttributeKeys = [...]string{
+	"auth_kind",
+	"credential_uid",
+	"note",
+	"path",
+	"plan_type",
+	"priority",
+	"refresh_strategy",
+	"runtime_only",
+	"source_auth_id",
+	"source_credential_uid",
+}
+
+var managementCatalogMetadataKeys = [...]string{
+	"auth_kind",
+	"credential_uid",
+	"deletion_state",
+	"email",
+	"lifecycle_reason",
+	"lifecycle_state",
+	"note",
+	"plan_type",
+	"priority",
+	"refresh_strategy",
+	"source_auth_id",
+	"source_credential_uid",
+}
+
+func managementCatalogScalar(value any) (any, bool) {
+	switch typed := value.(type) {
+	case string:
+		return typed, true
+	case bool:
+		return typed, true
+	case int:
+		return typed, true
+	case int8:
+		return typed, true
+	case int16:
+		return typed, true
+	case int32:
+		return typed, true
+	case int64:
+		return typed, true
+	case uint:
+		return typed, true
+	case uint8:
+		return typed, true
+	case uint16:
+		return typed, true
+	case uint32:
+		return typed, true
+	case uint64:
+		return typed, true
+	case float32:
+		return typed, true
+	case float64:
+		return typed, true
+	case json.Number:
+		return typed, true
+	default:
+		return nil, false
+	}
+}
+
+func managementCatalogErrorCode(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" || len(value) > 128 {
+		return ""
+	}
+	for _, char := range value {
+		if (char >= 'a' && char <= 'z') || (char >= 'A' && char <= 'Z') ||
+			(char >= '0' && char <= '9') || char == '_' || char == '-' || char == '.' || char == ':' {
+			continue
+		}
+		return ""
+	}
+	return value
+}
+
+func managementAuthCatalogSummary(auth *Auth, planType string) *Auth {
+	if auth == nil {
+		return nil
+	}
+	summary := &Auth{
+		ID:            strings.TrimSpace(auth.ID),
+		Index:         strings.TrimSpace(auth.Index),
+		Provider:      strings.TrimSpace(auth.Provider),
+		FileName:      strings.TrimSpace(auth.FileName),
+		Label:         strings.TrimSpace(auth.Label),
+		Status:        auth.Status,
+		StatusMessage: "",
+		Disabled:      auth.Disabled,
+		Unavailable:   auth.Unavailable,
+	}
+	if strings.TrimSpace(auth.StatusMessage) != "" {
+		summary.StatusMessage = "problem"
+	}
+	for _, key := range managementCatalogAttributeKeys {
+		if value := strings.TrimSpace(auth.Attributes[key]); value != "" {
+			if summary.Attributes == nil {
+				summary.Attributes = make(map[string]string)
+			}
+			summary.Attributes[key] = value
+		}
+	}
+	for _, key := range managementCatalogMetadataKeys {
+		if value, ok := managementCatalogScalar(auth.Metadata[key]); ok {
+			if summary.Metadata == nil {
+				summary.Metadata = make(map[string]any)
+			}
+			summary.Metadata[key] = value
+		}
+	}
+	if summary.Metadata == nil && strings.TrimSpace(planType) != "" {
+		summary.Metadata = make(map[string]any, 1)
+	}
+	if summary.Metadata != nil {
+		if _, explicit := summary.Metadata["plan_type"]; !explicit && strings.TrimSpace(planType) != "" {
+			summary.Metadata["plan_type"] = strings.TrimSpace(planType)
+		}
+	}
+	if auth.LastError != nil {
+		summary.LastError = &Error{
+			Code:       managementCatalogErrorCode(auth.LastError.Code),
+			Retryable:  auth.LastError.Retryable,
+			HTTPStatus: auth.LastError.HTTPStatus,
+		}
+	}
+	return summary
+}
+
+func (m *Manager) updateManagementAuthCatalogLocked(auth *Auth) {
+	if m == nil || auth == nil || strings.TrimSpace(auth.ID) == "" {
+		return
+	}
+	if m.managementAuthCatalog == nil {
+		m.managementAuthCatalog = make(map[string]*Auth)
+	}
+	id := strings.TrimSpace(auth.ID)
+	next := managementAuthCatalogSummary(auth, m.authPlanTypesByID[id])
+	nextUsage := usageAuthInfoLocked(auth, strings.TrimSpace(auth.Index))
+	if reflect.DeepEqual(m.managementAuthCatalog[id], next) && m.usageAuthCatalog[id] == nextUsage {
+		return
+	}
+	m.managementAuthCatalog[id] = next
+	if m.usageAuthCatalog == nil {
+		m.usageAuthCatalog = make(map[string]UsageAuthInfo)
+	}
+	m.usageAuthCatalog[id] = nextUsage
+	m.managementCatalogRevision++
+}
+
+func (m *Manager) removeManagementAuthCatalogLocked(id string) {
+	if m == nil {
+		return
+	}
+	id = strings.TrimSpace(id)
+	if id == "" || m.managementAuthCatalog[id] == nil {
+		return
+	}
+	delete(m.managementAuthCatalog, id)
+	delete(m.usageAuthCatalog, id)
+	m.managementCatalogRevision++
+}
 
 func authBackingPathKey(auth *Auth, cfg *internalconfig.Config) string {
 	if auth == nil {
@@ -325,6 +493,7 @@ func (m *Manager) addAuthIndexesLocked(auth *Auth, cfg *internalconfig.Config) {
 	if strings.EqualFold(strings.TrimSpace(auth.Provider), chatgptwebauth.Provider) {
 		m.addChatGPTWebIdentityIndexLocked(auth)
 	}
+	m.updateManagementAuthCatalogLocked(auth)
 }
 
 // installAuthLocked atomically installs an auth and updates all Manager indexes.
@@ -359,6 +528,7 @@ func (m *Manager) removeAuthLocked(id string) {
 	removed := m.auths[id]
 	delete(m.auths, id)
 	m.removeAuthIndexesLocked(id)
+	m.removeManagementAuthCatalogLocked(id)
 	m.removeAPIKeyModelAliasForAuthLocked(removed)
 	m.authIndexRevision++
 }
@@ -423,6 +593,8 @@ type managerAuthIndexState struct {
 	authIDsByIndex             map[string]map[string]struct{}
 	managedFileAuthIDs         map[string]map[string]struct{}
 	managedFileKeysByAuthID    map[string][]string
+	managementAuthCatalog      map[string]*Auth
+	usageAuthCatalog           map[string]UsageAuthInfo
 	authPlanTypesByID          map[string]string
 	dependencyAuthsByID        map[string]*Auth
 	dependencySourceIDs        map[string]map[string]struct{}
@@ -445,6 +617,8 @@ func newManagerAuthIndexBuilder(auths map[string]*Auth) *Manager {
 		authIDsByIndex:             make(map[string]map[string]struct{}),
 		managedFileAuthIDs:         make(map[string]map[string]struct{}),
 		managedFileKeysByAuthID:    make(map[string][]string),
+		managementAuthCatalog:      make(map[string]*Auth),
+		usageAuthCatalog:           make(map[string]UsageAuthInfo),
 		authPlanTypesByID:          make(map[string]string),
 		dependencyAuthsByID:        make(map[string]*Auth),
 		dependencySourceIDs:        make(map[string]map[string]struct{}),
@@ -494,6 +668,8 @@ func buildManagerAuthIndexState(auths map[string]*Auth, persisted []*Auth, compl
 		authIDsByIndex:             builder.authIDsByIndex,
 		managedFileAuthIDs:         builder.managedFileAuthIDs,
 		managedFileKeysByAuthID:    builder.managedFileKeysByAuthID,
+		managementAuthCatalog:      builder.managementAuthCatalog,
+		usageAuthCatalog:           builder.usageAuthCatalog,
 		authPlanTypesByID:          builder.authPlanTypesByID,
 		dependencyAuthsByID:        builder.dependencyAuthsByID,
 		dependencySourceIDs:        builder.dependencySourceIDs,
@@ -516,6 +692,11 @@ func (m *Manager) applyManagerAuthIndexStateLocked(state managerAuthIndexState) 
 	m.authIDsByIndex = state.authIDsByIndex
 	m.managedFileAuthIDs = state.managedFileAuthIDs
 	m.managedFileKeysByAuthID = state.managedFileKeysByAuthID
+	if !reflect.DeepEqual(m.managementAuthCatalog, state.managementAuthCatalog) || !reflect.DeepEqual(m.usageAuthCatalog, state.usageAuthCatalog) {
+		m.managementAuthCatalog = state.managementAuthCatalog
+		m.usageAuthCatalog = state.usageAuthCatalog
+		m.managementCatalogRevision++
+	}
 	m.authPlanTypesByID = state.authPlanTypesByID
 	m.dependencyAuthsByID = state.dependencyAuthsByID
 	m.dependencySourceIDs = state.dependencySourceIDs
@@ -589,6 +770,59 @@ func (m *Manager) ChatGPTWebDependencyIndexSnapshot() (*ChatGPTWebDependencyGrap
 	complete := m.dependencyIndexComplete
 	m.mu.RUnlock()
 	return BuildChatGPTWebDependencyGraph(auths), complete
+}
+
+// ChatGPTWebDependencyGraphForAuths builds the dependency view needed to
+// render the supplied auths without cloning unrelated credentials. The cost is
+// proportional to the targets and their linked sources or dependents.
+func (m *Manager) ChatGPTWebDependencyGraphForAuths(auths []*Auth) (*ChatGPTWebDependencyGraph, bool) {
+	if m == nil || len(auths) == 0 {
+		return BuildChatGPTWebDependencyGraph(nil), false
+	}
+	targets := make(map[string]*Auth, len(auths))
+	neededIDs := make(map[string]struct{}, len(auths))
+	for _, auth := range auths {
+		if auth == nil || strings.TrimSpace(auth.ID) == "" {
+			continue
+		}
+		id := strings.TrimSpace(auth.ID)
+		targets[id] = auth
+		neededIDs[id] = struct{}{}
+	}
+	m.mu.RLock()
+	for _, auth := range targets {
+		if uid := ChatGPTWebCredentialUID(auth); uid != "" && strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") {
+			for id := range m.dependencySourceIDs[uid] {
+				neededIDs[id] = struct{}{}
+			}
+			for id := range m.dependencyDependentIDs[uid] {
+				neededIDs[id] = struct{}{}
+			}
+		}
+		if uid := ChatGPTWebLinkedSourceUID(auth); uid != "" {
+			for id := range m.dependencySourceIDs[uid] {
+				neededIDs[id] = struct{}{}
+			}
+		}
+	}
+	ids := make([]string, 0, len(neededIDs))
+	for id := range neededIDs {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	graphAuths := make([]*Auth, 0, len(ids))
+	for _, id := range ids {
+		if target := targets[id]; target != nil {
+			graphAuths = append(graphAuths, target.Clone())
+			continue
+		}
+		if indexed := m.dependencyAuthsByID[id]; indexed != nil {
+			graphAuths = append(graphAuths, indexed.Clone())
+		}
+	}
+	complete := m.dependencyIndexComplete
+	m.mu.RUnlock()
+	return BuildChatGPTWebDependencyGraph(graphAuths), complete
 }
 
 // ChatGPTWebSourceByCredentialUID resolves one Codex source directly from the
@@ -860,6 +1094,39 @@ func (m *Manager) AuthIDs() []string {
 	m.mu.RUnlock()
 	sort.Strings(ids)
 	return ids
+}
+
+// ManagementAuthCatalogRevision returns the revision of list-visible auth fields.
+func (m *Manager) ManagementAuthCatalogRevision() uint64 {
+	if m == nil {
+		return 0
+	}
+	m.mu.RLock()
+	revision := m.managementCatalogRevision
+	m.mu.RUnlock()
+	return revision
+}
+
+// ManagementAuthCatalogSnapshot returns non-sensitive auth summaries for list filtering.
+func (m *Manager) ManagementAuthCatalogSnapshot() (uint64, []*Auth) {
+	if m == nil {
+		return 0, nil
+	}
+	m.mu.RLock()
+	revision := m.managementCatalogRevision
+	ids := make([]string, 0, len(m.managementAuthCatalog))
+	for id := range m.managementAuthCatalog {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	auths := make([]*Auth, 0, len(ids))
+	for _, id := range ids {
+		if auth := m.managementAuthCatalog[id]; auth != nil {
+			auths = append(auths, auth.Clone())
+		}
+	}
+	m.mu.RUnlock()
+	return revision, auths
 }
 
 // GetByIDs clones only the requested runtime credentials in request order.

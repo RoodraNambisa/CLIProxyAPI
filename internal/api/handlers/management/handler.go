@@ -101,6 +101,9 @@ type Handler struct {
 	cleanupCancel           context.CancelFunc
 	cleanupWG               sync.WaitGroup
 	cleanupStopOnce         sync.Once
+	authFilesPagination     authFilesPaginationCache
+	usageAuthCatalog        usageAuthCatalogCache
+	usageAuthPagination     usageAuthPaginationCache
 }
 
 // ConfigMutationMiddleware serializes management writes that replace runtime

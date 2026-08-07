@@ -7,10 +7,12 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/usage"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	coreusage "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/usage"
 )
 
@@ -36,6 +38,13 @@ type usageAuthInfo struct {
 	AccountType string
 	Account     string
 	Email       string
+}
+
+type usageAuthCatalogCache struct {
+	mu       sync.Mutex
+	manager  *coreauth.Manager
+	revision uint64
+	infos    map[string]usageAuthInfo
 }
 
 const (
@@ -175,46 +184,42 @@ func (h *Handler) GetUsageAuthSummaries(c *gin.Context) {
 		return
 	}
 	authIndexes := parseUsageAuthIndexList(c)
+	if pageQuery.Enabled {
+		rows := h.cachedUsageAuthRows(timeRange, authIndexes, pageQuery)
+		total := len(rows)
+		pageRows, page, totalPages := paginateUsageAuthRows(rows, pageQuery.Page, pageQuery.PageSize)
+		auths := make([]gin.H, 0, len(pageRows))
+		for _, row := range pageRows {
+			auths = append(auths, buildUsageAuthResponse(row.Summary, row.Info, row.Stale))
+		}
+		c.Header("Cache-Control", "no-store")
+		c.JSON(http.StatusOK, gin.H{
+			"auths": auths,
+			"total": total,
+			"pagination": gin.H{
+				"enabled":     true,
+				"page":        page,
+				"page_size":   pageQuery.PageSize,
+				"total_pages": totalPages,
+			},
+		})
+		return
+	}
+
 	infoByIndex := h.usageAuthInfoByIndex()
 	summaries := map[string]usage.AuthUsageSnapshot{}
 	if stats := h.usageStatisticsSnapshot(); stats != nil {
-		query := usage.AuthUsageQuery{
-			TimeRange:   timeRange,
-			AuthIndexes: authIndexes,
-		}
+		query := usage.AuthUsageQuery{TimeRange: timeRange, AuthIndexes: authIndexes}
 		for _, summary := range stats.AuthSummariesForQuery(query) {
 			summaries[summary.AuthIndex] = summary
 		}
 	}
-
 	rows := mergeUsageAuthRows(authIndexes, infoByIndex, summaries)
-	if !pageQuery.Enabled {
-		auths := make([]gin.H, 0, len(rows))
-		for _, row := range rows {
-			auths = append(auths, buildUsageAuthResponse(row.Summary, row.Info, row.Stale))
-		}
-		c.JSON(http.StatusOK, gin.H{"auths": auths})
-		return
-	}
-	rows = filterUsageAuthRows(rows, pageQuery)
-	sortUsageAuthRows(rows, pageQuery)
-	total := len(rows)
-	pageRows, page, totalPages := paginateUsageAuthRows(rows, pageQuery.Page, pageQuery.PageSize)
-	auths := make([]gin.H, 0, len(pageRows))
-	for _, row := range pageRows {
+	auths := make([]gin.H, 0, len(rows))
+	for _, row := range rows {
 		auths = append(auths, buildUsageAuthResponse(row.Summary, row.Info, row.Stale))
 	}
-	c.Header("Cache-Control", "no-store")
-	c.JSON(http.StatusOK, gin.H{
-		"auths": auths,
-		"total": total,
-		"pagination": gin.H{
-			"enabled":     true,
-			"page":        page,
-			"page_size":   pageQuery.PageSize,
-			"total_pages": totalPages,
-		},
-	})
+	c.JSON(http.StatusOK, gin.H{"auths": auths})
 }
 
 // GetUsageFacets returns bounded remote suggestions for high-cardinality usage filters.
@@ -821,14 +826,40 @@ func isUsageGroupBy(groupBy string) bool {
 }
 
 func (h *Handler) usageAuthInfoByIndex() map[string]usageAuthInfo {
-	out := map[string]usageAuthInfo{}
 	if h == nil || h.authManager == nil {
-		return out
+		return map[string]usageAuthInfo{}
 	}
-	for _, info := range h.authManager.ListUsageAuthInfos() {
-		out[info.AuthIndex] = usageAuthInfoFromCore(info)
+	manager := h.authManager
+	revision := manager.ManagementAuthCatalogRevision()
+	cache := &h.usageAuthCatalog
+	cache.mu.Lock()
+	if cache.manager == manager && cache.revision == revision && cache.infos != nil {
+		infos := cache.infos
+		cache.mu.Unlock()
+		return infos
 	}
-	return out
+	cache.mu.Unlock()
+
+	revision, summaries := manager.UsageAuthCatalogSnapshot()
+	infos := make(map[string]usageAuthInfo, len(summaries))
+	for _, info := range summaries {
+		if authIndex := strings.TrimSpace(info.AuthIndex); authIndex != "" {
+			current, exists := infos[authIndex]
+			if !exists || strings.TrimSpace(info.ID) < strings.TrimSpace(current.ID) {
+				infos[authIndex] = usageAuthInfoFromCore(info)
+			}
+		}
+	}
+
+	cache.mu.Lock()
+	if cache.manager != manager || cache.revision <= revision || cache.infos == nil {
+		cache.manager = manager
+		cache.revision = revision
+		cache.infos = infos
+	}
+	infos = cache.infos
+	cache.mu.Unlock()
+	return infos
 }
 
 func (h *Handler) usageAuthInfoByAuthIndex(authIndex string) (usageAuthInfo, bool) {
