@@ -4411,7 +4411,7 @@ func runtimeRestartFields(previous, requested *config.Config) []string {
 	if previous == nil || requested == nil {
 		return nil
 	}
-	fields := make([]string, 0, 5)
+	fields := make([]string, 0, 6)
 	if previous.Host != requested.Host {
 		fields = append(fields, "host")
 	}
@@ -4427,6 +4427,9 @@ func runtimeRestartFields(previous, requested *config.Config) []string {
 	if previous.CommercialMode != requested.CommercialMode {
 		fields = append(fields, "commercial-mode")
 	}
+	if previous.RemoteManagement.AccessPath != requested.RemoteManagement.AccessPath {
+		fields = append(fields, "remote-management.access-path")
+	}
 	return fields
 }
 
@@ -4439,6 +4442,7 @@ func preserveRuntimeStartupFields(runtimeCfg, previous *config.Config) {
 	runtimeCfg.TLS = previous.TLS
 	runtimeCfg.AuthDir = previous.AuthDir
 	runtimeCfg.CommercialMode = previous.CommercialMode
+	runtimeCfg.RemoteManagement.AccessPath = previous.RemoteManagement.AccessPath
 }
 
 func runtimeConfigHash(cfg *config.Config) ([sha256.Size]byte, error) {

@@ -1,6 +1,7 @@
 package cliproxy
 
 import (
+	"slices"
 	"testing"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
@@ -12,12 +13,18 @@ func TestApplyRuntimeConfigPreservesStartupFieldsAndDeduplicates(t *testing.T) {
 		Port:         8317,
 		AuthDir:      "/runtime/auths",
 		RequestRetry: 1,
+		RemoteManagement: config.RemoteManagement{
+			AccessPath: "runtime-path",
+		},
 	}}
 	requested := &config.Config{
 		Host:         "0.0.0.0",
 		Port:         9000,
 		AuthDir:      "/next/auths",
 		RequestRetry: 4,
+		RemoteManagement: config.RemoteManagement{
+			AccessPath: "next-path",
+		},
 	}
 
 	result, errApply := service.ApplyRuntimeConfig(t.Context(), requested)
@@ -27,8 +34,11 @@ func TestApplyRuntimeConfigPreservesStartupFieldsAndDeduplicates(t *testing.T) {
 	if !result.Applied || !result.RestartRequired {
 		t.Fatalf("ApplyRuntimeConfig() result = %#v", result)
 	}
-	if got := service.currentConfig(); got.Host != "127.0.0.1" || got.Port != 8317 || got.AuthDir != "/runtime/auths" || got.RequestRetry != 4 {
+	if got := service.currentConfig(); got.Host != "127.0.0.1" || got.Port != 8317 || got.AuthDir != "/runtime/auths" || got.RequestRetry != 4 || got.RemoteManagement.AccessPath != "runtime-path" {
 		t.Fatalf("runtime config = %#v", got)
+	}
+	if !slices.Contains(result.RestartFields, "remote-management.access-path") {
+		t.Fatalf("restart fields = %v, want remote-management.access-path", result.RestartFields)
 	}
 
 	second, errSecond := service.ApplyRuntimeConfig(t.Context(), requested)

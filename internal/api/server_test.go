@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -18,6 +19,7 @@ import (
 	sdkaccess "github.com/router-for-me/CLIProxyAPI/v6/sdk/access"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v6/sdk/config"
+	"golang.org/x/crypto/bcrypt"
 	"gopkg.in/yaml.v3"
 )
 
@@ -63,6 +65,30 @@ func newTestServerWithConfig(t *testing.T, mutate func(*proxyconfig.Config)) *Se
 		}
 	})
 	return server
+}
+
+func TestServerCurrentConfigConcurrentReplacement(t *testing.T) {
+	server := &Server{cfg: &proxyconfig.Config{Port: 1}}
+	var wait sync.WaitGroup
+	wait.Add(5)
+	go func() {
+		defer wait.Done()
+		for port := 2; port <= 2_000; port++ {
+			server.setCurrentConfig(&proxyconfig.Config{Port: port})
+		}
+	}()
+	for range 4 {
+		go func() {
+			defer wait.Done()
+			for range 2_000 {
+				if current := server.currentConfig(); current == nil || current.Port <= 0 {
+					t.Errorf("currentConfig() = %#v", current)
+					return
+				}
+			}
+		}()
+	}
+	wait.Wait()
 }
 
 func TestHealthz(t *testing.T) {
@@ -403,24 +429,59 @@ func TestManagementAccessPathPrefixesManagementRoutesAndCallbacks(t *testing.T) 
 		t.Fatalf("unprefixed callback status = %d, want %d; body=%s", oldCallbackRec.Code, http.StatusNotFound, oldCallbackRec.Body.String())
 	}
 
-	updatedCfg := *server.cfg
+	updatedCfg := *server.currentConfig()
 	updatedCfg.RemoteManagement.AccessPath = "new-secret-token"
-	server.UpdateClients(&updatedCfg)
+	if errUpdate := server.UpdateClients(&updatedCfg); errUpdate != nil {
+		t.Fatalf("UpdateClients() error = %v", errUpdate)
+	}
 
 	staleReq := httptest.NewRequest(http.MethodGet, "/secret-token/v0/management/config", nil)
 	staleReq.Header.Set("X-Management-Key", "secret")
 	staleRec := httptest.NewRecorder()
 	server.engine.ServeHTTP(staleRec, staleReq)
-	if staleRec.Code != http.StatusNotFound {
-		t.Fatalf("stale prefixed management route status = %d, want %d; body=%s", staleRec.Code, http.StatusNotFound, staleRec.Body.String())
+	if staleRec.Code != http.StatusOK {
+		t.Fatalf("runtime management route status = %d, want %d; body=%s", staleRec.Code, http.StatusOK, staleRec.Body.String())
 	}
 
 	newReq := httptest.NewRequest(http.MethodGet, "/new-secret-token/v0/management/config", nil)
 	newReq.Header.Set("X-Management-Key", "secret")
 	newRec := httptest.NewRecorder()
 	server.engine.ServeHTTP(newRec, newReq)
-	if newRec.Code != http.StatusOK {
-		t.Fatalf("updated prefixed management route status = %d, want %d; body=%s", newRec.Code, http.StatusOK, newRec.Body.String())
+	if newRec.Code != http.StatusNotFound {
+		t.Fatalf("unregistered management route status = %d, want %d; body=%s", newRec.Code, http.StatusNotFound, newRec.Body.String())
+	}
+}
+
+func TestManagementRoutesCanBeEnabledWithoutRuntimeRegistration(t *testing.T) {
+	server := newTestServer(t)
+	if server.managementRoutesEnabled.Load() {
+		t.Fatal("management routes unexpectedly enabled")
+	}
+
+	disabledReq := httptest.NewRequest(http.MethodGet, "/v0/management/config", nil)
+	disabledRec := httptest.NewRecorder()
+	server.engine.ServeHTTP(disabledRec, disabledReq)
+	if disabledRec.Code != http.StatusNotFound {
+		t.Fatalf("disabled management status = %d, want %d", disabledRec.Code, http.StatusNotFound)
+	}
+
+	updatedCfg := *server.currentConfig()
+	secretHash, errHash := bcrypt.GenerateFromPassword([]byte("secret"), bcrypt.MinCost)
+	if errHash != nil {
+		t.Fatalf("GenerateFromPassword() error = %v", errHash)
+	}
+	updatedCfg.RemoteManagement.SecretKey = string(secretHash)
+	updatedCfg.RemoteManagement.AllowRemote = true
+	if errUpdate := server.UpdateClients(&updatedCfg); errUpdate != nil {
+		t.Fatalf("UpdateClients() error = %v", errUpdate)
+	}
+
+	enabledReq := httptest.NewRequest(http.MethodGet, "/v0/management/config", nil)
+	enabledReq.Header.Set("X-Management-Key", "secret")
+	enabledRec := httptest.NewRecorder()
+	server.engine.ServeHTTP(enabledRec, enabledReq)
+	if enabledRec.Code != http.StatusOK {
+		t.Fatalf("enabled management status = %d, want %d; body=%s", enabledRec.Code, http.StatusOK, enabledRec.Body.String())
 	}
 }
 
@@ -439,7 +500,7 @@ func TestUpdateClientsRollsBackEarlierSideEffectsAfterLaterFailure(t *testing.T)
 	t.Setenv("WRITABLE_PATH", blockedPath)
 	t.Setenv("writable_path", "")
 
-	updatedCfg := *server.cfg
+	updatedCfg := *server.currentConfig()
 	updatedCfg.RequestLog = true
 	updatedCfg.LoggingToFile = true
 	if errUpdate := server.UpdateClients(&updatedCfg); errUpdate == nil {
@@ -449,8 +510,9 @@ func TestUpdateClientsRollsBackEarlierSideEffectsAfterLaterFailure(t *testing.T)
 	if len(requestLogStates) != 2 || !requestLogStates[0] || requestLogStates[1] {
 		t.Fatalf("request log states = %v, want [true false]", requestLogStates)
 	}
-	if server.cfg.RequestLog || server.cfg.LoggingToFile {
-		t.Fatalf("runtime config was not rolled back: request_log=%t logging_to_file=%t", server.cfg.RequestLog, server.cfg.LoggingToFile)
+	current := server.currentConfig()
+	if current.RequestLog || current.LoggingToFile {
+		t.Fatalf("runtime config was not rolled back: request_log=%t logging_to_file=%t", current.RequestLog, current.LoggingToFile)
 	}
 	var snapshot proxyconfig.Config
 	if errUnmarshal := yaml.Unmarshal(server.oldConfigYaml, &snapshot); errUnmarshal != nil {

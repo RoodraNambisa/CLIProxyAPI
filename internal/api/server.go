@@ -178,7 +178,13 @@ type Server struct {
 	handlers *handlers.BaseAPIHandler
 
 	// cfg holds the current server configuration.
-	cfg *config.Config
+	configMu sync.RWMutex
+	cfg      *config.Config
+
+	// configUpdateMu serializes direct UpdateClients callers. Service-owned
+	// runtime transactions already serialize their work, but the API package can
+	// also be embedded without a Service.
+	configUpdateMu sync.Mutex
 
 	// oldConfigYaml stores a YAML snapshot of the previous configuration for change detection.
 	// This prevents issues when the config object is modified in place by Management API.
@@ -227,6 +233,27 @@ type Server struct {
 	keepAliveStop      chan struct{}
 }
 
+// currentConfig returns the immutable configuration currently used by the API
+// server. Runtime updates replace the pointer instead of mutating the value.
+func (s *Server) currentConfig() *config.Config {
+	if s == nil {
+		return nil
+	}
+	s.configMu.RLock()
+	current := s.cfg
+	s.configMu.RUnlock()
+	return current
+}
+
+func (s *Server) setCurrentConfig(cfg *config.Config) {
+	if s == nil {
+		return
+	}
+	s.configMu.Lock()
+	s.cfg = cfg
+	s.configMu.Unlock()
+}
+
 // NewServer creates and initializes a new API server instance.
 // It sets up the Gin engine, middleware, routes, and handlers.
 //
@@ -273,8 +300,10 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 		}
 		if requestLogger != nil {
 			engine.Use(middleware.RequestLoggingMiddleware(requestLogger, func() config.RequestBodyReleaseConfig {
-				if serverRef != nil && serverRef.cfg != nil {
-					return serverRef.cfg.RequestBodyRelease
+				if serverRef != nil {
+					if current := serverRef.currentConfig(); current != nil {
+						return current.RequestBodyRelease
+					}
 				}
 				if cfg != nil {
 					return cfg.RequestBodyRelease
@@ -373,13 +402,11 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 		optionState.routerConfigurator(engine, s.handlers, cfg)
 	}
 
-	// Register management routes when configuration or environment secrets are available,
-	// or when a local management password is provided (e.g. TUI mode).
+	// Register management routes before the HTTP server starts. Runtime updates
+	// only toggle availability; Gin route mutation is not safe while serving.
 	hasManagementSecret := cfg.RemoteManagement.SecretKey != "" || envManagementSecret || s.localPassword != ""
 	s.managementRoutesEnabled.Store(hasManagementSecret)
-	if hasManagementSecret {
-		s.registerManagementRoutes()
-	}
+	s.registerManagementRoutes()
 
 	if optionState.keepAliveEnabled {
 		s.enableKeepAlive(optionState.keepAliveTimeout, optionState.keepAliveOnTimeout)
@@ -465,10 +492,11 @@ func (s *Server) setupRoutes() {
 
 func (s *Server) requestBodyAuditMiddleware() gin.HandlerFunc {
 	return middleware.RequestBodyAuditMiddleware(func() config.RequestBodyAuditConfig {
-		if s == nil || s.cfg == nil {
+		current := s.currentConfig()
+		if current == nil {
 			return config.RequestBodyAuditConfig{}
 		}
-		return s.cfg.RequestBodyAudit
+		return current.RequestBodyAudit
 	})
 }
 
@@ -510,10 +538,11 @@ func (s *Server) AttachWebsocketRoute(path string, handler http.Handler) {
 }
 
 func (s *Server) currentManagementAccessPrefix() string {
-	if s == nil || s.cfg == nil {
+	current := s.currentConfig()
+	if current == nil {
 		return ""
 	}
-	return config.ManagementAccessPathPrefix(s.cfg.RemoteManagement.AccessPath)
+	return config.ManagementAccessPathPrefix(current.RemoteManagement.AccessPath)
 }
 
 func (s *Server) activeManagementPrefixMiddleware(registeredPrefix string) gin.HandlerFunc {
@@ -560,8 +589,8 @@ func (s *Server) oauthCallbackHandler(provider string) gin.HandlerFunc {
 		if errStr == "" {
 			errStr = c.Query("error_description")
 		}
-		if state != "" {
-			_, _ = managementHandlers.WriteOAuthCallbackFileForPendingSession(s.cfg.AuthDir, provider, state, code, errStr)
+		if current := s.currentConfig(); state != "" && current != nil {
+			_, _ = managementHandlers.WriteOAuthCallbackFileForPendingSession(current.AuthDir, provider, state, code, errStr)
 		}
 		c.Header("Content-Type", "text/html; charset=utf-8")
 		c.String(http.StatusOK, oauthCallbackSuccessHTML)
@@ -858,7 +887,7 @@ func (s *Server) managementAvailabilityMiddleware() gin.HandlerFunc {
 }
 
 func (s *Server) serveManagementControlPanel(c *gin.Context) {
-	cfg := s.cfg
+	cfg := s.currentConfig()
 	if cfg == nil || cfg.RemoteManagement.DisableControlPanel {
 		c.AbortWithStatus(http.StatusNotFound)
 		return
@@ -994,10 +1023,11 @@ func (s *Server) Start() error {
 		return fmt.Errorf("failed to start HTTP server: server not initialized")
 	}
 
-	useTLS := s.cfg != nil && s.cfg.TLS.Enable
+	current := s.currentConfig()
+	useTLS := current != nil && current.TLS.Enable
 	if useTLS {
-		cert := strings.TrimSpace(s.cfg.TLS.Cert)
-		key := strings.TrimSpace(s.cfg.TLS.Key)
+		cert := strings.TrimSpace(current.TLS.Cert)
+		key := strings.TrimSpace(current.TLS.Key)
 		if cert == "" || key == "" {
 			return fmt.Errorf("failed to start HTTPS server: tls.cert or tls.key is empty")
 		}
@@ -1097,6 +1127,11 @@ func (s *Server) applyAccessConfig(oldCfg, newCfg *config.Config) error {
 //   - clients: The new slice of AI service clients
 //   - cfg: The new application configuration
 func (s *Server) UpdateClients(cfg *config.Config) error {
+	if s == nil {
+		return errors.New("runtime configuration is unavailable")
+	}
+	s.configUpdateMu.Lock()
+	defer s.configUpdateMu.Unlock()
 	return s.updateClients(cfg, true)
 }
 
@@ -1112,6 +1147,12 @@ func (s *Server) updateClients(cfg *config.Config, rollbackOnError bool) error {
 	var oldCfg *config.Config
 	if len(s.oldConfigYaml) > 0 {
 		_ = yaml.Unmarshal(s.oldConfigYaml, &oldCfg)
+	}
+	// The management access path determines Gin route registration and cannot
+	// be replaced safely after the server starts. Service-owned updates already
+	// preserve it; keep the same guarantee for direct embedded callers.
+	if oldCfg != nil {
+		runtimeCfg.RemoteManagement.AccessPath = oldCfg.RemoteManagement.AccessPath
 	}
 	// Record the attempted state before applying side effects. If a later step
 	// fails, the rollback pass must compare the previous configuration against
@@ -1178,43 +1219,7 @@ func (s *Server) updateClients(cfg *config.Config, rollbackOnError bool) error {
 		util.SetLogLevel(runtimeCfg)
 	}
 
-	s.cfg = runtimeCfg
-	s.registerManagementSurfaceRoutes()
-
-	prevSecretEmpty := true
-	if oldCfg != nil {
-		prevSecretEmpty = oldCfg.RemoteManagement.SecretKey == ""
-	}
-	newSecretEmpty := runtimeCfg.RemoteManagement.SecretKey == ""
-	if s.envManagementSecret {
-		s.registerManagementRoutes()
-		if s.managementRoutesEnabled.CompareAndSwap(false, true) {
-			log.Info("management routes enabled via MANAGEMENT_PASSWORD")
-		} else {
-			s.managementRoutesEnabled.Store(true)
-		}
-	} else {
-		switch {
-		case prevSecretEmpty && !newSecretEmpty:
-			s.registerManagementRoutes()
-			if s.managementRoutesEnabled.CompareAndSwap(false, true) {
-				log.Info("management routes enabled after secret key update")
-			} else {
-				s.managementRoutesEnabled.Store(true)
-			}
-		case !prevSecretEmpty && newSecretEmpty:
-			if s.managementRoutesEnabled.CompareAndSwap(true, false) {
-				log.Info("management routes disabled after secret key removal")
-			} else {
-				s.managementRoutesEnabled.Store(false)
-			}
-		default:
-			s.managementRoutesEnabled.Store(!newSecretEmpty)
-		}
-	}
-	if s.managementRoutesEnabled.Load() {
-		s.registerManagementRoutes()
-	}
+	s.setCurrentConfig(runtimeCfg)
 
 	if errAccess := s.applyAccessConfig(oldCfg, runtimeCfg); errAccess != nil {
 		return rollback(fmt.Errorf("update access providers: %w", errAccess))
@@ -1232,6 +1237,26 @@ func (s *Server) updateClients(cfg *config.Config, rollbackOnError bool) error {
 			return rollback(fmt.Errorf("update management runtime configuration: %w", errManagement))
 		}
 		s.mgmt.SetAuthManager(s.handlers.AuthManager)
+	}
+
+	// Publish management availability only after the handler has the matching
+	// authentication snapshot. This avoids a window where a newly enabled route
+	// authenticates against the previous secret.
+	previousManagementEnabled := s.managementRoutesEnabled.Load()
+	newSecretEmpty := runtimeCfg.RemoteManagement.SecretKey == ""
+	managementEnabled := s.envManagementSecret || s.localPassword != "" || !newSecretEmpty
+	s.managementRoutesEnabled.Store(managementEnabled)
+	if !previousManagementEnabled && managementEnabled {
+		switch {
+		case s.envManagementSecret:
+			log.Info("management routes enabled via MANAGEMENT_PASSWORD")
+		case s.localPassword != "":
+			log.Info("management routes enabled via local password")
+		default:
+			log.Info("management routes enabled after secret key update")
+		}
+	} else if previousManagementEnabled && !managementEnabled {
+		log.Info("management routes disabled after secret key removal")
 	}
 
 	// Count client sources from configuration and auth store.
