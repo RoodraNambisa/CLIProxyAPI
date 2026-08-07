@@ -598,7 +598,7 @@ func (operation *authDependencyDeleteContext) loadDependencySnapshot(authoritati
 				operation.addDependencyAuth(auth, true)
 			}
 		}
-		for _, auth := range operation.h.authManager.List() {
+		for _, auth := range operation.h.authManager.AuthsForProviders("codex", "chatgpt-web") {
 			if auth == nil || strings.TrimSpace(auth.ID) == "" {
 				continue
 			}

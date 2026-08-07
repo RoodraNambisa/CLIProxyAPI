@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io/fs"
 	"net/http"
-	"sort"
 	"strings"
 	"time"
 
@@ -31,6 +30,8 @@ type resolvedCooldownTarget struct {
 	models   map[string]struct{}
 }
 
+const cooldownAuthReadBatchSize = 128
+
 // ClearAllAuthCooldowns clears transient cooldown state for every known auth.
 func (h *Handler) ClearAllAuthCooldowns(c *gin.Context) {
 	if h == nil || h.authManager == nil {
@@ -40,42 +41,38 @@ func (h *Handler) ClearAllAuthCooldowns(c *gin.Context) {
 
 	ctx := c.Request.Context()
 	now := time.Now()
-	auths := h.authManager.List()
-	sort.Slice(auths, func(i, j int) bool {
-		if auths[i] == nil {
-			return false
+	authIDs := h.authManager.AuthIDs()
+	verifiedIDs := make([]string, 0, len(authIDs))
+	for start := 0; start < len(authIDs); start += cooldownAuthReadBatchSize {
+		end := min(start+cooldownAuthReadBatchSize, len(authIDs))
+		for _, auth := range h.authManager.GetByIDs(authIDs[start:end]) {
+			retired, errCheck := h.authBackedByRetiredGeminiCLIFile(auth)
+			if errCheck != nil {
+				c.JSON(http.StatusServiceUnavailable, gin.H{"error": "unable to verify auth file"})
+				return
+			}
+			if !retired {
+				verifiedIDs = append(verifiedIDs, auth.ID)
+			}
 		}
-		if auths[j] == nil {
-			return true
-		}
-		return auths[i].ID < auths[j].ID
-	})
-	verified := make([]*coreauth.Auth, 0, len(auths))
-	for _, auth := range auths {
-		retired, errCheck := h.authBackedByRetiredGeminiCLIFile(auth)
-		if errCheck != nil {
-			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "unable to verify auth file"})
-			return
-		}
-		if retired {
-			continue
-		}
-		verified = append(verified, auth)
 	}
 
 	updated := 0
-	for _, auth := range verified {
-		if !clearFullAuthCooldownState(auth, now) {
-			continue
+	for start := 0; start < len(verifiedIDs); start += cooldownAuthReadBatchSize {
+		end := min(start+cooldownAuthReadBatchSize, len(verifiedIDs))
+		for _, auth := range h.authManager.GetByIDs(verifiedIDs[start:end]) {
+			if !clearFullAuthCooldownState(auth, now) {
+				continue
+			}
+			if err := h.updateClearedAuthCooldown(ctx, auth); err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to update auth %s: %v", auth.ID, err)})
+				return
+			}
+			updated++
 		}
-		if err := h.updateClearedAuthCooldown(ctx, auth); err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to update auth %s: %v", auth.ID, err)})
-			return
-		}
-		updated++
 	}
 
-	c.JSON(http.StatusOK, gin.H{"status": "ok", "total": len(auths), "updated": updated})
+	c.JSON(http.StatusOK, gin.H{"status": "ok", "total": len(authIDs), "updated": updated})
 }
 
 // ClearSelectedAuthCooldowns clears transient cooldown state for selected auths or auth model states.
@@ -249,13 +246,8 @@ func (h *Handler) findAuthForCooldown(ref string) *coreauth.Auth {
 	if auth := h.findManagedAuth(ref); auth != nil {
 		return auth
 	}
-	auths := h.authManager.List()
-	for _, auth := range auths {
-		if auth != nil && auth.Index == ref {
-			return auth
-		}
-	}
-	return nil
+	auth, _ := h.authManager.GetByAuthIndex(ref)
+	return auth
 }
 
 func normalizeCooldownModels(models []string) []string {

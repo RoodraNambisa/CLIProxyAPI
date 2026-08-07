@@ -29,7 +29,7 @@ func (h *Handler) authFileRuntimeSummariesForManager(authManager *coreauth.Manag
 	if authManager == nil {
 		return h.authFileRuntimeSummariesForAuths(nil, nil)
 	}
-	return h.authFileRuntimeSummariesForAuths(authManager, authManager.List())
+	return h.authFileRuntimeSummariesForAuths(authManager, authManager.AuthsForProviders(chatgptwebauth.Provider))
 }
 
 // authFileRuntimeSummariesForAuths collects account-info state only for the supplied

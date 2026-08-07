@@ -2699,7 +2699,7 @@ func (h *Handler) findManagedAuthWithManager(name string, manager *coreauth.Mana
 	if exactAuth != nil {
 		return exactAuth
 	}
-	auths := manager.List()
+	auths := manager.AuthsForManagedFileName(name)
 	for _, auth := range auths {
 		if auth != nil && isRuntimeOnlyAuth(auth) && managedAuthNameEqual(strings.TrimSpace(auth.FileName), name) {
 			return auth
@@ -2715,6 +2715,9 @@ func (h *Handler) findManagedAuthWithManager(name string, manager *coreauth.Mana
 	}
 	if auth, ok := manager.GetByID(lookupID); ok {
 		return auth
+	}
+	if !managedAuthNameEqual(normalizedName, name) {
+		auths = append(auths, manager.AuthsForManagedFileName(normalizedName)...)
 	}
 	for _, auth := range auths {
 		if auth == nil {

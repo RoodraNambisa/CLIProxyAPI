@@ -32,11 +32,20 @@ type saveOutcomePersistedSnapshotStore struct {
 	saveErr error
 }
 
+type listErrorPersistedSnapshotStore struct {
+	*chatGPTWebDependencyTestStore
+	listErr error
+}
+
 func (store *saveOutcomePersistedSnapshotStore) Save(ctx context.Context, auth *Auth) (string, error) {
 	if store.saveErr != nil {
 		return "", store.saveErr
 	}
 	return store.chatGPTWebDependencyTestStore.Save(ctx, auth)
+}
+
+func (store *listErrorPersistedSnapshotStore) List(context.Context) ([]*Auth, error) {
+	return nil, store.listErr
 }
 
 func (store *blockingPersistedSnapshotStore) List(ctx context.Context) ([]*Auth, error) {
@@ -115,6 +124,136 @@ func TestManagerAuthsForProvidersTracksReplacementAndDelete(t *testing.T) {
 		t.Fatal(errDelete)
 	}
 	assertAuthIDs(t, manager.AuthsForProviders("chatgpt-web"))
+	assertManagerAuthIndexesConsistent(t, manager)
+}
+
+func TestManagerDirectLookupIndexesTrackReplacementAndDelete(t *testing.T) {
+	manager := NewManager(nil, nil, nil)
+	for _, auth := range []*Auth{
+		{ID: "auth-b", Index: "shared-index", Provider: "codex", FileName: "nested/auth-b.json", Status: StatusActive},
+		{ID: "auth-a", Index: "shared-index", Provider: "chatgpt-web", FileName: "auth-a.json", Status: StatusActive},
+	} {
+		auth.indexAssigned = true
+		if _, errRegister := manager.Register(WithSkipPersist(t.Context()), auth); errRegister != nil {
+			t.Fatal(errRegister)
+		}
+	}
+
+	indexed, ok := manager.GetByAuthIndex("shared-index")
+	if !ok || indexed.ID != "auth-a" {
+		t.Fatalf("GetByAuthIndex() = %#v, %v", indexed, ok)
+	}
+	assertAuthIDs(t, manager.AuthsForManagedFileName("auth-b.json"), "auth-b")
+	byIDs := manager.GetByIDs([]string{"auth-b", "missing", "auth-a"})
+	if len(byIDs) != 2 || byIDs[0].ID != "auth-b" || byIDs[1].ID != "auth-a" {
+		t.Fatalf("GetByIDs() = %#v", byIDs)
+	}
+	if ids := manager.AuthIDsForProviders("CODEX"); !slices.Equal(ids, []string{"auth-b"}) {
+		t.Fatalf("AuthIDsForProviders() = %v", ids)
+	}
+
+	replacement, _ := manager.GetByID("auth-a")
+	replacement.Index = "replacement-index"
+	replacement.FileName = "replacement.json"
+	if _, errUpdate := manager.Update(WithSkipPersist(t.Context()), replacement); errUpdate != nil {
+		t.Fatal(errUpdate)
+	}
+	indexed, ok = manager.GetByAuthIndex("shared-index")
+	if !ok || indexed.ID != "auth-b" {
+		t.Fatalf("shared index after replacement = %#v, %v", indexed, ok)
+	}
+	if _, ok = manager.GetByAuthIndex("replacement-index"); !ok {
+		t.Fatal("replacement index was not installed")
+	}
+	assertAuthIDs(t, manager.AuthsForManagedFileName("auth-a.json"))
+	assertAuthIDs(t, manager.AuthsForManagedFileName("replacement.json"), "auth-a")
+
+	if errDelete := manager.Delete(WithSkipPersist(t.Context()), "auth-b"); errDelete != nil {
+		t.Fatal(errDelete)
+	}
+	if _, ok = manager.GetByAuthIndex("shared-index"); ok {
+		t.Fatal("deleted auth remained in reverse auth-index lookup")
+	}
+	assertAuthIDs(t, manager.AuthsForManagedFileName("auth-b.json"))
+	assertManagerAuthIndexesConsistent(t, manager)
+}
+
+func TestManagerLoadDoesNotHoldMainLockDuringStoreList(t *testing.T) {
+	store := &blockingPersistedSnapshotStore{
+		chatGPTWebDependencyTestStore: newChatGPTWebDependencyTestStore(
+			&Auth{ID: "loaded-auth", Provider: "codex", Status: StatusActive},
+		),
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	manager := NewManager(store, nil, nil)
+	if _, errRegister := manager.Register(WithSkipPersist(t.Context()), &Auth{ID: "existing-auth", Provider: "codex", Status: StatusActive}); errRegister != nil {
+		t.Fatal(errRegister)
+	}
+
+	loadDone := make(chan error, 1)
+	go func() { loadDone <- manager.Load(t.Context()) }()
+	select {
+	case <-store.started:
+	case <-time.After(time.Second):
+		t.Fatal("Load() did not start Store.List")
+	}
+
+	readDone := make(chan error, 1)
+	go func() {
+		if manager.Count() != 1 {
+			readDone <- errors.New("unexpected auth count while load was blocked")
+			return
+		}
+		if auth, ok := manager.GetByID("existing-auth"); !ok || auth == nil {
+			readDone <- errors.New("existing auth unavailable while load was blocked")
+			return
+		}
+		readDone <- nil
+	}()
+	select {
+	case errRead := <-readDone:
+		if errRead != nil {
+			t.Fatal(errRead)
+		}
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("Manager read blocked behind Store.List")
+	}
+
+	close(store.release)
+	if errLoad := <-loadDone; errLoad != nil {
+		t.Fatal(errLoad)
+	}
+	if _, ok := manager.GetByID("loaded-auth"); !ok {
+		t.Fatal("loaded auth was not installed")
+	}
+	if _, ok := manager.GetByID("existing-auth"); ok {
+		t.Fatal("stale runtime auth remained after load")
+	}
+}
+
+func TestManagerLoadFailurePreservesCurrentState(t *testing.T) {
+	store := &listErrorPersistedSnapshotStore{
+		chatGPTWebDependencyTestStore: newChatGPTWebDependencyTestStore(),
+		listErr:                       errors.New("list failed"),
+	}
+	manager := NewManager(store, nil, nil)
+	existing := &Auth{ID: "existing-auth", Index: "existing-index", Provider: "codex", FileName: "existing.json", Status: StatusActive}
+	existing.indexAssigned = true
+	if _, errRegister := manager.Register(WithSkipPersist(t.Context()), existing); errRegister != nil {
+		t.Fatal(errRegister)
+	}
+
+	if errLoad := manager.Load(t.Context()); !errors.Is(errLoad, store.listErr) {
+		t.Fatalf("Load() error = %v, want %v", errLoad, store.listErr)
+	}
+	if auth, ok := manager.GetByID(existing.ID); !ok || auth == nil || auth.Index != existing.Index {
+		t.Fatalf("current auth changed after failed load: %#v, %v", auth, ok)
+	}
+	if indexed, ok := manager.GetByAuthIndex(existing.Index); !ok || indexed.ID != existing.ID {
+		t.Fatalf("auth index changed after failed load: %#v, %v", indexed, ok)
+	}
+	assertAuthIDs(t, manager.AuthsForManagedFileName(existing.FileName), existing.ID)
 	assertManagerAuthIndexesConsistent(t, manager)
 }
 
@@ -772,12 +911,22 @@ func assertManagerAuthIndexesConsistent(t *testing.T, manager *Manager) {
 	expectedProviders := make(map[string]map[string]struct{})
 	expectedProviderByID := make(map[string]string)
 	expectedAuthIndexes := make(map[string]string)
+	expectedIDsByIndex := make(map[string]map[string]struct{})
+	expectedManagedFiles := make(map[string]map[string]struct{})
+	expectedManagedKeysByID := make(map[string][]string)
 	expectedPlanTypes := make(map[string]string)
 	expectedDependencies := make(map[string]*Auth)
 	expectedIdentityKeys := make(map[string][]string)
 	for id, auth := range manager.auths {
 		if index := strings.TrimSpace(auth.Index); index != "" {
 			expectedAuthIndexes[id] = index
+			addIDToDependencySet(expectedIDsByIndex, index, id)
+		}
+		if keys := authManagedFileIndexKeys(auth); len(keys) > 0 {
+			expectedManagedKeysByID[id] = keys
+			for _, key := range keys {
+				addIDToDependencySet(expectedManagedFiles, key, id)
+			}
 		}
 		if planType := strings.TrimSpace(internalcodex.EffectivePlanType(auth.Metadata)); planType != "" {
 			expectedPlanTypes[id] = planType
@@ -815,6 +964,12 @@ func assertManagerAuthIndexesConsistent(t *testing.T, manager *Manager) {
 	}
 	if !reflect.DeepEqual(manager.authIndexesByID, expectedAuthIndexes) {
 		t.Fatalf("auth index map is inconsistent: got=%v want=%v", manager.authIndexesByID, expectedAuthIndexes)
+	}
+	if !reflect.DeepEqual(manager.authIDsByIndex, expectedIDsByIndex) {
+		t.Fatalf("reverse auth index is inconsistent: got=%v want=%v", manager.authIDsByIndex, expectedIDsByIndex)
+	}
+	if !reflect.DeepEqual(manager.managedFileAuthIDs, expectedManagedFiles) || !reflect.DeepEqual(manager.managedFileKeysByAuthID, expectedManagedKeysByID) {
+		t.Fatalf("managed filename index is inconsistent: files=%v keys=%v", manager.managedFileAuthIDs, manager.managedFileKeysByAuthID)
 	}
 	if !reflect.DeepEqual(manager.authPlanTypesByID, expectedPlanTypes) {
 		t.Fatalf("auth plan type map is inconsistent: got=%v want=%v", manager.authPlanTypesByID, expectedPlanTypes)

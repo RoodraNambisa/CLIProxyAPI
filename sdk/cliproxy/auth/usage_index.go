@@ -49,10 +49,7 @@ func (m *Manager) UsageAuthInfoByIndex(authIndex string) (UsageAuthInfo, bool) {
 	m.mu.RLock()
 	var result UsageAuthInfo
 	found := false
-	for id, indexed := range m.authIndexesByID {
-		if indexed != authIndex {
-			continue
-		}
+	for id := range m.authIDsByIndex[authIndex] {
 		if auth := m.auths[id]; auth != nil && (!found || id < result.ID) {
 			result = usageAuthInfoLocked(auth, authIndex)
 			found = true

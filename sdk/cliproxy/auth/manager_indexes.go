@@ -31,6 +31,51 @@ func authBackingPathKey(auth *Auth, cfg *internalconfig.Config) string {
 	return authfileguard.PathIdentity(path)
 }
 
+func authManagedFileIndexKeys(auth *Auth) []string {
+	if auth == nil {
+		return nil
+	}
+	values := []string{auth.FileName, auth.ID}
+	if auth.Attributes != nil {
+		values = append(values, auth.Attributes["path"])
+	}
+	keys := make(map[string]struct{}, len(values)*2)
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		cleaned := filepath.ToSlash(filepath.Clean(value))
+		cleaned = strings.TrimPrefix(cleaned, "./")
+		if cleaned == "" || cleaned == "." {
+			continue
+		}
+		keys[strings.ToLower(cleaned)] = struct{}{}
+		if base := filepath.Base(cleaned); base != "" && base != "." {
+			keys[strings.ToLower(filepath.ToSlash(base))] = struct{}{}
+		}
+	}
+	ordered := make([]string, 0, len(keys))
+	for key := range keys {
+		ordered = append(ordered, key)
+	}
+	sort.Strings(ordered)
+	return ordered
+}
+
+func managedFileLookupKey(name string) string {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return ""
+	}
+	cleaned := filepath.ToSlash(filepath.Clean(name))
+	cleaned = strings.TrimPrefix(cleaned, "./")
+	if cleaned == "" || cleaned == "." {
+		return ""
+	}
+	return strings.ToLower(cleaned)
+}
+
 func authRelevantToChatGPTWebDependencyIndex(auth *Auth) bool {
 	if auth == nil {
 		return false
@@ -225,7 +270,14 @@ func (m *Manager) removeAuthIndexesLocked(id string) {
 		}
 		delete(m.providerByAuthID, id)
 	}
+	if index := m.authIndexesByID[id]; index != "" {
+		removeIDFromDependencySet(m.authIDsByIndex, index, id)
+	}
 	delete(m.authIndexesByID, id)
+	for _, key := range m.managedFileKeysByAuthID[id] {
+		removeIDFromDependencySet(m.managedFileAuthIDs, key, id)
+	}
+	delete(m.managedFileKeysByAuthID, id)
 	delete(m.authPlanTypesByID, id)
 	m.removeDependencyAuthIndexLocked(id)
 	m.removeChatGPTWebIdentityIndexLocked(id)
@@ -238,6 +290,13 @@ func (m *Manager) addAuthIndexesLocked(auth *Auth, cfg *internalconfig.Config) {
 	id := strings.TrimSpace(auth.ID)
 	if index := strings.TrimSpace(auth.Index); index != "" {
 		m.authIndexesByID[id] = index
+		addIDToDependencySet(m.authIDsByIndex, index, id)
+	}
+	if keys := authManagedFileIndexKeys(auth); len(keys) > 0 {
+		m.managedFileKeysByAuthID[id] = keys
+		for _, key := range keys {
+			addIDToDependencySet(m.managedFileAuthIDs, key, id)
+		}
 	}
 	if planType := strings.TrimSpace(internalcodex.EffectivePlanType(auth.Metadata)); planType != "" {
 		m.authPlanTypesByID[id] = planType
@@ -354,52 +413,129 @@ func (m *Manager) rebuildBackingPathIndexLocked(cfg *internalconfig.Config) {
 	m.authIndexRevision++
 }
 
-// rebuildAuthIndexesLocked rebuilds the runtime path index and the dependency
-// view. Persisted records are installed first so runtime records win by ID.
-// The caller must hold m.mu for writing.
-func (m *Manager) rebuildAuthIndexesLocked(persisted []*Auth, complete bool) {
-	m.backingPathAuthIDs = make(map[string]map[string]struct{})
-	m.backingPathByAuthID = make(map[string]string)
-	m.providerAuthIDs = make(map[string]map[string]struct{})
-	m.providerByAuthID = make(map[string]string)
-	m.authIndexesByID = make(map[string]string)
-	m.authPlanTypesByID = make(map[string]string)
-	m.dependencyAuthsByID = make(map[string]*Auth)
-	m.dependencySourceIDs = make(map[string]map[string]struct{})
-	m.dependencyDependentIDs = make(map[string]map[string]struct{})
-	m.chatGPTWebIdentityIDs = make(map[string]map[string]struct{})
-	m.chatGPTWebIdentityKeysByID = make(map[string][]string)
-	m.persistedAuthsByID = make(map[string]*Auth, len(persisted))
-	m.persistedAuthRevision++
+type managerAuthIndexState struct {
+	backingPathAuthIDs         map[string]map[string]struct{}
+	backingPathByAuthID        map[string]string
+	backingPathAuthDir         string
+	providerAuthIDs            map[string]map[string]struct{}
+	providerByAuthID           map[string]string
+	authIndexesByID            map[string]string
+	authIDsByIndex             map[string]map[string]struct{}
+	managedFileAuthIDs         map[string]map[string]struct{}
+	managedFileKeysByAuthID    map[string][]string
+	authPlanTypesByID          map[string]string
+	dependencyAuthsByID        map[string]*Auth
+	dependencySourceIDs        map[string]map[string]struct{}
+	dependencyDependentIDs     map[string]map[string]struct{}
+	dependencyIndexComplete    bool
+	chatGPTWebIdentityIDs      map[string]map[string]struct{}
+	chatGPTWebIdentityKeysByID map[string][]string
+	persistedAuthsByID         map[string]*Auth
+	chatGPTWebIdentityComplete bool
+}
+
+func newManagerAuthIndexBuilder(auths map[string]*Auth) *Manager {
+	return &Manager{
+		auths:                      auths,
+		backingPathAuthIDs:         make(map[string]map[string]struct{}),
+		backingPathByAuthID:        make(map[string]string),
+		providerAuthIDs:            make(map[string]map[string]struct{}),
+		providerByAuthID:           make(map[string]string),
+		authIndexesByID:            make(map[string]string),
+		authIDsByIndex:             make(map[string]map[string]struct{}),
+		managedFileAuthIDs:         make(map[string]map[string]struct{}),
+		managedFileKeysByAuthID:    make(map[string][]string),
+		authPlanTypesByID:          make(map[string]string),
+		dependencyAuthsByID:        make(map[string]*Auth),
+		dependencySourceIDs:        make(map[string]map[string]struct{}),
+		dependencyDependentIDs:     make(map[string]map[string]struct{}),
+		chatGPTWebIdentityIDs:      make(map[string]map[string]struct{}),
+		chatGPTWebIdentityKeysByID: make(map[string][]string),
+		persistedAuthsByID:         make(map[string]*Auth),
+	}
+}
+
+func buildManagerAuthIndexState(auths map[string]*Auth, persisted []*Auth, complete bool, cfg *internalconfig.Config) managerAuthIndexState {
+	if auths == nil {
+		auths = make(map[string]*Auth)
+	}
+	builder := newManagerAuthIndexBuilder(auths)
 	for _, auth := range persisted {
 		if auth == nil || strings.TrimSpace(auth.ID) == "" {
 			continue
 		}
-		m.persistedAuthsByID[strings.TrimSpace(auth.ID)] = auth.Clone()
+		builder.persistedAuthsByID[strings.TrimSpace(auth.ID)] = auth.Clone()
 		if authRelevantToChatGPTWebDependencyIndex(auth) {
-			m.addDependencyAuthIndexLocked(auth)
+			builder.addDependencyAuthIndexLocked(auth)
 		}
 		if strings.EqualFold(strings.TrimSpace(auth.Provider), chatgptwebauth.Provider) {
-			m.addChatGPTWebIdentityIndexLocked(auth)
+			builder.addChatGPTWebIdentityIndexLocked(auth)
 		}
 	}
-	cfg := m.currentConfig()
-	m.backingPathAuthDir = ""
 	if cfg != nil {
-		m.backingPathAuthDir = strings.TrimSpace(cfg.AuthDir)
+		builder.backingPathAuthDir = strings.TrimSpace(cfg.AuthDir)
 	}
-	for _, auth := range m.auths {
+	for _, auth := range auths {
 		if auth == nil || strings.TrimSpace(auth.ID) == "" {
 			continue
 		}
-		m.addAuthIndexesLocked(auth, cfg)
+		builder.addAuthIndexesLocked(auth, cfg)
 		if !authRelevantToChatGPTWebDependencyIndex(auth) {
-			m.removeDependencyAuthIndexLocked(auth.ID)
+			builder.removeDependencyAuthIndexLocked(auth.ID)
 		}
 	}
-	m.dependencyIndexComplete = complete
-	m.chatGPTWebIdentityComplete = complete
+	return managerAuthIndexState{
+		backingPathAuthIDs:         builder.backingPathAuthIDs,
+		backingPathByAuthID:        builder.backingPathByAuthID,
+		backingPathAuthDir:         builder.backingPathAuthDir,
+		providerAuthIDs:            builder.providerAuthIDs,
+		providerByAuthID:           builder.providerByAuthID,
+		authIndexesByID:            builder.authIndexesByID,
+		authIDsByIndex:             builder.authIDsByIndex,
+		managedFileAuthIDs:         builder.managedFileAuthIDs,
+		managedFileKeysByAuthID:    builder.managedFileKeysByAuthID,
+		authPlanTypesByID:          builder.authPlanTypesByID,
+		dependencyAuthsByID:        builder.dependencyAuthsByID,
+		dependencySourceIDs:        builder.dependencySourceIDs,
+		dependencyDependentIDs:     builder.dependencyDependentIDs,
+		dependencyIndexComplete:    complete,
+		chatGPTWebIdentityIDs:      builder.chatGPTWebIdentityIDs,
+		chatGPTWebIdentityKeysByID: builder.chatGPTWebIdentityKeysByID,
+		persistedAuthsByID:         builder.persistedAuthsByID,
+		chatGPTWebIdentityComplete: complete,
+	}
+}
+
+func (m *Manager) applyManagerAuthIndexStateLocked(state managerAuthIndexState) {
+	m.backingPathAuthIDs = state.backingPathAuthIDs
+	m.backingPathByAuthID = state.backingPathByAuthID
+	m.backingPathAuthDir = state.backingPathAuthDir
+	m.providerAuthIDs = state.providerAuthIDs
+	m.providerByAuthID = state.providerByAuthID
+	m.authIndexesByID = state.authIndexesByID
+	m.authIDsByIndex = state.authIDsByIndex
+	m.managedFileAuthIDs = state.managedFileAuthIDs
+	m.managedFileKeysByAuthID = state.managedFileKeysByAuthID
+	m.authPlanTypesByID = state.authPlanTypesByID
+	m.dependencyAuthsByID = state.dependencyAuthsByID
+	m.dependencySourceIDs = state.dependencySourceIDs
+	m.dependencyDependentIDs = state.dependencyDependentIDs
+	m.dependencyIndexComplete = state.dependencyIndexComplete
+	m.chatGPTWebIdentityIDs = state.chatGPTWebIdentityIDs
+	m.chatGPTWebIdentityKeysByID = state.chatGPTWebIdentityKeysByID
+	m.persistedAuthsByID = state.persistedAuthsByID
+	m.chatGPTWebIdentityComplete = state.chatGPTWebIdentityComplete
+	m.persistedAuthRevision++
 	m.authIndexRevision++
+}
+
+// rebuildAuthIndexesLocked rebuilds the runtime path index and the dependency
+// view. Persisted records are installed first so runtime records win by ID.
+// The caller must hold m.mu for writing.
+func (m *Manager) rebuildAuthIndexesLocked(persisted []*Auth, complete bool) {
+	cfg := m.currentConfig()
+	state := buildManagerAuthIndexState(m.auths, persisted, complete, cfg)
+	m.applyManagerAuthIndexStateLocked(state)
 }
 
 func (m *Manager) replaceAuthsLocked(auths map[string]*Auth, persisted []*Auth, complete bool) {
@@ -681,6 +817,138 @@ func (m *Manager) AuthsForProviders(providers ...string) []*Auth {
 	sort.Strings(ids)
 	auths := make([]*Auth, 0, len(ids))
 	for _, id := range ids {
+		if auth := m.auths[id]; auth != nil {
+			auths = append(auths, auth.Clone())
+		}
+	}
+	m.mu.RUnlock()
+	return auths
+}
+
+// AuthIDsForProviders returns stable runtime IDs without cloning credentials.
+func (m *Manager) AuthIDsForProviders(providers ...string) []string {
+	if m == nil {
+		return nil
+	}
+	m.mu.RLock()
+	uniqueIDs := make(map[string]struct{})
+	for _, provider := range providers {
+		providerKey := strings.ToLower(strings.TrimSpace(provider))
+		for id := range m.providerAuthIDs[providerKey] {
+			uniqueIDs[id] = struct{}{}
+		}
+	}
+	ids := make([]string, 0, len(uniqueIDs))
+	for id := range uniqueIDs {
+		ids = append(ids, id)
+	}
+	m.mu.RUnlock()
+	sort.Strings(ids)
+	return ids
+}
+
+// AuthIDs returns all runtime IDs in stable order without cloning credentials.
+func (m *Manager) AuthIDs() []string {
+	if m == nil {
+		return nil
+	}
+	m.mu.RLock()
+	ids := make([]string, 0, len(m.auths))
+	for id := range m.auths {
+		ids = append(ids, id)
+	}
+	m.mu.RUnlock()
+	sort.Strings(ids)
+	return ids
+}
+
+// GetByIDs clones only the requested runtime credentials in request order.
+func (m *Manager) GetByIDs(ids []string) []*Auth {
+	if m == nil || len(ids) == 0 {
+		return nil
+	}
+	m.mu.RLock()
+	auths := make([]*Auth, 0, len(ids))
+	for _, id := range ids {
+		if auth := m.auths[strings.TrimSpace(id)]; auth != nil {
+			auths = append(auths, auth.Clone())
+		}
+	}
+	m.mu.RUnlock()
+	return auths
+}
+
+// GetByAuthIndex returns the first stable runtime credential for an auth index.
+func (m *Manager) GetByAuthIndex(index string) (*Auth, bool) {
+	if m == nil || strings.TrimSpace(index) == "" {
+		return nil, false
+	}
+	index = strings.TrimSpace(index)
+	m.mu.RLock()
+	ids := m.authIDsByIndex[index]
+	ordered := make([]string, 0, len(ids))
+	for id := range ids {
+		ordered = append(ordered, id)
+	}
+	sort.Strings(ordered)
+	var auth *Auth
+	for _, id := range ordered {
+		if current := m.auths[id]; current != nil {
+			auth = current.Clone()
+			break
+		}
+	}
+	m.mu.RUnlock()
+	return auth, auth != nil
+}
+
+// GetByAuthIndexes resolves the first stable runtime credential for each index.
+func (m *Manager) GetByAuthIndexes(indexes []string) map[string]*Auth {
+	result := make(map[string]*Auth, len(indexes))
+	if m == nil || len(indexes) == 0 {
+		return result
+	}
+	m.mu.RLock()
+	for _, rawIndex := range indexes {
+		index := strings.TrimSpace(rawIndex)
+		if index == "" || result[index] != nil {
+			continue
+		}
+		ids := m.authIDsByIndex[index]
+		ordered := make([]string, 0, len(ids))
+		for id := range ids {
+			ordered = append(ordered, id)
+		}
+		sort.Strings(ordered)
+		for _, id := range ordered {
+			if auth := m.auths[id]; auth != nil {
+				result[index] = auth.Clone()
+				break
+			}
+		}
+	}
+	m.mu.RUnlock()
+	return result
+}
+
+// AuthsForManagedFileName returns indexed filename candidates in stable ID order.
+func (m *Manager) AuthsForManagedFileName(name string) []*Auth {
+	if m == nil {
+		return nil
+	}
+	key := managedFileLookupKey(name)
+	if key == "" {
+		return nil
+	}
+	m.mu.RLock()
+	ids := m.managedFileAuthIDs[key]
+	ordered := make([]string, 0, len(ids))
+	for id := range ids {
+		ordered = append(ordered, id)
+	}
+	sort.Strings(ordered)
+	auths := make([]*Auth, 0, len(ordered))
+	for _, id := range ordered {
 		if auth := m.auths[id]; auth != nil {
 			auths = append(auths, auth.Clone())
 		}

@@ -382,6 +382,7 @@ type Manager struct {
 	executors map[string]ProviderExecutor
 	selector  Selector
 	hookValue atomic.Value
+	loadMu    sync.Mutex
 	mu        sync.RWMutex
 	auths     map[string]*Auth
 	// backingPathAuthIDs indexes runtime auths by their normalized backing path.
@@ -393,6 +394,9 @@ type Manager struct {
 	providerAuthIDs            map[string]map[string]struct{}
 	providerByAuthID           map[string]string
 	authIndexesByID            map[string]string
+	authIDsByIndex             map[string]map[string]struct{}
+	managedFileAuthIDs         map[string]map[string]struct{}
+	managedFileKeysByAuthID    map[string][]string
 	authPlanTypesByID          map[string]string
 	dependencyAuthsByID        map[string]*Auth
 	dependencySourceIDs        map[string]map[string]struct{}
@@ -660,6 +664,9 @@ func NewManager(store Store, selector Selector, hook Hook) *Manager {
 		providerAuthIDs:             make(map[string]map[string]struct{}),
 		providerByAuthID:            make(map[string]string),
 		authIndexesByID:             make(map[string]string),
+		authIDsByIndex:              make(map[string]map[string]struct{}),
+		managedFileAuthIDs:          make(map[string]map[string]struct{}),
+		managedFileKeysByAuthID:     make(map[string][]string),
 		authPlanTypesByID:           make(map[string]string),
 		dependencyAuthsByID:         make(map[string]*Auth),
 		dependencySourceIDs:         make(map[string]map[string]struct{}),
@@ -2302,12 +2309,16 @@ func (m *Manager) rebuildAPIKeyModelAliasLocked(cfg *internalconfig.Config) {
 	if m == nil {
 		return
 	}
+	m.apiKeyModelAlias.Store(buildAPIKeyModelAliasTable(m.auths, cfg))
+}
+
+func buildAPIKeyModelAliasTable(auths map[string]*Auth, cfg *internalconfig.Config) apiKeyModelAliasTable {
 	if cfg == nil {
 		cfg = &internalconfig.Config{}
 	}
 
 	out := make(apiKeyModelAliasTable)
-	for _, auth := range m.auths {
+	for _, auth := range auths {
 		if auth == nil {
 			continue
 		}
@@ -2362,7 +2373,7 @@ func (m *Manager) rebuildAPIKeyModelAliasLocked(cfg *internalconfig.Config) {
 		}
 	}
 
-	m.apiKeyModelAlias.Store(out)
+	return out
 }
 
 func (m *Manager) removeAPIKeyModelAliasForAuthLocked(auth *Auth) {
@@ -3367,6 +3378,79 @@ func authRuntimeInstanceEquivalent(existing *Auth, next *Auth) bool {
 		reflect.DeepEqual(existing.Metadata, next.Metadata)
 }
 
+type loadAuthInstanceSummary struct {
+	id            string
+	provider      string
+	prefix        string
+	label         string
+	fileName      string
+	proxyURL      string
+	disabled      bool
+	status        Status
+	sourceHash    string
+	hashless      bool
+	attributes    map[string]string
+	metadata      map[string]any
+	instanceID    string
+	instanceState *authInstanceState
+}
+
+func snapshotLoadAuthInstance(auth *Auth) loadAuthInstanceSummary {
+	if auth == nil {
+		return loadAuthInstanceSummary{}
+	}
+	summary := loadAuthInstanceSummary{
+		id:            auth.ID,
+		provider:      auth.Provider,
+		prefix:        auth.Prefix,
+		label:         auth.Label,
+		fileName:      auth.FileName,
+		proxyURL:      auth.ProxyURL,
+		disabled:      auth.Disabled,
+		status:        auth.Status,
+		sourceHash:    authSourceHash(auth),
+		hashless:      hashlessConfigAuth(auth),
+		instanceID:    auth.instanceID,
+		instanceState: auth.instanceState,
+	}
+	if summary.hashless {
+		if len(auth.Attributes) > 0 {
+			summary.attributes = make(map[string]string, len(auth.Attributes))
+			for key, value := range auth.Attributes {
+				summary.attributes[key] = value
+			}
+		}
+		if len(auth.Metadata) > 0 {
+			summary.metadata = make(map[string]any, len(auth.Metadata))
+			for key, value := range auth.Metadata {
+				summary.metadata[key] = value
+			}
+		}
+	}
+	return summary
+}
+
+func (s loadAuthInstanceSummary) equivalent(next *Auth) bool {
+	if next == nil || s.id == "" || s.disabled || s.status == StatusDisabled || next.Disabled || next.Status == StatusDisabled {
+		return false
+	}
+	nextHash := authSourceHash(next)
+	if s.sourceHash != "" || nextHash != "" {
+		return s.sourceHash != "" && s.sourceHash == nextHash
+	}
+	if !s.hashless || !hashlessConfigAuth(next) {
+		return false
+	}
+	return s.id == next.ID &&
+		strings.EqualFold(strings.TrimSpace(s.provider), strings.TrimSpace(next.Provider)) &&
+		s.prefix == next.Prefix &&
+		s.label == next.Label &&
+		s.fileName == next.FileName &&
+		s.proxyURL == next.ProxyURL &&
+		reflect.DeepEqual(s.attributes, next.Attributes) &&
+		reflect.DeepEqual(s.metadata, next.Metadata)
+}
+
 func hashlessConfigAuth(auth *Auth) bool {
 	if auth == nil || strings.TrimSpace(auth.FileName) != "" {
 		return false
@@ -3681,6 +3765,11 @@ func (m *Manager) deleteWithOperation(ctx context.Context, id string, operation 
 
 // Load resets manager state from the backing store.
 func (m *Manager) Load(ctx context.Context) error {
+	if m == nil {
+		return nil
+	}
+	m.loadMu.Lock()
+	defer m.loadMu.Unlock()
 	if errLock := m.chatGPTWebDependencyMutation.lock(ctx); errLock != nil {
 		return errLock
 	}
@@ -3695,18 +3784,22 @@ func (m *Manager) Load(ctx context.Context) error {
 		return errBarrier
 	}
 	defer unlockBarrier()
-	m.mu.Lock()
-	if m.store == nil {
-		m.mu.Unlock()
+	m.mu.RLock()
+	store := m.store
+	storeRevision := m.storeRevision
+	previous := make(map[string]loadAuthInstanceSummary, len(m.auths))
+	for id, auth := range m.auths {
+		previous[id] = snapshotLoadAuthInstance(auth)
+	}
+	m.mu.RUnlock()
+	if store == nil {
 		return nil
 	}
-	items, err := m.store.List(ctx)
+	items, err := store.List(ctx)
 	if err != nil {
-		m.mu.Unlock()
 		return err
 	}
 	items = deduplicateLoadedChatGPTWebAuths(items)
-	previous := m.auths
 	loaded := make(map[string]*Auth, len(items))
 	cfg, _ := m.runtimeConfig.Load().(*internalconfig.Config)
 	if cfg == nil {
@@ -3730,7 +3823,7 @@ func (m *Manager) Load(ctx context.Context) error {
 		applyLifecycleRuntimeState(loadedAuth)
 		loadedAuth.installationID = uuid.NewString()
 		loadedAuth.requestRefreshFamilyID = uuid.NewString()
-		if existing := previous[auth.ID]; existing != nil && authRuntimeInstanceEquivalent(existing, loadedAuth) {
+		if existing, ok := previous[auth.ID]; ok && existing.equivalent(loadedAuth) {
 			loadedAuth.instanceID = existing.instanceID
 			loadedAuth.instanceState = existing.instanceState
 		}
@@ -3739,34 +3832,64 @@ func (m *Manager) Load(ctx context.Context) error {
 		}
 		if loadedAuth.instanceState == nil {
 			loadedAuth.instanceState = &authInstanceState{}
-			loadedAuth.bindExecutorOwner(m.executors[executorKeyFromAuth(loadedAuth)])
 		}
 		loaded[auth.ID] = loadedAuth
 	}
-	removed := make(map[string]*Auth)
-	replaced := make(map[string]*Auth)
-	for id, auth := range previous {
-		loadedAuth, ok := loaded[id]
-		if (!ok || loadedAuth == nil) && auth != nil {
-			removed[id] = auth.Clone()
-		} else if auth != nil && loadedAuth.instanceID != auth.instanceID {
-			replaced[id] = auth.Clone()
-		}
-	}
-	for id := range removed {
-		m.beginAuthInstanceCleanupLocked(id)
-	}
-	for id := range replaced {
-		m.beginAuthInstanceCleanupLocked(id)
-	}
-	m.replaceAuthsLocked(loaded, items, true)
-	m.rebuildAPIKeyModelAliasLocked(cfg)
 	schedulerAuths := make([]*Auth, 0, len(loaded))
 	for _, auth := range loaded {
 		schedulerAuths = append(schedulerAuths, auth.Clone())
 	}
+	sort.Slice(schedulerAuths, func(i, j int) bool {
+		return schedulerAuths[i].ID < schedulerAuths[j].ID
+	})
+
+	var (
+		removed  map[string]*Auth
+		replaced map[string]*Auth
+	)
+	for {
+		cfg = m.currentConfig()
+		indexState := buildManagerAuthIndexState(loaded, items, true, cfg)
+		aliasTable := buildAPIKeyModelAliasTable(loaded, cfg)
+
+		m.mu.Lock()
+		if m.storeRevision != storeRevision {
+			m.mu.Unlock()
+			return errors.New("auth store changed during load")
+		}
+		if m.currentConfig() != cfg {
+			m.mu.Unlock()
+			continue
+		}
+		removed = make(map[string]*Auth)
+		replaced = make(map[string]*Auth)
+		for id, auth := range m.auths {
+			loadedAuth, ok := loaded[id]
+			if (!ok || loadedAuth == nil) && auth != nil {
+				removed[id] = auth.Clone()
+			} else if auth != nil && loadedAuth.instanceID != auth.instanceID {
+				replaced[id] = auth.Clone()
+			}
+		}
+		for id := range removed {
+			m.beginAuthInstanceCleanupLocked(id)
+		}
+		for id := range replaced {
+			m.beginAuthInstanceCleanupLocked(id)
+		}
+		for _, loadedAuth := range loaded {
+			if loadedAuth != nil && loadedAuth.instanceState != nil {
+				loadedAuth.bindExecutorOwner(m.executors[executorKeyFromAuth(loadedAuth)])
+			}
+		}
+		m.auths = loaded
+		m.applyManagerAuthIndexStateLocked(indexState)
+		m.apiKeyModelAlias.Store(aliasTable)
+		m.mu.Unlock()
+		break
+	}
+
 	m.syncSchedulerFromSnapshot(schedulerAuths)
-	m.mu.Unlock()
 	for id := range removed {
 		m.cleanupRemovedAuthRuntimeStateAfterQuarantine(id)
 	}

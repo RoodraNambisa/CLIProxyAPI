@@ -393,13 +393,27 @@ func (h *Handler) codexPlanTypeRefreshTargets(manager *coreauth.Manager) []*core
 	}
 	filtered := len(authIDSet) > 0 || len(nameSet) > 0
 
-	targets := make([]*coreauth.Auth, 0)
-	for _, auth := range manager.List() {
+	candidates := make([]*coreauth.Auth, 0)
+	if !filtered {
+		candidates = manager.AuthsForProviders("codex")
+	} else {
+		candidates = append(candidates, manager.GetByIDs(targetAuthIDs)...)
+		for _, name := range targetNames {
+			candidates = append(candidates, manager.AuthsForManagedFileName(name)...)
+		}
+	}
+	targets := make([]*coreauth.Auth, 0, len(candidates))
+	seen := make(map[string]struct{}, len(candidates))
+	for _, auth := range candidates {
 		if !isCodexPlanTypeRefreshEligibleAuth(auth) {
+			continue
+		}
+		if _, duplicate := seen[auth.ID]; duplicate {
 			continue
 		}
 		if filtered {
 			if _, ok := authIDSet[strings.TrimSpace(auth.ID)]; ok {
+				seen[auth.ID] = struct{}{}
 				targets = append(targets, auth)
 				continue
 			}
@@ -407,6 +421,7 @@ func (h *Handler) codexPlanTypeRefreshTargets(manager *coreauth.Manager) []*core
 				continue
 			}
 		}
+		seen[auth.ID] = struct{}{}
 		targets = append(targets, auth)
 	}
 	return targets

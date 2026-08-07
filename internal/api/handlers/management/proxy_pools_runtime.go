@@ -211,17 +211,9 @@ func resolveProxyRebindTargets(body rebindProxyBindingsRequest, authManager *cor
 		targets = append(targets, proxyRebindTarget{authID: authID})
 	}
 
-	authIDByIndex := make(map[string]string)
+	authByIndex := make(map[string]*coreauth.Auth)
 	if authManager != nil {
-		for _, auth := range authManager.List() {
-			if auth == nil {
-				continue
-			}
-			index := strings.TrimSpace(auth.EnsureIndex())
-			if index != "" {
-				authIDByIndex[index] = auth.ID
-			}
-		}
+		authByIndex = authManager.GetByAuthIndexes(body.AuthIndexes)
 	}
 	seenMissingIndexes := make(map[string]struct{})
 	for _, rawIndex := range body.AuthIndexes {
@@ -229,7 +221,10 @@ func resolveProxyRebindTargets(body rebindProxyBindingsRequest, authManager *cor
 		if index == "" {
 			continue
 		}
-		authID := strings.TrimSpace(authIDByIndex[index])
+		authID := ""
+		if auth := authByIndex[index]; auth != nil {
+			authID = strings.TrimSpace(auth.ID)
+		}
 		if authID == "" {
 			if _, duplicate := seenMissingIndexes[index]; duplicate {
 				continue
