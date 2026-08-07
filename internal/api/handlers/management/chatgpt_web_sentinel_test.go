@@ -108,6 +108,15 @@ func TestGetChatGPTWebSentinelReturnsRuntimeSnapshot(t *testing.T) {
 		SessionObserverCount:   6,
 		FallbackCount:          7,
 		LastError:              "previous failure",
+		PersonaOutcomes: []chatgptwebauth.PersonaOutcomeSnapshot{{
+			CatalogVersion: "v2",
+			CatalogID:      "c146-mac-m2-1470",
+			TLSProfile:     "chrome_146",
+			UAMajor:        "146",
+			Platform:       "MacIntel",
+			Success200:     8,
+			Cloudflare403:  2,
+		}},
 	}})
 	handler := &Handler{cfg: &config.Config{}, authManager: manager}
 	ctx, recorder := newChatGPTWebSentinelRequest(http.MethodGet, "")
@@ -126,6 +135,9 @@ func TestGetChatGPTWebSentinelReturnsRuntimeSnapshot(t *testing.T) {
 	}
 	if response.SDKVersion != "20260721" || response.SDKSHA256 != "abcdef" || response.SourceCacheEntries != 2 || response.BytecodeCacheEntries != 1 || response.CompatibilityFallbacks != 5 || response.SDKPreferredHits != 2 || response.SessionObserverCount != 6 || response.FallbackCount != 7 || response.LastError != "previous failure" {
 		t.Fatalf("runtime details = %#v", response)
+	}
+	if len(response.PersonaOutcomes) != 1 || response.PersonaOutcomes[0].CatalogID != "c146-mac-m2-1470" || response.PersonaOutcomes[0].Success200 != 8 || response.PersonaOutcomes[0].Cloudflare403 != 2 {
+		t.Fatalf("persona outcomes = %#v", response.PersonaOutcomes)
 	}
 }
 

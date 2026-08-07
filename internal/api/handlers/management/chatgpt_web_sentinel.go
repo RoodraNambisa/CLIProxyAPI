@@ -29,24 +29,25 @@ type chatGPTWebSentinelRequest struct {
 
 type chatGPTWebSentinelResponse struct {
 	config.ResolvedChatGPTWebSentinelConfig
-	Initialized            bool   `json:"initialized"`
-	Available              bool   `json:"available"`
-	WorkerLimit            int    `json:"worker_limit"`
-	Busy                   int    `json:"busy"`
-	Queued                 int    `json:"queued"`
-	SourcePending          int    `json:"source_pending"`
-	SourceWaiters          int    `json:"source_waiters"`
-	BytecodeWaiters        int    `json:"bytecode_waiters"`
-	ObserverSessions       int    `json:"observer_sessions"`
-	SDKVersion             string `json:"sdk_version"`
-	SDKSHA256              string `json:"sdk_sha256"`
-	SourceCacheEntries     int    `json:"source_cache_entries"`
-	BytecodeCacheEntries   int    `json:"bytecode_cache_entries"`
-	CompatibilityFallbacks uint64 `json:"compatibility_fallback_count"`
-	SDKPreferredHits       uint64 `json:"sdk_preferred_hit_count"`
-	SessionObserverCount   uint64 `json:"session_observer_count"`
-	FallbackCount          uint64 `json:"fallback_count"`
-	LastError              string `json:"last_error"`
+	Initialized            bool                                    `json:"initialized"`
+	Available              bool                                    `json:"available"`
+	WorkerLimit            int                                     `json:"worker_limit"`
+	Busy                   int                                     `json:"busy"`
+	Queued                 int                                     `json:"queued"`
+	SourcePending          int                                     `json:"source_pending"`
+	SourceWaiters          int                                     `json:"source_waiters"`
+	BytecodeWaiters        int                                     `json:"bytecode_waiters"`
+	ObserverSessions       int                                     `json:"observer_sessions"`
+	SDKVersion             string                                  `json:"sdk_version"`
+	SDKSHA256              string                                  `json:"sdk_sha256"`
+	SourceCacheEntries     int                                     `json:"source_cache_entries"`
+	BytecodeCacheEntries   int                                     `json:"bytecode_cache_entries"`
+	CompatibilityFallbacks uint64                                  `json:"compatibility_fallback_count"`
+	SDKPreferredHits       uint64                                  `json:"sdk_preferred_hit_count"`
+	SessionObserverCount   uint64                                  `json:"session_observer_count"`
+	FallbackCount          uint64                                  `json:"fallback_count"`
+	LastError              string                                  `json:"last_error"`
+	PersonaOutcomes        []chatgptwebauth.PersonaOutcomeSnapshot `json:"persona_outcomes,omitempty"`
 }
 
 // GetChatGPTWebSentinel returns the effective SDK configuration and current runtime state.
@@ -98,6 +99,7 @@ func (h *Handler) GetChatGPTWebSentinel(c *gin.Context) {
 		SessionObserverCount:             snapshot.SessionObserverCount,
 		FallbackCount:                    snapshot.FallbackCount,
 		LastError:                        snapshot.LastError,
+		PersonaOutcomes:                  snapshot.PersonaOutcomes,
 	})
 }
 

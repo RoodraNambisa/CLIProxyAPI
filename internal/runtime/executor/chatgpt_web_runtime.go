@@ -109,7 +109,11 @@ type chatGPTWebSearchSource struct {
 }
 
 func (e *ChatGPTWebExecutor) executeRuntime(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (resp cliproxyexecutor.Response, err error) {
-	defer func() { logChatGPTWebSafeDiagnostic(ctx, auth, err) }()
+	var outcomePersona chatgptwebauth.Persona
+	defer func() {
+		logChatGPTWebSafeDiagnostic(ctx, auth, err)
+		e.recordPersonaOutcome(auth, outcomePersona, err)
+	}()
 	if selectedAuthInstanceRetired(opts) {
 		return resp, errXAIWebsocketSessionTerminated
 	}
@@ -126,6 +130,7 @@ func (e *ChatGPTWebExecutor) executeRuntime(ctx context.Context, auth *cliproxya
 	if err != nil {
 		return resp, err
 	}
+	outcomePersona = credential.Persona
 	defer e.finishChatGPTWebRuntimeClient(ctx, auth, credential, client)
 
 	if prepared.request.Image != nil {
@@ -154,7 +159,11 @@ func (e *ChatGPTWebExecutor) executeRuntime(ctx context.Context, auth *cliproxya
 }
 
 func (e *ChatGPTWebExecutor) executeRuntimeStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (_ *cliproxyexecutor.StreamResult, err error) {
-	defer func() { logChatGPTWebSafeDiagnostic(ctx, auth, err) }()
+	var outcomePersona chatgptwebauth.Persona
+	defer func() {
+		logChatGPTWebSafeDiagnostic(ctx, auth, err)
+		e.recordPersonaOutcome(auth, outcomePersona, err)
+	}()
 	if selectedAuthInstanceRetired(opts) {
 		return nil, errXAIWebsocketSessionTerminated
 	}
@@ -171,6 +180,7 @@ func (e *ChatGPTWebExecutor) executeRuntimeStream(ctx context.Context, auth *cli
 		prepared.discardUsageProjection()
 		return nil, err
 	}
+	outcomePersona = credential.Persona
 
 	if prepared.request.Image != nil {
 		imageStreamPassthrough := metadataBool(opts.Metadata, cliproxyexecutor.ImageGenerationStreamPassthroughMetadataKey)
@@ -852,6 +862,7 @@ func (e *ChatGPTWebExecutor) newRuntimeClientForAcquisition(auth *cliproxyauth.A
 	if err != nil {
 		return nil, nil, fmt.Errorf("parse chatgpt web credential: %w", err)
 	}
+	chatgptwebauth.ResolveCredentialPersona(credential, auth.ID)
 	if strings.TrimSpace(credential.AccessToken) == "" {
 		return nil, nil, statusErr{code: http.StatusUnauthorized, msg: "chatgpt web access token is empty"}
 	}
@@ -2162,7 +2173,11 @@ func logChatGPTWebSafeDiagnostic(ctx context.Context, auth *cliproxyauth.Auth, e
 	if auth != nil {
 		diagnostic.AuthIndex = auth.EnsureIndex()
 		if credential, errCredential := chatgptwebauth.ParseCredential(auth.Metadata); errCredential == nil && credential != nil {
+			chatgptwebauth.ResolveCredentialPersona(credential, auth.ID)
 			diagnostic.Persona = strings.TrimSpace(credential.Persona.Profile)
+			diagnostic.CatalogVersion = strings.TrimSpace(credential.Persona.CatalogVersion)
+			diagnostic.CatalogID = strings.TrimSpace(credential.Persona.CatalogID)
+			diagnostic.TLSProfile = strings.TrimSpace(credential.Persona.Profile)
 			diagnostic.Platform = strings.TrimSpace(credential.Persona.Platform)
 			diagnostic.UAMajor = chatGPTWebUserAgentMajor(credential.Persona.UserAgent)
 		}

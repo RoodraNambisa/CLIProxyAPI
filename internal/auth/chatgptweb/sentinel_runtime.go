@@ -118,30 +118,44 @@ type SentinelRuntimeConfig struct {
 	CacheVersions int
 }
 
+// PersonaOutcomeSnapshot contains request outcomes for one immutable browser persona.
+type PersonaOutcomeSnapshot struct {
+	CatalogVersion string `json:"catalog_version"`
+	CatalogID      string `json:"catalog_id"`
+	TLSProfile     string `json:"tls_profile"`
+	UAMajor        string `json:"ua_major"`
+	Platform       string `json:"platform"`
+	Success200     uint64 `json:"success_200"`
+	Forbidden403   uint64 `json:"forbidden_403"`
+	Cloudflare403  uint64 `json:"cloudflare_403"`
+	Other          uint64 `json:"other"`
+}
+
 // SentinelRuntimeSnapshot is safe to expose through the management API.
 type SentinelRuntimeSnapshot struct {
-	SDKRuntimeEnabled      bool   `json:"sdk-runtime-enabled"`
-	SDKWorkers             int    `json:"sdk-workers"`
-	SDKQueueSize           int    `json:"sdk-queue-size"`
-	SDKCacheVersions       int    `json:"sdk-cache-versions"`
-	Initialized            bool   `json:"initialized"`
-	Available              bool   `json:"available"`
-	WorkerLimit            int    `json:"worker_limit"`
-	Busy                   int    `json:"busy"`
-	Queued                 int    `json:"queued"`
-	SourcePending          int    `json:"source_pending"`
-	SourceWaiters          int    `json:"source_waiters"`
-	BytecodeWaiters        int    `json:"bytecode_waiters"`
-	ObserverSessions       int    `json:"observer_sessions"`
-	SDKVersion             string `json:"sdk_version,omitempty"`
-	SDKSHA256              string `json:"sdk_sha256,omitempty"`
-	SourceCacheEntries     int    `json:"source_cache_entries"`
-	BytecodeCacheEntries   int    `json:"bytecode_cache_entries"`
-	CompatibilityFallbacks uint64 `json:"compatibility_fallback_count"`
-	SDKPreferredHits       uint64 `json:"sdk_preferred_hit_count"`
-	SessionObserverCount   uint64 `json:"session_observer_count"`
-	FallbackCount          uint64 `json:"fallback_count"`
-	LastError              string `json:"last_error,omitempty"`
+	SDKRuntimeEnabled      bool                     `json:"sdk-runtime-enabled"`
+	SDKWorkers             int                      `json:"sdk-workers"`
+	SDKQueueSize           int                      `json:"sdk-queue-size"`
+	SDKCacheVersions       int                      `json:"sdk-cache-versions"`
+	Initialized            bool                     `json:"initialized"`
+	Available              bool                     `json:"available"`
+	WorkerLimit            int                      `json:"worker_limit"`
+	Busy                   int                      `json:"busy"`
+	Queued                 int                      `json:"queued"`
+	SourcePending          int                      `json:"source_pending"`
+	SourceWaiters          int                      `json:"source_waiters"`
+	BytecodeWaiters        int                      `json:"bytecode_waiters"`
+	ObserverSessions       int                      `json:"observer_sessions"`
+	SDKVersion             string                   `json:"sdk_version,omitempty"`
+	SDKSHA256              string                   `json:"sdk_sha256,omitempty"`
+	SourceCacheEntries     int                      `json:"source_cache_entries"`
+	BytecodeCacheEntries   int                      `json:"bytecode_cache_entries"`
+	CompatibilityFallbacks uint64                   `json:"compatibility_fallback_count"`
+	SDKPreferredHits       uint64                   `json:"sdk_preferred_hit_count"`
+	SessionObserverCount   uint64                   `json:"session_observer_count"`
+	FallbackCount          uint64                   `json:"fallback_count"`
+	LastError              string                   `json:"last_error,omitempty"`
+	PersonaOutcomes        []PersonaOutcomeSnapshot `json:"persona_outcomes,omitempty"`
 }
 
 // SentinelRuntimeError is a local SDK scheduling or availability failure.

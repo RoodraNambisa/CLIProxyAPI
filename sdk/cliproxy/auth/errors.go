@@ -16,20 +16,23 @@ type Error struct {
 
 // ErrorDiagnostic contains bounded troubleshooting metadata for authenticated management views.
 type ErrorDiagnostic struct {
-	Provider      string `json:"provider,omitempty"`
-	AuthIndex     string `json:"auth_index,omitempty"`
-	Stage         string `json:"stage,omitempty"`
-	Code          string `json:"code,omitempty"`
-	ResponseType  string `json:"response_type,omitempty"`
-	ContentType   string `json:"content_type,omitempty"`
-	CFRay         string `json:"cf_ray,omitempty"`
-	TargetHost    string `json:"target_host,omitempty"`
-	TargetPath    string `json:"target_path,omitempty"`
-	Persona       string `json:"persona,omitempty"`
-	UAMajor       string `json:"ua_major,omitempty"`
-	Platform      string `json:"platform,omitempty"`
-	ResponseBytes int64  `json:"response_bytes,omitempty"`
-	ResponseBody  string `json:"response_body,omitempty"`
+	Provider       string `json:"provider,omitempty"`
+	AuthIndex      string `json:"auth_index,omitempty"`
+	Stage          string `json:"stage,omitempty"`
+	Code           string `json:"code,omitempty"`
+	ResponseType   string `json:"response_type,omitempty"`
+	ContentType    string `json:"content_type,omitempty"`
+	CFRay          string `json:"cf_ray,omitempty"`
+	TargetHost     string `json:"target_host,omitempty"`
+	TargetPath     string `json:"target_path,omitempty"`
+	Persona        string `json:"persona,omitempty"`
+	CatalogVersion string `json:"catalog_version,omitempty"`
+	CatalogID      string `json:"catalog_id,omitempty"`
+	TLSProfile     string `json:"tls_profile,omitempty"`
+	UAMajor        string `json:"ua_major,omitempty"`
+	Platform       string `json:"platform,omitempty"`
+	ResponseBytes  int64  `json:"response_bytes,omitempty"`
+	ResponseBody   string `json:"response_body,omitempty"`
 	// ResponseBodyTruncated reports that ResponseBody contains only the bounded prefix.
 	ResponseBodyTruncated bool `json:"response_body_truncated,omitempty"`
 	Attempts              int  `json:"attempts,omitempty"`

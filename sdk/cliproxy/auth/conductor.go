@@ -7831,8 +7831,18 @@ func enrichExecutionErrorDiagnostic(diagnostic *ErrorDiagnostic, auth *Auth) {
 	if errCredential != nil || credential == nil {
 		return
 	}
+	chatgptwebauth.ResolveCredentialPersona(credential, auth.ID)
 	if diagnostic.Persona == "" {
 		diagnostic.Persona = strings.TrimSpace(credential.Persona.Profile)
+	}
+	if diagnostic.CatalogVersion == "" {
+		diagnostic.CatalogVersion = strings.TrimSpace(credential.Persona.CatalogVersion)
+	}
+	if diagnostic.CatalogID == "" {
+		diagnostic.CatalogID = strings.TrimSpace(credential.Persona.CatalogID)
+	}
+	if diagnostic.TLSProfile == "" {
+		diagnostic.TLSProfile = strings.TrimSpace(credential.Persona.Profile)
 	}
 	if diagnostic.Platform == "" {
 		diagnostic.Platform = strings.TrimSpace(credential.Persona.Platform)

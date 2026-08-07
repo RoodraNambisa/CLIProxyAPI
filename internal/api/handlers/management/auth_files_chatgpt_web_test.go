@@ -177,6 +177,9 @@ func TestSafeChatGPTWebErrorDiagnosticKeepsOnlyAllowlistedStructure(t *testing.T
 		TargetHost:            "evil.example.com",
 		TargetPath:            "/backend-api/files?token=secret",
 		Persona:               "chrome_146",
+		CatalogVersion:        "v2",
+		CatalogID:             "c146-mac-m2-1470",
+		TLSProfile:            "chrome_146",
 		UAMajor:               "146",
 		Platform:              "MacIntel",
 		ResponseBytes:         123,
@@ -195,6 +198,9 @@ func TestSafeChatGPTWebErrorDiagnosticKeepsOnlyAllowlistedStructure(t *testing.T
 	}
 	if safe.TargetPath != "/backend-api/files" || safe.Stage != "file_sign" || safe.Code != "cloudflare_challenge" {
 		t.Fatalf("safe diagnostic structure = %#v", safe)
+	}
+	if safe.CatalogVersion != "v2" || safe.CatalogID != "c146-mac-m2-1470" || safe.TLSProfile != "chrome_146" {
+		t.Fatalf("safe diagnostic persona = %#v", safe)
 	}
 	if safe.ResponseBody != source.ResponseBody || !safe.ResponseBodyTruncated {
 		t.Fatalf("safe diagnostic response body = %#v", safe)

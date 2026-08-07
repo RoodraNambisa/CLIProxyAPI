@@ -206,3 +206,13 @@ func resolveCredentialPersona(credential *Credential, fallbackSeed string) {
 	}
 	credential.Persona = personaCatalogEntryForSeed(seed).persona
 }
+
+// ResolveCredentialPersona maps a credential to the current immutable catalog.
+// The fallback seed is used only when the credential has no device or stable UID.
+func ResolveCredentialPersona(credential *Credential, fallbackSeed string) Persona {
+	resolveCredentialPersona(credential, fallbackSeed)
+	if credential == nil {
+		return Persona{}
+	}
+	return credential.Persona
+}

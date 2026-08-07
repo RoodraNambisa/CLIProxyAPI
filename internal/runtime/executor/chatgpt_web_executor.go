@@ -12,6 +12,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -92,6 +93,8 @@ type ChatGPTWebExecutor struct {
 	loginCoordinator          *ChatGPTWebLoginCoordinator
 	loginWG                   sync.WaitGroup
 	sentinelRuntime           helps.ChatGPTWebSentinelRuntime
+	personaOutcomeMu          sync.Mutex
+	personaOutcomes           map[string]chatgptwebauth.PersonaOutcomeSnapshot
 	usageCache                *helps.ChatGPTWebUsageCache
 	accountInfo               *chatGPTWebAccountInfoRuntime
 	sentinelSDKFetcherFactory func(*chatgptwebauth.Client, *chatgptwebauth.Credential) chatgptwebauth.SentinelSDKFetcher
@@ -135,6 +138,7 @@ func NewChatGPTWebExecutorWithLoginCoordinator(cfg *config.Config, manager *clip
 		reloginFlights:     make(map[string]*chatGPTWebReloginFlight),
 		loginCoordinator:   coordinator,
 		sentinelRuntime:    helps.NewChatGPTWebSentinelRuntime(chatGPTWebSentinelRuntimeConfig(cfg)),
+		personaOutcomes:    make(map[string]chatgptwebauth.PersonaOutcomeSnapshot),
 		usageCache:         helps.NewChatGPTWebUsageCache(),
 		backgroundRunning:  make(map[string]struct{}),
 		lifecycleCtx:       lifecycleCtx,
@@ -253,10 +257,99 @@ func chatGPTWebSentinelRuntimeConfig(cfg *config.Config) chatgptwebauth.Sentinel
 
 // SentinelSnapshot returns the currently applied SDK runtime state.
 func (e *ChatGPTWebExecutor) SentinelSnapshot() chatgptwebauth.SentinelRuntimeSnapshot {
-	if e == nil || e.sentinelRuntime == nil {
+	if e == nil {
 		return chatgptwebauth.SentinelRuntimeSnapshot{}
 	}
-	return e.sentinelRuntime.Snapshot()
+	snapshot := chatgptwebauth.SentinelRuntimeSnapshot{}
+	if e.sentinelRuntime != nil {
+		snapshot = e.sentinelRuntime.Snapshot()
+	}
+	e.personaOutcomeMu.Lock()
+	if len(e.personaOutcomes) > 0 {
+		snapshot.PersonaOutcomes = make([]chatgptwebauth.PersonaOutcomeSnapshot, 0, len(e.personaOutcomes))
+		for _, outcome := range e.personaOutcomes {
+			snapshot.PersonaOutcomes = append(snapshot.PersonaOutcomes, outcome)
+		}
+	}
+	e.personaOutcomeMu.Unlock()
+	sort.Slice(snapshot.PersonaOutcomes, func(i, j int) bool {
+		return snapshot.PersonaOutcomes[i].CatalogID < snapshot.PersonaOutcomes[j].CatalogID
+	})
+	return snapshot
+}
+
+func (e *ChatGPTWebExecutor) recordPersonaOutcome(auth *cliproxyauth.Auth, persona chatgptwebauth.Persona, err error) {
+	if e == nil || auth == nil {
+		return
+	}
+	if strings.TrimSpace(persona.CatalogID) == "" {
+		credential, errCredential := chatgptwebauth.ParseCredential(auth.Metadata)
+		if errCredential != nil || credential == nil {
+			return
+		}
+		persona = chatgptwebauth.ResolveCredentialPersona(credential, auth.ID)
+	}
+	if strings.TrimSpace(persona.CatalogID) == "" {
+		return
+	}
+	key := persona.CatalogVersion + "\x00" + persona.CatalogID
+	e.personaOutcomeMu.Lock()
+	if e.personaOutcomes == nil {
+		e.personaOutcomes = make(map[string]chatgptwebauth.PersonaOutcomeSnapshot)
+	}
+	outcome := e.personaOutcomes[key]
+	if outcome.CatalogID == "" {
+		outcome = chatgptwebauth.PersonaOutcomeSnapshot{
+			CatalogVersion: persona.CatalogVersion,
+			CatalogID:      persona.CatalogID,
+			TLSProfile:     persona.Profile,
+			UAMajor:        chatGPTWebUserAgentMajor(persona.UserAgent),
+			Platform:       persona.Platform,
+		}
+	}
+	switch {
+	case err == nil:
+		outcome.Success200++
+	default:
+		status, cloudflare := chatGPTWebPersonaOutcomeError(err)
+		switch {
+		case status == http.StatusForbidden && cloudflare:
+			outcome.Cloudflare403++
+		case status == http.StatusForbidden:
+			outcome.Forbidden403++
+		default:
+			outcome.Other++
+		}
+	}
+	e.personaOutcomes[key] = outcome
+	e.personaOutcomeMu.Unlock()
+}
+
+func chatGPTWebPersonaOutcomeError(err error) (int, bool) {
+	if err == nil {
+		return 0, false
+	}
+	type diagnosticProvider interface {
+		AuthErrorDiagnostic() *cliproxyauth.ErrorDiagnostic
+	}
+	var provider diagnosticProvider
+	cloudflare := false
+	if errors.As(err, &provider) && provider != nil {
+		if diagnostic := provider.AuthErrorDiagnostic(); diagnostic != nil {
+			cloudflare = diagnostic.Cloudflare
+			if diagnostic.HTTPStatus != 0 {
+				return diagnostic.HTTPStatus, cloudflare
+			}
+		}
+	}
+	type statusCoder interface {
+		StatusCode() int
+	}
+	var status statusCoder
+	if errors.As(err, &status) && status != nil {
+		return status.StatusCode(), cloudflare
+	}
+	return 0, cloudflare
 }
 
 // UsageCacheSnapshot returns active storage and cumulative accounting outcomes.
@@ -1381,6 +1474,7 @@ func (e *ChatGPTWebExecutor) refreshCredential(ctx context.Context, auth *clipro
 		setChatGPTWebLifecycle(updated, cliproxyauth.LifecycleStateReauthRequired, "credential_invalid", e.currentTime())
 		return updated, fmt.Errorf("parse chatgpt web credential: %w", errCredential), true
 	}
+	chatgptwebauth.ResolveCredentialPersona(credential, auth.ID)
 	if errIdentity := chatgptwebauth.EnsureCredentialRuntimeIDsForURL(credential, chatgptwebauth.CredentialRuntimeIdentityReader(auth.ID, credential), e.chatGPTWebBaseURL()); errIdentity != nil {
 		return nil, fmt.Errorf("initialize chatgpt web browser identity: %w", errIdentity), false
 	}

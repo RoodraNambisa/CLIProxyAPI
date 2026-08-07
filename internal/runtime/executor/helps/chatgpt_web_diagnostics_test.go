@@ -98,6 +98,23 @@ func TestClassifyChatGPTWebHTTPDiagnostic(t *testing.T) {
 	}
 }
 
+func TestChatGPTWebDiagnosticLogFieldsIncludeCatalogIdentity(t *testing.T) {
+	diagnostic := ClassifyChatGPTWebHTTPDiagnostic(
+		http.StatusForbidden,
+		"/backend-api/conversation",
+		[]byte(`{"error":{"code":"forbidden"}}`),
+		http.Header{"Content-Type": {"application/json"}},
+	)
+	diagnostic.CatalogVersion = "v2"
+	diagnostic.CatalogID = "c146-win-iris-1536"
+	diagnostic.TLSProfile = "chrome_146"
+
+	fields := ChatGPTWebDiagnosticLogFields(diagnostic)
+	if fields["catalog_version"] != "v2" || fields["catalog_id"] != "c146-win-iris-1536" || fields["tls_profile"] != "chrome_146" {
+		t.Fatalf("diagnostic fields = %#v", fields)
+	}
+}
+
 func TestClassifyChatGPTWebHTTPDiagnosticBoundsResponseBody(t *testing.T) {
 	body := strings.Repeat("界", maxChatGPTWebDiagnosticResponseBodyBytes)
 	diagnostic := ClassifyChatGPTWebHTTPDiagnostic(
