@@ -15,7 +15,10 @@ import (
 	http "github.com/bogdanfinn/fhttp"
 )
 
-const passkeyVerifyPath = "/api/accounts/passkey/verify"
+const (
+	passkeyVerifyPath                     = "/api/accounts/passkey/verify"
+	passkeyDiagnosticResponseBodyMaxBytes = 4096
+)
 
 var passkeyCallbackURLBodyPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`https?://[^\s"'<>]+code=[^\s"'<>]+state=[^\s"'<>]+`),
@@ -601,8 +604,24 @@ func attachPasskeyHTTPDiagnostic(authError *AuthError, response *http.Response, 
 	if authError.ResponseType == "text" && authError.ContentType == "text/html" {
 		authError.ResponseType = "html"
 	}
+	authError.ResponseBody, authError.ResponseBodyTruncated = boundedPasskeyDiagnosticResponseBody(payload, authError.ResponseType)
 	authError.TargetHost, authError.TargetPath = safePasskeyDiagnosticTarget(rawURL)
 	return authError
+}
+
+func boundedPasskeyDiagnosticResponseBody(payload []byte, responseType string) (string, bool) {
+	if len(payload) == 0 || responseType == "binary" {
+		return "", false
+	}
+	value := strings.ToValidUTF8(string(payload), "\uFFFD")
+	if len(value) <= passkeyDiagnosticResponseBodyMaxBytes {
+		return value, false
+	}
+	value = value[:passkeyDiagnosticResponseBodyMaxBytes]
+	for len(value) > 0 && !utf8.ValidString(value) {
+		value = value[:len(value)-1]
+	}
+	return value, true
 }
 
 func safePasskeyDiagnosticContentType(value string) string {

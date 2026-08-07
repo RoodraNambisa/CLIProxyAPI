@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 func TestClassifyChatGPTWebHTTPDiagnostic(t *testing.T) {
@@ -87,10 +88,26 @@ func TestClassifyChatGPTWebHTTPDiagnostic(t *testing.T) {
 			if errMarshal != nil {
 				t.Fatalf("marshal diagnostic: %v", errMarshal)
 			}
-			if strings.Contains(string(encoded), "private text") || strings.Contains(string(encoded), "secret") {
-				t.Fatalf("diagnostic leaked response content: %s", encoded)
+			if diagnostic.ResponseBody != test.body || diagnostic.ResponseBodyTruncated {
+				t.Fatalf("diagnostic response body = %q truncated=%v", diagnostic.ResponseBody, diagnostic.ResponseBodyTruncated)
+			}
+			if strings.Contains(diagnostic.TargetPath, "secret") {
+				t.Fatalf("diagnostic leaked target query: %s", encoded)
 			}
 		})
+	}
+}
+
+func TestClassifyChatGPTWebHTTPDiagnosticBoundsResponseBody(t *testing.T) {
+	body := strings.Repeat("界", maxChatGPTWebDiagnosticResponseBodyBytes)
+	diagnostic := ClassifyChatGPTWebHTTPDiagnostic(
+		http.StatusBadGateway,
+		"/backend-api/conversation",
+		[]byte(body),
+		http.Header{"Content-Type": {"text/plain"}},
+	)
+	if !diagnostic.ResponseBodyTruncated || len(diagnostic.ResponseBody) > maxChatGPTWebDiagnosticResponseBodyBytes || !utf8.ValidString(diagnostic.ResponseBody) {
+		t.Fatalf("bounded diagnostic = %#v", diagnostic)
 	}
 }
 

@@ -10,11 +10,11 @@ type Error struct {
 	Retryable bool `json:"retryable"`
 	// HTTPStatus optionally records an HTTP-like status code for the error.
 	HTTPStatus int `json:"http_status,omitempty"`
-	// Diagnostic contains redacted, provider-supplied troubleshooting metadata.
+	// Diagnostic contains provider-supplied troubleshooting metadata for authenticated management views.
 	Diagnostic *ErrorDiagnostic `json:"diagnostic,omitempty"`
 }
 
-// ErrorDiagnostic contains only non-secret fields safe for management views.
+// ErrorDiagnostic contains bounded troubleshooting metadata for authenticated management views.
 type ErrorDiagnostic struct {
 	Provider      string `json:"provider,omitempty"`
 	AuthIndex     string `json:"auth_index,omitempty"`
@@ -29,10 +29,13 @@ type ErrorDiagnostic struct {
 	UAMajor       string `json:"ua_major,omitempty"`
 	Platform      string `json:"platform,omitempty"`
 	ResponseBytes int64  `json:"response_bytes,omitempty"`
-	Attempts      int    `json:"attempts,omitempty"`
-	HTTPStatus    int    `json:"http_status,omitempty"`
-	Cloudflare    bool   `json:"cloudflare,omitempty"`
-	Retryable     bool   `json:"retryable"`
+	ResponseBody  string `json:"response_body,omitempty"`
+	// ResponseBodyTruncated reports that ResponseBody contains only the bounded prefix.
+	ResponseBodyTruncated bool `json:"response_body_truncated,omitempty"`
+	Attempts              int  `json:"attempts,omitempty"`
+	HTTPStatus            int  `json:"http_status,omitempty"`
+	Cloudflare            bool `json:"cloudflare,omitempty"`
+	Retryable             bool `json:"retryable"`
 }
 
 // Clone returns an independent diagnostic value.

@@ -11,16 +11,18 @@ import (
 	"sync/atomic"
 	"time"
 	"unicode"
+	"unicode/utf8"
 
 	log "github.com/sirupsen/logrus"
 )
 
 const (
-	liveLogCapacity           = 2000
-	liveLogSubscriberBuffer   = 256
-	liveLogMaxSubscribers     = 8
-	liveLogMaxMessageBytes    = 2048
-	liveLogMaxFieldValueBytes = 256
+	liveLogCapacity             = 2000
+	liveLogSubscriberBuffer     = 256
+	liveLogMaxSubscribers       = 8
+	liveLogMaxMessageBytes      = 2048
+	liveLogMaxFieldValueBytes   = 256
+	liveLogMaxResponseBodyBytes = 4096
 )
 
 var (
@@ -41,32 +43,34 @@ var (
 	liveLogHostPattern       = regexp.MustCompile(`(?i)^[a-z0-9](?:[a-z0-9.-]{0,253}[a-z0-9])?$`)
 )
 
-// LiveLogEvent is a safe, bounded representation of one log entry.
+// LiveLogEvent is a bounded representation of one log entry for authenticated management clients.
 type LiveLogEvent struct {
-	Cursor        uint64 `json:"cursor"`
-	Timestamp     string `json:"timestamp"`
-	Level         string `json:"level"`
-	Message       string `json:"message"`
-	RequestID     string `json:"request_id,omitempty"`
-	Provider      string `json:"provider,omitempty"`
-	AuthIndex     string `json:"auth_index,omitempty"`
-	Stage         string `json:"stage,omitempty"`
-	Code          string `json:"code,omitempty"`
-	Status        int    `json:"status,omitempty"`
-	Method        string `json:"method,omitempty"`
-	Path          string `json:"path,omitempty"`
-	Retryable     *bool  `json:"retryable,omitempty"`
-	Persona       string `json:"persona,omitempty"`
-	UAMajor       string `json:"ua_major,omitempty"`
-	Platform      string `json:"platform,omitempty"`
-	TargetHost    string `json:"target_host,omitempty"`
-	TargetPath    string `json:"target_path,omitempty"`
-	ResponseType  string `json:"response_type,omitempty"`
-	ContentType   string `json:"content_type,omitempty"`
-	CFRay         string `json:"cf_ray,omitempty"`
-	ResponseBytes int64  `json:"response_bytes,omitempty"`
-	Attempts      int    `json:"attempts,omitempty"`
-	Cloudflare    bool   `json:"cloudflare,omitempty"`
+	Cursor                uint64 `json:"cursor"`
+	Timestamp             string `json:"timestamp"`
+	Level                 string `json:"level"`
+	Message               string `json:"message"`
+	RequestID             string `json:"request_id,omitempty"`
+	Provider              string `json:"provider,omitempty"`
+	AuthIndex             string `json:"auth_index,omitempty"`
+	Stage                 string `json:"stage,omitempty"`
+	Code                  string `json:"code,omitempty"`
+	Status                int    `json:"status,omitempty"`
+	Method                string `json:"method,omitempty"`
+	Path                  string `json:"path,omitempty"`
+	Retryable             *bool  `json:"retryable,omitempty"`
+	Persona               string `json:"persona,omitempty"`
+	UAMajor               string `json:"ua_major,omitempty"`
+	Platform              string `json:"platform,omitempty"`
+	TargetHost            string `json:"target_host,omitempty"`
+	TargetPath            string `json:"target_path,omitempty"`
+	ResponseType          string `json:"response_type,omitempty"`
+	ContentType           string `json:"content_type,omitempty"`
+	CFRay                 string `json:"cf_ray,omitempty"`
+	ResponseBytes         int64  `json:"response_bytes,omitempty"`
+	ResponseBody          string `json:"response_body,omitempty"`
+	ResponseBodyTruncated bool   `json:"response_body_truncated,omitempty"`
+	Attempts              int    `json:"attempts,omitempty"`
+	Cloudflare            bool   `json:"cloudflare,omitempty"`
 }
 
 // LiveLogGap reports events dropped before they could be delivered to a slow subscriber.
@@ -360,7 +364,7 @@ func (filter LiveLogFilter) matches(event LiveLogEvent) bool {
 		}
 	}
 	if filter.Contains != "" {
-		haystack := strings.ToLower(strings.Join([]string{event.Message, event.RequestID, event.Provider, event.AuthIndex, event.Stage, event.Code, event.Method, event.Path}, " "))
+		haystack := strings.ToLower(strings.Join([]string{event.Message, event.RequestID, event.Provider, event.AuthIndex, event.Stage, event.Code, event.Method, event.Path, event.ResponseBody}, " "))
 		if !strings.Contains(haystack, filter.Contains) {
 			return false
 		}
@@ -415,6 +419,9 @@ func safeLiveLogEvent(entry *log.Entry) LiveLogEvent {
 	event.ContentType = safeLiveLogField(entry.Data, 128, "content_type")
 	event.CFRay = safeLiveLogField(entry.Data, 128, "cf_ray")
 	event.ResponseBytes = safeLiveLogInt64(entry.Data, "response_bytes")
+	if event.Status >= 400 || event.Code != "" {
+		event.ResponseBody, event.ResponseBodyTruncated = boundedLiveLogResponseBody(entry.Data)
+	}
 	event.Attempts = safeLiveLogInt(entry.Data, 100, "attempts", "flow_attempt", "request_attempt")
 	if value, ok := safeLiveLogBool(entry.Data, "cloudflare"); ok {
 		event.Cloudflare = value
@@ -423,6 +430,32 @@ func safeLiveLogEvent(entry *log.Entry) LiveLogEvent {
 		event.Retryable = &value
 	}
 	return event
+}
+
+func boundedLiveLogResponseBody(data log.Fields) (string, bool) {
+	value, exists := data["response_body"]
+	if !exists || value == nil {
+		return "", false
+	}
+	var raw string
+	switch typed := value.(type) {
+	case string:
+		raw = typed
+	case []byte:
+		raw = string(typed)
+	default:
+		raw = fmt.Sprint(typed)
+	}
+	raw = strings.ToValidUTF8(raw, "\uFFFD")
+	truncated, _ := safeLiveLogBool(data, "response_body_truncated")
+	if len(raw) <= liveLogMaxResponseBodyBytes {
+		return raw, truncated
+	}
+	raw = raw[:liveLogMaxResponseBodyBytes]
+	for len(raw) > 0 && !utf8.ValidString(raw) {
+		raw = raw[:len(raw)-1]
+	}
+	return raw, true
 }
 
 func safeLiveLogInt(data log.Fields, maximum int, names ...string) int {

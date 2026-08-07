@@ -167,22 +167,24 @@ func TestApplyChatGPTWebMetadataSummarySanitizesLifecycleReason(t *testing.T) {
 
 func TestSafeChatGPTWebErrorDiagnosticKeepsOnlyAllowlistedStructure(t *testing.T) {
 	source := &coreauth.ErrorDiagnostic{
-		Provider:      "attacker-provider",
-		AuthIndex:     "attacker-auth-index",
-		Stage:         "file_sign",
-		Code:          "cloudflare_challenge",
-		ResponseType:  "html",
-		ContentType:   "text/html",
-		CFRay:         "abc-SJC",
-		TargetHost:    "evil.example.com",
-		TargetPath:    "/backend-api/files?token=secret",
-		Persona:       "chrome_146",
-		UAMajor:       "146",
-		Platform:      "MacIntel",
-		ResponseBytes: 123,
-		HTTPStatus:    http.StatusForbidden,
-		Cloudflare:    true,
-		Retryable:     true,
+		Provider:              "attacker-provider",
+		AuthIndex:             "attacker-auth-index",
+		Stage:                 "file_sign",
+		Code:                  "cloudflare_challenge",
+		ResponseType:          "html",
+		ContentType:           "text/html",
+		CFRay:                 "abc-SJC",
+		TargetHost:            "evil.example.com",
+		TargetPath:            "/backend-api/files?token=secret",
+		Persona:               "chrome_146",
+		UAMajor:               "146",
+		Platform:              "MacIntel",
+		ResponseBytes:         123,
+		ResponseBody:          `{"error":{"message":"raw upstream detail"}}`,
+		ResponseBodyTruncated: true,
+		HTTPStatus:            http.StatusForbidden,
+		Cloudflare:            true,
+		Retryable:             true,
 	}
 	safe := safeChatGPTWebErrorDiagnostic(source, "trusted-index")
 	if safe == nil {
@@ -193,6 +195,9 @@ func TestSafeChatGPTWebErrorDiagnosticKeepsOnlyAllowlistedStructure(t *testing.T
 	}
 	if safe.TargetPath != "/backend-api/files" || safe.Stage != "file_sign" || safe.Code != "cloudflare_challenge" {
 		t.Fatalf("safe diagnostic structure = %#v", safe)
+	}
+	if safe.ResponseBody != source.ResponseBody || !safe.ResponseBodyTruncated {
+		t.Fatalf("safe diagnostic response body = %#v", safe)
 	}
 	encoded, errMarshal := json.Marshal(safe)
 	if errMarshal != nil {

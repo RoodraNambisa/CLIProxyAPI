@@ -26,6 +26,7 @@ func TestNewProviderErrorConvertsChatGPTWebAuthenticationDiagnostic(t *testing.T
 		TargetHost:     "auth.openai.com",
 		TargetPath:     "/api/accounts/passkey/verify",
 		ResponseBytes:  48,
+		ResponseBody:   `{"error":{"code":"invalid_passkey_response"}}`,
 		Retryable:      false,
 		Message:        "Passkey credential was rejected",
 	}
@@ -38,7 +39,8 @@ func TestNewProviderErrorConvertsChatGPTWebAuthenticationDiagnostic(t *testing.T
 	}
 	diagnostic := result.Diagnostic
 	if diagnostic.Code != "invalid_passkey_response" || diagnostic.Stage != "passkey_verify" || diagnostic.Attempts != 2 ||
-		diagnostic.TargetHost != "auth.openai.com" || diagnostic.TargetPath != "/api/accounts/passkey/verify" || diagnostic.AuthIndex != auth.EnsureIndex() {
+		diagnostic.TargetHost != "auth.openai.com" || diagnostic.TargetPath != "/api/accounts/passkey/verify" || diagnostic.AuthIndex != auth.EnsureIndex() ||
+		diagnostic.ResponseBody != err.ResponseBody {
 		t.Fatalf("diagnostic = %#v", diagnostic)
 	}
 }

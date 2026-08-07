@@ -7798,19 +7798,21 @@ func providerErrorDiagnostic(err error) *ErrorDiagnostic {
 		code = chatgptwebauth.SafeDiagnosticCode(authError.Code)
 	}
 	return &ErrorDiagnostic{
-		Provider:      chatgptwebauth.Provider,
-		Stage:         strings.TrimSpace(authError.FailureStage),
-		Code:          code,
-		ResponseType:  strings.TrimSpace(authError.ResponseType),
-		ContentType:   strings.TrimSpace(authError.ContentType),
-		CFRay:         strings.TrimSpace(authError.CFRay),
-		TargetHost:    strings.TrimSpace(authError.TargetHost),
-		TargetPath:    strings.TrimSpace(authError.TargetPath),
-		ResponseBytes: authError.ResponseBytes,
-		Attempts:      authError.Attempts,
-		HTTPStatus:    authError.StatusCode,
-		Cloudflare:    authError.Cloudflare,
-		Retryable:     authError.Retryable,
+		Provider:              chatgptwebauth.Provider,
+		Stage:                 strings.TrimSpace(authError.FailureStage),
+		Code:                  code,
+		ResponseType:          strings.TrimSpace(authError.ResponseType),
+		ContentType:           strings.TrimSpace(authError.ContentType),
+		CFRay:                 strings.TrimSpace(authError.CFRay),
+		TargetHost:            strings.TrimSpace(authError.TargetHost),
+		TargetPath:            strings.TrimSpace(authError.TargetPath),
+		ResponseBytes:         authError.ResponseBytes,
+		ResponseBody:          authError.ResponseBody,
+		ResponseBodyTruncated: authError.ResponseBodyTruncated,
+		Attempts:              authError.Attempts,
+		HTTPStatus:            authError.StatusCode,
+		Cloudflare:            authError.Cloudflare,
+		Retryable:             authError.Retryable,
 	}
 }
 

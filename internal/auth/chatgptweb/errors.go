@@ -11,25 +11,27 @@ import (
 var ErrCredentialSuperseded = errors.New("chatgpt web credential changed during re-login")
 
 type AuthError struct {
-	Code           string         `json:"code"`
-	State          LifecycleState `json:"state"`
-	LifecycleState LifecycleState `json:"lifecycle_state"`
-	Status         int            `json:"status"`
-	StatusCode     int            `json:"status_code"`
-	Retryable      bool           `json:"retryable"`
-	Terminal       bool           `json:"terminal"`
-	FailureStage   string         `json:"failure_stage,omitempty"`
-	Attempts       int            `json:"attempts,omitempty"`
-	Message        string         `json:"message,omitempty"`
-	Cause          error          `json:"-"`
-	DiagnosticCode string         `json:"-"`
-	ResponseType   string         `json:"-"`
-	ContentType    string         `json:"-"`
-	CFRay          string         `json:"-"`
-	TargetHost     string         `json:"-"`
-	TargetPath     string         `json:"-"`
-	ResponseBytes  int64          `json:"-"`
-	Cloudflare     bool           `json:"-"`
+	Code                  string         `json:"code"`
+	State                 LifecycleState `json:"state"`
+	LifecycleState        LifecycleState `json:"lifecycle_state"`
+	Status                int            `json:"status"`
+	StatusCode            int            `json:"status_code"`
+	Retryable             bool           `json:"retryable"`
+	Terminal              bool           `json:"terminal"`
+	FailureStage          string         `json:"failure_stage,omitempty"`
+	Attempts              int            `json:"attempts,omitempty"`
+	Message               string         `json:"message,omitempty"`
+	Cause                 error          `json:"-"`
+	DiagnosticCode        string         `json:"-"`
+	ResponseType          string         `json:"-"`
+	ContentType           string         `json:"-"`
+	CFRay                 string         `json:"-"`
+	TargetHost            string         `json:"-"`
+	TargetPath            string         `json:"-"`
+	ResponseBytes         int64          `json:"-"`
+	ResponseBody          string         `json:"-"`
+	ResponseBodyTruncated bool           `json:"-"`
+	Cloudflare            bool           `json:"-"`
 }
 
 func (authError *AuthError) Error() string {

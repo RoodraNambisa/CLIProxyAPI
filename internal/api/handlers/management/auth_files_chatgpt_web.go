@@ -149,21 +149,23 @@ func safeChatGPTWebErrorDiagnostic(diagnostic *coreauth.ErrorDiagnostic, authInd
 		return nil
 	}
 	safe := &coreauth.ErrorDiagnostic{
-		Provider:      "chatgpt-web",
-		AuthIndex:     safeChatGPTWebDiagnosticToken(authIndex, 64),
-		Stage:         safeChatGPTWebDiagnosticToken(diagnostic.Stage, 64),
-		Code:          chatgptwebauth.SafeDiagnosticCode(diagnostic.Code),
-		ResponseType:  safeChatGPTWebDiagnosticToken(diagnostic.ResponseType, 32),
-		ContentType:   safeChatGPTWebDiagnosticToken(diagnostic.ContentType, 128),
-		CFRay:         safeChatGPTWebDiagnosticToken(diagnostic.CFRay, 128),
-		Persona:       safeChatGPTWebDiagnosticToken(diagnostic.Persona, 64),
-		UAMajor:       safeChatGPTWebDiagnosticToken(diagnostic.UAMajor, 16),
-		Platform:      safeChatGPTWebDiagnosticToken(diagnostic.Platform, 64),
-		ResponseBytes: diagnostic.ResponseBytes,
-		Attempts:      diagnostic.Attempts,
-		HTTPStatus:    diagnostic.HTTPStatus,
-		Cloudflare:    diagnostic.Cloudflare,
-		Retryable:     diagnostic.Retryable,
+		Provider:              "chatgpt-web",
+		AuthIndex:             safeChatGPTWebDiagnosticToken(authIndex, 64),
+		Stage:                 safeChatGPTWebDiagnosticToken(diagnostic.Stage, 64),
+		Code:                  chatgptwebauth.SafeDiagnosticCode(diagnostic.Code),
+		ResponseType:          safeChatGPTWebDiagnosticToken(diagnostic.ResponseType, 32),
+		ContentType:           safeChatGPTWebDiagnosticToken(diagnostic.ContentType, 128),
+		CFRay:                 safeChatGPTWebDiagnosticToken(diagnostic.CFRay, 128),
+		Persona:               safeChatGPTWebDiagnosticToken(diagnostic.Persona, 64),
+		UAMajor:               safeChatGPTWebDiagnosticToken(diagnostic.UAMajor, 16),
+		Platform:              safeChatGPTWebDiagnosticToken(diagnostic.Platform, 64),
+		ResponseBytes:         diagnostic.ResponseBytes,
+		ResponseBody:          diagnostic.ResponseBody,
+		ResponseBodyTruncated: diagnostic.ResponseBodyTruncated,
+		Attempts:              diagnostic.Attempts,
+		HTTPStatus:            diagnostic.HTTPStatus,
+		Cloudflare:            diagnostic.Cloudflare,
+		Retryable:             diagnostic.Retryable,
 	}
 	if safe.Attempts < 0 || safe.Attempts > 100 {
 		safe.Attempts = 0

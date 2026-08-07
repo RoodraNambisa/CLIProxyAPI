@@ -18,7 +18,10 @@ import (
 	"github.com/tidwall/gjson"
 )
 
-const maxChatGPTWebDiagnosticValueBytes = 128
+const (
+	maxChatGPTWebDiagnosticValueBytes        = 128
+	maxChatGPTWebDiagnosticResponseBodyBytes = 4096
+)
 
 var chatGPTWebDiagnosticCodePattern = regexp.MustCompile(`^[a-zA-Z0-9._-]{1,128}$`)
 
@@ -65,7 +68,7 @@ func ClassifyChatGPTWebTransportDiagnostic(err error, path string) *cliproxyauth
 	}
 }
 
-// ClassifyChatGPTWebHTTPDiagnostic extracts only safe structural details from an upstream response.
+// ClassifyChatGPTWebHTTPDiagnostic extracts bounded troubleshooting details from an upstream response.
 func ClassifyChatGPTWebHTTPDiagnostic(status int, path string, body []byte, headers ChatGPTWebHeaderGetter) *cliproxyauth.ErrorDiagnostic {
 	contentType := ""
 	cfRay := ""
@@ -78,24 +81,42 @@ func ClassifyChatGPTWebHTTPDiagnostic(status int, path string, body []byte, head
 		server = strings.ToLower(strings.TrimSpace(headers.Get("server")))
 	}
 	responseType := chatGPTWebDiagnosticResponseType(contentType, body)
+	responseBody, responseBodyTruncated := chatGPTWebDiagnosticResponseBody(body, responseType)
 	cloudflare := chatGPTWebDiagnosticCloudflare(status, cfMitigated, server, responseType, body)
 	code := chatGPTWebDiagnosticErrorCode(status, responseType, cloudflare, body)
 	retryable := cloudflare || status == http.StatusRequestTimeout || status == http.StatusTooEarly ||
 		status == http.StatusTooManyRequests || status >= http.StatusInternalServerError
 	return &cliproxyauth.ErrorDiagnostic{
-		Provider:      "chatgpt-web",
-		Stage:         ChatGPTWebDiagnosticStage(path),
-		Code:          code,
-		ResponseType:  responseType,
-		ContentType:   contentType,
-		CFRay:         cfRay,
-		TargetHost:    chatGPTWebDiagnosticHost(path),
-		TargetPath:    safeChatGPTWebDiagnosticPath(path),
-		ResponseBytes: int64(len(body)),
-		HTTPStatus:    status,
-		Cloudflare:    cloudflare,
-		Retryable:     retryable,
+		Provider:              "chatgpt-web",
+		Stage:                 ChatGPTWebDiagnosticStage(path),
+		Code:                  code,
+		ResponseType:          responseType,
+		ContentType:           contentType,
+		CFRay:                 cfRay,
+		TargetHost:            chatGPTWebDiagnosticHost(path),
+		TargetPath:            safeChatGPTWebDiagnosticPath(path),
+		ResponseBytes:         int64(len(body)),
+		ResponseBody:          responseBody,
+		ResponseBodyTruncated: responseBodyTruncated,
+		HTTPStatus:            status,
+		Cloudflare:            cloudflare,
+		Retryable:             retryable,
 	}
+}
+
+func chatGPTWebDiagnosticResponseBody(body []byte, responseType string) (string, bool) {
+	if len(body) == 0 || responseType == "binary" {
+		return "", false
+	}
+	value := strings.ToValidUTF8(string(body), "\uFFFD")
+	if len(value) <= maxChatGPTWebDiagnosticResponseBodyBytes {
+		return value, false
+	}
+	value = value[:maxChatGPTWebDiagnosticResponseBodyBytes]
+	for len(value) > 0 && !utf8.ValidString(value) {
+		value = value[:len(value)-1]
+	}
+	return value, true
 }
 
 // ChatGPTWebDiagnosticStage maps trusted upstream paths to a stable troubleshooting stage.
@@ -294,6 +315,10 @@ func ChatGPTWebDiagnosticLogFields(diagnostic *cliproxyauth.ErrorDiagnostic) map
 		"response_bytes": diagnostic.ResponseBytes,
 		"attempts":       diagnostic.Attempts,
 		"cloudflare":     diagnostic.Cloudflare,
+	}
+	if diagnostic.ResponseBody != "" {
+		fields["response_body"] = diagnostic.ResponseBody
+		fields["response_body_truncated"] = diagnostic.ResponseBodyTruncated
 	}
 	if diagnostic.CFRay != "" {
 		fields["cf_ray"] = diagnostic.CFRay

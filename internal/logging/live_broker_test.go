@@ -10,7 +10,7 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
-func TestLiveLogBrokerFiltersAndRedacts(t *testing.T) {
+func TestLiveLogBrokerFiltersAndPreservesBoundedResponseBody(t *testing.T) {
 	broker := newLiveLogBroker()
 	broker.SetEnabled(true)
 	subscription, errSubscribe := broker.Subscribe(LiveLogFilter{
@@ -30,6 +30,7 @@ func TestLiveLogBrokerFiltersAndRedacts(t *testing.T) {
 		`{"password":"json-secret","session_token":"opaque-session","privateKey":"opaque-private"}` +
 		"\nCookie: first=cookie-one; second=cookie-two\n" +
 		"-----BEGIN PRIVATE KEY-----\nprivate-key-material\n-----END PRIVATE KEY-----"
+	responseBody := `{"error":{"message":"upstream detail","request_id":"upstream-request"}}`
 	entry.Data = log.Fields{
 		"provider":      "chatgpt-web",
 		"status":        403,
@@ -39,7 +40,7 @@ func TestLiveLogBrokerFiltersAndRedacts(t *testing.T) {
 		"retryable":     true,
 		"attempts":      3,
 		"access_token":  "must-not-appear",
-		"response_body": "must-not-appear-either",
+		"response_body": responseBody,
 	}
 	if errFire := broker.Fire(entry); errFire != nil {
 		t.Fatalf("fire: %v", errFire)
@@ -60,11 +61,39 @@ func TestLiveLogBrokerFiltersAndRedacts(t *testing.T) {
 				t.Fatalf("event leaked %q: %s", secret, text)
 			}
 		}
+		if frame.Event.ResponseBody != responseBody || frame.Event.ResponseBodyTruncated {
+			t.Fatalf("response body = %q truncated=%v", frame.Event.ResponseBody, frame.Event.ResponseBodyTruncated)
+		}
 		if frame.Event.Provider != "chatgpt-web" || frame.Event.Status != 403 || frame.Event.Stage != "file_sign" || frame.Event.Attempts != 3 || frame.Event.Retryable == nil || !*frame.Event.Retryable {
 			t.Fatalf("event = %#v", frame.Event)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for event")
+	}
+}
+
+func TestLiveLogBrokerBoundsRawResponseBodyAndFiltersIt(t *testing.T) {
+	broker := newLiveLogBroker()
+	broker.SetEnabled(true)
+	subscription, errSubscribe := broker.Subscribe(LiveLogFilter{Contains: "diagnostic-tail"}, 0)
+	if errSubscribe != nil {
+		t.Fatalf("subscribe: %v", errSubscribe)
+	}
+	defer subscription.Close()
+
+	entry := log.NewEntry(log.StandardLogger())
+	entry.Level = log.ErrorLevel
+	entry.Message = "upstream request failed"
+	entry.Data = log.Fields{
+		"status":        502,
+		"response_body": "diagnostic-tail" + strings.Repeat("界", liveLogMaxResponseBodyBytes),
+	}
+	if errFire := broker.Fire(entry); errFire != nil {
+		t.Fatalf("fire: %v", errFire)
+	}
+	frame := <-subscription.Frames
+	if frame.Event == nil || !frame.Event.ResponseBodyTruncated || len(frame.Event.ResponseBody) > liveLogMaxResponseBodyBytes || !strings.HasPrefix(frame.Event.ResponseBody, "diagnostic-tail") {
+		t.Fatalf("bounded event = %#v", frame.Event)
 	}
 }
 

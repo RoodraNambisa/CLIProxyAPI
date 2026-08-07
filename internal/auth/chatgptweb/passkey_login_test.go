@@ -452,7 +452,8 @@ func TestServicePasskeyLoginNeverFallsBackToPassword(t *testing.T) {
 	fixture.mu.Unlock()
 	if !ok || authError.Code != "passkey_verification_failed" || authError.DiagnosticCode != "invalid_passkey_response" ||
 		authError.FailureStage != "passkey_verify" || authError.StatusCode != http.StatusBadRequest || authError.Attempts != 1 ||
-		authError.ResponseType != "json" || authError.ContentType != "application/json" || authError.CFRay != "safe-ray-SJC" || passwordCalls != 0 {
+		authError.ResponseType != "json" || authError.ContentType != "application/json" || authError.CFRay != "safe-ray-SJC" ||
+		!strings.Contains(authError.ResponseBody, "invalid_passkey_response") || authError.ResponseBodyTruncated || passwordCalls != 0 {
 		t.Fatalf("credential=%#v error=%#v password_calls=%d", credential, errLogin, passwordCalls)
 	}
 }
