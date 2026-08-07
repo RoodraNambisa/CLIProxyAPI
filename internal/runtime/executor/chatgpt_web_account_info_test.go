@@ -802,6 +802,164 @@ func TestChatGPTWebAccountInfoAutoRefreshDisabledKeepsManualRefresh(t *testing.T
 	}
 }
 
+func TestChatGPTWebAccountInfoForcedTaskRefreshesReauthRequiredCredential(t *testing.T) {
+	var profileCalls atomic.Int32
+	var quotaCalls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case chatgptwebauth.AccountCheckPath:
+			profileCalls.Add(1)
+			_ = json.NewEncoder(w).Encode(map[string]any{"accounts": map[string]any{
+				"default": map[string]any{"account": map[string]any{
+					"account_id": "reauth-account",
+					"plan_type":  "free",
+				}},
+			}})
+		case chatgptwebauth.ConversationInitPath:
+			quotaCalls.Add(1)
+			_ = json.NewEncoder(w).Encode(map[string]any{"limits_progress": []any{
+				map[string]any{"feature_name": "image_gen", "remaining": 6},
+			}})
+		default:
+			http.NotFound(w, request)
+		}
+	}))
+	defer server.Close()
+
+	manager := cliproxyauth.NewManager(nil, nil, nil)
+	auth := chatGPTWebTestAuth("account-info-reauth-required")
+	credential, errCredential := chatgptwebauth.ParseCredential(auth.Metadata)
+	if errCredential != nil {
+		t.Fatalf("ParseCredential() error = %v", errCredential)
+	}
+	credential.LifecycleState = chatgptwebauth.LifecycleReauthRequired
+	credential.ApplyToMetadata(auth.Metadata)
+	if _, errRegister := manager.Register(cliproxyauth.WithSkipPersist(t.Context()), auth); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+	executor := NewChatGPTWebExecutor(&config.Config{}, manager)
+	executor.runtimeBaseURL = server.URL
+	t.Cleanup(func() { _ = executor.Close() })
+
+	blocked := executor.refreshChatGPTWebAccountInfo(t.Context(), auth.ID, true)
+	if blocked.errorCode != "credential_unavailable" {
+		t.Fatalf("non-task refresh = %+v, want credential_unavailable", blocked)
+	}
+	if profileCalls.Load() != 0 || quotaCalls.Load() != 0 {
+		t.Fatalf("non-task refresh reached upstream: profile=%d quota=%d", profileCalls.Load(), quotaCalls.Load())
+	}
+
+	task, errStart := executor.StartAccountInfoRefreshTask([]chatgptwebauth.AccountInfoRefreshTarget{{
+		Name:   "reauth-required.json",
+		AuthID: auth.ID,
+	}}, true)
+	if errStart != nil {
+		t.Fatalf("StartAccountInfoRefreshTask() error = %v", errStart)
+	}
+	task = waitForAccountInfoTask(t, executor, task.ID)
+	if task.State != chatgptwebauth.AccountInfoTaskCompleted ||
+		len(task.Results) != 1 ||
+		task.Results[0].Status != chatgptwebauth.AccountInfoResultUpdated {
+		t.Fatalf("forced task = %+v", task)
+	}
+	if profileCalls.Load() != 1 || quotaCalls.Load() != 1 {
+		t.Fatalf("forced task calls = profile:%d quota:%d, want one each", profileCalls.Load(), quotaCalls.Load())
+	}
+	current, ok := manager.GetByID(auth.ID)
+	if !ok || current == nil || current.LifecycleState() != cliproxyauth.LifecycleStateReauthRequired {
+		t.Fatalf("forced quota refresh changed lifecycle: %+v", current)
+	}
+	credential, errCredential = chatgptwebauth.ParseCredential(current.Metadata)
+	if errCredential != nil || credential.ImageQuotaRemaining == nil || *credential.ImageQuotaRemaining != 6 {
+		t.Fatalf("refreshed quota = %+v error=%v", credential, errCredential)
+	}
+}
+
+func TestChatGPTWebAccountInfoForcedTaskDoesNotReloginReauthRequiredCredential(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+	}))
+	defer server.Close()
+
+	manager := cliproxyauth.NewManager(nil, nil, nil)
+	auth := chatGPTWebTestAuth("account-info-reauth-diagnostic")
+	credential, errCredential := chatgptwebauth.ParseCredential(auth.Metadata)
+	if errCredential != nil {
+		t.Fatalf("ParseCredential() error = %v", errCredential)
+	}
+	credential.LifecycleState = chatgptwebauth.LifecycleReauthRequired
+	credential.ApplyToMetadata(auth.Metadata)
+	if _, errRegister := manager.Register(cliproxyauth.WithSkipPersist(t.Context()), auth); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+	var refreshCalls atomic.Int32
+	executor := NewChatGPTWebExecutor(&config.Config{}, manager)
+	executor.runtimeBaseURL = server.URL
+	executor.authService = &fakeChatGPTWebAuthService{refreshFn: func(
+		_ context.Context,
+		credential chatgptwebauth.Credential,
+		_ string,
+	) (*chatgptwebauth.Credential, error) {
+		refreshCalls.Add(1)
+		return &credential, errors.New("unexpected re-login")
+	}}
+	t.Cleanup(func() { _ = executor.Close() })
+
+	task, errStart := executor.StartAccountInfoRefreshTask([]chatgptwebauth.AccountInfoRefreshTarget{{
+		Name:   "reauth-diagnostic.json",
+		AuthID: auth.ID,
+	}}, true)
+	if errStart != nil {
+		t.Fatalf("StartAccountInfoRefreshTask() error = %v", errStart)
+	}
+	task = waitForAccountInfoTask(t, executor, task.ID)
+	if task.State != chatgptwebauth.AccountInfoTaskCompletedWithErrors ||
+		len(task.Results) != 1 ||
+		task.Results[0].Error != "unauthorized" {
+		t.Fatalf("forced diagnostic task = %+v", task)
+	}
+	if refreshCalls.Load() != 0 {
+		t.Fatalf("forced diagnostic task attempted %d re-logins", refreshCalls.Load())
+	}
+}
+
+func TestChatGPTWebAccountInfoManualBypassDoesNotRefreshDeadCredential(t *testing.T) {
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	manager := cliproxyauth.NewManager(nil, nil, nil)
+	auth := chatGPTWebTestAuth("account-info-dead")
+	credential, errCredential := chatgptwebauth.ParseCredential(auth.Metadata)
+	if errCredential != nil {
+		t.Fatalf("ParseCredential() error = %v", errCredential)
+	}
+	credential.LifecycleState = chatgptwebauth.LifecycleDead
+	credential.ApplyToMetadata(auth.Metadata)
+	if _, errRegister := manager.Register(cliproxyauth.WithSkipPersist(t.Context()), auth); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+	executor := NewChatGPTWebExecutor(&config.Config{}, manager)
+	executor.runtimeBaseURL = server.URL
+	t.Cleanup(func() { _ = executor.Close() })
+
+	ctx := context.WithValue(
+		t.Context(),
+		chatGPTWebAccountInfoManualLifecycleBypassContextKey{},
+		true,
+	)
+	outcome := executor.refreshChatGPTWebAccountInfo(ctx, auth.ID, true)
+	if outcome.errorCode != "credential_unavailable" {
+		t.Fatalf("dead credential refresh = %+v, want credential_unavailable", outcome)
+	}
+	if calls.Load() != 0 {
+		t.Fatalf("dead credential reached upstream %d times", calls.Load())
+	}
+}
+
 func TestChatGPTWebAmbiguousImageRecheckUsesPerCredentialCooldown(t *testing.T) {
 	now := time.Now().UTC()
 	runtime := newChatGPTWebAccountInfoRuntime(&ChatGPTWebExecutor{}, &config.Config{})
@@ -5260,6 +5418,22 @@ func TestClassifyChatGPTWebAccountInfoDeadlineForRetry(t *testing.T) {
 	code, retryable = classifyChatGPTWebAccountInfoError(context.Canceled)
 	if code != "canceled" || retryable {
 		t.Fatalf("canceled classification = %q retryable=%v", code, retryable)
+	}
+}
+
+func TestClassifyChatGPTWebAccountInfoCloudflareChallenge(t *testing.T) {
+	errChallenge := newChatGPTWebStatusError(
+		http.StatusForbidden,
+		chatgptwebauth.ConversationInitPath,
+		[]byte("<!doctype html><title>Just a moment...</title>"),
+		fhttp.Header{
+			"Cf-Mitigated": {"challenge"},
+			"Server":       {"cloudflare"},
+		},
+	)
+	code, retryable := classifyChatGPTWebAccountInfoError(errChallenge)
+	if code != "cloudflare_challenge" || !retryable {
+		t.Fatalf("Cloudflare classification = %q retryable=%v", code, retryable)
 	}
 }
 

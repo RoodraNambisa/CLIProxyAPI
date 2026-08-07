@@ -174,22 +174,23 @@ type chatGPTWebAccountInfoEpochRef struct {
 }
 
 type chatGPTWebAccountInfoWork struct {
-	target             chatgptwebauth.AccountInfoRefreshTarget
-	sequence           uint64
-	epoch              uint64
-	epochRef           *chatGPTWebAccountInfoEpochRef
-	taskID             string
-	index              int
-	force              bool
-	attempt            int
-	schedule           string
-	automatic          bool
-	independentTrigger chatGPTWebAccountInfoTriggerMode
-	quotaStateKnown    bool
-	exhausted          bool
-	quotaResetAt       time.Time
-	partialApplied     bool
-	importOnly         bool
+	target                chatgptwebauth.AccountInfoRefreshTarget
+	sequence              uint64
+	epoch                 uint64
+	epochRef              *chatGPTWebAccountInfoEpochRef
+	taskID                string
+	index                 int
+	force                 bool
+	manualLifecycleBypass bool
+	attempt               int
+	schedule              string
+	automatic             bool
+	independentTrigger    chatGPTWebAccountInfoTriggerMode
+	quotaStateKnown       bool
+	exhausted             bool
+	quotaResetAt          time.Time
+	partialApplied        bool
+	importOnly            bool
 }
 
 type chatGPTWebAccountInfoSchedule struct {
@@ -201,26 +202,29 @@ type chatGPTWebAccountInfoSchedule struct {
 }
 
 type chatGPTWebAccountInfoCall struct {
-	ctx            context.Context
-	cancel         context.CancelFunc
-	done           chan struct{}
-	authID         string
-	authInstanceID string
-	runtimeKey     string
-	epoch          uint64
-	outcome        chatGPTWebAccountInfoOutcome
-	waiters        int
-	accepting      bool
-	completed      bool
-	force          bool
-	checkFresh     bool
-	retryAttempt   int
-	retryAt        time.Time
+	ctx                   context.Context
+	cancel                context.CancelFunc
+	done                  chan struct{}
+	authID                string
+	authInstanceID        string
+	runtimeKey            string
+	epoch                 uint64
+	outcome               chatGPTWebAccountInfoOutcome
+	waiters               int
+	accepting             bool
+	completed             bool
+	force                 bool
+	checkFresh            bool
+	manualLifecycleBypass bool
+	retryAttempt          int
+	retryAt               time.Time
 }
 
 type chatGPTWebAccountInfoPersistenceContextKey struct{}
 
 type chatGPTWebAccountInfoDiagnosticContextKey struct{}
+
+type chatGPTWebAccountInfoManualLifecycleBypassContextKey struct{}
 
 type chatGPTWebAccountInfoDiagnosticContext struct {
 	authIndex string
@@ -488,6 +492,14 @@ func withChatGPTWebAccountInfoDiagnosticContext(
 		diagnostic.attempt = attempt
 	}
 	return context.WithValue(ctx, chatGPTWebAccountInfoDiagnosticContextKey{}, diagnostic)
+}
+
+func chatGPTWebAccountInfoManualLifecycleBypass(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+	allowed, _ := ctx.Value(chatGPTWebAccountInfoManualLifecycleBypassContextKey{}).(bool)
+	return allowed
 }
 
 func (e *ChatGPTWebExecutor) recordChatGPTWebAccountInfoDiagnostic(
@@ -878,6 +890,20 @@ func (runtime *chatGPTWebAccountInfoRuntime) resolveCurrentTarget(
 	}
 	target.AuthInstanceID = currentInstanceID
 	return target, true
+}
+
+func (runtime *chatGPTWebAccountInfoRuntime) targetRequiresManualLifecycleBypass(
+	target chatgptwebauth.AccountInfoRefreshTarget,
+) bool {
+	if runtime == nil || runtime.executor == nil || runtime.executor.manager == nil {
+		return false
+	}
+	auth, ok := runtime.executor.manager.GetByID(strings.TrimSpace(target.AuthID))
+	if !ok || auth == nil || auth.LifecycleState() != cliproxyauth.LifecycleStateReauthRequired {
+		return false
+	}
+	instanceID := strings.TrimSpace(target.AuthInstanceID)
+	return instanceID == "" || instanceID == strings.TrimSpace(auth.RuntimeInstanceID())
 }
 
 func (runtime *chatGPTWebAccountInfoRuntime) bindCurrentTargetLocked(
@@ -1838,12 +1864,7 @@ func (runtime *chatGPTWebAccountInfoRuntime) acquireAccountInfoCall(work chatGPT
 			runtime.calls = make(map[string]*chatGPTWebAccountInfoCall)
 		}
 		if call := runtime.calls[runtimeKey]; call != nil {
-			if call.accepting && call.epoch == work.epoch {
-				if call.completed && !accountInfoCallSatisfiesWork(call, work) {
-					delete(runtime.calls, runtimeKey)
-					runtime.mu.Unlock()
-					continue
-				}
+			if call.accepting && call.epoch == work.epoch && accountInfoCallSatisfiesWork(call, work) {
 				call.force = call.force || work.force
 				call.includeRetryAttempt(work.attempt)
 				call.waiters++
@@ -1901,7 +1922,7 @@ func (runtime *chatGPTWebAccountInfoRuntime) acquireOrCreateAccountInfoCallLocke
 	if call != nil {
 		if call.accepting &&
 			call.epoch == work.epoch &&
-			(!call.completed || accountInfoCallSatisfiesWork(call, work)) {
+			accountInfoCallSatisfiesWork(call, work) {
 			call.force = call.force || work.force
 			call.includeRetryAttempt(work.attempt)
 			call.waiters++
@@ -1963,6 +1984,7 @@ func (runtime *chatGPTWebAccountInfoRuntime) initializeAccountInfoCallLocked(
 	call.accepting = true
 	call.force = work.force
 	call.checkFresh = !work.force
+	call.manualLifecycleBypass = work.manualLifecycleBypass
 	call.retryAttempt = work.attempt
 	runtime.calls[call.runtimeKey] = call
 	runtime.wg.Add(1)
@@ -2014,6 +2036,13 @@ func (runtime *chatGPTWebAccountInfoRuntime) runAccountInfoCall(call *chatGPTWeb
 	attempt := call.retryAttempt
 	runtime.mu.Unlock()
 	callContext := withChatGPTWebAccountInfoDiagnosticContext(call.ctx, "", attempt)
+	if call.manualLifecycleBypass {
+		callContext = context.WithValue(
+			callContext,
+			chatGPTWebAccountInfoManualLifecycleBypassContextKey{},
+			true,
+		)
+	}
 	outcome := runtime.executor.refreshChatGPTWebAccountInfoForInstance(
 		callContext,
 		call.authID,
@@ -2046,7 +2075,13 @@ func accountInfoCallSatisfiesWork(
 	call *chatGPTWebAccountInfoCall,
 	work chatGPTWebAccountInfoWork,
 ) bool {
-	if call == nil || !call.completed {
+	if call == nil {
+		return false
+	}
+	if work.manualLifecycleBypass && !call.manualLifecycleBypass {
+		return false
+	}
+	if !call.completed {
 		return true
 	}
 	return !work.force ||
@@ -3382,8 +3417,12 @@ func (runtime *chatGPTWebAccountInfoRuntime) startTask(targets []chatgptwebauth.
 
 	resolvedTargets := make([]chatgptwebauth.AccountInfoRefreshTarget, len(targets))
 	currentTargets := make([]bool, len(targets))
+	manualLifecycleBypass := make([]bool, len(targets))
 	for index, target := range targets {
 		resolvedTargets[index], currentTargets[index] = runtime.resolveCurrentTarget(target)
+		manualLifecycleBypass[index] = force &&
+			currentTargets[index] &&
+			runtime.targetRequiresManualLifecycleBypass(resolvedTargets[index])
 	}
 	now := runtime.currentTime()
 	taskCtx, cancel := context.WithCancel(runtime.ctx)
@@ -3429,7 +3468,14 @@ func (runtime *chatGPTWebAccountInfoRuntime) startTask(targets []chatgptwebauth.
 			task.snapshot.Failed++
 			continue
 		}
-		work := chatGPTWebAccountInfoWork{target: target, taskID: task.snapshot.ID, index: index, force: force, attempt: 1}
+		work := chatGPTWebAccountInfoWork{
+			target:                target,
+			taskID:                task.snapshot.ID,
+			index:                 index,
+			force:                 force,
+			manualLifecycleBypass: manualLifecycleBypass[index],
+			attempt:               1,
+		}
 		enqueued, current := runtime.enqueueForCurrentInstanceLocked(work)
 		if enqueued {
 			continue
@@ -4301,9 +4347,17 @@ func (e *ChatGPTWebExecutor) refreshChatGPTWebAccountInfoForInstance(
 		outcome.errorCode = "credential_unavailable"
 		return outcome
 	}
+	manualLifecycleBypass := chatGPTWebAccountInfoManualLifecycleBypass(ctx) &&
+		auth.LifecycleState() == cliproxyauth.LifecycleStateReauthRequired
+	ctx = context.WithValue(
+		ctx,
+		chatGPTWebAccountInfoManualLifecycleBypassContextKey{},
+		manualLifecycleBypass,
+	)
 	ctx = withChatGPTWebAccountInfoDiagnosticContext(ctx, auth.Index, 0)
 	credential, errCredential := chatgptwebauth.ParseCredential(auth.Metadata)
-	if errCredential != nil || !auth.LifecycleRefreshable() {
+	if errCredential != nil ||
+		(!auth.LifecycleRefreshable() && !manualLifecycleBypass) {
 		outcome.errorCode = "credential_unavailable"
 		return outcome
 	}
@@ -4601,7 +4655,9 @@ func (e *ChatGPTWebExecutor) fetchChatGPTWebAccountInfo(ctx context.Context, aut
 		persona = client.Persona()
 		client.CloseIdleConnections()
 		quotaClient.CloseIdleConnections()
-		if refreshAttempt > 0 || !accountInfoUnauthorized(profileErr, quotaErr) {
+		if refreshAttempt > 0 ||
+			!accountInfoUnauthorized(profileErr, quotaErr) ||
+			chatGPTWebAccountInfoManualLifecycleBypass(ctx) {
 			return
 		}
 		installed, errRefresh := e.refreshChatGPTWebAccountInfoCredential(ctx, current)
@@ -4839,6 +4895,15 @@ func classifyChatGPTWebAccountInfoError(err error) (string, bool) {
 	}
 	if errors.Is(err, context.DeadlineExceeded) {
 		return "network_error", true
+	}
+	var diagnosticProvider interface {
+		AuthErrorDiagnostic() *cliproxyauth.ErrorDiagnostic
+	}
+	if errors.As(err, &diagnosticProvider) {
+		if diagnostic := diagnosticProvider.AuthErrorDiagnostic(); diagnostic != nil &&
+			strings.EqualFold(strings.TrimSpace(diagnostic.Code), "cloudflare_challenge") {
+			return "cloudflare_challenge", true
+		}
 	}
 	var status interface{ StatusCode() int }
 	if errors.As(err, &status) {
