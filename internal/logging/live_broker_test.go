@@ -26,7 +26,7 @@ func TestLiveLogBrokerFiltersAndRedacts(t *testing.T) {
 	entry := log.NewEntry(log.StandardLogger())
 	entry.Time = time.Unix(1700000000, 0)
 	entry.Level = log.ErrorLevel
-	entry.Message = "request failed authorization=Bearer secret-token email=user@example.com https://user:pass@example.com/path?sig=secret"
+	entry.Message = `request failed authorization=Bearer secret-token email=user@example.com https://user:pass@example.com/path?sig=secret {"password":"json-secret","session_token":"opaque-session","privateKey":"opaque-private"}`
 	entry.Data = log.Fields{
 		"provider":      "chatgpt-web",
 		"status":        403,
@@ -52,7 +52,7 @@ func TestLiveLogBrokerFiltersAndRedacts(t *testing.T) {
 			t.Fatalf("marshal event: %v", errMarshal)
 		}
 		text := string(encoded)
-		for _, secret := range []string{"secret-token", "user@example.com", "user:pass", "sig=secret", "must-not-appear"} {
+		for _, secret := range []string{"secret-token", "user@example.com", "user:pass", "sig=secret", "must-not-appear", "json-secret", "opaque-session", "opaque-private"} {
 			if strings.Contains(text, secret) {
 				t.Fatalf("event leaked %q: %s", secret, text)
 			}
