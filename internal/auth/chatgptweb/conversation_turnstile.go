@@ -637,7 +637,7 @@ func (vm *conversationTurnstileVM) continuePreparedProgram(ctx context.Context, 
 }
 
 func normalizeConversationTurnstileEnvironment(environment ConversationTurnstileEnvironment, startedAt time.Time) (map[string]any, []string, []string) {
-	persona := normalizePersona(environment.Persona)
+	persona := canonicalPersona(environment.Persona)
 	profile := resolveSentinelBrowserProfile(environment)
 	location := strings.TrimSpace(environment.Location)
 	if location == "" {

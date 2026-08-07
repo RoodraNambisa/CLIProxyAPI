@@ -769,7 +769,7 @@ elementInstance:canvas instanceof Element
 	profileEnvironment := sdkRequest.Environment
 	profileEnvironment.DeviceID = sdkRequest.DeviceID
 	profile := resolveSentinelBrowserProfile(profileEnvironment)
-	canvasPayload := fmt.Sprintf("sentinel-canvas-v1:%d:300x150", profile.slot&0x0f)
+	canvasPayload := fmt.Sprintf("sentinel-canvas-%s:%s:300x150", profile.version, profile.catalogID)
 	wantCanvasDataURL := "data:image/png;base64," + base64.StdEncoding.EncodeToString([]byte(canvasPayload))
 	if result.NavigatorTag != "[object Navigator]" || result.DocumentTag != "[object HTMLDocument]" ||
 		result.ElementTag != "[object HTMLElement]" || result.CanvasTag != "[object HTMLCanvasElement]" ||

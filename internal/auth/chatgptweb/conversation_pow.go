@@ -279,7 +279,8 @@ func buildConversationProofToken(ctx context.Context, seed, difficulty string, p
 }
 
 func buildConversationPoWConfig(persona Persona, scriptSources []string, dataBuild string, reader io.Reader, now func() time.Time) ([]any, error) {
-	persona = normalizePersona(persona)
+	persona = canonicalPersona(persona)
+	profile, _ := personaCatalogRuntimeEntry(persona)
 	reader = randomReader(reader)
 	if now == nil {
 		now = time.Now
@@ -295,7 +296,7 @@ func buildConversationPoWConfig(persona Persona, scriptSources []string, dataBui
 		"vendor−Google Inc.",
 		"webdriver−false",
 		"cookieEnabled−true",
-		"hardwareConcurrency−8",
+		fmt.Sprintf("hardwareConcurrency−%d", persona.HardwareConcurrency),
 		"language−en-US",
 		"product−Gecko",
 	})
@@ -335,7 +336,7 @@ func buildConversationPoWConfig(persona Persona, scriptSources []string, dataBui
 	return []any{
 		persona.ScreenWidth + persona.ScreenHeight,
 		eastern.Format("Mon Jan 02 2006 15:04:05") + " GMT-0500 (Eastern Standard Time)",
-		uint64(4_294_705_152),
+		uint64(profile.jsHeapSizeLimit),
 		1,
 		persona.UserAgent,
 		scriptSource,

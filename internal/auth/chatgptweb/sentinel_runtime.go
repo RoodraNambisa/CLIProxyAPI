@@ -2251,7 +2251,7 @@ func patchSentinelSDK(source []byte, adapter sentinelSDKAdapter) ([]byte, error)
 }
 
 func (manager *SentinelRuntimeManager) runtimeBootstrap(request SentinelSDKRequest, source *sentinelSourceCacheEntry) (string, error) {
-	persona := normalizePersona(request.Environment.Persona)
+	persona := canonicalPersona(request.Environment.Persona)
 	profileEnvironment := request.Environment
 	if strings.TrimSpace(profileEnvironment.DeviceID) == "" {
 		profileEnvironment.DeviceID = strings.TrimSpace(request.DeviceID)
@@ -2306,6 +2306,7 @@ func (manager *SentinelRuntimeManager) runtimeBootstrap(request SentinelSDKReque
 		"webgl_vendor":         profile.webGLVendor,
 		"webgl_renderer":       profile.webGLRenderer,
 		"fingerprint_version":  profile.version,
+		"fingerprint_catalog":  profile.catalogID,
 		"fingerprint_slot":     profile.slot,
 		"page_started_at_ms":   float64(pageStartedAt.UnixNano()) / float64(time.Millisecond),
 		"random_b64":           base64.StdEncoding.EncodeToString(randomBytes),

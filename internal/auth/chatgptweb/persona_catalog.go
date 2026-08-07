@@ -166,10 +166,19 @@ func personaCatalogEntryForSeed(seed string) personaCatalogEntry {
 }
 
 func canonicalPersona(persona Persona) Persona {
+	entry, _ := personaCatalogRuntimeEntry(persona)
+	return entry.persona
+}
+
+func personaCatalogRuntimeEntry(persona Persona) (personaCatalogEntry, int) {
 	if entry, ok := personaCatalogEntryForPersona(persona); ok {
-		return entry.persona
+		for index := range personaCatalogV2 {
+			if personaCatalogV2[index].persona.CatalogID == entry.persona.CatalogID {
+				return entry, index
+			}
+		}
 	}
-	return personaCatalogV2[0].persona
+	return personaCatalogV2[0], 0
 }
 
 func resolveCredentialPersona(credential *Credential, fallbackSeed string) {

@@ -85,7 +85,7 @@ func TestGoConversationTurnstileCanvasMatchesBrowserSemantics(t *testing.T) {
 	if err != nil {
 		t.Fatalf("toDataURL() error = %v", err)
 	}
-	payload := "sentinel-canvas-v1:3:300x150"
+	payload := "sentinel-canvas-" + vm.browserProfile.version + ":" + vm.browserProfile.catalogID + ":300x150"
 	want := "data:image/png;base64," + base64.StdEncoding.EncodeToString([]byte(payload))
 	if dataURL != want {
 		t.Fatalf("toDataURL() = %q, want %q", dataURL, want)

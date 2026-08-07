@@ -305,7 +305,7 @@ func (vm *conversationTurnstileVM) browserProperty(object any, key string) (any,
 						mime = parsed
 					}
 				}
-				fingerprint := fmt.Sprintf("sentinel-canvas-v1:%d:%dx%d", vm.browserProfile.slot&0x0f, value.width, value.height)
+				fingerprint := fmt.Sprintf("sentinel-canvas-%s:%s:%dx%d", vm.browserProfile.version, vm.browserProfile.catalogID, value.width, value.height)
 				encoded := base64.StdEncoding.EncodeToString([]byte(fingerprint))
 				if err := vm.reserveRuntimeBytes(len(mime) + len(encoded) + 13); err != nil {
 					return nil, err

@@ -368,8 +368,7 @@
   defineValue(canvasElementPrototype, "toDataURL", function toDataURL(type) {
     const mime = asString(type, "image/png") || "image/png";
     const state = elementData(this);
-    const renderProfile = Number(config.fingerprint_slot) & 15;
-    const fingerprint = `sentinel-canvas-v1:${renderProfile}:${state.width}x${state.height}`;
+    const fingerprint = `sentinel-canvas-${config.fingerprint_version}:${config.fingerprint_catalog}:${state.width}x${state.height}`;
     return `data:${mime};base64,${encodeBase64(utf8Encode(fingerprint))}`;
   }, { enumerable: true });
 

@@ -2,9 +2,7 @@ package chatgptweb
 
 import (
 	"encoding/json"
-	"fmt"
 	"io"
-	"strings"
 	"testing"
 	"time"
 )
@@ -22,181 +20,86 @@ func (reader *sentinelSequenceReader) Read(buffer []byte) (int, error) {
 	return len(buffer), nil
 }
 
-func TestSentinelBrowserFingerprintSpaceIsStableAndComplete(t *testing.T) {
-	persona := DefaultPersona()
-	seen := make(map[string]int, sentinelBrowserFingerprintSlots)
-	for slot := 0; slot < sentinelBrowserFingerprintSlots; slot++ {
-		profile := sentinelBrowserProfileForSlot(persona, slot)
-		key := fmt.Sprintf(
-			"%s\x00%s\x00%d\x00%d\x00%d\x00%d\x00%d\x00%d\x00%g\x00%g\x00%g\x00%d",
-			profile.webGLVendor,
-			profile.webGLRenderer,
-			profile.availLeft,
-			profile.availTop,
-			profile.availWidth,
-			profile.availHeight,
-			profile.innerWidth,
-			profile.innerHeight,
-			profile.devicePixelRatio,
-			profile.deviceMemory,
-			profile.jsHeapSizeLimit,
-			profile.colorDepth,
-		)
-		if previous, exists := seen[key]; exists {
-			t.Fatalf("fingerprint slots %d and %d resolve to the same values", previous, slot)
+func TestSentinelBrowserProfilesMatchPersonaCatalog(t *testing.T) {
+	if sentinelBrowserFingerprintSlots != len(personaCatalogV2) {
+		t.Fatalf("fingerprint slots = %d, catalog entries = %d", sentinelBrowserFingerprintSlots, len(personaCatalogV2))
+	}
+	seen := make(map[string]struct{}, len(personaCatalogV2))
+	for index, entry := range personaCatalogV2 {
+		profile := sentinelBrowserProfileForSlot(Persona{}, index)
+		want := sentinelBrowserProfileForCatalogEntry(entry, index)
+		if profile != want {
+			t.Fatalf("catalog profile %d mismatch:\n got: %#v\nwant: %#v", index, profile, want)
 		}
-		seen[key] = slot
-		if profile.slot != slot || profile.version != sentinelBrowserFingerprintVersion {
-			t.Fatalf("profile %d identity = %s/%d", slot, profile.version, profile.slot)
+		if profile.version != personaCatalogVersion || profile.catalogID != entry.persona.CatalogID || profile.slot != index {
+			t.Fatalf("catalog profile %d identity = %s/%s/%d", index, profile.version, profile.catalogID, profile.slot)
 		}
-	}
-	if len(seen) != sentinelBrowserFingerprintSlots {
-		t.Fatalf("unique fingerprint profiles = %d", len(seen))
-	}
-}
-
-func TestSentinelBrowserFingerprintV1GoldenProfiles(t *testing.T) {
-	tests := []struct {
-		slot int
-		want sentinelBrowserProfile
-	}{
-		{
-			slot: 0x000,
-			want: sentinelBrowserProfile{
-				version: sentinelBrowserFingerprintVersion, slot: 0x000, platform: sentinelBrowserPlatformMac,
-				webGLVendor: "Google Inc. (Apple)", webGLRenderer: "ANGLE (Apple, ANGLE Metal Renderer: Apple M1, Unspecified Version)",
-				availWidth: 1920, availHeight: 1080, innerWidth: 1920, innerHeight: 1008,
-				devicePixelRatio: 1, deviceMemory: 4, jsHeapSizeLimit: 2_147_352_576, colorDepth: 24,
-			},
-		},
-		{
-			slot: 0x123,
-			want: sentinelBrowserProfile{
-				version: sentinelBrowserFingerprintVersion, slot: 0x123, platform: sentinelBrowserPlatformMac,
-				webGLVendor: "Google Inc. (Apple)", webGLRenderer: "ANGLE (Apple, ANGLE Metal Renderer: Apple M2, Unspecified Version)",
-				availWidth: 1920, availHeight: 1080, innerWidth: 1888, innerHeight: 992,
-				devicePixelRatio: 1.5, deviceMemory: 4, jsHeapSizeLimit: 2_199_023_255, colorDepth: 24,
-			},
-		},
-		{
-			slot: 0xfff,
-			want: sentinelBrowserProfile{
-				version: sentinelBrowserFingerprintVersion, slot: 0xfff, platform: sentinelBrowserPlatformMac,
-				webGLVendor: "Google Inc. (ATI Technologies Inc.)", webGLRenderer: "ANGLE (ATI Technologies Inc., AMD Radeon Pro 5600M OpenGL Engine, OpenGL 4.1)",
-				availLeft: 72, availTop: 24, availWidth: 1848, availHeight: 1056, innerWidth: 1800, innerHeight: 960,
-				devicePixelRatio: 2, deviceMemory: 8, jsHeapSizeLimit: 4_647_288_832, colorDepth: 30,
-			},
-		},
-	}
-	for _, test := range tests {
-		if got := sentinelBrowserProfileForSlot(DefaultPersona(), test.slot); got != test.want {
-			t.Fatalf("slot %#03x profile changed:\n got: %#v\nwant: %#v", test.slot, got, test.want)
+		if _, exists := seen[profile.catalogID]; exists {
+			t.Fatalf("duplicate catalog profile %q", profile.catalogID)
 		}
+		seen[profile.catalogID] = struct{}{}
 	}
 }
 
-func TestSentinelBrowserFingerprintIsBoundToDeviceID(t *testing.T) {
-	environment := ConversationTurnstileEnvironment{
-		Persona:  DefaultPersona(),
-		DeviceID: "11111111-2222-4333-8444-555555555555",
-	}
-	first := resolveSentinelBrowserProfile(environment)
-	second := resolveSentinelBrowserProfile(environment)
-	if first != second {
-		t.Fatalf("same device profile changed: %#v != %#v", first, second)
-	}
-	if first.slot != 0xb14 {
-		t.Fatalf("v1 device fingerprint slot changed: %#x", first.slot)
-	}
-	environment.DeviceID = "11111111-2222-4333-8444-666666666666"
-	third := resolveSentinelBrowserProfile(environment)
-	if third.slot == first.slot {
-		t.Fatalf("test device IDs unexpectedly share slot %d", first.slot)
-	}
-}
-
-func TestSentinelBrowserFingerprintPreservesPersonaAndPlatform(t *testing.T) {
-	tests := []struct {
-		name     string
-		persona  Persona
-		platform sentinelBrowserPlatform
-	}{
-		{name: "mac", persona: DefaultPersona(), platform: sentinelBrowserPlatformMac},
-		{name: "windows", persona: Persona{Profile: "custom", UserAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/146.0.0.0", AcceptLanguage: "fr-FR", Language: "fr-FR", Platform: "Win32", ScreenWidth: 1600, ScreenHeight: 900, HardwareConcurrency: 12}, platform: sentinelBrowserPlatformWindows},
-		{name: "linux", persona: Persona{Profile: "custom", UserAgent: "Mozilla/5.0 (X11; Linux x86_64) Chrome/146.0.0.0", AcceptLanguage: "de-DE", Language: "de-DE", Platform: "Linux x86_64", ScreenWidth: 1366, ScreenHeight: 768, HardwareConcurrency: 4}, platform: sentinelBrowserPlatformLinux},
-	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			environment := ConversationTurnstileEnvironment{Persona: test.persona, DeviceID: "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"}
-			profile := resolveSentinelBrowserProfile(environment)
-			if profile.platform != test.platform {
-				t.Fatalf("platform profile = %d/%q", profile.platform, profile.webGLRenderer)
-			}
-			switch test.platform {
-			case sentinelBrowserPlatformMac:
-				if strings.Contains(profile.webGLRenderer, "Direct3D") {
-					t.Fatalf("mac profile uses Windows renderer %q", profile.webGLRenderer)
-				}
-			case sentinelBrowserPlatformWindows:
-				if !strings.Contains(profile.webGLRenderer, "Direct3D11") {
-					t.Fatalf("Windows profile renderer = %q", profile.webGLRenderer)
-				}
-			case sentinelBrowserPlatformLinux:
-				if !strings.Contains(profile.webGLRenderer, "OpenGL") {
-					t.Fatalf("Linux profile renderer = %q", profile.webGLRenderer)
-				}
-			}
-			values, _, _ := normalizeConversationTurnstileEnvironment(environment, testTime())
-			if values["window.navigator.userAgent"] != test.persona.UserAgent ||
-				values["window.navigator.platform"] != test.persona.Platform ||
-				values["window.screen.width"] != test.persona.ScreenWidth ||
-				values["window.screen.height"] != test.persona.ScreenHeight ||
-				values["window.navigator.hardwareConcurrency"] != test.persona.HardwareConcurrency {
-				t.Fatalf("explicit persona was not preserved: %#v", values)
-			}
-		})
-	}
-}
-
-func TestSentinelBrowserFingerprintDistributionForTenThousandDevices(t *testing.T) {
-	counts := make([]int, sentinelBrowserFingerprintSlots)
-	for index := 0; index < 10_000; index++ {
+func TestSentinelBrowserProfileFollowsCredentialPersona(t *testing.T) {
+	for index, entry := range personaCatalogV2 {
 		environment := ConversationTurnstileEnvironment{
-			Persona:  DefaultPersona(),
-			DeviceID: fmt.Sprintf("00000000-0000-4000-8000-%012x", index),
+			Persona:  entry.persona,
+			DeviceID: "11111111-2222-4333-8444-555555555555",
 		}
-		counts[resolveSentinelBrowserProfile(environment).slot]++
-	}
-	used := 0
-	maximum := 0
-	for _, count := range counts {
-		if count > 0 {
-			used++
+		first := resolveSentinelBrowserProfile(environment)
+		environment.DeviceID = "11111111-2222-4333-8444-666666666666"
+		second := resolveSentinelBrowserProfile(environment)
+		if first != second {
+			t.Fatalf("catalog %q changed with device ID: %#v != %#v", entry.persona.CatalogID, first, second)
 		}
-		if count > maximum {
-			maximum = count
+		if first.catalogID != entry.persona.CatalogID || first.slot != index {
+			t.Fatalf("catalog %q resolved to %q/%d", entry.persona.CatalogID, first.catalogID, first.slot)
 		}
-	}
-	if used < 3500 || maximum > 12 {
-		t.Fatalf("fingerprint distribution used=%d maximum=%d", used, maximum)
 	}
 }
 
-func TestSentinelRuntimeBootstrapSharesStableFingerprintSnapshot(t *testing.T) {
+func TestSentinelBrowserEnvironmentUsesCanonicalPersona(t *testing.T) {
+	legacy := Persona{
+		Profile:             "chrome_144",
+		UserAgent:           "Mozilla/5.0 (X11; Linux x86_64) Chrome/144.0.0.0",
+		AcceptLanguage:      "de-DE",
+		Language:            "de-DE",
+		Platform:            "Linux x86_64",
+		ScreenWidth:         800,
+		ScreenHeight:        600,
+		HardwareConcurrency: 2,
+	}
+	environment := ConversationTurnstileEnvironment{Persona: legacy, DeviceID: "legacy-device"}
+	profile := resolveSentinelBrowserProfile(environment)
+	if profile.catalogID != personaCatalogV2[0].persona.CatalogID {
+		t.Fatalf("legacy runtime profile = %q", profile.catalogID)
+	}
+	values, _, _ := normalizeConversationTurnstileEnvironment(environment, testTime())
+	want := personaCatalogV2[0].persona
+	if values["window.navigator.userAgent"] != want.UserAgent ||
+		values["window.navigator.platform"] != want.Platform ||
+		values["window.screen.width"] != want.ScreenWidth ||
+		values["window.screen.height"] != want.ScreenHeight ||
+		values["window.navigator.hardwareConcurrency"] != want.HardwareConcurrency {
+		t.Fatalf("legacy environment was not canonicalized: %#v", values)
+	}
+}
+
+func TestSentinelRuntimeBootstrapSharesCatalogSnapshot(t *testing.T) {
 	startedAt := time.Unix(1_700_000_000, 123_000_000)
 	random := &sentinelSequenceReader{}
 	manager := &SentinelRuntimeManager{
 		random: random,
 		now:    func() time.Time { return startedAt },
 	}
+	entry := personaCatalogV2[5]
 	environment := ConversationTurnstileEnvironment{
-		Persona:       DefaultPersona(),
+		Persona:       entry.persona,
 		DeviceID:      "11111111-2222-4333-8444-555555555555",
 		PageStartedAt: startedAt,
 	}
-	request := SentinelSDKRequest{
-		Environment: environment,
-	}
+	request := SentinelSDKRequest{Environment: environment}
 	source := &sentinelSourceCacheEntry{url: "https://sentinel.openai.com/sentinel/test/sdk.js"}
 
 	first := decodeSentinelRuntimeBootstrap(t, manager, request, source)
@@ -204,7 +107,10 @@ func TestSentinelRuntimeBootstrapSharesStableFingerprintSnapshot(t *testing.T) {
 	profile := resolveSentinelBrowserProfile(environment)
 	for key, want := range map[string]any{
 		"device_id":           environment.DeviceID,
-		"fingerprint_version": sentinelBrowserFingerprintVersion,
+		"user_agent":          entry.persona.UserAgent,
+		"platform":            entry.persona.Platform,
+		"fingerprint_version": personaCatalogVersion,
+		"fingerprint_catalog": entry.persona.CatalogID,
 		"fingerprint_slot":    float64(profile.slot),
 		"webgl_vendor":        profile.webGLVendor,
 		"webgl_renderer":      profile.webGLRenderer,

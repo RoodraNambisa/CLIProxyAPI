@@ -45,7 +45,7 @@ func NewSentinelGenerator(deviceID string, persona Persona, reader io.Reader, no
 	}
 	return &SentinelGenerator{
 		deviceID:    strings.TrimSpace(deviceID),
-		persona:     normalizePersona(persona),
+		persona:     canonicalPersona(persona),
 		sid:         sid,
 		random:      randomReader(reader),
 		now:         now,
@@ -115,6 +115,7 @@ func (generator *SentinelGenerator) GenerateProofContext(ctx context.Context, se
 }
 
 func (generator *SentinelGenerator) configuration() ([]any, error) {
+	profile, _ := personaCatalogRuntimeEntry(generator.persona)
 	perfRandom, err := generator.randomFloat64()
 	if err != nil {
 		return nil, err
@@ -158,7 +159,7 @@ func (generator *SentinelGenerator) configuration() ([]any, error) {
 	return []any{
 		fmt.Sprintf("%dx%d", generator.persona.ScreenWidth, generator.persona.ScreenHeight),
 		now.Format("Mon Jan 02 2006 15:04:05") + " GMT+0000 (Coordinated Universal Time)",
-		uint64(4_294_705_152),
+		uint64(profile.jsHeapSizeLimit),
 		firstRandom,
 		generator.persona.UserAgent,
 		sentinelSDKURL,

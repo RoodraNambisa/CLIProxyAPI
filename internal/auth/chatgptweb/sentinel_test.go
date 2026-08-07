@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -42,7 +43,9 @@ func TestSentinelRequirementsAndPoW(t *testing.T) {
 	if err := json.Unmarshal(decoded, &configuration); err != nil {
 		t.Fatal(err)
 	}
-	if len(configuration) != 18 || configuration[0] != "1920x1080" || configuration[3] != float64(1) || configuration[5] != sentinelSDKURL {
+	persona := canonicalPersona(DefaultPersona())
+	wantScreen := fmt.Sprintf("%dx%d", persona.ScreenWidth, persona.ScreenHeight)
+	if len(configuration) != 18 || configuration[0] != wantScreen || configuration[3] != float64(1) || configuration[4] != persona.UserAgent || configuration[5] != sentinelSDKURL {
 		t.Fatalf("requirements configuration = %#v", configuration)
 	}
 	if got := fnv1a32("hello"); got != "888d766e" {
