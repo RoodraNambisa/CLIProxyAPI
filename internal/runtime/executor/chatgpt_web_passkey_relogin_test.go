@@ -175,6 +175,7 @@ func TestChatGPTWebExecutorTokenOnlyPasskeySchedulesAutomaticRelogin(t *testing.
 }
 
 func TestChatGPTWebExecutorPromotesExhaustedInvalidPasskeyResponseToDead(t *testing.T) {
+	flowAttempts := 2
 	manager := cliproxyauth.NewManager(nil, nil, nil)
 	auth := chatGPTWebPasskeyOnlyReloginAuth(t, "invalid-passkey-dead")
 	auth.Unavailable = true
@@ -195,6 +196,11 @@ func TestChatGPTWebExecutorPromotesExhaustedInvalidPasskeyResponseToDead(t *test
 	fake := &fakeChatGPTWebAuthService{loginFn: invalidPasskeyResponseLogin}
 	executor := NewChatGPTWebExecutor(&config.Config{ChatGPTWeb: config.ChatGPTWebConfig{
 		InvalidPasskeyResponseAsDead: true,
+		LoginProxy: config.ChatGPTWebLoginProxyConfig{
+			Enabled:      true,
+			URLTemplate:  "http://proxy.example:8080",
+			FlowAttempts: &flowAttempts,
+		},
 	}}, manager)
 	executor.authService = fake
 	t.Cleanup(func() { _ = executor.Close() })
@@ -299,7 +305,11 @@ func invalidPasskeyResponseLogin(_ context.Context, input chatgptwebauth.LoginIn
 	credential := cloneChatGPTWebCredential(input.Credential)
 	credential.LifecycleState = chatgptwebauth.LifecycleReauthRequired
 	credential.LifecycleReason = "passkey_verification_failed"
-	return credential, invalidPasskeyResponseError()
+	authError := invalidPasskeyResponseError()
+	if input.RetryInvalidPasskeyResponse {
+		authError.Attempts = max(1, input.LoginProxy.FlowAttempts)
+	}
+	return credential, authError
 }
 
 func invalidPasskeyResponseError() *chatgptwebauth.AuthError {

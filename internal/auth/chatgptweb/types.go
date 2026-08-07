@@ -521,12 +521,13 @@ func normalizedCredentialLifecycleState(credential *Credential) LifecycleState {
 }
 
 type LoginInput struct {
-	Email           string
-	Password        string
-	TOTPSecret      string
-	ProxyURL        string
-	LoginProxy      LoginProxyConfig
-	PersistWebAuthn func(context.Context, WebAuthnCredential) (WebAuthnCredential, error)
+	Email                       string
+	Password                    string
+	TOTPSecret                  string
+	ProxyURL                    string
+	LoginProxy                  LoginProxyConfig
+	PersistWebAuthn             func(context.Context, WebAuthnCredential) (WebAuthnCredential, error)
+	RetryInvalidPasskeyResponse bool
 	// LoginProxyResolved keeps one runtime configuration snapshot fixed for the whole flow.
 	LoginProxyResolved bool
 	Credential         *Credential

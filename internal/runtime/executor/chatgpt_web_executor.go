@@ -1111,11 +1111,12 @@ func (e *ChatGPTWebExecutor) reloginCurrent(ctx context.Context, expected *clipr
 		return nil, false, fmt.Errorf("parse chatgpt web credential: %w", errCredential)
 	}
 	result, errLogin := e.Login(ctx, chatgptwebauth.LoginInput{
-		Credential:         credential,
-		ProxyURL:           e.proxyURLForTarget(resolved, chatgptwebauth.AuthBaseURL),
-		LoginProxy:         loginProxy,
-		LoginProxyResolved: true,
-		Relogin:            true,
+		Credential:                  credential,
+		ProxyURL:                    e.proxyURLForTarget(resolved, chatgptwebauth.AuthBaseURL),
+		LoginProxy:                  loginProxy,
+		LoginProxyResolved:          true,
+		Relogin:                     true,
+		RetryInvalidPasskeyResponse: e.invalidPasskeyResponseAsDeadEnabled(),
 		PersistWebAuthn: func(persistCtx context.Context, updated chatgptwebauth.WebAuthnCredential) (chatgptwebauth.WebAuthnCredential, error) {
 			return e.persistWebAuthnReloginState(persistCtx, expected, updated)
 		},

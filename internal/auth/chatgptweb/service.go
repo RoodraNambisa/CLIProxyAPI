@@ -110,7 +110,8 @@ func (service *Service) Login(ctx context.Context, input LoginInput) (*Credentia
 			authError.FailureStage = loginFailureStage(authError.Code)
 		}
 		errLogin = authError
-		if !authError.Retryable || flowAttempt >= flowAttempts {
+		retryFreshFlow := authError.Retryable || shouldRetryInvalidPasskeyResponse(input, authError)
+		if !retryFreshFlow || flowAttempt >= flowAttempts {
 			return credential, errLogin
 		}
 		log.WithFields(log.Fields{
@@ -127,6 +128,12 @@ func (service *Service) Login(ctx context.Context, input LoginInput) (*Credentia
 		}
 	}
 	return credential, errLogin
+}
+
+func shouldRetryInvalidPasskeyResponse(input LoginInput, authError *AuthError) bool {
+	return input.RetryInvalidPasskeyResponse && authError != nil &&
+		authError.StatusCode == http.StatusBadRequest && authError.Terminal && !authError.Retryable &&
+		authError.FailureStage == "passkey_verify" && authError.DiagnosticCode == "invalid_passkey_response"
 }
 
 func (service *Service) loginOnce(acquisitionContext context.Context, input LoginInput, selector *loginProxySelector, acquisitionTimeout time.Duration) (*Credential, error) {

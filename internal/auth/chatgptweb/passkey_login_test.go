@@ -30,6 +30,7 @@ type passkeyLoginFixture struct {
 	intermediate   bool
 	callbackURL    string
 	persisted      bool
+	challengeCalls int
 	verifyCalls    int
 	passwordCalls  int
 	sessionEmail   string
@@ -142,7 +143,11 @@ func (fixture *passkeyLoginFixture) serveHTTP(response http.ResponseWriter, requ
 }
 
 func (fixture *passkeyLoginFixture) writeChallenge(response http.ResponseWriter) {
-	challenge := base64.RawURLEncoding.EncodeToString([]byte("passkey-challenge"))
+	fixture.mu.Lock()
+	fixture.challengeCalls++
+	challengeCall := fixture.challengeCalls
+	fixture.mu.Unlock()
+	challenge := base64.RawURLEncoding.EncodeToString([]byte(fmt.Sprintf("passkey-challenge-%d", challengeCall)))
 	_, _ = fmt.Fprintf(response, `{"page":{"type":"login_password","payload":{"passkey_challenge_option":{"mfa_request_id":"request-1","passkey_request_options":{"challenge":%q,"rpId":"openai.com","allowCredentials":[{"type":"public-key","id":%q}]}}}}}`, challenge, fixture.credentialID)
 }
 
@@ -627,5 +632,47 @@ func TestServicePasskeyLoginFreshFlowRetryAdvancesCounterAgain(t *testing.T) {
 	fixture.mu.Unlock()
 	if verifyCalls != 2 || persisted.SignCount != 2 || credential.WebAuthn.SignCount != 2 {
 		t.Fatalf("verify_calls=%d persisted=%#v credential=%#v", verifyCalls, persisted, credential.WebAuthn)
+	}
+}
+
+func TestServicePasskeyLoginCanConfirmInvalidResponseAcrossFreshFlows(t *testing.T) {
+	webAuthn := testWebAuthnCredential(t)
+	fixture := newPasskeyLoginFixture(t, webAuthn.CredentialID, true)
+	fixture.verifyStatus = http.StatusBadRequest
+	fixture.verifyCode = "invalid_passkey_response"
+	proxy := newLoginConnectProxy(t, nil)
+	service := NewService(fixture.options(time.Now()))
+	persisted := cloneWebAuthnCredential(webAuthn)
+	credential, errLogin := service.Login(t.Context(), LoginInput{
+		Credential: &Credential{
+			CredentialSchemaVersion: 2,
+			Type:                    Provider,
+			Email:                   "person@example.com",
+			WebAuthn:                webAuthn,
+		},
+		LoginProxy: LoginProxyConfig{
+			Enabled:         true,
+			URLTemplate:     proxy.URL,
+			RequestAttempts: 1,
+			FlowAttempts:    2,
+		},
+		RetryInvalidPasskeyResponse: true,
+		PersistWebAuthn: func(_ context.Context, updated WebAuthnCredential) (WebAuthnCredential, error) {
+			persisted = cloneWebAuthnCredential(&updated)
+			fixture.mu.Lock()
+			fixture.persisted = true
+			fixture.mu.Unlock()
+			return updated, nil
+		},
+	})
+	authError, ok := AsAuthError(errLogin)
+	fixture.mu.Lock()
+	challengeCalls := fixture.challengeCalls
+	verifyCalls := fixture.verifyCalls
+	fixture.mu.Unlock()
+	if !ok || authError.DiagnosticCode != "invalid_passkey_response" || authError.Attempts != 2 ||
+		credential == nil || credential.WebAuthn.SignCount != 2 || persisted.SignCount != 2 ||
+		challengeCalls != 2 || verifyCalls != 2 {
+		t.Fatalf("credential=%#v error=%#v persisted=%#v challenge_calls=%d verify_calls=%d", credential, errLogin, persisted, challengeCalls, verifyCalls)
 	}
 }
