@@ -1097,6 +1097,10 @@ func (s *Server) applyAccessConfig(oldCfg, newCfg *config.Config) error {
 //   - clients: The new slice of AI service clients
 //   - cfg: The new application configuration
 func (s *Server) UpdateClients(cfg *config.Config) error {
+	return s.updateClients(cfg, true)
+}
+
+func (s *Server) updateClients(cfg *config.Config, rollbackOnError bool) error {
 	if s == nil || cfg == nil {
 		return errors.New("runtime configuration is unavailable")
 	}
@@ -1108,6 +1112,23 @@ func (s *Server) UpdateClients(cfg *config.Config) error {
 	var oldCfg *config.Config
 	if len(s.oldConfigYaml) > 0 {
 		_ = yaml.Unmarshal(s.oldConfigYaml, &oldCfg)
+	}
+	// Record the attempted state before applying side effects. If a later step
+	// fails, the rollback pass must compare the previous configuration against
+	// the attempted one rather than against the last successful snapshot.
+	nextConfigYAML, errMarshal := yaml.Marshal(runtimeCfg)
+	if errMarshal != nil {
+		return fmt.Errorf("snapshot API server runtime configuration: %w", errMarshal)
+	}
+	s.oldConfigYaml = nextConfigYAML
+	rollback := func(errApply error) error {
+		if !rollbackOnError || oldCfg == nil {
+			return errApply
+		}
+		if errRollback := s.updateClients(oldCfg, false); errRollback != nil {
+			return errors.Join(errApply, fmt.Errorf("rollback API server runtime configuration: %w", errRollback))
+		}
+		return errApply
 	}
 
 	// Update request logger enabled state if it has changed
@@ -1127,7 +1148,7 @@ func (s *Server) UpdateClients(cfg *config.Config) error {
 		oldCfg.LogsMaxTotalSizeMB != runtimeCfg.LogsMaxTotalSizeMB ||
 		oldCfg.RemoteManagement.LiveLogs.Enabled != runtimeCfg.RemoteManagement.LiveLogs.Enabled {
 		if errLogOutput := logging.ConfigureLogOutput(runtimeCfg); errLogOutput != nil {
-			return errLogOutput
+			return rollback(errLogOutput)
 		}
 	}
 
@@ -1196,21 +1217,19 @@ func (s *Server) UpdateClients(cfg *config.Config) error {
 	}
 
 	if errAccess := s.applyAccessConfig(oldCfg, runtimeCfg); errAccess != nil {
-		return fmt.Errorf("update access providers: %w", errAccess)
+		return rollback(fmt.Errorf("update access providers: %w", errAccess))
 	}
 	s.wsAuthEnabled.Store(runtimeCfg.WebsocketAuth)
 	if oldCfg != nil && s.wsAuthChanged != nil && oldCfg.WebsocketAuth != runtimeCfg.WebsocketAuth {
 		s.wsAuthChanged(oldCfg.WebsocketAuth, runtimeCfg.WebsocketAuth)
 	}
 	managementasset.SetCurrentConfig(runtimeCfg)
-	// Save YAML snapshot for next comparison
-	s.oldConfigYaml, _ = yaml.Marshal(runtimeCfg)
 
 	s.handlers.UpdateClients(&runtimeCfg.SDKConfig)
 
 	if s.mgmt != nil {
 		if errManagement := s.mgmt.SetConfig(runtimeCfg); errManagement != nil {
-			return fmt.Errorf("update management runtime configuration: %w", errManagement)
+			return rollback(fmt.Errorf("update management runtime configuration: %w", errManagement))
 		}
 		s.mgmt.SetAuthManager(s.handlers.AuthManager)
 	}

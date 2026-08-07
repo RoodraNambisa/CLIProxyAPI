@@ -18,6 +18,7 @@ import (
 	sdkaccess "github.com/router-for-me/CLIProxyAPI/v6/sdk/access"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v6/sdk/config"
+	"gopkg.in/yaml.v3"
 )
 
 func newTestServer(t *testing.T) *Server {
@@ -420,6 +421,43 @@ func TestManagementAccessPathPrefixesManagementRoutesAndCallbacks(t *testing.T) 
 	server.engine.ServeHTTP(newRec, newReq)
 	if newRec.Code != http.StatusOK {
 		t.Fatalf("updated prefixed management route status = %d, want %d; body=%s", newRec.Code, http.StatusOK, newRec.Body.String())
+	}
+}
+
+func TestUpdateClientsRollsBackEarlierSideEffectsAfterLaterFailure(t *testing.T) {
+	server := newTestServer(t)
+
+	var requestLogStates []bool
+	server.loggerToggle = func(enabled bool) {
+		requestLogStates = append(requestLogStates, enabled)
+	}
+
+	blockedPath := filepath.Join(t.TempDir(), "not-a-directory")
+	if errWrite := os.WriteFile(blockedPath, []byte("blocked"), 0o600); errWrite != nil {
+		t.Fatalf("write blocked path: %v", errWrite)
+	}
+	t.Setenv("WRITABLE_PATH", blockedPath)
+	t.Setenv("writable_path", "")
+
+	updatedCfg := *server.cfg
+	updatedCfg.RequestLog = true
+	updatedCfg.LoggingToFile = true
+	if errUpdate := server.UpdateClients(&updatedCfg); errUpdate == nil {
+		t.Fatal("UpdateClients() error = nil, want logging setup failure")
+	}
+
+	if len(requestLogStates) != 2 || !requestLogStates[0] || requestLogStates[1] {
+		t.Fatalf("request log states = %v, want [true false]", requestLogStates)
+	}
+	if server.cfg.RequestLog || server.cfg.LoggingToFile {
+		t.Fatalf("runtime config was not rolled back: request_log=%t logging_to_file=%t", server.cfg.RequestLog, server.cfg.LoggingToFile)
+	}
+	var snapshot proxyconfig.Config
+	if errUnmarshal := yaml.Unmarshal(server.oldConfigYaml, &snapshot); errUnmarshal != nil {
+		t.Fatalf("unmarshal runtime snapshot: %v", errUnmarshal)
+	}
+	if snapshot.RequestLog || snapshot.LoggingToFile {
+		t.Fatalf("runtime snapshot was not rolled back: request_log=%t logging_to_file=%t", snapshot.RequestLog, snapshot.LoggingToFile)
 	}
 }
 
