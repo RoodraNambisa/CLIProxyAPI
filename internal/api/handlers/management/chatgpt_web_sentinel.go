@@ -55,16 +55,18 @@ func (h *Handler) GetChatGPTWebSentinel(c *gin.Context) {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "configuration unavailable"})
 		return
 	}
-	h.mu.Lock()
-	if h.cfg == nil {
-		h.mu.Unlock()
+	cfg := h.currentConfig()
+	if cfg == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "configuration unavailable"})
 		return
 	}
-	resolved := h.cfg.ChatGPTWeb.Sentinel.Resolved()
+	resolved := cfg.ChatGPTWeb.Sentinel.Resolved()
 	snapshot := chatgptwebauth.SentinelRuntimeSnapshot{}
-	if h.authManager != nil {
-		if registered, ok := h.authManager.Executor(chatgptwebauth.Provider); ok {
+	h.mu.Lock()
+	manager := h.authManager
+	h.mu.Unlock()
+	if manager != nil {
+		if registered, ok := manager.Executor(chatgptwebauth.Provider); ok {
 			if snapshotter, okSnapshotter := registered.(chatGPTWebSentinelSnapshotter); okSnapshotter {
 				snapshot = snapshotter.SentinelSnapshot()
 				resolved = config.ResolvedChatGPTWebSentinelConfig{
@@ -76,7 +78,6 @@ func (h *Handler) GetChatGPTWebSentinel(c *gin.Context) {
 			}
 		}
 	}
-	h.mu.Unlock()
 	c.JSON(http.StatusOK, chatGPTWebSentinelResponse{
 		ResolvedChatGPTWebSentinelConfig: resolved,
 		Initialized:                      snapshot.Initialized,
@@ -126,8 +127,8 @@ func (h *Handler) updateChatGPTWebSentinel(c *gin.Context, replace bool) {
 	}
 
 	h.mu.Lock()
-	defer h.mu.Unlock()
 	if h.cfg == nil {
+		h.mu.Unlock()
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "configuration unavailable"})
 		return
 	}
@@ -137,10 +138,12 @@ func (h *Handler) updateChatGPTWebSentinel(c *gin.Context, replace bool) {
 		candidate = config.ChatGPTWebSentinelConfig{}
 	}
 	if errApply := request.apply(&candidate); errApply != nil {
+		h.mu.Unlock()
 		c.JSON(http.StatusBadRequest, gin.H{"error": errApply.Error()})
 		return
 	}
 	if errValidate := candidate.Validate(); errValidate != nil {
+		h.mu.Unlock()
 		c.JSON(http.StatusBadRequest, gin.H{"error": errValidate.Error()})
 		return
 	}
@@ -149,12 +152,16 @@ func (h *Handler) updateChatGPTWebSentinel(c *gin.Context, replace bool) {
 		if h.cfg != nil {
 			h.cfg.ChatGPTWeb.Sentinel = previous
 		}
+		h.mu.Unlock()
 		return
 	}
-	if h.authManager != nil {
-		if registered, ok := h.authManager.Executor(chatgptwebauth.Provider); ok {
+	manager := h.authManager
+	appliedConfig := h.configSnapshot.Load()
+	h.mu.Unlock()
+	if manager != nil {
+		if registered, ok := manager.Executor(chatgptwebauth.Provider); ok {
 			if updater, okUpdater := registered.(chatGPTWebSentinelConfigUpdater); okUpdater {
-				updater.UpdateConfig(h.cfg)
+				updater.UpdateConfig(appliedConfig)
 			}
 		}
 	}

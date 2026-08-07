@@ -344,8 +344,8 @@ func (h *Handler) updateAuthFileFields(ctx context.Context, auth *coreauth.Auth,
 	if !currentMatch || updated == nil {
 		return nil, http.StatusConflict, "auth file changed while fields were being updated"
 	}
-	if h.authStatusHook != nil {
-		h.authStatusHook(ctx, updated.Clone())
+	if hook := h.authStatusHookSnapshot(); hook != nil {
+		hook(ctx, updated.Clone())
 	}
 	return updated, http.StatusOK, ""
 }

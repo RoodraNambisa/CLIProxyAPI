@@ -14,8 +14,8 @@ type chatGPTWebAutoDeleteDeadStatsResponse struct {
 func (h *Handler) GetChatGPTWebAutoDeleteDeadStats(c *gin.Context) {
 	c.Header("Cache-Control", "no-store")
 	var count uint64
-	if h != nil && h.deadAuthDeleteCount != nil {
-		count = h.deadAuthDeleteCount()
+	if provider := h.deadAuthDeleteCountSnapshot(); provider != nil {
+		count = provider()
 	}
 	c.JSON(http.StatusOK, chatGPTWebAutoDeleteDeadStatsResponse{DeletedCount: count})
 }

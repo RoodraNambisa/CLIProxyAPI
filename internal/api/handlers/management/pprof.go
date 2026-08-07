@@ -17,7 +17,6 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 )
 
 const (
@@ -115,18 +114,6 @@ func (h *Handler) GetPprofProfile(c *gin.Context) {
 	default:
 		c.JSON(http.StatusBadRequest, gin.H{"error": "unsupported pprof format"})
 	}
-}
-
-func (h *Handler) currentConfig() *config.Config {
-	if h == nil {
-		return nil
-	}
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	if h.cfg == nil {
-		return nil
-	}
-	return h.cfg
 }
 
 func (h *Handler) writeRawPprofProfile(c *gin.Context, profileName string) {

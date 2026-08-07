@@ -31,13 +31,13 @@ func (h *Handler) GetChatGPTWebImport(c *gin.Context) {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "configuration unavailable"})
 		return
 	}
-	h.mu.Lock()
-	if h.cfg == nil {
-		h.mu.Unlock()
+	cfg := h.currentConfig()
+	if cfg == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "configuration unavailable"})
 		return
 	}
-	resolved := h.cfg.ChatGPTWeb.Import.Resolved()
+	resolved := cfg.ChatGPTWeb.Import.Resolved()
+	h.mu.Lock()
 	tasks := h.chatGPTWebMutationTasks
 	h.mu.Unlock()
 	var runtime chatGPTWebImportRuntimeSnapshot
@@ -110,11 +110,12 @@ func (h *Handler) updateChatGPTWebImport(c *gin.Context, replace bool) {
 		return
 	}
 	tasks := h.chatGPTWebMutationTasks
+	manager := h.authManager
 	h.mu.Unlock()
 	if tasks != nil {
 		tasks.updateWorkerLimit(candidate.Resolved().Workers)
 	}
-	if controller, ok := chatGPTWebAccountInfoControllerForManager(h.authManager); ok {
+	if controller, ok := chatGPTWebAccountInfoControllerForManager(manager); ok {
 		controller.UpdateConfig(updatedConfig)
 	}
 }

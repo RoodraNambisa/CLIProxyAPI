@@ -46,8 +46,8 @@ const (
 // GetUsageStatistics returns the in-memory request statistics snapshot.
 func (h *Handler) GetUsageStatistics(c *gin.Context) {
 	var snapshot usage.StatisticsSnapshot
-	if h != nil && h.usageStats != nil {
-		snapshot = h.usageStats.Snapshot()
+	if stats := h.usageStatisticsSnapshot(); stats != nil {
+		snapshot = stats.Snapshot()
 	}
 	c.JSON(http.StatusOK, gin.H{
 		"usage":           snapshot,
@@ -58,8 +58,8 @@ func (h *Handler) GetUsageStatistics(c *gin.Context) {
 // GetUsageMeta returns the smallest usage statistics view for frontend refresh checks.
 func (h *Handler) GetUsageMeta(c *gin.Context) {
 	var meta usage.MetaSnapshot
-	if h != nil && h.usageStats != nil {
-		meta = h.usageStats.Meta()
+	if stats := h.usageStatisticsSnapshot(); stats != nil {
+		meta = stats.Meta()
 	}
 	c.JSON(http.StatusOK, gin.H{
 		"usage":           meta,
@@ -69,7 +69,8 @@ func (h *Handler) GetUsageMeta(c *gin.Context) {
 
 // ClearUsageStatistics removes all request usage statistics and persists the empty state.
 func (h *Handler) ClearUsageStatistics(c *gin.Context) {
-	if h == nil || h.usageStats == nil {
+	stats := h.usageStatisticsSnapshot()
+	if stats == nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "usage statistics unavailable"})
 		return
 	}
@@ -79,7 +80,7 @@ func (h *Handler) ClearUsageStatistics(c *gin.Context) {
 		return
 	}
 	path := h.usageStatisticsFilePath()
-	previous, err := usage.ClearAndPersistRequestStatistics(path, h.usageStats)
+	previous, err := usage.ClearAndPersistRequestStatistics(path, stats)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"cleared": true,
@@ -87,7 +88,7 @@ func (h *Handler) ClearUsageStatistics(c *gin.Context) {
 		})
 		return
 	}
-	meta := h.usageStats.Meta()
+	meta := stats.Meta()
 	c.JSON(http.StatusOK, gin.H{
 		"cleared":                true,
 		"version":                meta.Version,
@@ -127,18 +128,18 @@ func (h *Handler) GetUsageSummary(c *gin.Context) {
 		}
 	}
 	var summary usage.SummarySnapshot
-	if h != nil && h.usageStats != nil {
+	if stats := h.usageStatisticsSnapshot(); stats != nil {
 		if timeRange.IsZero() {
 			if includeSources {
-				summary = h.usageStats.Summary()
+				summary = stats.Summary()
 			} else {
-				summary = h.usageStats.SummaryWithoutSources()
+				summary = stats.SummaryWithoutSources()
 			}
 		} else {
 			if includeSources {
-				summary = h.usageStats.SummaryForRange(timeRange)
+				summary = stats.SummaryForRange(timeRange)
 			} else {
-				summary = h.usageStats.SummaryForRangeWithoutSources(timeRange)
+				summary = stats.SummaryForRangeWithoutSources(timeRange)
 			}
 		}
 	}
@@ -155,8 +156,8 @@ func (h *Handler) GetUsageDetails(c *gin.Context) {
 		return
 	}
 	var page usage.DetailPage
-	if h != nil && h.usageStats != nil {
-		page = h.usageStats.Details(query)
+	if stats := h.usageStatisticsSnapshot(); stats != nil {
+		page = stats.Details(query)
 	} else {
 		page = usage.DetailPage{Items: []usage.DetailEntry{}, Details: []usage.DetailEntry{}, Limit: query.Limit}
 	}
@@ -176,12 +177,12 @@ func (h *Handler) GetUsageAuthSummaries(c *gin.Context) {
 	authIndexes := parseUsageAuthIndexList(c)
 	infoByIndex := h.usageAuthInfoByIndex()
 	summaries := map[string]usage.AuthUsageSnapshot{}
-	if h != nil && h.usageStats != nil {
+	if stats := h.usageStatisticsSnapshot(); stats != nil {
 		query := usage.AuthUsageQuery{
 			TimeRange:   timeRange,
 			AuthIndexes: authIndexes,
 		}
-		for _, summary := range h.usageStats.AuthSummariesForQuery(query) {
+		for _, summary := range stats.AuthSummariesForQuery(query) {
 			summaries[summary.AuthIndex] = summary
 		}
 	}
@@ -246,8 +247,8 @@ func (h *Handler) GetUsageFacets(c *gin.Context) {
 	}
 	items := []usage.SourceFacet{}
 	total := 0
-	if h != nil && h.usageStats != nil {
-		items, total = h.usageStats.SourceFacets(timeRange, query, limit)
+	if stats := h.usageStatisticsSnapshot(); stats != nil {
+		items, total = stats.SourceFacets(timeRange, query, limit)
 	}
 	c.Header("Cache-Control", "no-store")
 	c.JSON(http.StatusOK, gin.H{"kind": kind, "items": items, "total": total})
@@ -260,8 +261,8 @@ func (h *Handler) GetUsageSeries(c *gin.Context) {
 		return
 	}
 	var result usage.SeriesResult
-	if h != nil && h.usageStats != nil {
-		result = h.usageStats.Series(query)
+	if stats := h.usageStatisticsSnapshot(); stats != nil {
+		result = stats.Series(query)
 	} else {
 		result = usage.SeriesResult{
 			Bucket:  query.Bucket,
@@ -279,8 +280,8 @@ func (h *Handler) GetUsageHealth(c *gin.Context) {
 		return
 	}
 	var result usage.HealthResult
-	if h != nil && h.usageStats != nil {
-		result = h.usageStats.Health(query)
+	if stats := h.usageStatisticsSnapshot(); stats != nil {
+		result = stats.Health(query)
 	} else {
 		result = usage.HealthResult{
 			AsOf:    time.Now().UTC(),
@@ -301,8 +302,8 @@ func (h *Handler) GetUsageRates(c *gin.Context) {
 		return
 	}
 	var result usage.RatesResult
-	if h != nil && h.usageStats != nil {
-		result = h.usageStats.Rates(query)
+	if stats := h.usageStatisticsSnapshot(); stats != nil {
+		result = stats.Rates(query)
 	} else {
 		result = usage.RatesResult{
 			AsOf:             time.Now().UTC(),
@@ -321,8 +322,8 @@ func (h *Handler) GetUsageTokens(c *gin.Context) {
 		return
 	}
 	var result usage.TokenResult
-	if h != nil && h.usageStats != nil {
-		result = h.usageStats.TokensForQuery(query)
+	if stats := h.usageStatisticsSnapshot(); stats != nil {
+		result = stats.TokensForQuery(query)
 	} else {
 		result = usage.TokenResult{
 			AsOf:    time.Now().UTC(),
@@ -342,8 +343,8 @@ func (h *Handler) GetUsageCosts(c *gin.Context) {
 	}
 	query.Prices = h.usageCostPrices()
 	var result usage.CostResult
-	if h != nil && h.usageStats != nil {
-		result = h.usageStats.Costs(query)
+	if stats := h.usageStatisticsSnapshot(); stats != nil {
+		result = stats.Costs(query)
 	} else {
 		result = usage.CostResult{
 			AsOf:               time.Now().UTC(),
@@ -368,8 +369,8 @@ func (h *Handler) GetUsageAuthSummary(c *gin.Context) {
 	}
 	info, current := h.usageAuthInfoByAuthIndex(authIndex)
 	summary, hasUsage := usage.AuthUsageSnapshot{AuthIndex: authIndex}, false
-	if h != nil && h.usageStats != nil {
-		summary, hasUsage = h.usageStats.AuthSummary(authIndex)
+	if stats := h.usageStatisticsSnapshot(); stats != nil {
+		summary, hasUsage = stats.AuthSummary(authIndex)
 	}
 	if !current && !hasUsage {
 		c.JSON(http.StatusNotFound, gin.H{"error": "auth usage not found"})
@@ -388,16 +389,17 @@ func (h *Handler) GetUsageAuthModelSummaries(c *gin.Context) {
 	info, current := h.usageAuthInfoByAuthIndex(authIndex)
 	models := []usage.AuthModelUsageSnapshot{}
 	hasUsage := false
-	if h != nil && h.usageStats != nil {
-		models, hasUsage = h.usageStats.AuthModelSummaries(authIndex)
+	stats := h.usageStatisticsSnapshot()
+	if stats != nil {
+		models, hasUsage = stats.AuthModelSummaries(authIndex)
 	}
 	if !current && !hasUsage {
 		c.JSON(http.StatusNotFound, gin.H{"error": "auth usage not found"})
 		return
 	}
 	summary := usage.AuthUsageSnapshot{AuthIndex: authIndex}
-	if h != nil && h.usageStats != nil {
-		if got, ok := h.usageStats.AuthSummary(authIndex); ok {
+	if stats != nil {
+		if got, ok := stats.AuthSummary(authIndex); ok {
 			summary = got
 		}
 	}
@@ -410,8 +412,8 @@ func (h *Handler) GetUsageAuthModelSummaries(c *gin.Context) {
 // ExportUsageStatistics returns a complete usage snapshot for backup/migration.
 func (h *Handler) ExportUsageStatistics(c *gin.Context) {
 	var snapshot usage.StatisticsSnapshot
-	if h != nil && h.usageStats != nil {
-		snapshot = h.usageStats.Snapshot()
+	if stats := h.usageStatisticsSnapshot(); stats != nil {
+		snapshot = stats.Snapshot()
 	}
 	c.JSON(http.StatusOK, usageExportPayload{
 		Version:    1,
@@ -422,7 +424,8 @@ func (h *Handler) ExportUsageStatistics(c *gin.Context) {
 
 // ImportUsageStatistics merges a previously exported usage snapshot into memory.
 func (h *Handler) ImportUsageStatistics(c *gin.Context) {
-	if h == nil || h.usageStats == nil {
+	stats := h.usageStatisticsSnapshot()
+	if stats == nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "usage statistics unavailable"})
 		return
 	}
@@ -443,8 +446,8 @@ func (h *Handler) ImportUsageStatistics(c *gin.Context) {
 		return
 	}
 
-	result := h.usageStats.MergeSnapshot(payload.Usage)
-	snapshot := h.usageStats.Snapshot()
+	result := stats.MergeSnapshot(payload.Usage)
+	snapshot := stats.Snapshot()
 	c.JSON(http.StatusOK, gin.H{
 		"added":           result.Added,
 		"skipped":         result.Skipped,

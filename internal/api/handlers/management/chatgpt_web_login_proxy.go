@@ -31,13 +31,12 @@ func (h *Handler) GetChatGPTWebLoginProxy(c *gin.Context) {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "configuration unavailable"})
 		return
 	}
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	if h.cfg == nil {
+	cfg := h.currentConfig()
+	if cfg == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "configuration unavailable"})
 		return
 	}
-	c.JSON(http.StatusOK, h.cfg.ChatGPTWeb.LoginProxy.Resolved())
+	c.JSON(http.StatusOK, cfg.ChatGPTWeb.LoginProxy.Resolved())
 }
 
 // PutChatGPTWebLoginProxy replaces all login-only proxy settings.
@@ -76,8 +75,8 @@ func (h *Handler) updateChatGPTWebLoginProxy(c *gin.Context, replace bool) {
 	}
 
 	h.mu.Lock()
-	defer h.mu.Unlock()
 	if h.cfg == nil {
+		h.mu.Unlock()
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "configuration unavailable"})
 		return
 	}
@@ -87,10 +86,12 @@ func (h *Handler) updateChatGPTWebLoginProxy(c *gin.Context, replace bool) {
 		candidate = config.ChatGPTWebLoginProxyConfig{}
 	}
 	if errApply := request.apply(&candidate); errApply != nil {
+		h.mu.Unlock()
 		c.JSON(http.StatusBadRequest, gin.H{"error": errApply.Error()})
 		return
 	}
 	if errValidate := candidate.Validate(); errValidate != nil {
+		h.mu.Unlock()
 		c.JSON(http.StatusBadRequest, gin.H{"error": errValidate.Error()})
 		return
 	}
@@ -99,10 +100,13 @@ func (h *Handler) updateChatGPTWebLoginProxy(c *gin.Context, replace bool) {
 		if h.cfg != nil {
 			h.cfg.ChatGPTWeb.LoginProxy = previous
 		}
+		h.mu.Unlock()
 		return
 	}
+	appliedConfig := h.configSnapshot.Load()
+	h.mu.Unlock()
 	if updater != nil {
-		updater.UpdateConfig(h.cfg)
+		updater.UpdateConfig(appliedConfig)
 	}
 }
 

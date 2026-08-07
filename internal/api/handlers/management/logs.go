@@ -177,11 +177,12 @@ func (h *Handler) GetLogs(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "handler unavailable"})
 		return
 	}
-	if h.cfg == nil {
+	cfg := h.currentConfig()
+	if cfg == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "configuration unavailable"})
 		return
 	}
-	if !h.cfg.LoggingToFile {
+	if !cfg.LoggingToFile {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "logging to file disabled"})
 		return
 	}
@@ -239,11 +240,12 @@ func (h *Handler) DeleteLogs(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "handler unavailable"})
 		return
 	}
-	if h.cfg == nil {
+	cfg := h.currentConfig()
+	if cfg == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "configuration unavailable"})
 		return
 	}
-	if !h.cfg.LoggingToFile {
+	if !cfg.LoggingToFile {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "logging to file disabled"})
 		return
 	}
@@ -301,11 +303,12 @@ func (h *Handler) GetRequestErrorLogs(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "handler unavailable"})
 		return
 	}
-	if h.cfg == nil {
+	cfg := h.currentConfig()
+	if cfg == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "configuration unavailable"})
 		return
 	}
-	if h.cfg.RequestLog {
+	if cfg.RequestLog {
 		c.JSON(http.StatusOK, gin.H{"files": []any{}})
 		return
 	}
@@ -365,7 +368,7 @@ func (h *Handler) GetRequestLogByID(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "handler unavailable"})
 		return
 	}
-	if h.cfg == nil {
+	if h.currentConfig() == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "configuration unavailable"})
 		return
 	}
@@ -452,7 +455,7 @@ func (h *Handler) DownloadRequestErrorLog(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "handler unavailable"})
 		return
 	}
-	if h.cfg == nil {
+	if h.currentConfig() == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "configuration unavailable"})
 		return
 	}
@@ -506,10 +509,13 @@ func (h *Handler) logDirectory() string {
 	if h == nil {
 		return ""
 	}
-	if h.logDir != "" {
-		return h.logDir
+	h.mu.Lock()
+	logDir := h.logDir
+	h.mu.Unlock()
+	if logDir != "" {
+		return logDir
 	}
-	return logging.ResolveLogDirectory(h.cfg)
+	return logging.ResolveLogDirectory(h.currentConfig())
 }
 
 func (h *Handler) collectLogFiles(dir string) ([]string, error) {

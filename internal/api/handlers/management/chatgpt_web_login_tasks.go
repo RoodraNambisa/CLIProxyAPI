@@ -1173,8 +1173,8 @@ func (h *Handler) persistChatGPTWebCredentialLocked(ctx context.Context, manager
 		CreatedAt:     now,
 		UpdatedAt:     now,
 	}
-	if h.postAuthHook != nil {
-		if errHook := h.postAuthHook(ctx, record); errHook != nil {
+	if hook := h.postAuthHookSnapshot(); hook != nil {
+		if errHook := hook(ctx, record); errHook != nil {
 			return nil, "", fmt.Errorf("post-auth hook failed: %w", errHook)
 		}
 	}

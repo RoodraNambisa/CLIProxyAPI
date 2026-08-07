@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -68,8 +69,10 @@ const attemptMaxIdleTime = 2 * time.Hour
 // Handler aggregates config reference, persistence path and helpers.
 type Handler struct {
 	cfg                     *config.Config
+	configSnapshot          atomic.Pointer[config.Config]
 	configFilePath          string
 	mu                      sync.Mutex
+	setConfigMu             sync.Mutex
 	codexPlanRefreshMu      sync.Mutex
 	codexPlanRefresh        codexPlanTypeRefreshTask
 	attemptsMu              sync.Mutex
@@ -173,10 +176,53 @@ func NewHandler(cfg *config.Config, configFilePath string, manager *coreauth.Man
 		chatGPTWebMutationTasks: mutationTasks,
 		agentIdentityTasks:      newCodexAgentIdentityTaskManager(),
 	}
+	if errSnapshot := h.publishConfigSnapshot(cfg); errSnapshot != nil {
+		log.WithError(errSnapshot).Error("failed to initialize management configuration snapshot")
+	}
 	cleanupCtx, cleanupCancel := context.WithCancel(context.Background())
 	h.cleanupCancel = cleanupCancel
 	h.startAttemptCleanup(cleanupCtx)
 	return h
+}
+
+// currentConfig returns the immutable configuration published for concurrent
+// request readers. Callers must not mutate the returned value.
+func (h *Handler) currentConfig() *config.Config {
+	if h == nil {
+		return nil
+	}
+	if snapshot := h.configSnapshot.Load(); snapshot != nil {
+		return snapshot
+	}
+	// A few embedders construct Handler values directly. Lazily publish their
+	// initial mutable configuration so those readers receive the same immutable
+	// snapshot as handlers created through NewHandler.
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if snapshot := h.configSnapshot.Load(); snapshot != nil {
+		return snapshot
+	}
+	snapshot, errClone := config.Clone(h.cfg)
+	if errClone != nil {
+		log.WithError(errClone).Error("failed to create management configuration snapshot")
+		return nil
+	}
+	h.configSnapshot.Store(snapshot)
+	return snapshot
+}
+
+// publishConfigSnapshot clones the mutable management configuration before
+// making it visible to concurrent request readers.
+func (h *Handler) publishConfigSnapshot(cfg *config.Config) error {
+	if h == nil {
+		return nil
+	}
+	snapshot, errClone := config.Clone(cfg)
+	if errClone != nil {
+		return errClone
+	}
+	h.configSnapshot.Store(snapshot)
+	return nil
 }
 
 // startAttemptCleanup launches a background goroutine that periodically
@@ -286,23 +332,32 @@ func (h *Handler) SetConfig(cfg *config.Config) error {
 	if h == nil {
 		return nil
 	}
+	h.setConfigMu.Lock()
+	defer h.setConfigMu.Unlock()
 	snapshot, errClone := config.Clone(cfg)
 	if errClone != nil {
 		return errClone
 	}
-	h.mu.Lock()
-	if h.proxyPoolManager != nil {
-		if errProxyConfig := h.proxyPoolManager.UpdateConfig(snapshot); errProxyConfig != nil {
-			h.mu.Unlock()
-			return errProxyConfig
-		}
+	published, errPublished := config.Clone(snapshot)
+	if errPublished != nil {
+		return errPublished
 	}
-	h.cfg = snapshot
+	h.mu.Lock()
+	proxyPoolManager := h.proxyPoolManager
 	mutationTasks := h.chatGPTWebMutationTasks
 	workers := config.DefaultChatGPTWebImportWorkers
 	if snapshot != nil {
 		workers = snapshot.ChatGPTWeb.Import.Resolved().Workers
 	}
+	h.mu.Unlock()
+	if proxyPoolManager != nil {
+		if errProxyConfig := proxyPoolManager.UpdateConfig(snapshot); errProxyConfig != nil {
+			return errProxyConfig
+		}
+	}
+	h.mu.Lock()
+	h.cfg = snapshot
+	h.configSnapshot.Store(published)
 	h.mu.Unlock()
 	if mutationTasks != nil {
 		mutationTasks.updateWorkerLimit(workers)
@@ -338,33 +393,45 @@ func (h *Handler) SetProxyPoolManager(manager *proxypool.Manager) {
 	}
 	h.mu.Lock()
 	h.proxyPoolManager = manager
-	cfg := h.cfg
+	h.mu.Unlock()
+	cfg := h.currentConfig()
 	if manager != nil {
 		if errProxyConfig := manager.UpdateConfig(cfg); errProxyConfig != nil {
 			log.WithError(errProxyConfig).Error("failed to initialize proxy pool runtime configuration")
 		}
 	}
-	h.mu.Unlock()
 }
 
 // SetUsageStatistics allows replacing the usage statistics reference.
-func (h *Handler) SetUsageStatistics(stats *usage.RequestStatistics) { h.usageStats = stats }
+func (h *Handler) SetUsageStatistics(stats *usage.RequestStatistics) {
+	if h == nil {
+		return
+	}
+	h.mu.Lock()
+	h.usageStats = stats
+	h.mu.Unlock()
+}
 
 func (h *Handler) usageStatisticsFilePath() string {
 	if h == nil {
 		return usage.StatisticsFilePath(nil)
 	}
-	h.mu.Lock()
 	authDir := ""
-	if h.cfg != nil {
-		authDir = h.cfg.AuthDir
+	if cfg := h.currentConfig(); cfg != nil {
+		authDir = cfg.AuthDir
 	}
-	h.mu.Unlock()
 	return usage.StatisticsFilePath(&config.Config{AuthDir: authDir})
 }
 
 // SetLocalPassword configures the runtime-local password accepted for localhost requests.
-func (h *Handler) SetLocalPassword(password string) { h.localPassword = password }
+func (h *Handler) SetLocalPassword(password string) {
+	if h == nil {
+		return
+	}
+	h.mu.Lock()
+	h.localPassword = password
+	h.mu.Unlock()
+}
 
 // SetLogDirectory updates the directory where main.log should be looked up.
 func (h *Handler) SetLogDirectory(dir string) {
@@ -376,32 +443,104 @@ func (h *Handler) SetLogDirectory(dir string) {
 			dir = abs
 		}
 	}
+	h.mu.Lock()
 	h.logDir = dir
+	h.mu.Unlock()
 }
 
 // SetPostAuthHook registers a hook to be called after auth record creation but before persistence.
 func (h *Handler) SetPostAuthHook(hook coreauth.PostAuthHook) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	h.postAuthHook = hook
 }
 
 // SetAuthStatusHook registers a hook to be called after auth status changes.
 func (h *Handler) SetAuthStatusHook(hook coreauth.AuthStatusHook) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	h.authStatusHook = hook
 }
 
 // SetAuthDeleteHook registers service-owned cleanup after managed credentials are deleted.
 func (h *Handler) SetAuthDeleteHook(hook func(context.Context, []*coreauth.Auth)) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	h.authDeleteHook = hook
 }
 
 // SetChatGPTWebDependencyReconcileHook registers the service-level dependency cleanup hook.
 func (h *Handler) SetChatGPTWebDependencyReconcileHook(hook func(context.Context, string) ([]string, error)) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	h.dependencyReconcileHook = hook
 }
 
 // SetChatGPTWebDeadAuthDeleteCountProvider registers the process-local deletion count provider.
 func (h *Handler) SetChatGPTWebDeadAuthDeleteCountProvider(provider func() uint64) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	h.deadAuthDeleteCount = provider
+}
+
+func (h *Handler) usageStatisticsSnapshot() *usage.RequestStatistics {
+	if h == nil {
+		return nil
+	}
+	h.mu.Lock()
+	stats := h.usageStats
+	h.mu.Unlock()
+	return stats
+}
+
+func (h *Handler) postAuthHookSnapshot() coreauth.PostAuthHook {
+	if h == nil {
+		return nil
+	}
+	h.mu.Lock()
+	hook := h.postAuthHook
+	h.mu.Unlock()
+	return hook
+}
+
+func (h *Handler) authStatusHookSnapshot() coreauth.AuthStatusHook {
+	if h == nil {
+		return nil
+	}
+	h.mu.Lock()
+	hook := h.authStatusHook
+	h.mu.Unlock()
+	return hook
+}
+
+func (h *Handler) authDeleteHookSnapshot() func(context.Context, []*coreauth.Auth) {
+	if h == nil {
+		return nil
+	}
+	h.mu.Lock()
+	hook := h.authDeleteHook
+	h.mu.Unlock()
+	return hook
+}
+
+func (h *Handler) dependencyReconcileHookSnapshot() func(context.Context, string) ([]string, error) {
+	if h == nil {
+		return nil
+	}
+	h.mu.Lock()
+	hook := h.dependencyReconcileHook
+	h.mu.Unlock()
+	return hook
+}
+
+func (h *Handler) deadAuthDeleteCountSnapshot() func() uint64 {
+	if h == nil {
+		return nil
+	}
+	h.mu.Lock()
+	provider := h.deadAuthDeleteCount
+	h.mu.Unlock()
+	return provider
 }
 
 // Middleware enforces access control for management endpoints.
@@ -418,19 +557,26 @@ func (h *Handler) Middleware() gin.HandlerFunc {
 
 		clientIP := c.ClientIP()
 		localClient := clientIP == "127.0.0.1" || clientIP == "::1"
-		cfg := h.cfg
+		cfg := h.currentConfig()
 		var (
-			allowRemote bool
-			secretHash  string
+			allowRemote         bool
+			secretHash          string
+			allowRemoteOverride bool
+			envSecret           string
+			localPassword       string
 		)
 		if cfg != nil {
 			allowRemote = cfg.RemoteManagement.AllowRemote
 			secretHash = cfg.RemoteManagement.SecretKey
 		}
-		if h.allowRemoteOverride {
+		h.mu.Lock()
+		allowRemoteOverride = h.allowRemoteOverride
+		envSecret = h.envSecret
+		localPassword = h.localPassword
+		h.mu.Unlock()
+		if allowRemoteOverride {
 			allowRemote = true
 		}
-		envSecret := h.envSecret
 
 		fail := func() {}
 		if !localClient {
@@ -500,7 +646,7 @@ func (h *Handler) Middleware() gin.HandlerFunc {
 		}
 
 		if localClient {
-			if lp := h.localPassword; lp != "" {
+			if lp := localPassword; lp != "" {
 				if subtle.ConstantTimeCompare([]byte(provided), []byte(lp)) == 1 {
 					c.Next()
 					return
@@ -562,15 +708,19 @@ func (h *Handler) persistLocked(c *gin.Context) bool {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to load current config"})
 		return false
 	}
-	// Preserve comments when writing
-	if err := config.SaveConfigPreserveComments(h.configFilePath, h.cfg); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to save config: %v", err)})
-		return false
-	}
 	candidate, errCandidate := config.Clone(h.cfg)
 	if errCandidate != nil {
-		_ = h.restorePersistedConfigLocked(previousBody, previousExisted, previousCfg)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to snapshot runtime configuration"})
+		return false
+	}
+	publishedCandidate, errPublishedCandidate := config.Clone(candidate)
+	if errPublishedCandidate != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to snapshot published configuration"})
+		return false
+	}
+	// Preserve comments when writing.
+	if err := config.SaveConfigPreserveComments(h.configFilePath, h.cfg); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to save config: %v", err)})
 		return false
 	}
 
@@ -595,6 +745,7 @@ func (h *Handler) persistLocked(c *gin.Context) bool {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "runtime_update_failed", "message": errApply.Error()})
 		return false
 	}
+	h.configSnapshot.Store(publishedCandidate)
 	response := gin.H{"status": "ok", "applied": result.Applied}
 	if result.RestartRequired {
 		response["restart_required"] = true
@@ -679,8 +830,10 @@ func (h *Handler) updateBoolField(c *gin.Context, set func(bool)) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
 		return
 	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	set(*body.Value)
-	h.persist(c)
+	h.persistLocked(c)
 }
 
 func (h *Handler) updateIntField(c *gin.Context, set func(int)) {
@@ -699,8 +852,10 @@ func (h *Handler) updateIntFieldNormalized(c *gin.Context, normalize func(int) i
 	if normalize != nil {
 		value = normalize(value)
 	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	set(value)
-	h.persist(c)
+	h.persistLocked(c)
 }
 
 func (h *Handler) updateStringField(c *gin.Context, set func(string)) {
@@ -711,6 +866,8 @@ func (h *Handler) updateStringField(c *gin.Context, set func(string)) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
 		return
 	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	set(*body.Value)
-	h.persist(c)
+	h.persistLocked(c)
 }

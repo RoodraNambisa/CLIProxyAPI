@@ -198,13 +198,20 @@ func TestUsageHealthRatesAndTokensHandlers(t *testing.T) {
 func TestUsageCostsHandlerUsesSharedPrices(t *testing.T) {
 	handler, stats, _ := newUsageHandlerForTest(t)
 	base := time.Now().UTC().Truncate(time.Hour).Add(-time.Hour)
-	handler.cfg.UsagePricing = config.UsagePricingConfig{Models: map[string]config.UsageModelPrice{
+	cfg, errConfig := config.Clone(handler.currentConfig())
+	if errConfig != nil {
+		t.Fatalf("clone config: %v", errConfig)
+	}
+	cfg.UsagePricing = config.UsagePricingConfig{Models: map[string]config.UsageModelPrice{
 		"model-a": {
 			InputPerMillion:       2,
 			OutputPerMillion:      10,
 			CachedInputPerMillion: 0.5,
 		},
 	}}
+	if errSet := handler.SetConfig(cfg); errSet != nil {
+		t.Fatalf("set config: %v", errSet)
+	}
 	stats.Record(context.Background(), coreusage.Record{
 		APIKey:      "api-a",
 		Model:       "model-a",

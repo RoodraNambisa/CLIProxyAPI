@@ -28,17 +28,15 @@ func (h *Handler) GetSystemMetrics(c *gin.Context) {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "configuration unavailable"})
 		return
 	}
-	h.mu.Lock()
-	if h.cfg == nil {
-		h.mu.Unlock()
+	cfg := h.currentConfig()
+	if cfg == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "configuration unavailable"})
 		return
 	}
-	authDirectory := strings.TrimSpace(h.cfg.AuthDir)
+	authDirectory := strings.TrimSpace(cfg.AuthDir)
 	usageCachePath := chatGPTWebUsageCacheFilesystemPath(
-		h.cfg.ChatGPTWeb.UsageCache.Resolved().Path,
+		cfg.ChatGPTWeb.UsageCache.Resolved().Path,
 	)
-	h.mu.Unlock()
 
 	workingDirectory, errWorkingDirectory := os.Getwd()
 	if errWorkingDirectory != nil {

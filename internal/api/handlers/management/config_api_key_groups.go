@@ -13,9 +13,10 @@ import (
 
 // GetAPIKeys returns configured client API keys.
 func (h *Handler) GetAPIKeys(c *gin.Context) {
-	h.mu.Lock()
-	keys := append([]string(nil), h.cfg.APIKeys...)
-	h.mu.Unlock()
+	var keys []string
+	if cfg := h.currentConfig(); cfg != nil {
+		keys = append([]string(nil), cfg.APIKeys...)
+	}
 	c.JSON(http.StatusOK, gin.H{"api-keys": keys})
 }
 
@@ -173,9 +174,10 @@ func (h *Handler) DeleteAPIKeys(c *gin.Context) {
 
 // GetAPIKeyGroups returns provider restrictions for configured API keys.
 func (h *Handler) GetAPIKeyGroups(c *gin.Context) {
-	h.mu.Lock()
-	groups := cloneAPIKeyGroups(h.cfg.APIKeyGroups)
-	h.mu.Unlock()
+	var groups []config.APIKeyGroup
+	if cfg := h.currentConfig(); cfg != nil {
+		groups = cloneAPIKeyGroups(cfg.APIKeyGroups)
+	}
 	c.JSON(http.StatusOK, gin.H{"api-key-groups": groups})
 }
 

@@ -989,8 +989,8 @@ func (h *Handler) reconcileChatGPTWebDependencies(ctx context.Context, reason st
 	if h == nil || h.authManager == nil {
 		return nil, nil
 	}
-	if h.dependencyReconcileHook != nil {
-		return h.dependencyReconcileHook(ctx, reason)
+	if hook := h.dependencyReconcileHookSnapshot(); hook != nil {
+		return hook(ctx, reason)
 	}
 	return h.authManager.ReconcileChatGPTWebDependencies(ctx)
 }

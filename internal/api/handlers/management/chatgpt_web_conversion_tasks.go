@@ -847,8 +847,8 @@ func (h *Handler) persistConvertedChatGPTWebCredential(ctx context.Context, mana
 		CreatedAt:  now,
 		UpdatedAt:  now,
 	}
-	if h.postAuthHook != nil {
-		if errHook := h.postAuthHook(ctx, record); errHook != nil {
+	if hook := h.postAuthHookSnapshot(); hook != nil {
+		if errHook := hook(ctx, record); errHook != nil {
 			return nil, errHook
 		}
 	}

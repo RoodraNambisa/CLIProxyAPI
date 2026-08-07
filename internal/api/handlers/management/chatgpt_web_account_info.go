@@ -63,13 +63,13 @@ func (h *Handler) GetChatGPTWebAccountInfo(c *gin.Context) {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "configuration unavailable"})
 		return
 	}
-	h.mu.Lock()
-	if h.cfg == nil {
-		h.mu.Unlock()
+	cfg := h.currentConfig()
+	if cfg == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "configuration unavailable"})
 		return
 	}
-	resolved := h.cfg.ChatGPTWeb.AccountInfo.Resolved()
+	resolved := cfg.ChatGPTWeb.AccountInfo.Resolved()
+	h.mu.Lock()
 	manager := h.authManager
 	h.mu.Unlock()
 	var snapshot chatgptwebauth.AccountInfoRuntimeSnapshot
@@ -160,8 +160,8 @@ func (h *Handler) updateChatGPTWebAccountInfo(c *gin.Context, replace bool) {
 	}
 
 	h.mu.Lock()
-	defer h.mu.Unlock()
 	if h.cfg == nil {
+		h.mu.Unlock()
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "configuration unavailable"})
 		return
 	}
@@ -171,10 +171,12 @@ func (h *Handler) updateChatGPTWebAccountInfo(c *gin.Context, replace bool) {
 		candidate = config.ChatGPTWebAccountInfoConfig{}
 	}
 	if errApply := request.apply(&candidate); errApply != nil {
+		h.mu.Unlock()
 		c.JSON(http.StatusBadRequest, gin.H{"error": errApply.Error()})
 		return
 	}
 	if errValidate := candidate.Validate(); errValidate != nil {
+		h.mu.Unlock()
 		c.JSON(http.StatusBadRequest, gin.H{"error": errValidate.Error()})
 		return
 	}
@@ -183,10 +185,14 @@ func (h *Handler) updateChatGPTWebAccountInfo(c *gin.Context, replace bool) {
 		if h.cfg != nil {
 			h.cfg.ChatGPTWeb.AccountInfo = previous
 		}
+		h.mu.Unlock()
 		return
 	}
-	if controller, ok := chatGPTWebAccountInfoControllerForManager(h.authManager); ok {
-		controller.UpdateConfig(h.cfg)
+	manager := h.authManager
+	appliedConfig := h.configSnapshot.Load()
+	h.mu.Unlock()
+	if controller, ok := chatGPTWebAccountInfoControllerForManager(manager); ok {
+		controller.UpdateConfig(appliedConfig)
 	}
 }
 

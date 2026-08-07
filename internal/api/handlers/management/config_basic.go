@@ -31,14 +31,12 @@ func (h *Handler) GetConfig(c *gin.Context) {
 		c.JSON(200, gin.H{})
 		return
 	}
-	h.mu.Lock()
-	if h.cfg == nil {
-		h.mu.Unlock()
+	cfg := h.currentConfig()
+	if cfg == nil {
 		c.JSON(200, gin.H{})
 		return
 	}
-	snapshot, errSnapshot := cloneConfigWithMaskedProxyURLs(h.cfg)
-	h.mu.Unlock()
+	snapshot, errSnapshot := cloneConfigWithMaskedProxyURLs(cfg)
 	if errSnapshot != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to snapshot configuration"})
 		return
@@ -55,12 +53,8 @@ type releaseInfo struct {
 func (h *Handler) GetLatestVersion(c *gin.Context) {
 	client := &http.Client{Timeout: 10 * time.Second}
 	proxyURL := ""
-	if h != nil {
-		h.mu.Lock()
-		if h.cfg != nil {
-			proxyURL = strings.TrimSpace(h.cfg.ProxyURL)
-		}
-		h.mu.Unlock()
+	if cfg := h.currentConfig(); cfg != nil {
+		proxyURL = strings.TrimSpace(cfg.ProxyURL)
 	}
 	if proxyURL != "" {
 		sdkCfg := &sdkconfig.SDKConfig{ProxyURL: proxyURL}
@@ -197,6 +191,18 @@ func (h *Handler) PutConfigYAML(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "reload_failed", "message": err.Error()})
 		return
 	}
+	publishedCfg, errPublishedCfg := config.Clone(newCfg)
+	if errPublishedCfg != nil {
+		errRollback := h.rollbackConfigYAMLLocked(previousBody, previousExisted, previousCfg)
+		h.mu.Unlock()
+		if errRollback != nil {
+			log.WithError(errors.Join(errPublishedCfg, errRollback)).Error("config upload snapshot failed and rollback was incomplete")
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "rollback_failed", "message": "config snapshot failed and rollback was incomplete"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "snapshot_failed", "message": errPublishedCfg.Error()})
+		return
+	}
 	h.cfg = newCfg
 	h.mu.Unlock()
 	result, errApply := h.applyRuntimeConfig(c.Request.Context(), newCfg)
@@ -216,6 +222,7 @@ func (h *Handler) PutConfigYAML(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "runtime_update_failed", "message": errApply.Error()})
 		return
 	}
+	h.configSnapshot.Store(publishedCfg)
 	response := gin.H{"ok": true, "changed": []string{"config"}, "applied": result.Applied}
 	if result.RestartRequired {
 		response["restart_required"] = true
@@ -255,12 +262,16 @@ func (h *Handler) GetConfigYAML(c *gin.Context) {
 }
 
 // Debug
-func (h *Handler) GetDebug(c *gin.Context) { c.JSON(200, gin.H{"debug": h.cfg.Debug}) }
+func (h *Handler) GetDebug(c *gin.Context) {
+	cfg := h.currentConfig()
+	c.JSON(200, gin.H{"debug": cfg != nil && cfg.Debug})
+}
 func (h *Handler) PutDebug(c *gin.Context) { h.updateBoolField(c, func(v bool) { h.cfg.Debug = v }) }
 
 // UsageStatisticsEnabled
 func (h *Handler) GetUsageStatisticsEnabled(c *gin.Context) {
-	c.JSON(200, gin.H{"usage-statistics-enabled": h.cfg.UsageStatisticsEnabled})
+	cfg := h.currentConfig()
+	c.JSON(200, gin.H{"usage-statistics-enabled": cfg != nil && cfg.UsageStatisticsEnabled})
 }
 func (h *Handler) PutUsageStatisticsEnabled(c *gin.Context) {
 	h.updateBoolField(c, func(v bool) { h.cfg.UsageStatisticsEnabled = v })
@@ -268,7 +279,8 @@ func (h *Handler) PutUsageStatisticsEnabled(c *gin.Context) {
 
 // UsageStatisticsEnabled
 func (h *Handler) GetLoggingToFile(c *gin.Context) {
-	c.JSON(200, gin.H{"logging-to-file": h.cfg.LoggingToFile})
+	cfg := h.currentConfig()
+	c.JSON(200, gin.H{"logging-to-file": cfg != nil && cfg.LoggingToFile})
 }
 func (h *Handler) PutLoggingToFile(c *gin.Context) {
 	h.updateBoolField(c, func(v bool) { h.cfg.LoggingToFile = v })
@@ -276,7 +288,12 @@ func (h *Handler) PutLoggingToFile(c *gin.Context) {
 
 // LogsMaxTotalSizeMB
 func (h *Handler) GetLogsMaxTotalSizeMB(c *gin.Context) {
-	c.JSON(200, gin.H{"logs-max-total-size-mb": h.cfg.LogsMaxTotalSizeMB})
+	cfg := h.currentConfig()
+	if cfg == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "configuration unavailable"})
+		return
+	}
+	c.JSON(200, gin.H{"logs-max-total-size-mb": cfg.LogsMaxTotalSizeMB})
 }
 func (h *Handler) PutLogsMaxTotalSizeMB(c *gin.Context) {
 	var body struct {
@@ -290,13 +307,20 @@ func (h *Handler) PutLogsMaxTotalSizeMB(c *gin.Context) {
 	if value < 0 {
 		value = 0
 	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	h.cfg.LogsMaxTotalSizeMB = value
-	h.persist(c)
+	h.persistLocked(c)
 }
 
 // ErrorLogsMaxFiles
 func (h *Handler) GetErrorLogsMaxFiles(c *gin.Context) {
-	c.JSON(200, gin.H{"error-logs-max-files": h.cfg.ErrorLogsMaxFiles})
+	cfg := h.currentConfig()
+	if cfg == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "configuration unavailable"})
+		return
+	}
+	c.JSON(200, gin.H{"error-logs-max-files": cfg.ErrorLogsMaxFiles})
 }
 func (h *Handler) PutErrorLogsMaxFiles(c *gin.Context) {
 	var body struct {
@@ -310,27 +334,33 @@ func (h *Handler) PutErrorLogsMaxFiles(c *gin.Context) {
 	if value < 0 {
 		value = 10
 	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	h.cfg.ErrorLogsMaxFiles = value
-	h.persist(c)
+	h.persistLocked(c)
 }
 
 // Request log
-func (h *Handler) GetRequestLog(c *gin.Context) { c.JSON(200, gin.H{"request-log": h.cfg.RequestLog}) }
+func (h *Handler) GetRequestLog(c *gin.Context) {
+	cfg := h.currentConfig()
+	c.JSON(200, gin.H{"request-log": cfg != nil && cfg.RequestLog})
+}
 func (h *Handler) PutRequestLog(c *gin.Context) {
 	h.updateBoolField(c, func(v bool) { h.cfg.RequestLog = v })
 }
 
 // Request body audit
 func (h *Handler) GetRequestBodyAudit(c *gin.Context) {
-	if h == nil || h.cfg == nil {
+	cfg := h.currentConfig()
+	if cfg == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "configuration unavailable"})
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"request-body-audit": config.NormalizeRequestBodyAudit(h.cfg.RequestBodyAudit)})
+	c.JSON(http.StatusOK, gin.H{"request-body-audit": config.NormalizeRequestBodyAudit(cfg.RequestBodyAudit)})
 }
 
 func (h *Handler) PutRequestBodyAudit(c *gin.Context) {
-	if h == nil || h.cfg == nil {
+	if h == nil || h.currentConfig() == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "configuration unavailable"})
 		return
 	}
@@ -341,20 +371,23 @@ func (h *Handler) PutRequestBodyAudit(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
 		return
 	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	h.cfg.RequestBodyAudit = config.NormalizeRequestBodyAudit(*body.Value)
-	h.persist(c)
+	h.persistLocked(c)
 }
 
 func (h *Handler) GetRequestBodyRelease(c *gin.Context) {
-	if h == nil || h.cfg == nil {
+	cfg := h.currentConfig()
+	if cfg == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "configuration unavailable"})
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"request-body-release": config.NormalizeRequestBodyRelease(h.cfg.RequestBodyRelease)})
+	c.JSON(http.StatusOK, gin.H{"request-body-release": config.NormalizeRequestBodyRelease(cfg.RequestBodyRelease)})
 }
 
 func (h *Handler) PutRequestBodyRelease(c *gin.Context) {
-	if h == nil || h.cfg == nil {
+	if h == nil || h.currentConfig() == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "configuration unavailable"})
 		return
 	}
@@ -365,13 +398,16 @@ func (h *Handler) PutRequestBodyRelease(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
 		return
 	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	h.cfg.RequestBodyRelease = config.NormalizeRequestBodyRelease(*body.Value)
-	h.persist(c)
+	h.persistLocked(c)
 }
 
 // Websocket auth
 func (h *Handler) GetWebsocketAuth(c *gin.Context) {
-	c.JSON(200, gin.H{"ws-auth": h.cfg.WebsocketAuth})
+	cfg := h.currentConfig()
+	c.JSON(200, gin.H{"ws-auth": cfg != nil && cfg.WebsocketAuth})
 }
 func (h *Handler) PutWebsocketAuth(c *gin.Context) {
 	h.updateBoolField(c, func(v bool) { h.cfg.WebsocketAuth = v })
@@ -379,22 +415,28 @@ func (h *Handler) PutWebsocketAuth(c *gin.Context) {
 
 // Request retry
 func (h *Handler) GetRequestRetry(c *gin.Context) {
-	c.JSON(200, gin.H{"request-retry": h.cfg.RequestRetry})
+	cfg := h.currentConfig()
+	if cfg == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "configuration unavailable"})
+		return
+	}
+	c.JSON(200, gin.H{"request-retry": cfg.RequestRetry})
 }
 func (h *Handler) PutRequestRetry(c *gin.Context) {
 	h.updateIntFieldNormalized(c, clampNonNegativeInt, func(v int) { h.cfg.RequestRetry = v })
 }
 
 func (h *Handler) GetNonRetryableErrors(c *gin.Context) {
-	if h == nil || h.cfg == nil {
+	cfg := h.currentConfig()
+	if cfg == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "configuration unavailable"})
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"non-retryable-errors": config.NormalizeNonRetryableErrorRules(h.cfg.NonRetryableErrors)})
+	c.JSON(http.StatusOK, gin.H{"non-retryable-errors": config.NormalizeNonRetryableErrorRules(cfg.NonRetryableErrors)})
 }
 
 func (h *Handler) PutNonRetryableErrors(c *gin.Context) {
-	if h == nil || h.cfg == nil {
+	if h == nil || h.currentConfig() == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "configuration unavailable"})
 		return
 	}
@@ -405,20 +447,23 @@ func (h *Handler) PutNonRetryableErrors(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
 		return
 	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	h.cfg.NonRetryableErrors = config.NormalizeNonRetryableErrorRules(*body.Value)
-	h.persist(c)
+	h.persistLocked(c)
 }
 
 func (h *Handler) GetAuthModelExclusions(c *gin.Context) {
-	if h == nil || h.cfg == nil {
+	cfg := h.currentConfig()
+	if cfg == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "configuration unavailable"})
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"auth-model-exclusions": config.NormalizeAuthModelExclusionRules(h.cfg.AuthModelExclusions)})
+	c.JSON(http.StatusOK, gin.H{"auth-model-exclusions": config.NormalizeAuthModelExclusionRules(cfg.AuthModelExclusions)})
 }
 
 func (h *Handler) PutAuthModelExclusions(c *gin.Context) {
-	if h == nil || h.cfg == nil {
+	if h == nil || h.currentConfig() == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "configuration unavailable"})
 		return
 	}
@@ -429,13 +474,20 @@ func (h *Handler) PutAuthModelExclusions(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
 		return
 	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	h.cfg.AuthModelExclusions = config.NormalizeAuthModelExclusionRules(*body.Value)
-	h.persist(c)
+	h.persistLocked(c)
 }
 
 // Max retry credentials
 func (h *Handler) GetMaxRetryCredentials(c *gin.Context) {
-	c.JSON(200, gin.H{"max-retry-credentials": h.cfg.MaxRetryCredentials})
+	cfg := h.currentConfig()
+	if cfg == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "configuration unavailable"})
+		return
+	}
+	c.JSON(200, gin.H{"max-retry-credentials": cfg.MaxRetryCredentials})
 }
 func (h *Handler) PutMaxRetryCredentials(c *gin.Context) {
 	h.updateIntFieldNormalized(c, clampNonNegativeInt, func(v int) { h.cfg.MaxRetryCredentials = v })
@@ -443,7 +495,12 @@ func (h *Handler) PutMaxRetryCredentials(c *gin.Context) {
 
 // Max retry interval
 func (h *Handler) GetMaxRetryInterval(c *gin.Context) {
-	c.JSON(200, gin.H{"max-retry-interval": h.cfg.MaxRetryInterval})
+	cfg := h.currentConfig()
+	if cfg == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "configuration unavailable"})
+		return
+	}
+	c.JSON(200, gin.H{"max-retry-interval": cfg.MaxRetryInterval})
 }
 func (h *Handler) PutMaxRetryInterval(c *gin.Context) {
 	h.updateIntFieldNormalized(c, clampNonNegativeInt, func(v int) { h.cfg.MaxRetryInterval = v })
@@ -451,7 +508,8 @@ func (h *Handler) PutMaxRetryInterval(c *gin.Context) {
 
 // ForceModelPrefix
 func (h *Handler) GetForceModelPrefix(c *gin.Context) {
-	c.JSON(200, gin.H{"force-model-prefix": h.cfg.ForceModelPrefix})
+	cfg := h.currentConfig()
+	c.JSON(200, gin.H{"force-model-prefix": cfg != nil && cfg.ForceModelPrefix})
 }
 func (h *Handler) PutForceModelPrefix(c *gin.Context) {
 	h.updateBoolField(c, func(v bool) { h.cfg.ForceModelPrefix = v })
@@ -485,10 +543,12 @@ func normalizePerAuthRequestWindowMinutes(value int) int {
 }
 
 func (h *Handler) updateRoutingConfig(c *gin.Context, update func(*config.RoutingConfig)) bool {
-	if h == nil || h.cfg == nil {
+	if h == nil || h.currentConfig() == nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "config not initialized"})
 		return false
 	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	routing := h.cfg.Routing
 	update(&routing)
 	normalized, errNormalize := config.NormalizeRoutingConfig(routing)
@@ -497,14 +557,19 @@ func (h *Handler) updateRoutingConfig(c *gin.Context, update func(*config.Routin
 		return false
 	}
 	h.cfg.Routing = normalized
-	return true
+	return h.persistLocked(c)
 }
 
 // RoutingStrategy
 func (h *Handler) GetRoutingStrategy(c *gin.Context) {
-	strategy, ok := normalizeRoutingStrategy(h.cfg.Routing.Strategy)
+	cfg := h.currentConfig()
+	if cfg == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "configuration unavailable"})
+		return
+	}
+	strategy, ok := normalizeRoutingStrategy(cfg.Routing.Strategy)
 	if !ok {
-		c.JSON(200, gin.H{"strategy": strings.TrimSpace(h.cfg.Routing.Strategy)})
+		c.JSON(200, gin.H{"strategy": strings.TrimSpace(cfg.Routing.Strategy)})
 		return
 	}
 	c.JSON(200, gin.H{"strategy": strategy})
@@ -527,11 +592,15 @@ func (h *Handler) PutRoutingStrategy(c *gin.Context) {
 	}) {
 		return
 	}
-	h.persist(c)
 }
 
 func (h *Handler) GetRoutingFillFirstRange(c *gin.Context) {
-	c.JSON(200, gin.H{"fill-first-range": normalizeFillFirstRange(h.cfg.Routing.FillFirstRange)})
+	cfg := h.currentConfig()
+	if cfg == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "configuration unavailable"})
+		return
+	}
+	c.JSON(200, gin.H{"fill-first-range": normalizeFillFirstRange(cfg.Routing.FillFirstRange)})
 }
 
 func (h *Handler) PutRoutingFillFirstRange(c *gin.Context) {
@@ -547,11 +616,15 @@ func (h *Handler) PutRoutingFillFirstRange(c *gin.Context) {
 	}) {
 		return
 	}
-	h.persist(c)
 }
 
 func (h *Handler) GetRoutingFillFirstPerAuthRPM(c *gin.Context) {
-	c.JSON(200, gin.H{"fill-first-per-auth-rpm": normalizeFillFirstPerAuthRPM(h.cfg.Routing.FillFirstPerAuthRPM)})
+	cfg := h.currentConfig()
+	if cfg == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "configuration unavailable"})
+		return
+	}
+	c.JSON(200, gin.H{"fill-first-per-auth-rpm": normalizeFillFirstPerAuthRPM(cfg.Routing.FillFirstPerAuthRPM)})
 }
 
 func (h *Handler) PutRoutingFillFirstPerAuthRPM(c *gin.Context) {
@@ -567,11 +640,15 @@ func (h *Handler) PutRoutingFillFirstPerAuthRPM(c *gin.Context) {
 	}) {
 		return
 	}
-	h.persist(c)
 }
 
 func (h *Handler) GetRoutingPerAuthRequestLimit(c *gin.Context) {
-	c.JSON(200, gin.H{"per-auth-request-limit": normalizePerAuthRequestLimit(h.cfg.Routing.PerAuthRequestLimit)})
+	cfg := h.currentConfig()
+	if cfg == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "configuration unavailable"})
+		return
+	}
+	c.JSON(200, gin.H{"per-auth-request-limit": normalizePerAuthRequestLimit(cfg.Routing.PerAuthRequestLimit)})
 }
 
 func (h *Handler) PutRoutingPerAuthRequestLimit(c *gin.Context) {
@@ -587,11 +664,15 @@ func (h *Handler) PutRoutingPerAuthRequestLimit(c *gin.Context) {
 	}) {
 		return
 	}
-	h.persist(c)
 }
 
 func (h *Handler) GetRoutingPerAuthRequestWindowMinutes(c *gin.Context) {
-	c.JSON(200, gin.H{"per-auth-request-window-minutes": normalizePerAuthRequestWindowMinutes(h.cfg.Routing.PerAuthRequestWindowMinutes)})
+	cfg := h.currentConfig()
+	if cfg == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "configuration unavailable"})
+		return
+	}
+	c.JSON(200, gin.H{"per-auth-request-window-minutes": normalizePerAuthRequestWindowMinutes(cfg.Routing.PerAuthRequestWindowMinutes)})
 }
 
 func (h *Handler) PutRoutingPerAuthRequestWindowMinutes(c *gin.Context) {
@@ -607,11 +688,15 @@ func (h *Handler) PutRoutingPerAuthRequestWindowMinutes(c *gin.Context) {
 	}) {
 		return
 	}
-	h.persist(c)
 }
 
 func (h *Handler) GetRoutingPriorityOverrides(c *gin.Context) {
-	c.JSON(200, gin.H{"priority-overrides": h.cfg.Routing.PriorityOverrides})
+	cfg := h.currentConfig()
+	if cfg == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "configuration unavailable"})
+		return
+	}
+	c.JSON(200, gin.H{"priority-overrides": cfg.Routing.PriorityOverrides})
 }
 
 func (h *Handler) PutRoutingPriorityOverrides(c *gin.Context) {
@@ -627,7 +712,6 @@ func (h *Handler) PutRoutingPriorityOverrides(c *gin.Context) {
 	}) {
 		return
 	}
-	h.persist(c)
 }
 
 // Proxy URL
@@ -636,14 +720,12 @@ func (h *Handler) GetProxyURL(c *gin.Context) {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "configuration unavailable"})
 		return
 	}
-	h.mu.Lock()
-	if h.cfg == nil {
-		h.mu.Unlock()
+	cfg := h.currentConfig()
+	if cfg == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "configuration unavailable"})
 		return
 	}
-	proxyURL := proxyutil.MaskProxyURL(h.cfg.ProxyURL)
-	h.mu.Unlock()
+	proxyURL := proxyutil.MaskProxyURL(cfg.ProxyURL)
 	c.JSON(200, gin.H{"proxy-url": proxyURL})
 }
 func (h *Handler) PutProxyURL(c *gin.Context) {

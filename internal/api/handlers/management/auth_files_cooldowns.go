@@ -287,8 +287,8 @@ func (h *Handler) updateClearedAuthCooldown(ctx context.Context, auth *coreauth.
 	if err != nil {
 		return err
 	}
-	if h.authStatusHook != nil {
-		h.authStatusHook(ctx, updated.Clone())
+	if hook := h.authStatusHookSnapshot(); hook != nil {
+		hook(ctx, updated.Clone())
 	}
 	return nil
 }

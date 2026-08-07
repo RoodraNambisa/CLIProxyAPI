@@ -35,12 +35,8 @@ type proxyCheckResponse struct {
 // GetProxyURLCheck checks the currently configured global proxy-url.
 func (h *Handler) GetProxyURLCheck(c *gin.Context) {
 	proxyURL := ""
-	if h != nil {
-		h.mu.Lock()
-		if h.cfg != nil {
-			proxyURL = h.cfg.ProxyURL
-		}
-		h.mu.Unlock()
+	if cfg := h.currentConfig(); cfg != nil {
+		proxyURL = cfg.ProxyURL
 	}
 	h.writeProxyURLCheck(c, proxyURL)
 }

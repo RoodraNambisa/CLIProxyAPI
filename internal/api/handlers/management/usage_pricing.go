@@ -137,15 +137,11 @@ func (h *Handler) DeleteUsagePrice(c *gin.Context) {
 }
 
 func (h *Handler) usagePricingSnapshot() (config.UsagePricingConfig, bool) {
-	if h == nil {
+	cfg := h.currentConfig()
+	if cfg == nil {
 		return config.UsagePricingConfig{}, false
 	}
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	if h.cfg == nil {
-		return config.UsagePricingConfig{}, false
-	}
-	return config.UsagePricingConfig{Models: cloneUsagePricingModels(h.cfg.UsagePricing.Models)}, true
+	return config.UsagePricingConfig{Models: cloneUsagePricingModels(cfg.UsagePricing.Models)}, true
 }
 
 func (h *Handler) usageCostPrices() map[string]usage.ModelPrice {

@@ -67,28 +67,29 @@ func (h *Handler) GetChatGPTWebUsageCache(c *gin.Context) {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "configuration unavailable"})
 		return
 	}
-	h.mu.Lock()
-	if h.cfg == nil {
-		h.mu.Unlock()
+	cfg := h.currentConfig()
+	if cfg == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "configuration unavailable"})
 		return
 	}
 	response := chatGPTWebUsageCacheResponse{
-		EstimateTokenUsage: h.cfg.ChatGPTWeb.TokenUsageEstimationEnabled(),
-		UsageCache:         h.cfg.ChatGPTWeb.UsageCache.Resolved(),
+		EstimateTokenUsage: cfg.ChatGPTWeb.TokenUsageEstimationEnabled(),
+		UsageCache:         cfg.ChatGPTWeb.UsageCache.Resolved(),
 		ImageUsage: chatGPTWebImageUsageResponse{
-			AutoOutputQuality: h.cfg.ChatGPTWeb.ImageUsage.ResolvedAutoOutputQuality(),
-			FallbackUsage:     h.cfg.ChatGPTWeb.ImageUsage.FallbackUsage.Resolved(),
+			AutoOutputQuality: cfg.ChatGPTWeb.ImageUsage.ResolvedAutoOutputQuality(),
+			FallbackUsage:     cfg.ChatGPTWeb.ImageUsage.FallbackUsage.Resolved(),
 		},
 	}
-	if h.authManager != nil {
-		if registered, ok := h.authManager.Executor(chatgptwebauth.Provider); ok {
+	h.mu.Lock()
+	manager := h.authManager
+	h.mu.Unlock()
+	if manager != nil {
+		if registered, ok := manager.Executor(chatgptwebauth.Provider); ok {
 			if snapshotter, okSnapshotter := registered.(chatGPTWebUsageCacheSnapshotter); okSnapshotter {
 				response.Stats = snapshotter.UsageCacheSnapshot()
 			}
 		}
 	}
-	h.mu.Unlock()
 	response.Filesystem = systemmetrics.CollectFilesystem(
 		chatGPTWebUsageCacheFilesystemPath(response.UsageCache.Path),
 	)
@@ -121,8 +122,8 @@ func (h *Handler) updateChatGPTWebUsageCache(c *gin.Context, replace bool) {
 	}
 
 	h.mu.Lock()
-	defer h.mu.Unlock()
 	if h.cfg == nil {
+		h.mu.Unlock()
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "configuration unavailable"})
 		return
 	}
@@ -136,10 +137,12 @@ func (h *Handler) updateChatGPTWebUsageCache(c *gin.Context, replace bool) {
 		candidate.ImageUsage = config.ChatGPTWebImageUsageConfig{}
 	}
 	if errApply := request.apply(&candidate, replace); errApply != nil {
+		h.mu.Unlock()
 		c.JSON(http.StatusBadRequest, gin.H{"error": errApply.Error()})
 		return
 	}
 	if errValidate := candidate.Validate(); errValidate != nil {
+		h.mu.Unlock()
 		c.JSON(http.StatusBadRequest, gin.H{"error": errValidate.Error()})
 		return
 	}
@@ -148,12 +151,16 @@ func (h *Handler) updateChatGPTWebUsageCache(c *gin.Context, replace bool) {
 		if h.cfg != nil {
 			h.cfg.ChatGPTWeb = previous
 		}
+		h.mu.Unlock()
 		return
 	}
-	if h.authManager != nil {
-		if registered, ok := h.authManager.Executor(chatgptwebauth.Provider); ok {
+	manager := h.authManager
+	appliedConfig := h.configSnapshot.Load()
+	h.mu.Unlock()
+	if manager != nil {
+		if registered, ok := manager.Executor(chatgptwebauth.Provider); ok {
 			if updater, okUpdater := registered.(chatGPTWebSentinelConfigUpdater); okUpdater {
-				updater.UpdateConfig(h.cfg)
+				updater.UpdateConfig(appliedConfig)
 			}
 		}
 	}

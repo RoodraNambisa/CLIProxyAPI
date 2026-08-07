@@ -129,7 +129,7 @@ func TestGetChatGPTWebSentinelReturnsRuntimeSnapshot(t *testing.T) {
 	}
 }
 
-func TestGetChatGPTWebSentinelKeepsConfigAndRuntimeSnapshotConsistent(t *testing.T) {
+func TestGetChatGPTWebSentinelAllowsConfigUpdateWhileRuntimeSnapshotBlocked(t *testing.T) {
 	handler, _ := newPersistedChatGPTWebSentinelHandler(t, explicitSentinelConfig(true, 2, 9, 4))
 	manager := coreauth.NewManager(nil, nil, nil)
 	executor := &sentinelBlockingSnapshotExecutor{
@@ -162,10 +162,14 @@ func TestGetChatGPTWebSentinelKeepsConfigAndRuntimeSnapshotConsistent(t *testing
 		handler.PatchChatGPTWebSentinel(ctx)
 		patchDone <- recorder
 	}()
+	var patchRecorder *httptest.ResponseRecorder
 	select {
-	case recorder := <-patchDone:
-		t.Fatalf("PATCH completed while GET runtime snapshot was blocked: %s", recorder.Body.String())
-	case <-time.After(50 * time.Millisecond):
+	case patchRecorder = <-patchDone:
+		if patchRecorder.Code != http.StatusOK {
+			t.Fatalf("PATCH status = %d, want 200: %s", patchRecorder.Code, patchRecorder.Body.String())
+		}
+	case <-time.After(time.Second):
+		t.Fatal("PATCH waited for an unrelated runtime snapshot")
 	}
 
 	close(executor.release)
@@ -173,10 +177,6 @@ func TestGetChatGPTWebSentinelKeepsConfigAndRuntimeSnapshotConsistent(t *testing
 	getResponse := decodeChatGPTWebSentinelResponse(t, getRecorder)
 	if !getResponse.SDKRuntimeEnabled || !getResponse.Available || getResponse.WorkerLimit != 2 {
 		t.Fatalf("GET response mixed config and runtime generations: %#v", getResponse)
-	}
-	patchRecorder := <-patchDone
-	if patchRecorder.Code != http.StatusOK {
-		t.Fatalf("PATCH status = %d, want 200: %s", patchRecorder.Code, patchRecorder.Body.String())
 	}
 }
 

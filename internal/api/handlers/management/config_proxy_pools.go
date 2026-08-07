@@ -2,6 +2,7 @@ package management
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -16,9 +17,10 @@ import (
 
 // GetProxyPools returns complete structured proxy pools to authenticated management clients.
 func (h *Handler) GetProxyPools(c *gin.Context) {
-	h.mu.Lock()
-	pools := cloneProxyPools(h.cfg.ProxyPools)
-	h.mu.Unlock()
+	var pools []config.ProxyPoolConfig
+	if cfg := h.currentConfig(); cfg != nil {
+		pools = cloneProxyPools(cfg.ProxyPools)
+	}
 	c.Header("Cache-Control", "no-store")
 	c.JSON(http.StatusOK, gin.H{"proxy-pools": pools})
 }
@@ -175,38 +177,81 @@ func (h *Handler) PatchProxyPool(c *gin.Context) {
 		h.mu.Unlock()
 		return
 	}
+	if !h.persistProxyPoolRenameLocked(c, oldName, *body.Name) {
+		h.cfg.ProxyPools = previousPools
+		h.cfg.ProxyRules = previousRules
+	}
+	h.mu.Unlock()
+}
+
+// persistProxyPoolRenameLocked preserves stable bindings while applying the
+// same full runtime configuration transaction used by other management writes.
+// The caller must hold h.mu; this method returns with h.mu held.
+func (h *Handler) persistProxyPoolRenameLocked(c *gin.Context, oldName, newName string) bool {
 	previousBody, previousExisted, errPreviousBody := h.readPersistedConfigBodyLocked()
 	if errPreviousBody != nil {
-		h.cfg.ProxyPools = previousPools
-		h.cfg.ProxyRules = previousRules
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read current config"})
-		h.mu.Unlock()
-		return
+		return false
+	}
+	previousCfg, errPreviousConfig := config.LoadConfigOptional(h.configFilePath, true)
+	if errPreviousConfig != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to load current config"})
+		return false
+	}
+	candidate, errCandidate := config.Clone(h.cfg)
+	if errCandidate != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to snapshot runtime configuration"})
+		return false
+	}
+	publishedCandidate, errPublishedCandidate := config.Clone(candidate)
+	if errPublishedCandidate != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to snapshot published configuration"})
+		return false
 	}
 	if errSave := config.SaveConfigPreserveComments(h.configFilePath, h.cfg); errSave != nil {
-		h.cfg.ProxyPools = previousPools
-		h.cfg.ProxyRules = previousRules
 		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to save config: %v", errSave)})
-		h.mu.Unlock()
-		return
+		return false
 	}
-	if errRuntime := h.proxyPoolManager.UpdateConfigWithPoolRename(h.cfg, oldName, *body.Name); errRuntime != nil {
-		h.cfg.ProxyPools = previousPools
-		h.cfg.ProxyRules = previousRules
-		errRollbackFile := h.restorePersistedConfigFileLocked(previousBody, previousExisted)
-		errRollbackRuntime := h.proxyPoolManager.UpdateConfig(h.cfg)
-		if errRollbackFile != nil || errRollbackRuntime != nil {
-			log.WithError(errors.Join(errRuntime, errRollbackFile, errRollbackRuntime)).Error("proxy pool rename failed and rollback was incomplete")
+	manager := h.proxyPoolManager
+	h.mu.Unlock()
+	errRename := manager.UpdateConfigWithPoolRename(candidate, oldName, newName)
+	var (
+		result   config.RuntimeApplyResult
+		errApply error
+	)
+	if errRename == nil {
+		result, errApply = h.applyRuntimeConfig(c.Request.Context(), candidate)
+	}
+	h.mu.Lock()
+	if errRename != nil || errApply != nil {
+		errPrimary := errors.Join(errRename, errApply)
+		errRollbackFile := h.restorePersistedConfigLocked(previousBody, previousExisted, previousCfg)
+		h.mu.Unlock()
+		var errRollbackRename error
+		if errRename == nil {
+			errRollbackRename = manager.UpdateConfigWithPoolRename(previousCfg, newName, oldName)
+		}
+		var errRollbackRuntime error
+		if previousCfg != nil {
+			_, errRollbackRuntime = h.applyRuntimeConfig(context.WithoutCancel(c.Request.Context()), previousCfg)
+		}
+		h.mu.Lock()
+		if errRollbackFile != nil || errRollbackRename != nil || errRollbackRuntime != nil {
+			log.WithError(errors.Join(errPrimary, errRollbackFile, errRollbackRename, errRollbackRuntime)).Error("proxy pool rename failed and rollback was incomplete")
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "proxy pool binding migration failed and rollback was incomplete"})
-			h.mu.Unlock()
-			return
+			return false
 		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to migrate proxy pool bindings"})
-		h.mu.Unlock()
-		return
+		return false
 	}
-	c.JSON(http.StatusOK, gin.H{"status": "ok"})
-	h.mu.Unlock()
+	h.configSnapshot.Store(publishedCandidate)
+	response := gin.H{"status": "ok", "applied": result.Applied}
+	if result.RestartRequired {
+		response["restart_required"] = true
+		response["restart_fields"] = result.RestartFields
+	}
+	c.JSON(http.StatusOK, response)
+	return true
 }
 
 // DeleteProxyPool removes an unreferenced structured proxy pool.
@@ -236,9 +281,10 @@ func (h *Handler) DeleteProxyPool(c *gin.Context) {
 
 // GetProxyRules returns ordered proxy routing rules.
 func (h *Handler) GetProxyRules(c *gin.Context) {
-	h.mu.Lock()
-	rules := cloneProxyRules(h.cfg.ProxyRules)
-	h.mu.Unlock()
+	var rules []config.ProxyRuleConfig
+	if cfg := h.currentConfig(); cfg != nil {
+		rules = cloneProxyRules(cfg.ProxyRules)
+	}
 	c.JSON(http.StatusOK, gin.H{"proxy-rules": rules})
 }
 

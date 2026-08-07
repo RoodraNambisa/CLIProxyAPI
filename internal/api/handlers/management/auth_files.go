@@ -238,18 +238,19 @@ func stopForwarderInstance(port int, forwarder *callbackForwarder) {
 }
 
 func (h *Handler) managementCallbackURL(path string) (string, error) {
-	if h == nil || h.cfg == nil || h.cfg.Port <= 0 {
+	cfg := h.currentConfig()
+	if cfg == nil || cfg.Port <= 0 {
 		return "", fmt.Errorf("server port is not configured")
 	}
 	if !strings.HasPrefix(path, "/") {
 		path = "/" + path
 	}
-	path = config.JoinManagementAccessPath(h.cfg.RemoteManagement.AccessPath, path)
+	path = config.JoinManagementAccessPath(cfg.RemoteManagement.AccessPath, path)
 	scheme := "http"
-	if h.cfg.TLS.Enable {
+	if cfg.TLS.Enable {
 		scheme = "https"
 	}
-	return fmt.Sprintf("%s://127.0.0.1:%d%s", scheme, h.cfg.Port, path), nil
+	return fmt.Sprintf("%s://127.0.0.1:%d%s", scheme, cfg.Port, path), nil
 }
 
 func (h *Handler) ListAuthFiles(c *gin.Context) {
@@ -271,8 +272,9 @@ func (h *Handler) ListAuthFiles(c *gin.Context) {
 	}
 	h.mu.Lock()
 	manager := h.authManager
-	paginationEnabled := h.cfg != nil && h.cfg.RemoteManagement.AuthFilesPagination.Enabled
 	h.mu.Unlock()
+	cfg := h.currentConfig()
+	paginationEnabled := cfg != nil && cfg.RemoteManagement.AuthFilesPagination.Enabled
 	if paged && paginationEnabled && manager != nil {
 		h.listAuthFilesPaged(c, manager)
 		return
@@ -342,9 +344,8 @@ func (h *Handler) listRetiredGeminiCLIAuthFilesExcluding(managedNames map[string
 	if h == nil {
 		return nil, nil
 	}
-	h.mu.Lock()
-	hasAuthDir := h.cfg != nil && strings.TrimSpace(h.cfg.AuthDir) != ""
-	h.mu.Unlock()
+	cfg := h.currentConfig()
+	hasAuthDir := cfg != nil && strings.TrimSpace(cfg.AuthDir) != ""
 	if !hasAuthDir {
 		return nil, nil
 	}
@@ -978,12 +979,10 @@ func (h *Handler) authDirSnapshot() (string, string, error) {
 	if h == nil {
 		return "", "", fmt.Errorf("handler not initialized")
 	}
-	h.mu.Lock()
 	configuredAuthDir := ""
-	if h.cfg != nil {
-		configuredAuthDir = h.cfg.AuthDir
+	if cfg := h.currentConfig(); cfg != nil {
+		configuredAuthDir = cfg.AuthDir
 	}
-	h.mu.Unlock()
 	if strings.TrimSpace(configuredAuthDir) == "" {
 		return "", "", fmt.Errorf("handler not initialized")
 	}
@@ -2428,7 +2427,8 @@ func (h *Handler) deleteAuthFileByNameAtRootExpected(ctx context.Context, root *
 }
 
 func (h *Handler) notifyManagedAuthDeleted(ctx context.Context, authsByID map[string]*coreauth.Auth) {
-	if h == nil || h.authDeleteHook == nil || len(authsByID) == 0 {
+	hook := h.authDeleteHookSnapshot()
+	if hook == nil || len(authsByID) == 0 {
 		return
 	}
 	auths := make([]*coreauth.Auth, 0, len(authsByID))
@@ -2445,7 +2445,7 @@ func (h *Handler) notifyManagedAuthDeleted(ctx context.Context, authsByID map[st
 			log.Errorf("managed auth delete cleanup hook panicked: %v", recovered)
 		}
 	}()
-	h.authDeleteHook(ctx, auths)
+	hook(ctx, auths)
 }
 
 func managedAuthFileProviderAtRoot(root *os.Root, authDir, name string) string {
@@ -2801,8 +2801,8 @@ func (h *Handler) authIDForPath(path string) string {
 		return false
 	}
 	if authDir, errAuthDir := h.resolvedAuthDir(); errAuthDir == nil {
-		if !setRelativeID(authDir, resolvedPath) && h != nil && h.cfg != nil {
-			if lexicalAuthDir, errResolve := util.ResolveAuthDir(strings.TrimSpace(h.cfg.AuthDir)); errResolve == nil && lexicalAuthDir != "" {
+		if cfg := h.currentConfig(); !setRelativeID(authDir, resolvedPath) && cfg != nil {
+			if lexicalAuthDir, errResolve := util.ResolveAuthDir(strings.TrimSpace(cfg.AuthDir)); errResolve == nil && lexicalAuthDir != "" {
 				if !filepath.IsAbs(lexicalAuthDir) {
 					if abs, errAbs := filepath.Abs(lexicalAuthDir); errAbs == nil {
 						lexicalAuthDir = abs
@@ -3232,8 +3232,8 @@ func (h *Handler) PatchAuthFileStatus(c *gin.Context) {
 		c.JSON(http.StatusConflict, gin.H{"error": "auth file changed while status was being updated"})
 		return
 	}
-	if h.authStatusHook != nil {
-		h.authStatusHook(ctx, updated.Clone())
+	if hook := h.authStatusHookSnapshot(); hook != nil {
+		hook(ctx, updated.Clone())
 	}
 
 	c.JSON(http.StatusOK, gin.H{"status": "ok", "disabled": *req.Disabled})
@@ -3273,15 +3273,11 @@ func (h *Handler) disableAuth(ctx context.Context, id string) {
 }
 
 func (h *Handler) configuredAuthDirSnapshot() string {
-	if h == nil {
+	cfg := h.currentConfig()
+	if cfg == nil {
 		return ""
 	}
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	if h.cfg == nil {
-		return ""
-	}
-	return h.cfg.AuthDir
+	return cfg.AuthDir
 }
 
 func (h *Handler) withTokenStoreBaseDir(baseDir string, operation func(coreauth.Store) error) error {
@@ -3317,8 +3313,8 @@ func (h *Handler) saveTokenRecord(ctx context.Context, record *coreauth.Auth) (s
 	if record == nil {
 		return "", fmt.Errorf("token record is nil")
 	}
-	if h.postAuthHook != nil {
-		if err := h.postAuthHook(ctx, record); err != nil {
+	if hook := h.postAuthHookSnapshot(); hook != nil {
+		if err := hook(ctx, record); err != nil {
 			return "", fmt.Errorf("post-auth hook failed: %w", err)
 		}
 	}
@@ -3332,6 +3328,11 @@ func (h *Handler) saveTokenRecord(ctx context.Context, record *coreauth.Auth) (s
 }
 
 func (h *Handler) RequestAnthropicToken(c *gin.Context) {
+	cfg := h.currentConfig()
+	if cfg == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "configuration unavailable"})
+		return
+	}
 	ctx := context.Background()
 	ctx = PopulateAuthContext(ctx, c)
 
@@ -3354,7 +3355,7 @@ func (h *Handler) RequestAnthropicToken(c *gin.Context) {
 	}
 
 	// Initialize Claude auth service
-	anthropicAuth := claude.NewClaudeAuth(h.cfg)
+	anthropicAuth := claude.NewClaudeAuth(cfg)
 
 	// Generate authorization URL (then override redirect_uri to reuse server port)
 	authURL, state, err := anthropicAuth.GenerateAuthURL(state, pkceCodes)
@@ -3389,7 +3390,7 @@ func (h *Handler) RequestAnthropicToken(c *gin.Context) {
 		}
 
 		// Helper: wait for callback file
-		waitFile := filepath.Join(h.cfg.AuthDir, fmt.Sprintf(".oauth-anthropic-%s.oauth", state))
+		waitFile := filepath.Join(cfg.AuthDir, fmt.Sprintf(".oauth-anthropic-%s.oauth", state))
 		waitForFile := func(path string, timeout time.Duration) (map[string]string, error) {
 			deadline := time.Now().Add(timeout)
 			for {
@@ -3479,6 +3480,11 @@ func (h *Handler) RequestAnthropicToken(c *gin.Context) {
 }
 
 func (h *Handler) RequestCodexToken(c *gin.Context) {
+	cfg := h.currentConfig()
+	if cfg == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "configuration unavailable"})
+		return
+	}
 	ctx := context.Background()
 	ctx = PopulateAuthContext(ctx, c)
 
@@ -3501,7 +3507,7 @@ func (h *Handler) RequestCodexToken(c *gin.Context) {
 	}
 
 	// Initialize Codex auth service
-	openaiAuth := codex.NewCodexAuth(h.cfg)
+	openaiAuth := codex.NewCodexAuth(cfg)
 
 	// Generate authorization URL
 	authURL, err := openaiAuth.GenerateAuthURL(state, pkceCodes)
@@ -3536,7 +3542,7 @@ func (h *Handler) RequestCodexToken(c *gin.Context) {
 		}
 
 		// Wait for callback file
-		waitFile := filepath.Join(h.cfg.AuthDir, fmt.Sprintf(".oauth-codex-%s.oauth", state))
+		waitFile := filepath.Join(cfg.AuthDir, fmt.Sprintf(".oauth-codex-%s.oauth", state))
 		deadline := time.Now().Add(5 * time.Minute)
 		var code string
 		for {
@@ -3627,12 +3633,17 @@ func (h *Handler) RequestCodexToken(c *gin.Context) {
 }
 
 func (h *Handler) RequestAntigravityToken(c *gin.Context) {
+	cfg := h.currentConfig()
+	if cfg == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "configuration unavailable"})
+		return
+	}
 	ctx := context.Background()
 	ctx = PopulateAuthContext(ctx, c)
 
 	fmt.Println("Initializing Antigravity authentication...")
 
-	authSvc := antigravity.NewAntigravityAuth(h.cfg, nil)
+	authSvc := antigravity.NewAntigravityAuth(cfg, nil)
 
 	state, errState := misc.GenerateRandomState()
 	if errState != nil {
@@ -3668,7 +3679,7 @@ func (h *Handler) RequestAntigravityToken(c *gin.Context) {
 			defer stopCallbackForwarderInstance(antigravity.CallbackPort, forwarder)
 		}
 
-		waitFile := filepath.Join(h.cfg.AuthDir, fmt.Sprintf(".oauth-antigravity-%s.oauth", state))
+		waitFile := filepath.Join(cfg.AuthDir, fmt.Sprintf(".oauth-antigravity-%s.oauth", state))
 		deadline := time.Now().Add(5 * time.Minute)
 		var authCode string
 		for {
@@ -3802,12 +3813,17 @@ func (h *Handler) RequestAntigravityToken(c *gin.Context) {
 
 // RequestXAIToken starts the xAI OAuth device-code flow.
 func (h *Handler) RequestXAIToken(c *gin.Context) {
+	cfg := h.currentConfig()
+	if cfg == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "configuration unavailable"})
+		return
+	}
 	ctx := PopulateAuthContext(context.Background(), c)
 
 	fmt.Println("Initializing xAI authentication...")
 
 	state := fmt.Sprintf("xai-%d", time.Now().UnixNano())
-	authSvc := xaiauth.NewXAIAuth(h.cfg)
+	authSvc := xaiauth.NewXAIAuth(cfg)
 	deviceFlow, errStartDeviceFlow := authSvc.StartDeviceFlow(ctx)
 	if errStartDeviceFlow != nil {
 		log.Errorf("Failed to start xAI device flow: %v", errStartDeviceFlow)
@@ -3917,6 +3933,11 @@ func (h *Handler) RequestXAIToken(c *gin.Context) {
 }
 
 func (h *Handler) RequestKimiToken(c *gin.Context) {
+	cfg := h.currentConfig()
+	if cfg == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "configuration unavailable"})
+		return
+	}
 	ctx := context.Background()
 	ctx = PopulateAuthContext(ctx, c)
 
@@ -3924,7 +3945,7 @@ func (h *Handler) RequestKimiToken(c *gin.Context) {
 
 	state := fmt.Sprintf("kmi-%d", time.Now().UnixNano())
 	// Initialize Kimi auth service
-	kimiAuth := kimi.NewKimiAuth(h.cfg)
+	kimiAuth := kimi.NewKimiAuth(cfg)
 
 	// Generate authorization URL
 	deviceFlow, errStartDeviceFlow := kimiAuth.StartDeviceFlow(ctx)

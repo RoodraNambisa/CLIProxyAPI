@@ -9,14 +9,15 @@ import (
 )
 
 func (h *Handler) GetControlPanelUpdate(c *gin.Context) {
-	if h == nil || h.cfg == nil {
+	cfg := h.currentConfig()
+	if cfg == nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "config unavailable"})
 		return
 	}
-	if h.cfg.RemoteManagement.DisableControlPanel {
+	if cfg.RemoteManagement.DisableControlPanel {
 		c.JSON(http.StatusOK, managementasset.ManagementHTMLStatus{
 			Disabled:           true,
-			AutoUpdateDisabled: h.cfg.RemoteManagement.DisableAutoUpdatePanel,
+			AutoUpdateDisabled: cfg.RemoteManagement.DisableAutoUpdatePanel,
 			CheckedAt:          time.Now().UTC(),
 		})
 		return
@@ -24,23 +25,24 @@ func (h *Handler) GetControlPanelUpdate(c *gin.Context) {
 	status := managementasset.CheckManagementHTMLStatus(
 		c.Request.Context(),
 		managementasset.StaticDir(h.configFilePath),
-		h.cfg.ProxyURL,
-		h.cfg.RemoteManagement.PanelGitHubRepository,
+		cfg.ProxyURL,
+		cfg.RemoteManagement.PanelGitHubRepository,
 	)
-	status.Disabled = h.cfg.RemoteManagement.DisableControlPanel
-	status.AutoUpdateDisabled = h.cfg.RemoteManagement.DisableAutoUpdatePanel
+	status.Disabled = cfg.RemoteManagement.DisableControlPanel
+	status.AutoUpdateDisabled = cfg.RemoteManagement.DisableAutoUpdatePanel
 	c.JSON(http.StatusOK, status)
 }
 
 func (h *Handler) PostControlPanelUpdate(c *gin.Context) {
-	if h == nil || h.cfg == nil {
+	cfg := h.currentConfig()
+	if cfg == nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "config unavailable"})
 		return
 	}
-	if h.cfg.RemoteManagement.DisableControlPanel {
+	if cfg.RemoteManagement.DisableControlPanel {
 		c.JSON(http.StatusOK, managementasset.ManagementHTMLStatus{
 			Disabled:           true,
-			AutoUpdateDisabled: h.cfg.RemoteManagement.DisableAutoUpdatePanel,
+			AutoUpdateDisabled: cfg.RemoteManagement.DisableAutoUpdatePanel,
 			CheckedAt:          time.Now().UTC(),
 			Error:              "control panel disabled",
 		})
@@ -49,10 +51,10 @@ func (h *Handler) PostControlPanelUpdate(c *gin.Context) {
 	status := managementasset.UpdateManagementHTML(
 		c.Request.Context(),
 		managementasset.StaticDir(h.configFilePath),
-		h.cfg.ProxyURL,
-		h.cfg.RemoteManagement.PanelGitHubRepository,
+		cfg.ProxyURL,
+		cfg.RemoteManagement.PanelGitHubRepository,
 		true,
 	)
-	status.AutoUpdateDisabled = h.cfg.RemoteManagement.DisableAutoUpdatePanel
+	status.AutoUpdateDisabled = cfg.RemoteManagement.DisableAutoUpdatePanel
 	c.JSON(http.StatusOK, status)
 }
