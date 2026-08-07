@@ -29,6 +29,28 @@ func TestEmptyRetiredPathIsIgnored(t *testing.T) {
 	}
 }
 
+func TestRetiredRevisionTracksCatalogChangesAndObservedRewrites(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "retired.json")
+	initial := RetiredRevision()
+	snapshot, created := MarkRetired(path)
+	if !created || RetiredRevision() <= initial {
+		t.Fatalf("mark revision = %d, initial = %d, created = %t", RetiredRevision(), initial, created)
+	}
+	marked := RetiredRevision()
+	if _, created = MarkRetired(path); created || RetiredRevision() != marked {
+		t.Fatalf("repeated mark changed revision: revision=%d marked=%d created=%t", RetiredRevision(), marked, created)
+	}
+	NotifyRetiredFileChanged(path)
+	if RetiredRevision() <= marked {
+		t.Fatalf("rewrite revision = %d, marked = %d", RetiredRevision(), marked)
+	}
+	rewritten := RetiredRevision()
+	ClearRetiredSnapshot(snapshot)
+	if RetiredRevision() <= rewritten || IsRetired(path) {
+		t.Fatalf("clear revision = %d, rewritten = %d, retired = %t", RetiredRevision(), rewritten, IsRetired(path))
+	}
+}
+
 func TestClearRetiredSnapshotPreservesNewGeneration(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "auth.json")
 	ClearRetired(path)

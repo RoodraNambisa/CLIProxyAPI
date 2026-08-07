@@ -29,6 +29,7 @@ type RetiredSnapshot struct {
 var retiredPaths = struct {
 	sync.RWMutex
 	nextGeneration uint64
+	revision       uint64
 	byKey          map[string]map[uint64]struct{}
 	byGeneration   map[uint64]retiredMarker
 }{
@@ -178,8 +179,31 @@ func MarkRetired(path string) (RetiredSnapshot, bool) {
 		}
 		generations[generation] = struct{}{}
 	}
+	retiredPaths.revision++
 	retiredPaths.Unlock()
 	return RetiredSnapshot{generations: []uint64{generation}}, true
+}
+
+// NotifyRetiredFileChanged advances the retired-file catalog revision after a
+// watcher observes new contents for an already retired path.
+func NotifyRetiredFileChanged(path string) {
+	keys := pathIdentityKeys(path)
+	if len(keys) == 0 {
+		return
+	}
+	retiredPaths.Lock()
+	if len(retiredGenerationsForKeysLocked(keys)) != 0 {
+		retiredPaths.revision++
+	}
+	retiredPaths.Unlock()
+}
+
+// RetiredRevision returns the revision of the process-wide retired-file set.
+func RetiredRevision() uint64 {
+	retiredPaths.RLock()
+	revision := retiredPaths.revision
+	retiredPaths.RUnlock()
+	return revision
 }
 
 // IsRetired reports whether a path is locked to management-only use.
@@ -240,7 +264,9 @@ func ClearRetired(path string) {
 		return
 	}
 	retiredPaths.Lock()
-	removeRetiredGenerationsLocked(retiredGenerationsForKeysLocked(keys))
+	if removeRetiredGenerationsLocked(retiredGenerationsForKeysLocked(keys)) {
+		retiredPaths.revision++
+	}
 	retiredPaths.Unlock()
 }
 
@@ -272,7 +298,9 @@ func ClearRetiredSnapshot(snapshot RetiredSnapshot) {
 		generations[generation] = struct{}{}
 	}
 	retiredPaths.Lock()
-	removeRetiredGenerationsLocked(generations)
+	if removeRetiredGenerationsLocked(generations) {
+		retiredPaths.revision++
+	}
 	retiredPaths.Unlock()
 }
 
@@ -286,12 +314,14 @@ func retiredGenerationsForKeysLocked(keys []string) map[uint64]struct{} {
 	return generations
 }
 
-func removeRetiredGenerationsLocked(generations map[uint64]struct{}) {
+func removeRetiredGenerationsLocked(generations map[uint64]struct{}) bool {
+	removed := false
 	for generation := range generations {
 		marker, ok := retiredPaths.byGeneration[generation]
 		if !ok {
 			continue
 		}
+		removed = true
 		delete(retiredPaths.byGeneration, generation)
 		for _, key := range marker.keys {
 			indexedGenerations := retiredPaths.byKey[key]
@@ -301,6 +331,7 @@ func removeRetiredGenerationsLocked(generations map[uint64]struct{}) {
 			}
 		}
 	}
+	return removed
 }
 
 func sortedUniqueKeys(keys []string) []string {

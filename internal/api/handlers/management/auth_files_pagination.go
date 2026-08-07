@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"os"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -16,6 +15,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	chatgptwebauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/chatgptweb"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/authfileguard"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 )
 
@@ -27,16 +27,16 @@ const (
 )
 
 type authFilesPaginationCache struct {
-	mu             sync.Mutex
-	manager        *coreauth.Manager
-	revision       uint64
-	authDir        string
-	directoryStamp string
-	records        []*authFileListRecord
-	retiredRecords []*authFileListRecord
-	managedNames   map[string]struct{}
-	queries        map[string]*list.Element
-	lru            *list.List
+	mu              sync.Mutex
+	manager         *coreauth.Manager
+	revision        uint64
+	authDir         string
+	retiredRevision uint64
+	records         []*authFileListRecord
+	retiredRecords  []*authFileListRecord
+	managedNames    map[string]struct{}
+	queries         map[string]*list.Element
+	lru             *list.List
 }
 
 type authFilesCachedQuery struct {
@@ -93,18 +93,6 @@ type authFilesFacetsResponse struct {
 	Plans      []authFilesFacetValue `json:"plans"`
 }
 
-func authFilesManagedDirectoryStamp(authDir string) string {
-	authDir = strings.TrimSpace(authDir)
-	if authDir == "" {
-		return ""
-	}
-	info, err := os.Stat(authDir)
-	if err != nil {
-		return "error:" + err.Error()
-	}
-	return fmt.Sprintf("%d:%d:%d", info.ModTime().UnixNano(), info.Size(), info.Mode())
-}
-
 func authFilesQueryCacheKey(query authFilesListQuery) string {
 	return strings.Join([]string{
 		query.provider,
@@ -118,11 +106,11 @@ func authFilesQueryCacheKey(query authFilesListQuery) string {
 	}, "\x00")
 }
 
-func (cache *authFilesPaginationCache) resetLocked(manager *coreauth.Manager, revision uint64, authDir, directoryStamp string, records, retiredRecords []*authFileListRecord, managedNames map[string]struct{}) {
+func (cache *authFilesPaginationCache) resetLocked(manager *coreauth.Manager, revision uint64, authDir string, retiredRevision uint64, records, retiredRecords []*authFileListRecord, managedNames map[string]struct{}) {
 	cache.manager = manager
 	cache.revision = revision
 	cache.authDir = authDir
-	cache.directoryStamp = directoryStamp
+	cache.retiredRevision = retiredRevision
 	cache.records = records
 	cache.retiredRecords = retiredRecords
 	cache.managedNames = managedNames
@@ -169,11 +157,11 @@ func (h *Handler) cachedAuthFileRecords(manager *coreauth.Manager, query authFil
 		if cfg != nil {
 			authDir = strings.TrimSpace(cfg.AuthDir)
 		}
-		directoryStamp := authFilesManagedDirectoryStamp(authDir)
+		retiredRevision := authfileguard.RetiredRevision()
 		revision := manager.ManagementAuthCatalogRevision()
 
 		cache.mu.Lock()
-		if cache.manager == manager && cache.revision == revision && cache.authDir == authDir && cache.directoryStamp == directoryStamp && cache.retiredRecords != nil {
+		if cache.manager == manager && cache.revision == revision && cache.authDir == authDir && cache.retiredRevision == retiredRevision && cache.retiredRecords != nil {
 			result := cache.queryLocked(query)
 			cache.mu.Unlock()
 			return result
@@ -184,7 +172,7 @@ func (h *Handler) cachedAuthFileRecords(manager *coreauth.Manager, query authFil
 		records, managedNames := h.authFileListRecordsFromSummaries(summaries)
 		var retiredRecords []*authFileListRecord
 		cache.mu.Lock()
-		if cache.authDir == authDir && cache.directoryStamp == directoryStamp && authFilesNameSetsEqual(cache.managedNames, managedNames) && cache.retiredRecords != nil {
+		if cache.authDir == authDir && cache.retiredRevision == retiredRevision && authFilesNameSetsEqual(cache.managedNames, managedNames) && cache.retiredRecords != nil {
 			retiredRecords = cache.retiredRecords
 		}
 		cache.mu.Unlock()
@@ -197,7 +185,7 @@ func (h *Handler) cachedAuthFileRecords(manager *coreauth.Manager, query authFil
 		if latestCfg != nil {
 			latestAuthDir = strings.TrimSpace(latestCfg.AuthDir)
 		}
-		if latestAuthDir != authDir || manager.ManagementAuthCatalogRevision() != revision || authFilesManagedDirectoryStamp(authDir) != directoryStamp {
+		if latestAuthDir != authDir || manager.ManagementAuthCatalogRevision() != revision || authfileguard.RetiredRevision() != retiredRevision {
 			if attempt < 2 {
 				continue
 			}
@@ -205,13 +193,13 @@ func (h *Handler) cachedAuthFileRecords(manager *coreauth.Manager, query authFil
 		}
 
 		cache.mu.Lock()
-		if cache.manager == manager && cache.revision > revision && cache.authDir == authDir && cache.directoryStamp == directoryStamp && cache.retiredRecords != nil {
+		if cache.manager == manager && cache.revision > revision && cache.authDir == authDir && cache.retiredRevision == retiredRevision && cache.retiredRecords != nil {
 			result := cache.queryLocked(query)
 			cache.mu.Unlock()
 			return result
 		}
-		if cache.manager != manager || cache.revision <= revision || cache.authDir != authDir || cache.directoryStamp != directoryStamp {
-			cache.resetLocked(manager, revision, authDir, directoryStamp, records, retiredRecords, managedNames)
+		if cache.manager != manager || cache.revision <= revision || cache.authDir != authDir || cache.retiredRevision != retiredRevision {
+			cache.resetLocked(manager, revision, authDir, retiredRevision, records, retiredRecords, managedNames)
 		}
 		result := cache.queryLocked(query)
 		cache.mu.Unlock()

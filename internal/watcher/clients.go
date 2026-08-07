@@ -511,7 +511,9 @@ func (w *Watcher) addOrUpdateClientWithPersistedHashLocked(path, persistedHash s
 	}
 
 	if coreauth.IsRetiredGeminiCLIAuthFileData(data) {
-		authfileguard.MarkRetired(path)
+		if _, created := authfileguard.MarkRetired(path); !created {
+			authfileguard.NotifyRetiredFileChanged(path)
+		}
 		w.retiredAuthPaths[normalized] = struct{}{}
 		delete(w.retiredDeletes, normalized)
 	}

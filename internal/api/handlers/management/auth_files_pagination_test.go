@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/authfileguard"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 )
@@ -24,7 +25,8 @@ func TestAuthFilesPaginationNegotiationFilteringAndSelection(t *testing.T) {
 	registerAuthFilesPaginationTestAuth(t, manager, authDir, "charlie.json", "claude", true, "", 0, false, "")
 	registerAuthFilesPaginationTestAuth(t, manager, authDir, "delta.json", "codex", false, "temporary_failure", 2, true, "pro")
 	registerAuthFilesPaginationTestAuth(t, manager, authDir, "echo.json", "xai", false, "", 0, false, "")
-	if errWrite := os.WriteFile(filepath.Join(authDir, "retired.json"), []byte(`{"type":"gemini","email":"legacy@example.com"}`), 0o600); errWrite != nil {
+	retiredPath := filepath.Join(authDir, "retired.json")
+	if errWrite := os.WriteFile(retiredPath, []byte(`{"type":"gemini","email":"legacy@example.com"}`), 0o600); errWrite != nil {
 		t.Fatal(errWrite)
 	}
 
@@ -183,7 +185,8 @@ func TestAuthFilesPaginationReusesQueriesAndIgnoresOpaqueCredentialRotation(t *t
 	h, manager, authDir := newAuthFilesPaginationTestHandler(t, true)
 	registerAuthFilesPaginationTestAuth(t, manager, authDir, "alpha.json", "codex", false, "", 1, true, "plus")
 	registerAuthFilesPaginationTestAuth(t, manager, authDir, "bravo.json", "codex", false, "", 1, true, "plus")
-	if errWrite := os.WriteFile(filepath.Join(authDir, "retired.json"), []byte(`{"type":"gemini","email":"legacy@example.com"}`), 0o600); errWrite != nil {
+	retiredPath := filepath.Join(authDir, "retired.json")
+	if errWrite := os.WriteFile(retiredPath, []byte(`{"type":"gemini","email":"legacy@example.com"}`), 0o600); errWrite != nil {
 		t.Fatal(errWrite)
 	}
 	router := gin.New()
@@ -224,6 +227,13 @@ func TestAuthFilesPaginationReusesQueriesAndIgnoresOpaqueCredentialRotation(t *t
 	}
 	alpha.Metadata["access_token"] = "rotated-access-token"
 	alpha.Metadata["session_cookie"] = "rotated-session-cookie"
+	rotatedPath := filepath.Join(authDir, ".alpha-rotated.json")
+	if errWrite := os.WriteFile(rotatedPath, []byte(`{"type":"codex","access_token":"rotated-access-token"}`), 0o600); errWrite != nil {
+		t.Fatal(errWrite)
+	}
+	if errRename := os.Rename(rotatedPath, filepath.Join(authDir, "alpha.json")); errRename != nil {
+		t.Fatal(errRename)
+	}
 	if _, errUpdate := manager.Update(coreauth.WithSkipPersist(t.Context()), alpha); errUpdate != nil {
 		t.Fatal(errUpdate)
 	}
@@ -238,6 +248,22 @@ func TestAuthFilesPaginationReusesQueriesAndIgnoresOpaqueCredentialRotation(t *t
 	if &h.authFilesPagination.records[0] != &records[0] {
 		t.Fatal("opaque credential rotation rebuilt the pagination directory")
 	}
+	h.authFilesPagination.mu.Unlock()
+
+	if errWrite := os.WriteFile(retiredPath, []byte(`{"type":"gemini","email":"updated-legacy@example.com"}`), 0o600); errWrite != nil {
+		t.Fatal(errWrite)
+	}
+	authfileguard.NotifyRetiredFileChanged(retiredPath)
+	retiredUpdated := performAuthFilesPaginationRequest(router, "/auth-files?paged=true&page=1&page_size=10&search=retired")
+	if retiredUpdated.Code != http.StatusOK || !strings.Contains(retiredUpdated.Body.String(), "updated-legacy@example.com") {
+		t.Fatalf("retired update was not reflected: status=%d body=%s", retiredUpdated.Code, retiredUpdated.Body.String())
+	}
+	h.authFilesPagination.mu.Lock()
+	if len(h.authFilesPagination.retiredRecords) != 1 || h.authFilesPagination.retiredRecords[0] == retiredRecords[0] {
+		h.authFilesPagination.mu.Unlock()
+		t.Fatal("retired credential rewrite did not rebuild the retired catalog")
+	}
+	retiredRecords = h.authFilesPagination.retiredRecords
 	h.authFilesPagination.mu.Unlock()
 
 	alpha, _ = manager.GetByID("alpha.json")
