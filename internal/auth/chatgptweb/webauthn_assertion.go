@@ -47,7 +47,7 @@ type webAuthnAuthenticatorResponse struct {
 	AuthenticatorData string `json:"authenticatorData"`
 	ClientDataJSON    string `json:"clientDataJSON"`
 	Signature         string `json:"signature"`
-	UserHandle        string `json:"userHandle"`
+	UserHandle        string `json:"userHandle,omitempty"`
 }
 
 func createWebAuthnAssertion(
@@ -124,6 +124,13 @@ func createWebAuthnAssertion(
 	if errSign != nil {
 		return nil, fmt.Errorf("sign WebAuthn assertion: %w", errSign)
 	}
+	// Browser AuthenticatorAssertionResponse serialization omits userHandle
+	// when the relying party supplied an allow-list. A discoverable credential
+	// request has no allowCredentials and must return the resident user handle.
+	userHandle := ""
+	if len(options.AllowCredentials) == 0 {
+		userHandle = credential.UserHandle
+	}
 	assertion := webAuthnAssertionResponse{
 		ID:                      credential.CredentialID,
 		RawID:                   credential.CredentialID,
@@ -134,7 +141,7 @@ func createWebAuthnAssertion(
 			AuthenticatorData: base64.RawURLEncoding.EncodeToString(authenticatorData),
 			ClientDataJSON:    base64.RawURLEncoding.EncodeToString(clientDataJSON),
 			Signature:         base64.RawURLEncoding.EncodeToString(signature),
-			UserHandle:        credential.UserHandle,
+			UserHandle:        userHandle,
 		},
 	}
 	rawAssertion, errEncode := json.Marshal(assertion)

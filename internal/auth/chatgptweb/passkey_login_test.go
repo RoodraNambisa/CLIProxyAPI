@@ -315,6 +315,13 @@ func TestCreateWebAuthnAssertionProducesVerifiableES256Payload(t *testing.T) {
 	if errAssertion != nil {
 		t.Fatal(errAssertion)
 	}
+	responsePayload, ok := assertion["response"].(map[string]any)
+	if !ok {
+		t.Fatalf("assertion response = %#v", assertion["response"])
+	}
+	if _, exists := responsePayload["userHandle"]; exists {
+		t.Fatalf("allow-list assertion unexpectedly included userHandle: %#v", responsePayload["userHandle"])
+	}
 	rawAssertion, errMarshal := json.Marshal(assertion)
 	if errMarshal != nil {
 		t.Fatal(errMarshal)
@@ -357,6 +364,26 @@ func TestCreateWebAuthnAssertionProducesVerifiableES256Payload(t *testing.T) {
 	signedHash := sha256.Sum256(signedPayload)
 	if !ecdsa.VerifyASN1(&privateKey.PublicKey, signedHash[:], signature) {
 		t.Fatal("WebAuthn assertion signature did not verify")
+	}
+}
+
+func TestCreateWebAuthnAssertionIncludesUserHandleForDiscoverableRequest(t *testing.T) {
+	credential := testWebAuthnCredential(t)
+	assertion, errAssertion := createWebAuthnAssertion(credential, map[string]any{
+		"challenge": base64.RawURLEncoding.EncodeToString([]byte("challenge")),
+		"rpId":      WebAuthnRPID,
+	}, func(updated WebAuthnCredential) (WebAuthnCredential, error) {
+		return updated, nil
+	})
+	if errAssertion != nil {
+		t.Fatal(errAssertion)
+	}
+	responsePayload, ok := assertion["response"].(map[string]any)
+	if !ok {
+		t.Fatalf("assertion response = %#v", assertion["response"])
+	}
+	if responsePayload["userHandle"] != credential.UserHandle {
+		t.Fatalf("discoverable assertion userHandle = %#v, want %q", responsePayload["userHandle"], credential.UserHandle)
 	}
 }
 
