@@ -44,6 +44,35 @@ func TestPersonaCatalogV2IsCoherent(t *testing.T) {
 	}
 }
 
+func TestPersonaCatalogV2UsesCoherentCPUAndDisplayProfiles(t *testing.T) {
+	tests := map[string]struct {
+		width               int
+		height              int
+		hardwareConcurrency int
+		devicePixelRatio    float64
+	}{
+		"c146-mac-m2-1470":      {width: 1470, height: 956, hardwareConcurrency: 8, devicePixelRatio: 2},
+		"c146-mac-m4p-1512":     {width: 1512, height: 982, hardwareConcurrency: 14, devicePixelRatio: 2},
+		"c146-win-rtx4060-2560": {width: 2560, height: 1440, hardwareConcurrency: 16, devicePixelRatio: 1},
+	}
+	for index := range personaCatalogV2 {
+		entry := personaCatalogV2[index]
+		want, ok := tests[entry.persona.CatalogID]
+		if !ok {
+			continue
+		}
+		if entry.persona.ScreenWidth != want.width || entry.persona.ScreenHeight != want.height ||
+			entry.persona.HardwareConcurrency != want.hardwareConcurrency || entry.devicePixelRatio != want.devicePixelRatio {
+			t.Fatalf("entry %q = %dx%d HC%d DPR%g", entry.persona.CatalogID, entry.persona.ScreenWidth,
+				entry.persona.ScreenHeight, entry.persona.HardwareConcurrency, entry.devicePixelRatio)
+		}
+		delete(tests, entry.persona.CatalogID)
+	}
+	if len(tests) != 0 {
+		t.Fatalf("missing corrected catalog entries: %v", tests)
+	}
+}
+
 func TestCredentialPersonaSelectionIsStable(t *testing.T) {
 	credential := &Credential{
 		CredentialUID: "credential-uid",

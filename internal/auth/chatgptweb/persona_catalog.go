@@ -40,7 +40,7 @@ var personaCatalogV2 = [...]personaCatalogEntry{
 		0, 25, 1440, 847, 1440, 775, 2, 8, 4_294_967_296, 30,
 	),
 	newPersonaCatalogEntry(
-		"c146-mac-m2-1470", chrome146MacUserAgent, "MacIntel", 1470, 956, 10,
+		"c146-mac-m2-1470", chrome146MacUserAgent, "MacIntel", 1470, 956, 8,
 		sentinelBrowserPlatformMac,
 		"Google Inc. (Apple)", "ANGLE (Apple, ANGLE Metal Renderer: Apple M2, Unspecified Version)",
 		0, 25, 1470, 843, 1470, 771, 2, 8, 4_294_967_296, 30,
@@ -52,10 +52,10 @@ var personaCatalogV2 = [...]personaCatalogEntry{
 		0, 25, 1728, 1004, 1728, 932, 2, 8, 4_294_967_296, 30,
 	),
 	newPersonaCatalogEntry(
-		"c146-mac-m4p-1920", chrome146MacUserAgent, "MacIntel", 1920, 1080, 16,
+		"c146-mac-m4p-1512", chrome146MacUserAgent, "MacIntel", 1512, 982, 14,
 		sentinelBrowserPlatformMac,
 		"Google Inc. (Apple)", "ANGLE (Apple, ANGLE Metal Renderer: Apple M4 Pro, Unspecified Version)",
-		0, 25, 1920, 1027, 1920, 955, 2, 8, 4_294_967_296, 30,
+		0, 25, 1512, 929, 1512, 857, 2, 8, 4_294_967_296, 30,
 	),
 	newPersonaCatalogEntry(
 		"c146-win-uhd-1366", chrome146WinUserAgent, "Win32", 1366, 768, 8,
@@ -79,7 +79,7 @@ var personaCatalogV2 = [...]personaCatalogEntry{
 		"c146-win-rtx4060-2560", chrome146WinUserAgent, "Win32", 2560, 1440, 16,
 		sentinelBrowserPlatformWindows,
 		"Google Inc. (NVIDIA)", "ANGLE (NVIDIA, NVIDIA GeForce RTX 4060 Direct3D11 vs_5_0 ps_5_0, D3D11)",
-		0, 0, 2560, 1400, 2560, 1328, 1.25, 8, 4_294_967_296, 24,
+		0, 0, 2560, 1400, 2560, 1328, 1, 8, 4_294_967_296, 24,
 	),
 }
 
