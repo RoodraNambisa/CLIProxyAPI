@@ -999,6 +999,46 @@ func TestChatGPTWebImageAccumulatorTracksPatchedTerminalAssistantText(t *testing
 	}
 }
 
+func TestChatGPTWebImageAccumulatorDoesNotTreatDirectedToolCallAsAssistantReply(t *testing.T) {
+	accumulator := &ChatGPTWebImageAccumulator{}
+	payload := []byte(`{"message":{"author":{"role":"assistant"},"content":{"content_type":"code","language":"json","text":"{\"size\":\"1536x864\",\"n\":1}"},"status":"finished_successfully","end_turn":true,"recipient":"dynamic.image.tool","channel":"commentary","metadata":{}}}`)
+	if _, err := accumulator.Apply(payload); err != nil {
+		t.Fatalf("Apply() error = %v", err)
+	}
+	if accumulator.HasTerminalAssistantText() {
+		t.Fatal("directed image tool call was classified as terminal assistant text")
+	}
+	if !accumulator.Terminal {
+		t.Fatal("completed directed image tool call did not retain terminal state for task polling")
+	}
+}
+
+func TestCaptureChatGPTWebImageConversationDoesNotTreatDirectedToolCallAsAssistantReply(t *testing.T) {
+	accumulator := &ChatGPTWebImageAccumulator{}
+	err := CaptureChatGPTWebImageConversation([]byte(`{
+		"current_node":"tool-call",
+		"mapping":{
+			"user":{"children":["tool-call"],"message":{
+				"author":{"role":"user"},"content":{"content_type":"text","parts":["draw"]}
+			}},
+			"tool-call":{"parent":"user","message":{
+				"author":{"role":"assistant"},"status":"finished_successfully","end_turn":true,
+				"recipient":"dynamic.image.tool","channel":"commentary",
+				"content":{"content_type":"code","language":"json","text":"{\"size\":\"1536x864\",\"n\":1}"}
+			}}
+		}
+	}`), accumulator)
+	if err != nil {
+		t.Fatalf("CaptureChatGPTWebImageConversation() error = %v", err)
+	}
+	if accumulator.HasTerminalAssistantText() {
+		t.Fatal("directed image tool call was classified as terminal assistant text")
+	}
+	if !accumulator.Terminal {
+		t.Fatal("completed directed image tool call did not retain terminal state for task polling")
+	}
+}
+
 func TestChatGPTWebImageAccumulatorIgnoresSkippedMainlineControlReply(t *testing.T) {
 	accumulator := &ChatGPTWebImageAccumulator{ConversationID: "conversation"}
 	payload := []byte(`{"message":{"author":{"role":"assistant"},"status":"finished_successfully","content":{"content_type":"code","text":"{\"skipped_mainline\":true}"}}}`)

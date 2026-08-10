@@ -3002,6 +3002,12 @@ func webMessageImageContext(message map[string]any) (string, bool) {
 	role := strings.ToLower(strings.TrimSpace(stringFromAny(author["role"])))
 	metadata, _ := message["metadata"].(map[string]any)
 	imageTool := strings.EqualFold(stringFromAny(metadata["async_task_type"]), "image_gen")
+	if role == "assistant" {
+		recipient := strings.TrimSpace(stringFromAny(message["recipient"]))
+		// User-visible replies target "all". Named recipients are tool calls,
+		// including image tools whose identifiers are assigned dynamically.
+		imageTool = imageTool || (recipient != "" && !strings.EqualFold(recipient, "all"))
+	}
 	if !imageTool {
 		content, _ := message["content"].(map[string]any)
 		if role == "assistant" {
