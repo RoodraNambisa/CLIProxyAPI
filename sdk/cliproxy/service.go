@@ -321,7 +321,7 @@ type authMaintenanceCandidate struct {
 	Key           string
 	Path          string
 	IDs           []string
-	Installations map[string]string
+	SourceHashes  map[string]string
 	Reason        string
 	Generation    uint64
 	Attempts      int
@@ -929,6 +929,7 @@ func (s *Service) handleManagementAuthDelete(ctx context.Context, auths []*corea
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	usageIndexes := make(map[string]struct{}, len(auths))
 	for _, deleted := range auths {
 		if deleted == nil || strings.TrimSpace(deleted.ID) == "" {
 			continue
@@ -949,10 +950,18 @@ func (s *Service) handleManagementAuthDelete(ctx context.Context, auths []*corea
 		s.cleanupChatGPTWebModelResourcesAfterDelete(lockedCtx, deleted.ID, deleted.RuntimeInstanceID())
 		index := strings.TrimSpace(deleted.EnsureIndex())
 		if index != "" {
-			s.removeUsageStatisticsForAuthIndexes([]string{index}, "management auth delete")
+			usageIndexes[index] = struct{}{}
 		}
 		unlockMutation()
 	}
+	if len(usageIndexes) == 0 {
+		return
+	}
+	indexes := make([]string, 0, len(usageIndexes))
+	for index := range usageIndexes {
+		indexes = append(indexes, index)
+	}
+	s.removeUsageStatisticsForAuthIndexes(indexes, "management auth delete")
 }
 
 func (s *Service) snapshotAuthMaintenanceConfig() (config.AuthMaintenanceConfig, string) {
@@ -1911,23 +1920,27 @@ func (s *Service) authMaintenanceCandidateForID(id, authDir, reason string) (aut
 	return s.authMaintenanceCandidateForAuth(auth, authDir, reason)
 }
 
-func (s *Service) snapshotAuthMaintenanceCandidateInstallations(candidate authMaintenanceCandidate, authDir string) (authMaintenanceCandidate, bool) {
+func (s *Service) snapshotAuthMaintenanceCandidateSourceHashes(candidate authMaintenanceCandidate, authDir string) (authMaintenanceCandidate, bool) {
 	if s == nil || s.coreManager == nil || len(candidate.IDs) == 0 {
 		return authMaintenanceCandidate{}, false
 	}
-	installations := make(map[string]string, len(candidate.IDs))
+	sourceHashes := make(map[string]string, len(candidate.IDs))
 	for _, id := range candidate.IDs {
 		id = strings.TrimSpace(id)
 		current, ok := s.coreManager.GetByID(id)
-		if !ok || current == nil || current.RuntimeInstallationID() == "" {
+		if !ok || current == nil || current.Attributes == nil {
 			return authMaintenanceCandidate{}, false
 		}
 		if path := strings.TrimSpace(candidate.Path); path != "" && !authMaintenancePathsEqual(resolveAuthFilePath(current, authDir), path) {
 			return authMaintenanceCandidate{}, false
 		}
-		installations[id] = current.RuntimeInstallationID()
+		sourceHash := strings.TrimSpace(current.Attributes[coreauth.SourceHashAttributeKey])
+		if sourceHash == "" {
+			return authMaintenanceCandidate{}, false
+		}
+		sourceHashes[id] = sourceHash
 	}
-	candidate.Installations = installations
+	candidate.SourceHashes = sourceHashes
 	return candidate, true
 }
 
@@ -2012,7 +2025,7 @@ func (s *Service) reconcilePersistedChatGPTWebDeadMaintenanceCandidates(ctx cont
 		if !ok || !isChatGPTWebDeadMaintenanceCandidate(candidate) {
 			continue
 		}
-		candidate, ok = s.snapshotAuthMaintenanceCandidateInstallations(candidate, authDir)
+		candidate, ok = s.snapshotAuthMaintenanceCandidateSourceHashes(candidate, authDir)
 		if !ok {
 			retry = true
 			continue
@@ -2103,7 +2116,7 @@ func (s *Service) processDirtyAuthMaintenanceIDs(cfg config.AuthMaintenanceConfi
 				continue
 			}
 			if isChatGPTWebDeadMaintenanceCandidate(candidate) {
-				candidate, candidateOK = s.snapshotAuthMaintenanceCandidateInstallations(candidate, authDir)
+				candidate, candidateOK = s.snapshotAuthMaintenanceCandidateSourceHashes(candidate, authDir)
 				if !candidateOK {
 					continue
 				}
@@ -2269,7 +2282,7 @@ func (s *Service) startAuthMaintenance(parent context.Context) {
 						continue
 					}
 					if isChatGPTWebDeadMaintenanceCandidate(candidate) {
-						snapshot, snapshotOK := s.snapshotAuthMaintenanceCandidateInstallations(candidate, authDir)
+						snapshot, snapshotOK := s.snapshotAuthMaintenanceCandidateSourceHashes(candidate, authDir)
 						if !snapshotOK {
 							continue
 						}
@@ -2387,7 +2400,7 @@ func (s *Service) handleAuthMaintenanceResult(_ context.Context, result coreauth
 			return
 		}
 		if isChatGPTWebDeadMaintenanceCandidate(candidate) {
-			candidate, candidateOK = s.snapshotAuthMaintenanceCandidateInstallations(candidate, authDir)
+			candidate, candidateOK = s.snapshotAuthMaintenanceCandidateSourceHashes(candidate, authDir)
 			if !candidateOK {
 				return
 			}
@@ -2470,8 +2483,17 @@ func (s *Service) chatGPTWebDeadMaintenanceCandidateStillEligible(candidate auth
 			expectedIDs[id] = struct{}{}
 		}
 	}
-	if len(expectedIDs) == 0 || len(candidate.Installations) != len(expectedIDs) {
+	if len(expectedIDs) == 0 || len(candidate.SourceHashes) != len(expectedIDs) {
 		return false
+	}
+	contents, errRead := readAuthMaintenanceFile(path)
+	if errRead != nil {
+		return false
+	}
+	for id := range expectedIDs {
+		if !coreauth.SourceHashMatchesBytes(candidate.SourceHashes[id], contents) {
+			return false
+		}
 	}
 	matched := make(map[string]struct{}, len(expectedIDs))
 	for _, auth := range s.coreManager.AuthsForBackingPath(path) {
@@ -2485,16 +2507,11 @@ func (s *Service) chatGPTWebDeadMaintenanceCandidateStillEligible(candidate auth
 		if _, ok := expectedIDs[id]; !ok {
 			return false
 		}
-		if expectedInstallation := strings.TrimSpace(candidate.Installations[id]); expectedInstallation == "" || auth.RuntimeInstallationID() != expectedInstallation {
+		expectedSourceHash := strings.TrimSpace(candidate.SourceHashes[id])
+		if expectedSourceHash == "" || auth.Attributes == nil || strings.TrimSpace(auth.Attributes[coreauth.SourceHashAttributeKey]) != expectedSourceHash {
 			return false
 		}
 		if _, ok := authEligibleForChatGPTWebDeadDelete(auth, policy); !ok {
-			return false
-		}
-		if auth.Attributes == nil || strings.TrimSpace(auth.Attributes[coreauth.SourceHashAttributeKey]) == "" {
-			return false
-		}
-		if !authFileUpdateStillCurrentAtPath(auth, path) {
 			return false
 		}
 		matched[id] = struct{}{}
@@ -2512,7 +2529,8 @@ func (s *Service) clearChatGPTWebDeadMaintenanceCandidate(ctx context.Context, c
 			if !ok || current == nil || !authMaintenancePendingDelete(current) {
 				continue
 			}
-			if expected := strings.TrimSpace(candidate.Installations[current.ID]); expected != "" && current.RuntimeInstallationID() != expected {
+			expectedSourceHash := strings.TrimSpace(candidate.SourceHashes[current.ID])
+			if expectedSourceHash == "" || current.Attributes == nil || strings.TrimSpace(current.Attributes[coreauth.SourceHashAttributeKey]) != expectedSourceHash {
 				continue
 			}
 			if reason := authMaintenanceReason(current); reason != "" && reason != strings.TrimSpace(candidate.Reason) {
@@ -2584,6 +2602,16 @@ func (s *Service) deleteAuthMaintenanceCandidateUnchecked(ctx context.Context, c
 		return false, coreauth.NewDeleteOutcomeError(coreauth.DeleteOutcomeRolledBack, errors.New("auth maintenance requires source-conditional persistence"))
 	}
 	expectedHash := authMaintenanceExpectedSourceHash(contents)
+	if isChatGPTWebDeadMaintenanceCandidate(candidate) {
+		if len(candidate.SourceHashes) != len(candidate.IDs) {
+			return false, nil
+		}
+		for _, id := range candidate.IDs {
+			if !coreauth.SourceHashMatchesBytes(candidate.SourceHashes[strings.TrimSpace(id)], contents) {
+				return false, nil
+			}
+		}
+	}
 	generation, generationCreated, errGeneration := s.authMaintenanceDeleteGeneration(candidate, expectedHash)
 	if errGeneration != nil {
 		return false, errGeneration
@@ -2636,7 +2664,8 @@ func (s *Service) deleteAuthMaintenanceCandidateUnchecked(ctx context.Context, c
 		if !exists || current == nil || !authMaintenancePathsEqual(resolveAuthFilePath(current, authDir), path) {
 			continue
 		}
-		if expectedInstallation := strings.TrimSpace(candidate.Installations[id]); expectedInstallation != "" && current.RuntimeInstallationID() != expectedInstallation {
+		if expectedSourceHash := strings.TrimSpace(candidate.SourceHashes[id]); expectedSourceHash != "" &&
+			(current.Attributes == nil || strings.TrimSpace(current.Attributes[coreauth.SourceHashAttributeKey]) != expectedSourceHash) {
 			continue
 		}
 		currentCtx := coreauth.WithSkipPersist(deleteCtx)

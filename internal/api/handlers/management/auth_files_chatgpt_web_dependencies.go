@@ -56,6 +56,7 @@ type authDependencyDeleteContext struct {
 	dependencyAuthoritative bool
 	dependencyDirty         bool
 	dependencyErr           error
+	deletedAuthsByID        map[string]*coreauth.Auth
 }
 
 func (h *Handler) deleteAuthFilesWithDependencies(ctx context.Context, root *os.Root, lexicalAuthDir, authDir string, names []string, forceCascade, ignoreMissing bool) authDependencyDeleteResult {
@@ -70,6 +71,12 @@ func (h *Handler) deleteAuthFilesWithDependencies(ctx context.Context, root *os.
 		suppressCleanup:   make(map[string]struct{}),
 		processed:         make(map[string]struct{}),
 		ignoreMissingFile: ignoreMissing,
+		deletedAuthsByID:  make(map[string]*coreauth.Auth),
+	}
+	if h != nil {
+		defer func() {
+			h.notifyManagedAuthDeleted(context.WithoutCancel(ctx), operation.deletedAuthsByID)
+		}()
 	}
 	run := func(lockedCtx context.Context) error {
 		operation.ctx = lockedCtx
@@ -113,7 +120,7 @@ func (h *Handler) deleteAuthFilesWithDependencies(ctx context.Context, root *os.
 			if auth != nil {
 				provider = strings.ToLower(strings.TrimSpace(auth.Provider))
 			}
-			if provider == "codex" || provider == "chatgpt-web" || coreauth.ChatGPTWebLinkedSourceUID(auth) != "" {
+			if provider == "codex" || coreauth.ChatGPTWebLinkedSourceUID(auth) != "" {
 				dependencySensitive = true
 				break
 			}
@@ -384,7 +391,11 @@ func (operation *authDependencyDeleteContext) allDependentsRequested(dependents 
 }
 
 func (operation *authDependencyDeleteContext) deletePhysical(name string, auth *coreauth.Auth, dependencyDelete bool) {
-	operation.deletePhysicalExpected(name, auth, dependencyDelete, "", dependencySourceHash(auth))
+	expectedSourceHash := ""
+	if coreauth.ChatGPTWebLinkedSourceUID(auth) != "" {
+		expectedSourceHash = dependencySourceHash(auth)
+	}
+	operation.deletePhysicalExpected(name, auth, dependencyDelete, "", expectedSourceHash)
 }
 
 func (operation *authDependencyDeleteContext) deleteExpected(name string, auth *coreauth.Auth, dependencyDelete bool, expectedSourceHash string) {
@@ -402,6 +413,10 @@ func (operation *authDependencyDeleteContext) deletePhysicalExpected(name string
 	if targetAuth == nil {
 		targetAuth = auth
 	}
+	if currentLinkedSourceUID := coreauth.ChatGPTWebLinkedSourceUID(targetAuth); currentLinkedSourceUID != linkedSourceUID {
+		operation.fail(name, http.StatusConflict, errors.New("ChatGPT Web credential dependency changed during deletion"))
+		return
+	}
 	deletedName, status, errDelete := operation.h.deleteAuthFileByNameAtRootExpected(
 		operation.ctx,
 		operation.root,
@@ -412,6 +427,7 @@ func (operation *authDependencyDeleteContext) deletePhysicalExpected(name string
 		true,
 		expectedSourceHash,
 		expectedSourceUID,
+		operation.deletedAuthsByID,
 	)
 	if errDelete != nil {
 		if operation.ignoreMissingFile && (errors.Is(errDelete, errAuthFileNotFound) || errors.Is(errDelete, fs.ErrNotExist)) {

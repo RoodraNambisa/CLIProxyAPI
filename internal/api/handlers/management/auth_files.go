@@ -2243,10 +2243,15 @@ func (h *Handler) deleteAuthFileByName(ctx context.Context, name string) (string
 }
 
 func (h *Handler) deleteAuthFileByNameAtRoot(ctx context.Context, root *os.Root, lexicalAuthDir, authDir, name string) (string, int, error) {
-	return h.deleteAuthFileByNameAtRootExpected(ctx, root, lexicalAuthDir, authDir, name, nil, false, "", "")
+	deletedAuthsByID := make(map[string]*coreauth.Auth)
+	deletedName, status, errDelete := h.deleteAuthFileByNameAtRootExpected(ctx, root, lexicalAuthDir, authDir, name, nil, false, "", "", deletedAuthsByID)
+	if errDelete == nil {
+		h.notifyManagedAuthDeleted(context.WithoutCancel(ctx), deletedAuthsByID)
+	}
+	return deletedName, status, errDelete
 }
 
-func (h *Handler) deleteAuthFileByNameAtRootExpected(ctx context.Context, root *os.Root, lexicalAuthDir, authDir, name string, targetAuth *coreauth.Auth, runtimeAuthResolved bool, expectedSourceHash, expectedSourceUID string) (string, int, error) {
+func (h *Handler) deleteAuthFileByNameAtRootExpected(ctx context.Context, root *os.Root, lexicalAuthDir, authDir, name string, targetAuth *coreauth.Auth, runtimeAuthResolved bool, expectedSourceHash, expectedSourceUID string, deletedAuthsByID map[string]*coreauth.Auth) (string, int, error) {
 	targetPath, displayName, errResolve := resolveManagedAuthFilePathAtRoot(root, authDir, name)
 	if errResolve != nil {
 		return "", managedAuthPathErrorStatus(errResolve), errResolve
@@ -2383,7 +2388,6 @@ func (h *Handler) deleteAuthFileByNameAtRootExpected(ctx context.Context, root *
 		return displayName, http.StatusInternalServerError, errDelete
 	}
 	authfileguard.ClearRetiredSnapshot(retiredSnapshot)
-	deletedAuthsByID := make(map[string]*coreauth.Auth, len(runtimeAuths)+1)
 	if targetAuth != nil && strings.TrimSpace(targetAuth.ID) != "" {
 		deletedAuthsByID[targetAuth.ID] = targetAuth.Clone()
 	}
@@ -2422,7 +2426,6 @@ func (h *Handler) deleteAuthFileByNameAtRootExpected(ctx context.Context, root *
 			}
 		}
 	}
-	h.notifyManagedAuthDeleted(lockedCtx, deletedAuthsByID)
 	return displayName, http.StatusOK, nil
 }
 

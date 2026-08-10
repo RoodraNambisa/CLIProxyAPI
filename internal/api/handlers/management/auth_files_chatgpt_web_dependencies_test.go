@@ -280,6 +280,148 @@ func TestDeleteAuthFilesWithDependenciesUsesCompleteIndexWithoutPersistedSnapsho
 	}
 }
 
+func TestDeleteStandaloneChatGPTWebUsesCurrentLockedFileGeneration(t *testing.T) {
+	h, manager, authDir := newChatGPTWebDependencyManagementHandler(t)
+	installed := registerChatGPTWebDependencyManagementAuth(t, manager, managementStandaloneWebAuth("standalone-web.json"))
+
+	path := filepath.Join(authDir, installed.FileName)
+	replaceManagementDependencyAuthFile(t, path, "watcher-has-not-reloaded-this-generation", "")
+	response := performChatGPTWebDependencyManagementRequest(
+		chatGPTWebDependencyManagementRouter(h),
+		http.MethodDelete,
+		"/auth-files?name="+installed.FileName,
+		"",
+	)
+	if response.Code != http.StatusOK {
+		t.Fatalf("delete standalone Web status = %d, body=%s", response.Code, response.Body.String())
+	}
+	if _, exists := manager.GetByID(installed.ID); exists {
+		t.Fatal("standalone Web credential remained in runtime")
+	}
+	if _, errStat := os.Stat(path); !os.IsNotExist(errStat) {
+		t.Fatalf("standalone Web credential file remained: %v", errStat)
+	}
+}
+
+func TestDeleteStandaloneChatGPTWebBatchDoesNotLoadPersistedSnapshot(t *testing.T) {
+	h, manager, _, store := newCountingChatGPTWebDependencyManagementHandler(t)
+	names := make([]string, 0, 20)
+	for index := 0; index < cap(names); index++ {
+		name := fmt.Sprintf("standalone-%02d.json", index)
+		registerChatGPTWebDependencyManagementAuth(t, manager, managementStandaloneWebAuth(name))
+		names = append(names, name)
+	}
+	hookCalls := 0
+	deletedByHook := make(map[string]struct{}, len(names))
+	h.SetAuthDeleteHook(func(_ context.Context, auths []*coreauth.Auth) {
+		hookCalls++
+		for _, auth := range auths {
+			if auth != nil {
+				deletedByHook[auth.ID] = struct{}{}
+			}
+		}
+	})
+	store.listCalls.Store(0)
+	payload, errMarshal := json.Marshal(map[string]any{"names": names})
+	if errMarshal != nil {
+		t.Fatal(errMarshal)
+	}
+	response := performChatGPTWebDependencyManagementRequest(
+		chatGPTWebDependencyManagementRouter(h),
+		http.MethodDelete,
+		"/auth-files",
+		string(payload),
+	)
+	if response.Code != http.StatusOK {
+		t.Fatalf("batch delete status = %d, body=%s", response.Code, response.Body.String())
+	}
+	if got := store.listCalls.Load(); got != 0 {
+		t.Fatalf("standalone batch loaded the persisted auth snapshot %d times", got)
+	}
+	if hookCalls != 1 {
+		t.Fatalf("standalone batch delete cleanup hook calls = %d, want 1", hookCalls)
+	}
+	if len(deletedByHook) != len(names) {
+		t.Fatalf("standalone batch delete cleanup auths = %d, want %d", len(deletedByHook), len(names))
+	}
+	for _, name := range names {
+		if _, exists := manager.GetByID(name); exists {
+			t.Fatalf("standalone Web credential %s remained in runtime", name)
+		}
+	}
+}
+
+func TestDeleteLinkedChatGPTWebStillRejectsChangedFileGeneration(t *testing.T) {
+	h, manager, authDir := newChatGPTWebDependencyManagementHandler(t)
+	source := registerChatGPTWebDependencyManagementAuth(t, manager, managementDependencyCodexAuth("source.json", "uid-a", false))
+	linked := registerChatGPTWebDependencyManagementAuth(t, manager, managementDependencyWebAuth("linked-web.json", source.ID, "uid-a"))
+
+	path := filepath.Join(authDir, linked.FileName)
+	replaceManagementDependencyAuthFile(t, path, "replacement-generation", "")
+	response := performChatGPTWebDependencyManagementRequest(
+		chatGPTWebDependencyManagementRouter(h),
+		http.MethodDelete,
+		"/auth-files?name="+linked.FileName,
+		"",
+	)
+	if response.Code != http.StatusConflict {
+		t.Fatalf("delete linked Web status = %d, body=%s", response.Code, response.Body.String())
+	}
+	if _, exists := manager.GetByID(linked.ID); !exists {
+		t.Fatal("linked Web runtime credential was removed after a generation conflict")
+	}
+	if _, errStat := os.Stat(path); errStat != nil {
+		t.Fatalf("linked Web replacement file was removed: %v", errStat)
+	}
+}
+
+func TestDeleteStandaloneChatGPTWebRejectsConcurrentDependencyChange(t *testing.T) {
+	h, manager, authDir := newChatGPTWebDependencyManagementHandler(t)
+	standalone := registerChatGPTWebDependencyManagementAuth(t, manager, managementStandaloneWebAuth("standalone-web.json"))
+	staleStandalone := standalone.Clone()
+
+	linked := standalone.Clone()
+	linked.Metadata["source_auth_id"] = "source"
+	linked.Metadata["source_credential_uid"] = "uid-a"
+	linked.Metadata["source_identity"] = "uid-a"
+	linked.Metadata["refresh_strategy"] = "codex_source"
+	if _, errUpdate := manager.Update(t.Context(), linked); errUpdate != nil {
+		t.Fatalf("convert standalone Web credential to linked: %v", errUpdate)
+	}
+
+	root, lexicalAuthDir, resolvedAuthDir, errRoot := h.openManagedAuthRootSnapshot()
+	if errRoot != nil {
+		t.Fatal(errRoot)
+	}
+	defer closeManagedAuthRoot(root)
+	operation := &authDependencyDeleteContext{
+		h:                 h,
+		ctx:               t.Context(),
+		root:              root,
+		lexicalAuthDir:    lexicalAuthDir,
+		authDir:           resolvedAuthDir,
+		processed:         make(map[string]struct{}),
+		deletedAuthsByID:  make(map[string]*coreauth.Auth),
+		runtimeLookupDone: make(map[string]struct{}),
+		authLookupDone:    make(map[string]struct{}),
+		ignoreMissingFile: false,
+	}
+	operation.deletePhysicalExpected(standalone.FileName, staleStandalone, false, "", "")
+
+	if len(operation.result.failed) != 1 {
+		t.Fatalf("dependency change failures = %#v, want one conflict", operation.result.failed)
+	}
+	if status, _ := operation.result.failed[0]["status"].(int); status != http.StatusConflict {
+		t.Fatalf("dependency change status = %d, want %d", status, http.StatusConflict)
+	}
+	if _, exists := manager.GetByID(standalone.ID); !exists {
+		t.Fatal("concurrently linked Web credential was removed")
+	}
+	if _, errStat := os.Stat(filepath.Join(authDir, standalone.FileName)); errStat != nil {
+		t.Fatalf("concurrently linked Web credential file was removed: %v", errStat)
+	}
+}
+
 func TestDeleteCodexSourceRefreshesAuthoritativeDependencies(t *testing.T) {
 	h, manager, authDir, store := newCountingChatGPTWebDependencyManagementHandler(t)
 	source := registerChatGPTWebDependencyManagementAuth(t, manager, managementDependencyCodexAuth("codex-source.json", "uid-a", false))
@@ -954,6 +1096,16 @@ func managementDependencyWebAuth(name, sourceID, sourceUID string) *coreauth.Aut
 			"lifecycle_state":       string(chatgptwebauth.LifecycleActive),
 		},
 	}
+}
+
+func managementStandaloneWebAuth(name string) *coreauth.Auth {
+	auth := managementDependencyWebAuth(name, "", "")
+	delete(auth.Metadata, "source_auth_id")
+	delete(auth.Metadata, "source_credential_uid")
+	delete(auth.Metadata, "source_identity")
+	auth.Metadata["credential_mode"] = chatgptwebauth.CredentialModeNative
+	auth.Metadata["refresh_strategy"] = string(chatgptwebauth.RefreshStrategyChatGPTSession)
+	return auth
 }
 
 func chatGPTWebDependencyManagementRouter(h *Handler) http.Handler {

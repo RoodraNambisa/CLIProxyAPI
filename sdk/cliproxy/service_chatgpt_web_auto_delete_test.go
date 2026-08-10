@@ -340,7 +340,7 @@ func TestServiceAuthMaintenanceRolledBackDeleteStartsRetryWithFreshGeneration(t 
 	if !ok {
 		t.Fatal("build maintenance candidate")
 	}
-	candidate.Installations = map[string]string{installed.ID: installed.RuntimeInstallationID()}
+	candidate.SourceHashes = map[string]string{installed.ID: installed.Attributes[coreauth.SourceHashAttributeKey]}
 
 	deleted, errDelete := service.deleteAuthMaintenanceCandidateUnchecked(t.Context(), candidate)
 	if deleted || errDelete == nil {
@@ -764,6 +764,58 @@ func TestServiceChatGPTWebDeadDeleteDoesNotDeleteReplacementGeneration(t *testin
 	}
 }
 
+func TestServiceChatGPTWebDeadDeleteSurvivesEquivalentRuntimeReinstall(t *testing.T) {
+	authDir := t.TempDir()
+	store := sdkauth.NewFileTokenStore()
+	store.SetBaseDir(authDir)
+	cfg := &config.Config{AuthDir: authDir}
+	cfg.ChatGPTWeb.AutoDeleteDeadAuths = true
+	cfg.ChatGPTWeb.AutoDeleteDeadPriorities = []int{-1}
+	service := &Service{
+		cfg:         cfg,
+		coreManager: coreauth.NewManager(store, nil, nil),
+	}
+	dead := chatGPTWebAutoDeleteTestAuth("equivalent-reinstall.json", -1, coreauth.LifecycleStateDead)
+	dead.FileName = filepath.Join(authDir, dead.ID)
+	dead.Attributes["path"] = dead.FileName
+	installed, errRegister := service.coreManager.Register(t.Context(), dead)
+	if errRegister != nil {
+		t.Fatalf("register dead auth: %v", errRegister)
+	}
+	candidate, ok := service.authMaintenanceCandidateForAuth(installed, authDir, "chatgpt_web_dead_account_deactivated")
+	if !ok || !service.disableAuthMaintenanceCandidate(t.Context(), candidate, true) {
+		t.Fatal("failed to stage dead auth candidate")
+	}
+	candidate = snapshotChatGPTWebAutoDeleteCandidate(t, service, candidate, authDir)
+
+	staged, exists := service.coreManager.GetByID(dead.ID)
+	if !exists || staged == nil {
+		t.Fatal("staged credential is missing")
+	}
+	originalInstallation := staged.RuntimeInstallationID()
+	reinstalled, errUpdate := service.coreManager.Update(t.Context(), staged)
+	if errUpdate != nil {
+		t.Fatalf("reinstall unchanged auth: %v", errUpdate)
+	}
+	if reinstalled.RuntimeInstallationID() == originalInstallation {
+		t.Fatal("test did not replace the volatile runtime installation")
+	}
+
+	deleted, errDelete := service.deleteAuthMaintenanceCandidate(t.Context(), candidate)
+	if errDelete != nil {
+		t.Fatalf("deleteAuthMaintenanceCandidate() error = %v", errDelete)
+	}
+	if !deleted {
+		t.Fatal("equivalent runtime reinstall canceled the pending delete")
+	}
+	if _, exists = service.coreManager.GetByID(dead.ID); exists {
+		t.Fatal("deleted credential remained in runtime")
+	}
+	if _, errStat := os.Stat(dead.FileName); !os.IsNotExist(errStat) {
+		t.Fatalf("deleted credential file remained: %v", errStat)
+	}
+}
+
 func TestServiceChatGPTWebDeadDeleteRequiresPersistedSourceHash(t *testing.T) {
 	authDir := t.TempDir()
 	service := &Service{
@@ -784,7 +836,9 @@ func TestServiceChatGPTWebDeadDeleteRequiresPersistedSourceHash(t *testing.T) {
 	if !ok {
 		t.Fatal("build dead auth candidate")
 	}
-	candidate = snapshotChatGPTWebAutoDeleteCandidate(t, service, candidate, authDir)
+	if _, snapshotOK := service.snapshotAuthMaintenanceCandidateSourceHashes(candidate, authDir); snapshotOK {
+		t.Fatal("candidate without a persisted source hash was snapshotted for deletion")
+	}
 	if service.chatGPTWebDeadMaintenanceCandidateStillEligible(
 		candidate,
 		chatGPTWebDeadAuthDeletePolicy{enabled: true, priorities: []int{-1}},
@@ -1010,7 +1064,7 @@ func chatGPTWebAutoDeleteTestAuth(id string, priority int, lifecycle string) *co
 
 func snapshotChatGPTWebAutoDeleteCandidate(t *testing.T, service *Service, candidate authMaintenanceCandidate, authDir string) authMaintenanceCandidate {
 	t.Helper()
-	snapshot, ok := service.snapshotAuthMaintenanceCandidateInstallations(candidate, authDir)
+	snapshot, ok := service.snapshotAuthMaintenanceCandidateSourceHashes(candidate, authDir)
 	if !ok {
 		t.Fatalf("snapshot auth maintenance candidate = %#v, false", candidate)
 	}
