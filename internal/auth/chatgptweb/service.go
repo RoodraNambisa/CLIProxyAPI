@@ -195,7 +195,15 @@ func (service *Service) loginOnce(acquisitionContext context.Context, input Logi
 		service.applyFailure(credential, authError, input.Relogin)
 		return credential, authError
 	}
-	sentinel, err := NewSentinel(client, service.options.SentinelBaseURL, service.options.AuthBaseURL, deviceID, service.options.Rand, service.options.Now)
+	sentinel, err := NewSentinelWithEnvironment(
+		client,
+		service.options.SentinelBaseURL,
+		service.options.AuthBaseURL,
+		deviceID,
+		ResolveCredentialBrowserEnvironment(credential, ""),
+		service.options.Rand,
+		service.options.Now,
+	)
 	if err != nil {
 		authError := newAuthError("sentinel_initialization_failed", pendingState, 0, false, true, "initialize sentinel", err)
 		service.applyFailure(credential, authError, input.Relogin)
@@ -721,6 +729,7 @@ func EnsureCredentialRuntimeIDsForURL(credential *Credential, reader io.Reader, 
 		}
 	}
 	resolveCredentialPersona(credential, "")
+	resolveCredentialBrowserEnvironment(credential, "")
 	return nil
 }
 
@@ -1088,6 +1097,10 @@ func cloneCredential(source *Credential) *Credential {
 	clone := *source
 	clone.Cookies = append([]Cookie(nil), source.Cookies...)
 	clone.WebAuthn = cloneWebAuthnCredential(source.WebAuthn)
+	if source.BrowserEnvironment != nil {
+		identity := *source.BrowserEnvironment
+		clone.BrowserEnvironment = &identity
+	}
 	return &clone
 }
 

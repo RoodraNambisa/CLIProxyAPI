@@ -171,7 +171,15 @@ func conversationSentinelSDKVersionFromPath(path string) (version string, backen
 // BuildConversationRequirementsToken creates the browser proof payload used by
 // the chat-requirements prepare endpoint.
 func BuildConversationRequirementsToken(persona Persona, scriptSources []string, dataBuild string, reader io.Reader, now func() time.Time) (string, error) {
-	config, err := buildConversationPoWConfig(persona, scriptSources, dataBuild, reader, now)
+	return BuildConversationRequirementsTokenWithEnvironment(
+		ConversationTurnstileEnvironment{Persona: persona}, scriptSources, dataBuild, reader, now,
+	)
+}
+
+// BuildConversationRequirementsTokenWithEnvironment creates a browser proof
+// payload from the same request-scoped environment used by Sentinel.
+func BuildConversationRequirementsTokenWithEnvironment(environment ConversationTurnstileEnvironment, scriptSources []string, dataBuild string, reader io.Reader, now func() time.Time) (string, error) {
+	config, err := buildConversationPoWConfig(environment, scriptSources, dataBuild, reader, now)
 	if err != nil {
 		return "", err
 	}
@@ -188,6 +196,18 @@ func BuildConversationProofToken(ctx context.Context, seed, difficulty string, p
 }
 
 func buildConversationProofToken(ctx context.Context, seed, difficulty string, persona Persona, scriptSources []string, dataBuild string, reader io.Reader, now, monotonicNow func() time.Time) (string, error) {
+	return buildConversationProofTokenWithEnvironment(
+		ctx, seed, difficulty, ConversationTurnstileEnvironment{Persona: persona}, scriptSources, dataBuild, reader, now, monotonicNow,
+	)
+}
+
+// BuildConversationProofTokenWithEnvironment solves the browser proof using
+// the same stable environment snapshot as Turnstile and Session Observer.
+func BuildConversationProofTokenWithEnvironment(ctx context.Context, seed, difficulty string, environment ConversationTurnstileEnvironment, scriptSources []string, dataBuild string, reader io.Reader, now func() time.Time) (string, error) {
+	return buildConversationProofTokenWithEnvironment(ctx, seed, difficulty, environment, scriptSources, dataBuild, reader, now, time.Now)
+}
+
+func buildConversationProofTokenWithEnvironment(ctx context.Context, seed, difficulty string, environment ConversationTurnstileEnvironment, scriptSources []string, dataBuild string, reader io.Reader, now, monotonicNow func() time.Time) (string, error) {
 	seed = strings.TrimSpace(seed)
 	difficulty = strings.ToLower(strings.TrimSpace(difficulty))
 	if seed == "" || difficulty == "" {
@@ -199,7 +219,7 @@ func buildConversationProofToken(ctx context.Context, seed, difficulty string, p
 	if _, err := hex.DecodeString(difficulty + strings.Repeat("0", len(difficulty)%2)); err != nil {
 		return "", fmt.Errorf("decode conversation proof difficulty: %w", err)
 	}
-	config, err := buildConversationPoWConfig(persona, scriptSources, dataBuild, reader, now)
+	config, err := buildConversationPoWConfig(environment, scriptSources, dataBuild, reader, now)
 	if err != nil {
 		return "", err
 	}
@@ -278,9 +298,9 @@ func buildConversationProofToken(ctx context.Context, seed, difficulty string, p
 	return "", fmt.Errorf("failed to solve conversation proof challenge")
 }
 
-func buildConversationPoWConfig(persona Persona, scriptSources []string, dataBuild string, reader io.Reader, now func() time.Time) ([]any, error) {
-	persona = canonicalPersona(persona)
-	profile, _ := personaCatalogRuntimeEntry(persona)
+func buildConversationPoWConfig(environment ConversationTurnstileEnvironment, scriptSources []string, dataBuild string, reader io.Reader, now func() time.Time) ([]any, error) {
+	persona := canonicalPersona(environment.Persona)
+	profile := resolveSentinelBrowserProfile(environment)
 	reader = randomReader(reader)
 	if now == nil {
 		now = time.Now
@@ -296,7 +316,7 @@ func buildConversationPoWConfig(persona Persona, scriptSources []string, dataBui
 		"vendor−Google Inc.",
 		"webdriver−false",
 		"cookieEnabled−true",
-		fmt.Sprintf("hardwareConcurrency−%d", persona.HardwareConcurrency),
+		fmt.Sprintf("hardwareConcurrency−%d", profile.hardwareConcurrency),
 		"language−en-US",
 		"product−Gecko",
 	})
@@ -329,12 +349,12 @@ func buildConversationPoWConfig(persona Persona, scriptSources []string, dataBui
 	eastern := current.In(time.FixedZone("EST", -5*60*60))
 	performanceNow := float64(current.UnixNano()%50_000_000) / float64(time.Microsecond)
 	timeOrigin := float64(current.UnixNano())/float64(time.Millisecond) - performanceNow
-	hardware := persona.HardwareConcurrency
+	hardware := profile.hardwareConcurrency
 	if hardware <= 0 {
 		hardware = 8
 	}
 	return []any{
-		persona.ScreenWidth + persona.ScreenHeight,
+		profile.screenWidth + profile.screenHeight,
 		eastern.Format("Mon Jan 02 2006 15:04:05") + " GMT-0500 (Eastern Standard Time)",
 		uint64(profile.jsHeapSizeLimit),
 		1,

@@ -287,7 +287,8 @@ func TestSentinelSolvesTurnstileChallenge(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer client.CloseIdleConnections()
-	sentinel, err := NewSentinel(client, server.URL, server.URL, deviceID, zeroReader{}, time.Now)
+	identity := browserEnvironmentIdentityForSlot(client.Persona(), 17)
+	sentinel, err := NewSentinelWithEnvironment(client, server.URL, server.URL, deviceID, identity, zeroReader{}, time.Now)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -314,6 +315,9 @@ func TestSentinelSolvesTurnstileChallenge(t *testing.T) {
 	}
 	if len(solverEnvironment.ScriptSources) != 1 || solverEnvironment.ScriptSources[0] != sentinelSDKURL {
 		t.Fatalf("Turnstile script sources = %#v", solverEnvironment.ScriptSources)
+	}
+	if solverEnvironment.BrowserEnvironment != identity {
+		t.Fatalf("Turnstile browser environment = %#v, want %#v", solverEnvironment.BrowserEnvironment, identity)
 	}
 }
 

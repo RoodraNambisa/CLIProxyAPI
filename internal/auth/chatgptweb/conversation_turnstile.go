@@ -128,12 +128,13 @@ type conversationTurnstileLocationRef struct {
 // compact Sentinel challenge. ScriptSources should come from the same bootstrap
 // document used to create the requirements token.
 type ConversationTurnstileEnvironment struct {
-	Persona          Persona
-	DeviceID         string
-	PageStartedAt    time.Time
-	ScriptSources    []string
-	Location         string
-	LocalStorageKeys []string
+	Persona            Persona
+	BrowserEnvironment BrowserEnvironmentIdentity
+	DeviceID           string
+	PageStartedAt      time.Time
+	ScriptSources      []string
+	Location           string
+	LocalStorageKeys   []string
 }
 
 type conversationTurnstileOrderedMap struct {
@@ -663,7 +664,7 @@ func normalizeConversationTurnstileEnvironment(environment ConversationTurnstile
 		"window.navigator.userAgent":                 persona.UserAgent,
 		"window.navigator.language":                  persona.Language,
 		"window.navigator.languages":                 languages,
-		"window.navigator.hardwareConcurrency":       persona.HardwareConcurrency,
+		"window.navigator.hardwareConcurrency":       profile.hardwareConcurrency,
 		"window.navigator.platform":                  persona.Platform,
 		"window.navigator.vendor":                    "Google Inc.",
 		"window.navigator.webdriver":                 false,
@@ -673,8 +674,8 @@ func normalizeConversationTurnstileEnvironment(environment ConversationTurnstile
 		"window.navigator.maxTouchPoints":            profile.maxTouchPoints,
 		"window.navigator.pdfViewerEnabled":          true,
 		"window.navigator.product":                   "Gecko",
-		"window.screen.width":                        persona.ScreenWidth,
-		"window.screen.height":                       persona.ScreenHeight,
+		"window.screen.width":                        profile.screenWidth,
+		"window.screen.height":                       profile.screenHeight,
 		"window.screen.availLeft":                    profile.availLeft,
 		"window.screen.availTop":                     profile.availTop,
 		"window.screen.availWidth":                   profile.availWidth,
@@ -683,6 +684,8 @@ func normalizeConversationTurnstileEnvironment(environment ConversationTurnstile
 		"window.screen.pixelDepth":                   profile.colorDepth,
 		"window.innerWidth":                          profile.innerWidth,
 		"window.innerHeight":                         profile.innerHeight,
+		"window.outerWidth":                          profile.outerWidth,
+		"window.outerHeight":                         profile.outerHeight,
 		"window.devicePixelRatio":                    profile.devicePixelRatio,
 		"window.location":                            locationRef,
 		"window.location.href":                       location,

@@ -1112,7 +1112,15 @@ func (e *ChatGPTWebExecutor) chatGPTWebRequirements(ctx context.Context, client 
 	if sdkResource.URL == "" {
 		sdkResource = chatgptwebauth.DefaultConversationSentinelSDKResource()
 	}
-	pToken, err := chatgptwebauth.BuildConversationRequirementsToken(credential.Persona, sources, dataBuild, e.runtimeRand, e.now)
+	sentinelEnvironment := chatgptwebauth.ConversationTurnstileEnvironment{
+		Persona:            credential.Persona,
+		BrowserEnvironment: chatgptwebauth.ResolveCredentialBrowserEnvironment(credential, ""),
+		DeviceID:           credential.DeviceID,
+		PageStartedAt:      e.now(),
+		ScriptSources:      sources,
+		Location:           strings.TrimRight(baseURL, "/") + "/",
+	}
+	pToken, err := chatgptwebauth.BuildConversationRequirementsTokenWithEnvironment(sentinelEnvironment, sources, dataBuild, e.runtimeRand, e.now)
 	if err != nil {
 		return chatGPTWebRequirements{}, chatGPTWebLocalProtocolError(
 			http.StatusBadGateway,
@@ -1136,13 +1144,6 @@ func (e *ChatGPTWebExecutor) chatGPTWebRequirements(ctx context.Context, client 
 			http.StatusForbidden,
 			"chatgpt web requires an unsupported Arkose challenge",
 		)
-	}
-	sentinelEnvironment := chatgptwebauth.ConversationTurnstileEnvironment{
-		Persona:       credential.Persona,
-		DeviceID:      credential.DeviceID,
-		PageStartedAt: e.now(),
-		ScriptSources: sources,
-		Location:      strings.TrimRight(baseURL, "/") + "/",
 	}
 	sdkFetcher := e.chatGPTWebSentinelSDKFetcher(client, credential)
 	if e.sentinelSDKFetcherFactory != nil {
@@ -1180,11 +1181,11 @@ func (e *ChatGPTWebExecutor) chatGPTWebRequirements(ctx context.Context, client 
 	proofToken := ""
 	if requiredJSONFlag(prepare, "proofofwork", "required") {
 		proof, _ := prepare["proofofwork"].(map[string]any)
-		proofToken, err = chatgptwebauth.BuildConversationProofToken(
+		proofToken, err = chatgptwebauth.BuildConversationProofTokenWithEnvironment(
 			ctx,
 			chatGPTWebAnyString(proof["seed"]),
 			chatGPTWebAnyString(proof["difficulty"]),
-			credential.Persona, sources, dataBuild, e.runtimeRand, e.now,
+			sentinelEnvironment, sources, dataBuild, e.runtimeRand, e.now,
 		)
 		if err != nil {
 			if ctx != nil && ctx.Err() != nil {

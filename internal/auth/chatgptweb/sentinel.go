@@ -24,17 +24,29 @@ const (
 )
 
 type SentinelGenerator struct {
-	deviceID    string
-	persona     Persona
-	sid         string
-	random      io.Reader
-	now         func() time.Time
-	maxAttempts int
+	deviceID           string
+	persona            Persona
+	browserEnvironment BrowserEnvironmentIdentity
+	sid                string
+	random             io.Reader
+	now                func() time.Time
+	maxAttempts        int
 }
 
 func NewSentinelGenerator(deviceID string, persona Persona, reader io.Reader, now func() time.Time) (*SentinelGenerator, error) {
+	return NewSentinelGeneratorWithEnvironment(deviceID, persona, BrowserEnvironmentIdentity{}, reader, now)
+}
+
+// NewSentinelGeneratorWithEnvironment creates a proof generator bound to one
+// immutable transport Persona and one stable browser environment.
+func NewSentinelGeneratorWithEnvironment(deviceID string, persona Persona, browserEnvironment BrowserEnvironmentIdentity, reader io.Reader, now func() time.Time) (*SentinelGenerator, error) {
 	if strings.TrimSpace(deviceID) == "" {
 		return nil, fmt.Errorf("sentinel device ID is empty")
+	}
+	deviceID = strings.TrimSpace(deviceID)
+	persona = canonicalPersona(persona)
+	if _, ok := browserEnvironmentSlot(persona, browserEnvironment); !ok {
+		browserEnvironment = browserEnvironmentIdentityForSeed(persona, deviceID)
 	}
 	if now == nil {
 		now = time.Now
@@ -44,12 +56,13 @@ func NewSentinelGenerator(deviceID string, persona Persona, reader io.Reader, no
 		return nil, fmt.Errorf("generate sentinel session ID: %w", err)
 	}
 	return &SentinelGenerator{
-		deviceID:    strings.TrimSpace(deviceID),
-		persona:     canonicalPersona(persona),
-		sid:         sid,
-		random:      randomReader(reader),
-		now:         now,
-		maxAttempts: defaultPoWMaxAttempts,
+		deviceID:           deviceID,
+		persona:            persona,
+		browserEnvironment: browserEnvironment,
+		sid:                sid,
+		random:             randomReader(reader),
+		now:                now,
+		maxAttempts:        defaultPoWMaxAttempts,
 	}, nil
 }
 
@@ -115,7 +128,11 @@ func (generator *SentinelGenerator) GenerateProofContext(ctx context.Context, se
 }
 
 func (generator *SentinelGenerator) configuration() ([]any, error) {
-	profile, _ := personaCatalogRuntimeEntry(generator.persona)
+	profile := resolveSentinelBrowserProfile(ConversationTurnstileEnvironment{
+		Persona:            generator.persona,
+		BrowserEnvironment: generator.browserEnvironment,
+		DeviceID:           generator.deviceID,
+	})
 	perfRandom, err := generator.randomFloat64()
 	if err != nil {
 		return nil, err
@@ -151,13 +168,13 @@ func (generator *SentinelGenerator) configuration() ([]any, error) {
 	if err != nil {
 		return nil, err
 	}
-	hardware := generator.persona.HardwareConcurrency
+	hardware := profile.hardwareConcurrency
 	if hardware <= 0 {
 		hardware = randomHardware
 	}
 	now := generator.now().UTC()
 	return []any{
-		fmt.Sprintf("%dx%d", generator.persona.ScreenWidth, generator.persona.ScreenHeight),
+		fmt.Sprintf("%dx%d", profile.screenWidth, profile.screenHeight),
 		now.Format("Mon Jan 02 2006 15:04:05") + " GMT+0000 (Coordinated Universal Time)",
 		uint64(profile.jsHeapSizeLimit),
 		firstRandom,
@@ -230,10 +247,16 @@ type Sentinel struct {
 }
 
 func NewSentinel(client *Client, baseURL, authURL, deviceID string, reader io.Reader, now func() time.Time) (*Sentinel, error) {
+	return NewSentinelWithEnvironment(client, baseURL, authURL, deviceID, BrowserEnvironmentIdentity{}, reader, now)
+}
+
+// NewSentinelWithEnvironment creates a Sentinel client that reuses the
+// credential's stable browser environment for proof and Turnstile work.
+func NewSentinelWithEnvironment(client *Client, baseURL, authURL, deviceID string, browserEnvironment BrowserEnvironmentIdentity, reader io.Reader, now func() time.Time) (*Sentinel, error) {
 	if client == nil {
 		return nil, fmt.Errorf("sentinel browser client is nil")
 	}
-	generator, err := NewSentinelGenerator(deviceID, client.Persona(), reader, now)
+	generator, err := NewSentinelGeneratorWithEnvironment(deviceID, client.Persona(), browserEnvironment, reader, now)
 	if err != nil {
 		return nil, err
 	}
@@ -352,11 +375,12 @@ func (sentinel *Sentinel) solveTurnstile(ctx context.Context, challenge map[stri
 		dx,
 		requirementsToken,
 		ConversationTurnstileEnvironment{
-			Persona:       sentinel.generator.persona,
-			DeviceID:      sentinel.deviceID,
-			PageStartedAt: sentinel.generator.now(),
-			ScriptSources: []string{sentinelSDKURL},
-			Location:      sentinel.baseURL + "/backend-api/sentinel/frame.html?sv=" + sentinelSDKVersion,
+			Persona:            sentinel.generator.persona,
+			BrowserEnvironment: sentinel.generator.browserEnvironment,
+			DeviceID:           sentinel.deviceID,
+			PageStartedAt:      sentinel.generator.now(),
+			ScriptSources:      []string{sentinelSDKURL},
+			Location:           sentinel.baseURL + "/backend-api/sentinel/frame.html?sv=" + sentinelSDKVersion,
 		},
 		sentinel.generator.random,
 		sentinel.generator.now,

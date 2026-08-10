@@ -20,41 +20,62 @@ func (reader *sentinelSequenceReader) Read(buffer []byte) (int, error) {
 	return len(buffer), nil
 }
 
-func TestSentinelBrowserProfilesMatchPersonaCatalog(t *testing.T) {
-	if sentinelBrowserFingerprintSlots != len(personaCatalogV2) {
-		t.Fatalf("fingerprint slots = %d, catalog entries = %d", sentinelBrowserFingerprintSlots, len(personaCatalogV2))
+func TestSentinelBrowserProfilesMatchEnvironmentCatalog(t *testing.T) {
+	if sentinelBrowserFingerprintSlots != browserEnvironmentVariantsPerPersona {
+		t.Fatalf("fingerprint slots = %d, environment slots = %d", sentinelBrowserFingerprintSlots, browserEnvironmentVariantsPerPersona)
 	}
-	seen := make(map[string]struct{}, len(personaCatalogV2))
-	for index, entry := range personaCatalogV2 {
-		profile := sentinelBrowserProfileForSlot(Persona{}, index)
-		want := sentinelBrowserProfileForCatalogEntry(entry, index)
-		if profile != want {
-			t.Fatalf("catalog profile %d mismatch:\n got: %#v\nwant: %#v", index, profile, want)
+	seen := make(map[string]struct{}, len(personaCatalogV2)*browserEnvironmentVariantsPerPersona)
+	for _, entry := range personaCatalogV2 {
+		for slot := 0; slot < browserEnvironmentVariantsPerPersona; slot++ {
+			profile := sentinelBrowserProfileForSlot(entry.persona, slot)
+			if profile.version != browserEnvironmentCatalogVersion || profile.slot != slot {
+				t.Fatalf("profile %q/%d identity = %s/%s/%d", entry.persona.CatalogID, slot, profile.version, profile.catalogID, profile.slot)
+			}
+			if _, ok := browserEnvironmentSlot(entry.persona, BrowserEnvironmentIdentity{CatalogVersion: profile.version, CatalogID: profile.catalogID}); !ok {
+				t.Fatalf("profile %q is not valid for %q", profile.catalogID, entry.persona.CatalogID)
+			}
+			if _, exists := seen[profile.catalogID]; exists {
+				t.Fatalf("duplicate environment profile %q", profile.catalogID)
+			}
+			seen[profile.catalogID] = struct{}{}
+			if profile.platform != entry.platform || profile.webGLVendor != entry.webGLVendor || profile.webGLRenderer != entry.webGLRenderer {
+				t.Fatalf("profile %q crossed hardware families: %#v", profile.catalogID, profile)
+			}
+			if profile.screenWidth != entry.persona.ScreenWidth || profile.screenHeight != entry.persona.ScreenHeight ||
+				profile.hardwareConcurrency != entry.persona.HardwareConcurrency || profile.devicePixelRatio != entry.devicePixelRatio ||
+				profile.deviceMemory != entry.deviceMemory || profile.colorDepth != entry.colorDepth {
+				t.Fatalf("profile %q changed fixed family attributes: %#v", profile.catalogID, profile)
+			}
+			if profile.innerWidth < 1 || profile.innerWidth > profile.availWidth || profile.innerHeight < 1 || profile.innerHeight > profile.availHeight {
+				t.Fatalf("profile %q has invalid viewport: %#v", profile.catalogID, profile)
+			}
+			if profile.outerWidth < profile.innerWidth || profile.outerWidth > profile.availWidth ||
+				profile.outerHeight < profile.innerHeight || profile.outerHeight > profile.availHeight {
+				t.Fatalf("profile %q has invalid outer window: %#v", profile.catalogID, profile)
+			}
 		}
-		if profile.version != personaCatalogVersion || profile.catalogID != entry.persona.CatalogID || profile.slot != index {
-			t.Fatalf("catalog profile %d identity = %s/%s/%d", index, profile.version, profile.catalogID, profile.slot)
-		}
-		if _, exists := seen[profile.catalogID]; exists {
-			t.Fatalf("duplicate catalog profile %q", profile.catalogID)
-		}
-		seen[profile.catalogID] = struct{}{}
+	}
+	if len(seen) != 256 {
+		t.Fatalf("environment catalog has %d entries, want 256", len(seen))
 	}
 }
 
-func TestSentinelBrowserProfileFollowsCredentialPersona(t *testing.T) {
-	for index, entry := range personaCatalogV2 {
+func TestSentinelBrowserProfileUsesPersistedEnvironmentIdentity(t *testing.T) {
+	for _, entry := range personaCatalogV2 {
+		identity := browserEnvironmentIdentityForSlot(entry.persona, 17)
 		environment := ConversationTurnstileEnvironment{
-			Persona:  entry.persona,
-			DeviceID: "11111111-2222-4333-8444-555555555555",
+			Persona:            entry.persona,
+			BrowserEnvironment: identity,
+			DeviceID:           "11111111-2222-4333-8444-555555555555",
 		}
 		first := resolveSentinelBrowserProfile(environment)
 		environment.DeviceID = "11111111-2222-4333-8444-666666666666"
 		second := resolveSentinelBrowserProfile(environment)
 		if first != second {
-			t.Fatalf("catalog %q changed with device ID: %#v != %#v", entry.persona.CatalogID, first, second)
+			t.Fatalf("environment %q changed with device ID: %#v != %#v", identity.CatalogID, first, second)
 		}
-		if first.catalogID != entry.persona.CatalogID || first.slot != index {
-			t.Fatalf("catalog %q resolved to %q/%d", entry.persona.CatalogID, first.catalogID, first.slot)
+		if first.catalogID != identity.CatalogID || first.slot != 17 {
+			t.Fatalf("environment %q resolved to %q/%d", identity.CatalogID, first.catalogID, first.slot)
 		}
 	}
 }
@@ -72,7 +93,7 @@ func TestSentinelBrowserEnvironmentUsesCanonicalPersona(t *testing.T) {
 	}
 	environment := ConversationTurnstileEnvironment{Persona: legacy, DeviceID: "legacy-device"}
 	profile := resolveSentinelBrowserProfile(environment)
-	if profile.catalogID != personaCatalogV2[0].persona.CatalogID {
+	if _, ok := browserEnvironmentSlot(personaCatalogV2[0].persona, BrowserEnvironmentIdentity{CatalogVersion: profile.version, CatalogID: profile.catalogID}); !ok {
 		t.Fatalf("legacy runtime profile = %q", profile.catalogID)
 	}
 	values, _, _ := normalizeConversationTurnstileEnvironment(environment, testTime())
@@ -94,10 +115,12 @@ func TestSentinelRuntimeBootstrapSharesCatalogSnapshot(t *testing.T) {
 		now:    func() time.Time { return startedAt },
 	}
 	entry := personaCatalogV2[5]
+	identity := browserEnvironmentIdentityForSlot(entry.persona, 23)
 	environment := ConversationTurnstileEnvironment{
-		Persona:       entry.persona,
-		DeviceID:      "11111111-2222-4333-8444-555555555555",
-		PageStartedAt: startedAt,
+		Persona:            entry.persona,
+		BrowserEnvironment: identity,
+		DeviceID:           "11111111-2222-4333-8444-555555555555",
+		PageStartedAt:      startedAt,
 	}
 	request := SentinelSDKRequest{Environment: environment}
 	source := &sentinelSourceCacheEntry{url: "https://sentinel.openai.com/sentinel/test/sdk.js"}
@@ -109,8 +132,8 @@ func TestSentinelRuntimeBootstrapSharesCatalogSnapshot(t *testing.T) {
 		"device_id":           environment.DeviceID,
 		"user_agent":          entry.persona.UserAgent,
 		"platform":            entry.persona.Platform,
-		"fingerprint_version": personaCatalogVersion,
-		"fingerprint_catalog": entry.persona.CatalogID,
+		"fingerprint_version": browserEnvironmentCatalogVersion,
+		"fingerprint_catalog": identity.CatalogID,
 		"fingerprint_slot":    float64(profile.slot),
 		"webgl_vendor":        profile.webGLVendor,
 		"webgl_renderer":      profile.webGLRenderer,

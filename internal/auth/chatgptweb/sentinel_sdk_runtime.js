@@ -595,6 +595,8 @@
   defineReadonly(host, "devicePixelRatio", Number(config.device_pixel_ratio) || 1, false);
   defineReadonly(host, "innerWidth", Number(config.inner_width) || width, false);
   defineReadonly(host, "innerHeight", Number(config.inner_height) || height, false);
+  defineReadonly(host, "outerWidth", Number(config.outer_width) || width, false);
+  defineReadonly(host, "outerHeight", Number(config.outer_height) || height, false);
 
   const localStorage = new MemoryStorage(config.local_storage_keys);
   const sessionStorage = new MemoryStorage([]);

@@ -198,7 +198,15 @@ func (service *Service) beginPasskeyLogin(ctx context.Context, client *Client, c
 		return payload, nil
 	}
 
-	sentinel, errSentinel := NewSentinel(client, service.options.SentinelBaseURL, service.options.AuthBaseURL, credential.DeviceID, service.options.Rand, service.options.Now)
+	sentinel, errSentinel := NewSentinelWithEnvironment(
+		client,
+		service.options.SentinelBaseURL,
+		service.options.AuthBaseURL,
+		credential.DeviceID,
+		ResolveCredentialBrowserEnvironment(credential, ""),
+		service.options.Rand,
+		service.options.Now,
+	)
 	if errSentinel != nil {
 		return nil, newAuthError("sentinel_initialization_failed", pendingState, 0, false, true, "initialize Passkey login sentinel", errSentinel)
 	}

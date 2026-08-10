@@ -715,6 +715,10 @@ stored:localStorage.getItem("sentinel-test"),
 namedStored:localStorage["sentinel-test"],
 storageKeys:Object.keys(localStorage),
 availLeft:screen.availLeft,
+innerWidth:window.innerWidth,
+innerHeight:window.innerHeight,
+outerWidth:window.outerWidth,
+outerHeight:window.outerHeight,
 deviceMemory:navigator.deviceMemory,
 heap:performance.memory.jsHeapSizeLimit,
 routerState:typeof __reactRouterContext.state,
@@ -751,6 +755,10 @@ elementInstance:canvas instanceof Element
 		NamedStored        string   `json:"namedStored"`
 		StorageKeys        []string `json:"storageKeys"`
 		AvailLeft          int      `json:"availLeft"`
+		InnerWidth         int      `json:"innerWidth"`
+		InnerHeight        int      `json:"innerHeight"`
+		OuterWidth         int      `json:"outerWidth"`
+		OuterHeight        int      `json:"outerHeight"`
 		DeviceMemory       float64  `json:"deviceMemory"`
 		Heap               float64  `json:"heap"`
 		RouterState        string   `json:"routerState"`
@@ -778,6 +786,8 @@ elementInstance:canvas instanceof Element
 		t.Fatalf("browser object tags = %+v", result)
 	}
 	if result.Vendor != profile.webGLVendor || result.Renderer != profile.webGLRenderer || result.AvailLeft != profile.availLeft ||
+		result.InnerWidth != profile.innerWidth || result.InnerHeight != profile.innerHeight ||
+		result.OuterWidth != profile.outerWidth || result.OuterHeight != profile.outerHeight ||
 		result.DeviceMemory != profile.deviceMemory || result.Heap != profile.jsHeapSizeLimit || result.CanvasDataURL != wantCanvasDataURL {
 		t.Fatalf("SDK fingerprint = %+v, profile = %+v", result, profile)
 	}

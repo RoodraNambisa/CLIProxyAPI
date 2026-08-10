@@ -107,6 +107,42 @@ func TestBuildConversationRequirementsTokenUsesTwentyFiveItems(t *testing.T) {
 	}
 }
 
+func TestConversationPoWUsesBrowserEnvironmentSnapshot(t *testing.T) {
+	persona := personaCatalogV2[0].persona
+	decode := func(slot int) []any {
+		t.Helper()
+		environment := ConversationTurnstileEnvironment{
+			Persona:            persona,
+			BrowserEnvironment: browserEnvironmentIdentityForSlot(persona, slot),
+			DeviceID:           "stable-device",
+		}
+		token, err := BuildConversationRequirementsTokenWithEnvironment(
+			environment, []string{"/sdk.js"}, "build", zeroReader{}, func() time.Time { return time.Unix(1_700_000_000, 0) },
+		)
+		if err != nil {
+			t.Fatalf("BuildConversationRequirementsTokenWithEnvironment() error = %v", err)
+		}
+		payload, err := base64.StdEncoding.DecodeString(strings.TrimPrefix(token, "gAAAAAC"))
+		if err != nil {
+			t.Fatalf("decode token: %v", err)
+		}
+		var config []any
+		if err = json.Unmarshal(payload, &config); err != nil {
+			t.Fatalf("decode config: %v", err)
+		}
+		return config
+	}
+
+	first := decode(0)
+	second := decode(8)
+	if first[2] == second[2] {
+		t.Fatalf("heap profile did not follow browser environment: %#v == %#v", first[2], second[2])
+	}
+	if first[0] != second[0] || first[4] != second[4] || first[16] != second[16] {
+		t.Fatalf("browser environment changed fixed transport family fields: first=%#v second=%#v", first, second)
+	}
+}
+
 func TestConversationPoWBuildersAcceptNilRandomReader(t *testing.T) {
 	if _, err := BuildConversationRequirementsToken(DefaultPersona(), nil, "", nil, time.Now); err != nil {
 		t.Fatalf("BuildConversationRequirementsToken() error = %v", err)
