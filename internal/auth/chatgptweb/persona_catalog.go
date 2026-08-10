@@ -214,5 +214,6 @@ func ResolveCredentialPersona(credential *Credential, fallbackSeed string) Perso
 	if credential == nil {
 		return Persona{}
 	}
+	resolveCredentialBrowserEnvironment(credential, fallbackSeed)
 	return credential.Persona
 }
