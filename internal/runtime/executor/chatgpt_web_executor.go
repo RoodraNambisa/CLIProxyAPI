@@ -273,7 +273,10 @@ func (e *ChatGPTWebExecutor) SentinelSnapshot() chatgptwebauth.SentinelRuntimeSn
 	}
 	e.personaOutcomeMu.Unlock()
 	sort.Slice(snapshot.PersonaOutcomes, func(i, j int) bool {
-		return snapshot.PersonaOutcomes[i].CatalogID < snapshot.PersonaOutcomes[j].CatalogID
+		if snapshot.PersonaOutcomes[i].CatalogID != snapshot.PersonaOutcomes[j].CatalogID {
+			return snapshot.PersonaOutcomes[i].CatalogID < snapshot.PersonaOutcomes[j].CatalogID
+		}
+		return snapshot.PersonaOutcomes[i].BrowserEnvironmentID < snapshot.PersonaOutcomes[j].BrowserEnvironmentID
 	})
 	return snapshot
 }
@@ -282,17 +285,27 @@ func (e *ChatGPTWebExecutor) recordPersonaOutcome(auth *cliproxyauth.Auth, perso
 	if e == nil || auth == nil {
 		return
 	}
-	if strings.TrimSpace(persona.CatalogID) == "" {
-		credential, errCredential := chatgptwebauth.ParseCredential(auth.Metadata)
-		if errCredential != nil || credential == nil {
-			return
+	var browserEnvironment chatgptwebauth.BrowserEnvironmentIdentity
+	credential, errCredential := chatgptwebauth.ParseCredential(auth.Metadata)
+	if errCredential == nil && credential != nil {
+		if strings.TrimSpace(persona.CatalogID) == "" {
+			persona = chatgptwebauth.ResolveCredentialPersona(credential, auth.ID)
+		} else {
+			credential.Persona = persona
 		}
-		persona = chatgptwebauth.ResolveCredentialPersona(credential, auth.ID)
+		browserEnvironment = chatgptwebauth.ResolveCredentialBrowserEnvironment(credential, auth.ID)
 	}
 	if strings.TrimSpace(persona.CatalogID) == "" {
 		return
 	}
-	key := persona.CatalogVersion + "\x00" + persona.CatalogID
+	if strings.TrimSpace(browserEnvironment.CatalogID) == "" {
+		fallbackCredential := &chatgptwebauth.Credential{Persona: persona}
+		browserEnvironment = chatgptwebauth.ResolveCredentialBrowserEnvironment(fallbackCredential, auth.ID)
+	}
+	if strings.TrimSpace(browserEnvironment.CatalogID) == "" {
+		return
+	}
+	key := persona.CatalogVersion + "\x00" + persona.CatalogID + "\x00" + browserEnvironment.CatalogID
 	e.personaOutcomeMu.Lock()
 	if e.personaOutcomes == nil {
 		e.personaOutcomes = make(map[string]chatgptwebauth.PersonaOutcomeSnapshot)
@@ -300,23 +313,29 @@ func (e *ChatGPTWebExecutor) recordPersonaOutcome(auth *cliproxyauth.Auth, perso
 	outcome := e.personaOutcomes[key]
 	if outcome.CatalogID == "" {
 		outcome = chatgptwebauth.PersonaOutcomeSnapshot{
-			CatalogVersion: persona.CatalogVersion,
-			CatalogID:      persona.CatalogID,
-			TLSProfile:     persona.Profile,
-			UAMajor:        chatGPTWebUserAgentMajor(persona.UserAgent),
-			Platform:       persona.Platform,
+			CatalogVersion:       persona.CatalogVersion,
+			CatalogID:            persona.CatalogID,
+			TransportPersonaID:   persona.CatalogID,
+			BrowserEnvironmentID: browserEnvironment.CatalogID,
+			TLSProfile:           persona.Profile,
+			UAMajor:              chatGPTWebUserAgentMajor(persona.UserAgent),
+			Platform:             persona.Platform,
 		}
 	}
 	switch {
 	case err == nil:
 		outcome.Success200++
 	default:
-		status, cloudflare := chatGPTWebPersonaOutcomeError(err)
+		status, cloudflare, sentinel := chatGPTWebPersonaOutcomeError(err)
 		switch {
 		case status == http.StatusForbidden && cloudflare:
 			outcome.Cloudflare403++
+		case sentinel:
+			outcome.SentinelReject++
 		case status == http.StatusForbidden:
 			outcome.Forbidden403++
+		case status >= http.StatusBadRequest:
+			outcome.HTTPError++
 		default:
 			outcome.Other++
 		}
@@ -325,20 +344,25 @@ func (e *ChatGPTWebExecutor) recordPersonaOutcome(auth *cliproxyauth.Auth, perso
 	e.personaOutcomeMu.Unlock()
 }
 
-func chatGPTWebPersonaOutcomeError(err error) (int, bool) {
+func chatGPTWebPersonaOutcomeError(err error) (int, bool, bool) {
 	if err == nil {
-		return 0, false
+		return 0, false, false
 	}
 	type diagnosticProvider interface {
 		AuthErrorDiagnostic() *cliproxyauth.ErrorDiagnostic
 	}
 	var provider diagnosticProvider
 	cloudflare := false
+	sentinel := false
 	if errors.As(err, &provider) && provider != nil {
 		if diagnostic := provider.AuthErrorDiagnostic(); diagnostic != nil {
 			cloudflare = diagnostic.Cloudflare
+			stage := strings.ToLower(strings.TrimSpace(diagnostic.Stage))
+			code := strings.ToLower(strings.TrimSpace(diagnostic.Code))
+			sentinel = strings.HasPrefix(stage, "sentinel_") || strings.HasPrefix(code, "sentinel_") ||
+				code == "invalid_proof_token" || code == "chat_requirements" || code == "chat_requirements_failed"
 			if diagnostic.HTTPStatus != 0 {
-				return diagnostic.HTTPStatus, cloudflare
+				return diagnostic.HTTPStatus, cloudflare, sentinel
 			}
 		}
 	}
@@ -347,9 +371,9 @@ func chatGPTWebPersonaOutcomeError(err error) (int, bool) {
 	}
 	var status statusCoder
 	if errors.As(err, &status) && status != nil {
-		return status.StatusCode(), cloudflare
+		return status.StatusCode(), cloudflare, sentinel
 	}
-	return 0, cloudflare
+	return 0, cloudflare, sentinel
 }
 
 // UsageCacheSnapshot returns active storage and cumulative accounting outcomes.

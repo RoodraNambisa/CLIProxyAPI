@@ -27,6 +27,20 @@ func TestChatGPTWebPersonaOutcomesClassifyRequestResults(t *testing.T) {
 			Cloudflare: true,
 		},
 	})
+	executor.recordPersonaOutcome(auth, chatgptwebauth.Persona{}, chatGPTWebDiagnosticError{
+		cause: errors.New("sentinel rejected"),
+		diagnostic: &cliproxyauth.ErrorDiagnostic{
+			Stage:      "sentinel_finalize",
+			Code:       "invalid_proof_token",
+			HTTPStatus: http.StatusBadRequest,
+		},
+	})
+	executor.recordPersonaOutcome(auth, chatgptwebauth.Persona{}, chatGPTWebDiagnosticError{
+		cause: errors.New("upstream unavailable"),
+		diagnostic: &cliproxyauth.ErrorDiagnostic{
+			HTTPStatus: http.StatusServiceUnavailable,
+		},
+	})
 	executor.recordPersonaOutcome(auth, chatgptwebauth.Persona{}, errors.New("unclassified failure"))
 
 	snapshot := executor.SentinelSnapshot()
@@ -34,11 +48,49 @@ func TestChatGPTWebPersonaOutcomesClassifyRequestResults(t *testing.T) {
 		t.Fatalf("persona outcomes = %#v", snapshot.PersonaOutcomes)
 	}
 	outcome := snapshot.PersonaOutcomes[0]
-	if outcome.CatalogVersion != "v2" || outcome.CatalogID == "" || outcome.TLSProfile != "chrome_146" || outcome.UAMajor != "146" {
+	if outcome.CatalogVersion != "v2" || outcome.CatalogID == "" || outcome.TransportPersonaID != outcome.CatalogID ||
+		outcome.BrowserEnvironmentID == "" || outcome.TLSProfile != "chrome_146" || outcome.UAMajor != "146" {
 		t.Fatalf("persona identity = %#v", outcome)
 	}
-	if outcome.Success200 != 1 || outcome.Forbidden403 != 1 || outcome.Cloudflare403 != 1 || outcome.Other != 1 {
+	if outcome.Success200 != 1 || outcome.Forbidden403 != 1 || outcome.Cloudflare403 != 1 ||
+		outcome.SentinelReject != 1 || outcome.HTTPError != 1 || outcome.Other != 1 {
 		t.Fatalf("persona counters = %#v", outcome)
+	}
+}
+
+func TestChatGPTWebPersonaOutcomesSeparateBrowserEnvironments(t *testing.T) {
+	executor := &ChatGPTWebExecutor{personaOutcomes: make(map[string]chatgptwebauth.PersonaOutcomeSnapshot)}
+	first := chatGPTWebTestAuth("persona-environment-one")
+	second := first.Clone()
+	second.ID = "chatgpt-web-persona-environment-two"
+	credential, errCredential := chatgptwebauth.ParseCredential(first.Metadata)
+	if errCredential != nil || credential == nil {
+		t.Fatalf("ParseCredential() error = %v", errCredential)
+	}
+	persona := chatgptwebauth.ResolveCredentialPersona(credential, first.ID)
+	first.Metadata["persona"] = persona
+	second.Metadata["persona"] = persona
+	first.Metadata["browser_environment"] = chatgptwebauth.BrowserEnvironmentIdentity{
+		CatalogVersion: "v3",
+		CatalogID:      persona.CatalogID + "-e00",
+	}
+	second.Metadata["browser_environment"] = chatgptwebauth.BrowserEnvironmentIdentity{
+		CatalogVersion: "v3",
+		CatalogID:      persona.CatalogID + "-e01",
+	}
+
+	executor.recordPersonaOutcome(first, chatgptwebauth.Persona{}, nil)
+	executor.recordPersonaOutcome(second, chatgptwebauth.Persona{}, nil)
+
+	snapshot := executor.SentinelSnapshot()
+	if len(snapshot.PersonaOutcomes) != 2 {
+		t.Fatalf("persona outcomes = %#v", snapshot.PersonaOutcomes)
+	}
+	if snapshot.PersonaOutcomes[0].TransportPersonaID != snapshot.PersonaOutcomes[1].TransportPersonaID {
+		t.Fatalf("transport personas differ: %#v", snapshot.PersonaOutcomes)
+	}
+	if snapshot.PersonaOutcomes[0].BrowserEnvironmentID == snapshot.PersonaOutcomes[1].BrowserEnvironmentID {
+		t.Fatalf("browser environments were merged: %#v", snapshot.PersonaOutcomes)
 	}
 }
 

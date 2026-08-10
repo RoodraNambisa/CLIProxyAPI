@@ -107,10 +107,14 @@ func TestChatGPTWebDiagnosticLogFieldsIncludeCatalogIdentity(t *testing.T) {
 	)
 	diagnostic.CatalogVersion = "v2"
 	diagnostic.CatalogID = "c146-win-iris-1536"
+	diagnostic.TransportPersonaID = "c146-win-iris-1536"
+	diagnostic.BrowserEnvironmentID = "c146-win-iris-1536-e12"
 	diagnostic.TLSProfile = "chrome_146"
 
 	fields := ChatGPTWebDiagnosticLogFields(diagnostic)
-	if fields["catalog_version"] != "v2" || fields["catalog_id"] != "c146-win-iris-1536" || fields["tls_profile"] != "chrome_146" {
+	if fields["catalog_version"] != "v2" || fields["catalog_id"] != "c146-win-iris-1536" ||
+		fields["transport_persona_id"] != "c146-win-iris-1536" || fields["browser_environment_id"] != "c146-win-iris-1536-e12" ||
+		fields["tls_profile"] != "chrome_146" {
 		t.Fatalf("diagnostic fields = %#v", fields)
 	}
 }

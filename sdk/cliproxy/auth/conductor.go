@@ -7832,6 +7832,7 @@ func enrichExecutionErrorDiagnostic(diagnostic *ErrorDiagnostic, auth *Auth) {
 		return
 	}
 	chatgptwebauth.ResolveCredentialPersona(credential, auth.ID)
+	browserEnvironment := chatgptwebauth.ResolveCredentialBrowserEnvironment(credential, auth.ID)
 	if diagnostic.Persona == "" {
 		diagnostic.Persona = strings.TrimSpace(credential.Persona.Profile)
 	}
@@ -7840,6 +7841,12 @@ func enrichExecutionErrorDiagnostic(diagnostic *ErrorDiagnostic, auth *Auth) {
 	}
 	if diagnostic.CatalogID == "" {
 		diagnostic.CatalogID = strings.TrimSpace(credential.Persona.CatalogID)
+	}
+	if diagnostic.TransportPersonaID == "" {
+		diagnostic.TransportPersonaID = strings.TrimSpace(credential.Persona.CatalogID)
+	}
+	if diagnostic.BrowserEnvironmentID == "" {
+		diagnostic.BrowserEnvironmentID = strings.TrimSpace(browserEnvironment.CatalogID)
 	}
 	if diagnostic.TLSProfile == "" {
 		diagnostic.TLSProfile = strings.TrimSpace(credential.Persona.Profile)

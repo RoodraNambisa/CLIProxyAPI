@@ -118,17 +118,22 @@ type SentinelRuntimeConfig struct {
 	CacheVersions int
 }
 
-// PersonaOutcomeSnapshot contains request outcomes for one immutable browser persona.
+// PersonaOutcomeSnapshot contains request outcomes for one immutable transport
+// Persona and Sentinel browser environment pair.
 type PersonaOutcomeSnapshot struct {
-	CatalogVersion string `json:"catalog_version"`
-	CatalogID      string `json:"catalog_id"`
-	TLSProfile     string `json:"tls_profile"`
-	UAMajor        string `json:"ua_major"`
-	Platform       string `json:"platform"`
-	Success200     uint64 `json:"success_200"`
-	Forbidden403   uint64 `json:"forbidden_403"`
-	Cloudflare403  uint64 `json:"cloudflare_403"`
-	Other          uint64 `json:"other"`
+	CatalogVersion       string `json:"catalog_version"`
+	CatalogID            string `json:"catalog_id"`
+	TransportPersonaID   string `json:"transport_persona_id"`
+	BrowserEnvironmentID string `json:"browser_environment_id"`
+	TLSProfile           string `json:"tls_profile"`
+	UAMajor              string `json:"ua_major"`
+	Platform             string `json:"platform"`
+	Success200           uint64 `json:"success_200"`
+	Forbidden403         uint64 `json:"forbidden_403"`
+	Cloudflare403        uint64 `json:"cloudflare_403"`
+	SentinelReject       uint64 `json:"sentinel_reject"`
+	HTTPError            uint64 `json:"http_error"`
+	Other                uint64 `json:"other"`
 }
 
 // SentinelRuntimeSnapshot is safe to expose through the management API.

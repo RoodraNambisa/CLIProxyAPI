@@ -2175,9 +2175,12 @@ func logChatGPTWebSafeDiagnostic(ctx context.Context, auth *cliproxyauth.Auth, e
 		diagnostic.AuthIndex = auth.EnsureIndex()
 		if credential, errCredential := chatgptwebauth.ParseCredential(auth.Metadata); errCredential == nil && credential != nil {
 			chatgptwebauth.ResolveCredentialPersona(credential, auth.ID)
+			browserEnvironment := chatgptwebauth.ResolveCredentialBrowserEnvironment(credential, auth.ID)
 			diagnostic.Persona = strings.TrimSpace(credential.Persona.Profile)
 			diagnostic.CatalogVersion = strings.TrimSpace(credential.Persona.CatalogVersion)
 			diagnostic.CatalogID = strings.TrimSpace(credential.Persona.CatalogID)
+			diagnostic.TransportPersonaID = strings.TrimSpace(credential.Persona.CatalogID)
+			diagnostic.BrowserEnvironmentID = strings.TrimSpace(browserEnvironment.CatalogID)
 			diagnostic.TLSProfile = strings.TrimSpace(credential.Persona.Profile)
 			diagnostic.Platform = strings.TrimSpace(credential.Persona.Platform)
 			diagnostic.UAMajor = chatGPTWebUserAgentMajor(credential.Persona.UserAgent)

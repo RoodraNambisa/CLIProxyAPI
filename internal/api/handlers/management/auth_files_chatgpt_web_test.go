@@ -179,6 +179,8 @@ func TestSafeChatGPTWebErrorDiagnosticKeepsOnlyAllowlistedStructure(t *testing.T
 		Persona:               "chrome_146",
 		CatalogVersion:        "v2",
 		CatalogID:             "c146-mac-m2-1470",
+		TransportPersonaID:    "c146-mac-m2-1470",
+		BrowserEnvironmentID:  "c146-mac-m2-1470-e17",
 		TLSProfile:            "chrome_146",
 		UAMajor:               "146",
 		Platform:              "MacIntel",
@@ -199,7 +201,9 @@ func TestSafeChatGPTWebErrorDiagnosticKeepsOnlyAllowlistedStructure(t *testing.T
 	if safe.TargetPath != "/backend-api/files" || safe.Stage != "file_sign" || safe.Code != "cloudflare_challenge" {
 		t.Fatalf("safe diagnostic structure = %#v", safe)
 	}
-	if safe.CatalogVersion != "v2" || safe.CatalogID != "c146-mac-m2-1470" || safe.TLSProfile != "chrome_146" {
+	if safe.CatalogVersion != "v2" || safe.CatalogID != "c146-mac-m2-1470" ||
+		safe.TransportPersonaID != "c146-mac-m2-1470" || safe.BrowserEnvironmentID != "c146-mac-m2-1470-e17" ||
+		safe.TLSProfile != "chrome_146" {
 		t.Fatalf("safe diagnostic persona = %#v", safe)
 	}
 	if safe.ResponseBody != source.ResponseBody || !safe.ResponseBodyTruncated {

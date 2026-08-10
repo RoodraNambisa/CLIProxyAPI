@@ -159,6 +159,8 @@ func safeChatGPTWebErrorDiagnostic(diagnostic *coreauth.ErrorDiagnostic, authInd
 		Persona:               safeChatGPTWebDiagnosticToken(diagnostic.Persona, 64),
 		CatalogVersion:        safeChatGPTWebDiagnosticToken(diagnostic.CatalogVersion, 16),
 		CatalogID:             safeChatGPTWebDiagnosticToken(diagnostic.CatalogID, 64),
+		TransportPersonaID:    safeChatGPTWebDiagnosticToken(diagnostic.TransportPersonaID, 64),
+		BrowserEnvironmentID:  safeChatGPTWebDiagnosticToken(diagnostic.BrowserEnvironmentID, 96),
 		TLSProfile:            safeChatGPTWebDiagnosticToken(diagnostic.TLSProfile, 64),
 		UAMajor:               safeChatGPTWebDiagnosticToken(diagnostic.UAMajor, 16),
 		Platform:              safeChatGPTWebDiagnosticToken(diagnostic.Platform, 64),
