@@ -66,6 +66,36 @@ func TestLoadConfigRejectsInvalidPasskeyResponseAsDeadNullOrWrongType(t *testing
 	}
 }
 
+func TestLoadConfigChatGPTWebAPI798AutoLogin(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte("chatgpt-web:\n  api798-auto-login-enabled: true\n"), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	cfg, err := LoadConfig(path)
+	if err != nil {
+		t.Fatalf("LoadConfig() error = %v", err)
+	}
+	if !cfg.ChatGPTWeb.API798AutoLoginEnabled {
+		t.Fatal("API798AutoLoginEnabled = false, want true")
+	}
+}
+
+func TestLoadConfigRejectsInvalidAPI798AutoLogin(t *testing.T) {
+	for _, value := range []string{"null", `"true"`, "1"} {
+		t.Run(value, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.yaml")
+			raw := []byte("chatgpt-web:\n  api798-auto-login-enabled: " + value + "\n")
+			if err := os.WriteFile(path, raw, 0o600); err != nil {
+				t.Fatalf("write config: %v", err)
+			}
+			_, err := LoadConfig(path)
+			if err == nil || !strings.Contains(err.Error(), "api798-auto-login-enabled") {
+				t.Fatalf("LoadConfig() error = %v", err)
+			}
+		})
+	}
+}
+
 func TestSaveConfigPreservesChatGPTWebAutoDeleteDeadAuths(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.yaml")
 	if err := os.WriteFile(path, []byte("chatgpt-web:\n  auto-relogin: false\n"), 0o600); err != nil {

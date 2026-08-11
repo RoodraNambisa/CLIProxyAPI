@@ -72,6 +72,14 @@ func DecodeImportCredential(data []byte) (*Credential, error) {
 		return nil, fmt.Errorf("chatgpt web import contains conflicting account identity")
 	}
 	PopulateCredentialIdentity(credential)
+	if credential.LoginMethod == LoginMethodAPI798 && credential.API798URL == "" {
+		return nil, fmt.Errorf("login_method api798 requires api798_url")
+	}
+	if credential.API798URL != "" {
+		if errAPI798 := ValidateAPI798URL(credential.API798URL, credential.Email); errAPI798 != nil {
+			return nil, errAPI798
+		}
+	}
 	if credential.CredentialSchemaVersion == CredentialSchemaVersionWebAuthn &&
 		strings.TrimSpace(credential.AccessToken) == "" && !HasSessionCookieForURL(credential.Cookies, SessionBaseURL) {
 		return nil, fmt.Errorf("chatgpt web WebAuthn import requires a current access token or session cookie")

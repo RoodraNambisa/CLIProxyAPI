@@ -554,15 +554,20 @@ func confirmChatGPTWebImportPersistence(result *chatGPTWebMutationTaskResult, in
 		return errors.New("persisted credential is invalid")
 	}
 	result.CredentialSchemaVersion = persisted.CredentialSchemaVersion
-	if imported.CredentialSchemaVersion != chatgptwebauth.CredentialSchemaVersionWebAuthn {
-		return nil
+	if imported.API798URL != "" {
+		if persisted.API798URL != imported.API798URL || persisted.LoginMethod != imported.LoginMethod {
+			return errors.New("persisted API798 login settings do not match the imported credential")
+		}
+		result.PersistedFeatures = append(result.PersistedFeatures, chatgptwebauth.API798LoginFeature)
 	}
-	if persisted.CredentialSchemaVersion != chatgptwebauth.CredentialSchemaVersionWebAuthn ||
-		persisted.WebAuthn == nil || !reflect.DeepEqual(imported.WebAuthn, persisted.WebAuthn) {
-		return errors.New("persisted WebAuthn credential does not match the imported credential")
+	if imported.CredentialSchemaVersion == chatgptwebauth.CredentialSchemaVersionWebAuthn {
+		if persisted.CredentialSchemaVersion != chatgptwebauth.CredentialSchemaVersionWebAuthn ||
+			persisted.WebAuthn == nil || !reflect.DeepEqual(imported.WebAuthn, persisted.WebAuthn) {
+			return errors.New("persisted WebAuthn credential does not match the imported credential")
+		}
+		result.PersistedFeatures = append(result.PersistedFeatures, "webauthn_v1")
+		result.WebAuthnV1Persisted = true
 	}
-	result.PersistedFeatures = []string{"webauthn_v1"}
-	result.WebAuthnV1Persisted = true
 	return nil
 }
 
@@ -630,6 +635,7 @@ func (h *Handler) persistImportedChatGPTWebCredential(ctx context.Context, manag
 	if strings.TrimSpace(credential.CredentialUID) == "" {
 		credential.CredentialUID = uuid.NewString()
 	}
+	preserveImportedChatGPTWebLoginSettings(credential, persistExpected)
 	preserveImportedChatGPTWebAuthnRuntimeState(credential, persistExpected)
 	unchanged = existing != nil && importedChatGPTWebCredentialUnchanged(existing, credential)
 	status = "created"
@@ -649,6 +655,22 @@ func (h *Handler) persistImportedChatGPTWebCredential(ctx context.Context, manag
 		h.cleanupRetainedCodexSource(ctx, oldSourceUID)
 	}
 	return installed, status, false, err
+}
+
+func preserveImportedChatGPTWebLoginSettings(imported *chatgptwebauth.Credential, current *coreauth.Auth) {
+	if imported == nil || current == nil {
+		return
+	}
+	currentCredential, errParse := chatgptwebauth.ParseCredential(current.Metadata)
+	if errParse != nil {
+		return
+	}
+	if imported.API798URL == "" {
+		imported.API798URL = currentCredential.API798URL
+	}
+	if imported.LoginMethod == chatgptwebauth.LoginMethodAuto && currentCredential.LoginMethod != chatgptwebauth.LoginMethodAuto {
+		imported.LoginMethod = currentCredential.LoginMethod
+	}
 }
 
 func preserveImportedChatGPTWebAuthnRuntimeState(imported *chatgptwebauth.Credential, current *coreauth.Auth) {

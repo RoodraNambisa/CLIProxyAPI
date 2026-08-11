@@ -12,6 +12,6 @@ func (h *Handler) GetChatGPTWebCapabilities(c *gin.Context) {
 	c.Header("Cache-Control", "no-store")
 	c.JSON(http.StatusOK, gin.H{
 		"credential_schema_versions": []int{1, 2},
-		"features":                   []string{"webauthn_v1"},
+		"features":                   []string{"webauthn_v1", "api798_login_v1"},
 	})
 }

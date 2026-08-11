@@ -106,6 +106,8 @@ type Cookie struct {
 type Credential struct {
 	CredentialSchemaVersion  int                         `json:"credential_schema_version,omitempty"`
 	WebAuthn                 *WebAuthnCredential         `json:"webauthn,omitempty"`
+	LoginMethod              LoginMethod                 `json:"login_method,omitempty"`
+	API798URL                string                      `json:"api798_url,omitempty"`
 	Type                     string                      `json:"type"`
 	CredentialUID            string                      `json:"credential_uid,omitempty"`
 	CredentialMode           string                      `json:"credential_mode,omitempty"`
@@ -181,6 +183,16 @@ func DecodeCredential(data []byte) (*Credential, error) {
 	if err := ValidateCredentialWebAuthn(&credential); err != nil {
 		return nil, err
 	}
+	loginMethod, errLoginMethod := NormalizeLoginMethod(credential.LoginMethod)
+	if errLoginMethod != nil {
+		return nil, errLoginMethod
+	}
+	credential.LoginMethod = loginMethod
+	if credential.API798URL != "" {
+		if errAPI798 := ValidateAPI798URL(credential.API798URL, credential.Email); errAPI798 != nil {
+			return nil, errAPI798
+		}
+	}
 	credential.Cookies = scopeUnscopedCookiesForURL(credential.Cookies, SessionBaseURL)
 	credential.Cookies, credential.SessionToken = normalizeSessionCookies(credential.Cookies)
 	strategy, errStrategy := NormalizeRefreshStrategy(credential.RefreshStrategy, &credential)
@@ -223,6 +235,16 @@ func (credential *Credential) ApplyToMetadata(metadata map[string]any) {
 		delete(metadata, "webauthn")
 	} else {
 		metadata["webauthn"] = cloneWebAuthnCredential(credential.WebAuthn)
+	}
+	loginMethod, errLoginMethod := NormalizeLoginMethod(credential.LoginMethod)
+	if errLoginMethod != nil {
+		loginMethod = LoginMethodAuto
+	}
+	metadata["login_method"] = string(loginMethod)
+	if credential.API798URL == "" {
+		delete(metadata, "api798_url")
+	} else {
+		metadata["api798_url"] = credential.API798URL
 	}
 	metadata["credential_uid"] = strings.TrimSpace(credential.CredentialUID)
 	metadata["credential_mode"] = credentialModeForStrategy(credential.RefreshStrategy)

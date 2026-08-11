@@ -211,6 +211,28 @@ func TestDecodeImportCredentialRejectsLoginOnlyInput(t *testing.T) {
 	}
 }
 
+func TestDecodeImportCredentialValidatesAPI798Settings(t *testing.T) {
+	validURL := "https://api798.com/get_code?email=person%40example.com&auth_code=opaque%2520value"
+	credential, errDecode := DecodeImportCredential([]byte(`{"email":"person@example.com","access_token":"access","login_method":"api798","api798_url":"` + validURL + `"}`))
+	if errDecode != nil {
+		t.Fatalf("DecodeImportCredential() error = %v", errDecode)
+	}
+	if credential.LoginMethod != LoginMethodAPI798 || credential.API798URL != validURL {
+		t.Fatalf("API798 settings = method %q URL %q", credential.LoginMethod, credential.API798URL)
+	}
+
+	for name, payload := range map[string]string{
+		"missing URL":     `{"email":"person@example.com","access_token":"access","login_method":"api798"}`,
+		"mismatched mail": `{"email":"person@example.com","access_token":"access","login_method":"api798","api798_url":"https://api798.com/get_code?email=other%40example.com&auth_code=secret"}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, errInvalid := DecodeImportCredential([]byte(payload)); errInvalid == nil {
+				t.Fatal("DecodeImportCredential() accepted invalid API798 settings")
+			}
+		})
+	}
+}
+
 func TestDecodeImportCredentialRejectsForeignProvider(t *testing.T) {
 	_, err := DecodeImportCredential([]byte(`{"type":"codex","access_token":"access"}`))
 	if err == nil {

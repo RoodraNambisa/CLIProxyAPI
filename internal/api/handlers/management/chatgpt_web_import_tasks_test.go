@@ -66,7 +66,7 @@ func TestChatGPTWebImportTaskPersistsWebAuthnV1AndConfirmsCapability(t *testing.
 	if capabilities.Code != http.StatusOK || capabilities.Header().Get("Cache-Control") != "no-store" {
 		t.Fatalf("capabilities status = %d headers=%v body=%s", capabilities.Code, capabilities.Header(), capabilities.Body.String())
 	}
-	if got := capabilities.Body.String(); !strings.Contains(got, `"credential_schema_versions":[1,2]`) || !strings.Contains(got, `"webauthn_v1"`) {
+	if got := capabilities.Body.String(); !strings.Contains(got, `"credential_schema_versions":[1,2]`) || !strings.Contains(got, `"webauthn_v1"`) || !strings.Contains(got, `"api798_login_v1"`) {
 		t.Fatalf("capabilities body = %s", got)
 	}
 
@@ -103,6 +103,91 @@ func TestChatGPTWebImportTaskPersistsWebAuthnV1AndConfirmsCapability(t *testing.
 	}
 	if !bytes.Contains(raw, []byte(privateKey)) {
 		t.Fatal("persisted auth file omitted WebAuthn private key")
+	}
+}
+
+func TestChatGPTWebImportTaskPersistsAPI798LoginAndConfirmsCapability(t *testing.T) {
+	executor := &chatGPTWebManagementTestExecutor{}
+	h, manager, authDir := newChatGPTWebManagementTestHandler(t, executor)
+	router := chatGPTWebManagementTestRouter(h)
+	rawURL := "https://api798.com/get_code?email=mailbox%40example.com&auth_code=opaque%252Bvalue"
+	payload := `{"email":"mailbox@example.com","access_token":"access-secret","login_method":"api798","api798_url":"` + rawURL + `"}`
+
+	task := startChatGPTWebImportTask(t, router, []chatGPTWebImportTestFile{{
+		field: "files",
+		name:  "api798.json",
+		data:  payload,
+	}})
+	completed := waitForChatGPTWebMutationTask(t, router, chatGPTWebMutationTaskImport, task.ID)
+	if completed.Succeeded != 1 || completed.Failed != 0 || len(completed.Results) != 1 {
+		t.Fatalf("task = %+v", completed)
+	}
+	result := completed.Results[0]
+	if len(result.PersistedFeatures) != 1 || result.PersistedFeatures[0] != chatgptwebauth.API798LoginFeature {
+		t.Fatalf("persisted features = %v", result.PersistedFeatures)
+	}
+	if strings.Contains(mustMarshalChatGPTWebMutationTask(t, completed), rawURL) {
+		t.Fatal("import task response leaked api798_url")
+	}
+	installed, ok := manager.GetByID(result.Name)
+	if !ok {
+		t.Fatal("persisted credential was not registered")
+	}
+	credential, errParse := chatgptwebauth.ParseCredential(installed.Metadata)
+	if errParse != nil || credential.LoginMethod != chatgptwebauth.LoginMethodAPI798 || credential.API798URL != rawURL {
+		t.Fatalf("persisted credential = %#v error=%v", credential, errParse)
+	}
+	listEntry, errMarshalEntry := json.Marshal(h.buildAuthFileEntry(installed))
+	if errMarshalEntry != nil {
+		t.Fatal(errMarshalEntry)
+	}
+	if bytes.Contains(listEntry, []byte(rawURL)) {
+		t.Fatal("normal auth list leaked api798_url")
+	}
+	raw, errRead := os.ReadFile(filepath.Join(authDir, result.Name))
+	if errRead != nil {
+		t.Fatal(errRead)
+	}
+	var persisted map[string]any
+	if errUnmarshal := json.Unmarshal(raw, &persisted); errUnmarshal != nil {
+		t.Fatal(errUnmarshal)
+	}
+	if persisted["api798_url"] != rawURL || persisted["login_method"] != "api798" {
+		t.Fatalf("persisted auth file omitted API798 settings: %#v", persisted)
+	}
+}
+
+func TestChatGPTWebReimportPreservesAPI798LoginSettings(t *testing.T) {
+	executor := &chatGPTWebManagementTestExecutor{}
+	h, manager, _ := newChatGPTWebManagementTestHandler(t, executor)
+	router := chatGPTWebManagementTestRouter(h)
+	rawURL := "https://api798.com/get_code?email=mailbox%40example.com&auth_code=opaque"
+	first := startChatGPTWebImportTask(t, router, []chatGPTWebImportTestFile{{
+		field: "files",
+		name:  "api798.json",
+		data:  `{"email":"mailbox@example.com","access_token":"first","login_method":"api798","api798_url":"` + rawURL + `"}`,
+	}})
+	firstResult := waitForChatGPTWebMutationTask(t, router, chatGPTWebMutationTaskImport, first.ID)
+	if firstResult.Succeeded != 1 {
+		t.Fatalf("first task = %+v", firstResult)
+	}
+
+	second := startChatGPTWebImportTask(t, router, []chatGPTWebImportTestFile{{
+		field: "files",
+		name:  "replacement.json",
+		data:  `{"email":"mailbox@example.com","access_token":"second"}`,
+	}})
+	secondResult := waitForChatGPTWebMutationTask(t, router, chatGPTWebMutationTaskImport, second.ID)
+	if secondResult.Succeeded != 1 || len(secondResult.Results) != 1 {
+		t.Fatalf("second task = %+v", secondResult)
+	}
+	installed, ok := manager.GetByID(secondResult.Results[0].Name)
+	if !ok {
+		t.Fatal("reimported credential was not registered")
+	}
+	credential, errParse := chatgptwebauth.ParseCredential(installed.Metadata)
+	if errParse != nil || credential.LoginMethod != chatgptwebauth.LoginMethodAPI798 || credential.API798URL != rawURL {
+		t.Fatalf("reimported credential = %#v error=%v", credential, errParse)
 	}
 }
 

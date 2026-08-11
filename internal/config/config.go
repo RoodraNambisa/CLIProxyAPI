@@ -528,6 +528,8 @@ type ChatGPTWebConfig struct {
 	AutoDeleteDeadAuths bool `yaml:"auto-delete-dead-auths" json:"auto-delete-dead-auths"`
 	// InvalidPasskeyResponseAsDead allows exhausted Passkey-only recovery to mark the credential dead.
 	InvalidPasskeyResponseAsDead bool `yaml:"invalid-passkey-response-as-dead" json:"invalid-passkey-response-as-dead"`
+	// API798AutoLoginEnabled allows legacy auto credentials with no Passkey or password to use an API798 mailbox URL.
+	API798AutoLoginEnabled bool `yaml:"api798-auto-login-enabled" json:"api798-auto-login-enabled"`
 	// AutoDeleteDeadPriorities limits dead credential deletion to these priorities.
 	// An empty list matches every priority.
 	AutoDeleteDeadPriorities []int `yaml:"auto-delete-dead-priorities,omitempty" json:"auto-delete-dead-priorities,omitempty"`
@@ -2181,16 +2183,28 @@ func validateChatGPTWebLifecycleOptionsYAML(data []byte) error {
 	}
 	var section struct {
 		InvalidPasskeyResponseAsDead yaml.Node `yaml:"invalid-passkey-response-as-dead"`
+		API798AutoLoginEnabled       yaml.Node `yaml:"api798-auto-login-enabled"`
 	}
-	if err := envelope.ChatGPTWeb.Decode(&section); err != nil || section.InvalidPasskeyResponseAsDead.Kind == 0 {
+	if err := envelope.ChatGPTWeb.Decode(&section); err != nil {
 		return nil
 	}
-	if section.InvalidPasskeyResponseAsDead.Tag == "!!null" {
-		return fmt.Errorf("chatgpt-web.invalid-passkey-response-as-dead must not be null")
-	}
-	var enabled bool
-	if err := section.InvalidPasskeyResponseAsDead.Decode(&enabled); err != nil {
-		return fmt.Errorf("chatgpt-web.invalid-passkey-response-as-dead must be a boolean: %w", err)
+	for _, field := range []struct {
+		name string
+		node yaml.Node
+	}{
+		{name: "invalid-passkey-response-as-dead", node: section.InvalidPasskeyResponseAsDead},
+		{name: "api798-auto-login-enabled", node: section.API798AutoLoginEnabled},
+	} {
+		if field.node.Kind == 0 {
+			continue
+		}
+		if field.node.Tag == "!!null" {
+			return fmt.Errorf("chatgpt-web.%s must not be null", field.name)
+		}
+		var enabled bool
+		if err := field.node.Decode(&enabled); err != nil {
+			return fmt.Errorf("chatgpt-web.%s must be a boolean: %w", field.name, err)
+		}
 	}
 	return nil
 }
@@ -3908,6 +3922,7 @@ func preservesExplicitChatGPTWebValue(fullPath string, node *yaml.Node) bool {
 	switch fullPath {
 	case "chatgpt-web":
 		for _, key := range []string{
+			"api798-auto-login-enabled",
 			"auto-relogin-max-retries",
 			"auto-relogin-jitter-percent",
 			"force-session-refresh-on-import",
@@ -3930,6 +3945,7 @@ func preservesExplicitChatGPTWebValue(fullPath string, node *yaml.Node) bool {
 	case "chatgpt-web.auto-relogin-max-retries",
 		"chatgpt-web.auto-relogin-jitter-percent",
 		"chatgpt-web.force-session-refresh-on-import",
+		"chatgpt-web.api798-auto-login-enabled",
 		"chatgpt-web.timezone",
 		"chatgpt-web.timezone-offset-minutes":
 		return true

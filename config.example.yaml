@@ -87,6 +87,10 @@ chatgpt-web:
   # Treat an exhausted Passkey-only recovery as permanently dead only when the
   # access token and every other refresh or login path are already unavailable.
   invalid-passkey-response-as-dead: false
+  # When login_method is auto and no Passkey or password is available, allow a
+  # persisted api798_url to supply an email OTP. Explicit login_method=api798
+  # is not controlled by this fallback switch.
+  api798-auto-login-enabled: false
   # Empty matches every priority; otherwise only exact integer priorities are removed.
   auto-delete-dead-priorities: []
   # The initial background login is followed by at most this many retries.
