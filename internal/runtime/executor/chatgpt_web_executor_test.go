@@ -622,15 +622,48 @@ func TestChatGPTWebExecutorImportSessionIntentDoesNotBlockUsableAccessToken(t *t
 
 func TestChatGPTWebExecutorTerminalRefreshLifecycle(t *testing.T) {
 	for _, test := range []struct {
-		name            string
-		autoRelogin     bool
-		withoutPassword bool
-		failure         chatgptwebauth.LifecycleState
-		want            string
+		name              string
+		autoRelogin       bool
+		withoutPassword   bool
+		email             string
+		api798URL         string
+		loginMethod       chatgptwebauth.LoginMethod
+		autoAPI798Enabled bool
+		failure           chatgptwebauth.LifecycleState
+		want              string
 	}{
 		{name: "reauth", failure: chatgptwebauth.LifecycleReauthRequired, want: cliproxyauth.LifecycleStateReauthRequired},
 		{name: "auto relogin", autoRelogin: true, failure: chatgptwebauth.LifecycleReauthRequired, want: cliproxyauth.LifecycleStateReloginPending},
 		{name: "imported credential cannot auto relogin", autoRelogin: true, withoutPassword: true, failure: chatgptwebauth.LifecycleReauthRequired, want: cliproxyauth.LifecycleStateReauthRequired},
+		{
+			name:            "explicit API798 can auto relogin",
+			autoRelogin:     true,
+			withoutPassword: true,
+			email:           "explicit-api798@example.com",
+			api798URL:       "https://api798.com/get_code?email=explicit-api798%40example.com&auth_code=opaque",
+			loginMethod:     chatgptwebauth.LoginMethodAPI798,
+			failure:         chatgptwebauth.LifecycleReauthRequired,
+			want:            cliproxyauth.LifecycleStateReloginPending,
+		},
+		{
+			name:              "automatic API798 fallback can auto relogin when enabled",
+			autoRelogin:       true,
+			withoutPassword:   true,
+			email:             "auto-api798@example.com",
+			api798URL:         "https://api798.com/get_code?email=auto-api798%40example.com&auth_code=opaque",
+			autoAPI798Enabled: true,
+			failure:           chatgptwebauth.LifecycleReauthRequired,
+			want:              cliproxyauth.LifecycleStateReloginPending,
+		},
+		{
+			name:            "automatic API798 fallback stays disabled by default",
+			autoRelogin:     true,
+			withoutPassword: true,
+			email:           "disabled-api798@example.com",
+			api798URL:       "https://api798.com/get_code?email=disabled-api798%40example.com&auth_code=opaque",
+			failure:         chatgptwebauth.LifecycleReauthRequired,
+			want:            cliproxyauth.LifecycleStateReauthRequired,
+		},
 		{name: "dead never relogins", autoRelogin: true, failure: chatgptwebauth.LifecycleDead, want: cliproxyauth.LifecycleStateDead},
 		{name: "interaction never relogins", autoRelogin: true, failure: chatgptwebauth.LifecycleInteractionRequired, want: cliproxyauth.LifecycleStateInteractionRequired},
 	} {
@@ -640,12 +673,20 @@ func TestChatGPTWebExecutorTerminalRefreshLifecycle(t *testing.T) {
 				credential.LifecycleState = test.failure
 				return &credential, &chatgptwebauth.AuthError{Code: "terminal_failure", State: test.failure, LifecycleState: test.failure, Terminal: true}
 			}
-			executor := NewChatGPTWebExecutor(&config.Config{ChatGPTWeb: config.ChatGPTWebConfig{AutoRelogin: test.autoRelogin}}, nil)
+			executor := NewChatGPTWebExecutor(&config.Config{ChatGPTWeb: config.ChatGPTWebConfig{
+				AutoRelogin:            test.autoRelogin,
+				API798AutoLoginEnabled: test.autoAPI798Enabled,
+			}}, nil)
 			executor.authService = fake
 			auth := chatGPTWebTestAuth(test.name)
 			if test.withoutPassword {
 				auth.Metadata["password"] = ""
 				auth.Metadata["totp_secret"] = ""
+			}
+			if test.api798URL != "" {
+				auth.Metadata["email"] = test.email
+				auth.Metadata["api798_url"] = test.api798URL
+				auth.Metadata["login_method"] = string(test.loginMethod)
 			}
 			updated, errRefresh := executor.Refresh(t.Context(), auth)
 			if errRefresh == nil || updated == nil {
@@ -919,6 +960,53 @@ func TestChatGPTWebExecutorSessionCookieFallbackLifecycle(t *testing.T) {
 			persist, okPersist := errRefresh.(interface{ PersistAuthUpdateOnError() bool })
 			if got := okPersist && persist.PersistAuthUpdateOnError(); got != test.wantPersist {
 				t.Fatalf("PersistAuthUpdateOnError() = %t, want %t", got, test.wantPersist)
+			}
+		})
+	}
+}
+
+func TestClassifyChatGPTWebSessionCookieRefreshRecognizesAPI798Recovery(t *testing.T) {
+	const api798URL = "https://api798.com/get_code?email=api798-recovery%40example.com&auth_code=opaque"
+	for _, test := range []struct {
+		name            string
+		loginMethod     chatgptwebauth.LoginMethod
+		allowAutoAPI798 bool
+		wantState       chatgptwebauth.LifecycleState
+	}{
+		{
+			name:        "explicit API798",
+			loginMethod: chatgptwebauth.LoginMethodAPI798,
+			wantState:   chatgptwebauth.LifecycleReauthRequired,
+		},
+		{
+			name:            "automatic API798 enabled",
+			allowAutoAPI798: true,
+			wantState:       chatgptwebauth.LifecycleReauthRequired,
+		},
+		{
+			name:      "automatic API798 disabled",
+			wantState: chatgptwebauth.LifecycleDead,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			credential := &chatgptwebauth.Credential{
+				Email:           "api798-recovery@example.com",
+				LoginMethod:     test.loginMethod,
+				API798URL:       api798URL,
+				RefreshStrategy: chatgptwebauth.RefreshStrategyTokenOnly,
+			}
+			failure := &chatgptwebauth.AuthError{
+				Code:           "session_expired",
+				State:          chatgptwebauth.LifecycleReauthRequired,
+				LifecycleState: chatgptwebauth.LifecycleReauthRequired,
+				Terminal:       true,
+			}
+			updated, errRefresh, terminal := classifyChatGPTWebSessionCookieRefresh(credential, failure, test.allowAutoAPI798)
+			if !terminal || errRefresh == nil || updated == nil {
+				t.Fatalf("classifyChatGPTWebSessionCookieRefresh() = (%v, %v, %t)", updated, errRefresh, terminal)
+			}
+			if updated.LifecycleState != test.wantState {
+				t.Fatalf("lifecycle = %q, want %q", updated.LifecycleState, test.wantState)
 			}
 		})
 	}

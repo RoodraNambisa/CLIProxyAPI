@@ -751,6 +751,15 @@ func (e *ChatGPTWebExecutor) invalidPasskeyResponseAsDeadEnabled() bool {
 	return cfg != nil && cfg.ChatGPTWeb.InvalidPasskeyResponseAsDead
 }
 
+func (e *ChatGPTWebExecutor) api798AutoLoginEnabled() bool {
+	cfg := e.configSnapshot()
+	return cfg != nil && cfg.ChatGPTWeb.API798AutoLoginEnabled
+}
+
+func (e *ChatGPTWebExecutor) credentialCanRelogin(credential *chatgptwebauth.Credential) bool {
+	return chatGPTWebCredentialCanRelogin(credential, e.api798AutoLoginEnabled())
+}
+
 // TriggerBackgroundRelogin starts a bounded re-login task for the current auth
 // generation. Duplicate triggers share one background retry loop.
 func (e *ChatGPTWebExecutor) TriggerBackgroundRelogin(expected *cliproxyauth.Auth) {
@@ -758,7 +767,7 @@ func (e *ChatGPTWebExecutor) TriggerBackgroundRelogin(expected *cliproxyauth.Aut
 		return
 	}
 	credential, errCredential := chatgptwebauth.ParseCredential(expected.Metadata)
-	if errCredential != nil || !chatGPTWebCredentialCanRelogin(credential) {
+	if errCredential != nil || !e.credentialCanRelogin(credential) {
 		return
 	}
 	expected = cloneChatGPTWebAuth(expected)
@@ -1594,10 +1603,10 @@ func (e *ChatGPTWebExecutor) refreshCredential(ctx context.Context, auth *clipro
 	}
 	strategy := result.credential.RefreshStrategy
 	if strategy == chatgptwebauth.RefreshStrategyCodexSource ||
-		strategy == chatgptwebauth.RefreshStrategyTokenOnly && !chatGPTWebCredentialCanRelogin(result.credential) {
+		strategy == chatgptwebauth.RefreshStrategyTokenOnly && !e.credentialCanRelogin(result.credential) {
 		state = cliproxyauth.LifecycleStateReauthRequired
 	} else if state != cliproxyauth.LifecycleStateDead && state != cliproxyauth.LifecycleStateInteractionRequired {
-		if e.AutoReloginEnabled() && chatGPTWebCredentialCanRelogin(result.credential) {
+		if e.AutoReloginEnabled() && e.credentialCanRelogin(result.credential) {
 			state = cliproxyauth.LifecycleStateReloginPending
 		} else {
 			state = cliproxyauth.LifecycleStateReauthRequired
@@ -1636,7 +1645,7 @@ func (e *ChatGPTWebExecutor) refreshByStrategy(ctx context.Context, auth *clipro
 			*credential,
 			e.proxyURLForTarget(auth, chatgptwebauth.SessionBaseURL),
 		)
-		return classifyChatGPTWebSessionCookieRefresh(result, errRefresh)
+		return classifyChatGPTWebSessionCookieRefresh(result, errRefresh, e.api798AutoLoginEnabled())
 	}
 	switch credential.RefreshStrategy {
 	case chatgptwebauth.RefreshStrategyWebOAuthRT:
@@ -1645,7 +1654,7 @@ func (e *ChatGPTWebExecutor) refreshByStrategy(ctx context.Context, auth *clipro
 	case chatgptwebauth.RefreshStrategyChatGPTSession:
 		result, err := e.authService.RefreshSession(ctx, *credential, e.proxyURLForTarget(auth, chatgptwebauth.SessionBaseURL))
 		if e.sessionCookieRefreshOnTokenFailureEnabled() && !chatGPTWebCredentialHasCompletePasswordLogin(credential) {
-			return classifyChatGPTWebSessionCookieRefresh(result, err)
+			return classifyChatGPTWebSessionCookieRefresh(result, err, e.api798AutoLoginEnabled())
 		}
 		return result, err, false
 	case chatgptwebauth.RefreshStrategyCodexSource:
@@ -1676,6 +1685,7 @@ func chatGPTWebCredentialHasCompletePasswordLogin(credential *chatgptwebauth.Cre
 func classifyChatGPTWebSessionCookieRefresh(
 	credential *chatgptwebauth.Credential,
 	err error,
+	allowAutoAPI798 bool,
 ) (*chatgptwebauth.Credential, error, bool) {
 	if err == nil {
 		return credential, nil, false
@@ -1686,7 +1696,7 @@ func classifyChatGPTWebSessionCookieRefresh(
 	}
 	promoted := *authError
 	targetState := chatgptwebauth.LifecycleDead
-	if chatGPTWebCredentialCanRelogin(credential) {
+	if chatGPTWebCredentialCanRelogin(credential, allowAutoAPI798) {
 		targetState = chatgptwebauth.LifecycleReauthRequired
 	}
 	promoted.State = targetState
@@ -1735,14 +1745,9 @@ func (e *ChatGPTWebExecutor) refreshFromCodexSource(ctx context.Context, credent
 	return result, nil, false
 }
 
-func chatGPTWebCredentialCanRelogin(credential *chatgptwebauth.Credential) bool {
-	if credential == nil || strings.TrimSpace(credential.Email) == "" {
-		return false
-	}
-	if credential.WebAuthn != nil && chatgptwebauth.ValidateWebAuthnCredential(credential.WebAuthn) == nil {
-		return true
-	}
-	return strings.TrimSpace(credential.Password) != ""
+func chatGPTWebCredentialCanRelogin(credential *chatgptwebauth.Credential, allowAutoAPI798 bool) bool {
+	_, errResolve := chatgptwebauth.ResolveLoginMethod(credential, allowAutoAPI798)
+	return errResolve == nil
 }
 
 type chatGPTWebRefreshModeError struct {
