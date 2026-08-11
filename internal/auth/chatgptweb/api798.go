@@ -182,6 +182,13 @@ func decodeAPI798Message(payload []byte) (api798Message, error) {
 	if errDecode := decoder.Decode(&root); errDecode != nil {
 		return api798Message{}, fmt.Errorf("decode API798 JSON: %w", errDecode)
 	}
+	var trailing any
+	if errTrailing := decoder.Decode(&trailing); !errors.Is(errTrailing, io.EOF) {
+		if errTrailing == nil {
+			return api798Message{}, errors.New("API798 JSON must contain exactly one value")
+		}
+		return api798Message{}, fmt.Errorf("decode trailing API798 JSON: %w", errTrailing)
+	}
 	rootMap, ok := root.(map[string]any)
 	if !ok {
 		return api798Message{}, errors.New("API798 JSON root must be an object")

@@ -102,6 +102,8 @@ func TestAPI798MailboxResponseClassification(t *testing.T) {
 		{name: "unauthorized", status: http.StatusUnauthorized, body: `{}`, contentType: "application/json", wantCode: "api798_authorization_failed"},
 		{name: "forbidden html", status: http.StatusForbidden, body: `<html>forbidden</html>`, contentType: "text/html", wantCode: "api798_authorization_failed"},
 		{name: "malformed", status: http.StatusOK, body: `{`, contentType: "application/json", wantCode: "api798_response_invalid"},
+		{name: "trailing garbage", status: http.StatusOK, body: `{"success":false} trailing`, contentType: "application/json", wantCode: "api798_response_invalid"},
+		{name: "multiple values", status: http.StatusOK, body: `{"success":false}{"success":true}`, contentType: "application/json", wantCode: "api798_response_invalid"},
 		{name: "non json", status: http.StatusOK, body: `waiting`, contentType: "text/plain", wantCode: "api798_response_invalid"},
 		{name: "rate limited", status: http.StatusTooManyRequests, body: `{}`, contentType: "application/json", wantCode: "api798_unavailable"},
 	}
