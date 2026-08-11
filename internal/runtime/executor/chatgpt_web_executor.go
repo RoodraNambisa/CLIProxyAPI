@@ -562,6 +562,18 @@ func (e *ChatGPTWebExecutor) Login(ctx context.Context, input chatgptwebauth.Log
 	if e == nil || e.authService == nil {
 		return nil, errors.New("chatgpt web authentication service is unavailable")
 	}
+	if cfg := e.configSnapshot(); cfg != nil {
+		input.AllowAutoAPI798 = cfg.ChatGPTWeb.API798AutoLoginEnabled
+	}
+	if input.BeginSentinelObserver == nil && e.sentinelRuntime != nil {
+		input.BeginSentinelObserver = func(ctx context.Context, request chatgptwebauth.SentinelSDKRequest) (chatgptwebauth.SentinelObserverHandle, error) {
+			observer, errBegin := e.sentinelRuntime.BeginObserver(ctx, request)
+			if observer == nil {
+				return nil, errBegin
+			}
+			return observer, errBegin
+		}
+	}
 	if !input.LoginProxyResolved {
 		input.LoginProxy = e.LoginProxySnapshot()
 		input.LoginProxyResolved = true

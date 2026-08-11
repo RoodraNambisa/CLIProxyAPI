@@ -566,6 +566,8 @@ type LoginInput struct {
 	Email                       string
 	Password                    string
 	TOTPSecret                  string
+	AllowAutoAPI798             bool
+	BeginSentinelObserver       SentinelObserverStarter
 	ProxyURL                    string
 	LoginProxy                  LoginProxyConfig
 	PersistWebAuthn             func(context.Context, WebAuthnCredential) (WebAuthnCredential, error)
@@ -575,6 +577,17 @@ type LoginInput struct {
 	Credential         *Credential
 	Relogin            bool
 }
+
+// SentinelObserverHandle is the request-scoped Session Observer used by
+// authentication flows that require both Sentinel headers.
+type SentinelObserverHandle interface {
+	Snapshot(context.Context) (string, error)
+	Close()
+}
+
+// SentinelObserverStarter binds authentication to the executor-owned Sentinel
+// runtime without coupling the authentication package to executor helpers.
+type SentinelObserverStarter func(context.Context, SentinelSDKRequest) (SentinelObserverHandle, error)
 
 // LoginProxyConfig configures the dynamic proxy used only during interactive login.
 type LoginProxyConfig struct {
@@ -589,14 +602,18 @@ type LoginProxyConfig struct {
 }
 
 type Options struct {
-	AuthBaseURL        string
-	SessionBaseURL     string
-	SentinelBaseURL    string
-	RedirectURL        string
-	ClientID           string
-	Audience           string
-	AcquisitionTimeout time.Duration
-	Rand               io.Reader
-	Now                func() time.Time
-	Persona            Persona
+	AuthBaseURL          string
+	SessionBaseURL       string
+	SentinelBaseURL      string
+	RedirectURL          string
+	ClientID             string
+	Audience             string
+	AcquisitionTimeout   time.Duration
+	Rand                 io.Reader
+	Now                  func() time.Time
+	Persona              Persona
+	API798HTTPClient     *http.Client
+	API798RequestTimeout time.Duration
+	API798PollInterval   time.Duration
+	API798UndatedDelay   time.Duration
 }

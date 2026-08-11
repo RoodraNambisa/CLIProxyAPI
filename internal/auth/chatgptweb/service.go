@@ -47,6 +47,18 @@ func NewService(options Options) *Service {
 	if options.Now == nil {
 		options.Now = time.Now
 	}
+	if options.API798HTTPClient == nil {
+		options.API798HTTPClient = newAPI798HTTPClient()
+	}
+	if options.API798RequestTimeout <= 0 {
+		options.API798RequestTimeout = 15 * time.Second
+	}
+	if options.API798PollInterval <= 0 {
+		options.API798PollInterval = 2 * time.Second
+	}
+	if options.API798UndatedDelay <= 0 {
+		options.API798UndatedDelay = 30 * time.Second
+	}
 	options.Rand = randomReader(options.Rand)
 	options.Persona = normalizePersona(options.Persona)
 	options.AuthBaseURL = strings.TrimRight(strings.TrimSpace(options.AuthBaseURL), "/")
@@ -143,8 +155,22 @@ func (service *Service) loginOnce(acquisitionContext context.Context, input Logi
 		pendingState = LifecycleReloginPending
 	}
 	service.updateLifecycle(credential, pendingState, "")
-	if credential.Email == "" || credential.WebAuthn == nil && credential.Password == "" {
-		authError := newAuthError("missing_credentials", LifecycleReauthRequired, 0, false, true, "email and a Passkey or password are required", nil)
+	if credential.Email == "" {
+		authError := newAuthError("missing_credentials", LifecycleReauthRequired, 0, false, true, "email is required", nil)
+		service.applyFailure(credential, authError, input.Relogin)
+		return credential, authError
+	}
+	loginMethod, errResolve := ResolveLoginMethod(credential, input.AllowAutoAPI798)
+	if errResolve != nil {
+		resolutionError, _ := errResolve.(*LoginMethodResolutionError)
+		code := "missing_credentials"
+		message := "chatgpt web login method is unavailable"
+		if resolutionError != nil {
+			code = resolutionError.Code
+			message = resolutionError.Message
+		}
+		authError := newAuthError(code, LifecycleReauthRequired, 0, false, true, message, errResolve)
+		authError.FailureStage = "login_method"
 		service.applyFailure(credential, authError, input.Relogin)
 		return credential, authError
 	}
@@ -180,13 +206,25 @@ func (service *Service) loginOnce(acquisitionContext context.Context, input Logi
 		service.applyFailure(credential, authError, input.Relogin)
 		return credential, authError
 	}
-	if credential.WebAuthn != nil {
+	if loginMethod == LoginMethodPasskey {
 		if err := client.SetCookie(service.options.SessionBaseURL, "oai-did", deviceID); err != nil {
 			authError := newAuthError("cookie_initialization_failed", pendingState, 0, false, true, "initialize Passkey device cookie", err)
 			service.applyFailure(credential, authError, input.Relogin)
 			return credential, authError
 		}
 		return service.loginWithPasskey(acquisitionContext, client, credential, input, pendingState)
+	}
+
+	var api798Session *api798MailboxSession
+	if loginMethod == LoginMethodAPI798 {
+		var authError *AuthError
+		api798Session, authError = service.newAPI798MailboxSession(credential)
+		if authError != nil {
+			return service.loginFailure(credential, input.Relogin, authError)
+		}
+		if authError = api798Session.prepare(acquisitionContext); authError != nil {
+			return service.loginFailure(credential, input.Relogin, authError)
+		}
 	}
 
 	pkce, state, nonce, err := service.oauthValues()
@@ -211,6 +249,7 @@ func (service *Service) loginOnce(acquisitionContext context.Context, input Logi
 	}
 
 	authorizeURL := service.authorizeURL(credential.Email, deviceID, state, nonce, pkce.CodeChallenge)
+	api798IssuedAt := service.options.Now()
 	response, payload, err := client.DoFollowOnce(acquisitionContext, http.MethodGet, authorizeURL, map[string]string{
 		"accept":                    "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
 		"referer":                   redirectOrigin(service.options.RedirectURL) + "/",
@@ -231,6 +270,12 @@ func (service *Service) loginOnce(acquisitionContext context.Context, input Logi
 	if authError := classifyPermanentAccountPayload(payload); authError != nil {
 		return service.loginFailure(credential, input.Relogin, authError)
 	}
+	if loginMethod == LoginMethodAPI798 && isEmailOTPChallenge(authorizeEnvelope.PageType, authorizeEnvelope.ContinueURL) {
+		return service.completeAPI798EmailOTP(
+			acquisitionContext, client, sentinel, input.BeginSentinelObserver, credential, input.Relogin, pendingState,
+			api798Session, api798IssuedAt, deviceID, state, pkce.CodeVerifier,
+		)
+	}
 	if authError := classifyPageType(authorizeEnvelope.PageType); authError != nil && !isMFAChallenge(authorizeEnvelope.PageType, authorizeEnvelope.ContinueURL) {
 		return service.loginFailure(credential, input.Relogin, authError)
 	}
@@ -250,7 +295,8 @@ func (service *Service) loginOnce(acquisitionContext context.Context, input Logi
 			}
 			return service.finishLogin(acquisitionContext, client, credential, input.Relogin, code, pkce.CodeVerifier)
 		}
-		if !isMFAChallenge(authorizeEnvelope.PageType, authorizeEnvelope.ContinueURL) {
+		if !isMFAChallenge(authorizeEnvelope.PageType, authorizeEnvelope.ContinueURL) &&
+			!(loginMethod == LoginMethodAPI798 && isEmailOTPChallenge(authorizeEnvelope.PageType, authorizeEnvelope.ContinueURL)) {
 			if authError := classifyOAuthContinuationURL(continueURL, service.options.AuthBaseURL); authError != nil {
 				authError.FailureStage = "authorize"
 				return service.loginFailure(credential, input.Relogin, authError)
@@ -258,7 +304,9 @@ func (service *Service) loginOnce(acquisitionContext context.Context, input Logi
 		}
 	}
 	continueAuthorization, navigationError := classifyAuthorizeNavigation(authorizeRequestURL)
-	if navigationError != nil && (isPasswordChallenge(authorizeEnvelope.PageType, authorizeEnvelope.ContinueURL) || isMFAChallenge(authorizeEnvelope.PageType, authorizeEnvelope.ContinueURL)) {
+	if navigationError != nil && (isPasswordChallenge(authorizeEnvelope.PageType, authorizeEnvelope.ContinueURL) ||
+		isMFAChallenge(authorizeEnvelope.PageType, authorizeEnvelope.ContinueURL) ||
+		loginMethod == LoginMethodAPI798 && isEmailOTPChallenge(authorizeEnvelope.PageType, authorizeEnvelope.ContinueURL)) {
 		navigationError = nil
 	}
 	if navigationError != nil {
@@ -301,6 +349,12 @@ func (service *Service) loginOnce(acquisitionContext context.Context, input Logi
 			return service.finishLogin(acquisitionContext, client, credential, input.Relogin, code, pkce.CodeVerifier)
 		}
 		authorizeEnvelope = parseAuthorizationEnvelope(response, payload)
+		if loginMethod == LoginMethodAPI798 && isEmailOTPChallenge(authorizeEnvelope.PageType, authorizeEnvelope.ContinueURL) {
+			return service.completeAPI798EmailOTP(
+				acquisitionContext, client, sentinel, input.BeginSentinelObserver, credential, input.Relogin, pendingState,
+				api798Session, api798IssuedAt, deviceID, state, pkce.CodeVerifier,
+			)
+		}
 		if !isMFAChallenge(authorizeEnvelope.PageType, authorizeEnvelope.ContinueURL) {
 			if authError := classifyPageType(authorizeEnvelope.PageType); authError != nil {
 				return service.loginFailure(credential, input.Relogin, authError)
@@ -322,6 +376,12 @@ func (service *Service) loginOnce(acquisitionContext context.Context, input Logi
 					return service.loginFailure(credential, input.Relogin, authError)
 				}
 				authorizeEnvelope = parseAuthorizationEnvelope(response, followPayload)
+				if loginMethod == LoginMethodAPI798 && isEmailOTPChallenge(authorizeEnvelope.PageType, authorizeEnvelope.ContinueURL) {
+					return service.completeAPI798EmailOTP(
+						acquisitionContext, client, sentinel, input.BeginSentinelObserver, credential, input.Relogin, pendingState,
+						api798Session, api798IssuedAt, deviceID, state, pkce.CodeVerifier,
+					)
+				}
 				if authError := classifyPageType(authorizeEnvelope.PageType); authError != nil && !isMFAChallenge(authorizeEnvelope.PageType, authorizeEnvelope.ContinueURL) {
 					return service.loginFailure(credential, input.Relogin, authError)
 				}
@@ -348,6 +408,10 @@ func (service *Service) loginOnce(acquisitionContext context.Context, input Logi
 			return service.loginFailure(credential, input.Relogin, ensureAuthError(followError, pendingState))
 		}
 		return service.finishLogin(acquisitionContext, client, credential, input.Relogin, code, pkce.CodeVerifier)
+	}
+	if loginMethod == LoginMethodAPI798 {
+		authError := api798AuthError("api798_email_otp_unavailable", response.StatusCode, false, true, "authorize", nil)
+		return service.loginFailure(credential, input.Relogin, authError)
 	}
 
 	passwordSentinel, err := sentinel.Token(acquisitionContext, "password_verify")
@@ -1198,6 +1262,12 @@ func loginFailureStage(code string) string {
 		return "passkey_verify"
 	case strings.HasPrefix(code, "passkey_session"):
 		return "passkey_session"
+	case strings.HasPrefix(code, "api798_email_otp"):
+		return "email_otp_validate"
+	case strings.HasPrefix(code, "api798"):
+		return "api798_poll"
+	case strings.HasPrefix(code, "login_method"), strings.HasPrefix(code, "password_missing"):
+		return "login_method"
 	case strings.HasPrefix(code, "token_exchange"), strings.HasPrefix(code, "token_response"):
 		return "token_exchange"
 	case strings.HasPrefix(code, "oauth_redirect"), strings.HasPrefix(code, "invalid_state"):
@@ -1314,6 +1384,98 @@ func mergeMFAHints(target, source map[string]any) {
 
 func isMFAFactorType(value string) bool {
 	return normalizeMFAFactorType(value) != ""
+}
+
+func (service *Service) completeAPI798EmailOTP(
+	ctx context.Context,
+	client *Client,
+	sentinel *Sentinel,
+	beginObserver SentinelObserverStarter,
+	credential *Credential,
+	relogin bool,
+	pendingState LifecycleState,
+	mailbox *api798MailboxSession,
+	issuedAt time.Time,
+	deviceID string,
+	expectedState string,
+	codeVerifier string,
+) (*Credential, error) {
+	if mailbox == nil {
+		return service.loginFailure(credential, relogin, api798AuthError("api798_url_missing", http.StatusBadRequest, false, true, "api798_poll", nil))
+	}
+	verificationCode, authError := mailbox.waitForCode(ctx, issuedAt)
+	if authError != nil {
+		return service.loginFailure(credential, relogin, authError)
+	}
+	sentinelHeaders, errSentinel := sentinel.Headers(ctx, "email_otp_validate", beginObserver)
+	if errSentinel != nil {
+		return service.loginFailure(credential, relogin, ensureAuthError(errSentinel, pendingState))
+	}
+	headers := service.apiHeaders(deviceID, service.options.AuthBaseURL+"/email-verification", sentinelHeaders.Token)
+	if sentinelHeaders.SOToken != "" {
+		headers["openai-sentinel-so-token"] = sentinelHeaders.SOToken
+	}
+	response, payload, errRequest := client.DoJSONOnce(
+		ctx,
+		false,
+		http.MethodPost,
+		service.options.AuthBaseURL+"/api/accounts/email-otp/validate",
+		headers,
+		map[string]string{"code": verificationCode},
+	)
+	if errRequest != nil {
+		authError := networkAuthError("api798_email_otp_network_error", pendingState, errRequest)
+		authError.FailureStage = "email_otp_validate"
+		return service.loginFailure(credential, relogin, authError)
+	}
+	response, payload, authorizationCode, errRedirect := service.followAuthorizationRedirects(
+		ctx, client, response, payload, expectedState, pendingState,
+	)
+	if errRedirect != nil {
+		return service.loginFailure(credential, relogin, ensureAuthError(errRedirect, pendingState))
+	}
+	if authorizationCode != "" {
+		return service.finishLogin(ctx, client, credential, relogin, authorizationCode, codeVerifier)
+	}
+	if authError := classifyPermanentAccountPayload(payload); authError != nil {
+		return service.loginFailure(credential, relogin, authError)
+	}
+	if response != nil && response.StatusCode == http.StatusBadRequest {
+		authError := api798AuthError("api798_email_otp_rejected", response.StatusCode, false, true, "email_otp_validate", nil)
+		return service.loginFailure(credential, relogin, authError)
+	}
+	statusCode := 0
+	if response != nil {
+		statusCode = response.StatusCode
+	}
+	if authError := classifyHTTPResponse("email_otp_validate", statusCode, payload, pendingState); authError != nil {
+		authError.FailureStage = "email_otp_validate"
+		return service.loginFailure(credential, relogin, authError)
+	}
+	if code, matched, callbackError := parseOAuthCallback(responseRequestURL(response), service.options.RedirectURL, expectedState); matched {
+		if callbackError != nil {
+			return service.loginFailure(credential, relogin, callbackError)
+		}
+		return service.finishLogin(ctx, client, credential, relogin, code, codeVerifier)
+	}
+	envelope := parseAuthorizationEnvelope(response, payload)
+	if envelope.ContinueURL == "" || isEmailOTPChallenge(envelope.PageType, envelope.ContinueURL) {
+		authError := api798AuthError("api798_email_otp_rejected", statusCode, false, true, "email_otp_validate", nil)
+		return service.loginFailure(credential, relogin, authError)
+	}
+	code, errFollow := service.followOAuthCode(ctx, client, envelope.ContinueURL, expectedState, pendingState)
+	if errFollow != nil {
+		return service.loginFailure(credential, relogin, ensureAuthError(errFollow, pendingState))
+	}
+	return service.finishLogin(ctx, client, credential, relogin, code, codeVerifier)
+}
+
+func isEmailOTPChallenge(pageType, continueURL string) bool {
+	normalizedPage := normalizeCode(pageType)
+	normalizedURL := strings.ToLower(strings.TrimSpace(continueURL))
+	return (strings.Contains(normalizedPage, "email") &&
+		(strings.Contains(normalizedPage, "otp") || strings.Contains(normalizedPage, "verification") || strings.Contains(normalizedPage, "code"))) ||
+		strings.Contains(normalizedPage, "passwordless") || strings.Contains(normalizedURL, "/email-verification")
 }
 
 func (service *Service) verifyTOTPChallenge(ctx context.Context, client *Client, credential *Credential, deviceID string, challenge apiEnvelope) (apiEnvelope, error) {

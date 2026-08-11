@@ -34,6 +34,7 @@ type loginFixture struct {
 	authorizeContinueCloudflare bool
 	sentinelCalls               int
 	sentinelCloudflare          bool
+	sentinelObserver            bool
 	authorizeRedirect           bool
 	authorizeRedirectURL        string
 	authorizeRedirectStatus     int
@@ -54,6 +55,10 @@ type loginFixture struct {
 	mfaRedirectURL              string
 	mfaRedirectStatus           int
 	wantTOTP                    string
+	emailOTPCalls               int
+	emailOTPStatus              int
+	emailOTPBody                string
+	wantEmailOTP                string
 	state                       string
 	codeChallenge               string
 	server                      *httptest.Server
@@ -122,6 +127,8 @@ func (fixture *loginFixture) serveHTTP(response http.ResponseWriter, request *ht
 		_, _ = io.WriteString(response, "callback")
 	case "/api/accounts/password/verify":
 		fixture.handlePassword(response, request)
+	case "/api/accounts/email-otp/validate":
+		fixture.handleEmailOTP(response, request)
 	case "/api/accounts/mfa/verify", "/mfa-verify-follow":
 		fixture.handleMFAVerify(response, request)
 	case "/api/accounts/oauth/token":
@@ -225,11 +232,49 @@ func (fixture *loginFixture) handleSentinel(response http.ResponseWriter, reques
 	if err := json.NewDecoder(request.Body).Decode(&body); err != nil {
 		fixture.t.Errorf("decode sentinel request: %v", err)
 	}
-	if body["flow"] != "authorize_continue" && body["flow"] != "password_verify" {
+	if body["flow"] != "authorize_continue" && body["flow"] != "password_verify" && body["flow"] != "email_otp_validate" {
 		fixture.t.Errorf("sentinel flow = %#v", body["flow"])
 	}
 	response.Header().Set("Content-Type", "application/json")
+	if fixture.sentinelObserver && body["flow"] == "email_otp_validate" {
+		_, _ = io.WriteString(response, `{"token":"fixture-challenge","proofofwork":{"required":false},"so":{"required":true,"collector_dx":"collector","snapshot_dx":"snapshot"}}`)
+		return
+	}
 	_, _ = io.WriteString(response, `{"token":"fixture-challenge","proofofwork":{"required":false}}`)
+}
+
+func (fixture *loginFixture) handleEmailOTP(response http.ResponseWriter, request *http.Request) {
+	if request.Method != http.MethodPost {
+		fixture.t.Errorf("email OTP method = %s", request.Method)
+	}
+	if request.Header.Get("OpenAI-Sentinel-Token") == "" || request.Header.Get("Oai-Device-Id") == "" {
+		fixture.t.Errorf("email OTP headers missing: %#v", request.Header)
+	}
+	if fixture.sentinelObserver && request.Header.Get("OpenAI-Sentinel-So-Token") == "" {
+		fixture.t.Errorf("email OTP Session Observer header missing: %#v", request.Header)
+	}
+	var body map[string]string
+	if errDecode := json.NewDecoder(request.Body).Decode(&body); errDecode != nil {
+		fixture.t.Errorf("decode email OTP request: %v", errDecode)
+	}
+	fixture.mu.Lock()
+	fixture.emailOTPCalls++
+	wantCode := fixture.wantEmailOTP
+	status := fixture.emailOTPStatus
+	responseBody := fixture.emailOTPBody
+	fixture.mu.Unlock()
+	if body["code"] != wantCode {
+		fixture.t.Errorf("email OTP code = %q, want %q", body["code"], wantCode)
+	}
+	response.Header().Set("Content-Type", "application/json")
+	if status != 0 {
+		response.WriteHeader(status)
+	}
+	if responseBody != "" {
+		_, _ = io.WriteString(response, responseBody)
+		return
+	}
+	_, _ = fmt.Fprintf(response, `{"continue_url":%q,"page":{"type":"authorized"}}`, fixture.callbackURL())
 }
 
 func (fixture *loginFixture) handleAuthorizeContinue(response http.ResponseWriter, request *http.Request) {

@@ -21,6 +21,19 @@ func (zeroReader) Read(buffer []byte) (int, error) {
 	return len(buffer), nil
 }
 
+type sentinelTestObserver struct {
+	token  string
+	closed bool
+}
+
+func (observer *sentinelTestObserver) Snapshot(context.Context) (string, error) {
+	return observer.token, nil
+}
+
+func (observer *sentinelTestObserver) Close() {
+	observer.closed = true
+}
+
 func TestSentinelRequirementsAndPoW(t *testing.T) {
 	t.Parallel()
 	fixedNow := time.Date(2026, time.July, 16, 12, 30, 0, 0, time.UTC)
@@ -117,6 +130,93 @@ func TestSentinelTokenRequest(t *testing.T) {
 	}
 	if !foundCookie {
 		t.Fatal("oai-sc cookie was not persisted")
+	}
+}
+
+func TestSentinelHeadersIncludeRequiredSessionObserver(t *testing.T) {
+	t.Parallel()
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
+		response.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(response, `{
+			"token":"challenge-token",
+			"proofofwork":{"required":false},
+			"so":{"required":true,"collector_dx":"collector","snapshot_dx":"snapshot"}
+		}`)
+	}))
+	defer server.Close()
+
+	client, errClient := NewClient(DefaultPersona(), "", nil)
+	if errClient != nil {
+		t.Fatal(errClient)
+	}
+	defer client.CloseIdleConnections()
+	deviceID := "00000000-0000-4000-8000-000000000001"
+	sentinel, errSentinel := NewSentinel(client, server.URL, server.URL, deviceID, zeroReader{}, time.Now)
+	if errSentinel != nil {
+		t.Fatal(errSentinel)
+	}
+	observer := &sentinelTestObserver{token: `{"so":"snapshot"}`}
+	var received SentinelSDKRequest
+	headers, errHeaders := sentinel.Headers(t.Context(), "email_otp_validate", func(_ context.Context, request SentinelSDKRequest) (SentinelObserverHandle, error) {
+		received = request
+		return observer, nil
+	})
+	if errHeaders != nil {
+		t.Fatal(errHeaders)
+	}
+	if headers.Token == "" || headers.SOToken != observer.token {
+		t.Fatalf("headers = %#v", headers)
+	}
+	if !observer.closed {
+		t.Fatal("Session Observer was not closed")
+	}
+	if received.Flow != "email_otp_validate" || received.DeviceID != deviceID ||
+		received.SDKURL != sentinelSDKURL || received.ExpectedSHA256 != sentinelSDKSHA256 ||
+		!received.IntegrityRequired || received.Fetcher == nil ||
+		received.Environment.DeviceID != deviceID ||
+		received.Environment.PageStartedAt.IsZero() {
+		t.Fatalf("observer request = %#v", received)
+	}
+	if received.Environment.Persona.UserAgent != client.Persona().UserAgent {
+		t.Fatal("observer and transport personas differ")
+	}
+}
+
+func TestSentinelHeadersRejectMalformedRequiredSessionObserver(t *testing.T) {
+	t.Parallel()
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
+		response.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(response, `{
+			"token":"challenge-token",
+			"proofofwork":{"required":false},
+			"so":{"required":true,"collector_dx":"collector"}
+		}`)
+	}))
+	defer server.Close()
+
+	client, errClient := NewClient(DefaultPersona(), "", nil)
+	if errClient != nil {
+		t.Fatal(errClient)
+	}
+	defer client.CloseIdleConnections()
+	sentinel, errSentinel := NewSentinel(
+		client,
+		server.URL,
+		server.URL,
+		"00000000-0000-4000-8000-000000000001",
+		zeroReader{},
+		time.Now,
+	)
+	if errSentinel != nil {
+		t.Fatal(errSentinel)
+	}
+	_, errHeaders := sentinel.Headers(t.Context(), "email_otp_validate", func(_ context.Context, _ SentinelSDKRequest) (SentinelObserverHandle, error) {
+		t.Fatal("malformed Observer challenge must not start the runtime")
+		return nil, nil
+	})
+	var authError *AuthError
+	if !errors.As(errHeaders, &authError) || authError.Code != "sentinel_session_observer_unavailable" {
+		t.Fatalf("error = %#v", errHeaders)
 	}
 }
 

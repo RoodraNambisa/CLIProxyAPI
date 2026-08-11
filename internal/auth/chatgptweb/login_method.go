@@ -19,6 +19,20 @@ const (
 
 const API798LoginFeature = "api798_login_v1"
 
+// LoginMethodResolutionError reports why an explicitly selected or automatic
+// login method cannot be used. It contains no credential material.
+type LoginMethodResolutionError struct {
+	Code    string
+	Message string
+}
+
+func (resolutionError *LoginMethodResolutionError) Error() string {
+	if resolutionError == nil {
+		return "login method is unavailable"
+	}
+	return resolutionError.Message
+}
+
 // NormalizeLoginMethod validates a persisted login method. Credentials that
 // predate the field retain the existing automatic behavior.
 func NormalizeLoginMethod(method LoginMethod) (LoginMethod, error) {
@@ -31,6 +45,59 @@ func NormalizeLoginMethod(method LoginMethod) (LoginMethod, error) {
 		return method, nil
 	default:
 		return "", fmt.Errorf("unsupported chatgpt web login method %q", method)
+	}
+}
+
+// ResolveLoginMethod selects exactly one interactive login method. Once a
+// method is selected, authentication failures must not silently fall through
+// to another method.
+func ResolveLoginMethod(credential *Credential, allowAutoAPI798 bool) (LoginMethod, error) {
+	if credential == nil {
+		return "", &LoginMethodResolutionError{Code: "missing_credentials", Message: "chatgpt web credential is required"}
+	}
+	method, errNormalize := NormalizeLoginMethod(credential.LoginMethod)
+	if errNormalize != nil {
+		return "", &LoginMethodResolutionError{Code: "login_method_invalid", Message: "chatgpt web login_method is invalid"}
+	}
+	hasPasskey := credential.WebAuthn != nil
+	hasPassword := strings.TrimSpace(credential.Password) != ""
+	hasAPI798 := strings.TrimSpace(credential.API798URL) != ""
+
+	switch method {
+	case LoginMethodPasskey:
+		if !hasPasskey {
+			return "", &LoginMethodResolutionError{Code: "passkey_credential_missing", Message: "login_method passkey requires a WebAuthn credential"}
+		}
+		return method, nil
+	case LoginMethodPasswordTOTP:
+		if !hasPassword {
+			return "", &LoginMethodResolutionError{Code: "password_missing", Message: "login_method password_totp requires a password"}
+		}
+		return method, nil
+	case LoginMethodAPI798:
+		if !hasAPI798 {
+			return "", &LoginMethodResolutionError{Code: "api798_url_missing", Message: "login_method api798 requires api798_url"}
+		}
+		if errValidate := ValidateAPI798URL(credential.API798URL, credential.Email); errValidate != nil {
+			return "", &LoginMethodResolutionError{Code: "api798_url_invalid", Message: "login_method api798 has an invalid api798_url"}
+		}
+		return method, nil
+	case LoginMethodAuto:
+		switch {
+		case hasPasskey:
+			return LoginMethodPasskey, nil
+		case hasPassword:
+			return LoginMethodPasswordTOTP, nil
+		case allowAutoAPI798 && hasAPI798:
+			if errValidate := ValidateAPI798URL(credential.API798URL, credential.Email); errValidate != nil {
+				return "", &LoginMethodResolutionError{Code: "api798_url_invalid", Message: "automatic API798 login has an invalid api798_url"}
+			}
+			return LoginMethodAPI798, nil
+		default:
+			return "", &LoginMethodResolutionError{Code: "missing_credentials", Message: "email and a Passkey or password are required"}
+		}
+	default:
+		return "", &LoginMethodResolutionError{Code: "login_method_invalid", Message: "chatgpt web login_method is invalid"}
 	}
 }
 

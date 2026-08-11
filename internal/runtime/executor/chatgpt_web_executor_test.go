@@ -147,7 +147,7 @@ func TestChatGPTWebExecutorAppliesDedicatedProxyOnlyToLogin(t *testing.T) {
 	flowAttempts := 3
 	retryDelay := 250
 	timeout := 120
-	cfg := &config.Config{ChatGPTWeb: config.ChatGPTWebConfig{LoginProxy: config.ChatGPTWebLoginProxyConfig{
+	cfg := &config.Config{ChatGPTWeb: config.ChatGPTWebConfig{API798AutoLoginEnabled: true, LoginProxy: config.ChatGPTWebLoginProxyConfig{
 		Enabled:                   true,
 		URLTemplate:               "http://session-{8}:secret@proxy.example:8080",
 		PlaceholderCharset:        "abc123",
@@ -185,7 +185,8 @@ func TestChatGPTWebExecutorAppliesDedicatedProxyOnlyToLogin(t *testing.T) {
 	}); errLogin != nil {
 		t.Fatalf("Login() error = %v", errLogin)
 	}
-	if receivedLogin.ProxyURL != "" || !receivedLogin.LoginProxy.Enabled ||
+	if receivedLogin.ProxyURL != "" || !receivedLogin.LoginProxy.Enabled || !receivedLogin.AllowAutoAPI798 ||
+		receivedLogin.BeginSentinelObserver == nil ||
 		receivedLogin.LoginProxy.URLTemplate != cfg.ChatGPTWeb.LoginProxy.URLTemplate ||
 		receivedLogin.LoginProxy.RequestAttempts != requestAttempts ||
 		receivedLogin.LoginProxy.FlowAttempts != flowAttempts ||

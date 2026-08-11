@@ -3,9 +3,11 @@ package chatgptweb
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -246,6 +248,14 @@ type Sentinel struct {
 	turnstileSolver func(context.Context, string, string, ConversationTurnstileEnvironment, io.Reader, func() time.Time) (string, error)
 }
 
+// SentinelHeaders contains the authentication headers derived from one
+// Sentinel challenge. SOToken is present only when the challenge requires a
+// Session Observer.
+type SentinelHeaders struct {
+	Token   string
+	SOToken string
+}
+
 func NewSentinel(client *Client, baseURL, authURL, deviceID string, reader io.Reader, now func() time.Time) (*Sentinel, error) {
 	return NewSentinelWithEnvironment(client, baseURL, authURL, deviceID, BrowserEnvironmentIdentity{}, reader, now)
 }
@@ -274,9 +284,28 @@ func NewSentinelWithEnvironment(client *Client, baseURL, authURL, deviceID strin
 }
 
 func (sentinel *Sentinel) Token(ctx context.Context, flow string) (string, error) {
+	headers, err := sentinel.generateHeaders(ctx, flow, nil, false)
+	if err != nil {
+		return "", err
+	}
+	return headers.Token, nil
+}
+
+// Headers generates both Sentinel headers for authentication endpoints that
+// require a Session Observer. The observer runtime remains executor-owned.
+func (sentinel *Sentinel) Headers(ctx context.Context, flow string, beginObserver SentinelObserverStarter) (SentinelHeaders, error) {
+	return sentinel.generateHeaders(ctx, flow, beginObserver, true)
+}
+
+func (sentinel *Sentinel) generateHeaders(
+	ctx context.Context,
+	flow string,
+	beginObserver SentinelObserverStarter,
+	requireObserver bool,
+) (SentinelHeaders, error) {
 	requirementsToken, err := sentinel.generator.GenerateRequirementsToken()
 	if err != nil {
-		return "", newAuthError("sentinel_generation_failed", LifecycleLoginPending, 0, false, true, err.Error(), err)
+		return SentinelHeaders{}, newAuthError("sentinel_generation_failed", LifecycleLoginPending, 0, false, true, err.Error(), err)
 	}
 	requestBody := map[string]any{
 		"p":    requirementsToken,
@@ -295,37 +324,68 @@ func (sentinel *Sentinel) Token(ctx context.Context, flow string) (string, error
 			"sec-fetch-site": "same-origin",
 		}, requestBody)
 	if err != nil {
-		return "", networkAuthError("sentinel_network_error", LifecycleLoginPending, err)
+		return SentinelHeaders{}, networkAuthError("sentinel_network_error", LifecycleLoginPending, err)
 	}
 	if response.StatusCode != http.StatusOK {
 		if response.StatusCode == http.StatusTooManyRequests || response.StatusCode >= http.StatusInternalServerError {
-			return "", newAuthError("sentinel_transient_error", LifecycleLoginPending, response.StatusCode, true, false, "sentinel request was not accepted", nil)
+			return SentinelHeaders{}, newAuthError("sentinel_transient_error", LifecycleLoginPending, response.StatusCode, true, false, "sentinel request was not accepted", nil)
 		}
-		return "", newAuthError("sentinel_rejected", LifecycleInteractionRequired, response.StatusCode, false, true, "sentinel interaction is required", nil)
+		return SentinelHeaders{}, newAuthError("sentinel_rejected", LifecycleInteractionRequired, response.StatusCode, false, true, "sentinel interaction is required", nil)
 	}
 
 	var challenge map[string]any
 	decoder := json.NewDecoder(bytes.NewReader(payload))
 	decoder.UseNumber()
 	if err := decoder.Decode(&challenge); err != nil {
-		return "", newAuthError("sentinel_response_invalid", LifecycleLoginPending, response.StatusCode, true, false, "sentinel returned invalid JSON", err)
+		return SentinelHeaders{}, newAuthError("sentinel_response_invalid", LifecycleLoginPending, response.StatusCode, true, false, "sentinel returned invalid JSON", err)
 	}
 	if interaction := sentinelUnsupportedInteraction(challenge); interaction != "" {
-		return "", newAuthError(interaction, LifecycleInteractionRequired, response.StatusCode, false, true, "interactive challenge is required", nil)
+		return SentinelHeaders{}, newAuthError(interaction, LifecycleInteractionRequired, response.StatusCode, false, true, "interactive challenge is required", nil)
 	}
 	challengeToken := stringValue(challenge["token"])
 	if challengeToken == "" {
-		return "", newAuthError("sentinel_token_missing", LifecycleLoginPending, response.StatusCode, true, false, "sentinel response did not include a challenge token", nil)
+		return SentinelHeaders{}, newAuthError("sentinel_token_missing", LifecycleLoginPending, response.StatusCode, true, false, "sentinel response did not include a challenge token", nil)
 	}
 	proofOfWork, _ := challenge["proofofwork"].(map[string]any)
 	proofRequired := boolValue(proofOfWork["required"])
 	proofSeed := stringValue(proofOfWork["seed"])
 	if proofRequired && proofSeed == "" {
-		return "", newAuthError("sentinel_pow_invalid", LifecycleLoginPending, response.StatusCode, true, false, "sentinel proof-of-work seed is missing", nil)
+		return SentinelHeaders{}, newAuthError("sentinel_pow_invalid", LifecycleLoginPending, response.StatusCode, true, false, "sentinel proof-of-work seed is missing", nil)
 	}
-	turnstileToken, err := sentinel.solveTurnstile(ctx, challenge, requirementsToken, response.StatusCode)
+	environment := sentinel.environment()
+	var observer SentinelObserverHandle
+	if requireObserver && sentinelObserverChallengeRequired(challenge) {
+		if !sentinelObserverRequired(challenge) {
+			return SentinelHeaders{}, sentinelObserverAuthError(nil)
+		}
+		if beginObserver == nil {
+			return SentinelHeaders{}, sentinelObserverAuthError(nil)
+		}
+		observer, err = beginObserver(ctx, SentinelSDKRequest{
+			BaseURL:           sentinel.baseURL,
+			SDKURL:            sentinelSDKURL,
+			ScriptSources:     []string{sentinelSDKURL},
+			ExpectedSHA256:    sentinelSDKSHA256,
+			IntegrityRequired: true,
+			TransportKey:      sentinel.transportKey(),
+			Challenge:         challenge,
+			RequirementsToken: requirementsToken,
+			Environment:       environment,
+			DeviceID:          sentinel.deviceID,
+			Flow:              flow,
+			Fetcher:           sentinel.sdkFetcher(),
+		})
+		if err != nil {
+			return SentinelHeaders{}, sentinelObserverAuthError(err)
+		}
+		if observer == nil {
+			return SentinelHeaders{}, sentinelObserverAuthError(nil)
+		}
+		defer observer.Close()
+	}
+	turnstileToken, err := sentinel.solveTurnstile(ctx, challenge, requirementsToken, response.StatusCode, environment)
 	if err != nil {
-		return "", err
+		return SentinelHeaders{}, err
 	}
 
 	proof := ""
@@ -336,9 +396,9 @@ func (sentinel *Sentinel) Token(ctx context.Context, flow string) (string, error
 	}
 	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
-			return "", ctxErr
+			return SentinelHeaders{}, ctxErr
 		}
-		return "", newAuthError("sentinel_generation_failed", LifecycleLoginPending, response.StatusCode, false, true, err.Error(), err)
+		return SentinelHeaders{}, newAuthError("sentinel_generation_failed", LifecycleLoginPending, response.StatusCode, false, true, err.Error(), err)
 	}
 	headerValue, err := json.Marshal(map[string]any{
 		"p":    proof,
@@ -348,17 +408,109 @@ func (sentinel *Sentinel) Token(ctx context.Context, flow string) (string, error
 		"flow": flow,
 	})
 	if err != nil {
-		return "", newAuthError("sentinel_generation_failed", LifecycleLoginPending, response.StatusCode, false, true, "encode sentinel token", err)
+		return SentinelHeaders{}, newAuthError("sentinel_generation_failed", LifecycleLoginPending, response.StatusCode, false, true, "encode sentinel token", err)
 	}
 	if sentinel.authURL != "" {
 		if err := sentinel.client.SetCookie(sentinel.authURL, "oai-sc", "0"+challengeToken); err != nil {
-			return "", newAuthError("sentinel_cookie_failed", LifecycleLoginPending, 0, false, true, "persist sentinel cookie", err)
+			return SentinelHeaders{}, newAuthError("sentinel_cookie_failed", LifecycleLoginPending, 0, false, true, "persist sentinel cookie", err)
 		}
 	}
-	return string(headerValue), nil
+	result := SentinelHeaders{Token: string(headerValue)}
+	if observer != nil {
+		result.SOToken, err = observer.Snapshot(ctx)
+		if err != nil || strings.TrimSpace(result.SOToken) == "" {
+			return SentinelHeaders{}, sentinelObserverAuthError(err)
+		}
+	}
+	return result, nil
 }
 
-func (sentinel *Sentinel) solveTurnstile(ctx context.Context, challenge map[string]any, requirementsToken string, status int) (string, error) {
+func (sentinel *Sentinel) environment() ConversationTurnstileEnvironment {
+	return ConversationTurnstileEnvironment{
+		Persona:            sentinel.generator.persona,
+		BrowserEnvironment: sentinel.generator.browserEnvironment,
+		DeviceID:           sentinel.deviceID,
+		PageStartedAt:      sentinel.generator.now(),
+		ScriptSources:      []string{sentinelSDKURL},
+		Location:           sentinel.baseURL + "/backend-api/sentinel/frame.html?sv=" + sentinelSDKVersion,
+	}
+}
+
+func (sentinel *Sentinel) transportKey() string {
+	persona, _ := json.Marshal(sentinel.client.Persona())
+	digest := sha256.Sum256([]byte(sentinel.client.ProxyURL() + "\x00" + string(persona)))
+	return fmt.Sprintf("%x", digest[:])
+}
+
+func (sentinel *Sentinel) sdkFetcher() SentinelSDKFetcher {
+	return func(ctx context.Context, targetURL string, maxBytes int64) ([]byte, string, string, error) {
+		if maxBytes < 1 {
+			return nil, "", "", fmt.Errorf("Sentinel SDK response limit is invalid")
+		}
+		client, errClient := NewAcquisitionClient(
+			sentinel.client.Persona(), sentinel.client.ProxyURL(), nil, sentinel.client.acquisitionTimeout,
+		)
+		if errClient != nil {
+			return nil, "", "", fmt.Errorf("create cookie-free Sentinel SDK client: %w", errClient)
+		}
+		defer client.CloseIdleConnections()
+		defer client.CloseActiveAcquisitionConnections()
+		response, errRequest := client.DoSameOriginRedirectStream(ctx, http.MethodGet, targetURL, map[string]string{
+			"accept":         "text/javascript,application/javascript;q=0.9,*/*;q=0.1",
+			"referer":        sentinel.baseURL + "/",
+			"sec-fetch-dest": "script",
+			"sec-fetch-mode": "no-cors",
+			"sec-fetch-site": "same-origin",
+		}, 3)
+		if errRequest != nil {
+			return nil, "", "", errRequest
+		}
+		defer func() { _ = response.Body.Close() }()
+		if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
+			return nil, "", "", fmt.Errorf("Sentinel SDK request returned HTTP %d", response.StatusCode)
+		}
+		payload, errRead := io.ReadAll(io.LimitReader(response.Body, maxBytes+1))
+		if errRead != nil {
+			return nil, "", "", fmt.Errorf("read Sentinel SDK response: %w", errRead)
+		}
+		if int64(len(payload)) > maxBytes {
+			return nil, "", "", fmt.Errorf("Sentinel SDK response exceeds limit")
+		}
+		finalURL := targetURL
+		if response.Request != nil && response.Request.URL != nil {
+			finalURL = response.Request.URL.String()
+		}
+		return payload, response.Header.Get("Content-Type"), finalURL, nil
+	}
+}
+
+func sentinelObserverChallengeRequired(challenge map[string]any) bool {
+	observer, _ := challenge["so"].(map[string]any)
+	return boolValue(observer["required"])
+}
+
+func sentinelObserverAuthError(err error) error {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return err
+	}
+	return newAuthError(
+		"sentinel_session_observer_unavailable",
+		LifecycleLoginPending,
+		0,
+		true,
+		false,
+		"Sentinel Session Observer is unavailable",
+		err,
+	)
+}
+
+func (sentinel *Sentinel) solveTurnstile(
+	ctx context.Context,
+	challenge map[string]any,
+	requirementsToken string,
+	status int,
+	environment ConversationTurnstileEnvironment,
+) (string, error) {
 	required, dx := sentinelTurnstileChallenge(challenge["turnstile"])
 	if !required {
 		return "", nil
@@ -374,14 +526,7 @@ func (sentinel *Sentinel) solveTurnstile(ctx context.Context, challenge map[stri
 		ctx,
 		dx,
 		requirementsToken,
-		ConversationTurnstileEnvironment{
-			Persona:            sentinel.generator.persona,
-			BrowserEnvironment: sentinel.generator.browserEnvironment,
-			DeviceID:           sentinel.deviceID,
-			PageStartedAt:      sentinel.generator.now(),
-			ScriptSources:      []string{sentinelSDKURL},
-			Location:           sentinel.baseURL + "/backend-api/sentinel/frame.html?sv=" + sentinelSDKVersion,
-		},
+		environment,
 		sentinel.generator.random,
 		sentinel.generator.now,
 	)

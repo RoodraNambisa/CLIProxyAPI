@@ -26,6 +26,75 @@ func TestNormalizeLoginMethod(t *testing.T) {
 	}
 }
 
+func TestResolveLoginMethod(t *testing.T) {
+	validAPI798URL := "https://api798.com/get_code?email=user%40example.com&auth_code=opaque"
+	tests := []struct {
+		name     string
+		input    Credential
+		fallback bool
+		want     LoginMethod
+		wantCode string
+	}{
+		{
+			name:  "auto prefers passkey over password",
+			input: Credential{Email: "user@example.com", Password: "secret", WebAuthn: &WebAuthnCredential{}},
+			want:  LoginMethodPasskey,
+		},
+		{
+			name:  "auto uses password",
+			input: Credential{Email: "user@example.com", Password: "secret", TOTPSecret: "totp"},
+			want:  LoginMethodPasswordTOTP,
+		},
+		{
+			name:     "auto API798 fallback disabled",
+			input:    Credential{Email: "user@example.com", API798URL: validAPI798URL},
+			wantCode: "missing_credentials",
+		},
+		{
+			name:     "auto API798 fallback enabled",
+			input:    Credential{Email: "user@example.com", API798URL: validAPI798URL},
+			fallback: true,
+			want:     LoginMethodAPI798,
+		},
+		{
+			name:  "explicit API798 overrides password",
+			input: Credential{Email: "user@example.com", LoginMethod: LoginMethodAPI798, API798URL: validAPI798URL, Password: "secret"},
+			want:  LoginMethodAPI798,
+		},
+		{
+			name:     "explicit API798 needs URL",
+			input:    Credential{Email: "user@example.com", LoginMethod: LoginMethodAPI798, Password: "secret"},
+			wantCode: "api798_url_missing",
+		},
+		{
+			name:     "explicit passkey needs credential",
+			input:    Credential{Email: "user@example.com", LoginMethod: LoginMethodPasskey, Password: "secret"},
+			wantCode: "passkey_credential_missing",
+		},
+		{
+			name:     "explicit password needs password",
+			input:    Credential{Email: "user@example.com", LoginMethod: LoginMethodPasswordTOTP, API798URL: validAPI798URL},
+			fallback: true,
+			wantCode: "password_missing",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got, errResolve := ResolveLoginMethod(&test.input, test.fallback)
+			if test.wantCode == "" {
+				if errResolve != nil || got != test.want {
+					t.Fatalf("ResolveLoginMethod() = %q, %v; want %q", got, errResolve, test.want)
+				}
+				return
+			}
+			resolutionError, ok := errResolve.(*LoginMethodResolutionError)
+			if !ok || resolutionError.Code != test.wantCode {
+				t.Fatalf("ResolveLoginMethod() error = %#v; want code %q", errResolve, test.wantCode)
+			}
+		})
+	}
+}
+
 func TestNormalizeAPI798RequestURLPreservesOpaqueAuthCode(t *testing.T) {
 	rawURL := "http://api798.com/get_code?email=user%2Blabel%40example.com&auth_code=a%252Bb+c%2Fd"
 	got, errNormalize := normalizeAPI798RequestURL(rawURL, "user+label@example.com")
