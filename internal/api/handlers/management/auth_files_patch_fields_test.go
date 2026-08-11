@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	chatgptwebauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/chatgptweb"
 	xaiauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/xai"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v6/sdk/auth"
@@ -392,6 +393,111 @@ func TestPatchAuthFileFields_RejectsXAIFieldsForOtherProviders(t *testing.T) {
 	updated, _ := manager.GetByID("claude.json")
 	if updated.Prefix != "old" {
 		t.Fatalf("prefix changed on rejected request: %q", updated.Prefix)
+	}
+}
+
+func TestPatchAuthFileFields_ChatGPTWebAPI798Settings(t *testing.T) {
+	store := &memoryAuthStore{}
+	manager := coreauth.NewManager(store, nil, nil)
+	credential := &chatgptwebauth.Credential{
+		Type:        chatgptwebauth.Provider,
+		Email:       "person@example.com",
+		AccessToken: "access-token",
+		LoginMethod: chatgptwebauth.LoginMethodAuto,
+	}
+	metadata := make(map[string]any)
+	credential.ApplyToMetadata(metadata)
+	record := &coreauth.Auth{
+		ID:         "chatgpt-web-api798.json",
+		FileName:   "chatgpt-web-api798.json",
+		Provider:   chatgptwebauth.Provider,
+		Attributes: map[string]string{"path": "/tmp/chatgpt-web-api798.json"},
+		Metadata:   metadata,
+	}
+	if _, errRegister := manager.Register(context.Background(), record); errRegister != nil {
+		t.Fatalf("register chatgpt web auth: %v", errRegister)
+	}
+
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, manager)
+	rawURL := "http://api798.com/get_code?email=person%40example.com&auth_code=opaque%252Bvalue"
+	body, errMarshal := json.Marshal(map[string]any{
+		"names": []string{record.FileName},
+		"fields": map[string]any{
+			"login_method": string(chatgptwebauth.LoginMethodAPI798),
+			"api798_url":   rawURL,
+		},
+	})
+	if errMarshal != nil {
+		t.Fatal(errMarshal)
+	}
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	request := httptest.NewRequest(http.MethodPatch, "/v0/management/auth-files/fields", strings.NewReader(string(body)))
+	request.Header.Set("Content-Type", "application/json")
+	ctx.Request = request
+	h.PatchAuthFileFields(ctx)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	if strings.Contains(recorder.Body.String(), "auth_code") || strings.Contains(recorder.Body.String(), "api798.com") {
+		t.Fatalf("management response leaked API798 URL: %s", recorder.Body.String())
+	}
+	updated, ok := manager.GetByID(record.ID)
+	if !ok || updated == nil {
+		t.Fatal("updated chatgpt web auth not found")
+	}
+	if got := updated.Metadata["login_method"]; got != string(chatgptwebauth.LoginMethodAPI798) {
+		t.Fatalf("login_method = %#v, want api798", got)
+	}
+	if got := updated.Metadata["api798_url"]; got != rawURL {
+		t.Fatalf("api798_url = %#v, want exact original URL", got)
+	}
+	if _, exists := updated.Attributes["api798_url"]; exists {
+		t.Fatal("api798_url was copied into list-visible attributes")
+	}
+}
+
+func TestPatchAuthFileFields_RejectsUnavailableChatGPTWebLoginMethod(t *testing.T) {
+	manager := coreauth.NewManager(&memoryAuthStore{}, nil, nil)
+	credential := &chatgptwebauth.Credential{
+		Type:        chatgptwebauth.Provider,
+		Email:       "person@example.com",
+		AccessToken: "access-token",
+		LoginMethod: chatgptwebauth.LoginMethodAPI798,
+		API798URL:   "https://api798.com/get_code?email=person%40example.com&auth_code=opaque",
+	}
+	metadata := make(map[string]any)
+	credential.ApplyToMetadata(metadata)
+	record := &coreauth.Auth{
+		ID:         "chatgpt-web-api798-invalid.json",
+		FileName:   "chatgpt-web-api798-invalid.json",
+		Provider:   chatgptwebauth.Provider,
+		Attributes: map[string]string{"path": "/tmp/chatgpt-web-api798-invalid.json"},
+		Metadata:   metadata,
+	}
+	if _, errRegister := manager.Register(context.Background(), record); errRegister != nil {
+		t.Fatal(errRegister)
+	}
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, manager)
+
+	for name, fields := range map[string]string{
+		"clear explicit API798 URL": `{"api798_url":""}`,
+		"select missing Passkey":    `{"login_method":"passkey"}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			ctx, _ := gin.CreateTestContext(recorder)
+			request := httptest.NewRequest(http.MethodPatch, "/v0/management/auth-files/fields", strings.NewReader(`{"names":["chatgpt-web-api798-invalid.json"],"fields":`+fields+`}`))
+			request.Header.Set("Content-Type", "application/json")
+			ctx.Request = request
+			h.PatchAuthFileFields(ctx)
+			if recorder.Code != http.StatusMultiStatus {
+				t.Fatalf("status = %d, want %d; body=%s", recorder.Code, http.StatusMultiStatus, recorder.Body.String())
+			}
+			if strings.Contains(recorder.Body.String(), "auth_code") {
+				t.Fatalf("error response leaked API798 authorization: %s", recorder.Body.String())
+			}
+		})
 	}
 }
 

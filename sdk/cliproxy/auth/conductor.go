@@ -11605,6 +11605,8 @@ func carryForwardConcurrentRefreshMetadata(baseline, current, refreshed, next *A
 		"quota_updated_at",
 		"quota_stale",
 		"quota_last_error",
+		"login_method",
+		"api798_url",
 	} {
 		baselineValue, baselineOK := authMetadataEntry(baseline.Metadata, key)
 		currentValue, currentOK := authMetadataEntry(current.Metadata, key)
@@ -11681,6 +11683,17 @@ func chatGPTWebCredentialMetadataEntry(credential *chatgptwebauth.Credential, ke
 		return credential.QuotaStale, true
 	case "quota_last_error":
 		return chatgptwebauth.SafeQuotaError(credential.QuotaLastError), true
+	case "login_method":
+		method, errNormalize := chatgptwebauth.NormalizeLoginMethod(credential.LoginMethod)
+		if errNormalize != nil {
+			return nil, false
+		}
+		return string(method), true
+	case "api798_url":
+		if credential.API798URL == "" {
+			return nil, false
+		}
+		return credential.API798URL, true
 	default:
 		return nil, false
 	}

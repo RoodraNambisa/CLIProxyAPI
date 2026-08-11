@@ -417,6 +417,25 @@ func TestCarryForwardConcurrentRefreshMetadataPreservesNewestPasskeyState(t *tes
 	}
 }
 
+func TestCarryForwardConcurrentRefreshMetadataPreservesAPI798Settings(t *testing.T) {
+	baseline := chatGPTWebRefreshMergeAuth(nil)
+	baseline.Metadata["login_method"] = string(chatgptwebauth.LoginMethodAuto)
+	current := baseline.Clone()
+	current.Metadata["login_method"] = string(chatgptwebauth.LoginMethodAPI798)
+	current.Metadata["api798_url"] = "https://api798.com/get_code?email=person%40example.com&auth_code=current%252Bopaque"
+	refreshed := baseline.Clone()
+	next := refreshed.Clone()
+
+	carryForwardConcurrentRefreshMetadata(baseline, current, refreshed, next)
+
+	if got := next.Metadata["login_method"]; got != string(chatgptwebauth.LoginMethodAPI798) {
+		t.Fatalf("login_method = %#v, want api798", got)
+	}
+	if got := next.Metadata["api798_url"]; got != current.Metadata["api798_url"] {
+		t.Fatalf("api798_url = %#v, want exact concurrently edited value", got)
+	}
+}
+
 func TestCarryForwardConcurrentRefreshMetadataMergesAccountProfileAndQuotaFields(t *testing.T) {
 	baseline := chatGPTWebRefreshMergeAuth(nil)
 	for key, value := range map[string]any{

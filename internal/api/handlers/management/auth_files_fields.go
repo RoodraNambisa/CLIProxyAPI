@@ -14,22 +14,25 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	chatgptwebauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/chatgptweb"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/watcher/synthesizer"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 )
 
 type patchAuthFileFieldsRequest struct {
-	Name       string            `json:"name"`
-	Names      []string          `json:"names"`
-	Fields     json.RawMessage   `json:"fields"`
-	Prefix     *string           `json:"prefix"`
-	ProxyURL   *string           `json:"proxy_url"`
-	Headers    map[string]string `json:"headers"`
-	Priority   *int              `json:"priority"`
-	Note       *string           `json:"note"`
-	UsingAPI   *bool             `json:"using_api"`
-	Websockets *bool             `json:"websockets"`
+	Name        string            `json:"name"`
+	Names       []string          `json:"names"`
+	Fields      json.RawMessage   `json:"fields"`
+	Prefix      *string           `json:"prefix"`
+	ProxyURL    *string           `json:"proxy_url"`
+	Headers     map[string]string `json:"headers"`
+	Priority    *int              `json:"priority"`
+	Note        *string           `json:"note"`
+	UsingAPI    *bool             `json:"using_api"`
+	Websockets  *bool             `json:"websockets"`
+	LoginMethod *string           `json:"login_method"`
+	API798URL   *string           `json:"api798_url"`
 }
 
 type authFileFieldValues struct {
@@ -45,6 +48,8 @@ type authFileFieldValues struct {
 	excludedModels  []string
 	excludedSet     bool
 	disableCooling  *bool
+	loginMethod     *chatgptwebauth.LoginMethod
+	api798URL       *string
 	legacyHeaderOps bool
 }
 
@@ -101,7 +106,16 @@ func (h *Handler) patchAuthFileFieldsLegacy(c *gin.Context, req *patchAuthFileFi
 		note:            req.Note,
 		usingAPI:        req.UsingAPI,
 		websockets:      req.Websockets,
+		api798URL:       req.API798URL,
 		legacyHeaderOps: true,
+	}
+	if req.LoginMethod != nil {
+		method, errNormalize := chatgptwebauth.NormalizeLoginMethod(chatgptwebauth.LoginMethod(*req.LoginMethod))
+		if errNormalize != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid login_method"})
+			return
+		}
+		values.loginMethod = &method
 	}
 	if len(req.Headers) > 0 {
 		values.headers = req.Headers
@@ -120,6 +134,10 @@ func (h *Handler) patchAuthFileFieldsLegacy(c *gin.Context, req *patchAuthFileFi
 	}
 	if !values.hasNonHeaderFields() && !legacyAuthHeadersWouldChange(targetAuth, values.headers) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "no fields to update"})
+		return
+	}
+	if errValidate := validateBatchAuthFileFields(targetAuth, values); errValidate != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": errValidate.Error()})
 		return
 	}
 
@@ -259,6 +277,22 @@ func decodeAuthFileFieldValues(raw json.RawMessage) (authFileFieldValues, error)
 				return authFileFieldValues{}, fmt.Errorf("invalid disable_cooling")
 			}
 			values.disableCooling = &decoded
+		case "login_method":
+			var decoded string
+			if err := decodeNonNullAuthField(value, &decoded); err != nil {
+				return authFileFieldValues{}, fmt.Errorf("invalid login_method")
+			}
+			method, errNormalize := chatgptwebauth.NormalizeLoginMethod(chatgptwebauth.LoginMethod(decoded))
+			if errNormalize != nil {
+				return authFileFieldValues{}, fmt.Errorf("invalid login_method")
+			}
+			values.loginMethod = &method
+		case "api798_url":
+			var decoded string
+			if err := decodeNonNullAuthField(value, &decoded); err != nil {
+				return authFileFieldValues{}, fmt.Errorf("invalid api798_url")
+			}
+			values.api798URL = &decoded
 		default:
 			return authFileFieldValues{}, fmt.Errorf("unsupported field %q", name)
 		}
@@ -278,12 +312,13 @@ func decodeNonNullAuthField(raw json.RawMessage, target any) error {
 
 func (v authFileFieldValues) hasFields() bool {
 	return v.prefix != nil || v.proxyURL != nil || v.headersSet || v.prioritySet || v.note != nil ||
-		v.usingAPI != nil || v.websockets != nil || v.excludedSet || v.disableCooling != nil
+		v.usingAPI != nil || v.websockets != nil || v.excludedSet || v.disableCooling != nil ||
+		v.loginMethod != nil || v.api798URL != nil
 }
 
 func (v authFileFieldValues) hasNonHeaderFields() bool {
 	return v.prefix != nil || v.proxyURL != nil || v.prioritySet || v.note != nil || v.usingAPI != nil ||
-		v.websockets != nil || v.excludedSet || v.disableCooling != nil
+		v.websockets != nil || v.excludedSet || v.disableCooling != nil || v.loginMethod != nil || v.api798URL != nil
 }
 
 func validateBatchAuthFileFields(auth *coreauth.Auth, values authFileFieldValues) error {
@@ -293,6 +328,40 @@ func validateBatchAuthFileFields(auth *coreauth.Auth, values authFileFieldValues
 	}
 	if values.websockets != nil && provider != "xai" && provider != "codex" {
 		return errors.New("websockets is only supported for codex and xai auth files")
+	}
+	if values.loginMethod == nil && values.api798URL == nil {
+		return nil
+	}
+	if provider != chatgptwebauth.Provider {
+		return errors.New("login_method and api798_url are only supported for chatgpt-web auth files")
+	}
+	credential, errParse := chatgptwebauth.ParseCredential(auth.Metadata)
+	if errParse != nil {
+		return errors.New("chatgpt web credential is invalid")
+	}
+	if values.loginMethod != nil {
+		credential.LoginMethod = *values.loginMethod
+	}
+	if values.api798URL != nil {
+		credential.API798URL = *values.api798URL
+	}
+	method, errNormalize := chatgptwebauth.NormalizeLoginMethod(credential.LoginMethod)
+	if errNormalize != nil {
+		return errors.New("invalid login_method")
+	}
+	credential.LoginMethod = method
+	if credential.API798URL != "" {
+		if errValidate := chatgptwebauth.ValidateAPI798URL(credential.API798URL, credential.Email); errValidate != nil {
+			return errors.New("invalid api798_url")
+		}
+	}
+	if method != chatgptwebauth.LoginMethodAuto {
+		if _, errResolve := chatgptwebauth.ResolveLoginMethod(credential, false); errResolve != nil {
+			if resolutionError, ok := errResolve.(*chatgptwebauth.LoginMethodResolutionError); ok {
+				return errors.New(resolutionError.Message)
+			}
+			return errors.New("selected login method is unavailable")
+		}
 	}
 	return nil
 }
@@ -311,6 +380,10 @@ func (h *Handler) updateAuthFileFields(ctx context.Context, auth *coreauth.Auth,
 	if !exists || current == nil {
 		unlockAuth()
 		return nil, http.StatusNotFound, "auth file not found"
+	}
+	if errValidate := validateBatchAuthFileFields(current, values); errValidate != nil {
+		unlockAuth()
+		return nil, http.StatusBadRequest, errValidate.Error()
 	}
 	if coreauth.ChatGPTWebAuthRetainedForDependents(current) {
 		unlockAuth()
@@ -426,6 +499,18 @@ func (h *Handler) applyAuthFileFieldValues(auth *coreauth.Auth, values authFileF
 	if values.disableCooling != nil {
 		auth.Metadata["disable_cooling"] = *values.disableCooling
 		auth.Attributes["disable_cooling"] = strconv.FormatBool(*values.disableCooling)
+	}
+	if values.loginMethod != nil || values.api798URL != nil {
+		if values.loginMethod != nil {
+			auth.Metadata["login_method"] = string(*values.loginMethod)
+		}
+		if values.api798URL != nil {
+			if *values.api798URL == "" {
+				delete(auth.Metadata, "api798_url")
+			} else {
+				auth.Metadata["api798_url"] = *values.api798URL
+			}
+		}
 	}
 }
 
