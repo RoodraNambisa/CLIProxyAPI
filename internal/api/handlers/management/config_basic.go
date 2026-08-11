@@ -26,6 +26,15 @@ const (
 	latestReleaseUserAgent = "CLIProxyAPI"
 )
 
+type safeRemoteManagementConfig struct {
+	LiveLogs config.LiveLogsConfig `json:"live-logs"`
+}
+
+type configResponse struct {
+	*config.Config
+	RemoteManagement safeRemoteManagementConfig `json:"remote-management"`
+}
+
 func (h *Handler) GetConfig(c *gin.Context) {
 	if h == nil {
 		c.JSON(200, gin.H{})
@@ -41,7 +50,12 @@ func (h *Handler) GetConfig(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to snapshot configuration"})
 		return
 	}
-	c.JSON(200, &snapshot)
+	c.JSON(200, &configResponse{
+		Config: &snapshot,
+		RemoteManagement: safeRemoteManagementConfig{
+			LiveLogs: cfg.RemoteManagement.LiveLogs,
+		},
+	})
 }
 
 type releaseInfo struct {
