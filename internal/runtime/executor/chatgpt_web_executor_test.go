@@ -1512,6 +1512,318 @@ func TestChatGPTWebExecutorReloginUsesResolvedAPI798AcquisitionTimeout(t *testin
 	}
 }
 
+func TestChatGPTWebExecutorReloginKeepsOneRuntimeConfigSnapshot(t *testing.T) {
+	manager := cliproxyauth.NewManager(nil, nil, nil)
+	expected := registerChatGPTWebPendingAuth(t, manager, "relogin-runtime-snapshot")
+	timeout := 120
+	initialConfig := &config.Config{SDKConfig: config.SDKConfig{ProxyURL: "http://initial-proxy.example:8080"}, ChatGPTWeb: config.ChatGPTWebConfig{
+		API798AutoLoginEnabled:       true,
+		InvalidPasskeyResponseAsDead: true,
+		LoginProxy: config.ChatGPTWebLoginProxyConfig{
+			Enabled:                   true,
+			URLTemplate:               "http://initial-login-proxy.example:8080",
+			AcquisitionTimeoutSeconds: &timeout,
+		},
+	}}
+	replacementConfig := &config.Config{SDKConfig: config.SDKConfig{ProxyURL: "http://replacement-proxy.example:8080"}}
+
+	var executor *ChatGPTWebExecutor
+	fake := &fakeChatGPTWebAuthService{}
+	fake.loginAcquisitionTimeoutFn = func(input chatgptwebauth.LoginInput) time.Duration {
+		if !input.AllowAutoAPI798 || !input.LoginProxy.Enabled ||
+			input.LoginProxy.URLTemplate != "http://initial-login-proxy.example:8080" {
+			t.Fatalf("timeout input = %#v, want initial runtime snapshot", input)
+		}
+		executor.UpdateConfig(replacementConfig)
+		return time.Second
+	}
+	fake.loginFn = func(_ context.Context, input chatgptwebauth.LoginInput) (*chatgptwebauth.Credential, error) {
+		if !input.AllowAutoAPI798 || !input.RetryInvalidPasskeyResponse || !input.LoginProxy.Enabled ||
+			input.LoginProxy.URLTemplate != "http://initial-login-proxy.example:8080" || input.ProxyURL != "" {
+			t.Fatalf("login input = %#v, want the same initial runtime snapshot", input)
+		}
+		updated := *input.Credential
+		updated.AccessToken = "runtime-snapshot-token"
+		updated.LifecycleState = chatgptwebauth.LifecycleActive
+		return &updated, nil
+	}
+	executor = NewChatGPTWebExecutor(initialConfig, manager)
+	executor.authService = fake
+	t.Cleanup(func() { _ = executor.Close() })
+
+	updated, current, errRelogin := executor.ReloginCurrent(t.Context(), expected)
+	if errRelogin != nil || !current || updated == nil {
+		t.Fatalf("ReloginCurrent() = (%v, %v, %v)", updated, current, errRelogin)
+	}
+}
+
+func TestChatGPTWebExecutorReloginAcquisitionTimeoutStartsAfterQueue(t *testing.T) {
+	manager := cliproxyauth.NewManager(nil, nil, nil)
+	auth := chatGPTWebTestAuth("api798-queued-timeout")
+	credential, errCredential := chatgptwebauth.ParseCredential(auth.Metadata)
+	if errCredential != nil {
+		t.Fatal(errCredential)
+	}
+	credential.LoginMethod = chatgptwebauth.LoginMethodAPI798
+	credential.API798URL = "https://api798.com/get_code?email=api798-queued-timeout%40example.com&auth_code=opaque"
+	credential.Password = ""
+	credential.TOTPSecret = ""
+	credential.ApplyToMetadata(auth.Metadata)
+	auth.Metadata["lifecycle_state"] = cliproxyauth.LifecycleStateReloginPending
+	if _, errRegister := manager.Register(cliproxyauth.WithSkipPersist(t.Context()), auth); errRegister != nil {
+		t.Fatal(errRegister)
+	}
+	expected, ok := manager.GetByID(auth.ID)
+	if !ok {
+		t.Fatalf("registered auth %q not found", auth.ID)
+	}
+
+	const acquisitionTimeout = 100 * time.Millisecond
+	var timeoutCalls atomic.Int32
+	fake := &fakeChatGPTWebAuthService{}
+	fake.loginAcquisitionTimeoutFn = func(chatgptwebauth.LoginInput) time.Duration {
+		timeoutCalls.Add(1)
+		return acquisitionTimeout
+	}
+	fake.loginFn = func(ctx context.Context, input chatgptwebauth.LoginInput) (*chatgptwebauth.Credential, error) {
+		deadline, okDeadline := ctx.Deadline()
+		if !okDeadline || time.Until(deadline) <= 0 {
+			return nil, fmt.Errorf("re-login deadline = %v, want a fresh acquisition window", deadline)
+		}
+		updated := *input.Credential
+		updated.AccessToken = "api798-queued-token"
+		updated.LifecycleState = chatgptwebauth.LifecycleActive
+		return &updated, nil
+	}
+	executor := NewChatGPTWebExecutor(&config.Config{ChatGPTWeb: config.ChatGPTWebConfig{AutoRelogin: true}}, manager)
+	executor.authService = fake
+	executor.reloginSlots = make(chan struct{}, 1)
+	executor.reloginSlots <- struct{}{}
+	t.Cleanup(func() { _ = executor.Close() })
+
+	type reloginResult struct {
+		auth    *cliproxyauth.Auth
+		current bool
+		err     error
+	}
+	done := make(chan reloginResult, 1)
+	go func() {
+		updated, current, errRelogin := executor.reloginCurrentWithMode(t.Context(), expected, true)
+		done <- reloginResult{auth: updated, current: current, err: errRelogin}
+	}()
+	waitForChatGPTWebReloginWaiters(t, executor, expected, 1)
+	time.Sleep(2 * acquisitionTimeout)
+	if got := timeoutCalls.Load(); got != 0 {
+		t.Fatalf("acquisition timeout resolved while queued = %d, want 0", got)
+	}
+	select {
+	case result := <-done:
+		t.Fatalf("queued re-login completed before a slot was available: %#v", result)
+	default:
+	}
+
+	<-executor.reloginSlots
+	select {
+	case result := <-done:
+		if result.err != nil || !result.current || result.auth == nil {
+			t.Fatalf("queued re-login = (%v, %v, %v)", result.auth, result.current, result.err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("queued re-login did not complete after a slot became available")
+	}
+	if got := timeoutCalls.Load(); got != 1 {
+		t.Fatalf("acquisition timeout resolutions = %d, want 1", got)
+	}
+}
+
+func TestChatGPTWebExecutorBackgroundReloginRetriesClassifiedAcquisitionTimeout(t *testing.T) {
+	manager := cliproxyauth.NewManager(nil, nil, nil)
+	expected := registerChatGPTWebPendingAuth(t, manager, "classified-timeout-retry")
+	fake := &fakeChatGPTWebAuthService{}
+	fake.loginAcquisitionTimeoutFn = func(chatgptwebauth.LoginInput) time.Duration {
+		return 20 * time.Millisecond
+	}
+	fake.loginFn = func(ctx context.Context, input chatgptwebauth.LoginInput) (*chatgptwebauth.Credential, error) {
+		if fake.loginCalls.Load() == 1 {
+			<-ctx.Done()
+			return nil, &chatgptwebauth.AuthError{
+				Code:           "api798_timeout",
+				State:          chatgptwebauth.LifecycleReloginPending,
+				LifecycleState: chatgptwebauth.LifecycleReloginPending,
+				Retryable:      true,
+				Cause:          ctx.Err(),
+			}
+		}
+		updated := *input.Credential
+		updated.AccessToken = "retried-timeout-token"
+		updated.LifecycleState = chatgptwebauth.LifecycleActive
+		return &updated, nil
+	}
+	maxRetries := 1
+	executor := NewChatGPTWebExecutor(&config.Config{ChatGPTWeb: config.ChatGPTWebConfig{
+		AutoRelogin:           true,
+		AutoReloginMaxRetries: &maxRetries,
+	}}, manager)
+	executor.authService = fake
+	executor.reloginBackoff = func(int) time.Duration { return 0 }
+	t.Cleanup(func() { _ = executor.Close() })
+
+	executor.runBackgroundRelogin(expected)
+	if got := fake.loginCalls.Load(); got != 2 {
+		t.Fatalf("login calls = %d, want 2", got)
+	}
+	current, ok := manager.GetByID(expected.ID)
+	if !ok || current.LifecycleState() != cliproxyauth.LifecycleStateActive {
+		t.Fatalf("current auth = %#v, want active", current)
+	}
+}
+
+func TestChatGPTWebExecutorReloginPersistsClassifiedTerminalErrorAtDeadline(t *testing.T) {
+	manager := cliproxyauth.NewManager(nil, nil, nil)
+	expected := registerChatGPTWebPendingAuth(t, manager, "classified-terminal-deadline")
+	fake := &fakeChatGPTWebAuthService{}
+	fake.loginAcquisitionTimeoutFn = func(chatgptwebauth.LoginInput) time.Duration {
+		return 20 * time.Millisecond
+	}
+	fake.loginFn = func(ctx context.Context, input chatgptwebauth.LoginInput) (*chatgptwebauth.Credential, error) {
+		<-ctx.Done()
+		updated := *input.Credential
+		updated.LifecycleState = chatgptwebauth.LifecycleReauthRequired
+		updated.LifecycleReason = "invalid_grant"
+		return &updated, &chatgptwebauth.AuthError{
+			Code:           "invalid_grant",
+			State:          chatgptwebauth.LifecycleReauthRequired,
+			LifecycleState: chatgptwebauth.LifecycleReauthRequired,
+			Terminal:       true,
+			Cause:          ctx.Err(),
+		}
+	}
+	executor := NewChatGPTWebExecutor(&config.Config{ChatGPTWeb: config.ChatGPTWebConfig{AutoRelogin: true}}, manager)
+	executor.authService = fake
+	t.Cleanup(func() { _ = executor.Close() })
+
+	updated, current, errRelogin := executor.reloginCurrentWithMode(t.Context(), expected, true)
+	if errRelogin == nil || chatGPTWebErrorCode(errRelogin) != "invalid_grant" {
+		t.Fatalf("re-login error = %v, want classified invalid_grant", errRelogin)
+	}
+	if !current || updated == nil || updated.LifecycleState() != cliproxyauth.LifecycleStateReauthRequired {
+		t.Fatalf("re-login result = (%#v, %v), want current reauth_required", updated, current)
+	}
+	installed, ok := manager.GetByID(expected.ID)
+	if !ok || installed.LifecycleState() != cliproxyauth.LifecycleStateReauthRequired {
+		t.Fatalf("installed auth = %#v, want reauth_required", installed)
+	}
+}
+
+func TestChatGPTWebExecutorReloginPersistsSuccessAtAcquisitionDeadline(t *testing.T) {
+	manager := cliproxyauth.NewManager(nil, nil, nil)
+	expected := registerChatGPTWebPendingAuth(t, manager, "success-at-acquisition-deadline")
+	fake := &fakeChatGPTWebAuthService{}
+	fake.loginAcquisitionTimeoutFn = func(chatgptwebauth.LoginInput) time.Duration {
+		return 20 * time.Millisecond
+	}
+	fake.loginFn = func(ctx context.Context, input chatgptwebauth.LoginInput) (*chatgptwebauth.Credential, error) {
+		<-ctx.Done()
+		updated := *input.Credential
+		updated.AccessToken = "deadline-success-token"
+		updated.LifecycleState = chatgptwebauth.LifecycleActive
+		return &updated, nil
+	}
+	executor := NewChatGPTWebExecutor(&config.Config{ChatGPTWeb: config.ChatGPTWebConfig{AutoRelogin: true}}, manager)
+	executor.authService = fake
+	t.Cleanup(func() { _ = executor.Close() })
+
+	updated, current, errRelogin := executor.reloginCurrentWithMode(t.Context(), expected, true)
+	if errRelogin != nil || !current || updated == nil || updated.LifecycleState() != cliproxyauth.LifecycleStateActive {
+		t.Fatalf("re-login result = (%#v, %v, %v), want current active", updated, current, errRelogin)
+	}
+	installed, ok := manager.GetByID(expected.ID)
+	if !ok || installed.LifecycleState() != cliproxyauth.LifecycleStateActive {
+		t.Fatalf("installed auth = %#v, want active", installed)
+	}
+}
+
+func TestChatGPTWebExecutorCanceledReloginDoesNotPersistTerminalError(t *testing.T) {
+	manager := cliproxyauth.NewManager(nil, nil, nil)
+	expected := registerChatGPTWebPendingAuth(t, manager, "canceled-terminal-relogin")
+	started := make(chan struct{})
+	fake := &fakeChatGPTWebAuthService{}
+	fake.loginFn = func(ctx context.Context, input chatgptwebauth.LoginInput) (*chatgptwebauth.Credential, error) {
+		close(started)
+		<-ctx.Done()
+		updated := *input.Credential
+		updated.LifecycleState = chatgptwebauth.LifecycleReauthRequired
+		updated.LifecycleReason = "invalid_grant"
+		return &updated, &chatgptwebauth.AuthError{
+			Code:           "invalid_grant",
+			State:          chatgptwebauth.LifecycleReauthRequired,
+			LifecycleState: chatgptwebauth.LifecycleReauthRequired,
+			Terminal:       true,
+			Cause:          ctx.Err(),
+		}
+	}
+	executor := NewChatGPTWebExecutor(&config.Config{}, manager)
+	executor.authService = fake
+	t.Cleanup(func() { _ = executor.Close() })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, _, errRelogin := executor.ReloginCurrent(ctx, expected)
+		done <- errRelogin
+	}()
+	<-started
+	cancel()
+	select {
+	case errRelogin := <-done:
+		if !errors.Is(errRelogin, context.Canceled) {
+			t.Fatalf("re-login error = %v, want context canceled", errRelogin)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("canceled re-login did not return")
+	}
+	installed, ok := manager.GetByID(expected.ID)
+	if !ok || installed.LifecycleState() != cliproxyauth.LifecycleStateReloginPending {
+		t.Fatalf("installed auth = %#v, want relogin_pending", installed)
+	}
+}
+
+func TestChatGPTWebExecutorCallerDeadlineDoesNotPersistTerminalError(t *testing.T) {
+	manager := cliproxyauth.NewManager(nil, nil, nil)
+	expected := registerChatGPTWebPendingAuth(t, manager, "caller-deadline-terminal-relogin")
+	fake := &fakeChatGPTWebAuthService{}
+	fake.loginAcquisitionTimeoutFn = func(chatgptwebauth.LoginInput) time.Duration {
+		return time.Second
+	}
+	fake.loginFn = func(ctx context.Context, input chatgptwebauth.LoginInput) (*chatgptwebauth.Credential, error) {
+		<-ctx.Done()
+		updated := *input.Credential
+		updated.LifecycleState = chatgptwebauth.LifecycleReauthRequired
+		updated.LifecycleReason = "invalid_grant"
+		return &updated, &chatgptwebauth.AuthError{
+			Code:           "invalid_grant",
+			State:          chatgptwebauth.LifecycleReauthRequired,
+			LifecycleState: chatgptwebauth.LifecycleReauthRequired,
+			Terminal:       true,
+			Cause:          ctx.Err(),
+		}
+	}
+	executor := NewChatGPTWebExecutor(&config.Config{}, manager)
+	executor.authService = fake
+	t.Cleanup(func() { _ = executor.Close() })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	_, _, errRelogin := executor.ReloginCurrent(ctx, expected)
+	if !errors.Is(errRelogin, context.DeadlineExceeded) {
+		t.Fatalf("re-login error = %v, want caller deadline exceeded", errRelogin)
+	}
+	installed, ok := manager.GetByID(expected.ID)
+	if !ok || installed.LifecycleState() != cliproxyauth.LifecycleStateReloginPending {
+		t.Fatalf("installed auth = %#v, want relogin_pending", installed)
+	}
+}
+
 func TestChatGPTWebExecutorReloginPersistsSafePasskeyDiagnostic(t *testing.T) {
 	manager := cliproxyauth.NewManager(nil, nil, nil)
 	expected := registerChatGPTWebPendingAuth(t, manager, "passkey-diagnostic")
@@ -2182,6 +2494,12 @@ func TestChatGPTWebExecutorBackgroundReloginStopsOnClose(t *testing.T) {
 }
 
 func TestChatGPTWebBackgroundReloginRetryable(t *testing.T) {
+	if !chatGPTWebBackgroundReloginRetryable(context.DeadlineExceeded) {
+		t.Fatal("acquisition deadline was not retried")
+	}
+	if chatGPTWebBackgroundReloginRetryable(context.Canceled) {
+		t.Fatal("caller cancellation was retried")
+	}
 	if !chatGPTWebBackgroundReloginRetryable(&chatgptwebauth.AuthError{Retryable: true}) {
 		t.Fatal("retryable auth error was not retried")
 	}

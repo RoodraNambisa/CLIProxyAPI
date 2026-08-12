@@ -283,7 +283,14 @@ func TestChatGPTWebExecutorInvalidPasskeyResponseDeadGuards(t *testing.T) {
 			if test.mutateErr != nil {
 				test.mutateErr(authError)
 			}
-			promoted, promotedErr := executor.promoteExhaustedInvalidPasskeyResponse(auth, credential, authError, test.proxy)
+			promoted, promotedErr := promoteExhaustedInvalidPasskeyResponse(
+				cfg.InvalidPasskeyResponseAsDead,
+				auth,
+				credential,
+				authError,
+				test.proxy,
+				time.Now(),
+			)
 			if promoted.LifecycleState == chatgptwebauth.LifecycleDead {
 				t.Fatalf("guard promoted credential to dead: %#v / %v", promoted, promotedErr)
 			}

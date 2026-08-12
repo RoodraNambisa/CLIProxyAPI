@@ -62,7 +62,10 @@ const (
 
 var chatGPTWebBackgroundReloginSlots = make(chan struct{}, chatGPTWebBackgroundReloginConcurrency)
 
-var errChatGPTWebReloginOwnershipChanged = errors.New("chatgpt web re-login ownership changed")
+var (
+	errChatGPTWebReloginOwnershipChanged = errors.New("chatgpt web re-login ownership changed")
+	errChatGPTWebReloginAcquisitionLimit = errors.New("chatgpt web re-login acquisition deadline exceeded")
+)
 
 // ChatGPTWebExecutor manages ChatGPT Web credential refresh and re-login.
 // Request protocol support is added separately from the credential lifecycle.
@@ -563,7 +566,11 @@ func (e *ChatGPTWebExecutor) Login(ctx context.Context, input chatgptwebauth.Log
 	if e == nil || e.authService == nil {
 		return nil, errors.New("chatgpt web authentication service is unavailable")
 	}
-	if cfg := e.configSnapshot(); cfg != nil {
+	return e.loginWithRuntimeSnapshot(ctx, input, e.configSnapshot())
+}
+
+func (e *ChatGPTWebExecutor) loginWithRuntimeSnapshot(ctx context.Context, input chatgptwebauth.LoginInput, cfg *config.Config) (*chatgptwebauth.Credential, error) {
+	if cfg != nil {
 		input.AllowAutoAPI798 = cfg.ChatGPTWeb.API798AutoLoginEnabled
 	}
 	if input.BeginSentinelObserver == nil && e.sentinelRuntime != nil {
@@ -576,7 +583,7 @@ func (e *ChatGPTWebExecutor) Login(ctx context.Context, input chatgptwebauth.Log
 		}
 	}
 	if !input.LoginProxyResolved {
-		input.LoginProxy = e.LoginProxySnapshot()
+		input.LoginProxy = chatGPTWebLoginProxySnapshot(cfg)
 		input.LoginProxyResolved = true
 	}
 	if input.LoginProxy.Enabled {
@@ -587,7 +594,10 @@ func (e *ChatGPTWebExecutor) Login(ctx context.Context, input chatgptwebauth.Log
 
 // LoginProxySnapshot returns one immutable login-only proxy configuration copy.
 func (e *ChatGPTWebExecutor) LoginProxySnapshot() chatgptwebauth.LoginProxyConfig {
-	cfg := e.configSnapshot()
+	return chatGPTWebLoginProxySnapshot(e.configSnapshot())
+}
+
+func chatGPTWebLoginProxySnapshot(cfg *config.Config) chatgptwebauth.LoginProxyConfig {
 	if cfg == nil {
 		return chatgptwebauth.LoginProxyConfig{}
 	}
@@ -748,7 +758,10 @@ func (e *ChatGPTWebExecutor) sessionCookieRefreshOnTokenFailureEnabled() bool {
 }
 
 func (e *ChatGPTWebExecutor) invalidPasskeyResponseAsDeadEnabled() bool {
-	cfg := e.configSnapshot()
+	return chatGPTWebInvalidPasskeyResponseAsDeadEnabled(e.configSnapshot())
+}
+
+func chatGPTWebInvalidPasskeyResponseAsDeadEnabled(cfg *config.Config) bool {
 	return cfg != nil && cfg.ChatGPTWeb.InvalidPasskeyResponseAsDead
 }
 
@@ -818,7 +831,6 @@ func (e *ChatGPTWebExecutor) reloginCurrentWithMode(ctx context.Context, expecte
 
 func (e *ChatGPTWebExecutor) joinReloginFlight(ctx context.Context, expected *cliproxyauth.Auth, background bool) (*chatGPTWebReloginFlight, error) {
 	key := chatGPTWebReloginGenerationKey(expected)
-	acquisitionTimeout := e.reloginAcquisitionTimeout(expected)
 	for {
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -849,7 +861,7 @@ func (e *ChatGPTWebExecutor) joinReloginFlight(ctx context.Context, expected *cl
 			e.reloginMu.Unlock()
 			return nil, context.Canceled
 		}
-		acquisitionCtx, cancel := e.acquisitionContextWithTimeout(acquisitionTimeout)
+		flightCtx, cancel := context.WithCancel(e.lifecycleContext())
 		flight := &chatGPTWebReloginFlight{
 			key:         key,
 			done:        make(chan struct{}),
@@ -867,7 +879,7 @@ func (e *ChatGPTWebExecutor) joinReloginFlight(ctx context.Context, expected *cl
 		e.reloginMu.Unlock()
 		go func() {
 			defer e.reloginWG.Done()
-			e.runReloginFlight(acquisitionCtx, expected, flight)
+			e.runReloginFlight(flightCtx, expected, flight)
 		}()
 		return flight, nil
 	}
@@ -1174,6 +1186,9 @@ func chatGPTWebBackgroundReloginRetryable(err error) bool {
 	if errors.Is(err, errChatGPTWebReloginOwnershipChanged) {
 		return true
 	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
 	if chatgptwebauth.IsRetryable(err) {
 		return true
 	}
@@ -1233,8 +1248,14 @@ func (e *ChatGPTWebExecutor) reloginCurrent(ctx context.Context, expected *clipr
 			return cloneChatGPTWebAuth(latest), false, chatgptwebauth.ErrCredentialSuperseded
 		}
 	}
+	runtimeCfg := e.configSnapshot()
+	loginProxy := chatGPTWebLoginProxySnapshot(runtimeCfg)
+	allowAutoAPI798 := runtimeCfg != nil && runtimeCfg.ChatGPTWeb.API798AutoLoginEnabled
+	acquisitionTimeout := e.reloginAcquisitionTimeout(expected, loginProxy, allowAutoAPI798)
+	acquisitionCtx, cancelAcquisition := context.WithTimeoutCause(ctx, acquisitionTimeout, errChatGPTWebReloginAcquisitionLimit)
+	defer cancelAcquisition()
+	ctx = acquisitionCtx
 
-	loginProxy := e.LoginProxySnapshot()
 	loginProxyEnabled := loginProxy.Enabled
 	resolved := expected
 	if !loginProxyEnabled {
@@ -1250,23 +1271,39 @@ func (e *ChatGPTWebExecutor) reloginCurrent(ctx context.Context, expected *clipr
 	if errCredential != nil {
 		return nil, false, fmt.Errorf("parse chatgpt web credential: %w", errCredential)
 	}
-	result, errLogin := e.Login(ctx, chatgptwebauth.LoginInput{
+	result, errLogin := e.loginWithRuntimeSnapshot(ctx, chatgptwebauth.LoginInput{
 		Credential:                  credential,
-		ProxyURL:                    e.proxyURLForTarget(resolved, chatgptwebauth.AuthBaseURL),
+		ProxyURL:                    chatGPTWebProxyURLForTarget(resolved, chatgptwebauth.AuthBaseURL, runtimeCfg),
 		LoginProxy:                  loginProxy,
 		LoginProxyResolved:          true,
 		Relogin:                     true,
-		RetryInvalidPasskeyResponse: e.invalidPasskeyResponseAsDeadEnabled(),
+		RetryInvalidPasskeyResponse: chatGPTWebInvalidPasskeyResponseAsDeadEnabled(runtimeCfg),
 		PersistWebAuthn: func(persistCtx context.Context, updated chatgptwebauth.WebAuthnCredential) (chatgptwebauth.WebAuthnCredential, error) {
 			return e.persistWebAuthnReloginState(persistCtx, expected, updated)
 		},
-	})
+	}, runtimeCfg)
 	if errContext := ctx.Err(); errContext != nil {
 		if latest, ok := e.manager.GetByID(expected.ID); ok &&
 			chatGPTWebReloginGenerationKey(latest) != chatGPTWebReloginGenerationKey(expected) {
 			return cloneChatGPTWebAuth(latest), false, chatgptwebauth.ErrCredentialSuperseded
 		}
-		return nil, false, errContext
+		if !errors.Is(context.Cause(ctx), errChatGPTWebReloginAcquisitionLimit) {
+			return nil, false, errContext
+		}
+		if errLogin == nil {
+			if result == nil {
+				return nil, false, errContext
+			}
+			ctx = context.WithoutCancel(ctx)
+		} else {
+			if _, ok := chatgptwebauth.AsAuthError(errLogin); !ok {
+				return nil, false, errContext
+			}
+			if chatgptwebauth.IsRetryable(errLogin) || result == nil {
+				return nil, false, errLogin
+			}
+			ctx = context.WithoutCancel(ctx)
+		}
 	}
 	if errors.Is(errLogin, chatgptwebauth.ErrCredentialSuperseded) {
 		latest, _ = e.manager.GetByID(expected.ID)
@@ -1280,7 +1317,14 @@ func (e *ChatGPTWebExecutor) reloginCurrent(ctx context.Context, expected *clipr
 		return nil, false, firstNonNilError(errLogin, errors.New("chatgpt web re-login returned no credential"))
 	}
 	if errLogin != nil {
-		result, errLogin = e.promoteExhaustedInvalidPasskeyResponse(expected, result, errLogin, loginProxy)
+		result, errLogin = promoteExhaustedInvalidPasskeyResponse(
+			chatGPTWebInvalidPasskeyResponseAsDeadEnabled(runtimeCfg),
+			expected,
+			result,
+			errLogin,
+			loginProxy,
+			e.currentTime(),
+		)
 	}
 	updated := applyChatGPTWebCredential(expected, result)
 	updateCtx := ctx
@@ -1318,13 +1362,15 @@ func (e *ChatGPTWebExecutor) reloginCurrent(ctx context.Context, expected *clipr
 	return cloneChatGPTWebAuth(installed), true, nil
 }
 
-func (e *ChatGPTWebExecutor) promoteExhaustedInvalidPasskeyResponse(
+func promoteExhaustedInvalidPasskeyResponse(
+	enabled bool,
 	expected *cliproxyauth.Auth,
 	credential *chatgptwebauth.Credential,
 	errLogin error,
 	loginProxy chatgptwebauth.LoginProxyConfig,
+	now time.Time,
 ) (*chatgptwebauth.Credential, error) {
-	if !e.invalidPasskeyResponseAsDeadEnabled() || expected == nil || credential == nil {
+	if !enabled || expected == nil || credential == nil {
 		return credential, errLogin
 	}
 	authError, ok := chatgptwebauth.AsAuthError(errLogin)
@@ -1343,7 +1389,7 @@ func (e *ChatGPTWebExecutor) promoteExhaustedInvalidPasskeyResponse(
 	promotedCredential := cloneChatGPTWebCredential(credential)
 	promotedCredential.LifecycleState = chatgptwebauth.LifecycleDead
 	promotedCredential.LifecycleReason = "invalid_passkey_response"
-	promotedCredential.LifecycleUpdatedAt = e.currentTime().UTC().Format(time.RFC3339)
+	promotedCredential.LifecycleUpdatedAt = now.UTC().Format(time.RFC3339)
 	promotedError := *authError
 	promotedError.State = chatgptwebauth.LifecycleDead
 	promotedError.LifecycleState = chatgptwebauth.LifecycleDead
@@ -1966,7 +2012,7 @@ func (e *ChatGPTWebExecutor) acquisitionContextWithTimeout(timeout time.Duration
 	return context.WithTimeout(e.lifecycleContext(), timeout)
 }
 
-func (e *ChatGPTWebExecutor) reloginAcquisitionTimeout(expected *cliproxyauth.Auth) time.Duration {
+func (e *ChatGPTWebExecutor) reloginAcquisitionTimeout(expected *cliproxyauth.Auth, loginProxy chatgptwebauth.LoginProxyConfig, allowAutoAPI798 bool) time.Duration {
 	timeout := chatgptwebauth.DefaultAcquisitionTimeout
 	if e.authService == nil || expected == nil {
 		return timeout
@@ -1977,12 +2023,10 @@ func (e *ChatGPTWebExecutor) reloginAcquisitionTimeout(expected *cliproxyauth.Au
 	}
 	input := chatgptwebauth.LoginInput{
 		Credential:         credential,
-		LoginProxy:         e.LoginProxySnapshot(),
+		LoginProxy:         loginProxy,
 		LoginProxyResolved: true,
 		Relogin:            true,
-	}
-	if cfg := e.configSnapshot(); cfg != nil {
-		input.AllowAutoAPI798 = cfg.ChatGPTWeb.API798AutoLoginEnabled
+		AllowAutoAPI798:    allowAutoAPI798,
 	}
 	if resolved := e.authService.LoginAcquisitionTimeout(input); resolved > 0 {
 		return resolved
@@ -2003,12 +2047,16 @@ func (e *ChatGPTWebExecutor) acquisitionContextWithValues(ctx context.Context) (
 }
 
 func (e *ChatGPTWebExecutor) proxyURLForTarget(auth *cliproxyauth.Auth, targetURL string) string {
+	return chatGPTWebProxyURLForTarget(auth, targetURL, e.configSnapshot())
+}
+
+func chatGPTWebProxyURLForTarget(auth *cliproxyauth.Auth, targetURL string, cfg *config.Config) string {
 	if auth != nil {
 		if proxyURL := strings.TrimSpace(auth.EffectiveProxyURL()); proxyURL != "" {
 			return proxyURL
 		}
 	}
-	if cfg := e.configSnapshot(); cfg != nil {
+	if cfg != nil {
 		if proxyURL := strings.TrimSpace(cfg.ProxyURL); proxyURL != "" {
 			return proxyURL
 		}

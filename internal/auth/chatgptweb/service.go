@@ -1503,7 +1503,7 @@ func classifyAPI798EmailOTPActivationResponse(stage string, status int, payload 
 	if isConfirmedAPI798EmailOTPUnavailable(status, payload) {
 		return api798AuthError("api798_email_otp_unavailable", status, false, true, stage, nil)
 	}
-	if (status == http.StatusUnauthorized || status == http.StatusForbidden) && authError.State == pendingState {
+	if status >= http.StatusBadRequest && status < http.StatusInternalServerError && authError.State == pendingState {
 		retryable := *authError
 		retryable.Retryable = true
 		retryable.Terminal = false
