@@ -65,6 +65,8 @@ type loginFixture struct {
 	emailOTPSendStatus          int
 	emailOTPSendBody            string
 	emailOTPPageCalls           int
+	emailOTPPageStatus          int
+	emailOTPPageBody            string
 	emailOTPResendCalls         int
 	emailOTPRejectFirst         bool
 	emailOTPRejectAll           bool
@@ -334,12 +336,20 @@ func (fixture *loginFixture) handleEmailOTPPage(response http.ResponseWriter, re
 	fixture.mu.Lock()
 	requireNavigationHeaders := fixture.emailOTPSendCalls > 0
 	fixture.emailOTPPageCalls++
+	status := fixture.emailOTPPageStatus
+	body := fixture.emailOTPPageBody
 	fixture.mu.Unlock()
 	if requireNavigationHeaders && (request.Header.Get("Sec-Fetch-Dest") != "document" || request.Header.Get("Sec-Fetch-Mode") != "navigate") {
 		fixture.t.Errorf("email OTP page headers = %#v", request.Header)
 	}
 	response.Header().Set("Content-Type", "text/html")
-	_, _ = io.WriteString(response, "email verification")
+	if status != 0 {
+		response.WriteHeader(status)
+	}
+	if body == "" {
+		body = "email verification"
+	}
+	_, _ = io.WriteString(response, body)
 }
 
 func (fixture *loginFixture) handleEmailOTPResend(response http.ResponseWriter, request *http.Request) {

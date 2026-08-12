@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 	"sync"
@@ -20,12 +21,13 @@ import (
 )
 
 type fakeChatGPTWebAuthService struct {
-	loginFn             func(context.Context, chatgptwebauth.LoginInput) (*chatgptwebauth.Credential, error)
-	refreshFn           func(context.Context, chatgptwebauth.Credential, string) (*chatgptwebauth.Credential, error)
-	refreshSessionFn    func(context.Context, chatgptwebauth.Credential, string) (*chatgptwebauth.Credential, error)
-	loginCalls          atomic.Int32
-	refreshCalls        atomic.Int32
-	refreshSessionCalls atomic.Int32
+	loginFn                   func(context.Context, chatgptwebauth.LoginInput) (*chatgptwebauth.Credential, error)
+	loginAcquisitionTimeoutFn func(chatgptwebauth.LoginInput) time.Duration
+	refreshFn                 func(context.Context, chatgptwebauth.Credential, string) (*chatgptwebauth.Credential, error)
+	refreshSessionFn          func(context.Context, chatgptwebauth.Credential, string) (*chatgptwebauth.Credential, error)
+	loginCalls                atomic.Int32
+	refreshCalls              atomic.Int32
+	refreshSessionCalls       atomic.Int32
 }
 
 type chatGPTWebReloginSourceHashStore struct{}
@@ -123,6 +125,13 @@ func (service *fakeChatGPTWebAuthService) Login(ctx context.Context, input chatg
 		return nil, errors.New("unexpected login")
 	}
 	return service.loginFn(ctx, input)
+}
+
+func (service *fakeChatGPTWebAuthService) LoginAcquisitionTimeout(input chatgptwebauth.LoginInput) time.Duration {
+	if service.loginAcquisitionTimeoutFn != nil {
+		return service.loginAcquisitionTimeoutFn(input)
+	}
+	return chatgptwebauth.DefaultAcquisitionTimeout
 }
 
 func (service *fakeChatGPTWebAuthService) Refresh(ctx context.Context, credential chatgptwebauth.Credential, proxyURL string) (*chatgptwebauth.Credential, error) {
@@ -1453,6 +1462,54 @@ func TestChatGPTWebExecutorManualAndBackgroundReloginSingleflight(t *testing.T) 
 		current, ok := manager.GetByID(expected.ID)
 		return ok && current.LifecycleState() == cliproxyauth.LifecycleStateActive
 	})
+}
+
+func TestChatGPTWebExecutorReloginUsesResolvedAPI798AcquisitionTimeout(t *testing.T) {
+	manager := cliproxyauth.NewManager(nil, nil, nil)
+	auth := chatGPTWebTestAuth("api798-timeout")
+	credential, errCredential := chatgptwebauth.ParseCredential(auth.Metadata)
+	if errCredential != nil {
+		t.Fatal(errCredential)
+	}
+	credential.LoginMethod = chatgptwebauth.LoginMethodAPI798
+	credential.API798URL = "https://api798.com/get_code?email=api798-timeout%40example.com&auth_code=opaque"
+	credential.Password = ""
+	credential.TOTPSecret = ""
+	credential.ApplyToMetadata(auth.Metadata)
+	auth.Metadata["lifecycle_state"] = cliproxyauth.LifecycleStateReloginPending
+	if _, errRegister := manager.Register(cliproxyauth.WithSkipPersist(t.Context()), auth); errRegister != nil {
+		t.Fatal(errRegister)
+	}
+	expected, ok := manager.GetByID(auth.ID)
+	if !ok {
+		t.Fatalf("registered auth %q not found", auth.ID)
+	}
+
+	fake := &fakeChatGPTWebAuthService{}
+	fake.loginAcquisitionTimeoutFn = func(input chatgptwebauth.LoginInput) time.Duration {
+		if input.Credential == nil || input.Credential.LoginMethod != chatgptwebauth.LoginMethodAPI798 {
+			t.Fatalf("timeout input = %#v", input.Credential)
+		}
+		return chatgptwebauth.DefaultAPI798AcquisitionTimeout
+	}
+	fake.loginFn = func(ctx context.Context, input chatgptwebauth.LoginInput) (*chatgptwebauth.Credential, error) {
+		deadline, okDeadline := ctx.Deadline()
+		if !okDeadline || time.Until(deadline) < time.Minute {
+			return nil, fmt.Errorf("re-login deadline = %v, want API798 acquisition window", deadline)
+		}
+		updated := *input.Credential
+		updated.AccessToken = "api798-relogin-token"
+		updated.LifecycleState = chatgptwebauth.LifecycleActive
+		return &updated, nil
+	}
+	executor := NewChatGPTWebExecutor(&config.Config{}, manager)
+	executor.authService = fake
+	t.Cleanup(func() { _ = executor.Close() })
+
+	updated, current, errRelogin := executor.ReloginCurrent(t.Context(), expected)
+	if errRelogin != nil || !current || updated == nil {
+		t.Fatalf("ReloginCurrent() = (%v, %v, %v)", updated, current, errRelogin)
+	}
 }
 
 func TestChatGPTWebExecutorReloginPersistsSafePasskeyDiagnostic(t *testing.T) {

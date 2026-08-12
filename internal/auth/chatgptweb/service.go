@@ -77,7 +77,7 @@ func NewLoginService(options Options) *LoginService {
 func (service *Service) Login(ctx context.Context, input LoginInput) (*Credential, error) {
 	loginProxy := input.LoginProxy
 	flowAttempts := 1
-	acquisitionTimeout := service.loginAcquisitionTimeout(input)
+	acquisitionTimeout := service.LoginAcquisitionTimeout(input)
 	if loginProxy.Enabled {
 		flowAttempts = max(1, loginProxy.FlowAttempts)
 	}
@@ -142,7 +142,8 @@ func (service *Service) Login(ctx context.Context, input LoginInput) (*Credentia
 	return credential, errLogin
 }
 
-func (service *Service) loginAcquisitionTimeout(input LoginInput) time.Duration {
+// LoginAcquisitionTimeout returns the complete-flow timeout required by input.
+func (service *Service) LoginAcquisitionTimeout(input LoginInput) time.Duration {
 	timeout := service.options.AcquisitionTimeout
 	if input.LoginProxy.Enabled && input.LoginProxy.AcquisitionTimeout > 0 {
 		timeout = input.LoginProxy.AcquisitionTimeout
@@ -1465,10 +1466,7 @@ func (service *Service) ensureAPI798EmailOTPChallenge(
 	if authError := classifyPermanentAccountPayload(payload); authError != nil {
 		return issuedAt, false, authError
 	}
-	if authError := classifyHTTPResponse("email_otp_send", statusCode, payload, pendingState); authError != nil {
-		if statusCode >= http.StatusBadRequest && statusCode < http.StatusTooManyRequests {
-			authError = api798AuthError("api798_email_otp_unavailable", statusCode, false, true, "email_otp_send", nil)
-		}
+	if authError := classifyAPI798EmailOTPActivationResponse("email_otp_send", statusCode, payload, pendingState); authError != nil {
 		return issuedAt, false, authError
 	}
 
@@ -1488,13 +1486,57 @@ func (service *Service) ensureAPI798EmailOTPChallenge(
 	if authError := classifyPermanentAccountPayload(payload); authError != nil {
 		return issuedAt, false, authError
 	}
-	if authError := classifyHTTPResponse("email_otp_page", statusCode, payload, pendingState); authError != nil {
-		if statusCode >= http.StatusBadRequest && statusCode < http.StatusTooManyRequests {
-			authError = api798AuthError("api798_email_otp_unavailable", statusCode, false, true, "email_otp_page", nil)
-		}
+	if authError := classifyAPI798EmailOTPActivationResponse("email_otp_page", statusCode, payload, pendingState); authError != nil {
 		return issuedAt, false, authError
 	}
 	return issuedAt, true, nil
+}
+
+func classifyAPI798EmailOTPActivationResponse(stage string, status int, payload []byte, pendingState LifecycleState) *AuthError {
+	authError := classifyHTTPResponse(stage, status, payload, pendingState)
+	if authError == nil {
+		return nil
+	}
+	if authError.State == LifecycleDead {
+		return authError
+	}
+	if isConfirmedAPI798EmailOTPUnavailable(status, payload) {
+		return api798AuthError("api798_email_otp_unavailable", status, false, true, stage, nil)
+	}
+	if (status == http.StatusUnauthorized || status == http.StatusForbidden) && authError.State == pendingState {
+		retryable := *authError
+		retryable.Retryable = true
+		retryable.Terminal = false
+		retryable.Message = "email OTP challenge is temporarily unavailable"
+		return &retryable
+	}
+	return authError
+}
+
+func isConfirmedAPI798EmailOTPUnavailable(status int, payload []byte) bool {
+	switch status {
+	case http.StatusNotFound, http.StatusMethodNotAllowed, http.StatusGone:
+		return true
+	}
+	normalized := strings.ToLower(strings.TrimSpace(string(payload)))
+	if normalized == "" {
+		return false
+	}
+	for _, marker := range []string{
+		"email_otp_unavailable",
+		"email_otp_not_available",
+		"email_otp_not_supported",
+		"email_otp_disabled",
+		"email otp unavailable",
+		"email otp not available",
+		"email otp not supported",
+		"email otp disabled",
+	} {
+		if strings.Contains(normalized, marker) {
+			return true
+		}
+	}
+	return normalized == "unavailable" || normalized == "unsupported"
 }
 
 func (service *Service) api798ChallengeReferer(envelope apiEnvelope, fallback string) string {
@@ -2403,7 +2445,7 @@ func classifyHTTPResponse(stage string, status int, payload []byte, defaultState
 	if strings.Contains(messageLower, "account has been deleted") || strings.Contains(responseTextLower, "account because it has been deleted") {
 		return newAuthError("account_deleted", LifecycleDead, status, false, true, "account is deleted", nil)
 	}
-	if status == http.StatusTooManyRequests || status >= http.StatusInternalServerError {
+	if status == http.StatusRequestTimeout || status == http.StatusTooEarly || status == http.StatusTooManyRequests || status >= http.StatusInternalServerError {
 		return newAuthError(normalized, defaultState, status, true, false, "upstream authentication service is temporarily unavailable", nil)
 	}
 	if normalized == "invalid_grant" || normalized == "app_session_terminated" {

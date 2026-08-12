@@ -31,6 +31,7 @@ import (
 
 type chatGPTWebAuthService interface {
 	Login(context.Context, chatgptwebauth.LoginInput) (*chatgptwebauth.Credential, error)
+	LoginAcquisitionTimeout(chatgptwebauth.LoginInput) time.Duration
 	Refresh(context.Context, chatgptwebauth.Credential, string) (*chatgptwebauth.Credential, error)
 	RefreshSession(context.Context, chatgptwebauth.Credential, string) (*chatgptwebauth.Credential, error)
 }
@@ -817,6 +818,7 @@ func (e *ChatGPTWebExecutor) reloginCurrentWithMode(ctx context.Context, expecte
 
 func (e *ChatGPTWebExecutor) joinReloginFlight(ctx context.Context, expected *cliproxyauth.Auth, background bool) (*chatGPTWebReloginFlight, error) {
 	key := chatGPTWebReloginGenerationKey(expected)
+	acquisitionTimeout := e.reloginAcquisitionTimeout(expected)
 	for {
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -847,7 +849,7 @@ func (e *ChatGPTWebExecutor) joinReloginFlight(ctx context.Context, expected *cl
 			e.reloginMu.Unlock()
 			return nil, context.Canceled
 		}
-		acquisitionCtx, cancel := e.acquisitionContext()
+		acquisitionCtx, cancel := e.acquisitionContextWithTimeout(acquisitionTimeout)
 		flight := &chatGPTWebReloginFlight{
 			key:         key,
 			done:        make(chan struct{}),
@@ -1954,7 +1956,38 @@ func (e *ChatGPTWebExecutor) lifecycleContext() context.Context {
 }
 
 func (e *ChatGPTWebExecutor) acquisitionContext() (context.Context, context.CancelFunc) {
-	return context.WithTimeout(e.lifecycleContext(), chatgptwebauth.DefaultAcquisitionTimeout)
+	return e.acquisitionContextWithTimeout(chatgptwebauth.DefaultAcquisitionTimeout)
+}
+
+func (e *ChatGPTWebExecutor) acquisitionContextWithTimeout(timeout time.Duration) (context.Context, context.CancelFunc) {
+	if timeout <= 0 {
+		timeout = chatgptwebauth.DefaultAcquisitionTimeout
+	}
+	return context.WithTimeout(e.lifecycleContext(), timeout)
+}
+
+func (e *ChatGPTWebExecutor) reloginAcquisitionTimeout(expected *cliproxyauth.Auth) time.Duration {
+	timeout := chatgptwebauth.DefaultAcquisitionTimeout
+	if e.authService == nil || expected == nil {
+		return timeout
+	}
+	credential, errCredential := chatgptwebauth.ParseCredential(expected.Metadata)
+	if errCredential != nil {
+		return timeout
+	}
+	input := chatgptwebauth.LoginInput{
+		Credential:         credential,
+		LoginProxy:         e.LoginProxySnapshot(),
+		LoginProxyResolved: true,
+		Relogin:            true,
+	}
+	if cfg := e.configSnapshot(); cfg != nil {
+		input.AllowAutoAPI798 = cfg.ChatGPTWeb.API798AutoLoginEnabled
+	}
+	if resolved := e.authService.LoginAcquisitionTimeout(input); resolved > 0 {
+		return resolved
+	}
+	return timeout
 }
 
 func (e *ChatGPTWebExecutor) acquisitionContextWithValues(ctx context.Context) (context.Context, context.CancelFunc) {

@@ -561,6 +561,144 @@ func TestServiceLoginWithExplicitAPI798ReportsUnavailableEmailOTPEndpoint(t *tes
 	}
 }
 
+func TestAPI798EmailOTPActivationResponseClassification(t *testing.T) {
+	tests := []struct {
+		name          string
+		status        int
+		payload       string
+		wantCode      string
+		wantState     LifecycleState
+		wantRetryable bool
+		wantTerminal  bool
+	}{
+		{
+			name:          "request timeout",
+			status:        http.StatusRequestTimeout,
+			payload:       `{}`,
+			wantCode:      "email_otp_send_failed",
+			wantState:     LifecycleReloginPending,
+			wantRetryable: true,
+		},
+		{
+			name:          "too early",
+			status:        http.StatusTooEarly,
+			payload:       `{}`,
+			wantCode:      "email_otp_send_failed",
+			wantState:     LifecycleReloginPending,
+			wantRetryable: true,
+		},
+		{
+			name:          "expired oauth session",
+			status:        http.StatusUnauthorized,
+			payload:       `{}`,
+			wantCode:      "email_otp_send_failed",
+			wantState:     LifecycleReloginPending,
+			wantRetryable: true,
+		},
+		{
+			name:          "challenge response",
+			status:        http.StatusForbidden,
+			payload:       `<html>challenge</html>`,
+			wantCode:      "email_otp_send_failed",
+			wantState:     LifecycleReloginPending,
+			wantRetryable: true,
+		},
+		{
+			name:         "explicitly unavailable",
+			status:       http.StatusBadRequest,
+			payload:      `{"code":"email_otp_not_available"}`,
+			wantCode:     "api798_email_otp_unavailable",
+			wantState:    LifecycleReauthRequired,
+			wantTerminal: true,
+		},
+		{
+			name:         "missing endpoint",
+			status:       http.StatusNotFound,
+			payload:      `{}`,
+			wantCode:     "api798_email_otp_unavailable",
+			wantState:    LifecycleReauthRequired,
+			wantTerminal: true,
+		},
+		{
+			name:         "permanent account failure",
+			status:       http.StatusNotFound,
+			payload:      `{"error":"account_deactivated"}`,
+			wantCode:     "account_deactivated",
+			wantState:    LifecycleDead,
+			wantTerminal: true,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			authError := classifyAPI798EmailOTPActivationResponse(
+				"email_otp_send",
+				test.status,
+				[]byte(test.payload),
+				LifecycleReloginPending,
+			)
+			if authError == nil {
+				t.Fatal("classification returned nil")
+			}
+			if authError.Code != test.wantCode || authError.State != test.wantState ||
+				authError.Retryable != test.wantRetryable || authError.Terminal != test.wantTerminal ||
+				authError.FailureStage != "email_otp_send" {
+				t.Fatalf("classification = %#v", authError)
+			}
+		})
+	}
+}
+
+func TestServiceLoginWithExplicitAPI798KeepsTemporaryActivationResponsesRetryable(t *testing.T) {
+	tests := []struct {
+		name       string
+		stage      string
+		configure  func(*loginFixture)
+		wantStatus int
+	}{
+		{
+			name:  "send request timeout",
+			stage: "email_otp_send",
+			configure: func(fixture *loginFixture) {
+				fixture.emailOTPSendStatus = http.StatusRequestTimeout
+			},
+			wantStatus: http.StatusRequestTimeout,
+		},
+		{
+			name:  "verification page too early",
+			stage: "email_otp_page",
+			configure: func(fixture *loginFixture) {
+				fixture.emailOTPPageStatus = http.StatusTooEarly
+			},
+			wantStatus: http.StatusTooEarly,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newLoginFixture(t, http.StatusOK, "")
+			test.configure(fixture)
+			mailboxServer := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
+				response.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(response, `{"success":false}`)
+			}))
+			defer mailboxServer.Close()
+
+			options := fixture.options(time.Date(2026, time.August, 12, 12, 0, 0, 0, time.UTC))
+			options.API798HTTPClient = newAPI798TestClient(t, mailboxServer, nil)
+			_, errLogin := NewService(options).Login(t.Context(), LoginInput{Relogin: true, Credential: &Credential{
+				Type:        Provider,
+				Email:       "person@example.com",
+				LoginMethod: LoginMethodAPI798,
+				API798URL:   api798TestURL,
+			}})
+			authError, ok := AsAuthError(errLogin)
+			if !ok || authError.StatusCode != test.wantStatus || authError.FailureStage != test.stage ||
+				!authError.Retryable || authError.Terminal || authError.State != LifecycleReloginPending {
+				t.Fatalf("error = %#v", errLogin)
+			}
+		})
+	}
+}
+
 func TestAPI798ChallengeRefererPrefersTrustedContinuation(t *testing.T) {
 	service := NewService(Options{AuthBaseURL: "https://auth.openai.com"})
 
@@ -762,16 +900,16 @@ func TestAPI798LoginAcquisitionTimeoutHasIndependentMinimum(t *testing.T) {
 		LoginMethod: LoginMethodAPI798,
 		API798URL:   api798TestURL,
 	}}
-	if got := service.loginAcquisitionTimeout(input); got != DefaultAPI798AcquisitionTimeout {
+	if got := service.LoginAcquisitionTimeout(input); got != DefaultAPI798AcquisitionTimeout {
 		t.Fatalf("API798 acquisition timeout = %s, want %s", got, DefaultAPI798AcquisitionTimeout)
 	}
 	input.LoginProxy = LoginProxyConfig{Enabled: true, AcquisitionTimeout: 3 * time.Minute}
-	if got := service.loginAcquisitionTimeout(input); got != 3*time.Minute {
+	if got := service.LoginAcquisitionTimeout(input); got != 3*time.Minute {
 		t.Fatalf("longer configured acquisition timeout = %s", got)
 	}
 	input.Credential.LoginMethod = LoginMethodPasswordTOTP
 	input.Credential.Password = "secret"
-	if got := service.loginAcquisitionTimeout(input); got != 3*time.Minute {
+	if got := service.LoginAcquisitionTimeout(input); got != 3*time.Minute {
 		t.Fatalf("non-API798 acquisition timeout = %s", got)
 	}
 }
