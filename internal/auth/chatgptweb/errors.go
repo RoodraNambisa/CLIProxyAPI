@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 )
 
 // ErrCredentialSuperseded reports that a re-login result no longer matches
@@ -32,6 +33,7 @@ type AuthError struct {
 	ResponseBody          string         `json:"-"`
 	ResponseBodyTruncated bool           `json:"-"`
 	Cloudflare            bool           `json:"-"`
+	RetryAfter            time.Duration  `json:"-"`
 }
 
 func (authError *AuthError) Error() string {

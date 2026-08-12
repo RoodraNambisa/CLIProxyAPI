@@ -128,6 +128,36 @@ func TestAPI798MailboxResponseClassification(t *testing.T) {
 	}
 }
 
+func TestAPI798MailboxPrepareRetriesTransientResponse(t *testing.T) {
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
+		requests++
+		response.Header().Set("Content-Type", "application/json")
+		if requests == 1 {
+			response.Header().Set("Retry-After", "0")
+			response.WriteHeader(http.StatusTooManyRequests)
+			_, _ = io.WriteString(response, `{}`)
+			return
+		}
+		_, _ = io.WriteString(response, `{"success":false}`)
+	}))
+	defer server.Close()
+	service := NewService(Options{
+		API798HTTPClient:   newAPI798TestClient(t, server, nil),
+		API798PollInterval: time.Millisecond,
+	})
+	mailbox, authError := service.newAPI798MailboxSession(&Credential{Email: "person@example.com", API798URL: api798TestURL})
+	if authError != nil {
+		t.Fatal(authError)
+	}
+	if authError = mailbox.prepare(t.Context()); authError != nil {
+		t.Fatal(authError)
+	}
+	if requests != 2 {
+		t.Fatalf("requests = %d, want 2", requests)
+	}
+}
+
 func TestAPI798NetworkErrorDoesNotRetainSecretURL(t *testing.T) {
 	service := NewService(Options{API798HTTPClient: &http.Client{Transport: api798LeakingTransport{}}})
 	mailbox, authError := service.newAPI798MailboxSession(&Credential{Email: "person@example.com", API798URL: api798TestURL})
@@ -281,6 +311,512 @@ func TestServiceLoginWithExplicitAPI798(t *testing.T) {
 		if !strings.Contains(rawQuery, "auth_code=opaque%2Bvalue%252F") {
 			t.Fatalf("API798 auth_code encoding changed: %q", rawQuery)
 		}
+	}
+}
+
+func TestServiceLoginWithExplicitAPI798SelectsMFAEmailFactor(t *testing.T) {
+	fixedNow := time.Date(2026, time.August, 12, 12, 0, 0, 0, time.UTC)
+	fixture := newLoginFixture(t, http.StatusOK, "")
+	fixture.authorizeResponseBody = `{
+		"continue_url":"/mfa-challenge/email-factor?factor_type=email&mfa_request_id=mfa-request",
+		"page":{"type":"mfa_challenge","payload":{"mfa_request_id":"mfa-request","factors":[{"id":"email-factor","type":"email"}]}}
+	}`
+	fixture.wantMFAEmailOTP = "654321"
+	fixture.mfaRedirectURL = fixture.server.URL + "/mfa-verify-follow"
+	fixture.mfaRedirectStatus = http.StatusTemporaryRedirect
+
+	var mailboxCalls int
+	mailboxServer := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
+		mailboxCalls++
+		response.Header().Set("Content-Type", "application/json")
+		if mailboxCalls < 3 {
+			_, _ = io.WriteString(response, `{"success":true,"code":"111111","subject":"Old code","body":"111111","date":"2026-08-12T11:59:00Z"}`)
+			return
+		}
+		_, _ = io.WriteString(response, `{"success":true,"code":"654321","subject":"MFA code","body":"654321","date":"2026-08-12T12:00:01Z"}`)
+	}))
+	defer mailboxServer.Close()
+
+	options := fixture.options(fixedNow)
+	options.API798PollInterval = time.Millisecond
+	options.API798HTTPClient = newAPI798TestClient(t, mailboxServer, nil)
+	credential, errLogin := NewService(options).Login(t.Context(), LoginInput{Credential: &Credential{
+		Type:        Provider,
+		Email:       "person@example.com",
+		LoginMethod: LoginMethodAPI798,
+		API798URL:   api798TestURL,
+	}})
+	if errLogin != nil {
+		t.Fatal(errLogin)
+	}
+	if credential.LifecycleState != LifecycleActive {
+		t.Fatalf("credential = %#v", credential)
+	}
+	fixture.mu.Lock()
+	defer fixture.mu.Unlock()
+	if fixture.mfaIssueCalls != 1 || fixture.mfaEmailVerifyCalls != 2 || fixture.passwordCalls != 0 {
+		t.Fatalf("calls = issue:%d email_verify:%d password:%d", fixture.mfaIssueCalls, fixture.mfaEmailVerifyCalls, fixture.passwordCalls)
+	}
+}
+
+func TestServiceLoginWithExplicitAPI798RetriesRejectedMFAEmailOTP(t *testing.T) {
+	fixedNow := time.Date(2026, time.August, 12, 12, 0, 0, 0, time.UTC)
+	fixture := newLoginFixture(t, http.StatusOK, "")
+	fixture.authorizeResponseBody = `{
+		"continue_url":"/mfa-challenge/email-factor?factor_type=email&mfa_request_id=mfa-request",
+		"page":{"type":"mfa_challenge","payload":{"mfa_request_id":"mfa-request","factors":[{"id":"email-factor","type":"email"}]}}
+	}`
+	fixture.wantMFAEmailOTP = "654321"
+	fixture.mfaEmailOTPRejectFirst = true
+
+	var mailboxCalls int
+	mailboxServer := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
+		mailboxCalls++
+		response.Header().Set("Content-Type", "application/json")
+		switch mailboxCalls {
+		case 1, 2:
+			_, _ = io.WriteString(response, `{"success":true,"code":"111111","subject":"Old code","body":"111111","date":"2026-08-12T11:59:00Z"}`)
+		case 3, 4:
+			_, _ = io.WriteString(response, `{"success":true,"code":"654321","subject":"First code","body":"654321","date":"2026-08-12T12:00:01Z"}`)
+		default:
+			_, _ = io.WriteString(response, `{"success":true,"code":"654321","subject":"Fresh code","body":"654321","date":"2026-08-12T12:00:02Z"}`)
+		}
+	}))
+	defer mailboxServer.Close()
+
+	options := fixture.options(fixedNow)
+	options.API798PollInterval = time.Millisecond
+	options.API798HTTPClient = newAPI798TestClient(t, mailboxServer, nil)
+	credential, errLogin := NewService(options).Login(t.Context(), LoginInput{Credential: &Credential{
+		Type:        Provider,
+		Email:       "person@example.com",
+		LoginMethod: LoginMethodAPI798,
+		API798URL:   api798TestURL,
+	}})
+	if errLogin != nil {
+		t.Fatal(errLogin)
+	}
+	if credential.LifecycleState != LifecycleActive {
+		t.Fatalf("credential = %#v", credential)
+	}
+	fixture.mu.Lock()
+	defer fixture.mu.Unlock()
+	if fixture.mfaIssueCalls != 2 || fixture.mfaEmailVerifyCalls != 2 {
+		t.Fatalf("calls = issue:%d email_verify:%d", fixture.mfaIssueCalls, fixture.mfaEmailVerifyCalls)
+	}
+}
+
+func TestServiceLoginWithExplicitAPI798KeepsExhaustedMFAEmailOTPRetryable(t *testing.T) {
+	fixedNow := time.Date(2026, time.August, 12, 12, 0, 0, 0, time.UTC)
+	fixture := newLoginFixture(t, http.StatusOK, "")
+	fixture.authorizeResponseBody = `{
+		"continue_url":"/mfa-challenge/email-factor?factor_type=email&mfa_request_id=mfa-request",
+		"page":{"type":"mfa_challenge","payload":{"mfa_request_id":"mfa-request","factors":[{"id":"email-factor","type":"email"}]}}
+	}`
+	fixture.wantMFAEmailOTP = "654321"
+	fixture.mfaEmailOTPRejectAll = true
+
+	var mailboxCalls int
+	mailboxServer := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
+		mailboxCalls++
+		response.Header().Set("Content-Type", "application/json")
+		switch mailboxCalls {
+		case 1, 2:
+			_, _ = io.WriteString(response, `{"success":true,"code":"111111","subject":"Old code","body":"111111","date":"2026-08-12T11:59:00Z"}`)
+		case 3, 4:
+			_, _ = io.WriteString(response, `{"success":true,"code":"654321","subject":"First code","body":"654321","date":"2026-08-12T12:00:01Z"}`)
+		default:
+			_, _ = io.WriteString(response, `{"success":true,"code":"654321","subject":"Fresh code","body":"654321","date":"2026-08-12T12:00:02Z"}`)
+		}
+	}))
+	defer mailboxServer.Close()
+
+	options := fixture.options(fixedNow)
+	options.API798PollInterval = time.Millisecond
+	options.API798HTTPClient = newAPI798TestClient(t, mailboxServer, nil)
+	credential, errLogin := NewService(options).Login(t.Context(), LoginInput{Credential: &Credential{
+		Type:        Provider,
+		Email:       "person@example.com",
+		LoginMethod: LoginMethodAPI798,
+		API798URL:   api798TestURL,
+	}})
+	authError, ok := AsAuthError(errLogin)
+	if !ok || authError.Code != "api798_email_otp_rejected" || !authError.Retryable || authError.Terminal {
+		t.Fatalf("error = %#v, want retryable non-terminal rejection", errLogin)
+	}
+	if credential == nil || credential.LifecycleState != LifecycleLoginPending {
+		t.Fatalf("credential lifecycle = %#v, want login_pending", credential)
+	}
+	fixture.mu.Lock()
+	defer fixture.mu.Unlock()
+	if fixture.mfaIssueCalls != DefaultAPI798OTPAttempts || fixture.mfaEmailVerifyCalls != DefaultAPI798OTPAttempts {
+		t.Fatalf("calls = issue:%d email_verify:%d", fixture.mfaIssueCalls, fixture.mfaEmailVerifyCalls)
+	}
+}
+
+func TestServiceLoginWithExplicitAPI798SwitchesPasswordPageToEmailOTP(t *testing.T) {
+	fixedNow := time.Date(2026, time.August, 12, 12, 0, 0, 0, time.UTC)
+	fixture := newLoginFixture(t, http.StatusOK, "")
+	fixture.wantEmailOTP = "123456"
+	mailboxCalls := 0
+	mailboxServer := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
+		mailboxCalls++
+		response.Header().Set("Content-Type", "application/json")
+		if mailboxCalls <= 2 {
+			_, _ = io.WriteString(response, `{"success":true,"code":"000000","subject":"Old code","body":"000000","date":"2026-08-12T11:59:00Z"}`)
+			return
+		}
+		_, _ = io.WriteString(response, `{"success":true,"code":"123456","subject":"Fresh code","body":"123456","date":"2026-08-12T12:00:01Z"}`)
+	}))
+	defer mailboxServer.Close()
+
+	options := fixture.options(fixedNow)
+	options.API798PollInterval = time.Millisecond
+	options.API798HTTPClient = newAPI798TestClient(t, mailboxServer, nil)
+	credential, errLogin := NewService(options).Login(t.Context(), LoginInput{Credential: &Credential{
+		Type:        Provider,
+		Email:       "person@example.com",
+		Password:    "correct-password",
+		LoginMethod: LoginMethodAPI798,
+		API798URL:   api798TestURL,
+	}})
+	if errLogin != nil {
+		t.Fatal(errLogin)
+	}
+	if credential.LifecycleState != LifecycleActive {
+		t.Fatalf("credential = %#v", credential)
+	}
+	fixture.mu.Lock()
+	defer fixture.mu.Unlock()
+	if fixture.passwordCalls != 0 || fixture.emailOTPSendCalls != 1 || fixture.emailOTPPageCalls != 1 || fixture.emailOTPCalls != 1 {
+		t.Fatalf("calls = password:%d send:%d page:%d validate:%d", fixture.passwordCalls, fixture.emailOTPSendCalls, fixture.emailOTPPageCalls, fixture.emailOTPCalls)
+	}
+}
+
+func TestServiceLoginWithExplicitAPI798SwitchesPasskeyPageToEmailOTP(t *testing.T) {
+	fixedNow := time.Date(2026, time.August, 12, 12, 0, 0, 0, time.UTC)
+	fixture := newLoginFixture(t, http.StatusOK, "")
+	fixture.authorizeResponseBody = `{"continue_url":"/passkey","page":{"type":"passkey_challenge"}}`
+	fixture.wantEmailOTP = "123456"
+	mailboxCalls := 0
+	mailboxServer := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
+		mailboxCalls++
+		response.Header().Set("Content-Type", "application/json")
+		if mailboxCalls <= 2 {
+			_, _ = io.WriteString(response, `{"success":true,"code":"000000","subject":"Old code","body":"000000","date":"2026-08-12T11:59:00Z"}`)
+			return
+		}
+		_, _ = io.WriteString(response, `{"success":true,"code":"123456","subject":"Fresh code","body":"123456","date":"2026-08-12T12:00:01Z"}`)
+	}))
+	defer mailboxServer.Close()
+
+	options := fixture.options(fixedNow)
+	options.API798PollInterval = time.Millisecond
+	options.API798HTTPClient = newAPI798TestClient(t, mailboxServer, nil)
+	credential, errLogin := NewService(options).Login(t.Context(), LoginInput{Credential: &Credential{
+		Type:        Provider,
+		Email:       "person@example.com",
+		LoginMethod: LoginMethodAPI798,
+		API798URL:   api798TestURL,
+	}})
+	if errLogin != nil {
+		t.Fatal(errLogin)
+	}
+	if credential.LifecycleState != LifecycleActive {
+		t.Fatalf("credential = %#v", credential)
+	}
+	fixture.mu.Lock()
+	defer fixture.mu.Unlock()
+	if fixture.passwordCalls != 0 || fixture.emailOTPSendCalls != 1 || fixture.emailOTPPageCalls != 1 || fixture.emailOTPCalls != 1 {
+		t.Fatalf("calls = password:%d send:%d page:%d validate:%d", fixture.passwordCalls, fixture.emailOTPSendCalls, fixture.emailOTPPageCalls, fixture.emailOTPCalls)
+	}
+}
+
+func TestServiceLoginWithExplicitAPI798ReportsUnavailableEmailOTPEndpoint(t *testing.T) {
+	fixture := newLoginFixture(t, http.StatusOK, "")
+	fixture.emailOTPSendStatus = http.StatusBadRequest
+	fixture.emailOTPSendBody = "unavailable"
+	mailboxServer := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
+		response.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(response, `{"success":false}`)
+	}))
+	defer mailboxServer.Close()
+
+	options := fixture.options(time.Date(2026, time.August, 12, 12, 0, 0, 0, time.UTC))
+	options.API798HTTPClient = newAPI798TestClient(t, mailboxServer, nil)
+	_, errLogin := NewService(options).Login(t.Context(), LoginInput{Credential: &Credential{
+		Type:        Provider,
+		Email:       "person@example.com",
+		LoginMethod: LoginMethodAPI798,
+		API798URL:   api798TestURL,
+	}})
+	authError, ok := AsAuthError(errLogin)
+	if !ok || authError.Code != "api798_email_otp_unavailable" || authError.FailureStage != "email_otp_send" {
+		t.Fatalf("error = %#v", errLogin)
+	}
+	fixture.mu.Lock()
+	defer fixture.mu.Unlock()
+	if fixture.emailOTPSendCalls != 1 || fixture.emailOTPPageCalls != 0 || fixture.passwordCalls != 0 {
+		t.Fatalf("calls = send:%d page:%d password:%d", fixture.emailOTPSendCalls, fixture.emailOTPPageCalls, fixture.passwordCalls)
+	}
+}
+
+func TestAPI798ChallengeRefererPrefersTrustedContinuation(t *testing.T) {
+	service := NewService(Options{AuthBaseURL: "https://auth.openai.com"})
+
+	if got := service.api798ChallengeReferer(apiEnvelope{ContinueURL: "/passkey"}, "https://auth.openai.com/api/accounts/authorize/continue"); got != "https://auth.openai.com/passkey" {
+		t.Fatalf("continuation referer = %q", got)
+	}
+	if got := service.api798ChallengeReferer(apiEnvelope{ContinueURL: "https://attacker.example/passkey"}, "https://auth.openai.com/log-in/password"); got != "https://auth.openai.com/log-in/password" {
+		t.Fatalf("fallback referer = %q", got)
+	}
+	if got := service.api798ChallengeReferer(apiEnvelope{}, "https://auth.openai.com/log-in/password"); got != "https://auth.openai.com/log-in/password" {
+		t.Fatalf("empty continuation referer = %q", got)
+	}
+	if got := service.api798ChallengeReferer(apiEnvelope{ContinueURL: "https://attacker.example/passkey"}, "https://attacker.example/fallback"); got != "https://auth.openai.com/log-in" {
+		t.Fatalf("safe default referer = %q", got)
+	}
+}
+
+func TestRejectedAPI798OTPStatusClassification(t *testing.T) {
+	for _, testCase := range []struct {
+		name       string
+		statusCode int
+		payload    string
+		want       bool
+	}{
+		{name: "known wrong code", statusCode: http.StatusBadRequest, payload: `{"code":"wrong_email_otp_code"}`, want: true},
+		{name: "known expired code", statusCode: http.StatusBadRequest, payload: `{"code":"otp_expired"}`, want: true},
+		{name: "unauthorized", statusCode: http.StatusUnauthorized, payload: `{}`, want: true},
+		{name: "unrelated bad request", statusCode: http.StatusBadRequest, payload: `{"code":"account_problem"}`, want: false},
+		{name: "server failure", statusCode: http.StatusInternalServerError, payload: `{"code":"wrong_email_otp_code"}`, want: false},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			if got := isRejectedAPI798OTPStatus(testCase.statusCode, []byte(testCase.payload)); got != testCase.want {
+				t.Fatalf("isRejectedAPI798OTPStatus(%d, %s) = %v, want %v", testCase.statusCode, testCase.payload, got, testCase.want)
+			}
+		})
+	}
+}
+
+func TestAPI798ChallengePageIsNotMistakenForRetryableUpstreamFailure(t *testing.T) {
+	directChallenge := apiEnvelope{PageType: "email_otp", ContinueURL: "/email-verification"}
+	mfaChallenge := apiEnvelope{PageType: "mfa_challenge", ContinueURL: "/mfa-challenge/email-factor"}
+	for _, testCase := range []struct {
+		name       string
+		statusCode int
+		want       bool
+	}{
+		{name: "success", statusCode: http.StatusOK, want: true},
+		{name: "wrong code", statusCode: http.StatusBadRequest, want: true},
+		{name: "rate limited", statusCode: http.StatusTooManyRequests, want: false},
+		{name: "server failure", statusCode: http.StatusInternalServerError, want: false},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			if got := isRejectedAPI798EmailOTP(testCase.statusCode, nil, directChallenge); got != testCase.want {
+				t.Fatalf("direct challenge result = %v, want %v", got, testCase.want)
+			}
+			if got := isRejectedAPI798MFAEmailOTP(testCase.statusCode, nil, mfaChallenge); got != testCase.want {
+				t.Fatalf("MFA challenge result = %v, want %v", got, testCase.want)
+			}
+		})
+	}
+}
+
+func TestServiceLoginWithExplicitAPI798ResendsRejectedEmailOTP(t *testing.T) {
+	fixedNow := time.Date(2026, time.August, 12, 12, 0, 0, 0, time.UTC)
+	fixture := newLoginFixture(t, http.StatusOK, "")
+	fixture.authorizeResponseBody = `{"continue_url":"/email-verification","page":{"type":"email_otp"}}`
+	fixture.wantEmailOTP = "123456"
+	fixture.emailOTPRejectFirst = true
+
+	var mailboxCalls int
+	mailboxServer := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
+		mailboxCalls++
+		response.Header().Set("Content-Type", "application/json")
+		switch mailboxCalls {
+		case 1:
+			_, _ = io.WriteString(response, `{"success":true,"code":"000000","subject":"Old code","body":"000000","date":"2026-08-12T11:59:00Z"}`)
+		case 2, 3:
+			_, _ = io.WriteString(response, `{"success":true,"code":"123456","subject":"First code","body":"123456","date":"2026-08-12T12:00:01Z"}`)
+		default:
+			_, _ = io.WriteString(response, `{"success":true,"code":"123456","subject":"Resent code","body":"123456","date":"2026-08-12T12:00:02Z"}`)
+		}
+	}))
+	defer mailboxServer.Close()
+
+	options := fixture.options(fixedNow)
+	options.API798PollInterval = time.Millisecond
+	options.API798HTTPClient = newAPI798TestClient(t, mailboxServer, nil)
+	credential, errLogin := NewService(options).Login(t.Context(), LoginInput{Credential: &Credential{
+		Type:        Provider,
+		Email:       "person@example.com",
+		LoginMethod: LoginMethodAPI798,
+		API798URL:   api798TestURL,
+	}})
+	if errLogin != nil {
+		t.Fatal(errLogin)
+	}
+	if credential.LifecycleState != LifecycleActive {
+		t.Fatalf("credential = %#v", credential)
+	}
+	fixture.mu.Lock()
+	defer fixture.mu.Unlock()
+	if fixture.emailOTPCalls != 2 || fixture.emailOTPResendCalls != 1 {
+		t.Fatalf("calls = validate:%d resend:%d", fixture.emailOTPCalls, fixture.emailOTPResendCalls)
+	}
+}
+
+func TestServiceLoginWithExplicitAPI798KeepsExhaustedEmailOTPRetryable(t *testing.T) {
+	fixedNow := time.Date(2026, time.August, 12, 12, 0, 0, 0, time.UTC)
+	fixture := newLoginFixture(t, http.StatusOK, "")
+	fixture.authorizeResponseBody = `{"continue_url":"/email-verification","page":{"type":"email_otp"}}`
+	fixture.wantEmailOTP = "123456"
+	fixture.emailOTPRejectAll = true
+
+	var mailboxCalls int
+	mailboxServer := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
+		mailboxCalls++
+		response.Header().Set("Content-Type", "application/json")
+		switch mailboxCalls {
+		case 1:
+			_, _ = io.WriteString(response, `{"success":true,"code":"000000","subject":"Old code","body":"000000","date":"2026-08-12T11:59:00Z"}`)
+		case 2, 3:
+			_, _ = io.WriteString(response, `{"success":true,"code":"123456","subject":"First code","body":"123456","date":"2026-08-12T12:00:01Z"}`)
+		default:
+			_, _ = io.WriteString(response, `{"success":true,"code":"123456","subject":"Resent code","body":"123456","date":"2026-08-12T12:00:02Z"}`)
+		}
+	}))
+	defer mailboxServer.Close()
+
+	options := fixture.options(fixedNow)
+	options.API798PollInterval = time.Millisecond
+	options.API798HTTPClient = newAPI798TestClient(t, mailboxServer, nil)
+	credential, errLogin := NewService(options).Login(t.Context(), LoginInput{Credential: &Credential{
+		Type:        Provider,
+		Email:       "person@example.com",
+		LoginMethod: LoginMethodAPI798,
+		API798URL:   api798TestURL,
+	}})
+	authError, ok := AsAuthError(errLogin)
+	if !ok || authError.Code != "api798_email_otp_rejected" || !authError.Retryable || authError.Terminal {
+		t.Fatalf("error = %#v, want retryable non-terminal rejection", errLogin)
+	}
+	if credential == nil || credential.LifecycleState != LifecycleLoginPending {
+		t.Fatalf("credential lifecycle = %#v, want login_pending", credential)
+	}
+	fixture.mu.Lock()
+	defer fixture.mu.Unlock()
+	if fixture.emailOTPCalls != DefaultAPI798OTPAttempts || fixture.emailOTPResendCalls != DefaultAPI798OTPAttempts-1 {
+		t.Fatalf("calls = validate:%d resend:%d", fixture.emailOTPCalls, fixture.emailOTPResendCalls)
+	}
+}
+
+func TestServiceLoginWithExplicitAPI798DoesNotResendOnUpstreamFailure(t *testing.T) {
+	fixedNow := time.Date(2026, time.August, 12, 12, 0, 0, 0, time.UTC)
+	fixture := newLoginFixture(t, http.StatusOK, "")
+	fixture.authorizeResponseBody = `{"continue_url":"/email-verification","page":{"type":"email_otp"}}`
+	fixture.wantEmailOTP = "123456"
+	fixture.emailOTPStatus = http.StatusInternalServerError
+	fixture.emailOTPBody = `{"error":{"code":"temporarily_unavailable"}}`
+
+	mailboxCalls := 0
+	mailboxServer := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
+		mailboxCalls++
+		response.Header().Set("Content-Type", "application/json")
+		if mailboxCalls == 1 {
+			_, _ = io.WriteString(response, `{"success":true,"code":"000000","subject":"Old code","body":"000000","date":"2026-08-12T11:59:00Z"}`)
+			return
+		}
+		_, _ = io.WriteString(response, `{"success":true,"code":"123456","subject":"Fresh code","body":"123456","date":"2026-08-12T12:00:01Z"}`)
+	}))
+	defer mailboxServer.Close()
+
+	options := fixture.options(fixedNow)
+	options.API798PollInterval = time.Millisecond
+	options.API798HTTPClient = newAPI798TestClient(t, mailboxServer, nil)
+	_, errLogin := NewService(options).Login(t.Context(), LoginInput{Credential: &Credential{
+		Type:        Provider,
+		Email:       "person@example.com",
+		LoginMethod: LoginMethodAPI798,
+		API798URL:   api798TestURL,
+	}})
+	authError, ok := AsAuthError(errLogin)
+	if !ok || !authError.Retryable || authError.StatusCode != http.StatusInternalServerError || authError.FailureStage != "email_otp_validate" {
+		t.Fatalf("error = %#v", errLogin)
+	}
+	fixture.mu.Lock()
+	defer fixture.mu.Unlock()
+	if fixture.emailOTPCalls != 1 || fixture.emailOTPResendCalls != 0 {
+		t.Fatalf("calls = validate:%d resend:%d", fixture.emailOTPCalls, fixture.emailOTPResendCalls)
+	}
+}
+
+func TestAPI798LoginAcquisitionTimeoutHasIndependentMinimum(t *testing.T) {
+	service := NewService(Options{
+		AcquisitionTimeout:       5 * time.Second,
+		API798AcquisitionTimeout: 10 * time.Second,
+	})
+	input := LoginInput{Credential: &Credential{
+		Email:       "person@example.com",
+		LoginMethod: LoginMethodAPI798,
+		API798URL:   api798TestURL,
+	}}
+	if got := service.loginAcquisitionTimeout(input); got != DefaultAPI798AcquisitionTimeout {
+		t.Fatalf("API798 acquisition timeout = %s, want %s", got, DefaultAPI798AcquisitionTimeout)
+	}
+	input.LoginProxy = LoginProxyConfig{Enabled: true, AcquisitionTimeout: 3 * time.Minute}
+	if got := service.loginAcquisitionTimeout(input); got != 3*time.Minute {
+		t.Fatalf("longer configured acquisition timeout = %s", got)
+	}
+	input.Credential.LoginMethod = LoginMethodPasswordTOTP
+	input.Credential.Password = "secret"
+	if got := service.loginAcquisitionTimeout(input); got != 3*time.Minute {
+		t.Fatalf("non-API798 acquisition timeout = %s", got)
+	}
+}
+
+func TestAPI798RetryDelay(t *testing.T) {
+	if got := api798RetryDelay(2*time.Second, 3, 0); got != 8*time.Second {
+		t.Fatalf("exponential delay = %s", got)
+	}
+	if got := api798RetryDelay(2*time.Second, 10, 0); got != DefaultAPI798RetryMaxDelay {
+		t.Fatalf("capped delay = %s", got)
+	}
+	if got := api798RetryDelay(2*time.Second, 3, 17*time.Second); got != 17*time.Second {
+		t.Fatalf("Retry-After delay = %s", got)
+	}
+	if got := api798RetryDelay(2*time.Second, 3, 3*time.Minute); got != DefaultAPI798AcquisitionTimeout {
+		t.Fatalf("capped Retry-After delay = %s", got)
+	}
+	if got := api798RetryDelay(time.Minute, 1, 0); got != DefaultAPI798RetryMaxDelay {
+		t.Fatalf("capped base delay = %s", got)
+	}
+}
+
+func TestParseAPI798RetryAfter(t *testing.T) {
+	now := time.Date(2026, time.August, 12, 12, 0, 0, 0, time.UTC)
+	if got := parseAPI798RetryAfter(now.Add(7*time.Second).Format(http.TimeFormat), now); got != 7*time.Second {
+		t.Fatalf("HTTP-date Retry-After = %s", got)
+	}
+	if got := parseAPI798RetryAfter("9223372036854775807", now); got != DefaultAPI798AcquisitionTimeout {
+		t.Fatalf("large Retry-After = %s", got)
+	}
+}
+
+func TestAPI798FetchPreservesRetryAfter(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
+		response.Header().Set("Content-Type", "application/json")
+		response.Header().Set("Retry-After", "7")
+		response.WriteHeader(http.StatusTooManyRequests)
+		_, _ = io.WriteString(response, `{}`)
+	}))
+	defer server.Close()
+	service := NewService(Options{API798HTTPClient: newAPI798TestClient(t, server, nil)})
+	mailbox, _ := service.newAPI798MailboxSession(&Credential{Email: "person@example.com", API798URL: api798TestURL})
+	_, authError := mailbox.fetch(t.Context())
+	if authError == nil || authError.Code != "api798_unavailable" || authError.RetryAfter != 7*time.Second {
+		t.Fatalf("error = %#v", authError)
 	}
 }
 

@@ -49,13 +49,25 @@ type loginFixture struct {
 	tokenCalls                  int
 	tokenCloudflareRemaining    int
 	mfaVerifyCalls              int
+	mfaIssueCalls               int
+	mfaEmailVerifyCalls         int
 	mfaStatus                   int
 	mfaBody                     string
 	mfaContinuationOnly         bool
 	mfaRedirectURL              string
 	mfaRedirectStatus           int
+	mfaEmailOTPRejectFirst      bool
+	mfaEmailOTPRejectAll        bool
 	wantTOTP                    string
+	wantMFAEmailOTP             string
 	emailOTPCalls               int
+	emailOTPSendCalls           int
+	emailOTPSendStatus          int
+	emailOTPSendBody            string
+	emailOTPPageCalls           int
+	emailOTPResendCalls         int
+	emailOTPRejectFirst         bool
+	emailOTPRejectAll           bool
 	emailOTPStatus              int
 	emailOTPBody                string
 	wantEmailOTP                string
@@ -81,9 +93,13 @@ func (fixture *loginFixture) serveHTTP(response http.ResponseWriter, request *ht
 		fixture.handleSentinel(response, request)
 	case "/api/accounts/authorize/continue":
 		fixture.handleAuthorizeContinue(response, request)
-	case "/log-in", "/log-in/password", "/email-verification":
+	case "/log-in", "/log-in/password":
 		response.Header().Set("Content-Type", "text/html")
 		_, _ = io.WriteString(response, "login")
+	case "/api/accounts/email-otp/send":
+		fixture.handleEmailOTPSend(response, request)
+	case "/email-verification":
+		fixture.handleEmailOTPPage(response, request)
 	case "/password-page":
 		if fixture.passwordPageRedirect {
 			http.Redirect(response, request, fixture.callbackURL(), http.StatusFound)
@@ -129,6 +145,10 @@ func (fixture *loginFixture) serveHTTP(response http.ResponseWriter, request *ht
 		fixture.handlePassword(response, request)
 	case "/api/accounts/email-otp/validate":
 		fixture.handleEmailOTP(response, request)
+	case "/api/accounts/email-otp/resend":
+		fixture.handleEmailOTPResend(response, request)
+	case "/api/accounts/mfa/issue_challenge":
+		fixture.handleMFAIssue(response, request)
 	case "/api/accounts/mfa/verify", "/mfa-verify-follow":
 		fixture.handleMFAVerify(response, request)
 	case "/api/accounts/oauth/token":
@@ -259,14 +279,22 @@ func (fixture *loginFixture) handleEmailOTP(response http.ResponseWriter, reques
 	}
 	fixture.mu.Lock()
 	fixture.emailOTPCalls++
+	call := fixture.emailOTPCalls
 	wantCode := fixture.wantEmailOTP
 	status := fixture.emailOTPStatus
 	responseBody := fixture.emailOTPBody
+	rejectFirst := fixture.emailOTPRejectFirst
+	rejectAll := fixture.emailOTPRejectAll
 	fixture.mu.Unlock()
 	if body["code"] != wantCode {
 		fixture.t.Errorf("email OTP code = %q, want %q", body["code"], wantCode)
 	}
 	response.Header().Set("Content-Type", "application/json")
+	if rejectAll || (rejectFirst && call == 1) {
+		response.WriteHeader(http.StatusBadRequest)
+		_, _ = io.WriteString(response, `{"error":{"code":"wrong_email_otp_code","message":"wrong code"}}`)
+		return
+	}
 	if status != 0 {
 		response.WriteHeader(status)
 	}
@@ -275,6 +303,83 @@ func (fixture *loginFixture) handleEmailOTP(response http.ResponseWriter, reques
 		return
 	}
 	_, _ = fmt.Fprintf(response, `{"continue_url":%q,"page":{"type":"authorized"}}`, fixture.callbackURL())
+}
+
+func (fixture *loginFixture) handleEmailOTPSend(response http.ResponseWriter, request *http.Request) {
+	if request.Method != http.MethodGet {
+		fixture.t.Errorf("email OTP send method = %s", request.Method)
+	}
+	if request.Header.Get("Sec-Fetch-Dest") != "document" || request.Header.Get("Sec-Fetch-Mode") != "navigate" || request.Header.Get("Referer") == "" {
+		fixture.t.Errorf("email OTP send headers = %#v", request.Header)
+	}
+	fixture.mu.Lock()
+	fixture.emailOTPSendCalls++
+	status := fixture.emailOTPSendStatus
+	body := fixture.emailOTPSendBody
+	fixture.mu.Unlock()
+	response.Header().Set("Content-Type", "text/html")
+	if status != 0 {
+		response.WriteHeader(status)
+	}
+	if body == "" {
+		body = "sent"
+	}
+	_, _ = io.WriteString(response, body)
+}
+
+func (fixture *loginFixture) handleEmailOTPPage(response http.ResponseWriter, request *http.Request) {
+	if request.Method != http.MethodGet {
+		fixture.t.Errorf("email OTP page method = %s", request.Method)
+	}
+	fixture.mu.Lock()
+	requireNavigationHeaders := fixture.emailOTPSendCalls > 0
+	fixture.emailOTPPageCalls++
+	fixture.mu.Unlock()
+	if requireNavigationHeaders && (request.Header.Get("Sec-Fetch-Dest") != "document" || request.Header.Get("Sec-Fetch-Mode") != "navigate") {
+		fixture.t.Errorf("email OTP page headers = %#v", request.Header)
+	}
+	response.Header().Set("Content-Type", "text/html")
+	_, _ = io.WriteString(response, "email verification")
+}
+
+func (fixture *loginFixture) handleEmailOTPResend(response http.ResponseWriter, request *http.Request) {
+	if request.Method != http.MethodPost {
+		fixture.t.Errorf("email OTP resend method = %s", request.Method)
+	}
+	if request.Header.Get("Oai-Device-Id") == "" || request.Header.Get("Origin") != fixture.server.URL {
+		fixture.t.Errorf("email OTP resend headers = %#v", request.Header)
+	}
+	fixture.mu.Lock()
+	fixture.emailOTPResendCalls++
+	fixture.mu.Unlock()
+	response.Header().Set("Content-Type", "application/json")
+	_, _ = io.WriteString(response, `{}`)
+}
+
+func (fixture *loginFixture) handleMFAIssue(response http.ResponseWriter, request *http.Request) {
+	if request.Method != http.MethodPost {
+		fixture.t.Errorf("MFA issue method = %s", request.Method)
+	}
+	if request.Header.Get("Oai-Device-Id") == "" || request.Header.Get("Origin") != fixture.server.URL {
+		fixture.t.Errorf("MFA issue headers = %#v", request.Header)
+	}
+	var body map[string]any
+	if err := json.NewDecoder(request.Body).Decode(&body); err != nil {
+		fixture.t.Errorf("decode MFA issue request: %v", err)
+	}
+	if body["id"] != "email-factor" || body["type"] != "email" || body["mfa_request_id"] != "mfa-request" {
+		fixture.t.Errorf("MFA issue body = %#v", body)
+	}
+	fixture.mu.Lock()
+	fixture.mfaIssueCalls++
+	call := fixture.mfaIssueCalls
+	fixture.mu.Unlock()
+	wantForceFresh := call > 1
+	if gotForceFresh, ok := body["force_fresh_challenge"].(bool); !ok || gotForceFresh != wantForceFresh {
+		fixture.t.Errorf("MFA issue force_fresh_challenge = %#v, want %t", body["force_fresh_challenge"], wantForceFresh)
+	}
+	response.Header().Set("Content-Type", "application/json")
+	_, _ = io.WriteString(response, `{}`)
 }
 
 func (fixture *loginFixture) handleAuthorizeContinue(response http.ResponseWriter, request *http.Request) {
@@ -371,9 +476,26 @@ func (fixture *loginFixture) handleMFAVerify(response http.ResponseWriter, reque
 	fixture.mu.Lock()
 	fixture.mfaVerifyCalls++
 	wantTOTP := fixture.wantTOTP
+	wantEmailOTP := fixture.wantMFAEmailOTP
 	fixture.mu.Unlock()
-	if body["id"] != "totp-factor" || body["type"] != "totp" || body["mfa_request_id"] != "mfa-request" || body["code"] != wantTOTP {
-		fixture.t.Errorf("MFA verify body = %#v", body)
+	if body["type"] == "email" {
+		fixture.mu.Lock()
+		fixture.mfaEmailVerifyCalls++
+		emailCall := fixture.mfaEmailVerifyCalls
+		rejectFirst := fixture.mfaEmailOTPRejectFirst
+		rejectAll := fixture.mfaEmailOTPRejectAll
+		fixture.mu.Unlock()
+		if body["id"] != "email-factor" || body["mfa_request_id"] != "mfa-request" || body["code"] != wantEmailOTP {
+			fixture.t.Errorf("MFA email verify body = %#v", body)
+		}
+		if rejectAll || (rejectFirst && emailCall == 1) {
+			response.Header().Set("Content-Type", "application/json")
+			response.WriteHeader(http.StatusBadRequest)
+			_, _ = io.WriteString(response, `{"error":{"code":"wrong_email_otp_code","message":"wrong code"}}`)
+			return
+		}
+	} else if body["id"] != "totp-factor" || body["type"] != "totp" || body["mfa_request_id"] != "mfa-request" || body["code"] != wantTOTP {
+		fixture.t.Errorf("MFA TOTP verify body = %#v", body)
 	}
 	if request.URL.Path == "/api/accounts/mfa/verify" && fixture.mfaRedirectURL != "" {
 		response.Header().Set("Location", fixture.mfaRedirectURL)

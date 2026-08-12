@@ -61,33 +61,90 @@ func (service *Service) newAPI798MailboxSession(credential *Credential) (*api798
 }
 
 func (session *api798MailboxSession) prepare(ctx context.Context) *AuthError {
-	message, authError := session.fetch(ctx)
-	if authError != nil {
-		return authError
+	temporaryFailures := 0
+	for {
+		message, authError := session.fetch(ctx)
+		if authError == nil {
+			session.baselineFingerprint = message.Fingerprint
+			return nil
+		}
+		if !authError.Retryable {
+			return authError
+		}
+		temporaryFailures++
+		if waitError := waitAPI798Retry(ctx, api798RetryDelay(
+			session.service.options.API798PollInterval,
+			temporaryFailures,
+			authError.RetryAfter,
+		)); waitError != nil {
+			return waitError
+		}
 	}
-	session.baselineFingerprint = message.Fingerprint
-	return nil
 }
 
 func (session *api798MailboxSession) waitForCode(ctx context.Context, issuedAt time.Time) (string, *AuthError) {
+	temporaryFailures := 0
 	for {
 		message, authError := session.fetch(ctx)
 		if authError != nil {
 			if !authError.Retryable {
 				return "", authError
 			}
+			temporaryFailures++
 		} else if session.isFresh(message, issuedAt, session.service.options.Now()) {
 			return strings.TrimSpace(message.Code), nil
+		} else {
+			temporaryFailures = 0
 		}
 
-		timer := time.NewTimer(session.service.options.API798PollInterval)
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-			return "", api798AuthError("api798_timeout", 0, true, false, "api798_poll", ctx.Err())
-		case <-timer.C:
+		retryAfter := time.Duration(0)
+		if authError != nil {
+			retryAfter = authError.RetryAfter
+		}
+		if waitError := waitAPI798Retry(ctx, api798RetryDelay(session.service.options.API798PollInterval, temporaryFailures, retryAfter)); waitError != nil {
+			return "", waitError
 		}
 	}
+}
+
+func waitAPI798Retry(ctx context.Context, delay time.Duration) *AuthError {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return api798AuthError("api798_timeout", 0, true, false, "api798_poll", ctx.Err())
+	case <-timer.C:
+		return nil
+	}
+}
+
+func api798RetryDelay(base time.Duration, temporaryFailures int, retryAfter time.Duration) time.Duration {
+	if retryAfter > 0 {
+		if retryAfter > DefaultAPI798AcquisitionTimeout {
+			return DefaultAPI798AcquisitionTimeout
+		}
+		return retryAfter
+	}
+	if base <= 0 {
+		base = 2 * time.Second
+	}
+	if base > DefaultAPI798RetryMaxDelay {
+		base = DefaultAPI798RetryMaxDelay
+	}
+	if temporaryFailures <= 1 {
+		return base
+	}
+	delay := base
+	for attempt := 1; attempt < temporaryFailures; attempt++ {
+		if delay >= DefaultAPI798RetryMaxDelay/2 {
+			return DefaultAPI798RetryMaxDelay
+		}
+		delay *= 2
+	}
+	if delay > DefaultAPI798RetryMaxDelay {
+		return DefaultAPI798RetryMaxDelay
+	}
+	return delay
 }
 
 func (session *api798MailboxSession) isFresh(message api798Message, issuedAt, now time.Time) bool {
@@ -139,7 +196,9 @@ func (session *api798MailboxSession) fetch(ctx context.Context) (api798Message, 
 	case response.StatusCode == http.StatusUnauthorized || response.StatusCode == http.StatusForbidden:
 		return api798Message{}, api798AuthError("api798_authorization_failed", response.StatusCode, false, true, "api798_poll", nil)
 	case response.StatusCode == http.StatusTooManyRequests || response.StatusCode >= http.StatusInternalServerError:
-		return api798Message{}, api798AuthError("api798_unavailable", response.StatusCode, true, false, "api798_poll", nil)
+		authError := api798AuthError("api798_unavailable", response.StatusCode, true, false, "api798_poll", nil)
+		authError.RetryAfter = parseAPI798RetryAfter(response.Header.Get("Retry-After"), session.service.options.Now())
+		return api798Message{}, authError
 	case response.StatusCode >= http.StatusBadRequest:
 		return api798Message{}, api798AuthError("api798_request_rejected", response.StatusCode, false, true, "api798_poll", nil)
 	}
@@ -153,6 +212,31 @@ func (session *api798MailboxSession) fetch(ctx context.Context) (api798Message, 
 		return api798Message{}, api798AuthError("api798_response_invalid", response.StatusCode, false, true, "api798_poll", errDecode)
 	}
 	return message, nil
+}
+
+func parseAPI798RetryAfter(value string, now time.Time) time.Duration {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return 0
+	}
+	if seconds, errSeconds := strconv.ParseInt(value, 10, 64); errSeconds == nil {
+		if seconds <= 0 {
+			return 0
+		}
+		if seconds >= int64(DefaultAPI798AcquisitionTimeout/time.Second) {
+			return DefaultAPI798AcquisitionTimeout
+		}
+		return time.Duration(seconds) * time.Second
+	}
+	deadline, errDate := http.ParseTime(value)
+	if errDate != nil || !deadline.After(now) {
+		return 0
+	}
+	delay := deadline.Sub(now)
+	if delay > DefaultAPI798AcquisitionTimeout {
+		return DefaultAPI798AcquisitionTimeout
+	}
+	return delay
 }
 
 func safeAPI798NetworkCause(err error) error {

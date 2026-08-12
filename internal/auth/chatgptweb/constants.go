@@ -21,8 +21,12 @@ const (
 	RedirectURL    = "https://platform.openai.com/auth/callback"
 	AudienceURL    = "https://api.openai.com/v1"
 
-	DefaultAcquisitionTimeout = 30 * time.Second
-	DefaultRefreshLead        = 5 * time.Minute
+	DefaultAcquisitionTimeout       = 30 * time.Second
+	DefaultAPI798AcquisitionTimeout = 2 * time.Minute
+	DefaultAPI798RetryMaxDelay      = 30 * time.Second
+	DefaultAPI798OTPAttempts        = 2
+	DefaultRefreshLead              = 5 * time.Minute
+	api798MailClockSkew             = 8 * time.Second
 
 	auth0Client = "eyJuYW1lIjoiYXV0aDAtc3BhLWpzIiwidmVyc2lvbiI6IjEuMjEuMCJ9"
 )

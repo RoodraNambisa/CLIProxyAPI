@@ -602,18 +602,19 @@ type LoginProxyConfig struct {
 }
 
 type Options struct {
-	AuthBaseURL          string
-	SessionBaseURL       string
-	SentinelBaseURL      string
-	RedirectURL          string
-	ClientID             string
-	Audience             string
-	AcquisitionTimeout   time.Duration
-	Rand                 io.Reader
-	Now                  func() time.Time
-	Persona              Persona
-	API798HTTPClient     *http.Client
-	API798RequestTimeout time.Duration
-	API798PollInterval   time.Duration
-	API798UndatedDelay   time.Duration
+	AuthBaseURL              string
+	SessionBaseURL           string
+	SentinelBaseURL          string
+	RedirectURL              string
+	ClientID                 string
+	Audience                 string
+	AcquisitionTimeout       time.Duration
+	Rand                     io.Reader
+	Now                      func() time.Time
+	Persona                  Persona
+	API798HTTPClient         *http.Client
+	API798AcquisitionTimeout time.Duration
+	API798RequestTimeout     time.Duration
+	API798PollInterval       time.Duration
+	API798UndatedDelay       time.Duration
 }

@@ -50,6 +50,9 @@ func NewService(options Options) *Service {
 	if options.API798HTTPClient == nil {
 		options.API798HTTPClient = newAPI798HTTPClient()
 	}
+	if options.API798AcquisitionTimeout < DefaultAPI798AcquisitionTimeout {
+		options.API798AcquisitionTimeout = DefaultAPI798AcquisitionTimeout
+	}
 	if options.API798RequestTimeout <= 0 {
 		options.API798RequestTimeout = 15 * time.Second
 	}
@@ -74,12 +77,9 @@ func NewLoginService(options Options) *LoginService {
 func (service *Service) Login(ctx context.Context, input LoginInput) (*Credential, error) {
 	loginProxy := input.LoginProxy
 	flowAttempts := 1
-	acquisitionTimeout := service.options.AcquisitionTimeout
+	acquisitionTimeout := service.loginAcquisitionTimeout(input)
 	if loginProxy.Enabled {
 		flowAttempts = max(1, loginProxy.FlowAttempts)
-		if loginProxy.AcquisitionTimeout > 0 {
-			acquisitionTimeout = loginProxy.AcquisitionTimeout
-		}
 	}
 	selector, errSelector := newLoginProxySelector(loginProxy, service.options.Rand)
 	if errSelector != nil {
@@ -140,6 +140,19 @@ func (service *Service) Login(ctx context.Context, input LoginInput) (*Credentia
 		}
 	}
 	return credential, errLogin
+}
+
+func (service *Service) loginAcquisitionTimeout(input LoginInput) time.Duration {
+	timeout := service.options.AcquisitionTimeout
+	if input.LoginProxy.Enabled && input.LoginProxy.AcquisitionTimeout > 0 {
+		timeout = input.LoginProxy.AcquisitionTimeout
+	}
+	credential := service.loginCredential(input)
+	method, errResolve := ResolveLoginMethod(credential, input.AllowAutoAPI798)
+	if errResolve == nil && method == LoginMethodAPI798 && timeout < service.options.API798AcquisitionTimeout {
+		timeout = service.options.API798AcquisitionTimeout
+	}
+	return timeout
 }
 
 func shouldRetryInvalidPasskeyResponse(input LoginInput, authError *AuthError) bool {
@@ -247,9 +260,29 @@ func (service *Service) loginOnce(acquisitionContext context.Context, input Logi
 		service.applyFailure(credential, authError, input.Relogin)
 		return credential, authError
 	}
+	completeAPI798FromEnvelope := func(envelope apiEnvelope, referer string, issuedAt time.Time) (*Credential, error, bool) {
+		if loginMethod != LoginMethodAPI798 {
+			return nil, nil, false
+		}
+		readyAt, ready, authError := service.ensureAPI798EmailOTPChallenge(
+			acquisitionContext, client, api798Session, envelope, referer, issuedAt, pendingState,
+		)
+		if authError != nil {
+			result, errFailure := service.loginFailure(credential, input.Relogin, authError)
+			return result, errFailure, true
+		}
+		if !ready {
+			return nil, nil, false
+		}
+		result, errComplete := service.completeAPI798EmailOTP(
+			acquisitionContext, client, sentinel, input.BeginSentinelObserver, credential, input.Relogin, pendingState,
+			api798Session, readyAt, deviceID, state, pkce.CodeVerifier,
+		)
+		return result, errComplete, true
+	}
 
 	authorizeURL := service.authorizeURL(credential.Email, deviceID, state, nonce, pkce.CodeChallenge)
-	api798IssuedAt := service.options.Now()
+	api798IssuedAt := service.options.Now().Add(-api798MailClockSkew)
 	response, payload, err := client.DoFollowOnce(acquisitionContext, http.MethodGet, authorizeURL, map[string]string{
 		"accept":                    "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
 		"referer":                   redirectOrigin(service.options.RedirectURL) + "/",
@@ -270,13 +303,13 @@ func (service *Service) loginOnce(acquisitionContext context.Context, input Logi
 	if authError := classifyPermanentAccountPayload(payload); authError != nil {
 		return service.loginFailure(credential, input.Relogin, authError)
 	}
-	if loginMethod == LoginMethodAPI798 && isEmailOTPChallenge(authorizeEnvelope.PageType, authorizeEnvelope.ContinueURL) {
-		return service.completeAPI798EmailOTP(
-			acquisitionContext, client, sentinel, input.BeginSentinelObserver, credential, input.Relogin, pendingState,
-			api798Session, api798IssuedAt, deviceID, state, pkce.CodeVerifier,
-		)
+	if result, errComplete, handled := completeAPI798FromEnvelope(authorizeEnvelope, authorizeRequestURL, api798IssuedAt); handled {
+		return result, errComplete
 	}
 	if authError := classifyPageType(authorizeEnvelope.PageType); authError != nil && !isMFAChallenge(authorizeEnvelope.PageType, authorizeEnvelope.ContinueURL) {
+		if loginMethod == LoginMethodAPI798 && authError.Code == "passkey_required" {
+			authError = api798AuthError("api798_email_otp_unavailable", response.StatusCode, false, true, "authorize", nil)
+		}
 		return service.loginFailure(credential, input.Relogin, authError)
 	}
 	if authorizeRequestURL != "" {
@@ -349,14 +382,14 @@ func (service *Service) loginOnce(acquisitionContext context.Context, input Logi
 			return service.finishLogin(acquisitionContext, client, credential, input.Relogin, code, pkce.CodeVerifier)
 		}
 		authorizeEnvelope = parseAuthorizationEnvelope(response, payload)
-		if loginMethod == LoginMethodAPI798 && isEmailOTPChallenge(authorizeEnvelope.PageType, authorizeEnvelope.ContinueURL) {
-			return service.completeAPI798EmailOTP(
-				acquisitionContext, client, sentinel, input.BeginSentinelObserver, credential, input.Relogin, pendingState,
-				api798Session, api798IssuedAt, deviceID, state, pkce.CodeVerifier,
-			)
+		if result, errComplete, handled := completeAPI798FromEnvelope(authorizeEnvelope, responseRequestURL(response), api798IssuedAt); handled {
+			return result, errComplete
 		}
 		if !isMFAChallenge(authorizeEnvelope.PageType, authorizeEnvelope.ContinueURL) {
 			if authError := classifyPageType(authorizeEnvelope.PageType); authError != nil {
+				if loginMethod == LoginMethodAPI798 && authError.Code == "passkey_required" {
+					authError = api798AuthError("api798_email_otp_unavailable", response.StatusCode, false, true, "authorize", nil)
+				}
 				return service.loginFailure(credential, input.Relogin, authError)
 			}
 			if authorizeEnvelope.ContinueURL != "" {
@@ -376,13 +409,13 @@ func (service *Service) loginOnce(acquisitionContext context.Context, input Logi
 					return service.loginFailure(credential, input.Relogin, authError)
 				}
 				authorizeEnvelope = parseAuthorizationEnvelope(response, followPayload)
-				if loginMethod == LoginMethodAPI798 && isEmailOTPChallenge(authorizeEnvelope.PageType, authorizeEnvelope.ContinueURL) {
-					return service.completeAPI798EmailOTP(
-						acquisitionContext, client, sentinel, input.BeginSentinelObserver, credential, input.Relogin, pendingState,
-						api798Session, api798IssuedAt, deviceID, state, pkce.CodeVerifier,
-					)
+				if result, errComplete, handled := completeAPI798FromEnvelope(authorizeEnvelope, responseRequestURL(response), api798IssuedAt); handled {
+					return result, errComplete
 				}
 				if authError := classifyPageType(authorizeEnvelope.PageType); authError != nil && !isMFAChallenge(authorizeEnvelope.PageType, authorizeEnvelope.ContinueURL) {
+					if loginMethod == LoginMethodAPI798 && authError.Code == "passkey_required" {
+						authError = api798AuthError("api798_email_otp_unavailable", response.StatusCode, false, true, "authorize", nil)
+					}
 					return service.loginFailure(credential, input.Relogin, authError)
 				}
 				if code, matched, callbackError := parseOAuthCallback(responseRequestURL(response), service.options.RedirectURL, state); matched {
@@ -395,7 +428,13 @@ func (service *Service) loginOnce(acquisitionContext context.Context, input Logi
 		}
 	}
 	if isMFAChallenge(authorizeEnvelope.PageType, authorizeEnvelope.ContinueURL) {
-		authorizeEnvelope, err = service.verifyTOTPChallenge(acquisitionContext, client, credential, deviceID, authorizeEnvelope)
+		if loginMethod == LoginMethodAPI798 {
+			authorizeEnvelope, err = service.verifyAPI798MFAEmailChallenge(
+				acquisitionContext, client, api798Session, deviceID, authorizeEnvelope, pendingState,
+			)
+		} else {
+			authorizeEnvelope, err = service.verifyTOTPChallenge(acquisitionContext, client, credential, deviceID, authorizeEnvelope)
+		}
 		if err != nil {
 			return service.loginFailure(credential, input.Relogin, ensureAuthError(err, pendingState))
 		}
@@ -1386,6 +1425,123 @@ func isMFAFactorType(value string) bool {
 	return normalizeMFAFactorType(value) != ""
 }
 
+func (service *Service) ensureAPI798EmailOTPChallenge(
+	ctx context.Context,
+	client *Client,
+	mailbox *api798MailboxSession,
+	envelope apiEnvelope,
+	referer string,
+	issuedAt time.Time,
+	pendingState LifecycleState,
+) (time.Time, bool, *AuthError) {
+	if isEmailOTPChallenge(envelope.PageType, envelope.ContinueURL) {
+		return issuedAt, true, nil
+	}
+	if !shouldStartAPI798EmailOTP(envelope.PageType, envelope.ContinueURL) {
+		return issuedAt, false, nil
+	}
+	if mailbox == nil {
+		return issuedAt, false, api798AuthError("api798_url_missing", http.StatusBadRequest, false, true, "api798_poll", nil)
+	}
+	if authError := mailbox.prepare(ctx); authError != nil {
+		return issuedAt, false, authError
+	}
+	referer = service.api798ChallengeReferer(envelope, referer)
+	headers := api798NavigationHeaders(referer)
+	issuedAt = service.options.Now().Add(-api798MailClockSkew)
+	response, payload, errRequest := client.DoFollow(
+		ctx,
+		http.MethodGet,
+		service.options.AuthBaseURL+"/api/accounts/email-otp/send",
+		headers,
+		nil,
+	)
+	if errRequest != nil {
+		authError := networkAuthError("api798_email_otp_network_error", pendingState, errRequest)
+		authError.FailureStage = "email_otp_send"
+		return issuedAt, false, authError
+	}
+	statusCode := responseStatusCode(response)
+	if authError := classifyPermanentAccountPayload(payload); authError != nil {
+		return issuedAt, false, authError
+	}
+	if authError := classifyHTTPResponse("email_otp_send", statusCode, payload, pendingState); authError != nil {
+		if statusCode >= http.StatusBadRequest && statusCode < http.StatusTooManyRequests {
+			authError = api798AuthError("api798_email_otp_unavailable", statusCode, false, true, "email_otp_send", nil)
+		}
+		return issuedAt, false, authError
+	}
+
+	response, payload, errRequest = client.DoFollow(
+		ctx,
+		http.MethodGet,
+		service.options.AuthBaseURL+"/email-verification",
+		headers,
+		nil,
+	)
+	if errRequest != nil {
+		authError := networkAuthError("api798_email_otp_network_error", pendingState, errRequest)
+		authError.FailureStage = "email_otp_page"
+		return issuedAt, false, authError
+	}
+	statusCode = responseStatusCode(response)
+	if authError := classifyPermanentAccountPayload(payload); authError != nil {
+		return issuedAt, false, authError
+	}
+	if authError := classifyHTTPResponse("email_otp_page", statusCode, payload, pendingState); authError != nil {
+		if statusCode >= http.StatusBadRequest && statusCode < http.StatusTooManyRequests {
+			authError = api798AuthError("api798_email_otp_unavailable", statusCode, false, true, "email_otp_page", nil)
+		}
+		return issuedAt, false, authError
+	}
+	return issuedAt, true, nil
+}
+
+func (service *Service) api798ChallengeReferer(envelope apiEnvelope, fallback string) string {
+	for _, candidate := range []string{envelope.ContinueURL, fallback} {
+		if strings.TrimSpace(candidate) == "" {
+			continue
+		}
+		candidate = resolveURL(service.options.AuthBaseURL, candidate)
+		if validateOAuthContinuationOrigin(candidate, service.options.AuthBaseURL) != nil {
+			continue
+		}
+		return candidate
+	}
+	return service.options.AuthBaseURL + "/log-in"
+}
+
+func shouldStartAPI798EmailOTP(pageType, continueURL string) bool {
+	if isPasswordChallenge(pageType, continueURL) {
+		return true
+	}
+	normalizedPage := normalizeCode(pageType)
+	normalizedURL := strings.ToLower(strings.TrimSpace(continueURL))
+	return strings.Contains(normalizedPage, "passkey") || strings.Contains(normalizedPage, "webauthn") ||
+		strings.Contains(normalizedURL, "/passkey") || strings.Contains(normalizedURL, "/webauthn")
+}
+
+func api798NavigationHeaders(referer string) map[string]string {
+	return map[string]string{
+		"accept":                    "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+		"cache-control":             "no-cache",
+		"pragma":                    "no-cache",
+		"referer":                   strings.TrimSpace(referer),
+		"sec-fetch-dest":            "document",
+		"sec-fetch-mode":            "navigate",
+		"sec-fetch-site":            "same-origin",
+		"sec-fetch-user":            "?1",
+		"upgrade-insecure-requests": "1",
+	}
+}
+
+func responseStatusCode(response *fhttp.Response) int {
+	if response == nil {
+		return 0
+	}
+	return response.StatusCode
+}
+
 func (service *Service) completeAPI798EmailOTP(
 	ctx context.Context,
 	client *Client,
@@ -1399,6 +1555,27 @@ func (service *Service) completeAPI798EmailOTP(
 	deviceID string,
 	expectedState string,
 	codeVerifier string,
+) (*Credential, error) {
+	return service.completeAPI798EmailOTPAttempt(
+		ctx, client, sentinel, beginObserver, credential, relogin, pendingState,
+		mailbox, issuedAt, deviceID, expectedState, codeVerifier, DefaultAPI798OTPAttempts,
+	)
+}
+
+func (service *Service) completeAPI798EmailOTPAttempt(
+	ctx context.Context,
+	client *Client,
+	sentinel *Sentinel,
+	beginObserver SentinelObserverStarter,
+	credential *Credential,
+	relogin bool,
+	pendingState LifecycleState,
+	mailbox *api798MailboxSession,
+	issuedAt time.Time,
+	deviceID string,
+	expectedState string,
+	codeVerifier string,
+	attemptsRemaining int,
 ) (*Credential, error) {
 	if mailbox == nil {
 		return service.loginFailure(credential, relogin, api798AuthError("api798_url_missing", http.StatusBadRequest, false, true, "api798_poll", nil))
@@ -1440,13 +1617,27 @@ func (service *Service) completeAPI798EmailOTP(
 	if authError := classifyPermanentAccountPayload(payload); authError != nil {
 		return service.loginFailure(credential, relogin, authError)
 	}
-	if response != nil && response.StatusCode == http.StatusBadRequest {
-		authError := api798AuthError("api798_email_otp_rejected", response.StatusCode, false, true, "email_otp_validate", nil)
-		return service.loginFailure(credential, relogin, authError)
-	}
 	statusCode := 0
 	if response != nil {
 		statusCode = response.StatusCode
+	}
+	envelope := parseAuthorizationEnvelope(response, payload)
+	if isRejectedAPI798EmailOTP(statusCode, payload, envelope) {
+		if attemptsRemaining > 1 {
+			if authError = mailbox.prepare(ctx); authError != nil {
+				return service.loginFailure(credential, relogin, authError)
+			}
+			resentAt := service.options.Now().Add(-api798MailClockSkew)
+			if authError = service.resendAPI798EmailOTP(ctx, client, deviceID, pendingState); authError != nil {
+				return service.loginFailure(credential, relogin, authError)
+			}
+			return service.completeAPI798EmailOTPAttempt(
+				ctx, client, sentinel, beginObserver, credential, relogin, pendingState,
+				mailbox, resentAt, deviceID, expectedState, codeVerifier, attemptsRemaining-1,
+			)
+		}
+		authError := api798AuthError("api798_email_otp_rejected", statusCode, true, false, "email_otp_validate", nil)
+		return service.loginFailure(credential, relogin, authError)
 	}
 	if authError := classifyHTTPResponse("email_otp_validate", statusCode, payload, pendingState); authError != nil {
 		authError.FailureStage = "email_otp_validate"
@@ -1458,8 +1649,7 @@ func (service *Service) completeAPI798EmailOTP(
 		}
 		return service.finishLogin(ctx, client, credential, relogin, code, codeVerifier)
 	}
-	envelope := parseAuthorizationEnvelope(response, payload)
-	if envelope.ContinueURL == "" || isEmailOTPChallenge(envelope.PageType, envelope.ContinueURL) {
+	if envelope.ContinueURL == "" {
 		authError := api798AuthError("api798_email_otp_rejected", statusCode, false, true, "email_otp_validate", nil)
 		return service.loginFailure(credential, relogin, authError)
 	}
@@ -1468,6 +1658,252 @@ func (service *Service) completeAPI798EmailOTP(
 		return service.loginFailure(credential, relogin, ensureAuthError(errFollow, pendingState))
 	}
 	return service.finishLogin(ctx, client, credential, relogin, code, codeVerifier)
+}
+
+func (service *Service) resendAPI798EmailOTP(ctx context.Context, client *Client, deviceID string, pendingState LifecycleState) *AuthError {
+	response, payload, errRequest := client.DoJSONOnce(
+		ctx,
+		false,
+		http.MethodPost,
+		service.options.AuthBaseURL+"/api/accounts/email-otp/resend",
+		service.apiHeaders(deviceID, service.options.AuthBaseURL+"/email-verification", ""),
+		map[string]any{},
+	)
+	if errRequest != nil {
+		authError := networkAuthError("api798_email_otp_network_error", pendingState, errRequest)
+		authError.FailureStage = "email_otp_resend"
+		return authError
+	}
+	statusCode := 0
+	if response != nil {
+		statusCode = response.StatusCode
+	}
+	if authError := classifyHTTPResponse("email_otp_resend", statusCode, payload, pendingState); authError != nil {
+		authError.FailureStage = "email_otp_resend"
+		return authError
+	}
+	return nil
+}
+
+func isRejectedAPI798EmailOTP(statusCode int, payload []byte, envelope apiEnvelope) bool {
+	if isAPI798OTPChallengeResponse(statusCode) && isEmailOTPChallenge(envelope.PageType, envelope.ContinueURL) {
+		return true
+	}
+	return isRejectedAPI798OTPStatus(statusCode, payload)
+}
+
+func (service *Service) verifyAPI798MFAEmailChallenge(
+	ctx context.Context,
+	client *Client,
+	mailbox *api798MailboxSession,
+	deviceID string,
+	challenge apiEnvelope,
+	pendingState LifecycleState,
+) (apiEnvelope, error) {
+	if mailbox == nil {
+		return apiEnvelope{}, api798AuthError("api798_url_missing", http.StatusBadRequest, false, true, "api798_poll", nil)
+	}
+	factorID, requestID := selectMFAFactor(challenge.Payload, "email")
+	if factorID == "" {
+		factorID = "email-otp"
+		requestID = mfaRequestID(challenge.Payload)
+	}
+	for attempt := 1; attempt <= DefaultAPI798OTPAttempts; attempt++ {
+		if authError := mailbox.prepare(ctx); authError != nil {
+			return apiEnvelope{}, authError
+		}
+		issuedAt := service.options.Now().Add(-api798MailClockSkew)
+		if authError := service.issueAPI798MFAEmailChallenge(
+			ctx, client, deviceID, challenge, factorID, requestID, attempt > 1, pendingState,
+		); authError != nil {
+			return apiEnvelope{}, authError
+		}
+		verificationCode, authError := mailbox.waitForCode(ctx, issuedAt)
+		if authError != nil {
+			return apiEnvelope{}, authError
+		}
+		verified, rejected, authError := service.verifyAPI798MFAEmailCode(
+			ctx, client, deviceID, challenge, factorID, requestID, verificationCode, pendingState,
+		)
+		if authError != nil {
+			return apiEnvelope{}, authError
+		}
+		if !rejected {
+			return verified, nil
+		}
+	}
+	return apiEnvelope{}, api798AuthError("api798_email_otp_rejected", http.StatusBadRequest, true, false, "mfa_email_otp_verify", nil)
+}
+
+func (service *Service) issueAPI798MFAEmailChallenge(
+	ctx context.Context,
+	client *Client,
+	deviceID string,
+	challenge apiEnvelope,
+	factorID string,
+	requestID string,
+	forceFresh bool,
+	pendingState LifecycleState,
+) *AuthError {
+	body := map[string]any{
+		"id":                    factorID,
+		"type":                  "email",
+		"force_fresh_challenge": forceFresh,
+	}
+	if requestID != "" {
+		body["mfa_request_id"] = requestID
+	}
+	referer := resolveURL(service.options.AuthBaseURL, challenge.ContinueURL)
+	response, payload, errRequest := client.DoJSONOnce(
+		ctx,
+		false,
+		http.MethodPost,
+		service.options.AuthBaseURL+"/api/accounts/mfa/issue_challenge",
+		service.mfaHeaders(deviceID, referer),
+		body,
+	)
+	if errRequest != nil {
+		authError := networkAuthError("api798_email_otp_network_error", pendingState, errRequest)
+		authError.FailureStage = "mfa_email_otp_issue"
+		return authError
+	}
+	statusCode := 0
+	if response != nil {
+		statusCode = response.StatusCode
+	}
+	if authError := classifyHTTPResponse("mfa_email_otp_issue", statusCode, payload, pendingState); authError != nil {
+		authError.FailureStage = "mfa_email_otp_issue"
+		return authError
+	}
+	return nil
+}
+
+func (service *Service) verifyAPI798MFAEmailCode(
+	ctx context.Context,
+	client *Client,
+	deviceID string,
+	challenge apiEnvelope,
+	factorID string,
+	requestID string,
+	verificationCode string,
+	pendingState LifecycleState,
+) (apiEnvelope, bool, *AuthError) {
+	body := map[string]any{"id": factorID, "type": "email", "code": verificationCode}
+	if requestID != "" {
+		body["mfa_request_id"] = requestID
+	}
+	referer := resolveURL(service.options.AuthBaseURL, challenge.ContinueURL)
+	if strings.TrimSpace(challenge.ContinueURL) == "" {
+		referer = service.options.AuthBaseURL + "/mfa-challenge/" + url.PathEscape(factorID)
+	}
+	targetURL := service.options.AuthBaseURL + "/api/accounts/mfa/verify"
+	var response *fhttp.Response
+	var payload []byte
+	for redirects := 0; ; redirects++ {
+		var errRequest error
+		response, payload, errRequest = client.DoJSONOnce(
+			ctx,
+			false,
+			http.MethodPost,
+			targetURL,
+			service.mfaHeaders(deviceID, referer),
+			body,
+		)
+		if errRequest != nil {
+			authError := networkAuthError("api798_email_otp_network_error", pendingState, errRequest)
+			authError.FailureStage = "mfa_email_otp_verify"
+			return apiEnvelope{}, false, authError
+		}
+		if response == nil || !isChatGPTWebRedirectStatus(response.StatusCode) {
+			break
+		}
+		location := strings.TrimSpace(response.Header.Get("Location"))
+		if location == "" {
+			break
+		}
+		nextURL := resolveURL(targetURL, location)
+		if response.StatusCode != http.StatusTemporaryRedirect && response.StatusCode != http.StatusPermanentRedirect {
+			return apiEnvelope{ContinueURL: nextURL}, false, nil
+		}
+		if authError := validateOAuthContinuationOrigin(nextURL, service.options.AuthBaseURL); authError != nil {
+			return apiEnvelope{}, false, authError
+		}
+		if redirects >= 9 {
+			authError := newAuthError("oauth_redirect_limit", pendingState, response.StatusCode, true, false, "MFA redirect limit exceeded", nil)
+			authError.FailureStage = "mfa_email_otp_verify"
+			return apiEnvelope{}, false, authError
+		}
+		referer = targetURL
+		targetURL = nextURL
+	}
+	statusCode := 0
+	if response != nil {
+		statusCode = response.StatusCode
+	}
+	if authError := classifyPermanentAccountPayload(payload); authError != nil {
+		return apiEnvelope{}, false, authError
+	}
+	verified := parseAuthorizationEnvelope(response, payload)
+	if isRejectedAPI798MFAEmailOTP(statusCode, payload, verified) {
+		return apiEnvelope{}, true, nil
+	}
+	if authError := classifyHTTPResponse("mfa_email_otp_verify", statusCode, payload, pendingState); authError != nil {
+		authError.FailureStage = "mfa_email_otp_verify"
+		return apiEnvelope{}, false, authError
+	}
+	if authError := classifyPageType(verified.PageType); authError != nil {
+		if authError.Code == "passkey_required" {
+			authError = api798AuthError("api798_email_otp_unavailable", statusCode, false, true, "mfa_email_otp_verify", nil)
+		}
+		return apiEnvelope{}, false, authError
+	}
+	return verified, false, nil
+}
+
+func isRejectedAPI798MFAEmailOTP(statusCode int, payload []byte, envelope apiEnvelope) bool {
+	if isAPI798OTPChallengeResponse(statusCode) && isMFAChallenge(envelope.PageType, envelope.ContinueURL) {
+		return true
+	}
+	return isRejectedAPI798OTPStatus(statusCode, payload)
+}
+
+func isAPI798OTPChallengeResponse(statusCode int) bool {
+	return statusCode >= http.StatusOK && statusCode < http.StatusMultipleChoices ||
+		statusCode == http.StatusBadRequest || statusCode == http.StatusUnauthorized
+}
+
+func isRejectedAPI798OTPStatus(statusCode int, payload []byte) bool {
+	if statusCode != http.StatusBadRequest && statusCode != http.StatusUnauthorized {
+		return false
+	}
+	normalizedPayload := strings.ToLower(string(payload))
+	return statusCode == http.StatusUnauthorized ||
+		strings.Contains(normalizedPayload, "wrong_email_otp_code") ||
+		strings.Contains(normalizedPayload, "wrong code") ||
+		strings.Contains(normalizedPayload, "invalid code") ||
+		strings.Contains(normalizedPayload, "invalid_otp") ||
+		strings.Contains(normalizedPayload, "otp_invalid") ||
+		strings.Contains(normalizedPayload, "expired_otp") ||
+		strings.Contains(normalizedPayload, "otp_expired") ||
+		strings.Contains(normalizedPayload, "verification_code_invalid")
+}
+
+func mfaRequestID(payload map[string]any) string {
+	if payload == nil {
+		return ""
+	}
+	requestID := firstNonEmptyString(stringValue(payload["mfa_request_id"]), stringValue(payload["mfaRequestId"]))
+	if requestID != "" {
+		return requestID
+	}
+	for _, key := range []string{"oai-client-auth-session", "client_auth_session", "auth_session"} {
+		if session, ok := payload[key].(map[string]any); ok {
+			if requestID = mfaRequestID(session); requestID != "" {
+				return requestID
+			}
+		}
+	}
+	return ""
 }
 
 func isEmailOTPChallenge(pageType, continueURL string) bool {
@@ -1634,7 +2070,8 @@ func normalizeMFAFactorType(value string) string {
 func isPasswordChallenge(pageType, continueURL string) bool {
 	normalizedPage := normalizeCode(pageType)
 	normalizedURL := strings.ToLower(strings.TrimSpace(continueURL))
-	return normalizedPage == "login_password" || strings.Contains(normalizedURL, "/log-in/password")
+	return normalizedPage == "password" || normalizedPage == "login_password" ||
+		strings.Contains(normalizedURL, "/log-in/password") || strings.Contains(normalizedURL, "/password-page")
 }
 
 func selectMFAFactor(payload map[string]any, factorType string) (string, string) {
