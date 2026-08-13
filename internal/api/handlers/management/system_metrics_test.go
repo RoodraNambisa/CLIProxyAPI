@@ -61,4 +61,7 @@ func TestGetSystemMetricsReturnsRuntimeAndConfiguredFilesystems(t *testing.T) {
 	if response.UsageBatch.QueueCapacity < 1 {
 		t.Fatalf("UsageBatch = %#v, want bounded production queue", response.UsageBatch)
 	}
+	if response.ImageProcessing.CapacityBytes < 1 {
+		t.Fatalf("ImageProcessing = %#v, want bounded production admission", response.ImageProcessing)
+	}
 }

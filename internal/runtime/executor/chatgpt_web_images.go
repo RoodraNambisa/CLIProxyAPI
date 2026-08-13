@@ -716,7 +716,8 @@ func (e *ChatGPTWebExecutor) finishChatGPTWebImage(ctx context.Context, client *
 	if normalizeChatGPTWebImageOutputFormat(imageRequest.OutputFormat) == "png" && outputCompression == 0 {
 		outputCompression = 100
 	}
-	outputImages, err := prepareChatGPTWebImageOutputsWithConfigAndCompression(
+	outputImages, err := prepareChatGPTWebImageOutputsWithContextAndCompression(
+		ctx,
 		imageRequest.OutputFormat,
 		outputCompression,
 		imageRequest.Model,
@@ -771,6 +772,27 @@ func prepareChatGPTWebImageOutputsWithConfig(
 }
 
 func prepareChatGPTWebImageOutputsWithConfigAndCompression(
+	requestedFormat string,
+	outputCompression int,
+	model, quality string,
+	images [][]byte,
+	imageSizeMatch *helps.ChatGPTWebImageSizeMatch,
+	imageConfig cliproxyexecutor.ChatGPTWebImageConfigSnapshot,
+) ([]helps.ChatGPTWebUsageImage, error) {
+	return prepareChatGPTWebImageOutputsWithContextAndCompression(
+		context.Background(),
+		requestedFormat,
+		outputCompression,
+		model,
+		quality,
+		images,
+		imageSizeMatch,
+		imageConfig,
+	)
+}
+
+func prepareChatGPTWebImageOutputsWithContextAndCompression(
+	ctx context.Context,
 	requestedFormat string,
 	outputCompression int,
 	model, quality string,
@@ -846,30 +868,18 @@ func prepareChatGPTWebImageOutputsWithConfigAndCompression(
 			continue
 		}
 
-		decoded, _, errDecode := decodeAndValidateChatGPTWebOutputImage(imageData, "image/"+originalFormat)
-		if errDecode != nil {
-			return nil, fmt.Errorf("decode chatgpt web %s image for post-processing: %w", originalFormat, errDecode)
-		}
-		processed := image.Image(decoded)
-		if needsResize {
-			crop := chatGPTWebImageCenterCrop(decoded.Bounds(), imageSizeMatch.Width, imageSizeMatch.Height)
-			if crop.Empty() {
-				return nil, errors.New("computed chatgpt web image crop is empty")
-			}
-			destination := image.NewRGBA(image.Rect(0, 0, imageSizeMatch.Width, imageSizeMatch.Height))
-			scaler := xdraw.Scaler(xdraw.CatmullRom)
-			if strings.EqualFold(strings.TrimSpace(imageConfig.ResizeFilter), config.ChatGPTWebResizeFilterApproxBiLinear) {
-				scaler = xdraw.ApproxBiLinear
-			}
-			scaler.Scale(destination, destination.Bounds(), decoded, crop, xdraw.Src, nil)
-			processed = destination
-		}
-
-		encoded, errEncode := encodeChatGPTWebOutputImage(
-			processed,
+		encoded, processedWidth, processedHeight, errEncode := processChatGPTWebOutputImage(
+			ctx,
+			imageData,
+			originalFormat,
 			requestedFormat,
 			outputCompression,
 			responseByteLimit-candidateTotalBytes,
+			originalOutputs[index].Width,
+			originalOutputs[index].Height,
+			needsResize,
+			imageSizeMatch,
+			imageConfig,
 		)
 		if errors.Is(errEncode, errChatGPTWebImageResponseBudgetExceeded) {
 			if imageConfig.StrictSize {
@@ -889,7 +899,7 @@ func prepareChatGPTWebImageOutputsWithConfigAndCompression(
 		candidates[index] = encoded
 		candidateTotalBytes += len(encoded)
 		candidateOutputs = append(candidateOutputs, helps.ChatGPTWebUsageImage{
-			Model: model, Use: "image_generation_output", Width: processed.Bounds().Dx(), Height: processed.Bounds().Dy(), Quality: quality,
+			Model: model, Use: "image_generation_output", Width: processedWidth, Height: processedHeight, Quality: quality,
 		})
 		changed = true
 	}
@@ -897,6 +907,127 @@ func prepareChatGPTWebImageOutputsWithConfigAndCompression(
 		copy(images, candidates)
 	}
 	return candidateOutputs, nil
+}
+
+func processChatGPTWebOutputImage(
+	ctx context.Context,
+	imageData []byte,
+	originalFormat string,
+	requestedFormat string,
+	outputCompression int,
+	maxBytes int,
+	sourceWidth int,
+	sourceHeight int,
+	needsResize bool,
+	imageSizeMatch *helps.ChatGPTWebImageSizeMatch,
+	imageConfig cliproxyexecutor.ChatGPTWebImageConfigSnapshot,
+) ([]byte, int, int, error) {
+	targetWidth, targetHeight := sourceWidth, sourceHeight
+	if needsResize && imageSizeMatch != nil {
+		targetWidth, targetHeight = imageSizeMatch.Width, imageSizeMatch.Height
+	}
+	estimatedBytes := estimateChatGPTWebImagePostProcessingBytes(
+		sourceWidth,
+		sourceHeight,
+		targetWidth,
+		targetHeight,
+		needsResize,
+		requestedFormat,
+	)
+	releaseMemory, errAcquire := helps.AcquireChatGPTWebImageMemory(ctx, estimatedBytes)
+	if errAcquire != nil {
+		return nil, 0, 0, fmt.Errorf("wait for chatgpt web image post-processing memory: %w", errAcquire)
+	}
+	defer releaseMemory()
+
+	decoded, _, errDecode := decodeAndValidateChatGPTWebOutputImage(imageData, "image/"+originalFormat)
+	if errDecode != nil {
+		return nil, 0, 0, fmt.Errorf("decode chatgpt web %s image for post-processing: %w", originalFormat, errDecode)
+	}
+	processed := image.Image(decoded)
+	if needsResize {
+		crop := chatGPTWebImageCenterCrop(decoded.Bounds(), targetWidth, targetHeight)
+		if crop.Empty() {
+			return nil, 0, 0, errors.New("computed chatgpt web image crop is empty")
+		}
+		destination := image.NewRGBA(image.Rect(0, 0, targetWidth, targetHeight))
+		scaler := xdraw.Scaler(xdraw.CatmullRom)
+		if strings.EqualFold(strings.TrimSpace(imageConfig.ResizeFilter), config.ChatGPTWebResizeFilterApproxBiLinear) {
+			scaler = xdraw.ApproxBiLinear
+		}
+		scaler.Scale(destination, destination.Bounds(), decoded, crop, xdraw.Src, nil)
+		processed = destination
+	}
+
+	encoded, errEncode := encodeChatGPTWebOutputImage(
+		processed,
+		requestedFormat,
+		outputCompression,
+		maxBytes,
+	)
+	return encoded, processed.Bounds().Dx(), processed.Bounds().Dy(), errEncode
+}
+
+func estimateChatGPTWebImagePostProcessingBytes(
+	sourceWidth int,
+	sourceHeight int,
+	targetWidth int,
+	targetHeight int,
+	needsResize bool,
+	requestedFormat string,
+) int64 {
+	sourcePixels := saturatingChatGPTWebImagePixels(sourceWidth, sourceHeight)
+	targetPixels := sourcePixels
+	if needsResize {
+		targetPixels = saturatingChatGPTWebImagePixels(targetWidth, targetHeight)
+	}
+	estimatedBytes := saturatingChatGPTWebImageMultiply(sourcePixels, chatGPTWebDecodedImageBytesPerPixel)
+	if needsResize {
+		estimatedBytes = saturatingChatGPTWebImageAdd(
+			estimatedBytes,
+			saturatingChatGPTWebImageMultiply(targetPixels, 4),
+		)
+	}
+	if requestedFormat == "jpeg" || requestedFormat == "webp" {
+		estimatedBytes = saturatingChatGPTWebImageAdd(
+			estimatedBytes,
+			saturatingChatGPTWebImageMultiply(targetPixels, 4),
+		)
+	}
+	// Reserve a conservative encoded-output allowance. The bounded encoder may
+	// stop earlier, but keeping this memory in the admission estimate prevents
+	// several large output buffers from growing concurrently without accounting.
+	estimatedBytes = saturatingChatGPTWebImageAdd(
+		estimatedBytes,
+		saturatingChatGPTWebImageMultiply(targetPixels, 4),
+	)
+	return max(estimatedBytes, int64(1))
+}
+
+func saturatingChatGPTWebImagePixels(width, height int) int64 {
+	if width <= 0 || height <= 0 || int64(width) > int64(^uint64(0)>>1)/int64(height) {
+		return int64(^uint64(0) >> 1)
+	}
+	return int64(width) * int64(height)
+}
+
+func saturatingChatGPTWebImageMultiply(value int64, factor int) int64 {
+	maxInt64 := int64(^uint64(0) >> 1)
+	if value <= 0 || factor <= 0 {
+		return 0
+	}
+	if value > maxInt64/int64(factor) {
+		return maxInt64
+	}
+	return value * int64(factor)
+}
+
+func saturatingChatGPTWebImageAdd(left, right int64) int64 {
+	maxInt64 := int64(^uint64(0) >> 1)
+	if left >= maxInt64-right {
+		return maxInt64
+	}
+	return left + right
 }
 
 var errChatGPTWebImageResponseBudgetExceeded = errors.New("chatgpt web image response budget exceeded")

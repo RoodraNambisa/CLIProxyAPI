@@ -2,6 +2,7 @@ package executor
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"image"
 	"image/color"
@@ -46,6 +47,80 @@ func TestPrepareChatGPTWebImageOutputsResizesMatchedResult(t *testing.T) {
 				t.Fatalf("alpha = %d, want preserved transparency", got)
 			}
 		})
+	}
+}
+
+func TestEstimateChatGPTWebImagePostProcessingBytes(t *testing.T) {
+	tests := []struct {
+		name            string
+		sourceWidth     int
+		sourceHeight    int
+		targetWidth     int
+		targetHeight    int
+		needsResize     bool
+		requestedFormat string
+		wantBytes       int64
+	}{
+		{name: "PNG conversion", sourceWidth: 100, sourceHeight: 50, requestedFormat: "png", wantBytes: 60_000},
+		{name: "JPEG conversion", sourceWidth: 100, sourceHeight: 50, requestedFormat: "jpeg", wantBytes: 80_000},
+		{name: "resize PNG", sourceWidth: 100, sourceHeight: 50, targetWidth: 200, targetHeight: 100, needsResize: true, requestedFormat: "png", wantBytes: 200_000},
+		{name: "resize WebP", sourceWidth: 100, sourceHeight: 50, targetWidth: 200, targetHeight: 100, needsResize: true, requestedFormat: "webp", wantBytes: 280_000},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			gotBytes := estimateChatGPTWebImagePostProcessingBytes(
+				test.sourceWidth,
+				test.sourceHeight,
+				test.targetWidth,
+				test.targetHeight,
+				test.needsResize,
+				test.requestedFormat,
+			)
+			if gotBytes != test.wantBytes {
+				t.Fatalf("estimate = %d, want %d", gotBytes, test.wantBytes)
+			}
+		})
+	}
+}
+
+func TestPrepareChatGPTWebImageOutputsOnlyWaitsForActualPostProcessing(t *testing.T) {
+	original := chatGPTWebResizeTestPNG(t, 16, 16, false)
+	canceledContext, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	passthrough := [][]byte{append([]byte(nil), original...)}
+	if _, errPrepare := prepareChatGPTWebImageOutputsWithContextAndCompression(
+		canceledContext,
+		"png",
+		100,
+		"gpt-image-2",
+		"auto",
+		passthrough,
+		nil,
+		cliproxyexecutor.ChatGPTWebImageConfigSnapshot{MaxImageResponseBytes: 1 << 20},
+	); errPrepare != nil {
+		t.Fatalf("passthrough with canceled context error = %v", errPrepare)
+	}
+	if !bytes.Equal(passthrough[0], original) {
+		t.Fatal("passthrough image was modified")
+	}
+
+	converted := [][]byte{append([]byte(nil), original...)}
+	_, errPrepare := prepareChatGPTWebImageOutputsWithContextAndCompression(
+		canceledContext,
+		"jpeg",
+		90,
+		"gpt-image-2",
+		"auto",
+		converted,
+		nil,
+		cliproxyexecutor.ChatGPTWebImageConfigSnapshot{MaxImageResponseBytes: 1 << 20},
+	)
+	if !errors.Is(errPrepare, context.Canceled) {
+		t.Fatalf("conversion with canceled context error = %v, want context canceled", errPrepare)
+	}
+	if !bytes.Equal(converted[0], original) {
+		t.Fatal("canceled conversion modified the original image")
 	}
 }
 
