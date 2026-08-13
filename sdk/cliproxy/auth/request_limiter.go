@@ -7,15 +7,18 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	internalconfig "github.com/router-for-me/CLIProxyAPI/v6/internal/config"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 )
 
 type authRequestLimitPolicy struct {
 	limit         int
 	windowMinutes int
 	generation    uint64
+	requestSlot   *cliproxyexecutor.AuthRequestSlot
 }
 
 func normalizeAuthRequestLimitPolicy(policy authRequestLimitPolicy) authRequestLimitPolicy {
@@ -128,13 +131,74 @@ type authRequestWindowCount struct {
 	windowMinutes int
 	limit         int
 	count         int
+	version       uint64
 }
 
 type authRequestWindowLimiter struct {
-	mu         sync.Mutex
-	now        func() time.Time
-	generation uint64
-	counts     map[string]authRequestWindowCount
+	mu          sync.Mutex
+	now         func() time.Time
+	generation  uint64
+	nextVersion uint64
+	counts      map[string]authRequestWindowCount
+}
+
+const (
+	authRequestReservationReserved uint32 = iota
+	authRequestReservationCommitted
+	authRequestReservationReleased
+)
+
+type authRequestReservation struct {
+	limiter       *authRequestWindowLimiter
+	authID        string
+	generation    uint64
+	window        int64
+	windowMinutes int
+	limit         int
+	entryVersion  uint64
+	noOp          bool
+	state         atomic.Uint32
+}
+
+func (r *authRequestReservation) Commit() bool {
+	return r != nil && r.state.CompareAndSwap(authRequestReservationReserved, authRequestReservationCommitted)
+}
+
+func (r *authRequestReservation) Release() bool {
+	if r == nil || !r.state.CompareAndSwap(authRequestReservationReserved, authRequestReservationReleased) {
+		return false
+	}
+	if r.noOp || r.limiter == nil || r.authID == "" {
+		return true
+	}
+	r.limiter.mu.Lock()
+	defer r.limiter.mu.Unlock()
+	if r.limiter.generation != r.generation {
+		return true
+	}
+	entry, ok := r.limiter.counts[r.authID]
+	if !ok || entry.window != r.window || entry.windowMinutes != r.windowMinutes || entry.limit != r.limit || entry.version != r.entryVersion {
+		return true
+	}
+	if entry.count <= 1 {
+		delete(r.limiter.counts, r.authID)
+		return true
+	}
+	entry.count--
+	r.limiter.counts[r.authID] = entry
+	return true
+}
+
+func (r *authRequestReservation) Reserved() bool {
+	return r != nil && r.state.Load() == authRequestReservationReserved
+}
+
+func (r *authRequestReservation) Committed() bool {
+	return r != nil && r.state.Load() == authRequestReservationCommitted
+}
+
+func (r *authRequestReservation) Consumed() bool {
+	return r != nil && !r.noOp
 }
 
 func newAuthRequestWindowLimiter() *authRequestWindowLimiter {
@@ -214,9 +278,22 @@ func (l *authRequestWindowLimiter) availableAt(authID string, policy authRequest
 }
 
 func (l *authRequestWindowLimiter) tryAcquireAt(authID string, policy authRequestLimitPolicy, now time.Time) (bool, authRequestLimitBlock) {
+	reservation, acquired, block := l.reserveAt(authID, policy, now)
+	if !acquired {
+		return false, block
+	}
+	if policy.requestSlot != nil {
+		policy.requestSlot.Bind(reservation)
+		return true, authRequestLimitBlock{}
+	}
+	reservation.Commit()
+	return true, authRequestLimitBlock{}
+}
+
+func (l *authRequestWindowLimiter) reserveAt(authID string, policy authRequestLimitPolicy, now time.Time) (*authRequestReservation, bool, authRequestLimitBlock) {
 	policy = normalizeAuthRequestLimitPolicy(policy)
 	if l == nil || authID == "" {
-		return true, authRequestLimitBlock{}
+		return &authRequestReservation{authID: authID, noOp: true}, true, authRequestLimitBlock{}
 	}
 	var window int64
 	var resetAt time.Time
@@ -226,29 +303,41 @@ func (l *authRequestWindowLimiter) tryAcquireAt(authID string, policy authReques
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if policy.generation != 0 && policy.generation != l.generation {
-		return false, authRequestLimitBlock{stalePolicy: true}
+		return nil, false, authRequestLimitBlock{stalePolicy: true}
 	}
 	if policy.limit == 0 {
-		return true, authRequestLimitBlock{}
+		return &authRequestReservation{limiter: l, authID: authID, generation: l.generation, windowMinutes: policy.windowMinutes, noOp: true}, true, authRequestLimitBlock{}
 	}
 	if l.counts == nil {
 		l.counts = make(map[string]authRequestWindowCount)
 	}
 	entry := l.counts[authID]
 	if entry.window != window || entry.windowMinutes != policy.windowMinutes || entry.limit != policy.limit {
-		entry = authRequestWindowCount{window: window, windowMinutes: policy.windowMinutes, limit: policy.limit}
+		l.nextVersion++
+		entry = authRequestWindowCount{window: window, windowMinutes: policy.windowMinutes, limit: policy.limit, version: l.nextVersion}
 	}
 	if entry.count >= policy.limit {
-		return false, newAuthRequestLimitBlock(policy, resetAt.Sub(now))
+		return nil, false, newAuthRequestLimitBlock(policy, resetAt.Sub(now))
 	}
 	entry.count++
 	l.counts[authID] = entry
-	return true, authRequestLimitBlock{}
+	return &authRequestReservation{
+		limiter:       l,
+		authID:        authID,
+		generation:    l.generation,
+		window:        window,
+		windowMinutes: policy.windowMinutes,
+		limit:         policy.limit,
+		entryVersion:  entry.version,
+	}, true, authRequestLimitBlock{}
 }
 
-func (m *Manager) acquireAdditionalAuthRequest(auth *Auth) error {
+func (m *Manager) acquireAdditionalAuthRequest(auth *Auth, requestSlot *cliproxyexecutor.AuthRequestSlot) error {
 	if m == nil || auth == nil {
 		return nil
+	}
+	if requestSlot != nil {
+		requestSlot.Release()
 	}
 	limiter := m.authRequestLimiter()
 	if limiter == nil {
@@ -256,14 +345,25 @@ func (m *Manager) acquireAdditionalAuthRequest(auth *Auth) error {
 	}
 	for {
 		policy := m.routingAuthRequestLimitPolicyForAuth(auth)
+		policy.requestSlot = requestSlot
 		acquired, block := limiter.tryAcquireAt(auth.ID, policy, limiter.nowTime())
 		if acquired {
+			commitImmediateAuthRequestReservation(auth, requestSlot)
 			return nil
 		}
 		if block.stalePolicy {
 			continue
 		}
 		return newAuthRequestLimitedError(block)
+	}
+}
+
+func commitImmediateAuthRequestReservation(auth *Auth, requestSlot *cliproxyexecutor.AuthRequestSlot) {
+	if auth == nil || requestSlot == nil {
+		return
+	}
+	if !strings.EqualFold(strings.TrimSpace(auth.Provider), "chatgpt-web") {
+		requestSlot.Commit()
 	}
 }
 

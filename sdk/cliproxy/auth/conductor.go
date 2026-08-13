@@ -2171,7 +2171,7 @@ func (m *Manager) executeStreamWithModelPool(ctx, resultCtx context.Context, exe
 			return nil, &Error{Code: "request_body_released", Message: "request body released; retry disabled"}
 		}
 		if idx > 0 {
-			if errLimit := m.acquireAdditionalAuthRequest(auth); errLimit != nil {
+			if errLimit := m.acquireAdditionalAuthRequest(auth, opts.AuthRequestSlot); errLimit != nil {
 				return nil, errLimit
 			}
 		}
@@ -5026,6 +5026,8 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 	opts = ensureRequestedModelMetadata(opts, routeModel)
 	opts = setSelectionAttemptMetadata(opts, requestAttempt)
 	opts = withImageGenerationResultState(req, opts)
+	opts.AuthRequestSlot = &cliproxyexecutor.AuthRequestSlot{}
+	defer opts.AuthRequestSlot.Release()
 	strictSessionAffinity := m.strictSessionAffinityForRequest(req, opts)
 	pickAllowed := m.roundPickAllowed(roundState, maxRetryCredentials)
 	unregisterRelease := registerRequestBodyReleaseCallback(ctx, opts, func([]byte) {
@@ -5053,6 +5055,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			}
 			return cliproxyexecutor.Response{}, errPick
 		}
+		commitImmediateAuthRequestReservation(auth, opts.AuthRequestSlot)
 		roundState.tried[auth.ID] = struct{}{}
 		resolvedAuth, errProxy := m.ResolveProxyAuth(ctx, auth)
 		if errProxy != nil {
@@ -5123,7 +5126,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 				break
 			}
 			if modelIndex > 0 {
-				if errLimit := m.acquireAdditionalAuthRequest(auth); errLimit != nil {
+				if errLimit := m.acquireAdditionalAuthRequest(auth, opts.AuthRequestSlot); errLimit != nil {
 					authErr = errLimit
 					break
 				}
@@ -5187,7 +5190,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 					auth = refreshed
 					opts = withSelectedAuthInstanceMetadata(opts, auth)
 					auth.bindExecutorOwner(executor)
-					if errLimit := m.acquireAdditionalAuthRequest(auth); errLimit != nil {
+					if errLimit := m.acquireAdditionalAuthRequest(auth, opts.AuthRequestSlot); errLimit != nil {
 						authErr = errLimit
 						break
 					}
@@ -5271,6 +5274,8 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 	routeModel := req.Model
 	opts = ensureRequestedModelMetadata(opts, routeModel)
 	opts = setSelectionAttemptMetadata(opts, requestAttempt)
+	opts.AuthRequestSlot = &cliproxyexecutor.AuthRequestSlot{}
+	defer opts.AuthRequestSlot.Release()
 	strictSessionAffinity := m.strictSessionAffinityForRequest(req, opts)
 	pickAllowed := m.roundPickAllowed(roundState, maxRetryCredentials)
 	unregisterRelease := registerRequestBodyReleaseCallback(ctx, opts, func([]byte) {
@@ -5298,6 +5303,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 			}
 			return cliproxyexecutor.Response{}, errPick
 		}
+		commitImmediateAuthRequestReservation(auth, opts.AuthRequestSlot)
 		roundState.tried[auth.ID] = struct{}{}
 		resolvedAuth, errProxy := m.ResolveProxyAuth(ctx, auth)
 		if errProxy != nil {
@@ -5368,7 +5374,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 				break
 			}
 			if modelIndex > 0 {
-				if errLimit := m.acquireAdditionalAuthRequest(auth); errLimit != nil {
+				if errLimit := m.acquireAdditionalAuthRequest(auth, opts.AuthRequestSlot); errLimit != nil {
 					authErr = errLimit
 					break
 				}
@@ -5431,7 +5437,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 					auth = refreshed
 					opts = withSelectedAuthInstanceMetadata(opts, auth)
 					auth.bindExecutorOwner(executor)
-					if errLimit := m.acquireAdditionalAuthRequest(auth); errLimit != nil {
+					if errLimit := m.acquireAdditionalAuthRequest(auth, opts.AuthRequestSlot); errLimit != nil {
 						authErr = errLimit
 						break
 					}
@@ -5512,6 +5518,8 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 	opts = ensureRequestedModelMetadata(opts, routeModel)
 	opts = setSelectionAttemptMetadata(opts, requestAttempt)
 	opts = withImageGenerationResultState(req, opts)
+	opts.AuthRequestSlot = &cliproxyexecutor.AuthRequestSlot{}
+	defer opts.AuthRequestSlot.Release()
 	strictSessionAffinity := m.strictSessionAffinityForRequest(req, opts)
 	pickAllowed := m.roundPickAllowed(roundState, maxRetryCredentials)
 	unregisterRelease := registerRequestBodyReleaseCallback(ctx, opts, func([]byte) {
@@ -5539,6 +5547,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			}
 			return nil, errPick
 		}
+		commitImmediateAuthRequestReservation(auth, opts.AuthRequestSlot)
 		roundState.tried[auth.ID] = struct{}{}
 		resolvedAuth, errProxy := m.ResolveProxyAuth(ctx, auth)
 		if errProxy != nil {
@@ -5652,7 +5661,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 					auth = refreshed
 					opts = withSelectedAuthInstanceMetadata(opts, auth)
 					auth.bindExecutorOwner(executor)
-					if errLimit := m.acquireAdditionalAuthRequest(auth); errLimit != nil {
+					if errLimit := m.acquireAdditionalAuthRequest(auth, opts.AuthRequestSlot); errLimit != nil {
 						errStream = errLimit
 						markDeferredFailure = false
 					} else {
@@ -6036,6 +6045,7 @@ func (m *Manager) pickAntigravityCreditsAtPriority(ctx context.Context, opts cli
 			return nil, preferAuthRequestLimitError(nil, requestBlocked)
 		}
 		requestPolicy := m.routingAuthRequestLimitPolicyForAuth(selected)
+		requestPolicy.requestSlot = opts.AuthRequestSlot
 		if acquired, block := requestLimiter.tryAcquireAt(selected.ID, requestPolicy, now); !acquired {
 			if block.stalePolicy {
 				requestBlocked = authRequestLimitBlock{}
@@ -8713,6 +8723,7 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 			return nil, nil, preferAuthRequestLimitError(&Error{Code: "auth_not_found", Message: "selector returned no auth"}, requestBlocked)
 		}
 		policy := m.routingAuthRequestLimitPolicyForAuth(selected)
+		policy.requestSlot = opts.AuthRequestSlot
 		if acquired, block := requestLimiter.tryAcquireAt(selected.ID, policy, now); !acquired {
 			if block.stalePolicy {
 				requestBlocked = authRequestLimitBlock{}
@@ -8930,6 +8941,7 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 			return nil, nil, "", preferAuthRequestLimitError(&Error{Code: "auth_not_found", Message: "selector returned no auth"}, requestBlocked)
 		}
 		policy := m.routingAuthRequestLimitPolicyForAuth(selected)
+		policy.requestSlot = opts.AuthRequestSlot
 		if acquired, block := requestLimiter.tryAcquireAt(selected.ID, policy, now); !acquired {
 			if block.stalePolicy {
 				requestBlocked = authRequestLimitBlock{}

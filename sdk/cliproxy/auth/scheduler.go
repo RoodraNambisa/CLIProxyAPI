@@ -510,7 +510,12 @@ func (s *authScheduler) pickSingle(ctx context.Context, provider, model string, 
 	strategyForPriority := s.strategyForPriorityLocked
 	fillFirstRangeForPriority := s.fillFirstRangeForPriorityLocked
 	fillFirstPerAuthRPMForPriority := s.fillFirstPerAuthRPMForPriorityLocked
-	requestLimitForAuth := s.requestLimitPolicyForAuthLocked
+	baseRequestLimitForAuth := s.requestLimitPolicyForAuthLocked
+	requestLimitForAuth := func(auth *Auth) authRequestLimitPolicy {
+		policy := baseRequestLimitForAuth(auth)
+		policy.requestSlot = opts.AuthRequestSlot
+		return policy
+	}
 	fillFirstLimiter := s.fillFirstLimiter
 	requestLimiter := s.requestLimiter
 	selectionAttempt = selectionAttemptFromMetadata(opts.Metadata)
@@ -584,7 +589,12 @@ func (s *authScheduler) pickMixed(ctx context.Context, providers []string, model
 	strategyForPriority := s.strategyForPriorityLocked
 	fillFirstRangeForPriority := s.fillFirstRangeForPriorityLocked
 	fillFirstPerAuthRPMForPriority := s.fillFirstPerAuthRPMForPriorityLocked
-	requestLimitForAuth := s.requestLimitPolicyForAuthLocked
+	baseRequestLimitForAuth := s.requestLimitPolicyForAuthLocked
+	requestLimitForAuth := func(auth *Auth) authRequestLimitPolicy {
+		policy := baseRequestLimitForAuth(auth)
+		policy.requestSlot = opts.AuthRequestSlot
+		return policy
+	}
 	fillFirstLimiter := s.fillFirstLimiter
 	requestLimiter := s.requestLimiter
 	selectionAttempt = selectionAttemptFromMetadata(opts.Metadata)
@@ -702,9 +712,6 @@ func (s *authScheduler) pickMixed(ctx context.Context, providers []string, model
 				index := rand.IntN(len(candidates))
 				picked := candidates[index]
 				requestPolicy := requestLimitForAuth(picked.auth)
-				if requestPolicy.limit == 0 {
-					return picked.auth, picked.providerKey, nil
-				}
 				if acquired, block := requestLimiter.tryAcquireAt(picked.auth.ID, requestPolicy, requestLimiter.nowTime()); acquired {
 					return picked.auth, picked.providerKey, nil
 				} else {
@@ -875,14 +882,13 @@ func pickMixedFillFirstAtPriorityLocked(providers []string, candidateShards []*m
 			}
 			candidate := candidates[index]
 			requestPolicy := requestLimitForAuth(candidate.entry.auth)
-			if requestPolicy.limit > 0 {
-				if acquired, block := requestLimiter.tryAcquireAt(candidate.entry.auth.ID, requestPolicy, requestNow); !acquired {
-					requestLimited = earlierAuthRequestLimitBlock(requestLimited, block)
-					candidates[index] = candidates[len(candidates)-1]
-					candidates = candidates[:len(candidates)-1]
-					continue
-				}
-			} else if fillFirstPerAuthRPM > 0 && rpmLimiter != nil && !rpmLimiter.tryAcquireAt(candidate.entry.auth.ID, fillFirstPerAuthRPM, rpmNow) {
+			if acquired, block := requestLimiter.tryAcquireAt(candidate.entry.auth.ID, requestPolicy, requestNow); !acquired {
+				requestLimited = earlierAuthRequestLimitBlock(requestLimited, block)
+				candidates[index] = candidates[len(candidates)-1]
+				candidates = candidates[:len(candidates)-1]
+				continue
+			}
+			if requestPolicy.limit == 0 && fillFirstPerAuthRPM > 0 && rpmLimiter != nil && !rpmLimiter.tryAcquireAt(candidate.entry.auth.ID, fillFirstPerAuthRPM, rpmNow) {
 				rpmLimited = true
 				candidates[index] = candidates[len(candidates)-1]
 				candidates = candidates[:len(candidates)-1]
@@ -1648,14 +1654,13 @@ func (m *modelScheduler) pickFillFirstAtPriorityLocked(preferWebsocket bool, pri
 			}
 			candidate := candidates[index]
 			requestPolicy := requestLimitForAuth(candidate.auth)
-			if requestPolicy.limit > 0 {
-				if acquired, block := requestLimiter.tryAcquireAt(candidate.auth.ID, requestPolicy, requestNow); !acquired {
-					requestLimited = earlierAuthRequestLimitBlock(requestLimited, block)
-					candidates[index] = candidates[len(candidates)-1]
-					candidates = candidates[:len(candidates)-1]
-					continue
-				}
-			} else if fillFirstPerAuthRPM > 0 && rpmLimiter != nil && !rpmLimiter.tryAcquireAt(candidate.auth.ID, fillFirstPerAuthRPM, rpmNow) {
+			if acquired, block := requestLimiter.tryAcquireAt(candidate.auth.ID, requestPolicy, requestNow); !acquired {
+				requestLimited = earlierAuthRequestLimitBlock(requestLimited, block)
+				candidates[index] = candidates[len(candidates)-1]
+				candidates = candidates[:len(candidates)-1]
+				continue
+			}
+			if requestPolicy.limit == 0 && fillFirstPerAuthRPM > 0 && rpmLimiter != nil && !rpmLimiter.tryAcquireAt(candidate.auth.ID, fillFirstPerAuthRPM, rpmNow) {
 				rpmLimited = true
 				candidates[index] = candidates[len(candidates)-1]
 				candidates = candidates[:len(candidates)-1]
@@ -1958,9 +1963,6 @@ func (v *readyView) pickWithRequestLimit(strategy schedulerStrategy, predicate f
 		policy := authRequestLimitPolicy{}
 		if requestLimitForAuth != nil {
 			policy = requestLimitForAuth(entry.auth)
-		}
-		if policy.limit == 0 {
-			return true
 		}
 		acquired, block := limiter.tryAcquireAt(entry.auth.ID, policy, now)
 		if !acquired {

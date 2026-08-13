@@ -108,6 +108,12 @@ type chatGPTWebSearchSource struct {
 	URL   string `json:"url"`
 }
 
+func commitChatGPTWebAuthRequestSlot(opts cliproxyexecutor.Options) {
+	if opts.AuthRequestSlot != nil {
+		opts.AuthRequestSlot.Commit()
+	}
+}
+
 func (e *ChatGPTWebExecutor) executeRuntime(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (resp cliproxyexecutor.Response, err error) {
 	var outcomePersona chatgptwebauth.Persona
 	defer func() {
@@ -130,6 +136,7 @@ func (e *ChatGPTWebExecutor) executeRuntime(ctx context.Context, auth *cliproxya
 	if err != nil {
 		return resp, err
 	}
+	commitChatGPTWebAuthRequestSlot(opts)
 	outcomePersona = credential.Persona
 	defer e.finishChatGPTWebRuntimeClient(ctx, auth, credential, client)
 
@@ -180,6 +187,7 @@ func (e *ChatGPTWebExecutor) executeRuntimeStream(ctx context.Context, auth *cli
 		prepared.discardUsageProjection()
 		return nil, err
 	}
+	commitChatGPTWebAuthRequestSlot(opts)
 	outcomePersona = credential.Persona
 
 	if prepared.request.Image != nil {

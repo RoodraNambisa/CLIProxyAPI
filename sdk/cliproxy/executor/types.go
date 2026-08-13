@@ -3,6 +3,7 @@ package executor
 import (
 	"net/http"
 	"net/url"
+	"sync"
 	"sync/atomic"
 
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v6/sdk/translator"
@@ -158,6 +159,84 @@ type AuthInstanceRetirement interface {
 	Retired() bool
 }
 
+// AuthRequestReservation represents one per-auth request-limit reservation.
+// Implementations must make Commit and Release idempotent and concurrency-safe.
+type AuthRequestReservation interface {
+	Commit() bool
+	Release() bool
+	Reserved() bool
+	Committed() bool
+	Consumed() bool
+}
+
+// AuthRequestSlot carries an attempt-local request-limit reservation from auth
+// selection to the executor that owns the upstream commit boundary.
+type AuthRequestSlot struct {
+	mu          sync.RWMutex
+	reservation AuthRequestReservation
+}
+
+// Bind replaces the previous attempt's reservation with the next one. A still
+// pending reservation is released before replacement so retries do not retain
+// capacity that never reached an upstream request.
+func (s *AuthRequestSlot) Bind(reservation AuthRequestReservation) {
+	if s == nil || reservation == nil {
+		return
+	}
+	s.mu.Lock()
+	previous := s.reservation
+	s.reservation = reservation
+	s.mu.Unlock()
+	if previous != nil && previous.Reserved() {
+		previous.Release()
+	}
+}
+
+func (s *AuthRequestSlot) current() AuthRequestReservation {
+	if s == nil {
+		return nil
+	}
+	s.mu.RLock()
+	reservation := s.reservation
+	s.mu.RUnlock()
+	return reservation
+}
+
+// Commit keeps the reserved capacity until its original request window ends.
+func (s *AuthRequestSlot) Commit() bool {
+	reservation := s.current()
+	return reservation != nil && reservation.Commit()
+}
+
+// Release returns capacity only when the attached reservation is still pending.
+func (s *AuthRequestSlot) Release() bool {
+	reservation := s.current()
+	return reservation != nil && reservation.Release()
+}
+
+// Bound reports whether selection attached a reservation to this slot.
+func (s *AuthRequestSlot) Bound() bool {
+	return s.current() != nil
+}
+
+// Reserved reports whether the attached reservation still awaits settlement.
+func (s *AuthRequestSlot) Reserved() bool {
+	reservation := s.current()
+	return reservation != nil && reservation.Reserved()
+}
+
+// Committed reports whether an upstream request consumed the attached slot.
+func (s *AuthRequestSlot) Committed() bool {
+	reservation := s.current()
+	return reservation != nil && reservation.Committed()
+}
+
+// Consumed reports whether the attached policy reserves real capacity.
+func (s *AuthRequestSlot) Consumed() bool {
+	reservation := s.current()
+	return reservation != nil && reservation.Consumed()
+}
+
 // Request encapsulates the translated payload that will be sent to a provider executor.
 type Request struct {
 	// Model is the upstream model identifier after translation.
@@ -189,6 +268,8 @@ type Options struct {
 	ResponseFormat sdktranslator.Format
 	// Metadata carries extra execution hints shared across selection and executors.
 	Metadata map[string]any
+	// AuthRequestSlot carries the attempt-local per-auth request-limit reservation.
+	AuthRequestSlot *AuthRequestSlot
 }
 
 // ResponseFormatOrSource returns the explicit downstream format when present.

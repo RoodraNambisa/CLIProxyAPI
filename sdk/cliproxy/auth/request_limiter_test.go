@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -54,6 +55,137 @@ func TestAuthRequestWindowLimiterEnforcesConcurrentCap(t *testing.T) {
 	wg.Wait()
 	if acquired != policy.limit {
 		t.Fatalf("acquired = %d, want %d", acquired, policy.limit)
+	}
+}
+
+func TestAuthRequestWindowLimiterReservationReleaseRestoresCapacity(t *testing.T) {
+	fixed := time.Date(2026, 8, 14, 12, 4, 30, 0, time.UTC)
+	limiter := newAuthRequestWindowLimiter()
+	policy := authRequestLimitPolicy{limit: 1, windowMinutes: 5}
+	reservation, acquired, _ := limiter.reserveAt("auth", policy, fixed)
+	if !acquired || reservation == nil || !reservation.Reserved() || !reservation.Consumed() {
+		t.Fatalf("reservation = (%v, %v), want consumed pending reservation", reservation, acquired)
+	}
+	if _, acquiredSecond, block := limiter.reserveAt("auth", policy, fixed); acquiredSecond || !block.limited() {
+		t.Fatalf("second reservation = (%v, %#v), want request limit", acquiredSecond, block)
+	}
+	if !reservation.Release() || reservation.Release() {
+		t.Fatal("Release must succeed exactly once")
+	}
+	if _, acquiredAfterRelease, _ := limiter.reserveAt("auth", policy, fixed); !acquiredAfterRelease {
+		t.Fatal("reservation after release = false, want true")
+	}
+}
+
+func TestAuthRequestWindowLimiterReservationEnforcesConcurrentCap(t *testing.T) {
+	fixed := time.Date(2026, 8, 14, 12, 4, 30, 0, time.UTC)
+	limiter := newAuthRequestWindowLimiter()
+	policy := authRequestLimitPolicy{limit: 1, windowMinutes: 5}
+	var acquired atomic.Int32
+	reservations := make(chan *authRequestReservation, 100)
+	var wg sync.WaitGroup
+	for index := 0; index < 100; index++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			reservation, ok, _ := limiter.reserveAt("auth", policy, fixed)
+			if ok {
+				acquired.Add(1)
+				reservations <- reservation
+			}
+		}()
+	}
+	wg.Wait()
+	close(reservations)
+	if got := acquired.Load(); got != 1 {
+		t.Fatalf("concurrent reservations = %d, want 1", got)
+	}
+	for reservation := range reservations {
+		reservation.Release()
+	}
+}
+
+func TestAuthRequestWindowLimiterCommittedReservationCannotRelease(t *testing.T) {
+	fixed := time.Date(2026, 8, 14, 12, 4, 30, 0, time.UTC)
+	limiter := newAuthRequestWindowLimiter()
+	policy := authRequestLimitPolicy{limit: 1, windowMinutes: 5}
+	reservation, acquired, _ := limiter.reserveAt("auth", policy, fixed)
+	if !acquired || !reservation.Commit() || reservation.Commit() {
+		t.Fatal("Commit must succeed exactly once")
+	}
+	if reservation.Release() {
+		t.Fatal("Release after Commit = true, want false")
+	}
+	if _, acquiredSecond, block := limiter.reserveAt("auth", policy, fixed); acquiredSecond || !block.limited() {
+		t.Fatalf("second reservation = (%v, %#v), want committed request limit", acquiredSecond, block)
+	}
+}
+
+func TestAuthRequestWindowLimiterOldReservationCannotDecrementReplacement(t *testing.T) {
+	fixed := time.Date(2026, 8, 14, 12, 4, 30, 0, time.UTC)
+	policy := authRequestLimitPolicy{limit: 1, windowMinutes: 5}
+	tests := []struct {
+		name    string
+		replace func(*authRequestWindowLimiter)
+		now     time.Time
+		policy  authRequestLimitPolicy
+	}{
+		{name: "window rollover", now: fixed.Add(30 * time.Second), policy: policy},
+		{name: "remove and readd", replace: func(limiter *authRequestWindowLimiter) { limiter.remove("auth") }, now: fixed, policy: policy},
+		{name: "generation reset", replace: func(limiter *authRequestWindowLimiter) { limiter.reset(2) }, now: fixed, policy: authRequestLimitPolicy{limit: 1, windowMinutes: 5, generation: 2}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			limiter := newAuthRequestWindowLimiter()
+			oldReservation, acquired, _ := limiter.reserveAt("auth", policy, fixed)
+			if !acquired {
+				t.Fatal("old reservation = false, want true")
+			}
+			if test.replace != nil {
+				test.replace(limiter)
+			}
+			newReservation, acquiredNew, _ := limiter.reserveAt("auth", test.policy, test.now)
+			if !acquiredNew || !newReservation.Commit() {
+				t.Fatal("replacement reservation must commit")
+			}
+			if !oldReservation.Release() {
+				t.Fatal("old reservation release must settle its own state")
+			}
+			if _, acquiredAfterOldRelease, block := limiter.reserveAt("auth", test.policy, test.now); acquiredAfterOldRelease || !block.limited() {
+				t.Fatalf("reservation after old release = (%v, %#v), want replacement count preserved", acquiredAfterOldRelease, block)
+			}
+		})
+	}
+}
+
+func TestAuthRequestWindowLimiterNoOpReservationDoesNotConsumeCapacity(t *testing.T) {
+	limiter := newAuthRequestWindowLimiter()
+	reservation, acquired, _ := limiter.reserveAt("auth", authRequestLimitPolicy{limit: 0, windowMinutes: 5}, time.Now())
+	if !acquired || reservation == nil || reservation.Consumed() {
+		t.Fatalf("no-op reservation = (%v, %v), want non-consuming reservation", reservation, acquired)
+	}
+	if !reservation.Commit() || reservation.Commit() {
+		t.Fatal("no-op Commit must remain idempotent")
+	}
+}
+
+func TestAuthRequestSlotReplacingLimitedReservationWithNoOpReleasesCapacity(t *testing.T) {
+	fixed := time.Date(2026, 8, 14, 12, 4, 30, 0, time.UTC)
+	limiter := newAuthRequestWindowLimiter()
+	limitedPolicy := authRequestLimitPolicy{limit: 1, windowMinutes: 5}
+	limited, acquired, _ := limiter.reserveAt("limited", limitedPolicy, fixed)
+	if !acquired {
+		t.Fatal("limited reservation = false, want true")
+	}
+	slot := &cliproxyexecutor.AuthRequestSlot{}
+	slot.Bind(limited)
+	noOp, acquiredNoOp, _ := limiter.reserveAt("unlimited", authRequestLimitPolicy{limit: 0, windowMinutes: 5}, fixed)
+	if !acquiredNoOp {
+		t.Fatal("no-op reservation = false, want true")
+	}
+	slot.Bind(noOp)
+	if _, acquiredAfterReplacement, _ := limiter.reserveAt("limited", limitedPolicy, fixed); !acquiredAfterReplacement {
+		t.Fatal("limited capacity remained reserved after no-op replacement")
 	}
 }
 
@@ -971,6 +1103,108 @@ type requestLimitOperationExecutor struct {
 	schedulerTestExecutor
 	mu    sync.Mutex
 	calls []string
+}
+
+type requestLimitReservationTestError struct{}
+
+func (requestLimitReservationTestError) Error() string        { return "request limit reservation test error" }
+func (requestLimitReservationTestError) SkipAuthResult() bool { return true }
+
+type requestLimitChatGPTWebReservationExecutor struct {
+	schedulerTestExecutor
+	commit bool
+	calls  atomic.Int32
+}
+
+func (*requestLimitChatGPTWebReservationExecutor) Identifier() string { return "chatgpt-web" }
+
+func (e *requestLimitChatGPTWebReservationExecutor) Execute(_ context.Context, _ *Auth, _ cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	e.calls.Add(1)
+	if e.commit && opts.AuthRequestSlot != nil {
+		opts.AuthRequestSlot.Commit()
+	}
+	return cliproxyexecutor.Response{}, requestLimitReservationTestError{}
+}
+
+func newRequestLimitChatGPTWebReservationManager(t *testing.T, executor *requestLimitChatGPTWebReservationExecutor) *Manager {
+	t.Helper()
+	const model = "request-limit-chatgpt-web-reservation"
+	manager := NewManager(nil, &FillFirstSelector{}, nil)
+	manager.RegisterExecutor(executor)
+	manager.SetConfig(&internalconfig.Config{Routing: internalconfig.RoutingConfig{PerAuthRequestLimit: 1, PerAuthRequestWindowMinutes: 5}})
+	manager.SetRetryConfig(0, 0, 0)
+	manager.scheduler.requestLimiter.now = func() time.Time {
+		return time.Date(2026, 8, 14, 12, 0, 10, 0, time.UTC)
+	}
+	auth := &Auth{
+		ID:       "chatgpt-web-auth",
+		Provider: "chatgpt-web",
+		Status:   StatusActive,
+		Metadata: map[string]any{
+			"access_token":    "test-access-token",
+			"lifecycle_state": LifecycleStateActive,
+		},
+	}
+	registry.GetGlobalRegistry().RegisterClient(auth.ID, auth.Provider, []*registry.ModelInfo{{ID: model}})
+	t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(auth.ID) })
+	if _, errRegister := manager.Register(WithSkipPersist(t.Context()), auth); errRegister != nil {
+		t.Fatalf("Register() error = %v", errRegister)
+	}
+	return manager
+}
+
+func TestManagerChatGPTWebRequestReservationReleasesBeforeUpstreamCommit(t *testing.T) {
+	executor := &requestLimitChatGPTWebReservationExecutor{}
+	manager := newRequestLimitChatGPTWebReservationManager(t, executor)
+	request := cliproxyexecutor.Request{Model: "request-limit-chatgpt-web-reservation"}
+
+	for attempt := 0; attempt < 2; attempt++ {
+		if _, errExecute := manager.Execute(t.Context(), []string{"chatgpt-web"}, request, cliproxyexecutor.Options{}); errExecute == nil {
+			t.Fatalf("Execute() attempt %d error = nil, want test error", attempt+1)
+		}
+	}
+	if calls := executor.calls.Load(); calls != 2 {
+		t.Fatalf("upstream attempts = %d, want 2 after uncommitted reservations were released", calls)
+	}
+}
+
+func TestManagerChatGPTWebRequestReservationPersistsAfterUpstreamCommit(t *testing.T) {
+	executor := &requestLimitChatGPTWebReservationExecutor{commit: true}
+	manager := newRequestLimitChatGPTWebReservationManager(t, executor)
+	request := cliproxyexecutor.Request{Model: "request-limit-chatgpt-web-reservation"}
+
+	if _, errExecute := manager.Execute(t.Context(), []string{"chatgpt-web"}, request, cliproxyexecutor.Options{}); errExecute == nil {
+		t.Fatal("first Execute() error = nil, want test error")
+	}
+	if _, errExecute := manager.Execute(t.Context(), []string{"chatgpt-web"}, request, cliproxyexecutor.Options{}); !isAuthRequestLimitedError(errExecute) {
+		t.Fatalf("second Execute() error = %T %v, want auth_request_limited", errExecute, errExecute)
+	}
+	if calls := executor.calls.Load(); calls != 1 {
+		t.Fatalf("upstream attempts = %d, want committed first attempt only", calls)
+	}
+}
+
+func TestManagerAcquireAdditionalAuthRequestReplacesPendingReservation(t *testing.T) {
+	fixed := time.Date(2026, 8, 14, 12, 0, 10, 0, time.UTC)
+	manager := NewManager(nil, &FillFirstSelector{}, nil)
+	manager.SetConfig(&internalconfig.Config{Routing: internalconfig.RoutingConfig{PerAuthRequestLimit: 1, PerAuthRequestWindowMinutes: 5}})
+	manager.scheduler.requestLimiter.now = func() time.Time { return fixed }
+	auth := &Auth{ID: "chatgpt-web-auth", Provider: "chatgpt-web", Status: StatusActive}
+	slot := &cliproxyexecutor.AuthRequestSlot{}
+	policy := manager.routingAuthRequestLimitPolicyForAuth(auth)
+	policy.requestSlot = slot
+	if acquired, block := manager.authRequestLimiter().tryAcquireAt(auth.ID, policy, fixed); !acquired {
+		t.Fatalf("initial reservation failed: %#v", block)
+	}
+	if errAcquire := manager.acquireAdditionalAuthRequest(auth, slot); errAcquire != nil {
+		t.Fatalf("acquireAdditionalAuthRequest() error = %v", errAcquire)
+	}
+	if !slot.Reserved() {
+		t.Fatal("replacement reservation is not pending")
+	}
+	if !slot.Release() {
+		t.Fatal("replacement reservation release = false, want true")
+	}
 }
 
 func (e *requestLimitOperationExecutor) record(auth *Auth) {
