@@ -119,11 +119,21 @@ func TestChatGPTWebImportTaskPersistsAdvancedAccountSecurityAndMergesRuntimeStat
 	h, manager, _ := newChatGPTWebManagementTestHandler(t, executor)
 	router := chatGPTWebManagementTestRouter(h)
 	payload, advanced := chatGPTWebImportAdvancedSecurityFixture(t)
+	rawAPI798URL := "https://api798.com/get_code?email=advanced%40example.com&auth_code=opaque"
+	var initialPayload map[string]any
+	if errUnmarshal := json.Unmarshal([]byte(payload), &initialPayload); errUnmarshal != nil {
+		t.Fatal(errUnmarshal)
+	}
+	initialPayload["api798_url"] = rawAPI798URL
+	payloadWithAPI798, errMarshal := json.Marshal(initialPayload)
+	if errMarshal != nil {
+		t.Fatal(errMarshal)
+	}
 
 	firstTask := startChatGPTWebImportTask(t, router, []chatGPTWebImportTestFile{{
 		field: "files",
 		name:  "advanced-security.json",
-		data:  payload,
+		data:  string(payloadWithAPI798),
 	}})
 	first := waitForChatGPTWebMutationTask(t, router, chatGPTWebMutationTaskImport, firstTask.ID)
 	if first.Succeeded != 1 || len(first.Results) != 1 {
@@ -178,6 +188,15 @@ func TestChatGPTWebImportTaskPersistsAdvancedAccountSecurityAndMergesRuntimeStat
 	}
 	if got := reparsed.AdvancedAccountSecurity.Passkeys[0].Credential.SignCount; got != 17 {
 		t.Fatalf("sign_count = %d, want 17", got)
+	}
+	if reparsed.API798URL != rawAPI798URL {
+		t.Fatalf("api798_url = %q, want %q", reparsed.API798URL, rawAPI798URL)
+	}
+	if reparsed.LoginMethod != chatgptwebauth.LoginMethodAdvancedSecurityPasskey {
+		t.Fatalf("login_method = %q, want %q", reparsed.LoginMethod, chatgptwebauth.LoginMethodAdvancedSecurityPasskey)
+	}
+	if !chatgptwebauth.AdvancedAccountSecurityMaterialMatches(reparsed.AdvancedAccountSecurity, advanced) {
+		t.Fatal("reimport changed advanced account security material")
 	}
 	if !reflect.DeepEqual(reparsed.AdvancedAccountSecurity.RecoveryKeys, advanced.RecoveryKeys) {
 		t.Fatal("reimport changed recovery keys")

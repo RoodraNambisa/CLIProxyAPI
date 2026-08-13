@@ -671,16 +671,16 @@ func preserveImportedChatGPTWebLoginSettings(imported *chatgptwebauth.Credential
 	if imported == nil || current == nil {
 		return
 	}
-	if imported.CredentialSchemaVersion == chatgptwebauth.CredentialSchemaVersionAdvancedAccountSecurity {
-		imported.LoginMethod = chatgptwebauth.LoginMethodAdvancedSecurityPasskey
-		return
-	}
 	currentCredential, errParse := chatgptwebauth.ParseCredential(current.Metadata)
 	if errParse != nil {
 		return
 	}
 	if imported.API798URL == "" {
 		imported.API798URL = currentCredential.API798URL
+	}
+	if imported.CredentialSchemaVersion == chatgptwebauth.CredentialSchemaVersionAdvancedAccountSecurity {
+		imported.LoginMethod = chatgptwebauth.LoginMethodAdvancedSecurityPasskey
+		return
 	}
 	if imported.LoginMethod == chatgptwebauth.LoginMethodAuto && currentCredential.LoginMethod != chatgptwebauth.LoginMethodAuto {
 		imported.LoginMethod = currentCredential.LoginMethod
