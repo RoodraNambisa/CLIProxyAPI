@@ -205,8 +205,12 @@ func TestMergeSnapshotRebuildsRealtimeAggregatesAndIndex(t *testing.T) {
 
 	stats.mu.RLock()
 	defer stats.mu.RUnlock()
-	if len(stats.detailIndex) != 1 || stats.detailIndex[0].API != "api-a" || stats.detailIndex[0].Model != "model-a" {
+	if len(stats.detailIndex) != 1 {
 		t.Fatalf("detail index = %+v", stats.detailIndex)
+	}
+	location, ok := stats.detailLocations[stats.detailIndex[0].ID]
+	if !ok || location.API != "api-a" || location.Model != "model-a" {
+		t.Fatalf("detail location = %+v, %t", location, ok)
 	}
 	if stats.tokens.InputTokens != 7 || stats.models["model-a"].TotalTokens != 7 || stats.sources["source-a"].TotalRequests != 1 {
 		t.Fatalf("all-time aggregates not rebuilt: tokens=%+v models=%+v sources=%+v", stats.tokens, stats.models, stats.sources)

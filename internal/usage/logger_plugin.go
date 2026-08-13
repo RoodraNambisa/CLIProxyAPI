@@ -89,15 +89,19 @@ type RequestStatistics struct {
 	tokenRowsByDay  map[string]int64
 	tokenRowsByHour map[int]int64
 
-	minuteBuckets     map[int64]*usageAggregateBucket
-	hourBuckets       map[int64]*usageAggregateBucket
-	dayBuckets        map[int64]*usageAggregateBucket
-	detailIndex       []usageDetailRef
-	detailIndexDirty  bool
-	authSeries        map[string]map[usageSeriesKey]struct{}
-	stringPool        map[string]string
-	lastPrunedMinute  int64
-	legacyHourBuckets map[legacyHourKey]*legacyHourStats
+	minuteBuckets         map[int64]*usageAggregateBucket
+	hourBuckets           map[int64]*usageAggregateBucket
+	dayBuckets            map[int64]*usageAggregateBucket
+	detailIndex           []usageDetailRef
+	detailIndexDirty      bool
+	detailLocations       map[uint64]usageDetailLocation
+	detailIndexTombstones int
+	nextDetailID          uint64
+	authSeries            map[string]map[usageSeriesKey]struct{}
+	authDetailIDs         map[string][]uint64
+	stringPool            map[string]string
+	lastPrunedMinute      int64
+	legacyHourBuckets     map[legacyHourKey]*legacyHourStats
 }
 
 type legacyHourKey struct {
@@ -177,6 +181,7 @@ type RequestDetail struct {
 	Tokens              TokenStats `json:"tokens"`
 	Failed              bool       `json:"failed"`
 	Auxiliary           bool       `json:"auxiliary,omitempty"`
+	internalID          uint64
 }
 
 // TokenStats captures the token usage breakdown for a request.
@@ -245,6 +250,8 @@ func newRequestStatistics(async bool) *RequestStatistics {
 		dayBuckets:        make(map[int64]*usageAggregateBucket),
 		legacyHourBuckets: make(map[legacyHourKey]*legacyHourStats),
 		authSeries:        make(map[string]map[usageSeriesKey]struct{}),
+		authDetailIDs:     make(map[string][]uint64),
+		detailLocations:   make(map[uint64]usageDetailLocation),
 		stringPool:        make(map[string]string),
 	}
 	if async {
@@ -347,15 +354,16 @@ func (s *RequestStatistics) recordPreparedLocked(record preparedUsageRecord, now
 		stats = &apiStats{Models: make(map[string]*modelStats)}
 		s.apis[statsKey] = stats
 	}
-	detailOffset := s.updateAPIStats(stats, modelName, requestDetail)
+	detailOffset, detailID := s.updateAPIStats(stats, modelName, requestDetail)
+	requestDetail = stats.Models[modelName].Details[detailOffset]
 	s.updateAuthStats(modelName, requestDetail)
 	s.updateRealtimeAggregatesLocked(statsKey, modelName, requestDetail, now)
 	s.indexAuthSeriesLocked(statsKey, modelName, requestDetail.AuthIndex)
+	s.indexAuthDetailLocked(requestDetail.AuthIndex, detailID)
+	s.detailLocations[detailID] = usageDetailLocation{API: statsKey, Model: modelName, Offset: detailOffset}
 	s.insertDetailRefLocked(usageDetailRef{
 		Timestamp: requestDetail.Timestamp,
-		API:       statsKey,
-		Model:     modelName,
-		Offset:    detailOffset,
+		ID:        detailID,
 	})
 	dayKey := requestDetail.Timestamp.Format("2006-01-02")
 	hourKey := requestDetail.Timestamp.Hour()
@@ -382,16 +390,25 @@ func (s *RequestStatistics) internStringLocked(value string) string {
 	return value
 }
 
-func (s *RequestStatistics) updateAPIStats(stats *apiStats, model string, detail RequestDetail) int {
+func (s *RequestStatistics) updateAPIStats(stats *apiStats, model string, detail RequestDetail) (int, uint64) {
 	modelStatsValue, ok := stats.Models[model]
 	if !ok {
 		modelStatsValue = &modelStats{}
 		stats.Models[model] = modelStatsValue
 	}
 	detailOffset := len(modelStatsValue.Details)
+	detail.internalID = s.allocateDetailIDLocked()
 	modelStatsValue.Details = append(modelStatsValue.Details, detail)
 	updateAPIAggregates(stats, modelStatsValue, detail)
-	return detailOffset
+	return detailOffset, detail.internalID
+}
+
+func (s *RequestStatistics) allocateDetailIDLocked() uint64 {
+	s.nextDetailID++
+	if s.nextDetailID == 0 {
+		s.nextDetailID++
+	}
+	return s.nextDetailID
 }
 
 func updateAPIAggregates(stats *apiStats, modelStatsValue *modelStats, detail RequestDetail) {
@@ -486,7 +503,9 @@ func (s *RequestStatistics) snapshotLocked() StatisticsSnapshot {
 		}
 		for modelName, modelStatsValue := range stats.Models {
 			requestDetails := make([]RequestDetail, len(modelStatsValue.Details))
-			copy(requestDetails, modelStatsValue.Details)
+			for index, detail := range modelStatsValue.Details {
+				requestDetails[index] = publicRequestDetail(detail)
+			}
 			apiSnapshot.Models[modelName] = ModelSnapshot{
 				TotalRequests: modelStatsValue.TotalRequests,
 				TotalTokens:   modelStatsValue.TotalTokens,
@@ -519,6 +538,11 @@ func (s *RequestStatistics) snapshotLocked() StatisticsSnapshot {
 	}
 
 	return result
+}
+
+func publicRequestDetail(detail RequestDetail) RequestDetail {
+	detail.internalID = 0
+	return detail
 }
 
 type MergeResult struct {
@@ -696,7 +720,11 @@ func (s *RequestStatistics) resetLocked() {
 	s.legacyHourBuckets = make(map[legacyHourKey]*legacyHourStats)
 	s.detailIndex = nil
 	s.detailIndexDirty = false
+	s.detailLocations = make(map[uint64]usageDetailLocation)
+	s.detailIndexTombstones = 0
+	s.nextDetailID = 0
 	s.authSeries = make(map[string]map[usageSeriesKey]struct{})
+	s.authDetailIDs = make(map[string][]uint64)
 	s.stringPool = make(map[string]string)
 	s.lastPrunedMinute = 0
 }
@@ -754,38 +782,47 @@ func (s *RequestStatistics) PruneAuthIndexes(valid map[string]struct{}) int {
 }
 
 func (s *RequestStatistics) removeAuthIndexesLocked(indexSet map[string]struct{}) int {
-	affected := make(map[usageSeriesKey]struct{})
-	for authIndex := range indexSet {
-		for series := range s.authSeries[authIndex] {
-			affected[series] = struct{}{}
-		}
-	}
+	affectedAPIs := make(map[string]struct{})
+	affectedSeries := make(map[usageSeriesKey]struct{})
+	affectedModels := make(map[string]struct{})
+	affectedSources := make(map[string]struct{})
+	affectedMinuteBuckets := make(map[int64]struct{})
+	affectedHourBuckets := make(map[int64]struct{})
+	affectedDayBuckets := make(map[int64]struct{})
+	extremeRemoved := false
+	futureExtremeRemoved := false
 	removed := 0
-	for series := range affected {
-		stats := s.apis[series.API]
-		if stats == nil {
-			continue
-		}
-		modelStatsValue := stats.Models[series.Model]
-		if modelStatsValue == nil {
-			continue
-		}
-		kept := modelStatsValue.Details[:0]
-		for _, detail := range modelStatsValue.Details {
-			if _, ok := indexSet[strings.TrimSpace(detail.AuthIndex)]; !ok {
-				kept = append(kept, detail)
+	for authIndex := range indexSet {
+		for _, detailID := range s.authDetailIDs[authIndex] {
+			detail, location, ok := s.detailForIDLocked(detailID)
+			if !ok || normalizeUsageDimension(detail.AuthIndex) != authIndex {
 				continue
 			}
-			s.removeDetailAggregatesLocked(series.API, series.Model, stats, modelStatsValue, detail)
+			stats := s.apis[location.API]
+			modelStatsValue := stats.Models[location.Model]
+			affectedAPIs[location.API] = struct{}{}
+			affectedSeries[usageSeriesKey{API: location.API, Model: location.Model}] = struct{}{}
+			affectedModels[location.Model] = struct{}{}
+			source := normalizeUsageDimension(detail.Source)
+			affectedSources[source] = struct{}{}
+			affectedMinuteBuckets[truncateAggregateTime(detail.Timestamp, time.Minute).Unix()] = struct{}{}
+			affectedHourBuckets[truncateAggregateTime(detail.Timestamp, time.Hour).Unix()] = struct{}{}
+			affectedDayBuckets[truncateAggregateTime(detail.Timestamp, 24*time.Hour).Unix()] = struct{}{}
+			if detail.Timestamp.Equal(s.oldestAt) || detail.Timestamp.Equal(s.newestAt) {
+				extremeRemoved = true
+			}
+			if detail.Timestamp.Equal(s.dayOnlyFutureOldest) || detail.Timestamp.Equal(s.dayOnlyFutureNewest) {
+				futureExtremeRemoved = true
+			}
+			s.removeDetailAggregatesLocked(location.API, location.Model, stats, modelStatsValue, detail)
+			s.removeDetailAtLocked(modelStatsValue, location, detailID)
+			if len(modelStatsValue.Details) == 0 {
+				delete(stats.Models, location.Model)
+			}
+			if len(stats.Models) == 0 {
+				delete(s.apis, location.API)
+			}
 			removed++
-		}
-		clear(modelStatsValue.Details[len(kept):])
-		modelStatsValue.Details = kept
-		if len(kept) == 0 {
-			delete(stats.Models, series.Model)
-		}
-		if len(stats.Models) == 0 {
-			delete(s.apis, series.API)
 		}
 	}
 	if removed == 0 {
@@ -793,11 +830,34 @@ func (s *RequestStatistics) removeAuthIndexesLocked(indexSet map[string]struct{}
 	}
 	for authIndex := range indexSet {
 		delete(s.authSeries, authIndex)
+		delete(s.authDetailIDs, authIndex)
 		delete(s.auths, authIndex)
 	}
-	s.rebuildAffectedDetailIndexLocked(affected)
-	s.restoreAggregateTimesLocked()
+	s.restoreAffectedAggregateTimesLocked(affectedAPIs, affectedSeries, affectedModels, affectedSources, affectedMinuteBuckets, affectedHourBuckets, affectedDayBuckets)
+	if extremeRemoved || futureExtremeRemoved {
+		s.restoreDetailRangeTimesLocked(extremeRemoved, futureExtremeRemoved)
+	}
+	s.compactDetailIndexLocked()
 	return removed
+}
+
+func (s *RequestStatistics) removeDetailAtLocked(modelStatsValue *modelStats, location usageDetailLocation, detailID uint64) {
+	if modelStatsValue == nil || location.Offset < 0 || location.Offset >= len(modelStatsValue.Details) {
+		return
+	}
+	lastOffset := len(modelStatsValue.Details) - 1
+	if location.Offset != lastOffset {
+		moved := modelStatsValue.Details[lastOffset]
+		modelStatsValue.Details[location.Offset] = moved
+		if movedLocation, ok := s.detailLocations[moved.internalID]; ok {
+			movedLocation.Offset = location.Offset
+			s.detailLocations[moved.internalID] = movedLocation
+		}
+	}
+	modelStatsValue.Details[lastOffset] = RequestDetail{}
+	modelStatsValue.Details = modelStatsValue.Details[:lastOffset]
+	delete(s.detailLocations, detailID)
+	s.detailIndexTombstones++
 }
 
 func (s *RequestStatistics) removeDetailAggregatesLocked(apiName, modelName string, stats *apiStats, modelStatsValue *modelStats, detail RequestDetail) {
@@ -881,100 +941,197 @@ func subtractTokenIntCounter(values, rows map[int]int64, key int, decrement int6
 	values[key] = subtractNonNegativeInt64(values[key], decrement)
 }
 
-func (s *RequestStatistics) rebuildAffectedDetailIndexLocked(affected map[usageSeriesKey]struct{}) {
-	if len(affected) == 0 {
-		return
+func normalizeUsageDimension(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "unknown"
 	}
-	kept := s.detailIndex[:0]
-	for _, ref := range s.detailIndex {
-		if _, ok := affected[usageSeriesKey{API: ref.API, Model: ref.Model}]; !ok {
-			kept = append(kept, ref)
-		}
-	}
-	clear(s.detailIndex[len(kept):])
-	s.detailIndex = kept
-	for series := range affected {
+	return value
+}
+
+func (s *RequestStatistics) restoreAffectedAggregateTimesLocked(
+	affectedAPIs map[string]struct{}, affectedSeries map[usageSeriesKey]struct{}, affectedModels, affectedSources map[string]struct{},
+	affectedMinuteBuckets, affectedHourBuckets, affectedDayBuckets map[int64]struct{},
+) {
+	s.restoreAffectedBucketTimesLocked(s.minuteBuckets, affectedMinuteBuckets)
+	s.restoreAffectedBucketTimesLocked(s.hourBuckets, affectedHourBuckets)
+	s.restoreAffectedBucketTimesLocked(s.dayBuckets, affectedDayBuckets)
+	for series := range affectedSeries {
 		stats := s.apis[series.API]
 		if stats == nil {
 			continue
 		}
 		modelStatsValue := stats.Models[series.Model]
-		if modelStatsValue == nil {
+		if modelStatsValue == nil || !modelStatsValue.LastUsedAt.IsZero() {
 			continue
 		}
-		for offset, detail := range modelStatsValue.Details {
-			s.detailIndex = append(s.detailIndex, usageDetailRef{
-				Timestamp: detail.Timestamp,
-				API:       series.API,
-				Model:     series.Model,
-				Offset:    offset,
-			})
+		for _, bucket := range s.dayBuckets {
+			if bucket == nil || bucket.APIModels[series.API] == nil {
+				continue
+			}
+			if bucketAggregate := bucket.APIModels[series.API][series.Model]; bucketAggregate != nil {
+				touchTime(&modelStatsValue.LastUsedAt, bucketAggregate.LastUsedAt)
+			}
 		}
 	}
-	s.detailIndexDirty = true
-	s.sortDetailIndexLocked()
-}
-
-func (s *RequestStatistics) restoreAggregateTimesLocked() {
-	s.oldestAt = time.Time{}
-	s.newestAt = time.Time{}
-	s.dayOnlyFutureOldest = time.Time{}
-	s.dayOnlyFutureNewest = time.Time{}
-	resetAggregateMapTimes(s.models)
-	resetAggregateMapTimes(s.sources)
-	resetAggregateBucketMapTimes(s.dayBuckets)
-	resetAggregateBucketMapTimes(s.hourBuckets)
-	resetAggregateBucketMapTimes(s.minuteBuckets)
-	for _, stats := range s.auths {
+	for apiName := range affectedAPIs {
+		stats := s.apis[apiName]
 		if stats == nil {
 			continue
 		}
 		stats.LastUsedAt = time.Time{}
 		for _, modelStatsValue := range stats.Models {
-			if modelStatsValue != nil {
-				modelStatsValue.LastUsedAt = time.Time{}
-			}
-		}
-	}
-	now := time.Now().UTC()
-	for apiName, stats := range s.apis {
-		if stats == nil {
-			continue
-		}
-		stats.LastUsedAt = time.Time{}
-		for modelName, modelStatsValue := range stats.Models {
 			if modelStatsValue == nil {
 				continue
 			}
-			modelStatsValue.LastUsedAt = time.Time{}
-			for _, detail := range modelStatsValue.Details {
-				touchTime(&stats.LastUsedAt, detail.Timestamp)
-				touchTime(&modelStatsValue.LastUsedAt, detail.Timestamp)
-				touchAggregateMapTime(s.models, modelName, detail.Timestamp)
-				source := strings.TrimSpace(detail.Source)
-				if source == "" {
-					source = "unknown"
-				}
-				touchAggregateMapTime(s.sources, source, detail.Timestamp)
-				touchAuthTime(s.auths, modelName, detail)
-				touchBucketTime(s.dayBuckets, 24*time.Hour, apiName, modelName, detail)
-				touchBucketTime(s.hourBuckets, time.Hour, apiName, modelName, detail)
-				touchBucketTime(s.minuteBuckets, time.Minute, apiName, modelName, detail)
-				if s.oldestAt.IsZero() || detail.Timestamp.Before(s.oldestAt) {
-					s.oldestAt = detail.Timestamp
-				}
-				if s.newestAt.IsZero() || detail.Timestamp.After(s.newestAt) {
-					s.newestAt = detail.Timestamp
-				}
-				if detail.Timestamp.After(now.Add(usageFutureTolerance)) {
-					if s.dayOnlyFutureOldest.IsZero() || detail.Timestamp.Before(s.dayOnlyFutureOldest) {
-						s.dayOnlyFutureOldest = detail.Timestamp
-					}
-					if s.dayOnlyFutureNewest.IsZero() || detail.Timestamp.After(s.dayOnlyFutureNewest) {
-						s.dayOnlyFutureNewest = detail.Timestamp
-					}
-				}
+			touchTime(&stats.LastUsedAt, modelStatsValue.LastUsedAt)
+		}
+	}
+	for modelName := range affectedModels {
+		aggregate := s.models[modelName]
+		if aggregate == nil || !aggregate.LastUsedAt.IsZero() {
+			continue
+		}
+		for _, bucket := range s.dayBuckets {
+			if bucket == nil {
+				continue
 			}
+			if bucketAggregate := bucket.Models[modelName]; bucketAggregate != nil {
+				touchTime(&aggregate.LastUsedAt, bucketAggregate.LastUsedAt)
+			}
+		}
+	}
+	for source := range affectedSources {
+		aggregate := s.sources[source]
+		if aggregate == nil || !aggregate.LastUsedAt.IsZero() {
+			continue
+		}
+		for _, bucket := range s.dayBuckets {
+			if bucket == nil {
+				continue
+			}
+			if bucketAggregate := bucket.Sources[source]; bucketAggregate != nil {
+				touchTime(&aggregate.LastUsedAt, bucketAggregate.LastUsedAt)
+			}
+		}
+	}
+}
+
+func (s *RequestStatistics) restoreAffectedBucketTimesLocked(buckets map[int64]*usageAggregateBucket, affected map[int64]struct{}) {
+	for key := range affected {
+		bucket := buckets[key]
+		if bucket == nil {
+			continue
+		}
+		resetUsageAggregateBucketTimes(bucket)
+		kept := bucket.detailIDs[:0]
+		for _, detailID := range bucket.detailIDs {
+			detail, location, ok := s.detailForIDLocked(detailID)
+			if ok {
+				kept = append(kept, detailID)
+				touchBucketTimeForDetail(bucket, location.API, location.Model, detail)
+			}
+		}
+		clear(bucket.detailIDs[len(kept):])
+		bucket.detailIDs = kept
+	}
+}
+
+func resetUsageAggregateBucketTimes(bucket *usageAggregateBucket) {
+	if bucket == nil {
+		return
+	}
+	bucket.Total.LastUsedAt = time.Time{}
+	resetAggregateMapTimes(bucket.APIs)
+	resetAggregateMapTimes(bucket.Models)
+	resetNestedAggregateMapTimes(bucket.APIModels)
+	resetAggregateMapTimes(bucket.Auths)
+	resetNestedAggregateMapTimes(bucket.AuthModels)
+	resetAggregateMapTimes(bucket.Sources)
+	resetNestedAggregateMapTimes(bucket.AuthSources)
+}
+
+func touchBucketTimeForDetail(bucket *usageAggregateBucket, apiName, modelName string, detail RequestDetail) {
+	if bucket == nil {
+		return
+	}
+	touchTime(&bucket.Total.LastUsedAt, detail.Timestamp)
+	touchAggregateMapTime(bucket.APIs, apiName, detail.Timestamp)
+	touchAggregateMapTime(bucket.Models, modelName, detail.Timestamp)
+	touchNestedAggregateMapTime(bucket.APIModels, apiName, modelName, detail.Timestamp)
+	authIndex := normalizeUsageDimension(detail.AuthIndex)
+	touchAggregateMapTime(bucket.Auths, authIndex, detail.Timestamp)
+	touchNestedAggregateMapTime(bucket.AuthModels, authIndex, modelName, detail.Timestamp)
+	source := normalizeUsageDimension(detail.Source)
+	touchAggregateMapTime(bucket.Sources, source, detail.Timestamp)
+	touchNestedAggregateMapTime(bucket.AuthSources, authIndex, source, detail.Timestamp)
+}
+
+func (s *RequestStatistics) restoreDetailRangeTimesLocked(restoreExtremes, restoreFutureExtremes bool) {
+	if restoreExtremes {
+		s.oldestAt = time.Time{}
+		s.newestAt = time.Time{}
+	}
+	if restoreFutureExtremes {
+		s.dayOnlyFutureOldest = time.Time{}
+		s.dayOnlyFutureNewest = time.Time{}
+	}
+	if !restoreExtremes && !restoreFutureExtremes {
+		return
+	}
+	if restoreExtremes {
+		oldestKey, newestKey, ok := aggregateBucketKeyBounds(s.dayBuckets, func(bucket *usageAggregateBucket) bool {
+			return bucket != nil && !bucket.Total.LastUsedAt.IsZero()
+		})
+		if ok {
+			s.scanBucketDetailTimesLocked(s.dayBuckets[oldestKey], time.Time{}, &s.oldestAt, nil)
+			s.scanBucketDetailTimesLocked(s.dayBuckets[newestKey], time.Time{}, nil, &s.newestAt)
+		}
+	}
+	if restoreFutureExtremes {
+		cutoff := time.Now().UTC().Add(usageFutureTolerance)
+		oldestKey, newestKey, ok := aggregateBucketKeyBounds(s.dayBuckets, func(bucket *usageAggregateBucket) bool {
+			return bucket != nil && bucket.Total.LastUsedAt.After(cutoff)
+		})
+		if ok {
+			s.scanBucketDetailTimesLocked(s.dayBuckets[oldestKey], cutoff, &s.dayOnlyFutureOldest, nil)
+			s.scanBucketDetailTimesLocked(s.dayBuckets[newestKey], cutoff, nil, &s.dayOnlyFutureNewest)
+		}
+	}
+}
+
+func aggregateBucketKeyBounds(buckets map[int64]*usageAggregateBucket, include func(*usageAggregateBucket) bool) (int64, int64, bool) {
+	var oldest, newest int64
+	found := false
+	for key, bucket := range buckets {
+		if !include(bucket) {
+			continue
+		}
+		if !found || key < oldest {
+			oldest = key
+		}
+		if !found || key > newest {
+			newest = key
+		}
+		found = true
+	}
+	return oldest, newest, found
+}
+
+func (s *RequestStatistics) scanBucketDetailTimesLocked(bucket *usageAggregateBucket, after time.Time, oldest, newest *time.Time) {
+	if bucket == nil {
+		return
+	}
+	for _, detailID := range bucket.detailIDs {
+		detail, _, ok := s.detailForIDLocked(detailID)
+		if !ok || (!after.IsZero() && !detail.Timestamp.After(after)) {
+			continue
+		}
+		if oldest != nil && (oldest.IsZero() || detail.Timestamp.Before(*oldest)) {
+			*oldest = detail.Timestamp
+		}
+		if newest != nil && (newest.IsZero() || detail.Timestamp.After(*newest)) {
+			*newest = detail.Timestamp
 		}
 	}
 }
@@ -990,22 +1147,6 @@ func resetAggregateMapTimes(values map[string]*aggregateStats) {
 func resetNestedAggregateMapTimes(values map[string]map[string]*aggregateStats) {
 	for _, nested := range values {
 		resetAggregateMapTimes(nested)
-	}
-}
-
-func resetAggregateBucketMapTimes(values map[int64]*usageAggregateBucket) {
-	for _, bucket := range values {
-		if bucket == nil {
-			continue
-		}
-		bucket.Total.LastUsedAt = time.Time{}
-		resetAggregateMapTimes(bucket.APIs)
-		resetAggregateMapTimes(bucket.Models)
-		resetNestedAggregateMapTimes(bucket.APIModels)
-		resetAggregateMapTimes(bucket.Auths)
-		resetNestedAggregateMapTimes(bucket.AuthModels)
-		resetAggregateMapTimes(bucket.Sources)
-		resetNestedAggregateMapTimes(bucket.AuthSources)
 	}
 }
 
@@ -1025,44 +1166,6 @@ func touchNestedAggregateMapTime(values map[string]map[string]*aggregateStats, f
 	if nested := values[first]; nested != nil {
 		touchAggregateMapTime(nested, second, timestamp)
 	}
-}
-
-func touchAuthTime(values map[string]*authStats, modelName string, detail RequestDetail) {
-	authIndex := strings.TrimSpace(detail.AuthIndex)
-	if authIndex == "" {
-		return
-	}
-	stats := values[authIndex]
-	if stats == nil {
-		return
-	}
-	touchTime(&stats.LastUsedAt, detail.Timestamp)
-	if modelStatsValue := stats.Models[modelName]; modelStatsValue != nil {
-		touchTime(&modelStatsValue.LastUsedAt, detail.Timestamp)
-	}
-}
-
-func touchBucketTime(buckets map[int64]*usageAggregateBucket, step time.Duration, apiName, modelName string, detail RequestDetail) {
-	bucket := buckets[truncateAggregateTime(detail.Timestamp, step).Unix()]
-	if bucket == nil {
-		return
-	}
-	touchTime(&bucket.Total.LastUsedAt, detail.Timestamp)
-	touchAggregateMapTime(bucket.APIs, apiName, detail.Timestamp)
-	touchAggregateMapTime(bucket.Models, modelName, detail.Timestamp)
-	touchNestedAggregateMapTime(bucket.APIModels, apiName, modelName, detail.Timestamp)
-	authIndex := strings.TrimSpace(detail.AuthIndex)
-	if authIndex == "" {
-		authIndex = "unknown"
-	}
-	touchAggregateMapTime(bucket.Auths, authIndex, detail.Timestamp)
-	touchNestedAggregateMapTime(bucket.AuthModels, authIndex, modelName, detail.Timestamp)
-	source := strings.TrimSpace(detail.Source)
-	if source == "" {
-		source = "unknown"
-	}
-	touchAggregateMapTime(bucket.Sources, source, detail.Timestamp)
-	touchNestedAggregateMapTime(bucket.AuthSources, authIndex, source, detail.Timestamp)
 }
 
 func (s *RequestStatistics) removeLegacyHourEntryLocked(detail RequestDetail) {
@@ -1143,10 +1246,17 @@ func (s *RequestStatistics) recordImported(apiName, modelName string, stats *api
 	}
 	s.totalTokens = saturatingAddInt64(s.totalTokens, totalTokens)
 
-	s.updateAPIStats(stats, modelName, detail)
+	detailOffset, detailID := s.updateAPIStats(stats, modelName, detail)
+	detail = stats.Models[modelName].Details[detailOffset]
 	s.updateAuthStats(modelName, detail)
 	s.updateRealtimeAggregatesLocked(apiName, modelName, detail, now)
 	s.indexAuthSeriesLocked(apiName, modelName, detail.AuthIndex)
+	s.indexAuthDetailLocked(detail.AuthIndex, detailID)
+	s.detailLocations[detailID] = usageDetailLocation{API: apiName, Model: modelName, Offset: detailOffset}
+	s.insertDetailRefLocked(usageDetailRef{
+		Timestamp: detail.Timestamp,
+		ID:        detailID,
+	})
 
 	dayKey := detail.Timestamp.Format("2006-01-02")
 	hourKey := detail.Timestamp.Hour()
@@ -1188,7 +1298,11 @@ func (s *RequestStatistics) rebuildLocked() {
 	s.legacyHourBuckets = make(map[legacyHourKey]*legacyHourStats)
 	s.detailIndex = nil
 	s.detailIndexDirty = false
+	s.detailLocations = make(map[uint64]usageDetailLocation)
+	s.detailIndexTombstones = 0
+	s.nextDetailID = 0
 	s.authSeries = make(map[string]map[usageSeriesKey]struct{})
+	s.authDetailIDs = make(map[string][]uint64)
 	s.stringPool = make(map[string]string)
 	s.lastPrunedMinute = 0
 	now := time.Now().UTC()
@@ -1231,6 +1345,7 @@ func (s *RequestStatistics) rebuildLocked() {
 				if detail.Timestamp.IsZero() {
 					detail.Timestamp = time.Now()
 				}
+				detail.internalID = s.allocateDetailIDLocked()
 				modelStatsValue.Details[idx] = detail
 
 				totalTokens := nonNegativeInt64(detail.Tokens.TotalTokens)
@@ -1248,6 +1363,7 @@ func (s *RequestStatistics) rebuildLocked() {
 				s.updateAuthStats(modelName, detail)
 				s.updateRealtimeAggregatesLocked(apiName, modelName, detail, now)
 				s.indexAuthSeriesLocked(apiName, modelName, detail.AuthIndex)
+				s.indexAuthDetailLocked(detail.AuthIndex, detail.internalID)
 
 				dayKey := detail.Timestamp.Format("2006-01-02")
 				hourKey := detail.Timestamp.Hour()
@@ -1281,6 +1397,14 @@ func (s *RequestStatistics) indexAuthSeriesLocked(apiName, modelName, authIndex 
 		s.authSeries[authIndex] = series
 	}
 	series[usageSeriesKey{API: apiName, Model: modelName}] = struct{}{}
+}
+
+func (s *RequestStatistics) indexAuthDetailLocked(authIndex string, detailID uint64) {
+	authIndex = strings.TrimSpace(authIndex)
+	if authIndex == "" || detailID == 0 {
+		return
+	}
+	s.authDetailIDs[authIndex] = append(s.authDetailIDs[authIndex], detailID)
 }
 
 func (s *RequestStatistics) markChangedLocked() {

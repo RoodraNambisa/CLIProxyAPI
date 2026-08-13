@@ -37,6 +37,7 @@ type usageAggregateBucket struct {
 	AuthModels  map[string]map[string]*aggregateStats
 	AuthSources map[string]map[string]*aggregateStats
 	Sources     map[string]*aggregateStats
+	detailIDs   []uint64
 }
 
 type usageAggregateProjection struct {
@@ -46,9 +47,13 @@ type usageAggregateProjection struct {
 
 type usageDetailRef struct {
 	Timestamp time.Time
-	API       string
-	Model     string
-	Offset    int
+	ID        uint64
+}
+
+type usageDetailLocation struct {
+	API    string
+	Model  string
+	Offset int
 }
 
 func newUsageAggregateBucket() *usageAggregateBucket {
@@ -216,6 +221,9 @@ func (b *usageAggregateBucket) add(apiName, modelName string, detail RequestDeta
 	}
 	ensureAggregate(b.Sources, source).addDetail(detail)
 	ensureNestedAggregate(b.AuthSources, authIndex, source).addDetail(detail)
+	if detail.internalID != 0 {
+		b.detailIDs = append(b.detailIDs, detail.internalID)
+	}
 }
 
 func (b *usageAggregateBucket) merge(other *usageAggregateBucket) {
@@ -408,6 +416,13 @@ func (s *RequestStatistics) insertDetailRefLocked(ref usageDetailRef) {
 
 func (s *RequestStatistics) rebuildDetailIndexLocked() {
 	s.detailIndex = make([]usageDetailRef, 0)
+	s.detailLocations = make(map[uint64]usageDetailLocation)
+	s.detailIndexTombstones = 0
+	s.authDetailIDs = make(map[string][]uint64)
+	clearAggregateBucketDetailRefs(s.minuteBuckets)
+	clearAggregateBucketDetailRefs(s.hourBuckets)
+	clearAggregateBucketDetailRefs(s.dayBuckets)
+	seen := make(map[uint64]struct{})
 	for apiName, stats := range s.apis {
 		if stats == nil {
 			continue
@@ -417,17 +432,63 @@ func (s *RequestStatistics) rebuildDetailIndexLocked() {
 				continue
 			}
 			for offset, detail := range modelStatsValue.Details {
-				s.detailIndex = append(s.detailIndex, usageDetailRef{
+				if detail.internalID == 0 {
+					detail.internalID = s.allocateDetailIDLocked()
+				} else if _, duplicate := seen[detail.internalID]; duplicate {
+					detail.internalID = s.allocateDetailIDLocked()
+				} else if detail.internalID > s.nextDetailID {
+					s.nextDetailID = detail.internalID
+				}
+				seen[detail.internalID] = struct{}{}
+				modelStatsValue.Details[offset] = detail
+				s.detailLocations[detail.internalID] = usageDetailLocation{API: apiName, Model: modelName, Offset: offset}
+				s.indexAuthDetailLocked(detail.AuthIndex, detail.internalID)
+				ref := usageDetailRef{
 					Timestamp: detail.Timestamp,
-					API:       apiName,
-					Model:     modelName,
-					Offset:    offset,
-				})
+					ID:        detail.internalID,
+				}
+				s.detailIndex = append(s.detailIndex, ref)
+				appendAggregateBucketDetailID(s.minuteBuckets, time.Minute, ref.Timestamp, ref.ID)
+				appendAggregateBucketDetailID(s.hourBuckets, time.Hour, ref.Timestamp, ref.ID)
+				appendAggregateBucketDetailID(s.dayBuckets, 24*time.Hour, ref.Timestamp, ref.ID)
 			}
 		}
 	}
 	s.detailIndexDirty = true
 	s.sortDetailIndexLocked()
+}
+
+func clearAggregateBucketDetailRefs(buckets map[int64]*usageAggregateBucket) {
+	for _, bucket := range buckets {
+		if bucket != nil {
+			bucket.detailIDs = nil
+		}
+	}
+}
+
+func appendAggregateBucketDetailID(buckets map[int64]*usageAggregateBucket, step time.Duration, timestamp time.Time, detailID uint64) {
+	bucket := buckets[truncateAggregateTime(timestamp, step).Unix()]
+	if bucket != nil {
+		bucket.detailIDs = append(bucket.detailIDs, detailID)
+	}
+}
+
+func (s *RequestStatistics) compactDetailIndexLocked() {
+	if s.detailIndexTombstones == 0 {
+		return
+	}
+	if s.detailIndexTombstones < 4096 && s.detailIndexTombstones*2 < len(s.detailIndex) {
+		return
+	}
+	kept := s.detailIndex[:0]
+	for _, ref := range s.detailIndex {
+		if _, ok := s.detailLocations[ref.ID]; ok {
+			kept = append(kept, ref)
+		}
+	}
+	clear(s.detailIndex[len(kept):])
+	s.detailIndex = kept
+	s.detailIndexTombstones = 0
 }
 
 func (s *RequestStatistics) sortDetailIndexLocked() {
@@ -439,13 +500,7 @@ func (s *RequestStatistics) sortDetailIndexLocked() {
 		if !left.Timestamp.Equal(right.Timestamp) {
 			return left.Timestamp.Before(right.Timestamp)
 		}
-		if left.API != right.API {
-			return left.API < right.API
-		}
-		if left.Model != right.Model {
-			return left.Model < right.Model
-		}
-		return left.Offset < right.Offset
+		return left.ID < right.ID
 	})
 	s.detailIndexDirty = false
 }
@@ -725,24 +780,32 @@ func (s *RequestStatistics) forEachIndexedDetailLocked(timeRange TimeRange, visi
 		if !timeRange.To.IsZero() && !ref.Timestamp.Before(timeRange.To) {
 			break
 		}
-		detail, ok := s.detailForRefLocked(ref)
+		detail, location, ok := s.detailForIDLocked(ref.ID)
 		if !ok {
 			continue
 		}
-		visit(ref.API, ref.Model, detail)
+		visit(location.API, location.Model, detail)
 	}
 }
 
-func (s *RequestStatistics) detailForRefLocked(ref usageDetailRef) (RequestDetail, bool) {
-	stats := s.apis[ref.API]
+func (s *RequestStatistics) detailForIDLocked(detailID uint64) (RequestDetail, usageDetailLocation, bool) {
+	location, ok := s.detailLocations[detailID]
+	if !ok {
+		return RequestDetail{}, usageDetailLocation{}, false
+	}
+	stats := s.apis[location.API]
 	if stats == nil {
-		return RequestDetail{}, false
+		return RequestDetail{}, usageDetailLocation{}, false
 	}
-	modelStatsValue := stats.Models[ref.Model]
-	if modelStatsValue == nil || ref.Offset < 0 || ref.Offset >= len(modelStatsValue.Details) {
-		return RequestDetail{}, false
+	modelStatsValue := stats.Models[location.Model]
+	if modelStatsValue == nil || location.Offset < 0 || location.Offset >= len(modelStatsValue.Details) {
+		return RequestDetail{}, usageDetailLocation{}, false
 	}
-	return modelStatsValue.Details[ref.Offset], true
+	detail := modelStatsValue.Details[location.Offset]
+	if detail.internalID != detailID {
+		return RequestDetail{}, usageDetailLocation{}, false
+	}
+	return detail, location, true
 }
 
 func (s *RequestStatistics) allTimeAggregateLocked() *usageAggregateBucket {

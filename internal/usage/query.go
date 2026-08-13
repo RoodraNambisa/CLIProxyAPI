@@ -539,7 +539,7 @@ func (s *RequestStatistics) Details(query DetailQuery) DetailPage {
 				matches = append(matches, DetailEntry{
 					API:           apiName,
 					Model:         modelName,
-					RequestDetail: detail,
+					RequestDetail: publicRequestDetail(detail),
 				})
 			}
 		}

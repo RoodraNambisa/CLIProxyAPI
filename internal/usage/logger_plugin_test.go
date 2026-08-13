@@ -879,6 +879,20 @@ func TestRequestStatisticsRemoveAndPruneRebuildAuthSummaries(t *testing.T) {
 	if summary, ok := stats.AuthSummary("auth-b"); !ok || summary.TotalRequests != 1 || summary.TotalTokens != 20 {
 		t.Fatalf("AuthSummary(auth-b) = %+v, %t; want one request and 20 tokens", summary, ok)
 	}
+	snapshot := stats.Snapshot()
+	details := snapshot.APIs["test-key"].Models["gpt-5.4"].Details
+	if len(details) != 1 || details[0].AuthIndex != "auth-b" {
+		t.Fatalf("remaining details = %+v, want only auth-b", details)
+	}
+	stats.mu.RLock()
+	for detailID, location := range stats.detailLocations {
+		modelStatsValue := stats.apis[location.API].Models[location.Model]
+		if location.Offset < 0 || location.Offset >= len(modelStatsValue.Details) || modelStatsValue.Details[location.Offset].internalID != detailID {
+			stats.mu.RUnlock()
+			t.Fatalf("detail location %d = %+v is inconsistent", detailID, location)
+		}
+	}
+	stats.mu.RUnlock()
 }
 
 func TestRequestStatisticsDetailsFiltersAndPaginates(t *testing.T) {
