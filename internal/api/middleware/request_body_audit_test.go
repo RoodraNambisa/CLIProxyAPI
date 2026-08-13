@@ -181,8 +181,9 @@ func TestRequestBodyAuditMatchedCaseInsensitivePaths(t *testing.T) {
 func TestRequestBodyAuditMatchedASCIIHasNoAllocations(t *testing.T) {
 	body := []byte(`{"model":"gpt-5.5","prompt":"draw a cat"}`)
 	keywords := [][]byte{[]byte("draw a cat"), []byte("blocked")}
+	matcher := newRequestBodyAuditMatcher(keywords, false)
 	allocations := testing.AllocsPerRun(1000, func() {
-		if !requestBodyAuditMatched(body, keywords, false) {
+		if !matcher.match(body) {
 			t.Fatal("expected keyword match")
 		}
 	})
@@ -199,14 +200,77 @@ func TestRequestBodyAuditMatchedLongASCIIUsesUnicodeFold(t *testing.T) {
 	}
 }
 
+func TestRequestBodyAuditMatcherHandlesOverlappingKeywords(t *testing.T) {
+	matcher := newRequestBodyAuditMatcher([][]byte{
+		[]byte("abcd"),
+		[]byte("bcdx"),
+		[]byte("draw a cat"),
+	}, false)
+	for _, body := range [][]byte{
+		[]byte("--ABCD--"),
+		[]byte("prefix BCDX suffix"),
+		[]byte("prefix DRAW A CAT"),
+	} {
+		if !matcher.match(body) {
+			t.Fatalf("matcher did not find a keyword in %q", body)
+		}
+	}
+	if matcher.match([]byte("prefix bcdz suffix")) {
+		t.Fatal("matcher reported an overlapping prefix as a complete keyword")
+	}
+}
+
+func TestRequestBodyAuditRuntimeRecompilesChangedConfig(t *testing.T) {
+	runtime := &requestBodyAuditRuntime{}
+	cfg := config.RequestBodyAuditConfig{Enable: true, Keywords: []string{"first"}}
+	firstPolicy := runtime.resolve(cfg)
+	if firstPolicy.matcher == nil || !firstPolicy.matcher.match([]byte("FIRST")) {
+		t.Fatal("initial policy did not match its keyword")
+	}
+
+	cfg.Keywords[0] = "second"
+	secondPolicy := runtime.resolve(cfg)
+	if secondPolicy == firstPolicy {
+		t.Fatal("changed configuration reused the previous policy")
+	}
+	if secondPolicy.matcher == nil || !secondPolicy.matcher.match([]byte("SECOND")) {
+		t.Fatal("updated policy did not match its keyword")
+	}
+	if secondPolicy.matcher.match([]byte("FIRST")) {
+		t.Fatal("updated policy retained the previous keyword")
+	}
+}
+
 func BenchmarkRequestBodyAuditMatchedASCII(b *testing.B) {
 	body := bytes.Repeat([]byte(`{"model":"gpt-5.5","prompt":"draw a cat"}`), 1024)
 	keywords := [][]byte{[]byte("draw a cat")}
+	matcher := newRequestBodyAuditMatcher(keywords, false)
 	b.ReportAllocs()
+	b.SetBytes(int64(len(body)))
 	b.ResetTimer()
 	for range b.N {
-		if !requestBodyAuditMatched(body, keywords, false) {
+		if !matcher.match(body) {
 			b.Fatal("expected keyword match")
+		}
+	}
+}
+
+func BenchmarkRequestBodyAuditMatcher50MiBThirteenKeywords(b *testing.B) {
+	body := bytes.Repeat([]byte("A"), 50<<20)
+	copy(body[len(body)-len("tail-keyword"):], "tail-keyword")
+	matcher := newRequestBodyAuditMatcher([][]byte{
+		[]byte("alpha"), []byte("bravo"), []byte("charlie"),
+		[]byte("delta"), []byte("echo"), []byte("foxtrot"),
+		[]byte("golf"), []byte("hotel"), []byte("india"),
+		[]byte("juliet"), []byte("kilo"), []byte("lima"),
+		[]byte("tail-keyword"),
+	}, false)
+	b.ReportAllocs()
+	b.SetBytes(int64(len(body)))
+	b.ResetTimer()
+	for range b.N {
+		if !matcher.match(body) {
+			b.Fatal("expected tail keyword match")
 		}
 	}
 }
