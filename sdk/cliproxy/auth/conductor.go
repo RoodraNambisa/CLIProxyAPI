@@ -4912,6 +4912,13 @@ func clearChatGPTWebReloginRuntimeCredentialMetadata(credential *chatgptwebauth.
 		credential.WebAuthn.SignCount = 0
 		credential.WebAuthn.LastUsedAt = ""
 	}
+	if credential.AdvancedAccountSecurity != nil {
+		credential.AdvancedAccountSecurity = chatgptwebauth.CloneAdvancedAccountSecurityCredential(credential.AdvancedAccountSecurity)
+		for index := range credential.AdvancedAccountSecurity.Passkeys {
+			credential.AdvancedAccountSecurity.Passkeys[index].Credential.SignCount = 0
+			credential.AdvancedAccountSecurity.Passkeys[index].Credential.LastUsedAt = ""
+		}
+	}
 }
 
 func authMetadataMatchesExceptKeys(expected, current map[string]any, ignored map[string]struct{}) bool {
@@ -11585,6 +11592,7 @@ func carryForwardConcurrentRefreshMetadata(baseline, current, refreshed, next *A
 			setAuthMetadataEntry(next, "cookies", append([]chatgptwebauth.Cookie(nil), cookies...), true)
 		}
 		carryForwardConcurrentWebAuthnMetadata(baselineCredential, currentCredential, refreshedCredential, next)
+		carryForwardConcurrentAdvancedAccountSecurityMetadata(baselineCredential, currentCredential, refreshedCredential, next)
 	}
 
 	for _, key := range []string{
@@ -11643,6 +11651,21 @@ func carryForwardConcurrentWebAuthnMetadata(
 		merged.LastUsedAt = current.WebAuthn.LastUsedAt
 	}
 	setAuthMetadataEntry(next, "webauthn", &merged, true)
+}
+
+func carryForwardConcurrentAdvancedAccountSecurityMetadata(
+	baseline, current, refreshed *chatgptwebauth.Credential,
+	next *Auth,
+) {
+	if baseline == nil || current == nil || refreshed == nil || next == nil ||
+		baseline.AdvancedAccountSecurity == nil || current.AdvancedAccountSecurity == nil || refreshed.AdvancedAccountSecurity == nil ||
+		!chatgptwebauth.AdvancedAccountSecurityMaterialMatches(baseline.AdvancedAccountSecurity, current.AdvancedAccountSecurity) ||
+		!chatgptwebauth.AdvancedAccountSecurityMaterialMatches(baseline.AdvancedAccountSecurity, refreshed.AdvancedAccountSecurity) {
+		return
+	}
+	merged := chatgptwebauth.CloneAdvancedAccountSecurityCredential(refreshed.AdvancedAccountSecurity)
+	chatgptwebauth.MergeAdvancedAccountSecurityRuntimeState(merged, current.AdvancedAccountSecurity)
+	setAuthMetadataEntry(next, "advanced_account_security", merged, true)
 }
 
 func chatGPTWebCredentialMetadataEntry(credential *chatgptwebauth.Credential, key string) (any, bool) {

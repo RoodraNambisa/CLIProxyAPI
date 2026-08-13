@@ -152,6 +152,133 @@ func TestChatGPTWebExecutorReloginMergesPersistedPasskeyCounter(t *testing.T) {
 	}
 }
 
+func TestChatGPTWebExecutorPersistsAdvancedSecurityReloginStateForCurrentInstance(t *testing.T) {
+	manager := cliproxyauth.NewManager(nil, nil, nil)
+	auth := chatGPTWebAdvancedSecurityTestAuth(t, "persist-advanced-security-state", 6, 4)
+	registered, errRegister := manager.Register(cliproxyauth.WithSkipPersist(t.Context()), auth)
+	if errRegister != nil {
+		t.Fatal(errRegister)
+	}
+	executor := NewChatGPTWebExecutor(&config.Config{}, manager)
+	t.Cleanup(func() { _ = executor.Close() })
+
+	credential, errCredential := chatgptwebauth.ParseCredential(registered.Metadata)
+	if errCredential != nil {
+		t.Fatal(errCredential)
+	}
+	updated := chatgptwebauth.CloneAdvancedAccountSecurityCredential(credential.AdvancedAccountSecurity)
+	updated.Passkeys[1].Credential.SignCount++
+	persisted, errPersist := executor.persistAdvancedAccountSecurityReloginState(t.Context(), registered, *updated)
+	if errPersist != nil {
+		t.Fatal(errPersist)
+	}
+	if persisted.Passkeys[0].Credential.SignCount != 6 || persisted.Passkeys[1].Credential.SignCount != 5 {
+		t.Fatalf("persisted counters = %d/%d, want 6/5", persisted.Passkeys[0].Credential.SignCount, persisted.Passkeys[1].Credential.SignCount)
+	}
+
+	const lastUsedAt = "2026-08-05T04:00:00Z"
+	updated = chatgptwebauth.CloneAdvancedAccountSecurityCredential(&persisted)
+	updated.Passkeys[1].Credential.LastUsedAt = lastUsedAt
+	persisted, errPersist = executor.persistAdvancedAccountSecurityReloginState(t.Context(), registered, *updated)
+	if errPersist != nil {
+		t.Fatal(errPersist)
+	}
+	if persisted.Passkeys[1].Credential.LastUsedAt != lastUsedAt ||
+		persisted.RecoveryKeys[0].RecoveryKey != credential.AdvancedAccountSecurity.RecoveryKeys[0].RecoveryKey {
+		t.Fatalf("persisted advanced security state = %#v", persisted)
+	}
+
+	tampered := chatgptwebauth.CloneAdvancedAccountSecurityCredential(&persisted)
+	tampered.RecoveryKeys[0].RecoveryKey = "replacement-recovery-key"
+	if _, errPersist = executor.persistAdvancedAccountSecurityReloginState(t.Context(), registered, *tampered); !errors.Is(errPersist, chatgptwebauth.ErrCredentialSuperseded) {
+		t.Fatalf("tampered advanced security state error = %v, want superseded", errPersist)
+	}
+}
+
+func TestChatGPTWebExecutorRejectsAdvancedSecurityStateFromReplacedInstance(t *testing.T) {
+	manager := cliproxyauth.NewManager(nil, nil, nil)
+	auth := chatGPTWebAdvancedSecurityTestAuth(t, "replace-advanced-security-state", 6, 4)
+	registered, errRegister := manager.Register(cliproxyauth.WithSkipPersist(t.Context()), auth)
+	if errRegister != nil {
+		t.Fatal(errRegister)
+	}
+	executor := NewChatGPTWebExecutor(&config.Config{}, manager)
+	t.Cleanup(func() { _ = executor.Close() })
+
+	replacement := registered.Clone()
+	replacement.Metadata["password"] = "management-replacement"
+	if _, errUpdate := manager.Update(cliproxyauth.WithSkipPersist(t.Context()), replacement); errUpdate != nil {
+		t.Fatal(errUpdate)
+	}
+	credential, errCredential := chatgptwebauth.ParseCredential(registered.Metadata)
+	if errCredential != nil {
+		t.Fatal(errCredential)
+	}
+	updated := chatgptwebauth.CloneAdvancedAccountSecurityCredential(credential.AdvancedAccountSecurity)
+	updated.Passkeys[0].Credential.SignCount++
+	if _, errPersist := executor.persistAdvancedAccountSecurityReloginState(t.Context(), registered, *updated); !errors.Is(errPersist, chatgptwebauth.ErrCredentialSuperseded) {
+		t.Fatalf("persistAdvancedAccountSecurityReloginState() error = %v, want superseded", errPersist)
+	}
+}
+
+func TestChatGPTWebExecutorReloginMergesPersistedAdvancedSecurityState(t *testing.T) {
+	manager := cliproxyauth.NewManager(&chatGPTWebReloginSourceHashStore{}, nil, nil)
+	auth := chatGPTWebAdvancedSecurityTestAuth(t, "merge-advanced-security-state", 6, 4)
+	auth.Metadata["lifecycle_state"] = cliproxyauth.LifecycleStateReloginPending
+	if _, errRegister := manager.Register(t.Context(), auth); errRegister != nil {
+		t.Fatal(errRegister)
+	}
+	expected, ok := manager.GetByID(auth.ID)
+	if !ok {
+		t.Fatal("registered credential not found")
+	}
+
+	const lastUsedAt = "2026-08-05T05:00:00Z"
+	fake := &fakeChatGPTWebAuthService{loginFn: func(ctx context.Context, input chatgptwebauth.LoginInput) (*chatgptwebauth.Credential, error) {
+		if input.PersistAdvancedAccountSecurity == nil || input.Credential == nil || input.Credential.AdvancedAccountSecurity == nil {
+			t.Fatal("advanced security re-login did not receive its persistence callback")
+		}
+		updated := chatgptwebauth.CloneAdvancedAccountSecurityCredential(input.Credential.AdvancedAccountSecurity)
+		updated.Passkeys[1].Credential.SignCount++
+		persisted, errPersist := input.PersistAdvancedAccountSecurity(ctx, *updated)
+		if errPersist != nil {
+			return nil, errPersist
+		}
+		persisted.Passkeys[1].Credential.LastUsedAt = lastUsedAt
+		if _, errPersist = input.PersistAdvancedAccountSecurity(ctx, persisted); errPersist != nil {
+			return nil, errPersist
+		}
+
+		result := cloneChatGPTWebCredential(input.Credential)
+		result.AccessToken = "fresh-advanced-security-access"
+		result.RefreshToken = ""
+		result.RefreshStrategy = chatgptwebauth.RefreshStrategyChatGPTSession
+		result.LifecycleState = chatgptwebauth.LifecycleActive
+		return result, nil
+	}}
+	executor := NewChatGPTWebExecutor(&config.Config{}, manager)
+	executor.authService = fake
+	t.Cleanup(func() { _ = executor.Close() })
+
+	installed, current, errRelogin := executor.ReloginCurrent(t.Context(), expected)
+	if errRelogin != nil || !current || installed == nil {
+		t.Fatalf("ReloginCurrent() = (%v, %v, %v)", installed, current, errRelogin)
+	}
+	credential, errCredential := chatgptwebauth.ParseCredential(installed.Metadata)
+	if errCredential != nil {
+		t.Fatal(errCredential)
+	}
+	if credential.AdvancedAccountSecurity == nil ||
+		credential.AdvancedAccountSecurity.Passkeys[0].Credential.SignCount != 6 ||
+		credential.AdvancedAccountSecurity.Passkeys[1].Credential.SignCount != 5 ||
+		credential.AdvancedAccountSecurity.Passkeys[1].Credential.LastUsedAt != lastUsedAt {
+		t.Fatalf("installed advanced security state = %#v", credential.AdvancedAccountSecurity)
+	}
+	if credential.AdvancedAccountSecurity.RecoveryKeys[0].RecoveryKey != "recovery-a" {
+		t.Fatalf("recovery material changed: %#v", credential.AdvancedAccountSecurity.RecoveryKeys[0])
+	}
+}
+
 func TestChatGPTWebExecutorTokenOnlyPasskeySchedulesAutomaticRelogin(t *testing.T) {
 	auth := chatGPTWebPasskeyTestAuth(t, "token-only-passkey", 0)
 	credential, errCredential := chatgptwebauth.ParseCredential(auth.Metadata)
@@ -429,6 +556,58 @@ func chatGPTWebPasskeyTestAuth(t *testing.T, id string, signCount uint32) *clipr
 		UserVerified:    true,
 		CreatedAt:       "2026-08-05T00:00:00Z",
 		LastUsedAt:      "2026-08-05T00:00:00Z",
+	}
+	credential.ApplyToMetadata(auth.Metadata)
+	return auth
+}
+
+func chatGPTWebAdvancedSecurityTestAuth(t *testing.T, id string, passkeyCount, securityKeyCount uint32) *cliproxyauth.Auth {
+	t.Helper()
+	auth := chatGPTWebPasskeyTestAuth(t, id+"-passkey", passkeyCount)
+	auth.ID = id
+	credential, errCredential := chatgptwebauth.ParseCredential(auth.Metadata)
+	if errCredential != nil {
+		t.Fatal(errCredential)
+	}
+	passkey := clonePasskeyTestCredential(credential.WebAuthn)
+	passkey.BackupEligible = true
+	passkey.BackupState = true
+	passkey.Transports = []string{"hybrid"}
+
+	securityAuth := chatGPTWebPasskeyTestAuth(t, id+"-security-key", securityKeyCount)
+	securityCredential, errSecurityCredential := chatgptwebauth.ParseCredential(securityAuth.Metadata)
+	if errSecurityCredential != nil {
+		t.Fatal(errSecurityCredential)
+	}
+	securityKey := clonePasskeyTestCredential(securityCredential.WebAuthn)
+	securityKey.BackupEligible = false
+	securityKey.BackupState = false
+	securityKey.Transports = []string{"usb"}
+
+	recoveryKeys := make([]chatgptwebauth.AdvancedAccountRecoveryKey, 5)
+	for index := range recoveryKeys {
+		suffix := string(rune('a' + index))
+		recoveryKeys[index] = chatgptwebauth.AdvancedAccountRecoveryKey{
+			RecoveryKey:                "recovery-" + suffix,
+			AccountRecoveryCode:        "account-" + suffix,
+			XWingPublicKeyBase64:       base64.StdEncoding.EncodeToString([]byte{byte(index + 1), 1}),
+			AuthenticationSecretBase64: base64.StdEncoding.EncodeToString([]byte{byte(index + 1), 2}),
+		}
+	}
+	credential.CredentialSchemaVersion = chatgptwebauth.CredentialSchemaVersionAdvancedAccountSecurity
+	credential.WebAuthn = nil
+	credential.LoginMethod = chatgptwebauth.LoginMethodAdvancedSecurityPasskey
+	credential.AdvancedAccountSecurity = &chatgptwebauth.AdvancedAccountSecurityCredential{
+		Version: chatgptwebauth.AdvancedAccountSecurityCredentialVersion,
+		Enabled: true,
+		Passkeys: []chatgptwebauth.AdvancedAccountSecurityPasskeyCredential{
+			{Kind: "passkey", IsNonDeviceBound: true, Credential: passkey},
+			{Kind: "security-key", IsSecurityKey: true, Credential: securityKey},
+		},
+		RecoveryKeys: recoveryKeys,
+		EnrolledAt:   "2026-08-05T00:00:00Z",
+		VerifiedAt:   "2026-08-05T01:00:00Z",
+		LoginMethod:  "passkey",
 	}
 	credential.ApplyToMetadata(auth.Metadata)
 	return auth

@@ -1303,6 +1303,9 @@ func (e *ChatGPTWebExecutor) reloginCurrent(ctx context.Context, expected *clipr
 		PersistWebAuthn: func(persistCtx context.Context, updated chatgptwebauth.WebAuthnCredential) (chatgptwebauth.WebAuthnCredential, error) {
 			return e.persistWebAuthnReloginState(persistCtx, expected, updated)
 		},
+		PersistAdvancedAccountSecurity: func(persistCtx context.Context, updated chatgptwebauth.AdvancedAccountSecurityCredential) (chatgptwebauth.AdvancedAccountSecurityCredential, error) {
+			return e.persistAdvancedAccountSecurityReloginState(persistCtx, expected, updated)
+		},
 	}, runtimeCfg)
 	if errContext := ctx.Err(); errContext != nil {
 		if latest, ok := e.manager.GetByID(expected.ID); ok &&
@@ -1571,6 +1574,75 @@ func (e *ChatGPTWebExecutor) persistWebAuthnReloginState(
 	result := *persisted.WebAuthn
 	result.Transports = append([]string(nil), persisted.WebAuthn.Transports...)
 	return result, nil
+}
+
+func (e *ChatGPTWebExecutor) persistAdvancedAccountSecurityReloginState(
+	ctx context.Context,
+	expected *cliproxyauth.Auth,
+	updated chatgptwebauth.AdvancedAccountSecurityCredential,
+) (chatgptwebauth.AdvancedAccountSecurityCredential, error) {
+	if e == nil || e.manager == nil || expected == nil {
+		return chatgptwebauth.AdvancedAccountSecurityCredential{}, chatgptwebauth.ErrCredentialSuperseded
+	}
+	if errValidate := chatgptwebauth.ValidateAdvancedAccountSecurityCredential(&updated); errValidate != nil {
+		return chatgptwebauth.AdvancedAccountSecurityCredential{}, errValidate
+	}
+	var mutationErr error
+	installed, current, errMutate := e.manager.MutateRuntimeMetadataIfCurrent(ctx, expected, func(candidate *cliproxyauth.Auth) {
+		if mutationErr != nil || candidate == nil {
+			return
+		}
+		credential, errParse := chatgptwebauth.ParseCredential(candidate.Metadata)
+		if errParse != nil || credential.AdvancedAccountSecurity == nil ||
+			!chatgptwebauth.AdvancedAccountSecurityMaterialMatches(credential.AdvancedAccountSecurity, &updated) {
+			mutationErr = chatgptwebauth.ErrCredentialSuperseded
+			return
+		}
+
+		var incremented uint64
+		for index := range updated.Passkeys {
+			currentKey := &credential.AdvancedAccountSecurity.Passkeys[index].Credential
+			updatedKey := &updated.Passkeys[index].Credential
+			if updatedKey.SignCount < currentKey.SignCount || updatedKey.SignCount-currentKey.SignCount > 1 {
+				mutationErr = errors.New("chatgpt web advanced security Passkey signature counter is not monotonic")
+				return
+			}
+			incremented += uint64(updatedKey.SignCount - currentKey.SignCount)
+			if chatgptwebauth.CompareWebAuthnLastUsedAt(updatedKey.LastUsedAt, currentKey.LastUsedAt) < 0 {
+				mutationErr = errors.New("chatgpt web advanced security Passkey last-used timestamp moved backwards")
+				return
+			}
+		}
+		if incremented > 1 {
+			mutationErr = errors.New("chatgpt web advanced security updated multiple Passkey counters")
+			return
+		}
+
+		credential.AdvancedAccountSecurity = chatgptwebauth.CloneAdvancedAccountSecurityCredential(&updated)
+		credential.ApplyToMetadata(candidate.Metadata)
+	})
+	if errMutate != nil {
+		return chatgptwebauth.AdvancedAccountSecurityCredential{}, errMutate
+	}
+	if !current || mutationErr != nil {
+		if mutationErr != nil {
+			return chatgptwebauth.AdvancedAccountSecurityCredential{}, mutationErr
+		}
+		return chatgptwebauth.AdvancedAccountSecurityCredential{}, chatgptwebauth.ErrCredentialSuperseded
+	}
+	persisted, errParse := chatgptwebauth.ParseCredential(installed.Metadata)
+	if errParse != nil || persisted.AdvancedAccountSecurity == nil ||
+		!chatgptwebauth.AdvancedAccountSecurityMaterialMatches(persisted.AdvancedAccountSecurity, &updated) {
+		return chatgptwebauth.AdvancedAccountSecurityCredential{}, errors.New("persisted chatgpt web advanced security state is invalid")
+	}
+	for index := range updated.Passkeys {
+		persistedKey := &persisted.AdvancedAccountSecurity.Passkeys[index].Credential
+		updatedKey := &updated.Passkeys[index].Credential
+		if persistedKey.SignCount != updatedKey.SignCount || persistedKey.LastUsedAt != updatedKey.LastUsedAt {
+			return chatgptwebauth.AdvancedAccountSecurityCredential{}, errors.New("persisted chatgpt web advanced security authenticator state is invalid")
+		}
+	}
+	return *chatgptwebauth.CloneAdvancedAccountSecurityCredential(persisted.AdvancedAccountSecurity), nil
 }
 
 func (e *ChatGPTWebExecutor) refreshCredential(ctx context.Context, auth *cliproxyauth.Auth, waitForCompletion bool) (*cliproxyauth.Auth, error, bool) {
@@ -1884,6 +1956,7 @@ func cloneChatGPTWebCredential(credential *chatgptwebauth.Credential) *chatgptwe
 		webAuthn.Transports = append([]string(nil), credential.WebAuthn.Transports...)
 		clone.WebAuthn = &webAuthn
 	}
+	clone.AdvancedAccountSecurity = chatgptwebauth.CloneAdvancedAccountSecurityCredential(credential.AdvancedAccountSecurity)
 	return &clone
 }
 

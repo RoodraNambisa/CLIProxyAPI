@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"reflect"
 	"strings"
 	"time"
 )
@@ -167,6 +168,27 @@ func CloneAdvancedAccountSecurityCredential(source *AdvancedAccountSecurityCrede
 	}
 	clone.RecoveryKeys = append([]AdvancedAccountRecoveryKey(nil), source.RecoveryKeys...)
 	return &clone
+}
+
+// AdvancedAccountSecurityMaterialMatches reports whether two advanced account
+// security credentials contain the same immutable authenticator and recovery
+// material. Runtime counters and last-used timestamps are intentionally
+// ignored because they advance during authentication.
+func AdvancedAccountSecurityMaterialMatches(left, right *AdvancedAccountSecurityCredential) bool {
+	if left == nil || right == nil {
+		return false
+	}
+	leftClone := CloneAdvancedAccountSecurityCredential(left)
+	rightClone := CloneAdvancedAccountSecurityCredential(right)
+	for index := range leftClone.Passkeys {
+		leftClone.Passkeys[index].Credential.SignCount = 0
+		leftClone.Passkeys[index].Credential.LastUsedAt = ""
+	}
+	for index := range rightClone.Passkeys {
+		rightClone.Passkeys[index].Credential.SignCount = 0
+		rightClone.Passkeys[index].Credential.LastUsedAt = ""
+	}
+	return reflect.DeepEqual(leftClone, rightClone)
 }
 
 // MergeAdvancedAccountSecurityRuntimeState preserves monotonic authenticator
