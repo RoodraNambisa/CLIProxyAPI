@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -580,6 +581,89 @@ func TestRequestStatisticsPruneAuthIndexesRemovesStaleEntries(t *testing.T) {
 	snapshot := stats.Snapshot()
 	if snapshot.TotalRequests != 1 || snapshot.TotalTokens != 10 {
 		t.Fatalf("snapshot totals = %+v, want requests=1 tokens=10", snapshot)
+	}
+}
+
+func TestRequestStatisticsAsyncRecordFlushesBeforeRead(t *testing.T) {
+	stats := newRequestStatistics(true)
+	stats.Record(context.Background(), coreusage.Record{
+		APIKey:      "test-key",
+		Model:       "gpt-5.4",
+		RequestedAt: time.Date(2026, 3, 20, 12, 0, 0, 0, time.UTC),
+		Detail:      coreusage.Detail{TotalTokens: 17},
+		AuthIndex:   "auth-a",
+	})
+
+	summary := stats.Summary()
+	if summary.TotalRequests != 1 || summary.TotalTokens != 17 {
+		t.Fatalf("summary = %+v, want one request and 17 tokens", summary)
+	}
+	runtime := stats.batch.snapshot()
+	if runtime.QueueDepth != 0 || runtime.ProcessedRecords != 1 || runtime.Flushes == 0 {
+		t.Fatalf("batch runtime = %+v, want flushed record", runtime)
+	}
+}
+
+func TestRequestStatisticsRemoveAuthIndexesPreservesDerivedViews(t *testing.T) {
+	stats := NewRequestStatistics()
+	base := time.Now().UTC().Add(-2 * time.Hour).Truncate(time.Minute)
+	records := []coreusage.Record{
+		{APIKey: "api-a", Model: "model-a", Source: "source-a", RequestedAt: base, Detail: coreusage.Detail{InputTokens: 3, OutputTokens: 7, TotalTokens: 10}, AuthIndex: "remove"},
+		{APIKey: "api-a", Model: "model-a", Source: "source-a", RequestedAt: base.Add(time.Minute), Failed: true, Detail: coreusage.Detail{InputTokens: 4, OutputTokens: 16, TotalTokens: 20}, AuthIndex: "keep"},
+		{APIKey: "api-b", Model: "model-b", Source: "source-b", RequestedAt: base.Add(2 * time.Minute), Detail: coreusage.Detail{InputTokens: 5, OutputTokens: 25, TotalTokens: 30}, AuthIndex: "remove"},
+		{APIKey: "api-b", Model: "model-b", Source: "source-b", RequestedAt: base.Add(3 * time.Minute), Detail: coreusage.Detail{InputTokens: 6, OutputTokens: 34, TotalTokens: 40}, AuthIndex: "keep"},
+	}
+	for _, record := range records {
+		stats.Record(context.Background(), record)
+	}
+	expected := NewRequestStatistics()
+	for _, record := range records {
+		if record.AuthIndex == "keep" {
+			expected.Record(context.Background(), record)
+		}
+	}
+
+	if removed := stats.RemoveAuthIndexes([]string{"remove"}); removed != 2 {
+		t.Fatalf("RemoveAuthIndexes() = %d, want 2", removed)
+	}
+	if got, want := stats.Snapshot(), expected.Snapshot(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("snapshot mismatch after incremental removal\ngot:  %+v\nwant: %+v", got, want)
+	}
+	gotSummary, wantSummary := stats.Summary(), expected.Summary()
+	wantSummary.Version = gotSummary.Version
+	if !reflect.DeepEqual(gotSummary, wantSummary) {
+		t.Fatalf("summary mismatch after incremental removal\ngot:  %+v\nwant: %+v", gotSummary, wantSummary)
+	}
+	gotDetails := stats.Details(DetailQuery{Limit: 10})
+	wantDetails := expected.Details(DetailQuery{Limit: 10})
+	if !reflect.DeepEqual(gotDetails, wantDetails) {
+		t.Fatalf("details mismatch after incremental removal\ngot:  %+v\nwant: %+v", gotDetails, wantDetails)
+	}
+}
+
+func TestRequestStatisticsRemoveAuthIndexesPreservesZeroTokenAuxiliaryViews(t *testing.T) {
+	stats := NewRequestStatistics()
+	base := time.Now().UTC().Add(-2 * time.Hour).Truncate(time.Minute)
+	records := []coreusage.Record{
+		{APIKey: "api-a", Model: "model-a", Source: "source-a", RequestedAt: base, Auxiliary: true, AuthIndex: "keep"},
+		{APIKey: "api-a", Model: "model-a", Source: "source-a", RequestedAt: base.Add(time.Minute), Auxiliary: true, AuthIndex: "remove"},
+	}
+	for _, record := range records {
+		stats.Record(context.Background(), record)
+	}
+	expected := NewRequestStatistics()
+	expected.Record(context.Background(), records[0])
+
+	if removed := stats.RemoveAuthIndexes([]string{"remove"}); removed != 1 {
+		t.Fatalf("RemoveAuthIndexes() = %d, want 1", removed)
+	}
+	gotSummary, wantSummary := stats.Summary(), expected.Summary()
+	wantSummary.Version = gotSummary.Version
+	if !reflect.DeepEqual(gotSummary, wantSummary) {
+		t.Fatalf("summary mismatch after zero-token auxiliary removal\ngot:  %+v\nwant: %+v", gotSummary, wantSummary)
+	}
+	if got, want := stats.Details(DetailQuery{Limit: 10}), expected.Details(DetailQuery{Limit: 10}); !reflect.DeepEqual(got, want) {
+		t.Fatalf("details mismatch after zero-token auxiliary removal\ngot:  %+v\nwant: %+v", got, want)
 	}
 }
 

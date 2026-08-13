@@ -130,6 +130,7 @@ func (s *RequestStatistics) healthAt(query HealthQuery, now time.Time) HealthRes
 	if s == nil || result.From.IsZero() || result.To.IsZero() || !result.From.Before(result.To) {
 		return result
 	}
+	s.flushPending()
 
 	authSet := stringSet(query.AuthIndexes)
 	sourceSet := stringSet(query.Sources)
@@ -206,6 +207,7 @@ func (s *RequestStatistics) ratesAt(query RatesQuery, now time.Time) RatesResult
 	if s == nil {
 		return result
 	}
+	s.flushPending()
 	now = now.UTC()
 
 	s.pruneExpiredBuckets(now)
@@ -253,6 +255,7 @@ func (s *RequestStatistics) TokensForQuery(query TokenQuery) TokenResult {
 	if s == nil {
 		return result
 	}
+	s.flushPending()
 
 	s.pruneExpiredBuckets(result.AsOf)
 	s.mu.RLock()

@@ -138,6 +138,7 @@ func (s *RequestStatistics) Costs(query CostQuery) CostResult {
 	if s == nil {
 		return result
 	}
+	s.flushPending()
 
 	s.pruneExpiredBuckets(result.AsOf)
 	s.mu.RLock()

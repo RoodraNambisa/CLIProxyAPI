@@ -9,6 +9,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/api/middleware"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/systemmetrics"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/usage"
 )
 
 type systemMetricsFilesystems struct {
@@ -22,6 +23,7 @@ type systemMetricsResponse struct {
 	Runtime          systemmetrics.RuntimeSnapshot              `json:"runtime"`
 	Filesystems      systemMetricsFilesystems                   `json:"filesystems"`
 	RequestBodyAudit middleware.RequestBodyAuditRuntimeSnapshot `json:"request_body_audit"`
+	UsageBatch       usage.UsageBatchRuntimeSnapshot            `json:"usage_batch"`
 }
 
 // GetSystemMetrics returns low-overhead process and filesystem metrics.
@@ -48,6 +50,7 @@ func (h *Handler) GetSystemMetrics(c *gin.Context) {
 		CollectedAt:      time.Now().UTC(),
 		Runtime:          systemmetrics.CollectRuntime(),
 		RequestBodyAudit: middleware.RequestBodyAuditSnapshot(),
+		UsageBatch:       usage.BatchRuntimeSnapshot(),
 		Filesystems: systemMetricsFilesystems{
 			WorkingDirectory: systemmetrics.CollectFilesystem(workingDirectory),
 			AuthDirectory:    systemmetrics.CollectFilesystem(authDirectory),

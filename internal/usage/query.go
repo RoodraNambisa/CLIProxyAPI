@@ -210,6 +210,7 @@ func (s *RequestStatistics) Meta() MetaSnapshot {
 	if s == nil {
 		return MetaSnapshot{Enabled: StatisticsEnabled(), AsOf: now}
 	}
+	s.flushPending()
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return MetaSnapshot{
@@ -242,11 +243,12 @@ func (s *RequestStatistics) summary(includeSources bool) SummarySnapshot {
 	if s == nil {
 		return result
 	}
+	s.flushPending()
 	s.pruneExpiredBuckets(time.Now().UTC())
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	result = summarySnapshotFromAggregate(s.changeCount, s.aggregateProjectedRangeLocked(TimeRange{}, summaryAggregateProjection(includeSources)), includeSources)
+	result = s.summaryAllTimeLocked(includeSources)
 	result.RequestsByDay = cloneStringIntMap(s.requestsByDay)
 	result.RequestsByHour = cloneHourIntMap(s.requestsByHour)
 	result.TokensByDay = cloneStringIntMap(s.tokensByDay)
@@ -273,6 +275,7 @@ func (s *RequestStatistics) summaryForRange(timeRange TimeRange, includeSources 
 	if s == nil {
 		return result
 	}
+	s.flushPending()
 
 	s.pruneExpiredBuckets(time.Now().UTC())
 	s.mu.RLock()
@@ -288,6 +291,7 @@ func (s *RequestStatistics) SourceFacets(timeRange TimeRange, query string, limi
 	if s == nil {
 		return []SourceFacet{}, 0
 	}
+	s.flushPending()
 	query = strings.ToLower(strings.TrimSpace(query))
 	if limit <= 0 {
 		limit = 100
@@ -392,6 +396,7 @@ func (s *RequestStatistics) AuthSummaries() []AuthUsageSnapshot {
 	if s == nil {
 		return nil
 	}
+	s.flushPending()
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	out := make([]AuthUsageSnapshot, 0, len(s.auths))
@@ -415,6 +420,19 @@ func (s *RequestStatistics) AuthSummariesForQuery(query AuthUsageQuery) []AuthUs
 	authSet := stringSet(query.AuthIndexes)
 	if query.TimeRange.IsZero() && len(authSet) == 0 {
 		return s.AuthSummaries()
+	}
+	s.flushPending()
+	if query.TimeRange.IsZero() {
+		s.mu.RLock()
+		out := make([]AuthUsageSnapshot, 0, len(authSet))
+		for authIndex := range authSet {
+			if stats := s.auths[authIndex]; stats != nil {
+				out = append(out, authUsageSnapshot(authIndex, stats))
+			}
+		}
+		s.mu.RUnlock()
+		sort.Slice(out, func(i, j int) bool { return out[i].AuthIndex < out[j].AuthIndex })
+		return out
 	}
 
 	s.pruneExpiredBuckets(time.Now().UTC())
@@ -445,6 +463,7 @@ func (s *RequestStatistics) AuthSummary(authIndex string) (AuthUsageSnapshot, bo
 	if s == nil || authIndex == "" {
 		return AuthUsageSnapshot{}, false
 	}
+	s.flushPending()
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	stats, ok := s.auths[authIndex]
@@ -460,6 +479,7 @@ func (s *RequestStatistics) AuthModelSummaries(authIndex string) ([]AuthModelUsa
 	if s == nil || authIndex == "" {
 		return nil, false
 	}
+	s.flushPending()
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	stats, ok := s.auths[authIndex]
@@ -494,6 +514,7 @@ func (s *RequestStatistics) Details(query DetailQuery) DetailPage {
 		return newDetailPage(nil, 0, query.Offset, query.Limit)
 	}
 	query = normalizeDetailQuery(query)
+	s.flushPending()
 
 	s.mu.RLock()
 	matches := make([]DetailEntry, 0)
@@ -550,6 +571,7 @@ func (s *RequestStatistics) Series(query SeriesQuery) SeriesResult {
 	if s == nil {
 		return result
 	}
+	s.flushPending()
 
 	s.pruneExpiredBuckets(time.Now().UTC())
 	s.mu.RLock()
@@ -748,6 +770,56 @@ func summarySnapshotFromAggregate(version uint64, aggregate *usageAggregateBucke
 	}
 	if includeSources {
 		for source, stats := range aggregate.Sources {
+			if stats != nil {
+				result.Sources[source] = modelSummarySnapshotFromAggregate(stats)
+			}
+		}
+	}
+	return result
+}
+
+func (s *RequestStatistics) summaryAllTimeLocked(includeSources bool) SummarySnapshot {
+	result := newSummarySnapshot(s.changeCount)
+	result.TotalRequests = s.totalRequests
+	result.SuccessCount = s.successCount
+	result.FailureCount = s.failureCount
+	result.TotalTokens = s.totalTokens
+	result.Tokens = s.tokens
+	for apiName, stats := range s.apis {
+		if stats == nil {
+			continue
+		}
+		apiSnapshot := APISummarySnapshot{
+			TotalRequests: stats.TotalRequests,
+			SuccessCount:  stats.SuccessCount,
+			FailureCount:  stats.FailureCount,
+			TotalTokens:   stats.TotalTokens,
+			Tokens:        stats.Tokens,
+			LastUsedAt:    usageTimePointer(stats.LastUsedAt),
+			Models:        make(map[string]ModelSummarySnapshot, len(stats.Models)),
+		}
+		for modelName, modelStatsValue := range stats.Models {
+			if modelStatsValue == nil {
+				continue
+			}
+			apiSnapshot.Models[modelName] = ModelSummarySnapshot{
+				TotalRequests: modelStatsValue.TotalRequests,
+				SuccessCount:  modelStatsValue.SuccessCount,
+				FailureCount:  modelStatsValue.FailureCount,
+				TotalTokens:   modelStatsValue.TotalTokens,
+				Tokens:        modelStatsValue.Tokens,
+				LastUsedAt:    usageTimePointer(modelStatsValue.LastUsedAt),
+			}
+		}
+		result.APIs[apiName] = apiSnapshot
+	}
+	for modelName, stats := range s.models {
+		if stats != nil {
+			result.Models[modelName] = modelSummarySnapshotFromAggregate(stats)
+		}
+	}
+	if includeSources {
+		for source, stats := range s.sources {
 			if stats != nil {
 				result.Sources[source] = modelSummarySnapshotFromAggregate(stats)
 			}

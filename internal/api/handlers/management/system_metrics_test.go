@@ -58,4 +58,7 @@ func TestGetSystemMetricsReturnsRuntimeAndConfiguredFilesystems(t *testing.T) {
 		response.Filesystems.UsageCache.Path != root {
 		t.Fatalf("nearest existing filesystems = %#v", response.Filesystems)
 	}
+	if response.UsageBatch.QueueCapacity < 1 {
+		t.Fatalf("UsageBatch = %#v, want bounded production queue", response.UsageBatch)
+	}
 }

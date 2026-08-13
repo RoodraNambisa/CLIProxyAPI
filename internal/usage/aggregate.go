@@ -14,6 +14,7 @@ const (
 )
 
 type aggregateStats struct {
+	DetailCount        int64
 	TotalRequests      int64
 	SuccessCount       int64
 	FailureCount       int64
@@ -66,6 +67,7 @@ func (a *aggregateStats) addDetail(detail RequestDetail) {
 	if a == nil {
 		return
 	}
+	a.DetailCount = saturatingAddInt64(a.DetailCount, 1)
 	updateUsageAggregate(
 		&a.TotalRequests,
 		&a.SuccessCount,
@@ -96,6 +98,7 @@ func (a *aggregateStats) merge(other aggregateStats) {
 	if a == nil {
 		return
 	}
+	a.DetailCount = saturatingAddInt64(a.DetailCount, other.DetailCount)
 	a.TotalRequests = saturatingAddInt64(a.TotalRequests, other.TotalRequests)
 	a.SuccessCount = saturatingAddInt64(a.SuccessCount, other.SuccessCount)
 	a.FailureCount = saturatingAddInt64(a.FailureCount, other.FailureCount)
@@ -111,6 +114,37 @@ func (a *aggregateStats) merge(other aggregateStats) {
 	}
 }
 
+func (a *aggregateStats) removeDetail(detail RequestDetail) {
+	if a == nil {
+		return
+	}
+	a.DetailCount = subtractNonNegativeInt64(a.DetailCount, 1)
+	subtractUsageAggregate(
+		&a.TotalRequests,
+		&a.SuccessCount,
+		&a.FailureCount,
+		&a.TotalTokens,
+		&a.Tokens,
+		detail,
+	)
+	if detail.Failed {
+		subtractTokenStats(&a.FailureTokens, detail.Tokens)
+	} else {
+		subtractTokenStats(&a.SuccessTokens, detail.Tokens)
+	}
+	normalizedTokens := normaliseTokenStats(detail.Tokens)
+	if hasCostBreakdown(normalizedTokens) {
+		if !detail.Auxiliary {
+			a.CalculableRequests = subtractNonNegativeInt64(a.CalculableRequests, 1)
+		}
+		a.CalculableTokens = subtractNonNegativeInt64(a.CalculableTokens, normalizedTokens.TotalTokens)
+		a.NonCachedInput = subtractNonNegativeInt64(a.NonCachedInput, nonCachedInputTokens(normalizedTokens))
+	}
+	if a.LastUsedAt.Equal(detail.Timestamp) {
+		a.LastUsedAt = time.Time{}
+	}
+}
+
 func addTokenStats(target *TokenStats, value TokenStats) {
 	if target == nil {
 		return
@@ -122,6 +156,19 @@ func addTokenStats(target *TokenStats, value TokenStats) {
 	target.CachedTokens = saturatingAddInt64(target.CachedTokens, value.CachedTokens)
 	target.CacheCreationTokens = saturatingAddInt64(target.CacheCreationTokens, value.CacheCreationTokens)
 	target.TotalTokens = saturatingAddInt64(target.TotalTokens, value.TotalTokens)
+}
+
+func subtractTokenStats(target *TokenStats, value TokenStats) {
+	if target == nil {
+		return
+	}
+	value = normaliseTokenStats(value)
+	target.InputTokens = subtractNonNegativeInt64(target.InputTokens, value.InputTokens)
+	target.OutputTokens = subtractNonNegativeInt64(target.OutputTokens, value.OutputTokens)
+	target.ReasoningTokens = subtractNonNegativeInt64(target.ReasoningTokens, value.ReasoningTokens)
+	target.CachedTokens = subtractNonNegativeInt64(target.CachedTokens, value.CachedTokens)
+	target.CacheCreationTokens = subtractNonNegativeInt64(target.CacheCreationTokens, value.CacheCreationTokens)
+	target.TotalTokens = subtractNonNegativeInt64(target.TotalTokens, value.TotalTokens)
 }
 
 func hasCostBreakdown(tokens TokenStats) bool {
@@ -183,6 +230,62 @@ func (b *usageAggregateBucket) merge(other *usageAggregateBucket) {
 	mergeNestedAggregateMap(b.AuthModels, other.AuthModels)
 	mergeNestedAggregateMap(b.AuthSources, other.AuthSources)
 	mergeAggregateMap(b.Sources, other.Sources)
+}
+
+func (b *usageAggregateBucket) remove(apiName, modelName string, detail RequestDetail) {
+	if b == nil {
+		return
+	}
+	apiName = strings.TrimSpace(apiName)
+	if apiName == "" {
+		apiName = "unknown"
+	}
+	modelName = strings.TrimSpace(modelName)
+	if modelName == "" {
+		modelName = "unknown"
+	}
+	b.Total.removeDetail(detail)
+	removeAggregateDetail(b.APIs, apiName, detail)
+	removeAggregateDetail(b.Models, modelName, detail)
+	removeNestedAggregateDetail(b.APIModels, apiName, modelName, detail)
+	authIndex := strings.TrimSpace(detail.AuthIndex)
+	if authIndex == "" {
+		authIndex = "unknown"
+	}
+	removeAggregateDetail(b.Auths, authIndex, detail)
+	removeNestedAggregateDetail(b.AuthModels, authIndex, modelName, detail)
+	source := strings.TrimSpace(detail.Source)
+	if source == "" {
+		source = "unknown"
+	}
+	removeAggregateDetail(b.Sources, source, detail)
+	removeNestedAggregateDetail(b.AuthSources, authIndex, source, detail)
+}
+
+func removeAggregateDetail(values map[string]*aggregateStats, key string, detail RequestDetail) {
+	value := values[key]
+	if value == nil {
+		return
+	}
+	value.removeDetail(detail)
+	if value.empty() {
+		delete(values, key)
+	}
+}
+
+func removeNestedAggregateDetail(values map[string]map[string]*aggregateStats, first, second string, detail RequestDetail) {
+	nested := values[first]
+	if nested == nil {
+		return
+	}
+	removeAggregateDetail(nested, second, detail)
+	if len(nested) == 0 {
+		delete(values, first)
+	}
+}
+
+func (a *aggregateStats) empty() bool {
+	return a == nil || a.DetailCount == 0
 }
 
 func ensureAggregate(values map[string]*aggregateStats, key string) *aggregateStats {
@@ -679,6 +782,7 @@ func (s *RequestStatistics) updateLegacyHourBucketLocked(detail RequestDetail) {
 		Timestamp: timestamp,
 		Tokens:    totalTokens,
 		Requests:  requests,
+		AuthIndex: strings.TrimSpace(detail.AuthIndex),
 	})
 }
 
@@ -713,4 +817,12 @@ func nonNegativeInt64(value int64) int64 {
 		return 0
 	}
 	return value
+}
+
+func subtractNonNegativeInt64(value, decrement int64) int64 {
+	decrement = nonNegativeInt64(decrement)
+	if decrement >= value {
+		return 0
+	}
+	return value - decrement
 }
