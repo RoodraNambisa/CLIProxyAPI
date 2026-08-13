@@ -250,6 +250,7 @@ func applyChatGPTWebMetadataSummary(entry gin.H, metadata map[string]any, lifecy
 	if credential, errParse := chatgptwebauth.ParseCredential(metadata); errParse == nil {
 		strategy = string(credential.RefreshStrategy)
 		mode = credential.CredentialMode
+		applyChatGPTWebAdvancedSecuritySummary(entry, credential)
 		planType := strings.TrimSpace(credential.PlanType)
 		entry["plan_type"] = planType
 		entry["quota_state"] = string(credential.QuotaState)
@@ -271,6 +272,20 @@ func applyChatGPTWebMetadataSummary(entry gin.H, metadata map[string]any, lifecy
 	entry["source_credential_uid"] = strings.TrimSpace(stringValue(metadata, "source_credential_uid"))
 	if uid := strings.TrimSpace(stringValue(metadata, "credential_uid")); uid != "" {
 		entry["credential_uid"] = uid
+	}
+}
+
+func applyChatGPTWebAdvancedSecuritySummary(entry gin.H, credential *chatgptwebauth.Credential) {
+	if entry == nil || credential == nil || credential.AdvancedAccountSecurity == nil {
+		return
+	}
+	advanced := credential.AdvancedAccountSecurity
+	entry["credential_schema_version"] = credential.CredentialSchemaVersion
+	entry["advanced_account_security"] = gin.H{
+		"enabled":            advanced.Enabled,
+		"login_method":       strings.TrimSpace(advanced.LoginMethod),
+		"passkey_count":      len(advanced.Passkeys),
+		"recovery_key_count": len(advanced.RecoveryKeys),
 	}
 }
 

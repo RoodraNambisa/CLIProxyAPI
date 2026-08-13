@@ -165,6 +165,50 @@ func TestApplyChatGPTWebMetadataSummarySanitizesLifecycleReason(t *testing.T) {
 	}
 }
 
+func TestApplyChatGPTWebMetadataSummaryIncludesSafeAdvancedSecuritySummary(t *testing.T) {
+	metadata, secrets := advancedSecuritySummaryMetadata(t)
+	entry := gin.H{}
+	applyChatGPTWebMetadataSummary(entry, metadata, string(chatgptwebauth.LifecycleActive), time.Now())
+
+	if entry["credential_schema_version"] != chatgptwebauth.CredentialSchemaVersionAdvancedAccountSecurity {
+		t.Fatalf("credential_schema_version = %#v", entry["credential_schema_version"])
+	}
+	summary, ok := entry["advanced_account_security"].(gin.H)
+	if !ok {
+		t.Fatalf("advanced_account_security = %#v", entry["advanced_account_security"])
+	}
+	if summary["enabled"] != true || summary["login_method"] != "passkey" ||
+		summary["passkey_count"] != 2 || summary["recovery_key_count"] != 5 {
+		t.Fatalf("advanced account security summary = %#v", summary)
+	}
+	encoded, errMarshal := json.Marshal(entry)
+	if errMarshal != nil {
+		t.Fatal(errMarshal)
+	}
+	for _, secret := range secrets {
+		if strings.Contains(string(encoded), secret) {
+			t.Fatalf("advanced account security summary leaked %q: %s", secret, encoded)
+		}
+	}
+}
+
+func advancedSecuritySummaryMetadata(t *testing.T) (map[string]any, []string) {
+	t.Helper()
+	payload, advanced := chatGPTWebImportAdvancedSecurityFixture(t)
+	var metadata map[string]any
+	if errUnmarshal := json.Unmarshal([]byte(payload), &metadata); errUnmarshal != nil {
+		t.Fatal(errUnmarshal)
+	}
+	secrets := make([]string, 0, len(advanced.Passkeys)*2+len(advanced.RecoveryKeys)*2)
+	for _, passkey := range advanced.Passkeys {
+		secrets = append(secrets, passkey.Credential.PrivateKeyPKCS8, passkey.Credential.CredentialID)
+	}
+	for _, recovery := range advanced.RecoveryKeys {
+		secrets = append(secrets, recovery.RecoveryKey, recovery.AccountRecoveryCode)
+	}
+	return metadata, secrets
+}
+
 func TestSafeChatGPTWebErrorDiagnosticKeepsOnlyAllowlistedStructure(t *testing.T) {
 	source := &coreauth.ErrorDiagnostic{
 		Provider:              "attacker-provider",
