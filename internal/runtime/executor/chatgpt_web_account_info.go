@@ -4173,10 +4173,15 @@ func (runtime *chatGPTWebAccountInfoRuntime) clearPendingTriggersLocked() {
 
 // AccountInfoSnapshot returns bounded refresh runtime state.
 func (e *ChatGPTWebExecutor) AccountInfoSnapshot() chatgptwebauth.AccountInfoRuntimeSnapshot {
-	if e == nil || e.accountInfo == nil {
+	if e == nil {
 		return chatgptwebauth.AccountInfoRuntimeSnapshot{}
 	}
-	return e.accountInfo.snapshot()
+	var snapshot chatgptwebauth.AccountInfoRuntimeSnapshot
+	if e.accountInfo != nil {
+		snapshot = e.accountInfo.snapshot()
+	}
+	snapshot.BackgroundRelogin = e.BackgroundReloginSnapshot()
+	return snapshot
 }
 
 // AccountInfoDiagnosticsSnapshot returns the bounded in-memory failures.

@@ -32,14 +32,26 @@ const (
 
 // AccountInfoRuntimeSnapshot is safe for the management API.
 type AccountInfoRuntimeSnapshot struct {
-	Busy         int    `json:"busy"`
+	Busy              int                              `json:"busy"`
+	Queued            int                              `json:"queued"`
+	Scheduled         int                              `json:"scheduled"`
+	Inflight          int                              `json:"inflight"`
+	RefreshCount      uint64                           `json:"refresh_count"`
+	RetryCount        uint64                           `json:"retry_count"`
+	FailedCount       uint64                           `json:"failed_count"`
+	LastError         string                           `json:"last_error"`
+	BackgroundRelogin BackgroundReloginRuntimeSnapshot `json:"background_relogin"`
+}
+
+// BackgroundReloginRuntimeSnapshot reports bounded queue activity without
+// exposing credential material.
+type BackgroundReloginRuntimeSnapshot struct {
 	Queued       int    `json:"queued"`
-	Scheduled    int    `json:"scheduled"`
-	Inflight     int    `json:"inflight"`
-	RefreshCount uint64 `json:"refresh_count"`
-	RetryCount   uint64 `json:"retry_count"`
-	FailedCount  uint64 `json:"failed_count"`
-	LastError    string `json:"last_error"`
+	Delayed      int    `json:"delayed"`
+	Running      int    `json:"running"`
+	Promoted     uint64 `json:"promoted"`
+	Deduplicated uint64 `json:"deduplicated"`
+	Canceled     uint64 `json:"canceled"`
 }
 
 // AccountInfoAuthRuntimeState contains transient refresh state for one auth.

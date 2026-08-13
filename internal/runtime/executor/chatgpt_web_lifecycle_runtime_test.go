@@ -89,9 +89,8 @@ func TestChatGPTWebAutoReloginExhaustionIsFinite(t *testing.T) {
 		return ok && current.LifecycleState() == cliproxyauth.LifecycleStateReauthRequired
 	})
 	waitForChatGPTWebCondition(t, time.Second, func() bool {
-		executor.backgroundMu.Lock()
-		defer executor.backgroundMu.Unlock()
-		return len(executor.backgroundRunning) == 0
+		snapshot := executor.BackgroundReloginSnapshot()
+		return snapshot.Queued == 0 && snapshot.Delayed == 0 && snapshot.Running == 0
 	})
 	if got := fake.loginCalls.Load(); got != 3 {
 		t.Fatalf("login calls = %d, want initial plus 2 retries", got)
