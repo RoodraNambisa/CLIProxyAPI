@@ -220,11 +220,14 @@ func (service *Service) loginOnce(acquisitionContext context.Context, input Logi
 		service.applyFailure(credential, authError, input.Relogin)
 		return credential, authError
 	}
-	if loginMethod == LoginMethodPasskey {
+	if loginMethod == LoginMethodPasskey || loginMethod == LoginMethodAdvancedSecurityPasskey {
 		if err := client.SetCookie(service.options.SessionBaseURL, "oai-did", deviceID); err != nil {
 			authError := newAuthError("cookie_initialization_failed", pendingState, 0, false, true, "initialize Passkey device cookie", err)
 			service.applyFailure(credential, authError, input.Relogin)
 			return credential, authError
+		}
+		if loginMethod == LoginMethodAdvancedSecurityPasskey {
+			return service.loginWithAdvancedSecurityPasskey(acquisitionContext, client, credential, input, pendingState)
 		}
 		return service.loginWithPasskey(acquisitionContext, client, credential, input, pendingState)
 	}

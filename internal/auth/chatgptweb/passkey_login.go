@@ -183,6 +183,10 @@ func (service *Service) beginPasskeyLogin(ctx context.Context, client *Client, c
 		authError.FailureStage = "passkey_challenge"
 		return nil, attachPasskeyHTTPDiagnostic(authError, response, payload, authURL)
 	}
+	if credential.CredentialSchemaVersion == CredentialSchemaVersionAdvancedAccountSecurity &&
+		isAdvancedSecurityAuthChallenge(payload, responseRequestURL(response)) {
+		return payload, nil
+	}
 	if authError := classifyPasskeyChallengeResponse(response.StatusCode, payload, pendingState); authError != nil {
 		return nil, attachPasskeyHTTPDiagnostic(authError, response, payload, authURL)
 	}
@@ -350,7 +354,72 @@ func passkeyCallbackURLAllowed(rawURL string, authBase, sessionBase *url.URL) bo
 	return sameOAuthEndpointOrigin(parsed, authBase) || sameOAuthEndpointOrigin(parsed, sessionBase)
 }
 
+type passkeySessionStatePersist func(context.Context, string) *AuthError
+
 func (service *Service) finishPasskeyLogin(ctx context.Context, client *Client, credential *Credential, input LoginInput, pendingState LifecycleState) (*Credential, error) {
+	return service.finishPasskeySession(ctx, client, credential, input, pendingState, func(ctx context.Context, lastUsedAt string) *AuthError {
+		updatedWebAuthn := cloneWebAuthnCredential(credential.WebAuthn)
+		if CompareWebAuthnLastUsedAt(updatedWebAuthn.LastUsedAt, lastUsedAt) > 0 {
+			lastUsedAt = updatedWebAuthn.LastUsedAt
+		}
+		updatedWebAuthn.LastUsedAt = lastUsedAt
+		if input.PersistWebAuthn == nil {
+			return passkeyStatePersistenceError(pendingState, "passkey_session", nil)
+		}
+		persisted, errPersist := input.PersistWebAuthn(ctx, *updatedWebAuthn)
+		if errPersist != nil {
+			return passkeyStatePersistenceError(pendingState, "passkey_session", errPersist)
+		}
+		if errValidate := ValidateWebAuthnCredential(&persisted); errValidate != nil ||
+			!WebAuthnAuthenticatorMatches(&persisted, updatedWebAuthn) ||
+			persisted.SignCount < updatedWebAuthn.SignCount ||
+			CompareWebAuthnLastUsedAt(persisted.LastUsedAt, updatedWebAuthn.LastUsedAt) < 0 {
+			return passkeyCredentialError("passkey_credential_invalid", "Persisted Passkey state is invalid", errValidate)
+		}
+		credential.WebAuthn = cloneWebAuthnCredential(&persisted)
+		return nil
+	})
+}
+
+func (service *Service) finishAdvancedSecurityLogin(
+	ctx context.Context,
+	client *Client,
+	credential *Credential,
+	input LoginInput,
+	keyIndex int,
+	pendingState LifecycleState,
+) (*Credential, error) {
+	return service.finishPasskeySession(ctx, client, credential, input, pendingState, func(ctx context.Context, lastUsedAt string) *AuthError {
+		if credential.AdvancedAccountSecurity == nil || keyIndex < 0 || keyIndex >= len(credential.AdvancedAccountSecurity.Passkeys) {
+			return advancedSecurityCredentialError("advanced_security_credential_invalid", "Advanced account security credential is unavailable", nil)
+		}
+		updatedAAS := CloneAdvancedAccountSecurityCredential(credential.AdvancedAccountSecurity)
+		updatedKey := &updatedAAS.Passkeys[keyIndex].Credential
+		if CompareWebAuthnLastUsedAt(updatedKey.LastUsedAt, lastUsedAt) > 0 {
+			lastUsedAt = updatedKey.LastUsedAt
+		}
+		updatedKey.LastUsedAt = lastUsedAt
+		if input.PersistAdvancedAccountSecurity == nil {
+			return advancedSecurityStatePersistenceError(pendingState, "advanced_security_session", nil)
+		}
+		persisted, errPersist := input.PersistAdvancedAccountSecurity(ctx, *updatedAAS)
+		if errPersist != nil {
+			return advancedSecurityStatePersistenceError(pendingState, "advanced_security_session", errPersist)
+		}
+		if errValidate := ValidateAdvancedAccountSecurityCredential(&persisted); errValidate != nil {
+			return advancedSecurityCredentialError("advanced_security_credential_invalid", "Persisted advanced account security state is invalid", errValidate)
+		}
+		persistedIndex := findAdvancedSecurityAuthenticator(&persisted, updatedKey)
+		if persistedIndex < 0 || persisted.Passkeys[persistedIndex].Credential.SignCount < updatedKey.SignCount ||
+			CompareWebAuthnLastUsedAt(persisted.Passkeys[persistedIndex].Credential.LastUsedAt, updatedKey.LastUsedAt) < 0 {
+			return advancedSecurityCredentialError("advanced_security_credential_invalid", "Persisted advanced account security state is invalid", nil)
+		}
+		credential.AdvancedAccountSecurity = CloneAdvancedAccountSecurityCredential(&persisted)
+		return nil
+	})
+}
+
+func (service *Service) finishPasskeySession(ctx context.Context, client *Client, credential *Credential, input LoginInput, pendingState LifecycleState, persist passkeySessionStatePersist) (*Credential, error) {
 	response, payload, errSession := client.DoNoRedirect(ctx, http.MethodGet,
 		service.options.SessionBaseURL+"/api/auth/session?refresh=true",
 		service.sessionAPIHeaders(service.options.SessionBaseURL+"/"), nil)
@@ -395,26 +464,12 @@ func (service *Service) finishPasskeyLogin(ctx context.Context, client *Client, 
 		return service.loginFailure(credential, input.Relogin, passkeyCredentialError("passkey_session_invalid", "Passkey session cookie is unavailable", nil))
 	}
 
-	updatedWebAuthn := cloneWebAuthnCredential(credential.WebAuthn)
-	lastUsedAt := service.timestamp()
-	if CompareWebAuthnLastUsedAt(updatedWebAuthn.LastUsedAt, lastUsedAt) > 0 {
-		lastUsedAt = updatedWebAuthn.LastUsedAt
-	}
-	updatedWebAuthn.LastUsedAt = lastUsedAt
-	if input.PersistWebAuthn == nil {
+	if persist == nil {
 		return service.loginFailure(credential, input.Relogin, passkeyStatePersistenceError(pendingState, "passkey_session", nil))
 	}
-	persisted, errPersist := input.PersistWebAuthn(ctx, *updatedWebAuthn)
-	if errPersist != nil {
-		return service.loginFailure(credential, input.Relogin, passkeyStatePersistenceError(pendingState, "passkey_session", errPersist))
+	if authError := persist(ctx, service.timestamp()); authError != nil {
+		return service.loginFailure(credential, input.Relogin, authError)
 	}
-	if errValidate := ValidateWebAuthnCredential(&persisted); errValidate != nil ||
-		!WebAuthnAuthenticatorMatches(&persisted, updatedWebAuthn) ||
-		persisted.SignCount < updatedWebAuthn.SignCount ||
-		CompareWebAuthnLastUsedAt(persisted.LastUsedAt, updatedWebAuthn.LastUsedAt) < 0 {
-		return service.loginFailure(credential, input.Relogin, passkeyCredentialError("passkey_credential_invalid", "Persisted Passkey state is invalid", errValidate))
-	}
-	credential.WebAuthn = cloneWebAuthnCredential(&persisted)
 	credential.AccessToken = strings.TrimSpace(session.AccessToken)
 	credential.RefreshToken = ""
 	credential.IDToken = strings.TrimSpace(session.IDToken)

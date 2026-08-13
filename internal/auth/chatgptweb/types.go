@@ -576,15 +576,16 @@ func normalizedCredentialLifecycleState(credential *Credential) LifecycleState {
 }
 
 type LoginInput struct {
-	Email                       string
-	Password                    string
-	TOTPSecret                  string
-	AllowAutoAPI798             bool
-	BeginSentinelObserver       SentinelObserverStarter
-	ProxyURL                    string
-	LoginProxy                  LoginProxyConfig
-	PersistWebAuthn             func(context.Context, WebAuthnCredential) (WebAuthnCredential, error)
-	RetryInvalidPasskeyResponse bool
+	Email                          string
+	Password                       string
+	TOTPSecret                     string
+	AllowAutoAPI798                bool
+	BeginSentinelObserver          SentinelObserverStarter
+	ProxyURL                       string
+	LoginProxy                     LoginProxyConfig
+	PersistWebAuthn                func(context.Context, WebAuthnCredential) (WebAuthnCredential, error)
+	PersistAdvancedAccountSecurity func(context.Context, AdvancedAccountSecurityCredential) (AdvancedAccountSecurityCredential, error)
+	RetryInvalidPasskeyResponse    bool
 	// LoginProxyResolved keeps one runtime configuration snapshot fixed for the whole flow.
 	LoginProxyResolved bool
 	Credential         *Credential
