@@ -30,6 +30,32 @@ type OAuthModelAliasResult struct {
 	OriginalAlias string
 }
 
+func (m *Manager) oauthModelAliasMayRewrite(provider, requestedModel string) bool {
+	if m == nil {
+		return false
+	}
+	channel := OAuthModelAliasChannel(provider, "")
+	if channel == "" {
+		return false
+	}
+	raw := m.oauthModelAlias.Load()
+	table, _ := raw.(*oauthModelAliasTable)
+	if table == nil || table.reverse == nil {
+		return false
+	}
+	reverse := table.reverse[channel]
+	if len(reverse) == 0 {
+		return false
+	}
+	_, candidates := modelAliasLookupCandidates(requestedModel)
+	for _, candidate := range candidates {
+		if _, ok := reverse[strings.ToLower(strings.TrimSpace(candidate))]; ok {
+			return true
+		}
+	}
+	return false
+}
+
 func compileOAuthModelAliasTable(aliases map[string][]internalconfig.OAuthModelAlias) *oauthModelAliasTable {
 	if len(aliases) == 0 {
 		return &oauthModelAliasTable{}

@@ -6,6 +6,7 @@ import (
 	"reflect"
 	"sort"
 	"strings"
+	"time"
 
 	chatgptwebauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/chatgptweb"
 	internalcodex "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/codex"
@@ -39,6 +40,107 @@ var managementCatalogMetadataKeys = [...]string{
 	"refresh_strategy",
 	"source_auth_id",
 	"source_credential_uid",
+}
+
+type providerRequestRetryEntry struct {
+	provider    string
+	override    int
+	hasOverride bool
+}
+
+type providerRequestRetryAggregate struct {
+	authCount      int
+	defaultCount   int
+	overrideCounts map[int]int
+	maxOverride    int
+}
+
+func (m *Manager) removeProviderSchedulingIndexesLocked(id string) {
+	if m == nil {
+		return
+	}
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return
+	}
+	entry, ok := m.providerRetryByAuthID[id]
+	if ok {
+		delete(m.providerRetryByAuthID, id)
+		aggregate := m.providerRetryAggregates[entry.provider]
+		if aggregate != nil {
+			aggregate.authCount--
+			if entry.hasOverride {
+				if count := aggregate.overrideCounts[entry.override]; count <= 1 {
+					delete(aggregate.overrideCounts, entry.override)
+					if entry.override == aggregate.maxOverride {
+						aggregate.maxOverride = 0
+						for value, remaining := range aggregate.overrideCounts {
+							if remaining > 0 && value > aggregate.maxOverride {
+								aggregate.maxOverride = value
+							}
+						}
+					}
+				} else {
+					aggregate.overrideCounts[entry.override] = count - 1
+				}
+			} else {
+				aggregate.defaultCount--
+			}
+			if aggregate.authCount <= 0 {
+				delete(m.providerRetryAggregates, entry.provider)
+			}
+		}
+	}
+	if ok {
+		if ids := m.providerPrefixedAuthIDs[entry.provider]; ids != nil {
+			delete(ids, id)
+			if len(ids) == 0 {
+				delete(m.providerPrefixedAuthIDs, entry.provider)
+			}
+		}
+	}
+}
+
+func (m *Manager) addProviderSchedulingIndexesLocked(auth *Auth) {
+	if m == nil || auth == nil {
+		return
+	}
+	id := strings.TrimSpace(auth.ID)
+	provider := strings.ToLower(strings.TrimSpace(auth.Provider))
+	if id == "" || provider == "" {
+		return
+	}
+	override, hasOverride := auth.RequestRetryOverride()
+	if override < 0 {
+		override = 0
+	}
+	m.providerRetryByAuthID[id] = providerRequestRetryEntry{
+		provider:    provider,
+		override:    override,
+		hasOverride: hasOverride,
+	}
+	aggregate := m.providerRetryAggregates[provider]
+	if aggregate == nil {
+		aggregate = &providerRequestRetryAggregate{overrideCounts: make(map[int]int)}
+		m.providerRetryAggregates[provider] = aggregate
+	}
+	aggregate.authCount++
+	if hasOverride {
+		aggregate.overrideCounts[override]++
+		if override > aggregate.maxOverride {
+			aggregate.maxOverride = override
+		}
+	} else {
+		aggregate.defaultCount++
+	}
+	if strings.TrimSpace(auth.Prefix) != "" {
+		ids := m.providerPrefixedAuthIDs[provider]
+		if ids == nil {
+			ids = make(map[string]struct{})
+			m.providerPrefixedAuthIDs[provider] = ids
+		}
+		ids[id] = struct{}{}
+	}
 }
 
 func managementCatalogScalar(value any) (any, bool) {
@@ -149,6 +251,7 @@ func (m *Manager) updateManagementAuthCatalogLocked(auth *Auth) {
 	if m == nil || auth == nil || strings.TrimSpace(auth.ID) == "" {
 		return
 	}
+	m.refreshChatGPTWebImageQuotaCheckLocked(auth, time.Now())
 	if m.managementAuthCatalog == nil {
 		m.managementAuthCatalog = make(map[string]*Auth)
 	}
@@ -420,6 +523,9 @@ func (m *Manager) removeAuthIndexesLocked(id string) {
 	if id == "" {
 		return
 	}
+	m.removeProviderSchedulingIndexesLocked(id)
+	delete(m.chatGPTWebImageBlockedIDs, id)
+	m.removeChatGPTWebImageQuotaCheckLocked(id)
 	if pathKey := m.backingPathByAuthID[id]; pathKey != "" {
 		if ids := m.backingPathAuthIDs[pathKey]; ids != nil {
 			delete(ids, id)
@@ -478,6 +584,7 @@ func (m *Manager) addAuthIndexesLocked(auth *Auth, cfg *internalconfig.Config) {
 		ids[id] = struct{}{}
 		m.providerByAuthID[id] = providerKey
 	}
+	m.addProviderSchedulingIndexesLocked(auth)
 	if pathKey := authBackingPathKey(auth, cfg); pathKey != "" {
 		ids := m.backingPathAuthIDs[pathKey]
 		if ids == nil {
@@ -589,6 +696,13 @@ type managerAuthIndexState struct {
 	backingPathAuthDir         string
 	providerAuthIDs            map[string]map[string]struct{}
 	providerByAuthID           map[string]string
+	providerPrefixedAuthIDs    map[string]map[string]struct{}
+	providerRetryByAuthID      map[string]providerRequestRetryEntry
+	providerRetryAggregates    map[string]*providerRequestRetryAggregate
+	chatGPTWebImageBlockedIDs  map[string]string
+	chatGPTWebImageQuotaChecks map[string]chatGPTWebImageQuotaCheck
+	chatGPTWebImageQuotaHeap   chatGPTWebImageQuotaCheckHeap
+	chatGPTWebQuotaGeneration  uint64
 	authIndexesByID            map[string]string
 	authIDsByIndex             map[string]map[string]struct{}
 	managedFileAuthIDs         map[string]map[string]struct{}
@@ -613,6 +727,11 @@ func newManagerAuthIndexBuilder(auths map[string]*Auth) *Manager {
 		backingPathByAuthID:        make(map[string]string),
 		providerAuthIDs:            make(map[string]map[string]struct{}),
 		providerByAuthID:           make(map[string]string),
+		providerPrefixedAuthIDs:    make(map[string]map[string]struct{}),
+		providerRetryByAuthID:      make(map[string]providerRequestRetryEntry),
+		providerRetryAggregates:    make(map[string]*providerRequestRetryAggregate),
+		chatGPTWebImageBlockedIDs:  make(map[string]string),
+		chatGPTWebImageQuotaChecks: make(map[string]chatGPTWebImageQuotaCheck),
 		authIndexesByID:            make(map[string]string),
 		authIDsByIndex:             make(map[string]map[string]struct{}),
 		managedFileAuthIDs:         make(map[string]map[string]struct{}),
@@ -664,6 +783,13 @@ func buildManagerAuthIndexState(auths map[string]*Auth, persisted []*Auth, compl
 		backingPathAuthDir:         builder.backingPathAuthDir,
 		providerAuthIDs:            builder.providerAuthIDs,
 		providerByAuthID:           builder.providerByAuthID,
+		providerPrefixedAuthIDs:    builder.providerPrefixedAuthIDs,
+		providerRetryByAuthID:      builder.providerRetryByAuthID,
+		providerRetryAggregates:    builder.providerRetryAggregates,
+		chatGPTWebImageBlockedIDs:  builder.chatGPTWebImageBlockedIDs,
+		chatGPTWebImageQuotaChecks: builder.chatGPTWebImageQuotaChecks,
+		chatGPTWebImageQuotaHeap:   builder.chatGPTWebImageQuotaHeap,
+		chatGPTWebQuotaGeneration:  builder.chatGPTWebQuotaGeneration,
 		authIndexesByID:            builder.authIndexesByID,
 		authIDsByIndex:             builder.authIDsByIndex,
 		managedFileAuthIDs:         builder.managedFileAuthIDs,
@@ -688,6 +814,13 @@ func (m *Manager) applyManagerAuthIndexStateLocked(state managerAuthIndexState) 
 	m.backingPathAuthDir = state.backingPathAuthDir
 	m.providerAuthIDs = state.providerAuthIDs
 	m.providerByAuthID = state.providerByAuthID
+	m.providerPrefixedAuthIDs = state.providerPrefixedAuthIDs
+	m.providerRetryByAuthID = state.providerRetryByAuthID
+	m.providerRetryAggregates = state.providerRetryAggregates
+	m.chatGPTWebImageBlockedIDs = state.chatGPTWebImageBlockedIDs
+	m.chatGPTWebImageQuotaChecks = state.chatGPTWebImageQuotaChecks
+	m.chatGPTWebImageQuotaHeap = state.chatGPTWebImageQuotaHeap
+	m.chatGPTWebQuotaGeneration = state.chatGPTWebQuotaGeneration
 	m.authIndexesByID = state.authIndexesByID
 	m.authIDsByIndex = state.authIDsByIndex
 	m.managedFileAuthIDs = state.managedFileAuthIDs

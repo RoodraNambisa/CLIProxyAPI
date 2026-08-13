@@ -393,6 +393,13 @@ type Manager struct {
 	backingPathAuthDir         string
 	providerAuthIDs            map[string]map[string]struct{}
 	providerByAuthID           map[string]string
+	providerPrefixedAuthIDs    map[string]map[string]struct{}
+	providerRetryByAuthID      map[string]providerRequestRetryEntry
+	providerRetryAggregates    map[string]*providerRequestRetryAggregate
+	chatGPTWebImageBlockedIDs  map[string]string
+	chatGPTWebImageQuotaChecks map[string]chatGPTWebImageQuotaCheck
+	chatGPTWebImageQuotaHeap   chatGPTWebImageQuotaCheckHeap
+	chatGPTWebQuotaGeneration  uint64
 	authIndexesByID            map[string]string
 	authIDsByIndex             map[string]map[string]struct{}
 	managedFileAuthIDs         map[string]map[string]struct{}
@@ -666,6 +673,11 @@ func NewManager(store Store, selector Selector, hook Hook) *Manager {
 		backingPathByAuthID:         make(map[string]string),
 		providerAuthIDs:             make(map[string]map[string]struct{}),
 		providerByAuthID:            make(map[string]string),
+		providerPrefixedAuthIDs:     make(map[string]map[string]struct{}),
+		providerRetryByAuthID:       make(map[string]providerRequestRetryEntry),
+		providerRetryAggregates:     make(map[string]*providerRequestRetryAggregate),
+		chatGPTWebImageBlockedIDs:   make(map[string]string),
+		chatGPTWebImageQuotaChecks:  make(map[string]chatGPTWebImageQuotaCheck),
 		authIndexesByID:             make(map[string]string),
 		authIDsByIndex:              make(map[string]map[string]struct{}),
 		managedFileAuthIDs:          make(map[string]map[string]struct{}),
@@ -6877,8 +6889,7 @@ func (m *Manager) maxRequestRetryForProviders(providers []string) int {
 	if m == nil || len(providers) == 0 {
 		return defaultRetry
 	}
-	var providerSet map[string]struct{}
-	providerSet = make(map[string]struct{}, len(providers))
+	providerSet := make(map[string]struct{}, len(providers))
 	for _, provider := range providers {
 		key := strings.TrimSpace(strings.ToLower(provider))
 		if key == "" {
@@ -6890,41 +6901,22 @@ func (m *Manager) maxRequestRetryForProviders(providers []string) int {
 		return defaultRetry
 	}
 
-	providerMaxRetry := make(map[string]int, len(providerSet))
-	providerHasAuth := make(map[string]bool, len(providerSet))
-	m.mu.RLock()
-	for _, auth := range m.auths {
-		if auth == nil {
-			continue
-		}
-		providerKey := strings.TrimSpace(strings.ToLower(auth.Provider))
-		if _, ok := providerSet[providerKey]; !ok {
-			continue
-		}
-		effectiveRetry := defaultRetry
-		if override, ok := auth.RequestRetryOverride(); ok {
-			if override < 0 {
-				override = 0
-			}
-			effectiveRetry = override
-		}
-		if !providerHasAuth[providerKey] || effectiveRetry > providerMaxRetry[providerKey] {
-			providerMaxRetry[providerKey] = effectiveRetry
-		}
-		providerHasAuth[providerKey] = true
-	}
-	m.mu.RUnlock()
-
 	maxRetry := 0
+	m.mu.RLock()
 	for provider := range providerSet {
+		aggregate := m.providerRetryAggregates[provider]
 		effectiveRetry := defaultRetry
-		if providerHasAuth[provider] {
-			effectiveRetry = providerMaxRetry[provider]
+		if aggregate != nil && aggregate.authCount > 0 {
+			effectiveRetry = aggregate.maxOverride
+			if aggregate.defaultCount > 0 && defaultRetry > effectiveRetry {
+				effectiveRetry = defaultRetry
+			}
 		}
 		if effectiveRetry > maxRetry {
 			maxRetry = effectiveRetry
 		}
 	}
+	m.mu.RUnlock()
 	return maxRetry
 }
 
@@ -8560,6 +8552,43 @@ func (m *Manager) routeAwareSelectionRequired(auth *Auth, routeModel string) boo
 	return m.selectionModelKeyForAuth(auth, routeModel) != canonicalModelKey(routeModel)
 }
 
+func (m *Manager) routeAwareSelectionRequiredForProviders(providers []string, routeModel string, tried map[string]struct{}) bool {
+	if m == nil || strings.TrimSpace(routeModel) == "" {
+		return false
+	}
+	providerSet := make(map[string]struct{}, len(providers))
+	for _, provider := range providers {
+		provider = strings.ToLower(strings.TrimSpace(provider))
+		if provider == "" {
+			continue
+		}
+		providerSet[provider] = struct{}{}
+		if m.oauthModelAliasMayRewrite(provider, routeModel) {
+			return true
+		}
+	}
+	if len(providerSet) == 0 {
+		return false
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	for provider := range providerSet {
+		for id := range m.providerPrefixedAuthIDs[provider] {
+			candidate := m.auths[id]
+			if candidate == nil || candidate.Disabled || m.sessionCleanupPendingLocked(id) {
+				continue
+			}
+			if _, used := tried[id]; used {
+				continue
+			}
+			if m.routeAwareSelectionRequired(candidate, routeModel) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, ProviderExecutor, error) {
 	pinnedAuthID := pinnedAuthIDFromMetadata(opts.Metadata)
 	registryRef := registry.GetGlobalRegistry()
@@ -8711,25 +8740,12 @@ func (m *Manager) pickNext(ctx context.Context, provider, model string, opts cli
 		}
 		return auth, executor, errPick
 	}
-	if strings.TrimSpace(model) != "" {
-		m.mu.RLock()
-		for _, candidate := range m.auths {
-			if candidate == nil || candidate.Provider != provider || candidate.Disabled || m.sessionCleanupPendingLocked(candidate.ID) {
-				continue
-			}
-			if _, used := tried[candidate.ID]; used {
-				continue
-			}
-			if m.routeAwareSelectionRequired(candidate, model) {
-				m.mu.RUnlock()
-				auth, executor, errPick := m.pickNextLegacy(ctx, provider, model, opts, tried)
-				if errPick != nil {
-					errPick = m.preferChatGPTWebImageQuotaError(errPick, []string{provider}, model, opts, tried, nil)
-				}
-				return auth, executor, errPick
-			}
+	if m.routeAwareSelectionRequiredForProviders([]string{provider}, model, tried) {
+		auth, executor, errPick := m.pickNextLegacy(ctx, provider, model, opts, tried)
+		if errPick != nil {
+			errPick = m.preferChatGPTWebImageQuotaError(errPick, []string{provider}, model, opts, tried, nil)
 		}
-		m.mu.RUnlock()
+		return auth, executor, errPick
 	}
 	executor, okExecutor := m.Executor(provider)
 	if !okExecutor {
@@ -8970,32 +8986,12 @@ func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model s
 	if len(eligibleProviders) == 0 {
 		return nil, nil, "", &Error{Code: "auth_not_found", Message: "no auth available"}
 	}
-	if strings.TrimSpace(model) != "" {
-		providerSet := make(map[string]struct{}, len(eligibleProviders))
-		for _, providerKey := range eligibleProviders {
-			providerSet[providerKey] = struct{}{}
+	if m.routeAwareSelectionRequiredForProviders(eligibleProviders, model, tried) {
+		auth, executor, selectedProvider, errPick := m.pickNextMixedLegacy(ctx, providers, model, opts, tried, allowed)
+		if errPick != nil {
+			errPick = m.preferChatGPTWebImageQuotaError(errPick, eligibleProviders, model, opts, tried, allowed)
 		}
-		m.mu.RLock()
-		for _, candidate := range m.auths {
-			if candidate == nil || candidate.Disabled || m.sessionCleanupPendingLocked(candidate.ID) {
-				continue
-			}
-			if _, ok := providerSet[strings.TrimSpace(strings.ToLower(candidate.Provider))]; !ok {
-				continue
-			}
-			if _, used := tried[candidate.ID]; used {
-				continue
-			}
-			if m.routeAwareSelectionRequired(candidate, model) {
-				m.mu.RUnlock()
-				auth, executor, selectedProvider, errPick := m.pickNextMixedLegacy(ctx, providers, model, opts, tried, allowed)
-				if errPick != nil {
-					errPick = m.preferChatGPTWebImageQuotaError(errPick, eligibleProviders, model, opts, tried, allowed)
-				}
-				return auth, executor, selectedProvider, errPick
-			}
-		}
-		m.mu.RUnlock()
+		return auth, executor, selectedProvider, errPick
 	}
 
 	selected, providerKey, errPick := m.scheduler.pickMixed(ctx, eligibleProviders, model, opts, tried, allowed)

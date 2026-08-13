@@ -1012,6 +1012,11 @@ func assertManagerAuthIndexesConsistent(t *testing.T, manager *Manager) {
 	expectedByID := make(map[string]string)
 	expectedProviders := make(map[string]map[string]struct{})
 	expectedProviderByID := make(map[string]string)
+	expectedProviderPrefixed := make(map[string]map[string]struct{})
+	expectedProviderRetryByID := make(map[string]providerRequestRetryEntry)
+	expectedProviderRetryAggregates := make(map[string]*providerRequestRetryAggregate)
+	expectedImageBlockedIDs := make(map[string]string)
+	expectedQuotaChecks := make(map[string]string)
 	expectedAuthIndexes := make(map[string]string)
 	expectedIDsByIndex := make(map[string]map[string]struct{})
 	expectedManagedFiles := make(map[string]map[string]struct{})
@@ -1043,6 +1048,43 @@ func assertManagerAuthIndexesConsistent(t *testing.T, manager *Manager) {
 			}
 			ids[id] = struct{}{}
 			expectedProviderByID[id] = providerKey
+			override, hasOverride := auth.RequestRetryOverride()
+			if override < 0 {
+				override = 0
+			}
+			expectedProviderRetryByID[id] = providerRequestRetryEntry{
+				provider:    providerKey,
+				override:    override,
+				hasOverride: hasOverride,
+			}
+			aggregate := expectedProviderRetryAggregates[providerKey]
+			if aggregate == nil {
+				aggregate = &providerRequestRetryAggregate{overrideCounts: make(map[int]int)}
+				expectedProviderRetryAggregates[providerKey] = aggregate
+			}
+			aggregate.authCount++
+			if hasOverride {
+				aggregate.overrideCounts[override]++
+				if override > aggregate.maxOverride {
+					aggregate.maxOverride = override
+				}
+			} else {
+				aggregate.defaultCount++
+			}
+			if strings.TrimSpace(auth.Prefix) != "" {
+				ids := expectedProviderPrefixed[providerKey]
+				if ids == nil {
+					ids = make(map[string]struct{})
+					expectedProviderPrefixed[providerKey] = ids
+				}
+				ids[id] = struct{}{}
+			}
+		}
+		if _, scheduled := chatGPTWebImageQuotaRefreshDueAt(auth, time.Now()); scheduled && !manager.sessionCleanupPendingLocked(id) {
+			expectedQuotaChecks[id] = auth.RuntimeInstanceID()
+		}
+		if chatGPTWebImageMayBeBlocked(auth, time.Now()) && !manager.sessionCleanupPendingLocked(id) {
+			expectedImageBlockedIDs[id] = auth.RuntimeInstanceID()
 		}
 		if key := authBackingPathKey(auth, manager.currentConfig()); key != "" {
 			ids := expectedPaths[key]
@@ -1068,6 +1110,25 @@ func assertManagerAuthIndexesConsistent(t *testing.T, manager *Manager) {
 	}
 	if !reflect.DeepEqual(manager.providerAuthIDs, expectedProviders) || !reflect.DeepEqual(manager.providerByAuthID, expectedProviderByID) {
 		t.Fatalf("provider index is inconsistent: providers=%v byID=%v", manager.providerAuthIDs, manager.providerByAuthID)
+	}
+	if !reflect.DeepEqual(manager.providerPrefixedAuthIDs, expectedProviderPrefixed) {
+		t.Fatalf("provider prefix index is inconsistent: got=%v want=%v", manager.providerPrefixedAuthIDs, expectedProviderPrefixed)
+	}
+	if !reflect.DeepEqual(manager.providerRetryByAuthID, expectedProviderRetryByID) ||
+		!reflect.DeepEqual(manager.providerRetryAggregates, expectedProviderRetryAggregates) {
+		t.Fatalf("provider retry indexes are inconsistent: byID=%v aggregates=%v", manager.providerRetryByAuthID, manager.providerRetryAggregates)
+	}
+	if !reflect.DeepEqual(manager.chatGPTWebImageBlockedIDs, expectedImageBlockedIDs) {
+		t.Fatalf("image blocked index is inconsistent: got=%v want=%v", manager.chatGPTWebImageBlockedIDs, expectedImageBlockedIDs)
+	}
+	if len(manager.chatGPTWebImageQuotaChecks) != len(expectedQuotaChecks) {
+		t.Fatalf("image quota schedule size = %d, want %d", len(manager.chatGPTWebImageQuotaChecks), len(expectedQuotaChecks))
+	}
+	for id, instanceID := range expectedQuotaChecks {
+		check, ok := manager.chatGPTWebImageQuotaChecks[id]
+		if !ok || check.instanceID != instanceID {
+			t.Fatalf("image quota schedule for %q = %+v, %t; want instance %q", id, check, ok, instanceID)
+		}
 	}
 	if !reflect.DeepEqual(manager.authIndexesByID, expectedAuthIndexes) {
 		t.Fatalf("auth index map is inconsistent: got=%v want=%v", manager.authIndexesByID, expectedAuthIndexes)

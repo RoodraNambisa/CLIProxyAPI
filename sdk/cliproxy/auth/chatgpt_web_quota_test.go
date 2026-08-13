@@ -1026,6 +1026,22 @@ func TestManagerExpiredOrdinaryImage429WaitsForFreshQuotaRecheck(t *testing.T) {
 	}
 
 	executor.runtimeStates[authID] = chatgptwebauth.AccountInfoAuthRuntimeState{}
+	current, _ = manager.GetByID(authID)
+	if _, matched, errMutate := manager.MutateRuntimeMetadataIfCurrent(
+		context.Background(),
+		current,
+		func(candidate *Auth) {
+			candidate.Metadata["quota_updated_at"] = time.Now().UTC().Format(time.RFC3339Nano)
+		},
+	); errMutate != nil || !matched {
+		t.Fatalf("publish completed quota recheck = matched %v, error %v", matched, errMutate)
+	}
+	manager.mu.RLock()
+	recheck, scheduled := manager.chatGPTWebImageQuotaChecks[authID]
+	manager.mu.RUnlock()
+	if !scheduled || recheck.dueAt.After(time.Now()) {
+		t.Fatalf("completed quota recheck schedule = %+v, %t; want due now", recheck, scheduled)
+	}
 	_, _ = manager.Execute(
 		context.Background(),
 		[]string{chatgptwebauth.Provider},
@@ -1243,6 +1259,12 @@ func TestManagerTriggersRefreshWhenExhaustedQuotaResetIsDue(t *testing.T) {
 	if len(executor.authIDs) != 1 || executor.authIDs[0] != authID {
 		t.Fatalf("refresh triggers = %v", executor.authIDs)
 	}
+	manager.mu.RLock()
+	recheck, scheduled := manager.chatGPTWebImageQuotaChecks[authID]
+	manager.mu.RUnlock()
+	if !scheduled || recheck.dueAt.Before(time.Now().Add(20*time.Second)) {
+		t.Fatalf("quota recheck schedule = %+v, want a delayed recheck after an accepted trigger", recheck)
+	}
 
 	current, ok := manager.GetByID(authID)
 	if !ok || current == nil {
@@ -1262,6 +1284,143 @@ func TestManagerTriggersRefreshWhenExhaustedQuotaResetIsDue(t *testing.T) {
 	if len(executor.authIDs) != 0 {
 		t.Fatalf("future quota reset triggered an eager refresh: %v", executor.authIDs)
 	}
+}
+
+func TestManagerDueImageQuotaRefreshIgnoresNonWebRequests(t *testing.T) {
+	manager := NewManager(nil, &FillFirstSelector{}, nil)
+	executor := &chatGPTWebQuotaRefreshTriggerExecutor{
+		authFallbackExecutor: &authFallbackExecutor{id: chatgptwebauth.Provider},
+	}
+	manager.RegisterExecutor(executor)
+	authID := "quota-provider-filter-" + uuid.NewString()
+	if _, errRegister := manager.Register(context.Background(), &Auth{
+		ID:       authID,
+		Provider: chatgptwebauth.Provider,
+		Status:   StatusActive,
+		Metadata: map[string]any{
+			"lifecycle_state":      LifecycleStateActive,
+			"quota_state":          string(chatgptwebauth.QuotaStateExhausted),
+			"image_quota_reset_at": time.Now().Add(-time.Minute).Format(time.RFC3339Nano),
+		},
+	}); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+
+	manager.triggerDueChatGPTWebImageQuotaRefreshes(
+		[]string{"codex"},
+		"",
+		cliproxyexecutor.Options{},
+		nil,
+		nil,
+		true,
+	)
+	if len(executor.authIDs) != 0 {
+		t.Fatalf("Codex-only request triggered Web quota refresh: %v", executor.authIDs)
+	}
+	manager.mu.RLock()
+	_, stillScheduled := manager.chatGPTWebImageQuotaChecks[authID]
+	manager.mu.RUnlock()
+	if !stillScheduled {
+		t.Fatal("Codex-only request consumed the Web quota schedule")
+	}
+}
+
+func TestChatGPTWebImageQuotaRefreshDueAcceptsExplicitCustomImageReason(t *testing.T) {
+	now := time.Now()
+	auth := &Auth{
+		ID:       "custom-image-quota",
+		Provider: chatgptwebauth.Provider,
+		Status:   StatusActive,
+		Metadata: map[string]any{"lifecycle_state": LifecycleStateActive},
+		ModelStates: map[string]*ModelState{
+			"canvas-v2": {
+				Quota: QuotaState{
+					Exceeded:      true,
+					Reason:        "chatgpt_web_image_quota",
+					NextRecoverAt: now.Add(-time.Minute),
+				},
+			},
+		},
+	}
+	dueAt, ok := chatGPTWebImageQuotaRefreshDueAt(auth, now)
+	if !ok || dueAt.After(now) {
+		t.Fatalf("custom image quota schedule = %v, %t; want due now", dueAt, ok)
+	}
+}
+
+func TestBuildManagerAuthIndexesDoesNotScheduleHealthyWebCredentials(t *testing.T) {
+	auths := make(map[string]*Auth, 10_001)
+	for index := 0; index < 10_000; index++ {
+		id := fmt.Sprintf("healthy-web-%05d", index)
+		auths[id] = &Auth{
+			ID:       id,
+			Provider: chatgptwebauth.Provider,
+			Status:   StatusActive,
+			Metadata: map[string]any{"lifecycle_state": LifecycleStateActive},
+		}
+	}
+	auths["due-web"] = &Auth{
+		ID:       "due-web",
+		Provider: chatgptwebauth.Provider,
+		Status:   StatusActive,
+		Metadata: map[string]any{
+			"lifecycle_state":      LifecycleStateActive,
+			"quota_state":          string(chatgptwebauth.QuotaStateExhausted),
+			"image_quota_reset_at": time.Now().Add(-time.Minute).Format(time.RFC3339Nano),
+		},
+	}
+	state := buildManagerAuthIndexState(auths, nil, true, nil)
+	if len(state.chatGPTWebImageQuotaChecks) != 1 {
+		t.Fatalf("quota check count = %d, want 1", len(state.chatGPTWebImageQuotaChecks))
+	}
+	if _, ok := state.chatGPTWebImageQuotaChecks["due-web"]; !ok {
+		t.Fatal("due credential is absent from the quota check index")
+	}
+}
+
+func TestManagerImageQuotaErrorInspectsOnlyBlockedWebCredentials(t *testing.T) {
+	manager := NewManager(nil, &FillFirstSelector{}, nil)
+	now := time.Now()
+	manager.mu.Lock()
+	for index := 0; index < 10_000; index++ {
+		id := fmt.Sprintf("healthy-quota-error-%05d", index)
+		manager.installAuthLocked(id, &Auth{
+			ID:       id,
+			Provider: chatgptwebauth.Provider,
+			Status:   StatusActive,
+			Metadata: map[string]any{"lifecycle_state": LifecycleStateActive},
+		})
+	}
+	blockedID := "blocked-quota-error-" + uuid.NewString()
+	manager.installAuthLocked(blockedID, &Auth{
+		ID:       blockedID,
+		Provider: chatgptwebauth.Provider,
+		Status:   StatusActive,
+		Metadata: map[string]any{
+			"lifecycle_state":      LifecycleStateActive,
+			"quota_state":          string(chatgptwebauth.QuotaStateExhausted),
+			"image_quota_reset_at": now.Add(time.Hour).Format(time.RFC3339Nano),
+		},
+	})
+	manager.mu.Unlock()
+
+	inspected := 0
+	errOriginal := &Error{Code: "auth_unavailable", Message: "no auth available"}
+	errGot := manager.preferChatGPTWebImageToolQuotaError(
+		errOriginal,
+		[]string{chatgptwebauth.Provider},
+		"",
+		cliproxyexecutor.Options{},
+		nil,
+		func(auth *Auth) bool {
+			inspected++
+			return auth != nil && auth.ID == blockedID
+		},
+	)
+	if inspected != 1 {
+		t.Fatalf("inspected credentials = %d, want 1 blocked credential", inspected)
+	}
+	assertChatGPTWebImageQuotaError(t, errGot)
 }
 
 func TestManagerDueImageQuotaRefreshDoesNotExposeLaterResetRetryAfter(t *testing.T) {

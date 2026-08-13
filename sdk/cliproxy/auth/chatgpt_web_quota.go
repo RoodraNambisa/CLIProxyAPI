@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"container/heap"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -16,6 +17,44 @@ import (
 )
 
 const chatGPTWebImageModel = chatgptwebauth.ImageModel
+
+const (
+	chatGPTWebQuotaClaimLimit        = 128
+	chatGPTWebQuotaTriggerRetryDelay = 30 * time.Second
+)
+
+type chatGPTWebImageQuotaCheck struct {
+	authID     string
+	instanceID string
+	dueAt      time.Time
+	generation uint64
+}
+
+type chatGPTWebImageQuotaCheckHeap []chatGPTWebImageQuotaCheck
+
+func (h chatGPTWebImageQuotaCheckHeap) Len() int { return len(h) }
+
+func (h chatGPTWebImageQuotaCheckHeap) Less(i, j int) bool {
+	if h[i].dueAt.Equal(h[j].dueAt) {
+		return h[i].authID < h[j].authID
+	}
+	return h[i].dueAt.Before(h[j].dueAt)
+}
+
+func (h chatGPTWebImageQuotaCheckHeap) Swap(i, j int) { h[i], h[j] = h[j], h[i] }
+
+func (h *chatGPTWebImageQuotaCheckHeap) Push(value any) {
+	*h = append(*h, value.(chatGPTWebImageQuotaCheck))
+}
+
+func (h *chatGPTWebImageQuotaCheckHeap) Pop() any {
+	old := *h
+	last := len(old) - 1
+	value := old[last]
+	old[last] = chatGPTWebImageQuotaCheck{}
+	*h = old[:last]
+	return value
+}
 
 type chatGPTWebImageCapabilityState struct {
 	blocked            bool
@@ -489,6 +528,232 @@ func laterTime(first, second time.Time) time.Time {
 	return first
 }
 
+func chatGPTWebImageQuotaRefreshDueAt(auth *Auth, now time.Time) (time.Time, bool) {
+	if auth == nil ||
+		!strings.EqualFold(strings.TrimSpace(auth.Provider), chatgptwebauth.Provider) ||
+		auth.Disabled ||
+		!auth.LifecycleSelectable() {
+		return time.Time{}, false
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+
+	blocked := false
+	dueAt := time.Time{}
+	if exhausted, resetAt := chatGPTWebImageQuotaExhausted(auth); exhausted {
+		blocked = true
+		dueAt = laterTime(dueAt, futureTime(resetAt, now))
+	}
+	for model, state := range auth.ModelStates {
+		if state == nil || !state.Quota.Exceeded {
+			continue
+		}
+		reason := strings.ToLower(strings.TrimSpace(state.Quota.Reason))
+		if reason != "chatgpt_web_image_quota" && reason != "quota" {
+			continue
+		}
+		modelKey := strings.ToLower(canonicalModelKey(model))
+		if reason == "quota" &&
+			modelKey != strings.ToLower(canonicalModelKey(chatGPTWebImageModel)) &&
+			!strings.Contains(modelKey, "image") {
+			continue
+		}
+		retryAt := laterTime(state.NextRetryAfter, state.Quota.NextRecoverAt)
+		if reason == "quota" &&
+			!retryAt.After(now) &&
+			chatGPTWebImageQuotaConfirmedAvailableAfter(auth, laterTime(state.Quota.NextRecoverAt, state.UpdatedAt)) {
+			continue
+		}
+		blocked = true
+		dueAt = laterTime(dueAt, futureTime(retryAt, now))
+	}
+	if !blocked {
+		return time.Time{}, false
+	}
+	if dueAt.IsZero() {
+		dueAt = now
+	}
+	return dueAt, true
+}
+
+func (m *Manager) removeChatGPTWebImageQuotaCheckLocked(authID string) {
+	if m == nil || strings.TrimSpace(authID) == "" {
+		return
+	}
+	delete(m.chatGPTWebImageQuotaChecks, strings.TrimSpace(authID))
+}
+
+func (m *Manager) setChatGPTWebImageQuotaCheckLocked(authID, instanceID string, dueAt time.Time) {
+	if m == nil || strings.TrimSpace(authID) == "" || dueAt.IsZero() {
+		return
+	}
+	if m.chatGPTWebImageQuotaChecks == nil {
+		m.chatGPTWebImageQuotaChecks = make(map[string]chatGPTWebImageQuotaCheck)
+	}
+	authID = strings.TrimSpace(authID)
+	if current, ok := m.chatGPTWebImageQuotaChecks[authID]; ok &&
+		current.instanceID == instanceID && current.dueAt.Equal(dueAt) {
+		return
+	}
+	m.chatGPTWebQuotaGeneration++
+	check := chatGPTWebImageQuotaCheck{
+		authID:     authID,
+		instanceID: instanceID,
+		dueAt:      dueAt,
+		generation: m.chatGPTWebQuotaGeneration,
+	}
+	m.chatGPTWebImageQuotaChecks[authID] = check
+	heap.Push(&m.chatGPTWebImageQuotaHeap, check)
+	if len(m.chatGPTWebImageQuotaHeap) > len(m.chatGPTWebImageQuotaChecks)*4+1024 {
+		m.compactChatGPTWebImageQuotaChecksLocked()
+	}
+}
+
+func (m *Manager) compactChatGPTWebImageQuotaChecksLocked() {
+	if m == nil {
+		return
+	}
+	compacted := make(chatGPTWebImageQuotaCheckHeap, 0, len(m.chatGPTWebImageQuotaChecks))
+	for _, check := range m.chatGPTWebImageQuotaChecks {
+		compacted = append(compacted, check)
+	}
+	heap.Init(&compacted)
+	m.chatGPTWebImageQuotaHeap = compacted
+}
+
+func (m *Manager) refreshChatGPTWebImageQuotaCheckLocked(auth *Auth, now time.Time) {
+	if m == nil || auth == nil || strings.TrimSpace(auth.ID) == "" {
+		return
+	}
+	authID := strings.TrimSpace(auth.ID)
+	m.refreshChatGPTWebImageBlockedIndexLocked(auth, now)
+	if m.sessionCleanupPendingLocked(authID) {
+		delete(m.chatGPTWebImageBlockedIDs, authID)
+		m.removeChatGPTWebImageQuotaCheckLocked(authID)
+		return
+	}
+	dueAt, ok := chatGPTWebImageQuotaRefreshDueAt(auth, now)
+	if !ok {
+		m.removeChatGPTWebImageQuotaCheckLocked(authID)
+		return
+	}
+	m.setChatGPTWebImageQuotaCheckLocked(authID, auth.RuntimeInstanceID(), dueAt)
+}
+
+func (m *Manager) refreshChatGPTWebImageBlockedIndexLocked(auth *Auth, now time.Time) {
+	if m == nil || auth == nil {
+		return
+	}
+	authID := strings.TrimSpace(auth.ID)
+	if authID == "" {
+		return
+	}
+	if m.chatGPTWebImageBlockedIDs == nil {
+		m.chatGPTWebImageBlockedIDs = make(map[string]string)
+	}
+	if !strings.EqualFold(strings.TrimSpace(auth.Provider), chatgptwebauth.Provider) ||
+		!chatGPTWebImageMayBeBlocked(auth, now) {
+		delete(m.chatGPTWebImageBlockedIDs, authID)
+		return
+	}
+	m.chatGPTWebImageBlockedIDs[authID] = auth.RuntimeInstanceID()
+}
+
+func chatGPTWebImageMayBeBlocked(auth *Auth, now time.Time) bool {
+	if auth == nil || !strings.EqualFold(strings.TrimSpace(auth.Provider), chatgptwebauth.Provider) {
+		return false
+	}
+	if exhausted, _ := chatGPTWebImageQuotaExhausted(auth); exhausted {
+		return true
+	}
+	for _, state := range auth.ModelStates {
+		if state == nil {
+			continue
+		}
+		if state.Status == StatusDisabled || state.Quota.Exceeded {
+			return true
+		}
+		if state.Unavailable && state.NextRetryAfter.After(now) {
+			return true
+		}
+	}
+	return false
+}
+
+func (m *Manager) claimDueChatGPTWebImageQuotaChecks(now time.Time, pinnedAuthID string) []*Auth {
+	if m == nil {
+		return nil
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if pinnedAuthID = strings.TrimSpace(pinnedAuthID); pinnedAuthID != "" {
+		check, ok := m.chatGPTWebImageQuotaChecks[pinnedAuthID]
+		if !ok || check.dueAt.After(now) {
+			return nil
+		}
+		current := m.auths[pinnedAuthID]
+		if current == nil || current.RuntimeInstanceID() != check.instanceID {
+			delete(m.chatGPTWebImageQuotaChecks, pinnedAuthID)
+			return nil
+		}
+		m.setChatGPTWebImageQuotaCheckLocked(
+			pinnedAuthID,
+			check.instanceID,
+			now.Add(chatGPTWebQuotaTriggerRetryDelay),
+		)
+		return []*Auth{current.Clone()}
+	}
+
+	claimed := make([]*Auth, 0, chatGPTWebQuotaClaimLimit)
+	for len(m.chatGPTWebImageQuotaHeap) > 0 && len(claimed) < chatGPTWebQuotaClaimLimit {
+		check := m.chatGPTWebImageQuotaHeap[0]
+		currentCheck, ok := m.chatGPTWebImageQuotaChecks[check.authID]
+		if !ok || currentCheck.generation != check.generation {
+			heap.Pop(&m.chatGPTWebImageQuotaHeap)
+			continue
+		}
+		if check.dueAt.After(now) {
+			break
+		}
+		heap.Pop(&m.chatGPTWebImageQuotaHeap)
+		current := m.auths[check.authID]
+		if current == nil || current.RuntimeInstanceID() != check.instanceID {
+			delete(m.chatGPTWebImageQuotaChecks, check.authID)
+			continue
+		}
+		m.setChatGPTWebImageQuotaCheckLocked(
+			check.authID,
+			check.instanceID,
+			now.Add(chatGPTWebQuotaTriggerRetryDelay),
+		)
+		claimed = append(claimed, current.Clone())
+	}
+	return claimed
+}
+
+func (m *Manager) requeueChatGPTWebImageQuotaCheck(auth *Auth, notBefore time.Time) {
+	if m == nil || auth == nil || strings.TrimSpace(auth.ID) == "" {
+		return
+	}
+	now := time.Now()
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	current := m.auths[auth.ID]
+	if current == nil || current.RuntimeInstanceID() != auth.RuntimeInstanceID() {
+		return
+	}
+	dueAt, ok := chatGPTWebImageQuotaRefreshDueAt(current, now)
+	if !ok {
+		m.removeChatGPTWebImageQuotaCheckLocked(auth.ID)
+		return
+	}
+	if notBefore.After(dueAt) {
+		dueAt = notBefore
+	}
+	m.setChatGPTWebImageQuotaCheckLocked(auth.ID, current.RuntimeInstanceID(), dueAt)
+}
+
 func metadataString(value any) string {
 	switch typed := value.(type) {
 	case string:
@@ -625,9 +890,31 @@ func (m *Manager) preferChatGPTWebImageQuotaErrorForCandidates(
 	preferOriginal := false
 	blockedCandidates := make([]chatGPTWebImageCapabilityCandidate, 0)
 	authCandidates := make([]*Auth, 0)
+	unblockedIndexEntries := make(map[string]string)
 
 	m.mu.RLock()
-	for _, candidate := range m.auths {
+	candidateIDs := make(map[string]struct{})
+	if pinnedAuthID != "" {
+		candidateIDs[pinnedAuthID] = struct{}{}
+	} else {
+		for provider := range providerSet {
+			ids := m.providerAuthIDs[provider]
+			if provider == chatgptwebauth.Provider {
+				ids = make(map[string]struct{}, len(m.chatGPTWebImageBlockedIDs))
+				for authID, instanceID := range m.chatGPTWebImageBlockedIDs {
+					candidate := m.auths[authID]
+					if candidate != nil && candidate.RuntimeInstanceID() == instanceID {
+						ids[authID] = struct{}{}
+					}
+				}
+			}
+			for authID := range ids {
+				candidateIDs[authID] = struct{}{}
+			}
+		}
+	}
+	for authID := range candidateIDs {
+		candidate := m.auths[authID]
 		if candidate == nil || candidate.Disabled || m.sessionCleanupPendingLocked(candidate.ID) || !candidate.LifecycleSelectable() {
 			continue
 		}
@@ -671,6 +958,9 @@ func (m *Manager) preferChatGPTWebImageQuotaErrorForCandidates(
 			})
 			continue
 		}
+		if strings.EqualFold(provider, chatgptwebauth.Provider) {
+			unblockedIndexEntries[candidate.ID] = candidate.RuntimeInstanceID()
+		}
 		if !imageTool {
 			preferOriginal = true
 			continue
@@ -685,6 +975,7 @@ func (m *Manager) preferChatGPTWebImageQuotaErrorForCandidates(
 		preferOriginal = true
 		continue
 	}
+	m.pruneChatGPTWebImageBlockedIndex(unblockedIndexEntries, now)
 	if len(blockedCandidates) == 0 {
 		return err
 	}
@@ -739,6 +1030,23 @@ func (m *Manager) preferChatGPTWebImageQuotaErrorForCandidates(
 	return quotaErr
 }
 
+func (m *Manager) pruneChatGPTWebImageBlockedIndex(entries map[string]string, now time.Time) {
+	if m == nil || len(entries) == 0 {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for authID, instanceID := range entries {
+		current := m.auths[authID]
+		if current == nil || current.RuntimeInstanceID() != instanceID {
+			continue
+		}
+		if !chatGPTWebImageMayBeBlocked(current, now) {
+			delete(m.chatGPTWebImageBlockedIDs, authID)
+		}
+	}
+}
+
 func (m *Manager) triggerDueChatGPTWebImageQuotaRefreshes(
 	providers []string,
 	model string,
@@ -764,84 +1072,83 @@ func (m *Manager) triggerDueChatGPTWebImageQuotaRefreshes(
 	pinnedAuthID := pinnedAuthIDFromMetadata(opts.Metadata)
 	registryRef := registry.GetGlobalRegistry()
 	now := time.Now()
-	dueCandidates := make([]chatGPTWebImageCapabilityCandidate, 0)
-	authCandidates := make([]*Auth, 0)
-	m.mu.RLock()
-	for _, candidate := range m.auths {
-		if candidate == nil ||
-			!strings.EqualFold(strings.TrimSpace(candidate.Provider), chatgptwebauth.Provider) ||
-			candidate.Disabled ||
-			m.sessionCleanupPendingLocked(candidate.ID) ||
-			!candidate.LifecycleSelectable() {
-			continue
-		}
-		if pinnedAuthID != "" && candidate.ID != pinnedAuthID {
-			continue
-		}
-		if _, alreadyTried := tried[candidate.ID]; alreadyTried {
-			continue
-		}
-		authCandidates = append(authCandidates, candidate.Clone())
+	authCandidates := m.claimDueChatGPTWebImageQuotaChecks(now, pinnedAuthID)
+	if len(authCandidates) == 0 {
+		return
 	}
-	m.mu.RUnlock()
+	trigger := m.chatGPTWebAccountInfoAutomaticRefreshTrigger()
+	runtimeReader := m.chatGPTWebAccountInfoRuntimeStateReader()
 	for _, candidate := range authCandidates {
+		if _, alreadyTried := tried[candidate.ID]; alreadyTried {
+			m.requeueChatGPTWebImageQuotaCheck(candidate, now.Add(chatGPTWebQuotaTriggerRetryDelay))
+			continue
+		}
 		if pickAllowed != nil && !pickAllowed(candidate) {
+			m.requeueChatGPTWebImageQuotaCheck(candidate, now.Add(chatGPTWebQuotaTriggerRetryDelay))
 			continue
 		}
 		if strings.TrimSpace(model) != "" && !m.authSupportsRouteModel(registryRef, candidate, model) {
+			m.requeueChatGPTWebImageQuotaCheck(candidate, now.Add(chatGPTWebQuotaTriggerRetryDelay))
 			continue
 		}
 		if candidate.Unavailable &&
 			strings.EqualFold(strings.TrimSpace(candidate.CooldownScope), cooldownScopeAuth) &&
 			candidate.NextRetryAfter.After(now) {
+			m.requeueChatGPTWebImageQuotaCheck(candidate, candidate.NextRetryAfter)
 			continue
 		}
 		imageModels := ChatGPTWebImageModelIDs(candidate)
 		if !imageTool && !chatGPTWebImageModelProjectionForModels(candidate, m.selectionModelKeyForAuth(candidate, model), imageModels) {
+			m.requeueChatGPTWebImageQuotaCheck(candidate, now.Add(chatGPTWebQuotaTriggerRetryDelay))
 			continue
 		}
 		capability := chatGPTWebImageCapabilityStateForAuthWithModels(candidate, now, imageModels)
-		if capability.refreshDue {
-			dueCandidates = append(dueCandidates, chatGPTWebImageCapabilityCandidate{
-				authID:     candidate.ID,
-				capability: capability,
-			})
-		}
-	}
-	refreshAuthIDs := make([]string, 0, len(dueCandidates))
-	runtimeReader := m.chatGPTWebAccountInfoRuntimeStateReader()
-	for _, candidate := range dueCandidates {
 		runtimeState := chatgptwebauth.AccountInfoAuthRuntimeState{}
 		if runtimeReader != nil {
-			runtimeState = runtimeReader.AccountInfoAuthState(candidate.authID)
+			runtimeState = runtimeReader.AccountInfoAuthState(candidate.ID)
 		}
-		capability := chatGPTWebImageCapabilityWithRuntimeState(
-			candidate.capability,
+		capability = chatGPTWebImageCapabilityWithRuntimeState(
+			capability,
 			runtimeState,
 			now,
 		)
-		if capability.refreshDue {
-			refreshAuthIDs = append(refreshAuthIDs, candidate.authID)
+		if capability.refreshDue && trigger != nil {
+			_ = trigger.TriggerAutomaticAccountInfoRefresh(candidate.ID)
+			retryAt := now.Add(chatGPTWebQuotaTriggerRetryDelay)
+			m.requeueChatGPTWebImageQuotaCheck(candidate, retryAt)
+			continue
+		}
+		if capability.refreshInFlight {
+			retryAt := runtimeState.NextRefreshAt
+			if !retryAt.After(now) {
+				retryAt = now.Add(chatGPTWebQuotaTriggerRetryDelay)
+			}
+			m.requeueChatGPTWebImageQuotaCheck(candidate, retryAt)
+			continue
+		}
+		if capability.nextRetryAt.After(now) {
+			m.requeueChatGPTWebImageQuotaCheck(candidate, capability.nextRetryAt)
+			continue
+		}
+		if capability.blocked {
+			m.requeueChatGPTWebImageQuotaCheck(candidate, now.Add(chatGPTWebQuotaTriggerRetryDelay))
 		}
 	}
-	m.triggerChatGPTWebAccountInfoRefresh(refreshAuthIDs)
 }
 
-func (m *Manager) triggerChatGPTWebAccountInfoRefresh(authIDs []string) {
-	if m == nil || len(authIDs) == 0 {
-		return
+func (m *Manager) chatGPTWebAccountInfoAutomaticRefreshTrigger() chatGPTWebAccountInfoAutomaticRefreshTrigger {
+	if m == nil {
+		return nil
 	}
 	registered, ok := m.Executor(chatgptwebauth.Provider)
 	if !ok || registered == nil {
-		return
+		return nil
 	}
 	trigger, ok := registered.(chatGPTWebAccountInfoAutomaticRefreshTrigger)
 	if !ok {
-		return
+		return nil
 	}
-	for _, authID := range authIDs {
-		trigger.TriggerAutomaticAccountInfoRefresh(authID)
-	}
+	return trigger
 }
 
 func (m *Manager) triggerChatGPTWebImageQuotaEvidenceRefresh(authID, authInstanceID string) {
