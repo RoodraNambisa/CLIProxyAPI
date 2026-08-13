@@ -4232,9 +4232,48 @@ func TestValidateChatGPTWebDownloadedImageRejectsTruncatedPayload(t *testing.T) 
 	if err := validateChatGPTWebDownloadedImage(valid, "image/png"); err != nil {
 		t.Fatalf("validateChatGPTWebDownloadedImage(valid) error = %v", err)
 	}
+	if err := validateChatGPTWebDownloadedImage(valid, "image/jpeg"); err == nil {
+		t.Fatal("validateChatGPTWebDownloadedImage() accepted a mismatched MIME type")
+	}
 	truncated := valid[:len(valid)-8]
 	if err := validateChatGPTWebDownloadedImage(truncated, "image/png"); err == nil {
 		t.Fatal("validateChatGPTWebDownloadedImage() accepted truncated PNG")
+	}
+}
+
+func TestValidateChatGPTWebDownloadedImageWaitsForMemoryAndCancels(t *testing.T) {
+	valid := chatGPTWebPNGBytes(t, color.NRGBA{R: 255, A: 255})
+	admission := helps.NewChatGPTWebImageMemoryAdmission(1)
+	releaseHeld, errAcquire := admission.Acquire(context.Background(), 1)
+	if errAcquire != nil {
+		t.Fatalf("Acquire() error = %v", errAcquire)
+	}
+	defer releaseHeld()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() {
+		result <- validateChatGPTWebDownloadedImageWithAdmission(ctx, valid, "image/png", admission.Acquire)
+	}()
+
+	deadline := time.Now().Add(time.Second)
+	for admission.Snapshot().WaitingTasks != 1 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if snapshot := admission.Snapshot(); snapshot.WaitingTasks != 1 {
+		t.Fatalf("waiting tasks = %d, want 1", snapshot.WaitingTasks)
+	}
+	cancel()
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("validation error = %v, want context canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("validation did not leave memory admission after cancellation")
+	}
+	if snapshot := admission.Snapshot(); snapshot.CanceledWaits != 1 {
+		t.Fatalf("canceled waits = %d, want 1", snapshot.CanceledWaits)
 	}
 }
 

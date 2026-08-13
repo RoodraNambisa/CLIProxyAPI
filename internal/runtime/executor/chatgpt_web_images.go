@@ -1758,15 +1758,23 @@ func decodeAndValidateChatGPTWebImageWithConfig(
 	if err != nil {
 		return nil, image.Config{}, err
 	}
-	decoded, _, err := image.Decode(bytes.NewReader(data))
+	decoded, err := decodeAndValidateChatGPTWebImageAgainstConfig(data, imageConfig)
 	if err != nil {
 		return nil, image.Config{}, err
 	}
+	return decoded, imageConfig, nil
+}
+
+func decodeAndValidateChatGPTWebImageAgainstConfig(data []byte, imageConfig image.Config) (image.Image, error) {
+	decoded, _, err := image.Decode(bytes.NewReader(data))
+	if err != nil {
+		return nil, err
+	}
 	bounds := decoded.Bounds()
 	if bounds.Dx() != imageConfig.Width || bounds.Dy() != imageConfig.Height {
-		return nil, image.Config{}, errors.New("decoded image dimensions do not match its header")
+		return nil, errors.New("decoded image dimensions do not match its header")
 	}
-	return decoded, imageConfig, nil
+	return decoded, nil
 }
 
 func validateChatGPTWebImageConfig(imageConfig image.Config) error {
@@ -3187,7 +3195,10 @@ func (e *ChatGPTWebExecutor) downloadChatGPTWebImageAssetOnce(ctx context.Contex
 	if len(payload) == 0 {
 		return nil, chatGPTWebImageOutputProtocolError("chatgpt web image download is empty"), true
 	}
-	if errValidate := validateChatGPTWebDownloadedImage(payload, contentType); errValidate != nil {
+	if errValidate := validateChatGPTWebDownloadedImageWithAdmission(ctx, payload, contentType, helps.AcquireChatGPTWebImageMemory); errValidate != nil {
+		if errors.Is(errValidate, context.Canceled) || errors.Is(errValidate, context.DeadlineExceeded) {
+			return nil, errValidate, false
+		}
 		return nil, chatGPTWebImageOutputProtocolError("chatgpt web image download is invalid: " + errValidate.Error()), true
 	}
 	return payload, nil, false
@@ -3316,12 +3327,40 @@ func chatGPTWebCommittedRequestError(ctx context.Context, err error) error {
 }
 
 func validateChatGPTWebDownloadedImage(data []byte, contentType string) error {
+	return validateChatGPTWebDownloadedImageWithAdmission(
+		context.Background(),
+		data,
+		contentType,
+		helps.AcquireChatGPTWebImageMemory,
+	)
+}
+
+func validateChatGPTWebDownloadedImageWithAdmission(
+	ctx context.Context,
+	data []byte,
+	contentType string,
+	acquire func(context.Context, int64) (func(), error),
+) error {
 	mimeType := strings.TrimSpace(contentType)
 	if parsed, _, err := mime.ParseMediaType(mimeType); err == nil {
 		mimeType = parsed
 	}
-	_, _, err := decodeAndValidateChatGPTWebOutputImage(data, mimeType)
-	return err
+	imageConfig, errConfig := chatGPTWebOutputImageConfig(data, mimeType)
+	if errConfig != nil {
+		return errConfig
+	}
+	estimatedBytes := saturatingChatGPTWebImageMultiply(
+		saturatingChatGPTWebImagePixels(imageConfig.Width, imageConfig.Height),
+		chatGPTWebDecodedImageBytesPerPixel,
+	)
+	releaseMemory, errAcquire := acquire(ctx, max(estimatedBytes, int64(1)))
+	if errAcquire != nil {
+		return fmt.Errorf("wait for chatgpt web image validation memory: %w", errAcquire)
+	}
+	defer releaseMemory()
+
+	_, errDecode := decodeAndValidateChatGPTWebImageAgainstConfig(data, imageConfig)
+	return errDecode
 }
 
 func chatGPTWebImageOutputProtocolError(message string) error {
