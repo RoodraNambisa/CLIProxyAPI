@@ -11,10 +11,11 @@ import (
 type LoginMethod string
 
 const (
-	LoginMethodAuto         LoginMethod = "auto"
-	LoginMethodPasskey      LoginMethod = "passkey"
-	LoginMethodPasswordTOTP LoginMethod = "password_totp"
-	LoginMethodAPI798       LoginMethod = "api798"
+	LoginMethodAuto                    LoginMethod = "auto"
+	LoginMethodPasskey                 LoginMethod = "passkey"
+	LoginMethodPasswordTOTP            LoginMethod = "password_totp"
+	LoginMethodAPI798                  LoginMethod = "api798"
+	LoginMethodAdvancedSecurityPasskey LoginMethod = "advanced_security_passkey"
 )
 
 const API798LoginFeature = "api798_login_v1"
@@ -41,7 +42,7 @@ func NormalizeLoginMethod(method LoginMethod) (LoginMethod, error) {
 		return LoginMethodAuto, nil
 	}
 	switch method {
-	case LoginMethodAuto, LoginMethodPasskey, LoginMethodPasswordTOTP, LoginMethodAPI798:
+	case LoginMethodAuto, LoginMethodPasskey, LoginMethodPasswordTOTP, LoginMethodAPI798, LoginMethodAdvancedSecurityPasskey:
 		return method, nil
 	default:
 		return "", fmt.Errorf("unsupported chatgpt web login method %q", method)
@@ -54,6 +55,12 @@ func NormalizeLoginMethod(method LoginMethod) (LoginMethod, error) {
 func ResolveLoginMethod(credential *Credential, allowAutoAPI798 bool) (LoginMethod, error) {
 	if credential == nil {
 		return "", &LoginMethodResolutionError{Code: "missing_credentials", Message: "chatgpt web credential is required"}
+	}
+	if credential.CredentialSchemaVersion == CredentialSchemaVersionAdvancedAccountSecurity {
+		if errValidate := ValidateAdvancedAccountSecurityCredential(credential.AdvancedAccountSecurity); errValidate != nil {
+			return "", &LoginMethodResolutionError{Code: "advanced_security_credential_invalid", Message: "advanced account security credential is invalid"}
+		}
+		return LoginMethodAdvancedSecurityPasskey, nil
 	}
 	method, errNormalize := NormalizeLoginMethod(credential.LoginMethod)
 	if errNormalize != nil {

@@ -568,6 +568,15 @@ func confirmChatGPTWebImportPersistence(result *chatGPTWebMutationTaskResult, in
 		result.PersistedFeatures = append(result.PersistedFeatures, "webauthn_v1")
 		result.WebAuthnV1Persisted = true
 	}
+	if imported.CredentialSchemaVersion == chatgptwebauth.CredentialSchemaVersionAdvancedAccountSecurity {
+		if persisted.CredentialSchemaVersion != chatgptwebauth.CredentialSchemaVersionAdvancedAccountSecurity ||
+			persisted.AdvancedAccountSecurity == nil ||
+			!reflect.DeepEqual(imported.AdvancedAccountSecurity, persisted.AdvancedAccountSecurity) {
+			return errors.New("persisted advanced account security credential does not match the imported credential")
+		}
+		result.PersistedFeatures = append(result.PersistedFeatures, chatgptwebauth.AdvancedAccountSecurityFeature)
+		result.AdvancedSecurityPersisted = true
+	}
 	return nil
 }
 
@@ -637,6 +646,7 @@ func (h *Handler) persistImportedChatGPTWebCredential(ctx context.Context, manag
 	}
 	preserveImportedChatGPTWebLoginSettings(credential, persistExpected)
 	preserveImportedChatGPTWebAuthnRuntimeState(credential, persistExpected)
+	preserveImportedChatGPTWebAdvancedAccountSecurityRuntimeState(credential, persistExpected)
 	unchanged = existing != nil && importedChatGPTWebCredentialUnchanged(existing, credential)
 	status = "created"
 	if existing != nil {
@@ -661,6 +671,10 @@ func preserveImportedChatGPTWebLoginSettings(imported *chatgptwebauth.Credential
 	if imported == nil || current == nil {
 		return
 	}
+	if imported.CredentialSchemaVersion == chatgptwebauth.CredentialSchemaVersionAdvancedAccountSecurity {
+		imported.LoginMethod = chatgptwebauth.LoginMethodAdvancedSecurityPasskey
+		return
+	}
 	currentCredential, errParse := chatgptwebauth.ParseCredential(current.Metadata)
 	if errParse != nil {
 		return
@@ -671,6 +685,17 @@ func preserveImportedChatGPTWebLoginSettings(imported *chatgptwebauth.Credential
 	if imported.LoginMethod == chatgptwebauth.LoginMethodAuto && currentCredential.LoginMethod != chatgptwebauth.LoginMethodAuto {
 		imported.LoginMethod = currentCredential.LoginMethod
 	}
+}
+
+func preserveImportedChatGPTWebAdvancedAccountSecurityRuntimeState(imported *chatgptwebauth.Credential, current *coreauth.Auth) {
+	if imported == nil || imported.AdvancedAccountSecurity == nil || current == nil {
+		return
+	}
+	currentCredential, errParse := chatgptwebauth.ParseCredential(current.Metadata)
+	if errParse != nil || currentCredential.AdvancedAccountSecurity == nil {
+		return
+	}
+	chatgptwebauth.MergeAdvancedAccountSecurityRuntimeState(imported.AdvancedAccountSecurity, currentCredential.AdvancedAccountSecurity)
 }
 
 func preserveImportedChatGPTWebAuthnRuntimeState(imported *chatgptwebauth.Credential, current *coreauth.Auth) {

@@ -3,14 +3,22 @@ package management
 import (
 	"bytes"
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -66,7 +74,7 @@ func TestChatGPTWebImportTaskPersistsWebAuthnV1AndConfirmsCapability(t *testing.
 	if capabilities.Code != http.StatusOK || capabilities.Header().Get("Cache-Control") != "no-store" {
 		t.Fatalf("capabilities status = %d headers=%v body=%s", capabilities.Code, capabilities.Header(), capabilities.Body.String())
 	}
-	if got := capabilities.Body.String(); !strings.Contains(got, `"credential_schema_versions":[1,2]`) || !strings.Contains(got, `"webauthn_v1"`) || !strings.Contains(got, `"api798_login_v1"`) {
+	if got := capabilities.Body.String(); !strings.Contains(got, `"credential_schema_versions":[1,2,3]`) || !strings.Contains(got, `"webauthn_v1"`) || !strings.Contains(got, `"api798_login_v1"`) || !strings.Contains(got, `"advanced_account_security_v1"`) {
 		t.Fatalf("capabilities body = %s", got)
 	}
 
@@ -103,6 +111,76 @@ func TestChatGPTWebImportTaskPersistsWebAuthnV1AndConfirmsCapability(t *testing.
 	}
 	if !bytes.Contains(raw, []byte(privateKey)) {
 		t.Fatal("persisted auth file omitted WebAuthn private key")
+	}
+}
+
+func TestChatGPTWebImportTaskPersistsAdvancedAccountSecurityAndMergesRuntimeState(t *testing.T) {
+	executor := &chatGPTWebManagementTestExecutor{}
+	h, manager, _ := newChatGPTWebManagementTestHandler(t, executor)
+	router := chatGPTWebManagementTestRouter(h)
+	payload, advanced := chatGPTWebImportAdvancedSecurityFixture(t)
+
+	firstTask := startChatGPTWebImportTask(t, router, []chatGPTWebImportTestFile{{
+		field: "files",
+		name:  "advanced-security.json",
+		data:  payload,
+	}})
+	first := waitForChatGPTWebMutationTask(t, router, chatGPTWebMutationTaskImport, firstTask.ID)
+	if first.Succeeded != 1 || len(first.Results) != 1 {
+		t.Fatalf("first task = %+v", first)
+	}
+	result := first.Results[0]
+	if result.CredentialSchemaVersion != chatgptwebauth.CredentialSchemaVersionAdvancedAccountSecurity ||
+		!result.AdvancedSecurityPersisted || !slices.Contains(result.PersistedFeatures, chatgptwebauth.AdvancedAccountSecurityFeature) {
+		t.Fatalf("first result = %+v", result)
+	}
+	serializedTask := mustMarshalChatGPTWebMutationTask(t, first)
+	assertChatGPTWebManagementSecretsAbsent(t, serializedTask,
+		advanced.Passkeys[0].Credential.PrivateKeyPKCS8,
+		advanced.Passkeys[1].Credential.CredentialID,
+		advanced.RecoveryKeys[0].RecoveryKey,
+		advanced.RecoveryKeys[0].AuthenticationSecretBase64,
+	)
+
+	installed, ok := manager.GetByID(result.Name)
+	if !ok {
+		t.Fatal("persisted advanced credential was not registered")
+	}
+	current, errParse := chatgptwebauth.ParseCredential(installed.Metadata)
+	if errParse != nil || !reflect.DeepEqual(current.AdvancedAccountSecurity, advanced) {
+		t.Fatalf("persisted advanced credential = %#v error=%v", current, errParse)
+	}
+	current.AdvancedAccountSecurity.Passkeys[0].Credential.SignCount = 17
+	current.AdvancedAccountSecurity.Passkeys[0].Credential.LastUsedAt = "2026-08-06T03:00:00Z"
+	_, currentInstance, errMutate := manager.MutateRuntimeMetadataIfCurrent(t.Context(), installed, func(candidate *coreauth.Auth) {
+		current.ApplyToMetadata(candidate.Metadata)
+	})
+	if errMutate != nil || !currentInstance {
+		t.Fatalf("MutateRuntimeMetadataIfCurrent() current=%t error=%v", currentInstance, errMutate)
+	}
+
+	secondTask := startChatGPTWebImportTask(t, router, []chatGPTWebImportTestFile{{
+		field: "files",
+		name:  "advanced-security-copy.json",
+		data:  payload,
+	}})
+	second := waitForChatGPTWebMutationTask(t, router, chatGPTWebMutationTaskImport, secondTask.ID)
+	if second.Succeeded != 1 || len(second.Results) != 1 || !second.Results[0].AdvancedSecurityPersisted {
+		t.Fatalf("second task = %+v", second)
+	}
+	reinstalled, ok := manager.GetByID(result.Name)
+	if !ok {
+		t.Fatal("reimported advanced credential is missing")
+	}
+	reparsed, errReparse := chatgptwebauth.ParseCredential(reinstalled.Metadata)
+	if errReparse != nil || reparsed.AdvancedAccountSecurity == nil {
+		t.Fatalf("reparsed advanced credential = %#v error=%v", reparsed, errReparse)
+	}
+	if got := reparsed.AdvancedAccountSecurity.Passkeys[0].Credential.SignCount; got != 17 {
+		t.Fatalf("sign_count = %d, want 17", got)
+	}
+	if !reflect.DeepEqual(reparsed.AdvancedAccountSecurity.RecoveryKeys, advanced.RecoveryKeys) {
+		t.Fatal("reimport changed recovery keys")
 	}
 }
 
@@ -856,6 +934,71 @@ func chatGPTWebImportWebAuthnFixture(t *testing.T) (payload, privateKeyPKCS8, cr
 		t.Fatalf("DecodeImportCredential() credential=%#v error=%v", credential, errDecode)
 	}
 	return string(raw), credential.WebAuthn.PrivateKeyPKCS8, credential.WebAuthn.CredentialID, credential.WebAuthn.UserHandle
+}
+
+func chatGPTWebImportAdvancedSecurityFixture(t *testing.T) (string, *chatgptwebauth.AdvancedAccountSecurityCredential) {
+	t.Helper()
+	newAuthenticator := func(label string, signCount uint32, transports []string, backupEligible, backupState bool) chatgptwebauth.WebAuthnCredential {
+		privateKey, errGenerate := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+		if errGenerate != nil {
+			t.Fatal(errGenerate)
+		}
+		privateDER, errMarshal := x509.MarshalPKCS8PrivateKey(privateKey)
+		if errMarshal != nil {
+			t.Fatal(errMarshal)
+		}
+		return chatgptwebauth.WebAuthnCredential{
+			Version:         chatgptwebauth.WebAuthnCredentialVersion,
+			CredentialID:    base64.RawURLEncoding.EncodeToString([]byte("credential-" + label)),
+			UserHandle:      base64.RawURLEncoding.EncodeToString([]byte("user-handle-" + label)),
+			RPID:            chatgptwebauth.WebAuthnRPID,
+			Origin:          chatgptwebauth.WebAuthnOrigin,
+			Algorithm:       chatgptwebauth.WebAuthnES256Algorithm,
+			PrivateKeyPKCS8: base64.StdEncoding.EncodeToString(privateDER),
+			SignCount:       signCount,
+			MFAFactorID:     "factor-" + label,
+			Transports:      transports,
+			UserPresent:     true,
+			UserVerified:    true,
+			BackupEligible:  backupEligible,
+			BackupState:     backupState,
+			CreatedAt:       "2026-08-05T00:00:00Z",
+			LastUsedAt:      "2026-08-05T01:00:00Z",
+		}
+	}
+	recoveryKeys := make([]chatgptwebauth.AdvancedAccountRecoveryKey, 5)
+	for index := range recoveryKeys {
+		recoveryKeys[index] = chatgptwebauth.AdvancedAccountRecoveryKey{
+			RecoveryKey:                fmt.Sprintf("display-%d", index),
+			AccountRecoveryCode:        fmt.Sprintf("account-%d", index),
+			XWingPublicKeyBase64:       base64.StdEncoding.EncodeToString([]byte{byte(index + 1), 1}),
+			AuthenticationSecretBase64: base64.StdEncoding.EncodeToString([]byte{byte(index + 1), 2}),
+		}
+	}
+	advanced := &chatgptwebauth.AdvancedAccountSecurityCredential{
+		Version: chatgptwebauth.AdvancedAccountSecurityCredentialVersion,
+		Enabled: true,
+		Passkeys: []chatgptwebauth.AdvancedAccountSecurityPasskeyCredential{
+			{Kind: "passkey", IsNonDeviceBound: true, Credential: newAuthenticator("passkey", 6, []string{"hybrid"}, true, true)},
+			{Kind: "security-key", IsSecurityKey: true, Credential: newAuthenticator("security-key", 4, []string{"usb"}, false, false)},
+		},
+		RecoveryKeys: recoveryKeys,
+		EnrolledAt:   "2026-08-05T00:00:00Z",
+		VerifiedAt:   "2026-08-05T01:00:00Z",
+		LoginMethod:  "passkey",
+	}
+	payload, errMarshal := json.Marshal(map[string]any{
+		"type":                      chatgptwebauth.Provider,
+		"credential_schema_version": chatgptwebauth.CredentialSchemaVersionAdvancedAccountSecurity,
+		"email":                     "advanced@example.com",
+		"access_token":              "advanced-access-token",
+		"login_method":              chatgptwebauth.LoginMethodAdvancedSecurityPasskey,
+		"advanced_account_security": advanced,
+	})
+	if errMarshal != nil {
+		t.Fatal(errMarshal)
+	}
+	return string(payload), advanced
 }
 
 func startChatGPTWebImportTask(t *testing.T, router http.Handler, files []chatGPTWebImportTestFile) chatGPTWebMutationTask {

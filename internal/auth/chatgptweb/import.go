@@ -80,9 +80,9 @@ func DecodeImportCredential(data []byte) (*Credential, error) {
 			return nil, errAPI798
 		}
 	}
-	if credential.CredentialSchemaVersion == CredentialSchemaVersionWebAuthn &&
+	if (credential.CredentialSchemaVersion == CredentialSchemaVersionWebAuthn || credential.CredentialSchemaVersion == CredentialSchemaVersionAdvancedAccountSecurity) &&
 		strings.TrimSpace(credential.AccessToken) == "" && !HasSessionCookieForURL(credential.Cookies, SessionBaseURL) {
-		return nil, fmt.Errorf("chatgpt web WebAuthn import requires a current access token or session cookie")
+		return nil, fmt.Errorf("chatgpt web versioned credential import requires a current access token or session cookie")
 	}
 	switch credential.RefreshStrategy {
 	case RefreshStrategyWebOAuthRT:

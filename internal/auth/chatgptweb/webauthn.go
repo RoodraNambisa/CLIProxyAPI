@@ -71,7 +71,7 @@ func ValidateCredentialWebAuthn(credential *Credential) error {
 	schemaVersion := credential.CredentialSchemaVersion
 	switch schemaVersion {
 	case 0, 1:
-		if credential.WebAuthn != nil {
+		if credential.WebAuthn != nil || credential.AdvancedAccountSecurity != nil {
 			return errors.New("chatgpt web WebAuthn credential requires credential_schema_version 2")
 		}
 		return nil
@@ -79,10 +79,40 @@ func ValidateCredentialWebAuthn(credential *Credential) error {
 		if credential.WebAuthn == nil {
 			return errors.New("chatgpt web credential schema 2 requires webauthn")
 		}
+		if credential.AdvancedAccountSecurity != nil {
+			return errors.New("chatgpt web credential schema 2 cannot contain advanced_account_security")
+		}
+		return ValidateWebAuthnCredential(credential.WebAuthn)
+	case CredentialSchemaVersionAdvancedAccountSecurity:
+		if credential.AdvancedAccountSecurity == nil {
+			return errors.New("chatgpt web credential schema 3 requires advanced_account_security")
+		}
+		return ValidateAdvancedAccountSecurityCredential(credential.AdvancedAccountSecurity)
 	default:
 		return fmt.Errorf("unsupported chatgpt web credential schema version %d", schemaVersion)
 	}
-	return ValidateWebAuthnCredential(credential.WebAuthn)
+}
+
+func validateCredentialAdvancedAccountSecurityJSON(data []byte) error {
+	var root map[string]json.RawMessage
+	if err := json.Unmarshal(data, &root); err != nil {
+		return fmt.Errorf("decode chatgpt web credential: %w", err)
+	}
+	raw, ok := root["advanced_account_security"]
+	if !ok || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		return errors.New("chatgpt web credential schema 3 requires advanced_account_security")
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil || fields == nil {
+		return errors.New("chatgpt web advanced account security credential is invalid")
+	}
+	for _, field := range []string{"version", "enabled", "passkeys", "recovery_keys", "enrolled_at", "verified_at", "login_method"} {
+		value, exists := fields[field]
+		if !exists || bytes.Equal(bytes.TrimSpace(value), []byte("null")) {
+			return fmt.Errorf("chatgpt web advanced account security %s is required", field)
+		}
+	}
+	return nil
 }
 
 func validateCredentialWebAuthnJSON(data []byte) error {

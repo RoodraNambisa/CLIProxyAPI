@@ -20,23 +20,24 @@ const (
 )
 
 type chatGPTWebMutationTaskResult struct {
-	File                    string   `json:"file,omitempty"`
-	SourceName              string   `json:"source_name,omitempty"`
-	Email                   string   `json:"email,omitempty"`
-	Status                  string   `json:"status"`
-	Name                    string   `json:"name,omitempty"`
-	TargetName              string   `json:"target_name,omitempty"`
-	AuthIndex               string   `json:"auth_index,omitempty"`
-	CredentialMode          string   `json:"credential_mode,omitempty"`
-	CredentialSchemaVersion int      `json:"credential_schema_version,omitempty"`
-	PersistedFeatures       []string `json:"persisted_features,omitempty"`
-	WebAuthnV1Persisted     bool     `json:"webauthn_v1_persisted,omitempty"`
-	ErrorCategory           string   `json:"error_category,omitempty"`
-	Error                   string   `json:"error,omitempty"`
-	HTTPStatus              int      `json:"http_status,omitempty"`
-	SessionRefreshState     string   `json:"session_refresh_state,omitempty"`
-	ModelValidationState    string   `json:"model_validation_state,omitempty"`
-	AccountInfoRefreshState string   `json:"account_info_refresh_state,omitempty"`
+	File                      string   `json:"file,omitempty"`
+	SourceName                string   `json:"source_name,omitempty"`
+	Email                     string   `json:"email,omitempty"`
+	Status                    string   `json:"status"`
+	Name                      string   `json:"name,omitempty"`
+	TargetName                string   `json:"target_name,omitempty"`
+	AuthIndex                 string   `json:"auth_index,omitempty"`
+	CredentialMode            string   `json:"credential_mode,omitempty"`
+	CredentialSchemaVersion   int      `json:"credential_schema_version,omitempty"`
+	PersistedFeatures         []string `json:"persisted_features,omitempty"`
+	WebAuthnV1Persisted       bool     `json:"webauthn_v1_persisted,omitempty"`
+	AdvancedSecurityPersisted bool     `json:"advanced_account_security_v1_persisted,omitempty"`
+	ErrorCategory             string   `json:"error_category,omitempty"`
+	Error                     string   `json:"error,omitempty"`
+	HTTPStatus                int      `json:"http_status,omitempty"`
+	SessionRefreshState       string   `json:"session_refresh_state,omitempty"`
+	ModelValidationState      string   `json:"model_validation_state,omitempty"`
+	AccountInfoRefreshState   string   `json:"account_info_refresh_state,omitempty"`
 }
 
 type chatGPTWebMutationTask struct {

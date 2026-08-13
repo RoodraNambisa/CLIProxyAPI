@@ -1201,6 +1201,7 @@ func cloneCredential(source *Credential) *Credential {
 	clone := *source
 	clone.Cookies = append([]Cookie(nil), source.Cookies...)
 	clone.WebAuthn = cloneWebAuthnCredential(source.WebAuthn)
+	clone.AdvancedAccountSecurity = CloneAdvancedAccountSecurityCredential(source.AdvancedAccountSecurity)
 	if source.BrowserEnvironment != nil {
 		identity := *source.BrowserEnvironment
 		clone.BrowserEnvironment = &identity
