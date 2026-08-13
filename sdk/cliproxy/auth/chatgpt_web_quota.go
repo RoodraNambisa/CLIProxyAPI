@@ -664,6 +664,11 @@ func chatGPTWebImageMayBeBlocked(auth *Auth, now time.Time) bool {
 	if auth == nil || !strings.EqualFold(strings.TrimSpace(auth.Provider), chatgptwebauth.Provider) {
 		return false
 	}
+	if auth.Unavailable &&
+		strings.EqualFold(strings.TrimSpace(auth.CooldownScope), cooldownScopeAuth) &&
+		auth.NextRetryAfter.After(now) {
+		return true
+	}
 	if exhausted, _ := chatGPTWebImageQuotaExhausted(auth); exhausted {
 		return true
 	}

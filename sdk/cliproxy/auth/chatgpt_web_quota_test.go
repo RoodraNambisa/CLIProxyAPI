@@ -1423,6 +1423,57 @@ func TestManagerImageQuotaErrorInspectsOnlyBlockedWebCredentials(t *testing.T) {
 	assertChatGPTWebImageQuotaError(t, errGot)
 }
 
+func TestManagerImageQuotaErrorPreservesOriginalForAuthCooldown(t *testing.T) {
+	manager := NewManager(nil, &FillFirstSelector{}, nil)
+	now := time.Now()
+	quotaID := "quota-error-exhausted-" + uuid.NewString()
+	cooldownID := "quota-error-auth-cooldown-" + uuid.NewString()
+
+	manager.mu.Lock()
+	manager.installAuthLocked(quotaID, &Auth{
+		ID:       quotaID,
+		Provider: chatgptwebauth.Provider,
+		Status:   StatusActive,
+		Metadata: map[string]any{
+			"lifecycle_state":      LifecycleStateActive,
+			"quota_state":          string(chatgptwebauth.QuotaStateExhausted),
+			"image_quota_reset_at": now.Add(time.Hour).Format(time.RFC3339Nano),
+		},
+	})
+	manager.installAuthLocked(cooldownID, &Auth{
+		ID:             cooldownID,
+		Provider:       chatgptwebauth.Provider,
+		Status:         StatusError,
+		Unavailable:    true,
+		CooldownScope:  cooldownScopeAuth,
+		NextRetryAfter: now.Add(2 * time.Minute),
+		Metadata:       map[string]any{"lifecycle_state": LifecycleStateActive},
+	})
+	_, cooldownIndexed := manager.chatGPTWebImageBlockedIDs[cooldownID]
+	_, cooldownRefreshScheduled := manager.chatGPTWebImageQuotaChecks[cooldownID]
+	manager.mu.Unlock()
+
+	if !cooldownIndexed {
+		t.Fatal("auth-level cooldown is absent from the image error priority index")
+	}
+	if cooldownRefreshScheduled {
+		t.Fatal("auth-level cooldown was incorrectly scheduled for image quota refresh")
+	}
+
+	errOriginal := &Error{Code: "auth_unavailable", Message: "no auth available"}
+	errGot := manager.preferChatGPTWebImageToolQuotaError(
+		errOriginal,
+		[]string{chatgptwebauth.Provider},
+		"",
+		cliproxyexecutor.Options{},
+		nil,
+		nil,
+	)
+	if errGot != errOriginal {
+		t.Fatalf("preferred error = %v, want original %v", errGot, errOriginal)
+	}
+}
+
 func TestManagerDueImageQuotaRefreshDoesNotExposeLaterResetRetryAfter(t *testing.T) {
 	manager := NewManager(nil, &FillFirstSelector{}, nil)
 	manager.SetRetryConfig(0, 0, 0)
