@@ -41,6 +41,7 @@ func TestChatGPTWebReloginQueueTenThousandDelayedTasksUseConstantGoroutines(t *t
 			heapIndex:     -1,
 		}
 		queue.tasks[key] = task
+		queue.indexTaskLocked(task)
 		heap.Push(&queue.delayed, task)
 	}
 	queue.sequence = 10_000
@@ -161,6 +162,7 @@ func TestChatGPTWebReloginQueuePromotesManualRelogin(t *testing.T) {
 	queue.sequence++
 	task.sequence = queue.sequence
 	queue.tasks[task.generationKey] = task
+	queue.indexTaskLocked(task)
 	heap.Push(&queue.delayed, task)
 	queue.mu.Unlock()
 	queue.notify()
@@ -178,5 +180,56 @@ func TestChatGPTWebReloginQueuePromotesManualRelogin(t *testing.T) {
 	}
 	if snapshot.Queued != 0 || snapshot.Delayed != 0 || snapshot.Running != 0 {
 		t.Fatalf("queue snapshot after manual re-login = %+v", snapshot)
+	}
+}
+
+func TestChatGPTWebReloginQueueRemovalUsesAuthIndex(t *testing.T) {
+	lifecycleCtx, lifecycleCancel := context.WithCancel(context.Background())
+	executor := &ChatGPTWebExecutor{
+		now:             time.Now,
+		lifecycleCtx:    lifecycleCtx,
+		lifecycleCancel: lifecycleCancel,
+	}
+	queue := newChatGPTWebReloginQueue(executor, lifecycleCtx, 1)
+	executor.backgroundQueue = queue
+	queue.setEnabled(true)
+	t.Cleanup(queue.close)
+
+	dueAt := time.Now().Add(time.Hour)
+	queue.mu.Lock()
+	for index := range 10_000 {
+		authID := "auth-" + strconv.Itoa(index)
+		key := "generation-" + strconv.Itoa(index)
+		task := &chatGPTWebReloginQueueTask{
+			authID:        authID,
+			instanceID:    "instance-" + strconv.Itoa(index),
+			generationKey: key,
+			attempt:       1,
+			dueAt:         dueAt,
+			sequence:      uint64(index + 1),
+			heapIndex:     -1,
+		}
+		queue.tasks[key] = task
+		queue.indexTaskLocked(task)
+		heap.Push(&queue.delayed, task)
+	}
+	queue.sequence = 10_000
+	queue.mu.Unlock()
+
+	queue.removeAuthInstance("auth-7319", "instance-7319")
+
+	queue.mu.Lock()
+	defer queue.mu.Unlock()
+	if got := len(queue.tasks); got != 9_999 {
+		t.Fatalf("queued tasks = %d, want 9999", got)
+	}
+	if _, exists := queue.tasks["generation-7319"]; exists {
+		t.Fatal("target task remains queued")
+	}
+	if _, exists := queue.byAuthID["auth-7319"]; exists {
+		t.Fatal("target auth index remains")
+	}
+	if got := len(queue.byAuthID); got != 9_999 {
+		t.Fatalf("auth index entries = %d, want 9999", got)
 	}
 }

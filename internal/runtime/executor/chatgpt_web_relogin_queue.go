@@ -73,6 +73,7 @@ type chatGPTWebReloginQueue struct {
 	sequence uint64
 	tasks    map[string]*chatGPTWebReloginQueueTask
 	active   map[string]*chatGPTWebReloginQueueActive
+	byAuthID map[string]map[string]struct{}
 	delayed  chatGPTWebReloginTaskHeap
 
 	promoted     atomic.Uint64
@@ -97,6 +98,7 @@ func newChatGPTWebReloginQueue(executor *ChatGPTWebExecutor, parent context.Cont
 		work:     make(chan *chatGPTWebReloginQueueTask),
 		tasks:    make(map[string]*chatGPTWebReloginQueueTask),
 		active:   make(map[string]*chatGPTWebReloginQueueActive),
+		byAuthID: make(map[string]map[string]struct{}),
 	}
 	heap.Init(&queue.delayed)
 	queue.wg.Add(1 + workers)
@@ -176,6 +178,7 @@ func (q *chatGPTWebReloginQueue) enqueueAuth(auth *cliproxyauth.Auth) bool {
 	q.sequence++
 	task.sequence = q.sequence
 	q.tasks[task.generationKey] = task
+	q.indexTaskLocked(task)
 	heap.Push(&q.delayed, task)
 	q.mu.Unlock()
 	q.notify()
@@ -194,6 +197,7 @@ func (q *chatGPTWebReloginQueue) promote(auth *cliproxyauth.Auth) *chatGPTWebRel
 		if task.heapIndex >= 0 {
 			heap.Remove(&q.delayed, task.heapIndex)
 		}
+		q.unindexTaskLocked(task)
 		q.promoted.Add(1)
 	}
 	q.mu.Unlock()
@@ -217,6 +221,7 @@ func (q *chatGPTWebReloginQueue) restore(task *chatGPTWebReloginQueueTask) {
 	q.sequence++
 	task.sequence = q.sequence
 	q.tasks[task.generationKey] = task
+	q.indexTaskLocked(task)
 	heap.Push(&q.delayed, task)
 	q.mu.Unlock()
 	q.notify()
@@ -230,26 +235,32 @@ func (q *chatGPTWebReloginQueue) removeAuthInstance(authID string, instanceID st
 	instanceID = strings.TrimSpace(instanceID)
 	q.mu.Lock()
 	removed := uint64(0)
-	for key, task := range q.tasks {
-		if task.authID != authID || (instanceID != "" && task.instanceID != instanceID) {
+	for key := range q.byAuthID[authID] {
+		if task := q.tasks[key]; task != nil {
+			if instanceID != "" && task.instanceID != instanceID {
+				continue
+			}
+			delete(q.tasks, key)
+			if task.heapIndex >= 0 {
+				heap.Remove(&q.delayed, task.heapIndex)
+			}
+			q.unindexTaskLocked(task)
+			removed++
 			continue
 		}
-		delete(q.tasks, key)
-		if task.heapIndex >= 0 {
-			heap.Remove(&q.delayed, task.heapIndex)
-		}
-		removed++
-	}
-	for key, active := range q.active {
-		if active == nil || active.task == nil || active.task.authID != authID ||
-			(instanceID != "" && active.task.instanceID != instanceID) {
+		if active := q.active[key]; active != nil && active.task != nil {
+			if instanceID != "" && active.task.instanceID != instanceID {
+				continue
+			}
+			delete(q.active, key)
+			q.unindexTaskLocked(active.task)
+			if active.cancel != nil {
+				active.cancel()
+			}
+			removed++
 			continue
 		}
-		delete(q.active, key)
-		if active.cancel != nil {
-			active.cancel()
-		}
-		removed++
+		q.unindexKeyLocked(authID, key)
 	}
 	q.mu.Unlock()
 	if removed > 0 {
@@ -407,6 +418,8 @@ func (q *chatGPTWebReloginQueue) finish(task *chatGPTWebReloginQueueTask, retry 
 		task.heapIndex = -1
 		q.tasks[task.generationKey] = task
 		heap.Push(&q.delayed, task)
+	} else {
+		q.unindexTaskLocked(task)
 	}
 	q.mu.Unlock()
 	q.notify()
@@ -425,9 +438,47 @@ func (q *chatGPTWebReloginQueue) clearLocked(cancelActive bool) {
 			}
 		}
 		q.active = make(map[string]*chatGPTWebReloginQueueActive)
+		q.byAuthID = make(map[string]map[string]struct{})
+	} else {
+		q.byAuthID = make(map[string]map[string]struct{}, len(q.active))
+		for _, active := range q.active {
+			if active != nil {
+				q.indexTaskLocked(active.task)
+			}
+		}
 	}
 	if removed > 0 {
 		q.canceled.Add(removed)
+	}
+}
+
+func (q *chatGPTWebReloginQueue) indexTaskLocked(task *chatGPTWebReloginQueueTask) {
+	if q == nil || task == nil || task.authID == "" || task.generationKey == "" {
+		return
+	}
+	keys := q.byAuthID[task.authID]
+	if keys == nil {
+		keys = make(map[string]struct{})
+		q.byAuthID[task.authID] = keys
+	}
+	keys[task.generationKey] = struct{}{}
+}
+
+func (q *chatGPTWebReloginQueue) unindexTaskLocked(task *chatGPTWebReloginQueueTask) {
+	if task == nil {
+		return
+	}
+	q.unindexKeyLocked(task.authID, task.generationKey)
+}
+
+func (q *chatGPTWebReloginQueue) unindexKeyLocked(authID, generationKey string) {
+	keys := q.byAuthID[authID]
+	if keys == nil {
+		return
+	}
+	delete(keys, generationKey)
+	if len(keys) == 0 {
+		delete(q.byAuthID, authID)
 	}
 }
 
