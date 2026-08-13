@@ -236,6 +236,9 @@ func newRequestBodyAuditMatcher(keywords [][]byte, caseSensitive bool) *requestB
 			asciiKeywords = append(asciiKeywords, cloned)
 			continue
 		}
+		if !caseSensitive {
+			cloned = bytes.ToLower(cloned)
+		}
 		matcher.nonASCII = append(matcher.nonASCII, cloned)
 	}
 	matcher.ascii = newRequestBodyAuditAutomaton(asciiKeywords)

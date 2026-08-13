@@ -165,6 +165,7 @@ func TestRequestBodyAuditMatchedCaseInsensitivePaths(t *testing.T) {
 		{name: "ascii", body: []byte(`{"prompt":"DrAw A Cat"}`), keyword: []byte("draw a cat"), want: true},
 		{name: "unicode", body: []byte(`{"prompt":"STRASSE ÄNDERUNG"}`), keyword: bytes.ToLower([]byte("straße änderung")), want: false},
 		{name: "unicode exact fold", body: []byte(`{"prompt":"ÄNDERUNG"}`), keyword: bytes.ToLower([]byte("änderung")), want: true},
+		{name: "unicode keyword fold", body: []byte(`{"prompt":"änderung"}`), keyword: []byte("ÄNDERUNG"), want: true},
 		{name: "unicode fold to ascii", body: []byte(`{"prompt":"K"}`), keyword: []byte("k"), want: true},
 		{name: "binary", body: []byte{0x00, 'A', 0x01, 'b'}, keyword: []byte{0x00, 'a', 0x01, 'B'}, want: true},
 		{name: "missing", body: []byte("some payload"), keyword: []byte("absent"), want: false},
