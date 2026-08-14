@@ -1651,6 +1651,26 @@ func TestReloginChatGPTWebAuthUsesExecutorAndReturnsSafeLifecycle(t *testing.T) 
 		!strings.Contains(recorder.Body.String(), `"error_category":"persist_failed"`) {
 		t.Fatalf("rolled-back relogin response = %d %s", recorder.Code, recorder.Body.String())
 	}
+
+	executor.mu.Lock()
+	executor.reloginFn = func(_ context.Context, auth *coreauth.Auth) (*coreauth.Auth, bool, error) {
+		return auth.Clone(), true, &chatgptwebauth.AuthError{
+			Code:           "advanced_security_challenge_unavailable",
+			State:          chatgptwebauth.LifecycleReauthRequired,
+			LifecycleState: chatgptwebauth.LifecycleReauthRequired,
+			StatusCode:     http.StatusBadRequest,
+			FailureStage:   "advanced_security_login",
+			Message:        "upstream detail must not be returned",
+		}
+	}
+	executor.mu.Unlock()
+	recorder = performChatGPTWebManagementRequest(t, router, http.MethodPost, path, "")
+	if recorder.Code != http.StatusBadRequest ||
+		!strings.Contains(recorder.Body.String(), `"error_category":"advanced_security_challenge_unavailable"`) ||
+		!strings.Contains(recorder.Body.String(), `"failure_stage":"advanced_security_login"`) ||
+		strings.Contains(recorder.Body.String(), "upstream detail") {
+		t.Fatalf("advanced security relogin response = %d %s", recorder.Code, recorder.Body.String())
+	}
 }
 
 func TestReloginChatGPTWebAuthHoldsProxyBindingLease(t *testing.T) {

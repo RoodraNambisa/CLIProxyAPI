@@ -29,6 +29,7 @@ type advancedSecurityLoginFixture struct {
 	verifyCode         string
 	dropVerifyResponse bool
 	finalizeStatus     int
+	entryURLOnly       bool
 	sessionEmail       string
 	sessionUserID      string
 	mu                 sync.Mutex
@@ -57,10 +58,16 @@ func (fixture *advancedSecurityLoginFixture) serveHTTP(response http.ResponseWri
 		http.SetCookie(response, &http.Cookie{Name: "next-auth.csrf-token", Value: "csrf-token%7Chash", Path: "/"})
 		_, _ = io.WriteString(response, `{"csrfToken":"csrf-token"}`)
 	case "/api/auth/signin/openai":
-		_, _ = fmt.Fprintf(response, `{"url":%q}`, fixture.server.URL+"/oauth/authorize")
+		entryPath := "/oauth/authorize"
+		if fixture.entryURLOnly {
+			entryPath = "/auth-challenge"
+		}
+		_, _ = fmt.Fprintf(response, `{"url":%q}`, fixture.server.URL+entryPath)
 	case "/oauth/authorize":
 		response.WriteHeader(http.StatusBadRequest)
 		_, _ = io.WriteString(response, `{"page":{"type":"advanced_account_security"},"continue_url":"/auth-challenge"}`)
+	case "/auth-challenge":
+		_, _ = io.WriteString(response, `{"page":{"type":"sign_in"}}`)
 	case advancedSecurityChallengeIssuePath:
 		fixture.mu.Lock()
 		fixture.issueCalls++
@@ -362,5 +369,45 @@ func TestServiceAdvancedSecurityLoginSelectsAllowedCredentialAndFinalizes(t *tes
 				t.Fatalf("credential = %#v", credential)
 			}
 		})
+	}
+}
+
+func TestServiceAdvancedSecurityLoginRecognizesFinalURLOnlyChallenge(t *testing.T) {
+	fixedNow := time.Date(2026, time.August, 5, 12, 0, 0, 0, time.UTC)
+	aas := testAdvancedAccountSecurityCredential(t)
+	allowed := aas.Passkeys[0].Credential.CredentialID
+	initialCount := aas.Passkeys[0].Credential.SignCount
+	fixture := newAdvancedSecurityLoginFixture(t, allowed, false)
+	fixture.entryURLOnly = true
+	service := NewService(fixture.options(fixedNow))
+
+	credential, errLogin := service.Login(t.Context(), LoginInput{
+		Credential: &Credential{
+			CredentialSchemaVersion: CredentialSchemaVersionAdvancedAccountSecurity,
+			Type:                    Provider,
+			Email:                   "person@example.com",
+			AccountID:               "account-1",
+			UserID:                  "user-1",
+			AdvancedAccountSecurity: aas,
+		},
+		Relogin: true,
+		PersistAdvancedAccountSecurity: func(_ context.Context, updated AdvancedAccountSecurityCredential) (AdvancedAccountSecurityCredential, error) {
+			fixture.mu.Lock()
+			fixture.persisted = true
+			fixture.mu.Unlock()
+			return *CloneAdvancedAccountSecurityCredential(&updated), nil
+		},
+	})
+	if errLogin != nil {
+		t.Fatalf("Login() error = %v", errLogin)
+	}
+	fixture.mu.Lock()
+	issueCalls, dumpCalls, verifyCalls := fixture.issueCalls, fixture.dumpCalls, fixture.verifyCalls
+	fixture.mu.Unlock()
+	if issueCalls != 1 || dumpCalls != 1 || verifyCalls != 1 {
+		t.Fatalf("calls issue=%d dump=%d verify=%d", issueCalls, dumpCalls, verifyCalls)
+	}
+	if credential.AdvancedAccountSecurity.Passkeys[0].Credential.SignCount != initialCount+1 {
+		t.Fatalf("sign_count = %d, want %d", credential.AdvancedAccountSecurity.Passkeys[0].Credential.SignCount, initialCount+1)
 	}
 }

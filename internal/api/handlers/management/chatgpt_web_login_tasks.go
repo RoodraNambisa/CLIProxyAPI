@@ -1459,6 +1459,20 @@ func safeChatGPTWebErrorMessage(category string) string {
 		return "Cloudflare challenge blocked authentication"
 	case "login_proxy_invalid":
 		return "login proxy configuration is invalid"
+	case "advanced_security_credential_invalid":
+		return "advanced account security credential is invalid"
+	case "advanced_security_state_persist_failed":
+		return "advanced account security state could not be saved"
+	case "advanced_security_challenge_unavailable":
+		return "advanced account security challenge is unavailable"
+	case "advanced_security_credential_not_allowed":
+		return "advanced account security credential is not allowed"
+	case "advanced_security_assertion_invalid":
+		return "advanced account security assertion is invalid"
+	case "advanced_security_verification_failed":
+		return "advanced account security verification failed"
+	case "advanced_security_finalize_failed":
+		return "advanced account security login could not be finalized"
 	default:
 		return "chatgpt web authentication failed"
 	}

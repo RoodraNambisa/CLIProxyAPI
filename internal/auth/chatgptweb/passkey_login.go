@@ -39,7 +39,7 @@ func (service *Service) loginWithPasskey(
 		return service.loginFailure(credential, input.Relogin, passkeyCredentialError("passkey_credential_invalid", "Passkey credential is invalid", errValidate))
 	}
 
-	challengePayload, errChallenge := service.beginPasskeyLogin(ctx, client, credential, pendingState)
+	challengePayload, _, errChallenge := service.beginPasskeyLogin(ctx, client, credential, pendingState)
 	if errChallenge != nil {
 		return service.loginFailure(credential, input.Relogin, ensureAuthError(errChallenge, pendingState))
 	}
@@ -106,28 +106,28 @@ func (service *Service) loginWithPasskey(
 	return service.finishPasskeyLogin(ctx, client, credential, input, pendingState)
 }
 
-func (service *Service) beginPasskeyLogin(ctx context.Context, client *Client, credential *Credential, pendingState LifecycleState) ([]byte, error) {
+func (service *Service) beginPasskeyLogin(ctx context.Context, client *Client, credential *Credential, pendingState LifecycleState) ([]byte, string, error) {
 	response, payload, errCSRF := client.DoFollow(ctx, http.MethodGet,
 		service.options.SessionBaseURL+"/api/auth/csrf",
 		service.sessionAPIHeaders(service.options.SessionBaseURL+"/"), nil)
 	if errCSRF != nil {
-		return nil, networkAuthError("passkey_challenge_unavailable", pendingState, errCSRF)
+		return nil, "", networkAuthError("passkey_challenge_unavailable", pendingState, errCSRF)
 	}
 	if isCloudflareChallenge(response, payload) {
 		authError := newAuthError("cloudflare_challenge", pendingState, response.StatusCode, true, false, "Cloudflare challenge blocked Passkey login", nil)
 		authError.FailureStage = "passkey_challenge"
-		return nil, attachPasskeyHTTPDiagnostic(authError, response, payload, service.options.SessionBaseURL+"/api/auth/csrf")
+		return nil, "", attachPasskeyHTTPDiagnostic(authError, response, payload, service.options.SessionBaseURL+"/api/auth/csrf")
 	}
 	if authError := classifyPasskeyChallengeResponse(response.StatusCode, payload, pendingState); authError != nil {
-		return nil, attachPasskeyHTTPDiagnostic(authError, response, payload, service.options.SessionBaseURL+"/api/auth/csrf")
+		return nil, "", attachPasskeyHTTPDiagnostic(authError, response, payload, service.options.SessionBaseURL+"/api/auth/csrf")
 	}
 	csrfToken := passkeyCSRFToken(payload, client.ExportCookies(), service.options.SessionBaseURL)
 	if csrfToken == "" {
-		return nil, passkeyCredentialError("passkey_challenge_unavailable", "Passkey login CSRF token is unavailable", nil)
+		return nil, "", passkeyCredentialError("passkey_challenge_unavailable", "Passkey login CSRF token is unavailable", nil)
 	}
 	authSessionID, errSessionID := GenerateDeviceID(service.options.Rand)
 	if errSessionID != nil {
-		return nil, newAuthError("random_generation_failed", pendingState, 0, false, true, "initialize Passkey login session", errSessionID)
+		return nil, "", newAuthError("random_generation_failed", pendingState, 0, false, true, "initialize Passkey login session", errSessionID)
 	}
 	query := url.Values{
 		"prompt":                          {"login"},
@@ -148,23 +148,23 @@ func (service *Service) beginPasskeyLogin(ctx context.Context, client *Client, c
 		service.options.SessionBaseURL+"/api/auth/signin/openai?"+query.Encode(),
 		headers, strings.NewReader(form.Encode()))
 	if errSignin != nil {
-		return nil, networkAuthError("passkey_challenge_unavailable", pendingState, errSignin)
+		return nil, "", networkAuthError("passkey_challenge_unavailable", pendingState, errSignin)
 	}
 	if isCloudflareChallenge(response, payload) {
 		authError := newAuthError("cloudflare_challenge", pendingState, response.StatusCode, true, false, "Cloudflare challenge blocked Passkey login", nil)
 		authError.FailureStage = "passkey_challenge"
-		return nil, attachPasskeyHTTPDiagnostic(authError, response, payload, service.options.SessionBaseURL+"/api/auth/signin/openai")
+		return nil, "", attachPasskeyHTTPDiagnostic(authError, response, payload, service.options.SessionBaseURL+"/api/auth/signin/openai")
 	}
 	if authError := classifyPasskeyChallengeResponse(response.StatusCode, payload, pendingState); authError != nil {
-		return nil, attachPasskeyHTTPDiagnostic(authError, response, payload, service.options.SessionBaseURL+"/api/auth/signin/openai")
+		return nil, "", attachPasskeyHTTPDiagnostic(authError, response, payload, service.options.SessionBaseURL+"/api/auth/signin/openai")
 	}
 	var signin map[string]any
 	if errDecode := json.Unmarshal(payload, &signin); errDecode != nil {
-		return nil, passkeyCredentialError("passkey_challenge_unavailable", "Passkey sign-in response is invalid", errDecode)
+		return nil, "", passkeyCredentialError("passkey_challenge_unavailable", "Passkey sign-in response is invalid", errDecode)
 	}
 	authURL := strings.TrimSpace(stringValue(signin["url"]))
 	if authURL == "" || validateOAuthContinuationOrigin(authURL, service.options.AuthBaseURL) != nil {
-		return nil, passkeyCredentialError("passkey_challenge_unavailable", "Passkey sign-in response did not contain a trusted authorization URL", nil)
+		return nil, "", passkeyCredentialError("passkey_challenge_unavailable", "Passkey sign-in response did not contain a trusted authorization URL", nil)
 	}
 	response, payload, errEntry := client.DoFollow(ctx, http.MethodGet, authURL, map[string]string{
 		"accept":                    "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
@@ -176,30 +176,30 @@ func (service *Service) beginPasskeyLogin(ctx context.Context, client *Client, c
 		"upgrade-insecure-requests": "1",
 	}, nil)
 	if errEntry != nil {
-		return nil, networkAuthError("passkey_challenge_unavailable", pendingState, errEntry)
+		return nil, "", networkAuthError("passkey_challenge_unavailable", pendingState, errEntry)
 	}
 	if isCloudflareChallenge(response, payload) {
 		authError := newAuthError("cloudflare_challenge", pendingState, response.StatusCode, true, false, "Cloudflare challenge blocked Passkey login", nil)
 		authError.FailureStage = "passkey_challenge"
-		return nil, attachPasskeyHTTPDiagnostic(authError, response, payload, authURL)
+		return nil, "", attachPasskeyHTTPDiagnostic(authError, response, payload, authURL)
 	}
 	if credential.CredentialSchemaVersion == CredentialSchemaVersionAdvancedAccountSecurity &&
 		isAdvancedSecurityAuthChallenge(payload, responseRequestURL(response)) {
-		return payload, nil
+		return payload, responseRequestURL(response), nil
 	}
 	if authError := classifyPasskeyChallengeResponse(response.StatusCode, payload, pendingState); authError != nil {
-		return nil, attachPasskeyHTTPDiagnostic(authError, response, payload, authURL)
+		return nil, "", attachPasskeyHTTPDiagnostic(authError, response, payload, authURL)
 	}
 	if deviceID, errCookie := credentialCookieValueForURL(client.ExportCookies(), service.options.AuthBaseURL, "oai-did"); errCookie == nil && strings.TrimSpace(deviceID) != "" {
 		credential.DeviceID = strings.TrimSpace(deviceID)
 		if errSet := client.SetCookie(service.options.SessionBaseURL, "oai-did", credential.DeviceID); errSet != nil {
 			authError := newAuthError("cookie_initialization_failed", pendingState, 0, false, true, "synchronize Passkey device cookie", errSet)
 			authError.FailureStage = "passkey_challenge"
-			return nil, authError
+			return nil, "", authError
 		}
 	}
 	if _, _, ok := extractPasskeyChallenge(payload); ok {
-		return payload, nil
+		return payload, responseRequestURL(response), nil
 	}
 
 	sentinel, errSentinel := NewSentinelWithEnvironment(
@@ -212,11 +212,11 @@ func (service *Service) beginPasskeyLogin(ctx context.Context, client *Client, c
 		service.options.Now,
 	)
 	if errSentinel != nil {
-		return nil, newAuthError("sentinel_initialization_failed", pendingState, 0, false, true, "initialize Passkey login sentinel", errSentinel)
+		return nil, "", newAuthError("sentinel_initialization_failed", pendingState, 0, false, true, "initialize Passkey login sentinel", errSentinel)
 	}
 	authorizeSentinel, errToken := sentinel.Token(ctx, "authorize_continue")
 	if errToken != nil {
-		return nil, ensureAuthError(errToken, pendingState)
+		return nil, "", ensureAuthError(errToken, pendingState)
 	}
 	response, payload, errContinue := client.DoJSON(ctx, true, http.MethodPost,
 		service.options.AuthBaseURL+"/api/accounts/authorize/continue",
@@ -226,17 +226,17 @@ func (service *Service) beginPasskeyLogin(ctx context.Context, client *Client, c
 			"screen_hint": "login",
 		})
 	if errContinue != nil {
-		return nil, networkAuthError("passkey_challenge_unavailable", pendingState, errContinue)
+		return nil, "", networkAuthError("passkey_challenge_unavailable", pendingState, errContinue)
 	}
 	if isCloudflareChallenge(response, payload) {
 		authError := newAuthError("cloudflare_challenge", pendingState, response.StatusCode, true, false, "Cloudflare challenge blocked Passkey login", nil)
 		authError.FailureStage = "passkey_challenge"
-		return nil, attachPasskeyHTTPDiagnostic(authError, response, payload, service.options.AuthBaseURL+"/api/accounts/authorize/continue")
+		return nil, "", attachPasskeyHTTPDiagnostic(authError, response, payload, service.options.AuthBaseURL+"/api/accounts/authorize/continue")
 	}
 	if authError := classifyPasskeyChallengeResponse(response.StatusCode, payload, pendingState); authError != nil {
-		return nil, attachPasskeyHTTPDiagnostic(authError, response, payload, service.options.AuthBaseURL+"/api/accounts/authorize/continue")
+		return nil, "", attachPasskeyHTTPDiagnostic(authError, response, payload, service.options.AuthBaseURL+"/api/accounts/authorize/continue")
 	}
-	return payload, nil
+	return payload, responseRequestURL(response), nil
 }
 
 func (service *Service) consumePasskeyCallback(ctx context.Context, client *Client, rawURL string, pendingState LifecycleState) error {

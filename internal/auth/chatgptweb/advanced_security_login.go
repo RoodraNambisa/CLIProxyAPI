@@ -31,11 +31,11 @@ func (service *Service) loginWithAdvancedSecurityPasskey(
 		return service.loginFailure(credential, input.Relogin, advancedSecurityStatePersistenceError(pendingState, "advanced_security_challenge", nil))
 	}
 
-	entryPayload, errEntry := service.beginPasskeyLogin(ctx, client, credential, pendingState)
+	entryPayload, entryURL, errEntry := service.beginPasskeyLogin(ctx, client, credential, pendingState)
 	if errEntry != nil {
 		return service.loginFailure(credential, input.Relogin, ensureAuthError(errEntry, pendingState))
 	}
-	if !isAdvancedSecurityAuthChallenge(entryPayload, "") {
+	if !isAdvancedSecurityAuthChallenge(entryPayload, entryURL) {
 		return service.loginFailure(credential, input.Relogin, advancedSecurityCredentialError("advanced_security_challenge_unavailable", "Advanced account security challenge is unavailable", nil))
 	}
 	if authError := service.issueAdvancedSecurityPasskeyChallenge(ctx, client, credential, pendingState); authError != nil {
