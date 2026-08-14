@@ -3,11 +3,14 @@ package helps
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net"
 	"net/http"
 	"strings"
 	"testing"
 	"unicode/utf8"
+
+	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 )
 
 func TestClassifyChatGPTWebHTTPDiagnostic(t *testing.T) {
@@ -81,9 +84,6 @@ func TestClassifyChatGPTWebHTTPDiagnostic(t *testing.T) {
 			if diagnostic.Cloudflare != test.wantCloudflare || diagnostic.Retryable != test.wantRetryable {
 				t.Fatalf("diagnostic classification = %#v", diagnostic)
 			}
-			if strings.Contains(diagnostic.TargetPath, "?") {
-				t.Fatalf("target path retained a query: %q", diagnostic.TargetPath)
-			}
 			encoded, errMarshal := json.Marshal(diagnostic)
 			if errMarshal != nil {
 				t.Fatalf("marshal diagnostic: %v", errMarshal)
@@ -116,6 +116,41 @@ func TestChatGPTWebDiagnosticLogFieldsIncludeCatalogIdentity(t *testing.T) {
 		fields["transport_persona_id"] != "c146-win-iris-1536" || fields["browser_environment_id"] != "c146-win-iris-1536-e12" ||
 		fields["tls_profile"] != "chrome_146" {
 		t.Fatalf("diagnostic fields = %#v", fields)
+	}
+}
+
+func TestChatGPTWebDiagnosticLogFieldsPreserveNonCredentialBodyForOrdinaryLogs(t *testing.T) {
+	diagnostic := &cliproxyauth.ErrorDiagnostic{
+		ResponseBody: `{"email":"person@example.com","message":"upstream detail","access_token":"sk-abcdefghijk1234"}`,
+	}
+	fields := ChatGPTWebDiagnosticLogFields(diagnostic)
+	ordinary := fmt.Sprint(fields["response_body"])
+	for _, want := range []string{"person@example.com", "upstream detail"} {
+		if !strings.Contains(ordinary, want) {
+			t.Fatalf("ordinary log body lost existing non-credential detail %q: %s", want, ordinary)
+		}
+	}
+	if strings.Contains(ordinary, "sk-abcdefghijk1234") {
+		t.Fatalf("ordinary log body leaked credential material: %s", ordinary)
+	}
+}
+
+func TestClassifyChatGPTWebHTTPDiagnosticKeepsOnlyOrdinaryQueryDetails(t *testing.T) {
+	diagnostic := ClassifyChatGPTWebHTTPDiagnostic(
+		http.StatusBadGateway,
+		"https://chatgpt.com/backend-api/conversation?trace=abc&code=oauth-secret",
+		[]byte(`{"error":"failed"}`),
+		http.Header{"Content-Type": {"application/json"}},
+	)
+	if !strings.Contains(diagnostic.TargetPath, "trace=abc") {
+		t.Fatalf("target path lost ordinary query: %s", diagnostic.TargetPath)
+	}
+	if strings.Contains(diagnostic.TargetPath, "oauth-secret") {
+		t.Fatalf("target path leaked authorization query: %s", diagnostic.TargetPath)
+	}
+	fields := ChatGPTWebDiagnosticLogFields(diagnostic)
+	if got := fmt.Sprint(fields["target_path"]); got != "/backend-api/conversation" {
+		t.Fatalf("ordinary log target path = %q", got)
 	}
 }
 
@@ -162,7 +197,7 @@ func TestClassifyChatGPTWebTransportDiagnostic(t *testing.T) {
 			path:          "https://files.oaiusercontent.com/object/image.png?sig=secret",
 			wantCode:      "dns_error",
 			wantHost:      "files.oaiusercontent.com",
-			wantPath:      "/object/image.png",
+			wantPath:      "/object/image.png?redacted",
 			wantRetryable: true,
 		},
 		{
@@ -180,7 +215,7 @@ func TestClassifyChatGPTWebTransportDiagnostic(t *testing.T) {
 			path:          "https://secret.internal/path?token=secret",
 			wantCode:      "network_timeout",
 			wantHost:      "external_asset",
-			wantPath:      "/path",
+			wantPath:      "/path?token=%3Credacted%3E",
 			wantRetryable: true,
 		},
 	}

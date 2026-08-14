@@ -23,6 +23,7 @@ import (
 	"github.com/google/uuid"
 	chatgptwebauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/chatgptweb"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/managementdiag"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor/helps"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	log "github.com/sirupsen/logrus"
@@ -34,6 +35,7 @@ const (
 	chatGPTWebAccountInfoExpiredRecoveryBackoff = 5 * time.Minute
 	chatGPTWebAccountInfoMaxRetryAfter          = 5 * time.Minute
 	chatGPTWebAccountInfoMaxBodyBytes           = 1 << 20
+	chatGPTWebAccountInfoDiagnosticBodyMaxBytes = 4 << 10
 	chatGPTWebAccountInfoMaxRedirects           = 5
 	chatGPTWebAmbiguousImageRecheckCooldown     = 5 * time.Minute
 	chatGPTWebAccountInfoPeriodicSchedulePrefix = "periodic:"
@@ -580,7 +582,17 @@ func (e *ChatGPTWebExecutor) chatGPTWebAccountInfoDiagnosticEvent(
 		}
 	}
 	chatGPTWebAccountInfoBodyDiagnosticEvent(payload, &event)
+	event.ResponseBody, event.ResponseBodyTruncated = managementdiag.ProcessResponseBody(
+		string(payload),
+		managementdiag.DetailLevelFull,
+		chatGPTWebAccountInfoDiagnosticBodyMaxBytes,
+	)
 	if err != nil {
+		event.ErrorMessage, _ = managementdiag.ProcessText(
+			err.Error(),
+			managementdiag.DetailLevelFull,
+			chatGPTWebAccountInfoDiagnosticBodyMaxBytes,
+		)
 		event.ErrorType = safeChatGPTWebAccountInfoDiagnosticErrorType(err)
 		errorCode, _ := classifyChatGPTWebAccountInfoError(err)
 		event.Reason = safeChatGPTWebAccountInfoDiagnosticReason(err)

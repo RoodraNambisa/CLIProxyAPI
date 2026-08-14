@@ -1187,11 +1187,16 @@ func (s *Server) updateClients(cfg *config.Config, rollbackOnError bool) error {
 	}
 
 	if oldCfg == nil || oldCfg.LoggingToFile != runtimeCfg.LoggingToFile ||
-		oldCfg.LogsMaxTotalSizeMB != runtimeCfg.LogsMaxTotalSizeMB ||
-		oldCfg.RemoteManagement.LiveLogs.Enabled != runtimeCfg.RemoteManagement.LiveLogs.Enabled {
+		oldCfg.LogsMaxTotalSizeMB != runtimeCfg.LogsMaxTotalSizeMB {
 		if errLogOutput := logging.ConfigureLogOutput(runtimeCfg); errLogOutput != nil {
 			return rollback(errLogOutput)
 		}
+	} else if oldCfg.RemoteManagement.LiveLogs.Enabled != runtimeCfg.RemoteManagement.LiveLogs.Enabled ||
+		oldCfg.RemoteManagement.Diagnostics.ResolvedDetailLevel() != runtimeCfg.RemoteManagement.Diagnostics.ResolvedDetailLevel() {
+		logging.ConfigureManagementDiagnostics(
+			runtimeCfg.RemoteManagement.LiveLogs.Enabled,
+			runtimeCfg.RemoteManagement.Diagnostics.ResolvedDetailLevel(),
+		)
 	}
 
 	if oldCfg == nil || oldCfg.UsageStatisticsEnabled != runtimeCfg.UsageStatisticsEnabled {

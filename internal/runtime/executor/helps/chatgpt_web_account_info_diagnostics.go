@@ -13,7 +13,7 @@ import (
 )
 
 // ChatGPTWebAccountInfoDiagnostics keeps a bounded, de-duplicated in-memory
-// view of safe account-info failures.
+// view of credential-filtered account-info failures.
 type ChatGPTWebAccountInfoDiagnostics struct {
 	mu           sync.Mutex
 	enabled      bool
@@ -50,7 +50,7 @@ func (diagnostics *ChatGPTWebAccountInfoDiagnostics) Enabled() bool {
 	return diagnostics.enabled
 }
 
-// Record merges one safe diagnostic event into the bounded store.
+// Record merges one credential-filtered diagnostic event into the bounded store.
 func (diagnostics *ChatGPTWebAccountInfoDiagnostics) Record(event chatgptwebauth.AccountInfoDiagnosticEvent) {
 	if diagnostics == nil {
 		return
@@ -181,6 +181,9 @@ func chatGPTWebNewAccountInfoDiagnostic(
 		ResponseBytes:            event.ResponseBytes,
 		ContentLength:            max(0, event.ContentLength),
 		UpstreamErrorCode:        event.UpstreamErrorCode,
+		ErrorMessage:             event.ErrorMessage,
+		ResponseBody:             event.ResponseBody,
+		ResponseBodyTruncated:    event.ResponseBodyTruncated,
 		Count:                    1,
 		FirstSeen:                now,
 		LastSeen:                 now,
@@ -209,6 +212,9 @@ func chatGPTWebMergeAccountInfoDiagnostic(
 		record.ContentLength = max(0, event.ContentLength)
 		record.LastAuthIndex = event.AuthIndex
 		record.LastAttempt = event.Attempt
+		record.ErrorMessage = event.ErrorMessage
+		record.ResponseBody = event.ResponseBody
+		record.ResponseBodyTruncated = event.ResponseBodyTruncated
 	}
 	chatGPTWebMergeAccountInfoDiagnosticRemaining(record, event.ImageQuotaRemaining, isLatest)
 }

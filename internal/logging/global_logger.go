@@ -183,7 +183,10 @@ func ConfigureLogOutput(cfg *config.Config) error {
 	}
 
 	configureLogDirCleanerLocked(logDir, cfg.LogsMaxTotalSizeMB, protectedPath)
-	ConfigureLiveLogs(cfg.RemoteManagement.LiveLogs.Enabled)
+	ConfigureManagementDiagnostics(
+		cfg.RemoteManagement.LiveLogs.Enabled,
+		cfg.RemoteManagement.Diagnostics.ResolvedDetailLevel(),
+	)
 	return nil
 }
 

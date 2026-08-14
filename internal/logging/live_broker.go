@@ -10,9 +10,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-	"unicode"
-	"unicode/utf8"
 
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/managementdiag"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -31,16 +30,7 @@ var (
 	ErrLiveLogsDisabled = errors.New("live logs disabled")
 	// ErrLiveLogConnectionLimit indicates that all subscriber slots are occupied.
 	ErrLiveLogConnectionLimit = errors.New("live log connection limit reached")
-
-	liveLogJWTPattern        = regexp.MustCompile(`(?i)\beyJ[a-z0-9_-]{8,}\.[a-z0-9_-]{8,}(?:\.[a-z0-9_-]{8,})?\b`)
-	liveLogAPIKeyPattern     = regexp.MustCompile(`(?i)\bsk-[a-z0-9_-]{8,}\b`)
-	liveLogBearerPattern     = regexp.MustCompile(`(?i)\bbearer\s+[^\s,;]+`)
-	liveLogCookieHeader      = regexp.MustCompile(`(?im)\b(set-cookie|cookie)\s*:\s*[^\r\n]*`)
-	liveLogEmailPattern      = regexp.MustCompile(`(?i)\b[a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,}\b`)
-	liveLogAssignmentPattern = regexp.MustCompile(`(?i)(["']?(authorization|access[_-]?token|refresh[_-]?token|session[_-]?token|cookie|password|secret|private[_-]?key|assertion|proxy[_-]?url)["']?)(\s*[=:]\s*|\s+)("[^"\r\n]*"|'[^'\r\n]*'|[^\s,;]+)`)
-	liveLogPrivateKeyPattern = regexp.MustCompile(`(?is)-----BEGIN [^-\r\n]*PRIVATE KEY-----.*?-----END [^-\r\n]*PRIVATE KEY-----`)
-	liveLogURLPattern        = regexp.MustCompile(`https?://[^\s<>"']+`)
-	liveLogHostPattern       = regexp.MustCompile(`(?i)^[a-z0-9](?:[a-z0-9.-]{0,253}[a-z0-9])?$`)
+	liveLogHostPattern        = regexp.MustCompile(`(?i)^[a-z0-9](?:[a-z0-9.-]{0,253}[a-z0-9])?$`)
 )
 
 // LiveLogEvent is a bounded representation of one log entry for authenticated management clients.
@@ -127,8 +117,10 @@ func (subscription *LiveLogSubscription) Close() {
 // LiveLogBroker stores recent safe log events and fans them out without blocking writers.
 type LiveLogBroker struct {
 	enabled atomic.Bool
+	full    atomic.Bool
 
 	mu             sync.Mutex
+	configuration  uint64
 	ring           [liveLogCapacity]LiveLogEvent
 	ringStart      int
 	ringCount      int
@@ -146,6 +138,11 @@ func ConfigureLiveLogs(enabled bool) {
 	globalLiveLogBroker.SetEnabled(enabled)
 }
 
+// ConfigureManagementDiagnostics atomically updates live-log collection and detail policy.
+func ConfigureManagementDiagnostics(enabled bool, detailLevel string) {
+	globalLiveLogBroker.SetConfiguration(enabled, detailLevel)
+}
+
 // GlobalLiveLogBroker returns the process-wide safe live log broker.
 func GlobalLiveLogBroker() *LiveLogBroker {
 	return globalLiveLogBroker
@@ -158,8 +155,40 @@ func (broker *LiveLogBroker) SetEnabled(enabled bool) {
 	}
 	broker.mu.Lock()
 	defer broker.mu.Unlock()
-	broker.enabled.Store(enabled)
+	if broker.enabled.Load() != enabled {
+		broker.configuration++
+		broker.enabled.Store(enabled)
+	}
 	if enabled {
+		return
+	}
+	for id, subscriber := range broker.subscribers {
+		close(subscriber.frames)
+		delete(broker.subscribers, id)
+	}
+}
+
+// SetConfiguration updates collection and detail policy. Downgrading to safe
+// clears retained full-detail entries and disconnects current subscribers.
+func (broker *LiveLogBroker) SetConfiguration(enabled bool, detailLevel string) {
+	if broker == nil {
+		return
+	}
+	broker.mu.Lock()
+	defer broker.mu.Unlock()
+	full := managementdiag.NormalizeDetailLevel(detailLevel) == managementdiag.DetailLevelFull
+	downgraded := broker.full.Load() && !full
+	if broker.enabled.Load() != enabled || broker.full.Load() != full {
+		broker.configuration++
+	}
+	broker.full.Store(full)
+	broker.enabled.Store(enabled)
+	if downgraded {
+		broker.ringStart = 0
+		broker.ringCount = 0
+		broker.ring = [liveLogCapacity]LiveLogEvent{}
+	}
+	if enabled && !downgraded {
 		return
 	}
 	for id, subscriber := range broker.subscribers {
@@ -183,7 +212,25 @@ func (broker *LiveLogBroker) Fire(entry *log.Entry) error {
 	if broker == nil || entry == nil || !broker.enabled.Load() {
 		return nil
 	}
-	broker.publish(safeLiveLogEvent(entry))
+	broker.mu.Lock()
+	if !broker.enabled.Load() {
+		broker.mu.Unlock()
+		return nil
+	}
+	detailLevel := managementdiag.DetailLevelSafe
+	if broker.full.Load() {
+		detailLevel = managementdiag.DetailLevelFull
+	}
+	configuration := broker.configuration
+	broker.mu.Unlock()
+
+	event := managementLiveLogEvent(entry, detailLevel)
+	broker.mu.Lock()
+	defer broker.mu.Unlock()
+	if !broker.enabled.Load() || broker.configuration != configuration {
+		return nil
+	}
+	broker.publishLocked(event)
 	return nil
 }
 
@@ -273,6 +320,10 @@ func (broker *LiveLogBroker) publish(event LiveLogEvent) {
 	if !broker.enabled.Load() {
 		return
 	}
+	broker.publishLocked(event)
+}
+
+func (broker *LiveLogBroker) publishLocked(event LiveLogEvent) {
 	broker.nextCursor++
 	event.Cursor = broker.nextCursor
 	broker.appendLocked(event)
@@ -396,31 +447,31 @@ func (filter LiveLogFilter) matches(event LiveLogEvent) bool {
 	return !filter.HideManagement || !strings.Contains(event.Path, "/management")
 }
 
-func safeLiveLogEvent(entry *log.Entry) LiveLogEvent {
+func managementLiveLogEvent(entry *log.Entry, detailLevel string) LiveLogEvent {
 	event := LiveLogEvent{
 		Timestamp: entry.Time.UTC().Format(time.RFC3339Nano),
 		Level:     entry.Level.String(),
-		Message:   sanitizeLiveLogValue(entry.Message, liveLogMaxMessageBytes),
+		Message:   sanitizeLiveLogValue(entry.Message, detailLevel, liveLogMaxMessageBytes),
 	}
-	event.RequestID = safeLiveLogField(entry.Data, liveLogMaxFieldValueBytes, "request_id")
-	event.Provider = safeLiveLogField(entry.Data, liveLogMaxFieldValueBytes, "provider")
-	event.AuthIndex = safeLiveLogField(entry.Data, liveLogMaxFieldValueBytes, "auth_index", "authIndex")
-	event.Stage = safeLiveLogField(entry.Data, liveLogMaxFieldValueBytes, "stage", "failure_stage")
-	event.Code = safeLiveLogField(entry.Data, liveLogMaxFieldValueBytes, "code", "error_code")
+	event.RequestID = safeLiveLogField(entry.Data, detailLevel, liveLogMaxFieldValueBytes, "request_id")
+	event.Provider = safeLiveLogField(entry.Data, detailLevel, liveLogMaxFieldValueBytes, "provider")
+	event.AuthIndex = safeLiveLogField(entry.Data, detailLevel, liveLogMaxFieldValueBytes, "auth_index", "authIndex")
+	event.Stage = safeLiveLogField(entry.Data, detailLevel, liveLogMaxFieldValueBytes, "stage", "failure_stage")
+	event.Code = safeLiveLogField(entry.Data, detailLevel, liveLogMaxFieldValueBytes, "code", "error_code")
 	event.Status = safeLiveLogStatus(entry.Data)
-	event.Method = strings.ToUpper(safeLiveLogField(entry.Data, 16, "method"))
-	event.Path = sanitizeLiveLogPath(safeLiveLogField(entry.Data, liveLogMaxFieldValueBytes, "path"))
-	event.Persona = safeLiveLogField(entry.Data, 64, "persona")
-	event.UAMajor = safeLiveLogField(entry.Data, 16, "ua_major")
-	event.Platform = safeLiveLogField(entry.Data, 64, "platform")
-	event.TargetHost = sanitizeLiveLogHost(safeLiveLogField(entry.Data, 255, "target_host"))
-	event.TargetPath = sanitizeLiveLogPath(safeLiveLogField(entry.Data, liveLogMaxFieldValueBytes, "target_path"))
-	event.ResponseType = safeLiveLogField(entry.Data, 32, "response_type")
-	event.ContentType = safeLiveLogField(entry.Data, 128, "content_type")
-	event.CFRay = safeLiveLogField(entry.Data, 128, "cf_ray")
+	event.Method = strings.ToUpper(safeLiveLogField(entry.Data, detailLevel, 16, "method"))
+	event.Path = sanitizeLiveLogPath(safeLiveLogField(entry.Data, detailLevel, liveLogMaxFieldValueBytes, "path"), detailLevel)
+	event.Persona = safeLiveLogField(entry.Data, detailLevel, 64, "persona")
+	event.UAMajor = safeLiveLogField(entry.Data, detailLevel, 16, "ua_major")
+	event.Platform = safeLiveLogField(entry.Data, detailLevel, 64, "platform")
+	event.TargetHost = sanitizeLiveLogHost(safeLiveLogField(entry.Data, detailLevel, 255, "target_host"))
+	event.TargetPath = sanitizeLiveLogPath(safeLiveLogField(entry.Data, detailLevel, liveLogMaxFieldValueBytes, "target_path"), detailLevel)
+	event.ResponseType = safeLiveLogField(entry.Data, detailLevel, 32, "response_type")
+	event.ContentType = safeLiveLogField(entry.Data, detailLevel, 128, "content_type")
+	event.CFRay = safeLiveLogField(entry.Data, detailLevel, 128, "cf_ray")
 	event.ResponseBytes = safeLiveLogInt64(entry.Data, "response_bytes")
 	if event.Status >= 400 || event.Code != "" {
-		event.ResponseBody, event.ResponseBodyTruncated = boundedLiveLogResponseBody(entry.Data)
+		event.ResponseBody, event.ResponseBodyTruncated = boundedLiveLogResponseBody(entry.Data, detailLevel)
 	}
 	event.Attempts = safeLiveLogInt(entry.Data, 100, "attempts", "flow_attempt", "request_attempt")
 	if value, ok := safeLiveLogBool(entry.Data, "cloudflare"); ok {
@@ -432,7 +483,7 @@ func safeLiveLogEvent(entry *log.Entry) LiveLogEvent {
 	return event
 }
 
-func boundedLiveLogResponseBody(data log.Fields) (string, bool) {
+func boundedLiveLogResponseBody(data log.Fields, detailLevel string) (string, bool) {
 	value, exists := data["response_body"]
 	if !exists || value == nil {
 		return "", false
@@ -443,19 +494,14 @@ func boundedLiveLogResponseBody(data log.Fields) (string, bool) {
 		raw = typed
 	case []byte:
 		raw = string(typed)
+	case managementdiag.ManagementOnlyValue:
+		raw = typed.Value()
 	default:
 		raw = fmt.Sprint(typed)
 	}
-	raw = strings.ToValidUTF8(raw, "\uFFFD")
-	truncated, _ := safeLiveLogBool(data, "response_body_truncated")
-	if len(raw) <= liveLogMaxResponseBodyBytes {
-		return raw, truncated
-	}
-	raw = raw[:liveLogMaxResponseBodyBytes]
-	for len(raw) > 0 && !utf8.ValidString(raw) {
-		raw = raw[:len(raw)-1]
-	}
-	return raw, true
+	processed, truncated := managementdiag.ProcessResponseBody(raw, detailLevel, liveLogMaxResponseBodyBytes)
+	alreadyTruncated, _ := safeLiveLogBool(data, "response_body_truncated")
+	return processed, truncated || alreadyTruncated
 }
 
 func safeLiveLogInt(data log.Fields, maximum int, names ...string) int {
@@ -484,13 +530,17 @@ func safeLiveLogInt64(data log.Fields, name string) int64 {
 	return parsed
 }
 
-func safeLiveLogField(data log.Fields, maxBytes int, names ...string) string {
+func safeLiveLogField(data log.Fields, detailLevel string, maxBytes int, names ...string) string {
 	for _, name := range names {
 		value, exists := data[name]
 		if !exists || value == nil {
 			continue
 		}
-		return sanitizeLiveLogValue(fmt.Sprint(value), maxBytes)
+		raw := fmt.Sprint(value)
+		if managementValue, ok := value.(managementdiag.ManagementOnlyValue); ok {
+			raw = managementValue.Value()
+		}
+		return sanitizeLiveLogValue(raw, detailLevel, maxBytes)
 	}
 	return ""
 }
@@ -525,51 +575,31 @@ func safeLiveLogBool(data log.Fields, name string) (bool, bool) {
 	}
 }
 
-func sanitizeLiveLogValue(value string, maxBytes int) string {
-	value = strings.Map(func(r rune) rune {
-		if r == '\n' || r == '\t' || !unicode.IsControl(r) {
-			return r
-		}
-		return -1
-	}, strings.TrimSpace(value))
-	value = liveLogURLPattern.ReplaceAllStringFunc(value, sanitizeLiveLogURL)
-	value = liveLogPrivateKeyPattern.ReplaceAllString(value, "<redacted-private-key>")
-	value = liveLogCookieHeader.ReplaceAllString(value, `${1}: <redacted>`)
-	value = liveLogBearerPattern.ReplaceAllString(value, "Bearer <redacted-token>")
-	value = liveLogAssignmentPattern.ReplaceAllString(value, `${1}${3}<redacted>`)
-	value = liveLogJWTPattern.ReplaceAllString(value, "<redacted-token>")
-	value = liveLogAPIKeyPattern.ReplaceAllString(value, "<redacted-key>")
-	value = liveLogEmailPattern.ReplaceAllString(value, "<redacted-email>")
-	if maxBytes > 0 && len(value) > maxBytes {
-		value = value[:maxBytes] + "…"
+func sanitizeLiveLogValue(value, detailLevel string, maxBytes int) string {
+	processed, truncated := managementdiag.ProcessText(value, detailLevel, maxBytes)
+	if truncated {
+		return processed + "…"
 	}
-	return value
+	return processed
 }
 
-func sanitizeLiveLogURL(raw string) string {
-	trimmed := strings.TrimRight(raw, ".,);]")
-	suffix := raw[len(trimmed):]
-	parsed, err := url.Parse(trimmed)
-	if err != nil || parsed.Host == "" {
-		return "<redacted-url>" + suffix
-	}
-	parsed.User = nil
-	parsed.RawQuery = ""
-	parsed.Fragment = ""
-	return parsed.String() + suffix
-}
-
-func sanitizeLiveLogPath(path string) string {
+func sanitizeLiveLogPath(path, detailLevel string) string {
 	if path == "" {
 		return ""
 	}
-	if parsed, err := url.Parse(path); err == nil {
-		path = parsed.Path
+	if parsed, errParse := url.Parse(path); errParse == nil && parsed.IsAbs() {
+		processed := managementdiag.ProcessURL(path, detailLevel)
+		if parsedProcessed, errProcessed := url.Parse(processed); errProcessed == nil {
+			path = parsedProcessed.EscapedPath()
+			if parsedProcessed.RawQuery != "" {
+				path += "?" + parsedProcessed.RawQuery
+			}
+		}
+	} else if strings.HasPrefix(path, "/") {
+		processed := managementdiag.ProcessURL("https://management.invalid"+path, detailLevel)
+		path = strings.TrimPrefix(processed, "https://management.invalid")
 	}
-	if index := strings.IndexByte(path, '?'); index >= 0 {
-		path = path[:index]
-	}
-	return sanitizeLiveLogValue(path, liveLogMaxFieldValueBytes)
+	return sanitizeLiveLogValue(path, detailLevel, liveLogMaxFieldValueBytes)
 }
 
 func sanitizeLiveLogHost(host string) string {

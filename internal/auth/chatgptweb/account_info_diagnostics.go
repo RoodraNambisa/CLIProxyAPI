@@ -4,7 +4,7 @@ import "time"
 
 const AccountInfoDiagnosticsCapacity = 100
 
-// AccountInfoDiagnosticEvent contains only the safe structure extracted from
+// AccountInfoDiagnosticEvent contains the credential-filtered structure extracted from
 // one failed account-info request. It is never persisted.
 type AccountInfoDiagnosticEvent struct {
 	OccurredAt               time.Time
@@ -27,11 +27,14 @@ type AccountInfoDiagnosticEvent struct {
 	ResponseBytes            int
 	ContentLength            int64
 	UpstreamErrorCode        string
+	ErrorMessage             string
+	ResponseBody             string
+	ResponseBodyTruncated    bool
 	AuthIndex                string
 	Attempt                  int
 }
 
-// AccountInfoDiagnosticRecord is one de-duplicated, management-safe error.
+// AccountInfoDiagnosticRecord is one de-duplicated, credential-filtered error.
 type AccountInfoDiagnosticRecord struct {
 	ID                       string    `json:"id"`
 	Phase                    string    `json:"phase"`
@@ -55,6 +58,9 @@ type AccountInfoDiagnosticRecord struct {
 	ResponseBytes            int       `json:"response_bytes"`
 	ContentLength            int64     `json:"content_length"`
 	UpstreamErrorCode        string    `json:"upstream_error_code,omitempty"`
+	ErrorMessage             string    `json:"error_message,omitempty"`
+	ResponseBody             string    `json:"response_body,omitempty"`
+	ResponseBodyTruncated    bool      `json:"response_body_truncated,omitempty"`
 	Count                    uint64    `json:"count"`
 	FirstSeen                time.Time `json:"first_seen"`
 	LastSeen                 time.Time `json:"last_seen"`

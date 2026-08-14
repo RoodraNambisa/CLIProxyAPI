@@ -3,12 +3,25 @@ package logging
 import (
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/managementdiag"
 	log "github.com/sirupsen/logrus"
 )
+
+type blockingLiveLogValue struct {
+	started chan<- struct{}
+	release <-chan struct{}
+}
+
+func (value blockingLiveLogValue) String() string {
+	value.started <- struct{}{}
+	<-value.release
+	return "person@example.com upstream detail"
+}
 
 func TestLiveLogBrokerFiltersAndPreservesBoundedResponseBody(t *testing.T) {
 	broker := newLiveLogBroker()
@@ -94,6 +107,122 @@ func TestLiveLogBrokerBoundsRawResponseBodyAndFiltersIt(t *testing.T) {
 	frame := <-subscription.Frames
 	if frame.Event == nil || !frame.Event.ResponseBodyTruncated || len(frame.Event.ResponseBody) > liveLogMaxResponseBodyBytes || !strings.HasPrefix(frame.Event.ResponseBody, "diagnostic-tail") {
 		t.Fatalf("bounded event = %#v", frame.Event)
+	}
+}
+
+func TestLiveLogBrokerFullDetailKeepsNonCredentialContent(t *testing.T) {
+	broker := newLiveLogBroker()
+	broker.SetConfiguration(true, "full")
+	subscription, errSubscribe := broker.Subscribe(LiveLogFilter{}, 0)
+	if errSubscribe != nil {
+		t.Fatalf("subscribe: %v", errSubscribe)
+	}
+	defer subscription.Close()
+
+	entry := log.NewEntry(log.StandardLogger())
+	entry.Level = log.ErrorLevel
+	entry.Message = "failed for person@example.com https://example.com/path?trace=abc&code=oauth-secret Bearer bearer-secret"
+	entry.Data = log.Fields{
+		"status": 403,
+		"path":   "/backend-api/test?trace=abc&code=oauth-secret",
+		"target_path": managementdiag.NewManagementOnlyValueWithFallback(
+			"/backend-api/test?trace=abc&code=oauth-secret",
+			"/backend-api/test",
+		),
+		"response_body": managementdiag.NewManagementOnlyValue(`<html>person@example.com upstream detail ` +
+			`https://example.com/error?trace=abc Cookie: session=secret</html>`),
+	}
+	if errFire := broker.Fire(entry); errFire != nil {
+		t.Fatalf("fire: %v", errFire)
+	}
+	frame := <-subscription.Frames
+	if frame.Event == nil {
+		t.Fatalf("frame = %#v", frame)
+	}
+	encoded, errMarshal := json.Marshal(frame.Event)
+	if errMarshal != nil {
+		t.Fatal(errMarshal)
+	}
+	text := string(encoded)
+	for _, want := range []string{"person@example.com", "trace=abc", "upstream detail"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("full event missing %q: %s", want, text)
+		}
+	}
+	for _, secret := range []string{"oauth-secret", "bearer-secret", "session=secret"} {
+		if strings.Contains(text, secret) {
+			t.Fatalf("full event leaked %q: %s", secret, text)
+		}
+	}
+}
+
+func TestLiveLogBrokerFullToSafeClearsRingAndDisconnectsStreams(t *testing.T) {
+	broker := newLiveLogBroker()
+	broker.SetConfiguration(true, "full")
+	subscription, errSubscribe := broker.Subscribe(LiveLogFilter{}, 0)
+	if errSubscribe != nil {
+		t.Fatal(errSubscribe)
+	}
+	broker.publish(LiveLogEvent{Level: "error", Message: "person@example.com"})
+	<-subscription.Frames
+
+	broker.SetConfiguration(true, "safe")
+	if _, open := <-subscription.Frames; open {
+		t.Fatal("full-detail subscription remained open after downgrade")
+	}
+	reconnected, errReconnect := broker.Subscribe(LiveLogFilter{}, 0)
+	if errReconnect != nil {
+		t.Fatal(errReconnect)
+	}
+	defer reconnected.Close()
+	select {
+	case frame := <-reconnected.Frames:
+		t.Fatalf("downgrade replayed retained full event: %#v", frame)
+	case <-time.After(25 * time.Millisecond):
+	}
+}
+
+func TestLiveLogBrokerDowngradeSerializesWithInFlightFullEvent(t *testing.T) {
+	broker := newLiveLogBroker()
+	broker.SetConfiguration(true, "full")
+	started := make(chan struct{}, 1)
+	release := make(chan struct{})
+	entry := log.NewEntry(log.StandardLogger())
+	entry.Level = log.ErrorLevel
+	entry.Data = log.Fields{
+		"status":        http.StatusBadGateway,
+		"response_body": blockingLiveLogValue{started: started, release: release},
+	}
+	fired := make(chan struct{})
+	go func() {
+		_ = broker.Fire(entry)
+		close(fired)
+	}()
+	<-started
+
+	downgraded := make(chan struct{})
+	go func() {
+		broker.SetConfiguration(true, "safe")
+		close(downgraded)
+	}()
+	select {
+	case <-downgraded:
+		// Configuration changes must not wait for diagnostic formatting.
+	case <-time.After(25 * time.Millisecond):
+		t.Fatal("detail downgrade blocked on an in-flight full event")
+	}
+	close(release)
+	<-fired
+
+	subscription, errSubscribe := broker.Subscribe(LiveLogFilter{}, 0)
+	if errSubscribe != nil {
+		t.Fatal(errSubscribe)
+	}
+	defer subscription.Close()
+	select {
+	case frame := <-subscription.Frames:
+		t.Fatalf("downgrade retained an in-flight full event: %#v", frame)
+	case <-time.After(25 * time.Millisecond):
 	}
 }
 

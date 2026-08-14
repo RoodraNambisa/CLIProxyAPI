@@ -220,6 +220,62 @@ func TestGetAndClearChatGPTWebAccountInfoRawQuotaResponses(t *testing.T) {
 	}
 }
 
+func TestGetChatGPTWebAccountInfoRawQuotaResponsesUsesManagementDetailPolicy(t *testing.T) {
+	executor := &accountInfoControllerTestExecutor{rawQuota: chatgptwebauth.AccountInfoRawQuotaResponsesSnapshot{
+		Enabled:  true,
+		Capacity: chatgptwebauth.AccountInfoRawQuotaResponseCapacity,
+		MaxBytes: chatgptwebauth.AccountInfoRawQuotaResponseMaxBytes,
+		Records: []chatgptwebauth.AccountInfoRawQuotaResponseRecord{{
+			AuthIndex: "auth-a",
+			Body:      `{"email":"person@example.com","message":"detail","access_token":"token-secret"}`,
+		}},
+	}}
+	cfg := &config.Config{}
+	cfg.RemoteManagement.Diagnostics.DetailLevel = config.ManagementDiagnosticsDetailFull
+	manager := coreauth.NewManager(nil, nil, nil)
+	manager.RegisterExecutor(executor)
+	handler := NewHandlerWithoutConfigFilePath(cfg, manager)
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	handler.GetChatGPTWebAccountInfoRawQuotaResponses(ctx)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if !strings.Contains(recorder.Body.String(), "person@example.com") || !strings.Contains(recorder.Body.String(), "detail") {
+		t.Fatalf("full raw quota response missing details: %s", recorder.Body.String())
+	}
+	if strings.Contains(recorder.Body.String(), "token-secret") {
+		t.Fatalf("full raw quota response leaked token: %s", recorder.Body.String())
+	}
+}
+
+func TestManagementAccountInfoDiagnosticsSnapshotAppliesDiagnosticDetail(t *testing.T) {
+	snapshot := chatgptwebauth.AccountInfoDiagnosticsSnapshot{Records: []chatgptwebauth.AccountInfoDiagnosticRecord{{
+		ErrorMessage: "person@example.com upstream detail Bearer token-secret",
+		ResponseBody: `{"email":"person@example.com","message":"upstream detail","access_token":"token-secret"}`,
+	}}}
+
+	handler := &Handler{}
+	safe := handler.managementAccountInfoDiagnosticsSnapshot(snapshot)
+	if strings.Contains(safe.Records[0].ErrorMessage, "person@example.com") || strings.Contains(safe.Records[0].ResponseBody, "person@example.com") {
+		t.Fatalf("safe diagnostics leaked email: %+v", safe.Records[0])
+	}
+
+	if errSet := handler.SetConfig(&config.Config{RemoteManagement: config.RemoteManagement{
+		Diagnostics: config.ManagementDiagnosticsConfig{DetailLevel: config.ManagementDiagnosticsDetailFull},
+	}}); errSet != nil {
+		t.Fatalf("set full diagnostics config: %v", errSet)
+	}
+	full := handler.managementAccountInfoDiagnosticsSnapshot(snapshot)
+	if !strings.Contains(full.Records[0].ErrorMessage, "person@example.com") || !strings.Contains(full.Records[0].ResponseBody, "upstream detail") {
+		t.Fatalf("full diagnostics lost detail: %+v", full.Records[0])
+	}
+	if strings.Contains(full.Records[0].ErrorMessage, "token-secret") || strings.Contains(full.Records[0].ResponseBody, "token-secret") {
+		t.Fatalf("full diagnostics leaked credential: %+v", full.Records[0])
+	}
+}
+
 func TestGetAndClearChatGPTWebAccountInfoDiagnostics(t *testing.T) {
 	executor := &accountInfoControllerTestExecutor{diagnostics: chatgptwebauth.AccountInfoDiagnosticsSnapshot{
 		Enabled:      true,

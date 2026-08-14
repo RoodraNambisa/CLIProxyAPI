@@ -27,7 +27,8 @@ const (
 )
 
 type safeRemoteManagementConfig struct {
-	LiveLogs config.LiveLogsConfig `json:"live-logs"`
+	LiveLogs    config.LiveLogsConfig              `json:"live-logs"`
+	Diagnostics config.ManagementDiagnosticsConfig `json:"diagnostics"`
 }
 
 type configResponse struct {
@@ -54,6 +55,9 @@ func (h *Handler) GetConfig(c *gin.Context) {
 		Config: &snapshot,
 		RemoteManagement: safeRemoteManagementConfig{
 			LiveLogs: cfg.RemoteManagement.LiveLogs,
+			Diagnostics: config.ManagementDiagnosticsConfig{
+				DetailLevel: cfg.RemoteManagement.Diagnostics.ResolvedDetailLevel(),
+			},
 		},
 	})
 }

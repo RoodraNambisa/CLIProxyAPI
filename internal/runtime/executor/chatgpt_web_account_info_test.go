@@ -115,8 +115,8 @@ func TestChatGPTWebAccountInfoDiagnosticsAreSafeAndDetailed(t *testing.T) {
 	t.Cleanup(func() { _ = executor.Close() })
 	payload := []byte(`{
 		"limits_progress":[{"feature_name":"image_gen","remaining":-1,"reset_after":"2026-08-03T13:23:29Z"}],
-		"error":{"code":"secret-token"},
-		"access_token":"secret-token",
+		"error":{"code":"upstream_detail"},
+		"access_token":"sk-abcdefghijk1234",
 		"email":"person@example.com",
 		"cookie":"secret-cookie"
 	}`)
@@ -151,10 +151,13 @@ func TestChatGPTWebAccountInfoDiagnosticsAreSafeAndDetailed(t *testing.T) {
 	if errMarshal != nil {
 		t.Fatalf("marshal diagnostic fields: %v", errMarshal)
 	}
-	for _, secret := range []string{"secret-token", "person@example.com", "secret-cookie"} {
+	for _, secret := range []string{"sk-abcdefghijk1234", "secret-cookie"} {
 		if bytes.Contains(encoded, []byte(secret)) {
 			t.Fatalf("diagnostics leaked %q: %s", secret, encoded)
 		}
+	}
+	if !bytes.Contains(encoded, []byte("person@example.com")) || !bytes.Contains(encoded, []byte("upstream_detail")) {
+		t.Fatalf("internal diagnostics lost full non-credential detail: %s", encoded)
 	}
 }
 

@@ -1261,6 +1261,8 @@ type RemoteManagement struct {
 	AuthFilesPagination AuthFilesPaginationConfig `yaml:"auth-files-pagination" json:"auth-files-pagination"`
 	// LiveLogs controls the in-memory management log stream.
 	LiveLogs LiveLogsConfig `yaml:"live-logs" json:"live-logs"`
+	// Diagnostics controls authenticated management-only diagnostic detail.
+	Diagnostics ManagementDiagnosticsConfig `yaml:"diagnostics" json:"diagnostics"`
 }
 
 // UnmarshalYAML preserves existing remote-management compatibility while rejecting
@@ -1286,12 +1288,71 @@ func (cfg *RemoteManagement) UnmarshalYAML(node *yaml.Node) error {
 	if value, present := effective["live-logs"]; present && value == nil {
 		return fmt.Errorf("remote-management.live-logs must be an object")
 	}
+	if value, present := effective["diagnostics"]; present && value == nil {
+		return fmt.Errorf("remote-management.diagnostics must be an object")
+	}
 	type plainRemoteManagement RemoteManagement
 	decoded := plainRemoteManagement(*cfg)
 	if err := node.Decode(&decoded); err != nil {
 		return fmt.Errorf("remote-management: %w", err)
 	}
 	*cfg = RemoteManagement(decoded)
+	return nil
+}
+
+const (
+	ManagementDiagnosticsDetailSafe = "safe"
+	ManagementDiagnosticsDetailFull = "full"
+)
+
+// ManagementDiagnosticsConfig controls management-only diagnostic content.
+type ManagementDiagnosticsConfig struct {
+	DetailLevel string `yaml:"detail-level" json:"detail-level"`
+}
+
+// ResolvedDetailLevel returns the effective detail level. The zero value is safe.
+func (cfg ManagementDiagnosticsConfig) ResolvedDetailLevel() string {
+	if strings.EqualFold(strings.TrimSpace(cfg.DetailLevel), ManagementDiagnosticsDetailFull) {
+		return ManagementDiagnosticsDetailFull
+	}
+	return ManagementDiagnosticsDetailSafe
+}
+
+// MarshalYAML keeps cloned and generated zero-value configurations valid.
+func (cfg ManagementDiagnosticsConfig) MarshalYAML() (any, error) {
+	return struct {
+		DetailLevel string `yaml:"detail-level"`
+	}{DetailLevel: cfg.ResolvedDetailLevel()}, nil
+}
+
+// UnmarshalYAML rejects null, scalar, unknown, and unsupported diagnostics settings.
+func (cfg *ManagementDiagnosticsConfig) UnmarshalYAML(node *yaml.Node) error {
+	if cfg == nil || node == nil || (node.Kind != yaml.MappingNode && node.Kind != yaml.AliasNode) {
+		return fmt.Errorf("remote-management.diagnostics must be an object")
+	}
+	var effective map[string]any
+	if err := node.Decode(&effective); err != nil {
+		return fmt.Errorf("remote-management.diagnostics: %w", err)
+	}
+	for name, value := range effective {
+		if name != "detail-level" {
+			return fmt.Errorf("remote-management.diagnostics.%s is not supported", name)
+		}
+		if value == nil {
+			return fmt.Errorf("remote-management.diagnostics.detail-level must not be null")
+		}
+	}
+	decoded := struct {
+		DetailLevel string `yaml:"detail-level"`
+	}{DetailLevel: ManagementDiagnosticsDetailSafe}
+	if err := node.Decode(&decoded); err != nil {
+		return fmt.Errorf("remote-management.diagnostics: %w", err)
+	}
+	decoded.DetailLevel = strings.ToLower(strings.TrimSpace(decoded.DetailLevel))
+	if decoded.DetailLevel != ManagementDiagnosticsDetailSafe && decoded.DetailLevel != ManagementDiagnosticsDetailFull {
+		return fmt.Errorf("remote-management.diagnostics.detail-level must be safe or full")
+	}
+	*cfg = ManagementDiagnosticsConfig{DetailLevel: decoded.DetailLevel}
 	return nil
 }
 

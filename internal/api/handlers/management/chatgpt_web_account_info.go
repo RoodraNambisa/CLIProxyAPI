@@ -12,6 +12,7 @@ import (
 	"github.com/gin-gonic/gin"
 	chatgptwebauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/chatgptweb"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/managementdiag"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 )
 
@@ -97,7 +98,25 @@ func (h *Handler) GetChatGPTWebAccountInfoDiagnostics(c *gin.Context) {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "chatgpt web account info diagnostics are unavailable"})
 		return
 	}
-	c.JSON(http.StatusOK, controller.AccountInfoDiagnosticsSnapshot())
+	c.JSON(http.StatusOK, h.managementAccountInfoDiagnosticsSnapshot(controller.AccountInfoDiagnosticsSnapshot()))
+}
+
+func (h *Handler) managementAccountInfoDiagnosticsSnapshot(snapshot chatgptwebauth.AccountInfoDiagnosticsSnapshot) chatgptwebauth.AccountInfoDiagnosticsSnapshot {
+	detailLevel := managementdiag.DetailLevelSafe
+	if h != nil {
+		if cfg := h.currentConfig(); cfg != nil {
+			detailLevel = cfg.RemoteManagement.Diagnostics.ResolvedDetailLevel()
+		}
+	}
+	snapshot.Records = append([]chatgptwebauth.AccountInfoDiagnosticRecord(nil), snapshot.Records...)
+	for index := range snapshot.Records {
+		record := &snapshot.Records[index]
+		record.ErrorMessage, _ = managementdiag.ProcessText(record.ErrorMessage, detailLevel, 4096)
+		body, truncated := managementdiag.ProcessResponseBody(record.ResponseBody, detailLevel, 4096)
+		record.ResponseBody = body
+		record.ResponseBodyTruncated = record.ResponseBodyTruncated || truncated
+	}
+	return snapshot
 }
 
 // ClearChatGPTWebAccountInfoDiagnostics removes all in-memory failures.
@@ -124,7 +143,26 @@ func (h *Handler) GetChatGPTWebAccountInfoRawQuotaResponses(c *gin.Context) {
 		c.JSON(http.StatusNotImplemented, gin.H{"error": "chatgpt web raw quota responses are unsupported"})
 		return
 	}
-	c.JSON(http.StatusOK, rawController.AccountInfoRawQuotaResponsesSnapshot())
+	c.JSON(http.StatusOK, h.managementRawQuotaSnapshot(rawController.AccountInfoRawQuotaResponsesSnapshot()))
+}
+
+func (h *Handler) managementRawQuotaSnapshot(snapshot chatgptwebauth.AccountInfoRawQuotaResponsesSnapshot) chatgptwebauth.AccountInfoRawQuotaResponsesSnapshot {
+	detailLevel := managementdiag.DetailLevelSafe
+	if h != nil {
+		if cfg := h.currentConfig(); cfg != nil {
+			detailLevel = cfg.RemoteManagement.Diagnostics.ResolvedDetailLevel()
+		}
+	}
+	snapshot.Records = append([]chatgptwebauth.AccountInfoRawQuotaResponseRecord(nil), snapshot.Records...)
+	for index := range snapshot.Records {
+		record := &snapshot.Records[index]
+		body, truncated := managementdiag.ProcessResponseBody(record.Body, detailLevel, chatgptwebauth.AccountInfoRawQuotaResponseMaxBytes)
+		record.Body = body
+		record.Truncated = record.Truncated || truncated
+		parseError, _ := managementdiag.ProcessText(record.ParseError, detailLevel, 1024)
+		record.ParseError = parseError
+	}
+	return snapshot
 }
 
 // ClearChatGPTWebAccountInfoRawQuotaResponses removes captured conversation/init bodies.

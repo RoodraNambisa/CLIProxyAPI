@@ -14,6 +14,7 @@ import (
 	"unicode/utf8"
 
 	chatgptwebauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/chatgptweb"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/managementdiag"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	"github.com/tidwall/gjson"
 )
@@ -108,20 +109,19 @@ func chatGPTWebDiagnosticResponseBody(body []byte, responseType string) (string,
 	if len(body) == 0 || responseType == "binary" {
 		return "", false
 	}
-	value := strings.ToValidUTF8(string(body), "\uFFFD")
-	if len(value) <= maxChatGPTWebDiagnosticResponseBodyBytes {
-		return value, false
-	}
-	value = value[:maxChatGPTWebDiagnosticResponseBodyBytes]
-	for len(value) > 0 && !utf8.ValidString(value) {
-		value = value[:len(value)-1]
-	}
-	return value, true
+	return managementdiag.ProcessResponseBody(
+		string(body),
+		managementdiag.DetailLevelFull,
+		maxChatGPTWebDiagnosticResponseBodyBytes,
+	)
 }
 
 // ChatGPTWebDiagnosticStage maps trusted upstream paths to a stable troubleshooting stage.
 func ChatGPTWebDiagnosticStage(path string) string {
 	path = strings.ToLower(safeChatGPTWebDiagnosticPath(path))
+	if queryIndex := strings.IndexByte(path, '?'); queryIndex >= 0 {
+		path = path[:queryIndex]
+	}
 	switch {
 	case strings.Contains(path, "/passkey/verify"):
 		return "passkey_verify"
@@ -265,14 +265,24 @@ func chatGPTWebDiagnosticTarget(raw string) (string, string) {
 		if !trustedChatGPTWebDiagnosticHost(host) {
 			host = "external_asset"
 		}
-		path := parsed.EscapedPath()
+		processed := managementdiag.ProcessURL(raw, managementdiag.DetailLevelFull)
+		processedURL, errProcessed := url.Parse(processed)
+		if errProcessed != nil {
+			processedURL = parsed
+			processedURL.RawQuery = ""
+		}
+		path := processedURL.EscapedPath()
 		if path == "" {
 			path = "/"
 		}
+		if processedURL.RawQuery != "" {
+			path += "?" + processedURL.RawQuery
+		}
 		return host, safeChatGPTWebDiagnosticValue(path)
 	}
-	if index := strings.IndexByte(raw, '?'); index >= 0 {
-		raw = raw[:index]
+	if strings.HasPrefix(raw, "/") {
+		processed := managementdiag.ProcessURL("https://management.invalid"+raw, managementdiag.DetailLevelFull)
+		raw = strings.TrimPrefix(processed, "https://management.invalid")
 	}
 	if raw == "" || raw[0] != '/' {
 		raw = "/"
@@ -299,14 +309,17 @@ func ChatGPTWebDiagnosticLogFields(diagnostic *cliproxyauth.ErrorDiagnostic) map
 		return nil
 	}
 	fields := map[string]any{
-		"provider":               diagnostic.Provider,
-		"auth_index":             diagnostic.AuthIndex,
-		"stage":                  diagnostic.Stage,
-		"code":                   diagnostic.Code,
-		"status":                 diagnostic.HTTPStatus,
-		"retryable":              diagnostic.Retryable,
-		"target_host":            diagnostic.TargetHost,
-		"target_path":            diagnostic.TargetPath,
+		"provider":    diagnostic.Provider,
+		"auth_index":  diagnostic.AuthIndex,
+		"stage":       diagnostic.Stage,
+		"code":        diagnostic.Code,
+		"status":      diagnostic.HTTPStatus,
+		"retryable":   diagnostic.Retryable,
+		"target_host": diagnostic.TargetHost,
+		"target_path": managementdiag.NewManagementOnlyValueWithFallback(
+			diagnostic.TargetPath,
+			strings.SplitN(diagnostic.TargetPath, "?", 2)[0],
+		),
 		"persona":                diagnostic.Persona,
 		"catalog_version":        diagnostic.CatalogVersion,
 		"catalog_id":             diagnostic.CatalogID,
@@ -322,7 +335,12 @@ func ChatGPTWebDiagnosticLogFields(diagnostic *cliproxyauth.ErrorDiagnostic) map
 		"cloudflare":             diagnostic.Cloudflare,
 	}
 	if diagnostic.ResponseBody != "" {
-		fields["response_body"] = diagnostic.ResponseBody
+		fileLogBody, _ := managementdiag.ProcessResponseBody(
+			diagnostic.ResponseBody,
+			managementdiag.DetailLevelFull,
+			maxChatGPTWebDiagnosticResponseBodyBytes,
+		)
+		fields["response_body"] = managementdiag.NewManagementOnlyValueWithFallback(diagnostic.ResponseBody, fileLogBody)
 		fields["response_body_truncated"] = diagnostic.ResponseBodyTruncated
 	}
 	if diagnostic.CFRay != "" {

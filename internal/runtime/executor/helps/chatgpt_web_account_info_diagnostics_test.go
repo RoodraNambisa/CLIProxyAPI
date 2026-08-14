@@ -27,6 +27,7 @@ func TestChatGPTWebAccountInfoDiagnosticsDeduplicatesNegativeRemaining(t *testin
 		BodyKind:  "json_object", LimitsProgressKind: "array", LimitsProgressCount: 4,
 		ImageQuotaRemainingKind: "number", ImageQuotaRemaining: &second,
 		ImageQuotaResetAfter: "2026-08-05T00:00:00Z", AuthIndex: "second", Attempt: 2,
+		ErrorMessage: "latest upstream error", ResponseBody: `{"error":"latest body"}`, ResponseBodyTruncated: true,
 	})
 
 	snapshot := diagnostics.Snapshot()
@@ -41,6 +42,9 @@ func TestChatGPTWebAccountInfoDiagnosticsDeduplicatesNegativeRemaining(t *testin
 		record.LastAuthIndex != "second" || record.LastAttempt != 2 ||
 		record.ImageQuotaResetAfter != "2026-08-05T00:00:00Z" {
 		t.Fatalf("record = %+v", record)
+	}
+	if record.ErrorMessage != "latest upstream error" || record.ResponseBody != `{"error":"latest body"}` || !record.ResponseBodyTruncated {
+		t.Fatalf("latest diagnostic content = %+v", record)
 	}
 }
 

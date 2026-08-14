@@ -14,6 +14,7 @@ import (
 	"github.com/gin-gonic/gin"
 	chatgptwebauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/chatgptweb"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/managementdiag"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/proxypool"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 )
@@ -261,6 +262,66 @@ func TestSafeChatGPTWebErrorDiagnosticKeepsOnlyAllowlistedStructure(t *testing.T
 		if strings.Contains(string(encoded), unsafe) {
 			t.Fatalf("safe diagnostic leaked %q: %s", unsafe, encoded)
 		}
+	}
+}
+
+func TestChatGPTWebManagementErrorDiagnosticFullKeepsDetailsButHidesSecrets(t *testing.T) {
+	source := &coreauth.ErrorDiagnostic{
+		Stage:      "conversation",
+		Code:       "upstream_non_json",
+		TargetHost: "chatgpt.com",
+		TargetPath: "/backend-api/conversation?trace=abc&code=oauth-secret",
+		ResponseBody: `<html>person@example.com upstream detail ` +
+			`https://example.com/error?trace=abc Cookie: session=secret</html>`,
+		HTTPStatus: http.StatusBadGateway,
+	}
+	full := chatGPTWebManagementErrorDiagnostic(source, "trusted-index", "full")
+	if full == nil {
+		t.Fatal("full diagnostic is nil")
+	}
+	encoded, errMarshal := json.Marshal(full)
+	if errMarshal != nil {
+		t.Fatal(errMarshal)
+	}
+	text := string(encoded)
+	for _, want := range []string{"person@example.com", "upstream detail", "trace=abc"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("full diagnostic missing %q: %s", want, text)
+		}
+	}
+	for _, secret := range []string{"oauth-secret", "session=secret"} {
+		if strings.Contains(text, secret) {
+			t.Fatalf("full diagnostic leaked %q: %s", secret, text)
+		}
+	}
+
+	safe := chatGPTWebManagementErrorDiagnostic(source, "trusted-index", "safe")
+	safeJSON, _ := json.Marshal(safe)
+	if strings.Contains(string(safeJSON), "person@example.com") || strings.Contains(string(safeJSON), "trace=abc") {
+		t.Fatalf("safe diagnostic retained full details: %s", safeJSON)
+	}
+}
+
+func TestApplyChatGPTWebAuthFileSummaryFullKeepsUpstreamMessageWithoutCredentials(t *testing.T) {
+	auth := &coreauth.Auth{
+		ID:       "chatgpt-web.json",
+		Provider: chatgptwebauth.Provider,
+		LastError: &coreauth.Error{
+			Code:    "upstream_error",
+			Message: "upstream rejected person@example.com Bearer token-secret",
+		},
+	}
+	entry := gin.H{}
+	applyChatGPTWebAuthFileSummaryWithDetail(entry, auth, time.Now(), managementdiag.DetailLevelFull)
+	lastError, ok := entry["last_error"].(*coreauth.Error)
+	if !ok {
+		t.Fatalf("last_error = %#v", entry["last_error"])
+	}
+	if !strings.Contains(lastError.Message, "person@example.com") || !strings.Contains(lastError.Message, "upstream rejected") {
+		t.Fatalf("full error message = %q", lastError.Message)
+	}
+	if strings.Contains(lastError.Message, "token-secret") {
+		t.Fatalf("full error message leaked token: %q", lastError.Message)
 	}
 }
 

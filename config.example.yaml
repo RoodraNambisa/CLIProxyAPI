@@ -48,6 +48,13 @@ remote-management:
   live-logs:
     enabled: false
 
+  # Controls authenticated management-only diagnostic detail. "full" keeps
+  # non-credential upstream text, email addresses, paths, and ordinary URL
+  # parameters. Tokens, cookies, passwords, private keys, assertions, recovery
+  # codes, authorization parameters, and signed URLs are always hidden.
+  diagnostics:
+    detail-level: safe
+
 # Authentication directory (supports ~ for home directory)
 auth-dir: "~/.cli-proxy-api"
 

@@ -6,6 +6,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	chatgptwebauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/chatgptweb"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/managementdiag"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/proxypool"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 )
@@ -96,6 +97,10 @@ func authFileRuntimeSummaryForAuth(auth *coreauth.Auth, graph *coreauth.ChatGPTW
 }
 
 func applyChatGPTWebAuthFileSummary(entry gin.H, auth *coreauth.Auth, now time.Time, runtimeSummaries ...authFileRuntimeSummary) {
+	applyChatGPTWebAuthFileSummaryWithDetail(entry, auth, now, managementdiag.DetailLevelSafe, runtimeSummaries...)
+}
+
+func applyChatGPTWebAuthFileSummaryWithDetail(entry gin.H, auth *coreauth.Auth, now time.Time, detailLevel string, runtimeSummaries ...authFileRuntimeSummary) {
 	if entry == nil || auth == nil || !strings.EqualFold(strings.TrimSpace(auth.Provider), "chatgpt-web") {
 		return
 	}
@@ -131,10 +136,16 @@ func applyChatGPTWebAuthFileSummary(entry gin.H, auth *coreauth.Auth, now time.T
 			category = reason
 		}
 	}
-	safeDiagnostic := safeChatGPTWebErrorDiagnostic(auth.LastError.Diagnostic, auth.EnsureIndex())
+	safeDiagnostic := chatGPTWebManagementErrorDiagnostic(auth.LastError.Diagnostic, auth.EnsureIndex(), detailLevel)
+	errorMessage := safeChatGPTWebErrorMessage(category)
+	if managementdiag.NormalizeDetailLevel(detailLevel) == managementdiag.DetailLevelFull {
+		if fullMessage, _ := managementdiag.ProcessText(auth.LastError.Message, detailLevel, 4096); strings.TrimSpace(fullMessage) != "" {
+			errorMessage = fullMessage
+		}
+	}
 	entry["last_error"] = &coreauth.Error{
 		Code:       category,
-		Message:    safeChatGPTWebErrorMessage(category),
+		Message:    errorMessage,
 		Retryable:  auth.LastError.Retryable,
 		HTTPStatus: auth.LastError.HTTPStatus,
 		Diagnostic: safeDiagnostic,
@@ -145,9 +156,15 @@ func applyChatGPTWebAuthFileSummary(entry gin.H, auth *coreauth.Auth, now time.T
 }
 
 func safeChatGPTWebErrorDiagnostic(diagnostic *coreauth.ErrorDiagnostic, authIndex string) *coreauth.ErrorDiagnostic {
+	return chatGPTWebManagementErrorDiagnostic(diagnostic, authIndex, managementdiag.DetailLevelSafe)
+}
+
+func chatGPTWebManagementErrorDiagnostic(diagnostic *coreauth.ErrorDiagnostic, authIndex, detailLevel string) *coreauth.ErrorDiagnostic {
 	if diagnostic == nil {
 		return nil
 	}
+	detailLevel = managementdiag.NormalizeDetailLevel(detailLevel)
+	responseBody, responseBodyTruncated := managementdiag.ProcessResponseBody(diagnostic.ResponseBody, detailLevel, 4096)
 	safe := &coreauth.ErrorDiagnostic{
 		Provider:              "chatgpt-web",
 		AuthIndex:             safeChatGPTWebDiagnosticToken(authIndex, 64),
@@ -165,8 +182,8 @@ func safeChatGPTWebErrorDiagnostic(diagnostic *coreauth.ErrorDiagnostic, authInd
 		UAMajor:               safeChatGPTWebDiagnosticToken(diagnostic.UAMajor, 16),
 		Platform:              safeChatGPTWebDiagnosticToken(diagnostic.Platform, 64),
 		ResponseBytes:         diagnostic.ResponseBytes,
-		ResponseBody:          diagnostic.ResponseBody,
-		ResponseBodyTruncated: diagnostic.ResponseBodyTruncated,
+		ResponseBody:          responseBody,
+		ResponseBodyTruncated: diagnostic.ResponseBodyTruncated || responseBodyTruncated,
 		Attempts:              diagnostic.Attempts,
 		HTTPStatus:            diagnostic.HTTPStatus,
 		Cloudflare:            diagnostic.Cloudflare,
@@ -179,9 +196,8 @@ func safeChatGPTWebErrorDiagnostic(diagnostic *coreauth.ErrorDiagnostic, authInd
 		safe.TargetHost = host
 	}
 	if path := strings.TrimSpace(diagnostic.TargetPath); strings.HasPrefix(path, "/") {
-		if index := strings.IndexByte(path, '?'); index >= 0 {
-			path = path[:index]
-		}
+		processed := managementdiag.ProcessURL("https://management.invalid"+path, detailLevel)
+		path = strings.TrimPrefix(processed, "https://management.invalid")
 		for _, character := range path {
 			if character < 0x20 || character == 0x7f {
 				path = ""

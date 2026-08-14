@@ -703,7 +703,11 @@ func (h *Handler) buildAuthFileEntryAtWithRuntime(auth *coreauth.Auth, now time.
 			entry["last_error_status_code"] = auth.LastError.HTTPStatus
 		}
 	}
-	applyChatGPTWebAuthFileSummary(entry, auth, now, runtimeSummary)
+	detailLevel := config.ManagementDiagnosticsDetailSafe
+	if cfg := h.currentConfig(); cfg != nil {
+		detailLevel = cfg.RemoteManagement.Diagnostics.ResolvedDetailLevel()
+	}
+	applyChatGPTWebAuthFileSummaryWithDetail(entry, auth, now, detailLevel, runtimeSummary)
 	if !auth.NextRetryAfter.IsZero() {
 		entry["next_retry_after"] = auth.NextRetryAfter
 	}
