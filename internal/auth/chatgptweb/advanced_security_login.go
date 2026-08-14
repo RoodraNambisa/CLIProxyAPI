@@ -36,7 +36,7 @@ func (service *Service) loginWithAdvancedSecurityPasskey(
 		return service.loginFailure(credential, input.Relogin, ensureAuthError(errEntry, pendingState))
 	}
 	if !isAdvancedSecurityAuthChallenge(entryPayload, entryURL) {
-		return service.loginFailure(credential, input.Relogin, advancedSecurityCredentialError("advanced_security_challenge_unavailable", "Advanced account security challenge is unavailable", nil))
+		return service.loginFailure(credential, input.Relogin, advancedSecurityChallengeUnavailableError("Advanced account security challenge is unavailable", nil))
 	}
 	if authError := service.issueAdvancedSecurityPasskeyChallenge(ctx, client, credential, pendingState); authError != nil {
 		return service.loginFailure(credential, input.Relogin, authError)
@@ -124,13 +124,12 @@ func (service *Service) fetchAdvancedSecurityPasskeyChallenge(ctx context.Contex
 	}
 	var decoded map[string]any
 	if errDecode := json.Unmarshal(payload, &decoded); errDecode != nil {
-		return nil, "", advancedSecurityCredentialError("advanced_security_challenge_unavailable", "Advanced account security session is invalid", errDecode)
+		return nil, "", advancedSecurityChallengeUnavailableError("Advanced account security session is invalid", errDecode)
 	}
 	session, _ := decoded["client_auth_session"].(map[string]any)
-	enabled, _ := session["aas_enabled"].(bool)
-	options, requestID, ok := extractPasskeyChallengeFromValue(session)
-	if !enabled || !ok {
-		return nil, "", advancedSecurityCredentialError("advanced_security_challenge_unavailable", "Advanced account security session did not contain Passkey options", nil)
+	options, requestID, ok := extractAdvancedSecurityPasskeyChallenge(session)
+	if !ok {
+		return nil, "", advancedSecurityChallengeUnavailableError("Advanced account security session did not contain an AAS Passkey challenge", nil)
 	}
 	return options, requestID, nil
 }
@@ -240,6 +239,18 @@ func extractPasskeyChallengeFromValue(value any) (map[string]any, string, bool) 
 	return extractPasskeyChallenge(payload)
 }
 
+func extractAdvancedSecurityPasskeyChallenge(session map[string]any) (map[string]any, string, bool) {
+	challengeData, ok := session["auth_challenge_data"].(map[string]any)
+	if !ok || normalizeCode(stringValue(challengeData["challenge_type"])) != "aas" {
+		return nil, "", false
+	}
+	challengeOption, ok := session["passkey_challenge_option"].(map[string]any)
+	if !ok {
+		return nil, "", false
+	}
+	return extractPasskeyChallengeFromValue(challengeOption)
+}
+
 func isAdvancedSecurityAuthChallenge(payload []byte, rawURL string) bool {
 	if code, _ := responseError(payload); normalizeCode(code) == "passkey_required" {
 		return true
@@ -261,6 +272,12 @@ func (service *Service) isAdvancedSecurityCallbackURL(rawURL string) bool {
 func advancedSecurityCredentialError(code, message string, cause error) *AuthError {
 	authError := newAuthError(code, LifecycleReauthRequired, http.StatusBadRequest, false, true, message, cause)
 	authError.FailureStage = "advanced_security_login"
+	return authError
+}
+
+func advancedSecurityChallengeUnavailableError(message string, cause error) *AuthError {
+	authError := advancedSecurityCredentialError("advanced_security_challenge_unavailable", message, cause)
+	authError.FailureStage = "advanced_security_challenge"
 	return authError
 }
 

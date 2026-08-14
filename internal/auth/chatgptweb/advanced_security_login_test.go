@@ -13,6 +13,8 @@ import (
 	"time"
 )
 
+const advancedSecurityTestRequestID = "0123456789abcdef0123456789abcdef"
+
 type advancedSecurityLoginFixture struct {
 	t                  *testing.T
 	server             *httptest.Server
@@ -31,6 +33,7 @@ type advancedSecurityLoginFixture struct {
 	finalizeStatus     int
 	entryURLOnly       bool
 	passkeyRequired    bool
+	sessionChallenge   string
 	sessionEmail       string
 	sessionUserID      string
 	mu                 sync.Mutex
@@ -39,13 +42,14 @@ type advancedSecurityLoginFixture struct {
 func newAdvancedSecurityLoginFixture(t *testing.T, allowedID string, finalize bool) *advancedSecurityLoginFixture {
 	t.Helper()
 	fixture := &advancedSecurityLoginFixture{
-		t:              t,
-		allowedID:      allowedID,
-		finalize:       finalize,
-		verifyStatus:   http.StatusOK,
-		finalizeStatus: http.StatusOK,
-		sessionEmail:   "person@example.com",
-		sessionUserID:  "user-1",
+		t:                t,
+		allowedID:        allowedID,
+		finalize:         finalize,
+		verifyStatus:     http.StatusOK,
+		finalizeStatus:   http.StatusOK,
+		sessionChallenge: "aas",
+		sessionEmail:     "person@example.com",
+		sessionUserID:    "user-1",
 	}
 	fixture.server = httptest.NewServer(http.HandlerFunc(fixture.serveHTTP))
 	t.Cleanup(fixture.server.Close)
@@ -70,7 +74,7 @@ func (fixture *advancedSecurityLoginFixture) serveHTTP(response http.ResponseWri
 			_, _ = io.WriteString(response, `{"error":{"code":"passkey_required"}}`)
 			return
 		}
-		_, _ = io.WriteString(response, `{"page":{"type":"advanced_account_security"},"continue_url":"/auth-challenge"}`)
+		_, _ = io.WriteString(response, `{"page":{"type":"auth_challenge","payload":{"challenge_type":"aas"}},"continue_url":"/auth_challenge/passkey"}`)
 	case "/auth-challenge":
 		_, _ = io.WriteString(response, `{"page":{"type":"sign_in"}}`)
 	case advancedSecurityChallengeIssuePath:
@@ -82,13 +86,13 @@ func (fixture *advancedSecurityLoginFixture) serveHTTP(response http.ResponseWri
 		if body["method_id"] != "passkey" {
 			fixture.t.Errorf("issue body = %#v", body)
 		}
-		_, _ = io.WriteString(response, `{}`)
+		_, _ = io.WriteString(response, `{"passkey_method_challenge_data":{}}`)
 	case advancedSecuritySessionDumpPath:
 		fixture.mu.Lock()
 		fixture.dumpCalls++
 		fixture.mu.Unlock()
 		challenge := base64.RawURLEncoding.EncodeToString([]byte("advanced-security-challenge"))
-		_, _ = fmt.Fprintf(response, `{"client_auth_session":{"aas_enabled":true,"mfa_request_id":"aas-request-1","passkey_request_options":{"challenge":%q,"rpId":"openai.com","allowCredentials":[{"type":"public-key","id":%q}]}}}`, challenge, fixture.allowedID)
+		_, _ = fmt.Fprintf(response, `{"client_auth_session":{"auth_challenge_data":{"challenge_type":%q},"passkey_challenge_option":{"mfa_request_id":%q,"passkey_request_options":{"challenge":%q,"rpId":"openai.com","allowCredentials":[{"type":"public-key","id":%q}]}}}}`, fixture.sessionChallenge, advancedSecurityTestRequestID, challenge, fixture.allowedID)
 	case advancedSecurityChallengeVerifyPath:
 		fixture.mu.Lock()
 		fixture.verifyCalls++
@@ -110,7 +114,7 @@ func (fixture *advancedSecurityLoginFixture) serveHTTP(response http.ResponseWri
 			fixture.t.Errorf("decode verify body: %v", errDecode)
 		}
 		fixture.verifiedKeyID = body.Response.Assertion.ID
-		if body.MethodID != "passkey" || body.Response.RequestID != "aas-request-1" {
+		if body.MethodID != "passkey" || body.Response.RequestID != advancedSecurityTestRequestID {
 			fixture.t.Errorf("verify body = %#v", body)
 		}
 		if fixture.dropVerifyResponse {
@@ -458,6 +462,59 @@ func TestServiceAdvancedSecurityLoginRecognizesPasskeyRequiredChallenge(t *testi
 	}
 	if credential.AdvancedAccountSecurity.Passkeys[1].Credential.SignCount != otherInitialCount {
 		t.Fatalf("unselected sign_count = %d, want %d", credential.AdvancedAccountSecurity.Passkeys[1].Credential.SignCount, otherInitialCount)
+	}
+}
+
+func TestServiceAdvancedSecurityLoginRejectsNonAASPasskeySession(t *testing.T) {
+	fixedNow := time.Date(2026, time.August, 5, 12, 0, 0, 0, time.UTC)
+	aas := testAdvancedAccountSecurityCredential(t)
+	initialCounts := []uint32{
+		aas.Passkeys[0].Credential.SignCount,
+		aas.Passkeys[1].Credential.SignCount,
+	}
+	fixture := newAdvancedSecurityLoginFixture(t, aas.Passkeys[0].Credential.CredentialID, false)
+	fixture.sessionChallenge = "mfa"
+	service := NewService(fixture.options(fixedNow))
+	persistCalls := 0
+
+	credential, errLogin := service.Login(t.Context(), LoginInput{
+		Credential: &Credential{
+			CredentialSchemaVersion: CredentialSchemaVersionAdvancedAccountSecurity,
+			Type:                    Provider,
+			Email:                   "person@example.com",
+			AccountID:               "account-1",
+			UserID:                  "user-1",
+			Password:                "must-not-be-used",
+			WebAuthn:                testWebAuthnCredential(t),
+			API798URL:               "https://api798.com/get_code?email=person%40example.com&auth_code=opaque",
+			AdvancedAccountSecurity: aas,
+		},
+		Relogin: true,
+		PersistAdvancedAccountSecurity: func(_ context.Context, updated AdvancedAccountSecurityCredential) (AdvancedAccountSecurityCredential, error) {
+			persistCalls++
+			return updated, nil
+		},
+	})
+	if errLogin == nil {
+		t.Fatal("Login() error = nil")
+	}
+	authError, ok := AsAuthError(errLogin)
+	if !ok || authError.Code != "advanced_security_challenge_unavailable" || authError.FailureStage != "advanced_security_challenge" {
+		t.Fatalf("Login() error = %#v", errLogin)
+	}
+	fixture.mu.Lock()
+	issueCalls, dumpCalls, verifyCalls, ordinaryCalls := fixture.issueCalls, fixture.dumpCalls, fixture.verifyCalls, fixture.ordinaryCalls
+	fixture.mu.Unlock()
+	if issueCalls != 1 || dumpCalls != 1 || verifyCalls != 0 || ordinaryCalls != 0 {
+		t.Fatalf("calls issue=%d dump=%d verify=%d ordinary=%d", issueCalls, dumpCalls, verifyCalls, ordinaryCalls)
+	}
+	if persistCalls != 0 {
+		t.Fatalf("persist calls = %d", persistCalls)
+	}
+	for index, initialCount := range initialCounts {
+		if credential.AdvancedAccountSecurity.Passkeys[index].Credential.SignCount != initialCount {
+			t.Fatalf("passkey %d sign_count = %d, want %d", index, credential.AdvancedAccountSecurity.Passkeys[index].Credential.SignCount, initialCount)
+		}
 	}
 }
 
