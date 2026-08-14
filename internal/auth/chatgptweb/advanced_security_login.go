@@ -241,6 +241,9 @@ func extractPasskeyChallengeFromValue(value any) (map[string]any, string, bool) 
 }
 
 func isAdvancedSecurityAuthChallenge(payload []byte, rawURL string) bool {
+	if code, _ := responseError(payload); normalizeCode(code) == "passkey_required" {
+		return true
+	}
 	combined := strings.ToLower(string(payload) + " " + rawURL)
 	return strings.Contains(combined, "advanced_account_security") || strings.Contains(combined, "auth_challenge") || strings.Contains(combined, "auth-challenge")
 }

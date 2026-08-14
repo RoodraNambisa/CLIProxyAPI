@@ -30,6 +30,7 @@ type advancedSecurityLoginFixture struct {
 	dropVerifyResponse bool
 	finalizeStatus     int
 	entryURLOnly       bool
+	passkeyRequired    bool
 	sessionEmail       string
 	sessionUserID      string
 	mu                 sync.Mutex
@@ -65,6 +66,10 @@ func (fixture *advancedSecurityLoginFixture) serveHTTP(response http.ResponseWri
 		_, _ = fmt.Fprintf(response, `{"url":%q}`, fixture.server.URL+entryPath)
 	case "/oauth/authorize":
 		response.WriteHeader(http.StatusBadRequest)
+		if fixture.passkeyRequired {
+			_, _ = io.WriteString(response, `{"error":{"code":"passkey_required"}}`)
+			return
+		}
 		_, _ = io.WriteString(response, `{"page":{"type":"advanced_account_security"},"continue_url":"/auth-challenge"}`)
 	case "/auth-challenge":
 		_, _ = io.WriteString(response, `{"page":{"type":"sign_in"}}`)
@@ -409,5 +414,70 @@ func TestServiceAdvancedSecurityLoginRecognizesFinalURLOnlyChallenge(t *testing.
 	}
 	if credential.AdvancedAccountSecurity.Passkeys[0].Credential.SignCount != initialCount+1 {
 		t.Fatalf("sign_count = %d, want %d", credential.AdvancedAccountSecurity.Passkeys[0].Credential.SignCount, initialCount+1)
+	}
+}
+
+func TestServiceAdvancedSecurityLoginRecognizesPasskeyRequiredChallenge(t *testing.T) {
+	fixedNow := time.Date(2026, time.August, 5, 12, 0, 0, 0, time.UTC)
+	aas := testAdvancedAccountSecurityCredential(t)
+	allowed := aas.Passkeys[0].Credential.CredentialID
+	initialCount := aas.Passkeys[0].Credential.SignCount
+	otherInitialCount := aas.Passkeys[1].Credential.SignCount
+	fixture := newAdvancedSecurityLoginFixture(t, allowed, false)
+	fixture.passkeyRequired = true
+	service := NewService(fixture.options(fixedNow))
+
+	credential, errLogin := service.Login(t.Context(), LoginInput{
+		Credential: &Credential{
+			CredentialSchemaVersion: CredentialSchemaVersionAdvancedAccountSecurity,
+			Type:                    Provider,
+			Email:                   "person@example.com",
+			AccountID:               "account-1",
+			UserID:                  "user-1",
+			AdvancedAccountSecurity: aas,
+		},
+		Relogin: true,
+		PersistAdvancedAccountSecurity: func(_ context.Context, updated AdvancedAccountSecurityCredential) (AdvancedAccountSecurityCredential, error) {
+			fixture.mu.Lock()
+			fixture.persisted = true
+			fixture.mu.Unlock()
+			return *CloneAdvancedAccountSecurityCredential(&updated), nil
+		},
+	})
+	if errLogin != nil {
+		t.Fatalf("Login() error = %v", errLogin)
+	}
+	fixture.mu.Lock()
+	issueCalls, dumpCalls, verifyCalls, ordinaryCalls := fixture.issueCalls, fixture.dumpCalls, fixture.verifyCalls, fixture.ordinaryCalls
+	fixture.mu.Unlock()
+	if issueCalls != 1 || dumpCalls != 1 || verifyCalls != 1 || ordinaryCalls != 0 {
+		t.Fatalf("calls issue=%d dump=%d verify=%d ordinary=%d", issueCalls, dumpCalls, verifyCalls, ordinaryCalls)
+	}
+	if credential.AdvancedAccountSecurity.Passkeys[0].Credential.SignCount != initialCount+1 {
+		t.Fatalf("sign_count = %d, want %d", credential.AdvancedAccountSecurity.Passkeys[0].Credential.SignCount, initialCount+1)
+	}
+	if credential.AdvancedAccountSecurity.Passkeys[1].Credential.SignCount != otherInitialCount {
+		t.Fatalf("unselected sign_count = %d, want %d", credential.AdvancedAccountSecurity.Passkeys[1].Credential.SignCount, otherInitialCount)
+	}
+}
+
+func TestIsAdvancedSecurityAuthChallengeRecognizesStructuredPasskeyRequired(t *testing.T) {
+	payload := []byte(`{"error":{"code":"passkey_required"}}`)
+	for _, testCase := range []struct {
+		name   string
+		url    string
+		value  []byte
+		wanted bool
+	}{
+		{name: "missing response URL", value: payload, wanted: true},
+		{name: "original authorize URL", url: "https://auth.openai.com/oauth/authorize?client_id=app", value: payload, wanted: true},
+		{name: "message only", value: []byte(`{"message":"passkey_required"}`)},
+		{name: "different structured code", value: []byte(`{"error":{"code":"ordinary_passkey_required"}}`)},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			if got := isAdvancedSecurityAuthChallenge(testCase.value, testCase.url); got != testCase.wanted {
+				t.Fatalf("isAdvancedSecurityAuthChallenge() = %t, want %t", got, testCase.wanted)
+			}
+		})
 	}
 }
