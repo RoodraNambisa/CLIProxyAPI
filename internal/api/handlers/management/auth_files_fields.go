@@ -398,10 +398,10 @@ func (h *Handler) updateAuthFileFields(ctx context.Context, auth *coreauth.Auth,
 		currentMatch bool
 		errUpdate    error
 	)
-	if strings.TrimSpace(auth.Attributes[coreauth.SourceHashAttributeKey]) != "" && h.authManager.SupportsSourceConditionalSave() {
-		updated, currentMatch, errUpdate = h.authManager.UpdateIfCurrentSourceHash(lockedCtx, auth, updatedCandidate)
+	if strings.TrimSpace(current.Attributes[coreauth.SourceHashAttributeKey]) != "" && h.authManager.SupportsSourceConditionalSave() {
+		updated, currentMatch, errUpdate = h.authManager.UpdateIfCurrentSourceHash(lockedCtx, current, updatedCandidate)
 	} else {
-		updated, currentMatch, errUpdate = h.authManager.UpdateIfCurrent(lockedCtx, auth, updatedCandidate)
+		updated, currentMatch, errUpdate = h.authManager.UpdateIfCurrent(lockedCtx, current, updatedCandidate)
 	}
 	unlockAuth()
 	unlockDependency()

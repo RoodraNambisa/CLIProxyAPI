@@ -274,6 +274,50 @@ func TestPatchAuthFileFieldsFallsBackForStoreWithoutConditionalSave(t *testing.T
 	}
 }
 
+func TestUpdateAuthFileFieldsUsesCurrentGenerationAfterLock(t *testing.T) {
+	authDir := t.TempDir()
+	store := sdkAuth.NewFileTokenStore()
+	store.SetBaseDir(authDir)
+	manager := coreauth.NewManager(store, nil, nil)
+	record := &coreauth.Auth{
+		ID:       "current-generation.json",
+		FileName: "current-generation.json",
+		Provider: "codex",
+		Metadata: map[string]any{
+			"type":          "codex",
+			"access_token":  "initial-token",
+			"session_state": "initial-session",
+		},
+	}
+	stale, errRegister := manager.Register(t.Context(), record)
+	if errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+
+	advanced := stale.Clone()
+	advanced.Metadata["access_token"] = "rotated-token"
+	advanced.Metadata["session_state"] = "latest-session"
+	if installed, current, errUpdate := manager.UpdateIfCurrentSourceHash(t.Context(), stale, advanced); errUpdate != nil || !current || installed == nil {
+		t.Fatalf("advance auth = (%#v, %v, %v), want installed current generation", installed, current, errUpdate)
+	}
+
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, manager)
+	note := "management-note"
+	updated, status, message := h.updateAuthFileFields(t.Context(), stale, authFileFieldValues{note: &note})
+	if status != http.StatusOK || updated == nil {
+		t.Fatalf("update fields = (%#v, %d, %q), want success", updated, status, message)
+	}
+	if got := updated.Metadata["access_token"]; got != "rotated-token" {
+		t.Fatalf("access_token = %#v, want rotated token preserved", got)
+	}
+	if got := updated.Metadata["session_state"]; got != "latest-session" {
+		t.Fatalf("session_state = %#v, want latest session preserved", got)
+	}
+	if got := updated.Metadata["note"]; got != note {
+		t.Fatalf("note = %#v, want %q", got, note)
+	}
+}
+
 func TestPatchAuthFileFields_XAIBooleanFields(t *testing.T) {
 	store := &memoryAuthStore{}
 	manager := coreauth.NewManager(store, nil, nil)
