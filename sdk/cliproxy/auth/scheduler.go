@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	chatgptwebauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/chatgptweb"
 	internalconfig "github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
@@ -56,6 +57,31 @@ type authScheduler struct {
 	requestLimiter            *authRequestWindowLimiter
 	mixedCursorMu             sync.Mutex
 	mixedCursors              map[string]int
+}
+
+// RoutingDiagnosticsSnapshot summarizes credential availability for one provider/model shard.
+type RoutingDiagnosticsSnapshot struct {
+	Provider   string                       `json:"provider"`
+	Model      string                       `json:"model"`
+	Priorities []RoutingPriorityDiagnostics `json:"priorities"`
+}
+
+// RoutingPriorityDiagnostics summarizes one priority tier without exposing credential material.
+type RoutingPriorityDiagnostics struct {
+	Priority                    int        `json:"priority"`
+	Total                       int        `json:"total"`
+	QuotaExhausted              int        `json:"quota_exhausted"`
+	Cooldown                    int        `json:"cooldown"`
+	Unavailable                 int        `json:"unavailable"`
+	ReadyBeforeRequestLimit     int        `json:"ready_before_request_limit"`
+	RequestLimited              int        `json:"request_limited"`
+	EligibleNow                 int        `json:"eligible_now"`
+	EarliestRequestLimitResetAt *time.Time `json:"earliest_request_limit_reset_at"`
+}
+
+type routingPriorityDiagnosticsAccumulator struct {
+	diagnostics                 RoutingPriorityDiagnostics
+	earliestRequestLimitResetAt time.Time
 }
 
 // providerScheduler stores auth metadata and model shards for a single provider.
@@ -390,6 +416,122 @@ func (s *authScheduler) requestLimitPolicyForAuth(auth *Auth) authRequestLimitPo
 	policy := s.requestLimitPolicyForAuthLocked(auth)
 	s.mu.RUnlock()
 	return policy
+}
+
+// RoutingDiagnostics returns a read-only availability snapshot for one provider/model shard.
+func (s *authScheduler) RoutingDiagnostics(provider, model string, now time.Time) RoutingDiagnosticsSnapshot {
+	providerKey := strings.ToLower(strings.TrimSpace(provider))
+	modelKey := canonicalModelKey(model)
+	snapshot := RoutingDiagnosticsSnapshot{
+		Provider:   providerKey,
+		Model:      modelKey,
+		Priorities: make([]RoutingPriorityDiagnostics, 0),
+	}
+	if s == nil || providerKey == "" {
+		return snapshot
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	providerState := s.providers[providerKey]
+	if providerState == nil {
+		return snapshot
+	}
+	providerState.mu.Lock()
+	defer providerState.mu.Unlock()
+	shard := providerState.modelShards[modelKey]
+	entries := make([]*scheduledAuth, 0)
+	if shard != nil {
+		entries = make([]*scheduledAuth, 0, len(shard.entries))
+		for _, storedEntry := range shard.entries {
+			if storedEntry == nil || storedEntry.meta == nil {
+				continue
+			}
+			entries = append(entries, buildScheduledAuth(storedEntry.meta, modelKey, now))
+		}
+	} else {
+		entries = make([]*scheduledAuth, 0, len(providerState.auths))
+		for _, meta := range providerState.auths {
+			if meta == nil || !meta.supportsModel(modelKey) {
+				continue
+			}
+			entries = append(entries, buildScheduledAuth(meta, modelKey, now))
+		}
+	}
+
+	byPriority := make(map[int]*routingPriorityDiagnosticsAccumulator)
+	for _, entry := range entries {
+		if entry == nil || entry.auth == nil || entry.meta == nil {
+			continue
+		}
+		priority := entry.meta.priority
+		accumulator := byPriority[priority]
+		if accumulator == nil {
+			accumulator = &routingPriorityDiagnosticsAccumulator{
+				diagnostics: RoutingPriorityDiagnostics{Priority: priority},
+			}
+			byPriority[priority] = accumulator
+		}
+		accumulator.diagnostics.Total++
+
+		if entry.state == scheduledStateCooldown && chatGPTWebImageQuotaExhaustedForRoutingDiagnostics(entry.auth, modelKey, now) {
+			accumulator.diagnostics.QuotaExhausted++
+			continue
+		}
+
+		switch entry.state {
+		case scheduledStateReady:
+			accumulator.diagnostics.ReadyBeforeRequestLimit++
+			policy := s.requestLimitPolicyForAuthLocked(entry.auth)
+			available := true
+			block := authRequestLimitBlock{}
+			if s.requestLimiter != nil {
+				available, block = s.requestLimiter.availableAt(entry.auth.ID, policy, now)
+			}
+			if available {
+				accumulator.diagnostics.EligibleNow++
+				continue
+			}
+			accumulator.diagnostics.RequestLimited++
+			resetAt := now.Add(block.resetIn)
+			if accumulator.earliestRequestLimitResetAt.IsZero() || resetAt.Before(accumulator.earliestRequestLimitResetAt) {
+				accumulator.earliestRequestLimitResetAt = resetAt
+			}
+		case scheduledStateCooldown:
+			accumulator.diagnostics.Cooldown++
+		case scheduledStateBlocked, scheduledStateDisabled:
+			accumulator.diagnostics.Unavailable++
+		}
+	}
+
+	priorities := make([]int, 0, len(byPriority))
+	for priority := range byPriority {
+		priorities = append(priorities, priority)
+	}
+	sort.Sort(sort.Reverse(sort.IntSlice(priorities)))
+	for _, priority := range priorities {
+		accumulator := byPriority[priority]
+		if !accumulator.earliestRequestLimitResetAt.IsZero() {
+			resetAt := accumulator.earliestRequestLimitResetAt
+			accumulator.diagnostics.EarliestRequestLimitResetAt = &resetAt
+		}
+		snapshot.Priorities = append(snapshot.Priorities, accumulator.diagnostics)
+	}
+	return snapshot
+}
+
+func chatGPTWebImageQuotaExhaustedForRoutingDiagnostics(auth *Auth, model string, now time.Time) bool {
+	if auth == nil || !strings.EqualFold(strings.TrimSpace(auth.Provider), chatgptwebauth.Provider) {
+		return false
+	}
+	imageModels := ChatGPTWebImageModelIDs(auth)
+	if !chatGPTWebImageModelProjectionForModels(auth, model, imageModels) {
+		return false
+	}
+	return chatGPTWebImageCapabilityStateForAuthWithModels(auth, now, imageModels).confirmedExhausted
 }
 
 // setSelector updates the active built-in strategy and resets mixed-provider cursors.

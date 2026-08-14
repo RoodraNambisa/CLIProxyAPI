@@ -453,6 +453,29 @@ func (e *ChatGPTWebExecutor) Execute(ctx context.Context, auth *cliproxyauth.Aut
 	return response, e.handleChatGPTWebRuntimeLifecycleError(ctx, auth, err)
 }
 
+// PrepareProviderRequest completes credential-independent validation before
+// auth selection and returns an immutable plan shared by provider attempts.
+func (e *ChatGPTWebExecutor) PrepareProviderRequest(ctx context.Context, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, operation cliproxyexecutor.RequestOperation) (any, error) {
+	if operation == cliproxyexecutor.RequestOperationCount {
+		return nil, cliproxyexecutor.NewProviderIncompatibleRequestPreparationError(newChatGPTWebProtocolUnavailableError())
+	}
+	prepared, errPrepare := e.prepareRuntimeRequestTemplate(ctx, req, opts, operation == cliproxyexecutor.RequestOperationStream)
+	if errPrepare == nil {
+		return prepared, nil
+	}
+	var retryOtherProvider interface{ RetryOtherAuth() bool }
+	if errors.As(errPrepare, &retryOtherProvider) && retryOtherProvider.RetryOtherAuth() {
+		return nil, cliproxyexecutor.NewProviderIncompatibleRequestPreparationError(errPrepare)
+	}
+	return nil, cliproxyexecutor.NewGlobalProviderRequestPreparationError(errPrepare)
+}
+
+// DeferAuthRequestCommitUntilUpstream reports that the executor commits the
+// auth request slot immediately before its first model upstream request.
+func (*ChatGPTWebExecutor) DeferAuthRequestCommitUntilUpstream() bool {
+	return true
+}
+
 // ExecuteStream runs a streaming ChatGPT Web request.
 func (e *ChatGPTWebExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
 	result, err := e.executeRuntimeStream(ctx, auth, req, opts)

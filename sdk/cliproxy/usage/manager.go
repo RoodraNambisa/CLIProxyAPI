@@ -28,8 +28,13 @@ type Record struct {
 	Failed              bool
 	// Auxiliary marks a secondary model token/cost allocation for the same
 	// downstream request. Auxiliary records do not represent another request.
-	Auxiliary bool
-	Detail    Detail
+	Auxiliary               bool
+	FailureStage            string
+	ErrorCode               string
+	CredentialSelected      bool
+	UpstreamCommitted       bool
+	AuthRequestSlotConsumed bool
+	Detail                  Detail
 }
 
 // Detail holds the token usage breakdown.

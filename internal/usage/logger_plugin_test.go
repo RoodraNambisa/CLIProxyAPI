@@ -41,6 +41,33 @@ func TestRequestStatisticsRecordIncludesLatency(t *testing.T) {
 	}
 }
 
+func TestRequestStatisticsRecordIncludesExecutionDiagnostics(t *testing.T) {
+	stats := NewRequestStatistics()
+	stats.Record(context.Background(), coreusage.Record{
+		APIKey:                  "test-key",
+		Model:                   "gpt-image-2",
+		RequestedAt:             time.Now().UTC(),
+		Failed:                  true,
+		FailureStage:            "upstream",
+		ErrorCode:               "rate_limit_exceeded",
+		CredentialSelected:      true,
+		UpstreamCommitted:       true,
+		AuthRequestSlotConsumed: true,
+	})
+
+	details := stats.Snapshot().APIs["test-key"].Models["gpt-image-2"].Details
+	if len(details) != 1 {
+		t.Fatalf("details len = %d, want 1", len(details))
+	}
+	detail := details[0]
+	if detail.FailureStage != "upstream" || detail.ErrorCode != "rate_limit_exceeded" {
+		t.Fatalf("failure diagnostics = stage:%q code:%q", detail.FailureStage, detail.ErrorCode)
+	}
+	if !detail.CredentialSelected || !detail.UpstreamCommitted || !detail.AuthRequestSlotConsumed {
+		t.Fatalf("execution ownership diagnostics = %+v", detail)
+	}
+}
+
 func TestRequestStatisticsNormalizesNegativeRecordTokens(t *testing.T) {
 	stats := NewRequestStatistics()
 	stats.Record(context.Background(), coreusage.Record{

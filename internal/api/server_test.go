@@ -176,6 +176,7 @@ func TestPerAuthRequestLimitManagementRoutesAreRegistered(t *testing.T) {
 		cfg.RemoteManagement.SecretKey = "secret"
 	})
 	want := map[string]bool{
+		http.MethodGet + " /v0/management/routing/diagnostics":                       false,
 		http.MethodGet + " /v0/management/routing/per-auth-request-limit":            false,
 		http.MethodPut + " /v0/management/routing/per-auth-request-limit":            false,
 		http.MethodPatch + " /v0/management/routing/per-auth-request-limit":          false,

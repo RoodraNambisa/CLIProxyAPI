@@ -17,6 +17,7 @@ import (
 	"time"
 
 	chatgptwebauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/chatgptweb"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v6/sdk/translator"
@@ -30,6 +31,198 @@ type chatGPTWebRuntimeUpdateHook struct {
 
 func (hook *chatGPTWebRuntimeUpdateHook) OnAuthUpdated(context.Context, *cliproxyauth.Auth) {
 	hook.updates.Add(1)
+}
+
+func TestChatGPTWebPreparedRequestInstancesAreIsolated(t *testing.T) {
+	executor := NewChatGPTWebExecutor(nil, nil)
+	t.Cleanup(func() { _ = executor.Close() })
+
+	template, err := executor.prepareRuntimeRequestTemplate(t.Context(), cliproxyexecutor.Request{
+		Model:   "gpt-5",
+		Payload: []byte(`{"model":"gpt-5","input":[{"role":"user","content":[{"type":"input_text","text":"hello"},{"type":"input_image","image_url":"data:image/png;base64,aGVsbG8="}]}]}`),
+	}, cliproxyexecutor.Options{
+		SourceFormat:   sdktranslator.FormatCodex,
+		ResponseFormat: sdktranslator.FormatCodex,
+	}, false)
+	if err != nil {
+		t.Fatalf("prepareRuntimeRequestTemplate() error = %v", err)
+	}
+	if template.usageProjection != nil || template.bodyRelease != nil || template.imageResultState != nil {
+		t.Fatal("template contains execution-scoped state")
+	}
+
+	firstBodyRelease := cliproxyexecutor.NewRequestBodyReleaseController(128, []byte("released-first"))
+	secondBodyRelease := cliproxyexecutor.NewRequestBodyReleaseController(256, []byte("released-second"))
+	firstImageState := &cliproxyexecutor.ImageGenerationResultState{}
+	secondImageState := &cliproxyexecutor.ImageGenerationResultState{}
+	first, err := executor.instantiateRuntimeRequest(template, cliproxyexecutor.Options{Metadata: map[string]any{
+		cliproxyexecutor.BodyReleaseControllerMetadataKey:      firstBodyRelease,
+		cliproxyexecutor.ImageGenerationResultStateMetadataKey: firstImageState,
+	}})
+	if err != nil {
+		t.Fatalf("instantiateRuntimeRequest(first) error = %v", err)
+	}
+	defer first.discardUsageProjection()
+	second, err := executor.instantiateRuntimeRequest(template, cliproxyexecutor.Options{Metadata: map[string]any{
+		cliproxyexecutor.BodyReleaseControllerMetadataKey:      secondBodyRelease,
+		cliproxyexecutor.ImageGenerationResultStateMetadataKey: secondImageState,
+	}})
+	if err != nil {
+		t.Fatalf("instantiateRuntimeRequest(second) error = %v", err)
+	}
+	defer second.discardUsageProjection()
+
+	if first.usageProjection == nil || second.usageProjection == nil || first.usageProjection == second.usageProjection {
+		t.Fatalf("usage projections are not isolated: first=%p second=%p", first.usageProjection, second.usageProjection)
+	}
+	if first.bodyRelease != firstBodyRelease || second.bodyRelease != secondBodyRelease || first.bodyRelease == second.bodyRelease {
+		t.Fatal("request body release controllers are not isolated")
+	}
+	if first.imageResultState != firstImageState || second.imageResultState != secondImageState || first.imageResultState == second.imageResultState {
+		t.Fatal("image result states are not isolated")
+	}
+	if len(first.request.Messages) == 0 || len(first.request.Messages[0].Parts) < 2 {
+		t.Fatalf("prepared messages = %#v, want text and image parts", first.request.Messages)
+	}
+
+	first.request.Messages[0].Parts[0].Text = "mutated"
+	first.request.Messages[0].Parts[1].ImageURL = "data:image/png;base64,bXV0YXRlZA=="
+	first.originalPayload[0] = 'X'
+	first.canonicalBody[0] = 'Y'
+	if second.request.Messages[0].Parts[0].Text != "hello" || template.request.Messages[0].Parts[0].Text != "hello" {
+		t.Fatal("message text mutation escaped the first instance")
+	}
+	if second.request.Messages[0].Parts[1].ImageURL == first.request.Messages[0].Parts[1].ImageURL || template.request.Messages[0].Parts[1].ImageURL == first.request.Messages[0].Parts[1].ImageURL {
+		t.Fatal("message image mutation escaped the first instance")
+	}
+	if second.originalPayload[0] == 'X' || template.originalPayload[0] == 'X' || second.canonicalBody[0] == 'Y' || template.canonicalBody[0] == 'Y' {
+		t.Fatal("payload mutation escaped the first instance")
+	}
+}
+
+func TestChatGPTWebPreparedRequestRebuildsForSelectedAuthModelMapping(t *testing.T) {
+	executor := NewChatGPTWebExecutor(nil, nil)
+	t.Cleanup(func() { _ = executor.Close() })
+	opts := cliproxyexecutor.Options{
+		SourceFormat:   sdktranslator.FormatCodex,
+		ResponseFormat: sdktranslator.FormatCodex,
+		Metadata: map[string]any{
+			cliproxyexecutor.RequestedModelMetadataKey: "public-model",
+		},
+	}
+	template, errPrepare := executor.prepareRuntimeRequestTemplate(t.Context(), cliproxyexecutor.Request{
+		Model:   "public-model",
+		Payload: []byte(`{"model":"public-model","input":"hello"}`),
+	}, opts, false)
+	if errPrepare != nil {
+		t.Fatalf("prepareRuntimeRequestTemplate() error = %v", errPrepare)
+	}
+	opts = cliproxyexecutor.WithProviderPreparedRequest(opts, executor.Identifier(), template)
+
+	prepared, errPrepare := executor.prepareRuntimeRequest(t.Context(), nil, cliproxyexecutor.Request{
+		Model:   "gpt-5",
+		Payload: []byte(`{"model":"public-model","input":"hello"}`),
+	}, opts, false)
+	if errPrepare != nil {
+		t.Fatalf("prepareRuntimeRequest() error = %v", errPrepare)
+	}
+	defer prepared.discardUsageProjection()
+	if prepared.baseModel != "gpt-5" {
+		t.Fatalf("base model = %q, want mapped model gpt-5", prepared.baseModel)
+	}
+	if prepared.request.Model != "gpt-5" {
+		t.Fatalf("upstream request model = %q, want mapped model gpt-5", prepared.request.Model)
+	}
+}
+
+func TestChatGPTWebPreparedRequestModelRebuildFailureDoesNotCommitRequestSlot(t *testing.T) {
+	executor := NewChatGPTWebExecutor(nil, nil)
+	t.Cleanup(func() { _ = executor.Close() })
+	reservation := &chatGPTWebUsageTestReservation{reserved: true}
+	slot := &cliproxyexecutor.AuthRequestSlot{}
+	slot.Bind(reservation)
+	opts := cliproxyexecutor.Options{
+		SourceFormat:    sdktranslator.FormatCodex,
+		ResponseFormat:  sdktranslator.FormatCodex,
+		AuthRequestSlot: slot,
+	}
+	template, errPrepare := executor.prepareRuntimeRequestTemplate(t.Context(), cliproxyexecutor.Request{
+		Model:   "public-model",
+		Payload: []byte(`{"model":"public-model","input":"hello"}`),
+	}, opts, false)
+	if errPrepare != nil {
+		t.Fatalf("prepareRuntimeRequestTemplate() error = %v", errPrepare)
+	}
+	opts = cliproxyexecutor.WithProviderPreparedRequest(opts, executor.Identifier(), template)
+
+	_, errPrepare = executor.prepareRuntimeRequest(t.Context(), nil, cliproxyexecutor.Request{
+		Model:   "gpt-5",
+		Payload: []byte(`{"broken":`),
+	}, opts, false)
+	if errPrepare == nil {
+		t.Fatal("prepareRuntimeRequest() error = nil, want mapped-model rebuild failure")
+	}
+	if reservation.committed || !reservation.reserved {
+		t.Fatalf("reservation state after local rebuild failure = reserved:%v committed:%v", reservation.reserved, reservation.committed)
+	}
+	if !slot.Release() {
+		t.Fatal("AuthRequestSlot.Release() = false, want pending reservation release")
+	}
+}
+
+func TestManagerChatGPTWebPreflightRebuildsAfterPrefixMapping(t *testing.T) {
+	var conversationModel atomic.Value
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/":
+			_, _ = io.WriteString(w, `<html><script src="/c/build/_next/a.js"></script></html>`)
+		case "/backend-api/sentinel/chat-requirements/prepare":
+			_ = json.NewEncoder(w).Encode(map[string]any{"prepare_token": "prepare"})
+		case "/backend-api/sentinel/chat-requirements/finalize":
+			_ = json.NewEncoder(w).Encode(map[string]any{"token": "requirements"})
+		case "/backend-api/conversation":
+			var body map[string]any
+			if errDecode := json.NewDecoder(request.Body).Decode(&body); errDecode != nil {
+				t.Errorf("decode conversation request: %v", errDecode)
+				http.Error(w, "invalid request", http.StatusBadRequest)
+				return
+			}
+			model, _ := body["model"].(string)
+			conversationModel.Store(strings.TrimSpace(model))
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = io.WriteString(w, "data: {\"message\":{\"author\":{\"role\":\"assistant\"},\"content\":{\"parts\":[\"mapped\"]}}}\n\n")
+			_, _ = io.WriteString(w, "data: [DONE]\n\n")
+		default:
+			http.NotFound(w, request)
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	manager := cliproxyauth.NewManager(nil, &cliproxyauth.FillFirstSelector{}, nil)
+	executor := NewChatGPTWebExecutor(nil, manager)
+	executor.runtimeBaseURL = server.URL
+	manager.RegisterExecutor(executor)
+	t.Cleanup(func() { _ = executor.Close() })
+	auth := chatGPTWebRuntimeAuth()
+	auth.Prefix = "team"
+	registry.GetGlobalRegistry().RegisterClient(auth.ID, chatgptwebauth.Provider, []*registry.ModelInfo{{ID: "gpt-5"}})
+	t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(auth.ID) })
+	_, errRegister := manager.Register(cliproxyauth.WithSkipPersist(t.Context()), auth)
+	if errRegister != nil {
+		t.Fatalf("Register() error = %v", errRegister)
+	}
+	manager.RefreshSchedulerEntry(auth.ID)
+
+	_, errExecute := manager.Execute(t.Context(), []string{chatgptwebauth.Provider}, cliproxyexecutor.Request{
+		Model:   "team/gpt-5",
+		Payload: []byte(`{"model":"team/gpt-5","input":"hello"}`),
+	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatCodex, ResponseFormat: sdktranslator.FormatCodex})
+	if errExecute != nil {
+		t.Fatalf("Execute() error = %v", errExecute)
+	}
+	if got, _ := conversationModel.Load().(string); got != "gpt-5" {
+		t.Fatalf("conversation model = %q, want mapped model gpt-5", got)
+	}
 }
 
 func TestChatGPTWebExecutorExecuteTextConversation(t *testing.T) {

@@ -254,6 +254,61 @@ func TestChatGPTWebGenericImageRateLimitPreservesCommittedMarkerWithoutQuotaCode
 	}
 }
 
+func TestChatGPTWebImageFailureStageSurvivesRequestNormalization(t *testing.T) {
+	tests := []struct {
+		name  string
+		stage string
+		err   error
+	}{
+		{
+			name:  "download transport",
+			stage: "download",
+			err: withChatGPTWebFailureStage("download",
+				newChatGPTWebAssetTransportError(context.Background(), "download", io.ErrUnexpectedEOF)),
+		},
+		{
+			name:  "settle response",
+			stage: "settle",
+			err: withChatGPTWebFailureStage("settle", newChatGPTWebImageSettleError(
+				newChatGPTWebStatusError(http.StatusBadGateway, "/backend-api/conversation/image-settle", nil, nil))),
+		},
+		{
+			name:  "generic rate limit",
+			stage: "settle",
+			err: withChatGPTWebFailureStage("settle", newChatGPTWebStatusError(
+				http.StatusTooManyRequests,
+				"/backend-api/f/conversation",
+				[]byte(`{"error":{"code":"rate_limit_exceeded","message":"Too many requests"}}`),
+				nil,
+			)),
+		},
+		{
+			name:  "image quota",
+			stage: "settle",
+			err: withChatGPTWebFailureStage("settle", newChatGPTWebStatusError(
+				http.StatusTooManyRequests,
+				"/backend-api/f/conversation",
+				[]byte(`{"error":{"code":"image_generation_limit_reached","message":"image quota exhausted"}}`),
+				nil,
+			)),
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			projected := chatGPTWebImageRequestError(test.err)
+			committed := chatGPTWebCommittedRequestError(context.Background(), projected)
+			var stageProvider chatGPTWebFailureStageProvider
+			if !errors.As(committed, &stageProvider) {
+				t.Fatalf("normalized error has no failure stage: %v", committed)
+			}
+			if got := stageProvider.ChatGPTWebFailureStage(); got != test.stage {
+				t.Fatalf("failure stage = %q, want %q", got, test.stage)
+			}
+		})
+	}
+}
+
 func TestChatGPTWebTerminalImageFailureProjectsExplicitQuotaEvidence(t *testing.T) {
 	projected := chatGPTWebImageRequestError(chatGPTWebImageFailureError(
 		"image generation limit reached; no remaining image credits",

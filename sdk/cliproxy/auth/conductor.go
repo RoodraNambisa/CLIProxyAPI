@@ -51,6 +51,18 @@ type ProviderExecutor interface {
 	HttpRequest(ctx context.Context, auth *Auth, req *http.Request) (*http.Response, error)
 }
 
+// ProviderRequestPreparer performs provider-specific deterministic work before
+// auth selection and returns an immutable request-scoped execution plan.
+type ProviderRequestPreparer interface {
+	PrepareProviderRequest(ctx context.Context, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, operation cliproxyexecutor.RequestOperation) (any, error)
+}
+
+// DeferredAuthRequestCommitter marks executors that commit a selected auth
+// request slot immediately before their first model upstream request.
+type DeferredAuthRequestCommitter interface {
+	DeferAuthRequestCommitUntilUpstream() bool
+}
+
 // DurableRefreshExecutor waits for provider-owned credential acquisition to
 // finish after it starts, even if the initiating request stops waiting. The
 // implementation must keep that acquisition bounded independently of request
@@ -423,6 +435,7 @@ type Manager struct {
 	persistedAuthRevision uint64
 	storeRevision         uint64
 	scheduler             *authScheduler
+	executionMetrics      *cliproxyexecutor.RequestExecutionMetrics
 	// executorLifecycleMu serializes registry changes with executor shutdown.
 	executorLifecycleMu sync.Mutex
 	executorCloseCond   *sync.Cond
@@ -557,6 +570,12 @@ func runtimeAuthInstanceRetiredError() *Error {
 func isRuntimeAuthInstanceRetiredError(err error) bool {
 	var authErr *Error
 	return errors.As(err, &authErr) && authErr != nil && authErr.Code == "auth_instance_retired"
+}
+
+func releaseRetiredAuthRequestSlot(opts cliproxyexecutor.Options) {
+	if opts.AuthRequestSlot != nil {
+		opts.AuthRequestSlot.Release()
+	}
 }
 
 func runtimeAuthInstanceRetiredContext(ctx context.Context) bool {
@@ -709,7 +728,29 @@ func NewManager(store Store, selector Selector, hook Hook) *Manager {
 	manager.runtimeConfig.Store(&internalconfig.Config{})
 	manager.apiKeyModelAlias.Store(apiKeyModelAliasTable(nil))
 	manager.scheduler = newAuthScheduler(selector)
+	manager.executionMetrics = &cliproxyexecutor.RequestExecutionMetrics{}
 	return manager
+}
+
+// RequestExecutionMetrics returns process-local model request boundary metrics.
+func (m *Manager) RequestExecutionMetrics() cliproxyexecutor.RequestExecutionMetricsSnapshot {
+	if m == nil {
+		return cliproxyexecutor.RequestExecutionMetricsSnapshot{}
+	}
+	return m.executionMetrics.Snapshot()
+}
+
+// RoutingDiagnostics returns a read-only availability snapshot for one
+// provider/model shard without cloning credential material.
+func (m *Manager) RoutingDiagnostics(provider, model string, now time.Time) RoutingDiagnosticsSnapshot {
+	if m == nil || m.scheduler == nil {
+		return RoutingDiagnosticsSnapshot{
+			Provider:   strings.ToLower(strings.TrimSpace(provider)),
+			Model:      canonicalModelKey(model),
+			Priorities: make([]RoutingPriorityDiagnostics, 0),
+		}
+	}
+	return m.scheduler.RoutingDiagnostics(provider, model, now)
 }
 
 func isBuiltInSelector(selector Selector) bool {
@@ -2171,7 +2212,7 @@ func (m *Manager) executeStreamWithModelPool(ctx, resultCtx context.Context, exe
 			return nil, &Error{Code: "request_body_released", Message: "request body released; retry disabled"}
 		}
 		if idx > 0 {
-			if errLimit := m.acquireAdditionalAuthRequest(auth, opts.AuthRequestSlot); errLimit != nil {
+			if errLimit := m.acquireAdditionalAuthRequest(auth, executor, opts.AuthRequestSlot); errLimit != nil {
 				return nil, errLimit
 			}
 		}
@@ -2196,7 +2237,8 @@ func (m *Manager) executeStreamWithModelPool(ctx, resultCtx context.Context, exe
 			}
 			return nil, &Error{Code: "request_body_released", Message: "request body released; retry disabled"}
 		}
-		streamResult, errStream := executor.ExecuteStream(ctx, auth, execReq, execOpts)
+		attemptCtx, usageAttempt := cliproxyexecutor.WithRequestUsageAttempt(ctx)
+		streamResult, errStream := executor.ExecuteStream(attemptCtx, auth, execReq, execOpts)
 		if errStream != nil {
 			unregisterRelease()
 			if errCtx := ctx.Err(); errCtx != nil {
@@ -2224,7 +2266,6 @@ func (m *Manager) executeStreamWithModelPool(ctx, resultCtx context.Context, exe
 			}
 			continue
 		}
-
 		buffered, closed, bootstrapErr := readStreamBootstrap(ctx, streamResult.Chunks)
 		unregisterRelease()
 		releaseMu.Lock()
@@ -2304,6 +2345,7 @@ func (m *Manager) executeStreamWithModelPool(ctx, resultCtx context.Context, exe
 			close(closedCh)
 			remaining = closedCh
 		}
+		opts.UsageOutcome.AcceptStreamAttempt(usageAttempt)
 		return m.wrapStreamResult(ctx, resultCtx, auth.Clone(), affinityProviders, provider, routeModel, resultModel, wrapOpts, streamResult.Headers, buffered, remaining, aliasResult, onDone), nil
 	}
 	if lastErr == nil {
@@ -4008,13 +4050,29 @@ func authFilePathQuarantined(auth *Auth, authDir string) bool {
 
 // Execute performs a non-streaming execution using the configured selector and executor.
 // It supports multiple providers for the same model and round-robins the starting provider per model.
-func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (response cliproxyexecutor.Response, err error) {
+	opts = m.ensureExecutionDiagnostics(opts)
+	ctx = cliproxyexecutor.WithRequestUsageOutcome(ctx, opts.UsageOutcome)
+	defer func() {
+		m.recordExecutionResultMetrics(opts, err)
+		if err != nil {
+			opts.UsageOutcome.FinalizeFailure()
+			return
+		}
+		opts.ExecutionDiagnostics.ClearFailure()
+		opts.UsageOutcome.FinalizeSuccess()
+	}()
 	if usesRetiredGeminiCLIExecutionFormat(req, opts) || usesRetiredGeminiCLIProvider(providers) {
 		return cliproxyexecutor.Response{}, retiredGeminiCLIAuthError()
 	}
 	normalized := m.normalizeProviders(providers)
 	if len(normalized) == 0 {
 		return cliproxyexecutor.Response{}, &Error{Code: "provider_not_found", Message: "no provider supplied"}
+	}
+	var errPrepare error
+	normalized, opts, errPrepare = m.prepareProviderRequests(ctx, normalized, req, opts, cliproxyexecutor.RequestOperationExecute)
+	if errPrepare != nil {
+		return cliproxyexecutor.Response{}, errPrepare
 	}
 	strictSessionAffinity := m.strictSessionAffinityForRequest(req, opts)
 
@@ -4070,13 +4128,29 @@ func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxye
 
 // ExecuteCount performs a non-streaming execution using the configured selector and executor.
 // It supports multiple providers for the same model and round-robins the starting provider per model.
-func (m *Manager) ExecuteCount(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+func (m *Manager) ExecuteCount(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (response cliproxyexecutor.Response, err error) {
+	opts = m.ensureExecutionDiagnostics(opts)
+	ctx = cliproxyexecutor.WithRequestUsageOutcome(ctx, opts.UsageOutcome)
+	defer func() {
+		m.recordExecutionResultMetrics(opts, err)
+		if err != nil {
+			opts.UsageOutcome.FinalizeFailure()
+			return
+		}
+		opts.ExecutionDiagnostics.ClearFailure()
+		opts.UsageOutcome.FinalizeSuccess()
+	}()
 	if usesRetiredGeminiCLIExecutionFormat(req, opts) || usesRetiredGeminiCLIProvider(providers) {
 		return cliproxyexecutor.Response{}, retiredGeminiCLIAuthError()
 	}
 	normalized := m.normalizeProviders(providers)
 	if len(normalized) == 0 {
 		return cliproxyexecutor.Response{}, &Error{Code: "provider_not_found", Message: "no provider supplied"}
+	}
+	var errPrepare error
+	normalized, opts, errPrepare = m.prepareProviderRequests(ctx, normalized, req, opts, cliproxyexecutor.RequestOperationCount)
+	if errPrepare != nil {
+		return cliproxyexecutor.Response{}, errPrepare
 	}
 	strictSessionAffinity := m.strictSessionAffinityForRequest(req, opts)
 
@@ -4125,13 +4199,29 @@ func (m *Manager) ExecuteCount(ctx context.Context, providers []string, req clip
 
 // ExecuteStream performs a streaming execution using the configured selector and executor.
 // It supports multiple providers for the same model and round-robins the starting provider per model.
-func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
+func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (result *cliproxyexecutor.StreamResult, err error) {
+	opts = m.ensureExecutionDiagnostics(opts)
+	ctx = cliproxyexecutor.WithRequestUsageOutcome(ctx, opts.UsageOutcome)
+	defer func() {
+		m.recordExecutionResultMetrics(opts, err)
+		if err != nil {
+			opts.UsageOutcome.FinalizeFailure()
+			return
+		}
+		opts.ExecutionDiagnostics.ClearFailure()
+		opts.UsageOutcome.AcceptStream()
+	}()
 	if usesRetiredGeminiCLIExecutionFormat(req, opts) || usesRetiredGeminiCLIProvider(providers) {
 		return nil, retiredGeminiCLIAuthError()
 	}
 	normalized := m.normalizeProviders(providers)
 	if len(normalized) == 0 {
 		return nil, &Error{Code: "provider_not_found", Message: "no provider supplied"}
+	}
+	var errPrepare error
+	normalized, opts, errPrepare = m.prepareProviderRequests(ctx, normalized, req, opts, cliproxyexecutor.RequestOperationStream)
+	if errPrepare != nil {
+		return nil, errPrepare
 	}
 	strictSessionAffinity := m.strictSessionAffinityForRequest(req, opts)
 
@@ -5026,7 +5116,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 	opts = ensureRequestedModelMetadata(opts, routeModel)
 	opts = setSelectionAttemptMetadata(opts, requestAttempt)
 	opts = withImageGenerationResultState(req, opts)
-	opts.AuthRequestSlot = &cliproxyexecutor.AuthRequestSlot{}
+	opts.AuthRequestSlot = newAuthRequestSlot(opts.ExecutionDiagnostics, opts.ExecutionMetrics)
 	defer opts.AuthRequestSlot.Release()
 	strictSessionAffinity := m.strictSessionAffinityForRequest(req, opts)
 	pickAllowed := m.roundPickAllowed(roundState, maxRetryCredentials)
@@ -5055,7 +5145,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			}
 			return cliproxyexecutor.Response{}, errPick
 		}
-		commitImmediateAuthRequestReservation(auth, opts.AuthRequestSlot)
+		commitImmediateAuthRequestReservation(executor, opts.AuthRequestSlot)
 		roundState.tried[auth.ID] = struct{}{}
 		resolvedAuth, errProxy := m.ResolveProxyAuth(ctx, auth)
 		if errProxy != nil {
@@ -5084,6 +5174,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 				return cliproxyexecutor.Response{}, errCtx
 			}
 			if isRuntimeAuthInstanceRetiredError(errPrepare) {
+				releaseRetiredAuthRequestSlot(opts)
 				roundState.forgetRetiredAttempt(auth)
 				if errWait := waitForRetiredAuthInstanceCleanup(execCtx, auth); errWait != nil {
 					return cliproxyexecutor.Response{}, errWait
@@ -5126,7 +5217,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 				break
 			}
 			if modelIndex > 0 {
-				if errLimit := m.acquireAdditionalAuthRequest(auth, opts.AuthRequestSlot); errLimit != nil {
+				if errLimit := m.acquireAdditionalAuthRequest(auth, executor, opts.AuthRequestSlot); errLimit != nil {
 					authErr = errLimit
 					break
 				}
@@ -5146,6 +5237,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			runtimeCtx, releaseExecution, active := auth.BeginRuntimeExecution(execCtx)
 			if !active {
 				unregisterAttemptRelease()
+				releaseRetiredAuthRequestSlot(opts)
 				roundState.forgetRetiredAttempt(auth)
 				if errWait := waitForRetiredAuthInstanceCleanup(execCtx, auth); errWait != nil {
 					return cliproxyexecutor.Response{}, errWait
@@ -5165,6 +5257,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 				return resp, nil
 			}
 			if retiredDuringExecution {
+				releaseRetiredAuthRequestSlot(opts)
 				roundState.forgetRetiredAttempt(auth)
 				if errWait := waitForRetiredAuthInstanceCleanup(execCtx, auth); errWait != nil {
 					return cliproxyexecutor.Response{}, errWait
@@ -5190,12 +5283,13 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 					auth = refreshed
 					opts = withSelectedAuthInstanceMetadata(opts, auth)
 					auth.bindExecutorOwner(executor)
-					if errLimit := m.acquireAdditionalAuthRequest(auth, opts.AuthRequestSlot); errLimit != nil {
+					if errLimit := m.acquireAdditionalAuthRequest(auth, executor, opts.AuthRequestSlot); errLimit != nil {
 						authErr = errLimit
 						break
 					}
 					retryCtx, releaseRetry, retryActive := auth.BeginRuntimeExecution(execCtx)
 					if !retryActive {
+						releaseRetiredAuthRequestSlot(opts)
 						roundState.forgetRetiredAttempt(auth)
 						if errWait := waitForRetiredAuthInstanceCleanup(execCtx, auth); errWait != nil {
 							return cliproxyexecutor.Response{}, errWait
@@ -5214,6 +5308,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 						return resp, nil
 					}
 					if retiredDuringRetry {
+						releaseRetiredAuthRequestSlot(opts)
 						roundState.forgetRetiredAttempt(auth)
 						if errWait := waitForRetiredAuthInstanceCleanup(execCtx, auth); errWait != nil {
 							return cliproxyexecutor.Response{}, errWait
@@ -5274,7 +5369,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 	routeModel := req.Model
 	opts = ensureRequestedModelMetadata(opts, routeModel)
 	opts = setSelectionAttemptMetadata(opts, requestAttempt)
-	opts.AuthRequestSlot = &cliproxyexecutor.AuthRequestSlot{}
+	opts.AuthRequestSlot = newAuthRequestSlot(opts.ExecutionDiagnostics, opts.ExecutionMetrics)
 	defer opts.AuthRequestSlot.Release()
 	strictSessionAffinity := m.strictSessionAffinityForRequest(req, opts)
 	pickAllowed := m.roundPickAllowed(roundState, maxRetryCredentials)
@@ -5303,7 +5398,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 			}
 			return cliproxyexecutor.Response{}, errPick
 		}
-		commitImmediateAuthRequestReservation(auth, opts.AuthRequestSlot)
+		commitImmediateAuthRequestReservation(executor, opts.AuthRequestSlot)
 		roundState.tried[auth.ID] = struct{}{}
 		resolvedAuth, errProxy := m.ResolveProxyAuth(ctx, auth)
 		if errProxy != nil {
@@ -5332,6 +5427,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 				return cliproxyexecutor.Response{}, errCtx
 			}
 			if isRuntimeAuthInstanceRetiredError(errPrepare) {
+				releaseRetiredAuthRequestSlot(opts)
 				roundState.forgetRetiredAttempt(auth)
 				if errWait := waitForRetiredAuthInstanceCleanup(execCtx, auth); errWait != nil {
 					return cliproxyexecutor.Response{}, errWait
@@ -5374,7 +5470,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 				break
 			}
 			if modelIndex > 0 {
-				if errLimit := m.acquireAdditionalAuthRequest(auth, opts.AuthRequestSlot); errLimit != nil {
+				if errLimit := m.acquireAdditionalAuthRequest(auth, executor, opts.AuthRequestSlot); errLimit != nil {
 					authErr = errLimit
 					break
 				}
@@ -5394,6 +5490,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 			runtimeCtx, releaseExecution, active := auth.BeginRuntimeExecution(execCtx)
 			if !active {
 				unregisterAttemptRelease()
+				releaseRetiredAuthRequestSlot(opts)
 				roundState.forgetRetiredAttempt(auth)
 				if errWait := waitForRetiredAuthInstanceCleanup(execCtx, auth); errWait != nil {
 					return cliproxyexecutor.Response{}, errWait
@@ -5412,6 +5509,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 				return resp, nil
 			}
 			if retiredDuringExecution {
+				releaseRetiredAuthRequestSlot(opts)
 				roundState.forgetRetiredAttempt(auth)
 				if errWait := waitForRetiredAuthInstanceCleanup(execCtx, auth); errWait != nil {
 					return cliproxyexecutor.Response{}, errWait
@@ -5437,12 +5535,13 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 					auth = refreshed
 					opts = withSelectedAuthInstanceMetadata(opts, auth)
 					auth.bindExecutorOwner(executor)
-					if errLimit := m.acquireAdditionalAuthRequest(auth, opts.AuthRequestSlot); errLimit != nil {
+					if errLimit := m.acquireAdditionalAuthRequest(auth, executor, opts.AuthRequestSlot); errLimit != nil {
 						authErr = errLimit
 						break
 					}
 					retryCtx, releaseRetry, retryActive := auth.BeginRuntimeExecution(execCtx)
 					if !retryActive {
+						releaseRetiredAuthRequestSlot(opts)
 						roundState.forgetRetiredAttempt(auth)
 						if errWait := waitForRetiredAuthInstanceCleanup(execCtx, auth); errWait != nil {
 							return cliproxyexecutor.Response{}, errWait
@@ -5460,6 +5559,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 						return resp, nil
 					}
 					if retiredDuringRetry {
+						releaseRetiredAuthRequestSlot(opts)
 						roundState.forgetRetiredAttempt(auth)
 						if errWait := waitForRetiredAuthInstanceCleanup(execCtx, auth); errWait != nil {
 							return cliproxyexecutor.Response{}, errWait
@@ -5518,7 +5618,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 	opts = ensureRequestedModelMetadata(opts, routeModel)
 	opts = setSelectionAttemptMetadata(opts, requestAttempt)
 	opts = withImageGenerationResultState(req, opts)
-	opts.AuthRequestSlot = &cliproxyexecutor.AuthRequestSlot{}
+	opts.AuthRequestSlot = newAuthRequestSlot(opts.ExecutionDiagnostics, opts.ExecutionMetrics)
 	defer opts.AuthRequestSlot.Release()
 	strictSessionAffinity := m.strictSessionAffinityForRequest(req, opts)
 	pickAllowed := m.roundPickAllowed(roundState, maxRetryCredentials)
@@ -5547,7 +5647,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			}
 			return nil, errPick
 		}
-		commitImmediateAuthRequestReservation(auth, opts.AuthRequestSlot)
+		commitImmediateAuthRequestReservation(executor, opts.AuthRequestSlot)
 		roundState.tried[auth.ID] = struct{}{}
 		resolvedAuth, errProxy := m.ResolveProxyAuth(ctx, auth)
 		if errProxy != nil {
@@ -5576,6 +5676,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 				return nil, errCtx
 			}
 			if isRuntimeAuthInstanceRetiredError(errPrepare) {
+				releaseRetiredAuthRequestSlot(opts)
 				roundState.forgetRetiredAttempt(auth)
 				if errWait := waitForRetiredAuthInstanceCleanup(execCtx, auth); errWait != nil {
 					return nil, errWait
@@ -5623,6 +5724,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 		runtimeCtx, releaseExecution, active := auth.BeginRuntimeExecution(execCtx)
 		if !active {
 			unregisterAttemptRelease()
+			releaseRetiredAuthRequestSlot(opts)
 			roundState.forgetRetiredAttempt(auth)
 			if errWait := waitForRetiredAuthInstanceCleanup(execCtx, auth); errWait != nil {
 				return nil, errWait
@@ -5635,6 +5737,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 		if errStream != nil {
 			retiredDuringExecution := releaseExecution()
 			if retiredDuringExecution {
+				releaseRetiredAuthRequestSlot(opts)
 				roundState.forgetRetiredAttempt(auth)
 				if errWait := waitForRetiredAuthInstanceCleanup(execCtx, auth); errWait != nil {
 					return nil, errWait
@@ -5661,12 +5764,13 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 					auth = refreshed
 					opts = withSelectedAuthInstanceMetadata(opts, auth)
 					auth.bindExecutorOwner(executor)
-					if errLimit := m.acquireAdditionalAuthRequest(auth, opts.AuthRequestSlot); errLimit != nil {
+					if errLimit := m.acquireAdditionalAuthRequest(auth, executor, opts.AuthRequestSlot); errLimit != nil {
 						errStream = errLimit
 						markDeferredFailure = false
 					} else {
 						retryCtx, releaseRetry, retryActive := auth.BeginRuntimeExecution(execCtx)
 						if !retryActive {
+							releaseRetiredAuthRequestSlot(opts)
 							roundState.forgetRetiredAttempt(auth)
 							if errWait := waitForRetiredAuthInstanceCleanup(execCtx, auth); errWait != nil {
 								return nil, errWait
@@ -5678,6 +5782,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 							return streamResult, nil
 						}
 						if releaseRetry() {
+							releaseRetiredAuthRequestSlot(opts)
 							roundState.forgetRetiredAttempt(auth)
 							if errWait := waitForRetiredAuthInstanceCleanup(execCtx, auth); errWait != nil {
 								return nil, errWait
@@ -6801,6 +6906,95 @@ func (m *Manager) normalizeProviders(providers []string) []string {
 		result = append(result, p)
 	}
 	return result
+}
+
+func (m *Manager) prepareProviderRequests(
+	ctx context.Context,
+	providers []string,
+	req cliproxyexecutor.Request,
+	opts cliproxyexecutor.Options,
+	operation cliproxyexecutor.RequestOperation,
+) ([]string, cliproxyexecutor.Options, error) {
+	preparedProviders := make([]string, 0, len(providers))
+	preparedOpts := opts
+	var firstErr error
+	for _, provider := range providers {
+		exec := m.executorFor(provider)
+		preparer, ok := exec.(ProviderRequestPreparer)
+		if !ok {
+			preparedProviders = append(preparedProviders, provider)
+			continue
+		}
+		prepared, errPrepare := preparer.PrepareProviderRequest(ctx, req, opts, operation)
+		if errPrepare != nil {
+			if cliproxyexecutor.ProviderRequestPreparationScopeOf(errPrepare) != cliproxyexecutor.ProviderRequestPreparationProviderIncompatible {
+				preparedOpts.ExecutionMetrics.RecordPreflightRejected()
+				if preparedOpts.ExecutionDiagnostics != nil {
+					preparedOpts.ExecutionDiagnostics.SetFailure("preflight", requestErrorCode(errPrepare))
+				}
+				return nil, opts, errPrepare
+			}
+			if firstErr == nil {
+				firstErr = errPrepare
+			}
+			continue
+		}
+		preparedOpts = cliproxyexecutor.WithProviderPreparedRequest(preparedOpts, provider, prepared)
+		preparedProviders = append(preparedProviders, provider)
+	}
+	if len(preparedProviders) == 0 && firstErr != nil {
+		preparedOpts.ExecutionMetrics.RecordPreflightRejected()
+		if preparedOpts.ExecutionDiagnostics != nil {
+			preparedOpts.ExecutionDiagnostics.SetFailure("preflight", requestErrorCode(firstErr))
+		}
+		return nil, opts, firstErr
+	}
+	return preparedProviders, preparedOpts, nil
+}
+
+func (m *Manager) ensureExecutionDiagnostics(opts cliproxyexecutor.Options) cliproxyexecutor.Options {
+	if opts.ExecutionDiagnostics == nil {
+		opts.ExecutionDiagnostics = &cliproxyexecutor.RequestExecutionDiagnostics{}
+	}
+	if opts.UsageOutcome == nil {
+		opts.UsageOutcome = &cliproxyexecutor.RequestUsageOutcome{}
+	}
+	if opts.ExecutionMetrics == nil && m != nil {
+		opts.ExecutionMetrics = m.executionMetrics
+	}
+	return opts
+}
+
+func newAuthRequestSlot(diagnostics *cliproxyexecutor.RequestExecutionDiagnostics, metrics *cliproxyexecutor.RequestExecutionMetrics) *cliproxyexecutor.AuthRequestSlot {
+	slot := &cliproxyexecutor.AuthRequestSlot{}
+	slot.SetDiagnostics(diagnostics)
+	slot.SetMetrics(metrics)
+	return slot
+}
+
+func (m *Manager) recordExecutionResultMetrics(opts cliproxyexecutor.Options, err error) {
+	if err == nil || opts.ExecutionMetrics == nil {
+		return
+	}
+	var limited *authRequestLimitedError
+	if errors.As(err, &limited) {
+		opts.ExecutionMetrics.RecordAuthRequestLimited()
+	}
+}
+
+func requestErrorCode(err error) string {
+	if err == nil {
+		return ""
+	}
+	var authErr *Error
+	if errors.As(err, &authErr) && authErr != nil && strings.TrimSpace(authErr.Code) != "" {
+		return strings.TrimSpace(authErr.Code)
+	}
+	var status interface{ StatusCode() int }
+	if errors.As(err, &status) {
+		return fmt.Sprintf("http_%d", status.StatusCode())
+	}
+	return "invalid_request"
 }
 
 func (m *Manager) retrySettings() (int, int, time.Duration) {

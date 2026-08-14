@@ -2,6 +2,7 @@ package chatgptweb
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -67,6 +68,210 @@ func TestAcquisitionClientAcceptsConfiguredProxyDialer(t *testing.T) {
 				t.Fatalf("NewAcquisitionClient() error = %v", errClient)
 			}
 			client.CloseIdleConnections()
+		})
+	}
+}
+
+func TestClientBeforeRequestHookRunsImmediatelyBeforeFirstDo(t *testing.T) {
+	var hookCalls atomic.Int32
+	var handlerCalls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
+		handlerCalls.Add(1)
+		if got := hookCalls.Load(); got != 1 {
+			t.Errorf("before-request hook calls at handler = %d, want 1", got)
+		}
+		response.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	client, errClient := NewClient(DefaultPersona(), "", nil)
+	if errClient != nil {
+		t.Fatalf("NewClient() error = %v", errClient)
+	}
+	defer client.CloseIdleConnections()
+	client.SetBeforeRequestHook(func() { hookCalls.Add(1) })
+
+	for attempt := 0; attempt < 2; attempt++ {
+		response, _, errRequest := client.DoNoRedirect(t.Context(), http.MethodGet, server.URL, nil, nil)
+		if errRequest != nil {
+			t.Fatalf("DoNoRedirect() attempt %d error = %v", attempt+1, errRequest)
+		}
+		if response.StatusCode != http.StatusNoContent {
+			t.Fatalf("DoNoRedirect() attempt %d status = %d, want 204", attempt+1, response.StatusCode)
+		}
+	}
+	if got := hookCalls.Load(); got != 1 {
+		t.Fatalf("before-request hook calls = %d, want 1", got)
+	}
+	if got := handlerCalls.Load(); got != 2 {
+		t.Fatalf("handler calls = %d, want 2", got)
+	}
+}
+
+func TestClientBeforeRequestHookDoesNotRunWhenRequestConstructionFails(t *testing.T) {
+	client, errClient := NewClient(DefaultPersona(), "", nil)
+	if errClient != nil {
+		t.Fatalf("NewClient() error = %v", errClient)
+	}
+	defer client.CloseIdleConnections()
+	var hookCalls atomic.Int32
+	client.SetBeforeRequestHook(func() { hookCalls.Add(1) })
+
+	if _, errRequest := client.DoNoRedirectStream(t.Context(), http.MethodGet, "://invalid", nil, nil); errRequest == nil {
+		t.Fatal("DoNoRedirectStream() error = nil, want request construction failure")
+	}
+	if got := hookCalls.Load(); got != 0 {
+		t.Fatalf("before-request hook calls = %d, want 0", got)
+	}
+}
+
+func TestClientBeforeRequestHookDoesNotRunForPreCanceledContext(t *testing.T) {
+	var hookCalls atomic.Int32
+	var handlerCalls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
+		handlerCalls.Add(1)
+		response.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	client, errClient := NewClient(DefaultPersona(), "", nil)
+	if errClient != nil {
+		t.Fatalf("NewClient() error = %v", errClient)
+	}
+	defer client.CloseIdleConnections()
+	client.SetBeforeRequestHook(func() { hookCalls.Add(1) })
+
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	if _, errRequest := client.DoNoRedirectStream(ctx, http.MethodGet, server.URL, nil, nil); !errors.Is(errRequest, context.Canceled) {
+		t.Fatalf("DoNoRedirectStream() error = %v, want context.Canceled", errRequest)
+	}
+	if got := hookCalls.Load(); got != 0 {
+		t.Fatalf("before-request hook calls = %d, want 0", got)
+	}
+	if got := handlerCalls.Load(); got != 0 {
+		t.Fatalf("handler calls = %d, want 0", got)
+	}
+}
+
+func TestClientBeforeRequestHookRemainsCommittedAfterUpstreamFailure(t *testing.T) {
+	for _, statusCode := range []int{http.StatusBadRequest, http.StatusInternalServerError} {
+		t.Run(http.StatusText(statusCode), func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
+				response.WriteHeader(statusCode)
+			}))
+			defer server.Close()
+			client, errClient := NewClient(DefaultPersona(), "", nil)
+			if errClient != nil {
+				t.Fatalf("NewClient() error = %v", errClient)
+			}
+			defer client.CloseIdleConnections()
+			var hookCalls atomic.Int32
+			client.SetBeforeRequestHook(func() { hookCalls.Add(1) })
+
+			response, _, errRequest := client.DoNoRedirect(t.Context(), http.MethodGet, server.URL, nil, nil)
+			if errRequest != nil {
+				t.Fatalf("DoNoRedirect() error = %v", errRequest)
+			}
+			if response.StatusCode != statusCode {
+				t.Fatalf("DoNoRedirect() status = %d, want %d", response.StatusCode, statusCode)
+			}
+			if got := hookCalls.Load(); got != 1 {
+				t.Fatalf("before-request hook calls = %d, want 1", got)
+			}
+		})
+	}
+}
+
+const (
+	testReservationPending uint32 = iota
+	testReservationCommitted
+	testReservationReleased
+)
+
+type clientTestReservation struct {
+	state atomic.Uint32
+}
+
+func (reservation *clientTestReservation) commit() bool {
+	return reservation != nil && reservation.state.CompareAndSwap(testReservationPending, testReservationCommitted)
+}
+
+func (reservation *clientTestReservation) release() bool {
+	return reservation != nil && reservation.state.CompareAndSwap(testReservationPending, testReservationReleased)
+}
+
+func TestClientBeforeRequestHookSettlesReservationAtDoBoundary(t *testing.T) {
+	t.Run("request construction failure releases", func(t *testing.T) {
+		client, errClient := NewClient(DefaultPersona(), "", nil)
+		if errClient != nil {
+			t.Fatalf("NewClient() error = %v", errClient)
+		}
+		defer client.CloseIdleConnections()
+		reservation := &clientTestReservation{}
+		client.SetBeforeRequestHook(func() { reservation.commit() })
+
+		if _, errRequest := client.DoNoRedirectStream(t.Context(), http.MethodGet, "://invalid", nil, nil); errRequest == nil {
+			t.Fatal("DoNoRedirectStream() error = nil, want request construction failure")
+		}
+		if !reservation.release() {
+			t.Fatalf("release() = false, state = %d", reservation.state.Load())
+		}
+		if got := reservation.state.Load(); got != testReservationReleased {
+			t.Fatalf("reservation state = %d, want released", got)
+		}
+	})
+
+	for _, testCase := range []struct {
+		name       string
+		statusCode int
+		closeFirst bool
+	}{
+		{name: "HTTP 400", statusCode: http.StatusBadRequest},
+		{name: "HTTP 500", statusCode: http.StatusInternalServerError},
+		{name: "transport error", closeFirst: true},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			reservation := &clientTestReservation{}
+			server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
+				if got := reservation.state.Load(); got != testReservationCommitted {
+					t.Errorf("reservation state at handler = %d, want committed", got)
+				}
+				response.WriteHeader(testCase.statusCode)
+			}))
+			serverURL := server.URL
+			if testCase.closeFirst {
+				server.Close()
+			} else {
+				defer server.Close()
+			}
+
+			client, errClient := NewClient(DefaultPersona(), "", nil)
+			if errClient != nil {
+				t.Fatalf("NewClient() error = %v", errClient)
+			}
+			defer client.CloseIdleConnections()
+			client.SetBeforeRequestHook(func() { reservation.commit() })
+
+			response, _, errRequest := client.DoNoRedirect(t.Context(), http.MethodGet, serverURL, nil, nil)
+			if testCase.closeFirst {
+				if errRequest == nil {
+					t.Fatal("DoNoRedirect() error = nil, want transport error")
+				}
+			} else {
+				if errRequest != nil {
+					t.Fatalf("DoNoRedirect() error = %v", errRequest)
+				}
+				if response.StatusCode != testCase.statusCode {
+					t.Fatalf("DoNoRedirect() status = %d, want %d", response.StatusCode, testCase.statusCode)
+				}
+			}
+			if reservation.release() {
+				t.Fatal("release() = true after upstream Do")
+			}
+			if got := reservation.state.Load(); got != testReservationCommitted {
+				t.Fatalf("reservation state = %d, want committed", got)
+			}
 		})
 	}
 }

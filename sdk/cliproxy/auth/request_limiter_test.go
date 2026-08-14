@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -1105,6 +1106,12 @@ type requestLimitOperationExecutor struct {
 	calls []string
 }
 
+type requestLimitImmediateChatGPTWebExecutor struct {
+	requestLimitOperationExecutor
+}
+
+func (*requestLimitImmediateChatGPTWebExecutor) Identifier() string { return "chatgpt-web" }
+
 type requestLimitReservationTestError struct{}
 
 func (requestLimitReservationTestError) Error() string        { return "request limit reservation test error" }
@@ -1112,18 +1119,68 @@ func (requestLimitReservationTestError) SkipAuthResult() bool { return true }
 
 type requestLimitChatGPTWebReservationExecutor struct {
 	schedulerTestExecutor
-	commit bool
-	calls  atomic.Int32
+	mu               sync.RWMutex
+	commit           bool
+	prepareErr       error
+	prepareCalls     atomic.Int32
+	calls            atomic.Int32
+	missingPrepared  atomic.Int32
+	preparedByMethod sync.Map
 }
 
 func (*requestLimitChatGPTWebReservationExecutor) Identifier() string { return "chatgpt-web" }
 
-func (e *requestLimitChatGPTWebReservationExecutor) Execute(_ context.Context, _ *Auth, _ cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+func (*requestLimitChatGPTWebReservationExecutor) DeferAuthRequestCommitUntilUpstream() bool {
+	return true
+}
+
+func (e *requestLimitChatGPTWebReservationExecutor) PrepareProviderRequest(_ context.Context, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options, operation cliproxyexecutor.RequestOperation) (any, error) {
+	e.prepareCalls.Add(1)
+	e.mu.RLock()
+	errPrepare := e.prepareErr
+	e.mu.RUnlock()
+	if errPrepare != nil {
+		return nil, errPrepare
+	}
+	prepared := &struct {
+		operation cliproxyexecutor.RequestOperation
+	}{operation: operation}
+	e.preparedByMethod.Store(operation, prepared)
+	return prepared, nil
+}
+
+func (e *requestLimitChatGPTWebReservationExecutor) setPrepareError(errPrepare error) {
+	e.mu.Lock()
+	e.prepareErr = errPrepare
+	e.mu.Unlock()
+}
+
+func (e *requestLimitChatGPTWebReservationExecutor) finish(opts cliproxyexecutor.Options, operation cliproxyexecutor.RequestOperation) error {
 	e.calls.Add(1)
-	if e.commit && opts.AuthRequestSlot != nil {
+	prepared, ok := cliproxyexecutor.ProviderPreparedRequest(opts, "chatgpt-web")
+	expected, expectedOK := e.preparedByMethod.Load(operation)
+	if !ok || !expectedOK || prepared != expected {
+		e.missingPrepared.Add(1)
+	}
+	e.mu.RLock()
+	commit := e.commit
+	e.mu.RUnlock()
+	if commit && opts.AuthRequestSlot != nil {
 		opts.AuthRequestSlot.Commit()
 	}
-	return cliproxyexecutor.Response{}, requestLimitReservationTestError{}
+	return requestLimitReservationTestError{}
+}
+
+func (e *requestLimitChatGPTWebReservationExecutor) Execute(_ context.Context, _ *Auth, _ cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	return cliproxyexecutor.Response{}, e.finish(opts, cliproxyexecutor.RequestOperationExecute)
+}
+
+func (e *requestLimitChatGPTWebReservationExecutor) CountTokens(_ context.Context, _ *Auth, _ cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	return cliproxyexecutor.Response{}, e.finish(opts, cliproxyexecutor.RequestOperationCount)
+}
+
+func (e *requestLimitChatGPTWebReservationExecutor) ExecuteStream(_ context.Context, _ *Auth, _ cliproxyexecutor.Request, opts cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
+	return nil, e.finish(opts, cliproxyexecutor.RequestOperationStream)
 }
 
 func newRequestLimitChatGPTWebReservationManager(t *testing.T, executor *requestLimitChatGPTWebReservationExecutor) *Manager {
@@ -1166,6 +1223,13 @@ func TestManagerChatGPTWebRequestReservationReleasesBeforeUpstreamCommit(t *test
 	if calls := executor.calls.Load(); calls != 2 {
 		t.Fatalf("upstream attempts = %d, want 2 after uncommitted reservations were released", calls)
 	}
+	if got := manager.RequestExecutionMetrics(); got != (cliproxyexecutor.RequestExecutionMetricsSnapshot{
+		AuthSlotReserved:        2,
+		AuthSlotReleased:        2,
+		SelectedButNotCommitted: 2,
+	}) {
+		t.Fatalf("execution metrics = %+v", got)
+	}
 }
 
 func TestManagerChatGPTWebRequestReservationPersistsAfterUpstreamCommit(t *testing.T) {
@@ -1182,6 +1246,303 @@ func TestManagerChatGPTWebRequestReservationPersistsAfterUpstreamCommit(t *testi
 	if calls := executor.calls.Load(); calls != 1 {
 		t.Fatalf("upstream attempts = %d, want committed first attempt only", calls)
 	}
+	if got := manager.RequestExecutionMetrics(); got != (cliproxyexecutor.RequestExecutionMetricsSnapshot{
+		AuthSlotReserved:   1,
+		UpstreamCommitted:  1,
+		AuthRequestLimited: 1,
+	}) {
+		t.Fatalf("execution metrics = %+v", got)
+	}
+}
+
+func TestManagerChatGPTWebPreflightRejectsBeforeSelectionAndRequestLimit(t *testing.T) {
+	executor := &requestLimitChatGPTWebReservationExecutor{}
+	executor.setPrepareError(errors.New("deterministic preflight rejection"))
+	manager := newRequestLimitChatGPTWebReservationManager(t, executor)
+	request := cliproxyexecutor.Request{Model: "request-limit-chatgpt-web-reservation"}
+	var selected atomic.Int32
+	opts := cliproxyexecutor.Options{Metadata: map[string]any{
+		cliproxyexecutor.SelectedAuthCallbackMetadataKey: func(string) { selected.Add(1) },
+	}}
+
+	for attempt := 0; attempt < 100; attempt++ {
+		if _, errExecute := manager.Execute(t.Context(), []string{"chatgpt-web"}, request, opts); errExecute == nil {
+			t.Fatalf("Execute() attempt %d error = nil, want preflight rejection", attempt+1)
+		}
+	}
+	if got := executor.prepareCalls.Load(); got != 100 {
+		t.Fatalf("preflight calls = %d, want 100", got)
+	}
+	if got := selected.Load(); got != 0 {
+		t.Fatalf("selected credentials = %d, want 0", got)
+	}
+	if got := executor.calls.Load(); got != 0 {
+		t.Fatalf("upstream attempts = %d, want 0", got)
+	}
+	if got := manager.RequestExecutionMetrics(); got != (cliproxyexecutor.RequestExecutionMetricsSnapshot{PreflightRejected: 100}) {
+		t.Fatalf("metrics after deterministic rejections = %+v", got)
+	}
+
+	executor.setPrepareError(nil)
+	executor.mu.Lock()
+	executor.commit = true
+	executor.mu.Unlock()
+	if _, errExecute := manager.Execute(t.Context(), []string{"chatgpt-web"}, request, opts); errExecute == nil {
+		t.Fatal("first valid Execute() error = nil, want test error")
+	}
+	if _, errExecute := manager.Execute(t.Context(), []string{"chatgpt-web"}, request, opts); !isAuthRequestLimitedError(errExecute) {
+		t.Fatalf("second valid Execute() error = %T %v, want auth_request_limited", errExecute, errExecute)
+	}
+	if got := executor.calls.Load(); got != 1 {
+		t.Fatalf("upstream attempts after valid request = %d, want 1", got)
+	}
+	if got := executor.missingPrepared.Load(); got != 0 {
+		t.Fatalf("missing prepared requests = %d, want 0", got)
+	}
+	if got := manager.RequestExecutionMetrics(); got != (cliproxyexecutor.RequestExecutionMetricsSnapshot{
+		PreflightRejected:  100,
+		AuthSlotReserved:   1,
+		UpstreamCommitted:  1,
+		AuthRequestLimited: 1,
+	}) {
+		t.Fatalf("metrics after valid request and limit = %+v", got)
+	}
+}
+
+func TestManagerChatGPTWebPreflightAllowsOtherProviderFallback(t *testing.T) {
+	const model = "request-limit-preflight-provider-fallback"
+	webExecutor := &requestLimitChatGPTWebReservationExecutor{}
+	webExecutor.setPrepareError(cliproxyexecutor.NewProviderIncompatibleRequestPreparationError(errors.New("web-only deterministic rejection")))
+	fallbackExecutor := &requestLimitOperationExecutor{}
+	manager := NewManager(nil, &FillFirstSelector{}, nil)
+	manager.RegisterExecutor(webExecutor)
+	manager.RegisterExecutor(fallbackExecutor)
+	manager.SetRetryConfig(0, 0, 0)
+	for _, auth := range []*Auth{
+		{ID: "web-auth", Provider: "chatgpt-web", Status: StatusActive},
+		{ID: "fallback-auth", Provider: "test", Status: StatusActive},
+	} {
+		registry.GetGlobalRegistry().RegisterClient(auth.ID, auth.Provider, []*registry.ModelInfo{{ID: model}})
+		t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(auth.ID) })
+		if _, errRegister := manager.Register(WithSkipPersist(t.Context()), auth); errRegister != nil {
+			t.Fatalf("Register(%s) error = %v", auth.ID, errRegister)
+		}
+	}
+
+	if _, errExecute := manager.Execute(t.Context(), []string{"chatgpt-web", "test"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{}); errExecute != nil {
+		t.Fatalf("Execute() error = %v", errExecute)
+	}
+	if got := webExecutor.calls.Load(); got != 0 {
+		t.Fatalf("web upstream attempts = %d, want 0", got)
+	}
+	if got := fallbackExecutor.callIDs(); len(got) != 1 || got[0] != "fallback-auth" {
+		t.Fatalf("fallback calls = %v, want [fallback-auth]", got)
+	}
+}
+
+func TestManagerGlobalPreflightErrorDoesNotFallbackOrSelectCredential(t *testing.T) {
+	const model = "request-limit-preflight-global-invalid"
+	webExecutor := &requestLimitChatGPTWebReservationExecutor{}
+	webExecutor.setPrepareError(cliproxyexecutor.NewGlobalProviderRequestPreparationError(errors.New("malformed JSON payload")))
+	fallbackExecutor := &requestLimitOperationExecutor{}
+	manager := NewManager(nil, &FillFirstSelector{}, nil)
+	manager.RegisterExecutor(webExecutor)
+	manager.RegisterExecutor(fallbackExecutor)
+	manager.SetRetryConfig(0, 0, 0)
+	for _, auth := range []*Auth{
+		{ID: "web-auth", Provider: "chatgpt-web", Status: StatusActive},
+		{ID: "fallback-auth", Provider: "test", Status: StatusActive},
+	} {
+		registry.GetGlobalRegistry().RegisterClient(auth.ID, auth.Provider, []*registry.ModelInfo{{ID: model}})
+		t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(auth.ID) })
+		if _, errRegister := manager.Register(WithSkipPersist(t.Context()), auth); errRegister != nil {
+			t.Fatalf("Register(%s) error = %v", auth.ID, errRegister)
+		}
+	}
+	var selected atomic.Int32
+	opts := cliproxyexecutor.Options{Metadata: map[string]any{
+		cliproxyexecutor.SelectedAuthCallbackMetadataKey: func(string) { selected.Add(1) },
+	}}
+
+	_, errExecute := manager.Execute(t.Context(), []string{"chatgpt-web", "test"}, cliproxyexecutor.Request{
+		Model:   model,
+		Payload: []byte(`{"broken":`),
+	}, opts)
+	if errExecute == nil || !strings.Contains(errExecute.Error(), "malformed JSON payload") {
+		t.Fatalf("Execute() error = %v, want malformed JSON preflight error", errExecute)
+	}
+	if got := selected.Load(); got != 0 {
+		t.Fatalf("selected credentials = %d, want 0", got)
+	}
+	if got := webExecutor.calls.Load(); got != 0 {
+		t.Fatalf("web upstream attempts = %d, want 0", got)
+	}
+	if got := fallbackExecutor.callIDs(); len(got) != 0 {
+		t.Fatalf("fallback calls = %v, want none", got)
+	}
+	if got := manager.RequestExecutionMetrics(); got != (cliproxyexecutor.RequestExecutionMetricsSnapshot{PreflightRejected: 1}) {
+		t.Fatalf("execution metrics = %+v", got)
+	}
+}
+
+func TestManagerChatGPTWebPreparedRequestPropagatesAcrossOperations(t *testing.T) {
+	for _, testCase := range []struct {
+		name string
+		run  func(*Manager) error
+	}{
+		{name: "execute", run: func(manager *Manager) error {
+			_, errExecute := manager.Execute(t.Context(), []string{"chatgpt-web"}, cliproxyexecutor.Request{Model: "request-limit-chatgpt-web-reservation"}, cliproxyexecutor.Options{})
+			return errExecute
+		}},
+		{name: "count", run: func(manager *Manager) error {
+			_, errCount := manager.ExecuteCount(t.Context(), []string{"chatgpt-web"}, cliproxyexecutor.Request{Model: "request-limit-chatgpt-web-reservation"}, cliproxyexecutor.Options{})
+			return errCount
+		}},
+		{name: "stream", run: func(manager *Manager) error {
+			_, errStream := manager.ExecuteStream(t.Context(), []string{"chatgpt-web"}, cliproxyexecutor.Request{Model: "request-limit-chatgpt-web-reservation"}, cliproxyexecutor.Options{})
+			return errStream
+		}},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			executor := &requestLimitChatGPTWebReservationExecutor{}
+			manager := newRequestLimitChatGPTWebReservationManager(t, executor)
+			if errRun := testCase.run(manager); errRun == nil {
+				t.Fatal("operation error = nil, want test error")
+			}
+			if got := executor.missingPrepared.Load(); got != 0 {
+				t.Fatalf("missing prepared requests = %d, want 0", got)
+			}
+		})
+	}
+}
+
+func TestManagerChatGPTWebExecutorWithoutDeferredCommitCapabilityConsumesRequestSlot(t *testing.T) {
+	for _, testCase := range []struct {
+		name string
+		run  func(*Manager) error
+	}{
+		{name: "execute", run: func(manager *Manager) error {
+			_, errExecute := manager.Execute(t.Context(), []string{"chatgpt-web"}, cliproxyexecutor.Request{Model: "request-limit-chatgpt-web-immediate"}, cliproxyexecutor.Options{})
+			return errExecute
+		}},
+		{name: "count", run: func(manager *Manager) error {
+			_, errCount := manager.ExecuteCount(t.Context(), []string{"chatgpt-web"}, cliproxyexecutor.Request{Model: "request-limit-chatgpt-web-immediate"}, cliproxyexecutor.Options{})
+			return errCount
+		}},
+		{name: "stream", run: func(manager *Manager) error {
+			result, errStream := manager.ExecuteStream(t.Context(), []string{"chatgpt-web"}, cliproxyexecutor.Request{Model: "request-limit-chatgpt-web-immediate"}, cliproxyexecutor.Options{})
+			if errStream != nil {
+				return errStream
+			}
+			for range result.Chunks {
+			}
+			return nil
+		}},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			executor := &requestLimitImmediateChatGPTWebExecutor{}
+			manager := NewManager(nil, &FillFirstSelector{}, nil)
+			manager.RegisterExecutor(executor)
+			manager.SetConfig(&internalconfig.Config{Routing: internalconfig.RoutingConfig{PerAuthRequestLimit: 1, PerAuthRequestWindowMinutes: 5}})
+			manager.SetRetryConfig(0, 0, 0)
+			manager.scheduler.requestLimiter.now = func() time.Time {
+				return time.Date(2026, 8, 14, 12, 0, 10, 0, time.UTC)
+			}
+			auth := &Auth{
+				ID:       "chatgpt-web-immediate-auth",
+				Provider: "chatgpt-web",
+				Status:   StatusActive,
+				Metadata: map[string]any{
+					"access_token":    "test-access-token",
+					"lifecycle_state": LifecycleStateActive,
+				},
+			}
+			registry.GetGlobalRegistry().RegisterClient(auth.ID, auth.Provider, []*registry.ModelInfo{{ID: "request-limit-chatgpt-web-immediate"}})
+			t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(auth.ID) })
+			if _, errRegister := manager.Register(WithSkipPersist(t.Context()), auth); errRegister != nil {
+				t.Fatalf("Register() error = %v", errRegister)
+			}
+
+			if errRun := testCase.run(manager); errRun != nil {
+				t.Fatalf("first operation error = %v", errRun)
+			}
+			if errRun := testCase.run(manager); !isAuthRequestLimitedError(errRun) {
+				t.Fatalf("second operation error = %T %v, want auth_request_limited", errRun, errRun)
+			}
+			if calls := executor.callIDs(); len(calls) != 1 || calls[0] != auth.ID {
+				t.Fatalf("executor calls = %v, want [%s]", calls, auth.ID)
+			}
+			if got := manager.RequestExecutionMetrics(); got != (cliproxyexecutor.RequestExecutionMetricsSnapshot{
+				AuthSlotReserved:   1,
+				UpstreamCommitted:  1,
+				AuthRequestLimited: 1,
+			}) {
+				t.Fatalf("execution metrics = %+v", got)
+			}
+		})
+	}
+}
+
+func TestAuthRequestSlotUpdatesExecutionDiagnosticsAtSelectionAndCommit(t *testing.T) {
+	diagnostics := &cliproxyexecutor.RequestExecutionDiagnostics{}
+	slot := &cliproxyexecutor.AuthRequestSlot{}
+	slot.SetDiagnostics(diagnostics)
+	reservation := &authRequestReservation{noOp: false}
+
+	slot.Bind(reservation)
+	selected := diagnostics.Snapshot()
+	if !selected.CredentialSelected || selected.UpstreamCommitted || selected.AuthRequestSlotConsumed {
+		t.Fatalf("after Bind diagnostics = %+v", selected)
+	}
+	if !slot.Commit() {
+		t.Fatal("Commit() = false, want true")
+	}
+	committed := diagnostics.Snapshot()
+	if !committed.CredentialSelected || !committed.UpstreamCommitted || !committed.AuthRequestSlotConsumed {
+		t.Fatalf("after Commit diagnostics = %+v", committed)
+	}
+}
+
+func TestAuthRequestSlotTracksExecutionMetricsIdempotently(t *testing.T) {
+	metrics := &cliproxyexecutor.RequestExecutionMetrics{}
+	slot := &cliproxyexecutor.AuthRequestSlot{}
+	slot.SetMetrics(metrics)
+
+	released := &authRequestReservation{}
+	slot.Bind(released)
+	if !slot.Release() {
+		t.Fatal("Release() = false, want true")
+	}
+	if slot.Release() {
+		t.Fatal("second Release() = true, want false")
+	}
+
+	committed := &authRequestReservation{}
+	slot.Bind(committed)
+	if !slot.Commit() {
+		t.Fatal("Commit() = false, want true")
+	}
+	if slot.Commit() {
+		t.Fatal("second Commit() = true, want false")
+	}
+	if slot.Release() {
+		t.Fatal("Release() after Commit() = true, want false")
+	}
+
+	noOp := &authRequestReservation{noOp: true}
+	slot.Bind(noOp)
+	if !slot.Release() {
+		t.Fatal("no-op Release() = false, want true")
+	}
+
+	if got := metrics.Snapshot(); got != (cliproxyexecutor.RequestExecutionMetricsSnapshot{
+		AuthSlotReserved:        2,
+		AuthSlotReleased:        1,
+		UpstreamCommitted:       1,
+		SelectedButNotCommitted: 2,
+	}) {
+		t.Fatalf("metrics = %+v", got)
+	}
 }
 
 func TestManagerAcquireAdditionalAuthRequestReplacesPendingReservation(t *testing.T) {
@@ -1196,7 +1557,7 @@ func TestManagerAcquireAdditionalAuthRequestReplacesPendingReservation(t *testin
 	if acquired, block := manager.authRequestLimiter().tryAcquireAt(auth.ID, policy, fixed); !acquired {
 		t.Fatalf("initial reservation failed: %#v", block)
 	}
-	if errAcquire := manager.acquireAdditionalAuthRequest(auth, slot); errAcquire != nil {
+	if errAcquire := manager.acquireAdditionalAuthRequest(auth, &requestLimitChatGPTWebReservationExecutor{}, slot); errAcquire != nil {
 		t.Fatalf("acquireAdditionalAuthRequest() error = %v", errAcquire)
 	}
 	if !slot.Reserved() {

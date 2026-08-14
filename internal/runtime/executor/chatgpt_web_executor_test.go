@@ -18,6 +18,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
+	sdktranslator "github.com/router-for-me/CLIProxyAPI/v6/sdk/translator"
 )
 
 type fakeChatGPTWebAuthService struct {
@@ -403,8 +404,8 @@ func TestChatGPTWebExecutorLinkedCodexRequestPreparationPreservesRefreshLocks(t 
 	response, errExecute := manager.Execute(
 		ctx,
 		[]string{chatgptwebauth.Provider},
-		cliproxyexecutor.Request{Model: model},
-		cliproxyexecutor.Options{},
+		cliproxyexecutor.Request{Model: model, Payload: []byte(`{"model":"gpt-5","input":"hello"}`)},
+		cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatCodex, ResponseFormat: sdktranslator.FormatCodex},
 	)
 	if errExecute != nil {
 		t.Fatal(errExecute)
@@ -432,8 +433,8 @@ func TestChatGPTWebExecutorLinkedCodexUnauthorizedRefreshPreservesRefreshLocks(t
 	response, errExecute := manager.Execute(
 		ctx,
 		[]string{chatgptwebauth.Provider},
-		cliproxyexecutor.Request{Model: model},
-		cliproxyexecutor.Options{},
+		cliproxyexecutor.Request{Model: model, Payload: []byte(`{"model":"gpt-5","input":"hello"}`)},
+		cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatCodex, ResponseFormat: sdktranslator.FormatCodex},
 	)
 	if errExecute != nil {
 		t.Fatal(errExecute)

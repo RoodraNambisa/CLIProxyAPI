@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	fhttp "github.com/bogdanfinn/fhttp"
@@ -31,6 +32,9 @@ type Client struct {
 	acquisitionTimeout time.Duration
 	acquisitionTracker *acquisitionConnectionTracker
 	loginRetry         *loginClientRetry
+	beforeRequestMu    sync.RWMutex
+	beforeRequest      func()
+	beforeRequestOnce  sync.Once
 }
 
 // accessTokenCookieJar retains all server-issued cookies but withholds browser
@@ -514,7 +518,28 @@ func (client *Client) doStream(ctx context.Context, httpClient tls_client.HttpCl
 	}
 	request = request.WithContext(ctx)
 	client.applyHeaders(request, headers)
+	if errContext := ctx.Err(); errContext != nil {
+		return nil, errContext
+	}
+	client.beforeRequestOnce.Do(func() {
+		client.beforeRequestMu.RLock()
+		hook := client.beforeRequest
+		client.beforeRequestMu.RUnlock()
+		if hook != nil {
+			hook()
+		}
+	})
 	return httpClient.Do(request)
+}
+
+// SetBeforeRequestHook installs a one-shot callback invoked immediately before
+// this client performs its first upstream HTTP request.
+func (client *Client) SetBeforeRequestHook(hook func()) {
+	if client != nil {
+		client.beforeRequestMu.Lock()
+		client.beforeRequest = hook
+		client.beforeRequestMu.Unlock()
+	}
 }
 
 func (client *Client) applyHeaders(request *fhttp.Request, overrides map[string]string) {

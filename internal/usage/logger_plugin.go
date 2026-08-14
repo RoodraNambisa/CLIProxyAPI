@@ -171,17 +171,22 @@ type authModelStats struct {
 
 // RequestDetail stores the timestamp, latency, and token usage for a single request.
 type RequestDetail struct {
-	Timestamp           time.Time  `json:"timestamp"`
-	LatencyMs           int64      `json:"latency_ms"`
-	Source              string     `json:"source"`
-	ClientIP            string     `json:"client_ip"`
-	AuthIndex           string     `json:"auth_index"`
-	RequestServiceTier  string     `json:"request_service_tier,omitempty"`
-	ResponseServiceTier string     `json:"response_service_tier,omitempty"`
-	Tokens              TokenStats `json:"tokens"`
-	Failed              bool       `json:"failed"`
-	Auxiliary           bool       `json:"auxiliary,omitempty"`
-	internalID          uint64
+	Timestamp               time.Time  `json:"timestamp"`
+	LatencyMs               int64      `json:"latency_ms"`
+	Source                  string     `json:"source"`
+	ClientIP                string     `json:"client_ip"`
+	AuthIndex               string     `json:"auth_index"`
+	RequestServiceTier      string     `json:"request_service_tier,omitempty"`
+	ResponseServiceTier     string     `json:"response_service_tier,omitempty"`
+	Tokens                  TokenStats `json:"tokens"`
+	Failed                  bool       `json:"failed"`
+	Auxiliary               bool       `json:"auxiliary,omitempty"`
+	FailureStage            string     `json:"failure_stage,omitempty"`
+	ErrorCode               string     `json:"error_code,omitempty"`
+	CredentialSelected      bool       `json:"credential_selected"`
+	UpstreamCommitted       bool       `json:"upstream_committed"`
+	AuthRequestSlotConsumed bool       `json:"auth_request_slot_consumed"`
+	internalID              uint64
 }
 
 // TokenStats captures the token usage breakdown for a request.
@@ -290,16 +295,21 @@ func (s *RequestStatistics) Record(ctx context.Context, record coreusage.Record)
 		modelName = "unknown"
 	}
 	requestDetail := RequestDetail{
-		Timestamp:           timestamp,
-		LatencyMs:           normaliseLatency(record.Latency),
-		Source:              record.Source,
-		ClientIP:            resolveClientIP(ctx),
-		AuthIndex:           record.AuthIndex,
-		RequestServiceTier:  strings.TrimSpace(record.RequestServiceTier),
-		ResponseServiceTier: strings.TrimSpace(record.ResponseServiceTier),
-		Tokens:              detail,
-		Failed:              failed,
-		Auxiliary:           record.Auxiliary,
+		Timestamp:               timestamp,
+		LatencyMs:               normaliseLatency(record.Latency),
+		Source:                  record.Source,
+		ClientIP:                resolveClientIP(ctx),
+		AuthIndex:               record.AuthIndex,
+		RequestServiceTier:      strings.TrimSpace(record.RequestServiceTier),
+		ResponseServiceTier:     strings.TrimSpace(record.ResponseServiceTier),
+		Tokens:                  detail,
+		Failed:                  failed,
+		Auxiliary:               record.Auxiliary,
+		FailureStage:            strings.TrimSpace(record.FailureStage),
+		ErrorCode:               strings.TrimSpace(record.ErrorCode),
+		CredentialSelected:      record.CredentialSelected,
+		UpstreamCommitted:       record.UpstreamCommitted,
+		AuthRequestSlotConsumed: record.AuthRequestSlotConsumed,
 	}
 	if requestDetail.ResponseServiceTier == "" {
 		requestDetail.ResponseServiceTier = strings.TrimSpace(record.Detail.ResponseServiceTier)

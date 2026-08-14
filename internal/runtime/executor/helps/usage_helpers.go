@@ -12,25 +12,29 @@ import (
 
 	"github.com/gin-gonic/gin"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/usage"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
 
 type UsageReporter struct {
-	provider           string
-	model              string
-	authID             string
-	authIndex          string
-	apiKey             string
-	source             string
-	requestServiceTier string
-	requestedAt        time.Time
-	mu                 sync.Mutex
-	published          bool
-	observedDetail     usage.Detail
-	observed           bool
-	observedAdditional []observedModelUsage
+	provider             string
+	model                string
+	authID               string
+	authIndex            string
+	apiKey               string
+	source               string
+	requestServiceTier   string
+	requestedAt          time.Time
+	mu                   sync.Mutex
+	published            bool
+	observedDetail       usage.Detail
+	observed             bool
+	observedAdditional   []observedModelUsage
+	executionDiagnostics *cliproxyexecutor.RequestExecutionDiagnostics
+	requestUsageOutcome  *cliproxyexecutor.RequestUsageOutcome
+	requestUsageAttempt  *cliproxyexecutor.RequestUsageAttempt
 }
 
 type observedModelUsage struct {
@@ -54,18 +58,35 @@ func NewExecutorUsageReporter(ctx context.Context, executor usageExecutor, model
 func NewUsageReporter(ctx context.Context, provider, model string, auth *cliproxyauth.Auth) *UsageReporter {
 	apiKey := APIKeyFromContext(ctx)
 	reporter := &UsageReporter{
-		provider:           provider,
-		model:              model,
-		requestedAt:        time.Now(),
-		apiKey:             apiKey,
-		source:             resolveUsageSource(auth, apiKey),
-		requestServiceTier: usage.ServiceTierFromContext(ctx),
+		provider:            provider,
+		model:               model,
+		requestedAt:         time.Now(),
+		apiKey:              apiKey,
+		source:              resolveUsageSource(auth, apiKey),
+		requestServiceTier:  usage.ServiceTierFromContext(ctx),
+		requestUsageOutcome: cliproxyexecutor.RequestUsageOutcomeFromContext(ctx),
+		requestUsageAttempt: cliproxyexecutor.RequestUsageAttemptFromContext(ctx),
 	}
 	if auth != nil {
 		reporter.authID = auth.ID
 		reporter.authIndex = auth.EnsureIndex()
 	}
 	return reporter
+}
+
+// SetExecutionDiagnostics attaches request-scoped execution ownership metadata.
+func (r *UsageReporter) SetExecutionDiagnostics(diagnostics *cliproxyexecutor.RequestExecutionDiagnostics) {
+	if r != nil {
+		r.executionDiagnostics = diagnostics
+	}
+}
+
+// SetRequestUsageOutcome coordinates primary records across internal auth
+// attempts that belong to one downstream request.
+func (r *UsageReporter) SetRequestUsageOutcome(outcome *cliproxyexecutor.RequestUsageOutcome) {
+	if r != nil {
+		r.requestUsageOutcome = outcome
+	}
 }
 
 // SetRequestServiceTierFromPayload records the translated upstream service tier.
@@ -244,15 +265,36 @@ func (r *UsageReporter) publishWithOutcome(ctx context.Context, detail usage.Det
 	r.observedAdditional = nil
 	r.mu.Unlock()
 
-	usage.PublishRecord(ctx, r.buildRecord(detail, failed))
-	if failed {
+	if !failed && r.executionDiagnostics != nil {
+		r.executionDiagnostics.ClearFailure()
+	}
+	primaryRecord := r.buildRecord(detail, failed)
+	additionalRecords := make([]usage.Record, 0, len(additional))
+	if !failed {
+		for i := range additional {
+			record := r.buildRecordForModel(additional[i].model, additional[i].detail, false)
+			record.Auxiliary = true
+			additionalRecords = append(additionalRecords, record)
+		}
+	}
+	publish := func() {
+		usage.PublishRecord(ctx, primaryRecord)
+		if failed {
+			return
+		}
+		for i := range additionalRecords {
+			usage.PublishRecord(ctx, additionalRecords[i])
+		}
+	}
+	if r.requestUsageOutcome == nil {
+		publish()
 		return
 	}
-	for i := range additional {
-		record := r.buildRecordForModel(additional[i].model, additional[i].detail, false)
-		record.Auxiliary = true
-		usage.PublishRecord(ctx, record)
+	if failed {
+		r.requestUsageOutcome.StageFailureForAttempt(r.requestUsageAttempt, publish)
+		return
 	}
+	r.requestUsageOutcome.PublishSuccessForAttempt(r.requestUsageAttempt, publish)
 }
 
 func normalizeUsageDetailTotal(detail usage.Detail) usage.Detail {
@@ -298,7 +340,7 @@ func (r *UsageReporter) buildRecordForModel(model string, detail usage.Detail, f
 	if r == nil {
 		return usage.Record{Model: model, Detail: detail, Failed: failed}
 	}
-	return usage.Record{
+	record := usage.Record{
 		Provider:            r.provider,
 		Model:               model,
 		Source:              r.source,
@@ -312,6 +354,15 @@ func (r *UsageReporter) buildRecordForModel(model string, detail usage.Detail, f
 		Failed:              failed,
 		Detail:              detail,
 	}
+	if r.executionDiagnostics != nil {
+		diagnostics := r.executionDiagnostics.Snapshot()
+		record.FailureStage = diagnostics.FailureStage
+		record.ErrorCode = diagnostics.ErrorCode
+		record.CredentialSelected = diagnostics.CredentialSelected
+		record.UpstreamCommitted = diagnostics.UpstreamCommitted
+		record.AuthRequestSlotConsumed = diagnostics.AuthRequestSlotConsumed
+	}
+	return record
 }
 
 func extractServiceTierFromPayload(payload []byte) (string, bool) {

@@ -39,6 +39,8 @@ func newCleanupQuarantineExecutor(provider string) *cleanupQuarantineExecutor {
 
 func (e *cleanupQuarantineExecutor) Identifier() string { return e.provider }
 
+func (e *cleanupQuarantineExecutor) DeferAuthRequestCommitUntilUpstream() bool { return true }
+
 func (e *cleanupQuarantineExecutor) Execute(ctx context.Context, auth *Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
 	if e.executeCalls.Add(1) == 1 {
 		close(e.firstStarted)
@@ -162,13 +164,16 @@ func runCleanupQuarantineReselectionTest(t *testing.T, strictAffinity bool, invo
 	}
 
 	manager := NewManager(nil, selector, nil)
+	routing := internalconfig.RoutingConfig{
+		SessionAffinity:             strictAffinity,
+		PerAuthRequestLimit:         1,
+		PerAuthRequestWindowMinutes: 5,
+	}
 	if strictAffinity {
 		failover := false
-		manager.SetConfig(&internalconfig.Config{Routing: internalconfig.RoutingConfig{
-			SessionAffinity:         true,
-			SessionAffinityFailover: &failover,
-		}})
+		routing.SessionAffinityFailover = &failover
 	}
+	manager.SetConfig(&internalconfig.Config{Routing: routing})
 	manager.SetRetryConfig(0, 0, 1)
 	executor := newCleanupQuarantineExecutor(provider)
 	t.Cleanup(executor.releaseCleanup)

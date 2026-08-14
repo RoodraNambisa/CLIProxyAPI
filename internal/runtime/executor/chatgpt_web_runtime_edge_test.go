@@ -28,6 +28,7 @@ import (
 	"github.com/gin-gonic/gin"
 	chatgptwebauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/chatgptweb"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor/helps"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
@@ -36,6 +37,35 @@ import (
 )
 
 type chatGPTWebBrokenErrorBody struct{}
+
+type chatGPTWebPreflightFallbackExecutor struct {
+	calls atomic.Int32
+}
+
+func (*chatGPTWebPreflightFallbackExecutor) Identifier() string { return "test" }
+
+func (e *chatGPTWebPreflightFallbackExecutor) Execute(context.Context, *cliproxyauth.Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	e.calls.Add(1)
+	return cliproxyexecutor.Response{}, nil
+}
+
+func (e *chatGPTWebPreflightFallbackExecutor) ExecuteStream(context.Context, *cliproxyauth.Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
+	e.calls.Add(1)
+	return &cliproxyexecutor.StreamResult{}, nil
+}
+
+func (*chatGPTWebPreflightFallbackExecutor) Refresh(_ context.Context, auth *cliproxyauth.Auth) (*cliproxyauth.Auth, error) {
+	return auth, nil
+}
+
+func (e *chatGPTWebPreflightFallbackExecutor) CountTokens(context.Context, *cliproxyauth.Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	e.calls.Add(1)
+	return cliproxyexecutor.Response{}, nil
+}
+
+func (*chatGPTWebPreflightFallbackExecutor) HttpRequest(context.Context, *cliproxyauth.Auth, *http.Request) (*http.Response, error) {
+	return nil, errors.New("unexpected direct HTTP request")
+}
 
 type chatGPTWebTrackedBody struct {
 	io.Reader
@@ -4431,6 +4461,152 @@ func TestChatGPTWebUnsupportedFunctionToolRequestsProviderFallback(t *testing.T)
 	}
 }
 
+func TestChatGPTWebPrepareProviderRequestClassifiesMalformedJSONAsGlobalInvalid(t *testing.T) {
+	executor := NewChatGPTWebExecutor(nil, nil)
+	t.Cleanup(func() { _ = executor.Close() })
+	request := cliproxyexecutor.Request{Model: "gpt-5", Payload: []byte(`{"broken":`)}
+	opts := cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatCodex}
+
+	_, errPrepare := executor.PrepareProviderRequest(t.Context(), request, opts, cliproxyexecutor.RequestOperationExecute)
+	if errPrepare == nil {
+		t.Fatal("PrepareProviderRequest() error = nil, want malformed JSON error")
+	}
+	if scope := cliproxyexecutor.ProviderRequestPreparationScopeOf(errPrepare); scope != cliproxyexecutor.ProviderRequestPreparationGlobalInvalid {
+		t.Fatalf("preflight scope = %q, want %q", scope, cliproxyexecutor.ProviderRequestPreparationGlobalInvalid)
+	}
+
+	manager, fallback := newChatGPTWebPreflightRoutingManager(t, executor)
+	var selected atomic.Int32
+	opts.Metadata = map[string]any{
+		cliproxyexecutor.SelectedAuthCallbackMetadataKey: func(string) { selected.Add(1) },
+	}
+	if _, errExecute := manager.Execute(t.Context(), []string{"chatgpt-web", "test"}, request, opts); errExecute == nil {
+		t.Fatal("Execute() error = nil, want malformed JSON error")
+	}
+	if got := selected.Load(); got != 0 {
+		t.Fatalf("selected credentials = %d, want 0", got)
+	}
+	if got := fallback.calls.Load(); got != 0 {
+		t.Fatalf("fallback calls = %d, want 0", got)
+	}
+}
+
+func TestChatGPTWebPrepareProviderRequestClassifiesUnsupportedFunctionAsProviderIncompatible(t *testing.T) {
+	executor := NewChatGPTWebExecutor(nil, nil)
+	t.Cleanup(func() { _ = executor.Close() })
+	request := cliproxyexecutor.Request{
+		Model:   "gpt-5",
+		Payload: []byte(`{"model":"gpt-5","input":"hello","tools":[{"type":"function","name":"lookup"}]}`),
+	}
+	opts := cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatCodex}
+
+	_, errPrepare := executor.PrepareProviderRequest(t.Context(), request, opts, cliproxyexecutor.RequestOperationExecute)
+	if errPrepare == nil {
+		t.Fatal("PrepareProviderRequest() error = nil, want provider incompatibility")
+	}
+	if scope := cliproxyexecutor.ProviderRequestPreparationScopeOf(errPrepare); scope != cliproxyexecutor.ProviderRequestPreparationProviderIncompatible {
+		t.Fatalf("preflight scope = %q, want %q", scope, cliproxyexecutor.ProviderRequestPreparationProviderIncompatible)
+	}
+
+	manager, fallback := newChatGPTWebPreflightRoutingManager(t, executor)
+	var selected atomic.Int32
+	opts.Metadata = map[string]any{
+		cliproxyexecutor.SelectedAuthCallbackMetadataKey: func(string) { selected.Add(1) },
+	}
+	if _, errExecute := manager.Execute(t.Context(), []string{"chatgpt-web", "test"}, request, opts); errExecute != nil {
+		t.Fatalf("Execute() error = %v", errExecute)
+	}
+	if got := selected.Load(); got != 1 {
+		t.Fatalf("selected credentials = %d, want 1 fallback credential", got)
+	}
+	if got := fallback.calls.Load(); got != 1 {
+		t.Fatalf("fallback calls = %d, want 1", got)
+	}
+}
+
+func TestChatGPTWebPrepareProviderRequestCountSkipsWebWithoutSelectionOrSlot(t *testing.T) {
+	executor := NewChatGPTWebExecutor(nil, nil)
+	t.Cleanup(func() { _ = executor.Close() })
+	request := cliproxyexecutor.Request{Model: "gpt-5", Payload: []byte(`{"broken":`)}
+	opts := cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatCodex}
+
+	_, errPrepare := executor.PrepareProviderRequest(t.Context(), request, opts, cliproxyexecutor.RequestOperationCount)
+	if errPrepare == nil {
+		t.Fatal("PrepareProviderRequest() error = nil, want protocol unavailable")
+	}
+	if scope := cliproxyexecutor.ProviderRequestPreparationScopeOf(errPrepare); scope != cliproxyexecutor.ProviderRequestPreparationProviderIncompatible {
+		t.Fatalf("preflight scope = %q, want %q", scope, cliproxyexecutor.ProviderRequestPreparationProviderIncompatible)
+	}
+	if !strings.Contains(errPrepare.Error(), "protocol is not available") {
+		t.Fatalf("PrepareProviderRequest() error = %v", errPrepare)
+	}
+
+	manager, fallback := newChatGPTWebPreflightRoutingManager(t, executor)
+	var selected atomic.Int32
+	opts.Metadata = map[string]any{
+		cliproxyexecutor.SelectedAuthCallbackMetadataKey: func(string) { selected.Add(1) },
+	}
+	if _, errCount := manager.ExecuteCount(t.Context(), []string{"chatgpt-web"}, request, opts); errCount == nil {
+		t.Fatal("ExecuteCount() error = nil, want protocol unavailable")
+	}
+	if got := selected.Load(); got != 0 {
+		t.Fatalf("selected credentials = %d, want 0", got)
+	}
+	if got := fallback.calls.Load(); got != 0 {
+		t.Fatalf("fallback calls = %d, want 0", got)
+	}
+	metrics := manager.RequestExecutionMetrics()
+	if metrics.AuthSlotReserved != 0 || metrics.UpstreamCommitted != 0 || metrics.AuthRequestLimited != 0 {
+		t.Fatalf("request metrics = %+v, want no selected or consumed Web slot", metrics)
+	}
+}
+
+func TestChatGPTWebPrepareProviderRequestCountFallsBackToCompatibleProvider(t *testing.T) {
+	executor := NewChatGPTWebExecutor(nil, nil)
+	t.Cleanup(func() { _ = executor.Close() })
+	manager, fallback := newChatGPTWebPreflightRoutingManager(t, executor)
+	request := cliproxyexecutor.Request{Model: "gpt-5", Payload: []byte(`{"broken":`)}
+	opts := cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FormatCodex,
+		Metadata: map[string]any{
+			cliproxyexecutor.SelectedAuthCallbackMetadataKey: func(string) {},
+		},
+	}
+	var selected atomic.Int32
+	opts.Metadata[cliproxyexecutor.SelectedAuthCallbackMetadataKey] = func(string) { selected.Add(1) }
+
+	if _, errCount := manager.ExecuteCount(t.Context(), []string{"chatgpt-web", "test"}, request, opts); errCount != nil {
+		t.Fatalf("ExecuteCount() error = %v", errCount)
+	}
+	if got := selected.Load(); got != 1 {
+		t.Fatalf("selected credentials = %d, want only fallback credential", got)
+	}
+	if got := fallback.calls.Load(); got != 1 {
+		t.Fatalf("fallback calls = %d, want 1", got)
+	}
+}
+
+func newChatGPTWebPreflightRoutingManager(t *testing.T, webExecutor *ChatGPTWebExecutor) (*cliproxyauth.Manager, *chatGPTWebPreflightFallbackExecutor) {
+	t.Helper()
+	fallback := &chatGPTWebPreflightFallbackExecutor{}
+	manager := cliproxyauth.NewManager(nil, &cliproxyauth.FillFirstSelector{}, nil)
+	manager.RegisterExecutor(webExecutor)
+	manager.RegisterExecutor(fallback)
+	manager.SetRetryConfig(0, 0, 0)
+	for _, auth := range []*cliproxyauth.Auth{
+		{ID: "preflight-web-auth", Provider: "chatgpt-web", Status: cliproxyauth.StatusActive},
+		{ID: "preflight-fallback-auth", Provider: "test", Status: cliproxyauth.StatusActive},
+	} {
+		registry.GetGlobalRegistry().RegisterClient(auth.ID, auth.Provider, []*registry.ModelInfo{{ID: "gpt-5"}})
+		authID := auth.ID
+		t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(authID) })
+		if _, errRegister := manager.Register(cliproxyauth.WithSkipPersist(t.Context()), auth); errRegister != nil {
+			t.Fatalf("Register(%s) error = %v", auth.ID, errRegister)
+		}
+	}
+	return manager, fallback
+}
+
 func TestChatGPTWebUnsupportedSearchImageRequestsProviderFallback(t *testing.T) {
 	executor := NewChatGPTWebExecutor(nil, nil)
 	_, err := executor.Execute(context.Background(), chatGPTWebRuntimeAuth(), cliproxyexecutor.Request{
@@ -6800,6 +6976,115 @@ func TestChatGPTWebExecutorImageEditUploadsCompositedMask(t *testing.T) {
 	_, _, _, secondAlpha := decoded.At(1, 0).RGBA()
 	if firstAlpha != 0 || secondAlpha != 0xffff {
 		t.Fatalf("uploaded alpha = (%d, %d)", firstAlpha, secondAlpha)
+	}
+}
+
+func TestChatGPTWebImageMaskIsCompositedDuringPreflight(t *testing.T) {
+	executor := NewChatGPTWebExecutor(nil, nil)
+	t.Cleanup(func() { _ = executor.Close() })
+	input := chatGPTWebPNGDataURL(t, color.NRGBA{R: 255, A: 255}, color.NRGBA{G: 255, A: 255})
+	mask := chatGPTWebPNGDataURL(t, color.NRGBA{A: 0}, color.NRGBA{A: 255})
+	payload := []byte(`{
+		"model":"gpt-image-2",
+		"input":[{"role":"user","content":[
+			{"type":"input_text","text":"edit"},
+			{"type":"input_image","image_url":"` + input + `"}
+		]}],
+		"tools":[{"type":"image_generation","input_image_mask":{"image_url":"` + mask + `"}}]
+	}`)
+
+	template, err := executor.prepareRuntimeRequestTemplate(t.Context(), cliproxyexecutor.Request{
+		Model: "gpt-image-2", Payload: payload,
+	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatCodex, ResponseFormat: sdktranslator.FormatCodex}, false)
+	if err != nil {
+		t.Fatalf("prepareRuntimeRequestTemplate() error = %v", err)
+	}
+	if template.request.Image == nil {
+		t.Fatal("prepared image request = nil")
+	}
+	if template.request.Image.MaskURL != "" {
+		t.Fatalf("prepared mask URL was not consumed: %q", template.request.Image.MaskURL)
+	}
+	if len(template.request.Image.Images) != 1 || template.request.Image.Images[0] == input {
+		t.Fatalf("prepared images = %#v, want one composited image", template.request.Image.Images)
+	}
+	composited, _, err := decodeChatGPTWebImageReference(template.request.Image.Images[0])
+	if err != nil {
+		t.Fatalf("decode composited image: %v", err)
+	}
+	decoded, err := png.Decode(bytes.NewReader(composited))
+	if err != nil {
+		t.Fatalf("decode composited PNG: %v", err)
+	}
+	_, _, _, firstAlpha := decoded.At(0, 0).RGBA()
+	_, _, _, secondAlpha := decoded.At(1, 0).RGBA()
+	if firstAlpha != 0 || secondAlpha != 0xffff {
+		t.Fatalf("composited alpha = (%d, %d), want (0, 65535)", firstAlpha, secondAlpha)
+	}
+}
+
+func TestChatGPTWebImageMaskCompositeIsRevalidatedDuringPreflight(t *testing.T) {
+	source := image.NewNRGBA(image.Rect(0, 0, 64, 64))
+	for y := 0; y < 64; y++ {
+		for x := 0; x < 64; x++ {
+			source.SetNRGBA(x, y, color.NRGBA{
+				R: uint8((x*37 + y*17) & 0xff),
+				G: uint8((x*11 + y*53) & 0xff),
+				B: uint8((x*71 + y*29) & 0xff),
+				A: 255,
+			})
+		}
+	}
+	var jpegData bytes.Buffer
+	if err := jpeg.Encode(&jpegData, source, &jpeg.Options{Quality: 20}); err != nil {
+		t.Fatalf("encode input JPEG: %v", err)
+	}
+	input := "data:image/jpeg;base64," + base64.StdEncoding.EncodeToString(jpegData.Bytes())
+
+	maskImage := image.NewNRGBA(image.Rect(0, 0, 64, 64))
+	for y := 0; y < 64; y++ {
+		for x := 0; x < 64; x++ {
+			maskImage.SetNRGBA(x, y, color.NRGBA{A: uint8((x*19 + y*23) & 0xff)})
+		}
+	}
+	var maskData bytes.Buffer
+	if err := png.Encode(&maskData, maskImage); err != nil {
+		t.Fatalf("encode mask PNG: %v", err)
+	}
+	mask := "data:image/png;base64," + base64.StdEncoding.EncodeToString(maskData.Bytes())
+	composited, err := compositeChatGPTWebMask(input, mask)
+	if err != nil {
+		t.Fatalf("compositeChatGPTWebMask() error = %v", err)
+	}
+	inputBytes, err := helps.ChatGPTWebEncodedImageSize(input, 1<<20)
+	if err != nil {
+		t.Fatalf("input size: %v", err)
+	}
+	maskBytes, err := helps.ChatGPTWebEncodedImageSize(mask, 1<<20)
+	if err != nil {
+		t.Fatalf("mask size: %v", err)
+	}
+	compositedBytes, err := helps.ChatGPTWebEncodedImageSize(composited, 1<<20)
+	if err != nil {
+		t.Fatalf("composited size: %v", err)
+	}
+	individualLimit := max(inputBytes, maskBytes)
+	if compositedBytes <= individualLimit {
+		t.Fatalf("fixture composite size = %d, want greater than individual limit %d", compositedBytes, individualLimit)
+	}
+
+	request := &helps.ChatGPTWebImageRequest{
+		Images:         []string{input},
+		MaskURL:        mask,
+		MaskImageIndex: 0,
+	}
+	err = prepareChatGPTWebImageMaskWithLimits(request, individualLimit, individualLimit*2)
+	if err == nil {
+		t.Fatal("prepareChatGPTWebImageMaskWithLimits() error = nil")
+	}
+	var status interface{ StatusCode() int }
+	if !errors.As(err, &status) || status.StatusCode() != http.StatusRequestEntityTooLarge {
+		t.Fatalf("preflight error = %v, want HTTP 413", err)
 	}
 }
 

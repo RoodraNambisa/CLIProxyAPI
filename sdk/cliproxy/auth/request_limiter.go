@@ -332,7 +332,7 @@ func (l *authRequestWindowLimiter) reserveAt(authID string, policy authRequestLi
 	}, true, authRequestLimitBlock{}
 }
 
-func (m *Manager) acquireAdditionalAuthRequest(auth *Auth, requestSlot *cliproxyexecutor.AuthRequestSlot) error {
+func (m *Manager) acquireAdditionalAuthRequest(auth *Auth, executor ProviderExecutor, requestSlot *cliproxyexecutor.AuthRequestSlot) error {
 	if m == nil || auth == nil {
 		return nil
 	}
@@ -348,7 +348,7 @@ func (m *Manager) acquireAdditionalAuthRequest(auth *Auth, requestSlot *cliproxy
 		policy.requestSlot = requestSlot
 		acquired, block := limiter.tryAcquireAt(auth.ID, policy, limiter.nowTime())
 		if acquired {
-			commitImmediateAuthRequestReservation(auth, requestSlot)
+			commitImmediateAuthRequestReservation(executor, requestSlot)
 			return nil
 		}
 		if block.stalePolicy {
@@ -358,13 +358,14 @@ func (m *Manager) acquireAdditionalAuthRequest(auth *Auth, requestSlot *cliproxy
 	}
 }
 
-func commitImmediateAuthRequestReservation(auth *Auth, requestSlot *cliproxyexecutor.AuthRequestSlot) {
-	if auth == nil || requestSlot == nil {
+func commitImmediateAuthRequestReservation(executor ProviderExecutor, requestSlot *cliproxyexecutor.AuthRequestSlot) {
+	if requestSlot == nil {
 		return
 	}
-	if !strings.EqualFold(strings.TrimSpace(auth.Provider), "chatgpt-web") {
-		requestSlot.Commit()
+	if deferred, ok := executor.(DeferredAuthRequestCommitter); ok && deferred.DeferAuthRequestCommitUntilUpstream() {
+		return
 	}
+	requestSlot.Commit()
 }
 
 type authRequestLimitBlock struct {

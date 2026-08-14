@@ -261,10 +261,13 @@ func (e *chatGPTWebImageQuotaResultError) RetryOtherAuth() bool {
 	return e != nil && chatGPTWebImageResultRetryOtherAuth(e.cause)
 }
 
-func chatGPTWebImageRequestError(err error) error {
+func chatGPTWebImageRequestError(err error) (projectedError error) {
 	if err == nil {
 		return nil
 	}
+	defer func() {
+		projectedError = preserveChatGPTWebFailureStage(err, projectedError)
+	}()
 	var projected *chatGPTWebImageQuotaResultError
 	if errors.As(err, &projected) {
 		return err
@@ -567,26 +570,6 @@ func (e *ChatGPTWebExecutor) beginChatGPTWebImage(ctx context.Context, client *c
 	}
 	upstreamPrompt := chatGPTWebImageUpstreamPrompt(imageRequest.Prompt, imageRequest.Action, prepared.imageSizeMatch)
 	imageInputs := append([]string(nil), imageRequest.Images...)
-	if strings.TrimSpace(imageRequest.MaskURL) != "" {
-		if len(imageInputs) == 0 {
-			return nil, statusErr{code: http.StatusBadRequest, msg: "image mask requires an input image", skipAuthResult: true}
-		}
-		maskImageIndex := imageRequest.MaskImageIndex
-		if maskImageIndex < 0 || maskImageIndex >= len(imageInputs) {
-			return nil, statusErr{code: http.StatusBadRequest, msg: "image mask target is invalid", skipAuthResult: true}
-		}
-		composited, err := compositeChatGPTWebMask(imageInputs[maskImageIndex], imageRequest.MaskURL)
-		if err != nil {
-			var unsupportedTool *helps.ChatGPTWebUnsupportedToolError
-			return nil, statusErr{
-				code:           http.StatusBadRequest,
-				msg:            err.Error(),
-				skipAuthResult: true,
-				retryOtherAuth: errors.As(err, &unsupportedTool),
-			}
-		}
-		imageInputs[maskImageIndex] = composited
-	}
 	uploads := make([]chatGPTWebUploadedImage, 0, len(imageInputs))
 	inputIDs := make(map[string]struct{}, len(imageInputs))
 	for index, imageURL := range imageInputs {
@@ -641,7 +624,13 @@ func chatGPTWebImageUpstreamPrompt(prompt, action string, match *helps.ChatGPTWe
 	)
 }
 
-func (e *ChatGPTWebExecutor) finishChatGPTWebImage(ctx context.Context, client *chatgptwebauth.Client, credential *chatgptwebauth.Credential, prepared *chatGPTWebPreparedRequest, execution *chatGPTWebImageExecution) ([]byte, error) {
+func (e *ChatGPTWebExecutor) finishChatGPTWebImage(ctx context.Context, client *chatgptwebauth.Client, credential *chatgptwebauth.Credential, prepared *chatGPTWebPreparedRequest, execution *chatGPTWebImageExecution) (payload []byte, err error) {
+	failureStage := "settle"
+	defer func() {
+		if err != nil {
+			err = withChatGPTWebFailureStage(failureStage, err)
+		}
+	}()
 	if execution == nil || execution.response == nil {
 		return nil, errors.New("chatgpt web image execution is nil")
 	}
@@ -701,6 +690,7 @@ func (e *ChatGPTWebExecutor) finishChatGPTWebImage(ctx context.Context, client *
 			retryOtherAuth: true,
 		}
 	}
+	failureStage = "download"
 	responseByteLimit := chatGPTWebImageResponseByteLimit(prepared.imageConfigSnapshot)
 	images, err := e.downloadChatGPTWebImagesLimitedWithBudget(ctx, client, credential, accumulator, prepared.maxImageResults, responseByteLimit)
 	if prepared.imageResultState != nil && len(images) > 0 {
@@ -3272,10 +3262,13 @@ func chatGPTWebFinalAssetError(err error) error {
 	}
 }
 
-func chatGPTWebCommittedRequestError(ctx context.Context, err error) error {
+func chatGPTWebCommittedRequestError(ctx context.Context, err error) (committedError error) {
 	if err == nil {
 		return nil
 	}
+	defer func() {
+		committedError = preserveChatGPTWebFailureStage(err, committedError)
+	}()
 	if ctx != nil && ctx.Err() != nil {
 		return ctx.Err()
 	}
@@ -3647,6 +3640,44 @@ func validateChatGPTWebImageRequest(request *helps.ChatGPTWebImageRequest) error
 		}
 	}
 	if err := helps.ValidateChatGPTWebImageReferences(references, chatGPTWebMaxImageBytes, chatGPTWebMaxImageRequestBytes); err != nil {
+		return statusErr{
+			code:           http.StatusRequestEntityTooLarge,
+			msg:            err.Error(),
+			skipAuthResult: true,
+		}
+	}
+	return nil
+}
+
+func prepareChatGPTWebImageMask(request *helps.ChatGPTWebImageRequest) error {
+	return prepareChatGPTWebImageMaskWithLimits(request, chatGPTWebMaxImageBytes, chatGPTWebMaxImageRequestBytes)
+}
+
+func prepareChatGPTWebImageMaskWithLimits(request *helps.ChatGPTWebImageRequest, maxImageBytes, maxTotalBytes int) error {
+	if request == nil || strings.TrimSpace(request.MaskURL) == "" {
+		return nil
+	}
+	if len(request.Images) == 0 {
+		return statusErr{code: http.StatusBadRequest, msg: "image mask requires an input image", skipAuthResult: true}
+	}
+	maskImageIndex := request.MaskImageIndex
+	if maskImageIndex < 0 || maskImageIndex >= len(request.Images) {
+		return statusErr{code: http.StatusBadRequest, msg: "image mask target is invalid", skipAuthResult: true}
+	}
+	composited, err := compositeChatGPTWebMask(request.Images[maskImageIndex], request.MaskURL)
+	if err != nil {
+		var unsupportedTool *helps.ChatGPTWebUnsupportedToolError
+		return statusErr{
+			code:           http.StatusBadRequest,
+			msg:            err.Error(),
+			skipAuthResult: true,
+			retryOtherAuth: errors.As(err, &unsupportedTool),
+		}
+	}
+	request.Images = append([]string(nil), request.Images...)
+	request.Images[maskImageIndex] = composited
+	request.MaskURL = ""
+	if err := helps.ValidateChatGPTWebImageReferences(request.Images, maxImageBytes, maxTotalBytes); err != nil {
 		return statusErr{
 			code:           http.StatusRequestEntityTooLarge,
 			msg:            err.Error(),

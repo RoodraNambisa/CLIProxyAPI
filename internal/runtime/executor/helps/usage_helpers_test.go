@@ -3,10 +3,13 @@ package helps
 import (
 	"bytes"
 	"context"
+	"errors"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/usage"
 	"github.com/tidwall/gjson"
 )
@@ -348,6 +351,113 @@ func TestUsageReporterObservedUsageDoesNotHideTerminalFailure(t *testing.T) {
 	case <-time.After(50 * time.Millisecond):
 	}
 }
+
+func TestUsageReporterPublishesExecutionDiagnosticsSnapshot(t *testing.T) {
+	const authID = "usage-reporter-execution-diagnostics"
+	records := make(chan usage.Record, 1)
+	usage.RegisterPlugin(&usageReporterTestPlugin{authID: authID, records: records})
+	diagnostics := &cliproxyexecutor.RequestExecutionDiagnostics{}
+	reservation := &usageReporterTestReservation{consumed: true}
+	slot := &cliproxyexecutor.AuthRequestSlot{}
+	slot.SetDiagnostics(diagnostics)
+	slot.Bind(reservation)
+	if !slot.Commit() {
+		t.Fatal("Commit() = false, want true")
+	}
+	diagnostics.SetFailure("upstream", "http_500")
+
+	reporter := NewUsageReporter(context.Background(), "chatgpt-web", "gpt-image-2", &cliproxyauth.Auth{ID: authID})
+	reporter.SetExecutionDiagnostics(diagnostics)
+	reporter.PublishFailure(context.Background(), errors.New("upstream failed"))
+
+	select {
+	case record := <-records:
+		if record.FailureStage != "upstream" || record.ErrorCode != "http_500" {
+			t.Fatalf("failure diagnostics = stage:%q code:%q", record.FailureStage, record.ErrorCode)
+		}
+		if !record.CredentialSelected || !record.UpstreamCommitted || !record.AuthRequestSlotConsumed {
+			t.Fatalf("execution diagnostics = %+v", record)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for usage record")
+	}
+}
+
+func TestUsageReporterStagesFrozenFailureSnapshot(t *testing.T) {
+	const authID = "usage-reporter-frozen-failure"
+	records := make(chan usage.Record, 1)
+	usage.RegisterPlugin(&usageReporterTestPlugin{authID: authID, records: records})
+	diagnostics := &cliproxyexecutor.RequestExecutionDiagnostics{}
+	outcome := &cliproxyexecutor.RequestUsageOutcome{}
+	diagnostics.SetFailure("selection", "proxy_unavailable")
+
+	reporter := NewUsageReporter(context.Background(), "chatgpt-web", "gpt-5", &cliproxyauth.Auth{ID: authID})
+	reporter.SetExecutionDiagnostics(diagnostics)
+	reporter.SetRequestUsageOutcome(outcome)
+	reporter.PublishFailure(context.Background(), errors.New("first attempt failed"))
+
+	diagnostics.SetFailure("upstream", "http_500")
+	outcome.FinalizeFailure()
+
+	select {
+	case record := <-records:
+		if record.FailureStage != "selection" || record.ErrorCode != "proxy_unavailable" {
+			t.Fatalf("staged diagnostics = stage:%q code:%q", record.FailureStage, record.ErrorCode)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for staged usage record")
+	}
+}
+
+func TestUsageReporterSupersededFailurePublishesOnlySuccess(t *testing.T) {
+	const authID = "usage-reporter-retry-success"
+	records := make(chan usage.Record, 2)
+	usage.RegisterPlugin(&usageReporterTestPlugin{authID: authID, records: records})
+	diagnostics := &cliproxyexecutor.RequestExecutionDiagnostics{}
+	outcome := &cliproxyexecutor.RequestUsageOutcome{}
+	diagnostics.SetFailure("upstream", "http_500")
+
+	failed := NewUsageReporter(context.Background(), "chatgpt-web", "gpt-5", &cliproxyauth.Auth{ID: authID})
+	failed.SetExecutionDiagnostics(diagnostics)
+	failed.SetRequestUsageOutcome(outcome)
+	failed.PublishFailure(context.Background(), errors.New("first attempt failed"))
+
+	succeeded := NewUsageReporter(context.Background(), "chatgpt-web", "gpt-5", &cliproxyauth.Auth{ID: authID})
+	succeeded.SetExecutionDiagnostics(diagnostics)
+	succeeded.SetRequestUsageOutcome(outcome)
+	succeeded.Publish(context.Background(), usage.Detail{InputTokens: 2, OutputTokens: 3})
+
+	select {
+	case record := <-records:
+		if record.Failed || record.FailureStage != "" || record.ErrorCode != "" {
+			t.Fatalf("final record = %+v, want clean success", record)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for success usage record")
+	}
+	select {
+	case record := <-records:
+		t.Fatalf("received superseded failure record: %+v", record)
+	case <-time.After(50 * time.Millisecond):
+	}
+}
+
+type usageReporterTestReservation struct {
+	state    atomic.Uint32
+	consumed bool
+}
+
+func (r *usageReporterTestReservation) Commit() bool {
+	return r != nil && r.state.CompareAndSwap(0, 1)
+}
+
+func (r *usageReporterTestReservation) Release() bool {
+	return r != nil && r.state.CompareAndSwap(0, 2)
+}
+
+func (r *usageReporterTestReservation) Reserved() bool  { return r != nil && r.state.Load() == 0 }
+func (r *usageReporterTestReservation) Committed() bool { return r != nil && r.state.Load() == 1 }
+func (r *usageReporterTestReservation) Consumed() bool  { return r != nil && r.consumed }
 
 func TestUsageReporterObserveMergesSplitStreamUsage(t *testing.T) {
 	reporter := &UsageReporter{}
