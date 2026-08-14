@@ -27,6 +27,7 @@ type advancedSecurityLoginFixture struct {
 	finalizeCalls      int
 	ordinaryCalls      int
 	verifiedKeyID      string
+	staleSessionSeen   bool
 	verifyStatus       int
 	verifyCode         string
 	dropVerifyResponse bool
@@ -57,6 +58,11 @@ func newAdvancedSecurityLoginFixture(t *testing.T, allowedID string, finalize bo
 }
 
 func (fixture *advancedSecurityLoginFixture) serveHTTP(response http.ResponseWriter, request *http.Request) {
+	if cookie, errCookie := request.Cookie("next-auth.session-token"); errCookie == nil && cookie.Value == "stale-session" {
+		fixture.mu.Lock()
+		fixture.staleSessionSeen = true
+		fixture.mu.Unlock()
+	}
 	response.Header().Set("Content-Type", "application/json")
 	switch request.URL.Path {
 	case "/api/auth/csrf":
@@ -168,6 +174,45 @@ func (fixture *advancedSecurityLoginFixture) serveHTTP(response http.ResponseWri
 	default:
 		fixture.t.Errorf("unexpected advanced security request: %s %s", request.Method, request.URL.String())
 		http.NotFound(response, request)
+	}
+}
+
+func TestServiceAdvancedSecurityLoginStartsWithIsolatedCookieJar(t *testing.T) {
+	fixedNow := time.Date(2026, time.August, 14, 12, 0, 0, 0, time.UTC)
+	aas := testAdvancedAccountSecurityCredential(t)
+	fixture := newAdvancedSecurityLoginFixture(t, aas.Passkeys[0].Credential.CredentialID, false)
+	service := NewService(fixture.options(fixedNow))
+	staleCookies, errCookies := ParseCookieHeader("next-auth.session-token=stale-session", fixture.server.URL)
+	if errCookies != nil {
+		t.Fatal(errCookies)
+	}
+
+	_, errLogin := service.Login(t.Context(), LoginInput{
+		Credential: &Credential{
+			CredentialSchemaVersion: CredentialSchemaVersionAdvancedAccountSecurity,
+			Type:                    Provider,
+			Email:                   "person@example.com",
+			AccountID:               "account-1",
+			UserID:                  "user-1",
+			Cookies:                 staleCookies,
+			AdvancedAccountSecurity: aas,
+		},
+		Relogin: true,
+		PersistAdvancedAccountSecurity: func(_ context.Context, updated AdvancedAccountSecurityCredential) (AdvancedAccountSecurityCredential, error) {
+			fixture.mu.Lock()
+			fixture.persisted = true
+			fixture.mu.Unlock()
+			return *CloneAdvancedAccountSecurityCredential(&updated), nil
+		},
+	})
+	if errLogin != nil {
+		t.Fatalf("Login() error = %v", errLogin)
+	}
+	fixture.mu.Lock()
+	staleSessionSeen := fixture.staleSessionSeen
+	fixture.mu.Unlock()
+	if staleSessionSeen {
+		t.Fatal("AAS login sent a persisted NextAuth session cookie into the fresh OAuth flow")
 	}
 }
 

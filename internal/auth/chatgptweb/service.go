@@ -198,10 +198,20 @@ func (service *Service) loginOnce(acquisitionContext context.Context, input Logi
 		client *Client
 		err    error
 	)
+	loginCookies := credential.Cookies
+	if loginMethod == LoginMethodAdvancedSecurityPasskey {
+		// An AAS possession challenge belongs to the newly-created OAuth login
+		// session. Reusing persisted ChatGPT or auth.openai.com cookies can bind
+		// issue_method_challenge and verify to different/expired sessions, which
+		// the upstream reports as login_challenge_not_found_in_session or
+		// "Session ... Please start over". Start with an isolated jar and add the
+		// stable oai-did below, matching the enrollment validation flow.
+		loginCookies = nil
+	}
 	if selector != nil {
-		client, err = newLoginClient(credential.Persona, credential.Cookies, selector, acquisitionTimeout)
+		client, err = newLoginClient(credential.Persona, loginCookies, selector, acquisitionTimeout)
 	} else {
-		client, err = NewClient(credential.Persona, input.ProxyURL, credential.Cookies)
+		client, err = NewClient(credential.Persona, input.ProxyURL, loginCookies)
 		if err == nil {
 			client.loginRetry = &loginClientRetry{attempts: 1}
 		}
