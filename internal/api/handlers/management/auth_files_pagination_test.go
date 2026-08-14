@@ -25,6 +25,14 @@ func TestAuthFilesPaginationNegotiationFilteringAndSelection(t *testing.T) {
 	registerAuthFilesPaginationTestAuth(t, manager, authDir, "charlie.json", "claude", true, "", 0, false, "")
 	registerAuthFilesPaginationTestAuth(t, manager, authDir, "delta.json", "codex", false, "temporary_failure", 2, true, "pro")
 	registerAuthFilesPaginationTestAuth(t, manager, authDir, "echo.json", "xai", false, "", 0, false, "")
+	bravo, ok := manager.GetByID("bravo.json")
+	if !ok {
+		t.Fatal("bravo auth not found")
+	}
+	bravo.Metadata["email"] = "refill-curio-76@icloud.com"
+	if _, errUpdate := manager.Update(coreauth.WithSkipPersist(t.Context()), bravo); errUpdate != nil {
+		t.Fatal(errUpdate)
+	}
 	retiredPath := filepath.Join(authDir, "retired.json")
 	if errWrite := os.WriteFile(retiredPath, []byte(`{"type":"gemini","email":"legacy@example.com"}`), 0o600); errWrite != nil {
 		t.Fatal(errWrite)
@@ -80,6 +88,13 @@ func TestAuthFilesPaginationNegotiationFilteringAndSelection(t *testing.T) {
 	}
 	if len(pagedBody.Facets.Providers) != 5 || len(pagedBody.Facets.Priorities) != 3 {
 		t.Fatalf("facets = %#v", pagedBody.Facets)
+	}
+
+	emailSearch := performAuthFilesPaginationRequest(router, "/auth-files?paged=true&page=1&page_size=10&search=refill-curio-76%40icloud.com")
+	decodeAuthFilesPaginationResponse(t, emailSearch, &pagedBody)
+	if pagedBody.Total != 1 || strings.Join(authFilesPaginationNames(pagedBody.Files), ",") != "bravo.json" ||
+		pagedBody.Files[0]["email"] != "refill-curio-76@icloud.com" {
+		t.Fatalf("email search response = %#v", pagedBody)
 	}
 
 	filtered := performAuthFilesPaginationRequest(router, "/auth-files?paged=true&page=99&page_size=1&provider=codex&priority=2&sort=priority")

@@ -585,7 +585,7 @@ func authFileRecordForAuth(auth *coreauth.Auth, name string, runtimeOnly bool) *
 	plan = strings.ToLower(plan)
 	priority, prioritySet := authFilePriority(auth)
 	note := authFileNote(auth)
-	searchValues := []string{name, provider, plan, string(auth.Status), note, statusMessage}
+	searchValues := []string{name, provider, plan, string(auth.Status), note, statusMessage, authEmail(auth)}
 	if auth.LastError != nil {
 		searchValues = append(searchValues, auth.LastError.Code, auth.LastError.Message)
 	}
