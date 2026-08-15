@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -149,6 +150,45 @@ func TestCodexWebsocketSessionIdentityStaysStableAcrossTurns(t *testing.T) {
 	}
 	if got := headers.Get("X-Codex-Turn-Metadata"); got != gjson.GetBytes(payloads[0], "client_metadata.x-codex-turn-metadata").String() {
 		t.Fatalf("handshake/body turn metadata differ: header=%q body=%q", got, gjson.GetBytes(payloads[0], "client_metadata.x-codex-turn-metadata").String())
+	}
+}
+
+func TestCodexWebsocketDirectFallbackReusesPreparedSessionIdentity(t *testing.T) {
+	var websocketTurnID string
+	var httpTurnID string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.EqualFold(strings.TrimSpace(r.Header.Get("Upgrade")), "websocket") {
+			websocketTurnID = gjson.Get(r.Header.Get("X-Codex-Turn-Metadata"), "turn_id").String()
+			w.WriteHeader(http.StatusUpgradeRequired)
+			_, _ = w.Write([]byte(`{"error":{"message":"use HTTP"}}`))
+			return
+		}
+		body, _ := io.ReadAll(r.Body)
+		httpTurnMetadata := gjson.GetBytes(body, "client_metadata.x-codex-turn-metadata").String()
+		httpTurnID = gjson.Get(httpTurnMetadata, "turn_id").String()
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"object\":\"response\",\"status\":\"completed\",\"output\":[]}}\n\n"))
+	}))
+	defer server.Close()
+
+	exec := NewCodexWebsocketsExecutor(&config.Config{
+		Codex:     config.CodexConfig{SpoofSessionIdentity: true},
+		SDKConfig: sdkconfig.SDKConfig{ProxyURL: "direct"},
+	})
+	auth := &cliproxyauth.Auth{
+		ID: "oauth-ws-auth", Provider: "codex",
+		Metadata:   map[string]any{"access_token": "oauth-token"},
+		Attributes: map[string]string{"base_url": server.URL},
+	}
+	req := cliproxyexecutor.Request{Model: "gpt-5.4", Payload: []byte(`{"model":"gpt-5.4","input":"hello"}`)}
+	if _, err := exec.Execute(t.Context(), auth, req, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("codex")}); err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if websocketTurnID == "" || httpTurnID == "" {
+		t.Fatalf("turn IDs are empty: websocket=%q HTTP=%q", websocketTurnID, httpTurnID)
+	}
+	if websocketTurnID != httpTurnID {
+		t.Fatalf("fallback changed turn ID: websocket=%q HTTP=%q", websocketTurnID, httpTurnID)
 	}
 }
 

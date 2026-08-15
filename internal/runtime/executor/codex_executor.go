@@ -313,6 +313,7 @@ func NewCodexExecutor(cfg *config.Config) *CodexExecutor { return &CodexExecutor
 func (e *CodexExecutor) Identifier() string { return "codex" }
 
 type codexPreparedSessionIdentity struct {
+	Enabled     bool
 	SessionID   string
 	ThreadID    string
 	TurnID      string
@@ -325,8 +326,12 @@ var codexSessionIdentityNamespace = uuid.NewSHA1(uuid.NameSpaceURL, []byte("cli-
 // PrepareProviderRequest creates one immutable identity fallback shared by all
 // credential retries and transport fallbacks for the logical request.
 func (e *CodexExecutor) PrepareProviderRequest(ctx context.Context, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, operation cliproxyexecutor.RequestOperation) (any, error) {
-	if !codexSpoofSessionIdentityEnabled(e.cfg) || operation == cliproxyexecutor.RequestOperationCount {
+	if operation == cliproxyexecutor.RequestOperationCount {
 		return nil, nil
+	}
+	prepared := codexPreparedSessionIdentity{Enabled: codexSpoofSessionIdentityEnabled(e.cfg)}
+	if !prepared.Enabled {
+		return prepared, nil
 	}
 	payload := req.Payload
 	if len(opts.OriginalRequest) > 0 {
@@ -334,6 +339,7 @@ func (e *CodexExecutor) PrepareProviderRequest(ctx context.Context, req cliproxy
 	}
 	threadID := codexPreparedThreadID(ctx, opts, payload)
 	return codexPreparedSessionIdentity{
+		Enabled:     true,
 		SessionID:   threadID,
 		ThreadID:    threadID,
 		TurnID:      uuid.NewString(),
@@ -633,6 +639,10 @@ func (e *CodexExecutor) HttpRequest(ctx context.Context, auth *cliproxyauth.Auth
 
 func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (resp cliproxyexecutor.Response, err error) {
 	ctx = contextWithCodexFingerprintPersona(ctx, e.cfg, auth)
+	opts, err = e.ensureCodexPreparedSessionIdentity(ctx, req, opts, cliproxyexecutor.RequestOperationExecute)
+	if err != nil {
+		return resp, err
+	}
 	if isCodexOpenAIImageRequest(opts) {
 		return e.executeOpenAIImage(ctx, auth, req, opts)
 	}
@@ -954,6 +964,10 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 
 func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (_ *cliproxyexecutor.StreamResult, err error) {
 	ctx = contextWithCodexFingerprintPersona(ctx, e.cfg, auth)
+	opts, err = e.ensureCodexPreparedSessionIdentity(ctx, req, opts, cliproxyexecutor.RequestOperationStream)
+	if err != nil {
+		return nil, err
+	}
 	if isCodexOpenAIImageRequest(opts) {
 		return e.executeOpenAIImageStream(ctx, auth, req, opts)
 	}
@@ -1626,10 +1640,13 @@ func (e *CodexExecutor) projectCodexSessionIdentity(
 	rawJSON []byte,
 	identityConfuse *codexIdentityConfuseState,
 ) ([]byte, codexSessionIdentityState, error) {
-	if !codexSpoofSessionIdentityEnabled(e.cfg) || auth == nil || codexAuthUsesAPIKey(auth) {
+	if auth == nil || codexAuthUsesAPIKey(auth) {
 		return rawJSON, codexSessionIdentityState{}, nil
 	}
 	prepared := e.codexPreparedSessionIdentity(ctx, req, opts)
+	if !prepared.Enabled {
+		return rawJSON, codexSessionIdentityState{}, nil
+	}
 	defaults := helps.CodexSessionIdentity{
 		SessionID: prepared.SessionID, ThreadID: prepared.ThreadID, TurnID: prepared.TurnID,
 		WindowID: prepared.WindowID, RequestKind: prepared.RequestKind,
@@ -1725,6 +1742,17 @@ func (e *CodexExecutor) codexPreparedSessionIdentity(ctx context.Context, req cl
 	opaque, _ := e.PrepareProviderRequest(ctx, req, opts, operation)
 	prepared, _ := opaque.(codexPreparedSessionIdentity)
 	return prepared
+}
+
+func (e *CodexExecutor) ensureCodexPreparedSessionIdentity(ctx context.Context, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, operation cliproxyexecutor.RequestOperation) (cliproxyexecutor.Options, error) {
+	if _, ok := cliproxyexecutor.ProviderPreparedRequest(opts, e.Identifier()); ok {
+		return opts, nil
+	}
+	prepared, err := e.PrepareProviderRequest(ctx, req, opts, operation)
+	if err != nil {
+		return opts, err
+	}
+	return cliproxyexecutor.WithProviderPreparedRequest(opts, e.Identifier(), prepared), nil
 }
 
 func codexCredentialSessionIdentitySource(auth *cliproxyauth.Auth) helps.CodexSessionIdentityHeaderSource {

@@ -25,8 +25,41 @@ func TestCodexPrepareProviderRequestDisabled(t *testing.T) {
 	if err != nil {
 		t.Fatalf("PrepareProviderRequest() error = %v", err)
 	}
-	if prepared != nil {
-		t.Fatalf("PrepareProviderRequest() = %#v, want nil", prepared)
+	identity, ok := prepared.(codexPreparedSessionIdentity)
+	if !ok || identity.Enabled {
+		t.Fatalf("PrepareProviderRequest() = %#v, want disabled identity snapshot", prepared)
+	}
+}
+
+func TestCodexPreparedSessionIdentitySnapshotsEnabledState(t *testing.T) {
+	auth := &cliproxyauth.Auth{Provider: "codex", Metadata: map[string]any{"access_token": "oauth-token"}}
+	req := cliproxyexecutor.Request{Payload: []byte(`{"prompt_cache_key":"cache-key"}`)}
+
+	enabledCfg := &config.Config{Codex: config.CodexConfig{SpoofSessionIdentity: true}}
+	enabledExecutor := NewCodexExecutor(enabledCfg)
+	enabledPrepared, err := enabledExecutor.PrepareProviderRequest(t.Context(), req, cliproxyexecutor.Options{}, cliproxyexecutor.RequestOperationExecute)
+	if err != nil {
+		t.Fatalf("prepare enabled identity: %v", err)
+	}
+	enabledOpts := cliproxyexecutor.WithProviderPreparedRequest(cliproxyexecutor.Options{}, enabledExecutor.Identifier(), enabledPrepared)
+	enabledCfg.Codex.SpoofSessionIdentity = false
+	_, enabledState, err := enabledExecutor.projectCodexSessionIdentity(t.Context(), auth, req, enabledOpts, []byte(`{}`), &codexIdentityConfuseState{})
+	if err != nil || !enabledState.enabled {
+		t.Fatalf("enabled request after config change = %#v, %v; want projection enabled", enabledState, err)
+	}
+
+	disabledCfg := &config.Config{}
+	disabledExecutor := NewCodexExecutor(disabledCfg)
+	disabledPrepared, err := disabledExecutor.PrepareProviderRequest(t.Context(), req, cliproxyexecutor.Options{}, cliproxyexecutor.RequestOperationExecute)
+	if err != nil {
+		t.Fatalf("prepare disabled identity: %v", err)
+	}
+	disabledOpts := cliproxyexecutor.WithProviderPreparedRequest(cliproxyexecutor.Options{}, disabledExecutor.Identifier(), disabledPrepared)
+	disabledCfg.Codex.SpoofSessionIdentity = true
+	raw := []byte(`{"client_metadata":[]}`)
+	projected, disabledState, err := disabledExecutor.projectCodexSessionIdentity(t.Context(), auth, req, disabledOpts, raw, &codexIdentityConfuseState{})
+	if err != nil || disabledState.enabled || string(projected) != string(raw) {
+		t.Fatalf("disabled request after config change = %s, %#v, %v; want unchanged payload", projected, disabledState, err)
 	}
 }
 
@@ -115,6 +148,7 @@ func contextWithCodexTestAPIKey(apiKey string) context.Context {
 func TestCodexProjectSessionIdentityUsesIndependentSourcePriority(t *testing.T) {
 	executor := NewCodexExecutor(&config.Config{Codex: config.CodexConfig{SpoofSessionIdentity: true}})
 	prepared := codexPreparedSessionIdentity{
+		Enabled:   true,
 		SessionID: "default-session", ThreadID: "default-thread", TurnID: "default-turn",
 		WindowID: "default-thread:0", RequestKind: "turn",
 	}

@@ -227,6 +227,10 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 		ctx = context.Background()
 	}
 	ctx = contextWithCodexFingerprintPersona(ctx, e.cfg, auth)
+	opts, err = e.ensureCodexPreparedSessionIdentity(ctx, req, opts, cliproxyexecutor.RequestOperationExecute)
+	if err != nil {
+		return resp, err
+	}
 	if opts.Alt == "responses/compact" {
 		return e.CodexExecutor.executeCompact(ctx, auth, req, opts)
 	}
@@ -511,6 +515,10 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 		ctx = context.Background()
 	}
 	ctx = contextWithCodexFingerprintPersona(ctx, e.cfg, auth)
+	opts, err = e.ensureCodexPreparedSessionIdentity(ctx, req, opts, cliproxyexecutor.RequestOperationStream)
+	if err != nil {
+		return nil, err
+	}
 	if opts.Alt == "responses/compact" {
 		return nil, statusErr{code: http.StatusBadRequest, msg: "streaming not supported for /responses/compact"}
 	}
