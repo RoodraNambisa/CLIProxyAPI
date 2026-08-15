@@ -78,46 +78,55 @@ func ProjectCodexSessionIdentity(
 	bodyTurnID := codexRawJSONString(metadata["turn_id"])
 	bodyWindowID := codexRawJSONString(metadata["x-codex-window-id"])
 
+	sessionID := firstCodexIdentityValue(
+		admin.SessionID, codexTurnString(adminTurn, "session_id"),
+		confused.SessionID,
+		codexTurnString(bodyTurn, "session_id"), bodySessionID,
+		client.SessionID, codexTurnString(clientTurn, "session_id"),
+	)
+	threadID := firstCodexIdentityValue(
+		admin.ThreadID, codexTurnString(adminTurn, "thread_id"),
+		confused.ThreadID,
+		codexTurnString(bodyTurn, "thread_id"), bodyThreadID,
+		client.ThreadID, codexTurnString(clientTurn, "thread_id"),
+	)
+	usingDefaultIdentity := sessionID == "" && threadID == ""
+	if usingDefaultIdentity {
+		sessionID = firstCodexIdentityValue(defaults.SessionID)
+		threadID = firstCodexIdentityValue(defaults.ThreadID)
+	}
+	if threadID == "" {
+		threadID = sessionID
+	}
+	if sessionID == "" {
+		sessionID = threadID
+	}
+	windowID := firstCodexIdentityValue(
+		admin.WindowID, codexTurnString(adminTurn, "window_id"),
+		confused.WindowID,
+		codexTurnString(bodyTurn, "window_id"), bodyWindowID,
+		client.WindowID, codexTurnString(clientTurn, "window_id"),
+	)
+	if windowID == "" && usingDefaultIdentity {
+		windowID = firstCodexIdentityValue(defaults.WindowID)
+	}
+	if windowID == "" && threadID != "" {
+		windowID = threadID + ":0"
+	}
+
 	identity := CodexSessionIdentity{
-		SessionID: firstCodexIdentityValue(
-			admin.SessionID, codexTurnString(adminTurn, "session_id"),
-			confused.SessionID,
-			codexTurnString(bodyTurn, "session_id"), bodySessionID,
-			client.SessionID, codexTurnString(clientTurn, "session_id"),
-			defaults.SessionID,
-		),
-		ThreadID: firstCodexIdentityValue(
-			admin.ThreadID, codexTurnString(adminTurn, "thread_id"),
-			confused.ThreadID,
-			codexTurnString(bodyTurn, "thread_id"), bodyThreadID,
-			client.ThreadID, codexTurnString(clientTurn, "thread_id"),
-			defaults.ThreadID,
-		),
+		SessionID: sessionID,
+		ThreadID:  threadID,
 		TurnID: firstCodexIdentityValue(
 			codexTurnString(adminTurn, "turn_id"),
 			codexTurnString(bodyTurn, "turn_id"), bodyTurnID,
 			codexTurnString(clientTurn, "turn_id"), defaults.TurnID,
 		),
-		WindowID: firstCodexIdentityValue(
-			admin.WindowID, codexTurnString(adminTurn, "window_id"),
-			confused.WindowID,
-			codexTurnString(bodyTurn, "window_id"), bodyWindowID,
-			client.WindowID, codexTurnString(clientTurn, "window_id"),
-			defaults.WindowID,
-		),
+		WindowID: windowID,
 		RequestKind: firstCodexIdentityValue(
 			codexTurnString(adminTurn, "request_kind"), codexTurnString(bodyTurn, "request_kind"),
 			codexTurnString(clientTurn, "request_kind"), defaults.RequestKind,
 		),
-	}
-	if identity.ThreadID == "" {
-		identity.ThreadID = identity.SessionID
-	}
-	if identity.SessionID == "" {
-		identity.SessionID = identity.ThreadID
-	}
-	if identity.WindowID == "" && identity.ThreadID != "" {
-		identity.WindowID = identity.ThreadID + ":0"
 	}
 	if identity.RequestKind == "" {
 		identity.RequestKind = "turn"

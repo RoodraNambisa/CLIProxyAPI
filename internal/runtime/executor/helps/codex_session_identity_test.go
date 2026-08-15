@@ -80,6 +80,35 @@ func TestProjectCodexSessionIdentityUsesDocumentedPriority(t *testing.T) {
 	}
 }
 
+func TestProjectCodexSessionIdentityPairsPartialSessionAndThreadIdentity(t *testing.T) {
+	defaults := CodexSessionIdentity{
+		SessionID: "default-session", ThreadID: "default-thread", TurnID: "default-turn",
+		WindowID: "default-thread:0", RequestKind: "turn",
+	}
+	tests := []struct {
+		name    string
+		payload string
+		wantID  string
+	}{
+		{name: "thread only", payload: `{"client_metadata":{"thread_id":"explicit-thread"}}`, wantID: "explicit-thread"},
+		{name: "session only", payload: `{"client_metadata":{"session_id":"explicit-session"}}`, wantID: "explicit-session"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, identity, _, err := ProjectCodexSessionIdentity([]byte(tt.payload), CodexSessionIdentityHeaderSource{}, CodexSessionIdentityHeaderSource{}, CodexSessionIdentityHeaderSource{}, defaults)
+			if err != nil {
+				t.Fatalf("ProjectCodexSessionIdentity() error = %v", err)
+			}
+			if identity.SessionID != tt.wantID || identity.ThreadID != tt.wantID {
+				t.Fatalf("session/thread = %q/%q, want %q/%q", identity.SessionID, identity.ThreadID, tt.wantID, tt.wantID)
+			}
+			if wantWindow := tt.wantID + ":0"; identity.WindowID != wantWindow {
+				t.Fatalf("WindowID = %q, want %q", identity.WindowID, wantWindow)
+			}
+		})
+	}
+}
+
 func TestProjectCodexSessionIdentityRejectsMalformedMetadata(t *testing.T) {
 	defaults := CodexSessionIdentity{SessionID: "s", ThreadID: "t", TurnID: "u", WindowID: "w", RequestKind: "turn"}
 	tests := []struct {
