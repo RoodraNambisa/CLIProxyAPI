@@ -923,7 +923,12 @@ func (runtime *chatGPTWebAccountInfoRuntime) targetRequiresManualLifecycleBypass
 		return false
 	}
 	auth, ok := runtime.executor.manager.GetByID(strings.TrimSpace(target.AuthID))
-	if !ok || auth == nil || auth.LifecycleState() != cliproxyauth.LifecycleStateReauthRequired {
+	if !ok || auth == nil {
+		return false
+	}
+	switch auth.LifecycleState() {
+	case cliproxyauth.LifecycleStateReauthRequired, cliproxyauth.LifecycleStateInteractionRequired:
+	default:
 		return false
 	}
 	instanceID := strings.TrimSpace(target.AuthInstanceID)
@@ -4727,8 +4732,10 @@ func (e *ChatGPTWebExecutor) refreshChatGPTWebAccountInfoForInstance(
 		outcome.errorCode = "credential_unavailable"
 		return outcome
 	}
+	lifecycleState := auth.LifecycleState()
 	manualLifecycleBypass := chatGPTWebAccountInfoManualLifecycleBypass(ctx) &&
-		auth.LifecycleState() == cliproxyauth.LifecycleStateReauthRequired
+		(lifecycleState == cliproxyauth.LifecycleStateReauthRequired ||
+			lifecycleState == cliproxyauth.LifecycleStateInteractionRequired)
 	ctx = context.WithValue(
 		ctx,
 		chatGPTWebAccountInfoManualLifecycleBypassContextKey{},
@@ -4786,6 +4793,24 @@ func (e *ChatGPTWebExecutor) refreshChatGPTWebAccountInfoForInstance(
 	if errCredential != nil {
 		outcome.errorCode = "credential_unavailable"
 		return outcome
+	}
+	if failureCode, _ := classifyChatGPTWebAccountInfoErrors(profileErr, quotaErr); failureCode == "account_unverified" || failureCode == "interaction_required" {
+		auth, profileErr, quotaErr = e.markAccountInfoInteractionFailure(
+			ctx,
+			auth,
+			profileErr,
+			quotaErr,
+			failureCode,
+		)
+		if auth == nil {
+			outcome.errorCode = "credential_unavailable"
+			return outcome
+		}
+		credential, errCredential = chatgptwebauth.ParseCredential(auth.Metadata)
+		if errCredential != nil {
+			outcome.errorCode = "credential_unavailable"
+			return outcome
+		}
 	}
 	quotaObservation := captureChatGPTWebImageQuotaObservation(auth)
 	if errors.Is(ctx.Err(), context.Canceled) {
@@ -5126,6 +5151,56 @@ func (e *ChatGPTWebExecutor) markAccountInfoAuthenticationFailure(
 		profileErr = authError
 	}
 	if accountInfoUnauthorized(quotaErr) {
+		quotaErr = authError
+	}
+	return installed, profileErr, quotaErr
+}
+
+func (e *ChatGPTWebExecutor) markAccountInfoInteractionFailure(
+	ctx context.Context,
+	current *cliproxyauth.Auth,
+	profileErr error,
+	quotaErr error,
+	reason string,
+) (*cliproxyauth.Auth, error, error) {
+	if e == nil || e.manager == nil || current == nil {
+		return current, profileErr, quotaErr
+	}
+	reason = chatgptwebauth.SafeQuotaError(reason)
+	if reason != "account_unverified" {
+		reason = "interaction_required"
+	}
+	updated := current.Clone()
+	setChatGPTWebLifecycle(updated, cliproxyauth.LifecycleStateInteractionRequired, reason, e.currentTime())
+	persistContext := ctx
+	cancelPersist := func() {}
+	if e.accountInfo != nil {
+		persistContext, cancelPersist = e.accountInfo.persistenceContext(ctx)
+	}
+	defer cancelPersist()
+	installed, applied, errUpdate := e.manager.UpdateIfCurrent(persistContext, current, updated)
+	if errUpdate != nil {
+		log.WithFields(log.Fields{
+			"auth_id":    current.ID,
+			"error_code": "refresh_persist_backpressure",
+		}).WithError(errUpdate).Warn("chatgpt web account-info interaction state could not be persisted")
+		return current, profileErr, quotaErr
+	}
+	if !applied || installed == nil {
+		return current, profileErr, quotaErr
+	}
+	authError := &chatgptwebauth.AuthError{
+		Code:           reason,
+		State:          chatgptwebauth.LifecycleInteractionRequired,
+		LifecycleState: chatgptwebauth.LifecycleInteractionRequired,
+		Status:         http.StatusForbidden,
+		StatusCode:     http.StatusForbidden,
+		Terminal:       true,
+	}
+	if code, _ := classifyChatGPTWebAccountInfoError(profileErr); code == "account_unverified" || code == "interaction_required" {
+		profileErr = authError
+	}
+	if code, _ := classifyChatGPTWebAccountInfoError(quotaErr); code == "account_unverified" || code == "interaction_required" {
 		quotaErr = authError
 	}
 	return installed, profileErr, quotaErr

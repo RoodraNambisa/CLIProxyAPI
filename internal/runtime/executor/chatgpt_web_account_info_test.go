@@ -5681,6 +5681,86 @@ func TestClassifyChatGPTWebAccountInfoForbiddenAndInteractionStates(t *testing.T
 	}
 }
 
+func TestChatGPTWebAccountInfoUnverifiedPersistsInteractionUntilManualRecheck(t *testing.T) {
+	var verified atomic.Bool
+	var requestCount atomic.Int32
+	resetAt := time.Now().UTC().Add(time.Hour).Format(time.RFC3339)
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		requestCount.Add(1)
+		writer.Header().Set("Content-Type", "application/json")
+		if !verified.Load() {
+			writer.WriteHeader(http.StatusForbidden)
+			_, _ = io.WriteString(writer, `{"error":{"code":"email_unverified"}}`)
+			return
+		}
+		switch request.URL.Path {
+		case chatgptwebauth.AccountCheckPath:
+			_, _ = io.WriteString(writer, `{"accounts":{"default":{"account":{"account_id":"account-1","plan_type":"plus"}}}}`)
+		case chatgptwebauth.ConversationInitPath:
+			_ = json.NewEncoder(writer).Encode(map[string]any{"limits_progress": []any{
+				map[string]any{"feature_name": "image_gen", "remaining": 3, "reset_after": resetAt},
+			}})
+		default:
+			http.NotFound(writer, request)
+		}
+	}))
+	defer server.Close()
+
+	manager := cliproxyauth.NewManager(nil, nil, nil)
+	auth := chatGPTWebTestAuth("account-info-unverified")
+	if _, errRegister := manager.Register(cliproxyauth.WithSkipPersist(t.Context()), auth); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+	executor := NewChatGPTWebExecutor(&config.Config{}, manager)
+	executor.runtimeBaseURL = server.URL
+	t.Cleanup(func() { _ = executor.Close() })
+
+	outcome := executor.refreshChatGPTWebAccountInfo(t.Context(), auth.ID, true)
+	if outcome.errorCode != "account_unverified" || outcome.retryable {
+		t.Fatalf("unverified outcome = %+v", outcome)
+	}
+	if got := requestCount.Load(); got != 2 {
+		t.Fatalf("unverified request count = %d, want one profile and one quota request", got)
+	}
+	current, ok := manager.GetByID(auth.ID)
+	if !ok || current == nil {
+		t.Fatal("unverified auth missing")
+	}
+	if current.LifecycleState() != cliproxyauth.LifecycleStateInteractionRequired ||
+		current.Metadata["lifecycle_reason"] != "account_unverified" {
+		t.Fatalf("unverified lifecycle = %+v", current.Metadata)
+	}
+	target := chatgptwebauth.AccountInfoRefreshTarget{
+		AuthID:         current.ID,
+		AuthInstanceID: current.RuntimeInstanceID(),
+	}
+	if !executor.accountInfo.targetRequiresManualLifecycleBypass(target) {
+		t.Fatal("interaction-required credential did not allow an explicit manual recheck")
+	}
+
+	verified.Store(true)
+	manualContext := context.WithValue(
+		t.Context(),
+		chatGPTWebAccountInfoManualLifecycleBypassContextKey{},
+		true,
+	)
+	outcome = executor.refreshChatGPTWebAccountInfoForInstance(
+		manualContext,
+		current.ID,
+		current.RuntimeInstanceID(),
+		true,
+	)
+	if outcome.errorCode != "" ||
+		(outcome.status != chatgptwebauth.AccountInfoResultUpdated &&
+			outcome.status != chatgptwebauth.AccountInfoResultUnchanged) {
+		t.Fatalf("manual recheck outcome = %+v", outcome)
+	}
+	current, ok = manager.GetByID(auth.ID)
+	if !ok || current == nil || current.LifecycleState() != cliproxyauth.LifecycleStateActive {
+		t.Fatalf("successful manual recheck did not reactivate credential: %+v", current)
+	}
+}
+
 func TestChatGPTWebAccountInfoUnauthorizedRefreshUsesResolvedProxyAndInstallsTerminalState(t *testing.T) {
 	manager := cliproxyauth.NewManager(nil, nil, nil)
 	manager.SetProxyResolver(&accountInfoTestProxyResolver{url: "http://proxy.example:8080"})
