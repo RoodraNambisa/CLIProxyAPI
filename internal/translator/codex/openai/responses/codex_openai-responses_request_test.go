@@ -368,6 +368,82 @@ func TestTruncationRemovedForCodexCompatibility(t *testing.T) {
 	}
 }
 
+func TestCodexResponsesCacheFieldsRemovedForCompatibility(t *testing.T) {
+	inputJSON := []byte(`{
+		"model":"gpt-5.4",
+		"prompt_cache_options":{"mode":"implicit"},
+		"input":[
+			{
+				"type":"message",
+				"role":"system",
+				"content":[{
+					"type":"input_text",
+					"text":"system prompt",
+					"custom_field":"preserved",
+					"prompt_cache_breakpoint":{"mode":"explicit"}
+				}]
+			},
+			{
+				"type":"message",
+				"role":"user",
+				"content":[
+					{"type":"input_text","text":"first","prompt_cache_breakpoint":true},
+					{"type":"input_text","text":"second"}
+				]
+			},
+			{
+				"type":"function_call",
+				"call_id":"call_1",
+				"arguments":"{\"prompt_cache_breakpoint\":\"business-data\"}"
+			}
+		],
+		"tools":[{
+			"type":"function",
+			"name":"lookup",
+			"parameters":{
+				"type":"object",
+				"properties":{"prompt_cache_breakpoint":{"type":"string"}}
+			}
+		}]
+	}`)
+
+	output := ConvertOpenAIResponsesRequestToCodex("gpt-5.4", inputJSON, false)
+	if gjson.GetBytes(output, "prompt_cache_options").Exists() {
+		t.Fatalf("prompt_cache_options should be removed: %s", output)
+	}
+	for _, path := range []string{
+		"input.0.content.0.prompt_cache_breakpoint",
+		"input.1.content.0.prompt_cache_breakpoint",
+	} {
+		if gjson.GetBytes(output, path).Exists() {
+			t.Fatalf("%s should be removed: %s", path, output)
+		}
+	}
+	if got := gjson.GetBytes(output, "input.0.role").String(); got != "developer" {
+		t.Fatalf("input.0.role = %q, want developer", got)
+	}
+	if got := gjson.GetBytes(output, "input.0.content.0.custom_field").String(); got != "preserved" {
+		t.Fatalf("custom content field = %q, want preserved", got)
+	}
+	if got := gjson.GetBytes(output, "input.1.content.1.text").String(); got != "second" {
+		t.Fatalf("second content text = %q, want second", got)
+	}
+	if got := gjson.GetBytes(output, "input.2.arguments").String(); !strings.Contains(got, "prompt_cache_breakpoint") {
+		t.Fatalf("function arguments lost business field: %q", got)
+	}
+	if got := gjson.GetBytes(output, "tools.0.parameters.properties.prompt_cache_breakpoint.type").String(); got != "string" {
+		t.Fatalf("tool schema field = %q, want string", got)
+	}
+}
+
+func TestCodexResponsesMalformedJSONPreserved(t *testing.T) {
+	inputJSON := []byte(`{"prompt_cache_options":`)
+	output := ConvertOpenAIResponsesRequestToCodex("gpt-5.4", inputJSON, false)
+	if !reflect.DeepEqual(output, inputJSON) {
+		t.Fatalf("malformed payload changed: got %q want %q", output, inputJSON)
+	}
+}
+
 func TestConvertOpenAIResponsesRequestToCodex_FastPathParity(t *testing.T) {
 	testCases := []struct {
 		name  string
@@ -431,7 +507,8 @@ func TestConvertOpenAIResponsesRequestToCodex_FastPathParity(t *testing.T) {
 func TestConvertOpenAIResponsesRequestToCodex_FastPathParity_LongRequest(t *testing.T) {
 	longPrompt := buildLongPrompt("translator-long")
 	payload := map[string]any{
-		"model": "gpt-5.4",
+		"model":                "gpt-5.4",
+		"prompt_cache_options": map[string]any{"mode": "implicit"},
 		"input": []any{
 			map[string]any{
 				"type": "message",
@@ -448,8 +525,9 @@ func TestConvertOpenAIResponsesRequestToCodex_FastPathParity_LongRequest(t *test
 				"role": "user",
 				"content": []any{
 					map[string]any{
-						"type": "input_text",
-						"text": longPrompt,
+						"type":                    "input_text",
+						"text":                    longPrompt,
+						"prompt_cache_breakpoint": map[string]any{"mode": "explicit"},
 					},
 				},
 			},

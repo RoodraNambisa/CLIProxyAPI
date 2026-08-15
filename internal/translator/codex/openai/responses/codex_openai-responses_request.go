@@ -2,7 +2,6 @@ package responses
 
 import (
 	"bytes"
-	"encoding/json"
 	"fmt"
 	"strconv"
 	"strings"
@@ -47,7 +46,7 @@ func convertOpenAIResponsesRequestToCodexFastPath(inputRawJSON []byte) ([]byte, 
 	root.ForEach(func(key, value gjson.Result) bool {
 		field := key.String()
 		switch field {
-		case "max_output_tokens", "max_completion_tokens", "temperature", "top_p", "truncation", "context_management", "user":
+		case "max_output_tokens", "max_completion_tokens", "temperature", "top_p", "truncation", "context_management", "prompt_cache_options", "user":
 			return true
 		case "input":
 			output = appendJSONObjectFieldName(output, field, &wroteField)
@@ -148,19 +147,24 @@ func appendNormalizedOpenAIResponsesInput(dst []byte, input gjson.Result) ([]byt
 			return dst, true
 		}
 
-		hasSystemRole := false
+		needsNormalization := false
 		input.ForEach(func(_, item gjson.Result) bool {
 			if !item.IsObject() {
 				return true
 			}
 			role := item.Get("role")
 			if role.Type == gjson.String && role.String() == "system" {
-				hasSystemRole = true
+				needsNormalization = true
+				return false
+			}
+			content := item.Get("content")
+			if content.IsArray() && strings.Contains(content.Raw, `"prompt_cache_breakpoint"`) {
+				needsNormalization = true
 				return false
 			}
 			return true
 		})
-		if !hasSystemRole {
+		if !needsNormalization {
 			dst = append(dst, input.Raw...)
 			return dst, true
 		}
@@ -200,7 +204,10 @@ func appendNormalizedOpenAIResponsesInputItem(dst []byte, item gjson.Result) ([]
 	}
 
 	role := item.Get("role")
-	if role.Type != gjson.String || role.String() != "system" {
+	isSystemRole := role.Type == gjson.String && role.String() == "system"
+	content := item.Get("content")
+	stripContentCacheBreakpoints := content.IsArray() && strings.Contains(content.Raw, `"prompt_cache_breakpoint"`)
+	if !isSystemRole && !stripContentCacheBreakpoints {
 		dst = append(dst, item.Raw...)
 		return dst, true
 	}
@@ -208,9 +215,14 @@ func appendNormalizedOpenAIResponsesInputItem(dst []byte, item gjson.Result) ([]
 	dst = append(dst, '{')
 	wroteField := false
 	item.ForEach(func(key, value gjson.Result) bool {
-		dst = appendJSONObjectFieldName(dst, key.String(), &wroteField)
-		if key.String() == "role" {
+		field := key.String()
+		dst = appendJSONObjectFieldName(dst, field, &wroteField)
+		if field == "role" && isSystemRole {
 			dst = strconv.AppendQuote(dst, "developer")
+			return true
+		}
+		if field == "content" && stripContentCacheBreakpoints {
+			dst = appendCodexResponsesContentWithoutCacheBreakpoints(dst, value)
 			return true
 		}
 		dst = append(dst, value.Raw...)
@@ -218,6 +230,40 @@ func appendNormalizedOpenAIResponsesInputItem(dst []byte, item gjson.Result) ([]
 	})
 	dst = append(dst, '}')
 	return dst, true
+}
+
+func appendCodexResponsesContentWithoutCacheBreakpoints(dst []byte, content gjson.Result) []byte {
+	if !content.IsArray() {
+		return append(dst, content.Raw...)
+	}
+	dst = append(dst, '[')
+	wrotePart := false
+	content.ForEach(func(_, part gjson.Result) bool {
+		if wrotePart {
+			dst = append(dst, ',')
+		} else {
+			wrotePart = true
+		}
+		if !part.IsObject() || !part.Get("prompt_cache_breakpoint").Exists() {
+			dst = append(dst, part.Raw...)
+			return true
+		}
+
+		dst = append(dst, '{')
+		wroteField := false
+		part.ForEach(func(key, value gjson.Result) bool {
+			if key.String() == "prompt_cache_breakpoint" {
+				return true
+			}
+			dst = appendJSONObjectFieldName(dst, key.String(), &wroteField)
+			dst = append(dst, value.Raw...)
+			return true
+		})
+		dst = append(dst, '}')
+		return true
+	})
+	dst = append(dst, ']')
+	return dst
 }
 
 func appendNormalizedCodexFastPathTools(dst []byte, raw string) []byte {
@@ -348,6 +394,7 @@ func convertOpenAIResponsesRequestToCodexFallback(inputRawJSON []byte) []byte {
 		"top_p",
 		"truncation",
 		"context_management",
+		"prompt_cache_options",
 		"user",
 	} {
 		if output, err = sjson.DeleteBytes(output, path); err != nil {
@@ -367,35 +414,18 @@ func convertOpenAIResponsesRequestToCodexFallback(inputRawJSON []byte) []byte {
 func normalizeOpenAIResponsesInputForCodexFallback(inputRawJSON []byte) ([]byte, error) {
 	input := gjson.GetBytes(inputRawJSON, "input")
 	switch input.Type {
-	case gjson.String:
-		encodedText, err := json.Marshal(input.String())
-		if err != nil {
-			return nil, err
-		}
-		replacement := []byte(`[{"type":"message","role":"user","content":[{"type":"input_text","text":`)
-		replacement = append(replacement, encodedText...)
-		replacement = append(replacement, []byte(`}]}]`)...)
-		return sjson.SetRawBytes(inputRawJSON, "input", replacement)
-	case gjson.JSON:
-		if !input.IsArray() {
+	case gjson.String, gjson.JSON:
+		if input.Type == gjson.JSON && !input.IsArray() {
 			return inputRawJSON, nil
 		}
-		output := inputRawJSON
-		for index, rawItem := range input.Array() {
-			if !rawItem.IsObject() {
-				continue
-			}
-			role := rawItem.Get("role")
-			if role.Type != gjson.String || role.String() != "system" {
-				continue
-			}
-			var err error
-			output, err = sjson.SetBytes(output, "input."+strconv.Itoa(index)+".role", "developer")
-			if err != nil {
-				return nil, err
-			}
+		replacement, ok := appendNormalizedOpenAIResponsesInput(nil, input)
+		if !ok {
+			return nil, fmt.Errorf("normalize Codex Responses input")
 		}
-		return output, nil
+		if bytes.Equal(replacement, []byte(input.Raw)) {
+			return inputRawJSON, nil
+		}
+		return sjson.SetRawBytes(inputRawJSON, "input", replacement)
 	default:
 		return inputRawJSON, nil
 	}
