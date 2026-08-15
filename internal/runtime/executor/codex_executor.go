@@ -690,6 +690,14 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	if err != nil {
 		return resp, err
 	}
+	if err = applyCodexHeaders(httpReq, auth, apiKey, true, e.cfg); err != nil {
+		return resp, err
+	}
+	applyCodexIdentityConfuseHeaders(httpReq.Header, &identityState)
+	upstreamBody, err = e.applyCodexHTTPSessionIdentity(ctx, auth, req, opts, httpReq, upstreamBody, identityState)
+	if err != nil {
+		return resp, err
+	}
 	releasedOriginalPayload := slimCodexOriginalPayloadForTranslation(from, originalPayload)
 	releasedBody := slimCodexBodyForStreamUsage(body)
 	originalRef, bodyRef, unregisterBodies := codexStreamBodyRefs(ctx, opts, originalPayload, body, releasedOriginalPayload, releasedBody)
@@ -699,10 +707,6 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	originalPayload = nil
 	body = nil
 	dropCodexRawRequestCopies(&req, &opts)
-	if err = applyCodexHeaders(httpReq, auth, apiKey, true, e.cfg); err != nil {
-		return resp, err
-	}
-	applyCodexIdentityConfuseHeaders(httpReq.Header, &identityState)
 	var authID, authLabel, authType, authValue string
 	if auth != nil {
 		authID = auth.ID
@@ -875,6 +879,14 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 	if err != nil {
 		return resp, err
 	}
+	if err = applyCodexHeaders(httpReq, auth, apiKey, false, e.cfg); err != nil {
+		return resp, err
+	}
+	applyCodexIdentityConfuseHeaders(httpReq.Header, &identityState)
+	upstreamBody, err = e.applyCodexHTTPSessionIdentity(ctx, auth, req, opts, httpReq, upstreamBody, identityState)
+	if err != nil {
+		return resp, err
+	}
 	releasedOriginalPayload := slimCodexOriginalPayloadForTranslation(from, originalPayload)
 	releasedBody := slimCodexBodyForStreamUsage(body)
 	originalRef, bodyRef, unregisterBodies := codexStreamBodyRefs(ctx, opts, originalPayload, body, releasedOriginalPayload, releasedBody)
@@ -884,10 +896,6 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 	originalPayload = nil
 	body = nil
 	dropCodexRawRequestCopies(&req, &opts)
-	if err = applyCodexHeaders(httpReq, auth, apiKey, false, e.cfg); err != nil {
-		return resp, err
-	}
-	applyCodexIdentityConfuseHeaders(httpReq.Header, &identityState)
 	var authID, authLabel, authType, authValue string
 	if auth != nil {
 		authID = auth.ID
@@ -1005,6 +1013,14 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	if err != nil {
 		return nil, err
 	}
+	if err = applyCodexHeaders(httpReq, auth, apiKey, true, e.cfg); err != nil {
+		return nil, err
+	}
+	applyCodexIdentityConfuseHeaders(httpReq.Header, &identityState)
+	upstreamBody, err = e.applyCodexHTTPSessionIdentity(ctx, auth, req, opts, httpReq, upstreamBody, identityState)
+	if err != nil {
+		return nil, err
+	}
 	releasedOriginalPayload := slimCodexOriginalPayloadForTranslation(from, originalPayload)
 	releasedBody := slimCodexBodyForStreamUsage(body)
 	streamOriginalPayload, streamBody, unregisterStreamBodies := codexStreamBodyRefs(ctx, opts, originalPayload, body, releasedOriginalPayload, releasedBody)
@@ -1016,11 +1032,6 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	originalPayload = nil
 	body = nil
 	dropCodexRawRequestCopies(&req, &opts)
-	if err = applyCodexHeaders(httpReq, auth, apiKey, true, e.cfg); err != nil {
-		cleanupBodies()
-		return nil, err
-	}
-	applyCodexIdentityConfuseHeaders(httpReq.Header, &identityState)
 	var authID, authLabel, authType, authValue string
 	if auth != nil {
 		authID = auth.ID
@@ -1574,6 +1585,168 @@ type codexIdentityConfuseState struct {
 type codexIdentityReplacement struct {
 	original string
 	confused string
+}
+
+type codexSessionIdentityState struct {
+	enabled      bool
+	identity     helps.CodexSessionIdentity
+	turnMetadata string
+}
+
+func (e *CodexExecutor) applyCodexHTTPSessionIdentity(
+	ctx context.Context,
+	auth *cliproxyauth.Auth,
+	req cliproxyexecutor.Request,
+	opts cliproxyexecutor.Options,
+	httpReq *http.Request,
+	rawJSON []byte,
+	identityConfuse codexIdentityConfuseState,
+) ([]byte, error) {
+	projected, state, err := e.projectCodexSessionIdentity(ctx, auth, req, opts, rawJSON, identityConfuse)
+	if err != nil {
+		closeCodexRequestBody(httpReq)
+		return nil, err
+	}
+	if !state.enabled {
+		return rawJSON, nil
+	}
+	closeCodexRequestBody(httpReq)
+	bodyReader := cliproxyexecutor.NewReleasableReadCloser(projected, nil)
+	httpReq.Body = bodyReader
+	httpReq.ContentLength = int64(bodyReader.Len())
+	applyCodexSessionIdentityHeaders(httpReq.Header, state, false)
+	return projected, nil
+}
+
+func (e *CodexExecutor) projectCodexSessionIdentity(
+	ctx context.Context,
+	auth *cliproxyauth.Auth,
+	req cliproxyexecutor.Request,
+	opts cliproxyexecutor.Options,
+	rawJSON []byte,
+	identityConfuse codexIdentityConfuseState,
+) ([]byte, codexSessionIdentityState, error) {
+	if !codexSpoofSessionIdentityEnabled(e.cfg) || auth == nil || codexAuthUsesAPIKey(auth) {
+		return rawJSON, codexSessionIdentityState{}, nil
+	}
+	prepared := e.codexPreparedSessionIdentity(ctx, req, opts)
+	defaults := helps.CodexSessionIdentity{
+		SessionID: prepared.SessionID, ThreadID: prepared.ThreadID, TurnID: prepared.TurnID,
+		WindowID: prepared.WindowID, RequestKind: prepared.RequestKind,
+	}
+	confused := helps.CodexSessionIdentityHeaderSource{}
+	if identityConfuse.promptCacheKey != "" {
+		confused.SessionID = identityConfuse.promptCacheKey
+		confused.ThreadID = identityConfuse.promptCacheKey
+		confused.WindowID = identityConfuse.promptCacheKey + ":0"
+	}
+	projected, identity, turnMetadata, err := helps.ProjectCodexSessionIdentity(
+		rawJSON,
+		codexCredentialSessionIdentitySource(auth),
+		confused,
+		codexClientSessionIdentitySource(ctx, opts),
+		defaults,
+	)
+	if err != nil {
+		status := codexStreamStatusErr(
+			http.StatusBadRequest,
+			"invalid Codex session identity metadata: "+err.Error(),
+			"invalid_session_identity_metadata",
+			"invalid_request_error",
+			nil,
+		)
+		status.skipAuthResult = true
+		return nil, codexSessionIdentityState{}, status
+	}
+	return projected, codexSessionIdentityState{enabled: true, identity: identity, turnMetadata: turnMetadata}, nil
+}
+
+func (e *CodexExecutor) codexPreparedSessionIdentity(ctx context.Context, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) codexPreparedSessionIdentity {
+	if opaque, ok := cliproxyexecutor.ProviderPreparedRequest(opts, e.Identifier()); ok {
+		switch prepared := opaque.(type) {
+		case codexPreparedSessionIdentity:
+			return prepared
+		case *codexPreparedSessionIdentity:
+			if prepared != nil {
+				return *prepared
+			}
+		}
+	}
+	operation := cliproxyexecutor.RequestOperationExecute
+	if opts.Stream {
+		operation = cliproxyexecutor.RequestOperationStream
+	}
+	opaque, _ := e.PrepareProviderRequest(ctx, req, opts, operation)
+	prepared, _ := opaque.(codexPreparedSessionIdentity)
+	return prepared
+}
+
+func codexCredentialSessionIdentitySource(auth *cliproxyauth.Auth) helps.CodexSessionIdentityHeaderSource {
+	if auth == nil || len(auth.Attributes) == 0 {
+		return helps.CodexSessionIdentityHeaderSource{}
+	}
+	headers := make(http.Header)
+	util.ApplyCustomHeadersFromAttrs(&http.Request{Header: headers}, auth.Attributes)
+	return codexSessionIdentitySourceFromHeaders(headers)
+}
+
+func codexClientSessionIdentitySource(ctx context.Context, opts cliproxyexecutor.Options) helps.CodexSessionIdentityHeaderSource {
+	headers := make(http.Header)
+	if ctx != nil {
+		if ginCtx, ok := ctx.Value("gin").(*gin.Context); ok && ginCtx != nil && ginCtx.Request != nil {
+			copyCodexHeaders(headers, ginCtx.Request.Header)
+		}
+	}
+	copyCodexHeaders(headers, opts.Headers)
+	return codexSessionIdentitySourceFromHeaders(headers)
+}
+
+func codexSessionIdentitySourceFromHeaders(headers http.Header) helps.CodexSessionIdentityHeaderSource {
+	sessionID := headerValueCaseInsensitive(headers, "Session-Id")
+	if sessionID == "" {
+		sessionID = headerValueCaseInsensitive(headers, "Session_id")
+	}
+	return helps.CodexSessionIdentityHeaderSource{
+		SessionID:    strings.TrimSpace(sessionID),
+		ThreadID:     strings.TrimSpace(headerValueCaseInsensitive(headers, "Thread-Id")),
+		WindowID:     strings.TrimSpace(headerValueCaseInsensitive(headers, "X-Codex-Window-Id")),
+		TurnMetadata: strings.TrimSpace(headerValueCaseInsensitive(headers, "X-Codex-Turn-Metadata")),
+	}
+}
+
+func copyCodexHeaders(target, source http.Header) {
+	for key, values := range source {
+		deleteHeaderCaseInsensitive(target, key)
+		for _, value := range values {
+			target.Add(key, value)
+		}
+	}
+}
+
+func applyCodexSessionIdentityHeaders(headers http.Header, state codexSessionIdentityState, websocket bool) {
+	if headers == nil || !state.enabled {
+		return
+	}
+	for _, name := range []string{"Session-Id", "Session_id", "Thread-Id", "X-Codex-Window-Id", "X-Codex-Turn-Metadata"} {
+		deleteHeaderCaseInsensitive(headers, name)
+	}
+	setHeaderCasePreserved(headers, "Session-Id", state.identity.SessionID)
+	setHeaderCasePreserved(headers, "Thread-Id", state.identity.ThreadID)
+	setHeaderCasePreserved(headers, "X-Codex-Window-Id", state.identity.WindowID)
+	setHeaderCasePreserved(headers, "X-Codex-Turn-Metadata", state.turnMetadata)
+	if websocket {
+		deleteHeaderCaseInsensitive(headers, "session_id")
+		setHeaderCasePreserved(headers, "session_id", state.identity.SessionID)
+	}
+}
+
+func closeCodexRequestBody(req *http.Request) {
+	if req == nil || req.Body == nil {
+		return
+	}
+	if err := req.Body.Close(); err != nil {
+		log.Debugf("codex executor: close replaced request body: %v", err)
+	}
 }
 
 func (e *CodexExecutor) cacheHelper(ctx context.Context, from sdktranslator.Format, url string, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, userPayload []byte, rawJSON []byte, allowIdentityConfuse bool) (*http.Request, []byte, codexIdentityConfuseState, error) {

@@ -117,13 +117,17 @@ func (e *CodexExecutor) executeOpenAIImage(ctx context.Context, auth *cliproxyau
 	if err != nil {
 		return resp, err
 	}
-	body = nil
-	originalPayload = nil
-	dropCodexRawRequestCopies(&req, &opts)
 	if err = applyCodexDirectImageHeaders(httpReq, auth, apiKey, false, e.cfg); err != nil {
 		return resp, err
 	}
 	applyCodexIdentityConfuseHeaders(httpReq.Header, &identityState)
+	upstreamBody, err = e.applyCodexHTTPSessionIdentity(ctx, auth, req, opts, httpReq, upstreamBody, identityState)
+	if err != nil {
+		return resp, err
+	}
+	body = nil
+	originalPayload = nil
+	dropCodexRawRequestCopies(&req, &opts)
 	recordCodexOpenAIImageRequest(ctx, e, auth, url, httpReq.Header.Clone(), upstreamBody)
 	upstreamBody = nil
 
@@ -192,13 +196,17 @@ func (e *CodexExecutor) executeOpenAIImageStream(ctx context.Context, auth *clip
 	if err != nil {
 		return nil, err
 	}
-	body = nil
-	originalPayload = nil
-	dropCodexRawRequestCopies(&req, &opts)
 	if err = applyCodexDirectImageHeaders(httpReq, auth, apiKey, true, e.cfg); err != nil {
 		return nil, err
 	}
 	applyCodexIdentityConfuseHeaders(httpReq.Header, &identityState)
+	upstreamBody, err = e.applyCodexHTTPSessionIdentity(ctx, auth, req, opts, httpReq, upstreamBody, identityState)
+	if err != nil {
+		return nil, err
+	}
+	body = nil
+	originalPayload = nil
+	dropCodexRawRequestCopies(&req, &opts)
 	recordCodexOpenAIImageRequest(ctx, e, auth, url, httpReq.Header.Clone(), upstreamBody)
 	upstreamBody = nil
 
