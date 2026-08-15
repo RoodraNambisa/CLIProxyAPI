@@ -94,6 +94,13 @@ func TestBuildConfigChangeDetails_NoChanges(t *testing.T) {
 	}
 }
 
+func TestBuildConfigChangeDetails_CodexSessionIdentitySpoof(t *testing.T) {
+	details := BuildConfigChangeDetails(&config.Config{}, &config.Config{
+		Codex: config.CodexConfig{SpoofSessionIdentity: true},
+	})
+	expectContains(t, details, "codex.spoof-session-identity: false -> true")
+}
+
 func TestBuildConfigChangeDetails_ChatGPTWebTokenUsageEstimation(t *testing.T) {
 	disabled := false
 	enabled := true

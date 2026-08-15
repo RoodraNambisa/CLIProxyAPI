@@ -510,7 +510,8 @@ type CodexHeaderDefaults struct {
 
 // CodexConfig configures provider-wide Codex request behavior.
 type CodexConfig struct {
-	IdentityConfuse bool `yaml:"identity-confuse" json:"identity-confuse"`
+	IdentityConfuse      bool `yaml:"identity-confuse" json:"identity-confuse"`
+	SpoofSessionIdentity bool `yaml:"spoof-session-identity" json:"spoof-session-identity"`
 }
 
 // ChatGPTWebConfig configures ChatGPT Web credential, usage, and Sentinel behavior.

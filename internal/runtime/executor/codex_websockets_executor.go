@@ -2061,6 +2061,13 @@ func NewCodexAutoExecutor(cfg *config.Config) *CodexAutoExecutor {
 
 func (e *CodexAutoExecutor) Identifier() string { return "codex" }
 
+func (e *CodexAutoExecutor) PrepareProviderRequest(ctx context.Context, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, operation cliproxyexecutor.RequestOperation) (any, error) {
+	if e == nil || e.httpExec == nil {
+		return nil, fmt.Errorf("codex auto executor: http executor is nil")
+	}
+	return e.httpExec.PrepareProviderRequest(ctx, req, opts, operation)
+}
+
 func (e *CodexAutoExecutor) ShouldPrepareRequestAuth(auth *cliproxyauth.Auth) bool {
 	return e != nil && e.httpExec != nil && e.httpExec.ShouldPrepareRequestAuth(auth)
 }

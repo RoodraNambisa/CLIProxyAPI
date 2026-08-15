@@ -14,6 +14,7 @@ import (
 
 	codexauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/codex"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/misc"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
@@ -310,6 +311,74 @@ type CodexExecutor struct {
 func NewCodexExecutor(cfg *config.Config) *CodexExecutor { return &CodexExecutor{cfg: cfg} }
 
 func (e *CodexExecutor) Identifier() string { return "codex" }
+
+type codexPreparedSessionIdentity struct {
+	SessionID   string
+	ThreadID    string
+	TurnID      string
+	WindowID    string
+	RequestKind string
+}
+
+var codexSessionIdentityNamespace = uuid.NewSHA1(uuid.NameSpaceURL, []byte("cli-proxy-api:codex:session-identity"))
+
+// PrepareProviderRequest creates one immutable identity fallback shared by all
+// credential retries and transport fallbacks for the logical request.
+func (e *CodexExecutor) PrepareProviderRequest(ctx context.Context, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, operation cliproxyexecutor.RequestOperation) (any, error) {
+	if !codexSpoofSessionIdentityEnabled(e.cfg) || operation == cliproxyexecutor.RequestOperationCount {
+		return nil, nil
+	}
+	payload := req.Payload
+	if len(opts.OriginalRequest) > 0 {
+		payload = opts.OriginalRequest
+	}
+	threadID := codexPreparedThreadID(ctx, opts, payload)
+	return codexPreparedSessionIdentity{
+		SessionID:   threadID,
+		ThreadID:    threadID,
+		TurnID:      uuid.NewString(),
+		WindowID:    threadID + ":0",
+		RequestKind: codexSessionRequestKind(opts, payload),
+	}, nil
+}
+
+func codexPreparedThreadID(ctx context.Context, opts cliproxyexecutor.Options, payload []byte) string {
+	if promptCacheKey := strings.TrimSpace(gjson.GetBytes(payload, "prompt_cache_key").String()); promptCacheKey != "" {
+		if parsed, err := uuid.Parse(promptCacheKey); err == nil {
+			return parsed.String()
+		}
+		tenant := strings.TrimSpace(helps.APIKeyFromContext(ctx))
+		return codexSessionIdentityUUID("prompt-cache", tenant+"\x00"+promptCacheKey)
+	}
+	if executionSessionID := executionSessionIDFromOptions(opts); executionSessionID != "" {
+		if parsed, err := uuid.Parse(executionSessionID); err == nil {
+			return parsed.String()
+		}
+		return codexSessionIdentityUUID("execution-session", executionSessionID)
+	}
+	if requestID := strings.TrimSpace(logging.GetRequestID(ctx)); requestID != "" {
+		return codexSessionIdentityUUID("request", requestID)
+	}
+	return uuid.NewString()
+}
+
+func codexSessionIdentityUUID(kind, value string) string {
+	return uuid.NewSHA1(codexSessionIdentityNamespace, []byte(strings.TrimSpace(kind)+"\x00"+strings.TrimSpace(value))).String()
+}
+
+func codexSessionRequestKind(opts cliproxyexecutor.Options, payload []byte) string {
+	if strings.EqualFold(strings.Trim(strings.TrimSpace(opts.Alt), "/"), "responses/compact") {
+		return "compaction"
+	}
+	if generate := gjson.GetBytes(payload, "generate"); generate.Exists() && !generate.Bool() {
+		return "prewarm"
+	}
+	return "turn"
+}
+
+func codexSpoofSessionIdentityEnabled(cfg *config.Config) bool {
+	return cfg != nil && cfg.Codex.SpoofSessionIdentity
+}
 
 // ShouldPrepareRequestAuth reports whether an Agent Identity needs a task before use.
 func (e *CodexExecutor) ShouldPrepareRequestAuth(auth *cliproxyauth.Auth) bool {

@@ -20,6 +20,7 @@ codex-fingerprint:
   images-force-http1: true
 codex:
   identity-confuse: true
+  spoof-session-identity: true
 `)
 	if err := os.WriteFile(configPath, configYAML, 0o600); err != nil {
 		t.Fatalf("failed to write config: %v", err)
@@ -50,5 +51,8 @@ codex:
 	}
 	if !cfg.Codex.IdentityConfuse {
 		t.Fatalf("Codex.IdentityConfuse = false, want true")
+	}
+	if !cfg.Codex.SpoofSessionIdentity {
+		t.Fatalf("Codex.SpoofSessionIdentity = false, want true")
 	}
 }
