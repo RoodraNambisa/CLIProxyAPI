@@ -301,6 +301,42 @@ func TestCodexProjectSessionIdentityKeepsIdentityConfuseApplied(t *testing.T) {
 	}
 }
 
+func TestCodexProjectSessionIdentityConfusesCredentialHeadersBeforePriorityMerge(t *testing.T) {
+	cfg := &config.Config{
+		Routing: config.RoutingConfig{Strategy: "fill-first"},
+		Codex: config.CodexConfig{
+			IdentityConfuse:      true,
+			SpoofSessionIdentity: true,
+		},
+	}
+	executor := NewCodexExecutor(cfg)
+	auth := &cliproxyauth.Auth{
+		ID: "oauth-auth", Provider: "codex",
+		Metadata: map[string]any{"access_token": "oauth-token"},
+		Attributes: map[string]string{
+			"header:Session-Id":            "admin-session",
+			"header:Thread-Id":             "admin-thread",
+			"header:X-Codex-Window-Id":     "admin-window",
+			"header:X-Codex-Turn-Metadata": `{"turn_id":"admin-turn"}`,
+		},
+	}
+	requestPayload := []byte(`{"prompt_cache_key":"cache-original"}`)
+	upstreamPayload, identityState := applyCodexIdentityConfuseBody(cfg, auth, requestPayload, []byte(`{"model":"gpt-5.4"}`))
+
+	_, state, err := executor.projectCodexSessionIdentity(t.Context(), auth, cliproxyexecutor.Request{Payload: requestPayload}, cliproxyexecutor.Options{}, upstreamPayload, &identityState)
+	if err != nil {
+		t.Fatalf("projectCodexSessionIdentity() error = %v", err)
+	}
+	wantSession := codexIdentityConfuseUUID(auth.ID, "prompt-cache", "cache-original")
+	wantTurn := codexIdentityConfuseUUID(auth.ID, "turn", "admin-turn")
+	if state.identity.SessionID != wantSession || state.identity.ThreadID != wantSession || state.identity.WindowID != wantSession+":0" {
+		t.Fatalf("credential identity = %#v, want confused session %q", state.identity, wantSession)
+	}
+	if state.identity.TurnID != wantTurn {
+		t.Fatalf("credential TurnID = %q, want %q", state.identity.TurnID, wantTurn)
+	}
+}
+
 func TestCodexExecutorProjectsSessionIdentityAcrossHTTPPaths(t *testing.T) {
 	tests := []struct {
 		name       string

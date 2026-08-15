@@ -1652,9 +1652,11 @@ func (e *CodexExecutor) projectCodexSessionIdentity(
 		WindowID: prepared.WindowID, RequestKind: prepared.RequestKind,
 	}
 	confused := helps.CodexSessionIdentityHeaderSource{}
+	admin := codexCredentialSessionIdentitySource(auth)
 	client := codexClientSessionIdentitySource(ctx, opts)
 	if identityConfuse != nil && identityConfuse.enabled {
 		rawJSON = applyCodexIdentityConfuseFlatTurnID(rawJSON, identityConfuse)
+		admin = applyCodexIdentityConfuseSessionSource(admin, identityConfuse)
 		client = applyCodexIdentityConfuseSessionSource(client, identityConfuse)
 	}
 	if identityConfuse != nil && identityConfuse.promptCacheKey != "" {
@@ -1664,7 +1666,7 @@ func (e *CodexExecutor) projectCodexSessionIdentity(
 	}
 	projected, identity, turnMetadata, err := helps.ProjectCodexSessionIdentity(
 		rawJSON,
-		codexCredentialSessionIdentitySource(auth),
+		admin,
 		confused,
 		client,
 		defaults,
