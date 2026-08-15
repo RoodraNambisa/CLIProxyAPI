@@ -58,6 +58,19 @@ var sentinelBrowserWindowLayouts = [...]sentinelBrowserWindowLayout{
 	{widthPercent: 72, heightPercent: 64},
 }
 
+// sentinelBrowserExtendedWindowLayouts adds new viewport shapes without
+// changing the meaning of the persisted e00-e31 catalog identities.
+var sentinelBrowserExtendedWindowLayouts = [...]sentinelBrowserWindowLayout{
+	{widthPercent: 96, heightPercent: 92},
+	{widthPercent: 90, heightPercent: 88},
+	{widthPercent: 86, heightPercent: 84},
+	{widthPercent: 82, heightPercent: 80},
+	{widthPercent: 78, heightPercent: 76},
+	{widthPercent: 74, heightPercent: 72},
+	{widthPercent: 70, heightPercent: 68},
+	{widthPercent: 66, heightPercent: 60},
+}
+
 // These four Chrome heap limits come from the previously verified capacity
 // table. Device memory and color depth remain fixed by the hardware family.
 var sentinelBrowserHeapProfiles = [...]float64{
@@ -89,12 +102,19 @@ func sentinelBrowserProfileForSlot(persona Persona, slot int) sentinelBrowserPro
 }
 
 func sentinelBrowserProfileForCatalogEntry(entry personaCatalogEntry, slot int) sentinelBrowserProfile {
-	slot %= browserEnvironmentVariantsPerPersona
+	variantCount := browserEnvironmentVariantCount(entry.persona)
+	slot %= variantCount
 	if slot < 0 {
-		slot += browserEnvironmentVariantsPerPersona
+		slot += variantCount
 	}
-	layout := sentinelBrowserWindowLayouts[slot%len(sentinelBrowserWindowLayouts)]
-	heap := sentinelBrowserHeapProfiles[slot/len(sentinelBrowserWindowLayouts)]
+	layoutSlot := slot
+	layouts := sentinelBrowserWindowLayouts[:]
+	if slot >= len(sentinelBrowserWindowLayouts)*len(sentinelBrowserHeapProfiles) {
+		layoutSlot -= len(sentinelBrowserWindowLayouts) * len(sentinelBrowserHeapProfiles)
+		layouts = sentinelBrowserExtendedWindowLayouts[:]
+	}
+	layout := layouts[layoutSlot%len(layouts)]
+	heap := sentinelBrowserHeapProfiles[layoutSlot/len(layouts)]
 	innerWidth := scaleBrowserViewport(entry.innerWidth, layout.widthPercent, 640, entry.availWidth)
 	innerHeight := scaleBrowserViewport(entry.innerHeight, layout.heightPercent, 480, entry.availHeight)
 	outerWidth := innerWidth

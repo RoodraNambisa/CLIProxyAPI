@@ -9,7 +9,8 @@ import (
 
 const (
 	browserEnvironmentCatalogVersion     = "v3"
-	browserEnvironmentVariantsPerPersona = 32
+	browserEnvironmentV2Variants         = 32
+	browserEnvironmentVariantsPerPersona = 64
 )
 
 // BrowserEnvironmentIdentity selects the stable application-layer browser
@@ -22,9 +23,10 @@ type BrowserEnvironmentIdentity struct {
 
 func browserEnvironmentIdentityForSlot(persona Persona, slot int) BrowserEnvironmentIdentity {
 	persona = canonicalPersona(persona)
-	slot %= browserEnvironmentVariantsPerPersona
+	variantCount := browserEnvironmentVariantCount(persona)
+	slot %= variantCount
 	if slot < 0 {
-		slot += browserEnvironmentVariantsPerPersona
+		slot += variantCount
 	}
 	return BrowserEnvironmentIdentity{
 		CatalogVersion: browserEnvironmentCatalogVersion,
@@ -46,7 +48,7 @@ func browserEnvironmentSlot(persona Persona, identity BrowserEnvironmentIdentity
 		return 0, false
 	}
 	slot, err := strconv.Atoi(suffix)
-	if err != nil || slot < 0 || slot >= browserEnvironmentVariantsPerPersona {
+	if err != nil || slot < 0 || slot >= browserEnvironmentVariantCount(persona) {
 		return 0, false
 	}
 	return slot, true
@@ -58,7 +60,15 @@ func browserEnvironmentIdentityForSeed(persona Persona, seed string) BrowserEnvi
 		return BrowserEnvironmentIdentity{}
 	}
 	digest := sha256.Sum256([]byte("chatgpt-web-browser-environment-" + browserEnvironmentCatalogVersion + "\x00" + seed))
-	return browserEnvironmentIdentityForSlot(persona, int(digest[len(digest)-1])%browserEnvironmentVariantsPerPersona)
+	return browserEnvironmentIdentityForSlot(persona, int(digest[len(digest)-1])%browserEnvironmentVariantCount(persona))
+}
+
+func browserEnvironmentVariantCount(persona Persona) int {
+	persona = canonicalPersona(persona)
+	if strings.EqualFold(persona.CatalogVersion, personaCatalogV2Version) {
+		return browserEnvironmentV2Variants
+	}
+	return browserEnvironmentVariantsPerPersona
 }
 
 func resolveCredentialBrowserEnvironment(credential *Credential, fallbackSeed string) {

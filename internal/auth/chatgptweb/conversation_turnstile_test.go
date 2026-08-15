@@ -373,7 +373,7 @@ func TestBuildConversationTurnstileTokenSubroutineCaptureModes(t *testing.T) {
 
 func TestBuildConversationTurnstileTokenMatchesSentinelSDKFixtures(t *testing.T) {
 	requirementsToken := "fixture-requirements-token"
-	persona := DefaultPersona()
+	persona := personaCatalogV2[0].persona
 	environment := ConversationTurnstileEnvironment{
 		Persona: persona,
 		ScriptSources: []string{

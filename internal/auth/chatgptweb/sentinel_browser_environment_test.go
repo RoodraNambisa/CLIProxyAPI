@@ -3,6 +3,7 @@ package chatgptweb
 import (
 	"encoding/json"
 	"io"
+	"reflect"
 	"testing"
 	"time"
 )
@@ -24,8 +25,8 @@ func TestSentinelBrowserProfilesMatchEnvironmentCatalog(t *testing.T) {
 	if sentinelBrowserFingerprintSlots != browserEnvironmentVariantsPerPersona {
 		t.Fatalf("fingerprint slots = %d, environment slots = %d", sentinelBrowserFingerprintSlots, browserEnvironmentVariantsPerPersona)
 	}
-	seen := make(map[string]struct{}, len(personaCatalogV2)*browserEnvironmentVariantsPerPersona)
-	for _, entry := range personaCatalogV2 {
+	seen := make(map[string]struct{}, len(personaCatalogV3)*browserEnvironmentVariantsPerPersona)
+	for _, entry := range personaCatalogV3 {
 		for slot := 0; slot < browserEnvironmentVariantsPerPersona; slot++ {
 			profile := sentinelBrowserProfileForSlot(entry.persona, slot)
 			if profile.version != browserEnvironmentCatalogVersion || profile.slot != slot {
@@ -55,13 +56,27 @@ func TestSentinelBrowserProfilesMatchEnvironmentCatalog(t *testing.T) {
 			}
 		}
 	}
-	if len(seen) != 256 {
-		t.Fatalf("environment catalog has %d entries, want 256", len(seen))
+	if len(seen) != 512 {
+		t.Fatalf("environment catalog has %d entries, want 512", len(seen))
+	}
+}
+
+func TestSentinelBrowserProfilePreservesOriginalSlots(t *testing.T) {
+	entry := personaCatalogV2[0]
+	profile := sentinelBrowserProfileForSlot(entry.persona, 17)
+	if profile.innerWidth != scaleBrowserViewport(entry.innerWidth, 92, 640, entry.availWidth) ||
+		profile.innerHeight != scaleBrowserViewport(entry.innerHeight, 96, 480, entry.availHeight) ||
+		profile.jsHeapSizeLimit != sentinelBrowserHeapProfiles[2] {
+		t.Fatalf("persisted e17 profile changed: %#v", profile)
+	}
+	identity := BrowserEnvironmentIdentity{CatalogVersion: browserEnvironmentCatalogVersion, CatalogID: entry.persona.CatalogID + "-e17"}
+	if slot, ok := browserEnvironmentSlot(entry.persona, identity); !ok || slot != 17 {
+		t.Fatalf("persisted v2 environment resolved to %d/%v", slot, ok)
 	}
 }
 
 func TestSentinelBrowserProfileUsesPersistedEnvironmentIdentity(t *testing.T) {
-	for _, entry := range personaCatalogV2 {
+	for _, entry := range personaCatalogV3 {
 		identity := browserEnvironmentIdentityForSlot(entry.persona, 17)
 		environment := ConversationTurnstileEnvironment{
 			Persona:            entry.persona,
@@ -93,11 +108,11 @@ func TestSentinelBrowserEnvironmentUsesCanonicalPersona(t *testing.T) {
 	}
 	environment := ConversationTurnstileEnvironment{Persona: legacy, DeviceID: "legacy-device"}
 	profile := resolveSentinelBrowserProfile(environment)
-	if _, ok := browserEnvironmentSlot(personaCatalogV2[0].persona, BrowserEnvironmentIdentity{CatalogVersion: profile.version, CatalogID: profile.catalogID}); !ok {
+	if _, ok := browserEnvironmentSlot(personaCatalogV3[0].persona, BrowserEnvironmentIdentity{CatalogVersion: profile.version, CatalogID: profile.catalogID}); !ok {
 		t.Fatalf("legacy runtime profile = %q", profile.catalogID)
 	}
 	values, _, _ := normalizeConversationTurnstileEnvironment(environment, testTime())
-	want := personaCatalogV2[0].persona
+	want := personaCatalogV3[0].persona
 	if values["window.navigator.userAgent"] != want.UserAgent ||
 		values["window.navigator.platform"] != want.Platform ||
 		values["window.screen.width"] != want.ScreenWidth ||
@@ -114,7 +129,7 @@ func TestSentinelRuntimeBootstrapSharesCatalogSnapshot(t *testing.T) {
 		random: random,
 		now:    func() time.Time { return startedAt },
 	}
-	entry := personaCatalogV2[5]
+	entry := personaCatalogV3[6]
 	identity := browserEnvironmentIdentityForSlot(entry.persona, 23)
 	environment := ConversationTurnstileEnvironment{
 		Persona:            entry.persona,
@@ -131,6 +146,7 @@ func TestSentinelRuntimeBootstrapSharesCatalogSnapshot(t *testing.T) {
 	for key, want := range map[string]any{
 		"device_id":           environment.DeviceID,
 		"user_agent":          entry.persona.UserAgent,
+		"language":            entry.persona.Language,
 		"platform":            entry.persona.Platform,
 		"fingerprint_version": browserEnvironmentCatalogVersion,
 		"fingerprint_catalog": identity.CatalogID,
@@ -145,6 +161,13 @@ func TestSentinelRuntimeBootstrapSharesCatalogSnapshot(t *testing.T) {
 		if first[key] != want || second[key] != want {
 			t.Fatalf("bootstrap %q changed: first=%#v second=%#v want=%#v", key, first[key], second[key], want)
 		}
+	}
+	wantLanguages := make([]any, len(personaNavigatorLanguages(entry.persona)))
+	for index, language := range personaNavigatorLanguages(entry.persona) {
+		wantLanguages[index] = language
+	}
+	if !reflect.DeepEqual(first["languages"], wantLanguages) || !reflect.DeepEqual(second["languages"], wantLanguages) {
+		t.Fatalf("bootstrap languages = first:%#v second:%#v want:%#v", first["languages"], second["languages"], wantLanguages)
 	}
 	if first["random_b64"] == second["random_b64"] {
 		t.Fatalf("page random pool did not change: %q", first["random_b64"])

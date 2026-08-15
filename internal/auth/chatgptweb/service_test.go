@@ -609,7 +609,8 @@ func TestServiceLogin(t *testing.T) {
 	if tokenCalls != 1 {
 		t.Fatalf("token exchange calls = %d, want 1", tokenCalls)
 	}
-	if len(credential.Cookies) == 0 || credential.Persona.Profile != "chrome_146" {
+	if len(credential.Cookies) == 0 || credential.Persona.Profile != "chrome_146" ||
+		chromeMajor(credential.Persona.UserAgent) != "146" {
 		t.Fatal("login did not persist cookies and persona")
 	}
 }

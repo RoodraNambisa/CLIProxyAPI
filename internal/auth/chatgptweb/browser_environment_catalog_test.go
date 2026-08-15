@@ -1,24 +1,43 @@
 package chatgptweb
 
 import (
+	"crypto/sha256"
 	"fmt"
 	"testing"
 )
 
 func TestBrowserEnvironmentCatalogHasStablePerPersonaSlots(t *testing.T) {
-	for _, entry := range personaCatalogV2 {
-		seen := make(map[string]struct{}, browserEnvironmentVariantsPerPersona)
-		for slot := 0; slot < browserEnvironmentVariantsPerPersona; slot++ {
-			identity := browserEnvironmentIdentityForSlot(entry.persona, slot)
-			gotSlot, ok := browserEnvironmentSlot(entry.persona, identity)
-			if !ok || gotSlot != slot {
-				t.Fatalf("identity %q resolved to %d/%v, want %d", identity.CatalogID, gotSlot, ok, slot)
+	for _, catalog := range [][]personaCatalogEntry{personaCatalogV3, personaCatalogV2[:]} {
+		for _, entry := range catalog {
+			variantCount := browserEnvironmentVariantCount(entry.persona)
+			seen := make(map[string]struct{}, variantCount)
+			for slot := 0; slot < variantCount; slot++ {
+				identity := browserEnvironmentIdentityForSlot(entry.persona, slot)
+				gotSlot, ok := browserEnvironmentSlot(entry.persona, identity)
+				if !ok || gotSlot != slot {
+					t.Fatalf("identity %q resolved to %d/%v, want %d", identity.CatalogID, gotSlot, ok, slot)
+				}
+				seen[identity.CatalogID] = struct{}{}
 			}
-			seen[identity.CatalogID] = struct{}{}
+			if len(seen) != variantCount {
+				t.Fatalf("persona %q has %d unique environments", entry.persona.CatalogID, len(seen))
+			}
 		}
-		if len(seen) != browserEnvironmentVariantsPerPersona {
-			t.Fatalf("persona %q has %d unique environments", entry.persona.CatalogID, len(seen))
-		}
+	}
+}
+
+func TestBrowserEnvironmentCatalogPreservesV2SeedMapping(t *testing.T) {
+	persona := personaCatalogV2[4].persona
+	seed := "persisted-v2-device"
+	digest := sha256.Sum256([]byte("chatgpt-web-browser-environment-" + browserEnvironmentCatalogVersion + "\x00" + seed))
+	wantSlot := int(digest[len(digest)-1]) % browserEnvironmentV2Variants
+	identity := browserEnvironmentIdentityForSeed(persona, seed)
+	gotSlot, ok := browserEnvironmentSlot(persona, identity)
+	if !ok || gotSlot != wantSlot {
+		t.Fatalf("v2 seed mapped to %d/%v, want %d", gotSlot, ok, wantSlot)
+	}
+	if wrapped := browserEnvironmentIdentityForSlot(persona, wantSlot+browserEnvironmentV2Variants); wrapped != identity {
+		t.Fatalf("v2 slot expansion changed identity: %#v != %#v", wrapped, identity)
 	}
 }
 
@@ -30,7 +49,7 @@ func TestCredentialBrowserEnvironmentSelectionIsStable(t *testing.T) {
 		AccessToken:    "first-access-token",
 		Cookies:        []Cookie{{Name: "session", Value: "first-session-cookie"}},
 		SourceProxyURL: "http://first-proxy.example.test:8080",
-		Persona:        personaCatalogV2[3].persona,
+		Persona:        personaCatalogV3[3].persona,
 	}
 	first := ResolveCredentialBrowserEnvironment(credential, "auth-id")
 	for index := 0; index < 10; index++ {
@@ -51,7 +70,7 @@ func TestCredentialBrowserEnvironmentSelectionIsStable(t *testing.T) {
 func TestBrowserEnvironmentSelectionDistribution(t *testing.T) {
 	const credentialCount = 10_000
 	counts := make([]int, browserEnvironmentVariantsPerPersona)
-	persona := personaCatalogV2[1].persona
+	persona := personaCatalogV3[1].persona
 	for index := 0; index < credentialCount; index++ {
 		identity := browserEnvironmentIdentityForSeed(persona, fmt.Sprintf("device-%05d", index))
 		slot, ok := browserEnvironmentSlot(persona, identity)
@@ -62,14 +81,14 @@ func TestBrowserEnvironmentSelectionDistribution(t *testing.T) {
 	}
 
 	for slot, count := range counts {
-		if count < 240 || count > 390 {
+		if count < 110 || count > 210 {
 			t.Fatalf("slot %d count = %d, distribution = %#v", slot, count, counts)
 		}
 	}
 }
 
 func TestCredentialBrowserEnvironmentSeedPriority(t *testing.T) {
-	persona := personaCatalogV2[6].persona
+	persona := personaCatalogV3[6].persona
 	credential := &Credential{
 		DeviceID:      "device-seed",
 		CredentialUID: "credential-seed",
@@ -93,10 +112,10 @@ func TestCredentialBrowserEnvironmentSeedPriority(t *testing.T) {
 }
 
 func TestCredentialBrowserEnvironmentRejectsCrossPersonaIdentity(t *testing.T) {
-	identity := browserEnvironmentIdentityForSlot(personaCatalogV2[0].persona, 7)
+	identity := browserEnvironmentIdentityForSlot(personaCatalogV3[0].persona, 7)
 	credential := &Credential{
 		DeviceID:           "stable-device",
-		Persona:            personaCatalogV2[4].persona,
+		Persona:            personaCatalogV3[4].persona,
 		BrowserEnvironment: &identity,
 	}
 	got := ResolveCredentialBrowserEnvironment(credential, "")
@@ -113,7 +132,7 @@ func TestCredentialBrowserEnvironmentMetadataRoundTrip(t *testing.T) {
 		Type:          Provider,
 		CredentialUID: "credential-uid",
 		DeviceID:      "stable-device",
-		Persona:       personaCatalogV2[2].persona,
+		Persona:       personaCatalogV3[2].persona,
 	}
 	want := ResolveCredentialBrowserEnvironment(credential, "auth-id")
 	metadata := map[string]any{}

@@ -5,7 +5,10 @@ import (
 	"strings"
 )
 
-const personaCatalogVersion = "v2"
+const (
+	personaCatalogV2Version = "v2"
+	personaCatalogVersion   = "v3"
+)
 
 type personaCatalogEntry struct {
 	persona          Persona
@@ -94,7 +97,7 @@ func newPersonaCatalogEntry(
 ) personaCatalogEntry {
 	return personaCatalogEntry{
 		persona: Persona{
-			CatalogVersion:      personaCatalogVersion,
+			CatalogVersion:      personaCatalogV2Version,
 			CatalogID:           id,
 			Profile:             "chrome_146",
 			UserAgent:           userAgent,
@@ -122,14 +125,74 @@ func newPersonaCatalogEntry(
 	}
 }
 
-func personaCatalogEntryByID(version, id string) (personaCatalogEntry, bool) {
-	if !strings.EqualFold(strings.TrimSpace(version), personaCatalogVersion) {
-		return personaCatalogEntry{}, false
+type personaLocalePack struct {
+	id             string
+	acceptLanguage string
+	language       string
+}
+
+var personaCatalogV3 = buildPersonaCatalogV3()
+
+func buildPersonaCatalogV3() []personaCatalogEntry {
+	locales := [...]personaLocalePack{
+		{id: "en-us", acceptLanguage: "en-US,en;q=0.9", language: "en-US"},
 	}
+	entries := make([]personaCatalogEntry, 0, len(locales)*len(personaCatalogV2))
+	for _, locale := range locales {
+		for _, base := range personaCatalogV2 {
+			entry := base
+			entry.persona.CatalogVersion = personaCatalogVersion
+			entry.persona.CatalogID = "c146-" + locale.id + "-" + strings.TrimPrefix(base.persona.CatalogID, "c146-")
+			entry.persona.Profile = "chrome_146"
+			entry.persona.AcceptLanguage = locale.acceptLanguage
+			entry.persona.Language = locale.language
+			entries = append(entries, entry)
+		}
+	}
+	return entries
+}
+
+func personaNavigatorLanguages(persona Persona) []string {
+	languages := make([]string, 0, 3)
+	appendLanguage := func(value string) {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			return
+		}
+		for _, existing := range languages {
+			if strings.EqualFold(existing, value) {
+				return
+			}
+		}
+		languages = append(languages, value)
+	}
+	appendLanguage(persona.Language)
+	for _, part := range strings.Split(persona.AcceptLanguage, ",") {
+		appendLanguage(strings.SplitN(part, ";", 2)[0])
+	}
+	if len(languages) == 0 {
+		appendLanguage(DefaultPersona().Language)
+	}
+	return languages
+}
+
+func personaCatalogEntries(version string) []personaCatalogEntry {
+	switch strings.ToLower(strings.TrimSpace(version)) {
+	case personaCatalogV2Version:
+		return personaCatalogV2[:]
+	case personaCatalogVersion:
+		return personaCatalogV3
+	default:
+		return nil
+	}
+}
+
+func personaCatalogEntryByID(version, id string) (personaCatalogEntry, bool) {
 	id = strings.TrimSpace(id)
-	for index := range personaCatalogV2 {
-		if personaCatalogV2[index].persona.CatalogID == id {
-			return personaCatalogV2[index], true
+	entries := personaCatalogEntries(version)
+	for index := range entries {
+		if entries[index].persona.CatalogID == id {
+			return entries[index], true
 		}
 	}
 	return personaCatalogEntry{}, false
@@ -139,17 +202,19 @@ func personaCatalogEntryForPersona(persona Persona) (personaCatalogEntry, bool) 
 	if entry, ok := personaCatalogEntryByID(persona.CatalogVersion, persona.CatalogID); ok {
 		return entry, true
 	}
-	for index := range personaCatalogV2 {
-		candidate := personaCatalogV2[index].persona
-		if strings.EqualFold(strings.TrimSpace(persona.Profile), candidate.Profile) &&
-			strings.TrimSpace(persona.UserAgent) == candidate.UserAgent &&
-			strings.TrimSpace(persona.AcceptLanguage) == candidate.AcceptLanguage &&
-			strings.TrimSpace(persona.Language) == candidate.Language &&
-			strings.EqualFold(strings.TrimSpace(persona.Platform), candidate.Platform) &&
-			persona.ScreenWidth == candidate.ScreenWidth &&
-			persona.ScreenHeight == candidate.ScreenHeight &&
-			persona.HardwareConcurrency == candidate.HardwareConcurrency {
-			return personaCatalogV2[index], true
+	for _, entries := range [][]personaCatalogEntry{personaCatalogV3, personaCatalogV2[:]} {
+		for index := range entries {
+			candidate := entries[index].persona
+			if strings.EqualFold(strings.TrimSpace(persona.Profile), candidate.Profile) &&
+				strings.TrimSpace(persona.UserAgent) == candidate.UserAgent &&
+				strings.TrimSpace(persona.AcceptLanguage) == candidate.AcceptLanguage &&
+				strings.TrimSpace(persona.Language) == candidate.Language &&
+				strings.EqualFold(strings.TrimSpace(persona.Platform), candidate.Platform) &&
+				persona.ScreenWidth == candidate.ScreenWidth &&
+				persona.ScreenHeight == candidate.ScreenHeight &&
+				persona.HardwareConcurrency == candidate.HardwareConcurrency {
+				return entries[index], true
+			}
 		}
 	}
 	return personaCatalogEntry{}, false
@@ -158,11 +223,11 @@ func personaCatalogEntryForPersona(persona Persona) (personaCatalogEntry, bool) 
 func personaCatalogEntryForSeed(seed string) personaCatalogEntry {
 	seed = strings.TrimSpace(seed)
 	if seed == "" {
-		return personaCatalogV2[0]
+		return personaCatalogV3[0]
 	}
 	digest := sha256.Sum256([]byte("chatgpt-web-persona-" + personaCatalogVersion + "\x00" + seed))
-	index := uint64(digest[len(digest)-1]) % uint64(len(personaCatalogV2))
-	return personaCatalogV2[index]
+	index := uint64(digest[len(digest)-1]) % uint64(len(personaCatalogV3))
+	return personaCatalogV3[index]
 }
 
 func canonicalPersona(persona Persona) Persona {
@@ -172,13 +237,14 @@ func canonicalPersona(persona Persona) Persona {
 
 func personaCatalogRuntimeEntry(persona Persona) (personaCatalogEntry, int) {
 	if entry, ok := personaCatalogEntryForPersona(persona); ok {
-		for index := range personaCatalogV2 {
-			if personaCatalogV2[index].persona.CatalogID == entry.persona.CatalogID {
+		entries := personaCatalogEntries(entry.persona.CatalogVersion)
+		for index := range entries {
+			if entries[index].persona.CatalogID == entry.persona.CatalogID {
 				return entry, index
 			}
 		}
 	}
-	return personaCatalogV2[0], 0
+	return personaCatalogV3[0], 0
 }
 
 func resolveCredentialPersona(credential *Credential, fallbackSeed string) {

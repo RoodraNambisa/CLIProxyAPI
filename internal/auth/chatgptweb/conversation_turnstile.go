@@ -659,7 +659,12 @@ func normalizeConversationTurnstileEnvironment(environment ConversationTurnstile
 	if len(storageKeys) == 0 {
 		storageKeys = append([]string(nil), conversationTurnstileLocalStorageKeys...)
 	}
-	languages := conversationTurnstileArrayValue([]any{persona.Language})
+	navigatorLanguages := personaNavigatorLanguages(persona)
+	languageValues := make([]any, len(navigatorLanguages))
+	for index := range navigatorLanguages {
+		languageValues[index] = navigatorLanguages[index]
+	}
+	languages := conversationTurnstileArrayValue(languageValues)
 	values := map[string]any{
 		"window.navigator.userAgent":                 persona.UserAgent,
 		"window.navigator.language":                  persona.Language,

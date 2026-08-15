@@ -86,7 +86,7 @@ func TestExecutionResultErrorEnrichesDiagnosticWithoutChangingBusinessCode(t *te
 		t.Fatalf("result classification = %#v", result)
 	}
 	if result.Diagnostic.AuthIndex != auth.EnsureIndex() || result.Diagnostic.Persona != "chrome_146" ||
-		result.Diagnostic.CatalogVersion != "v2" || result.Diagnostic.CatalogID == "" ||
+		result.Diagnostic.CatalogVersion != "v3" || result.Diagnostic.CatalogID == "" ||
 		result.Diagnostic.TransportPersonaID == "" || result.Diagnostic.BrowserEnvironmentID == "" ||
 		result.Diagnostic.TLSProfile != "chrome_146" || result.Diagnostic.UAMajor != "146" ||
 		(result.Diagnostic.Platform != "MacIntel" && result.Diagnostic.Platform != "Win32") {

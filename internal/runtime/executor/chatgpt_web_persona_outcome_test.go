@@ -48,7 +48,7 @@ func TestChatGPTWebPersonaOutcomesClassifyRequestResults(t *testing.T) {
 		t.Fatalf("persona outcomes = %#v", snapshot.PersonaOutcomes)
 	}
 	outcome := snapshot.PersonaOutcomes[0]
-	if outcome.CatalogVersion != "v2" || outcome.CatalogID == "" || outcome.TransportPersonaID != outcome.CatalogID ||
+	if outcome.CatalogVersion != "v3" || outcome.CatalogID == "" || outcome.TransportPersonaID != outcome.CatalogID ||
 		outcome.BrowserEnvironmentID == "" || outcome.TLSProfile != "chrome_146" || outcome.UAMajor != "146" {
 		t.Fatalf("persona identity = %#v", outcome)
 	}
