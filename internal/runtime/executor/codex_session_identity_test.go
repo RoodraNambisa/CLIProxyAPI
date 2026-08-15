@@ -62,7 +62,7 @@ func TestCodexPrepareProviderRequestKeepsExplicitUUID(t *testing.T) {
 func TestCodexPrepareProviderRequestUsesExecutionSessionAndRequestID(t *testing.T) {
 	executor := NewCodexExecutor(&config.Config{Codex: config.CodexConfig{SpoofSessionIdentity: true}})
 	executionSessionID := uuid.NewString()
-	wsPrepared := prepareCodexSessionIdentityForTest(t, executor, t.Context(), cliproxyexecutor.Request{}, cliproxyexecutor.Options{
+	wsPrepared := prepareCodexSessionIdentityForTest(t, executor, t.Context(), cliproxyexecutor.Request{Payload: []byte(`{"prompt_cache_key":"request-cache"}`)}, cliproxyexecutor.Options{
 		Metadata: map[string]any{cliproxyexecutor.ExecutionSessionMetadataKey: executionSessionID},
 	})
 	if wsPrepared.ThreadID != executionSessionID {

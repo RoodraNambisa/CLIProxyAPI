@@ -343,18 +343,18 @@ func (e *CodexExecutor) PrepareProviderRequest(ctx context.Context, req cliproxy
 }
 
 func codexPreparedThreadID(ctx context.Context, opts cliproxyexecutor.Options, payload []byte) string {
+	if executionSessionID := executionSessionIDFromOptions(opts); executionSessionID != "" {
+		if parsed, err := uuid.Parse(executionSessionID); err == nil {
+			return parsed.String()
+		}
+		return codexSessionIdentityUUID("execution-session", executionSessionID)
+	}
 	if promptCacheKey := strings.TrimSpace(gjson.GetBytes(payload, "prompt_cache_key").String()); promptCacheKey != "" {
 		if parsed, err := uuid.Parse(promptCacheKey); err == nil {
 			return parsed.String()
 		}
 		tenant := strings.TrimSpace(helps.APIKeyFromContext(ctx))
 		return codexSessionIdentityUUID("prompt-cache", tenant+"\x00"+promptCacheKey)
-	}
-	if executionSessionID := executionSessionIDFromOptions(opts); executionSessionID != "" {
-		if parsed, err := uuid.Parse(executionSessionID); err == nil {
-			return parsed.String()
-		}
-		return codexSessionIdentityUUID("execution-session", executionSessionID)
 	}
 	if requestID := strings.TrimSpace(logging.GetRequestID(ctx)); requestID != "" {
 		return codexSessionIdentityUUID("request", requestID)

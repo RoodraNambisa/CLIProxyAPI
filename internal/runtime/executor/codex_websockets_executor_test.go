@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
@@ -37,6 +39,116 @@ func TestBuildCodexWebsocketRequestBodyPreservesPreviousResponseID(t *testing.T)
 	}
 	if got := gjson.GetBytes(wsReqBody, "type").String(); got == "response.append" {
 		t.Fatalf("unexpected websocket request type: %s", got)
+	}
+}
+
+func TestCodexWebsocketSessionIdentityStaysStableAcrossTurns(t *testing.T) {
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	headersCh := make(chan http.Header, 1)
+	payloadCh := make(chan []byte, 2)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		headersCh <- r.Header.Clone()
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Errorf("upgrade websocket: %v", err)
+			return
+		}
+		defer func() { _ = conn.Close() }()
+		for index := 0; index < 2; index++ {
+			_, payload, errRead := conn.ReadMessage()
+			if errRead != nil {
+				t.Errorf("read websocket request %d: %v", index, errRead)
+				return
+			}
+			payloadCh <- bytes.Clone(payload)
+			completed := []byte(fmt.Sprintf(`{"type":"response.completed","response":{"id":"resp_%d","output":[],"usage":{"input_tokens":0,"output_tokens":0,"total_tokens":0}}}`, index+1))
+			if errWrite := conn.WriteMessage(websocket.TextMessage, completed); errWrite != nil {
+				t.Errorf("write websocket response %d: %v", index, errWrite)
+				return
+			}
+		}
+	}))
+	defer server.Close()
+
+	executionSessionID := uuid.NewString()
+	exec := NewCodexWebsocketsExecutor(&config.Config{
+		Codex:     config.CodexConfig{SpoofSessionIdentity: true},
+		SDKConfig: sdkconfig.SDKConfig{ProxyURL: "direct"},
+	})
+	defer exec.CloseExecutionSession(executionSessionID)
+	auth := &cliproxyauth.Auth{
+		ID: "oauth-ws-auth", Provider: "codex",
+		Metadata:   map[string]any{"access_token": "oauth-token"},
+		Attributes: map[string]string{"base_url": server.URL},
+	}
+	opts := cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("codex"),
+		Metadata: map[string]any{
+			cliproxyexecutor.ExecutionSessionMetadataKey: executionSessionID,
+		},
+	}
+	for index := 0; index < 2; index++ {
+		req := cliproxyexecutor.Request{Model: "gpt-5.4", Payload: []byte(fmt.Sprintf(`{"model":"gpt-5.4","input":"hello","prompt_cache_key":"cache-%d"}`, index+1))}
+		if _, err := exec.Execute(t.Context(), auth, req, opts); err != nil {
+			t.Fatalf("Execute() turn %d error = %v", index+1, err)
+		}
+	}
+
+	var headers http.Header
+	select {
+	case headers = <-headersCh:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for websocket handshake headers")
+	}
+	payloads := make([][]byte, 0, 2)
+	for len(payloads) < 2 {
+		select {
+		case payload := <-payloadCh:
+			payloads = append(payloads, payload)
+		case <-time.After(5 * time.Second):
+			t.Fatal("timed out waiting for websocket request payloads")
+		}
+	}
+
+	if got := headers.Get("Session-Id"); got != executionSessionID {
+		t.Fatalf("Session-Id = %q, want %q", got, executionSessionID)
+	}
+	if got := headers.Get("Thread-Id"); got != executionSessionID {
+		t.Fatalf("Thread-Id = %q, want %q", got, executionSessionID)
+	}
+	if got := headers.Get("X-Codex-Window-Id"); got != executionSessionID+":0" {
+		t.Fatalf("X-Codex-Window-Id = %q, want %q", got, executionSessionID+":0")
+	}
+	if got := headerValueCaseInsensitive(headers, "session_id"); got != executionSessionID {
+		t.Fatalf("websocket session_id = %q, want %q", got, executionSessionID)
+	}
+	if got := headers.Get("X-OpenAI-Internal-Codex-Responses-Lite"); got != "" {
+		t.Fatalf("Responses Lite header = %q, want absent", got)
+	}
+
+	turnIDs := make([]string, 0, 2)
+	for index, payload := range payloads {
+		if got := gjson.GetBytes(payload, "type").String(); got != "response.create" {
+			t.Fatalf("payload %d type = %q, want response.create", index+1, got)
+		}
+		if got := gjson.GetBytes(payload, "client_metadata.session_id").String(); got != executionSessionID {
+			t.Fatalf("payload %d session_id = %q, want %q", index+1, got, executionSessionID)
+		}
+		if got := gjson.GetBytes(payload, "client_metadata.thread_id").String(); got != executionSessionID {
+			t.Fatalf("payload %d thread_id = %q, want %q", index+1, got, executionSessionID)
+		}
+		turnMetadata := gjson.GetBytes(payload, "client_metadata.x-codex-turn-metadata").String()
+		turnID := gjson.Get(turnMetadata, "turn_id").String()
+		if turnID == "" {
+			t.Fatalf("payload %d turn_id is empty", index+1)
+		}
+		turnIDs = append(turnIDs, turnID)
+	}
+	if turnIDs[0] == turnIDs[1] {
+		t.Fatalf("two websocket turns reused turn ID %q", turnIDs[0])
+	}
+	if got := headers.Get("X-Codex-Turn-Metadata"); got != gjson.GetBytes(payloads[0], "client_metadata.x-codex-turn-metadata").String() {
+		t.Fatalf("handshake/body turn metadata differ: header=%q body=%q", got, gjson.GetBytes(payloads[0], "client_metadata.x-codex-turn-metadata").String())
 	}
 }
 
