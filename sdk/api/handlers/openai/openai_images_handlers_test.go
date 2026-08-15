@@ -9,10 +9,13 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/gin-gonic/gin"
+	internalconfig "github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/constant"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
@@ -45,6 +48,42 @@ type imageCaptureExecutor struct {
 	response                        []byte
 	streamChunks                    []coreexecutor.StreamChunk
 	beforeExecute                   func()
+}
+
+type imagePressureExecutor struct {
+	entered chan struct{}
+	release <-chan struct{}
+	once    sync.Once
+	calls   atomic.Int64
+}
+
+func (e *imagePressureExecutor) Identifier() string { return "codex" }
+
+func (e *imagePressureExecutor) Execute(ctx context.Context, _ *coreauth.Auth, _ coreexecutor.Request, _ coreexecutor.Options) (coreexecutor.Response, error) {
+	e.calls.Add(1)
+	e.once.Do(func() { close(e.entered) })
+	select {
+	case <-ctx.Done():
+		return coreexecutor.Response{}, ctx.Err()
+	case <-e.release:
+	}
+	return coreexecutor.Response{Payload: []byte(`{"created_at":1700000000,"output":[{"type":"image_generation_call","result":"aGVsbG8="}]}`)}, nil
+}
+
+func (e *imagePressureExecutor) ExecuteStream(context.Context, *coreauth.Auth, coreexecutor.Request, coreexecutor.Options) (*coreexecutor.StreamResult, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (e *imagePressureExecutor) Refresh(_ context.Context, auth *coreauth.Auth) (*coreauth.Auth, error) {
+	return auth, nil
+}
+
+func (e *imagePressureExecutor) CountTokens(context.Context, *coreauth.Auth, coreexecutor.Request, coreexecutor.Options) (coreexecutor.Response, error) {
+	return coreexecutor.Response{}, errors.New("not implemented")
+}
+
+func (e *imagePressureExecutor) HttpRequest(context.Context, *coreauth.Auth, *http.Request) (*http.Response, error) {
+	return nil, errors.New("not implemented")
 }
 
 func (e *imageCaptureExecutor) Identifier() string {
@@ -210,6 +249,135 @@ func newMixedImagesTestHandler(t *testing.T, codexExecutor, webExecutor *imageCa
 		Images: sdkconfig.ImagesConfig{CodexModel: "gpt-5.4-mini"},
 	}, manager)
 	return NewOpenAIImagesAPIHandler(base)
+}
+
+func TestOpenAIImagesGenerationsBoundsFifteenHundredConcurrentRequestsBeforeRouting(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	const (
+		requestCount = 1500
+		requestLimit = 1000
+	)
+	baseline := executorhelps.ChatGPTWebImageMemorySnapshot()
+	if baseline.ProcessingTasks != 0 || baseline.WaitingTasks != 0 {
+		t.Fatalf("image admission was busy before pressure test: %+v", baseline)
+	}
+
+	releaseExecutor := make(chan struct{})
+	executor := &imagePressureExecutor{
+		entered: make(chan struct{}),
+		release: releaseExecutor,
+	}
+	manager := coreauth.NewManager(nil, nil, nil)
+	manager.RegisterExecutor(executor)
+	manager.SetConfig(&internalconfig.Config{Routing: internalconfig.RoutingConfig{
+		PerAuthRequestLimit:         requestLimit,
+		PerAuthRequestWindowMinutes: 1,
+	}})
+	auth := &coreauth.Auth{ID: "image-pressure-auth", Provider: executor.Identifier(), Status: coreauth.StatusActive}
+	if _, errRegister := manager.Register(t.Context(), auth); errRegister != nil {
+		t.Fatalf("register pressure auth: %v", errRegister)
+	}
+	registry.GetGlobalRegistry().RegisterClient(auth.ID, auth.Provider, []*registry.ModelInfo{
+		{ID: "gpt-image-2"},
+		{ID: "gpt-5.4-mini"},
+	})
+	t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(auth.ID) })
+
+	handler := NewOpenAIImagesAPIHandler(handlers.NewBaseAPIHandlers(&sdkconfig.SDKConfig{
+		Images: sdkconfig.ImagesConfig{CodexModel: "gpt-5.4-mini"},
+	}, manager))
+	router := gin.New()
+	router.POST("/v1/images/generations", handler.Generations)
+
+	start := make(chan struct{})
+	var wait sync.WaitGroup
+	var succeeded atomic.Int64
+	var rejected atomic.Int64
+	var unexpected atomic.Int64
+	wait.Add(requestCount)
+	for range requestCount {
+		go func() {
+			defer wait.Done()
+			<-start
+			request := httptest.NewRequest(
+				http.MethodPost,
+				"/v1/images/generations",
+				strings.NewReader(`{"model":"gpt-image-2","prompt":"pressure test"}`),
+			)
+			request.Header.Set("Content-Type", "application/json")
+			// A large declared body forces every admitted request to own the full
+			// memory budget without allocating a large fixture in the test itself.
+			request.ContentLength = 200 << 20
+			response := httptest.NewRecorder()
+			router.ServeHTTP(response, request)
+			switch response.Code {
+			case http.StatusOK:
+				succeeded.Add(1)
+			case http.StatusServiceUnavailable:
+				if strings.Contains(response.Body.String(), `"code":"image_memory_capacity"`) &&
+					strings.Contains(response.Body.String(), `"failure_stage":"admission"`) {
+					rejected.Add(1)
+					return
+				}
+				unexpected.Add(1)
+			default:
+				unexpected.Add(1)
+			}
+		}()
+	}
+	close(start)
+
+	select {
+	case <-executor.entered:
+	case <-time.After(10 * time.Second):
+		t.Fatal("stub executor was not reached")
+	}
+	expectedSucceeded := baseline.QueueLimit + 1
+	expectedRejected := int64(requestCount) - expectedSucceeded
+	deadline := time.Now().Add(10 * time.Second)
+	for rejected.Load() < expectedRejected && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if rejected.Load() != expectedRejected {
+		close(releaseExecutor)
+		t.Fatalf("fast admission rejections = %d, want %d", rejected.Load(), expectedRejected)
+	}
+	close(releaseExecutor)
+
+	completed := make(chan struct{})
+	go func() {
+		wait.Wait()
+		close(completed)
+	}()
+	select {
+	case <-completed:
+	case <-time.After(20 * time.Second):
+		t.Fatal("pressure requests did not finish")
+	}
+	if succeeded.Load() != expectedSucceeded || rejected.Load() != expectedRejected || unexpected.Load() != 0 {
+		t.Fatalf(
+			"pressure outcomes = success:%d rejected:%d unexpected:%d, want success:%d rejected:%d",
+			succeeded.Load(), rejected.Load(), unexpected.Load(), expectedSucceeded, expectedRejected,
+		)
+	}
+	after := executorhelps.ChatGPTWebImageMemorySnapshot()
+	if after.ProcessingTasks != 0 || after.ProcessingBytes != 0 || after.WaitingTasks != 0 || after.WaitingBytes != 0 {
+		t.Fatalf("image admission leaked after pressure test: %+v", after)
+	}
+	if after.PeakProcessingBytes > after.CapacityBytes {
+		t.Fatalf("image admission peak exceeded capacity: %+v", after)
+	}
+	if executor.calls.Load() != expectedSucceeded {
+		t.Fatalf("stub executor calls = %d, want %d", executor.calls.Load(), expectedSucceeded)
+	}
+
+	routing := manager.RoutingDiagnostics("codex", "gpt-image-2", time.Now())
+	if len(routing.Priorities) != 1 || routing.Priorities[0].RequestCapacity.RemainingSlots == nil {
+		t.Fatalf("routing diagnostics after pressure test = %+v", routing)
+	}
+	if remaining := *routing.Priorities[0].RequestCapacity.RemainingSlots; remaining != requestLimit-expectedSucceeded {
+		t.Fatalf("remaining request slots = %d, want %d", remaining, requestLimit-expectedSucceeded)
+	}
 }
 
 func TestOpenAIImagesGenerationsNonStreamingUsesCodexImageTool(t *testing.T) {
