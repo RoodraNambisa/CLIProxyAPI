@@ -137,6 +137,46 @@ func TestAuthSchedulerRoutingDiagnosticsReportsUnlimitedCapacityExplicitly(t *te
 	}
 }
 
+func TestAuthSchedulerRoutingDiagnosticsReportsFiniteTotalsForMixedCapacity(t *testing.T) {
+	now := time.Date(2026, time.August, 14, 12, 34, 56, 0, time.UTC)
+	auths := []*Auth{
+		routingDiagnosticsTestAuth("limited", "test", 0),
+		routingDiagnosticsTestAuth("unlimited", "test", 0),
+	}
+	auths[1].Attributes["plan_type"] = "unlimited"
+	disabled := 0
+	scheduler := newRoutingDiagnosticsTestScheduler("test", "diag-model", now, auths)
+	scheduler.setRoutingConfig(internalconfig.RoutingConfig{
+		PerAuthRequestLimit:         2,
+		PerAuthRequestWindowMinutes: 5,
+		PriorityOverrides: []internalconfig.RoutingPriorityOverride{{
+			Priority: 0,
+			SubscriptionOverrides: []internalconfig.RoutingSubscriptionOverride{{
+				PlanTypes:           []string{"unlimited"},
+				PerAuthRequestLimit: &disabled,
+			}},
+		}},
+	})
+
+	snapshot := scheduler.RoutingDiagnostics("test", "diag-model", now)
+	if len(snapshot.Priorities) != 1 {
+		t.Fatalf("priority groups = %d, want 1", len(snapshot.Priorities))
+	}
+	capacity := snapshot.Priorities[0].RequestCapacity
+	if capacity.Mode != "mixed" || capacity.LimitedCredentials != 1 || capacity.UnlimitedCredentials != 1 {
+		t.Fatalf("capacity = %+v, want one limited and one unlimited credential", capacity)
+	}
+	if capacity.ConfiguredSlots == nil || *capacity.ConfiguredSlots != 2 {
+		t.Fatalf("configured slots = %v, want 2", capacity.ConfiguredSlots)
+	}
+	if capacity.RemainingSlots == nil || *capacity.RemainingSlots != 2 {
+		t.Fatalf("remaining slots = %v, want 2", capacity.RemainingSlots)
+	}
+	if capacity.ConfiguredRPM == nil || *capacity.ConfiguredRPM != 0.4 {
+		t.Fatalf("configured RPM = %v, want 0.4", capacity.ConfiguredRPM)
+	}
+}
+
 func TestAuthSchedulerRoutingDiagnosticsTenThousandEntries(t *testing.T) {
 	now := time.Date(2026, time.August, 14, 12, 34, 56, 0, time.UTC)
 	auths := make([]*Auth, 10_000)

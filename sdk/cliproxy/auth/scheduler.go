@@ -547,14 +547,16 @@ func (s *authScheduler) RoutingDiagnostics(provider, model string, now time.Time
 			capacity.Mode = "unlimited"
 		case capacity.LimitedCredentials > 0:
 			capacity.Mode = "limited"
+		default:
+			capacity.Mode = "none"
+		}
+		if capacity.LimitedCredentials > 0 {
 			configuredSlots := accumulator.configuredSlots
 			remainingSlots := accumulator.remainingSlots
 			configuredRPM := accumulator.configuredRPM
 			capacity.ConfiguredSlots = &configuredSlots
 			capacity.RemainingSlots = &remainingSlots
 			capacity.ConfiguredRPM = &configuredRPM
-		default:
-			capacity.Mode = "none"
 		}
 		if !accumulator.earliestConsumedResetAt.IsZero() {
 			resetAt := accumulator.earliestConsumedResetAt
