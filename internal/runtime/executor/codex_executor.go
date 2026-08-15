@@ -694,7 +694,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 		return resp, err
 	}
 	applyCodexIdentityConfuseHeaders(httpReq.Header, &identityState)
-	upstreamBody, err = e.applyCodexHTTPSessionIdentity(ctx, auth, req, opts, httpReq, upstreamBody, identityState)
+	upstreamBody, err = e.applyCodexHTTPSessionIdentity(ctx, auth, req, opts, httpReq, upstreamBody, &identityState)
 	if err != nil {
 		return resp, err
 	}
@@ -883,7 +883,7 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 		return resp, err
 	}
 	applyCodexIdentityConfuseHeaders(httpReq.Header, &identityState)
-	upstreamBody, err = e.applyCodexHTTPSessionIdentity(ctx, auth, req, opts, httpReq, upstreamBody, identityState)
+	upstreamBody, err = e.applyCodexHTTPSessionIdentity(ctx, auth, req, opts, httpReq, upstreamBody, &identityState)
 	if err != nil {
 		return resp, err
 	}
@@ -1017,7 +1017,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 		return nil, err
 	}
 	applyCodexIdentityConfuseHeaders(httpReq.Header, &identityState)
-	upstreamBody, err = e.applyCodexHTTPSessionIdentity(ctx, auth, req, opts, httpReq, upstreamBody, identityState)
+	upstreamBody, err = e.applyCodexHTTPSessionIdentity(ctx, auth, req, opts, httpReq, upstreamBody, &identityState)
 	if err != nil {
 		return nil, err
 	}
@@ -1600,7 +1600,7 @@ func (e *CodexExecutor) applyCodexHTTPSessionIdentity(
 	opts cliproxyexecutor.Options,
 	httpReq *http.Request,
 	rawJSON []byte,
-	identityConfuse codexIdentityConfuseState,
+	identityConfuse *codexIdentityConfuseState,
 ) ([]byte, error) {
 	projected, state, err := e.projectCodexSessionIdentity(ctx, auth, req, opts, rawJSON, identityConfuse)
 	if err != nil {
@@ -1624,7 +1624,7 @@ func (e *CodexExecutor) projectCodexSessionIdentity(
 	req cliproxyexecutor.Request,
 	opts cliproxyexecutor.Options,
 	rawJSON []byte,
-	identityConfuse codexIdentityConfuseState,
+	identityConfuse *codexIdentityConfuseState,
 ) ([]byte, codexSessionIdentityState, error) {
 	if !codexSpoofSessionIdentityEnabled(e.cfg) || auth == nil || codexAuthUsesAPIKey(auth) {
 		return rawJSON, codexSessionIdentityState{}, nil
@@ -1635,7 +1635,12 @@ func (e *CodexExecutor) projectCodexSessionIdentity(
 		WindowID: prepared.WindowID, RequestKind: prepared.RequestKind,
 	}
 	confused := helps.CodexSessionIdentityHeaderSource{}
-	if identityConfuse.promptCacheKey != "" {
+	client := codexClientSessionIdentitySource(ctx, opts)
+	if identityConfuse != nil && identityConfuse.enabled {
+		rawJSON = applyCodexIdentityConfuseFlatTurnID(rawJSON, identityConfuse)
+		client = applyCodexIdentityConfuseSessionSource(client, identityConfuse)
+	}
+	if identityConfuse != nil && identityConfuse.promptCacheKey != "" {
 		confused.SessionID = identityConfuse.promptCacheKey
 		confused.ThreadID = identityConfuse.promptCacheKey
 		confused.WindowID = identityConfuse.promptCacheKey + ":0"
@@ -1644,7 +1649,7 @@ func (e *CodexExecutor) projectCodexSessionIdentity(
 		rawJSON,
 		codexCredentialSessionIdentitySource(auth),
 		confused,
-		codexClientSessionIdentitySource(ctx, opts),
+		client,
 		defaults,
 	)
 	if err != nil {
@@ -1659,6 +1664,47 @@ func (e *CodexExecutor) projectCodexSessionIdentity(
 		return nil, codexSessionIdentityState{}, status
 	}
 	return projected, codexSessionIdentityState{enabled: true, identity: identity, turnMetadata: turnMetadata}, nil
+}
+
+func applyCodexIdentityConfuseFlatTurnID(rawJSON []byte, state *codexIdentityConfuseState) []byte {
+	if state == nil || !state.enabled {
+		return rawJSON
+	}
+	turnID := strings.TrimSpace(gjson.GetBytes(rawJSON, "client_metadata.turn_id").String())
+	if turnID == "" {
+		return rawJSON
+	}
+	confusedTurnID := state.confuseTurnID(turnID)
+	if confusedTurnID == turnID {
+		return rawJSON
+	}
+	updated, err := sjson.SetBytes(rawJSON, "client_metadata.turn_id", confusedTurnID)
+	if err != nil {
+		return rawJSON
+	}
+	return updated
+}
+
+func applyCodexIdentityConfuseSessionSource(source helps.CodexSessionIdentityHeaderSource, state *codexIdentityConfuseState) helps.CodexSessionIdentityHeaderSource {
+	if state == nil || !state.enabled {
+		return source
+	}
+	if source.TurnMetadata != "" {
+		source.TurnMetadata = applyCodexTurnMetadataIdentityConfuse(source.TurnMetadata, state)
+	}
+	if state.promptCacheKey == "" {
+		return source
+	}
+	if source.SessionID != "" {
+		source.SessionID = state.promptCacheKey
+	}
+	if source.ThreadID != "" {
+		source.ThreadID = state.promptCacheKey
+	}
+	if source.WindowID != "" {
+		source.WindowID = state.promptCacheKey + ":0"
+	}
+	return source
 }
 
 func (e *CodexExecutor) codexPreparedSessionIdentity(ctx context.Context, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) codexPreparedSessionIdentity {

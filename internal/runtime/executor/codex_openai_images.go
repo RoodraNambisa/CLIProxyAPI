@@ -121,7 +121,7 @@ func (e *CodexExecutor) executeOpenAIImage(ctx context.Context, auth *cliproxyau
 		return resp, err
 	}
 	applyCodexIdentityConfuseHeaders(httpReq.Header, &identityState)
-	upstreamBody, err = e.applyCodexHTTPSessionIdentity(ctx, auth, req, opts, httpReq, upstreamBody, identityState)
+	upstreamBody, err = e.applyCodexHTTPSessionIdentity(ctx, auth, req, opts, httpReq, upstreamBody, &identityState)
 	if err != nil {
 		return resp, err
 	}
@@ -200,7 +200,7 @@ func (e *CodexExecutor) executeOpenAIImageStream(ctx context.Context, auth *clip
 		return nil, err
 	}
 	applyCodexIdentityConfuseHeaders(httpReq.Header, &identityState)
-	upstreamBody, err = e.applyCodexHTTPSessionIdentity(ctx, auth, req, opts, httpReq, upstreamBody, identityState)
+	upstreamBody, err = e.applyCodexHTTPSessionIdentity(ctx, auth, req, opts, httpReq, upstreamBody, &identityState)
 	if err != nil {
 		return nil, err
 	}

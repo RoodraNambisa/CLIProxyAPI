@@ -81,15 +81,17 @@ func ProjectCodexSessionIdentity(
 	identity := CodexSessionIdentity{
 		SessionID: firstCodexIdentityValue(
 			admin.SessionID, codexTurnString(adminTurn, "session_id"),
+			confused.SessionID,
 			codexTurnString(bodyTurn, "session_id"), bodySessionID,
 			client.SessionID, codexTurnString(clientTurn, "session_id"),
-			confused.SessionID, defaults.SessionID,
+			defaults.SessionID,
 		),
 		ThreadID: firstCodexIdentityValue(
 			admin.ThreadID, codexTurnString(adminTurn, "thread_id"),
+			confused.ThreadID,
 			codexTurnString(bodyTurn, "thread_id"), bodyThreadID,
 			client.ThreadID, codexTurnString(clientTurn, "thread_id"),
-			confused.ThreadID, defaults.ThreadID,
+			defaults.ThreadID,
 		),
 		TurnID: firstCodexIdentityValue(
 			codexTurnString(adminTurn, "turn_id"),
@@ -98,9 +100,10 @@ func ProjectCodexSessionIdentity(
 		),
 		WindowID: firstCodexIdentityValue(
 			admin.WindowID, codexTurnString(adminTurn, "window_id"),
+			confused.WindowID,
 			codexTurnString(bodyTurn, "window_id"), bodyWindowID,
 			client.WindowID, codexTurnString(clientTurn, "window_id"),
-			confused.WindowID, defaults.WindowID,
+			defaults.WindowID,
 		),
 		RequestKind: firstCodexIdentityValue(
 			codexTurnString(adminTurn, "request_kind"), codexTurnString(bodyTurn, "request_kind"),

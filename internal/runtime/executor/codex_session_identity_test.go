@@ -136,7 +136,8 @@ func TestCodexProjectSessionIdentityUsesIndependentSourcePriority(t *testing.T) 
 	}
 	raw := []byte(`{"model":"gpt-5.4","client_metadata":{"thread_id":"body-flat-thread","x-codex-turn-metadata":"{\"thread_id\":\"body-turn-thread\",\"turn_id\":\"body-turn\",\"workspace\":\"/tmp/project\"}"}}`)
 
-	projected, state, err := executor.projectCodexSessionIdentity(t.Context(), auth, cliproxyexecutor.Request{}, opts, raw, codexIdentityConfuseState{promptCacheKey: "confused-cache"})
+	identityState := codexIdentityConfuseState{}
+	projected, state, err := executor.projectCodexSessionIdentity(t.Context(), auth, cliproxyexecutor.Request{}, opts, raw, &identityState)
 	if err != nil {
 		t.Fatalf("projectCodexSessionIdentity() error = %v", err)
 	}
@@ -180,7 +181,8 @@ func TestCodexProjectSessionIdentitySkipsDisabledAndAPIKeyAuth(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			projected, state, err := tt.executor.projectCodexSessionIdentity(t.Context(), tt.auth, cliproxyexecutor.Request{}, cliproxyexecutor.Options{}, raw, codexIdentityConfuseState{})
+			identityState := codexIdentityConfuseState{}
+			projected, state, err := tt.executor.projectCodexSessionIdentity(t.Context(), tt.auth, cliproxyexecutor.Request{}, cliproxyexecutor.Options{}, raw, &identityState)
 			if err != nil {
 				t.Fatalf("projectCodexSessionIdentity() error = %v", err)
 			}
@@ -197,7 +199,8 @@ func TestCodexProjectSessionIdentitySkipsDisabledAndAPIKeyAuth(t *testing.T) {
 func TestCodexProjectSessionIdentityRejectsMalformedMetadataWithoutCoolingAuth(t *testing.T) {
 	executor := NewCodexExecutor(&config.Config{Codex: config.CodexConfig{SpoofSessionIdentity: true}})
 	auth := &cliproxyauth.Auth{Provider: "codex", Metadata: map[string]any{"access_token": "oauth-token"}}
-	_, _, err := executor.projectCodexSessionIdentity(t.Context(), auth, cliproxyexecutor.Request{}, cliproxyexecutor.Options{}, []byte(`{"client_metadata":[]}`), codexIdentityConfuseState{})
+	identityState := codexIdentityConfuseState{}
+	_, _, err := executor.projectCodexSessionIdentity(t.Context(), auth, cliproxyexecutor.Request{}, cliproxyexecutor.Options{}, []byte(`{"client_metadata":[]}`), &identityState)
 	if err == nil {
 		t.Fatal("projectCodexSessionIdentity() error = nil, want validation error")
 	}
@@ -207,6 +210,60 @@ func TestCodexProjectSessionIdentityRejectsMalformedMetadataWithoutCoolingAuth(t
 	}
 	if status.StatusCode() != http.StatusBadRequest || !status.SkipAuthResult() {
 		t.Fatalf("status = %d, skip auth = %v; want 400, true", status.StatusCode(), status.SkipAuthResult())
+	}
+}
+
+func TestCodexProjectSessionIdentityKeepsIdentityConfuseApplied(t *testing.T) {
+	cfg := &config.Config{
+		Routing: config.RoutingConfig{Strategy: "fill-first"},
+		Codex: config.CodexConfig{
+			IdentityConfuse:      true,
+			SpoofSessionIdentity: true,
+		},
+	}
+	executor := NewCodexExecutor(cfg)
+	auth := &cliproxyauth.Auth{ID: "oauth-auth", Provider: "codex", Metadata: map[string]any{"access_token": "oauth-token"}}
+	originalCacheKey := "cache-original"
+	originalTurnID := "turn-original"
+	requestPayload := []byte(`{"prompt_cache_key":"cache-original"}`)
+	upstreamPayload := []byte(`{"model":"gpt-5.4","client_metadata":{"session_id":"session-original","thread_id":"thread-original","turn_id":"turn-original","x-codex-window-id":"thread-original:0","x-codex-turn-metadata":"{\"session_id\":\"session-original\",\"thread_id\":\"thread-original\",\"turn_id\":\"turn-original\",\"window_id\":\"thread-original:0\"}"}}`)
+	upstreamPayload, identityState := applyCodexIdentityConfuseBody(cfg, auth, requestPayload, upstreamPayload)
+	opts := cliproxyexecutor.Options{Headers: http.Header{
+		"Session-Id":            []string{"client-session"},
+		"Thread-Id":             []string{"client-thread"},
+		"X-Codex-Window-Id":     []string{"client-window"},
+		"X-Codex-Turn-Metadata": []string{`{"turn_id":"client-turn"}`},
+	}}
+
+	projected, state, err := executor.projectCodexSessionIdentity(t.Context(), auth, cliproxyexecutor.Request{Payload: requestPayload}, opts, upstreamPayload, &identityState)
+	if err != nil {
+		t.Fatalf("projectCodexSessionIdentity() error = %v", err)
+	}
+	expectedCacheKey := codexIdentityConfuseUUID(auth.ID, "prompt-cache", originalCacheKey)
+	expectedTurnID := codexIdentityConfuseUUID(auth.ID, "turn", originalTurnID)
+	if state.identity.SessionID != expectedCacheKey || state.identity.ThreadID != expectedCacheKey || state.identity.WindowID != expectedCacheKey+":0" {
+		t.Fatalf("projected identity = %#v, want confused cache identity %q", state.identity, expectedCacheKey)
+	}
+	if state.identity.TurnID != expectedTurnID {
+		t.Fatalf("TurnID = %q, want %q", state.identity.TurnID, expectedTurnID)
+	}
+	for _, path := range []string{"client_metadata.session_id", "client_metadata.thread_id"} {
+		if got := gjson.GetBytes(projected, path).String(); got != expectedCacheKey {
+			t.Fatalf("%s = %q, want %q", path, got, expectedCacheKey)
+		}
+	}
+	if got := gjson.GetBytes(projected, "client_metadata.turn_id").String(); got != expectedTurnID {
+		t.Fatalf("client_metadata.turn_id = %q, want %q", got, expectedTurnID)
+	}
+	foundResponseMapping := false
+	for _, mapping := range identityState.turnIDs {
+		if mapping.original == originalTurnID && mapping.confused == expectedTurnID {
+			foundResponseMapping = true
+			break
+		}
+	}
+	if !foundResponseMapping {
+		t.Fatalf("turn ID response mapping = %#v", identityState.turnIDs)
 	}
 }
 
