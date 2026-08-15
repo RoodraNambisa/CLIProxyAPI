@@ -510,6 +510,23 @@ func TestApplyChatGPTWebAuthFileSummaryExposesBoundedRecoveryState(t *testing.T)
 	}
 }
 
+func TestChatGPTWebAccountInfoManualRecheckableIncludesInteractionRequired(t *testing.T) {
+	auth := &coreauth.Auth{
+		Provider: chatgptwebauth.Provider,
+		Status:   coreauth.StatusError,
+		Metadata: map[string]any{
+			"lifecycle_state": string(chatgptwebauth.LifecycleInteractionRequired),
+		},
+	}
+	if !chatGPTWebAccountInfoManualRecheckable(auth) {
+		t.Fatal("interaction-required credential was not manually recheckable")
+	}
+	auth.Metadata["lifecycle_state"] = string(chatgptwebauth.LifecycleDead)
+	if chatGPTWebAccountInfoManualRecheckable(auth) {
+		t.Fatal("dead credential was manually recheckable")
+	}
+}
+
 func TestParseLastRefreshValueRejectsJSONUnsafeTimestamps(t *testing.T) {
 	for _, value := range []any{
 		float64(1_000_000_000_000),

@@ -177,7 +177,8 @@ func chatGPTWebAccountInfoManualRecheckable(auth *coreauth.Auth) bool {
 		return false
 	}
 	switch auth.LifecycleState() {
-	case "", coreauth.LifecycleStateActive, coreauth.LifecycleStateReauthRequired:
+	case "", coreauth.LifecycleStateActive, coreauth.LifecycleStateReauthRequired,
+		coreauth.LifecycleStateInteractionRequired:
 		return true
 	default:
 		return false
