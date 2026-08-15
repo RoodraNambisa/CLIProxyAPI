@@ -68,20 +68,37 @@ type RoutingDiagnosticsSnapshot struct {
 
 // RoutingPriorityDiagnostics summarizes one priority tier without exposing credential material.
 type RoutingPriorityDiagnostics struct {
-	Priority                    int        `json:"priority"`
-	Total                       int        `json:"total"`
-	QuotaExhausted              int        `json:"quota_exhausted"`
-	Cooldown                    int        `json:"cooldown"`
-	Unavailable                 int        `json:"unavailable"`
-	ReadyBeforeRequestLimit     int        `json:"ready_before_request_limit"`
-	RequestLimited              int        `json:"request_limited"`
-	EligibleNow                 int        `json:"eligible_now"`
-	EarliestRequestLimitResetAt *time.Time `json:"earliest_request_limit_reset_at"`
+	Priority                    int                               `json:"priority"`
+	Total                       int                               `json:"total"`
+	QuotaExhausted              int                               `json:"quota_exhausted"`
+	Cooldown                    int                               `json:"cooldown"`
+	Unavailable                 int                               `json:"unavailable"`
+	ReadyBeforeRequestLimit     int                               `json:"ready_before_request_limit"`
+	RequestLimited              int                               `json:"request_limited"`
+	EligibleNow                 int                               `json:"eligible_now"`
+	EarliestRequestLimitResetAt *time.Time                        `json:"earliest_request_limit_reset_at"`
+	RequestCapacity             RoutingRequestCapacityDiagnostics `json:"request_capacity"`
+}
+
+// RoutingRequestCapacityDiagnostics describes the configured fixed-window
+// capacity without treating unlimited credentials as zero-capacity entries.
+type RoutingRequestCapacityDiagnostics struct {
+	Mode                    string     `json:"mode"`
+	LimitedCredentials      int        `json:"limited_credentials"`
+	UnlimitedCredentials    int        `json:"unlimited_credentials"`
+	ConfiguredSlots         *int64     `json:"configured_slots"`
+	RemainingSlots          *int64     `json:"remaining_slots"`
+	ConfiguredRPM           *float64   `json:"configured_rpm"`
+	EarliestConsumedResetAt *time.Time `json:"earliest_consumed_reset_at"`
 }
 
 type routingPriorityDiagnosticsAccumulator struct {
 	diagnostics                 RoutingPriorityDiagnostics
 	earliestRequestLimitResetAt time.Time
+	configuredSlots             int64
+	remainingSlots              int64
+	configuredRPM               float64
+	earliestConsumedResetAt     time.Time
 }
 
 // providerScheduler stores auth metadata and model shards for a single provider.
@@ -486,17 +503,25 @@ func (s *authScheduler) RoutingDiagnostics(provider, model string, now time.Time
 		case scheduledStateReady:
 			accumulator.diagnostics.ReadyBeforeRequestLimit++
 			policy := s.requestLimitPolicyForAuthLocked(entry.auth)
-			available := true
-			block := authRequestLimitBlock{}
-			if s.requestLimiter != nil {
-				available, block = s.requestLimiter.availableAt(entry.auth.ID, policy, now)
+			usage := s.requestLimiter.usageAt(entry.auth.ID, policy, now)
+			if !usage.configured {
+				accumulator.diagnostics.RequestCapacity.UnlimitedCredentials++
+				accumulator.diagnostics.EligibleNow++
+				continue
 			}
-			if available {
+			accumulator.diagnostics.RequestCapacity.LimitedCredentials++
+			accumulator.configuredSlots += int64(usage.limit)
+			accumulator.remainingSlots += int64(usage.remaining)
+			accumulator.configuredRPM += float64(usage.limit) / float64(usage.windowMinutes)
+			if usage.remaining < usage.limit && (accumulator.earliestConsumedResetAt.IsZero() || usage.resetAt.Before(accumulator.earliestConsumedResetAt)) {
+				accumulator.earliestConsumedResetAt = usage.resetAt
+			}
+			if usage.remaining > 0 {
 				accumulator.diagnostics.EligibleNow++
 				continue
 			}
 			accumulator.diagnostics.RequestLimited++
-			resetAt := now.Add(block.resetIn)
+			resetAt := usage.resetAt
 			if accumulator.earliestRequestLimitResetAt.IsZero() || resetAt.Before(accumulator.earliestRequestLimitResetAt) {
 				accumulator.earliestRequestLimitResetAt = resetAt
 			}
@@ -514,6 +539,27 @@ func (s *authScheduler) RoutingDiagnostics(provider, model string, now time.Time
 	sort.Sort(sort.Reverse(sort.IntSlice(priorities)))
 	for _, priority := range priorities {
 		accumulator := byPriority[priority]
+		capacity := &accumulator.diagnostics.RequestCapacity
+		switch {
+		case capacity.UnlimitedCredentials > 0 && capacity.LimitedCredentials > 0:
+			capacity.Mode = "mixed"
+		case capacity.UnlimitedCredentials > 0:
+			capacity.Mode = "unlimited"
+		case capacity.LimitedCredentials > 0:
+			capacity.Mode = "limited"
+			configuredSlots := accumulator.configuredSlots
+			remainingSlots := accumulator.remainingSlots
+			configuredRPM := accumulator.configuredRPM
+			capacity.ConfiguredSlots = &configuredSlots
+			capacity.RemainingSlots = &remainingSlots
+			capacity.ConfiguredRPM = &configuredRPM
+		default:
+			capacity.Mode = "none"
+		}
+		if !accumulator.earliestConsumedResetAt.IsZero() {
+			resetAt := accumulator.earliestConsumedResetAt
+			capacity.EarliestConsumedResetAt = &resetAt
+		}
 		if !accumulator.earliestRequestLimitResetAt.IsZero() {
 			resetAt := accumulator.earliestRequestLimitResetAt
 			accumulator.diagnostics.EarliestRequestLimitResetAt = &resetAt
@@ -521,6 +567,38 @@ func (s *authScheduler) RoutingDiagnostics(provider, model string, now time.Time
 		snapshot.Priorities = append(snapshot.Priorities, accumulator.diagnostics)
 	}
 	return snapshot
+}
+
+// authIDsSupportingModel returns the scheduler entries whose cached registry
+// snapshot already includes model. It intentionally copies IDs only; callers
+// use it to repair stale model membership without cloning credential material.
+func (s *authScheduler) authIDsSupportingModel(providers []string, model string) map[string]struct{} {
+	supported := make(map[string]struct{})
+	if s == nil {
+		return supported
+	}
+	providerKeys := normalizeProviderKeys(providers)
+	modelKey := canonicalModelKey(model)
+	if len(providerKeys) == 0 || modelKey == "" {
+		return supported
+	}
+
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, providerKey := range providerKeys {
+		providerState := s.providers[providerKey]
+		if providerState == nil {
+			continue
+		}
+		providerState.mu.Lock()
+		for authID, meta := range providerState.auths {
+			if meta != nil && meta.supportsModel(modelKey) {
+				supported[authID] = struct{}{}
+			}
+		}
+		providerState.mu.Unlock()
+	}
+	return supported
 }
 
 func chatGPTWebImageQuotaExhaustedForRoutingDiagnostics(auth *Auth, model string, now time.Time) bool {

@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
@@ -159,5 +161,37 @@ func TestManager_PickNext_RebuildsSchedulerAfterModelCooldownError(t *testing.T)
 	}
 	if got == nil || got.ID != newAuth.ID {
 		t.Fatalf("pickNext() auth = %v, want %q", got, newAuth.ID)
+	}
+}
+
+func TestManager_RefreshSchedulerRoute_CoalescesSaturatedPickFailures(t *testing.T) {
+	manager := NewManager(nil, &RoundRobinSelector{}, nil)
+	auth := &Auth{ID: "saturated-auth", Provider: "gemini"}
+	if _, errRegister := manager.Register(t.Context(), auth); errRegister != nil {
+		t.Fatal(errRegister)
+	}
+	registerSchedulerModels(t, "gemini", "scheduler-saturated-model", auth.ID)
+	manager.RefreshSchedulerEntry(auth.ID)
+
+	var observed atomic.Int32
+	manager.schedulerRouteRefreshObserved = func(_ string, refreshed int) {
+		if refreshed != 0 {
+			t.Errorf("refreshed entries = %d, want 0", refreshed)
+		}
+		observed.Add(1)
+	}
+
+	const callers = 64
+	var workers sync.WaitGroup
+	workers.Add(callers)
+	for range callers {
+		go func() {
+			defer workers.Done()
+			manager.refreshSchedulerRoute([]string{"gemini"}, "scheduler-saturated-model")
+		}()
+	}
+	workers.Wait()
+	if got := observed.Load(); got != 1 {
+		t.Fatalf("route refresh scans = %d, want 1", got)
 	}
 }

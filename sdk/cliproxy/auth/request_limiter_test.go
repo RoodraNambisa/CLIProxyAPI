@@ -650,7 +650,7 @@ func TestSchedulerPerAuthRequestLimitSupportsAllStrategies(t *testing.T) {
 			if errJSON := json.Unmarshal([]byte(limitErr.Error()), &body); errJSON != nil {
 				t.Fatalf("decode error body: %v", errJSON)
 			}
-			if body["error"]["code"] != "auth_request_limited" || body["error"]["limit"] != float64(1) || body["error"]["window_minutes"] != float64(5) {
+			if body["error"]["code"] != "auth_request_capacity_exhausted" || body["error"]["legacy_code"] != "auth_request_limited" || body["error"]["limit"] != float64(1) || body["error"]["window_minutes"] != float64(5) {
 				t.Fatalf("error body = %#v", body)
 			}
 		})
@@ -1240,8 +1240,13 @@ func TestManagerChatGPTWebRequestReservationPersistsAfterUpstreamCommit(t *testi
 	if _, errExecute := manager.Execute(t.Context(), []string{"chatgpt-web"}, request, cliproxyexecutor.Options{}); errExecute == nil {
 		t.Fatal("first Execute() error = nil, want test error")
 	}
-	if _, errExecute := manager.Execute(t.Context(), []string{"chatgpt-web"}, request, cliproxyexecutor.Options{}); !isAuthRequestLimitedError(errExecute) {
+	diagnostics := &cliproxyexecutor.RequestExecutionDiagnostics{}
+	if _, errExecute := manager.Execute(t.Context(), []string{"chatgpt-web"}, request, cliproxyexecutor.Options{ExecutionDiagnostics: diagnostics}); !isAuthRequestLimitedError(errExecute) {
 		t.Fatalf("second Execute() error = %T %v, want auth_request_limited", errExecute, errExecute)
+	}
+	snapshot := diagnostics.Snapshot()
+	if snapshot.FailureStage != "selection" || snapshot.ErrorCode != "auth_request_capacity_exhausted" || snapshot.CredentialSelected || snapshot.UpstreamCommitted || snapshot.AuthRequestSlotConsumed {
+		t.Fatalf("limited request diagnostics = %+v", snapshot)
 	}
 	if calls := executor.calls.Load(); calls != 1 {
 		t.Fatalf("upstream attempts = %d, want committed first attempt only", calls)

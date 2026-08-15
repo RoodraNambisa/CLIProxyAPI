@@ -513,6 +513,10 @@ type Manager struct {
 	refreshCommitRetryObserved func(string, int)
 	// refreshFlightWaitObserved is used by shutdown tests to observe the executor close barrier.
 	refreshFlightWaitObserved func()
+	// schedulerRouteRefreshMu coalesces the rare registry/scheduler repair path.
+	schedulerRouteRefreshMu       sync.Mutex
+	schedulerRouteRefreshedAt     map[string]time.Time
+	schedulerRouteRefreshObserved func(string, int)
 	// prioritySelectors stores built-in legacy selectors used by per-priority overrides.
 	prioritySelectors sync.Map
 }
@@ -718,6 +722,7 @@ func NewManager(store Store, selector Selector, hook Hook) *Manager {
 		refreshCleanupWait:          refreshShutdownTimeout,
 		refreshCommitAttemptTimeout: refreshCommitTimeout,
 		refreshCommitMaxAttempts:    refreshCommitAttempts,
+		schedulerRouteRefreshedAt:   make(map[string]time.Time),
 		providerOffsets:             make(map[string]int),
 		modelPoolOffsets:            make(map[string]int),
 	}
@@ -774,6 +779,67 @@ func (m *Manager) syncScheduler() {
 		return
 	}
 	m.syncSchedulerFromSnapshot(m.snapshotAuths())
+}
+
+const schedulerRouteRefreshInterval = 30 * time.Second
+
+// refreshSchedulerRoute repairs only auth entries whose registered model set
+// is newer than the scheduler snapshot. A pick failure caused by cooldown or
+// request saturation is not evidence that every credential changed, so it must
+// not trigger a full credential clone and rebuild.
+func (m *Manager) refreshSchedulerRoute(providers []string, model string) {
+	if m == nil || m.scheduler == nil {
+		return
+	}
+	providerKeys := normalizeProviderKeys(providers)
+	modelKey := canonicalModelKey(model)
+	if len(providerKeys) == 0 || modelKey == "" {
+		return
+	}
+	sort.Strings(providerKeys)
+	key := strings.Join(providerKeys, ",") + ":" + modelKey
+
+	m.schedulerRouteRefreshMu.Lock()
+	defer m.schedulerRouteRefreshMu.Unlock()
+	now := time.Now()
+	if refreshedAt := m.schedulerRouteRefreshedAt[key]; !refreshedAt.IsZero() && now.Sub(refreshedAt) < schedulerRouteRefreshInterval {
+		return
+	}
+
+	supported := m.scheduler.authIDsSupportingModel(providerKeys, modelKey)
+	candidates := make([]string, 0)
+	m.mu.RLock()
+	for _, providerKey := range providerKeys {
+		for authID := range m.providerAuthIDs[providerKey] {
+			if _, ok := supported[authID]; ok {
+				continue
+			}
+			auth := m.auths[authID]
+			if auth == nil || auth.Disabled || m.sessionCleanupPendingLocked(authID) {
+				continue
+			}
+			candidates = append(candidates, authID)
+		}
+	}
+	m.mu.RUnlock()
+	sort.Strings(candidates)
+
+	registryRef := registry.GetGlobalRegistry()
+	refreshed := 0
+	for _, authID := range candidates {
+		models := registryRef.GetModelsForClient(authID)
+		for _, registeredModel := range models {
+			if registeredModel != nil && canonicalModelKey(registeredModel.ID) == modelKey {
+				m.RefreshSchedulerEntry(authID)
+				refreshed++
+				break
+			}
+		}
+	}
+	m.schedulerRouteRefreshedAt[key] = now
+	if m.schedulerRouteRefreshObserved != nil {
+		m.schedulerRouteRefreshObserved(key, refreshed)
+	}
 }
 
 func (m *Manager) snapshotAuths() []*Auth {
@@ -6984,12 +7050,17 @@ func newAuthRequestSlot(diagnostics *cliproxyexecutor.RequestExecutionDiagnostic
 }
 
 func (m *Manager) recordExecutionResultMetrics(opts cliproxyexecutor.Options, err error) {
-	if err == nil || opts.ExecutionMetrics == nil {
+	if err == nil {
 		return
 	}
 	var limited *authRequestLimitedError
 	if errors.As(err, &limited) {
-		opts.ExecutionMetrics.RecordAuthRequestLimited()
+		if opts.ExecutionMetrics != nil {
+			opts.ExecutionMetrics.RecordAuthRequestLimited()
+		}
+		if opts.ExecutionDiagnostics != nil {
+			opts.ExecutionDiagnostics.SetFailure("selection", "auth_request_capacity_exhausted")
+		}
 	}
 }
 
@@ -8976,7 +9047,7 @@ func (m *Manager) pickNext(ctx context.Context, provider, model string, opts cli
 	}
 	selected, errPick := m.scheduler.pickSingle(ctx, provider, model, opts, tried)
 	if errPick != nil && model != "" && shouldRetrySchedulerPick(errPick) {
-		m.syncScheduler()
+		m.refreshSchedulerRoute([]string{provider}, model)
 		selected, errPick = m.scheduler.pickSingle(ctx, provider, model, opts, tried)
 	}
 	if errPick != nil {
@@ -9220,7 +9291,7 @@ func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model s
 
 	selected, providerKey, errPick := m.scheduler.pickMixed(ctx, eligibleProviders, model, opts, tried, allowed)
 	if errPick != nil && model != "" && shouldRetrySchedulerPick(errPick) {
-		m.syncScheduler()
+		m.refreshSchedulerRoute(eligibleProviders, model)
 		selected, providerKey, errPick = m.scheduler.pickMixed(ctx, eligibleProviders, model, opts, tried, allowed)
 	}
 	if errPick != nil {

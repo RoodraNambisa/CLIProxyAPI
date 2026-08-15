@@ -142,6 +142,14 @@ type authRequestWindowLimiter struct {
 	counts      map[string]authRequestWindowCount
 }
 
+type authRequestLimitUsage struct {
+	configured    bool
+	limit         int
+	remaining     int
+	windowMinutes int
+	resetAt       time.Time
+}
+
 const (
 	authRequestReservationReserved uint32 = iota
 	authRequestReservationCommitted
@@ -275,6 +283,43 @@ func (l *authRequestWindowLimiter) availableAt(authID string, policy authRequest
 		return true, authRequestLimitBlock{}
 	}
 	return false, newAuthRequestLimitBlock(policy, resetAt.Sub(now))
+}
+
+func (l *authRequestWindowLimiter) usageAt(authID string, policy authRequestLimitPolicy, now time.Time) authRequestLimitUsage {
+	policy = normalizeAuthRequestLimitPolicy(policy)
+	usage := authRequestLimitUsage{
+		configured:    policy.limit > 0,
+		limit:         policy.limit,
+		remaining:     policy.limit,
+		windowMinutes: policy.windowMinutes,
+	}
+	if policy.limit == 0 {
+		return usage
+	}
+	_, resetAt := authRequestWindowAt(now, policy.windowMinutes)
+	usage.resetAt = resetAt
+	if l == nil || authID == "" {
+		return usage
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if policy.generation != 0 && policy.generation != l.generation {
+		return usage
+	}
+	window, _ := authRequestWindowAt(now, policy.windowMinutes)
+	entry := l.counts[authID]
+	if entry.window != window || entry.windowMinutes != policy.windowMinutes || entry.limit != policy.limit {
+		return usage
+	}
+	consumed := entry.count
+	if consumed < 0 {
+		consumed = 0
+	}
+	if consumed > policy.limit {
+		consumed = policy.limit
+	}
+	usage.remaining = policy.limit - consumed
+	return usage
 }
 
 func (l *authRequestWindowLimiter) tryAcquireAt(authID string, policy authRequestLimitPolicy, now time.Time) (bool, authRequestLimitBlock) {
@@ -412,7 +457,8 @@ func (e *authRequestLimitedError) Error() string {
 	}
 	payload := map[string]any{
 		"error": map[string]any{
-			"code":           "auth_request_limited",
+			"code":           "auth_request_capacity_exhausted",
+			"legacy_code":    "auth_request_limited",
 			"message":        "All available credentials reached their request limit",
 			"limit":          e.limit,
 			"window_minutes": e.windowMinutes,
@@ -421,7 +467,7 @@ func (e *authRequestLimitedError) Error() string {
 	}
 	data, err := json.Marshal(payload)
 	if err != nil {
-		return `{"error":{"code":"auth_request_limited","message":"All available credentials reached their request limit"}}`
+		return `{"error":{"code":"auth_request_capacity_exhausted","legacy_code":"auth_request_limited","message":"All available credentials reached their request limit"}}`
 	}
 	return string(data)
 }

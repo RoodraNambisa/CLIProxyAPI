@@ -159,6 +159,42 @@ type DetailQuery struct {
 	Limit     int
 }
 
+// FailureSummaryQuery filters the safe failure aggregation view.
+type FailureSummaryQuery struct {
+	API       string
+	Model     string
+	Source    string
+	TimeRange TimeRange
+}
+
+// FailureDimensionCount is one value in a failure distribution.
+type FailureDimensionCount struct {
+	Value   string  `json:"value"`
+	Count   int64   `json:"count"`
+	Percent float64 `json:"percent"`
+}
+
+// FailureBoundarySummary counts where failed requests crossed execution boundaries.
+type FailureBoundarySummary struct {
+	CredentialSelected      int64 `json:"credential_selected"`
+	UpstreamCommitted       int64 `json:"upstream_committed"`
+	AuthRequestSlotConsumed int64 `json:"auth_request_slot_consumed"`
+}
+
+// FailureSummary is a safe aggregate view that never returns request bodies or credentials.
+type FailureSummary struct {
+	AsOf           time.Time               `json:"as_of"`
+	Total          int64                   `json:"total"`
+	Main           int64                   `json:"main"`
+	Auxiliary      int64                   `json:"auxiliary"`
+	Boundaries     FailureBoundarySummary  `json:"boundaries"`
+	ByErrorCode    []FailureDimensionCount `json:"by_error_code"`
+	ByFailureStage []FailureDimensionCount `json:"by_failure_stage"`
+	ByModel        []FailureDimensionCount `json:"by_model"`
+	BySource       []FailureDimensionCount `json:"by_source"`
+	ByHour         []FailureDimensionCount `json:"by_hour"`
+}
+
 // DetailEntry is a request detail with its API and model keys.
 type DetailEntry struct {
 	API   string `json:"api"`
@@ -557,6 +593,102 @@ func (s *RequestStatistics) Details(query DetailQuery) DetailPage {
 		end = total
 	}
 	return newDetailPage(matches[query.Offset:end], total, query.Offset, query.Limit)
+}
+
+// FailureSummary returns failure-only aggregates for management diagnostics.
+func (s *RequestStatistics) FailureSummary(query FailureSummaryQuery) FailureSummary {
+	result := FailureSummary{
+		AsOf:           time.Now().UTC(),
+		ByErrorCode:    []FailureDimensionCount{},
+		ByFailureStage: []FailureDimensionCount{},
+		ByModel:        []FailureDimensionCount{},
+		BySource:       []FailureDimensionCount{},
+		ByHour:         []FailureDimensionCount{},
+	}
+	if s == nil {
+		return result
+	}
+	query.API = strings.TrimSpace(query.API)
+	query.Model = strings.TrimSpace(query.Model)
+	query.Source = strings.TrimSpace(query.Source)
+	s.flushPending()
+
+	errorCodes := map[string]int64{}
+	failureStages := map[string]int64{}
+	models := map[string]int64{}
+	sources := map[string]int64{}
+	hours := map[string]int64{}
+	s.mu.RLock()
+	for apiName, apiStatsValue := range s.apis {
+		if apiStatsValue == nil || (query.API != "" && apiName != query.API) {
+			continue
+		}
+		for modelName, modelStatsValue := range apiStatsValue.Models {
+			if modelStatsValue == nil || (query.Model != "" && modelName != query.Model) {
+				continue
+			}
+			for _, detail := range modelStatsValue.Details {
+				if !detail.Failed || !query.TimeRange.contains(detail.Timestamp) || (query.Source != "" && strings.TrimSpace(detail.Source) != query.Source) {
+					continue
+				}
+				result.Total++
+				if detail.Auxiliary {
+					result.Auxiliary++
+				} else {
+					result.Main++
+				}
+				if detail.CredentialSelected {
+					result.Boundaries.CredentialSelected++
+				}
+				if detail.UpstreamCommitted {
+					result.Boundaries.UpstreamCommitted++
+				}
+				if detail.AuthRequestSlotConsumed {
+					result.Boundaries.AuthRequestSlotConsumed++
+				}
+				incrementFailureDimension(errorCodes, detail.ErrorCode, "unknown")
+				incrementFailureDimension(failureStages, detail.FailureStage, "unknown")
+				incrementFailureDimension(models, modelName, "unknown")
+				incrementFailureDimension(sources, detail.Source, "unknown")
+				hour := detail.Timestamp.UTC().Truncate(time.Hour).Format(time.RFC3339)
+				incrementFailureDimension(hours, hour, "unknown")
+			}
+		}
+	}
+	s.mu.RUnlock()
+
+	result.ByErrorCode = sortedFailureDimensionCounts(errorCodes, result.Total)
+	result.ByFailureStage = sortedFailureDimensionCounts(failureStages, result.Total)
+	result.ByModel = sortedFailureDimensionCounts(models, result.Total)
+	result.BySource = sortedFailureDimensionCounts(sources, result.Total)
+	result.ByHour = sortedFailureDimensionCounts(hours, result.Total)
+	return result
+}
+
+func incrementFailureDimension(target map[string]int64, value, fallback string) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		value = fallback
+	}
+	target[value]++
+}
+
+func sortedFailureDimensionCounts(values map[string]int64, total int64) []FailureDimensionCount {
+	out := make([]FailureDimensionCount, 0, len(values))
+	for value, count := range values {
+		percent := float64(0)
+		if total > 0 {
+			percent = float64(count) * 100 / float64(total)
+		}
+		out = append(out, FailureDimensionCount{Value: value, Count: count, Percent: percent})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Count == out[j].Count {
+			return out[i].Value < out[j].Value
+		}
+		return out[i].Count > out[j].Count
+	})
+	return out
 }
 
 // Series returns grouped time-series usage aggregates.

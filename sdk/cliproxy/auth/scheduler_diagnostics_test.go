@@ -98,6 +98,42 @@ func TestAuthSchedulerRoutingDiagnosticsMixedStates(t *testing.T) {
 		} else if got.EarliestRequestLimitResetAt == nil || !got.EarliestRequestLimitResetAt.Equal(*test.expectedResetAt) {
 			t.Errorf("priority %d reset = %v, want %v", test.priority, got.EarliestRequestLimitResetAt, test.expectedResetAt)
 		}
+		if got.RequestCapacity.Mode != "limited" || got.RequestCapacity.LimitedCredentials != test.readyBeforeLimit || got.RequestCapacity.UnlimitedCredentials != 0 {
+			t.Errorf("priority %d request capacity = %+v", test.priority, got.RequestCapacity)
+			continue
+		}
+		if got.RequestCapacity.ConfiguredSlots == nil || *got.RequestCapacity.ConfiguredSlots != int64(test.readyBeforeLimit) {
+			t.Errorf("priority %d configured slots = %v", test.priority, got.RequestCapacity.ConfiguredSlots)
+		}
+		if got.RequestCapacity.RemainingSlots == nil || *got.RequestCapacity.RemainingSlots != int64(test.eligibleNow) {
+			t.Errorf("priority %d remaining slots = %v", test.priority, got.RequestCapacity.RemainingSlots)
+		}
+		wantRPM := float64(test.readyBeforeLimit) / 5
+		if got.RequestCapacity.ConfiguredRPM == nil || *got.RequestCapacity.ConfiguredRPM != wantRPM {
+			t.Errorf("priority %d configured RPM = %v, want %v", test.priority, got.RequestCapacity.ConfiguredRPM, wantRPM)
+		}
+	}
+}
+
+func TestAuthSchedulerRoutingDiagnosticsReportsUnlimitedCapacityExplicitly(t *testing.T) {
+	now := time.Date(2026, time.August, 14, 12, 34, 56, 0, time.UTC)
+	auths := []*Auth{
+		routingDiagnosticsTestAuth("unlimited-a", "test", 0),
+		routingDiagnosticsTestAuth("unlimited-b", "test", 0),
+	}
+	scheduler := newRoutingDiagnosticsTestScheduler("test", "diag-model", now, auths)
+	scheduler.setRoutingConfig(internalconfig.RoutingConfig{PerAuthRequestLimit: 0})
+
+	snapshot := scheduler.RoutingDiagnostics("test", "diag-model", now)
+	if len(snapshot.Priorities) != 1 {
+		t.Fatalf("priority groups = %d, want 1", len(snapshot.Priorities))
+	}
+	capacity := snapshot.Priorities[0].RequestCapacity
+	if capacity.Mode != "unlimited" || capacity.UnlimitedCredentials != 2 || capacity.LimitedCredentials != 0 {
+		t.Fatalf("capacity = %+v, want explicit unlimited mode", capacity)
+	}
+	if capacity.ConfiguredSlots != nil || capacity.RemainingSlots != nil || capacity.ConfiguredRPM != nil {
+		t.Fatalf("unlimited capacity totals = %+v, want null totals", capacity)
 	}
 }
 

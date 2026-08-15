@@ -173,6 +173,27 @@ func (h *Handler) GetUsageDetails(c *gin.Context) {
 	c.JSON(http.StatusOK, page)
 }
 
+// GetUsageFailureSummary returns safe failure aggregates without raw error bodies.
+func (h *Handler) GetUsageFailureSummary(c *gin.Context) {
+	timeRange, ok := parseUsageTimeRange(c)
+	if !ok {
+		return
+	}
+	query := usage.FailureSummaryQuery{
+		API:       strings.TrimSpace(c.Query("api")),
+		Model:     strings.TrimSpace(c.Query("model")),
+		Source:    strings.TrimSpace(c.Query("source")),
+		TimeRange: timeRange,
+	}
+	var summary usage.FailureSummary
+	if stats := h.usageStatisticsSnapshot(); stats != nil {
+		summary = stats.FailureSummary(query)
+	} else {
+		summary = (*usage.RequestStatistics)(nil).FailureSummary(query)
+	}
+	c.JSON(http.StatusOK, gin.H{"failures": summary})
+}
+
 // GetUsageAuthSummaries returns per-auth usage summaries enriched with current auth metadata.
 func (h *Handler) GetUsageAuthSummaries(c *gin.Context) {
 	timeRange, ok := parseUsageTimeRange(c)

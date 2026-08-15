@@ -68,6 +68,49 @@ func TestRequestStatisticsRecordIncludesExecutionDiagnostics(t *testing.T) {
 	}
 }
 
+func TestRequestStatisticsFailureSummaryAggregatesSafeDimensions(t *testing.T) {
+	stats := NewRequestStatistics()
+	base := time.Date(2026, 8, 16, 12, 0, 0, 0, time.UTC)
+	records := []coreusage.Record{
+		{
+			APIKey: "api-a", Model: "gpt-image-2", Source: "chatgpt-web", RequestedAt: base,
+			Failed: true, ErrorCode: "http_401", FailureStage: "upstream",
+			CredentialSelected: true, UpstreamCommitted: true, AuthRequestSlotConsumed: true,
+		},
+		{
+			APIKey: "api-a", Model: "gpt-image-2", Source: "chatgpt-web", RequestedAt: base.Add(10 * time.Minute),
+			Failed: true, Auxiliary: true, ErrorCode: "http_401", FailureStage: "upstream",
+			CredentialSelected: true,
+		},
+		{
+			APIKey: "api-a", Model: "gpt-5", Source: "codex", RequestedAt: base.Add(time.Hour),
+			Failed: true, ErrorCode: "auth_request_capacity_exhausted", FailureStage: "selection",
+		},
+		{APIKey: "api-a", Model: "gpt-image-2", Source: "chatgpt-web", RequestedAt: base.Add(20 * time.Minute)},
+	}
+	for _, record := range records {
+		stats.Record(context.Background(), record)
+	}
+
+	summary := stats.FailureSummary(FailureSummaryQuery{
+		API:       "api-a",
+		Source:    "chatgpt-web",
+		TimeRange: TimeRange{From: base, To: base.Add(time.Hour)},
+	})
+	if summary.Total != 2 || summary.Main != 1 || summary.Auxiliary != 1 {
+		t.Fatalf("failure totals = total:%d main:%d auxiliary:%d", summary.Total, summary.Main, summary.Auxiliary)
+	}
+	if summary.Boundaries.CredentialSelected != 2 || summary.Boundaries.UpstreamCommitted != 1 || summary.Boundaries.AuthRequestSlotConsumed != 1 {
+		t.Fatalf("failure boundaries = %+v", summary.Boundaries)
+	}
+	if len(summary.ByErrorCode) != 1 || summary.ByErrorCode[0].Value != "http_401" || summary.ByErrorCode[0].Count != 2 || summary.ByErrorCode[0].Percent != 100 {
+		t.Fatalf("error distribution = %+v", summary.ByErrorCode)
+	}
+	if len(summary.ByHour) != 1 || summary.ByHour[0].Value != "2026-08-16T12:00:00Z" || summary.ByHour[0].Count != 2 {
+		t.Fatalf("hour distribution = %+v", summary.ByHour)
+	}
+}
+
 func TestRequestStatisticsNormalizesNegativeRecordTokens(t *testing.T) {
 	stats := NewRequestStatistics()
 	stats.Record(context.Background(), coreusage.Record{
