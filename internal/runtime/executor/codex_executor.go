@@ -1550,7 +1550,7 @@ func (e *CodexExecutor) cacheHelper(ctx context.Context, from sdktranslator.Form
 	}
 	httpReq.ContentLength = int64(bodyReader.Len())
 	if cache.ID != "" {
-		httpReq.Header.Set("Session_id", cache.ID)
+		httpReq.Header.Set("Session-Id", cache.ID)
 	}
 	return httpReq, rawJSON, identityState, nil
 }
@@ -1710,12 +1710,12 @@ func applyCodexHeadersFromSources(r *http.Request, auth *cliproxyauth.Auth, toke
 	misc.EnsureHeader(r.Header, ginHeaders, "Version", "")
 	misc.EnsureHeader(r.Header, ginHeaders, "X-Codex-Turn-Metadata", "")
 	misc.EnsureHeader(r.Header, ginHeaders, "X-Client-Request-Id", "")
+	misc.EnsureHeader(r.Header, ginHeaders, "X-Codex-Window-Id", "")
+	misc.EnsureHeader(r.Header, ginHeaders, "Thread-Id", "")
+	ensureCodexHTTPSessionHeader(r.Header, ginHeaders)
+	misc.EnsureHeader(r.Header, ginHeaders, "X-OpenAI-Internal-Codex-Responses-Lite", "")
 	cfgUserAgent, cfgOriginator, _ := codexHeaderDefaults(cfg, auth)
 	ensureHeaderWithConfigPrecedence(r.Header, ginHeaders, "User-Agent", cfgUserAgent, codexUserAgent)
-
-	if strings.Contains(r.Header.Get("User-Agent"), "Mac OS") {
-		misc.EnsureHeader(r.Header, ginHeaders, "Session_id", uuid.NewString())
-	}
 
 	if stream {
 		r.Header.Set("Accept", "text/event-stream")
@@ -1751,6 +1751,7 @@ func applyCodexHeadersFromSources(r *http.Request, auth *cliproxyauth.Auth, toke
 		attrs = auth.Attributes
 	}
 	util.ApplyCustomHeadersFromAttrs(r, attrs)
+	normalizeCodexHTTPSessionHeader(r.Header, codexCustomHTTPSessionHeader(attrs))
 	authorization, err := codexauth.AuthorizationHeader(authMetadata(auth), token, time.Now())
 	if err != nil {
 		return fmt.Errorf("codex executor: build authorization: %w", err)
@@ -1759,6 +1760,59 @@ func applyCodexHeadersFromSources(r *http.Request, auth *cliproxyauth.Auth, toke
 		r.Header.Set("Authorization", authorization)
 	}
 	return nil
+}
+
+func ensureCodexHTTPSessionHeader(target, source http.Header) {
+	value := headerValueCaseInsensitive(source, "Session-Id")
+	if value == "" {
+		value = headerValueCaseInsensitive(source, "Session_id")
+	}
+	if value == "" {
+		value = headerValueCaseInsensitive(target, "Session-Id")
+	}
+	if value == "" {
+		value = headerValueCaseInsensitive(target, "Session_id")
+	}
+	normalizeCodexHTTPSessionHeader(target, value)
+}
+
+func normalizeCodexHTTPSessionHeader(headers http.Header, preferredValue string) {
+	if headers == nil {
+		return
+	}
+	value := strings.TrimSpace(preferredValue)
+	if value == "" {
+		value = headerValueCaseInsensitive(headers, "Session-Id")
+	}
+	if value == "" {
+		value = headerValueCaseInsensitive(headers, "Session_id")
+	}
+	deleteHeaderCaseInsensitive(headers, "Session-Id")
+	deleteHeaderCaseInsensitive(headers, "Session_id")
+	if value != "" {
+		setHeaderCasePreserved(headers, "Session-Id", value)
+	}
+}
+
+func codexCustomHTTPSessionHeader(attrs map[string]string) string {
+	var legacyValue string
+	for key, value := range attrs {
+		if !strings.HasPrefix(key, "header:") {
+			continue
+		}
+		name := strings.TrimSpace(strings.TrimPrefix(key, "header:"))
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		if strings.EqualFold(name, "Session-Id") {
+			return value
+		}
+		if strings.EqualFold(name, "Session_id") {
+			legacyValue = value
+		}
+	}
+	return legacyValue
 }
 
 func authMetadata(auth *cliproxyauth.Auth) map[string]any {

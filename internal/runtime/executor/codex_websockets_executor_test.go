@@ -1619,10 +1619,14 @@ func TestApplyCodexHeadersPassesThroughClientIdentityHeaders(t *testing.T) {
 		Metadata: map[string]any{"email": "user@example.com"},
 	}
 	req = req.WithContext(contextWithGinHeaders(map[string]string{
-		"Originator":            "Codex Desktop",
-		"Version":               "0.115.0-alpha.27",
-		"X-Codex-Turn-Metadata": `{"turn_id":"turn-1"}`,
-		"X-Client-Request-Id":   "019d2233-e240-7162-992d-38df0a2a0e0d",
+		"Originator":                             "Codex Desktop",
+		"Version":                                "0.115.0-alpha.27",
+		"X-Codex-Turn-Metadata":                  `{"turn_id":"turn-1"}`,
+		"X-Client-Request-Id":                    "019d2233-e240-7162-992d-38df0a2a0e0d",
+		"X-Codex-Window-Id":                      "window-1",
+		"Thread-Id":                              "thread-1",
+		"Session-Id":                             "session-1",
+		"X-OpenAI-Internal-Codex-Responses-Lite": "true",
 	}))
 
 	applyCodexHeaders(req, auth, "oauth-token", true, nil)
@@ -1638,6 +1642,86 @@ func TestApplyCodexHeadersPassesThroughClientIdentityHeaders(t *testing.T) {
 	}
 	if got := req.Header.Get("X-Client-Request-Id"); got != "019d2233-e240-7162-992d-38df0a2a0e0d" {
 		t.Fatalf("X-Client-Request-Id = %s, want %s", got, "019d2233-e240-7162-992d-38df0a2a0e0d")
+	}
+	if got := req.Header.Get("X-Codex-Window-Id"); got != "window-1" {
+		t.Fatalf("X-Codex-Window-Id = %s, want %s", got, "window-1")
+	}
+	if got := req.Header.Get("Thread-Id"); got != "thread-1" {
+		t.Fatalf("Thread-Id = %s, want %s", got, "thread-1")
+	}
+	if got := req.Header.Get("Session-Id"); got != "session-1" {
+		t.Fatalf("Session-Id = %s, want %s", got, "session-1")
+	}
+	if got := req.Header.Get("X-OpenAI-Internal-Codex-Responses-Lite"); got != "true" {
+		t.Fatalf("X-OpenAI-Internal-Codex-Responses-Lite = %s, want true", got)
+	}
+}
+
+func TestApplyCodexHeadersNormalizesSessionHeader(t *testing.T) {
+	tests := []struct {
+		name       string
+		downstream map[string]string
+		attrs      map[string]string
+		want       string
+	}{
+		{
+			name: "generated session retained",
+			want: "generated-session",
+		},
+		{
+			name:       "legacy downstream header",
+			downstream: map[string]string{"Session_id": "legacy-client"},
+			want:       "legacy-client",
+		},
+		{
+			name: "canonical downstream header wins",
+			downstream: map[string]string{
+				"Session-Id": "canonical-client",
+				"Session_id": "legacy-client",
+			},
+			want: "canonical-client",
+		},
+		{
+			name:       "custom legacy header overrides downstream",
+			downstream: map[string]string{"Session-Id": "canonical-client"},
+			attrs:      map[string]string{"header:Session_id": "legacy-custom"},
+			want:       "legacy-custom",
+		},
+		{
+			name:       "custom canonical header wins",
+			downstream: map[string]string{"Session_id": "legacy-client"},
+			attrs: map[string]string{
+				"header:Session-Id": "canonical-custom",
+				"header:Session_id": "legacy-custom",
+			},
+			want: "canonical-custom",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req, err := http.NewRequest(http.MethodPost, "https://example.com/responses", nil)
+			if err != nil {
+				t.Fatalf("NewRequest() error = %v", err)
+			}
+			req.Header.Set("Session-Id", "generated-session")
+			req = req.WithContext(contextWithGinHeaders(tt.downstream))
+			auth := &cliproxyauth.Auth{Provider: "codex", Attributes: tt.attrs}
+
+			if errApply := applyCodexHeaders(req, auth, "oauth-token", true, nil); errApply != nil {
+				t.Fatalf("applyCodexHeaders() error = %v", errApply)
+			}
+
+			if got := req.Header.Get("Session-Id"); got != tt.want {
+				t.Fatalf("Session-Id = %q, want %q", got, tt.want)
+			}
+			if got := headerValueCaseInsensitive(req.Header, "Session_id"); got != "" {
+				t.Fatalf("Session_id = %q, want empty", got)
+			}
+			if values, ok := req.Header["Session-Id"]; !ok || len(values) != 1 {
+				t.Fatalf("canonical Session-Id = %#v, want exactly one value", values)
+			}
+		})
 	}
 }
 
@@ -1657,6 +1741,11 @@ func TestApplyCodexHeadersDoesNotInjectClientOnlyHeadersByDefault(t *testing.T) 
 	}
 	if got := req.Header.Get("X-Client-Request-Id"); got != "" {
 		t.Fatalf("X-Client-Request-Id = %q, want empty", got)
+	}
+	for _, key := range []string{"X-Codex-Window-Id", "Thread-Id", "Session-Id", "Session_id", "X-OpenAI-Internal-Codex-Responses-Lite"} {
+		if got := headerValueCaseInsensitive(req.Header, key); got != "" {
+			t.Fatalf("%s = %q, want empty", key, got)
+		}
 	}
 }
 

@@ -47,8 +47,11 @@ func TestCodexExecutorCacheHelper_OpenAIChatCompletions_StablePromptCacheKeyFrom
 	if gotConversation := httpReq.Header.Get("Conversation_id"); gotConversation != "" {
 		t.Fatalf("Conversation_id = %q, want empty", gotConversation)
 	}
-	if gotSession := httpReq.Header.Get("Session_id"); gotSession != expectedKey {
-		t.Fatalf("Session_id = %q, want %q", gotSession, expectedKey)
+	if gotSession := httpReq.Header.Get("Session-Id"); gotSession != expectedKey {
+		t.Fatalf("Session-Id = %q, want %q", gotSession, expectedKey)
+	}
+	if gotLegacySession := headerValueCaseInsensitive(httpReq.Header, "Session_id"); gotLegacySession != "" {
+		t.Fatalf("Session_id = %q, want empty", gotLegacySession)
 	}
 
 	httpReq2, _, _, err := executor.cacheHelper(ctx, sdktranslator.FromString("openai"), url, nil, req, req.Payload, rawJSON, true)
@@ -119,8 +122,8 @@ func TestCodexExecutorCacheHelper_IdentityConfuseRemapsBodyAndHeaders(t *testing
 			t.Fatalf("%s = %q, want %q", headerName, gotHeader, expectedPromptCacheKey)
 		}
 	}
-	if gotSession := headerValueCaseInsensitive(httpReq.Header, "Session_id"); gotSession != expectedPromptCacheKey {
-		t.Fatalf("Session_id = %q, want %q", gotSession, expectedPromptCacheKey)
+	if gotSession := headerValueCaseInsensitive(httpReq.Header, "Session_id"); gotSession != "" {
+		t.Fatalf("Session_id = %q, want empty", gotSession)
 	}
 	if gotWindow := httpReq.Header.Get("X-Codex-Window-Id"); gotWindow != expectedPromptCacheKey+":0" {
 		t.Fatalf("X-Codex-Window-Id = %q, want %q", gotWindow, expectedPromptCacheKey+":0")
