@@ -153,6 +153,13 @@ func buildPersonaCatalogV3() []personaCatalogEntry {
 }
 
 func personaNavigatorLanguages(persona Persona) []string {
+	persona = canonicalPersona(persona)
+	if strings.EqualFold(persona.CatalogVersion, personaCatalogV2Version) {
+		if language := strings.TrimSpace(persona.Language); language != "" {
+			return []string{language}
+		}
+		return []string{DefaultPersona().Language}
+	}
 	languages := make([]string, 0, 3)
 	appendLanguage := func(value string) {
 		value = strings.TrimSpace(value)

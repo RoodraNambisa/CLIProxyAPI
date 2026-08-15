@@ -217,6 +217,9 @@ func TestCredentialPersonaPreservesPersistedV2Identity(t *testing.T) {
 	if credential.Persona != want {
 		t.Fatalf("persisted v2 persona changed: %#v != %#v", credential.Persona, want)
 	}
+	if languages := personaNavigatorLanguages(credential.Persona); !slices.Equal(languages, []string{"en-US"}) {
+		t.Fatalf("persisted v2 navigator languages changed: %#v", languages)
+	}
 }
 
 func TestPersonaCatalogDistribution(t *testing.T) {
