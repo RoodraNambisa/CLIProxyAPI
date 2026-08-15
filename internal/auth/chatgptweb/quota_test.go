@@ -92,4 +92,18 @@ func TestSafeQuotaErrorRedactsUnknownMessages(t *testing.T) {
 	if got := SafeQuotaError("RATE_LIMITED"); got != "rate_limited" {
 		t.Fatalf("SafeQuotaError() = %q, want rate_limited", got)
 	}
+	for _, code := range []string{
+		"account_unverified",
+		"interaction_required",
+		"relogin_pending",
+		"reauth_required",
+		"forbidden",
+		"cloudflare_challenge",
+		"recovery_exhausted",
+		"refresh_persist_backpressure",
+	} {
+		if got := SafeQuotaError(code); got != code {
+			t.Fatalf("SafeQuotaError(%q) = %q", code, got)
+		}
+	}
 }

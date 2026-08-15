@@ -347,7 +347,10 @@ func NormalizeQuotaState(state QuotaState, remaining *int) QuotaState {
 func SafeQuotaError(value string) string {
 	switch strings.ToLower(strings.TrimSpace(value)) {
 	case "", "unauthorized", "rate_limited", "upstream_unavailable", "network_error",
-		"invalid_response", "identity_mismatch", "credential_unavailable", "canceled":
+		"invalid_response", "identity_mismatch", "credential_unavailable", "canceled",
+		"account_unverified", "interaction_required", "relogin_pending", "reauth_required",
+		"forbidden", "cloudflare_challenge", "recovery_exhausted", "refresh_persist_backpressure",
+		"stale_quota_observation":
 		return strings.ToLower(strings.TrimSpace(value))
 	default:
 		return "refresh_failed"

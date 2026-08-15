@@ -46,17 +46,18 @@ type authFilesCachedQuery struct {
 }
 
 type authFilesListQuery struct {
-	page         int
-	pageSize     int
-	provider     string
-	plan         string
-	priority     string
-	problemOnly  bool
-	enabledOnly  bool
-	disabledOnly bool
-	search       string
-	searchRE     *regexp.Regexp
-	sort         string
+	page          int
+	pageSize      int
+	provider      string
+	plan          string
+	priority      string
+	problemOnly   bool
+	enabledOnly   bool
+	disabledOnly  bool
+	recoveryState string
+	search        string
+	searchRE      *regexp.Regexp
+	sort          string
 }
 
 type authFileListRecord struct {
@@ -302,9 +303,25 @@ func parseAuthFilesListQuery(c *gin.Context, pagination bool) (authFilesListQuer
 	if errSearch != nil {
 		return query, errSearch
 	}
+	recoveryStateValue, errRecoveryState := authFilesSingleQueryValue(values, "account_info_recovery_state")
+	if errRecoveryState != nil {
+		return query, errRecoveryState
+	}
 	query.provider = normalizeAuthFilesProvider(authFilesFilterValue(providerValue, "all"))
 	query.plan = strings.ToLower(authFilesFilterValue(planValue, "all"))
 	query.priority = authFilesFilterValue(priorityValue, "all")
+	query.recoveryState = strings.ToLower(authFilesFilterValue(recoveryStateValue, "all"))
+	switch query.recoveryState {
+	case "all", chatgptwebauth.AccountInfoRecoveryIdle,
+		chatgptwebauth.AccountInfoRecoveryAutoRetrying,
+		chatgptwebauth.AccountInfoRecoveryManualChecking,
+		chatgptwebauth.AccountInfoRecoveryManualRequired,
+		chatgptwebauth.AccountInfoRecoveryReloginPending,
+		chatgptwebauth.AccountInfoRecoveryReauthRequired,
+		chatgptwebauth.AccountInfoRecoveryInteractionRequired:
+	default:
+		return query, fmt.Errorf("account_info_recovery_state is invalid")
+	}
 	if query.priority != "all" && query.priority != "__unset__" {
 		if _, errPriority := strconv.Atoi(query.priority); errPriority != nil {
 			return query, fmt.Errorf("priority must be all, __unset__, or an integer")
@@ -318,10 +335,11 @@ func parseAuthFilesListQuery(c *gin.Context, pagination bool) (authFilesListQuer
 	}
 	query.search = strings.TrimSpace(searchValue)
 	for name, value := range map[string]string{
-		"provider": query.provider,
-		"plan":     query.plan,
-		"priority": query.priority,
-		"search":   query.search,
+		"provider":                    query.provider,
+		"plan":                        query.plan,
+		"priority":                    query.priority,
+		"account_info_recovery_state": query.recoveryState,
+		"search":                      query.search,
 	} {
 		if len(value) > maxAuthFilesFilterLength {
 			return query, fmt.Errorf("%s is too long", name)
@@ -398,6 +416,7 @@ func (h *Handler) listAuthFilesPaged(c *gin.Context, manager *coreauth.Manager) 
 	}
 	cached := h.cachedAuthFileRecords(manager, query)
 	matched := cached.matched
+	matched = filterAuthFileRecordsByAccountInfoRecoveryState(manager, matched, query.recoveryState)
 
 	total := len(matched)
 	totalPages := max(1, (total+query.pageSize-1)/query.pageSize)
@@ -475,6 +494,7 @@ func (h *Handler) ListAuthFileSelection(c *gin.Context) {
 	}
 	cached := h.cachedAuthFileRecords(manager, query)
 	matched := cached.matched
+	matched = filterAuthFileRecordsByAccountInfoRecoveryState(manager, matched, query.recoveryState)
 	files := make([]gin.H, 0, len(matched))
 	now := time.Now()
 	ids := make([]string, 0, len(matched))
@@ -816,6 +836,7 @@ func buildAuthFileSelectionEntry(record *authFileListRecord, graph *coreauth.Cha
 	}
 	if strings.EqualFold(record.provider, "chatgpt-web") {
 		entry["account_info_refreshable"] = !auth.Disabled && auth.Status != coreauth.StatusDisabled && auth.LifecycleRefreshable()
+		entry["account_info_manual_recheckable"] = chatGPTWebAccountInfoManualRecheckable(auth)
 	}
 	if strings.EqualFold(record.provider, "codex") {
 		entry["retained_for_dependents"] = coreauth.ChatGPTWebAuthRetainedForDependents(auth)
@@ -827,4 +848,42 @@ func buildAuthFileSelectionEntry(record *authFileListRecord, graph *coreauth.Cha
 		}
 	}
 	return entry
+}
+
+func filterAuthFileRecordsByAccountInfoRecoveryState(
+	manager *coreauth.Manager,
+	records []*authFileListRecord,
+	recoveryState string,
+) []*authFileListRecord {
+	recoveryState = strings.ToLower(strings.TrimSpace(recoveryState))
+	if recoveryState == "" || recoveryState == "all" || manager == nil {
+		return records
+	}
+	controller, ok := chatGPTWebAccountInfoControllerForManager(manager)
+	if !ok {
+		return nil
+	}
+	recoveryStates := make(map[string]string)
+	batchedRecoveryStates := false
+	if stateController, supported := controller.(chatGPTWebAccountInfoRecoveryStateController); supported {
+		recoveryStates = stateController.AccountInfoRecoveryStates()
+		batchedRecoveryStates = true
+	}
+	filtered := make([]*authFileListRecord, 0, len(records))
+	for _, record := range records {
+		if record == nil || !strings.EqualFold(record.provider, chatgptwebauth.Provider) || record.auth == nil {
+			continue
+		}
+		actual := strings.ToLower(strings.TrimSpace(recoveryStates[record.auth.ID]))
+		if !batchedRecoveryStates {
+			actual = strings.ToLower(strings.TrimSpace(controller.AccountInfoAuthState(record.auth.ID).RecoveryState))
+		}
+		if actual == "" {
+			actual = chatgptwebauth.AccountInfoRecoveryIdle
+		}
+		if actual == recoveryState {
+			filtered = append(filtered, record)
+		}
+	}
+	return filtered
 }

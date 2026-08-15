@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	chatgptwebauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/chatgptweb"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/authfileguard"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
@@ -96,6 +97,39 @@ func TestAuthFilesPaginationNegotiationFilteringAndSelection(t *testing.T) {
 		pagedBody.Files[0]["email"] != "refill-curio-76@icloud.com" {
 		t.Fatalf("email search response = %#v", pagedBody)
 	}
+	recoveryController := &accountInfoControllerTestExecutor{authStates: map[string]chatgptwebauth.AccountInfoAuthRuntimeState{
+		bravo.ID: {RecoveryState: chatgptwebauth.AccountInfoRecoveryManualRequired},
+	}}
+	manager.RegisterExecutor(recoveryController)
+	recoveryFiltered := performAuthFilesPaginationRequest(
+		router,
+		"/auth-files?paged=true&page=1&page_size=10&account_info_recovery_state=manual_recovery_required",
+	)
+	decodeAuthFilesPaginationResponse(t, recoveryFiltered, &pagedBody)
+	if pagedBody.Total != 1 || strings.Join(authFilesPaginationNames(pagedBody.Files), ",") != "bravo.json" {
+		t.Fatalf("recovery filter response = %#v", pagedBody)
+	}
+	recoverySelection := performAuthFilesPaginationRequest(
+		router,
+		"/auth-files/selection?account_info_recovery_state=manual_recovery_required",
+	)
+	var recoverySelectionBody struct {
+		Files []map[string]any `json:"files"`
+		Total int              `json:"total"`
+	}
+	decodeAuthFilesPaginationResponse(t, recoverySelection, &recoverySelectionBody)
+	if recoverySelectionBody.Total != 1 || strings.Join(authFilesPaginationNames(recoverySelectionBody.Files), ",") != "bravo.json" {
+		t.Fatalf("recovery selection response = %#v", recoverySelectionBody)
+	}
+	delete(recoveryController.authStates, bravo.ID)
+	idleRecovery := performAuthFilesPaginationRequest(
+		router,
+		"/auth-files?paged=true&page=1&page_size=10&account_info_recovery_state=idle",
+	)
+	decodeAuthFilesPaginationResponse(t, idleRecovery, &pagedBody)
+	if pagedBody.Total != 1 || strings.Join(authFilesPaginationNames(pagedBody.Files), ",") != "bravo.json" {
+		t.Fatalf("idle recovery filter response = %#v", pagedBody)
+	}
 
 	filtered := performAuthFilesPaginationRequest(router, "/auth-files?paged=true&page=99&page_size=1&provider=codex&priority=2&sort=priority")
 	var filteredBody struct {
@@ -153,6 +187,7 @@ func TestAuthFilesPaginationRejectsInvalidQueryValues(t *testing.T) {
 		"/auth-files?paged=true&sort=random",
 		"/auth-files?paged=true&page=1&page=2",
 		"/auth-files?paged=true&provider=codex&provider=claude",
+		"/auth-files?paged=true&account_info_recovery_state=forever_retrying",
 	} {
 		response := performAuthFilesPaginationRequest(router, path)
 		if response.Code != http.StatusBadRequest {

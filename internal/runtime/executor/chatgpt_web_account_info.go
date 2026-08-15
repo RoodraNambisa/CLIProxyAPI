@@ -5,6 +5,7 @@ import (
 	"container/heap"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -33,7 +34,8 @@ const (
 	chatGPTWebAccountInfoTaskRetention          = 24 * time.Hour
 	chatGPTWebAccountInfoTaskMaxKept            = 128
 	chatGPTWebAccountInfoExpiredRecoveryBackoff = 5 * time.Minute
-	chatGPTWebAccountInfoMaxRetryAfter          = 5 * time.Minute
+	chatGPTWebAccountInfoMaxRetryBackoff        = 30 * time.Minute
+	chatGPTWebAccountInfoMaxRetryAfter          = 24 * time.Hour
 	chatGPTWebAccountInfoMaxBodyBytes           = 1 << 20
 	chatGPTWebAccountInfoDiagnosticBodyMaxBytes = 4 << 10
 	chatGPTWebAccountInfoMaxRedirects           = 5
@@ -184,6 +186,11 @@ type chatGPTWebAccountInfoWork struct {
 	index                 int
 	force                 bool
 	manualLifecycleBypass bool
+	recoveryCycleReset    bool
+	previousRecoveryState string
+	previousRecoveryStop  string
+	previousAttempts      int
+	previousFailures      int
 	attempt               int
 	schedule              string
 	automatic             bool
@@ -332,6 +339,10 @@ type chatGPTWebAccountInfoRuntime struct {
 	workSequence      uint64
 	lastErrorSequence uint64
 	lastError         string
+	lastFailure       string
+	lastFailureAt     time.Time
+	lastSuccessAt     time.Time
+	failureCounts     map[string]uint64
 	calls             map[string]*chatGPTWebAccountInfoCall
 	now               func() time.Time
 	random            io.Reader
@@ -368,6 +379,7 @@ func newChatGPTWebAccountInfoRuntime(executor *ChatGPTWebExecutor, cfg *config.C
 		scheduled:                  make(map[string]*chatGPTWebAccountInfoSchedule),
 		scheduledByTarget:          make(map[string]map[string]*chatGPTWebAccountInfoSchedule),
 		calls:                      make(map[string]*chatGPTWebAccountInfoCall),
+		failureCounts:              make(map[string]uint64),
 		wake:                       make(chan struct{}, 1),
 		periodicWake:               make(chan struct{}, 1),
 		ctx:                        ctx,
@@ -1487,7 +1499,8 @@ func (runtime *chatGPTWebAccountInfoRuntime) enqueuePeriodicTargetsLocked(
 			continue
 		}
 		runtimeKey := chatGPTWebAccountInfoTargetKey(target)
-		if runtimeKey == "" || runtime.periodicTargetCoveredLocked(target) {
+		if runtimeKey == "" || runtime.automaticRecoveryBlockedLocked(runtimeKey) ||
+			runtime.periodicTargetCoveredLocked(target) {
 			continue
 		}
 		enqueued, current := runtime.enqueueForCurrentInstanceLocked(chatGPTWebAccountInfoWork{
@@ -1577,7 +1590,8 @@ func (runtime *chatGPTWebAccountInfoRuntime) drainPeriodicPendingLocked() {
 		}
 		delete(runtime.periodicPendingByTarget, runtimeKey)
 		resolved, current := runtime.resolveCurrentTargetLocked(stored)
-		if !current || runtime.periodicTargetCoveredLocked(resolved) {
+		if !current || runtime.automaticRecoveryBlockedLocked(runtimeKey) ||
+			runtime.periodicTargetCoveredLocked(resolved) {
 			continue
 		}
 		enqueued, current := runtime.enqueueForCurrentInstanceLocked(chatGPTWebAccountInfoWork{
@@ -2180,7 +2194,7 @@ func (runtime *chatGPTWebAccountInfoRuntime) releaseAccountInfoCall(
 	if !canceled && outcome.retryable && outcome.status != chatgptwebauth.AccountInfoResultCanceled {
 		call.includeRetryAttempt(attempt)
 		if call.retryAt.IsZero() {
-			delay := runtime.retryDelay(call.retryAttempt)
+			delay := runtime.retryDelay(call.retryAttempt, call.authID)
 			if retryAfter := clampChatGPTWebAccountInfoRetryAfter(outcome.retryAfter); retryAfter > delay {
 				delay = retryAfter
 			}
@@ -2255,12 +2269,36 @@ func (runtime *chatGPTWebAccountInfoRuntime) finishWorkLocked(work chatGPTWebAcc
 	}
 	runtimeKey := chatGPTWebAccountInfoTargetKey(work.target)
 	state := runtime.states[runtimeKey]
-	if outcome.errorCode != "" {
-		state.LastError = chatgptwebauth.SafeQuotaError(outcome.errorCode)
-	} else {
-		state.LastError = ""
+	if outcome.status == chatgptwebauth.AccountInfoResultCanceled && work.recoveryCycleReset {
+		runtime.restoreRecoveryCycleLocked(work)
+		state = runtime.states[runtimeKey]
 	}
-	runtime.updateLastErrorLocked(work.sequence, outcome.status, state.LastError)
+	now := runtime.currentTime()
+	safeError := chatgptwebauth.SafeQuotaError(outcome.errorCode)
+	if outcome.status != chatgptwebauth.AccountInfoResultCanceled && safeError != "" {
+		state.LastError = safeError
+		state.LastFailure = safeError
+		state.LastFailureAt = now
+		state.RecoveryAttempts = max(1, work.attempt)
+		state.RecoveryMaxAttempts = runtime.maxAutomaticAttemptsLocked()
+		state.ConsecutiveFailures++
+		runtime.updateLastErrorLocked(work.sequence, safeError)
+		runtime.lastFailure = safeError
+		runtime.lastFailureAt = now
+		if runtime.failureCounts == nil {
+			runtime.failureCounts = make(map[string]uint64)
+		}
+		runtime.failureCounts[safeError]++
+	} else if accountInfoResultSuccessful(outcome.status) {
+		state.LastError = ""
+		state.RecoveryState = chatgptwebauth.AccountInfoRecoveryIdle
+		state.RecoveryAttempts = 0
+		state.RecoveryMaxAttempts = runtime.maxAutomaticAttemptsLocked()
+		state.RecoveryStopReason = ""
+		state.LastSuccessAt = now
+		state.ConsecutiveFailures = 0
+		runtime.lastSuccessAt = now
+	}
 	runtime.states[runtimeKey] = state
 
 	freshQuotaState := outcome.quotaStateKnown
@@ -2272,10 +2310,14 @@ func (runtime *chatGPTWebAccountInfoRuntime) finishWorkLocked(work chatGPTWebAcc
 	if outcome.status == chatgptwebauth.AccountInfoResultPartial {
 		work.partialApplied = true
 	}
-	if outcome.retryable && work.attempt <= runtime.cfg.MaxRetries && outcome.status != chatgptwebauth.AccountInfoResultCanceled {
+	if outcome.retryable && work.attempt <= runtime.automaticRetryLimitLocked() && outcome.status != chatgptwebauth.AccountInfoResultCanceled {
+		state = runtime.states[runtimeKey]
+		state.RecoveryState = chatgptwebauth.AccountInfoRecoveryAutoRetrying
+		state.RecoveryStopReason = ""
+		runtime.states[runtimeKey] = state
 		next := outcome.retryAt
 		if next.IsZero() {
-			delay := runtime.retryDelay(work.attempt)
+			delay := runtime.retryDelay(work.attempt, work.target.AuthID)
 			if retryAfter := clampChatGPTWebAccountInfoRetryAfter(outcome.retryAfter); retryAfter > delay {
 				delay = retryAfter
 			}
@@ -2290,6 +2332,17 @@ func (runtime *chatGPTWebAccountInfoRuntime) finishWorkLocked(work chatGPTWebAcc
 		}
 		outcome.status = chatgptwebauth.AccountInfoResultFailed
 		outcome.errorCode = "refresh_failed"
+		safeError = "refresh_failed"
+	}
+	if outcome.status != chatgptwebauth.AccountInfoResultCanceled && safeError != "" {
+		state = runtime.states[runtimeKey]
+		state.LastError = safeError
+		state.RecoveryState, state.RecoveryStopReason = accountInfoTerminalRecoveryState(safeError, outcome.retryable)
+		if state.RecoveryState != chatgptwebauth.AccountInfoRecoveryIdle {
+			runtime.deletePendingTriggerLocked(runtimeKey)
+			runtime.deletePeriodicPendingLocked(runtimeKey)
+		}
+		runtime.states[runtimeKey] = state
 	}
 	if work.partialApplied && outcome.status == chatgptwebauth.AccountInfoResultFailed {
 		outcome.status = chatgptwebauth.AccountInfoResultPartial
@@ -2346,21 +2399,42 @@ func (runtime *chatGPTWebAccountInfoRuntime) assignWorkSequenceLocked(work *chat
 	work.sequence = runtime.workSequence
 }
 
-func (runtime *chatGPTWebAccountInfoRuntime) updateLastErrorLocked(sequence uint64, status, errorCode string) {
+func (runtime *chatGPTWebAccountInfoRuntime) updateLastErrorLocked(sequence uint64, errorCode string) {
 	if sequence < runtime.lastErrorSequence {
 		return
 	}
 	if errorCode != "" {
 		runtime.lastErrorSequence = sequence
 		runtime.lastError = errorCode
-		return
 	}
+}
+
+func accountInfoResultSuccessful(status string) bool {
 	switch status {
 	case chatgptwebauth.AccountInfoResultUpdated,
 		chatgptwebauth.AccountInfoResultUnchanged,
 		chatgptwebauth.AccountInfoResultFresh:
-		runtime.lastErrorSequence = sequence
-		runtime.lastError = ""
+		return true
+	default:
+		return false
+	}
+}
+
+func accountInfoTerminalRecoveryState(errorCode string, retryable bool) (string, string) {
+	switch chatgptwebauth.SafeQuotaError(errorCode) {
+	case "account_unverified", "interaction_required":
+		return chatgptwebauth.AccountInfoRecoveryInteractionRequired, chatgptwebauth.SafeQuotaError(errorCode)
+	case "relogin_pending":
+		return chatgptwebauth.AccountInfoRecoveryReloginPending, "relogin_pending"
+	case "reauth_required", "unauthorized":
+		return chatgptwebauth.AccountInfoRecoveryReauthRequired, chatgptwebauth.SafeQuotaError(errorCode)
+	case "canceled", "credential_unavailable":
+		return chatgptwebauth.AccountInfoRecoveryIdle, ""
+	default:
+		if retryable {
+			return chatgptwebauth.AccountInfoRecoveryManualRequired, "recovery_exhausted"
+		}
+		return chatgptwebauth.AccountInfoRecoveryManualRequired, chatgptwebauth.SafeQuotaError(errorCode)
 	}
 }
 
@@ -2849,6 +2923,12 @@ func (runtime *chatGPTWebAccountInfoRuntime) syncRecoveryScheduleForTargetLocked
 		return
 	}
 	key := "recovery:" + chatGPTWebAccountInfoTargetKey(target)
+	if runtime.automaticRecoveryBlockedLocked(chatGPTWebAccountInfoTargetKey(target)) {
+		if entry := runtime.removeScheduleLocked(key); entry != nil {
+			runtime.releaseWorkEpochLocked(entry.work)
+		}
+		return
+	}
 	if !runtime.cfg.AutomaticRefreshEnabled() {
 		if entry := runtime.removeScheduleLocked(key); entry != nil {
 			runtime.releaseWorkEpochLocked(entry.work)
@@ -2951,6 +3031,12 @@ func (runtime *chatGPTWebAccountInfoRuntime) schedulerLoop() {
 					status:    chatgptwebauth.AccountInfoResultFailed,
 					errorCode: "credential_unavailable",
 				})
+				runtime.releaseWorkEpochLocked(entry.work)
+				continue
+			}
+			if entry.work.automatic && runtime.automaticRecoveryBlockedLocked(
+				chatGPTWebAccountInfoTargetKey(entry.work.target),
+			) {
 				runtime.releaseWorkEpochLocked(entry.work)
 				continue
 			}
@@ -3109,23 +3195,113 @@ func (runtime *chatGPTWebAccountInfoRuntime) signalPeriodic() {
 	}
 }
 
-func (runtime *chatGPTWebAccountInfoRuntime) retryDelay(attempt int) time.Duration {
+func (runtime *chatGPTWebAccountInfoRuntime) retryDelay(attempt int, authID string) time.Duration {
 	if attempt < 1 {
 		attempt = 1
 	}
-	delay := 30 * time.Second
-	for index := 1; index < attempt && delay < chatGPTWebAccountInfoMaxRetryAfter; index++ {
+	delay := 5 * time.Minute
+	for index := 1; index < attempt && delay < chatGPTWebAccountInfoMaxRetryBackoff; index++ {
 		delay *= 2
 	}
-	if delay > chatGPTWebAccountInfoMaxRetryAfter {
-		delay = chatGPTWebAccountInfoMaxRetryAfter
+	if delay > chatGPTWebAccountInfoMaxRetryBackoff {
+		delay = chatGPTWebAccountInfoMaxRetryBackoff
 	}
-	jitter := runtime.fraction(0.2)
-	delay += time.Duration(float64(delay) * jitter)
-	if delay > chatGPTWebAccountInfoMaxRetryAfter {
-		return chatGPTWebAccountInfoMaxRetryAfter
+	delay += stableChatGPTWebAccountInfoRetryJitter(
+		authID,
+		attempt,
+		time.Duration(runtime.cfg.RecoveryJitterSeconds)*time.Second,
+	)
+	if delay > chatGPTWebAccountInfoMaxRetryBackoff {
+		return chatGPTWebAccountInfoMaxRetryBackoff
 	}
 	return delay
+}
+
+func (runtime *chatGPTWebAccountInfoRuntime) automaticRetryLimitLocked() int {
+	if runtime == nil || runtime.cfg.MaxRetries <= 0 {
+		return 0
+	}
+	return min(runtime.cfg.MaxRetries, chatgptwebauth.AccountInfoRecoveryMaxAutomaticRetryCount)
+}
+
+func (runtime *chatGPTWebAccountInfoRuntime) maxAutomaticAttemptsLocked() int {
+	return runtime.automaticRetryLimitLocked() + 1
+}
+
+func (runtime *chatGPTWebAccountInfoRuntime) automaticRecoveryBlockedLocked(runtimeKey string) bool {
+	if runtime == nil || strings.TrimSpace(runtimeKey) == "" {
+		return false
+	}
+	switch runtime.states[strings.TrimSpace(runtimeKey)].RecoveryState {
+	case chatgptwebauth.AccountInfoRecoveryManualRequired,
+		chatgptwebauth.AccountInfoRecoveryReloginPending,
+		chatgptwebauth.AccountInfoRecoveryReauthRequired,
+		chatgptwebauth.AccountInfoRecoveryInteractionRequired:
+		return true
+	default:
+		return false
+	}
+}
+
+func (runtime *chatGPTWebAccountInfoRuntime) resetRecoveryCycleLocked(target chatgptwebauth.AccountInfoRefreshTarget) {
+	if runtime == nil {
+		return
+	}
+	runtimeKey := chatGPTWebAccountInfoTargetKey(target)
+	if runtimeKey == "" {
+		return
+	}
+	if entry := runtime.removeScheduleLocked("retry:" + runtimeKey); entry != nil {
+		runtime.releaseWorkEpochLocked(entry.work)
+	}
+	if call := runtime.calls[runtimeKey]; call != nil && call.completed {
+		delete(runtime.calls, runtimeKey)
+	}
+	runtime.deletePendingTriggerLocked(runtimeKey)
+	runtime.deletePeriodicPendingLocked(runtimeKey)
+	state := runtime.states[runtimeKey]
+	state.RecoveryState = chatgptwebauth.AccountInfoRecoveryManualChecking
+	state.RecoveryAttempts = 0
+	state.RecoveryMaxAttempts = runtime.maxAutomaticAttemptsLocked()
+	state.RecoveryStopReason = ""
+	state.NextRefreshAt = time.Time{}
+	runtime.states[runtimeKey] = state
+}
+
+func (runtime *chatGPTWebAccountInfoRuntime) restoreRecoveryCycleLocked(work chatGPTWebAccountInfoWork) {
+	if runtime == nil || !work.recoveryCycleReset {
+		return
+	}
+	runtimeKey := chatGPTWebAccountInfoTargetKey(work.target)
+	if runtimeKey == "" {
+		return
+	}
+	state := runtime.states[runtimeKey]
+	if work.attempt > 1 {
+		state.RecoveryState = chatgptwebauth.AccountInfoRecoveryManualRequired
+		state.RecoveryAttempts = work.attempt - 1
+		state.RecoveryMaxAttempts = runtime.maxAutomaticAttemptsLocked()
+		state.RecoveryStopReason = "canceled"
+		state.NextRefreshAt = time.Time{}
+		runtime.states[runtimeKey] = state
+		return
+	}
+	state.RecoveryState = work.previousRecoveryState
+	state.RecoveryAttempts = work.previousAttempts
+	state.RecoveryMaxAttempts = runtime.maxAutomaticAttemptsLocked()
+	state.RecoveryStopReason = work.previousRecoveryStop
+	state.ConsecutiveFailures = work.previousFailures
+	state.NextRefreshAt = time.Time{}
+	runtime.states[runtimeKey] = state
+}
+
+func stableChatGPTWebAccountInfoRetryJitter(authID string, attempt int, maximum time.Duration) time.Duration {
+	if strings.TrimSpace(authID) == "" || maximum <= 0 {
+		return 0
+	}
+	sum := sha256.Sum256([]byte(fmt.Sprintf("%s\x00%d", strings.TrimSpace(authID), attempt)))
+	fraction := float64(binary.LittleEndian.Uint64(sum[:8])>>11) / float64(uint64(1)<<53)
+	return time.Duration(fraction * float64(maximum))
 }
 
 func (runtime *chatGPTWebAccountInfoRuntime) recoveryJitter() time.Duration {
@@ -3488,8 +3664,24 @@ func (runtime *chatGPTWebAccountInfoRuntime) startTask(targets []chatgptwebauth.
 			manualLifecycleBypass: manualLifecycleBypass[index],
 			attempt:               1,
 		}
+		if force {
+			runtimeKey := chatGPTWebAccountInfoTargetKey(target)
+			previous := runtime.states[runtimeKey]
+			work.recoveryCycleReset = true
+			work.previousRecoveryState = previous.RecoveryState
+			work.previousRecoveryStop = previous.RecoveryStopReason
+			work.previousAttempts = previous.RecoveryAttempts
+			work.previousFailures = previous.ConsecutiveFailures
+			if work.previousRecoveryState == "" && manualLifecycleBypass[index] {
+				work.previousRecoveryState = chatgptwebauth.AccountInfoRecoveryReauthRequired
+				work.previousRecoveryStop = "reauth_required"
+			}
+		}
 		enqueued, current := runtime.enqueueForCurrentInstanceLocked(work)
 		if enqueued {
+			if force {
+				runtime.resetRecoveryCycleLocked(target)
+			}
 			continue
 		}
 		task.snapshot.Results[index].Status = chatgptwebauth.AccountInfoResultFailed
@@ -3544,6 +3736,7 @@ func (runtime *chatGPTWebAccountInfoRuntime) cancelTask(id string) (*chatgptweba
 			filtered = append(filtered, work)
 			continue
 		}
+		runtime.restoreRecoveryCycleLocked(work)
 		runtime.syncCanceledWorkRecoveryLocked(work)
 		runtime.retainIndependentTriggerLocked(work)
 		result := &task.snapshot.Results[work.index]
@@ -3568,6 +3761,7 @@ func (runtime *chatGPTWebAccountInfoRuntime) cancelTask(id string) (*chatgptweba
 		if entry == nil {
 			continue
 		}
+		runtime.restoreRecoveryCycleLocked(entry.work)
 		runtime.syncCanceledWorkRecoveryLocked(entry.work)
 		runtime.retainIndependentTriggerLocked(entry.work)
 		result := &task.snapshot.Results[entry.work.index]
@@ -3636,24 +3830,96 @@ func (runtime *chatGPTWebAccountInfoRuntime) snapshot() chatgptwebauth.AccountIn
 		return chatgptwebauth.AccountInfoRuntimeSnapshot{}
 	}
 	runtime.mu.Lock()
-	defer runtime.mu.Unlock()
-	queued := runtime.queueLengthLocked() + runtime.waiting
+	immediateQueued := runtime.queueLengthLocked() + runtime.waiting
 	for _, mode := range runtime.pendingTriggers {
 		if mode != chatGPTWebAccountInfoTriggerNone {
-			queued++
+			immediateQueued++
 		}
 	}
-	queued += len(runtime.periodicPendingByTarget)
-	return chatgptwebauth.AccountInfoRuntimeSnapshot{
-		Busy:         runtime.busy,
-		Queued:       queued,
-		Scheduled:    len(runtime.scheduled),
-		Inflight:     len(runtime.inflight),
-		RefreshCount: runtime.refreshCount,
-		RetryCount:   runtime.retryCount,
-		FailedCount:  runtime.failedCount,
-		LastError:    chatgptwebauth.SafeQuotaError(runtime.lastError),
+	queued := immediateQueued + len(runtime.periodicPendingByTarget)
+	retryScheduled := 0
+	taskRetryScheduled := 0
+	transientRecoveryScheduled := 0
+	quotaRecoveryScheduled := 0
+	for key, entry := range runtime.scheduled {
+		switch {
+		case strings.HasPrefix(key, "recovery:"):
+			quotaRecoveryScheduled++
+		case entry != nil && entry.work.attempt > 1:
+			retryScheduled++
+			if entry.work.taskID != "" {
+				taskRetryScheduled++
+			} else {
+				transientRecoveryScheduled++
+			}
+		}
 	}
+	failureCounts := make(map[string]uint64, len(runtime.failureCounts))
+	for code, count := range runtime.failureCounts {
+		failureCounts[code] = count
+	}
+	states := make(map[string]chatgptwebauth.AccountInfoAuthRuntimeState, len(runtime.states))
+	for runtimeKey, state := range runtime.states {
+		states[runtimeKey] = state
+	}
+	periodicScheduled := 0
+	if runtime.periodicEnabledLocked() && !runtime.periodicNextAt.IsZero() {
+		periodicScheduled = 1
+	}
+	snapshot := chatgptwebauth.AccountInfoRuntimeSnapshot{
+		Busy:                       runtime.busy,
+		Queued:                     queued,
+		ImmediateQueued:            immediateQueued,
+		Scheduled:                  len(runtime.scheduled),
+		RetryScheduled:             retryScheduled,
+		TaskRetryScheduled:         taskRetryScheduled,
+		TransientRecoveryScheduled: transientRecoveryScheduled,
+		QuotaRecoveryScheduled:     quotaRecoveryScheduled,
+		PeriodicReviewScheduled:    periodicScheduled,
+		PeriodicPending:            len(runtime.periodicPendingByTarget),
+		PeriodicNextAt:             runtime.periodicNextAt,
+		MaxAutomaticAttempts:       runtime.maxAutomaticAttemptsLocked(),
+		Inflight:                   len(runtime.inflight),
+		RefreshCount:               runtime.refreshCount,
+		RetryCount:                 runtime.retryCount,
+		FailedCount:                runtime.failedCount,
+		LastError:                  chatgptwebauth.SafeQuotaError(runtime.lastError),
+		LastFailure:                chatgptwebauth.SafeQuotaError(runtime.lastFailure),
+		LastFailureAt:              runtime.lastFailureAt,
+		LastSuccessAt:              runtime.lastSuccessAt,
+		FailureCounts:              failureCounts,
+		RecoveryStateCounts:        make(map[string]int),
+	}
+	runtime.mu.Unlock()
+
+	if runtime.executor != nil && runtime.executor.manager != nil {
+		for _, auth := range runtime.executor.manager.ChatGPTWebAuths() {
+			if auth == nil {
+				continue
+			}
+			runtimeKey := chatGPTWebAccountInfoAuthInstanceKey(auth.ID, auth.RuntimeInstanceID())
+			state, exists := states[runtimeKey]
+			if !exists {
+				state = states[auth.ID]
+			}
+			applyChatGPTWebAccountInfoLifecycleRecoveryState(auth, &state)
+			addChatGPTWebAccountInfoRecoveryStateCount(snapshot.RecoveryStateCounts, state.RecoveryState)
+			delete(states, runtimeKey)
+			delete(states, auth.ID)
+		}
+	}
+	for _, state := range states {
+		addChatGPTWebAccountInfoRecoveryStateCount(snapshot.RecoveryStateCounts, state.RecoveryState)
+	}
+	return snapshot
+}
+
+func addChatGPTWebAccountInfoRecoveryStateCount(counts map[string]int, state string) {
+	state = strings.TrimSpace(state)
+	if state == "" || state == chatgptwebauth.AccountInfoRecoveryIdle {
+		return
+	}
+	counts[state]++
 }
 
 func (runtime *chatGPTWebAccountInfoRuntime) authState(authID string) chatgptwebauth.AccountInfoAuthRuntimeState {
@@ -3665,16 +3931,86 @@ func (runtime *chatGPTWebAccountInfoRuntime) authState(authID string) chatgptweb
 		return chatgptwebauth.AccountInfoAuthRuntimeState{}
 	}
 	runtime.mu.Lock()
-	defer runtime.mu.Unlock()
 	target = runtime.bindCurrentTargetLocked(target)
 	runtimeKey := chatGPTWebAccountInfoTargetKey(target)
 	state := runtime.states[runtimeKey]
+	state.RecoveryMaxAttempts = runtime.maxAutomaticAttemptsLocked()
 	if runtime.inflight[runtimeKey] > 0 ||
 		runtime.pendingTriggers[runtimeKey] != chatGPTWebAccountInfoTriggerNone ||
 		runtime.targetQueuedLocked(runtimeKey) {
 		state.Refreshing = true
 	}
+	runtime.mu.Unlock()
+	runtime.applyAuthLifecycleRecoveryState(target.AuthID, &state)
 	return state
+}
+
+func (runtime *chatGPTWebAccountInfoRuntime) recoveryStates() map[string]string {
+	result := make(map[string]string)
+	if runtime == nil || runtime.executor == nil || runtime.executor.manager == nil {
+		return result
+	}
+	runtime.mu.Lock()
+	states := make(map[string]chatgptwebauth.AccountInfoAuthRuntimeState, len(runtime.states))
+	for runtimeKey, state := range runtime.states {
+		states[runtimeKey] = state
+	}
+	runtime.mu.Unlock()
+	for _, auth := range runtime.executor.manager.ChatGPTWebAuths() {
+		if auth == nil {
+			continue
+		}
+		runtimeKey := chatGPTWebAccountInfoAuthInstanceKey(auth.ID, auth.RuntimeInstanceID())
+		state, exists := states[runtimeKey]
+		if !exists {
+			state = states[auth.ID]
+		}
+		applyChatGPTWebAccountInfoLifecycleRecoveryState(auth, &state)
+		if state.RecoveryState != "" && state.RecoveryState != chatgptwebauth.AccountInfoRecoveryIdle {
+			result[auth.ID] = state.RecoveryState
+		}
+	}
+	return result
+}
+
+func (runtime *chatGPTWebAccountInfoRuntime) applyAuthLifecycleRecoveryState(
+	authID string,
+	state *chatgptwebauth.AccountInfoAuthRuntimeState,
+) {
+	if runtime == nil || state == nil || runtime.executor == nil || runtime.executor.manager == nil {
+		return
+	}
+	auth, ok := runtime.executor.manager.GetByID(strings.TrimSpace(authID))
+	if !ok || auth == nil {
+		return
+	}
+	applyChatGPTWebAccountInfoLifecycleRecoveryState(auth, state)
+}
+
+func applyChatGPTWebAccountInfoLifecycleRecoveryState(
+	auth *cliproxyauth.Auth,
+	state *chatgptwebauth.AccountInfoAuthRuntimeState,
+) {
+	if auth == nil || state == nil {
+		return
+	}
+	switch auth.LifecycleState() {
+	case cliproxyauth.LifecycleStateReloginPending:
+		state.RecoveryState = chatgptwebauth.AccountInfoRecoveryReloginPending
+		state.RecoveryStopReason = "relogin_pending"
+	case cliproxyauth.LifecycleStateReauthRequired, cliproxyauth.LifecycleStateDead:
+		state.RecoveryState = chatgptwebauth.AccountInfoRecoveryReauthRequired
+		state.RecoveryStopReason = "reauth_required"
+	case cliproxyauth.LifecycleStateInteractionRequired:
+		reason := "interaction_required"
+		if auth.Metadata != nil {
+			if value, _ := auth.Metadata["lifecycle_reason"].(string); accountInfoUnverifiedCode(value) {
+				reason = "account_unverified"
+			}
+		}
+		state.RecoveryState = chatgptwebauth.AccountInfoRecoveryInteractionRequired
+		state.RecoveryStopReason = reason
+	}
 }
 
 func (runtime *chatGPTWebAccountInfoRuntime) targetQueuedLocked(runtimeKey string) bool {
@@ -3785,6 +4121,9 @@ func (runtime *chatGPTWebAccountInfoRuntime) triggerImportDetailed(authID string
 		return false, false
 	}
 	runtimeKey := chatGPTWebAccountInfoTargetKey(target)
+	if runtime.automaticRecoveryBlockedLocked(runtimeKey) {
+		return false, false
+	}
 	if runtime.targetHasRefreshWorkLocked(runtimeKey) {
 		return true, true
 	}
@@ -3831,6 +4170,9 @@ func (runtime *chatGPTWebAccountInfoRuntime) triggerImageQuotaEvidenceRecheckFor
 		return false
 	}
 	runtimeKey := chatGPTWebAccountInfoTargetKey(target)
+	if runtime.automaticRecoveryBlockedLocked(runtimeKey) {
+		return false
+	}
 	if runtime.inflight[runtimeKey] > 0 {
 		return true
 	}
@@ -3920,6 +4262,11 @@ func (runtime *chatGPTWebAccountInfoRuntime) triggerTargetLocked(
 	mode chatGPTWebAccountInfoTriggerMode,
 ) bool {
 	runtimeKey := chatGPTWebAccountInfoTargetKey(target)
+	if mode != chatGPTWebAccountInfoTriggerForce && runtime.automaticRecoveryBlockedLocked(runtimeKey) {
+		runtime.deletePendingTriggerLocked(runtimeKey)
+		runtime.deletePeriodicPendingLocked(runtimeKey)
+		return false
+	}
 	if mode != chatGPTWebAccountInfoTriggerForce && !runtime.cfg.AutomaticRefreshEnabled() {
 		runtime.deletePendingTriggerLocked(runtimeKey)
 		return false
@@ -4199,7 +4546,10 @@ func (e *ChatGPTWebExecutor) AccountInfoSnapshot() chatgptwebauth.AccountInfoRun
 // AccountInfoDiagnosticsSnapshot returns the bounded in-memory failures.
 func (e *ChatGPTWebExecutor) AccountInfoDiagnosticsSnapshot() chatgptwebauth.AccountInfoDiagnosticsSnapshot {
 	if e == nil || e.accountInfo == nil || e.accountInfo.diagnostics == nil {
-		return chatgptwebauth.AccountInfoDiagnosticsSnapshot{Capacity: chatgptwebauth.AccountInfoDiagnosticsCapacity}
+		return chatgptwebauth.AccountInfoDiagnosticsSnapshot{
+			Capacity: chatgptwebauth.AccountInfoDiagnosticsCapacity,
+			Records:  make([]chatgptwebauth.AccountInfoDiagnosticRecord, 0),
+		}
 	}
 	return e.accountInfo.diagnostics.Snapshot()
 }
@@ -4207,7 +4557,10 @@ func (e *ChatGPTWebExecutor) AccountInfoDiagnosticsSnapshot() chatgptwebauth.Acc
 // ClearAccountInfoDiagnostics removes all in-memory failures.
 func (e *ChatGPTWebExecutor) ClearAccountInfoDiagnostics() chatgptwebauth.AccountInfoDiagnosticsSnapshot {
 	if e == nil || e.accountInfo == nil || e.accountInfo.diagnostics == nil {
-		return chatgptwebauth.AccountInfoDiagnosticsSnapshot{Capacity: chatgptwebauth.AccountInfoDiagnosticsCapacity}
+		return chatgptwebauth.AccountInfoDiagnosticsSnapshot{
+			Capacity: chatgptwebauth.AccountInfoDiagnosticsCapacity,
+			Records:  make([]chatgptwebauth.AccountInfoDiagnosticRecord, 0),
+		}
 	}
 	return e.accountInfo.diagnostics.Clear()
 }
@@ -4218,6 +4571,7 @@ func (e *ChatGPTWebExecutor) AccountInfoRawQuotaResponsesSnapshot() chatgptwebau
 		return chatgptwebauth.AccountInfoRawQuotaResponsesSnapshot{
 			Capacity: chatgptwebauth.AccountInfoRawQuotaResponseCapacity,
 			MaxBytes: chatgptwebauth.AccountInfoRawQuotaResponseMaxBytes,
+			Records:  make([]chatgptwebauth.AccountInfoRawQuotaResponseRecord, 0),
 		}
 	}
 	return e.accountInfo.rawQuotaResponses.Snapshot()
@@ -4229,6 +4583,7 @@ func (e *ChatGPTWebExecutor) ClearAccountInfoRawQuotaResponses() chatgptwebauth.
 		return chatgptwebauth.AccountInfoRawQuotaResponsesSnapshot{
 			Capacity: chatgptwebauth.AccountInfoRawQuotaResponseCapacity,
 			MaxBytes: chatgptwebauth.AccountInfoRawQuotaResponseMaxBytes,
+			Records:  make([]chatgptwebauth.AccountInfoRawQuotaResponseRecord, 0),
 		}
 	}
 	return e.accountInfo.rawQuotaResponses.Clear()
@@ -4245,6 +4600,14 @@ func (e *ChatGPTWebExecutor) AccountInfoAuthState(authID string) chatgptwebauth.
 		return chatgptwebauth.AccountInfoAuthRuntimeState{}
 	}
 	return e.accountInfo.authState(authID)
+}
+
+// AccountInfoRecoveryStates returns current non-idle recovery states keyed by auth ID.
+func (e *ChatGPTWebExecutor) AccountInfoRecoveryStates() map[string]string {
+	if e == nil || e.accountInfo == nil {
+		return make(map[string]string)
+	}
+	return e.accountInfo.recoveryStates()
 }
 
 // StartAccountInfoRefreshTask queues bounded account profile and quota refreshes.
@@ -4533,6 +4896,11 @@ func (e *ChatGPTWebExecutor) refreshChatGPTWebAccountInfoForInstance(
 		}
 		if profileErr == nil && quotaErr == nil {
 			currentCredential.ImportAccountInfoPending = false
+			if manualLifecycleBypass {
+				currentCredential.LifecycleState = chatgptwebauth.LifecycleActive
+				currentCredential.LifecycleReason = "ready"
+				currentCredential.LifecycleUpdatedAt = now.Format(time.RFC3339)
+			}
 		}
 		currentCredential.ApplyToMetadata(currentAuth.Metadata)
 	}
@@ -4672,8 +5040,22 @@ func (e *ChatGPTWebExecutor) fetchChatGPTWebAccountInfo(ctx context.Context, aut
 		persona = client.Persona()
 		client.CloseIdleConnections()
 		quotaClient.CloseIdleConnections()
-		if refreshAttempt > 0 ||
-			!accountInfoUnauthorized(profileErr, quotaErr) ||
+		if refreshAttempt > 0 {
+			if accountInfoUnauthorized(profileErr, quotaErr) &&
+				!chatGPTWebAccountInfoManualLifecycleBypass(ctx) {
+				code, _ := classifyChatGPTWebAccountInfoErrors(profileErr, quotaErr)
+				if code == "unauthorized" {
+					current, profileErr, quotaErr = e.markAccountInfoAuthenticationFailure(
+						ctx,
+						current,
+						profileErr,
+						quotaErr,
+					)
+				}
+			}
+			return
+		}
+		if !accountInfoUnauthorized(profileErr, quotaErr) ||
 			chatGPTWebAccountInfoManualLifecycleBypass(ctx) {
 			return
 		}
@@ -4692,6 +5074,61 @@ func (e *ChatGPTWebExecutor) fetchChatGPTWebAccountInfo(ctx context.Context, aut
 		}
 	}
 	return
+}
+
+func (e *ChatGPTWebExecutor) markAccountInfoAuthenticationFailure(
+	ctx context.Context,
+	current *cliproxyauth.Auth,
+	profileErr error,
+	quotaErr error,
+) (*cliproxyauth.Auth, error, error) {
+	if e == nil || e.manager == nil || current == nil {
+		return current, profileErr, quotaErr
+	}
+	state := cliproxyauth.LifecycleStateReauthRequired
+	recoveryCode := "reauth_required"
+	credential, errCredential := chatgptwebauth.ParseCredential(current.Metadata)
+	if errCredential == nil && e.AutoReloginEnabled() && e.credentialCanRelogin(credential) {
+		state = cliproxyauth.LifecycleStateReloginPending
+		recoveryCode = "relogin_pending"
+	}
+	updated := current.Clone()
+	setChatGPTWebLifecycle(updated, state, "session_expired", e.currentTime())
+	persistContext := ctx
+	cancelPersist := func() {}
+	if e.accountInfo != nil {
+		persistContext, cancelPersist = e.accountInfo.persistenceContext(ctx)
+	}
+	defer cancelPersist()
+	installed, applied, errUpdate := e.manager.UpdateIfCurrent(persistContext, current, updated)
+	if errUpdate != nil {
+		log.WithFields(log.Fields{
+			"auth_id":    current.ID,
+			"error_code": "refresh_persist_backpressure",
+		}).WithError(errUpdate).Warn("chatgpt web account-info authentication state could not be persisted")
+		return current, profileErr, quotaErr
+	}
+	if !applied || installed == nil {
+		return current, profileErr, quotaErr
+	}
+	if state == cliproxyauth.LifecycleStateReloginPending {
+		e.TriggerBackgroundRelogin(installed)
+	}
+	authError := &chatgptwebauth.AuthError{
+		Code:           recoveryCode,
+		State:          chatgptwebauth.LifecycleState(state),
+		LifecycleState: chatgptwebauth.LifecycleState(state),
+		Status:         http.StatusUnauthorized,
+		StatusCode:     http.StatusUnauthorized,
+		Terminal:       true,
+	}
+	if accountInfoUnauthorized(profileErr) {
+		profileErr = authError
+	}
+	if accountInfoUnauthorized(quotaErr) {
+		quotaErr = authError
+	}
+	return installed, profileErr, quotaErr
 }
 
 func (e *ChatGPTWebExecutor) refreshChatGPTWebAccountInfoCredential(
@@ -4901,9 +5338,33 @@ func classifyChatGPTWebAccountInfoError(err error) (string, bool) {
 		return "", false
 	}
 	if authError, ok := chatgptwebauth.AsAuthError(err); ok {
-		code := chatgptwebauth.SafeQuotaError(authError.Code)
+		diagnosticCode := chatgptwebauth.SafeDiagnosticCode(authError.DiagnosticCode)
+		if authError.Cloudflare || diagnosticCode == "cloudflare_challenge" {
+			return "cloudflare_challenge", true
+		}
+		if accountInfoUnverifiedCode(authError.Code) || accountInfoUnverifiedCode(diagnosticCode) {
+			return "account_unverified", false
+		}
+		state := authError.LifecycleState
+		if state == "" {
+			state = authError.State
+		}
+		switch state {
+		case chatgptwebauth.LifecycleInteractionRequired:
+			return "interaction_required", false
+		case chatgptwebauth.LifecycleReloginPending:
+			return "relogin_pending", false
+		case chatgptwebauth.LifecycleReauthRequired:
+			return "reauth_required", false
+		case chatgptwebauth.LifecycleDead:
+			return "unauthorized", false
+		}
+		code := chatgptwebauth.SafeQuotaError(diagnosticCode)
+		if code == "" || code == "refresh_failed" {
+			code = chatgptwebauth.SafeQuotaError(authError.Code)
+		}
 		if code == "refresh_failed" && authError.Terminal {
-			code = "unauthorized"
+			return "unauthorized", false
 		}
 		return code, authError.Retryable
 	}
@@ -4917,16 +5378,23 @@ func classifyChatGPTWebAccountInfoError(err error) (string, bool) {
 		AuthErrorDiagnostic() *cliproxyauth.ErrorDiagnostic
 	}
 	if errors.As(err, &diagnosticProvider) {
-		if diagnostic := diagnosticProvider.AuthErrorDiagnostic(); diagnostic != nil &&
-			strings.EqualFold(strings.TrimSpace(diagnostic.Code), "cloudflare_challenge") {
-			return "cloudflare_challenge", true
+		if diagnostic := diagnosticProvider.AuthErrorDiagnostic(); diagnostic != nil {
+			diagnosticCode := chatgptwebauth.SafeDiagnosticCode(diagnostic.Code)
+			switch {
+			case diagnosticCode == "cloudflare_challenge":
+				return "cloudflare_challenge", true
+			case accountInfoUnverifiedCode(diagnosticCode):
+				return "account_unverified", false
+			}
 		}
 	}
 	var status interface{ StatusCode() int }
 	if errors.As(err, &status) {
 		switch code := status.StatusCode(); {
-		case code == http.StatusUnauthorized || code == http.StatusForbidden:
+		case code == http.StatusUnauthorized:
 			return "unauthorized", false
+		case code == http.StatusForbidden:
+			return "forbidden", false
 		case code == http.StatusTooManyRequests:
 			return "rate_limited", true
 		case code >= http.StatusInternalServerError:
@@ -4945,6 +5413,15 @@ func classifyChatGPTWebAccountInfoError(err error) (string, bool) {
 	return "network_error", true
 }
 
+func accountInfoUnverifiedCode(value string) bool {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "account_unverified", "email_unverified", "email_verification_required":
+		return true
+	default:
+		return false
+	}
+}
+
 func classifyChatGPTWebAccountInfoErrors(errs ...error) (string, bool) {
 	type classification struct {
 		code      string
@@ -4957,7 +5434,9 @@ func classifyChatGPTWebAccountInfoErrors(errs ...error) (string, bool) {
 		}
 		code, retryable := classifyChatGPTWebAccountInfoError(err)
 		classified = append(classified, classification{code: code, retryable: retryable})
-		if code == "unauthorized" || code == "identity_mismatch" {
+		if code == "account_unverified" || code == "interaction_required" ||
+			code == "relogin_pending" || code == "reauth_required" ||
+			code == "unauthorized" || code == "forbidden" || code == "identity_mismatch" {
 			return code, false
 		}
 	}

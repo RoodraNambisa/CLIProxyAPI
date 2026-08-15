@@ -479,6 +479,37 @@ func TestApplyChatGPTWebAuthFileSummaryClassifiesRateLimitCooldown(t *testing.T)
 	}
 }
 
+func TestApplyChatGPTWebAuthFileSummaryExposesBoundedRecoveryState(t *testing.T) {
+	now := time.Now().UTC()
+	auth := &coreauth.Auth{
+		Provider: chatgptwebauth.Provider,
+		Status:   coreauth.StatusActive,
+		Metadata: map[string]any{"lifecycle_state": string(chatgptwebauth.LifecycleActive)},
+	}
+	entry := gin.H{}
+	applyChatGPTWebAuthFileSummary(entry, auth, now, authFileRuntimeSummary{
+		accountInfo: &chatgptwebauth.AccountInfoAuthRuntimeState{
+			RecoveryState:       chatgptwebauth.AccountInfoRecoveryManualRequired,
+			RecoveryAttempts:    4,
+			RecoveryMaxAttempts: 4,
+			RecoveryStopReason:  "recovery_exhausted",
+			LastFailure:         "network_error",
+			LastFailureAt:       now.Add(-time.Minute),
+			LastSuccessAt:       now.Add(-time.Hour),
+			ConsecutiveFailures: 4,
+		},
+	})
+	if entry["account_info_recovery_state"] != chatgptwebauth.AccountInfoRecoveryManualRequired ||
+		entry["account_info_recovery_attempts"] != 4 ||
+		entry["account_info_recovery_max_attempts"] != 4 ||
+		entry["account_info_recovery_stop_reason"] != "recovery_exhausted" ||
+		entry["account_info_last_failure"] != "network_error" ||
+		entry["account_info_consecutive_failures"] != 4 ||
+		entry["account_info_manual_recheckable"] != true {
+		t.Fatalf("recovery summary = %+v", entry)
+	}
+}
+
 func TestParseLastRefreshValueRejectsJSONUnsafeTimestamps(t *testing.T) {
 	for _, value := range []any{
 		float64(1_000_000_000_000),

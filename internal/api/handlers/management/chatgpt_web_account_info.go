@@ -36,6 +36,10 @@ type chatGPTWebAccountInfoRawQuotaController interface {
 	ClearAccountInfoRawQuotaResponses() chatgptwebauth.AccountInfoRawQuotaResponsesSnapshot
 }
 
+type chatGPTWebAccountInfoRecoveryStateController interface {
+	AccountInfoRecoveryStates() map[string]string
+}
+
 type chatGPTWebAccountInfoResponse struct {
 	Config             config.ResolvedChatGPTWebAccountInfoConfig `json:"config"`
 	Runtime            chatgptwebauth.AccountInfoRuntimeSnapshot  `json:"runtime"`
@@ -78,6 +82,18 @@ func (h *Handler) GetChatGPTWebAccountInfo(c *gin.Context) {
 	if controller, ok := chatGPTWebAccountInfoControllerForManager(manager); ok {
 		snapshot = controller.AccountInfoSnapshot()
 	}
+	if snapshot.FailureCounts == nil {
+		snapshot.FailureCounts = make(map[string]uint64)
+	}
+	if snapshot.RecoveryStateCounts == nil {
+		snapshot.RecoveryStateCounts = make(map[string]int)
+	}
+	if snapshot.MaxAutomaticAttempts < 1 {
+		snapshot.MaxAutomaticAttempts = min(
+			resolved.MaxRetries,
+			chatgptwebauth.AccountInfoRecoveryMaxAutomaticRetryCount,
+		) + 1
+	}
 	var persistence coreauth.RefreshPersistenceMetricsSnapshot
 	if manager != nil {
 		persistence = manager.RefreshPersistenceMetrics()
@@ -117,7 +133,9 @@ func (h *Handler) managementAccountInfoDiagnosticsSnapshot(snapshot chatgptwebau
 			detailLevel = cfg.RemoteManagement.Diagnostics.ResolvedDetailLevel()
 		}
 	}
-	snapshot.Records = append([]chatgptwebauth.AccountInfoDiagnosticRecord(nil), snapshot.Records...)
+	records := make([]chatgptwebauth.AccountInfoDiagnosticRecord, len(snapshot.Records))
+	copy(records, snapshot.Records)
+	snapshot.Records = records
 	for index := range snapshot.Records {
 		record := &snapshot.Records[index]
 		record.ErrorMessage, _ = managementdiag.ProcessText(record.ErrorMessage, detailLevel, 4096)
@@ -136,7 +154,7 @@ func (h *Handler) ClearChatGPTWebAccountInfoDiagnostics(c *gin.Context) {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "chatgpt web account info diagnostics are unavailable"})
 		return
 	}
-	c.JSON(http.StatusOK, controller.ClearAccountInfoDiagnostics())
+	c.JSON(http.StatusOK, h.managementAccountInfoDiagnosticsSnapshot(controller.ClearAccountInfoDiagnostics()))
 }
 
 // GetChatGPTWebAccountInfoRawQuotaResponses returns bounded in-memory conversation/init bodies.
@@ -162,7 +180,9 @@ func (h *Handler) managementRawQuotaSnapshot(snapshot chatgptwebauth.AccountInfo
 			detailLevel = cfg.RemoteManagement.Diagnostics.ResolvedDetailLevel()
 		}
 	}
-	snapshot.Records = append([]chatgptwebauth.AccountInfoRawQuotaResponseRecord(nil), snapshot.Records...)
+	records := make([]chatgptwebauth.AccountInfoRawQuotaResponseRecord, len(snapshot.Records))
+	copy(records, snapshot.Records)
+	snapshot.Records = records
 	for index := range snapshot.Records {
 		record := &snapshot.Records[index]
 		body, truncated := managementdiag.ProcessResponseBody(record.Body, detailLevel, chatgptwebauth.AccountInfoRawQuotaResponseMaxBytes)
@@ -187,7 +207,7 @@ func (h *Handler) ClearChatGPTWebAccountInfoRawQuotaResponses(c *gin.Context) {
 		c.JSON(http.StatusNotImplemented, gin.H{"error": "chatgpt web raw quota responses are unsupported"})
 		return
 	}
-	c.JSON(http.StatusOK, rawController.ClearAccountInfoRawQuotaResponses())
+	c.JSON(http.StatusOK, h.managementRawQuotaSnapshot(rawController.ClearAccountInfoRawQuotaResponses()))
 }
 
 func (h *Handler) updateChatGPTWebAccountInfo(c *gin.Context, replace bool) {

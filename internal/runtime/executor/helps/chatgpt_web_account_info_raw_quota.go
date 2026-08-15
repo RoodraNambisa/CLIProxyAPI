@@ -108,6 +108,7 @@ func (responses *ChatGPTWebAccountInfoRawQuotaResponses) Snapshot() chatgptwebau
 		return chatgptwebauth.AccountInfoRawQuotaResponsesSnapshot{
 			Capacity: chatgptwebauth.AccountInfoRawQuotaResponseCapacity,
 			MaxBytes: chatgptwebauth.AccountInfoRawQuotaResponseMaxBytes,
+			Records:  make([]chatgptwebauth.AccountInfoRawQuotaResponseRecord, 0),
 		}
 	}
 	responses.mu.Lock()
@@ -121,6 +122,7 @@ func (responses *ChatGPTWebAccountInfoRawQuotaResponses) Clear() chatgptwebauth.
 		return chatgptwebauth.AccountInfoRawQuotaResponsesSnapshot{
 			Capacity: chatgptwebauth.AccountInfoRawQuotaResponseCapacity,
 			MaxBytes: chatgptwebauth.AccountInfoRawQuotaResponseMaxBytes,
+			Records:  make([]chatgptwebauth.AccountInfoRawQuotaResponseRecord, 0),
 		}
 	}
 	responses.mu.Lock()

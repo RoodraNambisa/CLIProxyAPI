@@ -112,13 +112,30 @@ func applyChatGPTWebAuthFileSummaryWithDetail(entry gin.H, auth *coreauth.Auth, 
 	entry["account_info_refreshable"] = !auth.Disabled &&
 		auth.Status != coreauth.StatusDisabled &&
 		auth.LifecycleRefreshable()
+	entry["account_info_manual_recheckable"] = chatGPTWebAccountInfoManualRecheckable(auth)
 	if runtimeSummary.accountInfo != nil {
 		entry["quota_refreshing"] = runtimeSummary.accountInfo.Refreshing
+		entry["account_info_recovery_state"] = runtimeSummary.accountInfo.RecoveryState
+		entry["account_info_recovery_attempts"] = runtimeSummary.accountInfo.RecoveryAttempts
+		entry["account_info_recovery_max_attempts"] = runtimeSummary.accountInfo.RecoveryMaxAttempts
+		entry["account_info_consecutive_failures"] = runtimeSummary.accountInfo.ConsecutiveFailures
+		if runtimeSummary.accountInfo.RecoveryStopReason != "" {
+			entry["account_info_recovery_stop_reason"] = runtimeSummary.accountInfo.RecoveryStopReason
+		}
 		if !runtimeSummary.accountInfo.NextRefreshAt.IsZero() {
 			entry["quota_next_refresh_at"] = runtimeSummary.accountInfo.NextRefreshAt
 		}
 		if runtimeSummary.accountInfo.LastError != "" {
 			entry["quota_last_error"] = chatgptwebauth.SafeQuotaError(runtimeSummary.accountInfo.LastError)
+		}
+		if runtimeSummary.accountInfo.LastFailure != "" {
+			entry["account_info_last_failure"] = chatgptwebauth.SafeQuotaError(runtimeSummary.accountInfo.LastFailure)
+		}
+		if !runtimeSummary.accountInfo.LastFailureAt.IsZero() {
+			entry["account_info_last_failure_at"] = runtimeSummary.accountInfo.LastFailureAt
+		}
+		if !runtimeSummary.accountInfo.LastSuccessAt.IsZero() {
+			entry["account_info_last_success_at"] = runtimeSummary.accountInfo.LastSuccessAt
 		}
 	}
 	credential, _ := chatgptwebauth.ParseCredential(auth.Metadata)
@@ -152,6 +169,18 @@ func applyChatGPTWebAuthFileSummaryWithDetail(entry gin.H, auth *coreauth.Auth, 
 	}
 	if safeDiagnostic != nil {
 		entry["last_diagnostic"] = safeDiagnostic
+	}
+}
+
+func chatGPTWebAccountInfoManualRecheckable(auth *coreauth.Auth) bool {
+	if auth == nil || auth.Disabled || auth.Status == coreauth.StatusDisabled {
+		return false
+	}
+	switch auth.LifecycleState() {
+	case "", coreauth.LifecycleStateActive, coreauth.LifecycleStateReauthRequired:
+		return true
+	default:
+		return false
 	}
 }
 

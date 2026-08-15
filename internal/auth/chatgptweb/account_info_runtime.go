@@ -28,19 +28,42 @@ const (
 	AccountInfoResultPartial   = "partial"
 	AccountInfoResultFailed    = "failed"
 	AccountInfoResultCanceled  = "canceled"
+
+	AccountInfoRecoveryIdle                   = "idle"
+	AccountInfoRecoveryAutoRetrying           = "auto_retrying"
+	AccountInfoRecoveryManualChecking         = "manual_checking"
+	AccountInfoRecoveryManualRequired         = "manual_recovery_required"
+	AccountInfoRecoveryReloginPending         = "relogin_pending"
+	AccountInfoRecoveryReauthRequired         = "reauth_required"
+	AccountInfoRecoveryInteractionRequired    = "interaction_required"
+	AccountInfoRecoveryMaxAutomaticRetryCount = 3
 )
 
 // AccountInfoRuntimeSnapshot is safe for the management API.
 type AccountInfoRuntimeSnapshot struct {
-	Busy              int                              `json:"busy"`
-	Queued            int                              `json:"queued"`
-	Scheduled         int                              `json:"scheduled"`
-	Inflight          int                              `json:"inflight"`
-	RefreshCount      uint64                           `json:"refresh_count"`
-	RetryCount        uint64                           `json:"retry_count"`
-	FailedCount       uint64                           `json:"failed_count"`
-	LastError         string                           `json:"last_error"`
-	BackgroundRelogin BackgroundReloginRuntimeSnapshot `json:"background_relogin"`
+	Busy                       int                              `json:"busy"`
+	Queued                     int                              `json:"queued"`
+	ImmediateQueued            int                              `json:"immediate_queued"`
+	Scheduled                  int                              `json:"scheduled"`
+	RetryScheduled             int                              `json:"retry_scheduled"`
+	TaskRetryScheduled         int                              `json:"task_retry_scheduled"`
+	TransientRecoveryScheduled int                              `json:"transient_recovery_scheduled"`
+	QuotaRecoveryScheduled     int                              `json:"quota_recovery_scheduled"`
+	PeriodicReviewScheduled    int                              `json:"periodic_review_scheduled"`
+	PeriodicPending            int                              `json:"periodic_pending"`
+	PeriodicNextAt             time.Time                        `json:"periodic_next_at,omitempty"`
+	MaxAutomaticAttempts       int                              `json:"max_automatic_attempts"`
+	Inflight                   int                              `json:"inflight"`
+	RefreshCount               uint64                           `json:"refresh_count"`
+	RetryCount                 uint64                           `json:"retry_count"`
+	FailedCount                uint64                           `json:"failed_count"`
+	LastError                  string                           `json:"last_error"`
+	LastFailure                string                           `json:"last_failure"`
+	LastFailureAt              time.Time                        `json:"last_failure_at,omitempty"`
+	LastSuccessAt              time.Time                        `json:"last_success_at,omitempty"`
+	FailureCounts              map[string]uint64                `json:"failure_counts"`
+	RecoveryStateCounts        map[string]int                   `json:"recovery_state_counts"`
+	BackgroundRelogin          BackgroundReloginRuntimeSnapshot `json:"background_relogin"`
 }
 
 // BackgroundReloginRuntimeSnapshot reports bounded queue activity without
@@ -56,9 +79,17 @@ type BackgroundReloginRuntimeSnapshot struct {
 
 // AccountInfoAuthRuntimeState contains transient refresh state for one auth.
 type AccountInfoAuthRuntimeState struct {
-	Refreshing    bool      `json:"refreshing"`
-	NextRefreshAt time.Time `json:"next_refresh_at,omitempty"`
-	LastError     string    `json:"last_error,omitempty"`
+	Refreshing          bool      `json:"refreshing"`
+	NextRefreshAt       time.Time `json:"next_refresh_at,omitempty"`
+	LastError           string    `json:"last_error,omitempty"`
+	RecoveryState       string    `json:"recovery_state,omitempty"`
+	RecoveryAttempts    int       `json:"recovery_attempts,omitempty"`
+	RecoveryMaxAttempts int       `json:"recovery_max_attempts,omitempty"`
+	RecoveryStopReason  string    `json:"recovery_stop_reason,omitempty"`
+	LastFailure         string    `json:"last_failure,omitempty"`
+	LastFailureAt       time.Time `json:"last_failure_at,omitempty"`
+	LastSuccessAt       time.Time `json:"last_success_at,omitempty"`
+	ConsecutiveFailures int       `json:"consecutive_failures,omitempty"`
 }
 
 // AccountInfoRefreshTarget maps a management filename to a runtime auth ID.

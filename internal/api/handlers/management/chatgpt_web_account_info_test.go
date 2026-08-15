@@ -30,6 +30,7 @@ type accountInfoControllerTestExecutor struct {
 	force       bool
 	updates     int
 	startErr    error
+	authStates  map[string]chatgptwebauth.AccountInfoAuthRuntimeState
 
 	expectedAuthID     string
 	invalidAuthIDCount int
@@ -81,6 +82,9 @@ func (executor *accountInfoControllerTestExecutor) AccountInfoAuthState(authID s
 	defer executor.mu.Unlock()
 	if executor.expectedAuthID != "" && authID != executor.expectedAuthID {
 		executor.invalidAuthIDCount++
+	}
+	if state, ok := executor.authStates[authID]; ok {
+		return state
 	}
 	return chatgptwebauth.AccountInfoAuthRuntimeState{}
 }
@@ -173,7 +177,9 @@ func TestGetChatGPTWebAccountInfoReturnsDefaultsAndRuntime(t *testing.T) {
 		t.Fatalf("defaults = %+v", response.Config)
 	}
 	if response.Runtime.Busy != 2 || response.Runtime.Queued != 3 ||
-		response.Runtime.Scheduled != 4 || response.Runtime.RefreshCount != 7 {
+		response.Runtime.Scheduled != 4 || response.Runtime.RefreshCount != 7 ||
+		response.Runtime.MaxAutomaticAttempts != 4 || response.Runtime.FailureCounts == nil ||
+		response.Runtime.RecoveryStateCounts == nil {
 		t.Fatalf("runtime = %+v", response.Runtime)
 	}
 }
@@ -217,6 +223,9 @@ func TestGetAndClearChatGPTWebAccountInfoRawQuotaResponses(t *testing.T) {
 	}
 	if !after.Enabled || len(after.Records) != 0 || after.TotalBytes != 0 || after.EvictedCount != 0 {
 		t.Fatalf("cleared raw quota = %+v", after)
+	}
+	if !strings.Contains(recorder.Body.String(), `"records":[]`) {
+		t.Fatalf("cleared raw quota encoded null records: %s", recorder.Body.String())
 	}
 }
 
@@ -316,6 +325,9 @@ func TestGetAndClearChatGPTWebAccountInfoDiagnostics(t *testing.T) {
 	if !after.Enabled || after.Capacity != chatgptwebauth.AccountInfoDiagnosticsCapacity ||
 		after.UniqueCount != 0 || after.TotalCount != 0 || after.EvictedCount != 0 || len(after.Records) != 0 {
 		t.Fatalf("cleared diagnostics = %+v", after)
+	}
+	if !strings.Contains(recorder.Body.String(), `"records":[]`) {
+		t.Fatalf("cleared diagnostics encoded null records: %s", recorder.Body.String())
 	}
 }
 

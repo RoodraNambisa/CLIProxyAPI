@@ -563,6 +563,11 @@ func TestChatGPTWebAccountInfoPeriodicPendingUsesSingleFIFOAtScale(t *testing.T)
 		}
 	}
 	runtime.mu.Unlock()
+	snapshot := runtime.snapshot()
+	if snapshot.Queued != len(targets) || snapshot.ImmediateQueued != queued ||
+		snapshot.PeriodicPending != pending {
+		t.Fatalf("periodic snapshot = %+v", snapshot)
+	}
 }
 
 func TestChatGPTWebAccountInfoPeriodicPendingDrainsAndAcceptsPriorityUpgrade(t *testing.T) {
@@ -869,8 +874,9 @@ func TestChatGPTWebAccountInfoForcedTaskRefreshesReauthRequiredCredential(t *tes
 		t.Fatalf("forced task calls = profile:%d quota:%d, want one each", profileCalls.Load(), quotaCalls.Load())
 	}
 	current, ok := manager.GetByID(auth.ID)
-	if !ok || current == nil || current.LifecycleState() != cliproxyauth.LifecycleStateReauthRequired {
-		t.Fatalf("forced quota refresh changed lifecycle: %+v", current)
+	if !ok || current == nil || current.LifecycleState() != cliproxyauth.LifecycleStateActive ||
+		current.Status != cliproxyauth.StatusActive {
+		t.Fatalf("successful forced check did not restore lifecycle: %+v", current)
 	}
 	credential, errCredential = chatgptwebauth.ParseCredential(current.Metadata)
 	if errCredential != nil || credential.ImageQuotaRemaining == nil || *credential.ImageQuotaRemaining != 6 {
@@ -923,6 +929,10 @@ func TestChatGPTWebAccountInfoForcedTaskDoesNotReloginReauthRequiredCredential(t
 	}
 	if refreshCalls.Load() != 0 {
 		t.Fatalf("forced diagnostic task attempted %d re-logins", refreshCalls.Load())
+	}
+	current, ok := manager.GetByID(auth.ID)
+	if !ok || current == nil || current.LifecycleState() != cliproxyauth.LifecycleStateReauthRequired {
+		t.Fatalf("failed forced check changed lifecycle: %+v", current)
 	}
 }
 
@@ -2078,6 +2088,151 @@ func TestChatGPTWebAccountInfoRuntimeUsesFiniteRetries(t *testing.T) {
 	if runtime.retryCount != 3 || runtime.failedCount != 1 {
 		t.Fatalf("retry/failed counts = %d/%d, want 3/1", runtime.retryCount, runtime.failedCount)
 	}
+	state := runtime.states["retry"]
+	if state.RecoveryState != chatgptwebauth.AccountInfoRecoveryManualRequired ||
+		state.RecoveryAttempts != 4 || state.RecoveryMaxAttempts != 4 ||
+		state.RecoveryStopReason != "recovery_exhausted" || state.ConsecutiveFailures != 4 {
+		t.Fatalf("exhausted recovery state = %+v", state)
+	}
+}
+
+func TestChatGPTWebAccountInfoRuntimeHardCapsAutomaticRetries(t *testing.T) {
+	now := time.Now().UTC()
+	runtime := &chatGPTWebAccountInfoRuntime{
+		cfg: config.ResolvedChatGPTWebAccountInfoConfig{
+			RecoveryJitterSeconds: 0,
+			MaxRetries:            10,
+		},
+		states:    make(map[string]chatgptwebauth.AccountInfoAuthRuntimeState),
+		scheduled: make(map[string]*chatGPTWebAccountInfoSchedule),
+		wake:      make(chan struct{}, 1),
+		now:       func() time.Time { return now },
+	}
+	work := chatGPTWebAccountInfoWork{
+		target:    chatgptwebauth.AccountInfoRefreshTarget{AuthID: "hard-cap"},
+		attempt:   1,
+		automatic: true,
+	}
+	outcome := chatGPTWebAccountInfoOutcome{
+		status:    chatgptwebauth.AccountInfoResultFailed,
+		errorCode: "upstream_unavailable",
+		retryable: true,
+	}
+	for attempt := 1; attempt <= 4; attempt++ {
+		runtime.finishWorkLocked(work, outcome)
+		entry := runtime.removeScheduleLocked("retry:hard-cap")
+		if attempt < 4 {
+			if entry == nil {
+				t.Fatalf("attempt %d did not schedule a retry", attempt)
+			}
+			work = entry.work
+		} else if entry != nil {
+			t.Fatalf("attempt 4 exceeded the hard retry cap: %+v", entry)
+		}
+	}
+	state := runtime.states["hard-cap"]
+	if state.RecoveryAttempts != 4 || state.RecoveryMaxAttempts != 4 ||
+		state.RecoveryState != chatgptwebauth.AccountInfoRecoveryManualRequired {
+		t.Fatalf("hard-capped recovery state = %+v", state)
+	}
+}
+
+func TestChatGPTWebAccountInfoManualCheckStartsNewRecoveryCycle(t *testing.T) {
+	done := make(chan struct{})
+	close(done)
+	runtime := &chatGPTWebAccountInfoRuntime{
+		cfg: config.ResolvedChatGPTWebAccountInfoConfig{MaxRetries: 3},
+		states: map[string]chatgptwebauth.AccountInfoAuthRuntimeState{
+			"manual": {
+				RecoveryState:       chatgptwebauth.AccountInfoRecoveryManualRequired,
+				RecoveryAttempts:    4,
+				RecoveryMaxAttempts: 4,
+				RecoveryStopReason:  "recovery_exhausted",
+				LastFailure:         "network_error",
+				ConsecutiveFailures: 4,
+			},
+		},
+		calls: map[string]*chatGPTWebAccountInfoCall{
+			"manual": {runtimeKey: "manual", completed: true, done: done},
+		},
+		scheduled: make(map[string]*chatGPTWebAccountInfoSchedule),
+		wake:      make(chan struct{}, 1),
+	}
+	runtime.resetRecoveryCycleLocked(chatgptwebauth.AccountInfoRefreshTarget{AuthID: "manual"})
+	state := runtime.states["manual"]
+	if state.RecoveryState != chatgptwebauth.AccountInfoRecoveryManualChecking ||
+		state.RecoveryAttempts != 0 || state.RecoveryMaxAttempts != 4 ||
+		state.RecoveryStopReason != "" || state.LastFailure != "network_error" ||
+		state.ConsecutiveFailures != 4 {
+		t.Fatalf("manual recovery reset state = %+v", state)
+	}
+	if runtime.calls["manual"] != nil {
+		t.Fatal("manual recovery retained a completed call instead of requiring a real check")
+	}
+	runtime.restoreRecoveryCycleLocked(chatGPTWebAccountInfoWork{
+		target:                chatgptwebauth.AccountInfoRefreshTarget{AuthID: "manual"},
+		recoveryCycleReset:    true,
+		previousRecoveryState: chatgptwebauth.AccountInfoRecoveryManualRequired,
+		previousRecoveryStop:  "recovery_exhausted",
+		previousAttempts:      4,
+		previousFailures:      4,
+	})
+	state = runtime.states["manual"]
+	if state.RecoveryState != chatgptwebauth.AccountInfoRecoveryManualRequired ||
+		state.RecoveryAttempts != 4 || state.RecoveryStopReason != "recovery_exhausted" ||
+		state.ConsecutiveFailures != 4 {
+		t.Fatalf("canceled manual recovery state = %+v", state)
+	}
+}
+
+func TestChatGPTWebAccountInfoAutomaticTriggersSkipManualRecoveryRequired(t *testing.T) {
+	runtime := newChatGPTWebAccountInfoRuntime(nil, nil)
+	runtime.cfg.RefreshWorkers = 1
+	runtime.cfg.RefreshQueueSize = 1
+	runtime.mu.Lock()
+	runtime.states["manual"] = chatgptwebauth.AccountInfoAuthRuntimeState{
+		RecoveryState: chatgptwebauth.AccountInfoRecoveryManualRequired,
+	}
+	target := chatgptwebauth.AccountInfoRefreshTarget{AuthID: "manual"}
+	if runtime.triggerTargetLocked(target, chatGPTWebAccountInfoTriggerAutomaticRecheck) {
+		runtime.mu.Unlock()
+		t.Fatal("automatic recheck revived a credential requiring manual recovery")
+	}
+	if !runtime.triggerTargetLocked(target, chatGPTWebAccountInfoTriggerForce) {
+		runtime.mu.Unlock()
+		t.Fatal("manual force did not revive a credential requiring manual recovery")
+	}
+	runtime.mu.Unlock()
+}
+
+func TestChatGPTWebAccountInfoCancelAfterFailedManualAttemptKeepsFailure(t *testing.T) {
+	runtime := &chatGPTWebAccountInfoRuntime{
+		cfg: config.ResolvedChatGPTWebAccountInfoConfig{MaxRetries: 3},
+		states: map[string]chatgptwebauth.AccountInfoAuthRuntimeState{
+			"manual": {
+				RecoveryState:       chatgptwebauth.AccountInfoRecoveryAutoRetrying,
+				RecoveryAttempts:    1,
+				RecoveryMaxAttempts: 4,
+				LastFailure:         "network_error",
+				ConsecutiveFailures: 5,
+			},
+		},
+	}
+	runtime.restoreRecoveryCycleLocked(chatGPTWebAccountInfoWork{
+		target:                chatgptwebauth.AccountInfoRefreshTarget{AuthID: "manual"},
+		recoveryCycleReset:    true,
+		previousRecoveryState: chatgptwebauth.AccountInfoRecoveryManualRequired,
+		previousRecoveryStop:  "recovery_exhausted",
+		previousAttempts:      4,
+		previousFailures:      4,
+		attempt:               2,
+	})
+	state := runtime.states["manual"]
+	if state.RecoveryState != chatgptwebauth.AccountInfoRecoveryManualRequired ||
+		state.RecoveryAttempts != 1 || state.RecoveryStopReason != "canceled" ||
+		state.ConsecutiveFailures != 5 || state.LastFailure != "network_error" {
+		t.Fatalf("canceled failed manual recovery state = %+v", state)
+	}
 }
 
 func TestChatGPTWebAccountInfoPartialResultSurvivesRetryFailure(t *testing.T) {
@@ -2172,8 +2327,8 @@ func TestChatGPTWebAccountInfoRetryUsesLaterUpstreamRetryAfter(t *testing.T) {
 		retryAfter: 2 * time.Minute,
 	})
 	entry := runtime.scheduled["retry:retry-after"]
-	if entry == nil || !entry.due.Equal(now.Add(2*time.Minute)) {
-		t.Fatalf("retry due = %+v, want %v", entry, now.Add(2*time.Minute))
+	if entry == nil || !entry.due.Equal(now.Add(5*time.Minute)) {
+		t.Fatalf("retry due = %+v, want %v", entry, now.Add(5*time.Minute))
 	}
 
 	secondsError := newChatGPTWebStatusError(
@@ -2786,7 +2941,7 @@ func TestChatGPTWebAccountInfoForceTriggerPromotesScheduledAndInflightWork(t *te
 		runtime.pendingTriggers["running"] != chatGPTWebAccountInfoTriggerForce {
 		t.Fatal("force trigger did not remember an in-flight follow-up")
 	}
-	if snapshot := runtime.snapshot(); snapshot.Queued != 1 || snapshot.Inflight != 1 {
+	if snapshot := runtime.snapshot(); snapshot.Queued != 1 || snapshot.ImmediateQueued != 1 || snapshot.Inflight != 1 {
 		t.Fatalf("pending follow-up snapshot = %+v, want one queued and one inflight", snapshot)
 	}
 	delete(runtime.inflight, "running")
@@ -3001,7 +3156,7 @@ func TestChatGPTWebAccountInfoPendingDrainOnlyVisitsReadyTargets(t *testing.T) {
 	}
 }
 
-func TestChatGPTWebAccountInfoForcedEarlyRecoveryRestoresFutureResetAfterRetries(t *testing.T) {
+func TestChatGPTWebAccountInfoForcedEarlyRecoveryStopsForManualReviewAfterRetries(t *testing.T) {
 	now := time.Now().UTC()
 	resetAt := now.Add(time.Hour)
 	runtime := &chatGPTWebAccountInfoRuntime{
@@ -3041,16 +3196,14 @@ func TestChatGPTWebAccountInfoForcedEarlyRecoveryRestoresFutureResetAfterRetries
 	}
 	runtime.finishWorkLocked(retry.work, failure)
 
-	restored := runtime.scheduled["recovery:forced-recovery"]
-	if restored == nil || !restored.due.Equal(resetAt) {
-		t.Fatalf("restored recovery = %+v, want reset %s", restored, resetAt)
+	if restored := runtime.scheduled["recovery:forced-recovery"]; restored != nil {
+		t.Fatalf("exhausted recovery was scheduled again: %+v", restored)
 	}
-	if !restored.work.quotaStateKnown || !restored.work.exhausted ||
-		!restored.work.quotaResetAt.Equal(resetAt) || restored.work.attempt != 1 {
-		t.Fatalf("restored recovery evidence = %+v", restored.work)
-	}
-	if state := runtime.states["forced-recovery"]; !state.NextRefreshAt.Equal(resetAt) {
-		t.Fatalf("NextRefreshAt = %s, want %s", state.NextRefreshAt, resetAt)
+	state := runtime.states["forced-recovery"]
+	if !state.NextRefreshAt.IsZero() || state.RecoveryState != chatgptwebauth.AccountInfoRecoveryManualRequired ||
+		state.RecoveryAttempts != 2 || state.RecoveryMaxAttempts != 2 ||
+		state.RecoveryStopReason != "recovery_exhausted" {
+		t.Fatalf("exhausted recovery state = %+v", state)
 	}
 	if runtime.retryCount != 1 || runtime.failedCount != 1 {
 		t.Fatalf("retry/failed counts = %d/%d, want 1/1", runtime.retryCount, runtime.failedCount)
@@ -3265,14 +3418,26 @@ func TestChatGPTWebAccountInfoSharedFailureUsesOneRetryDeadline(t *testing.T) {
 	if first.retryAt.IsZero() || !first.retryAt.Equal(second.retryAt) {
 		t.Fatalf("shared retry deadlines = %v and %v", first.retryAt, second.retryAt)
 	}
-	if want := now.Add(time.Minute); !first.retryAt.Equal(want) {
+	if want := now.Add(10 * time.Minute); !first.retryAt.Equal(want) {
 		t.Fatalf("shared retry deadline = %v, want %v", first.retryAt, want)
 	}
-	if remaining := randomReader.Len(); remaining != 8 {
-		t.Fatalf("shared retry consumed %d random bytes, want 8", len(randomBytes)-remaining)
+	if remaining := randomReader.Len(); remaining != len(randomBytes) {
+		t.Fatalf("stable retry jitter consumed %d random bytes, want 0", len(randomBytes)-remaining)
 	}
 	if runtime.calls["shared-retry"] != nil {
 		t.Fatal("completed failed call remained after all waiters released it")
+	}
+}
+
+func TestChatGPTWebAccountInfoRetryJitterIsStableByCredential(t *testing.T) {
+	maximum := 30 * time.Second
+	first := stableChatGPTWebAccountInfoRetryJitter("credential-a", 2, maximum)
+	second := stableChatGPTWebAccountInfoRetryJitter("credential-a", 2, maximum)
+	if first != second || first < 0 || first >= maximum {
+		t.Fatalf("stable jitter = %v and %v, maximum %v", first, second, maximum)
+	}
+	if other := stableChatGPTWebAccountInfoRetryJitter("credential-b", 2, maximum); other == first {
+		t.Fatalf("different credentials received identical deterministic jitter %v", first)
 	}
 }
 
@@ -5161,7 +5326,7 @@ func TestChatGPTWebAccountInfoExpiredRecoveryStopsAfterFiniteRetries(t *testing.
 	}
 	runtime.finishWorkLocked(work, outcome)
 	entry := runtime.scheduled["retry:expired"]
-	wantDue := now.Add(chatGPTWebAccountInfoMaxRetryAfter)
+	wantDue := now.Add(retryAfter)
 	if entry == nil || len(runtime.scheduled) != 1 || len(runtime.schedules) != 1 ||
 		!entry.due.Equal(wantDue) {
 		t.Fatalf("first failure did not create exactly one retry: map=%d heap=%d", len(runtime.scheduled), len(runtime.schedules))
@@ -5179,7 +5344,9 @@ func TestChatGPTWebAccountInfoExpiredRecoveryStopsAfterFiniteRetries(t *testing.
 		)
 	}
 	if state := runtime.states["expired"]; !state.NextRefreshAt.IsZero() ||
-		state.LastError != "network_error" {
+		state.LastError != "network_error" ||
+		state.RecoveryState != chatgptwebauth.AccountInfoRecoveryManualRequired ||
+		state.RecoveryStopReason != "recovery_exhausted" {
 		t.Fatalf("expired recovery state = %+v, want stopped retry state", state)
 	}
 	if runtime.retryCount != 1 || runtime.failedCount != 1 {
@@ -5215,7 +5382,7 @@ func TestChatGPTWebAccountInfoAvailableResultCancelsOldRecoverySchedule(t *testi
 	}
 }
 
-func TestChatGPTWebAccountInfoSuccessfulRefreshClearsLatestGlobalError(t *testing.T) {
+func TestChatGPTWebAccountInfoSuccessfulRefreshPreservesLatestGlobalFailure(t *testing.T) {
 	runtime := newChatGPTWebAccountInfoRuntime(nil, nil)
 	runtime.cfg.RefreshQueueSize = 2
 	runtime.mu.Lock()
@@ -5238,8 +5405,10 @@ func TestChatGPTWebAccountInfoSuccessfulRefreshClearsLatestGlobalError(t *testin
 	})
 	runtime.mu.Unlock()
 
-	if snapshot := runtime.snapshot(); snapshot.LastError != "" {
-		t.Fatalf("last error = %q, want cleared after newer success", snapshot.LastError)
+	if snapshot := runtime.snapshot(); snapshot.LastError != "network_error" ||
+		snapshot.LastFailure != "network_error" || snapshot.LastFailureAt.IsZero() ||
+		snapshot.LastSuccessAt.IsZero() || snapshot.FailureCounts["network_error"] != 1 {
+		t.Fatalf("runtime failure history = %+v", snapshot)
 	}
 }
 
@@ -5268,6 +5437,39 @@ func TestChatGPTWebAccountInfoOlderSuccessDoesNotClearNewerGlobalError(t *testin
 
 	if snapshot := runtime.snapshot(); snapshot.LastError != "rate_limited" {
 		t.Fatalf("last error = %q, want newer failure preserved", snapshot.LastError)
+	}
+}
+
+func TestChatGPTWebAccountInfoLastFailureFollowsCompletionOrder(t *testing.T) {
+	runtime := newChatGPTWebAccountInfoRuntime(nil, nil)
+	runtime.cfg.RefreshQueueSize = 2
+	runtime.mu.Lock()
+	if !runtime.enqueueLocked(chatGPTWebAccountInfoWork{
+		target: chatgptwebauth.AccountInfoRefreshTarget{AuthID: "older-work"},
+	}) || !runtime.enqueueLocked(chatGPTWebAccountInfoWork{
+		target: chatgptwebauth.AccountInfoRefreshTarget{AuthID: "newer-work"},
+	}) {
+		runtime.mu.Unlock()
+		t.Fatal("failed to enqueue account-info work")
+	}
+	olderWork, _ := runtime.dequeueLocked()
+	newerWork, _ := runtime.dequeueLocked()
+	runtime.finishWorkLocked(newerWork, chatGPTWebAccountInfoOutcome{
+		status:    chatgptwebauth.AccountInfoResultFailed,
+		errorCode: "rate_limited",
+	})
+	runtime.finishWorkLocked(olderWork, chatGPTWebAccountInfoOutcome{
+		status:    chatgptwebauth.AccountInfoResultFailed,
+		errorCode: "network_error",
+	})
+	runtime.mu.Unlock()
+
+	snapshot := runtime.snapshot()
+	if snapshot.LastError != "rate_limited" {
+		t.Fatalf("compatibility last error = %q, want higher sequence", snapshot.LastError)
+	}
+	if snapshot.LastFailure != "network_error" || snapshot.LastFailureAt.IsZero() {
+		t.Fatalf("latest completed failure = %q at %s", snapshot.LastFailure, snapshot.LastFailureAt)
 	}
 }
 
@@ -5440,6 +5642,45 @@ func TestClassifyChatGPTWebAccountInfoCloudflareChallenge(t *testing.T) {
 	}
 }
 
+func TestClassifyChatGPTWebAccountInfoForbiddenAndInteractionStates(t *testing.T) {
+	forbidden := newChatGPTWebStatusError(
+		http.StatusForbidden,
+		chatgptwebauth.ConversationInitPath,
+		[]byte(`{"error":{"code":"access_denied"}}`),
+		nil,
+	)
+	if code, retryable := classifyChatGPTWebAccountInfoError(forbidden); code != "forbidden" || retryable {
+		t.Fatalf("forbidden classification = %q retryable=%v", code, retryable)
+	}
+	unverified := &chatgptwebauth.AuthError{
+		Code:           "email_verification_required",
+		State:          chatgptwebauth.LifecycleInteractionRequired,
+		LifecycleState: chatgptwebauth.LifecycleInteractionRequired,
+		Terminal:       true,
+	}
+	if code, retryable := classifyChatGPTWebAccountInfoError(unverified); code != "account_unverified" || retryable {
+		t.Fatalf("unverified classification = %q retryable=%v", code, retryable)
+	}
+	unverifiedHTTP := newChatGPTWebStatusError(
+		http.StatusForbidden,
+		chatgptwebauth.ConversationInitPath,
+		[]byte(`{"error":{"code":"email_unverified"}}`),
+		nil,
+	)
+	if code, retryable := classifyChatGPTWebAccountInfoError(unverifiedHTTP); code != "account_unverified" || retryable {
+		t.Fatalf("unverified HTTP classification = %q retryable=%v", code, retryable)
+	}
+	relogin := &chatgptwebauth.AuthError{
+		Code:           "session_expired",
+		State:          chatgptwebauth.LifecycleReloginPending,
+		LifecycleState: chatgptwebauth.LifecycleReloginPending,
+		Terminal:       true,
+	}
+	if code, retryable := classifyChatGPTWebAccountInfoError(relogin); code != "relogin_pending" || retryable {
+		t.Fatalf("relogin classification = %q retryable=%v", code, retryable)
+	}
+}
+
 func TestChatGPTWebAccountInfoUnauthorizedRefreshUsesResolvedProxyAndInstallsTerminalState(t *testing.T) {
 	manager := cliproxyauth.NewManager(nil, nil, nil)
 	manager.SetProxyResolver(&accountInfoTestProxyResolver{url: "http://proxy.example:8080"})
@@ -5480,6 +5721,43 @@ func TestChatGPTWebAccountInfoUnauthorizedRefreshUsesResolvedProxyAndInstallsTer
 	current, ok := manager.GetByID(auth.ID)
 	if !ok || current == nil || current.LifecycleState() != cliproxyauth.LifecycleStateDead {
 		t.Fatalf("terminal lifecycle was not installed: %+v", current)
+	}
+}
+
+func TestChatGPTWebAccountInfoRepeatedUnauthorizedRequiresReauthentication(t *testing.T) {
+	manager := cliproxyauth.NewManager(nil, nil, nil)
+	auth := chatGPTWebTestAuth("account-info-repeated-unauthorized")
+	if _, errRegister := manager.Register(cliproxyauth.WithSkipPersist(context.Background()), auth); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+	executor := NewChatGPTWebExecutor(&config.Config{}, manager)
+	manager.RegisterExecutor(executor)
+	t.Cleanup(func() { _ = executor.Close() })
+	current, _ := manager.GetByID(auth.ID)
+	unauthorized := newChatGPTWebStatusError(
+		http.StatusUnauthorized,
+		chatgptwebauth.AccountCheckPath,
+		[]byte(`{"error":{"code":"invalid_token"}}`),
+		nil,
+	)
+	installed, profileErr, quotaErr := executor.markAccountInfoAuthenticationFailure(
+		t.Context(),
+		current,
+		unauthorized,
+		unauthorized,
+	)
+	if installed == nil || installed.LifecycleState() != cliproxyauth.LifecycleStateReauthRequired {
+		t.Fatalf("installed lifecycle = %+v", installed)
+	}
+	for _, errResult := range []error{profileErr, quotaErr} {
+		code, retryable := classifyChatGPTWebAccountInfoError(errResult)
+		if code != "reauth_required" || retryable {
+			t.Fatalf("repeated 401 classification = %q retryable=%v error=%v", code, retryable, errResult)
+		}
+	}
+	persisted, ok := manager.GetByID(auth.ID)
+	if !ok || persisted == nil || persisted.LifecycleState() != cliproxyauth.LifecycleStateReauthRequired {
+		t.Fatalf("persisted lifecycle = %+v", persisted)
 	}
 }
 

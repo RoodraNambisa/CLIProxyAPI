@@ -4825,7 +4825,11 @@ func (m *Manager) mutateRuntimeMetadataIfCurrent(
 		}
 	}
 	if mutate != nil {
+		previousLifecycle := candidate.LifecycleState()
 		mutate(candidate)
+		if candidate.LifecycleState() != previousLifecycle {
+			applyLifecycleRuntimeState(candidate)
+		}
 		if clearObservationMatches {
 			clearChatGPTWebImageRateLimitsAfterFreshQuotaForModels(candidate, now, imageModels)
 		}
@@ -4853,7 +4857,11 @@ func (m *Manager) mutateRuntimeMetadataIfCurrent(
 	installed := current.Clone()
 	var clearedFreshImageRateLimits []string
 	if mutate != nil {
+		previousLifecycle := installed.LifecycleState()
 		mutate(installed)
+		if installed.LifecycleState() != previousLifecycle {
+			applyLifecycleRuntimeState(installed)
+		}
 		if clearObservationMatches {
 			clearedFreshImageRateLimits = clearChatGPTWebImageRateLimitsAfterFreshQuotaForModels(installed, now, imageModels)
 		}

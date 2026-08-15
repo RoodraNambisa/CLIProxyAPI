@@ -83,7 +83,10 @@ func (diagnostics *ChatGPTWebAccountInfoDiagnostics) Record(event chatgptwebauth
 // Snapshot returns a detached copy sorted by most recent occurrence.
 func (diagnostics *ChatGPTWebAccountInfoDiagnostics) Snapshot() chatgptwebauth.AccountInfoDiagnosticsSnapshot {
 	if diagnostics == nil {
-		return chatgptwebauth.AccountInfoDiagnosticsSnapshot{Capacity: chatgptwebauth.AccountInfoDiagnosticsCapacity}
+		return chatgptwebauth.AccountInfoDiagnosticsSnapshot{
+			Capacity: chatgptwebauth.AccountInfoDiagnosticsCapacity,
+			Records:  make([]chatgptwebauth.AccountInfoDiagnosticRecord, 0),
+		}
 	}
 	diagnostics.mu.Lock()
 	defer diagnostics.mu.Unlock()
@@ -93,7 +96,10 @@ func (diagnostics *ChatGPTWebAccountInfoDiagnostics) Snapshot() chatgptwebauth.A
 // Clear removes records and cumulative counters while preserving the switch.
 func (diagnostics *ChatGPTWebAccountInfoDiagnostics) Clear() chatgptwebauth.AccountInfoDiagnosticsSnapshot {
 	if diagnostics == nil {
-		return chatgptwebauth.AccountInfoDiagnosticsSnapshot{Capacity: chatgptwebauth.AccountInfoDiagnosticsCapacity}
+		return chatgptwebauth.AccountInfoDiagnosticsSnapshot{
+			Capacity: chatgptwebauth.AccountInfoDiagnosticsCapacity,
+			Records:  make([]chatgptwebauth.AccountInfoDiagnosticRecord, 0),
+		}
 	}
 	diagnostics.mu.Lock()
 	defer diagnostics.mu.Unlock()
