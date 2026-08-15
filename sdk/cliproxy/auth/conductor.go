@@ -1909,6 +1909,16 @@ func streamErrorResult(headers http.Header, err error) *cliproxyexecutor.StreamR
 	}
 }
 
+func validateStreamResult(result *cliproxyexecutor.StreamResult, err error) (*cliproxyexecutor.StreamResult, error) {
+	if err != nil {
+		return result, err
+	}
+	if result == nil || result.Chunks == nil {
+		return result, &Error{Code: "empty_stream", Message: "upstream stream has no source", Retryable: true}
+	}
+	return result, nil
+}
+
 func enqueueTerminalStreamChunk(ctx context.Context, out chan cliproxyexecutor.StreamChunk, chunk cliproxyexecutor.StreamChunk) {
 	if ctx == nil {
 		out <- chunk
@@ -2239,6 +2249,7 @@ func (m *Manager) executeStreamWithModelPool(ctx, resultCtx context.Context, exe
 		}
 		attemptCtx, usageAttempt := cliproxyexecutor.WithRequestUsageAttempt(ctx)
 		streamResult, errStream := executor.ExecuteStream(attemptCtx, auth, execReq, execOpts)
+		streamResult, errStream = validateStreamResult(streamResult, errStream)
 		if errStream != nil {
 			unregisterRelease()
 			if errCtx := ctx.Err(); errCtx != nil {
