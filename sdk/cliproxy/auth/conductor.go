@@ -783,7 +783,10 @@ func (m *Manager) syncScheduler() {
 	m.syncSchedulerFromSnapshot(m.snapshotAuths())
 }
 
-const schedulerRouteRefreshInterval = 30 * time.Second
+const (
+	schedulerRouteRefreshInterval   = 30 * time.Second
+	schedulerRouteRefreshMaxEntries = 1024
+)
 
 // refreshSchedulerRoute repairs only auth entries whose registered model set
 // is newer than the scheduler snapshot. A pick failure caused by cooldown or
@@ -800,6 +803,22 @@ func (m *Manager) refreshSchedulerRoute(providers []string, model string) {
 	}
 	sort.Strings(providerKeys)
 	key := strings.Join(providerKeys, ",") + ":" + modelKey
+	registryRef := registry.GetGlobalRegistry()
+	registeredProviders := registryRef.GetModelProviders(modelKey)
+	registeredProviderSet := make(map[string]struct{}, len(registeredProviders))
+	for _, providerKey := range registeredProviders {
+		registeredProviderSet[strings.ToLower(strings.TrimSpace(providerKey))] = struct{}{}
+	}
+	providerRegistered := false
+	for _, providerKey := range providerKeys {
+		if _, ok := registeredProviderSet[providerKey]; ok {
+			providerRegistered = true
+			break
+		}
+	}
+	if !providerRegistered {
+		return
+	}
 
 	m.schedulerRouteRefreshMu.Lock()
 	defer m.schedulerRouteRefreshMu.Unlock()
@@ -826,7 +845,6 @@ func (m *Manager) refreshSchedulerRoute(providers []string, model string) {
 	m.mu.RUnlock()
 	sort.Strings(candidates)
 
-	registryRef := registry.GetGlobalRegistry()
 	refreshed := 0
 	for _, authID := range candidates {
 		models := registryRef.GetModelsForClient(authID)
@@ -838,10 +856,33 @@ func (m *Manager) refreshSchedulerRoute(providers []string, model string) {
 			}
 		}
 	}
-	m.schedulerRouteRefreshedAt[key] = now
+	m.rememberSchedulerRouteRefreshLocked(key, now)
 	if m.schedulerRouteRefreshObserved != nil {
 		m.schedulerRouteRefreshObserved(key, refreshed)
 	}
+}
+
+func (m *Manager) rememberSchedulerRouteRefreshLocked(key string, now time.Time) {
+	if m.schedulerRouteRefreshedAt == nil {
+		m.schedulerRouteRefreshedAt = make(map[string]time.Time)
+	}
+	for cachedKey, refreshedAt := range m.schedulerRouteRefreshedAt {
+		if refreshedAt.IsZero() || now.Sub(refreshedAt) >= schedulerRouteRefreshInterval {
+			delete(m.schedulerRouteRefreshedAt, cachedKey)
+		}
+	}
+	if _, exists := m.schedulerRouteRefreshedAt[key]; !exists && len(m.schedulerRouteRefreshedAt) >= schedulerRouteRefreshMaxEntries {
+		oldestKey := ""
+		var oldestAt time.Time
+		for cachedKey, refreshedAt := range m.schedulerRouteRefreshedAt {
+			if oldestKey == "" || refreshedAt.Before(oldestAt) {
+				oldestKey = cachedKey
+				oldestAt = refreshedAt
+			}
+		}
+		delete(m.schedulerRouteRefreshedAt, oldestKey)
+	}
+	m.schedulerRouteRefreshedAt[key] = now
 }
 
 func (m *Manager) snapshotAuths() []*Auth {

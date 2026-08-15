@@ -3,10 +3,12 @@ package auth
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
@@ -193,5 +195,40 @@ func TestManager_RefreshSchedulerRoute_CoalescesSaturatedPickFailures(t *testing
 	workers.Wait()
 	if got := observed.Load(); got != 1 {
 		t.Fatalf("route refresh scans = %d, want 1", got)
+	}
+}
+
+func TestManager_RefreshSchedulerRoute_SkipsUnknownModelsWithoutCaching(t *testing.T) {
+	manager := NewManager(nil, &RoundRobinSelector{}, nil)
+	if _, errRegister := manager.Register(t.Context(), &Auth{ID: "unknown-model-auth", Provider: "gemini"}); errRegister != nil {
+		t.Fatal(errRegister)
+	}
+	var observed atomic.Int32
+	manager.schedulerRouteRefreshObserved = func(string, int) {
+		observed.Add(1)
+	}
+
+	for index := 0; index < 100; index++ {
+		manager.refreshSchedulerRoute([]string{"gemini"}, fmt.Sprintf("unknown-model-%d", index))
+	}
+	if got := observed.Load(); got != 0 {
+		t.Fatalf("unknown model route scans = %d, want 0", got)
+	}
+	if got := len(manager.schedulerRouteRefreshedAt); got != 0 {
+		t.Fatalf("unknown model cache entries = %d, want 0", got)
+	}
+}
+
+func TestManager_RememberSchedulerRouteRefreshBoundsCache(t *testing.T) {
+	manager := NewManager(nil, &RoundRobinSelector{}, nil)
+	now := time.Now()
+	manager.schedulerRouteRefreshMu.Lock()
+	for index := 0; index < schedulerRouteRefreshMaxEntries+100; index++ {
+		manager.rememberSchedulerRouteRefreshLocked(fmt.Sprintf("route-%d", index), now.Add(time.Duration(index)*time.Nanosecond))
+	}
+	got := len(manager.schedulerRouteRefreshedAt)
+	manager.schedulerRouteRefreshMu.Unlock()
+	if got != schedulerRouteRefreshMaxEntries {
+		t.Fatalf("route refresh cache entries = %d, want %d", got, schedulerRouteRefreshMaxEntries)
 	}
 }
