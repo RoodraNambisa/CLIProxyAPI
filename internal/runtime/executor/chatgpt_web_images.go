@@ -1980,7 +1980,10 @@ func (e *ChatGPTWebExecutor) startChatGPTWebImageTaskPollForTurn(ctx context.Con
 		pollResult := chatGPTWebImageTaskPollResult{
 			accumulator: &helps.ChatGPTWebImageAccumulator{ConversationID: conversationID, Turn: turn},
 		}
-		_, payload, err := e.doChatGPTWebPollGET(ctx, client, credential, "/backend-api/tasks", nil, budget)
+		_, payload, releaseMemory, err := e.doChatGPTWebPollGET(ctx, client, credential, "/backend-api/tasks", nil, budget)
+		if releaseMemory != nil {
+			defer releaseMemory()
+		}
 		if err != nil {
 			pollResult.err = err
 		} else {
@@ -2007,7 +2010,10 @@ func (e *ChatGPTWebExecutor) startChatGPTWebImageConversationPollForTurn(ctx con
 			accumulator: &helps.ChatGPTWebImageAccumulator{ConversationID: conversationID, Turn: turn},
 		}
 		path := "/backend-api/conversation/" + url.PathEscape(conversationID)
-		_, payload, err := e.doChatGPTWebPollGET(ctx, client, credential, path, nil, budget)
+		_, payload, releaseMemory, err := e.doChatGPTWebPollGET(ctx, client, credential, path, nil, budget)
+		if releaseMemory != nil {
+			defer releaseMemory()
+		}
 		if err != nil {
 			pollResult.err = err
 		} else {
@@ -3147,9 +3153,13 @@ func (e *ChatGPTWebExecutor) downloadChatGPTWebImagesLimitedWithBudget(
 func (e *ChatGPTWebExecutor) resolveChatGPTWebImageDownloadURL(ctx context.Context, client *chatgptwebauth.Client, credential *chatgptwebauth.Credential, path string) (string, error) {
 	var lastErr error
 	for attempt := 0; attempt < chatGPTWebAssetSettleAttempts; attempt++ {
-		_, payload, err := e.doChatGPTWebGET(ctx, client, credential, path, nil)
+		_, payload, releaseMemory, err := e.doChatGPTWebGET(ctx, client, credential, path, nil)
 		if err == nil {
-			if downloadURL := firstChatGPTWebURL(payload); downloadURL != "" {
+			downloadURL := firstChatGPTWebURL(payload)
+			if releaseMemory != nil {
+				releaseMemory()
+			}
+			if downloadURL != "" {
 				return downloadURL, nil
 			}
 			err = chatGPTWebImageOutputProtocolError("chatgpt web image output metadata is missing a download URL")
@@ -3516,13 +3526,13 @@ func readChatGPTWebBoundedBodyWithAdmission(
 	return payload, nil
 }
 
-func (e *ChatGPTWebExecutor) doChatGPTWebGET(ctx context.Context, client *chatgptwebauth.Client, credential *chatgptwebauth.Credential, path string, extra map[string]string) (*fhttp.Response, []byte, error) {
+func (e *ChatGPTWebExecutor) doChatGPTWebGET(ctx context.Context, client *chatgptwebauth.Client, credential *chatgptwebauth.Credential, path string, extra map[string]string) (*fhttp.Response, []byte, func(), error) {
 	return e.doChatGPTWebGETWithBudget(ctx, client, credential, path, extra, nil, true)
 }
 
-func (e *ChatGPTWebExecutor) doChatGPTWebPollGET(ctx context.Context, client *chatgptwebauth.Client, credential *chatgptwebauth.Credential, path string, extra map[string]string, budget *chatGPTWebPollResponseBudget) (*fhttp.Response, []byte, error) {
+func (e *ChatGPTWebExecutor) doChatGPTWebPollGET(ctx context.Context, client *chatgptwebauth.Client, credential *chatgptwebauth.Credential, path string, extra map[string]string, budget *chatGPTWebPollResponseBudget) (*fhttp.Response, []byte, func(), error) {
 	if err := acquireChatGPTWebImagePollSlot(ctx, chatGPTWebImagePollSlots); err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	defer releaseChatGPTWebImagePollSlot(chatGPTWebImagePollSlots)
 	return e.doChatGPTWebGETWithBudget(ctx, client, credential, path, extra, budget, false)
@@ -3575,30 +3585,28 @@ func readChatGPTWebPollResponseBody(response *fhttp.Response, maxBytes int) ([]b
 	return data, release, nil
 }
 
-func (e *ChatGPTWebExecutor) doChatGPTWebGETWithBudget(ctx context.Context, client *chatgptwebauth.Client, credential *chatgptwebauth.Credential, path string, extra map[string]string, budget *chatGPTWebPollResponseBudget, logBody bool) (*fhttp.Response, []byte, error) {
+func (e *ChatGPTWebExecutor) doChatGPTWebGETWithBudget(ctx context.Context, client *chatgptwebauth.Client, credential *chatgptwebauth.Credential, path string, extra map[string]string, budget *chatGPTWebPollResponseBudget, logBody bool) (*fhttp.Response, []byte, func(), error) {
 	headers := e.chatGPTWebHeaders(credential, path, extra)
 	e.recordChatGPTWebRequest(ctx, credential, http.MethodGet, path, headers, nil)
 	response, err := client.DoNoRedirectStream(ctx, http.MethodGet, e.chatGPTWebBaseURL()+path, headers, nil)
 	if err != nil {
 		helps.RecordAPIResponseError(ctx, e.configSnapshot(), err)
-		return nil, nil, chatGPTWebTransportDiagnosticError(err, path)
+		return nil, nil, nil, chatGPTWebTransportDiagnosticError(err, path)
 	}
 	helps.RecordAPIResponseMetadata(ctx, e.configSnapshot(), response.StatusCode, chatGPTWebResponseLogHeaders(response.Header))
 	data, releaseMemory, err := readChatGPTWebPollResponseBody(response, chatGPTWebMaxJSONBodyBytes)
-	if releaseMemory != nil {
-		defer releaseMemory()
-	}
 	if err != nil {
 		helps.RecordAPIResponseError(ctx, e.configSnapshot(), err)
 		var memoryErr *chatGPTWebImageMemoryCapacityError
 		if errors.As(err, &memoryErr) {
-			return response, nil, err
+			return response, nil, nil, err
 		}
-		return response, nil, chatGPTWebTransportDiagnosticError(err, path)
+		return response, nil, nil, chatGPTWebTransportDiagnosticError(err, path)
 	}
 	if err = budget.consume(len(data)); err != nil {
+		releaseMemory()
 		helps.RecordAPIResponseError(ctx, e.configSnapshot(), err)
-		return response, nil, err
+		return response, nil, nil, err
 	}
 	sanitizedData := chatGPTWebResponseLogBody(path, data)
 	if logBody {
@@ -3607,12 +3615,15 @@ func (e *ChatGPTWebExecutor) doChatGPTWebGETWithBudget(ctx context.Context, clie
 		helps.AppendAPIResponseChunk(ctx, e.configSnapshot(), []byte("<chatgpt web polling response body omitted>"))
 	}
 	if challengeErr := newChatGPTWebChallengeResponseError(response.StatusCode, path, data, response.Header); challengeErr != nil {
-		return response, nil, challengeErr
+		releaseMemory()
+		return response, nil, nil, challengeErr
 	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		return response, nil, newChatGPTWebStatusError(response.StatusCode, path, data, response.Header)
+		statusErr := newChatGPTWebStatusError(response.StatusCode, path, data, response.Header)
+		releaseMemory()
+		return response, nil, nil, statusErr
 	}
-	return response, data, nil
+	return response, data, releaseMemory, nil
 }
 
 func chatGPTWebAssetNetworkError(ctx context.Context, action string, err error) error {

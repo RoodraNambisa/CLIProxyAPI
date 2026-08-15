@@ -316,7 +316,7 @@ func (e *ChatGPTWebExecutor) pollChatGPTWebSearch(ctx context.Context, client *c
 	responseBudget := newChatGPTWebPollResponseBudget(chatGPTWebSearchPollMaxBytes)
 	for pollAttempt := 1; ; pollAttempt++ {
 		path := "/backend-api/conversation/" + conversationID
-		_, payload, err := e.doChatGPTWebPollGET(ctx, client, credential, path, map[string]string{
+		_, payload, releaseMemory, err := e.doChatGPTWebPollGET(ctx, client, credential, path, map[string]string{
 			"accept":                "*/*",
 			"referer":               e.chatGPTWebBaseURL() + "/c/" + conversationID,
 			"x-openai-target-route": "/backend-api/conversation/{conversation_id}",
@@ -324,6 +324,9 @@ func (e *ChatGPTWebExecutor) pollChatGPTWebSearch(ctx context.Context, client *c
 		if err == nil {
 			transientFailures = 0
 			result, status, complete, errExtract := extractChatGPTWebSearchResult(payload, turnMessageID)
+			if releaseMemory != nil {
+				releaseMemory()
+			}
 			if errExtract != nil {
 				return chatGPTWebTextResult{}, statusErr{
 					code:           http.StatusBadGateway,

@@ -1493,7 +1493,7 @@ func TestChatGPTWebBufferedErrorBodiesAreBounded(t *testing.T) {
 	if string(payload) != "<upstream-error-body-truncated>" {
 		t.Fatalf("JSON error payload = %q", payload)
 	}
-	_, _, err = executor.doChatGPTWebGET(context.Background(), client, credential, "/backend-api/get", nil)
+	_, _, _, err = executor.doChatGPTWebGET(context.Background(), client, credential, "/backend-api/get", nil)
 	if err == nil || err.Error() != "<upstream-error-body-truncated>" {
 		t.Fatalf("GET error = %v", err)
 	}
@@ -1514,12 +1514,23 @@ func TestChatGPTWebGETWithoutPollBudget(t *testing.T) {
 	}
 	defer client.CloseIdleConnections()
 
-	_, payload, err := executor.doChatGPTWebGET(context.Background(), client, credential, "/backend-api/get", nil)
+	before := helps.ChatGPTWebImageMemorySnapshot()
+	_, payload, releaseMemory, err := executor.doChatGPTWebGET(context.Background(), client, credential, "/backend-api/get", nil)
 	if err != nil {
 		t.Fatalf("GET error = %v", err)
 	}
 	if string(payload) != responseBody {
 		t.Fatalf("GET payload = %q, want %q", payload, responseBody)
+	}
+	during := helps.ChatGPTWebImageMemorySnapshot()
+	if during.ProcessingTasks != before.ProcessingTasks+1 || during.ProcessingBytes <= before.ProcessingBytes {
+		t.Fatalf("GET response lease = before:%+v during:%+v", before, during)
+	}
+	releaseMemory()
+	releaseMemory()
+	after := helps.ChatGPTWebImageMemorySnapshot()
+	if after.ProcessingTasks != before.ProcessingTasks || after.ProcessingBytes != before.ProcessingBytes {
+		t.Fatalf("GET response lease after release = before:%+v after:%+v", before, after)
 	}
 }
 
@@ -1554,22 +1565,24 @@ func TestChatGPTWebPollResponsesUsePerResponseBudgetAndOmitSnapshotsFromLogs(t *
 	defer client.CloseIdleConnections()
 
 	budget := newChatGPTWebPollResponseLimit(len(responseBody))
-	_, payload, err := executor.doChatGPTWebPollGET(ctx, client, credential, "/backend-api/conversation/test", nil, budget)
+	_, payload, releaseMemory, err := executor.doChatGPTWebPollGET(ctx, client, credential, "/backend-api/conversation/test", nil, budget)
 	if err != nil {
 		t.Fatalf("first poll error = %v", err)
 	}
 	if string(payload) != responseBody {
 		t.Fatalf("first poll payload = %q", payload)
 	}
-	_, payload, err = executor.doChatGPTWebPollGET(ctx, client, credential, "/backend-api/conversation/test", nil, budget)
+	releaseMemory()
+	_, payload, releaseMemory, err = executor.doChatGPTWebPollGET(ctx, client, credential, "/backend-api/conversation/test", nil, budget)
 	if err != nil {
 		t.Fatalf("second poll error = %v", err)
 	}
 	if string(payload) != responseBody {
 		t.Fatalf("second poll payload = %q", payload)
 	}
+	releaseMemory()
 
-	_, _, err = executor.doChatGPTWebPollGET(
+	_, _, _, err = executor.doChatGPTWebPollGET(
 		ctx,
 		client,
 		credential,
