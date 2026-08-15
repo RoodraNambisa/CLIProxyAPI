@@ -508,6 +508,160 @@ func TestChatGPTWebRefreshCommitRetriesAfterPersistLockContention(t *testing.T) 
 	}
 }
 
+func TestChatGPTWebRefreshPersistenceWaitDoesNotConsumeCommitTimeout(t *testing.T) {
+	store := &chatGPTWebRefreshPersistenceStore{}
+	manager := NewManager(store, nil, nil)
+	manager.refreshCommitAttemptTimeout = 25 * time.Millisecond
+	manager.refreshCommitMaxAttempts = 1
+
+	firstStarted := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	firstResult := make(chan error, 1)
+	go func() {
+		_, errCommit := manager.commitChatGPTWebRefreshDurably(
+			t.Context(),
+			&Auth{ID: "first-refresh"},
+			&Auth{ID: "first-refresh"},
+			time.Time{},
+			func(context.Context) (*Auth, error) {
+				close(firstStarted)
+				<-releaseFirst
+				return &Auth{ID: "first-refresh"}, nil
+			},
+		)
+		firstResult <- errCommit
+	}()
+	<-firstStarted
+
+	secondStarted := make(chan struct{})
+	secondResult := make(chan error, 1)
+	go func() {
+		_, errCommit := manager.commitChatGPTWebRefreshDurably(
+			t.Context(),
+			&Auth{ID: "second-refresh"},
+			&Auth{ID: "second-refresh"},
+			time.Time{},
+			func(ctx context.Context) (*Auth, error) {
+				close(secondStarted)
+				if errContext := ctx.Err(); errContext != nil {
+					return nil, errContext
+				}
+				return &Auth{ID: "second-refresh"}, nil
+			},
+		)
+		secondResult <- errCommit
+	}()
+
+	deadline := time.Now().Add(time.Second)
+	for manager.RefreshPersistenceMetrics().Queued != 1 {
+		if time.Now().After(deadline) {
+			t.Fatalf("refresh persistence metrics = %#v", manager.RefreshPersistenceMetrics())
+		}
+		time.Sleep(time.Millisecond)
+	}
+	time.Sleep(2 * manager.refreshCommitAttemptTimeout)
+	select {
+	case <-secondStarted:
+		t.Fatal("second refresh entered the store before serialized execution was available")
+	default:
+	}
+	close(releaseFirst)
+
+	select {
+	case errCommit := <-firstResult:
+		if errCommit != nil {
+			t.Fatalf("first refresh commit error = %v", errCommit)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("first refresh commit did not finish")
+	}
+	select {
+	case errCommit := <-secondResult:
+		if errCommit != nil {
+			t.Fatalf("queued refresh commit error = %v", errCommit)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("queued refresh commit did not finish")
+	}
+
+	snapshot := manager.RefreshPersistenceMetrics()
+	if !snapshot.Enabled || snapshot.Concurrency != 1 || snapshot.Queued != 0 || snapshot.Active != 0 || snapshot.BackpressureEvents != 1 {
+		t.Fatalf("refresh persistence metrics = %#v", snapshot)
+	}
+}
+
+func TestChatGPTWebRefreshPersistenceBackpressureKeepsCredentialRecoverable(t *testing.T) {
+	manager := NewManager(&chatGPTWebRefreshPersistenceStore{}, nil, nil)
+	installed, errRegister := manager.Register(WithSkipPersist(t.Context()), &Auth{
+		ID:       "refresh-backpressure",
+		Provider: "chatgpt-web",
+		Status:   StatusActive,
+		Metadata: map[string]any{
+			"access_token":     "old-token",
+			"refresh_strategy": "web_oauth_rt",
+			"lifecycle_state":  LifecycleStateActive,
+		},
+	})
+	if errRegister != nil {
+		t.Fatal(errRegister)
+	}
+	coordinator := manager.refreshPersistence.Load()
+	coordinator.queueLimit = 1
+	releaseActive, errAcquire := coordinator.acquire()
+	if errAcquire != nil {
+		t.Fatal(errAcquire)
+	}
+	waiterRelease := make(chan func(), 1)
+	go func() {
+		release, _ := coordinator.acquire()
+		waiterRelease <- release
+	}()
+	deadline := time.Now().Add(time.Second)
+	for coordinator.queued.Load() != 1 {
+		if time.Now().After(deadline) {
+			t.Fatal("refresh persistence waiter did not queue")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	commitCalled := false
+	_, errCommit := manager.commitChatGPTWebRefreshDurably(
+		t.Context(),
+		installed,
+		installed.Clone(),
+		time.Time{},
+		func(context.Context) (*Auth, error) {
+			commitCalled = true
+			return nil, nil
+		},
+	)
+	var authErr *Error
+	if !errors.As(errCommit, &authErr) || authErr.Code != "refresh_persist_backpressure" || !authErr.Retryable {
+		t.Fatalf("refresh commit error = %#v", errCommit)
+	}
+	if commitCalled {
+		t.Fatal("refresh commit ran while the persistence queue was full")
+	}
+	current, ok := manager.GetByID(installed.ID)
+	if !ok || current == nil || current.LifecycleState() != LifecycleStateActive || current.Unavailable {
+		t.Fatalf("backpressured credential became unavailable: %#v", current)
+	}
+	if current.LastError == nil || current.LastError.Code != "refresh_persist_backpressure" || !current.NextRefreshAfter.After(time.Now()) {
+		t.Fatalf("backpressure recovery state = %#v", current)
+	}
+	if snapshot := manager.RefreshPersistenceMetrics(); snapshot.Rejected != 1 {
+		t.Fatalf("refresh persistence metrics = %#v", snapshot)
+	}
+
+	releaseActive()
+	select {
+	case releaseWaiter := <-waiterRelease:
+		releaseWaiter()
+	case <-time.After(time.Second):
+		t.Fatal("queued persistence waiter did not acquire after release")
+	}
+}
+
 func TestChatGPTWebRefreshCommitFailureMarksCredentialUnavailable(t *testing.T) {
 	store := &chatGPTWebRefreshPersistenceStore{}
 	manager := NewManager(store, nil, nil)

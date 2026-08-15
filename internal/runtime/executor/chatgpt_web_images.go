@@ -19,6 +19,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -86,6 +87,34 @@ type chatGPTWebAssetTransportError struct {
 
 type chatGPTWebImageBodyLimitError struct {
 	maxBytes int
+}
+
+type chatGPTWebImageMemoryCapacityError struct {
+	stage string
+}
+
+func (err *chatGPTWebImageMemoryCapacityError) Error() string {
+	stage := "download"
+	if err != nil && strings.TrimSpace(err.stage) != "" {
+		stage = strings.TrimSpace(err.stage)
+	}
+	payload, _ := json.Marshal(map[string]any{"error": map[string]any{
+		"message":       "image request memory capacity is temporarily exhausted",
+		"type":          "server_error",
+		"code":          "image_memory_capacity",
+		"failure_stage": stage,
+	}})
+	return string(payload)
+}
+
+func (*chatGPTWebImageMemoryCapacityError) StatusCode() int { return http.StatusServiceUnavailable }
+
+func (*chatGPTWebImageMemoryCapacityError) SkipAuthResult() bool { return true }
+
+func (*chatGPTWebImageMemoryCapacityError) RetryOtherAuth() bool { return false }
+
+func (*chatGPTWebImageMemoryCapacityError) ExecutionResultErrorCode() string {
+	return "image_memory_capacity"
 }
 
 func (err *chatGPTWebImageBodyLimitError) Error() string {
@@ -669,6 +698,10 @@ func (e *ChatGPTWebExecutor) finishChatGPTWebImage(ctx context.Context, client *
 		}
 	} else if streamIncomplete || !hasTerminal || !hasStreamOutput {
 		if err := e.pollChatGPTWebImageConversation(ctx, client, credential, accumulator, execution.inputIDs, hasStreamOutput, pollBudget); err != nil {
+			var memoryErr *chatGPTWebImageMemoryCapacityError
+			if errors.As(err, &memoryErr) {
+				return nil, err
+			}
 			if hasStreamOutput {
 				return nil, newChatGPTWebImageSettleError(err)
 			}
@@ -924,7 +957,7 @@ func processChatGPTWebOutputImage(
 		needsResize,
 		requestedFormat,
 	)
-	releaseMemory, errAcquire := helps.AcquireChatGPTWebImageMemory(ctx, estimatedBytes)
+	releaseMemory, errAcquire := acquireChatGPTWebTransientImageMemory(ctx, estimatedBytes)
 	if errAcquire != nil {
 		return nil, 0, 0, fmt.Errorf("wait for chatgpt web image post-processing memory: %w", errAcquire)
 	}
@@ -3174,9 +3207,13 @@ func (e *ChatGPTWebExecutor) downloadChatGPTWebImageAssetOnce(ctx context.Contex
 		return nil, statusErr, chatGPTWebAssetSettleStatusRetryable(response.StatusCode)
 	}
 	contentType := response.Header.Get("Content-Type")
-	payload, errRead := readChatGPTWebBoundedBody(response.Body, maxBytes)
+	payload, errRead := readChatGPTWebImageDownloadBody(ctx, response.Body, response.ContentLength, maxBytes)
 	errClose := response.Body.Close()
 	if errRead != nil {
+		var memoryErr *chatGPTWebImageMemoryCapacityError
+		if errors.As(errRead, &memoryErr) {
+			return nil, errRead, false
+		}
 		return nil, newChatGPTWebAssetTransportError(ctx, "download response", errRead), false
 	}
 	if errClose != nil {
@@ -3189,9 +3226,28 @@ func (e *ChatGPTWebExecutor) downloadChatGPTWebImageAssetOnce(ctx context.Contex
 		if errors.Is(errValidate, context.Canceled) || errors.Is(errValidate, context.DeadlineExceeded) {
 			return nil, errValidate, false
 		}
+		var memoryErr *chatGPTWebImageMemoryCapacityError
+		if errors.As(errValidate, &memoryErr) {
+			return nil, errValidate, false
+		}
 		return nil, chatGPTWebImageOutputProtocolError("chatgpt web image download is invalid: " + errValidate.Error()), true
 	}
 	return payload, nil, false
+}
+
+func readChatGPTWebImageDownloadBody(ctx context.Context, body io.Reader, contentLength int64, maxBytes int) ([]byte, error) {
+	leases := helps.ChatGPTWebImageMemoryLeaseSetFromContext(ctx)
+	if leases == nil {
+		return readChatGPTWebBoundedBody(body, maxBytes)
+	}
+	return readChatGPTWebBoundedBodyWithAdmission(body, contentLength, maxBytes, func(size int64) (func(), error) {
+		base64Bytes := saturatingChatGPTWebImageMultiply(saturatingChatGPTWebImageAdd(size, 2)/3, 4)
+		estimatedBytes := saturatingChatGPTWebImageAdd(size, saturatingChatGPTWebImageMultiply(base64Bytes, 2))
+		if !leases.TryAcquire(max(estimatedBytes, int64(1))) {
+			return nil, &chatGPTWebImageMemoryCapacityError{}
+		}
+		return func() {}, nil
+	})
 }
 
 func chatGPTWebAssetRetryDelay(err error, fallback time.Duration) (time.Duration, bool) {
@@ -3308,6 +3364,10 @@ func chatGPTWebCommittedRequestError(ctx context.Context, err error) (committedE
 	if errors.As(err, &limitErr) {
 		return err
 	}
+	var memoryErr *chatGPTWebImageMemoryCapacityError
+	if errors.As(err, &memoryErr) {
+		return err
+	}
 	code := statusCodeFromError(err)
 	if code == 0 {
 		code = http.StatusBadGateway
@@ -3346,7 +3406,13 @@ func validateChatGPTWebDownloadedImageWithAdmission(
 		saturatingChatGPTWebImagePixels(imageConfig.Width, imageConfig.Height),
 		chatGPTWebDecodedImageBytesPerPixel,
 	)
-	releaseMemory, errAcquire := acquire(ctx, max(estimatedBytes, int64(1)))
+	var releaseMemory func()
+	var errAcquire error
+	if helps.ChatGPTWebImageMemoryLeaseSetFromContext(ctx) != nil {
+		releaseMemory, errAcquire = acquireChatGPTWebTransientImageMemory(ctx, max(estimatedBytes, int64(1)))
+	} else {
+		releaseMemory, errAcquire = acquire(ctx, max(estimatedBytes, int64(1)))
+	}
 	if errAcquire != nil {
 		return fmt.Errorf("wait for chatgpt web image validation memory: %w", errAcquire)
 	}
@@ -3354,6 +3420,17 @@ func validateChatGPTWebDownloadedImageWithAdmission(
 
 	_, errDecode := decodeAndValidateChatGPTWebImageAgainstConfig(data, imageConfig)
 	return errDecode
+}
+
+func acquireChatGPTWebTransientImageMemory(ctx context.Context, estimatedBytes int64) (func(), error) {
+	if helps.ChatGPTWebImageMemoryLeaseSetFromContext(ctx) == nil {
+		return helps.AcquireChatGPTWebImageMemory(ctx, estimatedBytes)
+	}
+	release, acquired := helps.TryAcquireChatGPTWebImageMemory(estimatedBytes)
+	if !acquired {
+		return nil, &chatGPTWebImageMemoryCapacityError{}
+	}
+	return release, nil
 }
 
 func chatGPTWebImageOutputProtocolError(message string) error {
@@ -3378,6 +3455,63 @@ func readChatGPTWebBoundedBody(body io.Reader, maxBytes int) ([]byte, error) {
 	}
 	if len(payload) > maxBytes {
 		return nil, &chatGPTWebImageBodyLimitError{maxBytes: maxBytes}
+	}
+	return payload, nil
+}
+
+func readChatGPTWebBoundedBodyWithAdmission(
+	body io.Reader,
+	contentLength int64,
+	maxBytes int,
+	acquire func(int64) (func(), error),
+) ([]byte, error) {
+	if body == nil {
+		return nil, errors.New("chatgpt web response body is nil")
+	}
+	if maxBytes < 1 {
+		return nil, errors.New("chatgpt web response body limit is invalid")
+	}
+	if contentLength > int64(maxBytes) {
+		return nil, &chatGPTWebImageBodyLimitError{maxBytes: maxBytes}
+	}
+	if contentLength > 0 {
+		release, errAcquire := acquire(contentLength)
+		if errAcquire != nil {
+			return nil, errAcquire
+		}
+		if release != nil {
+			defer release()
+		}
+		return readChatGPTWebBoundedBody(body, maxBytes)
+	}
+
+	temporary, errCreate := os.CreateTemp("", "cliproxy-chatgpt-web-image-*")
+	if errCreate != nil {
+		return nil, fmt.Errorf("create bounded image spool: %w", errCreate)
+	}
+	path := temporary.Name()
+	defer func() { _ = os.Remove(path) }()
+	defer func() { _ = temporary.Close() }()
+	copied, errCopy := io.Copy(temporary, io.LimitReader(body, int64(maxBytes)+1))
+	if errCopy != nil {
+		return nil, fmt.Errorf("spool chatgpt web response body: %w", errCopy)
+	}
+	if copied > int64(maxBytes) {
+		return nil, &chatGPTWebImageBodyLimitError{maxBytes: maxBytes}
+	}
+	release, errAcquire := acquire(copied)
+	if errAcquire != nil {
+		return nil, errAcquire
+	}
+	if release != nil {
+		defer release()
+	}
+	if _, errSeek := temporary.Seek(0, io.SeekStart); errSeek != nil {
+		return nil, fmt.Errorf("rewind bounded image spool: %w", errSeek)
+	}
+	payload := make([]byte, copied)
+	if _, errRead := io.ReadFull(temporary, payload); errRead != nil {
+		return nil, fmt.Errorf("read bounded image spool: %w", errRead)
 	}
 	return payload, nil
 }
@@ -3415,6 +3549,32 @@ func releaseChatGPTWebImagePollSlot(slots chan struct{}) {
 	}
 }
 
+func readChatGPTWebPollResponseBody(response *fhttp.Response, maxBytes int) ([]byte, func(), error) {
+	if response == nil {
+		return nil, nil, errors.New("chatgpt web response is nil")
+	}
+	estimatedBytes := response.ContentLength
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		estimatedBytes = chatGPTWebMaxErrorBodyBytes
+	} else if estimatedBytes <= 0 || estimatedBytes > int64(maxBytes) {
+		estimatedBytes = int64(maxBytes)
+	}
+	estimatedBytes = saturatingChatGPTWebImageMultiply(estimatedBytes, 2)
+	release, acquired := helps.TryAcquireChatGPTWebImageMemory(max(estimatedBytes, int64(1)))
+	if !acquired {
+		if response.Body != nil {
+			_ = response.Body.Close()
+		}
+		return nil, nil, &chatGPTWebImageMemoryCapacityError{stage: "settle"}
+	}
+	data, err := readChatGPTWebResponseBody(response, maxBytes)
+	if err != nil {
+		release()
+		return nil, nil, err
+	}
+	return data, release, nil
+}
+
 func (e *ChatGPTWebExecutor) doChatGPTWebGETWithBudget(ctx context.Context, client *chatgptwebauth.Client, credential *chatgptwebauth.Credential, path string, extra map[string]string, budget *chatGPTWebPollResponseBudget, logBody bool) (*fhttp.Response, []byte, error) {
 	headers := e.chatGPTWebHeaders(credential, path, extra)
 	e.recordChatGPTWebRequest(ctx, credential, http.MethodGet, path, headers, nil)
@@ -3424,9 +3584,16 @@ func (e *ChatGPTWebExecutor) doChatGPTWebGETWithBudget(ctx context.Context, clie
 		return nil, nil, chatGPTWebTransportDiagnosticError(err, path)
 	}
 	helps.RecordAPIResponseMetadata(ctx, e.configSnapshot(), response.StatusCode, chatGPTWebResponseLogHeaders(response.Header))
-	data, err := readChatGPTWebResponseBody(response, chatGPTWebMaxJSONBodyBytes)
+	data, releaseMemory, err := readChatGPTWebPollResponseBody(response, chatGPTWebMaxJSONBodyBytes)
+	if releaseMemory != nil {
+		defer releaseMemory()
+	}
 	if err != nil {
 		helps.RecordAPIResponseError(ctx, e.configSnapshot(), err)
+		var memoryErr *chatGPTWebImageMemoryCapacityError
+		if errors.As(err, &memoryErr) {
+			return response, nil, err
+		}
 		return response, nil, chatGPTWebTransportDiagnosticError(err, path)
 	}
 	if err = budget.consume(len(data)); err != nil {

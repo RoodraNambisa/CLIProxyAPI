@@ -20,12 +20,13 @@ type systemMetricsFilesystems struct {
 }
 
 type systemMetricsResponse struct {
-	CollectedAt      time.Time                                  `json:"collected_at"`
-	Runtime          systemmetrics.RuntimeSnapshot              `json:"runtime"`
-	Filesystems      systemMetricsFilesystems                   `json:"filesystems"`
-	RequestBodyAudit middleware.RequestBodyAuditRuntimeSnapshot `json:"request_body_audit"`
-	UsageBatch       usage.UsageBatchRuntimeSnapshot            `json:"usage_batch"`
-	ImageProcessing  helps.ChatGPTWebImageMemoryRuntimeSnapshot `json:"image_post_processing"`
+	CollectedAt        time.Time                                  `json:"collected_at"`
+	Runtime            systemmetrics.RuntimeSnapshot              `json:"runtime"`
+	Filesystems        systemMetricsFilesystems                   `json:"filesystems"`
+	RequestBodyAudit   middleware.RequestBodyAuditRuntimeSnapshot `json:"request_body_audit"`
+	UsageBatch         usage.UsageBatchRuntimeSnapshot            `json:"usage_batch"`
+	ImageProcessing    helps.ChatGPTWebImageMemoryRuntimeSnapshot `json:"image_post_processing"`
+	ImageRequestMemory helps.ChatGPTWebImageMemoryRuntimeSnapshot `json:"image_request_memory"`
 }
 
 // GetSystemMetrics returns low-overhead process and filesystem metrics.
@@ -48,12 +49,14 @@ func (h *Handler) GetSystemMetrics(c *gin.Context) {
 	if errWorkingDirectory != nil {
 		workingDirectory = ""
 	}
+	imageMemory := helps.ChatGPTWebImageMemorySnapshot()
 	c.JSON(http.StatusOK, systemMetricsResponse{
-		CollectedAt:      time.Now().UTC(),
-		Runtime:          systemmetrics.CollectRuntime(),
-		RequestBodyAudit: middleware.RequestBodyAuditSnapshot(),
-		UsageBatch:       usage.BatchRuntimeSnapshot(),
-		ImageProcessing:  helps.ChatGPTWebImageMemorySnapshot(),
+		CollectedAt:        time.Now().UTC(),
+		Runtime:            systemmetrics.CollectRuntime(),
+		RequestBodyAudit:   middleware.RequestBodyAuditSnapshot(),
+		UsageBatch:         usage.BatchRuntimeSnapshot(),
+		ImageProcessing:    imageMemory,
+		ImageRequestMemory: imageMemory,
 		Filesystems: systemMetricsFilesystems{
 			WorkingDirectory: systemmetrics.CollectFilesystem(workingDirectory),
 			AuthDirectory:    systemmetrics.CollectFilesystem(authDirectory),

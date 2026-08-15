@@ -159,6 +159,11 @@ func NewGitTokenStore(remote, username, password, branch string) *GitTokenStore 
 	}
 }
 
+// RefreshPersistenceConcurrency reports that auth file mutations are serialized.
+func (*GitTokenStore) RefreshPersistenceConcurrency() int {
+	return 1
+}
+
 // SetBaseDir updates the default directory used for auth JSON persistence when no explicit path is provided.
 func (s *GitTokenStore) SetBaseDir(dir string) {
 	s.bindingMu.Lock()

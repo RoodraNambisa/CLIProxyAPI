@@ -37,8 +37,9 @@ type chatGPTWebAccountInfoRawQuotaController interface {
 }
 
 type chatGPTWebAccountInfoResponse struct {
-	Config  config.ResolvedChatGPTWebAccountInfoConfig `json:"config"`
-	Runtime chatgptwebauth.AccountInfoRuntimeSnapshot  `json:"runtime"`
+	Config             config.ResolvedChatGPTWebAccountInfoConfig `json:"config"`
+	Runtime            chatgptwebauth.AccountInfoRuntimeSnapshot  `json:"runtime"`
+	RefreshPersistence coreauth.RefreshPersistenceMetricsSnapshot `json:"refresh_persistence"`
 }
 
 type chatGPTWebAccountInfoConfigRequest struct {
@@ -77,7 +78,15 @@ func (h *Handler) GetChatGPTWebAccountInfo(c *gin.Context) {
 	if controller, ok := chatGPTWebAccountInfoControllerForManager(manager); ok {
 		snapshot = controller.AccountInfoSnapshot()
 	}
-	c.JSON(http.StatusOK, chatGPTWebAccountInfoResponse{Config: resolved, Runtime: snapshot})
+	var persistence coreauth.RefreshPersistenceMetricsSnapshot
+	if manager != nil {
+		persistence = manager.RefreshPersistenceMetrics()
+	}
+	c.JSON(http.StatusOK, chatGPTWebAccountInfoResponse{
+		Config:             resolved,
+		Runtime:            snapshot,
+		RefreshPersistence: persistence,
+	})
 }
 
 // PutChatGPTWebAccountInfo replaces all account profile refresh settings.

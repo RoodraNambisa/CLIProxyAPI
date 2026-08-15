@@ -35,6 +35,10 @@ type chatGPTWebRefreshPersistenceStore struct {
 	startOnce   sync.Once
 }
 
+func (*chatGPTWebRefreshPersistenceStore) RefreshPersistenceConcurrency() int {
+	return 1
+}
+
 type chatGPTWebDoneObservedContext struct {
 	context.Context
 	once     sync.Once

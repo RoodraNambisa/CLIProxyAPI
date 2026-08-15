@@ -112,6 +112,13 @@ type Store interface {
 	Delete(ctx context.Context, id string) error
 }
 
+// RefreshPersistenceConcurrencyStore declares how many refresh writes the
+// backing store can execute concurrently. Stores that omit this capability do
+// not use the refresh persistence coordinator.
+type RefreshPersistenceConcurrencyStore interface {
+	RefreshPersistenceConcurrency() int
+}
+
 // ConditionalCreateStore atomically persists a record only when its ID is
 // absent. Errors after a write may have reached durable storage should carry a
 // SaveOutcomeError.

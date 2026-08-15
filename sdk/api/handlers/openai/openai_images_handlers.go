@@ -12,11 +12,14 @@ import (
 	_ "image/jpeg"
 	_ "image/png"
 	"io"
+	"math"
 	"mime"
 	"mime/multipart"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -52,6 +55,7 @@ type imageOperation struct {
 }
 
 var (
+	imageRequestSpoolSlots   = make(chan struct{}, max(1, int(executorhelps.ChatGPTWebImageMemorySnapshot().QueueLimit)))
 	imageGenerationOperation = imageOperation{
 		action:         "generate",
 		partialEvent:   "image_generation.partial_image",
@@ -63,6 +67,35 @@ var (
 		completedEvent: "image_edit.completed",
 	}
 )
+
+type imageRequestSpoolBody struct {
+	file *os.File
+	path string
+	once sync.Once
+}
+
+func (body *imageRequestSpoolBody) Read(data []byte) (int, error) {
+	if body == nil || body.file == nil {
+		return 0, io.EOF
+	}
+	return body.file.Read(data)
+}
+
+func (body *imageRequestSpoolBody) Close() error {
+	if body == nil {
+		return nil
+	}
+	var closeErr error
+	body.once.Do(func() {
+		if body.file != nil {
+			closeErr = body.file.Close()
+		}
+		if body.path != "" {
+			closeErr = errors.Join(closeErr, os.Remove(body.path))
+		}
+	})
+	return closeErr
+}
 
 // OpenAIImagesAPIHandler adapts OpenAI Images requests to Codex Responses image tools.
 type OpenAIImagesAPIHandler struct {
@@ -225,6 +258,10 @@ func (e imageUnsupportedError) Unwrap() error {
 
 // Generations handles POST /v1/images/generations.
 func (h *OpenAIImagesAPIHandler) Generations(c *gin.Context) {
+	if !h.admitImageRequest(c) {
+		return
+	}
+	defer releaseImageRequestMemory(c)
 	rawJSON, err := readOpenAIImageJSONRequestBody(c)
 	if err != nil {
 		h.writeImagesRequestError(c, fmt.Errorf("invalid request: %w", err))
@@ -256,6 +293,10 @@ func (h *OpenAIImagesAPIHandler) Generations(c *gin.Context) {
 
 // Edits handles POST /v1/images/edits.
 func (h *OpenAIImagesAPIHandler) Edits(c *gin.Context) {
+	if !h.admitImageRequest(c) {
+		return
+	}
+	defer releaseImageRequestMemory(c)
 	contentType, _, _ := mime.ParseMediaType(c.GetHeader("Content-Type"))
 	if strings.EqualFold(contentType, "multipart/form-data") {
 		if h.handleXAIEditIfRequested(c, nil) {
@@ -313,6 +354,136 @@ func (h *OpenAIImagesAPIHandler) Edits(c *gin.Context) {
 		return
 	}
 	h.handleImagesRequest(c, req, imageEditOperation)
+}
+
+func (h *OpenAIImagesAPIHandler) admitImageRequest(c *gin.Context) bool {
+	if c == nil || c.Request == nil {
+		return false
+	}
+	if c.Request.ContentLength < 0 {
+		if errSpool := spoolUnknownImageRequestBody(c.Request); errSpool != nil {
+			var maxBytesErr *http.MaxBytesError
+			if errors.As(errSpool, &maxBytesErr) {
+				h.writeImagesRequestError(c, errSpool)
+				return false
+			}
+			c.Header("Retry-After", "1")
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": gin.H{
+				"message":       "image request spool capacity is temporarily exhausted",
+				"type":          "server_error",
+				"code":          "image_memory_capacity",
+				"failure_stage": "admission",
+			}})
+			return false
+		}
+	}
+	leases := executorhelps.NewChatGPTWebImageMemoryLeaseSet()
+	estimatedBytes := estimateImageRequestResidentBytes(c.Request)
+	if err := leases.AcquireInput(c.Request.Context(), estimatedBytes); err != nil {
+		leases.Release()
+		releaseOpenAIMultipartRequest(c)
+		c.Header("Retry-After", "1")
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": gin.H{
+			"message":       "image request memory capacity is temporarily exhausted",
+			"type":          "server_error",
+			"code":          "image_memory_capacity",
+			"failure_stage": "admission",
+		}})
+		return false
+	}
+	c.Set(executorhelps.ChatGPTWebImageMemoryLeaseSetMetadataKey, leases)
+	return true
+}
+
+func spoolUnknownImageRequestBody(request *http.Request) error {
+	if request == nil || request.ContentLength >= 0 {
+		return nil
+	}
+	select {
+	case imageRequestSpoolSlots <- struct{}{}:
+		defer func() { <-imageRequestSpoolSlots }()
+	default:
+		return executorhelps.ErrChatGPTWebImageMemoryQueueFull
+	}
+	original := request.Body
+	if original == nil {
+		original = http.NoBody
+	}
+	defer func() { _ = original.Close() }()
+	temporary, errCreate := os.CreateTemp("", "cliproxy-image-request-*")
+	if errCreate != nil {
+		return fmt.Errorf("create image request spool: %w", errCreate)
+	}
+	body := &imageRequestSpoolBody{file: temporary, path: temporary.Name()}
+	keep := false
+	defer func() {
+		if !keep {
+			_ = body.Close()
+		}
+	}()
+	copied, errCopy := io.Copy(temporary, io.LimitReader(original, int64(maxImageMultipartBytes)+1))
+	if errCopy != nil {
+		return fmt.Errorf("spool image request body: %w", errCopy)
+	}
+	if copied > int64(maxImageMultipartBytes) {
+		return &http.MaxBytesError{Limit: int64(maxImageMultipartBytes)}
+	}
+	if _, errSeek := temporary.Seek(0, io.SeekStart); errSeek != nil {
+		return fmt.Errorf("rewind image request spool: %w", errSeek)
+	}
+	request.Body = body
+	request.ContentLength = copied
+	keep = true
+	return nil
+}
+
+func releaseImageRequestMemory(c *gin.Context) {
+	if c == nil {
+		return
+	}
+	value, ok := c.Get(executorhelps.ChatGPTWebImageMemoryLeaseSetMetadataKey)
+	if !ok {
+		return
+	}
+	if leases, _ := value.(*executorhelps.ChatGPTWebImageMemoryLeaseSet); leases != nil {
+		leases.Release()
+	}
+}
+
+func estimateImageRequestResidentBytes(request *http.Request) int64 {
+	if request == nil {
+		return 1
+	}
+	rawBytes := request.ContentLength
+	if rawBytes < 0 {
+		rawBytes = maxImageMultipartBytes
+	}
+	if rawBytes < 1 {
+		rawBytes = 1
+	}
+	mediaType, _, _ := mime.ParseMediaType(request.Header.Get("Content-Type"))
+	if strings.EqualFold(mediaType, "multipart/form-data") {
+		encodedBytes := saturatingImageRequestMultiply(saturatingImageRequestAdd(rawBytes, 2), 4) / 3
+		return saturatingImageRequestAdd(rawBytes, saturatingImageRequestMultiply(encodedBytes, 2))
+	}
+	return saturatingImageRequestMultiply(rawBytes, 3)
+}
+
+func saturatingImageRequestAdd(left, right int64) int64 {
+	if left > math.MaxInt64-right {
+		return math.MaxInt64
+	}
+	return left + right
+}
+
+func saturatingImageRequestMultiply(value, factor int64) int64 {
+	if value <= 0 || factor <= 0 {
+		return 0
+	}
+	if value > math.MaxInt64/factor {
+		return math.MaxInt64
+	}
+	return value * factor
 }
 
 func (h *OpenAIImagesAPIHandler) handleImagesRequest(c *gin.Context, req openAIImageRequest, op imageOperation) {

@@ -511,6 +511,7 @@ type Manager struct {
 	refreshCommitMaxAttempts    int
 	// refreshCommitRetryObserved is used by tests to observe a failed commit attempt.
 	refreshCommitRetryObserved func(string, int)
+	refreshPersistence         atomic.Pointer[refreshPersistenceCoordinator]
 	// refreshFlightWaitObserved is used by shutdown tests to observe the executor close barrier.
 	refreshFlightWaitObserved func()
 	// schedulerRouteRefreshMu coalesces the rare registry/scheduler repair path.
@@ -734,6 +735,7 @@ func NewManager(store Store, selector Selector, hook Hook) *Manager {
 	manager.apiKeyModelAlias.Store(apiKeyModelAliasTable(nil))
 	manager.scheduler = newAuthScheduler(selector)
 	manager.executionMetrics = &cliproxyexecutor.RequestExecutionMetrics{}
+	manager.refreshPersistence.Store(newRefreshPersistenceCoordinator(store))
 	return manager
 }
 
@@ -1153,6 +1155,7 @@ func (m *Manager) SetStore(store Store) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.store = store
+	m.refreshPersistence.Store(newRefreshPersistenceCoordinator(store))
 	m.storeRevision++
 	m.rebuildAuthIndexesLocked(nil, false)
 }
@@ -11556,9 +11559,21 @@ func (m *Manager) commitChatGPTWebRefreshDurably(
 	}
 	var lastErr error
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		coordinator := m.refreshPersistence.Load()
+		releasePersistence, errAcquire := coordinator.acquire()
+		if errAcquire != nil {
+			var authErr *Error
+			if errors.As(errAcquire, &authErr) && authErr != nil && authErr.Code == "refresh_persist_backpressure" {
+				m.markChatGPTWebRefreshBackpressure(expected, pendingUntil, authErr)
+				return nil, authErr
+			}
+			lastErr = errAcquire
+			break
+		}
 		commitCtx, cancelCommit := context.WithTimeout(context.WithoutCancel(ctx), attemptTimeout)
 		saved, errCommit := commit(commitCtx)
 		cancelCommit()
+		releasePersistence()
 		if errCommit == nil {
 			return saved, nil
 		}
@@ -11582,6 +11597,32 @@ func (m *Manager) commitChatGPTWebRefreshDurably(
 	m.markChatGPTWebRefreshCommitFailure(expected, updated, pendingUntil, failure)
 	m.logChatGPTWebRefreshCommitFailure(ctx, expected.ID, lastErr)
 	return nil, failure
+}
+
+func (m *Manager) markChatGPTWebRefreshBackpressure(expected *Auth, pendingUntil time.Time, failure *Error) {
+	if m == nil || expected == nil || failure == nil {
+		return
+	}
+	now := time.Now()
+	var snapshot *Auth
+	m.mu.Lock()
+	current := m.auths[expected.ID]
+	if runtimeMetadataMutationMatchesCurrent(current, expected) {
+		current.LastError = failure
+		current.NextRefreshAfter = now.Add(refreshFailureBackoff)
+		current.UpdatedAt = now
+		clearRefreshPendingMarker(current, pendingUntil)
+		m.installAuthLocked(current.ID, current)
+		snapshot = current.Clone()
+		if m.scheduler != nil {
+			m.scheduler.upsertAuthState(snapshot)
+		}
+	}
+	m.mu.Unlock()
+	if snapshot != nil {
+		m.queueRefreshReschedule(snapshot.ID)
+		m.Hook().OnAuthUpdated(context.Background(), snapshot.Clone())
+	}
 }
 
 func newChatGPTWebRefreshCommitFailure(updated *Auth) *Error {

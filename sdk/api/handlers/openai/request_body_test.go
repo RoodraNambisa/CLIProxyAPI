@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 
@@ -36,6 +37,55 @@ func TestReadOpenAIJSONRequestBodyWithLimitRejectsChunkedOverflow(t *testing.T) 
 	var maxBytesErr *http.MaxBytesError
 	if !errors.As(err, &maxBytesErr) || maxBytesErr.Limit != 4 {
 		t.Fatalf("read error = %#v, want MaxBytesError limit 4", err)
+	}
+}
+
+func TestSpoolUnknownImageRequestBodyUsesDiskAndCleansUp(t *testing.T) {
+	trackedBody := &trackedOpenAIRequestBody{Reader: strings.NewReader(`{"prompt":"hello"}`)}
+	request := httptest.NewRequest(http.MethodPost, "/v1/images/generations", trackedBody)
+	request.ContentLength = -1
+
+	if err := spoolUnknownImageRequestBody(request); err != nil {
+		t.Fatalf("spoolUnknownImageRequestBody() error: %v", err)
+	}
+	spooled, ok := request.Body.(*imageRequestSpoolBody)
+	if !ok {
+		t.Fatalf("request body type = %T", request.Body)
+	}
+	if !trackedBody.closed {
+		t.Fatal("original request body was not closed")
+	}
+	if request.ContentLength != int64(len(`{"prompt":"hello"}`)) {
+		t.Fatalf("content length = %d", request.ContentLength)
+	}
+	payload, errRead := io.ReadAll(request.Body)
+	if errRead != nil || string(payload) != `{"prompt":"hello"}` {
+		t.Fatalf("spooled payload = %q, error = %v", payload, errRead)
+	}
+	path := spooled.path
+	if errClose := request.Body.Close(); errClose != nil {
+		t.Fatalf("close spooled body: %v", errClose)
+	}
+	if _, errStat := os.Stat(path); !errors.Is(errStat, os.ErrNotExist) {
+		t.Fatalf("spool file remained after close: %v", errStat)
+	}
+}
+
+func TestSpoolUnknownImageRequestBodyRejectsWhenQueueIsFull(t *testing.T) {
+	for range cap(imageRequestSpoolSlots) {
+		imageRequestSpoolSlots <- struct{}{}
+	}
+	defer func() {
+		for range cap(imageRequestSpoolSlots) {
+			<-imageRequestSpoolSlots
+		}
+	}()
+	request := httptest.NewRequest(http.MethodPost, "/v1/images/generations", strings.NewReader(`{}`))
+	request.ContentLength = -1
+
+	errSpool := spoolUnknownImageRequestBody(request)
+	if !errors.Is(errSpool, executorhelps.ErrChatGPTWebImageMemoryQueueFull) {
+		t.Fatalf("spool error = %v", errSpool)
 	}
 }
 
