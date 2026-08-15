@@ -653,6 +653,12 @@ func NewFileTokenStore() *FileTokenStore {
 	return &FileTokenStore{}
 }
 
+// RefreshPersistenceConcurrency reports that file mutations share one
+// process-wide operation token and must enter refresh persistence serially.
+func (*FileTokenStore) RefreshPersistenceConcurrency() int {
+	return 1
+}
+
 func (s *FileTokenStore) lockOperation(ctx context.Context) (func(), error) {
 	if ctx == nil {
 		ctx = context.Background()

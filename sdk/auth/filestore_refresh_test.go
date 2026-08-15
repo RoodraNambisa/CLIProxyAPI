@@ -56,6 +56,18 @@ func fileTokenStoreTestMetadataString(auth *cliproxyauth.Auth, key string) strin
 	return value
 }
 
+func TestFileTokenStoreEnablesSerializedRefreshPersistence(t *testing.T) {
+	store := NewFileTokenStore()
+	if concurrency := store.RefreshPersistenceConcurrency(); concurrency != 1 {
+		t.Fatalf("refresh persistence concurrency = %d, want 1", concurrency)
+	}
+	manager := cliproxyauth.NewManager(store, nil, nil)
+	snapshot := manager.RefreshPersistenceMetrics()
+	if !snapshot.Enabled || snapshot.Concurrency != 1 || snapshot.QueueLimit <= 0 {
+		t.Fatalf("refresh persistence metrics = %+v, want enabled serialized queue", snapshot)
+	}
+}
+
 func TestFileTokenStorePersistsRotatedChatGPTWebRefreshTokens(t *testing.T) {
 	const (
 		authID = "chatgpt-web-file-refresh.json"
