@@ -10,6 +10,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	codexauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/codex"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
@@ -205,7 +206,9 @@ func TestCodexProjectSessionIdentitySkipsDisabledAndAPIKeyAuth(t *testing.T) {
 		{
 			name:     "disabled",
 			executor: NewCodexExecutor(&config.Config{}),
-			auth:     &cliproxyauth.Auth{Provider: "codex", Metadata: map[string]any{"access_token": "oauth-token"}},
+			auth: &cliproxyauth.Auth{Provider: "codex", Metadata: map[string]any{
+				"access_token": "oauth-token", codexauth.FingerprintModeMetadataKey: "off",
+			}},
 		},
 		{
 			name:     "codex api key",
@@ -227,6 +230,132 @@ func TestCodexProjectSessionIdentitySkipsDisabledAndAPIKeyAuth(t *testing.T) {
 				t.Fatalf("projected payload = %s, want unchanged %s", projected, raw)
 			}
 		})
+	}
+}
+
+func TestCodexProjectSessionIdentityConvergesPerCredentialMode(t *testing.T) {
+	executor := NewCodexExecutor(&config.Config{})
+	prepared := codexPreparedSessionIdentity{TurnID: "prepared-turn", RequestKind: "turn"}
+	opts := cliproxyexecutor.WithProviderPreparedRequest(cliproxyexecutor.Options{
+		Headers: http.Header{"Session-Id": []string{"client-session"}},
+	}, executor.Identifier(), prepared)
+	raw := []byte(`{"model":"gpt-5.4","client_metadata":{"session_id":"body-session","thread_id":"body-thread","turn_id":"body-turn","x-codex-window-id":"body-window","x-codex-installation-id":"body-install","x-codex-turn-metadata":"{\"workspace\":\"/tmp/project\",\"session_id\":\"body-session\"}"}}`)
+
+	tests := []struct {
+		mode               codexauth.FingerprintMode
+		wantProjectSession bool
+	}{
+		{mode: codexauth.FingerprintModeDevice, wantProjectSession: false},
+		{mode: codexauth.FingerprintModeSession, wantProjectSession: true},
+		{mode: codexauth.FingerprintModeFull, wantProjectSession: true},
+	}
+	for _, tt := range tests {
+		t.Run(string(tt.mode), func(t *testing.T) {
+			auth := &cliproxyauth.Auth{
+				ID: "oauth-auth", Provider: "codex",
+				Metadata: map[string]any{
+					"type": "codex", "account_id": "account-1",
+					codexauth.FingerprintModeMetadataKey: string(tt.mode),
+				},
+			}
+			projected, state, err := executor.projectCodexSessionIdentity(t.Context(), auth, cliproxyexecutor.Request{}, opts, raw, &codexIdentityConfuseState{})
+			if err != nil {
+				t.Fatalf("projectCodexSessionIdentity() error = %v", err)
+			}
+			if !state.enabled || state.projectSession != tt.wantProjectSession || !state.converged {
+				t.Fatalf("state = %#v, want enabled/converged with projectSession=%v", state, tt.wantProjectSession)
+			}
+			wantInstallation := deriveStableCodexFingerprintUUID("installation", "account-1")
+			if got := gjson.GetBytes(projected, "client_metadata.x-codex-installation-id").String(); got != wantInstallation {
+				t.Fatalf("installation ID = %q, want %q", got, wantInstallation)
+			}
+			if tt.mode == codexauth.FingerprintModeDevice {
+				if got := gjson.GetBytes(projected, "client_metadata.session_id").String(); got != "body-session" {
+					t.Fatalf("device mode session ID = %q, want body-session", got)
+				}
+				return
+			}
+			wantSession := deriveStableCodexFingerprintUUID("session", "account-1")
+			wantThread := wantSession
+			if tt.mode == codexauth.FingerprintModeSession {
+				wantThread = deriveStableCodexFingerprintUUID("thread", "account-1\x00client-session")
+			}
+			if state.identity.SessionID != wantSession || state.identity.ThreadID != wantThread || state.identity.TurnID != "prepared-turn" || state.identity.WindowID != wantThread+":0" {
+				t.Fatalf("identity = %#v, want session=%q thread=%q", state.identity, wantSession, wantThread)
+			}
+			turnMetadata := gjson.GetBytes(projected, "client_metadata.x-codex-turn-metadata").String()
+			if gjson.Get(turnMetadata, "workspace").String() != "/tmp/project" || gjson.Get(turnMetadata, "installation_id").String() != wantInstallation {
+				t.Fatalf("turn metadata = %s, want preserved workspace and converged installation", turnMetadata)
+			}
+		})
+	}
+}
+
+func TestCodexProjectSessionIdentityDefaultsToStableInstallation(t *testing.T) {
+	executor := NewCodexExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{
+		ID:       "oauth-auth",
+		Provider: "codex",
+		Metadata: map[string]any{"type": "codex", "account_id": "account-1"},
+	}
+	raw := []byte(`{"model":"gpt-5.4","client_metadata":{"session_id":"client-session","thread_id":"client-thread","x-codex-installation-id":"client-install"}}`)
+
+	projected, state, err := executor.projectCodexSessionIdentity(t.Context(), auth, cliproxyexecutor.Request{}, cliproxyexecutor.Options{}, raw, &codexIdentityConfuseState{})
+	if err != nil {
+		t.Fatalf("projectCodexSessionIdentity() error = %v", err)
+	}
+	wantInstallation := deriveStableCodexFingerprintUUID("installation", "account-1")
+	if !state.enabled || state.projectSession || !state.converged {
+		t.Fatalf("state = %#v, want installation-only convergence", state)
+	}
+	if got := gjson.GetBytes(projected, "client_metadata.x-codex-installation-id").String(); got != wantInstallation {
+		t.Fatalf("installation ID = %q, want %q", got, wantInstallation)
+	}
+	if got := gjson.GetBytes(projected, "client_metadata.session_id").String(); got != "client-session" {
+		t.Fatalf("session ID = %q, want client-session", got)
+	}
+}
+
+func TestCodexConvergedFingerprintStaysStableAndSeparatesClientSessions(t *testing.T) {
+	auth := &cliproxyauth.Auth{ID: "auth", Provider: "codex", Metadata: map[string]any{
+		"account_id": "account-1", codexauth.FingerprintModeMetadataKey: "session",
+	}}
+	prepared := codexPreparedSessionIdentity{TurnID: "turn-1"}
+	first := resolveCodexConvergedFingerprint(auth, prepared, "client-a")
+	repeated := resolveCodexConvergedFingerprint(auth, prepared, "client-a")
+	otherClient := resolveCodexConvergedFingerprint(auth, prepared, "client-b")
+	if first != repeated {
+		t.Fatalf("same account/session fingerprint changed: %#v != %#v", first, repeated)
+	}
+	if first.sessionID != otherClient.sessionID || first.installationID != otherClient.installationID {
+		t.Fatalf("account-level IDs differ across client sessions: %#v vs %#v", first, otherClient)
+	}
+	if first.threadID == otherClient.threadID {
+		t.Fatalf("different client sessions share thread ID %q", first.threadID)
+	}
+}
+
+func TestCodexConvergedFingerprintReplacesInvalidPersistedInstallationID(t *testing.T) {
+	auth := &cliproxyauth.Auth{ID: "auth", Provider: "codex", Metadata: map[string]any{
+		"account_id": "account-1", "openai_device_id": "not-a-uuid",
+	}}
+
+	got := resolveCodexConvergedFingerprint(auth, codexPreparedSessionIdentity{}, "")
+	want := deriveStableCodexFingerprintUUID("installation", "account-1")
+	if got.installationID != want {
+		t.Fatalf("installation ID = %q, want %q", got.installationID, want)
+	}
+}
+
+func TestCodexConvergedFingerprintKeepsValidPersistedInstallationID(t *testing.T) {
+	persisted := uuid.NewString()
+	auth := &cliproxyauth.Auth{ID: "auth", Provider: "codex", Metadata: map[string]any{
+		"account_id": "account-1", "openai_device_id": persisted,
+	}}
+
+	got := resolveCodexConvergedFingerprint(auth, codexPreparedSessionIdentity{}, "")
+	if got.installationID != persisted {
+		t.Fatalf("installation ID = %q, want persisted %q", got.installationID, persisted)
 	}
 }
 

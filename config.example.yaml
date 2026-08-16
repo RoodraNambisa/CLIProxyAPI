@@ -605,8 +605,8 @@ nonstream-keepalive-interval: 0
 # websocket requests; `beta-features` only applies to websocket requests.
 # They do not apply to codex-api-key entries.
 # codex-header-defaults:
-#   user-agent: "codex-tui/0.135.0 (Mac OS 26.5.0; arm64) iTerm.app/3.6.10 (codex-tui; 0.135.0)"
-#   originator: "codex-tui"
+#   user-agent: "codex_cli_rs/0.146.0 (Mac OS 26.5.0; arm64) iTerm.app/3.6.10"
+#   originator: "codex_cli_rs"
 #   beta-features: "multi_agent"
 
 # Provider-wide Codex behavior. Disabled by default.

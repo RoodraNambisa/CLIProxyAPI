@@ -128,3 +128,53 @@ func TestProjectCodexSessionIdentityRejectsMalformedMetadata(t *testing.T) {
 		})
 	}
 }
+
+func TestProjectCodexSessionIdentityDeviceProjectionOnlyRewritesInstallation(t *testing.T) {
+	payload := []byte(`{"model":"gpt-5.4","client_metadata":{"session_id":"client-session","thread_id":"client-thread","x-codex-installation-id":"old-install","x-codex-turn-metadata":"{\"workspace\":\"/tmp/project\",\"installation_id\":\"old-install\"}"}}`)
+	projected, identity, turnMetadata, err := ProjectCodexSessionIdentityWithProjection(
+		payload,
+		CodexSessionIdentityHeaderSource{},
+		CodexSessionIdentityHeaderSource{},
+		CodexSessionIdentityHeaderSource{},
+		CodexSessionIdentity{},
+		CodexSessionIdentityProjection{InstallationID: "stable-install", ProjectSession: false},
+	)
+	if err != nil {
+		t.Fatalf("ProjectCodexSessionIdentityWithProjection() error = %v", err)
+	}
+	if identity.InstallationID != "stable-install" || identity.SessionID != "" || identity.ThreadID != "" {
+		t.Fatalf("identity = %#v, want installation-only projection", identity)
+	}
+	if got := gjson.GetBytes(projected, "client_metadata.x-codex-installation-id").String(); got != "stable-install" {
+		t.Fatalf("installation ID = %q, want stable-install", got)
+	}
+	if got := gjson.GetBytes(projected, "client_metadata.session_id").String(); got != "client-session" {
+		t.Fatalf("session ID = %q, want original client-session", got)
+	}
+	if got := gjson.Get(turnMetadata, "installation_id").String(); got != "stable-install" {
+		t.Fatalf("turn installation ID = %q, want stable-install", got)
+	}
+	if got := gjson.Get(turnMetadata, "workspace").String(); got != "/tmp/project" {
+		t.Fatalf("workspace = %q, want preserved value", got)
+	}
+}
+
+func TestProjectCodexSessionIdentityForcedValuesOverrideClientButNotAdmin(t *testing.T) {
+	payload := []byte(`{"client_metadata":{"session_id":"body-session","thread_id":"body-thread"}}`)
+	admin := CodexSessionIdentityHeaderSource{SessionID: "admin-session"}
+	forced := CodexSessionIdentity{SessionID: "forced-session", ThreadID: "forced-thread", TurnID: "forced-turn", WindowID: "forced-window"}
+	_, identity, _, err := ProjectCodexSessionIdentityWithProjection(
+		payload,
+		admin,
+		CodexSessionIdentityHeaderSource{},
+		CodexSessionIdentityHeaderSource{SessionID: "client-session", ThreadID: "client-thread"},
+		CodexSessionIdentity{RequestKind: "turn"},
+		CodexSessionIdentityProjection{ForcedIdentity: forced, ProjectSession: true},
+	)
+	if err != nil {
+		t.Fatalf("ProjectCodexSessionIdentityWithProjection() error = %v", err)
+	}
+	if identity.SessionID != "admin-session" || identity.ThreadID != "forced-thread" || identity.TurnID != "forced-turn" || identity.WindowID != "forced-window" {
+		t.Fatalf("identity = %#v, want admin session plus forced identity", identity)
+	}
+}

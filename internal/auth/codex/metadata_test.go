@@ -2,14 +2,15 @@ package codex
 
 import "testing"
 
-func TestEffectiveFingerprintModeRequiresExplicitValidMode(t *testing.T) {
+func TestEffectiveFingerprintModeDefaultsToStableDeviceIdentity(t *testing.T) {
 	tests := []struct {
 		name     string
 		metadata map[string]any
 		want     FingerprintMode
 	}{
-		{name: "missing", metadata: nil, want: FingerprintModeOff},
-		{name: "invalid", metadata: map[string]any{FingerprintModeMetadataKey: "aggressive"}, want: FingerprintModeOff},
+		{name: "missing", metadata: nil, want: FingerprintModeDevice},
+		{name: "invalid", metadata: map[string]any{FingerprintModeMetadataKey: "aggressive"}, want: FingerprintModeDevice},
+		{name: "explicit off", metadata: map[string]any{FingerprintModeMetadataKey: "off"}, want: FingerprintModeOff},
 		{name: "normalized", metadata: map[string]any{FingerprintModeMetadataKey: " Session "}, want: FingerprintModeSession},
 		{name: "full", metadata: map[string]any{FingerprintModeMetadataKey: "full"}, want: FingerprintModeFull},
 	}

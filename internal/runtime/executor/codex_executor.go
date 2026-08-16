@@ -32,8 +32,8 @@ import (
 )
 
 const (
-	codexUserAgent             = "codex-tui/0.135.0 (Mac OS 26.5.0; arm64) iTerm.app/3.6.10 (codex-tui; 0.135.0)"
-	codexOriginator            = "codex-tui"
+	codexUserAgent             = "codex_cli_rs/0.146.0 (Mac OS 26.5.0; arm64) iTerm.app/3.6.10"
+	codexOriginator            = "codex_cli_rs"
 	codexDefaultImageToolModel = "gpt-image-2"
 	codexSSEMaxFrameBytes      = 52_428_800
 )
@@ -329,20 +329,24 @@ func (e *CodexExecutor) PrepareProviderRequest(ctx context.Context, req cliproxy
 	if operation == cliproxyexecutor.RequestOperationCount {
 		return nil, nil
 	}
-	prepared := codexPreparedSessionIdentity{Enabled: codexSpoofSessionIdentityEnabled(e.cfg)}
-	if !prepared.Enabled {
-		return prepared, nil
-	}
 	payload := req.Payload
 	if len(opts.OriginalRequest) > 0 {
 		payload = opts.OriginalRequest
+	}
+	prepared := codexPreparedSessionIdentity{
+		Enabled:     codexSpoofSessionIdentityEnabled(e.cfg),
+		TurnID:      uuid.NewString(),
+		RequestKind: codexSessionRequestKind(opts, payload),
+	}
+	if !prepared.Enabled {
+		return prepared, nil
 	}
 	threadID := codexPreparedThreadID(ctx, opts, payload)
 	return codexPreparedSessionIdentity{
 		Enabled:     true,
 		SessionID:   threadID,
 		ThreadID:    threadID,
-		TurnID:      uuid.NewString(),
+		TurnID:      prepared.TurnID,
 		WindowID:    threadID + ":0",
 		RequestKind: codexSessionRequestKind(opts, payload),
 	}, nil
@@ -1602,9 +1606,11 @@ type codexIdentityReplacement struct {
 }
 
 type codexSessionIdentityState struct {
-	enabled      bool
-	identity     helps.CodexSessionIdentity
-	turnMetadata string
+	enabled        bool
+	projectSession bool
+	converged      bool
+	identity       helps.CodexSessionIdentity
+	turnMetadata   string
 }
 
 func (e *CodexExecutor) applyCodexHTTPSessionIdentity(
@@ -1644,7 +1650,11 @@ func (e *CodexExecutor) projectCodexSessionIdentity(
 		return rawJSON, codexSessionIdentityState{}, nil
 	}
 	prepared := e.codexPreparedSessionIdentity(ctx, req, opts)
-	if !prepared.Enabled {
+	client := codexClientSessionIdentitySource(ctx, opts)
+	fingerprint := resolveCodexConvergedFingerprint(auth, prepared, originalCodexClientSessionID(client.SessionID, rawJSON))
+	converged := fingerprint.mode != codexauth.FingerprintModeOff
+	projectSession := prepared.Enabled || fingerprint.mode == codexauth.FingerprintModeSession || fingerprint.mode == codexauth.FingerprintModeFull
+	if !prepared.Enabled && !converged {
 		return rawJSON, codexSessionIdentityState{}, nil
 	}
 	defaults := helps.CodexSessionIdentity{
@@ -1653,7 +1663,6 @@ func (e *CodexExecutor) projectCodexSessionIdentity(
 	}
 	confused := helps.CodexSessionIdentityHeaderSource{}
 	admin := codexCredentialSessionIdentitySource(auth)
-	client := codexClientSessionIdentitySource(ctx, opts)
 	if identityConfuse != nil && identityConfuse.enabled {
 		rawJSON = applyCodexIdentityConfuseFlatTurnID(rawJSON, identityConfuse)
 		admin = applyCodexIdentityConfuseSessionSource(admin, identityConfuse)
@@ -1664,12 +1673,25 @@ func (e *CodexExecutor) projectCodexSessionIdentity(
 		confused.ThreadID = identityConfuse.promptCacheKey
 		confused.WindowID = identityConfuse.promptCacheKey + ":0"
 	}
-	projected, identity, turnMetadata, err := helps.ProjectCodexSessionIdentity(
+	projection := helps.CodexSessionIdentityProjection{
+		InstallationID: fingerprint.installationID,
+		ProjectSession: projectSession,
+	}
+	if fingerprint.mode == codexauth.FingerprintModeSession || fingerprint.mode == codexauth.FingerprintModeFull {
+		projection.ForcedIdentity = helps.CodexSessionIdentity{
+			SessionID: fingerprint.sessionID,
+			ThreadID:  fingerprint.threadID,
+			TurnID:    fingerprint.turnID,
+			WindowID:  fingerprint.windowID,
+		}
+	}
+	projected, identity, turnMetadata, err := helps.ProjectCodexSessionIdentityWithProjection(
 		rawJSON,
 		admin,
 		confused,
 		client,
 		defaults,
+		projection,
 	)
 	if err != nil {
 		status := codexStreamStatusErr(
@@ -1682,7 +1704,10 @@ func (e *CodexExecutor) projectCodexSessionIdentity(
 		status.skipAuthResult = true
 		return nil, codexSessionIdentityState{}, status
 	}
-	return projected, codexSessionIdentityState{enabled: true, identity: identity, turnMetadata: turnMetadata}, nil
+	return projected, codexSessionIdentityState{
+		enabled: true, projectSession: projectSession, converged: converged,
+		identity: identity, turnMetadata: turnMetadata,
+	}, nil
 }
 
 func applyCodexIdentityConfuseFlatTurnID(rawJSON []byte, state *codexIdentityConfuseState) []byte {
@@ -1783,10 +1808,11 @@ func codexSessionIdentitySourceFromHeaders(headers http.Header) helps.CodexSessi
 		sessionID = headerValueCaseInsensitive(headers, "Session_id")
 	}
 	return helps.CodexSessionIdentityHeaderSource{
-		SessionID:    strings.TrimSpace(sessionID),
-		ThreadID:     strings.TrimSpace(headerValueCaseInsensitive(headers, "Thread-Id")),
-		WindowID:     strings.TrimSpace(headerValueCaseInsensitive(headers, "X-Codex-Window-Id")),
-		TurnMetadata: strings.TrimSpace(headerValueCaseInsensitive(headers, "X-Codex-Turn-Metadata")),
+		InstallationID: strings.TrimSpace(headerValueCaseInsensitive(headers, "X-Codex-Installation-Id")),
+		SessionID:      strings.TrimSpace(sessionID),
+		ThreadID:       strings.TrimSpace(headerValueCaseInsensitive(headers, "Thread-Id")),
+		WindowID:       strings.TrimSpace(headerValueCaseInsensitive(headers, "X-Codex-Window-Id")),
+		TurnMetadata:   strings.TrimSpace(headerValueCaseInsensitive(headers, "X-Codex-Turn-Metadata")),
 	}
 }
 
@@ -1803,13 +1829,27 @@ func applyCodexSessionIdentityHeaders(headers http.Header, state codexSessionIde
 	if headers == nil || !state.enabled {
 		return
 	}
-	for _, name := range []string{"Session-Id", "Session_id", "Thread-Id", "X-Codex-Window-Id", "X-Codex-Turn-Metadata"} {
+	deleteHeaderCaseInsensitive(headers, "X-Codex-Installation-Id")
+	if state.identity.InstallationID != "" {
+		setHeaderCasePreserved(headers, "X-Codex-Installation-Id", state.identity.InstallationID)
+	}
+	if state.turnMetadata != "" {
+		deleteHeaderCaseInsensitive(headers, "X-Codex-Turn-Metadata")
+		setHeaderCasePreserved(headers, "X-Codex-Turn-Metadata", state.turnMetadata)
+	}
+	if !state.projectSession {
+		return
+	}
+	for _, name := range []string{"Session-Id", "Session_id", "Thread-Id", "X-Codex-Window-Id"} {
 		deleteHeaderCaseInsensitive(headers, name)
 	}
 	setHeaderCasePreserved(headers, "Session-Id", state.identity.SessionID)
 	setHeaderCasePreserved(headers, "Thread-Id", state.identity.ThreadID)
 	setHeaderCasePreserved(headers, "X-Codex-Window-Id", state.identity.WindowID)
-	setHeaderCasePreserved(headers, "X-Codex-Turn-Metadata", state.turnMetadata)
+	if state.converged {
+		deleteHeaderCaseInsensitive(headers, "X-Client-Request-Id")
+		setHeaderCasePreserved(headers, "X-Client-Request-Id", state.identity.ThreadID)
+	}
 	if websocket {
 		deleteHeaderCaseInsensitive(headers, "session_id")
 		setHeaderCasePreserved(headers, "session_id", state.identity.SessionID)
@@ -2028,6 +2068,7 @@ func applyCodexHeadersFromSources(r *http.Request, auth *cliproxyauth.Auth, toke
 	misc.EnsureHeader(r.Header, ginHeaders, "Version", "")
 	misc.EnsureHeader(r.Header, ginHeaders, "X-Codex-Turn-Metadata", "")
 	misc.EnsureHeader(r.Header, ginHeaders, "X-Client-Request-Id", "")
+	misc.EnsureHeader(r.Header, ginHeaders, "X-Codex-Installation-Id", "")
 	misc.EnsureHeader(r.Header, ginHeaders, "X-Codex-Window-Id", "")
 	misc.EnsureHeader(r.Header, ginHeaders, "Thread-Id", "")
 	ensureCodexHTTPSessionHeader(r.Header, ginHeaders)

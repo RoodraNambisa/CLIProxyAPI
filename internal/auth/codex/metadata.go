@@ -26,12 +26,13 @@ func NormalizeFingerprintMode(value string) (FingerprintMode, bool) {
 	}
 }
 
-// EffectiveFingerprintMode returns the configured mode, defaulting invalid or
-// missing values to off so convergence always remains explicit opt-in.
+// EffectiveFingerprintMode returns the configured mode. Missing or invalid
+// values keep the per-credential installation identity stable by default;
+// callers must explicitly select off to disable convergence.
 func EffectiveFingerprintMode(metadata map[string]any) FingerprintMode {
 	mode, ok := NormalizeFingerprintMode(metadataString(metadata, FingerprintModeMetadataKey))
 	if !ok {
-		return FingerprintModeOff
+		return FingerprintModeDevice
 	}
 	return mode
 }
