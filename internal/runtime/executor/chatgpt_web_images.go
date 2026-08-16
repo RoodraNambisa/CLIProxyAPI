@@ -117,6 +117,13 @@ func (*chatGPTWebImageMemoryCapacityError) ExecutionResultErrorCode() string {
 	return "image_memory_capacity"
 }
 
+func (err *chatGPTWebImageMemoryCapacityError) ChatGPTWebFailureStage() string {
+	if err == nil || strings.TrimSpace(err.stage) == "" {
+		return "download"
+	}
+	return strings.TrimSpace(err.stage)
+}
+
 func (err *chatGPTWebImageBodyLimitError) Error() string {
 	return fmt.Sprintf("chatgpt web image exceeds %d bytes", err.maxBytes)
 }
@@ -2367,6 +2374,11 @@ func (e *ChatGPTWebExecutor) watchChatGPTWebImageTasks(ctx context.Context, clie
 		now = time.Now()
 
 		if taskReady {
+			var memoryErr *chatGPTWebImageMemoryCapacityError
+			if errors.As(taskResult.err, &memoryErr) {
+				e.publishChatGPTWebImageTaskWatchResult(ctx, streamBody, result, chatGPTWebImageTaskWatchResult{err: taskResult.err})
+				return
+			}
 			var limitErr *helps.ChatGPTWebResponseLimitError
 			if errors.As(taskResult.err, &limitErr) {
 				// The primary SSE remains authoritative while it is healthy. If it
@@ -2437,6 +2449,11 @@ func (e *ChatGPTWebExecutor) watchChatGPTWebImageTasks(ctx context.Context, clie
 		}
 
 		if conversationReady {
+			var memoryErr *chatGPTWebImageMemoryCapacityError
+			if errors.As(conversationResult.err, &memoryErr) {
+				e.publishChatGPTWebImageTaskWatchResult(ctx, streamBody, result, chatGPTWebImageTaskWatchResult{err: conversationResult.err})
+				return
+			}
 			var limitErr *helps.ChatGPTWebResponseLimitError
 			if errors.As(conversationResult.err, &limitErr) {
 				// Do not replace a still-running primary SSE with an auxiliary
@@ -2733,6 +2750,10 @@ func (e *ChatGPTWebExecutor) pollChatGPTWebImageConversation(ctx context.Context
 		now = time.Now()
 
 		if taskReady {
+			var memoryErr *chatGPTWebImageMemoryCapacityError
+			if errors.As(taskResult.err, &memoryErr) {
+				return taskResult.err
+			}
 			var limitErr *helps.ChatGPTWebResponseLimitError
 			if errors.As(taskResult.err, &limitErr) {
 				return taskResult.err
@@ -2816,6 +2837,10 @@ func (e *ChatGPTWebExecutor) pollChatGPTWebImageConversation(ctx context.Context
 		}
 
 		if conversationReady {
+			var memoryErr *chatGPTWebImageMemoryCapacityError
+			if errors.As(conversationResult.err, &memoryErr) {
+				return conversationResult.err
+			}
 			if conversationResult.err == nil {
 				lastConversationErr = nil
 				conversationAccumulator := conversationResult.accumulator
@@ -3018,6 +3043,10 @@ func chatGPTWebImageTaskQueryFatal(ctx context.Context, err error) bool {
 	if ctx != nil && ctx.Err() != nil {
 		return true
 	}
+	var memoryErr *chatGPTWebImageMemoryCapacityError
+	if errors.As(err, &memoryErr) {
+		return true
+	}
 	var limitErr *helps.ChatGPTWebResponseLimitError
 	if errors.As(err, &limitErr) {
 		return true
@@ -3027,6 +3056,10 @@ func chatGPTWebImageTaskQueryFatal(ctx context.Context, err error) bool {
 }
 
 func chatGPTWebPollRetryDelay(err error, fallback time.Duration) (time.Duration, bool) {
+	var memoryErr *chatGPTWebImageMemoryCapacityError
+	if errors.As(err, &memoryErr) {
+		return 0, false
+	}
 	var limitErr *helps.ChatGPTWebResponseLimitError
 	if errors.As(err, &limitErr) {
 		return 0, false

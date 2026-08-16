@@ -1626,6 +1626,195 @@ func TestChatGPTWebPollResponseBudgetLimitsCumulativeBytes(t *testing.T) {
 	}
 }
 
+func TestChatGPTWebPollRetryDistinguishesLocalMemoryFromUpstreamServiceUnavailable(t *testing.T) {
+	memoryErr := &chatGPTWebImageMemoryCapacityError{stage: "settle"}
+	if !chatGPTWebImageTaskQueryFatal(t.Context(), memoryErr) {
+		t.Fatal("local image memory capacity error was not terminal")
+	}
+	if delay, retryable := chatGPTWebPollRetryDelay(memoryErr, 10*time.Second); retryable || delay != 0 {
+		t.Fatalf("local image memory retry = (%v, %v), want (0, false)", delay, retryable)
+	}
+
+	retryAfter := 3 * time.Second
+	upstreamErr := statusErr{code: http.StatusServiceUnavailable, retryAfter: &retryAfter}
+	if chatGPTWebImageTaskQueryFatal(t.Context(), upstreamErr) {
+		t.Fatal("upstream service unavailable became terminal")
+	}
+	if delay, retryable := chatGPTWebPollRetryDelay(upstreamErr, 10*time.Second); !retryable || delay != retryAfter {
+		t.Fatalf("upstream service unavailable retry = (%v, %v), want (%v, true)", delay, retryable, retryAfter)
+	}
+}
+
+func TestChatGPTWebImagePollingStopsAfterLocalMemoryCapacityError(t *testing.T) {
+	testCases := []struct {
+		name           string
+		memoryPath     string
+		streamingWatch bool
+	}{
+		{name: "synchronous task", memoryPath: "/backend-api/tasks"},
+		{name: "synchronous conversation", memoryPath: "/backend-api/conversation/memory-capacity"},
+		{name: "streaming task", memoryPath: "/backend-api/tasks", streamingWatch: true},
+		{name: "streaming conversation", memoryPath: "/backend-api/conversation/memory-capacity", streamingWatch: true},
+	}
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			capacity := helps.ChatGPTWebImageMemorySnapshot().CapacityBytes
+			releaseCapacity, err := helps.AcquireChatGPTWebImageMemory(t.Context(), capacity-64)
+			if err != nil {
+				t.Fatalf("reserve image memory: %v", err)
+			}
+			defer releaseCapacity()
+
+			var taskPolls atomic.Int32
+			var conversationPolls atomic.Int32
+			memoryResponseClosed := make(chan struct{})
+			var memoryResponseClosedOnce sync.Once
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+				switch request.URL.Path {
+				case "/backend-api/tasks":
+					taskPolls.Add(1)
+				case "/backend-api/conversation/memory-capacity":
+					conversationPolls.Add(1)
+				default:
+					http.NotFound(w, request)
+					return
+				}
+				if request.URL.Path == testCase.memoryPath {
+					w.Header().Set("Content-Length", "4096")
+					w.WriteHeader(http.StatusOK)
+					if flusher, ok := w.(http.Flusher); ok {
+						flusher.Flush()
+					}
+					<-request.Context().Done()
+					memoryResponseClosedOnce.Do(func() { close(memoryResponseClosed) })
+					return
+				}
+				if request.URL.Path == "/backend-api/tasks" {
+					_, _ = io.WriteString(w, `{"tasks":[]}`)
+					return
+				}
+				_, _ = io.WriteString(w, `{"mapping":{}}`)
+			}))
+			defer server.Close()
+
+			executor := NewChatGPTWebExecutor(nil, nil)
+			executor.runtimeBaseURL = server.URL
+			executor.imageInitialWait = 0
+			executor.imagePollInterval = 20 * time.Millisecond
+			executor.imageSettleWait = 0
+			executor.imageMaxPolls = 8
+			client, credential, err := executor.newRuntimeClient(chatGPTWebRuntimeAuth())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer client.CloseIdleConnections()
+
+			pollSlotsBefore := len(chatGPTWebImagePollSlots)
+			var resultErr error
+			var streamBody *chatGPTWebImageWatchBody
+			if testCase.streamingWatch {
+				trackedBody := &chatGPTWebTrackedBody{Reader: strings.NewReader("")}
+				streamBody = &chatGPTWebImageWatchBody{ReadCloser: trackedBody}
+				result := make(chan chatGPTWebImageTaskWatchResult, 1)
+				executor.watchChatGPTWebImageTasks(
+					t.Context(), client, credential, "memory-capacity", helps.ChatGPTWebImageTurn{},
+					streamBody, result, nil, nil, nil,
+				)
+				watchResult := <-result
+				resultErr = watchResult.err
+				if !trackedBody.closed.Load() {
+					t.Fatal("stream body was not closed after polling memory error")
+				}
+			} else {
+				resultErr = executor.pollChatGPTWebImageConversation(
+					t.Context(), client, credential,
+					&helps.ChatGPTWebImageAccumulator{ConversationID: "memory-capacity"}, nil, false,
+				)
+			}
+
+			var memoryErr *chatGPTWebImageMemoryCapacityError
+			if !errors.As(resultErr, &memoryErr) {
+				t.Fatalf("poll result error = %v, want image memory capacity", resultErr)
+			}
+			var coded interface{ ExecutionResultErrorCode() string }
+			if !errors.As(resultErr, &coded) || coded.ExecutionResultErrorCode() != "image_memory_capacity" {
+				t.Fatalf("poll error code = %v", resultErr)
+			}
+			var staged chatGPTWebFailureStageProvider
+			if !errors.As(resultErr, &staged) || staged.ChatGPTWebFailureStage() != "settle" {
+				t.Fatalf("poll failure stage = %v, want settle", resultErr)
+			}
+			select {
+			case <-memoryResponseClosed:
+			case <-time.After(time.Second):
+				t.Fatal("poll response body was not closed")
+			}
+			if got := taskPolls.Load(); got > 1 {
+				t.Fatalf("task polls = %d, want at most 1", got)
+			}
+			if got := conversationPolls.Load(); got > 1 {
+				t.Fatalf("conversation polls = %d, want at most 1", got)
+			}
+			if got := len(chatGPTWebImagePollSlots); got != pollSlotsBefore {
+				t.Fatalf("poll slots in use = %d, want %d", got, pollSlotsBefore)
+			}
+			taskCount := taskPolls.Load()
+			conversationCount := conversationPolls.Load()
+			time.Sleep(3 * executor.imagePollInterval)
+			if taskPolls.Load() != taskCount || conversationPolls.Load() != conversationCount {
+				t.Fatalf("polling continued after terminal memory error: task=%d->%d conversation=%d->%d",
+					taskCount, taskPolls.Load(), conversationCount, conversationPolls.Load())
+			}
+		})
+	}
+}
+
+func TestChatGPTWebImagePollingRetriesUpstreamServiceUnavailable(t *testing.T) {
+	var taskPolls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/backend-api/tasks":
+			if taskPolls.Add(1) == 1 {
+				w.Header().Set("Retry-After", "0")
+				http.Error(w, "temporarily unavailable", http.StatusServiceUnavailable)
+				return
+			}
+			_, _ = io.WriteString(w, `{"tasks":[]}`)
+		case "/backend-api/conversation/upstream-retry":
+			if taskPolls.Load() < 2 {
+				_, _ = io.WriteString(w, `{"mapping":{}}`)
+				return
+			}
+			writeTerminalChatGPTWebImageConversation(w, "generated")
+		default:
+			http.NotFound(w, request)
+		}
+	}))
+	defer server.Close()
+
+	executor := NewChatGPTWebExecutor(nil, nil)
+	executor.runtimeBaseURL = server.URL
+	executor.imageInitialWait = 0
+	executor.imagePollInterval = time.Millisecond
+	executor.imageSettleWait = 0
+	executor.imageMaxPolls = 8
+	client, credential, err := executor.newRuntimeClient(chatGPTWebRuntimeAuth())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.CloseIdleConnections()
+	accumulator := &helps.ChatGPTWebImageAccumulator{ConversationID: "upstream-retry"}
+	if err = executor.pollChatGPTWebImageConversation(t.Context(), client, credential, accumulator, nil, false); err != nil {
+		t.Fatalf("pollChatGPTWebImageConversation() error = %v", err)
+	}
+	if got := taskPolls.Load(); got < 2 {
+		t.Fatalf("upstream 503 task polls = %d, want at least 2", got)
+	}
+	if !reflect.DeepEqual(accumulator.FileIDs, []string{"generated"}) {
+		t.Fatalf("result files = %v", accumulator.FileIDs)
+	}
+}
+
 func TestChatGPTWebPollResponseBudgetIsConcurrentSafe(t *testing.T) {
 	const (
 		limit    = 64
