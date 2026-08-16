@@ -33,6 +33,11 @@ type chatGPTWebRequestRefreshError struct {
 	persist bool
 }
 
+type chatGPTWebUnauthorizedChunkExecutor struct {
+	*chatGPTWebUnauthorizedRefreshExecutor
+	releaseUnauthorized <-chan struct{}
+}
+
 type chatGPTWebRefreshPersistenceStore struct {
 	mu          sync.Mutex
 	saved       *Auth
@@ -130,6 +135,20 @@ func (executor *chatGPTWebUnauthorizedRefreshExecutor) ExecuteStream(_ context.C
 	chunks := make(chan cliproxyexecutor.StreamChunk, 1)
 	chunks <- cliproxyexecutor.StreamChunk{Payload: []byte(auth.ID + ":" + authAccessToken(auth))}
 	close(chunks)
+	return &cliproxyexecutor.StreamResult{Chunks: chunks}, nil
+}
+
+func (executor *chatGPTWebUnauthorizedChunkExecutor) ExecuteStream(_ context.Context, auth *Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
+	executor.streamCalls = append(executor.streamCalls, auth.ID)
+	chunks := make(chan cliproxyexecutor.StreamChunk)
+	go func() {
+		defer close(chunks)
+		chunks <- cliproxyexecutor.BootstrapCommitStreamChunk()
+		if executor.releaseUnauthorized != nil {
+			<-executor.releaseUnauthorized
+		}
+		chunks <- cliproxyexecutor.StreamChunk{Err: &Error{HTTPStatus: http.StatusUnauthorized, Message: "invalid access token"}}
+	}()
 	return &cliproxyexecutor.StreamResult{Chunks: chunks}, nil
 }
 
@@ -354,6 +373,79 @@ func TestChatGPTWebUnauthorizedReturnsWithoutWaitingForBackgroundRefresh(t *test
 				t.Fatalf("request refresh blocks after completion = %d, want 0", blocks)
 			}
 		})
+	}
+}
+
+func TestChatGPTWebUnauthorizedStreamChunkStartsBackgroundRefreshWithoutCooldown(t *testing.T) {
+	manager, baseExecutor, primary, backup, model := newChatGPTWebUnauthorizedRefreshFixture(t)
+	releaseUnauthorized := make(chan struct{})
+	refreshStarted := make(chan struct{})
+	releaseRefresh := make(chan struct{})
+	var refreshStartOnce sync.Once
+	baseExecutor.beforeRefresh = func() {
+		refreshStartOnce.Do(func() { close(refreshStarted) })
+		<-releaseRefresh
+	}
+	executor := &chatGPTWebUnauthorizedChunkExecutor{
+		chatGPTWebUnauthorizedRefreshExecutor: baseExecutor,
+		releaseUnauthorized:                   releaseUnauthorized,
+	}
+	manager.RegisterExecutor(executor)
+
+	stream, errStream := manager.ExecuteStream(t.Context(), []string{"chatgpt-web"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
+	if errStream != nil || stream == nil {
+		t.Fatalf("ExecuteStream() = %#v, %v", stream, errStream)
+	}
+	close(releaseUnauthorized)
+	var unauthorized error
+	for chunk := range stream.Chunks {
+		if chunk.Err != nil {
+			unauthorized = chunk.Err
+		}
+	}
+	if statusCodeFromError(unauthorized) != http.StatusUnauthorized || unauthorized.Error() != "invalid access token" {
+		close(releaseRefresh)
+		t.Fatalf("stream error = %T %v, want original 401", unauthorized, unauthorized)
+	}
+	select {
+	case <-refreshStarted:
+	case <-time.After(time.Second):
+		close(releaseRefresh)
+		t.Fatal("stream 401 did not start background refresh")
+	}
+	if len(baseExecutor.streamCalls) != 1 || baseExecutor.streamCalls[0] != primary.ID {
+		close(releaseRefresh)
+		t.Fatalf("stream calls = %v, want primary once", baseExecutor.streamCalls)
+	}
+	for _, authID := range baseExecutor.streamCalls {
+		if authID == backup.ID {
+			close(releaseRefresh)
+			t.Fatalf("stream 401 fell back to backup: %v", baseExecutor.streamCalls)
+		}
+	}
+	current, ok := manager.GetByID(primary.ID)
+	if !ok || current == nil || current.Unavailable || current.CooldownScope != "" || current.LastError != nil {
+		close(releaseRefresh)
+		t.Fatalf("stream 401 synchronously mutated credential state: %#v", current)
+	}
+	if blocks := chatGPTWebRequestRefreshBlockCount(manager, primary.ID); blocks != 1 {
+		close(releaseRefresh)
+		t.Fatalf("stream 401 request refresh blocks = %d, want 1", blocks)
+	}
+	close(releaseRefresh)
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		current, ok = manager.GetByID(primary.ID)
+		if ok && authAccessToken(current) == "fresh" && chatGPTWebRequestRefreshBlockCount(manager, primary.ID) == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("stream 401 background refresh did not finish: %#v", current)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if baseExecutor.refreshCalls != 1 {
+		t.Fatalf("refresh calls = %d, want 1", baseExecutor.refreshCalls)
 	}
 }
 

@@ -2286,6 +2286,10 @@ func (m *Manager) wrapStreamResult(ctx, resultCtx context.Context, auth *Auth, a
 					chunk.Err = runtimeAuthInstanceRetiredError()
 				} else {
 					chunk.Err = m.reportProxyFailure(resultCtx, auth, chunk.Err)
+					if strings.EqualFold(strings.TrimSpace(provider), "chatgpt-web") && isUnauthorizedError(chunk.Err) {
+						chunk.Err = m.wrapChatGPTWebUnauthorizedRequestError(resultCtx, auth, chunk.Err)
+						triggerChatGPTWebUnauthorizedRequestRefresh(chunk.Err)
+					}
 				}
 				rerr := &Error{Message: chunk.Err.Error()}
 				if se, ok := errors.AsType[cliproxyexecutor.StatusError](chunk.Err); ok && se != nil {
@@ -8465,6 +8469,21 @@ func triggerChatGPTWebUnauthorizedRequestRefresh(err error) {
 	wrapped.startOnce.Do(wrapped.startRefresh)
 }
 
+func (m *Manager) wrapChatGPTWebUnauthorizedRequestError(ctx context.Context, auth *Auth, err error) error {
+	if auth == nil || !isNativeChatGPTWebCredentialAuth(auth) || !auth.LifecycleRefreshable() {
+		return wrapChatGPTWebUnauthorizedRequestError(err, nil)
+	}
+	refreshAuth := auth.Clone()
+	failedAccessToken := authAccessToken(refreshAuth)
+	startRefresh := func() {
+		_, errStart := m.startChatGPTWebRequestRefreshFlight(ctx, refreshAuth.ID, failedAccessToken, refreshAuth)
+		if errStart != nil {
+			log.Debugf("chatgpt-web credential background refresh could not start for %s: %v", refreshAuth.ID, errStart)
+		}
+	}
+	return wrapChatGPTWebUnauthorizedRequestError(err, startRefresh)
+}
+
 func authAccessToken(auth *Auth) string {
 	if token := authMetadataString(auth, "access_token"); token != "" {
 		return token
@@ -10703,18 +10722,8 @@ func (m *Manager) tryRefreshAfterUnauthorized(ctx context.Context, executor Prov
 			return auth, false, nil
 		}
 	case "chatgpt-web":
-		if isNativeChatGPTWebCredentialAuth(auth) && auth.LifecycleRefreshable() {
-			refreshAuth := auth.Clone()
-			failedAccessToken := authAccessToken(refreshAuth)
-			startRefresh := func() {
-				_, errStart := m.startChatGPTWebRequestRefreshFlight(ctx, refreshAuth.ID, failedAccessToken, refreshAuth)
-				if errStart != nil {
-					log.Debugf("chatgpt-web credential background refresh could not start for %s: %v", refreshAuth.ID, errStart)
-				}
-			}
-			return auth, true, wrapChatGPTWebUnauthorizedRequestError(execErr, startRefresh)
-		}
-		return auth, false, wrapChatGPTWebUnauthorizedRequestError(execErr, nil)
+		wrapped := m.wrapChatGPTWebUnauthorizedRequestError(ctx, auth, execErr)
+		return auth, isNativeChatGPTWebCredentialAuth(auth) && auth.LifecycleRefreshable(), wrapped
 	default:
 		return auth, false, nil
 	}
