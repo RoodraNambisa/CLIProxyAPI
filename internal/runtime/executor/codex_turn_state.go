@@ -8,6 +8,7 @@ import (
 	"time"
 
 	codexauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/codex"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 )
 
@@ -30,6 +31,14 @@ type codexTurnStateOriginTracker struct {
 	ttl     time.Duration
 }
 
+type codexTurnStateRelation uint8
+
+const (
+	codexTurnStateUnknown codexTurnStateRelation = iota
+	codexTurnStateSameAccount
+	codexTurnStateOtherAccount
+)
+
 var globalCodexTurnStateOrigins = newCodexTurnStateOriginTracker(codexTurnStateOriginLimit, codexTurnStateOriginTTL)
 
 func newCodexTurnStateOriginTracker(limit int, ttl time.Duration) *codexTurnStateOriginTracker {
@@ -46,12 +55,16 @@ func newCodexTurnStateOriginTracker(limit int, ttl time.Duration) *codexTurnStat
 	}
 }
 
-func guardCodexTurnStateHeader(auth *cliproxyauth.Auth, headers http.Header) {
+func guardCodexTurnStateHeader(cfg *config.Config, auth *cliproxyauth.Auth, headers http.Header) {
 	owner := codexTurnStateOwner(auth)
 	if owner == "" || headers == nil {
 		return
 	}
-	globalCodexTurnStateOrigins.guard(owner, headers, time.Now())
+	policy := config.CodexTurnStatePolicyGuardCrossAccount
+	if cfg != nil {
+		policy = cfg.Codex.ResolvedTurnStatePolicy()
+	}
+	globalCodexTurnStateOrigins.apply(policy, owner, headers, time.Now())
 }
 
 func ensureCodexTurnStateHeader(target, source http.Header) {
@@ -105,11 +118,40 @@ func (t *codexTurnStateOriginTracker) note(owner, state string, now time.Time) {
 	}
 }
 
-func (t *codexTurnStateOriginTracker) guard(owner string, headers http.Header, now time.Time) bool {
+func (t *codexTurnStateOriginTracker) apply(policy config.CodexTurnStatePolicy, owner string, headers http.Header, now time.Time) bool {
 	owner = strings.TrimSpace(owner)
-	state := strings.TrimSpace(headers.Get(codexTurnStateHeader))
-	if t == nil || owner == "" || state == "" {
+	if owner == "" || headers == nil {
 		return false
+	}
+	state := strings.TrimSpace(headers.Get(codexTurnStateHeader))
+	switch policy {
+	case config.CodexTurnStatePolicyPassthrough:
+		return false
+	case config.CodexTurnStatePolicyStrip:
+		deleteHeaderCaseInsensitive(headers, codexTurnStateHeader)
+		return state != ""
+	}
+	if state == "" {
+		return false
+	}
+
+	relation := t.relation(owner, state, now)
+	shouldStrip := relation == codexTurnStateOtherAccount
+	if policy == config.CodexTurnStatePolicySameAccountOnly {
+		shouldStrip = relation != codexTurnStateSameAccount
+	}
+	if !shouldStrip {
+		return false
+	}
+	deleteHeaderCaseInsensitive(headers, codexTurnStateHeader)
+	return true
+}
+
+func (t *codexTurnStateOriginTracker) relation(owner, state string, now time.Time) codexTurnStateRelation {
+	owner = strings.TrimSpace(owner)
+	state = strings.TrimSpace(state)
+	if t == nil || owner == "" || state == "" {
+		return codexTurnStateUnknown
 	}
 	digest := sha256.Sum256([]byte(state))
 	t.mu.Lock()
@@ -119,11 +161,13 @@ func (t *codexTurnStateOriginTracker) guard(owner string, headers http.Header, n
 		exists = false
 	}
 	t.mu.Unlock()
-	if !exists || origin.owner == owner {
-		return false
+	if !exists {
+		return codexTurnStateUnknown
 	}
-	deleteHeaderCaseInsensitive(headers, codexTurnStateHeader)
-	return true
+	if origin.owner == owner {
+		return codexTurnStateSameAccount
+	}
+	return codexTurnStateOtherAccount
 }
 
 func (t *codexTurnStateOriginTracker) evictOneLocked(now time.Time) {

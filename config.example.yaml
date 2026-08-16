@@ -613,9 +613,14 @@ nonstream-keepalive-interval: 0
 # `identity-confuse` remaps identities already supplied by the client.
 # `spoof-session-identity` fills missing session/thread/window/turn identities
 # for Codex OAuth/file-backed credentials and keeps them stable across retries.
+# `turn-state-policy` controls client X-Codex-Turn-State forwarding for Codex OAuth identities:
+# `passthrough` keeps every state, `guard-cross-account` removes only known cross-account states,
+# `same-account-only` keeps only states known to belong to the selected account, and `strip` removes all.
+# Upstream response states are always recorded and returned to the client. The default is `guard-cross-account`.
 # codex:
 #   identity-confuse: false
 #   spoof-session-identity: false
+#   turn-state-policy: "guard-cross-account"
 
 # Optional Codex upstream fingerprinting. Disabled by default.
 # `ja3` forces the observed native Codex TLS 1.2 ClientHello, HTTP/1.1,

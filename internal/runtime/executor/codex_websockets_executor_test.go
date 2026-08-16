@@ -43,6 +43,55 @@ func TestBuildCodexWebsocketRequestBodyPreservesPreviousResponseID(t *testing.T)
 	}
 }
 
+func TestCodexWebsocketTurnStatePolicyStrip(t *testing.T) {
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	headersCh := make(chan http.Header, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		headersCh <- r.Header.Clone()
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Errorf("upgrade websocket: %v", err)
+			return
+		}
+		defer func() { _ = conn.Close() }()
+		if _, _, err = conn.ReadMessage(); err != nil {
+			t.Errorf("read websocket request: %v", err)
+			return
+		}
+		completed := []byte(`{"type":"response.completed","response":{"id":"resp_1","output":[],"usage":{"input_tokens":0,"output_tokens":0,"total_tokens":0}}}`)
+		if err = conn.WriteMessage(websocket.TextMessage, completed); err != nil {
+			t.Errorf("write websocket response: %v", err)
+		}
+	}))
+	defer server.Close()
+
+	exec := NewCodexWebsocketsExecutor(&config.Config{
+		Codex:     config.CodexConfig{TurnStatePolicy: config.CodexTurnStatePolicyStrip},
+		SDKConfig: sdkconfig.SDKConfig{ProxyURL: "direct"},
+	})
+	auth := &cliproxyauth.Auth{
+		ID: "oauth-ws-auth", Provider: "codex",
+		Metadata:   map[string]any{"access_token": "oauth-token"},
+		Attributes: map[string]string{"base_url": server.URL},
+	}
+	req := cliproxyexecutor.Request{Model: "gpt-5.4", Payload: []byte(`{"model":"gpt-5.4","input":"hello"}`)}
+	opts := cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("codex"),
+		Headers:      http.Header{codexTurnStateHeader: []string{"client-state"}},
+	}
+	if _, err := exec.Execute(t.Context(), auth, req, opts); err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	select {
+	case headers := <-headersCh:
+		if got := headers.Get(codexTurnStateHeader); got != "" {
+			t.Fatalf("websocket turn state = %q, want stripped", got)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for websocket handshake headers")
+	}
+}
+
 func TestCodexWebsocketSessionIdentityStaysStableAcrossTurns(t *testing.T) {
 	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
 	headersCh := make(chan http.Header, 1)

@@ -256,6 +256,9 @@ func BuildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 	if oldCfg.Codex.SpoofSessionIdentity != newCfg.Codex.SpoofSessionIdentity {
 		changes = append(changes, fmt.Sprintf("codex.spoof-session-identity: %t -> %t", oldCfg.Codex.SpoofSessionIdentity, newCfg.Codex.SpoofSessionIdentity))
 	}
+	if oldCfg.Codex.ResolvedTurnStatePolicy() != newCfg.Codex.ResolvedTurnStatePolicy() {
+		changes = append(changes, fmt.Sprintf("codex.turn-state-policy: %s -> %s", oldCfg.Codex.ResolvedTurnStatePolicy(), newCfg.Codex.ResolvedTurnStatePolicy()))
+	}
 	if oldCfg.ChatGPTWeb.TokenUsageEstimationEnabled() != newCfg.ChatGPTWeb.TokenUsageEstimationEnabled() {
 		changes = append(changes, fmt.Sprintf("chatgpt-web.estimate-token-usage: %t -> %t", oldCfg.ChatGPTWeb.TokenUsageEstimationEnabled(), newCfg.ChatGPTWeb.TokenUsageEstimationEnabled()))
 	}

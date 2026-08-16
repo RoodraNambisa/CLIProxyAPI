@@ -510,8 +510,45 @@ type CodexHeaderDefaults struct {
 
 // CodexConfig configures provider-wide Codex request behavior.
 type CodexConfig struct {
-	IdentityConfuse      bool `yaml:"identity-confuse" json:"identity-confuse"`
-	SpoofSessionIdentity bool `yaml:"spoof-session-identity" json:"spoof-session-identity"`
+	IdentityConfuse      bool                 `yaml:"identity-confuse" json:"identity-confuse"`
+	SpoofSessionIdentity bool                 `yaml:"spoof-session-identity" json:"spoof-session-identity"`
+	TurnStatePolicy      CodexTurnStatePolicy `yaml:"turn-state-policy" json:"turn-state-policy"`
+}
+
+// CodexTurnStatePolicy controls how client turn-state headers are forwarded to Codex OAuth upstreams.
+type CodexTurnStatePolicy string
+
+const (
+	CodexTurnStatePolicyPassthrough       CodexTurnStatePolicy = "passthrough"
+	CodexTurnStatePolicyGuardCrossAccount CodexTurnStatePolicy = "guard-cross-account"
+	CodexTurnStatePolicySameAccountOnly   CodexTurnStatePolicy = "same-account-only"
+	CodexTurnStatePolicyStrip             CodexTurnStatePolicy = "strip"
+)
+
+// NormalizeCodexTurnStatePolicy validates and canonicalizes the configured policy.
+func NormalizeCodexTurnStatePolicy(value CodexTurnStatePolicy) (CodexTurnStatePolicy, error) {
+	normalized := CodexTurnStatePolicy(strings.ToLower(strings.TrimSpace(string(value))))
+	if normalized == "" {
+		return CodexTurnStatePolicyGuardCrossAccount, nil
+	}
+	switch normalized {
+	case CodexTurnStatePolicyPassthrough,
+		CodexTurnStatePolicyGuardCrossAccount,
+		CodexTurnStatePolicySameAccountOnly,
+		CodexTurnStatePolicyStrip:
+		return normalized, nil
+	default:
+		return "", fmt.Errorf("codex.turn-state-policy must be passthrough, guard-cross-account, same-account-only, or strip")
+	}
+}
+
+// ResolvedTurnStatePolicy returns the effective policy for runtime-created configurations.
+func (c CodexConfig) ResolvedTurnStatePolicy() CodexTurnStatePolicy {
+	policy, err := NormalizeCodexTurnStatePolicy(c.TurnStatePolicy)
+	if err != nil {
+		return CodexTurnStatePolicyGuardCrossAccount
+	}
+	return policy
 }
 
 // ChatGPTWebConfig configures ChatGPT Web credential, usage, and Sentinel behavior.
@@ -2043,6 +2080,9 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 		return nil, fmt.Errorf("invalid remote-management.access-path: %w", errAccessPath)
 	}
 	cfg.RemoteManagement.AccessPath = accessPath
+	if cfg.Codex.TurnStatePolicy, err = NormalizeCodexTurnStatePolicy(cfg.Codex.TurnStatePolicy); err != nil {
+		return nil, err
+	}
 
 	cfg.Images.CodexModel = strings.TrimSpace(cfg.Images.CodexModel)
 	if cfg.Images.CodexModel == "" {

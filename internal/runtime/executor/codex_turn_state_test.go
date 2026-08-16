@@ -6,27 +6,53 @@ import (
 	"testing"
 	"time"
 
+	codexauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/codex"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 )
 
-func TestCodexTurnStateOriginTrackerGuardsOnlyKnownOtherAccount(t *testing.T) {
+func TestCodexTurnStateOriginTrackerAppliesPolicies(t *testing.T) {
 	tracker := newCodexTurnStateOriginTracker(8, time.Hour)
 	now := time.Unix(100, 0)
 	tracker.note("account:a", "state-a", now)
 
-	same := http.Header{codexTurnStateHeader: []string{"state-a"}}
-	if tracker.guard("account:a", same, now.Add(time.Minute)) || same.Get(codexTurnStateHeader) == "" {
-		t.Fatal("same-account turn state was stripped")
+	tests := []struct {
+		name      string
+		policy    config.CodexTurnStatePolicy
+		owner     string
+		state     string
+		wantStrip bool
+	}{
+		{name: "passthrough other", policy: config.CodexTurnStatePolicyPassthrough, owner: "account:b", state: "state-a"},
+		{name: "guard same", policy: config.CodexTurnStatePolicyGuardCrossAccount, owner: "account:a", state: "state-a"},
+		{name: "guard other", policy: config.CodexTurnStatePolicyGuardCrossAccount, owner: "account:b", state: "state-a", wantStrip: true},
+		{name: "guard unknown", policy: config.CodexTurnStatePolicyGuardCrossAccount, owner: "account:b", state: "state-unknown"},
+		{name: "same only same", policy: config.CodexTurnStatePolicySameAccountOnly, owner: "account:a", state: "state-a"},
+		{name: "same only other", policy: config.CodexTurnStatePolicySameAccountOnly, owner: "account:b", state: "state-a", wantStrip: true},
+		{name: "same only unknown", policy: config.CodexTurnStatePolicySameAccountOnly, owner: "account:a", state: "state-unknown", wantStrip: true},
+		{name: "strip same", policy: config.CodexTurnStatePolicyStrip, owner: "account:a", state: "state-a", wantStrip: true},
+		{name: "strip unknown", policy: config.CodexTurnStatePolicyStrip, owner: "account:a", state: "state-unknown", wantStrip: true},
 	}
-
-	other := http.Header{codexTurnStateHeader: []string{"state-a"}}
-	if !tracker.guard("account:b", other, now.Add(time.Minute)) || other.Get(codexTurnStateHeader) != "" {
-		t.Fatal("known cross-account turn state was not stripped")
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			headers := http.Header{codexTurnStateHeader: []string{test.state}}
+			if got := tracker.apply(test.policy, test.owner, headers, now.Add(time.Minute)); got != test.wantStrip {
+				t.Fatalf("apply() = %v, want %v", got, test.wantStrip)
+			}
+			if got := headers.Get(codexTurnStateHeader); (got == "") != test.wantStrip {
+				t.Fatalf("turn state = %q after apply, wantStrip=%v", got, test.wantStrip)
+			}
+		})
 	}
+}
 
-	unknown := http.Header{codexTurnStateHeader: []string{"state-unknown"}}
-	if tracker.guard("account:b", unknown, now.Add(time.Minute)) || unknown.Get(codexTurnStateHeader) == "" {
-		t.Fatal("unknown turn state was stripped")
+func TestCodexTurnStateStripRemovesEmptyHeader(t *testing.T) {
+	tracker := newCodexTurnStateOriginTracker(1, time.Hour)
+	headers := http.Header{codexTurnStateHeader: []string{""}}
+	tracker.apply(config.CodexTurnStatePolicyStrip, "account:a", headers, time.Now())
+	if _, exists := headers[codexTurnStateHeader]; exists {
+		t.Fatal("strip policy left an empty turn-state header")
 	}
 }
 
@@ -35,8 +61,12 @@ func TestCodexTurnStateOriginTrackerExpiresAndBoundsEntries(t *testing.T) {
 	now := time.Unix(100, 0)
 	tracker.note("account:a", "expired", now)
 	expired := http.Header{codexTurnStateHeader: []string{"expired"}}
-	if tracker.guard("account:b", expired, now.Add(time.Minute)) || expired.Get(codexTurnStateHeader) == "" {
+	if tracker.apply(config.CodexTurnStatePolicyGuardCrossAccount, "account:b", expired, now.Add(time.Minute)) || expired.Get(codexTurnStateHeader) == "" {
 		t.Fatal("expired turn state provenance should not strip the header")
+	}
+	strictExpired := http.Header{codexTurnStateHeader: []string{"expired"}}
+	if !tracker.apply(config.CodexTurnStatePolicySameAccountOnly, "account:a", strictExpired, now.Add(time.Minute)) || strictExpired.Get(codexTurnStateHeader) != "" {
+		t.Fatal("same-account-only should strip expired provenance")
 	}
 
 	for i := 0; i < 4; i++ {
@@ -46,6 +76,45 @@ func TestCodexTurnStateOriginTrackerExpiresAndBoundsEntries(t *testing.T) {
 	defer tracker.mu.Unlock()
 	if got := len(tracker.origins); got > 2 {
 		t.Fatalf("origin count = %d, want <= 2", got)
+	}
+}
+
+func TestGuardCodexTurnStateHeaderUsesRuntimePolicyAndSkipsAPIKeys(t *testing.T) {
+	oauth := &cliproxyauth.Auth{ID: "oauth", Provider: "codex"}
+	stripCfg := &config.Config{Codex: config.CodexConfig{TurnStatePolicy: config.CodexTurnStatePolicyStrip}}
+	oauthHeaders := http.Header{codexTurnStateHeader: []string{"client-state"}}
+	guardCodexTurnStateHeader(stripCfg, oauth, oauthHeaders)
+	if got := oauthHeaders.Get(codexTurnStateHeader); got != "" {
+		t.Fatalf("OAuth turn state = %q, want stripped", got)
+	}
+
+	apiKey := &cliproxyauth.Auth{ID: "key", Provider: "codex", Attributes: map[string]string{"api_key": "secret"}}
+	apiKeyHeaders := http.Header{codexTurnStateHeader: []string{"client-state"}}
+	guardCodexTurnStateHeader(stripCfg, apiKey, apiKeyHeaders)
+	if got := apiKeyHeaders.Get(codexTurnStateHeader); got != "client-state" {
+		t.Fatalf("API-key turn state = %q, want passthrough", got)
+	}
+}
+
+func TestApplyCodexHTTPSessionIdentityAppliesTurnStatePolicy(t *testing.T) {
+	executor := NewCodexExecutor(&config.Config{Codex: config.CodexConfig{TurnStatePolicy: config.CodexTurnStatePolicyStrip}})
+	auth := &cliproxyauth.Auth{
+		ID:       "oauth",
+		Provider: "codex",
+		Metadata: map[string]any{codexauth.FingerprintModeMetadataKey: string(codexauth.FingerprintModeOff)},
+	}
+	httpReq, err := http.NewRequest(http.MethodPost, "https://chatgpt.com/backend-api/codex/responses", nil)
+	if err != nil {
+		t.Fatalf("NewRequest() error = %v", err)
+	}
+	httpReq.Header.Set(codexTurnStateHeader, "client-state")
+	if _, err = executor.applyCodexHTTPSessionIdentity(
+		t.Context(), auth, cliproxyexecutor.Request{}, cliproxyexecutor.Options{}, httpReq, []byte(`{}`), &codexIdentityConfuseState{},
+	); err != nil {
+		t.Fatalf("applyCodexHTTPSessionIdentity() error = %v", err)
+	}
+	if got := httpReq.Header.Get(codexTurnStateHeader); got != "" {
+		t.Fatalf("HTTP turn state = %q, want stripped", got)
 	}
 }
 

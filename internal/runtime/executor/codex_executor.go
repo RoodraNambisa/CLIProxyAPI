@@ -1642,7 +1642,7 @@ func (e *CodexExecutor) applyCodexHTTPSessionIdentity(
 	}
 	ensureCodexTurnStateHeader(httpReq.Header, opts.Headers)
 	if !state.enabled {
-		guardCodexTurnStateHeader(auth, httpReq.Header)
+		guardCodexTurnStateHeader(e.cfg, auth, httpReq.Header)
 		return rawJSON, nil
 	}
 	closeCodexRequestBody(httpReq)
@@ -1650,7 +1650,7 @@ func (e *CodexExecutor) applyCodexHTTPSessionIdentity(
 	httpReq.Body = bodyReader
 	httpReq.ContentLength = int64(bodyReader.Len())
 	applyCodexSessionIdentityHeaders(httpReq.Header, state, false)
-	guardCodexTurnStateHeader(auth, httpReq.Header)
+	guardCodexTurnStateHeader(e.cfg, auth, httpReq.Header)
 	return projected, nil
 }
 

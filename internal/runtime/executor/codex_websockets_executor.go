@@ -295,7 +295,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 	}
 	applyCodexSessionIdentityHeaders(wsHeaders, sessionIdentity, true)
 	ensureCodexTurnStateHeader(wsHeaders, opts.Headers)
-	guardCodexTurnStateHeader(auth, wsHeaders)
+	guardCodexTurnStateHeader(e.cfg, auth, wsHeaders)
 	releasedOriginalPayload := slimCodexOriginalPayloadForTranslation(from, originalPayload)
 	releasedClientBody := slimCodexBodyForStreamUsage(clientBody)
 	originalRef, clientBodyRef, unregisterClientBodies := codexStreamBodyRefs(ctx, opts, originalPayload, clientBody, releasedOriginalPayload, releasedClientBody)
@@ -588,7 +588,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 	}
 	applyCodexSessionIdentityHeaders(wsHeaders, sessionIdentity, true)
 	ensureCodexTurnStateHeader(wsHeaders, opts.Headers)
-	guardCodexTurnStateHeader(auth, wsHeaders)
+	guardCodexTurnStateHeader(e.cfg, auth, wsHeaders)
 	releasedOriginalPayload := slimCodexOriginalPayloadForTranslation(from, userPayload)
 	releasedClientBody := slimCodexBodyForStreamUsage(clientBody)
 	originalRef, clientBodyRef, unregisterClientBodies := codexStreamBodyRefs(ctx, opts, userPayload, clientBody, releasedOriginalPayload, releasedClientBody)
