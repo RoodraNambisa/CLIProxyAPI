@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"sync"
 	"time"
@@ -73,6 +74,33 @@ type refreshPersistenceReservation struct {
 }
 
 type refreshPersistenceReservationContextKey struct{}
+
+type refreshPersistenceCoordinatorExpectation struct {
+	coordinator *refreshPersistenceCoordinator
+}
+
+type refreshPersistenceCoordinatorExpectationContextKey struct{}
+
+var errRefreshPersistenceStoreChanged = errors.New("refresh persistence store changed")
+
+func withRefreshPersistenceCoordinatorExpectation(ctx context.Context, coordinator *refreshPersistenceCoordinator) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(
+		ctx,
+		refreshPersistenceCoordinatorExpectationContextKey{},
+		refreshPersistenceCoordinatorExpectation{coordinator: coordinator},
+	)
+}
+
+func (m *Manager) refreshPersistenceCoordinatorMatchesContext(ctx context.Context) bool {
+	if m == nil || ctx == nil {
+		return true
+	}
+	expectation, ok := ctx.Value(refreshPersistenceCoordinatorExpectationContextKey{}).(refreshPersistenceCoordinatorExpectation)
+	return !ok || m.refreshPersistence.Load() == expectation.coordinator
+}
 
 func newRefreshPersistenceCoordinator(store Store) *refreshPersistenceCoordinator {
 	capable, ok := store.(RefreshPersistenceConcurrencyStore)

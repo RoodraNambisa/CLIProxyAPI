@@ -10088,6 +10088,13 @@ func (m *Manager) lockPersistKeysContext(ctx context.Context, ids ...string) (fu
 		m.persistBarrier.RUnlock()
 		return nil, err
 	}
+	if !m.refreshPersistenceCoordinatorMatchesContext(ctx) {
+		for index := len(locks) - 1; index >= 0; index-- {
+			locks[index].semaphore <- struct{}{}
+		}
+		m.persistBarrier.RUnlock()
+		return nil, errRefreshPersistenceStoreChanged
+	}
 	var once sync.Once
 	return func() {
 		once.Do(func() {
@@ -12030,26 +12037,21 @@ func (m *Manager) commitChatGPTWebRefreshDurably(
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	reservation := refreshPersistenceReservationFromContext(ctx)
-	if reservation == nil {
-		priority := RefreshPersistencePriorityMaintenance
-		if unauthorized, _ := ctx.Value(chatGPTWebUnauthorizedRefreshContextKey{}).(bool); unauthorized {
-			priority = RefreshPersistencePrioritySession
-		} else if ChatGPTWebImportIntent(updated, ChatGPTWebImportSessionIntent) {
-			priority = RefreshPersistencePriorityImport
-		}
-		var errReserve error
-		reservation, errReserve = m.refreshPersistence.Load().acquireContext(ctx, priority, expected.ID)
-		if errReserve != nil {
-			var authErr *Error
-			if errors.As(errReserve, &authErr) && authErr != nil && authErr.Code == "refresh_persist_backpressure" {
-				m.markChatGPTWebRefreshBackpressure(expected, pendingUntil, authErr)
-			}
-			return nil, errReserve
-		}
-		defer reservation.release()
-		ctx = reservation.context(ctx)
+	priority := RefreshPersistencePriorityMaintenance
+	if unauthorized, _ := ctx.Value(chatGPTWebUnauthorizedRefreshContextKey{}).(bool); unauthorized {
+		priority = RefreshPersistencePrioritySession
+	} else if ChatGPTWebImportIntent(updated, ChatGPTWebImportSessionIntent) {
+		priority = RefreshPersistencePriorityImport
 	}
+	baseCtx := context.WithValue(ctx, refreshPersistenceReservationContextKey{}, (*refreshPersistenceReservation)(nil))
+	baseCtx = WithRefreshPersistenceBatchInfo(baseCtx, RefreshPersistenceBatchInfo{})
+	reservation := refreshPersistenceReservationFromContext(ctx)
+	reservationOwned := false
+	defer func() {
+		if reservationOwned {
+			reservation.release()
+		}
+	}()
 	attemptTimeout := m.refreshCommitAttemptTimeout
 	if attemptTimeout <= 0 {
 		attemptTimeout = refreshCommitTimeout
@@ -12058,37 +12060,78 @@ func (m *Manager) commitChatGPTWebRefreshDurably(
 	if maxAttempts <= 0 {
 		maxAttempts = refreshCommitAttempts
 	}
-	var lastErr error
-	for attempt := 1; attempt <= maxAttempts; attempt++ {
-		commitCtx, cancelCommit := context.WithTimeout(context.WithoutCancel(ctx), attemptTimeout)
-		saved, errCommit := commit(commitCtx)
-		cancelCommit()
-		if errCommit == nil {
-			return saved, nil
-		}
-		lastErr = errCommit
-		if errors.Is(errCommit, ErrRefreshPersistenceSuperseded) {
-			return nil, ErrAuthMutationIdentityChanged
-		}
-		if errors.Is(errCommit, ErrAuthMutationIdentityChanged) {
-			return nil, errCommit
-		}
-		if outcome, explicit := SaveOutcomeFromError(errCommit); explicit && outcome == SaveOutcomeRolledBack {
-			failure := newChatGPTWebRefreshCommitFailure(updated)
-			if m.markChatGPTWebRefreshCommitFailure(expected, updated, pendingUntil, failure) {
-				m.logChatGPTWebRefreshCommitFailure(ctx, expected.ID, errCommit)
-				return nil, failure
+	for {
+		currentCoordinator := m.refreshPersistence.Load()
+		if reservation == nil || reservation.coordinator != currentCoordinator {
+			if reservationOwned {
+				reservation.release()
+				reservationOwned = false
 			}
-			return nil, errCommit
+			acquired, errReserve := currentCoordinator.acquireContext(baseCtx, priority, expected.ID)
+			if errReserve != nil {
+				if m.refreshPersistence.Load() != currentCoordinator {
+					reservation = nil
+					continue
+				}
+				var authErr *Error
+				if errors.As(errReserve, &authErr) && authErr != nil && authErr.Code == "refresh_persist_backpressure" {
+					m.markChatGPTWebRefreshBackpressure(expected, pendingUntil, authErr)
+				}
+				return nil, errReserve
+			}
+			reservation = acquired
+			reservationOwned = true
 		}
-		if attempt < maxAttempts && m.refreshCommitRetryObserved != nil {
-			m.refreshCommitRetryObserved(expected.ID, attempt)
+
+		commitBaseCtx := reservation.context(baseCtx)
+		commitBaseCtx = withRefreshPersistenceCoordinatorExpectation(commitBaseCtx, currentCoordinator)
+		if m.refreshPersistence.Load() != currentCoordinator {
+			continue
 		}
+
+		var lastErr error
+		storeChanged := false
+		for attempt := 1; attempt <= maxAttempts; attempt++ {
+			commitCtx, cancelCommit := context.WithTimeout(context.WithoutCancel(commitBaseCtx), attemptTimeout)
+			saved, errCommit := commit(commitCtx)
+			cancelCommit()
+			if errCommit == nil {
+				return saved, nil
+			}
+			if errors.Is(errCommit, errRefreshPersistenceStoreChanged) {
+				storeChanged = true
+				break
+			}
+			lastErr = errCommit
+			if errors.Is(errCommit, ErrRefreshPersistenceSuperseded) {
+				return nil, ErrAuthMutationIdentityChanged
+			}
+			if errors.Is(errCommit, ErrAuthMutationIdentityChanged) {
+				return nil, errCommit
+			}
+			if outcome, explicit := SaveOutcomeFromError(errCommit); explicit && outcome == SaveOutcomeRolledBack {
+				failure := newChatGPTWebRefreshCommitFailure(updated)
+				if m.markChatGPTWebRefreshCommitFailure(expected, updated, pendingUntil, failure) {
+					m.logChatGPTWebRefreshCommitFailure(ctx, expected.ID, errCommit)
+					return nil, failure
+				}
+				return nil, errCommit
+			}
+			if attempt < maxAttempts && m.refreshCommitRetryObserved != nil {
+				m.refreshCommitRetryObserved(expected.ID, attempt)
+			}
+		}
+		if storeChanged {
+			if m.refreshPersistence.Load() == currentCoordinator {
+				return nil, errRefreshPersistenceStoreChanged
+			}
+			continue
+		}
+		failure := newChatGPTWebRefreshCommitFailure(updated)
+		m.markChatGPTWebRefreshCommitFailure(expected, updated, pendingUntil, failure)
+		m.logChatGPTWebRefreshCommitFailure(ctx, expected.ID, lastErr)
+		return nil, failure
 	}
-	failure := newChatGPTWebRefreshCommitFailure(updated)
-	m.markChatGPTWebRefreshCommitFailure(expected, updated, pendingUntil, failure)
-	m.logChatGPTWebRefreshCommitFailure(ctx, expected.ID, lastErr)
-	return nil, failure
 }
 
 func (m *Manager) markChatGPTWebRefreshBackpressure(expected *Auth, pendingUntil time.Time, failure *Error) {

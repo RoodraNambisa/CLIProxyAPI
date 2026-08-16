@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"runtime"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -62,6 +63,128 @@ func TestRefreshPersistenceUsesSeparateLifecycleAdmission(t *testing.T) {
 	})
 	if snapshot := coordinator.snapshot(); snapshot.Concurrency != 4 || snapshot.TransactionConcurrency != 1 {
 		t.Fatalf("refresh persistence metrics = %+v, want lifecycle admission 4 and transaction concurrency 1", snapshot)
+	}
+}
+
+func TestChatGPTWebRefreshCommitReacquiresAdmissionAfterStoreReplacement(t *testing.T) {
+	oldStore := &refreshPersistenceAdmissionTestStore{concurrency: 1, admission: 4}
+	intermediateStore := &refreshPersistenceAdmissionTestStore{concurrency: 1, admission: 1}
+	finalStore := &refreshPersistenceAdmissionTestStore{concurrency: 1, admission: 1}
+	manager := NewManager(oldStore, nil, nil)
+	oldCoordinator := manager.refreshPersistence.Load()
+	oldReservation, errOld := oldCoordinator.acquireContext(
+		t.Context(),
+		RefreshPersistencePrioritySession,
+		"store-replacement",
+	)
+	if errOld != nil {
+		t.Fatal(errOld)
+	}
+	defer oldReservation.release()
+	oldCtx := oldReservation.context(t.Context())
+
+	manager.SetStore(intermediateStore)
+	intermediateCoordinator := manager.refreshPersistence.Load()
+	blocker, errBlocker := intermediateCoordinator.acquireContext(
+		t.Context(),
+		RefreshPersistencePrioritySession,
+		"blocker",
+	)
+	if errBlocker != nil {
+		t.Fatal(errBlocker)
+	}
+	defer blocker.release()
+	persistBarrierRead := make(chan struct{})
+	continuePersistBarrierRead := make(chan struct{})
+	var continuePersistBarrierReadOnce sync.Once
+	releasePersistBarrierRead := func() {
+		continuePersistBarrierReadOnce.Do(func() { close(continuePersistBarrierRead) })
+	}
+	t.Cleanup(releasePersistBarrierRead)
+	var observedPersistBarrierRead atomic.Bool
+	manager.persistBarrierReadObserved = func() {
+		if observedPersistBarrierRead.CompareAndSwap(false, true) {
+			close(persistBarrierRead)
+			<-continuePersistBarrierRead
+		}
+	}
+
+	expected := &Auth{ID: "store-replacement", Provider: "chatgpt-web"}
+	updated := expected.Clone()
+	commitReservation := make(chan *refreshPersistenceReservation, 1)
+	var commitAttempts atomic.Int64
+	commitDone := make(chan error, 1)
+	go func() {
+		_, errCommit := manager.commitChatGPTWebRefreshDurably(
+			oldCtx,
+			expected,
+			updated,
+			time.Time{},
+			func(commitCtx context.Context) (*Auth, error) {
+				commitAttempts.Add(1)
+				unlockPersist, errLock := manager.lockAuthIDMutationContext(commitCtx, expected.ID)
+				if errLock != nil {
+					return nil, errLock
+				}
+				defer unlockPersist()
+				commitReservation <- refreshPersistenceReservationFromContext(commitCtx)
+				return updated.Clone(), nil
+			},
+		)
+		commitDone <- errCommit
+	}()
+
+	deadline := time.Now().Add(time.Second)
+	for intermediateCoordinator.snapshot().Queued != 1 {
+		select {
+		case reservation := <-commitReservation:
+			t.Fatalf("refresh commit bypassed replacement admission with reservation %#v", reservation)
+		default:
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("refresh commit did not queue on replacement coordinator: %#v", intermediateCoordinator.snapshot())
+		}
+		time.Sleep(time.Millisecond)
+	}
+	blocker.release()
+	select {
+	case <-persistBarrierRead:
+	case <-time.After(time.Second):
+		t.Fatal("refresh commit did not reach the persistence barrier")
+	}
+	manager.SetStore(finalStore)
+	finalCoordinator := manager.refreshPersistence.Load()
+	releasePersistBarrierRead()
+	var reservation *refreshPersistenceReservation
+	select {
+	case reservation = <-commitReservation:
+	case <-time.After(time.Second):
+		t.Fatal("refresh commit did not complete after the final store replacement")
+	}
+	if reservation == nil || reservation.coordinator != finalCoordinator {
+		t.Fatalf("refresh commit reservation = %#v, want final replacement coordinator", reservation)
+	}
+	var errCommit error
+	select {
+	case errCommit = <-commitDone:
+	case <-time.After(time.Second):
+		t.Fatal("refresh commit did not return after the final store replacement")
+	}
+	if errCommit != nil {
+		t.Fatalf("refresh commit error: %v", errCommit)
+	}
+	if attempts := commitAttempts.Load(); attempts != 2 {
+		t.Fatalf("refresh commit attempts = %d, want one rejected stale attempt and one final attempt", attempts)
+	}
+	if snapshot := intermediateCoordinator.snapshot(); snapshot.Active != 0 || snapshot.Queued != 0 {
+		t.Fatalf("intermediate coordinator leaked capacity: %#v", snapshot)
+	}
+	if snapshot := finalCoordinator.snapshot(); snapshot.Active != 0 || snapshot.Queued != 0 {
+		t.Fatalf("final coordinator leaked capacity: %#v", snapshot)
+	}
+	oldReservation.release()
+	if errClose := manager.CloseExecutors(); errClose != nil {
+		t.Fatal(errClose)
 	}
 }
 
