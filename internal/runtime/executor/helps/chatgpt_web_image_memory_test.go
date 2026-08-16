@@ -210,6 +210,46 @@ func TestChatGPTWebImageCompletionReserveRestoresTransientCredit(t *testing.T) {
 	}
 }
 
+func TestChatGPTWebImageOrdinaryTransientCannotBlockFinalizationWithBorrowedReserve(t *testing.T) {
+	previous := defaultChatGPTWebImageMemoryAdmission
+	defaultChatGPTWebImageMemoryAdmission = NewChatGPTWebImageMemoryAdmission(4)
+	t.Cleanup(func() { defaultChatGPTWebImageMemoryAdmission = previous })
+
+	ordinary := NewChatGPTWebImageMemoryLeaseSet()
+	finalizing := NewChatGPTWebImageMemoryLeaseSet()
+	t.Cleanup(ordinary.Release)
+	t.Cleanup(finalizing.Release)
+	if !ordinary.TryReserveCompletion(1) || !finalizing.TryReserveCompletion(1) {
+		t.Fatal("failed to reserve completion memory")
+	}
+	ordinaryContext, cancelOrdinary := context.WithTimeout(t.Context(), time.Second)
+	defer cancelOrdinary()
+	if _, err := ordinary.AcquireTransient(ordinaryContext, 4); !errors.Is(err, ErrChatGPTWebImageMemoryQueueFull) {
+		t.Fatalf("ordinary AcquireTransient() error = %v, want queue full", err)
+	}
+	if snapshot := ChatGPTWebImageMemorySnapshot(); snapshot.WaitingTasks != 0 || snapshot.ImmediateRejected != 1 || snapshot.CompletionReservations != 2 {
+		t.Fatalf("ordinary pressure snapshot = %#v", snapshot)
+	}
+
+	releaseTurn, err := finalizing.BeginFinalization(t.Context())
+	if err != nil {
+		t.Fatalf("BeginFinalization() error = %v", err)
+	}
+	defer releaseTurn()
+	releaseTransient, err := finalizing.AcquireTransient(t.Context(), 4)
+	if err != nil {
+		t.Fatalf("finalizing AcquireTransient() error = %v", err)
+	}
+	releaseTransient()
+	releaseTurn()
+	ordinary.Release()
+	finalizing.Release()
+	if snapshot := ChatGPTWebImageMemorySnapshot(); snapshot.WaitingTasks != 0 || snapshot.ProcessingTasks != 0 || snapshot.ProcessingBytes != 0 ||
+		snapshot.CompletionReservations != 0 || snapshot.FinalizationActive != 0 {
+		t.Fatalf("final snapshot = %#v", snapshot)
+	}
+}
+
 func TestChatGPTWebImageInputAdmissionFailsFast(t *testing.T) {
 	previous := defaultChatGPTWebImageMemoryAdmission
 	defaultChatGPTWebImageMemoryAdmission = NewChatGPTWebImageMemoryAdmission(4)

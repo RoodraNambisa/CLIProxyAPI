@@ -248,19 +248,10 @@ func (leases *ChatGPTWebImageMemoryLeaseSet) Acquire(ctx context.Context, estima
 	if err != nil {
 		return err
 	}
-	borrowed, remaining, err := leases.borrowCompletion(weight)
+	borrowed, release, err := leases.acquireLeaseMemory(ctx, weight)
 	if err != nil {
 		leases.cancelRetainedWeight(weight)
 		return err
-	}
-	var release func()
-	if remaining > 0 {
-		release, err = leases.acquireMemory(ctx, remaining)
-		if err != nil {
-			leases.restoreCompletion(borrowed)
-			leases.cancelRetainedWeight(weight)
-			return err
-		}
 	}
 	if err = leases.retain(release, weight); err != nil {
 		leases.restoreCompletion(borrowed)
@@ -474,8 +465,9 @@ func (leases *ChatGPTWebImageMemoryLeaseSet) ReleaseInput() {
 	}
 }
 
-// AcquireTransient borrows the completion allowance and waits for only the
-// excess working set. The returned release restores the borrowed allowance.
+// AcquireTransient borrows completion allowance during finalization. Before
+// finalization it either uses a fully funded allowance or acquires immediately,
+// so ordinary polling cannot hold a partial allowance while blocking finalizers.
 func (leases *ChatGPTWebImageMemoryLeaseSet) AcquireTransient(ctx context.Context, estimatedBytes int64) (func(), error) {
 	if leases == nil {
 		return AcquireChatGPTWebImageMemory(ctx, estimatedBytes)
@@ -484,25 +476,16 @@ func (leases *ChatGPTWebImageMemoryLeaseSet) AcquireTransient(ctx context.Contex
 	if err != nil {
 		return nil, err
 	}
-	borrowed, remaining, err := leases.borrowCompletion(weight)
+	borrowed, releaseMemory, err := leases.acquireLeaseMemory(ctx, weight)
 	if err != nil {
 		leases.releaseTransientWeight(weight)
 		return nil, err
 	}
-	var releaseExcess func()
-	if remaining > 0 {
-		releaseExcess, err = leases.acquireMemory(ctx, remaining)
-		if err != nil {
-			leases.restoreCompletion(borrowed)
-			leases.releaseTransientWeight(weight)
-			return nil, err
-		}
-	}
 	var once sync.Once
 	return func() {
 		once.Do(func() {
-			if releaseExcess != nil {
-				releaseExcess()
+			if releaseMemory != nil {
+				releaseMemory()
 			}
 			leases.restoreCompletion(borrowed)
 			leases.releaseTransientWeight(weight)
@@ -570,17 +553,45 @@ func normalizedChatGPTWebImageLeaseWeight(estimatedBytes int64) (int64, int64) {
 	return weight, capacity
 }
 
-func (leases *ChatGPTWebImageMemoryLeaseSet) acquireMemory(ctx context.Context, estimatedBytes int64) (func(), error) {
-	if leases == nil {
-		return AcquireChatGPTWebImageMemory(ctx, estimatedBytes)
+func (leases *ChatGPTWebImageMemoryLeaseSet) acquireLeaseMemory(ctx context.Context, weight int64) (int64, func(), error) {
+	if ctx == nil {
+		ctx = context.Background()
 	}
 	leases.mu.Lock()
-	critical := leases.finalizationOwned && !leases.released
-	leases.mu.Unlock()
-	if critical {
-		return defaultChatGPTWebImageMemoryAdmission.acquireCritical(ctx, estimatedBytes)
+	if leases.released {
+		leases.mu.Unlock()
+		return 0, nil, context.Canceled
 	}
-	return AcquireChatGPTWebImageMemory(ctx, estimatedBytes)
+	critical := leases.finalizationOwned
+	if !critical && !leases.completionRevoked && leases.completionAvailable >= weight {
+		leases.completionAvailable -= weight
+		leases.mu.Unlock()
+		return weight, nil, nil
+	}
+	leases.mu.Unlock()
+	if !critical {
+		if err := ctx.Err(); err != nil {
+			return 0, nil, err
+		}
+		release, acquired := TryAcquireChatGPTWebImageMemory(weight)
+		if !acquired {
+			return 0, nil, ErrChatGPTWebImageMemoryQueueFull
+		}
+		return 0, release, nil
+	}
+	borrowed, remaining, err := leases.borrowCompletion(weight)
+	if err != nil {
+		return 0, nil, err
+	}
+	if remaining == 0 {
+		return borrowed, nil, nil
+	}
+	release, err := defaultChatGPTWebImageMemoryAdmission.acquireCritical(ctx, remaining)
+	if err != nil {
+		leases.restoreCompletion(borrowed)
+		return 0, nil, err
+	}
+	return borrowed, release, nil
 }
 
 func (leases *ChatGPTWebImageMemoryLeaseSet) borrowCompletion(estimatedBytes int64) (int64, int64, error) {

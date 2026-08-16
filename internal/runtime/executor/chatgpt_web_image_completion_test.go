@@ -28,6 +28,11 @@ func TestChatGPTWebDownloadUsesReservedCompletionMemoryAtCapacity(t *testing.T) 
 		t.Fatal("TryReserveCompletion() = false")
 	}
 	defer leases.Release()
+	releaseTurn, err := leases.BeginFinalization(t.Context())
+	if err != nil {
+		t.Fatalf("BeginFinalization() error = %v", err)
+	}
+	defer releaseTurn()
 	ctx := helps.WithChatGPTWebImageMemoryLeaseSet(t.Context(), leases)
 	source := bytes.Repeat([]byte{0x7f}, 512<<10)
 	type downloadResult struct {
