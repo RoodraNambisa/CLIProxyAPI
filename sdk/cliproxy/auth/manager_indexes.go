@@ -1013,6 +1013,33 @@ func (m *Manager) ChatGPTWebDependentsForSource(source *Auth) ([]*Auth, bool, bo
 	return dependents, false, complete
 }
 
+// ChatGPTWebDependentsBySourceUID resolves linked Web credentials directly
+// from the incremental dependency index when the caller already has the stable
+// Codex credential UID.
+func (m *Manager) ChatGPTWebDependentsBySourceUID(uid string) ([]*Auth, bool) {
+	if m == nil || strings.TrimSpace(uid) == "" {
+		return nil, false
+	}
+	uid = strings.TrimSpace(uid)
+	m.mu.RLock()
+	ids := m.dependencyDependentIDs[uid]
+	ordered := make([]string, 0, len(ids))
+	for id := range ids {
+		ordered = append(ordered, id)
+	}
+	sort.Strings(ordered)
+	dependents := make([]*Auth, 0, len(ordered))
+	for _, id := range ordered {
+		indexed := m.dependencyAuthsByID[id]
+		if indexed != nil && ChatGPTWebLinkedSourceUID(indexed) == uid {
+			dependents = append(dependents, indexed.Clone())
+		}
+	}
+	complete := m.dependencyIndexComplete
+	m.mu.RUnlock()
+	return dependents, complete
+}
+
 // markChatGPTWebDependencyIndexDirtyLocked invalidates the authoritative store
 // view after a persistence outcome becomes uncertain. The caller must hold
 // m.mu for writing.

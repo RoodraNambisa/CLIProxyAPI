@@ -76,6 +76,38 @@ func TestChatGPTWebConversionClassifiesCredentialSnapshotFailure(t *testing.T) {
 	}
 }
 
+func TestChatGPTWebConversionCredentialLookupsUseCompleteIndexes(t *testing.T) {
+	executor := &chatGPTWebManagementTestExecutor{}
+	_, manager, store := newChatGPTWebManagementFailingListTestHandler(t, executor)
+	if errLoad := manager.Load(t.Context()); errLoad != nil {
+		t.Fatal(errLoad)
+	}
+	linked := &coreauth.Auth{
+		ID:       "linked-web.json",
+		FileName: "linked-web.json",
+		Provider: chatgptwebauth.Provider,
+		Metadata: map[string]any{
+			"type":                  chatgptwebauth.Provider,
+			"refresh_strategy":      "codex_source",
+			"source_auth_id":        "source.json",
+			"source_credential_uid": "stable-source-uid",
+		},
+	}
+	if _, errRegister := manager.Register(t.Context(), linked); errRegister != nil {
+		t.Fatal(errRegister)
+	}
+	store.fail.Store(true)
+
+	persisted, errPersisted := persistedChatGPTWebAuthByID(t.Context(), manager, linked.ID)
+	if errPersisted != nil || persisted == nil || persisted.ID != linked.ID {
+		t.Fatalf("persisted lookup = %#v, err=%v", persisted, errPersisted)
+	}
+	dependent, errDependent := findChatGPTWebAuthBySourceUID(t.Context(), manager, "stable-source-uid")
+	if errDependent != nil || dependent == nil || dependent.ID != linked.ID {
+		t.Fatalf("dependent lookup = %#v, err=%v", dependent, errDependent)
+	}
+}
+
 func TestChatGPTWebConversionUsesSourceProxyWithoutCopyingRefreshToken(t *testing.T) {
 	const sourceProxy = "socks5h://user:pass@127.0.0.1:1080"
 	executor := &chatGPTWebManagementTestExecutor{}

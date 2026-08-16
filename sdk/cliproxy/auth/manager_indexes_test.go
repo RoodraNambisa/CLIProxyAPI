@@ -408,11 +408,23 @@ func TestManagerDependencyIndexIncludesPersistedOnlyAuthsAndDirtyState(t *testin
 	if !directComplete || ambiguous || len(directDependents) != 1 || directDependents[0].ID != web.ID {
 		t.Fatalf("direct dependents = %#v, complete = %v, ambiguous = %v", directDependents, directComplete, ambiguous)
 	}
+	uidDependents, uidComplete := manager.ChatGPTWebDependentsBySourceUID("uid-a")
+	if !uidComplete || len(uidDependents) != 1 || uidDependents[0].ID != web.ID {
+		t.Fatalf("UID dependents = %#v, complete = %v", uidDependents, uidComplete)
+	}
+	uidDependents[0].Metadata["access_token"] = "mutated-clone"
+	uidDependents, uidComplete = manager.ChatGPTWebDependentsBySourceUID("uid-a")
+	if !uidComplete || len(uidDependents) != 1 || uidDependents[0].Metadata["access_token"] != "token" {
+		t.Fatalf("UID dependents after clone mutation = %#v, complete = %v", uidDependents, uidComplete)
+	}
 	assertAuthIDsForPath(t, manager, source.Attributes["path"])
 
 	manager.MarkChatGPTWebDependencyIndexDirty()
 	if _, complete = manager.ChatGPTWebDependencyIndexSnapshot(); complete {
 		t.Fatal("dependency index remained complete after being marked dirty")
+	}
+	if _, uidComplete = manager.ChatGPTWebDependentsBySourceUID("uid-a"); uidComplete {
+		t.Fatal("UID dependent lookup remained complete after the index was marked dirty")
 	}
 	if _, errSnapshot := manager.PersistedAuthSnapshot(t.Context()); errSnapshot != nil {
 		t.Fatal(errSnapshot)

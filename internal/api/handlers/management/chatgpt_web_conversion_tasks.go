@@ -473,16 +473,9 @@ func (h *Handler) executeChatGPTWebConversion(ctx context.Context, input chatGPT
 			sourceGeneration != "" && strings.TrimSpace(currentSource.Attributes[coreauth.SourceHashAttributeKey]) != sourceGeneration {
 			return errChatGPTWebConversionSourceChanged
 		}
-		persistedAuths, errPersisted := manager.PersistedAuthSnapshot(lockedCtx)
+		persistedSource, errPersisted := persistedChatGPTWebAuthByID(lockedCtx, manager, source.ID)
 		if errPersisted != nil {
 			return errPersisted
-		}
-		var persistedSource *coreauth.Auth
-		for _, candidate := range persistedAuths {
-			if candidate != nil && candidate.ID == source.ID {
-				persistedSource = candidate
-				break
-			}
 		}
 		persistedIdentitySource := persistedSource
 		if persistedIdentitySource != nil {
@@ -551,20 +544,12 @@ func (h *Handler) executeChatGPTWebConversion(ctx context.Context, input chatGPT
 				"target_auth_id": reservation.AuthID,
 			}).Warn("ChatGPT Web conversion dependency reservation renewal stopped")
 		}
-		persistedAuths, errVerify := manager.PersistedAuthSnapshot(lockedCtx)
+		persistedTarget, errVerify := persistedChatGPTWebAuthByID(lockedCtx, manager, installed.ID)
 		if errVerify != nil {
 			return fmt.Errorf("verify linked Web credential persistence: %w", errVerify)
 		}
-		persistedTarget := false
-		for _, candidate := range persistedAuths {
-			if candidate != nil && candidate.ID == installed.ID &&
-				coreauth.ChatGPTWebLinkedSourceUID(candidate) == sourceUID &&
-				coreauth.ChatGPTWebCredentialUID(candidate) == credential.CredentialUID {
-				persistedTarget = true
-				break
-			}
-		}
-		if !persistedTarget {
+		if persistedTarget == nil || coreauth.ChatGPTWebLinkedSourceUID(persistedTarget) != sourceUID ||
+			coreauth.ChatGPTWebCredentialUID(persistedTarget) != credential.CredentialUID {
 			return coreauth.NewSaveOutcomeError(coreauth.SaveOutcomeUncertain, errors.New("linked Web credential is not visible in the persisted auth snapshot"))
 		}
 		if errFinalize := manager.FinalizeChatGPTWebDependentReservation(lockedCtx, reservedSource.ID, sourceUID, reservation, time.Now()); errFinalize != nil {
@@ -726,9 +711,13 @@ func findChatGPTWebAuthBySourceUID(ctx context.Context, manager *coreauth.Manage
 		return nil, nil
 	}
 	var match *coreauth.Auth
-	auths, errList := manager.CompleteAuthSnapshot(ctx)
-	if errList != nil {
-		return nil, fmt.Errorf("%w: %w", errChatGPTWebCredentialLookup, errList)
+	auths, complete := manager.ChatGPTWebDependentsBySourceUID(sourceUID)
+	if !complete {
+		var errList error
+		auths, errList = manager.CompleteAuthSnapshot(ctx)
+		if errList != nil {
+			return nil, fmt.Errorf("%w: %w", errChatGPTWebCredentialLookup, errList)
+		}
 	}
 	for _, candidate := range auths {
 		if candidate == nil || !strings.EqualFold(strings.TrimSpace(candidate.Provider), chatgptwebauth.Provider) ||
@@ -741,6 +730,21 @@ func findChatGPTWebAuthBySourceUID(ctx context.Context, manager *coreauth.Manage
 		match = candidate
 	}
 	return match, nil
+}
+
+func persistedChatGPTWebAuthByID(ctx context.Context, manager *coreauth.Manager, authID string) (*coreauth.Auth, error) {
+	if manager == nil || strings.TrimSpace(authID) == "" {
+		return nil, nil
+	}
+	auth, complete := manager.PersistedAuthByID(authID)
+	if complete {
+		return auth, nil
+	}
+	if _, errSnapshot := manager.PersistedAuthSnapshot(ctx); errSnapshot != nil {
+		return nil, errSnapshot
+	}
+	auth, _ = manager.PersistedAuthByID(authID)
+	return auth, nil
 }
 
 func codexSourceWebIdentity(source *coreauth.Auth) string {
