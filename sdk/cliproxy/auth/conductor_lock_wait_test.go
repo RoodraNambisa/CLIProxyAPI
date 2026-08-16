@@ -607,17 +607,25 @@ func TestChatGPTWebRefreshPersistenceBackpressureKeepsCredentialRecoverable(t *t
 	}
 	coordinator := manager.refreshPersistence.Load()
 	coordinator.queueLimit = 1
-	releaseActive, errAcquire := coordinator.acquire()
+	activeReservation, errAcquire := coordinator.acquireContext(
+		t.Context(),
+		RefreshPersistencePriorityMaintenance,
+		"active",
+	)
 	if errAcquire != nil {
 		t.Fatal(errAcquire)
 	}
-	waiterRelease := make(chan func(), 1)
+	waiterReservation := make(chan *refreshPersistenceReservation, 1)
 	go func() {
-		release, _ := coordinator.acquire()
-		waiterRelease <- release
+		reservation, _ := coordinator.acquireContext(
+			context.Background(),
+			RefreshPersistencePriorityMaintenance,
+			"waiter",
+		)
+		waiterReservation <- reservation
 	}()
 	deadline := time.Now().Add(time.Second)
-	for coordinator.queued.Load() != 1 {
+	for coordinator.snapshot().Queued != 1 {
 		if time.Now().After(deadline) {
 			t.Fatal("refresh persistence waiter did not queue")
 		}
@@ -653,10 +661,10 @@ func TestChatGPTWebRefreshPersistenceBackpressureKeepsCredentialRecoverable(t *t
 		t.Fatalf("refresh persistence metrics = %#v", snapshot)
 	}
 
-	releaseActive()
+	activeReservation.release()
 	select {
-	case releaseWaiter := <-waiterRelease:
-		releaseWaiter()
+	case reservation := <-waiterReservation:
+		reservation.release()
 	case <-time.After(time.Second):
 		t.Fatal("queued persistence waiter did not acquire after release")
 	}

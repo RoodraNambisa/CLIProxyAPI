@@ -36,6 +36,26 @@ type accountInfoControllerTestExecutor struct {
 	invalidAuthIDCount int
 }
 
+type accountInfoRefreshMetricsStore struct {
+	snapshot coreauth.RefreshPersistenceStoreMetricsSnapshot
+}
+
+func (*accountInfoRefreshMetricsStore) List(context.Context) ([]*coreauth.Auth, error) {
+	return nil, nil
+}
+
+func (*accountInfoRefreshMetricsStore) Save(context.Context, *coreauth.Auth) (string, error) {
+	return "", nil
+}
+
+func (*accountInfoRefreshMetricsStore) Delete(context.Context, string) error { return nil }
+
+func (*accountInfoRefreshMetricsStore) RefreshPersistenceConcurrency() int { return 1 }
+
+func (store *accountInfoRefreshMetricsStore) RefreshPersistenceStoreMetrics() coreauth.RefreshPersistenceStoreMetricsSnapshot {
+	return store.snapshot
+}
+
 func (executor *accountInfoControllerTestExecutor) Identifier() string {
 	return chatgptwebauth.Provider
 }
@@ -153,7 +173,9 @@ func (executor *accountInfoControllerTestExecutor) UpdateConfig(*config.Config) 
 }
 
 func TestGetChatGPTWebAccountInfoReturnsDefaultsAndRuntime(t *testing.T) {
-	manager := coreauth.NewManager(nil, nil, nil)
+	manager := coreauth.NewManager(&accountInfoRefreshMetricsStore{snapshot: coreauth.RefreshPersistenceStoreMetricsSnapshot{
+		Batches: 3, BatchItems: 17, Coalesced: 2, Pushes: 3, PushDurationNanos: 19,
+	}}, nil, nil)
 	executor := &accountInfoControllerTestExecutor{snapshot: chatgptwebauth.AccountInfoRuntimeSnapshot{
 		Busy: 2, Queued: 3, Scheduled: 4, Inflight: 1, RefreshCount: 7,
 	}}
@@ -181,6 +203,13 @@ func TestGetChatGPTWebAccountInfoReturnsDefaultsAndRuntime(t *testing.T) {
 		response.Runtime.MaxAutomaticAttempts != 4 || response.Runtime.FailureCounts == nil ||
 		response.Runtime.RecoveryStateCounts == nil {
 		t.Fatalf("runtime = %+v", response.Runtime)
+	}
+	if !response.RefreshPersistence.Enabled || response.RefreshPersistence.Concurrency != 1 ||
+		response.RefreshPersistence.TransactionConcurrency != 1 ||
+		response.RefreshPersistence.Batches != 3 || response.RefreshPersistence.BatchItems != 17 ||
+		response.RefreshPersistence.Coalesced != 2 || response.RefreshPersistence.Pushes != 3 ||
+		response.RefreshPersistence.PushDurationNanos != 19 {
+		t.Fatalf("refresh persistence = %+v", response.RefreshPersistence)
 	}
 }
 

@@ -35,6 +35,14 @@ import (
 // gcInterval defines minimum time between garbage collection runs.
 const gcInterval = 5 * time.Minute
 
+const (
+	gitRefreshPersistenceAdmissionConcurrency = 32
+	gitRefreshBatchLimit                      = 64
+	gitRefreshBatchWindow                     = 5 * time.Millisecond
+	gitRefreshBatchTransactionTimeout         = 30 * time.Second
+	gitRefreshBatchVerificationTimeout        = 10 * time.Second
+)
+
 // GitTokenStore persists token records and auth metadata using git as the backing storage.
 type GitTokenStore struct {
 	mu              sync.Mutex
@@ -53,6 +61,46 @@ type GitTokenStore struct {
 
 	beforeAuthLocalSnapshot func(string)
 	beforeAuthCommit        func(string)
+
+	refreshBatchMu                  sync.Mutex
+	refreshBatchPending             []*gitRefreshSaveRequest
+	refreshBatchByAuthID            map[string]*gitRefreshSaveRequest
+	refreshBatchRunning             bool
+	refreshBatchActiveAt            time.Time
+	refreshBatchWindow              time.Duration
+	refreshBatchVerificationTimeout time.Duration
+	refreshBatchMetrics             cliproxyauth.RefreshPersistenceStoreMetricsSnapshot
+}
+
+type gitRefreshSaveRequest struct {
+	ctx                context.Context
+	auth               *cliproxyauth.Auth
+	expectedSourceHash string
+	targetIdentity     string
+	info               cliproxyauth.RefreshPersistenceBatchInfo
+	enqueuedAt         time.Time
+	result             chan gitRefreshSaveResult
+	state              gitRefreshSaveState
+}
+
+type gitRefreshSaveState uint8
+
+const (
+	gitRefreshSavePending gitRefreshSaveState = iota
+	gitRefreshSaveActive
+	gitRefreshSaveDone
+)
+
+type gitRefreshSaveResult struct {
+	path string
+	err  error
+}
+
+type gitPushAttemptObserverContextKey struct{}
+
+type gitPushAttemptObserver struct {
+	attempted bool
+	duration  time.Duration
 }
 
 type resolvedRemoteBranch struct {
@@ -162,6 +210,37 @@ func NewGitTokenStore(remote, username, password, branch string) *GitTokenStore 
 // RefreshPersistenceConcurrency reports that auth file mutations are serialized.
 func (*GitTokenStore) RefreshPersistenceConcurrency() int {
 	return 1
+}
+
+// RefreshPersistenceAdmissionConcurrency bounds refresh exchanges separately
+// from the single serialized git transaction worker.
+func (*GitTokenStore) RefreshPersistenceAdmissionConcurrency() int {
+	return gitRefreshPersistenceAdmissionConcurrency
+}
+
+// RefreshPersistenceStoreMetrics reports batching pressure without auth data.
+func (s *GitTokenStore) RefreshPersistenceStoreMetrics() cliproxyauth.RefreshPersistenceStoreMetricsSnapshot {
+	if s == nil {
+		return cliproxyauth.RefreshPersistenceStoreMetricsSnapshot{}
+	}
+	s.refreshBatchMu.Lock()
+	defer s.refreshBatchMu.Unlock()
+	snapshot := s.refreshBatchMetrics
+	now := time.Now()
+	oldest := s.refreshBatchActiveAt
+	for _, request := range s.refreshBatchPending {
+		if request == nil || request.state != gitRefreshSavePending ||
+			s.refreshBatchByAuthID[request.info.AuthID] != request || request.enqueuedAt.IsZero() {
+			continue
+		}
+		if oldest.IsZero() || request.enqueuedAt.Before(oldest) {
+			oldest = request.enqueuedAt
+		}
+	}
+	if !oldest.IsZero() {
+		snapshot.OldestWaitNanos = int64(max(now.Sub(oldest), 0))
+	}
+	return snapshot
 }
 
 // SetBaseDir updates the default directory used for auth JSON persistence when no explicit path is provided.
@@ -516,7 +595,744 @@ func ensureGitLocalAuthLockExclusion(repoDir string) (err error) {
 // Save persists token storage and metadata to the resolved auth file path.
 func (s *GitTokenStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (string, error) {
 	expectedSourceHash, _ := cliproxyauth.SourceHashSavePrecondition(ctx)
+	if info, batched := cliproxyauth.RefreshPersistenceBatchInfoFromContext(ctx); batched && expectedSourceHash != "" {
+		return s.enqueueRefreshSave(ctx, auth, expectedSourceHash, info)
+	}
 	return s.save(ctx, auth, false, expectedSourceHash)
+}
+
+func (s *GitTokenStore) enqueueRefreshSave(
+	ctx context.Context,
+	auth *cliproxyauth.Auth,
+	expectedSourceHash string,
+	info cliproxyauth.RefreshPersistenceBatchInfo,
+) (string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if errContext := ctx.Err(); errContext != nil {
+		return "", errContext
+	}
+	if auth == nil {
+		return "", errors.New("auth filestore: auth is nil")
+	}
+	targetIdentity, errIdentity := s.refreshSaveTargetIdentity(auth, info)
+	if errIdentity != nil {
+		return "", errIdentity
+	}
+	request := &gitRefreshSaveRequest{
+		ctx:                ctx,
+		auth:               auth,
+		expectedSourceHash: strings.TrimSpace(expectedSourceHash),
+		targetIdentity:     targetIdentity,
+		info:               info,
+		enqueuedAt:         time.Now(),
+		result:             make(chan gitRefreshSaveResult, 1),
+		state:              gitRefreshSavePending,
+	}
+	startWorker := false
+	s.refreshBatchMu.Lock()
+	if s.refreshBatchByAuthID == nil {
+		s.refreshBatchByAuthID = make(map[string]*gitRefreshSaveRequest)
+	}
+	if existing := s.refreshBatchByAuthID[info.AuthID]; existing != nil {
+		sameSourceGeneration := existing.expectedSourceHash == request.expectedSourceHash &&
+			existing.targetIdentity == request.targetIdentity
+		if !sameSourceGeneration {
+			request.state = gitRefreshSaveDone
+			request.result <- gitRefreshSaveResult{err: gitRefreshIdentityMismatch(
+				"refresh ticket source generation or target changed while another save is pending",
+			)}
+		} else if existing.info.Generation < info.Generation {
+			s.refreshBatchByAuthID[info.AuthID] = request
+			s.refreshBatchPending = append(s.refreshBatchPending, request)
+			s.refreshBatchMetrics.Coalesced++
+			existing.state = gitRefreshSaveDone
+			existing.result <- gitRefreshSaveResult{err: cliproxyauth.NewSaveOutcomeError(
+				cliproxyauth.SaveOutcomeRolledBack,
+				cliproxyauth.ErrRefreshPersistenceSuperseded,
+			)}
+		} else {
+			s.refreshBatchMetrics.Coalesced++
+			request.state = gitRefreshSaveDone
+			request.result <- gitRefreshSaveResult{err: cliproxyauth.NewSaveOutcomeError(
+				cliproxyauth.SaveOutcomeRolledBack,
+				cliproxyauth.ErrRefreshPersistenceSuperseded,
+			)}
+		}
+	} else {
+		s.refreshBatchByAuthID[info.AuthID] = request
+		s.refreshBatchPending = append(s.refreshBatchPending, request)
+	}
+	if !s.refreshBatchRunning {
+		s.refreshBatchRunning = true
+		startWorker = true
+	}
+	s.refreshBatchMu.Unlock()
+	if startWorker {
+		go s.runRefreshSaveBatches()
+	}
+	select {
+	case result := <-request.result:
+		return result.path, result.err
+	case <-ctx.Done():
+		s.refreshBatchMu.Lock()
+		if request.state == gitRefreshSavePending && s.refreshBatchByAuthID[info.AuthID] == request {
+			delete(s.refreshBatchByAuthID, info.AuthID)
+			request.state = gitRefreshSaveDone
+			s.refreshBatchMu.Unlock()
+			return "", ctx.Err()
+		}
+		s.refreshBatchMu.Unlock()
+		// Once a transaction has claimed the item, wait for a durable outcome;
+		// returning only the caller deadline would make an eventual push ambiguous.
+		result := <-request.result
+		return result.path, result.err
+	}
+}
+
+func (s *GitTokenStore) refreshSaveTargetIdentity(auth *cliproxyauth.Auth, info cliproxyauth.RefreshPersistenceBatchInfo) (string, error) {
+	if auth == nil || strings.TrimSpace(auth.ID) == "" || strings.TrimSpace(auth.ID) != strings.TrimSpace(info.AuthID) {
+		return "", gitRefreshIdentityMismatch("refresh ticket auth identity does not match the credential")
+	}
+	baseDir := s.baseDirSnapshot()
+	if strings.TrimSpace(baseDir) == "" {
+		return "", gitRefreshIdentityMismatch("refresh ticket store directory is not configured")
+	}
+	path, errPath := s.resolveAuthPath(auth)
+	if errPath != nil {
+		return "", gitRefreshIdentityMismatch("refresh ticket target could not be resolved")
+	}
+	targetIdentity, errTarget := authFileNameAtBaseDir(baseDir, path)
+	if errTarget != nil {
+		return "", gitRefreshIdentityMismatch("refresh ticket target is outside the auth directory")
+	}
+	authIdentity, errAuthID := authFileNameAtBaseDir(baseDir, info.AuthID)
+	if errAuthID != nil || filepath.Clean(targetIdentity) != filepath.Clean(authIdentity) {
+		return "", gitRefreshIdentityMismatch("refresh ticket auth identity does not match the target file")
+	}
+	return filepath.Clean(targetIdentity), nil
+}
+
+func gitRefreshIdentityMismatch(message string) error {
+	return cliproxyauth.NewSaveOutcomeError(
+		cliproxyauth.SaveOutcomeRolledBack,
+		fmt.Errorf("%w: %s", cliproxyauth.ErrAuthMutationIdentityChanged, message),
+	)
+}
+
+func (s *GitTokenStore) runRefreshSaveBatches() {
+	window := s.refreshBatchWindow
+	if window <= 0 {
+		window = gitRefreshBatchWindow
+	}
+	timer := time.NewTimer(window)
+	defer timer.Stop()
+	<-timer.C
+	for {
+		batch := s.takeRefreshSaveBatch()
+		if len(batch) == 0 {
+			return
+		}
+		results := s.saveRefreshBatch(batch)
+		for index, request := range batch {
+			result := gitRefreshSaveResult{err: errors.New("git token store: missing refresh batch result")}
+			if index < len(results) {
+				result = results[index]
+			}
+			s.refreshBatchMu.Lock()
+			request.state = gitRefreshSaveDone
+			s.refreshBatchMu.Unlock()
+			request.result <- result
+		}
+		s.refreshBatchMu.Lock()
+		s.refreshBatchActiveAt = time.Time{}
+		empty := len(s.refreshBatchByAuthID) == 0
+		if empty {
+			s.refreshBatchRunning = false
+		}
+		s.refreshBatchMu.Unlock()
+		if empty {
+			return
+		}
+	}
+}
+
+func (s *GitTokenStore) takeRefreshSaveBatch() []*gitRefreshSaveRequest {
+	s.refreshBatchMu.Lock()
+	defer s.refreshBatchMu.Unlock()
+	if len(s.refreshBatchPending) == 0 {
+		s.refreshBatchRunning = false
+		return nil
+	}
+	sort.SliceStable(s.refreshBatchPending, func(first, second int) bool {
+		left := s.refreshBatchPending[first]
+		right := s.refreshBatchPending[second]
+		if left == nil || right == nil {
+			return right == nil
+		}
+		if left.info.Priority != right.info.Priority {
+			return left.info.Priority > right.info.Priority
+		}
+		return left.enqueuedAt.Before(right.enqueuedAt)
+	})
+	batch := make([]*gitRefreshSaveRequest, 0, min(gitRefreshBatchLimit, len(s.refreshBatchPending)))
+	remaining := make([]*gitRefreshSaveRequest, 0, len(s.refreshBatchPending))
+	for _, request := range s.refreshBatchPending {
+		if request == nil || s.refreshBatchByAuthID[request.info.AuthID] != request {
+			continue
+		}
+		if len(batch) >= gitRefreshBatchLimit {
+			remaining = append(remaining, request)
+			continue
+		}
+		delete(s.refreshBatchByAuthID, request.info.AuthID)
+		request.state = gitRefreshSaveActive
+		batch = append(batch, request)
+	}
+	s.refreshBatchPending = remaining
+	if len(batch) == 0 && len(s.refreshBatchByAuthID) == 0 {
+		s.refreshBatchRunning = false
+	}
+	if len(batch) > 0 {
+		s.refreshBatchActiveAt = batch[0].enqueuedAt
+		for _, request := range batch[1:] {
+			if request.enqueuedAt.Before(s.refreshBatchActiveAt) {
+				s.refreshBatchActiveAt = request.enqueuedAt
+			}
+		}
+		s.refreshBatchMetrics.Batches++
+		s.refreshBatchMetrics.BatchItems += uint64(len(batch))
+	}
+	return batch
+}
+
+type gitRefreshBatchCandidate struct {
+	requestIndex int
+	request      *gitRefreshSaveRequest
+	path         string
+	rel          string
+	target       string
+	local        authFileSnapshot
+	runtime      authRuntimeSnapshot
+	data         []byte
+	remoteData   []byte
+	remoteExists bool
+}
+
+type gitRefreshCandidatePushOutcome uint8
+
+const (
+	gitRefreshPushUnknown gitRefreshCandidatePushOutcome = iota
+	gitRefreshPushCommitted
+	gitRefreshPushSuperseded
+)
+
+func (s *GitTokenStore) saveRefreshBatch(requests []*gitRefreshSaveRequest) []gitRefreshSaveResult {
+	results := make([]gitRefreshSaveResult, len(requests))
+	completed := make([]bool, len(requests))
+	complete := func(index int, path string, err error) {
+		if index < 0 || index >= len(results) || completed[index] {
+			return
+		}
+		results[index] = gitRefreshSaveResult{path: path, err: err}
+		completed[index] = true
+	}
+	completeRemaining := func(err error) {
+		for index := range results {
+			complete(index, "", err)
+		}
+	}
+	if len(requests) == 0 {
+		return results
+	}
+
+	s.bindingMu.RLock()
+	defer s.bindingMu.RUnlock()
+	baseDir := s.baseDirSnapshot()
+	repoDir := s.repoDirSnapshot()
+	candidates := make([]*gitRefreshBatchCandidate, 0, len(requests))
+	byRelativePath := make(map[string]*gitRefreshBatchCandidate, len(requests))
+	for index, request := range requests {
+		if request == nil || request.auth == nil {
+			complete(index, "", cliproxyauth.NewSaveOutcomeError(
+				cliproxyauth.SaveOutcomeRolledBack,
+				errors.New("auth filestore: auth is nil"),
+			))
+			continue
+		}
+		if errContext := request.ctx.Err(); errContext != nil {
+			complete(index, "", errContext)
+			continue
+		}
+		if cliproxyauth.IsRetiredGeminiCLIAuth(request.auth) {
+			complete(index, "", cliproxyauth.NewSaveOutcomeError(
+				cliproxyauth.SaveOutcomeRolledBack,
+				cliproxyauth.ErrRetiredGeminiCLIAuthReadOnly,
+			))
+			continue
+		}
+		path, errPath := s.resolveAuthPath(request.auth)
+		if errPath != nil {
+			complete(index, "", cliproxyauth.NewSaveOutcomeError(cliproxyauth.SaveOutcomeRolledBack, errPath))
+			continue
+		}
+		rel, errRel := s.relativeToRepo(path)
+		if errRel != nil {
+			complete(index, "", cliproxyauth.NewSaveOutcomeError(cliproxyauth.SaveOutcomeRolledBack, errRel))
+			continue
+		}
+		if _, errTarget := authFileNameAtBaseDir(baseDir, path); errTarget != nil {
+			complete(index, "", cliproxyauth.NewSaveOutcomeError(
+				cliproxyauth.SaveOutcomeRolledBack,
+				fmt.Errorf("%w: %v", errUnsafeGitAuthPath, errTarget),
+			))
+			continue
+		}
+		targetIdentity, errTargetIdentity := authFileNameAtBaseDir(baseDir, path)
+		if errTargetIdentity != nil || filepath.Clean(targetIdentity) != request.targetIdentity {
+			complete(index, "", gitRefreshIdentityMismatch("refresh ticket target changed before the batch transaction"))
+			continue
+		}
+		candidate := &gitRefreshBatchCandidate{
+			requestIndex: index,
+			request:      request,
+			path:         path,
+			rel:          rel,
+			target:       filepath.FromSlash(rel),
+		}
+		if existing := byRelativePath[rel]; existing != nil {
+			complete(index, "", gitRefreshIdentityMismatch(
+				"multiple refresh identities resolved to the same target file",
+			))
+			continue
+		}
+		byRelativePath[rel] = candidate
+		candidates = append(candidates, candidate)
+	}
+	if len(candidates) == 0 {
+		return results
+	}
+
+	batchCtx, cancelBatch := gitRefreshBatchContext(candidates)
+	defer cancelBatch()
+	pushObserver := &gitPushAttemptObserver{}
+	batchCtx = context.WithValue(batchCtx, gitPushAttemptObserverContextKey{}, pushObserver)
+	if errEnsure := s.ensureRepositoryLockedWithRemoteSync(batchCtx, false); errEnsure != nil {
+		completeRemaining(errEnsure)
+		return results
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if errContext := batchCtx.Err(); errContext != nil {
+		completeRemaining(errContext)
+		return results
+	}
+	unlockRepository, errRepositoryLock := lockGitRepository(repoDir)
+	if errRepositoryLock != nil {
+		completeRemaining(errRepositoryLock)
+		return results
+	}
+	defer func() {
+		if errUnlock := unlockRepository(); errUnlock != nil {
+			log.WithError(errUnlock).Error("git token store: unlock repository after refresh batch")
+		}
+	}()
+	if errValidate := validateGitAuthDirectoryTree(repoDir, baseDir, false); errValidate != nil {
+		completeRemaining(errValidate)
+		return results
+	}
+	root, errRoot := os.OpenRoot(repoDir)
+	if errRoot != nil {
+		completeRemaining(fmt.Errorf("git token store: open repository root for refresh batch: %w", errRoot))
+		return results
+	}
+	defer func() {
+		if errClose := root.Close(); errClose != nil {
+			log.WithError(errClose).Error("git token store: close repository root after refresh batch")
+		}
+	}()
+	authRoot, errAuthRoot := os.OpenRoot(baseDir)
+	if errAuthRoot != nil {
+		completeRemaining(fmt.Errorf("git token store: open auth root for refresh batch: %w", errAuthRoot))
+		return results
+	}
+	defer func() {
+		if errClose := authRoot.Close(); errClose != nil {
+			log.WithError(errClose).Error("git token store: close auth root after refresh batch")
+		}
+	}()
+	unlockRootMutation, errMutationLock := authfileguard.LockRootMutationContext(batchCtx, authRoot)
+	if errMutationLock != nil {
+		completeRemaining(fmt.Errorf("git token store: lock auth root for refresh batch: %w", errMutationLock))
+		return results
+	}
+	defer func() {
+		if errUnlock := unlockRootMutation(); errUnlock != nil {
+			log.WithError(errUnlock).Error("git token store: unlock auth root after refresh batch")
+		}
+	}()
+	relativePaths := make([]string, 0, len(candidates))
+	for _, candidate := range candidates {
+		relativePaths = append(relativePaths, candidate.rel)
+	}
+	pathLockTargets, persistentLockTargets, errLockTargets := gitAuthPersistenceLockTargets(root, repoDir, relativePaths)
+	if errLockTargets != nil {
+		completeRemaining(errLockTargets)
+		return results
+	}
+	pathUnlocks := make([]func(), 0, len(pathLockTargets))
+	targetUnlocks := make([]func() error, 0, len(persistentLockTargets))
+	defer func() {
+		for index := len(targetUnlocks) - 1; index >= 0; index-- {
+			if errUnlock := targetUnlocks[index](); errUnlock != nil {
+				log.WithError(errUnlock).Error("git token store: unlock refresh batch target")
+			}
+		}
+		for index := len(pathUnlocks) - 1; index >= 0; index-- {
+			pathUnlocks[index]()
+		}
+	}()
+	for _, path := range pathLockTargets {
+		unlockPath, errPathLock := authfileguard.LockContext(batchCtx, path)
+		if errPathLock != nil {
+			completeRemaining(fmt.Errorf("git token store: lock refresh batch auth path: %w", errPathLock))
+			return results
+		}
+		pathUnlocks = append(pathUnlocks, unlockPath)
+	}
+	for _, target := range persistentLockTargets {
+		if errMkdir := mkdirAuthDirectoriesAtRoot(root, filepath.Dir(target), 0o700); errMkdir != nil {
+			completeRemaining(fmt.Errorf("git token store: create refresh batch target parent: %w", errMkdir))
+			return results
+		}
+		unlockTarget, errTargetLock := authfileguard.LockRootTargetContext(batchCtx, root, target)
+		if errTargetLock != nil {
+			completeRemaining(fmt.Errorf("git token store: lock refresh batch target: %w", errTargetLock))
+			return results
+		}
+		targetUnlocks = append(targetUnlocks, unlockTarget)
+	}
+
+	remoteState, errRemote := s.remoteBranchPreconditionLocked(batchCtx)
+	if errRemote != nil {
+		completeRemaining(errRemote)
+		return results
+	}
+	localHead, errLocalHead := captureGitLocalHead(repoDir)
+	if errLocalHead != nil {
+		completeRemaining(errLocalHead)
+		return results
+	}
+	eligible := make([]*gitRefreshBatchCandidate, 0, len(candidates))
+	snapshots := make(map[string]authFileSnapshot, len(candidates))
+	commitPaths := make([]string, 0, len(candidates))
+	for _, candidate := range candidates {
+		request := candidate.request
+		if errContext := request.ctx.Err(); errContext != nil {
+			complete(candidate.requestIndex, "", errContext)
+			continue
+		}
+		if authfileguard.IsRetired(candidate.path) {
+			complete(candidate.requestIndex, "", gitRefreshRolledBack(cliproxyauth.ErrRetiredGeminiCLIAuthReadOnly))
+			continue
+		}
+		if authfileguard.IsQuarantined(candidate.path) {
+			complete(candidate.requestIndex, "", gitRefreshRolledBack(authfileguard.ErrDeleteGenerationUncertain))
+			continue
+		}
+		if s.beforeAuthLocalSnapshot != nil {
+			s.beforeAuthLocalSnapshot(candidate.path)
+		}
+		localSnapshot, errSnapshot := captureAuthFileSnapshotAtPath(candidate.path)
+		if errSnapshot != nil {
+			complete(candidate.requestIndex, "", gitRefreshRolledBack(errSnapshot))
+			continue
+		}
+		if errRetired := localSnapshot.rejectRetiredGeminiCLIAuthPersistence(); errRetired != nil {
+			authfileguard.MarkRetired(candidate.path)
+			complete(candidate.requestIndex, "", gitRefreshRolledBack(errRetired))
+			continue
+		}
+		if !localSnapshot.exists || !cliproxyauth.SourceHashMatchesBytes(request.expectedSourceHash, localSnapshot.data) {
+			complete(candidate.requestIndex, "", gitRefreshRolledBack(authfileguard.ErrPersistGenerationStale))
+			continue
+		}
+		remoteBlob, errBlob := readGitRemoteAuthBlob(repoDir, remoteState, candidate.rel)
+		if errBlob != nil {
+			complete(candidate.requestIndex, "", gitRefreshRolledBack(errBlob))
+			continue
+		}
+		if !remoteBlob.exists || !cliproxyauth.SourceHashMatchesBytes(request.expectedSourceHash, remoteBlob.data) {
+			complete(candidate.requestIndex, "", gitRefreshRolledBack(authfileguard.ErrPersistGenerationStale))
+			continue
+		}
+		if errRetired := cliproxyauth.RejectRetiredGeminiCLIAuthFileMutation(remoteBlob.data); errRetired != nil {
+			authfileguard.MarkRetired(candidate.path)
+			complete(candidate.requestIndex, "", gitRefreshRolledBack(errRetired))
+			continue
+		}
+		candidate.local = localSnapshot
+		candidate.runtime = captureAuthRuntimeSnapshot(request.auth)
+		data, errData := gitRefreshAuthData(request.auth, candidate.runtime)
+		if errData != nil {
+			complete(candidate.requestIndex, "", gitRefreshRolledBack(errData))
+			continue
+		}
+		candidate.data = data
+		if request.auth.Attributes == nil {
+			request.auth.Attributes = make(map[string]string)
+		}
+		request.auth.Attributes["path"] = candidate.path
+		if strings.TrimSpace(request.auth.FileName) == "" {
+			request.auth.FileName = request.auth.ID
+		}
+		if request.auth.Storage != nil {
+			if errSync := cliproxyauth.SyncPersistedMetadataAndSourceHash(request.auth, data); errSync != nil {
+				candidate.runtime.restore(request.auth)
+				complete(candidate.requestIndex, "", gitRefreshRolledBack(fmt.Errorf("auth filestore: sync refreshed storage auth: %w", errSync)))
+				continue
+			}
+		} else {
+			cliproxyauth.SetSourceHashAttribute(request.auth, data)
+		}
+		snapshots[candidate.rel] = authFileSnapshot{data: append([]byte(nil), data...), mode: 0o600, exists: true}
+		commitPaths = append(commitPaths, candidate.rel)
+		eligible = append(eligible, candidate)
+	}
+	if len(eligible) == 0 {
+		return results
+	}
+	for _, candidate := range eligible {
+		if s.beforeAuthCommit != nil {
+			s.beforeAuthCommit(candidate.path)
+		}
+	}
+	errCommit := s.commitAndPushAgainstRemoteWithSnapshotsLocked(
+		batchCtx,
+		fmt.Sprintf("Refresh %d auth credentials", len(eligible)),
+		remoteState,
+		snapshots,
+		commitPaths...,
+	)
+	s.recordRefreshBatchPush(pushObserver.duration, pushObserver.attempted)
+	pushOutcomes := make(map[*gitRefreshBatchCandidate]gitRefreshCandidatePushOutcome, len(eligible))
+	if errCommit == nil {
+		for _, candidate := range eligible {
+			pushOutcomes[candidate] = gitRefreshPushCommitted
+		}
+	}
+	remoteOutcomeKnown := errCommit == nil
+	var errProbe error
+	if errCommit != nil {
+		verificationTimeout := s.refreshBatchVerificationTimeout
+		if verificationTimeout <= 0 {
+			verificationTimeout = gitRefreshBatchVerificationTimeout
+		}
+		verificationCtx, cancelVerification := context.WithTimeout(
+			context.WithoutCancel(batchCtx),
+			verificationTimeout,
+		)
+		pushOutcomes, remoteOutcomeKnown, errProbe = s.refreshBatchPushOutcomes(
+			verificationCtx,
+			errCommit,
+			eligible,
+		)
+		cancelVerification()
+	}
+	resolved := false
+	for _, outcome := range pushOutcomes {
+		if outcome != gitRefreshPushUnknown {
+			resolved = true
+			break
+		}
+	}
+	if !resolved {
+		errReset := s.resetGitWorkspaceAfterFailedSaveLocked(remoteState, localHead, commitPaths...)
+		outcome := cliproxyauth.SaveOutcomeUncertain
+		if remoteOutcomeKnown && errProbe == nil && errReset == nil {
+			outcome = cliproxyauth.SaveOutcomeRolledBack
+		}
+		batchErr := cliproxyauth.NewSaveOutcomeError(outcome, errors.Join(
+			errCommit,
+			wrapOptionalError("git token store: verify refresh batch after push failure", errProbe),
+			wrapOptionalError("git token store: reset refresh batch after push failure", errReset),
+		))
+		for _, candidate := range eligible {
+			candidate.runtime.restore(candidate.request.auth)
+			complete(candidate.requestIndex, "", batchErr)
+		}
+		return results
+	}
+
+	for _, candidate := range eligible {
+		switch pushOutcomes[candidate] {
+		case gitRefreshPushSuperseded:
+			candidate.runtime.restore(candidate.request.auth)
+			var errMirror error
+			if candidate.remoteExists {
+				_, errMirror = writeAuthFileAtomicallyAtRootWithReceiptTransactionTargetLockedContext(
+					authRollbackContext(batchCtx),
+					root,
+					candidate.target,
+					candidate.remoteData,
+					&candidate.local,
+				)
+			} else {
+				errMirror = removeAuthFileAtRootTransactionTargetLockedContext(
+					authRollbackContext(batchCtx),
+					root,
+					candidate.target,
+				)
+			}
+			if errMirror != nil {
+				complete(candidate.requestIndex, "", cliproxyauth.NewSaveOutcomeError(
+					cliproxyauth.SaveOutcomeUncertain,
+					fmt.Errorf("git token store: superseded refresh local mirror could not be reconciled: %w", errMirror),
+				))
+				continue
+			}
+			complete(candidate.requestIndex, "", gitRefreshRolledBack(cliproxyauth.ErrRefreshPersistenceSuperseded))
+			continue
+		case gitRefreshPushUnknown:
+			candidate.runtime.restore(candidate.request.auth)
+			complete(candidate.requestIndex, "", cliproxyauth.NewSaveOutcomeError(
+				cliproxyauth.SaveOutcomeUncertain,
+				errors.Join(
+					errCommit,
+					wrapOptionalError("git token store: verify refresh item after push failure", errProbe),
+				),
+			))
+			continue
+		}
+		_, errWrite := writeAuthFileAtomicallyAtRootWithReceiptTransactionTargetLockedContext(
+			authRollbackContext(batchCtx),
+			root,
+			candidate.target,
+			candidate.data,
+			&candidate.local,
+		)
+		if errWrite != nil {
+			complete(candidate.requestIndex, candidate.path, cliproxyauth.NewSaveOutcomeError(
+				cliproxyauth.SaveOutcomeCommitted,
+				fmt.Errorf("git token store: refresh batch committed but local mirror update failed: %w", errWrite),
+			))
+			continue
+		}
+		complete(candidate.requestIndex, candidate.path, nil)
+	}
+	return results
+}
+
+func gitRefreshBatchContext(candidates []*gitRefreshBatchCandidate) (context.Context, context.CancelFunc) {
+	maximum := time.Now().Add(gitRefreshBatchTransactionTimeout)
+	var latest time.Time
+	for _, candidate := range candidates {
+		if candidate == nil || candidate.request == nil || candidate.request.ctx == nil {
+			latest = maximum
+			break
+		}
+		deadline, hasDeadline := candidate.request.ctx.Deadline()
+		if !hasDeadline {
+			latest = maximum
+			break
+		}
+		if hasDeadline && deadline.After(latest) {
+			latest = deadline
+		}
+	}
+	if latest.IsZero() || latest.After(maximum) {
+		latest = maximum
+	}
+	return context.WithDeadline(context.Background(), latest)
+}
+
+func gitRefreshAuthData(auth *cliproxyauth.Auth, runtime authRuntimeSnapshot) ([]byte, error) {
+	if auth == nil {
+		return nil, errors.New("auth filestore: auth is nil")
+	}
+	if auth.Storage != nil {
+		data, errData := prepareAuthStorageData(auth, runtime)
+		if errData != nil {
+			return nil, fmt.Errorf("auth filestore: produce refreshed storage auth: %w", errData)
+		}
+		return data, nil
+	}
+	if auth.Metadata == nil {
+		return nil, fmt.Errorf("auth filestore: nothing to persist for %s", auth.ID)
+	}
+	raw, errMarshal := cliproxyauth.CanonicalMetadataBytes(auth)
+	if errMarshal != nil {
+		return nil, fmt.Errorf("auth filestore: canonicalize refreshed metadata: %w", errMarshal)
+	}
+	return raw, nil
+}
+
+func gitRefreshRolledBack(err error) error {
+	if err == nil {
+		return nil
+	}
+	if _, explicit := cliproxyauth.SaveOutcomeFromError(err); explicit {
+		return err
+	}
+	return cliproxyauth.NewSaveOutcomeError(cliproxyauth.SaveOutcomeRolledBack, err)
+}
+
+func (s *GitTokenStore) recordRefreshBatchPush(duration time.Duration, attempted bool) {
+	s.refreshBatchMu.Lock()
+	defer s.refreshBatchMu.Unlock()
+	if !attempted {
+		return
+	}
+	s.refreshBatchMetrics.Pushes++
+	s.refreshBatchMetrics.PushDurationNanos += uint64(max(duration, 0))
+}
+
+func (s *GitTokenStore) refreshBatchPushOutcomes(
+	ctx context.Context,
+	errCommit error,
+	candidates []*gitRefreshBatchCandidate,
+) (outcomes map[*gitRefreshBatchCandidate]gitRefreshCandidatePushOutcome, remoteOutcomeKnown bool, errProbe error) {
+	outcomes = make(map[*gitRefreshBatchCandidate]gitRefreshCandidatePushOutcome, len(candidates))
+	pushAttempt, pushAttempted := gitPushAttemptFromError(errCommit)
+	if !pushAttempted {
+		return outcomes, true, nil
+	}
+	latestState, errLatest := s.remoteBranchPreconditionLocked(ctx)
+	if errLatest != nil {
+		return outcomes, false, errLatest
+	}
+	if latestState.exists && latestState.branch == pushAttempt.branch && latestState.hash == pushAttempt.hash {
+		for _, candidate := range candidates {
+			outcomes[candidate] = gitRefreshPushCommitted
+		}
+		return outcomes, true, nil
+	}
+	remoteOutcomeKnown = pushAttempt.rejected
+	if latestState.branch != pushAttempt.branch {
+		return outcomes, remoteOutcomeKnown, nil
+	}
+	// GitTokenStore intentionally squashes each published tree into a parentless
+	// commit, so ancestry cannot prove whether a lost acknowledgement reached
+	// the remote. The latest blob itself is the durable per-item authority.
+	remoteOutcomeKnown = true
+	var probeErrors []error
+	for _, candidate := range candidates {
+		blob, errBlob := readGitRemoteAuthBlob(s.repoDirSnapshot(), latestState, candidate.rel)
+		if errBlob != nil {
+			probeErrors = append(probeErrors, fmt.Errorf("inspect %s: %w", candidate.rel, errBlob))
+			continue
+		}
+		if blob.exists && jsonEqual(blob.data, candidate.data) {
+			outcomes[candidate] = gitRefreshPushCommitted
+		} else {
+			candidate.remoteExists = blob.exists
+			candidate.remoteData = append([]byte(nil), blob.data...)
+			outcomes[candidate] = gitRefreshPushSuperseded
+		}
+	}
+	return outcomes, remoteOutcomeKnown, errors.Join(probeErrors...)
 }
 
 // SaveIfAbsent persists auth only when neither the remote branch nor local mirror contains it.
@@ -2450,7 +3266,6 @@ func (s *GitTokenStore) commitAndPushAgainstRemoteWithSnapshotsLocked(ctx contex
 	if pushHead.Name() != remoteState.branch {
 		return fmt.Errorf("git token store: candidate branch %s does not match target branch %s", pushHead.Name(), remoteState.branch)
 	}
-	s.maybeRunGC(repo)
 	pushOpts := &git.PushOptions{
 		Auth:     s.gitAuth(),
 		RefSpecs: []config.RefSpec{config.RefSpec(remoteState.branch.String() + ":" + remoteState.branch.String())},
@@ -2461,19 +3276,34 @@ func (s *GitTokenStore) commitAndPushAgainstRemoteWithSnapshotsLocked(ctx contex
 			Hash:    remoteState.hash,
 		}
 	}
+	observer, _ := ctx.Value(gitPushAttemptObserverContextKey{}).(*gitPushAttemptObserver)
+	var pushStarted time.Time
+	observePushStart := func() {
+		pushStarted = time.Now()
+		if observer != nil {
+			observer.attempted = true
+		}
+	}
 	switch {
 	case s.pushRepoContext != nil:
+		observePushStart()
 		err = s.pushRepoContext(ctx, repo, pushOpts)
 	case s.pushRepo != nil:
 		if errContext := ctx.Err(); errContext != nil {
 			return errContext
 		}
+		observePushStart()
 		err = s.pushRepo(repo, pushOpts)
 	default:
+		observePushStart()
 		err = repo.PushContext(ctx, pushOpts)
+	}
+	if observer != nil && !pushStarted.IsZero() {
+		observer.duration += time.Since(pushStarted)
 	}
 	if err != nil {
 		if errors.Is(err, git.NoErrAlreadyUpToDate) {
+			s.maybeRunGC(repo)
 			return nil
 		}
 		return &gitPushAttemptError{
@@ -2483,6 +3313,7 @@ func (s *GitTokenStore) commitAndPushAgainstRemoteWithSnapshotsLocked(ctx contex
 			err:      fmt.Errorf("git token store: push: %w", err),
 		}
 	}
+	s.maybeRunGC(repo)
 	return nil
 }
 

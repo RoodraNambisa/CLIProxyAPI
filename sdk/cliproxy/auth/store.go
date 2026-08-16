@@ -6,6 +6,10 @@ import (
 	"strings"
 )
 
+// ErrRefreshPersistenceSuperseded reports that a newer legal generation for
+// the same credential replaced a queued refresh before durable commit.
+var ErrRefreshPersistenceSuperseded = errors.New("refresh persistence generation superseded")
+
 // DeleteOutcome describes the durable result of a delete operation that
 // returned an error after touching an external store.
 type DeleteOutcome uint8
@@ -117,6 +121,69 @@ type Store interface {
 // not use the refresh persistence coordinator.
 type RefreshPersistenceConcurrencyStore interface {
 	RefreshPersistenceConcurrency() int
+}
+
+// RefreshPersistenceAdmissionStore separates bounded refresh lifecycle work
+// from the number of backing-store transactions. A batch-capable store can
+// admit several token exchanges while still serializing one durable push.
+type RefreshPersistenceAdmissionStore interface {
+	RefreshPersistenceAdmissionConcurrency() int
+}
+
+// RefreshPersistencePriority orders durable credential recovery ahead of
+// maintenance refreshes when the backing store is saturated.
+type RefreshPersistencePriority uint8
+
+const (
+	RefreshPersistencePriorityMaintenance RefreshPersistencePriority = iota
+	RefreshPersistencePriorityImport
+	RefreshPersistencePrioritySession
+)
+
+// RefreshPersistenceBatchInfo identifies one refresh mutation to stores that
+// can safely combine multiple source-conditional saves into one transaction.
+type RefreshPersistenceBatchInfo struct {
+	AuthID     string
+	Generation uint64
+	Priority   RefreshPersistencePriority
+}
+
+type refreshPersistenceBatchContextKey struct{}
+
+// WithRefreshPersistenceBatchInfo marks a Save as a refresh-only mutation.
+// Ordinary Save, Delete, and watcher persistence calls remain unchanged.
+func WithRefreshPersistenceBatchInfo(ctx context.Context, info RefreshPersistenceBatchInfo) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	info.AuthID = strings.TrimSpace(info.AuthID)
+	return context.WithValue(ctx, refreshPersistenceBatchContextKey{}, info)
+}
+
+// RefreshPersistenceBatchInfoFromContext returns refresh batching metadata.
+func RefreshPersistenceBatchInfoFromContext(ctx context.Context) (RefreshPersistenceBatchInfo, bool) {
+	if ctx == nil {
+		return RefreshPersistenceBatchInfo{}, false
+	}
+	info, ok := ctx.Value(refreshPersistenceBatchContextKey{}).(RefreshPersistenceBatchInfo)
+	info.AuthID = strings.TrimSpace(info.AuthID)
+	return info, ok && info.AuthID != "" && info.Generation != 0
+}
+
+// RefreshPersistenceStoreMetricsSnapshot reports store-side batching without
+// exposing credential identifiers or payload data.
+type RefreshPersistenceStoreMetricsSnapshot struct {
+	Batches           uint64 `json:"batches"`
+	BatchItems        uint64 `json:"batch_items"`
+	Coalesced         uint64 `json:"coalesced"`
+	Pushes            uint64 `json:"pushes"`
+	PushDurationNanos uint64 `json:"push_duration_nanos"`
+	OldestWaitNanos   int64  `json:"oldest_wait_nanos"`
+}
+
+// RefreshPersistenceMetricsStore exposes optional store-side batch metrics.
+type RefreshPersistenceMetricsStore interface {
+	RefreshPersistenceStoreMetrics() RefreshPersistenceStoreMetricsSnapshot
 }
 
 // ConditionalCreateStore atomically persists a record only when its ID is

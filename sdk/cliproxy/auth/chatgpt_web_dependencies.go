@@ -688,7 +688,9 @@ func (m *Manager) SupportsSourceConditionalSave() bool {
 	if m == nil {
 		return false
 	}
+	m.mu.RLock()
 	_, supported := m.store.(SourceConditionalSaveStore)
+	m.mu.RUnlock()
 	return supported
 }
 

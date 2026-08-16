@@ -230,6 +230,16 @@ func newChatGPTWebUnauthorizedRefreshFixture(t *testing.T) (*Manager, *chatGPTWe
 	return manager, executor, auths[0], auths[1], model
 }
 
+func chatGPTWebRequestRefreshBlockCount(manager *Manager, authID string) int {
+	if manager == nil || manager.scheduler == nil {
+		return 0
+	}
+	manager.scheduler.mu.RLock()
+	blocks := manager.scheduler.requestRefreshBlocks[authID]
+	manager.scheduler.mu.RUnlock()
+	return blocks
+}
+
 func TestChatGPTWebUnauthorizedReturnsWithoutWaitingForBackgroundRefresh(t *testing.T) {
 	testCases := []struct {
 		name   string
@@ -316,9 +326,13 @@ func TestChatGPTWebUnauthorizedReturnsWithoutWaitingForBackgroundRefresh(t *test
 				}
 			}
 			current, ok := manager.GetByID(primary.ID)
-			if !ok || current == nil || !current.Unavailable || current.CooldownScope != cooldownScopeAuth {
+			if !ok || current == nil || current.Unavailable || current.CooldownScope != "" {
 				close(releaseRefresh)
-				t.Fatalf("401 cooldown = %#v", current)
+				t.Fatalf("401 request synchronously mutated cooldown before refresh result: %#v", current)
+			}
+			if blocks := chatGPTWebRequestRefreshBlockCount(manager, primary.ID); blocks != 1 {
+				close(releaseRefresh)
+				t.Fatalf("request refresh blocks = %d, want exactly one while refresh is active", blocks)
 			}
 
 			close(releaseRefresh)
@@ -335,6 +349,9 @@ func TestChatGPTWebUnauthorizedReturnsWithoutWaitingForBackgroundRefresh(t *test
 			}
 			if executor.refreshCalls != 1 {
 				t.Fatalf("refresh calls = %d, want 1", executor.refreshCalls)
+			}
+			if blocks := chatGPTWebRequestRefreshBlockCount(manager, primary.ID); blocks != 0 {
+				t.Fatalf("request refresh blocks after completion = %d, want 0", blocks)
 			}
 		})
 	}
@@ -399,6 +416,67 @@ func TestChatGPTWebUnauthorizedCredentialIsExcludedDuringBackgroundRefreshWhenCo
 	}
 }
 
+func TestChatGPTWebUnauthorizedRefreshBackpressureTemporarilyExcludesOnlyFailedCredential(t *testing.T) {
+	const model = "chatgpt-web-refresh-backpressure-model"
+	primaryAuth := resultPersistenceTestAuth("aa-chatgpt-web-refresh-backpressure", 10)
+	primaryAuth.Metadata["access_token"] = "stale"
+	backupAuth := resultPersistenceTestAuth("bb-chatgpt-web-refresh-backpressure", 10)
+	backupAuth.Metadata["access_token"] = "backup"
+	store := newResultPersistenceTestStore(1, 1, primaryAuth, backupAuth)
+	manager := NewManager(store, &FillFirstSelector{}, nil)
+	executor := &chatGPTWebUnauthorizedRefreshExecutor{}
+	manager.RegisterExecutor(executor)
+	primary := registerResultPersistenceTestAuth(t, manager, store, primaryAuth.ID)
+	backup := registerResultPersistenceTestAuth(t, manager, store, backupAuth.ID)
+	for _, auth := range []*Auth{primary, backup} {
+		registry.GetGlobalRegistry().RegisterClient(auth.ID, auth.Provider, []*registry.ModelInfo{{ID: model}})
+		defer registry.GetGlobalRegistry().UnregisterClient(auth.ID)
+	}
+
+	coordinator := manager.refreshPersistence.Load()
+	coordinator.queueLimit = 0
+	active, errActive := coordinator.acquireContext(t.Context(), RefreshPersistencePrioritySession, "capacity-blocker")
+	if errActive != nil {
+		t.Fatal(errActive)
+	}
+	defer func() {
+		active.release()
+		if errClose := manager.CloseExecutors(); errClose != nil {
+			t.Errorf("CloseExecutors() error: %v", errClose)
+		}
+	}()
+
+	_, errFirst := manager.Execute(t.Context(), []string{"chatgpt-web"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
+	if statusCodeFromError(errFirst) != http.StatusUnauthorized || errFirst.Error() != "invalid access token" {
+		t.Fatalf("first request error = %v, want original upstream 401", errFirst)
+	}
+	waitForResultPersistenceCondition(t, time.Second, "backpressured 401 credential was not excluded", func() bool {
+		current, ok := manager.GetByID(primary.ID)
+		return ok && current != nil && current.Unavailable && current.CooldownScope == cooldownScopeAuth &&
+			current.NextRetryAfter.After(time.Now()) && current.NextRefreshAfter.After(time.Now()) &&
+			current.LastError != nil && current.LastError.Code == "refresh_persist_backpressure" &&
+			chatGPTWebRequestRefreshBlockCount(manager, primary.ID) == 0
+	})
+	if executor.refreshCalls != 0 {
+		t.Fatalf("refresh calls = %d, want zero before persistence admission", executor.refreshCalls)
+	}
+
+	response, errSecond := manager.Execute(t.Context(), []string{"chatgpt-web"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
+	if errSecond != nil {
+		t.Fatalf("second request error: %v", errSecond)
+	}
+	if got := string(response.Payload); got != backup.ID+":backup" {
+		t.Fatalf("second request payload = %q, want ready backup credential", got)
+	}
+	if len(executor.executeCalls) != 2 || executor.executeCalls[0] != primary.ID || executor.executeCalls[1] != backup.ID {
+		t.Fatalf("execute calls = %v, want failed credential once then backup", executor.executeCalls)
+	}
+	currentBackup, ok := manager.GetByID(backup.ID)
+	if !ok || currentBackup == nil || currentBackup.Unavailable {
+		t.Fatalf("backpressure affected unrelated credential: %#v", currentBackup)
+	}
+}
+
 func TestChatGPTWebUnauthorizedBackgroundRefreshIsSingleflight(t *testing.T) {
 	manager, executor, primary, _, _ := newChatGPTWebUnauthorizedRefreshFixture(t)
 	primary, _ = manager.GetByID(primary.ID)
@@ -449,6 +527,17 @@ func TestChatGPTWebUnauthorizedBackgroundRefreshIsSingleflight(t *testing.T) {
 		close(releaseRefresh)
 		t.Fatalf("refresh calls = %d, want one shared attempt", executor.refreshCalls)
 	}
+	if blocks := chatGPTWebRequestRefreshBlockCount(manager, primary.ID); blocks != 1 {
+		close(releaseRefresh)
+		t.Fatalf("request refresh blocks = %d, want one shared block", blocks)
+	}
+	manager.chatGPTWebRefreshMu.Lock()
+	activeFlights := len(manager.chatGPTWebRefreshes)
+	manager.chatGPTWebRefreshMu.Unlock()
+	if activeFlights != 1 {
+		close(releaseRefresh)
+		t.Fatalf("active ChatGPT Web refresh flights = %d, want 1", activeFlights)
+	}
 	close(releaseRefresh)
 	select {
 	case <-refreshFinished:
@@ -465,6 +554,9 @@ func TestChatGPTWebUnauthorizedBackgroundRefreshIsSingleflight(t *testing.T) {
 			t.Fatalf("shared background refresh was not installed: %#v", current)
 		}
 		time.Sleep(time.Millisecond)
+	}
+	if blocks := chatGPTWebRequestRefreshBlockCount(manager, primary.ID); blocks != 0 {
+		t.Fatalf("request refresh blocks after shared completion = %d, want 0", blocks)
 	}
 }
 
@@ -511,9 +603,13 @@ func TestChatGPTWebUnauthorizedPreparationReturnsWithoutWaitingForRefresh(t *tes
 		t.Fatalf("prepare calls = %d, execute calls = %v", executor.prepareCalls, executor.executeCalls)
 	}
 	current, ok := manager.GetByID(primary.ID)
-	if !ok || current == nil || !current.Unavailable || current.CooldownScope != cooldownScopeAuth {
+	if !ok || current == nil || current.Unavailable || current.CooldownScope != "" {
 		close(releaseRefresh)
-		t.Fatalf("preparation 401 cooldown = %#v", current)
+		t.Fatalf("preparation 401 synchronously mutated cooldown before refresh result: %#v", current)
+	}
+	if blocks := chatGPTWebRequestRefreshBlockCount(manager, primary.ID); blocks != 1 {
+		close(releaseRefresh)
+		t.Fatalf("preparation request refresh blocks = %d, want exactly one", blocks)
 	}
 	close(releaseRefresh)
 	select {
@@ -1283,12 +1379,21 @@ func TestChatGPTWebTransientRefreshFailureCoolsWholeCredential(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("background refresh failure did not finish")
 	}
-	current, ok := manager.GetByID(primary.ID)
-	if !ok || current == nil {
-		t.Fatal("primary auth missing")
-	}
-	if !current.Unavailable || current.CooldownScope != cooldownScopeAuth || current.NextRetryAfter.IsZero() {
-		t.Fatalf("primary cooldown = unavailable:%t scope:%q until:%s", current.Unavailable, current.CooldownScope, current.NextRetryAfter)
+	deadline := time.Now().Add(5 * time.Second)
+	var current *Auth
+	for {
+		var ok bool
+		current, ok = manager.GetByID(primary.ID)
+		if !ok || current == nil {
+			t.Fatal("primary auth missing")
+		}
+		if current.Unavailable && current.CooldownScope == cooldownScopeAuth && !current.NextRetryAfter.IsZero() {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("primary cooldown = unavailable:%t scope:%q until:%s", current.Unavailable, current.CooldownScope, current.NextRetryAfter)
+		}
+		time.Sleep(time.Millisecond)
 	}
 	if len(current.ModelStates) != 0 {
 		t.Fatalf("401 created model-only state: %#v", current.ModelStates)
