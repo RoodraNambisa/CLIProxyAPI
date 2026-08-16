@@ -45,8 +45,11 @@ type ChatGPTWebImageMemoryRuntimeSnapshot struct {
 	ImmediateRejected             uint64 `json:"immediate_rejected"`
 	CompletionReservations        int64  `json:"completion_reservations"`
 	RevokedCompletionReservations uint64 `json:"revoked_completion_reservations"`
-	FinalizationActive            int64  `json:"finalization_active"`
-	FinalizationWaiting           int64  `json:"finalization_waiting"`
+	// BypassedCompletionReservations counts unique request lease sets admitted
+	// without an idle reservation while another request owned finalization.
+	BypassedCompletionReservations uint64 `json:"bypassed_completion_reservations"`
+	FinalizationActive             int64  `json:"finalization_active"`
+	FinalizationWaiting            int64  `json:"finalization_waiting"`
 }
 
 // ChatGPTWebImageMemoryAdmission bounds concurrent decoded image working sets.
@@ -74,6 +77,7 @@ type ChatGPTWebImageMemoryLeaseSet struct {
 	completionBytes     int64
 	completionAvailable int64
 	completionRevoked   bool
+	completionBypassed  bool
 	finalizationOwned   bool
 	retainedBytes       int64
 	pendingRetained     int64
@@ -92,6 +96,7 @@ type chatGPTWebImageCompletionCoordinator struct {
 
 	reservationCount atomic.Int64
 	revokedCount     atomic.Uint64
+	bypassedCount    atomic.Uint64
 	active           atomic.Int64
 	waiting          atomic.Int64
 }
@@ -302,9 +307,6 @@ func (leases *ChatGPTWebImageMemoryLeaseSet) TryReserveCompletion(estimatedBytes
 	coordinator := defaultChatGPTWebImageCompletionCoordinator
 	coordinator.mu.Lock()
 	defer coordinator.mu.Unlock()
-	if coordinator.finalizing {
-		return false
-	}
 	leases.mu.Lock()
 	if leases.released {
 		leases.mu.Unlock()
@@ -314,6 +316,20 @@ func (leases *ChatGPTWebImageMemoryLeaseSet) TryReserveCompletion(estimatedBytes
 		reserved := !leases.completionRevoked && leases.completionBytes >= weight
 		leases.mu.Unlock()
 		return reserved
+	}
+	// The active finalizer already owns forward progress and revokes idle
+	// reservations. Admit new bounded executions without another reservation
+	// instead of turning its entire critical section into a zero-capacity window.
+	// Their pre-finalization transient allocations remain non-blocking, so they
+	// cannot reintroduce a reservation hold-and-wait cycle.
+	if coordinator.finalizing {
+		firstBypass := !leases.completionBypassed
+		leases.completionBypassed = true
+		leases.mu.Unlock()
+		if firstBypass {
+			coordinator.bypassedCount.Add(1)
+		}
+		return true
 	}
 	leases.mu.Unlock()
 	release, acquired := TryAcquireChatGPTWebImageMemory(weight)
@@ -733,21 +749,22 @@ func (admission *ChatGPTWebImageMemoryAdmission) Snapshot() ChatGPTWebImageMemor
 	}
 	coordinator := defaultChatGPTWebImageCompletionCoordinator
 	return ChatGPTWebImageMemoryRuntimeSnapshot{
-		CapacityBytes:                 admission.capacity,
-		QueueLimit:                    admission.queueLimit,
-		WaitingTasks:                  admission.waitingTasks.Load(),
-		WaitingBytes:                  admission.waitingBytes.Load(),
-		ProcessingTasks:               admission.processingTasks.Load(),
-		ProcessingBytes:               admission.processingBytes.Load(),
-		PeakProcessingBytes:           admission.peakProcessingBytes.Load(),
-		Acquisitions:                  admission.acquisitions.Load(),
-		CanceledWaits:                 admission.canceledWaits.Load(),
-		QueueRejected:                 admission.queueRejected.Load(),
-		ImmediateRejected:             admission.immediateRejected.Load(),
-		CompletionReservations:        coordinator.reservationCount.Load(),
-		RevokedCompletionReservations: coordinator.revokedCount.Load(),
-		FinalizationActive:            coordinator.active.Load(),
-		FinalizationWaiting:           coordinator.waiting.Load(),
+		CapacityBytes:                  admission.capacity,
+		QueueLimit:                     admission.queueLimit,
+		WaitingTasks:                   admission.waitingTasks.Load(),
+		WaitingBytes:                   admission.waitingBytes.Load(),
+		ProcessingTasks:                admission.processingTasks.Load(),
+		ProcessingBytes:                admission.processingBytes.Load(),
+		PeakProcessingBytes:            admission.peakProcessingBytes.Load(),
+		Acquisitions:                   admission.acquisitions.Load(),
+		CanceledWaits:                  admission.canceledWaits.Load(),
+		QueueRejected:                  admission.queueRejected.Load(),
+		ImmediateRejected:              admission.immediateRejected.Load(),
+		CompletionReservations:         coordinator.reservationCount.Load(),
+		RevokedCompletionReservations:  coordinator.revokedCount.Load(),
+		BypassedCompletionReservations: coordinator.bypassedCount.Load(),
+		FinalizationActive:             coordinator.active.Load(),
+		FinalizationWaiting:            coordinator.waiting.Load(),
 	}
 }
 

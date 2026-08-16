@@ -139,6 +139,50 @@ func TestImageExecutionAdmissionTimeoutCancellationAndHotLowering(t *testing.T) 
 	}
 }
 
+func TestImageExecutionAdmissionBoundsBurstBehindLongTasks(t *testing.T) {
+	admission := newImageExecutionAdmission()
+	admission.configure(2, 4)
+	releaseA, errA := admission.acquire(t.Context(), 0)
+	releaseB, errB := admission.acquire(t.Context(), 0)
+	if errA != nil || errB != nil {
+		t.Fatalf("fill admission = %v / %v", errA, errB)
+	}
+
+	waitResults := make(chan error, 4)
+	for queued := 1; queued <= 4; queued++ {
+		go func() {
+			_, errAcquire := admission.acquire(t.Context(), 50*time.Millisecond)
+			waitResults <- errAcquire
+		}()
+		waitForImageAdmissionSnapshot(t, admission, func(snapshot ImageExecutionAdmissionSnapshot) bool {
+			return snapshot.Queued == queued
+		})
+	}
+	for attempt := 0; attempt < 10; attempt++ {
+		started := time.Now()
+		if _, err := admission.acquire(t.Context(), time.Second); !IsImageExecutionCapacityError(err) {
+			t.Fatalf("overflow attempt %d error = %T %v", attempt, err, err)
+		}
+		if elapsed := time.Since(started); elapsed > 100*time.Millisecond {
+			t.Fatalf("overflow attempt %d waited %v", attempt, elapsed)
+		}
+	}
+	for attempt := 0; attempt < 4; attempt++ {
+		if err := <-waitResults; !IsImageExecutionCapacityError(err) {
+			t.Fatalf("queued attempt %d error = %T %v", attempt, err, err)
+		}
+	}
+	if snapshot := admission.snapshot(); snapshot.Active != 2 || snapshot.Queued != 0 || snapshot.Admitted != 2 ||
+		snapshot.QueueRejects != 10 || snapshot.TimedOut != 4 {
+		t.Fatalf("saturated admission snapshot = %#v", snapshot)
+	}
+	releaseA()
+	releaseB()
+	if snapshot := admission.snapshot(); snapshot.Active != 0 || snapshot.Queued != 0 {
+		t.Fatalf("released admission snapshot = %#v", snapshot)
+	}
+}
+
 func TestImageExecutionAdmissionGrantCancellationRaceDoesNotLeak(t *testing.T) {
 	for iteration := 0; iteration < 100; iteration++ {
 		admission := newImageExecutionAdmission()

@@ -19,6 +19,7 @@ import (
 	chatgptwebauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/chatgptweb"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor/helps"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v6/sdk/translator"
@@ -886,6 +887,8 @@ func TestChatGPTWebExecutorRejectsChatCompletionsToolHistory(t *testing.T) {
 }
 
 func TestChatGPTWebExecutorExecuteImageGeneration(t *testing.T) {
+	cliproxyexecutor.ConfigureChatGPTWebImageAdmissions(1, 0, 1)
+	t.Cleanup(func() { cliproxyexecutor.ConfigureChatGPTWebImageAdmissions(64, 64, 8) })
 	server := newChatGPTWebImageFixture(t)
 	defer server.Close()
 	executor := NewChatGPTWebExecutor(nil, nil)
@@ -919,6 +922,78 @@ func TestChatGPTWebExecutorExecuteImageGeneration(t *testing.T) {
 	if revised := gjson.GetBytes(response.Payload, "response.output.0.revised_prompt"); revised.Exists() {
 		t.Fatalf("revised_prompt = %s, want absent", revised.Raw)
 	}
+	if snapshot := cliproxyexecutor.ChatGPTWebImageExecutionAdmissionSnapshot(); snapshot.Active != 0 || snapshot.Queued != 0 {
+		t.Fatalf("successful image lifecycle leaked: %#v", snapshot)
+	}
+}
+
+func TestChatGPTWebExecutorImageLifecycleReleasesOnUnauthorizedAndCancellation(t *testing.T) {
+	for _, test := range []struct {
+		name         string
+		unauthorized bool
+	}{
+		{name: "unauthorized", unauthorized: true},
+		{name: "cancellation"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			cliproxyexecutor.ConfigureChatGPTWebImageAdmissions(1, 0, 1)
+			t.Cleanup(func() { cliproxyexecutor.ConfigureChatGPTWebImageAdmissions(64, 64, 8) })
+			requestStarted := make(chan struct{})
+			releaseRequest := make(chan struct{})
+			var releaseOnce sync.Once
+			t.Cleanup(func() { releaseOnce.Do(func() { close(releaseRequest) }) })
+			var startedOnce sync.Once
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+				if request.URL.Path == "/" {
+					_, _ = io.WriteString(w, `<html><script src="/c/build/_next/a.js"></script></html>`)
+					return
+				}
+				startedOnce.Do(func() { close(requestStarted) })
+				if test.unauthorized {
+					http.Error(w, `{"error":{"code":"unauthorized"}}`, http.StatusUnauthorized)
+					return
+				}
+				<-releaseRequest
+			}))
+			defer server.Close()
+			executor := NewChatGPTWebExecutor(nil, nil)
+			t.Cleanup(func() { _ = executor.Close() })
+			executor.runtimeBaseURL = server.URL
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			result := make(chan error, 1)
+			go func() {
+				_, errExecute := executor.Execute(ctx, chatGPTWebRuntimeAuth(), cliproxyexecutor.Request{
+					Model:   "gpt-image-2",
+					Payload: []byte(`{"model":"gpt-image-2","input":"draw","tools":[{"type":"image_generation"}]}`),
+				}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatCodex, ResponseFormat: sdktranslator.FormatCodex})
+				result <- errExecute
+			}()
+			select {
+			case <-requestStarted:
+			case <-time.After(time.Second):
+				t.Fatal("upstream request did not start")
+			}
+			if !test.unauthorized {
+				cancel()
+			}
+			errExecute := <-result
+			if !test.unauthorized {
+				releaseOnce.Do(func() { close(releaseRequest) })
+			}
+			if test.unauthorized {
+				var statusErr interface{ StatusCode() int }
+				if !errors.As(errExecute, &statusErr) || statusErr.StatusCode() != http.StatusUnauthorized {
+					t.Fatalf("Execute() error = %T %v, want 401", errExecute, errExecute)
+				}
+			} else if !errors.Is(errExecute, context.Canceled) {
+				t.Fatalf("Execute() error = %T %v, want cancellation", errExecute, errExecute)
+			}
+			if snapshot := cliproxyexecutor.ChatGPTWebImageExecutionAdmissionSnapshot(); snapshot.Active != 0 || snapshot.Queued != 0 {
+				t.Fatalf("failed image lifecycle leaked: %#v", snapshot)
+			}
+		})
+	}
 }
 
 func TestChatGPTWebExecutorImageLifecycleAdmissionPrecedesFirstUpstream(t *testing.T) {
@@ -948,6 +1023,38 @@ func TestChatGPTWebExecutorImageLifecycleAdmissionPrecedesFirstUpstream(t *testi
 	}
 	if got := upstreamCalls.Load(); got != 0 {
 		t.Fatalf("upstream calls = %d, want 0", got)
+	}
+}
+
+func TestChatGPTWebExecutorImageLifecycleDoesNotRejectDuringFinalization(t *testing.T) {
+	cliproxyexecutor.ConfigureChatGPTWebImageAdmissions(1, 0, 1)
+	t.Cleanup(func() { cliproxyexecutor.ConfigureChatGPTWebImageAdmissions(64, 64, 8) })
+	finalizing := helps.NewChatGPTWebImageMemoryLeaseSet()
+	t.Cleanup(finalizing.Release)
+	if !finalizing.TryReserveCompletion(1) {
+		t.Fatal("failed to reserve finalizer completion memory")
+	}
+	releaseFinalization, err := finalizing.BeginFinalization(t.Context())
+	if err != nil {
+		t.Fatalf("BeginFinalization() error = %v", err)
+	}
+	defer releaseFinalization()
+
+	executor := NewChatGPTWebExecutor(nil, nil)
+	prepared := &chatGPTWebPreparedRequest{
+		imageMemoryLeases:      helps.NewChatGPTWebImageMemoryLeaseSet(),
+		imageMemoryLeasesOwned: true,
+	}
+	releaseLifecycle, err := executor.acquireChatGPTWebImageLifecycle(t.Context(), prepared)
+	if err != nil {
+		t.Fatalf("acquireChatGPTWebImageLifecycle() error = %T %v", err, err)
+	}
+	if snapshot := cliproxyexecutor.ChatGPTWebImageExecutionAdmissionSnapshot(); snapshot.Active != 1 {
+		t.Fatalf("active lifecycle snapshot = %#v", snapshot)
+	}
+	releaseLifecycle()
+	if snapshot := cliproxyexecutor.ChatGPTWebImageExecutionAdmissionSnapshot(); snapshot.Active != 0 {
+		t.Fatalf("released lifecycle snapshot = %#v", snapshot)
 	}
 }
 

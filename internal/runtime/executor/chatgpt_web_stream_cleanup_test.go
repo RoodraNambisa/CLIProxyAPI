@@ -109,4 +109,36 @@ func TestChatGPTWebDeferredStreamCleanupWaitsForWorkerAndConsumer(t *testing.T) 
 			t.Fatalf("work calls after bootstrap delivery failure = %d", got)
 		}
 	})
+
+	t.Run("image lifecycle release", func(t *testing.T) {
+		cliproxyexecutor.ConfigureChatGPTWebImageAdmissions(1, 0, 1)
+		t.Cleanup(func() { cliproxyexecutor.ConfigureChatGPTWebImageAdmissions(64, 64, 8) })
+		releaseLifecycle, err := cliproxyexecutor.AcquireChatGPTWebImageExecution(t.Context(), 0)
+		if err != nil {
+			t.Fatalf("AcquireChatGPTWebImageExecution() error = %v", err)
+		}
+		executor, prepared, _, _, _ := newChatGPTWebStreamCleanupTest(t)
+		done := make(chan struct{}, 1)
+		var calls atomic.Int32
+		cleanup := func() {
+			calls.Add(1)
+			releaseLifecycle()
+			select {
+			case done <- struct{}{}:
+			default:
+			}
+		}
+		result := executor.streamDeferredChatGPTWebResponse(
+			t.Context(), nil, nil, prepared, nil, nil, nil, nil, false, cleanup,
+			func() ([]byte, error) {
+				return buildChatGPTWebCompletedEvent("gpt-image-2", chatGPTWebTextResult{Text: "done"}), nil
+			},
+		)
+		for range result.Chunks {
+		}
+		waitForChatGPTWebStreamCleanup(t, done, &calls)
+		if snapshot := cliproxyexecutor.ChatGPTWebImageExecutionAdmissionSnapshot(); snapshot.Active != 0 || snapshot.Queued != 0 {
+			t.Fatalf("stream image lifecycle leaked: %#v", snapshot)
+		}
+	})
 }

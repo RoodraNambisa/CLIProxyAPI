@@ -304,10 +304,29 @@ func TestChatGPTWebImageFinalizationAvoidsRetainedMemoryHoldAndWait(t *testing.T
 	if snapshot := ChatGPTWebImageMemorySnapshot(); snapshot.FinalizationActive != 1 || snapshot.FinalizationWaiting != 1 || snapshot.CompletionReservations != 1 {
 		t.Fatalf("serialized finalization snapshot = %#v", snapshot)
 	}
-	if third := NewChatGPTWebImageMemoryLeaseSet(); third.TryReserveCompletion(1) {
+	bypassedBefore := ChatGPTWebImageMemorySnapshot().BypassedCompletionReservations
+	third := NewChatGPTWebImageMemoryLeaseSet()
+	if !third.TryReserveCompletion(1) {
 		third.Release()
-		t.Fatal("new completion reservation was admitted during finalization")
+		t.Fatal("bounded execution was rejected during finalization")
 	}
+	if !third.TryReserveCompletion(1) {
+		third.Release()
+		t.Fatal("repeated bounded execution reservation was rejected")
+	}
+	if snapshot := ChatGPTWebImageMemorySnapshot(); snapshot.CompletionReservations != 1 || snapshot.BypassedCompletionReservations != bypassedBefore+1 {
+		third.Release()
+		t.Fatalf("completion bypass snapshot = %#v", snapshot)
+	}
+	if _, errThird := third.AcquireTransient(t.Context(), 6); !errors.Is(errThird, ErrChatGPTWebImageMemoryQueueFull) {
+		third.Release()
+		t.Fatalf("bypassed transient error = %v, want queue full", errThird)
+	}
+	if snapshot := ChatGPTWebImageMemorySnapshot(); snapshot.WaitingTasks != 0 {
+		third.Release()
+		t.Fatalf("bypassed execution joined ordinary wait queue: %#v", snapshot)
+	}
+	third.Release()
 	canceledContext, cancel := context.WithCancel(t.Context())
 	canceled := make(chan error, 1)
 	go func() {
@@ -361,6 +380,116 @@ func TestChatGPTWebImageFinalizationAvoidsRetainedMemoryHoldAndWait(t *testing.T
 	if snapshot := ChatGPTWebImageMemorySnapshot(); snapshot.ProcessingTasks != 0 || snapshot.ProcessingBytes != 0 ||
 		snapshot.CompletionReservations != 0 || snapshot.FinalizationActive != 0 || snapshot.FinalizationWaiting != 0 {
 		t.Fatalf("finalization leaked: %#v", snapshot)
+	}
+}
+
+func TestChatGPTWebImageBypassedCompletionFinishesNextTurnUnderMemoryPressure(t *testing.T) {
+	previousAdmission := defaultChatGPTWebImageMemoryAdmission
+	previousCoordinator := defaultChatGPTWebImageCompletionCoordinator
+	defaultChatGPTWebImageMemoryAdmission = NewChatGPTWebImageMemoryAdmission(6)
+	defaultChatGPTWebImageCompletionCoordinator = &chatGPTWebImageCompletionCoordinator{
+		turn:         make(chan struct{}, 1),
+		reservations: make(map[*ChatGPTWebImageMemoryLeaseSet]struct{}),
+	}
+	t.Cleanup(func() {
+		defaultChatGPTWebImageMemoryAdmission = previousAdmission
+		defaultChatGPTWebImageCompletionCoordinator = previousCoordinator
+	})
+
+	first := NewChatGPTWebImageMemoryLeaseSet()
+	bypassed := NewChatGPTWebImageMemoryLeaseSet()
+	t.Cleanup(first.Release)
+	t.Cleanup(bypassed.Release)
+	if !first.TryReserveCompletion(1) {
+		t.Fatal("failed to reserve first completion memory")
+	}
+	firstTurn, err := first.BeginFinalization(t.Context())
+	if err != nil {
+		t.Fatalf("first BeginFinalization() error = %v", err)
+	}
+	defer firstTurn()
+	if !bypassed.TryReserveCompletion(1) || !bypassed.TryReserveCompletion(1) {
+		t.Fatal("execution was rejected while first finalizer was active")
+	}
+	if snapshot := ChatGPTWebImageMemorySnapshot(); snapshot.BypassedCompletionReservations != 1 || snapshot.CompletionReservations != 1 {
+		t.Fatalf("bypassed reservation snapshot = %#v", snapshot)
+	}
+	if err = first.Acquire(t.Context(), 2); err != nil {
+		t.Fatalf("first retained acquisition error = %v", err)
+	}
+
+	type turnResult struct {
+		release func()
+		err     error
+	}
+	nextTurn := make(chan turnResult, 1)
+	go func() {
+		release, errBegin := bypassed.BeginFinalization(t.Context())
+		nextTurn <- turnResult{release: release, err: errBegin}
+	}()
+	deadline := time.Now().Add(time.Second)
+	for ChatGPTWebImageMemorySnapshot().FinalizationWaiting == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	firstTurn()
+	var bypassedTurn func()
+	select {
+	case result := <-nextTurn:
+		if result.err != nil {
+			t.Fatalf("bypassed BeginFinalization() error = %v", result.err)
+		}
+		bypassedTurn = result.release
+		defer bypassedTurn()
+	case <-time.After(time.Second):
+		t.Fatal("bypassed execution did not enter the next finalization turn")
+	}
+	if err = bypassed.Acquire(t.Context(), 3); err != nil {
+		t.Fatalf("bypassed retained acquisition error = %v", err)
+	}
+	type transientResult struct {
+		release func()
+		err     error
+	}
+	transient := make(chan transientResult, 1)
+	go func() {
+		release, errAcquire := bypassed.AcquireTransient(t.Context(), 3)
+		transient <- transientResult{release: release, err: errAcquire}
+	}()
+	deadline = time.Now().Add(time.Second)
+	for ChatGPTWebImageMemorySnapshot().WaitingTasks == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if snapshot := ChatGPTWebImageMemorySnapshot(); snapshot.WaitingTasks != 1 || snapshot.FinalizationActive != 1 {
+		t.Fatalf("bypassed finalizer pressure snapshot = %#v", snapshot)
+	}
+	newcomer := NewChatGPTWebImageMemoryLeaseSet()
+	if !newcomer.TryReserveCompletion(1) {
+		newcomer.Release()
+		t.Fatal("new bounded execution was rejected behind critical waiter")
+	}
+	if _, errNewcomer := newcomer.AcquireTransient(t.Context(), 1); !errors.Is(errNewcomer, ErrChatGPTWebImageMemoryQueueFull) {
+		newcomer.Release()
+		t.Fatalf("new transient error = %v, want queue full behind critical waiter", errNewcomer)
+	}
+	newcomer.Release()
+	if snapshot := ChatGPTWebImageMemorySnapshot(); snapshot.WaitingTasks != 1 || snapshot.BypassedCompletionReservations != 2 {
+		t.Fatalf("new execution preempted critical waiter: %#v", snapshot)
+	}
+	first.Release()
+	select {
+	case result := <-transient:
+		if result.err != nil {
+			t.Fatalf("bypassed transient acquisition error = %v", result.err)
+		}
+		result.release()
+	case <-time.After(time.Second):
+		t.Fatal("bypassed finalizer did not advance after memory release")
+	}
+	bypassedTurn()
+	bypassed.Release()
+	if snapshot := ChatGPTWebImageMemorySnapshot(); snapshot.ProcessingTasks != 0 || snapshot.ProcessingBytes != 0 ||
+		snapshot.WaitingTasks != 0 || snapshot.CompletionReservations != 0 || snapshot.FinalizationActive != 0 || snapshot.FinalizationWaiting != 0 {
+		t.Fatalf("bypassed finalization leaked: %#v", snapshot)
 	}
 }
 
