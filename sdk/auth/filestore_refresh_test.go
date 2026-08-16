@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
@@ -54,6 +55,21 @@ func fileTokenStoreTestMetadataString(auth *cliproxyauth.Auth, key string) strin
 	}
 	value, _ := auth.Metadata[key].(string)
 	return value
+}
+
+func waitForFileTokenStoreAuth(t *testing.T, manager *cliproxyauth.Manager, authID string, ready func(*cliproxyauth.Auth) bool) *cliproxyauth.Auth {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		current, ok := manager.GetByID(authID)
+		if ok && current != nil && ready(current) {
+			return current
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("credential %q did not reach the expected background refresh state: %#v", authID, current)
+		}
+		time.Sleep(time.Millisecond)
+	}
 }
 
 func TestFileTokenStoreEnablesSerializedRefreshPersistence(t *testing.T) {
@@ -104,6 +120,19 @@ func TestFileTokenStorePersistsRotatedChatGPTWebRefreshTokens(t *testing.T) {
 	registry.GetGlobalRegistry().RegisterClient(registered.ID, registered.Provider, []*registry.ModelInfo{{ID: model}})
 	t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(registered.ID) })
 
+	_, errExecute := manager.Execute(
+		t.Context(),
+		[]string{"chatgpt-web"},
+		cliproxyexecutor.Request{Model: model},
+		cliproxyexecutor.Options{},
+	)
+	var unauthorized *cliproxyauth.Error
+	if !errors.As(errExecute, &unauthorized) || unauthorized.StatusCode() != http.StatusUnauthorized {
+		t.Fatalf("first request error = %v, want original 401", errExecute)
+	}
+	waitForFileTokenStoreAuth(t, manager, registered.ID, func(current *cliproxyauth.Auth) bool {
+		return fileTokenStoreTestMetadataString(current, "access_token") == "fresh-access-token" && !current.Unavailable
+	})
 	response, errExecute := manager.Execute(
 		t.Context(),
 		[]string{"chatgpt-web"},
@@ -180,14 +209,19 @@ func TestFileTokenStoreRefreshAcceptsLegacyPayloadWithoutDisabled(t *testing.T) 
 	registry.GetGlobalRegistry().RegisterClient(loaded.ID, loaded.Provider, []*registry.ModelInfo{{ID: model}})
 	t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(loaded.ID) })
 
-	if _, errExecute := manager.Execute(
+	_, errExecute := manager.Execute(
 		t.Context(),
 		[]string{"chatgpt-web"},
 		cliproxyexecutor.Request{Model: model},
 		cliproxyexecutor.Options{},
-	); errExecute != nil {
-		t.Fatal(errExecute)
+	)
+	var unauthorized *cliproxyauth.Error
+	if !errors.As(errExecute, &unauthorized) || unauthorized.StatusCode() != http.StatusUnauthorized {
+		t.Fatalf("first request error = %v, want original 401", errExecute)
 	}
+	waitForFileTokenStoreAuth(t, manager, loaded.ID, func(current *cliproxyauth.Auth) bool {
+		return fileTokenStoreTestMetadataString(current, "access_token") == "fresh-access-token" && !current.Unavailable
+	})
 	persisted, errRead := os.ReadFile(path)
 	if errRead != nil {
 		t.Fatal(errRead)
@@ -253,9 +287,13 @@ func TestFileTokenStoreRefreshDoesNotOverwriteExternalReplacement(t *testing.T) 
 		cliproxyexecutor.Options{},
 	)
 	var authErr *cliproxyauth.Error
-	if !errors.As(errExecute, &authErr) || authErr.Code != "refresh_persist_failed" {
-		t.Fatalf("refresh error = %v, want refresh_persist_failed", errExecute)
+	if !errors.As(errExecute, &authErr) || authErr.StatusCode() != http.StatusUnauthorized {
+		t.Fatalf("request error = %v, want original 401", errExecute)
 	}
+	current := waitForFileTokenStoreAuth(t, manager, registered.ID, func(candidate *cliproxyauth.Auth) bool {
+		return candidate.LifecycleState() == cliproxyauth.LifecycleStateReauthRequired &&
+			candidate.LastError != nil && candidate.LastError.Code == "refresh_persist_failed"
+	})
 	persisted, errRead := os.ReadFile(path)
 	if errRead != nil {
 		t.Fatal(errRead)
@@ -263,9 +301,7 @@ func TestFileTokenStoreRefreshDoesNotOverwriteExternalReplacement(t *testing.T) 
 	if !bytes.Equal(persisted, replacement) {
 		t.Fatalf("external replacement was overwritten:\n got: %s\nwant: %s", persisted, replacement)
 	}
-	current, ok := manager.GetByID(registered.ID)
-	if !ok || current == nil ||
-		fileTokenStoreTestMetadataString(current, "access_token") != "stale-access-token" ||
+	if fileTokenStoreTestMetadataString(current, "access_token") != "stale-access-token" ||
 		current.LifecycleState() != cliproxyauth.LifecycleStateReauthRequired {
 		t.Fatalf("runtime credential changed after rejected refresh: %#v", current)
 	}

@@ -784,6 +784,11 @@ func TestServiceChatGPTWebControlledOpaqueRefreshKeepsLastCatalogOnFetchFailure(
 	executor := &chatGPTWebCatalogTestExecutor{}
 	manager := coreauth.NewManager(nil, &coreauth.FillFirstSelector{}, nil)
 	manager.RegisterExecutor(executor)
+	t.Cleanup(func() {
+		if errClose := manager.CloseExecutors(); errClose != nil {
+			t.Errorf("close auth manager executors: %v", errClose)
+		}
+	})
 	service := &Service{cfg: &config.Config{}, coreManager: manager}
 	auth, err := manager.Register(context.Background(), &coreauth.Auth{
 		ID:       "chatgpt-web-opaque-refresh-catalog",
@@ -824,20 +829,34 @@ func TestServiceChatGPTWebControlledOpaqueRefreshKeepsLastCatalogOnFetchFailure(
 	executor.set(nil, errors.New("catalog unavailable"))
 	manager.AddHook(authMaintenanceHook{service: service})
 
-	response, err := manager.Execute(context.Background(), []string{chatgptwebauth.Provider}, cliproxyexecutor.Request{
+	_, err = manager.Execute(context.Background(), []string{chatgptwebauth.Provider}, cliproxyexecutor.Request{
 		Model: "remote-only-model",
 	}, cliproxyexecutor.Options{})
-	if err != nil {
-		t.Fatalf("execute after controlled refresh: %v", err)
-	}
-	if string(response.Payload) != "ok" {
-		t.Fatalf("response payload = %q", response.Payload)
+	var unauthorized *coreauth.Error
+	if !errors.As(err, &unauthorized) || unauthorized.StatusCode() != http.StatusUnauthorized {
+		t.Fatalf("first request error = %v, want original 401", err)
 	}
 
-	current, ok := manager.GetByID(auth.ID)
-	if !ok || current == nil {
-		t.Fatal("refreshed auth missing")
+	deadline := time.Now().Add(5 * time.Second)
+	var current *coreauth.Auth
+	for {
+		candidate, ok := manager.GetByID(auth.ID)
+		if ok && candidate != nil && candidate.Metadata["access_token"] == "fresh" && !candidate.Unavailable {
+			cached, cachedOK := service.chatGPTWebModelCatalog.Load(auth.ID)
+			entry, entryOK := cached.(*chatGPTWebModelCatalogCacheEntry)
+			if cachedOK && entryOK && entry != nil &&
+				entry.RuntimeInstanceID == candidate.RuntimeInstanceID() &&
+				entry.CredentialIdentity == chatGPTWebCatalogCredentialIdentity(candidate) {
+				current = candidate
+				break
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("background refresh did not migrate the cached catalog: auth=%#v", candidate)
+		}
+		time.Sleep(time.Millisecond)
 	}
+
 	cached, ok := service.chatGPTWebModelCatalog.Load(auth.ID)
 	entry, okEntry := cached.(*chatGPTWebModelCatalogCacheEntry)
 	if !ok || !okEntry || entry == nil {

@@ -98,7 +98,7 @@ func TestBaseAPIHandlerWritesPerAuthRequestLimitContract(t *testing.T) {
 	if errJSON := json.Unmarshal(recorder.Body.Bytes(), &payload); errJSON != nil {
 		t.Fatalf("decode response: %v", errJSON)
 	}
-	if payload.Error.Code != "auth_request_capacity_exhausted" ||
+	if payload.Error.Code != "auth_request_limited" ||
 		payload.Error.Message != "All available credentials reached their request limit" ||
 		payload.Error.Limit != 1 || payload.Error.WindowMinutes != 5 ||
 		payload.Error.ResetSeconds != retryAfter {

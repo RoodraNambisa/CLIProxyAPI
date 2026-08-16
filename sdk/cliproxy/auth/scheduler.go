@@ -53,10 +53,13 @@ type authScheduler struct {
 	providers                 map[string]*providerScheduler
 	authProviders             map[string]string
 	blockedAuths              map[string]struct{}
-	fillFirstLimiter          *fillFirstMinuteLimiter
-	requestLimiter            *authRequestWindowLimiter
-	mixedCursorMu             sync.Mutex
-	mixedCursors              map[string]int
+	// requestRefreshBlocks keeps credentials out of routing while a request-triggered
+	// credential refresh is in flight, independently of configured cooldown policy.
+	requestRefreshBlocks map[string]int
+	fillFirstLimiter     *fillFirstMinuteLimiter
+	requestLimiter       *authRequestWindowLimiter
+	mixedCursorMu        sync.Mutex
+	mixedCursors         map[string]int
 }
 
 // RoutingDiagnosticsSnapshot summarizes credential availability for one provider/model shard.
@@ -199,6 +202,7 @@ func newAuthScheduler(selector Selector) *authScheduler {
 		providers:                 make(map[string]*providerScheduler),
 		authProviders:             make(map[string]string),
 		blockedAuths:              make(map[string]struct{}),
+		requestRefreshBlocks:      make(map[string]int),
 		fillFirstLimiter:          newFillFirstMinuteLimiter(),
 		requestLimiter:            newAuthRequestWindowLimiter(),
 		mixedCursors:              make(map[string]int),
@@ -710,6 +714,50 @@ func (s *authScheduler) unblockAuth(authID string, auth *Auth) {
 	}
 	s.mu.Lock()
 	delete(s.blockedAuths, authID)
+	if auth != nil {
+		s.upsertAuthLocked(auth, time.Now(), true)
+	}
+	s.mu.Unlock()
+}
+
+func (s *authScheduler) blockAuthRequestRefresh(authID string) {
+	if s == nil {
+		return
+	}
+	authID = strings.TrimSpace(authID)
+	if authID == "" {
+		return
+	}
+	s.mu.Lock()
+	if s.requestRefreshBlocks == nil {
+		s.requestRefreshBlocks = make(map[string]int)
+	}
+	s.requestRefreshBlocks[authID]++
+	s.removeAuthLocked(authID)
+	s.mu.Unlock()
+}
+
+func (s *authScheduler) unblockAuthRequestRefresh(authID string, auth *Auth) {
+	if s == nil {
+		return
+	}
+	authID = strings.TrimSpace(authID)
+	if authID == "" {
+		return
+	}
+	s.mu.Lock()
+	blocks := s.requestRefreshBlocks[authID]
+	if blocks <= 0 {
+		s.mu.Unlock()
+		return
+	}
+	remaining := blocks - 1
+	if remaining > 0 {
+		s.requestRefreshBlocks[authID] = remaining
+		s.mu.Unlock()
+		return
+	}
+	delete(s.requestRefreshBlocks, authID)
 	if auth != nil {
 		s.upsertAuthLocked(auth, time.Now(), true)
 	}
@@ -1274,7 +1322,8 @@ func (s *authScheduler) upsertAuthLocked(auth *Auth, now time.Time, refreshSuppo
 	}
 	authID := strings.TrimSpace(auth.ID)
 	providerKey := strings.ToLower(strings.TrimSpace(auth.Provider))
-	if _, blocked := s.blockedAuths[authID]; blocked {
+	_, blocked := s.blockedAuths[authID]
+	if blocked || s.requestRefreshBlocks[authID] > 0 {
 		s.removeAuthLocked(authID)
 		return
 	}

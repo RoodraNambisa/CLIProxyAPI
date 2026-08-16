@@ -425,11 +425,33 @@ func TestChatGPTWebExecutorLinkedCodexRequestPreparationPreservesRefreshLocks(t 
 	}
 }
 
-func TestChatGPTWebExecutorLinkedCodexUnauthorizedRefreshPreservesRefreshLocks(t *testing.T) {
-	manager, codexExecutor, webExecutor, _, model := newLinkedChatGPTWebRuntime(t, false, true)
+func TestChatGPTWebExecutorLinkedCodexUnauthorizedBackgroundRefreshPreservesRefreshLocks(t *testing.T) {
+	manager, codexExecutor, webExecutor, web, model := newLinkedChatGPTWebRuntime(t, false, true)
 
 	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
 	defer cancel()
+	_, errExecute := manager.Execute(
+		ctx,
+		[]string{chatgptwebauth.Provider},
+		cliproxyexecutor.Request{Model: model, Payload: []byte(`{"model":"gpt-5","input":"hello"}`)},
+		cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatCodex, ResponseFormat: sdktranslator.FormatCodex},
+	)
+	var statusErr cliproxyexecutor.StatusError
+	if !errors.As(errExecute, &statusErr) || statusErr.StatusCode() != http.StatusUnauthorized {
+		t.Fatalf("first request error = %v, want original 401", errExecute)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		current, ok := manager.GetByID(web.ID)
+		if ok && current != nil && current.Metadata["access_token"] == "source-new" && !current.Unavailable {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("background refresh did not install linked source token: %#v", current)
+		}
+		time.Sleep(time.Millisecond)
+	}
+
 	response, errExecute := manager.Execute(
 		ctx,
 		[]string{chatgptwebauth.Provider},
@@ -440,7 +462,7 @@ func TestChatGPTWebExecutorLinkedCodexUnauthorizedRefreshPreservesRefreshLocks(t
 		t.Fatal(errExecute)
 	}
 	if got := string(response.Payload); got != "source-new" {
-		t.Fatalf("response token = %q, want source-new", got)
+		t.Fatalf("second response token = %q, want source-new", got)
 	}
 	if got := codexExecutor.refreshCalls.Load(); got != 1 {
 		t.Fatalf("codex refresh calls = %d, want 1", got)

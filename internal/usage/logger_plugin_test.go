@@ -84,7 +84,7 @@ func TestRequestStatisticsFailureSummaryAggregatesSafeDimensions(t *testing.T) {
 		},
 		{
 			APIKey: "api-a", Model: "gpt-5", Source: "codex", RequestedAt: base.Add(time.Hour),
-			Failed: true, ErrorCode: "auth_request_capacity_exhausted", FailureStage: "selection",
+			Failed: true, ErrorCode: "auth_request_limited", FailureStage: "selection",
 		},
 		{APIKey: "api-a", Model: "gpt-image-2", Source: "chatgpt-web", RequestedAt: base.Add(20 * time.Minute)},
 	}

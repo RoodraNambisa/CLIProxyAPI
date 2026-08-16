@@ -517,8 +517,8 @@ func TestRoutingManagementUpdatesRequestLimiterImmediately(t *testing.T) {
 			if _, errExecute := manager.Execute(t.Context(), []string{"chatgpt-web"}, request, options); errExecute != nil {
 				t.Fatalf("first execution: %v", errExecute)
 			}
-			if _, errExecute := manager.Execute(t.Context(), []string{"chatgpt-web"}, request, options); errExecute == nil || !strings.Contains(errExecute.Error(), "auth_request_capacity_exhausted") {
-				t.Fatalf("second execution error = %v, want auth_request_capacity_exhausted", errExecute)
+			if _, errExecute := manager.Execute(t.Context(), []string{"chatgpt-web"}, request, options); errExecute == nil || !strings.Contains(errExecute.Error(), "auth_request_limited") {
+				t.Fatalf("second execution error = %v, want auth_request_limited", errExecute)
 			}
 			if testCase.prepareUpdate != nil {
 				testCase.prepareUpdate(cfg)

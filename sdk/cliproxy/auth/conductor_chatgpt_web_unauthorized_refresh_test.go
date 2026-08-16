@@ -9,16 +9,22 @@ import (
 	"testing"
 	"time"
 
+	internalconfig "github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 )
 
 type chatGPTWebUnauthorizedRefreshExecutor struct {
 	executeCalls       []string
+	countCalls         []string
+	streamCalls        []string
+	prepareCalls       int
 	refreshCalls       int
+	prepareErr         error
 	refreshErr         error
 	persistError       bool
 	beforeRefresh      func()
+	afterRefresh       func()
 	refreshContextHook func(context.Context) error
 	refreshHook        func(*Auth, *Auth)
 }
@@ -116,16 +122,30 @@ func (executor *chatGPTWebUnauthorizedRefreshExecutor) Execute(_ context.Context
 	return cliproxyexecutor.Response{Payload: []byte(auth.ID + ":" + authAccessToken(auth))}, nil
 }
 
-func (executor *chatGPTWebUnauthorizedRefreshExecutor) ExecuteStream(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
-	return nil, errors.New("not implemented")
+func (executor *chatGPTWebUnauthorizedRefreshExecutor) ExecuteStream(_ context.Context, auth *Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
+	executor.streamCalls = append(executor.streamCalls, auth.ID)
+	if authAccessToken(auth) == "stale" {
+		return nil, &Error{HTTPStatus: http.StatusUnauthorized, Message: "invalid access token"}
+	}
+	chunks := make(chan cliproxyexecutor.StreamChunk, 1)
+	chunks <- cliproxyexecutor.StreamChunk{Payload: []byte(auth.ID + ":" + authAccessToken(auth))}
+	close(chunks)
+	return &cliproxyexecutor.StreamResult{Chunks: chunks}, nil
 }
 
-func (executor *chatGPTWebUnauthorizedRefreshExecutor) CountTokens(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
-	return cliproxyexecutor.Response{}, errors.New("not implemented")
+func (executor *chatGPTWebUnauthorizedRefreshExecutor) CountTokens(_ context.Context, auth *Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	executor.countCalls = append(executor.countCalls, auth.ID)
+	if authAccessToken(auth) == "stale" {
+		return cliproxyexecutor.Response{}, &Error{HTTPStatus: http.StatusUnauthorized, Message: "invalid access token"}
+	}
+	return cliproxyexecutor.Response{Payload: []byte(auth.ID + ":" + authAccessToken(auth))}, nil
 }
 
 func (executor *chatGPTWebUnauthorizedRefreshExecutor) Refresh(ctx context.Context, auth *Auth) (*Auth, error) {
 	executor.refreshCalls++
+	if executor.afterRefresh != nil {
+		defer executor.afterRefresh()
+	}
 	if executor.beforeRefresh != nil {
 		executor.beforeRefresh()
 	}
@@ -149,6 +169,18 @@ func (executor *chatGPTWebUnauthorizedRefreshExecutor) Refresh(ctx context.Conte
 		executor.refreshHook(auth, updated)
 	}
 	return updated, nil
+}
+
+func (executor *chatGPTWebUnauthorizedRefreshExecutor) ShouldPrepareRequestAuth(*Auth) bool {
+	return executor.prepareErr != nil
+}
+
+func (executor *chatGPTWebUnauthorizedRefreshExecutor) PrepareRequestAuth(_ context.Context, auth *Auth) (*Auth, error) {
+	executor.prepareCalls++
+	if executor.prepareErr != nil {
+		return auth, executor.prepareErr
+	}
+	return auth, nil
 }
 
 func (*chatGPTWebUnauthorizedRefreshExecutor) HttpRequest(context.Context, *Auth, *http.Request) (*http.Response, error) {
@@ -190,66 +222,315 @@ func newChatGPTWebUnauthorizedRefreshFixture(t *testing.T) (*Manager, *chatGPTWe
 		registry.GetGlobalRegistry().RegisterClient(auth.ID, auth.Provider, []*registry.ModelInfo{{ID: model}})
 		t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(auth.ID) })
 	}
+	t.Cleanup(func() {
+		if errClose := manager.CloseExecutors(); errClose != nil {
+			t.Errorf("CloseExecutors() error: %v", errClose)
+		}
+	})
 	return manager, executor, auths[0], auths[1], model
 }
 
-func TestChatGPTWebUnauthorizedRefreshesSameCredentialBeforeFallback(t *testing.T) {
-	manager, executor, primary, _, model := newChatGPTWebUnauthorizedRefreshFixture(t)
-	response, err := manager.Execute(context.Background(), []string{"chatgpt-web"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
-	if err != nil {
-		t.Fatalf("Execute() error: %v", err)
+func TestChatGPTWebUnauthorizedReturnsWithoutWaitingForBackgroundRefresh(t *testing.T) {
+	testCases := []struct {
+		name   string
+		invoke func(context.Context, *Manager, string) error
+		calls  func(*chatGPTWebUnauthorizedRefreshExecutor) []string
+	}{
+		{
+			name: "execute",
+			invoke: func(ctx context.Context, manager *Manager, model string) error {
+				_, err := manager.Execute(ctx, []string{"chatgpt-web"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
+				return err
+			},
+			calls: func(executor *chatGPTWebUnauthorizedRefreshExecutor) []string { return executor.executeCalls },
+		},
+		{
+			name: "count_tokens",
+			invoke: func(ctx context.Context, manager *Manager, model string) error {
+				_, err := manager.ExecuteCount(ctx, []string{"chatgpt-web"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
+				return err
+			},
+			calls: func(executor *chatGPTWebUnauthorizedRefreshExecutor) []string { return executor.countCalls },
+		},
+		{
+			name: "stream",
+			invoke: func(ctx context.Context, manager *Manager, model string) error {
+				_, err := manager.ExecuteStream(ctx, []string{"chatgpt-web"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
+				return err
+			},
+			calls: func(executor *chatGPTWebUnauthorizedRefreshExecutor) []string { return executor.streamCalls },
+		},
 	}
-	if got := string(response.Payload); got != primary.ID+":fresh" {
-		t.Fatalf("payload = %q, want refreshed primary", got)
-	}
-	if executor.refreshCalls != 1 || len(executor.executeCalls) != 2 ||
-		executor.executeCalls[0] != primary.ID || executor.executeCalls[1] != primary.ID {
-		t.Fatalf("refresh calls = %d, execute calls = %v", executor.refreshCalls, executor.executeCalls)
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			manager, executor, primary, backup, model := newChatGPTWebUnauthorizedRefreshFixture(t)
+			refreshStarted := make(chan struct{})
+			releaseRefresh := make(chan struct{})
+			var startOnce sync.Once
+			executor.beforeRefresh = func() {
+				startOnce.Do(func() { close(refreshStarted) })
+				<-releaseRefresh
+			}
+			requestDone := make(chan error, 1)
+			go func() {
+				requestDone <- testCase.invoke(t.Context(), manager, model)
+			}()
+
+			select {
+			case <-refreshStarted:
+			case <-time.After(5 * time.Second):
+				close(releaseRefresh)
+				t.Fatal("background refresh did not start")
+			}
+			select {
+			case errRequest := <-requestDone:
+				if statusCodeFromError(errRequest) != http.StatusUnauthorized {
+					close(releaseRefresh)
+					t.Fatalf("request error = %v, want original 401", errRequest)
+				}
+				directStatus, ok := errRequest.(interface{ StatusCode() int })
+				if !ok || directStatus.StatusCode() != http.StatusUnauthorized {
+					close(releaseRefresh)
+					t.Fatalf("direct request status = %T %v, want 401", errRequest, errRequest)
+				}
+				if errRequest.Error() != "invalid access token" {
+					close(releaseRefresh)
+					t.Fatalf("request error text = %q, want original upstream message", errRequest.Error())
+				}
+			case <-time.After(time.Second):
+				close(releaseRefresh)
+				t.Fatal("request waited for the background refresh")
+			}
+			calls := testCase.calls(executor)
+			if len(calls) != 1 || calls[0] != primary.ID {
+				close(releaseRefresh)
+				t.Fatalf("upstream calls = %v, want primary once", calls)
+			}
+			for _, calls := range [][]string{executor.executeCalls, executor.countCalls, executor.streamCalls} {
+				for _, authID := range calls {
+					if authID == backup.ID {
+						close(releaseRefresh)
+						t.Fatalf("401 request fell back to backup: execute=%v count=%v stream=%v", executor.executeCalls, executor.countCalls, executor.streamCalls)
+					}
+				}
+			}
+			current, ok := manager.GetByID(primary.ID)
+			if !ok || current == nil || !current.Unavailable || current.CooldownScope != cooldownScopeAuth {
+				close(releaseRefresh)
+				t.Fatalf("401 cooldown = %#v", current)
+			}
+
+			close(releaseRefresh)
+			deadline := time.Now().Add(5 * time.Second)
+			for {
+				current, ok = manager.GetByID(primary.ID)
+				if ok && authAccessToken(current) == "fresh" && !current.Unavailable {
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Fatalf("background refresh did not restore credential: %#v", current)
+				}
+				time.Sleep(time.Millisecond)
+			}
+			if executor.refreshCalls != 1 {
+				t.Fatalf("refresh calls = %d, want 1", executor.refreshCalls)
+			}
+		})
 	}
 }
 
-func TestChatGPTWebUnauthorizedRefreshUsesConcurrentBackgroundResult(t *testing.T) {
-	manager, executor, primary, _, model := newChatGPTWebUnauthorizedRefreshFixture(t)
-	backgroundDone := make(chan error, 1)
-	executor.refreshHook = func(_ *Auth, updated *Auth) {
-		manager.mu.RLock()
-		expected := manager.auths[primary.ID]
-		baseline := expected.Clone()
-		manager.mu.RUnlock()
-		go func() {
-			_, err := manager.applyRefreshedAuth(t.Context(), expected, baseline, updated.Clone(), time.Time{})
-			backgroundDone <- err
-		}()
-		deadline := time.Now().Add(5 * time.Second)
-		for {
-			current, ok := manager.GetByID(primary.ID)
-			if ok && authAccessToken(current) == "fresh" {
-				return
-			}
-			if time.Now().After(deadline) {
-				t.Fatal("concurrent background refresh did not install the fresh credential")
-			}
-			time.Sleep(time.Millisecond)
-		}
+func TestChatGPTWebUnauthorizedCredentialIsExcludedDuringBackgroundRefreshWhenCooldownDisabled(t *testing.T) {
+	manager, executor, primary, backup, model := newChatGPTWebUnauthorizedRefreshFixture(t)
+	manager.SetConfig(&internalconfig.Config{NoCooldownStatusCodes: []int{http.StatusUnauthorized}})
+	refreshStarted := make(chan struct{})
+	releaseRefresh := make(chan struct{})
+	refreshFinished := make(chan struct{})
+	var startOnce sync.Once
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(releaseRefresh) }) }
+	t.Cleanup(release)
+	executor.beforeRefresh = func() {
+		startOnce.Do(func() { close(refreshStarted) })
+		<-releaseRefresh
 	}
+	executor.afterRefresh = func() { close(refreshFinished) }
 
-	response, err := manager.Execute(t.Context(), []string{"chatgpt-web"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
-	if err != nil {
-		t.Fatalf("Execute() error: %v", err)
-	}
-	if got := string(response.Payload); got != primary.ID+":fresh" {
-		t.Fatalf("payload = %q, want concurrently refreshed primary", got)
+	firstDone := make(chan error, 1)
+	go func() {
+		_, err := manager.Execute(t.Context(), []string{"chatgpt-web"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
+		firstDone <- err
+	}()
+	select {
+	case <-refreshStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("background refresh did not start")
 	}
 	select {
-	case err = <-backgroundDone:
-		if err != nil {
-			t.Fatalf("background applyRefreshedAuth() error: %v", err)
+	case errRequest := <-firstDone:
+		if statusCodeFromError(errRequest) != http.StatusUnauthorized {
+			t.Fatalf("first request error = %v, want original 401", errRequest)
 		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("background refresh installation did not finish")
+	case <-time.After(time.Second):
+		t.Fatal("first request waited for the background refresh")
 	}
-	if len(executor.executeCalls) != 2 || executor.executeCalls[0] != primary.ID || executor.executeCalls[1] != primary.ID {
-		t.Fatalf("execute calls = %v, want refreshed primary twice", executor.executeCalls)
+
+	current, ok := manager.GetByID(primary.ID)
+	if !ok || current == nil || current.Unavailable {
+		t.Fatalf("401 cooldown override was not applied: %#v", current)
+	}
+
+	response, errSecond := manager.Execute(t.Context(), []string{"chatgpt-web"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
+	if errSecond != nil {
+		t.Fatalf("second request error: %v", errSecond)
+	}
+	if got := string(response.Payload); got != backup.ID+":backup" {
+		t.Fatalf("second request payload = %q, want backup credential", got)
+	}
+	if len(executor.executeCalls) != 2 || executor.executeCalls[0] != primary.ID || executor.executeCalls[1] != backup.ID {
+		t.Fatalf("execute calls = %v, want primary then backup", executor.executeCalls)
+	}
+
+	release()
+	select {
+	case <-refreshFinished:
+	case <-time.After(5 * time.Second):
+		t.Fatal("background refresh did not finish")
+	}
+}
+
+func TestChatGPTWebUnauthorizedBackgroundRefreshIsSingleflight(t *testing.T) {
+	manager, executor, primary, _, _ := newChatGPTWebUnauthorizedRefreshFixture(t)
+	primary, _ = manager.GetByID(primary.ID)
+	refreshStarted := make(chan struct{})
+	releaseRefresh := make(chan struct{})
+	refreshFinished := make(chan struct{})
+	var startOnce sync.Once
+	executor.beforeRefresh = func() {
+		startOnce.Do(func() { close(refreshStarted) })
+		<-releaseRefresh
+	}
+	executor.afterRefresh = func() { close(refreshFinished) }
+
+	const callers = 32
+	results := make(chan error, callers)
+	for range callers {
+		go func() {
+			_, _, err := manager.tryRefreshAfterUnauthorized(
+				t.Context(),
+				executor,
+				primary,
+				&Error{HTTPStatus: http.StatusUnauthorized, Message: "invalid access token"},
+				false,
+			)
+			triggerChatGPTWebUnauthorizedRequestRefresh(err)
+			results <- err
+		}()
+	}
+	for range callers {
+		select {
+		case errRequest := <-results:
+			if statusCodeFromError(errRequest) != http.StatusUnauthorized || !isChatGPTWebUnauthorizedRequestError(errRequest) {
+				close(releaseRefresh)
+				t.Fatalf("trigger error = %v, want immediate wrapped 401", errRequest)
+			}
+		case <-time.After(time.Second):
+			close(releaseRefresh)
+			t.Fatal("401 caller waited for the shared refresh")
+		}
+	}
+	select {
+	case <-refreshStarted:
+	case <-time.After(5 * time.Second):
+		close(releaseRefresh)
+		t.Fatal("shared background refresh did not start")
+	}
+	if executor.refreshCalls != 1 {
+		close(releaseRefresh)
+		t.Fatalf("refresh calls = %d, want one shared attempt", executor.refreshCalls)
+	}
+	close(releaseRefresh)
+	select {
+	case <-refreshFinished:
+	case <-time.After(5 * time.Second):
+		t.Fatal("shared background refresh did not finish")
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		current, ok := manager.GetByID(primary.ID)
+		if ok && authAccessToken(current) == "fresh" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("shared background refresh was not installed: %#v", current)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func TestChatGPTWebUnauthorizedPreparationReturnsWithoutWaitingForRefresh(t *testing.T) {
+	manager, executor, primary, _, model := newChatGPTWebUnauthorizedRefreshFixture(t)
+	executor.prepareErr = &Error{HTTPStatus: http.StatusUnauthorized, Message: "expired access token"}
+	refreshStarted := make(chan struct{})
+	releaseRefresh := make(chan struct{})
+	refreshFinished := make(chan struct{})
+	var startOnce sync.Once
+	executor.beforeRefresh = func() {
+		startOnce.Do(func() { close(refreshStarted) })
+		<-releaseRefresh
+	}
+	executor.afterRefresh = func() { close(refreshFinished) }
+	requestDone := make(chan error, 1)
+	go func() {
+		_, err := manager.Execute(t.Context(), []string{"chatgpt-web"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
+		requestDone <- err
+	}()
+
+	select {
+	case <-refreshStarted:
+	case <-time.After(5 * time.Second):
+		close(releaseRefresh)
+		t.Fatal("background refresh did not start after preparation 401")
+	}
+	select {
+	case errRequest := <-requestDone:
+		if statusCodeFromError(errRequest) != http.StatusUnauthorized {
+			close(releaseRefresh)
+			t.Fatalf("request error = %v, want original preparation 401", errRequest)
+		}
+		if errRequest.Error() != "expired access token" {
+			close(releaseRefresh)
+			t.Fatalf("request error text = %q, want original preparation message", errRequest.Error())
+		}
+	case <-time.After(time.Second):
+		close(releaseRefresh)
+		t.Fatal("preparation 401 waited for the background refresh")
+	}
+	if executor.prepareCalls != 1 || len(executor.executeCalls) != 0 {
+		close(releaseRefresh)
+		t.Fatalf("prepare calls = %d, execute calls = %v", executor.prepareCalls, executor.executeCalls)
+	}
+	current, ok := manager.GetByID(primary.ID)
+	if !ok || current == nil || !current.Unavailable || current.CooldownScope != cooldownScopeAuth {
+		close(releaseRefresh)
+		t.Fatalf("preparation 401 cooldown = %#v", current)
+	}
+	close(releaseRefresh)
+	select {
+	case <-refreshFinished:
+	case <-time.After(5 * time.Second):
+		t.Fatal("preparation background refresh did not finish")
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		current, ok = manager.GetByID(primary.ID)
+		if ok && authAccessToken(current) == "fresh" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("preparation background refresh was not installed: %#v", current)
+		}
+		time.Sleep(time.Millisecond)
 	}
 }
 
@@ -989,14 +1270,18 @@ func TestChatGPTWebUnauthorizedRefreshRejectsStaleSameAccountInstallation(t *tes
 }
 
 func TestChatGPTWebTransientRefreshFailureCoolsWholeCredential(t *testing.T) {
-	manager, executor, primary, backup, model := newChatGPTWebUnauthorizedRefreshFixture(t)
+	manager, executor, primary, _, model := newChatGPTWebUnauthorizedRefreshFixture(t)
 	executor.refreshErr = chatGPTWebRequestRefreshError{}
-	response, err := manager.Execute(context.Background(), []string{"chatgpt-web"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
-	if err != nil {
-		t.Fatalf("Execute() error: %v", err)
+	refreshFinished := make(chan struct{})
+	executor.afterRefresh = func() { close(refreshFinished) }
+	_, err := manager.Execute(context.Background(), []string{"chatgpt-web"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
+	if statusCodeFromError(err) != http.StatusUnauthorized {
+		t.Fatalf("Execute() error = %v, want original 401", err)
 	}
-	if got := string(response.Payload); got != backup.ID+":backup" {
-		t.Fatalf("payload = %q, want backup", got)
+	select {
+	case <-refreshFinished:
+	case <-time.After(5 * time.Second):
+		t.Fatal("background refresh failure did not finish")
 	}
 	current, ok := manager.GetByID(primary.ID)
 	if !ok || current == nil {
@@ -1008,26 +1293,35 @@ func TestChatGPTWebTransientRefreshFailureCoolsWholeCredential(t *testing.T) {
 	if len(current.ModelStates) != 0 {
 		t.Fatalf("401 created model-only state: %#v", current.ModelStates)
 	}
+	if len(executor.executeCalls) != 1 || executor.executeCalls[0] != primary.ID {
+		t.Fatalf("execute calls = %v, want primary once", executor.executeCalls)
+	}
 }
 
-func TestChatGPTWebTerminalRefreshFailurePersistsLifecycleBeforeFallback(t *testing.T) {
-	manager, executor, primary, backup, model := newChatGPTWebUnauthorizedRefreshFixture(t)
+func TestChatGPTWebTerminalRefreshFailurePersistsLifecycleInBackground(t *testing.T) {
+	manager, executor, primary, _, model := newChatGPTWebUnauthorizedRefreshFixture(t)
 	executor.persistError = true
-	response, err := manager.Execute(context.Background(), []string{"chatgpt-web"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
-	if err != nil {
-		t.Fatalf("Execute() error: %v", err)
+	_, err := manager.Execute(context.Background(), []string{"chatgpt-web"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
+	if statusCodeFromError(err) != http.StatusUnauthorized {
+		t.Fatalf("Execute() error = %v, want original 401", err)
 	}
-	if got := string(response.Payload); got != backup.ID+":backup" {
-		t.Fatalf("payload = %q, want backup", got)
-	}
-	current, ok := manager.GetByID(primary.ID)
-	if !ok || current == nil {
-		t.Fatal("primary auth missing")
-	}
-	if current.LifecycleState() != LifecycleStateReloginPending || current.Status != StatusPending {
-		t.Fatalf("primary lifecycle = %q/%q, want relogin_pending/pending", current.LifecycleState(), current.Status)
+	deadline := time.Now().Add(5 * time.Second)
+	var current *Auth
+	var ok bool
+	for {
+		current, ok = manager.GetByID(primary.ID)
+		if ok && current != nil && current.LifecycleState() == LifecycleStateReloginPending && current.Status == StatusPending {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("primary lifecycle = %#v, want relogin_pending/pending", current)
+		}
+		time.Sleep(time.Millisecond)
 	}
 	if current.Unavailable || current.CooldownScope != "" {
 		t.Fatalf("terminal refresh failure created cooldown: %#v", current)
+	}
+	if len(executor.executeCalls) != 1 || executor.executeCalls[0] != primary.ID {
+		t.Fatalf("execute calls = %v, want primary once", executor.executeCalls)
 	}
 }

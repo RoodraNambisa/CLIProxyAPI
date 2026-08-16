@@ -457,8 +457,7 @@ func (e *authRequestLimitedError) Error() string {
 	}
 	payload := map[string]any{
 		"error": map[string]any{
-			"code":           "auth_request_capacity_exhausted",
-			"legacy_code":    "auth_request_limited",
+			"code":           "auth_request_limited",
 			"message":        "All available credentials reached their request limit",
 			"limit":          e.limit,
 			"window_minutes": e.windowMinutes,
@@ -467,7 +466,7 @@ func (e *authRequestLimitedError) Error() string {
 	}
 	data, err := json.Marshal(payload)
 	if err != nil {
-		return `{"error":{"code":"auth_request_capacity_exhausted","legacy_code":"auth_request_limited","message":"All available credentials reached their request limit"}}`
+		return `{"error":{"code":"auth_request_limited","message":"All available credentials reached their request limit"}}`
 	}
 	return string(data)
 }
