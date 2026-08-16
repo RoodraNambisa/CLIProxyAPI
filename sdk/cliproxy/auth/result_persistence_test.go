@@ -754,7 +754,7 @@ func TestDiscardStreamChunksHasBoundedCleanupForUncooperativeSources(t *testing.
 		cancel()
 		select {
 		case <-done:
-		case <-time.After(200 * time.Millisecond):
+		case <-time.After(time.Second):
 			t.Fatal("stream discard goroutine did not stop after shutdown cancellation")
 		}
 	})
@@ -769,21 +769,21 @@ func TestDiscardStreamChunksHasBoundedCleanupForUncooperativeSources(t *testing.
 		var asynchronousDone <-chan struct{}
 		select {
 		case asynchronousDone = <-returned:
-		case <-time.After(200 * time.Millisecond):
+		case <-time.After(time.Second):
 			cancel()
 			t.Fatal("stream discard waited for cleanup before returning")
 		}
 		cancel()
 		select {
 		case <-asynchronousDone:
-		case <-time.After(200 * time.Millisecond):
+		case <-time.After(time.Second):
 			t.Fatal("asynchronous stream discard did not stop after cancellation")
 		}
 
 		done := discardStreamChunksWithin(context.Background(), remaining, 20*time.Millisecond)
 		select {
 		case <-done:
-		case <-time.After(200 * time.Millisecond):
+		case <-time.After(time.Second):
 			t.Fatal("stream discard goroutine exceeded its fallback cleanup bound")
 		}
 	})

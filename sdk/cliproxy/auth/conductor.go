@@ -10970,8 +10970,11 @@ func (m *Manager) startChatGPTWebRequestRefreshFlight(ctx context.Context, id, f
 }
 
 func chatGPTWebRequestRefreshBackpressured(err error) bool {
-	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+	if err == nil || errors.Is(err, context.Canceled) {
 		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
 	}
 	var authErr *Error
 	return errors.As(err, &authErr) && authErr != nil && authErr.Code == "refresh_persist_backpressure"

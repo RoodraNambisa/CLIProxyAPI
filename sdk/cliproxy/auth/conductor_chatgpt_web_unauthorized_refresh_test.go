@@ -569,6 +569,27 @@ func TestChatGPTWebUnauthorizedRefreshBackpressureTemporarilyExcludesOnlyFailedC
 	}
 }
 
+func TestChatGPTWebRequestRefreshBackpressureClassification(t *testing.T) {
+	for _, testCase := range []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "queue full", err: refreshPersistenceBackpressureError(), want: true},
+		{name: "admission deadline", err: context.DeadlineExceeded, want: true},
+		{name: "shutdown cancellation", err: context.Canceled, want: false},
+		{name: "coordinator closed", err: refreshPersistenceClosedError(), want: false},
+		{name: "unrelated error", err: errors.New("refresh failed"), want: false},
+		{name: "success", err: nil, want: false},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			if got := chatGPTWebRequestRefreshBackpressured(testCase.err); got != testCase.want {
+				t.Fatalf("chatGPTWebRequestRefreshBackpressured(%v) = %t, want %t", testCase.err, got, testCase.want)
+			}
+		})
+	}
+}
+
 func TestChatGPTWebUnauthorizedBackgroundRefreshIsSingleflight(t *testing.T) {
 	manager, executor, primary, _, _ := newChatGPTWebUnauthorizedRefreshFixture(t)
 	primary, _ = manager.GetByID(primary.ID)
