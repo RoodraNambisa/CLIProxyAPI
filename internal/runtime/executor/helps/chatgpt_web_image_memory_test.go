@@ -157,6 +157,378 @@ func TestChatGPTWebImageMemoryAdmissionCancellationAndOversizedWork(t *testing.T
 	}
 }
 
+func TestChatGPTWebImageMemoryAdmissionResizeReweightsQueuedRequest(t *testing.T) {
+	t.Run("expansion uses original request", func(t *testing.T) {
+		admission := NewChatGPTWebImageMemoryAdmission(4)
+		releaseActive, err := admission.Acquire(t.Context(), 4)
+		if err != nil {
+			t.Fatalf("Acquire(active) error = %v", err)
+		}
+		acquired := make(chan func(), 1)
+		go func() {
+			release, errAcquire := admission.Acquire(t.Context(), 8)
+			if errAcquire == nil {
+				acquired <- release
+			}
+		}()
+		waitForImageMemorySnapshot(t, admission, func(snapshot ChatGPTWebImageMemoryRuntimeSnapshot) bool {
+			return snapshot.WaitingTasks == 1 && snapshot.WaitingBytes == 4
+		})
+
+		admission.Resize(12)
+		var releaseQueued func()
+		select {
+		case releaseQueued = <-acquired:
+		case <-time.After(time.Second):
+			t.Fatal("expanded admission did not grant queued request")
+		}
+		if snapshot := admission.Snapshot(); snapshot.CapacityBytes != 12 || snapshot.ProcessingBytes != 12 || snapshot.WaitingTasks != 0 {
+			t.Fatalf("expanded snapshot = %#v", snapshot)
+		}
+		releaseQueued()
+		releaseActive()
+		assertImageMemoryAdmissionEmpty(t, admission)
+	})
+
+	t.Run("shrink preserves oversized exclusive contract", func(t *testing.T) {
+		admission := NewChatGPTWebImageMemoryAdmission(8)
+		releaseActive, err := admission.Acquire(t.Context(), 8)
+		if err != nil {
+			t.Fatalf("Acquire(active) error = %v", err)
+		}
+		acquired := make(chan func(), 1)
+		go func() {
+			release, errAcquire := admission.Acquire(t.Context(), 16)
+			if errAcquire == nil {
+				acquired <- release
+			}
+		}()
+		waitForImageMemorySnapshot(t, admission, func(snapshot ChatGPTWebImageMemoryRuntimeSnapshot) bool {
+			return snapshot.WaitingTasks == 1 && snapshot.WaitingBytes == 8
+		})
+
+		admission.Resize(4)
+		if snapshot := admission.Snapshot(); snapshot.CapacityBytes != 4 || snapshot.ProcessingBytes != 8 || snapshot.WaitingBytes != 4 {
+			t.Fatalf("shrunk blocked snapshot = %#v", snapshot)
+		}
+		releaseActive()
+		var releaseQueued func()
+		select {
+		case releaseQueued = <-acquired:
+		case <-time.After(time.Second):
+			t.Fatal("shrunk admission did not grant exclusive request")
+		}
+		if snapshot := admission.Snapshot(); snapshot.ProcessingBytes != 4 || snapshot.ProcessingTasks != 1 {
+			t.Fatalf("shrunk granted snapshot = %#v", snapshot)
+		}
+		releaseQueued()
+		assertImageMemoryAdmissionEmpty(t, admission)
+	})
+
+	t.Run("zero grant waits for shrink convergence", func(t *testing.T) {
+		admission := NewChatGPTWebImageMemoryAdmission(8)
+		releaseSelfHeld, err := admission.Acquire(t.Context(), 4)
+		if err != nil {
+			t.Fatalf("Acquire(self-held) error = %v", err)
+		}
+		releaseOther, err := admission.Acquire(t.Context(), 4)
+		if err != nil {
+			t.Fatalf("Acquire(other) error = %v", err)
+		}
+		admission.Resize(4)
+		acquired := make(chan func(), 1)
+		go func() {
+			release, _, errAcquire := admission.acquireCritical(t.Context(), 1, 4)
+			if errAcquire == nil {
+				acquired <- release
+			}
+		}()
+		waitForImageMemorySnapshot(t, admission, func(snapshot ChatGPTWebImageMemoryRuntimeSnapshot) bool {
+			return snapshot.ProcessingBytes == 8 && snapshot.WaitingTasks == 1 && snapshot.WaitingBytes == 0
+		})
+		select {
+		case releaseQueued := <-acquired:
+			releaseQueued()
+			t.Fatal("zero-grant request bypassed the shrunken capacity")
+		default:
+		}
+
+		releaseOther()
+		var releaseQueued func()
+		select {
+		case releaseQueued = <-acquired:
+		case <-time.After(time.Second):
+			t.Fatal("zero-grant request did not resume after usage converged")
+		}
+		releaseQueued()
+		releaseSelfHeld()
+		assertImageMemoryAdmissionEmpty(t, admission)
+		admission.mu.Lock()
+		used := admission.used
+		admission.mu.Unlock()
+		if used != 0 {
+			t.Fatalf("internal used after zero-grant release = %d", used)
+		}
+	})
+}
+
+func TestChatGPTWebImageMemoryAdmissionCancelGrantRaceDoesNotDoubleRelease(t *testing.T) {
+	for iteration := range 100 {
+		admission := NewChatGPTWebImageMemoryAdmission(1)
+		releaseActive, err := admission.Acquire(t.Context(), 1)
+		if err != nil {
+			t.Fatalf("iteration %d: Acquire(active) error = %v", iteration, err)
+		}
+		ctx, cancel := context.WithCancel(t.Context())
+		result := make(chan struct {
+			release func()
+			err     error
+		}, 1)
+		go func() {
+			release, errAcquire := admission.Acquire(ctx, 1)
+			result <- struct {
+				release func()
+				err     error
+			}{release: release, err: errAcquire}
+		}()
+		waitForImageMemorySnapshot(t, admission, func(snapshot ChatGPTWebImageMemoryRuntimeSnapshot) bool {
+			return snapshot.WaitingTasks == 1
+		})
+
+		var race sync.WaitGroup
+		race.Add(2)
+		go func() {
+			defer race.Done()
+			cancel()
+		}()
+		go func() {
+			defer race.Done()
+			releaseActive()
+		}()
+		race.Wait()
+		outcome := <-result
+		if outcome.err == nil && outcome.release != nil {
+			outcome.release()
+		} else if !errors.Is(outcome.err, context.Canceled) {
+			t.Fatalf("iteration %d: Acquire(waiter) error = %v", iteration, outcome.err)
+		}
+		assertImageMemoryAdmissionEmpty(t, admission)
+		admission.mu.Lock()
+		used := admission.used
+		admission.mu.Unlock()
+		if used != 0 {
+			t.Fatalf("iteration %d: internal used = %d", iteration, used)
+		}
+	}
+}
+
+func TestChatGPTWebImageMemoryLeaseSetResizeUsesActualGrantWeight(t *testing.T) {
+	t.Run("retained expansion", func(t *testing.T) {
+		admission, leases, releaseTurn := installResizableImageMemoryTestState(t, 4)
+		releaseActive, err := admission.Acquire(t.Context(), 4)
+		if err != nil {
+			t.Fatalf("Acquire(active) error = %v", err)
+		}
+		acquired := make(chan error, 1)
+		go func() { acquired <- leases.Acquire(t.Context(), 8) }()
+		waitForImageMemorySnapshot(t, admission, func(snapshot ChatGPTWebImageMemoryRuntimeSnapshot) bool {
+			return snapshot.WaitingTasks == 1 && snapshot.WaitingBytes == 4
+		})
+
+		admission.Resize(12)
+		if err = <-acquired; err != nil {
+			t.Fatalf("LeaseSet.Acquire() error = %v", err)
+		}
+		leases.mu.Lock()
+		retained := leases.retainedBytes
+		pending := leases.pendingRetained
+		leases.mu.Unlock()
+		if retained != 8 || pending != 0 {
+			t.Fatalf("lease accounting = retained:%d pending:%d, want 8/0", retained, pending)
+		}
+		if snapshot := admission.Snapshot(); snapshot.ProcessingBytes != 12 || snapshot.WaitingBytes != 0 {
+			t.Fatalf("expanded lease snapshot = %#v", snapshot)
+		}
+		releaseTurn()
+		leases.Release()
+		releaseActive()
+		assertImageMemoryAdmissionEmpty(t, admission)
+	})
+
+	t.Run("transient shrink", func(t *testing.T) {
+		admission, leases, releaseTurn := installResizableImageMemoryTestState(t, 8)
+		releaseActive, err := admission.Acquire(t.Context(), 8)
+		if err != nil {
+			t.Fatalf("Acquire(active) error = %v", err)
+		}
+		type transientResult struct {
+			release func()
+			err     error
+		}
+		acquired := make(chan transientResult, 1)
+		go func() {
+			release, errAcquire := leases.AcquireTransient(t.Context(), 16)
+			acquired <- transientResult{release: release, err: errAcquire}
+		}()
+		waitForImageMemorySnapshot(t, admission, func(snapshot ChatGPTWebImageMemoryRuntimeSnapshot) bool {
+			return snapshot.WaitingTasks == 1 && snapshot.WaitingBytes == 8
+		})
+
+		admission.Resize(4)
+		if snapshot := admission.Snapshot(); snapshot.WaitingBytes != 4 || snapshot.ProcessingBytes != 8 {
+			t.Fatalf("shrunk lease snapshot = %#v", snapshot)
+		}
+		releaseActive()
+		outcome := <-acquired
+		if outcome.err != nil {
+			t.Fatalf("LeaseSet.AcquireTransient() error = %v", outcome.err)
+		}
+		leases.mu.Lock()
+		transient := leases.transientBytes
+		leases.mu.Unlock()
+		if transient != 4 {
+			t.Fatalf("transient accounting = %d, want 4", transient)
+		}
+		if snapshot := admission.Snapshot(); snapshot.ProcessingBytes != 4 || snapshot.WaitingTasks != 0 {
+			t.Fatalf("shrunk transient snapshot = %#v", snapshot)
+		}
+		outcome.release()
+		leases.mu.Lock()
+		transient = leases.transientBytes
+		leases.mu.Unlock()
+		if transient != 0 {
+			t.Fatalf("transient accounting after release = %d", transient)
+		}
+		releaseTurn()
+		leases.Release()
+		assertImageMemoryAdmissionEmpty(t, admission)
+	})
+}
+
+func TestChatGPTWebImageMemoryLeaseSetShrinkCreditsOwnedFinalizerMemory(t *testing.T) {
+	previousAdmission := defaultChatGPTWebImageMemoryAdmission
+	previousCoordinator := defaultChatGPTWebImageCompletionCoordinator
+	admission := NewChatGPTWebImageMemoryAdmission(8)
+	defaultChatGPTWebImageMemoryAdmission = admission
+	defaultChatGPTWebImageCompletionCoordinator = &chatGPTWebImageCompletionCoordinator{
+		turn:         make(chan struct{}, 1),
+		reservations: make(map[*ChatGPTWebImageMemoryLeaseSet]struct{}),
+	}
+	t.Cleanup(func() {
+		defaultChatGPTWebImageMemoryAdmission = previousAdmission
+		defaultChatGPTWebImageCompletionCoordinator = previousCoordinator
+	})
+
+	leases := NewChatGPTWebImageMemoryLeaseSet()
+	if !leases.TryReserveCompletion(1) {
+		t.Fatal("TryReserveCompletion() = false")
+	}
+	releaseTurn, err := leases.BeginFinalization(t.Context())
+	if err != nil {
+		t.Fatalf("BeginFinalization() error = %v", err)
+	}
+	if err = leases.Acquire(t.Context(), 2); err != nil {
+		t.Fatalf("Acquire(retained) error = %v", err)
+	}
+	releaseBlocker, err := admission.Acquire(t.Context(), 6)
+	if err != nil {
+		t.Fatalf("Acquire(blocker) error = %v", err)
+	}
+
+	type transientResult struct {
+		release func()
+		err     error
+	}
+	acquired := make(chan transientResult, 1)
+	go func() {
+		release, errAcquire := leases.AcquireTransient(t.Context(), 6)
+		acquired <- transientResult{release: release, err: errAcquire}
+	}()
+	waitForImageMemorySnapshot(t, admission, func(snapshot ChatGPTWebImageMemoryRuntimeSnapshot) bool {
+		return snapshot.WaitingTasks == 1 && snapshot.WaitingBytes == 6 && snapshot.ProcessingBytes == 8
+	})
+
+	admission.Resize(4)
+	if snapshot := admission.Snapshot(); snapshot.CapacityBytes != 4 || snapshot.WaitingBytes != 2 || snapshot.ProcessingBytes != 8 {
+		t.Fatalf("shrunk credited snapshot = %#v", snapshot)
+	}
+	releaseBlocker()
+	var outcome transientResult
+	select {
+	case outcome = <-acquired:
+	case <-time.After(time.Second):
+		t.Fatal("finalizer remained self-blocked after shrink")
+	}
+	if outcome.err != nil {
+		t.Fatalf("AcquireTransient() error = %v", outcome.err)
+	}
+	leases.mu.Lock()
+	retained := leases.retainedBytes
+	retainedGrant := leases.retainedGrantBytes
+	transient := leases.transientBytes
+	transientGrant := leases.transientGrantBytes
+	leases.mu.Unlock()
+	if retained != 2 || retainedGrant != 1 || transient != 2 || transientGrant != 2 {
+		t.Fatalf("lease accounting = retained:%d/%d transient:%d/%d", retained, retainedGrant, transient, transientGrant)
+	}
+	if snapshot := admission.Snapshot(); snapshot.ProcessingBytes != 4 || snapshot.WaitingTasks != 0 || snapshot.WaitingBytes != 0 {
+		t.Fatalf("credited grant snapshot = %#v", snapshot)
+	}
+
+	outcome.release()
+	releaseTurn()
+	leases.Release()
+	assertImageMemoryAdmissionEmpty(t, admission)
+	admission.mu.Lock()
+	used := admission.used
+	admission.mu.Unlock()
+	if used != 0 {
+		t.Fatalf("internal used after release = %d", used)
+	}
+}
+
+func installResizableImageMemoryTestState(t *testing.T, capacity int64) (*ChatGPTWebImageMemoryAdmission, *ChatGPTWebImageMemoryLeaseSet, func()) {
+	t.Helper()
+	previousAdmission := defaultChatGPTWebImageMemoryAdmission
+	previousCoordinator := defaultChatGPTWebImageCompletionCoordinator
+	admission := NewChatGPTWebImageMemoryAdmission(capacity)
+	defaultChatGPTWebImageMemoryAdmission = admission
+	defaultChatGPTWebImageCompletionCoordinator = &chatGPTWebImageCompletionCoordinator{
+		turn:         make(chan struct{}, 1),
+		reservations: make(map[*ChatGPTWebImageMemoryLeaseSet]struct{}),
+	}
+	t.Cleanup(func() {
+		defaultChatGPTWebImageMemoryAdmission = previousAdmission
+		defaultChatGPTWebImageCompletionCoordinator = previousCoordinator
+	})
+	leases := NewChatGPTWebImageMemoryLeaseSet()
+	releaseTurn, err := leases.BeginFinalization(t.Context())
+	if err != nil {
+		t.Fatalf("BeginFinalization() error = %v", err)
+	}
+	return admission, leases, releaseTurn
+}
+
+func waitForImageMemorySnapshot(t *testing.T, admission *ChatGPTWebImageMemoryAdmission, ready func(ChatGPTWebImageMemoryRuntimeSnapshot) bool) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if ready(admission.Snapshot()) {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("admission did not reach expected state: %#v", admission.Snapshot())
+}
+
+func assertImageMemoryAdmissionEmpty(t *testing.T, admission *ChatGPTWebImageMemoryAdmission) {
+	t.Helper()
+	snapshot := admission.Snapshot()
+	if snapshot.ProcessingTasks != 0 || snapshot.ProcessingBytes != 0 || snapshot.WaitingTasks != 0 || snapshot.WaitingBytes != 0 {
+		t.Fatalf("admission leaked: %#v", snapshot)
+	}
+}
+
 func TestChatGPTWebImageCompletionReserveClampsAndFundsCompletion(t *testing.T) {
 	previous := defaultChatGPTWebImageMemoryAdmission
 	defaultChatGPTWebImageMemoryAdmission = NewChatGPTWebImageMemoryAdmission(4)

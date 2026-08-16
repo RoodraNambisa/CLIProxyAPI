@@ -71,6 +71,9 @@ const (
 	DefaultChatGPTWebImageCompletionReserveMB  = internalconfig.DefaultChatGPTWebImageCompletionReserveMB
 	MinChatGPTWebImageCompletionReserveMB      = internalconfig.MinChatGPTWebImageCompletionReserveMB
 	MaxChatGPTWebImageCompletionReserveMB      = internalconfig.MaxChatGPTWebImageCompletionReserveMB
+	DefaultChatGPTWebImageMemoryCapacityMB     = internalconfig.DefaultChatGPTWebImageMemoryCapacityMB
+	MinChatGPTWebImageMemoryCapacityMB         = internalconfig.MinChatGPTWebImageMemoryCapacityMB
+	MaxChatGPTWebImageMemoryCapacityMB         = internalconfig.MaxChatGPTWebImageMemoryCapacityMB
 	MinChatGPTWebMaxN                          = internalconfig.MinChatGPTWebMaxN
 	MaxChatGPTWebMaxN                          = internalconfig.MaxChatGPTWebMaxN
 )

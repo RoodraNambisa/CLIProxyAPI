@@ -1062,6 +1062,7 @@ func TestChatGPTWebExecutorUpdateConfigAppliesImageAdmissionPolicyWithoutEvictin
 	executor := NewChatGPTWebExecutor(nil, nil)
 	t.Cleanup(func() { _ = executor.Close() })
 	t.Cleanup(func() {
+		helps.ConfigureChatGPTWebImageMemoryCapacity(int64(config.DefaultChatGPTWebImageMemoryCapacityMB) << 20)
 		cliproxyexecutor.ConfigureChatGPTWebImageAdmissions(
 			config.DefaultChatGPTWebImageMaxInFlight,
 			config.DefaultChatGPTWebImageAdmissionQueueSize,
@@ -1071,11 +1072,17 @@ func TestChatGPTWebExecutorUpdateConfigAppliesImageAdmissionPolicyWithoutEvictin
 	maxInFlight := 2
 	queueLimit := 1
 	maxFinalizers := 1
+	memoryCapacity := 96
 	executor.UpdateConfig(&config.Config{SDKConfig: config.SDKConfig{Images: config.ImagesConfig{ChatGPTWeb: config.ChatGPTWebImageConfig{
-		MaxInFlight:        &maxInFlight,
-		AdmissionQueueSize: &queueLimit,
-		MaxFinalizers:      &maxFinalizers,
+		MaxInFlight:             &maxInFlight,
+		AdmissionQueueSize:      &queueLimit,
+		MaxFinalizers:           &maxFinalizers,
+		MemoryCapacityMegabytes: &memoryCapacity,
 	}}}})
+	memoryRelease, errMemory := helps.AcquireChatGPTWebImageMemory(t.Context(), 80<<20)
+	if errMemory != nil {
+		t.Fatalf("initial memory admission = %v", errMemory)
+	}
 	releaseA, errA := cliproxyexecutor.AcquireChatGPTWebImageExecution(t.Context(), 0)
 	releaseB, errB := cliproxyexecutor.AcquireChatGPTWebImageExecution(t.Context(), 0)
 	if errA != nil || errB != nil {
@@ -1083,10 +1090,12 @@ func TestChatGPTWebExecutorUpdateConfigAppliesImageAdmissionPolicyWithoutEvictin
 	}
 	lowered := 1
 	queueDisabled := 0
+	loweredMemoryCapacity := 64
 	executor.UpdateConfig(&config.Config{SDKConfig: config.SDKConfig{Images: config.ImagesConfig{ChatGPTWeb: config.ChatGPTWebImageConfig{
-		MaxInFlight:        &lowered,
-		AdmissionQueueSize: &queueDisabled,
-		MaxFinalizers:      &maxFinalizers,
+		MaxInFlight:             &lowered,
+		AdmissionQueueSize:      &queueDisabled,
+		MaxFinalizers:           &maxFinalizers,
+		MemoryCapacityMegabytes: &loweredMemoryCapacity,
 	}}}})
 	snapshot := cliproxyexecutor.ChatGPTWebImageExecutionAdmissionSnapshot()
 	if snapshot.Limit != 1 || snapshot.Active != 2 || snapshot.QueueLimit != 0 {
@@ -1095,8 +1104,16 @@ func TestChatGPTWebExecutorUpdateConfigAppliesImageAdmissionPolicyWithoutEvictin
 	if _, err := cliproxyexecutor.AcquireChatGPTWebImageExecution(t.Context(), 0); !cliproxyexecutor.IsImageExecutionCapacityError(err) {
 		t.Fatalf("admission while over lowered limit = %T %v", err, err)
 	}
+	if memorySnapshot := helps.ChatGPTWebImageMemorySnapshot(); memorySnapshot.CapacityBytes != 64<<20 || memorySnapshot.ProcessingBytes != 80<<20 {
+		t.Fatalf("hot-lowered memory snapshot = %#v", memorySnapshot)
+	}
+	if releaseMemory, acquired := helps.TryAcquireChatGPTWebImageMemory(1); acquired {
+		releaseMemory()
+		t.Fatal("memory admission succeeded while active usage exceeded lowered capacity")
+	}
 	releaseA()
 	releaseB()
+	memoryRelease()
 	if snapshot = cliproxyexecutor.ChatGPTWebImageExecutionAdmissionSnapshot(); snapshot.Active != 0 {
 		t.Fatalf("released snapshot = %#v", snapshot)
 	}

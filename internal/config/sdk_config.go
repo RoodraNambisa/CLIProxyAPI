@@ -196,6 +196,8 @@ type ChatGPTWebImageConfig struct {
 	MaxFinalizers *int `yaml:"max-finalizers,omitempty" json:"max-finalizers,omitempty"`
 	// CompletionReserveMegabytes reserves a small per-attempt completion allowance before upstream work.
 	CompletionReserveMegabytes *int `yaml:"completion-reserve-megabytes,omitempty" json:"completion-reserve-megabytes,omitempty"`
+	// MemoryCapacityMegabytes bounds the shared process-wide ChatGPT Web image working set.
+	MemoryCapacityMegabytes *int `yaml:"memory-capacity-megabytes,omitempty" json:"memory-capacity-megabytes,omitempty"`
 }
 
 const (
@@ -227,6 +229,9 @@ const (
 	DefaultChatGPTWebImageCompletionReserveMB   = 1
 	MinChatGPTWebImageCompletionReserveMB       = 0
 	MaxChatGPTWebImageCompletionReserveMB       = 32
+	DefaultChatGPTWebImageMemoryCapacityMB      = 512
+	MinChatGPTWebImageMemoryCapacityMB          = 64
+	MaxChatGPTWebImageMemoryCapacityMB          = 8192
 )
 
 // ResolvedChatGPTWebImageConfig contains effective ChatGPT Web image compatibility values.
@@ -246,6 +251,7 @@ type ResolvedChatGPTWebImageConfig struct {
 	AdmissionWaitMilliseconds  int
 	MaxFinalizers              int
 	CompletionReserveMegabytes int
+	MemoryCapacityMegabytes    int
 }
 
 // ResolvedUpstreamModel returns the effective ChatGPT Web image conversation model.
@@ -274,6 +280,7 @@ func (cfg ChatGPTWebImageConfig) Resolved() ResolvedChatGPTWebImageConfig {
 		AdmissionWaitMilliseconds:  DefaultChatGPTWebImageAdmissionWaitMS,
 		MaxFinalizers:              DefaultChatGPTWebImageMaxFinalizers,
 		CompletionReserveMegabytes: DefaultChatGPTWebImageCompletionReserveMB,
+		MemoryCapacityMegabytes:    DefaultChatGPTWebImageMemoryCapacityMB,
 	}
 	if cfg.AspectRatioMaxErrorPercent != nil {
 		resolved.AspectRatioMaxErrorPercent = *cfg.AspectRatioMaxErrorPercent
@@ -304,6 +311,9 @@ func (cfg ChatGPTWebImageConfig) Resolved() ResolvedChatGPTWebImageConfig {
 	}
 	if cfg.CompletionReserveMegabytes != nil {
 		resolved.CompletionReserveMegabytes = *cfg.CompletionReserveMegabytes
+	}
+	if cfg.MemoryCapacityMegabytes != nil {
+		resolved.MemoryCapacityMegabytes = *cfg.MemoryCapacityMegabytes
 	}
 	return resolved
 }
@@ -349,6 +359,9 @@ func (cfg ChatGPTWebImageConfig) Validate() error {
 	}
 	if resolved.CompletionReserveMegabytes < MinChatGPTWebImageCompletionReserveMB || resolved.CompletionReserveMegabytes > MaxChatGPTWebImageCompletionReserveMB {
 		return fmt.Errorf("images.chatgpt-web.completion-reserve-megabytes must be between %d and %d", MinChatGPTWebImageCompletionReserveMB, MaxChatGPTWebImageCompletionReserveMB)
+	}
+	if resolved.MemoryCapacityMegabytes < MinChatGPTWebImageMemoryCapacityMB || resolved.MemoryCapacityMegabytes > MaxChatGPTWebImageMemoryCapacityMB {
+		return fmt.Errorf("images.chatgpt-web.memory-capacity-megabytes must be between %d and %d", MinChatGPTWebImageMemoryCapacityMB, MaxChatGPTWebImageMemoryCapacityMB)
 	}
 	return nil
 }

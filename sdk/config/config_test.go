@@ -12,6 +12,7 @@ func TestChatGPTWebImageAdmissionBoundsAreReexported(t *testing.T) {
 		{name: "admission wait", minimum: MinChatGPTWebImageAdmissionWaitMS, value: DefaultChatGPTWebImageAdmissionWaitMS, maximum: MaxChatGPTWebImageAdmissionWaitMS},
 		{name: "max finalizers", minimum: MinChatGPTWebImageMaxFinalizers, value: DefaultChatGPTWebImageMaxFinalizers, maximum: MaxChatGPTWebImageMaxFinalizers},
 		{name: "completion reserve", minimum: MinChatGPTWebImageCompletionReserveMB, value: DefaultChatGPTWebImageCompletionReserveMB, maximum: MaxChatGPTWebImageCompletionReserveMB},
+		{name: "memory capacity", minimum: MinChatGPTWebImageMemoryCapacityMB, value: DefaultChatGPTWebImageMemoryCapacityMB, maximum: MaxChatGPTWebImageMemoryCapacityMB},
 	}
 	for _, check := range checks {
 		if check.minimum > check.value || check.value > check.maximum {

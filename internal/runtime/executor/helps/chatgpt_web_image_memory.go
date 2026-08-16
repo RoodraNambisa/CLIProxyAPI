@@ -3,19 +3,13 @@ package helps
 import (
 	"context"
 	"errors"
-	"math"
 	"runtime"
-	"runtime/debug"
 	"sync"
 	"sync/atomic"
-
-	"golang.org/x/sync/semaphore"
 )
 
 const (
-	defaultChatGPTWebImageMemoryBytes = 256 << 20
-	minChatGPTWebImageMemoryBytes     = 1 << 20
-	maxChatGPTWebImageMemoryBytes     = 512 << 20
+	defaultChatGPTWebImageMemoryBytes = 512 << 20
 )
 
 // ErrChatGPTWebImageMemoryQueueFull reports admission overload before work starts.
@@ -54,9 +48,11 @@ type ChatGPTWebImageMemoryRuntimeSnapshot struct {
 
 // ChatGPTWebImageMemoryAdmission bounds concurrent decoded image working sets.
 type ChatGPTWebImageMemoryAdmission struct {
+	mu         sync.Mutex
 	capacity   int64
+	used       int64
 	queueLimit int64
-	weighted   *semaphore.Weighted
+	waiters    []*chatGPTWebImageMemoryWaiter
 
 	waitingTasks        atomic.Int64
 	waitingBytes        atomic.Int64
@@ -67,6 +63,14 @@ type ChatGPTWebImageMemoryAdmission struct {
 	canceledWaits       atomic.Uint64
 	queueRejected       atomic.Uint64
 	immediateRejected   atomic.Uint64
+}
+
+type chatGPTWebImageMemoryWaiter struct {
+	ready           chan struct{}
+	requestedWeight int64
+	creditWeight    int64
+	grantWeight     int64
+	granted         bool
 }
 
 // ChatGPTWebImageMemoryLeaseSet owns all long-lived image buffers for one request.
@@ -80,8 +84,10 @@ type ChatGPTWebImageMemoryLeaseSet struct {
 	completionBypassed  bool
 	finalizationOwned   bool
 	retainedBytes       int64
+	retainedGrantBytes  int64
 	pendingRetained     int64
 	transientBytes      int64
+	transientGrantBytes int64
 	releases            []func()
 	released            bool
 }
@@ -101,17 +107,15 @@ type chatGPTWebImageCompletionCoordinator struct {
 	waiting          atomic.Int64
 }
 
-var defaultChatGPTWebImageMemoryAdmission = NewChatGPTWebImageMemoryAdmission(
-	resolvedChatGPTWebImageMemoryCapacity(),
-)
+var defaultChatGPTWebImageMemoryAdmission = NewChatGPTWebImageMemoryAdmission(defaultChatGPTWebImageMemoryBytes)
 
 var defaultChatGPTWebImageCompletionCoordinator = &chatGPTWebImageCompletionCoordinator{
 	turn:         make(chan struct{}, 1),
 	reservations: make(map[*ChatGPTWebImageMemoryLeaseSet]struct{}),
 }
 
-// NewChatGPTWebImageMemoryAdmission creates an admission controller with a
-// fixed byte budget. Values below one are normalized to one byte for tests.
+// NewChatGPTWebImageMemoryAdmission creates a resizable admission controller.
+// Values below one are normalized to one byte for tests.
 func NewChatGPTWebImageMemoryAdmission(capacityBytes int64) *ChatGPTWebImageMemoryAdmission {
 	if capacityBytes < 1 {
 		capacityBytes = 1
@@ -119,7 +123,6 @@ func NewChatGPTWebImageMemoryAdmission(capacityBytes int64) *ChatGPTWebImageMemo
 	return &ChatGPTWebImageMemoryAdmission{
 		capacity:   capacityBytes,
 		queueLimit: int64(chatGPTWebImageMemoryQueueLimit()),
-		weighted:   semaphore.NewWeighted(capacityBytes),
 	}
 }
 
@@ -145,97 +148,210 @@ func ChatGPTWebImageMemorySnapshot() ChatGPTWebImageMemoryRuntimeSnapshot {
 	return defaultChatGPTWebImageMemoryAdmission.Snapshot()
 }
 
+// ConfigureChatGPTWebImageMemoryCapacity applies a process-wide byte budget
+// without replacing the admission controller or revoking active leases.
+func ConfigureChatGPTWebImageMemoryCapacity(capacityBytes int64) {
+	defaultChatGPTWebImageMemoryAdmission.Resize(capacityBytes)
+}
+
+// Resize updates the admission target in place. Existing leases remain valid;
+// queued work resumes in FIFO order when the new target has room.
+func (admission *ChatGPTWebImageMemoryAdmission) Resize(capacityBytes int64) {
+	if admission == nil {
+		return
+	}
+	if capacityBytes < 1 {
+		capacityBytes = 1
+	}
+	admission.mu.Lock()
+	admission.capacity = capacityBytes
+	waitingBytes := int64(0)
+	for _, waiter := range admission.waiters {
+		waiter.grantWeight = admission.grantWeightLocked(waiter.requestedWeight, waiter.creditWeight)
+		waitingBytes += waiter.grantWeight
+	}
+	admission.waitingBytes.Store(waitingBytes)
+	admission.grantWaitersLocked()
+	admission.mu.Unlock()
+}
+
 // Acquire reserves estimated decoded image memory until the returned release
 // function is called.
 func (admission *ChatGPTWebImageMemoryAdmission) Acquire(ctx context.Context, estimatedBytes int64) (func(), error) {
-	return admission.acquire(ctx, estimatedBytes, false)
+	release, _, err := admission.acquire(ctx, estimatedBytes, 0, false)
+	return release, err
 }
 
-func (admission *ChatGPTWebImageMemoryAdmission) acquireCritical(ctx context.Context, estimatedBytes int64) (func(), error) {
-	return admission.acquire(ctx, estimatedBytes, true)
+func (admission *ChatGPTWebImageMemoryAdmission) acquireCritical(ctx context.Context, requestedBytes, selfHeldBytes int64) (func(), int64, error) {
+	return admission.acquire(ctx, requestedBytes, selfHeldBytes, true)
 }
 
-func (admission *ChatGPTWebImageMemoryAdmission) acquire(ctx context.Context, estimatedBytes int64, critical bool) (func(), error) {
+func (admission *ChatGPTWebImageMemoryAdmission) acquire(ctx context.Context, estimatedBytes, selfHeldBytes int64, critical bool) (func(), int64, error) {
 	if admission == nil {
-		return func() {}, nil
+		weight := normalizedChatGPTWebImageMemoryRequest(estimatedBytes)
+		return func() {}, weight, nil
 	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	weight := estimatedBytes
-	if weight < 1 {
-		weight = 1
-	}
-	if weight > admission.capacity {
-		weight = admission.capacity
-	}
-
-	waiting := admission.waitingTasks.Add(1)
-	if !critical && waiting > admission.queueLimit {
-		admission.waitingTasks.Add(-1)
-		admission.queueRejected.Add(1)
-		return nil, ErrChatGPTWebImageMemoryQueueFull
-	}
-	admission.waitingBytes.Add(weight)
-	errAcquire := admission.weighted.Acquire(ctx, weight)
-	admission.waitingTasks.Add(-1)
-	admission.waitingBytes.Add(-weight)
-	if errAcquire != nil {
+	if err := ctx.Err(); err != nil {
 		admission.canceledWaits.Add(1)
-		return nil, errAcquire
+		return nil, 0, err
 	}
 
-	admission.acquisitions.Add(1)
-	admission.processingTasks.Add(1)
-	processingBytes := admission.processingBytes.Add(weight)
-	updateChatGPTWebImageMemoryPeak(&admission.peakProcessingBytes, processingBytes)
+	admission.mu.Lock()
+	requestedWeight := normalizedChatGPTWebImageMemoryRequest(estimatedBytes)
+	creditWeight := max(selfHeldBytes, int64(0))
+	weight := admission.grantWeightLocked(requestedWeight, creditWeight)
+	if len(admission.waiters) == 0 && admission.used <= admission.capacity && admission.used+weight <= admission.capacity {
+		if weight > 0 {
+			admission.activateLocked(weight)
+		}
+		admission.mu.Unlock()
+		return admission.releaseFunc(weight), weight, nil
+	}
+	if !critical && int64(len(admission.waiters)) >= admission.queueLimit {
+		admission.queueRejected.Add(1)
+		admission.mu.Unlock()
+		return nil, 0, ErrChatGPTWebImageMemoryQueueFull
+	}
+	waiter := &chatGPTWebImageMemoryWaiter{
+		ready:           make(chan struct{}),
+		requestedWeight: requestedWeight,
+		creditWeight:    creditWeight,
+		grantWeight:     weight,
+	}
+	admission.waiters = append(admission.waiters, waiter)
+	admission.waitingTasks.Add(1)
+	admission.waitingBytes.Add(weight)
+	admission.mu.Unlock()
 
-	var releaseOnce sync.Once
-	return func() {
-		releaseOnce.Do(func() {
-			admission.processingBytes.Add(-weight)
-			admission.processingTasks.Add(-1)
-			admission.weighted.Release(weight)
-		})
-	}, nil
+	select {
+	case <-waiter.ready:
+		if err := ctx.Err(); err != nil {
+			admission.cancelWaiter(waiter)
+			return nil, 0, err
+		}
+		return admission.releaseFunc(waiter.grantWeight), waiter.grantWeight, nil
+	case <-ctx.Done():
+		admission.cancelWaiter(waiter)
+		return nil, 0, ctx.Err()
+	}
 }
 
 // TryAcquire reserves memory immediately or reports current capacity pressure.
 func (admission *ChatGPTWebImageMemoryAdmission) TryAcquire(estimatedBytes int64) (func(), bool) {
-	if admission == nil {
-		return func() {}, true
-	}
-	weight := admission.normalizedWeight(estimatedBytes)
-	if !admission.weighted.TryAcquire(weight) {
-		admission.immediateRejected.Add(1)
-		return nil, false
-	}
-	admission.acquisitions.Add(1)
-	admission.processingTasks.Add(1)
-	processingBytes := admission.processingBytes.Add(weight)
-	updateChatGPTWebImageMemoryPeak(&admission.peakProcessingBytes, processingBytes)
-	return admission.releaseFunc(weight), true
+	release, _, acquired := admission.tryAcquire(estimatedBytes)
+	return release, acquired
 }
 
-func (admission *ChatGPTWebImageMemoryAdmission) normalizedWeight(estimatedBytes int64) int64 {
-	weight := estimatedBytes
-	if weight < 1 {
-		weight = 1
+func (admission *ChatGPTWebImageMemoryAdmission) tryAcquire(estimatedBytes int64) (func(), int64, bool) {
+	if admission == nil {
+		return func() {}, normalizedChatGPTWebImageMemoryRequest(estimatedBytes), true
 	}
-	if weight > admission.capacity {
-		weight = admission.capacity
+	admission.mu.Lock()
+	weight := admission.grantWeightLocked(normalizedChatGPTWebImageMemoryRequest(estimatedBytes), 0)
+	if len(admission.waiters) > 0 || admission.used+weight > admission.capacity {
+		admission.immediateRejected.Add(1)
+		admission.mu.Unlock()
+		return nil, 0, false
 	}
+	admission.activateLocked(weight)
+	admission.mu.Unlock()
+	return admission.releaseFunc(weight), weight, true
+}
+
+func normalizedChatGPTWebImageMemoryRequest(estimatedBytes int64) int64 {
+	if estimatedBytes < 1 {
+		return 1
+	}
+	return estimatedBytes
+}
+
+func (admission *ChatGPTWebImageMemoryAdmission) grantWeightLocked(requestedWeight, creditWeight int64) int64 {
+	availableWeight := max(admission.capacity-max(creditWeight, int64(0)), int64(0))
+	return min(normalizedChatGPTWebImageMemoryRequest(requestedWeight), availableWeight)
+}
+
+func (admission *ChatGPTWebImageMemoryAdmission) currentGrantWeight(requestedWeight, creditWeight int64) int64 {
+	if admission == nil {
+		return normalizedChatGPTWebImageMemoryRequest(requestedWeight)
+	}
+	admission.mu.Lock()
+	weight := admission.grantWeightLocked(requestedWeight, creditWeight)
+	admission.mu.Unlock()
 	return weight
 }
 
 func (admission *ChatGPTWebImageMemoryAdmission) releaseFunc(weight int64) func() {
+	if admission == nil || weight <= 0 {
+		return func() {}
+	}
 	var releaseOnce sync.Once
 	return func() {
 		releaseOnce.Do(func() {
-			admission.processingBytes.Add(-weight)
-			admission.processingTasks.Add(-1)
-			admission.weighted.Release(weight)
+			admission.mu.Lock()
+			admission.deactivateLocked(weight)
+			admission.grantWaitersLocked()
+			admission.mu.Unlock()
 		})
+	}
+}
+
+func (admission *ChatGPTWebImageMemoryAdmission) cancelWaiter(waiter *chatGPTWebImageMemoryWaiter) {
+	admission.mu.Lock()
+	defer admission.mu.Unlock()
+	if waiter.granted {
+		waiter.granted = false
+		if waiter.grantWeight > 0 {
+			admission.deactivateLocked(waiter.grantWeight)
+		}
+	} else {
+		for index, candidate := range admission.waiters {
+			if candidate != waiter {
+				continue
+			}
+			admission.waiters = append(admission.waiters[:index], admission.waiters[index+1:]...)
+			admission.waitingTasks.Add(-1)
+			admission.waitingBytes.Add(-waiter.grantWeight)
+			break
+		}
+	}
+	admission.canceledWaits.Add(1)
+	admission.grantWaitersLocked()
+}
+
+func (admission *ChatGPTWebImageMemoryAdmission) activateLocked(weight int64) {
+	admission.used += weight
+	admission.acquisitions.Add(1)
+	admission.processingTasks.Add(1)
+	processingBytes := admission.processingBytes.Add(weight)
+	updateChatGPTWebImageMemoryPeak(&admission.peakProcessingBytes, processingBytes)
+}
+
+func (admission *ChatGPTWebImageMemoryAdmission) deactivateLocked(weight int64) {
+	admission.used -= weight
+	admission.processingBytes.Add(-weight)
+	admission.processingTasks.Add(-1)
+}
+
+func (admission *ChatGPTWebImageMemoryAdmission) grantWaitersLocked() {
+	for len(admission.waiters) > 0 {
+		if admission.used > admission.capacity {
+			return
+		}
+		waiter := admission.waiters[0]
+		if waiter.grantWeight > 0 && admission.used+waiter.grantWeight > admission.capacity {
+			return
+		}
+		admission.waiters = admission.waiters[1:]
+		admission.waitingTasks.Add(-1)
+		admission.waitingBytes.Add(-waiter.grantWeight)
+		waiter.granted = true
+		if waiter.grantWeight > 0 {
+			admission.activateLocked(waiter.grantWeight)
+		}
+		close(waiter.ready)
 	}
 }
 
@@ -249,16 +365,16 @@ func (leases *ChatGPTWebImageMemoryLeaseSet) Acquire(ctx context.Context, estima
 		release()
 		return nil
 	}
-	weight, err := leases.reserveRetainedWeight(estimatedBytes)
+	requestedWeight, pendingWeight, err := leases.reserveRetainedWeight(estimatedBytes)
 	if err != nil {
 		return err
 	}
-	borrowed, release, err := leases.acquireLeaseMemory(ctx, weight)
+	borrowed, release, actualWeight, err := leases.acquireLeaseMemory(ctx, requestedWeight)
 	if err != nil {
-		leases.cancelRetainedWeight(weight)
+		leases.cancelRetainedWeight(pendingWeight)
 		return err
 	}
-	if err = leases.retain(release, weight); err != nil {
+	if err = leases.retain(release, pendingWeight, actualWeight, actualWeight-borrowed); err != nil {
 		leases.restoreCompletion(borrowed)
 		return err
 	}
@@ -297,13 +413,8 @@ func (leases *ChatGPTWebImageMemoryLeaseSet) TryReserveCompletion(estimatedBytes
 	if leases == nil || estimatedBytes <= 0 {
 		return true
 	}
-	weight := estimatedBytes
-	if capacity := ChatGPTWebImageMemorySnapshot().CapacityBytes; capacity > 0 && weight > capacity {
-		weight = capacity
-	}
-	if weight < 1 {
-		weight = 1
-	}
+	requestedWeight := normalizedChatGPTWebImageMemoryRequest(estimatedBytes)
+	targetWeight := defaultChatGPTWebImageMemoryAdmission.currentGrantWeight(requestedWeight, 0)
 	coordinator := defaultChatGPTWebImageCompletionCoordinator
 	coordinator.mu.Lock()
 	defer coordinator.mu.Unlock()
@@ -313,7 +424,7 @@ func (leases *ChatGPTWebImageMemoryLeaseSet) TryReserveCompletion(estimatedBytes
 		return false
 	}
 	if leases.completionRelease != nil {
-		reserved := !leases.completionRevoked && leases.completionBytes >= weight
+		reserved := !leases.completionRevoked && leases.completionBytes >= targetWeight
 		leases.mu.Unlock()
 		return reserved
 	}
@@ -332,7 +443,7 @@ func (leases *ChatGPTWebImageMemoryLeaseSet) TryReserveCompletion(estimatedBytes
 		return true
 	}
 	leases.mu.Unlock()
-	release, acquired := TryAcquireChatGPTWebImageMemory(weight)
+	release, actualWeight, acquired := defaultChatGPTWebImageMemoryAdmission.tryAcquire(requestedWeight)
 	if !acquired {
 		return false
 	}
@@ -343,14 +454,14 @@ func (leases *ChatGPTWebImageMemoryLeaseSet) TryReserveCompletion(estimatedBytes
 		return false
 	}
 	if leases.completionRelease != nil {
-		reserved := leases.completionBytes >= weight
+		reserved := leases.completionBytes >= actualWeight
 		leases.mu.Unlock()
 		release()
 		return reserved
 	}
 	leases.completionRelease = release
-	leases.completionBytes = weight
-	leases.completionAvailable = weight
+	leases.completionBytes = actualWeight
+	leases.completionAvailable = actualWeight
 	leases.completionRevoked = false
 	leases.mu.Unlock()
 	if _, exists := coordinator.reservations[leases]; !exists {
@@ -488,13 +599,21 @@ func (leases *ChatGPTWebImageMemoryLeaseSet) AcquireTransient(ctx context.Contex
 	if leases == nil {
 		return AcquireChatGPTWebImageMemory(ctx, estimatedBytes)
 	}
-	weight, err := leases.reserveTransientWeight(estimatedBytes)
+	requestedWeight, pendingWeight, err := leases.reserveTransientWeight(estimatedBytes)
 	if err != nil {
 		return nil, err
 	}
-	borrowed, releaseMemory, err := leases.acquireLeaseMemory(ctx, weight)
+	borrowed, releaseMemory, actualWeight, err := leases.acquireLeaseMemory(ctx, requestedWeight)
 	if err != nil {
-		leases.releaseTransientWeight(weight)
+		leases.releaseTransientWeight(pendingWeight, 0)
+		return nil, err
+	}
+	grantedWeight := actualWeight - borrowed
+	if err = leases.commitTransientWeight(pendingWeight, actualWeight, grantedWeight); err != nil {
+		if releaseMemory != nil {
+			releaseMemory()
+		}
+		leases.restoreCompletion(borrowed)
 		return nil, err
 	}
 	var once sync.Once
@@ -504,24 +623,24 @@ func (leases *ChatGPTWebImageMemoryLeaseSet) AcquireTransient(ctx context.Contex
 				releaseMemory()
 			}
 			leases.restoreCompletion(borrowed)
-			leases.releaseTransientWeight(weight)
+			leases.releaseTransientWeight(actualWeight, grantedWeight)
 		})
 	}, nil
 }
 
-func (leases *ChatGPTWebImageMemoryLeaseSet) reserveRetainedWeight(estimatedBytes int64) (int64, error) {
-	weight, capacity := normalizedChatGPTWebImageLeaseWeight(estimatedBytes)
+func (leases *ChatGPTWebImageMemoryLeaseSet) reserveRetainedWeight(estimatedBytes int64) (int64, int64, error) {
+	requestedWeight, weight, capacity := normalizedChatGPTWebImageLeaseWeight(estimatedBytes)
 	leases.mu.Lock()
 	defer leases.mu.Unlock()
 	if leases.released {
-		return 0, context.Canceled
+		return 0, 0, context.Canceled
 	}
 	used := leases.retainedBytes + leases.pendingRetained + leases.transientBytes
 	if used > capacity || weight > capacity-used {
-		return 0, ErrChatGPTWebImageMemoryWorkingSetTooLarge
+		return 0, 0, ErrChatGPTWebImageMemoryWorkingSetTooLarge
 	}
 	leases.pendingRetained += weight
-	return weight, nil
+	return requestedWeight, weight, nil
 }
 
 func (leases *ChatGPTWebImageMemoryLeaseSet) cancelRetainedWeight(weight int64) {
@@ -529,107 +648,122 @@ func (leases *ChatGPTWebImageMemoryLeaseSet) cancelRetainedWeight(weight int64) 
 		return
 	}
 	leases.mu.Lock()
-	leases.pendingRetained = max(leases.pendingRetained-weight, int64(0))
-	leases.mu.Unlock()
-}
-
-func (leases *ChatGPTWebImageMemoryLeaseSet) reserveTransientWeight(estimatedBytes int64) (int64, error) {
-	weight, capacity := normalizedChatGPTWebImageLeaseWeight(estimatedBytes)
-	leases.mu.Lock()
-	defer leases.mu.Unlock()
-	if leases.released {
-		return 0, context.Canceled
-	}
-	used := leases.retainedBytes + leases.pendingRetained + leases.transientBytes
-	if used > capacity || weight > capacity-used {
-		return 0, ErrChatGPTWebImageMemoryWorkingSetTooLarge
-	}
-	leases.transientBytes += weight
-	return weight, nil
-}
-
-func (leases *ChatGPTWebImageMemoryLeaseSet) releaseTransientWeight(weight int64) {
-	if leases == nil || weight <= 0 {
-		return
-	}
-	leases.mu.Lock()
-	leases.transientBytes = max(leases.transientBytes-weight, int64(0))
-	leases.mu.Unlock()
-}
-
-func normalizedChatGPTWebImageLeaseWeight(estimatedBytes int64) (int64, int64) {
-	capacity := ChatGPTWebImageMemorySnapshot().CapacityBytes
-	if capacity < 1 {
-		capacity = 1
-	}
-	weight := max(estimatedBytes, int64(1))
-	if weight > capacity {
-		weight = capacity
-	}
-	return weight, capacity
-}
-
-func (leases *ChatGPTWebImageMemoryLeaseSet) acquireLeaseMemory(ctx context.Context, weight int64) (int64, func(), error) {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	leases.mu.Lock()
-	if leases.released {
-		leases.mu.Unlock()
-		return 0, nil, context.Canceled
-	}
-	critical := leases.finalizationOwned
-	if !critical && !leases.completionRevoked && leases.completionAvailable >= weight {
-		leases.completionAvailable -= weight
-		leases.mu.Unlock()
-		return weight, nil, nil
+	if !leases.released {
+		leases.pendingRetained -= weight
 	}
 	leases.mu.Unlock()
-	if !critical {
-		if err := ctx.Err(); err != nil {
-			return 0, nil, err
-		}
-		release, acquired := TryAcquireChatGPTWebImageMemory(weight)
-		if !acquired {
-			return 0, nil, ErrChatGPTWebImageMemoryQueueFull
-		}
-		return 0, release, nil
-	}
-	borrowed, remaining, err := leases.borrowCompletion(weight)
-	if err != nil {
-		return 0, nil, err
-	}
-	if remaining == 0 {
-		return borrowed, nil, nil
-	}
-	release, err := defaultChatGPTWebImageMemoryAdmission.acquireCritical(ctx, remaining)
-	if err != nil {
-		leases.restoreCompletion(borrowed)
-		return 0, nil, err
-	}
-	return borrowed, release, nil
 }
 
-func (leases *ChatGPTWebImageMemoryLeaseSet) borrowCompletion(estimatedBytes int64) (int64, int64, error) {
-	if leases == nil {
-		return 0, max(estimatedBytes, int64(1)), nil
-	}
-	capacity := ChatGPTWebImageMemorySnapshot().CapacityBytes
-	weight := max(estimatedBytes, int64(1))
-	if capacity > 0 && weight > capacity {
-		weight = capacity
-	}
+func (leases *ChatGPTWebImageMemoryLeaseSet) reserveTransientWeight(estimatedBytes int64) (int64, int64, error) {
+	requestedWeight, weight, capacity := normalizedChatGPTWebImageLeaseWeight(estimatedBytes)
 	leases.mu.Lock()
 	defer leases.mu.Unlock()
 	if leases.released {
 		return 0, 0, context.Canceled
 	}
+	used := leases.retainedBytes + leases.pendingRetained + leases.transientBytes
+	if used > capacity || weight > capacity-used {
+		return 0, 0, ErrChatGPTWebImageMemoryWorkingSetTooLarge
+	}
+	leases.transientBytes += weight
+	return requestedWeight, weight, nil
+}
+
+func (leases *ChatGPTWebImageMemoryLeaseSet) commitTransientWeight(pendingWeight, actualWeight, grantedWeight int64) error {
+	leases.mu.Lock()
+	defer leases.mu.Unlock()
+	if leases.released {
+		leases.transientBytes -= pendingWeight
+		return context.Canceled
+	}
+	leases.transientBytes += actualWeight - pendingWeight
+	leases.transientGrantBytes += grantedWeight
+	return nil
+}
+
+func (leases *ChatGPTWebImageMemoryLeaseSet) releaseTransientWeight(weight, grantedWeight int64) {
+	if leases == nil || weight <= 0 {
+		return
+	}
+	leases.mu.Lock()
+	leases.transientBytes -= weight
+	leases.transientGrantBytes -= grantedWeight
+	leases.mu.Unlock()
+}
+
+func normalizedChatGPTWebImageLeaseWeight(estimatedBytes int64) (int64, int64, int64) {
+	capacity := ChatGPTWebImageMemorySnapshot().CapacityBytes
+	if capacity < 1 {
+		capacity = 1
+	}
+	requestedWeight := normalizedChatGPTWebImageMemoryRequest(estimatedBytes)
+	weight := requestedWeight
+	if weight > capacity {
+		weight = capacity
+	}
+	return requestedWeight, weight, capacity
+}
+
+func (leases *ChatGPTWebImageMemoryLeaseSet) acquireLeaseMemory(ctx context.Context, requestedWeight int64) (int64, func(), int64, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	targetWeight := defaultChatGPTWebImageMemoryAdmission.currentGrantWeight(requestedWeight, 0)
+	leases.mu.Lock()
+	if leases.released {
+		leases.mu.Unlock()
+		return 0, nil, 0, context.Canceled
+	}
+	critical := leases.finalizationOwned
+	if !critical && !leases.completionRevoked && leases.completionAvailable >= targetWeight {
+		leases.completionAvailable -= targetWeight
+		leases.mu.Unlock()
+		return targetWeight, nil, targetWeight, nil
+	}
+	leases.mu.Unlock()
+	if !critical {
+		if err := ctx.Err(); err != nil {
+			return 0, nil, 0, err
+		}
+		release, actualWeight, acquired := defaultChatGPTWebImageMemoryAdmission.tryAcquire(requestedWeight)
+		if !acquired {
+			return 0, nil, 0, ErrChatGPTWebImageMemoryQueueFull
+		}
+		return 0, release, actualWeight, nil
+	}
+	borrowed, selfHeldWeight, err := leases.borrowCompletion(requestedWeight)
+	if err != nil {
+		return 0, nil, 0, err
+	}
+	remainingWeight := max(requestedWeight-borrowed, int64(0))
+	if remainingWeight == 0 {
+		return borrowed, nil, borrowed, nil
+	}
+	release, grantedWeight, err := defaultChatGPTWebImageMemoryAdmission.acquireCritical(ctx, remainingWeight, selfHeldWeight)
+	if err != nil {
+		leases.restoreCompletion(borrowed)
+		return 0, nil, 0, err
+	}
+	return borrowed, release, borrowed + grantedWeight, nil
+}
+
+func (leases *ChatGPTWebImageMemoryLeaseSet) borrowCompletion(estimatedBytes int64) (int64, int64, error) {
+	if leases == nil {
+		return 0, 0, nil
+	}
+	weight := defaultChatGPTWebImageMemoryAdmission.currentGrantWeight(estimatedBytes, 0)
+	leases.mu.Lock()
+	defer leases.mu.Unlock()
+	if leases.released {
+		return 0, 0, context.Canceled
+	}
+	selfHeldWeight := leases.completionBytes + leases.retainedGrantBytes + leases.transientGrantBytes
 	if leases.completionRevoked {
-		return 0, weight, nil
+		return 0, selfHeldWeight, nil
 	}
 	borrowed := min(weight, leases.completionAvailable)
 	leases.completionAvailable -= borrowed
-	return borrowed, weight - borrowed, nil
+	return borrowed, selfHeldWeight, nil
 }
 
 func (leases *ChatGPTWebImageMemoryLeaseSet) restoreCompletion(bytes int64) {
@@ -654,7 +788,7 @@ func (leases *ChatGPTWebImageMemoryLeaseSet) restoreCompletion(bytes int64) {
 	}
 }
 
-func (leases *ChatGPTWebImageMemoryLeaseSet) retain(release func(), weight int64) error {
+func (leases *ChatGPTWebImageMemoryLeaseSet) retain(release func(), pendingWeight, actualWeight, grantedWeight int64) error {
 	if leases == nil {
 		if release != nil {
 			release()
@@ -662,7 +796,6 @@ func (leases *ChatGPTWebImageMemoryLeaseSet) retain(release func(), weight int64
 		return nil
 	}
 	leases.mu.Lock()
-	leases.pendingRetained = max(leases.pendingRetained-weight, int64(0))
 	if leases.released {
 		leases.mu.Unlock()
 		if release != nil {
@@ -670,7 +803,9 @@ func (leases *ChatGPTWebImageMemoryLeaseSet) retain(release func(), weight int64
 		}
 		return context.Canceled
 	}
-	leases.retainedBytes += weight
+	leases.pendingRetained -= pendingWeight
+	leases.retainedBytes += actualWeight
+	leases.retainedGrantBytes += grantedWeight
 	if release != nil {
 		leases.releases = append(leases.releases, release)
 	}
@@ -696,6 +831,7 @@ func (leases *ChatGPTWebImageMemoryLeaseSet) Release() {
 	releases := leases.releases
 	leases.releases = nil
 	leases.retainedBytes = 0
+	leases.retainedGrantBytes = 0
 	leases.pendingRetained = 0
 	leases.mu.Unlock()
 	unregisterChatGPTWebImageCompletionReservation(leases, completionWasRevoked)
@@ -742,15 +878,19 @@ func ChatGPTWebImageMemoryLeaseSetFromContext(ctx context.Context) *ChatGPTWebIm
 	return leases
 }
 
-// Snapshot returns a lock-free point-in-time view of the controller.
+// Snapshot returns a point-in-time view of the controller.
 func (admission *ChatGPTWebImageMemoryAdmission) Snapshot() ChatGPTWebImageMemoryRuntimeSnapshot {
 	if admission == nil {
 		return ChatGPTWebImageMemoryRuntimeSnapshot{}
 	}
+	admission.mu.Lock()
+	capacity := admission.capacity
+	queueLimit := admission.queueLimit
+	admission.mu.Unlock()
 	coordinator := defaultChatGPTWebImageCompletionCoordinator
 	return ChatGPTWebImageMemoryRuntimeSnapshot{
-		CapacityBytes:                  admission.capacity,
-		QueueLimit:                     admission.queueLimit,
+		CapacityBytes:                  capacity,
+		QueueLimit:                     queueLimit,
 		WaitingTasks:                   admission.waitingTasks.Load(),
 		WaitingBytes:                   admission.waitingBytes.Load(),
 		ProcessingTasks:                admission.processingTasks.Load(),
@@ -777,21 +917,6 @@ func chatGPTWebImageMemoryQueueLimit() int {
 		return 512
 	}
 	return limit
-}
-
-func resolvedChatGPTWebImageMemoryCapacity() int64 {
-	memoryLimit := debug.SetMemoryLimit(-1)
-	if memoryLimit <= 0 || memoryLimit == math.MaxInt64 {
-		return defaultChatGPTWebImageMemoryBytes
-	}
-	capacity := memoryLimit / 4
-	if capacity < minChatGPTWebImageMemoryBytes {
-		return minChatGPTWebImageMemoryBytes
-	}
-	if capacity > maxChatGPTWebImageMemoryBytes {
-		return maxChatGPTWebImageMemoryBytes
-	}
-	return capacity
 }
 
 func updateChatGPTWebImageMemoryPeak(peak *atomic.Int64, value int64) {

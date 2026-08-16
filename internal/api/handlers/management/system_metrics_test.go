@@ -11,13 +11,16 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/systemmetrics"
 	coreexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 )
 
 func TestGetSystemMetricsReturnsRuntimeAndConfiguredFilesystems(t *testing.T) {
+	helps.ConfigureChatGPTWebImageMemoryCapacity(96 << 20)
 	coreexecutor.ConfigureChatGPTWebImageAdmissions(7, 4, 2)
 	t.Cleanup(func() {
+		helps.ConfigureChatGPTWebImageMemoryCapacity(int64(config.DefaultChatGPTWebImageMemoryCapacityMB) << 20)
 		coreexecutor.ConfigureChatGPTWebImageAdmissions(
 			config.DefaultChatGPTWebImageMaxInFlight,
 			config.DefaultChatGPTWebImageAdmissionQueueSize,
@@ -70,8 +73,8 @@ func TestGetSystemMetricsReturnsRuntimeAndConfiguredFilesystems(t *testing.T) {
 	if response.UsageBatch.QueueCapacity < 1 {
 		t.Fatalf("UsageBatch = %#v, want bounded production queue", response.UsageBatch)
 	}
-	if response.ImageProcessing.CapacityBytes < 1 {
-		t.Fatalf("ImageProcessing = %#v, want bounded production admission", response.ImageProcessing)
+	if response.ImageProcessing.CapacityBytes != 96<<20 || response.ImageRequestMemory.CapacityBytes != 96<<20 {
+		t.Fatalf("image memory aliases = %#v / %#v, want configured capacity", response.ImageProcessing, response.ImageRequestMemory)
 	}
 	if response.ChatGPTWebImageInFlight.Limit != 7 || response.ChatGPTWebImageInFlight.QueueLimit != 4 ||
 		response.ChatGPTWebFinalizers.Limit != 2 || response.ChatGPTWebFinalizers.QueueLimit != 7 {

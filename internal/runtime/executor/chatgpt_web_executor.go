@@ -268,6 +268,7 @@ func (e *ChatGPTWebExecutor) UpdateConfig(cfg *config.Config) {
 }
 
 func configureChatGPTWebImageAdmissions(resolved config.ResolvedChatGPTWebImageConfig) {
+	helps.ConfigureChatGPTWebImageMemoryCapacity(int64(resolved.MemoryCapacityMegabytes) << 20)
 	cliproxyexecutor.ConfigureChatGPTWebImageAdmissions(
 		resolved.MaxInFlight,
 		resolved.AdmissionQueueSize,

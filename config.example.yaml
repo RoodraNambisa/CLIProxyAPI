@@ -472,6 +472,7 @@ nonstream-keepalive-interval: 0
 #     admission-wait-milliseconds: 1000 # Maximum local admission wait before a retryable 503.
 #     max-finalizers: 8                 # Settled tasks admitted to staging; the memory-heavy critical section is serialized.
 #     completion-reserve-megabytes: 1   # Per-attempt memory reserved before upstream generation starts.
+#     memory-capacity-megabytes: 512     # Shared process-wide Web image working-set budget (64-8192 MiB); independent of GOMEMLIMIT.
 #   native:
 #     generations:
 #       enabled: false
