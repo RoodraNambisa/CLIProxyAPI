@@ -56,8 +56,8 @@ func TestSentinelBrowserProfilesMatchEnvironmentCatalog(t *testing.T) {
 			}
 		}
 	}
-	if len(seen) != 512 {
-		t.Fatalf("environment catalog has %d entries, want 512", len(seen))
+	if len(seen) != 2048 {
+		t.Fatalf("environment catalog has %d entries, want 2048", len(seen))
 	}
 }
 
@@ -72,6 +72,42 @@ func TestSentinelBrowserProfilePreservesOriginalSlots(t *testing.T) {
 	identity := BrowserEnvironmentIdentity{CatalogVersion: browserEnvironmentCatalogVersion, CatalogID: entry.persona.CatalogID + "-e17"}
 	if slot, ok := browserEnvironmentSlot(entry.persona, identity); !ok || slot != 17 {
 		t.Fatalf("persisted v2 environment resolved to %d/%v", slot, ok)
+	}
+}
+
+func TestSentinelBrowserProfilePreservesFirstV3ExpansionSlots(t *testing.T) {
+	entry := personaCatalogV3[0]
+	tests := []struct {
+		slot          int
+		widthPercent  int
+		heightPercent int
+		heapIndex     int
+	}{
+		{slot: 0, widthPercent: 100, heightPercent: 100, heapIndex: 0},
+		{slot: 31, widthPercent: 72, heightPercent: 64, heapIndex: 3},
+		{slot: 32, widthPercent: 96, heightPercent: 92, heapIndex: 0},
+		{slot: 63, widthPercent: 66, heightPercent: 60, heapIndex: 3},
+	}
+	for _, test := range tests {
+		profile := sentinelBrowserProfileForSlot(entry.persona, test.slot)
+		if profile.innerWidth != scaleBrowserViewport(entry.innerWidth, test.widthPercent, 640, entry.availWidth) ||
+			profile.innerHeight != scaleBrowserViewport(entry.innerHeight, test.heightPercent, 480, entry.availHeight) ||
+			profile.jsHeapSizeLimit != sentinelBrowserHeapProfiles[test.heapIndex] {
+			t.Fatalf("persisted e%02d profile changed: %#v", test.slot, profile)
+		}
+	}
+}
+
+func TestSentinelBrowserProfilesAreDistinctWithinPersona(t *testing.T) {
+	entry := personaCatalogV3[0]
+	seen := make(map[[3]float64]int, browserEnvironmentVariantsPerPersona)
+	for slot := 0; slot < browserEnvironmentVariantsPerPersona; slot++ {
+		profile := sentinelBrowserProfileForSlot(entry.persona, slot)
+		signature := [3]float64{float64(profile.innerWidth), float64(profile.innerHeight), profile.jsHeapSizeLimit}
+		if previous, exists := seen[signature]; exists {
+			t.Fatalf("slots %d and %d have the same runtime environment: %#v", previous, slot, profile)
+		}
+		seen[signature] = slot
 	}
 }
 

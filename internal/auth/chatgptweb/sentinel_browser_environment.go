@@ -58,8 +58,8 @@ var sentinelBrowserWindowLayouts = [...]sentinelBrowserWindowLayout{
 	{widthPercent: 72, heightPercent: 64},
 }
 
-// sentinelBrowserExtendedWindowLayouts adds new viewport shapes without
-// changing the meaning of the persisted e00-e31 catalog identities.
+// sentinelBrowserExtendedWindowLayouts adds viewport shapes without changing
+// the meaning of the persisted e00-e31 catalog identities.
 var sentinelBrowserExtendedWindowLayouts = [...]sentinelBrowserWindowLayout{
 	{widthPercent: 96, heightPercent: 92},
 	{widthPercent: 90, heightPercent: 88},
@@ -69,6 +69,19 @@ var sentinelBrowserExtendedWindowLayouts = [...]sentinelBrowserWindowLayout{
 	{widthPercent: 74, heightPercent: 72},
 	{widthPercent: 70, heightPercent: 68},
 	{widthPercent: 66, heightPercent: 60},
+}
+
+// The additional layout dimensions extend v3 from e64 onward. They deliberately
+// vary only ordinary window sizes within the selected hardware family; the
+// Chrome version, TLS profile, UA, platform, screen, DPR, GPU, CPU, memory and
+// language remain unchanged. Keep both arrays ordered and immutable because
+// their Cartesian-product order is part of the persisted catalog identity.
+var sentinelBrowserAdditionalWindowWidths = [...]int{
+	99, 97, 95, 93, 91, 89, 87, 85, 83, 81, 79, 77,
+}
+
+var sentinelBrowserAdditionalWindowHeights = [...]int{
+	98, 94, 90, 86,
 }
 
 // These four Chrome heap limits come from the previously verified capacity
@@ -107,14 +120,7 @@ func sentinelBrowserProfileForCatalogEntry(entry personaCatalogEntry, slot int) 
 	if slot < 0 {
 		slot += variantCount
 	}
-	layoutSlot := slot
-	layouts := sentinelBrowserWindowLayouts[:]
-	if slot >= len(sentinelBrowserWindowLayouts)*len(sentinelBrowserHeapProfiles) {
-		layoutSlot -= len(sentinelBrowserWindowLayouts) * len(sentinelBrowserHeapProfiles)
-		layouts = sentinelBrowserExtendedWindowLayouts[:]
-	}
-	layout := layouts[layoutSlot%len(layouts)]
-	heap := sentinelBrowserHeapProfiles[layoutSlot/len(layouts)]
+	layout, heap := sentinelBrowserLayoutAndHeapForSlot(slot)
 	innerWidth := scaleBrowserViewport(entry.innerWidth, layout.widthPercent, 640, entry.availWidth)
 	innerHeight := scaleBrowserViewport(entry.innerHeight, layout.heightPercent, 480, entry.availHeight)
 	outerWidth := innerWidth
@@ -146,6 +152,28 @@ func sentinelBrowserProfileForCatalogEntry(entry personaCatalogEntry, slot int) 
 		jsHeapSizeLimit:     heap,
 		colorDepth:          entry.colorDepth,
 		maxTouchPoints:      entry.maxTouchPoints,
+	}
+}
+
+func sentinelBrowserLayoutAndHeapForSlot(slot int) (sentinelBrowserWindowLayout, float64) {
+	legacyBlockSize := len(sentinelBrowserWindowLayouts) * len(sentinelBrowserHeapProfiles)
+	extendedBlockSize := len(sentinelBrowserExtendedWindowLayouts) * len(sentinelBrowserHeapProfiles)
+	switch {
+	case slot < legacyBlockSize:
+		return sentinelBrowserWindowLayouts[slot%len(sentinelBrowserWindowLayouts)],
+			sentinelBrowserHeapProfiles[slot/len(sentinelBrowserWindowLayouts)]
+	case slot < legacyBlockSize+extendedBlockSize:
+		index := slot - legacyBlockSize
+		return sentinelBrowserExtendedWindowLayouts[index%len(sentinelBrowserExtendedWindowLayouts)],
+			sentinelBrowserHeapProfiles[index/len(sentinelBrowserExtendedWindowLayouts)]
+	default:
+		index := slot - legacyBlockSize - extendedBlockSize
+		layoutCount := len(sentinelBrowserAdditionalWindowWidths) * len(sentinelBrowserAdditionalWindowHeights)
+		layoutIndex := index % layoutCount
+		return sentinelBrowserWindowLayout{
+			widthPercent:  sentinelBrowserAdditionalWindowWidths[layoutIndex%len(sentinelBrowserAdditionalWindowWidths)],
+			heightPercent: sentinelBrowserAdditionalWindowHeights[layoutIndex/len(sentinelBrowserAdditionalWindowWidths)],
+		}, sentinelBrowserHeapProfiles[index/layoutCount]
 	}
 }
 

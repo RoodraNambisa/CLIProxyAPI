@@ -3,6 +3,7 @@ package chatgptweb
 import (
 	"crypto/sha256"
 	"fmt"
+	"strings"
 	"testing"
 )
 
@@ -22,6 +23,26 @@ func TestBrowserEnvironmentCatalogHasStablePerPersonaSlots(t *testing.T) {
 			if len(seen) != variantCount {
 				t.Fatalf("persona %q has %d unique environments", entry.persona.CatalogID, len(seen))
 			}
+		}
+	}
+}
+
+func TestBrowserEnvironmentCatalogAcceptsCanonicalThreeDigitSlots(t *testing.T) {
+	persona := personaCatalogV3[0].persona
+	identity := browserEnvironmentIdentityForSlot(persona, 255)
+	if !strings.HasSuffix(identity.CatalogID, "-e255") {
+		t.Fatalf("slot 255 identity = %q", identity.CatalogID)
+	}
+	if slot, ok := browserEnvironmentSlot(persona, identity); !ok || slot != 255 {
+		t.Fatalf("slot 255 resolved to %d/%v", slot, ok)
+	}
+	for _, suffix := range []string{"e000", "e064", "e256", "e1000"} {
+		candidate := BrowserEnvironmentIdentity{
+			CatalogVersion: browserEnvironmentCatalogVersion,
+			CatalogID:      persona.CatalogID + "-" + suffix,
+		}
+		if slot, ok := browserEnvironmentSlot(persona, candidate); ok {
+			t.Fatalf("non-canonical identity %q resolved to slot %d", candidate.CatalogID, slot)
 		}
 	}
 }
@@ -81,7 +102,7 @@ func TestBrowserEnvironmentSelectionDistribution(t *testing.T) {
 	}
 
 	for slot, count := range counts {
-		if count < 110 || count > 210 {
+		if count < 15 || count > 70 {
 			t.Fatalf("slot %d count = %d, distribution = %#v", slot, count, counts)
 		}
 	}

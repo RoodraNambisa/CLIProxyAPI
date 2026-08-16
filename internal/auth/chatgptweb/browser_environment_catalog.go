@@ -10,7 +10,7 @@ import (
 const (
 	browserEnvironmentCatalogVersion     = "v3"
 	browserEnvironmentV2Variants         = 32
-	browserEnvironmentVariantsPerPersona = 64
+	browserEnvironmentVariantsPerPersona = 256
 )
 
 // BrowserEnvironmentIdentity selects the stable application-layer browser
@@ -44,11 +44,14 @@ func browserEnvironmentSlot(persona Persona, identity BrowserEnvironmentIdentity
 		return 0, false
 	}
 	suffix := strings.TrimPrefix(identity.CatalogID, prefix)
-	if len(suffix) != 2 {
+	if len(suffix) < 2 || len(suffix) > 3 {
 		return 0, false
 	}
 	slot, err := strconv.Atoi(suffix)
 	if err != nil || slot < 0 || slot >= browserEnvironmentVariantCount(persona) {
+		return 0, false
+	}
+	if suffix != fmt.Sprintf("%02d", slot) {
 		return 0, false
 	}
 	return slot, true
