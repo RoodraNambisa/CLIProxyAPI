@@ -323,7 +323,11 @@ func (l *authRequestWindowLimiter) usageAt(authID string, policy authRequestLimi
 }
 
 func (l *authRequestWindowLimiter) tryAcquireAt(authID string, policy authRequestLimitPolicy, now time.Time) (bool, authRequestLimitBlock) {
+	started := time.Now()
 	reservation, acquired, block := l.reserveAt(authID, policy, now)
+	if policy.requestSlot != nil {
+		policy.requestSlot.RecordReservationDuration(time.Since(started))
+	}
 	if !acquired {
 		return false, block
 	}

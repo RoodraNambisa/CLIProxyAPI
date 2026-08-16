@@ -87,6 +87,11 @@ func TestLoadConfigOptionalChatGPTWebImageAspectSettings(t *testing.T) {
     resize-filter: approx-bilinear
     max-image-response-megabytes: 64
     max-n: 2
+    max-in-flight: 48
+    admission-queue-size: 24
+    admission-wait-milliseconds: 750
+    max-finalizers: 6
+    completion-reserve-megabytes: 2
 `)
 	if err := os.WriteFile(path, data, 0o600); err != nil {
 		t.Fatalf("write config: %v", err)
@@ -99,7 +104,9 @@ func TestLoadConfigOptionalChatGPTWebImageAspectSettings(t *testing.T) {
 	resolved := cfg.Images.ChatGPTWeb.Resolved()
 	if !resolved.AdaptSizeToAspectRatio || !resolved.StrictSize || resolved.AspectRatioMaxErrorPercent != 0.5 || resolved.MaxResizeEdgePixels != 2048 ||
 		!resolved.ResizeToRequestedSize || resolved.ResizeFilter != ChatGPTWebResizeFilterApproxBiLinear ||
-		resolved.MaxImageResponseMegabytes != responseBudget || resolved.MaxN != 2 {
+		resolved.MaxImageResponseMegabytes != responseBudget || resolved.MaxN != 2 ||
+		resolved.MaxInFlight != 48 || resolved.AdmissionQueueSize != 24 || resolved.AdmissionWaitMilliseconds != 750 ||
+		resolved.MaxFinalizers != 6 || resolved.CompletionReserveMegabytes != 2 {
 		t.Fatalf("resolved ChatGPT Web image config = %#v", resolved)
 	}
 }
@@ -112,7 +119,12 @@ func TestChatGPTWebImageAspectSettingsDefaultsAndValidation(t *testing.T) {
 		resolved.MaxResizeEdgePixels != DefaultChatGPTWebMaxResizeEdgePixels ||
 		resolved.ResizeToRequestedSize || resolved.ResizeFilter != DefaultChatGPTWebResizeFilter ||
 		resolved.MaxImageResponseMegabytes != DefaultChatGPTWebMaxImageResponseMegabytes ||
-		resolved.MaxN != DefaultChatGPTWebMaxN {
+		resolved.MaxN != DefaultChatGPTWebMaxN ||
+		resolved.MaxInFlight != DefaultChatGPTWebImageMaxInFlight ||
+		resolved.AdmissionQueueSize != DefaultChatGPTWebImageAdmissionQueueSize ||
+		resolved.AdmissionWaitMilliseconds != DefaultChatGPTWebImageAdmissionWaitMS ||
+		resolved.MaxFinalizers != DefaultChatGPTWebImageMaxFinalizers ||
+		resolved.CompletionReserveMegabytes != DefaultChatGPTWebImageCompletionReserveMB {
 		t.Fatalf("resolved defaults = %#v", resolved)
 	}
 
@@ -125,6 +137,16 @@ func TestChatGPTWebImageAspectSettingsDefaultsAndValidation(t *testing.T) {
 	tooLargeResponseBudget := MaxChatGPTWebMaxImageResponseMegabytes + 1
 	zeroN := 0
 	tooLargeN := MaxChatGPTWebMaxN + 1
+	zeroInFlight := 0
+	tooLargeInFlight := MaxChatGPTWebImageMaxInFlight + 1
+	negativeQueue := -1
+	tooLargeQueue := MaxChatGPTWebImageAdmissionQueueSize + 1
+	negativeAdmissionWait := -1
+	tooLargeAdmissionWait := MaxChatGPTWebImageAdmissionWaitMS + 1
+	zeroFinalizers := 0
+	tooLargeFinalizers := MaxChatGPTWebImageMaxFinalizers + 1
+	negativeReserve := -1
+	tooLargeReserve := MaxChatGPTWebImageCompletionReserveMB + 1
 	tests := []struct {
 		name string
 		cfg  ChatGPTWebImageConfig
@@ -141,6 +163,16 @@ func TestChatGPTWebImageAspectSettingsDefaultsAndValidation(t *testing.T) {
 		{name: "large response budget", cfg: ChatGPTWebImageConfig{MaxImageResponseMegabytes: &tooLargeResponseBudget}},
 		{name: "zero max n", cfg: ChatGPTWebImageConfig{MaxN: &zeroN}},
 		{name: "large max n", cfg: ChatGPTWebImageConfig{MaxN: &tooLargeN}},
+		{name: "zero in flight", cfg: ChatGPTWebImageConfig{MaxInFlight: &zeroInFlight}},
+		{name: "large in flight", cfg: ChatGPTWebImageConfig{MaxInFlight: &tooLargeInFlight}},
+		{name: "negative queue", cfg: ChatGPTWebImageConfig{AdmissionQueueSize: &negativeQueue}},
+		{name: "large queue", cfg: ChatGPTWebImageConfig{AdmissionQueueSize: &tooLargeQueue}},
+		{name: "negative admission wait", cfg: ChatGPTWebImageConfig{AdmissionWaitMilliseconds: &negativeAdmissionWait}},
+		{name: "large admission wait", cfg: ChatGPTWebImageConfig{AdmissionWaitMilliseconds: &tooLargeAdmissionWait}},
+		{name: "zero finalizers", cfg: ChatGPTWebImageConfig{MaxFinalizers: &zeroFinalizers}},
+		{name: "large finalizers", cfg: ChatGPTWebImageConfig{MaxFinalizers: &tooLargeFinalizers}},
+		{name: "negative reserve", cfg: ChatGPTWebImageConfig{CompletionReserveMegabytes: &negativeReserve}},
+		{name: "large reserve", cfg: ChatGPTWebImageConfig{CompletionReserveMegabytes: &tooLargeReserve}},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -173,6 +205,11 @@ func TestLoadConfigOptionalRejectsInvalidChatGPTWebImageAspectSettings(t *testin
 		{name: "resize filter", body: "resize-filter: nearest"},
 		{name: "response budget", body: "max-image-response-megabytes: 257"},
 		{name: "max n", body: "max-n: 11"},
+		{name: "max in flight", body: "max-in-flight: 0"},
+		{name: "admission queue", body: "admission-queue-size: -1"},
+		{name: "admission wait", body: "admission-wait-milliseconds: 30001"},
+		{name: "max finalizers", body: "max-finalizers: 0"},
+		{name: "completion reserve", body: "completion-reserve-megabytes: 33"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

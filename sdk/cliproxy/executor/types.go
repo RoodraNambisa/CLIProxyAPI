@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v6/sdk/translator"
 )
@@ -428,10 +429,11 @@ func (d *RequestExecutionDiagnostics) Snapshot() RequestExecutionDiagnosticsSnap
 // AuthRequestSlot carries an attempt-local request-limit reservation from auth
 // selection to the executor that owns the upstream commit boundary.
 type AuthRequestSlot struct {
-	mu          sync.RWMutex
-	reservation AuthRequestReservation
-	diagnostics *RequestExecutionDiagnostics
-	metrics     *RequestExecutionMetrics
+	mu                       sync.RWMutex
+	reservation              AuthRequestReservation
+	diagnostics              *RequestExecutionDiagnostics
+	metrics                  *RequestExecutionMetrics
+	reservationDurationNanos atomic.Uint64
 }
 
 // SetDiagnostics binds request-scoped diagnostics before auth selection.
@@ -452,6 +454,24 @@ func (s *AuthRequestSlot) SetMetrics(metrics *RequestExecutionMetrics) {
 	s.mu.Lock()
 	s.metrics = metrics
 	s.mu.Unlock()
+}
+
+// RecordReservationDuration accumulates time spent reserving fixed-window
+// request capacity while the scheduler selects a credential.
+func (s *AuthRequestSlot) RecordReservationDuration(duration time.Duration) {
+	if s == nil || duration <= 0 {
+		return
+	}
+	s.reservationDurationNanos.Add(uint64(duration.Nanoseconds()))
+}
+
+// ReservationDurationNanos returns the cumulative request-capacity
+// reservation duration for the current downstream request.
+func (s *AuthRequestSlot) ReservationDurationNanos() uint64 {
+	if s == nil {
+		return 0
+	}
+	return s.reservationDurationNanos.Load()
 }
 
 // Bind replaces the previous attempt's reservation with the next one. A still

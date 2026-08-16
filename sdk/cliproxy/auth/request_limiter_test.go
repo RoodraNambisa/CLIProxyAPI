@@ -1508,6 +1508,38 @@ func TestAuthRequestSlotUpdatesExecutionDiagnosticsAtSelectionAndCommit(t *testi
 	}
 }
 
+func TestAuthRequestSlotAccumulatesReservationDurations(t *testing.T) {
+	slot := &cliproxyexecutor.AuthRequestSlot{}
+	slot.RecordReservationDuration(2 * time.Millisecond)
+	slot.RecordReservationDuration(3 * time.Millisecond)
+	if got := slot.ReservationDurationNanos(); got != uint64(5*time.Millisecond) {
+		t.Fatalf("manual reservation duration = %d, want %d", got, 5*time.Millisecond)
+	}
+
+	limiter := newAuthRequestWindowLimiter()
+	policy := authRequestLimitPolicy{limit: 1, windowMinutes: 5, requestSlot: slot}
+	now := time.Now()
+	beforeFirst := slot.ReservationDurationNanos()
+	if acquired, block := limiter.tryAcquireAt("auth", policy, now); !acquired {
+		t.Fatalf("first reservation failed: %#v", block)
+	}
+	afterFirst := slot.ReservationDurationNanos()
+	if afterFirst <= beforeFirst {
+		t.Fatalf("first reservation duration did not increase: before=%d after=%d", beforeFirst, afterFirst)
+	}
+	if !slot.Release() {
+		t.Fatal("first reservation release = false")
+	}
+	if acquired, block := limiter.tryAcquireAt("auth", policy, now); !acquired {
+		t.Fatalf("second reservation failed: %#v", block)
+	}
+	afterSecond := slot.ReservationDurationNanos()
+	if afterSecond <= afterFirst {
+		t.Fatalf("second reservation duration did not accumulate: first=%d second=%d", afterFirst, afterSecond)
+	}
+	slot.Release()
+}
+
 func TestAuthRequestSlotTracksExecutionMetricsIdempotently(t *testing.T) {
 	metrics := &cliproxyexecutor.RequestExecutionMetrics{}
 	slot := &cliproxyexecutor.AuthRequestSlot{}

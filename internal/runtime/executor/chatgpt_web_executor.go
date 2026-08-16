@@ -229,6 +229,7 @@ func (e *ChatGPTWebExecutor) UpdateConfig(cfg *config.Config) {
 	defer e.configUpdateMu.Unlock()
 	if cfg == nil {
 		e.cfg.Store(nil)
+		configureChatGPTWebImageAdmissions(config.ChatGPTWebImageConfig{}.Resolved())
 		if e.backgroundQueue != nil {
 			e.backgroundQueue.setEnabled(false)
 		}
@@ -246,6 +247,7 @@ func (e *ChatGPTWebExecutor) UpdateConfig(cfg *config.Config) {
 		return
 	}
 	e.cfg.Store(snapshot)
+	configureChatGPTWebImageAdmissions(snapshot.Images.ChatGPTWeb.Resolved())
 	if e.backgroundQueue != nil {
 		e.backgroundQueue.setEnabled(snapshot.ChatGPTWeb.AutoRelogin)
 	}
@@ -263,6 +265,14 @@ func (e *ChatGPTWebExecutor) UpdateConfig(cfg *config.Config) {
 		e.accountInfo.updateConfig(snapshot)
 		e.accountInfo.restoreImportAccountInfoIntents()
 	}
+}
+
+func configureChatGPTWebImageAdmissions(resolved config.ResolvedChatGPTWebImageConfig) {
+	cliproxyexecutor.ConfigureChatGPTWebImageAdmissions(
+		resolved.MaxInFlight,
+		resolved.AdmissionQueueSize,
+		resolved.MaxFinalizers,
+	)
 }
 
 func chatGPTWebSentinelRuntimeConfig(cfg *config.Config) chatgptwebauth.SentinelRuntimeConfig {

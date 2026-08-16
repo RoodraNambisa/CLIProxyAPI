@@ -332,7 +332,9 @@ func TestOpenAIImagesGenerationsBoundsFifteenHundredConcurrentRequestsBeforeRout
 	case <-time.After(10 * time.Second):
 		t.Fatal("stub executor was not reached")
 	}
-	expectedSucceeded := baseline.QueueLimit + 1
+	// Input admission is intentionally immediate: one 200 MiB request fits the
+	// 256 MiB budget and every concurrent peer is rejected before routing.
+	expectedSucceeded := int64(1)
 	expectedRejected := int64(requestCount) - expectedSucceeded
 	deadline := time.Now().Add(10 * time.Second)
 	for rejected.Load() < expectedRejected && time.Now().Before(deadline) {
@@ -375,8 +377,8 @@ func TestOpenAIImagesGenerationsBoundsFifteenHundredConcurrentRequestsBeforeRout
 	if len(routing.Priorities) != 1 || routing.Priorities[0].RequestCapacity.RemainingSlots == nil {
 		t.Fatalf("routing diagnostics after pressure test = %+v", routing)
 	}
-	if remaining := *routing.Priorities[0].RequestCapacity.RemainingSlots; remaining != requestLimit-expectedSucceeded {
-		t.Fatalf("remaining request slots = %d, want %d", remaining, requestLimit-expectedSucceeded)
+	if remaining := *routing.Priorities[0].RequestCapacity.RemainingSlots; int64(remaining) != int64(requestLimit)-expectedSucceeded {
+		t.Fatalf("remaining request slots = %d, want %d", remaining, int64(requestLimit)-expectedSucceeded)
 	}
 }
 
@@ -1689,6 +1691,53 @@ func TestOpenAIImagesNativeEditsJSONForwardsFileIDs(t *testing.T) {
 	}
 	if got := gjson.GetBytes(executor.payload, "images.1.image_url").String(); got != "https://example.com/image.png" {
 		t.Fatalf("images.1.image_url = %q", got)
+	}
+}
+
+func TestOpenAIImagesNativeEditFinishesParsePhaseBeforeExecution(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var enteredOnce sync.Once
+	executor := &imageCaptureExecutor{
+		response: []byte(`{"created":1700000000,"data":[{"b64_json":"ZWRpdA=="}]}`),
+		beforeExecute: func() {
+			enteredOnce.Do(func() { close(entered) })
+			<-release
+		},
+	}
+	h := newImagesTestHandler(t, executor, "gpt-image-2")
+	h.Cfg.Images.Native.Edits.Enabled = true
+	h.Cfg.Images.Native.Edits.Models = []string{"gpt-image-2"}
+	router := gin.New()
+	router.POST("/v1/images/edits", h.Edits)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/images/edits", strings.NewReader(
+		`{"model":"gpt-image-2","prompt":"edit","images":[{"file_id":"file_image"}]}`,
+	))
+	req.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	parseBefore := coreexecutor.ImageRequestPhaseSnapshot()[coreexecutor.ImagePhaseInputParse].Count
+	done := make(chan struct{})
+	go func() {
+		router.ServeHTTP(response, req)
+		close(done)
+	}()
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("native edit executor was not reached")
+	}
+	parseDuringExecution := coreexecutor.ImageRequestPhaseSnapshot()[coreexecutor.ImagePhaseInputParse].Count
+	if parseDuringExecution != parseBefore+1 {
+		close(release)
+		<-done
+		t.Fatalf("parse count during native execution = %d, want %d", parseDuringExecution, parseBefore+1)
+	}
+	close(release)
+	<-done
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", response.Code, response.Body.String())
 	}
 }
 

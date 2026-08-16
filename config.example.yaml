@@ -467,6 +467,11 @@ nonstream-keepalive-interval: 0
 #     resize-filter: "catmull-rom"     # catmull-rom for quality, or approx-bilinear for throughput.
 #     max-image-response-megabytes: 128 # Maximum compressed image bytes returned by one request.
 #     max-n: 1                          # Maximum images in one logical ChatGPT Web image request (1-10).
+#     max-in-flight: 64                 # Complete Web image attempts, including sleeping polls.
+#     admission-queue-size: 64          # Bounded pre-upstream waiters; excess requests fail fast.
+#     admission-wait-milliseconds: 1000 # Maximum local admission wait before a retryable 503.
+#     max-finalizers: 8                 # Settled tasks admitted to staging; the memory-heavy critical section is serialized.
+#     completion-reserve-megabytes: 1   # Per-attempt memory reserved before upstream generation starts.
 #   native:
 #     generations:
 #       enabled: false

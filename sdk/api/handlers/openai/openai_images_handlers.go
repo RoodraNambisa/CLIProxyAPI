@@ -258,10 +258,14 @@ func (e imageUnsupportedError) Unwrap() error {
 
 // Generations handles POST /v1/images/generations.
 func (h *OpenAIImagesAPIHandler) Generations(c *gin.Context) {
+	finishTrace := beginImageRequestTrace(c)
+	defer finishTrace()
 	if !h.admitImageRequest(c) {
 		return
 	}
 	defer releaseImageRequestMemory(c)
+	finishParse := beginImageRequestPhase(c, coreexecutor.ImagePhaseInputParse)
+	defer finishParse()
 	rawJSON, err := readOpenAIImageJSONRequestBody(c)
 	if err != nil {
 		h.writeImagesRequestError(c, fmt.Errorf("invalid request: %w", err))
@@ -276,6 +280,7 @@ func (h *OpenAIImagesAPIHandler) Generations(c *gin.Context) {
 		h.writeImagesRequestError(c, err)
 		return
 	}
+	finishParse()
 	if h.handleXAIGenerationIfRequested(c, rawJSON) {
 		return
 	}
@@ -293,6 +298,8 @@ func (h *OpenAIImagesAPIHandler) Generations(c *gin.Context) {
 
 // Edits handles POST /v1/images/edits.
 func (h *OpenAIImagesAPIHandler) Edits(c *gin.Context) {
+	finishTrace := beginImageRequestTrace(c)
+	defer finishTrace()
 	if !h.admitImageRequest(c) {
 		return
 	}
@@ -302,6 +309,8 @@ func (h *OpenAIImagesAPIHandler) Edits(c *gin.Context) {
 		if h.handleXAIEditIfRequested(c, nil) {
 			return
 		}
+		finishParse := beginImageRequestPhase(c, coreexecutor.ImagePhaseInputParse)
+		defer finishParse()
 		if h.imagesNativeEnabled(imageEditOperation) {
 			req, rawJSON, err := h.parseNativeImageEditRequest(c)
 			if err != nil {
@@ -312,6 +321,7 @@ func (h *OpenAIImagesAPIHandler) Edits(c *gin.Context) {
 				h.writeImagesRequestError(c, err)
 				return
 			}
+			finishParse()
 			h.handleNativeImagesRequest(c, rawJSON, req, imageEditOperation)
 			return
 		}
@@ -324,10 +334,13 @@ func (h *OpenAIImagesAPIHandler) Edits(c *gin.Context) {
 			h.writeImagesRequestError(c, err)
 			return
 		}
+		finishParse()
 		h.handleImagesRequest(c, req, imageEditOperation)
 		return
 	}
 
+	finishParse := beginImageRequestPhase(c, coreexecutor.ImagePhaseInputParse)
+	defer finishParse()
 	rawJSON, err := readOpenAIImageJSONRequestBody(c)
 	if err != nil {
 		h.writeImagesRequestError(c, fmt.Errorf("invalid request: %w", err))
@@ -337,7 +350,9 @@ func (h *OpenAIImagesAPIHandler) Edits(c *gin.Context) {
 		h.writeImagesRequestError(c, err)
 		return
 	}
-	if h.handleXAIEditIfRequested(c, rawJSON) {
+	if isXAIImagesModel(strings.TrimSpace(gjson.GetBytes(rawJSON, "model").String())) {
+		finishParse()
+		h.handleXAIEditIfRequested(c, rawJSON)
 		return
 	}
 	req, err := parseJSONImageEditRequest(rawJSON, h.imagesNativeEnabled(imageEditOperation))
@@ -346,6 +361,7 @@ func (h *OpenAIImagesAPIHandler) Edits(c *gin.Context) {
 		return
 	}
 	if h.imagesNativeEnabled(imageEditOperation) {
+		finishParse()
 		h.handleNativeImagesRequest(c, rawJSON, req, imageEditOperation)
 		return
 	}
@@ -353,13 +369,53 @@ func (h *OpenAIImagesAPIHandler) Edits(c *gin.Context) {
 		h.writeImagesRequestError(c, err)
 		return
 	}
+	finishParse()
 	h.handleImagesRequest(c, req, imageEditOperation)
+}
+
+func beginImageRequestTrace(c *gin.Context) func() {
+	observer := coreexecutor.GlobalImageRequestPhaseObserver()
+	if c != nil {
+		c.Set(coreexecutor.RequestPhaseObserverMetadataKey, observer)
+	}
+	started := time.Now()
+	return func() { observer.ObserveRequestPhase(coreexecutor.ImagePhaseRequestTotal, time.Since(started)) }
+}
+
+func beginImageRequestPhase(c *gin.Context, name string) func() {
+	started := time.Now()
+	var once sync.Once
+	return func() {
+		once.Do(func() { observeImageRequestPhase(c, name, started) })
+	}
+}
+
+func observeImageRequestPhase(c *gin.Context, name string, started time.Time) {
+	if c == nil {
+		return
+	}
+	value, ok := c.Get(coreexecutor.RequestPhaseObserverMetadataKey)
+	if !ok {
+		return
+	}
+	observer, _ := value.(coreexecutor.RequestPhaseObserver)
+	if observer != nil {
+		observer.ObserveRequestPhase(name, time.Since(started))
+	}
+}
+
+func observeImageResponseWrite(c *gin.Context, write func()) {
+	started := time.Now()
+	write()
+	observeImageRequestPhase(c, coreexecutor.ImagePhaseResponseWriteOperation, started)
 }
 
 func (h *OpenAIImagesAPIHandler) admitImageRequest(c *gin.Context) bool {
 	if c == nil || c.Request == nil {
 		return false
 	}
+	started := time.Now()
+	defer func() { observeImageRequestPhase(c, coreexecutor.ImagePhaseInputAdmission, started) }()
 	if c.Request.ContentLength < 0 {
 		if errSpool := spoolUnknownImageRequestBody(c.Request); errSpool != nil {
 			var maxBytesErr *http.MaxBytesError
@@ -379,7 +435,7 @@ func (h *OpenAIImagesAPIHandler) admitImageRequest(c *gin.Context) bool {
 	}
 	leases := executorhelps.NewChatGPTWebImageMemoryLeaseSet()
 	estimatedBytes := estimateImageRequestResidentBytes(c.Request)
-	if err := leases.AcquireInput(c.Request.Context(), estimatedBytes); err != nil {
+	if !leases.TryAcquireInput(estimatedBytes) {
 		leases.Release()
 		releaseOpenAIMultipartRequest(c)
 		c.Header("Retry-After", "1")
@@ -563,7 +619,7 @@ func (h *OpenAIImagesAPIHandler) handleNativeNonStreamingImagesResponse(c *gin.C
 		return
 	}
 	handlers.WriteUpstreamHeaders(c.Writer.Header(), headers)
-	_, _ = c.Writer.Write(resp)
+	observeImageResponseWrite(c, func() { _, _ = c.Writer.Write(resp) })
 	cliCancel(resp)
 }
 
@@ -585,7 +641,7 @@ func (h *OpenAIImagesAPIHandler) handleNativeStreamingImagesResponse(c *gin.Cont
 		FlushInterval: imageStreamFlushInterval(h.Cfg),
 		FlushMinBytes: imageStreamFlushMinBytes(h.Cfg),
 		WriteChunk: func(chunk []byte) {
-			_, _ = c.Writer.Write(chunk)
+			observeImageResponseWrite(c, func() { _, _ = c.Writer.Write(chunk) })
 		},
 		WriteTerminalError: func(errMsg *interfaces.ErrorMessage) {
 			if errMsg == nil {
@@ -600,7 +656,9 @@ func (h *OpenAIImagesAPIHandler) handleNativeStreamingImagesResponse(c *gin.Cont
 				errText = errMsg.Error.Error()
 			}
 			body := handlers.BuildErrorResponseBodyForMessage(status, errText, errMsg)
-			_, _ = fmt.Fprintf(c.Writer, "\nevent: error\ndata: %s\n\n", string(body))
+			observeImageResponseWrite(c, func() {
+				_, _ = fmt.Fprintf(c.Writer, "\nevent: error\ndata: %s\n\n", string(body))
+			})
 		},
 	})
 }
@@ -676,13 +734,15 @@ func (h *OpenAIImagesAPIHandler) handleNonStreamingImagesResponse(c *gin.Context
 		cliCancel(resp)
 	}
 	applyImageResponseFormat(&combined, responseFormat)
+	encodeStarted := time.Now()
 	imagesPayload, err := json.Marshal(combined)
+	observeImageRequestPhase(c, coreexecutor.ImagePhaseResponseEncode, encodeStarted)
 	if err != nil {
 		h.writeImagesError(c, http.StatusInternalServerError, err)
 		return
 	}
 	handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
-	_, _ = c.Writer.Write(imagesPayload)
+	observeImageResponseWrite(c, func() { _, _ = c.Writer.Write(imagesPayload) })
 }
 
 func (h *OpenAIImagesAPIHandler) handleStreamingImagesResponse(c *gin.Context, rawJSON []byte, imageModel, codexModel string, op imageOperation, count int, responseFormat string, providers []string, ignoreUnsupportedImageParams bool, imageConfig coreexecutor.ChatGPTWebImageConfigSnapshot) {
@@ -758,9 +818,11 @@ func (h *OpenAIImagesAPIHandler) handleStreamingImagesResponse(c *gin.Context, r
 				}
 				setSSEHeaders()
 				handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
-				_, _ = c.Writer.Write(firstFrame.Bytes())
-				_, _ = c.Writer.Write([]byte("\n"))
-				flusher.Flush()
+				observeImageResponseWrite(c, func() {
+					_, _ = c.Writer.Write(firstFrame.Bytes())
+					_, _ = c.Writer.Write([]byte("\n"))
+					flusher.Flush()
+				})
 				cliCancel(nil)
 				return
 			}
@@ -775,8 +837,10 @@ func (h *OpenAIImagesAPIHandler) handleStreamingImagesResponse(c *gin.Context, r
 			}
 			setSSEHeaders()
 			handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
-			_, _ = c.Writer.Write(firstFrame.Bytes())
-			flusher.Flush()
+			observeImageResponseWrite(c, func() {
+				_, _ = c.Writer.Write(firstFrame.Bytes())
+				flusher.Flush()
+			})
 			_ = mapper.consumeForceFlush()
 			h.forwardImagesStream(c, flusher, func(err error) { cliCancel(err) }, dataChan, errChan, mapper)
 			return
@@ -799,8 +863,10 @@ func (h *OpenAIImagesAPIHandler) handleMultiStreamingImagesResponse(c *gin.Conte
 		iterationImageConfig := imageConfig
 		if responseByteLimit > 0 {
 			if remainingResponseBytes <= 0 {
-				_, _ = fmt.Fprintf(c.Writer, "\nevent: error\ndata: %s\n\n", string(handlers.BuildErrorResponseBody(http.StatusBadGateway, imageResponseBudgetError(responseByteLimit).Error())))
-				flusher.Flush()
+				observeImageResponseWrite(c, func() {
+					_, _ = fmt.Fprintf(c.Writer, "\nevent: error\ndata: %s\n\n", string(handlers.BuildErrorResponseBody(http.StatusBadGateway, imageResponseBudgetError(responseByteLimit).Error())))
+					flusher.Flush()
+				})
 				return
 			}
 			iterationImageConfig.MaxImageResponseBytes = remainingResponseBytes
@@ -831,7 +897,7 @@ func (h *OpenAIImagesAPIHandler) handleMultiStreamingImagesResponse(c *gin.Conte
 			FlushInterval: imageStreamFlushInterval(h.Cfg),
 			FlushMinBytes: imageStreamFlushMinBytes(h.Cfg),
 			WriteChunk: func(chunk []byte) {
-				mapper.writeChunk(c.Writer, chunk)
+				observeImageResponseWrite(c, func() { mapper.writeChunk(c.Writer, chunk) })
 			},
 			ChunkError: mapper.fatalError,
 			FlushChunk: func([]byte) bool {
@@ -850,10 +916,12 @@ func (h *OpenAIImagesAPIHandler) handleMultiStreamingImagesResponse(c *gin.Conte
 					errText = errMsg.Error.Error()
 				}
 				body := handlers.BuildErrorResponseBodyForMessage(status, errText, errMsg)
-				_, _ = fmt.Fprintf(c.Writer, "\nevent: error\ndata: %s\n\n", string(body))
+				observeImageResponseWrite(c, func() {
+					_, _ = fmt.Fprintf(c.Writer, "\nevent: error\ndata: %s\n\n", string(body))
+				})
 			},
 			WriteDone: func() {
-				mapper.flush(c.Writer)
+				observeImageResponseWrite(c, func() { mapper.flush(c.Writer) })
 			},
 		})
 		if streamErr == nil {
@@ -866,8 +934,10 @@ func (h *OpenAIImagesAPIHandler) handleMultiStreamingImagesResponse(c *gin.Conte
 			remainingResponseBytes -= mapper.completedBinaryBytes
 		}
 	}
-	_, _ = c.Writer.Write([]byte("\n"))
-	flusher.Flush()
+	observeImageResponseWrite(c, func() {
+		_, _ = c.Writer.Write([]byte("\n"))
+		flusher.Flush()
+	})
 }
 
 func (h *OpenAIImagesAPIHandler) forwardImagesStream(c *gin.Context, flusher http.Flusher, cancel func(error), data <-chan []byte, errs <-chan *interfaces.ErrorMessage, mapper *imageStreamMapper) {
@@ -878,7 +948,7 @@ func (h *OpenAIImagesAPIHandler) forwardImagesStream(c *gin.Context, flusher htt
 		FlushInterval: imageStreamFlushInterval(h.Cfg),
 		FlushMinBytes: imageStreamFlushMinBytes(h.Cfg),
 		WriteChunk: func(chunk []byte) {
-			mapper.writeChunk(c.Writer, chunk)
+			observeImageResponseWrite(c, func() { mapper.writeChunk(c.Writer, chunk) })
 		},
 		ChunkError: mapper.fatalError,
 		FlushChunk: func([]byte) bool {
@@ -897,13 +967,17 @@ func (h *OpenAIImagesAPIHandler) forwardImagesStream(c *gin.Context, flusher htt
 				errText = errMsg.Error.Error()
 			}
 			body := handlers.BuildErrorResponseBodyForMessage(status, errText, errMsg)
-			_, _ = fmt.Fprintf(c.Writer, "\nevent: error\ndata: %s\n\n", string(body))
+			observeImageResponseWrite(c, func() {
+				_, _ = fmt.Fprintf(c.Writer, "\nevent: error\ndata: %s\n\n", string(body))
+			})
 		},
 		WriteDone: func() {
-			mapper.flush(c.Writer)
-			if mapper.fatalError() == nil {
-				_, _ = c.Writer.Write([]byte("\n"))
-			}
+			observeImageResponseWrite(c, func() {
+				mapper.flush(c.Writer)
+				if mapper.fatalError() == nil {
+					_, _ = c.Writer.Write([]byte("\n"))
+				}
+			})
 		},
 	})
 }

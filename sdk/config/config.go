@@ -56,6 +56,21 @@ const (
 	MinChatGPTWebMaxImageResponseMegabytes     = internalconfig.MinChatGPTWebMaxImageResponseMegabytes
 	MaxChatGPTWebMaxImageResponseMegabytes     = internalconfig.MaxChatGPTWebMaxImageResponseMegabytes
 	DefaultChatGPTWebMaxN                      = internalconfig.DefaultChatGPTWebMaxN
+	DefaultChatGPTWebImageMaxInFlight          = internalconfig.DefaultChatGPTWebImageMaxInFlight
+	MinChatGPTWebImageMaxInFlight              = internalconfig.MinChatGPTWebImageMaxInFlight
+	MaxChatGPTWebImageMaxInFlight              = internalconfig.MaxChatGPTWebImageMaxInFlight
+	DefaultChatGPTWebImageAdmissionQueueSize   = internalconfig.DefaultChatGPTWebImageAdmissionQueueSize
+	MinChatGPTWebImageAdmissionQueueSize       = internalconfig.MinChatGPTWebImageAdmissionQueueSize
+	MaxChatGPTWebImageAdmissionQueueSize       = internalconfig.MaxChatGPTWebImageAdmissionQueueSize
+	DefaultChatGPTWebImageAdmissionWaitMS      = internalconfig.DefaultChatGPTWebImageAdmissionWaitMS
+	MinChatGPTWebImageAdmissionWaitMS          = internalconfig.MinChatGPTWebImageAdmissionWaitMS
+	MaxChatGPTWebImageAdmissionWaitMS          = internalconfig.MaxChatGPTWebImageAdmissionWaitMS
+	DefaultChatGPTWebImageMaxFinalizers        = internalconfig.DefaultChatGPTWebImageMaxFinalizers
+	MinChatGPTWebImageMaxFinalizers            = internalconfig.MinChatGPTWebImageMaxFinalizers
+	MaxChatGPTWebImageMaxFinalizers            = internalconfig.MaxChatGPTWebImageMaxFinalizers
+	DefaultChatGPTWebImageCompletionReserveMB  = internalconfig.DefaultChatGPTWebImageCompletionReserveMB
+	MinChatGPTWebImageCompletionReserveMB      = internalconfig.MinChatGPTWebImageCompletionReserveMB
+	MaxChatGPTWebImageCompletionReserveMB      = internalconfig.MaxChatGPTWebImageCompletionReserveMB
 	MinChatGPTWebMaxN                          = internalconfig.MinChatGPTWebMaxN
 	MaxChatGPTWebMaxN                          = internalconfig.MaxChatGPTWebMaxN
 )

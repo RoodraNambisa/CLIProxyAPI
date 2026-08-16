@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"reflect"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 	"unicode/utf8"
@@ -71,26 +72,28 @@ func (body *chatGPTWebChallengeInspectingBody) challengeError() error {
 }
 
 type chatGPTWebPreparedRequest struct {
-	baseModel            string
-	routeModel           string
-	responseFormat       sdktranslator.Format
-	originalPayload      []byte
-	canonicalBody        []byte
-	request              helps.ChatGPTWebRequest
-	terminalMarker       bool
-	trustUpstreamSSE     bool
-	maxImageResults      int
-	usageProjection      *helps.ChatGPTWebUsageProjection
-	usageProjectionOn    bool
-	usageProjectionOpts  helps.ChatGPTWebUsageCacheOptions
-	imageFallbackUsage   config.ResolvedChatGPTWebImageFallbackUsageConfig
-	imageConfigSnapshot  cliproxyexecutor.ChatGPTWebImageConfigSnapshot
-	imageSizeMatch       *helps.ChatGPTWebImageSizeMatch
-	bodyRelease          *cliproxyexecutor.RequestBodyReleaseController
-	imageResultState     *cliproxyexecutor.ImageGenerationResultState
-	executionDiagnostics *cliproxyexecutor.RequestExecutionDiagnostics
-	requestUsageOutcome  *cliproxyexecutor.RequestUsageOutcome
-	imageMemoryLeases    *helps.ChatGPTWebImageMemoryLeaseSet
+	baseModel              string
+	routeModel             string
+	responseFormat         sdktranslator.Format
+	originalPayload        []byte
+	canonicalBody          []byte
+	request                helps.ChatGPTWebRequest
+	terminalMarker         bool
+	trustUpstreamSSE       bool
+	maxImageResults        int
+	usageProjection        *helps.ChatGPTWebUsageProjection
+	usageProjectionOn      bool
+	usageProjectionOpts    helps.ChatGPTWebUsageCacheOptions
+	imageFallbackUsage     config.ResolvedChatGPTWebImageFallbackUsageConfig
+	imageConfigSnapshot    cliproxyexecutor.ChatGPTWebImageConfigSnapshot
+	imageSizeMatch         *helps.ChatGPTWebImageSizeMatch
+	bodyRelease            *cliproxyexecutor.RequestBodyReleaseController
+	imageResultState       *cliproxyexecutor.ImageGenerationResultState
+	executionDiagnostics   *cliproxyexecutor.RequestExecutionDiagnostics
+	requestUsageOutcome    *cliproxyexecutor.RequestUsageOutcome
+	imageMemoryLeases      *helps.ChatGPTWebImageMemoryLeaseSet
+	imageMemoryLeasesOwned bool
+	phaseObserver          cliproxyexecutor.RequestPhaseObserver
 }
 
 type chatGPTWebRequirements struct {
@@ -117,6 +120,40 @@ func commitChatGPTWebAuthRequestSlot(opts cliproxyexecutor.Options) {
 	if opts.AuthRequestSlot != nil {
 		opts.AuthRequestSlot.Commit()
 	}
+}
+
+func (e *ChatGPTWebExecutor) currentChatGPTWebImageConfig() config.ResolvedChatGPTWebImageConfig {
+	if cfg := e.configSnapshot(); cfg != nil {
+		return cfg.Images.ChatGPTWeb.Resolved()
+	}
+	return config.ChatGPTWebImageConfig{}.Resolved()
+}
+
+func (e *ChatGPTWebExecutor) acquireChatGPTWebImageLifecycle(ctx context.Context, prepared *chatGPTWebPreparedRequest) (func(), error) {
+	resolved := e.currentChatGPTWebImageConfig()
+	started := time.Now()
+	releaseExecution, err := cliproxyexecutor.AcquireChatGPTWebImageExecution(
+		ctx,
+		time.Duration(resolved.AdmissionWaitMilliseconds)*time.Millisecond,
+	)
+	cliproxyexecutor.ObserveRequestPhaseContext(ctx, cliproxyexecutor.ImagePhaseExecutionAdmission, started)
+	if err != nil {
+		return nil, err
+	}
+	reserveBytes := int64(resolved.CompletionReserveMegabytes) << 20
+	if prepared != nil && prepared.imageMemoryLeases != nil && !prepared.imageMemoryLeases.TryReserveCompletion(reserveBytes) {
+		releaseExecution()
+		return nil, cliproxyexecutor.NewImageExecutionCapacityError("completion_memory")
+	}
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			if prepared != nil && prepared.imageMemoryLeasesOwned && prepared.imageMemoryLeases != nil {
+				prepared.imageMemoryLeases.Release()
+			}
+			releaseExecution()
+		})
+	}, nil
 }
 
 type chatGPTWebFailureStageProvider interface {
@@ -257,11 +294,24 @@ func (e *ChatGPTWebExecutor) executeRuntime(ctx context.Context, auth *cliproxya
 		return resp, err
 	}
 	defer prepared.discardUsageProjection()
+	if prepared.request.Image != nil && prepared.imageMemoryLeases == nil {
+		prepared.imageMemoryLeases = helps.NewChatGPTWebImageMemoryLeaseSet()
+		prepared.imageMemoryLeasesOwned = true
+	}
 	ctx = helps.WithChatGPTWebImageMemoryLeaseSet(ctx, prepared.imageMemoryLeases)
+	ctx = cliproxyexecutor.WithRequestPhaseObserver(ctx, prepared.phaseObserver)
 	reporter = helps.NewExecutorUsageReporter(ctx, e, prepared.routeModel, auth)
 	reporter.SetExecutionDiagnostics(opts.ExecutionDiagnostics)
 	reporter.SetRequestUsageOutcome(opts.UsageOutcome)
 	reporter.SetTranslatedReasoningEffort(prepared.canonicalBody, e.Identifier())
+	var releaseImageLifecycle func()
+	if prepared.request.Image != nil {
+		releaseImageLifecycle, err = e.acquireChatGPTWebImageLifecycle(ctx, prepared)
+		if err != nil {
+			return resp, err
+		}
+		defer releaseImageLifecycle()
+	}
 
 	client, credential, err := e.newRuntimeClient(auth)
 	if err != nil {
@@ -309,7 +359,12 @@ func (e *ChatGPTWebExecutor) executeRuntimeStream(ctx context.Context, auth *cli
 	if err != nil {
 		return nil, err
 	}
+	if prepared.request.Image != nil && prepared.imageMemoryLeases == nil {
+		prepared.imageMemoryLeases = helps.NewChatGPTWebImageMemoryLeaseSet()
+		prepared.imageMemoryLeasesOwned = true
+	}
 	ctx = helps.WithChatGPTWebImageMemoryLeaseSet(ctx, prepared.imageMemoryLeases)
+	ctx = cliproxyexecutor.WithRequestPhaseObserver(ctx, prepared.phaseObserver)
 	reporter := helps.NewExecutorUsageReporter(ctx, e, prepared.routeModel, auth)
 	reporter.SetExecutionDiagnostics(opts.ExecutionDiagnostics)
 	reporter.SetRequestUsageOutcome(opts.UsageOutcome)
@@ -324,8 +379,19 @@ func (e *ChatGPTWebExecutor) executeRuntimeStream(ctx context.Context, auth *cli
 	if passthroughState != nil {
 		passthroughState.SetEnabled(false)
 	}
+	var releaseImageLifecycle func()
+	if prepared.request.Image != nil {
+		releaseImageLifecycle, err = e.acquireChatGPTWebImageLifecycle(ctx, prepared)
+		if err != nil {
+			prepared.discardUsageProjection()
+			return nil, err
+		}
+	}
 	client, credential, err := e.newRuntimeClient(auth)
 	if err != nil {
+		if releaseImageLifecycle != nil {
+			releaseImageLifecycle()
+		}
 		prepared.discardUsageProjection()
 		return nil, err
 	}
@@ -336,11 +402,12 @@ func (e *ChatGPTWebExecutor) executeRuntimeStream(ctx context.Context, auth *cli
 		imageStreamPassthrough := metadataBool(opts.Metadata, cliproxyexecutor.ImageGenerationStreamPassthroughMetadataKey)
 		execution, errImage := e.beginChatGPTWebImage(ctx, client, credential, prepared)
 		if errImage != nil {
+			releaseImageLifecycle()
 			prepared.discardUsageProjection()
 			e.finishChatGPTWebRuntimeClient(ctx, auth, credential, client)
 			return nil, e.handleChatGPTWebImageRequestError(auth.ID, errImage)
 		}
-		return e.streamDeferredChatGPTWebResponse(ctx, auth, credential, prepared, client, reporter, execution.headers, passthroughState, imageStreamPassthrough, func() ([]byte, error) {
+		return e.streamDeferredChatGPTWebResponse(ctx, auth, credential, prepared, client, reporter, execution.headers, passthroughState, imageStreamPassthrough, releaseImageLifecycle, func() ([]byte, error) {
 			completed, errFinish := e.finishChatGPTWebImage(ctx, client, credential, prepared, execution)
 			return completed, chatGPTWebCommittedRequestError(ctx, e.handleChatGPTWebImageRequestError(auth.ID, errFinish))
 		}), nil
@@ -353,7 +420,7 @@ func (e *ChatGPTWebExecutor) executeRuntimeStream(ctx context.Context, auth *cli
 			e.finishChatGPTWebRuntimeClient(ctx, auth, credential, client)
 			return nil, errSearch
 		}
-		return e.streamDeferredChatGPTWebResponse(ctx, auth, credential, prepared, client, reporter, execution.headers, nil, false, func() ([]byte, error) {
+		return e.streamDeferredChatGPTWebResponse(ctx, auth, credential, prepared, client, reporter, execution.headers, nil, false, nil, func() ([]byte, error) {
 			result, errFinish := e.finishChatGPTWebSearch(ctx, client, credential, execution)
 			if errFinish != nil {
 				return nil, chatGPTWebCommittedRequestError(ctx, errFinish)
@@ -747,6 +814,8 @@ func (e *ChatGPTWebExecutor) instantiateRuntimeRequest(template *chatGPTWebPrepa
 	prepared.executionDiagnostics = opts.ExecutionDiagnostics
 	prepared.requestUsageOutcome = opts.UsageOutcome
 	prepared.imageMemoryLeases = helps.ChatGPTWebImageMemoryLeaseSetFromMetadata(opts.Metadata)
+	prepared.imageMemoryLeasesOwned = false
+	prepared.phaseObserver = cliproxyexecutor.RequestPhaseObserverFromMetadata(opts.Metadata)
 	prepared.imageResultState, _ = opts.Metadata[cliproxyexecutor.ImageGenerationResultStateMetadataKey].(*cliproxyexecutor.ImageGenerationResultState)
 	if prepared.usageProjectionOn {
 		projection, err := e.usageCache.NewProjection(prepared.routeModel, prepared.request, prepared.usageProjectionOpts)
@@ -771,6 +840,8 @@ func cloneChatGPTWebPreparedRequest(template *chatGPTWebPreparedRequest) *chatGP
 	prepared.executionDiagnostics = nil
 	prepared.requestUsageOutcome = nil
 	prepared.imageMemoryLeases = nil
+	prepared.imageMemoryLeasesOwned = false
+	prepared.phaseObserver = nil
 	prepared.request.Messages = make([]helps.ChatGPTWebMessage, len(template.request.Messages))
 	for index := range template.request.Messages {
 		prepared.request.Messages[index] = template.request.Messages[index]
@@ -2647,8 +2718,17 @@ func (e *ChatGPTWebExecutor) streamDeferredChatGPTWebResponse(
 	headers http.Header,
 	passthroughState *cliproxyexecutor.ImageGenerationStreamPassthroughState,
 	enablePassthrough bool,
+	cleanup func(),
 	work func() ([]byte, error),
 ) *cliproxyexecutor.StreamResult {
+	var cleanupOnce sync.Once
+	finishCleanup := func() {
+		cleanupOnce.Do(func() {
+			if cleanup != nil {
+				cleanup()
+			}
+		})
+	}
 	out := make(chan cliproxyexecutor.StreamChunk)
 	if prepared.requestUsageOutcome != nil {
 		prepared.requestUsageOutcome.AcceptStreamAttempt(cliproxyexecutor.RequestUsageAttemptFromContext(ctx))
@@ -2659,8 +2739,17 @@ func (e *ChatGPTWebExecutor) streamDeferredChatGPTWebResponse(
 		if !sendChatGPTWebStreamChunk(ctx, out, cliproxyexecutor.BootstrapCommitStreamChunk()) {
 			publishChatGPTWebStreamFailure(ctx, reporter, prepared.executionDiagnostics, chatGPTWebStreamDeliveryError(ctx))
 			e.finishChatGPTWebRuntimeClient(ctx, auth, credential, client)
+			finishCleanup()
 			return
 		}
+		var cleanupParts atomic.Int32
+		cleanupParts.Store(2)
+		finishCleanupPart := func() {
+			if cleanupParts.Add(-1) == 0 {
+				finishCleanup()
+			}
+		}
+		defer finishCleanupPart()
 		type deferredResult struct {
 			completed []byte
 			err       error
@@ -2668,6 +2757,7 @@ func (e *ChatGPTWebExecutor) streamDeferredChatGPTWebResponse(
 		resultCh := make(chan deferredResult, 1)
 		go func() {
 			defer e.finishChatGPTWebRuntimeClient(ctx, auth, credential, client)
+			defer finishCleanupPart()
 			completed, err := work()
 			resultCh <- deferredResult{completed: completed, err: err}
 		}()

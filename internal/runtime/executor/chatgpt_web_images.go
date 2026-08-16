@@ -70,6 +70,42 @@ var chatGPTWebAssetHostSuffixes = []string{
 
 var chatGPTWebImagePollSlots = make(chan struct{}, chatGPTWebImagePollConcurrency)
 
+var chatGPTWebImagePollMetrics struct {
+	active         atomic.Int64
+	peakActive     atomic.Int64
+	attempts       atomic.Uint64
+	acquired       atomic.Uint64
+	canceled       atomic.Uint64
+	totalWaitNanos atomic.Uint64
+	maxWaitNanos   atomic.Uint64
+}
+
+// ChatGPTWebImagePollRuntimeSnapshot contains only aggregate poll-slot data.
+type ChatGPTWebImagePollRuntimeSnapshot struct {
+	Limit           int    `json:"limit"`
+	Active          int64  `json:"active"`
+	PeakActive      int64  `json:"peak_active"`
+	AcquireAttempts uint64 `json:"acquire_attempts"`
+	Acquired        uint64 `json:"acquired"`
+	Canceled        uint64 `json:"canceled"`
+	TotalWaitNanos  uint64 `json:"total_wait_nanos"`
+	MaxWaitNanos    uint64 `json:"max_wait_nanos"`
+}
+
+// ChatGPTWebImagePollSnapshot returns process-wide poll-slot metrics.
+func ChatGPTWebImagePollSnapshot() ChatGPTWebImagePollRuntimeSnapshot {
+	return ChatGPTWebImagePollRuntimeSnapshot{
+		Limit:           cap(chatGPTWebImagePollSlots),
+		Active:          chatGPTWebImagePollMetrics.active.Load(),
+		PeakActive:      chatGPTWebImagePollMetrics.peakActive.Load(),
+		AcquireAttempts: chatGPTWebImagePollMetrics.attempts.Load(),
+		Acquired:        chatGPTWebImagePollMetrics.acquired.Load(),
+		Canceled:        chatGPTWebImagePollMetrics.canceled.Load(),
+		TotalWaitNanos:  chatGPTWebImagePollMetrics.totalWaitNanos.Load(),
+		MaxWaitNanos:    chatGPTWebImagePollMetrics.maxWaitNanos.Load(),
+	}
+}
+
 type chatGPTWebUploadedImage struct {
 	FileID   string
 	FileName string
@@ -608,6 +644,14 @@ func (e *ChatGPTWebExecutor) beginChatGPTWebImage(ctx context.Context, client *c
 	imageInputs := append([]string(nil), imageRequest.Images...)
 	uploads := make([]chatGPTWebUploadedImage, 0, len(imageInputs))
 	inputIDs := make(map[string]struct{}, len(imageInputs))
+	uploadStarted := time.Now()
+	var uploadObserved sync.Once
+	finishUploadObservation := func() {
+		uploadObserved.Do(func() {
+			cliproxyexecutor.ObserveRequestPhaseContext(ctx, cliproxyexecutor.ImagePhaseInputUpload, uploadStarted)
+		})
+	}
+	defer finishUploadObservation()
 	for index, imageURL := range imageInputs {
 		uploaded, err := e.uploadChatGPTWebImage(ctx, client, credential, imageURL, fmt.Sprintf("image_%d.png", index+1))
 		if err != nil {
@@ -620,17 +664,24 @@ func (e *ChatGPTWebExecutor) beginChatGPTWebImage(ctx context.Context, client *c
 		})
 		inputIDs[uploaded.FileID] = struct{}{}
 	}
+	finishUploadObservation()
 
+	requirementsStarted := time.Now()
 	requirements, err := e.chatGPTWebRequirements(ctx, client, credential)
+	cliproxyexecutor.ObserveRequestPhaseContext(ctx, cliproxyexecutor.ImagePhaseRequirements, requirementsStarted)
 	if err != nil {
 		return nil, err
 	}
 	upstreamModel := e.chatGPTWebImageUpstreamModel()
+	prepareStarted := time.Now()
 	conduit, err := e.prepareChatGPTWebImageConversation(ctx, client, credential, requirements, upstreamModel, upstreamPrompt)
+	cliproxyexecutor.ObserveRequestPhaseContext(ctx, cliproxyexecutor.ImagePhaseConversationPrepare, prepareStarted)
 	if err != nil {
 		return nil, err
 	}
+	upstreamStarted := time.Now()
 	response, turn, err := e.openChatGPTWebImageConversation(ctx, client, credential, requirements, upstreamModel, conduit, upstreamPrompt, uploads)
+	cliproxyexecutor.ObserveRequestPhaseContext(ctx, cliproxyexecutor.ImagePhaseUpstreamInitial, upstreamStarted)
 	if err != nil {
 		return nil, err
 	}
@@ -662,7 +713,12 @@ func chatGPTWebImageUpstreamPrompt(prompt, action string, match *helps.ChatGPTWe
 
 func (e *ChatGPTWebExecutor) finishChatGPTWebImage(ctx context.Context, client *chatgptwebauth.Client, credential *chatgptwebauth.Credential, prepared *chatGPTWebPreparedRequest, execution *chatGPTWebImageExecution) (payload []byte, err error) {
 	failureStage := "settle"
+	settleStarted := time.Now()
+	settleObserved := false
 	defer func() {
+		if !settleObserved {
+			cliproxyexecutor.ObserveRequestPhaseContext(ctx, cliproxyexecutor.ImagePhaseStreamSettle, settleStarted)
+		}
 		if err != nil {
 			err = withChatGPTWebFailureStage(failureStage, err)
 		}
@@ -730,9 +786,29 @@ func (e *ChatGPTWebExecutor) finishChatGPTWebImage(ctx context.Context, client *
 			retryOtherAuth: true,
 		}
 	}
+	cliproxyexecutor.ObserveRequestPhaseContext(ctx, cliproxyexecutor.ImagePhaseStreamSettle, settleStarted)
+	settleObserved = true
+	finalizerStarted := time.Now()
+	releaseFinalizer, errFinalizer := cliproxyexecutor.AcquireChatGPTWebImageFinalizer(ctx)
+	if errFinalizer != nil {
+		cliproxyexecutor.ObserveRequestPhaseContext(ctx, cliproxyexecutor.ImagePhaseFinalizerWait, finalizerStarted)
+		return nil, errFinalizer
+	}
+	defer releaseFinalizer()
 	failureStage = "download"
+	if prepared.imageMemoryLeases != nil {
+		releaseCompletionTurn, errFinalization := prepared.imageMemoryLeases.BeginFinalization(ctx)
+		if errFinalization != nil {
+			cliproxyexecutor.ObserveRequestPhaseContext(ctx, cliproxyexecutor.ImagePhaseFinalizerWait, finalizerStarted)
+			return nil, errFinalization
+		}
+		defer releaseCompletionTurn()
+	}
+	cliproxyexecutor.ObserveRequestPhaseContext(ctx, cliproxyexecutor.ImagePhaseFinalizerWait, finalizerStarted)
 	responseByteLimit := chatGPTWebImageResponseByteLimit(prepared.imageConfigSnapshot)
+	downloadStarted := time.Now()
 	images, err := e.downloadChatGPTWebImagesLimitedWithBudget(ctx, client, credential, accumulator, prepared.maxImageResults, responseByteLimit)
+	cliproxyexecutor.ObserveRequestPhaseContext(ctx, cliproxyexecutor.ImagePhaseDownload, downloadStarted)
 	if prepared.imageResultState != nil && len(images) > 0 {
 		prepared.imageResultState.AddProduced(len(images))
 	}
@@ -746,6 +822,7 @@ func (e *ChatGPTWebExecutor) finishChatGPTWebImage(ctx context.Context, client *
 	if normalizeChatGPTWebImageOutputFormat(imageRequest.OutputFormat) == "png" && outputCompression == 0 {
 		outputCompression = 100
 	}
+	encodeStarted := time.Now()
 	outputImages, err := prepareChatGPTWebImageOutputsWithContextAndCompression(
 		ctx,
 		imageRequest.OutputFormat,
@@ -764,6 +841,7 @@ func (e *ChatGPTWebExecutor) finishChatGPTWebImage(ctx context.Context, client *
 		usage = e.completeChatGPTWebUsage(prepared, "", outputImages)
 	}
 	completed, err := buildPreparedChatGPTWebImageCompletedEvent(prepared.routeModel, imageRequest.OutputFormat, images, outputImages, usage)
+	cliproxyexecutor.ObserveRequestPhaseContext(ctx, cliproxyexecutor.ImagePhaseWebResponseEncode, encodeStarted)
 	if err != nil {
 		return nil, err
 	}
@@ -2069,6 +2147,13 @@ type chatGPTWebImageTaskPollContext struct {
 
 func (chatGPTWebImageTaskPollContext) Value(any) any { return nil }
 
+func newChatGPTWebImageTaskPollContext(ctx context.Context) context.Context {
+	base := context.Context(chatGPTWebImageTaskPollContext{Context: ctx})
+	base = cliproxyexecutor.WithRequestPhaseObserver(base, cliproxyexecutor.RequestPhaseObserverFromContext(ctx))
+	base = helps.WithChatGPTWebImageMemoryLeaseSet(base, helps.ChatGPTWebImageMemoryLeaseSetFromContext(ctx))
+	return base
+}
+
 func (e *ChatGPTWebExecutor) consumeChatGPTWebImageStreamWithTaskPolling(ctx context.Context, client *chatgptwebauth.Client, credential *chatgptwebauth.Credential, response *fhttp.Response, budgets ...*chatGPTWebPollResponseBudget) (*helps.ChatGPTWebImageAccumulator, error) {
 	return e.consumeChatGPTWebImageStreamWithTaskPollingForTurn(ctx, client, credential, response, helps.ChatGPTWebImageTurn{}, budgets...)
 }
@@ -2088,7 +2173,7 @@ func (e *ChatGPTWebExecutor) consumeChatGPTWebImageStreamWithTaskPollingForTurn(
 		}
 	}()
 	defer close(stopContextRead)
-	watchCtx, cancelWatch := context.WithCancel(chatGPTWebImageTaskPollContext{Context: ctx})
+	watchCtx, cancelWatch := context.WithCancel(newChatGPTWebImageTaskPollContext(ctx))
 	defer cancelWatch()
 	result := make(chan chatGPTWebImageTaskWatchResult, 1)
 	watchDone := make(chan struct{})
@@ -2165,7 +2250,7 @@ func (e *ChatGPTWebExecutor) watchChatGPTWebImageTasks(ctx context.Context, clie
 	pollBudget = chatGPTWebSharedPollResponseBudget([]*chatGPTWebPollResponseBudget{pollBudget})
 	tasksEnabled := true
 	conversationEnabled := true
-	pollContext, cancelPolls := context.WithCancel(chatGPTWebImageTaskPollContext{Context: ctx})
+	pollContext, cancelPolls := context.WithCancel(newChatGPTWebImageTaskPollContext(ctx))
 	var taskPoll <-chan chatGPTWebImageTaskPollResult
 	var conversationPoll <-chan chatGPTWebImageConversationPollResult
 	defer func() {
@@ -2577,7 +2662,7 @@ func (e *ChatGPTWebExecutor) pollChatGPTWebImageConversation(ctx context.Context
 	pollBudget := chatGPTWebSharedPollResponseBudget(budgets)
 	tasksEnabled := true
 	conversationEnabled := true
-	pollContext, cancelPolls := context.WithCancel(chatGPTWebImageTaskPollContext{Context: ctx})
+	pollContext, cancelPolls := context.WithCancel(newChatGPTWebImageTaskPollContext(ctx))
 	var taskPoll <-chan chatGPTWebImageTaskPollResult
 	var conversationPoll <-chan chatGPTWebImageConversationPollResult
 	defer func() {
@@ -3286,8 +3371,11 @@ func readChatGPTWebImageDownloadBody(ctx context.Context, body io.Reader, conten
 	return readChatGPTWebBoundedBodyWithAdmission(body, contentLength, maxBytes, func(size int64) (func(), error) {
 		base64Bytes := saturatingChatGPTWebImageMultiply(saturatingChatGPTWebImageAdd(size, 2)/3, 4)
 		estimatedBytes := saturatingChatGPTWebImageAdd(size, saturatingChatGPTWebImageMultiply(base64Bytes, 2))
-		if !leases.TryAcquire(max(estimatedBytes, int64(1))) {
-			return nil, &chatGPTWebImageMemoryCapacityError{}
+		if errAcquire := leases.Acquire(ctx, max(estimatedBytes, int64(1))); errAcquire != nil {
+			if errors.Is(errAcquire, context.Canceled) || errors.Is(errAcquire, context.DeadlineExceeded) {
+				return nil, errAcquire
+			}
+			return nil, &chatGPTWebImageMemoryCapacityError{stage: "download"}
 		}
 		return func() {}, nil
 	})
@@ -3466,14 +3554,15 @@ func validateChatGPTWebDownloadedImageWithAdmission(
 }
 
 func acquireChatGPTWebTransientImageMemory(ctx context.Context, estimatedBytes int64) (func(), error) {
-	if helps.ChatGPTWebImageMemoryLeaseSetFromContext(ctx) == nil {
+	leases := helps.ChatGPTWebImageMemoryLeaseSetFromContext(ctx)
+	if leases == nil {
 		return helps.AcquireChatGPTWebImageMemory(ctx, estimatedBytes)
 	}
-	release, acquired := helps.TryAcquireChatGPTWebImageMemory(estimatedBytes)
-	if !acquired {
+	release, err := leases.AcquireTransient(ctx, estimatedBytes)
+	if errors.Is(err, helps.ErrChatGPTWebImageMemoryQueueFull) || errors.Is(err, helps.ErrChatGPTWebImageMemoryWorkingSetTooLarge) {
 		return nil, &chatGPTWebImageMemoryCapacityError{}
 	}
-	return release, nil
+	return release, err
 }
 
 func chatGPTWebImageOutputProtocolError(message string) error {
@@ -3568,7 +3657,10 @@ func (e *ChatGPTWebExecutor) doChatGPTWebPollGET(ctx context.Context, client *ch
 		return nil, nil, nil, err
 	}
 	defer releaseChatGPTWebImagePollSlot(chatGPTWebImagePollSlots)
-	return e.doChatGPTWebGETWithBudget(ctx, client, credential, path, extra, budget, false)
+	started := time.Now()
+	response, payload, release, err := e.doChatGPTWebGETWithBudget(ctx, client, credential, path, extra, budget, false)
+	cliproxyexecutor.ObserveRequestPhaseContext(ctx, cliproxyexecutor.ImagePhasePollRequest, started)
+	return response, payload, release, err
 }
 
 func acquireChatGPTWebImagePollSlot(ctx context.Context, slots chan struct{}) error {
@@ -3578,10 +3670,21 @@ func acquireChatGPTWebImagePollSlot(ctx context.Context, slots chan struct{}) er
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	started := time.Now()
+	chatGPTWebImagePollMetrics.attempts.Add(1)
 	select {
 	case slots <- struct{}{}:
+		chatGPTWebImagePollMetrics.acquired.Add(1)
+		waitNanos := uint64(max(time.Since(started).Nanoseconds(), int64(0)))
+		chatGPTWebImagePollMetrics.totalWaitNanos.Add(waitNanos)
+		updateAtomicUint64Max(&chatGPTWebImagePollMetrics.maxWaitNanos, waitNanos)
+		active := chatGPTWebImagePollMetrics.active.Add(1)
+		updateAtomicInt64Max(&chatGPTWebImagePollMetrics.peakActive, active)
+		cliproxyexecutor.ObserveRequestPhaseContext(ctx, cliproxyexecutor.ImagePhasePollSlotWait, started)
 		return nil
 	case <-ctx.Done():
+		chatGPTWebImagePollMetrics.canceled.Add(1)
+		cliproxyexecutor.ObserveRequestPhaseContext(ctx, cliproxyexecutor.ImagePhasePollSlotWait, started)
 		return ctx.Err()
 	}
 }
@@ -3589,10 +3692,29 @@ func acquireChatGPTWebImagePollSlot(ctx context.Context, slots chan struct{}) er
 func releaseChatGPTWebImagePollSlot(slots chan struct{}) {
 	if slots != nil {
 		<-slots
+		chatGPTWebImagePollMetrics.active.Add(-1)
 	}
 }
 
-func readChatGPTWebPollResponseBody(response *fhttp.Response, maxBytes int) ([]byte, func(), error) {
+func updateAtomicUint64Max(target *atomic.Uint64, value uint64) {
+	for {
+		current := target.Load()
+		if value <= current || target.CompareAndSwap(current, value) {
+			return
+		}
+	}
+}
+
+func updateAtomicInt64Max(target *atomic.Int64, value int64) {
+	for {
+		current := target.Load()
+		if value <= current || target.CompareAndSwap(current, value) {
+			return
+		}
+	}
+}
+
+func readChatGPTWebPollResponseBody(ctx context.Context, response *fhttp.Response, maxBytes int) ([]byte, func(), error) {
 	if response == nil {
 		return nil, nil, errors.New("chatgpt web response is nil")
 	}
@@ -3603,10 +3725,23 @@ func readChatGPTWebPollResponseBody(response *fhttp.Response, maxBytes int) ([]b
 		estimatedBytes = int64(maxBytes)
 	}
 	estimatedBytes = saturatingChatGPTWebImageMultiply(estimatedBytes, 2)
-	release, acquired := helps.TryAcquireChatGPTWebImageMemory(max(estimatedBytes, int64(1)))
-	if !acquired {
+	var release func()
+	var errAcquire error
+	if leases := helps.ChatGPTWebImageMemoryLeaseSetFromContext(ctx); leases != nil {
+		release, errAcquire = leases.AcquireTransient(ctx, max(estimatedBytes, int64(1)))
+	} else {
+		var acquired bool
+		release, acquired = helps.TryAcquireChatGPTWebImageMemory(max(estimatedBytes, int64(1)))
+		if !acquired {
+			errAcquire = helps.ErrChatGPTWebImageMemoryQueueFull
+		}
+	}
+	if errAcquire != nil {
 		if response.Body != nil {
 			_ = response.Body.Close()
+		}
+		if errors.Is(errAcquire, context.Canceled) || errors.Is(errAcquire, context.DeadlineExceeded) {
+			return nil, nil, errAcquire
 		}
 		return nil, nil, &chatGPTWebImageMemoryCapacityError{stage: "settle"}
 	}
@@ -3627,7 +3762,7 @@ func (e *ChatGPTWebExecutor) doChatGPTWebGETWithBudget(ctx context.Context, clie
 		return nil, nil, nil, chatGPTWebTransportDiagnosticError(err, path)
 	}
 	helps.RecordAPIResponseMetadata(ctx, e.configSnapshot(), response.StatusCode, chatGPTWebResponseLogHeaders(response.Header))
-	data, releaseMemory, err := readChatGPTWebPollResponseBody(response, chatGPTWebMaxJSONBodyBytes)
+	data, releaseMemory, err := readChatGPTWebPollResponseBody(ctx, response, chatGPTWebMaxJSONBodyBytes)
 	if err != nil {
 		helps.RecordAPIResponseError(ctx, e.configSnapshot(), err)
 		var memoryErr *chatGPTWebImageMemoryCapacityError

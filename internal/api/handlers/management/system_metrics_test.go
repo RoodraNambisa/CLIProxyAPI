@@ -12,9 +12,18 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/systemmetrics"
+	coreexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 )
 
 func TestGetSystemMetricsReturnsRuntimeAndConfiguredFilesystems(t *testing.T) {
+	coreexecutor.ConfigureChatGPTWebImageAdmissions(7, 4, 2)
+	t.Cleanup(func() {
+		coreexecutor.ConfigureChatGPTWebImageAdmissions(
+			config.DefaultChatGPTWebImageMaxInFlight,
+			config.DefaultChatGPTWebImageAdmissionQueueSize,
+			config.DefaultChatGPTWebImageMaxFinalizers,
+		)
+	})
 	root := t.TempDir()
 	authDirectory := filepath.Join(root, "auth")
 	cacheDirectory := filepath.Join(root, "usage-cache")
@@ -63,5 +72,18 @@ func TestGetSystemMetricsReturnsRuntimeAndConfiguredFilesystems(t *testing.T) {
 	}
 	if response.ImageProcessing.CapacityBytes < 1 {
 		t.Fatalf("ImageProcessing = %#v, want bounded production admission", response.ImageProcessing)
+	}
+	if response.ChatGPTWebImageInFlight.Limit != 7 || response.ChatGPTWebImageInFlight.QueueLimit != 4 ||
+		response.ChatGPTWebFinalizers.Limit != 2 || response.ChatGPTWebFinalizers.QueueLimit != 7 {
+		t.Fatalf("image lifecycle admissions = %#v / %#v", response.ChatGPTWebImageInFlight, response.ChatGPTWebFinalizers)
+	}
+	if response.ChatGPTWebPollSlots.Limit < 1 {
+		t.Fatalf("ChatGPTWebPollSlots = %#v", response.ChatGPTWebPollSlots)
+	}
+	if response.ImageRequestPhases.HandlerScope != "all_image_routes" ||
+		response.ImageRequestPhases.WebScope != "chatgpt_web_only_after_executor_selection" ||
+		response.ImageRequestPhases.ResponseWriteCountSemantics != "write_operations" ||
+		response.ImageRequestPhases.Metrics == nil {
+		t.Fatalf("ImageRequestPhases = %#v", response.ImageRequestPhases)
 	}
 }

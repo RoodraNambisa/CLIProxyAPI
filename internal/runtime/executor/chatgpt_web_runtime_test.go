@@ -17,6 +17,7 @@ import (
 	"time"
 
 	chatgptwebauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/chatgptweb"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
@@ -917,6 +918,80 @@ func TestChatGPTWebExecutorExecuteImageGeneration(t *testing.T) {
 	}
 	if revised := gjson.GetBytes(response.Payload, "response.output.0.revised_prompt"); revised.Exists() {
 		t.Fatalf("revised_prompt = %s, want absent", revised.Raw)
+	}
+}
+
+func TestChatGPTWebExecutorImageLifecycleAdmissionPrecedesFirstUpstream(t *testing.T) {
+	var upstreamCalls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		upstreamCalls.Add(1)
+		http.Error(w, "unexpected upstream call", http.StatusInternalServerError)
+	}))
+	defer server.Close()
+	executor := NewChatGPTWebExecutor(nil, nil)
+	t.Cleanup(func() { _ = executor.Close() })
+	executor.runtimeBaseURL = server.URL
+	cliproxyexecutor.ConfigureChatGPTWebImageAdmissions(1, 0, 1)
+	t.Cleanup(func() { cliproxyexecutor.ConfigureChatGPTWebImageAdmissions(64, 64, 8) })
+	release, err := cliproxyexecutor.AcquireChatGPTWebImageExecution(t.Context(), 0)
+	if err != nil {
+		t.Fatalf("fill lifecycle gate: %v", err)
+	}
+	defer release()
+
+	_, err = executor.Execute(t.Context(), chatGPTWebRuntimeAuth(), cliproxyexecutor.Request{
+		Model:   "gpt-image-2",
+		Payload: []byte(`{"model":"gpt-image-2","input":"draw","tools":[{"type":"image_generation"}]}`),
+	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatCodex, ResponseFormat: sdktranslator.FormatCodex})
+	if !cliproxyexecutor.IsImageExecutionCapacityError(err) {
+		t.Fatalf("Execute() error = %T %v, want image capacity", err, err)
+	}
+	if got := upstreamCalls.Load(); got != 0 {
+		t.Fatalf("upstream calls = %d, want 0", got)
+	}
+}
+
+func TestChatGPTWebExecutorUpdateConfigAppliesImageAdmissionPolicyWithoutEvictingActive(t *testing.T) {
+	executor := NewChatGPTWebExecutor(nil, nil)
+	t.Cleanup(func() { _ = executor.Close() })
+	t.Cleanup(func() {
+		cliproxyexecutor.ConfigureChatGPTWebImageAdmissions(
+			config.DefaultChatGPTWebImageMaxInFlight,
+			config.DefaultChatGPTWebImageAdmissionQueueSize,
+			config.DefaultChatGPTWebImageMaxFinalizers,
+		)
+	})
+	maxInFlight := 2
+	queueLimit := 1
+	maxFinalizers := 1
+	executor.UpdateConfig(&config.Config{SDKConfig: config.SDKConfig{Images: config.ImagesConfig{ChatGPTWeb: config.ChatGPTWebImageConfig{
+		MaxInFlight:        &maxInFlight,
+		AdmissionQueueSize: &queueLimit,
+		MaxFinalizers:      &maxFinalizers,
+	}}}})
+	releaseA, errA := cliproxyexecutor.AcquireChatGPTWebImageExecution(t.Context(), 0)
+	releaseB, errB := cliproxyexecutor.AcquireChatGPTWebImageExecution(t.Context(), 0)
+	if errA != nil || errB != nil {
+		t.Fatalf("initial admissions = %v / %v", errA, errB)
+	}
+	lowered := 1
+	queueDisabled := 0
+	executor.UpdateConfig(&config.Config{SDKConfig: config.SDKConfig{Images: config.ImagesConfig{ChatGPTWeb: config.ChatGPTWebImageConfig{
+		MaxInFlight:        &lowered,
+		AdmissionQueueSize: &queueDisabled,
+		MaxFinalizers:      &maxFinalizers,
+	}}}})
+	snapshot := cliproxyexecutor.ChatGPTWebImageExecutionAdmissionSnapshot()
+	if snapshot.Limit != 1 || snapshot.Active != 2 || snapshot.QueueLimit != 0 {
+		t.Fatalf("hot-lowered snapshot = %#v", snapshot)
+	}
+	if _, err := cliproxyexecutor.AcquireChatGPTWebImageExecution(t.Context(), 0); !cliproxyexecutor.IsImageExecutionCapacityError(err) {
+		t.Fatalf("admission while over lowered limit = %T %v", err, err)
+	}
+	releaseA()
+	releaseB()
+	if snapshot = cliproxyexecutor.ChatGPTWebImageExecutionAdmissionSnapshot(); snapshot.Active != 0 {
+		t.Fatalf("released snapshot = %#v", snapshot)
 	}
 }
 

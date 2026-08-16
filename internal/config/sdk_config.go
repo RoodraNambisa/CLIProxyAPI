@@ -185,6 +185,17 @@ type ChatGPTWebImageConfig struct {
 	MaxImageResponseMegabytes *int `yaml:"max-image-response-megabytes,omitempty" json:"max-image-response-megabytes,omitempty"`
 	// MaxN limits the number of images requested from ChatGPT Web in one logical request.
 	MaxN *int `yaml:"max-n,omitempty" json:"max-n,omitempty"`
+	// MaxInFlight bounds complete ChatGPT Web image attempts, including sleeping polls.
+	MaxInFlight *int `yaml:"max-in-flight,omitempty" json:"max-in-flight,omitempty"`
+	// AdmissionQueueSize bounds requests waiting to enter the Web image lifecycle.
+	AdmissionQueueSize *int `yaml:"admission-queue-size,omitempty" json:"admission-queue-size,omitempty"`
+	// AdmissionWaitMilliseconds limits pre-upstream lifecycle admission waiting.
+	AdmissionWaitMilliseconds *int `yaml:"admission-wait-milliseconds,omitempty" json:"admission-wait-milliseconds,omitempty"`
+	// MaxFinalizers bounds settled requests admitted to finalizer staging. The
+	// memory-owning download/decode/encode critical section is serialized.
+	MaxFinalizers *int `yaml:"max-finalizers,omitempty" json:"max-finalizers,omitempty"`
+	// CompletionReserveMegabytes reserves a small per-attempt completion allowance before upstream work.
+	CompletionReserveMegabytes *int `yaml:"completion-reserve-megabytes,omitempty" json:"completion-reserve-megabytes,omitempty"`
 }
 
 const (
@@ -201,6 +212,21 @@ const (
 	DefaultChatGPTWebMaxN                       = 1
 	MinChatGPTWebMaxN                           = 1
 	MaxChatGPTWebMaxN                           = 10
+	DefaultChatGPTWebImageMaxInFlight           = 64
+	MinChatGPTWebImageMaxInFlight               = 1
+	MaxChatGPTWebImageMaxInFlight               = 512
+	DefaultChatGPTWebImageAdmissionQueueSize    = 64
+	MinChatGPTWebImageAdmissionQueueSize        = 0
+	MaxChatGPTWebImageAdmissionQueueSize        = 512
+	DefaultChatGPTWebImageAdmissionWaitMS       = 1000
+	MinChatGPTWebImageAdmissionWaitMS           = 0
+	MaxChatGPTWebImageAdmissionWaitMS           = 30000
+	DefaultChatGPTWebImageMaxFinalizers         = 8
+	MinChatGPTWebImageMaxFinalizers             = 1
+	MaxChatGPTWebImageMaxFinalizers             = 64
+	DefaultChatGPTWebImageCompletionReserveMB   = 1
+	MinChatGPTWebImageCompletionReserveMB       = 0
+	MaxChatGPTWebImageCompletionReserveMB       = 32
 )
 
 // ResolvedChatGPTWebImageConfig contains effective ChatGPT Web image compatibility values.
@@ -215,6 +241,11 @@ type ResolvedChatGPTWebImageConfig struct {
 	ResizeFilter               string
 	MaxImageResponseMegabytes  int
 	MaxN                       int
+	MaxInFlight                int
+	AdmissionQueueSize         int
+	AdmissionWaitMilliseconds  int
+	MaxFinalizers              int
+	CompletionReserveMegabytes int
 }
 
 // ResolvedUpstreamModel returns the effective ChatGPT Web image conversation model.
@@ -238,6 +269,11 @@ func (cfg ChatGPTWebImageConfig) Resolved() ResolvedChatGPTWebImageConfig {
 		ResizeFilter:               DefaultChatGPTWebResizeFilter,
 		MaxImageResponseMegabytes:  DefaultChatGPTWebMaxImageResponseMegabytes,
 		MaxN:                       DefaultChatGPTWebMaxN,
+		MaxInFlight:                DefaultChatGPTWebImageMaxInFlight,
+		AdmissionQueueSize:         DefaultChatGPTWebImageAdmissionQueueSize,
+		AdmissionWaitMilliseconds:  DefaultChatGPTWebImageAdmissionWaitMS,
+		MaxFinalizers:              DefaultChatGPTWebImageMaxFinalizers,
+		CompletionReserveMegabytes: DefaultChatGPTWebImageCompletionReserveMB,
 	}
 	if cfg.AspectRatioMaxErrorPercent != nil {
 		resolved.AspectRatioMaxErrorPercent = *cfg.AspectRatioMaxErrorPercent
@@ -253,6 +289,21 @@ func (cfg ChatGPTWebImageConfig) Resolved() ResolvedChatGPTWebImageConfig {
 	}
 	if cfg.MaxN != nil {
 		resolved.MaxN = *cfg.MaxN
+	}
+	if cfg.MaxInFlight != nil {
+		resolved.MaxInFlight = *cfg.MaxInFlight
+	}
+	if cfg.AdmissionQueueSize != nil {
+		resolved.AdmissionQueueSize = *cfg.AdmissionQueueSize
+	}
+	if cfg.AdmissionWaitMilliseconds != nil {
+		resolved.AdmissionWaitMilliseconds = *cfg.AdmissionWaitMilliseconds
+	}
+	if cfg.MaxFinalizers != nil {
+		resolved.MaxFinalizers = *cfg.MaxFinalizers
+	}
+	if cfg.CompletionReserveMegabytes != nil {
+		resolved.CompletionReserveMegabytes = *cfg.CompletionReserveMegabytes
 	}
 	return resolved
 }
@@ -283,6 +334,21 @@ func (cfg ChatGPTWebImageConfig) Validate() error {
 	}
 	if resolved.MaxN < MinChatGPTWebMaxN || resolved.MaxN > MaxChatGPTWebMaxN {
 		return fmt.Errorf("images.chatgpt-web.max-n must be between %d and %d", MinChatGPTWebMaxN, MaxChatGPTWebMaxN)
+	}
+	if resolved.MaxInFlight < MinChatGPTWebImageMaxInFlight || resolved.MaxInFlight > MaxChatGPTWebImageMaxInFlight {
+		return fmt.Errorf("images.chatgpt-web.max-in-flight must be between %d and %d", MinChatGPTWebImageMaxInFlight, MaxChatGPTWebImageMaxInFlight)
+	}
+	if resolved.AdmissionQueueSize < MinChatGPTWebImageAdmissionQueueSize || resolved.AdmissionQueueSize > MaxChatGPTWebImageAdmissionQueueSize {
+		return fmt.Errorf("images.chatgpt-web.admission-queue-size must be between %d and %d", MinChatGPTWebImageAdmissionQueueSize, MaxChatGPTWebImageAdmissionQueueSize)
+	}
+	if resolved.AdmissionWaitMilliseconds < MinChatGPTWebImageAdmissionWaitMS || resolved.AdmissionWaitMilliseconds > MaxChatGPTWebImageAdmissionWaitMS {
+		return fmt.Errorf("images.chatgpt-web.admission-wait-milliseconds must be between %d and %d", MinChatGPTWebImageAdmissionWaitMS, MaxChatGPTWebImageAdmissionWaitMS)
+	}
+	if resolved.MaxFinalizers < MinChatGPTWebImageMaxFinalizers || resolved.MaxFinalizers > MaxChatGPTWebImageMaxFinalizers {
+		return fmt.Errorf("images.chatgpt-web.max-finalizers must be between %d and %d", MinChatGPTWebImageMaxFinalizers, MaxChatGPTWebImageMaxFinalizers)
+	}
+	if resolved.CompletionReserveMegabytes < MinChatGPTWebImageCompletionReserveMB || resolved.CompletionReserveMegabytes > MaxChatGPTWebImageCompletionReserveMB {
+		return fmt.Errorf("images.chatgpt-web.completion-reserve-megabytes must be between %d and %d", MinChatGPTWebImageCompletionReserveMB, MaxChatGPTWebImageCompletionReserveMB)
 	}
 	return nil
 }

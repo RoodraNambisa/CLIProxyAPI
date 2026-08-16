@@ -532,6 +532,7 @@ type requestRoundState struct {
 	tried               map[string]struct{}
 	attempted           map[string]struct{}
 	attemptedByPriority map[int]map[string]struct{}
+	blockedProviders    map[string]struct{}
 	lastErr             error
 	lastErrAuthID       string
 }
@@ -592,6 +593,7 @@ func newRequestRoundState() *requestRoundState {
 		tried:               make(map[string]struct{}),
 		attempted:           make(map[string]struct{}),
 		attemptedByPriority: make(map[int]map[string]struct{}),
+		blockedProviders:    make(map[string]struct{}),
 	}
 }
 
@@ -608,7 +610,30 @@ func (s *requestRoundState) ensure() *requestRoundState {
 	if s.attemptedByPriority == nil {
 		s.attemptedByPriority = make(map[int]map[string]struct{})
 	}
+	if s.blockedProviders == nil {
+		s.blockedProviders = make(map[string]struct{})
+	}
 	return s
+}
+
+func (s *requestRoundState) blockProvider(provider string) {
+	if s == nil {
+		return
+	}
+	s = s.ensure()
+	provider = strings.ToLower(strings.TrimSpace(provider))
+	if provider != "" {
+		s.blockedProviders[provider] = struct{}{}
+	}
+}
+
+func (s *requestRoundState) providerBlocked(provider string) bool {
+	if s == nil {
+		return false
+	}
+	s = s.ensure()
+	_, blocked := s.blockedProviders[strings.ToLower(strings.TrimSpace(provider))]
+	return blocked
 }
 
 func (s *requestRoundState) markAttempted(auth *Auth) {
@@ -2364,6 +2389,9 @@ func (m *Manager) executeStreamWithModelPool(ctx, resultCtx context.Context, exe
 			unregisterRelease()
 			if errCtx := ctx.Err(); errCtx != nil {
 				return nil, errCtx
+			}
+			if cliproxyexecutor.IsImageExecutionCapacityError(errStream) {
+				return nil, errStream
 			}
 			errStream = m.reportProxyFailure(ctx, auth, errStream)
 			m.projectFailedImageGenerationQuota(ctx, auth, provider, executionResultModelForError(resultModel, errStream), opts)
@@ -5261,7 +5289,10 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			}
 			return cliproxyexecutor.Response{}, &Error{Code: "request_body_released", Message: "request body released; retry disabled"}
 		}
+		selectionStarted := time.Now()
+		requestSlotBefore := opts.AuthRequestSlot.ReservationDurationNanos()
 		auth, executor, provider, errPick := m.pickNextMixedWithImageToolFallback(ctx, providers, routeModel, req, opts, roundState.tried, pickAllowed)
+		observeImageRequestSelectionPhases(opts.Metadata, opts.AuthRequestSlot, selectionStarted, requestSlotBefore)
 		if errPick != nil {
 			if chatGPTWebImageQuotaRefreshPendingError(errPick) {
 				return cliproxyexecutor.Response{}, errPick
@@ -5400,6 +5431,11 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			}
 			if errCtx := execCtx.Err(); errCtx != nil {
 				return cliproxyexecutor.Response{}, errCtx
+			}
+			if cliproxyexecutor.IsImageExecutionCapacityError(errExec) {
+				roundState.blockProvider(provider)
+				authErr = errExec
+				break
 			}
 			if errExec != nil && requestBodyReplayable(execCtx, opts) {
 				refreshed, attemptedRefresh, errRefresh := m.tryRefreshAfterUnauthorized(execCtx, executor, auth, errExec, didRefreshOnUnauthorized)
@@ -5773,7 +5809,10 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			}
 			return nil, &Error{Code: "request_body_released", Message: "request body released; retry disabled"}
 		}
+		selectionStarted := time.Now()
+		requestSlotBefore := opts.AuthRequestSlot.ReservationDurationNanos()
 		auth, executor, provider, errPick := m.pickNextMixedWithImageToolFallback(ctx, providers, routeModel, req, opts, roundState.tried, pickAllowed)
+		observeImageRequestSelectionPhases(opts.Metadata, opts.AuthRequestSlot, selectionStarted, requestSlotBefore)
 		if errPick != nil {
 			if chatGPTWebImageQuotaRefreshPendingError(errPick) {
 				return nil, errPick
@@ -5889,6 +5928,14 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			}
 			if errCtx := execCtx.Err(); errCtx != nil {
 				return nil, errCtx
+			}
+			if cliproxyexecutor.IsImageExecutionCapacityError(errStream) {
+				roundState.blockProvider(provider)
+				roundState.setLastError(auth, errStream)
+				if strictSessionAffinity || !requestBodyReplayable(execCtx, opts) {
+					return nil, errStream
+				}
+				continue
 			}
 			markDeferredFailure := deferAntigravityUnauthorizedStreamResult(auth, errStream)
 			if requestBodyReplayable(execCtx, opts) {
@@ -7116,6 +7163,23 @@ func newAuthRequestSlot(diagnostics *cliproxyexecutor.RequestExecutionDiagnostic
 	return slot
 }
 
+func observeImageRequestSelectionPhases(metadata map[string]any, slot *cliproxyexecutor.AuthRequestSlot, started time.Time, reservationBefore uint64) {
+	elapsed := time.Since(started)
+	reservationDuration := time.Duration(0)
+	if slot != nil {
+		reservationAfter := slot.ReservationDurationNanos()
+		if reservationAfter > reservationBefore {
+			reservationNanos := reservationAfter - reservationBefore
+			if elapsedNanos := uint64(max(elapsed.Nanoseconds(), int64(0))); reservationNanos > elapsedNanos {
+				reservationNanos = elapsedNanos
+			}
+			reservationDuration = time.Duration(reservationNanos)
+		}
+	}
+	cliproxyexecutor.ObserveRequestPhaseDuration(metadata, cliproxyexecutor.ImagePhaseRequestSlot, reservationDuration)
+	cliproxyexecutor.ObserveRequestPhaseDuration(metadata, cliproxyexecutor.ImagePhaseCredentialSelection, elapsed-reservationDuration)
+}
+
 func (m *Manager) recordExecutionResultMetrics(opts cliproxyexecutor.Options, err error) {
 	if err == nil {
 		return
@@ -7177,6 +7241,9 @@ func (m *Manager) maxRetryCredentialsForPriority(priority int, globalMaxRetryCre
 func (m *Manager) roundPickAllowed(roundState *requestRoundState, globalMaxRetryCredentials int) func(*Auth) bool {
 	return func(auth *Auth) bool {
 		if auth == nil || auth.RuntimeInstanceRetired() {
+			return false
+		}
+		if roundState.providerBlocked(auth.Provider) {
 			return false
 		}
 		priority := authPriority(auth)

@@ -288,9 +288,14 @@ func TestXAIImagesMultipartEditPreservesNativeOptions(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/v1/images/edits", &body)
 	req.Header.Set("Content-Type", writer.FormDataContentType())
 	resp := httptest.NewRecorder()
+	parseBefore := coreexecutor.ImageRequestPhaseSnapshot()[coreexecutor.ImagePhaseInputParse].Count
 	router.ServeHTTP(resp, req)
+	parseAfter := coreexecutor.ImageRequestPhaseSnapshot()[coreexecutor.ImagePhaseInputParse].Count
 	if resp.Code != http.StatusOK {
 		t.Fatalf("response status=%d body=%s", resp.Code, resp.Body.String())
+	}
+	if parseAfter != parseBefore {
+		t.Fatalf("XAI multipart execution changed input-parse count: before=%d after=%d", parseBefore, parseAfter)
 	}
 
 	capture.mu.Lock()

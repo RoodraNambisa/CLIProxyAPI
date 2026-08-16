@@ -627,6 +627,9 @@ func requestExecutionMetadata(ctx context.Context) map[string]any {
 			if leases, exists := ginCtx.Get(executorhelps.ChatGPTWebImageMemoryLeaseSetMetadataKey); exists {
 				meta[executorhelps.ChatGPTWebImageMemoryLeaseSetMetadataKey] = leases
 			}
+			if observer, exists := ginCtx.Get(coreexecutor.RequestPhaseObserverMetadataKey); exists {
+				meta[coreexecutor.RequestPhaseObserverMetadataKey] = observer
+			}
 		}
 	}
 
