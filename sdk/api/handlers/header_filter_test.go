@@ -53,3 +53,26 @@ func TestFilterUpstreamHeaders_ReturnsNilWhenAllHeadersBlocked(t *testing.T) {
 		t.Fatalf("expected nil when all headers are filtered, got %#v", filtered)
 	}
 }
+
+func TestClientUpstreamHeadersAlwaysPreservesCodexTurnState(t *testing.T) {
+	src := http.Header{
+		codexTurnStateResponseHeader: []string{"state-1"},
+		"X-Request-Id":               []string{"request-1"},
+	}
+
+	withoutPassthrough := ClientUpstreamHeaders(src, false)
+	if got := withoutPassthrough.Get(codexTurnStateResponseHeader); got != "state-1" {
+		t.Fatalf("turn state = %q, want state-1", got)
+	}
+	if got := withoutPassthrough.Get("X-Request-Id"); got != "" {
+		t.Fatalf("request ID = %q, want omitted", got)
+	}
+
+	withPassthrough := ClientUpstreamHeaders(src, true)
+	if got := withPassthrough.Get(codexTurnStateResponseHeader); got != "state-1" {
+		t.Fatalf("turn state with passthrough = %q, want state-1", got)
+	}
+	if got := withPassthrough.Get("X-Request-Id"); got != "request-1" {
+		t.Fatalf("request ID with passthrough = %q, want request-1", got)
+	}
+}

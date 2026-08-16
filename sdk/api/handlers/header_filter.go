@@ -5,6 +5,8 @@ import (
 	"strings"
 )
 
+const codexTurnStateResponseHeader = "X-Codex-Turn-State"
+
 // gatewayHeaderPrefixes lists header name prefixes injected by known AI gateway
 // proxies. Claude Code's client-side telemetry detects these and reports the
 // gateway type, so we strip them from upstream responses to avoid detection.
@@ -71,6 +73,22 @@ func FilterUpstreamHeaders(src http.Header) http.Header {
 		return nil
 	}
 	return dst
+}
+
+// ClientUpstreamHeaders preserves the Codex turn-state protocol header even
+// when general upstream header passthrough is disabled.
+func ClientUpstreamHeaders(src http.Header, passthrough bool) http.Header {
+	if passthrough {
+		return FilterUpstreamHeaders(src)
+	}
+	if src == nil {
+		return nil
+	}
+	state := strings.TrimSpace(src.Get(codexTurnStateResponseHeader))
+	if state == "" {
+		return nil
+	}
+	return http.Header{codexTurnStateResponseHeader: []string{state}}
 }
 
 func connectionScopedHeaders(src http.Header) map[string]struct{} {

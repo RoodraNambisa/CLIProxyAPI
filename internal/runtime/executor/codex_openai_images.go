@@ -164,7 +164,7 @@ func (e *CodexExecutor) executeOpenAIImage(ctx context.Context, auth *cliproxyau
 	reporter.Publish(ctx, helps.ParseOpenAIUsage(upstreamData))
 	reporter.EnsurePublished(ctx)
 	clientData := applyCodexIdentityExposeResponsePayload(upstreamData, identityState)
-	return cliproxyexecutor.Response{Payload: clientData, Headers: httpResp.Header.Clone()}, nil
+	return cliproxyexecutor.Response{Payload: clientData, Headers: codexSuccessfulResponseHeaders(auth, httpResp.Header)}, nil
 }
 
 func (e *CodexExecutor) executeOpenAIImageStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (_ *cliproxyexecutor.StreamResult, err error) {
@@ -330,7 +330,7 @@ func (e *CodexExecutor) executeOpenAIImageStream(ctx context.Context, auth *clip
 			return
 		}
 	}()
-	return &cliproxyexecutor.StreamResult{Headers: httpResp.Header.Clone(), Chunks: out}, nil
+	return &cliproxyexecutor.StreamResult{Headers: codexSuccessfulResponseHeaders(auth, httpResp.Header), Chunks: out}, nil
 }
 
 func emitCodexOpenAIImageStreamChunk(ctx context.Context, out chan<- cliproxyexecutor.StreamChunk, chunk cliproxyexecutor.StreamChunk) bool {

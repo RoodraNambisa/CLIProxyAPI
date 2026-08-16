@@ -845,7 +845,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 		var param any
 		clientCompletedData := applyCodexIdentityExposeResponsePayload(completedData, identityState)
 		out := sdktranslator.TranslateNonStream(ctx, to, from, req.Model, originalRef.Bytes(), bodyRef.Bytes(), clientCompletedData, &param)
-		resp = cliproxyexecutor.Response{Payload: out, Headers: httpResp.Header.Clone()}
+		resp = cliproxyexecutor.Response{Payload: out, Headers: codexSuccessfulResponseHeaders(auth, httpResp.Header)}
 		return resp, nil
 	}
 	err = statusErr{code: 408, msg: "stream error: stream disconnected before completion: stream closed before response.completed"}
@@ -962,7 +962,7 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 	var param any
 	clientData := applyCodexIdentityExposeResponsePayload(upstreamData, identityState)
 	out := sdktranslator.TranslateNonStream(ctx, to, from, req.Model, originalRef.Bytes(), bodyRef.Bytes(), clientData, &param)
-	resp = cliproxyexecutor.Response{Payload: out, Headers: httpResp.Header.Clone()}
+	resp = cliproxyexecutor.Response{Payload: out, Headers: codexSuccessfulResponseHeaders(auth, httpResp.Header)}
 	return resp, nil
 }
 
@@ -1344,7 +1344,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 			_ = emit(cliproxyexecutor.StreamChunk{Err: errIncomplete})
 		}
 	}()
-	return &cliproxyexecutor.StreamResult{Headers: httpResp.Header.Clone(), Chunks: out}, nil
+	return &cliproxyexecutor.StreamResult{Headers: codexSuccessfulResponseHeaders(auth, httpResp.Header), Chunks: out}, nil
 }
 
 func splitCodexSSELinesPreserveEndings(data []byte, atEOF bool) (advance int, token []byte, err error) {
@@ -1627,7 +1627,9 @@ func (e *CodexExecutor) applyCodexHTTPSessionIdentity(
 		closeCodexRequestBody(httpReq)
 		return nil, err
 	}
+	ensureCodexTurnStateHeader(httpReq.Header, opts.Headers)
 	if !state.enabled {
+		guardCodexTurnStateHeader(auth, httpReq.Header)
 		return rawJSON, nil
 	}
 	closeCodexRequestBody(httpReq)
@@ -1635,6 +1637,7 @@ func (e *CodexExecutor) applyCodexHTTPSessionIdentity(
 	httpReq.Body = bodyReader
 	httpReq.ContentLength = int64(bodyReader.Len())
 	applyCodexSessionIdentityHeaders(httpReq.Header, state, false)
+	guardCodexTurnStateHeader(auth, httpReq.Header)
 	return projected, nil
 }
 

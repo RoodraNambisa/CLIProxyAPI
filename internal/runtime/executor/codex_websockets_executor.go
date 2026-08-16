@@ -294,6 +294,8 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 		return resp, err
 	}
 	applyCodexSessionIdentityHeaders(wsHeaders, sessionIdentity, true)
+	ensureCodexTurnStateHeader(wsHeaders, opts.Headers)
+	guardCodexTurnStateHeader(auth, wsHeaders)
 	releasedOriginalPayload := slimCodexOriginalPayloadForTranslation(from, originalPayload)
 	releasedClientBody := slimCodexBodyForStreamUsage(clientBody)
 	originalRef, clientBodyRef, unregisterClientBodies := codexStreamBodyRefs(ctx, opts, originalPayload, clientBody, releasedOriginalPayload, releasedClientBody)
@@ -361,6 +363,10 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 		return resp, errDial
 	}
 	recordAPIWebsocketHandshake(ctx, e.cfg, respHS)
+	var upstreamHeaders http.Header
+	if respHS != nil {
+		upstreamHeaders = respHS.Header.Clone()
+	}
 	dropCodexRawRequestCopies(&req, &opts)
 	if sess == nil {
 		logCodexWebsocketConnected(executionSessionID, authID, wsURL)
@@ -410,6 +416,9 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 					AuthValue: authValue,
 				})
 				recordAPIWebsocketHandshake(ctx, e.cfg, respHSRetry)
+				if respHSRetry != nil {
+					upstreamHeaders = respHSRetry.Header.Clone()
+				}
 				if errSendRetry := writeCurrentCodexWebsocketMessage(ctx, auth, sess, connRetry, wsReqBodyRetry); errSendRetry == nil {
 					conn = connRetry
 					wsReqBodyRetry = nil
@@ -503,7 +512,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 			}
 			var param any
 			out := sdktranslator.TranslateNonStream(ctx, to, from, req.Model, originalRef.Bytes(), clientBodyRef.Bytes(), clientPayload, &param)
-			resp = cliproxyexecutor.Response{Payload: out}
+			resp = cliproxyexecutor.Response{Payload: out, Headers: codexSuccessfulResponseHeaders(auth, upstreamHeaders)}
 			return resp, nil
 		}
 	}
@@ -578,6 +587,8 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 		return nil, err
 	}
 	applyCodexSessionIdentityHeaders(wsHeaders, sessionIdentity, true)
+	ensureCodexTurnStateHeader(wsHeaders, opts.Headers)
+	guardCodexTurnStateHeader(auth, wsHeaders)
 	releasedOriginalPayload := slimCodexOriginalPayloadForTranslation(from, userPayload)
 	releasedClientBody := slimCodexBodyForStreamUsage(clientBody)
 	originalRef, clientBodyRef, unregisterClientBodies := codexStreamBodyRefs(ctx, opts, userPayload, clientBody, releasedOriginalPayload, releasedClientBody)
@@ -626,9 +637,6 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 
 	conn, respHS, errDial := e.ensureUpstreamConn(ctx, auth, sess, authID, wsURL, wsHeaders)
 	var upstreamHeaders http.Header
-	if respHS != nil {
-		upstreamHeaders = respHS.Header.Clone()
-	}
 	if errDial != nil {
 		if sess != nil {
 			sess.reqMu.Unlock()
@@ -655,6 +663,9 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 		return nil, errDial
 	}
 	recordAPIWebsocketHandshake(ctx, e.cfg, respHS)
+	if respHS != nil {
+		upstreamHeaders = respHS.Header.Clone()
+	}
 	dropCodexRawRequestCopies(&req, &opts)
 
 	if sess == nil {
@@ -702,6 +713,9 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 				AuthValue: authValue,
 			})
 			recordAPIWebsocketHandshake(ctx, e.cfg, respHSRetry)
+			if respHSRetry != nil {
+				upstreamHeaders = respHSRetry.Header.Clone()
+			}
 			if errSendRetry := writeCurrentCodexWebsocketMessage(ctx, auth, sess, connRetry, wsReqBodyRetry); errSendRetry != nil {
 				helps.RecordAPIWebsocketError(ctx, e.cfg, "send_retry", errSendRetry)
 				e.invalidateUpstreamConn(sess, connRetry, "send_error", errSendRetry)
@@ -878,7 +892,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 		}
 	}()
 
-	return &cliproxyexecutor.StreamResult{Headers: upstreamHeaders, Chunks: out}, nil
+	return &cliproxyexecutor.StreamResult{Headers: codexSuccessfulResponseHeaders(auth, upstreamHeaders), Chunks: out}, nil
 }
 
 func (e *CodexWebsocketsExecutor) dialCodexWebsocket(ctx context.Context, auth *cliproxyauth.Auth, wsURL string, headers http.Header) (*websocket.Conn, *http.Response, error) {

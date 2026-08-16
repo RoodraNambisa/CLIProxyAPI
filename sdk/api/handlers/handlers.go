@@ -1036,10 +1036,7 @@ func (h *BaseAPIHandler) ExecuteWithAuthManager(ctx context.Context, handlerType
 		}
 		return nil, nil, h.RewriteExecutionErrorResponse(executionErrorMessage(err, providers, normalizedModel))
 	}
-	if !PassthroughHeadersEnabled(h.Cfg) {
-		return resp.Payload, nil, nil
-	}
-	return resp.Payload, FilterUpstreamHeaders(resp.Headers), nil
+	return resp.Payload, ClientUpstreamHeaders(resp.Headers, PassthroughHeadersEnabled(h.Cfg)), nil
 }
 
 // ExecuteWithProviders executes a non-streaming request against an explicit provider set.
@@ -1098,10 +1095,7 @@ func (h *BaseAPIHandler) ExecuteWithProvidersAndExecutionModel(ctx context.Conte
 		}
 		return nil, nil, h.RewriteExecutionErrorResponse(executionErrorMessage(err, providers, normalizedRouteModel))
 	}
-	if !PassthroughHeadersEnabled(h.Cfg) {
-		return resp.Payload, nil, nil
-	}
-	return resp.Payload, FilterUpstreamHeaders(resp.Headers), nil
+	return resp.Payload, ClientUpstreamHeaders(resp.Headers, PassthroughHeadersEnabled(h.Cfg)), nil
 }
 
 // ExecuteStreamWithProviders executes a streaming request against an explicit provider set.
@@ -1170,10 +1164,7 @@ func (h *BaseAPIHandler) ExecuteCountWithAuthManager(ctx context.Context, handle
 		}
 		return nil, nil, h.RewriteExecutionErrorResponse(executionErrorMessage(err, providers, normalizedModel))
 	}
-	if !PassthroughHeadersEnabled(h.Cfg) {
-		return resp.Payload, nil, nil
-	}
-	return resp.Payload, FilterUpstreamHeaders(resp.Headers), nil
+	return resp.Payload, ClientUpstreamHeaders(resp.Headers, PassthroughHeadersEnabled(h.Cfg)), nil
 }
 
 // ExecuteStreamWithAuthManager executes a streaming request via the core auth manager.
@@ -1260,12 +1251,9 @@ func (h *BaseAPIHandler) executeStreamWithResolvedProviders(ctx context.Context,
 	passthroughHeadersEnabled := PassthroughHeadersEnabled(h.Cfg)
 	// Capture upstream headers from the initial connection synchronously before the goroutine starts.
 	// Keep a mutable map so bootstrap retries can replace it before first payload is sent.
-	var upstreamHeaders http.Header
-	if passthroughHeadersEnabled {
-		upstreamHeaders = cloneHeader(FilterUpstreamHeaders(streamResult.Headers))
-		if upstreamHeaders == nil {
-			upstreamHeaders = make(http.Header)
-		}
+	upstreamHeaders := cloneHeader(ClientUpstreamHeaders(streamResult.Headers, passthroughHeadersEnabled))
+	if upstreamHeaders == nil && (passthroughHeadersEnabled || handlerType == "openai-response") {
+		upstreamHeaders = make(http.Header)
 	}
 	chunks := streamResult.Chunks
 	dataChan := make(chan []byte)
@@ -1401,8 +1389,8 @@ func (h *BaseAPIHandler) executeStreamWithResolvedProviders(ctx context.Context,
 							bootstrapRetries++
 							retryResult, retryErr := h.AuthManager.ExecuteStream(ctx, providers, req, opts)
 							if retryErr == nil {
-								if passthroughHeadersEnabled {
-									replaceHeader(upstreamHeaders, FilterUpstreamHeaders(retryResult.Headers))
+								if upstreamHeaders != nil {
+									replaceHeader(upstreamHeaders, ClientUpstreamHeaders(retryResult.Headers, passthroughHeadersEnabled))
 								}
 								chunks = retryResult.Chunks
 								continue outer
