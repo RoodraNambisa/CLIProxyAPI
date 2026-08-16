@@ -75,3 +75,17 @@ func TestEnsureCodexTurnStateHeaderKeepsCredentialOverride(t *testing.T) {
 		t.Fatalf("turn state = %q, want client-state", got)
 	}
 }
+
+func TestApplyCodexHeadersForwardsClientTurnState(t *testing.T) {
+	req, err := http.NewRequest(http.MethodPost, "https://chatgpt.com/backend-api/codex/responses", nil)
+	if err != nil {
+		t.Fatalf("NewRequest() error = %v", err)
+	}
+	clientHeaders := http.Header{codexTurnStateHeader: []string{"client-state"}}
+	if err = applyCodexHeadersFromSources(req, nil, "oauth-token", true, nil, clientHeaders); err != nil {
+		t.Fatalf("applyCodexHeadersFromSources() error = %v", err)
+	}
+	if got := req.Header.Get(codexTurnStateHeader); got != "client-state" {
+		t.Fatalf("turn state = %q, want client-state", got)
+	}
+}
