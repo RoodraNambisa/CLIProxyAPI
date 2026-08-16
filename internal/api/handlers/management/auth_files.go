@@ -568,6 +568,7 @@ func (h *Handler) listAuthFilesFromDisk(c *gin.Context, manager *coreauth.Manage
 						fileData["plan_type"] = planType
 					}
 					applyCodexAuthModeSummary(fileData, dependencyMetadata, now)
+					fileData[codex.FingerprintModeMetadataKey] = codex.EffectiveFingerprintMode(dependencyMetadata)
 				}
 			}
 			if dependencyMetadata != nil {
@@ -671,6 +672,7 @@ func (h *Handler) buildAuthFileEntryAtWithRuntime(auth *coreauth.Auth, now time.
 	}
 	if strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") && !codexAuthUsesAPIKeyCredential(auth) {
 		applyCodexAuthModeSummary(entry, auth.Metadata, now)
+		entry[codex.FingerprintModeMetadataKey] = codex.EffectiveFingerprintMode(auth.Metadata)
 	}
 	if strings.EqualFold(strings.TrimSpace(auth.Provider), "xai") {
 		entry["using_api"] = effectiveXAIUsingAPI(auth)
@@ -3050,6 +3052,7 @@ func (h *Handler) buildAuthFromFileData(path string, data []byte) (*coreauth.Aut
 		if planType := codex.EffectivePlanType(metadata); planType != "" {
 			attr["plan_type"] = planType
 		}
+		attr[codex.FingerprintModeMetadataKey] = string(codex.EffectiveFingerprintMode(metadata))
 	}
 	disabled, _ := metadata["disabled"].(bool)
 	status := coreauth.StatusActive

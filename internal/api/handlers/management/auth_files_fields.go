@@ -15,42 +15,45 @@ import (
 
 	"github.com/gin-gonic/gin"
 	chatgptwebauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/chatgptweb"
+	codexauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/codex"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/watcher/synthesizer"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 )
 
 type patchAuthFileFieldsRequest struct {
-	Name        string            `json:"name"`
-	Names       []string          `json:"names"`
-	Fields      json.RawMessage   `json:"fields"`
-	Prefix      *string           `json:"prefix"`
-	ProxyURL    *string           `json:"proxy_url"`
-	Headers     map[string]string `json:"headers"`
-	Priority    *int              `json:"priority"`
-	Note        *string           `json:"note"`
-	UsingAPI    *bool             `json:"using_api"`
-	Websockets  *bool             `json:"websockets"`
-	LoginMethod *string           `json:"login_method"`
-	API798URL   *string           `json:"api798_url"`
+	Name                 string            `json:"name"`
+	Names                []string          `json:"names"`
+	Fields               json.RawMessage   `json:"fields"`
+	Prefix               *string           `json:"prefix"`
+	ProxyURL             *string           `json:"proxy_url"`
+	Headers              map[string]string `json:"headers"`
+	Priority             *int              `json:"priority"`
+	Note                 *string           `json:"note"`
+	UsingAPI             *bool             `json:"using_api"`
+	Websockets           *bool             `json:"websockets"`
+	LoginMethod          *string           `json:"login_method"`
+	API798URL            *string           `json:"api798_url"`
+	CodexFingerprintMode *string           `json:"codex_fingerprint_mode"`
 }
 
 type authFileFieldValues struct {
-	prefix          *string
-	proxyURL        *string
-	headers         map[string]string
-	headersSet      bool
-	priority        *int
-	prioritySet     bool
-	note            *string
-	usingAPI        *bool
-	websockets      *bool
-	excludedModels  []string
-	excludedSet     bool
-	disableCooling  *bool
-	loginMethod     *chatgptwebauth.LoginMethod
-	api798URL       *string
-	legacyHeaderOps bool
+	prefix               *string
+	proxyURL             *string
+	headers              map[string]string
+	headersSet           bool
+	priority             *int
+	prioritySet          bool
+	note                 *string
+	usingAPI             *bool
+	websockets           *bool
+	excludedModels       []string
+	excludedSet          bool
+	disableCooling       *bool
+	loginMethod          *chatgptwebauth.LoginMethod
+	api798URL            *string
+	codexFingerprintMode *codexauth.FingerprintMode
+	legacyHeaderOps      bool
 }
 
 type authFileFieldPatchFailure struct {
@@ -108,6 +111,14 @@ func (h *Handler) patchAuthFileFieldsLegacy(c *gin.Context, req *patchAuthFileFi
 		websockets:      req.Websockets,
 		api798URL:       req.API798URL,
 		legacyHeaderOps: true,
+	}
+	if req.CodexFingerprintMode != nil {
+		mode, ok := codexauth.NormalizeFingerprintMode(*req.CodexFingerprintMode)
+		if !ok {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid codex_fingerprint_mode"})
+			return
+		}
+		values.codexFingerprintMode = &mode
 	}
 	if req.LoginMethod != nil {
 		method, errNormalize := chatgptwebauth.NormalizeLoginMethod(chatgptwebauth.LoginMethod(*req.LoginMethod))
@@ -293,6 +304,16 @@ func decodeAuthFileFieldValues(raw json.RawMessage) (authFileFieldValues, error)
 				return authFileFieldValues{}, fmt.Errorf("invalid api798_url")
 			}
 			values.api798URL = &decoded
+		case codexauth.FingerprintModeMetadataKey:
+			var decoded string
+			if err := decodeNonNullAuthField(value, &decoded); err != nil {
+				return authFileFieldValues{}, fmt.Errorf("invalid codex_fingerprint_mode")
+			}
+			mode, ok := codexauth.NormalizeFingerprintMode(decoded)
+			if !ok {
+				return authFileFieldValues{}, fmt.Errorf("invalid codex_fingerprint_mode")
+			}
+			values.codexFingerprintMode = &mode
 		default:
 			return authFileFieldValues{}, fmt.Errorf("unsupported field %q", name)
 		}
@@ -313,12 +334,13 @@ func decodeNonNullAuthField(raw json.RawMessage, target any) error {
 func (v authFileFieldValues) hasFields() bool {
 	return v.prefix != nil || v.proxyURL != nil || v.headersSet || v.prioritySet || v.note != nil ||
 		v.usingAPI != nil || v.websockets != nil || v.excludedSet || v.disableCooling != nil ||
-		v.loginMethod != nil || v.api798URL != nil
+		v.loginMethod != nil || v.api798URL != nil || v.codexFingerprintMode != nil
 }
 
 func (v authFileFieldValues) hasNonHeaderFields() bool {
 	return v.prefix != nil || v.proxyURL != nil || v.prioritySet || v.note != nil || v.usingAPI != nil ||
-		v.websockets != nil || v.excludedSet || v.disableCooling != nil || v.loginMethod != nil || v.api798URL != nil
+		v.websockets != nil || v.excludedSet || v.disableCooling != nil || v.loginMethod != nil ||
+		v.api798URL != nil || v.codexFingerprintMode != nil
 }
 
 func validateBatchAuthFileFields(auth *coreauth.Auth, values authFileFieldValues) error {
@@ -328,6 +350,14 @@ func validateBatchAuthFileFields(auth *coreauth.Auth, values authFileFieldValues
 	}
 	if values.websockets != nil && provider != "xai" && provider != "codex" {
 		return errors.New("websockets is only supported for codex and xai auth files")
+	}
+	if values.codexFingerprintMode != nil {
+		if provider != "codex" {
+			return errors.New("codex_fingerprint_mode is only supported for codex auth files")
+		}
+		if codexAuthUsesAPIKeyCredential(auth) {
+			return errors.New("codex_fingerprint_mode is not supported for codex api-key auth files")
+		}
 	}
 	if values.loginMethod == nil && values.api798URL == nil {
 		return nil
@@ -467,6 +497,11 @@ func (h *Handler) applyAuthFileFieldValues(auth *coreauth.Auth, values authFileF
 	if values.websockets != nil {
 		auth.Metadata["websockets"] = *values.websockets
 		auth.Attributes["websockets"] = strconv.FormatBool(*values.websockets)
+	}
+	if values.codexFingerprintMode != nil {
+		mode := string(*values.codexFingerprintMode)
+		auth.Metadata[codexauth.FingerprintModeMetadataKey] = mode
+		auth.Attributes[codexauth.FingerprintModeMetadataKey] = mode
 	}
 	if values.excludedSet {
 		models := config.NormalizeExcludedModels(values.excludedModels)

@@ -14,6 +14,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	chatgptwebauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/chatgptweb"
+	codexauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/codex"
 	xaiauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/xai"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v6/sdk/auth"
@@ -271,6 +272,63 @@ func TestPatchAuthFileFieldsFallsBackForStoreWithoutConditionalSave(t *testing.T
 	updated, ok := manager.GetByID(record.ID)
 	if !ok || updated.Attributes["note"] != "updated" {
 		t.Fatalf("updated auth = %#v", updated)
+	}
+}
+
+func TestPatchAuthFileFields_CodexFingerprintMode(t *testing.T) {
+	store := &memoryAuthStore{}
+	manager := coreauth.NewManager(store, nil, nil)
+	record := &coreauth.Auth{
+		ID:         "codex-fingerprint.json",
+		FileName:   "codex-fingerprint.json",
+		Provider:   "codex",
+		Attributes: map[string]string{"path": "/tmp/codex-fingerprint.json"},
+		Metadata:   map[string]any{"type": "codex", "access_token": "token"},
+	}
+	if _, errRegister := manager.Register(t.Context(), record); errRegister != nil {
+		t.Fatal(errRegister)
+	}
+
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, manager)
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	request := httptest.NewRequest(http.MethodPatch, "/v0/management/auth-files/fields", strings.NewReader(
+		`{"names":["codex-fingerprint.json"],"fields":{"codex_fingerprint_mode":" Session "}}`,
+	))
+	request.Header.Set("Content-Type", "application/json")
+	ctx.Request = request
+	h.PatchAuthFileFields(ctx)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", recorder.Code, recorder.Body.String())
+	}
+	updated, ok := manager.GetByID(record.ID)
+	if !ok || updated == nil {
+		t.Fatal("updated Codex auth not found")
+	}
+	if got := updated.Metadata["codex_fingerprint_mode"]; got != "session" {
+		t.Fatalf("metadata.codex_fingerprint_mode = %#v, want session", got)
+	}
+	if got := updated.Attributes["codex_fingerprint_mode"]; got != "session" {
+		t.Fatalf("attribute codex_fingerprint_mode = %q, want session", got)
+	}
+	entry := h.buildAuthFileEntry(updated)
+	if got := entry["codex_fingerprint_mode"]; got != codexauth.FingerprintModeSession {
+		t.Fatalf("entry.codex_fingerprint_mode = %#v, want session", got)
+	}
+}
+
+func TestValidateBatchAuthFileFieldsRejectsFingerprintModeForCodexAPIKey(t *testing.T) {
+	mode := codexauth.FingerprintModeFull
+	auth := &coreauth.Auth{
+		Provider:   "codex",
+		Attributes: map[string]string{"api_key": "secret"},
+		Metadata:   map[string]any{"type": "codex"},
+	}
+
+	err := validateBatchAuthFileFields(auth, authFileFieldValues{codexFingerprintMode: &mode})
+	if err == nil || !strings.Contains(err.Error(), "api-key") {
+		t.Fatalf("validateBatchAuthFileFields() error = %v, want api-key rejection", err)
 	}
 }
 

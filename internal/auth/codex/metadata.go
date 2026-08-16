@@ -2,6 +2,40 @@ package codex
 
 import "strings"
 
+// FingerprintMode controls how aggressively one Codex credential converges
+// client-provided device and session identity.
+type FingerprintMode string
+
+const (
+	FingerprintModeOff     FingerprintMode = "off"
+	FingerprintModeDevice  FingerprintMode = "device"
+	FingerprintModeSession FingerprintMode = "session"
+	FingerprintModeFull    FingerprintMode = "full"
+)
+
+const FingerprintModeMetadataKey = "codex_fingerprint_mode"
+
+// NormalizeFingerprintMode validates a configured per-credential mode.
+func NormalizeFingerprintMode(value string) (FingerprintMode, bool) {
+	mode := FingerprintMode(strings.ToLower(strings.TrimSpace(value)))
+	switch mode {
+	case FingerprintModeOff, FingerprintModeDevice, FingerprintModeSession, FingerprintModeFull:
+		return mode, true
+	default:
+		return FingerprintModeOff, false
+	}
+}
+
+// EffectiveFingerprintMode returns the configured mode, defaulting invalid or
+// missing values to off so convergence always remains explicit opt-in.
+func EffectiveFingerprintMode(metadata map[string]any) FingerprintMode {
+	mode, ok := NormalizeFingerprintMode(metadataString(metadata, FingerprintModeMetadataKey))
+	if !ok {
+		return FingerprintModeOff
+	}
+	return mode
+}
+
 func metadataString(metadata map[string]any, keys ...string) string {
 	if len(metadata) == 0 {
 		return ""
