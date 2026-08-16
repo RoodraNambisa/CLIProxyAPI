@@ -359,6 +359,113 @@ func TestCodexConvergedFingerprintKeepsValidPersistedInstallationID(t *testing.T
 	}
 }
 
+func TestCodexPrepareRequestAuthGeneratesPersistentInstallationID(t *testing.T) {
+	executor := NewCodexExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{ID: "oauth-auth", Provider: "codex", Metadata: map[string]any{
+		"type": "codex", "account_id": "account-1", "openai_device_id": "invalid",
+	}}
+
+	if !executor.ShouldPrepareRequestAuth(auth) {
+		t.Fatal("invalid installation ID was not marked for preparation")
+	}
+	prepared, errPrepare := executor.PrepareRequestAuth(t.Context(), auth)
+	if errPrepare != nil {
+		t.Fatalf("PrepareRequestAuth() error = %v", errPrepare)
+	}
+	installationID := codexMetadataString(prepared.Metadata, "openai_device_id")
+	parsed, errParse := uuid.Parse(installationID)
+	if errParse != nil || parsed.Version() != 4 {
+		t.Fatalf("prepared installation ID = %q, want UUIDv4", installationID)
+	}
+	if got := codexMetadataString(auth.Metadata, "openai_device_id"); got != "invalid" {
+		t.Fatalf("caller installation ID = %q, want unchanged invalid value", got)
+	}
+	if executor.ShouldPrepareRequestAuth(prepared) {
+		t.Fatal("valid persisted installation ID still requires preparation")
+	}
+	reused, errReuse := executor.PrepareRequestAuth(t.Context(), prepared)
+	if errReuse != nil {
+		t.Fatalf("second PrepareRequestAuth() error = %v", errReuse)
+	}
+	if got := codexMetadataString(reused.Metadata, "openai_device_id"); got != installationID {
+		t.Fatalf("reused installation ID = %q, want %q", got, installationID)
+	}
+	other, errOther := executor.PrepareRequestAuth(t.Context(), &cliproxyauth.Auth{
+		ID: "oauth-auth-copy", Provider: "codex",
+		Metadata: map[string]any{"type": "codex", "account_id": "account-1"},
+	})
+	if errOther != nil {
+		t.Fatalf("other PrepareRequestAuth() error = %v", errOther)
+	}
+	if got := codexMetadataString(other.Metadata, "openai_device_id"); got == installationID {
+		t.Fatalf("separate credentials share installation ID %q", got)
+	}
+	projected, state, errProject := executor.projectCodexSessionIdentity(
+		t.Context(),
+		prepared,
+		cliproxyexecutor.Request{},
+		cliproxyexecutor.Options{},
+		[]byte(`{"client_metadata":{"x-codex-installation-id":"client-installation"}}`),
+		&codexIdentityConfuseState{},
+	)
+	if errProject != nil {
+		t.Fatalf("projectCodexSessionIdentity() error = %v", errProject)
+	}
+	if got := gjson.GetBytes(projected, "client_metadata.x-codex-installation-id").String(); got != installationID {
+		t.Fatalf("projected installation ID = %q, want persisted %q", got, installationID)
+	}
+	if state.identity.InstallationID != installationID {
+		t.Fatalf("identity installation ID = %q, want persisted %q", state.identity.InstallationID, installationID)
+	}
+}
+
+func TestCodexPrepareRequestAuthCreatesMissingMetadata(t *testing.T) {
+	executor := NewCodexExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{ID: "oauth-auth", Provider: "codex"}
+
+	if !executor.ShouldPrepareRequestAuth(auth) {
+		t.Fatal("missing metadata was not marked for installation preparation")
+	}
+	prepared, errPrepare := executor.PrepareRequestAuth(t.Context(), auth)
+	if errPrepare != nil {
+		t.Fatalf("PrepareRequestAuth() error = %v", errPrepare)
+	}
+	if _, errParse := uuid.Parse(codexMetadataString(prepared.Metadata, "openai_device_id")); errParse != nil {
+		t.Fatalf("prepared installation ID is invalid: %v", errParse)
+	}
+	if auth.Metadata != nil {
+		t.Fatal("PrepareRequestAuth() mutated the caller metadata")
+	}
+}
+
+func TestCodexPrepareRequestAuthSkipsDisabledConvergenceAndAPIKeys(t *testing.T) {
+	executor := NewCodexExecutor(&config.Config{})
+	tests := []struct {
+		name string
+		auth *cliproxyauth.Auth
+	}{
+		{
+			name: "explicit off",
+			auth: &cliproxyauth.Auth{ID: "oauth-off", Provider: "codex", Metadata: map[string]any{
+				"type": "codex", codexauth.FingerprintModeMetadataKey: string(codexauth.FingerprintModeOff),
+			}},
+		},
+		{
+			name: "api key",
+			auth: &cliproxyauth.Auth{ID: "api-key", Provider: "codex", Attributes: map[string]string{
+				"api_key": "secret",
+			}, Metadata: map[string]any{"type": "codex"}},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if executor.ShouldPrepareRequestAuth(tt.auth) {
+				t.Fatal("credential unexpectedly requires installation preparation")
+			}
+		})
+	}
+}
+
 func TestCodexProjectSessionIdentityRejectsMalformedMetadataWithoutCoolingAuth(t *testing.T) {
 	executor := NewCodexExecutor(&config.Config{Codex: config.CodexConfig{SpoofSessionIdentity: true}})
 	auth := &cliproxyauth.Auth{Provider: "codex", Metadata: map[string]any{"access_token": "oauth-token"}}

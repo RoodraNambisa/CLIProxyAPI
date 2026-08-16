@@ -390,18 +390,31 @@ func codexSpoofSessionIdentityEnabled(cfg *config.Config) bool {
 	return cfg != nil && cfg.Codex.SpoofSessionIdentity
 }
 
-// ShouldPrepareRequestAuth reports whether an Agent Identity needs a task before use.
+// ShouldPrepareRequestAuth reports whether persistent Codex identity metadata
+// must be completed before the credential is used.
 func (e *CodexExecutor) ShouldPrepareRequestAuth(auth *cliproxyauth.Auth) bool {
+	return codexInstallationIDNeedsPreparation(auth) || codexAgentIdentityNeedsTask(auth)
+}
+
+// PrepareRequestAuth prepares a stable installation ID and registers a missing
+// Agent Identity task for the manager to persist in one credential update.
+func (e *CodexExecutor) PrepareRequestAuth(ctx context.Context, auth *cliproxyauth.Auth) (*cliproxyauth.Auth, error) {
+	if auth == nil {
+		return nil, errors.New("codex executor: auth is nil")
+	}
+	updated, _ := prepareCodexInstallationID(auth)
+	if codexAgentIdentityNeedsTask(updated) {
+		return e.registerAgentIdentityTask(ctx, updated)
+	}
+	return updated, nil
+}
+
+func codexAgentIdentityNeedsTask(auth *cliproxyauth.Auth) bool {
 	if auth == nil || !codexauth.IsAgentIdentityMetadata(auth.Metadata) {
 		return false
 	}
 	credential, err := codexauth.ParseAgentIdentityCredential(auth.Metadata)
 	return err == nil && strings.TrimSpace(credential.TaskID) == ""
-}
-
-// PrepareRequestAuth registers a missing Agent Identity task before execution.
-func (e *CodexExecutor) PrepareRequestAuth(ctx context.Context, auth *cliproxyauth.Auth) (*cliproxyauth.Auth, error) {
-	return e.registerAgentIdentityTask(ctx, auth)
 }
 
 // ShouldRecoverUnauthorized limits task recovery to explicit upstream task errors.

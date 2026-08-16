@@ -94,6 +94,29 @@ func resolveCodexConvergedFingerprint(auth *cliproxyauth.Auth, prepared codexPre
 	return resolved
 }
 
+func codexInstallationIDNeedsPreparation(auth *cliproxyauth.Auth) bool {
+	if auth == nil || codexAuthUsesAPIKey(auth) ||
+		!strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") ||
+		codexauth.EffectiveFingerprintMode(auth.Metadata) == codexauth.FingerprintModeOff {
+		return false
+	}
+	installationID := codexMetadataString(auth.Metadata, "openai_device_id")
+	parsed, err := uuid.Parse(installationID)
+	return err != nil || installationID != parsed.String()
+}
+
+func prepareCodexInstallationID(auth *cliproxyauth.Auth) (*cliproxyauth.Auth, bool) {
+	if !codexInstallationIDNeedsPreparation(auth) {
+		return auth, false
+	}
+	updated := auth.Clone()
+	if updated.Metadata == nil {
+		updated.Metadata = make(map[string]any)
+	}
+	updated.Metadata["openai_device_id"] = uuid.NewString()
+	return updated, true
+}
+
 func deriveStableCodexFingerprintUUID(kind, seed string) string {
 	sum := sha256.Sum256([]byte("cli-proxy-api:codex-fingerprint:v1:" + kind + ":" + seed))
 	var id uuid.UUID

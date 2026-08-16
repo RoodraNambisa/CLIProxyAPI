@@ -91,6 +91,9 @@ func TestCodexAgentIdentityRegistersMissingTaskAndClassifiesRecovery(t *testing.
 	if got := strings.TrimSpace(prepared.Metadata["task_id"].(string)); got != "replacement-task" {
 		t.Fatalf("prepared task_id = %q, want replacement-task", got)
 	}
+	if installationID := codexMetadataString(prepared.Metadata, "openai_device_id"); installationID == "" {
+		t.Fatal("prepared Agent Identity is missing its persistent installation ID")
+	}
 	if strings.TrimSpace(auth.Metadata["task_id"].(string)) != "" {
 		t.Fatal("PrepareRequestAuth() mutated the caller auth")
 	}
