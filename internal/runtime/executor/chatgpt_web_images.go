@@ -212,6 +212,11 @@ type chatGPTWebImageSettleError struct {
 	headers http.Header
 }
 
+type chatGPTWebImageSettleStatusError struct {
+	statusErr
+	errorCode string
+}
+
 type chatGPTWebImageQuotaResultError struct {
 	cause     error
 	committed bool
@@ -224,6 +229,32 @@ type chatGPTWebImageRateLimitResultError struct {
 
 type chatGPTWebImageNoOutputResultError struct {
 	statusErr
+}
+
+const (
+	chatGPTWebImageErrorUpstreamFailed  = "chatgpt_web_image_upstream_failed"
+	chatGPTWebImageErrorNoOutput        = "chatgpt_web_image_no_output"
+	chatGPTWebImageErrorMissingTerminal = "chatgpt_web_image_missing_terminal"
+	chatGPTWebImageErrorPollUnsettled   = "chatgpt_web_image_poll_not_converged"
+	chatGPTWebImageErrorPollFailed      = "chatgpt_web_image_poll_failed"
+)
+
+func (e chatGPTWebImageSettleStatusError) ExecutionResultErrorCode() string {
+	return strings.TrimSpace(e.errorCode)
+}
+
+func (chatGPTWebImageNoOutputResultError) ExecutionResultErrorCode() string {
+	return chatGPTWebImageErrorNoOutput
+}
+
+func (e chatGPTWebImageSettleError) ExecutionResultErrorCode() string {
+	var provider interface{ ExecutionResultErrorCode() string }
+	if errors.As(e.cause, &provider) && provider != nil {
+		if code := strings.TrimSpace(provider.ExecutionResultErrorCode()); code != "" {
+			return code
+		}
+	}
+	return chatGPTWebImageErrorPollFailed
 }
 
 func chatGPTWebImageResultStatusCode(err error) int {
@@ -519,6 +550,18 @@ func newChatGPTWebImageSettleError(cause error) chatGPTWebImageSettleError {
 	return err
 }
 
+func newChatGPTWebImageSettleStatusError(code, message string) error {
+	return chatGPTWebImageSettleStatusError{
+		statusErr: statusErr{
+			code:           http.StatusBadGateway,
+			msg:            strings.TrimSpace(message),
+			skipAuthResult: true,
+			retryOtherAuth: true,
+		},
+		errorCode: strings.TrimSpace(code),
+	}
+}
+
 func (e chatGPTWebImageSettleError) Unwrap() error { return e.cause }
 
 func (e chatGPTWebImageSettleError) Headers() http.Header {
@@ -785,12 +828,10 @@ func (e *ChatGPTWebExecutor) finishChatGPTWebImage(ctx context.Context, client *
 	hasDownloadableSediment := strings.TrimSpace(accumulator.ConversationID) != "" && len(accumulator.SedimentIDs) > 0
 	if strings.TrimSpace(accumulator.ConversationID) == "" {
 		if !hasTerminal {
-			return nil, statusErr{
-				code:           http.StatusBadGateway,
-				msg:            "chatgpt web image stream ended without an explicit terminal state or conversation ID",
-				skipAuthResult: true,
-				retryOtherAuth: true,
-			}
+			return nil, newChatGPTWebImageSettleStatusError(
+				chatGPTWebImageErrorMissingTerminal,
+				"chatgpt web image stream ended without an explicit terminal state or conversation ID",
+			)
 		}
 		if !hasStreamOutput {
 			return nil, newChatGPTWebImageNoOutputResultError()
@@ -799,6 +840,9 @@ func (e *ChatGPTWebExecutor) finishChatGPTWebImage(ctx context.Context, client *
 		if err := e.pollChatGPTWebImageConversation(ctx, client, credential, accumulator, execution.inputIDs, hasStreamOutput, pollBudget); err != nil {
 			var memoryErr *chatGPTWebImageMemoryCapacityError
 			if errors.As(err, &memoryErr) {
+				return nil, err
+			}
+			if chatGPTWebImagePollAuthenticationError(err) {
 				return nil, err
 			}
 			if hasStreamOutput {
@@ -815,12 +859,10 @@ func (e *ChatGPTWebExecutor) finishChatGPTWebImage(ctx context.Context, client *
 		return nil, newChatGPTWebImageModerationResultError()
 	}
 	if !accumulator.Terminal && !hasDownloadableSediment {
-		return nil, statusErr{
-			code:           http.StatusBadGateway,
-			msg:            "chatgpt web image conversation ended without an explicit terminal state",
-			skipAuthResult: true,
-			retryOtherAuth: true,
-		}
+		return nil, newChatGPTWebImageSettleStatusError(
+			chatGPTWebImageErrorMissingTerminal,
+			"chatgpt web image conversation ended without an explicit terminal state",
+		)
 	}
 	cliproxyexecutor.ObserveRequestPhaseContext(ctx, cliproxyexecutor.ImagePhaseStreamSettle, settleStarted)
 	settleObserved = true
@@ -1362,12 +1404,10 @@ func chatGPTWebImageFailureError(status string) error {
 			skipAuthResult: true,
 		}
 	}
-	return statusErr{
-		code:           http.StatusBadGateway,
-		msg:            "chatgpt web image generation failed: " + strings.TrimSpace(status),
-		skipAuthResult: true,
-		retryOtherAuth: true,
-	}
+	return newChatGPTWebImageSettleStatusError(
+		chatGPTWebImageErrorUpstreamFailed,
+		"chatgpt web image generation failed: "+strings.TrimSpace(status),
+	)
 }
 
 func chatGPTWebImageModerationFailure(status string) bool {
@@ -2530,6 +2570,10 @@ func (e *ChatGPTWebExecutor) watchChatGPTWebImageTasks(ctx context.Context, clie
 				// exhausted shared polling budget.
 				return
 			}
+			if chatGPTWebImagePollAuthenticationError(taskResult.err) {
+				e.publishChatGPTWebImageTaskWatchResult(ctx, streamBody, result, chatGPTWebImageTaskWatchResult{err: taskResult.err})
+				return
+			}
 			if taskResult.err == nil {
 				taskSnapshot = taskResult.accumulator
 				taskState = taskResult.state
@@ -2602,6 +2646,10 @@ func (e *ChatGPTWebExecutor) watchChatGPTWebImageTasks(ctx context.Context, clie
 			if errors.As(conversationResult.err, &limitErr) {
 				// Do not replace a still-running primary SSE with an auxiliary
 				// polling limit error.
+				return
+			}
+			if chatGPTWebImagePollAuthenticationError(conversationResult.err) {
+				e.publishChatGPTWebImageTaskWatchResult(ctx, streamBody, result, chatGPTWebImageTaskWatchResult{err: conversationResult.err})
 				return
 			}
 			if conversationResult.err == nil {
@@ -2902,6 +2950,9 @@ func (e *ChatGPTWebExecutor) pollChatGPTWebImageConversation(ctx context.Context
 			if errors.As(taskResult.err, &limitErr) {
 				return taskResult.err
 			}
+			if chatGPTWebImagePollAuthenticationError(taskResult.err) {
+				return taskResult.err
+			}
 			if taskResult.err == nil {
 				taskState = taskResult.state
 				taskStateKnown = true
@@ -2983,6 +3034,9 @@ func (e *ChatGPTWebExecutor) pollChatGPTWebImageConversation(ctx context.Context
 		if conversationReady {
 			var memoryErr *chatGPTWebImageMemoryCapacityError
 			if errors.As(conversationResult.err, &memoryErr) {
+				return conversationResult.err
+			}
+			if chatGPTWebImagePollAuthenticationError(conversationResult.err) {
 				return conversationResult.err
 			}
 			if conversationResult.err == nil {
@@ -3072,12 +3126,10 @@ func (e *ChatGPTWebExecutor) pollChatGPTWebImageConversation(ctx context.Context
 			taskFallbackAt = now.Add(e.imageSettleWait)
 		}
 	}
-	return statusErr{
-		code:           http.StatusBadGateway,
-		msg:            fmt.Sprintf("chatgpt web image generation remained incomplete after %d polls", maxPolls),
-		skipAuthResult: true,
-		retryOtherAuth: true,
-	}
+	return newChatGPTWebImageSettleStatusError(
+		chatGPTWebImageErrorPollUnsettled,
+		fmt.Sprintf("chatgpt web image generation remained incomplete after %d polls", maxPolls),
+	)
 }
 
 func chatGPTWebImageOutputCount(accumulator *helps.ChatGPTWebImageAccumulator) int {
@@ -3197,6 +3249,17 @@ func chatGPTWebImageTaskQueryFatal(ctx context.Context, err error) bool {
 	}
 	statusCode := statusCodeFromError(err)
 	return statusCode == http.StatusUnauthorized || statusCode == http.StatusForbidden
+}
+
+func chatGPTWebImagePollAuthenticationError(err error) bool {
+	statusCode := statusCodeFromError(err)
+	if statusCode == http.StatusUnauthorized {
+		return true
+	}
+	if statusCode != http.StatusForbidden {
+		return false
+	}
+	return chatGPTWebLifecycleError(err) != nil
 }
 
 func chatGPTWebPollRetryDelay(err error, fallback time.Duration) (time.Duration, bool) {
@@ -3830,6 +3893,19 @@ func chatGPTWebCommittedRequestError(ctx context.Context, err error) (committedE
 		settleErr.skipAuthResult = true
 		settleErr.retryOtherAuth = false
 		return settleErr
+	}
+	var settleStatusErr chatGPTWebImageSettleStatusError
+	if errors.As(err, &settleStatusErr) {
+		settleStatusErr.skipAuthResult = true
+		settleStatusErr.retryOtherAuth = false
+		return settleStatusErr
+	}
+	var noOutputErr *chatGPTWebImageNoOutputResultError
+	if errors.As(err, &noOutputErr) && noOutputErr != nil {
+		projected := *noOutputErr
+		projected.skipAuthResult = true
+		projected.retryOtherAuth = false
+		return &projected
 	}
 	var transportErr chatGPTWebAssetTransportError
 	if errors.As(err, &transportErr) {

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -93,14 +94,23 @@ func TestPublishChatGPTWebTerminalUsageIncludesImageToolModel(t *testing.T) {
 }
 
 func TestChatGPTWebImageFailureStagePersistsInUsage(t *testing.T) {
-	for _, stage := range []string{"settle", "download"} {
-		stage := stage
-		t.Run(stage, func(t *testing.T) {
-			authID := "chatgpt-web-image-failure-stage-" + stage
+	tests := []struct {
+		name     string
+		stage    string
+		err      error
+		wantCode string
+	}{
+		{name: "generic settle", stage: "settle", err: errors.New("image completion failed"), wantCode: "chatgpt_web_request_failed"},
+		{name: "classified settle", stage: "settle", err: newChatGPTWebImageSettleStatusError(chatGPTWebImageErrorPollUnsettled, "polling did not converge"), wantCode: chatGPTWebImageErrorPollUnsettled},
+		{name: "generic download", stage: "download", err: errors.New("image download failed"), wantCode: "chatgpt_web_request_failed"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			authID := "chatgpt-web-image-failure-stage-" + strings.ReplaceAll(test.name, " ", "-")
 			records := make(chan coreusage.Record, 1)
 			coreusage.RegisterPlugin(&chatGPTWebUsageReportingPlugin{authID: authID, records: records})
 			diagnostics := &cliproxyexecutor.RequestExecutionDiagnostics{}
-			err := withChatGPTWebFailureStage(stage, errors.New("image completion failed"))
+			err := withChatGPTWebFailureStage(test.stage, test.err)
 			recordChatGPTWebExecutionFailure(diagnostics, err)
 
 			reporter := helps.NewUsageReporter(context.Background(), "chatgpt-web", "gpt-image-2", &cliproxyauth.Auth{ID: authID})
@@ -109,11 +119,11 @@ func TestChatGPTWebImageFailureStagePersistsInUsage(t *testing.T) {
 
 			select {
 			case record := <-records:
-				if record.FailureStage != stage {
-					t.Fatalf("failure stage = %q, want %q", record.FailureStage, stage)
+				if record.FailureStage != test.stage {
+					t.Fatalf("failure stage = %q, want %q", record.FailureStage, test.stage)
 				}
-				if record.ErrorCode != "chatgpt_web_request_failed" {
-					t.Fatalf("error code = %q, want chatgpt_web_request_failed", record.ErrorCode)
+				if record.ErrorCode != test.wantCode {
+					t.Fatalf("error code = %q, want %q", record.ErrorCode, test.wantCode)
 				}
 			case <-time.After(time.Second):
 				t.Fatal("timed out waiting for image failure usage record")

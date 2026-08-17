@@ -324,8 +324,8 @@ func TestChatGPTWebTerminalImageFailureProjectsExplicitQuotaEvidence(t *testing.
 	}
 
 	generic := chatGPTWebImageRequestError(chatGPTWebImageFailureError("image generation failed"))
-	if errors.As(generic, &code) {
-		t.Fatalf("generic terminal failure received quota projection: %v", generic)
+	if !errors.As(generic, &code) || code.ExecutionResultErrorCode() != chatGPTWebImageErrorUpstreamFailed {
+		t.Fatalf("generic terminal failure code = %v", generic)
 	}
 	if !errors.As(generic, &status) || status.StatusCode() != http.StatusBadGateway {
 		t.Fatalf("generic terminal status = %v, want 502", generic)
@@ -467,8 +467,8 @@ func TestChatGPTWebEmptyImageResultKeeps502AndSchedulesCooledQuotaRecheck(t *tes
 		t.Fatalf("empty image result status = %v, want 502", projected)
 	}
 	var code interface{ ExecutionResultErrorCode() string }
-	if errors.As(projected, &code) {
-		t.Fatalf("empty image result received quota code %q", code.ExecutionResultErrorCode())
+	if !errors.As(projected, &code) || code.ExecutionResultErrorCode() != chatGPTWebImageErrorNoOutput {
+		t.Fatalf("empty image result code = %v", projected)
 	}
 	if projected.Error() != chatGPTWebImageNoOutputMessage {
 		t.Fatalf("empty image result = %q, want %q", projected.Error(), chatGPTWebImageNoOutputMessage)

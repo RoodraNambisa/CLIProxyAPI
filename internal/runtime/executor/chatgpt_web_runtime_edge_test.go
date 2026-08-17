@@ -1645,6 +1645,153 @@ func TestChatGPTWebPollRetryDistinguishesLocalMemoryFromUpstreamServiceUnavailab
 	}
 }
 
+func TestChatGPTWebImagePollAuthenticationClassificationRequiresLifecycleEvidenceForForbidden(t *testing.T) {
+	unauthorized := newChatGPTWebStatusError(
+		http.StatusUnauthorized,
+		"/backend-api/conversation/image-auth",
+		[]byte(`{"error":{"code":"unauthorized"}}`),
+		nil,
+	)
+	if !chatGPTWebImagePollAuthenticationError(unauthorized) {
+		t.Fatal("poll 401 was not classified as an authentication error")
+	}
+
+	forbidden := newChatGPTWebStatusError(
+		http.StatusForbidden,
+		"/backend-api/conversation/image-auth",
+		[]byte(`{"error":{"code":"permission_error"}}`),
+		nil,
+	)
+	if chatGPTWebImagePollAuthenticationError(forbidden) {
+		t.Fatal("ordinary poll 403 was classified as an authentication error")
+	}
+
+	dead := newChatGPTWebStatusError(
+		http.StatusForbidden,
+		"/backend-api/conversation/image-auth",
+		[]byte(`{"error":{"code":"account_deactivated","message":"account deactivated"}}`),
+		nil,
+	)
+	if !chatGPTWebImagePollAuthenticationError(dead) {
+		t.Fatal("lifecycle-confirmed poll 403 was not classified as an authentication error")
+	}
+}
+
+func TestFinishChatGPTWebImagePreservesPollAuthenticationAfterPartialOutput(t *testing.T) {
+	tests := []struct {
+		name       string
+		statusCode int
+		body       string
+	}{
+		{name: "unauthorized", statusCode: http.StatusUnauthorized, body: `{"error":{"code":"unauthorized"}}`},
+		{name: "lifecycle forbidden", statusCode: http.StatusForbidden, body: `{"error":{"code":"account_deactivated","message":"account deactivated"}}`},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var taskPolls atomic.Int32
+			var conversationPolls atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+				switch request.URL.Path {
+				case "/backend-api/tasks":
+					taskPolls.Add(1)
+				case "/backend-api/conversation/partial-auth":
+					conversationPolls.Add(1)
+				default:
+					http.NotFound(w, request)
+					return
+				}
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(test.statusCode)
+				_, _ = io.WriteString(w, test.body)
+			}))
+			defer server.Close()
+
+			executor := NewChatGPTWebExecutor(nil, nil)
+			executor.runtimeBaseURL = server.URL
+			executor.imageMaxPolls = 8
+			disableChatGPTWebImagePollWaits(executor)
+			client, credential, err := executor.newRuntimeClient(chatGPTWebRuntimeAuth())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer client.CloseIdleConnections()
+			prepared := &chatGPTWebPreparedRequest{
+				routeModel: "gpt-image-2",
+				request: helps.ChatGPTWebRequest{
+					Image: &helps.ChatGPTWebImageRequest{Prompt: "draw"},
+				},
+			}
+			execution := &chatGPTWebImageExecution{response: &fhttp.Response{
+				StatusCode: http.StatusOK,
+				Body: io.NopCloser(strings.NewReader(
+					"data: {\"conversation_id\":\"partial-auth\",\"message\":{\"author\":{\"role\":\"tool\"},\"metadata\":{\"async_task_type\":\"image_gen\"},\"content\":{\"parts\":[{\"asset_pointer\":\"file-service://partial\"}]}}}\n\n",
+				)),
+			}}
+
+			_, err = executor.finishChatGPTWebImage(context.Background(), client, credential, prepared, execution)
+			committed := chatGPTWebCommittedRequestError(context.Background(), err)
+			var status interface{ StatusCode() int }
+			if !errors.As(committed, &status) || status.StatusCode() != test.statusCode {
+				t.Fatalf("partial-output poll error = %v, want original %d", committed, test.statusCode)
+			}
+			var stage chatGPTWebFailureStageProvider
+			if !errors.As(committed, &stage) || stage.ChatGPTWebFailureStage() != "settle" {
+				t.Fatalf("partial-output poll stage = %v, want settle", committed)
+			}
+			var retry interface{ RetryOtherAuth() bool }
+			if !errors.As(committed, &retry) || retry.RetryOtherAuth() {
+				t.Fatalf("committed poll authentication failure can switch credentials: %v", committed)
+			}
+			var safeCode interface{ ExecutionResultErrorCode() string }
+			if errors.As(committed, &safeCode) && strings.HasPrefix(safeCode.ExecutionResultErrorCode(), "chatgpt_web_image_") {
+				t.Fatalf("authentication error was masked by settle code %q", safeCode.ExecutionResultErrorCode())
+			}
+			if got := taskPolls.Load(); got > 1 {
+				t.Fatalf("task polls = %d, want at most 1", got)
+			}
+			if got := conversationPolls.Load(); got > 1 {
+				t.Fatalf("conversation polls = %d, want at most 1", got)
+			}
+		})
+	}
+}
+
+func TestChatGPTWebImageSettleErrorsExposeStableSafeCodes(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		code string
+	}{
+		{name: "upstream task failed", err: chatGPTWebImageFailureError("failed"), code: chatGPTWebImageErrorUpstreamFailed},
+		{name: "no output", err: newChatGPTWebImageNoOutputResultError(), code: chatGPTWebImageErrorNoOutput},
+		{name: "missing terminal", err: newChatGPTWebImageSettleStatusError(chatGPTWebImageErrorMissingTerminal, "missing terminal"), code: chatGPTWebImageErrorMissingTerminal},
+		{name: "poll not converged", err: newChatGPTWebImageSettleStatusError(chatGPTWebImageErrorPollUnsettled, "not converged"), code: chatGPTWebImageErrorPollUnsettled},
+		{name: "wrapped poll not converged", err: newChatGPTWebImageSettleError(newChatGPTWebImageSettleStatusError(chatGPTWebImageErrorPollUnsettled, "not converged")), code: chatGPTWebImageErrorPollUnsettled},
+		{name: "poll failed", err: newChatGPTWebImageSettleError(errors.New("temporary poll failure")), code: chatGPTWebImageErrorPollFailed},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			committed := chatGPTWebCommittedRequestError(context.Background(), withChatGPTWebFailureStage("settle", test.err))
+			var code interface{ ExecutionResultErrorCode() string }
+			if !errors.As(committed, &code) || code.ExecutionResultErrorCode() != test.code {
+				t.Fatalf("error code = %v, want %q", committed, test.code)
+			}
+			var status interface{ StatusCode() int }
+			if !errors.As(committed, &status) || status.StatusCode() != http.StatusBadGateway {
+				t.Fatalf("status = %v, want 502", committed)
+			}
+			var skip interface{ SkipAuthResult() bool }
+			if !errors.As(committed, &skip) || !skip.SkipAuthResult() {
+				t.Fatalf("ordinary settle error can mutate auth: %v", committed)
+			}
+			var retry interface{ RetryOtherAuth() bool }
+			if !errors.As(committed, &retry) || retry.RetryOtherAuth() {
+				t.Fatalf("committed settle error can switch auth: %v", committed)
+			}
+		})
+	}
+}
+
 func TestChatGPTWebImagePollingStopsAfterLocalMemoryCapacityError(t *testing.T) {
 	testCases := []struct {
 		name           string
