@@ -26,6 +26,7 @@ func TestLoadConfigUsagePersistenceDefaultsAndOverrides(t *testing.T) {
 usage-statistics-persist-interval-seconds: -1
 usage-statistics-detail-retention-days: -2
 usage-statistics-max-storage-megabytes: -3
+logs-retention-days: -4
 `
 	if errWrite := os.WriteFile(path, []byte(raw), 0o600); errWrite != nil {
 		t.Fatalf("WriteFile() error = %v", errWrite)
@@ -39,6 +40,9 @@ usage-statistics-max-storage-megabytes: -3
 	}
 	if cfg.UsageStatisticsPersistIntervalSeconds != 0 || cfg.UsageStatisticsDetailRetentionDays != 0 || cfg.UsageStatisticsMaxStorageMB != 0 {
 		t.Fatalf("negative usage storage values were not normalized: %+v", cfg)
+	}
+	if cfg.LogsRetentionDays != 0 {
+		t.Fatalf("negative log retention was not normalized: %d", cfg.LogsRetentionDays)
 	}
 }
 

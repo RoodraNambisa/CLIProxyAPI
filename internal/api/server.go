@@ -58,6 +58,7 @@ type serverOptionConfig struct {
 	proxyPoolManager     *proxypool.Manager
 	runtimeConfigApply   func(context.Context, *config.Config) (config.RuntimeApplyResult, error)
 	startupState         *StartupState
+	usageRestoreStatus   func() usage.RestoreRuntimeSnapshot
 }
 
 // ServerOption customises HTTP server construction.
@@ -172,6 +173,13 @@ func WithRuntimeConfigApply(apply func(context.Context, *config.Config) (config.
 func WithStartupState(state *StartupState) ServerOption {
 	return func(cfg *serverOptionConfig) {
 		cfg.startupState = state
+	}
+}
+
+// WithUsageRestoreStatusProvider exposes safe background Usage restore state.
+func WithUsageRestoreStatusProvider(provider func() usage.RestoreRuntimeSnapshot) ServerOption {
+	return func(cfg *serverOptionConfig) {
+		cfg.usageRestoreStatus = provider
 	}
 }
 
@@ -407,6 +415,9 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 	}
 	if optionState.deadAuthDeleteCount != nil {
 		s.mgmt.SetChatGPTWebDeadAuthDeleteCountProvider(optionState.deadAuthDeleteCount)
+	}
+	if optionState.usageRestoreStatus != nil {
+		s.mgmt.SetUsageRestoreStatusProvider(optionState.usageRestoreStatus)
 	}
 	s.localPassword = optionState.localPassword
 
@@ -679,6 +690,7 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.GET("/startup/status", s.getStartupStatus)
 		mgmt.GET("/usage", s.mgmt.GetUsageStatistics)
 		mgmt.DELETE("/usage", s.mgmt.ClearUsageStatistics)
+		mgmt.POST("/usage/prune", s.mgmt.PruneUsageHistory)
 		mgmt.GET("/usage/meta", s.mgmt.GetUsageMeta)
 		mgmt.GET("/usage/summary", s.mgmt.GetUsageSummary)
 		mgmt.GET("/usage/details", s.mgmt.GetUsageDetails)
@@ -699,6 +711,9 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.GET("/usage/auths/:auth_index", s.mgmt.GetUsageAuthSummary)
 		mgmt.GET("/usage/export", s.mgmt.ExportUsageStatistics)
 		mgmt.POST("/usage/import", s.mgmt.ImportUsageStatistics)
+		mgmt.GET("/usage/storage-config", s.mgmt.GetUsageStorageConfig)
+		mgmt.PUT("/usage/storage-config", s.mgmt.PutUsageStorageConfig)
+		mgmt.PATCH("/usage/storage-config", s.mgmt.PutUsageStorageConfig)
 		mgmt.GET("/config", s.mgmt.GetConfig)
 		mgmt.GET("/config.yaml", s.mgmt.GetConfigYAML)
 		mgmt.PUT("/config.yaml", s.mgmt.PutConfigYAML)
@@ -721,6 +736,7 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.PATCH("/pprof/addr", s.mgmt.PutPprofAddr)
 		mgmt.GET("/pprof/profile/:profile", s.mgmt.GetPprofProfile)
 		mgmt.GET("/system/metrics", s.mgmt.GetSystemMetrics)
+		mgmt.GET("/storage/history", s.mgmt.GetStorageHistory)
 		mgmt.GET("/routing/diagnostics", s.mgmt.GetRoutingDiagnostics)
 
 		mgmt.GET("/logging-to-file", s.mgmt.GetLoggingToFile)
@@ -730,6 +746,9 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.GET("/logs-max-total-size-mb", s.mgmt.GetLogsMaxTotalSizeMB)
 		mgmt.PUT("/logs-max-total-size-mb", s.mgmt.PutLogsMaxTotalSizeMB)
 		mgmt.PATCH("/logs-max-total-size-mb", s.mgmt.PutLogsMaxTotalSizeMB)
+		mgmt.GET("/logs-retention-days", s.mgmt.GetLogsRetentionDays)
+		mgmt.PUT("/logs-retention-days", s.mgmt.PutLogsRetentionDays)
+		mgmt.PATCH("/logs-retention-days", s.mgmt.PutLogsRetentionDays)
 
 		mgmt.GET("/error-logs-max-files", s.mgmt.GetErrorLogsMaxFiles)
 		mgmt.PUT("/error-logs-max-files", s.mgmt.PutErrorLogsMaxFiles)
@@ -788,6 +807,7 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.GET("/logs", s.mgmt.GetLogs)
 		mgmt.GET("/logs/stream", s.mgmt.StreamLogs)
 		mgmt.DELETE("/logs", s.mgmt.DeleteLogs)
+		mgmt.POST("/logs/prune", s.mgmt.PruneLogHistory)
 		mgmt.GET("/request-error-logs", s.mgmt.GetRequestErrorLogs)
 		mgmt.GET("/request-error-logs/:name", s.mgmt.DownloadRequestErrorLog)
 		mgmt.GET("/request-log-by-id/:id", s.mgmt.GetRequestLogByID)
@@ -939,6 +959,7 @@ func (s *Server) registerManagementRoutes() {
 }
 
 func (s *Server) getStartupStatus(c *gin.Context) {
+	c.Header("Cache-Control", "no-store")
 	c.JSON(http.StatusOK, s.startupState.Snapshot())
 }
 
@@ -964,6 +985,7 @@ func startupManagementPathAvailable(path string) bool {
 		"/config",
 		"/config.yaml",
 		"/system/metrics",
+		"/storage/history",
 		"/latest-version",
 		"/control-panel/update",
 		"/debug",
@@ -972,8 +994,10 @@ func startupManagementPathAvailable(path string) bool {
 		"/pprof/addr",
 		"/logging-to-file",
 		"/logs-max-total-size-mb",
+		"/logs-retention-days",
 		"/error-logs-max-files",
 		"/usage-statistics-enabled",
+		"/usage/storage-config",
 		"/logs",
 		"/logs/stream",
 	} {
@@ -1294,7 +1318,8 @@ func (s *Server) updateClients(cfg *config.Config, rollbackOnError bool) error {
 	}
 
 	if oldCfg == nil || oldCfg.LoggingToFile != runtimeCfg.LoggingToFile ||
-		oldCfg.LogsMaxTotalSizeMB != runtimeCfg.LogsMaxTotalSizeMB {
+		oldCfg.LogsMaxTotalSizeMB != runtimeCfg.LogsMaxTotalSizeMB ||
+		oldCfg.LogsRetentionDays != runtimeCfg.LogsRetentionDays {
 		if errLogOutput := logging.ConfigureLogOutput(runtimeCfg); errLogOutput != nil {
 			return rollback(errLogOutput)
 		}

@@ -57,6 +57,56 @@ func TestEnforceLogDirSizeLimitSkipsProtected(t *testing.T) {
 	}
 }
 
+func TestCleanupLogDirectoryAppliesRetentionBeforeSize(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Date(2026, time.August, 17, 12, 0, 0, 0, time.UTC)
+	old := filepath.Join(dir, "old.log.gz")
+	recent := filepath.Join(dir, "recent.log")
+	protected := filepath.Join(dir, "main.log")
+	ignored := filepath.Join(dir, "usage-statistics.snapshot")
+	writeLogFile(t, old, 80, now.Add(-72*time.Hour))
+	writeLogFile(t, recent, 60, now.Add(-time.Hour))
+	writeLogFile(t, protected, 70, now.Add(-96*time.Hour))
+	writeLogFile(t, ignored, 200, now.Add(-96*time.Hour))
+
+	result, errCleanup := CleanupLogDirectory(dir, 2, 100, protected, now)
+	if errCleanup != nil {
+		t.Fatalf("CleanupLogDirectory() error = %v", errCleanup)
+	}
+	if result.Before.FileCount != 3 || result.Before.TotalBytes != 210 {
+		t.Fatalf("before = %+v", result.Before)
+	}
+	if result.RemovedFiles != 2 || result.RemovedBytes != 140 || result.FailedFiles != 0 {
+		t.Fatalf("result = %+v", result)
+	}
+	if result.After.FileCount != 1 || result.After.TotalBytes != 70 {
+		t.Fatalf("after = %+v", result.After)
+	}
+	if _, errStat := os.Stat(protected); errStat != nil {
+		t.Fatalf("protected file removed: %v", errStat)
+	}
+	if _, errStat := os.Stat(ignored); errStat != nil {
+		t.Fatalf("non-log file removed: %v", errStat)
+	}
+}
+
+func TestInspectLogDirectoryDoesNotExposePaths(t *testing.T) {
+	dir := t.TempDir()
+	modified := time.Date(2026, time.August, 17, 1, 2, 3, 0, time.UTC)
+	writeLogFile(t, filepath.Join(dir, "main.log"), 42, modified)
+
+	snapshot, errInspect := InspectLogDirectory(dir, filepath.Join(dir, "main.log"))
+	if errInspect != nil {
+		t.Fatalf("InspectLogDirectory() error = %v", errInspect)
+	}
+	if !snapshot.Available || snapshot.FileCount != 1 || snapshot.TotalBytes != 42 {
+		t.Fatalf("snapshot = %+v", snapshot)
+	}
+	if snapshot.OldestAt == nil || !snapshot.OldestAt.Equal(modified) || snapshot.NewestAt == nil || !snapshot.NewestAt.Equal(modified) {
+		t.Fatalf("snapshot timestamps = %+v", snapshot)
+	}
+}
+
 func writeLogFile(t *testing.T, path string, size int, modTime time.Time) {
 	t.Helper()
 

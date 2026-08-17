@@ -144,8 +144,7 @@ func ResolveLogDirectory(cfg *config.Config) string {
 }
 
 // ConfigureLogOutput switches the global log destination between rotating files and stdout.
-// When logsMaxTotalSizeMB > 0, a background cleaner removes the oldest log files in the logs directory
-// until the total size is within the limit.
+// A background cleaner applies configured age and total-size retention to log files.
 func ConfigureLogOutput(cfg *config.Config) error {
 	SetupBaseLogger()
 	if cfg == nil {
@@ -182,7 +181,7 @@ func ConfigureLogOutput(cfg *config.Config) error {
 		log.SetOutput(os.Stdout)
 	}
 
-	configureLogDirCleanerLocked(logDir, cfg.LogsMaxTotalSizeMB, protectedPath)
+	configureLogDirCleanerLocked(logDir, cfg.LogsMaxTotalSizeMB, cfg.LogsRetentionDays, protectedPath)
 	ConfigureManagementDiagnostics(
 		cfg.RemoteManagement.LiveLogs.Enabled,
 		cfg.RemoteManagement.Diagnostics.ResolvedDetailLevel(),

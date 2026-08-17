@@ -306,6 +306,10 @@ type Config struct {
 	// When exceeded, the oldest log files are deleted until within the limit. Set to 0 to disable.
 	LogsMaxTotalSizeMB int `yaml:"logs-max-total-size-mb" json:"logs-max-total-size-mb"`
 
+	// LogsRetentionDays removes inactive log files older than the configured number of days.
+	// Set to 0 to disable age-based cleanup.
+	LogsRetentionDays int `yaml:"logs-retention-days" json:"logs-retention-days"`
+
 	// ErrorLogsMaxFiles limits the number of error log files retained when request logging is disabled.
 	// When exceeded, the oldest error log files are deleted. Default is 10. Set to 0 to disable cleanup.
 	ErrorLogsMaxFiles int `yaml:"error-logs-max-files" json:"error-logs-max-files"`
@@ -2004,6 +2008,7 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	cfg.Host = "" // Default empty: binds to all interfaces (IPv4 + IPv6)
 	cfg.LoggingToFile = false
 	cfg.LogsMaxTotalSizeMB = 0
+	cfg.LogsRetentionDays = 0
 	cfg.ErrorLogsMaxFiles = 10
 	cfg.UsageStatisticsEnabled = false
 	cfg.DisableCooling = false
@@ -2141,6 +2146,9 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 
 	if cfg.LogsMaxTotalSizeMB < 0 {
 		cfg.LogsMaxTotalSizeMB = 0
+	}
+	if cfg.LogsRetentionDays < 0 {
+		cfg.LogsRetentionDays = 0
 	}
 
 	if cfg.ErrorLogsMaxFiles < 0 {

@@ -169,7 +169,7 @@ func TestStartupReadinessGatesProxyAndCredentialManagement(t *testing.T) {
 		t.Fatalf("initial proxy response = %d %s, want service_initializing 503", proxyRecorder.Code, proxyRecorder.Body.String())
 	}
 
-	for _, path := range []string{"/v0/management/config", "/v0/management/startup/status"} {
+	for _, path := range []string{"/v0/management/config", "/v0/management/startup/status", "/v0/management/storage/history"} {
 		request := httptest.NewRequest(http.MethodGet, path, nil)
 		request.Header.Set("X-Management-Key", "secret")
 		recorder := httptest.NewRecorder()

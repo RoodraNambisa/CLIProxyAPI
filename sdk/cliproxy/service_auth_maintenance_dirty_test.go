@@ -44,6 +44,54 @@ func TestServiceAuthMaintenanceDirtyQueueDeduplicatesAndBatches(t *testing.T) {
 	}
 }
 
+func TestServiceAuthMaintenanceQueuesStayBoundedAndRequestRescan(t *testing.T) {
+	service := &Service{}
+	for index := range authMaintenanceDirtyQueueLimit {
+		if !service.markAuthMaintenanceDirty(fmt.Sprintf("dirty-%d", index)) {
+			t.Fatalf("dirty queue rejected item %d before limit", index)
+		}
+	}
+	if service.markAuthMaintenanceDirty("dirty-overflow") {
+		t.Fatal("dirty queue accepted item beyond limit")
+	}
+	service.maintenanceMu.Lock()
+	if len(service.maintenanceDirtyQueue) != authMaintenanceDirtyQueueLimit || !service.maintenanceRescanNeeded || service.maintenanceBackpressure != 1 {
+		t.Fatalf("dirty queue state = len:%d rescan:%t backpressure:%d", len(service.maintenanceDirtyQueue), service.maintenanceRescanNeeded, service.maintenanceBackpressure)
+	}
+	service.maintenanceMu.Unlock()
+	if service.consumeAuthMaintenanceRescanNeeded() {
+		t.Fatal("rescan consumed while dirty queue remained above half capacity")
+	}
+	service.takeAuthMaintenanceDirtyIDs(authMaintenanceDirtyQueueLimit / 2)
+	if !service.consumeAuthMaintenanceRescanNeeded() {
+		t.Fatal("rescan was not released after bounded queue pressure subsided")
+	}
+
+	service = &Service{}
+	for index := range authMaintenanceQueueLimit {
+		candidate := authMaintenanceCandidate{Key: fmt.Sprintf("candidate-%d", index), IDs: []string{fmt.Sprintf("auth-%d", index)}}
+		if !service.enqueueAuthMaintenanceCandidate(candidate) {
+			t.Fatalf("candidate queue rejected item %d before limit", index)
+		}
+	}
+	if service.enqueueAuthMaintenanceCandidate(authMaintenanceCandidate{Key: "candidate-overflow", IDs: []string{"overflow"}}) {
+		t.Fatal("candidate queue accepted item beyond limit")
+	}
+	service.maintenanceMu.Lock()
+	if len(service.maintenanceQueue) != authMaintenanceQueueLimit || !service.maintenanceRescanNeeded || service.maintenanceBackpressure != 1 {
+		t.Fatalf("candidate queue state = len:%d rescan:%t backpressure:%d", len(service.maintenanceQueue), service.maintenanceRescanNeeded, service.maintenanceBackpressure)
+	}
+	service.maintenanceMu.Unlock()
+	for range authMaintenanceQueueLimit / 2 {
+		if _, ok := service.dequeueAuthMaintenanceCandidate(); !ok {
+			t.Fatal("candidate queue drained before half capacity")
+		}
+	}
+	if !service.consumeAuthMaintenanceRescanNeeded() {
+		t.Fatal("candidate overflow did not request a later full rescan")
+	}
+}
+
 func TestServiceProcessDirtyAuthMaintenanceIDDisablesWithoutFullScan(t *testing.T) {
 	authDir := t.TempDir()
 	store := sdkauth.NewFileTokenStore()

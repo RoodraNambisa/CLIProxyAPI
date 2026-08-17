@@ -90,6 +90,7 @@ type Handler struct {
 	authDeleteHook          func(context.Context, []*coreauth.Auth)
 	dependencyReconcileHook func(context.Context, string) ([]string, error)
 	deadAuthDeleteCount     func() uint64
+	usageRestoreStatus      func() usage.RestoreRuntimeSnapshot
 	proxyPoolManager        *proxypool.Manager
 	runtimeConfigApplier    func(context.Context, *config.Config) (config.RuntimeApplyResult, error)
 	chatGPTWebTasks         *chatGPTWebLoginTaskManager
@@ -484,6 +485,26 @@ func (h *Handler) SetChatGPTWebDeadAuthDeleteCountProvider(provider func() uint6
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.deadAuthDeleteCount = provider
+}
+
+// SetUsageRestoreStatusProvider registers the service-owned restore snapshot provider.
+func (h *Handler) SetUsageRestoreStatusProvider(provider func() usage.RestoreRuntimeSnapshot) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.usageRestoreStatus = provider
+}
+
+func (h *Handler) usageRestoreStatusSnapshot() usage.RestoreRuntimeSnapshot {
+	if h == nil {
+		return usage.RestoreRuntimeSnapshot{Status: "unavailable"}
+	}
+	h.mu.Lock()
+	provider := h.usageRestoreStatus
+	h.mu.Unlock()
+	if provider == nil {
+		return usage.RestoreRuntimeSnapshot{Status: "unavailable"}
+	}
+	return provider()
 }
 
 func (h *Handler) usageStatisticsSnapshot() *usage.RequestStatistics {

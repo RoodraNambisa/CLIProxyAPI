@@ -200,6 +200,11 @@ type Service struct {
 	// usageRestoreNeedsSidecar remains true after an interrupted or failed
 	// restore so shutdown cannot overwrite an unapplied main snapshot.
 	usageRestoreNeedsSidecar bool
+	usageRestoreStartedAt    time.Time
+	usageRestoreCompletedAt  time.Time
+	usageRestoreAdded        int64
+	usageRestoreSkipped      int64
+	usageRestoreErrorCode    string
 
 	// usageStats optionally overrides the shared usage statistics store for tests.
 	usageStats *internalusage.RequestStatistics
@@ -269,6 +274,10 @@ type Service struct {
 	// maintenanceDirtySet deduplicates changed auth IDs waiting for policy checks.
 	maintenanceDirtySet map[string]struct{}
 
+	// maintenanceRescanNeeded preserves work rejected by bounded queues.
+	maintenanceRescanNeeded bool
+	maintenanceBackpressure uint64
+
 	// maintenanceDependencyReconcilePending retries retained Codex cleanup after a transient failure.
 	maintenanceDependencyReconcilePending bool
 
@@ -304,8 +313,12 @@ const (
 	authMaintenanceStagedIgnoreWindow       = 200 * time.Millisecond
 	authMaintenanceCheckpointDeletes        = 64
 	authMaintenanceDirtyBatchSize           = 256
+	authMaintenanceQueueLimit               = 4096
+	authMaintenanceDirtyQueueLimit          = 4096
 	defaultModelSyncWorkers                 = 4
 	defaultModelSyncQueueSize               = 256
+	authMaintenanceBootstrapWorkers         = 4
+	authMaintenanceBootstrapQueueSize       = 256
 	authMaintenanceMetadataPrefix           = "auth_maintenance_"
 	authMaintenanceActionMetadataKey        = "auth_maintenance_action"
 	authMaintenanceReasonMetadataKey        = "auth_maintenance_reason"
@@ -683,6 +696,11 @@ func (s *Service) startUsageRestore() {
 	s.usageRestoreDone = done
 	s.usageRestoreActive = true
 	s.usageRestoreApplied = false
+	s.usageRestoreStartedAt = time.Now().UTC()
+	s.usageRestoreCompletedAt = time.Time{}
+	s.usageRestoreAdded = 0
+	s.usageRestoreSkipped = 0
+	s.usageRestoreErrorCode = ""
 	s.usageRestoreMu.Unlock()
 
 	stats := s.usageStatisticsStore()
@@ -694,7 +712,9 @@ func (s *Service) startUsageRestore() {
 		errorCode := ""
 		applied := false
 		if errPrepare != nil {
-			if !errors.Is(errPrepare, context.Canceled) {
+			if errors.Is(errPrepare, context.Canceled) {
+				errorCode = "usage_snapshot_restore_canceled"
+			} else {
 				errorCode = "usage_snapshot_restore_failed"
 				log.WithError(errPrepare).Warn("failed to prepare usage statistics snapshot")
 			}
@@ -728,6 +748,10 @@ func (s *Service) startUsageRestore() {
 			s.usageRestoreApplied = applied
 			s.usageRestoreNeedsSidecar = !applied
 			s.usageRestoreCancel = nil
+			s.usageRestoreCompletedAt = time.Now().UTC()
+			s.usageRestoreAdded = result.Added
+			s.usageRestoreSkipped = result.Skipped
+			s.usageRestoreErrorCode = errorCode
 		}
 		s.usageRestoreMu.Unlock()
 	}()
@@ -741,6 +765,45 @@ func (s *Service) usageRestoreInProgress() bool {
 	active := s.usageRestoreActive
 	s.usageRestoreMu.Unlock()
 	return active
+}
+
+func (s *Service) usageRestoreRuntimeSnapshot() internalusage.RestoreRuntimeSnapshot {
+	if s == nil {
+		return internalusage.RestoreRuntimeSnapshot{Status: "unavailable"}
+	}
+	enabled := s.usageStatisticsEnabled() && s.usagePersistenceSettings().enabled
+	s.usageRestoreMu.Lock()
+	snapshot := internalusage.RestoreRuntimeSnapshot{
+		Enabled:       enabled,
+		Active:        s.usageRestoreActive,
+		Applied:       s.usageRestoreApplied,
+		NeedsSidecar:  s.usageRestoreNeedsSidecar,
+		Added:         s.usageRestoreAdded,
+		Skipped:       s.usageRestoreSkipped,
+		SafeErrorCode: s.usageRestoreErrorCode,
+	}
+	if !s.usageRestoreStartedAt.IsZero() {
+		startedAt := s.usageRestoreStartedAt
+		snapshot.StartedAt = &startedAt
+	}
+	if !s.usageRestoreCompletedAt.IsZero() {
+		completedAt := s.usageRestoreCompletedAt
+		snapshot.CompletedAt = &completedAt
+	}
+	s.usageRestoreMu.Unlock()
+	switch {
+	case !enabled:
+		snapshot.Status = "disabled"
+	case snapshot.Active:
+		snapshot.Status = "running"
+	case snapshot.SafeErrorCode != "":
+		snapshot.Status = "failed"
+	case snapshot.Applied:
+		snapshot.Status = "completed"
+	default:
+		snapshot.Status = "idle"
+	}
+	return snapshot
 }
 
 // stopUsageRestore cancels and joins the background loader. It reports whether
@@ -1479,6 +1542,13 @@ func (s *Service) markAuthMaintenanceDirty(authID string) bool {
 		s.maintenanceMu.Unlock()
 		return false
 	}
+	if len(s.maintenanceDirtyQueue) >= authMaintenanceDirtyQueueLimit {
+		s.maintenanceRescanNeeded = true
+		s.maintenanceBackpressure++
+		s.maintenanceMu.Unlock()
+		s.wakeAuthMaintenance()
+		return false
+	}
 	s.maintenanceDirtySet[authID] = struct{}{}
 	s.maintenanceDirtyQueue = append(s.maintenanceDirtyQueue, authID)
 	s.maintenanceMu.Unlock()
@@ -1519,17 +1589,48 @@ func (s *Service) hasAuthMaintenanceDirtyIDs() bool {
 	return len(s.maintenanceDirtyQueue) > 0
 }
 
-func (s *Service) installAuthMaintenanceHook(ctx context.Context) {
+func (s *Service) installAuthMaintenanceHook(ctx context.Context) int64 {
 	if s == nil || s.coreManager == nil {
-		return
+		return 0
 	}
 	hook := authMaintenanceHook{service: s}
 	s.coreManager.AddHook(hook)
-	for _, auth := range s.coreManager.ChatGPTWebAuths() {
-		if isNativeChatGPTWebAuth(auth) {
-			hook.OnAuthUpdated(ctx, auth)
+	ids := s.coreManager.AuthIDsForProviders(chatgptwebauth.Provider)
+	if len(ids) == 0 {
+		return 0
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	jobs := make(chan string, authMaintenanceBootstrapQueueSize)
+	var workers sync.WaitGroup
+	var processed atomic.Int64
+	for range min(authMaintenanceBootstrapWorkers, len(ids)) {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			for id := range jobs {
+				auth, ok := s.coreManager.GetByID(id)
+				if !ok || !isNativeChatGPTWebAuth(auth) {
+					continue
+				}
+				hook.OnAuthUpdated(ctx, auth)
+				processed.Add(1)
+			}
+		}()
+	}
+	for _, id := range ids {
+		select {
+		case <-ctx.Done():
+			close(jobs)
+			workers.Wait()
+			return processed.Load()
+		case jobs <- id:
 		}
 	}
+	close(jobs)
+	workers.Wait()
+	return processed.Load()
 }
 
 func (s *Service) triggerChatGPTWebRelogin(auth *coreauth.Auth) {
@@ -1583,6 +1684,11 @@ func (s *Service) enqueueAuthMaintenanceCandidate(candidate authMaintenanceCandi
 	if _, exists := s.maintenancePending[key]; exists {
 		return false
 	}
+	if len(s.maintenanceQueue) >= authMaintenanceQueueLimit {
+		s.maintenanceRescanNeeded = true
+		s.maintenanceBackpressure++
+		return false
+	}
 	candidate.Generation = s.maintenanceGeneration[key]
 	s.maintenancePending[key] = struct{}{}
 	s.maintenanceQueue = append(s.maintenanceQueue, candidate)
@@ -1599,9 +1705,26 @@ func (s *Service) dequeueAuthMaintenanceCandidate() (authMaintenanceCandidate, b
 		return authMaintenanceCandidate{}, false
 	}
 	candidate := s.maintenanceQueue[0]
-	s.maintenanceQueue = append([]authMaintenanceCandidate(nil), s.maintenanceQueue[1:]...)
+	s.maintenanceQueue[0] = authMaintenanceCandidate{}
+	s.maintenanceQueue = s.maintenanceQueue[1:]
+	if len(s.maintenanceQueue) == 0 {
+		s.maintenanceQueue = nil
+	}
 	delete(s.maintenancePending, strings.TrimSpace(candidate.Key))
 	return candidate, true
+}
+
+func (s *Service) consumeAuthMaintenanceRescanNeeded() bool {
+	if s == nil {
+		return false
+	}
+	s.maintenanceMu.Lock()
+	defer s.maintenanceMu.Unlock()
+	if !s.maintenanceRescanNeeded || len(s.maintenanceQueue) > authMaintenanceQueueLimit/2 || len(s.maintenanceDirtyQueue) > authMaintenanceDirtyQueueLimit/2 {
+		return false
+	}
+	s.maintenanceRescanNeeded = false
+	return true
 }
 
 func authMaintenanceCandidateEnabled(candidate authMaintenanceCandidate, genericEnabled, webDeadEnabled bool) bool {
@@ -2419,6 +2542,9 @@ func (s *Service) startAuthMaintenance(parent context.Context) {
 			}
 
 			now := time.Now()
+			if s.consumeAuthMaintenanceRescanNeeded() {
+				nextFullScanAt = time.Time{}
+			}
 			fullScanDue := enabled && (nextFullScanAt.IsZero() || !now.Before(nextFullScanAt))
 			if fullScanDue {
 				scanInterval := time.Duration(cfg.ScanIntervalSeconds) * time.Second
@@ -4825,6 +4951,7 @@ func (s *Service) prepareAPIServer() error {
 	serverOpts = append(serverOpts, api.WithProxyPoolManager(s.proxyPoolManager))
 	serverOpts = append(serverOpts, api.WithRuntimeConfigApply(s.ApplyRuntimeConfig))
 	serverOpts = append(serverOpts, api.WithStartupState(s.startupState))
+	serverOpts = append(serverOpts, api.WithUsageRestoreStatusProvider(s.usageRestoreRuntimeSnapshot))
 	s.server = api.NewServer(s.cfg, s.coreManager, s.accessManager, s.configPath, serverOpts...)
 
 	s.ensureWebsocketGateway()
@@ -4998,29 +5125,37 @@ func (s *Service) Run(ctx context.Context) error {
 	_, _ = s.reconcileChatGPTWebDependencies(ctx, "startup")
 	finishDependencies(authCount, "")
 
+	finishTokenLoad := s.startupState.BeginStage("token_provider_load")
 	tokenResult, err := s.tokenProvider.Load(ctx, s.cfg)
 	if err != nil && !errors.Is(err, context.Canceled) {
+		finishTokenLoad(0, "token_provider_load_failed")
 		return err
 	}
 	if tokenResult == nil {
 		tokenResult = &TokenClientResult{}
 	}
 	_ = tokenResult
+	finishTokenLoad(1, "")
 
+	finishAPIKeyLoad := s.startupState.BeginStage("api_key_provider_load")
 	apiKeyResult, err := s.apiKeyProvider.Load(ctx, s.cfg)
 	if err != nil && !errors.Is(err, context.Canceled) {
+		finishAPIKeyLoad(0, "api_key_provider_load_failed")
 		return err
 	}
 	if apiKeyResult == nil {
 		apiKeyResult = &APIKeyClientResult{}
 	}
 	_ = apiKeyResult
+	finishAPIKeyLoad(1, "")
 	// legacy clients removed; no caches to refresh
 
 	finishRouting := s.startupState.BeginStage("routing_bootstrap")
 	s.startModelSyncLoop(ctx)
 	s.restoreChatGPTWebImportModelIntents(ctx)
-	s.installAuthMaintenanceHook(ctx)
+	finishMaintenanceBootstrap := s.startupState.BeginStage("credential_maintenance_bootstrap")
+	maintenanceProcessed := s.installAuthMaintenanceHook(ctx)
+	finishMaintenanceBootstrap(maintenanceProcessed, "")
 	if cfg, _ := s.snapshotAuthMaintenanceConfig(); cfg.Enable {
 		s.warnAuthMaintenanceConfig(cfg)
 	}
@@ -5050,8 +5185,10 @@ func (s *Service) Run(ctx context.Context) error {
 		}
 	}
 
+	finishWatcherSync := s.startupState.BeginStage("watcher_initial_sync")
 	watcherWrapper, err = s.watcherFactory(s.configPath, s.cfg.AuthDir, reloadCallback)
 	if err != nil {
+		finishWatcherSync(0, "watcher_create_failed")
 		finishRouting(authCount, "watcher_create_failed")
 		s.startupState.MarkFailed()
 		return fmt.Errorf("cliproxy: failed to create watcher: %w", err)
@@ -5076,15 +5213,18 @@ func (s *Service) Run(ctx context.Context) error {
 	watcherCtx, watcherCancel := context.WithCancel(context.Background())
 	s.watcherCancel = watcherCancel
 	if err = watcherWrapper.Start(watcherCtx); err != nil {
+		finishWatcherSync(0, "watcher_start_failed")
 		finishRouting(authCount, "watcher_start_failed")
 		s.startupState.MarkFailed()
 		return fmt.Errorf("cliproxy: failed to start watcher: %w", err)
 	}
 	if err = watcherWrapper.WaitForAuthUpdates(ctx); err != nil {
+		finishWatcherSync(0, "watcher_initial_sync_failed")
 		finishRouting(authCount, "watcher_initial_sync_failed")
 		s.startupState.MarkFailed()
 		return fmt.Errorf("cliproxy: wait for initial auth updates: %w", err)
 	}
+	finishWatcherSync(authCount, "")
 	log.Info("file watcher started for config and auth directory changes")
 	// Start proxy health checks only after file-backed auths are visible, so
 	// restored bindings are not pruned as stale.

@@ -39,8 +39,17 @@ func BuildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 	if oldCfg.UsageStatisticsEnabled != newCfg.UsageStatisticsEnabled {
 		changes = append(changes, fmt.Sprintf("usage-statistics-enabled: %t -> %t", oldCfg.UsageStatisticsEnabled, newCfg.UsageStatisticsEnabled))
 	}
+	if oldCfg.UsageStatisticsPersistence() != newCfg.UsageStatisticsPersistence() {
+		changes = append(changes, fmt.Sprintf("usage-statistics-persistence-enabled: %t -> %t", oldCfg.UsageStatisticsPersistence(), newCfg.UsageStatisticsPersistence()))
+	}
 	if oldCfg.UsageStatisticsPersistIntervalSeconds != newCfg.UsageStatisticsPersistIntervalSeconds {
 		changes = append(changes, fmt.Sprintf("usage-statistics-persist-interval-seconds: %d -> %d", oldCfg.UsageStatisticsPersistIntervalSeconds, newCfg.UsageStatisticsPersistIntervalSeconds))
+	}
+	if oldCfg.UsageStatisticsDetailRetentionDays != newCfg.UsageStatisticsDetailRetentionDays {
+		changes = append(changes, fmt.Sprintf("usage-statistics-detail-retention-days: %d -> %d", oldCfg.UsageStatisticsDetailRetentionDays, newCfg.UsageStatisticsDetailRetentionDays))
+	}
+	if oldCfg.UsageStatisticsMaxStorageMB != newCfg.UsageStatisticsMaxStorageMB {
+		changes = append(changes, fmt.Sprintf("usage-statistics-max-storage-megabytes: %d -> %d", oldCfg.UsageStatisticsMaxStorageMB, newCfg.UsageStatisticsMaxStorageMB))
 	}
 	if oldCfg.DisableCooling != newCfg.DisableCooling {
 		changes = append(changes, fmt.Sprintf("disable-cooling: %t -> %t", oldCfg.DisableCooling, newCfg.DisableCooling))
@@ -56,6 +65,9 @@ func BuildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 	}
 	if oldCfg.LogsMaxTotalSizeMB != newCfg.LogsMaxTotalSizeMB {
 		changes = append(changes, fmt.Sprintf("logs-max-total-size-mb: %d -> %d", oldCfg.LogsMaxTotalSizeMB, newCfg.LogsMaxTotalSizeMB))
+	}
+	if oldCfg.LogsRetentionDays != newCfg.LogsRetentionDays {
+		changes = append(changes, fmt.Sprintf("logs-retention-days: %d -> %d", oldCfg.LogsRetentionDays, newCfg.LogsRetentionDays))
 	}
 	if oldCfg.ErrorLogsMaxFiles != newCfg.ErrorLogsMaxFiles {
 		changes = append(changes, fmt.Sprintf("error-logs-max-files: %d -> %d", oldCfg.ErrorLogsMaxFiles, newCfg.ErrorLogsMaxFiles))

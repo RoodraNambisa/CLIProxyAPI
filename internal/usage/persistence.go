@@ -48,6 +48,22 @@ type PersistenceResult struct {
 	SnapshotPath string `json:"-"`
 }
 
+// StatisticsStorageFileSnapshot describes one known Usage snapshot file.
+type StatisticsStorageFileSnapshot struct {
+	Exists     bool       `json:"exists"`
+	SizeBytes  int64      `json:"size_bytes"`
+	ModifiedAt *time.Time `json:"modified_at,omitempty"`
+}
+
+// StatisticsStorageSnapshot is a safe aggregate view of Usage history files.
+type StatisticsStorageSnapshot struct {
+	Available  bool                          `json:"available"`
+	TotalBytes int64                         `json:"total_bytes"`
+	Main       StatisticsStorageFileSnapshot `json:"main"`
+	Pending    StatisticsStorageFileSnapshot `json:"pending"`
+	Legacy     StatisticsStorageFileSnapshot `json:"legacy"`
+}
+
 // StatisticsFilePath returns the default on-disk path used for automatic usage
 // statistics persistence.
 func StatisticsFilePath(cfg *config.Config) string {
@@ -68,6 +84,11 @@ func PendingStatisticsFilePath(path string) string {
 	return filepath.Clean(target) + pendingStatisticsSuffix
 }
 
+// LegacyStatisticsFilePath returns the legacy snapshot path, when applicable.
+func LegacyStatisticsFilePath(path string) string {
+	return legacyStatisticsFilePath(path)
+}
+
 func legacyStatisticsFilePath(path string) string {
 	target := strings.TrimSpace(path)
 	if target == "" {
@@ -78,6 +99,41 @@ func legacyStatisticsFilePath(path string) string {
 		return ""
 	}
 	return filepath.Join(filepath.Dir(target), legacyStatisticsFileName)
+}
+
+// InspectStatisticsStorage returns file counts and sizes without exposing paths.
+func InspectStatisticsStorage(path string) (StatisticsStorageSnapshot, error) {
+	var snapshot StatisticsStorageSnapshot
+	paths := []struct {
+		path   string
+		target *StatisticsStorageFileSnapshot
+	}{
+		{path: path, target: &snapshot.Main},
+		{path: PendingStatisticsFilePath(path), target: &snapshot.Pending},
+		{path: legacyStatisticsFilePath(path), target: &snapshot.Legacy},
+	}
+	for _, item := range paths {
+		if strings.TrimSpace(item.path) == "" {
+			continue
+		}
+		info, errStat := os.Stat(item.path)
+		if errStat != nil {
+			if os.IsNotExist(errStat) {
+				continue
+			}
+			return StatisticsStorageSnapshot{}, errStat
+		}
+		snapshot.Available = true
+		if !info.Mode().IsRegular() {
+			continue
+		}
+		modifiedAt := info.ModTime().UTC()
+		item.target.Exists = true
+		item.target.SizeBytes = info.Size()
+		item.target.ModifiedAt = &modifiedAt
+		snapshot.TotalBytes += info.Size()
+	}
+	return snapshot, nil
 }
 
 // SaveSnapshotFile writes a complete statistics snapshot to disk atomically.
@@ -263,12 +319,27 @@ func PersistRequestStatistics(path string, stats *RequestStatistics) (bool, erro
 // PersistRequestStatisticsWithPolicy applies retention and writes the current
 // snapshot atomically when there are unpersisted changes.
 func PersistRequestStatisticsWithPolicy(path string, stats *RequestStatistics, policy PersistencePolicy) (PersistenceResult, error) {
-	result := PersistenceResult{SnapshotPath: path}
 	if stats == nil {
-		return result, nil
+		return PersistenceResult{SnapshotPath: path}, nil
 	}
 	statisticsPersistenceMu.Lock()
 	defer statisticsPersistenceMu.Unlock()
+	return persistRequestStatisticsWithPolicyLocked(path, stats, policy, false)
+}
+
+// PruneAndPersistRequestStatistics applies retention even when the current
+// snapshot was previously persisted, then durably writes any changed result.
+func PruneAndPersistRequestStatistics(path string, stats *RequestStatistics, policy PersistencePolicy) (PersistenceResult, error) {
+	if stats == nil {
+		return PersistenceResult{SnapshotPath: path}, nil
+	}
+	statisticsPersistenceMu.Lock()
+	defer statisticsPersistenceMu.Unlock()
+	return persistRequestStatisticsWithPolicyLocked(path, stats, policy, true)
+}
+
+func persistRequestStatisticsWithPolicyLocked(path string, stats *RequestStatistics, policy PersistencePolicy, inspectPersisted bool) (PersistenceResult, error) {
+	result := PersistenceResult{SnapshotPath: path}
 
 	if policy.DetailRetentionDays > 0 {
 		cutoff := time.Now().UTC().AddDate(0, 0, -policy.DetailRetentionDays)
@@ -277,7 +348,7 @@ func PersistRequestStatisticsWithPolicy(path string, stats *RequestStatistics, p
 
 	for {
 		snapshot, version, persistedVersion := stats.SnapshotWithState()
-		if version == persistedVersion {
+		if version == persistedVersion && !inspectPersisted {
 			return result, nil
 		}
 		data, errMarshal := marshalSnapshotFile(snapshot)
@@ -285,12 +356,15 @@ func PersistRequestStatisticsWithPolicy(path string, stats *RequestStatistics, p
 			return result, errMarshal
 		}
 		if policy.MaxBytes <= 0 || int64(len(data)) <= policy.MaxBytes {
+			result.SizeBytes = int64(len(data))
+			result.DetailCount = stats.DetailCount()
+			if version == persistedVersion {
+				return result, nil
+			}
 			if errWrite := writeFileAtomic(path, data); errWrite != nil {
 				return result, errWrite
 			}
 			result.Saved = true
-			result.SizeBytes = int64(len(data))
-			result.DetailCount = stats.DetailCount()
 			if pendingPath := PendingStatisticsFilePath(path); pendingPath != "" {
 				if errRemove := os.Remove(pendingPath); errRemove != nil && !os.IsNotExist(errRemove) {
 					return result, fmt.Errorf("usage: remove pending snapshot: %w", errRemove)

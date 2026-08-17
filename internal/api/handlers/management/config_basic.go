@@ -331,6 +331,30 @@ func (h *Handler) PutLogsMaxTotalSizeMB(c *gin.Context) {
 	h.persistLocked(c)
 }
 
+// LogsRetentionDays
+func (h *Handler) GetLogsRetentionDays(c *gin.Context) {
+	cfg := h.currentConfig()
+	if cfg == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "configuration unavailable"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"logs-retention-days": cfg.LogsRetentionDays})
+}
+
+func (h *Handler) PutLogsRetentionDays(c *gin.Context) {
+	var body struct {
+		Value *int `json:"value"`
+	}
+	if errBindJSON := c.ShouldBindJSON(&body); errBindJSON != nil || body.Value == nil || *body.Value < 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
+		return
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.cfg.LogsRetentionDays = *body.Value
+	h.persistLocked(c)
+}
+
 // ErrorLogsMaxFiles
 func (h *Handler) GetErrorLogsMaxFiles(c *gin.Context) {
 	cfg := h.currentConfig()
