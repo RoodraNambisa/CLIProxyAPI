@@ -57,6 +57,7 @@ type serverOptionConfig struct {
 	deadAuthDeleteCount  func() uint64
 	proxyPoolManager     *proxypool.Manager
 	runtimeConfigApply   func(context.Context, *config.Config) (config.RuntimeApplyResult, error)
+	startupState         *StartupState
 }
 
 // ServerOption customises HTTP server construction.
@@ -165,6 +166,15 @@ func WithRuntimeConfigApply(apply func(context.Context, *config.Config) (config.
 	}
 }
 
+// WithStartupState installs a service-owned readiness and startup diagnostics
+// state. Servers created without this option remain immediately ready for SDK
+// compatibility.
+func WithStartupState(state *StartupState) ServerOption {
+	return func(cfg *serverOptionConfig) {
+		cfg.startupState = state
+	}
+}
+
 // Server represents the main API server.
 // It encapsulates the Gin engine, HTTP server, handlers, and configuration.
 type Server struct {
@@ -231,6 +241,8 @@ type Server struct {
 	keepAliveOnTimeout func()
 	keepAliveHeartbeat chan struct{}
 	keepAliveStop      chan struct{}
+
+	startupState *StartupState
 }
 
 // currentConfig returns the immutable configuration currently used by the API
@@ -340,6 +352,10 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 		wsRoutes:               make(map[string]struct{}),
 		managementAPIPrefixes:  make(map[string]struct{}),
 		managementSurfacePaths: make(map[string]struct{}),
+		startupState:           optionState.startupState,
+	}
+	if s.startupState == nil {
+		s.startupState = newReadyStartupState()
 	}
 	serverRef = s
 	s.wsAuthEnabled.Store(cfg.WebsocketAuth)
@@ -434,6 +450,28 @@ func (s *Server) setupRoutes() {
 	}
 	s.engine.GET("/healthz", healthzHandler)
 	s.engine.HEAD("/healthz", healthzHandler)
+	readyzHandler := func(c *gin.Context) {
+		snapshot := s.startupState.Snapshot()
+		if !snapshot.Ready {
+			c.Header("Retry-After", "2")
+			if c.Request.Method == http.MethodHead {
+				c.Status(http.StatusServiceUnavailable)
+				return
+			}
+			c.JSON(http.StatusServiceUnavailable, gin.H{
+				"status": "initializing",
+				"phase":  snapshot.Phase,
+			})
+			return
+		}
+		if c.Request.Method == http.MethodHead {
+			c.Status(http.StatusOK)
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"status": "ok", "phase": snapshot.Phase})
+	}
+	s.engine.GET("/readyz", readyzHandler)
+	s.engine.HEAD("/readyz", readyzHandler)
 
 	s.registerManagementSurfaceRoutes()
 	openaiHandlers := openai.NewOpenAIAPIHandler(s.handlers)
@@ -445,6 +483,7 @@ func (s *Server) setupRoutes() {
 	// OpenAI compatible API routes
 	v1 := s.engine.Group("/v1")
 	v1.Use(AuthMiddleware(s.accessManager))
+	v1.Use(s.proxyReadinessMiddleware())
 	v1.Use(s.requestBodyAuditMiddleware())
 	{
 		v1.GET("/models", s.unifiedModelsHandler(openaiHandlers, claudeCodeHandlers))
@@ -468,6 +507,7 @@ func (s *Server) setupRoutes() {
 	// Gemini compatible API routes
 	v1beta := s.engine.Group("/v1beta")
 	v1beta.Use(AuthMiddleware(s.accessManager))
+	v1beta.Use(s.proxyReadinessMiddleware())
 	v1beta.Use(s.requestBodyAuditMiddleware())
 	{
 		v1beta.GET("/models", geminiHandlers.GeminiModels)
@@ -488,6 +528,25 @@ func (s *Server) setupRoutes() {
 		})
 	})
 	// Management routes are registered lazily by registerManagementRoutes when a secret is configured.
+}
+
+func (s *Server) proxyReadinessMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		snapshot := s.startupState.Snapshot()
+		if snapshot.Ready {
+			c.Next()
+			return
+		}
+		c.Header("Retry-After", "2")
+		c.AbortWithStatusJSON(http.StatusServiceUnavailable, gin.H{
+			"error": gin.H{
+				"message": "service is initializing",
+				"type":    "service_unavailable",
+				"code":    "service_initializing",
+			},
+			"startup_phase": snapshot.Phase,
+		})
+	}
 }
 
 func (s *Server) requestBodyAuditMiddleware() gin.HandlerFunc {
@@ -534,7 +593,7 @@ func (s *Server) AttachWebsocketRoute(path string, handler http.Handler) {
 		c.Abort()
 	}
 
-	s.engine.GET(trimmed, conditionalAuth, finalHandler)
+	s.engine.GET(trimmed, conditionalAuth, s.proxyReadinessMiddleware(), finalHandler)
 }
 
 func (s *Server) currentManagementAccessPrefix() string {
@@ -615,8 +674,9 @@ func (s *Server) registerManagementRoutes() {
 	log.Infof("management routes registered at %s", apiPrefix)
 
 	mgmt := s.engine.Group(apiPrefix)
-	mgmt.Use(s.activeManagementPrefixMiddleware(prefix), s.managementAvailabilityMiddleware(), s.mgmt.Middleware(), s.mgmt.ConfigMutationMiddleware())
+	mgmt.Use(s.activeManagementPrefixMiddleware(prefix), s.managementAvailabilityMiddleware(), s.mgmt.Middleware(), s.startupManagementMiddleware(), s.mgmt.ConfigMutationMiddleware())
 	{
+		mgmt.GET("/startup/status", s.getStartupStatus)
 		mgmt.GET("/usage", s.mgmt.GetUsageStatistics)
 		mgmt.DELETE("/usage", s.mgmt.ClearUsageStatistics)
 		mgmt.GET("/usage/meta", s.mgmt.GetUsageMeta)
@@ -876,6 +936,52 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.GET("/get-auth-status", s.mgmt.GetAuthStatus)
 		mgmt.DELETE("/oauth-session", s.mgmt.CancelAuthSession)
 	}
+}
+
+func (s *Server) getStartupStatus(c *gin.Context) {
+	c.JSON(http.StatusOK, s.startupState.Snapshot())
+}
+
+func (s *Server) startupManagementMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		snapshot := s.startupState.Snapshot()
+		if snapshot.Ready || startupManagementPathAvailable(c.Request.URL.Path) {
+			c.Next()
+			return
+		}
+		c.Header("Retry-After", "2")
+		c.AbortWithStatusJSON(http.StatusServiceUnavailable, gin.H{
+			"error":         "service is initializing",
+			"code":          "service_initializing",
+			"startup_phase": snapshot.Phase,
+		})
+	}
+}
+
+func startupManagementPathAvailable(path string) bool {
+	for _, suffix := range []string{
+		"/startup/status",
+		"/config",
+		"/config.yaml",
+		"/system/metrics",
+		"/latest-version",
+		"/control-panel/update",
+		"/debug",
+		"/pprof/config",
+		"/pprof/enable",
+		"/pprof/addr",
+		"/logging-to-file",
+		"/logs-max-total-size-mb",
+		"/error-logs-max-files",
+		"/usage-statistics-enabled",
+		"/logs",
+		"/logs/stream",
+	} {
+		if strings.HasSuffix(path, suffix) {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Server) managementAvailabilityMiddleware() gin.HandlerFunc {

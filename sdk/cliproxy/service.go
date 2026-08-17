@@ -85,6 +85,9 @@ type Service struct {
 	// serverErr channel for server startup/shutdown errors.
 	serverErr chan error
 
+	// startupState gates proxy routes until essential routing initialization is complete.
+	startupState *api.StartupState
+
 	// watcher handles file system monitoring.
 	watcher *WatcherWrapper
 
@@ -4653,6 +4656,128 @@ func (s *Service) applyRuntimeConfigState(ctx context.Context, previousCfg, next
 	return nil
 }
 
+func (s *Service) prepareAPIServer() error {
+	if s.startupState == nil {
+		s.startupState = api.NewStartupState()
+	}
+	if s.authManager == nil {
+		s.authManager = newDefaultAuthManager()
+	}
+
+	// Management login must be available before the first ChatGPT Web
+	// credential exists, including on a fresh installation.
+	s.ensureChatGPTWebExecutor(false)
+
+	serverOpts := append([]api.ServerOption(nil), s.serverOptions...)
+	serverOpts = append(serverOpts, api.WithAuthStatusHook(s.handleManagementAuthStatusChange))
+	serverOpts = append(serverOpts, api.WithAuthDeleteHook(s.handleManagementAuthDelete))
+	serverOpts = append(serverOpts, api.WithChatGPTWebDependencyReconcileHook(s.reconcileChatGPTWebDependencies))
+	serverOpts = append(serverOpts, api.WithChatGPTWebDeadAuthDeleteCountProvider(s.chatGPTWebDeadAuthDeletedCount.Load))
+	serverOpts = append(serverOpts, api.WithProxyPoolManager(s.proxyPoolManager))
+	serverOpts = append(serverOpts, api.WithRuntimeConfigApply(s.ApplyRuntimeConfig))
+	serverOpts = append(serverOpts, api.WithStartupState(s.startupState))
+	s.server = api.NewServer(s.cfg, s.coreManager, s.accessManager, s.configPath, serverOpts...)
+
+	s.ensureWebsocketGateway()
+	if s.server != nil && s.wsGateway != nil {
+		s.server.AttachWebsocketRoute(s.wsGateway.Path(), s.wsGateway.Handler())
+		s.server.SetWebsocketAuthChangeHandler(func(oldEnabled, newEnabled bool) {
+			if oldEnabled == newEnabled {
+				return
+			}
+			if !oldEnabled && newEnabled {
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				if errStop := s.wsGateway.Stop(ctx); errStop != nil {
+					log.Warnf("failed to reset websocket connections after ws-auth change %t -> %t: %v", oldEnabled, newEnabled, errStop)
+					return
+				}
+					log.Debugf("ws-auth enabled; existing websocket sessions terminated to enforce authentication")
+					return
+				}
+				log.Debugf("ws-auth disabled; existing websocket sessions remain connected")
+		})
+	}
+
+	if errBeforeStart := s.applyBeforeStartConfig(); errBeforeStart != nil {
+		return errBeforeStart
+	}
+	s.configureModelRefreshCallback()
+	return nil
+}
+
+func (s *Service) configureModelRefreshCallback() {
+	registry.SetModelRefreshCallback(func(changedProviders []string) {
+		if s == nil || s.coreManager == nil || len(changedProviders) == 0 {
+			return
+		}
+
+		providerSet := make(map[string]bool, len(changedProviders))
+		for _, p := range changedProviders {
+			providerSet[strings.ToLower(strings.TrimSpace(p))] = true
+		}
+
+		auths := s.coreManager.AuthsForProviders(changedProviders...)
+		refreshed := 0
+		for _, item := range auths {
+			if item == nil || item.ID == "" {
+				continue
+			}
+			auth, ok := s.coreManager.GetByID(item.ID)
+			if !ok || auth == nil || auth.Disabled {
+				continue
+			}
+			provider := strings.ToLower(strings.TrimSpace(auth.Provider))
+			if !providerSet[provider] {
+				continue
+			}
+			if s.refreshModelRegistrationForAuth(auth) {
+				refreshed++
+			}
+		}
+
+		if refreshed > 0 {
+			log.Infof("re-registered models for %d auth(s) due to model catalog changes: %v", refreshed, changedProviders)
+		}
+	})
+}
+
+func (s *Service) startAPIListener() error {
+	if s.server == nil {
+		return errors.New("cliproxy: API server unavailable")
+	}
+	finishListener := s.startupState.BeginStage("listener_start")
+	s.serverErr = make(chan error, 1)
+	go func() {
+		if errStart := s.server.Start(); errStart != nil {
+			s.serverErr <- errStart
+		} else {
+			s.serverErr <- nil
+		}
+	}()
+
+	timer := time.NewTimer(100 * time.Millisecond)
+	defer timer.Stop()
+	select {
+	case errStart := <-s.serverErr:
+		finishListener(0, "listener_start_failed")
+		if errStart == nil {
+			return errors.New("cliproxy: API server stopped during startup")
+		}
+		return errStart
+	case <-timer.C:
+	}
+	finishListener(1, "")
+	s.startupState.SetPhase(api.StartupPhaseListenerReady)
+	fmt.Printf("API server started successfully on: %s:%d\n", s.cfg.Host, s.cfg.Port)
+
+	s.applyPprofConfig(s.cfg)
+	if s.hooks.OnAfterStart != nil {
+		s.hooks.OnAfterStart(s)
+	}
+	return nil
+}
+
 // Run starts the service and blocks until the context is cancelled or the server stops.
 // It initializes all components including authentication, file watching, HTTP server,
 // and starts processing requests. The method blocks until the context is cancelled.
@@ -4692,14 +4817,42 @@ func (s *Service) Run(ctx context.Context) error {
 	if errQuarantine := watcher.LoadAuthDeleteQuarantine(s.configPath, s.cfg.AuthDir); errQuarantine != nil {
 		return fmt.Errorf("cliproxy: load auth deletion quarantine: %w", errQuarantine)
 	}
+	if errPrepare := s.prepareAPIServer(); errPrepare != nil {
+		return errPrepare
+	}
+	if errStart := s.startAPIListener(); errStart != nil {
+		return errStart
+	}
+	defer func() {
+		if !s.startupState.Ready() {
+			s.startupState.MarkFailed()
+		}
+	}()
 
+	s.startupState.SetPhase(api.StartupPhaseAuthLoading)
+	finishAuthLoad := s.startupState.BeginStage("auth_store_load")
+	authLoadErrorCode := ""
 	if s.coreManager != nil {
 		if errLoad := s.coreManager.Load(ctx); errLoad != nil {
 			log.Warnf("failed to load auth store: %v", errLoad)
+			authLoadErrorCode = "auth_store_load_failed"
 		}
 	}
+	authCount := int64(0)
+	if s.coreManager != nil {
+		authCount = int64(s.coreManager.Count())
+	}
+	finishAuthLoad(authCount, authLoadErrorCode)
+
+	finishUsageRestore := s.startupState.BeginStage("usage_snapshot_restore")
 	s.restoreUsageStatistics()
+	usageCount := s.usageStatisticsStore().Meta().TotalRequests
+	finishUsageRestore(usageCount, "")
+
+	s.startupState.SetPhase(api.StartupPhaseRoutingBootstrap)
+	finishDependencies := s.startupState.BeginStage("credential_dependency_reconcile")
 	_, _ = s.reconcileChatGPTWebDependencies(ctx, "startup")
+	finishDependencies(authCount, "")
 	if s.reconcileUsageStatistics("startup") > 0 {
 		s.persistUsageStatistics("startup-reconcile")
 	}
@@ -4723,109 +4876,12 @@ func (s *Service) Run(ctx context.Context) error {
 	_ = apiKeyResult
 	// legacy clients removed; no caches to refresh
 
-	// Management login must be available before the first ChatGPT Web
-	// credential exists, including on a fresh installation.
-	s.ensureChatGPTWebExecutor(false)
-
-	// handlers no longer depend on legacy clients; pass nil slice initially
-	serverOpts := append([]api.ServerOption(nil), s.serverOptions...)
-	serverOpts = append(serverOpts, api.WithAuthStatusHook(s.handleManagementAuthStatusChange))
-	serverOpts = append(serverOpts, api.WithAuthDeleteHook(s.handleManagementAuthDelete))
-	serverOpts = append(serverOpts, api.WithChatGPTWebDependencyReconcileHook(s.reconcileChatGPTWebDependencies))
-	serverOpts = append(serverOpts, api.WithChatGPTWebDeadAuthDeleteCountProvider(s.chatGPTWebDeadAuthDeletedCount.Load))
-	serverOpts = append(serverOpts, api.WithProxyPoolManager(s.proxyPoolManager))
-	serverOpts = append(serverOpts, api.WithRuntimeConfigApply(s.ApplyRuntimeConfig))
-	s.server = api.NewServer(s.cfg, s.coreManager, s.accessManager, s.configPath, serverOpts...)
-
-	if s.authManager == nil {
-		s.authManager = newDefaultAuthManager()
-	}
+	finishRouting := s.startupState.BeginStage("routing_bootstrap")
 	s.startModelSyncLoop(ctx)
 	s.restoreChatGPTWebImportModelIntents(ctx)
 	s.installAuthMaintenanceHook(ctx)
 	if cfg, _ := s.snapshotAuthMaintenanceConfig(); cfg.Enable {
 		s.warnAuthMaintenanceConfig(cfg)
-	}
-
-	s.ensureWebsocketGateway()
-	if s.server != nil && s.wsGateway != nil {
-		s.server.AttachWebsocketRoute(s.wsGateway.Path(), s.wsGateway.Handler())
-		s.server.SetWebsocketAuthChangeHandler(func(oldEnabled, newEnabled bool) {
-			if oldEnabled == newEnabled {
-				return
-			}
-			if !oldEnabled && newEnabled {
-				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-				defer cancel()
-				if errStop := s.wsGateway.Stop(ctx); errStop != nil {
-					log.Warnf("failed to reset websocket connections after ws-auth change %t -> %t: %v", oldEnabled, newEnabled, errStop)
-					return
-				}
-				log.Debugf("ws-auth enabled; existing websocket sessions terminated to enforce authentication")
-				return
-			}
-			log.Debugf("ws-auth disabled; existing websocket sessions remain connected")
-		})
-	}
-
-	if errBeforeStart := s.applyBeforeStartConfig(); errBeforeStart != nil {
-		return errBeforeStart
-	}
-
-	// Register callback for startup and periodic model catalog refresh.
-	// When remote model definitions change, re-register models for affected providers.
-	// This intentionally rebuilds per-auth model availability from the latest catalog
-	// snapshot instead of preserving prior registry suppression state.
-	registry.SetModelRefreshCallback(func(changedProviders []string) {
-		if s == nil || s.coreManager == nil || len(changedProviders) == 0 {
-			return
-		}
-
-		providerSet := make(map[string]bool, len(changedProviders))
-		for _, p := range changedProviders {
-			providerSet[strings.ToLower(strings.TrimSpace(p))] = true
-		}
-
-		auths := s.coreManager.AuthsForProviders(changedProviders...)
-		refreshed := 0
-		for _, item := range auths {
-			if item == nil || item.ID == "" {
-				continue
-			}
-			auth, ok := s.coreManager.GetByID(item.ID)
-			if !ok || auth == nil || auth.Disabled {
-				continue
-			}
-			provider := strings.ToLower(strings.TrimSpace(auth.Provider))
-			if !providerSet[provider] {
-				continue
-			}
-			if s.refreshModelRegistrationForAuth(auth) {
-				refreshed++
-			}
-		}
-
-		if refreshed > 0 {
-			log.Infof("re-registered models for %d auth(s) due to model catalog changes: %v", refreshed, changedProviders)
-		}
-	})
-
-	s.serverErr = make(chan error, 1)
-	go func() {
-		if errStart := s.server.Start(); errStart != nil {
-			s.serverErr <- errStart
-		} else {
-			s.serverErr <- nil
-		}
-	}()
-
-	time.Sleep(100 * time.Millisecond)
-	fmt.Printf("API server started successfully on: %s:%d\n", s.cfg.Host, s.cfg.Port)
-
-	s.applyPprofConfig(s.cfg)
-
-	if s.hooks.OnAfterStart != nil {
-		s.hooks.OnAfterStart(s)
 	}
 
 	var watcherWrapper *WatcherWrapper
@@ -4855,6 +4911,8 @@ func (s *Service) Run(ctx context.Context) error {
 
 	watcherWrapper, err = s.watcherFactory(s.configPath, s.cfg.AuthDir, reloadCallback)
 	if err != nil {
+		finishRouting(authCount, "watcher_create_failed")
+		s.startupState.MarkFailed()
 		return fmt.Errorf("cliproxy: failed to create watcher: %w", err)
 	}
 	s.watcher = watcherWrapper
@@ -4877,9 +4935,13 @@ func (s *Service) Run(ctx context.Context) error {
 	watcherCtx, watcherCancel := context.WithCancel(context.Background())
 	s.watcherCancel = watcherCancel
 	if err = watcherWrapper.Start(watcherCtx); err != nil {
+		finishRouting(authCount, "watcher_start_failed")
+		s.startupState.MarkFailed()
 		return fmt.Errorf("cliproxy: failed to start watcher: %w", err)
 	}
 	if err = watcherWrapper.WaitForAuthUpdates(ctx); err != nil {
+		finishRouting(authCount, "watcher_initial_sync_failed")
+		s.startupState.MarkFailed()
 		return fmt.Errorf("cliproxy: wait for initial auth updates: %w", err)
 	}
 	log.Info("file watcher started for config and auth directory changes")
@@ -4897,6 +4959,8 @@ func (s *Service) Run(ctx context.Context) error {
 		s.coreManager.StartAutoRefresh(context.Background(), interval)
 		log.Infof("core auth auto-refresh started (interval=%s)", interval)
 	}
+	finishRouting(authCount, "")
+	s.startupState.MarkReady()
 
 	select {
 	case <-ctx.Done():

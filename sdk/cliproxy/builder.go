@@ -268,6 +268,7 @@ func (b *Builder) Build() (*Service, error) {
 		coreManager:      coreManager,
 		proxyPoolManager: proxyPoolManager,
 		serverOptions:    append([]api.ServerOption(nil), b.serverOptions...),
+		startupState:     api.NewStartupState(),
 	}
 	return service, nil
 }

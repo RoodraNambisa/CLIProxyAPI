@@ -28,6 +28,10 @@ func newTestServer(t *testing.T) *Server {
 }
 
 func newTestServerWithConfig(t *testing.T, mutate func(*proxyconfig.Config)) *Server {
+	return newTestServerWithConfigAndOptions(t, mutate)
+}
+
+func newTestServerWithConfigAndOptions(t *testing.T, mutate func(*proxyconfig.Config), opts ...ServerOption) *Server {
 	t.Helper()
 
 	gin.SetMode(gin.TestMode)
@@ -56,7 +60,7 @@ func newTestServerWithConfig(t *testing.T, mutate func(*proxyconfig.Config)) *Se
 	accessManager := sdkaccess.NewManager()
 
 	configPath := filepath.Join(tmpDir, "config.yaml")
-	server := NewServer(cfg, authManager, accessManager, configPath)
+	server := NewServer(cfg, authManager, accessManager, configPath, opts...)
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
@@ -126,6 +130,86 @@ func TestHealthz(t *testing.T) {
 			t.Fatalf("expected empty body for HEAD request, got %q", rr.Body.String())
 		}
 	})
+}
+
+func TestStartupReadinessGatesProxyAndCredentialManagement(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "secret")
+	startup := NewStartupState()
+	startup.SetPhase(StartupPhaseAuthLoading)
+	server := newTestServerWithConfigAndOptions(t, func(cfg *proxyconfig.Config) {
+		cfg.RemoteManagement.SecretKey = "secret"
+		cfg.RemoteManagement.AllowRemote = true
+	}, WithStartupState(startup))
+
+	readyRequest := httptest.NewRequest(http.MethodGet, "/readyz", nil)
+	readyRecorder := httptest.NewRecorder()
+	server.engine.ServeHTTP(readyRecorder, readyRequest)
+	if readyRecorder.Code != http.StatusServiceUnavailable || readyRecorder.Header().Get("Retry-After") != "2" {
+		t.Fatalf("initial readyz = %d retry=%q, want 503 retry=2: %s", readyRecorder.Code, readyRecorder.Header().Get("Retry-After"), readyRecorder.Body.String())
+	}
+	headReadyRequest := httptest.NewRequest(http.MethodHead, "/readyz", nil)
+	headReadyRecorder := httptest.NewRecorder()
+	server.engine.ServeHTTP(headReadyRecorder, headReadyRequest)
+	if headReadyRecorder.Code != http.StatusServiceUnavailable || headReadyRecorder.Body.Len() != 0 {
+		t.Fatalf("initial HEAD readyz = %d body=%q, want empty 503", headReadyRecorder.Code, headReadyRecorder.Body.String())
+	}
+
+	unauthorized := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	unauthorizedRecorder := httptest.NewRecorder()
+	server.engine.ServeHTTP(unauthorizedRecorder, unauthorized)
+	if unauthorizedRecorder.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthorized proxy status = %d, want 401: %s", unauthorizedRecorder.Code, unauthorizedRecorder.Body.String())
+	}
+
+	proxyRequest := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	proxyRequest.Header.Set("Authorization", "Bearer test-key")
+	proxyRecorder := httptest.NewRecorder()
+	server.engine.ServeHTTP(proxyRecorder, proxyRequest)
+	if proxyRecorder.Code != http.StatusServiceUnavailable || !strings.Contains(proxyRecorder.Body.String(), `"code":"service_initializing"`) {
+		t.Fatalf("initial proxy response = %d %s, want service_initializing 503", proxyRecorder.Code, proxyRecorder.Body.String())
+	}
+
+	for _, path := range []string{"/v0/management/config", "/v0/management/startup/status"} {
+		request := httptest.NewRequest(http.MethodGet, path, nil)
+		request.Header.Set("X-Management-Key", "secret")
+		recorder := httptest.NewRecorder()
+		server.engine.ServeHTTP(recorder, request)
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("initial management %s status = %d, want 200: %s", path, recorder.Code, recorder.Body.String())
+		}
+	}
+
+	authFilesRequest := httptest.NewRequest(http.MethodGet, "/v0/management/auth-files", nil)
+	authFilesRequest.Header.Set("X-Management-Key", "secret")
+	authFilesRecorder := httptest.NewRecorder()
+	server.engine.ServeHTTP(authFilesRecorder, authFilesRequest)
+	if authFilesRecorder.Code != http.StatusServiceUnavailable || !strings.Contains(authFilesRecorder.Body.String(), "service_initializing") {
+		t.Fatalf("initial auth-files response = %d %s, want 503", authFilesRecorder.Code, authFilesRecorder.Body.String())
+	}
+
+	startup.MarkReady()
+	readyRecorder = httptest.NewRecorder()
+	server.engine.ServeHTTP(readyRecorder, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+	if readyRecorder.Code != http.StatusOK {
+		t.Fatalf("readyz after MarkReady = %d, want 200: %s", readyRecorder.Code, readyRecorder.Body.String())
+	}
+
+	proxyRecorder = httptest.NewRecorder()
+	proxyRequest = httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	proxyRequest.Header.Set("Authorization", "Bearer test-key")
+	server.engine.ServeHTTP(proxyRecorder, proxyRequest)
+	if proxyRecorder.Code == http.StatusServiceUnavailable && strings.Contains(proxyRecorder.Body.String(), "service_initializing") {
+		t.Fatalf("proxy remained startup-gated after MarkReady: %s", proxyRecorder.Body.String())
+	}
+}
+
+func TestServerWithoutStartupStateRemainsReady(t *testing.T) {
+	server := newTestServer(t)
+	recorder := httptest.NewRecorder()
+	server.engine.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("default readyz = %d, want 200: %s", recorder.Code, recorder.Body.String())
+	}
 }
 
 func TestInteractionsRoutesAreRegistered(t *testing.T) {
