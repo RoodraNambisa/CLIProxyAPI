@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -504,6 +506,16 @@ func newLinkedChatGPTWebRuntime(
 		ChatGPTWebExecutor: NewChatGPTWebExecutor(&config.Config{}, manager),
 		unauthorizedOnce:   unauthorizedOnce,
 	}
+	probeServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != chatgptwebauth.AccountCheckPath {
+			http.NotFound(w, request)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"accounts":{"linked-account":{"account_id":"linked-account","plan_type":"plus"}}}`)
+	}))
+	t.Cleanup(probeServer.Close)
+	webExecutor.runtimeBaseURL = probeServer.URL
 	manager.RegisterExecutor(codexExecutor)
 	manager.RegisterExecutor(webExecutor)
 	t.Cleanup(func() {
@@ -1465,8 +1477,15 @@ func TestChatGPTWebExecutorManualAndBackgroundReloginSingleflight(t *testing.T) 
 	}
 	executor := NewChatGPTWebExecutor(&config.Config{ChatGPTWeb: config.ChatGPTWebConfig{AutoRelogin: true}}, manager)
 	executor.authService = fake
-	executor.TriggerBackgroundRelogin(expected)
-	<-started
+	if !executor.TriggerBackgroundRelogin(expected) {
+		t.Fatalf("TriggerBackgroundRelogin() rejected task: %+v", executor.BackgroundReloginSnapshot())
+	}
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		current, _ := manager.GetByID(expected.ID)
+		t.Fatalf("background re-login did not start: snapshot=%+v lifecycle=%q reason=%q", executor.BackgroundReloginSnapshot(), current.LifecycleState(), chatGPTWebLifecycleReason(current))
+	}
 
 	manualDone := make(chan error, 1)
 	go func() {
@@ -2804,6 +2823,11 @@ func TestChatGPTWebExecutorBackgroundReloginGlobalConcurrencyLimit(t *testing.T)
 		NewChatGPTWebExecutor(&config.Config{ChatGPTWeb: config.ChatGPTWebConfig{AutoRelogin: true}}, manager),
 		NewChatGPTWebExecutor(&config.Config{ChatGPTWeb: config.ChatGPTWebConfig{AutoRelogin: true}}, manager),
 	}
+	t.Cleanup(func() {
+		for _, executor := range executors {
+			_ = executor.Close()
+		}
+	})
 	for _, executor := range executors {
 		executor.authService = fake
 	}

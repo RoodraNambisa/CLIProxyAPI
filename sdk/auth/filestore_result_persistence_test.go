@@ -103,6 +103,21 @@ func (executor *fileTokenStorePersistenceExecutor) Refresh(_ context.Context, au
 	return updated, nil
 }
 
+func (*fileTokenStorePersistenceExecutor) ValidateUnauthorizedRequestRefresh(
+	_ context.Context,
+	failedAccessToken string,
+	_ *cliproxyauth.Auth,
+	refreshed *cliproxyauth.Auth,
+) (*cliproxyauth.Auth, error) {
+	if refreshed == nil {
+		return nil, errors.New("refreshed credential is nil")
+	}
+	if token := fileTokenStoreTestMetadataString(refreshed, "access_token"); token == "" || token == failedAccessToken {
+		return nil, errors.New("refreshed access token was not replaced")
+	}
+	return refreshed.Clone(), nil
+}
+
 func (*fileTokenStorePersistenceExecutor) HttpRequest(context.Context, *cliproxyauth.Auth, *http.Request) (*http.Response, error) {
 	return nil, errors.New("not implemented")
 }

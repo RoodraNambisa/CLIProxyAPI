@@ -71,6 +71,16 @@ type DurableRefreshExecutor interface {
 	RefreshToCompletion(ctx context.Context, auth *Auth) (*Auth, error)
 }
 
+// UnauthorizedRequestRefreshValidator validates a refreshed credential against
+// an authenticated provider endpoint before it can re-enter request routing.
+type UnauthorizedRequestRefreshValidator interface {
+	ValidateUnauthorizedRequestRefresh(ctx context.Context, failedAccessToken string, previous, refreshed *Auth) (*Auth, error)
+}
+
+type backgroundReloginTrigger interface {
+	TriggerBackgroundRelogin(expected *Auth) bool
+}
+
 // RequestAuthPreparer lets an executor fill required auth metadata immediately before execution.
 type RequestAuthPreparer interface {
 	ShouldPrepareRequestAuth(auth *Auth) bool
@@ -488,12 +498,13 @@ type Manager struct {
 	refreshExecutions  map[*authInstanceState]map[chan struct{}]struct{}
 	refreshCleanupWait time.Duration
 	// requestRefreshLocks serializes request-time provider refreshes by auth ID.
-	requestRefreshLocksMu sync.Mutex
-	requestRefreshLocks   sync.Map
-	requestRefreshFlights singleflight.Group
-	requestPrepareFlights singleflight.Group
-	chatGPTWebRefreshMu   sync.Mutex
-	chatGPTWebRefreshes   map[string]*chatGPTWebRequestRefreshFlight
+	requestRefreshLocksMu           sync.Mutex
+	requestRefreshLocks             sync.Map
+	requestRefreshFlights           singleflight.Group
+	requestPrepareFlights           singleflight.Group
+	chatGPTWebRefreshMu             sync.Mutex
+	chatGPTWebRefreshes             map[string]*chatGPTWebRequestRefreshFlight
+	chatGPTWebRequestRefreshMetrics chatGPTWebRequestRefreshMetrics
 
 	// persistLocks serializes store operations per auth ID.
 	persistBarrier              sync.RWMutex
@@ -2286,7 +2297,7 @@ func (m *Manager) wrapStreamResult(ctx, resultCtx context.Context, auth *Auth, a
 					chunk.Err = runtimeAuthInstanceRetiredError()
 				} else {
 					chunk.Err = m.reportProxyFailure(resultCtx, auth, chunk.Err)
-					if strings.EqualFold(strings.TrimSpace(provider), "chatgpt-web") && isUnauthorizedError(chunk.Err) {
+					if strings.EqualFold(strings.TrimSpace(provider), "chatgpt-web") && isChatGPTWebAuthenticationRecoveryError(chunk.Err) {
 						chunk.Err = m.wrapChatGPTWebUnauthorizedRequestError(resultCtx, auth, chunk.Err)
 						triggerChatGPTWebUnauthorizedRequestRefresh(chunk.Err)
 					}
@@ -8406,12 +8417,26 @@ func isUnauthorizedError(err error) bool {
 	return strings.Contains(raw, "status 401") || strings.Contains(raw, "401 unauthorized")
 }
 
+func isChatGPTWebAuthenticationRecoveryError(err error) bool {
+	if isUnauthorizedError(err) {
+		return true
+	}
+	if statusCodeFromError(err) != http.StatusForbidden {
+		return false
+	}
+	var lifecycleProvider interface {
+		ChatGPTWebLifecycleError() *chatgptwebauth.AuthError
+	}
+	return errors.As(err, &lifecycleProvider) && lifecycleProvider != nil && lifecycleProvider.ChatGPTWebLifecycleError() != nil
+}
+
 // chatGPTWebUnauthorizedRequestError keeps the original upstream error while
 // preventing the rejected request from waiting for credential recovery or
 // falling through to another credential.
 type chatGPTWebUnauthorizedRequestError struct {
 	cause        error
 	startRefresh func()
+	skipResult   bool
 	startOnce    sync.Once
 }
 
@@ -8443,9 +8468,15 @@ func (err *chatGPTWebUnauthorizedRequestError) StatusCode() int {
 	return statusCodeFromError(err.cause)
 }
 
-func (*chatGPTWebUnauthorizedRequestError) SkipAuthResult() bool { return true }
+func (err *chatGPTWebUnauthorizedRequestError) SkipAuthResult() bool {
+	return err != nil && err.skipResult
+}
 
 func wrapChatGPTWebUnauthorizedRequestError(err error, startRefresh func()) error {
+	return wrapChatGPTWebUnauthorizedRequestErrorWithResultPolicy(err, startRefresh, true)
+}
+
+func wrapChatGPTWebUnauthorizedRequestErrorWithResultPolicy(err error, startRefresh func(), skipResult bool) error {
 	if err == nil {
 		return nil
 	}
@@ -8453,7 +8484,7 @@ func wrapChatGPTWebUnauthorizedRequestError(err error, startRefresh func()) erro
 	if errors.As(err, &wrapped) {
 		return err
 	}
-	return &chatGPTWebUnauthorizedRequestError{cause: err, startRefresh: startRefresh}
+	return &chatGPTWebUnauthorizedRequestError{cause: err, startRefresh: startRefresh, skipResult: skipResult}
 }
 
 func isChatGPTWebUnauthorizedRequestError(err error) bool {
@@ -8470,14 +8501,66 @@ func triggerChatGPTWebUnauthorizedRequestRefresh(err error) {
 }
 
 func (m *Manager) wrapChatGPTWebUnauthorizedRequestError(ctx context.Context, auth *Auth, err error) error {
-	if auth == nil || !isNativeChatGPTWebCredentialAuth(auth) || !auth.LifecycleRefreshable() {
+	if isChatGPTWebUnauthorizedRequestError(err) {
+		return err
+	}
+	if m != nil && isUnauthorizedError(err) {
+		m.chatGPTWebRequestRefreshMetrics.received.Add(1)
+	}
+	var lifecycleProvider interface {
+		ChatGPTWebLifecycleError() *chatgptwebauth.AuthError
+	}
+	if errors.As(err, &lifecycleProvider) && lifecycleProvider != nil {
+		if lifecycle := lifecycleProvider.ChatGPTWebLifecycleError(); lifecycle != nil && lifecycle.State == chatgptwebauth.LifecycleDead {
+			reason := chatgptwebauth.SafeLifecycleReason(lifecycle.Code)
+			if reason != "account_deleted" && reason != "account_deactivated" {
+				if m != nil {
+					m.chatGPTWebRequestRefreshMetrics.noStart.Add(1)
+				}
+				return wrapChatGPTWebUnauthorizedRequestErrorWithResultPolicy(err, nil, false)
+			}
+			if m != nil {
+				m.chatGPTWebRequestRefreshMetrics.noStart.Add(1)
+				m.chatGPTWebRequestRefreshMetrics.deadConfirmed.Add(1)
+			}
+			if m == nil || auth == nil || !isNativeChatGPTWebCredentialAuth(auth) {
+				return wrapChatGPTWebUnauthorizedRequestError(err, nil)
+			}
+			terminalAuth := auth.Clone()
+			startTerminal := func() {
+				m.markChatGPTWebTerminalLifecycle(terminalAuth, lifecycle)
+			}
+			return wrapChatGPTWebUnauthorizedRequestError(err, startTerminal)
+		}
+	}
+	if auth == nil {
+		if m != nil {
+			m.chatGPTWebRequestRefreshMetrics.noStart.Add(1)
+		}
 		return wrapChatGPTWebUnauthorizedRequestError(err, nil)
+	}
+	if !isNativeChatGPTWebCredentialAuth(auth) || !auth.LifecycleRefreshable() {
+		if m != nil {
+			m.chatGPTWebRequestRefreshMetrics.noStart.Add(1)
+		}
+		// There is no safe refresh flight for this credential. Preserve the
+		// request-invalid contract while allowing the normal result mutation to
+		// persist a cooldown instead of leaving the credential ready.
+		return wrapChatGPTWebUnauthorizedRequestErrorWithResultPolicy(err, nil, false)
 	}
 	refreshAuth := auth.Clone()
 	failedAccessToken := authAccessToken(refreshAuth)
 	startRefresh := func() {
-		_, errStart := m.startChatGPTWebRequestRefreshFlight(ctx, refreshAuth.ID, failedAccessToken, refreshAuth)
+		refreshCtx := context.Background()
+		if ctx != nil {
+			refreshCtx = context.WithoutCancel(ctx)
+		}
+		_, errStart := m.startChatGPTWebRequestRefreshFlight(refreshCtx, refreshAuth.ID, failedAccessToken, refreshAuth, true)
 		if errStart != nil {
+			m.chatGPTWebRequestRefreshMetrics.noStart.Add(1)
+			if !errors.Is(errStart, context.Canceled) {
+				m.markChatGPTWebUnauthorizedRefreshFailure(refreshAuth, failedAccessToken)
+			}
 			log.Debugf("chatgpt-web credential background refresh could not start for %s: %v", refreshAuth.ID, errStart)
 		}
 	}
@@ -8504,14 +8587,14 @@ func authHasRefreshCredential(auth *Auth) bool {
 }
 
 func deferUnauthorizedStreamResult(auth *Auth, err error) bool {
-	if auth == nil || !isUnauthorizedError(err) {
+	if auth == nil {
 		return false
 	}
 	switch strings.ToLower(strings.TrimSpace(auth.Provider)) {
 	case "antigravity":
-		return authHasRefreshCredential(auth)
+		return isUnauthorizedError(err) && authHasRefreshCredential(auth)
 	case "chatgpt-web":
-		return isNativeChatGPTWebCredentialAuth(auth) && auth.LifecycleRefreshable()
+		return isChatGPTWebAuthenticationRecoveryError(err) && isNativeChatGPTWebCredentialAuth(auth) && auth.LifecycleRefreshable()
 	default:
 		return false
 	}
@@ -10719,18 +10802,22 @@ func (m *Manager) tryRefreshAfterUnauthorized(ctx context.Context, executor Prov
 		}
 		return resolved, true, nil
 	}
+	provider := strings.ToLower(strings.TrimSpace(auth.Provider))
+	if provider == "chatgpt-web" {
+		if !isChatGPTWebAuthenticationRecoveryError(execErr) {
+			return auth, false, nil
+		}
+		wrapped := m.wrapChatGPTWebUnauthorizedRequestError(ctx, auth, execErr)
+		return auth, isNativeChatGPTWebCredentialAuth(auth) && auth.LifecycleRefreshable(), wrapped
+	}
 	if !isUnauthorizedError(execErr) {
 		return auth, false, nil
 	}
-	provider := strings.ToLower(strings.TrimSpace(auth.Provider))
 	switch provider {
 	case "antigravity":
 		if !authHasRefreshCredential(auth) {
 			return auth, false, nil
 		}
-	case "chatgpt-web":
-		wrapped := m.wrapChatGPTWebUnauthorizedRequestError(ctx, auth, execErr)
-		return auth, isNativeChatGPTWebCredentialAuth(auth) && auth.LifecycleRefreshable(), wrapped
 	default:
 		return auth, false, nil
 	}
@@ -10877,7 +10964,17 @@ func (m *Manager) refreshProviderForRequest(ctx context.Context, id, failedAcces
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	flight, errStart := m.startChatGPTWebRequestRefreshFlight(ctx, id, failedAccessToken, expected)
+	return m.waitForChatGPTWebRequestRefresh(ctx, id, failedAccessToken, expected, true)
+}
+
+func (m *Manager) waitForChatGPTWebRequestRefresh(
+	ctx context.Context,
+	id string,
+	failedAccessToken string,
+	expected *Auth,
+	validateUnauthorized bool,
+) (*Auth, error) {
+	flight, errStart := m.startChatGPTWebRequestRefreshFlight(ctx, id, failedAccessToken, expected, validateUnauthorized)
 	if errStart != nil {
 		return nil, errStart
 	}
@@ -10896,7 +10993,13 @@ func (m *Manager) refreshProviderForRequest(ctx context.Context, id, failedAcces
 	}
 }
 
-func (m *Manager) startChatGPTWebRequestRefreshFlight(ctx context.Context, id, failedAccessToken string, expected *Auth) (*chatGPTWebRequestRefreshFlight, error) {
+func (m *Manager) startChatGPTWebRequestRefreshFlight(
+	ctx context.Context,
+	id string,
+	failedAccessToken string,
+	expected *Auth,
+	validateUnauthorized bool,
+) (*chatGPTWebRequestRefreshFlight, error) {
 	if m == nil {
 		return nil, errors.New("auth manager is nil")
 	}
@@ -10907,8 +11010,16 @@ func (m *Manager) startChatGPTWebRequestRefreshFlight(ctx context.Context, id, f
 		return nil, err
 	}
 	key := chatGPTWebRequestRefreshFlightKey(id, expected)
+	if validateUnauthorized {
+		key += "\x00unauthorized"
+	} else {
+		key += "\x00maintenance"
+	}
 	m.chatGPTWebRefreshMu.Lock()
 	if active := m.chatGPTWebRefreshes[key]; active != nil {
+		if validateUnauthorized {
+			m.chatGPTWebRequestRefreshMetrics.deduplicated.Add(1)
+		}
 		m.chatGPTWebRefreshMu.Unlock()
 		return active, nil
 	}
@@ -10922,6 +11033,9 @@ func (m *Manager) startChatGPTWebRequestRefreshFlight(ctx context.Context, id, f
 	}
 	flight := &chatGPTWebRequestRefreshFlight{done: make(chan struct{})}
 	m.chatGPTWebRefreshes[key] = flight
+	if validateUnauthorized {
+		m.chatGPTWebRequestRefreshMetrics.queued.Add(1)
+	}
 	scheduler := m.scheduler
 	if scheduler != nil {
 		scheduler.blockAuthRequestRefresh(id)
@@ -10932,9 +11046,16 @@ func (m *Manager) startChatGPTWebRequestRefreshFlight(ctx context.Context, id, f
 	// finish applying its result even when every initiating request stops waiting.
 	go func() {
 		defer releaseFlight()
+		if validateUnauthorized {
+			m.chatGPTWebRequestRefreshMetrics.queued.Add(-1)
+			m.chatGPTWebRequestRefreshMetrics.running.Add(1)
+			defer m.chatGPTWebRequestRefreshMetrics.running.Add(-1)
+		}
 		workerCtx, cancelWorker := context.WithTimeout(context.WithoutCancel(ctx), chatGPTWebRefreshFlightTimeout)
 		defer cancelWorker()
-		workerCtx = context.WithValue(workerCtx, chatGPTWebUnauthorizedRefreshContextKey{}, true)
+		if validateUnauthorized {
+			workerCtx = context.WithValue(workerCtx, chatGPTWebUnauthorizedRefreshContextKey{}, true)
+		}
 		refreshAttempted := false
 		reservation, errReserve := m.refreshPersistence.Load().acquireContext(
 			workerCtx,
@@ -10949,10 +11070,36 @@ func (m *Manager) startChatGPTWebRequestRefreshFlight(ctx context.Context, id, f
 			flight.result.Val, flight.result.Err = m.refreshProviderForRequestSynchronized(workerCtx, id, failedAccessToken, "chatgpt-web", expected, nil)
 			reservation.release()
 		}
-		if refreshAttempted && flight.result.Err != nil {
-			m.markChatGPTWebUnauthorizedRefreshFailure(expected, failedAccessToken)
-		} else if chatGPTWebRequestRefreshBackpressured(flight.result.Err) {
-			m.markChatGPTWebUnauthorizedRefreshBackpressure(expected, failedAccessToken, flight.result.Err)
+		if validateUnauthorized {
+			if flight.result.Err == nil {
+				m.chatGPTWebRequestRefreshMetrics.succeeded.Add(1)
+			} else {
+				m.chatGPTWebRequestRefreshMetrics.failed.Add(1)
+				m.chatGPTWebRequestRefreshMetrics.observeOutcome(chatGPTWebRequestRefreshOutcome(flight.result.Err))
+			}
+			backpressured := (!refreshAttempted && chatGPTWebRequestRefreshBackpressured(errReserve)) ||
+				chatGPTWebRequestRefreshPersistenceBackpressured(flight.result.Err)
+			if backpressured {
+				m.chatGPTWebRequestRefreshMetrics.backpressured.Add(1)
+				m.markChatGPTWebUnauthorizedRefreshBackpressure(expected, failedAccessToken, flight.result.Err)
+			} else if refreshAttempted && flight.result.Err != nil && !errors.Is(flight.result.Err, context.Canceled) {
+				m.markChatGPTWebUnauthorizedRefreshFailure(expected, failedAccessToken)
+			}
+		}
+		if validateUnauthorized {
+			if recovered, ok := flight.result.Val.(*Auth); ok && recovered != nil {
+				switch recovered.LifecycleState() {
+				case LifecycleStateDead:
+					m.chatGPTWebRequestRefreshMetrics.deadConfirmed.Add(1)
+				case LifecycleStateReloginPending:
+					m.mu.RLock()
+					executor := m.executors["chatgpt-web"]
+					m.mu.RUnlock()
+					if trigger, okTrigger := executor.(backgroundReloginTrigger); okTrigger {
+						trigger.TriggerBackgroundRelogin(recovered)
+					}
+				}
+			}
 		}
 
 		m.chatGPTWebRefreshMu.Lock()
@@ -10975,6 +11122,14 @@ func chatGPTWebRequestRefreshBackpressured(err error) bool {
 	}
 	if errors.Is(err, context.DeadlineExceeded) {
 		return true
+	}
+	var authErr *Error
+	return errors.As(err, &authErr) && authErr != nil && authErr.Code == "refresh_persist_backpressure"
+}
+
+func chatGPTWebRequestRefreshPersistenceBackpressured(err error) bool {
+	if err == nil {
+		return false
 	}
 	var authErr *Error
 	return errors.As(err, &authErr) && authErr != nil && authErr.Code == "refresh_persist_backpressure"
@@ -11054,6 +11209,59 @@ func (m *Manager) markChatGPTWebUnauthorizedRefreshFailure(expected *Auth, faile
 		HTTPStatus: http.StatusUnauthorized,
 	}
 	m.markExecutionResult(context.Background(), result)
+}
+
+func (m *Manager) markChatGPTWebTerminalLifecycle(expected *Auth, lifecycle *chatgptwebauth.AuthError) {
+	if m == nil || expected == nil || lifecycle == nil || lifecycle.State != chatgptwebauth.LifecycleDead {
+		return
+	}
+	reason := chatgptwebauth.SafeLifecycleReason(lifecycle.Code)
+	if reason != "account_deleted" && reason != "account_deactivated" {
+		return
+	}
+	now := time.Now()
+	status := lifecycle.StatusCode
+	if status == 0 {
+		status = lifecycle.Status
+	}
+	if status == 0 {
+		status = http.StatusForbidden
+	}
+	unlockResult := m.lockResultMutation(expected.ID)
+	var snapshot *Auth
+	m.mu.Lock()
+	current := m.auths[expected.ID]
+	if runtimeMetadataMutationMatchesCurrent(current, expected) && isNativeChatGPTWebCredentialAuth(current) {
+		if current.Metadata == nil {
+			current.Metadata = make(map[string]any)
+		}
+		current.Metadata["lifecycle_state"] = LifecycleStateDead
+		current.Metadata["lifecycle_reason"] = reason
+		current.Metadata["lifecycle_updated_at"] = now.UTC().Format(time.RFC3339)
+		current.LastError = &Error{
+			Code:       reason,
+			Message:    "upstream confirmed that the account is unavailable",
+			HTTPStatus: status,
+		}
+		current.NextRetryAfter = time.Time{}
+		current.NextRefreshAfter = time.Time{}
+		current.UpdatedAt = now
+		applyLifecycleRuntimeState(current)
+		m.updateManagementAuthCatalogLocked(current)
+		snapshot = current.Clone()
+	}
+	m.mu.Unlock()
+	if snapshot != nil && m.resultPersistence != nil && authSourceHash(snapshot) != "" && m.SupportsSourceConditionalSave() {
+		m.resultPersistence.enqueue(snapshot.ID)
+	}
+	unlockResult()
+	if snapshot == nil {
+		return
+	}
+	if m.scheduler != nil {
+		m.scheduler.upsertAuthState(snapshot)
+	}
+	m.Hook().OnAuthUpdated(context.Background(), snapshot.Clone())
 }
 
 func chatGPTWebRequestRefreshFlightKey(id string, expected *Auth) string {
@@ -11140,10 +11348,27 @@ func (m *Manager) refreshProviderForRequestSynchronized(ctx context.Context, id,
 			return current, errUnavailable
 		}
 	}
+	exec := m.executors[auth.Provider]
+	if exec == nil {
+		m.mu.Unlock()
+		return nil, fmt.Errorf("%s executor not found", provider)
+	}
+	auth.bindExecutorOwner(exec)
 	if failedAccessToken != "" {
 		if currentToken := authAccessToken(auth); currentToken != "" && currentToken != failedAccessToken {
 			current := auth.Clone()
+			requestUnauthorized, _ := ctx.Value(chatGPTWebUnauthorizedRefreshContextKey{}).(bool)
 			m.mu.Unlock()
+			if provider == "chatgpt-web" && requestUnauthorized {
+				return m.validateExistingChatGPTWebUnauthorizedRefresh(
+					ctx,
+					lock,
+					exec,
+					failedAccessToken,
+					expected,
+					current,
+				)
+			}
 			return current, nil
 		}
 	}
@@ -11153,12 +11378,6 @@ func (m *Manager) refreshProviderForRequestSynchronized(ctx context.Context, id,
 			return nil, sharedFailure
 		}
 	}
-	exec := m.executors[auth.Provider]
-	if exec == nil {
-		m.mu.Unlock()
-		return nil, fmt.Errorf("%s executor not found", provider)
-	}
-	auth.bindExecutorOwner(exec)
 	baseline := auth.Clone()
 	refreshInput := auth.Clone()
 	refreshCtx, releaseRefresh, active := m.beginRefreshExecutionLocked(
@@ -11180,6 +11399,19 @@ func (m *Manager) refreshProviderForRequestSynchronized(ctx context.Context, id,
 	refreshInput = resolvedRefreshInput
 
 	updated, errRefresh := refreshExecutorCredential(refreshCtx, exec, refreshInput)
+	if errRefresh == nil && provider == "chatgpt-web" {
+		if requestUnauthorized, _ := ctx.Value(chatGPTWebUnauthorizedRefreshContextKey{}).(bool); requestUnauthorized {
+			if validator, ok := exec.(UnauthorizedRequestRefreshValidator); ok {
+				updated, errRefresh = validator.ValidateUnauthorizedRequestRefresh(refreshCtx, failedAccessToken, baseline, updated)
+				if errRefresh == nil {
+					m.chatGPTWebRequestRefreshMetrics.observeOutcome(ChatGPTWebRequestRefreshOutcomeProbeSucceeded)
+				}
+			} else {
+				errRefresh = errors.New("chatgpt-web executor cannot validate a replacement access token")
+				updated = nil
+			}
+		}
+	}
 	if errRefresh != nil {
 		errRefresh = m.reportProxyFailure(refreshCtx, refreshInput, errRefresh)
 	}
@@ -11204,7 +11436,9 @@ func (m *Manager) refreshProviderForRequestSynchronized(ctx context.Context, id,
 			if updated.Runtime == nil {
 				updated.Runtime = baseline.Runtime
 			}
-			updated.NextRefreshAfter = time.Time{}
+			if chatGPTWebRequestRefreshOutcome(errRefresh) != ChatGPTWebRequestRefreshOutcomeProbeTransient {
+				updated.NextRefreshAfter = time.Time{}
+			}
 			updated.UpdatedAt = time.Now()
 			saved, errUpdate := m.applyRefreshedAuthDurably(ctx, provider, auth, baseline, updated, time.Time{})
 			if errUpdate != nil {
@@ -11270,6 +11504,76 @@ func (m *Manager) refreshProviderForRequestSynchronized(ctx context.Context, id,
 	}
 	lock.remember(provider, auth, saved)
 	return saved, nil
+}
+
+func (m *Manager) validateExistingChatGPTWebUnauthorizedRefresh(
+	ctx context.Context,
+	lock *authRequestRefreshLock,
+	exec ProviderExecutor,
+	failedAccessToken string,
+	previous *Auth,
+	current *Auth,
+) (*Auth, error) {
+	validator, ok := exec.(UnauthorizedRequestRefreshValidator)
+	if !ok || validator == nil {
+		return nil, errors.New("chatgpt-web executor cannot validate a replacement access token")
+	}
+	validated, errValidate := validator.ValidateUnauthorizedRequestRefresh(
+		ctx,
+		failedAccessToken,
+		previous,
+		current,
+	)
+	if errValidate == nil {
+		m.chatGPTWebRequestRefreshMetrics.observeOutcome(ChatGPTWebRequestRefreshOutcomeProbeSucceeded)
+	} else {
+		errValidate = m.reportProxyFailure(ctx, current, errValidate)
+	}
+	if validated == nil {
+		if errValidate != nil {
+			return nil, errValidate
+		}
+		return nil, errors.New("chatgpt-web credential validation returned no credential")
+	}
+	if errValidate != nil && !persistAuthUpdateForError(errValidate) {
+		return nil, errValidate
+	}
+	carryRuntimeProxy(current, validated)
+	if validated.Runtime == nil {
+		validated.Runtime = current.Runtime
+	}
+	validated.UpdatedAt = time.Now()
+	saved, errUpdate := m.applyRefreshedAuthDurably(
+		ctx,
+		"chatgpt-web",
+		current,
+		current,
+		validated,
+		time.Time{},
+	)
+	if errUpdate != nil {
+		return nil, errUpdate
+	}
+	if saved == nil {
+		return nil, runtimeAuthInstanceRetiredError()
+	}
+	if lock != nil {
+		lock.remember("chatgpt-web", previous, saved)
+		lock.remember("chatgpt-web", current, saved)
+	}
+	return saved, errValidate
+}
+
+type chatGPTWebRequestRefreshOutcomeProvider interface {
+	ChatGPTWebRequestRefreshOutcome() string
+}
+
+func chatGPTWebRequestRefreshOutcome(err error) string {
+	var provider chatGPTWebRequestRefreshOutcomeProvider
+	if errors.As(err, &provider) && provider != nil {
+		return strings.TrimSpace(provider.ChatGPTWebRequestRefreshOutcome())
+	}
+	return ""
 }
 
 func (m *Manager) acquireRequestRefreshLock(id string) *authRequestRefreshLock {
@@ -11627,12 +11931,12 @@ func (m *Manager) RefreshChatGPTWebForRequest(ctx context.Context, expected *Aut
 	if !strings.EqualFold(strings.TrimSpace(expected.Provider), "chatgpt-web") {
 		return nil, fmt.Errorf("credential provider %q is not chatgpt-web", expected.Provider)
 	}
-	return m.refreshProviderForRequest(
+	return m.waitForChatGPTWebRequestRefresh(
 		ctx,
 		expected.ID,
 		authAccessToken(expected),
-		"chatgpt-web",
 		expected,
+		false,
 	)
 }
 

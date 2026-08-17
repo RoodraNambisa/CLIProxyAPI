@@ -63,18 +63,51 @@ type AccountInfoRuntimeSnapshot struct {
 	LastSuccessAt              time.Time                        `json:"last_success_at,omitempty"`
 	FailureCounts              map[string]uint64                `json:"failure_counts"`
 	RecoveryStateCounts        map[string]int                   `json:"recovery_state_counts"`
+	RequestRefresh             RequestRefreshRuntimeSnapshot    `json:"request_refresh"`
 	BackgroundRelogin          BackgroundReloginRuntimeSnapshot `json:"background_relogin"`
+}
+
+// RequestRefreshRuntimeSnapshot reports request-triggered 401 recovery without
+// exposing credential identity or authentication material.
+type RequestRefreshRuntimeSnapshot struct {
+	Received          uint64 `json:"received"`
+	Queued            int64  `json:"queued"`
+	Running           int64  `json:"running"`
+	SchedulerBlocked  int    `json:"scheduler_blocked"`
+	Deduplicated      uint64 `json:"deduplicated"`
+	Succeeded         uint64 `json:"succeeded"`
+	Failed            uint64 `json:"failed"`
+	Backpressured     uint64 `json:"backpressured"`
+	NoStart           uint64 `json:"no_start"`
+	SameToken         uint64 `json:"same_token"`
+	ProbeSucceeded    uint64 `json:"probe_succeeded"`
+	ProbeUnauthorized uint64 `json:"probe_unauthorized"`
+	ProbeTransient    uint64 `json:"probe_transient"`
+	DeadConfirmed     uint64 `json:"dead_confirmed"`
 }
 
 // BackgroundReloginRuntimeSnapshot reports bounded queue activity without
 // exposing credential material.
 type BackgroundReloginRuntimeSnapshot struct {
-	Queued       int    `json:"queued"`
-	Delayed      int    `json:"delayed"`
-	Running      int    `json:"running"`
-	Promoted     uint64 `json:"promoted"`
-	Deduplicated uint64 `json:"deduplicated"`
-	Canceled     uint64 `json:"canceled"`
+	Workers                   int    `json:"workers"`
+	WorkerLimit               int    `json:"worker_limit"`
+	QueueLimit                int    `json:"queue_limit"`
+	Queued                    int    `json:"queued"`
+	Delayed                   int    `json:"delayed"`
+	Running                   int    `json:"running"`
+	Shrinking                 bool   `json:"shrinking"`
+	Promoted                  uint64 `json:"promoted"`
+	Deduplicated              uint64 `json:"deduplicated"`
+	Backpressured             uint64 `json:"backpressured"`
+	Succeeded                 uint64 `json:"succeeded"`
+	Failed                    uint64 `json:"failed"`
+	Exhausted                 uint64 `json:"exhausted"`
+	Dead                      uint64 `json:"dead"`
+	Canceled                  uint64 `json:"canceled"`
+	HistoricalEligible        int    `json:"historical_eligible"`
+	HistoricalBlockedByMethod int    `json:"historical_blocked_by_method"`
+	HistoricalCooling         int    `json:"historical_cooling"`
+	HistoricalExhausted       int    `json:"historical_exhausted"`
 }
 
 // AccountInfoAuthRuntimeState contains transient refresh state for one auth.

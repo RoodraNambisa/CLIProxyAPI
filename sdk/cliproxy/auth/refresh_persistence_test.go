@@ -496,6 +496,7 @@ func TestRequestRefreshBackpressurePrecedesTokenExchange(t *testing.T) {
 		installed.ID,
 		"stale",
 		installed,
+		true,
 	)
 	if errStart != nil {
 		t.Fatal(errStart)
@@ -542,7 +543,7 @@ func TestDifferentCredentialRefreshStormIsLifecycleBounded(t *testing.T) {
 			t.Fatal(errRegister)
 		}
 		flight, errStart := manager.startChatGPTWebRequestRefreshFlight(
-			t.Context(), authID, "stale", installed,
+			t.Context(), authID, "stale", installed, true,
 		)
 		if errStart != nil {
 			t.Fatal(errStart)

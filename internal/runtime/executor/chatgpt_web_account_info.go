@@ -4544,6 +4544,9 @@ func (e *ChatGPTWebExecutor) AccountInfoSnapshot() chatgptwebauth.AccountInfoRun
 	if e.accountInfo != nil {
 		snapshot = e.accountInfo.snapshot()
 	}
+	if e.manager != nil {
+		snapshot.RequestRefresh = e.manager.ChatGPTWebRequestRefreshSnapshot()
+	}
 	snapshot.BackgroundRelogin = e.BackgroundReloginSnapshot()
 	return snapshot
 }
@@ -5099,6 +5102,290 @@ func (e *ChatGPTWebExecutor) fetchChatGPTWebAccountInfo(ctx context.Context, aut
 		}
 	}
 	return
+}
+
+// ValidateUnauthorizedRequestRefresh proves that a replacement access token is
+// both new and accepted by the authenticated account endpoint before routing
+// can use it again.
+func (e *ChatGPTWebExecutor) ValidateUnauthorizedRequestRefresh(
+	ctx context.Context,
+	failedAccessToken string,
+	previous *cliproxyauth.Auth,
+	refreshed *cliproxyauth.Auth,
+) (*cliproxyauth.Auth, error) {
+	if e == nil || refreshed == nil {
+		return nil, newChatGPTWebCredentialUnavailableError(
+			newChatGPTWebUnauthorizedRefreshValidationError(
+				errors.New("chatgpt web request refresh returned no credential"),
+				cliproxyauth.ChatGPTWebRequestRefreshOutcomeProbeTransient,
+			),
+			false,
+		)
+	}
+	refreshedCredential, errCredential := chatgptwebauth.ParseCredential(refreshed.Metadata)
+	if errCredential != nil {
+		return nil, newChatGPTWebCredentialUnavailableError(
+			newChatGPTWebUnauthorizedRefreshValidationError(
+				errCredential,
+				cliproxyauth.ChatGPTWebRequestRefreshOutcomeProbeTransient,
+			),
+			false,
+		)
+	}
+	if strings.TrimSpace(failedAccessToken) != "" && refreshedCredential.AccessToken == failedAccessToken {
+		return e.chatGPTWebUnauthorizedRefreshLifecycleResult(
+			refreshed,
+			"session_expired",
+			cliproxyauth.ChatGPTWebRequestRefreshOutcomeSameToken,
+			http.StatusUnauthorized,
+		)
+	}
+
+	verified, errProbe := e.probeChatGPTWebUnauthorizedRefresh(ctx, previous, refreshed)
+	if errProbe == nil {
+		return verified, nil
+	}
+	if lifecycle := chatGPTWebLifecycleError(errProbe); lifecycle != nil && lifecycle.State == chatgptwebauth.LifecycleDead {
+		return e.chatGPTWebUnauthorizedRefreshLifecycleResult(
+			refreshed,
+			lifecycle.Code,
+			cliproxyauth.ChatGPTWebRequestRefreshOutcomeProbeUnauthorized,
+			statusCodeFromError(errProbe),
+		)
+	}
+	code, retryable := classifyChatGPTWebAccountInfoError(errProbe)
+	switch code {
+	case "unauthorized", "forbidden":
+		return e.chatGPTWebUnauthorizedRefreshLifecycleResult(
+			refreshed,
+			"session_expired",
+			cliproxyauth.ChatGPTWebRequestRefreshOutcomeProbeUnauthorized,
+			statusCodeFromError(errProbe),
+		)
+	case "account_unverified", "interaction_required", "identity_mismatch":
+		return e.chatGPTWebUnauthorizedRefreshInteractionResult(refreshed, code, errProbe)
+	case "cloudflare_challenge", "network_error", "upstream_unavailable", "rate_limited":
+		retryable = true
+	}
+	if retryable || errors.Is(errProbe, context.Canceled) || errors.Is(errProbe, context.DeadlineExceeded) {
+		return e.chatGPTWebUnauthorizedRefreshTransientResult(refreshed, errProbe)
+	}
+	return e.chatGPTWebUnauthorizedRefreshInteractionResult(refreshed, "interaction_required", errProbe)
+}
+
+func (e *ChatGPTWebExecutor) probeChatGPTWebUnauthorizedRefresh(
+	ctx context.Context,
+	previous *cliproxyauth.Auth,
+	refreshed *cliproxyauth.Auth,
+) (*cliproxyauth.Auth, error) {
+	resolved := refreshed
+	if e.manager != nil {
+		var errResolve error
+		resolved, errResolve = e.manager.ResolveProxyAuth(ctx, refreshed)
+		if errResolve != nil {
+			return nil, errResolve
+		}
+	}
+	client, credential, errClient := e.newRuntimeClientForAcquisition(resolved, true)
+	if errClient != nil {
+		return nil, errClient
+	}
+	defer client.CloseIdleConnections()
+	stopCancellation := context.AfterFunc(ctx, client.CloseActiveAcquisitionConnections)
+	defer stopCancellation()
+
+	path := chatgptwebauth.AccountCheckPath
+	queryPath := fmt.Sprintf("%s?timezone_offset_min=%d", path, e.chatGPTWebTimezone().OffsetMinutes)
+	headers := e.chatGPTWebHeaders(credential, path, map[string]string{
+		"chatgpt-account-id": strings.TrimSpace(credential.AccountID),
+	})
+	e.recordChatGPTWebRequest(ctx, credential, http.MethodGet, queryPath, headers, nil)
+	response, errRequest := client.DoSameOriginRedirectStream(
+		ctx,
+		http.MethodGet,
+		e.chatGPTWebBaseURL()+queryPath,
+		headers,
+		chatGPTWebAccountInfoMaxRedirects,
+	)
+	if errRequest != nil {
+		return nil, errRequest
+	}
+	payload, errRead := readChatGPTWebResponseBody(response, chatGPTWebAccountInfoMaxBodyBytes)
+	if errRead != nil {
+		return nil, errRead
+	}
+	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
+		return nil, newChatGPTWebStatusError(response.StatusCode, path, payload, response.Header)
+	}
+	preferredAccountID := strings.TrimSpace(credential.AccountID)
+	profile, errParse := chatgptwebauth.ParseAccountProfileForAccount(payload, preferredAccountID)
+	if errParse != nil {
+		return nil, errParse
+	}
+	if previous != nil {
+		previousCredential, errPrevious := chatgptwebauth.ParseCredential(previous.Metadata)
+		if errPrevious == nil {
+			previousAccountID := strings.TrimSpace(previousCredential.AccountID)
+			if previousAccountID != "" && profile.AccountID != previousAccountID {
+				return nil, chatgptwebauth.ErrAccountProfileIdentityMismatch
+			}
+		}
+	}
+	credential.AccountID = profile.AccountID
+	credential.Cookies = client.ExportCookies()
+	credential.Persona = client.Persona()
+	verified := applyChatGPTWebCredential(refreshed, credential)
+	if previous != nil && cliproxyauth.ChatGPTWebCredentialRefreshIdentityChanged(previous, verified) {
+		return nil, chatgptwebauth.ErrAccountProfileIdentityMismatch
+	}
+	return verified, nil
+}
+
+func chatGPTWebLifecycleError(err error) *chatgptwebauth.AuthError {
+	var provider interface {
+		ChatGPTWebLifecycleError() *chatgptwebauth.AuthError
+	}
+	if !errors.As(err, &provider) || provider == nil {
+		return nil
+	}
+	return provider.ChatGPTWebLifecycleError()
+}
+
+func (e *ChatGPTWebExecutor) chatGPTWebUnauthorizedRefreshLifecycleResult(
+	refreshed *cliproxyauth.Auth,
+	reason string,
+	outcome string,
+	status int,
+) (*cliproxyauth.Auth, error) {
+	credential, errCredential := chatgptwebauth.ParseCredential(refreshed.Metadata)
+	if errCredential != nil {
+		return nil, newChatGPTWebCredentialUnavailableError(
+			newChatGPTWebUnauthorizedRefreshValidationError(errCredential, outcome),
+			false,
+		)
+	}
+	state := cliproxyauth.LifecycleStateReauthRequired
+	if reason == "account_deleted" || reason == "account_deactivated" {
+		state = cliproxyauth.LifecycleStateDead
+	} else if e.AutoReloginEnabled() && e.credentialCanRelogin(credential) {
+		state = cliproxyauth.LifecycleStateReloginPending
+	}
+	updated := refreshed.Clone()
+	setChatGPTWebLifecycle(updated, state, reason, e.currentTime())
+	if status == 0 {
+		status = http.StatusUnauthorized
+	}
+	authError := &chatgptwebauth.AuthError{
+		Code:           chatgptwebauth.SafeLifecycleReason(reason),
+		State:          chatgptwebauth.LifecycleState(state),
+		LifecycleState: chatgptwebauth.LifecycleState(state),
+		Status:         status,
+		StatusCode:     status,
+		Terminal:       true,
+		Message:        "refreshed credential did not pass authenticated validation",
+	}
+	return updated, newChatGPTWebCredentialUnavailableError(
+		newChatGPTWebUnauthorizedRefreshValidationError(authError, outcome),
+		true,
+	)
+}
+
+func (e *ChatGPTWebExecutor) chatGPTWebUnauthorizedRefreshInteractionResult(
+	refreshed *cliproxyauth.Auth,
+	reason string,
+	cause error,
+) (*cliproxyauth.Auth, error) {
+	reason = chatgptwebauth.SafeLifecycleReason(reason)
+	if reason == "authentication_failed" || reason == "identity_mismatch" {
+		reason = "interaction_required"
+	}
+	updated := refreshed.Clone()
+	setChatGPTWebLifecycle(updated, cliproxyauth.LifecycleStateInteractionRequired, reason, e.currentTime())
+	authError := &chatgptwebauth.AuthError{
+		Code:           reason,
+		State:          chatgptwebauth.LifecycleInteractionRequired,
+		LifecycleState: chatgptwebauth.LifecycleInteractionRequired,
+		Status:         statusCodeFromError(cause),
+		StatusCode:     statusCodeFromError(cause),
+		Terminal:       true,
+		Message:        "refreshed credential identity requires manual review",
+		Cause:          cause,
+	}
+	return updated, newChatGPTWebCredentialUnavailableError(
+		newChatGPTWebUnauthorizedRefreshValidationError(
+			authError,
+			cliproxyauth.ChatGPTWebRequestRefreshOutcomeProbeUnauthorized,
+		),
+		true,
+	)
+}
+
+func (e *ChatGPTWebExecutor) chatGPTWebUnauthorizedRefreshTransientResult(
+	refreshed *cliproxyauth.Auth,
+	cause error,
+) (*cliproxyauth.Auth, error) {
+	if refreshed == nil {
+		return nil, newChatGPTWebCredentialUnavailableError(
+			newChatGPTWebUnauthorizedRefreshValidationError(
+				cause,
+				cliproxyauth.ChatGPTWebRequestRefreshOutcomeProbeTransient,
+			),
+			false,
+		)
+	}
+	now := e.currentTime()
+	retryAt := now.Add(time.Minute)
+	updated := refreshed.Clone()
+	updated.Status = cliproxyauth.StatusError
+	updated.StatusMessage = "authenticated credential validation is temporarily unavailable"
+	updated.Unavailable = true
+	updated.CooldownScope = "auth"
+	updated.NextRetryAfter = retryAt
+	updated.NextRefreshAfter = retryAt
+	updated.UpdatedAt = now
+	updated.LastError = &cliproxyauth.Error{
+		Code:       "unauthorized_refresh_probe_transient",
+		Message:    "authenticated credential validation is temporarily unavailable",
+		Retryable:  true,
+		HTTPStatus: http.StatusServiceUnavailable,
+	}
+	return updated, newChatGPTWebCredentialUnavailableError(
+		newChatGPTWebUnauthorizedRefreshValidationError(
+			cause,
+			cliproxyauth.ChatGPTWebRequestRefreshOutcomeProbeTransient,
+		),
+		true,
+	)
+}
+
+type chatGPTWebUnauthorizedRefreshValidationError struct {
+	cause   error
+	outcome string
+}
+
+func newChatGPTWebUnauthorizedRefreshValidationError(cause error, outcome string) *chatGPTWebUnauthorizedRefreshValidationError {
+	return &chatGPTWebUnauthorizedRefreshValidationError{cause: cause, outcome: outcome}
+}
+
+func (err *chatGPTWebUnauthorizedRefreshValidationError) Error() string {
+	if err == nil || err.cause == nil {
+		return "chatgpt web request refresh validation failed"
+	}
+	return err.cause.Error()
+}
+
+func (err *chatGPTWebUnauthorizedRefreshValidationError) Unwrap() error {
+	if err == nil {
+		return nil
+	}
+	return err.cause
+}
+
+func (err *chatGPTWebUnauthorizedRefreshValidationError) ChatGPTWebRequestRefreshOutcome() string {
+	if err == nil {
+		return ""
+	}
+	return err.outcome
 }
 
 func (e *ChatGPTWebExecutor) markAccountInfoAuthenticationFailure(

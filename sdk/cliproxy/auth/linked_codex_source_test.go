@@ -37,6 +37,10 @@ func (executor *linkedCodexRequestPrepareExecutor) Refresh(ctx context.Context, 
 	return executor.refreshLinkedSource(ctx, auth)
 }
 
+func (*linkedCodexRequestPrepareExecutor) ValidateUnauthorizedRequestRefresh(_ context.Context, _ string, _ *Auth, refreshed *Auth) (*Auth, error) {
+	return refreshed, nil
+}
+
 func (executor *linkedCodexRequestPrepareExecutor) refreshLinkedSource(ctx context.Context, auth *Auth) (*Auth, error) {
 	result, errRefresh := executor.manager.RefreshLinkedCodexSource(
 		ctx,

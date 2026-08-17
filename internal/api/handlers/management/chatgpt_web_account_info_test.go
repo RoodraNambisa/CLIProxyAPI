@@ -178,6 +178,14 @@ func TestGetChatGPTWebAccountInfoReturnsDefaultsAndRuntime(t *testing.T) {
 	}}, nil, nil)
 	executor := &accountInfoControllerTestExecutor{snapshot: chatgptwebauth.AccountInfoRuntimeSnapshot{
 		Busy: 2, Queued: 3, Scheduled: 4, Inflight: 1, RefreshCount: 7,
+		RequestRefresh: chatgptwebauth.RequestRefreshRuntimeSnapshot{
+			Received: 11, Running: 2, SchedulerBlocked: 2, SameToken: 3, ProbeSucceeded: 4,
+			DeadConfirmed: 5,
+		},
+		BackgroundRelogin: chatgptwebauth.BackgroundReloginRuntimeSnapshot{
+			Workers: 4, WorkerLimit: 4, QueueLimit: 4096, Queued: 5, Backpressured: 6,
+			HistoricalEligible: 7, HistoricalBlockedByMethod: 8, HistoricalExhausted: 9,
+		},
 	}}
 	manager.RegisterExecutor(executor)
 	handler := &Handler{cfg: &config.Config{}, authManager: manager}
@@ -203,6 +211,18 @@ func TestGetChatGPTWebAccountInfoReturnsDefaultsAndRuntime(t *testing.T) {
 		response.Runtime.MaxAutomaticAttempts != 4 || response.Runtime.FailureCounts == nil ||
 		response.Runtime.RecoveryStateCounts == nil {
 		t.Fatalf("runtime = %+v", response.Runtime)
+	}
+	if response.Runtime.RequestRefresh.Received != 11 || response.Runtime.RequestRefresh.Running != 2 ||
+		response.Runtime.RequestRefresh.SchedulerBlocked != 2 || response.Runtime.RequestRefresh.SameToken != 3 ||
+		response.Runtime.RequestRefresh.ProbeSucceeded != 4 || response.Runtime.RequestRefresh.DeadConfirmed != 5 {
+		t.Fatalf("request refresh runtime = %+v", response.Runtime.RequestRefresh)
+	}
+	if response.Runtime.BackgroundRelogin.WorkerLimit != 4 || response.Runtime.BackgroundRelogin.QueueLimit != 4096 ||
+		response.Runtime.BackgroundRelogin.Queued != 5 || response.Runtime.BackgroundRelogin.Backpressured != 6 ||
+		response.Runtime.BackgroundRelogin.HistoricalEligible != 7 ||
+		response.Runtime.BackgroundRelogin.HistoricalBlockedByMethod != 8 ||
+		response.Runtime.BackgroundRelogin.HistoricalExhausted != 9 {
+		t.Fatalf("background re-login runtime = %+v", response.Runtime.BackgroundRelogin)
 	}
 	if !response.RefreshPersistence.Enabled || response.RefreshPersistence.Concurrency != 1 ||
 		response.RefreshPersistence.TransactionConcurrency != 1 ||

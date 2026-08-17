@@ -56,6 +56,10 @@ func (executor *chatGPTWebCatalogTestExecutor) Refresh(_ context.Context, auth *
 	return auth, nil
 }
 
+func (*chatGPTWebCatalogTestExecutor) ValidateUnauthorizedRequestRefresh(_ context.Context, _ string, _ *coreauth.Auth, refreshed *coreauth.Auth) (*coreauth.Auth, error) {
+	return refreshed, nil
+}
+
 func (*chatGPTWebCatalogTestExecutor) CountTokens(context.Context, *coreauth.Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
 	return cliproxyexecutor.Response{}, nil
 }

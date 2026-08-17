@@ -35,6 +35,17 @@ type PayloadRule = internalconfig.PayloadRule
 type PayloadFilterRule = internalconfig.PayloadFilterRule
 type PayloadModelRule = internalconfig.PayloadModelRule
 
+const (
+	DefaultChatGPTWebAutoReloginMaxRetries    = internalconfig.DefaultChatGPTWebAutoReloginMaxRetries
+	DefaultChatGPTWebAutoReloginJitterPercent = internalconfig.DefaultChatGPTWebAutoReloginJitterPercent
+	DefaultChatGPTWebAutoReloginWorkers       = internalconfig.DefaultChatGPTWebAutoReloginWorkers
+	DefaultChatGPTWebAutoReloginQueueSize     = internalconfig.DefaultChatGPTWebAutoReloginQueueSize
+	MaxChatGPTWebAutoReloginRetries           = internalconfig.MaxChatGPTWebAutoReloginRetries
+	MaxChatGPTWebAutoReloginJitterPercent     = internalconfig.MaxChatGPTWebAutoReloginJitterPercent
+	MaxChatGPTWebAutoReloginWorkers           = internalconfig.MaxChatGPTWebAutoReloginWorkers
+	MaxChatGPTWebAutoReloginQueueSize         = internalconfig.MaxChatGPTWebAutoReloginQueueSize
+)
+
 type GeminiKey = internalconfig.GeminiKey
 type CodexKey = internalconfig.CodexKey
 type CodexCustomModel = internalconfig.CodexCustomModel

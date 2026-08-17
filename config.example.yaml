@@ -104,6 +104,11 @@ chatgpt-web:
   auto-relogin-max-retries: 3
   # Apply symmetric jitter to retry delays to avoid synchronized login bursts.
   auto-relogin-jitter-percent: 20
+  # Concurrent background automatic re-login workers. Reducing this value does
+  # not cancel attempts that are already running.
+  auto-relogin-workers: 4
+  # Bound queued and running credential generations retained by automatic re-login.
+  auto-relogin-queue-size: 4096
   # Browser timezone shared by text, search, image, and account-info requests.
   timezone: "Asia/Shanghai"
   # Omit this field to derive the current offset, including DST, from timezone.

@@ -6,6 +6,7 @@ import (
 	"runtime"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -231,5 +232,153 @@ func TestChatGPTWebReloginQueueRemovalUsesAuthIndex(t *testing.T) {
 	}
 	if got := len(queue.byAuthID); got != 9_999 {
 		t.Fatalf("auth index entries = %d, want 9999", got)
+	}
+}
+
+func TestChatGPTWebReloginQueueBackpressureIsBoundedAndPersistent(t *testing.T) {
+	manager := cliproxyauth.NewManager(nil, nil, nil)
+	workers := 1
+	queueSize := 1
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	t.Cleanup(func() { releaseOnce.Do(func() { close(release) }) })
+	fake := &fakeChatGPTWebAuthService{loginFn: func(ctx context.Context, input chatgptwebauth.LoginInput) (*chatgptwebauth.Credential, error) {
+		select {
+		case <-release:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+		credential := *input.Credential
+		credential.AccessToken = "bounded-queue-token"
+		credential.LifecycleState = chatgptwebauth.LifecycleActive
+		return &credential, nil
+	}}
+	executor := NewChatGPTWebExecutor(&config.Config{ChatGPTWeb: config.ChatGPTWebConfig{
+		AutoRelogin:          true,
+		AutoReloginWorkers:   &workers,
+		AutoReloginQueueSize: &queueSize,
+	}}, manager)
+	executor.authService = fake
+	t.Cleanup(func() { _ = executor.Close() })
+
+	first := registerChatGPTWebPendingAuth(t, manager, "bounded-queue-first")
+	second := registerChatGPTWebPendingAuth(t, manager, "bounded-queue-second")
+	if !executor.TriggerBackgroundRelogin(first) {
+		t.Fatal("first task was rejected")
+	}
+	waitForChatGPTWebCondition(t, time.Second, func() bool { return fake.loginCalls.Load() == 1 })
+	if executor.TriggerBackgroundRelogin(second) {
+		t.Fatal("second task was accepted beyond the configured queue capacity")
+	}
+	current, ok := manager.GetByID(second.ID)
+	if !ok || current == nil || current.LifecycleState() != cliproxyauth.LifecycleStateReloginPending || chatGPTWebLifecycleReason(current) != "auto_relogin_backpressure" {
+		t.Fatalf("backpressured credential = %#v; snapshot=%+v expected_key=%q current_key=%q", current, executor.BackgroundReloginSnapshot(), chatGPTWebReloginGenerationKey(second), chatGPTWebReloginGenerationKey(current))
+	}
+	snapshot := executor.BackgroundReloginSnapshot()
+	if snapshot.QueueLimit != 1 || snapshot.Backpressured != 1 || snapshot.Running != 1 {
+		t.Fatalf("bounded queue snapshot = %+v", snapshot)
+	}
+
+	releaseOnce.Do(func() { close(release) })
+	waitForChatGPTWebCondition(t, time.Second, func() bool { return fake.loginCalls.Load() == 2 })
+}
+
+func TestChatGPTWebReloginQueueHotResizeGrowsAndShrinksWithoutDroppingActiveTasks(t *testing.T) {
+	manager := cliproxyauth.NewManager(nil, nil, nil)
+	workers := 1
+	queueSize := 4
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	t.Cleanup(func() { releaseOnce.Do(func() { close(release) }) })
+	var active atomic.Int32
+	var maximum atomic.Int32
+	fake := &fakeChatGPTWebAuthService{loginFn: func(ctx context.Context, input chatgptwebauth.LoginInput) (*chatgptwebauth.Credential, error) {
+		current := active.Add(1)
+		defer active.Add(-1)
+		for previous := maximum.Load(); current > previous && !maximum.CompareAndSwap(previous, current); previous = maximum.Load() {
+		}
+		select {
+		case <-release:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+		credential := *input.Credential
+		credential.AccessToken = "resized-queue-token"
+		credential.LifecycleState = chatgptwebauth.LifecycleActive
+		return &credential, nil
+	}}
+	cfg := &config.Config{ChatGPTWeb: config.ChatGPTWebConfig{
+		AutoRelogin:          true,
+		AutoReloginWorkers:   &workers,
+		AutoReloginQueueSize: &queueSize,
+	}}
+	executor := NewChatGPTWebExecutor(cfg, manager)
+	executor.authService = fake
+	t.Cleanup(func() { _ = executor.Close() })
+
+	for index := range 3 {
+		auth := registerChatGPTWebPendingAuth(t, manager, "resize-"+strconv.Itoa(index))
+		if !executor.TriggerBackgroundRelogin(auth) {
+			t.Fatalf("task %d was rejected", index)
+		}
+	}
+	waitForChatGPTWebCondition(t, time.Second, func() bool { return fake.loginCalls.Load() == 1 })
+
+	workers = 3
+	executor.UpdateConfig(&config.Config{ChatGPTWeb: config.ChatGPTWebConfig{
+		AutoRelogin:          true,
+		AutoReloginWorkers:   &workers,
+		AutoReloginQueueSize: &queueSize,
+	}})
+	waitForChatGPTWebCondition(t, time.Second, func() bool { return fake.loginCalls.Load() == 3 })
+
+	workers = 1
+	executor.UpdateConfig(&config.Config{ChatGPTWeb: config.ChatGPTWebConfig{
+		AutoRelogin:          true,
+		AutoReloginWorkers:   &workers,
+		AutoReloginQueueSize: &queueSize,
+	}})
+	waitForChatGPTWebCondition(t, time.Second, func() bool {
+		snapshot := executor.BackgroundReloginSnapshot()
+		return snapshot.WorkerLimit == 1 && snapshot.Shrinking && snapshot.Running == 3
+	})
+	releaseOnce.Do(func() { close(release) })
+	waitForChatGPTWebCondition(t, time.Second, func() bool {
+		snapshot := executor.BackgroundReloginSnapshot()
+		return snapshot.Workers == 1 && snapshot.Running == 0 && snapshot.Queued == 0
+	})
+	if got := maximum.Load(); got != 3 {
+		t.Fatalf("maximum concurrency = %d, want 3 after hot growth", got)
+	}
+}
+
+func TestChatGPTWebReloginQueueBackpressureRefillsOnlyAtLowWater(t *testing.T) {
+	first := &chatGPTWebReloginQueueTask{authID: "first", generationKey: "first"}
+	second := &chatGPTWebReloginQueueTask{authID: "second", generationKey: "second"}
+	queue := &chatGPTWebReloginQueue{
+		executor:   &ChatGPTWebExecutor{},
+		wake:       make(chan struct{}, 1),
+		enabled:    true,
+		queueLimit: 4,
+		tasks: map[string]*chatGPTWebReloginQueueTask{
+			"third":  {authID: "third", generationKey: "third"},
+			"fourth": {authID: "fourth", generationKey: "fourth"},
+		},
+		active: map[string]*chatGPTWebReloginQueueActive{
+			first.generationKey:  {task: first},
+			second.generationKey: {task: second},
+		},
+		byAuthID: make(map[string]map[string]struct{}),
+	}
+	queue.reconcileNeeded.Store(true)
+
+	queue.finish(first, false)
+	if !queue.reconcileNeeded.Load() {
+		t.Fatal("backpressure reconciliation ran before the queue reached its low-water mark")
+	}
+
+	queue.finish(second, false)
+	if queue.reconcileNeeded.Load() {
+		t.Fatal("backpressure reconciliation was not released at the low-water mark")
 	}
 }

@@ -54,12 +54,14 @@ func NewChatGPTWebLoginCoordinator() *ChatGPTWebLoginCoordinator {
 }
 
 const (
-	chatGPTWebBackgroundReloginConcurrency = 4
+	chatGPTWebBackgroundReloginConcurrency = config.DefaultChatGPTWebAutoReloginWorkers
 	chatGPTWebBackgroundReloginLogInterval = 3
 	chatGPTWebBackgroundReloginMaxBackoff  = 5 * time.Minute
 )
 
 var chatGPTWebBackgroundReloginSlots = make(chan struct{}, chatGPTWebBackgroundReloginConcurrency)
+
+type chatGPTWebReloginQueueWorkerContextKey struct{}
 
 var (
 	errChatGPTWebReloginOwnershipChanged = errors.New("chatgpt web re-login ownership changed")
@@ -103,6 +105,9 @@ type ChatGPTWebExecutor struct {
 	sentinelSDKFetcherFactory func(*chatgptwebauth.Client, *chatgptwebauth.Credential) chatgptwebauth.SentinelSDKFetcher
 	backgroundMu              sync.Mutex
 	backgroundQueue           *chatGPTWebReloginQueue
+	reloginReconcilePending   bool
+	reloginReconcileRequested bool
+	reloginReconcileFull      bool
 	lifecycleCtx              context.Context
 	lifecycleCancel           context.CancelFunc
 	closed                    bool
@@ -145,7 +150,11 @@ func NewChatGPTWebExecutorWithLoginCoordinator(cfg *config.Config, manager *clip
 		lifecycleCtx:       lifecycleCtx,
 		lifecycleCancel:    lifecycleCancel,
 	}
-	executor.backgroundQueue = newChatGPTWebReloginQueue(executor, lifecycleCtx, chatGPTWebBackgroundReloginConcurrency)
+	reloginPolicy := config.ChatGPTWebConfig{}.ResolvedAutoRelogin()
+	if cfg != nil {
+		reloginPolicy = cfg.ChatGPTWeb.ResolvedAutoRelogin()
+	}
+	executor.backgroundQueue = newChatGPTWebReloginQueue(executor, lifecycleCtx, reloginPolicy.Workers, reloginPolicy.QueueSize)
 	executor.UpdateConfig(cfg)
 	executor.accountInfo = newChatGPTWebAccountInfoRuntime(executor, executor.configSnapshot())
 	executor.accountInfo.start()
@@ -231,7 +240,8 @@ func (e *ChatGPTWebExecutor) UpdateConfig(cfg *config.Config) {
 		e.cfg.Store(nil)
 		configureChatGPTWebImageAdmissions(config.ChatGPTWebImageConfig{}.Resolved())
 		if e.backgroundQueue != nil {
-			e.backgroundQueue.setEnabled(false)
+			policy := config.ChatGPTWebConfig{}.ResolvedAutoRelogin()
+			e.backgroundQueue.setConfig(false, policy.Workers, policy.QueueSize)
 		}
 		if e.sentinelRuntime != nil {
 			e.sentinelRuntime.UpdateConfig(chatgptwebauth.SentinelRuntimeConfig{})
@@ -253,7 +263,14 @@ func (e *ChatGPTWebExecutor) UpdateConfig(cfg *config.Config) {
 	e.cfg.Store(snapshot)
 	configureChatGPTWebImageAdmissions(snapshot.Images.ChatGPTWeb.Resolved())
 	if e.backgroundQueue != nil {
-		e.backgroundQueue.setEnabled(snapshot.ChatGPTWeb.AutoRelogin)
+		policy := snapshot.ChatGPTWeb.ResolvedAutoRelogin()
+		e.backgroundQueue.setConfig(snapshot.ChatGPTWeb.AutoRelogin, policy.Workers, policy.QueueSize)
+		// Constructor initialization runs before account-info and service hooks are
+		// ready. Startup reconciliation is scheduled explicitly after bootstrap;
+		// subsequent hot updates can reconcile immediately.
+		if snapshot.ChatGPTWeb.AutoRelogin && e.accountInfo != nil {
+			e.scheduleBackgroundReloginReconcile(false)
+		}
 	}
 	if e.usageCache != nil {
 		usageCache := snapshot.ChatGPTWeb.UsageCache.Resolved()
@@ -843,17 +860,34 @@ func (e *ChatGPTWebExecutor) credentialCanRelogin(credential *chatgptwebauth.Cre
 
 // TriggerBackgroundRelogin enqueues a bounded re-login task for the current
 // auth generation. Duplicate triggers share one lightweight queue entry.
-func (e *ChatGPTWebExecutor) TriggerBackgroundRelogin(expected *cliproxyauth.Auth) {
-	if e == nil || e.manager == nil || !e.AutoReloginEnabled() || expected == nil || expected.LifecycleState() != cliproxyauth.LifecycleStateReloginPending {
-		return
+func (e *ChatGPTWebExecutor) TriggerBackgroundRelogin(expected *cliproxyauth.Auth) bool {
+	result := e.triggerBackgroundRelogin(expected)
+	return result == chatGPTWebReloginEnqueueAccepted || result == chatGPTWebReloginEnqueueDeduplicated
+}
+
+func (e *ChatGPTWebExecutor) triggerBackgroundRelogin(expected *cliproxyauth.Auth) chatGPTWebReloginEnqueueResult {
+	if e == nil || e.manager == nil || !e.AutoReloginEnabled() || expected == nil {
+		return chatGPTWebReloginEnqueueRejected
 	}
+	current, ok := e.manager.GetByID(expected.ID)
+	if !ok || current == nil || current.LifecycleState() != cliproxyauth.LifecycleStateReloginPending ||
+		(expected.RuntimeInstanceID() != "" && current.RuntimeInstanceID() != expected.RuntimeInstanceID()) {
+		return chatGPTWebReloginEnqueueRejected
+	}
+	expected = current
 	credential, errCredential := chatgptwebauth.ParseCredential(expected.Metadata)
 	if errCredential != nil || !e.credentialCanRelogin(credential) {
-		return
+		return chatGPTWebReloginEnqueueRejected
 	}
 	if e.backgroundQueue != nil {
-		e.backgroundQueue.enqueueAuth(expected)
+		result := e.backgroundQueue.enqueueAuth(expected)
+		switch result {
+		case chatGPTWebReloginEnqueueBackpressured:
+			e.markBackgroundReloginBackpressure(expected)
+		}
+		return result
 	}
+	return chatGPTWebReloginEnqueueRejected
 }
 
 // BackgroundReloginSnapshot returns bounded queue activity without exposing
@@ -863,6 +897,199 @@ func (e *ChatGPTWebExecutor) BackgroundReloginSnapshot() chatgptwebauth.Backgrou
 		return chatgptwebauth.BackgroundReloginRuntimeSnapshot{}
 	}
 	return e.backgroundQueue.snapshot()
+}
+
+func (e *ChatGPTWebExecutor) markBackgroundReloginBackpressure(expected *cliproxyauth.Auth) {
+	if e == nil || e.manager == nil || expected == nil {
+		return
+	}
+	current, ok := e.manager.GetByID(expected.ID)
+	if !ok || current == nil || chatGPTWebReloginGenerationKey(current) != chatGPTWebReloginGenerationKey(expected) {
+		return
+	}
+	if chatGPTWebLifecycleReason(current) == "auto_relogin_backpressure" {
+		return
+	}
+	updatedAt := e.currentTime().UTC().Format(time.RFC3339)
+	if _, _, errUpdate := e.manager.MutateRuntimeMetadataIfCurrent(context.Background(), current, func(auth *cliproxyauth.Auth) {
+		if auth.Metadata == nil {
+			auth.Metadata = make(map[string]any)
+		}
+		auth.Metadata["lifecycle_state"] = cliproxyauth.LifecycleStateReloginPending
+		auth.Metadata["lifecycle_reason"] = "auto_relogin_backpressure"
+		auth.Metadata["lifecycle_updated_at"] = updatedAt
+	}); errUpdate != nil {
+		log.WithError(errUpdate).Warn("chatgpt web auto re-login backpressure could not be persisted")
+	}
+}
+
+// SyncUnauthorizedRecovery moves only a safely resolvable historical
+// session-expired credential into the existing bounded re-login queue.
+func (e *ChatGPTWebExecutor) SyncUnauthorizedRecovery(expected *cliproxyauth.Auth) bool {
+	result := e.syncUnauthorizedRecovery(e.lifecycleContext(), expected)
+	return result == chatGPTWebReloginEnqueueAccepted || result == chatGPTWebReloginEnqueueDeduplicated
+}
+
+func (e *ChatGPTWebExecutor) syncUnauthorizedRecovery(ctx context.Context, expected *cliproxyauth.Auth) chatGPTWebReloginEnqueueResult {
+	if e == nil || e.manager == nil || !e.AutoReloginEnabled() || expected == nil ||
+		expected.LifecycleState() != cliproxyauth.LifecycleStateReauthRequired ||
+		chatGPTWebLifecycleReason(expected) != "session_expired" {
+		return chatGPTWebReloginEnqueueRejected
+	}
+	if expected.NextRetryAfter.After(e.currentTime()) {
+		return chatGPTWebReloginEnqueueRejected
+	}
+	credential, errCredential := chatgptwebauth.ParseCredential(expected.Metadata)
+	if errCredential != nil || !e.credentialCanRelogin(credential) {
+		return chatGPTWebReloginEnqueueRejected
+	}
+	updated := expected.Clone()
+	setChatGPTWebLifecycle(updated, cliproxyauth.LifecycleStateReloginPending, "session_expired", e.currentTime())
+	installed, current, errUpdate := e.manager.UpdateIfCurrent(ctx, expected, updated)
+	if errUpdate != nil {
+		log.WithError(errUpdate).Warn("chatgpt web historical session recovery could not be persisted")
+		return chatGPTWebReloginEnqueueRejected
+	}
+	if !current || installed == nil {
+		return chatGPTWebReloginEnqueueRejected
+	}
+	return e.triggerBackgroundRelogin(installed)
+}
+
+// ScheduleUnauthorizedRecoveryReconcile rechecks the bounded historical
+// session-expired backlog after startup or a relevant configuration change.
+func (e *ChatGPTWebExecutor) ScheduleUnauthorizedRecoveryReconcile() {
+	e.scheduleBackgroundReloginReconcile(false)
+}
+
+func (e *ChatGPTWebExecutor) scheduleBackgroundReloginBackpressureReconcile() {
+	e.scheduleBackgroundReloginReconcile(true)
+}
+
+func (e *ChatGPTWebExecutor) scheduleBackgroundReloginReconcile(backpressuredOnly bool) {
+	if e == nil || e.manager == nil || !e.AutoReloginEnabled() || e.backgroundQueue == nil {
+		return
+	}
+	e.backgroundMu.Lock()
+	if e.closed {
+		e.backgroundMu.Unlock()
+		return
+	}
+	e.reloginReconcileRequested = true
+	if !backpressuredOnly {
+		e.reloginReconcileFull = true
+	}
+	if e.reloginReconcilePending {
+		e.backgroundMu.Unlock()
+		return
+	}
+	e.reloginReconcilePending = true
+	e.reloginWG.Add(1)
+	e.backgroundMu.Unlock()
+	go func() {
+		defer e.reloginWG.Done()
+		for {
+			e.backgroundMu.Lock()
+			if e.closed {
+				e.reloginReconcilePending = false
+				e.reloginReconcileRequested = false
+				e.reloginReconcileFull = false
+				e.backgroundMu.Unlock()
+				return
+			}
+			full := e.reloginReconcileFull
+			e.reloginReconcileRequested = false
+			e.reloginReconcileFull = false
+			e.backgroundMu.Unlock()
+
+			e.reconcileBackgroundRelogins(!full)
+
+			e.backgroundMu.Lock()
+			if !e.reloginReconcileRequested {
+				e.reloginReconcilePending = false
+				e.backgroundMu.Unlock()
+				return
+			}
+			e.backgroundMu.Unlock()
+		}
+	}()
+}
+
+func (e *ChatGPTWebExecutor) reconcileBackgroundRelogins(backpressuredOnly bool) {
+	ctx := e.lifecycleContext()
+	auths := e.manager.ChatGPTWebAuths()
+	candidates := make([]*cliproxyauth.Auth, 0)
+	pending := make([]*cliproxyauth.Auth, 0)
+	eligible := int64(0)
+	blockedByMethod := int64(0)
+	cooling := int64(0)
+	exhausted := int64(0)
+	now := e.currentTime()
+	for _, auth := range auths {
+		if auth == nil {
+			continue
+		}
+		if auth.LifecycleState() == cliproxyauth.LifecycleStateReloginPending {
+			credential, errCredential := chatgptwebauth.ParseCredential(auth.Metadata)
+			if errCredential != nil || !e.credentialCanRelogin(credential) {
+				blockedByMethod++
+				continue
+			}
+			pending = append(pending, auth)
+			continue
+		}
+		if backpressuredOnly || auth.LifecycleState() != cliproxyauth.LifecycleStateReauthRequired {
+			continue
+		}
+		reason := chatGPTWebLifecycleReason(auth)
+		if reason == "auto_relogin_exhausted" {
+			exhausted++
+			continue
+		}
+		if reason != "session_expired" {
+			continue
+		}
+		if auth.NextRetryAfter.After(now) {
+			cooling++
+			continue
+		}
+		credential, errCredential := chatgptwebauth.ParseCredential(auth.Metadata)
+		if errCredential != nil || !e.credentialCanRelogin(credential) {
+			blockedByMethod++
+			continue
+		}
+		eligible++
+		candidates = append(candidates, auth)
+	}
+	remainingEligible := eligible
+	if !backpressuredOnly {
+		e.backgroundQueue.historicalBlockedByMethod.Store(blockedByMethod)
+		e.backgroundQueue.historicalCooling.Store(cooling)
+		e.backgroundQueue.historicalExhausted.Store(exhausted)
+		defer func() {
+			e.backgroundQueue.historicalEligible.Store(remainingEligible)
+		}()
+	}
+	for _, auth := range candidates {
+		if ctx.Err() != nil {
+			return
+		}
+		result := e.syncUnauthorizedRecovery(ctx, auth)
+		if result == chatGPTWebReloginEnqueueAccepted || result == chatGPTWebReloginEnqueueDeduplicated {
+			remainingEligible--
+		}
+		if result == chatGPTWebReloginEnqueueBackpressured {
+			return
+		}
+	}
+	for _, auth := range pending {
+		if ctx.Err() != nil {
+			return
+		}
+		if e.triggerBackgroundRelogin(auth) == chatGPTWebReloginEnqueueBackpressured {
+			return
+		}
+	}
 }
 
 // ReloginCurrent performs a synchronous re-login and conditionally installs
@@ -1083,7 +1310,16 @@ func (e *ChatGPTWebExecutor) executeBackgroundReloginTask(ctx context.Context, t
 	}
 	_, _, errRelogin := e.reloginCurrentWithMode(ctx, current, true)
 	if errRelogin == nil {
+		if e.backgroundQueue != nil {
+			e.backgroundQueue.succeeded.Add(1)
+		}
 		return false
+	}
+	if e.backgroundQueue != nil {
+		e.backgroundQueue.failed.Add(1)
+		if chatgptwebauth.IsLifecycleState(errRelogin, chatgptwebauth.LifecycleDead) {
+			e.backgroundQueue.dead.Add(1)
+		}
 	}
 	current, pending = e.backgroundReloginTaskCurrent(task)
 	if !pending {
@@ -1101,6 +1337,9 @@ func (e *ChatGPTWebExecutor) executeBackgroundReloginTask(ctx context.Context, t
 	if task.attempt >= maxAttempts {
 		logChatGPTWebBackgroundReloginFailure(current, errRelogin)
 		e.markBackgroundReloginExhausted(ctx, current)
+		if e.backgroundQueue != nil {
+			e.backgroundQueue.exhausted.Add(1)
+		}
 		return false
 	}
 	if task.attempt%chatGPTWebBackgroundReloginLogInterval == 0 {
@@ -1173,6 +1412,14 @@ func (e *ChatGPTWebExecutor) acquireReloginExecution(ctx context.Context, expect
 			flight.mode = chatGPTWebReloginModeManual
 			e.reloginMu.Unlock()
 			return false, nil, true
+		}
+		if queueWorker, _ := ctx.Value(chatGPTWebReloginQueueWorkerContextKey{}).(bool); queueWorker {
+			flight.mode = chatGPTWebReloginModeBackground
+			e.reloginMu.Unlock()
+			if e.reloginSlotAcquired != nil {
+				e.reloginSlotAcquired()
+			}
+			return true, func() {}, true
 		}
 		e.reloginMu.Unlock()
 		if !e.backgroundReloginPending(expected) {

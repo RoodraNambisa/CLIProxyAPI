@@ -1630,11 +1630,16 @@ func (s *Service) installAuthMaintenanceHook(ctx context.Context) int64 {
 	}
 	close(jobs)
 	workers.Wait()
+	s.reconcileChatGPTWebUnauthorizedRecovery()
 	return processed.Load()
 }
 
 func (s *Service) triggerChatGPTWebRelogin(auth *coreauth.Auth) {
-	if s == nil || s.coreManager == nil || auth == nil || auth.Disabled || auth.LifecycleState() != coreauth.LifecycleStateReloginPending || !strings.EqualFold(strings.TrimSpace(auth.Provider), "chatgpt-web") {
+	if s == nil || s.coreManager == nil || auth == nil || auth.Disabled || !strings.EqualFold(strings.TrimSpace(auth.Provider), "chatgpt-web") {
+		return
+	}
+	state := auth.LifecycleState()
+	if state != coreauth.LifecycleStateReloginPending && state != coreauth.LifecycleStateReauthRequired {
 		return
 	}
 	if _, _, isCompat := openAICompatInfoFromAuth(auth); isCompat {
@@ -1652,7 +1657,26 @@ func (s *Service) triggerChatGPTWebRelogin(auth *coreauth.Auth) {
 	if !ok {
 		return
 	}
+	if state == coreauth.LifecycleStateReauthRequired {
+		chatGPTWebExecutor.SyncUnauthorizedRecovery(auth)
+		return
+	}
 	chatGPTWebExecutor.TriggerBackgroundRelogin(auth)
+}
+
+func (s *Service) reconcileChatGPTWebUnauthorizedRecovery() {
+	if s == nil || s.coreManager == nil {
+		return
+	}
+	registered, ok := s.coreManager.Executor(chatgptwebauth.Provider)
+	if !ok {
+		return
+	}
+	chatGPTWebExecutor, ok := registered.(*executor.ChatGPTWebExecutor)
+	if !ok {
+		return
+	}
+	chatGPTWebExecutor.ScheduleUnauthorizedRecoveryReconcile()
 }
 
 func (s *Service) syncChatGPTWebAccountInfoRecovery(auth *coreauth.Auth) {

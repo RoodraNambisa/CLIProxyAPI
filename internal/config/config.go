@@ -58,8 +58,12 @@ const (
 	DefaultChatGPTWebImageUpstreamModel        = "gpt-5-5"
 	DefaultChatGPTWebAutoReloginMaxRetries     = 3
 	DefaultChatGPTWebAutoReloginJitterPercent  = 20
+	DefaultChatGPTWebAutoReloginWorkers        = 4
+	DefaultChatGPTWebAutoReloginQueueSize      = 4096
 	MaxChatGPTWebAutoReloginRetries            = 10
 	MaxChatGPTWebAutoReloginJitterPercent      = 100
+	MaxChatGPTWebAutoReloginWorkers            = 256
+	MaxChatGPTWebAutoReloginQueueSize          = 1_000_000
 	DefaultChatGPTWebImportWorkers             = 4
 	MaxChatGPTWebImportWorkers                 = 32
 	DefaultChatGPTWebTimezone                  = "Asia/Shanghai"
@@ -591,6 +595,10 @@ type ChatGPTWebConfig struct {
 	AutoReloginMaxRetries *int `yaml:"auto-relogin-max-retries,omitempty" json:"auto-relogin-max-retries,omitempty"`
 	// AutoReloginJitterPercent applies symmetric jitter to background retry delays.
 	AutoReloginJitterPercent *int `yaml:"auto-relogin-jitter-percent,omitempty" json:"auto-relogin-jitter-percent,omitempty"`
+	// AutoReloginWorkers controls concurrent background re-login attempts.
+	AutoReloginWorkers *int `yaml:"auto-relogin-workers,omitempty" json:"auto-relogin-workers,omitempty"`
+	// AutoReloginQueueSize bounds queued and running background re-login generations.
+	AutoReloginQueueSize *int `yaml:"auto-relogin-queue-size,omitempty" json:"auto-relogin-queue-size,omitempty"`
 	// Timezone is the browser IANA timezone sent to ChatGPT Web.
 	Timezone string `yaml:"timezone,omitempty" json:"timezone,omitempty"`
 	// TimezoneOffsetMinutes overrides the browser offset. Omitted values follow Timezone and DST.
@@ -610,6 +618,8 @@ type ChatGPTWebConfig struct {
 type ResolvedChatGPTWebAutoReloginConfig struct {
 	MaxRetries    int
 	JitterPercent int
+	Workers       int
+	QueueSize     int
 }
 
 // ResolvedAutoRelogin returns effective background re-login settings.
@@ -617,12 +627,20 @@ func (cfg ChatGPTWebConfig) ResolvedAutoRelogin() ResolvedChatGPTWebAutoReloginC
 	resolved := ResolvedChatGPTWebAutoReloginConfig{
 		MaxRetries:    DefaultChatGPTWebAutoReloginMaxRetries,
 		JitterPercent: DefaultChatGPTWebAutoReloginJitterPercent,
+		Workers:       DefaultChatGPTWebAutoReloginWorkers,
+		QueueSize:     DefaultChatGPTWebAutoReloginQueueSize,
 	}
 	if cfg.AutoReloginMaxRetries != nil {
 		resolved.MaxRetries = *cfg.AutoReloginMaxRetries
 	}
 	if cfg.AutoReloginJitterPercent != nil {
 		resolved.JitterPercent = *cfg.AutoReloginJitterPercent
+	}
+	if cfg.AutoReloginWorkers != nil {
+		resolved.Workers = *cfg.AutoReloginWorkers
+	}
+	if cfg.AutoReloginQueueSize != nil {
+		resolved.QueueSize = *cfg.AutoReloginQueueSize
 	}
 	return resolved
 }
@@ -1001,6 +1019,12 @@ func (cfg ChatGPTWebConfig) Validate() error {
 	}
 	if relogin.JitterPercent < 0 || relogin.JitterPercent > MaxChatGPTWebAutoReloginJitterPercent {
 		return fmt.Errorf("chatgpt-web.auto-relogin-jitter-percent must be between 0 and %d", MaxChatGPTWebAutoReloginJitterPercent)
+	}
+	if relogin.Workers < 1 || relogin.Workers > MaxChatGPTWebAutoReloginWorkers {
+		return fmt.Errorf("chatgpt-web.auto-relogin-workers must be between 1 and %d", MaxChatGPTWebAutoReloginWorkers)
+	}
+	if relogin.QueueSize < 1 || relogin.QueueSize > MaxChatGPTWebAutoReloginQueueSize {
+		return fmt.Errorf("chatgpt-web.auto-relogin-queue-size must be between 1 and %d", MaxChatGPTWebAutoReloginQueueSize)
 	}
 	timezone := strings.TrimSpace(cfg.Timezone)
 	if timezone != "" {
