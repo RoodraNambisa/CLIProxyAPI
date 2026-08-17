@@ -51,6 +51,138 @@ func TestImageExecutionCapacityErrorUsesStableSafeContract(t *testing.T) {
 	}
 }
 
+func TestChatGPTWebRuntimeAdmissionsStartWithCompatibleDefaults(t *testing.T) {
+	ConfigureChatGPTWebImageAdmissions(64, 64, 8)
+	ConfigureChatGPTWebImageRuntimeAdmissions(64, 64, 1)
+	t.Cleanup(func() {
+		ConfigureChatGPTWebImageAdmissions(64, 64, 8)
+		ConfigureChatGPTWebImageRuntimeAdmissions(64, 64, 1)
+	})
+
+	poll := ChatGPTWebImagePollAdmissionSnapshot()
+	memoryFinalizer := ChatGPTWebImageMemoryFinalizerAdmissionSnapshot()
+	if poll.Limit != 64 || poll.QueueLimit != 128 {
+		t.Fatalf("poll startup admission = %#v", poll)
+	}
+	if memoryFinalizer.Limit != 1 || memoryFinalizer.QueueLimit != 64 {
+		t.Fatalf("memory finalizer startup admission = %#v", memoryFinalizer)
+	}
+}
+
+func TestChatGPTWebRuntimeAdmissionsHotResizeWithoutRevokingHolders(t *testing.T) {
+	ConfigureChatGPTWebImageAdmissions(4, 4, 2)
+	ConfigureChatGPTWebImageRuntimeAdmissions(4, 2, 2)
+	t.Cleanup(func() {
+		ConfigureChatGPTWebImageAdmissions(64, 64, 8)
+		ConfigureChatGPTWebImageRuntimeAdmissions(64, 64, 1)
+	})
+
+	releasePollA, err := AcquireChatGPTWebImagePoll(t.Context())
+	if err != nil {
+		t.Fatalf("AcquireChatGPTWebImagePoll(A) error = %v", err)
+	}
+	releasePollB, err := AcquireChatGPTWebImagePoll(t.Context())
+	if err != nil {
+		releasePollA()
+		t.Fatalf("AcquireChatGPTWebImagePoll(B) error = %v", err)
+	}
+	ConfigureChatGPTWebImageRuntimeAdmissions(4, 1, 3)
+	if snapshot := ChatGPTWebImagePollAdmissionSnapshot(); snapshot.Limit != 1 || snapshot.Active != 2 || !snapshot.Shrinking {
+		t.Fatalf("poll admission after shrink = %#v", snapshot)
+	}
+
+	pollResult := make(chan struct {
+		release func()
+		err     error
+	}, 1)
+	go func() {
+		release, errAcquire := AcquireChatGPTWebImagePoll(t.Context())
+		pollResult <- struct {
+			release func()
+			err     error
+		}{release: release, err: errAcquire}
+	}()
+	waitForImageAdmissionSnapshot(t, defaultChatGPTWebImagePollAdmission, func(snapshot ImageExecutionAdmissionSnapshot) bool {
+		return snapshot.Queued == 1
+	})
+	releasePollA()
+	select {
+	case result := <-pollResult:
+		if result.release != nil {
+			result.release()
+		}
+		t.Fatalf("poll waiter granted before active reached the shrunken limit: %v", result.err)
+	default:
+	}
+	releasePollB()
+	result := <-pollResult
+	if result.err != nil {
+		t.Fatalf("poll waiter after shrink error = %v", result.err)
+	}
+	result.release()
+
+	if snapshot := ChatGPTWebImageMemoryFinalizerAdmissionSnapshot(); snapshot.Limit != 3 || snapshot.Active != 0 || snapshot.QueueLimit != 4 {
+		t.Fatalf("memory finalizer expansion = %#v", snapshot)
+	}
+	releases := make([]func(), 0, 3)
+	for range 3 {
+		release, errAcquire := AcquireChatGPTWebImageMemoryFinalizer(t.Context())
+		if errAcquire != nil {
+			t.Fatalf("AcquireChatGPTWebImageMemoryFinalizer() error = %v", errAcquire)
+		}
+		releases = append(releases, release)
+	}
+	for _, release := range releases {
+		release()
+	}
+	if snapshot := ChatGPTWebImageMemoryFinalizerAdmissionSnapshot(); snapshot.Active != 0 || snapshot.Queued != 0 || snapshot.PeakActive < 3 {
+		t.Fatalf("memory finalizer final snapshot = %#v", snapshot)
+	}
+}
+
+func TestChatGPTWebRuntimeAdmissionsUseLatestExecutorConfiguration(t *testing.T) {
+	ConfigureChatGPTWebImageAdmissions(2, 2, 1)
+	ConfigureChatGPTWebImageRuntimeAdmissions(2, 3, 2)
+	ConfigureChatGPTWebImageAdmissions(7, 5, 4)
+	ConfigureChatGPTWebImageRuntimeAdmissions(7, 11, 6)
+	t.Cleanup(func() {
+		ConfigureChatGPTWebImageAdmissions(64, 64, 8)
+		ConfigureChatGPTWebImageRuntimeAdmissions(64, 64, 1)
+	})
+	if snapshot := ChatGPTWebImagePollAdmissionSnapshot(); snapshot.Limit != 11 || snapshot.QueueLimit != 14 {
+		t.Fatalf("latest poll configuration = %#v", snapshot)
+	}
+	if snapshot := ChatGPTWebImageMemoryFinalizerAdmissionSnapshot(); snapshot.Limit != 6 || snapshot.QueueLimit != 7 {
+		t.Fatalf("latest memory finalizer configuration = %#v", snapshot)
+	}
+}
+
+func TestImageExecutionAdmissionAcceptsTwoThousandInFlightAndRemainsBounded(t *testing.T) {
+	admission := newImageExecutionAdmission()
+	admission.configure(2000, 2000)
+	releases := make([]func(), 0, 2000)
+	for index := 0; index < 2000; index++ {
+		release, err := admission.acquire(t.Context(), 0)
+		if err != nil {
+			t.Fatalf("acquire %d of 2000: %v", index+1, err)
+		}
+		releases = append(releases, release)
+	}
+	if snapshot := admission.snapshot(); snapshot.Limit != 2000 || snapshot.QueueLimit != 2000 || snapshot.Active != 2000 || snapshot.PeakActive != 2000 {
+		t.Fatalf("2000-task admission snapshot = %#v", snapshot)
+	}
+	if release, err := admission.acquire(t.Context(), 0); err == nil {
+		release()
+		t.Fatal("2001st immediate acquisition exceeded configured lifecycle bound")
+	}
+	for _, release := range releases {
+		release()
+	}
+	if snapshot := admission.snapshot(); snapshot.Active != 0 || snapshot.Queued != 0 || snapshot.ImmediateRejects != 1 {
+		t.Fatalf("released 2000-task admission snapshot = %#v", snapshot)
+	}
+}
+
 func TestImageExecutionAdmissionFIFOExpansionAndDoubleRelease(t *testing.T) {
 	admission := newImageExecutionAdmission()
 	admission.configure(1, 2)

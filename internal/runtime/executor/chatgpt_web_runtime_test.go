@@ -1068,17 +1068,32 @@ func TestChatGPTWebExecutorUpdateConfigAppliesImageAdmissionPolicyWithoutEvictin
 			config.DefaultChatGPTWebImageAdmissionQueueSize,
 			config.DefaultChatGPTWebImageMaxFinalizers,
 		)
+		cliproxyexecutor.ConfigureChatGPTWebImageRuntimeAdmissions(
+			config.DefaultChatGPTWebImageMaxInFlight,
+			config.DefaultChatGPTWebImagePollConcurrency,
+			config.DefaultChatGPTWebImageMemoryFinalizerConcurrency,
+		)
 	})
 	maxInFlight := 2
 	queueLimit := 1
 	maxFinalizers := 1
 	memoryCapacity := 96
+	pollConcurrency := 3
+	memoryFinalizerConcurrency := 2
 	executor.UpdateConfig(&config.Config{SDKConfig: config.SDKConfig{Images: config.ImagesConfig{ChatGPTWeb: config.ChatGPTWebImageConfig{
-		MaxInFlight:             &maxInFlight,
-		AdmissionQueueSize:      &queueLimit,
-		MaxFinalizers:           &maxFinalizers,
-		MemoryCapacityMegabytes: &memoryCapacity,
+		MaxInFlight:                &maxInFlight,
+		AdmissionQueueSize:         &queueLimit,
+		MaxFinalizers:              &maxFinalizers,
+		MemoryCapacityMegabytes:    &memoryCapacity,
+		PollConcurrency:            &pollConcurrency,
+		MemoryFinalizerConcurrency: &memoryFinalizerConcurrency,
 	}}}})
+	if pollSnapshot := cliproxyexecutor.ChatGPTWebImagePollAdmissionSnapshot(); pollSnapshot.Limit != 3 || pollSnapshot.QueueLimit != 4 {
+		t.Fatalf("initial poll admission = %#v", pollSnapshot)
+	}
+	if finalizerSnapshot := cliproxyexecutor.ChatGPTWebImageMemoryFinalizerAdmissionSnapshot(); finalizerSnapshot.Limit != 2 || finalizerSnapshot.QueueLimit != 2 {
+		t.Fatalf("initial memory finalizer admission = %#v", finalizerSnapshot)
+	}
 	memoryRelease, errMemory := helps.AcquireChatGPTWebImageMemory(t.Context(), 80<<20)
 	if errMemory != nil {
 		t.Fatalf("initial memory admission = %v", errMemory)
@@ -1091,11 +1106,15 @@ func TestChatGPTWebExecutorUpdateConfigAppliesImageAdmissionPolicyWithoutEvictin
 	lowered := 1
 	queueDisabled := 0
 	loweredMemoryCapacity := 64
+	loweredPollConcurrency := 1
+	loweredMemoryFinalizerConcurrency := 1
 	executor.UpdateConfig(&config.Config{SDKConfig: config.SDKConfig{Images: config.ImagesConfig{ChatGPTWeb: config.ChatGPTWebImageConfig{
-		MaxInFlight:             &lowered,
-		AdmissionQueueSize:      &queueDisabled,
-		MaxFinalizers:           &maxFinalizers,
-		MemoryCapacityMegabytes: &loweredMemoryCapacity,
+		MaxInFlight:                &lowered,
+		AdmissionQueueSize:         &queueDisabled,
+		MaxFinalizers:              &maxFinalizers,
+		MemoryCapacityMegabytes:    &loweredMemoryCapacity,
+		PollConcurrency:            &loweredPollConcurrency,
+		MemoryFinalizerConcurrency: &loweredMemoryFinalizerConcurrency,
 	}}}})
 	snapshot := cliproxyexecutor.ChatGPTWebImageExecutionAdmissionSnapshot()
 	if snapshot.Limit != 1 || snapshot.Active != 2 || snapshot.QueueLimit != 0 {
@@ -1106,6 +1125,12 @@ func TestChatGPTWebExecutorUpdateConfigAppliesImageAdmissionPolicyWithoutEvictin
 	}
 	if memorySnapshot := helps.ChatGPTWebImageMemorySnapshot(); memorySnapshot.CapacityBytes != 64<<20 || memorySnapshot.ProcessingBytes != 80<<20 {
 		t.Fatalf("hot-lowered memory snapshot = %#v", memorySnapshot)
+	}
+	if pollSnapshot := cliproxyexecutor.ChatGPTWebImagePollAdmissionSnapshot(); pollSnapshot.Limit != 1 || pollSnapshot.QueueLimit != 4 {
+		t.Fatalf("hot-lowered poll admission = %#v", pollSnapshot)
+	}
+	if finalizerSnapshot := cliproxyexecutor.ChatGPTWebImageMemoryFinalizerAdmissionSnapshot(); finalizerSnapshot.Limit != 1 || finalizerSnapshot.QueueLimit != 2 {
+		t.Fatalf("hot-lowered memory finalizer admission = %#v", finalizerSnapshot)
 	}
 	if releaseMemory, acquired := helps.TryAcquireChatGPTWebImageMemory(1); acquired {
 		releaseMemory()

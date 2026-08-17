@@ -19,12 +19,18 @@ import (
 func TestGetSystemMetricsReturnsRuntimeAndConfiguredFilesystems(t *testing.T) {
 	helps.ConfigureChatGPTWebImageMemoryCapacity(96 << 20)
 	coreexecutor.ConfigureChatGPTWebImageAdmissions(7, 4, 2)
+	coreexecutor.ConfigureChatGPTWebImageRuntimeAdmissions(7, 5, 3)
 	t.Cleanup(func() {
 		helps.ConfigureChatGPTWebImageMemoryCapacity(int64(config.DefaultChatGPTWebImageMemoryCapacityMB) << 20)
 		coreexecutor.ConfigureChatGPTWebImageAdmissions(
 			config.DefaultChatGPTWebImageMaxInFlight,
 			config.DefaultChatGPTWebImageAdmissionQueueSize,
 			config.DefaultChatGPTWebImageMaxFinalizers,
+		)
+		coreexecutor.ConfigureChatGPTWebImageRuntimeAdmissions(
+			config.DefaultChatGPTWebImageMaxInFlight,
+			config.DefaultChatGPTWebImagePollConcurrency,
+			config.DefaultChatGPTWebImageMemoryFinalizerConcurrency,
 		)
 	})
 	root := t.TempDir()
@@ -80,8 +86,11 @@ func TestGetSystemMetricsReturnsRuntimeAndConfiguredFilesystems(t *testing.T) {
 		response.ChatGPTWebFinalizers.Limit != 2 || response.ChatGPTWebFinalizers.QueueLimit != 7 {
 		t.Fatalf("image lifecycle admissions = %#v / %#v", response.ChatGPTWebImageInFlight, response.ChatGPTWebFinalizers)
 	}
-	if response.ChatGPTWebPollSlots.Limit < 1 {
+	if response.ChatGPTWebPollSlots.Limit != 5 || response.ChatGPTWebPollSlots.QueueLimit != 14 || response.ChatGPTWebPollSlots.Queued != 0 || response.ChatGPTWebPollSlots.Shrinking {
 		t.Fatalf("ChatGPTWebPollSlots = %#v", response.ChatGPTWebPollSlots)
+	}
+	if response.ChatGPTWebMemoryFinalizers.Limit != 3 || response.ChatGPTWebMemoryFinalizers.QueueLimit != 7 || response.ChatGPTWebMemoryFinalizers.Active != 0 {
+		t.Fatalf("ChatGPTWebMemoryFinalizers = %#v", response.ChatGPTWebMemoryFinalizers)
 	}
 	if response.ImageRequestPhases.HandlerScope != "all_image_routes" ||
 		response.ImageRequestPhases.WebScope != "chatgpt_web_only_after_executor_selection" ||

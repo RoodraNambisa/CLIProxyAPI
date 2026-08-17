@@ -198,6 +198,11 @@ type ChatGPTWebImageConfig struct {
 	CompletionReserveMegabytes *int `yaml:"completion-reserve-megabytes,omitempty" json:"completion-reserve-megabytes,omitempty"`
 	// MemoryCapacityMegabytes bounds the shared process-wide ChatGPT Web image working set.
 	MemoryCapacityMegabytes *int `yaml:"memory-capacity-megabytes,omitempty" json:"memory-capacity-megabytes,omitempty"`
+	// PollConcurrency bounds concurrent ChatGPT Web image poll HTTP requests.
+	PollConcurrency *int `yaml:"poll-concurrency,omitempty" json:"poll-concurrency,omitempty"`
+	// MemoryFinalizerConcurrency bounds finalizers that download to disk and
+	// reserve their complete in-memory working set before decode or encode work.
+	MemoryFinalizerConcurrency *int `yaml:"memory-finalizer-concurrency,omitempty" json:"memory-finalizer-concurrency,omitempty"`
 }
 
 const (
@@ -216,10 +221,10 @@ const (
 	MaxChatGPTWebMaxN                           = 10
 	DefaultChatGPTWebImageMaxInFlight           = 64
 	MinChatGPTWebImageMaxInFlight               = 1
-	MaxChatGPTWebImageMaxInFlight               = 512
+	MaxChatGPTWebImageMaxInFlight               = 4096
 	DefaultChatGPTWebImageAdmissionQueueSize    = 64
 	MinChatGPTWebImageAdmissionQueueSize        = 0
-	MaxChatGPTWebImageAdmissionQueueSize        = 512
+	MaxChatGPTWebImageAdmissionQueueSize        = 4096
 	DefaultChatGPTWebImageAdmissionWaitMS       = 1000
 	MinChatGPTWebImageAdmissionWaitMS           = 0
 	MaxChatGPTWebImageAdmissionWaitMS           = 30000
@@ -232,6 +237,15 @@ const (
 	DefaultChatGPTWebImageMemoryCapacityMB      = 512
 	MinChatGPTWebImageMemoryCapacityMB          = 64
 	MaxChatGPTWebImageMemoryCapacityMB          = 8192
+)
+
+const (
+	DefaultChatGPTWebImagePollConcurrency            = 64
+	MinChatGPTWebImagePollConcurrency                = 1
+	MaxChatGPTWebImagePollConcurrency                = 512
+	DefaultChatGPTWebImageMemoryFinalizerConcurrency = 1
+	MinChatGPTWebImageMemoryFinalizerConcurrency     = 1
+	MaxChatGPTWebImageMemoryFinalizerConcurrency     = 64
 )
 
 // ResolvedChatGPTWebImageConfig contains effective ChatGPT Web image compatibility values.
@@ -252,6 +266,8 @@ type ResolvedChatGPTWebImageConfig struct {
 	MaxFinalizers              int
 	CompletionReserveMegabytes int
 	MemoryCapacityMegabytes    int
+	PollConcurrency            int
+	MemoryFinalizerConcurrency int
 }
 
 // ResolvedUpstreamModel returns the effective ChatGPT Web image conversation model.
@@ -281,6 +297,8 @@ func (cfg ChatGPTWebImageConfig) Resolved() ResolvedChatGPTWebImageConfig {
 		MaxFinalizers:              DefaultChatGPTWebImageMaxFinalizers,
 		CompletionReserveMegabytes: DefaultChatGPTWebImageCompletionReserveMB,
 		MemoryCapacityMegabytes:    DefaultChatGPTWebImageMemoryCapacityMB,
+		PollConcurrency:            DefaultChatGPTWebImagePollConcurrency,
+		MemoryFinalizerConcurrency: DefaultChatGPTWebImageMemoryFinalizerConcurrency,
 	}
 	if cfg.AspectRatioMaxErrorPercent != nil {
 		resolved.AspectRatioMaxErrorPercent = *cfg.AspectRatioMaxErrorPercent
@@ -314,6 +332,12 @@ func (cfg ChatGPTWebImageConfig) Resolved() ResolvedChatGPTWebImageConfig {
 	}
 	if cfg.MemoryCapacityMegabytes != nil {
 		resolved.MemoryCapacityMegabytes = *cfg.MemoryCapacityMegabytes
+	}
+	if cfg.PollConcurrency != nil {
+		resolved.PollConcurrency = *cfg.PollConcurrency
+	}
+	if cfg.MemoryFinalizerConcurrency != nil {
+		resolved.MemoryFinalizerConcurrency = *cfg.MemoryFinalizerConcurrency
 	}
 	return resolved
 }
@@ -362,6 +386,12 @@ func (cfg ChatGPTWebImageConfig) Validate() error {
 	}
 	if resolved.MemoryCapacityMegabytes < MinChatGPTWebImageMemoryCapacityMB || resolved.MemoryCapacityMegabytes > MaxChatGPTWebImageMemoryCapacityMB {
 		return fmt.Errorf("images.chatgpt-web.memory-capacity-megabytes must be between %d and %d", MinChatGPTWebImageMemoryCapacityMB, MaxChatGPTWebImageMemoryCapacityMB)
+	}
+	if resolved.PollConcurrency < MinChatGPTWebImagePollConcurrency || resolved.PollConcurrency > MaxChatGPTWebImagePollConcurrency {
+		return fmt.Errorf("images.chatgpt-web.poll-concurrency must be between %d and %d", MinChatGPTWebImagePollConcurrency, MaxChatGPTWebImagePollConcurrency)
+	}
+	if resolved.MemoryFinalizerConcurrency < MinChatGPTWebImageMemoryFinalizerConcurrency || resolved.MemoryFinalizerConcurrency > MaxChatGPTWebImageMemoryFinalizerConcurrency {
+		return fmt.Errorf("images.chatgpt-web.memory-finalizer-concurrency must be between %d and %d", MinChatGPTWebImageMemoryFinalizerConcurrency, MaxChatGPTWebImageMemoryFinalizerConcurrency)
 	}
 	return nil
 }

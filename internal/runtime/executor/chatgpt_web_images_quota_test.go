@@ -13,6 +13,7 @@ import (
 	chatgptwebauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/chatgptweb"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor/helps"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 )
 
 func TestChatGPTWebImageRequestErrorRequiresExplicitQuotaEvidence(t *testing.T) {
@@ -499,22 +500,60 @@ func TestChatGPTWebEmptyImageResultKeeps502AndSchedulesCooledQuotaRecheck(t *tes
 }
 
 func TestChatGPTWebImagePollSlotsAreBoundedAndCancelable(t *testing.T) {
-	slots := make(chan struct{}, 1)
-	if err := acquireChatGPTWebImagePollSlot(context.Background(), slots); err != nil {
+	cliproxyexecutor.ConfigureChatGPTWebImageAdmissions(1, 1, 1)
+	cliproxyexecutor.ConfigureChatGPTWebImageRuntimeAdmissions(1, 1, 1)
+	t.Cleanup(func() {
+		cliproxyexecutor.ConfigureChatGPTWebImageAdmissions(
+			config.DefaultChatGPTWebImageMaxInFlight,
+			config.DefaultChatGPTWebImageAdmissionQueueSize,
+			config.DefaultChatGPTWebImageMaxFinalizers,
+		)
+		cliproxyexecutor.ConfigureChatGPTWebImageRuntimeAdmissions(
+			config.DefaultChatGPTWebImageMaxInFlight,
+			config.DefaultChatGPTWebImagePollConcurrency,
+			config.DefaultChatGPTWebImageMemoryFinalizerConcurrency,
+		)
+	})
+	before := ChatGPTWebImagePollSnapshot()
+	releaseFirst, err := acquireChatGPTWebImagePollSlot(context.Background())
+	if err != nil {
 		t.Fatalf("acquire first poll slot: %v", err)
 	}
-
 	waitCtx, cancel := context.WithCancel(context.Background())
-	cancel()
-	if err := acquireChatGPTWebImagePollSlot(waitCtx, slots); !errors.Is(err, context.Canceled) {
-		t.Fatalf("blocked poll acquire error = %v, want context canceled", err)
+	waitResult := make(chan error, 2)
+	for range 2 {
+		go func() {
+			_, errAcquire := acquireChatGPTWebImagePollSlot(waitCtx)
+			waitResult <- errAcquire
+		}()
 	}
-
-	releaseChatGPTWebImagePollSlot(slots)
-	if err := acquireChatGPTWebImagePollSlot(context.Background(), slots); err != nil {
+	waitForChatGPTWebCondition(t, time.Second, func() bool {
+		return cliproxyexecutor.ChatGPTWebImagePollAdmissionSnapshot().Queued == 2
+	})
+	if _, errFull := acquireChatGPTWebImagePollSlot(context.Background()); errFull == nil {
+		t.Fatal("acquire with full poll queue succeeded")
+	}
+	cancel()
+	for range 2 {
+		if errCanceled := <-waitResult; !errors.Is(errCanceled, context.Canceled) {
+			t.Fatalf("blocked poll acquire error = %v, want context canceled", errCanceled)
+		}
+	}
+	releaseFirst()
+	releaseSecond, err := acquireChatGPTWebImagePollSlot(context.Background())
+	if err != nil {
 		t.Fatalf("reacquire poll slot: %v", err)
 	}
-	releaseChatGPTWebImagePollSlot(slots)
+	releaseSecond()
+	after := ChatGPTWebImagePollSnapshot()
+	if after.Limit != 1 || after.QueueLimit != 2 || after.Queued != 0 || after.PeakQueued < 2 {
+		t.Fatalf("poll capacity snapshot = %#v", after)
+	}
+	if after.AcquireAttempts != before.AcquireAttempts+5 || after.Acquired != before.Acquired+2 ||
+		after.QueueRejects != before.QueueRejects+1 || after.Canceled != before.Canceled+2 ||
+		after.TimedOut != before.TimedOut {
+		t.Fatalf("poll accounting before=%#v after=%#v", before, after)
+	}
 }
 
 func TestChatGPTWebImageResultErrorsPreserveQuotaCredentialUpdate(t *testing.T) {

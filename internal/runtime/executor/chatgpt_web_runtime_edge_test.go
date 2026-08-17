@@ -1709,7 +1709,7 @@ func TestChatGPTWebImagePollingStopsAfterLocalMemoryCapacityError(t *testing.T) 
 			}
 			defer client.CloseIdleConnections()
 
-			pollSlotsBefore := len(chatGPTWebImagePollSlots)
+			pollSlotsBefore := cliproxyexecutor.ChatGPTWebImagePollAdmissionSnapshot().Active
 			var resultErr error
 			var streamBody *chatGPTWebImageWatchBody
 			if testCase.streamingWatch {
@@ -1755,7 +1755,7 @@ func TestChatGPTWebImagePollingStopsAfterLocalMemoryCapacityError(t *testing.T) 
 			if got := conversationPolls.Load(); got > 1 {
 				t.Fatalf("conversation polls = %d, want at most 1", got)
 			}
-			if got := len(chatGPTWebImagePollSlots); got != pollSlotsBefore {
+			if got := cliproxyexecutor.ChatGPTWebImagePollAdmissionSnapshot().Active; got != pollSlotsBefore {
 				t.Fatalf("poll slots in use = %d, want %d", got, pollSlotsBefore)
 			}
 			taskCount := taskPolls.Load()

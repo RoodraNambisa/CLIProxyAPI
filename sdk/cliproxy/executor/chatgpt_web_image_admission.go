@@ -38,6 +38,8 @@ const (
 var (
 	defaultChatGPTWebImageExecutionAdmission = newImageExecutionAdmission()
 	defaultChatGPTWebImageFinalizerAdmission = newImageExecutionAdmission()
+	defaultChatGPTWebImagePollAdmission      = newConfiguredImageExecutionAdmission(64, 128)
+	defaultChatGPTWebImageMemoryFinalizer    = newConfiguredImageExecutionAdmission(1, 64)
 	globalImageRequestPhaseObserver          = newImageRequestPhaseObserver()
 )
 
@@ -116,6 +118,7 @@ type ImageExecutionAdmissionSnapshot struct {
 	ActiveOver5Min   int           `json:"active_over_5_minutes"`
 	ActiveOver15Min  int           `json:"active_over_15_minutes"`
 	ActiveOver25Min  int           `json:"active_over_25_minutes"`
+	Shrinking        bool          `json:"shrinking"`
 }
 
 type imageExecutionAdmission struct {
@@ -143,6 +146,12 @@ func newImageExecutionAdmission() *imageExecutionAdmission {
 	return &imageExecutionAdmission{activeSince: make(map[uint64]time.Time)}
 }
 
+func newConfiguredImageExecutionAdmission(limit, queueLimit int) *imageExecutionAdmission {
+	admission := newImageExecutionAdmission()
+	admission.configure(limit, queueLimit)
+	return admission
+}
+
 // ConfigureChatGPTWebImageAdmissions applies the current process-wide policy.
 // Existing holders remain valid when a limit is lowered.
 func ConfigureChatGPTWebImageAdmissions(maxInFlight, queueLimit, maxFinalizers int) {
@@ -152,16 +161,42 @@ func ConfigureChatGPTWebImageAdmissions(maxInFlight, queueLimit, maxFinalizers i
 	defaultChatGPTWebImageFinalizerAdmission.configure(maxFinalizers, finalizerQueueLimit)
 }
 
+// ConfigureChatGPTWebImageRuntimeAdmissions applies hot-reloadable limits to
+// poll HTTP requests and memory-heavy finalization. Existing holders survive a
+// shrink; new grants resume after active work falls below the new limit.
+func ConfigureChatGPTWebImageRuntimeAdmissions(maxInFlight, pollConcurrency, memoryFinalizerConcurrency int) {
+	activeExecution := defaultChatGPTWebImageExecutionAdmission.snapshot().Active
+	queueLimit := max(maxInFlight, activeExecution)
+	pollQueueLimit := queueLimit
+	if queueLimit <= int(^uint(0)>>1)/2 {
+		pollQueueLimit = queueLimit * 2
+	}
+	defaultChatGPTWebImagePollAdmission.configure(pollConcurrency, pollQueueLimit)
+	defaultChatGPTWebImageMemoryFinalizer.configure(memoryFinalizerConcurrency, queueLimit)
+}
+
 // AcquireChatGPTWebImageExecution bounds the complete selected Web image
 // attempt, including sleeping task polls.
 func AcquireChatGPTWebImageExecution(ctx context.Context, wait time.Duration) (func(), error) {
 	return defaultChatGPTWebImageExecutionAdmission.acquire(ctx, wait)
 }
 
-// AcquireChatGPTWebImageFinalizer bounds download, decode, and response encode
-// work. It waits only for request cancellation and never adds an upstream timeout.
+// AcquireChatGPTWebImageFinalizer bounds settled tasks admitted to finalizer
+// staging. It waits only for request cancellation and never adds an upstream timeout.
 func AcquireChatGPTWebImageFinalizer(ctx context.Context) (func(), error) {
 	return defaultChatGPTWebImageFinalizerAdmission.acquire(ctx, -1)
+}
+
+// AcquireChatGPTWebImagePoll bounds one actual poll HTTP exchange. Sleeping
+// intervals between polls do not retain this admission.
+func AcquireChatGPTWebImagePoll(ctx context.Context) (func(), error) {
+	return defaultChatGPTWebImagePollAdmission.acquire(ctx, -1)
+}
+
+// AcquireChatGPTWebImageMemoryFinalizer bounds disk-spooled download, decode,
+// encode, and response materialization work.
+func AcquireChatGPTWebImageMemoryFinalizer(ctx context.Context) (func(), error) {
+	return defaultChatGPTWebImageMemoryFinalizer.acquire(ctx, -1)
 }
 
 // ChatGPTWebImageExecutionAdmissionSnapshot returns process-wide lifecycle metrics.
@@ -172,6 +207,16 @@ func ChatGPTWebImageExecutionAdmissionSnapshot() ImageExecutionAdmissionSnapshot
 // ChatGPTWebImageFinalizerAdmissionSnapshot returns process-wide finalizer metrics.
 func ChatGPTWebImageFinalizerAdmissionSnapshot() ImageExecutionAdmissionSnapshot {
 	return defaultChatGPTWebImageFinalizerAdmission.snapshot()
+}
+
+// ChatGPTWebImagePollAdmissionSnapshot returns actual poll HTTP concurrency metrics.
+func ChatGPTWebImagePollAdmissionSnapshot() ImageExecutionAdmissionSnapshot {
+	return defaultChatGPTWebImagePollAdmission.snapshot()
+}
+
+// ChatGPTWebImageMemoryFinalizerAdmissionSnapshot returns memory-heavy finalizer metrics.
+func ChatGPTWebImageMemoryFinalizerAdmissionSnapshot() ImageExecutionAdmissionSnapshot {
+	return defaultChatGPTWebImageMemoryFinalizer.snapshot()
 }
 
 func (admission *imageExecutionAdmission) configure(limit, queueLimit int) {
@@ -373,6 +418,7 @@ func (admission *imageExecutionAdmission) snapshot() ImageExecutionAdmissionSnap
 		ActiveOver5Min:   over5Minutes,
 		ActiveOver15Min:  over15Minutes,
 		ActiveOver25Min:  over25Minutes,
+		Shrinking:        admission.active > admission.limit,
 	}
 }
 

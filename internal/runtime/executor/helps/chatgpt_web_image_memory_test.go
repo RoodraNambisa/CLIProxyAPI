@@ -1001,3 +1001,218 @@ func TestChatGPTWebImageFinalizationRejectsImpossibleOwnWorkingSetWithoutWaiting
 		t.Fatalf("impossible working set changed admission state: %#v", snapshot)
 	}
 }
+
+func TestChatGPTWebImageExactFinalizationNeverClampsOversizedWorkspace(t *testing.T) {
+	previous := defaultChatGPTWebImageMemoryAdmission
+	defaultChatGPTWebImageMemoryAdmission = NewChatGPTWebImageMemoryAdmission(4)
+	t.Cleanup(func() { defaultChatGPTWebImageMemoryAdmission = previous })
+
+	leases := NewChatGPTWebImageMemoryLeaseSet()
+	t.Cleanup(leases.Release)
+	releaseTurn, err := leases.BeginFinalization(t.Context())
+	if err != nil {
+		t.Fatalf("BeginFinalization() error = %v", err)
+	}
+	defer releaseTurn()
+	if err = leases.AcquireExact(t.Context(), 5); !errors.Is(err, ErrChatGPTWebImageMemoryWorkingSetTooLarge) {
+		t.Fatalf("AcquireExact(oversized) error = %v, want working set too large", err)
+	}
+	if snapshot := ChatGPTWebImageMemorySnapshot(); snapshot.ProcessingTasks != 0 || snapshot.ProcessingBytes != 0 || snapshot.WaitingTasks != 0 {
+		t.Fatalf("oversized exact workspace changed admission state: %#v", snapshot)
+	}
+}
+
+func TestChatGPTWebImageExactFinalizationDoesNotCreatePartialHoldAndWait(t *testing.T) {
+	previous := defaultChatGPTWebImageMemoryAdmission
+	defaultChatGPTWebImageMemoryAdmission = NewChatGPTWebImageMemoryAdmission(200)
+	t.Cleanup(func() { defaultChatGPTWebImageMemoryAdmission = previous })
+
+	first := NewChatGPTWebImageMemoryLeaseSet()
+	second := NewChatGPTWebImageMemoryLeaseSet()
+	t.Cleanup(first.Release)
+	t.Cleanup(second.Release)
+
+	firstTurn, err := first.BeginFinalization(t.Context())
+	if err != nil {
+		t.Fatalf("first BeginFinalization() error = %v", err)
+	}
+	if err = first.AcquireExact(t.Context(), 200); err != nil {
+		firstTurn()
+		t.Fatalf("first AcquireExact() error = %v", err)
+	}
+	firstTurn()
+
+	type acquireResult struct {
+		releaseTurn func()
+		err         error
+	}
+	secondResult := make(chan acquireResult, 1)
+	go func() {
+		releaseTurn, errBegin := second.BeginFinalization(t.Context())
+		if errBegin != nil {
+			secondResult <- acquireResult{err: errBegin}
+			return
+		}
+		errAcquire := second.AcquireExact(t.Context(), 200)
+		secondResult <- acquireResult{releaseTurn: releaseTurn, err: errAcquire}
+	}()
+
+	deadline := time.Now().Add(time.Second)
+	for ChatGPTWebImageMemorySnapshot().WaitingTasks != 1 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if snapshot := ChatGPTWebImageMemorySnapshot(); snapshot.ProcessingTasks != 1 || snapshot.ProcessingBytes != 200 || snapshot.WaitingTasks != 1 || snapshot.WaitingBytes != 200 {
+		t.Fatalf("whole-workspace serialization snapshot = %#v", snapshot)
+	}
+	first.Release()
+	select {
+	case result := <-secondResult:
+		if result.err != nil {
+			t.Fatalf("second AcquireExact() error = %v", result.err)
+		}
+		result.releaseTurn()
+	case <-time.After(time.Second):
+		t.Fatal("second whole workspace did not advance after first release")
+	}
+	second.Release()
+	if snapshot := ChatGPTWebImageMemorySnapshot(); snapshot.ProcessingTasks != 0 || snapshot.ProcessingBytes != 0 || snapshot.WaitingTasks != 0 {
+		t.Fatalf("whole-workspace finalization leaked: %#v", snapshot)
+	}
+}
+
+func TestChatGPTWebImageExactFinalizationFailsQueuedGrantAfterHotShrink(t *testing.T) {
+	previous := defaultChatGPTWebImageMemoryAdmission
+	admission := NewChatGPTWebImageMemoryAdmission(8)
+	defaultChatGPTWebImageMemoryAdmission = admission
+	t.Cleanup(func() { defaultChatGPTWebImageMemoryAdmission = previous })
+
+	leases := NewChatGPTWebImageMemoryLeaseSet()
+	t.Cleanup(leases.Release)
+	if !leases.TryReserveCompletion(1) {
+		t.Fatal("TryReserveCompletion() = false")
+	}
+	releaseOther, err := admission.Acquire(t.Context(), 7)
+	if err != nil {
+		t.Fatalf("other Acquire() error = %v", err)
+	}
+	defer releaseOther()
+	releaseTurn, err := leases.BeginFinalization(t.Context())
+	if err != nil {
+		t.Fatalf("BeginFinalization() error = %v", err)
+	}
+	defer releaseTurn()
+
+	result := make(chan error, 1)
+	go func() { result <- leases.AcquireExact(t.Context(), 8) }()
+	deadline := time.Now().Add(time.Second)
+	for admission.Snapshot().WaitingTasks != 1 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	admission.Resize(4)
+	select {
+	case errAcquire := <-result:
+		if !errors.Is(errAcquire, ErrChatGPTWebImageMemoryWorkingSetTooLarge) {
+			t.Fatalf("AcquireExact() after shrink error = %v", errAcquire)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("exact workspace remained queued after shrinking below its size")
+	}
+	releaseOther()
+	leases.Release()
+	if snapshot := admission.Snapshot(); snapshot.ProcessingTasks != 0 || snapshot.ProcessingBytes != 0 || snapshot.WaitingTasks != 0 || snapshot.WaitingBytes != 0 {
+		t.Fatalf("hot-shrink exact workspace leaked: %#v", snapshot)
+	}
+}
+
+func TestChatGPTWebImageExactFinalizationRequiresEmptyLease(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		acquire func(*testing.T, *ChatGPTWebImageMemoryLeaseSet) error
+	}{
+		{
+			name: "retained",
+			acquire: func(t *testing.T, leases *ChatGPTWebImageMemoryLeaseSet) error {
+				return leases.Acquire(t.Context(), 4)
+			},
+		},
+		{
+			name: "transient",
+			acquire: func(t *testing.T, leases *ChatGPTWebImageMemoryLeaseSet) error {
+				release, err := leases.AcquireTransient(t.Context(), 4)
+				if err == nil {
+					t.Cleanup(release)
+				}
+				return err
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			previous := defaultChatGPTWebImageMemoryAdmission
+			admission := NewChatGPTWebImageMemoryAdmission(8)
+			defaultChatGPTWebImageMemoryAdmission = admission
+			t.Cleanup(func() { defaultChatGPTWebImageMemoryAdmission = previous })
+
+			leases := NewChatGPTWebImageMemoryLeaseSet()
+			t.Cleanup(leases.Release)
+			releaseTurn, err := leases.BeginFinalization(t.Context())
+			if err != nil {
+				t.Fatalf("BeginFinalization() error = %v", err)
+			}
+			defer releaseTurn()
+			if err = test.acquire(t, leases); err != nil {
+				t.Fatalf("partial %s acquire error = %v", test.name, err)
+			}
+			started := time.Now()
+			if err = leases.AcquireExact(t.Context(), 4); !errors.Is(err, ErrChatGPTWebImageMemoryWorkingSetTooLarge) {
+				t.Fatalf("AcquireExact() error = %v, want working set too large", err)
+			}
+			if elapsed := time.Since(started); elapsed > 100*time.Millisecond {
+				t.Fatalf("AcquireExact() with partial %s waited %v", test.name, elapsed)
+			}
+			if snapshot := admission.Snapshot(); snapshot.WaitingTasks != 0 || snapshot.ProcessingBytes != 4 {
+				t.Fatalf("partial %s exact rejection snapshot = %#v", test.name, snapshot)
+			}
+		})
+	}
+}
+
+func TestChatGPTWebImageExactFinalizationRequiresReleasedInputAndForbidsGrowth(t *testing.T) {
+	previous := defaultChatGPTWebImageMemoryAdmission
+	admission := NewChatGPTWebImageMemoryAdmission(8)
+	defaultChatGPTWebImageMemoryAdmission = admission
+	t.Cleanup(func() { defaultChatGPTWebImageMemoryAdmission = previous })
+
+	leases := NewChatGPTWebImageMemoryLeaseSet()
+	t.Cleanup(leases.Release)
+	if !leases.TryAcquireInput(2) {
+		t.Fatal("TryAcquireInput() = false")
+	}
+	releaseTurn, err := leases.BeginFinalization(t.Context())
+	if err != nil {
+		t.Fatalf("BeginFinalization() error = %v", err)
+	}
+	defer releaseTurn()
+	if err = leases.AcquireExact(t.Context(), 6); !errors.Is(err, ErrChatGPTWebImageMemoryWorkingSetTooLarge) {
+		t.Fatalf("AcquireExact() with input lease error = %v", err)
+	}
+	if snapshot := admission.Snapshot(); snapshot.ProcessingBytes != 2 || snapshot.WaitingTasks != 0 {
+		t.Fatalf("input-held exact rejection snapshot = %#v", snapshot)
+	}
+
+	leases.ReleaseInput()
+	if err = leases.AcquireExact(t.Context(), 6); err != nil {
+		t.Fatalf("AcquireExact() after ReleaseInput() error = %v", err)
+	}
+	if err = leases.AcquireExact(t.Context(), 1); !errors.Is(err, ErrChatGPTWebImageMemoryWorkingSetTooLarge) {
+		t.Fatalf("second AcquireExact() error = %v", err)
+	}
+	if _, err = leases.AcquireTransient(t.Context(), 1); !errors.Is(err, ErrChatGPTWebImageMemoryWorkingSetTooLarge) {
+		t.Fatalf("AcquireTransient() after exact error = %v", err)
+	}
+	if leases.TryAcquireInput(1) {
+		t.Fatal("TryAcquireInput() after exact = true")
+	}
+	if snapshot := admission.Snapshot(); snapshot.ProcessingBytes != 6 || snapshot.WaitingTasks != 0 {
+		t.Fatalf("exact no-growth snapshot = %#v", snapshot)
+	}
+}

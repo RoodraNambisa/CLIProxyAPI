@@ -55,7 +55,7 @@ const (
 	chatGPTWebImageStreamMaxBytes       = 128 << 20
 	chatGPTWebImageStreamMaxEvents      = 65_536
 	chatGPTWebPollResponseMaxBytes      = 128 << 20
-	chatGPTWebImagePollConcurrency      = 64
+	chatGPTWebImageResponseJSONOverhead = 8 << 20
 	chatGPTWebImageRateLimitClientBody  = `{"error":{"message":"Rate limit reached for requests. Please try again later.","type":"rate_limit_error","code":"rate_limit_exceeded"}}`
 	chatGPTWebImageNoOutputMessage      = "chatgpt web image generation completed without an image"
 )
@@ -68,41 +68,49 @@ var chatGPTWebAssetHostSuffixes = []string{
 	"openai.com",
 }
 
-var chatGPTWebImagePollSlots = make(chan struct{}, chatGPTWebImagePollConcurrency)
-
 var chatGPTWebImagePollMetrics struct {
-	active         atomic.Int64
-	peakActive     atomic.Int64
-	attempts       atomic.Uint64
-	acquired       atomic.Uint64
-	canceled       atomic.Uint64
-	totalWaitNanos atomic.Uint64
-	maxWaitNanos   atomic.Uint64
+	attempts atomic.Uint64
+	acquired atomic.Uint64
 }
 
 // ChatGPTWebImagePollRuntimeSnapshot contains only aggregate poll-slot data.
 type ChatGPTWebImagePollRuntimeSnapshot struct {
-	Limit           int    `json:"limit"`
-	Active          int64  `json:"active"`
-	PeakActive      int64  `json:"peak_active"`
-	AcquireAttempts uint64 `json:"acquire_attempts"`
-	Acquired        uint64 `json:"acquired"`
-	Canceled        uint64 `json:"canceled"`
-	TotalWaitNanos  uint64 `json:"total_wait_nanos"`
-	MaxWaitNanos    uint64 `json:"max_wait_nanos"`
+	Limit            int    `json:"limit"`
+	QueueLimit       int    `json:"queue_limit"`
+	Active           int64  `json:"active"`
+	Queued           int64  `json:"queued"`
+	PeakActive       int64  `json:"peak_active"`
+	PeakQueued       int64  `json:"peak_queued"`
+	Shrinking        bool   `json:"shrinking"`
+	AcquireAttempts  uint64 `json:"acquire_attempts"`
+	Acquired         uint64 `json:"acquired"`
+	ImmediateRejects uint64 `json:"immediate_rejects"`
+	QueueRejects     uint64 `json:"queue_rejects"`
+	TimedOut         uint64 `json:"timed_out"`
+	Canceled         uint64 `json:"canceled"`
+	TotalWaitNanos   uint64 `json:"total_wait_nanos"`
+	MaxWaitNanos     uint64 `json:"max_wait_nanos"`
 }
 
 // ChatGPTWebImagePollSnapshot returns process-wide poll-slot metrics.
 func ChatGPTWebImagePollSnapshot() ChatGPTWebImagePollRuntimeSnapshot {
+	admission := cliproxyexecutor.ChatGPTWebImagePollAdmissionSnapshot()
 	return ChatGPTWebImagePollRuntimeSnapshot{
-		Limit:           cap(chatGPTWebImagePollSlots),
-		Active:          chatGPTWebImagePollMetrics.active.Load(),
-		PeakActive:      chatGPTWebImagePollMetrics.peakActive.Load(),
-		AcquireAttempts: chatGPTWebImagePollMetrics.attempts.Load(),
-		Acquired:        chatGPTWebImagePollMetrics.acquired.Load(),
-		Canceled:        chatGPTWebImagePollMetrics.canceled.Load(),
-		TotalWaitNanos:  chatGPTWebImagePollMetrics.totalWaitNanos.Load(),
-		MaxWaitNanos:    chatGPTWebImagePollMetrics.maxWaitNanos.Load(),
+		Limit:            admission.Limit,
+		QueueLimit:       admission.QueueLimit,
+		Active:           int64(admission.Active),
+		Queued:           int64(admission.Queued),
+		PeakActive:       int64(admission.PeakActive),
+		PeakQueued:       int64(admission.PeakQueued),
+		Shrinking:        admission.Shrinking,
+		AcquireAttempts:  chatGPTWebImagePollMetrics.attempts.Load(),
+		Acquired:         chatGPTWebImagePollMetrics.acquired.Load(),
+		ImmediateRejects: admission.ImmediateRejects,
+		QueueRejects:     admission.QueueRejects,
+		TimedOut:         admission.TimedOut,
+		Canceled:         admission.Canceled,
+		TotalWaitNanos:   uint64(max(admission.TotalWait.Nanoseconds(), int64(0))),
+		MaxWaitNanos:     uint64(max(admission.MaxWait.Nanoseconds(), int64(0))),
 	}
 }
 
@@ -113,6 +121,32 @@ type chatGPTWebUploadedImage struct {
 	Size     int
 	Width    int
 	Height   int
+}
+
+type chatGPTWebSpooledImage struct {
+	path        string
+	size        int
+	contentType string
+	format      string
+	width       int
+	height      int
+}
+
+func (image *chatGPTWebSpooledImage) remove() error {
+	if image == nil || image.path == "" {
+		return nil
+	}
+	err := os.Remove(image.path)
+	image.path = ""
+	return err
+}
+
+func removeChatGPTWebSpooledImages(images []*chatGPTWebSpooledImage) {
+	for _, image := range images {
+		if err := image.remove(); err != nil && !errors.Is(err, os.ErrNotExist) {
+			log.WithError(err).Warn("chatgpt web image: remove completion spool")
+		}
+	}
 }
 
 type chatGPTWebAssetTransportError struct {
@@ -795,8 +829,15 @@ func (e *ChatGPTWebExecutor) finishChatGPTWebImage(ctx context.Context, client *
 		return nil, errFinalizer
 	}
 	defer releaseFinalizer()
+	releaseMemoryFinalizer, errMemoryFinalizer := cliproxyexecutor.AcquireChatGPTWebImageMemoryFinalizer(ctx)
+	if errMemoryFinalizer != nil {
+		cliproxyexecutor.ObserveRequestPhaseContext(ctx, cliproxyexecutor.ImagePhaseFinalizerWait, finalizerStarted)
+		return nil, errMemoryFinalizer
+	}
+	defer releaseMemoryFinalizer()
 	failureStage = "download"
-	if prepared.imageMemoryLeases != nil {
+	parallelMemoryFinalization := cliproxyexecutor.ChatGPTWebImageMemoryFinalizerAdmissionSnapshot().Limit > 1
+	if prepared.imageMemoryLeases != nil && !parallelMemoryFinalization {
 		releaseCompletionTurn, errFinalization := prepared.imageMemoryLeases.BeginFinalization(ctx)
 		if errFinalization != nil {
 			cliproxyexecutor.ObserveRequestPhaseContext(ctx, cliproxyexecutor.ImagePhaseFinalizerWait, finalizerStarted)
@@ -807,7 +848,23 @@ func (e *ChatGPTWebExecutor) finishChatGPTWebImage(ctx context.Context, client *
 	cliproxyexecutor.ObserveRequestPhaseContext(ctx, cliproxyexecutor.ImagePhaseFinalizerWait, finalizerStarted)
 	responseByteLimit := chatGPTWebImageResponseByteLimit(prepared.imageConfigSnapshot)
 	downloadStarted := time.Now()
-	images, err := e.downloadChatGPTWebImagesLimitedWithBudget(ctx, client, credential, accumulator, prepared.maxImageResults, responseByteLimit)
+	var images [][]byte
+	if parallelMemoryFinalization && prepared.imageMemoryLeases != nil {
+		images, ctx, err = e.downloadChatGPTWebImagesWithWholeFinalization(
+			ctx,
+			client,
+			credential,
+			accumulator,
+			prepared.maxImageResults,
+			responseByteLimit,
+			imageRequest,
+			prepared.imageSizeMatch,
+			prepared.imageConfigSnapshot,
+			prepared.imageMemoryLeases,
+		)
+	} else {
+		images, err = e.downloadChatGPTWebImagesLimitedWithBudget(ctx, client, credential, accumulator, prepared.maxImageResults, responseByteLimit)
+	}
 	cliproxyexecutor.ObserveRequestPhaseContext(ctx, cliproxyexecutor.ImagePhaseDownload, downloadStarted)
 	if prepared.imageResultState != nil && len(images) > 0 {
 		prepared.imageResultState.AddProduced(len(images))
@@ -3208,6 +3265,41 @@ func (e *ChatGPTWebExecutor) downloadChatGPTWebImagesLimitedWithBudget(
 	if responseByteLimit <= 0 {
 		responseByteLimit = chatGPTWebMaxImageResponseBytes
 	}
+	urls, errURLs := e.chatGPTWebImageDownloadURLs(ctx, client, credential, accumulator, maxResults)
+	if errURLs != nil {
+		return nil, errURLs
+	}
+	images := make([][]byte, 0, len(urls))
+	totalBytes := 0
+	for _, downloadURL := range urls {
+		remainingBytes := responseByteLimit - totalBytes
+		if remainingBytes <= 0 {
+			return images, chatGPTWebImageResponseLimitError(responseByteLimit)
+		}
+		payload, err := e.downloadChatGPTWebImageAsset(ctx, client, credential, downloadURL, remainingBytes)
+		if err != nil {
+			var limitErr *chatGPTWebImageBodyLimitError
+			if errors.As(err, &limitErr) {
+				return images, chatGPTWebImageResponseLimitError(responseByteLimit)
+			}
+			return images, err
+		}
+		if totalBytes > responseByteLimit-len(payload) {
+			return images, chatGPTWebImageResponseLimitError(responseByteLimit)
+		}
+		totalBytes += len(payload)
+		images = append(images, payload)
+	}
+	return images, nil
+}
+
+func (e *ChatGPTWebExecutor) chatGPTWebImageDownloadURLs(
+	ctx context.Context,
+	client *chatgptwebauth.Client,
+	credential *chatgptwebauth.Credential,
+	accumulator *helps.ChatGPTWebImageAccumulator,
+	maxResults int,
+) ([]string, error) {
 	references := accumulator.References
 	if len(references) == 0 {
 		references = make([]helps.ChatGPTWebImageReference, 0, len(accumulator.FileIDs)+len(accumulator.SedimentIDs))
@@ -3244,28 +3336,283 @@ func (e *ChatGPTWebExecutor) downloadChatGPTWebImagesLimitedWithBudget(
 		}
 		urls = append(urls, downloadURL)
 	}
-	images := make([][]byte, 0, len(urls))
+	return urls, nil
+}
+
+func (e *ChatGPTWebExecutor) downloadChatGPTWebImagesWithWholeFinalization(
+	ctx context.Context,
+	client *chatgptwebauth.Client,
+	credential *chatgptwebauth.Credential,
+	accumulator *helps.ChatGPTWebImageAccumulator,
+	maxResults int,
+	responseByteLimit int,
+	request *helps.ChatGPTWebImageRequest,
+	imageSizeMatch *helps.ChatGPTWebImageSizeMatch,
+	imageConfig cliproxyexecutor.ChatGPTWebImageConfigSnapshot,
+	leases *helps.ChatGPTWebImageMemoryLeaseSet,
+) ([][]byte, context.Context, error) {
+	if leases == nil {
+		return nil, ctx, errors.New("chatgpt web image finalization memory lease is unavailable")
+	}
+	if responseByteLimit <= 0 {
+		responseByteLimit = chatGPTWebMaxImageResponseBytes
+	}
+	urls, errURLs := e.chatGPTWebImageDownloadURLs(ctx, client, credential, accumulator, maxResults)
+	if errURLs != nil {
+		return nil, ctx, errURLs
+	}
+	spooled := make([]*chatGPTWebSpooledImage, 0, len(urls))
+	defer func() { removeChatGPTWebSpooledImages(spooled) }()
 	totalBytes := 0
 	for _, downloadURL := range urls {
 		remainingBytes := responseByteLimit - totalBytes
 		if remainingBytes <= 0 {
-			return images, chatGPTWebImageResponseLimitError(responseByteLimit)
+			return nil, ctx, chatGPTWebImageResponseLimitError(responseByteLimit)
 		}
-		payload, err := e.downloadChatGPTWebImageAsset(ctx, client, credential, downloadURL, remainingBytes)
-		if err != nil {
+		image, errDownload := e.downloadChatGPTWebImageAssetToSpool(ctx, client, credential, downloadURL, remainingBytes)
+		if errDownload != nil {
 			var limitErr *chatGPTWebImageBodyLimitError
-			if errors.As(err, &limitErr) {
-				return images, chatGPTWebImageResponseLimitError(responseByteLimit)
+			if errors.As(errDownload, &limitErr) {
+				return nil, ctx, chatGPTWebImageResponseLimitError(responseByteLimit)
 			}
-			return images, err
+			return nil, ctx, errDownload
 		}
-		if totalBytes > responseByteLimit-len(payload) {
-			return images, chatGPTWebImageResponseLimitError(responseByteLimit)
+		if totalBytes > responseByteLimit-image.size {
+			_ = image.remove()
+			return nil, ctx, chatGPTWebImageResponseLimitError(responseByteLimit)
 		}
-		totalBytes += len(payload)
+		totalBytes += image.size
+		spooled = append(spooled, image)
+	}
+	workspaceBytes, errEstimate := estimateChatGPTWebWholeFinalizationBytes(
+		spooled,
+		request,
+		imageSizeMatch,
+		imageConfig,
+		responseByteLimit,
+	)
+	if errEstimate != nil {
+		return nil, ctx, errEstimate
+	}
+	if capacity := helps.ChatGPTWebImageMemorySnapshot().CapacityBytes; capacity < 1 || workspaceBytes > capacity {
+		return nil, ctx, &chatGPTWebImageMemoryCapacityError{stage: "download"}
+	}
+	releaseTurn, errBegin := leases.BeginFinalization(ctx)
+	if errBegin != nil {
+		return nil, ctx, errBegin
+	}
+	turnReleased := false
+	defer func() {
+		if !turnReleased {
+			releaseTurn()
+		}
+	}()
+	if errAcquire := leases.AcquireExact(ctx, workspaceBytes); errAcquire != nil {
+		return nil, ctx, chatGPTWebWholeFinalizationMemoryError(errAcquire)
+	}
+	releaseTurn()
+	turnReleased = true
+	workspaceContext := helps.WithChatGPTWebImageWholeFinalization(ctx)
+	images := make([][]byte, 0, len(spooled))
+	for _, image := range spooled {
+		payload, errRead := os.ReadFile(image.path)
+		if errRead != nil {
+			return nil, workspaceContext, fmt.Errorf("read chatgpt web image completion spool: %w", errRead)
+		}
+		if len(payload) != image.size {
+			return nil, workspaceContext, errors.New("chatgpt web image completion spool size changed")
+		}
+		if errValidate := validateChatGPTWebDownloadedImageWithAdmission(
+			workspaceContext,
+			payload,
+			image.contentType,
+			helps.AcquireChatGPTWebImageMemory,
+		); errValidate != nil {
+			return nil, workspaceContext, chatGPTWebImageOutputProtocolError("chatgpt web image download is invalid: " + errValidate.Error())
+		}
 		images = append(images, payload)
 	}
-	return images, nil
+	return images, workspaceContext, nil
+}
+
+func chatGPTWebWholeFinalizationMemoryError(err error) error {
+	if errors.Is(err, helps.ErrChatGPTWebImageMemoryQueueFull) || errors.Is(err, helps.ErrChatGPTWebImageMemoryWorkingSetTooLarge) {
+		return &chatGPTWebImageMemoryCapacityError{stage: "download"}
+	}
+	return err
+}
+
+func (e *ChatGPTWebExecutor) downloadChatGPTWebImageAssetToSpool(
+	ctx context.Context,
+	client *chatgptwebauth.Client,
+	credential *chatgptwebauth.Credential,
+	downloadURL string,
+	maxBytes int,
+) (*chatGPTWebSpooledImage, error) {
+	var lastErr error
+	for attempt := 0; attempt < chatGPTWebAssetSettleAttempts; attempt++ {
+		image, err, retryable := e.downloadChatGPTWebImageAssetToSpoolOnce(ctx, client, credential, downloadURL, maxBytes)
+		if err == nil {
+			return image, nil
+		}
+		lastErr = err
+		if !retryable {
+			return nil, err
+		}
+		if attempt+1 >= chatGPTWebAssetSettleAttempts {
+			return nil, chatGPTWebFinalAssetError(err)
+		}
+		delay, _ := chatGPTWebAssetRetryDelay(err, e.imageSettleWait)
+		if errWait := waitForChatGPTWebPoll(ctx, delay); errWait != nil {
+			return nil, errWait
+		}
+	}
+	return nil, chatGPTWebFinalAssetError(lastErr)
+}
+
+func (e *ChatGPTWebExecutor) downloadChatGPTWebImageAssetToSpoolOnce(
+	ctx context.Context,
+	client *chatgptwebauth.Client,
+	credential *chatgptwebauth.Credential,
+	downloadURL string,
+	maxBytes int,
+) (*chatGPTWebSpooledImage, error, bool) {
+	downloadHeaders := map[string]string{"accept": chatGPTWebImageDownloadAccept}
+	response, finalDownloadURL, errRequest := e.doChatGPTWebAssetRequest(ctx, client, credential, http.MethodGet, downloadURL, downloadHeaders, nil, false)
+	if errRequest != nil {
+		sanitizedErr := newChatGPTWebAssetTransportError(ctx, "download", errRequest)
+		helps.RecordAPIResponseError(ctx, e.configSnapshot(), sanitizedErr)
+		return nil, sanitizedErr, true
+	}
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		payload := readAndCloseChatGPTWebErrorBody(response.Body)
+		statusErr := newChatGPTWebAssetStatusError(response.StatusCode, finalDownloadURL, payload, response.Header, "image_download")
+		return nil, statusErr, chatGPTWebAssetSettleStatusRetryable(response.StatusCode)
+	}
+	contentType := response.Header.Get("Content-Type")
+	temporary, errCreate := os.CreateTemp("", "cliproxy-web-image-completion-*")
+	if errCreate != nil {
+		_ = response.Body.Close()
+		return nil, fmt.Errorf("create chatgpt web image completion spool: %w", errCreate), false
+	}
+	spooled := &chatGPTWebSpooledImage{path: temporary.Name(), contentType: contentType}
+	keep := false
+	defer func() {
+		if !keep {
+			_ = temporary.Close()
+			_ = spooled.remove()
+		}
+	}()
+	copied, errCopy := io.Copy(temporary, io.LimitReader(response.Body, int64(maxBytes)+1))
+	errCloseBody := response.Body.Close()
+	if errCopy != nil {
+		return nil, newChatGPTWebAssetTransportError(ctx, "download response", errCopy), false
+	}
+	if errCloseBody != nil {
+		return nil, newChatGPTWebAssetTransportError(ctx, "download response", errCloseBody), false
+	}
+	if copied > int64(maxBytes) {
+		return nil, &chatGPTWebImageBodyLimitError{maxBytes: maxBytes}, false
+	}
+	if copied == 0 {
+		return nil, chatGPTWebImageOutputProtocolError("chatgpt web image download is empty"), true
+	}
+	if _, errSeek := temporary.Seek(0, io.SeekStart); errSeek != nil {
+		return nil, fmt.Errorf("rewind chatgpt web image completion spool: %w", errSeek), false
+	}
+	decodedConfig, format, errConfig := image.DecodeConfig(temporary)
+	if errConfig != nil {
+		return nil, chatGPTWebImageOutputProtocolError("chatgpt web image download is invalid: " + errConfig.Error()), true
+	}
+	if errClose := temporary.Close(); errClose != nil {
+		return nil, fmt.Errorf("close chatgpt web image completion spool: %w", errClose), false
+	}
+	spooled.size = int(copied)
+	spooled.format = normalizeChatGPTWebImageOutputFormat(format)
+	spooled.width = decodedConfig.Width
+	spooled.height = decodedConfig.Height
+	keep = true
+	return spooled, nil, false
+}
+
+func estimateChatGPTWebWholeFinalizationBytes(
+	images []*chatGPTWebSpooledImage,
+	request *helps.ChatGPTWebImageRequest,
+	imageSizeMatch *helps.ChatGPTWebImageSizeMatch,
+	imageConfig cliproxyexecutor.ChatGPTWebImageConfigSnapshot,
+	responseByteLimit int,
+) (int64, error) {
+	if request == nil {
+		return 0, errors.New("chatgpt web image request is unavailable during finalization")
+	}
+	requestedFormat := normalizeChatGPTWebImageOutputFormat(request.OutputFormat)
+	if requestedFormat != "png" && requestedFormat != "jpeg" && requestedFormat != "webp" {
+		return 0, statusErr{code: http.StatusBadRequest, msg: "chatgpt web does not support the requested image output format", skipAuthResult: true, retryOtherAuth: true}
+	}
+	resizeEnabled := imageConfig.ResizeToRequestedSize && imageSizeMatch != nil
+	inputBytes := int64(0)
+	outputBytes := int64(0)
+	transientPeak := int64(1)
+	changed := false
+	for _, image := range images {
+		if image == nil || image.size <= 0 || image.width <= 0 || image.height <= 0 {
+			return 0, errors.New("chatgpt web image completion spool metadata is invalid")
+		}
+		inputBytes = saturatingChatGPTWebImageAdd(inputBytes, int64(image.size))
+		validationBytes := saturatingChatGPTWebImageMultiply(
+			saturatingChatGPTWebImagePixels(image.width, image.height),
+			chatGPTWebDecodedImageBytesPerPixel,
+		)
+		if validationBytes > transientPeak {
+			transientPeak = validationBytes
+		}
+		needsResize := resizeEnabled && (image.width != imageSizeMatch.Width || image.height != imageSizeMatch.Height)
+		needsEncoding := image.format != requestedFormat || requestedFormat == "jpeg" || requestedFormat == "webp"
+		if !needsResize && !needsEncoding {
+			outputBytes = saturatingChatGPTWebImageAdd(outputBytes, int64(image.size))
+			continue
+		}
+		changed = true
+		targetWidth, targetHeight := image.width, image.height
+		if needsResize {
+			targetWidth, targetHeight = imageSizeMatch.Width, imageSizeMatch.Height
+		}
+		processingBytes := estimateChatGPTWebImagePostProcessingBytes(
+			image.width,
+			image.height,
+			targetWidth,
+			targetHeight,
+			needsResize,
+			requestedFormat,
+		)
+		if processingBytes > transientPeak {
+			transientPeak = processingBytes
+		}
+		encodedUpperBound := chatGPTWebImageEncodedOutputUpperBound(targetWidth, targetHeight)
+		outputBytes = saturatingChatGPTWebImageAdd(outputBytes, encodedUpperBound)
+	}
+	if outputBytes > int64(responseByteLimit) {
+		outputBytes = int64(responseByteLimit)
+	}
+	base64Bytes := saturatingChatGPTWebImageMultiply(saturatingChatGPTWebImageAdd(outputBytes, 2)/3, 4)
+	workspaceBytes := saturatingChatGPTWebImageAdd(inputBytes, transientPeak)
+	if changed {
+		workspaceBytes = saturatingChatGPTWebImageAdd(workspaceBytes, outputBytes)
+	}
+	workspaceBytes = saturatingChatGPTWebImageAdd(workspaceBytes, saturatingChatGPTWebImageMultiply(base64Bytes, 2))
+	workspaceBytes = saturatingChatGPTWebImageAdd(workspaceBytes, chatGPTWebImageResponseJSONOverhead)
+	return max(workspaceBytes, int64(1)), nil
+}
+
+func chatGPTWebImageEncodedOutputUpperBound(width, height int) int64 {
+	// All supported encoders receive at most four bytes of source color data per
+	// pixel. Twice that raw size plus one MiB covers PNG scanline/DEFLATE and
+	// container overhead as well as the JPEG/WebP encoder output buffers. The
+	// response byte limit remains the final hard cap across all images.
+	return saturatingChatGPTWebImageAdd(
+		saturatingChatGPTWebImageMultiply(saturatingChatGPTWebImagePixels(width, height), 8),
+		1<<20,
+	)
 }
 
 func (e *ChatGPTWebExecutor) resolveChatGPTWebImageDownloadURL(ctx context.Context, client *chatgptwebauth.Client, credential *chatgptwebauth.Credential, path string) (string, error) {
@@ -3282,6 +3629,10 @@ func (e *ChatGPTWebExecutor) resolveChatGPTWebImageDownloadURL(ctx context.Conte
 			}
 			err = chatGPTWebImageOutputProtocolError("chatgpt web image output metadata is missing a download URL")
 		} else {
+			var memoryErr *chatGPTWebImageMemoryCapacityError
+			if errors.As(err, &memoryErr) {
+				return "", err
+			}
 			err = chatGPTWebAssetNetworkError(ctx, "download URL", err)
 		}
 		lastErr = err
@@ -3554,6 +3905,9 @@ func validateChatGPTWebDownloadedImageWithAdmission(
 }
 
 func acquireChatGPTWebTransientImageMemory(ctx context.Context, estimatedBytes int64) (func(), error) {
+	if helps.ChatGPTWebImageWholeFinalizationFromContext(ctx) {
+		return func() {}, nil
+	}
 	leases := helps.ChatGPTWebImageMemoryLeaseSetFromContext(ctx)
 	if leases == nil {
 		return helps.AcquireChatGPTWebImageMemory(ctx, estimatedBytes)
@@ -3653,65 +4007,30 @@ func (e *ChatGPTWebExecutor) doChatGPTWebGET(ctx context.Context, client *chatgp
 }
 
 func (e *ChatGPTWebExecutor) doChatGPTWebPollGET(ctx context.Context, client *chatgptwebauth.Client, credential *chatgptwebauth.Credential, path string, extra map[string]string, budget *chatGPTWebPollResponseBudget) (*fhttp.Response, []byte, func(), error) {
-	if err := acquireChatGPTWebImagePollSlot(ctx, chatGPTWebImagePollSlots); err != nil {
-		return nil, nil, nil, err
+	releasePoll, errPoll := acquireChatGPTWebImagePollSlot(ctx)
+	if errPoll != nil {
+		return nil, nil, nil, errPoll
 	}
-	defer releaseChatGPTWebImagePollSlot(chatGPTWebImagePollSlots)
+	defer releasePoll()
 	started := time.Now()
 	response, payload, release, err := e.doChatGPTWebGETWithBudget(ctx, client, credential, path, extra, budget, false)
 	cliproxyexecutor.ObserveRequestPhaseContext(ctx, cliproxyexecutor.ImagePhasePollRequest, started)
 	return response, payload, release, err
 }
 
-func acquireChatGPTWebImagePollSlot(ctx context.Context, slots chan struct{}) error {
-	if slots == nil {
-		return nil
-	}
+func acquireChatGPTWebImagePollSlot(ctx context.Context) (func(), error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	started := time.Now()
 	chatGPTWebImagePollMetrics.attempts.Add(1)
-	select {
-	case slots <- struct{}{}:
-		chatGPTWebImagePollMetrics.acquired.Add(1)
-		waitNanos := uint64(max(time.Since(started).Nanoseconds(), int64(0)))
-		chatGPTWebImagePollMetrics.totalWaitNanos.Add(waitNanos)
-		updateAtomicUint64Max(&chatGPTWebImagePollMetrics.maxWaitNanos, waitNanos)
-		active := chatGPTWebImagePollMetrics.active.Add(1)
-		updateAtomicInt64Max(&chatGPTWebImagePollMetrics.peakActive, active)
-		cliproxyexecutor.ObserveRequestPhaseContext(ctx, cliproxyexecutor.ImagePhasePollSlotWait, started)
-		return nil
-	case <-ctx.Done():
-		chatGPTWebImagePollMetrics.canceled.Add(1)
-		cliproxyexecutor.ObserveRequestPhaseContext(ctx, cliproxyexecutor.ImagePhasePollSlotWait, started)
-		return ctx.Err()
+	release, err := cliproxyexecutor.AcquireChatGPTWebImagePoll(ctx)
+	cliproxyexecutor.ObserveRequestPhaseContext(ctx, cliproxyexecutor.ImagePhasePollSlotWait, started)
+	if err != nil {
+		return nil, err
 	}
-}
-
-func releaseChatGPTWebImagePollSlot(slots chan struct{}) {
-	if slots != nil {
-		<-slots
-		chatGPTWebImagePollMetrics.active.Add(-1)
-	}
-}
-
-func updateAtomicUint64Max(target *atomic.Uint64, value uint64) {
-	for {
-		current := target.Load()
-		if value <= current || target.CompareAndSwap(current, value) {
-			return
-		}
-	}
-}
-
-func updateAtomicInt64Max(target *atomic.Int64, value int64) {
-	for {
-		current := target.Load()
-		if value <= current || target.CompareAndSwap(current, value) {
-			return
-		}
-	}
+	chatGPTWebImagePollMetrics.acquired.Add(1)
+	return release, nil
 }
 
 func readChatGPTWebPollResponseBody(ctx context.Context, response *fhttp.Response, maxBytes int) ([]byte, func(), error) {

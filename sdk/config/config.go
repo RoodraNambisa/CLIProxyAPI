@@ -78,6 +78,15 @@ const (
 	MaxChatGPTWebMaxN                          = internalconfig.MaxChatGPTWebMaxN
 )
 
+const (
+	DefaultChatGPTWebImagePollConcurrency            = internalconfig.DefaultChatGPTWebImagePollConcurrency
+	MinChatGPTWebImagePollConcurrency                = internalconfig.MinChatGPTWebImagePollConcurrency
+	MaxChatGPTWebImagePollConcurrency                = internalconfig.MaxChatGPTWebImagePollConcurrency
+	DefaultChatGPTWebImageMemoryFinalizerConcurrency = internalconfig.DefaultChatGPTWebImageMemoryFinalizerConcurrency
+	MinChatGPTWebImageMemoryFinalizerConcurrency     = internalconfig.MinChatGPTWebImageMemoryFinalizerConcurrency
+	MaxChatGPTWebImageMemoryFinalizerConcurrency     = internalconfig.MaxChatGPTWebImageMemoryFinalizerConcurrency
+)
+
 func LoadConfig(configFile string) (*Config, error) { return internalconfig.LoadConfig(configFile) }
 
 func LoadConfigOptional(configFile string, optional bool) (*Config, error) {

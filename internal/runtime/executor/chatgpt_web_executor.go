@@ -274,6 +274,11 @@ func configureChatGPTWebImageAdmissions(resolved config.ResolvedChatGPTWebImageC
 		resolved.AdmissionQueueSize,
 		resolved.MaxFinalizers,
 	)
+	cliproxyexecutor.ConfigureChatGPTWebImageRuntimeAdmissions(
+		resolved.MaxInFlight,
+		resolved.PollConcurrency,
+		resolved.MemoryFinalizerConcurrency,
+	)
 }
 
 func chatGPTWebSentinelRuntimeConfig(cfg *config.Config) chatgptwebauth.SentinelRuntimeConfig {
