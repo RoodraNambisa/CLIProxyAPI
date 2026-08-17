@@ -25,6 +25,7 @@ func TestFinishChatGPTWebImageUsesConfiguredParallelWholeFinalization(t *testing
 	temporaryDirectory := t.TempDir()
 	t.Setenv("TMPDIR", temporaryDirectory)
 	imageData := chatGPTWebPNGBytes(t, color.NRGBA{R: 0x44, B: 0xff, A: 0xff})
+	spoolBefore := helps.ChatGPTWebImageSpoolSnapshot()
 	var server *httptest.Server
 	server = httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
 		switch request.URL.Path {
@@ -101,6 +102,12 @@ func TestFinishChatGPTWebImageUsesConfiguredParallelWholeFinalization(t *testing
 	entries, errReadDir := os.ReadDir(temporaryDirectory)
 	if errReadDir != nil || len(entries) != 0 {
 		t.Fatalf("finish completion spool entries = %v, error = %v", entries, errReadDir)
+	}
+	spoolAfter := helps.ChatGPTWebImageSpoolSnapshot()
+	if spoolAfter.CurrentFiles != spoolBefore.CurrentFiles || spoolAfter.CurrentBytes != spoolBefore.CurrentBytes ||
+		spoolAfter.CreatedFiles != spoolBefore.CreatedFiles+1 || spoolAfter.CleanedFiles != spoolBefore.CleanedFiles+1 ||
+		spoolAfter.PeakBytes < int64(len(imageData)) {
+		t.Fatalf("completion spool metrics before=%#v after=%#v", spoolBefore, spoolAfter)
 	}
 	leases.Release()
 	if snapshot := helps.ChatGPTWebImageMemorySnapshot(); snapshot.ProcessingTasks != 0 || snapshot.ProcessingBytes != 0 {

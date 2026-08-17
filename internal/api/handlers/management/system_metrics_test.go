@@ -92,6 +92,9 @@ func TestGetSystemMetricsReturnsRuntimeAndConfiguredFilesystems(t *testing.T) {
 	if response.ChatGPTWebMemoryFinalizers.Limit != 3 || response.ChatGPTWebMemoryFinalizers.QueueLimit != 7 || response.ChatGPTWebMemoryFinalizers.Active != 0 {
 		t.Fatalf("ChatGPTWebMemoryFinalizers = %#v", response.ChatGPTWebMemoryFinalizers)
 	}
+	if response.ImageSpool.CurrentFiles < 0 || response.ImageSpool.CurrentBytes < 0 || response.ImageSpool.PeakBytes < response.ImageSpool.CurrentBytes {
+		t.Fatalf("ImageSpool = %#v", response.ImageSpool)
+	}
 	if response.ImageRequestPhases.HandlerScope != "all_image_routes" ||
 		response.ImageRequestPhases.WebScope != "chatgpt_web_only_after_executor_selection" ||
 		response.ImageRequestPhases.ResponseWriteCountSemantics != "write_operations" ||

@@ -130,6 +130,7 @@ type chatGPTWebSpooledImage struct {
 	format      string
 	width       int
 	height      int
+	tracker     *helps.ChatGPTWebImageSpoolFile
 }
 
 func (image *chatGPTWebSpooledImage) remove() error {
@@ -138,6 +139,7 @@ func (image *chatGPTWebSpooledImage) remove() error {
 	}
 	err := os.Remove(image.path)
 	image.path = ""
+	image.tracker.FinishCleanup(err)
 	return err
 }
 
@@ -3495,7 +3497,11 @@ func (e *ChatGPTWebExecutor) downloadChatGPTWebImageAssetToSpoolOnce(
 		_ = response.Body.Close()
 		return nil, fmt.Errorf("create chatgpt web image completion spool: %w", errCreate), false
 	}
-	spooled := &chatGPTWebSpooledImage{path: temporary.Name(), contentType: contentType}
+	spooled := &chatGPTWebSpooledImage{
+		path:        temporary.Name(),
+		contentType: contentType,
+		tracker:     helps.BeginChatGPTWebImageSpool(),
+	}
 	keep := false
 	defer func() {
 		if !keep {
@@ -3504,6 +3510,7 @@ func (e *ChatGPTWebExecutor) downloadChatGPTWebImageAssetToSpoolOnce(
 		}
 	}()
 	copied, errCopy := io.Copy(temporary, io.LimitReader(response.Body, int64(maxBytes)+1))
+	spooled.tracker.SetBytes(copied)
 	errCloseBody := response.Body.Close()
 	if errCopy != nil {
 		return nil, newChatGPTWebAssetTransportError(ctx, "download response", errCopy), false
@@ -3976,9 +3983,14 @@ func readChatGPTWebBoundedBodyWithAdmission(
 		return nil, fmt.Errorf("create bounded image spool: %w", errCreate)
 	}
 	path := temporary.Name()
-	defer func() { _ = os.Remove(path) }()
+	spoolTracker := helps.BeginChatGPTWebImageSpool()
+	defer func() {
+		errRemove := os.Remove(path)
+		spoolTracker.FinishCleanup(errRemove)
+	}()
 	defer func() { _ = temporary.Close() }()
 	copied, errCopy := io.Copy(temporary, io.LimitReader(body, int64(maxBytes)+1))
+	spoolTracker.SetBytes(copied)
 	if errCopy != nil {
 		return nil, fmt.Errorf("spool chatgpt web response body: %w", errCopy)
 	}

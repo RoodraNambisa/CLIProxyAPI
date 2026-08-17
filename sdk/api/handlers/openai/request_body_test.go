@@ -41,6 +41,7 @@ func TestReadOpenAIJSONRequestBodyWithLimitRejectsChunkedOverflow(t *testing.T) 
 }
 
 func TestSpoolUnknownImageRequestBodyUsesDiskAndCleansUp(t *testing.T) {
+	spoolBefore := executorhelps.ChatGPTWebImageSpoolSnapshot()
 	trackedBody := &trackedOpenAIRequestBody{Reader: strings.NewReader(`{"prompt":"hello"}`)}
 	request := httptest.NewRequest(http.MethodPost, "/v1/images/generations", trackedBody)
 	request.ContentLength = -1
@@ -68,6 +69,14 @@ func TestSpoolUnknownImageRequestBodyUsesDiskAndCleansUp(t *testing.T) {
 	}
 	if _, errStat := os.Stat(path); !errors.Is(errStat, os.ErrNotExist) {
 		t.Fatalf("spool file remained after close: %v", errStat)
+	}
+	if errCloseAgain := request.Body.Close(); errCloseAgain != nil {
+		t.Fatalf("second close spooled body: %v", errCloseAgain)
+	}
+	spoolAfter := executorhelps.ChatGPTWebImageSpoolSnapshot()
+	if spoolAfter.CurrentFiles != spoolBefore.CurrentFiles || spoolAfter.CurrentBytes != spoolBefore.CurrentBytes ||
+		spoolAfter.CreatedFiles != spoolBefore.CreatedFiles+1 || spoolAfter.CleanedFiles != spoolBefore.CleanedFiles+1 {
+		t.Fatalf("spool metrics before=%#v after=%#v", spoolBefore, spoolAfter)
 	}
 }
 

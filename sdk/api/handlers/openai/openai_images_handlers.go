@@ -69,9 +69,10 @@ var (
 )
 
 type imageRequestSpoolBody struct {
-	file *os.File
-	path string
-	once sync.Once
+	file    *os.File
+	path    string
+	tracker *executorhelps.ChatGPTWebImageSpoolFile
+	once    sync.Once
 }
 
 func (body *imageRequestSpoolBody) Read(data []byte) (int, error) {
@@ -90,9 +91,12 @@ func (body *imageRequestSpoolBody) Close() error {
 		if body.file != nil {
 			closeErr = body.file.Close()
 		}
+		var removeErr error
 		if body.path != "" {
-			closeErr = errors.Join(closeErr, os.Remove(body.path))
+			removeErr = os.Remove(body.path)
 		}
+		body.tracker.FinishCleanup(removeErr)
+		closeErr = errors.Join(closeErr, removeErr)
 	})
 	return closeErr
 }
@@ -470,7 +474,11 @@ func spoolUnknownImageRequestBody(request *http.Request) error {
 	if errCreate != nil {
 		return fmt.Errorf("create image request spool: %w", errCreate)
 	}
-	body := &imageRequestSpoolBody{file: temporary, path: temporary.Name()}
+	body := &imageRequestSpoolBody{
+		file:    temporary,
+		path:    temporary.Name(),
+		tracker: executorhelps.BeginChatGPTWebImageSpool(),
+	}
 	keep := false
 	defer func() {
 		if !keep {
@@ -478,6 +486,7 @@ func spoolUnknownImageRequestBody(request *http.Request) error {
 		}
 	}()
 	copied, errCopy := io.Copy(temporary, io.LimitReader(original, int64(maxImageMultipartBytes)+1))
+	body.tracker.SetBytes(copied)
 	if errCopy != nil {
 		return fmt.Errorf("spool image request body: %w", errCopy)
 	}

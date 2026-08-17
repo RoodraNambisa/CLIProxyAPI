@@ -33,6 +33,7 @@ type systemMetricsResponse struct {
 	ChatGPTWebFinalizers       coreexecutor.ImageExecutionAdmissionSnapshot       `json:"chatgpt_web_image_finalizers"`
 	ChatGPTWebMemoryFinalizers coreexecutor.ImageExecutionAdmissionSnapshot       `json:"chatgpt_web_image_memory_finalizers"`
 	ChatGPTWebPollSlots        runtimeexecutor.ChatGPTWebImagePollRuntimeSnapshot `json:"chatgpt_web_image_poll_slots"`
+	ImageSpool                 helps.ChatGPTWebImageSpoolRuntimeSnapshot          `json:"image_spool"`
 	ImageRequestPhases         systemMetricsImageRequestPhases                    `json:"image_request_phases"`
 }
 
@@ -75,6 +76,7 @@ func (h *Handler) GetSystemMetrics(c *gin.Context) {
 		ChatGPTWebFinalizers:       coreexecutor.ChatGPTWebImageFinalizerAdmissionSnapshot(),
 		ChatGPTWebMemoryFinalizers: coreexecutor.ChatGPTWebImageMemoryFinalizerAdmissionSnapshot(),
 		ChatGPTWebPollSlots:        runtimeexecutor.ChatGPTWebImagePollSnapshot(),
+		ImageSpool:                 helps.ChatGPTWebImageSpoolSnapshot(),
 		ImageRequestPhases: systemMetricsImageRequestPhases{
 			HandlerScope:                "all_image_routes",
 			WebScope:                    "chatgpt_web_only_after_executor_selection",
