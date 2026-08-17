@@ -1144,6 +1144,63 @@ func TestChatGPTWebExecutorUpdateConfigAppliesImageAdmissionPolicyWithoutEvictin
 	}
 }
 
+func TestChatGPTWebExecutorUpdateConfigAppliesValuesAboveRecommendations(t *testing.T) {
+	executor := NewChatGPTWebExecutor(nil, nil)
+	t.Cleanup(func() { _ = executor.Close() })
+	t.Cleanup(func() {
+		configureChatGPTWebImageAdmissions(config.ChatGPTWebImageConfig{}.Resolved())
+	})
+	maxInFlight := 5000
+	queueLimit := 5000
+	waitMilliseconds := 30001
+	maxFinalizers := 65
+	completionReserve := 33
+	memoryCapacity := 8193
+	pollConcurrency := 600
+	memoryFinalizerConcurrency := 65
+	imageConfig := config.ChatGPTWebImageConfig{
+		MaxInFlight:                &maxInFlight,
+		AdmissionQueueSize:         &queueLimit,
+		AdmissionWaitMilliseconds:  &waitMilliseconds,
+		MaxFinalizers:              &maxFinalizers,
+		CompletionReserveMegabytes: &completionReserve,
+		MemoryCapacityMegabytes:    &memoryCapacity,
+		PollConcurrency:            &pollConcurrency,
+		MemoryFinalizerConcurrency: &memoryFinalizerConcurrency,
+	}
+	if errValidate := imageConfig.Validate(); errValidate != nil {
+		t.Fatalf("Validate() error = %v", errValidate)
+	}
+	executor.UpdateConfig(&config.Config{SDKConfig: config.SDKConfig{Images: config.ImagesConfig{ChatGPTWeb: imageConfig}}})
+
+	resolved := executor.currentChatGPTWebImageConfig()
+	if resolved.MaxInFlight != maxInFlight || resolved.AdmissionQueueSize != queueLimit ||
+		resolved.AdmissionWaitMilliseconds != waitMilliseconds || resolved.MaxFinalizers != maxFinalizers ||
+		resolved.CompletionReserveMegabytes != completionReserve || resolved.MemoryCapacityMegabytes != memoryCapacity ||
+		resolved.PollConcurrency != pollConcurrency || resolved.MemoryFinalizerConcurrency != memoryFinalizerConcurrency {
+		t.Fatalf("resolved image config = %#v", resolved)
+	}
+	if snapshot := cliproxyexecutor.ChatGPTWebImageExecutionAdmissionSnapshot(); snapshot.Limit != maxInFlight || snapshot.QueueLimit != queueLimit {
+		t.Fatalf("execution admission = %#v", snapshot)
+	}
+	if snapshot := cliproxyexecutor.ChatGPTWebImageFinalizerAdmissionSnapshot(); snapshot.Limit != maxFinalizers || snapshot.QueueLimit != maxInFlight {
+		t.Fatalf("finalizer admission = %#v", snapshot)
+	}
+	if snapshot := cliproxyexecutor.ChatGPTWebImagePollAdmissionSnapshot(); snapshot.Limit != pollConcurrency || snapshot.QueueLimit != maxInFlight*2 {
+		t.Fatalf("poll admission = %#v", snapshot)
+	}
+	if snapshot := cliproxyexecutor.ChatGPTWebImageMemoryFinalizerAdmissionSnapshot(); snapshot.Limit != memoryFinalizerConcurrency || snapshot.QueueLimit != maxInFlight {
+		t.Fatalf("memory finalizer admission = %#v", snapshot)
+	}
+	capacityBytes, errCapacity := config.ChatGPTWebImageMegabytesToBytes(memoryCapacity)
+	if errCapacity != nil {
+		t.Fatalf("ChatGPTWebImageMegabytesToBytes() error = %v", errCapacity)
+	}
+	if snapshot := helps.ChatGPTWebImageMemorySnapshot(); snapshot.CapacityBytes != capacityBytes {
+		t.Fatalf("memory admission = %#v", snapshot)
+	}
+}
+
 func TestChatGPTWebExecutorFetchModels(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
 		switch request.URL.Path {

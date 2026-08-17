@@ -131,16 +131,24 @@ func (e *ChatGPTWebExecutor) currentChatGPTWebImageConfig() config.ResolvedChatG
 
 func (e *ChatGPTWebExecutor) acquireChatGPTWebImageLifecycle(ctx context.Context, prepared *chatGPTWebPreparedRequest) (func(), error) {
 	resolved := e.currentChatGPTWebImageConfig()
+	admissionWait, errWait := config.ChatGPTWebImageAdmissionWaitDuration(resolved.AdmissionWaitMilliseconds)
+	if errWait != nil {
+		return nil, cliproxyexecutor.NewImageExecutionCapacityError("invalid_admission_wait")
+	}
 	started := time.Now()
 	releaseExecution, err := cliproxyexecutor.AcquireChatGPTWebImageExecution(
 		ctx,
-		time.Duration(resolved.AdmissionWaitMilliseconds)*time.Millisecond,
+		admissionWait,
 	)
 	cliproxyexecutor.ObserveRequestPhaseContext(ctx, cliproxyexecutor.ImagePhaseExecutionAdmission, started)
 	if err != nil {
 		return nil, err
 	}
-	reserveBytes := int64(resolved.CompletionReserveMegabytes) << 20
+	reserveBytes, errReserve := config.ChatGPTWebImageMegabytesToBytes(resolved.CompletionReserveMegabytes)
+	if errReserve != nil {
+		releaseExecution()
+		return nil, cliproxyexecutor.NewImageExecutionCapacityError("invalid_completion_reserve")
+	}
 	if prepared != nil && prepared.imageMemoryLeases != nil && !prepared.imageMemoryLeases.TryReserveCompletion(reserveBytes) {
 		releaseExecution()
 		return nil, cliproxyexecutor.NewImageExecutionCapacityError("completion_memory")

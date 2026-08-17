@@ -58,33 +58,50 @@ const (
 	DefaultChatGPTWebMaxN                      = internalconfig.DefaultChatGPTWebMaxN
 	DefaultChatGPTWebImageMaxInFlight          = internalconfig.DefaultChatGPTWebImageMaxInFlight
 	MinChatGPTWebImageMaxInFlight              = internalconfig.MinChatGPTWebImageMaxInFlight
-	MaxChatGPTWebImageMaxInFlight              = internalconfig.MaxChatGPTWebImageMaxInFlight
-	DefaultChatGPTWebImageAdmissionQueueSize   = internalconfig.DefaultChatGPTWebImageAdmissionQueueSize
-	MinChatGPTWebImageAdmissionQueueSize       = internalconfig.MinChatGPTWebImageAdmissionQueueSize
-	MaxChatGPTWebImageAdmissionQueueSize       = internalconfig.MaxChatGPTWebImageAdmissionQueueSize
-	DefaultChatGPTWebImageAdmissionWaitMS      = internalconfig.DefaultChatGPTWebImageAdmissionWaitMS
-	MinChatGPTWebImageAdmissionWaitMS          = internalconfig.MinChatGPTWebImageAdmissionWaitMS
+	RecommendedMaxChatGPTWebImageMaxInFlight   = internalconfig.RecommendedMaxChatGPTWebImageMaxInFlight
+	// Deprecated: this advisory alias is not a validation limit. Use RecommendedMaxChatGPTWebImageMaxInFlight.
+	MaxChatGPTWebImageMaxInFlight                   = internalconfig.MaxChatGPTWebImageMaxInFlight
+	DefaultChatGPTWebImageAdmissionQueueSize        = internalconfig.DefaultChatGPTWebImageAdmissionQueueSize
+	MinChatGPTWebImageAdmissionQueueSize            = internalconfig.MinChatGPTWebImageAdmissionQueueSize
+	RecommendedMaxChatGPTWebImageAdmissionQueueSize = internalconfig.RecommendedMaxChatGPTWebImageAdmissionQueueSize
+	// Deprecated: this advisory alias is not a validation limit. Use RecommendedMaxChatGPTWebImageAdmissionQueueSize.
+	MaxChatGPTWebImageAdmissionQueueSize         = internalconfig.MaxChatGPTWebImageAdmissionQueueSize
+	DefaultChatGPTWebImageAdmissionWaitMS        = internalconfig.DefaultChatGPTWebImageAdmissionWaitMS
+	MinChatGPTWebImageAdmissionWaitMS            = internalconfig.MinChatGPTWebImageAdmissionWaitMS
+	RecommendedMaxChatGPTWebImageAdmissionWaitMS = internalconfig.RecommendedMaxChatGPTWebImageAdmissionWaitMS
+	// Deprecated: this advisory alias is not a validation limit. Use RecommendedMaxChatGPTWebImageAdmissionWaitMS.
 	MaxChatGPTWebImageAdmissionWaitMS          = internalconfig.MaxChatGPTWebImageAdmissionWaitMS
 	DefaultChatGPTWebImageMaxFinalizers        = internalconfig.DefaultChatGPTWebImageMaxFinalizers
 	MinChatGPTWebImageMaxFinalizers            = internalconfig.MinChatGPTWebImageMaxFinalizers
-	MaxChatGPTWebImageMaxFinalizers            = internalconfig.MaxChatGPTWebImageMaxFinalizers
-	DefaultChatGPTWebImageCompletionReserveMB  = internalconfig.DefaultChatGPTWebImageCompletionReserveMB
-	MinChatGPTWebImageCompletionReserveMB      = internalconfig.MinChatGPTWebImageCompletionReserveMB
-	MaxChatGPTWebImageCompletionReserveMB      = internalconfig.MaxChatGPTWebImageCompletionReserveMB
-	DefaultChatGPTWebImageMemoryCapacityMB     = internalconfig.DefaultChatGPTWebImageMemoryCapacityMB
-	MinChatGPTWebImageMemoryCapacityMB         = internalconfig.MinChatGPTWebImageMemoryCapacityMB
-	MaxChatGPTWebImageMemoryCapacityMB         = internalconfig.MaxChatGPTWebImageMemoryCapacityMB
-	MinChatGPTWebMaxN                          = internalconfig.MinChatGPTWebMaxN
-	MaxChatGPTWebMaxN                          = internalconfig.MaxChatGPTWebMaxN
+	RecommendedMaxChatGPTWebImageMaxFinalizers = internalconfig.RecommendedMaxChatGPTWebImageMaxFinalizers
+	// Deprecated: this advisory alias is not a validation limit. Use RecommendedMaxChatGPTWebImageMaxFinalizers.
+	MaxChatGPTWebImageMaxFinalizers                  = internalconfig.MaxChatGPTWebImageMaxFinalizers
+	DefaultChatGPTWebImageCompletionReserveMB        = internalconfig.DefaultChatGPTWebImageCompletionReserveMB
+	MinChatGPTWebImageCompletionReserveMB            = internalconfig.MinChatGPTWebImageCompletionReserveMB
+	RecommendedMaxChatGPTWebImageCompletionReserveMB = internalconfig.RecommendedMaxChatGPTWebImageCompletionReserveMB
+	// Deprecated: this advisory alias is not a validation limit. Use RecommendedMaxChatGPTWebImageCompletionReserveMB.
+	MaxChatGPTWebImageCompletionReserveMB         = internalconfig.MaxChatGPTWebImageCompletionReserveMB
+	DefaultChatGPTWebImageMemoryCapacityMB        = internalconfig.DefaultChatGPTWebImageMemoryCapacityMB
+	MinChatGPTWebImageMemoryCapacityMB            = internalconfig.MinChatGPTWebImageMemoryCapacityMB
+	RecommendedMinChatGPTWebImageMemoryCapacityMB = internalconfig.RecommendedMinChatGPTWebImageMemoryCapacityMB
+	RecommendedMaxChatGPTWebImageMemoryCapacityMB = internalconfig.RecommendedMaxChatGPTWebImageMemoryCapacityMB
+	// Deprecated: this advisory alias is not a validation limit. Use RecommendedMaxChatGPTWebImageMemoryCapacityMB.
+	MaxChatGPTWebImageMemoryCapacityMB = internalconfig.MaxChatGPTWebImageMemoryCapacityMB
+	MinChatGPTWebMaxN                  = internalconfig.MinChatGPTWebMaxN
+	MaxChatGPTWebMaxN                  = internalconfig.MaxChatGPTWebMaxN
 )
 
 const (
-	DefaultChatGPTWebImagePollConcurrency            = internalconfig.DefaultChatGPTWebImagePollConcurrency
-	MinChatGPTWebImagePollConcurrency                = internalconfig.MinChatGPTWebImagePollConcurrency
-	MaxChatGPTWebImagePollConcurrency                = internalconfig.MaxChatGPTWebImagePollConcurrency
-	DefaultChatGPTWebImageMemoryFinalizerConcurrency = internalconfig.DefaultChatGPTWebImageMemoryFinalizerConcurrency
-	MinChatGPTWebImageMemoryFinalizerConcurrency     = internalconfig.MinChatGPTWebImageMemoryFinalizerConcurrency
-	MaxChatGPTWebImageMemoryFinalizerConcurrency     = internalconfig.MaxChatGPTWebImageMemoryFinalizerConcurrency
+	DefaultChatGPTWebImagePollConcurrency        = internalconfig.DefaultChatGPTWebImagePollConcurrency
+	MinChatGPTWebImagePollConcurrency            = internalconfig.MinChatGPTWebImagePollConcurrency
+	RecommendedMaxChatGPTWebImagePollConcurrency = internalconfig.RecommendedMaxChatGPTWebImagePollConcurrency
+	// Deprecated: this advisory alias is not a validation limit. Use RecommendedMaxChatGPTWebImagePollConcurrency.
+	MaxChatGPTWebImagePollConcurrency                       = internalconfig.MaxChatGPTWebImagePollConcurrency
+	DefaultChatGPTWebImageMemoryFinalizerConcurrency        = internalconfig.DefaultChatGPTWebImageMemoryFinalizerConcurrency
+	MinChatGPTWebImageMemoryFinalizerConcurrency            = internalconfig.MinChatGPTWebImageMemoryFinalizerConcurrency
+	RecommendedMaxChatGPTWebImageMemoryFinalizerConcurrency = internalconfig.RecommendedMaxChatGPTWebImageMemoryFinalizerConcurrency
+	// Deprecated: this advisory alias is not a validation limit. Use RecommendedMaxChatGPTWebImageMemoryFinalizerConcurrency.
+	MaxChatGPTWebImageMemoryFinalizerConcurrency = internalconfig.MaxChatGPTWebImageMemoryFinalizerConcurrency
 )
 
 func LoadConfig(configFile string) (*Config, error) { return internalconfig.LoadConfig(configFile) }

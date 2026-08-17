@@ -467,14 +467,14 @@ nonstream-keepalive-interval: 0
 #     resize-filter: "catmull-rom"     # catmull-rom for quality, or approx-bilinear for throughput.
 #     max-image-response-megabytes: 128 # Maximum compressed image bytes returned by one request.
 #     max-n: 1                          # Maximum images in one logical ChatGPT Web image request (1-10).
-#     max-in-flight: 64                 # Complete Web image attempts, including sleeping polls (1-4096).
-#     admission-queue-size: 64          # Bounded pre-upstream waiters; excess requests fail fast (0-4096).
-#     admission-wait-milliseconds: 1000 # Maximum local admission wait before a retryable 503.
-#     max-finalizers: 8                 # Settled tasks admitted to staging, separate from memory-finalizer-concurrency.
-#     completion-reserve-megabytes: 1   # Per-attempt memory reserved before upstream generation starts.
-#     memory-capacity-megabytes: 512    # Shared process-wide Web image working-set budget (64-8192 MiB); independent of GOMEMLIMIT.
-#     poll-concurrency: 64              # Concurrent image poll HTTP requests (1-512); sleeping tasks do not occupy a slot.
-#     memory-finalizer-concurrency: 1   # Concurrent disk-spooled heavy finalizers (1-64); also bounded by max-finalizers and memory capacity.
+#     max-in-flight: 64                 # Complete Web image attempts, including sleeping polls (recommended: 1-4096).
+#     admission-queue-size: 64          # Bounded pre-upstream waiters; excess requests fail fast (recommended: 0-4096).
+#     admission-wait-milliseconds: 1000 # Maximum local admission wait before a retryable 503 (recommended: 0-30000 ms).
+#     max-finalizers: 8                 # Settled staging tasks (recommended: 1-64), separate from memory-finalizer-concurrency.
+#     completion-reserve-megabytes: 1   # Per-attempt memory reserved before upstream work (recommended: 0-32 MiB).
+#     memory-capacity-megabytes: 512    # Shared process-wide working set (recommended: 64-8192 MiB); independent of GOMEMLIMIT.
+#     poll-concurrency: 64              # Concurrent poll HTTP requests (recommended: 1-512); sleeping tasks hold no slot.
+#     memory-finalizer-concurrency: 1   # Disk-spooled heavy finalizers (recommended: 1-64), also bounded by staging and memory.
 #   native:
 #     generations:
 #       enabled: false

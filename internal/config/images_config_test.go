@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestLoadConfigOptionalImagesStreamFlushSettings(t *testing.T) {
@@ -145,27 +146,32 @@ func TestChatGPTWebImageAspectSettingsDefaultsAndValidation(t *testing.T) {
 	zeroN := 0
 	tooLargeN := MaxChatGPTWebMaxN + 1
 	zeroInFlight := 0
-	tooLargeInFlight := MaxChatGPTWebImageMaxInFlight + 1
 	negativeQueue := -1
-	tooLargeQueue := MaxChatGPTWebImageAdmissionQueueSize + 1
 	negativeAdmissionWait := -1
-	tooLargeAdmissionWait := MaxChatGPTWebImageAdmissionWaitMS + 1
 	zeroFinalizers := 0
-	tooLargeFinalizers := MaxChatGPTWebImageMaxFinalizers + 1
 	negativeReserve := -1
-	tooLargeReserve := MaxChatGPTWebImageCompletionReserveMB + 1
-	tooSmallMemoryCapacity := MinChatGPTWebImageMemoryCapacityMB - 1
-	tooLargeMemoryCapacity := MaxChatGPTWebImageMemoryCapacityMB + 1
+	zeroMemoryCapacity := 0
 	zeroPollConcurrency := 0
-	tooLargePollConcurrency := MaxChatGPTWebImagePollConcurrency + 1
 	zeroMemoryFinalizers := 0
-	tooLargeMemoryFinalizers := MaxChatGPTWebImageMemoryFinalizerConcurrency + 1
-	twoThousand := 2000
+	aboveRecommendedInFlight := 5000
+	aboveRecommendedQueue := 5000
+	aboveRecommendedAdmissionWait := 30001
+	aboveRecommendedFinalizers := 65
+	aboveRecommendedReserve := 33
+	aboveRecommendedMemory := 8193
+	aboveRecommendedPoll := 600
+	aboveRecommendedMemoryFinalizers := 65
 	if err := (ChatGPTWebImageConfig{
-		MaxInFlight:        &twoThousand,
-		AdmissionQueueSize: &twoThousand,
+		MaxInFlight:                &aboveRecommendedInFlight,
+		AdmissionQueueSize:         &aboveRecommendedQueue,
+		AdmissionWaitMilliseconds:  &aboveRecommendedAdmissionWait,
+		MaxFinalizers:              &aboveRecommendedFinalizers,
+		CompletionReserveMegabytes: &aboveRecommendedReserve,
+		MemoryCapacityMegabytes:    &aboveRecommendedMemory,
+		PollConcurrency:            &aboveRecommendedPoll,
+		MemoryFinalizerConcurrency: &aboveRecommendedMemoryFinalizers,
 	}).Validate(); err != nil {
-		t.Fatalf("2000-task image capacity should be configurable: %v", err)
+		t.Fatalf("values above the operational recommendations should be configurable: %v", err)
 	}
 	tests := []struct {
 		name string
@@ -184,21 +190,35 @@ func TestChatGPTWebImageAspectSettingsDefaultsAndValidation(t *testing.T) {
 		{name: "zero max n", cfg: ChatGPTWebImageConfig{MaxN: &zeroN}},
 		{name: "large max n", cfg: ChatGPTWebImageConfig{MaxN: &tooLargeN}},
 		{name: "zero in flight", cfg: ChatGPTWebImageConfig{MaxInFlight: &zeroInFlight}},
-		{name: "large in flight", cfg: ChatGPTWebImageConfig{MaxInFlight: &tooLargeInFlight}},
 		{name: "negative queue", cfg: ChatGPTWebImageConfig{AdmissionQueueSize: &negativeQueue}},
-		{name: "large queue", cfg: ChatGPTWebImageConfig{AdmissionQueueSize: &tooLargeQueue}},
 		{name: "negative admission wait", cfg: ChatGPTWebImageConfig{AdmissionWaitMilliseconds: &negativeAdmissionWait}},
-		{name: "large admission wait", cfg: ChatGPTWebImageConfig{AdmissionWaitMilliseconds: &tooLargeAdmissionWait}},
 		{name: "zero finalizers", cfg: ChatGPTWebImageConfig{MaxFinalizers: &zeroFinalizers}},
-		{name: "large finalizers", cfg: ChatGPTWebImageConfig{MaxFinalizers: &tooLargeFinalizers}},
 		{name: "negative reserve", cfg: ChatGPTWebImageConfig{CompletionReserveMegabytes: &negativeReserve}},
-		{name: "large reserve", cfg: ChatGPTWebImageConfig{CompletionReserveMegabytes: &tooLargeReserve}},
-		{name: "small memory capacity", cfg: ChatGPTWebImageConfig{MemoryCapacityMegabytes: &tooSmallMemoryCapacity}},
-		{name: "large memory capacity", cfg: ChatGPTWebImageConfig{MemoryCapacityMegabytes: &tooLargeMemoryCapacity}},
+		{name: "zero memory capacity", cfg: ChatGPTWebImageConfig{MemoryCapacityMegabytes: &zeroMemoryCapacity}},
 		{name: "zero poll concurrency", cfg: ChatGPTWebImageConfig{PollConcurrency: &zeroPollConcurrency}},
-		{name: "large poll concurrency", cfg: ChatGPTWebImageConfig{PollConcurrency: &tooLargePollConcurrency}},
 		{name: "zero memory finalizers", cfg: ChatGPTWebImageConfig{MemoryFinalizerConcurrency: &zeroMemoryFinalizers}},
-		{name: "large memory finalizers", cfg: ChatGPTWebImageConfig{MemoryFinalizerConcurrency: &tooLargeMemoryFinalizers}},
+	}
+	overflowInFlight := math.MaxInt/2 + 1
+	tests = append(tests, struct {
+		name string
+		cfg  ChatGPTWebImageConfig
+	}{name: "poll queue derivation overflow", cfg: ChatGPTWebImageConfig{MaxInFlight: &overflowInFlight}})
+	if overflowWait := int64(math.MaxInt64/int64(time.Millisecond)) + 1; overflowWait <= int64(math.MaxInt) {
+		value := int(overflowWait)
+		tests = append(tests, struct {
+			name string
+			cfg  ChatGPTWebImageConfig
+		}{name: "admission wait duration overflow", cfg: ChatGPTWebImageConfig{AdmissionWaitMilliseconds: &value}})
+	}
+	if overflowMegabytes := int64(math.MaxInt64/(1<<20)) + 1; overflowMegabytes <= int64(math.MaxInt) {
+		value := int(overflowMegabytes)
+		tests = append(tests, struct {
+			name string
+			cfg  ChatGPTWebImageConfig
+		}{name: "memory bytes overflow", cfg: ChatGPTWebImageConfig{MemoryCapacityMegabytes: &value}}, struct {
+			name string
+			cfg  ChatGPTWebImageConfig
+		}{name: "completion reserve bytes overflow", cfg: ChatGPTWebImageConfig{CompletionReserveMegabytes: &value}})
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -233,10 +253,10 @@ func TestLoadConfigOptionalRejectsInvalidChatGPTWebImageAspectSettings(t *testin
 		{name: "max n", body: "max-n: 11"},
 		{name: "max in flight", body: "max-in-flight: 0"},
 		{name: "admission queue", body: "admission-queue-size: -1"},
-		{name: "admission wait", body: "admission-wait-milliseconds: 30001"},
+		{name: "admission wait", body: "admission-wait-milliseconds: -1"},
 		{name: "max finalizers", body: "max-finalizers: 0"},
-		{name: "completion reserve", body: "completion-reserve-megabytes: 33"},
-		{name: "memory capacity", body: "memory-capacity-megabytes: 63"},
+		{name: "completion reserve", body: "completion-reserve-megabytes: -1"},
+		{name: "memory capacity", body: "memory-capacity-megabytes: 0"},
 		{name: "poll concurrency", body: "poll-concurrency: 0"},
 		{name: "memory finalizer concurrency", body: "memory-finalizer-concurrency: 0"},
 	}

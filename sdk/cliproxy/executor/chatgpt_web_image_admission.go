@@ -170,6 +170,8 @@ func ConfigureChatGPTWebImageRuntimeAdmissions(maxInFlight, pollConcurrency, mem
 	pollQueueLimit := queueLimit
 	if queueLimit <= int(^uint(0)>>1)/2 {
 		pollQueueLimit = queueLimit * 2
+	} else {
+		pollQueueLimit = int(^uint(0) >> 1)
 	}
 	defaultChatGPTWebImagePollAdmission.configure(pollConcurrency, pollQueueLimit)
 	defaultChatGPTWebImageMemoryFinalizer.configure(memoryFinalizerConcurrency, queueLimit)

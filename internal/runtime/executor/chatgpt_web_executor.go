@@ -246,6 +246,10 @@ func (e *ChatGPTWebExecutor) UpdateConfig(cfg *config.Config) {
 		log.WithError(errClone).Error("chatgpt web executor: retain previous configuration after snapshot failure")
 		return
 	}
+	if errValidate := snapshot.Images.ChatGPTWeb.Validate(); errValidate != nil {
+		log.WithError(errValidate).Error("chatgpt web executor: retain previous configuration after image policy validation failure")
+		return
+	}
 	e.cfg.Store(snapshot)
 	configureChatGPTWebImageAdmissions(snapshot.Images.ChatGPTWeb.Resolved())
 	if e.backgroundQueue != nil {
@@ -268,7 +272,12 @@ func (e *ChatGPTWebExecutor) UpdateConfig(cfg *config.Config) {
 }
 
 func configureChatGPTWebImageAdmissions(resolved config.ResolvedChatGPTWebImageConfig) {
-	helps.ConfigureChatGPTWebImageMemoryCapacity(int64(resolved.MemoryCapacityMegabytes) << 20)
+	capacityBytes, errCapacity := config.ChatGPTWebImageMegabytesToBytes(resolved.MemoryCapacityMegabytes)
+	if errCapacity != nil {
+		log.WithError(errCapacity).Error("chatgpt web executor: retain previous image memory capacity")
+		return
+	}
+	helps.ConfigureChatGPTWebImageMemoryCapacity(capacityBytes)
 	cliproxyexecutor.ConfigureChatGPTWebImageAdmissions(
 		resolved.MaxInFlight,
 		resolved.AdmissionQueueSize,

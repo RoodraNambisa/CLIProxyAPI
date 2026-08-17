@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"math"
 	"strings"
+	"time"
 )
 
 // SDKConfig represents the application's configuration, loaded from a YAML file.
@@ -191,8 +192,8 @@ type ChatGPTWebImageConfig struct {
 	AdmissionQueueSize *int `yaml:"admission-queue-size,omitempty" json:"admission-queue-size,omitempty"`
 	// AdmissionWaitMilliseconds limits pre-upstream lifecycle admission waiting.
 	AdmissionWaitMilliseconds *int `yaml:"admission-wait-milliseconds,omitempty" json:"admission-wait-milliseconds,omitempty"`
-	// MaxFinalizers bounds settled requests admitted to finalizer staging. The
-	// memory-owning download/decode/encode critical section is serialized.
+	// MaxFinalizers bounds settled requests admitted to finalizer staging. Heavy
+	// memory finalization is controlled independently.
 	MaxFinalizers *int `yaml:"max-finalizers,omitempty" json:"max-finalizers,omitempty"`
 	// CompletionReserveMegabytes reserves a small per-attempt completion allowance before upstream work.
 	CompletionReserveMegabytes *int `yaml:"completion-reserve-megabytes,omitempty" json:"completion-reserve-megabytes,omitempty"`
@@ -221,32 +222,69 @@ const (
 	MaxChatGPTWebMaxN                           = 10
 	DefaultChatGPTWebImageMaxInFlight           = 64
 	MinChatGPTWebImageMaxInFlight               = 1
-	MaxChatGPTWebImageMaxInFlight               = 4096
-	DefaultChatGPTWebImageAdmissionQueueSize    = 64
-	MinChatGPTWebImageAdmissionQueueSize        = 0
-	MaxChatGPTWebImageAdmissionQueueSize        = 4096
-	DefaultChatGPTWebImageAdmissionWaitMS       = 1000
-	MinChatGPTWebImageAdmissionWaitMS           = 0
-	MaxChatGPTWebImageAdmissionWaitMS           = 30000
-	DefaultChatGPTWebImageMaxFinalizers         = 8
-	MinChatGPTWebImageMaxFinalizers             = 1
-	MaxChatGPTWebImageMaxFinalizers             = 64
-	DefaultChatGPTWebImageCompletionReserveMB   = 1
-	MinChatGPTWebImageCompletionReserveMB       = 0
-	MaxChatGPTWebImageCompletionReserveMB       = 32
-	DefaultChatGPTWebImageMemoryCapacityMB      = 512
-	MinChatGPTWebImageMemoryCapacityMB          = 64
-	MaxChatGPTWebImageMemoryCapacityMB          = 8192
+	RecommendedMaxChatGPTWebImageMaxInFlight    = 4096
+	// Deprecated: this advisory alias is not a validation limit. Use RecommendedMaxChatGPTWebImageMaxInFlight.
+	MaxChatGPTWebImageMaxInFlight                   = RecommendedMaxChatGPTWebImageMaxInFlight
+	DefaultChatGPTWebImageAdmissionQueueSize        = 64
+	MinChatGPTWebImageAdmissionQueueSize            = 0
+	RecommendedMaxChatGPTWebImageAdmissionQueueSize = 4096
+	// Deprecated: this advisory alias is not a validation limit. Use RecommendedMaxChatGPTWebImageAdmissionQueueSize.
+	MaxChatGPTWebImageAdmissionQueueSize         = RecommendedMaxChatGPTWebImageAdmissionQueueSize
+	DefaultChatGPTWebImageAdmissionWaitMS        = 1000
+	MinChatGPTWebImageAdmissionWaitMS            = 0
+	RecommendedMaxChatGPTWebImageAdmissionWaitMS = 30000
+	// Deprecated: this advisory alias is not a validation limit. Use RecommendedMaxChatGPTWebImageAdmissionWaitMS.
+	MaxChatGPTWebImageAdmissionWaitMS          = RecommendedMaxChatGPTWebImageAdmissionWaitMS
+	DefaultChatGPTWebImageMaxFinalizers        = 8
+	MinChatGPTWebImageMaxFinalizers            = 1
+	RecommendedMaxChatGPTWebImageMaxFinalizers = 64
+	// Deprecated: this advisory alias is not a validation limit. Use RecommendedMaxChatGPTWebImageMaxFinalizers.
+	MaxChatGPTWebImageMaxFinalizers                  = RecommendedMaxChatGPTWebImageMaxFinalizers
+	DefaultChatGPTWebImageCompletionReserveMB        = 1
+	MinChatGPTWebImageCompletionReserveMB            = 0
+	RecommendedMaxChatGPTWebImageCompletionReserveMB = 32
+	// Deprecated: this advisory alias is not a validation limit. Use RecommendedMaxChatGPTWebImageCompletionReserveMB.
+	MaxChatGPTWebImageCompletionReserveMB         = RecommendedMaxChatGPTWebImageCompletionReserveMB
+	DefaultChatGPTWebImageMemoryCapacityMB        = 512
+	MinChatGPTWebImageMemoryCapacityMB            = 1
+	RecommendedMinChatGPTWebImageMemoryCapacityMB = 64
+	RecommendedMaxChatGPTWebImageMemoryCapacityMB = 8192
+	// Deprecated: this advisory alias is not a validation limit. Use RecommendedMaxChatGPTWebImageMemoryCapacityMB.
+	MaxChatGPTWebImageMemoryCapacityMB = RecommendedMaxChatGPTWebImageMemoryCapacityMB
 )
 
 const (
-	DefaultChatGPTWebImagePollConcurrency            = 64
-	MinChatGPTWebImagePollConcurrency                = 1
-	MaxChatGPTWebImagePollConcurrency                = 512
-	DefaultChatGPTWebImageMemoryFinalizerConcurrency = 1
-	MinChatGPTWebImageMemoryFinalizerConcurrency     = 1
-	MaxChatGPTWebImageMemoryFinalizerConcurrency     = 64
+	DefaultChatGPTWebImagePollConcurrency        = 64
+	MinChatGPTWebImagePollConcurrency            = 1
+	RecommendedMaxChatGPTWebImagePollConcurrency = 512
+	// Deprecated: this advisory alias is not a validation limit. Use RecommendedMaxChatGPTWebImagePollConcurrency.
+	MaxChatGPTWebImagePollConcurrency                       = RecommendedMaxChatGPTWebImagePollConcurrency
+	DefaultChatGPTWebImageMemoryFinalizerConcurrency        = 1
+	MinChatGPTWebImageMemoryFinalizerConcurrency            = 1
+	RecommendedMaxChatGPTWebImageMemoryFinalizerConcurrency = 64
+	// Deprecated: this advisory alias is not a validation limit. Use RecommendedMaxChatGPTWebImageMemoryFinalizerConcurrency.
+	MaxChatGPTWebImageMemoryFinalizerConcurrency = RecommendedMaxChatGPTWebImageMemoryFinalizerConcurrency
 )
+
+const chatGPTWebImageBytesPerMegabyte int64 = 1 << 20
+
+// ChatGPTWebImageMegabytesToBytes converts a configured image budget without
+// allowing the platform representation to wrap.
+func ChatGPTWebImageMegabytesToBytes(megabytes int) (int64, error) {
+	if megabytes < 0 || int64(megabytes) > math.MaxInt64/chatGPTWebImageBytesPerMegabyte {
+		return 0, fmt.Errorf("image memory value cannot be represented as bytes on this platform")
+	}
+	return int64(megabytes) * chatGPTWebImageBytesPerMegabyte, nil
+}
+
+// ChatGPTWebImageAdmissionWaitDuration converts a configured admission wait
+// without allowing time.Duration to wrap.
+func ChatGPTWebImageAdmissionWaitDuration(milliseconds int) (time.Duration, error) {
+	if milliseconds < 0 || int64(milliseconds) > math.MaxInt64/int64(time.Millisecond) {
+		return 0, fmt.Errorf("image admission wait cannot be represented on this platform")
+	}
+	return time.Duration(milliseconds) * time.Millisecond, nil
+}
 
 // ResolvedChatGPTWebImageConfig contains effective ChatGPT Web image compatibility values.
 type ResolvedChatGPTWebImageConfig struct {
@@ -369,29 +407,41 @@ func (cfg ChatGPTWebImageConfig) Validate() error {
 	if resolved.MaxN < MinChatGPTWebMaxN || resolved.MaxN > MaxChatGPTWebMaxN {
 		return fmt.Errorf("images.chatgpt-web.max-n must be between %d and %d", MinChatGPTWebMaxN, MaxChatGPTWebMaxN)
 	}
-	if resolved.MaxInFlight < MinChatGPTWebImageMaxInFlight || resolved.MaxInFlight > MaxChatGPTWebImageMaxInFlight {
-		return fmt.Errorf("images.chatgpt-web.max-in-flight must be between %d and %d", MinChatGPTWebImageMaxInFlight, MaxChatGPTWebImageMaxInFlight)
+	if resolved.MaxInFlight < MinChatGPTWebImageMaxInFlight {
+		return fmt.Errorf("images.chatgpt-web.max-in-flight must be at least %d", MinChatGPTWebImageMaxInFlight)
 	}
-	if resolved.AdmissionQueueSize < MinChatGPTWebImageAdmissionQueueSize || resolved.AdmissionQueueSize > MaxChatGPTWebImageAdmissionQueueSize {
-		return fmt.Errorf("images.chatgpt-web.admission-queue-size must be between %d and %d", MinChatGPTWebImageAdmissionQueueSize, MaxChatGPTWebImageAdmissionQueueSize)
+	if resolved.MaxInFlight > math.MaxInt/2 {
+		return fmt.Errorf("images.chatgpt-web.max-in-flight cannot be represented safely when deriving the poll queue on this platform")
 	}
-	if resolved.AdmissionWaitMilliseconds < MinChatGPTWebImageAdmissionWaitMS || resolved.AdmissionWaitMilliseconds > MaxChatGPTWebImageAdmissionWaitMS {
-		return fmt.Errorf("images.chatgpt-web.admission-wait-milliseconds must be between %d and %d", MinChatGPTWebImageAdmissionWaitMS, MaxChatGPTWebImageAdmissionWaitMS)
+	if resolved.AdmissionQueueSize < MinChatGPTWebImageAdmissionQueueSize {
+		return fmt.Errorf("images.chatgpt-web.admission-queue-size must be at least %d", MinChatGPTWebImageAdmissionQueueSize)
 	}
-	if resolved.MaxFinalizers < MinChatGPTWebImageMaxFinalizers || resolved.MaxFinalizers > MaxChatGPTWebImageMaxFinalizers {
-		return fmt.Errorf("images.chatgpt-web.max-finalizers must be between %d and %d", MinChatGPTWebImageMaxFinalizers, MaxChatGPTWebImageMaxFinalizers)
+	if resolved.AdmissionWaitMilliseconds < MinChatGPTWebImageAdmissionWaitMS {
+		return fmt.Errorf("images.chatgpt-web.admission-wait-milliseconds must be at least %d", MinChatGPTWebImageAdmissionWaitMS)
 	}
-	if resolved.CompletionReserveMegabytes < MinChatGPTWebImageCompletionReserveMB || resolved.CompletionReserveMegabytes > MaxChatGPTWebImageCompletionReserveMB {
-		return fmt.Errorf("images.chatgpt-web.completion-reserve-megabytes must be between %d and %d", MinChatGPTWebImageCompletionReserveMB, MaxChatGPTWebImageCompletionReserveMB)
+	if _, errDuration := ChatGPTWebImageAdmissionWaitDuration(resolved.AdmissionWaitMilliseconds); errDuration != nil {
+		return fmt.Errorf("images.chatgpt-web.admission-wait-milliseconds: %w", errDuration)
 	}
-	if resolved.MemoryCapacityMegabytes < MinChatGPTWebImageMemoryCapacityMB || resolved.MemoryCapacityMegabytes > MaxChatGPTWebImageMemoryCapacityMB {
-		return fmt.Errorf("images.chatgpt-web.memory-capacity-megabytes must be between %d and %d", MinChatGPTWebImageMemoryCapacityMB, MaxChatGPTWebImageMemoryCapacityMB)
+	if resolved.MaxFinalizers < MinChatGPTWebImageMaxFinalizers {
+		return fmt.Errorf("images.chatgpt-web.max-finalizers must be at least %d", MinChatGPTWebImageMaxFinalizers)
 	}
-	if resolved.PollConcurrency < MinChatGPTWebImagePollConcurrency || resolved.PollConcurrency > MaxChatGPTWebImagePollConcurrency {
-		return fmt.Errorf("images.chatgpt-web.poll-concurrency must be between %d and %d", MinChatGPTWebImagePollConcurrency, MaxChatGPTWebImagePollConcurrency)
+	if resolved.CompletionReserveMegabytes < MinChatGPTWebImageCompletionReserveMB {
+		return fmt.Errorf("images.chatgpt-web.completion-reserve-megabytes must be at least %d", MinChatGPTWebImageCompletionReserveMB)
 	}
-	if resolved.MemoryFinalizerConcurrency < MinChatGPTWebImageMemoryFinalizerConcurrency || resolved.MemoryFinalizerConcurrency > MaxChatGPTWebImageMemoryFinalizerConcurrency {
-		return fmt.Errorf("images.chatgpt-web.memory-finalizer-concurrency must be between %d and %d", MinChatGPTWebImageMemoryFinalizerConcurrency, MaxChatGPTWebImageMemoryFinalizerConcurrency)
+	if _, errBytes := ChatGPTWebImageMegabytesToBytes(resolved.CompletionReserveMegabytes); errBytes != nil {
+		return fmt.Errorf("images.chatgpt-web.completion-reserve-megabytes: %w", errBytes)
+	}
+	if resolved.MemoryCapacityMegabytes < MinChatGPTWebImageMemoryCapacityMB {
+		return fmt.Errorf("images.chatgpt-web.memory-capacity-megabytes must be at least %d", MinChatGPTWebImageMemoryCapacityMB)
+	}
+	if _, errBytes := ChatGPTWebImageMegabytesToBytes(resolved.MemoryCapacityMegabytes); errBytes != nil {
+		return fmt.Errorf("images.chatgpt-web.memory-capacity-megabytes: %w", errBytes)
+	}
+	if resolved.PollConcurrency < MinChatGPTWebImagePollConcurrency {
+		return fmt.Errorf("images.chatgpt-web.poll-concurrency must be at least %d", MinChatGPTWebImagePollConcurrency)
+	}
+	if resolved.MemoryFinalizerConcurrency < MinChatGPTWebImageMemoryFinalizerConcurrency {
+		return fmt.Errorf("images.chatgpt-web.memory-finalizer-concurrency must be at least %d", MinChatGPTWebImageMemoryFinalizerConcurrency)
 	}
 	return nil
 }
