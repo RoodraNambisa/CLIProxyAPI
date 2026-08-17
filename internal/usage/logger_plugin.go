@@ -70,6 +70,9 @@ type RequestStatistics struct {
 	tokens         TokenStats
 	changeCount    uint64
 	persistedCount uint64
+	// historyGeneration advances on destructive history mutations so a
+	// background restore cannot resurrect data cleared or pruned after it began.
+	historyGeneration uint64
 
 	apis map[string]*apiStats
 
@@ -563,14 +566,29 @@ type MergeResult struct {
 // MergeSnapshot merges an exported statistics snapshot into the current store.
 // Existing data is preserved and duplicate request details are skipped.
 func (s *RequestStatistics) MergeSnapshot(snapshot StatisticsSnapshot) MergeResult {
-	return s.mergeSnapshot(snapshot, false)
+	return s.mergeSnapshot(snapshot, false, true)
 }
 
 func (s *RequestStatistics) mergePersistedSnapshot(snapshot StatisticsSnapshot) MergeResult {
-	return s.mergeSnapshot(snapshot, true)
+	return s.mergeSnapshot(snapshot, true, false)
 }
 
-func (s *RequestStatistics) mergeSnapshot(snapshot StatisticsSnapshot, markPersistedIfClean bool) MergeResult {
+func (s *RequestStatistics) mergeSnapshotContext(ctx context.Context, snapshot StatisticsSnapshot, markPersistedIfClean, deduplicate bool) (MergeResult, error) {
+	if s == nil {
+		return MergeResult{}, nil
+	}
+	s.flushPending()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cleanBeforeMerge := s.changeCount == s.persistedCount
+	result, errMerge := s.mergeSnapshotLocked(ctx, snapshot, deduplicate)
+	if errMerge == nil && markPersistedIfClean && cleanBeforeMerge {
+		s.persistedCount = s.changeCount
+	}
+	return result, errMerge
+}
+
+func (s *RequestStatistics) mergeSnapshot(snapshot StatisticsSnapshot, markPersistedIfClean, advanceHistory bool) MergeResult {
 	result := MergeResult{}
 	if s == nil {
 		return result
@@ -580,23 +598,42 @@ func (s *RequestStatistics) mergeSnapshot(snapshot StatisticsSnapshot, markPersi
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	cleanBeforeMerge := s.changeCount == s.persistedCount
-	now := time.Now().UTC()
+	result, _ = s.mergeSnapshotLocked(context.Background(), snapshot, true)
+	if advanceHistory && result.Added > 0 {
+		s.historyGeneration++
+	}
+	if markPersistedIfClean && cleanBeforeMerge {
+		s.persistedCount = s.changeCount
+	}
+	return result
+}
 
-	seen := make(map[string]struct{})
-	for apiName, stats := range s.apis {
-		if stats == nil {
-			continue
-		}
-		for modelName, modelStatsValue := range stats.Models {
-			if modelStatsValue == nil {
+func (s *RequestStatistics) mergeSnapshotLocked(ctx context.Context, snapshot StatisticsSnapshot, deduplicate bool) (MergeResult, error) {
+	result := MergeResult{}
+	select {
+	case <-ctx.Done():
+		return result, ctx.Err()
+	default:
+	}
+	now := time.Now().UTC()
+	var seen map[string]struct{}
+	if deduplicate {
+		seen = make(map[string]struct{})
+		for apiName, stats := range s.apis {
+			if stats == nil {
 				continue
 			}
-			for _, detail := range modelStatsValue.Details {
-				seen[dedupKey(apiName, modelName, detail)] = struct{}{}
+			for modelName, modelStatsValue := range stats.Models {
+				if modelStatsValue == nil {
+					continue
+				}
+				for _, detail := range modelStatsValue.Details {
+					seen[dedupKey(apiName, modelName, detail)] = struct{}{}
+				}
 			}
 		}
 	}
-
+	processed := 0
 	for apiName, apiSnapshot := range snapshot.APIs {
 		apiName = strings.TrimSpace(apiName)
 		if apiName == "" {
@@ -615,6 +652,14 @@ func (s *RequestStatistics) mergeSnapshot(snapshot StatisticsSnapshot, markPersi
 				modelName = "unknown"
 			}
 			for _, detail := range modelSnapshot.Details {
+				processed++
+				if processed%1024 == 0 {
+					select {
+					case <-ctx.Done():
+						return result, ctx.Err()
+					default:
+					}
+				}
 				detail.Tokens = normaliseTokenStats(detail.Tokens)
 				if detail.LatencyMs < 0 {
 					detail.LatencyMs = 0
@@ -622,26 +667,99 @@ func (s *RequestStatistics) mergeSnapshot(snapshot StatisticsSnapshot, markPersi
 				if detail.Timestamp.IsZero() {
 					detail.Timestamp = time.Now()
 				}
-				key := dedupKey(apiName, modelName, detail)
-				if _, exists := seen[key]; exists {
-					result.Skipped++
-					continue
+				if deduplicate {
+					key := dedupKey(apiName, modelName, detail)
+					if _, exists := seen[key]; exists {
+						result.Skipped++
+						continue
+					}
+					seen[key] = struct{}{}
 				}
-				seen[key] = struct{}{}
 				s.recordImported(apiName, modelName, stats, detail, now)
 				result.Added++
 			}
 		}
 	}
 	if result.Added > 0 {
-		s.rebuildDetailIndexLocked()
+		s.sortDetailIndexLocked()
 		s.pruneTimeBucketsLocked(now)
 	}
-	if markPersistedIfClean && cleanBeforeMerge {
-		s.persistedCount = s.changeCount
+	select {
+	case <-ctx.Done():
+		return result, ctx.Err()
+	default:
+	}
+	return result, nil
+}
+
+// ApplyPreparedRestore atomically installs a fully built persisted store and
+// replays the small live window collected while it was loading. A destructive
+// mutation after expectedHistoryGeneration makes the restore stale.
+func (s *RequestStatistics) ApplyPreparedRestore(prepared *RequestStatistics, expectedHistoryGeneration uint64) (MergeResult, bool) {
+	if s == nil || prepared == nil || s == prepared {
+		return MergeResult{}, false
+	}
+	s.flushPending()
+	prepared.flushPending()
+
+	prepared.mu.Lock()
+	defer prepared.mu.Unlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.historyGeneration != expectedHistoryGeneration {
+		return MergeResult{}, false
 	}
 
-	return result
+	liveSnapshot := s.snapshotLocked()
+	liveChangeCount := s.changeCount
+	historyGeneration := s.historyGeneration
+	s.adoptPreparedLocked(prepared)
+	if s.changeCount < liveChangeCount {
+		s.changeCount = liveChangeCount
+	}
+	if s.persistedCount > s.changeCount {
+		s.persistedCount = s.changeCount
+	}
+	s.historyGeneration = historyGeneration
+	result, _ := s.mergeSnapshotLocked(context.Background(), liveSnapshot, false)
+	return result, true
+}
+
+func (s *RequestStatistics) adoptPreparedLocked(prepared *RequestStatistics) {
+	s.totalRequests = prepared.totalRequests
+	s.successCount = prepared.successCount
+	s.failureCount = prepared.failureCount
+	s.totalTokens = prepared.totalTokens
+	s.tokens = prepared.tokens
+	s.changeCount = prepared.changeCount
+	s.persistedCount = prepared.persistedCount
+	s.apis = prepared.apis
+	s.auths = prepared.auths
+	s.models = prepared.models
+	s.sources = prepared.sources
+	s.oldestAt = prepared.oldestAt
+	s.newestAt = prepared.newestAt
+	s.dayOnlyFutureOldest = prepared.dayOnlyFutureOldest
+	s.dayOnlyFutureNewest = prepared.dayOnlyFutureNewest
+	s.requestsByDay = prepared.requestsByDay
+	s.requestsByHour = prepared.requestsByHour
+	s.tokensByDay = prepared.tokensByDay
+	s.tokensByHour = prepared.tokensByHour
+	s.tokenRowsByDay = prepared.tokenRowsByDay
+	s.tokenRowsByHour = prepared.tokenRowsByHour
+	s.minuteBuckets = prepared.minuteBuckets
+	s.hourBuckets = prepared.hourBuckets
+	s.dayBuckets = prepared.dayBuckets
+	s.detailIndex = prepared.detailIndex
+	s.detailIndexDirty = prepared.detailIndexDirty
+	s.detailLocations = prepared.detailLocations
+	s.detailIndexTombstones = prepared.detailIndexTombstones
+	s.nextDetailID = prepared.nextDetailID
+	s.authSeries = prepared.authSeries
+	s.authDetailIDs = prepared.authDetailIDs
+	s.stringPool = prepared.stringPool
+	s.lastPrunedMinute = prepared.lastPrunedMinute
+	s.legacyHourBuckets = prepared.legacyHourBuckets
 }
 
 // HasPendingPersistence reports whether there are in-memory changes that have
@@ -700,6 +818,7 @@ func (s *RequestStatistics) clearWithState() (StatisticsSnapshot, StatisticsSnap
 
 	previous := s.snapshotLocked()
 	s.resetLocked()
+	s.historyGeneration++
 	s.markChangedLocked()
 	return previous, s.snapshotLocked(), s.changeCount
 }
@@ -763,6 +882,7 @@ func (s *RequestStatistics) RemoveAuthIndexes(indexes []string) int {
 	if removed == 0 {
 		return 0
 	}
+	s.historyGeneration++
 	s.markChangedLocked()
 	return removed
 }
@@ -787,6 +907,7 @@ func (s *RequestStatistics) PruneAuthIndexes(valid map[string]struct{}) int {
 	if removed == 0 {
 		return 0
 	}
+	s.historyGeneration++
 	s.markChangedLocked()
 	return removed
 }

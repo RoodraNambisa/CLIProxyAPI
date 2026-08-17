@@ -220,9 +220,21 @@ error-logs-max-files: 10
 # When false, disable in-memory usage statistics aggregation
 usage-statistics-enabled: false
 
+# When in-memory usage collection is enabled, independently control snapshot restore and writes.
+# Set to false to ignore existing snapshots and disable all automatic snapshot writes.
+usage-statistics-persistence-enabled: true
+
 # How often to persist usage statistics to the logs directory.
-# Set to 0 to disable automatic snapshot persistence.
+# Set to 0 to restore at startup and persist only during graceful shutdown.
 usage-statistics-persist-interval-seconds: 0
+
+# Remove request detail rows older than this many days before persistence.
+# Set to 0 to retain details without a time limit.
+usage-statistics-detail-retention-days: 0
+
+# Limit the persisted Usage snapshot by removing oldest detail rows first.
+# Set to 0 to disable the snapshot size limit.
+usage-statistics-max-storage-megabytes: 0
 
 # Shared USD prices per one million tokens for server-side usage cost reports.
 # Model names are matched exactly after trimming and converting to lowercase.

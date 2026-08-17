@@ -313,9 +313,21 @@ type Config struct {
 	// UsageStatisticsEnabled toggles in-memory usage aggregation; when false, usage data is discarded.
 	UsageStatisticsEnabled bool `yaml:"usage-statistics-enabled" json:"usage-statistics-enabled"`
 
+	// UsageStatisticsPersistenceEnabled controls automatic snapshot restore and writes when
+	// in-memory collection is enabled. Missing configuration keeps the legacy enabled behavior.
+	UsageStatisticsPersistenceEnabled *bool `yaml:"usage-statistics-persistence-enabled,omitempty" json:"usage-statistics-persistence-enabled,omitempty"`
+
 	// UsageStatisticsPersistIntervalSeconds controls how often usage statistics
-	// are flushed to disk automatically. Set to 0 to disable periodic persistence.
+	// are flushed to disk automatically. Set to 0 for restore plus shutdown-only persistence.
 	UsageStatisticsPersistIntervalSeconds int `yaml:"usage-statistics-persist-interval-seconds" json:"usage-statistics-persist-interval-seconds"`
+
+	// UsageStatisticsDetailRetentionDays removes detail rows older than this many days before
+	// persistence. Set to 0 to retain details without a time limit.
+	UsageStatisticsDetailRetentionDays int `yaml:"usage-statistics-detail-retention-days" json:"usage-statistics-detail-retention-days"`
+
+	// UsageStatisticsMaxStorageMB limits the automatic snapshot size by removing the oldest
+	// detail rows before persistence. Set to 0 to disable the size limit.
+	UsageStatisticsMaxStorageMB int `yaml:"usage-statistics-max-storage-megabytes" json:"usage-statistics-max-storage-megabytes"`
 
 	// UsagePricing defines shared per-model prices for usage cost aggregation.
 	UsagePricing UsagePricingConfig `yaml:"usage-pricing" json:"usage-pricing"`
@@ -2134,6 +2146,15 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	if cfg.ErrorLogsMaxFiles < 0 {
 		cfg.ErrorLogsMaxFiles = 10
 	}
+	if cfg.UsageStatisticsPersistIntervalSeconds < 0 {
+		cfg.UsageStatisticsPersistIntervalSeconds = 0
+	}
+	if cfg.UsageStatisticsDetailRetentionDays < 0 {
+		cfg.UsageStatisticsDetailRetentionDays = 0
+	}
+	if cfg.UsageStatisticsMaxStorageMB < 0 {
+		cfg.UsageStatisticsMaxStorageMB = 0
+	}
 
 	if cfg.UsagePricing, err = NormalizeUsagePricing(cfg.UsagePricing); err != nil {
 		if optional {
@@ -2240,6 +2261,12 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 
 	// Return the populated configuration struct.
 	return &cfg, nil
+}
+
+// UsageStatisticsPersistence reports whether automatic Usage snapshot restore
+// and writes are enabled. An omitted setting preserves the legacy enabled behavior.
+func (cfg *Config) UsageStatisticsPersistence() bool {
+	return cfg == nil || cfg.UsageStatisticsPersistenceEnabled == nil || *cfg.UsageStatisticsPersistenceEnabled
 }
 
 func validateChatGPTWebAccountInfoYAML(data []byte) error {
@@ -3955,6 +3982,9 @@ func appendPath(path []string, key string) []string {
 // This prevents non-zero defaults from polluting the config.
 func isKnownDefaultValue(path []string, node *yaml.Node) bool {
 	fullPath := strings.Join(path, ".")
+	if fullPath == "usage-statistics-persistence-enabled" && node != nil && node.Kind == yaml.ScalarNode && node.Tag == "!!bool" {
+		return node.Value == "true"
+	}
 	if preservesExplicitChatGPTWebValue(fullPath, node) {
 		return false
 	}

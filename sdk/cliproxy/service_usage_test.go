@@ -143,7 +143,7 @@ func TestServiceHandleAuthUpdateDelete_RemovesRuntimeAuthAndUsage(t *testing.T) 
 	}
 }
 
-func TestServicePersistUsageStatistics_DisableWritesFinalSnapshotWithoutExistingFile(t *testing.T) {
+func TestServicePersistUsageStatistics_PersistenceDisabledDoesNotWriteFinalSnapshot(t *testing.T) {
 	baseDir := t.TempDir()
 	t.Setenv("WRITABLE_PATH", baseDir)
 
@@ -172,18 +172,40 @@ func TestServicePersistUsageStatistics_DisableWritesFinalSnapshotWithoutExisting
 
 	service.persistUsageStatistics("disable")
 
-	if _, err := os.Stat(path); err != nil {
-		t.Fatalf("expected disable persistence to create snapshot file, stat err=%v", err)
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("persistence-disabled write created snapshot, stat err=%v", err)
 	}
-	snapshot, err := internalusage.LoadSnapshotFile(path)
-	if err != nil {
-		t.Fatalf("LoadSnapshotFile() error = %v", err)
+}
+
+func TestServicePersistUsageStatistics_ZeroIntervalWritesOnShutdown(t *testing.T) {
+	baseDir := t.TempDir()
+	t.Setenv("WRITABLE_PATH", baseDir)
+
+	stats := internalusage.NewRequestStatistics()
+	service := &Service{
+		cfg: &config.Config{
+			UsageStatisticsEnabled: true,
+		},
+		usageStats: stats,
 	}
-	if snapshot.TotalRequests != 1 {
-		t.Fatalf("total_requests = %d, want 1", snapshot.TotalRequests)
+	stats.Record(context.Background(), coreusage.Record{
+		APIKey:      "shutdown-key",
+		Model:       "gpt-5.4",
+		RequestedAt: time.Date(2026, time.March, 21, 8, 0, 0, 0, time.UTC),
+		Detail:      coreusage.Detail{TotalTokens: 42},
+	})
+
+	service.persistUsageStatistics("periodic")
+	if _, err := os.Stat(service.usageStatisticsFilePath()); !os.IsNotExist(err) {
+		t.Fatalf("zero interval periodic write created snapshot, stat err=%v", err)
 	}
-	if snapshot.TotalTokens != 42 {
-		t.Fatalf("total_tokens = %d, want 42", snapshot.TotalTokens)
+	service.persistUsageStatistics("shutdown")
+	snapshot, errLoad := internalusage.LoadSnapshotFile(service.usageStatisticsFilePath())
+	if errLoad != nil {
+		t.Fatalf("LoadSnapshotFile() error = %v", errLoad)
+	}
+	if snapshot.TotalRequests != 1 || snapshot.TotalTokens != 42 {
+		t.Fatalf("shutdown snapshot = %+v", snapshot)
 	}
 }
 
@@ -222,9 +244,11 @@ func TestServicePersistUsageStatistics_DisabledAutoPathsDoNotRewriteExistingSnap
 	t.Setenv("WRITABLE_PATH", baseDir)
 
 	stats := internalusage.NewRequestStatistics()
+	persistenceEnabled := true
 	service := &Service{
 		cfg: &config.Config{
 			UsageStatisticsEnabled:                true,
+			UsageStatisticsPersistenceEnabled:     &persistenceEnabled,
 			UsageStatisticsPersistIntervalSeconds: 0,
 		},
 		usageStats: stats,
@@ -259,5 +283,128 @@ func TestServicePersistUsageStatistics_DisabledAutoPathsDoNotRewriteExistingSnap
 	}
 	if snapshot.TotalTokens != existingSnapshot.TotalTokens {
 		t.Fatalf("total_tokens = %d, want existing snapshot %d", snapshot.TotalTokens, existingSnapshot.TotalTokens)
+	}
+}
+
+func TestServiceBackgroundUsageRestoreAppliesHistoryWithoutDroppingLiveRecords(t *testing.T) {
+	baseDir := t.TempDir()
+	t.Setenv("WRITABLE_PATH", baseDir)
+	historical := internalusage.NewRequestStatistics()
+	historical.Record(context.Background(), coreusage.Record{
+		APIKey:      "history-key",
+		Model:       "gpt-5.4",
+		RequestedAt: time.Date(2026, time.August, 1, 1, 0, 0, 0, time.UTC),
+		Detail:      coreusage.Detail{TotalTokens: 10},
+	})
+	persistenceEnabled := true
+	service := &Service{
+		cfg: &config.Config{
+			UsageStatisticsEnabled:            true,
+			UsageStatisticsPersistenceEnabled: &persistenceEnabled,
+		},
+		usageStats: internalusage.NewRequestStatistics(),
+	}
+	if errSave := internalusage.SaveSnapshotFile(service.usageStatisticsFilePath(), historical.Snapshot()); errSave != nil {
+		t.Fatalf("SaveSnapshotFile() error = %v", errSave)
+	}
+
+	service.startUsageRestore()
+	service.usageStats.Record(context.Background(), coreusage.Record{
+		APIKey:      "live-key",
+		Model:       "gpt-5.4",
+		RequestedAt: time.Date(2026, time.August, 17, 1, 0, 0, 0, time.UTC),
+		Detail:      coreusage.Detail{TotalTokens: 20},
+	})
+	service.usageRestoreMu.Lock()
+	done := service.usageRestoreDone
+	service.usageRestoreMu.Unlock()
+	if done == nil {
+		t.Fatal("background usage restore did not start")
+	}
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("background usage restore did not finish")
+	}
+	if meta := service.usageStats.Meta(); meta.TotalRequests != 2 || meta.TotalTokens != 30 {
+		t.Fatalf("restored usage meta = %+v", meta)
+	}
+}
+
+func TestServicePersistenceDisabledIgnoresExistingUsageSnapshot(t *testing.T) {
+	baseDir := t.TempDir()
+	t.Setenv("WRITABLE_PATH", baseDir)
+	persistenceEnabled := false
+	service := &Service{
+		cfg: &config.Config{
+			UsageStatisticsEnabled:            true,
+			UsageStatisticsPersistenceEnabled: &persistenceEnabled,
+		},
+		usageStats: internalusage.NewRequestStatistics(),
+	}
+	if errSave := internalusage.SaveSnapshotFile(service.usageStatisticsFilePath(), internalusage.StatisticsSnapshot{TotalRequests: 99}); errSave != nil {
+		t.Fatalf("SaveSnapshotFile() error = %v", errSave)
+	}
+	service.startUsageRestore()
+	service.usageRestoreMu.Lock()
+	done := service.usageRestoreDone
+	service.usageRestoreMu.Unlock()
+	if done != nil {
+		t.Fatal("persistence-disabled service started snapshot restore")
+	}
+	if got := service.usageStats.Meta().TotalRequests; got != 0 {
+		t.Fatalf("ignored snapshot restored %d requests", got)
+	}
+}
+
+func TestServiceUsageRestoreRunsOnceAcrossPersistenceToggle(t *testing.T) {
+	baseDir := t.TempDir()
+	t.Setenv("WRITABLE_PATH", baseDir)
+	historical := internalusage.NewRequestStatistics()
+	historical.Record(context.Background(), coreusage.Record{
+		APIKey:      "history-key",
+		Model:       "gpt-5.4",
+		RequestedAt: time.Date(2026, time.August, 1, 1, 0, 0, 0, time.UTC),
+		Detail:      coreusage.Detail{TotalTokens: 10},
+	})
+	persistenceEnabled := true
+	service := &Service{
+		cfg: &config.Config{
+			UsageStatisticsEnabled:            true,
+			UsageStatisticsPersistenceEnabled: &persistenceEnabled,
+		},
+		usageStats: internalusage.NewRequestStatistics(),
+	}
+	if errSave := internalusage.SaveSnapshotFile(service.usageStatisticsFilePath(), historical.Snapshot()); errSave != nil {
+		t.Fatalf("SaveSnapshotFile() error = %v", errSave)
+	}
+
+	service.startUsageRestore()
+	service.usageRestoreMu.Lock()
+	firstDone := service.usageRestoreDone
+	service.usageRestoreMu.Unlock()
+	select {
+	case <-firstDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("initial restore did not finish")
+	}
+	if got := service.usageStats.Meta().TotalRequests; got != 1 {
+		t.Fatalf("initial restored requests = %d, want 1", got)
+	}
+
+	service.stopUsageRestore()
+	service.startUsageRestore()
+	service.usageRestoreMu.Lock()
+	secondDone := service.usageRestoreDone
+	applied := service.usageRestoreApplied
+	service.usageRestoreMu.Unlock()
+	if secondDone != nil {
+		t.Fatal("completed snapshot restore restarted after persistence toggle")
+	}
+	if !applied {
+		t.Fatal("completed snapshot restore lost applied state")
+	}
+	if got := service.usageStats.Meta().TotalRequests; got != 1 {
+		t.Fatalf("restored snapshot was duplicated, requests=%d", got)
 	}
 }

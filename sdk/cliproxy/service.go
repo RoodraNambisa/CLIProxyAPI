@@ -190,6 +190,17 @@ type Service struct {
 	// usagePersistenceDone is closed when the periodic usage persistence loop exits.
 	usagePersistenceDone chan struct{}
 
+	// usageRestoreMu protects the cancellable one-shot background restore.
+	usageRestoreMu sync.Mutex
+
+	usageRestoreCancel  context.CancelFunc
+	usageRestoreDone    chan struct{}
+	usageRestoreActive  bool
+	usageRestoreApplied bool
+	// usageRestoreNeedsSidecar remains true after an interrupted or failed
+	// restore so shutdown cannot overwrite an unapplied main snapshot.
+	usageRestoreNeedsSidecar bool
+
 	// usageStats optionally overrides the shared usage statistics store for tests.
 	usageStats *internalusage.RequestStatistics
 
@@ -583,11 +594,40 @@ func (s *Service) triggerChatGPTWebAccountInfoRefresh(result coreauth.Result) {
 	trigger.TriggerAutomaticAccountInfoRefresh(authID)
 }
 
-func usagePersistenceIntervalForConfig(cfg *config.Config) time.Duration {
-	if cfg == nil || cfg.UsageStatisticsPersistIntervalSeconds <= 0 {
-		return 0
+type usagePersistenceSettings struct {
+	enabled       bool
+	interval      time.Duration
+	retentionDays int
+	maxBytes      int64
+}
+
+func usagePersistenceSettingsForConfig(cfg *config.Config) usagePersistenceSettings {
+	if cfg == nil {
+		return usagePersistenceSettings{}
 	}
-	return time.Duration(cfg.UsageStatisticsPersistIntervalSeconds) * time.Second
+	settings := usagePersistenceSettings{
+		enabled:       cfg.UsageStatisticsPersistence(),
+		retentionDays: max(cfg.UsageStatisticsDetailRetentionDays, 0),
+	}
+	if cfg.UsageStatisticsPersistIntervalSeconds > 0 {
+		seconds := int64(cfg.UsageStatisticsPersistIntervalSeconds)
+		maxSeconds := int64((time.Duration(1<<63 - 1)) / time.Second)
+		if seconds > maxSeconds {
+			settings.interval = time.Duration(1<<63 - 1)
+		} else {
+			settings.interval = time.Duration(seconds) * time.Second
+		}
+	}
+	if cfg.UsageStatisticsMaxStorageMB > 0 {
+		megabytes := int64(cfg.UsageStatisticsMaxStorageMB)
+		maxMegabytes := int64(^uint64(0)>>1) >> 20
+		if megabytes > maxMegabytes {
+			settings.maxBytes = int64(^uint64(0) >> 1)
+		} else {
+			settings.maxBytes = megabytes << 20
+		}
+	}
+	return settings
 }
 
 func (s *Service) currentConfig() *config.Config {
@@ -604,8 +644,8 @@ func (s *Service) usageStatisticsEnabled() bool {
 	return cfg != nil && cfg.UsageStatisticsEnabled
 }
 
-func (s *Service) usagePersistenceInterval() time.Duration {
-	return usagePersistenceIntervalForConfig(s.currentConfig())
+func (s *Service) usagePersistenceSettings() usagePersistenceSettings {
+	return usagePersistenceSettingsForConfig(s.currentConfig())
 }
 
 func (s *Service) usageStatisticsFilePath() string {
@@ -623,42 +663,144 @@ func (s *Service) usageStatisticsStore() *internalusage.RequestStatistics {
 	return internalusage.GetRequestStatistics()
 }
 
-func (s *Service) restoreUsageStatistics() {
-	if s == nil || !s.usageStatisticsEnabled() {
+func (s *Service) startUsageRestore() {
+	if s == nil || !s.usageStatisticsEnabled() || !s.usagePersistenceSettings().enabled {
 		return
 	}
 	path := s.usageStatisticsFilePath()
 	if strings.TrimSpace(path) == "" {
 		return
 	}
-	loaded, result, err := internalusage.RestoreRequestStatistics(path, s.usageStatisticsStore())
-	if err != nil {
-		log.WithError(err).Warnf("failed to restore usage statistics from %s", path)
+
+	s.usageRestoreMu.Lock()
+	if s.usageRestoreActive || s.usageRestoreApplied {
+		s.usageRestoreMu.Unlock()
 		return
 	}
-	if loaded {
-		log.Infof("usage statistics restored from %s (added=%d skipped=%d)", path, result.Added, result.Skipped)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	s.usageRestoreCancel = cancel
+	s.usageRestoreDone = done
+	s.usageRestoreActive = true
+	s.usageRestoreApplied = false
+	s.usageRestoreMu.Unlock()
+
+	stats := s.usageStatisticsStore()
+	expectedGeneration := stats.HistoryGeneration()
+	finishStage := s.startupState.BeginStage("usage_snapshot_restore")
+	go func() {
+		defer close(done)
+		loaded, prepared, result, errPrepare := internalusage.PrepareRequestStatistics(ctx, path)
+		errorCode := ""
+		applied := false
+		if errPrepare != nil {
+			if !errors.Is(errPrepare, context.Canceled) {
+				errorCode = "usage_snapshot_restore_failed"
+				log.WithError(errPrepare).Warn("failed to prepare usage statistics snapshot")
+			}
+		} else if loaded {
+			liveResult, appliedRestore := stats.ApplyPreparedRestore(prepared, expectedGeneration)
+			applied = appliedRestore
+			if appliedRestore {
+				result.Added += liveResult.Added
+				result.Skipped += liveResult.Skipped
+				removed := s.reconcileUsageStatistics("background-restore")
+				log.WithFields(log.Fields{
+					"added":   result.Added,
+					"skipped": result.Skipped,
+					"removed": removed,
+				}).Info("usage statistics restored in background")
+			} else if ctx.Err() == nil {
+				// A newer destructive mutation intentionally supersedes the old
+				// snapshot, so shutdown may safely persist the current live state.
+				applied = true
+				errorCode = "usage_snapshot_restore_stale"
+				log.Info("usage statistics restore discarded after a newer clear or prune")
+			}
+		} else {
+			applied = true
+		}
+		finishStage(result.Added, errorCode)
+
+		s.usageRestoreMu.Lock()
+		if s.usageRestoreDone == done {
+			s.usageRestoreActive = false
+			s.usageRestoreApplied = applied
+			s.usageRestoreNeedsSidecar = !applied
+			s.usageRestoreCancel = nil
+		}
+		s.usageRestoreMu.Unlock()
+	}()
+}
+
+func (s *Service) usageRestoreInProgress() bool {
+	if s == nil {
+		return false
 	}
+	s.usageRestoreMu.Lock()
+	active := s.usageRestoreActive
+	s.usageRestoreMu.Unlock()
+	return active
+}
+
+// stopUsageRestore cancels and joins the background loader. It reports whether
+// live history must be preserved in the pending sidecar instead of replacing
+// an unapplied main snapshot.
+func (s *Service) stopUsageRestore() bool {
+	if s == nil {
+		return false
+	}
+	s.usageRestoreMu.Lock()
+	cancel := s.usageRestoreCancel
+	done := s.usageRestoreDone
+	s.usageRestoreMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	if done != nil {
+		<-done
+	}
+	s.usageRestoreMu.Lock()
+	needsSidecar := s.usageRestoreNeedsSidecar
+	s.usageRestoreDone = nil
+	s.usageRestoreCancel = nil
+	s.usageRestoreActive = false
+	s.usageRestoreMu.Unlock()
+	return needsSidecar
 }
 
 func (s *Service) persistUsageStatistics(reason string) {
 	if s == nil {
 		return
 	}
+	settings := s.usagePersistenceSettings()
+	if !settings.enabled || s.usageRestoreInProgress() {
+		return
+	}
 	path := s.usageStatisticsFilePath()
 	if strings.TrimSpace(path) == "" {
 		return
 	}
-	if s.usagePersistenceInterval() <= 0 && reason != "disable" && reason != "shutdown" {
+	if settings.interval <= 0 && reason != "shutdown" {
 		return
 	}
-	saved, err := internalusage.PersistRequestStatistics(path, s.usageStatisticsStore())
+	result, err := internalusage.PersistRequestStatisticsWithPolicy(path, s.usageStatisticsStore(), internalusage.PersistencePolicy{
+		DetailRetentionDays: settings.retentionDays,
+		MaxBytes:            settings.maxBytes,
+	})
 	if err != nil {
 		log.WithError(err).Warnf("failed to persist usage statistics during %s", reason)
 		return
 	}
-	if !saved {
+	if !result.Saved {
 		return
+	}
+	if result.Pruned > 0 {
+		log.WithFields(log.Fields{
+			"pruned":       result.Pruned,
+			"size_bytes":   result.SizeBytes,
+			"detail_count": result.DetailCount,
+		}).Info("usage statistics retention applied")
 	}
 	if reason == "shutdown" {
 		log.Infof("usage statistics persisted to %s during shutdown", path)
@@ -668,10 +810,11 @@ func (s *Service) persistUsageStatistics(reason string) {
 }
 
 func (s *Service) nextUsagePersistenceWait() time.Duration {
-	if !s.usageStatisticsEnabled() {
+	settings := s.usagePersistenceSettings()
+	if !s.usageStatisticsEnabled() || !settings.enabled {
 		return usagePersistenceDisabledPollInterval
 	}
-	interval := s.usagePersistenceInterval()
+	interval := settings.interval
 	if interval <= 0 {
 		return usagePersistenceDisabledPollInterval
 	}
@@ -680,6 +823,10 @@ func (s *Service) nextUsagePersistenceWait() time.Duration {
 
 func (s *Service) startUsagePersistenceLoop() {
 	if s == nil {
+		return
+	}
+	settings := s.usagePersistenceSettings()
+	if !s.usageStatisticsEnabled() || !settings.enabled || settings.interval <= 0 {
 		return
 	}
 	s.usagePersistenceMu.Lock()
@@ -710,7 +857,8 @@ func (s *Service) startUsagePersistenceLoop() {
 			case <-timer.C:
 			}
 
-			if s.usageStatisticsEnabled() && s.usagePersistenceInterval() > 0 {
+			settings := s.usagePersistenceSettings()
+			if s.usageStatisticsEnabled() && settings.enabled && settings.interval > 0 {
 				s.reconcileUsageStatistics("periodic")
 				s.persistUsageStatistics("periodic")
 			}
@@ -745,23 +893,24 @@ func (s *Service) restartUsagePersistenceLoop() {
 	s.startUsagePersistenceLoop()
 }
 
-func (s *Service) applyUsagePersistenceConfigChange(previousEnabled bool, previousInterval time.Duration, newCfg *config.Config) {
+func (s *Service) applyUsagePersistenceConfigChange(previousCollection bool, previousSettings usagePersistenceSettings, newCfg *config.Config) {
 	if s == nil || newCfg == nil {
 		return
 	}
-	currentEnabled := newCfg.UsageStatisticsEnabled
-	currentInterval := usagePersistenceIntervalForConfig(newCfg)
+	currentCollection := newCfg.UsageStatisticsEnabled
+	currentSettings := usagePersistenceSettingsForConfig(newCfg)
 
-	if previousEnabled && !currentEnabled {
-		s.persistUsageStatistics("disable")
+	if previousSettings.enabled && !currentSettings.enabled {
+		s.stopUsageRestore()
+		s.stopUsagePersistenceLoop()
 	}
-	if !previousEnabled && currentEnabled {
-		s.restoreUsageStatistics()
-		if s.reconcileUsageStatistics("enable") > 0 {
-			s.persistUsageStatistics("enable-reconcile")
-		}
+	if previousCollection && !currentCollection {
+		s.stopUsageRestore()
 	}
-	if previousEnabled != currentEnabled || previousInterval != currentInterval {
+	if currentCollection && currentSettings.enabled && (!previousCollection || !previousSettings.enabled) {
+		s.startUsageRestore()
+	}
+	if previousCollection != currentCollection || previousSettings != currentSettings {
 		s.restartUsagePersistenceLoop()
 	}
 }
@@ -4580,7 +4729,7 @@ func (s *Service) applyRuntimeConfigState(ctx context.Context, previousCfg, next
 		return errors.New("runtime configuration is unavailable")
 	}
 	previousUsageEnabled := previousCfg != nil && previousCfg.UsageStatisticsEnabled
-	previousUsageInterval := usagePersistenceIntervalForConfig(previousCfg)
+	previousUsageSettings := usagePersistenceSettingsForConfig(previousCfg)
 
 	if s.coreManager != nil {
 		var selector coreauth.Selector
@@ -4650,7 +4799,7 @@ func (s *Service) applyRuntimeConfigState(ctx context.Context, previousCfg, next
 			s.refreshModelRegistrationForAuth(auth)
 		}
 	}
-	s.applyUsagePersistenceConfigChange(previousUsageEnabled, previousUsageInterval, nextCfg)
+	s.applyUsagePersistenceConfigChange(previousUsageEnabled, previousUsageSettings, nextCfg)
 	s.warnAuthMaintenanceConfig(nextCfg.AuthMaintenance)
 	s.wakeAuthMaintenance()
 	return nil
@@ -4692,10 +4841,10 @@ func (s *Service) prepareAPIServer() error {
 					log.Warnf("failed to reset websocket connections after ws-auth change %t -> %t: %v", oldEnabled, newEnabled, errStop)
 					return
 				}
-					log.Debugf("ws-auth enabled; existing websocket sessions terminated to enforce authentication")
-					return
-				}
-				log.Debugf("ws-auth disabled; existing websocket sessions remain connected")
+				log.Debugf("ws-auth enabled; existing websocket sessions terminated to enforce authentication")
+				return
+			}
+			log.Debugf("ws-auth disabled; existing websocket sessions remain connected")
 		})
 	}
 
@@ -4844,18 +4993,10 @@ func (s *Service) Run(ctx context.Context) error {
 	}
 	finishAuthLoad(authCount, authLoadErrorCode)
 
-	finishUsageRestore := s.startupState.BeginStage("usage_snapshot_restore")
-	s.restoreUsageStatistics()
-	usageCount := s.usageStatisticsStore().Meta().TotalRequests
-	finishUsageRestore(usageCount, "")
-
 	s.startupState.SetPhase(api.StartupPhaseRoutingBootstrap)
 	finishDependencies := s.startupState.BeginStage("credential_dependency_reconcile")
 	_, _ = s.reconcileChatGPTWebDependencies(ctx, "startup")
 	finishDependencies(authCount, "")
-	if s.reconcileUsageStatistics("startup") > 0 {
-		s.persistUsageStatistics("startup-reconcile")
-	}
 
 	tokenResult, err := s.tokenProvider.Load(ctx, s.cfg)
 	if err != nil && !errors.Is(err, context.Canceled) {
@@ -4950,7 +5091,6 @@ func (s *Service) Run(ctx context.Context) error {
 	if s.proxyPoolManager != nil {
 		s.proxyPoolManager.Start(ctx)
 	}
-	s.startUsagePersistenceLoop()
 	s.startAuthMaintenance(context.Background())
 
 	// Prefer core auth manager auto refresh if available.
@@ -4961,6 +5101,8 @@ func (s *Service) Run(ctx context.Context) error {
 	}
 	finishRouting(authCount, "")
 	s.startupState.MarkReady()
+	s.startUsageRestore()
+	s.startUsagePersistenceLoop()
 
 	select {
 	case <-ctx.Done():
@@ -5071,9 +5213,19 @@ func (s *Service) runShutdown() {
 	}
 	s.stopModelSyncLoop()
 	s.stopAuthMaintenance()
-	s.reconcileUsageStatistics("shutdown")
-	s.persistUsageStatistics("shutdown")
 	s.stopUsagePersistenceLoop()
+	needsUsageSidecar := s.stopUsageRestore()
+	if s.usagePersistenceSettings().enabled {
+		if needsUsageSidecar {
+			if errPending := internalusage.PersistPendingRequestStatistics(s.usageStatisticsFilePath(), s.usageStatisticsStore()); errPending != nil {
+				log.WithError(errPending).Error("failed to preserve pending usage statistics during shutdown")
+				shutdownErr = errors.Join(shutdownErr, errPending)
+			}
+		} else {
+			s.reconcileUsageStatistics("shutdown")
+			s.persistUsageStatistics("shutdown")
+		}
+	}
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	errShutdownPprof := s.shutdownPprof(shutdownCtx)
