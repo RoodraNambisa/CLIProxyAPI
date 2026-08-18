@@ -1,12 +1,14 @@
 package usage
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -16,7 +18,8 @@ import (
 )
 
 const (
-	StatisticsFileVersion    = 1
+	StatisticsFileVersion    = 2
+	legacyStatisticsVersion  = 1
 	StatisticsFileName       = "usage-statistics.snapshot"
 	legacyStatisticsFileName = "usage-statistics.json"
 	pendingStatisticsSuffix  = ".pending"
@@ -24,12 +27,43 @@ const (
 
 var statisticsPersistenceMu sync.Mutex
 
-// StatisticsFilePayload is the on-disk representation used for automatic
-// persistence.
+// StatisticsFilePayload is the legacy version 1 representation retained for
+// compatibility imports and one-time migration.
 type StatisticsFilePayload struct {
 	Version    int                `json:"version"`
 	ExportedAt time.Time          `json:"exported_at"`
 	Usage      StatisticsSnapshot `json:"usage"`
+}
+
+const statisticsStreamBatchSize = 512
+
+type statisticsStreamEnvelope struct {
+	Kind          string         `json:"kind"`
+	Version       int            `json:"version,omitempty"`
+	ExportedAt    time.Time      `json:"exported_at,omitempty"`
+	TotalRequests int64          `json:"total_requests,omitempty"`
+	SuccessCount  int64          `json:"success_count,omitempty"`
+	FailureCount  int64          `json:"failure_count,omitempty"`
+	TotalTokens   int64          `json:"total_tokens,omitempty"`
+	API           string         `json:"api,omitempty"`
+	Model         string         `json:"model,omitempty"`
+	Detail        *RequestDetail `json:"detail,omitempty"`
+	Records       int64          `json:"records,omitempty"`
+}
+
+type persistedUsageRecord struct {
+	API    string
+	Model  string
+	Detail RequestDetail
+}
+
+// PreparedStatisticsRestore contains an isolated restored store and migration
+// metadata. Migration paths are internal filesystem details and must never be
+// exposed through management responses.
+type PreparedStatisticsRestore struct {
+	Statistics      *RequestStatistics
+	NeedsMigration  bool
+	MigrationSource string
 }
 
 // PersistencePolicy controls destructive retention applied immediately before
@@ -138,11 +172,31 @@ func InspectStatisticsStorage(path string) (StatisticsStorageSnapshot, error) {
 
 // SaveSnapshotFile writes a complete statistics snapshot to disk atomically.
 func SaveSnapshotFile(path string, snapshot StatisticsSnapshot) error {
-	data, errMarshal := marshalSnapshotFile(snapshot)
-	if errMarshal != nil {
-		return errMarshal
+	if snapshotDetailCount(snapshot) == 0 && (snapshot.TotalRequests != 0 || snapshot.SuccessCount != 0 || snapshot.FailureCount != 0 || snapshot.TotalTokens != 0) {
+		header, errHeader := marshalStatisticsStreamLine(statisticsStreamEnvelope{
+			Kind:          "header",
+			Version:       StatisticsFileVersion,
+			ExportedAt:    time.Now().UTC(),
+			TotalRequests: snapshot.TotalRequests,
+			SuccessCount:  snapshot.SuccessCount,
+			FailureCount:  snapshot.FailureCount,
+			TotalTokens:   snapshot.TotalTokens,
+		})
+		if errHeader != nil {
+			return errHeader
+		}
+		footer, errFooter := marshalStatisticsStreamLine(statisticsStreamEnvelope{Kind: "footer"})
+		if errFooter != nil {
+			return errFooter
+		}
+		return writeFileAtomic(path, append(header, footer...))
 	}
-	return writeFileAtomic(path, data)
+	stats := NewRequestStatistics()
+	if _, errMerge := stats.mergeSnapshotContext(context.Background(), snapshot, false, false); errMerge != nil {
+		return errMerge
+	}
+	_, errWrite := rewriteRequestStatisticsWithPolicyLocked(path, stats, PersistencePolicy{})
+	return errWrite
 }
 
 // LoadSnapshotFile reads a persisted snapshot from disk.
@@ -150,44 +204,94 @@ func LoadSnapshotFile(path string) (StatisticsSnapshot, error) {
 	return LoadSnapshotFileContext(context.Background(), path)
 }
 
-// LoadSnapshotFileContext streams one snapshot from disk in a single JSON
-// decoder pass and observes cancellation between reads.
+// LoadSnapshotFileContext loads one snapshot for compatibility callers and
+// observes cancellation between reads. Automatic version 2 restore uses the
+// record-level path below instead of constructing this exported snapshot.
 func LoadSnapshotFileContext(ctx context.Context, path string) (StatisticsSnapshot, error) {
-	var snapshot StatisticsSnapshot
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	file, errOpen := os.Open(path)
 	if errOpen != nil {
-		return snapshot, errOpen
+		return StatisticsSnapshot{}, errOpen
 	}
-	defer func() { _ = file.Close() }()
-
-	decoded := statisticsFileDecode{}
 	decoder := json.NewDecoder(&contextReader{ctx: ctx, reader: file})
-	if errDecode := decoder.Decode(&decoded); errDecode != nil {
-		if errDecode == io.EOF {
-			return snapshot, fmt.Errorf("usage: statistics file is empty")
+	var first json.RawMessage
+	errFirst := decoder.Decode(&first)
+	_ = file.Close()
+	if errFirst != nil {
+		if errFirst == io.EOF {
+			return StatisticsSnapshot{}, fmt.Errorf("usage: statistics file is empty")
 		}
-		return snapshot, fmt.Errorf("usage: decode snapshot: %w", errDecode)
+		return StatisticsSnapshot{}, fmt.Errorf("usage: decode snapshot: %w", errFirst)
 	}
-	if errContext := ctx.Err(); errContext != nil {
-		return snapshot, errContext
+	var probe struct {
+		Kind    string `json:"kind"`
+		Version int    `json:"version"`
 	}
-	var trailing json.RawMessage
-	if errTrailing := decoder.Decode(&trailing); errTrailing != io.EOF {
-		if errTrailing == nil {
-			return snapshot, fmt.Errorf("usage: snapshot contains trailing JSON data")
+	if errProbe := json.Unmarshal(first, &probe); errProbe != nil {
+		return StatisticsSnapshot{}, fmt.Errorf("usage: decode snapshot header: %w", errProbe)
+	}
+	if probe.Kind == "header" && probe.Version != StatisticsFileVersion {
+		return StatisticsSnapshot{}, fmt.Errorf("usage: unsupported snapshot version %d", probe.Version)
+	}
+	if probe.Version != StatisticsFileVersion || probe.Kind != "header" {
+		decoded := statisticsFileDecode{}
+		if errDecode := json.Unmarshal(first, &decoded); errDecode != nil {
+			return StatisticsSnapshot{}, fmt.Errorf("usage: decode legacy snapshot: %w", errDecode)
 		}
-		return snapshot, fmt.Errorf("usage: decode trailing snapshot data: %w", errTrailing)
-	}
-	if decoded.Usage != nil {
-		if decoded.Version != 0 && decoded.Version != StatisticsFileVersion {
-			return snapshot, fmt.Errorf("usage: unsupported snapshot version %d", decoded.Version)
+		if decoded.Version != 0 && decoded.Version != legacyStatisticsVersion {
+			return StatisticsSnapshot{}, fmt.Errorf("usage: unsupported snapshot version %d", decoded.Version)
 		}
-		return *decoded.Usage, nil
+		fileTrailing, errReopen := os.Open(path)
+		if errReopen != nil {
+			return StatisticsSnapshot{}, errReopen
+		}
+		defer func() { _ = fileTrailing.Close() }()
+		trailingDecoder := json.NewDecoder(&contextReader{ctx: ctx, reader: fileTrailing})
+		var ignored json.RawMessage
+		if errDecode := trailingDecoder.Decode(&ignored); errDecode != nil {
+			return StatisticsSnapshot{}, fmt.Errorf("usage: decode legacy snapshot: %w", errDecode)
+		}
+		var trailing json.RawMessage
+		if errTrailing := trailingDecoder.Decode(&trailing); errTrailing != io.EOF {
+			if errTrailing == nil {
+				return StatisticsSnapshot{}, fmt.Errorf("usage: snapshot contains trailing JSON data")
+			}
+			return StatisticsSnapshot{}, fmt.Errorf("usage: decode trailing snapshot data: %w", errTrailing)
+		}
+		if decoded.Usage != nil {
+			return *decoded.Usage, nil
+		}
+		return decoded.legacySnapshot(), nil
 	}
-	return decoded.legacySnapshot(), nil
+
+	stats := NewRequestStatistics()
+	_, _, errLoad := loadStatisticsFileInto(ctx, path, stats, time.Time{}, false)
+	if errLoad != nil {
+		return StatisticsSnapshot{}, errLoad
+	}
+	snapshot := stats.Snapshot()
+	if snapshot.TotalRequests == 0 && snapshot.TotalTokens == 0 {
+		header := statisticsStreamEnvelope{}
+		if errHeader := json.Unmarshal(first, &header); errHeader == nil {
+			snapshot.TotalRequests = header.TotalRequests
+			snapshot.SuccessCount = header.SuccessCount
+			snapshot.FailureCount = header.FailureCount
+			snapshot.TotalTokens = header.TotalTokens
+		}
+	}
+	return snapshot, nil
+}
+
+func snapshotDetailCount(snapshot StatisticsSnapshot) int {
+	count := 0
+	for _, apiSnapshot := range snapshot.APIs {
+		for _, modelSnapshot := range apiSnapshot.Models {
+			count += len(modelSnapshot.Details)
+		}
+	}
+	return count
 }
 
 type statisticsFileDecode struct {
@@ -221,6 +325,213 @@ func (decoded statisticsFileDecode) legacySnapshot() StatisticsSnapshot {
 type contextReader struct {
 	ctx    context.Context
 	reader io.Reader
+}
+
+func loadStatisticsFileInto(ctx context.Context, path string, stats *RequestStatistics, cutoff time.Time, markPersisted bool) (int, MergeResult, error) {
+	result := MergeResult{}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if stats == nil {
+		return 0, result, fmt.Errorf("usage: nil statistics restore target")
+	}
+	file, errOpen := os.Open(path)
+	if errOpen != nil {
+		return 0, result, errOpen
+	}
+	defer func() { _ = file.Close() }()
+
+	decoder := json.NewDecoder(&contextReader{ctx: ctx, reader: file})
+	var first json.RawMessage
+	if errDecode := decoder.Decode(&first); errDecode != nil {
+		if errDecode == io.EOF {
+			return 0, result, fmt.Errorf("usage: statistics file is empty")
+		}
+		return 0, result, fmt.Errorf("usage: decode snapshot: %w", errDecode)
+	}
+	var probe struct {
+		Kind    string `json:"kind"`
+		Version int    `json:"version"`
+	}
+	if errProbe := json.Unmarshal(first, &probe); errProbe != nil {
+		return 0, result, fmt.Errorf("usage: decode snapshot header: %w", errProbe)
+	}
+	if probe.Kind == "header" && probe.Version != StatisticsFileVersion {
+		return probe.Version, result, fmt.Errorf("usage: unsupported snapshot version %d", probe.Version)
+	}
+	if probe.Version == StatisticsFileVersion && probe.Kind == "header" {
+		streamResult, errStream := decodeStatisticsStream(ctx, decoder, stats, cutoff, markPersisted)
+		return StatisticsFileVersion, streamResult, errStream
+	}
+
+	decoded := statisticsFileDecode{}
+	if errDecode := json.Unmarshal(first, &decoded); errDecode != nil {
+		return 0, result, fmt.Errorf("usage: decode legacy snapshot: %w", errDecode)
+	}
+	if decoded.Version != 0 && decoded.Version != legacyStatisticsVersion {
+		return decoded.Version, result, fmt.Errorf("usage: unsupported snapshot version %d", decoded.Version)
+	}
+	var trailing json.RawMessage
+	if errTrailing := decoder.Decode(&trailing); errTrailing != io.EOF {
+		if errTrailing == nil {
+			return legacyStatisticsVersion, result, fmt.Errorf("usage: snapshot contains trailing JSON data")
+		}
+		return legacyStatisticsVersion, result, fmt.Errorf("usage: decode trailing snapshot data: %w", errTrailing)
+	}
+	snapshot := decoded.legacySnapshot()
+	if decoded.Usage != nil {
+		snapshot = *decoded.Usage
+	}
+	legacyResult, errMerge := mergePersistedSnapshotRecords(ctx, stats, snapshot, cutoff)
+	if errMerge == nil && markPersisted {
+		stats.MarkAllPersisted()
+	}
+	return legacyStatisticsVersion, legacyResult, errMerge
+}
+
+func decodeStatisticsStream(ctx context.Context, decoder *json.Decoder, stats *RequestStatistics, cutoff time.Time, markPersisted bool) (MergeResult, error) {
+	result := MergeResult{}
+	batch := make([]persistedUsageRecord, 0, statisticsStreamBatchSize)
+	var seen int64
+	footerSeen := false
+	flush := func() error {
+		if len(batch) == 0 {
+			return nil
+		}
+		added, errInsert := insertPersistedUsageBatch(ctx, stats, batch)
+		result.Added += added
+		batch = batch[:0]
+		return errInsert
+	}
+	for {
+		var envelope statisticsStreamEnvelope
+		errDecode := decoder.Decode(&envelope)
+		if errDecode == io.EOF {
+			if !footerSeen {
+				return result, fmt.Errorf("usage: truncated version 2 snapshot")
+			}
+			if errFlush := flush(); errFlush != nil {
+				return result, errFlush
+			}
+			if markPersisted {
+				stats.MarkAllPersisted()
+			}
+			return result, nil
+		}
+		if errDecode != nil {
+			return result, fmt.Errorf("usage: decode version 2 snapshot: %w", errDecode)
+		}
+		if footerSeen {
+			return result, fmt.Errorf("usage: version 2 snapshot contains data after footer")
+		}
+		switch envelope.Kind {
+		case "request":
+			if envelope.Detail == nil {
+				return result, fmt.Errorf("usage: version 2 request record is missing detail")
+			}
+			seen++
+			if !cutoff.IsZero() && !envelope.Detail.Timestamp.IsZero() && envelope.Detail.Timestamp.Before(cutoff) {
+				result.Skipped++
+				continue
+			}
+			batch = append(batch, persistedUsageRecord{API: envelope.API, Model: envelope.Model, Detail: *envelope.Detail})
+			if len(batch) >= statisticsStreamBatchSize {
+				if errFlush := flush(); errFlush != nil {
+					return result, errFlush
+				}
+			}
+		case "footer":
+			if envelope.Records != seen {
+				return result, fmt.Errorf("usage: version 2 snapshot record count mismatch")
+			}
+			footerSeen = true
+		default:
+			return result, fmt.Errorf("usage: unsupported version 2 record kind %q", envelope.Kind)
+		}
+	}
+}
+
+func mergePersistedSnapshotRecords(ctx context.Context, stats *RequestStatistics, snapshot StatisticsSnapshot, cutoff time.Time) (MergeResult, error) {
+	result := MergeResult{}
+	batch := make([]persistedUsageRecord, 0, statisticsStreamBatchSize)
+	flush := func() error {
+		if len(batch) == 0 {
+			return nil
+		}
+		added, errInsert := insertPersistedUsageBatch(ctx, stats, batch)
+		result.Added += added
+		batch = batch[:0]
+		return errInsert
+	}
+	for apiName, apiSnapshot := range snapshot.APIs {
+		for modelName, modelSnapshot := range apiSnapshot.Models {
+			for _, detail := range modelSnapshot.Details {
+				if !cutoff.IsZero() && !detail.Timestamp.IsZero() && detail.Timestamp.Before(cutoff) {
+					result.Skipped++
+					continue
+				}
+				batch = append(batch, persistedUsageRecord{API: apiName, Model: modelName, Detail: detail})
+				if len(batch) >= statisticsStreamBatchSize {
+					if errFlush := flush(); errFlush != nil {
+						return result, errFlush
+					}
+				}
+			}
+		}
+	}
+	if errFlush := flush(); errFlush != nil {
+		return result, errFlush
+	}
+	return result, nil
+}
+
+func insertPersistedUsageBatch(ctx context.Context, stats *RequestStatistics, records []persistedUsageRecord) (int64, error) {
+	if len(records) == 0 {
+		return 0, nil
+	}
+	select {
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	default:
+	}
+	now := time.Now().UTC()
+	stats.mu.Lock()
+	defer stats.mu.Unlock()
+	var added int64
+	for index := range records {
+		if index%128 == 0 {
+			select {
+			case <-ctx.Done():
+				return added, ctx.Err()
+			default:
+			}
+		}
+		record := records[index]
+		apiName := strings.TrimSpace(record.API)
+		if apiName == "" {
+			apiName = "unknown"
+		}
+		modelName := strings.TrimSpace(record.Model)
+		if modelName == "" {
+			modelName = "unknown"
+		}
+		detail := record.Detail
+		detail.Tokens = normaliseTokenStats(detail.Tokens)
+		if detail.LatencyMs < 0 {
+			detail.LatencyMs = 0
+		}
+		if detail.Timestamp.IsZero() {
+			detail.Timestamp = now
+		}
+		apiValue := stats.apis[apiName]
+		if apiValue == nil {
+			apiValue = &apiStats{Models: make(map[string]*modelStats)}
+			stats.apis[apiName] = apiValue
+		}
+		stats.recordImported(apiName, modelName, apiValue, detail, now)
+		added++
+	}
+	return added, nil
 }
 
 func (reader *contextReader) Read(buffer []byte) (int, error) {
@@ -263,50 +574,62 @@ func RestoreRequestStatistics(path string, stats *RequestStatistics) (loaded boo
 // as unpersisted data and is retained until the combined main snapshot is
 // durably written.
 func PrepareRequestStatistics(ctx context.Context, path string) (loaded bool, prepared *RequestStatistics, result MergeResult, err error) {
+	loaded, preparation, result, err := PrepareRequestStatisticsWithPolicy(ctx, path, PersistencePolicy{})
+	return loaded, preparation.Statistics, result, err
+}
+
+// PrepareRequestStatisticsWithPolicy restores automatic snapshots directly
+// into an isolated store. Version 2 records are decoded and inserted in fixed
+// batches; legacy version 1 remains a one-time full-object compatibility path.
+func PrepareRequestStatisticsWithPolicy(ctx context.Context, path string, policy PersistencePolicy) (loaded bool, preparation PreparedStatisticsRestore, result MergeResult, err error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	prepared = NewRequestStatistics()
-	snapshot, errLoad := LoadSnapshotFileContext(ctx, path)
+	prepared := NewRequestStatistics()
+	preparation.Statistics = prepared
+	cutoff := time.Time{}
+	if policy.DetailRetentionDays > 0 {
+		cutoff = time.Now().UTC().AddDate(0, 0, -policy.DetailRetentionDays)
+	}
+	version, mainResult, errLoad := loadStatisticsFileInto(ctx, path, prepared, cutoff, true)
 	if errLoad != nil {
 		if os.IsNotExist(errLoad) {
 			if legacyPath := legacyStatisticsFilePath(path); legacyPath != "" {
-				snapshot, errLoad = LoadSnapshotFileContext(ctx, legacyPath)
+				version, mainResult, errLoad = loadStatisticsFileInto(ctx, legacyPath, prepared, cutoff, true)
 				loaded = errLoad == nil
+				if loaded {
+					preparation.MigrationSource = legacyPath
+				}
 			}
 		}
 		if errLoad != nil && !os.IsNotExist(errLoad) {
-			return false, nil, result, errLoad
+			return false, PreparedStatisticsRestore{}, result, errLoad
 		}
 	} else {
 		loaded = true
 	}
 	if errLoad == nil {
-		var errMerge error
-		result, errMerge = prepared.mergeSnapshotContext(ctx, snapshot, true, false)
-		if errMerge != nil {
-			return false, nil, result, errMerge
-		}
+		result = mainResult
+		preparation.NeedsMigration = version < StatisticsFileVersion
 	}
 
 	pendingPath := PendingStatisticsFilePath(path)
 	if pendingPath == "" {
-		return loaded, prepared, result, nil
+		return loaded, preparation, result, nil
 	}
-	pending, errPending := LoadSnapshotFileContext(ctx, pendingPath)
+	pendingVersion, pendingResult, errPending := loadStatisticsFileInto(ctx, pendingPath, prepared, cutoff, false)
 	if errPending != nil {
 		if os.IsNotExist(errPending) {
-			return loaded, prepared, result, nil
+			return loaded, preparation, result, nil
 		}
-		return false, nil, result, errPending
+		return false, PreparedStatisticsRestore{}, result, errPending
 	}
-	pendingResult, errMergePending := prepared.mergeSnapshotContext(ctx, pending, false, false)
 	result.Added += pendingResult.Added
 	result.Skipped += pendingResult.Skipped
-	if errMergePending != nil {
-		return false, nil, result, errMergePending
+	if pendingVersion < StatisticsFileVersion {
+		preparation.NeedsMigration = true
 	}
-	return true, prepared, result, nil
+	return true, preparation, result, nil
 }
 
 // PersistRequestStatistics writes the current statistics snapshot to disk when
@@ -338,7 +661,26 @@ func PruneAndPersistRequestStatistics(path string, stats *RequestStatistics, pol
 	return persistRequestStatisticsWithPolicyLocked(path, stats, policy, true)
 }
 
+// RewriteRequestStatisticsWithPolicy forces a version 2 rewrite. It is used
+// after a generation-fenced legacy restore has been applied successfully.
+func RewriteRequestStatisticsWithPolicy(path string, stats *RequestStatistics, policy PersistencePolicy) (PersistenceResult, error) {
+	if stats == nil {
+		return PersistenceResult{SnapshotPath: path}, nil
+	}
+	statisticsPersistenceMu.Lock()
+	defer statisticsPersistenceMu.Unlock()
+	return rewriteRequestStatisticsWithPolicyLocked(path, stats, policy)
+}
+
 func persistRequestStatisticsWithPolicyLocked(path string, stats *RequestStatistics, policy PersistencePolicy, inspectPersisted bool) (PersistenceResult, error) {
+	return writeRequestStatisticsWithPolicyLocked(path, stats, policy, inspectPersisted, false)
+}
+
+func rewriteRequestStatisticsWithPolicyLocked(path string, stats *RequestStatistics, policy PersistencePolicy) (PersistenceResult, error) {
+	return writeRequestStatisticsWithPolicyLocked(path, stats, policy, true, true)
+}
+
+func writeRequestStatisticsWithPolicyLocked(path string, stats *RequestStatistics, policy PersistencePolicy, inspectPersisted, force bool) (PersistenceResult, error) {
 	result := PersistenceResult{SnapshotPath: path}
 
 	if policy.DetailRetentionDays > 0 {
@@ -347,23 +689,33 @@ func persistRequestStatisticsWithPolicyLocked(path string, stats *RequestStatist
 	}
 
 	for {
-		snapshot, version, persistedVersion := stats.SnapshotWithState()
+		spool, errSpool := spoolRequestStatistics(path, stats)
+		if errSpool != nil {
+			return result, errSpool
+		}
+		version := spool.version
+		persistedVersion := spool.persistedVersion
 		if version == persistedVersion && !inspectPersisted {
+			spool.closeAndRemove()
 			return result, nil
 		}
-		data, errMarshal := marshalSnapshotFile(snapshot)
-		if errMarshal != nil {
-			return result, errMarshal
+		trim, errTrim := calculateStatisticsStreamTrim(spool, policy.MaxBytes)
+		if errTrim != nil {
+			spool.closeAndRemove()
+			return result, errTrim
 		}
-		if policy.MaxBytes <= 0 || int64(len(data)) <= policy.MaxBytes {
-			result.SizeBytes = int64(len(data))
-			result.DetailCount = stats.DetailCount()
-			if version == persistedVersion {
+		if trim.removeRecords == 0 {
+			result.SizeBytes = trim.finalBytes
+			result.DetailCount = trim.keepRecords
+			if version == persistedVersion && !force {
+				spool.closeAndRemove()
 				return result, nil
 			}
-			if errWrite := writeFileAtomic(path, data); errWrite != nil {
+			if errWrite := installStatisticsStream(path, spool, trim); errWrite != nil {
+				spool.closeAndRemove()
 				return result, errWrite
 			}
+			spool.closeAndRemove()
 			result.Saved = true
 			if pendingPath := PendingStatisticsFilePath(path); pendingPath != "" {
 				if errRemove := os.Remove(pendingPath); errRemove != nil && !os.IsNotExist(errRemove) {
@@ -377,25 +729,272 @@ func persistRequestStatisticsWithPolicyLocked(path string, stats *RequestStatist
 			return result, nil
 		}
 
-		detailCount := stats.DetailCount()
-		if detailCount == 0 {
-			return result, fmt.Errorf("usage: snapshot metadata exceeds maximum size %d", policy.MaxBytes)
-		}
-		keepRatio := float64(policy.MaxBytes) / float64(len(data))
-		keepCount := int(float64(detailCount) * keepRatio * 0.95)
-		if keepCount < 0 {
-			keepCount = 0
-		}
-		removeCount := detailCount - keepCount
-		if removeCount < 1 {
-			removeCount = 1
-		}
-		removed := stats.PruneOldest(removeCount)
+		spool.closeAndRemove()
+		removed := stats.PruneOldest(trim.removeRecords)
 		if removed == 0 {
 			return result, fmt.Errorf("usage: unable to prune snapshot below maximum size %d", policy.MaxBytes)
 		}
 		result.Pruned += removed
 	}
+}
+
+type statisticsRecordSpool struct {
+	file             *os.File
+	path             string
+	header           []byte
+	recordBytes      int64
+	records          int
+	version          uint64
+	persistedVersion uint64
+}
+
+type statisticsPersistenceCursor struct {
+	timestamp time.Time
+	id        uint64
+	valid     bool
+}
+
+func (spool *statisticsRecordSpool) closeAndRemove() {
+	if spool == nil {
+		return
+	}
+	if spool.file != nil {
+		_ = spool.file.Close()
+	}
+	if spool.path != "" {
+		_ = os.Remove(spool.path)
+	}
+}
+
+type statisticsStreamTrim struct {
+	offset        int64
+	remaining     int64
+	removeRecords int
+	keepRecords   int
+	footer        []byte
+	finalBytes    int64
+}
+
+func spoolRequestStatistics(path string, stats *RequestStatistics) (*statisticsRecordSpool, error) {
+	return spoolRequestStatisticsWithCapture(path, stats, nil)
+}
+
+func spoolRequestStatisticsWithCapture(path string, stats *RequestStatistics, afterCapture func()) (*statisticsRecordSpool, error) {
+	target := strings.TrimSpace(path)
+	if target == "" {
+		return nil, fmt.Errorf("usage: empty snapshot path")
+	}
+	target = filepath.Clean(target)
+	dir := filepath.Dir(target)
+	if errMkdir := os.MkdirAll(dir, 0o755); errMkdir != nil {
+		return nil, fmt.Errorf("usage: create snapshot directory: %w", errMkdir)
+	}
+	raw, errCreate := os.CreateTemp(dir, "usage-records-*.tmp")
+	if errCreate != nil {
+		return nil, fmt.Errorf("usage: create record spool: %w", errCreate)
+	}
+	spool := &statisticsRecordSpool{file: raw, path: raw.Name()}
+	fail := func(err error) (*statisticsRecordSpool, error) {
+		spool.closeAndRemove()
+		return nil, err
+	}
+
+	header, errHeader := marshalStatisticsStreamLine(statisticsStreamEnvelope{
+		Kind:       "header",
+		Version:    StatisticsFileVersion,
+		ExportedAt: time.Now().UTC(),
+	})
+	if errHeader != nil {
+		return fail(errHeader)
+	}
+	spool.header = header
+
+	stats.flushPending()
+	stats.mu.Lock()
+	stats.sortDetailIndexLocked()
+	highWaterID := stats.nextDetailID
+	spool.version = stats.changeCount
+	spool.persistedVersion = stats.persistedCount
+	stats.mu.Unlock()
+	if afterCapture != nil {
+		afterCapture()
+	}
+
+	encoder := json.NewEncoder(raw)
+	cursor := statisticsPersistenceCursor{}
+	for {
+		records, nextCursor, done := persistenceRecordBatchAfter(stats, cursor, highWaterID, statisticsStreamBatchSize)
+		for index := range records {
+			detail := records[index].Detail
+			if errEncode := encoder.Encode(statisticsStreamEnvelope{
+				Kind:   "request",
+				API:    records[index].API,
+				Model:  records[index].Model,
+				Detail: &detail,
+			}); errEncode != nil {
+				return fail(fmt.Errorf("usage: encode version 2 request record: %w", errEncode))
+			}
+			spool.records++
+		}
+		cursor = nextCursor
+		if done {
+			break
+		}
+	}
+	position, errPosition := raw.Seek(0, io.SeekCurrent)
+	if errPosition != nil {
+		return fail(fmt.Errorf("usage: inspect record spool: %w", errPosition))
+	}
+	spool.recordBytes = position
+	return spool, nil
+}
+
+func persistenceRecordBatchAfter(stats *RequestStatistics, cursor statisticsPersistenceCursor, highWaterID uint64, batchSize int) ([]persistedUsageRecord, statisticsPersistenceCursor, bool) {
+	if stats == nil || batchSize <= 0 {
+		return nil, cursor, true
+	}
+	stats.mu.Lock()
+	defer stats.mu.Unlock()
+	stats.sortDetailIndexLocked()
+	start := 0
+	if cursor.valid {
+		start = sort.Search(len(stats.detailIndex), func(index int) bool {
+			ref := stats.detailIndex[index]
+			if !ref.Timestamp.Equal(cursor.timestamp) {
+				return ref.Timestamp.After(cursor.timestamp)
+			}
+			return ref.ID > cursor.id
+		})
+	}
+	records := make([]persistedUsageRecord, 0, batchSize)
+	nextCursor := cursor
+	index := start
+	for ; index < len(stats.detailIndex); index++ {
+		ref := stats.detailIndex[index]
+		nextCursor = statisticsPersistenceCursor{timestamp: ref.Timestamp, id: ref.ID, valid: true}
+		if ref.ID > highWaterID {
+			continue
+		}
+		location, ok := stats.detailLocations[ref.ID]
+		if !ok {
+			continue
+		}
+		apiValue := stats.apis[location.API]
+		if apiValue == nil {
+			continue
+		}
+		modelValue := apiValue.Models[location.Model]
+		if modelValue == nil || location.Offset < 0 || location.Offset >= len(modelValue.Details) {
+			continue
+		}
+		detail := modelValue.Details[location.Offset]
+		if detail.internalID != ref.ID {
+			continue
+		}
+		records = append(records, persistedUsageRecord{
+			API:    location.API,
+			Model:  location.Model,
+			Detail: publicRequestDetail(detail),
+		})
+		if len(records) >= batchSize {
+			index++
+			break
+		}
+	}
+	return records, nextCursor, index >= len(stats.detailIndex)
+}
+
+func calculateStatisticsStreamTrim(spool *statisticsRecordSpool, maxBytes int64) (statisticsStreamTrim, error) {
+	trim := statisticsStreamTrim{remaining: spool.recordBytes, keepRecords: spool.records}
+	footer, errFooter := marshalStatisticsStreamLine(statisticsStreamEnvelope{Kind: "footer", Records: int64(trim.keepRecords)})
+	if errFooter != nil {
+		return trim, errFooter
+	}
+	trim.footer = footer
+	trim.finalBytes = int64(len(spool.header)) + trim.remaining + int64(len(trim.footer))
+	if maxBytes <= 0 || trim.finalBytes <= maxBytes {
+		return trim, nil
+	}
+	emptyFooter, errEmptyFooter := marshalStatisticsStreamLine(statisticsStreamEnvelope{Kind: "footer"})
+	if errEmptyFooter != nil {
+		return trim, errEmptyFooter
+	}
+	if int64(len(spool.header)+len(emptyFooter)) > maxBytes {
+		return trim, fmt.Errorf("usage: snapshot metadata exceeds maximum size %d", maxBytes)
+	}
+	if _, errSeek := spool.file.Seek(0, io.SeekStart); errSeek != nil {
+		return trim, fmt.Errorf("usage: rewind record spool: %w", errSeek)
+	}
+	reader := bufio.NewReader(spool.file)
+	for trim.keepRecords > 0 && trim.finalBytes > maxBytes {
+		line, errRead := reader.ReadBytes('\n')
+		if errRead != nil {
+			return trim, fmt.Errorf("usage: scan record spool: %w", errRead)
+		}
+		lineBytes := int64(len(line))
+		trim.offset += lineBytes
+		trim.remaining -= lineBytes
+		trim.removeRecords++
+		trim.keepRecords--
+		trim.footer, errFooter = marshalStatisticsStreamLine(statisticsStreamEnvelope{Kind: "footer", Records: int64(trim.keepRecords)})
+		if errFooter != nil {
+			return trim, errFooter
+		}
+		trim.finalBytes = int64(len(spool.header)) + trim.remaining + int64(len(trim.footer))
+	}
+	return trim, nil
+}
+
+func installStatisticsStream(path string, spool *statisticsRecordSpool, trim statisticsStreamTrim) error {
+	target := filepath.Clean(strings.TrimSpace(path))
+	dir := filepath.Dir(target)
+	temporary, errCreate := os.CreateTemp(dir, "usage-statistics-*.tmp")
+	if errCreate != nil {
+		return fmt.Errorf("usage: create temp snapshot file: %w", errCreate)
+	}
+	temporaryPath := temporary.Name()
+	committed := false
+	defer func() {
+		_ = temporary.Close()
+		if !committed {
+			_ = os.Remove(temporaryPath)
+		}
+	}()
+	if _, errWrite := temporary.Write(spool.header); errWrite != nil {
+		return fmt.Errorf("usage: write version 2 header: %w", errWrite)
+	}
+	if _, errSeek := spool.file.Seek(trim.offset, io.SeekStart); errSeek != nil {
+		return fmt.Errorf("usage: seek retained record window: %w", errSeek)
+	}
+	if _, errCopy := io.CopyN(temporary, spool.file, trim.remaining); errCopy != nil {
+		return fmt.Errorf("usage: copy retained record window: %w", errCopy)
+	}
+	if _, errWrite := temporary.Write(trim.footer); errWrite != nil {
+		return fmt.Errorf("usage: write version 2 footer: %w", errWrite)
+	}
+	if errSync := temporary.Sync(); errSync != nil {
+		return fmt.Errorf("usage: sync temp snapshot file: %w", errSync)
+	}
+	if errClose := temporary.Close(); errClose != nil {
+		return fmt.Errorf("usage: close temp snapshot file: %w", errClose)
+	}
+	if errRename := os.Rename(temporaryPath, target); errRename != nil {
+		return fmt.Errorf("usage: rename snapshot file: %w", errRename)
+	}
+	committed = true
+	if dirHandle, errOpenDir := os.Open(dir); errOpenDir == nil {
+		_ = dirHandle.Sync()
+		_ = dirHandle.Close()
+	}
+	return nil
+}
+
+func marshalStatisticsStreamLine(envelope statisticsStreamEnvelope) ([]byte, error) {
+	data, errMarshal := json.Marshal(envelope)
+	if errMarshal != nil {
+		return nil, fmt.Errorf("usage: marshal version 2 snapshot record: %w", errMarshal)
+	}
+	return append(data, '\n'), nil
 }
 
 func persistRequestStatisticsWithSave(path string, stats *RequestStatistics, save func(string, StatisticsSnapshot) error) (bool, error) {
@@ -473,26 +1072,68 @@ func PersistPendingRequestStatistics(path string, stats *RequestStatistics) erro
 	defer statisticsPersistenceMu.Unlock()
 
 	combined := NewRequestStatistics()
-	if existing, errLoad := LoadSnapshotFile(pendingPath); errLoad == nil {
-		combined.mergePersistedSnapshot(existing)
+	if _, _, errLoad := loadStatisticsFileInto(context.Background(), pendingPath, combined, time.Time{}, false); errLoad == nil {
 	} else if !os.IsNotExist(errLoad) {
 		return errLoad
 	}
-	combined.MergeSnapshot(stats.Snapshot())
-	return SaveSnapshotFile(pendingPath, combined.Snapshot())
+	if errCopy := copyRequestStatisticsRecords(context.Background(), stats, combined); errCopy != nil {
+		return errCopy
+	}
+	_, errWrite := rewriteRequestStatisticsWithPolicyLocked(pendingPath, combined, PersistencePolicy{})
+	return errWrite
 }
 
-func marshalSnapshotFile(snapshot StatisticsSnapshot) ([]byte, error) {
-	payload := StatisticsFilePayload{
-		Version:    StatisticsFileVersion,
-		ExportedAt: time.Now().UTC(),
-		Usage:      snapshot,
+func copyRequestStatisticsRecords(ctx context.Context, source, target *RequestStatistics) error {
+	if source == nil || target == nil {
+		return nil
 	}
-	data, errMarshal := json.MarshalIndent(payload, "", "  ")
-	if errMarshal != nil {
-		return nil, fmt.Errorf("usage: marshal snapshot file: %w", errMarshal)
+	source.flushPending()
+	source.mu.Lock()
+	source.sortDetailIndexLocked()
+	highWaterID := source.nextDetailID
+	source.mu.Unlock()
+	seen := make(map[string]struct{})
+	target.mu.RLock()
+	for apiName, apiValue := range target.apis {
+		if apiValue == nil {
+			continue
+		}
+		for modelName, modelValue := range apiValue.Models {
+			if modelValue == nil {
+				continue
+			}
+			for _, detail := range modelValue.Details {
+				seen[dedupKey(apiName, modelName, detail)] = struct{}{}
+			}
+		}
 	}
-	return append(data, '\n'), nil
+	target.mu.RUnlock()
+	cursor := statisticsPersistenceCursor{}
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+		records, nextCursor, done := persistenceRecordBatchAfter(source, cursor, highWaterID, statisticsStreamBatchSize)
+		kept := records[:0]
+		for _, record := range records {
+			key := dedupKey(record.API, record.Model, record.Detail)
+			if _, exists := seen[key]; exists {
+				continue
+			}
+			seen[key] = struct{}{}
+			kept = append(kept, record)
+		}
+		if _, errInsert := insertPersistedUsageBatch(ctx, target, kept); errInsert != nil {
+			return errInsert
+		}
+		cursor = nextCursor
+		if done {
+			break
+		}
+	}
+	return nil
 }
 
 func writeFileAtomic(path string, data []byte) error {

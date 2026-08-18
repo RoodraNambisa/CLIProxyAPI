@@ -704,11 +704,16 @@ func (s *Service) startUsageRestore() {
 	s.usageRestoreMu.Unlock()
 
 	stats := s.usageStatisticsStore()
+	settings := s.usagePersistenceSettings()
 	expectedGeneration := stats.HistoryGeneration()
 	finishStage := s.startupState.BeginStage("usage_snapshot_restore")
 	go func() {
 		defer close(done)
-		loaded, prepared, result, errPrepare := internalusage.PrepareRequestStatistics(ctx, path)
+		loaded, preparation, result, errPrepare := internalusage.PrepareRequestStatisticsWithPolicy(ctx, path, internalusage.PersistencePolicy{
+			DetailRetentionDays: settings.retentionDays,
+			MaxBytes:            settings.maxBytes,
+		})
+		prepared := preparation.Statistics
 		errorCode := ""
 		applied := false
 		if errPrepare != nil {
@@ -730,6 +735,21 @@ func (s *Service) startUsageRestore() {
 					"skipped": result.Skipped,
 					"removed": removed,
 				}).Info("usage statistics restored in background")
+				if preparation.NeedsMigration {
+					migrationResult, errMigration := internalusage.RewriteRequestStatisticsWithPolicy(path, stats, internalusage.PersistencePolicy{
+						DetailRetentionDays: settings.retentionDays,
+						MaxBytes:            settings.maxBytes,
+					})
+					if errMigration != nil {
+						errorCode = "usage_snapshot_migration_failed"
+						log.WithError(errMigration).Warn("failed to migrate usage statistics snapshot to version 2")
+					} else if migrationResult.Saved && preparation.MigrationSource != "" && filepath.Clean(preparation.MigrationSource) != filepath.Clean(path) {
+						if errRemove := os.Remove(preparation.MigrationSource); errRemove != nil && !os.IsNotExist(errRemove) {
+							errorCode = "usage_snapshot_legacy_cleanup_failed"
+							log.WithError(errRemove).Warn("failed to remove migrated legacy usage snapshot")
+						}
+					}
+				}
 			} else if ctx.Err() == nil {
 				// A newer destructive mutation intentionally supersedes the old
 				// snapshot, so shutdown may safely persist the current live state.

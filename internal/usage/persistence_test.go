@@ -1,9 +1,12 @@
 package usage
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -32,6 +35,207 @@ func TestLoadSnapshotFileContextHonorsCancellation(t *testing.T) {
 	cancel()
 	if _, errLoad := LoadSnapshotFileContext(ctx, path); !errors.Is(errLoad, context.Canceled) {
 		t.Fatalf("LoadSnapshotFileContext() error = %v, want context canceled", errLoad)
+	}
+}
+
+func TestVersion2SnapshotUsesRecordStreamAndRequiresFooter(t *testing.T) {
+	path := filepath.Join(t.TempDir(), StatisticsFileName)
+	stats := NewRequestStatistics()
+	now := time.Now().UTC()
+	usageTestRecord(stats, "first", now.Add(-time.Minute), 1)
+	usageTestRecord(stats, "second", now, 2)
+	if _, errPersist := RewriteRequestStatisticsWithPolicy(path, stats, PersistencePolicy{}); errPersist != nil {
+		t.Fatalf("RewriteRequestStatisticsWithPolicy() error = %v", errPersist)
+	}
+
+	file, errOpen := os.Open(path)
+	if errOpen != nil {
+		t.Fatalf("Open() error = %v", errOpen)
+	}
+	scanner := bufio.NewScanner(file)
+	kinds := make([]string, 0, 4)
+	for scanner.Scan() {
+		var envelope statisticsStreamEnvelope
+		if errDecode := json.Unmarshal(scanner.Bytes(), &envelope); errDecode != nil {
+			t.Fatalf("decode stream line: %v", errDecode)
+		}
+		kinds = append(kinds, envelope.Kind)
+		if len(kinds) == 1 && envelope.Version != StatisticsFileVersion {
+			t.Fatalf("header version = %d, want %d", envelope.Version, StatisticsFileVersion)
+		}
+	}
+	_ = file.Close()
+	if errScan := scanner.Err(); errScan != nil {
+		t.Fatalf("scan stream: %v", errScan)
+	}
+	if got := strings.Join(kinds, ","); got != "header,request,request,footer" {
+		t.Fatalf("record kinds = %q", got)
+	}
+
+	data, errRead := os.ReadFile(path)
+	if errRead != nil {
+		t.Fatalf("ReadFile() error = %v", errRead)
+	}
+	footerAt := strings.LastIndex(string(data), `{"kind":"footer"`)
+	if footerAt < 0 {
+		t.Fatal("footer was not found")
+	}
+	if errWrite := os.WriteFile(path, data[:footerAt], 0o600); errWrite != nil {
+		t.Fatalf("truncate stream: %v", errWrite)
+	}
+	if _, _, _, errPrepare := PrepareRequestStatistics(context.Background(), path); errPrepare == nil || !strings.Contains(errPrepare.Error(), "truncated") {
+		t.Fatalf("truncated stream error = %v", errPrepare)
+	}
+	unsupportedHeader, errMarshal := marshalStatisticsStreamLine(statisticsStreamEnvelope{Kind: "header", Version: StatisticsFileVersion + 1})
+	if errMarshal != nil {
+		t.Fatalf("marshal unsupported header: %v", errMarshal)
+	}
+	if errWrite := os.WriteFile(path, append(unsupportedHeader, []byte("{\"kind\":\"footer\"}\n")...), 0o600); errWrite != nil {
+		t.Fatalf("write unsupported stream: %v", errWrite)
+	}
+	if _, _, _, errPrepare := PrepareRequestStatistics(context.Background(), path); errPrepare == nil || !strings.Contains(errPrepare.Error(), "unsupported snapshot version") {
+		t.Fatalf("unsupported stream error = %v", errPrepare)
+	}
+}
+
+func TestVersion2RestoreFiltersExpiredRecordsBeforeInsertion(t *testing.T) {
+	path := filepath.Join(t.TempDir(), StatisticsFileName)
+	source := NewRequestStatistics()
+	now := time.Now().UTC()
+	usageTestRecord(source, "expired", now.Add(-72*time.Hour), 1)
+	usageTestRecord(source, "retained", now.Add(-time.Hour), 2)
+	if _, errPersist := RewriteRequestStatisticsWithPolicy(path, source, PersistencePolicy{}); errPersist != nil {
+		t.Fatalf("persist source: %v", errPersist)
+	}
+
+	loaded, preparation, result, errPrepare := PrepareRequestStatisticsWithPolicy(context.Background(), path, PersistencePolicy{DetailRetentionDays: 1})
+	if errPrepare != nil || !loaded {
+		t.Fatalf("PrepareRequestStatisticsWithPolicy() loaded=%t error=%v", loaded, errPrepare)
+	}
+	if result.Added != 1 || result.Skipped != 1 {
+		t.Fatalf("restore result = %+v", result)
+	}
+	if meta := preparation.Statistics.Meta(); meta.TotalRequests != 1 || meta.TotalTokens != 2 {
+		t.Fatalf("retained meta = %+v", meta)
+	}
+}
+
+func TestVersion2SpoolKeepsCapturedHighWaterAcrossIndexReorder(t *testing.T) {
+	path := filepath.Join(t.TempDir(), StatisticsFileName)
+	stats := NewRequestStatistics()
+	base := time.Now().UTC().Add(-time.Hour)
+	for index := 0; index < statisticsStreamBatchSize+37; index++ {
+		usageTestRecord(stats, fmt.Sprintf("captured-%04d", index), base.Add(time.Duration(index)*time.Second), int64(index+1))
+	}
+	spool, errSpool := spoolRequestStatisticsWithCapture(path, stats, func() {
+		usageTestRecord(stats, "after-high-water", base.Add(-time.Hour), 999)
+		stats.mu.Lock()
+		stats.sortDetailIndexLocked()
+		stats.mu.Unlock()
+	})
+	if errSpool != nil {
+		t.Fatalf("spoolRequestStatisticsWithCapture() error = %v", errSpool)
+	}
+	defer spool.closeAndRemove()
+	if spool.records != statisticsStreamBatchSize+37 {
+		t.Fatalf("spooled records = %d, want %d", spool.records, statisticsStreamBatchSize+37)
+	}
+	if spool.version >= stats.changeCount {
+		t.Fatalf("captured version = %d, current = %d", spool.version, stats.changeCount)
+	}
+	if _, errSeek := spool.file.Seek(0, io.SeekStart); errSeek != nil {
+		t.Fatalf("Seek() error = %v", errSeek)
+	}
+	seen := make(map[string]int)
+	decoder := json.NewDecoder(spool.file)
+	for {
+		var envelope statisticsStreamEnvelope
+		errDecode := decoder.Decode(&envelope)
+		if errDecode == io.EOF {
+			break
+		}
+		if errDecode != nil {
+			t.Fatalf("decode spooled record: %v", errDecode)
+		}
+		seen[envelope.Detail.Source]++
+	}
+	if seen["after-high-water"] != 0 {
+		t.Fatal("record created after the captured high-water entered the snapshot")
+	}
+	for index := 0; index < statisticsStreamBatchSize+37; index++ {
+		key := fmt.Sprintf("captured-%04d", index)
+		if seen[key] != 1 {
+			t.Fatalf("spooled occurrences for %s = %d, want 1", key, seen[key])
+		}
+	}
+	trim, errTrim := calculateStatisticsStreamTrim(spool, 0)
+	if errTrim != nil {
+		t.Fatalf("calculateStatisticsStreamTrim() error = %v", errTrim)
+	}
+	if errInstall := installStatisticsStream(path, spool, trim); errInstall != nil {
+		t.Fatalf("installStatisticsStream() error = %v", errInstall)
+	}
+	stats.MarkPersisted(spool.version)
+	if !stats.HasPendingPersistence() {
+		t.Fatal("record created after the captured high-water was marked persisted")
+	}
+	firstSnapshot, errLoad := LoadSnapshotFile(path)
+	if errLoad != nil {
+		t.Fatalf("LoadSnapshotFile(first) error = %v", errLoad)
+	}
+	if firstSnapshot.TotalRequests != int64(statisticsStreamBatchSize+37) {
+		t.Fatalf("first persisted requests = %d, want %d", firstSnapshot.TotalRequests, statisticsStreamBatchSize+37)
+	}
+	if _, errPersist := PersistRequestStatisticsWithPolicy(path, stats, PersistencePolicy{}); errPersist != nil {
+		t.Fatalf("PersistRequestStatisticsWithPolicy() error = %v", errPersist)
+	}
+	secondSnapshot, errLoad := LoadSnapshotFile(path)
+	if errLoad != nil {
+		t.Fatalf("LoadSnapshotFile(second) error = %v", errLoad)
+	}
+	if secondSnapshot.TotalRequests != int64(statisticsStreamBatchSize+38) {
+		t.Fatalf("second persisted requests = %d, want %d", secondSnapshot.TotalRequests, statisticsStreamBatchSize+38)
+	}
+}
+
+func TestLegacySnapshotMigratesOnlyAfterPreparedRestoreApplies(t *testing.T) {
+	path := filepath.Join(t.TempDir(), StatisticsFileName)
+	legacyStats := NewRequestStatistics()
+	usageTestRecord(legacyStats, "legacy", time.Now().UTC().Add(-time.Hour), 9)
+	legacyData, errMarshal := json.Marshal(StatisticsFilePayload{
+		Version:    legacyStatisticsVersion,
+		ExportedAt: time.Now().UTC(),
+		Usage:      legacyStats.Snapshot(),
+	})
+	if errMarshal != nil {
+		t.Fatalf("marshal legacy snapshot: %v", errMarshal)
+	}
+	if errWrite := os.WriteFile(path, legacyData, 0o600); errWrite != nil {
+		t.Fatalf("write legacy snapshot: %v", errWrite)
+	}
+
+	loaded, preparation, _, errPrepare := PrepareRequestStatisticsWithPolicy(context.Background(), path, PersistencePolicy{})
+	if errPrepare != nil || !loaded || !preparation.NeedsMigration {
+		t.Fatalf("legacy preparation loaded=%t migration=%t error=%v", loaded, preparation.NeedsMigration, errPrepare)
+	}
+	target := NewRequestStatistics()
+	if _, applied := target.ApplyPreparedRestore(preparation.Statistics, target.HistoryGeneration()); !applied {
+		t.Fatal("legacy preparation was not applied")
+	}
+	if _, errRewrite := RewriteRequestStatisticsWithPolicy(path, target, PersistencePolicy{}); errRewrite != nil {
+		t.Fatalf("rewrite migrated snapshot: %v", errRewrite)
+	}
+	file, errOpen := os.Open(path)
+	if errOpen != nil {
+		t.Fatalf("open migrated snapshot: %v", errOpen)
+	}
+	defer file.Close()
+	var header statisticsStreamEnvelope
+	if errDecode := json.NewDecoder(file).Decode(&header); errDecode != nil {
+		t.Fatalf("decode migrated header: %v", errDecode)
+	}
+	if header.Kind != "header" || header.Version != StatisticsFileVersion {
+		t.Fatalf("migrated header = %+v", header)
 	}
 }
 
