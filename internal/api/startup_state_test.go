@@ -38,3 +38,29 @@ func TestStartupStateTracksSafeIdempotentStages(t *testing.T) {
 		t.Fatalf("ready snapshot = %+v", ready)
 	}
 }
+
+func TestStartupStateDistinguishesDegradedAndFailed(t *testing.T) {
+	state := NewStartupState()
+	finish := state.BeginReportedStage("auth_store_load")
+	finish(8, 2, "")
+	state.AddIssue("auth_store_load", "auth_records_skipped", "warning")
+	state.MarkReady()
+
+	degraded := state.Snapshot()
+	if degraded.Status != StartupStatusDegraded || !degraded.Ready || !degraded.Degraded {
+		t.Fatalf("degraded snapshot = %+v", degraded)
+	}
+	if len(degraded.Issues) != 1 || degraded.Issues[0].Code != "auth_records_skipped" {
+		t.Fatalf("degraded issues = %+v", degraded.Issues)
+	}
+	if len(degraded.Stages) != 1 || degraded.Stages[0].Processed != 8 || degraded.Stages[0].Skipped != 2 {
+		t.Fatalf("reported stage = %+v", degraded.Stages)
+	}
+
+	state.AddIssue("watcher_initial_sync", "watcher_initial_sync_failed", "error")
+	state.MarkFailed()
+	failed := state.Snapshot()
+	if failed.Status != StartupStatusFailed || failed.Ready {
+		t.Fatalf("failed snapshot = %+v", failed)
+	}
+}

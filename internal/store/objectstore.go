@@ -422,15 +422,28 @@ func (s *ObjectTokenStore) save(ctx context.Context, auth *cliproxyauth.Auth, re
 }
 
 // List enumerates auth JSON files from the mirrored workspace.
-func (s *ObjectTokenStore) List(_ context.Context) ([]*cliproxyauth.Auth, error) {
+func (s *ObjectTokenStore) List(ctx context.Context) ([]*cliproxyauth.Auth, error) {
+	entries, _, err := s.ListWithReport(ctx)
+	return entries, err
+}
+
+// ListWithReport reports individual mirror records that could not be loaded.
+func (s *ObjectTokenStore) ListWithReport(ctx context.Context) ([]*cliproxyauth.Auth, cliproxyauth.StoreLoadReport, error) {
+	report := cliproxyauth.StoreLoadReport{}
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	dir := strings.TrimSpace(s.AuthDir())
 	if dir == "" {
-		return nil, fmt.Errorf("object store: auth directory not configured")
+		return nil, report, fmt.Errorf("object store: auth directory not configured")
 	}
 	entries := make([]*cliproxyauth.Auth, 0, 32)
 	err := filepath.WalkDir(dir, func(path string, d fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
+		}
+		if errContext := ctx.Err(); errContext != nil {
+			return errContext
 		}
 		if d.IsDir() {
 			return nil
@@ -438,20 +451,25 @@ func (s *ObjectTokenStore) List(_ context.Context) ([]*cliproxyauth.Auth, error)
 		if !strings.HasSuffix(strings.ToLower(d.Name()), ".json") {
 			return nil
 		}
+		report.Scanned++
 		auth, err := s.readAuthFile(path, dir)
 		if err != nil {
 			log.WithError(err).Warnf("object store: skip auth %s", path)
+			report.Skipped++
 			return nil
 		}
 		if auth != nil {
 			entries = append(entries, auth)
+			report.Loaded++
+		} else {
+			report.Skipped++
 		}
 		return nil
 	})
 	if err != nil {
-		return nil, fmt.Errorf("object store: walk auth directory: %w", err)
+		return nil, report, fmt.Errorf("object store: walk auth directory: %w", err)
 	}
-	return entries, nil
+	return entries, report, nil
 }
 
 // Delete removes an auth file locally and remotely.

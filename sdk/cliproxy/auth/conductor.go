@@ -4039,13 +4039,22 @@ func (m *Manager) deleteWithOperation(ctx context.Context, id string, operation 
 
 // Load resets manager state from the backing store.
 func (m *Manager) Load(ctx context.Context) error {
+	_, err := m.LoadWithReport(ctx)
+	return err
+}
+
+// LoadWithReport resets manager state and returns a safe aggregate describing
+// records scanned, installed, and skipped by standard stores and manager-level
+// credential filtering.
+func (m *Manager) LoadWithReport(ctx context.Context) (StoreLoadReport, error) {
+	report := StoreLoadReport{}
 	if m == nil {
-		return nil
+		return report, nil
 	}
 	m.loadMu.Lock()
 	defer m.loadMu.Unlock()
 	if errLock := m.chatGPTWebDependencyMutation.lock(ctx); errLock != nil {
-		return errLock
+		return report, errLock
 	}
 	dependencyLocked := true
 	defer func() {
@@ -4055,7 +4064,7 @@ func (m *Manager) Load(ctx context.Context) error {
 	}()
 	unlockBarrier, errBarrier := m.lockPersistBarrierWrite(ctx)
 	if errBarrier != nil {
-		return errBarrier
+		return report, errBarrier
 	}
 	defer unlockBarrier()
 	m.mu.RLock()
@@ -4067,11 +4076,19 @@ func (m *Manager) Load(ctx context.Context) error {
 	}
 	m.mu.RUnlock()
 	if store == nil {
-		return nil
+		return report, nil
 	}
-	items, err := store.List(ctx)
+	var items []*Auth
+	var err error
+	if reportingStore, ok := store.(LoadReportingStore); ok {
+		items, report, err = reportingStore.ListWithReport(ctx)
+	} else {
+		items, err = store.List(ctx)
+		report.Scanned = int64(len(items))
+		report.Loaded = int64(len(items))
+	}
 	if err != nil {
-		return err
+		return report, err
 	}
 	items = deduplicateLoadedChatGPTWebAuths(items)
 	loaded := make(map[string]*Auth, len(items))
@@ -4129,7 +4146,7 @@ func (m *Manager) Load(ctx context.Context) error {
 		m.mu.Lock()
 		if m.storeRevision != storeRevision {
 			m.mu.Unlock()
-			return errors.New("auth store changed during load")
+			return report, errors.New("auth store changed during load")
 		}
 		if m.currentConfig() != cfg {
 			m.mu.Unlock()
@@ -4176,7 +4193,12 @@ func (m *Manager) Load(ctx context.Context) error {
 	for id, auth := range replaced {
 		m.finishAuthSessionCleanup(id, auth, "auth_replaced", nil)
 	}
-	return nil
+	report.Loaded = int64(len(loaded))
+	if report.Scanned < report.Loaded {
+		report.Scanned = report.Loaded
+	}
+	report.Skipped = report.Scanned - report.Loaded
+	return report, nil
 }
 
 func deduplicateLoadedChatGPTWebAuths(items []*Auth) []*Auth {

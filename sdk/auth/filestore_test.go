@@ -191,6 +191,29 @@ func TestFileTokenStoreReadAuthFileSetsCanonicalSourceHash(t *testing.T) {
 	}
 }
 
+func TestFileTokenStoreListWithReportCountsSkippedRecords(t *testing.T) {
+	dir := t.TempDir()
+	if errWrite := os.WriteFile(filepath.Join(dir, "valid.json"), []byte(`{"type":"codex","access_token":"valid"}`), 0o600); errWrite != nil {
+		t.Fatalf("write valid auth: %v", errWrite)
+	}
+	if errWrite := os.WriteFile(filepath.Join(dir, "invalid.json"), []byte(`{"type":`), 0o600); errWrite != nil {
+		t.Fatalf("write invalid auth: %v", errWrite)
+	}
+	if errWrite := os.WriteFile(filepath.Join(dir, "ignored.txt"), []byte("ignored"), 0o600); errWrite != nil {
+		t.Fatalf("write ignored file: %v", errWrite)
+	}
+
+	store := NewFileTokenStore()
+	store.SetBaseDir(dir)
+	auths, report, errList := store.ListWithReport(t.Context())
+	if errList != nil {
+		t.Fatalf("ListWithReport() error = %v", errList)
+	}
+	if len(auths) != 1 || report.Scanned != 2 || report.Loaded != 1 || report.Skipped != 1 {
+		t.Fatalf("auths=%d report=%+v, want 1 loaded and 1 skipped", len(auths), report)
+	}
+}
+
 func TestFileTokenStoreConditionalDeleteRejectsEmptySourceHash(t *testing.T) {
 	errDelete := (&FileTokenStore{}).DeleteIfSourceHashMatches(t.Context(), "auth.json", "  ")
 	if outcome, explicit := cliproxyauth.DeleteOutcomeFromError(errDelete); !explicit || outcome != cliproxyauth.DeleteOutcomeRolledBack {

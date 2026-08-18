@@ -83,7 +83,7 @@ type Service struct {
 	pprofServer *pprofServer
 
 	// serverErr channel for server startup/shutdown errors.
-	serverErr chan error
+	serverErr <-chan error
 
 	// startupState gates proxy routes until essential routing initialization is complete.
 	startupState *api.StartupState
@@ -5047,26 +5047,13 @@ func (s *Service) startAPIListener() error {
 		return errors.New("cliproxy: API server unavailable")
 	}
 	finishListener := s.startupState.BeginStage("listener_start")
-	s.serverErr = make(chan error, 1)
-	go func() {
-		if errStart := s.server.Start(); errStart != nil {
-			s.serverErr <- errStart
-		} else {
-			s.serverErr <- nil
-		}
-	}()
-
-	timer := time.NewTimer(100 * time.Millisecond)
-	defer timer.Stop()
-	select {
-	case errStart := <-s.serverErr:
+	_, serverErr, errStart := s.server.StartListening()
+	if errStart != nil {
 		finishListener(0, "listener_start_failed")
-		if errStart == nil {
-			return errors.New("cliproxy: API server stopped during startup")
-		}
+		s.startupState.AddIssue("listener_start", "listener_start_failed", "error")
 		return errStart
-	case <-timer.C:
 	}
+	s.serverErr = serverErr
 	finishListener(1, "")
 	s.startupState.SetPhase(api.StartupPhaseListenerReady)
 	fmt.Printf("API server started successfully on: %s:%d\n", s.cfg.Host, s.cfg.Port)
@@ -5130,11 +5117,14 @@ func (s *Service) Run(ctx context.Context) error {
 	}()
 
 	s.startupState.SetPhase(api.StartupPhaseAuthLoading)
-	finishAuthLoad := s.startupState.BeginStage("auth_store_load")
+	finishAuthLoad := s.startupState.BeginReportedStage("auth_store_load")
 	authLoadErrorCode := ""
+	authLoadReport := coreauth.StoreLoadReport{}
+	var authLoadErr error
 	if s.coreManager != nil {
-		if errLoad := s.coreManager.Load(ctx); errLoad != nil {
-			log.Warnf("failed to load auth store: %v", errLoad)
+		authLoadReport, authLoadErr = s.coreManager.LoadWithReport(ctx)
+		if authLoadErr != nil {
+			log.Warnf("failed to load auth store: %v", authLoadErr)
 			authLoadErrorCode = "auth_store_load_failed"
 		}
 	}
@@ -5142,18 +5132,34 @@ func (s *Service) Run(ctx context.Context) error {
 	if s.coreManager != nil {
 		authCount = int64(s.coreManager.Count())
 	}
-	finishAuthLoad(authCount, authLoadErrorCode)
+	finishAuthLoad(authCount, authLoadReport.Skipped, authLoadErrorCode)
+	if authLoadErr != nil {
+		if authCount == 0 {
+			s.startupState.AddIssue("auth_store_load", authLoadErrorCode, "error")
+			return s.waitForFailedStartup(ctx, fmt.Errorf("cliproxy: load auth store: %w", authLoadErr))
+		}
+		s.startupState.AddIssue("auth_store_load", authLoadErrorCode, "warning")
+	}
+	if authLoadReport.Skipped > 0 {
+		s.startupState.AddIssue("auth_store_load", "auth_records_skipped", "warning")
+	}
 
 	s.startupState.SetPhase(api.StartupPhaseRoutingBootstrap)
 	finishDependencies := s.startupState.BeginStage("credential_dependency_reconcile")
-	_, _ = s.reconcileChatGPTWebDependencies(ctx, "startup")
-	finishDependencies(authCount, "")
+	_, errDependencies := s.reconcileChatGPTWebDependencies(ctx, "startup")
+	dependencyErrorCode := ""
+	if errDependencies != nil {
+		dependencyErrorCode = "credential_dependency_reconcile_failed"
+		s.startupState.AddIssue("credential_dependency_reconcile", dependencyErrorCode, "warning")
+	}
+	finishDependencies(authCount, dependencyErrorCode)
 
 	finishTokenLoad := s.startupState.BeginStage("token_provider_load")
 	tokenResult, err := s.tokenProvider.Load(ctx, s.cfg)
 	if err != nil && !errors.Is(err, context.Canceled) {
 		finishTokenLoad(0, "token_provider_load_failed")
-		return err
+		s.startupState.AddIssue("token_provider_load", "token_provider_load_failed", "error")
+		return s.waitForFailedStartup(ctx, err)
 	}
 	if tokenResult == nil {
 		tokenResult = &TokenClientResult{}
@@ -5165,7 +5171,8 @@ func (s *Service) Run(ctx context.Context) error {
 	apiKeyResult, err := s.apiKeyProvider.Load(ctx, s.cfg)
 	if err != nil && !errors.Is(err, context.Canceled) {
 		finishAPIKeyLoad(0, "api_key_provider_load_failed")
-		return err
+		s.startupState.AddIssue("api_key_provider_load", "api_key_provider_load_failed", "error")
+		return s.waitForFailedStartup(ctx, err)
 	}
 	if apiKeyResult == nil {
 		apiKeyResult = &APIKeyClientResult{}
@@ -5214,8 +5221,8 @@ func (s *Service) Run(ctx context.Context) error {
 	if err != nil {
 		finishWatcherSync(0, "watcher_create_failed")
 		finishRouting(authCount, "watcher_create_failed")
-		s.startupState.MarkFailed()
-		return fmt.Errorf("cliproxy: failed to create watcher: %w", err)
+		s.startupState.AddIssue("watcher_initial_sync", "watcher_create_failed", "error")
+		return s.waitForFailedStartup(ctx, fmt.Errorf("cliproxy: failed to create watcher: %w", err))
 	}
 	s.watcher = watcherWrapper
 	watcherWrapper.SetConfigApply(func(newCfg *config.Config) (*config.Config, error) {
@@ -5239,14 +5246,14 @@ func (s *Service) Run(ctx context.Context) error {
 	if err = watcherWrapper.Start(watcherCtx); err != nil {
 		finishWatcherSync(0, "watcher_start_failed")
 		finishRouting(authCount, "watcher_start_failed")
-		s.startupState.MarkFailed()
-		return fmt.Errorf("cliproxy: failed to start watcher: %w", err)
+		s.startupState.AddIssue("watcher_initial_sync", "watcher_start_failed", "error")
+		return s.waitForFailedStartup(ctx, fmt.Errorf("cliproxy: failed to start watcher: %w", err))
 	}
 	if err = watcherWrapper.WaitForAuthUpdates(ctx); err != nil {
 		finishWatcherSync(0, "watcher_initial_sync_failed")
 		finishRouting(authCount, "watcher_initial_sync_failed")
-		s.startupState.MarkFailed()
-		return fmt.Errorf("cliproxy: wait for initial auth updates: %w", err)
+		s.startupState.AddIssue("watcher_initial_sync", "watcher_initial_sync_failed", "error")
+		return s.waitForFailedStartup(ctx, fmt.Errorf("cliproxy: wait for initial auth updates: %w", err))
 	}
 	finishWatcherSync(authCount, "")
 	log.Info("file watcher started for config and auth directory changes")
@@ -5274,6 +5281,22 @@ func (s *Service) Run(ctx context.Context) error {
 		return ctx.Err()
 	case err = <-s.serverErr:
 		return err
+	}
+}
+
+func (s *Service) waitForFailedStartup(ctx context.Context, startupErr error) error {
+	if s != nil && s.startupState != nil {
+		s.startupState.MarkFailed()
+	}
+	log.WithError(startupErr).Error("service startup failed; management diagnostics remain available")
+	select {
+	case <-ctx.Done():
+		return errors.Join(startupErr, ctx.Err())
+	case errServer := <-s.serverErr:
+		if errServer == nil {
+			return startupErr
+		}
+		return errors.Join(startupErr, errServer)
 	}
 }
 

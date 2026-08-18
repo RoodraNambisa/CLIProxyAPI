@@ -179,6 +179,24 @@ func TestStartupReadinessGatesProxyAndCredentialManagement(t *testing.T) {
 		}
 	}
 
+	for _, testCase := range []struct {
+		method string
+		path   string
+	}{
+		{method: http.MethodPut, path: "/v0/management/config.yaml"},
+		{method: http.MethodPatch, path: "/v0/management/debug"},
+		{method: http.MethodPost, path: "/v0/management/control-panel/update"},
+		{method: http.MethodDelete, path: "/v0/management/usage"},
+	} {
+		request := httptest.NewRequest(testCase.method, testCase.path, nil)
+		request.Header.Set("X-Management-Key", "secret")
+		recorder := httptest.NewRecorder()
+		server.engine.ServeHTTP(recorder, request)
+		if recorder.Code != http.StatusServiceUnavailable || !strings.Contains(recorder.Body.String(), `"code":"service_initializing"`) {
+			t.Fatalf("initial management write %s %s = %d %s, want service_initializing 503", testCase.method, testCase.path, recorder.Code, recorder.Body.String())
+		}
+	}
+
 	authFilesRequest := httptest.NewRequest(http.MethodGet, "/v0/management/auth-files", nil)
 	authFilesRequest.Header.Set("X-Management-Key", "secret")
 	authFilesRecorder := httptest.NewRecorder()
@@ -200,6 +218,66 @@ func TestStartupReadinessGatesProxyAndCredentialManagement(t *testing.T) {
 	server.engine.ServeHTTP(proxyRecorder, proxyRequest)
 	if proxyRecorder.Code == http.StatusServiceUnavailable && strings.Contains(proxyRecorder.Body.String(), "service_initializing") {
 		t.Fatalf("proxy remained startup-gated after MarkReady: %s", proxyRecorder.Body.String())
+	}
+}
+
+func TestFailedStartupKeepsSafeReadsAndRejectsWrites(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "secret")
+	startup := NewStartupState()
+	startup.AddIssue("watcher_initial_sync", "watcher_initial_sync_failed", "error")
+	startup.MarkFailed()
+	server := newTestServerWithConfigAndOptions(t, func(cfg *proxyconfig.Config) {
+		cfg.RemoteManagement.SecretKey = "secret"
+		cfg.RemoteManagement.AllowRemote = true
+	}, WithStartupState(startup))
+
+	read := httptest.NewRequest(http.MethodGet, "/v0/management/startup/status", nil)
+	read.Header.Set("X-Management-Key", "secret")
+	readRecorder := httptest.NewRecorder()
+	server.engine.ServeHTTP(readRecorder, read)
+	if readRecorder.Code != http.StatusOK || !strings.Contains(readRecorder.Body.String(), `"status":"failed"`) {
+		t.Fatalf("failed startup safe read = %d %s", readRecorder.Code, readRecorder.Body.String())
+	}
+
+	write := httptest.NewRequest(http.MethodPut, "/v0/management/config.yaml", strings.NewReader("debug: true\n"))
+	write.Header.Set("X-Management-Key", "secret")
+	writeRecorder := httptest.NewRecorder()
+	server.engine.ServeHTTP(writeRecorder, write)
+	if writeRecorder.Code != http.StatusServiceUnavailable || !strings.Contains(writeRecorder.Body.String(), `"code":"service_startup_failed"`) {
+		t.Fatalf("failed startup write = %d %s", writeRecorder.Code, writeRecorder.Body.String())
+	}
+}
+
+func TestStartListeningBindsBeforeReturning(t *testing.T) {
+	server := newTestServerWithConfig(t, func(cfg *proxyconfig.Config) {
+		cfg.Host = "127.0.0.1"
+		cfg.Port = 0
+	})
+	addr, serverErr, errStart := server.StartListening()
+	if errStart != nil {
+		t.Fatalf("StartListening() error = %v", errStart)
+	}
+	if addr == nil {
+		t.Fatal("StartListening() returned nil address")
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if errStop := server.Stop(ctx); errStop != nil {
+			t.Errorf("Stop() error = %v", errStop)
+		}
+		if errServe := <-serverErr; errServe != nil {
+			t.Errorf("Serve() error = %v", errServe)
+		}
+	})
+
+	response, errGet := http.Get("http://" + addr.String() + "/healthz")
+	if errGet != nil {
+		t.Fatalf("health request immediately after StartListening: %v", errGet)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("health status = %d, want 200", response.StatusCode)
 	}
 }
 

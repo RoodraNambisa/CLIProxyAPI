@@ -512,10 +512,18 @@ func (s *PostgresStore) save(ctx context.Context, auth *cliproxyauth.Auth, requi
 
 // List enumerates all auth records stored in PostgreSQL.
 func (s *PostgresStore) List(ctx context.Context) ([]*cliproxyauth.Auth, error) {
+	auths, _, err := s.ListWithReport(ctx)
+	return auths, err
+}
+
+// ListWithReport reports rows skipped because their stored credential payload
+// cannot be safely loaded.
+func (s *PostgresStore) ListWithReport(ctx context.Context) ([]*cliproxyauth.Auth, cliproxyauth.StoreLoadReport, error) {
+	report := cliproxyauth.StoreLoadReport{}
 	query := fmt.Sprintf("SELECT id, content, created_at, updated_at FROM %s ORDER BY id", s.fullTableName(s.cfg.AuthTable))
 	rows, err := s.db.QueryContext(ctx, query)
 	if err != nil {
-		return nil, fmt.Errorf("postgres store: list auth: %w", err)
+		return nil, report, fmt.Errorf("postgres store: list auth: %w", err)
 	}
 	defer rows.Close()
 
@@ -529,16 +537,17 @@ func (s *PostgresStore) List(ctx context.Context) ([]*cliproxyauth.Auth, error) 
 	for rows.Next() {
 		record := listedAuthRecord{}
 		if err = rows.Scan(&record.id, &record.payload, &record.createdAt, &record.updatedAt); err != nil {
-			return nil, fmt.Errorf("postgres store: scan auth row: %w", err)
+			return nil, report, fmt.Errorf("postgres store: scan auth row: %w", err)
 		}
 		records = append(records, record)
 	}
 	if err = rows.Err(); err != nil {
-		return nil, fmt.Errorf("postgres store: iterate auth rows: %w", err)
+		return nil, report, fmt.Errorf("postgres store: iterate auth rows: %w", err)
 	}
 	if err = rows.Close(); err != nil {
-		return nil, fmt.Errorf("postgres store: close auth rows: %w", err)
+		return nil, report, fmt.Errorf("postgres store: close auth rows: %w", err)
 	}
+	report.Scanned = int64(len(records))
 
 	auths := make([]*cliproxyauth.Auth, 0, len(records))
 	for _, record := range records {
@@ -553,7 +562,7 @@ func (s *PostgresStore) List(ctx context.Context) ([]*cliproxyauth.Auth, error) 
 		if cliproxyauth.IsRetiredGeminiCLIAuthFileData(payloadData) {
 			current, errCurrent := s.markRetiredAuthRecordIfCurrent(ctx, id, path, payloadData)
 			if errCurrent != nil {
-				return nil, errCurrent
+				return nil, report, errCurrent
 			}
 			if !current {
 				continue
@@ -600,7 +609,9 @@ func (s *PostgresStore) List(ctx context.Context) ([]*cliproxyauth.Auth, error) 
 		cliproxyauth.ApplyCustomHeadersFromMetadata(auth)
 		auths = append(auths, auth)
 	}
-	return auths, nil
+	report.Loaded = int64(len(auths))
+	report.Skipped = report.Scanned - report.Loaded
+	return auths, report, nil
 }
 
 // Delete removes an auth file and the corresponding database record.

@@ -116,6 +116,21 @@ type Store interface {
 	Delete(ctx context.Context, id string) error
 }
 
+// StoreLoadReport summarizes a standard store scan without exposing record
+// identifiers or storage locations.
+type StoreLoadReport struct {
+	Scanned int64
+	Loaded  int64
+	Skipped int64
+}
+
+// LoadReportingStore optionally reports partial record failures during List.
+// Manager remains compatible with third-party Store implementations that only
+// provide List.
+type LoadReportingStore interface {
+	ListWithReport(ctx context.Context) ([]*Auth, StoreLoadReport, error)
+}
+
 // RefreshPersistenceConcurrencyStore declares how many refresh writes the
 // backing store can execute concurrently. Stores that omit this capability do
 // not use the refresh persistence coordinator.

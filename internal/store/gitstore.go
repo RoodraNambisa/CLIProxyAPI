@@ -1752,28 +1752,36 @@ func rollBackCommittedGitAuthFileWrite(path string, installed, original authFile
 
 // List enumerates all auth JSON files under the configured directory.
 func (s *GitTokenStore) List(ctx context.Context) ([]*cliproxyauth.Auth, error) {
+	entries, _, err := s.ListWithReport(ctx)
+	return entries, err
+}
+
+// ListWithReport reports individual credential files skipped during a Git
+// workspace scan while preserving fatal repository and path validation errors.
+func (s *GitTokenStore) ListWithReport(ctx context.Context) ([]*cliproxyauth.Auth, cliproxyauth.StoreLoadReport, error) {
+	report := cliproxyauth.StoreLoadReport{}
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	if errContext := ctx.Err(); errContext != nil {
-		return nil, errContext
+		return nil, report, errContext
 	}
 	s.bindingMu.RLock()
 	defer s.bindingMu.RUnlock()
 	if repoDir, baseDir := s.repoDirSnapshot(), s.baseDirSnapshot(); repoDir != "" && baseDir != "" {
 		if errValidate := validateGitAuthDirectoryTree(repoDir, baseDir, true); errValidate != nil {
-			return nil, errValidate
+			return nil, report, errValidate
 		}
 	}
 	if err := s.ensureRepositoryLocked(ctx); err != nil {
-		return nil, err
+		return nil, report, err
 	}
 	dir := s.baseDirSnapshot()
 	if dir == "" {
-		return nil, fmt.Errorf("auth filestore: directory not configured")
+		return nil, report, fmt.Errorf("auth filestore: directory not configured")
 	}
 	if errValidate := validateGitAuthFilesystemPath(s.repoDirSnapshot(), dir, false, true); errValidate != nil {
-		return nil, errValidate
+		return nil, report, errValidate
 	}
 	entries := make([]*cliproxyauth.Auth, 0)
 	err := filepath.WalkDir(dir, func(path string, d fs.DirEntry, walkErr error) error {
@@ -1796,22 +1804,27 @@ func (s *GitTokenStore) List(ctx context.Context) ([]*cliproxyauth.Auth, error) 
 		if !strings.HasSuffix(strings.ToLower(d.Name()), ".json") {
 			return nil
 		}
+		report.Scanned++
 		auth, err := s.readAuthFile(path, dir)
 		if err != nil {
 			if errors.Is(err, errUnsafeGitAuthPath) {
 				return err
 			}
+			report.Skipped++
 			return nil
 		}
 		if auth != nil {
 			entries = append(entries, auth)
+			report.Loaded++
+		} else {
+			report.Skipped++
 		}
 		return nil
 	})
 	if err != nil {
-		return nil, err
+		return nil, report, err
 	}
-	return entries, nil
+	return entries, report, nil
 }
 
 // Delete removes the auth file.

@@ -1159,20 +1159,28 @@ func finishFileTokenSave(auth *cliproxyauth.Auth, persistedPath string, committe
 
 // List enumerates all auth JSON files under the configured directory.
 func (s *FileTokenStore) List(ctx context.Context) ([]*cliproxyauth.Auth, error) {
+	entries, _, err := s.ListWithReport(ctx)
+	return entries, err
+}
+
+// ListWithReport enumerates auth files and reports records skipped because an
+// individual file could not be inspected or decoded.
+func (s *FileTokenStore) ListWithReport(ctx context.Context) ([]*cliproxyauth.Auth, cliproxyauth.StoreLoadReport, error) {
+	report := cliproxyauth.StoreLoadReport{}
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	_, dir, errBase := resolveFileTokenBaseDir(s.baseDirSnapshot(), false)
 	if errBase != nil {
-		return nil, errBase
+		return nil, report, errBase
 	}
 	s.rememberResolvedBaseDir(dir)
 	if dir == "" {
-		return nil, fmt.Errorf("auth filestore: directory not configured")
+		return nil, report, fmt.Errorf("auth filestore: directory not configured")
 	}
 	root, errRoot := os.OpenRoot(dir)
 	if errRoot != nil {
-		return nil, fmt.Errorf("auth filestore: open directory: %w", errRoot)
+		return nil, report, fmt.Errorf("auth filestore: open directory: %w", errRoot)
 	}
 	defer closeFileTokenRoot(root)
 	entries := make([]*cliproxyauth.Auth, 0)
@@ -1192,9 +1200,15 @@ func (s *FileTokenStore) List(ctx context.Context) ([]*cliproxyauth.Auth, error)
 		if !strings.HasSuffix(strings.ToLower(d.Name()), ".json") {
 			return nil
 		}
+		report.Scanned++
 		info, errInfo := d.Info()
-		if errInfo != nil || !info.Mode().IsRegular() {
-			return errInfo
+		if errInfo != nil {
+			report.Skipped++
+			return nil
+		}
+		if !info.Mode().IsRegular() {
+			report.Skipped++
+			return nil
 		}
 		relativePath := filepath.FromSlash(walkPath)
 		path := filepath.Join(dir, relativePath)
@@ -1203,17 +1217,21 @@ func (s *FileTokenStore) List(ctx context.Context) ([]*cliproxyauth.Auth, error)
 			if errContext := ctx.Err(); errContext != nil {
 				return errContext
 			}
+			report.Skipped++
 			return nil
 		}
 		if auth != nil {
 			entries = append(entries, auth)
+			report.Loaded++
+		} else {
+			report.Skipped++
 		}
 		return nil
 	})
 	if err != nil {
-		return nil, err
+		return nil, report, err
 	}
-	return entries, nil
+	return entries, report, nil
 }
 
 // Delete removes the auth file.

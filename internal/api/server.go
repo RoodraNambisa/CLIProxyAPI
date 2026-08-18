@@ -7,8 +7,10 @@ package api
 import (
 	"context"
 	"crypto/subtle"
+	"crypto/tls"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -548,12 +550,13 @@ func (s *Server) proxyReadinessMiddleware() gin.HandlerFunc {
 			c.Next()
 			return
 		}
+		code, message := startupUnavailableResponse(snapshot)
 		c.Header("Retry-After", "2")
 		c.AbortWithStatusJSON(http.StatusServiceUnavailable, gin.H{
 			"error": gin.H{
-				"message": "service is initializing",
+				"message": message,
 				"type":    "service_unavailable",
-				"code":    "service_initializing",
+				"code":    code,
 			},
 			"startup_phase": snapshot.Phase,
 		})
@@ -966,17 +969,29 @@ func (s *Server) getStartupStatus(c *gin.Context) {
 func (s *Server) startupManagementMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		snapshot := s.startupState.Snapshot()
-		if snapshot.Ready || startupManagementPathAvailable(c.Request.URL.Path) {
+		if snapshot.Ready || (startupManagementMethodAvailable(c.Request.Method) && startupManagementPathAvailable(c.Request.URL.Path)) {
 			c.Next()
 			return
 		}
+		code, message := startupUnavailableResponse(snapshot)
 		c.Header("Retry-After", "2")
 		c.AbortWithStatusJSON(http.StatusServiceUnavailable, gin.H{
-			"error":         "service is initializing",
-			"code":          "service_initializing",
+			"error":         message,
+			"code":          code,
 			"startup_phase": snapshot.Phase,
 		})
 	}
+}
+
+func startupManagementMethodAvailable(method string) bool {
+	return method == http.MethodGet || method == http.MethodHead
+}
+
+func startupUnavailableResponse(snapshot StartupSnapshot) (code, message string) {
+	if snapshot.Status == StartupStatusFailed || snapshot.Phase == StartupPhaseFailed {
+		return "service_startup_failed", "service startup failed"
+	}
+	return "service_initializing", "service is initializing"
 }
 
 func startupManagementPathAvailable(path string) bool {
@@ -1151,31 +1166,60 @@ func (s *Server) unifiedModelsHandler(openaiHandler *openai.OpenAIAPIHandler, cl
 // Returns:
 //   - error: An error if the server fails to start
 func (s *Server) Start() error {
+	_, serverErr, errListen := s.StartListening()
+	if errListen != nil {
+		return errListen
+	}
+	return <-serverErr
+}
+
+// StartListening synchronously binds the configured socket and validates TLS
+// material before starting Serve in the background. A successful return proves
+// that the listener is owned by this server; callers can safely publish
+// listener readiness without relying on a timing heuristic.
+func (s *Server) StartListening() (net.Addr, <-chan error, error) {
 	if s == nil || s.server == nil {
-		return fmt.Errorf("failed to start HTTP server: server not initialized")
+		return nil, nil, fmt.Errorf("failed to start HTTP server: server not initialized")
 	}
 
 	current := s.currentConfig()
 	useTLS := current != nil && current.TLS.Enable
+	cert := ""
+	key := ""
 	if useTLS {
-		cert := strings.TrimSpace(current.TLS.Cert)
-		key := strings.TrimSpace(current.TLS.Key)
+		cert = strings.TrimSpace(current.TLS.Cert)
+		key = strings.TrimSpace(current.TLS.Key)
 		if cert == "" || key == "" {
-			return fmt.Errorf("failed to start HTTPS server: tls.cert or tls.key is empty")
+			return nil, nil, fmt.Errorf("failed to start HTTPS server: tls.cert or tls.key is empty")
 		}
-		log.Debugf("Starting API server on %s with TLS", s.server.Addr)
-		if errServeTLS := s.server.ListenAndServeTLS(cert, key); errServeTLS != nil && !errors.Is(errServeTLS, http.ErrServerClosed) {
-			return fmt.Errorf("failed to start HTTPS server: %v", errServeTLS)
+		if _, errCertificate := tls.LoadX509KeyPair(cert, key); errCertificate != nil {
+			return nil, nil, fmt.Errorf("failed to start HTTPS server: load TLS certificate: %w", errCertificate)
 		}
-		return nil
 	}
 
-	log.Debugf("Starting API server on %s", s.server.Addr)
-	if errServe := s.server.ListenAndServe(); errServe != nil && !errors.Is(errServe, http.ErrServerClosed) {
-		return fmt.Errorf("failed to start HTTP server: %v", errServe)
+	listener, errListen := net.Listen("tcp", s.server.Addr)
+	if errListen != nil {
+		return nil, nil, fmt.Errorf("failed to bind API server on %s: %w", s.server.Addr, errListen)
 	}
-
-	return nil
+	serverErr := make(chan error, 1)
+	go func() {
+		var errServe error
+		if useTLS {
+			log.Debugf("Starting API server on %s with TLS", listener.Addr())
+			errServe = s.server.ServeTLS(listener, cert, key)
+		} else {
+			log.Debugf("Starting API server on %s", listener.Addr())
+			errServe = s.server.Serve(listener)
+		}
+		if errors.Is(errServe, http.ErrServerClosed) {
+			errServe = nil
+		}
+		if errServe != nil {
+			errServe = fmt.Errorf("API server stopped: %w", errServe)
+		}
+		serverErr <- errServe
+	}()
+	return listener.Addr(), serverErr, nil
 }
 
 // Stop gracefully shuts down the API server without interrupting any
