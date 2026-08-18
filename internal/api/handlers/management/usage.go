@@ -83,13 +83,21 @@ func (h *Handler) ClearUsageStatistics(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "usage statistics unavailable"})
 		return
 	}
+	if active := h.usagePruneTaskManagerSnapshot().history().Active; active != nil {
+		c.JSON(http.StatusConflict, gin.H{
+			"error":   "usage prune task is already running",
+			"code":    "usage_prune_in_progress",
+			"task_id": active.TaskID,
+		})
+		return
+	}
 	if err := coreusage.DefaultManager().Barrier(c.Request.Context()); err != nil {
 		status, message := usageBarrierErrorResponse(err)
 		c.JSON(status, gin.H{"error": message})
 		return
 	}
 	path := h.usageStatisticsFilePath()
-	previous, err := usage.ClearAndPersistRequestStatistics(path, stats)
+	previous, err := usage.ClearAndPersistRequestStatisticsMeta(path, stats)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"cleared": true,

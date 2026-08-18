@@ -178,6 +178,13 @@ func TestStartupReadinessGatesProxyAndCredentialManagement(t *testing.T) {
 			t.Fatalf("initial management %s status = %d, want 200: %s", path, recorder.Code, recorder.Body.String())
 		}
 	}
+	pruneTaskRequest := httptest.NewRequest(http.MethodGet, "/v0/management/usage/prune/missing", nil)
+	pruneTaskRequest.Header.Set("X-Management-Key", "secret")
+	pruneTaskRecorder := httptest.NewRecorder()
+	server.engine.ServeHTTP(pruneTaskRecorder, pruneTaskRequest)
+	if pruneTaskRecorder.Code != http.StatusNotFound || strings.Contains(pruneTaskRecorder.Body.String(), "service_initializing") {
+		t.Fatalf("initial prune task query = %d %s, want handler 404 without startup gate", pruneTaskRecorder.Code, pruneTaskRecorder.Body.String())
+	}
 
 	for _, testCase := range []struct {
 		method string

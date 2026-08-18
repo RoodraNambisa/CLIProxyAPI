@@ -392,3 +392,53 @@ func TestPendingUsageSidecarSurvivesInterruptedRestore(t *testing.T) {
 		t.Fatalf("pending sidecar remains after durable merge, stat error=%v", errStat)
 	}
 }
+
+func TestClearAndPersistRequestStatisticsMetaKeepsOnlyAggregateResponse(t *testing.T) {
+	path := filepath.Join(t.TempDir(), StatisticsFileName)
+	stats := NewRequestStatistics()
+	now := time.Now().UTC()
+	for index := 0; index < 100; index++ {
+		usageTestRecord(stats, fmt.Sprintf("clear-%03d", index), now.Add(time.Duration(index)*time.Second), 1)
+	}
+	if _, errPersist := PersistRequestStatisticsWithPolicy(path, stats, PersistencePolicy{}); errPersist != nil {
+		t.Fatalf("persist before clear: %v", errPersist)
+	}
+	previous, errClear := ClearAndPersistRequestStatisticsMeta(path, stats)
+	if errClear != nil {
+		t.Fatalf("ClearAndPersistRequestStatisticsMeta() error = %v", errClear)
+	}
+	if previous.TotalRequests != 100 || previous.TotalTokens != 100 || stats.DetailCount() != 0 {
+		t.Fatalf("clear meta = %+v, remaining=%d", previous, stats.DetailCount())
+	}
+	loaded, errLoad := LoadSnapshotFile(path)
+	if errLoad != nil {
+		t.Fatalf("load cleared snapshot: %v", errLoad)
+	}
+	if loaded.TotalRequests != 0 || snapshotDetailCount(loaded) != 0 {
+		t.Fatalf("cleared disk snapshot = %+v", loaded)
+	}
+}
+
+func TestPendingSnapshotRemovalFailureFallsBackToEmptyAtomicSnapshot(t *testing.T) {
+	path := filepath.Join(t.TempDir(), StatisticsFileName)
+	pendingPath := PendingStatisticsFilePath(path)
+	pending := NewRequestStatistics()
+	usageTestRecord(pending, "pending-old", time.Now().UTC(), 9)
+	if errSave := SaveSnapshotFile(pendingPath, pending.Snapshot()); errSave != nil {
+		t.Fatalf("save pending snapshot: %v", errSave)
+	}
+	forcedRemoveError := errors.New("forced unlink failure")
+	errClear := removeOrClearPendingStatisticsFileWith(path, func(string) error {
+		return forcedRemoveError
+	}, SaveSnapshotFile)
+	if errClear != nil {
+		t.Fatalf("removeOrClearPendingStatisticsFileWith() error = %v", errClear)
+	}
+	cleared, errLoad := LoadSnapshotFile(pendingPath)
+	if errLoad != nil {
+		t.Fatalf("load fallback pending snapshot: %v", errLoad)
+	}
+	if cleared.TotalRequests != 0 || snapshotDetailCount(cleared) != 0 {
+		t.Fatalf("fallback pending snapshot = %+v", cleared)
+	}
+}

@@ -717,14 +717,11 @@ func writeRequestStatisticsWithPolicyLocked(path string, stats *RequestStatistic
 			}
 			spool.closeAndRemove()
 			result.Saved = true
-			if pendingPath := PendingStatisticsFilePath(path); pendingPath != "" {
-				if errRemove := os.Remove(pendingPath); errRemove != nil && !os.IsNotExist(errRemove) {
-					return result, fmt.Errorf("usage: remove pending snapshot: %w", errRemove)
-				}
+			if errPending := removeOrClearPendingStatisticsFile(path); errPending != nil {
+				return result, errPending
 			}
-			// Keep the state dirty until the pending sidecar is removed. If the
-			// removal fails, the next persistence pass rewrites the combined main
-			// snapshot and retries instead of leaving duplicate data for restart.
+			// Keep the state dirty until the pending sidecar is removed or safely
+			// replaced with an empty snapshot.
 			stats.MarkPersisted(version)
 			return result, nil
 		}
@@ -1021,6 +1018,26 @@ func ClearAndPersistRequestStatistics(path string, stats *RequestStatistics) (St
 	return clearAndPersistRequestStatisticsWithSave(path, stats, SaveSnapshotFile)
 }
 
+// ClearAndPersistRequestStatisticsMeta clears Usage history without copying
+// all request details solely to build the management response.
+func ClearAndPersistRequestStatisticsMeta(path string, stats *RequestStatistics) (MetaSnapshot, error) {
+	if stats == nil {
+		return MetaSnapshot{}, nil
+	}
+	statisticsPersistenceMu.Lock()
+	defer statisticsPersistenceMu.Unlock()
+
+	previous, version := stats.clearMetaWithState()
+	if errSave := SaveSnapshotFile(path, StatisticsSnapshot{}); errSave != nil {
+		return previous, errSave
+	}
+	if errPending := removeOrClearPendingStatisticsFile(path); errPending != nil {
+		return previous, errPending
+	}
+	stats.MarkPersisted(version)
+	return previous, nil
+}
+
 func clearAndPersistRequestStatisticsWithSave(path string, stats *RequestStatistics, save func(string, StatisticsSnapshot) error) (StatisticsSnapshot, error) {
 	return clearAndPersistRequestStatisticsWithHooks(path, stats, save, nil, nil)
 }
@@ -1048,13 +1065,33 @@ func clearAndPersistRequestStatisticsWithHooks(
 	if err := save(path, empty); err != nil {
 		return previous, err
 	}
-	if pendingPath := PendingStatisticsFilePath(path); pendingPath != "" {
-		if errRemove := os.Remove(pendingPath); errRemove != nil && !os.IsNotExist(errRemove) {
-			return previous, fmt.Errorf("usage: remove pending snapshot: %w", errRemove)
-		}
+	if errPending := removeOrClearPendingStatisticsFile(path); errPending != nil {
+		return previous, errPending
 	}
 	stats.MarkPersisted(version)
 	return previous, nil
+}
+
+func removeOrClearPendingStatisticsFile(path string) error {
+	return removeOrClearPendingStatisticsFileWith(path, os.Remove, SaveSnapshotFile)
+}
+
+func removeOrClearPendingStatisticsFileWith(path string, remove func(string) error, clearFile func(string, StatisticsSnapshot) error) error {
+	pendingPath := PendingStatisticsFilePath(path)
+	if pendingPath == "" {
+		return nil
+	}
+	errRemove := remove(pendingPath)
+	if errRemove == nil || os.IsNotExist(errRemove) {
+		return nil
+	}
+	// Once the main snapshot is durable, an old sidecar must not be eligible
+	// for a later merge. An empty atomic replacement is a safe fallback on
+	// filesystems where unlinking the existing file is temporarily unavailable.
+	if errClear := clearFile(pendingPath, StatisticsSnapshot{}); errClear != nil {
+		return fmt.Errorf("usage: remove pending snapshot: %v; clear fallback: %w", errRemove, errClear)
+	}
+	return nil
 }
 
 // PersistPendingRequestStatistics merges the current live window into a

@@ -10,7 +10,6 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/usage"
-	coreusage "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/usage"
 )
 
 type historyCleanupRequest struct {
@@ -120,6 +119,7 @@ func (h *Handler) GetStorageHistory(c *gin.Context) {
 			"meta":                     usageMeta,
 			"storage":                  usageStorage,
 			"restore":                  h.usageRestoreStatusSnapshot(),
+			"prune_tasks":              h.usagePruneTaskManagerSnapshot().history(),
 		},
 		"logs": gin.H{
 			"file_logging_enabled": cfg.LoggingToFile,
@@ -130,7 +130,7 @@ func (h *Handler) GetStorageHistory(c *gin.Context) {
 	})
 }
 
-// PruneUsageHistory applies an explicit time and size retention pass.
+// PruneUsageHistory creates one asynchronous time and size retention task.
 func (h *Handler) PruneUsageHistory(c *gin.Context) {
 	cfg := h.currentConfig()
 	stats := h.usageStatisticsSnapshot()
@@ -147,31 +147,26 @@ func (h *Handler) PruneUsageHistory(c *gin.Context) {
 	if !ok {
 		return
 	}
-	if errBarrier := coreusage.DefaultManager().Barrier(c.Request.Context()); errBarrier != nil {
-		status, message := usageBarrierErrorResponse(errBarrier)
-		c.JSON(status, gin.H{"error": message})
+	manager := h.usagePruneTaskManagerSnapshot()
+	task, active, errSubmit := manager.submit(usagePrunePolicy{
+		OlderThanDays:       *request.OlderThanDays,
+		MaxStorageMegabytes: *request.MaxStorageMegabytes,
+	}, h.usagePruneRunnerSnapshot())
+	if active {
+		c.JSON(http.StatusConflict, gin.H{
+			"error":   "usage prune task is already running",
+			"code":    "usage_prune_in_progress",
+			"task_id": task.TaskID,
+			"task":    task,
+		})
 		return
 	}
-	before := stats.Meta()
-	beforeDetails := stats.DetailCount()
-	result, errPrune := usage.PruneAndPersistRequestStatistics(h.usageStatisticsFilePath(), stats, usage.PersistencePolicy{
-		DetailRetentionDays: *request.OlderThanDays,
-		MaxBytes:            historyMegabytesToBytes(*request.MaxStorageMegabytes),
-	})
-	if errPrune != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to prune usage history"})
+	if errSubmit != nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "usage prune tasks unavailable", "code": "usage_prune_tasks_unavailable"})
 		return
 	}
-	after := stats.Meta()
-	c.JSON(http.StatusOK, gin.H{
-		"pruned":                result.Pruned,
-		"saved":                 result.Saved,
-		"size_bytes":            result.SizeBytes,
-		"detail_count_before":   beforeDetails,
-		"detail_count_after":    stats.DetailCount(),
-		"total_requests_before": before.TotalRequests,
-		"total_requests_after":  after.TotalRequests,
-	})
+	c.Header("Cache-Control", "no-store")
+	c.JSON(http.StatusAccepted, task)
 }
 
 // PruneLogHistory applies an explicit time and size retention pass.

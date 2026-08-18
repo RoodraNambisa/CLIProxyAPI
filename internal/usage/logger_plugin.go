@@ -823,6 +823,32 @@ func (s *RequestStatistics) clearWithState() (StatisticsSnapshot, StatisticsSnap
 	return previous, s.snapshotLocked(), s.changeCount
 }
 
+func (s *RequestStatistics) clearMetaWithState() (MetaSnapshot, uint64) {
+	if s == nil {
+		return MetaSnapshot{}, 0
+	}
+	s.flushPending()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := time.Now().UTC()
+	previous := MetaSnapshot{
+		Version:       s.changeCount,
+		Enabled:       StatisticsEnabled(),
+		Available:     true,
+		AsOf:          now,
+		OldestAt:      usageTimePointer(s.oldestAt),
+		NewestAt:      usageTimePointer(s.newestAt),
+		TotalRequests: s.totalRequests,
+		SuccessCount:  s.successCount,
+		FailureCount:  s.failureCount,
+		TotalTokens:   s.totalTokens,
+	}
+	s.resetLocked()
+	s.historyGeneration++
+	s.markChangedLocked()
+	return previous, s.changeCount
+}
+
 func (s *RequestStatistics) resetLocked() {
 	s.totalRequests = 0
 	s.successCount = 0

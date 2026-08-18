@@ -694,6 +694,7 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.GET("/usage", s.mgmt.GetUsageStatistics)
 		mgmt.DELETE("/usage", s.mgmt.ClearUsageStatistics)
 		mgmt.POST("/usage/prune", s.mgmt.PruneUsageHistory)
+		mgmt.GET("/usage/prune/:task_id", s.mgmt.GetUsagePruneTask)
 		mgmt.GET("/usage/meta", s.mgmt.GetUsageMeta)
 		mgmt.GET("/usage/summary", s.mgmt.GetUsageSummary)
 		mgmt.GET("/usage/details", s.mgmt.GetUsageDetails)
@@ -995,6 +996,12 @@ func startupUnavailableResponse(snapshot StartupSnapshot) (code, message string)
 }
 
 func startupManagementPathAvailable(path string) bool {
+	const marker = "/v0/management"
+	if index := strings.LastIndex(path, marker); index >= 0 {
+		if strings.HasPrefix(path[index+len(marker):], "/usage/prune/") {
+			return true
+		}
+	}
 	for _, suffix := range []string{
 		"/startup/status",
 		"/config",

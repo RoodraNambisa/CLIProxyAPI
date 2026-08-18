@@ -91,6 +91,8 @@ type Handler struct {
 	dependencyReconcileHook func(context.Context, string) ([]string, error)
 	deadAuthDeleteCount     func() uint64
 	usageRestoreStatus      func() usage.RestoreRuntimeSnapshot
+	usagePruneTasks         *usagePruneTaskManager
+	usagePruneRunner        usagePruneRunner
 	proxyPoolManager        *proxypool.Manager
 	runtimeConfigApplier    func(context.Context, *config.Config) (config.RuntimeApplyResult, error)
 	chatGPTWebTasks         *chatGPTWebLoginTaskManager
@@ -179,6 +181,7 @@ func NewHandler(cfg *config.Config, configFilePath string, manager *coreauth.Man
 		chatGPTWebTasks:         newChatGPTWebLoginTaskManager(),
 		chatGPTWebMutationTasks: mutationTasks,
 		agentIdentityTasks:      newCodexAgentIdentityTaskManager(),
+		usagePruneTasks:         newUsagePruneTaskManager(),
 	}
 	if errSnapshot := h.publishConfigSnapshot(cfg); errSnapshot != nil {
 		log.WithError(errSnapshot).Error("failed to initialize management configuration snapshot")
@@ -285,9 +288,10 @@ func (h *Handler) Shutdown(ctx context.Context) error {
 	taskManager := h.chatGPTWebTasks
 	mutationTaskManager := h.chatGPTWebMutationTasks
 	agentIdentityTasks := h.agentIdentityTasks
+	usagePruneTasks := h.usagePruneTasks
 	h.mu.Unlock()
 	type shutdownResult struct{ err error }
-	results := make(chan shutdownResult, 3)
+	results := make(chan shutdownResult, 4)
 	count := 0
 	if taskManager != nil {
 		count++
@@ -300,6 +304,10 @@ func (h *Handler) Shutdown(ctx context.Context) error {
 	if agentIdentityTasks != nil {
 		count++
 		go func() { results <- shutdownResult{err: agentIdentityTasks.shutdown(ctx)} }()
+	}
+	if usagePruneTasks != nil {
+		count++
+		go func() { results <- shutdownResult{err: usagePruneTasks.shutdown(ctx)} }()
 	}
 	var shutdownErr error
 	for range count {
