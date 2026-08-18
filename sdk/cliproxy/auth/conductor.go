@@ -11287,6 +11287,7 @@ func (m *Manager) refreshProviderForRequestSynchronized(ctx context.Context, id,
 	if provider == "" {
 		return nil, errors.New("auth provider is empty")
 	}
+	requestUnauthorized, _ := ctx.Value(chatGPTWebUnauthorizedRefreshContextKey{}).(bool)
 
 	lockIDs := []string{id}
 	if provider == "chatgpt-web" {
@@ -11357,7 +11358,6 @@ func (m *Manager) refreshProviderForRequestSynchronized(ctx context.Context, id,
 	if failedAccessToken != "" {
 		if currentToken := authAccessToken(auth); currentToken != "" && currentToken != failedAccessToken {
 			current := auth.Clone()
-			requestUnauthorized, _ := ctx.Value(chatGPTWebUnauthorizedRefreshContextKey{}).(bool)
 			m.mu.Unlock()
 			if provider == "chatgpt-web" && requestUnauthorized {
 				return m.validateExistingChatGPTWebUnauthorizedRefresh(
@@ -11400,8 +11400,9 @@ func (m *Manager) refreshProviderForRequestSynchronized(ctx context.Context, id,
 
 	updated, errRefresh := refreshExecutorCredential(refreshCtx, exec, refreshInput)
 	if errRefresh == nil && provider == "chatgpt-web" {
-		if requestUnauthorized, _ := ctx.Value(chatGPTWebUnauthorizedRefreshContextKey{}).(bool); requestUnauthorized {
+		if requestUnauthorized {
 			if validator, ok := exec.(UnauthorizedRequestRefreshValidator); ok {
+				m.observeChatGPTWebRequestRefreshToken(failedAccessToken, updated)
 				updated, errRefresh = validator.ValidateUnauthorizedRequestRefresh(refreshCtx, failedAccessToken, baseline, updated)
 				if errRefresh == nil {
 					m.chatGPTWebRequestRefreshMetrics.observeOutcome(ChatGPTWebRequestRefreshOutcomeProbeSucceeded)
@@ -11418,7 +11419,10 @@ func (m *Manager) refreshProviderForRequestSynchronized(ctx context.Context, id,
 	retiredDuringRefresh := releaseRefresh()
 	if retiredDuringRefresh || runtimeAuthInstanceRetiredContext(refreshCtx) {
 		if errRefresh == nil {
-			if current, ok := m.concurrentRequestRefreshResult(lock, auth, id, provider, failedAccessToken, updated); ok {
+			if current, ok := m.concurrentRequestRefreshResult(lock, auth, id, provider, failedAccessToken, updated, requestUnauthorized); ok {
+				if provider == "chatgpt-web" && requestUnauthorized {
+					return m.validateExistingChatGPTWebUnauthorizedRefresh(ctx, lock, exec, failedAccessToken, auth, current)
+				}
 				lock.remember(provider, auth, current)
 				return current, nil
 			}
@@ -11495,7 +11499,10 @@ func (m *Manager) refreshProviderForRequestSynchronized(ctx context.Context, id,
 	}
 	if saved == nil {
 		if provider == "chatgpt-web" {
-			if current, ok := m.concurrentRequestRefreshResult(lock, auth, id, provider, failedAccessToken, updated); ok {
+			if current, ok := m.concurrentRequestRefreshResult(lock, auth, id, provider, failedAccessToken, updated, requestUnauthorized); ok {
+				if requestUnauthorized {
+					return m.validateExistingChatGPTWebUnauthorizedRefresh(ctx, lock, exec, failedAccessToken, auth, current)
+				}
 				lock.remember(provider, auth, current)
 				return current, nil
 			}
@@ -11518,6 +11525,7 @@ func (m *Manager) validateExistingChatGPTWebUnauthorizedRefresh(
 	if !ok || validator == nil {
 		return nil, errors.New("chatgpt-web executor cannot validate a replacement access token")
 	}
+	m.observeChatGPTWebRequestRefreshToken(failedAccessToken, current)
 	validated, errValidate := validator.ValidateUnauthorizedRequestRefresh(
 		ctx,
 		failedAccessToken,
@@ -11880,9 +11888,9 @@ func (*chatGPTWebRefreshStateUnavailableError) PersistAuthUpdateOnError() bool {
 	return true
 }
 
-func (m *Manager) concurrentRequestRefreshResult(lock *authRequestRefreshLock, source *Auth, id, provider, failedAccessToken string, updated *Auth) (*Auth, bool) {
+func (m *Manager) concurrentRequestRefreshResult(lock *authRequestRefreshLock, source *Auth, id, provider, failedAccessToken string, updated *Auth, allowSameTokenCandidate bool) (*Auth, bool) {
 	refreshedToken := authAccessToken(updated)
-	if m == nil || updated == nil || refreshedToken == "" || refreshedToken == failedAccessToken {
+	if m == nil || updated == nil || refreshedToken == "" || (!allowSameTokenCandidate && refreshedToken == failedAccessToken) {
 		return nil, false
 	}
 	m.mu.RLock()

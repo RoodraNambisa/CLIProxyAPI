@@ -2244,14 +2244,20 @@ func TestConsumeChatGPTWebImageStreamDoesNotPollHealthyCompletedStream(t *testin
 	}
 }
 
-func TestConsumeChatGPTWebImageStreamKeepsPrimaryStreamAfterAuxiliaryAuthErrors(t *testing.T) {
-	polled := make(chan struct{}, 2)
+func TestConsumeChatGPTWebImageStreamSurfacesAuxiliaryAuthErrors(t *testing.T) {
+	pollStarted := make(chan struct{}, 2)
+	releasePolls := make(chan struct{})
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
 		switch request.URL.Path {
 		case "/backend-api/tasks", "/backend-api/conversation/auxiliary-auth-error":
 			select {
-			case polled <- struct{}{}:
+			case pollStarted <- struct{}{}:
 			default:
+			}
+			select {
+			case <-releasePolls:
+			case <-request.Context().Done():
+				return
 			}
 			http.Error(w, "auxiliary endpoint unavailable", http.StatusUnauthorized)
 		default:
@@ -2271,29 +2277,33 @@ func TestConsumeChatGPTWebImageStreamKeepsPrimaryStreamAfterAuxiliaryAuthErrors(
 	}
 	defer client.CloseIdleConnections()
 	streamReader, streamWriter := io.Pipe()
+	finishWriter := make(chan struct{})
+	writerDone := make(chan struct{})
 	go func() {
+		defer close(writerDone)
 		defer func() { _ = streamWriter.Close() }()
 		_, _ = io.WriteString(streamWriter, "data: {\"conversation_id\":\"auxiliary-auth-error\"}\n\n")
 		for count := 0; count < 2; count++ {
 			select {
-			case <-polled:
+			case <-pollStarted:
 			case <-time.After(time.Second):
 				return
 			}
 		}
-		_, _ = io.WriteString(streamWriter,
-			"data: {\"message\":{\"author\":{\"role\":\"tool\"},\"metadata\":{\"async_task_type\":\"image_gen\",\"is_complete\":true,\"status\":\"finished_successfully\"},\"content\":{\"parts\":[{\"asset_pointer\":\"file-service://generated\"}]}}}\n\n"+
-				"data: [DONE]\n\n",
-		)
+		close(releasePolls)
+		<-finishWriter
 	}()
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	accumulator, err := executor.consumeChatGPTWebImageStreamWithTaskPolling(ctx, client, credential, &fhttp.Response{Body: streamReader})
-	if err != nil {
-		t.Fatalf("consumeChatGPTWebImageStreamWithTaskPolling() error = %v", err)
+	close(finishWriter)
+	<-writerDone
+	var status interface{ StatusCode() int }
+	if !errors.As(err, &status) || status.StatusCode() != http.StatusUnauthorized {
+		t.Fatalf("consumeChatGPTWebImageStreamWithTaskPolling() error = %v, want auxiliary 401", err)
 	}
-	if !accumulator.Terminal || !accumulator.StreamTerminal || !reflect.DeepEqual(accumulator.FileIDs, []string{"generated"}) {
-		t.Fatalf("primary stream result = %+v", accumulator)
+	if accumulator == nil || accumulator.ConversationID != "auxiliary-auth-error" || accumulator.Terminal || len(accumulator.FileIDs) != 0 {
+		t.Fatalf("partial primary stream result = %+v", accumulator)
 	}
 }
 

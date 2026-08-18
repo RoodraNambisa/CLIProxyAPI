@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"strings"
 	"sync/atomic"
 
 	chatgptwebauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/chatgptweb"
@@ -43,6 +44,13 @@ func (metrics *chatGPTWebRequestRefreshMetrics) observeOutcome(outcome string) {
 	case ChatGPTWebRequestRefreshOutcomeProbeTransient:
 		metrics.probeTransient.Add(1)
 	}
+}
+
+func (m *Manager) observeChatGPTWebRequestRefreshToken(failedAccessToken string, refreshed *Auth) {
+	if m == nil || strings.TrimSpace(failedAccessToken) == "" || authAccessToken(refreshed) != failedAccessToken {
+		return
+	}
+	m.chatGPTWebRequestRefreshMetrics.observeOutcome(ChatGPTWebRequestRefreshOutcomeSameToken)
 }
 
 // ChatGPTWebRequestRefreshSnapshot returns aggregate request-triggered refresh

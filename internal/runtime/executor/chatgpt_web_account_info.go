@@ -5104,12 +5104,12 @@ func (e *ChatGPTWebExecutor) fetchChatGPTWebAccountInfo(ctx context.Context, aut
 	return
 }
 
-// ValidateUnauthorizedRequestRefresh proves that a replacement access token is
-// both new and accepted by the authenticated account endpoint before routing
-// can use it again.
+// ValidateUnauthorizedRequestRefresh proves that a refreshed credential is
+// accepted by the authenticated account endpoint before routing can use it
+// again.
 func (e *ChatGPTWebExecutor) ValidateUnauthorizedRequestRefresh(
 	ctx context.Context,
-	failedAccessToken string,
+	_ string,
 	previous *cliproxyauth.Auth,
 	refreshed *cliproxyauth.Auth,
 ) (*cliproxyauth.Auth, error) {
@@ -5122,7 +5122,7 @@ func (e *ChatGPTWebExecutor) ValidateUnauthorizedRequestRefresh(
 			false,
 		)
 	}
-	refreshedCredential, errCredential := chatgptwebauth.ParseCredential(refreshed.Metadata)
+	_, errCredential := chatgptwebauth.ParseCredential(refreshed.Metadata)
 	if errCredential != nil {
 		return nil, newChatGPTWebCredentialUnavailableError(
 			newChatGPTWebUnauthorizedRefreshValidationError(
@@ -5132,15 +5132,6 @@ func (e *ChatGPTWebExecutor) ValidateUnauthorizedRequestRefresh(
 			false,
 		)
 	}
-	if strings.TrimSpace(failedAccessToken) != "" && refreshedCredential.AccessToken == failedAccessToken {
-		return e.chatGPTWebUnauthorizedRefreshLifecycleResult(
-			refreshed,
-			"session_expired",
-			cliproxyauth.ChatGPTWebRequestRefreshOutcomeSameToken,
-			http.StatusUnauthorized,
-		)
-	}
-
 	verified, errProbe := e.probeChatGPTWebUnauthorizedRefresh(ctx, previous, refreshed)
 	if errProbe == nil {
 		return verified, nil

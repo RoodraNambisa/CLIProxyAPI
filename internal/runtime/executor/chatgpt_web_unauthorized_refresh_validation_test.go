@@ -29,10 +29,19 @@ func chatGPTWebUnauthorizedRefreshValidationAuth(t *testing.T, accessToken strin
 	return auth
 }
 
-func TestChatGPTWebUnauthorizedRefreshRejectsSameTokenWithoutProbe(t *testing.T) {
+func TestChatGPTWebUnauthorizedRefreshAcceptsSameTokenAfterAuthenticatedProbe(t *testing.T) {
 	var calls atomic.Int32
-	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
 		calls.Add(1)
+		if got := request.Header.Get("Authorization"); got != "Bearer retained-token" {
+			t.Errorf("probe authorization = %q", got)
+		}
+		http.SetCookie(w, &http.Cookie{Name: "probe-session", Value: "refreshed-cookie", Path: "/"})
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"accounts": map[string]any{
+				"account-1": map[string]any{"account_id": "account-1", "plan_type": "plus"},
+			},
+		})
 	}))
 	defer server.Close()
 	executor := &ChatGPTWebExecutor{
@@ -40,41 +49,58 @@ func TestChatGPTWebUnauthorizedRefreshRejectsSameTokenWithoutProbe(t *testing.T)
 		now:            testNow,
 	}
 	executor.cfg.Store(&config.Config{ChatGPTWeb: config.ChatGPTWebConfig{AutoRelogin: true}})
-	previous := chatGPTWebUnauthorizedRefreshValidationAuth(t, "rejected-token")
-	refreshed := chatGPTWebUnauthorizedRefreshValidationAuth(t, "rejected-token")
+	previous := chatGPTWebUnauthorizedRefreshValidationAuth(t, "retained-token")
+	refreshed := chatGPTWebUnauthorizedRefreshValidationAuth(t, "retained-token")
+	refreshedCredential, errCredential := chatgptwebauth.ParseCredential(refreshed.Metadata)
+	if errCredential != nil {
+		t.Fatal(errCredential)
+	}
+	refreshedCredential.Persona.HardwareConcurrency = 16
+	refreshedCredential.Cookies = []chatgptwebauth.Cookie{{
+		Name: "refresh-session", Value: "session-cookie", Path: "/", Host: "127.0.0.1",
+	}}
+	refreshedCredential.ApplyToMetadata(refreshed.Metadata)
 
 	updated, errValidate := executor.ValidateUnauthorizedRequestRefresh(
 		t.Context(),
-		"rejected-token",
+		"retained-token",
 		previous,
 		refreshed,
 	)
-	if updated == nil || updated.LifecycleState() != cliproxyauth.LifecycleStateReloginPending ||
-		chatGPTWebLifecycleReason(updated) != "session_expired" {
-		t.Fatalf("same-token lifecycle = %#v", updated)
+	if errValidate != nil || updated == nil || updated.LifecycleState() != cliproxyauth.LifecycleStateActive {
+		t.Fatalf("same-token validation = (%#v, %v)", updated, errValidate)
 	}
-	if !persistAuthUpdateForExecutorError(errValidate) {
-		t.Fatalf("same-token error = %T %v, want persistent lifecycle update", errValidate, errValidate)
+	verifiedCredential, errCredential := chatgptwebauth.ParseCredential(updated.Metadata)
+	if errCredential != nil {
+		t.Fatal(errCredential)
 	}
-	if outcome := chatGPTWebRequestRefreshValidationOutcome(errValidate); outcome != cliproxyauth.ChatGPTWebRequestRefreshOutcomeSameToken {
-		t.Fatalf("same-token outcome = %q", outcome)
+	if verifiedCredential.AccessToken != "retained-token" || verifiedCredential.Persona.HardwareConcurrency != 16 {
+		t.Fatalf("verified credential = %#v", verifiedCredential)
 	}
-	if calls.Load() != 0 {
-		t.Fatalf("authenticated probe calls = %d, want 0", calls.Load())
+	installedCookies := make(map[string]string)
+	for _, cookie := range verifiedCredential.Cookies {
+		installedCookies[cookie.Name] = cookie.Value
+	}
+	if installedCookies["refresh-session"] != "session-cookie" || installedCookies["probe-session"] != "refreshed-cookie" {
+		t.Fatalf("verified cookies = %#v, want refreshed and probe cookies", verifiedCredential.Cookies)
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("authenticated probe calls = %d, want 1", calls.Load())
 	}
 }
 
 func TestChatGPTWebUnauthorizedRefreshRequiresAuthenticatedProbe(t *testing.T) {
 	for _, testCase := range []struct {
-		name          string
-		status        int
-		body          any
-		wantState     string
-		wantOutcome   string
-		wantPersist   bool
-		wantToken     string
-		wantProbeAuth string
-		wantCooldown  bool
+		name           string
+		status         int
+		body           any
+		wantState      string
+		wantOutcome    string
+		wantPersist    bool
+		wantToken      string
+		wantProbeAuth  string
+		wantCooldown   bool
+		refreshedToken string
 	}{
 		{
 			name:          "different valid token",
@@ -83,6 +109,15 @@ func TestChatGPTWebUnauthorizedRefreshRequiresAuthenticatedProbe(t *testing.T) {
 			wantState:     cliproxyauth.LifecycleStateActive,
 			wantToken:     "replacement-token",
 			wantProbeAuth: "Bearer replacement-token",
+		},
+		{
+			name:           "same valid token",
+			status:         http.StatusOK,
+			body:           map[string]any{"accounts": map[string]any{"account-1": map[string]any{"account_id": "account-1", "plan_type": "plus"}}},
+			wantState:      cliproxyauth.LifecycleStateActive,
+			wantToken:      "rejected-token",
+			wantProbeAuth:  "Bearer rejected-token",
+			refreshedToken: "rejected-token",
 		},
 		{
 			name:          "different unauthorized token",
@@ -94,6 +129,16 @@ func TestChatGPTWebUnauthorizedRefreshRequiresAuthenticatedProbe(t *testing.T) {
 			wantProbeAuth: "Bearer replacement-token",
 		},
 		{
+			name:           "same unauthorized token",
+			status:         http.StatusUnauthorized,
+			body:           map[string]any{"error": map[string]any{"code": "invalid_token"}},
+			wantState:      cliproxyauth.LifecycleStateReloginPending,
+			wantOutcome:    cliproxyauth.ChatGPTWebRequestRefreshOutcomeProbeUnauthorized,
+			wantPersist:    true,
+			wantProbeAuth:  "Bearer rejected-token",
+			refreshedToken: "rejected-token",
+		},
+		{
 			name:          "different token with mismatched account",
 			status:        http.StatusOK,
 			body:          map[string]any{"accounts": map[string]any{"account-2": map[string]any{"account_id": "account-2", "plan_type": "plus"}}},
@@ -101,6 +146,16 @@ func TestChatGPTWebUnauthorizedRefreshRequiresAuthenticatedProbe(t *testing.T) {
 			wantOutcome:   cliproxyauth.ChatGPTWebRequestRefreshOutcomeProbeUnauthorized,
 			wantPersist:   true,
 			wantProbeAuth: "Bearer replacement-token",
+		},
+		{
+			name:           "same token with mismatched account",
+			status:         http.StatusOK,
+			body:           map[string]any{"accounts": map[string]any{"account-2": map[string]any{"account_id": "account-2", "plan_type": "plus"}}},
+			wantState:      cliproxyauth.LifecycleStateInteractionRequired,
+			wantOutcome:    cliproxyauth.ChatGPTWebRequestRefreshOutcomeProbeUnauthorized,
+			wantPersist:    true,
+			wantProbeAuth:  "Bearer rejected-token",
+			refreshedToken: "rejected-token",
 		},
 		{
 			name:          "cloudflare challenge remains transient",
@@ -112,6 +167,18 @@ func TestChatGPTWebUnauthorizedRefreshRequiresAuthenticatedProbe(t *testing.T) {
 			wantToken:     "replacement-token",
 			wantProbeAuth: "Bearer replacement-token",
 			wantCooldown:  true,
+		},
+		{
+			name:           "same token with cloudflare challenge remains transient",
+			status:         http.StatusForbidden,
+			body:           "<html><title>Just a moment...</title><p>Cloudflare</p></html>",
+			wantState:      cliproxyauth.LifecycleStateActive,
+			wantOutcome:    cliproxyauth.ChatGPTWebRequestRefreshOutcomeProbeTransient,
+			wantPersist:    true,
+			wantToken:      "rejected-token",
+			wantProbeAuth:  "Bearer rejected-token",
+			wantCooldown:   true,
+			refreshedToken: "rejected-token",
 		},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
@@ -138,7 +205,11 @@ func TestChatGPTWebUnauthorizedRefreshRequiresAuthenticatedProbe(t *testing.T) {
 			}
 			executor.cfg.Store(&config.Config{ChatGPTWeb: config.ChatGPTWebConfig{AutoRelogin: true}})
 			previous := chatGPTWebUnauthorizedRefreshValidationAuth(t, "rejected-token")
-			refreshed := chatGPTWebUnauthorizedRefreshValidationAuth(t, "replacement-token")
+			refreshedToken := testCase.refreshedToken
+			if refreshedToken == "" {
+				refreshedToken = "replacement-token"
+			}
+			refreshed := chatGPTWebUnauthorizedRefreshValidationAuth(t, refreshedToken)
 			updated, errValidate := executor.ValidateUnauthorizedRequestRefresh(
 				t.Context(),
 				"rejected-token",

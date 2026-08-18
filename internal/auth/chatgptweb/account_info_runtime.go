@@ -70,15 +70,17 @@ type AccountInfoRuntimeSnapshot struct {
 // RequestRefreshRuntimeSnapshot reports request-triggered 401 recovery without
 // exposing credential identity or authentication material.
 type RequestRefreshRuntimeSnapshot struct {
-	Received          uint64 `json:"received"`
-	Queued            int64  `json:"queued"`
-	Running           int64  `json:"running"`
-	SchedulerBlocked  int    `json:"scheduler_blocked"`
-	Deduplicated      uint64 `json:"deduplicated"`
-	Succeeded         uint64 `json:"succeeded"`
-	Failed            uint64 `json:"failed"`
-	Backpressured     uint64 `json:"backpressured"`
-	NoStart           uint64 `json:"no_start"`
+	Received         uint64 `json:"received"`
+	Queued           int64  `json:"queued"`
+	Running          int64  `json:"running"`
+	SchedulerBlocked int    `json:"scheduler_blocked"`
+	Deduplicated     uint64 `json:"deduplicated"`
+	Succeeded        uint64 `json:"succeeded"`
+	Failed           uint64 `json:"failed"`
+	Backpressured    uint64 `json:"backpressured"`
+	NoStart          uint64 `json:"no_start"`
+	// SameToken counts refresh results whose access token did not rotate. The
+	// authenticated probe fields report whether those results were usable.
 	SameToken         uint64 `json:"same_token"`
 	ProbeSucceeded    uint64 `json:"probe_succeeded"`
 	ProbeUnauthorized uint64 `json:"probe_unauthorized"`

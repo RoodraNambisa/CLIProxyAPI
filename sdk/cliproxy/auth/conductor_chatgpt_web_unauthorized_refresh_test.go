@@ -19,6 +19,7 @@ import (
 
 type chatGPTWebUnauthorizedRefreshExecutor struct {
 	executeCalls       []string
+	executeErr         error
 	countCalls         []string
 	streamCalls        []string
 	prepareCalls       int
@@ -38,6 +39,18 @@ type chatGPTWebRequestRefreshError struct {
 	persist bool
 	outcome string
 }
+
+type chatGPTWebSettledUnauthorizedError struct {
+	cause error
+}
+
+func (err chatGPTWebSettledUnauthorizedError) Error() string { return err.cause.Error() }
+func (err chatGPTWebSettledUnauthorizedError) Unwrap() error { return err.cause }
+func (chatGPTWebSettledUnauthorizedError) StatusCode() int   { return http.StatusUnauthorized }
+func (chatGPTWebSettledUnauthorizedError) ChatGPTWebFailureStage() string {
+	return "settle"
+}
+func (chatGPTWebSettledUnauthorizedError) RetryOtherAuth() bool { return false }
 
 type chatGPTWebDeadRequestError struct {
 	lifecycle *chatgptwebauth.AuthError
@@ -192,6 +205,9 @@ func (*chatGPTWebUnauthorizedRefreshExecutor) Identifier() string { return "chat
 func (executor *chatGPTWebUnauthorizedRefreshExecutor) Execute(_ context.Context, auth *Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
 	executor.executeCalls = append(executor.executeCalls, auth.ID)
 	if authAccessToken(auth) == "stale" {
+		if executor.executeErr != nil {
+			return cliproxyexecutor.Response{}, executor.executeErr
+		}
 		return cliproxyexecutor.Response{}, &Error{HTTPStatus: http.StatusUnauthorized, Message: "invalid access token"}
 	}
 	return cliproxyexecutor.Response{Payload: []byte(auth.ID + ":" + authAccessToken(auth))}, nil
@@ -962,50 +978,124 @@ func TestChatGPTWebUnauthorizedManyDistinctCredentialsRemainIndependentlyIsolate
 	}
 }
 
-func TestChatGPTWebUnauthorizedSameTokenNeverReturnsToRouting(t *testing.T) {
-	manager, executor, primary, backup, model := newChatGPTWebUnauthorizedRefreshFixture(t)
-	executor.refreshHook = func(_ *Auth, updated *Auth) {
-		updated.Metadata["access_token"] = "stale"
-	}
-	executor.validateHook = func(failedAccessToken string, _ *Auth, refreshed *Auth) (*Auth, error) {
-		if got := authAccessToken(refreshed); got != failedAccessToken {
-			return nil, fmt.Errorf("refreshed token = %q, want failed token %q", got, failedAccessToken)
-		}
-		updated := refreshed.Clone()
-		updated.Metadata["lifecycle_state"] = LifecycleStateReloginPending
-		updated.Metadata["lifecycle_reason"] = "session_expired"
-		return updated, chatGPTWebRequestRefreshError{
-			persist: true,
-			outcome: ChatGPTWebRequestRefreshOutcomeSameToken,
-		}
-	}
+func TestChatGPTWebUnauthorizedSameTokenCanRecoverAfterAuthenticatedProbe(t *testing.T) {
+	for _, testCase := range []struct {
+		name       string
+		requestErr error
+	}{
+		{name: "initial upstream unauthorized"},
+		{
+			name: "settle unauthorized after upstream commit",
+			requestErr: chatGPTWebSettledUnauthorizedError{
+				cause: &Error{HTTPStatus: http.StatusUnauthorized, Message: "settle access token rejected"},
+			},
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			manager, executor, primary, _, model := newChatGPTWebUnauthorizedRefreshFixture(t)
+			executor.executeErr = testCase.requestErr
+			executor.refreshHook = func(_ *Auth, updated *Auth) {
+				updated.Metadata["access_token"] = "stale"
+			}
+			executor.validateHook = func(failedAccessToken string, _ *Auth, refreshed *Auth) (*Auth, error) {
+				if got := authAccessToken(refreshed); got != failedAccessToken {
+					return nil, fmt.Errorf("refreshed token = %q, want failed token %q", got, failedAccessToken)
+				}
+				return refreshed, nil
+			}
 
-	_, errRequest := manager.Execute(t.Context(), []string{"chatgpt-web"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
-	if statusCodeFromError(errRequest) != http.StatusUnauthorized || errRequest.Error() != "invalid access token" {
-		t.Fatalf("request error = %v, want original upstream 401", errRequest)
+			_, errRequest := manager.Execute(t.Context(), []string{"chatgpt-web"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
+			if statusCodeFromError(errRequest) != http.StatusUnauthorized {
+				t.Fatalf("request error = %v, want original upstream 401", errRequest)
+			}
+			if testCase.requestErr != nil && errRequest.Error() != testCase.requestErr.Error() {
+				t.Fatalf("settle request error = %q, want %q", errRequest.Error(), testCase.requestErr.Error())
+			}
+			if testCase.requestErr != nil {
+				var stage interface{ ChatGPTWebFailureStage() string }
+				var retry interface{ RetryOtherAuth() bool }
+				if !errors.As(errRequest, &stage) || stage.ChatGPTWebFailureStage() != "settle" ||
+					!errors.As(errRequest, &retry) || retry.RetryOtherAuth() {
+					t.Fatalf("settle 401 contract = %v", errRequest)
+				}
+			}
+			waitForResultPersistenceCondition(t, 5*time.Second, "same-token refresh did not return to routing after validation", func() bool {
+				current, ok := manager.GetByID(primary.ID)
+				return ok && current != nil && current.LifecycleSelectable() &&
+					chatGPTWebRequestRefreshBlockCount(manager, primary.ID) == 0
+			})
+			if executor.refreshCalls != 1 || executor.validateCalls.Load() != 1 {
+				t.Fatalf("refresh/validate calls = %d/%d, want 1/1", executor.refreshCalls, executor.validateCalls.Load())
+			}
+			if len(executor.executeCalls) != 1 || executor.executeCalls[0] != primary.ID {
+				t.Fatalf("execute calls = %v, want original request once", executor.executeCalls)
+			}
+			snapshot := manager.ChatGPTWebRequestRefreshSnapshot()
+			if snapshot.Received != 1 || snapshot.SameToken != 1 || snapshot.ProbeSucceeded != 1 ||
+				snapshot.Succeeded != 1 || snapshot.Failed != 0 || snapshot.SchedulerBlocked != 0 {
+				t.Fatalf("request refresh snapshot = %#v", snapshot)
+			}
+		})
 	}
-	deadline := time.Now().Add(5 * time.Second)
-	for {
-		current, ok := manager.GetByID(primary.ID)
-		if ok && current != nil && current.LifecycleState() == LifecycleStateReloginPending &&
-			chatGPTWebRequestRefreshBlockCount(manager, primary.ID) == 0 {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("same-token refresh did not remain isolated: %#v", current)
-		}
-		time.Sleep(time.Millisecond)
-	}
-	response, errSecond := manager.Execute(t.Context(), []string{"chatgpt-web"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
-	if errSecond != nil || string(response.Payload) != backup.ID+":backup" {
-		t.Fatalf("second request = %q, %v; want backup credential", response.Payload, errSecond)
-	}
-	if executor.refreshCalls != 1 || executor.validateCalls.Load() != 1 {
-		t.Fatalf("refresh/validate calls = %d/%d, want 1/1", executor.refreshCalls, executor.validateCalls.Load())
-	}
-	snapshot := manager.ChatGPTWebRequestRefreshSnapshot()
-	if snapshot.Received != 1 || snapshot.SameToken != 1 || snapshot.Succeeded != 0 || snapshot.Failed != 1 || snapshot.SchedulerBlocked != 0 {
-		t.Fatalf("request refresh snapshot = %#v", snapshot)
+}
+
+func TestChatGPTWebUnauthorizedSameTokenPreservesProbeFailureMetrics(t *testing.T) {
+	for _, testCase := range []struct {
+		name             string
+		outcome          string
+		wantUnauthorized uint64
+		wantTransient    uint64
+		configureUpdated func(*Auth)
+	}{
+		{
+			name:             "probe unauthorized",
+			outcome:          ChatGPTWebRequestRefreshOutcomeProbeUnauthorized,
+			wantUnauthorized: 1,
+			configureUpdated: func(updated *Auth) {
+				updated.Metadata["lifecycle_state"] = LifecycleStateReloginPending
+				updated.Metadata["lifecycle_reason"] = "session_expired"
+			},
+		},
+		{
+			name:          "probe transient",
+			outcome:       ChatGPTWebRequestRefreshOutcomeProbeTransient,
+			wantTransient: 1,
+			configureUpdated: func(updated *Auth) {
+				updated.Unavailable = true
+				updated.CooldownScope = cooldownScopeAuth
+				updated.NextRetryAfter = time.Now().Add(time.Minute)
+				updated.NextRefreshAfter = updated.NextRetryAfter
+			},
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			manager, executor, primary, _, model := newChatGPTWebUnauthorizedRefreshFixture(t)
+			executor.refreshHook = func(_ *Auth, updated *Auth) {
+				updated.Metadata["access_token"] = "stale"
+			}
+			executor.validateHook = func(_ string, _ *Auth, refreshed *Auth) (*Auth, error) {
+				updated := refreshed.Clone()
+				testCase.configureUpdated(updated)
+				return updated, chatGPTWebRequestRefreshError{persist: true, outcome: testCase.outcome}
+			}
+
+			_, errRequest := manager.Execute(t.Context(), []string{"chatgpt-web"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
+			if statusCodeFromError(errRequest) != http.StatusUnauthorized {
+				t.Fatalf("request error = %v, want original upstream 401", errRequest)
+			}
+			waitForResultPersistenceCondition(t, 5*time.Second, "same-token probe failure metrics were not recorded", func() bool {
+				return manager.ChatGPTWebRequestRefreshSnapshot().Failed == 1 &&
+					chatGPTWebRequestRefreshBlockCount(manager, primary.ID) == 0
+			})
+			snapshot := manager.ChatGPTWebRequestRefreshSnapshot()
+			if snapshot.SameToken != 1 || snapshot.ProbeUnauthorized != testCase.wantUnauthorized ||
+				snapshot.ProbeTransient != testCase.wantTransient || snapshot.Succeeded != 0 || snapshot.Failed != 1 {
+				t.Fatalf("request refresh snapshot = %#v", snapshot)
+			}
+			if len(executor.executeCalls) != 1 || executor.executeCalls[0] != primary.ID {
+				t.Fatalf("execute calls = %v, want original request once", executor.executeCalls)
+			}
+		})
 	}
 }
 
@@ -1361,6 +1451,60 @@ func TestChatGPTWebUnauthorizedRefreshRejectsConcurrentSameTokenReinstall(t *tes
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("concurrent replacement did not finish")
+	}
+}
+
+func TestChatGPTWebUnauthorizedRefreshReusesAuthenticatedConcurrentSameTokenUpdate(t *testing.T) {
+	manager, executor, primary, _, _ := newChatGPTWebUnauthorizedRefreshFixture(t)
+	primary, _ = manager.GetByID(primary.ID)
+	var concurrentSaved *Auth
+	var concurrentErr error
+	var validatedLabels []string
+	executor.refreshHook = func(_ *Auth, updated *Auth) {
+		updated.Metadata["access_token"] = "stale"
+		concurrent := primary.Clone()
+		concurrent.Label = "concurrent-current-generation"
+		concurrent.Metadata["access_token"] = "stale"
+		concurrent.Metadata["session_token"] = "concurrent-session"
+		concurrentSaved, concurrentErr = manager.applyRefreshedAuth(
+			WithSkipPersist(t.Context()),
+			primary,
+			primary.Clone(),
+			concurrent,
+			time.Time{},
+		)
+	}
+	executor.validateHook = func(failedAccessToken string, _ *Auth, refreshed *Auth) (*Auth, error) {
+		if failedAccessToken != "stale" || authAccessToken(refreshed) != failedAccessToken {
+			return nil, fmt.Errorf("validation inputs = failed:%q refreshed:%q", failedAccessToken, authAccessToken(refreshed))
+		}
+		validatedLabels = append(validatedLabels, refreshed.Label)
+		return refreshed, nil
+	}
+
+	refreshed, errRefresh := manager.refreshProviderForRequest(
+		t.Context(),
+		primary.ID,
+		"stale",
+		"chatgpt-web",
+		primary,
+	)
+	if concurrentErr != nil || concurrentSaved == nil {
+		t.Fatalf("concurrent apply = (%#v, %v)", concurrentSaved, concurrentErr)
+	}
+	if errRefresh != nil || refreshed == nil || authAccessToken(refreshed) != "stale" ||
+		refreshed.Label != "concurrent-current-generation" {
+		t.Fatalf("authenticated concurrent result = (%#v, %v)", refreshed, errRefresh)
+	}
+	if executor.refreshCalls != 1 || executor.validateCalls.Load() != 2 {
+		t.Fatalf("refresh/validate calls = %d/%d, want 1/2", executor.refreshCalls, executor.validateCalls.Load())
+	}
+	if len(validatedLabels) != 2 || validatedLabels[1] != "concurrent-current-generation" {
+		t.Fatalf("validated concurrent credentials = %v", validatedLabels)
+	}
+	snapshot := manager.ChatGPTWebRequestRefreshSnapshot()
+	if snapshot.SameToken != 2 || snapshot.ProbeSucceeded != 2 || snapshot.Succeeded != 1 || snapshot.Failed != 0 {
+		t.Fatalf("request refresh snapshot = %#v", snapshot)
 	}
 }
 
