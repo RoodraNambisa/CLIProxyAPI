@@ -746,6 +746,41 @@ func TestChatGPTWebUnauthorizedCredentialIsExcludedDuringBackgroundRefreshWhenCo
 	}
 }
 
+func TestChatGPTWebUnauthorizedRecoveryDoesNotSelectManuallyDisabledCredential(t *testing.T) {
+	manager, executor, primary, backup, model := newChatGPTWebUnauthorizedRefreshFixture(t)
+	disabled := primary.Clone()
+	disabled.Disabled = true
+	disabled.Status = StatusDisabled
+	installed, errUpdate := manager.Update(t.Context(), disabled)
+	if errUpdate != nil {
+		t.Fatal(errUpdate)
+	}
+	if installed == nil || !installed.Disabled || installed.Status != StatusDisabled {
+		t.Fatalf("disabled credential was not installed: %#v", installed)
+	}
+
+	response, errExecute := manager.Execute(t.Context(), []string{"chatgpt-web"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
+	if errExecute != nil {
+		t.Fatalf("Execute() error: %v", errExecute)
+	}
+	if got := string(response.Payload); got != backup.ID+":backup" {
+		t.Fatalf("response payload = %q, want backup credential", got)
+	}
+	if len(executor.executeCalls) != 1 || executor.executeCalls[0] != backup.ID {
+		t.Fatalf("execute calls = %v, want only backup credential", executor.executeCalls)
+	}
+	if executor.refreshCalls != 0 {
+		t.Fatalf("refresh calls = %d, want zero for manually disabled credential", executor.refreshCalls)
+	}
+	if blocks := chatGPTWebRequestRefreshBlockCount(manager, primary.ID); blocks != 0 {
+		t.Fatalf("disabled credential request-refresh blocks = %d, want zero", blocks)
+	}
+	current, ok := manager.GetByID(primary.ID)
+	if !ok || current == nil || !current.Disabled || current.Status != StatusDisabled {
+		t.Fatalf("disabled credential state changed: %#v", current)
+	}
+}
+
 func TestChatGPTWebUnauthorizedRefreshBackpressureTemporarilyExcludesOnlyFailedCredential(t *testing.T) {
 	const model = "chatgpt-web-refresh-backpressure-model"
 	primaryAuth := resultPersistenceTestAuth("aa-chatgpt-web-refresh-backpressure", 10)
