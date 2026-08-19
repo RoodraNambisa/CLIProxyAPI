@@ -12,7 +12,23 @@ ARG VERSION=dev
 ARG COMMIT=none
 ARG BUILD_DATE=unknown
 
-RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w -X 'main.Version=${VERSION}' -X 'main.Commit=${COMMIT}' -X 'main.BuildDate=${BUILD_DATE}'" -o ./CLIProxyAPI ./cmd/server/
+RUN set -eu; \
+    resolved_commit="${COMMIT}"; \
+    if [ -z "${resolved_commit}" ] || [ "${resolved_commit}" = "none" ] || [ "${resolved_commit}" = "unknown" ]; then \
+      source_hash="$(find . -type f -print | LC_ALL=C sort | xargs sha256sum | sha256sum | cut -c1-12)"; \
+      resolved_commit="source-${source_hash}"; \
+    fi; \
+    resolved_version="${VERSION}"; \
+    if [ -z "${resolved_version}" ] || [ "${resolved_version}" = "dev" ]; then \
+      resolved_version="dev-${resolved_commit}"; \
+    fi; \
+    resolved_build_date="${BUILD_DATE}"; \
+    if [ -z "${resolved_build_date}" ] || [ "${resolved_build_date}" = "unknown" ]; then \
+      resolved_build_date="$(date -u +%Y-%m-%dT%H:%M:%SZ)"; \
+    fi; \
+    CGO_ENABLED=0 GOOS=linux go build \
+      -ldflags="-s -w -X main.Version=${resolved_version} -X main.Commit=${resolved_commit} -X main.BuildDate=${resolved_build_date}" \
+      -o ./CLIProxyAPI ./cmd/server/
 
 FROM alpine:3.22.0
 

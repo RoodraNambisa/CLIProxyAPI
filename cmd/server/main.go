@@ -83,9 +83,7 @@ func deprecatedGeminiCLIFlagsError(flagSet *flag.FlagSet) error {
 // init initializes the shared logger setup.
 func init() {
 	logging.SetupBaseLogger()
-	buildinfo.Version = Version
-	buildinfo.Commit = Commit
-	buildinfo.BuildDate = BuildDate
+	buildinfo.Configure(Version, Commit, BuildDate)
 }
 
 // main is the entry point of the application.
