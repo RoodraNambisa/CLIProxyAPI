@@ -15,6 +15,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	chatgptwebauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/chatgptweb"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/proxypool"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 )
@@ -26,6 +27,7 @@ const (
 	chatGPTWebLoginTaskWorkers      = 4
 	chatGPTWebLoginTaskMaxRetained  = 100
 	chatGPTWebLoginTaskRetention    = 24 * time.Hour
+	chatGPTWebManualReloginRetrySec = 5
 
 	chatGPTWebLoginTaskQueued              = "queued"
 	chatGPTWebLoginTaskRunning             = "running"
@@ -45,6 +47,7 @@ const (
 var (
 	errChatGPTWebLoginTaskCapacity       = errors.New("too many retained chatgpt web login tasks")
 	errChatGPTWebLoginTaskClosed         = errors.New("chatgpt web login task manager is closed")
+	errChatGPTWebManualReloginCapacity   = errors.New("chatgpt web manual re-login capacity is full")
 	errChatGPTWebLoginEmailBusy          = errors.New("chatgpt web account already has an active login operation")
 	errChatGPTWebCredentialChanged       = errors.New("chatgpt web credential changed before persistence")
 	errChatGPTWebCredentialIDOwned       = errors.New("chatgpt web credential ID is already owned")
@@ -125,18 +128,28 @@ type chatGPTWebLoginTaskManager struct {
 	shutdownOnce sync.Once
 	shutdownDone chan struct{}
 	closed       bool
+	manualActive int
+
+	manualPersistMu   sync.Mutex
+	manualJournalPath string
+	manualOperations  map[string]*chatGPTWebManualReloginOperationRecord
+	manualLatest      map[string]string
+	manualIdempotency map[string]string
 }
 
 func newChatGPTWebLoginTaskManager() *chatGPTWebLoginTaskManager {
 	rootCtx, rootCancel := context.WithCancel(context.Background())
 	return &chatGPTWebLoginTaskManager{
-		tasks:        make(map[string]*chatGPTWebLoginTask),
-		activeEmails: make(map[string]string),
-		slots:        make(chan struct{}, chatGPTWebLoginTaskWorkers),
-		now:          time.Now,
-		rootCtx:      rootCtx,
-		rootCancel:   rootCancel,
-		shutdownDone: make(chan struct{}),
+		tasks:             make(map[string]*chatGPTWebLoginTask),
+		activeEmails:      make(map[string]string),
+		slots:             make(chan struct{}, chatGPTWebLoginTaskWorkers),
+		now:               time.Now,
+		rootCtx:           rootCtx,
+		rootCancel:        rootCancel,
+		shutdownDone:      make(chan struct{}),
+		manualOperations:  make(map[string]*chatGPTWebManualReloginOperationRecord),
+		manualLatest:      make(map[string]string),
+		manualIdempotency: make(map[string]string),
 	}
 }
 
@@ -444,42 +457,48 @@ func (m *chatGPTWebLoginTaskManager) lifecycleContext() context.Context {
 	return m.rootCtx
 }
 
-func (m *chatGPTWebLoginTaskManager) beginOperation(ctx context.Context) (context.Context, func(), error) {
+func (m *chatGPTWebLoginTaskManager) beginManualOperation(ctx context.Context, limit int) (context.Context, func(), error) {
 	if m == nil {
 		return nil, nil, errors.New("chatgpt web login task manager is unavailable")
 	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	if errContext := ctx.Err(); errContext != nil {
+		return nil, nil, errContext
+	}
 	m.mu.Lock()
 	if m.closed {
 		m.mu.Unlock()
 		return nil, nil, errChatGPTWebLoginTaskClosed
 	}
+	if limit < 1 || m.manualActive >= limit {
+		m.mu.Unlock()
+		return nil, nil, errChatGPTWebManualReloginCapacity
+	}
 	rootCtx := m.rootCtx
+	m.manualActive++
 	m.workers.Add(1)
 	m.mu.Unlock()
 
 	operationCtx, cancel := context.WithCancel(ctx)
 	stopRootCancel := context.AfterFunc(rootCtx, cancel)
-	if !m.acquireSlot(operationCtx) {
-		stopRootCancel()
-		cancel()
-		m.workers.Done()
-		if errContext := operationCtx.Err(); errContext != nil {
-			return nil, nil, errContext
-		}
-		return nil, nil, errors.New("chatgpt web login slot is unavailable")
-	}
-
 	var releaseOnce sync.Once
 	release := func() {
 		releaseOnce.Do(func() {
-			m.releaseSlot()
+			m.mu.Lock()
+			if m.manualActive > 0 {
+				m.manualActive--
+			}
+			m.mu.Unlock()
 			stopRootCancel()
 			cancel()
 			m.workers.Done()
 		})
+	}
+	if errContext := operationCtx.Err(); errContext != nil {
+		release()
+		return nil, nil, errContext
 	}
 	return operationCtx, release, nil
 }
@@ -642,6 +661,11 @@ func (h *Handler) CancelChatGPTWebLoginTask(c *gin.Context) {
 
 // ReloginChatGPTWebAuth performs a synchronous manual re-login for one file.
 func (h *Handler) ReloginChatGPTWebAuth(c *gin.Context) {
+	if strings.EqualFold(strings.TrimSpace(c.Query("async")), "true") ||
+		strings.Contains(strings.ToLower(c.GetHeader("Prefer")), "respond-async") {
+		h.StartChatGPTWebReloginOperation(c)
+		return
+	}
 	name := strings.TrimSpace(c.Param("name"))
 	if name == "" || isUnsafeAuthFileName(name) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "valid auth file name is required"})
@@ -672,22 +696,50 @@ func (h *Handler) ReloginChatGPTWebAuth(c *gin.Context) {
 		return
 	}
 	defer taskManager.releaseEmail(email, owner)
-	operationCtx, releaseOperation, errOperation := taskManager.beginOperation(c.Request.Context())
+	manualReloginConcurrency := config.DefaultChatGPTWebManualReloginConcurrency
+	if cfg := h.currentConfig(); cfg != nil {
+		manualReloginConcurrency = cfg.ChatGPTWeb.ResolvedManualReloginConcurrency()
+	}
+	operationCtx, releaseOperation, errOperation := taskManager.beginManualOperation(c.Request.Context(), manualReloginConcurrency)
 	if errOperation != nil {
-		status := http.StatusServiceUnavailable
-		if errors.Is(errOperation, context.Canceled) || errors.Is(errOperation, context.DeadlineExceeded) {
-			status = http.StatusRequestTimeout
-		}
-		c.JSON(status, gin.H{"error": "chatgpt web re-login is unavailable"})
+		writeChatGPTWebManualReloginAdmissionError(c, errOperation)
 		return
 	}
 	defer releaseOperation()
+	status, response := h.executeChatGPTWebManualRelogin(operationCtx, auth, executor, manager)
+	c.JSON(status, response)
+}
+
+func writeChatGPTWebManualReloginAdmissionError(c *gin.Context, errOperation error) {
+	status := http.StatusServiceUnavailable
+	response := gin.H{
+		"status":         "failed",
+		"error_category": "manual_relogin_unavailable",
+		"error":          "chatgpt web re-login is unavailable",
+		"failure_stage":  "relogin",
+	}
+	if errors.Is(errOperation, errChatGPTWebManualReloginCapacity) {
+		status = http.StatusTooManyRequests
+		response["error_category"] = "manual_relogin_capacity"
+		response["error"] = "manual re-login capacity is full"
+		response["retry_after"] = chatGPTWebManualReloginRetrySec
+		c.Header("Retry-After", fmt.Sprintf("%d", chatGPTWebManualReloginRetrySec))
+	}
+	if errors.Is(errOperation, context.Canceled) || errors.Is(errOperation, context.DeadlineExceeded) {
+		status = http.StatusRequestTimeout
+		response["error_category"] = "relogin_canceled"
+		response["error"] = "chatgpt web re-login was canceled"
+	}
+	c.JSON(status, response)
+}
+
+func (h *Handler) executeChatGPTWebManualRelogin(ctx context.Context, auth *coreauth.Auth, executor chatGPTWebManagementExecutor, manager *coreauth.Manager) (int, gin.H) {
 	loginProxy, loginProxyResolved := chatGPTWebManagementLoginProxySnapshot(executor)
 	if !loginProxyResolved || !loginProxy.Enabled {
 		releaseProxyBinding := manager.HoldProxyBinding(auth.ID)
 		defer releaseProxyBinding()
 	}
-	updated, current, errRelogin := executor.ReloginCurrent(operationCtx, auth)
+	updated, current, errRelogin := executor.ReloginCurrent(ctx, auth)
 	if updated == nil {
 		updated, _ = manager.GetByID(auth.ID)
 	}
@@ -699,8 +751,7 @@ func (h *Handler) ReloginChatGPTWebAuth(c *gin.Context) {
 		response["status"] = "conflict"
 		response["error_category"] = "credential_changed"
 		response["error"] = "credential changed while re-login was running"
-		c.JSON(http.StatusConflict, response)
-		return
+		return http.StatusConflict, response
 	}
 	if errRelogin != nil {
 		if outcome, explicit := coreauth.SaveOutcomeFromError(errRelogin); explicit {
@@ -708,20 +759,17 @@ func (h *Handler) ReloginChatGPTWebAuth(c *gin.Context) {
 			case coreauth.SaveOutcomeCommitted:
 				response["status"] = "ok"
 				response["warning"] = "credential was saved with a cleanup warning"
-				c.JSON(http.StatusOK, response)
-				return
+				return http.StatusOK, response
 			case coreauth.SaveOutcomeUncertain:
 				response["status"] = "failed"
 				response["error_category"] = "persist_uncertain"
 				response["error"] = "credential persistence outcome is uncertain"
-				c.JSON(http.StatusServiceUnavailable, response)
-				return
+				return http.StatusServiceUnavailable, response
 			case coreauth.SaveOutcomeRolledBack:
 				response["status"] = "failed"
 				response["error_category"] = "persist_failed"
 				response["error"] = "failed to save chatgpt web credential"
-				c.JSON(http.StatusInternalServerError, response)
-				return
+				return http.StatusInternalServerError, response
 			}
 		}
 		category, message, status, _ := classifyChatGPTWebManagementError(errRelogin)
@@ -739,17 +787,15 @@ func (h *Handler) ReloginChatGPTWebAuth(c *gin.Context) {
 		if !current && errors.Is(errRelogin, context.Canceled) {
 			status = http.StatusRequestTimeout
 		}
-		c.JSON(status, response)
-		return
+		return status, response
 	}
 	if !current {
 		response["status"] = "conflict"
 		response["error_category"] = "credential_changed"
 		response["error"] = "credential changed while re-login was running"
-		c.JSON(http.StatusConflict, response)
-		return
+		return http.StatusConflict, response
 	}
-	c.JSON(http.StatusOK, response)
+	return http.StatusOK, response
 }
 
 func (h *Handler) chatGPTWebManagementExecutor() (chatGPTWebManagementExecutor, *coreauth.Manager, error) {

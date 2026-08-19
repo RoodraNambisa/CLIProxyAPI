@@ -40,10 +40,13 @@ const (
 	DefaultChatGPTWebAutoReloginJitterPercent = internalconfig.DefaultChatGPTWebAutoReloginJitterPercent
 	DefaultChatGPTWebAutoReloginWorkers       = internalconfig.DefaultChatGPTWebAutoReloginWorkers
 	DefaultChatGPTWebAutoReloginQueueSize     = internalconfig.DefaultChatGPTWebAutoReloginQueueSize
+	DefaultChatGPTWebManualReloginConcurrency = internalconfig.DefaultChatGPTWebManualReloginConcurrency
 	MaxChatGPTWebAutoReloginRetries           = internalconfig.MaxChatGPTWebAutoReloginRetries
 	MaxChatGPTWebAutoReloginJitterPercent     = internalconfig.MaxChatGPTWebAutoReloginJitterPercent
 	MaxChatGPTWebAutoReloginWorkers           = internalconfig.MaxChatGPTWebAutoReloginWorkers
 	MaxChatGPTWebAutoReloginQueueSize         = internalconfig.MaxChatGPTWebAutoReloginQueueSize
+	MinChatGPTWebManualReloginConcurrency     = internalconfig.MinChatGPTWebManualReloginConcurrency
+	MaxChatGPTWebManualReloginConcurrency     = internalconfig.MaxChatGPTWebManualReloginConcurrency
 )
 
 type GeminiKey = internalconfig.GeminiKey

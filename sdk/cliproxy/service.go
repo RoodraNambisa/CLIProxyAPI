@@ -5276,6 +5276,12 @@ func (s *Service) Run(ctx context.Context) error {
 		return s.waitForFailedStartup(ctx, fmt.Errorf("cliproxy: wait for initial auth updates: %w", err))
 	}
 	finishWatcherSync(authCount, "")
+	if s.server != nil {
+		if errReconcileOperations := s.server.ReconcileChatGPTWebManualReloginOperations(); errReconcileOperations != nil {
+			log.WithError(errReconcileOperations).Warn("failed to reconcile interrupted manual ChatGPT Web re-login operations")
+			s.startupState.AddIssue("manual_relogin_operations", "manual_relogin_operation_reconcile_failed", "warning")
+		}
+	}
 	log.Info("file watcher started for config and auth directory changes")
 	// Start proxy health checks only after file-backed auths are visible, so
 	// restored bindings are not pruned as stale.

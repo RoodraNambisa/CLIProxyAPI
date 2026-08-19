@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -26,6 +27,27 @@ func TestChatGPTWebAutoReloginDefaultsAndOverrides(t *testing.T) {
 	}.ResolvedAutoRelogin()
 	if explicit.MaxRetries != 0 || explicit.JitterPercent != 0 || explicit.Workers != 1 || explicit.QueueSize != 1 {
 		t.Fatalf("explicit zero ResolvedAutoRelogin() = %#v", explicit)
+	}
+}
+
+func TestChatGPTWebManualReloginConcurrencyDefaultsAndOverrides(t *testing.T) {
+	if got := (ChatGPTWebConfig{}).ResolvedManualReloginConcurrency(); got != DefaultChatGPTWebManualReloginConcurrency {
+		t.Fatalf("default manual re-login concurrency = %d, want %d", got, DefaultChatGPTWebManualReloginConcurrency)
+	}
+	override := 100
+	if got := (ChatGPTWebConfig{ManualReloginConcurrency: &override}).ResolvedManualReloginConcurrency(); got != override {
+		t.Fatalf("manual re-login concurrency = %d, want %d", got, override)
+	}
+}
+
+func TestChatGPTWebManualReloginConcurrencyValidation(t *testing.T) {
+	for _, value := range []int{0, MaxChatGPTWebManualReloginConcurrency + 1} {
+		t.Run(fmt.Sprintf("value_%d", value), func(t *testing.T) {
+			cfg := ChatGPTWebConfig{ManualReloginConcurrency: &value}
+			if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "chatgpt-web.manual-relogin-concurrency") {
+				t.Fatalf("Validate() error = %v", err)
+			}
+		})
 	}
 }
 
@@ -80,6 +102,8 @@ func TestSaveConfigPreservesExplicitZeroChatGPTWebAutoReloginValues(t *testing.T
 	cfg.ChatGPTWeb.AutoReloginJitterPercent = &zero
 	cfg.ChatGPTWeb.AutoReloginWorkers = &one
 	cfg.ChatGPTWeb.AutoReloginQueueSize = &one
+	manualConcurrency := 100
+	cfg.ChatGPTWeb.ManualReloginConcurrency = &manualConcurrency
 	if errSave := SaveConfigPreserveComments(path, cfg); errSave != nil {
 		t.Fatalf("SaveConfigPreserveComments() error = %v", errSave)
 	}
@@ -93,6 +117,7 @@ func TestSaveConfigPreservesExplicitZeroChatGPTWebAutoReloginValues(t *testing.T
 		"auto-relogin-jitter-percent: 0",
 		"auto-relogin-workers: 1",
 		"auto-relogin-queue-size: 1",
+		"manual-relogin-concurrency: 100",
 	} {
 		if !strings.Contains(string(saved), expected) {
 			t.Fatalf("saved config omitted %q:\n%s", expected, saved)
@@ -105,5 +130,8 @@ func TestSaveConfigPreservesExplicitZeroChatGPTWebAutoReloginValues(t *testing.T
 	resolved := reloaded.ChatGPTWeb.ResolvedAutoRelogin()
 	if resolved.MaxRetries != 0 || resolved.JitterPercent != 0 || resolved.Workers != 1 || resolved.QueueSize != 1 {
 		t.Fatalf("reloaded ResolvedAutoRelogin() = %#v", resolved)
+	}
+	if got := reloaded.ChatGPTWeb.ResolvedManualReloginConcurrency(); got != manualConcurrency {
+		t.Fatalf("reloaded manual re-login concurrency = %d, want %d", got, manualConcurrency)
 	}
 }

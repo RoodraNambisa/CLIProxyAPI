@@ -185,6 +185,13 @@ func TestStartupReadinessGatesProxyAndCredentialManagement(t *testing.T) {
 	if pruneTaskRecorder.Code != http.StatusNotFound || strings.Contains(pruneTaskRecorder.Body.String(), "service_initializing") {
 		t.Fatalf("initial prune task query = %d %s, want handler 404 without startup gate", pruneTaskRecorder.Code, pruneTaskRecorder.Body.String())
 	}
+	reloginTaskRequest := httptest.NewRequest(http.MethodGet, "/v0/management/chatgpt-web/relogin-operations/missing", nil)
+	reloginTaskRequest.Header.Set("X-Management-Key", "secret")
+	reloginTaskRecorder := httptest.NewRecorder()
+	server.engine.ServeHTTP(reloginTaskRecorder, reloginTaskRequest)
+	if reloginTaskRecorder.Code != http.StatusNotFound || strings.Contains(reloginTaskRecorder.Body.String(), "service_initializing") {
+		t.Fatalf("initial re-login operation query = %d %s, want handler 404 without startup gate", reloginTaskRecorder.Code, reloginTaskRecorder.Body.String())
+	}
 
 	for _, testCase := range []struct {
 		method string
@@ -193,6 +200,7 @@ func TestStartupReadinessGatesProxyAndCredentialManagement(t *testing.T) {
 		{method: http.MethodPut, path: "/v0/management/config.yaml"},
 		{method: http.MethodPatch, path: "/v0/management/debug"},
 		{method: http.MethodPost, path: "/v0/management/control-panel/update"},
+		{method: http.MethodPost, path: "/v0/management/chatgpt-web/auth-files/test.json/relogin-operations"},
 		{method: http.MethodDelete, path: "/v0/management/usage"},
 	} {
 		request := httptest.NewRequest(testCase.method, testCase.path, nil)
@@ -372,32 +380,35 @@ func TestChatGPTWebManagementRoutesAreRegistered(t *testing.T) {
 		cfg.RemoteManagement.SecretKey = "secret"
 	})
 	want := map[string]bool{
-		http.MethodPost + " /v0/management/chatgpt-web/login-tasks":                      false,
-		http.MethodGet + " /v0/management/chatgpt-web/login-tasks/:id":                   false,
-		http.MethodDelete + " /v0/management/chatgpt-web/login-tasks/:id":                false,
-		http.MethodPost + " /v0/management/chatgpt-web/import-tasks":                     false,
-		http.MethodGet + " /v0/management/chatgpt-web/import-tasks/:id":                  false,
-		http.MethodDelete + " /v0/management/chatgpt-web/import-tasks/:id":               false,
-		http.MethodGet + " /v0/management/chatgpt-web/capabilities":                      false,
-		http.MethodGet + " /v0/management/chatgpt-web/import":                            false,
-		http.MethodPut + " /v0/management/chatgpt-web/import":                            false,
-		http.MethodPatch + " /v0/management/chatgpt-web/import":                          false,
-		http.MethodPost + " /v0/management/chatgpt-web/conversion-tasks":                 false,
-		http.MethodGet + " /v0/management/chatgpt-web/conversion-tasks/:id":              false,
-		http.MethodDelete + " /v0/management/chatgpt-web/conversion-tasks/:id":           false,
-		http.MethodPost + " /v0/management/chatgpt-web/auth-files/:name/relogin":         false,
-		http.MethodGet + " /v0/management/chatgpt-web/sentinel":                          false,
-		http.MethodPut + " /v0/management/chatgpt-web/sentinel":                          false,
-		http.MethodPatch + " /v0/management/chatgpt-web/sentinel":                        false,
-		http.MethodGet + " /v0/management/chatgpt-web/account-info":                      false,
-		http.MethodPut + " /v0/management/chatgpt-web/account-info":                      false,
-		http.MethodPatch + " /v0/management/chatgpt-web/account-info":                    false,
-		http.MethodGet + " /v0/management/chatgpt-web/account-info/diagnostics":          false,
-		http.MethodDelete + " /v0/management/chatgpt-web/account-info/diagnostics":       false,
-		http.MethodPost + " /v0/management/chatgpt-web/account-info/refresh-tasks":       false,
-		http.MethodGet + " /v0/management/chatgpt-web/account-info/refresh-tasks/:id":    false,
-		http.MethodDelete + " /v0/management/chatgpt-web/account-info/refresh-tasks/:id": false,
-		http.MethodPost + " /v0/management/auth-files/restore":                           false,
+		http.MethodPost + " /v0/management/chatgpt-web/login-tasks":                         false,
+		http.MethodGet + " /v0/management/chatgpt-web/login-tasks/:id":                      false,
+		http.MethodDelete + " /v0/management/chatgpt-web/login-tasks/:id":                   false,
+		http.MethodPost + " /v0/management/chatgpt-web/import-tasks":                        false,
+		http.MethodGet + " /v0/management/chatgpt-web/import-tasks/:id":                     false,
+		http.MethodDelete + " /v0/management/chatgpt-web/import-tasks/:id":                  false,
+		http.MethodGet + " /v0/management/chatgpt-web/capabilities":                         false,
+		http.MethodGet + " /v0/management/chatgpt-web/import":                               false,
+		http.MethodPut + " /v0/management/chatgpt-web/import":                               false,
+		http.MethodPatch + " /v0/management/chatgpt-web/import":                             false,
+		http.MethodPost + " /v0/management/chatgpt-web/conversion-tasks":                    false,
+		http.MethodGet + " /v0/management/chatgpt-web/conversion-tasks/:id":                 false,
+		http.MethodDelete + " /v0/management/chatgpt-web/conversion-tasks/:id":              false,
+		http.MethodPost + " /v0/management/chatgpt-web/auth-files/:name/relogin":            false,
+		http.MethodPost + " /v0/management/chatgpt-web/auth-files/:name/relogin-operations": false,
+		http.MethodGet + " /v0/management/chatgpt-web/relogin-operations/:id":               false,
+		http.MethodGet + " /v0/management/chatgpt-web/auth-files/:name/relogin-operation":   false,
+		http.MethodGet + " /v0/management/chatgpt-web/sentinel":                             false,
+		http.MethodPut + " /v0/management/chatgpt-web/sentinel":                             false,
+		http.MethodPatch + " /v0/management/chatgpt-web/sentinel":                           false,
+		http.MethodGet + " /v0/management/chatgpt-web/account-info":                         false,
+		http.MethodPut + " /v0/management/chatgpt-web/account-info":                         false,
+		http.MethodPatch + " /v0/management/chatgpt-web/account-info":                       false,
+		http.MethodGet + " /v0/management/chatgpt-web/account-info/diagnostics":             false,
+		http.MethodDelete + " /v0/management/chatgpt-web/account-info/diagnostics":          false,
+		http.MethodPost + " /v0/management/chatgpt-web/account-info/refresh-tasks":          false,
+		http.MethodGet + " /v0/management/chatgpt-web/account-info/refresh-tasks/:id":       false,
+		http.MethodDelete + " /v0/management/chatgpt-web/account-info/refresh-tasks/:id":    false,
+		http.MethodPost + " /v0/management/auth-files/restore":                              false,
 	}
 	for _, route := range server.engine.Routes() {
 		key := route.Method + " " + route.Path

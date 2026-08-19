@@ -60,10 +60,13 @@ const (
 	DefaultChatGPTWebAutoReloginJitterPercent  = 20
 	DefaultChatGPTWebAutoReloginWorkers        = 4
 	DefaultChatGPTWebAutoReloginQueueSize      = 4096
+	DefaultChatGPTWebManualReloginConcurrency  = 4
 	MaxChatGPTWebAutoReloginRetries            = 10
 	MaxChatGPTWebAutoReloginJitterPercent      = 100
 	MaxChatGPTWebAutoReloginWorkers            = 256
 	MaxChatGPTWebAutoReloginQueueSize          = 1_000_000
+	MinChatGPTWebManualReloginConcurrency      = 1
+	MaxChatGPTWebManualReloginConcurrency      = 512
 	DefaultChatGPTWebImportWorkers             = 4
 	MaxChatGPTWebImportWorkers                 = 32
 	DefaultChatGPTWebTimezone                  = "Asia/Shanghai"
@@ -599,6 +602,8 @@ type ChatGPTWebConfig struct {
 	AutoReloginWorkers *int `yaml:"auto-relogin-workers,omitempty" json:"auto-relogin-workers,omitempty"`
 	// AutoReloginQueueSize bounds queued and running background re-login generations.
 	AutoReloginQueueSize *int `yaml:"auto-relogin-queue-size,omitempty" json:"auto-relogin-queue-size,omitempty"`
+	// ManualReloginConcurrency bounds management re-login operations without adding a server-side wait queue.
+	ManualReloginConcurrency *int `yaml:"manual-relogin-concurrency,omitempty" json:"manual-relogin-concurrency,omitempty"`
 	// Timezone is the browser IANA timezone sent to ChatGPT Web.
 	Timezone string `yaml:"timezone,omitempty" json:"timezone,omitempty"`
 	// TimezoneOffsetMinutes overrides the browser offset. Omitted values follow Timezone and DST.
@@ -643,6 +648,14 @@ func (cfg ChatGPTWebConfig) ResolvedAutoRelogin() ResolvedChatGPTWebAutoReloginC
 		resolved.QueueSize = *cfg.AutoReloginQueueSize
 	}
 	return resolved
+}
+
+// ResolvedManualReloginConcurrency returns the management re-login operation limit.
+func (cfg ChatGPTWebConfig) ResolvedManualReloginConcurrency() int {
+	if cfg.ManualReloginConcurrency != nil {
+		return *cfg.ManualReloginConcurrency
+	}
+	return DefaultChatGPTWebManualReloginConcurrency
 }
 
 // ResolvedChatGPTWebTimezone contains browser timezone fields sent upstream.
@@ -1025,6 +1038,14 @@ func (cfg ChatGPTWebConfig) Validate() error {
 	}
 	if relogin.QueueSize < 1 || relogin.QueueSize > MaxChatGPTWebAutoReloginQueueSize {
 		return fmt.Errorf("chatgpt-web.auto-relogin-queue-size must be between 1 and %d", MaxChatGPTWebAutoReloginQueueSize)
+	}
+	manualReloginConcurrency := cfg.ResolvedManualReloginConcurrency()
+	if manualReloginConcurrency < MinChatGPTWebManualReloginConcurrency || manualReloginConcurrency > MaxChatGPTWebManualReloginConcurrency {
+		return fmt.Errorf(
+			"chatgpt-web.manual-relogin-concurrency must be between %d and %d",
+			MinChatGPTWebManualReloginConcurrency,
+			MaxChatGPTWebManualReloginConcurrency,
+		)
 	}
 	timezone := strings.TrimSpace(cfg.Timezone)
 	if timezone != "" {

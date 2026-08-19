@@ -618,6 +618,14 @@ func (s *Server) currentManagementAccessPrefix() string {
 	return config.ManagementAccessPathPrefix(current.RemoteManagement.AccessPath)
 }
 
+// ReconcileChatGPTWebManualReloginOperations finalizes durable operations after auth loading completes.
+func (s *Server) ReconcileChatGPTWebManualReloginOperations() error {
+	if s == nil || s.mgmt == nil {
+		return nil
+	}
+	return s.mgmt.ReconcileChatGPTWebManualReloginOperations()
+}
+
 func (s *Server) activeManagementPrefixMiddleware(registeredPrefix string) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		if s.currentManagementAccessPrefix() != registeredPrefix {
@@ -929,6 +937,9 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.GET("/chatgpt-web/conversion-tasks/:id", s.mgmt.GetChatGPTWebConversionTask)
 		mgmt.DELETE("/chatgpt-web/conversion-tasks/:id", s.mgmt.CancelChatGPTWebConversionTask)
 		mgmt.POST("/chatgpt-web/auth-files/:name/relogin", s.mgmt.ReloginChatGPTWebAuth)
+		mgmt.POST("/chatgpt-web/auth-files/:name/relogin-operations", s.mgmt.StartChatGPTWebReloginOperation)
+		mgmt.GET("/chatgpt-web/relogin-operations/:id", s.mgmt.GetChatGPTWebReloginOperation)
+		mgmt.GET("/chatgpt-web/auth-files/:name/relogin-operation", s.mgmt.FindChatGPTWebReloginOperation)
 		mgmt.GET("/chatgpt-web/auto-delete-dead/stats", s.mgmt.GetChatGPTWebAutoDeleteDeadStats)
 		mgmt.GET("/chatgpt-web/sentinel", s.mgmt.GetChatGPTWebSentinel)
 		mgmt.PUT("/chatgpt-web/sentinel", s.mgmt.PutChatGPTWebSentinel)
@@ -998,7 +1009,10 @@ func startupUnavailableResponse(snapshot StartupSnapshot) (code, message string)
 func startupManagementPathAvailable(path string) bool {
 	const marker = "/v0/management"
 	if index := strings.LastIndex(path, marker); index >= 0 {
-		if strings.HasPrefix(path[index+len(marker):], "/usage/prune/") {
+		managementPath := path[index+len(marker):]
+		if strings.HasPrefix(managementPath, "/usage/prune/") ||
+			strings.HasPrefix(managementPath, "/chatgpt-web/relogin-operations/") ||
+			strings.HasSuffix(managementPath, "/relogin-operation") {
 			return true
 		}
 	}

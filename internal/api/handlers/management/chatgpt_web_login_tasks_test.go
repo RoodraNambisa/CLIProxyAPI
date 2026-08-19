@@ -1390,6 +1390,155 @@ func TestChatGPTWebLoginTaskManagerShutdownCancelsActiveTask(t *testing.T) {
 	}
 }
 
+func TestChatGPTWebManualReloginAdmissionIsBoundedAndHotResizable(t *testing.T) {
+	manager := newChatGPTWebLoginTaskManager()
+	firstCtx, releaseFirst, errFirst := manager.beginManualOperation(t.Context(), 2)
+	if errFirst != nil || firstCtx == nil {
+		t.Fatalf("first admission = ctx:%v err:%v", firstCtx, errFirst)
+	}
+	secondCtx, releaseSecond, errSecond := manager.beginManualOperation(t.Context(), 2)
+	if errSecond != nil || secondCtx == nil {
+		releaseFirst()
+		t.Fatalf("second admission = ctx:%v err:%v", secondCtx, errSecond)
+	}
+	if _, _, errCapacity := manager.beginManualOperation(t.Context(), 2); !errors.Is(errCapacity, errChatGPTWebManualReloginCapacity) {
+		releaseSecond()
+		releaseFirst()
+		t.Fatalf("third admission error = %v, want capacity", errCapacity)
+	}
+	if _, _, errShrink := manager.beginManualOperation(t.Context(), 1); !errors.Is(errShrink, errChatGPTWebManualReloginCapacity) {
+		releaseSecond()
+		releaseFirst()
+		t.Fatalf("shrunk admission error = %v, want capacity", errShrink)
+	}
+
+	releaseFirst()
+	releaseFirst()
+	if _, _, errStillFull := manager.beginManualOperation(t.Context(), 1); !errors.Is(errStillFull, errChatGPTWebManualReloginCapacity) {
+		releaseSecond()
+		t.Fatalf("admission at shrunk limit error = %v, want capacity", errStillFull)
+	}
+	releaseSecond()
+
+	resizedCtx, releaseResized, errResized := manager.beginManualOperation(t.Context(), 1)
+	if errResized != nil || resizedCtx == nil {
+		t.Fatalf("admission after release = ctx:%v err:%v", resizedCtx, errResized)
+	}
+	expandedCtx, releaseExpanded, errExpanded := manager.beginManualOperation(t.Context(), 2)
+	if errExpanded != nil || expandedCtx == nil {
+		releaseResized()
+		t.Fatalf("expanded admission = ctx:%v err:%v", expandedCtx, errExpanded)
+	}
+	releaseExpanded()
+	releaseResized()
+
+	canceledCtx, cancel := context.WithCancel(t.Context())
+	cancel()
+	if _, _, errCanceled := manager.beginManualOperation(canceledCtx, 2); !errors.Is(errCanceled, context.Canceled) {
+		t.Fatalf("canceled admission error = %v, want context canceled", errCanceled)
+	}
+	manager.mu.Lock()
+	active := manager.manualActive
+	manager.mu.Unlock()
+	if active != 0 {
+		t.Fatalf("manual active = %d, want 0", active)
+	}
+	shutdownCtx, shutdownCancel := context.WithTimeout(t.Context(), time.Second)
+	defer shutdownCancel()
+	if errShutdown := manager.shutdown(shutdownCtx); errShutdown != nil {
+		t.Fatalf("shutdown error = %v", errShutdown)
+	}
+}
+
+func TestChatGPTWebManualReloginAdmissionIsIndependentFromBatchSlots(t *testing.T) {
+	manager := newChatGPTWebLoginTaskManager()
+	for range chatGPTWebLoginTaskWorkers {
+		if !manager.acquireSlot(t.Context()) {
+			t.Fatal("failed to fill batch slot")
+		}
+	}
+	manualCtx, releaseManual, errManual := manager.beginManualOperation(t.Context(), 1)
+	if errManual != nil || manualCtx == nil {
+		t.Fatalf("manual admission with full batch slots = ctx:%v err:%v", manualCtx, errManual)
+	}
+	for range chatGPTWebLoginTaskWorkers {
+		manager.releaseSlot()
+	}
+	if !manager.acquireSlot(t.Context()) {
+		releaseManual()
+		t.Fatal("batch slot was blocked by active manual operation")
+	}
+	manager.releaseSlot()
+	releaseManual()
+
+	shutdownCtx, cancel := context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+	if errShutdown := manager.shutdown(shutdownCtx); errShutdown != nil {
+		t.Fatalf("shutdown error = %v", errShutdown)
+	}
+}
+
+func TestChatGPTWebManualReloginAdmissionBurstHasHardLimit(t *testing.T) {
+	const (
+		limit    = 8
+		requests = 100
+	)
+	manager := newChatGPTWebLoginTaskManager()
+	releaseAll := make(chan struct{})
+	results := make(chan error, requests)
+	var workers sync.WaitGroup
+	workers.Add(requests)
+	for range requests {
+		go func() {
+			defer workers.Done()
+			_, release, errAdmission := manager.beginManualOperation(t.Context(), limit)
+			results <- errAdmission
+			if errAdmission != nil {
+				return
+			}
+			<-releaseAll
+			release()
+		}()
+	}
+
+	admitted := 0
+	rejected := 0
+	for range requests {
+		errAdmission := <-results
+		switch {
+		case errAdmission == nil:
+			admitted++
+		case errors.Is(errAdmission, errChatGPTWebManualReloginCapacity):
+			rejected++
+		default:
+			t.Fatalf("unexpected admission error: %v", errAdmission)
+		}
+	}
+	if admitted != limit || rejected != requests-limit {
+		t.Fatalf("admitted/rejected = %d/%d, want %d/%d", admitted, rejected, limit, requests-limit)
+	}
+	manager.mu.Lock()
+	active := manager.manualActive
+	manager.mu.Unlock()
+	if active != limit {
+		t.Fatalf("manual active = %d, want %d", active, limit)
+	}
+	close(releaseAll)
+	workers.Wait()
+	manager.mu.Lock()
+	active = manager.manualActive
+	manager.mu.Unlock()
+	if active != 0 {
+		t.Fatalf("manual active after release = %d, want 0", active)
+	}
+
+	shutdownCtx, cancel := context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+	if errShutdown := manager.shutdown(shutdownCtx); errShutdown != nil {
+		t.Fatalf("shutdown error = %v", errShutdown)
+	}
+}
+
 func TestChatGPTWebLoginTaskFinishCancelsTaskContext(t *testing.T) {
 	manager := newChatGPTWebLoginTaskManager()
 	task, taskCtx, errCreate := manager.create([]chatGPTWebLoginInput{{
@@ -1760,6 +1909,515 @@ func TestReloginChatGPTWebAuthStopsWithHandlerShutdown(t *testing.T) {
 	}
 }
 
+func TestReloginChatGPTWebAuthReturnsFastCapacityBackpressure(t *testing.T) {
+	executor := &chatGPTWebManagementTestExecutor{}
+	h, manager, authDir := newChatGPTWebManagementTestHandler(t, executor)
+	limit := 1
+	if errConfig := h.SetConfig(&config.Config{
+		AuthDir: authDir,
+		ChatGPTWeb: config.ChatGPTWebConfig{
+			ManualReloginConcurrency: &limit,
+		},
+	}); errConfig != nil {
+		t.Fatalf("SetConfig() error = %v", errConfig)
+	}
+	install := func(email string) *coreauth.Auth {
+		credential := activeChatGPTWebManagementTestCredential(chatgptwebauth.LoginInput{
+			Email: email, Password: "password", TOTPSecret: "JBSWY3DPEHPK3PXP",
+		})
+		installed, errPersist := h.persistChatGPTWebLoginCredential(
+			t.Context(), manager, chatGPTWebCredentialFileName(email), credential, nil, nil,
+		)
+		if errPersist != nil {
+			t.Fatalf("persist %s: %v", email, errPersist)
+		}
+		return installed
+	}
+	first := install("manual-capacity-first@example.com")
+	second := install("manual-capacity-second@example.com")
+
+	started := make(chan struct{}, 1)
+	release := make(chan struct{})
+	var calls atomic.Int32
+	executor.reloginFn = func(ctx context.Context, auth *coreauth.Auth) (*coreauth.Auth, bool, error) {
+		calls.Add(1)
+		select {
+		case started <- struct{}{}:
+		default:
+		}
+		select {
+		case <-release:
+			return auth.Clone(), true, nil
+		case <-ctx.Done():
+			return nil, false, ctx.Err()
+		}
+	}
+	router := chatGPTWebManagementTestRouter(h)
+	firstRecorder := httptest.NewRecorder()
+	firstRequest := httptest.NewRequest(
+		http.MethodPost,
+		"/chatgpt-web/auth-files/"+url.PathEscape(first.FileName)+"/relogin",
+		nil,
+	)
+	firstDone := make(chan struct{})
+	go func() {
+		router.ServeHTTP(firstRecorder, firstRequest)
+		close(firstDone)
+	}()
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first manual re-login did not start")
+	}
+
+	secondPath := "/chatgpt-web/auth-files/" + url.PathEscape(second.FileName) + "/relogin"
+	startedAt := time.Now()
+	capacity := performChatGPTWebManagementRequest(t, router, http.MethodPost, secondPath, "")
+	if elapsed := time.Since(startedAt); elapsed > 500*time.Millisecond {
+		t.Fatalf("capacity response took %s, want fast rejection", elapsed)
+	}
+	if capacity.Code != http.StatusTooManyRequests || capacity.Header().Get("Retry-After") != "5" {
+		t.Fatalf("capacity response = %d retry=%q body=%s", capacity.Code, capacity.Header().Get("Retry-After"), capacity.Body.String())
+	}
+	var capacityBody struct {
+		Status        string `json:"status"`
+		ErrorCategory string `json:"error_category"`
+		FailureStage  string `json:"failure_stage"`
+		RetryAfter    int    `json:"retry_after"`
+	}
+	decodeChatGPTWebManagementResponse(t, capacity, &capacityBody)
+	if capacityBody.Status != "failed" || capacityBody.ErrorCategory != "manual_relogin_capacity" ||
+		capacityBody.FailureStage != "relogin" || capacityBody.RetryAfter != 5 {
+		t.Fatalf("capacity body = %+v", capacityBody)
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("re-login calls after rejection = %d, want 1", calls.Load())
+	}
+
+	close(release)
+	select {
+	case <-firstDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first manual re-login did not finish")
+	}
+	if firstRecorder.Code != http.StatusOK {
+		t.Fatalf("first response = %d body=%s", firstRecorder.Code, firstRecorder.Body.String())
+	}
+	retry := performChatGPTWebManagementRequest(t, router, http.MethodPost, secondPath, "")
+	if retry.Code != http.StatusOK {
+		t.Fatalf("retry response = %d body=%s", retry.Code, retry.Body.String())
+	}
+	if calls.Load() != 2 {
+		t.Fatalf("re-login calls after retry = %d, want 2", calls.Load())
+	}
+}
+
+func TestChatGPTWebReloginOperationLocationPreservesManagementPrefix(t *testing.T) {
+	for _, testCase := range []struct {
+		path string
+		want string
+	}{
+		{
+			path: "/kimoji/v0/management/chatgpt-web/auth-files/test.json/relogin-operations",
+			want: "/kimoji/v0/management/chatgpt-web/relogin-operations/operation-id",
+		},
+		{
+			path: "/v0/management/chatgpt-web/auth-files/test.json/relogin-operations",
+			want: "/v0/management/chatgpt-web/relogin-operations/operation-id",
+		},
+		{
+			path: "/chatgpt-web/auth-files/test.json/relogin-operations",
+			want: "/chatgpt-web/relogin-operations/operation-id",
+		},
+	} {
+		ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+		ctx.Request = httptest.NewRequest(http.MethodPost, testCase.path, nil)
+		if got := chatGPTWebManualReloginOperationLocation(ctx, "operation-id"); got != testCase.want {
+			t.Fatalf("location for %q = %q, want %q", testCase.path, got, testCase.want)
+		}
+	}
+}
+
+func TestChatGPTWebReloginOperationIsDurableIdempotentAndQueryable(t *testing.T) {
+	executor := &chatGPTWebManagementTestExecutor{}
+	h, manager, authDir := newChatGPTWebManagementTestHandler(t, executor)
+	journalPath := configureChatGPTWebManualReloginJournalForTest(t, h)
+	limit := 1
+	if errConfig := h.SetConfig(&config.Config{
+		AuthDir: authDir,
+		ChatGPTWeb: config.ChatGPTWebConfig{
+			ManualReloginConcurrency: &limit,
+		},
+	}); errConfig != nil {
+		t.Fatalf("SetConfig() error = %v", errConfig)
+	}
+	install := func(email string) *coreauth.Auth {
+		credential := activeChatGPTWebManagementTestCredential(chatgptwebauth.LoginInput{
+			Email: email, Password: "operation-password", TOTPSecret: "JBSWY3DPEHPK3PXP",
+		})
+		installed, errPersist := h.persistChatGPTWebLoginCredential(
+			t.Context(), manager, chatGPTWebCredentialFileName(email), credential, nil, nil,
+		)
+		if errPersist != nil {
+			t.Fatalf("persist %s: %v", email, errPersist)
+		}
+		return installed
+	}
+	first := install("manual-operation@example.com")
+	second := install("manual-operation-capacity@example.com")
+
+	started := make(chan struct{}, 1)
+	release := make(chan struct{})
+	var calls atomic.Int32
+	executor.reloginFn = func(ctx context.Context, auth *coreauth.Auth) (*coreauth.Auth, bool, error) {
+		calls.Add(1)
+		select {
+		case started <- struct{}{}:
+		default:
+		}
+		select {
+		case <-release:
+			return auth.Clone(), true, nil
+		case <-ctx.Done():
+			return nil, false, ctx.Err()
+		}
+	}
+	router := chatGPTWebManagementTestRouter(h)
+	path := "/chatgpt-web/auth-files/" + url.PathEscape(first.FileName) + "/relogin-operations"
+	requestCtx, cancelRequest := context.WithCancel(t.Context())
+	acceptedRequest := httptest.NewRequest(http.MethodPost, path, nil).WithContext(requestCtx)
+	acceptedRequest.Header.Set("Idempotency-Key", "registrar-batch-1:first")
+	accepted := httptest.NewRecorder()
+	router.ServeHTTP(accepted, acceptedRequest)
+	if accepted.Code != http.StatusAccepted {
+		t.Fatalf("accepted response = %d body=%s", accepted.Code, accepted.Body.String())
+	}
+	var acceptedBody struct {
+		Operation chatGPTWebManualReloginOperationSnapshot `json:"operation"`
+		Reused    bool                                     `json:"reused"`
+	}
+	decodeChatGPTWebManagementResponse(t, accepted, &acceptedBody)
+	if acceptedBody.Reused || acceptedBody.Operation.OperationID == "" || !acceptedBody.Operation.ResultDurable {
+		t.Fatalf("accepted operation = %+v", acceptedBody)
+	}
+	cancelRequest()
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("asynchronous manual re-login did not start")
+	}
+
+	duplicateRequest := httptest.NewRequest(http.MethodPost, path, nil)
+	duplicateRequest.Header.Set("Idempotency-Key", "registrar-batch-1:first")
+	duplicate := httptest.NewRecorder()
+	router.ServeHTTP(duplicate, duplicateRequest)
+	var duplicateBody struct {
+		Operation chatGPTWebManualReloginOperationSnapshot `json:"operation"`
+		Reused    bool                                     `json:"reused"`
+	}
+	decodeChatGPTWebManagementResponse(t, duplicate, &duplicateBody)
+	if duplicate.Code != http.StatusAccepted || !duplicateBody.Reused || duplicateBody.Operation.OperationID != acceptedBody.Operation.OperationID {
+		t.Fatalf("duplicate operation = %d %+v", duplicate.Code, duplicateBody)
+	}
+	conflictRequest := httptest.NewRequest(
+		http.MethodPost,
+		"/chatgpt-web/auth-files/"+url.PathEscape(second.FileName)+"/relogin-operations",
+		nil,
+	)
+	conflictRequest.Header.Set("Idempotency-Key", "registrar-batch-1:first")
+	conflict := httptest.NewRecorder()
+	router.ServeHTTP(conflict, conflictRequest)
+	if conflict.Code != http.StatusConflict || !strings.Contains(conflict.Body.String(), `"error_category":"idempotency_conflict"`) {
+		t.Fatalf("idempotency conflict = %d body=%s", conflict.Code, conflict.Body.String())
+	}
+
+	capacityPath := "/chatgpt-web/auth-files/" + url.PathEscape(second.FileName) + "/relogin-operations"
+	capacity := performChatGPTWebManagementRequest(t, router, http.MethodPost, capacityPath, "")
+	if capacity.Code != http.StatusTooManyRequests || capacity.Header().Get("Retry-After") != "5" ||
+		!strings.Contains(capacity.Body.String(), `"error_category":"manual_relogin_capacity"`) {
+		t.Fatalf("async capacity response = %d retry=%q body=%s", capacity.Code, capacity.Header().Get("Retry-After"), capacity.Body.String())
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("re-login calls before release = %d, want 1", calls.Load())
+	}
+
+	byID := performChatGPTWebManagementRequest(
+		t, router, http.MethodGet, "/chatgpt-web/relogin-operations/"+acceptedBody.Operation.OperationID, "",
+	)
+	if byID.Code != http.StatusOK {
+		t.Fatalf("query by ID = %d body=%s", byID.Code, byID.Body.String())
+	}
+	byIdentity := performChatGPTWebManagementRequest(
+		t,
+		router,
+		http.MethodGet,
+		"/chatgpt-web/auth-files/"+url.PathEscape(first.FileName)+"/relogin-operation?identity_fingerprint="+url.QueryEscape(acceptedBody.Operation.IdentityFingerprint),
+		"",
+	)
+	if byIdentity.Code != http.StatusOK || !strings.Contains(byIdentity.Body.String(), acceptedBody.Operation.OperationID) {
+		t.Fatalf("query by identity = %d body=%s", byIdentity.Code, byIdentity.Body.String())
+	}
+	byIdempotencyRequest := httptest.NewRequest(
+		http.MethodGet,
+		"/chatgpt-web/auth-files/"+url.PathEscape(first.FileName)+"/relogin-operation",
+		nil,
+	)
+	byIdempotencyRequest.Header.Set("Idempotency-Key", "registrar-batch-1:first")
+	byIdempotency := httptest.NewRecorder()
+	router.ServeHTTP(byIdempotency, byIdempotencyRequest)
+	if byIdempotency.Code != http.StatusOK || !strings.Contains(byIdempotency.Body.String(), acceptedBody.Operation.OperationID) {
+		t.Fatalf("query by idempotency = %d body=%s", byIdempotency.Code, byIdempotency.Body.String())
+	}
+	missingIdentity := performChatGPTWebManagementRequest(
+		t,
+		router,
+		http.MethodGet,
+		"/chatgpt-web/auth-files/"+url.PathEscape(first.FileName)+"/relogin-operation",
+		"",
+	)
+	if missingIdentity.Code != http.StatusBadRequest ||
+		!strings.Contains(missingIdentity.Body.String(), `"error_category":"manual_relogin_identity_required"`) {
+		t.Fatalf("query without frozen identity = %d body=%s", missingIdentity.Code, missingIdentity.Body.String())
+	}
+
+	close(release)
+	completed := waitForChatGPTWebManualReloginOperation(t, router, acceptedBody.Operation.OperationID)
+	if completed.Status != chatGPTWebManualReloginOperationCompleted || completed.Outcome != "succeeded" || !completed.ResultDurable {
+		t.Fatalf("completed operation = %+v", completed)
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("re-login calls after completion = %d, want 1", calls.Load())
+	}
+	journal, errRead := os.ReadFile(journalPath)
+	if errRead != nil {
+		t.Fatalf("read operation journal: %v", errRead)
+	}
+	assertChatGPTWebManagementSecretsAbsent(
+		t,
+		string(journal),
+		"operation-password",
+		"access-token",
+		"refresh-token",
+		"JBSWY3DPEHPK3PXP",
+		"registrar-batch-1:first",
+	)
+}
+
+func TestChatGPTWebReloginOperationShutdownCancelsWorkerWithoutLeakingAdmission(t *testing.T) {
+	executor := &chatGPTWebManagementTestExecutor{}
+	h, manager, authDir := newChatGPTWebManagementTestHandler(t, executor)
+	configureChatGPTWebManualReloginJournalForTest(t, h)
+	limit := 1
+	if errConfig := h.SetConfig(&config.Config{
+		AuthDir: authDir,
+		ChatGPTWeb: config.ChatGPTWebConfig{
+			ManualReloginConcurrency: &limit,
+		},
+	}); errConfig != nil {
+		t.Fatalf("SetConfig() error = %v", errConfig)
+	}
+	credential := activeChatGPTWebManagementTestCredential(chatgptwebauth.LoginInput{
+		Email: "manual-operation-shutdown@example.com", Password: "password", TOTPSecret: "JBSWY3DPEHPK3PXP",
+	})
+	installed, errPersist := h.persistChatGPTWebLoginCredential(
+		t.Context(), manager, chatGPTWebCredentialFileName(credential.Email), credential, nil, nil,
+	)
+	if errPersist != nil {
+		t.Fatalf("persist credential: %v", errPersist)
+	}
+	started := make(chan struct{})
+	executor.reloginFn = func(ctx context.Context, _ *coreauth.Auth) (*coreauth.Auth, bool, error) {
+		close(started)
+		<-ctx.Done()
+		return nil, false, ctx.Err()
+	}
+	router := chatGPTWebManagementTestRouter(h)
+	accepted := performChatGPTWebManagementRequest(
+		t,
+		router,
+		http.MethodPost,
+		"/chatgpt-web/auth-files/"+url.PathEscape(installed.FileName)+"/relogin-operations",
+		"",
+	)
+	if accepted.Code != http.StatusAccepted {
+		t.Fatalf("accepted response = %d body=%s", accepted.Code, accepted.Body.String())
+	}
+	var acceptedBody struct {
+		Operation chatGPTWebManualReloginOperationSnapshot `json:"operation"`
+	}
+	decodeChatGPTWebManagementResponse(t, accepted, &acceptedBody)
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("asynchronous manual re-login did not start")
+	}
+
+	shutdownCtx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	if errShutdown := h.Shutdown(shutdownCtx); errShutdown != nil {
+		t.Fatalf("Shutdown() error = %v", errShutdown)
+	}
+	operation, ok := h.chatGPTWebTaskManager().getManualReloginOperation(acceptedBody.Operation.OperationID)
+	if !ok || chatGPTWebManualReloginOperationActive(operation.Status) || !operation.ResultDurable {
+		t.Fatalf("operation after shutdown = %+v, exists=%v", operation, ok)
+	}
+	h.chatGPTWebTaskManager().mu.Lock()
+	active := h.chatGPTWebTaskManager().manualActive
+	h.chatGPTWebTaskManager().mu.Unlock()
+	if active != 0 {
+		t.Fatalf("manual active after shutdown = %d, want 0", active)
+	}
+}
+
+func TestChatGPTWebReloginOperationReconcilesMissingCredentialAfterRestart(t *testing.T) {
+	authDir := t.TempDir()
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	newManager := func() (*Handler, *coreauth.Manager) {
+		store := sdkAuth.NewFileTokenStore()
+		store.SetBaseDir(authDir)
+		manager := coreauth.NewManager(store, nil, nil)
+		executor := &chatGPTWebManagementTestExecutor{}
+		manager.RegisterExecutor(executor)
+		handler := NewHandler(&config.Config{AuthDir: authDir}, configPath, manager)
+		handler.tokenStore = store
+		return handler, manager
+	}
+
+	firstHandler, firstManager := newManager()
+	credential := activeChatGPTWebManagementTestCredential(chatgptwebauth.LoginInput{
+		Email: "restart-operation@example.com", Password: "password", TOTPSecret: "JBSWY3DPEHPK3PXP",
+	})
+	installed, errPersist := firstHandler.persistChatGPTWebLoginCredential(
+		t.Context(), firstManager, chatGPTWebCredentialFileName(credential.Email), credential, nil, nil,
+	)
+	if errPersist != nil {
+		t.Fatalf("persist credential: %v", errPersist)
+	}
+	fingerprint := chatGPTWebManualReloginIdentityFingerprint(installed, installed.FileName)
+	operation, _, errCreate := firstHandler.chatGPTWebTaskManager().createManualReloginOperation(
+		installed, installed.FileName, fingerprint, chatGPTWebManualReloginIdempotencyHash("restart-gap"),
+	)
+	if errCreate != nil {
+		t.Fatalf("create operation: %v", errCreate)
+	}
+	if errRunning := firstHandler.chatGPTWebTaskManager().markManualReloginOperationRunning(operation.OperationID); errRunning != nil {
+		t.Fatalf("mark operation running: %v", errRunning)
+	}
+	if errDelete := firstManager.Delete(t.Context(), installed.ID); errDelete != nil {
+		t.Fatalf("delete credential: %v", errDelete)
+	}
+	shutdownCtx, cancelFirst := context.WithTimeout(t.Context(), time.Second)
+	if errShutdown := firstHandler.Shutdown(shutdownCtx); errShutdown != nil {
+		cancelFirst()
+		t.Fatalf("shutdown first handler: %v", errShutdown)
+	}
+	cancelFirst()
+
+	secondHandler, secondManager := newManager()
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		if errShutdown := secondHandler.Shutdown(ctx); errShutdown != nil {
+			t.Errorf("shutdown second handler: %v", errShutdown)
+		}
+	}()
+	if _, errLoad := secondManager.LoadWithReport(t.Context()); errLoad != nil {
+		t.Fatalf("load second manager: %v", errLoad)
+	}
+	if errReconcile := secondHandler.ReconcileChatGPTWebManualReloginOperations(); errReconcile != nil {
+		t.Fatalf("reconcile operations: %v", errReconcile)
+	}
+	reconciled, ok := secondHandler.chatGPTWebTaskManager().getManualReloginOperation(operation.OperationID)
+	if !ok || reconciled.Status != chatGPTWebManualReloginOperationCompleted ||
+		reconciled.Outcome != "credential_missing_after_interruption" ||
+		reconciled.ErrorCategory != "remote_missing_reconciled" || !reconciled.ResultDurable {
+		t.Fatalf("reconciled operation = %+v, exists=%v", reconciled, ok)
+	}
+	retryRequest := httptest.NewRequest(
+		http.MethodPost,
+		"/chatgpt-web/auth-files/"+url.PathEscape(installed.FileName)+"/relogin-operations",
+		nil,
+	)
+	retryRequest.Header.Set("Idempotency-Key", "restart-gap")
+	retry := httptest.NewRecorder()
+	chatGPTWebManagementTestRouter(secondHandler).ServeHTTP(retry, retryRequest)
+	if retry.Code != http.StatusAccepted || !strings.Contains(retry.Body.String(), operation.OperationID) ||
+		!strings.Contains(retry.Body.String(), `"reused":true`) {
+		t.Fatalf("idempotent retry after credential deletion = %d body=%s", retry.Code, retry.Body.String())
+	}
+}
+
+func TestChatGPTWebReloginOperationJournalIgnoresTruncatedTail(t *testing.T) {
+	authDir := t.TempDir()
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	store := sdkAuth.NewFileTokenStore()
+	store.SetBaseDir(authDir)
+	manager := coreauth.NewManager(store, nil, nil)
+	executor := &chatGPTWebManagementTestExecutor{}
+	manager.RegisterExecutor(executor)
+	h := NewHandler(&config.Config{AuthDir: authDir}, configPath, manager)
+	h.tokenStore = store
+	credential := activeChatGPTWebManagementTestCredential(chatgptwebauth.LoginInput{
+		Email: "truncated-operation@example.com", Password: "password", TOTPSecret: "JBSWY3DPEHPK3PXP",
+	})
+	installed, errPersist := h.persistChatGPTWebLoginCredential(
+		t.Context(), manager, chatGPTWebCredentialFileName(credential.Email), credential, nil, nil,
+	)
+	if errPersist != nil {
+		t.Fatalf("persist credential: %v", errPersist)
+	}
+	operation, _, errCreate := h.chatGPTWebTaskManager().createManualReloginOperation(
+		installed,
+		installed.FileName,
+		chatGPTWebManualReloginIdentityFingerprint(installed, installed.FileName),
+		chatGPTWebManualReloginIdempotencyHash("truncated-tail"),
+	)
+	if errCreate != nil {
+		t.Fatalf("create operation: %v", errCreate)
+	}
+	journalPath := chatGPTWebManualReloginJournalPath(configPath)
+	journal, errOpen := os.OpenFile(journalPath, os.O_WRONLY|os.O_APPEND, 0o600)
+	if errOpen != nil {
+		t.Fatalf("open operation journal: %v", errOpen)
+	}
+	if _, errWrite := journal.WriteString(`{"snapshot":`); errWrite != nil {
+		_ = journal.Close()
+		t.Fatalf("append truncated record: %v", errWrite)
+	}
+	if errClose := journal.Close(); errClose != nil {
+		t.Fatalf("close operation journal: %v", errClose)
+	}
+	shutdownCtx, cancel := context.WithTimeout(t.Context(), time.Second)
+	if errShutdown := h.Shutdown(shutdownCtx); errShutdown != nil {
+		cancel()
+		t.Fatalf("shutdown first handler: %v", errShutdown)
+	}
+	cancel()
+
+	restartedManager := coreauth.NewManager(store, nil, nil)
+	restartedManager.RegisterExecutor(executor)
+	restarted := NewHandler(&config.Config{AuthDir: authDir}, configPath, restartedManager)
+	defer func() {
+		ctx, cancelRestarted := context.WithTimeout(context.Background(), time.Second)
+		defer cancelRestarted()
+		if errShutdown := restarted.Shutdown(ctx); errShutdown != nil {
+			t.Errorf("shutdown restarted handler: %v", errShutdown)
+		}
+	}()
+	loaded, ok := restarted.chatGPTWebTaskManager().getManualReloginOperation(operation.OperationID)
+	if !ok || loaded.OperationID != operation.OperationID {
+		t.Fatalf("operation after truncated tail recovery = %+v, exists=%v", loaded, ok)
+	}
+	compacted, errRead := os.ReadFile(journalPath)
+	if errRead != nil {
+		t.Fatalf("read compacted operation journal: %v", errRead)
+	}
+	lines := strings.Split(strings.TrimSpace(string(compacted)), "\n")
+	if len(lines) != 1 || !json.Valid([]byte(lines[0])) {
+		t.Fatalf("compacted operation journal = %q, want one valid record", compacted)
+	}
+}
+
 func TestChatGPTWebMutationClassifiesCredentialSnapshotFailure(t *testing.T) {
 	executor := &chatGPTWebManagementTestExecutor{}
 	h, manager, store := newChatGPTWebManagementFailingListTestHandler(t, executor)
@@ -1813,6 +2471,16 @@ func newChatGPTWebManagementTestHandler(t *testing.T, executor *chatGPTWebManage
 		}
 	})
 	return h, manager, authDir
+}
+
+func configureChatGPTWebManualReloginJournalForTest(t *testing.T, h *Handler) string {
+	t.Helper()
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	journalPath := chatGPTWebManualReloginJournalPath(configPath)
+	if errConfigure := h.chatGPTWebTaskManager().configureManualReloginJournal(journalPath); errConfigure != nil {
+		t.Fatalf("configure manual re-login operation journal: %v", errConfigure)
+	}
+	return journalPath
 }
 
 func newChatGPTWebManagementCountingTestHandler(t *testing.T, executor *chatGPTWebManagementTestExecutor) (*Handler, *coreauth.Manager, *countingChatGPTWebAuthStore) {
@@ -1880,6 +2548,9 @@ func chatGPTWebManagementTestRouter(h *Handler) *gin.Engine {
 	router.GET("/chatgpt-web/conversion-tasks/:id", h.GetChatGPTWebConversionTask)
 	router.DELETE("/chatgpt-web/conversion-tasks/:id", h.CancelChatGPTWebConversionTask)
 	router.POST("/chatgpt-web/auth-files/:name/relogin", h.ReloginChatGPTWebAuth)
+	router.POST("/chatgpt-web/auth-files/:name/relogin-operations", h.StartChatGPTWebReloginOperation)
+	router.GET("/chatgpt-web/relogin-operations/:id", h.GetChatGPTWebReloginOperation)
+	router.GET("/chatgpt-web/auth-files/:name/relogin-operation", h.FindChatGPTWebReloginOperation)
 	return router
 }
 
@@ -1911,6 +2582,25 @@ func waitForChatGPTWebLoginTask(t *testing.T, router http.Handler, id string) ch
 	}
 	t.Fatalf("task %s did not complete", id)
 	return chatGPTWebLoginTask{}
+}
+
+func waitForChatGPTWebManualReloginOperation(t *testing.T, router http.Handler, id string) chatGPTWebManualReloginOperationSnapshot {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		recorder := performChatGPTWebManagementRequest(t, router, http.MethodGet, "/chatgpt-web/relogin-operations/"+id, "")
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("get manual re-login operation = %d, body=%s", recorder.Code, recorder.Body.String())
+		}
+		var operation chatGPTWebManualReloginOperationSnapshot
+		decodeChatGPTWebManagementResponse(t, recorder, &operation)
+		if !chatGPTWebManualReloginOperationActive(operation.Status) {
+			return operation
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("manual re-login operation %s did not complete", id)
+	return chatGPTWebManualReloginOperationSnapshot{}
 }
 
 func waitForChatGPTWebManagementCondition(t *testing.T, timeout time.Duration, condition func() bool) {

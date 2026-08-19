@@ -109,6 +109,9 @@ chatgpt-web:
   auto-relogin-workers: 4
   # Bound queued and running credential generations retained by automatic re-login.
   auto-relogin-queue-size: 4096
+  # Concurrent management re-login operations, including durable asynchronous
+  # operations. Requests above this limit fail immediately with retryable backpressure.
+  manual-relogin-concurrency: 4
   # Browser timezone shared by text, search, image, and account-info requests.
   timezone: "Asia/Shanghai"
   # Omit this field to derive the current offset, including DST, from timezone.

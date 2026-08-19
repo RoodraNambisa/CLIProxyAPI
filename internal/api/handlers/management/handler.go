@@ -169,6 +169,12 @@ func NewHandler(cfg *config.Config, configFilePath string, manager *coreauth.Man
 	if cfg != nil {
 		mutationTasks.updateWorkerLimit(cfg.ChatGPTWeb.Import.Resolved().Workers)
 	}
+	loginTasks := newChatGPTWebLoginTaskManager()
+	if errJournal := loginTasks.configureManualReloginJournal(
+		chatGPTWebManualReloginJournalPath(configFilePath),
+	); errJournal != nil {
+		log.WithError(errJournal).Warn("failed to initialize manual ChatGPT Web re-login operation journal")
+	}
 	h := &Handler{
 		cfg:                     cfg,
 		configFilePath:          configFilePath,
@@ -178,7 +184,7 @@ func NewHandler(cfg *config.Config, configFilePath string, manager *coreauth.Man
 		tokenStore:              sdkAuth.GetTokenStore(),
 		allowRemoteOverride:     envSecret != "",
 		envSecret:               envSecret,
-		chatGPTWebTasks:         newChatGPTWebLoginTaskManager(),
+		chatGPTWebTasks:         loginTasks,
 		chatGPTWebMutationTasks: mutationTasks,
 		agentIdentityTasks:      newCodexAgentIdentityTaskManager(),
 		usagePruneTasks:         newUsagePruneTaskManager(),
