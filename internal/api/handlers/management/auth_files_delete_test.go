@@ -253,7 +253,8 @@ func TestDeleteAuthFileFallbackSerializesConcurrentUpload(t *testing.T) {
 		t.Fatal("upload did not finish after deletion")
 	}
 	persisted, errRead := os.ReadFile(path)
-	if errRead != nil || string(persisted) != string(replacement) {
+	wantReplacement := []byte(`{"type":"codex","access_token":"replacement","codex_fingerprint_mode":"device"}`)
+	if errRead != nil || string(persisted) != string(wantReplacement) {
 		t.Fatalf("replacement auth = %s, error %v", persisted, errRead)
 	}
 }

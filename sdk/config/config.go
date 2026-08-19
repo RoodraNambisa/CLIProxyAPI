@@ -16,6 +16,7 @@ type Config = internalconfig.Config
 type RuntimeApplyResult = internalconfig.RuntimeApplyResult
 
 type StreamingConfig = internalconfig.StreamingConfig
+type CodexFingerprintConfig = internalconfig.CodexFingerprintConfig
 type ImagesConfig = internalconfig.ImagesConfig
 type ChatGPTWebImageConfig = internalconfig.ChatGPTWebImageConfig
 type ResolvedChatGPTWebImageConfig = internalconfig.ResolvedChatGPTWebImageConfig
@@ -36,6 +37,7 @@ type PayloadFilterRule = internalconfig.PayloadFilterRule
 type PayloadModelRule = internalconfig.PayloadModelRule
 
 const (
+	DefaultCodexFingerprintMode               = internalconfig.DefaultCodexFingerprintMode
 	DefaultChatGPTWebAutoReloginMaxRetries    = internalconfig.DefaultChatGPTWebAutoReloginMaxRetries
 	DefaultChatGPTWebAutoReloginJitterPercent = internalconfig.DefaultChatGPTWebAutoReloginJitterPercent
 	DefaultChatGPTWebAutoReloginWorkers       = internalconfig.DefaultChatGPTWebAutoReloginWorkers

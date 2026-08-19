@@ -42,6 +42,7 @@ import (
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
+	"github.com/tidwall/sjson"
 )
 
 var lastRefreshKeys = []string{"last_refresh", "lastRefresh", "last_refreshed_at", "lastRefreshedAt"}
@@ -1971,12 +1972,16 @@ func (h *Handler) writeAuthFile(ctx context.Context, name string, data []byte) e
 		return errResolve
 	}
 	relativePath := filepath.FromSlash(displayName)
-	retired, _, errParse := parseRetiredGeminiCLIAuthFile(data)
+	retired, metadata, errParse := parseRetiredGeminiCLIAuthFile(data)
 	if errParse != nil {
 		return fmt.Errorf("%w: %v", errInvalidAuthFileData, errParse)
 	}
 	if retired {
 		return errGeminiCLIAuthGone
+	}
+	data, errParse = h.applyCodexFingerprintUploadDefault(data, metadata)
+	if errParse != nil {
+		return fmt.Errorf("%w: %v", errInvalidAuthFileData, errParse)
 	}
 	auth, errBuild := h.buildAuthFromFileData(dst, data)
 	if errBuild != nil {
@@ -2043,6 +2048,26 @@ func (h *Handler) writeAuthFile(ctx context.Context, name string, data []byte) e
 		return err
 	}
 	return nil
+}
+
+func (h *Handler) applyCodexFingerprintUploadDefault(data []byte, metadata map[string]any) ([]byte, error) {
+	provider, _ := metadata["type"].(string)
+	if !strings.EqualFold(strings.TrimSpace(provider), "codex") {
+		return data, nil
+	}
+	if _, configured := metadata[codex.FingerprintModeMetadataKey]; configured {
+		return data, nil
+	}
+
+	mode := config.DefaultCodexFingerprintMode
+	if cfg := h.currentConfig(); cfg != nil {
+		mode = cfg.CodexFingerprint.ResolvedDefaultMode()
+	}
+	updated, errSet := sjson.SetBytes(data, codex.FingerprintModeMetadataKey, mode)
+	if errSet != nil {
+		return nil, fmt.Errorf("set Codex fingerprint upload default: %w", errSet)
+	}
+	return updated, nil
 }
 
 func isChatGPTWebAuthFileData(data []byte) bool {

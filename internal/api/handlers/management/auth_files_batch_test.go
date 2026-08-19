@@ -126,7 +126,15 @@ func TestUploadAuthFile_BatchMultipart(t *testing.T) {
 		if err != nil {
 			t.Fatalf("expected uploaded file %s to exist: %v", file.name, err)
 		}
-		if string(data) != file.content {
+		if file.name == "alpha.json" {
+			var metadata map[string]any
+			if err = json.Unmarshal(data, &metadata); err != nil {
+				t.Fatalf("decode uploaded Codex file: %v", err)
+			}
+			if got := metadata["codex_fingerprint_mode"]; got != "device" {
+				t.Fatalf("Codex upload fingerprint mode = %#v, want device", got)
+			}
+		} else if string(data) != file.content {
 			t.Fatalf("expected file %s content %q, got %q", file.name, file.content, string(data))
 		}
 	}

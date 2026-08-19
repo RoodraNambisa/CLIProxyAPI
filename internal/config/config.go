@@ -28,6 +28,7 @@ import (
 const (
 	DefaultPanelGitHubRepository = "https://github.com/RoodraNambisa/Cli-Proxy-API-Management-Center"
 	DefaultPprofAddr             = "127.0.0.1:8316"
+	DefaultCodexFingerprintMode  = "device"
 
 	DefaultRequestBodyAuditStatusCode = http.StatusBadRequest
 	DefaultRequestBodyAuditMessage    = "Request body was rejected by policy."
@@ -1322,6 +1323,31 @@ type CodexFingerprintConfig struct {
 	JA3              bool `yaml:"ja3" json:"ja3"`
 	ForceHTTP1       bool `yaml:"force-http1" json:"force-http1"`
 	ImagesForceHTTP1 bool `yaml:"images-force-http1" json:"images-force-http1"`
+	// DefaultMode is persisted only on future Codex uploads that omit codex_fingerprint_mode.
+	DefaultMode string `yaml:"default-mode" json:"default-mode"`
+}
+
+// ResolvedDefaultMode returns the upload default while preserving the legacy device behavior.
+func (cfg CodexFingerprintConfig) ResolvedDefaultMode() string {
+	mode, err := NormalizeCodexFingerprintMode(cfg.DefaultMode)
+	if err != nil {
+		return DefaultCodexFingerprintMode
+	}
+	return mode
+}
+
+// NormalizeCodexFingerprintMode validates a Codex credential fingerprint mode.
+func NormalizeCodexFingerprintMode(value string) (string, error) {
+	mode := strings.ToLower(strings.TrimSpace(value))
+	if mode == "" {
+		return DefaultCodexFingerprintMode, nil
+	}
+	switch mode {
+	case "off", "device", "session", "full":
+		return mode, nil
+	default:
+		return "", fmt.Errorf("codex-fingerprint.default-mode must be off, device, session, or full")
+	}
 }
 
 // TLSConfig holds HTTPS server settings.
@@ -2086,6 +2112,7 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	cfg.Images.Native.Edits.Models = defaultNativeImageModels()
 	cfg.Images.Native.Edits.UnsupportedModelStatusCode = http.StatusBadRequest
 	cfg.Images.Native.Edits.UnsupportedModelMessage = "Native image edit is not enabled for model {model}"
+	cfg.CodexFingerprint.DefaultMode = DefaultCodexFingerprintMode
 	defaultImagesNAggregation := false
 	cfg.Images.EnableNAggregation = &defaultImagesNAggregation
 	cfg.Images.UnsupportedStatusCode = http.StatusBadRequest
@@ -2145,6 +2172,9 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	}
 	cfg.RemoteManagement.AccessPath = accessPath
 	if cfg.Codex.TurnStatePolicy, err = NormalizeCodexTurnStatePolicy(cfg.Codex.TurnStatePolicy); err != nil {
+		return nil, err
+	}
+	if cfg.CodexFingerprint.DefaultMode, err = NormalizeCodexFingerprintMode(cfg.CodexFingerprint.DefaultMode); err != nil {
 		return nil, err
 	}
 

@@ -660,10 +660,13 @@ nonstream-keepalive-interval: 0
 # HTTP/1.1-only options.
 # `force-http1` forces all Codex HTTPS requests to use HTTP/1.1.
 # `images-force-http1` only forces image_generation requests to use HTTP/1.1.
+# `default-mode` is written only to future Codex credential uploads that omit
+# `codex_fingerprint_mode`; existing credentials and explicit upload values are unchanged.
 # codex-fingerprint:
 #   ja3: false
 #   force-http1: false
 #   images-force-http1: false
+#   default-mode: "device" # off, device, session, or full
 
 # OpenAI compatibility providers
 # openai-compatibility:

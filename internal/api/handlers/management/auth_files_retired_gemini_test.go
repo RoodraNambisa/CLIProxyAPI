@@ -444,6 +444,10 @@ func TestUploadAuthFile_RejectsRetiredGeminiCLIWithoutOverwrite(t *testing.T) {
 			if errWrite := h.writeAuthFile(t.Context(), fileName, supported); errWrite != nil {
 				t.Fatalf("write supported auth: %v", errWrite)
 			}
+			expected, errRead := os.ReadFile(filepath.Join(authDir, fileName))
+			if errRead != nil {
+				t.Fatalf("read supported auth: %v", errRead)
+			}
 
 			recorder := httptest.NewRecorder()
 			ctx, _ := gin.CreateTestContext(recorder)
@@ -454,7 +458,7 @@ func TestUploadAuthFile_RejectsRetiredGeminiCLIWithoutOverwrite(t *testing.T) {
 				t.Fatalf("upload status = %d, want %d; body=%s", recorder.Code, http.StatusGone, recorder.Body.String())
 			}
 			persisted, errRead := os.ReadFile(filepath.Join(authDir, fileName))
-			if errRead != nil || !bytes.Equal(persisted, supported) {
+			if errRead != nil || !bytes.Equal(persisted, expected) {
 				t.Fatalf("existing file after rejected upload = %q, error=%v", persisted, errRead)
 			}
 			current, ok := manager.GetByID(fileName)
