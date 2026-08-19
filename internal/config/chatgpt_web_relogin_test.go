@@ -41,13 +41,18 @@ func TestChatGPTWebManualReloginConcurrencyDefaultsAndOverrides(t *testing.T) {
 }
 
 func TestChatGPTWebManualReloginConcurrencyValidation(t *testing.T) {
-	for _, value := range []int{0, MaxChatGPTWebManualReloginConcurrency + 1} {
+	for _, value := range []int{-1, 0} {
 		t.Run(fmt.Sprintf("value_%d", value), func(t *testing.T) {
 			cfg := ChatGPTWebConfig{ManualReloginConcurrency: &value}
 			if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "chatgpt-web.manual-relogin-concurrency") {
 				t.Fatalf("Validate() error = %v", err)
 			}
 		})
+	}
+
+	aboveRecommendation := RecommendedMaxChatGPTWebManualReloginConcurrency + 1
+	if err := (ChatGPTWebConfig{ManualReloginConcurrency: &aboveRecommendation}).Validate(); err != nil {
+		t.Fatalf("Validate() rejected advisory overflow %d: %v", aboveRecommendation, err)
 	}
 }
 

@@ -66,7 +66,8 @@ const (
 	MaxChatGPTWebAutoReloginWorkers            = 256
 	MaxChatGPTWebAutoReloginQueueSize          = 1_000_000
 	MinChatGPTWebManualReloginConcurrency      = 1
-	MaxChatGPTWebManualReloginConcurrency      = 512
+	// Deprecated: this advisory alias is not a validation limit. Use RecommendedMaxChatGPTWebManualReloginConcurrency.
+	MaxChatGPTWebManualReloginConcurrency      = RecommendedMaxChatGPTWebManualReloginConcurrency
 	DefaultChatGPTWebImportWorkers             = 4
 	MaxChatGPTWebImportWorkers                 = 32
 	DefaultChatGPTWebTimezone                  = "Asia/Shanghai"
@@ -98,6 +99,8 @@ const (
 	MinChatGPTWebLoginProxyTimeoutSeconds      = 30
 	MaxChatGPTWebLoginProxyTimeoutSeconds      = 600
 )
+
+const RecommendedMaxChatGPTWebManualReloginConcurrency = 512
 
 var (
 	deprecatedAmpConfigWarning       sync.Once
@@ -1040,11 +1043,10 @@ func (cfg ChatGPTWebConfig) Validate() error {
 		return fmt.Errorf("chatgpt-web.auto-relogin-queue-size must be between 1 and %d", MaxChatGPTWebAutoReloginQueueSize)
 	}
 	manualReloginConcurrency := cfg.ResolvedManualReloginConcurrency()
-	if manualReloginConcurrency < MinChatGPTWebManualReloginConcurrency || manualReloginConcurrency > MaxChatGPTWebManualReloginConcurrency {
+	if manualReloginConcurrency < MinChatGPTWebManualReloginConcurrency {
 		return fmt.Errorf(
-			"chatgpt-web.manual-relogin-concurrency must be between %d and %d",
+			"chatgpt-web.manual-relogin-concurrency must be at least %d",
 			MinChatGPTWebManualReloginConcurrency,
-			MaxChatGPTWebManualReloginConcurrency,
 		)
 	}
 	timezone := strings.TrimSpace(cfg.Timezone)

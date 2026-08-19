@@ -46,8 +46,11 @@ const (
 	MaxChatGPTWebAutoReloginWorkers           = internalconfig.MaxChatGPTWebAutoReloginWorkers
 	MaxChatGPTWebAutoReloginQueueSize         = internalconfig.MaxChatGPTWebAutoReloginQueueSize
 	MinChatGPTWebManualReloginConcurrency     = internalconfig.MinChatGPTWebManualReloginConcurrency
-	MaxChatGPTWebManualReloginConcurrency     = internalconfig.MaxChatGPTWebManualReloginConcurrency
+	// Deprecated: this advisory alias is not a validation limit. Use RecommendedMaxChatGPTWebManualReloginConcurrency.
+	MaxChatGPTWebManualReloginConcurrency = internalconfig.MaxChatGPTWebManualReloginConcurrency
 )
+
+const RecommendedMaxChatGPTWebManualReloginConcurrency = internalconfig.RecommendedMaxChatGPTWebManualReloginConcurrency
 
 type GeminiKey = internalconfig.GeminiKey
 type CodexKey = internalconfig.CodexKey
