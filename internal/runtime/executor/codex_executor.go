@@ -1675,11 +1675,11 @@ func (e *CodexExecutor) projectCodexSessionIdentity(
 	}
 	prepared := e.codexPreparedSessionIdentity(ctx, req, opts)
 	client := codexClientSessionIdentitySource(ctx, opts)
-	originalBodySessionID := strings.TrimSpace(gjson.GetBytes(rawJSON, "client_metadata.session_id").String())
-	currentPromptCacheKey := strings.TrimSpace(gjson.GetBytes(rawJSON, "prompt_cache_key").String())
+	originalBodySessionID := gjson.GetBytes(rawJSON, "client_metadata.session_id").String()
+	currentPromptCacheKey := gjson.GetBytes(rawJSON, "prompt_cache_key").String()
 	originalPromptCacheKey := currentPromptCacheKey
-	if identityConfuse != nil && strings.TrimSpace(identityConfuse.originalPromptCacheKey) != "" {
-		originalPromptCacheKey = strings.TrimSpace(identityConfuse.originalPromptCacheKey)
+	if identityConfuse != nil && identityConfuse.originalPromptCacheKey != "" {
+		originalPromptCacheKey = identityConfuse.originalPromptCacheKey
 	}
 	fingerprint := resolveCodexConvergedFingerprint(auth, prepared, originalCodexClientSessionID(client.SessionID, rawJSON))
 	converged := fingerprint.mode != codexauth.FingerprintModeOff
@@ -1955,7 +1955,7 @@ func applyCodexIdentityConfuseBody(cfg *config.Config, auth *cliproxyauth.Auth, 
 	}
 
 	state := codexIdentityConfuseState{enabled: true, authID: strings.TrimSpace(auth.ID)}
-	if promptCacheKey := strings.TrimSpace(gjson.GetBytes(userPayload, "prompt_cache_key").String()); promptCacheKey != "" {
+	if promptCacheKey := gjson.GetBytes(userPayload, "prompt_cache_key").String(); strings.TrimSpace(promptCacheKey) != "" {
 		state.originalPromptCacheKey = promptCacheKey
 		state.promptCacheKey = codexIdentityConfuseUUID(auth.ID, "prompt-cache", promptCacheKey)
 		rawJSON, _ = sjson.SetBytes(rawJSON, "prompt_cache_key", state.promptCacheKey)

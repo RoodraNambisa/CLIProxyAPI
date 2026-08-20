@@ -333,6 +333,53 @@ func TestCodexProjectSessionIdentityKeepsExplicitPromptCacheKey(t *testing.T) {
 	}
 }
 
+func TestCodexProjectSessionIdentityKeepsWhitespaceDistinctPromptCacheKey(t *testing.T) {
+	executor := NewCodexExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{ID: "oauth-auth", Provider: "codex", Metadata: map[string]any{
+		"type": "codex", "account_id": "account-1",
+		codexauth.FingerprintModeMetadataKey: string(codexauth.FingerprintModeFull),
+	}}
+	raw := []byte(`{"prompt_cache_key":" body-session ","client_metadata":{"session_id":"body-session"}}`)
+
+	projected, _, err := executor.projectCodexSessionIdentity(
+		t.Context(), auth, cliproxyexecutor.Request{}, cliproxyexecutor.Options{}, raw, &codexIdentityConfuseState{},
+	)
+	if err != nil {
+		t.Fatalf("projectCodexSessionIdentity() error = %v", err)
+	}
+	if got := gjson.GetBytes(projected, "prompt_cache_key").String(); got != " body-session " {
+		t.Fatalf("prompt_cache_key = %q, want whitespace-distinct explicit key", got)
+	}
+}
+
+func TestCodexProjectSessionIdentityKeepsConfusedWhitespaceDistinctPromptCacheKey(t *testing.T) {
+	cfg := &config.Config{
+		Routing: config.RoutingConfig{Strategy: "fill-first"},
+		Codex:   config.CodexConfig{IdentityConfuse: true},
+	}
+	executor := NewCodexExecutor(cfg)
+	auth := &cliproxyauth.Auth{ID: "oauth-auth", Provider: "codex", Metadata: map[string]any{
+		"type": "codex", "account_id": "account-1",
+		codexauth.FingerprintModeMetadataKey: string(codexauth.FingerprintModeFull),
+	}}
+	requestPayload := []byte(`{"prompt_cache_key":" body-session "}`)
+	upstreamPayload := []byte(`{"prompt_cache_key":" body-session ","client_metadata":{"session_id":"body-session"}}`)
+	upstreamPayload, identityState := applyCodexIdentityConfuseBody(cfg, auth, requestPayload, upstreamPayload)
+
+	projected, state, err := executor.projectCodexSessionIdentity(
+		t.Context(), auth, cliproxyexecutor.Request{Payload: requestPayload}, cliproxyexecutor.Options{}, upstreamPayload, &identityState,
+	)
+	if err != nil {
+		t.Fatalf("projectCodexSessionIdentity() error = %v", err)
+	}
+	if got := gjson.GetBytes(projected, "prompt_cache_key").String(); got != identityState.promptCacheKey {
+		t.Fatalf("prompt_cache_key = %q, want confused explicit key %q", got, identityState.promptCacheKey)
+	}
+	if identityState.promptCacheKey == state.identity.SessionID {
+		t.Fatal("whitespace-distinct explicit key was replaced by the converged session")
+	}
+}
+
 func TestCodexProjectSessionIdentityUpdatesIdentityConfusePromptMapping(t *testing.T) {
 	cfg := &config.Config{
 		Routing: config.RoutingConfig{Strategy: "fill-first"},

@@ -201,7 +201,7 @@ func ProjectCodexSessionIdentityWithProjection(
 	if identity.SessionID == "" || identity.ThreadID == "" || identity.TurnID == "" || identity.WindowID == "" {
 		return nil, CodexSessionIdentity{}, "", fmt.Errorf("Codex session identity defaults are incomplete")
 	}
-	if strings.TrimSpace(projection.PromptCacheKeyAlias) != "" {
+	if projection.PromptCacheKeyAlias != "" {
 		projection.PromptCacheKeyReplacement = identity.SessionID
 	}
 
@@ -267,9 +267,9 @@ func rebuildCodexSessionIdentityPayload(
 }
 
 func shouldRewriteCodexPromptCacheAlias(value string, projection CodexSessionIdentityProjection) bool {
-	alias := strings.TrimSpace(projection.PromptCacheKeyAlias)
-	replacement := strings.TrimSpace(projection.PromptCacheKeyReplacement)
-	return alias != "" && replacement != "" && strings.TrimSpace(value) == alias
+	return projection.PromptCacheKeyAlias != "" &&
+		projection.PromptCacheKeyReplacement != "" &&
+		value == projection.PromptCacheKeyAlias
 }
 
 func decodeCodexJSONObject(raw []byte, field string, missingAllowed bool) (map[string]json.RawMessage, error) {
