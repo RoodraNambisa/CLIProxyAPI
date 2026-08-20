@@ -276,6 +276,17 @@ proxy-url: ""
 #       - id: "geo"
 #         url-template: "http://user-session-{9}:pass@geo.example:18080"
 
+# Shared settings for scheduled and management proxy health checks.
+# proxy-health-check:
+#   concurrency: 8 # Global limit shared by scheduled rounds and management checks.
+#   endpoint-timeout-seconds: 8 # Complete-request timeout for each endpoint attempt.
+#   failure-threshold: 1 # Consecutive failed probes before a previously usable node is isolated.
+#   endpoints:
+#     - name: "cloudflare"
+#       url: "https://cloudflare.com/cdn-cgi/trace"
+#       mode: "cloudflare-trace" # cloudflare-trace or http-status
+#     # Endpoints are tried in order; any success completes the probe.
+
 # Ordered proxy rules. The first rule matching both provider and priority wins.
 # A matched rule never falls back to the global proxy or direct connections when its pool is unavailable.
 # proxy-rules:

@@ -1275,8 +1275,73 @@ func TestNextBoundCheckDelayHonorsShortConfiguredInterval(t *testing.T) {
 	if _, errResolve := manager.Resolve(context.Background(), proxyPoolTestAuth("auth-a")); errResolve != nil {
 		t.Fatalf("Resolve() error = %v", errResolve)
 	}
+	manager.CheckNow(context.Background())
 	if delay := manager.nextBoundCheckDelay(); delay != time.Second {
 		t.Fatalf("nextBoundCheckDelay() = %v, want 1s", delay)
+	}
+}
+
+func TestPoolCheckIntervalStartsAfterWholeRoundCompletes(t *testing.T) {
+	cfg := proxyPoolTestConfig("3334")
+	cfg.ProxyPools[0].CheckIntervalSeconds = 10
+	manager := newTestManager(t, filepath.Join(t.TempDir(), "config.yaml"), cfg)
+	current := time.Date(2026, time.August, 20, 12, 0, 0, 0, time.UTC)
+	manager.now = func() time.Time { return current }
+	manager.check = successfulTrace
+	if _, errResolve := manager.Resolve(t.Context(), proxyPoolTestAuth("round-delay")); errResolve != nil {
+		t.Fatalf("Resolve() error = %v", errResolve)
+	}
+	manager.check = func(context.Context, string) TraceResult {
+		current = current.Add(5 * time.Second)
+		return TraceResult{OK: true, CheckedAt: current}
+	}
+	manager.CheckNow(t.Context())
+	statuses := manager.PoolStatuses()
+	if len(statuses) != 1 || statuses[0].RoundCompletedAt == nil || statuses[0].NextCheckAt == nil {
+		t.Fatalf("pool status = %+v", statuses)
+	}
+	if got := statuses[0].NextCheckAt.Sub(*statuses[0].RoundCompletedAt); got != 10*time.Second {
+		t.Fatalf("next round delay = %s, want 10s", got)
+	}
+	if got := manager.nextBoundCheckDelay(); got != 10*time.Second {
+		t.Fatalf("nextBoundCheckDelay() = %s, want 10s after completion", got)
+	}
+}
+
+func TestPoolCheckIntervalHotUpdateUsesLastRoundCompletion(t *testing.T) {
+	cfg := proxyPoolTestConfig("3334")
+	cfg.ProxyPools[0].CheckIntervalSeconds = 10
+	manager := newTestManager(t, filepath.Join(t.TempDir(), "config.yaml"), cfg)
+	current := time.Date(2026, time.August, 20, 12, 0, 0, 0, time.UTC)
+	manager.now = func() time.Time { return current }
+	manager.check = successfulTrace
+	if _, errResolve := manager.Resolve(t.Context(), proxyPoolTestAuth("round-hot-update")); errResolve != nil {
+		t.Fatalf("Resolve() error = %v", errResolve)
+	}
+	manager.CheckNow(t.Context())
+	before := manager.PoolStatuses()[0]
+	if before.RoundCompletedAt == nil {
+		t.Fatalf("status before update = %+v", before)
+	}
+
+	current = current.Add(3 * time.Second)
+	next := proxyPoolTestConfig("3334")
+	next.ProxyPools[0].CheckIntervalSeconds = 20
+	if errUpdate := manager.UpdateConfig(next); errUpdate != nil {
+		t.Fatalf("UpdateConfig() error = %v", errUpdate)
+	}
+	after := manager.PoolStatuses()[0]
+	if after.RoundCompletedAt == nil || after.NextCheckAt == nil {
+		t.Fatalf("status after update = %+v", after)
+	}
+	if got := after.NextCheckAt.Sub(*after.RoundCompletedAt); got != 20*time.Second {
+		t.Fatalf("next round delay after hot update = %s, want 20s", got)
+	}
+	if delay := manager.nextBoundCheckDelay(); delay != backgroundCheckMaxWait {
+		t.Fatalf("nextBoundCheckDelay() = %s, want polling cap %s", delay, backgroundCheckMaxWait)
+	}
+	if len(after.Bindings) != 1 || after.Bindings[0].Healthy == nil || !*after.Bindings[0].Healthy {
+		t.Fatalf("compatible health was not preserved: %+v", after.Bindings)
 	}
 }
 

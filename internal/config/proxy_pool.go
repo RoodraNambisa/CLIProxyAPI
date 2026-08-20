@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"net/url"
 	"sort"
 	"strings"
 	"time"
@@ -13,8 +14,16 @@ const (
 	DefaultProxyPoolCheckIntervalSeconds = 300
 	DefaultProxyPoolBindAttempts         = 3
 	MaxProxyPoolBindAttempts             = 20
+	DefaultProxyHealthCheckConcurrency   = 8
+	DefaultProxyHealthCheckTimeout       = 8
+	DefaultProxyHealthFailureThreshold   = 1
+	ProxyHealthCheckModeCloudflareTrace  = "cloudflare-trace"
+	ProxyHealthCheckModeHTTPStatus       = "http-status"
 	maxProxyPoolCheckIntervalSeconds     = (1<<63 - 1) / int64(time.Second)
+	maxProxyHealthCheckTimeoutSeconds    = (1<<63 - 1) / int64(time.Second)
 )
+
+const DefaultProxyHealthCheckEndpoint = "https://cloudflare.com/cdn-cgi/trace"
 
 // NormalizeProxyConfiguration validates and canonicalizes proxy pools and rules.
 func NormalizeProxyConfiguration(pools []ProxyPoolConfig, rules []ProxyRuleConfig) ([]ProxyPoolConfig, []ProxyRuleConfig, error) {
@@ -139,7 +148,75 @@ func (cfg *Config) NormalizeProxyConfiguration() error {
 	}
 	cfg.ProxyPools = pools
 	cfg.ProxyRules = rules
+	health, errHealth := NormalizeProxyHealthCheckConfiguration(cfg.ProxyHealthCheck)
+	if errHealth != nil {
+		return errHealth
+	}
+	cfg.ProxyHealthCheck = health
 	return nil
+}
+
+// NormalizeProxyHealthCheckConfiguration validates and fills compatible defaults.
+func NormalizeProxyHealthCheckConfiguration(raw ProxyHealthCheckConfig) (ProxyHealthCheckConfig, error) {
+	config := raw
+	if config.Concurrency < 0 {
+		return ProxyHealthCheckConfig{}, fmt.Errorf("proxy-health-check.concurrency cannot be negative")
+	}
+	if config.Concurrency == 0 {
+		config.Concurrency = DefaultProxyHealthCheckConcurrency
+	}
+	if config.EndpointTimeoutSeconds < 0 {
+		return ProxyHealthCheckConfig{}, fmt.Errorf("proxy-health-check.endpoint-timeout-seconds cannot be negative")
+	}
+	if int64(config.EndpointTimeoutSeconds) > maxProxyHealthCheckTimeoutSeconds {
+		return ProxyHealthCheckConfig{}, fmt.Errorf("proxy-health-check.endpoint-timeout-seconds is too large")
+	}
+	if config.EndpointTimeoutSeconds == 0 {
+		config.EndpointTimeoutSeconds = DefaultProxyHealthCheckTimeout
+	}
+	if config.FailureThreshold < 0 {
+		return ProxyHealthCheckConfig{}, fmt.Errorf("proxy-health-check.failure-threshold cannot be negative")
+	}
+	if config.FailureThreshold == 0 {
+		config.FailureThreshold = DefaultProxyHealthFailureThreshold
+	}
+	if len(config.Endpoints) == 0 {
+		config.Endpoints = []ProxyHealthCheckEndpointConfig{{
+			Name: "cloudflare",
+			URL:  DefaultProxyHealthCheckEndpoint,
+			Mode: ProxyHealthCheckModeCloudflareTrace,
+		}}
+		return config, nil
+	}
+	seenNames := make(map[string]struct{}, len(config.Endpoints))
+	endpoints := make([]ProxyHealthCheckEndpointConfig, 0, len(config.Endpoints))
+	for index, rawEndpoint := range config.Endpoints {
+		endpoint := rawEndpoint
+		endpoint.Name = strings.TrimSpace(endpoint.Name)
+		if endpoint.Name == "" {
+			return ProxyHealthCheckConfig{}, fmt.Errorf("proxy-health-check.endpoints[%d].name is required", index)
+		}
+		nameKey := strings.ToLower(endpoint.Name)
+		if _, duplicate := seenNames[nameKey]; duplicate {
+			return ProxyHealthCheckConfig{}, fmt.Errorf("proxy-health-check.endpoints contains duplicate name %q", endpoint.Name)
+		}
+		seenNames[nameKey] = struct{}{}
+		endpoint.URL = strings.TrimSpace(endpoint.URL)
+		parsedURL, errParse := url.Parse(endpoint.URL)
+		if errParse != nil || parsedURL.Host == "" || (parsedURL.Scheme != "http" && parsedURL.Scheme != "https") {
+			return ProxyHealthCheckConfig{}, fmt.Errorf("proxy-health-check.endpoints[%d].url must be an absolute HTTP(S) URL", index)
+		}
+		endpoint.Mode = strings.ToLower(strings.TrimSpace(endpoint.Mode))
+		if endpoint.Mode == "" {
+			endpoint.Mode = ProxyHealthCheckModeCloudflareTrace
+		}
+		if endpoint.Mode != ProxyHealthCheckModeCloudflareTrace && endpoint.Mode != ProxyHealthCheckModeHTTPStatus {
+			return ProxyHealthCheckConfig{}, fmt.Errorf("proxy-health-check.endpoints[%d].mode is unsupported", index)
+		}
+		endpoints = append(endpoints, endpoint)
+	}
+	config.Endpoints = endpoints
+	return config, nil
 }
 
 // MatchProxyRule returns the first configured pool matching provider and priority.

@@ -22,6 +22,9 @@ type SDKConfig struct {
 	// ProxyRules selects proxy pools by runtime provider and credential priority.
 	ProxyRules []ProxyRuleConfig `yaml:"proxy-rules" json:"proxy-rules,omitempty"`
 
+	// ProxyHealthCheck configures shared background and management proxy probes.
+	ProxyHealthCheck ProxyHealthCheckConfig `yaml:"proxy-health-check,omitempty" json:"proxy-health-check,omitempty"`
+
 	// EnableGeminiCLIEndpoint is retained for v6 source compatibility and has no effect.
 	// Gemini CLI routes and execution support have been removed.
 	EnableGeminiCLIEndpoint bool `yaml:"-" json:"-"`
@@ -76,6 +79,21 @@ type ProxyPoolEntryConfig struct {
 	ID          string `yaml:"id" json:"id"`
 	URLTemplate string `yaml:"url-template" json:"url-template"`
 	Ports       string `yaml:"ports,omitempty" json:"ports,omitempty"`
+}
+
+// ProxyHealthCheckConfig controls process-wide scheduled and management proxy probes.
+type ProxyHealthCheckConfig struct {
+	Concurrency            int                              `yaml:"concurrency,omitempty" json:"concurrency,omitempty"`
+	EndpointTimeoutSeconds int                              `yaml:"endpoint-timeout-seconds,omitempty" json:"endpoint-timeout-seconds,omitempty"`
+	FailureThreshold       int                              `yaml:"failure-threshold,omitempty" json:"failure-threshold,omitempty"`
+	Endpoints              []ProxyHealthCheckEndpointConfig `yaml:"endpoints,omitempty" json:"endpoints,omitempty"`
+}
+
+// ProxyHealthCheckEndpointConfig defines one ordered health-check endpoint.
+type ProxyHealthCheckEndpointConfig struct {
+	Name string `yaml:"name" json:"name"`
+	URL  string `yaml:"url" json:"url"`
+	Mode string `yaml:"mode,omitempty" json:"mode,omitempty"`
 }
 
 // ProxyRuleConfig routes matching credentials through a named proxy pool.

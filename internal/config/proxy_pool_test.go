@@ -96,6 +96,49 @@ func TestNormalizeProxyConfigurationRejectsOverflowingCheckInterval(t *testing.T
 	}
 }
 
+func TestNormalizeProxyHealthCheckConfigurationDefaultsAndValidatesEndpoints(t *testing.T) {
+	defaults, errDefaults := NormalizeProxyHealthCheckConfiguration(ProxyHealthCheckConfig{})
+	if errDefaults != nil {
+		t.Fatalf("NormalizeProxyHealthCheckConfiguration(defaults) error = %v", errDefaults)
+	}
+	if defaults.Concurrency != 8 || defaults.EndpointTimeoutSeconds != 8 || defaults.FailureThreshold != 1 {
+		t.Fatalf("defaults = %#v", defaults)
+	}
+	if len(defaults.Endpoints) != 1 || defaults.Endpoints[0].Mode != ProxyHealthCheckModeCloudflareTrace {
+		t.Fatalf("default endpoints = %#v", defaults.Endpoints)
+	}
+
+	configured, errConfigured := NormalizeProxyHealthCheckConfiguration(ProxyHealthCheckConfig{
+		Concurrency:            24,
+		EndpointTimeoutSeconds: 11,
+		FailureThreshold:       3,
+		Endpoints: []ProxyHealthCheckEndpointConfig{
+			{Name: " primary ", URL: "https://primary.example/health", Mode: "HTTP-STATUS"},
+			{Name: "backup", URL: "http://backup.example/trace"},
+		},
+	})
+	if errConfigured != nil {
+		t.Fatalf("NormalizeProxyHealthCheckConfiguration(configured) error = %v", errConfigured)
+	}
+	if configured.Endpoints[0].Name != "primary" || configured.Endpoints[0].Mode != ProxyHealthCheckModeHTTPStatus || configured.Endpoints[1].Mode != ProxyHealthCheckModeCloudflareTrace {
+		t.Fatalf("configured endpoints = %#v", configured.Endpoints)
+	}
+
+	invalid := []ProxyHealthCheckConfig{
+		{Concurrency: -1},
+		{EndpointTimeoutSeconds: -1},
+		{FailureThreshold: -1},
+		{Endpoints: []ProxyHealthCheckEndpointConfig{{Name: "endpoint", URL: "file:///tmp/health"}}},
+		{Endpoints: []ProxyHealthCheckEndpointConfig{{Name: "endpoint", URL: "https://example.test", Mode: "unknown"}}},
+		{Endpoints: []ProxyHealthCheckEndpointConfig{{Name: "same", URL: "https://one.test"}, {Name: "SAME", URL: "https://two.test"}}},
+	}
+	for index, candidate := range invalid {
+		if _, errInvalid := NormalizeProxyHealthCheckConfiguration(candidate); errInvalid == nil {
+			t.Fatalf("invalid configuration %d was accepted: %#v", index, candidate)
+		}
+	}
+}
+
 func TestMatchProxyRuleUsesFirstMatch(t *testing.T) {
 	rules := []ProxyRuleConfig{
 		{Name: "codex-zero", Pool: "first", Providers: []string{"codex"}, Priorities: []int{0}},

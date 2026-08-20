@@ -56,6 +56,22 @@ func TestCheckTraceSupportsDirectAndInherit(t *testing.T) {
 	}
 }
 
+func TestCheckTraceHTTPStatusModeAcceptsEmptySuccessfulBody(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	result := CheckTrace(t.Context(), "direct", TraceOptions{
+		Endpoint: server.URL,
+		Timeout:  time.Second,
+		Mode:     TraceModeHTTPStatus,
+	})
+	if !result.OK || result.Error != "" || result.IP != "" {
+		t.Fatalf("CheckTrace(http-status) = %+v", result)
+	}
+}
+
 func TestCheckTraceDisablesKeepAliveForDedicatedTransport(t *testing.T) {
 	requestClosed := make(chan bool, 1)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

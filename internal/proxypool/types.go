@@ -33,6 +33,7 @@ type bindingStateFile struct {
 // TraceResult is the health information returned by one proxy probe.
 type TraceResult struct {
 	OK        bool      `json:"ok"`
+	Endpoint  string    `json:"endpoint,omitempty"`
 	IP        string    `json:"ip,omitempty"`
 	Location  string    `json:"loc,omitempty"`
 	HTTP      string    `json:"http,omitempty"`
@@ -46,13 +47,14 @@ type TraceResult struct {
 
 type nodeHealth struct {
 	TraceResult
-	Pool       string
-	Entry      string
-	BindingID  string
-	MaskedURL  string
-	RetryAfter time.Time
-	Generation uint64
-	ProbeEpoch uint64
+	Pool          string
+	Entry         string
+	BindingID     string
+	MaskedURL     string
+	RetryAfter    time.Time
+	Generation    uint64
+	ProbeEpoch    uint64
+	FailureStreak int
 }
 
 // BindingStatus is the management-safe view of one persisted binding.
@@ -75,17 +77,26 @@ type BindingStatus struct {
 	ElapsedMS     int64      `json:"elapsed_ms,omitempty"`
 	Error         string     `json:"error,omitempty"`
 	ErrorMessage  string     `json:"error_message,omitempty"`
+	Endpoint      string     `json:"endpoint,omitempty"`
+	FailureStreak int        `json:"failure_streak,omitempty"`
 }
 
 // PoolStatus summarizes runtime health without exposing proxy credentials.
 type PoolStatus struct {
-	Name           string          `json:"name"`
-	BindingCount   int             `json:"binding_count"`
-	HealthyCount   int             `json:"healthy_count"`
-	UnhealthyCount int             `json:"unhealthy_count"`
-	UnknownCount   int             `json:"unknown_count"`
-	LastCheckAt    *time.Time      `json:"last_check_at,omitempty"`
-	Bindings       []BindingStatus `json:"bindings,omitempty"`
+	Name             string          `json:"name"`
+	BindingCount     int             `json:"binding_count"`
+	HealthyCount     int             `json:"healthy_count"`
+	UnhealthyCount   int             `json:"unhealthy_count"`
+	UnknownCount     int             `json:"unknown_count"`
+	LastCheckAt      *time.Time      `json:"last_check_at,omitempty"`
+	Bindings         []BindingStatus `json:"bindings,omitempty"`
+	CheckRunning     bool            `json:"check_running"`
+	CheckTotal       int             `json:"check_total"`
+	CheckCompleted   int             `json:"check_completed"`
+	CheckFailed      int             `json:"check_failed"`
+	RoundStartedAt   *time.Time      `json:"round_started_at,omitempty"`
+	RoundCompletedAt *time.Time      `json:"round_completed_at,omitempty"`
+	NextCheckAt      *time.Time      `json:"next_check_at,omitempty"`
 }
 
 // CheckResult is one management-triggered bound or sampled node check.
@@ -106,6 +117,27 @@ type CheckResult struct {
 	CheckedAt time.Time `json:"checked_at"`
 	Error     string    `json:"error,omitempty"`
 	Message   string    `json:"message,omitempty"`
+	Endpoint  string    `json:"endpoint,omitempty"`
+}
+
+// CheckTask is the management-safe progress view of one asynchronous pool check.
+type CheckTask struct {
+	ID               string        `json:"task_id"`
+	Pool             string        `json:"pool"`
+	Status           string        `json:"status"`
+	Total            int           `json:"total"`
+	Completed        int           `json:"completed"`
+	Running          int           `json:"running"`
+	Succeeded        int           `json:"succeeded"`
+	Failed           int           `json:"failed"`
+	Bound            int           `json:"bound"`
+	Sampled          int           `json:"sampled"`
+	CreatedAt        time.Time     `json:"created_at"`
+	StartedAt        *time.Time    `json:"started_at,omitempty"`
+	CompletedAt      *time.Time    `json:"completed_at,omitempty"`
+	ErrorCode        string        `json:"error_code,omitempty"`
+	Results          []CheckResult `json:"results,omitempty"`
+	ResultsTruncated bool          `json:"results_truncated"`
 }
 
 // RebindResult reports one requested credential rebind.

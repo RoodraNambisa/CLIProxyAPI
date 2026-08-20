@@ -11,7 +11,9 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	internalconfig "github.com/router-for-me/CLIProxyAPI/v6/internal/config"
@@ -193,9 +195,89 @@ func proxyRuntimeTestRouter(h *Handler) *gin.Engine {
 	router := gin.New()
 	router.GET("/proxy-pools/:name/status", h.GetProxyPoolStatus)
 	router.POST("/proxy-pools/:name/check", h.CheckProxyPool)
+	router.POST("/proxy-pools/:name/check-tasks", h.PostProxyPoolCheckTask)
+	router.GET("/proxy-pools/:name/check-tasks", h.GetProxyPoolCheckTasks)
+	router.GET("/proxy-pools/:name/check-tasks/:task_id", h.GetProxyPoolCheckTask)
 	router.GET("/proxy-bindings", h.GetProxyBindings)
 	router.POST("/proxy-bindings/rebind", h.RebindProxyBindings)
 	return router
+}
+
+func TestProxyPoolCheckTaskReturnsAcceptedAndCanBePolled(t *testing.T) {
+	proxyServerURL := newProxyRuntimeTraceProxy(t)
+	manager := newProxyRuntimeTestManager(t, proxyRuntimeTestConfig(proxyServerURL))
+	h := &Handler{proxyPoolManager: manager}
+	router := proxyRuntimeTestRouter(h)
+
+	created := performProxyRuntimeRequest(t, router, http.MethodPost, "/proxy-pools/runtime/check-tasks", `{"sample":1}`)
+	if created.Code != http.StatusAccepted {
+		t.Fatalf("create status = %d, want 202; body=%s", created.Code, created.Body.String())
+	}
+	var createResponse struct {
+		Task proxypool.CheckTask `json:"task"`
+	}
+	decodeProxyRuntimeResponse(t, created, &createResponse)
+	if createResponse.Task.ID == "" {
+		t.Fatalf("created task = %+v", createResponse.Task)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		polled := performProxyRuntimeRequest(t, router, http.MethodGet, "/proxy-pools/runtime/check-tasks/"+createResponse.Task.ID, "")
+		if polled.Code != http.StatusOK {
+			t.Fatalf("poll status = %d; body=%s", polled.Code, polled.Body.String())
+		}
+		var pollResponse struct {
+			Task proxypool.CheckTask `json:"task"`
+		}
+		decodeProxyRuntimeResponse(t, polled, &pollResponse)
+		if pollResponse.Task.Status == proxypool.CheckTaskStatusCompleted {
+			if pollResponse.Task.Completed != pollResponse.Task.Total || pollResponse.Task.Succeeded == 0 {
+				t.Fatalf("completed task = %+v", pollResponse.Task)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("task did not complete: %+v", pollResponse.Task)
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	listed := performProxyRuntimeRequest(t, router, http.MethodGet, "/proxy-pools/runtime/check-tasks", "")
+	if listed.Code != http.StatusOK || !strings.Contains(listed.Body.String(), createResponse.Task.ID) {
+		t.Fatalf("list response = %d/%s", listed.Code, listed.Body.String())
+	}
+}
+
+func TestProxyPoolCheckTaskReturnsConflictForAnActivePoolTask(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var startedOnce sync.Once
+	proxyServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		startedOnce.Do(func() { close(started) })
+		<-release
+		http.Error(w, "probe released", http.StatusServiceUnavailable)
+	}))
+	t.Cleanup(proxyServer.Close)
+	manager := newProxyRuntimeTestManager(t, proxyRuntimeTestConfig(proxyServer.URL))
+	h := &Handler{proxyPoolManager: manager}
+	router := proxyRuntimeTestRouter(h)
+
+	created := performProxyRuntimeRequest(t, router, http.MethodPost, "/proxy-pools/runtime/check-tasks", `{"sample":1}`)
+	if created.Code != http.StatusAccepted {
+		t.Fatalf("create status = %d; body=%s", created.Code, created.Body.String())
+	}
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("proxy check did not start")
+	}
+	conflict := performProxyRuntimeRequest(t, router, http.MethodPost, "/proxy-pools/runtime/check-tasks", `{"sample":1}`)
+	if conflict.Code != http.StatusConflict || !strings.Contains(conflict.Body.String(), "proxy_check_task_active") {
+		t.Fatalf("conflict response = %d/%s", conflict.Code, conflict.Body.String())
+	}
+	close(release)
+	manager.Stop()
 }
 
 func performProxyRuntimeRequest(t *testing.T, router http.Handler, method, path, body string) *httptest.ResponseRecorder {

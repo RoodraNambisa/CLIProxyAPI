@@ -15,20 +15,45 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
-func checkProxyTrace(ctx context.Context, proxyURL string) TraceResult {
-	result := proxyutil.CheckTrace(ctx, proxyURL)
-	return TraceResult{
-		OK:        result.OK,
-		IP:        result.IP,
-		Location:  result.Location,
-		HTTP:      result.HTTP,
-		TLS:       result.TLS,
-		Colo:      result.Colo,
-		ElapsedMS: result.Elapsed.Milliseconds(),
-		CheckedAt: time.Now().UTC(),
-		Error:     result.Error,
-		Message:   result.Message,
+func (m *Manager) checkProxy(ctx context.Context, proxyURL string) TraceResult {
+	if m == nil {
+		return TraceResult{CheckedAt: time.Now().UTC(), Error: "manager_unavailable", Message: "proxy pool manager is unavailable"}
 	}
+	if m.check != nil {
+		return m.check(ctx, proxyURL)
+	}
+	healthConfig, errConfig := internalconfig.NormalizeProxyHealthCheckConfiguration(internalconfig.ProxyHealthCheckConfig{})
+	if errConfig != nil {
+		return TraceResult{CheckedAt: time.Now().UTC(), Error: "invalid_health_config", Message: "proxy health configuration is invalid"}
+	}
+	if snapshot := m.snapshot(); snapshot != nil {
+		healthConfig = snapshot.health
+	}
+	var last TraceResult
+	for _, endpoint := range healthConfig.Endpoints {
+		result := proxyutil.CheckTrace(ctx, proxyURL, proxyutil.TraceOptions{
+			Endpoint: endpoint.URL,
+			Timeout:  time.Duration(healthConfig.EndpointTimeoutSeconds) * time.Second,
+			Mode:     endpoint.Mode,
+		})
+		last = TraceResult{
+			OK:        result.OK,
+			Endpoint:  endpoint.Name,
+			IP:        result.IP,
+			Location:  result.Location,
+			HTTP:      result.HTTP,
+			TLS:       result.TLS,
+			Colo:      result.Colo,
+			ElapsedMS: result.Elapsed.Milliseconds(),
+			CheckedAt: time.Now().UTC(),
+			Error:     result.Error,
+			Message:   result.Message,
+		}
+		if result.OK || (ctx != nil && ctx.Err() != nil) {
+			return last
+		}
+	}
+	return last
 }
 
 // Start launches health checks for currently bound nodes only.
@@ -51,15 +76,23 @@ func (m *Manager) Start(parent context.Context) {
 	m.lifecycleMu.Unlock()
 	go func() {
 		defer close(done)
-		timer := time.NewTimer(0)
-		defer timer.Stop()
 		for {
+			timer := time.NewTimer(m.nextBoundCheckDelay())
 			select {
 			case <-ctx.Done():
+				if !timer.Stop() {
+					<-timer.C
+				}
 				return
 			case <-timer.C:
 				m.checkBoundNodes(ctx)
-				timer.Reset(m.nextBoundCheckDelay())
+			case <-m.wake:
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
 			}
 		}
 	}()
@@ -82,9 +115,14 @@ func (m *Manager) Stop() {
 	m.cancel = nil
 	m.done = nil
 	m.lifecycleMu.Unlock()
+	m.stopCheckTasks()
 }
 
 func (m *Manager) checkBoundNodes(ctx context.Context) {
+	m.checkBoundNodesWithForce(ctx, false)
+}
+
+func (m *Manager) checkBoundNodesWithForce(ctx context.Context, force bool) {
 	snapshot := m.snapshot()
 	if snapshot == nil {
 		return
@@ -96,34 +134,26 @@ func (m *Manager) checkBoundNodes(ctx context.Context) {
 			log.WithError(errRemove).Warn("failed to prune stale proxy bindings")
 		}
 	}
-	now := m.now()
-	type checkItem struct {
-		binding Binding
-		url     string
-	}
-	items := make([]checkItem, 0, len(valid))
+	byPool := make(map[string][]Binding, len(snapshot.pools))
 	for _, binding := range valid {
-		resolvedURL, ok := m.bindingURL(snapshot, binding)
-		if !ok {
-			continue
+		poolKey := strings.ToLower(strings.TrimSpace(binding.Pool))
+		if _, exists := snapshot.pools[poolKey]; exists {
+			byPool[poolKey] = append(byPool[poolKey], binding)
 		}
-		m.mu.RLock()
-		health, known := m.health[binding.ID]
-		m.mu.RUnlock()
-		if known && health.Generation == snapshot.generation && now.Before(health.RetryAfter) {
-			continue
-		}
-		items = append(items, checkItem{binding: binding, url: resolvedURL})
 	}
-	m.runChecks(ctx, len(items), func(index int) {
-		item := items[index]
-		probeEpoch := m.nextProbeEpoch()
-		result := m.check(ctx, item.url)
-		if ctx != nil && ctx.Err() != nil {
-			return
+	var wait sync.WaitGroup
+	for poolKey := range snapshot.pools {
+		if !force && !m.poolCheckDue(poolKey, m.now()) {
+			continue
 		}
-		m.storeBoundHealth(snapshot, item.binding, item.url, result, probeEpoch)
-	})
+		bindings := append([]Binding(nil), byPool[poolKey]...)
+		wait.Add(1)
+		go func(name string, poolBindings []Binding) {
+			defer wait.Done()
+			m.checkBoundPool(ctx, name, poolBindings, force)
+		}(poolKey, bindings)
+	}
+	wait.Wait()
 }
 
 func (m *Manager) nextBoundCheckDelay() time.Duration {
@@ -133,17 +163,17 @@ func (m *Manager) nextBoundCheckDelay() time.Duration {
 	}
 	now := m.now()
 	delay := backgroundCheckMaxWait
-	for _, binding := range m.SortedBindings() {
-		if _, valid := m.bindingURL(snapshot, binding); !valid {
-			continue
-		}
-		m.mu.RLock()
-		health, known := m.health[binding.ID]
-		m.mu.RUnlock()
-		if !known || health.Generation != snapshot.generation || !health.RetryAfter.After(now) {
+	m.roundMu.RLock()
+	defer m.roundMu.RUnlock()
+	for poolKey := range snapshot.pools {
+		state, known := m.rounds[poolKey]
+		if !known || (!state.Running && !state.NextCheckAt.After(now)) {
 			return time.Millisecond
 		}
-		if candidate := health.RetryAfter.Sub(now); candidate < delay {
+		if state.Running {
+			continue
+		}
+		if candidate := state.NextCheckAt.Sub(now); candidate < delay {
 			delay = candidate
 		}
 	}
@@ -151,6 +181,155 @@ func (m *Manager) nextBoundCheckDelay() time.Duration {
 		return time.Millisecond
 	}
 	return delay
+}
+
+type boundCheckItem struct {
+	binding Binding
+	url     string
+	epoch   uint64
+}
+
+func (m *Manager) checkBoundPool(ctx context.Context, poolKey string, bindings []Binding, force bool) {
+	unlock := m.lockPoolCheck(poolKey)
+	defer unlock()
+	snapshot := m.snapshot()
+	if snapshot == nil {
+		return
+	}
+	pool, exists := snapshot.pools[poolKey]
+	if !exists || (!force && !m.poolCheckDue(poolKey, m.now())) {
+		return
+	}
+	items := make([]boundCheckItem, 0, len(bindings))
+	for _, binding := range bindings {
+		resolvedURL, valid := resolveBindingURL(pool, binding)
+		if valid {
+			items = append(items, boundCheckItem{binding: binding, url: resolvedURL})
+		}
+	}
+	m.beginPoolRound(poolKey, len(items))
+	m.runChecks(ctx, len(items), func(index int) {
+		item := &items[index]
+		item.epoch = m.nextProbeEpoch()
+		result := m.checkProxy(ctx, item.url)
+		if ctx != nil && ctx.Err() != nil {
+			return
+		}
+		m.admission.recordResult(result.OK)
+		m.storeBoundHealthWithThreshold(snapshot, item.binding, item.url, result, item.epoch)
+		m.recordPoolRoundResult(poolKey, result.OK)
+	})
+	if ctx != nil && ctx.Err() != nil {
+		m.cancelPoolRound(poolKey)
+		return
+	}
+	m.completePoolRound(snapshot, poolKey, items)
+}
+
+func (m *Manager) lockPoolCheck(poolKey string) func() {
+	key := strings.ToLower(strings.TrimSpace(poolKey))
+	created := &poolCheckLock{}
+	raw, _ := m.checkLocks.LoadOrStore(key, created)
+	lock := raw.(*poolCheckLock)
+	lock.mutex.Lock()
+	return lock.mutex.Unlock
+}
+
+func (m *Manager) poolCheckDue(poolKey string, now time.Time) bool {
+	m.roundMu.RLock()
+	state, known := m.rounds[poolKey]
+	m.roundMu.RUnlock()
+	return !known || (!state.Running && !state.NextCheckAt.After(now))
+}
+
+func (m *Manager) reconcilePoolRounds(snapshot *configSnapshot) {
+	if m == nil || snapshot == nil {
+		return
+	}
+	now := m.now().UTC()
+	m.roundMu.Lock()
+	nextRounds := make(map[string]poolRoundState, len(snapshot.pools))
+	for poolKey, pool := range snapshot.pools {
+		state, exists := m.rounds[poolKey]
+		if !exists {
+			nextRounds[poolKey] = poolRoundState{}
+			continue
+		}
+		if state.Running {
+			state.NextCheckAt = now
+		} else if !state.CompletedAt.IsZero() {
+			state.NextCheckAt = state.CompletedAt.Add(time.Duration(pool.config.CheckIntervalSeconds) * time.Second)
+		}
+		nextRounds[poolKey] = state
+	}
+	m.rounds = nextRounds
+	m.roundMu.Unlock()
+}
+
+func (m *Manager) beginPoolRound(poolKey string, total int) {
+	now := m.now().UTC()
+	m.roundMu.Lock()
+	state := m.rounds[poolKey]
+	state.Running = true
+	state.Total = total
+	state.Completed = 0
+	state.Failed = 0
+	state.StartedAt = now
+	m.rounds[poolKey] = state
+	m.roundMu.Unlock()
+}
+
+func (m *Manager) recordPoolRoundResult(poolKey string, ok bool) {
+	m.roundMu.Lock()
+	state := m.rounds[poolKey]
+	state.Completed++
+	if !ok {
+		state.Failed++
+	}
+	m.rounds[poolKey] = state
+	m.roundMu.Unlock()
+}
+
+func (m *Manager) cancelPoolRound(poolKey string) {
+	m.roundMu.Lock()
+	state := m.rounds[poolKey]
+	state.Running = false
+	m.rounds[poolKey] = state
+	m.roundMu.Unlock()
+	m.wakeHealthLoop()
+}
+
+func (m *Manager) completePoolRound(snapshot *configSnapshot, poolKey string, items []boundCheckItem) bool {
+	current := m.snapshot()
+	if current == nil || current.generation != snapshot.generation {
+		m.cancelPoolRound(poolKey)
+		return false
+	}
+	pool, exists := current.pools[poolKey]
+	if !exists {
+		m.cancelPoolRound(poolKey)
+		return false
+	}
+	completedAt := m.now().UTC()
+	nextCheckAt := completedAt.Add(time.Duration(pool.config.CheckIntervalSeconds) * time.Second)
+	m.mu.Lock()
+	for _, item := range items {
+		health, known := m.health[item.binding.ID]
+		if known && health.Generation == current.generation && health.ProbeEpoch == item.epoch {
+			health.RetryAfter = nextCheckAt
+			m.health[item.binding.ID] = health
+		}
+	}
+	m.mu.Unlock()
+	m.roundMu.Lock()
+	state := m.rounds[poolKey]
+	state.Running = false
+	state.CompletedAt = completedAt
+	state.NextCheckAt = nextCheckAt
+	m.rounds[poolKey] = state
+	m.roundMu.Unlock()
+	m.wakeHealthLoop()
+	return true
 }
 
 type bindingRemovalCandidate struct {
@@ -364,27 +543,29 @@ func (m *Manager) runChecks(ctx context.Context, count int, run func(int)) {
 	if count <= 0 || run == nil {
 		return
 	}
-	semaphore := make(chan struct{}, maxConcurrentChecks)
 	var wait sync.WaitGroup
 	for index := 0; index < count; index++ {
-		if ctx == nil {
-			semaphore <- struct{}{}
-		} else {
-			select {
-			case <-ctx.Done():
-				wait.Wait()
-				return
-			case semaphore <- struct{}{}:
-			}
+		release, errAcquire := m.admission.acquire(ctx)
+		if errAcquire != nil {
+			wait.Wait()
+			return
 		}
 		wait.Add(1)
-		go func(checkIndex int) {
+		go func(checkIndex int, releaseCheck func()) {
 			defer wait.Done()
-			defer func() { <-semaphore }()
+			defer releaseCheck()
 			run(checkIndex)
-		}(index)
+		}(index, release)
 	}
 	wait.Wait()
+}
+
+// CheckAdmissionSnapshot returns process-wide scheduled and management probe pressure.
+func (m *Manager) CheckAdmissionSnapshot() CheckAdmissionSnapshot {
+	if m == nil {
+		return CheckAdmissionSnapshot{}
+	}
+	return m.admission.snapshot()
 }
 
 // PoolStatuses returns summaries for all configured pools.
@@ -429,9 +610,29 @@ func (m *Manager) PoolStatuses() []PoolStatus {
 		}
 	}
 	out := make([]PoolStatus, 0, len(statuses))
-	for _, status := range statuses {
+	m.roundMu.RLock()
+	for poolKey, status := range statuses {
+		if round, exists := m.rounds[poolKey]; exists {
+			status.CheckRunning = round.Running
+			status.CheckTotal = round.Total
+			status.CheckCompleted = round.Completed
+			status.CheckFailed = round.Failed
+			if !round.StartedAt.IsZero() {
+				startedAt := round.StartedAt
+				status.RoundStartedAt = &startedAt
+			}
+			if !round.CompletedAt.IsZero() {
+				completedAt := round.CompletedAt
+				status.RoundCompletedAt = &completedAt
+			}
+			if !round.NextCheckAt.IsZero() {
+				nextCheckAt := round.NextCheckAt
+				status.NextCheckAt = &nextCheckAt
+			}
+		}
 		out = append(out, *status)
 	}
+	m.roundMu.RUnlock()
 	sort.Slice(out, func(i, j int) bool { return strings.ToLower(out[i].Name) < strings.ToLower(out[j].Name) })
 	return out
 }
@@ -506,16 +707,31 @@ func (m *Manager) bindingStatus(snapshot *configSnapshot, binding Binding, resol
 	status.ElapsedMS = health.ElapsedMS
 	status.Error = health.Error
 	status.ErrorMessage = health.Message
+	status.Endpoint = health.Endpoint
+	status.FailureStreak = health.FailureStreak
 	return status
+}
+
+type poolCheckObserver struct {
+	prepared func(total, bound, sampled int)
+	started  func()
+	result   func(CheckResult)
 }
 
 // CheckPool checks bound nodes and up to sample unbound candidates.
 func (m *Manager) CheckPool(ctx context.Context, poolName string, sample int) ([]CheckResult, error) {
+	return m.checkPool(ctx, poolName, sample, nil, true)
+}
+
+func (m *Manager) checkPool(ctx context.Context, poolName string, sample int, observer *poolCheckObserver, collectResults bool) ([]CheckResult, error) {
+	poolKey := strings.ToLower(strings.TrimSpace(poolName))
+	unlock := m.lockPoolCheck(poolKey)
+	defer unlock()
 	snapshot := m.snapshot()
 	if snapshot == nil {
 		return nil, errors.New("proxy configuration unavailable")
 	}
-	pool, exists := snapshot.pools[strings.ToLower(strings.TrimSpace(poolName))]
+	pool, exists := snapshot.pools[poolKey]
 	if !exists {
 		return nil, errors.New("proxy pool not found")
 	}
@@ -556,18 +772,35 @@ func (m *Manager) CheckPool(ctx context.Context, poolName string, sample int) ([
 		seen[fingerprint] = struct{}{}
 		items = append(items, checkItem{binding: binding, url: resolvedURL})
 	}
-	results := make([]CheckResult, len(items))
+	boundCount := targetCount - sample
+	if boundCount > len(items) {
+		boundCount = len(items)
+	}
+	if observer != nil && observer.prepared != nil {
+		observer.prepared(len(items), boundCount, len(items)-boundCount)
+	}
+	m.beginPoolRound(poolKey, len(items))
+	var results []CheckResult
+	if collectResults {
+		results = make([]CheckResult, len(items))
+	}
+	roundItems := make([]boundCheckItem, len(items))
 	m.runChecks(ctx, len(items), func(index int) {
+		if observer != nil && observer.started != nil {
+			observer.started()
+		}
 		item := items[index]
 		probeEpoch := m.nextProbeEpoch()
-		trace := m.check(ctx, item.url)
+		trace := m.checkProxy(ctx, item.url)
 		if ctx != nil && ctx.Err() != nil {
 			return
 		}
+		m.admission.recordResult(trace.OK)
 		if item.bound {
-			m.storeBoundHealth(snapshot, item.binding, item.url, trace, probeEpoch)
+			m.storeBoundHealthWithThreshold(snapshot, item.binding, item.url, trace, probeEpoch)
+			roundItems[index] = boundCheckItem{binding: item.binding, url: item.url, epoch: probeEpoch}
 		}
-		results[index] = CheckResult{
+		result := CheckResult{
 			Pool:      pool.config.Name,
 			Entry:     item.binding.Entry,
 			Port:      item.binding.Port,
@@ -584,10 +817,31 @@ func (m *Manager) CheckPool(ctx context.Context, poolName string, sample int) ([
 			CheckedAt: trace.CheckedAt,
 			Error:     trace.Error,
 			Message:   trace.Message,
+			Endpoint:  trace.Endpoint,
 		}
+		if collectResults {
+			results[index] = result
+		}
+		if observer != nil && observer.result != nil {
+			observer.result(result)
+		}
+		m.recordPoolRoundResult(poolKey, trace.OK)
 	})
 	if ctx != nil && ctx.Err() != nil {
+		m.cancelPoolRound(poolKey)
 		return nil, ctx.Err()
+	}
+	boundRoundItems := roundItems[:0]
+	for _, item := range roundItems {
+		if item.binding.ID != "" {
+			boundRoundItems = append(boundRoundItems, item)
+		}
+	}
+	if !m.completePoolRound(snapshot, poolKey, boundRoundItems) {
+		return results, errProxyConfigurationChanged
+	}
+	if !collectResults {
+		return nil, nil
 	}
 	sort.Slice(results, func(i, j int) bool {
 		if results[i].Bound != results[j].Bound {
@@ -685,4 +939,4 @@ func (m *Manager) Rebind(ctx context.Context, authIDs []string) []RebindResult {
 }
 
 // CheckNow is used by tests and operators that need an immediate bound-node pass.
-func (m *Manager) CheckNow(ctx context.Context) { m.checkBoundNodes(ctx) }
+func (m *Manager) CheckNow(ctx context.Context) { m.checkBoundNodesWithForce(ctx, true) }

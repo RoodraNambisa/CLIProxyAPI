@@ -85,6 +85,80 @@ func (h *Handler) CheckProxyPool(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"results": results})
 }
 
+// PostProxyPoolCheckTask creates an asynchronous management health check.
+func (h *Handler) PostProxyPoolCheckTask(c *gin.Context) {
+	manager := h.proxyPoolRuntimeManager()
+	if manager == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "proxy pool manager unavailable"})
+		return
+	}
+	var body checkProxyPoolRequest
+	if errBind := c.ShouldBindJSON(&body); errBind != nil && !errors.Is(errBind, io.EOF) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+		return
+	}
+	sample := defaultProxyPoolCheckSample
+	if body.Sample != nil {
+		sample = *body.Sample
+	}
+	if sample < 1 || sample > 100 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "sample must be between 1 and 100"})
+		return
+	}
+	name := strings.TrimSpace(c.Param("name"))
+	if !proxyPoolExists(manager, name) {
+		c.JSON(http.StatusNotFound, gin.H{"error": "proxy pool not found"})
+		return
+	}
+	task, errStart := manager.StartCheckTask(name, sample)
+	if errStart != nil {
+		var conflict *proxypool.CheckTaskConflictError
+		switch {
+		case errors.As(errStart, &conflict):
+			c.JSON(http.StatusConflict, gin.H{"error": "proxy_check_task_active", "task_id": conflict.TaskID, "task": task})
+		case errors.Is(errStart, proxypool.ErrCheckTaskCapacity):
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "proxy_check_task_capacity"})
+		default:
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create proxy check task"})
+		}
+		return
+	}
+	c.JSON(http.StatusAccepted, gin.H{"task": task})
+}
+
+// GetProxyPoolCheckTasks returns active and recent tasks for one pool.
+func (h *Handler) GetProxyPoolCheckTasks(c *gin.Context) {
+	manager := h.proxyPoolRuntimeManager()
+	if manager == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "proxy pool manager unavailable"})
+		return
+	}
+	name := strings.TrimSpace(c.Param("name"))
+	if !proxyPoolExists(manager, name) {
+		c.JSON(http.StatusNotFound, gin.H{"error": "proxy pool not found"})
+		return
+	}
+	tasks := manager.CheckTasks(name)
+	c.Header("Cache-Control", "no-store")
+	c.JSON(http.StatusOK, gin.H{"tasks": tasks})
+}
+
+// GetProxyPoolCheckTask returns one task by ID.
+func (h *Handler) GetProxyPoolCheckTask(c *gin.Context) {
+	manager := h.proxyPoolRuntimeManager()
+	if manager == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "proxy pool manager unavailable"})
+		return
+	}
+	task, exists := manager.CheckTask(c.Param("name"), c.Param("task_id"))
+	if !exists {
+		c.JSON(http.StatusNotFound, gin.H{"error": "proxy check task not found"})
+		return
+	}
+	c.Header("Cache-Control", "no-store")
+	c.JSON(http.StatusOK, gin.H{"task": task})
+}
+
 // GetProxyBindings returns management-safe runtime binding details.
 func (h *Handler) GetProxyBindings(c *gin.Context) {
 	manager := h.proxyPoolRuntimeManager()

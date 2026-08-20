@@ -31,7 +31,6 @@ import (
 
 const (
 	backgroundCheckMaxWait = 15 * time.Second
-	maxConcurrentChecks    = 8
 )
 
 var errProxyConfigurationChanged = errors.New("proxy configuration changed")
@@ -53,10 +52,25 @@ type configSnapshot struct {
 	globalURL  string
 	rules      []internalconfig.ProxyRuleConfig
 	pools      map[string]runtimePool
+	health     internalconfig.ProxyHealthCheckConfig
 }
 
 type bindingLock struct {
 	semaphore chan struct{}
+}
+
+type poolCheckLock struct {
+	mutex sync.Mutex
+}
+
+type poolRoundState struct {
+	Running     bool
+	Total       int
+	Completed   int
+	Failed      int
+	StartedAt   time.Time
+	CompletedAt time.Time
+	NextCheckAt time.Time
 }
 
 // Manager owns immutable proxy configuration snapshots, stable credential
@@ -66,39 +80,55 @@ type Manager struct {
 	configMu sync.RWMutex
 	probeSeq atomic.Uint64
 
-	mu       sync.RWMutex
-	bindings map[string]Binding
-	health   map[string]nodeHealth
-	reserved map[string]Binding
-	auths    AuthSource
-	leaseMu  sync.RWMutex
-	leases   map[string]int
-
-	persistMu sync.Mutex
-	bindLocks sync.Map
-	statePath string
-	random    io.Reader
-	now       func() time.Time
-	check     traceChecker
-	syncDir   func(string) error
+	mu         sync.RWMutex
+	bindings   map[string]Binding
+	health     map[string]nodeHealth
+	reserved   map[string]Binding
+	auths      AuthSource
+	leaseMu    sync.RWMutex
+	leases     map[string]int
+	persistMu  sync.Mutex
+	bindLocks  sync.Map
+	checkLocks sync.Map
+	statePath  string
+	random     io.Reader
+	now        func() time.Time
+	check      traceChecker
+	syncDir    func(string) error
+	admission  *checkAdmission
 
 	lifecycleMu sync.Mutex
 	cancel      context.CancelFunc
 	done        chan struct{}
+	wake        chan struct{}
+	roundMu     sync.RWMutex
+	rounds      map[string]poolRoundState
+
+	taskMu      sync.Mutex
+	taskContext context.Context
+	taskCancel  context.CancelFunc
+	taskWG      sync.WaitGroup
+	checkTasks  map[string]*checkTaskState
+	taskByPool  map[string]string
+	taskOrder   []string
 }
 
 // NewManager creates a proxy-pool runtime and restores stable bindings.
 func NewManager(configPath string, cfg *internalconfig.Config) (*Manager, error) {
 	m := &Manager{
-		bindings:  make(map[string]Binding),
-		health:    make(map[string]nodeHealth),
-		reserved:  make(map[string]Binding),
-		leases:    make(map[string]int),
-		statePath: bindingStatePath(configPath),
-		random:    rand.Reader,
-		now:       time.Now,
-		check:     checkProxyTrace,
-		syncDir:   syncProxyBindingDirectory,
+		bindings:   make(map[string]Binding),
+		health:     make(map[string]nodeHealth),
+		reserved:   make(map[string]Binding),
+		leases:     make(map[string]int),
+		statePath:  bindingStatePath(configPath),
+		random:     rand.Reader,
+		now:        time.Now,
+		syncDir:    syncProxyBindingDirectory,
+		admission:  newCheckAdmission(internalconfig.DefaultProxyHealthCheckConcurrency),
+		wake:       make(chan struct{}, 1),
+		rounds:     make(map[string]poolRoundState),
+		checkTasks: make(map[string]*checkTaskState),
+		taskByPool: make(map[string]string),
 	}
 	if errLoad := m.loadBindings(); errLoad != nil {
 		return nil, errLoad
@@ -193,8 +223,12 @@ func (m *Manager) updateConfig(cfg *internalconfig.Config, oldPoolName, newPoolN
 	if errNormalize != nil {
 		return errNormalize
 	}
+	healthConfig, errHealth := internalconfig.NormalizeProxyHealthCheckConfiguration(cfg.ProxyHealthCheck)
+	if errHealth != nil {
+		return errHealth
+	}
 	globalURL := strings.TrimSpace(cfg.ProxyURL)
-	signature, errSignature := proxyConfigurationSignature(globalURL, pools, rules)
+	signature, errSignature := proxyConfigurationSignature(globalURL, pools, rules, healthConfig)
 	if errSignature != nil {
 		return errSignature
 	}
@@ -215,6 +249,7 @@ func (m *Manager) updateConfig(cfg *internalconfig.Config, oldPoolName, newPoolN
 		globalURL:  globalURL,
 		rules:      cloneRules(rules),
 		pools:      make(map[string]runtimePool, len(pools)),
+		health:     cloneProxyHealthCheckConfig(healthConfig),
 	}
 	for _, poolConfig := range pools {
 		pool := runtimePool{
@@ -242,7 +277,33 @@ func (m *Manager) updateConfig(cfg *internalconfig.Config, oldPoolName, newPoolN
 		}
 	}
 	m.config.Store(snapshot)
+	m.rebaseCompatibleHealth(previous, snapshot)
+	m.admission.resize(healthConfig.Concurrency)
+	m.reconcilePoolRounds(snapshot)
+	m.wakeHealthLoop()
 	return nil
+}
+
+func (m *Manager) rebaseCompatibleHealth(previous, next *configSnapshot) {
+	if m == nil || previous == nil || next == nil || previous.generation == next.generation {
+		return
+	}
+	m.mu.Lock()
+	for _, binding := range m.bindings {
+		health, exists := m.health[binding.ID]
+		if !exists || health.Generation != previous.generation {
+			continue
+		}
+		previousURL, previousValid := m.bindingURL(previous, binding)
+		nextURL, nextValid := m.bindingURL(next, binding)
+		if !previousValid || !nextValid || previousURL != nextURL {
+			delete(m.health, binding.ID)
+			continue
+		}
+		health.Generation = next.generation
+		m.health[binding.ID] = health
+	}
+	m.mu.Unlock()
 }
 
 func inferredPoolRename(previous, next *configSnapshot) (string, string, bool) {
@@ -319,21 +380,38 @@ func (m *Manager) renamePoolBindingsLocked(snapshot *configSnapshot, oldName, ne
 	return nil
 }
 
-func proxyConfigurationSignature(globalURL string, pools []internalconfig.ProxyPoolConfig, rules []internalconfig.ProxyRuleConfig) (string, error) {
+func proxyConfigurationSignature(globalURL string, pools []internalconfig.ProxyPoolConfig, rules []internalconfig.ProxyRuleConfig, health internalconfig.ProxyHealthCheckConfig) (string, error) {
 	payload, errMarshal := json.Marshal(struct {
-		GlobalURL string                           `json:"global_url"`
-		Pools     []internalconfig.ProxyPoolConfig `json:"pools"`
-		Rules     []internalconfig.ProxyRuleConfig `json:"rules"`
+		GlobalURL string                                `json:"global_url"`
+		Pools     []internalconfig.ProxyPoolConfig      `json:"pools"`
+		Rules     []internalconfig.ProxyRuleConfig      `json:"rules"`
+		Health    internalconfig.ProxyHealthCheckConfig `json:"health"`
 	}{
 		GlobalURL: globalURL,
 		Pools:     pools,
 		Rules:     rules,
+		Health:    health,
 	})
 	if errMarshal != nil {
 		return "", fmt.Errorf("encode proxy configuration signature: %w", errMarshal)
 	}
 	digest := sha256.Sum256(payload)
 	return hex.EncodeToString(digest[:]), nil
+}
+
+func cloneProxyHealthCheckConfig(config internalconfig.ProxyHealthCheckConfig) internalconfig.ProxyHealthCheckConfig {
+	config.Endpoints = append([]internalconfig.ProxyHealthCheckEndpointConfig(nil), config.Endpoints...)
+	return config
+}
+
+func (m *Manager) wakeHealthLoop() {
+	if m == nil || m.wake == nil {
+		return
+	}
+	select {
+	case m.wake <- struct{}{}:
+	default:
+	}
 }
 
 func cloneRules(rules []internalconfig.ProxyRuleConfig) []internalconfig.ProxyRuleConfig {
@@ -616,7 +694,7 @@ func (m *Manager) bindingUsable(ctx context.Context, snapshot *configSnapshot, b
 		return true, nil
 	}
 	probeEpoch := m.nextProbeEpoch()
-	result := m.check(ctx, resolvedURL)
+	result := m.checkProxy(ctx, resolvedURL)
 	if ctx != nil && ctx.Err() != nil {
 		return false, ctx.Err()
 	}
@@ -684,7 +762,7 @@ func (m *Manager) allocateBinding(ctx context.Context, snapshot *configSnapshot,
 		seen[fingerprint] = struct{}{}
 		probes++
 		probeEpoch := m.nextProbeEpoch()
-		result := m.check(ctx, resolvedURL)
+		result := m.checkProxy(ctx, resolvedURL)
 		if ctx != nil && ctx.Err() != nil {
 			return Binding{}, "", time.Time{}, ctx.Err()
 		}
@@ -727,7 +805,7 @@ func (m *Manager) allocateSpreadBinding(ctx context.Context, snapshot *configSna
 		attemptedOrdinals[ordinal] = struct{}{}
 		attemptedFingerprints[proxyURLFingerprint(resolvedURL)] = struct{}{}
 		probeEpoch := m.nextProbeEpoch()
-		result := m.check(ctx, resolvedURL)
+		result := m.checkProxy(ctx, resolvedURL)
 		if ctx != nil && ctx.Err() != nil {
 			m.releaseSpreadReservation(binding.ID)
 			return Binding{}, "", time.Time{}, ctx.Err()
@@ -1020,12 +1098,39 @@ func (m *Manager) storeHealth(snapshot *configSnapshot, binding Binding, resolve
 }
 
 func (m *Manager) storeBoundHealth(snapshot *configSnapshot, binding Binding, resolvedURL string, result TraceResult, probeEpoch uint64) (nodeHealth, bool) {
+	return m.storeBoundHealthInternal(snapshot, binding, resolvedURL, result, probeEpoch, false)
+}
+
+func (m *Manager) storeBoundHealthWithThreshold(snapshot *configSnapshot, binding Binding, resolvedURL string, result TraceResult, probeEpoch uint64) (nodeHealth, bool) {
+	return m.storeBoundHealthInternal(snapshot, binding, resolvedURL, result, probeEpoch, true)
+}
+
+func (m *Manager) storeBoundHealthInternal(snapshot *configSnapshot, binding Binding, resolvedURL string, result TraceResult, probeEpoch uint64, applyThreshold bool) (nodeHealth, bool) {
 	health := m.newHealth(snapshot, binding, resolvedURL, result, probeEpoch)
 	m.mu.Lock()
 	currentSnapshot := m.config.Load()
 	currentBinding, bound := m.bindings[binding.AuthID]
 	previous := m.health[binding.ID]
 	if currentSnapshot != nil && currentSnapshot.generation == snapshot.generation && bound && currentBinding.ID == binding.ID && previous.ProbeEpoch <= probeEpoch {
+		previousKnown := previous.Generation == snapshot.generation
+		if !previousKnown {
+			previous = nodeHealth{}
+		}
+		if result.OK {
+			health.FailureStreak = 0
+		} else {
+			health.FailureStreak = previous.FailureStreak
+			if health.FailureStreak < int(^uint(0)>>1) {
+				health.FailureStreak++
+			}
+			threshold := snapshot.health.FailureThreshold
+			if threshold < 1 {
+				threshold = internalconfig.DefaultProxyHealthFailureThreshold
+			}
+			if applyThreshold && health.FailureStreak < threshold && (!previousKnown || previous.OK) {
+				health.OK = true
+			}
+		}
 		m.health[binding.ID] = health
 		m.mu.Unlock()
 		return health, true
@@ -1100,7 +1205,7 @@ func (m *Manager) ReportFailure(ctx context.Context, auth *coreauth.Auth, err er
 	}
 	if ambiguous && !definitive {
 		probeEpoch := m.nextProbeEpoch()
-		result := m.check(ctx, resolvedURL)
+		result := m.checkProxy(ctx, resolvedURL)
 		if ctx != nil && ctx.Err() != nil {
 			return err
 		}

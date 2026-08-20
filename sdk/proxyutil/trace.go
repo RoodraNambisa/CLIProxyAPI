@@ -21,6 +21,10 @@ const (
 	DefaultTraceUserAgent = "Mozilla/5.0"
 	// DefaultTraceTimeout bounds the complete trace request.
 	DefaultTraceTimeout = 8 * time.Second
+	// TraceModeCloudflare parses Cloudflare-compatible key/value trace data.
+	TraceModeCloudflare = "cloudflare-trace"
+	// TraceModeHTTPStatus accepts any successful HTTP status without parsing a body contract.
+	TraceModeHTTPStatus = "http-status"
 
 	traceResponseLimit = 64 * 1024
 )
@@ -29,6 +33,7 @@ const (
 type TraceOptions struct {
 	Endpoint string
 	Timeout  time.Duration
+	Mode     string
 }
 
 // TraceResult describes the outbound connection observed by the trace endpoint.
@@ -53,9 +58,11 @@ func CheckTrace(ctx context.Context, proxyURL string, options ...TraceOptions) (
 	}
 	started := time.Now()
 	proxyURL = strings.TrimSpace(proxyURL)
+	traceOptions := resolveTraceOptions(options)
 	defer func() {
 		result.Elapsed = time.Since(started)
 		result.Message = maskTraceMessage(result.Message, proxyURL)
+		result.Message = maskTraceEndpointMessage(result.Message, traceOptions.Endpoint)
 	}()
 
 	transport, mode, errTransport := BuildHTTPTransport(proxyURL)
@@ -65,7 +72,6 @@ func CheckTrace(ctx context.Context, proxyURL string, options ...TraceOptions) (
 		return result
 	}
 
-	traceOptions := resolveTraceOptions(options)
 	traceCtx, cancelTrace := context.WithTimeout(ctx, traceOptions.Timeout)
 	defer cancelTrace()
 	req, errRequest := http.NewRequestWithContext(traceCtx, http.MethodGet, traceOptions.Endpoint, nil)
@@ -106,6 +112,10 @@ func CheckTrace(ctx context.Context, proxyURL string, options ...TraceOptions) (
 		return result
 	}
 
+	if traceOptions.Mode == TraceModeHTTPStatus {
+		result.OK = true
+		return result
+	}
 	trace := parseCloudflareTrace(string(body))
 	result.IP = trace["ip"]
 	result.Location = trace["loc"]
@@ -118,6 +128,13 @@ func CheckTrace(ctx context.Context, proxyURL string, options ...TraceOptions) (
 		result.Message = "trace response missing ip and loc"
 	}
 	return result
+}
+
+func maskTraceEndpointMessage(message, endpoint string) string {
+	if message == "" || endpoint == "" {
+		return message
+	}
+	return strings.ReplaceAll(message, endpoint, "configured health endpoint")
 }
 
 func traceHTTPTransport(base *http.Transport, connectTimeout time.Duration) *http.Transport {
@@ -150,6 +167,7 @@ func resolveTraceOptions(options []TraceOptions) TraceOptions {
 	resolved := TraceOptions{
 		Endpoint: DefaultTraceEndpoint,
 		Timeout:  DefaultTraceTimeout,
+		Mode:     TraceModeCloudflare,
 	}
 	for _, option := range options {
 		if endpoint := strings.TrimSpace(option.Endpoint); endpoint != "" {
@@ -157,6 +175,9 @@ func resolveTraceOptions(options []TraceOptions) TraceOptions {
 		}
 		if option.Timeout > 0 {
 			resolved.Timeout = option.Timeout
+		}
+		if mode := strings.ToLower(strings.TrimSpace(option.Mode)); mode == TraceModeCloudflare || mode == TraceModeHTTPStatus {
+			resolved.Mode = mode
 		}
 	}
 	return resolved
