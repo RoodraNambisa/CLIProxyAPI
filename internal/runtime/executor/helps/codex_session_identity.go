@@ -32,9 +32,16 @@ type CodexSessionIdentityHeaderSource struct {
 // CodexSessionIdentityProjection controls forced per-credential identity while
 // preserving the existing fill-missing behavior for ordinary session spoofing.
 type CodexSessionIdentityProjection struct {
-	InstallationID string
-	ForcedIdentity CodexSessionIdentity
-	ProjectSession bool
+	InstallationID            string
+	ForcedIdentity            CodexSessionIdentity
+	ProjectSession            bool
+	PromptCacheKeyAlias       string
+	PromptCacheKeyReplacement string
+}
+
+type codexSessionIdentityRawField struct {
+	key   []byte
+	value []byte
 }
 
 // ProjectCodexSessionIdentity merges identity sources into client_metadata and
@@ -68,15 +75,12 @@ func ProjectCodexSessionIdentityWithProjection(
 	}
 
 	var rawClientMetadata []byte
-	out := make([]byte, 0, len(payload)+512)
-	out = append(out, '{')
-	fields := 0
+	rawFields := make([]codexSessionIdentityRawField, 0, 12)
 	err := visitCodexTopLevelFields(trimmed, func(rawKey, rawValue []byte) {
 		if codexJSONKeyEquals(rawKey, "client_metadata") {
 			rawClientMetadata = rawValue
-			return
 		}
-		out = appendCodexRawJSONField(out, &fields, rawKey, rawValue)
+		rawFields = append(rawFields, codexSessionIdentityRawField{key: rawKey, value: rawValue})
 	})
 	if err != nil {
 		return nil, CodexSessionIdentity{}, "", err
@@ -128,8 +132,7 @@ func ProjectCodexSessionIdentityWithProjection(
 		if err != nil {
 			return nil, CodexSessionIdentity{}, "", fmt.Errorf("encode Codex client_metadata: %w", err)
 		}
-		out = appendCodexNamedJSONField(out, &fields, "client_metadata", string(metadataJSON))
-		out = append(out, '}')
+		out := rebuildCodexSessionIdentityPayload(trimmed, rawFields, metadataJSON, projection)
 		return out, CodexSessionIdentity{InstallationID: installationID}, string(turnMetadataJSON), nil
 	}
 
@@ -198,6 +201,9 @@ func ProjectCodexSessionIdentityWithProjection(
 	if identity.SessionID == "" || identity.ThreadID == "" || identity.TurnID == "" || identity.WindowID == "" {
 		return nil, CodexSessionIdentity{}, "", fmt.Errorf("Codex session identity defaults are incomplete")
 	}
+	if strings.TrimSpace(projection.PromptCacheKeyAlias) != "" {
+		projection.PromptCacheKeyReplacement = identity.SessionID
+	}
 
 	turnMetadata := cloneCodexRawMap(clientTurn)
 	overlayCodexRawMap(turnMetadata, bodyTurn)
@@ -207,6 +213,9 @@ func ProjectCodexSessionIdentityWithProjection(
 	setCodexRawString(turnMetadata, "turn_id", identity.TurnID)
 	setCodexRawString(turnMetadata, "window_id", identity.WindowID)
 	setCodexRawString(turnMetadata, "request_kind", identity.RequestKind)
+	if shouldRewriteCodexPromptCacheAlias(codexTurnString(turnMetadata, "prompt_cache_key"), projection) {
+		setCodexRawString(turnMetadata, "prompt_cache_key", projection.PromptCacheKeyReplacement)
+	}
 	if projection.InstallationID != "" {
 		identity.InstallationID = installationID
 		setCodexRawString(turnMetadata, "installation_id", installationID)
@@ -228,9 +237,39 @@ func ProjectCodexSessionIdentityWithProjection(
 	if err != nil {
 		return nil, CodexSessionIdentity{}, "", fmt.Errorf("encode Codex client_metadata: %w", err)
 	}
+	out := rebuildCodexSessionIdentityPayload(trimmed, rawFields, metadataJSON, projection)
+	return out, identity, string(turnMetadataJSON), nil
+}
+
+func rebuildCodexSessionIdentityPayload(
+	payload []byte,
+	rawFields []codexSessionIdentityRawField,
+	metadataJSON []byte,
+	projection CodexSessionIdentityProjection,
+) []byte {
+	out := make([]byte, 0, len(payload)+512)
+	out = append(out, '{')
+	fields := 0
+	for _, field := range rawFields {
+		if codexJSONKeyEquals(field.key, "client_metadata") {
+			continue
+		}
+		value := field.value
+		if codexJSONKeyEquals(field.key, "prompt_cache_key") &&
+			shouldRewriteCodexPromptCacheAlias(codexRawJSONString(value), projection) {
+			value = []byte(strconv.Quote(projection.PromptCacheKeyReplacement))
+		}
+		out = appendCodexRawJSONField(out, &fields, field.key, value)
+	}
 	out = appendCodexNamedJSONField(out, &fields, "client_metadata", string(metadataJSON))
 	out = append(out, '}')
-	return out, identity, string(turnMetadataJSON), nil
+	return out
+}
+
+func shouldRewriteCodexPromptCacheAlias(value string, projection CodexSessionIdentityProjection) bool {
+	alias := strings.TrimSpace(projection.PromptCacheKeyAlias)
+	replacement := strings.TrimSpace(projection.PromptCacheKeyReplacement)
+	return alias != "" && replacement != "" && strings.TrimSpace(value) == alias
 }
 
 func decodeCodexJSONObject(raw []byte, field string, missingAllowed bool) (map[string]json.RawMessage, error) {

@@ -1667,6 +1667,12 @@ func (e *CodexExecutor) projectCodexSessionIdentity(
 	}
 	prepared := e.codexPreparedSessionIdentity(ctx, req, opts)
 	client := codexClientSessionIdentitySource(ctx, opts)
+	originalBodySessionID := strings.TrimSpace(gjson.GetBytes(rawJSON, "client_metadata.session_id").String())
+	currentPromptCacheKey := strings.TrimSpace(gjson.GetBytes(rawJSON, "prompt_cache_key").String())
+	originalPromptCacheKey := currentPromptCacheKey
+	if identityConfuse != nil && strings.TrimSpace(identityConfuse.originalPromptCacheKey) != "" {
+		originalPromptCacheKey = strings.TrimSpace(identityConfuse.originalPromptCacheKey)
+	}
 	fingerprint := resolveCodexConvergedFingerprint(auth, prepared, originalCodexClientSessionID(client.SessionID, rawJSON))
 	converged := fingerprint.mode != codexauth.FingerprintModeOff
 	projectSession := prepared.Enabled || fingerprint.mode == codexauth.FingerprintModeSession || fingerprint.mode == codexauth.FingerprintModeFull
@@ -1700,6 +1706,9 @@ func (e *CodexExecutor) projectCodexSessionIdentity(
 			TurnID:    fingerprint.turnID,
 			WindowID:  fingerprint.windowID,
 		}
+		if originalPromptCacheKey != "" && originalPromptCacheKey == originalBodySessionID {
+			projection.PromptCacheKeyAlias = currentPromptCacheKey
+		}
 	}
 	projected, identity, turnMetadata, err := helps.ProjectCodexSessionIdentityWithProjection(
 		rawJSON,
@@ -1719,6 +1728,9 @@ func (e *CodexExecutor) projectCodexSessionIdentity(
 		)
 		status.skipAuthResult = true
 		return nil, codexSessionIdentityState{}, status
+	}
+	if projection.PromptCacheKeyAlias != "" && identityConfuse != nil && identityConfuse.enabled {
+		identityConfuse.promptCacheKey = identity.SessionID
 	}
 	return projected, codexSessionIdentityState{
 		enabled: true, projectSession: projectSession, converged: converged,

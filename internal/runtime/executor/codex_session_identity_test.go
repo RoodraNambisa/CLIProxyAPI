@@ -275,10 +275,10 @@ func TestCodexProjectSessionIdentityConvergesPerCredentialMode(t *testing.T) {
 				}
 				return
 			}
-			wantSession := deriveStableCodexFingerprintUUID("session", "account-1")
+			wantSession := deriveStableCodexFingerprintUUID("session", wantInstallation)
 			wantThread := wantSession
 			if tt.mode == codexauth.FingerprintModeSession {
-				wantThread = deriveStableCodexFingerprintUUID("thread", "account-1\x00client-session")
+				wantThread = deriveStableCodexFingerprintUUID("thread", wantInstallation+"\x00client-session")
 			}
 			if state.identity.SessionID != wantSession || state.identity.ThreadID != wantThread || state.identity.TurnID != "prepared-turn" || state.identity.WindowID != wantThread+":0" {
 				t.Fatalf("identity = %#v, want session=%q thread=%q", state.identity, wantSession, wantThread)
@@ -288,6 +288,82 @@ func TestCodexProjectSessionIdentityConvergesPerCredentialMode(t *testing.T) {
 				t.Fatalf("turn metadata = %s, want preserved workspace and converged installation", turnMetadata)
 			}
 		})
+	}
+}
+
+func TestCodexProjectSessionIdentityRewritesDefaultPromptCacheAlias(t *testing.T) {
+	executor := NewCodexExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{ID: "oauth-auth", Provider: "codex", Metadata: map[string]any{
+		"type": "codex", "account_id": "account-1",
+		codexauth.FingerprintModeMetadataKey: string(codexauth.FingerprintModeSession),
+	}}
+	raw := []byte(`{"prompt_cache_key":"body-session","client_metadata":{"session_id":"body-session","x-codex-turn-metadata":"{\"prompt_cache_key\":\"body-session\"}"}}`)
+
+	projected, state, err := executor.projectCodexSessionIdentity(
+		t.Context(), auth, cliproxyexecutor.Request{}, cliproxyexecutor.Options{}, raw, &codexIdentityConfuseState{},
+	)
+	if err != nil {
+		t.Fatalf("projectCodexSessionIdentity() error = %v", err)
+	}
+	if got := gjson.GetBytes(projected, "prompt_cache_key").String(); got != state.identity.SessionID {
+		t.Fatalf("prompt_cache_key = %q, want converged session %q", got, state.identity.SessionID)
+	}
+	turnMetadata := gjson.GetBytes(projected, "client_metadata.x-codex-turn-metadata").String()
+	if got := gjson.Get(turnMetadata, "prompt_cache_key").String(); got != state.identity.SessionID {
+		t.Fatalf("turn metadata prompt_cache_key = %q, want %q", got, state.identity.SessionID)
+	}
+}
+
+func TestCodexProjectSessionIdentityKeepsExplicitPromptCacheKey(t *testing.T) {
+	executor := NewCodexExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{ID: "oauth-auth", Provider: "codex", Metadata: map[string]any{
+		"type": "codex", "account_id": "account-1",
+		codexauth.FingerprintModeMetadataKey: string(codexauth.FingerprintModeFull),
+	}}
+	raw := []byte(`{"prompt_cache_key":"explicit-cache","client_metadata":{"session_id":"body-session"}}`)
+
+	projected, _, err := executor.projectCodexSessionIdentity(
+		t.Context(), auth, cliproxyexecutor.Request{}, cliproxyexecutor.Options{}, raw, &codexIdentityConfuseState{},
+	)
+	if err != nil {
+		t.Fatalf("projectCodexSessionIdentity() error = %v", err)
+	}
+	if got := gjson.GetBytes(projected, "prompt_cache_key").String(); got != "explicit-cache" {
+		t.Fatalf("prompt_cache_key = %q, want explicit-cache", got)
+	}
+}
+
+func TestCodexProjectSessionIdentityUpdatesIdentityConfusePromptMapping(t *testing.T) {
+	cfg := &config.Config{
+		Routing: config.RoutingConfig{Strategy: "fill-first"},
+		Codex:   config.CodexConfig{IdentityConfuse: true},
+	}
+	executor := NewCodexExecutor(cfg)
+	auth := &cliproxyauth.Auth{ID: "oauth-auth", Provider: "codex", Metadata: map[string]any{
+		"type": "codex", "account_id": "account-1",
+		codexauth.FingerprintModeMetadataKey: string(codexauth.FingerprintModeSession),
+	}}
+	requestPayload := []byte(`{"prompt_cache_key":"body-session"}`)
+	upstreamPayload := []byte(`{"prompt_cache_key":"body-session","client_metadata":{"session_id":"body-session","x-codex-turn-metadata":"{\"prompt_cache_key\":\"body-session\"}"}}`)
+	upstreamPayload, identityState := applyCodexIdentityConfuseBody(cfg, auth, requestPayload, upstreamPayload)
+
+	projected, state, err := executor.projectCodexSessionIdentity(
+		t.Context(), auth, cliproxyexecutor.Request{Payload: requestPayload}, cliproxyexecutor.Options{}, upstreamPayload, &identityState,
+	)
+	if err != nil {
+		t.Fatalf("projectCodexSessionIdentity() error = %v", err)
+	}
+	if identityState.promptCacheKey != state.identity.SessionID {
+		t.Fatalf("identity confuse prompt cache mapping = %q, want %q", identityState.promptCacheKey, state.identity.SessionID)
+	}
+	if got := gjson.GetBytes(projected, "prompt_cache_key").String(); got != state.identity.SessionID {
+		t.Fatalf("prompt_cache_key = %q, want %q", got, state.identity.SessionID)
+	}
+	restored := applyCodexIdentityExposeResponsePayload(
+		[]byte(`{"prompt_cache_key":"`+state.identity.SessionID+`"}`), identityState,
+	)
+	if got := gjson.GetBytes(restored, "prompt_cache_key").String(); got != "body-session" {
+		t.Fatalf("restored prompt_cache_key = %q, want body-session", got)
 	}
 }
 
@@ -347,15 +423,16 @@ func TestCodexConvergedFingerprintReplacesInvalidPersistedInstallationID(t *test
 	}
 }
 
-func TestCodexConvergedFingerprintKeepsValidPersistedInstallationID(t *testing.T) {
+func TestCodexConvergedFingerprintMigratesPersistedInstallationIDToAccountRoot(t *testing.T) {
 	persisted := uuid.NewString()
 	auth := &cliproxyauth.Auth{ID: "auth", Provider: "codex", Metadata: map[string]any{
 		"account_id": "account-1", "openai_device_id": persisted,
 	}}
 
 	got := resolveCodexConvergedFingerprint(auth, codexPreparedSessionIdentity{}, "")
-	if got.installationID != persisted {
-		t.Fatalf("installation ID = %q, want persisted %q", got.installationID, persisted)
+	want := deriveStableCodexFingerprintUUID("installation", "account-1")
+	if got.installationID != want {
+		t.Fatalf("installation ID = %q, want account-derived %q", got.installationID, want)
 	}
 }
 
@@ -377,6 +454,9 @@ func TestCodexPrepareRequestAuthGeneratesPersistentInstallationID(t *testing.T) 
 	if errParse != nil || parsed.Version() != 4 {
 		t.Fatalf("prepared installation ID = %q, want UUIDv4", installationID)
 	}
+	if want := deriveStableCodexFingerprintUUID("installation", "account-1"); installationID != want {
+		t.Fatalf("prepared installation ID = %q, want account-derived %q", installationID, want)
+	}
 	if got := codexMetadataString(auth.Metadata, "openai_device_id"); got != "invalid" {
 		t.Fatalf("caller installation ID = %q, want unchanged invalid value", got)
 	}
@@ -397,8 +477,8 @@ func TestCodexPrepareRequestAuthGeneratesPersistentInstallationID(t *testing.T) 
 	if errOther != nil {
 		t.Fatalf("other PrepareRequestAuth() error = %v", errOther)
 	}
-	if got := codexMetadataString(other.Metadata, "openai_device_id"); got == installationID {
-		t.Fatalf("separate credentials share installation ID %q", got)
+	if got := codexMetadataString(other.Metadata, "openai_device_id"); got != installationID {
+		t.Fatalf("same-account credential installation ID = %q, want %q", got, installationID)
 	}
 	projected, state, errProject := executor.projectCodexSessionIdentity(
 		t.Context(),
@@ -416,6 +496,25 @@ func TestCodexPrepareRequestAuthGeneratesPersistentInstallationID(t *testing.T) 
 	}
 	if state.identity.InstallationID != installationID {
 		t.Fatalf("identity installation ID = %q, want persisted %q", state.identity.InstallationID, installationID)
+	}
+}
+
+func TestCodexPrepareRequestAuthKeepsPersistedInstallationWithoutAccountID(t *testing.T) {
+	executor := NewCodexExecutor(&config.Config{})
+	installationID := uuid.NewString()
+	auth := &cliproxyauth.Auth{ID: "oauth-auth", Provider: "codex", Metadata: map[string]any{
+		"type": "codex", "openai_device_id": installationID,
+	}}
+
+	if executor.ShouldPrepareRequestAuth(auth) {
+		t.Fatal("valid persisted installation ID without account ID requires preparation")
+	}
+	prepared, err := executor.PrepareRequestAuth(t.Context(), auth)
+	if err != nil {
+		t.Fatalf("PrepareRequestAuth() error = %v", err)
+	}
+	if got := codexMetadataString(prepared.Metadata, "openai_device_id"); got != installationID {
+		t.Fatalf("installation ID = %q, want persisted %q", got, installationID)
 	}
 }
 

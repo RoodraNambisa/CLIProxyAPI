@@ -60,29 +60,20 @@ func resolveCodexConvergedFingerprint(auth *cliproxyauth.Auth, prepared codexPre
 		return codexConvergedFingerprint{mode: mode}
 	}
 
-	seed := strings.TrimSpace(codexauth.EffectiveRequestAccountID(auth.Metadata))
-	if seed == "" {
-		seed = strings.TrimSpace(auth.ID)
-	}
-	if seed == "" {
+	installationID := expectedCodexInstallationID(auth)
+	if installationID == "" {
 		return codexConvergedFingerprint{mode: codexauth.FingerprintModeOff}
-	}
-	installationID := codexMetadataString(auth.Metadata, "openai_device_id")
-	if parsedInstallationID, err := uuid.Parse(installationID); err == nil {
-		installationID = parsedInstallationID.String()
-	} else {
-		installationID = deriveStableCodexFingerprintUUID("installation", seed)
 	}
 	resolved := codexConvergedFingerprint{mode: mode, installationID: installationID}
 	if mode == codexauth.FingerprintModeDevice {
 		return resolved
 	}
 
-	resolved.sessionID = deriveStableCodexFingerprintUUID("session", seed)
+	resolved.sessionID = deriveStableCodexFingerprintUUID("session", installationID)
 	if mode == codexauth.FingerprintModeFull {
 		resolved.threadID = resolved.sessionID
 	} else if clientSessionID != "" {
-		resolved.threadID = deriveStableCodexFingerprintUUID("thread", seed+"\x00"+clientSessionID)
+		resolved.threadID = deriveStableCodexFingerprintUUID("thread", installationID+"\x00"+clientSessionID)
 	} else {
 		resolved.threadID = resolved.sessionID
 	}
@@ -100,9 +91,12 @@ func codexInstallationIDNeedsPreparation(auth *cliproxyauth.Auth) bool {
 		codexauth.EffectiveFingerprintMode(auth.Metadata) == codexauth.FingerprintModeOff {
 		return false
 	}
-	installationID := codexMetadataString(auth.Metadata, "openai_device_id")
-	parsed, err := uuid.Parse(installationID)
-	return err != nil || installationID != parsed.String()
+	installationID := canonicalCodexInstallationID(codexMetadataString(auth.Metadata, "openai_device_id"))
+	expected := derivedCodexAccountInstallationID(auth)
+	if expected != "" {
+		return installationID != expected
+	}
+	return installationID == ""
 }
 
 func prepareCodexInstallationID(auth *cliproxyauth.Auth) (*cliproxyauth.Auth, bool) {
@@ -113,8 +107,41 @@ func prepareCodexInstallationID(auth *cliproxyauth.Auth) (*cliproxyauth.Auth, bo
 	if updated.Metadata == nil {
 		updated.Metadata = make(map[string]any)
 	}
-	updated.Metadata["openai_device_id"] = uuid.NewString()
+	installationID := derivedCodexAccountInstallationID(updated)
+	if installationID == "" {
+		installationID = uuid.NewString()
+	}
+	updated.Metadata["openai_device_id"] = installationID
 	return updated, true
+}
+
+func expectedCodexInstallationID(auth *cliproxyauth.Auth) string {
+	if installationID := derivedCodexAccountInstallationID(auth); installationID != "" {
+		return installationID
+	}
+	if auth == nil {
+		return ""
+	}
+	return canonicalCodexInstallationID(codexMetadataString(auth.Metadata, "openai_device_id"))
+}
+
+func derivedCodexAccountInstallationID(auth *cliproxyauth.Auth) string {
+	if auth == nil {
+		return ""
+	}
+	accountID := strings.TrimSpace(codexauth.EffectiveRequestAccountID(auth.Metadata))
+	if accountID == "" {
+		return ""
+	}
+	return deriveStableCodexFingerprintUUID("installation", accountID)
+}
+
+func canonicalCodexInstallationID(value string) string {
+	parsed, err := uuid.Parse(strings.TrimSpace(value))
+	if err != nil || parsed == uuid.Nil {
+		return ""
+	}
+	return parsed.String()
 }
 
 func deriveStableCodexFingerprintUUID(kind, seed string) string {
