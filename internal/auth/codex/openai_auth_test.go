@@ -24,6 +24,62 @@ func TestNewCodexAuthDoesNotSetRequestTimeout(t *testing.T) {
 	}
 }
 
+func TestCodexAuthAppliesConfiguredSoftwareIdentityWithoutVersion(t *testing.T) {
+	auth := NewCodexAuth(&config.Config{
+		CodexHeaderDefaults: config.CodexHeaderDefaults{UserAgent: "codex-tui/0.150.0 (Linux; arm64)"},
+	})
+	req, err := http.NewRequest(http.MethodPost, TokenURL, nil)
+	if err != nil {
+		t.Fatalf("NewRequest() error = %v", err)
+	}
+	auth.applySoftwareIdentityHeaders(req)
+	if got := req.Header.Get("User-Agent"); got != "codex-tui/0.150.0 (Linux; arm64)" {
+		t.Fatalf("User-Agent = %q, want configured identity", got)
+	}
+	if got := req.Header.Get("Originator"); got != "codex-tui" {
+		t.Fatalf("Originator = %q, want codex-tui", got)
+	}
+	if got := req.Header.Get("Version"); got != "" {
+		t.Fatalf("Version = %q, want empty on OAuth requests", got)
+	}
+}
+
+func TestCodexAuthSkipsSoftwareIdentityWhenDisabled(t *testing.T) {
+	disabled := false
+	auth := NewCodexAuth(&config.Config{Codex: config.CodexConfig{EnforceSoftwareIdentity: &disabled}})
+	auth.SetSoftwareIdentityUserAgent("credential-client/0.153.0 (Linux; arm64)")
+	req, err := http.NewRequest(http.MethodPost, TokenURL, nil)
+	if err != nil {
+		t.Fatalf("NewRequest() error = %v", err)
+	}
+	auth.applySoftwareIdentityHeaders(req)
+	if got := req.Header.Get("User-Agent"); got != "" {
+		t.Fatalf("User-Agent = %q, want empty", got)
+	}
+	if got := req.Header.Get("Originator"); got != "" {
+		t.Fatalf("Originator = %q, want empty", got)
+	}
+}
+
+func TestCodexAuthOverridesSoftwareIdentityForCredentialRefresh(t *testing.T) {
+	auth := NewCodexAuth(&config.Config{})
+	auth.SetSoftwareIdentityUserAgent("credential-client/0.153.0 (Linux; arm64)")
+	req, err := http.NewRequest(http.MethodPost, TokenURL, nil)
+	if err != nil {
+		t.Fatalf("NewRequest() error = %v", err)
+	}
+	auth.applySoftwareIdentityHeaders(req)
+	if got := req.Header.Get("User-Agent"); got != "credential-client/0.153.0 (Linux; arm64)" {
+		t.Fatalf("User-Agent = %q, want credential identity", got)
+	}
+	if got := req.Header.Get("Originator"); got != "credential-client" {
+		t.Fatalf("Originator = %q, want credential-client", got)
+	}
+	if got := req.Header.Get("Version"); got != "" {
+		t.Fatalf("Version = %q, want empty on OAuth requests", got)
+	}
+}
+
 func TestRefreshTokensUsesIndependentTimeout(t *testing.T) {
 	callerCtx, cancelCaller := context.WithCancel(context.Background())
 	cancelCaller()

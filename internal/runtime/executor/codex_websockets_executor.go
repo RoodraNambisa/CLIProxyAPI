@@ -1179,6 +1179,7 @@ func prepareCodexWebsocketHeadersForURL(ctx context.Context, headers http.Header
 	if ginCtx, ok := ctx.Value("gin").(*gin.Context); ok && ginCtx != nil && ginCtx.Request != nil {
 		ginHeaders = ginCtx.Request.Header.Clone()
 	}
+	clientBetaFeatures := firstCodexHeaderValue("X-Codex-Beta-Features", headers, ginHeaders)
 
 	isAPIKey := codexAuthUsesAPIKey(auth)
 	cfgUserAgent, cfgOriginator, cfgBetaFeatures := codexHeaderDefaults(cfg, auth)
@@ -1229,6 +1230,8 @@ func prepareCodexWebsocketHeadersForURL(ctx context.Context, headers http.Header
 		attrs = auth.Attributes
 	}
 	util.ApplyCustomHeadersFromAttrs(&http.Request{Header: headers}, attrs)
+	applyCodexSoftwareIdentity(headers, auth, cfg)
+	applyCodexBetaFeatures(headers, auth, cfg, clientBetaFeatures)
 	authorization, err := codexauth.AuthorizationHeader(authMetadata(auth), token, time.Now())
 	if err != nil {
 		return nil, fmt.Errorf("codex websockets executor: build authorization: %w", err)

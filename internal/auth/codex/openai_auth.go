@@ -32,7 +32,8 @@ const (
 // It manages the HTTP client and provides methods for generating authorization URLs,
 // exchanging authorization codes for tokens, and refreshing access tokens.
 type CodexAuth struct {
-	httpClient *http.Client
+	httpClient       *http.Client
+	softwareIdentity *SoftwareIdentity
 }
 
 // NewCodexAuth creates a new CodexAuth service instance.
@@ -53,9 +54,16 @@ func NewCodexAuthWithProxyURL(cfg *config.Config, proxyURL string) *CodexAuth {
 		}
 	}
 	sdkCfg.ProxyURL = effectiveProxyURL
-	return &CodexAuth{
-		httpClient: util.SetProxy(&sdkCfg, &http.Client{}),
+	auth := &CodexAuth{httpClient: util.SetProxy(&sdkCfg, &http.Client{})}
+	if cfg == nil || cfg.Codex.ResolvedEnforceSoftwareIdentity() {
+		userAgent := ""
+		if cfg != nil {
+			userAgent = cfg.CodexHeaderDefaults.UserAgent
+		}
+		identity := ResolveSoftwareIdentity(userAgent)
+		auth.softwareIdentity = &identity
 	}
+	return auth
 }
 
 // GenerateAuthURL creates the OAuth authorization URL with PKCE (Proof Key for Code Exchange).
@@ -117,6 +125,7 @@ func (o *CodexAuth) ExchangeCodeForTokensWithRedirect(ctx context.Context, code,
 
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Set("Accept", "application/json")
+	o.applySoftwareIdentityHeaders(req)
 
 	resp, err := o.httpClient.Do(req)
 	if err != nil {
@@ -205,6 +214,7 @@ func (o *CodexAuth) RefreshTokens(ctx context.Context, refreshToken string) (*Co
 
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Set("Accept", "application/json")
+	o.applySoftwareIdentityHeaders(req)
 
 	resp, err := o.httpClient.Do(req)
 	if err != nil {
@@ -256,6 +266,25 @@ func (o *CodexAuth) RefreshTokens(ctx context.Context, refreshToken string) (*Co
 		Email:        email,
 		Expire:       time.Now().Add(time.Duration(tokenResp.ExpiresIn) * time.Second).Format(time.RFC3339),
 	}, nil
+}
+
+func (o *CodexAuth) applySoftwareIdentityHeaders(req *http.Request) {
+	if o == nil || o.softwareIdentity == nil || req == nil {
+		return
+	}
+	req.Header.Set("User-Agent", o.softwareIdentity.UserAgent)
+	req.Header.Set("Originator", o.softwareIdentity.Originator)
+}
+
+// SetSoftwareIdentityUserAgent overrides the software identity used for OAuth
+// requests. Callers use this to keep credential-specific model and refresh
+// requests on the same outbound identity.
+func (o *CodexAuth) SetSoftwareIdentityUserAgent(userAgent string) {
+	if o == nil || o.softwareIdentity == nil {
+		return
+	}
+	identity := ResolveSoftwareIdentity(userAgent)
+	o.softwareIdentity = &identity
 }
 
 // CreateTokenStorage creates a new CodexTokenStorage from a CodexAuthBundle.

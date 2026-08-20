@@ -212,6 +212,7 @@ func TestWriteOrderedHTTP1RequestCodexOrder(t *testing.T) {
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Originator", "Codex Desktop")
 	req.Header.Set("User-Agent", "Codex Desktop/0.136.0-alpha.2")
+	req.Header.Set("Version", "0.136.0-alpha.2")
 	req.Header.Set("Connection", "Keep-Alive")
 	req.ContentLength = int64(len(body))
 
@@ -236,6 +237,7 @@ func TestWriteOrderedHTTP1RequestCodexOrder(t *testing.T) {
 		"content-type: application/json",
 		"originator: Codex Desktop",
 		"user-agent: Codex Desktop/0.136.0-alpha.2",
+		"version: 0.136.0-alpha.2",
 		"host: chatgpt.com",
 		"content-length: 23",
 	}

@@ -271,6 +271,9 @@ func BuildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 	if oldCfg.Codex.ResolvedTurnStatePolicy() != newCfg.Codex.ResolvedTurnStatePolicy() {
 		changes = append(changes, fmt.Sprintf("codex.turn-state-policy: %s -> %s", oldCfg.Codex.ResolvedTurnStatePolicy(), newCfg.Codex.ResolvedTurnStatePolicy()))
 	}
+	if oldCfg.Codex.ResolvedEnforceSoftwareIdentity() != newCfg.Codex.ResolvedEnforceSoftwareIdentity() {
+		changes = append(changes, fmt.Sprintf("codex.enforce-software-identity: %t -> %t", oldCfg.Codex.ResolvedEnforceSoftwareIdentity(), newCfg.Codex.ResolvedEnforceSoftwareIdentity()))
+	}
 	if oldCfg.ChatGPTWeb.TokenUsageEstimationEnabled() != newCfg.ChatGPTWeb.TokenUsageEstimationEnabled() {
 		changes = append(changes, fmt.Sprintf("chatgpt-web.estimate-token-usage: %t -> %t", oldCfg.ChatGPTWeb.TokenUsageEstimationEnabled(), newCfg.ChatGPTWeb.TokenUsageEstimationEnabled()))
 	}

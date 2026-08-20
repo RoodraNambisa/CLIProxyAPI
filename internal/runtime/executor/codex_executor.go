@@ -32,8 +32,8 @@ import (
 )
 
 const (
-	codexUserAgent             = "codex_cli_rs/0.146.0 (Mac OS 26.5.0; arm64) iTerm.app/3.6.10"
-	codexOriginator            = "codex_cli_rs"
+	codexUserAgent             = codexauth.DefaultUserAgent
+	codexOriginator            = codexauth.DefaultOriginator
 	codexDefaultImageToolModel = "gpt-image-2"
 	codexSSEMaxFrameBytes      = 52_428_800
 )
@@ -626,7 +626,10 @@ func (e *CodexExecutor) PrepareRequest(req *http.Request, auth *cliproxyauth.Aut
 	if auth != nil {
 		attrs = auth.Attributes
 	}
+	clientBetaFeatures := headerValueCaseInsensitive(req.Header, "X-Codex-Beta-Features")
 	util.ApplyCustomHeadersFromAttrs(req, attrs)
+	applyCodexSoftwareIdentity(req.Header, auth, e.cfg)
+	applyCodexBetaFeatures(req.Header, auth, e.cfg, clientBetaFeatures)
 	authorization, err := codexauth.AuthorizationHeader(authMetadata(auth), apiKey, time.Now())
 	if err != nil {
 		return fmt.Errorf("codex executor: build authorization: %w", err)
@@ -1581,6 +1584,11 @@ func (e *CodexExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*
 		return auth, nil
 	}
 	svc := codexauth.NewCodexAuthWithProxyURL(e.cfg, auth.EffectiveProxyURL())
+	if codexEnforceSoftwareIdentity(e.cfg) {
+		if userAgent := codexCustomHeaderValue(auth, "User-Agent"); userAgent != "" {
+			svc.SetSoftwareIdentityUserAgent(userAgent)
+		}
+	}
 	td, err := svc.RefreshTokensWithRetry(ctx, refreshToken, 3)
 	if err != nil {
 		return nil, err
@@ -2089,9 +2097,10 @@ func applyCodexDirectImageHeaders(r *http.Request, auth *cliproxyauth.Auth, toke
 
 func applyCodexHeadersFromSources(r *http.Request, auth *cliproxyauth.Auth, token string, stream bool, cfg *config.Config, ginHeaders http.Header) error {
 	r.Header.Set("Content-Type", "application/json")
+	clientBetaFeatures := firstCodexHeaderValue("X-Codex-Beta-Features", r.Header, ginHeaders)
 
-	if ginHeaders.Get("X-Codex-Beta-Features") != "" {
-		r.Header.Set("X-Codex-Beta-Features", ginHeaders.Get("X-Codex-Beta-Features"))
+	if clientBetaFeatures != "" {
+		r.Header.Set("X-Codex-Beta-Features", clientBetaFeatures)
 	}
 	misc.EnsureHeader(r.Header, ginHeaders, "Version", "")
 	misc.EnsureHeader(r.Header, ginHeaders, "X-Codex-Turn-Metadata", "")
@@ -2140,6 +2149,8 @@ func applyCodexHeadersFromSources(r *http.Request, auth *cliproxyauth.Auth, toke
 	}
 	util.ApplyCustomHeadersFromAttrs(r, attrs)
 	normalizeCodexHTTPSessionHeader(r.Header, codexCustomHTTPSessionHeader(attrs))
+	applyCodexSoftwareIdentity(r.Header, auth, cfg)
+	applyCodexBetaFeatures(r.Header, auth, cfg, clientBetaFeatures)
 	authorization, err := codexauth.AuthorizationHeader(authMetadata(auth), token, time.Now())
 	if err != nil {
 		return fmt.Errorf("codex executor: build authorization: %w", err)
@@ -2148,6 +2159,66 @@ func applyCodexHeadersFromSources(r *http.Request, auth *cliproxyauth.Auth, toke
 		r.Header.Set("Authorization", authorization)
 	}
 	return nil
+}
+
+func applyCodexSoftwareIdentity(headers http.Header, auth *cliproxyauth.Auth, cfg *config.Config) {
+	if headers == nil || codexAuthUsesAPIKey(auth) || !codexEnforceSoftwareIdentity(cfg) {
+		return
+	}
+	candidate := codexCustomHeaderValue(auth, "User-Agent")
+	if candidate == "" && cfg != nil {
+		candidate = strings.TrimSpace(cfg.CodexHeaderDefaults.UserAgent)
+	}
+	identity := codexauth.ResolveSoftwareIdentity(candidate)
+	deleteHeaderCaseInsensitive(headers, "User-Agent")
+	deleteHeaderCaseInsensitive(headers, "Originator")
+	deleteHeaderCaseInsensitive(headers, "Version")
+	setHeaderCasePreserved(headers, "User-Agent", identity.UserAgent)
+	setHeaderCasePreserved(headers, "Originator", identity.Originator)
+	setHeaderCasePreserved(headers, "Version", identity.Version)
+}
+
+func applyCodexBetaFeatures(headers http.Header, auth *cliproxyauth.Auth, cfg *config.Config, clientValue string) {
+	if headers == nil || codexAuthUsesAPIKey(auth) {
+		return
+	}
+	value := codexCustomHeaderValue(auth, "X-Codex-Beta-Features")
+	if value == "" {
+		value = strings.TrimSpace(clientValue)
+	}
+	if value == "" && cfg != nil {
+		value = strings.TrimSpace(cfg.CodexHeaderDefaults.BetaFeatures)
+	}
+	deleteHeaderCaseInsensitive(headers, "X-Codex-Beta-Features")
+	if value != "" {
+		setHeaderCasePreserved(headers, "X-Codex-Beta-Features", value)
+	}
+}
+
+func codexEnforceSoftwareIdentity(cfg *config.Config) bool {
+	return cfg == nil || cfg.Codex.ResolvedEnforceSoftwareIdentity()
+}
+
+func codexCustomHeaderValue(auth *cliproxyauth.Auth, name string) string {
+	if auth == nil {
+		return ""
+	}
+	for key, value := range auth.Attributes {
+		if !strings.HasPrefix(key, "header:") || !strings.EqualFold(strings.TrimSpace(strings.TrimPrefix(key, "header:")), name) {
+			continue
+		}
+		return strings.TrimSpace(value)
+	}
+	return ""
+}
+
+func firstCodexHeaderValue(name string, sources ...http.Header) string {
+	for _, source := range sources {
+		if value := headerValueCaseInsensitive(source, name); value != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 func ensureCodexHTTPSessionHeader(target, source http.Header) {

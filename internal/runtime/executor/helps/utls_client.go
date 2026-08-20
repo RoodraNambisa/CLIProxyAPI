@@ -180,6 +180,7 @@ var codexHTTP1HeaderOrder = []orderedHeaderSpec{
 	{wireName: "content-type", keys: []string{"content-type"}},
 	{wireName: "originator", keys: []string{"originator"}},
 	{wireName: "user-agent", keys: []string{"user-agent"}},
+	{wireName: "version", keys: []string{"version"}},
 	{wireName: "cookie", keys: []string{"cookie"}},
 	{wireName: "host", keys: []string{"host"}},
 	{wireName: "content-length", keys: []string{"content-length"}},

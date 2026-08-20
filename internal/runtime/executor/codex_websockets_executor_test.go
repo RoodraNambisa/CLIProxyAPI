@@ -858,8 +858,8 @@ func TestApplyCodexWebsocketHeadersDefaultsToCurrentResponsesBeta(t *testing.T) 
 	if got := headers.Get("Originator"); got != codexOriginator {
 		t.Fatalf("Originator = %s, want %s", got, codexOriginator)
 	}
-	if got := headers.Get("Version"); got != "" {
-		t.Fatalf("Version = %q, want empty", got)
+	if got := headers.Get("Version"); got != "0.146.0" {
+		t.Fatalf("Version = %q, want 0.146.0", got)
 	}
 	if got := headers.Get("x-codex-beta-features"); got != "" {
 		t.Fatalf("x-codex-beta-features = %q, want empty", got)
@@ -878,7 +878,28 @@ func TestApplyCodexWebsocketHeadersDefaultsToCurrentResponsesBeta(t *testing.T) 
 	}
 }
 
+func TestApplyCodexWebsocketHeadersIgnoresClientUserAgentWhenEnforced(t *testing.T) {
+	auth := &cliproxyauth.Auth{Provider: "codex"}
+	ctx := contextWithGinHeaders(map[string]string{
+		"User-Agent": "codex-tui/0.150.0 (Linux; arm64)",
+	})
+
+	headers := applyCodexWebsocketHeaders(ctx, http.Header{}, auth, "", &config.Config{})
+
+	if got := headers.Get("User-Agent"); got != codexUserAgent {
+		t.Fatalf("User-Agent = %q, want canonical %q", got, codexUserAgent)
+	}
+	if got := headers.Get("Originator"); got != codexOriginator {
+		t.Fatalf("Originator = %q, want %q", got, codexOriginator)
+	}
+	if got := headers.Get("Version"); got != "0.146.0" {
+		t.Fatalf("Version = %q, want 0.146.0", got)
+	}
+}
+
 func TestApplyCodexWebsocketHeadersPassesThroughClientIdentityHeaders(t *testing.T) {
+	disabled := false
+	cfg := &config.Config{Codex: config.CodexConfig{EnforceSoftwareIdentity: &disabled}}
 	auth := &cliproxyauth.Auth{
 		Provider: "codex",
 		Metadata: map[string]any{"email": "user@example.com"},
@@ -892,7 +913,7 @@ func TestApplyCodexWebsocketHeadersPassesThroughClientIdentityHeaders(t *testing
 		"session_id":            "sess-client",
 	})
 
-	headers := applyCodexWebsocketHeaders(ctx, http.Header{}, auth, "", nil)
+	headers := applyCodexWebsocketHeaders(ctx, http.Header{}, auth, "", cfg)
 
 	if got := headers.Get("Originator"); got != "Codex Desktop" {
 		t.Fatalf("Originator = %s, want %s", got, "Codex Desktop")
@@ -920,7 +941,7 @@ func TestApplyCodexWebsocketHeadersPassesThroughClientIdentityHeaders(t *testing
 func TestApplyCodexWebsocketHeadersUsesConfigDefaultsForOAuth(t *testing.T) {
 	cfg := &config.Config{
 		CodexHeaderDefaults: config.CodexHeaderDefaults{
-			UserAgent:    "my-codex-client/1.0",
+			UserAgent:    "my-codex-client/1.0.0",
 			BetaFeatures: "feature-a,feature-b",
 		},
 	}
@@ -931,8 +952,14 @@ func TestApplyCodexWebsocketHeadersUsesConfigDefaultsForOAuth(t *testing.T) {
 
 	headers := applyCodexWebsocketHeaders(context.Background(), http.Header{}, auth, "", cfg)
 
-	if got := headers.Get("User-Agent"); got != "my-codex-client/1.0" {
-		t.Fatalf("User-Agent = %s, want %s", got, "my-codex-client/1.0")
+	if got := headers.Get("User-Agent"); got != "my-codex-client/1.0.0" {
+		t.Fatalf("User-Agent = %s, want %s", got, "my-codex-client/1.0.0")
+	}
+	if got := headers.Get("Originator"); got != "my-codex-client" {
+		t.Fatalf("Originator = %s, want my-codex-client", got)
+	}
+	if got := headers.Get("Version"); got != "1.0.0" {
+		t.Fatalf("Version = %s, want 1.0.0", got)
 	}
 	if got := headers.Get("x-codex-beta-features"); got != "feature-a,feature-b" {
 		t.Fatalf("x-codex-beta-features = %s, want %s", got, "feature-a,feature-b")
@@ -943,7 +970,9 @@ func TestApplyCodexWebsocketHeadersUsesConfigDefaultsForOAuth(t *testing.T) {
 }
 
 func TestApplyCodexWebsocketHeadersPrefersExistingHeadersOverClientAndConfig(t *testing.T) {
+	disabled := false
 	cfg := &config.Config{
+		Codex: config.CodexConfig{EnforceSoftwareIdentity: &disabled},
 		CodexHeaderDefaults: config.CodexHeaderDefaults{
 			UserAgent:    "config-ua",
 			Originator:   "config-originator",
@@ -975,7 +1004,7 @@ func TestApplyCodexWebsocketHeadersPrefersExistingHeadersOverClientAndConfig(t *
 func TestApplyCodexWebsocketHeadersConfigUserAgentOverridesClientHeader(t *testing.T) {
 	cfg := &config.Config{
 		CodexHeaderDefaults: config.CodexHeaderDefaults{
-			UserAgent:    "config-ua",
+			UserAgent:    "config-client/0.150.0 (Linux; arm64)",
 			Originator:   "config-originator",
 			BetaFeatures: "config-beta",
 		},
@@ -991,8 +1020,8 @@ func TestApplyCodexWebsocketHeadersConfigUserAgentOverridesClientHeader(t *testi
 
 	headers := applyCodexWebsocketHeaders(ctx, http.Header{}, auth, "", cfg)
 
-	if got := headers.Get("User-Agent"); got != "config-ua" {
-		t.Fatalf("User-Agent = %s, want %s", got, "config-ua")
+	if got := headers.Get("User-Agent"); got != "config-client/0.150.0 (Linux; arm64)" {
+		t.Fatalf("User-Agent = %s, want configured identity", got)
 	}
 	if got := headers.Get("x-codex-beta-features"); got != "client-beta" {
 		t.Fatalf("x-codex-beta-features = %s, want %s", got, "client-beta")
@@ -1603,7 +1632,7 @@ func TestApplyCodexHeadersUsesConfigUserAgentForOAuth(t *testing.T) {
 	}
 	cfg := &config.Config{
 		CodexHeaderDefaults: config.CodexHeaderDefaults{
-			UserAgent:    "config-ua",
+			UserAgent:    "config-client/0.150.0 (Linux; arm64)",
 			Originator:   "config-originator",
 			BetaFeatures: "config-beta",
 		},
@@ -1618,14 +1647,104 @@ func TestApplyCodexHeadersUsesConfigUserAgentForOAuth(t *testing.T) {
 
 	applyCodexHeaders(req, auth, "oauth-token", true, cfg)
 
-	if got := req.Header.Get("User-Agent"); got != "config-ua" {
-		t.Fatalf("User-Agent = %s, want %s", got, "config-ua")
+	if got := req.Header.Get("User-Agent"); got != "config-client/0.150.0 (Linux; arm64)" {
+		t.Fatalf("User-Agent = %s, want configured identity", got)
 	}
-	if got := req.Header.Get("Originator"); got != "config-originator" {
-		t.Fatalf("Originator = %s, want %s", got, "config-originator")
+	if got := req.Header.Get("Originator"); got != "config-client" {
+		t.Fatalf("Originator = %s, want config-client", got)
 	}
-	if got := req.Header.Get("x-codex-beta-features"); got != "" {
-		t.Fatalf("x-codex-beta-features = %q, want empty", got)
+	if got := req.Header.Get("Version"); got != "0.150.0" {
+		t.Fatalf("Version = %s, want 0.150.0", got)
+	}
+	if got := req.Header.Get("x-codex-beta-features"); got != "config-beta" {
+		t.Fatalf("x-codex-beta-features = %q, want config-beta", got)
+	}
+}
+
+func TestApplyCodexHeadersIgnoresClientUserAgentWhenEnforced(t *testing.T) {
+	req, err := http.NewRequest(http.MethodPost, "https://example.com/responses", nil)
+	if err != nil {
+		t.Fatalf("NewRequest() error = %v", err)
+	}
+	req = req.WithContext(contextWithGinHeaders(map[string]string{
+		"User-Agent": "codex-tui/0.150.0 (Linux; arm64)",
+	}))
+	auth := &cliproxyauth.Auth{Provider: "codex"}
+
+	if errApply := applyCodexHeaders(req, auth, "oauth-token", false, &config.Config{}); errApply != nil {
+		t.Fatalf("applyCodexHeaders() error = %v", errApply)
+	}
+	if got := req.Header.Get("User-Agent"); got != codexUserAgent {
+		t.Fatalf("User-Agent = %q, want canonical %q", got, codexUserAgent)
+	}
+	if got := req.Header.Get("Originator"); got != codexOriginator {
+		t.Fatalf("Originator = %q, want %q", got, codexOriginator)
+	}
+	if got := req.Header.Get("Version"); got != "0.146.0" {
+		t.Fatalf("Version = %q, want 0.146.0", got)
+	}
+}
+
+func TestApplyCodexHeadersUpgradesOldConfiguredVersionWithoutMutation(t *testing.T) {
+	const configuredUserAgent = "codex-tui/0.143.9 (Linux; arm64) tmux/3.5"
+	cfg := &config.Config{CodexHeaderDefaults: config.CodexHeaderDefaults{UserAgent: configuredUserAgent}}
+	req, err := http.NewRequest(http.MethodPost, "https://example.com/responses", nil)
+	if err != nil {
+		t.Fatalf("NewRequest() error = %v", err)
+	}
+	auth := &cliproxyauth.Auth{Provider: "codex"}
+
+	if errApply := applyCodexHeaders(req, auth, "oauth-token", false, cfg); errApply != nil {
+		t.Fatalf("applyCodexHeaders() error = %v", errApply)
+	}
+	if got := req.Header.Get("User-Agent"); got != "codex-tui/0.146.0 (Linux; arm64) tmux/3.5" {
+		t.Fatalf("User-Agent = %q, want upgraded version with preserved shape", got)
+	}
+	if got := req.Header.Get("Originator"); got != "codex-tui" {
+		t.Fatalf("Originator = %q, want codex-tui", got)
+	}
+	if got := req.Header.Get("Version"); got != "0.146.0" {
+		t.Fatalf("Version = %q, want 0.146.0", got)
+	}
+	if cfg.CodexHeaderDefaults.UserAgent != configuredUserAgent {
+		t.Fatalf("configured User-Agent mutated to %q", cfg.CodexHeaderDefaults.UserAgent)
+	}
+}
+
+func TestApplyCodexHeadersPrefersCredentialSoftwareIdentityAndBetaFeatures(t *testing.T) {
+	req, err := http.NewRequest(http.MethodPost, "https://example.com/responses", nil)
+	if err != nil {
+		t.Fatalf("NewRequest() error = %v", err)
+	}
+	req = req.WithContext(contextWithGinHeaders(map[string]string{
+		"User-Agent":            "client/0.151.0",
+		"X-Codex-Beta-Features": "client-beta",
+	}))
+	cfg := &config.Config{CodexHeaderDefaults: config.CodexHeaderDefaults{
+		UserAgent:    "configured/0.152.0",
+		BetaFeatures: "configured-beta",
+	}}
+	auth := &cliproxyauth.Auth{Provider: "codex", Attributes: map[string]string{
+		"header:User-Agent":            "credential-client/0.153.0 (Linux; arm64)",
+		"header:Originator":            "wrong-originator",
+		"header:Version":               "9.9.9",
+		"header:X-Codex-Beta-Features": "credential-beta",
+	}}
+
+	if errApply := applyCodexHeaders(req, auth, "oauth-token", false, cfg); errApply != nil {
+		t.Fatalf("applyCodexHeaders() error = %v", errApply)
+	}
+	if got := req.Header.Get("User-Agent"); got != "credential-client/0.153.0 (Linux; arm64)" {
+		t.Fatalf("User-Agent = %q, want credential identity", got)
+	}
+	if got := req.Header.Get("Originator"); got != "credential-client" {
+		t.Fatalf("Originator = %q, want credential-client", got)
+	}
+	if got := req.Header.Get("Version"); got != "0.153.0" {
+		t.Fatalf("Version = %q, want 0.153.0", got)
+	}
+	if got := req.Header.Get("X-Codex-Beta-Features"); got != "credential-beta" {
+		t.Fatalf("X-Codex-Beta-Features = %q, want credential-beta", got)
 	}
 }
 
@@ -1646,8 +1765,8 @@ func TestApplyCodexDirectImageHeadersIgnoresDownstreamUserAgent(t *testing.T) {
 	if got := req.Header.Get("User-Agent"); got == "client-ua" {
 		t.Fatalf("User-Agent = %s, want generated Codex default", got)
 	}
-	if got := req.Header.Get("Version"); got != "0.115.0-alpha.27" {
-		t.Fatalf("Version = %s, want %s", got, "0.115.0-alpha.27")
+	if got := req.Header.Get("Version"); got != "0.146.0" {
+		t.Fatalf("Version = %s, want 0.146.0", got)
 	}
 	if got := req.Header.Get("X-Client-Request-Id"); got != "req-1" {
 		t.Fatalf("X-Client-Request-Id = %s, want req-1", got)
@@ -1811,6 +1930,7 @@ func TestCodexAutoExecutorExecuteStream_WebsocketStripsPrefixedModelFromOutbound
 }
 
 func TestApplyCodexHeadersPassesThroughClientIdentityHeaders(t *testing.T) {
+	disabled := false
 	req, err := http.NewRequest(http.MethodPost, "https://example.com/responses", nil)
 	if err != nil {
 		t.Fatalf("NewRequest() error = %v", err)
@@ -1819,6 +1939,7 @@ func TestApplyCodexHeadersPassesThroughClientIdentityHeaders(t *testing.T) {
 		Provider: "codex",
 		Metadata: map[string]any{"email": "user@example.com"},
 	}
+	cfg := &config.Config{Codex: config.CodexConfig{EnforceSoftwareIdentity: &disabled}}
 	req = req.WithContext(contextWithGinHeaders(map[string]string{
 		"Originator":                             "Codex Desktop",
 		"Version":                                "0.115.0-alpha.27",
@@ -1830,7 +1951,7 @@ func TestApplyCodexHeadersPassesThroughClientIdentityHeaders(t *testing.T) {
 		"X-OpenAI-Internal-Codex-Responses-Lite": "true",
 	}))
 
-	applyCodexHeaders(req, auth, "oauth-token", true, nil)
+	applyCodexHeaders(req, auth, "oauth-token", true, cfg)
 
 	if got := req.Header.Get("Originator"); got != "Codex Desktop" {
 		t.Fatalf("Originator = %s, want %s", got, "Codex Desktop")
@@ -1934,8 +2055,8 @@ func TestApplyCodexHeadersDoesNotInjectClientOnlyHeadersByDefault(t *testing.T) 
 
 	applyCodexHeaders(req, nil, "oauth-token", true, nil)
 
-	if got := req.Header.Get("Version"); got != "" {
-		t.Fatalf("Version = %q, want empty", got)
+	if got := req.Header.Get("Version"); got != "0.146.0" {
+		t.Fatalf("Version = %q, want 0.146.0", got)
 	}
 	if got := req.Header.Get("X-Codex-Turn-Metadata"); got != "" {
 		t.Fatalf("X-Codex-Turn-Metadata = %q, want empty", got)

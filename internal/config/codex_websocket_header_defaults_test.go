@@ -21,6 +21,7 @@ codex-fingerprint:
 codex:
   identity-confuse: true
   spoof-session-identity: true
+  enforce-software-identity: false
 `)
 	if err := os.WriteFile(configPath, configYAML, 0o600); err != nil {
 		t.Fatalf("failed to write config: %v", err)
@@ -54,5 +55,18 @@ codex:
 	}
 	if !cfg.Codex.SpoofSessionIdentity {
 		t.Fatalf("Codex.SpoofSessionIdentity = false, want true")
+	}
+	if cfg.Codex.ResolvedEnforceSoftwareIdentity() {
+		t.Fatal("Codex.ResolvedEnforceSoftwareIdentity() = true, want false")
+	}
+}
+
+func TestCodexSoftwareIdentityDefaultsEnabled(t *testing.T) {
+	if !(CodexConfig{}).ResolvedEnforceSoftwareIdentity() {
+		t.Fatal("Codex software identity enforcement should default to enabled")
+	}
+	enabled := true
+	if !(CodexConfig{EnforceSoftwareIdentity: &enabled}).ResolvedEnforceSoftwareIdentity() {
+		t.Fatal("explicitly enabled Codex software identity enforcement resolved false")
 	}
 }

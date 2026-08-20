@@ -420,8 +420,8 @@ type Config struct {
 	// ChatGPTWeb configures provider-wide ChatGPT Web credential behavior.
 	ChatGPTWeb ChatGPTWebConfig `yaml:"chatgpt-web" json:"chatgpt-web"`
 
-	// CodexHeaderDefaults configures fallback headers for Codex OAuth model requests.
-	// These are used only when the client does not send its own headers.
+	// CodexHeaderDefaults configures canonical software identity and fallback
+	// feature headers for Codex OAuth model requests.
 	CodexHeaderDefaults CodexHeaderDefaults `yaml:"codex-header-defaults" json:"codex-header-defaults"`
 
 	// CodexFingerprint controls optional browser-style request fingerprinting for Codex upstreams.
@@ -526,9 +526,9 @@ type ClaudeHeaderDefaults struct {
 	StabilizeDeviceProfile *bool  `yaml:"stabilize-device-profile,omitempty" json:"stabilize-device-profile,omitempty"`
 }
 
-// CodexHeaderDefaults configures fallback header values injected into Codex
-// model requests for OAuth/file-backed auth when the client omits them.
-// UserAgent and Originator apply to HTTP and websocket requests; BetaFeatures only applies to websockets.
+// CodexHeaderDefaults configures header values injected into Codex model
+// requests for OAuth/file-backed auth. With software identity enforcement,
+// UserAgent is canonical; BetaFeatures remains a client fallback.
 type CodexHeaderDefaults struct {
 	UserAgent    string `yaml:"user-agent" json:"user-agent"`
 	Originator   string `yaml:"originator" json:"originator"`
@@ -537,9 +537,10 @@ type CodexHeaderDefaults struct {
 
 // CodexConfig configures provider-wide Codex request behavior.
 type CodexConfig struct {
-	IdentityConfuse      bool                 `yaml:"identity-confuse" json:"identity-confuse"`
-	SpoofSessionIdentity bool                 `yaml:"spoof-session-identity" json:"spoof-session-identity"`
-	TurnStatePolicy      CodexTurnStatePolicy `yaml:"turn-state-policy" json:"turn-state-policy"`
+	IdentityConfuse         bool                 `yaml:"identity-confuse" json:"identity-confuse"`
+	SpoofSessionIdentity    bool                 `yaml:"spoof-session-identity" json:"spoof-session-identity"`
+	TurnStatePolicy         CodexTurnStatePolicy `yaml:"turn-state-policy" json:"turn-state-policy"`
+	EnforceSoftwareIdentity *bool                `yaml:"enforce-software-identity,omitempty" json:"enforce-software-identity,omitempty"`
 }
 
 // CodexTurnStatePolicy controls how client turn-state headers are forwarded to Codex OAuth upstreams.
@@ -576,6 +577,12 @@ func (c CodexConfig) ResolvedTurnStatePolicy() CodexTurnStatePolicy {
 		return CodexTurnStatePolicyGuardCrossAccount
 	}
 	return policy
+}
+
+// ResolvedEnforceSoftwareIdentity returns whether Codex OAuth requests use a
+// normalized User-Agent, Originator, and Version tuple. The default is enabled.
+func (c CodexConfig) ResolvedEnforceSoftwareIdentity() bool {
+	return c.EnforceSoftwareIdentity == nil || *c.EnforceSoftwareIdentity
 }
 
 // ChatGPTWebConfig configures ChatGPT Web credential, usage, and Sentinel behavior.
@@ -2548,8 +2555,8 @@ func payloadRawString(value any) ([]byte, bool) {
 	}
 }
 
-// SanitizeCodexHeaderDefaults trims surrounding whitespace from the
-// configured Codex header fallback values.
+// SanitizeCodexHeaderDefaults trims surrounding whitespace from configured
+// Codex software identity and feature header values.
 func (cfg *Config) SanitizeCodexHeaderDefaults() {
 	if cfg == nil {
 		return

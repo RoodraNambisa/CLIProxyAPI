@@ -632,9 +632,10 @@ nonstream-keepalive-interval: 0
 #   stabilize-device-profile: false  # optional, default false; set true to enable per-auth/API-key fingerprint pinning
 
 # Default headers for Codex OAuth model requests.
-# These are used only for file-backed/OAuth Codex requests when the client
-# does not send the header. `user-agent` and `originator` apply to HTTP and
-# websocket requests; `beta-features` only applies to websocket requests.
+# With software identity enforcement enabled, `user-agent` is the canonical
+# outbound identity even when a client sends its own value. Versions below
+# 0.144.0 are upgraded only in outbound requests; the saved custom value is not
+# modified. `beta-features` remains a client fallback for HTTP and websocket requests.
 # They do not apply to codex-api-key entries.
 # codex-header-defaults:
 #   user-agent: "codex_cli_rs/0.146.0 (Mac OS 26.5.0; arm64) iTerm.app/3.6.10"
@@ -653,6 +654,7 @@ nonstream-keepalive-interval: 0
 #   identity-confuse: false
 #   spoof-session-identity: false
 #   turn-state-policy: "guard-cross-account"
+#   enforce-software-identity: true # normalize outbound User-Agent, Originator, and Version; default true
 
 # Optional Codex upstream fingerprinting. Disabled by default.
 # `ja3` forces the observed native Codex TLS 1.2 ClientHello, HTTP/1.1,
