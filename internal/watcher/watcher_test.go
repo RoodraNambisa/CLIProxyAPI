@@ -4268,9 +4268,13 @@ func TestAuthEqualIgnoresFileRuntimeAvailabilityState(t *testing.T) {
 	runtimeAuth.RuntimeProxyURL = "http://runtime-proxy.example"
 	runtimeAuth.RuntimeProxyBindingID = "binding"
 	runtimeAuth.RuntimeProxyAuthID = runtimeAuth.ID
+	runtimeAuth.Metadata = map[string]any{
+		"type":       "codex",
+		"project_id": "runtime-enriched-project",
+	}
 
 	if !authEqual(runtimeAuth, projected) {
-		t.Fatal("manager-owned runtime availability state changed watcher equality")
+		t.Fatal("manager-owned runtime availability or metadata state changed watcher equality")
 	}
 	w := &Watcher{
 		currentAuths: map[string]*coreauth.Auth{runtimeAuth.ID: runtimeAuth},

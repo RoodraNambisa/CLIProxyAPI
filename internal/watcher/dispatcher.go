@@ -575,6 +575,7 @@ func normalizeAuth(a *coreauth.Auth) *coreauth.Auth {
 	clone.CooldownScope = ""
 	clone.ModelStates = nil
 	if clone.Attributes != nil && strings.TrimSpace(clone.Attributes[coreauth.SourceHashAttributeKey]) != "" {
+		clone.Metadata = nil
 		clone.Status = ""
 		clone.StatusMessage = ""
 	}
