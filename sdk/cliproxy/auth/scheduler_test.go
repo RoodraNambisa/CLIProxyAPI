@@ -652,7 +652,7 @@ func TestSchedulerPick_MixedFillFirstPerAuthRPMAdvancesAcrossProviders(t *testin
 func TestSchedulerPick_MixedFillFirstPerAuthRPMReturnsCooldownWhenSooner(t *testing.T) {
 	t.Parallel()
 
-	fixed := time.Date(2026, 8, 19, 12, 0, 10, 0, time.UTC)
+	fixed := time.Now().UTC().Add(time.Hour).Truncate(time.Minute).Add(10 * time.Second)
 	scheduler := newSchedulerForTest(
 		&FillFirstSelector{},
 		&Auth{ID: "a-claude", Provider: "claude", Attributes: map[string]string{"priority": "0"}},
