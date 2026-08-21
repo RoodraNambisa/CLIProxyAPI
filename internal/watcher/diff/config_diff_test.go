@@ -102,10 +102,12 @@ func TestBuildConfigChangeDetails_CodexSessionIdentitySpoof(t *testing.T) {
 			TurnStatePolicy:         config.CodexTurnStatePolicySameAccountOnly,
 			EnforceSoftwareIdentity: &disabled,
 		},
+		CodexFingerprint: config.CodexFingerprintConfig{SessionIdentityPoolSize: 4},
 	})
 	expectContains(t, details, "codex.spoof-session-identity: false -> true")
 	expectContains(t, details, "codex.turn-state-policy: guard-cross-account -> same-account-only")
 	expectContains(t, details, "codex.enforce-software-identity: true -> false")
+	expectContains(t, details, "codex-fingerprint.session-identity-pool-size: 1 -> 4")
 }
 
 func TestBuildConfigChangeDetails_ChatGPTWebTokenUsageEstimation(t *testing.T) {

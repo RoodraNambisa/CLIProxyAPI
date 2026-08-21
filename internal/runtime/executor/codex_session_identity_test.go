@@ -2,6 +2,7 @@ package executor
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -13,6 +14,7 @@ import (
 	codexauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/codex"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor/helps"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v6/sdk/config"
@@ -145,6 +147,15 @@ func prepareCodexSessionIdentityForTest(t *testing.T, executor *CodexExecutor, c
 	return identity
 }
 
+func prepareCodexFingerprintAuthForTest(t *testing.T, executor *CodexExecutor, auth *cliproxyauth.Auth) *cliproxyauth.Auth {
+	t.Helper()
+	prepared, err := executor.PrepareRequestAuth(t.Context(), auth)
+	if err != nil {
+		t.Fatalf("PrepareRequestAuth() error = %v", err)
+	}
+	return prepared
+}
+
 func contextWithCodexTestAPIKey(apiKey string) context.Context {
 	ginContext, _ := gin.CreateTestContext(httptest.NewRecorder())
 	ginContext.Set("apiKey", apiKey)
@@ -263,6 +274,7 @@ func TestCodexProjectSessionIdentityConvergesPerCredentialMode(t *testing.T) {
 					codexauth.FingerprintModeMetadataKey: string(tt.mode),
 				},
 			}
+			auth = prepareCodexFingerprintAuthForTest(t, executor, auth)
 			projected, state, err := executor.projectCodexSessionIdentity(t.Context(), auth, cliproxyexecutor.Request{}, opts, raw, &codexIdentityConfuseState{})
 			if err != nil {
 				t.Fatalf("projectCodexSessionIdentity() error = %v", err)
@@ -280,11 +292,12 @@ func TestCodexProjectSessionIdentityConvergesPerCredentialMode(t *testing.T) {
 				}
 				return
 			}
-			wantSession := deriveStableCodexFingerprintUUID("session", wantInstallation)
-			wantThread := wantSession
-			if tt.mode == codexauth.FingerprintModeSession {
-				wantThread = deriveStableCodexFingerprintUUID("thread", wantInstallation+"\x00client-session")
+			pool, ok := codexSessionIdentityPool(auth.Metadata)
+			if !ok || len(pool) != 1 || !isCodexUUIDVersion(pool[0], uuid.Version(7)) {
+				t.Fatalf("session identity pool = %#v, %v; want one UUIDv7", pool, ok)
 			}
+			wantSession := pool[0]
+			wantThread := wantSession
 			if state.identity.SessionID != wantSession || state.identity.ThreadID != wantThread || state.identity.TurnID != "prepared-turn" || state.identity.WindowID != wantThread+":0" {
 				t.Fatalf("identity = %#v, want session=%q thread=%q", state.identity, wantSession, wantThread)
 			}
@@ -302,6 +315,7 @@ func TestCodexProjectSessionIdentityRewritesDefaultPromptCacheAlias(t *testing.T
 		"type": "codex", "account_id": "account-1",
 		codexauth.FingerprintModeMetadataKey: string(codexauth.FingerprintModeSession),
 	}}
+	auth = prepareCodexFingerprintAuthForTest(t, executor, auth)
 	raw := []byte(`{"prompt_cache_key":"body-session","client_metadata":{"session_id":"body-session","x-codex-turn-metadata":"{\"prompt_cache_key\":\"body-session\"}"}}`)
 
 	projected, state, err := executor.projectCodexSessionIdentity(
@@ -325,6 +339,7 @@ func TestCodexProjectSessionIdentityKeepsExplicitPromptCacheKey(t *testing.T) {
 		"type": "codex", "account_id": "account-1",
 		codexauth.FingerprintModeMetadataKey: string(codexauth.FingerprintModeFull),
 	}}
+	auth = prepareCodexFingerprintAuthForTest(t, executor, auth)
 	raw := []byte(`{"prompt_cache_key":"explicit-cache","client_metadata":{"session_id":"body-session"}}`)
 
 	projected, _, err := executor.projectCodexSessionIdentity(
@@ -344,6 +359,7 @@ func TestCodexProjectSessionIdentityKeepsWhitespaceDistinctPromptCacheKey(t *tes
 		"type": "codex", "account_id": "account-1",
 		codexauth.FingerprintModeMetadataKey: string(codexauth.FingerprintModeFull),
 	}}
+	auth = prepareCodexFingerprintAuthForTest(t, executor, auth)
 	raw := []byte(`{"prompt_cache_key":" body-session ","client_metadata":{"session_id":"body-session"}}`)
 
 	projected, _, err := executor.projectCodexSessionIdentity(
@@ -367,6 +383,7 @@ func TestCodexProjectSessionIdentityKeepsConfusedWhitespaceDistinctPromptCacheKe
 		"type": "codex", "account_id": "account-1",
 		codexauth.FingerprintModeMetadataKey: string(codexauth.FingerprintModeFull),
 	}}
+	auth = prepareCodexFingerprintAuthForTest(t, executor, auth)
 	requestPayload := []byte(`{"prompt_cache_key":" body-session "}`)
 	upstreamPayload := []byte(`{"prompt_cache_key":" body-session ","client_metadata":{"session_id":"body-session"}}`)
 	upstreamPayload, identityState := applyCodexIdentityConfuseBody(cfg, auth, requestPayload, upstreamPayload)
@@ -395,6 +412,7 @@ func TestCodexProjectSessionIdentityUpdatesIdentityConfusePromptMapping(t *testi
 		"type": "codex", "account_id": "account-1",
 		codexauth.FingerprintModeMetadataKey: string(codexauth.FingerprintModeSession),
 	}}
+	auth = prepareCodexFingerprintAuthForTest(t, executor, auth)
 	requestPayload := []byte(`{"prompt_cache_key":"body-session"}`)
 	upstreamPayload := []byte(`{"prompt_cache_key":"body-session","client_metadata":{"session_id":"body-session","x-codex-turn-metadata":"{\"prompt_cache_key\":\"body-session\"}"}}`)
 	upstreamPayload, identityState := applyCodexIdentityConfuseBody(cfg, auth, requestPayload, upstreamPayload)
@@ -445,21 +463,45 @@ func TestCodexProjectSessionIdentityDefaultsToStableInstallation(t *testing.T) {
 }
 
 func TestCodexConvergedFingerprintStaysStableAndSeparatesClientSessions(t *testing.T) {
+	executor := NewCodexExecutor(&config.Config{CodexFingerprint: config.CodexFingerprintConfig{SessionIdentityPoolSize: 64}})
 	auth := &cliproxyauth.Auth{ID: "auth", Provider: "codex", Metadata: map[string]any{
 		"account_id": "account-1", codexauth.FingerprintModeMetadataKey: "session",
 	}}
-	prepared := codexPreparedSessionIdentity{TurnID: "turn-1"}
-	first := resolveCodexConvergedFingerprint(auth, prepared, "client-a")
-	repeated := resolveCodexConvergedFingerprint(auth, prepared, "client-a")
-	otherClient := resolveCodexConvergedFingerprint(auth, prepared, "client-b")
+	auth = prepareCodexFingerprintAuthForTest(t, executor, auth)
+	turnID, err := helps.NewCodexUUIDv7()
+	if err != nil {
+		t.Fatal(err)
+	}
+	prepared := codexPreparedSessionIdentity{
+		TurnID: turnID, AffinityKind: "thread_id", AffinityDigest: codexFingerprintDigest("client-a"), TenantDigest: codexFingerprintDigest("tenant-a"),
+	}
+	otherPrepared := prepared
+	for candidate := 0; ; candidate++ {
+		otherPrepared.AffinityDigest = codexFingerprintDigest(fmt.Sprintf("client-%d", candidate))
+		if codexSessionIdentityPoolIndex(auth, prepared, turnID, 64) != codexSessionIdentityPoolIndex(auth, otherPrepared, turnID, 64) {
+			break
+		}
+	}
+	first, err := resolveCodexConvergedFingerprint(auth, prepared, "")
+	if err != nil {
+		t.Fatalf("resolve first fingerprint: %v", err)
+	}
+	repeated, err := resolveCodexConvergedFingerprint(auth, prepared, "")
+	if err != nil {
+		t.Fatalf("resolve repeated fingerprint: %v", err)
+	}
+	otherClient, err := resolveCodexConvergedFingerprint(auth, otherPrepared, "")
+	if err != nil {
+		t.Fatalf("resolve other fingerprint: %v", err)
+	}
 	if first != repeated {
 		t.Fatalf("same account/session fingerprint changed: %#v != %#v", first, repeated)
 	}
-	if first.sessionID != otherClient.sessionID || first.installationID != otherClient.installationID {
-		t.Fatalf("account-level IDs differ across client sessions: %#v vs %#v", first, otherClient)
+	if first.sessionID == otherClient.sessionID || first.installationID != otherClient.installationID {
+		t.Fatalf("pool identities did not separate client sessions: %#v vs %#v", first, otherClient)
 	}
-	if first.threadID == otherClient.threadID {
-		t.Fatalf("different client sessions share thread ID %q", first.threadID)
+	if !isCodexUUIDVersion(first.sessionID, uuid.Version(7)) || !isCodexUUIDVersion(otherClient.sessionID, uuid.Version(7)) {
+		t.Fatalf("pool session IDs are not UUIDv7: %q, %q", first.sessionID, otherClient.sessionID)
 	}
 }
 
@@ -468,7 +510,10 @@ func TestCodexConvergedFingerprintReplacesInvalidPersistedInstallationID(t *test
 		"account_id": "account-1", "openai_device_id": "not-a-uuid",
 	}}
 
-	got := resolveCodexConvergedFingerprint(auth, codexPreparedSessionIdentity{}, "")
+	got, err := resolveCodexConvergedFingerprint(auth, codexPreparedSessionIdentity{}, "")
+	if err != nil {
+		t.Fatalf("resolveCodexConvergedFingerprint() error = %v", err)
+	}
 	want := deriveStableCodexFingerprintUUID("installation", "account-1")
 	if got.installationID != want {
 		t.Fatalf("installation ID = %q, want %q", got.installationID, want)
@@ -481,7 +526,10 @@ func TestCodexConvergedFingerprintMigratesPersistedInstallationIDToAccountRoot(t
 		"account_id": "account-1", "openai_device_id": persisted,
 	}}
 
-	got := resolveCodexConvergedFingerprint(auth, codexPreparedSessionIdentity{}, "")
+	got, err := resolveCodexConvergedFingerprint(auth, codexPreparedSessionIdentity{}, "")
+	if err != nil {
+		t.Fatalf("resolveCodexConvergedFingerprint() error = %v", err)
+	}
 	want := deriveStableCodexFingerprintUUID("installation", "account-1")
 	if got.installationID != want {
 		t.Fatalf("installation ID = %q, want account-derived %q", got.installationID, want)
@@ -614,6 +662,187 @@ func TestCodexPrepareRequestAuthSkipsDisabledConvergenceAndAPIKeys(t *testing.T)
 				t.Fatal("credential unexpectedly requires installation preparation")
 			}
 		})
+	}
+}
+
+func TestCodexPrepareRequestAuthMaintainsSessionIdentityPool(t *testing.T) {
+	baseAuth := &cliproxyauth.Auth{ID: "oauth-auth", Provider: "codex", Metadata: map[string]any{
+		"type": "codex", "account_id": "account-1",
+		codexauth.FingerprintModeMetadataKey: string(codexauth.FingerprintModeSession),
+	}}
+	executor4 := NewCodexExecutor(&config.Config{CodexFingerprint: config.CodexFingerprintConfig{SessionIdentityPoolSize: 4}})
+	prepared4 := prepareCodexFingerprintAuthForTest(t, executor4, baseAuth)
+	pool4, ok := codexSessionIdentityPool(prepared4.Metadata)
+	if !ok || len(pool4) != 4 {
+		t.Fatalf("prepared pool = %#v, %v; want 4 members", pool4, ok)
+	}
+	for _, identity := range pool4 {
+		if !isCodexUUIDVersion(identity, uuid.Version(7)) {
+			t.Fatalf("pool member = %q, want UUIDv7", identity)
+		}
+	}
+	if _, exists := baseAuth.Metadata[codexSessionIdentityPoolMetadataKey]; exists {
+		t.Fatal("PrepareRequestAuth() mutated the caller pool")
+	}
+
+	executor6 := NewCodexExecutor(&config.Config{CodexFingerprint: config.CodexFingerprintConfig{SessionIdentityPoolSize: 6}})
+	if !executor6.ShouldPrepareRequestAuth(prepared4) {
+		t.Fatal("pool expansion was not detected by request auth preparation")
+	}
+	prepared6 := prepareCodexFingerprintAuthForTest(t, executor6, prepared4)
+	pool6, _ := codexSessionIdentityPool(prepared6.Metadata)
+	if len(pool6) != 6 {
+		t.Fatalf("expanded pool length = %d, want 6", len(pool6))
+	}
+	for index := range pool4 {
+		if pool6[index] != pool4[index] {
+			t.Fatalf("expanded pool member %d = %q, want preserved %q", index, pool6[index], pool4[index])
+		}
+	}
+
+	invalid := prepared6.Clone()
+	invalidMember := uuid.NewString()
+	invalid.Metadata[codexSessionIdentityPoolMetadataKey] = []any{pool6[0], invalidMember, pool6[2], pool6[3], pool6[4], pool6[5]}
+	repaired := prepareCodexFingerprintAuthForTest(t, executor6, invalid)
+	repairedPool, _ := codexSessionIdentityPool(repaired.Metadata)
+	if repairedPool[0] != pool6[0] || repairedPool[1] == invalidMember || !isCodexUUIDVersion(repairedPool[1], uuid.Version(7)) {
+		t.Fatalf("repaired pool = %#v, want valid members with unaffected positions preserved", repairedPool)
+	}
+
+	executor2 := NewCodexExecutor(&config.Config{CodexFingerprint: config.CodexFingerprintConfig{SessionIdentityPoolSize: 2}})
+	prepared2 := prepareCodexFingerprintAuthForTest(t, executor2, repaired)
+	pool2, _ := codexSessionIdentityPool(prepared2.Metadata)
+	if len(pool2) != 2 || pool2[0] != repairedPool[0] || pool2[1] != repairedPool[1] {
+		t.Fatalf("shrunk pool = %#v, want first two members %#v", pool2, repairedPool[:2])
+	}
+}
+
+func TestCodexSessionIdentityPoolSkipsInactiveModesAndAPIKeys(t *testing.T) {
+	executor := NewCodexExecutor(&config.Config{CodexFingerprint: config.CodexFingerprintConfig{SessionIdentityPoolSize: 4}})
+	for _, test := range []struct {
+		name string
+		auth *cliproxyauth.Auth
+	}{
+		{name: "off", auth: &cliproxyauth.Auth{Provider: "codex", Metadata: map[string]any{codexauth.FingerprintModeMetadataKey: "off"}}},
+		{name: "device", auth: &cliproxyauth.Auth{Provider: "codex", Metadata: map[string]any{codexauth.FingerprintModeMetadataKey: "device"}}},
+		{name: "api key", auth: &cliproxyauth.Auth{Provider: "codex", Attributes: map[string]string{"api_key": "secret"}, Metadata: map[string]any{codexauth.FingerprintModeMetadataKey: "full"}}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			prepared := prepareCodexFingerprintAuthForTest(t, executor, test.auth)
+			if _, exists := prepared.Metadata[codexSessionIdentityPoolMetadataKey]; exists {
+				t.Fatal("inactive fingerprint mode created a session identity pool")
+			}
+		})
+	}
+}
+
+func TestCodexSessionIdentityPoolMapsThreadsByOfficialUUIDRules(t *testing.T) {
+	executor := NewCodexExecutor(&config.Config{CodexFingerprint: config.CodexFingerprintConfig{SessionIdentityPoolSize: 4}})
+	auth := prepareCodexFingerprintAuthForTest(t, executor, &cliproxyauth.Auth{ID: "auth", Provider: "codex", Metadata: map[string]any{
+		"account_id": "account-1", codexauth.FingerprintModeMetadataKey: "session",
+	}})
+	turnID, err := helps.NewCodexUUIDv7()
+	if err != nil {
+		t.Fatal(err)
+	}
+	clientThreadID, err := helps.NewCodexUUIDv7()
+	if err != nil {
+		t.Fatal(err)
+	}
+	prepared := codexPreparedSessionIdentity{
+		TurnID: turnID, AffinityKind: "thread_id", AffinityDigest: codexFingerprintDigest(clientThreadID), TenantDigest: "tenant",
+	}
+	first, err := resolveCodexConvergedFingerprint(auth, prepared, clientThreadID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repeated, err := resolveCodexConvergedFingerprint(auth, prepared, clientThreadID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first != repeated {
+		t.Fatalf("mapped fingerprint changed: %#v != %#v", first, repeated)
+	}
+	originalUUID, _ := uuid.Parse(clientThreadID)
+	mappedUUID, err := uuid.Parse(first.threadID)
+	if err != nil || mappedUUID.Version() != uuid.Version(7) {
+		t.Fatalf("mapped thread = %q, want UUIDv7", first.threadID)
+	}
+	for index := 0; index < 6; index++ {
+		if mappedUUID[index] != originalUUID[index] {
+			t.Fatalf("mapped thread changed UUIDv7 timestamp bytes: %q -> %q", clientThreadID, first.threadID)
+		}
+	}
+	legacyThread := uuid.NewString()
+	legacy, err := resolveCodexConvergedFingerprint(auth, prepared, legacyThread)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if legacy.threadID != legacyThread {
+		t.Fatalf("legacy client thread = %q, want preserved %q", legacy.threadID, legacyThread)
+	}
+	opaque, err := resolveCodexConvergedFingerprint(auth, prepared, "not-a-uuid")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if opaque.threadID != opaque.sessionID {
+		t.Fatalf("opaque client thread = %q, want selected session %q", opaque.threadID, opaque.sessionID)
+	}
+	if !isCodexUUIDVersion(first.sessionID, uuid.Version(7)) || !isCodexUUIDVersion(first.turnID, uuid.Version(7)) {
+		t.Fatalf("fingerprint = %#v, want UUIDv7 session and turn", first)
+	}
+}
+
+func TestCodexPreparedAffinityIgnoresPreviousResponseID(t *testing.T) {
+	executor := NewCodexExecutor(&config.Config{})
+	req := cliproxyexecutor.Request{Payload: []byte(`{"previous_response_id":"resp_123"}`)}
+	first := prepareCodexSessionIdentityForTest(t, executor, t.Context(), req, cliproxyexecutor.Options{})
+	second := prepareCodexSessionIdentityForTest(t, executor, t.Context(), req, cliproxyexecutor.Options{})
+	if first.AffinityKind != "turn" || second.AffinityKind != "turn" {
+		t.Fatalf("affinity kinds = %q, %q; want turn", first.AffinityKind, second.AffinityKind)
+	}
+	if first.AffinityDigest == second.AffinityDigest {
+		t.Fatal("independent requests reused previous_response_id as pool affinity")
+	}
+}
+
+func TestCodexPreparedAffinityUsesStableSourcePriority(t *testing.T) {
+	turnID, err := helps.NewCodexUUIDv7()
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := []byte(`{"prompt_cache_key":"cache-key","client_metadata":{"session_id":"session-id","x-codex-turn-metadata":"{\"thread_id\":\"thread-id\"}"}}`)
+	opts := cliproxyexecutor.Options{Metadata: map[string]any{cliproxyexecutor.ExecutionSessionMetadataKey: "execution-id"}}
+	kind, digest, tenant, _, _ := codexPreparedRequestAffinity(contextWithCodexTestAPIKey("tenant-key"), opts, payload, turnID)
+	if kind != "execution_session_id" || digest != codexFingerprintDigest("execution-id") || tenant != codexFingerprintDigest("tenant-key") {
+		t.Fatalf("execution affinity = %q, %q, %q", kind, digest, tenant)
+	}
+
+	kind, digest, _, _, _ = codexPreparedRequestAffinity(t.Context(), cliproxyexecutor.Options{}, payload, turnID)
+	if kind != "thread_id" || digest != codexFingerprintDigest("thread-id") {
+		t.Fatalf("thread affinity = %q, %q", kind, digest)
+	}
+	payload = []byte(`{"prompt_cache_key":"cache-key","client_metadata":{"session_id":"session-id"}}`)
+	kind, digest, _, _, _ = codexPreparedRequestAffinity(t.Context(), cliproxyexecutor.Options{}, payload, turnID)
+	if kind != "prompt_cache_key" || digest != codexFingerprintDigest("cache-key") {
+		t.Fatalf("prompt cache affinity = %q, %q", kind, digest)
+	}
+	payload = []byte(`{"client_metadata":{"session_id":"session-id"}}`)
+	kind, digest, _, _, _ = codexPreparedRequestAffinity(t.Context(), cliproxyexecutor.Options{}, payload, turnID)
+	if kind != "session_id" || digest != codexFingerprintDigest("session-id") {
+		t.Fatalf("session affinity = %q, %q", kind, digest)
+	}
+}
+
+func TestCodexProjectSessionIdentityRejectsUnpreparedPoolWithoutCoolingAuth(t *testing.T) {
+	executor := NewCodexExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{Provider: "codex", Metadata: map[string]any{
+		"account_id": "account-1", codexauth.FingerprintModeMetadataKey: "session",
+	}}
+	_, _, err := executor.projectCodexSessionIdentity(t.Context(), auth, cliproxyexecutor.Request{}, cliproxyexecutor.Options{}, []byte(`{}`), &codexIdentityConfuseState{})
+	status, ok := err.(statusErr)
+	if !ok || status.StatusCode() != http.StatusInternalServerError || !status.SkipAuthResult() {
+		t.Fatalf("error = %#v, want local 500 with auth result skipped", err)
 	}
 }
 

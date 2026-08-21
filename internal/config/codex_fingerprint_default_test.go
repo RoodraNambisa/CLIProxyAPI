@@ -57,3 +57,44 @@ func TestLoadConfigNormalizesCodexFingerprintDefaultMode(t *testing.T) {
 		t.Fatal("LoadConfig() error = nil, want invalid mode rejection")
 	}
 }
+
+func TestCodexFingerprintSessionIdentityPoolSize(t *testing.T) {
+	if got := (CodexFingerprintConfig{}).ResolvedSessionIdentityPoolSize(); got != DefaultCodexSessionIdentityPoolSize {
+		t.Fatalf("zero-valued pool size = %d, want %d", got, DefaultCodexSessionIdentityPoolSize)
+	}
+	if got := (CodexFingerprintConfig{SessionIdentityPoolSize: 4}).ResolvedSessionIdentityPoolSize(); got != 4 {
+		t.Fatalf("configured pool size = %d, want 4", got)
+	}
+
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	for _, test := range []struct {
+		name    string
+		content string
+		want    int
+		wantErr bool
+	}{
+		{name: "omitted", content: "codex-fingerprint:\n  default-mode: session\n", want: 1},
+		{name: "configured", content: "codex-fingerprint:\n  session-identity-pool-size: 4\n", want: 4},
+		{name: "zero", content: "codex-fingerprint:\n  session-identity-pool-size: 0\n", wantErr: true},
+		{name: "too large", content: "codex-fingerprint:\n  session-identity-pool-size: 65\n", wantErr: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if err := os.WriteFile(configPath, []byte(test.content), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			cfg, err := LoadConfig(configPath)
+			if test.wantErr {
+				if err == nil || !strings.Contains(err.Error(), "codex-fingerprint.session-identity-pool-size") {
+					t.Fatalf("LoadConfig() error = %v, want pool size rejection", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("LoadConfig() error = %v", err)
+			}
+			if got := cfg.CodexFingerprint.SessionIdentityPoolSize; got != test.want {
+				t.Fatalf("SessionIdentityPoolSize = %d, want %d", got, test.want)
+			}
+		})
+	}
+}

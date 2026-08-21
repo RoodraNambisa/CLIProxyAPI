@@ -26,9 +26,11 @@ import (
 )
 
 const (
-	DefaultPanelGitHubRepository = "https://github.com/RoodraNambisa/Cli-Proxy-API-Management-Center"
-	DefaultPprofAddr             = "127.0.0.1:8316"
-	DefaultCodexFingerprintMode  = "device"
+	DefaultPanelGitHubRepository        = "https://github.com/RoodraNambisa/Cli-Proxy-API-Management-Center"
+	DefaultPprofAddr                    = "127.0.0.1:8316"
+	DefaultCodexFingerprintMode         = "device"
+	DefaultCodexSessionIdentityPoolSize = 1
+	MaxCodexSessionIdentityPoolSize     = 64
 
 	DefaultRequestBodyAuditStatusCode = http.StatusBadRequest
 	DefaultRequestBodyAuditMessage    = "Request body was rejected by policy."
@@ -1327,9 +1329,10 @@ func (cfg ChatGPTWebSentinelConfig) Validate() error {
 
 // CodexFingerprintConfig controls optional Codex upstream fingerprinting.
 type CodexFingerprintConfig struct {
-	JA3              bool `yaml:"ja3" json:"ja3"`
-	ForceHTTP1       bool `yaml:"force-http1" json:"force-http1"`
-	ImagesForceHTTP1 bool `yaml:"images-force-http1" json:"images-force-http1"`
+	JA3                     bool `yaml:"ja3" json:"ja3"`
+	ForceHTTP1              bool `yaml:"force-http1" json:"force-http1"`
+	ImagesForceHTTP1        bool `yaml:"images-force-http1" json:"images-force-http1"`
+	SessionIdentityPoolSize int  `yaml:"session-identity-pool-size" json:"session-identity-pool-size"`
 	// DefaultMode is persisted only on future Codex uploads that omit codex_fingerprint_mode.
 	DefaultMode string `yaml:"default-mode" json:"default-mode"`
 }
@@ -1341,6 +1344,15 @@ func (cfg CodexFingerprintConfig) ResolvedDefaultMode() string {
 		return DefaultCodexFingerprintMode
 	}
 	return mode
+}
+
+// ResolvedSessionIdentityPoolSize returns the configured pool size or the
+// default for zero-valued in-memory configurations.
+func (cfg CodexFingerprintConfig) ResolvedSessionIdentityPoolSize() int {
+	if cfg.SessionIdentityPoolSize < 1 || cfg.SessionIdentityPoolSize > MaxCodexSessionIdentityPoolSize {
+		return DefaultCodexSessionIdentityPoolSize
+	}
+	return cfg.SessionIdentityPoolSize
 }
 
 // NormalizeCodexFingerprintMode validates a Codex credential fingerprint mode.
@@ -2120,6 +2132,7 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	cfg.Images.Native.Edits.UnsupportedModelStatusCode = http.StatusBadRequest
 	cfg.Images.Native.Edits.UnsupportedModelMessage = "Native image edit is not enabled for model {model}"
 	cfg.CodexFingerprint.DefaultMode = DefaultCodexFingerprintMode
+	cfg.CodexFingerprint.SessionIdentityPoolSize = DefaultCodexSessionIdentityPoolSize
 	defaultImagesNAggregation := false
 	cfg.Images.EnableNAggregation = &defaultImagesNAggregation
 	cfg.Images.UnsupportedStatusCode = http.StatusBadRequest
@@ -2183,6 +2196,9 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	}
 	if cfg.CodexFingerprint.DefaultMode, err = NormalizeCodexFingerprintMode(cfg.CodexFingerprint.DefaultMode); err != nil {
 		return nil, err
+	}
+	if cfg.CodexFingerprint.SessionIdentityPoolSize < 1 || cfg.CodexFingerprint.SessionIdentityPoolSize > MaxCodexSessionIdentityPoolSize {
+		return nil, fmt.Errorf("codex-fingerprint.session-identity-pool-size must be between 1 and %d", MaxCodexSessionIdentityPoolSize)
 	}
 
 	cfg.Images.CodexModel = strings.TrimSpace(cfg.Images.CodexModel)

@@ -274,6 +274,13 @@ func BuildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 	if oldCfg.Codex.ResolvedEnforceSoftwareIdentity() != newCfg.Codex.ResolvedEnforceSoftwareIdentity() {
 		changes = append(changes, fmt.Sprintf("codex.enforce-software-identity: %t -> %t", oldCfg.Codex.ResolvedEnforceSoftwareIdentity(), newCfg.Codex.ResolvedEnforceSoftwareIdentity()))
 	}
+	if oldCfg.CodexFingerprint.ResolvedSessionIdentityPoolSize() != newCfg.CodexFingerprint.ResolvedSessionIdentityPoolSize() {
+		changes = append(changes, fmt.Sprintf(
+			"codex-fingerprint.session-identity-pool-size: %d -> %d",
+			oldCfg.CodexFingerprint.ResolvedSessionIdentityPoolSize(),
+			newCfg.CodexFingerprint.ResolvedSessionIdentityPoolSize(),
+		))
+	}
 	if oldCfg.ChatGPTWeb.TokenUsageEstimationEnabled() != newCfg.ChatGPTWeb.TokenUsageEstimationEnabled() {
 		changes = append(changes, fmt.Sprintf("chatgpt-web.estimate-token-usage: %t -> %t", oldCfg.ChatGPTWeb.TokenUsageEstimationEnabled(), newCfg.ChatGPTWeb.TokenUsageEstimationEnabled()))
 	}

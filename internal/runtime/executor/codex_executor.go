@@ -15,7 +15,6 @@ import (
 
 	codexauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/codex"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/misc"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
@@ -314,12 +313,16 @@ func NewCodexExecutor(cfg *config.Config) *CodexExecutor { return &CodexExecutor
 func (e *CodexExecutor) Identifier() string { return "codex" }
 
 type codexPreparedSessionIdentity struct {
-	Enabled     bool
-	SessionID   string
-	ThreadID    string
-	TurnID      string
-	WindowID    string
-	RequestKind string
+	Enabled        bool
+	SessionID      string
+	ThreadID       string
+	TurnID         string
+	WindowID       string
+	RequestKind    string
+	AffinityKind   string
+	AffinityDigest string
+	TenantDigest   string
+	ClientThreadID string
 }
 
 // PrepareProviderRequest creates one immutable identity fallback shared by all
@@ -336,45 +339,95 @@ func (e *CodexExecutor) PrepareProviderRequest(ctx context.Context, req cliproxy
 	if err != nil {
 		return nil, err
 	}
+	affinityKind, affinityDigest, tenantDigest, clientThreadID, spoofThreadID := codexPreparedRequestAffinity(ctx, opts, payload, turnID)
 	prepared := codexPreparedSessionIdentity{
-		Enabled:     codexSpoofSessionIdentityEnabled(e.cfg),
-		TurnID:      turnID,
-		RequestKind: codexSessionRequestKind(opts, payload),
+		Enabled:        codexSpoofSessionIdentityEnabled(e.cfg),
+		TurnID:         turnID,
+		RequestKind:    codexSessionRequestKind(opts, payload),
+		AffinityKind:   affinityKind,
+		AffinityDigest: affinityDigest,
+		TenantDigest:   tenantDigest,
+		ClientThreadID: clientThreadID,
 	}
 	if !prepared.Enabled {
 		return prepared, nil
 	}
-	threadID, err := codexPreparedThreadID(ctx, opts, payload)
-	if err != nil {
-		return nil, err
+	if spoofThreadID == "" {
+		spoofThreadID, err = helps.NewCodexUUIDv7()
+		if err != nil {
+			return nil, err
+		}
 	}
-	return codexPreparedSessionIdentity{
-		Enabled:     true,
-		SessionID:   threadID,
-		ThreadID:    threadID,
-		TurnID:      prepared.TurnID,
-		WindowID:    threadID + ":0",
-		RequestKind: codexSessionRequestKind(opts, payload),
-	}, nil
+	prepared.SessionID = spoofThreadID
+	prepared.ThreadID = spoofThreadID
+	prepared.WindowID = spoofThreadID + ":0"
+	return prepared, nil
 }
 
-func codexPreparedThreadID(ctx context.Context, opts cliproxyexecutor.Options, payload []byte) (string, error) {
-	if executionSessionID := executionSessionIDFromOptions(opts); executionSessionID != "" {
-		if parsed, err := uuid.Parse(executionSessionID); err == nil {
-			return parsed.String(), nil
+func codexPreparedRequestAffinity(ctx context.Context, opts cliproxyexecutor.Options, payload []byte, turnID string) (string, string, string, string, string) {
+	client := codexClientSessionIdentitySource(ctx, opts)
+	bodyTurnMetadata := gjson.GetBytes(payload, "client_metadata.x-codex-turn-metadata").String()
+	clientTurnMetadata := client.TurnMetadata
+	threadID := firstCodexPreparedIdentityValue(
+		gjson.Get(bodyTurnMetadata, "thread_id").String(),
+		gjson.GetBytes(payload, "client_metadata.thread_id").String(),
+		gjson.Get(clientTurnMetadata, "thread_id").String(),
+		client.ThreadID,
+	)
+	sessionID := firstCodexPreparedIdentityValue(
+		gjson.Get(bodyTurnMetadata, "session_id").String(),
+		gjson.GetBytes(payload, "client_metadata.session_id").String(),
+		gjson.Get(clientTurnMetadata, "session_id").String(),
+		client.SessionID,
+	)
+	promptCacheKey := strings.TrimSpace(gjson.GetBytes(payload, "prompt_cache_key").String())
+	executionSessionID := executionSessionIDFromOptions(opts)
+
+	affinityKind := "turn"
+	affinityValue := turnID
+	for _, candidate := range []struct {
+		kind  string
+		value string
+	}{
+		{kind: "execution_session_id", value: executionSessionID},
+		{kind: "thread_id", value: threadID},
+		{kind: "prompt_cache_key", value: promptCacheKey},
+		{kind: "session_id", value: sessionID},
+	} {
+		if strings.TrimSpace(candidate.value) == "" {
+			continue
 		}
-		return helps.NewCodexUUIDv7()
+		affinityKind = candidate.kind
+		affinityValue = candidate.value
+		break
 	}
-	if promptCacheKey := strings.TrimSpace(gjson.GetBytes(payload, "prompt_cache_key").String()); promptCacheKey != "" {
-		if parsed, err := uuid.Parse(promptCacheKey); err == nil {
-			return parsed.String(), nil
+
+	tenantDigest := "anonymous"
+	if apiKey := strings.TrimSpace(helps.APIKeyFromContext(ctx)); apiKey != "" {
+		tenantDigest = codexFingerprintDigest(apiKey)
+	}
+	clientThreadID := ""
+	if parsed, err := uuid.Parse(strings.TrimSpace(threadID)); err == nil && parsed != uuid.Nil {
+		clientThreadID = parsed.String()
+	}
+	spoofThreadID := ""
+	for _, candidate := range []string{executionSessionID, threadID, promptCacheKey, sessionID} {
+		parsed, err := uuid.Parse(strings.TrimSpace(candidate))
+		if err == nil && parsed != uuid.Nil {
+			spoofThreadID = parsed.String()
+			break
 		}
-		return helps.NewCodexUUIDv7()
 	}
-	if strings.TrimSpace(logging.GetRequestID(ctx)) != "" {
-		return helps.NewCodexUUIDv7()
+	return affinityKind, codexFingerprintDigest(affinityValue), tenantDigest, clientThreadID, spoofThreadID
+}
+
+func firstCodexPreparedIdentityValue(values ...string) string {
+	for _, value := range values {
+		if value = strings.TrimSpace(value); value != "" {
+			return value
+		}
 	}
-	return helps.NewCodexUUIDv7()
+	return ""
 }
 
 func codexSessionRequestKind(opts cliproxyexecutor.Options, payload []byte) string {
@@ -394,7 +447,7 @@ func codexSpoofSessionIdentityEnabled(cfg *config.Config) bool {
 // ShouldPrepareRequestAuth reports whether persistent Codex identity metadata
 // must be completed before the credential is used.
 func (e *CodexExecutor) ShouldPrepareRequestAuth(auth *cliproxyauth.Auth) bool {
-	return codexInstallationIDNeedsPreparation(auth) || codexAgentIdentityNeedsTask(auth)
+	return codexInstallationIDNeedsPreparation(auth) || codexSessionIdentityPoolNeedsPreparation(auth, e.cfg) || codexAgentIdentityNeedsTask(auth)
 }
 
 // PrepareRequestAuth prepares a stable installation ID and registers a missing
@@ -404,6 +457,11 @@ func (e *CodexExecutor) PrepareRequestAuth(ctx context.Context, auth *cliproxyau
 		return nil, errors.New("codex executor: auth is nil")
 	}
 	updated, _ := prepareCodexInstallationID(auth)
+	var err error
+	updated, _, err = prepareCodexSessionIdentityPool(updated, e.cfg)
+	if err != nil {
+		return nil, err
+	}
 	if codexAgentIdentityNeedsTask(updated) {
 		return e.registerAgentIdentityTask(ctx, updated)
 	}
@@ -1686,7 +1744,22 @@ func (e *CodexExecutor) projectCodexSessionIdentity(
 	if identityConfuse != nil && identityConfuse.originalPromptCacheKey != "" {
 		originalPromptCacheKey = identityConfuse.originalPromptCacheKey
 	}
-	fingerprint := resolveCodexConvergedFingerprint(auth, prepared, originalCodexClientSessionID(client.SessionID, rawJSON))
+	clientThreadID := strings.TrimSpace(prepared.ClientThreadID)
+	if clientThreadID == "" {
+		clientThreadID = originalCodexClientThreadID(client.ThreadID, rawJSON)
+	}
+	fingerprint, err := resolveCodexConvergedFingerprint(auth, prepared, clientThreadID)
+	if err != nil {
+		status := codexStreamStatusErr(
+			http.StatusInternalServerError,
+			"prepare Codex session identity: "+err.Error(),
+			"codex_session_identity_preparation_failed",
+			"server_error",
+			nil,
+		)
+		status.skipAuthResult = true
+		return nil, codexSessionIdentityState{}, status
+	}
 	converged := fingerprint.mode != codexauth.FingerprintModeOff
 	projectSession := prepared.Enabled || fingerprint.mode == codexauth.FingerprintModeSession || fingerprint.mode == codexauth.FingerprintModeFull
 	if !prepared.Enabled && !converged {
