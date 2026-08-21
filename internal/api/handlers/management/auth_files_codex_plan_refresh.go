@@ -29,7 +29,6 @@ const (
 	codexPlanTypeRefreshStatusUnchanged          = "unchanged"
 	codexPlanTypeRefreshStatusSkipped            = "skipped"
 	codexPlanTypeRefreshStatusFailed             = "failed"
-	codexPlanTypeRefreshUserAgent                = "codex_cli_rs/0.76.0 (Debian 13.0.0; x86_64) WindowsTerminal"
 	codexPlanTypeRefreshModeAll                  = "all"
 	codexPlanTypeRefreshModeFailed               = "failed"
 	codexPlanTypeRefreshActionPause              = "pause"
@@ -1004,7 +1003,10 @@ func (h *Handler) fetchCodexUsagePlanType(ctx context.Context, auth *coreauth.Au
 	}
 	req.Header.Set("Authorization", authorization)
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", codexPlanTypeRefreshUserAgent)
+	softwareIdentity := h.codexPlanTypeRefreshSoftwareIdentity(auth)
+	req.Header.Set("User-Agent", softwareIdentity.UserAgent)
+	req.Header.Set("Originator", softwareIdentity.Originator)
+	req.Header.Set("Version", softwareIdentity.Version)
 	req.Header.Set("Chatgpt-Account-Id", strings.TrimSpace(accountID))
 	if internalcodex.ChatGPTAccountIsFedRAMP(auth.Metadata) {
 		req.Header.Set("X-OpenAI-Fedramp", "true")
@@ -1054,6 +1056,23 @@ func (h *Handler) fetchCodexUsagePlanType(ctx context.Context, auth *coreauth.Au
 		return "", resp.StatusCode, fmt.Errorf("usage response missing plan_type")
 	}
 	return planType, resp.StatusCode, nil
+}
+
+func (h *Handler) codexPlanTypeRefreshSoftwareIdentity(auth *coreauth.Auth) internalcodex.SoftwareIdentity {
+	candidate := ""
+	if auth != nil {
+		for key, value := range auth.Attributes {
+			if !strings.HasPrefix(key, "header:") || !strings.EqualFold(strings.TrimSpace(strings.TrimPrefix(key, "header:")), "User-Agent") {
+				continue
+			}
+			candidate = strings.TrimSpace(value)
+			break
+		}
+	}
+	if candidate == "" && h != nil && h.cfg != nil {
+		candidate = strings.TrimSpace(h.cfg.CodexHeaderDefaults.UserAgent)
+	}
+	return internalcodex.ResolveSoftwareIdentity(candidate)
 }
 
 type codexUsageRequestError struct {

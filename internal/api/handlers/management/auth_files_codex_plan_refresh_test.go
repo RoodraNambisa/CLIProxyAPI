@@ -109,6 +109,45 @@ func TestCodexPlanTypeRefreshUpdatesPlanTypeAndListAuthFiles(t *testing.T) {
 	}
 }
 
+func TestCodexPlanTypeRefreshUsesUnifiedSoftwareIdentity(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		for header, want := range map[string]string{
+			"User-Agent": "credential-client/0.155.0 (Mac OS 26.5.0; arm64)",
+			"Originator": "credential-client",
+			"Version":    "0.155.0",
+		} {
+			if got := request.Header.Get(header); got != want {
+				t.Errorf("%s = %q, want %q", header, got, want)
+			}
+		}
+		writer.Header().Set("Content-Type", "application/json")
+		_, _ = writer.Write([]byte(`{"plan_type":"plus"}`))
+	}))
+	defer server.Close()
+
+	restoreUsageURL := codexPlanTypeRefreshUsageURL
+	codexPlanTypeRefreshUsageURL = server.URL
+	defer func() { codexPlanTypeRefreshUsageURL = restoreUsageURL }()
+
+	h := NewHandlerWithoutConfigFilePath(&config.Config{
+		CodexHeaderDefaults: config.CodexHeaderDefaults{UserAgent: "configured-client/0.154.0 (Linux; arm64)"},
+	}, nil)
+	auth := &coreauth.Auth{
+		Provider: "codex",
+		Metadata: map[string]any{"type": "codex", "access_token": "access-token"},
+		Attributes: map[string]string{
+			"header:user-agent": "credential-client/0.155.0 (Mac OS 26.5.0; arm64)",
+		},
+	}
+	planType, statusCode, err := h.fetchCodexUsagePlanType(t.Context(), auth, "access-token", "account-id")
+	if err != nil {
+		t.Fatalf("fetchCodexUsagePlanType() error = %v", err)
+	}
+	if statusCode != http.StatusOK || planType != "plus" {
+		t.Fatalf("fetchCodexUsagePlanType() = %q, %d; want plus, 200", planType, statusCode)
+	}
+}
+
 func TestCodexPlanTypeRefreshUsesAgentAssertion(t *testing.T) {
 	keyMaterial, errKey := internalcodex.GenerateAgentIdentityKeyMaterial()
 	if errKey != nil {
