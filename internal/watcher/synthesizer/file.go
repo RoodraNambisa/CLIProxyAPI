@@ -71,18 +71,28 @@ func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) []
 	if errUnmarshal := json.Unmarshal(data, &metadata); errUnmarshal != nil {
 		return nil
 	}
+	auths, _ := SynthesizeParsedAuthFile(ctx, fullPath, metadata)
+	return auths
+}
+
+// SynthesizeParsedAuthFile projects a file snapshot that was already decoded
+// after a caller completed its own path and file-generation checks.
+func SynthesizeParsedAuthFile(ctx *SynthesisContext, fullPath string, metadata map[string]any) ([]*coreauth.Auth, bool) {
+	if ctx == nil || metadata == nil {
+		return nil, false
+	}
 	t, _ := metadata["type"].(string)
 	provider := strings.ToLower(strings.TrimSpace(t))
-	if coreauth.IsRetiredGeminiCLIAuthFileData(data) {
-		coreauth.WarnRetiredGeminiCLIAuthIgnored()
-		return nil
-	}
-	if provider == "" {
-		return nil
-	}
 	a := &coreauth.Auth{
 		Provider: provider,
 		Metadata: metadata,
+	}
+	if coreauth.IsRetiredGeminiCLIAuth(a) {
+		coreauth.WarnRetiredGeminiCLIAuthIgnored()
+		return nil, true
+	}
+	if provider == "" {
+		return nil, false
 	}
 	if errProjection := coreauth.ApplyFileAuthProjection(a, coreauth.FileAuthProjectionOptions{
 		Config:  ctx.Config,
@@ -90,7 +100,7 @@ func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) []
 		Path:    fullPath,
 		Now:     ctx.Now,
 	}); errProjection != nil {
-		return nil
+		return nil, false
 	}
-	return []*coreauth.Auth{a}
+	return []*coreauth.Auth{a}, false
 }

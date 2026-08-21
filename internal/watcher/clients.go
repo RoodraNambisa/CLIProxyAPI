@@ -461,7 +461,22 @@ func (w *Watcher) cacheAuthFileForReloadAtRoot(cfg *config.Config, authDir strin
 }
 
 func (w *Watcher) cacheAuthFileDataForReload(cfg *config.Config, authDir, path string, data []byte, currentHash string, cacheAuthContents, resolveTombstoneReplacement bool) {
-	retiredFile := coreauth.IsRetiredGeminiCLIAuthFileData(data)
+	var metadata map[string]any
+	metadataValid := json.Unmarshal(data, &metadata) == nil
+
+	var pathAuths map[string]*coreauth.Auth
+	retiredFile := false
+	if metadataValid {
+		ctx := &synthesizer.SynthesisContext{
+			Config:      cfg,
+			AuthDir:     authDir,
+			Now:         time.Now(),
+			IDGenerator: synthesizer.NewStableIDGenerator(),
+		}
+		var projected []*coreauth.Auth
+		projected, retiredFile = synthesizer.SynthesizeParsedAuthFile(ctx, path, metadata)
+		pathAuths = authSliceToMap(projected)
+	}
 	if retiredFile {
 		authfileguard.MarkRetired(path)
 	}
@@ -469,22 +484,11 @@ func (w *Watcher) cacheAuthFileDataForReload(cfg *config.Config, authDir, path s
 	confirmReplacement := resolveTombstoneReplacement && w.shouldConfirmAuthDeleteTombstoneReplacement(normalizedPath, data)
 
 	var cachedAuth *coreauth.Auth
-	if cacheAuthContents {
-		var auth coreauth.Auth
-		if errParse := json.Unmarshal(data, &auth); errParse == nil {
-			cachedAuth = &auth
-		}
-	}
-
-	var pathAuths map[string]*coreauth.Auth
-	if !retiredFile {
-		ctx := &synthesizer.SynthesisContext{
-			Config:      cfg,
-			AuthDir:     authDir,
-			Now:         time.Now(),
-			IDGenerator: synthesizer.NewStableIDGenerator(),
-		}
-		pathAuths = authSliceToMap(synthesizer.SynthesizeAuthFile(ctx, path, data))
+	if cacheAuthContents && metadataValid {
+		cachedAuth = &coreauth.Auth{}
+		cachedAuth.Prefix, _ = metadata["prefix"].(string)
+		cachedAuth.ProxyURL, _ = metadata["proxy_url"].(string)
+		cachedAuth.Disabled, _ = metadata["disabled"].(bool)
 	}
 
 	w.clientsMutex.Lock()

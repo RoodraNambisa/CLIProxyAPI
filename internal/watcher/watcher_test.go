@@ -4101,6 +4101,27 @@ func TestScanAuthFilesForReloadReadsEachFileOnce(t *testing.T) {
 	}
 }
 
+func TestCacheAuthFileDataForReloadProjectsVerifiedSnapshotWithoutRestat(t *testing.T) {
+	authDir := t.TempDir()
+	path := filepath.Join(authDir, "removed-after-read.json")
+	data := []byte(`{"type":"codex","email":"snapshot@example.com"}`)
+	w := &Watcher{
+		authDir:          authDir,
+		lastAuthHashes:   make(map[string]string),
+		fileAuthsByPath:  make(map[string]map[string]*coreauth.Auth),
+		retiredAuthPaths: make(map[string]struct{}),
+	}
+	cfg := &config.Config{AuthDir: authDir}
+	w.SetConfig(cfg)
+
+	w.cacheAuthFileDataForReload(cfg, authDir, path, data, "snapshot-hash", false, false)
+
+	projected := w.fileAuthsByPath[w.normalizeAuthPath(path)]["removed-after-read.json"]
+	if projected == nil || projected.Attributes["email"] != "snapshot@example.com" {
+		t.Fatalf("verified snapshot projection = %#v", projected)
+	}
+}
+
 func TestReprojectCachedFileAuthsDoesNotReadFiles(t *testing.T) {
 	authDir := t.TempDir()
 	path := filepath.Join(authDir, "codex.json")
