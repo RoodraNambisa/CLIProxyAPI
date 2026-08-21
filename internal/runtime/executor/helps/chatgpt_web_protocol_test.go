@@ -999,6 +999,93 @@ func TestChatGPTWebImageAccumulatorTracksPatchedTerminalAssistantText(t *testing
 	}
 }
 
+func TestChatGPTWebImageAccumulatorRecognizesOfficialAsyncImageActivity(t *testing.T) {
+	tests := []struct {
+		name    string
+		payload string
+	}{
+		{
+			name:    "async flag",
+			payload: `{"message":{"author":{"role":"assistant"},"metadata":{"image_gen_async":true},"status":"in_progress","content":{"content_type":"text","parts":["Creating image"]}}}`,
+		},
+		{
+			name:    "multi stream flag",
+			payload: `{"message":{"author":{"role":"assistant"},"metadata":{"image_gen_multi_stream":true},"status":"in_progress","content":{"content_type":"text","parts":["Creating image"]}}}`,
+		},
+		{
+			name:    "task id",
+			payload: `{"message":{"author":{"role":"assistant"},"metadata":{"image_gen_task_id":"task-1"},"status":"in_progress","content":{"content_type":"text","parts":["Creating image"]}}}`,
+		},
+		{
+			name:    "image author",
+			payload: `{"message":{"author":{"role":"assistant","name":"image_gen"},"status":"in_progress","content":{"content_type":"text","parts":["Creating image"]}}}`,
+		},
+		{
+			name:    "task envelope",
+			payload: `{"image_gen_message":{"author":{"role":"tool"},"metadata":{"image_gen_async":true},"status":"in_progress","content":{"parts":[]}}}`,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			accumulator := &ChatGPTWebImageAccumulator{}
+			if _, err := accumulator.Apply([]byte(test.payload)); err != nil {
+				t.Fatalf("Apply() error = %v", err)
+			}
+			if !accumulator.imageTool {
+				t.Fatal("official async image activity was not recognized")
+			}
+			if accumulator.HasTerminalAssistantText() {
+				t.Fatal("async image activity was classified as terminal assistant text")
+			}
+		})
+	}
+}
+
+func TestChatGPTWebImageAccumulatorRecognizesPatchedAsyncImageActivity(t *testing.T) {
+	accumulator := &ChatGPTWebImageAccumulator{}
+	for _, payload := range []string{
+		`{"v":{"message":{"author":{"role":"assistant"},"metadata":{},"status":"in_progress","content":{"content_type":"text","parts":[""]}}}}`,
+		`{"o":"replace","p":"/message/metadata/image_gen_task_id","v":"task-1"}`,
+	} {
+		if _, err := accumulator.Apply([]byte(payload)); err != nil {
+			t.Fatalf("Apply() error = %v", err)
+		}
+	}
+	if !accumulator.imageTool {
+		t.Fatal("patched image task ID was not recognized")
+	}
+}
+
+func TestChatGPTWebImageAccumulatorIgnoresDisabledAsyncImageFlag(t *testing.T) {
+	accumulator := &ChatGPTWebImageAccumulator{}
+	payload := []byte(`{"message":{"author":{"role":"assistant"},"metadata":{"image_gen_async":false},"status":"finished_successfully","end_turn":true,"content":{"content_type":"text","parts":["Sorry, I cannot create that image."]}}}`)
+	if _, err := accumulator.Apply(payload); err != nil {
+		t.Fatalf("Apply() error = %v", err)
+	}
+	if accumulator.imageTool {
+		t.Fatal("disabled async image flag was classified as image activity")
+	}
+	if !accumulator.HasTerminalAssistantText() {
+		t.Fatal("terminal assistant refusal was hidden by a disabled async flag")
+	}
+}
+
+func TestCaptureChatGPTWebImageTasksRecognizesOfficialAsyncMetadata(t *testing.T) {
+	accumulator := &ChatGPTWebImageAccumulator{}
+	state, err := CaptureChatGPTWebImageTasks([]byte(`{"tasks":[{
+		"conversation_id":"target",
+		"status":"running",
+		"metadata":{"image_gen_async":true}
+	}]}`), "target", accumulator)
+	if err != nil {
+		t.Fatalf("CaptureChatGPTWebImageTasks() error = %v", err)
+	}
+	if state.Matched != 1 || !state.HasPending() {
+		t.Fatalf("task state = %+v, want one pending async image task", state)
+	}
+}
+
 func TestChatGPTWebImageAccumulatorDoesNotTreatDirectedToolCallAsAssistantReply(t *testing.T) {
 	accumulator := &ChatGPTWebImageAccumulator{}
 	payload := []byte(`{"message":{"author":{"role":"assistant"},"content":{"content_type":"code","language":"json","text":"{\"size\":\"1536x864\",\"n\":1}"},"status":"finished_successfully","end_turn":true,"recipient":"dynamic.image.tool","channel":"commentary","metadata":{}}}`)

@@ -821,7 +821,7 @@ func (e *ChatGPTWebExecutor) finishChatGPTWebImage(ctx context.Context, client *
 	if accumulator.FailureStatus != "" {
 		return nil, chatGPTWebImageFailureError(accumulator.FailureStatus)
 	}
-	if !hasStreamOutput && accumulator.HasTerminalAssistantText() {
+	if !hasStreamOutput && accumulator.HasTerminalAssistantText() && strings.TrimSpace(accumulator.ConversationID) == "" {
 		return nil, newChatGPTWebImageModerationResultError()
 	}
 	hasTerminal := accumulator.Terminal
@@ -841,6 +841,10 @@ func (e *ChatGPTWebExecutor) finishChatGPTWebImage(ctx context.Context, client *
 			var memoryErr *chatGPTWebImageMemoryCapacityError
 			if errors.As(err, &memoryErr) {
 				return nil, err
+			}
+			var noOutputErr *chatGPTWebImageNoOutputResultError
+			if errors.As(err, &noOutputErr) && accumulator.HasTerminalAssistantText() {
+				return nil, newChatGPTWebImageModerationResultError()
 			}
 			if chatGPTWebImagePollAuthenticationError(err) {
 				return nil, err

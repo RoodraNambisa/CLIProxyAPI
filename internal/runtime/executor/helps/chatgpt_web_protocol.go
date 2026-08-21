@@ -1750,7 +1750,17 @@ func (accumulator *ChatGPTWebImageAccumulator) applyImageContextPatch(event map[
 	if strings.Contains(path, "/author/role") {
 		accumulator.role = value
 	}
+	if strings.Contains(path, "/author/name") && value == "image_gen" {
+		accumulator.imageTool = true
+	}
 	if strings.Contains(path, "/metadata/async_task_type") && value == "image_gen" {
+		accumulator.imageTool = true
+	}
+	if strings.Contains(path, "/metadata/image_gen_async") ||
+		strings.Contains(path, "/metadata/image_gen_multi_stream") {
+		accumulator.imageTool = accumulator.imageTool || chatGPTWebTruthy(event["v"])
+	}
+	if strings.Contains(path, "/metadata/image_gen_task_id") && strings.TrimSpace(stringFromAny(event["v"])) != "" {
 		accumulator.imageTool = true
 	}
 }
@@ -2549,13 +2559,16 @@ func chatGPTWebImageTaskMessage(task map[string]any) (map[string]any, bool) {
 	if message != nil {
 		return message, true
 	}
-	for _, key := range []string{"type", "task_type", "async_task_type"} {
+	for _, key := range []string{"type", "task_type"} {
 		if strings.EqualFold(strings.TrimSpace(stringFromAny(task[key])), "image_gen") {
 			return nil, true
 		}
 	}
+	if chatGPTWebImageMetadataActivity(task) {
+		return nil, true
+	}
 	metadata, _ := task["metadata"].(map[string]any)
-	if strings.EqualFold(strings.TrimSpace(stringFromAny(metadata["async_task_type"])), "image_gen") {
+	if chatGPTWebImageMetadataActivity(metadata) {
 		return nil, true
 	}
 	return nil, false
@@ -2987,12 +3000,17 @@ func webMessageCanContainGeneratedImage(role string) bool {
 }
 
 func messageFromWebEvent(event map[string]any) map[string]any {
-	if message, ok := event["message"].(map[string]any); ok {
-		return message
-	}
-	if value, ok := event["v"].(map[string]any); ok {
-		message, _ := value["message"].(map[string]any)
-		return message
+	value, _ := event["v"].(map[string]any)
+	for _, candidate := range []map[string]any{event, value} {
+		if candidate == nil {
+			continue
+		}
+		if message, ok := candidate["message"].(map[string]any); ok {
+			return message
+		}
+		if message, ok := candidate["image_gen_message"].(map[string]any); ok {
+			return message
+		}
 	}
 	return nil
 }
@@ -3001,7 +3019,8 @@ func webMessageImageContext(message map[string]any) (string, bool) {
 	author, _ := message["author"].(map[string]any)
 	role := strings.ToLower(strings.TrimSpace(stringFromAny(author["role"])))
 	metadata, _ := message["metadata"].(map[string]any)
-	imageTool := strings.EqualFold(stringFromAny(metadata["async_task_type"]), "image_gen")
+	imageTool := chatGPTWebImageMetadataActivity(metadata) ||
+		strings.EqualFold(strings.TrimSpace(stringFromAny(author["name"])), "image_gen")
 	if role == "assistant" {
 		recipient := strings.TrimSpace(stringFromAny(message["recipient"]))
 		// User-visible replies target "all". Named recipients are tool calls,
@@ -3017,6 +3036,21 @@ func webMessageImageContext(message map[string]any) (string, bool) {
 		}
 	}
 	return role, imageTool
+}
+
+func chatGPTWebImageMetadataActivity(metadata map[string]any) bool {
+	if metadata == nil {
+		return false
+	}
+	if strings.EqualFold(strings.TrimSpace(stringFromAny(metadata["async_task_type"])), "image_gen") {
+		return true
+	}
+	for _, key := range []string{"image_gen_async", "image_gen_multi_stream"} {
+		if value, exists := metadata[key]; exists && chatGPTWebTruthy(value) {
+			return true
+		}
+	}
+	return strings.TrimSpace(stringFromAny(metadata["image_gen_task_id"])) != ""
 }
 
 func appendUniqueString(values *[]string, value string) {

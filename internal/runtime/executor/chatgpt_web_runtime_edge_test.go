@@ -4515,6 +4515,134 @@ func TestFinishChatGPTWebImagePollsConversationAfterIncompleteStream(t *testing.
 	}
 }
 
+func TestFinishChatGPTWebImageWaitsForOfficialAsyncOutputBeforeModeration(t *testing.T) {
+	imageData := chatGPTWebPNGBytes(t, color.NRGBA{R: 64, G: 128, B: 255, A: 255})
+	var conversationPolls atomic.Int32
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/backend-api/tasks":
+			_ = json.NewEncoder(w).Encode(map[string]any{"tasks": []any{}})
+		case "/backend-api/conversation/async-image":
+			conversationPolls.Add(1)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"current_node": "generated",
+				"mapping": map[string]any{
+					"generated": map[string]any{"message": map[string]any{
+						"author":   map[string]any{"role": "tool", "name": "image_gen"},
+						"metadata": map[string]any{"image_gen_async": true, "image_gen_task_id": "task-1", "is_complete": true, "finish_details": map[string]any{"type": "finished_successfully"}},
+						"content":  map[string]any{"content_type": "multimodal_text", "parts": []any{map[string]any{"content_type": "image_asset_pointer", "asset_pointer": "file-service://generated"}}},
+					}},
+				},
+			})
+		case "/backend-api/files/generated/download":
+			_ = json.NewEncoder(w).Encode(map[string]any{"download_url": server.URL + "/asset"})
+		case "/asset":
+			w.Header().Set("Content-Type", "image/png")
+			_, _ = w.Write(imageData)
+		default:
+			http.NotFound(w, request)
+		}
+	}))
+	defer server.Close()
+
+	executor := NewChatGPTWebExecutor(nil, nil)
+	executor.runtimeBaseURL = server.URL
+	executor.imageMaxPolls = 6
+	disableChatGPTWebImagePollWaits(executor)
+	client, credential, err := executor.newRuntimeClient(chatGPTWebRuntimeAuth())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.CloseIdleConnections()
+	prepared := &chatGPTWebPreparedRequest{
+		routeModel: "gpt-image-2",
+		request: helps.ChatGPTWebRequest{
+			Image: &helps.ChatGPTWebImageRequest{Prompt: "draw"},
+		},
+	}
+	execution := &chatGPTWebImageExecution{response: &fhttp.Response{
+		StatusCode: http.StatusOK,
+		Body: io.NopCloser(strings.NewReader(
+			"data: {\"conversation_id\":\"async-image\",\"message\":{\"author\":{\"role\":\"assistant\",\"name\":\"image_gen\"},\"metadata\":{\"image_gen_async\":true,\"image_gen_task_id\":\"task-1\"},\"status\":\"in_progress\",\"content\":{\"content_type\":\"text\",\"parts\":[\"Creating image\"]}}}\n\n" +
+				"data: {\"message\":{\"author\":{\"role\":\"assistant\"},\"status\":\"finished_successfully\",\"end_turn\":true,\"content\":{\"content_type\":\"text\",\"parts\":[\"Here you go\"]}}}\n\n" +
+				"data: [DONE]\n\n",
+		)),
+	}}
+
+	payload, err := executor.finishChatGPTWebImage(context.Background(), client, credential, prepared, execution)
+	if err != nil {
+		t.Fatalf("finishChatGPTWebImage() error = %v", err)
+	}
+	if len(payload) == 0 {
+		t.Fatal("finishChatGPTWebImage() omitted the asynchronously generated image")
+	}
+	if got := conversationPolls.Load(); got == 0 {
+		t.Fatal("official async image response was not confirmed through conversation polling")
+	}
+}
+
+func TestFinishChatGPTWebImageKeepsTerminalTextRefusalAfterPolling(t *testing.T) {
+	var conversationPolls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/backend-api/tasks":
+			_ = json.NewEncoder(w).Encode(map[string]any{"tasks": []any{}})
+		case "/backend-api/conversation/refused-image":
+			conversationPolls.Add(1)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"current_node": "refused",
+				"mapping": map[string]any{
+					"refused": map[string]any{"message": map[string]any{
+						"author":   map[string]any{"role": "assistant"},
+						"status":   "finished_successfully",
+						"end_turn": true,
+						"content":  map[string]any{"content_type": "text", "parts": []any{"Sorry, I cannot create that image."}},
+					}},
+				},
+			})
+		default:
+			http.NotFound(w, request)
+		}
+	}))
+	defer server.Close()
+
+	executor := NewChatGPTWebExecutor(nil, nil)
+	executor.runtimeBaseURL = server.URL
+	executor.imageMaxPolls = 4
+	disableChatGPTWebImagePollWaits(executor)
+	client, credential, err := executor.newRuntimeClient(chatGPTWebRuntimeAuth())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.CloseIdleConnections()
+	prepared := &chatGPTWebPreparedRequest{
+		routeModel: "gpt-image-2",
+		request: helps.ChatGPTWebRequest{
+			Image: &helps.ChatGPTWebImageRequest{Prompt: "draw"},
+		},
+	}
+	execution := &chatGPTWebImageExecution{response: &fhttp.Response{
+		StatusCode: http.StatusOK,
+		Body: io.NopCloser(strings.NewReader(
+			"data: {\"conversation_id\":\"refused-image\",\"message\":{\"author\":{\"role\":\"assistant\"},\"status\":\"finished_successfully\",\"end_turn\":true,\"content\":{\"content_type\":\"text\",\"parts\":[\"Sorry, I cannot create that image.\"]}}}\n\n" +
+				"data: [DONE]\n\n",
+		)),
+	}}
+
+	_, err = executor.finishChatGPTWebImage(context.Background(), client, credential, prepared, execution)
+	var status interface{ StatusCode() int }
+	if !errors.As(err, &status) || status.StatusCode() != http.StatusBadRequest {
+		t.Fatalf("terminal refusal status = %v, want 400", err)
+	}
+	if err.Error() != helps.OpenAIImageModerationErrorBody {
+		t.Fatalf("terminal refusal body = %q", err.Error())
+	}
+	if got := conversationPolls.Load(); got == 0 {
+		t.Fatal("terminal refusal was not confirmed after checking for async image output")
+	}
+}
+
 func TestFinishChatGPTWebImageDownloadsSedimentWithoutTaskTerminal(t *testing.T) {
 	imageData := chatGPTWebPNGBytes(t, color.NRGBA{R: 255, A: 255})
 	var conversationPolls atomic.Int32
