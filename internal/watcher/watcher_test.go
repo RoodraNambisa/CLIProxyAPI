@@ -4292,6 +4292,47 @@ func TestAuthEqualIgnoresFileRuntimeAvailabilityState(t *testing.T) {
 	}
 }
 
+func TestAuthEqualNormalizesSymlinkedFilePathAliases(t *testing.T) {
+	realDir := t.TempDir()
+	linkDir := filepath.Join(t.TempDir(), "auths")
+	if errLink := os.Symlink(realDir, linkDir); errLink != nil {
+		t.Skipf("symlink is unavailable: %v", errLink)
+	}
+	realPath := filepath.Join(realDir, "codex.json")
+	if errWrite := os.WriteFile(realPath, []byte(`{"type":"codex"}`), 0o600); errWrite != nil {
+		t.Fatalf("write auth: %v", errWrite)
+	}
+	const sourceHash = "same-canonical-source"
+	realAuth := &coreauth.Auth{
+		ID:       "codex.json",
+		Provider: "codex",
+		Attributes: map[string]string{
+			"path":                          realPath,
+			"source":                        realPath,
+			coreauth.SourceHashAttributeKey: sourceHash,
+		},
+	}
+	aliasAuth := realAuth.Clone()
+	aliasPath := filepath.Join(linkDir, "codex.json")
+	aliasAuth.Attributes["path"] = aliasPath
+	aliasAuth.Attributes["source"] = aliasPath
+	if !authEqual(realAuth, aliasAuth) {
+		t.Fatal("symlink alias for the same auth file triggered a modification")
+	}
+
+	otherDir := t.TempDir()
+	otherPath := filepath.Join(otherDir, "codex.json")
+	if errWrite := os.WriteFile(otherPath, []byte(`{"type":"codex"}`), 0o600); errWrite != nil {
+		t.Fatalf("write different auth path: %v", errWrite)
+	}
+	differentAuth := realAuth.Clone()
+	differentAuth.Attributes["path"] = otherPath
+	differentAuth.Attributes["source"] = otherPath
+	if authEqual(realAuth, differentAuth) {
+		t.Fatal("different backing auth paths were treated as aliases")
+	}
+}
+
 func TestInitialSyncEventBufferReplaysLatestAuthState(t *testing.T) {
 	t.Run("modify", func(t *testing.T) {
 		authDir := t.TempDir()

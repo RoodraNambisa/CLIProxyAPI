@@ -554,7 +554,45 @@ func (w *Watcher) stopDispatchLoopLocked() {
 }
 
 func authEqual(a, b *coreauth.Auth) bool {
-	return reflect.DeepEqual(normalizeAuth(a), normalizeAuth(b))
+	normalizedA := normalizeAuth(a)
+	normalizedB := normalizeAuth(b)
+	normalizeEquivalentFileAuthPaths(normalizedA, normalizedB)
+	return reflect.DeepEqual(normalizedA, normalizedB)
+}
+
+func normalizeEquivalentFileAuthPaths(a, b *coreauth.Auth) {
+	if a == nil || b == nil || a.Attributes == nil || b.Attributes == nil {
+		return
+	}
+	sourceHashA := strings.TrimSpace(a.Attributes[coreauth.SourceHashAttributeKey])
+	sourceHashB := strings.TrimSpace(b.Attributes[coreauth.SourceHashAttributeKey])
+	if sourceHashA == "" || sourceHashA != sourceHashB {
+		return
+	}
+	if a.Attributes["path"] == b.Attributes["path"] && a.Attributes["source"] == b.Attributes["source"] {
+		return
+	}
+	pathA := strings.TrimSpace(a.Attributes["path"])
+	if pathA == "" {
+		pathA = strings.TrimSpace(a.Attributes["source"])
+	}
+	pathB := strings.TrimSpace(b.Attributes["path"])
+	if pathB == "" {
+		pathB = strings.TrimSpace(b.Attributes["source"])
+	}
+	identityA := authfileguard.PathIdentity(pathA)
+	identityB := authfileguard.PathIdentity(pathB)
+	if identityA == "" || identityA != identityB {
+		return
+	}
+	for _, key := range []string{"path", "source"} {
+		_, presentA := a.Attributes[key]
+		_, presentB := b.Attributes[key]
+		if presentA || presentB {
+			a.Attributes[key] = identityA
+			b.Attributes[key] = identityA
+		}
+	}
 }
 
 func normalizeAuth(a *coreauth.Auth) *coreauth.Auth {
