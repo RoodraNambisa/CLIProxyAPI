@@ -467,6 +467,18 @@ func TestBuildConversationTurnstileTokenMatchesSentinelSDKFixtures(t *testing.T)
 			want:        "c2VudGluZWwvMjAyNjAyMTk=",
 		},
 		{
+			name: "script source trailing lookahead",
+			program: []any{
+				[]any{2, 40, `/sentinel/[^/]+/sdk\.js(?=[?#]|$)`},
+				[]any{11, 41, 40},
+				[]any{7, 3, 41},
+			},
+			environment: ConversationTurnstileEnvironment{ScriptSources: []string{
+				"https://sentinel.openai.com/sentinel/20260219f9f6/sdk.js?cache=1",
+			}},
+			want: base64.StdEncoding.EncodeToString([]byte("/sentinel/20260219f9f6/sdk.js")),
+		},
+		{
 			name: "custom local storage keys",
 			program: []any{
 				[]any{2, 40, "Object"},
@@ -1042,6 +1054,107 @@ func TestConversationTurnstileRegexpMatchingUsesBoundedCancelableWork(t *testing
 	matcher = regexp.MustCompile(`z$`)
 	if _, err = vm.regexpMatchIndices(matcher, strings.Repeat("a", 4096), false); !errors.Is(err, context.Canceled) {
 		t.Fatalf("regexp cancellation error = %v, want context.Canceled", err)
+	}
+}
+
+func TestConversationTurnstileRegexpSupportsTrailingCharacterLookahead(t *testing.T) {
+	vm := &conversationTurnstileVM{
+		ctx:                 context.Background(),
+		memoryBudget:        &conversationTurnstileMemoryBudget{},
+		executionBudget:     &conversationTurnstileExecutionBudget{},
+		compatibilityErrors: true,
+	}
+	matcher, err := vm.compileRegexp(`/sentinel/([^/]+)/sdk\.js(?=[?#]|$)`)
+	if err != nil {
+		t.Fatalf("compileRegexp() error = %v", err)
+	}
+	for _, test := range []struct {
+		name    string
+		text    string
+		match   string
+		version string
+	}{
+		{name: "end", text: "https://chatgpt.com/sentinel/20260219f9f6/sdk.js", match: "/sentinel/20260219f9f6/sdk.js", version: "20260219f9f6"},
+		{name: "query", text: "https://chatgpt.com/sentinel/20260219f9f6/sdk.js?v=1", match: "/sentinel/20260219f9f6/sdk.js", version: "20260219f9f6"},
+		{name: "fragment", text: "https://chatgpt.com/sentinel/20260219f9f6/sdk.js#ready", match: "/sentinel/20260219f9f6/sdk.js", version: "20260219f9f6"},
+		{name: "extra path", text: "https://chatgpt.com/sentinel/20260219f9f6/sdk.js/next"},
+		{name: "wrong file", text: "https://chatgpt.com/sentinel/20260219f9f6/sdk.jsx?v=1"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			indices, matchErr := vm.regexpMatchIndices(matcher, test.text, true)
+			if matchErr != nil {
+				t.Fatalf("regexpMatchIndices() error = %v", matchErr)
+			}
+			if test.match == "" {
+				if indices != nil {
+					t.Fatalf("indices = %v, want nil", indices)
+				}
+				return
+			}
+			if len(indices) != 4 {
+				t.Fatalf("indices = %v, want two match pairs", indices)
+			}
+			if got := test.text[indices[0]:indices[1]]; got != test.match {
+				t.Fatalf("match = %q, want %q", got, test.match)
+			}
+			if got := test.text[indices[2]:indices[3]]; got != test.version {
+				t.Fatalf("capture = %q, want %q", got, test.version)
+			}
+		})
+	}
+}
+
+func TestConversationTurnstileScriptSourceRestoresTrailingLookaheadRange(t *testing.T) {
+	vm := &conversationTurnstileVM{
+		ctx:                 context.Background(),
+		values:              make(map[string]any),
+		scriptSources:       []string{"https://chatgpt.com/sentinel/20260219f9f6/sdk.js?cache=1"},
+		memoryBudget:        &conversationTurnstileMemoryBudget{},
+		executionBudget:     &conversationTurnstileExecutionBudget{},
+		compatibilityErrors: true,
+	}
+	vm.set(40, `/sentinel/[^/]+/sdk\.js(?=[?#]|$)`)
+	if _, err := vm.opScriptSource([]any{41, 40}); err != nil {
+		t.Fatalf("opScriptSource() error = %v", err)
+	}
+	if got, want := vm.get(41), "/sentinel/20260219f9f6/sdk.js"; got != want {
+		t.Fatalf("script source = %#v, want %q", got, want)
+	}
+}
+
+func TestConversationTurnstileStringMethodsRestoreTrailingLookaheadRange(t *testing.T) {
+	vm := &conversationTurnstileVM{
+		ctx:                 context.Background(),
+		memoryBudget:        &conversationTurnstileMemoryBudget{},
+		executionBudget:     &conversationTurnstileExecutionBudget{},
+		compatibilityErrors: true,
+	}
+	const (
+		text    = "https://chatgpt.com/sentinel/20260219f9f6/sdk.js?cache=1"
+		pattern = `/sentinel/([^/]+)/sdk\.js(?=[?#]|$)`
+	)
+	bound, err := vm.bindStringProperty(text, "search")
+	if err != nil {
+		t.Fatal(err)
+	}
+	search := bound.(conversationTurnstileCallable)
+	if got, errSearch := search.invoke([]any{pattern}); errSearch != nil || got != strings.Index(text, "/sentinel/") {
+		t.Fatalf("search() = %#v, %v", got, errSearch)
+	}
+
+	bound, err = vm.bindStringProperty(text, "match")
+	if err != nil {
+		t.Fatal(err)
+	}
+	match := bound.(conversationTurnstileCallable)
+	got, err := match.invoke([]any{pattern})
+	if err != nil {
+		t.Fatalf("match() error = %v", err)
+	}
+	matches, ok := conversationTurnstileSlice(got)
+	want := []any{"/sentinel/20260219f9f6/sdk.js", "20260219f9f6"}
+	if !ok || !reflect.DeepEqual(matches, want) {
+		t.Fatalf("match() = %#v, want %#v", got, want)
 	}
 }
 

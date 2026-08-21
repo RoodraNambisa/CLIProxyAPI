@@ -415,6 +415,46 @@ type conversationTurnstileExecutionBudget struct {
 	runtimeWork int
 }
 
+type conversationTurnstileRegexpMatcher interface {
+	String() string
+	FindReaderIndex(io.RuneReader) []int
+	FindReaderSubmatchIndex(io.RuneReader) []int
+}
+
+type conversationTurnstileTrailingLookaheadRegexp struct {
+	pattern string
+	matcher *regexp.Regexp
+}
+
+func (matcher *conversationTurnstileTrailingLookaheadRegexp) String() string {
+	return matcher.pattern
+}
+
+func (matcher *conversationTurnstileTrailingLookaheadRegexp) FindReaderIndex(reader io.RuneReader) []int {
+	indices := matcher.findReaderSubmatchIndex(reader)
+	if indices == nil {
+		return nil
+	}
+	return indices[:2]
+}
+
+func (matcher *conversationTurnstileTrailingLookaheadRegexp) FindReaderSubmatchIndex(reader io.RuneReader) []int {
+	return matcher.findReaderSubmatchIndex(reader)
+}
+
+func (matcher *conversationTurnstileTrailingLookaheadRegexp) findReaderSubmatchIndex(reader io.RuneReader) []int {
+	indices := matcher.matcher.FindReaderSubmatchIndex(reader)
+	if len(indices) < 4 {
+		return indices
+	}
+	assertionStart := indices[len(indices)-2]
+	assertionEnd := indices[len(indices)-1]
+	if assertionStart >= 0 && assertionEnd > assertionStart {
+		indices[1] = assertionStart
+	}
+	return indices[:len(indices)-2]
+}
+
 type conversationTurnstileVM struct {
 	ctx                  context.Context
 	values               map[string]any
@@ -433,7 +473,7 @@ type conversationTurnstileVM struct {
 	browserProfile       sentinelBrowserProfile
 	memoryBudget         *conversationTurnstileMemoryBudget
 	executionBudget      *conversationTurnstileExecutionBudget
-	regexpCache          map[string]*regexp.Regexp
+	regexpCache          map[string]conversationTurnstileRegexpMatcher
 	fatalErr             error
 	processMap           *conversationTurnstileProcessMapRef
 	settled              bool
@@ -573,7 +613,7 @@ func newConversationTurnstileVM(ctx context.Context, prepared *conversationTurns
 		challengeEnvironment: environment,
 		memoryBudget:         prepared.memoryBudget,
 		executionBudget:      executionBudget,
-		regexpCache:          make(map[string]*regexp.Regexp),
+		regexpCache:          make(map[string]conversationTurnstileRegexpMatcher),
 		compatibilityErrors:  compatibilityErrors,
 		programKind:          programKind,
 		program:              prepared.program,
@@ -1771,7 +1811,7 @@ func (vm *conversationTurnstileVM) primitiveWithHint(value any, stringHint bool)
 	}
 }
 
-func (vm *conversationTurnstileVM) compileRegexp(value any) (*regexp.Regexp, error) {
+func (vm *conversationTurnstileVM) compileRegexp(value any) (conversationTurnstileRegexpMatcher, error) {
 	hasIsolatedSurrogate := false
 	switch typed := value.(type) {
 	case string:
@@ -1806,7 +1846,7 @@ func (vm *conversationTurnstileVM) compileRegexp(value any) (*regexp.Regexp, err
 		)
 	}
 	if vm.regexpCache == nil {
-		vm.regexpCache = make(map[string]*regexp.Regexp)
+		vm.regexpCache = make(map[string]conversationTurnstileRegexpMatcher)
 	}
 	if matcher := vm.regexpCache[pattern]; matcher != nil {
 		return matcher, nil
@@ -1817,8 +1857,16 @@ func (vm *conversationTurnstileVM) compileRegexp(value any) (*regexp.Regexp, err
 	if err = vm.reserveRuntimeBytes(256 + len(pattern)*8); err != nil {
 		return nil, err
 	}
-	matcher, err := regexp.Compile(pattern)
-	if vm.compatibilityErrors && ((err == nil && conversationTurnstileRegexpHasDifferentRE2Semantics(pattern)) ||
+	var matcher conversationTurnstileRegexpMatcher
+	compiled, err := regexp.Compile(pattern)
+	nativeRE2 := err == nil
+	if err == nil {
+		matcher = compiled
+	} else if trailing, ok := conversationTurnstileCompileTrailingLookaheadRegexp(pattern); ok {
+		matcher = trailing
+		err = nil
+	}
+	if vm.compatibilityErrors && ((err == nil && nativeRE2 && conversationTurnstileRegexpHasDifferentRE2Semantics(pattern)) ||
 		(err != nil && conversationTurnstileJavaScriptOnlyRegexp(pattern))) {
 		patternHash := sha256.Sum256([]byte(pattern))
 		return nil, vm.compatibilityError(
@@ -1832,6 +1880,42 @@ func (vm *conversationTurnstileVM) compileRegexp(value any) (*regexp.Regexp, err
 	}
 	vm.regexpCache[pattern] = matcher
 	return matcher, nil
+}
+
+func conversationTurnstileCompileTrailingLookaheadRegexp(pattern string) (conversationTurnstileRegexpMatcher, bool) {
+	const (
+		lookaheadPrefix = "(?=["
+		lookaheadSuffix = "|$)"
+	)
+	start := strings.LastIndex(pattern, lookaheadPrefix)
+	if start < 0 || !strings.HasSuffix(pattern, lookaheadSuffix) {
+		return nil, false
+	}
+	backslashes := 0
+	for index := start - 1; index >= 0 && pattern[index] == '\\'; index-- {
+		backslashes++
+	}
+	if backslashes%2 != 0 {
+		return nil, false
+	}
+	classStart := start + len("(?=")
+	classEnd := len(pattern) - len(lookaheadSuffix)
+	if classEnd <= classStart+1 || pattern[classStart] != '[' || pattern[classEnd-1] != ']' {
+		return nil, false
+	}
+	characterClass := pattern[classStart:classEnd]
+	for index := 1; index < len(characterClass)-1; index++ {
+		value := characterClass[index]
+		if value < 0x20 || value > 0x7e || strings.ContainsRune(`\[]^-`, rune(value)) {
+			return nil, false
+		}
+	}
+	transformed := pattern[:start] + "(" + characterClass + "|$)"
+	compiled, err := regexp.Compile(transformed)
+	if err != nil {
+		return nil, false
+	}
+	return &conversationTurnstileTrailingLookaheadRegexp{pattern: pattern, matcher: compiled}, true
 }
 
 func conversationTurnstileJavaScriptOnlyRegexp(pattern string) bool {
@@ -2806,7 +2890,7 @@ func (reader *conversationTurnstileContextRuneReader) ReadRune() (rune, int, err
 	return reader.reader.ReadRune()
 }
 
-func (vm *conversationTurnstileVM) regexpMatchIndices(matcher *regexp.Regexp, text string, submatches bool) ([]int, error) {
+func (vm *conversationTurnstileVM) regexpMatchIndices(matcher conversationTurnstileRegexpMatcher, text string, submatches bool) ([]int, error) {
 	patternSize := len(matcher.String())
 	if patternSize < 1 {
 		patternSize = 1
