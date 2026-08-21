@@ -2287,6 +2287,27 @@ func TestSeedCurrentFileAuthsRejectsPathsOutsideAuthDirectory(t *testing.T) {
 	}
 }
 
+func TestSeedCurrentFileAuthsOnlySeedsDirectAuthFiles(t *testing.T) {
+	authDir := t.TempDir()
+	auths := []*coreauth.Auth{
+		{ID: "direct.json", Provider: "codex", FileName: "direct.json"},
+		{ID: "nested-relative.json", Provider: "codex", FileName: "nested/relative.json"},
+		{
+			ID:       "nested-absolute.json",
+			Provider: "codex",
+			Attributes: map[string]string{
+				"path": filepath.Join(authDir, "nested", "absolute.json"),
+			},
+		},
+	}
+	w := &Watcher{authDir: authDir}
+	w.SeedCurrentFileAuths(auths)
+
+	if len(w.currentAuths) != 1 || w.currentAuths["direct.json"] == nil {
+		t.Fatalf("seeded auths = %#v, want only the direct auth file", w.currentAuths)
+	}
+}
+
 func TestAuthUsesRetiredPathResolvesSymlinkAlias(t *testing.T) {
 	realDir := t.TempDir()
 	linkDir := filepath.Join(t.TempDir(), "auths")

@@ -75,7 +75,10 @@ func fileAuthBelongsToDirectory(auth *coreauth.Auth, authDirIdentity string) boo
 		return false
 	}
 	relativePath, errRel := filepath.Rel(authDirIdentity, filepath.Clean(path))
-	return errRel == nil && relativePath != "." && relativePath != ".." && !strings.HasPrefix(relativePath, ".."+string(filepath.Separator))
+	if errRel != nil || relativePath == "." || relativePath == ".." || strings.HasPrefix(relativePath, ".."+string(filepath.Separator)) {
+		return false
+	}
+	return filepath.Dir(relativePath) == "."
 }
 
 func (w *Watcher) setAuthUpdateQueue(queue chan<- AuthUpdate) {
