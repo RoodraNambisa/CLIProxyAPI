@@ -1896,17 +1896,21 @@ func TestChatGPTWebImagePollingStopsAfterLocalMemoryCapacityError(t *testing.T) 
 			case <-time.After(time.Second):
 				t.Fatal("poll response body was not closed")
 			}
-			if got := taskPolls.Load(); got > 1 {
-				t.Fatalf("task polls = %d, want at most 1", got)
-			}
-			if got := conversationPolls.Load(); got > 1 {
-				t.Fatalf("conversation polls = %d, want at most 1", got)
-			}
 			if got := cliproxyexecutor.ChatGPTWebImagePollAdmissionSnapshot().Active; got != pollSlotsBefore {
 				t.Fatalf("poll slots in use = %d, want %d", got, pollSlotsBefore)
 			}
+			// A sibling request can already be on the wire when the terminal
+			// memory error cancels the poll context. Let that first request reach
+			// the test server before asserting that no later poll was scheduled.
+			time.Sleep(3 * executor.imagePollInterval)
 			taskCount := taskPolls.Load()
 			conversationCount := conversationPolls.Load()
+			if taskCount > 1 {
+				t.Fatalf("task polls = %d, want at most 1", taskCount)
+			}
+			if conversationCount > 1 {
+				t.Fatalf("conversation polls = %d, want at most 1", conversationCount)
+			}
 			time.Sleep(3 * executor.imagePollInterval)
 			if taskPolls.Load() != taskCount || conversationPolls.Load() != conversationCount {
 				t.Fatalf("polling continued after terminal memory error: task=%d->%d conversation=%d->%d",
