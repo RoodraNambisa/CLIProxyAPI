@@ -113,7 +113,7 @@ func (e *CodexExecutor) executeOpenAIImage(ctx context.Context, auth *cliproxyau
 		originalPayload = opts.OriginalRequest
 	}
 	url := strings.TrimSuffix(baseURL, "/") + endpoint
-	httpReq, upstreamBody, identityState, err := e.cacheHelper(ctx, sdktranslator.FromString(codexOpenAIImageSourceFormat), url, auth, req, originalPayload, body, true)
+	httpReq, upstreamBody, identityState, err := e.cacheHelper(ctx, sdktranslator.FromString(codexOpenAIImageSourceFormat), url, auth, req, opts, originalPayload, body, true)
 	if err != nil {
 		return resp, err
 	}
@@ -192,7 +192,7 @@ func (e *CodexExecutor) executeOpenAIImageStream(ctx context.Context, auth *clip
 		originalPayload = opts.OriginalRequest
 	}
 	url := strings.TrimSuffix(baseURL, "/") + endpoint
-	httpReq, upstreamBody, identityState, err := e.cacheHelper(ctx, sdktranslator.FromString(codexOpenAIImageSourceFormat), url, auth, req, originalPayload, body, true)
+	httpReq, upstreamBody, identityState, err := e.cacheHelper(ctx, sdktranslator.FromString(codexOpenAIImageSourceFormat), url, auth, req, opts, originalPayload, body, true)
 	if err != nil {
 		return nil, err
 	}

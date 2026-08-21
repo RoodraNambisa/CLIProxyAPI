@@ -4,16 +4,30 @@ import (
 	"context"
 	"io"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor/helps"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v6/sdk/translator"
 	"github.com/tidwall/gjson"
 )
+
+func TestCodexPromptCacheLookupKeyDoesNotRetainAPIKey(t *testing.T) {
+	const apiKey = "secret-downstream-api-key"
+	first := codexPromptCacheLookupKey("openai", apiKey)
+	second := codexPromptCacheLookupKey("openai", apiKey)
+	if first != second {
+		t.Fatalf("lookup keys differ: %q != %q", first, second)
+	}
+	if strings.Contains(first, apiKey) {
+		t.Fatalf("lookup key retains plaintext API key: %q", first)
+	}
+}
 
 func TestCodexExecutorCacheHelper_OpenAIChatCompletions_StablePromptCacheKeyFromAPIKey(t *testing.T) {
 	recorder := httptest.NewRecorder()
@@ -29,7 +43,7 @@ func TestCodexExecutorCacheHelper_OpenAIChatCompletions_StablePromptCacheKeyFrom
 	}
 	url := "https://example.com/responses"
 
-	httpReq, _, _, err := executor.cacheHelper(ctx, sdktranslator.FromString("openai"), url, nil, req, req.Payload, rawJSON, true)
+	httpReq, _, _, err := executor.cacheHelper(ctx, sdktranslator.FromString("openai"), url, nil, req, cliproxyexecutor.Options{}, req.Payload, rawJSON, true)
 	if err != nil {
 		t.Fatalf("cacheHelper error: %v", err)
 	}
@@ -39,22 +53,21 @@ func TestCodexExecutorCacheHelper_OpenAIChatCompletions_StablePromptCacheKeyFrom
 		t.Fatalf("read request body: %v", errRead)
 	}
 
-	expectedKey := uuid.NewSHA1(uuid.NameSpaceOID, []byte("cli-proxy-api:codex:prompt-cache:test-api-key")).String()
 	gotKey := gjson.GetBytes(body, "prompt_cache_key").String()
-	if gotKey != expectedKey {
-		t.Fatalf("prompt_cache_key = %q, want %q", gotKey, expectedKey)
+	if parsed, errParse := uuid.Parse(gotKey); errParse != nil || parsed.Version() != 7 {
+		t.Fatalf("prompt_cache_key = %q, want UUIDv7", gotKey)
 	}
 	if gotConversation := httpReq.Header.Get("Conversation_id"); gotConversation != "" {
 		t.Fatalf("Conversation_id = %q, want empty", gotConversation)
 	}
-	if gotSession := httpReq.Header.Get("Session-Id"); gotSession != expectedKey {
-		t.Fatalf("Session-Id = %q, want %q", gotSession, expectedKey)
+	if gotSession := httpReq.Header.Get("Session-Id"); gotSession != gotKey {
+		t.Fatalf("Session-Id = %q, want %q", gotSession, gotKey)
 	}
 	if gotLegacySession := headerValueCaseInsensitive(httpReq.Header, "Session_id"); gotLegacySession != "" {
 		t.Fatalf("Session_id = %q, want empty", gotLegacySession)
 	}
 
-	httpReq2, _, _, err := executor.cacheHelper(ctx, sdktranslator.FromString("openai"), url, nil, req, req.Payload, rawJSON, true)
+	httpReq2, _, _, err := executor.cacheHelper(ctx, sdktranslator.FromString("openai"), url, nil, req, cliproxyexecutor.Options{}, req.Payload, rawJSON, true)
 	if err != nil {
 		t.Fatalf("cacheHelper error (second call): %v", err)
 	}
@@ -63,8 +76,8 @@ func TestCodexExecutorCacheHelper_OpenAIChatCompletions_StablePromptCacheKeyFrom
 		t.Fatalf("read request body (second call): %v", errRead2)
 	}
 	gotKey2 := gjson.GetBytes(body2, "prompt_cache_key").String()
-	if gotKey2 != expectedKey {
-		t.Fatalf("prompt_cache_key (second call) = %q, want %q", gotKey2, expectedKey)
+	if gotKey2 != gotKey {
+		t.Fatalf("prompt_cache_key (second call) = %q, want %q", gotKey2, gotKey)
 	}
 }
 
@@ -88,7 +101,12 @@ func TestCodexExecutorCacheHelper_IdentityConfuseRemapsBodyAndHeaders(t *testing
 	}
 	url := "https://example.com/responses"
 
-	httpReq, body, identityState, err := executor.cacheHelper(ctx, sdktranslator.FromString("openai-response"), url, auth, req, req.Payload, rawJSON, true)
+	turnID, errTurn := helps.NewCodexUUIDv7()
+	if errTurn != nil {
+		t.Fatalf("generate turn ID: %v", errTurn)
+	}
+	opts := cliproxyexecutor.WithProviderPreparedRequest(cliproxyexecutor.Options{}, executor.Identifier(), codexPreparedSessionIdentity{TurnID: turnID})
+	httpReq, body, identityState, err := executor.cacheHelper(ctx, sdktranslator.FromString("openai-response"), url, auth, req, opts, req.Payload, rawJSON, true)
 	if err != nil {
 		t.Fatalf("cacheHelper error: %v", err)
 	}
@@ -96,7 +114,7 @@ func TestCodexExecutorCacheHelper_IdentityConfuseRemapsBodyAndHeaders(t *testing
 	applyCodexIdentityConfuseHeaders(httpReq.Header, &identityState)
 
 	expectedPromptCacheKey := codexIdentityConfuseUUID("auth-1", "prompt-cache", "cache-1")
-	expectedTurnID := codexIdentityConfuseUUID("auth-1", "turn", "turn-1")
+	expectedTurnID := codexIdentityConfuseTurnUUID("auth-1", "turn-1", turnID)
 	if gotKey := gjson.GetBytes(body, "prompt_cache_key").String(); gotKey != expectedPromptCacheKey {
 		t.Fatalf("prompt_cache_key = %q, want %q", gotKey, expectedPromptCacheKey)
 	}
@@ -111,22 +129,26 @@ func TestCodexExecutorCacheHelper_IdentityConfuseRemapsBodyAndHeaders(t *testing
 	if gotMetadataTurnID := gjson.Get(gotBodyMetadata, "turn_id").String(); gotMetadataTurnID != expectedTurnID {
 		t.Fatalf("client_metadata.x-codex-turn-metadata.turn_id = %q, want %q", gotMetadataTurnID, expectedTurnID)
 	}
-	if gotMetadataWindowID := gjson.Get(gotBodyMetadata, "window_id").String(); gotMetadataWindowID != expectedPromptCacheKey+":0" {
-		t.Fatalf("client_metadata.x-codex-turn-metadata.window_id = %q, want %q", gotMetadataWindowID, expectedPromptCacheKey+":0")
+	if gotMetadataWindowID := gjson.Get(gotBodyMetadata, "window_id").String(); gotMetadataWindowID != "cache-1:0" {
+		t.Fatalf("client_metadata.x-codex-turn-metadata.window_id = %q, want original value", gotMetadataWindowID)
 	}
-	if gotWindowID := gjson.GetBytes(body, "client_metadata.x-codex-window-id").String(); gotWindowID != expectedPromptCacheKey+":0" {
-		t.Fatalf("client_metadata.x-codex-window-id = %q, want %q", gotWindowID, expectedPromptCacheKey+":0")
+	if gotWindowID := gjson.GetBytes(body, "client_metadata.x-codex-window-id").String(); gotWindowID != "cache-1:0" {
+		t.Fatalf("client_metadata.x-codex-window-id = %q, want original value", gotWindowID)
 	}
-	for _, headerName := range []string{"Session-Id", "X-Client-Request-Id", "Thread-Id"} {
-		if gotHeader := httpReq.Header.Get(headerName); gotHeader != expectedPromptCacheKey {
-			t.Fatalf("%s = %q, want %q", headerName, gotHeader, expectedPromptCacheKey)
-		}
+	if gotHeader := httpReq.Header.Get("Session-Id"); gotHeader != "" {
+		t.Fatalf("Session-Id = %q, want empty for an opaque prompt_cache_key", gotHeader)
+	}
+	if gotHeader := httpReq.Header.Get("X-Client-Request-Id"); gotHeader != "client-request-1" {
+		t.Fatalf("X-Client-Request-Id = %q, want original client value", gotHeader)
+	}
+	if gotHeader := httpReq.Header.Get("Thread-Id"); gotHeader != "" {
+		t.Fatalf("Thread-Id = %q, want empty", gotHeader)
 	}
 	if gotSession := headerValueCaseInsensitive(httpReq.Header, "Session_id"); gotSession != "" {
 		t.Fatalf("Session_id = %q, want empty", gotSession)
 	}
-	if gotWindow := httpReq.Header.Get("X-Codex-Window-Id"); gotWindow != expectedPromptCacheKey+":0" {
-		t.Fatalf("X-Codex-Window-Id = %q, want %q", gotWindow, expectedPromptCacheKey+":0")
+	if gotWindow := httpReq.Header.Get("X-Codex-Window-Id"); gotWindow != "" {
+		t.Fatalf("X-Codex-Window-Id = %q, want empty", gotWindow)
 	}
 	gotHeaderMetadata := httpReq.Header.Get("X-Codex-Turn-Metadata")
 	if gotMetadataPromptCacheKey := gjson.Get(gotHeaderMetadata, "prompt_cache_key").String(); gotMetadataPromptCacheKey != expectedPromptCacheKey {
@@ -135,8 +157,8 @@ func TestCodexExecutorCacheHelper_IdentityConfuseRemapsBodyAndHeaders(t *testing
 	if gotMetadataTurnID := gjson.Get(gotHeaderMetadata, "turn_id").String(); gotMetadataTurnID != expectedTurnID {
 		t.Fatalf("X-Codex-Turn-Metadata.turn_id = %q, want %q", gotMetadataTurnID, expectedTurnID)
 	}
-	if gotMetadataWindowID := gjson.Get(gotHeaderMetadata, "window_id").String(); gotMetadataWindowID != expectedPromptCacheKey+":0" {
-		t.Fatalf("X-Codex-Turn-Metadata.window_id = %q, want %q", gotMetadataWindowID, expectedPromptCacheKey+":0")
+	if gotMetadataWindowID := gjson.Get(gotHeaderMetadata, "window_id").String(); gotMetadataWindowID != "cache-1:0" {
+		t.Fatalf("X-Codex-Turn-Metadata.window_id = %q, want original value", gotMetadataWindowID)
 	}
 }
 

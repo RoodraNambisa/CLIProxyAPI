@@ -281,9 +281,13 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 		return resp, err
 	}
 
-	body, wsHeaders := applyCodexPromptCacheHeaders(from, req, body)
+	body, wsHeaders, err := applyCodexPromptCacheHeaders(ctx, from, req, body)
+	if err != nil {
+		return resp, err
+	}
 	clientBody := body
-	upstreamBody, identityState := applyCodexIdentityConfuseBody(e.cfg, auth, originalPayloadSource, body)
+	preparedIdentity := e.codexPreparedSessionIdentity(ctx, req, opts)
+	upstreamBody, identityState := applyCodexIdentityConfuseBody(e.cfg, auth, originalPayloadSource, body, preparedIdentity.TurnID)
 	wsHeaders, err = prepareCodexWebsocketHeadersForURL(ctx, wsHeaders, auth, apiKey, e.cfg, parsedURLOrNil(wsURL))
 	if err != nil {
 		return resp, err
@@ -574,9 +578,13 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 		return nil, err
 	}
 
-	body, wsHeaders := applyCodexPromptCacheHeaders(from, req, body)
+	body, wsHeaders, err := applyCodexPromptCacheHeaders(ctx, from, req, body)
+	if err != nil {
+		return nil, err
+	}
 	clientBody := body
-	upstreamBody, identityState := applyCodexIdentityConfuseBody(e.cfg, auth, userPayload, body)
+	preparedIdentity := e.codexPreparedSessionIdentity(ctx, req, opts)
+	upstreamBody, identityState := applyCodexIdentityConfuseBody(e.cfg, auth, userPayload, body, preparedIdentity.TurnID)
 	wsHeaders, err = prepareCodexWebsocketHeadersForURL(ctx, wsHeaders, auth, apiKey, e.cfg, parsedURLOrNil(wsURL))
 	if err != nil {
 		return nil, err
@@ -1124,10 +1132,10 @@ func buildCodexResponsesWebsocketURL(httpURL string) (string, error) {
 	return parsed.String(), nil
 }
 
-func applyCodexPromptCacheHeaders(from sdktranslator.Format, req cliproxyexecutor.Request, rawJSON []byte) ([]byte, http.Header) {
+func applyCodexPromptCacheHeaders(ctx context.Context, from sdktranslator.Format, req cliproxyexecutor.Request, rawJSON []byte) ([]byte, http.Header, error) {
 	headers := http.Header{}
 	if len(rawJSON) == 0 {
-		return rawJSON, headers
+		return rawJSON, headers, nil
 	}
 
 	var cache helps.CodexCache
@@ -1135,29 +1143,35 @@ func applyCodexPromptCacheHeaders(from sdktranslator.Format, req cliproxyexecuto
 		userIDResult := gjson.GetBytes(req.Payload, "metadata.user_id")
 		if userIDResult.Exists() {
 			key := fmt.Sprintf("%s-%s", req.Model, userIDResult.String())
-			if cached, ok := helps.GetCodexCache(key); ok {
-				cache = cached
-			} else {
-				cache = helps.CodexCache{
-					ID:     uuid.New().String(),
-					Expire: time.Now().Add(1 * time.Hour),
-				}
-				helps.SetCodexCache(key, cache)
+			var errCache error
+			cache, errCache = codexPromptCacheIdentity(key)
+			if errCache != nil {
+				return nil, nil, errCache
 			}
 		}
 	} else if from == "openai-response" {
 		if promptCacheKey := gjson.GetBytes(req.Payload, "prompt_cache_key"); promptCacheKey.Exists() {
 			cache.ID = promptCacheKey.String()
 		}
+	} else if from == "openai" {
+		if apiKey := strings.TrimSpace(helps.APIKeyFromContext(ctx)); apiKey != "" {
+			var errCache error
+			cache, errCache = codexPromptCacheIdentity(codexPromptCacheLookupKey("openai", apiKey))
+			if errCache != nil {
+				return nil, nil, errCache
+			}
+		}
 	}
 
 	if cache.ID != "" {
 		rawJSON, _ = sjson.SetBytes(rawJSON, "prompt_cache_key", cache.ID)
-		setHeaderCasePreserved(headers, "session_id", cache.ID)
-		headers.Set("Conversation_id", cache.ID)
+		if _, errParse := uuid.Parse(strings.TrimSpace(cache.ID)); errParse == nil {
+			setHeaderCasePreserved(headers, "session_id", cache.ID)
+			headers.Set("Conversation_id", cache.ID)
+		}
 	}
 
-	return rawJSON, headers
+	return rawJSON, headers, nil
 }
 
 func applyCodexWebsocketHeaders(ctx context.Context, headers http.Header, auth *cliproxyauth.Auth, token string, cfg *config.Config) http.Header {
@@ -1205,7 +1219,15 @@ func prepareCodexWebsocketHeadersForURL(ctx context.Context, headers http.Header
 	}
 	headers.Set("OpenAI-Beta", betaHeader)
 	if strings.Contains(headers.Get("User-Agent"), "Mac OS") {
-		ensureHeaderCasePreserved(headers, ginHeaders, "session_id", "", uuid.NewString())
+		fallbackSessionID := ""
+		if headerValueCaseInsensitive(headers, "session_id") == "" && headerValueCaseInsensitive(ginHeaders, "session_id") == "" {
+			var errSession error
+			fallbackSessionID, errSession = helps.NewCodexUUIDv7()
+			if errSession != nil {
+				return nil, errSession
+			}
+		}
+		ensureHeaderCasePreserved(headers, ginHeaders, "session_id", "", fallbackSessionID)
 	}
 	ensureHeaderCasePreserved(headers, ginHeaders, "session_id", "", "")
 	if originator := strings.TrimSpace(ginHeaders.Get("Originator")); originator != "" {

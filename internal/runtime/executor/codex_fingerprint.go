@@ -144,6 +144,11 @@ func canonicalCodexInstallationID(value string) string {
 	return parsed.String()
 }
 
+func isCodexUUIDVersion(value string, version uuid.Version) bool {
+	parsed, err := uuid.Parse(strings.TrimSpace(value))
+	return err == nil && parsed != uuid.Nil && parsed.Version() == version
+}
+
 func deriveStableCodexFingerprintUUID(kind, seed string) string {
 	sum := sha256.Sum256([]byte("cli-proxy-api:codex-fingerprint:v1:" + kind + ":" + seed))
 	var id uuid.UUID

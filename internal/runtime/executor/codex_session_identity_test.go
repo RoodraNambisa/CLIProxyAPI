@@ -64,7 +64,7 @@ func TestCodexPreparedSessionIdentitySnapshotsEnabledState(t *testing.T) {
 	}
 }
 
-func TestCodexPrepareProviderRequestUsesStablePromptCacheIdentity(t *testing.T) {
+func TestCodexPrepareProviderRequestDoesNotUseOpaquePromptCacheAsSessionIdentity(t *testing.T) {
 	executor := NewCodexExecutor(&config.Config{Codex: config.CodexConfig{SpoofSessionIdentity: true}})
 	req := cliproxyexecutor.Request{Payload: []byte(`{"prompt_cache_key":"shared-cache"}`)}
 
@@ -72,11 +72,13 @@ func TestCodexPrepareProviderRequestUsesStablePromptCacheIdentity(t *testing.T) 
 	second := prepareCodexSessionIdentityForTest(t, executor, contextWithCodexTestAPIKey("tenant-a"), req, cliproxyexecutor.Options{})
 	otherTenant := prepareCodexSessionIdentityForTest(t, executor, contextWithCodexTestAPIKey("tenant-b"), req, cliproxyexecutor.Options{})
 
-	if first.ThreadID != second.ThreadID {
-		t.Fatalf("same tenant prompt cache thread IDs differ: %q != %q", first.ThreadID, second.ThreadID)
+	for _, identity := range []codexPreparedSessionIdentity{first, second, otherTenant} {
+		if !isCodexUUIDVersion(identity.ThreadID, uuid.Version(7)) || !isCodexUUIDVersion(identity.TurnID, uuid.Version(7)) {
+			t.Fatalf("prepared identity = %#v, want UUIDv7 thread and turn", identity)
+		}
 	}
-	if first.ThreadID == otherTenant.ThreadID {
-		t.Fatalf("different tenants share thread ID %q", first.ThreadID)
+	if first.ThreadID == second.ThreadID {
+		t.Fatalf("independent requests reused opaque prompt cache as thread ID %q", first.ThreadID)
 	}
 	if first.TurnID == second.TurnID {
 		t.Fatalf("independent requests share turn ID %q", first.TurnID)
@@ -106,8 +108,11 @@ func TestCodexPrepareProviderRequestUsesExecutionSessionAndRequestID(t *testing.
 	ctx := logging.WithRequestID(t.Context(), "request-123")
 	first := prepareCodexSessionIdentityForTest(t, executor, ctx, cliproxyexecutor.Request{}, cliproxyexecutor.Options{})
 	second := prepareCodexSessionIdentityForTest(t, executor, ctx, cliproxyexecutor.Request{}, cliproxyexecutor.Options{})
-	if first.ThreadID != second.ThreadID {
-		t.Fatalf("same request ID produced different threads: %q != %q", first.ThreadID, second.ThreadID)
+	if !isCodexUUIDVersion(first.ThreadID, uuid.Version(7)) || !isCodexUUIDVersion(second.ThreadID, uuid.Version(7)) {
+		t.Fatalf("request identities = %q, %q; want UUIDv7", first.ThreadID, second.ThreadID)
+	}
+	if first.ThreadID == second.ThreadID {
+		t.Fatalf("independent preflight snapshots share thread ID %q", first.ThreadID)
 	}
 }
 
@@ -639,7 +644,6 @@ func TestCodexProjectSessionIdentityKeepsIdentityConfuseApplied(t *testing.T) {
 	}
 	executor := NewCodexExecutor(cfg)
 	auth := &cliproxyauth.Auth{ID: "oauth-auth", Provider: "codex", Metadata: map[string]any{"access_token": "oauth-token"}}
-	originalCacheKey := "cache-original"
 	originalTurnID := "turn-original"
 	requestPayload := []byte(`{"prompt_cache_key":"cache-original"}`)
 	upstreamPayload := []byte(`{"model":"gpt-5.4","client_metadata":{"session_id":"session-original","thread_id":"thread-original","turn_id":"turn-original","x-codex-window-id":"thread-original:0","x-codex-turn-metadata":"{\"session_id\":\"session-original\",\"thread_id\":\"thread-original\",\"turn_id\":\"turn-original\",\"window_id\":\"thread-original:0\"}"}}`)
@@ -655,18 +659,18 @@ func TestCodexProjectSessionIdentityKeepsIdentityConfuseApplied(t *testing.T) {
 	if err != nil {
 		t.Fatalf("projectCodexSessionIdentity() error = %v", err)
 	}
-	expectedCacheKey := codexIdentityConfuseUUID(auth.ID, "prompt-cache", originalCacheKey)
 	expectedTurnID := codexIdentityConfuseUUID(auth.ID, "turn", originalTurnID)
-	if state.identity.SessionID != expectedCacheKey || state.identity.ThreadID != expectedCacheKey || state.identity.WindowID != expectedCacheKey+":0" {
-		t.Fatalf("projected identity = %#v, want confused cache identity %q", state.identity, expectedCacheKey)
+	if state.identity.SessionID != "session-original" || state.identity.ThreadID != "thread-original" || state.identity.WindowID != "thread-original:0" {
+		t.Fatalf("projected identity = %#v, want prompt cache kept separate from session identity", state.identity)
 	}
 	if state.identity.TurnID != expectedTurnID {
 		t.Fatalf("TurnID = %q, want %q", state.identity.TurnID, expectedTurnID)
 	}
-	for _, path := range []string{"client_metadata.session_id", "client_metadata.thread_id"} {
-		if got := gjson.GetBytes(projected, path).String(); got != expectedCacheKey {
-			t.Fatalf("%s = %q, want %q", path, got, expectedCacheKey)
-		}
+	if got := gjson.GetBytes(projected, "client_metadata.session_id").String(); got != "session-original" {
+		t.Fatalf("client_metadata.session_id = %q, want original session", got)
+	}
+	if got := gjson.GetBytes(projected, "client_metadata.thread_id").String(); got != "thread-original" {
+		t.Fatalf("client_metadata.thread_id = %q, want original thread", got)
 	}
 	if got := gjson.GetBytes(projected, "client_metadata.turn_id").String(); got != expectedTurnID {
 		t.Fatalf("client_metadata.turn_id = %q, want %q", got, expectedTurnID)
@@ -709,10 +713,9 @@ func TestCodexProjectSessionIdentityConfusesCredentialHeadersBeforePriorityMerge
 	if err != nil {
 		t.Fatalf("projectCodexSessionIdentity() error = %v", err)
 	}
-	wantSession := codexIdentityConfuseUUID(auth.ID, "prompt-cache", "cache-original")
-	wantTurn := codexIdentityConfuseUUID(auth.ID, "turn", "admin-turn")
-	if state.identity.SessionID != wantSession || state.identity.ThreadID != wantSession || state.identity.WindowID != wantSession+":0" {
-		t.Fatalf("credential identity = %#v, want confused session %q", state.identity, wantSession)
+	wantTurn := identityState.confuseTurnID("admin-turn")
+	if state.identity.SessionID != "admin-session" || state.identity.ThreadID != "admin-thread" || state.identity.WindowID != "admin-window" {
+		t.Fatalf("credential identity = %#v, want credential session identity preserved", state.identity)
 	}
 	if state.identity.TurnID != wantTurn {
 		t.Fatalf("credential TurnID = %q, want %q", state.identity.TurnID, wantTurn)
