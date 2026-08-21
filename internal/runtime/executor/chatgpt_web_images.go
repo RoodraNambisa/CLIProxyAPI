@@ -2404,7 +2404,10 @@ func (e *ChatGPTWebExecutor) fetchChatGPTWebImageTaskPages(ctx context.Context, 
 
 	for index := range result.state.Targets {
 		target := &result.state.Targets[index]
-		if target.Terminal || strings.TrimSpace(target.ResponseMessageID) == "" || exactStreams == nil {
+		if strings.TrimSpace(target.ResponseMessageID) == "" || exactStreams == nil {
+			continue
+		}
+		if target.Terminal && (chatGPTWebImageOutputCount(result.accumulator) > 0 || result.accumulator.FailureStatus != "") {
 			continue
 		}
 		exactAccumulator := exactStreams.load(target.TaskID)
@@ -2441,8 +2444,10 @@ func (e *ChatGPTWebExecutor) fetchChatGPTWebImageTaskPages(ctx context.Context, 
 		}
 		result.accumulator = merged
 		if exactAccumulator.Terminal || exactAccumulator.FailureStatus != "" || exactAccumulator.StreamTerminal {
-			target.Terminal = true
-			result.state.Terminal++
+			if !target.Terminal {
+				target.Terminal = true
+				result.state.Terminal++
+			}
 		}
 	}
 	result.accumulator.Terminal = result.state.AllTerminal()

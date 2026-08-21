@@ -6100,7 +6100,7 @@ func TestFetchChatGPTWebImageTaskPagesFindsCurrentTaskOnSecondPage(t *testing.T)
 	}
 }
 
-func TestFetchChatGPTWebImageTaskPagesUsesExactTaskStreamOnce(t *testing.T) {
+func TestFetchChatGPTWebImageTaskPagesUsesExactTaskStreamOnceForTerminalTaskWithoutOutput(t *testing.T) {
 	metricsBefore := ChatGPTWebImageProtocolSnapshot()
 	var streamRequests atomic.Int32
 	var invalidQuery atomic.Bool
@@ -6112,7 +6112,7 @@ func TestFetchChatGPTWebImageTaskPagesUsesExactTaskStreamOnce(t *testing.T) {
 				"response_message_id":                   "response-message",
 				"conversation_id":                       "stream-conversation",
 				"original_conversation_user_message_id": "current-user",
-				"status":                                "running",
+				"status":                                "completed",
 				"image_gen_message": map[string]any{
 					"author":   map[string]any{"role": "tool"},
 					"metadata": map[string]any{"async_task_type": "image_gen"},
