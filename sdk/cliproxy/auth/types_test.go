@@ -20,6 +20,17 @@ func TestRuntimeInstallationID(t *testing.T) {
 	}
 }
 
+func TestCloneWithoutRuntimeInstanceClearsCredentialGeneration(t *testing.T) {
+	auth := &Auth{chatGPTWebCredentialGeneration: "runtime-generation"}
+	clone := auth.CloneWithoutRuntimeInstance()
+	if clone.chatGPTWebCredentialGeneration != "" {
+		t.Fatalf("runtime-free clone generation = %q, want empty", clone.chatGPTWebCredentialGeneration)
+	}
+	if auth.chatGPTWebCredentialGeneration != "runtime-generation" {
+		t.Fatal("CloneWithoutRuntimeInstance() mutated the source auth")
+	}
+}
+
 func TestToolPrefixDisabled(t *testing.T) {
 	var a *Auth
 	if a.ToolPrefixDisabled() {

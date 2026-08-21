@@ -4109,6 +4109,25 @@ func (m *Manager) LoadWithReport(ctx context.Context) (StoreLoadReport, error) {
 		}
 		auth.EnsureIndex()
 		loadedAuth := auth.Clone()
+		projectionPath := ""
+		if loadedAuth.Attributes != nil {
+			projectionPath = strings.TrimSpace(loadedAuth.Attributes["path"])
+		}
+		if projectionPath == "" {
+			projectionPath = strings.TrimSpace(loadedAuth.FileName)
+		}
+		if projectionPath != "" && loadedAuth.Metadata != nil {
+			if errProjection := ApplyFileAuthProjection(loadedAuth, FileAuthProjectionOptions{
+				Config:  cfg,
+				AuthDir: cfg.AuthDir,
+				Path:    projectionPath,
+				Now:     loadedAuth.UpdatedAt,
+			}); errProjection != nil {
+				log.WithError(errProjection).Warnf("auth: skipping %s with invalid file projection", auth.ID)
+				continue
+			}
+		}
+		loadedAuth.EnsureIndex()
 		normalizeChatGPTWebDependencyState(loadedAuth)
 		stampChatGPTWebCredentialGeneration(loadedAuth)
 		applyLifecycleRuntimeState(loadedAuth)

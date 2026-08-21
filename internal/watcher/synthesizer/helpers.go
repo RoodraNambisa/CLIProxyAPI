@@ -4,11 +4,9 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
-	"sort"
 	"strings"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/watcher/diff"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 )
 
@@ -56,51 +54,7 @@ func (g *StableIDGenerator) Next(kind string, parts ...string) (string, string) 
 // For OAuth entries, perKey (from the JSON file's excluded-models field) is merged
 // with the global oauth-excluded-models config for the provider.
 func ApplyAuthExcludedModelsMeta(auth *coreauth.Auth, cfg *config.Config, perKey []string, authKind string) {
-	if auth == nil || cfg == nil {
-		return
-	}
-	authKindKey := strings.ToLower(strings.TrimSpace(authKind))
-	seen := make(map[string]struct{})
-	add := func(list []string) {
-		for _, entry := range list {
-			if trimmed := strings.TrimSpace(entry); trimmed != "" {
-				key := strings.ToLower(trimmed)
-				if _, exists := seen[key]; exists {
-					continue
-				}
-				seen[key] = struct{}{}
-			}
-		}
-	}
-	if authKindKey == "apikey" {
-		add(perKey)
-	} else {
-		// For OAuth: merge per-account excluded models with global provider-level exclusions
-		add(perKey)
-		if cfg.OAuthExcludedModels != nil {
-			providerKey := strings.ToLower(strings.TrimSpace(auth.Provider))
-			add(cfg.OAuthExcludedModels[providerKey])
-		}
-	}
-	combined := make([]string, 0, len(seen))
-	for k := range seen {
-		combined = append(combined, k)
-	}
-	sort.Strings(combined)
-	hash := diff.ComputeExcludedModelsHash(combined)
-	if auth.Attributes == nil {
-		auth.Attributes = make(map[string]string)
-	}
-	if hash != "" {
-		auth.Attributes["excluded_models_hash"] = hash
-	}
-	// Store the combined excluded models list so that routing can read it at runtime
-	if len(combined) > 0 {
-		auth.Attributes["excluded_models"] = strings.Join(combined, ",")
-	}
-	if authKind != "" {
-		auth.Attributes["auth_kind"] = authKind
-	}
+	coreauth.ApplyAuthExcludedModelsMeta(auth, cfg, perKey, authKind)
 }
 
 // addConfigHeadersToAttrs adds header configuration to auth attributes.

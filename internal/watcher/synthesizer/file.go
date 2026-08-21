@@ -4,12 +4,8 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
-	"runtime"
-	"strconv"
 	"strings"
 
-	chatgptwebauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/chatgptweb"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/auth/codex"
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v6/sdk/auth"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 )
@@ -71,8 +67,6 @@ func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) []
 	if ctx == nil || len(data) == 0 {
 		return nil
 	}
-	now := ctx.Now
-	cfg := ctx.Config
 	var metadata map[string]any
 	if errUnmarshal := json.Unmarshal(data, &metadata); errUnmarshal != nil {
 		return nil
@@ -86,147 +80,17 @@ func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) []
 	if provider == "" {
 		return nil
 	}
-	label := provider
-	if email, _ := metadata["email"].(string); email != "" {
-		label = email
-	}
-	// Use relative path under authDir as ID to stay consistent with the file-based token store.
-	id := fullPath
-	if strings.TrimSpace(ctx.AuthDir) != "" {
-		if rel, errRel := filepath.Rel(ctx.AuthDir, fullPath); errRel == nil && rel != "" {
-			id = rel
-		}
-	}
-	if runtime.GOOS == "windows" {
-		id = strings.ToLower(id)
-	}
-
-	proxyURL := ""
-	if p, ok := metadata["proxy_url"].(string); ok {
-		proxyURL = p
-	}
-	prefix := ""
-	if rawPrefix, ok := metadata["prefix"].(string); ok {
-		trimmed := strings.TrimSpace(rawPrefix)
-		trimmed = strings.Trim(trimmed, "/")
-		if trimmed != "" && !strings.Contains(trimmed, "/") {
-			prefix = trimmed
-		}
-	}
-
-	disabled, _ := metadata["disabled"].(bool)
-	status := coreauth.StatusActive
-	statusMessage := ""
-	if disabled {
-		status = coreauth.StatusDisabled
-	} else if provider == "chatgpt-web" {
-		state := (&coreauth.Auth{Provider: provider, Metadata: metadata}).LifecycleState()
-		status = coreauth.RuntimeStatusForLifecycle(state)
-		statusMessage = chatgptwebauth.SafeLifecycleReason(metadataString(metadata, "lifecycle_reason"))
-	}
-
-	// Read per-account excluded models from the OAuth JSON file.
-	perAccountExcluded := extractExcludedModelsFromMetadata(metadata)
-
 	a := &coreauth.Auth{
-		ID:            id,
-		Provider:      provider,
-		Label:         label,
-		Prefix:        prefix,
-		Status:        status,
-		StatusMessage: statusMessage,
-		Disabled:      disabled,
-		Attributes: map[string]string{
-			"source": fullPath,
-			"path":   fullPath,
-		},
-		ProxyURL:  proxyURL,
-		Metadata:  metadata,
-		CreatedAt: now,
-		UpdatedAt: now,
+		Provider: provider,
+		Metadata: metadata,
 	}
-	if provider == "chatgpt-web" {
-		a.FileName = id
-	}
-	coreauth.ApplyFileBackedGeminiAPIKey(a)
-	if errHash := coreauth.SetCanonicalSourceHashAttribute(a); errHash != nil {
+	if errProjection := coreauth.ApplyFileAuthProjection(a, coreauth.FileAuthProjectionOptions{
+		Config:  ctx.Config,
+		AuthDir: ctx.AuthDir,
+		Path:    fullPath,
+		Now:     ctx.Now,
+	}); errProjection != nil {
 		return nil
-	}
-	// Read priority from auth file.
-	if rawPriority, ok := metadata["priority"]; ok {
-		switch v := rawPriority.(type) {
-		case float64:
-			a.Attributes["priority"] = strconv.Itoa(int(v))
-		case string:
-			priority := strings.TrimSpace(v)
-			if _, errAtoi := strconv.Atoi(priority); errAtoi == nil {
-				a.Attributes["priority"] = priority
-			}
-		}
-	}
-	// Read note from auth file.
-	if rawNote, ok := metadata["note"]; ok {
-		if note, isStr := rawNote.(string); isStr {
-			if trimmed := strings.TrimSpace(note); trimmed != "" {
-				a.Attributes["note"] = trimmed
-			}
-		}
-	}
-	coreauth.ApplyCustomHeadersFromMetadata(a)
-	authKind := "oauth"
-	if strings.TrimSpace(a.Attributes["api_key"]) != "" {
-		authKind = "apikey"
-	}
-	ApplyAuthExcludedModelsMeta(a, cfg, perAccountExcluded, authKind)
-	if provider == "codex" {
-		if planType := codex.EffectivePlanType(metadata); planType != "" {
-			a.Attributes["plan_type"] = planType
-		}
 	}
 	return []*coreauth.Auth{a}
-}
-
-func metadataString(metadata map[string]any, key string) string {
-	if metadata == nil {
-		return ""
-	}
-	value, _ := metadata[key].(string)
-	return value
-}
-
-// extractExcludedModelsFromMetadata reads per-account excluded models from the OAuth JSON metadata.
-// Supports both "excluded_models" and "excluded-models" keys, and accepts both []string and []interface{}.
-func extractExcludedModelsFromMetadata(metadata map[string]any) []string {
-	if metadata == nil {
-		return nil
-	}
-	// Try both key formats
-	raw, ok := metadata["excluded_models"]
-	if !ok {
-		raw, ok = metadata["excluded-models"]
-	}
-	if !ok || raw == nil {
-		return nil
-	}
-	var stringSlice []string
-	switch v := raw.(type) {
-	case []string:
-		stringSlice = v
-	case []interface{}:
-		stringSlice = make([]string, 0, len(v))
-		for _, item := range v {
-			if s, ok := item.(string); ok {
-				stringSlice = append(stringSlice, s)
-			}
-		}
-	default:
-		return nil
-	}
-	result := make([]string, 0, len(stringSlice))
-	for _, s := range stringSlice {
-		if trimmed := strings.TrimSpace(s); trimmed != "" {
-			result = append(result, trimmed)
-		}
-	}
-	return result
 }

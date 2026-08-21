@@ -495,6 +495,7 @@ func (a *Auth) CloneWithoutRuntimeInstance() *Auth {
 	clone.installationID = ""
 	clone.instanceID = ""
 	clone.instanceState = nil
+	clone.chatGPTWebCredentialGeneration = ""
 	clone.requestRefreshFamilyID = ""
 	return clone
 }

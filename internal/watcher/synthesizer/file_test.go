@@ -735,6 +735,7 @@ func TestSynthesizeAuthFileMapsChatGPTWebLifecycle(t *testing.T) {
 			payload:      `{"type":"chatgpt-web","lifecycle_state":"dead","lifecycle_reason":"account_deactivated","disabled":true}`,
 			wantState:    coreauth.LifecycleStateDead,
 			wantStatus:   coreauth.StatusDisabled,
+			wantMessage:  "account_deactivated",
 			wantDisabled: true,
 		},
 	}
