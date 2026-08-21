@@ -86,28 +86,33 @@ func TestGetChatGPTWebSentinelReturnsDefaultsWithoutExecutor(t *testing.T) {
 func TestGetChatGPTWebSentinelReturnsRuntimeSnapshot(t *testing.T) {
 	manager := coreauth.NewManager(nil, nil, nil)
 	manager.RegisterExecutor(sentinelSnapshotTestExecutor{snapshot: chatgptwebauth.SentinelRuntimeSnapshot{
-		SDKRuntimeEnabled:      true,
-		SDKWorkers:             3,
-		SDKQueueSize:           8,
-		SDKCacheVersions:       2,
-		Initialized:            true,
-		Available:              true,
-		WorkerLimit:            3,
-		Busy:                   2,
-		Queued:                 4,
-		SourcePending:          2,
-		SourceWaiters:          5,
-		BytecodeWaiters:        3,
-		ObserverSessions:       1,
-		SDKVersion:             "20260721",
-		SDKSHA256:              "abcdef",
-		SourceCacheEntries:     2,
-		BytecodeCacheEntries:   1,
-		CompatibilityFallbacks: 5,
-		SDKPreferredHits:       2,
-		SessionObserverCount:   6,
-		FallbackCount:          7,
-		LastError:              "previous failure",
+		SDKRuntimeEnabled:              true,
+		SDKWorkers:                     3,
+		SDKQueueSize:                   8,
+		SDKCacheVersions:               2,
+		Initialized:                    true,
+		Available:                      true,
+		WorkerLimit:                    3,
+		Busy:                           2,
+		Queued:                         4,
+		SourcePending:                  2,
+		SourceWaiters:                  5,
+		BytecodeWaiters:                3,
+		ObserverSessions:               1,
+		SDKVersion:                     "20260721",
+		SDKSHA256:                      "abcdef",
+		SourceCacheEntries:             2,
+		BytecodeCacheEntries:           1,
+		CompatibilityFallbacks:         5,
+		TurnstileFallbacks:             3,
+		ObserverFallbacks:              2,
+		SDKPreferredHits:               2,
+		SessionObserverCount:           6,
+		FallbackCount:                  7,
+		LastCompatibilityProgram:       "observer",
+		LastCompatibilityKind:          "unsupported_value",
+		LastCompatibilityOperationHash: strings.Repeat("a", 64),
+		LastError:                      "previous failure",
 		PersonaOutcomes: []chatgptwebauth.PersonaOutcomeSnapshot{{
 			CatalogVersion:       "v2",
 			CatalogID:            "c146-mac-m2-1470",
@@ -137,6 +142,9 @@ func TestGetChatGPTWebSentinelReturnsRuntimeSnapshot(t *testing.T) {
 	}
 	if response.SDKVersion != "20260721" || response.SDKSHA256 != "abcdef" || response.SourceCacheEntries != 2 || response.BytecodeCacheEntries != 1 || response.CompatibilityFallbacks != 5 || response.SDKPreferredHits != 2 || response.SessionObserverCount != 6 || response.FallbackCount != 7 || response.LastError != "previous failure" {
 		t.Fatalf("runtime details = %#v", response)
+	}
+	if response.TurnstileFallbacks != 3 || response.ObserverFallbacks != 2 || response.LastCompatibilityProgram != "observer" || response.LastCompatibilityKind != "unsupported_value" || response.LastCompatibilityOperationHash != strings.Repeat("a", 64) {
+		t.Fatalf("compatibility details = %#v", response)
 	}
 	if len(response.PersonaOutcomes) != 1 || response.PersonaOutcomes[0].TransportPersonaID != "c146-mac-m2-1470" ||
 		response.PersonaOutcomes[0].BrowserEnvironmentID != "c146-mac-m2-1470-e17" ||

@@ -2,7 +2,6 @@ package chatgptweb
 
 import (
 	"context"
-	"crypto/sha256"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -335,28 +334,6 @@ func TestConversationTurnstileNamedCaptureAnalysisBoundsDuplicateWork(t *testing
 	duplicate, invalid, hasNamedCaptures, workLimitExceeded := conversationTurnstileRegexpNamedCaptureAnalysis(value)
 	if invalid || !hasNamedCaptures || !duplicate || !workLimitExceeded {
 		t.Fatalf("analysis = duplicate:%v invalid:%v named:%v limited:%v", duplicate, invalid, hasNamedCaptures, workLimitExceeded)
-	}
-}
-
-func TestConversationSentinelCompatibilitySignatureScopesValueSensitiveFallbacks(t *testing.T) {
-	base := strings.Repeat("a", sha256.Size*2)
-	first := conversationSentinelCompatibilitySignature(base, &SentinelCompatibilityError{
-		Kind:      SentinelCompatibilityMissingEnvironment,
-		Operation: "window.navigator.futureCapability",
-	})
-	second := conversationSentinelCompatibilitySignature(base, &SentinelCompatibilityError{
-		Kind:      SentinelCompatibilityMissingEnvironment,
-		Operation: "window.navigator.otherCapability",
-	})
-	if first == base || first == second {
-		t.Fatalf("compatibility signatures = %q and %q", first, second)
-	}
-	unknown := conversationSentinelCompatibilitySignature(base, &SentinelCompatibilityError{
-		Kind:      SentinelCompatibilityUnknownOpcode,
-		Operation: "99",
-	})
-	if unknown != base {
-		t.Fatalf("unknown opcode signature = %q, want %q", unknown, base)
 	}
 }
 

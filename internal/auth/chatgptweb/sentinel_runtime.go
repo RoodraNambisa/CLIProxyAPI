@@ -138,29 +138,34 @@ type PersonaOutcomeSnapshot struct {
 
 // SentinelRuntimeSnapshot is safe to expose through the management API.
 type SentinelRuntimeSnapshot struct {
-	SDKRuntimeEnabled      bool                     `json:"sdk-runtime-enabled"`
-	SDKWorkers             int                      `json:"sdk-workers"`
-	SDKQueueSize           int                      `json:"sdk-queue-size"`
-	SDKCacheVersions       int                      `json:"sdk-cache-versions"`
-	Initialized            bool                     `json:"initialized"`
-	Available              bool                     `json:"available"`
-	WorkerLimit            int                      `json:"worker_limit"`
-	Busy                   int                      `json:"busy"`
-	Queued                 int                      `json:"queued"`
-	SourcePending          int                      `json:"source_pending"`
-	SourceWaiters          int                      `json:"source_waiters"`
-	BytecodeWaiters        int                      `json:"bytecode_waiters"`
-	ObserverSessions       int                      `json:"observer_sessions"`
-	SDKVersion             string                   `json:"sdk_version,omitempty"`
-	SDKSHA256              string                   `json:"sdk_sha256,omitempty"`
-	SourceCacheEntries     int                      `json:"source_cache_entries"`
-	BytecodeCacheEntries   int                      `json:"bytecode_cache_entries"`
-	CompatibilityFallbacks uint64                   `json:"compatibility_fallback_count"`
-	SDKPreferredHits       uint64                   `json:"sdk_preferred_hit_count"`
-	SessionObserverCount   uint64                   `json:"session_observer_count"`
-	FallbackCount          uint64                   `json:"fallback_count"`
-	LastError              string                   `json:"last_error,omitempty"`
-	PersonaOutcomes        []PersonaOutcomeSnapshot `json:"persona_outcomes,omitempty"`
+	SDKRuntimeEnabled              bool                     `json:"sdk-runtime-enabled"`
+	SDKWorkers                     int                      `json:"sdk-workers"`
+	SDKQueueSize                   int                      `json:"sdk-queue-size"`
+	SDKCacheVersions               int                      `json:"sdk-cache-versions"`
+	Initialized                    bool                     `json:"initialized"`
+	Available                      bool                     `json:"available"`
+	WorkerLimit                    int                      `json:"worker_limit"`
+	Busy                           int                      `json:"busy"`
+	Queued                         int                      `json:"queued"`
+	SourcePending                  int                      `json:"source_pending"`
+	SourceWaiters                  int                      `json:"source_waiters"`
+	BytecodeWaiters                int                      `json:"bytecode_waiters"`
+	ObserverSessions               int                      `json:"observer_sessions"`
+	SDKVersion                     string                   `json:"sdk_version,omitempty"`
+	SDKSHA256                      string                   `json:"sdk_sha256,omitempty"`
+	SourceCacheEntries             int                      `json:"source_cache_entries"`
+	BytecodeCacheEntries           int                      `json:"bytecode_cache_entries"`
+	CompatibilityFallbacks         uint64                   `json:"compatibility_fallback_count"`
+	TurnstileFallbacks             uint64                   `json:"turnstile_compatibility_fallback_count"`
+	ObserverFallbacks              uint64                   `json:"observer_compatibility_fallback_count"`
+	SDKPreferredHits               uint64                   `json:"sdk_preferred_hit_count"`
+	SessionObserverCount           uint64                   `json:"session_observer_count"`
+	FallbackCount                  uint64                   `json:"fallback_count"`
+	LastCompatibilityProgram       string                   `json:"last_compatibility_program,omitempty"`
+	LastCompatibilityKind          string                   `json:"last_compatibility_kind,omitempty"`
+	LastCompatibilityOperationHash string                   `json:"last_compatibility_operation_hash,omitempty"`
+	LastError                      string                   `json:"last_error,omitempty"`
+	PersonaOutcomes                []PersonaOutcomeSnapshot `json:"persona_outcomes,omitempty"`
 }
 
 // SentinelRuntimeError is a local SDK scheduling or availability failure.
@@ -321,25 +326,30 @@ type SentinelRuntimeManager struct {
 	mu          sync.Mutex
 	lifecycleMu sync.Mutex
 
-	config                 SentinelRuntimeConfig
-	workerLimit            int
-	busy                   int
-	observerBusy           int
-	queued                 int
-	queues                 [sentinelPriorityCount][]*sentinelRuntimeWaiter
-	closed                 bool
-	initialized            bool
-	observerSessions       int
-	activeTasks            int
-	sourcePending          int
-	sourceWaiters          int
-	bytecodeWaiters        int
-	compatibilityFallbacks uint64
-	sdkPreferredHits       uint64
-	sessionObserverCount   uint64
-	lastError              string
-	latestVersion          string
-	latestHash             string
+	config                         SentinelRuntimeConfig
+	workerLimit                    int
+	busy                           int
+	observerBusy                   int
+	queued                         int
+	queues                         [sentinelPriorityCount][]*sentinelRuntimeWaiter
+	closed                         bool
+	initialized                    bool
+	observerSessions               int
+	activeTasks                    int
+	sourcePending                  int
+	sourceWaiters                  int
+	bytecodeWaiters                int
+	compatibilityFallbacks         uint64
+	turnstileFallbacks             uint64
+	observerFallbacks              uint64
+	sdkPreferredHits               uint64
+	sessionObserverCount           uint64
+	lastCompatibilityProgram       string
+	lastCompatibilityKind          string
+	lastCompatibilityOperationHash string
+	lastError                      string
+	latestVersion                  string
+	latestHash                     string
 
 	sourceCache     map[string]*list.Element
 	sourceLRU       *list.List
@@ -530,28 +540,33 @@ func (manager *SentinelRuntimeManager) Snapshot() SentinelRuntimeSnapshot {
 		available = false
 	}
 	return SentinelRuntimeSnapshot{
-		SDKRuntimeEnabled:      manager.config.Enabled,
-		SDKWorkers:             manager.config.Workers,
-		SDKQueueSize:           manager.config.QueueSize,
-		SDKCacheVersions:       manager.config.CacheVersions,
-		Initialized:            manager.initialized,
-		Available:              available,
-		WorkerLimit:            manager.workerLimit,
-		Busy:                   manager.busy,
-		Queued:                 manager.queued,
-		SourcePending:          manager.sourcePending,
-		SourceWaiters:          manager.sourceWaiters,
-		BytecodeWaiters:        manager.bytecodeWaiters,
-		ObserverSessions:       manager.observerSessions,
-		SDKVersion:             manager.latestVersion,
-		SDKSHA256:              manager.latestHash,
-		SourceCacheEntries:     len(manager.sourceCache),
-		BytecodeCacheEntries:   len(manager.bytecodeCache),
-		CompatibilityFallbacks: manager.compatibilityFallbacks,
-		SDKPreferredHits:       manager.sdkPreferredHits,
-		SessionObserverCount:   manager.sessionObserverCount,
-		FallbackCount:          manager.compatibilityFallbacks + manager.sdkPreferredHits,
-		LastError:              manager.lastError,
+		SDKRuntimeEnabled:              manager.config.Enabled,
+		SDKWorkers:                     manager.config.Workers,
+		SDKQueueSize:                   manager.config.QueueSize,
+		SDKCacheVersions:               manager.config.CacheVersions,
+		Initialized:                    manager.initialized,
+		Available:                      available,
+		WorkerLimit:                    manager.workerLimit,
+		Busy:                           manager.busy,
+		Queued:                         manager.queued,
+		SourcePending:                  manager.sourcePending,
+		SourceWaiters:                  manager.sourceWaiters,
+		BytecodeWaiters:                manager.bytecodeWaiters,
+		ObserverSessions:               manager.observerSessions,
+		SDKVersion:                     manager.latestVersion,
+		SDKSHA256:                      manager.latestHash,
+		SourceCacheEntries:             len(manager.sourceCache),
+		BytecodeCacheEntries:           len(manager.bytecodeCache),
+		CompatibilityFallbacks:         manager.compatibilityFallbacks,
+		TurnstileFallbacks:             manager.turnstileFallbacks,
+		ObserverFallbacks:              manager.observerFallbacks,
+		SDKPreferredHits:               manager.sdkPreferredHits,
+		SessionObserverCount:           manager.sessionObserverCount,
+		FallbackCount:                  manager.compatibilityFallbacks + manager.sdkPreferredHits,
+		LastCompatibilityProgram:       manager.lastCompatibilityProgram,
+		LastCompatibilityKind:          manager.lastCompatibilityKind,
+		LastCompatibilityOperationHash: manager.lastCompatibilityOperationHash,
+		LastError:                      manager.lastError,
 	}
 }
 
@@ -841,8 +856,31 @@ func (manager *SentinelRuntimeManager) recordSDKTurnstileSuccess(generation uint
 			manager.sdkPreferredHits++
 		default:
 			manager.compatibilityFallbacks++
+			manager.turnstileFallbacks++
 		}
 		manager.lastError = ""
+	}
+	manager.mu.Unlock()
+}
+
+func (manager *SentinelRuntimeManager) recordCompatibility(generation uint64, compatibility *SentinelCompatibilityError) {
+	if manager == nil || compatibility == nil {
+		return
+	}
+	program := compatibility.ProgramKind
+	if program == "" {
+		program = SentinelProgramTurnstile
+	}
+	operationHash := ""
+	if operation := strings.TrimSpace(compatibility.Operation); operation != "" {
+		digest := sha256.Sum256([]byte(operation))
+		operationHash = hex.EncodeToString(digest[:])
+	}
+	manager.mu.Lock()
+	if manager.cacheGeneration == generation && !manager.closed {
+		manager.lastCompatibilityProgram = string(program)
+		manager.lastCompatibilityKind = string(compatibility.Kind)
+		manager.lastCompatibilityOperationHash = operationHash
 	}
 	manager.mu.Unlock()
 }
@@ -2409,6 +2447,7 @@ func (manager *SentinelRuntimeManager) SolveTurnstile(
 	if !errors.As(err, &compatibility) {
 		return "", err
 	}
+	manager.recordCompatibility(generation, compatibility)
 	baseSignature := compatibility.OpcodeSignature
 	if baseSignature == "" {
 		var signatureErr error
@@ -2548,6 +2587,7 @@ func (manager *SentinelRuntimeManager) solveTurnstileWithSDK(
 // SentinelObserver retains one request-scoped Go VM or SDK instance.
 type SentinelObserver struct {
 	manager            *SentinelRuntimeManager
+	generation         uint64
 	request            SentinelSDKRequest
 	ctx                context.Context
 	cancel             context.CancelFunc
@@ -2593,6 +2633,8 @@ func (manager *SentinelRuntimeManager) BeginObserver(ctx context.Context, reques
 		return nil, newSentinelRuntimeError("sentinel_sdk_unavailable", 0, errors.New("Sentinel runtime is closed"))
 	}
 	observer.sdkFallbackAllowed = manager.config.Enabled && !manager.clearWhenIdle
+	generation := manager.cacheGeneration
+	observer.generation = generation
 	manager.observers[observer] = struct{}{}
 	manager.mu.Unlock()
 	observerConfig, _ := request.Challenge["so"].(map[string]any)
@@ -2616,6 +2658,7 @@ func (manager *SentinelRuntimeManager) BeginObserver(ctx context.Context, reques
 		close(observer.ready)
 		return observer, nil
 	}
+	manager.recordCompatibility(generation, compatibility)
 	if !observer.sdkFallbackAllowed {
 		observer.setError(newSentinelRuntimeError("sentinel_sdk_unavailable", 0, errors.New("Sentinel SDK runtime is disabled")))
 		close(observer.ready)
@@ -2786,6 +2829,7 @@ func (observer *SentinelObserver) installSDK(lease *sentinelRuntimeLease, source
 	if countObserverFallback && !observer.fallbackCounted {
 		observer.fallbackCounted = true
 		observer.manager.compatibilityFallbacks++
+		observer.manager.observerFallbacks++
 	}
 	observer.mu.Unlock()
 	if !wasCounted {
@@ -2917,6 +2961,7 @@ func (observer *SentinelObserver) Snapshot(ctx context.Context) (string, error) 
 				}
 				return "", newSentinelRuntimeError("sentinel_session_observer_unavailable", 0, errors.New("Sentinel Go VM snapshot failed"))
 			}
+			observer.manager.recordCompatibility(observer.generation, compatibility)
 			if err = observer.ensureSDK(callCtx, true); err != nil {
 				return "", observer.snapshotRuntimeError(err)
 			}

@@ -139,20 +139,6 @@ func conversationSentinelProgramSignature(ctx context.Context, program []any) (s
 	return hex.EncodeToString(digest.Sum(nil)), nil
 }
 
-func conversationSentinelCompatibilitySignature(signature string, compatibility *SentinelCompatibilityError) string {
-	if signature == "" || compatibility == nil || compatibility.Kind == SentinelCompatibilityUnknownOpcode {
-		return signature
-	}
-	digest := sha256.New()
-	_, _ = io.WriteString(digest, "sentinel-compatibility-v1\x00")
-	_, _ = io.WriteString(digest, signature)
-	_, _ = io.WriteString(digest, "\x00")
-	_, _ = io.WriteString(digest, string(compatibility.Kind))
-	_, _ = io.WriteString(digest, "\x00")
-	_, _ = io.WriteString(digest, strings.TrimSpace(compatibility.Operation))
-	return hex.EncodeToString(digest.Sum(nil))
-}
-
 func conversationSentinelWriteProgramShape(ctx context.Context, writer io.Writer, program []any, nodes *int, memoryBudget *conversationTurnstileMemoryBudget, depth int) error {
 	if depth > conversationTurnstileMaxJSONDepth {
 		return conversationTurnstileFatalError{message: fmt.Sprintf("conversation turnstile signature exceeds depth %d", conversationTurnstileMaxJSONDepth)}

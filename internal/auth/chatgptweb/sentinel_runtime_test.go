@@ -656,6 +656,10 @@ func TestSentinelRuntimeManagerSolvesCompatibilityFallback(t *testing.T) {
 	if !snapshot.Initialized || snapshot.CompatibilityFallbacks != 1 || snapshot.SDKPreferredHits != 0 || snapshot.FallbackCount != 1 || snapshot.SourceCacheEntries != 1 || snapshot.BytecodeCacheEntries != 1 {
 		t.Fatalf("snapshot = %+v", snapshot)
 	}
+	expectedOperationHash := sha256.Sum256([]byte("opcode:36"))
+	if snapshot.TurnstileFallbacks != 1 || snapshot.ObserverFallbacks != 0 || snapshot.LastCompatibilityProgram != string(SentinelProgramTurnstile) || snapshot.LastCompatibilityKind != string(SentinelCompatibilityUnknownOpcode) || snapshot.LastCompatibilityOperationHash != hexDigest(expectedOperationHash[:]) {
+		t.Fatalf("compatibility snapshot = %+v", snapshot)
+	}
 	if manager.maxActiveQJS.Load() > int64(snapshot.WorkerLimit) {
 		t.Fatalf("max active QJS = %d, worker limit = %d", manager.maxActiveQJS.Load(), snapshot.WorkerLimit)
 	}
@@ -1811,7 +1815,7 @@ func TestSentinelRuntimeObserverUsesGoVMWithoutSDKWork(t *testing.T) {
 				t.Fatalf("Observer token = %q, %v", token, err)
 			}
 			snapshot := manager.Snapshot()
-			if fetches.Load() != 0 || snapshot.Initialized || snapshot.Busy != 0 || snapshot.Queued != 0 || snapshot.CompatibilityFallbacks != 0 || snapshot.SessionObserverCount != 1 {
+			if fetches.Load() != 0 || snapshot.Initialized || snapshot.Busy != 0 || snapshot.Queued != 0 || snapshot.CompatibilityFallbacks != 0 || snapshot.TurnstileFallbacks != 0 || snapshot.ObserverFallbacks != 0 || snapshot.SessionObserverCount != 1 {
 				observer.Close()
 				t.Fatalf("Go Observer runtime state: fetches=%d snapshot=%+v", fetches.Load(), snapshot)
 			}
@@ -1848,6 +1852,9 @@ func TestSentinelRuntimeObserverSnapshotCompatibilityFallsBackToSDK(t *testing.T
 	snapshot := manager.Snapshot()
 	if fetches.Load() != 1 || !snapshot.Initialized || snapshot.CompatibilityFallbacks != 1 || snapshot.FallbackCount != 1 || snapshot.SessionObserverCount != 1 {
 		t.Fatalf("SDK fallback state: fetches=%d snapshot=%+v", fetches.Load(), snapshot)
+	}
+	if snapshot.TurnstileFallbacks != 0 || snapshot.ObserverFallbacks != 1 || snapshot.LastCompatibilityProgram != string(SentinelProgramObserverSnapshot) || snapshot.LastCompatibilityKind != string(SentinelCompatibilityUnknownOpcode) {
+		t.Fatalf("Observer compatibility state = %+v", snapshot)
 	}
 }
 
@@ -2098,6 +2105,9 @@ func TestSentinelRuntimeTurnstileFallbackPromotesGoObserverOnce(t *testing.T) {
 	snapshot := manager.Snapshot()
 	if fetches.Load() != 1 || snapshot.CompatibilityFallbacks != 1 || snapshot.FallbackCount != 1 || snapshot.SessionObserverCount != 1 {
 		t.Fatalf("promoted Observer state: fetches=%d snapshot=%+v", fetches.Load(), snapshot)
+	}
+	if snapshot.TurnstileFallbacks != 1 || snapshot.ObserverFallbacks != 0 || snapshot.LastCompatibilityProgram != string(SentinelProgramTurnstile) {
+		t.Fatalf("promoted Observer compatibility state = %+v", snapshot)
 	}
 }
 
