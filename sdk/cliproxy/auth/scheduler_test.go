@@ -432,7 +432,7 @@ func TestSchedulerPick_FillFirstPerAuthRPMSkipsCoolingFirstAuth(t *testing.T) {
 	aID := schedulerTestID(t, "a")
 	bID := schedulerTestID(t, "b")
 	registerSchedulerModels(t, "gemini", model, aID, bID)
-	fixed := time.Date(2026, 8, 19, 12, 0, 10, 0, time.UTC)
+	fixed := time.Now().UTC().Add(time.Hour).Truncate(time.Minute).Add(10 * time.Second)
 	scheduler := newSchedulerForTest(
 		&FillFirstSelector{},
 		&Auth{
@@ -497,7 +497,7 @@ func TestSchedulerPick_FillFirstPerAuthRPMReturnsRetryAfterWhenFull(t *testing.T
 func TestSchedulerPick_FillFirstPerAuthRPMReturnsCooldownWhenSooner(t *testing.T) {
 	t.Parallel()
 
-	fixed := time.Date(2026, 8, 19, 12, 0, 10, 0, time.UTC)
+	fixed := time.Now().UTC().Add(time.Hour).Truncate(time.Minute).Add(10 * time.Second)
 	scheduler := newSchedulerForTest(
 		&FillFirstSelector{},
 		&Auth{ID: "a", Provider: "gemini"},
