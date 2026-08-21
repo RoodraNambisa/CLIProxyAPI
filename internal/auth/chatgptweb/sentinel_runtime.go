@@ -2409,20 +2409,19 @@ func (manager *SentinelRuntimeManager) SolveTurnstile(
 	if !errors.As(err, &compatibility) {
 		return "", err
 	}
-	signature := compatibility.OpcodeSignature
-	if signature == "" {
+	baseSignature := compatibility.OpcodeSignature
+	if baseSignature == "" {
 		var signatureErr error
 		if prepared != nil {
-			signature, signatureErr = conversationSentinelProgramSignature(ctx, prepared.program)
+			baseSignature, signatureErr = conversationSentinelProgramSignature(ctx, prepared.program)
 		} else {
-			signature, signatureErr = conversationSentinelProgramSignatureForDX(ctx, goRequest.DX, goRequest.RequirementsToken)
+			baseSignature, signatureErr = conversationSentinelProgramSignatureForDX(ctx, goRequest.DX, goRequest.RequirementsToken)
 		}
 		if signatureErr != nil {
-			signature = ""
+			baseSignature = ""
 		}
 	}
-	signature = conversationSentinelCompatibilitySignature(signature, compatibility)
-	return manager.solveTurnstileWithSDK(ctx, sdkRequest, nil, signature, sentinelSDKCompatibilityFallback, observer, goRequest.DX, goRequest.RequirementsToken)
+	return manager.solveTurnstileWithSDK(ctx, sdkRequest, nil, baseSignature, sentinelSDKCompatibilityFallback, observer, goRequest.DX, goRequest.RequirementsToken)
 }
 
 func (manager *SentinelRuntimeManager) solveTurnstileWithSDK(

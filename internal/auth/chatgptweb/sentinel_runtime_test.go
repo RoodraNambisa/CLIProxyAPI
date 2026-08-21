@@ -1166,6 +1166,64 @@ func TestSentinelRuntimeManagerReusesCompatibilityClassAcrossDynamicLiterals(t *
 	}
 }
 
+func TestSentinelRuntimeManagerPrefersValueSensitiveCompatibilityShape(t *testing.T) {
+	manager := newSentinelRuntimeTestManager()
+	defer manager.Close()
+	request, sdkRequest := sentinelRuntimeTestRequests(t, false)
+	program := func(pattern string) []any {
+		return []any{
+			[]any{2, 40, pattern},
+			[]any{11, 41, 40},
+			[]any{7, 3, 41},
+		}
+	}
+	sdkRequest.Fetcher = sentinelRuntimeTestFetcher(nil)
+	request.DX = encodeConversationTurnstileProgram(t, request.RequirementsToken, program(`(?=first)first`))
+	sdkRequest.Challenge["turnstile"] = map[string]any{"required": true, "dx": request.DX}
+	if _, err := manager.SolveTurnstile(t.Context(), request, sdkRequest, nil); err != nil {
+		t.Fatalf("first SolveTurnstile() error = %v", err)
+	}
+
+	request.RequirementsToken = "different-requirements-token"
+	sdkRequest.RequirementsToken = request.RequirementsToken
+	request.DX = encodeConversationTurnstileProgram(t, request.RequirementsToken, program(`(?=other)other`))
+	sdkRequest.Challenge["turnstile"] = map[string]any{"required": true, "dx": request.DX}
+	if _, err := manager.SolveTurnstile(t.Context(), request, sdkRequest, nil); err != nil {
+		t.Fatalf("second SolveTurnstile() error = %v", err)
+	}
+	if snapshot := manager.Snapshot(); snapshot.CompatibilityFallbacks != 1 || snapshot.SDKPreferredHits != 1 {
+		t.Fatalf("snapshot = %+v, want one compatibility fallback and one preferred hit", snapshot)
+	}
+
+	request.DX = encodeConversationTurnstileProgram(t, request.RequirementsToken, append(program(`(?=third)third`), []any{2, 42, "different-shape"}))
+	sdkRequest.Challenge["turnstile"] = map[string]any{"required": true, "dx": request.DX}
+	if _, err := manager.SolveTurnstile(t.Context(), request, sdkRequest, nil); err != nil {
+		t.Fatalf("different-shape SolveTurnstile() error = %v", err)
+	}
+	if snapshot := manager.Snapshot(); snapshot.CompatibilityFallbacks != 2 || snapshot.SDKPreferredHits != 1 {
+		t.Fatalf("different-shape snapshot = %+v", snapshot)
+	}
+}
+
+func TestSentinelRuntimeManagerDoesNotCacheFailedSDKFallback(t *testing.T) {
+	manager := newSentinelRuntimeTestManager()
+	defer manager.Close()
+	request, sdkRequest := sentinelRuntimeTestRequests(t, false)
+	sdkRequest.Fetcher = func(_ context.Context, target string, _ int64) ([]byte, string, string, error) {
+		return []byte(sentinelRuntimeFailingTurnstileSDK), "application/javascript", target, nil
+	}
+	if _, err := manager.SolveTurnstile(t.Context(), request, sdkRequest, nil); err == nil {
+		t.Fatal("SolveTurnstile() error = nil")
+	}
+	manager.mu.Lock()
+	preferredCount := len(manager.preferred)
+	preferredHintCount := len(manager.preferredHints)
+	manager.mu.Unlock()
+	if preferredCount != 0 || preferredHintCount != 0 {
+		t.Fatalf("failed fallback populated preferred caches: %d/%d", preferredCount, preferredHintCount)
+	}
+}
+
 func TestSentinelRuntimeRealSDKFixture(t *testing.T) {
 	fixturePath := os.Getenv("CHATGPT_WEB_SENTINEL_SDK_FIXTURE")
 	if fixturePath == "" {
@@ -2689,6 +2747,18 @@ func TestSentinelRuntimeExpiredPreferredStateIsPrunedWithoutSource(t *testing.T)
 	manager.mu.Unlock()
 	if preferredCount != 0 {
 		t.Fatalf("expired preferred entries = %d", preferredCount)
+	}
+}
+
+func TestSentinelRuntimePreferredStateIsScopedToSDKHash(t *testing.T) {
+	manager := newSentinelRuntimeTestManager()
+	defer manager.Close()
+	manager.markPreferredForChallenge(manager.cacheGeneration, "first-hash", SentinelProgramTurnstile, "signature", "challenge", "requirements")
+	if !manager.isPreferred("first-hash", SentinelProgramTurnstile, "signature") {
+		t.Fatal("matching SDK hash did not reuse preferred state")
+	}
+	if manager.isPreferred("second-hash", SentinelProgramTurnstile, "signature") {
+		t.Fatal("different SDK hash reused preferred state")
 	}
 }
 
