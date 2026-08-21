@@ -18,6 +18,7 @@ import (
 )
 
 var snapshotCoreAuthsFunc = snapshotCoreAuths
+var snapshotConfigAuthsFunc = snapshotConfigAuths
 
 // SeedCurrentFileAuths records file-backed auths already loaded by the runtime
 // manager so the first watcher snapshot can emit deletions for quarantined or
@@ -172,8 +173,15 @@ func (w *Watcher) refreshAuthState(force bool) {
 	cfg := w.config
 	authDir := w.authDir
 	w.clientsMutex.RUnlock()
-	auths := snapshotCoreAuthsFunc(cfg, authDir)
+	auths := snapshotConfigAuthsFunc(cfg, authDir)
 	w.clientsMutex.Lock()
+	for _, pathAuths := range w.fileAuthsByPath {
+		for _, auth := range pathAuths {
+			if auth != nil {
+				auths = append(auths, auth.Clone())
+			}
+		}
+	}
 	if len(w.runtimeAuths) > 0 {
 		for id, a := range w.runtimeAuths {
 			if a == nil {
@@ -560,6 +568,21 @@ func normalizeAuth(a *coreauth.Auth) *coreauth.Auth {
 }
 
 func snapshotCoreAuths(cfg *config.Config, authDir string) []*coreauth.Auth {
+	out := snapshotConfigAuths(cfg, authDir)
+	ctx := &synthesizer.SynthesisContext{
+		Config:      cfg,
+		AuthDir:     authDir,
+		Now:         time.Now(),
+		IDGenerator: synthesizer.NewStableIDGenerator(),
+	}
+	fileSynth := synthesizer.NewFileSynthesizer()
+	if auths, err := fileSynth.Synthesize(ctx); err == nil {
+		out = append(out, auths...)
+	}
+	return out
+}
+
+func snapshotConfigAuths(cfg *config.Config, authDir string) []*coreauth.Auth {
 	ctx := &synthesizer.SynthesisContext{
 		Config:      cfg,
 		AuthDir:     authDir,
@@ -568,16 +591,9 @@ func snapshotCoreAuths(cfg *config.Config, authDir string) []*coreauth.Auth {
 	}
 
 	var out []*coreauth.Auth
-
 	configSynth := synthesizer.NewConfigSynthesizer()
 	if auths, err := configSynth.Synthesize(ctx); err == nil {
 		out = append(out, auths...)
 	}
-
-	fileSynth := synthesizer.NewFileSynthesizer()
-	if auths, err := fileSynth.Synthesize(ctx); err == nil {
-		out = append(out, auths...)
-	}
-
 	return out
 }

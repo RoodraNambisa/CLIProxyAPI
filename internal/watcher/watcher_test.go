@@ -522,12 +522,12 @@ func TestDependencyReconcileWaitsForTransientDeleteAddSnapshots(t *testing.T) {
 	}
 	w.clientsMutex.Unlock()
 
-	originalSnapshot := snapshotCoreAuthsFunc
+	originalSnapshot := snapshotConfigAuthsFunc
 	currentSnapshot := []*coreauth.Auth{source.Clone()}
-	snapshotCoreAuthsFunc = func(*config.Config, string) []*coreauth.Auth {
+	snapshotConfigAuthsFunc = func(*config.Config, string) []*coreauth.Auth {
 		return currentSnapshot
 	}
-	defer func() { snapshotCoreAuthsFunc = originalSnapshot }()
+	defer func() { snapshotConfigAuthsFunc = originalSnapshot }()
 
 	deleteSeen := make(chan struct{})
 	releaseDelete := make(chan struct{})
@@ -2436,6 +2436,9 @@ func TestReloadConfigFiltersAffectedOAuthProviders(t *testing.T) {
 		},
 	}
 	w.SetConfig(oldCfg)
+	if stats := w.scanAuthFilesForReload(oldCfg, false); stats.readable != 1 {
+		t.Fatalf("initial auth scan stats = %+v, want one readable file", stats)
+	}
 
 	if ok := w.reloadConfig(); !ok {
 		t.Fatal("expected reloadConfig to succeed")
@@ -2544,11 +2547,11 @@ func TestReloadConfigForcesAuthRefreshForAuthModelExclusionsChange(t *testing.T)
 		t.Fatalf("failed to write config: %v", errWrite)
 	}
 
-	origSnapshot := snapshotCoreAuthsFunc
-	snapshotCoreAuthsFunc = func(*config.Config, string) []*coreauth.Auth {
+	origSnapshot := snapshotConfigAuthsFunc
+	snapshotConfigAuthsFunc = func(*config.Config, string) []*coreauth.Auth {
 		return []*coreauth.Auth{{ID: "auth-1", Provider: "codex"}}
 	}
-	defer func() { snapshotCoreAuthsFunc = origSnapshot }()
+	defer func() { snapshotConfigAuthsFunc = origSnapshot }()
 
 	w := &Watcher{
 		configPath:     configPath,
@@ -4018,6 +4021,80 @@ func TestLoadFileClients_SymlinkDoesNotMutateMirroredAuth(t *testing.T) {
 	}
 	if got := atomic.LoadInt32(&store.authDeleted); got != 0 {
 		t.Fatalf("Delete calls = %d, want 0", got)
+	}
+}
+
+func TestScanAuthFilesForReloadReadsEachFileOnce(t *testing.T) {
+	authDir := t.TempDir()
+	const fileCount = 128
+	for index := 0; index < fileCount; index++ {
+		path := filepath.Join(authDir, fmt.Sprintf("auth-%03d.json", index))
+		payload := fmt.Sprintf(`{"type":"codex","email":"user-%03d@example.com"}`, index)
+		if errWrite := os.WriteFile(path, []byte(payload), 0o600); errWrite != nil {
+			t.Fatalf("write auth %d: %v", index, errWrite)
+		}
+	}
+	var reads atomic.Int64
+	w := &Watcher{
+		authDir:          authDir,
+		lastAuthHashes:   make(map[string]string),
+		fileAuthsByPath:  make(map[string]map[string]*coreauth.Auth),
+		retiredAuthPaths: make(map[string]struct{}),
+		readAuthFileAtRoot: func(root *os.Root, relativePath string) ([]byte, authFileVersion, error) {
+			reads.Add(1)
+			return readAuthFileVersionAtRoot(root, relativePath)
+		},
+	}
+	cfg := &config.Config{AuthDir: authDir}
+	w.SetConfig(cfg)
+
+	stats := w.scanAuthFilesForReload(cfg, false)
+	if stats.scanned != fileCount || stats.readable != fileCount {
+		t.Fatalf("scan stats = %+v, want %d scanned and readable", stats, fileCount)
+	}
+	if got := reads.Load(); got != fileCount {
+		t.Fatalf("file reads = %d, want %d", got, fileCount)
+	}
+	if len(w.lastAuthHashes) != fileCount || len(w.fileAuthsByPath) != fileCount {
+		t.Fatalf("cache sizes = hashes %d auth paths %d, want %d", len(w.lastAuthHashes), len(w.fileAuthsByPath), fileCount)
+	}
+}
+
+func TestReprojectCachedFileAuthsDoesNotReadFiles(t *testing.T) {
+	authDir := t.TempDir()
+	path := filepath.Join(authDir, "codex.json")
+	if errWrite := os.WriteFile(path, []byte(`{"type":"codex"}`), 0o600); errWrite != nil {
+		t.Fatalf("write auth: %v", errWrite)
+	}
+	var reads atomic.Int64
+	w := &Watcher{
+		authDir:          authDir,
+		lastAuthHashes:   make(map[string]string),
+		fileAuthsByPath:  make(map[string]map[string]*coreauth.Auth),
+		retiredAuthPaths: make(map[string]struct{}),
+		readAuthFileAtRoot: func(root *os.Root, relativePath string) ([]byte, authFileVersion, error) {
+			reads.Add(1)
+			return readAuthFileVersionAtRoot(root, relativePath)
+		},
+	}
+	initial := &config.Config{AuthDir: authDir}
+	w.SetConfig(initial)
+	if stats := w.scanAuthFilesForReload(initial, false); stats.readable != 1 {
+		t.Fatalf("initial scan stats = %+v", stats)
+	}
+	updated := &config.Config{
+		AuthDir: authDir,
+		OAuthExcludedModels: map[string][]string{
+			"codex": {"newly-excluded"},
+		},
+	}
+	w.reprojectCachedFileAuths(updated)
+	if got := reads.Load(); got != 1 {
+		t.Fatalf("file reads after config projection = %d, want 1", got)
+	}
+	projected := w.fileAuthsByPath[w.normalizeAuthPath(path)]["codex.json"]
+	if projected == nil || projected.Attributes["excluded_models"] != "newly-excluded" {
+		t.Fatalf("reprojected auth = %#v", projected)
 	}
 }
 

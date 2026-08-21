@@ -4,6 +4,7 @@ package watcher
 
 import (
 	"context"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -56,6 +57,7 @@ type Watcher struct {
 	lastAuthHashes       map[string]string
 	lastAuthContents     map[string]*coreauth.Auth
 	fileAuthsByPath      map[string]map[string]*coreauth.Auth
+	readAuthFileAtRoot   func(*os.Root, string) ([]byte, authFileVersion, error)
 	retiredAuthPaths     map[string]struct{}
 	retiredDeleteHashes  map[string]string
 	retiredDeleteStates  map[string]*authfileguard.DeleteGeneration
@@ -240,5 +242,5 @@ func (w *Watcher) SnapshotCoreAuths() []*coreauth.Auth {
 	w.clientsMutex.RLock()
 	cfg := w.config
 	w.clientsMutex.RUnlock()
-	return snapshotCoreAuths(cfg, w.authDir)
+	return snapshotCoreAuthsFunc(cfg, w.authDir)
 }

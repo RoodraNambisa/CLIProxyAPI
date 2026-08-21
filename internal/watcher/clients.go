@@ -13,7 +13,9 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/authfileguard"
@@ -74,6 +76,13 @@ func readAuthFileVersionUnderRoot(authDir, path string) ([]byte, authFileVersion
 		return nil, authFileVersion{}, errOpen
 	}
 	defer func() { _ = root.Close() }()
+	return readAuthFileVersionAtRoot(root, relativePath)
+}
+
+func readAuthFileVersionAtRoot(root *os.Root, relativePath string) ([]byte, authFileVersion, error) {
+	if root == nil || strings.TrimSpace(relativePath) == "" {
+		return nil, authFileVersion{}, os.ErrInvalid
+	}
 	before, errBefore := root.Lstat(relativePath)
 	if errBefore != nil {
 		return nil, authFileVersion{}, errBefore
@@ -110,6 +119,16 @@ func readAuthFileVersionUnderRoot(authDir, path string) ([]byte, authFileVersion
 	}
 	sum := sha256.Sum256(data)
 	return data, authFileVersion{hash: hex.EncodeToString(sum[:]), info: opened}, nil
+}
+
+type authFileScanStats struct {
+	scanned  int
+	readable int
+}
+
+type authFileScanJob struct {
+	relativePath string
+	fullPath     string
 }
 
 func sameAuthFileVersion(expected, current authFileVersion) bool {
@@ -200,50 +219,15 @@ func (w *Watcher) reloadClientsWithOptions(rescanAuth bool, affectedOAuthProvide
 
 	var authFileCount int
 	if rescanAuth {
-		authFileCount = w.loadFileClients(cfg)
-		log.Debugf("loaded %d file-based clients", authFileCount)
+		scanStats := w.scanAuthFilesForReload(cfg, resolveTombstoneReplacements)
+		authFileCount = scanStats.scanned
+		log.Debugf("auth directory scan complete - found %d .json files, %d readable", scanStats.scanned, scanStats.readable)
 	} else {
+		w.reprojectCachedFileAuths(cfg)
 		w.clientsMutex.RLock()
 		authFileCount = len(w.lastAuthHashes)
 		w.clientsMutex.RUnlock()
 		log.Debugf("skipping auth directory rescan; retaining %d existing auth files", authFileCount)
-	}
-
-	if rescanAuth {
-		cacheAuthContents := log.IsLevelEnabled(log.DebugLevel)
-		w.clientsMutex.Lock()
-		w.lastAuthHashes = make(map[string]string)
-		if cacheAuthContents {
-			w.lastAuthContents = make(map[string]*coreauth.Auth)
-		} else {
-			w.lastAuthContents = nil
-		}
-		w.fileAuthsByPath = make(map[string]map[string]*coreauth.Auth)
-		if w.retiredAuthPaths == nil {
-			w.retiredAuthPaths = make(map[string]struct{})
-		}
-		w.clientsMutex.Unlock()
-
-		if resolvedAuthDir, errResolveAuthDir := util.ResolveAuthDir(cfg.AuthDir); errResolveAuthDir != nil {
-			log.Errorf("failed to resolve auth directory for hash cache: %v", errResolveAuthDir)
-		} else if resolvedAuthDir != "" {
-			entries, errReadDir := os.ReadDir(resolvedAuthDir)
-			if errReadDir != nil {
-				log.Errorf("failed to read auth directory for hash cache: %v", errReadDir)
-			} else {
-				for _, entry := range entries {
-					if entry == nil || entry.IsDir() || entry.Type()&os.ModeSymlink != 0 {
-						continue
-					}
-					name := entry.Name()
-					if !strings.HasSuffix(strings.ToLower(name), ".json") {
-						continue
-					}
-					fullPath := filepath.Join(resolvedAuthDir, name)
-					w.cacheAuthFileForReload(cfg, resolvedAuthDir, fullPath, cacheAuthContents, resolveTombstoneReplacements)
-				}
-			}
-		}
 	}
 
 	totalNewClients := authFileCount + geminiAPIKeyCount + vertexCompatAPIKeyCount + claudeAPIKeyCount + codexAPIKeyCount + openAICompatCount
@@ -261,24 +245,198 @@ func (w *Watcher) reloadClientsWithOptions(rescanAuth bool, affectedOAuthProvide
 	)
 }
 
+func (w *Watcher) scanAuthFilesForReload(cfg *config.Config, resolveTombstoneReplacements bool) authFileScanStats {
+	stats := authFileScanStats{}
+	cacheAuthContents := log.IsLevelEnabled(log.DebugLevel)
+	w.resetAuthFileCaches(cacheAuthContents)
+	if cfg == nil {
+		return stats
+	}
+	authDir, errResolveAuthDir := util.ResolveAuthDir(cfg.AuthDir)
+	if errResolveAuthDir != nil {
+		log.Errorf("failed to resolve auth directory: %v", errResolveAuthDir)
+		return stats
+	}
+	if authDir == "" {
+		return stats
+	}
+	absAuthDir, errAbs := filepath.Abs(authDir)
+	if errAbs != nil {
+		log.Errorf("failed to resolve absolute auth directory: %v", errAbs)
+		return stats
+	}
+	rootPath := filepath.Clean(absAuthDir)
+	if resolved, errEval := filepath.EvalSymlinks(rootPath); errEval == nil {
+		rootPath = filepath.Clean(resolved)
+	} else if !os.IsNotExist(errEval) {
+		log.Errorf("failed to resolve auth directory symlinks: %v", errEval)
+		return stats
+	}
+	root, errRoot := os.OpenRoot(rootPath)
+	if errRoot != nil {
+		log.Errorf("failed to open auth directory: %v", errRoot)
+		return stats
+	}
+	defer func() {
+		if errClose := root.Close(); errClose != nil {
+			log.WithError(errClose).Warn("failed to close auth directory root")
+		}
+	}()
+	directory, errOpenDir := root.Open(".")
+	if errOpenDir != nil {
+		log.Errorf("failed to open auth directory for enumeration: %v", errOpenDir)
+		return stats
+	}
+	defer func() {
+		if errClose := directory.Close(); errClose != nil {
+			log.WithError(errClose).Warn("failed to close auth directory enumeration handle")
+		}
+	}()
+	entries, errReadDir := directory.ReadDir(-1)
+	if errReadDir != nil {
+		log.Errorf("failed to read auth directory: %v", errReadDir)
+		return stats
+	}
+	jobs := make([]authFileScanJob, 0, len(entries))
+	for _, entry := range entries {
+		if entry == nil || entry.IsDir() || entry.Type()&os.ModeSymlink != 0 {
+			continue
+		}
+		name := entry.Name()
+		if !strings.HasSuffix(strings.ToLower(name), ".json") {
+			continue
+		}
+		jobs = append(jobs, authFileScanJob{
+			relativePath: name,
+			fullPath:     filepath.Join(absAuthDir, name),
+		})
+	}
+	stats.scanned = len(jobs)
+	if len(jobs) == 0 {
+		return stats
+	}
+	workerCount := runtime.GOMAXPROCS(0)
+	if workerCount > 8 {
+		workerCount = 8
+	}
+	if workerCount < 1 {
+		workerCount = 1
+	}
+	jobQueue := make(chan authFileScanJob)
+	results := make(chan bool, len(jobs))
+	var workers sync.WaitGroup
+	workers.Add(workerCount)
+	for index := 0; index < workerCount; index++ {
+		go func() {
+			defer workers.Done()
+			for job := range jobQueue {
+				results <- w.cacheAuthFileForReloadAtRoot(cfg, absAuthDir, root, job, cacheAuthContents, resolveTombstoneReplacements)
+			}
+		}()
+	}
+	go func() {
+		for _, job := range jobs {
+			jobQueue <- job
+		}
+		close(jobQueue)
+		workers.Wait()
+		close(results)
+	}()
+	for readable := range results {
+		if readable {
+			stats.readable++
+		}
+	}
+	return stats
+}
+
+func (w *Watcher) resetAuthFileCaches(cacheAuthContents bool) {
+	w.clientsMutex.Lock()
+	defer w.clientsMutex.Unlock()
+	w.lastAuthHashes = make(map[string]string)
+	if cacheAuthContents {
+		w.lastAuthContents = make(map[string]*coreauth.Auth)
+	} else {
+		w.lastAuthContents = nil
+	}
+	w.fileAuthsByPath = make(map[string]map[string]*coreauth.Auth)
+	if w.retiredAuthPaths == nil {
+		w.retiredAuthPaths = make(map[string]struct{})
+	}
+}
+
+func (w *Watcher) reprojectCachedFileAuths(cfg *config.Config) {
+	if cfg == nil {
+		return
+	}
+	w.clientsMutex.Lock()
+	defer w.clientsMutex.Unlock()
+	for normalizedPath, auths := range w.fileAuthsByPath {
+		next := make(map[string]*coreauth.Auth, len(auths))
+		for id, auth := range auths {
+			if auth == nil {
+				continue
+			}
+			projected := auth.Clone()
+			path := normalizedPath
+			if projected.Attributes != nil {
+				if value := strings.TrimSpace(projected.Attributes["path"]); value != "" {
+					path = value
+				}
+			}
+			if errProjection := coreauth.ApplyFileAuthProjection(projected, coreauth.FileAuthProjectionOptions{
+				Config:  cfg,
+				AuthDir: cfg.AuthDir,
+				Path:    path,
+				Now:     projected.UpdatedAt,
+			}); errProjection != nil {
+				log.WithError(errProjection).Warnf("failed to reproject cached auth %s", id)
+				next[id] = auth.Clone()
+				continue
+			}
+			next[id] = projected
+		}
+		if len(next) == 0 {
+			delete(w.fileAuthsByPath, normalizedPath)
+			continue
+		}
+		w.fileAuthsByPath[normalizedPath] = next
+	}
+}
+
 func (w *Watcher) cacheAuthFileForReload(cfg *config.Config, authDir, path string, cacheAuthContents, resolveTombstoneReplacement bool) {
-	// Event handlers already hold the path lock when taking clientsMutex. Keep
-	// this order consistent so a reload cannot deadlock with a file event.
 	unlockPath := authfileguard.Lock(path)
 	defer unlockPath()
-
-	data, errReadFile := readAuthFileUnderRoot(authDir, path)
+	data, version, errReadFile := readAuthFileVersionUnderRoot(authDir, path)
 	if errReadFile != nil || len(data) == 0 {
 		return
 	}
+	w.cacheAuthFileDataForReload(cfg, authDir, path, data, version.hash, cacheAuthContents, resolveTombstoneReplacement)
+}
 
+func (w *Watcher) cacheAuthFileForReloadAtRoot(cfg *config.Config, authDir string, root *os.Root, job authFileScanJob, cacheAuthContents, resolveTombstoneReplacement bool) bool {
+	// Keep the path lock until the snapshot reaches the cache. Incremental file
+	// events use the same order, so a newer file generation cannot be overwritten.
+	unlockPath := authfileguard.Lock(job.fullPath)
+	defer unlockPath()
+	reader := readAuthFileVersionAtRoot
+	if w.readAuthFileAtRoot != nil {
+		reader = w.readAuthFileAtRoot
+	}
+	data, version, errReadFile := reader(root, job.relativePath)
+	if errReadFile != nil || len(data) == 0 {
+		return false
+	}
+	w.cacheAuthFileDataForReload(cfg, authDir, job.fullPath, data, version.hash, cacheAuthContents, resolveTombstoneReplacement)
+	return true
+}
+
+func (w *Watcher) cacheAuthFileDataForReload(cfg *config.Config, authDir, path string, data []byte, currentHash string, cacheAuthContents, resolveTombstoneReplacement bool) {
 	retiredFile := coreauth.IsRetiredGeminiCLIAuthFileData(data)
 	if retiredFile {
 		authfileguard.MarkRetired(path)
 	}
-	sum := sha256.Sum256(data)
 	normalizedPath := w.normalizeAuthPath(path)
-	currentHash := hex.EncodeToString(sum[:])
 	confirmReplacement := resolveTombstoneReplacement && w.shouldConfirmAuthDeleteTombstoneReplacement(normalizedPath, data)
 
 	var cachedAuth *coreauth.Auth
