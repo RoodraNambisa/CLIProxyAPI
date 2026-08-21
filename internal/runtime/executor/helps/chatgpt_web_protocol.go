@@ -1335,6 +1335,14 @@ type ChatGPTWebImageReference struct {
 type ChatGPTWebImageTaskState struct {
 	Matched  int
 	Terminal int
+	Targets  []ChatGPTWebImageTaskTarget
+}
+
+// ChatGPTWebImageTaskTarget identifies one exact official image task stream.
+type ChatGPTWebImageTaskTarget struct {
+	TaskID            string
+	ResponseMessageID string
+	Terminal          bool
 }
 
 // AllTerminal reports whether at least one task matched and all matched tasks
@@ -2840,10 +2848,12 @@ func CaptureChatGPTWebImageTasks(payload []byte, conversationID string, accumula
 			continue
 		}
 		state.Matched++
-		if err := snapshot.appendTaskID(chatGPTWebImageTaskID(task)); err != nil {
+		taskID := chatGPTWebImageTaskID(task)
+		responseMessageID := chatGPTWebImageTaskResponseMessageID(task)
+		if err := snapshot.appendTaskID(taskID); err != nil {
 			return ChatGPTWebImageTaskState{}, err
 		}
-		if err := snapshot.appendResponseMessageID(chatGPTWebImageTaskResponseMessageID(task)); err != nil {
+		if err := snapshot.appendResponseMessageID(responseMessageID); err != nil {
 			return ChatGPTWebImageTaskState{}, err
 		}
 		taskTerminal := false
@@ -2856,6 +2866,7 @@ func CaptureChatGPTWebImageTasks(payload []byte, conversationID string, accumula
 			taskTerminal = true
 		}
 		if message == nil {
+			state.appendTarget(ChatGPTWebImageTaskTarget{TaskID: taskID, ResponseMessageID: responseMessageID, Terminal: taskTerminal})
 			if taskTerminal {
 				state.Terminal++
 				if taskFailureStatus != "" {
@@ -2866,6 +2877,7 @@ func CaptureChatGPTWebImageTasks(payload []byte, conversationID string, accumula
 		}
 		role, _ := webMessageImageContext(message)
 		if role != "" && !webMessageCanContainGeneratedImage(role) {
+			state.appendTarget(ChatGPTWebImageTaskTarget{TaskID: taskID, ResponseMessageID: responseMessageID, Terminal: taskTerminal})
 			if taskTerminal {
 				state.Terminal++
 				if taskFailureStatus != "" {
@@ -2904,6 +2916,7 @@ func CaptureChatGPTWebImageTasks(payload []byte, conversationID string, accumula
 		if messageSnapshot.PendingOutput || chatGPTWebImageConversationPending(message) {
 			terminal = false
 		}
+		state.appendTarget(ChatGPTWebImageTaskTarget{TaskID: taskID, ResponseMessageID: responseMessageID, Terminal: terminal})
 		if terminal {
 			state.Terminal++
 			if failureStatus == "" {
@@ -2936,6 +2949,56 @@ func CaptureChatGPTWebImageTasks(payload []byte, conversationID string, accumula
 	accumulator.assistantTerminalSeen = snapshot.assistantTerminalSeen
 	accumulator.terminalAssistantText = snapshot.terminalAssistantText
 	return state, nil
+}
+
+func (state *ChatGPTWebImageTaskState) appendTarget(target ChatGPTWebImageTaskTarget) {
+	if state == nil {
+		return
+	}
+	target.TaskID = strings.TrimSpace(target.TaskID)
+	target.ResponseMessageID = strings.TrimSpace(target.ResponseMessageID)
+	if target.TaskID == "" {
+		return
+	}
+	for index := range state.Targets {
+		if state.Targets[index].TaskID == target.TaskID {
+			if state.Targets[index].ResponseMessageID == "" {
+				state.Targets[index].ResponseMessageID = target.ResponseMessageID
+			}
+			if target.Terminal && !state.Targets[index].Terminal {
+				state.Targets[index].Terminal = true
+			}
+			return
+		}
+	}
+	state.Targets = append(state.Targets, target)
+}
+
+// ChatGPTWebImageTasksNextCursor returns the next cursor from one official
+// paginated task response. An absent cursor terminates pagination.
+func ChatGPTWebImageTasksNextCursor(payload []byte) (string, bool, error) {
+	var root map[string]any
+	decoder := json.NewDecoder(bytes.NewReader(payload))
+	decoder.UseNumber()
+	if err := decoder.Decode(&root); err != nil {
+		return "", false, fmt.Errorf("decode chatgpt web image task cursor: %w", err)
+	}
+	for _, candidate := range []map[string]any{root, mapFromAny(root["pagination"]), mapFromAny(root["page_info"])} {
+		if candidate == nil {
+			continue
+		}
+		for _, key := range []string{"next_cursor", "nextCursor", "cursor"} {
+			if cursor := strings.TrimSpace(stringFromAny(candidate[key])); cursor != "" {
+				return cursor, true, nil
+			}
+		}
+	}
+	return "", false, nil
+}
+
+func mapFromAny(value any) map[string]any {
+	result, _ := value.(map[string]any)
+	return result
 }
 
 func chatGPTWebImageTaskMessage(task map[string]any) (map[string]any, bool) {

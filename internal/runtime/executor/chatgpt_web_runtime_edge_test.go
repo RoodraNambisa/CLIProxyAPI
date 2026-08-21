@@ -4582,6 +4582,71 @@ func TestFinishChatGPTWebImageWaitsForOfficialAsyncOutputBeforeModeration(t *tes
 	}
 }
 
+func TestFinishChatGPTWebImagePrefersExactTaskStreamImageOverEarlyTerminalText(t *testing.T) {
+	imageData := chatGPTWebPNGBytes(t, color.NRGBA{R: 220, G: 120, B: 40, A: 255})
+	var exactStreams atomic.Int32
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/backend-api/tasks":
+			_ = json.NewEncoder(w).Encode(map[string]any{"tasks": []any{map[string]any{
+				"task_id": "exact-task", "response_message_id": "response-message",
+				"conversation_id": "exact-conversation", "status": "running",
+				"image_gen_message": map[string]any{"author": map[string]any{"role": "tool"}, "metadata": map[string]any{"async_task_type": "image_gen"}, "content": map[string]any{"parts": []any{}}},
+			}}})
+		case "/backend-api/tasks/exact-task/stream":
+			exactStreams.Add(1)
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = io.WriteString(w,
+				"data: {\"task_id\":\"exact-task\",\"task_status\":\"completed\",\"final_message\":{\"author\":{\"role\":\"tool\"},\"metadata\":{\"async_task_type\":\"image_gen\"},\"status\":\"finished_successfully\",\"content\":{\"parts\":[{\"asset_pointer\":\"file-service://exact-output\"}]}}}\n\n"+
+					"data: [DONE]\n\n",
+			)
+		case "/backend-api/conversation/exact-conversation":
+			_ = json.NewEncoder(w).Encode(map[string]any{"mapping": map[string]any{}})
+		case "/backend-api/files/exact-output/download":
+			_ = json.NewEncoder(w).Encode(map[string]any{"download_url": server.URL + "/asset"})
+		case "/asset":
+			w.Header().Set("Content-Type", "image/png")
+			_, _ = w.Write(imageData)
+		default:
+			http.NotFound(w, request)
+		}
+	}))
+	defer server.Close()
+
+	executor := NewChatGPTWebExecutor(nil, nil)
+	executor.runtimeBaseURL = server.URL
+	executor.imageMaxPolls = 6
+	disableChatGPTWebImagePollWaits(executor)
+	client, credential, err := executor.newRuntimeClient(chatGPTWebRuntimeAuth())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.CloseIdleConnections()
+	prepared := &chatGPTWebPreparedRequest{
+		routeModel: "gpt-image-2",
+		request:    helps.ChatGPTWebRequest{Image: &helps.ChatGPTWebImageRequest{Prompt: "draw"}},
+	}
+	execution := &chatGPTWebImageExecution{response: &fhttp.Response{
+		StatusCode: http.StatusOK,
+		Body: io.NopCloser(strings.NewReader(
+			"data: {\"conversation_id\":\"exact-conversation\",\"message\":{\"author\":{\"role\":\"assistant\"},\"metadata\":{\"image_gen_async\":true,\"image_gen_task_id\":\"exact-task\"},\"status\":\"in_progress\",\"content\":{\"parts\":[\"Creating image\"]}}}\n\n" +
+				"data: {\"message\":{\"author\":{\"role\":\"assistant\"},\"status\":\"finished_successfully\",\"end_turn\":true,\"content\":{\"parts\":[\"Sorry, I cannot create that image.\"]}}}\n\n" +
+				"data: [DONE]\n\n",
+		)),
+	}}
+	payload, err := executor.finishChatGPTWebImage(context.Background(), client, credential, prepared, execution)
+	if err != nil {
+		t.Fatalf("finishChatGPTWebImage() error = %v", err)
+	}
+	if got := gjson.GetBytes(payload, "response.output.0.result").String(); got != base64.StdEncoding.EncodeToString(imageData) {
+		t.Fatal("exact task stream image was not returned")
+	}
+	if exactStreams.Load() != 1 {
+		t.Fatalf("exact stream requests = %d, want 1", exactStreams.Load())
+	}
+}
+
 func TestFinishChatGPTWebImageKeepsTerminalTextRefusalAfterPolling(t *testing.T) {
 	var conversationPolls atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
@@ -5980,6 +6045,394 @@ func TestPollChatGPTWebImageConversationReturnsFailureTerminal(t *testing.T) {
 	var status interface{ StatusCode() int }
 	if !errors.As(err, &status) || status.StatusCode() != http.StatusBadGateway {
 		t.Fatalf("status error = %v", err)
+	}
+}
+
+func TestFetchChatGPTWebImageTaskPagesFindsCurrentTaskOnSecondPage(t *testing.T) {
+	var pageRequests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/backend-api/tasks" {
+			http.NotFound(w, request)
+			return
+		}
+		pageRequests.Add(1)
+		if request.URL.Query().Get("cursor") == "second" {
+			_ = json.NewEncoder(w).Encode(map[string]any{"tasks": []any{map[string]any{
+				"task_id":                               "current-task",
+				"conversation_id":                       "paged-conversation",
+				"original_conversation_user_message_id": "current-user",
+				"status":                                "completed",
+				"image_gen_message": map[string]any{
+					"author":   map[string]any{"role": "tool"},
+					"metadata": map[string]any{"async_task_type": "image_gen"},
+					"content":  map[string]any{"parts": []any{map[string]any{"asset_pointer": "file-service://second-page"}}},
+				},
+			}}})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"tasks": []any{}, "cursor": "second"})
+	}))
+	defer server.Close()
+
+	executor := NewChatGPTWebExecutor(nil, nil)
+	executor.runtimeBaseURL = server.URL
+	client, credential, err := executor.newRuntimeClient(chatGPTWebRuntimeAuth())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.CloseIdleConnections()
+	result := executor.fetchChatGPTWebImageTaskPages(
+		context.Background(), client, credential,
+		&helps.ChatGPTWebImageAccumulator{ConversationID: "paged-conversation", Turn: helps.ChatGPTWebImageTurn{MessageID: "current-user"}},
+		newChatGPTWebPollResponseBudget(chatGPTWebPollResponseMaxBytes), nil,
+	)
+	if result.err != nil {
+		t.Fatalf("fetchChatGPTWebImageTaskPages() error = %v", result.err)
+	}
+	if pageRequests.Load() != 2 || result.state.Matched != 1 || !result.state.AllTerminal() ||
+		!reflect.DeepEqual(result.accumulator.FileIDs, []string{"second-page"}) {
+		t.Fatalf("pages = %d, state = %+v, files = %v", pageRequests.Load(), result.state, result.accumulator.FileIDs)
+	}
+}
+
+func TestFetchChatGPTWebImageTaskPagesUsesExactTaskStreamOnce(t *testing.T) {
+	var streamRequests atomic.Int32
+	var invalidQuery atomic.Bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/backend-api/tasks":
+			_ = json.NewEncoder(w).Encode(map[string]any{"tasks": []any{map[string]any{
+				"task_id":                               "stream-task",
+				"response_message_id":                   "response-message",
+				"conversation_id":                       "stream-conversation",
+				"original_conversation_user_message_id": "current-user",
+				"status":                                "running",
+				"image_gen_message": map[string]any{
+					"author":   map[string]any{"role": "tool"},
+					"metadata": map[string]any{"async_task_type": "image_gen"},
+					"content":  map[string]any{"parts": []any{}},
+				},
+			}}})
+		case "/backend-api/tasks/stream-task/stream":
+			streamRequests.Add(1)
+			if request.URL.Query().Get("parent_conversation_id") != "stream-conversation" || request.URL.Query().Get("message_id") != "response-message" {
+				invalidQuery.Store(true)
+				http.Error(w, "invalid query", http.StatusBadRequest)
+				return
+			}
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = io.WriteString(w,
+				"data: {\"task_id\":\"stream-task\",\"task_status\":\"completed\",\"final_message\":{\"author\":{\"role\":\"tool\"},\"metadata\":{\"async_task_type\":\"image_gen\"},\"status\":\"finished_successfully\",\"content\":{\"parts\":[{\"asset_pointer\":\"file-service://stream-output\"}]}}}\n\n"+
+					"data: [DONE]\n\n",
+			)
+		default:
+			http.NotFound(w, request)
+		}
+	}))
+	defer server.Close()
+
+	executor := NewChatGPTWebExecutor(nil, nil)
+	executor.runtimeBaseURL = server.URL
+	client, credential, err := executor.newRuntimeClient(chatGPTWebRuntimeAuth())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.CloseIdleConnections()
+	registry := &chatGPTWebImageExactStreamRegistry{}
+	seed := &helps.ChatGPTWebImageAccumulator{ConversationID: "stream-conversation", Turn: helps.ChatGPTWebImageTurn{MessageID: "current-user"}}
+	result := executor.fetchChatGPTWebImageTaskPages(context.Background(), client, credential, seed, newChatGPTWebPollResponseBudget(chatGPTWebPollResponseMaxBytes), registry)
+	if result.err != nil {
+		t.Fatalf("fetchChatGPTWebImageTaskPages() error = %v", result.err)
+	}
+	if !result.state.AllTerminal() || !reflect.DeepEqual(result.accumulator.FileIDs, []string{"stream-output"}) {
+		t.Fatalf("state = %+v, files = %v", result.state, result.accumulator.FileIDs)
+	}
+	second := executor.fetchChatGPTWebImageTaskPages(context.Background(), client, credential, seed, newChatGPTWebPollResponseBudget(chatGPTWebPollResponseMaxBytes), registry)
+	if second.err != nil {
+		t.Fatalf("second fetch error = %v", second.err)
+	}
+	if streamRequests.Load() != 1 {
+		t.Fatalf("exact stream requests = %d, want 1", streamRequests.Load())
+	}
+	if invalidQuery.Load() {
+		t.Fatal("exact stream query did not preserve the parent conversation and response message")
+	}
+}
+
+func TestFetchChatGPTWebImageTaskPagesPreservesExactStreamUnauthorized(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/backend-api/tasks":
+			_ = json.NewEncoder(w).Encode(map[string]any{"tasks": []any{map[string]any{
+				"task_id": "unauthorized-task", "response_message_id": "response-message",
+				"conversation_id": "unauthorized-conversation", "status": "running",
+				"image_gen_message": map[string]any{"author": map[string]any{"role": "tool"}, "metadata": map[string]any{"async_task_type": "image_gen"}, "content": map[string]any{"parts": []any{}}},
+			}}})
+		case "/backend-api/tasks/unauthorized-task/stream":
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = io.WriteString(w, `{"error":{"message":"unauthorized"}}`)
+		default:
+			http.NotFound(w, request)
+		}
+	}))
+	defer server.Close()
+
+	executor := NewChatGPTWebExecutor(nil, nil)
+	executor.runtimeBaseURL = server.URL
+	client, credential, err := executor.newRuntimeClient(chatGPTWebRuntimeAuth())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.CloseIdleConnections()
+	result := executor.fetchChatGPTWebImageTaskPages(
+		context.Background(), client, credential,
+		&helps.ChatGPTWebImageAccumulator{ConversationID: "unauthorized-conversation"},
+		newChatGPTWebPollResponseBudget(chatGPTWebPollResponseMaxBytes), &chatGPTWebImageExactStreamRegistry{},
+	)
+	var status interface{ StatusCode() int }
+	if !errors.As(result.err, &status) || status.StatusCode() != http.StatusUnauthorized {
+		t.Fatalf("exact stream error = %v", result.err)
+	}
+}
+
+func TestFetchChatGPTWebImageTaskPagesBoundsExactStreamResponseBudget(t *testing.T) {
+	taskPayload := `{"tasks":[{"task_id":"budget-task","response_message_id":"response-message","conversation_id":"budget-conversation","status":"running","image_gen_message":{"author":{"role":"tool"},"metadata":{"async_task_type":"image_gen"},"content":{"parts":[]}}}]}`
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/backend-api/tasks":
+			_, _ = io.WriteString(w, taskPayload)
+		case "/backend-api/tasks/budget-task/stream":
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = io.WriteString(w, "data: "+strings.Repeat("x", 256)+"\n\n")
+		default:
+			http.NotFound(w, request)
+		}
+	}))
+	defer server.Close()
+
+	executor := NewChatGPTWebExecutor(nil, nil)
+	executor.runtimeBaseURL = server.URL
+	client, credential, err := executor.newRuntimeClient(chatGPTWebRuntimeAuth())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.CloseIdleConnections()
+	result := executor.fetchChatGPTWebImageTaskPages(
+		context.Background(), client, credential,
+		&helps.ChatGPTWebImageAccumulator{ConversationID: "budget-conversation"},
+		newChatGPTWebPollResponseBudget(len(taskPayload)+32), &chatGPTWebImageExactStreamRegistry{},
+	)
+	var limitErr *helps.ChatGPTWebResponseLimitError
+	if !errors.As(result.err, &limitErr) {
+		t.Fatalf("exact stream budget error = %T %v", result.err, result.err)
+	}
+}
+
+func TestFetchChatGPTWebImageTaskPagesCancellationReleasesExactStreamPollSlot(t *testing.T) {
+	streamStarted := make(chan struct{})
+	streamCanceled := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/backend-api/tasks":
+			_ = json.NewEncoder(w).Encode(map[string]any{"tasks": []any{map[string]any{
+				"task_id": "cancel-task", "response_message_id": "response-message",
+				"conversation_id": "cancel-conversation", "status": "running",
+				"image_gen_message": map[string]any{"author": map[string]any{"role": "tool"}, "metadata": map[string]any{"async_task_type": "image_gen"}, "content": map[string]any{"parts": []any{}}},
+			}}})
+		case "/backend-api/tasks/cancel-task/stream":
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.WriteHeader(http.StatusOK)
+			if flusher, ok := w.(http.Flusher); ok {
+				flusher.Flush()
+			}
+			close(streamStarted)
+			<-request.Context().Done()
+			close(streamCanceled)
+		default:
+			http.NotFound(w, request)
+		}
+	}))
+	defer server.Close()
+
+	executor := NewChatGPTWebExecutor(nil, nil)
+	executor.runtimeBaseURL = server.URL
+	client, credential, err := executor.newRuntimeClient(chatGPTWebRuntimeAuth())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.CloseIdleConnections()
+	before := ChatGPTWebImagePollSnapshot()
+	ctx, cancel := context.WithCancel(context.Background())
+	resultCh := make(chan chatGPTWebImageTaskPollResult, 1)
+	go func() {
+		resultCh <- executor.fetchChatGPTWebImageTaskPages(
+			ctx, client, credential,
+			&helps.ChatGPTWebImageAccumulator{ConversationID: "cancel-conversation"},
+			newChatGPTWebPollResponseBudget(chatGPTWebPollResponseMaxBytes), &chatGPTWebImageExactStreamRegistry{},
+		)
+	}()
+	select {
+	case <-streamStarted:
+	case <-time.After(time.Second):
+		t.Fatal("exact stream did not start")
+	}
+	waitForChatGPTWebCondition(t, time.Second, func() bool {
+		return ChatGPTWebImagePollSnapshot().Active == before.Active+1
+	})
+	cancel()
+	select {
+	case result := <-resultCh:
+		if !errors.Is(result.err, context.Canceled) {
+			t.Fatalf("fetch cancellation error = %v", result.err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("exact stream fetch did not stop after cancellation")
+	}
+	select {
+	case <-streamCanceled:
+	case <-time.After(time.Second):
+		t.Fatal("exact stream response was not canceled")
+	}
+	waitForChatGPTWebCondition(t, time.Second, func() bool {
+		after := ChatGPTWebImagePollSnapshot()
+		return after.Active == before.Active && after.Queued == before.Queued
+	})
+}
+
+func TestFetchChatGPTWebImageTaskPagesBoundsRepeatedCursor(t *testing.T) {
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		requests.Add(1)
+		_ = json.NewEncoder(w).Encode(map[string]any{"tasks": []any{}, "cursor": "repeat"})
+	}))
+	defer server.Close()
+	executor := NewChatGPTWebExecutor(nil, nil)
+	executor.runtimeBaseURL = server.URL
+	client, credential, err := executor.newRuntimeClient(chatGPTWebRuntimeAuth())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.CloseIdleConnections()
+	result := executor.fetchChatGPTWebImageTaskPages(
+		context.Background(), client, credential,
+		&helps.ChatGPTWebImageAccumulator{ConversationID: "cursor-conversation"},
+		newChatGPTWebPollResponseBudget(chatGPTWebPollResponseMaxBytes), nil,
+	)
+	if result.err != nil {
+		t.Fatalf("fetch error = %v", result.err)
+	}
+	if requests.Load() != 2 {
+		t.Fatalf("requests = %d, want 2", requests.Load())
+	}
+}
+
+func TestFetchChatGPTWebImageTaskPagesBoundsPageCount(t *testing.T) {
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		count := requests.Add(1)
+		_ = json.NewEncoder(w).Encode(map[string]any{"tasks": []any{}, "cursor": fmt.Sprintf("page-%d", count+1)})
+	}))
+	defer server.Close()
+	executor := NewChatGPTWebExecutor(nil, nil)
+	executor.runtimeBaseURL = server.URL
+	client, credential, err := executor.newRuntimeClient(chatGPTWebRuntimeAuth())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.CloseIdleConnections()
+	result := executor.fetchChatGPTWebImageTaskPages(
+		context.Background(), client, credential,
+		&helps.ChatGPTWebImageAccumulator{ConversationID: "page-limit-conversation"},
+		newChatGPTWebPollResponseBudget(chatGPTWebPollResponseMaxBytes), nil,
+	)
+	if result.err != nil {
+		t.Fatalf("fetch error = %v", result.err)
+	}
+	if requests.Load() != chatGPTWebImageTaskMaxPages {
+		t.Fatalf("requests = %d, want %d", requests.Load(), chatGPTWebImageTaskMaxPages)
+	}
+}
+
+func TestPollChatGPTWebImageConversationFallsBackAfterExactStreamUnavailable(t *testing.T) {
+	var exactRequests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/backend-api/tasks":
+			_ = json.NewEncoder(w).Encode(map[string]any{"tasks": []any{map[string]any{
+				"task_id": "fallback-task", "response_message_id": "response-message",
+				"conversation_id": "fallback-conversation", "status": "running",
+				"image_gen_message": map[string]any{"author": map[string]any{"role": "tool"}, "metadata": map[string]any{"async_task_type": "image_gen"}, "content": map[string]any{"parts": []any{}}},
+			}}})
+		case "/backend-api/tasks/fallback-task/stream":
+			exactRequests.Add(1)
+			http.NotFound(w, request)
+		case "/backend-api/conversation/fallback-conversation":
+			writeTerminalChatGPTWebImageConversation(w, "conversation-output")
+		default:
+			http.NotFound(w, request)
+		}
+	}))
+	defer server.Close()
+	executor := NewChatGPTWebExecutor(nil, nil)
+	executor.runtimeBaseURL = server.URL
+	executor.imageMaxPolls = 6
+	disableChatGPTWebImagePollWaits(executor)
+	client, credential, err := executor.newRuntimeClient(chatGPTWebRuntimeAuth())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.CloseIdleConnections()
+	accumulator := &helps.ChatGPTWebImageAccumulator{ConversationID: "fallback-conversation"}
+	if err = executor.pollChatGPTWebImageConversation(context.Background(), client, credential, accumulator, nil, false); err != nil {
+		t.Fatalf("poll error = %v", err)
+	}
+	if !reflect.DeepEqual(accumulator.FileIDs, []string{"conversation-output"}) || exactRequests.Load() != 1 {
+		t.Fatalf("files = %v, exact requests = %d", accumulator.FileIDs, exactRequests.Load())
+	}
+}
+
+func TestPollChatGPTWebImageConversationReturnsExactStreamUnauthorizedWithoutFallback(t *testing.T) {
+	var exactRequests atomic.Int32
+	var conversationRequests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/backend-api/tasks":
+			_ = json.NewEncoder(w).Encode(map[string]any{"tasks": []any{map[string]any{
+				"task_id": "auth-task", "response_message_id": "response-message",
+				"conversation_id": "auth-conversation", "status": "running",
+				"image_gen_message": map[string]any{"author": map[string]any{"role": "tool"}, "metadata": map[string]any{"async_task_type": "image_gen"}, "content": map[string]any{"parts": []any{}}},
+			}}})
+		case "/backend-api/tasks/auth-task/stream":
+			exactRequests.Add(1)
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = io.WriteString(w, `{"error":{"message":"unauthorized"}}`)
+		case "/backend-api/conversation/auth-conversation":
+			conversationRequests.Add(1)
+			_ = json.NewEncoder(w).Encode(map[string]any{"mapping": map[string]any{}})
+		default:
+			http.NotFound(w, request)
+		}
+	}))
+	defer server.Close()
+	executor := NewChatGPTWebExecutor(nil, nil)
+	executor.runtimeBaseURL = server.URL
+	disableChatGPTWebImagePollWaits(executor)
+	client, credential, err := executor.newRuntimeClient(chatGPTWebRuntimeAuth())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.CloseIdleConnections()
+	err = executor.pollChatGPTWebImageConversation(context.Background(), client, credential, &helps.ChatGPTWebImageAccumulator{ConversationID: "auth-conversation"}, nil, false)
+	var status interface{ StatusCode() int }
+	if !errors.As(err, &status) || status.StatusCode() != http.StatusUnauthorized {
+		t.Fatalf("poll error = %v", err)
+	}
+	if exactRequests.Load() != 1 {
+		t.Fatalf("exact requests = %d, want 1", exactRequests.Load())
+	}
+	if conversationRequests.Load() > 1 {
+		t.Fatalf("conversation requests = %d, authentication error did not stop promptly", conversationRequests.Load())
 	}
 }
 

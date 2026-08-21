@@ -1162,6 +1162,25 @@ func TestCaptureChatGPTWebImageTasksRecognizesOfficialAsyncMetadata(t *testing.T
 	}
 }
 
+func TestChatGPTWebImageTasksNextCursorSupportsOfficialShapes(t *testing.T) {
+	for _, payload := range []string{
+		`{"tasks":[],"cursor":"next-page"}`,
+		`{"tasks":[],"pagination":{"next_cursor":"next-page"}}`,
+		`{"tasks":[],"page_info":{"nextCursor":"next-page"}}`,
+	} {
+		cursor, ok, err := ChatGPTWebImageTasksNextCursor([]byte(payload))
+		if err != nil || !ok || cursor != "next-page" {
+			t.Fatalf("cursor = %q, ok = %t, error = %v", cursor, ok, err)
+		}
+	}
+	if cursor, ok, err := ChatGPTWebImageTasksNextCursor([]byte(`{"tasks":[]}`)); err != nil || ok || cursor != "" {
+		t.Fatalf("absent cursor = %q, ok = %t, error = %v", cursor, ok, err)
+	}
+	if _, _, err := ChatGPTWebImageTasksNextCursor([]byte(`{"tasks":`)); err == nil {
+		t.Fatal("truncated task page did not fail cursor decoding")
+	}
+}
+
 func TestChatGPTWebImageAccumulatorDoesNotTreatDirectedToolCallAsAssistantReply(t *testing.T) {
 	accumulator := &ChatGPTWebImageAccumulator{}
 	payload := []byte(`{"message":{"author":{"role":"assistant"},"content":{"content_type":"code","language":"json","text":"{\"size\":\"1536x864\",\"n\":1}"},"status":"finished_successfully","end_turn":true,"recipient":"dynamic.image.tool","channel":"commentary","metadata":{}}}`)

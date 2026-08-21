@@ -55,6 +55,7 @@ const (
 	chatGPTWebImageStreamMaxBytes       = 128 << 20
 	chatGPTWebImageStreamMaxEvents      = 65_536
 	chatGPTWebPollResponseMaxBytes      = 128 << 20
+	chatGPTWebImageTaskMaxPages         = 8
 	chatGPTWebImageResponseJSONOverhead = 8 << 20
 	chatGPTWebImageRateLimitClientBody  = `{"error":{"message":"Rate limit reached for requests. Please try again later.","type":"rate_limit_error","code":"rate_limit_exceeded"}}`
 	chatGPTWebImageNoOutputMessage      = "chatgpt web image generation completed without an image"
@@ -2141,6 +2142,57 @@ type chatGPTWebImageTaskPollResult struct {
 	protocolError bool
 }
 
+type chatGPTWebImageExactStreamRegistry struct {
+	mu        sync.Mutex
+	attempted map[string]struct{}
+	completed map[string]*helps.ChatGPTWebImageAccumulator
+}
+
+func (registry *chatGPTWebImageExactStreamRegistry) claim(taskID string) bool {
+	if registry == nil {
+		return false
+	}
+	taskID = strings.TrimSpace(taskID)
+	if taskID == "" {
+		return false
+	}
+	registry.mu.Lock()
+	defer registry.mu.Unlock()
+	if registry.attempted == nil {
+		registry.attempted = make(map[string]struct{})
+	}
+	if _, exists := registry.attempted[taskID]; exists {
+		return false
+	}
+	registry.attempted[taskID] = struct{}{}
+	return true
+}
+
+func (registry *chatGPTWebImageExactStreamRegistry) store(taskID string, accumulator *helps.ChatGPTWebImageAccumulator) {
+	if registry == nil || accumulator == nil {
+		return
+	}
+	taskID = strings.TrimSpace(taskID)
+	if taskID == "" {
+		return
+	}
+	registry.mu.Lock()
+	defer registry.mu.Unlock()
+	if registry.completed == nil {
+		registry.completed = make(map[string]*helps.ChatGPTWebImageAccumulator)
+	}
+	registry.completed[taskID] = accumulator
+}
+
+func (registry *chatGPTWebImageExactStreamRegistry) load(taskID string) *helps.ChatGPTWebImageAccumulator {
+	if registry == nil {
+		return nil
+	}
+	registry.mu.Lock()
+	defer registry.mu.Unlock()
+	return registry.completed[strings.TrimSpace(taskID)]
+}
+
 type chatGPTWebImageConversationPollResult struct {
 	accumulator   *helps.ChatGPTWebImageAccumulator
 	err           error
@@ -2162,28 +2214,297 @@ func (e *ChatGPTWebExecutor) startChatGPTWebImageTaskPoll(ctx context.Context, c
 }
 
 func (e *ChatGPTWebExecutor) startChatGPTWebImageTaskPollForTurn(ctx context.Context, client *chatgptwebauth.Client, credential *chatgptwebauth.Credential, conversationID string, turn helps.ChatGPTWebImageTurn, budget *chatGPTWebPollResponseBudget) <-chan chatGPTWebImageTaskPollResult {
+	seed := &helps.ChatGPTWebImageAccumulator{ConversationID: conversationID, Turn: turn}
+	return e.startChatGPTWebImageTaskPollForAccumulator(ctx, client, credential, seed, budget, nil)
+}
+
+func (e *ChatGPTWebExecutor) startChatGPTWebImageTaskPollForAccumulator(ctx context.Context, client *chatgptwebauth.Client, credential *chatgptwebauth.Credential, seed *helps.ChatGPTWebImageAccumulator, budget *chatGPTWebPollResponseBudget, exactStreams *chatGPTWebImageExactStreamRegistry) <-chan chatGPTWebImageTaskPollResult {
 	result := make(chan chatGPTWebImageTaskPollResult, 1)
 	go func() {
 		defer close(result)
-		pollResult := chatGPTWebImageTaskPollResult{
-			accumulator: &helps.ChatGPTWebImageAccumulator{ConversationID: conversationID, Turn: turn},
-		}
-		_, payload, releaseMemory, err := e.doChatGPTWebPollGET(ctx, client, credential, "/backend-api/tasks", nil, budget)
-		if releaseMemory != nil {
-			defer releaseMemory()
-		}
-		if err != nil {
-			pollResult.err = err
-		} else {
-			pollResult.state, pollResult.err = helps.CaptureChatGPTWebImageTasks(payload, conversationID, pollResult.accumulator)
-			pollResult.protocolError = pollResult.err != nil
-		}
+		pollResult := e.fetchChatGPTWebImageTaskPages(ctx, client, credential, seed, budget, exactStreams)
 		select {
 		case result <- pollResult:
 		case <-ctx.Done():
 		}
 	}()
 	return result
+}
+
+func chatGPTWebImageTaskSeed(source *helps.ChatGPTWebImageAccumulator) *helps.ChatGPTWebImageAccumulator {
+	if source == nil {
+		return &helps.ChatGPTWebImageAccumulator{}
+	}
+	return &helps.ChatGPTWebImageAccumulator{
+		ConversationID:     source.ConversationID,
+		Turn:               source.Turn,
+		TaskIDs:            append([]string(nil), source.TaskIDs...),
+		ResponseMessageIDs: append([]string(nil), source.ResponseMessageIDs...),
+	}
+}
+
+func (e *ChatGPTWebExecutor) fetchChatGPTWebImageTaskPages(ctx context.Context, client *chatgptwebauth.Client, credential *chatgptwebauth.Credential, seed *helps.ChatGPTWebImageAccumulator, budget *chatGPTWebPollResponseBudget, exactStreams *chatGPTWebImageExactStreamRegistry) chatGPTWebImageTaskPollResult {
+	if seed == nil {
+		seed = &helps.ChatGPTWebImageAccumulator{}
+	}
+	accumulator, errClone := helps.MergeChatGPTWebImageAccumulators(nil, seed)
+	if errClone != nil {
+		return chatGPTWebImageTaskPollResult{accumulator: accumulator, err: errClone, protocolError: true}
+	}
+	conversationID := strings.TrimSpace(accumulator.ConversationID)
+	result := chatGPTWebImageTaskPollResult{accumulator: accumulator}
+	knownTaskIDs := append([]string(nil), accumulator.TaskIDs...)
+	seenCursors := make(map[string]struct{}, chatGPTWebImageTaskMaxPages)
+	cursor := ""
+	for page := 0; page < chatGPTWebImageTaskMaxPages; page++ {
+		path := "/backend-api/tasks"
+		if cursor != "" {
+			path += "?cursor=" + url.QueryEscape(cursor)
+		}
+		_, payload, releaseMemory, err := e.doChatGPTWebPollGET(ctx, client, credential, path, nil, budget)
+		if releaseMemory != nil {
+			releaseMemory()
+		}
+		if err != nil {
+			result.err = err
+			return result
+		}
+		pageAccumulator := &helps.ChatGPTWebImageAccumulator{
+			ConversationID: conversationID,
+			Turn:           accumulator.Turn,
+			TaskIDs:        append([]string(nil), knownTaskIDs...),
+		}
+		pageState, errCapture := helps.CaptureChatGPTWebImageTasks(payload, conversationID, pageAccumulator)
+		if errCapture != nil {
+			result.err = errCapture
+			result.protocolError = true
+			return result
+		}
+		mergedAccumulator, errMerge := helps.MergeChatGPTWebImageAccumulators(accumulator, pageAccumulator)
+		if errMerge != nil {
+			result.err = errMerge
+			result.protocolError = true
+			return result
+		}
+		accumulator = mergedAccumulator
+		result.accumulator = accumulator
+		mergeChatGPTWebImageTaskState(&result.state, pageState)
+
+		nextCursor, hasCursor, errCursor := helps.ChatGPTWebImageTasksNextCursor(payload)
+		if errCursor != nil {
+			result.err = errCursor
+			result.protocolError = true
+			return result
+		}
+		if chatGPTWebImageTaskIDsFound(knownTaskIDs, result.state.Targets) ||
+			(pageState.Matched > 0 && pageState.AllTerminal()) || !hasCursor {
+			break
+		}
+		if nextCursor == cursor {
+			break
+		}
+		if _, duplicate := seenCursors[nextCursor]; duplicate {
+			break
+		}
+		seenCursors[nextCursor] = struct{}{}
+		cursor = nextCursor
+	}
+
+	for index := range result.state.Targets {
+		target := &result.state.Targets[index]
+		if target.Terminal || strings.TrimSpace(target.ResponseMessageID) == "" || exactStreams == nil {
+			continue
+		}
+		exactAccumulator := exactStreams.load(target.TaskID)
+		var errExact error
+		if exactAccumulator == nil {
+			if !exactStreams.claim(target.TaskID) {
+				continue
+			}
+			exactAccumulator, errExact = e.consumeChatGPTWebExactImageTaskStream(ctx, client, credential, conversationID, *target, budget)
+		}
+		if errExact != nil {
+			if ctx != nil && ctx.Err() != nil {
+				result.err = ctx.Err()
+				return result
+			}
+			var limitErr *helps.ChatGPTWebResponseLimitError
+			if errors.As(errExact, &limitErr) {
+				result.err = errExact
+				return result
+			}
+			if chatGPTWebImagePollAuthenticationError(errExact) {
+				result.err = errExact
+				return result
+			}
+			continue
+		}
+		exactStreams.store(target.TaskID, exactAccumulator)
+		merged, errMerge := helps.MergeChatGPTWebImageAccumulators(result.accumulator, exactAccumulator)
+		if errMerge != nil {
+			result.err = errMerge
+			result.protocolError = true
+			return result
+		}
+		result.accumulator = merged
+		if exactAccumulator.Terminal || exactAccumulator.FailureStatus != "" || exactAccumulator.StreamTerminal {
+			target.Terminal = true
+			result.state.Terminal++
+		}
+	}
+	result.accumulator.Terminal = result.state.AllTerminal()
+	return result
+}
+
+func mergeChatGPTWebImageTaskState(target *helps.ChatGPTWebImageTaskState, source helps.ChatGPTWebImageTaskState) {
+	if target == nil {
+		return
+	}
+	terminalTargets := 0
+	for _, candidate := range source.Targets {
+		if candidate.Terminal {
+			terminalTargets++
+		}
+	}
+	target.Matched += max(source.Matched-len(source.Targets), 0)
+	target.Terminal += max(source.Terminal-terminalTargets, 0)
+	for _, candidate := range source.Targets {
+		found := false
+		for index := range target.Targets {
+			if target.Targets[index].TaskID != candidate.TaskID {
+				continue
+			}
+			found = true
+			if target.Targets[index].ResponseMessageID == "" {
+				target.Targets[index].ResponseMessageID = candidate.ResponseMessageID
+			}
+			if candidate.Terminal && !target.Targets[index].Terminal {
+				target.Targets[index].Terminal = true
+				target.Terminal++
+			}
+			break
+		}
+		if !found {
+			target.Targets = append(target.Targets, candidate)
+			target.Matched++
+			if candidate.Terminal {
+				target.Terminal++
+			}
+		}
+	}
+}
+
+func chatGPTWebImageTaskIDsFound(known []string, targets []helps.ChatGPTWebImageTaskTarget) bool {
+	if len(known) == 0 {
+		return false
+	}
+	for _, taskID := range known {
+		found := false
+		for _, target := range targets {
+			if strings.TrimSpace(target.TaskID) == strings.TrimSpace(taskID) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
+}
+
+func (e *ChatGPTWebExecutor) consumeChatGPTWebExactImageTaskStream(ctx context.Context, client *chatgptwebauth.Client, credential *chatgptwebauth.Credential, conversationID string, target helps.ChatGPTWebImageTaskTarget, budget *chatGPTWebPollResponseBudget) (*helps.ChatGPTWebImageAccumulator, error) {
+	conversationID = strings.TrimSpace(conversationID)
+	taskID := strings.TrimSpace(target.TaskID)
+	messageID := strings.TrimSpace(target.ResponseMessageID)
+	if conversationID == "" || taskID == "" || messageID == "" {
+		return nil, errors.New("chatgpt web exact image task stream identity is incomplete")
+	}
+	releasePoll, errPoll := acquireChatGPTWebImagePollSlot(ctx)
+	if errPoll != nil {
+		return nil, errPoll
+	}
+	defer releasePoll()
+
+	query := url.Values{}
+	query.Set("parent_conversation_id", conversationID)
+	query.Set("message_id", messageID)
+	path := "/backend-api/tasks/" + url.PathEscape(taskID) + "/stream?" + query.Encode()
+	safePath := "/backend-api/tasks/{task_id}/stream"
+	headers := e.chatGPTWebHeaders(credential, safePath, map[string]string{"accept": "text/event-stream"})
+	e.recordChatGPTWebRequest(ctx, credential, http.MethodGet, safePath, headers, nil)
+	started := time.Now()
+	response, errRequest := client.DoNoRedirectStream(ctx, http.MethodGet, e.chatGPTWebBaseURL()+path, headers, nil)
+	if errRequest != nil {
+		cliproxyexecutor.ObserveRequestPhaseContext(ctx, cliproxyexecutor.ImagePhasePollRequest, started)
+		helps.RecordAPIResponseError(ctx, e.configSnapshot(), errRequest)
+		return nil, chatGPTWebTransportDiagnosticError(errRequest, safePath)
+	}
+	defer func() { _ = response.Body.Close() }()
+	helps.RecordAPIResponseMetadata(ctx, e.configSnapshot(), response.StatusCode, chatGPTWebResponseLogHeaders(response.Header))
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		payload, releaseMemory, errRead := readChatGPTWebPollResponseBody(ctx, response, chatGPTWebMaxErrorBodyBytes)
+		cliproxyexecutor.ObserveRequestPhaseContext(ctx, cliproxyexecutor.ImagePhasePollRequest, started)
+		if releaseMemory != nil {
+			defer releaseMemory()
+		}
+		if errRead != nil {
+			return nil, errRead
+		}
+		if errBudget := budget.consume(len(payload)); errBudget != nil {
+			return nil, errBudget
+		}
+		if challengeErr := newChatGPTWebChallengeResponseError(response.StatusCode, safePath, payload, response.Header); challengeErr != nil {
+			return nil, challengeErr
+		}
+		return nil, newChatGPTWebStatusError(response.StatusCode, safePath, payload, response.Header)
+	}
+	contentType := strings.TrimSpace(response.Header.Get("Content-Type"))
+	if parsed, _, errParse := mime.ParseMediaType(contentType); errParse == nil {
+		contentType = parsed
+	}
+	if !strings.EqualFold(contentType, "text/event-stream") {
+		cliproxyexecutor.ObserveRequestPhaseContext(ctx, cliproxyexecutor.ImagePhasePollRequest, started)
+		return nil, errors.New("chatgpt web exact image task stream did not return SSE")
+	}
+
+	accumulator := &helps.ChatGPTWebImageAccumulator{
+		ConversationID: conversationID,
+		Turn:           helps.ChatGPTWebImageTurn{MessageID: messageID},
+		TaskIDs:        []string{taskID},
+	}
+	streamReader := &chatGPTWebImageBudgetReader{reader: response.Body, budget: budget}
+	errStream := consumeChatGPTWebImageStreamWithLimits(ctx, streamReader, accumulator, chatGPTWebImageStreamMaxBytes, chatGPTWebImageStreamMaxEvents)
+	cliproxyexecutor.ObserveRequestPhaseContext(ctx, cliproxyexecutor.ImagePhasePollRequest, started)
+	helps.AppendAPIResponseChunk(ctx, e.configSnapshot(), []byte("<chatgpt web exact task stream body omitted>"))
+	if errors.Is(errStream, errChatGPTWebImageIncompleteStream) && (accumulator.Terminal || accumulator.StreamTerminal || accumulator.FailureStatus != "") {
+		errStream = nil
+	}
+	if errStream != nil {
+		return accumulator, errStream
+	}
+	if !accumulator.Terminal && !accumulator.StreamTerminal && accumulator.FailureStatus == "" {
+		return accumulator, errors.New("chatgpt web exact image task stream ended without a terminal event")
+	}
+	return accumulator, nil
+}
+
+type chatGPTWebImageBudgetReader struct {
+	reader io.Reader
+	budget *chatGPTWebPollResponseBudget
+}
+
+func (reader *chatGPTWebImageBudgetReader) Read(buffer []byte) (int, error) {
+	if reader == nil || reader.reader == nil {
+		return 0, io.EOF
+	}
+	count, errRead := reader.reader.Read(buffer)
+	if count > 0 {
+		if errBudget := reader.budget.consume(count); errBudget != nil {
+			return 0, errBudget
+		}
+	}
+	return count, errRead
 }
 
 func (e *ChatGPTWebExecutor) startChatGPTWebImageConversationPoll(ctx context.Context, client *chatgptwebauth.Client, credential *chatgptwebauth.Credential, conversationID string, budget *chatGPTWebPollResponseBudget) <-chan chatGPTWebImageConversationPollResult {
@@ -2383,6 +2704,7 @@ func (e *ChatGPTWebExecutor) watchChatGPTWebImageTasks(ctx context.Context, clie
 	taskFallbackAt := time.Time{}
 	taskFallbackNeedsConversationRefresh := false
 	taskFallbackConversationRefreshed := false
+	exactStreams := &chatGPTWebImageExactStreamRegistry{}
 	lastConversationTerminalSignature := ""
 	stableConversationTerminalSnapshots := 0
 	conversationSettleAt := time.Time{}
@@ -2464,7 +2786,10 @@ func (e *ChatGPTWebExecutor) watchChatGPTWebImageTasks(ctx context.Context, clie
 			}
 		}
 		if tasksEnabled && taskPoll == nil && taskPolls < maxPolls && !now.Before(nextTaskPollAt) {
-			taskPoll = e.startChatGPTWebImageTaskPollForTurn(pollContext, client, credential, conversationID, turn, pollBudget)
+			seed := chatGPTWebImageTaskSeed(taskSnapshot)
+			seed.ConversationID = conversationID
+			seed.Turn = turn
+			taskPoll = e.startChatGPTWebImageTaskPollForAccumulator(pollContext, client, credential, seed, pollBudget, exactStreams)
 			taskPolls++
 		}
 		if conversationEnabled && conversationPoll == nil && conversationPolls < maxPolls && !now.Before(nextConversationPollAt) {
@@ -2801,6 +3126,7 @@ func (e *ChatGPTWebExecutor) pollChatGPTWebImageConversation(ctx context.Context
 	lastTaskFailure := ""
 	var lastConversationErr error
 	conversationTerminal := false
+	exactStreams := &chatGPTWebImageExactStreamRegistry{}
 	baseAccumulator, errClone := helps.MergeChatGPTWebImageAccumulators(nil, accumulator)
 	if errClone != nil {
 		return errClone
@@ -2847,7 +3173,7 @@ func (e *ChatGPTWebExecutor) pollChatGPTWebImageConversation(ctx context.Context
 			}
 		}
 		if tasksEnabled && taskPoll == nil && taskPolls < maxPolls && !now.Before(nextTaskPollAt) {
-			taskPoll = e.startChatGPTWebImageTaskPollForTurn(pollContext, client, credential, accumulator.ConversationID, accumulator.Turn, pollBudget)
+			taskPoll = e.startChatGPTWebImageTaskPollForAccumulator(pollContext, client, credential, chatGPTWebImageTaskSeed(accumulator), pollBudget, exactStreams)
 			taskPolls++
 		}
 		if conversationEnabled && conversationPoll == nil && conversationPolls < maxPolls && !now.Before(nextConversationPollAt) {
@@ -4166,11 +4492,12 @@ func readChatGPTWebPollResponseBody(ctx context.Context, response *fhttp.Respons
 
 func (e *ChatGPTWebExecutor) doChatGPTWebGETWithBudget(ctx context.Context, client *chatgptwebauth.Client, credential *chatgptwebauth.Credential, path string, extra map[string]string, budget *chatGPTWebPollResponseBudget, logBody bool) (*fhttp.Response, []byte, func(), error) {
 	headers := e.chatGPTWebHeaders(credential, path, extra)
-	e.recordChatGPTWebRequest(ctx, credential, http.MethodGet, path, headers, nil)
+	logPath := chatGPTWebRequestLogPath(path)
+	e.recordChatGPTWebRequest(ctx, credential, http.MethodGet, logPath, headers, nil)
 	response, err := client.DoNoRedirectStream(ctx, http.MethodGet, e.chatGPTWebBaseURL()+path, headers, nil)
 	if err != nil {
 		helps.RecordAPIResponseError(ctx, e.configSnapshot(), err)
-		return nil, nil, nil, chatGPTWebTransportDiagnosticError(err, path)
+		return nil, nil, nil, chatGPTWebTransportDiagnosticError(err, logPath)
 	}
 	helps.RecordAPIResponseMetadata(ctx, e.configSnapshot(), response.StatusCode, chatGPTWebResponseLogHeaders(response.Header))
 	data, releaseMemory, err := readChatGPTWebPollResponseBody(ctx, response, chatGPTWebMaxJSONBodyBytes)
@@ -4180,29 +4507,37 @@ func (e *ChatGPTWebExecutor) doChatGPTWebGETWithBudget(ctx context.Context, clie
 		if errors.As(err, &memoryErr) {
 			return response, nil, nil, err
 		}
-		return response, nil, nil, chatGPTWebTransportDiagnosticError(err, path)
+		return response, nil, nil, chatGPTWebTransportDiagnosticError(err, logPath)
 	}
 	if err = budget.consume(len(data)); err != nil {
 		releaseMemory()
 		helps.RecordAPIResponseError(ctx, e.configSnapshot(), err)
 		return response, nil, nil, err
 	}
-	sanitizedData := chatGPTWebResponseLogBody(path, data)
+	sanitizedData := chatGPTWebResponseLogBody(logPath, data)
 	if logBody {
 		helps.AppendAPIResponseChunk(ctx, e.configSnapshot(), sanitizedData)
 	} else {
 		helps.AppendAPIResponseChunk(ctx, e.configSnapshot(), []byte("<chatgpt web polling response body omitted>"))
 	}
-	if challengeErr := newChatGPTWebChallengeResponseError(response.StatusCode, path, data, response.Header); challengeErr != nil {
+	if challengeErr := newChatGPTWebChallengeResponseError(response.StatusCode, logPath, data, response.Header); challengeErr != nil {
 		releaseMemory()
 		return response, nil, nil, challengeErr
 	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		statusErr := newChatGPTWebStatusError(response.StatusCode, path, data, response.Header)
+		statusErr := newChatGPTWebStatusError(response.StatusCode, logPath, data, response.Header)
 		releaseMemory()
 		return response, nil, nil, statusErr
 	}
 	return response, data, releaseMemory, nil
+}
+
+func chatGPTWebRequestLogPath(path string) string {
+	parsed, err := url.Parse(strings.TrimSpace(path))
+	if err != nil || parsed == nil || strings.TrimSpace(parsed.Path) == "" {
+		return "/"
+	}
+	return parsed.EscapedPath()
 }
 
 func chatGPTWebAssetNetworkError(ctx context.Context, action string, err error) error {
