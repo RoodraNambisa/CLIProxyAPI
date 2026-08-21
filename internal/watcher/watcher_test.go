@@ -2267,6 +2267,26 @@ func TestSeedCurrentFileAuthsResolvesSymlinkedAuthDirectory(t *testing.T) {
 	}
 }
 
+func TestSeedCurrentFileAuthsRejectsPathsOutsideAuthDirectory(t *testing.T) {
+	authDir := t.TempDir()
+	outsidePath := filepath.Join(t.TempDir(), "outside.json")
+	auths := []*coreauth.Auth{
+		{ID: "relative-escape", Provider: "codex", FileName: "../outside.json"},
+		{
+			ID:       "absolute-outside",
+			Provider: "codex",
+			Attributes: map[string]string{
+				"path": outsidePath,
+			},
+		},
+	}
+	w := &Watcher{authDir: authDir}
+	w.SeedCurrentFileAuths(auths)
+	if len(w.currentAuths) != 0 {
+		t.Fatalf("outside auth paths were seeded: %#v", w.currentAuths)
+	}
+}
+
 func TestAuthUsesRetiredPathResolvesSymlinkAlias(t *testing.T) {
 	realDir := t.TempDir()
 	linkDir := filepath.Join(t.TempDir(), "auths")
@@ -4549,6 +4569,32 @@ func BenchmarkInitialAuthScan10000(b *testing.B) {
 	}
 	b.StopTimer()
 	b.ReportMetric(float64(reads.Load())/float64(b.N), "file_reads/op")
+}
+
+func BenchmarkSeedCurrentFileAuths10000(b *testing.B) {
+	authDir := b.TempDir()
+	const authCount = 10_000
+	auths := make([]*coreauth.Auth, 0, authCount)
+	for index := 0; index < authCount; index++ {
+		name := fmt.Sprintf("auth-%05d.json", index)
+		auths = append(auths, &coreauth.Auth{
+			ID:       name,
+			FileName: name,
+			Provider: "codex",
+			Attributes: map[string]string{
+				"path": filepath.Join(authDir, name),
+			},
+		})
+	}
+	w := &Watcher{authDir: authDir}
+
+	b.ResetTimer()
+	for iteration := 0; iteration < b.N; iteration++ {
+		w.clientsMutex.Lock()
+		w.currentAuths = nil
+		w.clientsMutex.Unlock()
+		w.SeedCurrentFileAuths(auths)
+	}
 }
 
 func TestDispatchLoopExitsWhenQueueNilAndContextCanceled(t *testing.T) {

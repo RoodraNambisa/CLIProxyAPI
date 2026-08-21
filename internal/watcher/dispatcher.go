@@ -35,20 +35,24 @@ func (w *Watcher) SeedCurrentFileAuths(auths []*coreauth.Auth) {
 	if errAuthDir != nil {
 		return
 	}
+	authDirIdentity := authfileguard.PathIdentity(authDir)
+	if authDirIdentity == "" {
+		return
+	}
 	w.clientsMutex.Lock()
 	defer w.clientsMutex.Unlock()
 	if w.currentAuths == nil {
 		w.currentAuths = make(map[string]*coreauth.Auth)
 	}
 	for _, auth := range auths {
-		if auth == nil || auth.ID == "" || !fileAuthBelongsToDirectory(auth, authDir) {
+		if auth == nil || auth.ID == "" || !fileAuthBelongsToDirectory(auth, authDirIdentity) {
 			continue
 		}
 		w.currentAuths[auth.ID] = auth.Clone()
 	}
 }
 
-func fileAuthBelongsToDirectory(auth *coreauth.Auth, authDir string) bool {
+func fileAuthBelongsToDirectory(auth *coreauth.Auth, authDirIdentity string) bool {
 	if auth.Attributes != nil && strings.EqualFold(strings.TrimSpace(auth.Attributes["runtime_only"]), "true") {
 		return false
 	}
@@ -63,18 +67,14 @@ func fileAuthBelongsToDirectory(auth *coreauth.Auth, authDir string) bool {
 		return false
 	}
 	if !filepath.IsAbs(path) {
-		path = filepath.Join(authDir, filepath.FromSlash(path))
+		path = filepath.Join(authDirIdentity, filepath.FromSlash(path))
+	} else {
+		path = authfileguard.PathIdentity(path)
 	}
-	absolutePath, errAbs := filepath.Abs(path)
-	if errAbs != nil {
+	if path == "" {
 		return false
 	}
-	authDirIdentity := authfileguard.PathIdentity(authDir)
-	pathIdentity := authfileguard.PathIdentity(absolutePath)
-	if authDirIdentity == "" || pathIdentity == "" {
-		return false
-	}
-	relativePath, errRel := filepath.Rel(authDirIdentity, pathIdentity)
+	relativePath, errRel := filepath.Rel(authDirIdentity, filepath.Clean(path))
 	return errRel == nil && relativePath != "." && relativePath != ".." && !strings.HasPrefix(relativePath, ".."+string(filepath.Separator))
 }
 
