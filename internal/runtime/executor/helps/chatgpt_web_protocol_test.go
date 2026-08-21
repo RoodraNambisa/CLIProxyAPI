@@ -1055,6 +1055,82 @@ func TestChatGPTWebImageAccumulatorRecognizesPatchedAsyncImageActivity(t *testin
 	if !accumulator.imageTool {
 		t.Fatal("patched image task ID was not recognized")
 	}
+	if !reflect.DeepEqual(accumulator.TaskIDs, []string{"task-1"}) {
+		t.Fatalf("task IDs = %v", accumulator.TaskIDs)
+	}
+}
+
+func TestChatGPTWebImageAccumulatorCapturesTaskIdentityFromFullAndFinalEvents(t *testing.T) {
+	accumulator := &ChatGPTWebImageAccumulator{}
+	for _, payload := range []string{
+		`{"message":{"author":{"role":"assistant"},"metadata":{"image_gen_task_id":"task-full"},"status":"in_progress","content":{"parts":[]}}}`,
+		`{"task_id":"task-stream","task_status":"completed","final_message":{"id":"response-message","author":{"role":"tool"},"metadata":{"async_task_type":"image_gen"},"status":"finished_successfully","content":{"parts":[{"asset_pointer":"file-service://final-output"}]}}}`,
+	} {
+		if _, err := accumulator.Apply([]byte(payload)); err != nil {
+			t.Fatalf("Apply() error = %v", err)
+		}
+	}
+	if !reflect.DeepEqual(accumulator.TaskIDs, []string{"task-full", "task-stream"}) {
+		t.Fatalf("task IDs = %v", accumulator.TaskIDs)
+	}
+	if !reflect.DeepEqual(accumulator.FileIDs, []string{"final-output"}) {
+		t.Fatalf("file IDs = %v", accumulator.FileIDs)
+	}
+}
+
+func TestChatGPTWebImageAccumulatorFiltersAndOrdersOfficialImageOutputs(t *testing.T) {
+	accumulator := &ChatGPTWebImageAccumulator{}
+	payload := []byte(`{"message":{"author":{"role":"tool"},"metadata":{"async_task_type":"image_gen","is_complete":true,"status":"finished_successfully"},"content":{"parts":[
+		{"asset_pointer":"file-service://third","generation_index":2},
+		{"asset_pointer":"file-service://hidden","generation_index":0,"is_visually_hidden_from_conversation":true},
+		{"asset_pointer":"file-service://first","generation_index":0},
+		{"asset_pointer":"file-service://unindexed"},
+		{"asset_pointer":"file-service://placeholder","metadata":{"is_no_auth_placeholder":true}}
+	]}}}`)
+	if _, err := accumulator.Apply(payload); err != nil {
+		t.Fatalf("Apply() error = %v", err)
+	}
+	if !reflect.DeepEqual(accumulator.FileIDs, []string{"first", "third", "unindexed"}) {
+		t.Fatalf("file IDs = %v", accumulator.FileIDs)
+	}
+	if !accumulator.HiddenOutputSeen || !accumulator.PlaceholderOutputSeen {
+		t.Fatalf("hidden = %t, placeholder = %t", accumulator.HiddenOutputSeen, accumulator.PlaceholderOutputSeen)
+	}
+}
+
+func TestChatGPTWebImageAccumulatorWaitsForProgressivePointerCompletion(t *testing.T) {
+	accumulator := &ChatGPTWebImageAccumulator{}
+	for index, payload := range []string{
+		`{"message":{"author":{"role":"tool"},"metadata":{"async_task_type":"image_gen","is_complete":true,"status":"finished_successfully"},"content":{"parts":[{"asset_pointer":"file-service://progressive","height":1024,"metadata":{"generation":{"height":512}}}]}}}`,
+		`{"message":{"author":{"role":"tool"},"metadata":{"async_task_type":"image_gen","is_complete":true,"status":"finished_successfully"},"content":{"parts":[{"asset_pointer":"file-service://progressive","height":1024,"metadata":{"generation":{"height":1024}}}]}}}`,
+	} {
+		if _, err := accumulator.Apply([]byte(payload)); err != nil {
+			t.Fatalf("Apply(%d) error = %v", index, err)
+		}
+		if index == 0 && (!accumulator.PendingOutput || accumulator.Terminal || len(accumulator.FileIDs) != 0) {
+			t.Fatalf("incomplete state = pending %t, terminal %t, files %v", accumulator.PendingOutput, accumulator.Terminal, accumulator.FileIDs)
+		}
+	}
+	if accumulator.PendingOutput || !accumulator.Terminal || !reflect.DeepEqual(accumulator.FileIDs, []string{"progressive"}) {
+		t.Fatalf("complete state = pending %t, terminal %t, files %v", accumulator.PendingOutput, accumulator.Terminal, accumulator.FileIDs)
+	}
+}
+
+func TestChatGPTWebImageConversationPendingRecognizesOfficialIntermediateStates(t *testing.T) {
+	for _, state := range []string{"created", "intermediate", "finalizing", "undetermined", "skipping"} {
+		if !chatGPTWebImageConversationPending(map[string]any{"status": state}) {
+			t.Fatalf("status %q was not pending", state)
+		}
+	}
+	if !chatGPTWebImageConversationPending(map[string]any{"ghostrider": map[string]any{"status": "intermediate"}}) {
+		t.Fatal("nested ghostrider intermediate was not pending")
+	}
+	if terminal, failure := chatGPTWebImageConversationState(map[string]any{"ghostrider_status": "final"}); !terminal || failure != "" {
+		t.Fatalf("ghostrider final = terminal %t, failure %q", terminal, failure)
+	}
+	if terminal, failure := chatGPTWebImageConversationState(map[string]any{"ghostrider_status": "cancelled"}); !terminal || failure != "cancelled" {
+		t.Fatalf("ghostrider cancelled = terminal %t, failure %q", terminal, failure)
+	}
 }
 
 func TestChatGPTWebImageAccumulatorIgnoresDisabledAsyncImageFlag(t *testing.T) {
@@ -1798,6 +1874,58 @@ func TestCaptureChatGPTWebImageTasksUsesCurrentMessageRelationWithoutTimestamp(t
 	}
 	if state.Matched != 1 || !reflect.DeepEqual(accumulator.FileIDs, []string{"current-one", "current-two"}) {
 		t.Fatalf("task state = %+v, file IDs = %v", state, accumulator.FileIDs)
+	}
+}
+
+func TestCaptureChatGPTWebImageTasksUsesOfficialOriginalUserRelation(t *testing.T) {
+	payload := []byte(`{"tasks":[
+		{"task_id":"other","conversation_id":"target","status":"completed","original_conversation_user_message_id":"other-user","image_gen_message":{"author":{"role":"tool"},"metadata":{"async_task_type":"image_gen"},"content":{"parts":[{"asset_pointer":"file-service://other"}]}}},
+		{"task_id":"current","conversation_id":"target","status":"completed","original_conversation_user_message_id":"current-user","response_message_id":"response-current","image_gen_message":{"author":{"role":"tool"},"metadata":{"async_task_type":"image_gen"},"content":{"parts":[{"asset_pointer":"file-service://current"}]}}}
+	]}`)
+	accumulator := &ChatGPTWebImageAccumulator{Turn: ChatGPTWebImageTurn{MessageID: "current-user", CreatedAt: 100}}
+	state, err := CaptureChatGPTWebImageTasks(payload, "target", accumulator)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.Matched != 1 || !reflect.DeepEqual(accumulator.TaskIDs, []string{"current"}) ||
+		!reflect.DeepEqual(accumulator.ResponseMessageIDs, []string{"response-current"}) ||
+		!reflect.DeepEqual(accumulator.FileIDs, []string{"current"}) {
+		t.Fatalf("state = %+v, task IDs = %v, response IDs = %v, file IDs = %v", state, accumulator.TaskIDs, accumulator.ResponseMessageIDs, accumulator.FileIDs)
+	}
+}
+
+func TestCaptureChatGPTWebImageTasksDoesNotTimeFallbackAfterExplicitMismatch(t *testing.T) {
+	payload := []byte(`{"tasks":[
+		{"task_id":"other-task","conversation_id":"target","status":"completed","original_conversation_user_message_id":"other-user","create_time":101,"image_gen_message":{"author":{"role":"tool"},"metadata":{"async_task_type":"image_gen"},"content":{"parts":[{"asset_pointer":"file-service://other"}]}}}
+	]}`)
+	accumulator := &ChatGPTWebImageAccumulator{
+		TaskIDs: []string{"current-task"},
+		Turn:    ChatGPTWebImageTurn{MessageID: "current-user", CreatedAt: 100},
+	}
+	state, err := CaptureChatGPTWebImageTasks(payload, "target", accumulator)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.Matched != 0 || len(accumulator.FileIDs) != 0 {
+		t.Fatalf("explicit mismatch leaked through fallback: state = %+v, files = %v", state, accumulator.FileIDs)
+	}
+}
+
+func TestCaptureChatGPTWebImageTasksPrefersExactTaskIDOverOtherAssociations(t *testing.T) {
+	payload := []byte(`{"tasks":[
+		{"task_id":"current-task","conversation_id":"other-conversation","status":"completed","original_conversation_user_message_id":"other-user","image_gen_message":{"author":{"role":"tool"},"metadata":{"async_task_type":"image_gen"},"content":{"parts":[{"asset_pointer":"file-service://exact"}]}}},
+		{"task_id":"other-task","conversation_id":"target","status":"completed","original_conversation_user_message_id":"current-user","image_gen_message":{"author":{"role":"tool"},"metadata":{"async_task_type":"image_gen"},"content":{"parts":[{"asset_pointer":"file-service://relation"}]}}}
+	]}`)
+	accumulator := &ChatGPTWebImageAccumulator{
+		TaskIDs: []string{"current-task"},
+		Turn:    ChatGPTWebImageTurn{MessageID: "current-user"},
+	}
+	state, err := CaptureChatGPTWebImageTasks(payload, "target", accumulator)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.Matched != 1 || !reflect.DeepEqual(accumulator.FileIDs, []string{"exact"}) {
+		t.Fatalf("state = %+v, file IDs = %v", state, accumulator.FileIDs)
 	}
 }
 

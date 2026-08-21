@@ -1286,6 +1286,8 @@ func CleanChatGPTWebText(value string) string {
 type ChatGPTWebImageAccumulator struct {
 	ConversationID        string
 	Turn                  ChatGPTWebImageTurn
+	TaskIDs               []string
+	ResponseMessageIDs    []string
 	FileIDs               []string
 	SedimentIDs           []string
 	References            []ChatGPTWebImageReference
@@ -1293,6 +1295,10 @@ type ChatGPTWebImageAccumulator struct {
 	StreamTerminal        bool
 	FailureStatus         string
 	ToolUsage             map[string]any
+	PendingOutput         bool
+	HiddenOutputSeen      bool
+	IncompleteOutputSeen  bool
+	PlaceholderOutputSeen bool
 	role                  string
 	imageTool             bool
 	assistantTextValue    string
@@ -1300,6 +1306,9 @@ type ChatGPTWebImageAccumulator struct {
 	assistantTextPatch    bool
 	assistantTerminalSeen bool
 	terminalAssistantText bool
+	taskSet               map[string]struct{}
+	responseMessageSet    map[string]struct{}
+	pendingReferenceSet   map[string]struct{}
 	referenceSet          map[string]struct{}
 }
 
@@ -1314,8 +1323,10 @@ type ChatGPTWebImageTurn struct {
 // ChatGPTWebImageReference preserves the upstream order of file-service and
 // sediment image outputs.
 type ChatGPTWebImageReference struct {
-	Kind string
-	ID   string
+	Kind               string
+	ID                 string
+	GenerationIndex    int
+	HasGenerationIndex bool
 }
 
 // ChatGPTWebImageTaskState summarizes image tasks associated with one
@@ -1358,6 +1369,9 @@ func MergeChatGPTWebImageAccumulators(primary, secondary *ChatGPTWebImageAccumul
 		merged.Terminal = merged.Terminal || source.Terminal
 		merged.StreamTerminal = merged.StreamTerminal || source.StreamTerminal
 		merged.FailureStatus = chatGPTWebPreferredImageFailure(merged.FailureStatus, source.FailureStatus)
+		merged.HiddenOutputSeen = merged.HiddenOutputSeen || source.HiddenOutputSeen
+		merged.IncompleteOutputSeen = merged.IncompleteOutputSeen || source.IncompleteOutputSeen
+		merged.PlaceholderOutputSeen = merged.PlaceholderOutputSeen || source.PlaceholderOutputSeen
 		if len(merged.ToolUsage) == 0 && len(source.ToolUsage) > 0 {
 			merged.ToolUsage = source.ToolUsage
 		}
@@ -1377,12 +1391,30 @@ func MergeChatGPTWebImageAccumulators(primary, secondary *ChatGPTWebImageAccumul
 			merged.assistantTextValue = source.assistantTextValue
 		}
 		merged.assistantTerminalSeen = merged.assistantTerminalSeen || source.assistantTerminalSeen
+		for _, taskID := range source.TaskIDs {
+			if err := merged.appendTaskID(taskID); err != nil {
+				return nil, err
+			}
+		}
+		for _, messageID := range source.ResponseMessageIDs {
+			if err := merged.appendResponseMessageID(messageID); err != nil {
+				return nil, err
+			}
+		}
+		for key := range source.pendingReferenceSet {
+			merged.markPendingReferenceKey(key)
+		}
 		for _, reference := range chatGPTWebImageAccumulatorReferences(source) {
-			if err := merged.appendReference(reference.Kind, reference.ID); err != nil {
+			if err := merged.appendReferenceWithMetadata(reference); err != nil {
 				return nil, err
 			}
 		}
 	}
+	for _, reference := range merged.References {
+		merged.clearPendingReferenceKey(reference.Kind + "\x00" + reference.ID)
+	}
+	merged.PendingOutput = len(merged.pendingReferenceSet) > 0
+	merged.sortReferences()
 	if merged.FailureStatus != "" {
 		merged.assistantTerminalSeen = false
 		merged.terminalAssistantText = false
@@ -1437,6 +1469,9 @@ func (accumulator *ChatGPTWebImageAccumulator) Apply(payload []byte) (bool, erro
 	if usage := chatGPTWebFindImageToolUsage(event, 0); len(usage) > 0 {
 		accumulator.ToolUsage = usage
 	}
+	if err := accumulator.captureImageTaskIDs(event, 0); err != nil {
+		return false, err
+	}
 	if chatGPTWebImageOuterModeration(event) {
 		accumulator.mergeTerminalState(true, "content_filter")
 		return chatGPTWebImageStreamTerminal(event), nil
@@ -1475,6 +1510,9 @@ func (accumulator *ChatGPTWebImageAccumulator) Apply(payload []byte) (bool, erro
 				if err := accumulator.captureReferences(message); err != nil {
 					return false, err
 				}
+				if accumulator.PendingOutput {
+					accumulator.Terminal = false
+				}
 			}
 			return streamTerminal, nil
 		}
@@ -1485,6 +1523,14 @@ func (accumulator *ChatGPTWebImageAccumulator) Apply(payload []byte) (bool, erro
 			}
 		}
 		return streamTerminal, nil
+	}
+	if taskStatus := strings.ToLower(strings.TrimSpace(stringFromAny(event["task_status"]))); taskStatus != "" {
+		switch {
+		case chatGPTWebFailureMessageStatus(taskStatus):
+			accumulator.mergeTerminalState(true, taskStatus)
+		case chatGPTWebTerminalMessageStatus(taskStatus):
+			accumulator.mergeTerminalState(true, "")
+		}
 	}
 	if err := accumulator.applyImagePatch(event); err != nil {
 		return false, err
@@ -1723,28 +1769,44 @@ func (accumulator *ChatGPTWebImageAccumulator) applyImagePatch(event map[string]
 		for _, rawOperation := range operations {
 			operation, okOperation := rawOperation.(map[string]any)
 			if okOperation {
-				accumulator.applyImageContextPatch(operation)
+				if err := accumulator.applyImageContextPatch(operation); err != nil {
+					return err
+				}
 			}
 		}
 		accumulator.captureAssistantPatchState(event)
 		if webMessageCanContainGeneratedImage(accumulator.role) &&
 			(accumulator.imageTool || chatGPTWebRelevantImageReference(accumulator.role, accumulator.imageTool, event)) {
 			accumulator.mergeTerminalState(chatGPTWebImageConversationState(event))
-			return accumulator.captureReferences(event)
+			if err := accumulator.captureReferences(event); err != nil {
+				return err
+			}
+			if accumulator.PendingOutput {
+				accumulator.Terminal = false
+			}
+			return nil
 		}
 		return nil
 	}
-	accumulator.applyImageContextPatch(event)
+	if err := accumulator.applyImageContextPatch(event); err != nil {
+		return err
+	}
 	accumulator.captureAssistantPatchState(event)
 	if webMessageCanContainGeneratedImage(accumulator.role) &&
 		(accumulator.imageTool || chatGPTWebRelevantImageReference(accumulator.role, accumulator.imageTool, event)) {
 		accumulator.mergeTerminalState(chatGPTWebImageConversationState(event))
-		return accumulator.captureReferences(event)
+		if err := accumulator.captureReferences(event); err != nil {
+			return err
+		}
+		if accumulator.PendingOutput {
+			accumulator.Terminal = false
+		}
+		return nil
 	}
 	return nil
 }
 
-func (accumulator *ChatGPTWebImageAccumulator) applyImageContextPatch(event map[string]any) {
+func (accumulator *ChatGPTWebImageAccumulator) applyImageContextPatch(event map[string]any) error {
 	path := strings.ToLower(strings.TrimSpace(stringFromAny(event["p"])))
 	value := strings.ToLower(strings.TrimSpace(stringFromAny(event["v"])))
 	if strings.Contains(path, "/author/role") {
@@ -1762,24 +1824,46 @@ func (accumulator *ChatGPTWebImageAccumulator) applyImageContextPatch(event map[
 	}
 	if strings.Contains(path, "/metadata/image_gen_task_id") && strings.TrimSpace(stringFromAny(event["v"])) != "" {
 		accumulator.imageTool = true
+		if err := accumulator.appendTaskID(stringFromAny(event["v"])); err != nil {
+			return err
+		}
 	}
+	return nil
 }
 
 func (accumulator *ChatGPTWebImageAccumulator) captureReferences(value any) error {
-	return accumulator.captureReferencesAt(value, "")
+	if err := accumulator.captureReferencesAt(value, "", 0, false); err != nil {
+		return err
+	}
+	accumulator.sortReferences()
+	return nil
 }
 
-func (accumulator *ChatGPTWebImageAccumulator) captureReferencesAt(value any, field string) error {
+func (accumulator *ChatGPTWebImageAccumulator) captureReferencesAt(value any, field string, generationIndex int, hasGenerationIndex bool) error {
 	switch typed := value.(type) {
 	case map[string]any:
+		if chatGPTWebImageVisuallyHidden(typed) {
+			accumulator.HiddenOutputSeen = true
+			return nil
+		}
+		if index, ok := chatGPTWebImageGenerationIndex(typed); ok {
+			generationIndex = index
+			hasGenerationIndex = true
+		}
 		if pointer, ok := typed["asset_pointer"].(string); ok {
-			if err := accumulator.appendImagePointer(pointer); err != nil {
+			if chatGPTWebImageNoAuthPlaceholder(typed) {
+				accumulator.PlaceholderOutputSeen = true
+				accumulator.clearPendingImagePointer(pointer)
+			} else if chatGPTWebImagePointerIncomplete(typed) {
+				accumulator.IncompleteOutputSeen = true
+				accumulator.markPendingImagePointer(pointer)
+			} else if err := accumulator.appendImagePointerWithGeneration(pointer, generationIndex, hasGenerationIndex); err != nil {
 				return err
 			}
 		}
 		path := strings.ToLower(strings.TrimSpace(stringFromAny(typed["p"])))
 		if strings.HasSuffix(path, "/asset_pointer") {
-			if err := accumulator.appendImagePointer(stringFromAny(typed["v"])); err != nil {
+			if err := accumulator.appendImagePointerWithGeneration(stringFromAny(typed["v"]), generationIndex, hasGenerationIndex); err != nil {
 				return err
 			}
 		}
@@ -1797,12 +1881,12 @@ func (accumulator *ChatGPTWebImageAccumulator) captureReferencesAt(value any, fi
 			}
 			switch typed[key].(type) {
 			case map[string]any, []any:
-				if err := accumulator.captureReferencesAt(typed[key], childField); err != nil {
+				if err := accumulator.captureReferencesAt(typed[key], childField, generationIndex, hasGenerationIndex); err != nil {
 					return err
 				}
 			case string:
 				if childField != "" {
-					if err := accumulator.captureReferencesAt(typed[key], childField); err != nil {
+					if err := accumulator.captureReferencesAt(typed[key], childField, generationIndex, hasGenerationIndex); err != nil {
 						return err
 					}
 				}
@@ -1810,16 +1894,16 @@ func (accumulator *ChatGPTWebImageAccumulator) captureReferencesAt(value any, fi
 		}
 	case []any:
 		for _, item := range typed {
-			if err := accumulator.captureReferencesAt(item, field); err != nil {
+			if err := accumulator.captureReferencesAt(item, field, generationIndex, hasGenerationIndex); err != nil {
 				return err
 			}
 		}
 	case string:
 		if kind := chatGPTWebImageReferenceKind(field); kind != "" {
-			return accumulator.appendImageFieldReference(kind, typed)
+			return accumulator.appendImageFieldReferenceWithGeneration(kind, typed, generationIndex, hasGenerationIndex)
 		}
 		if field != "" {
-			return accumulator.appendImagePointer(typed)
+			return accumulator.appendImagePointerWithGeneration(typed, generationIndex, hasGenerationIndex)
 		}
 	}
 	return nil
@@ -1846,37 +1930,61 @@ func chatGPTWebImageReferenceKind(field string) string {
 }
 
 func (accumulator *ChatGPTWebImageAccumulator) appendImageFieldReference(kind, value string) error {
+	return accumulator.appendImageFieldReferenceWithGeneration(kind, value, 0, false)
+}
+
+func (accumulator *ChatGPTWebImageAccumulator) appendImageFieldReferenceWithGeneration(kind, value string, generationIndex int, hasGenerationIndex bool) error {
 	if pointerKind, id := chatGPTWebImagePointerKindID(value); pointerKind != "" {
-		return accumulator.appendReference(pointerKind, id)
+		return accumulator.appendReferenceWithMetadata(ChatGPTWebImageReference{Kind: pointerKind, ID: id, GenerationIndex: generationIndex, HasGenerationIndex: hasGenerationIndex})
 	}
 	value = strings.TrimSpace(value)
 	if !chatGPTWebImageReferenceIDPattern.MatchString(value) {
 		return nil
 	}
-	return accumulator.appendReference(kind, value)
+	return accumulator.appendReferenceWithMetadata(ChatGPTWebImageReference{Kind: kind, ID: value, GenerationIndex: generationIndex, HasGenerationIndex: hasGenerationIndex})
 }
 
 func (accumulator *ChatGPTWebImageAccumulator) appendImagePointer(pointer string) error {
+	return accumulator.appendImagePointerWithGeneration(pointer, 0, false)
+}
+
+func (accumulator *ChatGPTWebImageAccumulator) appendImagePointerWithGeneration(pointer string, generationIndex int, hasGenerationIndex bool) error {
 	kind, id := chatGPTWebImagePointerKindID(pointer)
 	if kind == "" {
 		return nil
 	}
-	return accumulator.appendReference(kind, id)
+	return accumulator.appendReferenceWithMetadata(ChatGPTWebImageReference{Kind: kind, ID: id, GenerationIndex: generationIndex, HasGenerationIndex: hasGenerationIndex})
 }
 
 func (accumulator *ChatGPTWebImageAccumulator) appendReference(kind, id string) error {
-	id = strings.TrimSpace(id)
+	return accumulator.appendReferenceWithMetadata(ChatGPTWebImageReference{Kind: kind, ID: id})
+}
+
+func (accumulator *ChatGPTWebImageAccumulator) appendReferenceWithMetadata(reference ChatGPTWebImageReference) error {
+	reference.ID = strings.TrimSpace(reference.ID)
+	reference.Kind = strings.TrimSpace(reference.Kind)
+	id := reference.ID
 	if id == "" {
 		return nil
 	}
+	accumulator.clearPendingReferenceKey(reference.Kind + "\x00" + id)
 	if accumulator.referenceSet == nil {
 		accumulator.referenceSet = make(map[string]struct{}, len(accumulator.References)+1)
 		for _, existing := range accumulator.References {
 			accumulator.referenceSet[existing.Kind+"\x00"+existing.ID] = struct{}{}
 		}
 	}
-	key := kind + "\x00" + id
+	key := reference.Kind + "\x00" + id
 	if _, exists := accumulator.referenceSet[key]; exists {
+		if reference.HasGenerationIndex {
+			for index := range accumulator.References {
+				if accumulator.References[index].Kind == reference.Kind && accumulator.References[index].ID == id && !accumulator.References[index].HasGenerationIndex {
+					accumulator.References[index].GenerationIndex = reference.GenerationIndex
+					accumulator.References[index].HasGenerationIndex = true
+					break
+				}
+			}
+		}
 		return nil
 	}
 	if len(accumulator.References) >= chatGPTWebMaxImageOutputReferences {
@@ -1885,13 +1993,216 @@ func (accumulator *ChatGPTWebImageAccumulator) appendReference(kind, id string) 
 		}
 	}
 	accumulator.referenceSet[key] = struct{}{}
-	accumulator.References = append(accumulator.References, ChatGPTWebImageReference{Kind: kind, ID: id})
-	if kind == "sediment" {
+	accumulator.References = append(accumulator.References, reference)
+	if reference.Kind == "sediment" {
 		appendUniqueString(&accumulator.SedimentIDs, id)
 		return nil
 	}
 	appendUniqueString(&accumulator.FileIDs, id)
 	return nil
+}
+
+func (accumulator *ChatGPTWebImageAccumulator) markPendingImagePointer(pointer string) {
+	kind, id := chatGPTWebImagePointerKindID(pointer)
+	if kind == "" {
+		return
+	}
+	accumulator.markPendingReferenceKey(kind + "\x00" + id)
+}
+
+func (accumulator *ChatGPTWebImageAccumulator) clearPendingImagePointer(pointer string) {
+	kind, id := chatGPTWebImagePointerKindID(pointer)
+	if kind == "" {
+		return
+	}
+	accumulator.clearPendingReferenceKey(kind + "\x00" + id)
+}
+
+func (accumulator *ChatGPTWebImageAccumulator) markPendingReferenceKey(key string) {
+	if accumulator == nil || key == "" {
+		return
+	}
+	if accumulator.pendingReferenceSet == nil {
+		accumulator.pendingReferenceSet = make(map[string]struct{})
+	}
+	accumulator.pendingReferenceSet[key] = struct{}{}
+	accumulator.PendingOutput = true
+}
+
+func (accumulator *ChatGPTWebImageAccumulator) clearPendingReferenceKey(key string) {
+	if accumulator == nil || key == "" || accumulator.pendingReferenceSet == nil {
+		return
+	}
+	delete(accumulator.pendingReferenceSet, key)
+	accumulator.PendingOutput = len(accumulator.pendingReferenceSet) > 0
+}
+
+func (accumulator *ChatGPTWebImageAccumulator) sortReferences() {
+	if accumulator == nil || len(accumulator.References) == 0 {
+		return
+	}
+	sort.SliceStable(accumulator.References, func(left, right int) bool {
+		leftReference := accumulator.References[left]
+		rightReference := accumulator.References[right]
+		if leftReference.HasGenerationIndex != rightReference.HasGenerationIndex {
+			return leftReference.HasGenerationIndex
+		}
+		return leftReference.HasGenerationIndex && leftReference.GenerationIndex < rightReference.GenerationIndex
+	})
+	accumulator.FileIDs = accumulator.FileIDs[:0]
+	accumulator.SedimentIDs = accumulator.SedimentIDs[:0]
+	for _, reference := range accumulator.References {
+		if reference.Kind == "sediment" {
+			appendUniqueString(&accumulator.SedimentIDs, reference.ID)
+		} else {
+			appendUniqueString(&accumulator.FileIDs, reference.ID)
+		}
+	}
+}
+
+func (accumulator *ChatGPTWebImageAccumulator) captureImageTaskIDs(value any, depth int) error {
+	if accumulator == nil || depth > 10 {
+		return nil
+	}
+	switch typed := value.(type) {
+	case map[string]any:
+		if taskID := strings.TrimSpace(stringFromAny(typed["image_gen_task_id"])); taskID != "" {
+			if err := accumulator.appendTaskID(taskID); err != nil {
+				return err
+			}
+		}
+		if typed["task_status"] != nil || typed["final_message"] != nil || typed["image_gen_message"] != nil {
+			if err := accumulator.appendTaskID(stringFromAny(typed["task_id"])); err != nil {
+				return err
+			}
+		}
+		if err := accumulator.appendResponseMessageID(stringFromAny(typed["response_message_id"])); err != nil {
+			return err
+		}
+		for _, child := range typed {
+			switch child.(type) {
+			case map[string]any, []any:
+				if err := accumulator.captureImageTaskIDs(child, depth+1); err != nil {
+					return err
+				}
+			}
+		}
+	case []any:
+		for _, child := range typed {
+			if err := accumulator.captureImageTaskIDs(child, depth+1); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func (accumulator *ChatGPTWebImageAccumulator) appendTaskID(taskID string) error {
+	return appendBoundedImageIdentity(&accumulator.TaskIDs, &accumulator.taskSet, taskID, "tasks")
+}
+
+func (accumulator *ChatGPTWebImageAccumulator) appendResponseMessageID(messageID string) error {
+	return appendBoundedImageIdentity(&accumulator.ResponseMessageIDs, &accumulator.responseMessageSet, messageID, "response messages")
+}
+
+func appendBoundedImageIdentity(values *[]string, valueSet *map[string]struct{}, value, label string) error {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return nil
+	}
+	if *valueSet == nil {
+		*valueSet = make(map[string]struct{}, len(*values)+1)
+		for _, existing := range *values {
+			(*valueSet)[existing] = struct{}{}
+		}
+	}
+	if _, exists := (*valueSet)[value]; exists {
+		return nil
+	}
+	if len(*values) >= chatGPTWebMaxImageOutputReferences {
+		return &ChatGPTWebResponseLimitError{
+			Message: fmt.Sprintf("chatgpt web image output exceeds %d %s", chatGPTWebMaxImageOutputReferences, label),
+		}
+	}
+	(*valueSet)[value] = struct{}{}
+	*values = append(*values, value)
+	return nil
+}
+
+func chatGPTWebImageVisuallyHidden(value map[string]any) bool {
+	if value == nil {
+		return false
+	}
+	if value["is_visually_hidden_from_conversation"] == true {
+		return true
+	}
+	metadata, _ := value["metadata"].(map[string]any)
+	return metadata != nil && metadata["is_visually_hidden_from_conversation"] == true
+}
+
+func chatGPTWebImageGenerationIndex(value map[string]any) (int, bool) {
+	if value == nil {
+		return 0, false
+	}
+	if index, ok := chatGPTWebNonnegativeInteger(value["generation_index"]); ok {
+		return index, true
+	}
+	metadata, _ := value["metadata"].(map[string]any)
+	if metadata == nil {
+		return 0, false
+	}
+	return chatGPTWebNonnegativeInteger(metadata["generation_index"])
+}
+
+func chatGPTWebImageNoAuthPlaceholder(value map[string]any) bool {
+	if value == nil {
+		return false
+	}
+	if value["is_no_auth_placeholder"] == true {
+		return true
+	}
+	metadata, _ := value["metadata"].(map[string]any)
+	return metadata != nil && metadata["is_no_auth_placeholder"] == true
+}
+
+func chatGPTWebImagePointerIncomplete(value map[string]any) bool {
+	height, hasHeight := chatGPTWebPositiveNumber(value["height"])
+	metadata, _ := value["metadata"].(map[string]any)
+	generation, _ := metadata["generation"].(map[string]any)
+	generatedHeight, hasGeneratedHeight := chatGPTWebPositiveNumber(generation["height"])
+	return hasHeight && hasGeneratedHeight && generatedHeight < height
+}
+
+func chatGPTWebNonnegativeInteger(value any) (int, bool) {
+	number, ok := chatGPTWebNumber(value)
+	if !ok || number < 0 || math.Trunc(number) != number || number > float64(int(^uint(0)>>1)) {
+		return 0, false
+	}
+	return int(number), true
+}
+
+func chatGPTWebPositiveNumber(value any) (float64, bool) {
+	number, ok := chatGPTWebNumber(value)
+	return number, ok && number > 0
+}
+
+func chatGPTWebNumber(value any) (float64, bool) {
+	var number float64
+	var err error
+	switch typed := value.(type) {
+	case json.Number:
+		number, err = typed.Float64()
+	case float64:
+		number = typed
+	case string:
+		number, err = strconv.ParseFloat(strings.TrimSpace(typed), 64)
+	default:
+		return 0, false
+	}
+	if err != nil || math.IsNaN(number) || math.IsInf(number, 0) {
+		return 0, false
+	}
+	return number, true
 }
 
 func chatGPTWebImagePointerKindID(pointer string) (string, string) {
@@ -2034,7 +2345,17 @@ func CaptureChatGPTWebImageConversation(payload []byte, accumulator *ChatGPTWebI
 	}
 	mapping, _ := root["mapping"].(map[string]any)
 	messages, turnPresent := chatGPTWebCurrentConversationTurn(root, mapping, accumulator.Turn)
-	snapshot := &ChatGPTWebImageAccumulator{}
+	snapshot := &ChatGPTWebImageAccumulator{Turn: accumulator.Turn}
+	for _, taskID := range accumulator.TaskIDs {
+		if err := snapshot.appendTaskID(taskID); err != nil {
+			return err
+		}
+	}
+	for _, messageID := range accumulator.ResponseMessageIDs {
+		if err := snapshot.appendResponseMessageID(messageID); err != nil {
+			return err
+		}
+	}
 	hasRelevantMessage := false
 	hasImageMessage := false
 	hasPendingImage := false
@@ -2042,6 +2363,9 @@ func CaptureChatGPTWebImageConversation(payload []byte, accumulator *ChatGPTWebI
 	turnTerminal := false
 	rootFailureDetected := false
 	for _, message := range messages {
+		if err := snapshot.captureImageTaskIDs(message, 0); err != nil {
+			return err
+		}
 		role, imageTool := webMessageImageContext(message)
 		terminalText, terminalTextValue := chatGPTWebImageTerminalTextReply(message)
 		terminal, failureStatus := chatGPTWebImageConversationState(message)
@@ -2059,7 +2383,7 @@ func CaptureChatGPTWebImageConversation(payload []byte, accumulator *ChatGPTWebI
 		if failureStatus != "" {
 			snapshot.FailureStatus = chatGPTWebPreferredImageFailure(snapshot.FailureStatus, failureStatus)
 		} else if imageTool {
-			hasPendingImage = hasPendingImage || chatGPTWebImageConversationPending(message)
+			hasPendingImage = hasPendingImage || snapshot.PendingOutput || chatGPTWebImageConversationPending(message)
 		} else if terminalText {
 			turnTerminal = turnTerminal || terminal
 			if strings.TrimSpace(terminalTextValue) != "" {
@@ -2089,14 +2413,24 @@ func CaptureChatGPTWebImageConversation(payload []byte, accumulator *ChatGPTWebI
 		snapshot.terminalAssistantText = false
 		snapshot.Terminal = rootFailureDetected || !hasPendingImage
 	} else if hasRelevantMessage {
+		hasPendingImage = hasPendingImage || snapshot.PendingOutput
 		snapshot.Terminal = !hasPendingImage && (turnTerminal || hasImageMessage && imageTurnTerminal)
 	}
+	accumulator.TaskIDs = snapshot.TaskIDs
+	accumulator.ResponseMessageIDs = snapshot.ResponseMessageIDs
 	accumulator.FileIDs = snapshot.FileIDs
 	accumulator.SedimentIDs = snapshot.SedimentIDs
 	accumulator.References = snapshot.References
+	accumulator.taskSet = snapshot.taskSet
+	accumulator.responseMessageSet = snapshot.responseMessageSet
+	accumulator.pendingReferenceSet = snapshot.pendingReferenceSet
 	accumulator.referenceSet = snapshot.referenceSet
 	accumulator.Terminal = snapshot.Terminal
 	accumulator.FailureStatus = snapshot.FailureStatus
+	accumulator.PendingOutput = snapshot.PendingOutput
+	accumulator.HiddenOutputSeen = snapshot.HiddenOutputSeen
+	accumulator.IncompleteOutputSeen = snapshot.IncompleteOutputSeen
+	accumulator.PlaceholderOutputSeen = snapshot.PlaceholderOutputSeen
 	accumulator.assistantTextValue = snapshot.assistantTextValue
 	accumulator.assistantTextSeen = snapshot.assistantTextSeen
 	accumulator.assistantTerminalSeen = snapshot.assistantTerminalSeen
@@ -2113,11 +2447,16 @@ func chatGPTWebImageConversationPending(root map[string]any) bool {
 		}
 		switch typed := value.(type) {
 		case map[string]any:
+			if chatGPTWebImageGhostriderStatus(typed) == "intermediate" {
+				pending = true
+				return
+			}
 			for key, item := range typed {
 				switch strings.ToLower(strings.TrimSpace(key)) {
 				case "status", "state":
 					switch strings.ToLower(strings.TrimSpace(stringFromAny(item))) {
-					case "pending", "queued", "running", "in_progress", "processing", "started":
+					case "pending", "queued", "running", "in_progress", "processing", "started",
+						"created", "intermediate", "finalizing", "undetermined", "skipping":
 						pending = true
 						return
 					}
@@ -2478,13 +2817,22 @@ func CaptureChatGPTWebImageTasks(payload []byte, conversationID string, accumula
 		return ChatGPTWebImageTaskState{}, fmt.Errorf("decode chatgpt web image tasks: %w", err)
 	}
 	tasks, _ := root["tasks"].([]any)
-	fallbackCreatedAt, hasFallbackCreatedAt := chatGPTWebImageTaskTurnBoundary(tasks, conversationID, accumulator.Turn)
+	fallbackCreatedAt, hasFallbackCreatedAt := chatGPTWebImageTaskTurnBoundary(tasks, conversationID, accumulator)
 	snapshot := &ChatGPTWebImageAccumulator{ConversationID: conversationID, Turn: accumulator.Turn}
+	for _, taskID := range accumulator.TaskIDs {
+		if err := snapshot.appendTaskID(taskID); err != nil {
+			return ChatGPTWebImageTaskState{}, err
+		}
+	}
+	for _, messageID := range accumulator.ResponseMessageIDs {
+		if err := snapshot.appendResponseMessageID(messageID); err != nil {
+			return ChatGPTWebImageTaskState{}, err
+		}
+	}
 	state := ChatGPTWebImageTaskState{}
 	for _, rawTask := range tasks {
 		task, _ := rawTask.(map[string]any)
-		if task == nil || !chatGPTWebImageTaskMatchesConversation(task, conversationID) ||
-			!chatGPTWebImageTaskMatchesTurn(task, accumulator.Turn, fallbackCreatedAt, hasFallbackCreatedAt) {
+		if task == nil || !chatGPTWebImageTaskMatchesCurrent(task, conversationID, accumulator, fallbackCreatedAt, hasFallbackCreatedAt) {
 			continue
 		}
 		message, imageTask := chatGPTWebImageTaskMessage(task)
@@ -2492,6 +2840,12 @@ func CaptureChatGPTWebImageTasks(payload []byte, conversationID string, accumula
 			continue
 		}
 		state.Matched++
+		if err := snapshot.appendTaskID(chatGPTWebImageTaskID(task)); err != nil {
+			return ChatGPTWebImageTaskState{}, err
+		}
+		if err := snapshot.appendResponseMessageID(chatGPTWebImageTaskResponseMessageID(task)); err != nil {
+			return ChatGPTWebImageTaskState{}, err
+		}
 		taskTerminal := false
 		taskFailureStatus := ""
 		taskStatus := strings.ToLower(strings.TrimSpace(stringFromAny(task["status"])))
@@ -2520,9 +2874,23 @@ func CaptureChatGPTWebImageTasks(payload []byte, conversationID string, accumula
 			}
 			continue
 		}
-		if err := snapshot.captureReferences(message); err != nil {
+		messageSnapshot := &ChatGPTWebImageAccumulator{}
+		if err := messageSnapshot.captureImageTaskIDs(message, 0); err != nil {
 			return ChatGPTWebImageTaskState{}, err
 		}
+		if err := messageSnapshot.captureReferences(message); err != nil {
+			return ChatGPTWebImageTaskState{}, err
+		}
+		if terminalText, terminalTextValue := chatGPTWebImageTerminalTextReply(message); terminalText && strings.TrimSpace(terminalTextValue) != "" {
+			messageSnapshot.replaceAssistantText(terminalTextValue)
+			messageSnapshot.assistantTerminalSeen = true
+			messageSnapshot.updateTerminalAssistantText()
+		}
+		mergedSnapshot, err := MergeChatGPTWebImageAccumulators(snapshot, messageSnapshot)
+		if err != nil {
+			return ChatGPTWebImageTaskState{}, err
+		}
+		snapshot = mergedSnapshot
 		messageTerminal, failureStatus := chatGPTWebImageConversationState(message)
 		messageStatus := strings.ToLower(strings.TrimSpace(stringFromAny(message["status"])))
 		if failureStatus == "" && chatGPTWebFailureMessageStatus(messageStatus) {
@@ -2532,6 +2900,9 @@ func CaptureChatGPTWebImageTasks(payload []byte, conversationID string, accumula
 		terminal := taskTerminal
 		if taskStatus == "" {
 			terminal = messageTerminal
+		}
+		if messageSnapshot.PendingOutput || chatGPTWebImageConversationPending(message) {
+			terminal = false
 		}
 		if terminal {
 			state.Terminal++
@@ -2547,10 +2918,23 @@ func CaptureChatGPTWebImageTasks(payload []byte, conversationID string, accumula
 	accumulator.FileIDs = snapshot.FileIDs
 	accumulator.SedimentIDs = snapshot.SedimentIDs
 	accumulator.References = snapshot.References
+	accumulator.TaskIDs = snapshot.TaskIDs
+	accumulator.ResponseMessageIDs = snapshot.ResponseMessageIDs
+	accumulator.taskSet = snapshot.taskSet
+	accumulator.responseMessageSet = snapshot.responseMessageSet
+	accumulator.pendingReferenceSet = snapshot.pendingReferenceSet
 	accumulator.referenceSet = snapshot.referenceSet
 	accumulator.ConversationID = snapshot.ConversationID
 	accumulator.Terminal = snapshot.Terminal
 	accumulator.FailureStatus = snapshot.FailureStatus
+	accumulator.PendingOutput = snapshot.PendingOutput
+	accumulator.HiddenOutputSeen = snapshot.HiddenOutputSeen
+	accumulator.IncompleteOutputSeen = snapshot.IncompleteOutputSeen
+	accumulator.PlaceholderOutputSeen = snapshot.PlaceholderOutputSeen
+	accumulator.assistantTextValue = snapshot.assistantTextValue
+	accumulator.assistantTextSeen = snapshot.assistantTextSeen
+	accumulator.assistantTerminalSeen = snapshot.assistantTerminalSeen
+	accumulator.terminalAssistantText = snapshot.terminalAssistantText
 	return state, nil
 }
 
@@ -2583,18 +2967,19 @@ func chatGPTWebImageTaskMatchesConversation(task map[string]any, conversationID 
 	return false
 }
 
-func chatGPTWebImageTaskTurnBoundary(tasks []any, conversationID string, turn ChatGPTWebImageTurn) (float64, bool) {
-	messageID := strings.TrimSpace(turn.MessageID)
-	if turn.CreatedAt <= 0 {
+func chatGPTWebImageTaskTurnBoundary(tasks []any, conversationID string, accumulator *ChatGPTWebImageAccumulator) (float64, bool) {
+	if accumulator == nil || accumulator.Turn.CreatedAt <= 0 {
 		return 0, false
 	}
+	messageID := strings.TrimSpace(accumulator.Turn.MessageID)
 	// Legacy callers without a message ID can only use time. Keep the earliest
 	// timestamp cohort so later task batches are not merged into the same turn.
 	fallbackCreatedAt := 0.0
 	hasFallbackCreatedAt := false
 	for _, rawTask := range tasks {
 		task, _ := rawTask.(map[string]any)
-		if task == nil || !chatGPTWebImageTaskMatchesConversation(task, conversationID) {
+		if task == nil || !chatGPTWebImageTaskMatchesConversation(task, conversationID) ||
+			chatGPTWebImageTaskHasExplicitMismatch(task, accumulator) {
 			continue
 		}
 		if _, imageTask := chatGPTWebImageTaskMessage(task); !imageTask {
@@ -2607,7 +2992,7 @@ func chatGPTWebImageTaskTurnBoundary(tasks []any, conversationID string, turn Ch
 			}
 		}
 		createdAt, ok := chatGPTWebImageTaskCreatedAt(task)
-		if !ok || createdAt < turn.CreatedAt {
+		if !ok || createdAt < accumulator.Turn.CreatedAt {
 			continue
 		}
 		if !hasFallbackCreatedAt || createdAt < fallbackCreatedAt {
@@ -2616,6 +3001,51 @@ func chatGPTWebImageTaskTurnBoundary(tasks []any, conversationID string, turn Ch
 		}
 	}
 	return fallbackCreatedAt, hasFallbackCreatedAt
+}
+
+func chatGPTWebImageTaskMatchesCurrent(task map[string]any, conversationID string, accumulator *ChatGPTWebImageAccumulator, fallbackCreatedAt float64, hasFallbackCreatedAt bool) bool {
+	if task == nil || accumulator == nil {
+		return false
+	}
+	if taskID := chatGPTWebImageTaskID(task); taskID != "" && len(accumulator.TaskIDs) > 0 {
+		return imageIdentityContains(accumulator.TaskIDs, taskID)
+	}
+	messageID := strings.TrimSpace(accumulator.Turn.MessageID)
+	if messageID != "" {
+		relationMatch, relationSeen := chatGPTWebImageTaskRelation(task, messageID)
+		if relationSeen {
+			return relationMatch
+		}
+	}
+	if !chatGPTWebImageTaskMatchesConversation(task, conversationID) {
+		return false
+	}
+	return chatGPTWebImageTaskMatchesTurn(task, accumulator.Turn, fallbackCreatedAt, hasFallbackCreatedAt)
+}
+
+func chatGPTWebImageTaskHasExplicitMismatch(task map[string]any, accumulator *ChatGPTWebImageAccumulator) bool {
+	if task == nil || accumulator == nil {
+		return false
+	}
+	if taskID := chatGPTWebImageTaskID(task); taskID != "" && len(accumulator.TaskIDs) > 0 {
+		return !imageIdentityContains(accumulator.TaskIDs, taskID)
+	}
+	messageID := strings.TrimSpace(accumulator.Turn.MessageID)
+	if messageID == "" {
+		return false
+	}
+	matched, seen := chatGPTWebImageTaskRelation(task, messageID)
+	return seen && !matched
+}
+
+func imageIdentityContains(values []string, value string) bool {
+	value = strings.TrimSpace(value)
+	for _, candidate := range values {
+		if candidate == value {
+			return true
+		}
+	}
+	return false
 }
 
 func chatGPTWebImageTaskMatchesTurn(task map[string]any, turn ChatGPTWebImageTurn, fallbackCreatedAt float64, hasFallbackCreatedAt bool) bool {
@@ -2639,7 +3069,7 @@ func chatGPTWebImageTaskMatchesTurn(task map[string]any, turn ChatGPTWebImageTur
 func chatGPTWebImageTaskRelation(task map[string]any, messageID string) (bool, bool) {
 	relationSeen := false
 	for _, candidate := range chatGPTWebImageTaskObjects(task) {
-		for _, key := range []string{"parent_message_id", "request_message_id", "source_message_id", "original_message_id"} {
+		for _, key := range []string{"original_conversation_user_message_id", "parent_message_id", "request_message_id", "source_message_id", "original_message_id"} {
 			relationID := strings.TrimSpace(stringFromAny(candidate[key]))
 			if relationID == "" {
 				continue
@@ -2651,6 +3081,26 @@ func chatGPTWebImageTaskRelation(task map[string]any, messageID string) (bool, b
 		}
 	}
 	return false, relationSeen
+}
+
+func chatGPTWebImageTaskID(task map[string]any) string {
+	for _, candidate := range chatGPTWebImageTaskObjects(task) {
+		for _, key := range []string{"task_id", "image_gen_task_id"} {
+			if value := strings.TrimSpace(stringFromAny(candidate[key])); value != "" {
+				return value
+			}
+		}
+	}
+	return ""
+}
+
+func chatGPTWebImageTaskResponseMessageID(task map[string]any) string {
+	for _, candidate := range chatGPTWebImageTaskObjects(task) {
+		if value := strings.TrimSpace(stringFromAny(candidate["response_message_id"])); value != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 func chatGPTWebImageTaskCreatedAt(task map[string]any) (float64, bool) {
@@ -2666,6 +3116,9 @@ func chatGPTWebImageTaskCreatedAt(task map[string]any) (float64, bool) {
 
 func chatGPTWebImageTaskObjects(task map[string]any) []map[string]any {
 	objects := []map[string]any{task}
+	if metadata, _ := task["metadata"].(map[string]any); metadata != nil {
+		objects = append(objects, metadata)
+	}
 	message, _ := task["image_gen_message"].(map[string]any)
 	if message == nil {
 		return objects
@@ -2688,6 +3141,13 @@ func chatGPTWebImageConversationState(root map[string]any) (bool, string) {
 	visit = func(value any) {
 		switch typed := value.(type) {
 		case map[string]any:
+			switch chatGPTWebImageGhostriderStatus(typed) {
+			case "cancelled", "canceled":
+				failureStatus = chatGPTWebPreferredImageStatus(failureStatus, "cancelled")
+			case "final":
+				hasCompletionMarker = true
+				hasTerminalStatus = true
+			}
 			for key, item := range typed {
 				normalizedKey := strings.ToLower(strings.TrimSpace(key))
 				switch normalizedKey {
@@ -3011,6 +3471,9 @@ func messageFromWebEvent(event map[string]any) map[string]any {
 		if message, ok := candidate["image_gen_message"].(map[string]any); ok {
 			return message
 		}
+		if message, ok := candidate["final_message"].(map[string]any); ok {
+			return message
+		}
 	}
 	return nil
 }
@@ -3050,7 +3513,26 @@ func chatGPTWebImageMetadataActivity(metadata map[string]any) bool {
 			return true
 		}
 	}
-	return strings.TrimSpace(stringFromAny(metadata["image_gen_task_id"])) != ""
+	if strings.TrimSpace(stringFromAny(metadata["image_gen_task_id"])) != "" {
+		return true
+	}
+	switch chatGPTWebImageGhostriderStatus(metadata) {
+	case "intermediate", "final", "cancelled", "canceled":
+		return true
+	default:
+		return false
+	}
+}
+
+func chatGPTWebImageGhostriderStatus(value map[string]any) string {
+	if value == nil {
+		return ""
+	}
+	if status := strings.ToLower(strings.TrimSpace(stringFromAny(value["ghostrider_status"]))); status != "" {
+		return status
+	}
+	ghostrider, _ := value["ghostrider"].(map[string]any)
+	return strings.ToLower(strings.TrimSpace(stringFromAny(ghostrider["status"])))
 }
 
 func appendUniqueString(values *[]string, value string) {
