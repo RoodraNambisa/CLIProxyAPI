@@ -15,6 +15,71 @@ import (
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v6/sdk/config"
 )
 
+type wrappedHandlerTestError struct {
+	cause error
+}
+
+func (e *wrappedHandlerTestError) Error() string {
+	return e.cause.Error()
+}
+
+func (e *wrappedHandlerTestError) Unwrap() error {
+	return e.cause
+}
+
+type handlerStatusHeaderTestError struct{}
+
+func (*handlerStatusHeaderTestError) Error() string {
+	return `{"error":{"message":"rejected","code":"moderation_blocked"}}`
+}
+
+func (*handlerStatusHeaderTestError) StatusCode() int {
+	return http.StatusBadRequest
+}
+
+func (*handlerStatusHeaderTestError) Headers() http.Header {
+	return http.Header{"X-Test-Error": {"preserved"}}
+}
+
+func TestExecutionErrorMessageUnwrapsStatusAndHeaders(t *testing.T) {
+	errWrapped := &wrappedHandlerTestError{cause: &handlerStatusHeaderTestError{}}
+	if status := statusFromError(errWrapped); status != http.StatusBadRequest {
+		t.Fatalf("statusFromError() = %d, want %d", status, http.StatusBadRequest)
+	}
+
+	msg := executionErrorMessage(errWrapped, nil, "gpt-image-2")
+	if msg.StatusCode != http.StatusBadRequest {
+		t.Fatalf("message status = %d, want %d", msg.StatusCode, http.StatusBadRequest)
+	}
+	if got := msg.Addon.Get("X-Test-Error"); got != "preserved" {
+		t.Fatalf("message X-Test-Error = %q, want preserved", got)
+	}
+
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/images/generations", nil)
+	NewBaseAPIHandlers(&sdkconfig.SDKConfig{PassthroughHeaders: true}, nil).WriteErrorResponse(c, msg)
+
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("response status = %d, want %d", recorder.Code, http.StatusBadRequest)
+	}
+	if got := recorder.Header().Get("X-Test-Error"); got != "preserved" {
+		t.Fatalf("response X-Test-Error = %q, want preserved", got)
+	}
+	if !strings.Contains(recorder.Body.String(), "moderation_blocked") {
+		t.Fatalf("response body = %s, want moderation_blocked", recorder.Body.String())
+	}
+
+	unknown := &wrappedHandlerTestError{cause: errors.New("unknown failure")}
+	if status := statusFromError(unknown); status != 0 {
+		t.Fatalf("unknown statusFromError() = %d, want 0", status)
+	}
+	if msgUnknown := executionErrorMessage(unknown, nil, "gpt-image-2"); msgUnknown.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("unknown message status = %d, want %d", msgUnknown.StatusCode, http.StatusInternalServerError)
+	}
+}
+
 func TestWriteErrorResponse_RetryAfterAddonHeaderEnabledByDefault(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	recorder := httptest.NewRecorder()

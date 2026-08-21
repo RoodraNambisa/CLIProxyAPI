@@ -1469,7 +1469,8 @@ func statusFromError(err error) int {
 	if err == nil {
 		return 0
 	}
-	if se, ok := err.(interface{ StatusCode() int }); ok && se != nil {
+	var se interface{ StatusCode() int }
+	if errors.As(err, &se) && se != nil {
 		if code := se.StatusCode(); code > 0 {
 			return code
 		}
@@ -1480,13 +1481,12 @@ func statusFromError(err error) int {
 func executionErrorMessage(err error, providers []string, model string) *interfaces.ErrorMessage {
 	err = enrichAuthSelectionError(err, providers, model)
 	status := http.StatusInternalServerError
-	if se, ok := err.(interface{ StatusCode() int }); ok && se != nil {
-		if code := se.StatusCode(); code > 0 {
-			status = code
-		}
+	if code := statusFromError(err); code > 0 {
+		status = code
 	}
 	var addon http.Header
-	if he, ok := err.(interface{ Headers() http.Header }); ok && he != nil {
+	var he interface{ Headers() http.Header }
+	if errors.As(err, &he) && he != nil {
 		if hdr := he.Headers(); hdr != nil {
 			addon = hdr.Clone()
 		}

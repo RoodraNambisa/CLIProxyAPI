@@ -46,8 +46,21 @@ type imageCaptureExecutor struct {
 	imageConfigSnapshots            []coreexecutor.ChatGPTWebImageConfigSnapshot
 	hasImageConfigSnapshot          bool
 	response                        []byte
+	executeErr                      error
 	streamChunks                    []coreexecutor.StreamChunk
 	beforeExecute                   func()
+}
+
+type wrappedImageHandlerTestError struct {
+	cause error
+}
+
+func (e *wrappedImageHandlerTestError) Error() string {
+	return e.cause.Error()
+}
+
+func (e *wrappedImageHandlerTestError) Unwrap() error {
+	return e.cause
 }
 
 type imagePressureExecutor struct {
@@ -110,6 +123,9 @@ func (e *imageCaptureExecutor) Execute(ctx context.Context, auth *coreauth.Auth,
 	e.imageConfigSnapshot, e.hasImageConfigSnapshot = opts.Metadata[coreexecutor.ChatGPTWebImageConfigSnapshotMetadataKey].(coreexecutor.ChatGPTWebImageConfigSnapshot)
 	if e.hasImageConfigSnapshot {
 		e.imageConfigSnapshots = append(e.imageConfigSnapshots, e.imageConfigSnapshot)
+	}
+	if e.executeErr != nil {
+		return coreexecutor.Response{}, e.executeErr
 	}
 	if len(e.response) == 0 {
 		e.response = []byte(`{"created_at":1700000000,"output":[{"type":"image_generation_call","result":"aGVsbG8=","revised_prompt":"rev"}],"usage":{"total_tokens":3}}`)
@@ -2037,6 +2053,31 @@ func TestOpenAIImagesNonStreamingReturnsModerationForCompletedTextWithoutImage(t
 	if !strings.Contains(resp.Body.String(), "moderation_blocked") ||
 		strings.Contains(resp.Body.String(), "upstream did not return image output") {
 		t.Fatalf("moderation error missing or leaked generic detail: %s", resp.Body.String())
+	}
+}
+
+func TestOpenAIImagesNonStreamingPreservesWrappedModerationStatus(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	executor := &imageCaptureExecutor{
+		executeErr: &wrappedImageHandlerTestError{cause: executorhelps.NewOpenAIImageModerationError()},
+	}
+	h := newImagesTestHandler(t, executor)
+	router := gin.New()
+	router.POST("/v1/images/generations", h.Generations)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/images/generations", strings.NewReader(`{"model":"gpt-image-2","prompt":"draw"}`))
+	req.Header.Set("Content-Type", "application/json")
+	resp := httptest.NewRecorder()
+	router.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d, body=%s", resp.Code, http.StatusBadRequest, resp.Body.String())
+	}
+	if executor.calls != 1 {
+		t.Fatalf("executor calls = %d, want 1", executor.calls)
+	}
+	if !strings.Contains(resp.Body.String(), "moderation_blocked") {
+		t.Fatalf("moderation error missing: %s", resp.Body.String())
 	}
 }
 
