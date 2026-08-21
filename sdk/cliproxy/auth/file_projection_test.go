@@ -22,6 +22,7 @@ func TestApplyFileAuthProjectionMapsPersistedMetadata(t *testing.T) {
 		},
 		Metadata: map[string]any{
 			"type":            "codex",
+			"label":           "Primary account",
 			"email":           "person@example.com",
 			"prefix":          "/workspace/",
 			"proxy_url":       "http://proxy.example",
@@ -49,7 +50,7 @@ func TestApplyFileAuthProjectionMapsPersistedMetadata(t *testing.T) {
 		t.Fatalf("ApplyFileAuthProjection() error = %v", err)
 	}
 
-	if auth.FileName != "nested/codex.json" || auth.Label != "person@example.com" {
+	if auth.FileName != "nested/codex.json" || auth.Label != "Primary account" {
 		t.Fatalf("identity fields = filename %q label %q", auth.FileName, auth.Label)
 	}
 	if auth.Prefix != "workspace" || auth.ProxyURL != "http://proxy.example" {
@@ -77,6 +78,22 @@ func TestApplyFileAuthProjectionMapsPersistedMetadata(t *testing.T) {
 	}
 	if !auth.CreatedAt.Equal(now) || !auth.UpdatedAt.Equal(now) {
 		t.Fatalf("timestamps = %s %s, want %s", auth.CreatedAt, auth.UpdatedAt, now)
+	}
+}
+
+func TestApplyFileAuthProjectionUsesProjectIDLabelFallback(t *testing.T) {
+	auth := &Auth{
+		Provider: "antigravity",
+		Metadata: map[string]any{
+			"type":       "antigravity",
+			"project_id": "project-from-runtime",
+		},
+	}
+	if err := ApplyFileAuthProjection(auth, FileAuthProjectionOptions{}); err != nil {
+		t.Fatalf("ApplyFileAuthProjection() error = %v", err)
+	}
+	if auth.Label != "project-from-runtime" {
+		t.Fatalf("label = %q, want project ID fallback", auth.Label)
 	}
 }
 

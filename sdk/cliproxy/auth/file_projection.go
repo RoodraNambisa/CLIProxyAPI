@@ -75,10 +75,7 @@ func ApplyFileAuthProjection(auth *Auth, opts FileAuthProjectionOptions) error {
 	auth.Provider = provider
 	auth.FileName = id
 	auth.EnsureIndex()
-	auth.Label = provider
-	if email := strings.TrimSpace(metadataStringValue(metadata, "email")); email != "" {
-		auth.Label = email
-	}
+	auth.Label = fileAuthLabel(metadata, provider)
 	auth.Prefix = normalizedFileAuthPrefix(metadataStringValue(metadata, "prefix"))
 	auth.ProxyURL = metadataStringValue(metadata, "proxy_url")
 	auth.Disabled, _ = metadata["disabled"].(bool)
@@ -168,6 +165,15 @@ func normalizedFileAuthPrefix(value string) string {
 		return ""
 	}
 	return value
+}
+
+func fileAuthLabel(metadata map[string]any, provider string) string {
+	for _, key := range []string{"label", "email", "project_id"} {
+		if value := strings.TrimSpace(metadataStringValue(metadata, key)); value != "" {
+			return value
+		}
+	}
+	return provider
 }
 
 func metadataStringValue(metadata map[string]any, key string) string {

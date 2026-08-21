@@ -4256,6 +4256,7 @@ func TestAuthEqualIgnoresFileRuntimeAvailabilityState(t *testing.T) {
 	}
 	runtimeAuth := projected.Clone()
 	runtimeAuth.Status = coreauth.StatusError
+	runtimeAuth.Label = "runtime-enriched-project"
 	runtimeAuth.StatusMessage = "rate limited"
 	runtimeAuth.Unavailable = true
 	runtimeAuth.NextRetryAfter = time.Now().Add(time.Minute)
