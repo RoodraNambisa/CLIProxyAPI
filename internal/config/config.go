@@ -1332,7 +1332,7 @@ type CodexFingerprintConfig struct {
 	JA3                     bool `yaml:"ja3" json:"ja3"`
 	ForceHTTP1              bool `yaml:"force-http1" json:"force-http1"`
 	ImagesForceHTTP1        bool `yaml:"images-force-http1" json:"images-force-http1"`
-	SessionIdentityPoolSize int  `yaml:"session-identity-pool-size" json:"session-identity-pool-size"`
+	SessionIdentityPoolSize int  `yaml:"session-identity-pool-size,omitempty" json:"session-identity-pool-size,omitempty"`
 	// DefaultMode is persisted only on future Codex uploads that omit codex_fingerprint_mode.
 	DefaultMode string `yaml:"default-mode" json:"default-mode"`
 }

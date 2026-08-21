@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"gopkg.in/yaml.v3"
 )
 
 func TestCodexFingerprintDefaultMode(t *testing.T) {
@@ -96,5 +98,15 @@ func TestCodexFingerprintSessionIdentityPoolSize(t *testing.T) {
 				t.Fatalf("SessionIdentityPoolSize = %d, want %d", got, test.want)
 			}
 		})
+	}
+}
+
+func TestCodexFingerprintSessionIdentityPoolSizeOmitsZeroWhenMarshaled(t *testing.T) {
+	payload, err := yaml.Marshal(Config{})
+	if err != nil {
+		t.Fatalf("yaml.Marshal() error = %v", err)
+	}
+	if strings.Contains(string(payload), "session-identity-pool-size") {
+		t.Fatalf("yaml.Marshal() unexpectedly emitted zero pool size:\n%s", payload)
 	}
 }
