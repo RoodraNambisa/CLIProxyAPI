@@ -22,19 +22,20 @@ type systemMetricsFilesystems struct {
 }
 
 type systemMetricsResponse struct {
-	CollectedAt                time.Time                                          `json:"collected_at"`
-	Runtime                    systemmetrics.RuntimeSnapshot                      `json:"runtime"`
-	Filesystems                systemMetricsFilesystems                           `json:"filesystems"`
-	RequestBodyAudit           middleware.RequestBodyAuditRuntimeSnapshot         `json:"request_body_audit"`
-	UsageBatch                 usage.UsageBatchRuntimeSnapshot                    `json:"usage_batch"`
-	ImageProcessing            helps.ChatGPTWebImageMemoryRuntimeSnapshot         `json:"image_post_processing"`
-	ImageRequestMemory         helps.ChatGPTWebImageMemoryRuntimeSnapshot         `json:"image_request_memory"`
-	ChatGPTWebImageInFlight    coreexecutor.ImageExecutionAdmissionSnapshot       `json:"chatgpt_web_image_in_flight"`
-	ChatGPTWebFinalizers       coreexecutor.ImageExecutionAdmissionSnapshot       `json:"chatgpt_web_image_finalizers"`
-	ChatGPTWebMemoryFinalizers coreexecutor.ImageExecutionAdmissionSnapshot       `json:"chatgpt_web_image_memory_finalizers"`
-	ChatGPTWebPollSlots        runtimeexecutor.ChatGPTWebImagePollRuntimeSnapshot `json:"chatgpt_web_image_poll_slots"`
-	ImageSpool                 helps.ChatGPTWebImageSpoolRuntimeSnapshot          `json:"image_spool"`
-	ImageRequestPhases         systemMetricsImageRequestPhases                    `json:"image_request_phases"`
+	CollectedAt                time.Time                                              `json:"collected_at"`
+	Runtime                    systemmetrics.RuntimeSnapshot                          `json:"runtime"`
+	Filesystems                systemMetricsFilesystems                               `json:"filesystems"`
+	RequestBodyAudit           middleware.RequestBodyAuditRuntimeSnapshot             `json:"request_body_audit"`
+	UsageBatch                 usage.UsageBatchRuntimeSnapshot                        `json:"usage_batch"`
+	ImageProcessing            helps.ChatGPTWebImageMemoryRuntimeSnapshot             `json:"image_post_processing"`
+	ImageRequestMemory         helps.ChatGPTWebImageMemoryRuntimeSnapshot             `json:"image_request_memory"`
+	ChatGPTWebImageInFlight    coreexecutor.ImageExecutionAdmissionSnapshot           `json:"chatgpt_web_image_in_flight"`
+	ChatGPTWebFinalizers       coreexecutor.ImageExecutionAdmissionSnapshot           `json:"chatgpt_web_image_finalizers"`
+	ChatGPTWebMemoryFinalizers coreexecutor.ImageExecutionAdmissionSnapshot           `json:"chatgpt_web_image_memory_finalizers"`
+	ChatGPTWebPollSlots        runtimeexecutor.ChatGPTWebImagePollRuntimeSnapshot     `json:"chatgpt_web_image_poll_slots"`
+	ChatGPTWebImageProtocol    runtimeexecutor.ChatGPTWebImageProtocolRuntimeSnapshot `json:"chatgpt_web_image_protocol"`
+	ImageSpool                 helps.ChatGPTWebImageSpoolRuntimeSnapshot              `json:"image_spool"`
+	ImageRequestPhases         systemMetricsImageRequestPhases                        `json:"image_request_phases"`
 }
 
 type systemMetricsImageRequestPhases struct {
@@ -76,6 +77,7 @@ func (h *Handler) GetSystemMetrics(c *gin.Context) {
 		ChatGPTWebFinalizers:       coreexecutor.ChatGPTWebImageFinalizerAdmissionSnapshot(),
 		ChatGPTWebMemoryFinalizers: coreexecutor.ChatGPTWebImageMemoryFinalizerAdmissionSnapshot(),
 		ChatGPTWebPollSlots:        runtimeexecutor.ChatGPTWebImagePollSnapshot(),
+		ChatGPTWebImageProtocol:    runtimeexecutor.ChatGPTWebImageProtocolSnapshot(),
 		ImageSpool:                 helps.ChatGPTWebImageSpoolSnapshot(),
 		ImageRequestPhases: systemMetricsImageRequestPhases{
 			HandlerScope:                "all_image_routes",

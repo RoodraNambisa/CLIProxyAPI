@@ -11,6 +11,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
+	runtimeexecutor "github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/systemmetrics"
 	coreexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
@@ -51,6 +52,7 @@ func TestGetSystemMetricsReturnsRuntimeAndConfiguredFilesystems(t *testing.T) {
 	recorder := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(recorder)
 	ctx.Request = httptest.NewRequest(http.MethodGet, "/v0/management/system/metrics", nil)
+	protocolBefore := runtimeexecutor.ChatGPTWebImageProtocolSnapshot()
 	handler.GetSystemMetrics(ctx)
 
 	if recorder.Code != http.StatusOK {
@@ -91,6 +93,9 @@ func TestGetSystemMetricsReturnsRuntimeAndConfiguredFilesystems(t *testing.T) {
 	}
 	if response.ChatGPTWebMemoryFinalizers.Limit != 3 || response.ChatGPTWebMemoryFinalizers.QueueLimit != 7 || response.ChatGPTWebMemoryFinalizers.Active != 0 {
 		t.Fatalf("ChatGPTWebMemoryFinalizers = %#v", response.ChatGPTWebMemoryFinalizers)
+	}
+	if response.ChatGPTWebImageProtocol != protocolBefore {
+		t.Fatalf("ChatGPTWebImageProtocol = %#v, want %#v", response.ChatGPTWebImageProtocol, protocolBefore)
 	}
 	if response.ImageSpool.CurrentFiles < 0 || response.ImageSpool.CurrentBytes < 0 || response.ImageSpool.PeakBytes < response.ImageSpool.CurrentBytes {
 		t.Fatalf("ImageSpool = %#v", response.ImageSpool)

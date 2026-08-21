@@ -1299,6 +1299,7 @@ type ChatGPTWebImageAccumulator struct {
 	HiddenOutputSeen      bool
 	IncompleteOutputSeen  bool
 	PlaceholderOutputSeen bool
+	FinalMessageSeen      bool
 	role                  string
 	imageTool             bool
 	assistantTextValue    string
@@ -1380,6 +1381,7 @@ func MergeChatGPTWebImageAccumulators(primary, secondary *ChatGPTWebImageAccumul
 		merged.HiddenOutputSeen = merged.HiddenOutputSeen || source.HiddenOutputSeen
 		merged.IncompleteOutputSeen = merged.IncompleteOutputSeen || source.IncompleteOutputSeen
 		merged.PlaceholderOutputSeen = merged.PlaceholderOutputSeen || source.PlaceholderOutputSeen
+		merged.FinalMessageSeen = merged.FinalMessageSeen || source.FinalMessageSeen
 		if len(merged.ToolUsage) == 0 && len(source.ToolUsage) > 0 {
 			merged.ToolUsage = source.ToolUsage
 		}
@@ -1492,6 +1494,7 @@ func (accumulator *ChatGPTWebImageAccumulator) Apply(payload []byte) (bool, erro
 	}
 	accumulator.captureConversationID(event)
 	if message := messageFromWebEvent(event); message != nil {
+		accumulator.FinalMessageSeen = accumulator.FinalMessageSeen || chatGPTWebEventHasFinalMessage(event)
 		role, imageTool := webMessageImageContext(message)
 		accumulator.role = role
 		accumulator.imageTool = imageTool
@@ -1549,6 +1552,18 @@ func (accumulator *ChatGPTWebImageAccumulator) Apply(payload []byte) (bool, erro
 	}
 	accumulator.StreamTerminal = accumulator.StreamTerminal || streamTerminal
 	return streamTerminal, nil
+}
+
+func chatGPTWebEventHasFinalMessage(event map[string]any) bool {
+	if event == nil {
+		return false
+	}
+	if _, ok := event["final_message"].(map[string]any); ok {
+		return true
+	}
+	value, _ := event["v"].(map[string]any)
+	_, ok := value["final_message"].(map[string]any)
+	return ok
 }
 
 func (accumulator *ChatGPTWebImageAccumulator) captureAssistantPatchState(event map[string]any) {
@@ -2439,6 +2454,7 @@ func CaptureChatGPTWebImageConversation(payload []byte, accumulator *ChatGPTWebI
 	accumulator.HiddenOutputSeen = snapshot.HiddenOutputSeen
 	accumulator.IncompleteOutputSeen = snapshot.IncompleteOutputSeen
 	accumulator.PlaceholderOutputSeen = snapshot.PlaceholderOutputSeen
+	accumulator.FinalMessageSeen = snapshot.FinalMessageSeen
 	accumulator.assistantTextValue = snapshot.assistantTextValue
 	accumulator.assistantTextSeen = snapshot.assistantTextSeen
 	accumulator.assistantTerminalSeen = snapshot.assistantTerminalSeen
@@ -2944,6 +2960,7 @@ func CaptureChatGPTWebImageTasks(payload []byte, conversationID string, accumula
 	accumulator.HiddenOutputSeen = snapshot.HiddenOutputSeen
 	accumulator.IncompleteOutputSeen = snapshot.IncompleteOutputSeen
 	accumulator.PlaceholderOutputSeen = snapshot.PlaceholderOutputSeen
+	accumulator.FinalMessageSeen = snapshot.FinalMessageSeen
 	accumulator.assistantTextValue = snapshot.assistantTextValue
 	accumulator.assistantTextSeen = snapshot.assistantTextSeen
 	accumulator.assistantTerminalSeen = snapshot.assistantTerminalSeen

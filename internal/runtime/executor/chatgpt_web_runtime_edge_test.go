@@ -4648,6 +4648,7 @@ func TestFinishChatGPTWebImagePrefersExactTaskStreamImageOverEarlyTerminalText(t
 }
 
 func TestFinishChatGPTWebImageKeepsTerminalTextRefusalAfterPolling(t *testing.T) {
+	metricsBefore := ChatGPTWebImageProtocolSnapshot()
 	var conversationPolls atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
 		switch request.URL.Path {
@@ -4705,6 +4706,10 @@ func TestFinishChatGPTWebImageKeepsTerminalTextRefusalAfterPolling(t *testing.T)
 	}
 	if got := conversationPolls.Load(); got == 0 {
 		t.Fatal("terminal refusal was not confirmed after checking for async image output")
+	}
+	metricsAfter := ChatGPTWebImageProtocolSnapshot()
+	if metricsAfter.AllSourcesExhaustedWithoutOutput != metricsBefore.AllSourcesExhaustedWithoutOutput+1 {
+		t.Fatalf("protocol metrics before=%#v after=%#v", metricsBefore, metricsAfter)
 	}
 }
 
@@ -6096,6 +6101,7 @@ func TestFetchChatGPTWebImageTaskPagesFindsCurrentTaskOnSecondPage(t *testing.T)
 }
 
 func TestFetchChatGPTWebImageTaskPagesUsesExactTaskStreamOnce(t *testing.T) {
+	metricsBefore := ChatGPTWebImageProtocolSnapshot()
 	var streamRequests atomic.Int32
 	var invalidQuery atomic.Bool
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
@@ -6156,6 +6162,28 @@ func TestFetchChatGPTWebImageTaskPagesUsesExactTaskStreamOnce(t *testing.T) {
 	}
 	if invalidQuery.Load() {
 		t.Fatal("exact stream query did not preserve the parent conversation and response message")
+	}
+	metricsAfter := ChatGPTWebImageProtocolSnapshot()
+	if metricsAfter.TaskIDsObserved != metricsBefore.TaskIDsObserved+1 ||
+		metricsAfter.ExactStreamsStarted != metricsBefore.ExactStreamsStarted+1 ||
+		metricsAfter.ExactStreamsCompleted != metricsBefore.ExactStreamsCompleted+1 ||
+		metricsAfter.ExactStreamFallbacks != metricsBefore.ExactStreamFallbacks ||
+		metricsAfter.FinalMessagesCaptured != metricsBefore.FinalMessagesCaptured+1 ||
+		metricsAfter.TaskPagesFetched != metricsBefore.TaskPagesFetched+2 {
+		t.Fatalf("protocol metrics before=%#v after=%#v", metricsBefore, metricsAfter)
+	}
+}
+
+func TestObserveChatGPTWebImageProtocolAccumulatorCountsSafeFlags(t *testing.T) {
+	before := ChatGPTWebImageProtocolSnapshot()
+	observeChatGPTWebImageProtocolAccumulator(&helps.ChatGPTWebImageAccumulator{
+		HiddenOutputSeen:     true,
+		IncompleteOutputSeen: true,
+	})
+	after := ChatGPTWebImageProtocolSnapshot()
+	if after.HiddenOutputsIgnored != before.HiddenOutputsIgnored+1 ||
+		after.IncompletePointersObserved != before.IncompletePointersObserved+1 {
+		t.Fatalf("protocol metrics before=%#v after=%#v", before, after)
 	}
 }
 
@@ -6355,6 +6383,7 @@ func TestFetchChatGPTWebImageTaskPagesBoundsPageCount(t *testing.T) {
 }
 
 func TestPollChatGPTWebImageConversationFallsBackAfterExactStreamUnavailable(t *testing.T) {
+	metricsBefore := ChatGPTWebImageProtocolSnapshot()
 	var exactRequests atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
 		switch request.URL.Path {
@@ -6389,6 +6418,11 @@ func TestPollChatGPTWebImageConversationFallsBackAfterExactStreamUnavailable(t *
 	}
 	if !reflect.DeepEqual(accumulator.FileIDs, []string{"conversation-output"}) || exactRequests.Load() != 1 {
 		t.Fatalf("files = %v, exact requests = %d", accumulator.FileIDs, exactRequests.Load())
+	}
+	metricsAfter := ChatGPTWebImageProtocolSnapshot()
+	if metricsAfter.ExactStreamsStarted != metricsBefore.ExactStreamsStarted+1 ||
+		metricsAfter.ExactStreamFallbacks != metricsBefore.ExactStreamFallbacks+1 {
+		t.Fatalf("protocol metrics before=%#v after=%#v", metricsBefore, metricsAfter)
 	}
 }
 

@@ -1076,6 +1076,9 @@ func TestChatGPTWebImageAccumulatorCapturesTaskIdentityFromFullAndFinalEvents(t 
 	if !reflect.DeepEqual(accumulator.FileIDs, []string{"final-output"}) {
 		t.Fatalf("file IDs = %v", accumulator.FileIDs)
 	}
+	if !accumulator.FinalMessageSeen {
+		t.Fatal("final message event was not recorded")
+	}
 }
 
 func TestChatGPTWebImageAccumulatorFiltersAndOrdersOfficialImageOutputs(t *testing.T) {
