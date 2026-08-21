@@ -168,7 +168,7 @@ func (w *Watcher) dispatchRuntimeAuthUpdate(update AuthUpdate) RuntimeAuthUpdate
 	return RuntimeAuthUpdateResult{Enqueued: enqueued, Consumed: enqueued}
 }
 
-func (w *Watcher) refreshAuthState(force bool) {
+func (w *Watcher) refreshAuthState(force bool) authUpdateStats {
 	w.clientsMutex.RLock()
 	cfg := w.config
 	authDir := w.authDir
@@ -195,9 +195,10 @@ func (w *Watcher) refreshAuthState(force bool) {
 		}
 	}
 	auths = w.filterRetiredPathAuthsLocked(auths)
-	updates := w.prepareAuthUpdatesLocked(auths, force)
+	updates, stats := w.prepareAuthUpdatesLockedWithStats(auths, force)
 	w.clientsMutex.Unlock()
 	w.dispatchAuthUpdatesWithDependencyReconcile(updates)
+	return stats
 }
 
 func (w *Watcher) filterRetiredPathAuthsLocked(auths []*coreauth.Auth) []*coreauth.Auth {
@@ -260,6 +261,12 @@ func (w *Watcher) authUsesRetiredPathLocked(auth *coreauth.Auth) bool {
 }
 
 func (w *Watcher) prepareAuthUpdatesLocked(auths []*coreauth.Auth, force bool) []AuthUpdate {
+	updates, _ := w.prepareAuthUpdatesLockedWithStats(auths, force)
+	return updates
+}
+
+func (w *Watcher) prepareAuthUpdatesLockedWithStats(auths []*coreauth.Auth, force bool) ([]AuthUpdate, authUpdateStats) {
+	var stats authUpdateStats
 	newState := make(map[string]*coreauth.Auth, len(auths))
 	for _, auth := range auths {
 		if auth == nil || auth.ID == "" {
@@ -267,40 +274,37 @@ func (w *Watcher) prepareAuthUpdatesLocked(auths []*coreauth.Auth, force bool) [
 		}
 		newState[auth.ID] = auth.Clone()
 	}
-	if w.currentAuths == nil {
-		w.currentAuths = newState
-		if w.authQueue == nil {
-			return nil
-		}
-		updates := make([]AuthUpdate, 0, len(newState))
-		for id, auth := range newState {
-			updates = append(updates, AuthUpdate{Action: AuthUpdateActionAdd, ID: id, Auth: auth.Clone()})
-		}
-		return updates
-	}
-	if w.authQueue == nil {
-		w.currentAuths = newState
-		return nil
-	}
+	queueEnabled := w.authQueue != nil
 	updates := make([]AuthUpdate, 0, len(newState)+len(w.currentAuths))
 	for id, auth := range newState {
 		if existing, ok := w.currentAuths[id]; !ok {
-			updates = append(updates, AuthUpdate{Action: AuthUpdateActionAdd, ID: id, Auth: auth.Clone()})
+			stats.added++
+			if queueEnabled {
+				updates = append(updates, AuthUpdate{Action: AuthUpdateActionAdd, ID: id, Auth: auth.Clone()})
+			}
 		} else if force || !authEqual(existing, auth) {
-			updates = append(updates, AuthUpdate{Action: AuthUpdateActionModify, ID: id, Auth: auth.Clone()})
+			stats.modified++
+			if queueEnabled {
+				updates = append(updates, AuthUpdate{Action: AuthUpdateActionModify, ID: id, Auth: auth.Clone()})
+			}
+		} else {
+			stats.unchanged++
 		}
 	}
 	for id := range w.currentAuths {
 		if _, ok := newState[id]; !ok {
+			stats.deleted++
 			var deletedAuth *coreauth.Auth
 			if existing := w.currentAuths[id]; existing != nil {
 				deletedAuth = existing.Clone()
 			}
-			updates = append(updates, AuthUpdate{Action: AuthUpdateActionDelete, ID: id, Auth: deletedAuth})
+			if queueEnabled {
+				updates = append(updates, AuthUpdate{Action: AuthUpdateActionDelete, ID: id, Auth: deletedAuth})
+			}
 		}
 	}
 	w.currentAuths = newState
-	return updates
+	return updates, stats
 }
 
 func (w *Watcher) dispatchAuthUpdates(updates []AuthUpdate) bool {
@@ -558,12 +562,22 @@ func normalizeAuth(a *coreauth.Auth) *coreauth.Auth {
 		return nil
 	}
 	clone := a.CloneWithoutRuntimeInstance()
+	clone.Storage = nil
 	clone.CreatedAt = time.Time{}
 	clone.UpdatedAt = time.Time{}
 	clone.LastRefreshedAt = time.Time{}
 	clone.NextRefreshAfter = time.Time{}
+	clone.NextRetryAfter = time.Time{}
 	clone.Runtime = nil
-	clone.Quota.NextRecoverAt = time.Time{}
+	clone.Unavailable = false
+	clone.Quota = coreauth.QuotaState{}
+	clone.LastError = nil
+	clone.CooldownScope = ""
+	clone.ModelStates = nil
+	if clone.Attributes != nil && strings.TrimSpace(clone.Attributes[coreauth.SourceHashAttributeKey]) != "" {
+		clone.Status = ""
+		clone.StatusMessage = ""
+	}
 	return clone
 }
 

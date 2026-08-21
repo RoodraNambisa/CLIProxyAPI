@@ -4238,6 +4238,273 @@ func TestAuthEqualIgnoresManagerRuntimeInstance(t *testing.T) {
 	}
 }
 
+func TestAuthEqualIgnoresFileRuntimeAvailabilityState(t *testing.T) {
+	raw := []byte(`{"type":"codex"}`)
+	sourceHash, errHash := coreauth.CanonicalSourceHashFromBytes(raw)
+	if errHash != nil {
+		t.Fatalf("canonical source hash: %v", errHash)
+	}
+	projected := &coreauth.Auth{
+		ID:       "codex.json",
+		Provider: "codex",
+		Status:   coreauth.StatusActive,
+		Attributes: map[string]string{
+			"path":                          "/auth/codex.json",
+			coreauth.SourceHashAttributeKey: sourceHash,
+		},
+		Metadata: map[string]any{"type": "codex"},
+	}
+	runtimeAuth := projected.Clone()
+	runtimeAuth.Status = coreauth.StatusError
+	runtimeAuth.StatusMessage = "rate limited"
+	runtimeAuth.Unavailable = true
+	runtimeAuth.NextRetryAfter = time.Now().Add(time.Minute)
+	runtimeAuth.CooldownScope = "auth"
+	runtimeAuth.Quota = coreauth.QuotaState{Exceeded: true, Reason: "quota", BackoffLevel: 2}
+	runtimeAuth.LastError = &coreauth.Error{Code: "rate_limit", Message: "limited", HTTPStatus: 429}
+	runtimeAuth.ModelStates = map[string]*coreauth.ModelState{
+		"gpt-test": {Status: coreauth.StatusError, Unavailable: true},
+	}
+	runtimeAuth.RuntimeProxyURL = "http://runtime-proxy.example"
+	runtimeAuth.RuntimeProxyBindingID = "binding"
+	runtimeAuth.RuntimeProxyAuthID = runtimeAuth.ID
+
+	if !authEqual(runtimeAuth, projected) {
+		t.Fatal("manager-owned runtime availability state changed watcher equality")
+	}
+	w := &Watcher{
+		currentAuths: map[string]*coreauth.Auth{runtimeAuth.ID: runtimeAuth},
+		authQueue:    make(chan AuthUpdate, 1),
+	}
+	updates, stats := w.prepareAuthUpdatesLockedWithStats([]*coreauth.Auth{projected}, false)
+	if len(updates) != 0 || stats.unchanged != 1 || stats.added != 0 || stats.modified != 0 || stats.deleted != 0 {
+		t.Fatalf("same-source runtime auth reconciliation = updates %+v stats %+v", updates, stats)
+	}
+
+	changed := projected.Clone()
+	changed.ProxyURL = "http://configured-proxy.example"
+	if authEqual(runtimeAuth, changed) {
+		t.Fatal("watcher equality ignored a persisted routing change")
+	}
+}
+
+func TestInitialSyncEventBufferReplaysLatestAuthState(t *testing.T) {
+	t.Run("modify", func(t *testing.T) {
+		authDir := t.TempDir()
+		path := filepath.Join(authDir, "codex.json")
+		if errWrite := os.WriteFile(path, []byte(`{"type":"codex","email":"old@example.com"}`), 0o600); errWrite != nil {
+			t.Fatalf("write initial auth: %v", errWrite)
+		}
+		cfg := &config.Config{AuthDir: authDir}
+		w := &Watcher{authDir: authDir}
+		w.SetConfig(cfg)
+		if stats := w.scanAuthFilesForReload(cfg, false); stats.projected != 1 {
+			t.Fatalf("initial scan stats = %+v", stats)
+		}
+		_ = w.refreshAuthState(false)
+
+		w.beginInitialSyncEventBuffer()
+		if errWrite := os.WriteFile(path, []byte(`{"type":"codex","email":"new@example.com"}`), 0o600); errWrite != nil {
+			t.Fatalf("rewrite auth: %v", errWrite)
+		}
+		w.handleEvent(fsnotify.Event{Name: path, Op: fsnotify.Write})
+		if got := w.fileAuthsByPath[w.normalizeAuthPath(path)]["codex.json"].Attributes["email"]; got != "old@example.com" {
+			t.Fatalf("buffered event changed snapshot before replay: %q", got)
+		}
+		if replayed := w.replayInitialSyncEvents(context.Background()); replayed != 1 {
+			t.Fatalf("replayed events = %d, want 1", replayed)
+		}
+		current := w.currentAuths["codex.json"]
+		if current == nil || current.Attributes["email"] != "new@example.com" {
+			t.Fatalf("replayed auth = %#v", current)
+		}
+	})
+
+	t.Run("delete", func(t *testing.T) {
+		authDir := t.TempDir()
+		path := filepath.Join(authDir, "codex.json")
+		if errWrite := os.WriteFile(path, []byte(`{"type":"codex"}`), 0o600); errWrite != nil {
+			t.Fatalf("write initial auth: %v", errWrite)
+		}
+		cfg := &config.Config{AuthDir: authDir}
+		w := &Watcher{authDir: authDir}
+		w.SetConfig(cfg)
+		if stats := w.scanAuthFilesForReload(cfg, false); stats.projected != 1 {
+			t.Fatalf("initial scan stats = %+v", stats)
+		}
+		_ = w.refreshAuthState(false)
+
+		w.beginInitialSyncEventBuffer()
+		if errRemove := os.Remove(path); errRemove != nil {
+			t.Fatalf("remove auth: %v", errRemove)
+		}
+		w.handleEvent(fsnotify.Event{Name: path, Op: fsnotify.Remove})
+		if replayed := w.replayInitialSyncEvents(context.Background()); replayed != 1 {
+			t.Fatalf("replayed events = %d, want 1", replayed)
+		}
+		if _, ok := w.currentAuths["codex.json"]; ok {
+			t.Fatal("deleted auth remained after initial event replay")
+		}
+		if _, ok := w.fileAuthsByPath[w.normalizeAuthPath(path)]; ok {
+			t.Fatal("deleted file snapshot remained after initial event replay")
+		}
+	})
+
+	t.Run("config", func(t *testing.T) {
+		authDir := t.TempDir()
+		configPath := filepath.Join(t.TempDir(), "config.yaml")
+		oldConfig := &config.Config{AuthDir: authDir, RequestRetry: 1}
+		oldData, errMarshal := yaml.Marshal(oldConfig)
+		if errMarshal != nil {
+			t.Fatalf("marshal old config: %v", errMarshal)
+		}
+		if errWrite := os.WriteFile(configPath, oldData, 0o600); errWrite != nil {
+			t.Fatalf("write old config: %v", errWrite)
+		}
+		w := &Watcher{configPath: configPath, authDir: authDir}
+		w.SetConfig(oldConfig)
+
+		newConfig := &config.Config{AuthDir: authDir, RequestRetry: 7}
+		newData, errMarshal := yaml.Marshal(newConfig)
+		if errMarshal != nil {
+			t.Fatalf("marshal new config: %v", errMarshal)
+		}
+		w.beginInitialSyncEventBuffer()
+		if errWrite := os.WriteFile(configPath, newData, 0o600); errWrite != nil {
+			t.Fatalf("write new config: %v", errWrite)
+		}
+		w.handleEvent(fsnotify.Event{Name: configPath, Op: fsnotify.Write})
+		if w.config.RequestRetry != 1 {
+			t.Fatalf("buffered config applied before replay: %d", w.config.RequestRetry)
+		}
+		if replayed := w.replayInitialSyncEvents(context.Background()); replayed != 1 {
+			t.Fatalf("replayed events = %d, want 1", replayed)
+		}
+		if w.config.RequestRetry != 7 {
+			t.Fatalf("replayed config request retry = %d, want 7", w.config.RequestRetry)
+		}
+	})
+}
+
+func TestInitialSyncEventReplayDrainsQueuedWatcherEvents(t *testing.T) {
+	authDir := t.TempDir()
+	path := filepath.Join(authDir, "codex.json")
+	if errWrite := os.WriteFile(path, []byte(`{"type":"codex","email":"old@example.com"}`), 0o600); errWrite != nil {
+		t.Fatalf("write initial auth: %v", errWrite)
+	}
+	cfg := &config.Config{AuthDir: authDir}
+	w := &Watcher{
+		authDir: authDir,
+		watcher: &fsnotify.Watcher{
+			Events: make(chan fsnotify.Event, 1),
+			Errors: make(chan error, 1),
+		},
+	}
+	w.SetConfig(cfg)
+	if stats := w.scanAuthFilesForReload(cfg, false); stats.projected != 1 {
+		t.Fatalf("initial scan stats = %+v", stats)
+	}
+	_ = w.refreshAuthState(false)
+
+	w.initialSyncMu.Lock()
+	w.initialSyncDrain = make(chan chan struct{})
+	w.initialSyncMu.Unlock()
+	w.beginInitialSyncEventBuffer()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		w.processEvents(ctx)
+		close(done)
+	}()
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Fatal("event loop did not stop")
+		}
+	})
+
+	if errWrite := os.WriteFile(path, []byte(`{"type":"codex","email":"new@example.com"}`), 0o600); errWrite != nil {
+		t.Fatalf("rewrite auth: %v", errWrite)
+	}
+	w.watcher.Events <- fsnotify.Event{Name: path, Op: fsnotify.Write}
+	if replayed := w.replayInitialSyncEvents(context.Background()); replayed != 1 {
+		t.Fatalf("replayed events = %d, want 1", replayed)
+	}
+	current := w.currentAuths["codex.json"]
+	if current == nil || current.Attributes["email"] != "new@example.com" {
+		t.Fatalf("queued auth event was not replayed before handoff: %#v", current)
+	}
+}
+
+func TestInitialSyncEventReplayHonorsCanceledContext(t *testing.T) {
+	w := &Watcher{}
+	w.initialSyncMu.Lock()
+	w.initialSyncDrain = make(chan chan struct{})
+	w.initialSyncMu.Unlock()
+	w.beginInitialSyncEventBuffer()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	done := make(chan int, 1)
+	go func() {
+		done <- w.replayInitialSyncEvents(ctx)
+	}()
+	select {
+	case replayed := <-done:
+		if replayed != 0 {
+			t.Fatalf("replayed events = %d, want 0", replayed)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("initial event replay blocked after context cancellation")
+	}
+	w.initialSyncMu.Lock()
+	active := w.initialSyncActive
+	w.initialSyncMu.Unlock()
+	if active {
+		t.Fatal("initial event buffer remained active after cancellation")
+	}
+}
+
+func BenchmarkInitialAuthScan10000(b *testing.B) {
+	authDir := b.TempDir()
+	const fileCount = 10_000
+	for index := 0; index < fileCount; index++ {
+		path := filepath.Join(authDir, fmt.Sprintf("auth-%05d.json", index))
+		payload := fmt.Sprintf(`{"type":"codex","email":"user-%05d@example.com"}`, index)
+		if errWrite := os.WriteFile(path, []byte(payload), 0o600); errWrite != nil {
+			b.Fatalf("write auth %d: %v", index, errWrite)
+		}
+	}
+	var reads atomic.Int64
+	w := &Watcher{
+		authDir: authDir,
+		readAuthFileAtRoot: func(root *os.Root, relativePath string) ([]byte, authFileVersion, error) {
+			reads.Add(1)
+			return readAuthFileVersionAtRoot(root, relativePath)
+		},
+	}
+	cfg := &config.Config{AuthDir: authDir}
+	w.SetConfig(cfg)
+	if stats := w.scanAuthFilesForReload(cfg, false); stats.projected != fileCount {
+		b.Fatalf("setup scan stats = %+v", stats)
+	}
+	_ = w.refreshAuthState(false)
+	reads.Store(0)
+
+	b.ResetTimer()
+	for iteration := 0; iteration < b.N; iteration++ {
+		scanStats := w.scanAuthFilesForReload(cfg, false)
+		updateStats := w.refreshAuthState(false)
+		if scanStats.projected != fileCount || updateStats.unchanged != fileCount || updateStats.added != 0 || updateStats.modified != 0 || updateStats.deleted != 0 {
+			b.Fatalf("iteration %d scan=%+v updates=%+v", iteration, scanStats, updateStats)
+		}
+	}
+	b.StopTimer()
+	b.ReportMetric(float64(reads.Load())/float64(b.N), "file_reads/op")
+}
+
 func TestDispatchLoopExitsWhenQueueNilAndContextCanceled(t *testing.T) {
 	w := &Watcher{
 		dispatchCond:   nil,

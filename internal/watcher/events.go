@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"time"
 
@@ -79,6 +80,10 @@ func (w *Watcher) start(ctx context.Context) (err error) {
 	done := make(chan struct{})
 	w.eventCancel = cancel
 	w.eventDone = done
+	w.initialSyncMu.Lock()
+	w.initialSyncDrain = make(chan chan struct{})
+	w.initialSyncMu.Unlock()
+	w.beginInitialSyncEventBuffer()
 	go func() {
 		w.processEvents(eventCtx)
 		w.eventMu.Lock()
@@ -90,7 +95,25 @@ func (w *Watcher) start(ctx context.Context) (err error) {
 		close(done)
 	}()
 
-	w.reloadClientsWithOptions(true, nil, false, true, true)
+	syncStarted := time.Now()
+	reloadStats := w.reloadClientsWithOptions(true, nil, false, true, true)
+	replayedEvents := w.replayInitialSyncEvents(ctx)
+	if errContext := ctx.Err(); errContext != nil {
+		return errContext
+	}
+	log.WithFields(log.Fields{
+		"scanned":            reloadStats.scan.scanned,
+		"readable":           reloadStats.scan.readable,
+		"unchanged":          reloadStats.updates.unchanged,
+		"added":              reloadStats.updates.added,
+		"modified":           reloadStats.updates.modified,
+		"deleted":            reloadStats.updates.deleted,
+		"skipped":            reloadStats.scan.skipped,
+		"replayed_events":    replayedEvents,
+		"scan_duration":      reloadStats.scanDuration,
+		"reconcile_duration": reloadStats.reconcileDuration,
+		"total_duration":     time.Since(syncStarted),
+	}).Info("watcher initial sync complete; routing bootstrap remains in progress")
 	return nil
 }
 
@@ -98,6 +121,12 @@ func (w *Watcher) stopEventLoop() {
 	if w == nil {
 		return
 	}
+	w.initialSyncMu.Lock()
+	w.initialSyncActive = false
+	w.initialSyncConfig = false
+	w.initialSyncAuthPaths = nil
+	w.initialSyncDrain = nil
+	w.initialSyncMu.Unlock()
 	w.eventMu.Lock()
 	w.stopped.Store(true)
 	cancel := w.eventCancel
@@ -114,6 +143,31 @@ func (w *Watcher) stopEventLoop() {
 }
 
 func (w *Watcher) processEvents(ctx context.Context) {
+	w.initialSyncMu.Lock()
+	initialSyncDrain := w.initialSyncDrain
+	w.initialSyncMu.Unlock()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case drained := <-initialSyncDrain:
+			w.drainPendingEvents(ctx)
+			close(drained)
+		case event, ok := <-w.watcher.Events:
+			if !ok {
+				return
+			}
+			w.handleEvent(event)
+		case errWatch, ok := <-w.watcher.Errors:
+			if !ok {
+				return
+			}
+			log.Errorf("file watcher error: %v", errWatch)
+		}
+	}
+}
+
+func (w *Watcher) drainPendingEvents(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
@@ -128,6 +182,8 @@ func (w *Watcher) processEvents(ctx context.Context) {
 				return
 			}
 			log.Errorf("file watcher error: %v", errWatch)
+		default:
+			return
 		}
 	}
 }
@@ -143,6 +199,9 @@ func (w *Watcher) handleEvent(event fsnotify.Event) {
 	isAuthJSON := filepath.Dir(normalizedName) == normalizedAuthDir && strings.HasSuffix(normalizedName, ".json") && event.Op&authOps != 0
 	if !isConfigEvent && !isAuthJSON {
 		// Ignore unrelated files (e.g., cookie snapshots *.cookie) and other noise.
+		return
+	}
+	if w.bufferInitialSyncEvent(event, isConfigEvent, isAuthJSON) {
 		return
 	}
 
@@ -213,6 +272,149 @@ func (w *Watcher) handleEvent(event fsnotify.Event) {
 		log.Infof("auth file changed (%s): %s, processing incrementally", event.Op.String(), filepath.Base(event.Name))
 		w.addOrUpdateClient(event.Name)
 	}
+}
+
+func (w *Watcher) beginInitialSyncEventBuffer() {
+	w.initialSyncMu.Lock()
+	w.initialSyncActive = true
+	w.initialSyncConfig = false
+	w.initialSyncAuthPaths = make(map[string]string)
+	w.initialSyncMu.Unlock()
+}
+
+func (w *Watcher) bufferInitialSyncEvent(event fsnotify.Event, isConfigEvent, isAuthEvent bool) bool {
+	w.initialSyncMu.Lock()
+	defer w.initialSyncMu.Unlock()
+	if !w.initialSyncActive {
+		return false
+	}
+	if isConfigEvent {
+		w.initialSyncConfig = true
+	}
+	if isAuthEvent {
+		normalized := w.normalizeAuthPath(event.Name)
+		if normalized != "" {
+			w.initialSyncAuthPaths[normalized] = event.Name
+		}
+	}
+	return true
+}
+
+func (w *Watcher) replayInitialSyncEvents(ctx context.Context) int {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	replayed := 0
+	for {
+		if !w.drainInitialSyncEventLoop(ctx) {
+			w.initialSyncMu.Lock()
+			w.initialSyncActive = false
+			w.initialSyncConfig = false
+			w.initialSyncAuthPaths = nil
+			w.initialSyncMu.Unlock()
+			return replayed
+		}
+		w.initialSyncMu.Lock()
+		if !w.initialSyncConfig && len(w.initialSyncAuthPaths) == 0 {
+			w.initialSyncActive = false
+			w.initialSyncAuthPaths = nil
+			w.initialSyncMu.Unlock()
+			return replayed
+		}
+		configPending := w.initialSyncConfig
+		w.initialSyncConfig = false
+		paths := make([]string, 0, len(w.initialSyncAuthPaths))
+		for _, path := range w.initialSyncAuthPaths {
+			paths = append(paths, path)
+		}
+		w.initialSyncAuthPaths = make(map[string]string)
+		w.initialSyncMu.Unlock()
+
+		if configPending {
+			w.stopConfigReloadTimer()
+			w.reloadConfigIfChanged()
+			replayed++
+		}
+		sort.Strings(paths)
+		for _, path := range paths {
+			w.replayInitialSyncAuthPath(path)
+			replayed++
+		}
+	}
+}
+
+func (w *Watcher) drainInitialSyncEventLoop(ctx context.Context) bool {
+	w.initialSyncMu.Lock()
+	drainRequests := w.initialSyncDrain
+	w.initialSyncMu.Unlock()
+	if drainRequests == nil {
+		return true
+	}
+	drained := make(chan struct{})
+	select {
+	case drainRequests <- drained:
+	case <-ctx.Done():
+		return false
+	}
+	select {
+	case <-drained:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+func (w *Watcher) replayInitialSyncAuthPath(path string) {
+	info, errInfo := os.Lstat(path)
+	if errInfo == nil {
+		if info.Mode()&os.ModeSymlink != 0 {
+			w.removeClientState(path, false)
+			return
+		}
+		if info.Mode().IsRegular() {
+			w.addOrUpdateClient(path)
+		}
+		return
+	}
+	if os.IsNotExist(errInfo) && w.isTrackedAuthFile(path) {
+		w.removeClient(path)
+	}
+}
+
+func (w *Watcher) isTrackedAuthFile(path string) bool {
+	normalized := w.normalizeAuthPath(path)
+	authRoot := strings.TrimSpace(w.authRootDir())
+	w.clientsMutex.RLock()
+	defer w.clientsMutex.RUnlock()
+	if _, ok := w.lastAuthHashes[normalized]; ok {
+		return true
+	}
+	if _, ok := w.fileAuthsByPath[normalized]; ok {
+		return true
+	}
+	for _, auth := range w.currentAuths {
+		if auth == nil {
+			continue
+		}
+		candidate := strings.TrimSpace(auth.FileName)
+		if auth.Attributes != nil {
+			if value := strings.TrimSpace(auth.Attributes["path"]); value != "" {
+				candidate = value
+			} else if value := strings.TrimSpace(auth.Attributes["source"]); value != "" {
+				candidate = value
+			}
+		}
+		if candidate == "" {
+			continue
+		}
+		if !filepath.IsAbs(candidate) && authRoot != "" {
+			candidate = filepath.Join(authRoot, filepath.FromSlash(candidate))
+		}
+		if w.normalizeAuthPath(candidate) == normalized {
+			return true
+		}
+	}
+	return false
 }
 
 func (w *Watcher) authFileUnchanged(path string) (bool, error) {

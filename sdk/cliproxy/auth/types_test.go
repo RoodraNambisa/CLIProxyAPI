@@ -21,10 +21,19 @@ func TestRuntimeInstallationID(t *testing.T) {
 }
 
 func TestCloneWithoutRuntimeInstanceClearsCredentialGeneration(t *testing.T) {
-	auth := &Auth{chatGPTWebCredentialGeneration: "runtime-generation"}
+	auth := &Auth{
+		RuntimeProxyURL:                "http://proxy.example",
+		RuntimeProxyBindingID:          "binding",
+		RuntimeProxyAuthID:             "auth",
+		runtimeProxyResolved:           true,
+		chatGPTWebCredentialGeneration: "runtime-generation",
+	}
 	clone := auth.CloneWithoutRuntimeInstance()
 	if clone.chatGPTWebCredentialGeneration != "" {
 		t.Fatalf("runtime-free clone generation = %q, want empty", clone.chatGPTWebCredentialGeneration)
+	}
+	if clone.RuntimeProxyURL != "" || clone.RuntimeProxyBindingID != "" || clone.RuntimeProxyAuthID != "" || clone.runtimeProxyResolved {
+		t.Fatalf("runtime-free clone retained proxy identity: %#v", clone)
 	}
 	if auth.chatGPTWebCredentialGeneration != "runtime-generation" {
 		t.Fatal("CloneWithoutRuntimeInstance() mutated the source auth")

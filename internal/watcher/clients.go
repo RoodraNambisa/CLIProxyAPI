@@ -122,8 +122,24 @@ func readAuthFileVersionAtRoot(root *os.Root, relativePath string) ([]byte, auth
 }
 
 type authFileScanStats struct {
-	scanned  int
-	readable int
+	scanned   int
+	readable  int
+	projected int
+	skipped   int
+}
+
+type authUpdateStats struct {
+	unchanged int
+	added     int
+	modified  int
+	deleted   int
+}
+
+type authReloadStats struct {
+	scan              authFileScanStats
+	updates           authUpdateStats
+	scanDuration      time.Duration
+	reconcileDuration time.Duration
 }
 
 type authFileScanJob struct {
@@ -160,10 +176,11 @@ func (w *Watcher) authRootDir() string {
 }
 
 func (w *Watcher) reloadClients(rescanAuth bool, affectedOAuthProviders []string, forceAuthRefresh bool) {
-	w.reloadClientsWithOptions(rescanAuth, affectedOAuthProviders, forceAuthRefresh, false, true)
+	_ = w.reloadClientsWithOptions(rescanAuth, affectedOAuthProviders, forceAuthRefresh, false, true)
 }
 
-func (w *Watcher) reloadClientsWithOptions(rescanAuth bool, affectedOAuthProviders []string, forceAuthRefresh, resolveTombstoneReplacements, notifyRuntime bool) {
+func (w *Watcher) reloadClientsWithOptions(rescanAuth bool, affectedOAuthProviders []string, forceAuthRefresh, resolveTombstoneReplacements, notifyRuntime bool) authReloadStats {
+	var reloadStats authReloadStats
 	log.Debugf("starting full client load process")
 
 	w.clientsMutex.RLock()
@@ -172,7 +189,7 @@ func (w *Watcher) reloadClientsWithOptions(rescanAuth bool, affectedOAuthProvide
 
 	if cfg == nil {
 		log.Error("config is nil, cannot reload clients")
-		return
+		return reloadStats
 	}
 
 	// Let the service apply or reject the candidate before rebuilding clients.
@@ -187,7 +204,7 @@ func (w *Watcher) reloadClientsWithOptions(rescanAuth bool, affectedOAuthProvide
 		w.clientsMutex.RUnlock()
 		if cfg == nil {
 			log.Error("runtime config is nil after reload callback")
-			return
+			return reloadStats
 		}
 	}
 
@@ -219,9 +236,11 @@ func (w *Watcher) reloadClientsWithOptions(rescanAuth bool, affectedOAuthProvide
 
 	var authFileCount int
 	if rescanAuth {
-		scanStats := w.scanAuthFilesForReload(cfg, resolveTombstoneReplacements)
-		authFileCount = scanStats.scanned
-		log.Debugf("auth directory scan complete - found %d .json files, %d readable", scanStats.scanned, scanStats.readable)
+		scanStarted := time.Now()
+		reloadStats.scan = w.scanAuthFilesForReload(cfg, resolveTombstoneReplacements)
+		reloadStats.scanDuration = time.Since(scanStarted)
+		authFileCount = reloadStats.scan.scanned
+		log.Debugf("auth directory scan complete - found %d .json files, %d readable, %d projected, %d skipped", reloadStats.scan.scanned, reloadStats.scan.readable, reloadStats.scan.projected, reloadStats.scan.skipped)
 	} else {
 		w.reprojectCachedFileAuths(cfg)
 		w.clientsMutex.RLock()
@@ -232,7 +251,9 @@ func (w *Watcher) reloadClientsWithOptions(rescanAuth bool, affectedOAuthProvide
 
 	totalNewClients := authFileCount + geminiAPIKeyCount + vertexCompatAPIKeyCount + claudeAPIKeyCount + codexAPIKeyCount + openAICompatCount
 
-	w.refreshAuthState(forceAuthRefresh)
+	reconcileStarted := time.Now()
+	reloadStats.updates = w.refreshAuthState(forceAuthRefresh)
+	reloadStats.reconcileDuration = time.Since(reconcileStarted)
 
 	log.Infof("full client load complete - %d clients (%d auth files + %d Gemini API keys + %d Vertex API keys + %d Claude API keys + %d Codex keys + %d OpenAI-compat)",
 		totalNewClients,
@@ -243,6 +264,7 @@ func (w *Watcher) reloadClientsWithOptions(rescanAuth bool, affectedOAuthProvide
 		codexAPIKeyCount,
 		openAICompatCount,
 	)
+	return reloadStats
 }
 
 func (w *Watcher) scanAuthFilesForReload(cfg *config.Config, resolveTombstoneReplacements bool) authFileScanStats {
@@ -346,6 +368,13 @@ func (w *Watcher) scanAuthFilesForReload(cfg *config.Config, resolveTombstoneRep
 		if readable {
 			stats.readable++
 		}
+	}
+	w.clientsMutex.RLock()
+	stats.projected = len(w.fileAuthsByPath)
+	w.clientsMutex.RUnlock()
+	stats.skipped = stats.scanned - stats.projected
+	if stats.skipped < 0 {
+		stats.skipped = 0
 	}
 	return stats
 }

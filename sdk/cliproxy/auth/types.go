@@ -495,6 +495,10 @@ func (a *Auth) CloneWithoutRuntimeInstance() *Auth {
 	clone.installationID = ""
 	clone.instanceID = ""
 	clone.instanceState = nil
+	clone.RuntimeProxyURL = ""
+	clone.RuntimeProxyBindingID = ""
+	clone.RuntimeProxyAuthID = ""
+	clone.runtimeProxyResolved = false
 	clone.chatGPTWebCredentialGeneration = ""
 	clone.requestRefreshFamilyID = ""
 	return clone

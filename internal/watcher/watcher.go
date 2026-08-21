@@ -76,6 +76,11 @@ type Watcher struct {
 	eventDone            chan struct{}
 	eventInitialized     bool
 	eventPathsAdded      bool
+	initialSyncMu        sync.Mutex
+	initialSyncActive    bool
+	initialSyncConfig    bool
+	initialSyncAuthPaths map[string]string
+	initialSyncDrain     chan chan struct{}
 	lastRemoveTimes      map[string]time.Time
 	lastConfigHash       string
 	authQueue            chan<- AuthUpdate
