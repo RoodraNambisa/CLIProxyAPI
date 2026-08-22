@@ -479,6 +479,85 @@ func TestBuildConversationTurnstileTokenMatchesSentinelSDKFixtures(t *testing.T)
 			want: base64.StdEncoding.EncodeToString([]byte("/sentinel/20260219f9f6/sdk.js")),
 		},
 		{
+			name: "string split",
+			program: []any{
+				[]any{2, 40, "a,b,c"},
+				[]any{2, 41, "split"},
+				[]any{24, 42, 40, 41},
+				[]any{2, 43, ","},
+				[]any{17, 44, 42, 43},
+				[]any{15, 45, 44},
+				[]any{7, 3, 45},
+			},
+			want: "WyJhIiwiYiIsImMiXQ==",
+		},
+		{
+			name: "string split limit",
+			program: []any{
+				[]any{2, 40, "a,b,c"},
+				[]any{2, 41, "split"},
+				[]any{24, 42, 40, 41},
+				[]any{2, 43, ","},
+				[]any{2, 44, 2},
+				[]any{17, 45, 42, 43, 44},
+				[]any{15, 46, 45},
+				[]any{7, 3, 46},
+			},
+			want: "WyJhIiwiYiJd",
+		},
+		{
+			name: "string split empty separator",
+			program: []any{
+				[]any{2, 40, "abc"},
+				[]any{2, 41, "split"},
+				[]any{24, 42, 40, 41},
+				[]any{2, 43, ""},
+				[]any{17, 44, 42, 43},
+				[]any{15, 45, 44},
+				[]any{7, 3, 45},
+			},
+			want: "WyJhIiwiYiIsImMiXQ==",
+		},
+		{
+			name: "string split undefined separator",
+			program: []any{
+				[]any{2, 40, "a,b,c"},
+				[]any{2, 41, "split"},
+				[]any{24, 42, 40, 41},
+				[]any{17, 43, 42},
+				[]any{15, 44, 43},
+				[]any{7, 3, 44},
+			},
+			want: "WyJhLGIsYyJd",
+		},
+		{
+			name: "string split zero limit",
+			program: []any{
+				[]any{2, 40, "a,b,c"},
+				[]any{2, 41, "split"},
+				[]any{24, 42, 40, 41},
+				[]any{2, 43, ","},
+				[]any{2, 44, 0},
+				[]any{17, 45, 42, 43, 44},
+				[]any{15, 46, 45},
+				[]any{7, 3, 46},
+			},
+			want: "W10=",
+		},
+		{
+			name: "string split preserves empty fields",
+			program: []any{
+				[]any{2, 40, ",a,,"},
+				[]any{2, 41, "split"},
+				[]any{24, 42, 40, 41},
+				[]any{2, 43, ","},
+				[]any{17, 44, 42, 43},
+				[]any{15, 45, 44},
+				[]any{7, 3, 45},
+			},
+			want: "WyIiLCJhIiwiIiwiIl0=",
+		},
+		{
 			name: "custom local storage keys",
 			program: []any{
 				[]any{2, 40, "Object"},
@@ -663,6 +742,68 @@ func TestConversationTurnstileStringOperationsUseUTF16Units(t *testing.T) {
 	unit, err := isolatedCharCodeAt.invoke([]any{0})
 	if err != nil || unit != int(0xd800) {
 		t.Fatalf("isolated surrogate charCodeAt(0) = %#v, %v", unit, err)
+	}
+}
+
+func TestConversationTurnstileStringSplitSemantics(t *testing.T) {
+	tests := []struct {
+		name  string
+		value string
+		args  []any
+		want  []string
+	}{
+		{name: "overlapping separator", value: "aaaa", args: []any{"aa"}, want: []string{"", "", ""}},
+		{name: "empty source and separator", value: "", args: []any{""}, want: []string{}},
+		{name: "empty source", value: "", args: []any{","}, want: []string{""}},
+		{name: "negative limit wraps", value: "a,b", args: []any{",", -1}, want: []string{"a", "b"}},
+		{name: "uint32 modulus", value: "a,b", args: []any{",", float64(uint64(1) << 32)}, want: []string{}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			vm := &conversationTurnstileVM{ctx: t.Context(), memoryBudget: &conversationTurnstileMemoryBudget{}}
+			bound, err := vm.bindProperty(test.value, "split")
+			if err != nil {
+				t.Fatal(err)
+			}
+			callable, ok := bound.(conversationTurnstileCallable)
+			if !ok {
+				t.Fatalf("split property = %#v", bound)
+			}
+			result, err := callable.invoke(test.args)
+			if err != nil {
+				t.Fatal(err)
+			}
+			array, ok := result.(*conversationTurnstileArray)
+			if !ok || len(array.items) != len(test.want) {
+				t.Fatalf("split result = %#v, want %#v", result, test.want)
+			}
+			for index, item := range array.items {
+				if got := conversationTurnstileString(item); got != test.want[index] {
+					t.Fatalf("split result[%d] = %q, want %q", index, got, test.want[index])
+				}
+			}
+		})
+	}
+
+	vm := &conversationTurnstileVM{ctx: t.Context(), memoryBudget: &conversationTurnstileMemoryBudget{}}
+	bound, err := vm.bindProperty("A😀B", "split")
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := bound.(conversationTurnstileCallable).invoke([]any{""})
+	if err != nil {
+		t.Fatal(err)
+	}
+	array := result.(*conversationTurnstileArray)
+	wantUnits := []uint16{'A', 0xd83d, 0xde00, 'B'}
+	if len(array.items) != len(wantUnits) {
+		t.Fatalf("UTF-16 split length = %d, want %d", len(array.items), len(wantUnits))
+	}
+	for index, want := range wantUnits {
+		item, ok := array.items[index].(conversationTurnstileJSString)
+		if !ok || len(item.units) != 1 || item.units[0] != want {
+			t.Fatalf("UTF-16 split item[%d] = %#v, want %#x", index, array.items[index], want)
+		}
 	}
 }
 

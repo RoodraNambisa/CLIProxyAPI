@@ -4369,6 +4369,10 @@ func (vm *conversationTurnstileVM) bindStringProperty(value any, keyText string)
 	switch keyText {
 	case "toString":
 		return newConversationTurnstileCallable(func([]any) (any, error) { return value, nil }), nil
+	case "split":
+		return newConversationTurnstileCallable(func(args []any) (any, error) {
+			return vm.splitString(value, args)
+		}), nil
 	case "charCodeAt":
 		return newConversationTurnstileCallable(func(args []any) (any, error) {
 			indexValue := float64(0)
@@ -4476,6 +4480,138 @@ func (vm *conversationTurnstileVM) bindStringProperty(value any, keyText string)
 		}), nil
 	}
 	return vm.property(value, keyText)
+}
+
+func (vm *conversationTurnstileVM) splitString(value any, args []any) (any, error) {
+	limit := uint32(math.MaxUint32)
+	if len(args) > 1 && !isConversationTurnstileUndefined(args[1]) {
+		parsed, _, err := vm.number(args[1])
+		if err != nil {
+			return nil, err
+		}
+		limit = conversationTurnstileToUint32(parsed)
+	}
+	if limit == 0 {
+		return conversationTurnstileArrayValue(nil), nil
+	}
+	if len(args) == 0 || isConversationTurnstileUndefined(args[0]) {
+		if err := vm.reserveArrayElements(1, 16); err != nil {
+			return nil, err
+		}
+		return conversationTurnstileArrayValue([]any{value}), nil
+	}
+
+	valueUnits, err := vm.runtimeUTF16(value)
+	if err != nil {
+		return nil, err
+	}
+	separatorUnits, err := vm.runtimeUTF16(args[0])
+	if err != nil {
+		return nil, err
+	}
+	if len(separatorUnits) == 0 {
+		count := len(valueUnits)
+		if uint64(limit) < uint64(count) {
+			count = int(limit)
+		}
+		if err = vm.reserveArrayElements(count, 40); err != nil {
+			return nil, err
+		}
+		items := make([]any, count)
+		for index := range items {
+			if index&255 == 0 && vm.ctx != nil {
+				if err = vm.ctx.Err(); err != nil {
+					return nil, err
+				}
+			}
+			items[index] = conversationTurnstileJSString{units: valueUnits[index : index+1]}
+		}
+		return &conversationTurnstileArray{items: items}, nil
+	}
+
+	prefixBytes := len(separatorUnits) * 8
+	if err = vm.reserveRuntimeBytes(prefixBytes); err != nil {
+		return nil, err
+	}
+	prefix := make([]int, len(separatorUnits))
+	if err = vm.chargeRuntimeWork((len(valueUnits) + len(separatorUnits)) * 4); err != nil {
+		return nil, err
+	}
+	for index, matched := 1, 0; index < len(separatorUnits); index++ {
+		for matched > 0 && separatorUnits[index] != separatorUnits[matched] {
+			matched = prefix[matched-1]
+		}
+		if separatorUnits[index] == separatorUnits[matched] {
+			matched++
+		}
+		prefix[index] = matched
+	}
+
+	resultLimit := len(valueUnits) + 1
+	if uint64(limit) < uint64(resultLimit) {
+		resultLimit = int(limit)
+	}
+	resultCount, err := vm.countStringSplitResults(valueUnits, separatorUnits, prefix, resultLimit)
+	if err != nil {
+		return nil, err
+	}
+	if err = vm.reserveArrayElements(resultCount, 40); err != nil {
+		return nil, err
+	}
+	items := make([]any, 0, resultCount)
+	start, matched := 0, 0
+	for index, unit := range valueUnits {
+		if index&255 == 0 && vm.ctx != nil {
+			if err = vm.ctx.Err(); err != nil {
+				return nil, err
+			}
+		}
+		for matched > 0 && unit != separatorUnits[matched] {
+			matched = prefix[matched-1]
+		}
+		if unit == separatorUnits[matched] {
+			matched++
+		}
+		if matched != len(separatorUnits) {
+			continue
+		}
+		matchStart := index + 1 - len(separatorUnits)
+		items = append(items, conversationTurnstileJSString{units: valueUnits[start:matchStart]})
+		start = index + 1
+		matched = 0
+		if len(items) == resultLimit {
+			return &conversationTurnstileArray{items: items}, nil
+		}
+	}
+	items = append(items, conversationTurnstileJSString{units: valueUnits[start:]})
+	return &conversationTurnstileArray{items: items}, nil
+}
+
+func (vm *conversationTurnstileVM) countStringSplitResults(valueUnits, separatorUnits []uint16, prefix []int, limit int) (int, error) {
+	matched := 0
+	results := 1
+	for index, unit := range valueUnits {
+		if index&255 == 0 && vm.ctx != nil {
+			if err := vm.ctx.Err(); err != nil {
+				return 0, err
+			}
+		}
+		for matched > 0 && unit != separatorUnits[matched] {
+			matched = prefix[matched-1]
+		}
+		if unit == separatorUnits[matched] {
+			matched++
+		}
+		if matched != len(separatorUnits) {
+			continue
+		}
+		if results == limit {
+			return results, nil
+		}
+		results++
+		matched = 0
+	}
+	return results, nil
 }
 
 func (processMap *conversationTurnstileProcessMapRef) method(name string) any {
@@ -5053,6 +5189,18 @@ func conversationTurnstileToIntegerOrInfinity(value float64) float64 {
 		return value
 	}
 	return math.Trunc(value)
+}
+
+func conversationTurnstileToUint32(value float64) uint32 {
+	if math.IsNaN(value) || math.IsInf(value, 0) || value == 0 {
+		return 0
+	}
+	const modulus = float64(uint64(1) << 32)
+	integer := math.Mod(math.Trunc(value), modulus)
+	if integer < 0 {
+		integer += modulus
+	}
+	return uint32(integer)
 }
 
 func conversationTurnstileIsString(value any) bool {

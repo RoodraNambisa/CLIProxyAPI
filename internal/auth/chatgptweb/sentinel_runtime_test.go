@@ -1079,6 +1079,39 @@ func TestSentinelRuntimeManagerPrefersTypedCompatibilityFallback(t *testing.T) {
 	}
 }
 
+func TestSentinelRuntimeManagerKeepsStringSplitOnGoVM(t *testing.T) {
+	manager := newSentinelRuntimeTestManager()
+	defer manager.Close()
+	request, sdkRequest := sentinelRuntimeTestRequests(t, false)
+	request.DX = encodeConversationTurnstileProgram(t, request.RequirementsToken, []any{
+		[]any{2, 40, "a,b,c"},
+		[]any{2, 41, "split"},
+		[]any{24, 42, 40, 41},
+		[]any{2, 43, ","},
+		[]any{17, 44, 42, 43},
+		[]any{15, 45, 44},
+		[]any{7, 3, 45},
+	})
+	sdkRequest.Challenge["turnstile"] = map[string]any{"required": true, "dx": request.DX}
+	var fetches atomic.Int64
+	sdkRequest.Fetcher = sentinelRuntimeTestFetcher(&fetches)
+
+	token, err := manager.SolveTurnstile(t.Context(), request, sdkRequest, nil)
+	if err != nil {
+		t.Fatalf("SolveTurnstile() error = %v", err)
+	}
+	if token != "WyJhIiwiYiIsImMiXQ==" {
+		t.Fatalf("token = %q", token)
+	}
+	if fetches.Load() != 0 {
+		t.Fatalf("SDK source fetches = %d, want pure Go execution", fetches.Load())
+	}
+	snapshot := manager.Snapshot()
+	if snapshot.CompatibilityFallbacks != 0 || snapshot.SDKPreferredHits != 0 || snapshot.FallbackCount != 0 {
+		t.Fatalf("fallback counters = %+v", snapshot)
+	}
+}
+
 func TestSentinelRuntimeSDKPreferredExpiryDoesNotSlideOnHit(t *testing.T) {
 	manager := newSentinelRuntimeTestManager()
 	defer manager.Close()
