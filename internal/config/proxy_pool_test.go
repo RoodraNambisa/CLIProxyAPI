@@ -42,6 +42,9 @@ func TestNormalizeProxyConfiguration(t *testing.T) {
 	if got := rules[0].Priorities; len(got) != 2 || got[0] != 0 || got[1] != -1 {
 		t.Fatalf("priorities = %#v", got)
 	}
+	if rules[0].Pool != "" || len(rules[0].Targets) != 1 || rules[0].Targets[0].Pool != "Residential" || rules[0].Targets[0].Priority != 0 {
+		t.Fatalf("legacy rule targets = %#v", rules[0])
+	}
 }
 
 func TestNormalizeProxyConfigurationRejectsInvalidReferences(t *testing.T) {
@@ -62,6 +65,12 @@ func TestNormalizeProxyConfigurationRejectsInvalidReferences(t *testing.T) {
 		{name: "negative check interval", pools: []ProxyPoolConfig{{Name: "one", CheckIntervalSeconds: -1, Entries: validPool.Entries}}},
 		{name: "negative bind attempts", pools: []ProxyPoolConfig{{Name: "one", BindAttempts: -1, Entries: validPool.Entries}}},
 		{name: "explicit empty providers", pools: []ProxyPoolConfig{validPool}, rules: []ProxyRuleConfig{{Name: "rule", Pool: "one", Providers: []string{" "}}}},
+		{name: "missing targets", pools: []ProxyPoolConfig{validPool}, rules: []ProxyRuleConfig{{Name: "rule"}}},
+		{name: "legacy and targets", pools: []ProxyPoolConfig{validPool}, rules: []ProxyRuleConfig{{Name: "rule", Pool: "one", Targets: []ProxyRuleTargetConfig{{Direct: true}}}}},
+		{name: "target without kind", pools: []ProxyPoolConfig{validPool}, rules: []ProxyRuleConfig{{Name: "rule", Targets: []ProxyRuleTargetConfig{{Priority: 1}}}}},
+		{name: "target with two kinds", pools: []ProxyPoolConfig{validPool}, rules: []ProxyRuleConfig{{Name: "rule", Targets: []ProxyRuleTargetConfig{{Pool: "one", Direct: true}}}}},
+		{name: "duplicate pool target", pools: []ProxyPoolConfig{validPool}, rules: []ProxyRuleConfig{{Name: "rule", Targets: []ProxyRuleTargetConfig{{Pool: "one"}, {Pool: "ONE"}}}}},
+		{name: "duplicate direct target", pools: []ProxyPoolConfig{validPool}, rules: []ProxyRuleConfig{{Name: "rule", Targets: []ProxyRuleTargetConfig{{Direct: true}, {Direct: true}}}}},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -156,6 +165,35 @@ func TestMatchProxyRuleUsesFirstMatch(t *testing.T) {
 	}
 }
 
+func TestNormalizeProxyRuleTargetsAndMatchFirstRule(t *testing.T) {
+	pools := []ProxyPoolConfig{
+		{Name: "primary", Entries: []ProxyPoolEntryConfig{{ID: "node", URLTemplate: "http://primary.example:8080"}}},
+		{Name: "backup", Entries: []ProxyPoolEntryConfig{{ID: "node", URLTemplate: "http://backup.example:8080"}}},
+		{Name: "direct", Entries: []ProxyPoolEntryConfig{{ID: "node", URLTemplate: "http://named-direct.example:8080"}}},
+	}
+	_, rules, errNormalize := NormalizeProxyConfiguration(pools, []ProxyRuleConfig{{
+		Name: "route",
+		Targets: []ProxyRuleTargetConfig{
+			{Pool: " PRIMARY ", Priority: 10},
+			{Pool: "backup", Priority: 5},
+			{Pool: "direct", Priority: 1},
+			{Direct: true},
+		},
+		Providers: []string{"codex"},
+	}})
+	if errNormalize != nil {
+		t.Fatalf("NormalizeProxyConfiguration() error = %v", errNormalize)
+	}
+	targets, matched := MatchProxyRuleTargets(rules, "CODEX", 0)
+	if !matched || len(targets) != 4 || targets[0].Pool != "primary" || targets[1].Pool != "backup" || targets[2].Pool != "direct" || !targets[3].Direct {
+		t.Fatalf("matched targets = %#v, matched=%t", targets, matched)
+	}
+	targets[0].Pool = "mutated"
+	if rules[0].Targets[0].Pool != "primary" {
+		t.Fatal("MatchProxyRuleTargets returned shared storage")
+	}
+}
+
 func TestLoadConfigNormalizesProxyConfiguration(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.yaml")
 	raw := `
@@ -187,8 +225,8 @@ proxy-rules:
 	if got := cfg.ProxyPools[0].Entries[0].Ports; got != "3334,3336-3338" {
 		t.Fatalf("ports = %q", got)
 	}
-	if got := cfg.ProxyRules[0].Pool; got != "residential" {
-		t.Fatalf("rule pool = %q", got)
+	if got := cfg.ProxyRules[0].Targets; len(got) != 1 || got[0].Pool != "residential" {
+		t.Fatalf("rule targets = %#v", got)
 	}
 	if got, matched := MatchProxyRule(cfg.ProxyRules, "chatgpt-web", 0); !matched || got != "residential" {
 		t.Fatalf("normalized first match = %q, %t", got, matched)

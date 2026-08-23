@@ -66,6 +66,8 @@ const attemptCleanupInterval = 1 * time.Hour
 // attemptMaxIdleTime controls how long an IP can be idle before cleanup
 const attemptMaxIdleTime = 2 * time.Hour
 
+const managementResponseFieldsKey = "management_response_fields"
+
 // Handler aggregates config reference, persistence path and helpers.
 type Handler struct {
 	cfg                     *config.Config
@@ -785,6 +787,13 @@ func (h *Handler) persistLocked(c *gin.Context) bool {
 	}
 	h.configSnapshot.Store(publishedCandidate)
 	response := gin.H{"status": "ok", "applied": result.Applied}
+	if rawFields, exists := c.Get(managementResponseFieldsKey); exists {
+		if fields, ok := rawFields.(gin.H); ok {
+			for key, value := range fields {
+				response[key] = value
+			}
+		}
+	}
 	if result.RestartRequired {
 		response["restart_required"] = true
 		response["restart_fields"] = result.RestartFields

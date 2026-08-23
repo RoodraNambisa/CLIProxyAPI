@@ -29,6 +29,7 @@ func TestProxyPoolManagementReturnsSecretsAndMigratesRuleOnRename(t *testing.T) 
 	router.GET("/proxy-pools", h.GetProxyPools)
 	router.PATCH("/proxy-pools/:name", h.PatchProxyPool)
 	router.PUT("/proxy-rules", h.PutProxyRules)
+	router.GET("/proxy-rules", h.GetProxyRules)
 
 	create := performProxyConfigRequest(router, http.MethodPost, "/proxy-pools", `{
 		"name":"residential",
@@ -71,16 +72,23 @@ func TestProxyPoolManagementReturnsSecretsAndMigratesRuleOnRename(t *testing.T) 
 		t.Fatalf("entry delete result = %#v", cfg.ProxyPools[0].Entries)
 	}
 
-	rules := performProxyConfigRequest(router, http.MethodPut, "/proxy-rules", `[{"name":"web","pool":"residential","providers":["chatgpt-web"]}]`)
+	rules := performProxyConfigRequest(router, http.MethodPut, "/proxy-rules", `[{"name":"web","targets":[{"pool":"residential","priority":10},{"direct":true}],"providers":["chatgpt-web"]}]`)
 	if rules.Code != http.StatusOK {
 		t.Fatalf("put rules status = %d; body=%s", rules.Code, rules.Body.String())
+	}
+	if !strings.Contains(rules.Body.String(), `"schema_version":2`) || !strings.Contains(rules.Body.String(), `"proxy-rules"`) {
+		t.Fatalf("put rules v2 response = %s", rules.Body.String())
 	}
 	rename := performProxyConfigRequest(router, http.MethodPatch, "/proxy-pools/residential", `{"name":"primary"}`)
 	if rename.Code != http.StatusOK {
 		t.Fatalf("rename status = %d; body=%s", rename.Code, rename.Body.String())
 	}
-	if got := cfg.ProxyRules[0].Pool; got != "primary" {
-		t.Fatalf("rule pool after rename = %q, want primary", got)
+	if got := cfg.ProxyRules[0].Targets; len(got) != 2 || got[0].Pool != "primary" || !got[1].Direct {
+		t.Fatalf("rule targets after rename = %#v, want primary", got)
+	}
+	getRules := performProxyConfigRequest(router, http.MethodGet, "/proxy-rules", "")
+	if getRules.Code != http.StatusOK || !strings.Contains(getRules.Body.String(), `"schema_version":2`) || !strings.Contains(getRules.Body.String(), `"targets"`) {
+		t.Fatalf("v2 rules response = %d %s", getRules.Code, getRules.Body.String())
 	}
 }
 
@@ -113,6 +121,21 @@ func TestProxyPoolManagementPatchesSpreadBindings(t *testing.T) {
 	get := performProxyConfigRequest(router, http.MethodGet, "/proxy-pools", "")
 	if get.Code != http.StatusOK || strings.Contains(get.Body.String(), `"spread-bindings":true`) {
 		t.Fatalf("get spread pool response = %d %s", get.Code, get.Body.String())
+	}
+}
+
+func TestPutProxyRulesRejectsUnsupportedSchemaVersion(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	if errWrite := os.WriteFile(configPath, []byte("proxy-pools: []\nproxy-rules: []\n"), 0o600); errWrite != nil {
+		t.Fatalf("write config: %v", errWrite)
+	}
+	h := NewHandler(&config.Config{}, configPath, nil)
+	router := gin.New()
+	router.PUT("/proxy-rules", h.PutProxyRules)
+	response := performProxyConfigRequest(router, http.MethodPut, "/proxy-rules", `{"schema_version":3,"value":[]}`)
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body=%s", response.Code, response.Body.String())
 	}
 }
 
@@ -387,7 +410,7 @@ proxy-rules:
 	if string(persisted) != rawConfig {
 		t.Fatalf("rollback changed original YAML:\n%s\nwant:\n%s", persisted, rawConfig)
 	}
-	if cfg.ProxyPools[0].Name != "residential" || cfg.ProxyRules[0].Pool != "residential" {
+	if cfg.ProxyPools[0].Name != "residential" || len(cfg.ProxyRules[0].Targets) != 1 || cfg.ProxyRules[0].Targets[0].Pool != "residential" {
 		t.Fatalf("in-memory rename was not rolled back: %#v %#v", cfg.ProxyPools, cfg.ProxyRules)
 	}
 	statuses := proxyRuntime.PoolStatuses()
@@ -422,7 +445,7 @@ func TestDeleteProxyPoolRejectsReferencedPool(t *testing.T) {
 	}
 	cfg := &config.Config{SDKConfig: config.SDKConfig{
 		ProxyPools: []config.ProxyPoolConfig{{Name: "pool", Entries: []config.ProxyPoolEntryConfig{{ID: "node", URLTemplate: "http://proxy.example:8080"}}}},
-		ProxyRules: []config.ProxyRuleConfig{{Name: "rule", Pool: "pool"}},
+		ProxyRules: []config.ProxyRuleConfig{{Name: "rule", Targets: []config.ProxyRuleTargetConfig{{Pool: "pool"}, {Direct: true}}}},
 	}}
 	h := NewHandler(cfg, configPath, nil)
 	router := gin.New()

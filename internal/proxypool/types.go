@@ -11,15 +11,16 @@ import (
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 )
 
-const bindingStateVersion = 1
+const bindingStateVersion = 2
 
 // Binding stores the stable logical node selected for one credential.
 type Binding struct {
 	ID                string    `json:"id"`
 	AuthID            string    `json:"auth_id"`
 	CredentialUID     string    `json:"credential_uid,omitempty"`
-	Pool              string    `json:"pool"`
-	Entry             string    `json:"entry"`
+	Pool              string    `json:"pool,omitempty"`
+	Entry             string    `json:"entry,omitempty"`
+	Direct            bool      `json:"direct,omitempty"`
 	Port              int       `json:"port,omitempty"`
 	PlaceholderValues []string  `json:"placeholder_values,omitempty"`
 	BoundAt           time.Time `json:"bound_at"`
@@ -63,8 +64,9 @@ type BindingStatus struct {
 	AuthID        string     `json:"auth_id"`
 	AuthIndex     string     `json:"auth_index,omitempty"`
 	Provider      string     `json:"provider,omitempty"`
-	Pool          string     `json:"pool"`
-	Entry         string     `json:"entry"`
+	Pool          string     `json:"pool,omitempty"`
+	Entry         string     `json:"entry,omitempty"`
+	Direct        bool       `json:"direct,omitempty"`
 	Port          int        `json:"port,omitempty"`
 	BindingID     string     `json:"binding_id"`
 	ProxyURL      string     `json:"proxy_url"`

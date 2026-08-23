@@ -80,22 +80,23 @@ type Manager struct {
 	configMu sync.RWMutex
 	probeSeq atomic.Uint64
 
-	mu         sync.RWMutex
-	bindings   map[string]Binding
-	health     map[string]nodeHealth
-	reserved   map[string]Binding
-	auths      AuthSource
-	leaseMu    sync.RWMutex
-	leases     map[string]int
-	persistMu  sync.Mutex
-	bindLocks  sync.Map
-	checkLocks sync.Map
-	statePath  string
-	random     io.Reader
-	now        func() time.Time
-	check      traceChecker
-	syncDir    func(string) error
-	admission  *checkAdmission
+	mu             sync.RWMutex
+	bindings       map[string]Binding
+	health         map[string]nodeHealth
+	reserved       map[string]Binding
+	targetReserved map[string]int
+	auths          AuthSource
+	leaseMu        sync.RWMutex
+	leases         map[string]int
+	persistMu      sync.Mutex
+	bindLocks      sync.Map
+	checkLocks     sync.Map
+	statePath      string
+	random         io.Reader
+	now            func() time.Time
+	check          traceChecker
+	syncDir        func(string) error
+	admission      *checkAdmission
 
 	lifecycleMu sync.Mutex
 	cancel      context.CancelFunc
@@ -116,19 +117,20 @@ type Manager struct {
 // NewManager creates a proxy-pool runtime and restores stable bindings.
 func NewManager(configPath string, cfg *internalconfig.Config) (*Manager, error) {
 	m := &Manager{
-		bindings:   make(map[string]Binding),
-		health:     make(map[string]nodeHealth),
-		reserved:   make(map[string]Binding),
-		leases:     make(map[string]int),
-		statePath:  bindingStatePath(configPath),
-		random:     rand.Reader,
-		now:        time.Now,
-		syncDir:    syncProxyBindingDirectory,
-		admission:  newCheckAdmission(internalconfig.DefaultProxyHealthCheckConcurrency),
-		wake:       make(chan struct{}, 1),
-		rounds:     make(map[string]poolRoundState),
-		checkTasks: make(map[string]*checkTaskState),
-		taskByPool: make(map[string]string),
+		bindings:       make(map[string]Binding),
+		health:         make(map[string]nodeHealth),
+		reserved:       make(map[string]Binding),
+		targetReserved: make(map[string]int),
+		leases:         make(map[string]int),
+		statePath:      bindingStatePath(configPath),
+		random:         rand.Reader,
+		now:            time.Now,
+		syncDir:        syncProxyBindingDirectory,
+		admission:      newCheckAdmission(internalconfig.DefaultProxyHealthCheckConcurrency),
+		wake:           make(chan struct{}, 1),
+		rounds:         make(map[string]poolRoundState),
+		checkTasks:     make(map[string]*checkTaskState),
+		taskByPool:     make(map[string]string),
 	}
 	if errLoad := m.loadBindings(); errLoad != nil {
 		return nil, errLoad
@@ -418,6 +420,7 @@ func cloneRules(rules []internalconfig.ProxyRuleConfig) []internalconfig.ProxyRu
 	out := make([]internalconfig.ProxyRuleConfig, len(rules))
 	for index := range rules {
 		out[index] = rules[index]
+		out[index].Targets = append([]internalconfig.ProxyRuleTargetConfig(nil), rules[index].Targets...)
 		out[index].Providers = append([]string(nil), rules[index].Providers...)
 		out[index].Priorities = append([]int(nil), rules[index].Priorities...)
 	}
@@ -448,7 +451,7 @@ func (m *Manager) Resolve(ctx context.Context, auth *coreauth.Auth) (coreauth.Re
 		return coreauth.ResolvedProxy{}, nil
 	}
 	if strings.EqualFold(strings.TrimSpace(auth.Provider), "aistudio") {
-		return m.resolveAIStudioRelayProxy(auth)
+		return m.resolveAIStudioRelayProxy(ctx, auth)
 	}
 	if explicit := strings.TrimSpace(auth.ProxyURL); explicit != "" {
 		if _, errParse := proxyutil.Parse(explicit); errParse != nil {
@@ -469,14 +472,14 @@ func (m *Manager) Resolve(ctx context.Context, auth *coreauth.Auth) (coreauth.Re
 		if snapshot == nil {
 			return coreauth.ResolvedProxy{}, nil
 		}
-		poolName, matched := internalconfig.MatchProxyRule(snapshot.rules, auth.Provider, authPriority(auth))
+		targets, matched := internalconfig.MatchProxyRuleTargets(snapshot.rules, auth.Provider, authPriority(auth))
 		if !matched {
 			if snapshot.globalURL != "" {
 				return coreauth.ResolvedProxy{URL: snapshot.globalURL, Source: "global"}, nil
 			}
 			return coreauth.ResolvedProxy{Source: "inherit"}, nil
 		}
-		resolved, errResolve := m.resolvePoolBinding(ctx, snapshot, auth.ID, coreauth.ChatGPTWebCredentialUID(auth), poolName, false)
+		resolved, errResolve := m.resolveRuleBinding(ctx, snapshot, auth.ID, coreauth.ChatGPTWebCredentialUID(auth), targets, false)
 		if errors.Is(errResolve, errProxyConfigurationChanged) {
 			continue
 		}
@@ -543,7 +546,7 @@ func (m *Manager) resolveExistingBinding(ctx context.Context, authID, credential
 	}
 }
 
-func (m *Manager) resolveAIStudioRelayProxy(auth *coreauth.Auth) (coreauth.ResolvedProxy, error) {
+func (m *Manager) resolveAIStudioRelayProxy(ctx context.Context, auth *coreauth.Auth) (coreauth.ResolvedProxy, error) {
 	if auth == nil {
 		return coreauth.ResolvedProxy{}, nil
 	}
@@ -558,9 +561,19 @@ func (m *Manager) resolveAIStudioRelayProxy(auth *coreauth.Auth) (coreauth.Resol
 	if snapshot == nil {
 		return coreauth.ResolvedProxy{}, nil
 	}
-	poolName, matched := internalconfig.MatchProxyRule(snapshot.rules, auth.Provider, authPriority(auth))
+	targets, matched := internalconfig.MatchProxyRuleTargets(snapshot.rules, auth.Provider, authPriority(auth))
 	if matched {
-		return coreauth.ResolvedProxy{}, &UnavailableError{Pool: poolName}
+		for _, target := range targets {
+			if target.Direct {
+				unlock, errLock := m.lockBinding(ctx, auth.ID)
+				if errLock != nil {
+					return coreauth.ResolvedProxy{}, errLock
+				}
+				defer unlock()
+				return m.resolveRuleBinding(ctx, snapshot, auth.ID, coreauth.ChatGPTWebCredentialUID(auth), []internalconfig.ProxyRuleTargetConfig{target}, false)
+			}
+		}
+		return coreauth.ResolvedProxy{}, &UnavailableError{Pool: firstTargetPool(targets)}
 	}
 	if snapshot.globalURL != "" {
 		setting, errParse := proxyutil.Parse(snapshot.globalURL)
@@ -590,6 +603,186 @@ func (m *Manager) lockBinding(ctx context.Context, authID string) (func(), error
 	case <-lock.semaphore:
 		return func() { lock.semaphore <- struct{}{} }, nil
 	}
+}
+
+func firstTargetPool(targets []internalconfig.ProxyRuleTargetConfig) string {
+	for _, target := range targets {
+		if target.Pool != "" {
+			return target.Pool
+		}
+	}
+	return "direct"
+}
+
+func proxyRuleTargetKey(target internalconfig.ProxyRuleTargetConfig) string {
+	if target.Direct {
+		return "direct"
+	}
+	return "pool:" + strings.ToLower(strings.TrimSpace(target.Pool))
+}
+
+func bindingMatchesRuleTarget(binding Binding, target internalconfig.ProxyRuleTargetConfig) bool {
+	if target.Direct {
+		return binding.Direct
+	}
+	return !binding.Direct && strings.EqualFold(strings.TrimSpace(binding.Pool), strings.TrimSpace(target.Pool))
+}
+
+func bindingMatchesRuleTargets(binding Binding, targets []internalconfig.ProxyRuleTargetConfig) bool {
+	for _, target := range targets {
+		if bindingMatchesRuleTarget(binding, target) {
+			return true
+		}
+	}
+	return false
+}
+
+func (m *Manager) resolveRuleBinding(ctx context.Context, snapshot *configSnapshot, authID, credentialUID string, targets []internalconfig.ProxyRuleTargetConfig, force bool) (coreauth.ResolvedProxy, error) {
+	if ctx != nil && ctx.Err() != nil {
+		return coreauth.ResolvedProxy{}, ctx.Err()
+	}
+	credentialUID = strings.TrimSpace(credentialUID)
+	attempted := make(map[string]struct{}, len(targets))
+	m.mu.RLock()
+	current, hasCurrent := m.bindings[authID]
+	m.mu.RUnlock()
+	if hasCurrent && bindingCredentialGenerationMatches(current.CredentialUID, credentialUID) && bindingMatchesRuleTargets(current, targets) && !force {
+		if current.Direct {
+			if credentialUID != "" && strings.TrimSpace(current.CredentialUID) == "" {
+				current.CredentialUID = credentialUID
+				if errSave := m.saveBindingForSnapshot(snapshot, current); errSave != nil {
+					return coreauth.ResolvedProxy{}, errSave
+				}
+			}
+			return resolvedProxy(current, "direct"), nil
+		}
+		resolved, errResolve := m.resolvePoolBinding(ctx, snapshot, authID, credentialUID, current.Pool, false)
+		if errResolve == nil || errors.Is(errResolve, errProxyConfigurationChanged) {
+			return resolved, errResolve
+		}
+		if ctx != nil && ctx.Err() != nil {
+			return coreauth.ResolvedProxy{}, ctx.Err()
+		}
+		attempted["pool:"+strings.ToLower(strings.TrimSpace(current.Pool))] = struct{}{}
+	}
+
+	var (
+		earliestRetry time.Time
+		lastErr       error
+	)
+	for len(attempted) < len(targets) {
+		if ctx != nil && ctx.Err() != nil {
+			return coreauth.ResolvedProxy{}, ctx.Err()
+		}
+		target, release, ok := m.reserveBestRuleTarget(snapshot, targets, attempted)
+		if !ok {
+			break
+		}
+		key := proxyRuleTargetKey(target)
+		attempted[key] = struct{}{}
+		if ctx != nil && ctx.Err() != nil {
+			release()
+			return coreauth.ResolvedProxy{}, ctx.Err()
+		}
+		var (
+			resolved   coreauth.ResolvedProxy
+			errResolve error
+		)
+		if target.Direct {
+			resolved, errResolve = m.resolveDirectBinding(snapshot, authID, credentialUID)
+		} else {
+			resolved, errResolve = m.resolvePoolBinding(ctx, snapshot, authID, credentialUID, target.Pool, force)
+		}
+		release()
+		if errResolve == nil || errors.Is(errResolve, errProxyConfigurationChanged) {
+			return resolved, errResolve
+		}
+		if ctx != nil && ctx.Err() != nil {
+			return coreauth.ResolvedProxy{}, ctx.Err()
+		}
+		lastErr = errResolve
+		var unavailable *UnavailableError
+		if errors.As(errResolve, &unavailable) && !unavailable.RetryTime.IsZero() && (earliestRetry.IsZero() || unavailable.RetryTime.Before(earliestRetry)) {
+			earliestRetry = unavailable.RetryTime
+		}
+	}
+	return coreauth.ResolvedProxy{}, &UnavailableError{Pool: firstTargetPool(targets), RetryTime: earliestRetry, Cause: lastErr}
+}
+
+func (m *Manager) reserveBestRuleTarget(snapshot *configSnapshot, targets []internalconfig.ProxyRuleTargetConfig, attempted map[string]struct{}) (internalconfig.ProxyRuleTargetConfig, func(), bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	bestIndex := -1
+	bestPriority := 0
+	bestUsed := 0
+	bestCapacity := 1
+	bestKey := ""
+	for index, target := range targets {
+		key := proxyRuleTargetKey(target)
+		if _, seen := attempted[key]; seen {
+			continue
+		}
+		capacity := 1
+		if !target.Direct {
+			pool, exists := snapshot.pools[strings.ToLower(strings.TrimSpace(target.Pool))]
+			if !exists {
+				continue
+			}
+			capacity = poolCandidateCount(pool)
+			if capacity < 1 {
+				continue
+			}
+		}
+		used := m.targetReserved[key]
+		for _, binding := range m.bindings {
+			if bindingMatchesRuleTarget(binding, target) {
+				used++
+			}
+		}
+		if bestIndex < 0 || target.Priority > bestPriority || target.Priority == bestPriority && (int64(used)*int64(bestCapacity) < int64(bestUsed)*int64(capacity) || int64(used)*int64(bestCapacity) == int64(bestUsed)*int64(capacity) && key < bestKey) {
+			bestIndex = index
+			bestPriority = target.Priority
+			bestUsed = used
+			bestCapacity = capacity
+			bestKey = key
+		}
+	}
+	if bestIndex < 0 {
+		return internalconfig.ProxyRuleTargetConfig{}, func() {}, false
+	}
+	target := targets[bestIndex]
+	key := proxyRuleTargetKey(target)
+	m.targetReserved[key]++
+	var once sync.Once
+	return target, func() {
+		once.Do(func() {
+			m.mu.Lock()
+			if m.targetReserved[key] <= 1 {
+				delete(m.targetReserved, key)
+			} else {
+				m.targetReserved[key]--
+			}
+			m.mu.Unlock()
+		})
+	}, true
+}
+
+func (m *Manager) resolveDirectBinding(snapshot *configSnapshot, authID, credentialUID string) (coreauth.ResolvedProxy, error) {
+	bindingID, errID := randomBindingID(m.random)
+	if errID != nil {
+		return coreauth.ResolvedProxy{}, errID
+	}
+	binding := Binding{
+		ID:            bindingID,
+		AuthID:        authID,
+		CredentialUID: strings.TrimSpace(credentialUID),
+		Direct:        true,
+		BoundAt:       m.now().UTC(),
+	}
+	if errSave := m.saveBindingForSnapshot(snapshot, binding); errSave != nil {
+		return coreauth.ResolvedProxy{}, errSave
+	}
+	return resolvedProxy(binding, "direct"), nil
 }
 
 func (m *Manager) resolvePoolBinding(ctx context.Context, snapshot *configSnapshot, authID, credentialUID, poolName string, force bool) (coreauth.ResolvedProxy, error) {
@@ -651,6 +844,9 @@ func (m *Manager) resolvePoolBinding(ctx context.Context, snapshot *configSnapsh
 }
 
 func resolvedProxy(binding Binding, resolvedURL string) coreauth.ResolvedProxy {
+	if binding.Direct {
+		return coreauth.ResolvedProxy{URL: "direct", Source: "direct"}
+	}
 	return coreauth.ResolvedProxy{URL: resolvedURL, Source: "pool", BindingID: binding.ID}
 }
 
@@ -682,6 +878,9 @@ func resolveBindingURL(pool runtimePool, binding Binding) (string, bool) {
 func (m *Manager) bindingUsable(ctx context.Context, snapshot *configSnapshot, binding Binding, resolvedURL string) (bool, error) {
 	if ctx != nil && ctx.Err() != nil {
 		return false, ctx.Err()
+	}
+	if binding.Direct {
+		return true, nil
 	}
 	m.mu.RLock()
 	health, known := m.health[binding.ID]
@@ -1290,6 +1489,9 @@ func isAmbiguousProxyInfrastructureError(err error) bool {
 }
 
 func (m *Manager) bindingURL(snapshot *configSnapshot, binding Binding) (string, bool) {
+	if binding.Direct {
+		return "direct", true
+	}
 	pool, exists := snapshot.pools[strings.ToLower(binding.Pool)]
 	if !exists {
 		return "", false
@@ -1366,7 +1568,7 @@ func (m *Manager) loadBindings() error {
 	if errDecode := json.Unmarshal(data, &state); errDecode != nil {
 		return fmt.Errorf("decode proxy bindings: %w", errDecode)
 	}
-	if state.Version != bindingStateVersion {
+	if state.Version != 1 && state.Version != bindingStateVersion {
 		return fmt.Errorf("unsupported proxy binding state version %d", state.Version)
 	}
 	for authID, binding := range state.Bindings {
@@ -1374,7 +1576,7 @@ func (m *Manager) loadBindings() error {
 		if binding.AuthID == "" {
 			binding.AuthID = strings.TrimSpace(authID)
 		}
-		if binding.AuthID == "" || binding.ID == "" || binding.Pool == "" || binding.Entry == "" {
+		if binding.AuthID == "" || binding.ID == "" || (!binding.Direct && (binding.Pool == "" || binding.Entry == "")) {
 			continue
 		}
 		m.bindings[binding.AuthID] = cloneBinding(binding)

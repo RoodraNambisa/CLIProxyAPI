@@ -96,12 +96,20 @@ type ProxyHealthCheckEndpointConfig struct {
 	Mode string `yaml:"mode,omitempty" json:"mode,omitempty"`
 }
 
-// ProxyRuleConfig routes matching credentials through a named proxy pool.
+// ProxyRuleTargetConfig defines one ordered proxy target candidate.
+type ProxyRuleTargetConfig struct {
+	Pool     string `yaml:"pool,omitempty" json:"pool,omitempty"`
+	Direct   bool   `yaml:"direct,omitempty" json:"direct,omitempty"`
+	Priority int    `yaml:"priority,omitempty" json:"priority,omitempty"`
+}
+
+// ProxyRuleConfig routes matching credentials through one or more targets.
 type ProxyRuleConfig struct {
-	Name       string   `yaml:"name" json:"name"`
-	Pool       string   `yaml:"pool" json:"pool"`
-	Providers  []string `yaml:"providers,omitempty" json:"providers,omitempty"`
-	Priorities []int    `yaml:"priorities,omitempty" json:"priorities,omitempty"`
+	Name       string                  `yaml:"name" json:"name"`
+	Pool       string                  `yaml:"pool,omitempty" json:"pool,omitempty"`
+	Targets    []ProxyRuleTargetConfig `yaml:"targets,omitempty" json:"targets,omitempty"`
+	Providers  []string                `yaml:"providers,omitempty" json:"providers,omitempty"`
+	Priorities []int                   `yaml:"priorities,omitempty" json:"priorities,omitempty"`
 }
 
 // APIKeyGroup restricts one configured API key to a set of runtime provider IDs.

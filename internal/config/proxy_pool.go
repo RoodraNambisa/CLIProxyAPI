@@ -108,12 +108,43 @@ func NormalizeProxyConfiguration(pools []ProxyPoolConfig, rules []ProxyRuleConfi
 			return nil, nil, fmt.Errorf("proxy-rules contains duplicate name %q", rule.Name)
 		}
 		ruleNames[ruleKey] = struct{}{}
-		poolKey := strings.ToLower(strings.TrimSpace(rule.Pool))
-		canonicalPool, exists := poolNames[poolKey]
-		if !exists {
-			return nil, nil, fmt.Errorf("proxy-rules[%d] references unknown pool %q", index, rule.Pool)
+		legacyPool := strings.TrimSpace(rule.Pool)
+		if legacyPool != "" && len(rule.Targets) > 0 {
+			return nil, nil, fmt.Errorf("proxy-rules[%d] cannot configure both pool and targets", index)
 		}
-		rule.Pool = canonicalPool
+		if legacyPool != "" {
+			rule.Targets = []ProxyRuleTargetConfig{{Pool: legacyPool}}
+		}
+		if len(rule.Targets) == 0 {
+			return nil, nil, fmt.Errorf("proxy-rules[%d].targets cannot be empty", index)
+		}
+		targets := make([]ProxyRuleTargetConfig, 0, len(rule.Targets))
+		seenTargets := make(map[string]struct{}, len(rule.Targets))
+		for targetIndex, rawTarget := range rule.Targets {
+			target := rawTarget
+			target.Pool = strings.TrimSpace(target.Pool)
+			if (target.Pool == "") == !target.Direct {
+				return nil, nil, fmt.Errorf("proxy-rules[%d].targets[%d] must specify exactly one of pool or direct", index, targetIndex)
+			}
+			key := "direct"
+			if target.Pool != "" {
+				poolKey := strings.ToLower(target.Pool)
+				canonicalPool, exists := poolNames[poolKey]
+				if !exists {
+					return nil, nil, fmt.Errorf("proxy-rules[%d].targets[%d] references unknown pool %q", index, targetIndex, target.Pool)
+				}
+				target.Pool = canonicalPool
+				target.Direct = false
+				key = "pool:" + poolKey
+			}
+			if _, duplicate := seenTargets[key]; duplicate {
+				return nil, nil, fmt.Errorf("proxy-rules[%d] contains duplicate target %q", index, key)
+			}
+			seenTargets[key] = struct{}{}
+			targets = append(targets, target)
+		}
+		rule.Pool = ""
+		rule.Targets = targets
 		rawProviderCount := len(rule.Providers)
 		rule.Providers = normalizeLowerStrings(rule.Providers)
 		if rawProviderCount > 0 && len(rule.Providers) == 0 {
@@ -219,8 +250,8 @@ func NormalizeProxyHealthCheckConfiguration(raw ProxyHealthCheckConfig) (ProxyHe
 	return config, nil
 }
 
-// MatchProxyRule returns the first configured pool matching provider and priority.
-func MatchProxyRule(rules []ProxyRuleConfig, provider string, priority int) (string, bool) {
+// MatchProxyRuleTargets returns the first rule's normalized target list.
+func MatchProxyRuleTargets(rules []ProxyRuleConfig, provider string, priority int) ([]ProxyRuleTargetConfig, bool) {
 	provider = strings.ToLower(strings.TrimSpace(provider))
 	for _, rule := range rules {
 		if len(rule.Providers) > 0 && !containsString(rule.Providers, provider) {
@@ -229,7 +260,25 @@ func MatchProxyRule(rules []ProxyRuleConfig, provider string, priority int) (str
 		if len(rule.Priorities) > 0 && !containsInt(rule.Priorities, priority) {
 			continue
 		}
-		return rule.Pool, true
+		targets := append([]ProxyRuleTargetConfig(nil), rule.Targets...)
+		if len(targets) == 0 && strings.TrimSpace(rule.Pool) != "" {
+			targets = []ProxyRuleTargetConfig{{Pool: strings.TrimSpace(rule.Pool)}}
+		}
+		return targets, len(targets) > 0
+	}
+	return nil, false
+}
+
+// MatchProxyRule returns the first configured physical pool for legacy callers.
+func MatchProxyRule(rules []ProxyRuleConfig, provider string, priority int) (string, bool) {
+	targets, matched := MatchProxyRuleTargets(rules, provider, priority)
+	if !matched {
+		return "", false
+	}
+	for _, target := range targets {
+		if target.Pool != "" {
+			return target.Pool, true
+		}
 	}
 	return "", false
 }

@@ -153,6 +153,11 @@ func (h *Handler) PatchProxyPool(c *gin.Context) {
 	rules := cloneProxyRules(h.cfg.ProxyRules)
 	if body.Name != nil && !strings.EqualFold(strings.TrimSpace(oldName), strings.TrimSpace(*body.Name)) {
 		for ruleIndex := range rules {
+			for targetIndex := range rules[ruleIndex].Targets {
+				if strings.EqualFold(strings.TrimSpace(rules[ruleIndex].Targets[targetIndex].Pool), strings.TrimSpace(oldName)) {
+					rules[ruleIndex].Targets[targetIndex].Pool = *body.Name
+				}
+			}
 			if strings.EqualFold(strings.TrimSpace(rules[ruleIndex].Pool), strings.TrimSpace(oldName)) {
 				rules[ruleIndex].Pool = *body.Name
 			}
@@ -265,7 +270,7 @@ func (h *Handler) DeleteProxyPool(c *gin.Context) {
 	}
 	poolName := h.cfg.ProxyPools[index].Name
 	for _, rule := range h.cfg.ProxyRules {
-		if strings.EqualFold(strings.TrimSpace(rule.Pool), strings.TrimSpace(poolName)) {
+		if proxyRuleReferencesPool(rule, poolName) {
 			h.mu.Unlock()
 			c.JSON(http.StatusConflict, gin.H{"error": "proxy pool is referenced by a proxy rule"})
 			return
@@ -285,7 +290,7 @@ func (h *Handler) GetProxyRules(c *gin.Context) {
 	if cfg := h.currentConfig(); cfg != nil {
 		rules = cloneProxyRules(cfg.ProxyRules)
 	}
-	c.JSON(http.StatusOK, gin.H{"proxy-rules": rules})
+	c.JSON(http.StatusOK, gin.H{"schema_version": 2, "proxy-rules": rules})
 }
 
 // PutProxyRules replaces the complete ordered proxy rule list.
@@ -305,6 +310,10 @@ func (h *Handler) PutProxyRules(c *gin.Context) {
 	previousRules := h.cfg.ProxyRules
 	h.cfg.ProxyPools = normalizedPools
 	h.cfg.ProxyRules = normalizedRules
+	c.Set(managementResponseFieldsKey, gin.H{
+		"schema_version": 2,
+		"proxy-rules":    cloneProxyRules(normalizedRules),
+	})
 	if !h.persistLocked(c) {
 		h.cfg.ProxyPools = previousPools
 		h.cfg.ProxyRules = previousRules
@@ -343,12 +352,17 @@ func parseProxyRulesBody(c *gin.Context) ([]config.ProxyRuleConfig, bool) {
 		return rules, true
 	}
 	var wrapped struct {
-		Items      []config.ProxyRuleConfig `json:"items"`
-		Value      []config.ProxyRuleConfig `json:"value"`
-		ProxyRules []config.ProxyRuleConfig `json:"proxy-rules"`
+		SchemaVersion *int                     `json:"schema_version"`
+		Items         []config.ProxyRuleConfig `json:"items"`
+		Value         []config.ProxyRuleConfig `json:"value"`
+		ProxyRules    []config.ProxyRuleConfig `json:"proxy-rules"`
 	}
 	if errWrapped := json.Unmarshal(data, &wrapped); errWrapped != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
+		return nil, false
+	}
+	if wrapped.SchemaVersion != nil && *wrapped.SchemaVersion != 2 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "unsupported proxy rule schema version"})
 		return nil, false
 	}
 	switch {
@@ -373,10 +387,23 @@ func cloneProxyPools(input []config.ProxyPoolConfig) []config.ProxyPoolConfig {
 	return out
 }
 
+func proxyRuleReferencesPool(rule config.ProxyRuleConfig, poolName string) bool {
+	if strings.EqualFold(strings.TrimSpace(rule.Pool), strings.TrimSpace(poolName)) {
+		return true
+	}
+	for _, target := range rule.Targets {
+		if strings.EqualFold(strings.TrimSpace(target.Pool), strings.TrimSpace(poolName)) {
+			return true
+		}
+	}
+	return false
+}
+
 func cloneProxyRules(input []config.ProxyRuleConfig) []config.ProxyRuleConfig {
 	out := make([]config.ProxyRuleConfig, len(input))
 	for index := range input {
 		out[index] = input[index]
+		out[index].Targets = append([]config.ProxyRuleTargetConfig(nil), input[index].Targets...)
 		out[index].Providers = append([]string(nil), input[index].Providers...)
 		out[index].Priorities = append([]int(nil), input[index].Priorities...)
 	}

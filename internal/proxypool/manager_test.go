@@ -63,6 +63,24 @@ func TestResolvePersistsStableBindingWithoutExpandingPortRange(t *testing.T) {
 	}
 }
 
+func TestLoadBindingsAcceptsVersionOneState(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	statePath := bindingStatePath(configPath)
+	if errMkdir := os.MkdirAll(filepath.Dir(statePath), 0o700); errMkdir != nil {
+		t.Fatalf("MkdirAll(binding state): %v", errMkdir)
+	}
+	state := `{"version":1,"bindings":{"auth-a":{"id":"legacy-binding","auth_id":"auth-a","pool":"residential","entry":"home","port":3334,"bound_at":"2026-08-24T00:00:00Z"}}}`
+	if errWrite := os.WriteFile(statePath, []byte(state), 0o600); errWrite != nil {
+		t.Fatalf("WriteFile(binding state): %v", errWrite)
+	}
+	manager := newTestManager(t, configPath, proxyPoolTestConfig("3334"))
+	manager.check = successfulTrace
+	bindings := manager.SortedBindings()
+	if len(bindings) != 1 || bindings[0].ID != "legacy-binding" || bindings[0].Direct {
+		t.Fatalf("version one bindings = %#v", bindings)
+	}
+}
+
 func TestResolveSpreadBindingsUsesDistinctPortsWithoutRangeProbing(t *testing.T) {
 	t.Parallel()
 
@@ -94,6 +112,219 @@ func TestResolveSpreadBindingsUsesDistinctPortsWithoutRangeProbing(t *testing.T)
 	}
 	if got := manager.snapshot().pools["residential"].entries[0].ports.Count(); got != 10001 {
 		t.Fatalf("compact port count = %d, want 10001", got)
+	}
+}
+
+func TestResolveUsesHighestPriorityTargetAndFallsBack(t *testing.T) {
+	cfg := proxyMultiTargetTestConfig()
+	cfg.ProxyRules[0].Targets[0].Priority = 10
+	cfg.ProxyRules[0].Targets[1].Priority = 5
+	manager := newTestManager(t, filepath.Join(t.TempDir(), "config.yaml"), cfg)
+	manager.check = successfulTrace
+
+	resolved, errResolve := manager.Resolve(context.Background(), proxyPoolTestAuth("auth-primary"))
+	if errResolve != nil {
+		t.Fatalf("Resolve() error = %v", errResolve)
+	}
+	if !strings.Contains(resolved.URL, "primary.example") {
+		t.Fatalf("Resolve() URL = %q, want highest-priority target", resolved.URL)
+	}
+
+	fallback := newTestManager(t, filepath.Join(t.TempDir(), "fallback.yaml"), cfg)
+	fallback.check = func(_ context.Context, proxyURL string) TraceResult {
+		if strings.Contains(proxyURL, "primary.example") {
+			return TraceResult{CheckedAt: time.Now().UTC(), Error: "request_failed"}
+		}
+		return successfulTrace(context.Background(), proxyURL)
+	}
+	resolved, errResolve = fallback.Resolve(context.Background(), proxyPoolTestAuth("auth-fallback"))
+	if errResolve != nil {
+		t.Fatalf("fallback Resolve() error = %v", errResolve)
+	}
+	if !strings.Contains(resolved.URL, "backup.example") {
+		t.Fatalf("fallback URL = %q, want backup target", resolved.URL)
+	}
+}
+
+func TestResolveBalancesEqualPriorityTargetsAndKeepsStableBinding(t *testing.T) {
+	cfg := proxyMultiTargetTestConfig()
+	manager := newTestManager(t, filepath.Join(t.TempDir(), "config.yaml"), cfg)
+	manager.check = successfulTrace
+
+	first, errFirst := manager.Resolve(context.Background(), proxyPoolTestAuth("auth-a"))
+	if errFirst != nil {
+		t.Fatalf("first Resolve() error = %v", errFirst)
+	}
+	second, errSecond := manager.Resolve(context.Background(), proxyPoolTestAuth("auth-b"))
+	if errSecond != nil {
+		t.Fatalf("second Resolve() error = %v", errSecond)
+	}
+	if strings.Contains(first.URL, "primary.example") == strings.Contains(second.URL, "primary.example") {
+		t.Fatalf("equal-priority targets were not balanced: %q and %q", first.URL, second.URL)
+	}
+
+	cfg.ProxyRules[0].Targets[0].Priority = -10
+	cfg.ProxyRules[0].Targets[1].Priority = 10
+	if errUpdate := manager.UpdateConfig(cfg); errUpdate != nil {
+		t.Fatalf("UpdateConfig() error = %v", errUpdate)
+	}
+	stable, errStable := manager.Resolve(context.Background(), proxyPoolTestAuth("auth-a"))
+	if errStable != nil {
+		t.Fatalf("stable Resolve() error = %v", errStable)
+	}
+	if stable.URL != first.URL || stable.BindingID != first.BindingID {
+		t.Fatalf("priority update migrated healthy binding: got %+v, want %+v", stable, first)
+	}
+
+	remainingPool := "backup"
+	remainingHost := "backup.example"
+	if strings.Contains(first.URL, remainingHost) {
+		remainingPool = "primary"
+		remainingHost = "primary.example"
+	}
+	cfg.ProxyRules[0].Targets = []internalconfig.ProxyRuleTargetConfig{{Pool: remainingPool}}
+	if errUpdate := manager.UpdateConfig(cfg); errUpdate != nil {
+		t.Fatalf("UpdateConfig(remove target) error = %v", errUpdate)
+	}
+	reselected, errReselected := manager.Resolve(context.Background(), proxyPoolTestAuth("auth-a"))
+	if errReselected != nil {
+		t.Fatalf("Resolve(after target removal) error = %v", errReselected)
+	}
+	if !strings.Contains(reselected.URL, remainingHost) || reselected.BindingID == first.BindingID {
+		t.Fatalf("removed target retained stale binding: got %+v, previous %+v", reselected, first)
+	}
+}
+
+func TestResolveBalancesDirectWithEqualPriorityPool(t *testing.T) {
+	cfg := proxyPoolTestConfig("3334")
+	cfg.ProxyRules[0] = internalconfig.ProxyRuleConfig{
+		Name: "codex",
+		Targets: []internalconfig.ProxyRuleTargetConfig{
+			{Pool: "residential"},
+			{Direct: true},
+		},
+		Providers:  []string{"codex"},
+		Priorities: []int{0},
+	}
+	manager := newTestManager(t, filepath.Join(t.TempDir(), "config.yaml"), cfg)
+	manager.check = successfulTrace
+
+	first, errFirst := manager.Resolve(context.Background(), proxyPoolTestAuth("auth-a"))
+	if errFirst != nil {
+		t.Fatalf("first Resolve() error = %v", errFirst)
+	}
+	second, errSecond := manager.Resolve(context.Background(), proxyPoolTestAuth("auth-b"))
+	if errSecond != nil {
+		t.Fatalf("second Resolve() error = %v", errSecond)
+	}
+	if (first.URL == "direct") == (second.URL == "direct") {
+		t.Fatalf("direct and one-node pool were not balanced: %+v %+v", first, second)
+	}
+}
+
+func TestResolveEqualPriorityTargetReservationsBoundConcurrentSelection(t *testing.T) {
+	cfg := proxyMultiTargetTestConfig()
+	manager := newTestManager(t, filepath.Join(t.TempDir(), "config.yaml"), cfg)
+	started := make(chan string, 2)
+	release := make(chan struct{})
+	manager.check = func(_ context.Context, proxyURL string) TraceResult {
+		started <- proxyURL
+		<-release
+		return successfulTrace(context.Background(), proxyURL)
+	}
+	type result struct {
+		proxy coreauth.ResolvedProxy
+		err   error
+	}
+	results := make(chan result, 2)
+	for _, authID := range []string{"auth-a", "auth-b"} {
+		auth := proxyPoolTestAuth(authID)
+		go func() {
+			proxy, errResolve := manager.Resolve(context.Background(), auth)
+			results <- result{proxy: proxy, err: errResolve}
+		}()
+	}
+	firstURL := <-started
+	secondURL := <-started
+	close(release)
+	if strings.Contains(firstURL, "primary.example") == strings.Contains(secondURL, "primary.example") {
+		t.Fatalf("concurrent target reservations selected the same target: %q and %q", firstURL, secondURL)
+	}
+	for range 2 {
+		if result := <-results; result.err != nil {
+			t.Fatalf("Resolve() error = %v", result.err)
+		}
+	}
+}
+
+func TestResolveDirectTargetPersistsWithoutHealthOrFailureBinding(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	cfg := proxyPoolTestConfig("3334")
+	cfg.ProxyURL = "http://global.example:8080"
+	cfg.ProxyRules[0] = internalconfig.ProxyRuleConfig{
+		Name:       "direct",
+		Targets:    []internalconfig.ProxyRuleTargetConfig{{Direct: true, Priority: 10}, {Pool: "residential"}},
+		Providers:  []string{"codex"},
+		Priorities: []int{0},
+	}
+	manager := newTestManager(t, configPath, cfg)
+	var checks atomic.Int32
+	manager.check = func(context.Context, string) TraceResult {
+		checks.Add(1)
+		return successfulTrace(context.Background(), "")
+	}
+	resolved, errResolve := manager.Resolve(context.Background(), proxyPoolTestAuth("auth-direct"))
+	if errResolve != nil {
+		t.Fatalf("Resolve() error = %v", errResolve)
+	}
+	if resolved.URL != "direct" || resolved.Source != "direct" || resolved.BindingID != "" {
+		t.Fatalf("direct Resolve() = %+v", resolved)
+	}
+	if checks.Load() != 0 {
+		t.Fatalf("direct target ran %d health checks", checks.Load())
+	}
+	bindings := manager.SortedBindings()
+	if len(bindings) != 1 || !bindings[0].Direct || bindings[0].Pool != "" || bindings[0].Entry != "" {
+		t.Fatalf("persisted direct binding = %#v", bindings)
+	}
+	restored := newTestManager(t, configPath, cfg)
+	restored.check = func(context.Context, string) TraceResult {
+		t.Fatal("restored direct binding must not be health checked")
+		return TraceResult{}
+	}
+	restoredResolved, errRestored := restored.Resolve(context.Background(), proxyPoolTestAuth("auth-direct"))
+	if errRestored != nil || restoredResolved.URL != "direct" {
+		t.Fatalf("restored direct Resolve() = %+v, err=%v", restoredResolved, errRestored)
+	}
+	if got := restored.BindingStatuses(); len(got) != 1 || !got[0].Direct || got[0].Healthy != nil {
+		t.Fatalf("direct binding statuses = %#v", got)
+	}
+}
+
+func TestResolveUsesDeclaredDirectFallbackWithoutGlobalFallback(t *testing.T) {
+	cfg := proxyPoolTestConfig("3334")
+	cfg.ProxyURL = "http://global.example:8080"
+	cfg.ProxyRules[0] = internalconfig.ProxyRuleConfig{
+		Name:       "fallback",
+		Targets:    []internalconfig.ProxyRuleTargetConfig{{Pool: "residential", Priority: 10}, {Direct: true}},
+		Providers:  []string{"codex"},
+		Priorities: []int{0},
+	}
+	manager := newTestManager(t, filepath.Join(t.TempDir(), "config.yaml"), cfg)
+	manager.check = func(context.Context, string) TraceResult {
+		return TraceResult{CheckedAt: time.Now().UTC(), Error: "request_failed"}
+	}
+	resolved, errResolve := manager.Resolve(context.Background(), proxyPoolTestAuth("auth-direct-fallback"))
+	if errResolve != nil || resolved.URL != "direct" {
+		t.Fatalf("declared direct fallback = %+v, err=%v", resolved, errResolve)
+	}
+
+	cfg.ProxyRules[0].Targets = cfg.ProxyRules[0].Targets[:1]
+	strict := newTestManager(t, filepath.Join(t.TempDir(), "strict.yaml"), cfg)
+	strict.check = manager.check
+	resolved, errResolve = strict.Resolve(context.Background(), proxyPoolTestAuth("auth-strict"))
+	if errResolve == nil || resolved.URL == cfg.ProxyURL {
+		t.Fatalf("matched rule leaked to global proxy: resolved=%+v err=%v", resolved, errResolve)
 	}
 }
 
@@ -1576,6 +1807,38 @@ func proxyPoolTestConfig(ports string) *internalconfig.Config {
 	cfg.ProxyRules = []internalconfig.ProxyRuleConfig{{
 		Name:       "codex",
 		Pool:       "residential",
+		Providers:  []string{"codex"},
+		Priorities: []int{0},
+	}}
+	return cfg
+}
+
+func proxyMultiTargetTestConfig() *internalconfig.Config {
+	cfg := &internalconfig.Config{}
+	cfg.ProxyPools = []internalconfig.ProxyPoolConfig{
+		{
+			Name:         "primary",
+			BindAttempts: 1,
+			Entries: []internalconfig.ProxyPoolEntryConfig{{
+				ID:          "node",
+				URLTemplate: "http://primary.example:8080",
+			}},
+		},
+		{
+			Name:         "backup",
+			BindAttempts: 1,
+			Entries: []internalconfig.ProxyPoolEntryConfig{{
+				ID:          "node",
+				URLTemplate: "http://backup.example:8080",
+			}},
+		},
+	}
+	cfg.ProxyRules = []internalconfig.ProxyRuleConfig{{
+		Name: "codex",
+		Targets: []internalconfig.ProxyRuleTargetConfig{
+			{Pool: "primary"},
+			{Pool: "backup"},
+		},
 		Providers:  []string{"codex"},
 		Priorities: []int{0},
 	}}

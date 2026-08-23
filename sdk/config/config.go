@@ -11,6 +11,7 @@ type APIKeyGroup = internalconfig.APIKeyGroup
 type ProxyPoolConfig = internalconfig.ProxyPoolConfig
 type ProxyPoolEntryConfig = internalconfig.ProxyPoolEntryConfig
 type ProxyRuleConfig = internalconfig.ProxyRuleConfig
+type ProxyRuleTargetConfig = internalconfig.ProxyRuleTargetConfig
 type ProxyHealthCheckConfig = internalconfig.ProxyHealthCheckConfig
 type ProxyHealthCheckEndpointConfig = internalconfig.ProxyHealthCheckEndpointConfig
 

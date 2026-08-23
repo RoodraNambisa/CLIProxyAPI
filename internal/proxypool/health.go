@@ -440,11 +440,11 @@ func (m *Manager) bindingValidWithLease(snapshot *configSnapshot, binding Bindin
 	if auth.Disabled || auth.Status == coreauth.StatusDisabled || strings.TrimSpace(auth.ProxyURL) != "" {
 		return false
 	}
-	if strings.EqualFold(strings.TrimSpace(auth.Provider), "aistudio") {
+	if strings.EqualFold(strings.TrimSpace(auth.Provider), "aistudio") && !binding.Direct {
 		return false
 	}
-	poolName, matched := internalconfig.MatchProxyRule(snapshot.rules, auth.Provider, authPriority(auth))
-	if !matched || !strings.EqualFold(poolName, binding.Pool) {
+	targets, matched := internalconfig.MatchProxyRuleTargets(snapshot.rules, auth.Provider, authPriority(auth))
+	if !matched || !bindingMatchesRuleTargets(binding, targets) {
 		return false
 	}
 	_, valid := m.bindingURL(snapshot, binding)
@@ -679,6 +679,7 @@ func (m *Manager) bindingStatus(snapshot *configSnapshot, binding Binding, resol
 		AuthID:        binding.AuthID,
 		Pool:          binding.Pool,
 		Entry:         binding.Entry,
+		Direct:        binding.Direct,
 		Port:          binding.Port,
 		BindingID:     binding.ID,
 		ProxyURL:      proxyutil.MaskProxyURL(resolvedURL),
@@ -689,6 +690,10 @@ func (m *Manager) bindingStatus(snapshot *configSnapshot, binding Binding, resol
 			status.AuthIndex = auth.EnsureIndex()
 			status.Provider = auth.Provider
 		}
+	}
+	if binding.Direct {
+		status.ProxyURL = "direct"
+		return status
 	}
 	m.mu.RLock()
 	health, known := m.health[binding.ID]
@@ -891,19 +896,28 @@ func (m *Manager) Rebind(ctx context.Context, authIDs []string) []RebindResult {
 			results = append(results, result)
 			continue
 		}
-		if strings.EqualFold(strings.TrimSpace(auth.Provider), "aistudio") {
-			result.Error = "AIStudio relay cannot use server-side proxy pools"
-			result.HTTPStatus = http.StatusServiceUnavailable
-			results = append(results, result)
-			continue
-		}
 		snapshot := m.snapshot()
-		poolName, matched := internalconfig.MatchProxyRule(snapshot.rules, auth.Provider, authPriority(auth))
+		targets, matched := internalconfig.MatchProxyRuleTargets(snapshot.rules, auth.Provider, authPriority(auth))
 		if !matched {
 			result.Error = "auth does not match a proxy rule"
 			result.HTTPStatus = http.StatusConflict
 			results = append(results, result)
 			continue
+		}
+		if strings.EqualFold(strings.TrimSpace(auth.Provider), "aistudio") {
+			directTargets := targets[:0]
+			for _, target := range targets {
+				if target.Direct {
+					directTargets = append(directTargets, target)
+				}
+			}
+			if len(directTargets) == 0 {
+				result.Error = "AIStudio relay cannot use server-side proxy pools"
+				result.HTTPStatus = http.StatusServiceUnavailable
+				results = append(results, result)
+				continue
+			}
+			targets = directTargets
 		}
 		unlock, errLock := m.lockBinding(ctx, authID)
 		if errLock != nil {
@@ -912,7 +926,7 @@ func (m *Manager) Rebind(ctx context.Context, authIDs []string) []RebindResult {
 			results = append(results, result)
 			continue
 		}
-		resolved, errResolve := m.resolvePoolBinding(ctx, snapshot, authID, coreauth.ChatGPTWebCredentialUID(auth), poolName, true)
+		resolved, errResolve := m.resolveRuleBinding(ctx, snapshot, authID, coreauth.ChatGPTWebCredentialUID(auth), targets, true)
 		unlock()
 		if errResolve != nil {
 			var unavailable *UnavailableError
@@ -927,7 +941,7 @@ func (m *Manager) Rebind(ctx context.Context, authIDs []string) []RebindResult {
 		}
 		result.Updated = true
 		for _, status := range m.BindingStatuses() {
-			if status.AuthID == authID && status.BindingID == resolved.BindingID {
+			if status.AuthID == authID && (resolved.BindingID == "" || status.BindingID == resolved.BindingID) {
 				copyStatus := status
 				result.Binding = &copyStatus
 				break

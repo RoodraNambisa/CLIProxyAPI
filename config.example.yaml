@@ -288,12 +288,19 @@ proxy-url: ""
 #     # Endpoints are tried in order; any success completes the probe.
 
 # Ordered proxy rules. The first rule matching both provider and priority wins.
-# A matched rule never falls back to the global proxy or direct connections when its pool is unavailable.
+# Targets with a higher priority are tried first. Equal-priority targets are balanced by normalized load.
+# A matched rule never falls back to the global proxy or an undeclared direct connection.
 # proxy-rules:
 #   - name: "web-and-codex"
-#     pool: "residential"
+#     targets:
+#       - pool: "residential"
+#         priority: 10
+#       - pool: "backup"
+#         priority: 5
+#       - direct: true
+#         priority: 0
 #     providers: ["chatgpt-web", "codex"]
-#     priorities: [0, -1]
+#     priorities: [0, -1] # Credential priorities, unrelated to target priority.
 
 # When true, unprefixed model requests only use credentials without a prefix (except when prefix == model name).
 force-model-prefix: false
