@@ -19,6 +19,10 @@ func (*OpenAIImageModerationError) StatusCode() int {
 	return http.StatusBadRequest
 }
 
+func (*OpenAIImageModerationError) ExecutionResultErrorCode() string {
+	return "moderation_blocked"
+}
+
 func (*OpenAIImageModerationError) SkipAuthResult() bool {
 	return true
 }

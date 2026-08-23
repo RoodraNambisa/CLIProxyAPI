@@ -1792,6 +1792,89 @@ func TestChatGPTWebImageSettleErrorsExposeStableSafeCodes(t *testing.T) {
 	}
 }
 
+func TestChatGPTWebPartialOutputPollModerationPreservesBadRequest(t *testing.T) {
+	var taskPolls atomic.Int32
+	var conversationPolls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/backend-api/tasks":
+			taskPolls.Add(1)
+			_ = json.NewEncoder(w).Encode(map[string]any{"tasks": []any{}})
+		case "/backend-api/conversation/partial-moderation":
+			conversationPolls.Add(1)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"current_node": "current-failure",
+				"mapping": map[string]any{
+					"current-user": map[string]any{"message": map[string]any{
+						"id": "current-user", "author": map[string]any{"role": "user"}, "create_time": 1,
+					}},
+					"current-failure": map[string]any{
+						"parent": "current-user",
+						"message": map[string]any{
+							"id": "current-failure", "author": map[string]any{"role": "assistant"}, "create_time": 2,
+							"metadata": map[string]any{"finish_details": map[string]any{"type": "content_filter"}},
+							"content":  map[string]any{"content_type": "text", "parts": []any{"policy refusal"}},
+						},
+					},
+				},
+			})
+		default:
+			http.NotFound(w, request)
+		}
+	}))
+	defer server.Close()
+
+	executor := NewChatGPTWebExecutor(nil, nil)
+	executor.runtimeBaseURL = server.URL
+	executor.imageMaxPolls = 4
+	disableChatGPTWebImagePollWaits(executor)
+	client, credential, err := executor.newRuntimeClient(chatGPTWebRuntimeAuth())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.CloseIdleConnections()
+	prepared := &chatGPTWebPreparedRequest{
+		routeModel: "gpt-image-2",
+		request: helps.ChatGPTWebRequest{
+			Image: &helps.ChatGPTWebImageRequest{Prompt: "draw"},
+		},
+	}
+	execution := &chatGPTWebImageExecution{
+		turn: helps.ChatGPTWebImageTurn{MessageID: "current-user"},
+		response: &fhttp.Response{
+			StatusCode: http.StatusOK,
+			Body: io.NopCloser(strings.NewReader(
+				"data: {\"conversation_id\":\"partial-moderation\",\"message\":{\"author\":{\"role\":\"tool\"},\"metadata\":{\"async_task_type\":\"image_gen\"},\"content\":{\"parts\":[{\"asset_pointer\":\"file-service://provisional\"}]}}}\n\n",
+			)),
+		},
+	}
+
+	_, err = executor.finishChatGPTWebImage(context.Background(), client, credential, prepared, execution)
+	committed := chatGPTWebCommittedRequestError(context.Background(), err)
+	var status interface{ StatusCode() int }
+	if !errors.As(committed, &status) || status.StatusCode() != http.StatusBadRequest {
+		t.Fatalf("partial-output moderation status = %v, want 400", committed)
+	}
+	if committed.Error() != helps.OpenAIImageModerationErrorBody {
+		t.Fatalf("partial-output moderation body = %q", committed.Error())
+	}
+	var code interface{ ExecutionResultErrorCode() string }
+	if !errors.As(committed, &code) || code.ExecutionResultErrorCode() != "moderation_blocked" {
+		t.Fatalf("partial-output moderation code = %v, want moderation_blocked", committed)
+	}
+	var stage chatGPTWebFailureStageProvider
+	if !errors.As(committed, &stage) || stage.ChatGPTWebFailureStage() != "settle" {
+		t.Fatalf("partial-output moderation stage = %v, want settle", committed)
+	}
+	var retry interface{ RetryOtherAuth() bool }
+	if !errors.As(committed, &retry) || retry.RetryOtherAuth() {
+		t.Fatalf("partial-output moderation can switch credentials: %v", committed)
+	}
+	if taskPolls.Load() == 0 || conversationPolls.Load() == 0 {
+		t.Fatalf("poll calls = tasks:%d conversation:%d, want both paths exercised", taskPolls.Load(), conversationPolls.Load())
+	}
+}
+
 func TestChatGPTWebImagePollingStopsAfterLocalMemoryCapacityError(t *testing.T) {
 	testCases := []struct {
 		name           string

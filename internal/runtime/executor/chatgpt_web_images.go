@@ -909,6 +909,10 @@ func (e *ChatGPTWebExecutor) finishChatGPTWebImage(ctx context.Context, client *
 					return nil, newChatGPTWebImageModerationResultError()
 				}
 			}
+			var moderationErr *helps.OpenAIImageModerationError
+			if errors.As(err, &moderationErr) {
+				return nil, err
+			}
 			if chatGPTWebImagePollAuthenticationError(err) {
 				return nil, err
 			}
@@ -4322,6 +4326,10 @@ func chatGPTWebCommittedRequestError(ctx context.Context, err error) (committedE
 	if errors.As(err, &imageRateLimitErr) {
 		return &chatGPTWebImageRateLimitResultError{cause: imageRateLimitErr.cause, committed: true}
 	}
+	var moderationErr *helps.OpenAIImageModerationError
+	if errors.As(err, &moderationErr) {
+		return moderationErr
+	}
 	var settleErr chatGPTWebImageSettleError
 	if errors.As(err, &settleErr) {
 		settleErr.skipAuthResult = true
@@ -5101,7 +5109,8 @@ func gjsonString(payload []byte, path string) string {
 }
 
 func statusCodeFromError(err error) int {
-	if status, ok := err.(interface{ StatusCode() int }); ok {
+	var status interface{ StatusCode() int }
+	if errors.As(err, &status) && status != nil {
 		return status.StatusCode()
 	}
 	return 0

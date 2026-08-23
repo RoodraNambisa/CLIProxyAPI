@@ -102,6 +102,7 @@ func TestChatGPTWebImageFailureStagePersistsInUsage(t *testing.T) {
 	}{
 		{name: "generic settle", stage: "settle", err: errors.New("image completion failed"), wantCode: "chatgpt_web_request_failed"},
 		{name: "classified settle", stage: "settle", err: newChatGPTWebImageSettleStatusError(chatGPTWebImageErrorPollUnsettled, "polling did not converge"), wantCode: chatGPTWebImageErrorPollUnsettled},
+		{name: "moderation settle", stage: "settle", err: newChatGPTWebImageModerationResultError(), wantCode: "moderation_blocked"},
 		{name: "generic download", stage: "download", err: errors.New("image download failed"), wantCode: "chatgpt_web_request_failed"},
 	}
 	for _, test := range tests {

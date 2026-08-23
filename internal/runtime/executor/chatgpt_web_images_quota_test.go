@@ -409,21 +409,55 @@ func TestChatGPTWebStructuredModerationReturnsOpenAIError(t *testing.T) {
 }
 
 func TestChatGPTWebTerminalImageModerationFailureReturnsOpenAIError(t *testing.T) {
-	err := chatGPTWebCommittedRequestError(context.Background(), newChatGPTWebImageModerationResultError())
-	var status interface{ StatusCode() int }
-	if !errors.As(err, &status) || status.StatusCode() != http.StatusBadRequest {
-		t.Fatalf("moderation status = %v, want 400", err)
+	tests := []struct {
+		name string
+		err  error
+	}{
+		{
+			name: "failure stage wrapper",
+			err:  withChatGPTWebFailureStage("settle", newChatGPTWebImageModerationResultError()),
+		},
+		{
+			name: "settle wrapper after provisional output",
+			err: withChatGPTWebFailureStage("settle", newChatGPTWebImageSettleError(
+				newChatGPTWebImageModerationResultError(),
+			)),
+		},
 	}
-	if err.Error() != helps.OpenAIImageModerationErrorBody {
-		t.Fatalf("moderation body = %q", err.Error())
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := chatGPTWebCommittedRequestError(context.Background(), test.err)
+			var status interface{ StatusCode() int }
+			if !errors.As(err, &status) || status.StatusCode() != http.StatusBadRequest {
+				t.Fatalf("moderation status = %v, want 400", err)
+			}
+			if err.Error() != helps.OpenAIImageModerationErrorBody {
+				t.Fatalf("moderation body = %q", err.Error())
+			}
+			var code interface{ ExecutionResultErrorCode() string }
+			if !errors.As(err, &code) || code.ExecutionResultErrorCode() != "moderation_blocked" {
+				t.Fatalf("moderation error code = %v, want moderation_blocked", err)
+			}
+			var stage chatGPTWebFailureStageProvider
+			if !errors.As(err, &stage) || stage.ChatGPTWebFailureStage() != "settle" {
+				t.Fatalf("moderation failure stage = %v, want settle", err)
+			}
+			var skip interface{ SkipAuthResult() bool }
+			if !errors.As(err, &skip) || !skip.SkipAuthResult() {
+				t.Fatalf("moderation failure affected credential health: %v", err)
+			}
+			var retry interface{ RetryOtherAuth() bool }
+			if !errors.As(err, &retry) || retry.RetryOtherAuth() {
+				t.Fatalf("moderation failure retried another credential: %v", err)
+			}
+		})
 	}
-	var skip interface{ SkipAuthResult() bool }
-	if !errors.As(err, &skip) || !skip.SkipAuthResult() {
-		t.Fatalf("moderation failure affected credential health: %v", err)
-	}
-	var retry interface{ RetryOtherAuth() bool }
-	if !errors.As(err, &retry) || retry.RetryOtherAuth() {
-		t.Fatalf("moderation failure retried another credential: %v", err)
+}
+
+func TestChatGPTWebStatusCodeFromErrorUnwrapsFailureStage(t *testing.T) {
+	err := withChatGPTWebFailureStage("settle", newChatGPTWebImageModerationResultError())
+	if got := statusCodeFromError(err); got != http.StatusBadRequest {
+		t.Fatalf("statusCodeFromError() = %d, want 400", got)
 	}
 }
 
