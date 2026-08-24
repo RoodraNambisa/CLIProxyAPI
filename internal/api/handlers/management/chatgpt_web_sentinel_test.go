@@ -251,18 +251,18 @@ func TestPutChatGPTWebSentinelReplacesAllFields(t *testing.T) {
 func TestPatchChatGPTWebSentinelPreservesUnsubmittedFields(t *testing.T) {
 	initial := explicitSentinelConfig(true, 2, 9, 4)
 	handler, configPath := newPersistedChatGPTWebSentinelHandler(t, initial)
-	ctx, recorder := newChatGPTWebSentinelRequest(http.MethodPatch, `{"sdk-workers":6}`)
+	ctx, recorder := newChatGPTWebSentinelRequest(http.MethodPatch, `{"sdk-workers":64}`)
 	handler.PatchChatGPTWebSentinel(ctx)
 
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("PATCH status = %d, want 200: %s", recorder.Code, recorder.Body.String())
 	}
-	assertResolvedSentinelConfig(t, handler.cfg.ChatGPTWeb.Sentinel.Resolved(), true, 6, 9, 4)
+	assertResolvedSentinelConfig(t, handler.cfg.ChatGPTWeb.Sentinel.Resolved(), true, 64, 9, 4)
 	loaded, errLoad := config.LoadConfig(configPath)
 	if errLoad != nil {
 		t.Fatalf("LoadConfig() error = %v", errLoad)
 	}
-	assertResolvedSentinelConfig(t, loaded.ChatGPTWeb.Sentinel.Resolved(), true, 6, 9, 4)
+	assertResolvedSentinelConfig(t, loaded.ChatGPTWeb.Sentinel.Resolved(), true, 64, 9, 4)
 }
 
 func TestPatchChatGPTWebSentinelAppliesRuntimeBeforeReturning(t *testing.T) {
@@ -291,7 +291,6 @@ func TestChatGPTWebSentinelRejectsInvalidValuesWithoutMutation(t *testing.T) {
 		body string
 	}{
 		{name: "negative workers", body: `{"sdk-workers":-1}`},
-		{name: "too many workers", body: `{"sdk-workers":17}`},
 		{name: "negative queue", body: `{"sdk-queue-size":-1}`},
 		{name: "large queue", body: `{"sdk-queue-size":1025}`},
 		{name: "zero cache", body: `{"sdk-cache-versions":0}`},

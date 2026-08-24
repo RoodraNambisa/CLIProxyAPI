@@ -47,7 +47,7 @@ const (
 
 	DefaultChatGPTWebSentinelSDKQueueSize      = 32
 	DefaultChatGPTWebSentinelSDKCacheVersions  = 3
-	MaxChatGPTWebSentinelSDKWorkers            = 16
+	RecommendedChatGPTWebSentinelSDKWorkers    = 16
 	MaxChatGPTWebSentinelSDKQueueSize          = 1024
 	MaxChatGPTWebSentinelSDKCacheVersions      = 5
 	DefaultChatGPTWebUsageCacheThresholdMB     = 1
@@ -1312,11 +1312,11 @@ func (cfg ChatGPTWebSentinelConfig) Resolved() ResolvedChatGPTWebSentinelConfig 
 	return out
 }
 
-// Validate rejects Sentinel SDK values outside their documented bounds.
+// Validate rejects structurally invalid Sentinel SDK values.
 func (cfg ChatGPTWebSentinelConfig) Validate() error {
 	resolved := cfg.Resolved()
-	if resolved.SDKWorkers < 0 || resolved.SDKWorkers > MaxChatGPTWebSentinelSDKWorkers {
-		return fmt.Errorf("chatgpt-web.sentinel.sdk-workers must be 0 or between 1 and %d", MaxChatGPTWebSentinelSDKWorkers)
+	if resolved.SDKWorkers < 0 {
+		return fmt.Errorf("chatgpt-web.sentinel.sdk-workers must not be negative")
 	}
 	if resolved.SDKQueueSize < 0 || resolved.SDKQueueSize > MaxChatGPTWebSentinelSDKQueueSize {
 		return fmt.Errorf("chatgpt-web.sentinel.sdk-queue-size must be between 0 and %d", MaxChatGPTWebSentinelSDKQueueSize)

@@ -113,6 +113,23 @@ func (array *conversationTurnstileArray) remove(index int) {
 	}
 }
 
+func (array *conversationTurnstileArray) pop() any {
+	if array == nil || len(array.items) == 0 {
+		return conversationTurnstileUndefined
+	}
+	index := len(array.items) - 1
+	value := any(conversationTurnstileUndefined)
+	if array.has(index) {
+		value = array.items[index]
+	}
+	array.items[index] = nil
+	array.items = array.items[:index]
+	if array.present != nil {
+		array.present = array.present[:index]
+	}
+	return value
+}
+
 type conversationTurnstileBoxedPrimitive struct {
 	value any
 }
@@ -4317,9 +4334,15 @@ func (vm *conversationTurnstileVM) bindPropertyWithKey(object, propertyKey any) 
 	if processMap, ok := object.(*conversationTurnstileProcessMapRef); ok {
 		return vm.requireSupportedBoundProperty(object, keyText, processMap.method(keyText))
 	}
-	switch object.(type) {
+	switch typed := object.(type) {
 	case string, conversationTurnstileJSString:
-		value, bindErr := vm.bindStringProperty(object, keyText)
+		value, bindErr := vm.bindStringProperty(typed, keyText)
+		if bindErr != nil {
+			return conversationTurnstileUndefined, bindErr
+		}
+		return vm.requireSupportedBoundProperty(object, keyText, value)
+	case *conversationTurnstileArray:
+		value, bindErr := vm.bindArrayProperty(typed, keyText)
 		if bindErr != nil {
 			return conversationTurnstileUndefined, bindErr
 		}
@@ -4330,6 +4353,17 @@ func (vm *conversationTurnstileVM) bindPropertyWithKey(object, propertyKey any) 
 		return conversationTurnstileUndefined, err
 	}
 	return vm.requireSupportedBoundProperty(object, keyText, value)
+}
+
+func (vm *conversationTurnstileVM) bindArrayProperty(array *conversationTurnstileArray, keyText string) (any, error) {
+	switch keyText {
+	case "pop":
+		return newConversationTurnstileCallable(func([]any) (any, error) {
+			return array.pop(), nil
+		}), nil
+	default:
+		return vm.property(array, keyText)
+	}
 }
 
 func (vm *conversationTurnstileVM) requireSupportedBoundProperty(object any, keyText string, value any) (any, error) {

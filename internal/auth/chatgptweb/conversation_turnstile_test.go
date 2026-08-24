@@ -558,6 +558,21 @@ func TestBuildConversationTurnstileTokenMatchesSentinelSDKFixtures(t *testing.T)
 			want: "WyIiLCJhIiwiIiwiIl0=",
 		},
 		{
+			name: "array pop after string split",
+			program: []any{
+				[]any{2, 40, "a,b,c"},
+				[]any{2, 41, "split"},
+				[]any{24, 42, 40, 41},
+				[]any{2, 43, ","},
+				[]any{17, 44, 42, 43},
+				[]any{2, 45, "pop"},
+				[]any{24, 46, 44, 45},
+				[]any{17, 47, 46},
+				[]any{7, 3, 47},
+			},
+			want: "Yw==",
+		},
+		{
 			name: "custom local storage keys",
 			program: []any{
 				[]any{2, 40, "Object"},
@@ -804,6 +819,46 @@ func TestConversationTurnstileStringSplitSemantics(t *testing.T) {
 		if !ok || len(item.units) != 1 || item.units[0] != want {
 			t.Fatalf("UTF-16 split item[%d] = %#v, want %#x", index, array.items[index], want)
 		}
+	}
+}
+
+func TestConversationTurnstileArrayPopSemantics(t *testing.T) {
+	vm := &conversationTurnstileVM{
+		ctx:                 t.Context(),
+		memoryBudget:        &conversationTurnstileMemoryBudget{},
+		executionBudget:     &conversationTurnstileExecutionBudget{maxSteps: 100},
+		compatibilityErrors: true,
+	}
+	array := &conversationTurnstileArray{
+		items:   []any{"first", "hidden", "last"},
+		present: []bool{true, false, true},
+	}
+	bound, err := vm.bindProperty(array, "pop")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pop, ok := bound.(conversationTurnstileCallable)
+	if !ok {
+		t.Fatalf("pop property = %#v", bound)
+	}
+	value, err := pop.invoke(nil)
+	if err != nil || value != "last" {
+		t.Fatalf("first pop = %#v, %v", value, err)
+	}
+	value, err = pop.invoke(nil)
+	if err != nil || !isConversationTurnstileUndefined(value) {
+		t.Fatalf("sparse pop = %#v, %v", value, err)
+	}
+	value, err = pop.invoke(nil)
+	if err != nil || value != "first" {
+		t.Fatalf("third pop = %#v, %v", value, err)
+	}
+	value, err = pop.invoke(nil)
+	if err != nil || !isConversationTurnstileUndefined(value) {
+		t.Fatalf("empty pop = %#v, %v", value, err)
+	}
+	if len(array.items) != 0 || len(array.present) != 0 {
+		t.Fatalf("array after pops = %#v", array)
 	}
 }
 

@@ -83,26 +83,55 @@ func TestSentinelRuntimeManagerIsLazy(t *testing.T) {
 	}
 }
 
-func TestSentinelRuntimeManagerClampsDirectRuntimeLimits(t *testing.T) {
+func TestSentinelRuntimeManagerPreservesAdvisoryExceedingWorkerLimit(t *testing.T) {
 	manager := newSentinelRuntimeTestManagerWithConfig(SentinelRuntimeConfig{
 		Enabled:       true,
-		Workers:       sentinelSDKMaxWorkers + 100,
+		Workers:       64,
 		QueueSize:     sentinelSDKMaxQueueSize + 100,
 		CacheVersions: sentinelSDKMaxCacheVersions + 100,
 	})
 	defer manager.Close()
 	snapshot := manager.Snapshot()
-	if snapshot.WorkerLimit != sentinelSDKMaxWorkers || snapshot.SDKWorkers != sentinelSDKMaxWorkers {
+	if snapshot.WorkerLimit != 64 || snapshot.SDKWorkers != 64 {
 		t.Fatalf("worker limits = %+v", snapshot)
 	}
 	if snapshot.SDKQueueSize != sentinelSDKMaxQueueSize || snapshot.SDKCacheVersions != sentinelSDKMaxCacheVersions {
 		t.Fatalf("runtime limits = %+v", snapshot)
+	}
+	manager.UpdateConfig(SentinelRuntimeConfig{Enabled: true, Workers: 128, QueueSize: 1, CacheVersions: 3})
+	snapshot = manager.Snapshot()
+	if snapshot.WorkerLimit != 128 || snapshot.SDKWorkers != 128 {
+		t.Fatalf("hot-updated worker limits = %+v", snapshot)
 	}
 
 	manager.UpdateConfig(SentinelRuntimeConfig{Enabled: true, Workers: -1, QueueSize: -1, CacheVersions: -1})
 	snapshot = manager.Snapshot()
 	if snapshot.SDKWorkers != 0 || snapshot.SDKQueueSize != 0 || snapshot.SDKCacheVersions != 3 {
 		t.Fatalf("normalized runtime limits = %+v", snapshot)
+	}
+}
+
+func TestSentinelSDKCombinedLimitIsBoundedWithoutOverflow(t *testing.T) {
+	tests := []struct {
+		name      string
+		workers   int
+		queueSize int
+		maximum   int
+		want      int
+	}{
+		{name: "empty", maximum: 64, want: 1},
+		{name: "combined", workers: 2, queueSize: 3, maximum: 64, want: 5},
+		{name: "worker cap", workers: 64, queueSize: 1, maximum: 64, want: 64},
+		{name: "queue cap", workers: 1, queueSize: 64, maximum: 64, want: 64},
+		{name: "integer overflow", workers: int(^uint(0) >> 1), queueSize: int(^uint(0) >> 1), maximum: 64, want: 64},
+		{name: "invalid maximum", workers: 2, queueSize: 3, maximum: 0, want: 1},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := sentinelSDKCombinedLimit(test.workers, test.queueSize, test.maximum); got != test.want {
+				t.Fatalf("sentinelSDKCombinedLimit(%d, %d, %d) = %d, want %d", test.workers, test.queueSize, test.maximum, got, test.want)
+			}
+		})
 	}
 }
 
@@ -1101,6 +1130,41 @@ func TestSentinelRuntimeManagerKeepsStringSplitOnGoVM(t *testing.T) {
 		t.Fatalf("SolveTurnstile() error = %v", err)
 	}
 	if token != "WyJhIiwiYiIsImMiXQ==" {
+		t.Fatalf("token = %q", token)
+	}
+	if fetches.Load() != 0 {
+		t.Fatalf("SDK source fetches = %d, want pure Go execution", fetches.Load())
+	}
+	snapshot := manager.Snapshot()
+	if snapshot.CompatibilityFallbacks != 0 || snapshot.SDKPreferredHits != 0 || snapshot.FallbackCount != 0 {
+		t.Fatalf("fallback counters = %+v", snapshot)
+	}
+}
+
+func TestSentinelRuntimeManagerKeepsArrayPopOnGoVM(t *testing.T) {
+	manager := newSentinelRuntimeTestManager()
+	defer manager.Close()
+	request, sdkRequest := sentinelRuntimeTestRequests(t, false)
+	request.DX = encodeConversationTurnstileProgram(t, request.RequirementsToken, []any{
+		[]any{2, 40, "a,b,c"},
+		[]any{2, 41, "split"},
+		[]any{24, 42, 40, 41},
+		[]any{2, 43, ","},
+		[]any{17, 44, 42, 43},
+		[]any{2, 45, "pop"},
+		[]any{24, 46, 44, 45},
+		[]any{17, 47, 46},
+		[]any{7, 3, 47},
+	})
+	sdkRequest.Challenge["turnstile"] = map[string]any{"required": true, "dx": request.DX}
+	var fetches atomic.Int64
+	sdkRequest.Fetcher = sentinelRuntimeTestFetcher(&fetches)
+
+	token, err := manager.SolveTurnstile(t.Context(), request, sdkRequest, nil)
+	if err != nil {
+		t.Fatalf("SolveTurnstile() error = %v", err)
+	}
+	if token != "Yw==" {
 		t.Fatalf("token = %q", token)
 	}
 	if fetches.Load() != 0 {

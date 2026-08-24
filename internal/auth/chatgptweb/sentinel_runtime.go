@@ -45,7 +45,6 @@ const (
 	sentinelSDKSourceWaiterMax         = 64
 	sentinelSDKReclaimMinDelay         = 10 * time.Millisecond
 	sentinelSDKReclaimMaxDelay         = time.Second
-	sentinelSDKMaxWorkers              = 16
 	sentinelSDKMaxQueueSize            = 1024
 	sentinelSDKMaxCacheVersions        = 5
 	sentinelSDKAdapterVersion          = "exports-v2"
@@ -427,9 +426,6 @@ func newSentinelRuntimeManager(config SentinelRuntimeConfig, adapterResolver sen
 func normalizeSentinelRuntimeConfig(config SentinelRuntimeConfig) SentinelRuntimeConfig {
 	if config.Workers < 0 {
 		config.Workers = 0
-	}
-	if config.Workers > sentinelSDKMaxWorkers {
-		config.Workers = sentinelSDKMaxWorkers
 	}
 	if config.CacheVersions <= 0 {
 		config.CacheVersions = 3
@@ -1312,13 +1308,7 @@ func (manager *SentinelRuntimeManager) beginSourceFlight(key string, sourceConte
 	if manager.closed || (!manager.config.Enabled && !manager.clearWhenIdle) {
 		return nil, false, newSentinelRuntimeError("sentinel_sdk_unavailable", 0, errors.New("Sentinel SDK runtime is disabled"))
 	}
-	waiterLimit := manager.workerLimit + manager.config.QueueSize
-	if waiterLimit < 1 {
-		waiterLimit = 1
-	}
-	if waiterLimit > sentinelSDKSourceWaiterMax {
-		waiterLimit = sentinelSDKSourceWaiterMax
-	}
+	waiterLimit := sentinelSDKCombinedLimit(manager.workerLimit, manager.config.QueueSize, sentinelSDKSourceWaiterMax)
 	if manager.sourceWaiters >= waiterLimit {
 		return nil, false, newSentinelRuntimeError("sentinel_sdk_busy", time.Second, errors.New("Sentinel SDK source waiters are full"))
 	}
@@ -1327,13 +1317,7 @@ func (manager *SentinelRuntimeManager) beginSourceFlight(key string, sourceConte
 		manager.sourceWaiters++
 		return flight, false, nil
 	}
-	fetchLimit := manager.workerLimit + manager.config.QueueSize
-	if fetchLimit < 1 {
-		fetchLimit = 1
-	}
-	if fetchLimit > sentinelSDKSourceFetchMax {
-		fetchLimit = sentinelSDKSourceFetchMax
-	}
+	fetchLimit := sentinelSDKCombinedLimit(manager.workerLimit, manager.config.QueueSize, sentinelSDKSourceFetchMax)
 	if manager.sourcePending >= fetchLimit {
 		return nil, false, newSentinelRuntimeError("sentinel_sdk_busy", time.Second, errors.New("Sentinel SDK source queue is full"))
 	}
@@ -1349,6 +1333,20 @@ func (manager *SentinelRuntimeManager) beginSourceFlight(key string, sourceConte
 	manager.sourcePending++
 	manager.sourceWaiters++
 	return flight, true, nil
+}
+
+func sentinelSDKCombinedLimit(workers, queueSize, maximum int) int {
+	if maximum < 1 {
+		return 1
+	}
+	if workers >= maximum || queueSize >= maximum-workers {
+		return maximum
+	}
+	combined := workers + queueSize
+	if combined < 1 {
+		return 1
+	}
+	return combined
 }
 
 func (manager *SentinelRuntimeManager) releaseSourceWaiter(flight *sentinelSourceFlight) {

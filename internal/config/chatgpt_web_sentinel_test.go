@@ -49,7 +49,6 @@ func TestChatGPTWebSentinelConfigValidation(t *testing.T) {
 		message string
 	}{
 		{name: "negative workers", config: ChatGPTWebSentinelConfig{SDKWorkers: intPointer(-1)}, message: "sdk-workers"},
-		{name: "too many workers", config: ChatGPTWebSentinelConfig{SDKWorkers: intPointer(MaxChatGPTWebSentinelSDKWorkers + 1)}, message: "sdk-workers"},
 		{name: "negative queue", config: ChatGPTWebSentinelConfig{SDKQueueSize: intPointer(-1)}, message: "sdk-queue-size"},
 		{name: "too large queue", config: ChatGPTWebSentinelConfig{SDKQueueSize: intPointer(MaxChatGPTWebSentinelSDKQueueSize + 1)}, message: "sdk-queue-size"},
 		{name: "zero cache", config: ChatGPTWebSentinelConfig{SDKCacheVersions: intPointer(0)}, message: "sdk-cache-versions"},
@@ -65,6 +64,9 @@ func TestChatGPTWebSentinelConfigValidation(t *testing.T) {
 	}
 	if err := (ChatGPTWebSentinelConfig{}).Validate(); err != nil {
 		t.Fatalf("default Validate() error = %v", err)
+	}
+	if err := (ChatGPTWebSentinelConfig{SDKWorkers: intPointer(64)}).Validate(); err != nil {
+		t.Fatalf("advisory-exceeding Validate() error = %v", err)
 	}
 }
 
@@ -116,14 +118,17 @@ func TestSaveConfigPreserveCommentsAddsExplicitChatGPTWebSentinelZeroValues(t *t
 	}
 }
 
-func TestLoadConfigRejectsInvalidChatGPTWebSentinelValues(t *testing.T) {
+func TestLoadConfigAcceptsChatGPTWebSentinelWorkersAboveRecommendation(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.yaml")
-	if err := os.WriteFile(path, []byte("chatgpt-web:\n  sentinel:\n    sdk-workers: 17\n"), 0o600); err != nil {
+	if err := os.WriteFile(path, []byte("chatgpt-web:\n  sentinel:\n    sdk-workers: 64\n"), 0o600); err != nil {
 		t.Fatalf("write config: %v", err)
 	}
-	_, err := LoadConfig(path)
-	if err == nil || !strings.Contains(err.Error(), "sdk-workers") {
+	cfg, err := LoadConfig(path)
+	if err != nil {
 		t.Fatalf("LoadConfig() error = %v", err)
+	}
+	if got := cfg.ChatGPTWeb.Sentinel.Resolved().SDKWorkers; got != 64 {
+		t.Fatalf("SDKWorkers = %d, want 64", got)
 	}
 }
 
@@ -228,8 +233,8 @@ func TestLoadOptionalConfigRejectsInvalidChatGPTWebSentinelValues(t *testing.T) 
 		want string
 	}{
 		{
-			name: "range survives unrelated decode error",
-			yaml: "port: invalid\nchatgpt-web:\n  sentinel:\n    sdk-workers: 17\n",
+			name: "negative value survives unrelated decode error",
+			yaml: "port: invalid\nchatgpt-web:\n  sentinel:\n    sdk-workers: -1\n",
 			want: "sdk-workers",
 		},
 		{

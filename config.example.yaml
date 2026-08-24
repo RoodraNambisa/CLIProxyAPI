@@ -190,7 +190,9 @@ chatgpt-web:
     # official OpenAI HTTPS endpoint only when required. Bootstrap SRI is enforced
     # when present; set false if remote JavaScript execution is not acceptable.
     sdk-runtime-enabled: true
-    # 0 automatically uses max(1, min(4, (GOMAXPROCS+1)/2)).
+    # 0 automatically uses max(1, min(4, (GOMAXPROCS+1)/2)); 16 is the
+    # recommended manual starting point. Larger values are accepted but may
+    # increase QuickJS CPU and memory usage under compatibility fallback load.
     sdk-workers: 0
     # 0 disables waiting when every SDK worker is busy.
     sdk-queue-size: 32
