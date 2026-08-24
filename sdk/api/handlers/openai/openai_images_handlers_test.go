@@ -8,6 +8,7 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -608,6 +609,53 @@ func TestImageResponsesProvidersExcludeChatGPTWebForUnsupportedInputs(t *testing
 				t.Fatalf("providers = %v, want %v", got, test.want)
 			}
 		})
+	}
+}
+
+func TestImageResponsesProvidersIncludeChatGPTWebForEnabledRemoteImages(t *testing.T) {
+	remoteEnabled := defaultChatGPTWebImageConfigSnapshot()
+	remoteEnabled.RemoteImageURLEnabled = true
+	tests := []openAIImageRequest{
+		{Images: []imageReference{{ImageURL: "https://images.example:8443/input.png"}}},
+		{Images: []imageReference{{ImageURL: "https://images.example/input.png"}}, Mask: &imageReference{ImageURL: "https://images.example/mask.webp"}},
+	}
+	for index, request := range tests {
+		got := imageResponsesProviders(request, false, remoteEnabled)
+		want := []string{constant.Codex, constant.ChatGPTWeb}
+		if strings.Join(got, ",") != strings.Join(want, ",") {
+			t.Fatalf("case %d providers = %v, want %v", index, got, want)
+		}
+	}
+}
+
+func TestOpenAIImagesEditsPreserveRemoteImagesForChatGPTWeb(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	executor := &imageCaptureExecutor{provider: "chatgpt-web"}
+	h := newImagesTestHandler(t, executor)
+	h.Cfg.Images.ChatGPTWeb.RemoteImageURLEnabled = true
+	router := gin.New()
+	router.POST("/v1/images/edits", h.Edits)
+
+	request := httptest.NewRequest(http.MethodPost, "/v1/images/edits", strings.NewReader(`{
+		"model":"gpt-image-2",
+		"prompt":"edit",
+		"images":["https://images.example:8443/input.png"],
+		"mask":{"image_url":"https://images.example/mask.png"}
+	}`))
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", response.Code, response.Body.String())
+	}
+	parsed, errParse := executorhelps.ParseChatGPTWebRequest(executor.payload)
+	if errParse != nil {
+		t.Fatalf("parse captured request: %v", errParse)
+	}
+	if parsed.Image == nil || !reflect.DeepEqual(parsed.Image.Images, []string{"https://images.example:8443/input.png"}) ||
+		parsed.Image.MaskURL != "https://images.example/mask.png" {
+		t.Fatalf("captured image request = %#v", parsed.Image)
 	}
 }
 

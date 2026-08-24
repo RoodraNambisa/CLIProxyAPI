@@ -279,6 +279,22 @@ func (admission *ChatGPTWebImageMemoryAdmission) tryAcquire(estimatedBytes int64
 	return admission.releaseFunc(weight), weight, true
 }
 
+func (admission *ChatGPTWebImageMemoryAdmission) tryAcquireExact(estimatedBytes int64) (func(), bool) {
+	requestedWeight := normalizedChatGPTWebImageMemoryRequest(estimatedBytes)
+	if admission == nil {
+		return func() {}, true
+	}
+	admission.mu.Lock()
+	if requestedWeight > admission.capacity || len(admission.waiters) > 0 || admission.used+requestedWeight > admission.capacity {
+		admission.immediateRejected.Add(1)
+		admission.mu.Unlock()
+		return nil, false
+	}
+	admission.activateLocked(requestedWeight)
+	admission.mu.Unlock()
+	return admission.releaseFunc(requestedWeight), true
+}
+
 func normalizedChatGPTWebImageMemoryRequest(estimatedBytes int64) int64 {
 	if estimatedBytes < 1 {
 		return 1
@@ -447,6 +463,32 @@ func (leases *ChatGPTWebImageMemoryLeaseSet) AcquireExact(ctx context.Context, e
 // FIFO wait queue. This prevents large uploads from blocking small requests.
 func (leases *ChatGPTWebImageMemoryLeaseSet) TryAcquireInput(estimatedBytes int64) bool {
 	release, acquired := TryAcquireChatGPTWebImageMemory(estimatedBytes)
+	if !acquired {
+		return false
+	}
+	if leases == nil {
+		release()
+		return true
+	}
+	leases.mu.Lock()
+	if leases.released || leases.exactPending || leases.exactRetained {
+		leases.mu.Unlock()
+		release()
+		return false
+	}
+	previous := leases.inputRelease
+	leases.inputRelease = release
+	leases.mu.Unlock()
+	if previous != nil {
+		previous()
+	}
+	return true
+}
+
+// TryAcquireInputExact reserves the complete input working set without
+// clamping an oversized request to the current process capacity.
+func (leases *ChatGPTWebImageMemoryLeaseSet) TryAcquireInputExact(estimatedBytes int64) bool {
+	release, acquired := defaultChatGPTWebImageMemoryAdmission.tryAcquireExact(estimatedBytes)
 	if !acquired {
 		return false
 	}

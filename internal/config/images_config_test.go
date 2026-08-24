@@ -40,6 +40,8 @@ func TestLoadConfigOptionalChatGPTWebImageSettings(t *testing.T) {
   chatgpt-web:
     upstream-model: gpt-5-5-custom
     ignore-unsupported-params: true
+    remote-image-url-enabled: true
+    remote-image-url-download-mode: credential-proxy
 `)
 	if err := os.WriteFile(path, data, 0o600); err != nil {
 		t.Fatalf("write config: %v", err)
@@ -54,6 +56,13 @@ func TestLoadConfigOptionalChatGPTWebImageSettings(t *testing.T) {
 	}
 	if !cfg.Images.ChatGPTWeb.IgnoreUnsupportedParams {
 		t.Fatal("IgnoreUnsupportedParams = false, want true")
+	}
+	resolved := cfg.Images.ChatGPTWeb.Resolved()
+	if !resolved.RemoteImageURLEnabled {
+		t.Fatal("RemoteImageURLEnabled = false, want true")
+	}
+	if resolved.RemoteImageURLDownloadMode != ChatGPTWebRemoteImageDownloadCredentialProxy {
+		t.Fatalf("RemoteImageURLDownloadMode = %q", resolved.RemoteImageURLDownloadMode)
 	}
 }
 
@@ -72,6 +81,13 @@ func TestLoadConfigOptionalDefaultsChatGPTWebImageUpstreamModel(t *testing.T) {
 	}
 	if cfg.Images.ChatGPTWeb.IgnoreUnsupportedParams {
 		t.Fatal("IgnoreUnsupportedParams = true, want false")
+	}
+	resolved := cfg.Images.ChatGPTWeb.Resolved()
+	if resolved.RemoteImageURLEnabled {
+		t.Fatal("RemoteImageURLEnabled = true, want false")
+	}
+	if resolved.RemoteImageURLDownloadMode != ChatGPTWebRemoteImageDownloadDirect {
+		t.Fatalf("RemoteImageURLDownloadMode = %q", resolved.RemoteImageURLDownloadMode)
 	}
 }
 
@@ -118,7 +134,8 @@ func TestLoadConfigOptionalChatGPTWebImageAspectSettings(t *testing.T) {
 
 func TestChatGPTWebImageAspectSettingsDefaultsAndValidation(t *testing.T) {
 	resolved := (ChatGPTWebImageConfig{}).Resolved()
-	if resolved.AdaptSizeToAspectRatio ||
+	if resolved.RemoteImageURLEnabled ||
+		resolved.AdaptSizeToAspectRatio ||
 		resolved.StrictSize ||
 		resolved.AspectRatioMaxErrorPercent != DefaultChatGPTWebAspectRatioMaxErrorPercent ||
 		resolved.MaxResizeEdgePixels != DefaultChatGPTWebMaxResizeEdgePixels ||
@@ -185,6 +202,7 @@ func TestChatGPTWebImageAspectSettingsDefaultsAndValidation(t *testing.T) {
 		{name: "resize without adaptation", cfg: ChatGPTWebImageConfig{ResizeToRequestedSize: true}},
 		{name: "strict size without adaptation", cfg: ChatGPTWebImageConfig{StrictSize: true}},
 		{name: "unknown filter", cfg: ChatGPTWebImageConfig{ResizeFilter: "nearest"}},
+		{name: "unknown remote download mode", cfg: ChatGPTWebImageConfig{RemoteImageURLDownloadMode: "environment-proxy"}},
 		{name: "zero response budget", cfg: ChatGPTWebImageConfig{MaxImageResponseMegabytes: &zeroResponseBudget}},
 		{name: "large response budget", cfg: ChatGPTWebImageConfig{MaxImageResponseMegabytes: &tooLargeResponseBudget}},
 		{name: "zero max n", cfg: ChatGPTWebImageConfig{MaxN: &zeroN}},

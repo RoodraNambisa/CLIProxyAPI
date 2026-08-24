@@ -194,6 +194,10 @@ type ImagesConfig struct {
 type ChatGPTWebImageConfig struct {
 	// UpstreamModel is the ChatGPT Web conversation model that invokes picture_v2.
 	UpstreamModel string `yaml:"upstream-model,omitempty" json:"upstream-model,omitempty"`
+	// RemoteImageURLEnabled allows protected downloads for remote image inputs.
+	RemoteImageURLEnabled bool `yaml:"remote-image-url-enabled,omitempty" json:"remote-image-url-enabled,omitempty"`
+	// RemoteImageURLDownloadMode selects direct downloads or the selected credential's effective proxy.
+	RemoteImageURLDownloadMode string `yaml:"remote-image-url-download-mode,omitempty" json:"remote-image-url-download-mode,omitempty"`
 	// IgnoreUnsupportedParams allows Web routing after dropping options that Web cannot express.
 	IgnoreUnsupportedParams bool `yaml:"ignore-unsupported-params,omitempty" json:"ignore-unsupported-params,omitempty"`
 	// AdaptSizeToAspectRatio maps compatible explicit image sizes to an upstream canvas prompt.
@@ -233,22 +237,25 @@ type ChatGPTWebImageConfig struct {
 }
 
 const (
-	DefaultChatGPTWebAspectRatioMaxErrorPercent = 1.0
-	MaxChatGPTWebAspectRatioMaxErrorPercent     = 10.0
-	DefaultChatGPTWebMaxResizeEdgePixels        = 3840
-	MaxChatGPTWebMaxResizeEdgePixels            = 3840
-	ChatGPTWebResizeFilterCatmullRom            = "catmull-rom"
-	ChatGPTWebResizeFilterApproxBiLinear        = "approx-bilinear"
-	DefaultChatGPTWebResizeFilter               = ChatGPTWebResizeFilterCatmullRom
-	DefaultChatGPTWebMaxImageResponseMegabytes  = 128
-	MinChatGPTWebMaxImageResponseMegabytes      = 1
-	MaxChatGPTWebMaxImageResponseMegabytes      = 256
-	DefaultChatGPTWebMaxN                       = 1
-	MinChatGPTWebMaxN                           = 1
-	MaxChatGPTWebMaxN                           = 10
-	DefaultChatGPTWebImageMaxInFlight           = 64
-	MinChatGPTWebImageMaxInFlight               = 1
-	RecommendedMaxChatGPTWebImageMaxInFlight    = 4096
+	DefaultChatGPTWebAspectRatioMaxErrorPercent  = 1.0
+	MaxChatGPTWebAspectRatioMaxErrorPercent      = 10.0
+	DefaultChatGPTWebMaxResizeEdgePixels         = 3840
+	MaxChatGPTWebMaxResizeEdgePixels             = 3840
+	ChatGPTWebResizeFilterCatmullRom             = "catmull-rom"
+	ChatGPTWebResizeFilterApproxBiLinear         = "approx-bilinear"
+	DefaultChatGPTWebResizeFilter                = ChatGPTWebResizeFilterCatmullRom
+	ChatGPTWebRemoteImageDownloadDirect          = "direct"
+	ChatGPTWebRemoteImageDownloadCredentialProxy = "credential-proxy"
+	DefaultChatGPTWebRemoteImageDownloadMode     = ChatGPTWebRemoteImageDownloadDirect
+	DefaultChatGPTWebMaxImageResponseMegabytes   = 128
+	MinChatGPTWebMaxImageResponseMegabytes       = 1
+	MaxChatGPTWebMaxImageResponseMegabytes       = 256
+	DefaultChatGPTWebMaxN                        = 1
+	MinChatGPTWebMaxN                            = 1
+	MaxChatGPTWebMaxN                            = 10
+	DefaultChatGPTWebImageMaxInFlight            = 64
+	MinChatGPTWebImageMaxInFlight                = 1
+	RecommendedMaxChatGPTWebImageMaxInFlight     = 4096
 	// Deprecated: this advisory alias is not a validation limit. Use RecommendedMaxChatGPTWebImageMaxInFlight.
 	MaxChatGPTWebImageMaxInFlight                   = RecommendedMaxChatGPTWebImageMaxInFlight
 	DefaultChatGPTWebImageAdmissionQueueSize        = 64
@@ -315,6 +322,8 @@ func ChatGPTWebImageAdmissionWaitDuration(milliseconds int) (time.Duration, erro
 // ResolvedChatGPTWebImageConfig contains effective ChatGPT Web image compatibility values.
 type ResolvedChatGPTWebImageConfig struct {
 	UpstreamModel              string
+	RemoteImageURLEnabled      bool
+	RemoteImageURLDownloadMode string
 	IgnoreUnsupportedParams    bool
 	AdaptSizeToAspectRatio     bool
 	StrictSize                 bool
@@ -346,6 +355,8 @@ func (cfg ChatGPTWebImageConfig) ResolvedUpstreamModel() string {
 func (cfg ChatGPTWebImageConfig) Resolved() ResolvedChatGPTWebImageConfig {
 	resolved := ResolvedChatGPTWebImageConfig{
 		UpstreamModel:              cfg.ResolvedUpstreamModel(),
+		RemoteImageURLEnabled:      cfg.RemoteImageURLEnabled,
+		RemoteImageURLDownloadMode: DefaultChatGPTWebRemoteImageDownloadMode,
 		IgnoreUnsupportedParams:    cfg.IgnoreUnsupportedParams,
 		AdaptSizeToAspectRatio:     cfg.AdaptSizeToAspectRatio,
 		StrictSize:                 cfg.StrictSize,
@@ -363,6 +374,9 @@ func (cfg ChatGPTWebImageConfig) Resolved() ResolvedChatGPTWebImageConfig {
 		MemoryCapacityMegabytes:    DefaultChatGPTWebImageMemoryCapacityMB,
 		PollConcurrency:            DefaultChatGPTWebImagePollConcurrency,
 		MemoryFinalizerConcurrency: DefaultChatGPTWebImageMemoryFinalizerConcurrency,
+	}
+	if mode := strings.ToLower(strings.TrimSpace(cfg.RemoteImageURLDownloadMode)); mode != "" {
+		resolved.RemoteImageURLDownloadMode = mode
 	}
 	if cfg.AspectRatioMaxErrorPercent != nil {
 		resolved.AspectRatioMaxErrorPercent = *cfg.AspectRatioMaxErrorPercent
@@ -425,6 +439,10 @@ func (cfg ChatGPTWebImageConfig) Validate() error {
 	}
 	if resolved.ResizeFilter != ChatGPTWebResizeFilterCatmullRom && resolved.ResizeFilter != ChatGPTWebResizeFilterApproxBiLinear {
 		return fmt.Errorf("images.chatgpt-web.resize-filter must be %s or %s", ChatGPTWebResizeFilterCatmullRom, ChatGPTWebResizeFilterApproxBiLinear)
+	}
+	if resolved.RemoteImageURLDownloadMode != ChatGPTWebRemoteImageDownloadDirect &&
+		resolved.RemoteImageURLDownloadMode != ChatGPTWebRemoteImageDownloadCredentialProxy {
+		return fmt.Errorf("images.chatgpt-web.remote-image-url-download-mode must be %s or %s", ChatGPTWebRemoteImageDownloadDirect, ChatGPTWebRemoteImageDownloadCredentialProxy)
 	}
 	if resolved.MaxImageResponseMegabytes < MinChatGPTWebMaxImageResponseMegabytes ||
 		resolved.MaxImageResponseMegabytes > MaxChatGPTWebMaxImageResponseMegabytes {

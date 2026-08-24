@@ -97,6 +97,38 @@ func TestChatGPTWebImageMemoryLeaseSetReleasesInputAndOutputsOnce(t *testing.T) 
 	}
 }
 
+func TestChatGPTWebImageMemoryLeaseSetTryAcquireInputExactNeverClamps(t *testing.T) {
+	previous := defaultChatGPTWebImageMemoryAdmission
+	admission := NewChatGPTWebImageMemoryAdmission(10)
+	defaultChatGPTWebImageMemoryAdmission = admission
+	t.Cleanup(func() { defaultChatGPTWebImageMemoryAdmission = previous })
+
+	oversized := NewChatGPTWebImageMemoryLeaseSet()
+	if oversized.TryAcquireInputExact(11) {
+		t.Fatal("TryAcquireInputExact(11) = true at capacity 10")
+	}
+	if snapshot := admission.Snapshot(); snapshot.ProcessingBytes != 0 || snapshot.ProcessingTasks != 0 {
+		t.Fatalf("oversized snapshot = %#v", snapshot)
+	}
+
+	first := NewChatGPTWebImageMemoryLeaseSet()
+	if !first.TryAcquireInputExact(10) {
+		t.Fatal("TryAcquireInputExact(10) = false")
+	}
+	second := NewChatGPTWebImageMemoryLeaseSet()
+	if second.TryAcquireInputExact(1) {
+		t.Fatal("second exact input acquired while capacity was full")
+	}
+	first.ReleaseInput()
+	if !second.TryAcquireInputExact(1) {
+		t.Fatal("second exact input did not acquire after release")
+	}
+	second.Release()
+	if snapshot := admission.Snapshot(); snapshot.ProcessingBytes != 0 || snapshot.ProcessingTasks != 0 {
+		t.Fatalf("final snapshot = %#v", snapshot)
+	}
+}
+
 func TestChatGPTWebImageMemoryAdmissionBoundsFifteenHundredConcurrentRequests(t *testing.T) {
 	const requests = 1500
 	admission := NewChatGPTWebImageMemoryAdmission(64)

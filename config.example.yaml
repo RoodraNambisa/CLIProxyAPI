@@ -500,6 +500,8 @@ nonstream-keepalive-interval: 0
 #   stream-flush-min-bytes: 0        # Image-specific byte threshold. 0 falls back to streaming.stream-flush-min-bytes.
 #   chatgpt-web:
 #     upstream-model: "gpt-5-5"      # Web conversation model used to invoke picture_v2.
+#     remote-image-url-enabled: false # Fetch public HTTP(S) image_url inputs with SSRF and 50 MiB safeguards.
+#     remote-image-url-download-mode: direct # direct or credential-proxy; missing credential proxy falls back to direct.
 #     ignore-unsupported-params: false # Drop unsupported size/quality/etc. instead of excluding Web routing.
 #     adapt-size-to-aspect-ratio: false # Map compatible explicit WxH sizes to an exact canvas/aspect-ratio prompt.
 #     strict-size: false                # Exclude Web when an explicit size cannot be adapted; requires adaptation.

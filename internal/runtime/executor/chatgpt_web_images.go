@@ -4787,7 +4787,7 @@ func decodeChatGPTWebImageReference(value string) ([]byte, string, error) {
 	return data, strings.ToLower(mimeType), nil
 }
 
-func validateChatGPTWebImageRequest(request *helps.ChatGPTWebImageRequest) error {
+func validateChatGPTWebImageRequest(request *helps.ChatGPTWebImageRequest, remoteEnabled ...bool) error {
 	if request == nil {
 		return nil
 	}
@@ -4832,23 +4832,9 @@ func validateChatGPTWebImageRequest(request *helps.ChatGPTWebImageRequest) error
 	if mask := strings.TrimSpace(request.MaskURL); mask != "" {
 		references = append(references, mask)
 	}
-	for _, reference := range references {
-		reference = strings.TrimSpace(reference)
-		if strings.Contains(reference, "://") && !strings.HasPrefix(strings.ToLower(reference), "data:") {
-			return statusErr{
-				code:           http.StatusBadRequest,
-				msg:            "chatgpt web only supports base64 image inputs",
-				skipAuthResult: true,
-				retryOtherAuth: true,
-			}
-		}
-	}
-	if err := helps.ValidateChatGPTWebImageReferences(references, chatGPTWebMaxImageBytes, chatGPTWebMaxImageRequestBytes); err != nil {
-		return statusErr{
-			code:           http.StatusRequestEntityTooLarge,
-			msg:            err.Error(),
-			skipAuthResult: true,
-		}
+	allowRemote := len(remoteEnabled) > 0 && remoteEnabled[0]
+	if err := validateChatGPTWebImageReferences(references, allowRemote); err != nil {
+		return err
 	}
 	return nil
 }

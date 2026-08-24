@@ -86,6 +86,7 @@ type ChatGPTWebExecutor struct {
 	streamInitialWait         time.Duration
 	streamHeartbeat           time.Duration
 	accountInfoTimeout        time.Duration
+	remoteImageFetcher        chatGPTWebRemoteImageFetchFunc
 	now                       func() time.Time
 	reloginBackoff            func(int) time.Duration
 	reloginSlotAcquired       func()

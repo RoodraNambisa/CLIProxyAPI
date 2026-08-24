@@ -302,9 +302,13 @@ func (e *ChatGPTWebExecutor) executeRuntime(ctx context.Context, auth *cliproxya
 		return resp, err
 	}
 	defer prepared.discardUsageProjection()
-	if prepared.request.Image != nil && prepared.imageMemoryLeases == nil {
+	hasRemoteImages := chatGPTWebPreparedRequestHasRemoteImages(prepared)
+	if (prepared.request.Image != nil || hasRemoteImages) && prepared.imageMemoryLeases == nil {
 		prepared.imageMemoryLeases = helps.NewChatGPTWebImageMemoryLeaseSet()
 		prepared.imageMemoryLeasesOwned = true
+	}
+	if prepared.request.Image == nil && prepared.imageMemoryLeasesOwned && prepared.imageMemoryLeases != nil {
+		defer prepared.imageMemoryLeases.Release()
 	}
 	ctx = helps.WithChatGPTWebImageMemoryLeaseSet(ctx, prepared.imageMemoryLeases)
 	ctx = cliproxyexecutor.WithRequestPhaseObserver(ctx, prepared.phaseObserver)
@@ -319,6 +323,11 @@ func (e *ChatGPTWebExecutor) executeRuntime(ctx context.Context, auth *cliproxya
 			return resp, err
 		}
 		defer releaseImageLifecycle()
+	}
+	if hasRemoteImages {
+		if err = e.materializeChatGPTWebRemoteImages(ctx, auth, prepared); err != nil {
+			return resp, err
+		}
 	}
 
 	client, credential, err := e.newRuntimeClient(auth)
@@ -367,9 +376,13 @@ func (e *ChatGPTWebExecutor) executeRuntimeStream(ctx context.Context, auth *cli
 	if err != nil {
 		return nil, err
 	}
-	if prepared.request.Image != nil && prepared.imageMemoryLeases == nil {
+	hasRemoteImages := chatGPTWebPreparedRequestHasRemoteImages(prepared)
+	if (prepared.request.Image != nil || hasRemoteImages) && prepared.imageMemoryLeases == nil {
 		prepared.imageMemoryLeases = helps.NewChatGPTWebImageMemoryLeaseSet()
 		prepared.imageMemoryLeasesOwned = true
+	}
+	if prepared.request.Image == nil && prepared.imageMemoryLeasesOwned && prepared.imageMemoryLeases != nil {
+		defer prepared.imageMemoryLeases.Release()
 	}
 	ctx = helps.WithChatGPTWebImageMemoryLeaseSet(ctx, prepared.imageMemoryLeases)
 	ctx = cliproxyexecutor.WithRequestPhaseObserver(ctx, prepared.phaseObserver)
@@ -391,6 +404,15 @@ func (e *ChatGPTWebExecutor) executeRuntimeStream(ctx context.Context, auth *cli
 	if prepared.request.Image != nil {
 		releaseImageLifecycle, err = e.acquireChatGPTWebImageLifecycle(ctx, prepared)
 		if err != nil {
+			prepared.discardUsageProjection()
+			return nil, err
+		}
+	}
+	if hasRemoteImages {
+		if err = e.materializeChatGPTWebRemoteImages(ctx, auth, prepared); err != nil {
+			if releaseImageLifecycle != nil {
+				releaseImageLifecycle()
+			}
 			prepared.discardUsageProjection()
 			return nil, err
 		}
@@ -655,6 +677,8 @@ func (e *ChatGPTWebExecutor) prepareRuntimeRequestTemplate(_ context.Context, re
 		resolvedImageConfig = cfg.Images.ChatGPTWeb.Resolved()
 	}
 	imageConfigSnapshot := cliproxyexecutor.ChatGPTWebImageConfigSnapshot{
+		RemoteImageURLEnabled:      resolvedImageConfig.RemoteImageURLEnabled,
+		RemoteImageURLDownloadMode: resolvedImageConfig.RemoteImageURLDownloadMode,
 		AdaptSizeToAspectRatio:     resolvedImageConfig.AdaptSizeToAspectRatio,
 		StrictSize:                 resolvedImageConfig.StrictSize,
 		AspectRatioMaxErrorPercent: resolvedImageConfig.AspectRatioMaxErrorPercent,
@@ -749,14 +773,16 @@ func (e *ChatGPTWebExecutor) prepareRuntimeRequestTemplate(_ context.Context, re
 	if ignoreUnsupportedImageParams {
 		ignoreUnsupportedChatGPTWebImageParams(parsed.Image)
 	}
-	if err = validateChatGPTWebImageRequest(parsed.Image); err != nil {
+	if err = validateChatGPTWebImageRequest(parsed.Image, imageConfigSnapshot.RemoteImageURLEnabled); err != nil {
 		return nil, err
 	}
-	if err = prepareChatGPTWebImageMask(parsed.Image); err != nil {
-		return nil, err
+	if !chatGPTWebImageRequestHasRemoteReference(parsed.Image) {
+		if err = prepareChatGPTWebImageMask(parsed.Image); err != nil {
+			return nil, err
+		}
 	}
 	if parsed.Image == nil {
-		if err = validateChatGPTWebMessageImageInputs(parsed.Messages); err != nil {
+		if err = validateChatGPTWebMessageImageInputs(parsed.Messages, imageConfigSnapshot.RemoteImageURLEnabled); err != nil {
 			return nil, err
 		}
 	}
@@ -1108,7 +1134,7 @@ func chatGPTWebClaudeContentHasImage(content gjson.Result) bool {
 	})
 }
 
-func validateChatGPTWebMessageImageInputs(messages []helps.ChatGPTWebMessage) error {
+func validateChatGPTWebMessageImageInputs(messages []helps.ChatGPTWebMessage, remoteEnabled ...bool) error {
 	var references []string
 	for _, message := range messages {
 		for _, part := range message.Parts {
@@ -1120,29 +1146,8 @@ func validateChatGPTWebMessageImageInputs(messages []helps.ChatGPTWebMessage) er
 	if len(references) == 0 {
 		return nil
 	}
-	for _, reference := range references {
-		reference = strings.TrimSpace(reference)
-		if strings.Contains(reference, "://") && !strings.HasPrefix(strings.ToLower(reference), "data:") {
-			return statusErr{
-				code:           http.StatusBadRequest,
-				msg:            "chatgpt web only supports base64 image inputs",
-				skipAuthResult: true,
-				retryOtherAuth: true,
-			}
-		}
-	}
-	if err := helps.ValidateChatGPTWebImageReferences(
-		references,
-		chatGPTWebMaxImageBytes,
-		chatGPTWebMaxImageRequestBytes,
-	); err != nil {
-		return statusErr{
-			code:           http.StatusRequestEntityTooLarge,
-			msg:            err.Error(),
-			skipAuthResult: true,
-		}
-	}
-	return nil
+	allowRemote := len(remoteEnabled) > 0 && remoteEnabled[0]
+	return validateChatGPTWebImageReferences(references, allowRemote)
 }
 
 func chatGPTWebMaxImageResults(metadata map[string]any) int {

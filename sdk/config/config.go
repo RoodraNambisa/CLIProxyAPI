@@ -79,17 +79,20 @@ type OpenAICompatibilityModel = internalconfig.OpenAICompatibilityModel
 type TLS = internalconfig.TLSConfig
 
 const (
-	DefaultPanelGitHubRepository               = internalconfig.DefaultPanelGitHubRepository
-	ChatGPTWebResizeFilterCatmullRom           = internalconfig.ChatGPTWebResizeFilterCatmullRom
-	ChatGPTWebResizeFilterApproxBiLinear       = internalconfig.ChatGPTWebResizeFilterApproxBiLinear
-	DefaultChatGPTWebResizeFilter              = internalconfig.DefaultChatGPTWebResizeFilter
-	DefaultChatGPTWebMaxImageResponseMegabytes = internalconfig.DefaultChatGPTWebMaxImageResponseMegabytes
-	MinChatGPTWebMaxImageResponseMegabytes     = internalconfig.MinChatGPTWebMaxImageResponseMegabytes
-	MaxChatGPTWebMaxImageResponseMegabytes     = internalconfig.MaxChatGPTWebMaxImageResponseMegabytes
-	DefaultChatGPTWebMaxN                      = internalconfig.DefaultChatGPTWebMaxN
-	DefaultChatGPTWebImageMaxInFlight          = internalconfig.DefaultChatGPTWebImageMaxInFlight
-	MinChatGPTWebImageMaxInFlight              = internalconfig.MinChatGPTWebImageMaxInFlight
-	RecommendedMaxChatGPTWebImageMaxInFlight   = internalconfig.RecommendedMaxChatGPTWebImageMaxInFlight
+	DefaultPanelGitHubRepository                 = internalconfig.DefaultPanelGitHubRepository
+	ChatGPTWebResizeFilterCatmullRom             = internalconfig.ChatGPTWebResizeFilterCatmullRom
+	ChatGPTWebResizeFilterApproxBiLinear         = internalconfig.ChatGPTWebResizeFilterApproxBiLinear
+	DefaultChatGPTWebResizeFilter                = internalconfig.DefaultChatGPTWebResizeFilter
+	ChatGPTWebRemoteImageDownloadDirect          = internalconfig.ChatGPTWebRemoteImageDownloadDirect
+	ChatGPTWebRemoteImageDownloadCredentialProxy = internalconfig.ChatGPTWebRemoteImageDownloadCredentialProxy
+	DefaultChatGPTWebRemoteImageDownloadMode     = internalconfig.DefaultChatGPTWebRemoteImageDownloadMode
+	DefaultChatGPTWebMaxImageResponseMegabytes   = internalconfig.DefaultChatGPTWebMaxImageResponseMegabytes
+	MinChatGPTWebMaxImageResponseMegabytes       = internalconfig.MinChatGPTWebMaxImageResponseMegabytes
+	MaxChatGPTWebMaxImageResponseMegabytes       = internalconfig.MaxChatGPTWebMaxImageResponseMegabytes
+	DefaultChatGPTWebMaxN                        = internalconfig.DefaultChatGPTWebMaxN
+	DefaultChatGPTWebImageMaxInFlight            = internalconfig.DefaultChatGPTWebImageMaxInFlight
+	MinChatGPTWebImageMaxInFlight                = internalconfig.MinChatGPTWebImageMaxInFlight
+	RecommendedMaxChatGPTWebImageMaxInFlight     = internalconfig.RecommendedMaxChatGPTWebImageMaxInFlight
 	// Deprecated: this advisory alias is not a validation limit. Use RecommendedMaxChatGPTWebImageMaxInFlight.
 	MaxChatGPTWebImageMaxInFlight                   = internalconfig.MaxChatGPTWebImageMaxInFlight
 	DefaultChatGPTWebImageAdmissionQueueSize        = internalconfig.DefaultChatGPTWebImageAdmissionQueueSize

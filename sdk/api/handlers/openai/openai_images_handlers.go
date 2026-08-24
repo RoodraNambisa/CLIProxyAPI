@@ -161,6 +161,28 @@ type imageReference struct {
 	FileID   string `json:"file_id,omitempty"`
 }
 
+func (reference *imageReference) UnmarshalJSON(payload []byte) error {
+	if reference == nil {
+		return errors.New("image reference is nil")
+	}
+	var directURL string
+	if errString := json.Unmarshal(payload, &directURL); errString == nil {
+		if strings.TrimSpace(directURL) == "" {
+			return errors.New("image URL is empty")
+		}
+		reference.ImageURL = strings.TrimSpace(directURL)
+		reference.FileID = ""
+		return nil
+	}
+	type imageReferenceAlias imageReference
+	var object imageReferenceAlias
+	if errObject := json.Unmarshal(payload, &object); errObject != nil {
+		return errObject
+	}
+	*reference = imageReference(object)
+	return nil
+}
+
 type imageOutputItem struct {
 	Type          string          `json:"type"`
 	Result        string          `json:"result"`
@@ -2226,38 +2248,48 @@ func chatGPTWebImageRequestCompatibilityError(req openAIImageRequest, ignoreUnsu
 	}
 	references := make([]string, 0, len(req.Images)+1)
 	for _, reference := range req.Images {
-		if !chatGPTWebSupportsImageReference(reference) {
+		if !chatGPTWebSupportsImageReference(reference, imageConfig.RemoteImageURLEnabled) {
 			return &chatGPTWebImageCompatibilityError{
 				parameter: "images",
-				message:   "chatgpt web only supports data URL image inputs",
+				message:   "chatgpt web does not support this image reference",
 			}
 		}
 		imageURL, _ := imageURLFromReference(reference)
-		references = append(references, imageURL)
+		if !executorhelps.IsChatGPTWebRemoteImageURL(imageURL) {
+			references = append(references, imageURL)
+		}
 	}
 	if req.Mask != nil {
-		if !chatGPTWebSupportsImageReference(*req.Mask) {
+		if !chatGPTWebSupportsImageReference(*req.Mask, imageConfig.RemoteImageURLEnabled) {
 			return &chatGPTWebImageCompatibilityError{
 				parameter: "mask",
-				message:   "chatgpt web only supports data URL image masks",
+				message:   "chatgpt web does not support this image mask reference",
 			}
 		}
 		maskURL, err := imageURLFromReference(*req.Mask)
-		if err != nil || strings.HasPrefix(strings.ToLower(maskURL), "data:image/webp") {
+		if err != nil || (!executorhelps.IsChatGPTWebRemoteImageURL(maskURL) && strings.HasPrefix(strings.ToLower(maskURL), "data:image/webp")) {
 			return &chatGPTWebImageCompatibilityError{
 				parameter: "mask",
 				message:   "chatgpt web does not support WebP masks",
 			}
 		}
-		references = append(references, maskURL)
+		if !executorhelps.IsChatGPTWebRemoteImageURL(maskURL) {
+			references = append(references, maskURL)
+		}
 		for _, reference := range req.Images {
 			imageURL, errImage := imageURLFromReference(reference)
-			if errImage != nil || strings.HasPrefix(strings.ToLower(imageURL), "data:image/webp") {
+			if errImage != nil || (!executorhelps.IsChatGPTWebRemoteImageURL(imageURL) && strings.HasPrefix(strings.ToLower(imageURL), "data:image/webp")) {
 				return &chatGPTWebImageCompatibilityError{
 					parameter: "images",
 					message:   "chatgpt web does not support WebP image inputs with a mask",
 				}
 			}
+		}
+	}
+	if len(req.Images)+boolToInt(req.Mask != nil) > executorhelps.ChatGPTWebMaxImageInputs {
+		return &chatGPTWebImageCompatibilityError{
+			parameter: "images",
+			message:   fmt.Sprintf("chatgpt web image inputs exceed %d items", executorhelps.ChatGPTWebMaxImageInputs),
 		}
 	}
 	if err := executorhelps.ValidateChatGPTWebImageReferences(
@@ -2339,7 +2371,7 @@ func chatGPTWebUnsupportedParameterError(compatibilityErr *chatGPTWebImageCompat
 	return errors.New(string(payload))
 }
 
-func chatGPTWebSupportsImageReference(reference imageReference) bool {
+func chatGPTWebSupportsImageReference(reference imageReference, remoteEnabled ...bool) bool {
 	if strings.TrimSpace(reference.FileID) != "" {
 		return false
 	}
@@ -2347,7 +2379,18 @@ func chatGPTWebSupportsImageReference(reference imageReference) bool {
 	if err != nil {
 		return false
 	}
-	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(imageURL)), "data:image/")
+	imageURL = strings.TrimSpace(imageURL)
+	if strings.HasPrefix(strings.ToLower(imageURL), "data:image/") {
+		return true
+	}
+	return len(remoteEnabled) > 0 && remoteEnabled[0] && executorhelps.ValidateChatGPTWebRemoteImageURL(imageURL) == nil
+}
+
+func boolToInt(value bool) int {
+	if value {
+		return 1
+	}
+	return 0
 }
 
 func (m *imageStreamMapper) writeCompleted(w io.Writer, result imageResult, usage json.RawMessage) {
@@ -2596,6 +2639,8 @@ func (h *OpenAIImagesAPIHandler) chatGPTWebImageConfigSnapshot() coreexecutor.Ch
 		resolved = h.Cfg.Images.ChatGPTWeb.Resolved()
 	}
 	return coreexecutor.ChatGPTWebImageConfigSnapshot{
+		RemoteImageURLEnabled:      resolved.RemoteImageURLEnabled,
+		RemoteImageURLDownloadMode: resolved.RemoteImageURLDownloadMode,
 		AdaptSizeToAspectRatio:     resolved.AdaptSizeToAspectRatio,
 		StrictSize:                 resolved.StrictSize,
 		AspectRatioMaxErrorPercent: resolved.AspectRatioMaxErrorPercent,
