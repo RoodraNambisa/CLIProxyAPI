@@ -231,6 +231,12 @@ type ChatGPTWebImageConfig struct {
 	MemoryCapacityMegabytes *int `yaml:"memory-capacity-megabytes,omitempty" json:"memory-capacity-megabytes,omitempty"`
 	// PollConcurrency bounds concurrent ChatGPT Web image poll HTTP requests.
 	PollConcurrency *int `yaml:"poll-concurrency,omitempty" json:"poll-concurrency,omitempty"`
+	// PollStallBreakerEnabled rejects new image attempts when every poll slot has
+	// remained occupied without a completed exchange for the configured interval.
+	PollStallBreakerEnabled *bool `yaml:"poll-stall-breaker-enabled,omitempty" json:"poll-stall-breaker-enabled,omitempty"`
+	// PollStallSeconds controls how long full poll-slot saturation may make no
+	// transport progress before the breaker opens.
+	PollStallSeconds *int `yaml:"poll-stall-seconds,omitempty" json:"poll-stall-seconds,omitempty"`
 	// MemoryFinalizerConcurrency bounds finalizers that download to disk and
 	// reserve their complete in-memory working set before decode or encode work.
 	MemoryFinalizerConcurrency *int `yaml:"memory-finalizer-concurrency,omitempty" json:"memory-finalizer-concurrency,omitempty"`
@@ -292,6 +298,10 @@ const (
 	RecommendedMaxChatGPTWebImagePollConcurrency = 512
 	// Deprecated: this advisory alias is not a validation limit. Use RecommendedMaxChatGPTWebImagePollConcurrency.
 	MaxChatGPTWebImagePollConcurrency                       = RecommendedMaxChatGPTWebImagePollConcurrency
+	DefaultChatGPTWebImagePollStallBreakerEnabled           = true
+	DefaultChatGPTWebImagePollStallSeconds                  = 120
+	MinChatGPTWebImagePollStallSeconds                      = 30
+	MaxChatGPTWebImagePollStallSeconds                      = 3600
 	DefaultChatGPTWebImageMemoryFinalizerConcurrency        = 1
 	MinChatGPTWebImageMemoryFinalizerConcurrency            = 1
 	RecommendedMaxChatGPTWebImageMemoryFinalizerConcurrency = 64
@@ -340,6 +350,8 @@ type ResolvedChatGPTWebImageConfig struct {
 	CompletionReserveMegabytes int
 	MemoryCapacityMegabytes    int
 	PollConcurrency            int
+	PollStallBreakerEnabled    bool
+	PollStallSeconds           int
 	MemoryFinalizerConcurrency int
 }
 
@@ -373,6 +385,8 @@ func (cfg ChatGPTWebImageConfig) Resolved() ResolvedChatGPTWebImageConfig {
 		CompletionReserveMegabytes: DefaultChatGPTWebImageCompletionReserveMB,
 		MemoryCapacityMegabytes:    DefaultChatGPTWebImageMemoryCapacityMB,
 		PollConcurrency:            DefaultChatGPTWebImagePollConcurrency,
+		PollStallBreakerEnabled:    DefaultChatGPTWebImagePollStallBreakerEnabled,
+		PollStallSeconds:           DefaultChatGPTWebImagePollStallSeconds,
 		MemoryFinalizerConcurrency: DefaultChatGPTWebImageMemoryFinalizerConcurrency,
 	}
 	if mode := strings.ToLower(strings.TrimSpace(cfg.RemoteImageURLDownloadMode)); mode != "" {
@@ -413,6 +427,12 @@ func (cfg ChatGPTWebImageConfig) Resolved() ResolvedChatGPTWebImageConfig {
 	}
 	if cfg.PollConcurrency != nil {
 		resolved.PollConcurrency = *cfg.PollConcurrency
+	}
+	if cfg.PollStallBreakerEnabled != nil {
+		resolved.PollStallBreakerEnabled = *cfg.PollStallBreakerEnabled
+	}
+	if cfg.PollStallSeconds != nil {
+		resolved.PollStallSeconds = *cfg.PollStallSeconds
 	}
 	if cfg.MemoryFinalizerConcurrency != nil {
 		resolved.MemoryFinalizerConcurrency = *cfg.MemoryFinalizerConcurrency
@@ -483,6 +503,9 @@ func (cfg ChatGPTWebImageConfig) Validate() error {
 	}
 	if resolved.PollConcurrency < MinChatGPTWebImagePollConcurrency {
 		return fmt.Errorf("images.chatgpt-web.poll-concurrency must be at least %d", MinChatGPTWebImagePollConcurrency)
+	}
+	if resolved.PollStallSeconds < MinChatGPTWebImagePollStallSeconds || resolved.PollStallSeconds > MaxChatGPTWebImagePollStallSeconds {
+		return fmt.Errorf("images.chatgpt-web.poll-stall-seconds must be between %d and %d", MinChatGPTWebImagePollStallSeconds, MaxChatGPTWebImagePollStallSeconds)
 	}
 	if resolved.MemoryFinalizerConcurrency < MinChatGPTWebImageMemoryFinalizerConcurrency {
 		return fmt.Errorf("images.chatgpt-web.memory-finalizer-concurrency must be at least %d", MinChatGPTWebImageMemoryFinalizerConcurrency)

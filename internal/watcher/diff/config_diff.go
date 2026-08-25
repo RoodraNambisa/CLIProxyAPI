@@ -352,6 +352,14 @@ func BuildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 	if oldCfg.Images.ChatGPTWeb.IgnoreUnsupportedParams != newCfg.Images.ChatGPTWeb.IgnoreUnsupportedParams {
 		changes = append(changes, fmt.Sprintf("images.chatgpt-web.ignore-unsupported-params: %t -> %t", oldCfg.Images.ChatGPTWeb.IgnoreUnsupportedParams, newCfg.Images.ChatGPTWeb.IgnoreUnsupportedParams))
 	}
+	oldImageRuntime := oldCfg.Images.ChatGPTWeb.Resolved()
+	newImageRuntime := newCfg.Images.ChatGPTWeb.Resolved()
+	if oldImageRuntime.PollStallBreakerEnabled != newImageRuntime.PollStallBreakerEnabled {
+		changes = append(changes, fmt.Sprintf("images.chatgpt-web.poll-stall-breaker-enabled: %t -> %t", oldImageRuntime.PollStallBreakerEnabled, newImageRuntime.PollStallBreakerEnabled))
+	}
+	if oldImageRuntime.PollStallSeconds != newImageRuntime.PollStallSeconds {
+		changes = append(changes, fmt.Sprintf("images.chatgpt-web.poll-stall-seconds: %d -> %d", oldImageRuntime.PollStallSeconds, newImageRuntime.PollStallSeconds))
+	}
 
 	// Codex keys (do not print key material)
 	if len(oldCfg.CodexKey) != len(newCfg.CodexKey) {

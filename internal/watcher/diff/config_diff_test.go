@@ -163,6 +163,21 @@ func TestBuildConfigChangeDetails_ChatGPTWebTokenUsageEstimation(t *testing.T) {
 	}
 }
 
+func TestBuildConfigChangeDetails_ChatGPTWebImagePollStallBreaker(t *testing.T) {
+	disabled := false
+	stallSeconds := 300
+	details := BuildConfigChangeDetails(&config.Config{}, &config.Config{SDKConfig: config.SDKConfig{
+		Images: config.ImagesConfig{
+			ChatGPTWeb: config.ChatGPTWebImageConfig{
+				PollStallBreakerEnabled: &disabled,
+				PollStallSeconds:        &stallSeconds,
+			},
+		},
+	}})
+	expectContains(t, details, "images.chatgpt-web.poll-stall-breaker-enabled: true -> false")
+	expectContains(t, details, "images.chatgpt-web.poll-stall-seconds: 120 -> 300")
+}
+
 func TestBuildConfigChangeDetailsDoesNotExposeLoginProxyTemplate(t *testing.T) {
 	oldConfig := &config.Config{ChatGPTWeb: config.ChatGPTWebConfig{LoginProxy: config.ChatGPTWebLoginProxyConfig{
 		URLTemplate: "http://user:old-secret@old-proxy.example:8080",

@@ -14,6 +14,7 @@ func TestChatGPTWebImageAdmissionRecommendationsAreReexported(t *testing.T) {
 		{name: "completion reserve", minimum: MinChatGPTWebImageCompletionReserveMB, value: DefaultChatGPTWebImageCompletionReserveMB, maximum: RecommendedMaxChatGPTWebImageCompletionReserveMB},
 		{name: "memory capacity", minimum: RecommendedMinChatGPTWebImageMemoryCapacityMB, value: DefaultChatGPTWebImageMemoryCapacityMB, maximum: RecommendedMaxChatGPTWebImageMemoryCapacityMB},
 		{name: "poll concurrency", minimum: MinChatGPTWebImagePollConcurrency, value: DefaultChatGPTWebImagePollConcurrency, maximum: RecommendedMaxChatGPTWebImagePollConcurrency},
+		{name: "poll stall seconds", minimum: MinChatGPTWebImagePollStallSeconds, value: DefaultChatGPTWebImagePollStallSeconds, maximum: MaxChatGPTWebImagePollStallSeconds},
 		{name: "memory finalizer concurrency", minimum: MinChatGPTWebImageMemoryFinalizerConcurrency, value: DefaultChatGPTWebImageMemoryFinalizerConcurrency, maximum: RecommendedMaxChatGPTWebImageMemoryFinalizerConcurrency},
 	}
 	for _, check := range checks {

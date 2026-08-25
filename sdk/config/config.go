@@ -131,6 +131,10 @@ const (
 	RecommendedMaxChatGPTWebImagePollConcurrency = internalconfig.RecommendedMaxChatGPTWebImagePollConcurrency
 	// Deprecated: this advisory alias is not a validation limit. Use RecommendedMaxChatGPTWebImagePollConcurrency.
 	MaxChatGPTWebImagePollConcurrency                       = internalconfig.MaxChatGPTWebImagePollConcurrency
+	DefaultChatGPTWebImagePollStallBreakerEnabled           = internalconfig.DefaultChatGPTWebImagePollStallBreakerEnabled
+	DefaultChatGPTWebImagePollStallSeconds                  = internalconfig.DefaultChatGPTWebImagePollStallSeconds
+	MinChatGPTWebImagePollStallSeconds                      = internalconfig.MinChatGPTWebImagePollStallSeconds
+	MaxChatGPTWebImagePollStallSeconds                      = internalconfig.MaxChatGPTWebImagePollStallSeconds
 	DefaultChatGPTWebImageMemoryFinalizerConcurrency        = internalconfig.DefaultChatGPTWebImageMemoryFinalizerConcurrency
 	MinChatGPTWebImageMemoryFinalizerConcurrency            = internalconfig.MinChatGPTWebImageMemoryFinalizerConcurrency
 	RecommendedMaxChatGPTWebImageMemoryFinalizerConcurrency = internalconfig.RecommendedMaxChatGPTWebImageMemoryFinalizerConcurrency

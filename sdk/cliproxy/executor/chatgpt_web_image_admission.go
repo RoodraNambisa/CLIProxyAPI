@@ -39,6 +39,7 @@ var (
 	defaultChatGPTWebImageExecutionAdmission = newImageExecutionAdmission()
 	defaultChatGPTWebImageFinalizerAdmission = newImageExecutionAdmission()
 	defaultChatGPTWebImagePollAdmission      = newConfiguredImageExecutionAdmission(64, 128)
+	defaultChatGPTWebImagePollStallBreaker   = newImagePollStallBreaker(time.Now)
 	defaultChatGPTWebImageMemoryFinalizer    = newConfiguredImageExecutionAdmission(1, 64)
 	globalImageRequestPhaseObserver          = newImageRequestPhaseObserver()
 	globalImageRequestPhaseRollingSampler    = newImageRequestPhaseRollingSampler(time.Minute, 128)
@@ -178,10 +179,27 @@ func ConfigureChatGPTWebImageRuntimeAdmissions(maxInFlight, pollConcurrency, mem
 	defaultChatGPTWebImageMemoryFinalizer.configure(memoryFinalizerConcurrency, queueLimit)
 }
 
+// ConfigureChatGPTWebImagePollStallBreaker applies the current process-wide
+// transport stagnation policy without changing in-flight requests.
+func ConfigureChatGPTWebImagePollStallBreaker(enabled bool, stallDuration time.Duration) {
+	defaultChatGPTWebImagePollStallBreaker.configure(enabled, stallDuration)
+}
+
 // AcquireChatGPTWebImageExecution bounds the complete selected Web image
 // attempt, including sleeping task polls.
 func AcquireChatGPTWebImageExecution(ctx context.Context, wait time.Duration) (func(), error) {
-	return defaultChatGPTWebImageExecutionAdmission.acquire(ctx, wait)
+	if defaultChatGPTWebImagePollStallBreaker.reject(defaultChatGPTWebImagePollAdmission.snapshot()) {
+		return nil, &ImagePollStallError{}
+	}
+	release, err := defaultChatGPTWebImageExecutionAdmission.acquire(ctx, wait)
+	if err != nil {
+		return nil, err
+	}
+	if defaultChatGPTWebImagePollStallBreaker.reject(defaultChatGPTWebImagePollAdmission.snapshot()) {
+		release()
+		return nil, &ImagePollStallError{}
+	}
+	return release, nil
 }
 
 // AcquireChatGPTWebImageFinalizer bounds settled tasks admitted to finalizer
@@ -193,7 +211,25 @@ func AcquireChatGPTWebImageFinalizer(ctx context.Context) (func(), error) {
 // AcquireChatGPTWebImagePoll bounds one actual poll HTTP exchange. Sleeping
 // intervals between polls do not retain this admission.
 func AcquireChatGPTWebImagePoll(ctx context.Context) (func(), error) {
-	return defaultChatGPTWebImagePollAdmission.acquire(ctx, -1)
+	release, err := defaultChatGPTWebImagePollAdmission.acquire(ctx, -1)
+	if err != nil {
+		return nil, err
+	}
+	defaultChatGPTWebImagePollStallBreaker.observeAdmission(defaultChatGPTWebImagePollAdmission.snapshot())
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			release()
+			defaultChatGPTWebImagePollStallBreaker.observeAdmission(defaultChatGPTWebImagePollAdmission.snapshot())
+		})
+	}, nil
+}
+
+// ObserveChatGPTWebImagePollCompletion records one completed poll exchange.
+// Canceled exchanges release capacity but do not prove that upstream transport
+// progress has resumed.
+func ObserveChatGPTWebImagePollCompletion(canceled bool) {
+	defaultChatGPTWebImagePollStallBreaker.observeCompletion(canceled, defaultChatGPTWebImagePollAdmission.snapshot())
 }
 
 // AcquireChatGPTWebImageMemoryFinalizer bounds disk-spooled download, decode,
@@ -215,6 +251,11 @@ func ChatGPTWebImageFinalizerAdmissionSnapshot() ImageExecutionAdmissionSnapshot
 // ChatGPTWebImagePollAdmissionSnapshot returns actual poll HTTP concurrency metrics.
 func ChatGPTWebImagePollAdmissionSnapshot() ImageExecutionAdmissionSnapshot {
 	return defaultChatGPTWebImagePollAdmission.snapshot()
+}
+
+// ChatGPTWebImagePollStallBreakerSnapshot returns process-wide breaker metrics.
+func ChatGPTWebImagePollStallBreakerSnapshot() ImagePollStallBreakerSnapshot {
+	return defaultChatGPTWebImagePollStallBreaker.snapshot(defaultChatGPTWebImagePollAdmission.snapshot())
 }
 
 // ChatGPTWebImageMemoryFinalizerAdmissionSnapshot returns memory-heavy finalizer metrics.

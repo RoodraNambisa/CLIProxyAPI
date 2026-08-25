@@ -111,6 +111,8 @@ func TestLoadConfigOptionalChatGPTWebImageAspectSettings(t *testing.T) {
     completion-reserve-megabytes: 2
     memory-capacity-megabytes: 768
     poll-concurrency: 96
+    poll-stall-breaker-enabled: false
+    poll-stall-seconds: 300
     memory-finalizer-concurrency: 4
 `)
 	if err := os.WriteFile(path, data, 0o600); err != nil {
@@ -127,7 +129,8 @@ func TestLoadConfigOptionalChatGPTWebImageAspectSettings(t *testing.T) {
 		resolved.MaxImageResponseMegabytes != responseBudget || resolved.MaxN != 2 ||
 		resolved.MaxInFlight != 48 || resolved.AdmissionQueueSize != 24 || resolved.AdmissionWaitMilliseconds != 750 ||
 		resolved.MaxFinalizers != 6 || resolved.CompletionReserveMegabytes != 2 || resolved.MemoryCapacityMegabytes != 768 ||
-		resolved.PollConcurrency != 96 || resolved.MemoryFinalizerConcurrency != 4 {
+		resolved.PollConcurrency != 96 || resolved.PollStallBreakerEnabled || resolved.PollStallSeconds != 300 ||
+		resolved.MemoryFinalizerConcurrency != 4 {
 		t.Fatalf("resolved ChatGPT Web image config = %#v", resolved)
 	}
 }
@@ -149,6 +152,8 @@ func TestChatGPTWebImageAspectSettingsDefaultsAndValidation(t *testing.T) {
 		resolved.CompletionReserveMegabytes != DefaultChatGPTWebImageCompletionReserveMB ||
 		resolved.MemoryCapacityMegabytes != DefaultChatGPTWebImageMemoryCapacityMB ||
 		resolved.PollConcurrency != DefaultChatGPTWebImagePollConcurrency ||
+		resolved.PollStallBreakerEnabled != DefaultChatGPTWebImagePollStallBreakerEnabled ||
+		resolved.PollStallSeconds != DefaultChatGPTWebImagePollStallSeconds ||
 		resolved.MemoryFinalizerConcurrency != DefaultChatGPTWebImageMemoryFinalizerConcurrency {
 		t.Fatalf("resolved defaults = %#v", resolved)
 	}
@@ -169,6 +174,8 @@ func TestChatGPTWebImageAspectSettingsDefaultsAndValidation(t *testing.T) {
 	negativeReserve := -1
 	zeroMemoryCapacity := 0
 	zeroPollConcurrency := 0
+	tooShortPollStall := MinChatGPTWebImagePollStallSeconds - 1
+	tooLongPollStall := MaxChatGPTWebImagePollStallSeconds + 1
 	zeroMemoryFinalizers := 0
 	aboveRecommendedInFlight := 5000
 	aboveRecommendedQueue := 5000
@@ -214,6 +221,8 @@ func TestChatGPTWebImageAspectSettingsDefaultsAndValidation(t *testing.T) {
 		{name: "negative reserve", cfg: ChatGPTWebImageConfig{CompletionReserveMegabytes: &negativeReserve}},
 		{name: "zero memory capacity", cfg: ChatGPTWebImageConfig{MemoryCapacityMegabytes: &zeroMemoryCapacity}},
 		{name: "zero poll concurrency", cfg: ChatGPTWebImageConfig{PollConcurrency: &zeroPollConcurrency}},
+		{name: "short poll stall", cfg: ChatGPTWebImageConfig{PollStallSeconds: &tooShortPollStall}},
+		{name: "long poll stall", cfg: ChatGPTWebImageConfig{PollStallSeconds: &tooLongPollStall}},
 		{name: "zero memory finalizers", cfg: ChatGPTWebImageConfig{MemoryFinalizerConcurrency: &zeroMemoryFinalizers}},
 	}
 	overflowInFlight := math.MaxInt/2 + 1
@@ -276,6 +285,8 @@ func TestLoadConfigOptionalRejectsInvalidChatGPTWebImageAspectSettings(t *testin
 		{name: "completion reserve", body: "completion-reserve-megabytes: -1"},
 		{name: "memory capacity", body: "memory-capacity-megabytes: 0"},
 		{name: "poll concurrency", body: "poll-concurrency: 0"},
+		{name: "short poll stall", body: "poll-stall-seconds: 29"},
+		{name: "long poll stall", body: "poll-stall-seconds: 3601"},
 		{name: "memory finalizer concurrency", body: "memory-finalizer-concurrency: 0"},
 	}
 	for _, test := range tests {

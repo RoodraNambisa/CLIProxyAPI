@@ -306,6 +306,10 @@ func configureChatGPTWebImageAdmissions(resolved config.ResolvedChatGPTWebImageC
 		resolved.PollConcurrency,
 		resolved.MemoryFinalizerConcurrency,
 	)
+	cliproxyexecutor.ConfigureChatGPTWebImagePollStallBreaker(
+		resolved.PollStallBreakerEnabled,
+		time.Duration(resolved.PollStallSeconds)*time.Second,
+	)
 }
 
 func chatGPTWebSentinelRuntimeConfig(cfg *config.Config) chatgptwebauth.SentinelRuntimeConfig {

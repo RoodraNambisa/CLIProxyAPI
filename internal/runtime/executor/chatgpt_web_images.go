@@ -4544,6 +4544,11 @@ func (e *ChatGPTWebExecutor) doChatGPTWebPollGET(ctx context.Context, client *ch
 	defer releasePoll()
 	started := time.Now()
 	response, payload, release, err := e.doChatGPTWebGETWithBudget(ctx, client, credential, path, extra, budget, false)
+	canceled := errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+	if ctx != nil && ctx.Err() != nil {
+		canceled = true
+	}
+	cliproxyexecutor.ObserveChatGPTWebImagePollCompletion(canceled)
 	cliproxyexecutor.ObserveRequestPhaseContext(ctx, cliproxyexecutor.ImagePhasePollRequest, started)
 	return response, payload, release, err
 }
