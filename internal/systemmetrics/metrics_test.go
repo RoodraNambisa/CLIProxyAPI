@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestCollectFilesystemUsesNearestExistingAncestor(t *testing.T) {
@@ -76,5 +77,64 @@ func TestCollectRuntimeReturnsProcessMetrics(t *testing.T) {
 	if snapshot.RuntimeSysBytes < snapshot.HeapAllocBytes ||
 		snapshot.HeapInuseBytes < snapshot.HeapAllocBytes {
 		t.Fatalf("runtime memory = %#v", snapshot)
+	}
+}
+
+func TestRuntimeRateSamplerCalculatesProcessAndGCRates(t *testing.T) {
+	sampler := &runtimeRateSampler{}
+	started := time.Unix(100, 0)
+	if first := sampler.observe(runtimeRatePoint{
+		at:             started,
+		processCPUNano: uint64(time.Second),
+		cpuAvailable:   true,
+		totalAlloc:     100,
+		gcCycles:       2,
+		gcPauseNanos:   uint64(10 * time.Millisecond),
+	}, 4); first.available {
+		t.Fatalf("first sample = %#v, want unavailable", first)
+	}
+	rate := sampler.observe(runtimeRatePoint{
+		at:             started.Add(2 * time.Second),
+		processCPUNano: uint64(3 * time.Second),
+		cpuAvailable:   true,
+		totalAlloc:     1_100,
+		gcCycles:       6,
+		gcPauseNanos:   uint64(30 * time.Millisecond),
+	}, 4)
+	if !rate.available || !rate.processCPUAvailable || rate.sampleSeconds != 2 ||
+		math.Abs(rate.processCPUPercent-100) > 0.001 ||
+		math.Abs(rate.processCPUNormalizedPercent-25) > 0.001 ||
+		math.Abs(rate.allocationBytesPerSecond-500) > 0.001 ||
+		math.Abs(rate.gcCyclesPerSecond-2) > 0.001 ||
+		math.Abs(rate.gcPausePercent-1) > 0.001 {
+		t.Fatalf("rate = %#v", rate)
+	}
+}
+
+func TestRuntimeRateSamplerResetsAfterCounterRegression(t *testing.T) {
+	sampler := &runtimeRateSampler{}
+	started := time.Unix(100, 0)
+	_ = sampler.observe(runtimeRatePoint{at: started, totalAlloc: 100, gcCycles: 2, gcPauseNanos: 10}, 1)
+	regressed := sampler.observe(runtimeRatePoint{at: started.Add(time.Second), totalAlloc: 99, gcCycles: 2, gcPauseNanos: 10}, 1)
+	if regressed.available {
+		t.Fatalf("regressed sample = %#v, want unavailable", regressed)
+	}
+	recovered := sampler.observe(runtimeRatePoint{at: started.Add(2 * time.Second), totalAlloc: 199, gcCycles: 3, gcPauseNanos: 20}, 1)
+	if !recovered.available || recovered.allocationBytesPerSecond != 100 {
+		t.Fatalf("recovered sample = %#v", recovered)
+	}
+}
+
+func TestRuntimeRateSamplerRejectsStaleInterval(t *testing.T) {
+	sampler := &runtimeRateSampler{}
+	started := time.Unix(100, 0)
+	_ = sampler.observe(runtimeRatePoint{at: started, totalAlloc: 100}, 1)
+	stale := sampler.observe(runtimeRatePoint{at: started.Add(runtimeRateMaxSampleInterval + time.Second), totalAlloc: 200}, 1)
+	if stale.available {
+		t.Fatalf("stale sample = %#v, want unavailable", stale)
+	}
+	recovered := sampler.observe(runtimeRatePoint{at: started.Add(runtimeRateMaxSampleInterval + 2*time.Second), totalAlloc: 300}, 1)
+	if !recovered.available || recovered.allocationBytesPerSecond != 100 {
+		t.Fatalf("recovered sample = %#v", recovered)
 	}
 }

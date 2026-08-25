@@ -444,3 +444,69 @@ func TestImageRequestPhaseSnapshotUsesNamedBuckets(t *testing.T) {
 		t.Fatalf("metric = %#v", value)
 	}
 }
+
+func TestImageRequestPhaseRollingSamplerReturnsWindowDeltas(t *testing.T) {
+	sampler := newImageRequestPhaseRollingSampler(time.Minute, 4)
+	started := time.Unix(100, 0)
+	first := map[string]ImageRequestPhaseMetricSnapshot{
+		ImagePhasePollRequest: {Count: 10, TotalNanos: 100, UpTo1Millisecond: 4, Over1To10Milliseconds: 6},
+	}
+	if snapshot := sampler.observe(started, first); snapshot.Available || snapshot.HistorySamples != 1 {
+		t.Fatalf("first snapshot = %#v", snapshot)
+	}
+	second := map[string]ImageRequestPhaseMetricSnapshot{
+		ImagePhasePollRequest: {Count: 14, TotalNanos: 300, UpTo1Millisecond: 5, Over1To10Milliseconds: 9},
+	}
+	snapshot := sampler.observe(started.Add(5*time.Second), second)
+	metric := snapshot.Metrics[ImagePhasePollRequest]
+	if !snapshot.Available || snapshot.SampleSeconds != 5 || snapshot.HistorySamples != 2 ||
+		metric.Count != 4 || metric.TotalNanos != 200 || metric.AverageNanos != 50 ||
+		metric.UpTo1Millisecond != 1 || metric.Over1To10Milliseconds != 3 {
+		t.Fatalf("snapshot = %#v, metric = %#v", snapshot, metric)
+	}
+}
+
+func TestImageRequestPhaseRollingSamplerKeepsBoundedWindow(t *testing.T) {
+	sampler := newImageRequestPhaseRollingSampler(10*time.Second, 3)
+	started := time.Unix(100, 0)
+	for index := range 5 {
+		sampler.observe(started.Add(time.Duration(index)*5*time.Second), map[string]ImageRequestPhaseMetricSnapshot{
+			ImagePhasePollRequest: {Count: uint64(index)},
+		})
+	}
+	snapshot := sampler.observe(started.Add(25*time.Second), map[string]ImageRequestPhaseMetricSnapshot{
+		ImagePhasePollRequest: {Count: 5},
+	})
+	if !snapshot.Available || snapshot.HistorySamples > 3 || snapshot.SampleSeconds > 10 ||
+		snapshot.Metrics[ImagePhasePollRequest].Count != 2 {
+		t.Fatalf("snapshot = %#v", snapshot)
+	}
+}
+
+func TestImageRequestPhaseRollingSamplerRejectsStalePair(t *testing.T) {
+	sampler := newImageRequestPhaseRollingSampler(time.Minute, 4)
+	started := time.Unix(100, 0)
+	_ = sampler.observe(started, map[string]ImageRequestPhaseMetricSnapshot{
+		ImagePhasePollRequest: {Count: 1},
+	})
+	snapshot := sampler.observe(started.Add(2*time.Minute), map[string]ImageRequestPhaseMetricSnapshot{
+		ImagePhasePollRequest: {Count: 2},
+	})
+	if snapshot.Available || snapshot.HistorySamples != 1 {
+		t.Fatalf("snapshot = %#v", snapshot)
+	}
+}
+
+func TestImageRequestPhaseRollingSamplerResetsOnCounterRegression(t *testing.T) {
+	sampler := newImageRequestPhaseRollingSampler(time.Minute, 4)
+	started := time.Unix(100, 0)
+	_ = sampler.observe(started, map[string]ImageRequestPhaseMetricSnapshot{
+		ImagePhasePollRequest: {Count: 2, TotalNanos: 10},
+	})
+	snapshot := sampler.observe(started.Add(time.Second), map[string]ImageRequestPhaseMetricSnapshot{
+		ImagePhasePollRequest: {Count: 1, TotalNanos: 5},
+	})
+	if snapshot.Available || snapshot.HistorySamples != 1 {
+		t.Fatalf("snapshot = %#v", snapshot)
+	}
+}

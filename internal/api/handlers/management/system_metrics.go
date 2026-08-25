@@ -43,6 +43,7 @@ type systemMetricsImageRequestPhases struct {
 	WebScope                    string                                                  `json:"chatgpt_web_scope"`
 	ResponseWriteCountSemantics string                                                  `json:"response_write_count_semantics"`
 	Metrics                     map[string]coreexecutor.ImageRequestPhaseMetricSnapshot `json:"metrics"`
+	Rolling                     coreexecutor.ImageRequestPhaseRollingSnapshot           `json:"rolling"`
 }
 
 // GetSystemMetrics returns low-overhead process and filesystem metrics.
@@ -84,6 +85,7 @@ func (h *Handler) GetSystemMetrics(c *gin.Context) {
 			WebScope:                    "chatgpt_web_only_after_executor_selection",
 			ResponseWriteCountSemantics: "write_operations",
 			Metrics:                     coreexecutor.ImageRequestPhaseSnapshot(),
+			Rolling:                     coreexecutor.ImageRequestPhaseRollingWindowSnapshot(),
 		},
 		Filesystems: systemMetricsFilesystems{
 			WorkingDirectory: systemmetrics.CollectFilesystem(workingDirectory),

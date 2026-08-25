@@ -103,7 +103,8 @@ func TestGetSystemMetricsReturnsRuntimeAndConfiguredFilesystems(t *testing.T) {
 	if response.ImageRequestPhases.HandlerScope != "all_image_routes" ||
 		response.ImageRequestPhases.WebScope != "chatgpt_web_only_after_executor_selection" ||
 		response.ImageRequestPhases.ResponseWriteCountSemantics != "write_operations" ||
-		response.ImageRequestPhases.Metrics == nil {
+		response.ImageRequestPhases.Metrics == nil || response.ImageRequestPhases.Rolling.Metrics == nil ||
+		response.ImageRequestPhases.Rolling.RequestedWindowSeconds != 60 {
 		t.Fatalf("ImageRequestPhases = %#v", response.ImageRequestPhases)
 	}
 }

@@ -41,6 +41,7 @@ var (
 	defaultChatGPTWebImagePollAdmission      = newConfiguredImageExecutionAdmission(64, 128)
 	defaultChatGPTWebImageMemoryFinalizer    = newConfiguredImageExecutionAdmission(1, 64)
 	globalImageRequestPhaseObserver          = newImageRequestPhaseObserver()
+	globalImageRequestPhaseRollingSampler    = newImageRequestPhaseRollingSampler(time.Minute, 128)
 )
 
 // ImageExecutionCapacityError reports bounded local overload before the first
@@ -499,6 +500,40 @@ type ImageRequestPhaseMetricSnapshot struct {
 	Over10Seconds           uint64 `json:"over_10_seconds"`
 }
 
+// ImageRequestPhaseRollingMetricSnapshot contains one rolling-window delta.
+type ImageRequestPhaseRollingMetricSnapshot struct {
+	Count                   uint64 `json:"count"`
+	TotalNanos              uint64 `json:"total_nanos"`
+	AverageNanos            uint64 `json:"average_nanos"`
+	UpTo1Millisecond        uint64 `json:"up_to_1_millisecond"`
+	Over1To10Milliseconds   uint64 `json:"over_1_to_10_milliseconds"`
+	Over10To100Milliseconds uint64 `json:"over_10_to_100_milliseconds"`
+	Over100MillisecondsTo1S uint64 `json:"over_100_milliseconds_to_1_second"`
+	Over1To10Seconds        uint64 `json:"over_1_to_10_seconds"`
+	Over10Seconds           uint64 `json:"over_10_seconds"`
+}
+
+// ImageRequestPhaseRollingSnapshot describes deltas between management polls.
+type ImageRequestPhaseRollingSnapshot struct {
+	Available              bool                                              `json:"available"`
+	RequestedWindowSeconds uint64                                            `json:"requested_window_seconds"`
+	SampleSeconds          float64                                           `json:"sample_seconds"`
+	HistorySamples         int                                               `json:"history_samples"`
+	Metrics                map[string]ImageRequestPhaseRollingMetricSnapshot `json:"metrics"`
+}
+
+type imageRequestPhaseRollingPoint struct {
+	at      time.Time
+	metrics map[string]ImageRequestPhaseMetricSnapshot
+}
+
+type imageRequestPhaseRollingSampler struct {
+	mu         sync.Mutex
+	window     time.Duration
+	maxSamples int
+	history    []imageRequestPhaseRollingPoint
+}
+
 type imageRequestPhaseMetric struct {
 	count      atomic.Uint64
 	totalNanos atomic.Uint64
@@ -577,4 +612,111 @@ func ImageRequestPhaseSnapshot() map[string]ImageRequestPhaseMetricSnapshot {
 		snapshot[name] = value
 	}
 	return snapshot
+}
+
+// ImageRequestPhaseRollingWindowSnapshot samples cumulative counters on demand.
+// Request hot paths remain lock-free; the management poll owns the small history.
+func ImageRequestPhaseRollingWindowSnapshot() ImageRequestPhaseRollingSnapshot {
+	return globalImageRequestPhaseRollingSampler.observe(time.Now(), ImageRequestPhaseSnapshot())
+}
+
+func newImageRequestPhaseRollingSampler(window time.Duration, maxSamples int) *imageRequestPhaseRollingSampler {
+	if window <= 0 {
+		window = time.Minute
+	}
+	if maxSamples < 2 {
+		maxSamples = 2
+	}
+	return &imageRequestPhaseRollingSampler{window: window, maxSamples: maxSamples}
+}
+
+func (sampler *imageRequestPhaseRollingSampler) observe(now time.Time, current map[string]ImageRequestPhaseMetricSnapshot) ImageRequestPhaseRollingSnapshot {
+	requestedWindowSeconds := uint64(0)
+	if sampler != nil && sampler.window > 0 {
+		requestedWindowSeconds = uint64(sampler.window / time.Second)
+	}
+	result := ImageRequestPhaseRollingSnapshot{
+		RequestedWindowSeconds: requestedWindowSeconds,
+		Metrics:                make(map[string]ImageRequestPhaseRollingMetricSnapshot, len(current)),
+	}
+	if sampler == nil || now.IsZero() {
+		return result
+	}
+	sampler.mu.Lock()
+	defer sampler.mu.Unlock()
+	point := imageRequestPhaseRollingPoint{at: now, metrics: cloneImageRequestPhaseSnapshot(current)}
+	if len(sampler.history) > 0 && !now.After(sampler.history[len(sampler.history)-1].at) {
+		sampler.history[len(sampler.history)-1] = point
+	} else {
+		sampler.history = append(sampler.history, point)
+	}
+	cutoff := now.Add(-sampler.window)
+	for len(sampler.history) > 2 && !sampler.history[1].at.After(cutoff) {
+		sampler.history = sampler.history[1:]
+	}
+	if len(sampler.history) == 2 && sampler.history[0].at.Before(cutoff) {
+		sampler.history = []imageRequestPhaseRollingPoint{point}
+		result.HistorySamples = 1
+		return result
+	}
+	if len(sampler.history) > sampler.maxSamples {
+		sampler.history = sampler.history[len(sampler.history)-sampler.maxSamples:]
+	}
+	result.HistorySamples = len(sampler.history)
+	if len(sampler.history) < 2 {
+		return result
+	}
+	base := sampler.history[0]
+	elapsed := now.Sub(base.at)
+	if elapsed <= 0 {
+		return result
+	}
+	for name, value := range point.metrics {
+		baseline := base.metrics[name]
+		delta, ok := subtractImageRequestPhaseMetric(value, baseline)
+		if !ok {
+			sampler.history = []imageRequestPhaseRollingPoint{point}
+			result.HistorySamples = 1
+			result.Metrics = make(map[string]ImageRequestPhaseRollingMetricSnapshot, len(current))
+			return result
+		}
+		result.Metrics[name] = delta
+	}
+	result.Available = true
+	result.SampleSeconds = elapsed.Seconds()
+	return result
+}
+
+func cloneImageRequestPhaseSnapshot(source map[string]ImageRequestPhaseMetricSnapshot) map[string]ImageRequestPhaseMetricSnapshot {
+	clone := make(map[string]ImageRequestPhaseMetricSnapshot, len(source))
+	for name, value := range source {
+		clone[name] = value
+	}
+	return clone
+}
+
+func subtractImageRequestPhaseMetric(current, previous ImageRequestPhaseMetricSnapshot) (ImageRequestPhaseRollingMetricSnapshot, bool) {
+	if current.Count < previous.Count || current.TotalNanos < previous.TotalNanos ||
+		current.UpTo1Millisecond < previous.UpTo1Millisecond ||
+		current.Over1To10Milliseconds < previous.Over1To10Milliseconds ||
+		current.Over10To100Milliseconds < previous.Over10To100Milliseconds ||
+		current.Over100MillisecondsTo1S < previous.Over100MillisecondsTo1S ||
+		current.Over1To10Seconds < previous.Over1To10Seconds ||
+		current.Over10Seconds < previous.Over10Seconds {
+		return ImageRequestPhaseRollingMetricSnapshot{}, false
+	}
+	result := ImageRequestPhaseRollingMetricSnapshot{
+		Count:                   current.Count - previous.Count,
+		TotalNanos:              current.TotalNanos - previous.TotalNanos,
+		UpTo1Millisecond:        current.UpTo1Millisecond - previous.UpTo1Millisecond,
+		Over1To10Milliseconds:   current.Over1To10Milliseconds - previous.Over1To10Milliseconds,
+		Over10To100Milliseconds: current.Over10To100Milliseconds - previous.Over10To100Milliseconds,
+		Over100MillisecondsTo1S: current.Over100MillisecondsTo1S - previous.Over100MillisecondsTo1S,
+		Over1To10Seconds:        current.Over1To10Seconds - previous.Over1To10Seconds,
+		Over10Seconds:           current.Over10Seconds - previous.Over10Seconds,
+	}
+	if result.Count > 0 {
+		result.AverageNanos = result.TotalNanos / result.Count
+	}
+	return result, true
 }
