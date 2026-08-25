@@ -317,19 +317,25 @@ func (e *ChatGPTWebExecutor) executeRuntime(ctx context.Context, auth *cliproxya
 	reporter.SetRequestUsageOutcome(opts.UsageOutcome)
 	reporter.SetTranslatedReasoningEffort(prepared.canonicalBody, e.Identifier())
 	var releaseImageLifecycle func()
+	var imageTask *chatGPTWebImageTaskHandle
 	if prepared.request.Image != nil {
 		releaseImageLifecycle, err = e.acquireChatGPTWebImageLifecycle(ctx, prepared)
 		if err != nil {
 			return resp, err
 		}
 		defer releaseImageLifecycle()
+		ctx, imageTask = beginChatGPTWebImageTask(ctx, auth.ID)
+		defer imageTask.finish()
+		defer func() { err = normalizeChatGPTWebImageTaskCancellation(ctx, err) }()
 	}
 	if hasRemoteImages {
+		setChatGPTWebImageTaskStage(ctx, "materializing_inputs")
 		if err = e.materializeChatGPTWebRemoteImages(ctx, auth, prepared); err != nil {
 			return resp, err
 		}
 	}
 
+	setChatGPTWebImageTaskStage(ctx, "creating_client")
 	client, credential, err := e.newRuntimeClient(auth)
 	if err != nil {
 		return resp, err
@@ -401,26 +407,39 @@ func (e *ChatGPTWebExecutor) executeRuntimeStream(ctx context.Context, auth *cli
 		passthroughState.SetEnabled(false)
 	}
 	var releaseImageLifecycle func()
+	var releaseImageWork func()
 	if prepared.request.Image != nil {
 		releaseImageLifecycle, err = e.acquireChatGPTWebImageLifecycle(ctx, prepared)
 		if err != nil {
 			prepared.discardUsageProjection()
 			return nil, err
 		}
+		var imageTask *chatGPTWebImageTaskHandle
+		ctx, imageTask = beginChatGPTWebImageTask(ctx, auth.ID)
+		defer func() { err = normalizeChatGPTWebImageTaskCancellation(ctx, err) }()
+		var cleanupOnce sync.Once
+		releaseImageWork = func() {
+			cleanupOnce.Do(func() {
+				imageTask.finish()
+				releaseImageLifecycle()
+			})
+		}
 	}
 	if hasRemoteImages {
+		setChatGPTWebImageTaskStage(ctx, "materializing_inputs")
 		if err = e.materializeChatGPTWebRemoteImages(ctx, auth, prepared); err != nil {
-			if releaseImageLifecycle != nil {
-				releaseImageLifecycle()
+			if releaseImageWork != nil {
+				releaseImageWork()
 			}
 			prepared.discardUsageProjection()
 			return nil, err
 		}
 	}
+	setChatGPTWebImageTaskStage(ctx, "creating_client")
 	client, credential, err := e.newRuntimeClient(auth)
 	if err != nil {
-		if releaseImageLifecycle != nil {
-			releaseImageLifecycle()
+		if releaseImageWork != nil {
+			releaseImageWork()
 		}
 		prepared.discardUsageProjection()
 		return nil, err
@@ -432,13 +451,14 @@ func (e *ChatGPTWebExecutor) executeRuntimeStream(ctx context.Context, auth *cli
 		imageStreamPassthrough := metadataBool(opts.Metadata, cliproxyexecutor.ImageGenerationStreamPassthroughMetadataKey)
 		execution, errImage := e.beginChatGPTWebImage(ctx, client, credential, prepared)
 		if errImage != nil {
-			releaseImageLifecycle()
+			releaseImageWork()
 			prepared.discardUsageProjection()
 			e.finishChatGPTWebRuntimeClient(ctx, auth, credential, client)
 			return nil, e.handleChatGPTWebImageRequestError(auth.ID, errImage)
 		}
-		return e.streamDeferredChatGPTWebResponse(ctx, auth, credential, prepared, client, reporter, execution.headers, passthroughState, imageStreamPassthrough, releaseImageLifecycle, func() ([]byte, error) {
+		return e.streamDeferredChatGPTWebResponse(ctx, auth, credential, prepared, client, reporter, execution.headers, passthroughState, imageStreamPassthrough, releaseImageWork, func() ([]byte, error) {
 			completed, errFinish := e.finishChatGPTWebImage(ctx, client, credential, prepared, execution)
+			errFinish = normalizeChatGPTWebImageTaskCancellation(ctx, errFinish)
 			return completed, chatGPTWebCommittedRequestError(ctx, e.handleChatGPTWebImageRequestError(auth.ID, errFinish))
 		}), nil
 	}

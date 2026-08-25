@@ -947,6 +947,8 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.GET("/chatgpt-web/relogin-operations/:id", s.mgmt.GetChatGPTWebReloginOperation)
 		mgmt.GET("/chatgpt-web/auth-files/:name/relogin-operation", s.mgmt.FindChatGPTWebReloginOperation)
 		mgmt.GET("/chatgpt-web/auto-delete-dead/stats", s.mgmt.GetChatGPTWebAutoDeleteDeadStats)
+		mgmt.GET("/chatgpt-web/image-tasks", s.mgmt.GetChatGPTWebImageTasks)
+		mgmt.DELETE("/chatgpt-web/image-tasks/:id", s.mgmt.CancelChatGPTWebImageTask)
 		mgmt.GET("/chatgpt-web/sentinel", s.mgmt.GetChatGPTWebSentinel)
 		mgmt.PUT("/chatgpt-web/sentinel", s.mgmt.PutChatGPTWebSentinel)
 		mgmt.PATCH("/chatgpt-web/sentinel", s.mgmt.PatchChatGPTWebSentinel)

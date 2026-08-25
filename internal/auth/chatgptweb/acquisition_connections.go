@@ -13,30 +13,30 @@ import (
 	"golang.org/x/net/proxy"
 )
 
-type acquisitionConnectionTracker struct {
+type connectionTracker struct {
 	mu          sync.Mutex
-	connections map[*trackedAcquisitionConnection]struct{}
+	connections map[*trackedConnection]struct{}
 	closed      bool
 }
 
-type trackedAcquisitionConnection struct {
+type trackedConnection struct {
 	net.Conn
-	tracker *acquisitionConnectionTracker
+	tracker *connectionTracker
 	once    sync.Once
 }
 
-type trackedAcquisitionDialer struct {
+type trackedConnectionDialer struct {
 	base    proxyutil.ContextDialer
-	tracker *acquisitionConnectionTracker
+	tracker *connectionTracker
 }
 
-func newAcquisitionConnectionTracker() *acquisitionConnectionTracker {
-	return &acquisitionConnectionTracker{
-		connections: make(map[*trackedAcquisitionConnection]struct{}),
+func newConnectionTracker() *connectionTracker {
+	return &connectionTracker{
+		connections: make(map[*trackedConnection]struct{}),
 	}
 }
 
-func (tracker *acquisitionConnectionTracker) dialerFactory(configuredProxyURL string) tls_client.ProxyDialerFactory {
+func (tracker *connectionTracker) dialerFactory(configuredProxyURL string) tls_client.ProxyDialerFactory {
 	configuredProxyURL = strings.TrimSpace(configuredProxyURL)
 	return func(
 		_ string,
@@ -53,15 +53,15 @@ func (tracker *acquisitionConnectionTracker) dialerFactory(configuredProxyURL st
 		if errBuild != nil {
 			return nil, errBuild
 		}
-		return &trackedAcquisitionDialer{base: base, tracker: tracker}, nil
+		return &trackedConnectionDialer{base: base, tracker: tracker}, nil
 	}
 }
 
-func (tracker *acquisitionConnectionTracker) track(connection net.Conn) (net.Conn, error) {
+func (tracker *connectionTracker) track(connection net.Conn) (net.Conn, error) {
 	if tracker == nil || connection == nil {
 		return connection, nil
 	}
-	tracked := &trackedAcquisitionConnection{Conn: connection, tracker: tracker}
+	tracked := &trackedConnection{Conn: connection, tracker: tracker}
 	tracker.mu.Lock()
 	if tracker.closed {
 		tracker.mu.Unlock()
@@ -73,13 +73,13 @@ func (tracker *acquisitionConnectionTracker) track(connection net.Conn) (net.Con
 	return tracked, nil
 }
 
-func (tracker *acquisitionConnectionTracker) closeAll() {
+func (tracker *connectionTracker) closeAll() {
 	if tracker == nil {
 		return
 	}
 	tracker.mu.Lock()
 	tracker.closed = true
-	connections := make([]*trackedAcquisitionConnection, 0, len(tracker.connections))
+	connections := make([]*trackedConnection, 0, len(tracker.connections))
 	for connection := range tracker.connections {
 		connections = append(connections, connection)
 	}
@@ -90,7 +90,7 @@ func (tracker *acquisitionConnectionTracker) closeAll() {
 	}
 }
 
-func (connection *trackedAcquisitionConnection) Close() error {
+func (connection *trackedConnection) Close() error {
 	if connection == nil {
 		return nil
 	}
@@ -108,11 +108,11 @@ func (connection *trackedAcquisitionConnection) Close() error {
 	return errClose
 }
 
-func (dialer *trackedAcquisitionDialer) Dial(network, address string) (net.Conn, error) {
+func (dialer *trackedConnectionDialer) Dial(network, address string) (net.Conn, error) {
 	return dialer.DialContext(context.Background(), network, address)
 }
 
-func (dialer *trackedAcquisitionDialer) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
+func (dialer *trackedConnectionDialer) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
 	if dialer == nil || dialer.base == nil {
 		return nil, net.ErrClosed
 	}

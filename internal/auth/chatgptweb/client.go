@@ -30,11 +30,42 @@ type Client struct {
 	persona            Persona
 	proxyURL           string
 	acquisitionTimeout time.Duration
-	acquisitionTracker *acquisitionConnectionTracker
+	acquisitionTracker *connectionTracker
+	pollMu             sync.Mutex
+	pollTransport      *pollTransport
+	pollGeneration     uint64
+	pollCancelGrace    time.Duration
 	loginRetry         *loginClientRetry
 	beforeRequestMu    sync.RWMutex
 	beforeRequest      func()
 	beforeRequestOnce  sync.Once
+}
+
+const defaultPollCancellationGrace = 2 * time.Second
+
+type pollTransport struct {
+	client     tls_client.HttpClient
+	tracker    *connectionTracker
+	generation uint64
+}
+
+type pollRequestControl struct {
+	client     *Client
+	generation uint64
+	grace      time.Duration
+
+	mu       sync.Mutex
+	body     io.Closer
+	canceled bool
+	done     chan struct{}
+	doneOnce sync.Once
+	stop     func() bool
+}
+
+type pollResponseBody struct {
+	io.ReadCloser
+	control *pollRequestControl
+	once    sync.Once
 }
 
 // accessTokenCookieJar retains all server-issued cookies but withholds browser
@@ -93,36 +124,12 @@ func newClientWithSessionCookiePolicy(
 	if !sendSessionCookies {
 		jar = &accessTokenCookieJar{delegate: baseJar}
 	}
-	var acquisitionTracker *acquisitionConnectionTracker
+	var acquisitionTracker *connectionTracker
 	if timeout > 0 {
-		acquisitionTracker = newAcquisitionConnectionTracker()
+		acquisitionTracker = newConnectionTracker()
 	}
 	newHTTPClient := func(followRedirect bool) (tls_client.HttpClient, error) {
-		timeoutMilliseconds := 0
-		if timeout > 0 {
-			timeoutMilliseconds = max(1, int(timeout/time.Millisecond))
-		}
-		options := []tls_client.HttpClientOption{
-			tls_client.WithClientProfile(profile),
-			tls_client.WithCookieJar(jar),
-			tls_client.WithRandomTLSExtensionOrder(),
-			tls_client.WithTimeoutMilliseconds(timeoutMilliseconds),
-		}
-		if acquisitionTracker != nil {
-			options = append(
-				options,
-				tls_client.WithProxyDialerFactory(acquisitionTracker.dialerFactory(proxyURL)),
-				tls_client.WithTransportOptions(&tls_client.TransportOptions{DisableKeepAlives: true}),
-			)
-		} else if proxyURL != "" {
-			options = append(options, tls_client.WithProxyUrl(proxyURL))
-		}
-		httpClient, err := tls_client.NewHttpClient(tls_client.NewNoopLogger(), options...)
-		if err != nil {
-			return nil, err
-		}
-		httpClient.SetFollowRedirect(followRedirect)
-		return httpClient, nil
+		return newBrowserHTTPClient(profile, jar, proxyURL, timeout, followRedirect, acquisitionTracker, acquisitionTracker != nil)
 	}
 
 	follow, err := newHTTPClient(true)
@@ -143,6 +150,7 @@ func newClientWithSessionCookiePolicy(
 		proxyURL:           proxyURL,
 		acquisitionTimeout: timeout,
 		acquisitionTracker: acquisitionTracker,
+		pollCancelGrace:    defaultPollCancellationGrace,
 	}
 	if err := client.RestoreCookies(cookies); err != nil {
 		client.CloseIdleConnections()
@@ -187,6 +195,41 @@ func findTLSProfile(name string) (profiles.ClientProfile, bool) {
 	return profiles.ClientProfile{}, false
 }
 
+func newBrowserHTTPClient(
+	profile profiles.ClientProfile,
+	jar tls_client.CookieJar,
+	proxyURL string,
+	timeout time.Duration,
+	followRedirect bool,
+	tracker *connectionTracker,
+	disableKeepAlives bool,
+) (tls_client.HttpClient, error) {
+	timeoutMilliseconds := 0
+	if timeout > 0 {
+		timeoutMilliseconds = max(1, int(timeout/time.Millisecond))
+	}
+	options := []tls_client.HttpClientOption{
+		tls_client.WithClientProfile(profile),
+		tls_client.WithCookieJar(jar),
+		tls_client.WithRandomTLSExtensionOrder(),
+		tls_client.WithTimeoutMilliseconds(timeoutMilliseconds),
+	}
+	if tracker != nil {
+		options = append(options, tls_client.WithProxyDialerFactory(tracker.dialerFactory(proxyURL)))
+		if disableKeepAlives {
+			options = append(options, tls_client.WithTransportOptions(&tls_client.TransportOptions{DisableKeepAlives: true}))
+		}
+	} else if proxyURL != "" {
+		options = append(options, tls_client.WithProxyUrl(proxyURL))
+	}
+	httpClient, err := tls_client.NewHttpClient(tls_client.NewNoopLogger(), options...)
+	if err != nil {
+		return nil, err
+	}
+	httpClient.SetFollowRedirect(followRedirect)
+	return httpClient, nil
+}
+
 func (client *Client) Persona() Persona {
 	if client == nil {
 		return Persona{}
@@ -210,6 +253,12 @@ func (client *Client) CloseIdleConnections() {
 	}
 	if client.noRedirect != nil {
 		client.noRedirect.CloseIdleConnections()
+	}
+	client.pollMu.Lock()
+	poll := client.pollTransport
+	client.pollMu.Unlock()
+	if poll != nil && poll.client != nil {
+		poll.client.CloseIdleConnections()
 	}
 }
 
@@ -248,6 +297,141 @@ func (client *Client) DoNoRedirectOnce(ctx context.Context, method, targetURL st
 // or closing the response body. The caller must close the body.
 func (client *Client) DoNoRedirectStream(ctx context.Context, method, targetURL string, headers map[string]string, body io.Reader) (*fhttp.Response, error) {
 	return client.doStream(ctx, client.noRedirect, method, targetURL, headers, body)
+}
+
+// DoPollNoRedirectStream executes an idempotent image status request on a
+// dedicated transport so forced poll cleanup cannot terminate the primary SSE.
+func (client *Client) DoPollNoRedirectStream(ctx context.Context, method, targetURL string, headers map[string]string, body io.Reader) (*fhttp.Response, error) {
+	if client == nil {
+		return nil, fmt.Errorf("browser client is nil")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	poll, errPoll := client.currentPollTransport()
+	if errPoll != nil {
+		return nil, errPoll
+	}
+	control := &pollRequestControl{
+		client:     client,
+		generation: poll.generation,
+		grace:      client.pollCancelGrace,
+		done:       make(chan struct{}),
+	}
+	if control.grace <= 0 {
+		control.grace = defaultPollCancellationGrace
+	}
+	control.stop = context.AfterFunc(ctx, control.cancel)
+	response, errRequest := client.doStream(ctx, poll.client, method, targetURL, headers, body)
+	if errRequest != nil {
+		control.finish()
+		return nil, errRequest
+	}
+	if response == nil || response.Body == nil {
+		control.finish()
+		return response, nil
+	}
+	control.attach(response.Body)
+	response.Body = &pollResponseBody{ReadCloser: response.Body, control: control}
+	return response, nil
+}
+
+func (client *Client) currentPollTransport() (*pollTransport, error) {
+	client.pollMu.Lock()
+	defer client.pollMu.Unlock()
+	if client.pollTransport != nil {
+		return client.pollTransport, nil
+	}
+	profile, ok := findTLSProfile(client.persona.Profile)
+	if !ok {
+		return nil, fmt.Errorf("unsupported TLS profile %q", client.persona.Profile)
+	}
+	tracker := newConnectionTracker()
+	httpClient, errClient := newBrowserHTTPClient(profile, client.jar, client.proxyURL, 0, false, tracker, false)
+	if errClient != nil {
+		tracker.closeAll()
+		return nil, fmt.Errorf("create image poll browser client: %w", errClient)
+	}
+	client.pollGeneration++
+	client.pollTransport = &pollTransport{client: httpClient, tracker: tracker, generation: client.pollGeneration}
+	return client.pollTransport, nil
+}
+
+func (client *Client) retirePollTransport(generation uint64) {
+	if client == nil {
+		return
+	}
+	client.pollMu.Lock()
+	poll := client.pollTransport
+	if poll == nil || poll.generation != generation {
+		client.pollMu.Unlock()
+		return
+	}
+	client.pollTransport = nil
+	client.pollMu.Unlock()
+	if poll.client != nil {
+		poll.client.CloseIdleConnections()
+	}
+	if poll.tracker != nil {
+		poll.tracker.closeAll()
+	}
+}
+
+func (control *pollRequestControl) attach(body io.Closer) {
+	if control == nil || body == nil {
+		return
+	}
+	control.mu.Lock()
+	control.body = body
+	canceled := control.canceled
+	control.mu.Unlock()
+	if canceled {
+		_ = body.Close()
+	}
+}
+
+func (control *pollRequestControl) cancel() {
+	if control == nil {
+		return
+	}
+	control.mu.Lock()
+	control.canceled = true
+	body := control.body
+	control.mu.Unlock()
+	if body != nil {
+		_ = body.Close()
+	}
+	timer := time.NewTimer(control.grace)
+	defer timer.Stop()
+	select {
+	case <-control.done:
+	case <-timer.C:
+		control.client.retirePollTransport(control.generation)
+	}
+}
+
+func (control *pollRequestControl) finish() {
+	if control == nil {
+		return
+	}
+	control.doneOnce.Do(func() { close(control.done) })
+	if control.stop != nil {
+		control.stop()
+	}
+}
+
+func (body *pollResponseBody) Close() error {
+	if body == nil {
+		return nil
+	}
+	var errClose error
+	body.once.Do(func() {
+		if body.ReadCloser != nil {
+			errClose = body.ReadCloser.Close()
+		}
+		body.control.finish()
+	})
+	return errClose
 }
 
 // DoSameOriginRedirectStream follows a bounded redirect chain only while every

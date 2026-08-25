@@ -782,6 +782,7 @@ func (e *ChatGPTWebExecutor) beginChatGPTWebImage(ctx context.Context, client *c
 	uploads := make([]chatGPTWebUploadedImage, 0, len(imageInputs))
 	inputIDs := make(map[string]struct{}, len(imageInputs))
 	uploadStarted := time.Now()
+	setChatGPTWebImageTaskStage(ctx, "uploading_inputs")
 	var uploadObserved sync.Once
 	finishUploadObservation := func() {
 		uploadObserved.Do(func() {
@@ -804,6 +805,7 @@ func (e *ChatGPTWebExecutor) beginChatGPTWebImage(ctx context.Context, client *c
 	finishUploadObservation()
 
 	requirementsStarted := time.Now()
+	setChatGPTWebImageTaskStage(ctx, "fetching_requirements")
 	requirements, err := e.chatGPTWebRequirements(ctx, client, credential)
 	cliproxyexecutor.ObserveRequestPhaseContext(ctx, cliproxyexecutor.ImagePhaseRequirements, requirementsStarted)
 	if err != nil {
@@ -811,12 +813,14 @@ func (e *ChatGPTWebExecutor) beginChatGPTWebImage(ctx context.Context, client *c
 	}
 	upstreamModel := e.chatGPTWebImageUpstreamModel()
 	prepareStarted := time.Now()
+	setChatGPTWebImageTaskStage(ctx, "preparing_conversation")
 	conduit, err := e.prepareChatGPTWebImageConversation(ctx, client, credential, requirements, upstreamModel, upstreamPrompt)
 	cliproxyexecutor.ObserveRequestPhaseContext(ctx, cliproxyexecutor.ImagePhaseConversationPrepare, prepareStarted)
 	if err != nil {
 		return nil, err
 	}
 	upstreamStarted := time.Now()
+	setChatGPTWebImageTaskStage(ctx, "starting_generation")
 	response, turn, err := e.openChatGPTWebImageConversation(ctx, client, credential, requirements, upstreamModel, conduit, upstreamPrompt, uploads)
 	cliproxyexecutor.ObserveRequestPhaseContext(ctx, cliproxyexecutor.ImagePhaseUpstreamInitial, upstreamStarted)
 	if err != nil {
@@ -865,6 +869,7 @@ func (e *ChatGPTWebExecutor) finishChatGPTWebImage(ctx context.Context, client *
 	}
 	imageRequest := prepared.request.Image
 	response := execution.response
+	setChatGPTWebImageTaskStage(ctx, "settling_stream")
 	pollBudget := newChatGPTWebPollResponseBudget(chatGPTWebPollResponseMaxBytes)
 	accumulator, errStream := e.consumeChatGPTWebImageStreamWithTaskPollingForTurn(ctx, client, credential, response, execution.turn, pollBudget)
 	if errClose := response.Body.Close(); errClose != nil {
@@ -939,6 +944,7 @@ func (e *ChatGPTWebExecutor) finishChatGPTWebImage(ctx context.Context, client *
 	cliproxyexecutor.ObserveRequestPhaseContext(ctx, cliproxyexecutor.ImagePhaseStreamSettle, settleStarted)
 	settleObserved = true
 	finalizerStarted := time.Now()
+	setChatGPTWebImageTaskStage(ctx, "waiting_finalizer")
 	releaseFinalizer, errFinalizer := cliproxyexecutor.AcquireChatGPTWebImageFinalizer(ctx)
 	if errFinalizer != nil {
 		cliproxyexecutor.ObserveRequestPhaseContext(ctx, cliproxyexecutor.ImagePhaseFinalizerWait, finalizerStarted)
@@ -952,6 +958,7 @@ func (e *ChatGPTWebExecutor) finishChatGPTWebImage(ctx context.Context, client *
 	}
 	defer releaseMemoryFinalizer()
 	failureStage = "download"
+	setChatGPTWebImageTaskStage(ctx, "downloading")
 	parallelMemoryFinalization := cliproxyexecutor.ChatGPTWebImageMemoryFinalizerAdmissionSnapshot().Limit > 1
 	if prepared.imageMemoryLeases != nil && !parallelMemoryFinalization {
 		releaseCompletionTurn, errFinalization := prepared.imageMemoryLeases.BeginFinalization(ctx)
@@ -996,6 +1003,7 @@ func (e *ChatGPTWebExecutor) finishChatGPTWebImage(ctx context.Context, client *
 		outputCompression = 100
 	}
 	encodeStarted := time.Now()
+	setChatGPTWebImageTaskStage(ctx, "encoding")
 	outputImages, err := prepareChatGPTWebImageOutputsWithContextAndCompression(
 		ctx,
 		imageRequest.OutputFormat,
@@ -2515,7 +2523,7 @@ func chatGPTWebImageTaskIDsFound(known []string, targets []helps.ChatGPTWebImage
 	return true
 }
 
-func (e *ChatGPTWebExecutor) consumeChatGPTWebExactImageTaskStream(ctx context.Context, client *chatgptwebauth.Client, credential *chatgptwebauth.Credential, conversationID string, target helps.ChatGPTWebImageTaskTarget, budget *chatGPTWebPollResponseBudget) (*helps.ChatGPTWebImageAccumulator, error) {
+func (e *ChatGPTWebExecutor) consumeChatGPTWebExactImageTaskStream(ctx context.Context, client *chatgptwebauth.Client, credential *chatgptwebauth.Credential, conversationID string, target helps.ChatGPTWebImageTaskTarget, budget *chatGPTWebPollResponseBudget) (_ *helps.ChatGPTWebImageAccumulator, err error) {
 	conversationID = strings.TrimSpace(conversationID)
 	taskID := strings.TrimSpace(target.TaskID)
 	messageID := strings.TrimSpace(target.ResponseMessageID)
@@ -2527,6 +2535,15 @@ func (e *ChatGPTWebExecutor) consumeChatGPTWebExactImageTaskStream(ctx context.C
 		return nil, errPoll
 	}
 	defer releasePoll()
+	finishTaskPoll := beginChatGPTWebImageTaskPoll(ctx)
+	defer func() {
+		canceled := errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+		if ctx != nil && ctx.Err() != nil {
+			canceled = true
+		}
+		finishTaskPoll(canceled)
+		cliproxyexecutor.ObserveChatGPTWebImagePollCompletion(canceled)
+	}()
 
 	query := url.Values{}
 	query.Set("parent_conversation_id", conversationID)
@@ -2537,7 +2554,7 @@ func (e *ChatGPTWebExecutor) consumeChatGPTWebExactImageTaskStream(ctx context.C
 	e.recordChatGPTWebRequest(ctx, credential, http.MethodGet, safePath, headers, nil)
 	chatGPTWebImageProtocolMetrics.exactStreamsStarted.Add(1)
 	started := time.Now()
-	response, errRequest := client.DoNoRedirectStream(ctx, http.MethodGet, e.chatGPTWebBaseURL()+path, headers, nil)
+	response, errRequest := client.DoPollNoRedirectStream(ctx, http.MethodGet, e.chatGPTWebBaseURL()+path, headers, nil)
 	if errRequest != nil {
 		cliproxyexecutor.ObserveRequestPhaseContext(ctx, cliproxyexecutor.ImagePhasePollRequest, started)
 		helps.RecordAPIResponseError(ctx, e.configSnapshot(), errRequest)
@@ -2678,9 +2695,11 @@ type chatGPTWebImageTaskPollContext struct {
 func (chatGPTWebImageTaskPollContext) Value(any) any { return nil }
 
 func newChatGPTWebImageTaskPollContext(ctx context.Context) context.Context {
+	taskHandle := chatGPTWebImageTaskHandleFromContext(ctx)
 	base := context.Context(chatGPTWebImageTaskPollContext{Context: ctx})
 	base = cliproxyexecutor.WithRequestPhaseObserver(base, cliproxyexecutor.RequestPhaseObserverFromContext(ctx))
 	base = helps.WithChatGPTWebImageMemoryLeaseSet(base, helps.ChatGPTWebImageMemoryLeaseSetFromContext(ctx))
+	base = withChatGPTWebImageTaskHandle(base, taskHandle)
 	return base
 }
 
@@ -4315,6 +4334,9 @@ func chatGPTWebCommittedRequestError(ctx context.Context, err error) (committedE
 	defer func() {
 		committedError = preserveChatGPTWebFailureStage(err, committedError)
 	}()
+	if ctx != nil && errors.Is(context.Cause(ctx), errChatGPTWebImageTaskCanceledByAdmin) {
+		return normalizeChatGPTWebImageTaskCancellation(ctx, err)
+	}
 	if ctx != nil && ctx.Err() != nil {
 		return ctx.Err()
 	}
@@ -4533,21 +4555,24 @@ func readChatGPTWebBoundedBodyWithAdmission(
 }
 
 func (e *ChatGPTWebExecutor) doChatGPTWebGET(ctx context.Context, client *chatgptwebauth.Client, credential *chatgptwebauth.Credential, path string, extra map[string]string) (*fhttp.Response, []byte, func(), error) {
-	return e.doChatGPTWebGETWithBudget(ctx, client, credential, path, extra, nil, true)
+	return e.doChatGPTWebGETWithBudget(ctx, client, credential, path, extra, nil, true, false)
 }
 
 func (e *ChatGPTWebExecutor) doChatGPTWebPollGET(ctx context.Context, client *chatgptwebauth.Client, credential *chatgptwebauth.Credential, path string, extra map[string]string, budget *chatGPTWebPollResponseBudget) (*fhttp.Response, []byte, func(), error) {
+	setChatGPTWebImageTaskStage(ctx, "poll_slot_wait")
 	releasePoll, errPoll := acquireChatGPTWebImagePollSlot(ctx)
 	if errPoll != nil {
 		return nil, nil, nil, errPoll
 	}
 	defer releasePoll()
+	finishTaskPoll := beginChatGPTWebImageTaskPoll(ctx)
 	started := time.Now()
-	response, payload, release, err := e.doChatGPTWebGETWithBudget(ctx, client, credential, path, extra, budget, false)
+	response, payload, release, err := e.doChatGPTWebGETWithBudget(ctx, client, credential, path, extra, budget, false, true)
 	canceled := errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
 	if ctx != nil && ctx.Err() != nil {
 		canceled = true
 	}
+	finishTaskPoll(canceled)
 	cliproxyexecutor.ObserveChatGPTWebImagePollCompletion(canceled)
 	cliproxyexecutor.ObserveRequestPhaseContext(ctx, cliproxyexecutor.ImagePhasePollRequest, started)
 	return response, payload, release, err
@@ -4607,11 +4632,17 @@ func readChatGPTWebPollResponseBody(ctx context.Context, response *fhttp.Respons
 	return data, release, nil
 }
 
-func (e *ChatGPTWebExecutor) doChatGPTWebGETWithBudget(ctx context.Context, client *chatgptwebauth.Client, credential *chatgptwebauth.Credential, path string, extra map[string]string, budget *chatGPTWebPollResponseBudget, logBody bool) (*fhttp.Response, []byte, func(), error) {
+func (e *ChatGPTWebExecutor) doChatGPTWebGETWithBudget(ctx context.Context, client *chatgptwebauth.Client, credential *chatgptwebauth.Credential, path string, extra map[string]string, budget *chatGPTWebPollResponseBudget, logBody, usePollTransport bool) (*fhttp.Response, []byte, func(), error) {
 	headers := e.chatGPTWebHeaders(credential, path, extra)
 	logPath := chatGPTWebRequestLogPath(path)
 	e.recordChatGPTWebRequest(ctx, credential, http.MethodGet, logPath, headers, nil)
-	response, err := client.DoNoRedirectStream(ctx, http.MethodGet, e.chatGPTWebBaseURL()+path, headers, nil)
+	var response *fhttp.Response
+	var err error
+	if usePollTransport {
+		response, err = client.DoPollNoRedirectStream(ctx, http.MethodGet, e.chatGPTWebBaseURL()+path, headers, nil)
+	} else {
+		response, err = client.DoNoRedirectStream(ctx, http.MethodGet, e.chatGPTWebBaseURL()+path, headers, nil)
+	}
 	if err != nil {
 		helps.RecordAPIResponseError(ctx, e.configSnapshot(), err)
 		return nil, nil, nil, chatGPTWebTransportDiagnosticError(err, logPath)

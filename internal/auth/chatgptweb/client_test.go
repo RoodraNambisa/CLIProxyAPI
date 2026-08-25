@@ -57,6 +57,128 @@ func TestAcquisitionClientClosesActiveConnections(t *testing.T) {
 	}
 }
 
+func TestPollTransportSharesPersonaAndCookiesAndCancelsResponseBody(t *testing.T) {
+	type observedRequest struct {
+		path      string
+		userAgent string
+		cookie    string
+	}
+	observed := make(chan observedRequest, 2)
+	pollCanceled := make(chan struct{}, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		observed <- observedRequest{
+			path:      request.URL.Path,
+			userAgent: request.Header.Get("User-Agent"),
+			cookie:    request.Header.Get("Cookie"),
+		}
+		if request.URL.Path != "/poll" {
+			response.WriteHeader(http.StatusNoContent)
+			return
+		}
+		response.Header().Set("Content-Type", "application/json")
+		response.WriteHeader(http.StatusOK)
+		if flusher, ok := response.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		<-request.Context().Done()
+		pollCanceled <- struct{}{}
+	}))
+	defer server.Close()
+
+	client, errClient := NewClient(DefaultPersona(), "", nil)
+	if errClient != nil {
+		t.Fatalf("NewClient() error = %v", errClient)
+	}
+	defer client.CloseIdleConnections()
+	if errCookie := client.SetCookie(server.URL, "poll-test", "shared"); errCookie != nil {
+		t.Fatalf("SetCookie() error = %v", errCookie)
+	}
+
+	pollCtx, cancelPoll := context.WithCancel(t.Context())
+	response, errPoll := client.DoPollNoRedirectStream(pollCtx, http.MethodGet, server.URL+"/poll", nil, nil)
+	if errPoll != nil {
+		t.Fatalf("DoPollNoRedirectStream() error = %v", errPoll)
+	}
+	if client.pollTransport == nil || client.pollTransport.tracker == nil {
+		t.Fatal("poll transport was not initialized with a connection tracker")
+	}
+	cancelPoll()
+	select {
+	case <-pollCanceled:
+	case <-time.After(time.Second):
+		t.Fatal("poll response body was not closed after cancellation")
+	}
+	if errClose := response.Body.Close(); errClose != nil {
+		t.Fatalf("close poll response body: %v", errClose)
+	}
+
+	mainResponse, _, errMain := client.DoNoRedirect(t.Context(), http.MethodGet, server.URL+"/main", nil, nil)
+	if errMain != nil {
+		t.Fatalf("main transport request after poll cancellation: %v", errMain)
+	}
+	if mainResponse.StatusCode != http.StatusNoContent {
+		t.Fatalf("main transport status = %d, want 204", mainResponse.StatusCode)
+	}
+
+	seen := map[string]observedRequest{}
+	for range 2 {
+		request := <-observed
+		seen[request.path] = request
+	}
+	if seen["/poll"].userAgent == "" || seen["/poll"].userAgent != seen["/main"].userAgent {
+		t.Fatalf("persona user agents differ: poll=%q main=%q", seen["/poll"].userAgent, seen["/main"].userAgent)
+	}
+	for _, path := range []string{"/poll", "/main"} {
+		if !strings.Contains(seen[path].cookie, "poll-test=shared") {
+			t.Fatalf("%s cookie = %q, want shared jar cookie", path, seen[path].cookie)
+		}
+	}
+}
+
+func TestPollTransportRetirementDoesNotCloseMainTransport(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
+		response.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+	client, errClient := NewClient(DefaultPersona(), "", nil)
+	if errClient != nil {
+		t.Fatalf("NewClient() error = %v", errClient)
+	}
+	defer client.CloseIdleConnections()
+	client.pollCancelGrace = time.Millisecond
+	poll, errPoll := client.currentPollTransport()
+	if errPoll != nil {
+		t.Fatalf("currentPollTransport() error = %v", errPoll)
+	}
+	control := &pollRequestControl{
+		client:     client,
+		generation: poll.generation,
+		grace:      client.pollCancelGrace,
+		done:       make(chan struct{}),
+	}
+	control.cancel()
+	client.pollMu.Lock()
+	retired := client.pollTransport == nil
+	client.pollMu.Unlock()
+	if !retired {
+		t.Fatal("stuck poll transport was not retired")
+	}
+	replacement, errReplacement := client.currentPollTransport()
+	if errReplacement != nil {
+		t.Fatalf("recreate poll transport: %v", errReplacement)
+	}
+	if replacement.generation <= poll.generation {
+		t.Fatalf("replacement generation = %d, want greater than %d", replacement.generation, poll.generation)
+	}
+	response, _, errMain := client.DoNoRedirect(t.Context(), http.MethodGet, server.URL, nil, nil)
+	if errMain != nil {
+		t.Fatalf("main transport request after poll retirement: %v", errMain)
+	}
+	if response.StatusCode != http.StatusNoContent {
+		t.Fatalf("main transport status = %d, want 204", response.StatusCode)
+	}
+}
+
 func TestAcquisitionClientAcceptsConfiguredProxyDialer(t *testing.T) {
 	for _, proxyURL := range []string{
 		"http://user:pass@127.0.0.1:18080",
