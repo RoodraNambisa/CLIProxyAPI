@@ -6195,18 +6195,13 @@ func TestFetchChatGPTWebImageTaskPagesUsesExactTaskStreamOnceForTerminalTaskWith
 		switch request.URL.Path {
 		case "/backend-api/tasks":
 			_ = json.NewEncoder(w).Encode(map[string]any{"tasks": []any{map[string]any{
-				"task_id":                               "stream-task",
+				"task_id":                               "imagegen_stream-task",
 				"response_message_id":                   "response-message",
 				"conversation_id":                       "stream-conversation",
 				"original_conversation_user_message_id": "current-user",
 				"status":                                "completed",
-				"image_gen_message": map[string]any{
-					"author":   map[string]any{"role": "tool"},
-					"metadata": map[string]any{"async_task_type": "image_gen"},
-					"content":  map[string]any{"parts": []any{}},
-				},
 			}}})
-		case "/backend-api/tasks/stream-task/stream":
+		case "/backend-api/tasks/imagegen_stream-task/stream":
 			streamRequests.Add(1)
 			if request.URL.Query().Get("parent_conversation_id") != "stream-conversation" || request.URL.Query().Get("message_id") != "response-message" {
 				invalidQuery.Store(true)
@@ -6215,7 +6210,7 @@ func TestFetchChatGPTWebImageTaskPagesUsesExactTaskStreamOnceForTerminalTaskWith
 			}
 			w.Header().Set("Content-Type", "text/event-stream")
 			_, _ = io.WriteString(w,
-				"data: {\"task_id\":\"stream-task\",\"task_status\":\"completed\",\"final_message\":{\"author\":{\"role\":\"tool\"},\"metadata\":{\"async_task_type\":\"image_gen\"},\"status\":\"finished_successfully\",\"content\":{\"parts\":[{\"asset_pointer\":\"file-service://stream-output\"}]}}}\n\n"+
+				"data: {\"task_id\":\"imagegen_stream-task\",\"task_status\":\"completed\",\"final_message\":{\"author\":{\"role\":\"tool\"},\"metadata\":{\"async_task_type\":\"image_gen\"},\"status\":\"finished_successfully\",\"content\":{\"parts\":[{\"asset_pointer\":\"file-service://stream-output\"}]}}}\n\n"+
 					"data: [DONE]\n\n",
 			)
 		default:

@@ -3023,6 +3023,11 @@ func chatGPTWebImageTaskMessage(task map[string]any) (map[string]any, bool) {
 	if message != nil {
 		return message, true
 	}
+	// The official web client classifies pending image tasks by their ID before
+	// image_gen_message is available in the paginated task response.
+	if strings.HasPrefix(strings.ToLower(chatGPTWebImageTaskID(task)), "imagegen_") {
+		return nil, true
+	}
 	for _, key := range []string{"type", "task_type"} {
 		if strings.EqualFold(strings.TrimSpace(stringFromAny(task[key])), "image_gen") {
 			return nil, true

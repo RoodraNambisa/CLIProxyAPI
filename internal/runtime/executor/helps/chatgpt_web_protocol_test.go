@@ -1916,6 +1916,27 @@ func TestCaptureChatGPTWebImageTasksUsesOfficialOriginalUserRelation(t *testing.
 	}
 }
 
+func TestCaptureChatGPTWebImageTasksRecognizesOfficialPendingTaskID(t *testing.T) {
+	payload := []byte(`{"tasks":[
+		{"task_id":"imagegen_official-task","conversation_id":"target","status":"running","original_conversation_user_message_id":"current-user","response_message_id":"response-current"},
+		{"task_id":"research_other-task","conversation_id":"target","status":"running","original_conversation_user_message_id":"current-user","response_message_id":"response-other"}
+	]}`)
+	accumulator := &ChatGPTWebImageAccumulator{Turn: ChatGPTWebImageTurn{MessageID: "current-user", CreatedAt: 100}}
+	state, err := CaptureChatGPTWebImageTasks(payload, "target", accumulator)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.Matched != 1 || state.Terminal != 0 || len(state.Targets) != 1 ||
+		state.Targets[0].TaskID != "imagegen_official-task" ||
+		state.Targets[0].ResponseMessageID != "response-current" || state.Targets[0].Terminal {
+		t.Fatalf("task state = %+v", state)
+	}
+	if !reflect.DeepEqual(accumulator.TaskIDs, []string{"imagegen_official-task"}) ||
+		!reflect.DeepEqual(accumulator.ResponseMessageIDs, []string{"response-current"}) {
+		t.Fatalf("task IDs = %v, response IDs = %v", accumulator.TaskIDs, accumulator.ResponseMessageIDs)
+	}
+}
+
 func TestCaptureChatGPTWebImageTasksDoesNotTimeFallbackAfterExplicitMismatch(t *testing.T) {
 	payload := []byte(`{"tasks":[
 		{"task_id":"other-task","conversation_id":"target","status":"completed","original_conversation_user_message_id":"other-user","create_time":101,"image_gen_message":{"author":{"role":"tool"},"metadata":{"async_task_type":"image_gen"},"content":{"parts":[{"asset_pointer":"file-service://other"}]}}}
