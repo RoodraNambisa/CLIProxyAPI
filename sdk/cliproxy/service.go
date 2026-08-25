@@ -1615,7 +1615,10 @@ func (s *Service) installAuthMaintenanceHook(ctx context.Context) int64 {
 	}
 	hook := authMaintenanceHook{service: s}
 	s.coreManager.AddHook(hook)
-	ids := s.coreManager.AuthIDsForProviders(chatgptwebauth.Provider)
+	// The store is loaded before this hook is installed. Bootstrap every
+	// preloaded auth so providers whose watcher snapshot is seeded from the
+	// store still receive their initial executor and model registration.
+	ids := s.coreManager.AuthIDs()
 	if len(ids) == 0 {
 		return 0
 	}
@@ -1631,7 +1634,7 @@ func (s *Service) installAuthMaintenanceHook(ctx context.Context) int64 {
 			defer workers.Done()
 			for id := range jobs {
 				auth, ok := s.coreManager.GetByID(id)
-				if !ok || !isNativeChatGPTWebAuth(auth) {
+				if !ok {
 					continue
 				}
 				hook.OnAuthUpdated(ctx, auth)

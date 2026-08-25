@@ -2412,6 +2412,46 @@ func TestServiceHandleManagementAuthStatusChange_ReRegistersModelsForEnabledAuth
 	}
 }
 
+func TestInstallAuthMaintenanceHookRegistersPreloadedCodexModels(t *testing.T) {
+	manager := coreauth.NewManager(nil, nil, nil)
+	auth := &coreauth.Auth{
+		ID:       "service-preloaded-codex-models",
+		Provider: "codex",
+		Status:   coreauth.StatusActive,
+		Attributes: map[string]string{
+			"plan_type": "plus",
+		},
+	}
+	if _, errRegister := manager.Register(t.Context(), auth); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+	service := &Service{
+		cfg:         &config.Config{},
+		coreManager: manager,
+	}
+	registry.GetGlobalRegistry().UnregisterClient(auth.ID)
+	t.Cleanup(func() {
+		registry.GetGlobalRegistry().UnregisterClient(auth.ID)
+		_ = manager.CloseExecutors()
+	})
+
+	if models := registry.GetGlobalRegistry().GetModelsForClient(auth.ID); len(models) != 0 {
+		t.Fatalf("models before bootstrap = %v", registeredModelIDs(models))
+	}
+	if processed := service.installAuthMaintenanceHook(t.Context()); processed != 1 {
+		t.Fatalf("processed auths = %d, want 1", processed)
+	}
+
+	models := registry.GetGlobalRegistry().GetModelsForClient(auth.ID)
+	if len(models) == 0 {
+		t.Fatal("preloaded Codex auth models were not registered")
+	}
+	diagnostics := manager.RoutingDiagnostics("codex", models[0].ID, time.Now())
+	if len(diagnostics.Priorities) != 1 || diagnostics.Priorities[0].Total != 1 || diagnostics.Priorities[0].EligibleNow != 1 {
+		t.Fatalf("routing diagnostics = %#v", diagnostics.Priorities)
+	}
+}
+
 func TestServiceHandleManagementAuthStatusChangeReusesQueuedAntigravitySync(t *testing.T) {
 	service := &Service{
 		cfg:         &config.Config{},
