@@ -42,6 +42,8 @@ func TestLoadConfigOptionalChatGPTWebImageSettings(t *testing.T) {
     ignore-unsupported-params: true
     remote-image-url-enabled: true
     remote-image-url-download-mode: credential-proxy
+    normalize-mismatched-image-mime: true
+    normalize-remote-image-mime: false
 `)
 	if err := os.WriteFile(path, data, 0o600); err != nil {
 		t.Fatalf("write config: %v", err)
@@ -63,6 +65,12 @@ func TestLoadConfigOptionalChatGPTWebImageSettings(t *testing.T) {
 	}
 	if resolved.RemoteImageURLDownloadMode != ChatGPTWebRemoteImageDownloadCredentialProxy {
 		t.Fatalf("RemoteImageURLDownloadMode = %q", resolved.RemoteImageURLDownloadMode)
+	}
+	if !resolved.NormalizeMismatchedImageMIME {
+		t.Fatal("NormalizeMismatchedImageMIME = false, want true")
+	}
+	if resolved.NormalizeRemoteImageMIME {
+		t.Fatal("NormalizeRemoteImageMIME = true, want false")
 	}
 }
 
@@ -88,6 +96,12 @@ func TestLoadConfigOptionalDefaultsChatGPTWebImageUpstreamModel(t *testing.T) {
 	}
 	if resolved.RemoteImageURLDownloadMode != ChatGPTWebRemoteImageDownloadDirect {
 		t.Fatalf("RemoteImageURLDownloadMode = %q", resolved.RemoteImageURLDownloadMode)
+	}
+	if resolved.NormalizeMismatchedImageMIME {
+		t.Fatal("NormalizeMismatchedImageMIME = true, want false")
+	}
+	if !resolved.NormalizeRemoteImageMIME {
+		t.Fatal("NormalizeRemoteImageMIME = false, want true")
 	}
 }
 

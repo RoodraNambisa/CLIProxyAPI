@@ -189,16 +189,18 @@ const (
 
 // ChatGPTWebImageConfigSnapshot contains request-scoped Web image adaptation settings.
 type ChatGPTWebImageConfigSnapshot struct {
-	RemoteImageURLEnabled      bool
-	RemoteImageURLDownloadMode string
-	AdaptSizeToAspectRatio     bool
-	StrictSize                 bool
-	AspectRatioMaxErrorPercent float64
-	MaxResizeEdgePixels        int
-	ResizeToRequestedSize      bool
-	ResizeFilter               string
-	MaxImageResponseBytes      int
-	MaxN                       int
+	RemoteImageURLEnabled        bool
+	RemoteImageURLDownloadMode   string
+	NormalizeMismatchedImageMIME bool
+	NormalizeRemoteImageMIME     bool
+	AdaptSizeToAspectRatio       bool
+	StrictSize                   bool
+	AspectRatioMaxErrorPercent   float64
+	MaxResizeEdgePixels          int
+	ResizeToRequestedSize        bool
+	ResizeFilter                 string
+	MaxImageResponseBytes        int
+	MaxN                         int
 }
 
 // ImageGenerationStreamPassthroughState reports whether the selected upstream request

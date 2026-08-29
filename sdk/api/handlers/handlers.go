@@ -330,14 +330,18 @@ func (h *BaseAPIHandler) filterChatGPTWebStrictImageSize(
 			resolved = h.Cfg.Images.ChatGPTWeb.Resolved()
 		}
 		snapshot = coreexecutor.ChatGPTWebImageConfigSnapshot{
-			AdaptSizeToAspectRatio:     resolved.AdaptSizeToAspectRatio,
-			StrictSize:                 resolved.StrictSize,
-			AspectRatioMaxErrorPercent: resolved.AspectRatioMaxErrorPercent,
-			MaxResizeEdgePixels:        resolved.MaxResizeEdgePixels,
-			ResizeToRequestedSize:      resolved.ResizeToRequestedSize,
-			ResizeFilter:               resolved.ResizeFilter,
-			MaxImageResponseBytes:      resolved.MaxImageResponseMegabytes << 20,
-			MaxN:                       resolved.MaxN,
+			RemoteImageURLEnabled:        resolved.RemoteImageURLEnabled,
+			RemoteImageURLDownloadMode:   resolved.RemoteImageURLDownloadMode,
+			NormalizeMismatchedImageMIME: resolved.NormalizeMismatchedImageMIME,
+			NormalizeRemoteImageMIME:     resolved.NormalizeRemoteImageMIME,
+			AdaptSizeToAspectRatio:       resolved.AdaptSizeToAspectRatio,
+			StrictSize:                   resolved.StrictSize,
+			AspectRatioMaxErrorPercent:   resolved.AspectRatioMaxErrorPercent,
+			MaxResizeEdgePixels:          resolved.MaxResizeEdgePixels,
+			ResizeToRequestedSize:        resolved.ResizeToRequestedSize,
+			ResizeFilter:                 resolved.ResizeFilter,
+			MaxImageResponseBytes:        resolved.MaxImageResponseMegabytes << 20,
+			MaxN:                         resolved.MaxN,
 		}
 		ctx = WithChatGPTWebImageConfigSnapshot(ctx, snapshot)
 	}

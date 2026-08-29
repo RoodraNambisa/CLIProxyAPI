@@ -354,6 +354,12 @@ func BuildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 	}
 	oldImageRuntime := oldCfg.Images.ChatGPTWeb.Resolved()
 	newImageRuntime := newCfg.Images.ChatGPTWeb.Resolved()
+	if oldImageRuntime.NormalizeMismatchedImageMIME != newImageRuntime.NormalizeMismatchedImageMIME {
+		changes = append(changes, fmt.Sprintf("images.chatgpt-web.normalize-mismatched-image-mime: %t -> %t", oldImageRuntime.NormalizeMismatchedImageMIME, newImageRuntime.NormalizeMismatchedImageMIME))
+	}
+	if oldImageRuntime.NormalizeRemoteImageMIME != newImageRuntime.NormalizeRemoteImageMIME {
+		changes = append(changes, fmt.Sprintf("images.chatgpt-web.normalize-remote-image-mime: %t -> %t", oldImageRuntime.NormalizeRemoteImageMIME, newImageRuntime.NormalizeRemoteImageMIME))
+	}
 	if oldImageRuntime.PollStallBreakerEnabled != newImageRuntime.PollStallBreakerEnabled {
 		changes = append(changes, fmt.Sprintf("images.chatgpt-web.poll-stall-breaker-enabled: %t -> %t", oldImageRuntime.PollStallBreakerEnabled, newImageRuntime.PollStallBreakerEnabled))
 	}

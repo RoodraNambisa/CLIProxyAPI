@@ -697,16 +697,18 @@ func (e *ChatGPTWebExecutor) prepareRuntimeRequestTemplate(_ context.Context, re
 		resolvedImageConfig = cfg.Images.ChatGPTWeb.Resolved()
 	}
 	imageConfigSnapshot := cliproxyexecutor.ChatGPTWebImageConfigSnapshot{
-		RemoteImageURLEnabled:      resolvedImageConfig.RemoteImageURLEnabled,
-		RemoteImageURLDownloadMode: resolvedImageConfig.RemoteImageURLDownloadMode,
-		AdaptSizeToAspectRatio:     resolvedImageConfig.AdaptSizeToAspectRatio,
-		StrictSize:                 resolvedImageConfig.StrictSize,
-		AspectRatioMaxErrorPercent: resolvedImageConfig.AspectRatioMaxErrorPercent,
-		MaxResizeEdgePixels:        resolvedImageConfig.MaxResizeEdgePixels,
-		ResizeToRequestedSize:      resolvedImageConfig.ResizeToRequestedSize,
-		ResizeFilter:               resolvedImageConfig.ResizeFilter,
-		MaxImageResponseBytes:      resolvedImageConfig.MaxImageResponseMegabytes << 20,
-		MaxN:                       resolvedImageConfig.MaxN,
+		RemoteImageURLEnabled:        resolvedImageConfig.RemoteImageURLEnabled,
+		RemoteImageURLDownloadMode:   resolvedImageConfig.RemoteImageURLDownloadMode,
+		NormalizeMismatchedImageMIME: resolvedImageConfig.NormalizeMismatchedImageMIME,
+		NormalizeRemoteImageMIME:     resolvedImageConfig.NormalizeRemoteImageMIME,
+		AdaptSizeToAspectRatio:       resolvedImageConfig.AdaptSizeToAspectRatio,
+		StrictSize:                   resolvedImageConfig.StrictSize,
+		AspectRatioMaxErrorPercent:   resolvedImageConfig.AspectRatioMaxErrorPercent,
+		MaxResizeEdgePixels:          resolvedImageConfig.MaxResizeEdgePixels,
+		ResizeToRequestedSize:        resolvedImageConfig.ResizeToRequestedSize,
+		ResizeFilter:                 resolvedImageConfig.ResizeFilter,
+		MaxImageResponseBytes:        resolvedImageConfig.MaxImageResponseMegabytes << 20,
+		MaxN:                         resolvedImageConfig.MaxN,
 	}
 	if pinned, ok := opts.Metadata[cliproxyexecutor.ChatGPTWebImageConfigSnapshotMetadataKey].(cliproxyexecutor.ChatGPTWebImageConfigSnapshot); ok {
 		imageConfigSnapshot = pinned
@@ -731,6 +733,11 @@ func (e *ChatGPTWebExecutor) prepareRuntimeRequestTemplate(_ context.Context, re
 			msg:            err.Error(),
 			skipAuthResult: true,
 			retryOtherAuth: helps.IsChatGPTWebProviderUnsupported(err),
+		}
+	}
+	if imageConfigSnapshot.NormalizeMismatchedImageMIME {
+		if err = normalizeChatGPTWebRequestImageMIME(&parsed); err != nil {
+			return nil, statusErr{code: http.StatusBadRequest, msg: err.Error(), skipAuthResult: true}
 		}
 	}
 	if parsed.Model == "" {
@@ -857,6 +864,43 @@ func (e *ChatGPTWebExecutor) prepareRuntimeRequestTemplate(_ context.Context, re
 		imageConfigSnapshot: imageConfigSnapshot,
 		imageSizeMatch:      imageSizeMatch,
 	}, nil
+}
+
+func normalizeChatGPTWebRequestImageMIME(request *helps.ChatGPTWebRequest) error {
+	if request == nil {
+		return nil
+	}
+	for messageIndex := range request.Messages {
+		for partIndex := range request.Messages[messageIndex].Parts {
+			part := &request.Messages[messageIndex].Parts[partIndex]
+			if strings.TrimSpace(part.ImageURL) == "" {
+				continue
+			}
+			normalized, err := helps.NormalizeChatGPTWebImageDataURLMIME(part.ImageURL, chatGPTWebMaxImageBytes)
+			if err != nil {
+				return fmt.Errorf("decode message image: %w", err)
+			}
+			part.ImageURL = normalized
+		}
+	}
+	if request.Image == nil {
+		return nil
+	}
+	for index := range request.Image.Images {
+		normalized, err := helps.NormalizeChatGPTWebImageDataURLMIME(request.Image.Images[index], chatGPTWebMaxImageBytes)
+		if err != nil {
+			return fmt.Errorf("decode image input %d: %w", index, err)
+		}
+		request.Image.Images[index] = normalized
+	}
+	if strings.TrimSpace(request.Image.MaskURL) != "" {
+		normalized, err := helps.NormalizeChatGPTWebImageDataURLMIME(request.Image.MaskURL, chatGPTWebMaxImageBytes)
+		if err != nil {
+			return fmt.Errorf("decode image mask: %w", err)
+		}
+		request.Image.MaskURL = normalized
+	}
+	return nil
 }
 
 func (e *ChatGPTWebExecutor) instantiateRuntimeRequest(template *chatGPTWebPreparedRequest, opts cliproxyexecutor.Options) (*chatGPTWebPreparedRequest, error) {

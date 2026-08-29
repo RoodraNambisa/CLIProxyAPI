@@ -5,6 +5,8 @@ import (
 	"context"
 	"encoding/base64"
 	"errors"
+	"image"
+	"image/png"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
@@ -190,14 +192,18 @@ func assertImageToolNAbsent(t *testing.T, payload []byte) {
 func defaultChatGPTWebImageConfigSnapshot() coreexecutor.ChatGPTWebImageConfigSnapshot {
 	resolved := (sdkconfig.ChatGPTWebImageConfig{}).Resolved()
 	return coreexecutor.ChatGPTWebImageConfigSnapshot{
-		AdaptSizeToAspectRatio:     resolved.AdaptSizeToAspectRatio,
-		StrictSize:                 resolved.StrictSize,
-		AspectRatioMaxErrorPercent: resolved.AspectRatioMaxErrorPercent,
-		MaxResizeEdgePixels:        resolved.MaxResizeEdgePixels,
-		ResizeToRequestedSize:      resolved.ResizeToRequestedSize,
-		ResizeFilter:               resolved.ResizeFilter,
-		MaxImageResponseBytes:      resolved.MaxImageResponseMegabytes << 20,
-		MaxN:                       resolved.MaxN,
+		RemoteImageURLEnabled:        resolved.RemoteImageURLEnabled,
+		RemoteImageURLDownloadMode:   resolved.RemoteImageURLDownloadMode,
+		NormalizeMismatchedImageMIME: resolved.NormalizeMismatchedImageMIME,
+		NormalizeRemoteImageMIME:     resolved.NormalizeRemoteImageMIME,
+		AdaptSizeToAspectRatio:       resolved.AdaptSizeToAspectRatio,
+		StrictSize:                   resolved.StrictSize,
+		AspectRatioMaxErrorPercent:   resolved.AspectRatioMaxErrorPercent,
+		MaxResizeEdgePixels:          resolved.MaxResizeEdgePixels,
+		ResizeToRequestedSize:        resolved.ResizeToRequestedSize,
+		ResizeFilter:                 resolved.ResizeFilter,
+		MaxImageResponseBytes:        resolved.MaxImageResponseMegabytes << 20,
+		MaxN:                         resolved.MaxN,
 	}
 }
 
@@ -731,10 +737,13 @@ func TestImageResponsesProvidersKeepsExcessNForRequestFiltering(t *testing.T) {
 
 func TestOpenAIImagesPinsChatGPTWebImageAspectConfig(t *testing.T) {
 	gin.SetMode(gin.TestMode)
+	disabled := false
 	executor := &imageCaptureExecutor{provider: constant.ChatGPTWeb}
 	h := newImagesTestHandler(t, executor)
 	h.Cfg.Images.ChatGPTWeb.AdaptSizeToAspectRatio = true
 	h.Cfg.Images.ChatGPTWeb.StrictSize = true
+	h.Cfg.Images.ChatGPTWeb.NormalizeMismatchedImageMIME = true
+	h.Cfg.Images.ChatGPTWeb.NormalizeRemoteImageMIME = &disabled
 	router := gin.New()
 	router.Use(allowedImageProvidersMiddleware(constant.ChatGPTWeb))
 	router.POST("/v1/images/generations", h.Generations)
@@ -750,6 +759,7 @@ func TestOpenAIImagesPinsChatGPTWebImageAspectConfig(t *testing.T) {
 		t.Fatalf("status = %d, body=%s", response.Code, response.Body.String())
 	}
 	if !executor.hasImageConfigSnapshot || !executor.imageConfigSnapshot.AdaptSizeToAspectRatio || !executor.imageConfigSnapshot.StrictSize ||
+		!executor.imageConfigSnapshot.NormalizeMismatchedImageMIME || executor.imageConfigSnapshot.NormalizeRemoteImageMIME ||
 		executor.imageConfigSnapshot.AspectRatioMaxErrorPercent != 1 || executor.imageConfigSnapshot.MaxResizeEdgePixels != 3840 ||
 		executor.imageConfigSnapshot.ResizeFilter != sdkconfig.DefaultChatGPTWebResizeFilter ||
 		executor.imageConfigSnapshot.MaxImageResponseBytes != sdkconfig.DefaultChatGPTWebMaxImageResponseMegabytes<<20 ||
@@ -1687,6 +1697,63 @@ func TestDataURLFromFileHeaderRejectsEmptyFile(t *testing.T) {
 	defer func() { _ = form.RemoveAll() }()
 	if _, err := dataURLFromFileHeaderWithLimit(fileHeader, 1); err == nil || !strings.Contains(err.Error(), "empty") {
 		t.Fatalf("empty file error = %v", err)
+	}
+}
+
+func TestNormalizeChatGPTWebImageRequestMIMEPreservesCountAndPayload(t *testing.T) {
+	var encoded bytes.Buffer
+	if err := png.Encode(&encoded, image.NewNRGBA(image.Rect(0, 0, 2, 3))); err != nil {
+		t.Fatalf("encode PNG: %v", err)
+	}
+	payload := base64.StdEncoding.EncodeToString(encoded.Bytes())
+	count := 2
+	req := openAIImageRequest{
+		N:      &count,
+		Images: []imageReference{{ImageURL: "data:image/jpeg;base64," + payload}},
+		Mask:   &imageReference{ImageURL: "data:image/gif;base64," + payload},
+	}
+	if err := normalizeChatGPTWebImageRequestMIME(&req); err != nil {
+		t.Fatalf("normalizeChatGPTWebImageRequestMIME() error = %v", err)
+	}
+	if req.N == nil || *req.N != count {
+		t.Fatalf("n = %v, want %d", req.N, count)
+	}
+	for _, reference := range []imageReference{req.Images[0], *req.Mask} {
+		got, err := imageURLFromReference(reference)
+		if err != nil {
+			t.Fatalf("imageURLFromReference() error = %v", err)
+		}
+		if got != "data:image/png;base64,"+payload {
+			t.Fatalf("normalized image reference = %q", got)
+		}
+	}
+}
+
+func TestNormalizeChatGPTWebMultipartImageMIME(t *testing.T) {
+	var encoded bytes.Buffer
+	if err := png.Encode(&encoded, image.NewNRGBA(image.Rect(0, 0, 1, 1))); err != nil {
+		t.Fatalf("encode PNG: %v", err)
+	}
+	fileHeader, form := imageFileHeaderForTest(t, "declared.jpg", encoded.Bytes())
+	defer func() { _ = form.RemoveAll() }()
+	fileHeader.Header.Set("Content-Type", "image/jpeg")
+	dataURL, err := dataURLFromFileHeader(fileHeader)
+	if err != nil {
+		t.Fatalf("dataURLFromFileHeader() error = %v", err)
+	}
+	if !strings.HasPrefix(dataURL, "data:image/jpeg;base64,") {
+		t.Fatalf("declared data URL = %q", dataURL)
+	}
+	req := openAIImageRequest{Images: []imageReference{{ImageURL: dataURL}}}
+	if err = normalizeChatGPTWebImageRequestMIME(&req); err != nil {
+		t.Fatalf("normalizeChatGPTWebImageRequestMIME() error = %v", err)
+	}
+	got, err := imageURLFromReference(req.Images[0])
+	if err != nil {
+		t.Fatalf("imageURLFromReference() error = %v", err)
+	}
+	if !strings.HasPrefix(got, "data:image/png;base64,") {
+		t.Fatalf("normalized multipart data URL = %q", got)
 	}
 }
 

@@ -142,7 +142,7 @@ func TestMaterializeChatGPTWebRemoteImagesCompositesRemoteMask(t *testing.T) {
 }
 
 func TestMaterializeChatGPTWebRemoteImagesRejectsMIMEConflictWithoutLeakingLease(t *testing.T) {
-	file := &chatGPTWebRemoteImageTestFile{data: chatGPTWebRemoteImagePNG(t, 1, 1), contentType: "text/html"}
+	file := &chatGPTWebRemoteImageTestFile{data: chatGPTWebRemoteImagePNG(t, 1, 1), contentType: "image/jpeg"}
 	prepared := &chatGPTWebPreparedRequest{
 		request: helps.ChatGPTWebRequest{Messages: []helps.ChatGPTWebMessage{{Parts: []helps.ChatGPTWebContentPart{{
 			ImageURL: "https://images.example/image",
@@ -155,7 +155,10 @@ func TestMaterializeChatGPTWebRemoteImagesRejectsMIMEConflictWithoutLeakingLease
 		t.Context(), prepared, "",
 		func(context.Context, string, string) (chatGPTWebRemoteImageFile, error) { return file, nil },
 	)
-	assertChatGPTWebRemoteImageStatus(t, errMaterialize, http.StatusBadRequest, "remote_image_invalid_content")
+	assertChatGPTWebRemoteImageStatus(t, errMaterialize, http.StatusBadRequest, "remote_image_mime_mismatch")
+	if !strings.Contains(errMaterialize.Error(), `declared \"image/jpeg\", detected \"image/png\"`) {
+		t.Fatalf("remote image mismatch error = %v", errMaterialize)
+	}
 	prepared.imageMemoryLeases.Release()
 	after := helps.ChatGPTWebImageMemorySnapshot()
 	if after.ProcessingTasks != before.ProcessingTasks || after.ProcessingBytes != before.ProcessingBytes {
@@ -163,6 +166,54 @@ func TestMaterializeChatGPTWebRemoteImagesRejectsMIMEConflictWithoutLeakingLease
 	}
 	if file.removeCalls.Load() != 1 {
 		t.Fatalf("remove calls = %d", file.removeCalls.Load())
+	}
+}
+
+func TestMaterializeChatGPTWebRemoteImagesMIMENormalizationPolicy(t *testing.T) {
+	const remoteURL = "https://images.example/mismatched.jpg"
+	tests := []struct {
+		name            string
+		normalize       bool
+		normalizeRemote bool
+		wantCode        string
+	}{
+		{name: "normalization disabled", normalize: false, normalizeRemote: true, wantCode: "remote_image_mime_mismatch"},
+		{name: "remote normalization disabled", normalize: true, normalizeRemote: false, wantCode: "remote_image_mime_mismatch"},
+		{name: "remote normalization enabled", normalize: true, normalizeRemote: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			file := &chatGPTWebRemoteImageTestFile{
+				data:        chatGPTWebRemoteImagePNG(t, 2, 3),
+				contentType: "image/jpeg",
+			}
+			prepared := &chatGPTWebPreparedRequest{
+				request: helps.ChatGPTWebRequest{Messages: []helps.ChatGPTWebMessage{{Parts: []helps.ChatGPTWebContentPart{{
+					ImageURL: remoteURL,
+				}}}}},
+				imageMemoryLeases: helps.NewChatGPTWebImageMemoryLeaseSet(),
+			}
+			prepared.imageConfigSnapshot.RemoteImageURLEnabled = true
+			prepared.imageConfigSnapshot.NormalizeMismatchedImageMIME = tt.normalize
+			prepared.imageConfigSnapshot.NormalizeRemoteImageMIME = tt.normalizeRemote
+
+			errMaterialize := (&ChatGPTWebExecutor{}).materializeChatGPTWebRemoteImagesWithFetcher(
+				t.Context(), prepared, "",
+				func(context.Context, string, string) (chatGPTWebRemoteImageFile, error) { return file, nil },
+			)
+			defer prepared.imageMemoryLeases.Release()
+			if tt.wantCode != "" {
+				assertChatGPTWebRemoteImageStatus(t, errMaterialize, http.StatusBadRequest, tt.wantCode)
+				return
+			}
+			if errMaterialize != nil {
+				t.Fatalf("materialize() error = %v", errMaterialize)
+			}
+			got := prepared.request.Messages[0].Parts[0].ImageURL
+			if !strings.HasPrefix(got, "data:image/png;base64,") {
+				t.Fatalf("normalized remote image = %q", got)
+			}
+		})
 	}
 }
 
@@ -192,7 +243,7 @@ func TestChatGPTWebRemoteImageValidatesAllGIFFramesWithinPixelBudget(t *testing.
 		data:        chatGPTWebRemoteImageGIF(t, 3, 2, 2),
 		contentType: "image/gif",
 	}
-	metadata, errInspect := inspectChatGPTWebRemoteImage(file)
+	metadata, errInspect := inspectChatGPTWebRemoteImage(file, false)
 	if errInspect != nil {
 		t.Fatalf("inspectChatGPTWebRemoteImage() error = %v", errInspect)
 	}

@@ -102,6 +102,49 @@ func TestChatGPTWebPreparedRequestInstancesAreIsolated(t *testing.T) {
 	}
 }
 
+func TestChatGPTWebPreparedRequestNormalizesImageMIMEAcrossInputFormats(t *testing.T) {
+	pngPayload := base64.StdEncoding.EncodeToString(chatGPTWebPNGBytes(t, color.NRGBA{R: 0xff, A: 0xff}))
+	dataURL := "data:image/jpeg;base64," + pngPayload
+	tests := []struct {
+		name   string
+		format sdktranslator.Format
+		body   string
+	}{
+		{
+			name:   "OpenAI chat",
+			format: sdktranslator.FormatOpenAI,
+			body:   `{"model":"gpt-5","messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"` + dataURL + `"}}]}]}`,
+		},
+		{
+			name:   "OpenAI responses",
+			format: sdktranslator.FormatOpenAIResponse,
+			body:   `{"model":"gpt-5","input":[{"role":"user","content":[{"type":"input_image","image_url":"` + dataURL + `"}]}]}`,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := &config.Config{SDKConfig: config.SDKConfig{Images: config.ImagesConfig{ChatGPTWeb: config.ChatGPTWebImageConfig{
+				NormalizeMismatchedImageMIME: true,
+			}}}}
+			executor := NewChatGPTWebExecutor(cfg, nil)
+			t.Cleanup(func() { _ = executor.Close() })
+			prepared, err := executor.prepareRuntimeRequestTemplate(t.Context(), cliproxyexecutor.Request{
+				Model: "gpt-5", Payload: []byte(tt.body),
+			}, cliproxyexecutor.Options{SourceFormat: tt.format, ResponseFormat: tt.format}, false)
+			if err != nil {
+				t.Fatalf("prepareRuntimeRequestTemplate() error = %v", err)
+			}
+			if len(prepared.request.Messages) != 1 || len(prepared.request.Messages[0].Parts) == 0 {
+				t.Fatalf("prepared messages = %#v", prepared.request.Messages)
+			}
+			got := prepared.request.Messages[0].Parts[len(prepared.request.Messages[0].Parts)-1].ImageURL
+			if got != "data:image/png;base64,"+pngPayload {
+				t.Fatalf("normalized image URL = %q", got)
+			}
+		})
+	}
+}
+
 func TestChatGPTWebPreparedRequestRebuildsForSelectedAuthModelMapping(t *testing.T) {
 	executor := NewChatGPTWebExecutor(nil, nil)
 	t.Cleanup(func() { _ = executor.Close() })

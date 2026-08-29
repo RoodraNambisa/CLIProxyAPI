@@ -200,6 +200,10 @@ type ChatGPTWebImageConfig struct {
 	RemoteImageURLDownloadMode string `yaml:"remote-image-url-download-mode,omitempty" json:"remote-image-url-download-mode,omitempty"`
 	// IgnoreUnsupportedParams allows Web routing after dropping options that Web cannot express.
 	IgnoreUnsupportedParams bool `yaml:"ignore-unsupported-params,omitempty" json:"ignore-unsupported-params,omitempty"`
+	// NormalizeMismatchedImageMIME trusts a supported image's decoded format over its declared MIME type.
+	NormalizeMismatchedImageMIME bool `yaml:"normalize-mismatched-image-mime,omitempty" json:"normalize-mismatched-image-mime,omitempty"`
+	// NormalizeRemoteImageMIME extends MIME normalization to downloaded remote images.
+	NormalizeRemoteImageMIME *bool `yaml:"normalize-remote-image-mime,omitempty" json:"normalize-remote-image-mime,omitempty"`
 	// AdaptSizeToAspectRatio maps compatible explicit image sizes to an upstream canvas prompt.
 	AdaptSizeToAspectRatio bool `yaml:"adapt-size-to-aspect-ratio,omitempty" json:"adapt-size-to-aspect-ratio,omitempty"`
 	// StrictSize excludes ChatGPT Web when an explicit image size cannot be adapted.
@@ -331,28 +335,30 @@ func ChatGPTWebImageAdmissionWaitDuration(milliseconds int) (time.Duration, erro
 
 // ResolvedChatGPTWebImageConfig contains effective ChatGPT Web image compatibility values.
 type ResolvedChatGPTWebImageConfig struct {
-	UpstreamModel              string
-	RemoteImageURLEnabled      bool
-	RemoteImageURLDownloadMode string
-	IgnoreUnsupportedParams    bool
-	AdaptSizeToAspectRatio     bool
-	StrictSize                 bool
-	AspectRatioMaxErrorPercent float64
-	MaxResizeEdgePixels        int
-	ResizeToRequestedSize      bool
-	ResizeFilter               string
-	MaxImageResponseMegabytes  int
-	MaxN                       int
-	MaxInFlight                int
-	AdmissionQueueSize         int
-	AdmissionWaitMilliseconds  int
-	MaxFinalizers              int
-	CompletionReserveMegabytes int
-	MemoryCapacityMegabytes    int
-	PollConcurrency            int
-	PollStallBreakerEnabled    bool
-	PollStallSeconds           int
-	MemoryFinalizerConcurrency int
+	UpstreamModel                string
+	RemoteImageURLEnabled        bool
+	RemoteImageURLDownloadMode   string
+	IgnoreUnsupportedParams      bool
+	NormalizeMismatchedImageMIME bool
+	NormalizeRemoteImageMIME     bool
+	AdaptSizeToAspectRatio       bool
+	StrictSize                   bool
+	AspectRatioMaxErrorPercent   float64
+	MaxResizeEdgePixels          int
+	ResizeToRequestedSize        bool
+	ResizeFilter                 string
+	MaxImageResponseMegabytes    int
+	MaxN                         int
+	MaxInFlight                  int
+	AdmissionQueueSize           int
+	AdmissionWaitMilliseconds    int
+	MaxFinalizers                int
+	CompletionReserveMegabytes   int
+	MemoryCapacityMegabytes      int
+	PollConcurrency              int
+	PollStallBreakerEnabled      bool
+	PollStallSeconds             int
+	MemoryFinalizerConcurrency   int
 }
 
 // ResolvedUpstreamModel returns the effective ChatGPT Web image conversation model.
@@ -366,31 +372,36 @@ func (cfg ChatGPTWebImageConfig) ResolvedUpstreamModel() string {
 // Resolved returns the effective ChatGPT Web image compatibility configuration.
 func (cfg ChatGPTWebImageConfig) Resolved() ResolvedChatGPTWebImageConfig {
 	resolved := ResolvedChatGPTWebImageConfig{
-		UpstreamModel:              cfg.ResolvedUpstreamModel(),
-		RemoteImageURLEnabled:      cfg.RemoteImageURLEnabled,
-		RemoteImageURLDownloadMode: DefaultChatGPTWebRemoteImageDownloadMode,
-		IgnoreUnsupportedParams:    cfg.IgnoreUnsupportedParams,
-		AdaptSizeToAspectRatio:     cfg.AdaptSizeToAspectRatio,
-		StrictSize:                 cfg.StrictSize,
-		AspectRatioMaxErrorPercent: DefaultChatGPTWebAspectRatioMaxErrorPercent,
-		MaxResizeEdgePixels:        DefaultChatGPTWebMaxResizeEdgePixels,
-		ResizeToRequestedSize:      cfg.ResizeToRequestedSize,
-		ResizeFilter:               DefaultChatGPTWebResizeFilter,
-		MaxImageResponseMegabytes:  DefaultChatGPTWebMaxImageResponseMegabytes,
-		MaxN:                       DefaultChatGPTWebMaxN,
-		MaxInFlight:                DefaultChatGPTWebImageMaxInFlight,
-		AdmissionQueueSize:         DefaultChatGPTWebImageAdmissionQueueSize,
-		AdmissionWaitMilliseconds:  DefaultChatGPTWebImageAdmissionWaitMS,
-		MaxFinalizers:              DefaultChatGPTWebImageMaxFinalizers,
-		CompletionReserveMegabytes: DefaultChatGPTWebImageCompletionReserveMB,
-		MemoryCapacityMegabytes:    DefaultChatGPTWebImageMemoryCapacityMB,
-		PollConcurrency:            DefaultChatGPTWebImagePollConcurrency,
-		PollStallBreakerEnabled:    DefaultChatGPTWebImagePollStallBreakerEnabled,
-		PollStallSeconds:           DefaultChatGPTWebImagePollStallSeconds,
-		MemoryFinalizerConcurrency: DefaultChatGPTWebImageMemoryFinalizerConcurrency,
+		UpstreamModel:                cfg.ResolvedUpstreamModel(),
+		RemoteImageURLEnabled:        cfg.RemoteImageURLEnabled,
+		RemoteImageURLDownloadMode:   DefaultChatGPTWebRemoteImageDownloadMode,
+		IgnoreUnsupportedParams:      cfg.IgnoreUnsupportedParams,
+		NormalizeMismatchedImageMIME: cfg.NormalizeMismatchedImageMIME,
+		NormalizeRemoteImageMIME:     true,
+		AdaptSizeToAspectRatio:       cfg.AdaptSizeToAspectRatio,
+		StrictSize:                   cfg.StrictSize,
+		AspectRatioMaxErrorPercent:   DefaultChatGPTWebAspectRatioMaxErrorPercent,
+		MaxResizeEdgePixels:          DefaultChatGPTWebMaxResizeEdgePixels,
+		ResizeToRequestedSize:        cfg.ResizeToRequestedSize,
+		ResizeFilter:                 DefaultChatGPTWebResizeFilter,
+		MaxImageResponseMegabytes:    DefaultChatGPTWebMaxImageResponseMegabytes,
+		MaxN:                         DefaultChatGPTWebMaxN,
+		MaxInFlight:                  DefaultChatGPTWebImageMaxInFlight,
+		AdmissionQueueSize:           DefaultChatGPTWebImageAdmissionQueueSize,
+		AdmissionWaitMilliseconds:    DefaultChatGPTWebImageAdmissionWaitMS,
+		MaxFinalizers:                DefaultChatGPTWebImageMaxFinalizers,
+		CompletionReserveMegabytes:   DefaultChatGPTWebImageCompletionReserveMB,
+		MemoryCapacityMegabytes:      DefaultChatGPTWebImageMemoryCapacityMB,
+		PollConcurrency:              DefaultChatGPTWebImagePollConcurrency,
+		PollStallBreakerEnabled:      DefaultChatGPTWebImagePollStallBreakerEnabled,
+		PollStallSeconds:             DefaultChatGPTWebImagePollStallSeconds,
+		MemoryFinalizerConcurrency:   DefaultChatGPTWebImageMemoryFinalizerConcurrency,
 	}
 	if mode := strings.ToLower(strings.TrimSpace(cfg.RemoteImageURLDownloadMode)); mode != "" {
 		resolved.RemoteImageURLDownloadMode = mode
+	}
+	if cfg.NormalizeRemoteImageMIME != nil {
+		resolved.NormalizeRemoteImageMIME = *cfg.NormalizeRemoteImageMIME
 	}
 	if cfg.AspectRatioMaxErrorPercent != nil {
 		resolved.AspectRatioMaxErrorPercent = *cfg.AspectRatioMaxErrorPercent

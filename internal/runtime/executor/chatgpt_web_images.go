@@ -2000,10 +2000,14 @@ func chatGPTWebOutputImageConfig(data []byte, mimeType string) (image.Config, er
 }
 
 func decodeChatGPTWebImageConfig(data []byte, mimeType string) (image.Config, error) {
-	imageConfig, format, err := image.DecodeConfig(bytes.NewReader(data))
+	imageConfig, detected, err := helps.DetectChatGPTWebImageMIME(bytes.NewReader(data))
 	if err == nil {
-		if !chatGPTWebImageFormatMatchesMIME(format, mimeType) {
-			return image.Config{}, fmt.Errorf("image content does not match MIME type %q", mimeType)
+		declared := helps.CanonicalChatGPTWebImageMIME(mimeType)
+		if declared != detected {
+			if declared == "" {
+				declared = strings.ToLower(strings.TrimSpace(mimeType))
+			}
+			return image.Config{}, &helps.ChatGPTWebImageMIMEMismatchError{Declared: declared, Detected: detected}
 		}
 		return imageConfig, nil
 	}
@@ -2015,21 +2019,6 @@ func decodeChatGPTWebImageConfig(data []byte, mimeType string) (image.Config, er
 		return image.Config{}, err
 	}
 	return image.Config{Width: width, Height: height}, nil
-}
-
-func chatGPTWebImageFormatMatchesMIME(format, mimeType string) bool {
-	mediaType, _, errParse := mime.ParseMediaType(strings.ToLower(strings.TrimSpace(mimeType)))
-	if errParse != nil {
-		mediaType = strings.ToLower(strings.TrimSpace(strings.SplitN(mimeType, ";", 2)[0]))
-	}
-	switch mediaType {
-	case "image/jpeg", "image/jpg":
-		return strings.EqualFold(strings.TrimSpace(format), "jpeg")
-	case "image/png", "image/gif", "image/webp":
-		return strings.EqualFold(strings.TrimSpace(format), strings.TrimPrefix(mediaType, "image/"))
-	default:
-		return false
-	}
 }
 
 func decodeAndValidateChatGPTWebOutputImage(data []byte, mimeType string) (image.Image, image.Config, error) {

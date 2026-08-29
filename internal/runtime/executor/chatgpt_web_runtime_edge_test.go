@@ -25,6 +25,7 @@ import (
 	"time"
 
 	fhttp "github.com/bogdanfinn/fhttp"
+	imagewebp "github.com/gen2brain/webp"
 	"github.com/gin-gonic/gin"
 	chatgptwebauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/chatgptweb"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
@@ -5022,7 +5023,7 @@ func TestUploadChatGPTWebImageUsesHeaderOnlyForOrdinaryReference(t *testing.T) {
 
 func TestChatGPTWebReferenceImageConfigRejectsMIMEMismatch(t *testing.T) {
 	_, err := chatGPTWebReferenceImageConfig(chatGPTWebPNGBytes(t), "image/jpeg")
-	if err == nil || !strings.Contains(err.Error(), "does not match MIME type") {
+	if err == nil || !strings.Contains(err.Error(), `declared "image/jpeg", detected "image/png"`) {
 		t.Fatalf("chatGPTWebReferenceImageConfig() error = %v", err)
 	}
 }
@@ -7996,11 +7997,18 @@ func TestPollChatGPTWebImageConversationStopsAfterMaximumPolls(t *testing.T) {
 func TestChatGPTWebExecutorImageEditUploadsCompositedMask(t *testing.T) {
 	fixture := newChatGPTWebImageEditFixture(t)
 	defer fixture.server.Close()
-	executor := NewChatGPTWebExecutor(nil, nil)
+	executor := NewChatGPTWebExecutor(&config.Config{SDKConfig: config.SDKConfig{Images: config.ImagesConfig{
+		ChatGPTWeb: config.ChatGPTWebImageConfig{NormalizeMismatchedImageMIME: true},
+	}}}, nil)
 	executor.runtimeBaseURL = fixture.server.URL
 	disableChatGPTWebImagePollWaits(executor)
 
-	input := chatGPTWebPNGDataURL(t, color.NRGBA{R: 255, A: 255}, color.NRGBA{G: 255, A: 255})
+	input := strings.Replace(
+		chatGPTWebPNGDataURL(t, color.NRGBA{R: 255, A: 255}, color.NRGBA{G: 255, A: 255}),
+		"data:image/png;base64,",
+		"data:image/jpeg;base64,",
+		1,
+	)
 	mask := chatGPTWebPNGDataURL(t, color.NRGBA{A: 0}, color.NRGBA{A: 255})
 	response, err := executor.Execute(context.Background(), chatGPTWebRuntimeAuth(), cliproxyexecutor.Request{
 		Model: "gpt-image-2",
@@ -8023,7 +8031,12 @@ func TestChatGPTWebExecutorImageEditUploadsCompositedMask(t *testing.T) {
 
 	fixture.mu.Lock()
 	uploaded := bytes.Clone(fixture.uploaded)
+	uploadedContentType := fixture.uploadedContentType
+	uploadedFileName := fixture.uploadedFileName
 	fixture.mu.Unlock()
+	if uploadedContentType != "image/png" || !strings.HasSuffix(uploadedFileName, ".png") {
+		t.Fatalf("upload metadata = content-type %q, filename %q", uploadedContentType, uploadedFileName)
+	}
 	decoded, err := png.Decode(bytes.NewReader(uploaded))
 	if err != nil {
 		t.Fatalf("decode uploaded image: %v", err)
@@ -8076,6 +8089,30 @@ func TestChatGPTWebImageMaskIsCompositedDuringPreflight(t *testing.T) {
 	_, _, _, secondAlpha := decoded.At(1, 0).RGBA()
 	if firstAlpha != 0 || secondAlpha != 0xffff {
 		t.Fatalf("composited alpha = (%d, %d), want (0, 65535)", firstAlpha, secondAlpha)
+	}
+}
+
+func TestChatGPTWebImageMIMENormalizationStillRejectsWebPMask(t *testing.T) {
+	input := chatGPTWebPNGDataURL(t, color.NRGBA{R: 255, A: 255})
+	maskImage := image.NewNRGBA(image.Rect(0, 0, 1, 1))
+	maskImage.SetNRGBA(0, 0, color.NRGBA{A: 255})
+	var maskData bytes.Buffer
+	if err := imagewebp.Encode(&maskData, maskImage, imagewebp.Options{Quality: 90, Exact: true}); err != nil {
+		t.Fatalf("encode WebP mask: %v", err)
+	}
+	request := helps.ChatGPTWebRequest{Image: &helps.ChatGPTWebImageRequest{
+		Images:  []string{input},
+		MaskURL: "data:image/jpeg;base64," + base64.StdEncoding.EncodeToString(maskData.Bytes()),
+	}}
+	if err := normalizeChatGPTWebRequestImageMIME(&request); err != nil {
+		t.Fatalf("normalizeChatGPTWebRequestImageMIME() error = %v", err)
+	}
+	if !strings.HasPrefix(request.Image.MaskURL, "data:image/webp;base64,") {
+		t.Fatalf("normalized mask = %q", request.Image.MaskURL)
+	}
+	err := prepareChatGPTWebImageMask(request.Image)
+	if err == nil || !strings.Contains(err.Error(), "WebP mask compositing is not supported") {
+		t.Fatalf("prepareChatGPTWebImageMask() error = %v", err)
 	}
 }
 
@@ -8760,10 +8797,12 @@ func newChatGPTWebSearchFailureFixture(t *testing.T) *httptest.Server {
 }
 
 type chatGPTWebImageEditFixture struct {
-	server        *httptest.Server
-	mu            sync.Mutex
-	uploaded      []byte
-	turnMessageID string
+	server              *httptest.Server
+	mu                  sync.Mutex
+	uploaded            []byte
+	uploadedContentType string
+	uploadedFileName    string
+	turnMessageID       string
 }
 
 type chatGPTWebBlockingImageFixture struct {
@@ -8865,6 +8904,15 @@ func newChatGPTWebImageEditFixture(t *testing.T) *chatGPTWebImageEditFixture {
 		case "/backend-api/sentinel/chat-requirements/finalize":
 			_ = json.NewEncoder(w).Encode(map[string]any{"token": "requirements"})
 		case "/backend-api/files":
+			var body struct {
+				FileName string `json:"file_name"`
+			}
+			if err := json.NewDecoder(request.Body).Decode(&body); err != nil {
+				t.Errorf("decode upload metadata: %v", err)
+			}
+			fixture.mu.Lock()
+			fixture.uploadedFileName = body.FileName
+			fixture.mu.Unlock()
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"file_id":    "input-file",
 				"upload_url": fixture.server.URL + "/signed-upload?sig=secret",
@@ -8876,6 +8924,7 @@ func newChatGPTWebImageEditFixture(t *testing.T) *chatGPTWebImageEditFixture {
 			}
 			fixture.mu.Lock()
 			fixture.uploaded = payload
+			fixture.uploadedContentType = request.Header.Get("Content-Type")
 			fixture.mu.Unlock()
 			w.WriteHeader(http.StatusCreated)
 		case "/backend-api/files/input-file/uploaded":

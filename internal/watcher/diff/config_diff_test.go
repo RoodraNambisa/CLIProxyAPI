@@ -178,6 +178,20 @@ func TestBuildConfigChangeDetails_ChatGPTWebImagePollStallBreaker(t *testing.T) 
 	expectContains(t, details, "images.chatgpt-web.poll-stall-seconds: 120 -> 300")
 }
 
+func TestBuildConfigChangeDetails_ChatGPTWebImageMIMENormalization(t *testing.T) {
+	disabled := false
+	details := BuildConfigChangeDetails(&config.Config{}, &config.Config{SDKConfig: config.SDKConfig{
+		Images: config.ImagesConfig{
+			ChatGPTWeb: config.ChatGPTWebImageConfig{
+				NormalizeMismatchedImageMIME: true,
+				NormalizeRemoteImageMIME:     &disabled,
+			},
+		},
+	}})
+	expectContains(t, details, "images.chatgpt-web.normalize-mismatched-image-mime: false -> true")
+	expectContains(t, details, "images.chatgpt-web.normalize-remote-image-mime: true -> false")
+}
+
 func TestBuildConfigChangeDetailsDoesNotExposeLoginProxyTemplate(t *testing.T) {
 	oldConfig := &config.Config{ChatGPTWeb: config.ChatGPTWebConfig{LoginProxy: config.ChatGPTWebLoginProxyConfig{
 		URLTemplate: "http://user:old-secret@old-proxy.example:8080",

@@ -229,9 +229,19 @@ func (e *ChatGPTWebExecutor) materializeChatGPTWebRemoteImagesWithFetcher(
 		if errFetch != nil {
 			return chatGPTWebRemoteImageFetchStatusError(errFetch)
 		}
-		item, errInspect := inspectChatGPTWebRemoteImage(file)
+		normalizeMIME := prepared.imageConfigSnapshot.NormalizeMismatchedImageMIME &&
+			prepared.imageConfigSnapshot.NormalizeRemoteImageMIME
+		item, errInspect := inspectChatGPTWebRemoteImage(file, normalizeMIME)
 		if errInspect != nil {
 			_ = file.Remove()
+			var mismatch *helps.ChatGPTWebImageMIMEMismatchError
+			if errors.As(errInspect, &mismatch) {
+				return newChatGPTWebRemoteImageStatusError(
+					http.StatusBadRequest,
+					"remote_image_mime_mismatch",
+					mismatch.Error(),
+				)
+			}
 			return chatGPTWebRemoteImageContentError()
 		}
 		metadata[reference] = item
@@ -317,26 +327,31 @@ func chatGPTWebPreparedImageReferences(prepared *chatGPTWebPreparedRequest) []st
 	return references
 }
 
-func inspectChatGPTWebRemoteImage(file chatGPTWebRemoteImageFile) (*chatGPTWebRemoteImageMetadata, error) {
+func inspectChatGPTWebRemoteImage(file chatGPTWebRemoteImageFile, normalizeMIME bool) (*chatGPTWebRemoteImageMetadata, error) {
 	if file == nil || file.SizeBytes() < 1 {
 		return nil, errors.New("remote image file is empty")
 	}
 	var imageConfig image.Config
-	var format string
+	var mimeType string
 	errInspect := file.WithReader(func(reader io.Reader) error {
 		var errDecode error
-		imageConfig, format, errDecode = image.DecodeConfig(reader)
+		imageConfig, mimeType, errDecode = helps.DetectChatGPTWebImageMIME(reader)
 		return errDecode
 	})
 	if errInspect != nil {
 		return nil, errInspect
 	}
-	mimeType := chatGPTWebImageFormatMIME(format)
 	if mimeType == "" || validateChatGPTWebImageConfig(imageConfig) != nil {
 		return nil, errors.New("remote image format is unsupported")
 	}
 	if !chatGPTWebRemoteImageDeclaredMIMEMatches(file.ContentType(), mimeType) {
-		return nil, errors.New("remote image MIME type does not match content")
+		if !normalizeMIME {
+			declared := strings.TrimSpace(file.ContentType())
+			if canonical := helps.CanonicalChatGPTWebImageMIME(declared); canonical != "" {
+				declared = canonical
+			}
+			return nil, &helps.ChatGPTWebImageMIMEMismatchError{Declared: declared, Detected: mimeType}
+		}
 	}
 	metadata := &chatGPTWebRemoteImageMetadata{
 		file:          file,
