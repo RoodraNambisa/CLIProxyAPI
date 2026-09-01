@@ -276,7 +276,7 @@ func TestResponsesWebsocketSanitizesBodyAndEmbeddedHeaders(t *testing.T) {
 		Addon:      http.Header{"Retry-After": {"30"}, "X-Upstream-Task": {"task_123"}},
 	}
 	projected := base.ProjectChatGPTWebImageErrorResponse(c, original)
-	payload := []byte(`{"type":"error","status":503,"failure_stage":"poll","taskId":"task_root","task_status":2,"chatgpt_web_diagnostics":true,"diagnostics":{"conversation_id":"conversation_123","upstream_trace":17,"upstream_url":"https://internal.example/tasks/123"},"headers":{"Retry-After":"30","X-Upstream-Task":"task_123"},"error":{"message":"chatgpt web image poll task task_123 failed","code":"chatgpt_web_image_poll_stalled","failure_stage":"poll"}}`)
+	payload := []byte(`{"type":"error","status":503,"failure_stage":"poll","taskId":"task_root","task_status":2,"chatgptWebDiagnostics":true,"pictureV2Trace":"internal","diagnostics":{"conversation_id":"conversation_123","upstream_trace":17,"upstream_url":"https://internal.example/tasks/123"},"headers":{"Retry-After":"30","X-Upstream-Task":"task_123"},"error":{"message":"chatgpt web image poll task task_123 failed","code":"chatgpt_web_image_poll_stalled","failure_stage":"poll"}}`)
 	rewritten, errRewrite := rewriteResponsesWebsocketTerminalErrorPayload(payload, projected)
 	if errRewrite != nil {
 		t.Fatalf("rewrite websocket payload: %v", errRewrite)
@@ -288,7 +288,7 @@ func TestResponsesWebsocketSanitizesBodyAndEmbeddedHeaders(t *testing.T) {
 		t.Fatalf("unsafe header was retained: %s", rewritten)
 	}
 	lower := strings.ToLower(string(rewritten))
-	if strings.Contains(lower, "chatgpt") || strings.Contains(lower, "poll") || strings.Contains(lower, "failure_stage") || strings.Contains(lower, "task_") || strings.Contains(lower, "conversation_") || strings.Contains(lower, "upstream") || strings.Contains(lower, "internal.example") {
+	if strings.Contains(lower, "chatgpt") || strings.Contains(lower, "picturev2") || strings.Contains(lower, "poll") || strings.Contains(lower, "failure_stage") || strings.Contains(lower, "task_") || strings.Contains(lower, "conversation_") || strings.Contains(lower, "upstream") || strings.Contains(lower, "internal.example") {
 		t.Fatalf("sanitized websocket payload = %s", rewritten)
 	}
 }

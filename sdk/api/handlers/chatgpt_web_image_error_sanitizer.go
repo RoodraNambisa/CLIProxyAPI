@@ -708,6 +708,10 @@ func containsChatGPTWebImageInternalDetail(value string) bool {
 
 func containsChatGPTWebImageProvenance(value string) bool {
 	lower := strings.ToLower(value)
+	compact := strings.NewReplacer(" ", "", "-", "", "_", "").Replace(lower)
+	if strings.Contains(compact, "chatgptweb") || strings.Contains(compact, "picturev2") {
+		return true
+	}
 	for _, marker := range []string{
 		"chatgpt web", "chatgpt-web", "chatgpt_web", "picture_v2",
 		"failure_stage", "task_id", "task id", "conversation_id", "conversation id",

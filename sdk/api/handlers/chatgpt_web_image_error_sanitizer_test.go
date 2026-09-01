@@ -141,9 +141,11 @@ func TestChatGPTWebImageErrorSanitizationPreservesSafeRewriteAndBlocksUnsafeRewr
 		{
 			name: "unsafe rewrite",
 			body: map[string]any{"error": map[string]any{
-				"message":   "request failed at https://internal.example/tasks/123",
-				"pollState": "stalled",
-				"taskId":    "task_123",
+				"message":             "request failed at https://internal.example/tasks/123",
+				"pollState":           "stalled",
+				"taskId":              "task_123",
+				"chatgptWebTrace":     "internal",
+				"pictureV2Diagnostic": true,
 			}},
 			wantBody: "Rate limit reached for image generation",
 		},
@@ -346,7 +348,7 @@ func TestChatGPTWebImageErrorSanitizationDoesNotUseGenericProviderCodeAsWebIdent
 func assertSanitizedImageBody(t *testing.T, body string) {
 	t.Helper()
 	lower := strings.ToLower(body)
-	for _, forbidden := range []string{"chatgpt web", "chatgpt-web", "chatgpt_web", "failure_stage", "task_", "conversation_", "internal.example"} {
+	for _, forbidden := range []string{"chatgpt web", "chatgpt-web", "chatgpt_web", "chatgptweb", "picturev2", "failure_stage", "task_", "conversation_", "internal.example"} {
 		if strings.Contains(lower, forbidden) {
 			t.Fatalf("sanitized body leaked %q: %s", forbidden, body)
 		}
