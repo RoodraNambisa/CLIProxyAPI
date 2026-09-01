@@ -583,17 +583,80 @@ func safeSanitizedImageResponseBody(body []byte) bool {
 	return !containsChatGPTWebImageInternalDetail(string(body))
 }
 
+// SanitizeChatGPTWebImageProtocolPayload removes internal fields outside the
+// projected error object in Responses SSE and WebSocket terminal envelopes.
+func SanitizeChatGPTWebImageProtocolPayload(payload []byte) ([]byte, error) {
+	var value any
+	if errUnmarshal := json.Unmarshal(payload, &value); errUnmarshal != nil {
+		return nil, errUnmarshal
+	}
+	cleaned, keep := sanitizeInternalImageProtocolValue(value)
+	if !keep {
+		return nil, errors.New("sanitized image protocol payload has no safe root value")
+	}
+	encoded, errMarshal := json.Marshal(cleaned)
+	if errMarshal != nil {
+		return nil, errMarshal
+	}
+	if containsInternalImageResponseValue(cleaned) || containsChatGPTWebImageInternalDetail(string(encoded)) {
+		return nil, errors.New("sanitized image protocol payload still contains internal details")
+	}
+	return encoded, nil
+}
+
+func sanitizeInternalImageProtocolValue(value any) (any, bool) {
+	switch typed := value.(type) {
+	case map[string]any:
+		for key, item := range typed {
+			if internalImageResponseKey(key) {
+				delete(typed, key)
+				continue
+			}
+			cleaned, keep := sanitizeInternalImageProtocolValue(item)
+			if !keep {
+				delete(typed, key)
+				continue
+			}
+			typed[key] = cleaned
+		}
+		return typed, true
+	case []any:
+		cleaned := make([]any, 0, len(typed))
+		for _, item := range typed {
+			value, keep := sanitizeInternalImageProtocolValue(item)
+			if keep {
+				cleaned = append(cleaned, value)
+			}
+		}
+		return cleaned, true
+	case string:
+		if containsUnsafeImageResponseString(typed) {
+			return nil, false
+		}
+		return typed, true
+	default:
+		return value, true
+	}
+}
+
+func internalImageResponseKey(key string) bool {
+	normalized := strings.NewReplacer("_", "", "-", "", ".", "").Replace(strings.ToLower(strings.TrimSpace(key)))
+	if containsUnsafeImageResponseString(key) {
+		return true
+	}
+	for _, prefix := range []string{"poll", "task", "conversation", "failure", "upstream", "accesstoken", "authorization", "credential"} {
+		if strings.HasPrefix(normalized, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
 func containsInternalImageResponseValue(value any) bool {
 	switch typed := value.(type) {
 	case map[string]any:
 		for key, item := range typed {
-			normalized := strings.NewReplacer("_", "", "-", "", ".", "").Replace(strings.ToLower(strings.TrimSpace(key)))
-			if strings.HasPrefix(normalized, "poll") {
-				return true
-			}
-			switch normalized {
-			case "failurestage", "task", "taskid", "conversation", "conversationid", "upstreamresponse",
-				"upstreambody", "upstreamurl", "accesstoken", "authorization", "credentialid":
+			if internalImageResponseKey(key) {
 				return true
 			}
 			if containsInternalImageResponseValue(item) {

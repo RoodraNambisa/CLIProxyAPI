@@ -1107,6 +1107,12 @@ func rewriteResponsesWebsocketTerminalErrorPayload(payload []byte, errMsg *inter
 	if errFilter != nil {
 		return nil, errFilter
 	}
+	if handlers.IsChatGPTWebImageErrorResponseSanitized(errMsg) {
+		updated, errFilter = handlers.SanitizeChatGPTWebImageProtocolPayload(updated)
+		if errFilter != nil {
+			return nil, errFilter
+		}
+	}
 	return updated, nil
 }
 
