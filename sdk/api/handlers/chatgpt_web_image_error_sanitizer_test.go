@@ -315,6 +315,34 @@ func TestChatGPTWebImageErrorSanitizationDoesNotAffectUnidentifiedOrNonImageErro
 	}
 }
 
+func TestChatGPTWebImageErrorSanitizationDoesNotUseGenericProviderCodeAsWebIdentity(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	tests := []struct {
+		name   string
+		status int
+		code   string
+	}{
+		{name: "moderation", status: http.StatusBadRequest, code: "moderation_blocked"},
+		{name: "memory capacity", status: http.StatusServiceUnavailable, code: "image_memory_capacity"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			handler := NewBaseAPIHandlers(&sdkconfig.SDKConfig{
+				Images: sdkconfig.ImagesConfig{ChatGPTWeb: sdkconfig.ChatGPTWebImageConfig{SanitizeErrorResponses: true}},
+			}, nil)
+			recorder := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(recorder)
+			handler.BeginChatGPTWebImageErrorSanitization(c, true)
+			original := sanitizerTestImageError{message: "request rejected by provider: " + test.code, code: test.code}
+			handler.WriteErrorResponse(c, &interfaces.ErrorMessage{StatusCode: test.status, Error: original})
+
+			if recorder.Code != test.status || !strings.Contains(recorder.Body.String(), original.Error()) {
+				t.Fatalf("generic provider error was treated as ChatGPT Web: %d %s", recorder.Code, recorder.Body.String())
+			}
+		})
+	}
+}
+
 func assertSanitizedImageBody(t *testing.T, body string) {
 	t.Helper()
 	lower := strings.ToLower(body)

@@ -271,8 +271,7 @@ func isChatGPTWebImageError(err error, originalText string, sourceBody ...[]byte
 	var coded interface{ ExecutionResultErrorCode() string }
 	if errors.As(err, &coded) {
 		code := strings.ToLower(strings.TrimSpace(coded.ExecutionResultErrorCode()))
-		if strings.HasPrefix(code, "chatgpt_web_image_") || strings.HasPrefix(code, "remote_image_") ||
-			code == "image_generation_capacity" || code == "image_memory_capacity" || code == "moderation_blocked" {
+		if strings.HasPrefix(code, "chatgpt_web_image_") || strings.HasPrefix(code, "remote_image_") {
 			return true
 		}
 	}
@@ -288,11 +287,11 @@ func isChatGPTWebImageError(err error, originalText string, sourceBody ...[]byte
 	if errors.As(err, &remote) {
 		return true
 	}
-	if containsChatGPTWebImageInternalDetail(originalText) {
+	if containsChatGPTWebImageProvenance(originalText) {
 		return true
 	}
 	for _, body := range sourceBody {
-		if containsChatGPTWebImageInternalDetail(string(body)) {
+		if containsChatGPTWebImageProvenance(string(body)) {
 			return true
 		}
 	}
@@ -695,12 +694,24 @@ func containsUnsafeImageResponseString(value string) bool {
 }
 
 func containsChatGPTWebImageInternalDetail(value string) bool {
+	if containsChatGPTWebImageProvenance(value) {
+		return true
+	}
+	lower := strings.ToLower(value)
+	for _, marker := range []string{"image_generation_capacity", "image_memory_capacity"} {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func containsChatGPTWebImageProvenance(value string) bool {
 	lower := strings.ToLower(value)
 	for _, marker := range []string{
 		"chatgpt web", "chatgpt-web", "chatgpt_web", "picture_v2",
 		"failure_stage", "task_id", "task id", "conversation_id", "conversation id",
 		"poll_stalled", "polling", "poll failed", "poll state", "poll status", "remote_image_",
-		"image_generation_capacity", "image_memory_capacity",
 		"upstream_response", "upstream_body", "upstream_url", "access_token", "authorization",
 	} {
 		if strings.Contains(lower, marker) {

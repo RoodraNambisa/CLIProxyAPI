@@ -694,6 +694,7 @@ func (h *OpenAIImagesAPIHandler) handleImagesRequest(c *gin.Context, req openAII
 	}
 	responseFormat := strings.ToLower(strings.TrimSpace(req.ResponseFormat))
 	providers := imageResponsesProviders(req, ignoreUnsupportedImageParams, imageConfig)
+	h.PinChatGPTWebImageErrorSanitization(c, imageProvidersContain(providers, ChatGPTWeb))
 	if req.Stream {
 		h.handleStreamingImagesResponse(c, rawJSON, imageModel, codexModel, op, count, responseFormat, providers, ignoreUnsupportedImageParams, imageConfig)
 		return

@@ -58,6 +58,18 @@ type wrappedImageHandlerTestError struct {
 	cause error
 }
 
+type genericImageProviderTestError struct {
+	message string
+	code    string
+	status  int
+}
+
+func (e genericImageProviderTestError) Error() string { return e.message }
+
+func (e genericImageProviderTestError) ExecutionResultErrorCode() string { return e.code }
+
+func (e genericImageProviderTestError) StatusCode() int { return e.status }
+
 func (e *wrappedImageHandlerTestError) Error() string {
 	return e.cause.Error()
 }
@@ -1421,6 +1433,47 @@ func TestOpenAIImagesGenerationsSanitizesWebPostProcessingError(t *testing.T) {
 	if !strings.Contains(body, "an error occurred while processing the image") ||
 		strings.Contains(body, "upstream") || strings.Contains(body, "codex") {
 		t.Fatalf("post-processing response was not sanitized: %s", resp.Body.String())
+	}
+}
+
+func TestOpenAIImagesGenerationsDoesNotSanitizeCodexOnlyProviderErrors(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	tests := []struct {
+		name   string
+		status int
+		code   string
+	}{
+		{name: "moderation", status: http.StatusBadRequest, code: "moderation_blocked"},
+		{name: "memory capacity", status: http.StatusServiceUnavailable, code: "image_memory_capacity"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			message := "codex provider detail for " + test.code
+			executor := &imageCaptureExecutor{
+				provider: constant.Codex,
+				executeErr: genericImageProviderTestError{
+					message: message,
+					code:    test.code,
+					status:  test.status,
+				},
+			}
+			h := newImagesTestHandler(t, executor)
+			h.Cfg.Images.ChatGPTWeb.SanitizeErrorResponses = true
+			router := gin.New()
+			router.POST("/v1/images/generations", h.Generations)
+
+			req := httptest.NewRequest(http.MethodPost, "/v1/images/generations", strings.NewReader(`{"model":"gpt-image-2","prompt":"draw","quality":"high"}`))
+			req.Header.Set("Content-Type", "application/json")
+			resp := httptest.NewRecorder()
+			router.ServeHTTP(resp, req)
+
+			if resp.Code != test.status || !strings.Contains(resp.Body.String(), message) {
+				t.Fatalf("Codex-only error was sanitized: status=%d body=%s", resp.Code, resp.Body.String())
+			}
+			if executor.calls != 1 {
+				t.Fatalf("executor calls = %d, want 1", executor.calls)
+			}
+		})
 	}
 }
 
