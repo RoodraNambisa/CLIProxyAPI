@@ -44,6 +44,7 @@ func TestLoadConfigOptionalChatGPTWebImageSettings(t *testing.T) {
     remote-image-url-download-mode: credential-proxy
     normalize-mismatched-image-mime: true
     normalize-remote-image-mime: false
+    sanitize-error-responses: true
 `)
 	if err := os.WriteFile(path, data, 0o600); err != nil {
 		t.Fatalf("write config: %v", err)
@@ -71,6 +72,9 @@ func TestLoadConfigOptionalChatGPTWebImageSettings(t *testing.T) {
 	}
 	if resolved.NormalizeRemoteImageMIME {
 		t.Fatal("NormalizeRemoteImageMIME = true, want false")
+	}
+	if !resolved.SanitizeErrorResponses {
+		t.Fatal("SanitizeErrorResponses = false, want true")
 	}
 }
 
@@ -102,6 +106,9 @@ func TestLoadConfigOptionalDefaultsChatGPTWebImageUpstreamModel(t *testing.T) {
 	}
 	if !resolved.NormalizeRemoteImageMIME {
 		t.Fatal("NormalizeRemoteImageMIME = false, want true")
+	}
+	if resolved.SanitizeErrorResponses {
+		t.Fatal("SanitizeErrorResponses = true, want false")
 	}
 }
 

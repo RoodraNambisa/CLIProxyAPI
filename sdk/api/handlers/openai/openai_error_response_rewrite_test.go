@@ -4,14 +4,28 @@ import (
 	"bytes"
 	"errors"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
+	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/api/handlers"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/config"
 	"github.com/tidwall/gjson"
 )
+
+type openAISanitizerImageError struct{}
+
+func (openAISanitizerImageError) Error() string {
+	return "chatgpt web image poll task task_123 failed"
+}
+
+func (openAISanitizerImageError) ExecutionResultErrorCode() string {
+	return "chatgpt_web_image_poll_stalled"
+}
+
+func (openAISanitizerImageError) ChatGPTWebFailureStage() string { return "poll" }
 
 func TestWriteResponsesStreamErrorUsesExplicitRewriteBody(t *testing.T) {
 	body := map[string]any{"custom": "terminal"}
@@ -228,5 +242,53 @@ func TestResponsesSSETrustPassthroughRemainsByteForByte(t *testing.T) {
 	framer.WriteChunk(&output, input)
 	if !bytes.Equal(output.Bytes(), input) {
 		t.Fatalf("passthrough output = %q, want %q", output.Bytes(), input)
+	}
+}
+
+func TestResponsesSSESanitizesTerminalFrameAfterRewriteProjection(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	base := handlers.NewBaseAPIHandlers(&config.SDKConfig{Images: config.ImagesConfig{
+		ChatGPTWeb: config.ChatGPTWebImageConfig{SanitizeErrorResponses: true},
+	}}, nil)
+	handler := &OpenAIResponsesAPIHandler{BaseAPIHandler: base}
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	base.BeginChatGPTWebImageErrorSanitization(c, true)
+
+	frame, projected, rewritten := handler.rewriteResponsesSSETerminalErrorFrameForContext(c, []byte("event: error\ndata: {\"type\":\"error\",\"status\":503,\"error\":{\"message\":\"chatgpt web image poll failed\",\"code\":\"chatgpt_web_image_poll_stalled\",\"failure_stage\":\"poll\"}}\n\n"))
+	if !rewritten || !handlers.IsChatGPTWebImageErrorResponseSanitized(projected) {
+		t.Fatalf("rewritten/projected = %v/%#v", rewritten, projected)
+	}
+	if got := strings.ToLower(string(frame)); strings.Contains(got, "chatgpt") || strings.Contains(got, "poll") || strings.Contains(got, "failure_stage") || !strings.Contains(got, "temporarily unavailable") {
+		t.Fatalf("sanitized SSE frame = %s", frame)
+	}
+}
+
+func TestResponsesWebsocketSanitizesBodyAndEmbeddedHeaders(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	base := handlers.NewBaseAPIHandlers(&config.SDKConfig{Images: config.ImagesConfig{
+		ChatGPTWeb: config.ChatGPTWebImageConfig{SanitizeErrorResponses: true},
+	}}, nil)
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	base.BeginChatGPTWebImageErrorSanitization(c, true)
+	original := &interfaces.ErrorMessage{
+		StatusCode: http.StatusServiceUnavailable,
+		Error:      openAISanitizerImageError{},
+		Addon:      http.Header{"Retry-After": {"30"}, "X-Upstream-Task": {"task_123"}},
+	}
+	projected := base.ProjectChatGPTWebImageErrorResponse(c, original)
+	payload := []byte(`{"type":"error","status":503,"headers":{"Retry-After":"30","X-Upstream-Task":"task_123"},"error":{"message":"chatgpt web image poll task task_123 failed","code":"chatgpt_web_image_poll_stalled","failure_stage":"poll"}}`)
+	rewritten, errRewrite := rewriteResponsesWebsocketTerminalErrorPayload(payload, projected)
+	if errRewrite != nil {
+		t.Fatalf("rewrite websocket payload: %v", errRewrite)
+	}
+	if got := gjson.GetBytes(rewritten, "headers.Retry-After").String(); got != "30" {
+		t.Fatalf("Retry-After = %q", got)
+	}
+	if gjson.GetBytes(rewritten, "headers.X-Upstream-Task").Exists() {
+		t.Fatalf("unsafe header was retained: %s", rewritten)
+	}
+	lower := strings.ToLower(string(rewritten))
+	if strings.Contains(lower, "chatgpt") || strings.Contains(lower, "poll") || strings.Contains(lower, "failure_stage") || strings.Contains(lower, "task_123") {
+		t.Fatalf("sanitized websocket payload = %s", rewritten)
 	}
 }

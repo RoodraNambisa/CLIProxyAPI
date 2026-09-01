@@ -264,6 +264,11 @@ type chatGPTWebImageCompatibilityError struct {
 	providerFiltered bool
 }
 
+type chatGPTWebImageCompatibilityPayloadError struct {
+	cause   *chatGPTWebImageCompatibilityError
+	payload []byte
+}
+
 func (e *chatGPTWebImageCompatibilityError) Error() string {
 	if e == nil {
 		return "chatgpt web does not support this image request"
@@ -272,6 +277,62 @@ func (e *chatGPTWebImageCompatibilityError) Error() string {
 		return e.message
 	}
 	return fmt.Sprintf("chatgpt web does not support image parameter %q", e.parameter)
+}
+
+func (e *chatGPTWebImageCompatibilityError) ChatGPTWebImageErrorParameter() string {
+	if e == nil {
+		return ""
+	}
+	return e.parameter
+}
+
+func (e *chatGPTWebImageCompatibilityError) ChatGPTWebImageErrorClass() string {
+	if e == nil {
+		return "unsupported_parameter"
+	}
+	lower := strings.ToLower(e.Error())
+	if len(e.payload) > 0 && gjson.GetBytes(e.payload, "error.code").String() == "invalid_value" {
+		if strings.EqualFold(strings.TrimSpace(e.parameter), "size") {
+			return "size"
+		}
+		if strings.EqualFold(strings.TrimSpace(e.parameter), "n") {
+			return "image_count"
+		}
+		return "invalid_value"
+	}
+	if strings.Contains(lower, "image mask reference") {
+		return "mask_reference"
+	}
+	if strings.Contains(lower, "webp mask") || strings.Contains(lower, "with a mask") {
+		return "mask"
+	}
+	if strings.Contains(lower, "image reference") {
+		return "image_reference"
+	}
+	if strings.Contains(lower, "base64") {
+		return "base64"
+	}
+	if strings.Contains(lower, "mime") || strings.Contains(lower, "format") {
+		return "unsupported_format"
+	}
+	if strings.Contains(lower, "exceed") {
+		return "image_too_large"
+	}
+	return "unsupported_parameter"
+}
+
+func (e *chatGPTWebImageCompatibilityPayloadError) Error() string {
+	if e == nil {
+		return ""
+	}
+	return string(e.payload)
+}
+
+func (e *chatGPTWebImageCompatibilityPayloadError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.cause
 }
 
 func (e imageUnsupportedError) Error() string {
@@ -284,6 +345,7 @@ func (e imageUnsupportedError) Unwrap() error {
 
 // Generations handles POST /v1/images/generations.
 func (h *OpenAIImagesAPIHandler) Generations(c *gin.Context) {
+	h.BeginChatGPTWebImageErrorSanitization(c, false)
 	finishTrace := beginImageRequestTrace(c)
 	defer finishTrace()
 	if !h.admitImageRequest(c) {
@@ -324,6 +386,7 @@ func (h *OpenAIImagesAPIHandler) Generations(c *gin.Context) {
 
 // Edits handles POST /v1/images/edits.
 func (h *OpenAIImagesAPIHandler) Edits(c *gin.Context) {
+	h.BeginChatGPTWebImageErrorSanitization(c, false)
 	finishTrace := beginImageRequestTrace(c)
 	defer finishTrace()
 	if !h.admitImageRequest(c) {
@@ -449,13 +512,12 @@ func (h *OpenAIImagesAPIHandler) admitImageRequest(c *gin.Context) bool {
 				h.writeImagesRequestError(c, errSpool)
 				return false
 			}
-			c.Header("Retry-After", "1")
-			c.JSON(http.StatusServiceUnavailable, gin.H{"error": gin.H{
-				"message":       "image request spool capacity is temporarily exhausted",
-				"type":          "server_error",
-				"code":          "image_memory_capacity",
-				"failure_stage": "admission",
-			}})
+			h.PinChatGPTWebImageErrorSanitization(c, true)
+			h.WriteErrorResponse(c, &interfaces.ErrorMessage{
+				StatusCode: http.StatusServiceUnavailable,
+				Error:      errors.New(`{"error":{"code":"image_memory_capacity","failure_stage":"admission","message":"image request spool capacity is temporarily exhausted","type":"server_error"}}`),
+				Addon:      http.Header{"Retry-After": []string{"1"}},
+			})
 			return false
 		}
 	}
@@ -464,13 +526,12 @@ func (h *OpenAIImagesAPIHandler) admitImageRequest(c *gin.Context) bool {
 	if !leases.TryAcquireInput(estimatedBytes) {
 		leases.Release()
 		releaseOpenAIMultipartRequest(c)
-		c.Header("Retry-After", "1")
-		c.JSON(http.StatusServiceUnavailable, gin.H{"error": gin.H{
-			"message":       "image request memory capacity is temporarily exhausted",
-			"type":          "server_error",
-			"code":          "image_memory_capacity",
-			"failure_stage": "admission",
-		}})
+		h.PinChatGPTWebImageErrorSanitization(c, true)
+		h.WriteErrorResponse(c, &interfaces.ErrorMessage{
+			StatusCode: http.StatusServiceUnavailable,
+			Error:      errors.New(`{"error":{"code":"image_memory_capacity","failure_stage":"admission","message":"image request memory capacity is temporarily exhausted","type":"server_error"}}`),
+			Addon:      http.Header{"Retry-After": []string{"1"}},
+		})
 		return false
 	}
 	c.Set(executorhelps.ChatGPTWebImageMemoryLeaseSetMetadataKey, leases)
@@ -574,6 +635,7 @@ func saturatingImageRequestMultiply(value, factor int64) int64 {
 }
 
 func (h *OpenAIImagesAPIHandler) handleImagesRequest(c *gin.Context, req openAIImageRequest, op imageOperation) {
+	h.PinChatGPTWebImageErrorSanitization(c, true)
 	ignoreUnsupportedImageParams := h.chatGPTWebIgnoreUnsupportedImageParams()
 	imageConfig := h.chatGPTWebImageConfigSnapshot()
 	if imageConfig.NormalizeMismatchedImageMIME {
@@ -713,15 +775,7 @@ func (h *OpenAIImagesAPIHandler) handleNativeStreamingImagesResponse(c *gin.Cont
 			if errMsg == nil {
 				return
 			}
-			status := http.StatusInternalServerError
-			if errMsg.StatusCode > 0 {
-				status = errMsg.StatusCode
-			}
-			errText := http.StatusText(status)
-			if errMsg.Error != nil && strings.TrimSpace(errMsg.Error.Error()) != "" {
-				errText = errMsg.Error.Error()
-			}
-			body := handlers.BuildErrorResponseBodyForMessage(status, errText, errMsg)
+			body, _ := h.BuildPublicErrorResponseBody(c, errMsg)
 			observeImageResponseWrite(c, func() {
 				_, _ = fmt.Fprintf(c.Writer, "\nevent: error\ndata: %s\n\n", string(body))
 			})
@@ -973,15 +1027,7 @@ func (h *OpenAIImagesAPIHandler) handleMultiStreamingImagesResponse(c *gin.Conte
 				if errMsg == nil {
 					return
 				}
-				status := http.StatusInternalServerError
-				if errMsg.StatusCode > 0 {
-					status = errMsg.StatusCode
-				}
-				errText := http.StatusText(status)
-				if errMsg.Error != nil && strings.TrimSpace(errMsg.Error.Error()) != "" {
-					errText = errMsg.Error.Error()
-				}
-				body := handlers.BuildErrorResponseBodyForMessage(status, errText, errMsg)
+				body, _ := h.BuildPublicErrorResponseBody(c, errMsg)
 				observeImageResponseWrite(c, func() {
 					_, _ = fmt.Fprintf(c.Writer, "\nevent: error\ndata: %s\n\n", string(body))
 				})
@@ -1024,15 +1070,7 @@ func (h *OpenAIImagesAPIHandler) forwardImagesStream(c *gin.Context, flusher htt
 			if errMsg == nil {
 				return
 			}
-			status := http.StatusInternalServerError
-			if errMsg.StatusCode > 0 {
-				status = errMsg.StatusCode
-			}
-			errText := http.StatusText(status)
-			if errMsg.Error != nil && strings.TrimSpace(errMsg.Error.Error()) != "" {
-				errText = errMsg.Error.Error()
-			}
-			body := handlers.BuildErrorResponseBodyForMessage(status, errText, errMsg)
+			body, _ := h.BuildPublicErrorResponseBody(c, errMsg)
 			observeImageResponseWrite(c, func() {
 				_, _ = fmt.Fprintf(c.Writer, "\nevent: error\ndata: %s\n\n", string(body))
 			})
@@ -2387,7 +2425,7 @@ func chatGPTWebUnsupportedParameterError(compatibilityErr *chatGPTWebImageCompat
 	parameter := ""
 	if compatibilityErr != nil {
 		if len(compatibilityErr.payload) > 0 {
-			return errors.New(string(compatibilityErr.payload))
+			return &chatGPTWebImageCompatibilityPayloadError{cause: compatibilityErr, payload: bytes.Clone(compatibilityErr.payload)}
 		}
 		message = compatibilityErr.Error()
 		parameter = strings.TrimSpace(compatibilityErr.parameter)
@@ -2401,9 +2439,9 @@ func chatGPTWebUnsupportedParameterError(compatibilityErr *chatGPTWebImageCompat
 		},
 	})
 	if err != nil {
-		return errors.New(message)
+		return compatibilityErr
 	}
-	return errors.New(string(payload))
+	return &chatGPTWebImageCompatibilityPayloadError{cause: compatibilityErr, payload: payload}
 }
 
 func chatGPTWebSupportsImageReference(reference imageReference, remoteEnabled ...bool) bool {

@@ -125,6 +125,7 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 		if msgType != websocket.TextMessage && msgType != websocket.BinaryMessage {
 			continue
 		}
+		h.BeginChatGPTWebImageErrorSanitization(c, false)
 		// log.Infof(
 		// 	"responses websocket: downstream_in id=%s type=%d event=%s payload=%s",
 		// 	passthroughSessionID,
@@ -153,7 +154,7 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 		if errMsg != nil {
 			h.LoggingAPIResponseError(context.WithValue(context.Background(), "gin", c), errMsg)
 			markAPIResponseTimestamp(c)
-			errorPayload, errWrite := writeResponsesWebsocketError(conn, &wsTimelineLog, errMsg)
+			errorPayload, errWrite := h.writePublicResponsesWebsocketError(c, conn, &wsTimelineLog, errMsg)
 			log.Infof(
 				"responses websocket: downstream_out id=%s type=%d event=%s payload=%s",
 				passthroughSessionID,
@@ -178,7 +179,7 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 			if accessError := h.ValidateModelProviderAccess(accessContext, h.HandlerType(), modelName); accessError != nil {
 				h.LoggingAPIResponseError(accessContext, accessError)
 				markAPIResponseTimestamp(c)
-				errorPayload, errWrite := writeResponsesWebsocketError(conn, &wsTimelineLog, accessError)
+				errorPayload, errWrite := h.writePublicResponsesWebsocketError(c, conn, &wsTimelineLog, accessError)
 				log.Infof(
 					"responses websocket: downstream_out id=%s type=%d event=%s payload=%s",
 					passthroughSessionID,
@@ -209,6 +210,7 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 
 		requestJSON = repairResponsesWebsocketToolCalls(toolPairState, requestJSON)
 		requestJSON = dedupeResponsesWebsocketInputItemsByID(requestJSON)
+		h.PinChatGPTWebImageErrorSanitization(c, coreauth.PayloadHasImageGenerationTool(requestJSON))
 		updatedLastRequest = bytes.Clone(requestJSON)
 		lastRequest = updatedLastRequest
 
@@ -828,7 +830,7 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesWebsocket(
 		}
 		h.LoggingAPIResponseError(context.WithValue(context.Background(), "gin", c), errMsg)
 		markAPIResponseTimestamp(c)
-		errorPayload, errWrite := writeResponsesWebsocketError(conn, wsTimelineLog, errMsg)
+		errorPayload, errWrite := h.writePublicResponsesWebsocketError(c, conn, wsTimelineLog, errMsg)
 		log.Infof(
 			"responses websocket: downstream_out id=%s type=%d event=%s payload=%s",
 			sessionID,
@@ -904,6 +906,7 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesWebsocket(
 						projected := payloadErrMsg
 						if h != nil && h.BaseAPIHandler != nil {
 							projected = h.RewriteExecutionErrorResponse(payloadErrMsg)
+							projected = h.ProjectChatGPTWebImageErrorResponse(c, projected, payloads[i])
 						}
 						if projected != payloadErrMsg {
 							var errRewrite error
@@ -1100,21 +1103,26 @@ func rewriteResponsesWebsocketTerminalErrorPayload(payload []byte, errMsg *inter
 		}
 	}
 	var errFilter error
-	updated, errFilter = filterResponsesWebsocketHeaders(updated, status, rewriteBody)
+	updated, errFilter = filterResponsesWebsocketHeaders(updated, status, rewriteBody, errMsg)
 	if errFilter != nil {
 		return nil, errFilter
 	}
 	return updated, nil
 }
 
-func filterResponsesWebsocketHeaders(payload []byte, status int, bodyRewritten bool) ([]byte, error) {
+func filterResponsesWebsocketHeaders(payload []byte, status int, bodyRewritten bool, errMsg *interfaces.ErrorMessage) ([]byte, error) {
 	updated := payload
 	headers := gjson.GetBytes(updated, "headers")
 	if !headers.IsObject() {
 		return updated, nil
 	}
 	for key := range headers.Map() {
-		if !handlers.ShouldRemoveRewrittenErrorHeader(key, status, bodyRewritten) {
+		value := headers.Get(key).String()
+		remove := handlers.ShouldRemoveRewrittenErrorHeader(key, status, bodyRewritten)
+		if handlers.IsChatGPTWebImageErrorResponseSanitized(errMsg) {
+			remove = !handlers.ShouldForwardSanitizedImageErrorHeader(errMsg, key, value)
+		}
+		if !remove {
 			continue
 		}
 		headerPath := strings.ReplaceAll(strings.ReplaceAll(key, `\`, `\\`), ".", `\.`)
@@ -1230,6 +1238,13 @@ func writeResponsesWebsocketError(conn *websocket.Conn, wsTimelineLog *strings.B
 		return nil, errBuild
 	}
 	return payload, writeResponsesWebsocketPayload(conn, wsTimelineLog, payload, time.Now())
+}
+
+func (h *OpenAIResponsesAPIHandler) writePublicResponsesWebsocketError(c *gin.Context, conn *websocket.Conn, wsTimelineLog *strings.Builder, errMsg *interfaces.ErrorMessage) ([]byte, error) {
+	if h != nil && h.BaseAPIHandler != nil {
+		errMsg = h.ProjectChatGPTWebImageErrorResponse(c, errMsg)
+	}
+	return writeResponsesWebsocketError(conn, wsTimelineLog, errMsg)
 }
 
 func buildResponsesWebsocketErrorPayload(errMsg *interfaces.ErrorMessage) ([]byte, error) {

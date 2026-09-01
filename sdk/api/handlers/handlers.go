@@ -1651,6 +1651,7 @@ func applyErrorAddonHeaders(dst http.Header, addon http.Header, passthroughHeade
 
 // WriteErrorResponse writes an error message to the response writer using the HTTP status embedded in the message.
 func (h *BaseAPIHandler) WriteErrorResponse(c *gin.Context, msg *interfaces.ErrorMessage) {
+	msg = h.ProjectChatGPTWebImageErrorResponse(c, msg)
 	status := http.StatusInternalServerError
 	if msg != nil && msg.StatusCode > 0 {
 		status = msg.StatusCode

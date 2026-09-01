@@ -225,6 +225,13 @@ func writeResponsesStreamError(w io.Writer, errMsg *interfaces.ErrorMessage) {
 	_, _ = fmt.Fprintf(w, "\n\nevent: error\ndata: %s\n\n", string(chunk))
 }
 
+func (h *OpenAIResponsesAPIHandler) writePublicResponsesStreamError(c *gin.Context, w io.Writer, errMsg *interfaces.ErrorMessage) {
+	if h != nil && h.BaseAPIHandler != nil {
+		errMsg = h.ProjectChatGPTWebImageErrorResponse(c, errMsg)
+	}
+	writeResponsesStreamError(w, errMsg)
+}
+
 func (f *responsesSSEFramer) passthroughEnabled() bool {
 	return f != nil && (f.passthrough || (f.passthroughState != nil && f.passthroughState.Enabled()))
 }
@@ -326,6 +333,10 @@ func responsesSSEFrameWithEvent(frame []byte, eventType string) []byte {
 }
 
 func (h *OpenAIResponsesAPIHandler) rewriteResponsesSSETerminalErrorFrame(frame []byte) ([]byte, *interfaces.ErrorMessage, bool) {
+	return h.rewriteResponsesSSETerminalErrorFrameForContext(nil, frame)
+}
+
+func (h *OpenAIResponsesAPIHandler) rewriteResponsesSSETerminalErrorFrameForContext(c *gin.Context, frame []byte) ([]byte, *interfaces.ErrorMessage, bool) {
 	if h == nil || h.BaseAPIHandler == nil {
 		return frame, nil, false
 	}
@@ -339,6 +350,7 @@ func (h *OpenAIResponsesAPIHandler) rewriteResponsesSSETerminalErrorFrame(frame 
 	}
 	projectionInput := responsesWebsocketErrorMessageFromPayload(payload)
 	projected := h.RewriteExecutionErrorResponse(projectionInput)
+	projected = h.ProjectChatGPTWebImageErrorResponse(c, projected, payload)
 	if projected == projectionInput {
 		return frame, nil, false
 	}
@@ -531,6 +543,7 @@ func (h *OpenAIResponsesAPIHandler) Responses(c *gin.Context) {
 		writeResponsesRequestReadError(c, err)
 		return
 	}
+	h.BeginChatGPTWebImageErrorSanitization(c, cliproxyauth.PayloadHasImageGenerationTool(rawJSON))
 
 	// Check if the client requested a streaming response.
 	streamResult := gjson.GetBytes(rawJSON, "stream")
@@ -548,6 +561,7 @@ func (h *OpenAIResponsesAPIHandler) Compact(c *gin.Context) {
 		writeResponsesRequestReadError(c, err)
 		return
 	}
+	h.BeginChatGPTWebImageErrorSanitization(c, cliproxyauth.PayloadHasImageGenerationTool(rawJSON))
 
 	streamResult := gjson.GetBytes(rawJSON, "stream")
 	if streamResult.Type == gjson.True {
@@ -660,8 +674,10 @@ func (h *OpenAIResponsesAPIHandler) handleStreamingResponse(c *gin.Context, rawJ
 	}
 	trustUpstreamSSE := handlers.StreamingTrustUpstreamSSE(h.Cfg)
 	framer := &responsesSSEFramer{passthrough: trustUpstreamSSE}
-	if h.Cfg != nil && len(h.Cfg.ErrorResponseRewrites) > 0 {
-		framer.rewriteTerminalError = h.rewriteResponsesSSETerminalErrorFrame
+	if (h.Cfg != nil && len(h.Cfg.ErrorResponseRewrites) > 0) || handlers.ChatGPTWebImageErrorSanitizationEnabled(c) {
+		framer.rewriteTerminalError = func(frame []byte) ([]byte, *interfaces.ErrorMessage, bool) {
+			return h.rewriteResponsesSSETerminalErrorFrameForContext(c, frame)
+		}
 	}
 	if requestedImageStreamPassthrough {
 		framer.passthroughState = imageStreamPassthroughState
@@ -779,7 +795,7 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesStream(c *gin.Context, flush
 			if framer.terminalRewritten {
 				return
 			}
-			writeResponsesStreamError(c.Writer, errMsg)
+			h.writePublicResponsesStreamError(c, c.Writer, errMsg)
 		},
 		WriteDone: func() {
 			framer.Flush(c.Writer)
