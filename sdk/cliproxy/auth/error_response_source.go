@@ -24,8 +24,11 @@ func withAuthErrorResponseSource(err error, auth *Auth, fallbackProvider string)
 	return cliproxyexecutor.WithErrorResponseSource(err, errorResponseSourceForAuth(auth, fallbackProvider))
 }
 
-func withLocalErrorResponseSource(err error) error {
-	return cliproxyexecutor.WithErrorResponseSource(err, cliproxyexecutor.LocalErrorResponseSource())
+func withInheritedErrorResponseSource(err, sourceErr error) error {
+	if source, ok := cliproxyexecutor.ErrorResponseSourceOf(sourceErr); ok {
+		return cliproxyexecutor.WithErrorResponseSource(err, source)
+	}
+	return err
 }
 
 func publishErrorResponseSourceMetadata(meta map[string]any, source cliproxyexecutor.ErrorResponseSourceSnapshot) {
@@ -41,7 +44,6 @@ func finalizeErrorResponseSource(meta map[string]any, err error) error {
 	if err == nil {
 		return nil
 	}
-	err = withLocalErrorResponseSource(err)
 	if source, ok := cliproxyexecutor.ErrorResponseSourceOf(err); ok {
 		publishErrorResponseSourceMetadata(meta, source)
 	}

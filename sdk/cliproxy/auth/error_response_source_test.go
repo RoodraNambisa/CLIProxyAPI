@@ -19,6 +19,44 @@ type errorResponseSourceTestExecutor struct {
 	streamPayloadBefore bool
 }
 
+type cancelingErrorResponseSourceTestExecutor struct {
+	id      string
+	started chan<- struct{}
+}
+
+func (e *cancelingErrorResponseSourceTestExecutor) Identifier() string {
+	return e.id
+}
+
+func (e *cancelingErrorResponseSourceTestExecutor) waitForCancellation(ctx context.Context) error {
+	select {
+	case e.started <- struct{}{}:
+	default:
+	}
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+func (e *cancelingErrorResponseSourceTestExecutor) Execute(ctx context.Context, _ *Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	return cliproxyexecutor.Response{}, e.waitForCancellation(ctx)
+}
+
+func (e *cancelingErrorResponseSourceTestExecutor) ExecuteStream(ctx context.Context, _ *Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
+	return nil, e.waitForCancellation(ctx)
+}
+
+func (e *cancelingErrorResponseSourceTestExecutor) Refresh(_ context.Context, auth *Auth) (*Auth, error) {
+	return auth, nil
+}
+
+func (e *cancelingErrorResponseSourceTestExecutor) CountTokens(ctx context.Context, _ *Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	return cliproxyexecutor.Response{}, e.waitForCancellation(ctx)
+}
+
+func (e *cancelingErrorResponseSourceTestExecutor) HttpRequest(context.Context, *Auth, *http.Request) (*http.Response, error) {
+	return nil, errors.New("not implemented")
+}
+
 func (e *errorResponseSourceTestExecutor) Identifier() string {
 	return e.id
 }
@@ -172,6 +210,100 @@ func TestManagerPublishesBootstrapStreamErrorSourceWithoutChangingChunkError(t *
 		t.Fatalf("bootstrap chunk error = %T %v, want original *Error", chunk.Err, chunk.Err)
 	}
 	assertCredentialErrorResponseSource(t, recorder.load())
+}
+
+func TestManagerKeepsSelectedCredentialSourceWhenExecutionIsCanceled(t *testing.T) {
+	tests := []struct {
+		name string
+		run  func(context.Context, *Manager, cliproxyexecutor.Options) error
+	}{
+		{
+			name: "execute",
+			run: func(ctx context.Context, manager *Manager, opts cliproxyexecutor.Options) error {
+				_, errExecute := manager.Execute(ctx, []string{"source-test"}, cliproxyexecutor.Request{Model: "source-test-model"}, opts)
+				return errExecute
+			},
+		},
+		{
+			name: "count",
+			run: func(ctx context.Context, manager *Manager, opts cliproxyexecutor.Options) error {
+				_, errCount := manager.ExecuteCount(ctx, []string{"source-test"}, cliproxyexecutor.Request{Model: "source-test-model"}, opts)
+				return errCount
+			},
+		},
+		{
+			name: "stream",
+			run: func(ctx context.Context, manager *Manager, opts cliproxyexecutor.Options) error {
+				_, errStream := manager.ExecuteStream(ctx, []string{"source-test"}, cliproxyexecutor.Request{Model: "source-test-model"}, opts)
+				return errStream
+			},
+		},
+	}
+
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			manager := NewManager(nil, &FillFirstSelector{}, nil)
+			manager.SetRetryConfig(0, 0, 0)
+			started := make(chan struct{}, 1)
+			manager.RegisterExecutor(&cancelingErrorResponseSourceTestExecutor{id: "source-test", started: started})
+			registerErrorResponseSourceTestAuth(t, manager)
+
+			recorder := &errorResponseSourceRecorder{}
+			opts := cliproxyexecutor.Options{Metadata: map[string]any{
+				cliproxyexecutor.SelectedAuthSourceCallbackMetadataKey: recorder.store,
+			}}
+			ctx, cancel := context.WithCancel(t.Context())
+			result := make(chan error, 1)
+			go func() {
+				result <- testCase.run(ctx, manager, opts)
+			}()
+
+			select {
+			case <-started:
+				cancel()
+			case <-t.Context().Done():
+				cancel()
+				t.Fatal("executor did not start")
+			}
+
+			errExecute := <-result
+			if !errors.Is(errExecute, context.Canceled) {
+				t.Fatalf("execution error = %T %v, want context.Canceled", errExecute, errExecute)
+			}
+			assertCredentialErrorResponseSource(t, recorder.load())
+		})
+	}
+}
+
+func TestWithInheritedErrorResponseSourcePreservesTriggeringCredential(t *testing.T) {
+	sourceErr := cliproxyexecutor.WithErrorResponseSource(
+		errors.New("upstream unavailable"),
+		cliproxyexecutor.CredentialErrorResponseSource("codex", -1),
+	)
+	errWait := withInheritedErrorResponseSource(context.Canceled, sourceErr)
+	source, ok := cliproxyexecutor.ErrorResponseSourceOf(errWait)
+	if !ok {
+		t.Fatal("inherited error source is missing")
+	}
+	assertCredentialErrorResponseSourceFor(t, source, "codex", -1)
+	if !errors.Is(errWait, context.Canceled) {
+		t.Fatalf("inherited error = %T %v, want context.Canceled", errWait, errWait)
+	}
+}
+
+func TestFinalizeErrorResponseSourceDoesNotOverwriteSelectedCredential(t *testing.T) {
+	recorder := &errorResponseSourceRecorder{}
+	meta := map[string]any{
+		cliproxyexecutor.SelectedAuthSourceCallbackMetadataKey: recorder.store,
+	}
+	selected := cliproxyexecutor.CredentialErrorResponseSource("chatgpt-web", 4)
+	publishErrorResponseSourceMetadata(meta, selected)
+
+	errFinal := finalizeErrorResponseSource(meta, context.Canceled)
+	if !errors.Is(errFinal, context.Canceled) {
+		t.Fatalf("final error = %T %v, want context.Canceled", errFinal, errFinal)
+	}
+	assertCredentialErrorResponseSourceFor(t, recorder.load(), "chatgpt-web", 4)
 }
 
 func registerErrorResponseSourceTestAuth(t *testing.T, manager *Manager) {

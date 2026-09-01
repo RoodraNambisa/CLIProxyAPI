@@ -4358,7 +4358,7 @@ func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxye
 		}
 		if wait, shouldWait := cooldownWaitFromError(errExec, maxWait); shouldWait {
 			if errWait := waitForCooldown(ctx, wait); errWait != nil {
-				return cliproxyexecutor.Response{}, errWait
+				return cliproxyexecutor.Response{}, withInheritedErrorResponseSource(errWait, errExec)
 			}
 			if !requestBodyReplayable(ctx, opts) {
 				break
@@ -4370,7 +4370,7 @@ func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxye
 		}
 		if wait, shouldWait := retryAfterWaitFromError(errExec, maxWait); shouldWait {
 			if errWait := waitForCooldown(ctx, wait); errWait != nil {
-				return cliproxyexecutor.Response{}, errWait
+				return cliproxyexecutor.Response{}, withInheritedErrorResponseSource(errWait, errExec)
 			}
 			if !requestBodyReplayable(ctx, opts) {
 				break
@@ -4445,7 +4445,7 @@ func (m *Manager) ExecuteCount(ctx context.Context, providers []string, req clip
 		}
 		if wait, shouldWait := cooldownWaitFromError(errExec, maxWait); shouldWait {
 			if errWait := waitForCooldown(ctx, wait); errWait != nil {
-				return cliproxyexecutor.Response{}, errWait
+				return cliproxyexecutor.Response{}, withInheritedErrorResponseSource(errWait, errExec)
 			}
 			if !requestBodyReplayable(ctx, opts) {
 				break
@@ -4457,7 +4457,7 @@ func (m *Manager) ExecuteCount(ctx context.Context, providers []string, req clip
 		}
 		if wait, shouldWait := retryAfterWaitFromError(errExec, maxWait); shouldWait {
 			if errWait := waitForCooldown(ctx, wait); errWait != nil {
-				return cliproxyexecutor.Response{}, errWait
+				return cliproxyexecutor.Response{}, withInheritedErrorResponseSource(errWait, errExec)
 			}
 			if !requestBodyReplayable(ctx, opts) {
 				break
@@ -4530,7 +4530,7 @@ func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cli
 		}
 		if wait, shouldWait := cooldownWaitFromError(errStream, maxWait); shouldWait {
 			if errWait := waitForCooldown(ctx, wait); errWait != nil {
-				return nil, errWait
+				return nil, withInheritedErrorResponseSource(errWait, errStream)
 			}
 			if !requestBodyReplayable(ctx, opts) {
 				break
@@ -4542,7 +4542,7 @@ func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cli
 		}
 		if wait, shouldWait := retryAfterWaitFromError(errStream, maxWait); shouldWait {
 			if errWait := waitForCooldown(ctx, wait); errWait != nil {
-				return nil, errWait
+				return nil, withInheritedErrorResponseSource(errWait, errStream)
 			}
 			if !requestBodyReplayable(ctx, opts) {
 				break
@@ -5484,13 +5484,13 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 		preparedAuth, refreshedOnUnauthorized, errPrepare := m.prepareRequestAuthWithUnauthorizedRefresh(execCtx, executor, auth)
 		if errPrepare != nil {
 			if errCtx := execCtx.Err(); errCtx != nil {
-				return cliproxyexecutor.Response{}, errCtx
+				return cliproxyexecutor.Response{}, withAuthErrorResponseSource(errCtx, auth, provider)
 			}
 			if isRuntimeAuthInstanceRetiredError(errPrepare) {
 				releaseRetiredAuthRequestSlot(opts)
 				roundState.forgetRetiredAttempt(auth)
 				if errWait := waitForRetiredAuthInstanceCleanup(execCtx, auth); errWait != nil {
-					return cliproxyexecutor.Response{}, errWait
+					return cliproxyexecutor.Response{}, withAuthErrorResponseSource(errWait, auth, provider)
 				}
 				continue
 			}
@@ -5557,7 +5557,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 				releaseRetiredAuthRequestSlot(opts)
 				roundState.forgetRetiredAttempt(auth)
 				if errWait := waitForRetiredAuthInstanceCleanup(execCtx, auth); errWait != nil {
-					return cliproxyexecutor.Response{}, errWait
+					return cliproxyexecutor.Response{}, withAuthErrorResponseSource(errWait, auth, provider)
 				}
 				break
 			}
@@ -5577,13 +5577,13 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 				releaseRetiredAuthRequestSlot(opts)
 				roundState.forgetRetiredAttempt(auth)
 				if errWait := waitForRetiredAuthInstanceCleanup(execCtx, auth); errWait != nil {
-					return cliproxyexecutor.Response{}, errWait
+					return cliproxyexecutor.Response{}, withAuthErrorResponseSource(errWait, auth, provider)
 				}
 				authErr = nil
 				break
 			}
 			if errCtx := execCtx.Err(); errCtx != nil {
-				return cliproxyexecutor.Response{}, errCtx
+				return cliproxyexecutor.Response{}, withAuthErrorResponseSource(errCtx, auth, provider)
 			}
 			if cliproxyexecutor.IsImageExecutionCapacityError(errExec) {
 				roundState.blockProvider(provider)
@@ -5597,7 +5597,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 				}
 				if errRefresh != nil {
 					if errCtx := execCtx.Err(); errCtx != nil {
-						return cliproxyexecutor.Response{}, errCtx
+						return cliproxyexecutor.Response{}, withAuthErrorResponseSource(errCtx, auth, provider)
 					}
 					errExec = errRefresh
 				} else if attemptedRefresh {
@@ -5614,7 +5614,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 						releaseRetiredAuthRequestSlot(opts)
 						roundState.forgetRetiredAttempt(auth)
 						if errWait := waitForRetiredAuthInstanceCleanup(execCtx, auth); errWait != nil {
-							return cliproxyexecutor.Response{}, errWait
+							return cliproxyexecutor.Response{}, withAuthErrorResponseSource(errWait, auth, provider)
 						}
 						authErr = nil
 						break
@@ -5633,13 +5633,13 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 						releaseRetiredAuthRequestSlot(opts)
 						roundState.forgetRetiredAttempt(auth)
 						if errWait := waitForRetiredAuthInstanceCleanup(execCtx, auth); errWait != nil {
-							return cliproxyexecutor.Response{}, errWait
+							return cliproxyexecutor.Response{}, withAuthErrorResponseSource(errWait, auth, provider)
 						}
 						authErr = nil
 						break
 					}
 					if errCtx := execCtx.Err(); errCtx != nil {
-						return cliproxyexecutor.Response{}, errCtx
+						return cliproxyexecutor.Response{}, withAuthErrorResponseSource(errCtx, auth, provider)
 					}
 				}
 			}
@@ -5747,13 +5747,13 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 		preparedAuth, refreshedOnUnauthorized, errPrepare := m.prepareRequestAuthWithUnauthorizedRefresh(execCtx, executor, auth)
 		if errPrepare != nil {
 			if errCtx := execCtx.Err(); errCtx != nil {
-				return cliproxyexecutor.Response{}, errCtx
+				return cliproxyexecutor.Response{}, withAuthErrorResponseSource(errCtx, auth, provider)
 			}
 			if isRuntimeAuthInstanceRetiredError(errPrepare) {
 				releaseRetiredAuthRequestSlot(opts)
 				roundState.forgetRetiredAttempt(auth)
 				if errWait := waitForRetiredAuthInstanceCleanup(execCtx, auth); errWait != nil {
-					return cliproxyexecutor.Response{}, errWait
+					return cliproxyexecutor.Response{}, withAuthErrorResponseSource(errWait, auth, provider)
 				}
 				continue
 			}
@@ -5820,7 +5820,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 				releaseRetiredAuthRequestSlot(opts)
 				roundState.forgetRetiredAttempt(auth)
 				if errWait := waitForRetiredAuthInstanceCleanup(execCtx, auth); errWait != nil {
-					return cliproxyexecutor.Response{}, errWait
+					return cliproxyexecutor.Response{}, withAuthErrorResponseSource(errWait, auth, provider)
 				}
 				break
 			}
@@ -5839,13 +5839,13 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 				releaseRetiredAuthRequestSlot(opts)
 				roundState.forgetRetiredAttempt(auth)
 				if errWait := waitForRetiredAuthInstanceCleanup(execCtx, auth); errWait != nil {
-					return cliproxyexecutor.Response{}, errWait
+					return cliproxyexecutor.Response{}, withAuthErrorResponseSource(errWait, auth, provider)
 				}
 				authErr = nil
 				break
 			}
 			if errCtx := execCtx.Err(); errCtx != nil {
-				return cliproxyexecutor.Response{}, errCtx
+				return cliproxyexecutor.Response{}, withAuthErrorResponseSource(errCtx, auth, provider)
 			}
 			if errExec != nil && requestBodyReplayable(execCtx, opts) {
 				refreshed, attemptedRefresh, errRefresh := m.tryRefreshAfterUnauthorized(execCtx, executor, auth, errExec, didRefreshOnUnauthorized)
@@ -5854,7 +5854,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 				}
 				if errRefresh != nil {
 					if errCtx := execCtx.Err(); errCtx != nil {
-						return cliproxyexecutor.Response{}, errCtx
+						return cliproxyexecutor.Response{}, withAuthErrorResponseSource(errCtx, auth, provider)
 					}
 					errExec = errRefresh
 				} else if attemptedRefresh {
@@ -5871,7 +5871,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 						releaseRetiredAuthRequestSlot(opts)
 						roundState.forgetRetiredAttempt(auth)
 						if errWait := waitForRetiredAuthInstanceCleanup(execCtx, auth); errWait != nil {
-							return cliproxyexecutor.Response{}, errWait
+							return cliproxyexecutor.Response{}, withAuthErrorResponseSource(errWait, auth, provider)
 						}
 						authErr = nil
 						break
@@ -5889,13 +5889,13 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 						releaseRetiredAuthRequestSlot(opts)
 						roundState.forgetRetiredAttempt(auth)
 						if errWait := waitForRetiredAuthInstanceCleanup(execCtx, auth); errWait != nil {
-							return cliproxyexecutor.Response{}, errWait
+							return cliproxyexecutor.Response{}, withAuthErrorResponseSource(errWait, auth, provider)
 						}
 						authErr = nil
 						break
 					}
 					if errCtx := execCtx.Err(); errCtx != nil {
-						return cliproxyexecutor.Response{}, errCtx
+						return cliproxyexecutor.Response{}, withAuthErrorResponseSource(errCtx, auth, provider)
 					}
 				}
 			}
@@ -6004,13 +6004,13 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 		preparedAuth, refreshedOnUnauthorized, errPrepare := m.prepareRequestAuthWithUnauthorizedRefresh(execCtx, executor, auth)
 		if errPrepare != nil {
 			if errCtx := execCtx.Err(); errCtx != nil {
-				return nil, errCtx
+				return nil, withAuthErrorResponseSource(errCtx, auth, provider)
 			}
 			if isRuntimeAuthInstanceRetiredError(errPrepare) {
 				releaseRetiredAuthRequestSlot(opts)
 				roundState.forgetRetiredAttempt(auth)
 				if errWait := waitForRetiredAuthInstanceCleanup(execCtx, auth); errWait != nil {
-					return nil, errWait
+					return nil, withAuthErrorResponseSource(errWait, auth, provider)
 				}
 				continue
 			}
@@ -6062,7 +6062,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			releaseRetiredAuthRequestSlot(opts)
 			roundState.forgetRetiredAttempt(auth)
 			if errWait := waitForRetiredAuthInstanceCleanup(execCtx, auth); errWait != nil {
-				return nil, errWait
+				return nil, withAuthErrorResponseSource(errWait, auth, provider)
 			}
 			continue
 		}
@@ -6075,12 +6075,12 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 				releaseRetiredAuthRequestSlot(opts)
 				roundState.forgetRetiredAttempt(auth)
 				if errWait := waitForRetiredAuthInstanceCleanup(execCtx, auth); errWait != nil {
-					return nil, errWait
+					return nil, withAuthErrorResponseSource(errWait, auth, provider)
 				}
 				continue
 			}
 			if errCtx := execCtx.Err(); errCtx != nil {
-				return nil, errCtx
+				return nil, withAuthErrorResponseSource(errCtx, auth, provider)
 			}
 			if cliproxyexecutor.IsImageExecutionCapacityError(errStream) {
 				roundState.blockProvider(provider)
@@ -6098,7 +6098,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 				}
 				if errRefresh != nil {
 					if errCtx := execCtx.Err(); errCtx != nil {
-						return nil, errCtx
+						return nil, withAuthErrorResponseSource(errCtx, auth, provider)
 					}
 					errStream = errRefresh
 					markDeferredFailure = true
@@ -6116,7 +6116,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 							releaseRetiredAuthRequestSlot(opts)
 							roundState.forgetRetiredAttempt(auth)
 							if errWait := waitForRetiredAuthInstanceCleanup(execCtx, auth); errWait != nil {
-								return nil, errWait
+								return nil, withAuthErrorResponseSource(errWait, auth, provider)
 							}
 							continue
 						}
@@ -6128,12 +6128,12 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 							releaseRetiredAuthRequestSlot(opts)
 							roundState.forgetRetiredAttempt(auth)
 							if errWait := waitForRetiredAuthInstanceCleanup(execCtx, auth); errWait != nil {
-								return nil, errWait
+								return nil, withAuthErrorResponseSource(errWait, auth, provider)
 							}
 							continue
 						}
 						if errCtx := execCtx.Err(); errCtx != nil {
-							return nil, errCtx
+							return nil, withAuthErrorResponseSource(errCtx, auth, provider)
 						}
 						markDeferredFailure = deferUnauthorizedStreamResult(auth, errStream)
 					}
