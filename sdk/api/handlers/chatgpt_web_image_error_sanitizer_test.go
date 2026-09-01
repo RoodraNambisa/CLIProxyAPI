@@ -215,6 +215,89 @@ func TestChatGPTWebImageErrorSanitizationFiltersHeadersAndPreservesInternalError
 	}
 }
 
+func TestChatGPTWebImageErrorSanitizationProjectsOperationalCategories(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	tests := []struct {
+		name        string
+		status      int
+		err         sanitizerTestImageError
+		wantMessage string
+		wantType    string
+		wantCode    string
+	}{
+		{
+			name:        "content safety",
+			status:      http.StatusBadRequest,
+			err:         sanitizerTestImageError{message: "chatgpt web moderation result", code: "moderation_blocked", stage: "settle"},
+			wantMessage: "rejected by the safety system",
+			wantType:    "image_generation_user_error",
+			wantCode:    "moderation_blocked",
+		},
+		{
+			name:        "quota",
+			status:      http.StatusTooManyRequests,
+			err:         sanitizerTestImageError{message: "chatgpt web image quota exhausted", code: "chatgpt_web_image_quota", stage: "settle"},
+			wantMessage: "Rate limit reached for image generation",
+			wantType:    "rate_limit_error",
+			wantCode:    "rate_limit_exceeded",
+		},
+		{
+			name:        "capacity",
+			status:      http.StatusServiceUnavailable,
+			err:         sanitizerTestImageError{message: "chatgpt web image capacity exhausted", code: "image_generation_capacity", stage: "admission"},
+			wantMessage: "temporarily unavailable",
+			wantType:    "server_error",
+			wantCode:    "internal_server_error",
+		},
+		{
+			name:        "network protocol",
+			status:      http.StatusBadGateway,
+			err:         sanitizerTestImageError{message: "chatgpt web upstream protocol failed", code: "chatgpt_web_image_upstream_failed", stage: "upload"},
+			wantMessage: "An error occurred while processing the image",
+			wantType:    "server_error",
+			wantCode:    "internal_server_error",
+		},
+		{
+			name:        "no output",
+			status:      http.StatusBadGateway,
+			err:         sanitizerTestImageError{message: "chatgpt web task returned no image", code: "chatgpt_web_image_no_output", stage: "settle"},
+			wantMessage: "An error occurred while processing the image",
+			wantType:    "server_error",
+			wantCode:    "internal_server_error",
+		},
+		{
+			name:        "authentication",
+			status:      http.StatusUnauthorized,
+			err:         sanitizerTestImageError{message: "chatgpt web credential rejected", code: "http_401", stage: "upload"},
+			wantMessage: "Authentication failed for image generation",
+			wantType:    "authentication_error",
+			wantCode:    "invalid_api_key",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			handler := NewBaseAPIHandlers(&sdkconfig.SDKConfig{Images: sdkconfig.ImagesConfig{
+				ChatGPTWeb: sdkconfig.ChatGPTWebImageConfig{SanitizeErrorResponses: true},
+			}}, nil)
+			recorder := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(recorder)
+			handler.BeginChatGPTWebImageErrorSanitization(c, true)
+			handler.WriteErrorResponse(c, &interfaces.ErrorMessage{StatusCode: tt.status, Error: tt.err})
+
+			var response sanitizedImageErrorResponse
+			if errUnmarshal := json.Unmarshal(recorder.Body.Bytes(), &response); errUnmarshal != nil {
+				t.Fatalf("decode response: %v", errUnmarshal)
+			}
+			if recorder.Code != tt.status || response.Error.Type != tt.wantType || response.Error.Code != tt.wantCode ||
+				!strings.Contains(response.Error.Message, tt.wantMessage) {
+				t.Fatalf("response = %d %#v", recorder.Code, response.Error)
+			}
+			assertSanitizedImageBody(t, recorder.Body.String())
+		})
+	}
+}
+
 func TestChatGPTWebImageErrorSanitizationDoesNotAffectUnidentifiedOrNonImageErrors(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	handler := NewBaseAPIHandlers(&sdkconfig.SDKConfig{

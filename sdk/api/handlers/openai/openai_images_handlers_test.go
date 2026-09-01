@@ -1398,6 +1398,47 @@ func TestOpenAIImagesGenerationsEnforcesAggregateWebResponseBudget(t *testing.T)
 	}
 }
 
+func TestOpenAIImagesGenerationsSanitizesWebPostProcessingError(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	executor := &imageCaptureExecutor{
+		provider: constant.ChatGPTWeb,
+		response: []byte(`{"created_at":1700000000,"output":[]}`),
+	}
+	h := newImagesTestHandler(t, executor)
+	h.Cfg.Images.ChatGPTWeb.SanitizeErrorResponses = true
+	router := gin.New()
+	router.POST("/v1/images/generations", h.Generations)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/images/generations", strings.NewReader(`{"model":"gpt-image-2","prompt":"draw"}`))
+	req.Header.Set("Content-Type", "application/json")
+	resp := httptest.NewRecorder()
+	router.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want %d", resp.Code, http.StatusBadGateway)
+	}
+	body := strings.ToLower(resp.Body.String())
+	if !strings.Contains(body, "an error occurred while processing the image") ||
+		strings.Contains(body, "upstream") || strings.Contains(body, "codex") {
+		t.Fatalf("post-processing response was not sanitized: %s", resp.Body.String())
+	}
+}
+
+func TestMarkChatGPTWebImageProcessingErrorKeepsNonWebErrorsUnchanged(t *testing.T) {
+	original := errors.New("invalid Codex response")
+	if got := markChatGPTWebImageProcessingError(original, false); got != original {
+		t.Fatalf("non-Web error was wrapped: %T", got)
+	}
+	wrapped := markChatGPTWebImageProcessingError(original, true)
+	if wrapped == original || !errors.Is(wrapped, original) || wrapped.Error() != original.Error() {
+		t.Fatalf("Web processing error did not preserve its cause: %#v", wrapped)
+	}
+	var classified interface{ ChatGPTWebImageErrorClass() string }
+	if !errors.As(wrapped, &classified) || classified.ChatGPTWebImageErrorClass() != "processing" {
+		t.Fatalf("Web processing error class = %#v", classified)
+	}
+}
+
 func TestOpenAIImagesGenerationsRejectsAggregationAboveMaximum(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	executor := &imageCaptureExecutor{}
@@ -2401,6 +2442,39 @@ func TestOpenAIImagesStreamingEnforcesAggregateWebResponseBudget(t *testing.T) {
 	}
 	if got := executor.imageConfigSnapshots[1].MaxImageResponseBytes; got != (1<<20)-(700<<10) {
 		t.Fatalf("second stream response budget = %d", got)
+	}
+}
+
+func TestOpenAIImagesStreamingSanitizesAggregateWebResponseBudget(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	encoded := base64.StdEncoding.EncodeToString(make([]byte, 700<<10))
+	executor := &imageCaptureExecutor{
+		provider: constant.ChatGPTWeb,
+		streamChunks: []coreexecutor.StreamChunk{{Payload: []byte(
+			`data: {"type":"response.completed","response":{"output":[{"type":"image_generation_call","result":"` + encoded + `"}]}}` + "\n\n",
+		)}},
+	}
+	h := newImagesTestHandler(t, executor)
+	enableNAggregation := true
+	oneMegabyte := 1
+	maxN := 2
+	h.Cfg.Images.EnableNAggregation = &enableNAggregation
+	h.Cfg.Images.ChatGPTWeb.MaxImageResponseMegabytes = &oneMegabyte
+	h.Cfg.Images.ChatGPTWeb.MaxN = &maxN
+	h.Cfg.Images.ChatGPTWeb.SanitizeErrorResponses = true
+	router := gin.New()
+	router.POST("/v1/images/generations", h.Generations)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/images/generations", strings.NewReader(`{"model":"gpt-image-2","prompt":"draw","stream":true,"n":2}`))
+	req.Header.Set("Content-Type", "application/json")
+	resp := httptest.NewRecorder()
+	router.ServeHTTP(resp, req)
+
+	body := strings.ToLower(resp.Body.String())
+	if strings.Count(body, "event: error") != 1 ||
+		!strings.Contains(body, "an error occurred while processing the image") ||
+		strings.Contains(body, "image response exceeds") {
+		t.Fatalf("stream budget response was not sanitized: %s", resp.Body.String())
 	}
 }
 

@@ -312,6 +312,12 @@ func classifySanitizedImageError(msg *interfaces.ErrorMessage, snapshot chatGPTW
 	parsed := parseImageErrorDetail(originalText)
 	parameter := safeImageErrorParameter(parsed.Param)
 	code := strings.ToLower(strings.TrimSpace(parsed.Code))
+	var coded interface{ ExecutionResultErrorCode() string }
+	if errors.As(msg.Error, &coded) && coded != nil {
+		if structuredCode := strings.ToLower(strings.TrimSpace(coded.ExecutionResultErrorCode())); structuredCode != "" {
+			code = structuredCode
+		}
+	}
 	lower := strings.ToLower(strings.TrimSpace(parsed.Message))
 	if lower == "" {
 		lower = strings.ToLower(originalText)

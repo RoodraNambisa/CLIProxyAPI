@@ -269,6 +269,10 @@ type chatGPTWebImageCompatibilityPayloadError struct {
 	payload []byte
 }
 
+type chatGPTWebImageProcessingError struct {
+	cause error
+}
+
 func (e *chatGPTWebImageCompatibilityError) Error() string {
 	if e == nil {
 		return "chatgpt web does not support this image request"
@@ -333,6 +337,24 @@ func (e *chatGPTWebImageCompatibilityPayloadError) Unwrap() error {
 		return nil
 	}
 	return e.cause
+}
+
+func (e *chatGPTWebImageProcessingError) Error() string {
+	if e == nil || e.cause == nil {
+		return ""
+	}
+	return e.cause.Error()
+}
+
+func (e *chatGPTWebImageProcessingError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.cause
+}
+
+func (*chatGPTWebImageProcessingError) ChatGPTWebImageErrorClass() string {
+	return "processing"
 }
 
 func (e imageUnsupportedError) Error() string {
@@ -787,9 +809,10 @@ func (h *OpenAIImagesAPIHandler) handleNonStreamingImagesResponse(c *gin.Context
 	c.Header("Content-Type", "application/json")
 	var combined imagesResponse
 	var upstreamHeaders http.Header
+	webImageRoute := imageProvidersContain(providers, ChatGPTWeb)
 	responseByteLimit := 0
 	remainingResponseBytes := 0
-	if imageProvidersContain(providers, ChatGPTWeb) {
+	if webImageRoute {
 		responseByteLimit = imageResponseByteLimit(imageConfig)
 		remainingResponseBytes = responseByteLimit
 	}
@@ -801,7 +824,7 @@ func (h *OpenAIImagesAPIHandler) handleNonStreamingImagesResponse(c *gin.Context
 		iterationImageConfig := imageConfig
 		if responseByteLimit > 0 {
 			if remainingResponseBytes <= 0 {
-				h.writeImagesError(c, http.StatusBadGateway, imageResponseBudgetError(responseByteLimit))
+				h.writeImagesError(c, http.StatusBadGateway, markChatGPTWebImageProcessingError(imageResponseBudgetError(responseByteLimit), webImageRoute))
 				return
 			}
 			iterationImageConfig.MaxImageResponseBytes = remainingResponseBytes
@@ -821,7 +844,7 @@ func (h *OpenAIImagesAPIHandler) handleNonStreamingImagesResponse(c *gin.Context
 		}
 		parsed, err := parseResponsesToImagesResponse(resp, time.Now().Unix())
 		if err != nil {
-			h.WriteErrorResponse(c, h.RewriteExecutionErrorResponse(imageConversionErrorMessage(err)))
+			h.WriteErrorResponse(c, h.RewriteExecutionErrorResponse(imageConversionErrorMessage(markChatGPTWebImageProcessingError(err, webImageRoute))))
 			cliCancel(err)
 			return
 		}
@@ -843,7 +866,7 @@ func (h *OpenAIImagesAPIHandler) handleNonStreamingImagesResponse(c *gin.Context
 				if errSize == nil {
 					errSize = imageResponseBudgetError(responseByteLimit)
 				}
-				h.writeImagesError(c, http.StatusBadGateway, errSize)
+				h.writeImagesError(c, http.StatusBadGateway, markChatGPTWebImageProcessingError(errSize, webImageRoute))
 				cliCancel(errSize)
 				return
 			}
@@ -858,7 +881,7 @@ func (h *OpenAIImagesAPIHandler) handleNonStreamingImagesResponse(c *gin.Context
 	imagesPayload, err := json.Marshal(combined)
 	observeImageRequestPhase(c, coreexecutor.ImagePhaseResponseEncode, encodeStarted)
 	if err != nil {
-		h.writeImagesError(c, http.StatusInternalServerError, err)
+		h.writeImagesError(c, http.StatusInternalServerError, markChatGPTWebImageProcessingError(err, webImageRoute))
 		return
 	}
 	handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
@@ -890,16 +913,18 @@ func (h *OpenAIImagesAPIHandler) handleStreamingImagesResponse(c *gin.Context, r
 		c.Header("Access-Control-Allow-Origin", "*")
 	}
 
+	webImageRoute := imageProvidersContain(providers, ChatGPTWeb)
 	responseByteLimit := 0
-	if imageProvidersContain(providers, ChatGPTWeb) {
+	if webImageRoute {
 		responseByteLimit = imageResponseByteLimit(imageConfig)
 	}
 	mapper := &imageStreamMapper{
-		operation:      op,
-		responseFormat: responseFormat,
-		maxResults:     1,
-		parser:         imageSSEParser{maxPendingBytes: imageSSEPendingByteLimit(imageConfig)},
-		maxBinaryBytes: responseByteLimit,
+		operation:             op,
+		responseFormat:        responseFormat,
+		maxResults:            1,
+		parser:                imageSSEParser{maxPendingBytes: imageSSEPendingByteLimit(imageConfig)},
+		maxBinaryBytes:        responseByteLimit,
+		projectWebImageErrors: webImageRoute,
 	}
 	var firstFrame bytes.Buffer
 	for {
@@ -973,9 +998,10 @@ func (h *OpenAIImagesAPIHandler) handleMultiStreamingImagesResponse(c *gin.Conte
 	c.Header("Cache-Control", "no-cache")
 	c.Header("Connection", "keep-alive")
 	c.Header("Access-Control-Allow-Origin", "*")
+	webImageRoute := imageProvidersContain(providers, ChatGPTWeb)
 	responseByteLimit := 0
 	remainingResponseBytes := 0
-	if imageProvidersContain(providers, ChatGPTWeb) {
+	if webImageRoute {
 		responseByteLimit = imageResponseByteLimit(imageConfig)
 		remainingResponseBytes = responseByteLimit
 	}
@@ -983,8 +1009,10 @@ func (h *OpenAIImagesAPIHandler) handleMultiStreamingImagesResponse(c *gin.Conte
 		iterationImageConfig := imageConfig
 		if responseByteLimit > 0 {
 			if remainingResponseBytes <= 0 {
+				errMsg := imageConversionErrorMessage(markChatGPTWebImageProcessingError(imageResponseBudgetError(responseByteLimit), webImageRoute))
+				body, _ := h.BuildPublicErrorResponseBody(c, errMsg)
 				observeImageResponseWrite(c, func() {
-					_, _ = fmt.Fprintf(c.Writer, "\nevent: error\ndata: %s\n\n", string(handlers.BuildErrorResponseBody(http.StatusBadGateway, imageResponseBudgetError(responseByteLimit).Error())))
+					_, _ = fmt.Fprintf(c.Writer, "\nevent: error\ndata: %s\n\n", string(body))
 					flusher.Flush()
 				})
 				return
@@ -1002,12 +1030,13 @@ func (h *OpenAIImagesAPIHandler) handleMultiStreamingImagesResponse(c *gin.Conte
 			handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
 		}
 		mapper := &imageStreamMapper{
-			operation:      op,
-			omitInputUsage: i > 0,
-			responseFormat: responseFormat,
-			maxResults:     1,
-			parser:         imageSSEParser{maxPendingBytes: imageSSEPendingByteLimit(iterationImageConfig)},
-			maxBinaryBytes: remainingResponseBytes,
+			operation:             op,
+			omitInputUsage:        i > 0,
+			responseFormat:        responseFormat,
+			maxResults:            1,
+			parser:                imageSSEParser{maxPendingBytes: imageSSEPendingByteLimit(iterationImageConfig)},
+			maxBinaryBytes:        remainingResponseBytes,
+			projectWebImageErrors: webImageRoute,
 		}
 		var streamErr error
 		h.ForwardStream(c, flusher, func(err error) {
@@ -2054,19 +2083,20 @@ func mergeImageUsageValue(current, next any) any {
 }
 
 type imageStreamMapper struct {
-	operation            imageOperation
-	parser               imageSSEParser
-	finals               []imageResult
-	finalUsage           json.RawMessage
-	omitInputUsage       bool
-	responseFormat       string
-	maxResults           int
-	maxBinaryBytes       int
-	completedBinaryBytes int
-	completed            bool
-	forceFlush           bool
-	assistantTextSeen    bool
-	fatalErr             error
+	operation             imageOperation
+	parser                imageSSEParser
+	finals                []imageResult
+	finalUsage            json.RawMessage
+	omitInputUsage        bool
+	responseFormat        string
+	maxResults            int
+	maxBinaryBytes        int
+	completedBinaryBytes  int
+	completed             bool
+	forceFlush            bool
+	assistantTextSeen     bool
+	projectWebImageErrors bool
+	fatalErr              error
 }
 
 func (m *imageStreamMapper) writeChunk(w io.Writer, chunk []byte) {
@@ -2190,7 +2220,7 @@ func (m *imageStreamMapper) fatalError() error {
 	if m == nil {
 		return nil
 	}
-	return m.fatalErr
+	return markChatGPTWebImageProcessingError(m.fatalErr, m.projectWebImageErrors)
 }
 
 func imagePartialIndexFromResult(result gjson.Result) *int {
@@ -2249,6 +2279,17 @@ func imageProvidersContain(providers []string, provider string) bool {
 		}
 	}
 	return false
+}
+
+func markChatGPTWebImageProcessingError(err error, enabled bool) error {
+	if err == nil || !enabled {
+		return err
+	}
+	var classified interface{ ChatGPTWebImageErrorClass() string }
+	if errors.As(err, &classified) && strings.TrimSpace(classified.ChatGPTWebImageErrorClass()) != "" {
+		return err
+	}
+	return &chatGPTWebImageProcessingError{cause: err}
 }
 
 func imageResponseByteLimit(snapshot coreexecutor.ChatGPTWebImageConfigSnapshot) int {
