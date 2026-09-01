@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"strconv"
 	"sync"
 	"testing"
 
@@ -17,6 +18,7 @@ type errorResponseSourceTestExecutor struct {
 	executeErr          error
 	streamErr           error
 	streamPayloadBefore bool
+	preparedPriority    *int
 }
 
 type cancelingErrorResponseSourceTestExecutor struct {
@@ -70,9 +72,24 @@ func (e *errorResponseSourceTestExecutor) ExecuteStream(context.Context, *Auth, 
 	if e.streamPayloadBefore {
 		chunks <- cliproxyexecutor.StreamChunk{Payload: []byte("data")}
 	}
-	chunks <- cliproxyexecutor.StreamChunk{Err: e.streamErr}
+	if e.streamErr != nil {
+		chunks <- cliproxyexecutor.StreamChunk{Err: e.streamErr}
+	}
 	close(chunks)
 	return &cliproxyexecutor.StreamResult{Chunks: chunks}, nil
+}
+
+func (e *errorResponseSourceTestExecutor) ShouldPrepareRequestAuth(*Auth) bool {
+	return e.preparedPriority != nil
+}
+
+func (e *errorResponseSourceTestExecutor) PrepareRequestAuth(_ context.Context, auth *Auth) (*Auth, error) {
+	prepared := auth.Clone()
+	if prepared.Attributes == nil {
+		prepared.Attributes = make(map[string]string)
+	}
+	prepared.Attributes["priority"] = strconv.Itoa(*e.preparedPriority)
+	return prepared, nil
 }
 
 func (e *errorResponseSourceTestExecutor) Refresh(_ context.Context, auth *Auth) (*Auth, error) {
@@ -80,7 +97,7 @@ func (e *errorResponseSourceTestExecutor) Refresh(_ context.Context, auth *Auth)
 }
 
 func (e *errorResponseSourceTestExecutor) CountTokens(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
-	return cliproxyexecutor.Response{}, errors.New("not implemented")
+	return cliproxyexecutor.Response{}, e.executeErr
 }
 
 func (e *errorResponseSourceTestExecutor) HttpRequest(context.Context, *Auth, *http.Request) (*http.Response, error) {
@@ -271,6 +288,63 @@ func TestManagerKeepsSelectedCredentialSourceWhenExecutionIsCanceled(t *testing.
 				t.Fatalf("execution error = %T %v, want context.Canceled", errExecute, errExecute)
 			}
 			assertCredentialErrorResponseSource(t, recorder.load())
+		})
+	}
+}
+
+func TestManagerPublishesPreparedCredentialPriorityOnSuccess(t *testing.T) {
+	tests := []struct {
+		name string
+		run  func(context.Context, *Manager, cliproxyexecutor.Options) error
+	}{
+		{
+			name: "execute",
+			run: func(ctx context.Context, manager *Manager, opts cliproxyexecutor.Options) error {
+				_, errExecute := manager.Execute(ctx, []string{"source-test"}, cliproxyexecutor.Request{Model: "source-test-model"}, opts)
+				return errExecute
+			},
+		},
+		{
+			name: "count",
+			run: func(ctx context.Context, manager *Manager, opts cliproxyexecutor.Options) error {
+				_, errCount := manager.ExecuteCount(ctx, []string{"source-test"}, cliproxyexecutor.Request{Model: "source-test-model"}, opts)
+				return errCount
+			},
+		},
+		{
+			name: "stream",
+			run: func(ctx context.Context, manager *Manager, opts cliproxyexecutor.Options) error {
+				result, errStream := manager.ExecuteStream(ctx, []string{"source-test"}, cliproxyexecutor.Request{Model: "source-test-model"}, opts)
+				if errStream != nil {
+					return errStream
+				}
+				for range result.Chunks {
+				}
+				return nil
+			},
+		},
+	}
+
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			manager := NewManager(nil, &FillFirstSelector{}, nil)
+			manager.SetRetryConfig(0, 0, 0)
+			preparedPriority := 7
+			manager.RegisterExecutor(&errorResponseSourceTestExecutor{
+				id:                  "source-test",
+				streamPayloadBefore: true,
+				preparedPriority:    &preparedPriority,
+			})
+			registerErrorResponseSourceTestAuth(t, manager)
+
+			recorder := &errorResponseSourceRecorder{}
+			errExecute := testCase.run(t.Context(), manager, cliproxyexecutor.Options{Metadata: map[string]any{
+				cliproxyexecutor.SelectedAuthSourceCallbackMetadataKey: recorder.store,
+			}})
+			if errExecute != nil {
+				t.Fatalf("execution error = %v", errExecute)
+			}
+			assertCredentialErrorResponseSourceFor(t, recorder.load(), "source-test", preparedPriority)
 		})
 	}
 }

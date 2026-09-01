@@ -5517,6 +5517,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 		}
 		carryRuntimeProxy(auth, preparedAuth)
 		auth = preparedAuth
+		publishErrorResponseSourceMetadata(opts.Metadata, errorResponseSourceForAuth(auth, provider))
 		opts = withSelectedAuthInstanceMetadata(opts, auth)
 
 		models, pooled, aliasResult := m.preparedExecutionModelsWithAlias(auth, routeModel, opts)
@@ -5603,6 +5604,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 				} else if attemptedRefresh {
 					carryRuntimeProxy(auth, refreshed)
 					auth = refreshed
+					publishErrorResponseSourceMetadata(opts.Metadata, errorResponseSourceForAuth(auth, provider))
 					opts = withSelectedAuthInstanceMetadata(opts, auth)
 					auth.bindExecutorOwner(executor)
 					if errLimit := m.acquireAdditionalAuthRequest(auth, executor, opts.AuthRequestSlot); errLimit != nil {
@@ -5780,6 +5782,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 		}
 		carryRuntimeProxy(auth, preparedAuth)
 		auth = preparedAuth
+		publishErrorResponseSourceMetadata(opts.Metadata, errorResponseSourceForAuth(auth, provider))
 		opts = withSelectedAuthInstanceMetadata(opts, auth)
 
 		models, pooled := m.preparedExecutionModels(auth, routeModel, opts)
@@ -5860,6 +5863,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 				} else if attemptedRefresh {
 					carryRuntimeProxy(auth, refreshed)
 					auth = refreshed
+					publishErrorResponseSourceMetadata(opts.Metadata, errorResponseSourceForAuth(auth, provider))
 					opts = withSelectedAuthInstanceMetadata(opts, auth)
 					auth.bindExecutorOwner(executor)
 					if errLimit := m.acquireAdditionalAuthRequest(auth, executor, opts.AuthRequestSlot); errLimit != nil {
@@ -6037,6 +6041,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 		}
 		carryRuntimeProxy(auth, preparedAuth)
 		auth = preparedAuth
+		publishErrorResponseSourceMetadata(opts.Metadata, errorResponseSourceForAuth(auth, provider))
 		opts = withSelectedAuthInstanceMetadata(opts, auth)
 		models, pooled, aliasResult := m.preparedExecutionModelsWithAlias(auth, routeModel, opts)
 		if len(models) == 0 {
@@ -6105,6 +6110,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 				} else if attemptedRefresh {
 					carryRuntimeProxy(auth, refreshed)
 					auth = refreshed
+					publishErrorResponseSourceMetadata(opts.Metadata, errorResponseSourceForAuth(auth, provider))
 					opts = withSelectedAuthInstanceMetadata(opts, auth)
 					auth.bindExecutorOwner(executor)
 					if errLimit := m.acquireAdditionalAuthRequest(auth, executor, opts.AuthRequestSlot); errLimit != nil {
