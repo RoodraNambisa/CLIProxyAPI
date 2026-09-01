@@ -342,7 +342,13 @@ fixed-error-cooldowns:
 # or provider-key restrictions. Rules are evaluated in order.
 # Omit status-code or set it to 0 when one message can use multiple original statuses.
 # error-response-rewrites:
-#   - status-code: 429
+#   - sources:
+#       - chatgpt-web
+#       - codex
+#     auth-priorities:
+#       - 0
+#       - -1
+#     status-code: 429
 #     message-contains: "maximum context"
 #     response-status-code: 400
 #     response-body:

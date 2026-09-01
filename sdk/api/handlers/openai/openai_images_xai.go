@@ -373,7 +373,7 @@ func (h *OpenAIImagesAPIHandler) handleXAIImages(c *gin.Context, routeModel stri
 	}
 	results, _, usage, err := extractXAIImagesResponse(resp)
 	if err != nil {
-		h.WriteErrorResponse(c, h.RewriteExecutionErrorResponse(&interfaces.ErrorMessage{
+		h.WriteErrorResponse(c, h.RewriteExecutionErrorResponseForContext(cliCtx, &interfaces.ErrorMessage{
 			StatusCode: http.StatusBadGateway,
 			Error:      err,
 		}))
@@ -384,7 +384,7 @@ func (h *OpenAIImagesAPIHandler) handleXAIImages(c *gin.Context, routeModel stri
 	if !stream {
 		out, errBuild := buildImagesAPIResponseFromXAI(resp, responseFormat)
 		if errBuild != nil {
-			h.WriteErrorResponse(c, h.RewriteExecutionErrorResponse(&interfaces.ErrorMessage{
+			h.WriteErrorResponse(c, h.RewriteExecutionErrorResponseForContext(cliCtx, &interfaces.ErrorMessage{
 				StatusCode: http.StatusBadGateway,
 				Error:      errBuild,
 			}))

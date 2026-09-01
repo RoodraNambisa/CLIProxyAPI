@@ -183,6 +183,8 @@ const (
 	StreamTerminalMarkerMetadataKey = "stream_terminal_marker"
 	// SelectedAuthCallbackMetadataKey carries an optional callback invoked with the selected auth ID.
 	SelectedAuthCallbackMetadataKey = "selected_auth_callback"
+	// SelectedAuthSourceCallbackMetadataKey carries an optional callback invoked with the selected provider and priority.
+	SelectedAuthSourceCallbackMetadataKey = "selected_auth_source_callback"
 	// ExecutionSessionMetadataKey identifies a long-lived downstream execution session.
 	ExecutionSessionMetadataKey = "execution_session_id"
 )

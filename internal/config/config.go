@@ -2779,6 +2779,13 @@ func NormalizeErrorResponseRewrites(rules []ErrorResponseRewriteRule) ([]ErrorRe
 	}
 	out := make([]ErrorResponseRewriteRule, 0, len(rules))
 	for index, rule := range rules {
+		sources := normalizeStringListLower(rule.Sources)
+		for _, source := range sources {
+			if !validErrorResponseRewriteSource(source) {
+				return nil, fmt.Errorf("error-response-rewrites[%d].sources contains invalid provider ID %q", index, source)
+			}
+		}
+		authPriorities := normalizeIntList(rule.AuthPriorities)
 		statusCode := rule.StatusCode
 		if statusCode != 0 && (statusCode < 100 || statusCode > 599) {
 			return nil, fmt.Errorf("error-response-rewrites[%d].status-code must be between 100 and 599", index)
@@ -2809,6 +2816,8 @@ func NormalizeErrorResponseRewrites(rules []ErrorResponseRewriteRule) ([]ErrorRe
 		}
 
 		out = append(out, ErrorResponseRewriteRule{
+			Sources:            sources,
+			AuthPriorities:     authPriorities,
 			StatusCode:         statusCode,
 			MessageContains:    message,
 			ResponseStatusCode: responseStatusCode,
@@ -2816,6 +2825,20 @@ func NormalizeErrorResponseRewrites(rules []ErrorResponseRewriteRule) ([]ErrorRe
 		})
 	}
 	return out, nil
+}
+
+func validErrorResponseRewriteSource(source string) bool {
+	if source == "" {
+		return false
+	}
+	for index, r := range source {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') ||
+			(index > 0 && (r == '-' || r == '_' || r == '.')) {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 func cloneErrorResponseBody(src map[string]any) map[string]any {

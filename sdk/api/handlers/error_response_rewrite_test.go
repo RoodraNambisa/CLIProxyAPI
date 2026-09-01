@@ -235,6 +235,80 @@ func TestRewriteExecutionErrorResponseUnmatchedAndHTTPWrite(t *testing.T) {
 	}
 }
 
+func TestRewriteExecutionErrorResponseSourceAndPriorityFilters(t *testing.T) {
+	handler := NewBaseAPIHandlers(&config.SDKConfig{ErrorResponseRewrites: []config.ErrorResponseRewriteRule{
+		{Sources: []string{"codex"}, StatusCode: http.StatusBadRequest, ResponseStatusCode: http.StatusTeapot},
+		{Sources: []string{"chatgpt-web"}, AuthPriorities: []int{-1}, StatusCode: http.StatusBadRequest, ResponseStatusCode: http.StatusConflict},
+		{Sources: []string{"chatgpt-web", "codex"}, AuthPriorities: []int{-2, 3}, StatusCode: http.StatusBadRequest, ResponseStatusCode: http.StatusUnprocessableEntity},
+	}}, nil)
+	original := &interfaces.ErrorMessage{
+		StatusCode: http.StatusBadRequest,
+		Error: coreexecutor.WithErrorResponseSource(
+			errors.New("invalid image"),
+			coreexecutor.CredentialErrorResponseSource("ChatGPT-Web", 3),
+		),
+	}
+
+	projected := handler.RewriteExecutionErrorResponse(original)
+	if projected == original || projected.StatusCode != http.StatusUnprocessableEntity {
+		t.Fatalf("projected = %#v, want source and priority match", projected)
+	}
+}
+
+func TestRewriteExecutionErrorResponseLocalHasNoAuthPriority(t *testing.T) {
+	handler := NewBaseAPIHandlers(&config.SDKConfig{ErrorResponseRewrites: []config.ErrorResponseRewriteRule{
+		{Sources: []string{"local"}, AuthPriorities: []int{0}, StatusCode: http.StatusBadRequest, ResponseStatusCode: http.StatusConflict},
+		{Sources: []string{"local"}, StatusCode: http.StatusBadRequest, ResponseStatusCode: http.StatusUnprocessableEntity},
+	}}, nil)
+	original := &interfaces.ErrorMessage{StatusCode: http.StatusBadRequest, Error: errors.New("local validation")}
+
+	projected := handler.RewriteExecutionErrorResponse(original)
+	if projected == original || projected.StatusCode != http.StatusUnprocessableEntity {
+		t.Fatalf("projected = %#v, want local rule without priority", projected)
+	}
+}
+
+func TestRewriteExecutionErrorResponseUsesSelectedSourceForPostProcessing(t *testing.T) {
+	handler := NewBaseAPIHandlers(&config.SDKConfig{ErrorResponseRewrites: []config.ErrorResponseRewriteRule{{
+		Sources:            []string{"xai"},
+		AuthPriorities:     []int{-1},
+		StatusCode:         http.StatusBadGateway,
+		ResponseStatusCode: http.StatusUnprocessableEntity,
+	}}}, nil)
+	ctx, tracker := ensureErrorResponseSourceTracker(t.Context(), nil)
+	tracker.store(coreexecutor.CredentialErrorResponseSource("xai", -1))
+	original := &interfaces.ErrorMessage{StatusCode: http.StatusBadGateway, Error: errors.New("response conversion failed")}
+
+	projected := handler.RewriteExecutionErrorResponseForContext(ctx, original)
+	if projected == original || projected.StatusCode != http.StatusUnprocessableEntity {
+		t.Fatalf("projected = %#v, want request source fallback", projected)
+	}
+}
+
+func TestExecutionErrorRewriteMatchesActualCredentialSource(t *testing.T) {
+	manager := coreauth.NewManager(nil, &coreauth.FillFirstSelector{}, nil)
+	manager.RegisterExecutor(rewriteTestExecutor{})
+	if _, errRegister := manager.Register(coreauth.WithSkipPersist(t.Context()), &coreauth.Auth{
+		ID:         "rewrite-source-auth",
+		Provider:   "rewrite-test",
+		Status:     coreauth.StatusActive,
+		Attributes: map[string]string{"priority": "-2"},
+	}); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+	registry.GetGlobalRegistry().RegisterClient("rewrite-source-auth", "rewrite-test", []*registry.ModelInfo{{ID: "rewrite-source-model"}})
+	t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient("rewrite-source-auth") })
+	handler := NewBaseAPIHandlers(&config.SDKConfig{ErrorResponseRewrites: []config.ErrorResponseRewriteRule{
+		{Sources: []string{"codex"}, StatusCode: http.StatusBadRequest, ResponseStatusCode: http.StatusTeapot},
+		{Sources: []string{"rewrite-test"}, AuthPriorities: []int{-2}, StatusCode: http.StatusBadRequest, ResponseStatusCode: http.StatusUnprocessableEntity},
+	}}, manager)
+
+	_, _, errMsg := handler.ExecuteWithProviders(t.Context(), []string{"rewrite-test"}, "openai", "rewrite-source-model", nil, "")
+	if errMsg == nil || errMsg.StatusCode != http.StatusUnprocessableEntity {
+		t.Fatalf("execution error = %#v, want actual credential source match", errMsg)
+	}
+}
+
 func TestExplicitLocalProxyErrorsCanBeRewritten(t *testing.T) {
 	for _, test := range []struct {
 		name         string

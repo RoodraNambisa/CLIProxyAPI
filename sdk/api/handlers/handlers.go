@@ -649,6 +649,11 @@ func requestExecutionMetadata(ctx context.Context) map[string]any {
 	if selectedCallback := selectedAuthIDCallbackFromContext(ctx); selectedCallback != nil {
 		meta[coreexecutor.SelectedAuthCallbackMetadataKey] = selectedCallback
 	}
+	if sourceTracker := errorResponseSourceTrackerFromContext(ctx); sourceTracker != nil {
+		meta[coreexecutor.SelectedAuthSourceCallbackMetadataKey] = func(source coreexecutor.ErrorResponseSourceSnapshot) {
+			sourceTracker.store(source)
+		}
+	}
 	if executionSessionID := executionSessionIDFromContext(ctx); executionSessionID != "" {
 		meta[coreexecutor.ExecutionSessionMetadataKey] = executionSessionID
 	}
@@ -887,6 +892,7 @@ func (h *BaseAPIHandler) GetContextWithCancel(handler interfaces.APIHandler, c *
 	}
 	newCtx = context.WithValue(newCtx, "gin", c)
 	newCtx = context.WithValue(newCtx, "handler", handler)
+	newCtx, _ = ensureErrorResponseSourceTracker(newCtx, c)
 	return newCtx, func(params ...interface{}) {
 		if h.Cfg.RequestLog && len(params) == 1 {
 			if existing, exists := c.Get("API_RESPONSE"); exists {
@@ -1005,6 +1011,7 @@ func appendAPIResponse(c *gin.Context, data []byte) {
 // ExecuteWithAuthManager executes a non-streaming request via the core auth manager.
 // This path is the only supported execution route.
 func (h *BaseAPIHandler) ExecuteWithAuthManager(ctx context.Context, handlerType, modelName string, rawJSON []byte, alt string) ([]byte, http.Header, *interfaces.ErrorMessage) {
+	ctx, _ = ensureErrorResponseSourceTracker(ctx, nil)
 	providers, normalizedModel, errMsg := h.getRequestDetails(modelName)
 	if errMsg != nil {
 		return nil, nil, errMsg
@@ -1041,7 +1048,7 @@ func (h *BaseAPIHandler) ExecuteWithAuthManager(ctx context.Context, handlerType
 		if strictErr := chatGPTWebStrictImageSizeUnavailableError(ctx, err); strictErr != nil {
 			return nil, nil, strictErr
 		}
-		return nil, nil, h.RewriteExecutionErrorResponse(executionErrorMessage(err, providers, normalizedModel))
+		return nil, nil, h.RewriteExecutionErrorResponseForContext(ctx, executionErrorMessage(err, providers, normalizedModel))
 	}
 	return resp.Payload, ClientUpstreamHeaders(resp.Headers, PassthroughHeadersEnabled(h.Cfg)), nil
 }
@@ -1055,6 +1062,7 @@ func (h *BaseAPIHandler) ExecuteWithProviders(ctx context.Context, providers []s
 // ExecuteWithProvidersAndExecutionModel executes a non-streaming request against an explicit
 // provider set while allowing auth selection and upstream execution to use different model IDs.
 func (h *BaseAPIHandler) ExecuteWithProvidersAndExecutionModel(ctx context.Context, providers []string, handlerType, routeModelName, executionModelName string, rawJSON []byte, alt string) ([]byte, http.Header, *interfaces.ErrorMessage) {
+	ctx, _ = ensureErrorResponseSourceTracker(ctx, nil)
 	normalizedRouteModel := strings.TrimSpace(routeModelName)
 	if normalizedRouteModel == "" {
 		return nil, nil, &interfaces.ErrorMessage{StatusCode: http.StatusBadRequest, Error: fmt.Errorf("model is required")}
@@ -1100,7 +1108,7 @@ func (h *BaseAPIHandler) ExecuteWithProvidersAndExecutionModel(ctx context.Conte
 		if strictErr := chatGPTWebStrictImageSizeUnavailableError(ctx, err); strictErr != nil {
 			return nil, nil, strictErr
 		}
-		return nil, nil, h.RewriteExecutionErrorResponse(executionErrorMessage(err, providers, normalizedRouteModel))
+		return nil, nil, h.RewriteExecutionErrorResponseForContext(ctx, executionErrorMessage(err, providers, normalizedRouteModel))
 	}
 	return resp.Payload, ClientUpstreamHeaders(resp.Headers, PassthroughHeadersEnabled(h.Cfg)), nil
 }
@@ -1133,6 +1141,7 @@ func (h *BaseAPIHandler) ExecuteStreamWithProvidersAndExecutionModel(ctx context
 // ExecuteCountWithAuthManager executes a non-streaming request via the core auth manager.
 // This path is the only supported execution route.
 func (h *BaseAPIHandler) ExecuteCountWithAuthManager(ctx context.Context, handlerType, modelName string, rawJSON []byte, alt string) ([]byte, http.Header, *interfaces.ErrorMessage) {
+	ctx, _ = ensureErrorResponseSourceTracker(ctx, nil)
 	providers, normalizedModel, errMsg := h.getRequestDetails(modelName)
 	if errMsg != nil {
 		return nil, nil, errMsg
@@ -1169,7 +1178,7 @@ func (h *BaseAPIHandler) ExecuteCountWithAuthManager(ctx context.Context, handle
 		if strictErr := chatGPTWebStrictImageSizeUnavailableError(ctx, err); strictErr != nil {
 			return nil, nil, strictErr
 		}
-		return nil, nil, h.RewriteExecutionErrorResponse(executionErrorMessage(err, providers, normalizedModel))
+		return nil, nil, h.RewriteExecutionErrorResponseForContext(ctx, executionErrorMessage(err, providers, normalizedModel))
 	}
 	return resp.Payload, ClientUpstreamHeaders(resp.Headers, PassthroughHeadersEnabled(h.Cfg)), nil
 }
@@ -1190,6 +1199,7 @@ func (h *BaseAPIHandler) ExecuteStreamWithAuthManager(ctx context.Context, handl
 }
 
 func (h *BaseAPIHandler) executeStreamWithResolvedProviders(ctx context.Context, providers []string, handlerType, normalizedRouteModel, executionModelName string, rawJSON []byte, alt string) (<-chan []byte, http.Header, <-chan *interfaces.ErrorMessage) {
+	ctx, _ = ensureErrorResponseSourceTracker(ctx, nil)
 	var errRestricted *interfaces.ErrorMessage
 	providers, errRestricted = restrictExecutionProviders(ctx, providers)
 	if errRestricted != nil {
@@ -1250,7 +1260,7 @@ func (h *BaseAPIHandler) executeStreamWithResolvedProviders(ctx context.Context,
 		if strictErr := chatGPTWebStrictImageSizeUnavailableError(ctx, err); strictErr != nil {
 			errChan <- strictErr
 		} else {
-			errChan <- h.RewriteExecutionErrorResponse(executionErrorMessage(err, providers, normalizedRouteModel))
+			errChan <- h.RewriteExecutionErrorResponseForContext(ctx, executionErrorMessage(err, providers, normalizedRouteModel))
 		}
 		close(errChan)
 		return nil, nil, errChan
@@ -1366,7 +1376,7 @@ func (h *BaseAPIHandler) executeStreamWithResolvedProviders(ctx context.Context,
 					if handlerType == "openai-response" && !imageStreamPassthrough() && !trustResponsesSSE {
 						frames, err := responsesSSEFramer.Finish()
 						if err != nil {
-							_ = sendErr(h.RewriteExecutionErrorResponse(&interfaces.ErrorMessage{StatusCode: http.StatusBadGateway, Error: err}))
+							_ = sendErr(h.RewriteExecutionErrorResponseForContext(ctx, &interfaces.ErrorMessage{StatusCode: http.StatusBadGateway, Error: err}))
 							return
 						}
 						for _, frame := range frames {
@@ -1406,7 +1416,7 @@ func (h *BaseAPIHandler) executeStreamWithResolvedProviders(ctx context.Context,
 						}
 					}
 
-					errMsg := h.RewriteExecutionErrorResponse(executionErrorMessage(streamErr, providers, normalizedRouteModel))
+					errMsg := h.RewriteExecutionErrorResponseForContext(ctx, executionErrorMessage(streamErr, providers, normalizedRouteModel))
 					if pendingProtocolProjection != nil && !IsErrorResponseRewritten(errMsg) {
 						errMsg = pendingProtocolProjection
 					}
@@ -1436,7 +1446,7 @@ func (h *BaseAPIHandler) executeStreamWithResolvedProviders(ctx context.Context,
 								protocolProvider = "gemini"
 							}
 							original := executionErrorMessage(executorhelps.JSONStreamProtocolError(protocolProvider, protocolPayload), providers, normalizedRouteModel)
-							projected := h.RewriteExecutionErrorResponse(original)
+							projected := h.RewriteExecutionErrorResponseForContext(ctx, original)
 							if projected != original {
 								pendingProtocolProjection = projected
 								continue
@@ -1446,7 +1456,7 @@ func (h *BaseAPIHandler) executeStreamWithResolvedProviders(ctx context.Context,
 					if handlerType == "openai-response" && !effectiveImageStreamPassthrough && !trustResponsesSSE {
 						frames, err := responsesSSEFramer.Feed(chunk.Payload)
 						if err != nil {
-							_ = sendErr(h.RewriteExecutionErrorResponse(&interfaces.ErrorMessage{StatusCode: http.StatusBadGateway, Error: err}))
+							_ = sendErr(h.RewriteExecutionErrorResponseForContext(ctx, &interfaces.ErrorMessage{StatusCode: http.StatusBadGateway, Error: err}))
 							return
 						}
 						for _, frame := range frames {

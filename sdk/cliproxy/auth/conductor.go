@@ -678,7 +678,7 @@ func (s *requestRoundState) setLastError(auth *Auth, err error) {
 	if s == nil {
 		return
 	}
-	s.lastErr = err
+	s.lastErr = withAuthErrorResponseSource(err, auth, "")
 	s.lastErrAuthID = ""
 	if auth != nil {
 		s.lastErrAuthID = auth.ID
@@ -2251,6 +2251,7 @@ func (m *Manager) wrapStreamResult(ctx, resultCtx context.Context, auth *Auth, a
 				return
 			}
 			retiredErrorSent = true
+			publishErrorResponseSourceMetadata(opts.Metadata, errorResponseSourceForAuth(auth, provider))
 			enqueueTerminalStreamChunk(resultCtx, out, cliproxyexecutor.StreamChunk{Err: runtimeAuthInstanceRetiredError()})
 		}
 		defer func() {
@@ -2323,6 +2324,9 @@ func (m *Manager) wrapStreamResult(ctx, resultCtx context.Context, auth *Auth, a
 			}
 			if !forward {
 				return false
+			}
+			if chunk.Err != nil {
+				publishErrorResponseSourceMetadata(opts.Metadata, errorResponseSourceForAuth(auth, provider))
 			}
 			if chunk.Err == nil && len(chunk.Payload) > 0 {
 				payload := rewriteForceMappedStreamChunk(rewriter, chunk.Payload)
@@ -4313,6 +4317,9 @@ func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxye
 	opts = m.ensureExecutionDiagnostics(opts)
 	ctx = cliproxyexecutor.WithRequestUsageOutcome(ctx, opts.UsageOutcome)
 	defer func() {
+		if err != nil {
+			err = finalizeErrorResponseSource(opts.Metadata, err)
+		}
 		m.recordExecutionResultMetrics(opts, err)
 		if err != nil {
 			opts.UsageOutcome.FinalizeFailure()
@@ -4397,6 +4404,9 @@ func (m *Manager) ExecuteCount(ctx context.Context, providers []string, req clip
 	opts = m.ensureExecutionDiagnostics(opts)
 	ctx = cliproxyexecutor.WithRequestUsageOutcome(ctx, opts.UsageOutcome)
 	defer func() {
+		if err != nil {
+			err = finalizeErrorResponseSource(opts.Metadata, err)
+		}
 		m.recordExecutionResultMetrics(opts, err)
 		if err != nil {
 			opts.UsageOutcome.FinalizeFailure()
@@ -4479,6 +4489,9 @@ func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cli
 	opts = m.ensureExecutionDiagnostics(opts)
 	ctx = cliproxyexecutor.WithRequestUsageOutcome(ctx, opts.UsageOutcome)
 	defer func() {
+		if err != nil {
+			err = finalizeErrorResponseSource(opts.Metadata, err)
+		}
 		m.recordExecutionResultMetrics(opts, err)
 		if err != nil {
 			opts.UsageOutcome.FinalizeFailure()
@@ -4548,6 +4561,9 @@ func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cli
 		}
 		var bootstrapErr *streamBootstrapError
 		if errors.As(lastErr, &bootstrapErr) && bootstrapErr != nil {
+			if source, ok := cliproxyexecutor.ErrorResponseSourceOf(lastErr); ok {
+				publishErrorResponseSourceMetadata(opts.Metadata, source)
+			}
 			return streamErrorResult(bootstrapErr.Headers(), bootstrapErr.cause), nil
 		}
 		return nil, finalAuthSelectionError(lastErr)
@@ -5448,7 +5464,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 		if errProxy != nil {
 			roundState.markAttempted(auth)
 			if strictSessionAffinity {
-				return cliproxyexecutor.Response{}, errProxy
+				return cliproxyexecutor.Response{}, withAuthErrorResponseSource(errProxy, auth, provider)
 			}
 			roundState.setLastError(auth, errProxy)
 			continue
@@ -5457,7 +5473,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 
 		entry := logEntryWithRequestID(ctx)
 		debugLogAuthSelection(entry, auth, provider, req.Model)
-		publishSelectedAuthMetadata(opts.Metadata, auth.ID)
+		publishSelectedAuthMetadata(opts.Metadata, auth, provider)
 		opts = withSelectedAuthInstanceMetadata(opts, auth)
 
 		execCtx := ctx
@@ -5491,10 +5507,10 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			}
 			if isChatGPTWebUnauthorizedRequestError(errPrepare) {
 				triggerChatGPTWebUnauthorizedRequestRefresh(errPrepare)
-				return cliproxyexecutor.Response{}, errPrepare
+				return cliproxyexecutor.Response{}, withAuthErrorResponseSource(errPrepare, auth, provider)
 			}
 			if strictSessionAffinity {
-				return cliproxyexecutor.Response{}, errPrepare
+				return cliproxyexecutor.Response{}, withAuthErrorResponseSource(errPrepare, auth, provider)
 			}
 			roundState.setLastError(auth, errPrepare)
 			continue
@@ -5506,7 +5522,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 		models, pooled, aliasResult := m.preparedExecutionModelsWithAlias(auth, routeModel, opts)
 		if len(models) == 0 {
 			if strictSessionAffinity {
-				return cliproxyexecutor.Response{}, newStrictSessionAffinityError("session bound auth has no executable models")
+				return cliproxyexecutor.Response{}, withAuthErrorResponseSource(newStrictSessionAffinityError("session bound auth has no executable models"), auth, provider)
 			}
 			continue
 		}
@@ -5532,7 +5548,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			})
 			if !requestBodyReplayable(execCtx, opts) {
 				unregisterAttemptRelease()
-				return cliproxyexecutor.Response{}, &Error{Code: "request_body_released", Message: "request body released; retry disabled"}
+				return cliproxyexecutor.Response{}, withAuthErrorResponseSource(&Error{Code: "request_body_released", Message: "request body released; retry disabled"}, auth, provider)
 			}
 			auth.bindExecutorOwner(executor)
 			runtimeCtx, releaseExecution, active := auth.BeginRuntimeExecution(execCtx)
@@ -5644,24 +5660,24 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			}
 			triggerChatGPTWebUnauthorizedRequestRefresh(errExec)
 			if m.isRequestInvalidError(errExec) {
-				return cliproxyexecutor.Response{}, errExec
+				return cliproxyexecutor.Response{}, withAuthErrorResponseSource(errExec, auth, provider)
 			}
 			authErr = errExec
 			if !requestBodyReplayable(execCtx, opts) {
-				return cliproxyexecutor.Response{}, errExec
+				return cliproxyexecutor.Response{}, withAuthErrorResponseSource(errExec, auth, provider)
 			}
 			continue
 		}
 		if authErr != nil {
 			if m.isRequestInvalidError(authErr) {
-				return cliproxyexecutor.Response{}, authErr
+				return cliproxyexecutor.Response{}, withAuthErrorResponseSource(authErr, auth, provider)
 			}
 			if strictSessionAffinity {
-				return cliproxyexecutor.Response{}, authErr
+				return cliproxyexecutor.Response{}, withAuthErrorResponseSource(authErr, auth, provider)
 			}
 			roundState.setLastError(auth, authErr)
 			if !requestBodyReplayable(ctx, opts) {
-				return cliproxyexecutor.Response{}, authErr
+				return cliproxyexecutor.Response{}, withAuthErrorResponseSource(authErr, auth, provider)
 			}
 			continue
 		}
@@ -5711,7 +5727,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 		if errProxy != nil {
 			roundState.markAttempted(auth)
 			if strictSessionAffinity {
-				return cliproxyexecutor.Response{}, errProxy
+				return cliproxyexecutor.Response{}, withAuthErrorResponseSource(errProxy, auth, provider)
 			}
 			roundState.setLastError(auth, errProxy)
 			continue
@@ -5720,7 +5736,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 
 		entry := logEntryWithRequestID(ctx)
 		debugLogAuthSelection(entry, auth, provider, req.Model)
-		publishSelectedAuthMetadata(opts.Metadata, auth.ID)
+		publishSelectedAuthMetadata(opts.Metadata, auth, provider)
 		opts = withSelectedAuthInstanceMetadata(opts, auth)
 
 		execCtx := ctx
@@ -5754,10 +5770,10 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 			}
 			if isChatGPTWebUnauthorizedRequestError(errPrepare) {
 				triggerChatGPTWebUnauthorizedRequestRefresh(errPrepare)
-				return cliproxyexecutor.Response{}, errPrepare
+				return cliproxyexecutor.Response{}, withAuthErrorResponseSource(errPrepare, auth, provider)
 			}
 			if strictSessionAffinity {
-				return cliproxyexecutor.Response{}, errPrepare
+				return cliproxyexecutor.Response{}, withAuthErrorResponseSource(errPrepare, auth, provider)
 			}
 			roundState.setLastError(auth, errPrepare)
 			continue
@@ -5769,7 +5785,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 		models, pooled := m.preparedExecutionModels(auth, routeModel, opts)
 		if len(models) == 0 {
 			if strictSessionAffinity {
-				return cliproxyexecutor.Response{}, newStrictSessionAffinityError("session bound auth has no executable models")
+				return cliproxyexecutor.Response{}, withAuthErrorResponseSource(newStrictSessionAffinityError("session bound auth has no executable models"), auth, provider)
 			}
 			continue
 		}
@@ -5795,7 +5811,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 			})
 			if !requestBodyReplayable(execCtx, opts) {
 				unregisterAttemptRelease()
-				return cliproxyexecutor.Response{}, &Error{Code: "request_body_released", Message: "request body released; retry disabled"}
+				return cliproxyexecutor.Response{}, withAuthErrorResponseSource(&Error{Code: "request_body_released", Message: "request body released; retry disabled"}, auth, provider)
 			}
 			auth.bindExecutorOwner(executor)
 			runtimeCtx, releaseExecution, active := auth.BeginRuntimeExecution(execCtx)
@@ -5897,24 +5913,24 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 			}
 			triggerChatGPTWebUnauthorizedRequestRefresh(errExec)
 			if m.isRequestInvalidError(errExec) {
-				return cliproxyexecutor.Response{}, errExec
+				return cliproxyexecutor.Response{}, withAuthErrorResponseSource(errExec, auth, provider)
 			}
 			authErr = errExec
 			if !requestBodyReplayable(execCtx, opts) {
-				return cliproxyexecutor.Response{}, errExec
+				return cliproxyexecutor.Response{}, withAuthErrorResponseSource(errExec, auth, provider)
 			}
 			continue
 		}
 		if authErr != nil {
 			if m.isRequestInvalidError(authErr) {
-				return cliproxyexecutor.Response{}, authErr
+				return cliproxyexecutor.Response{}, withAuthErrorResponseSource(authErr, auth, provider)
 			}
 			if strictSessionAffinity {
-				return cliproxyexecutor.Response{}, authErr
+				return cliproxyexecutor.Response{}, withAuthErrorResponseSource(authErr, auth, provider)
 			}
 			roundState.setLastError(auth, authErr)
 			if !requestBodyReplayable(ctx, opts) {
-				return cliproxyexecutor.Response{}, authErr
+				return cliproxyexecutor.Response{}, withAuthErrorResponseSource(authErr, auth, provider)
 			}
 			continue
 		}
@@ -5968,7 +5984,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 		if errProxy != nil {
 			roundState.markAttempted(auth)
 			if strictSessionAffinity {
-				return nil, errProxy
+				return nil, withAuthErrorResponseSource(errProxy, auth, provider)
 			}
 			roundState.setLastError(auth, errProxy)
 			continue
@@ -5977,7 +5993,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 
 		entry := logEntryWithRequestID(ctx)
 		debugLogAuthSelection(entry, auth, provider, req.Model)
-		publishSelectedAuthMetadata(opts.Metadata, auth.ID)
+		publishSelectedAuthMetadata(opts.Metadata, auth, provider)
 		opts = withSelectedAuthInstanceMetadata(opts, auth)
 
 		execCtx := ctx
@@ -6011,10 +6027,10 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			}
 			if isChatGPTWebUnauthorizedRequestError(errPrepare) {
 				triggerChatGPTWebUnauthorizedRequestRefresh(errPrepare)
-				return nil, errPrepare
+				return nil, withAuthErrorResponseSource(errPrepare, auth, provider)
 			}
 			if strictSessionAffinity {
-				return nil, errPrepare
+				return nil, withAuthErrorResponseSource(errPrepare, auth, provider)
 			}
 			roundState.setLastError(auth, errPrepare)
 			continue
@@ -6025,7 +6041,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 		models, pooled, aliasResult := m.preparedExecutionModelsWithAlias(auth, routeModel, opts)
 		if len(models) == 0 {
 			if strictSessionAffinity {
-				return nil, newStrictSessionAffinityError("session bound auth has no executable models")
+				return nil, withAuthErrorResponseSource(newStrictSessionAffinityError("session bound auth has no executable models"), auth, provider)
 			}
 			continue
 		}
@@ -6037,7 +6053,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 		})
 		if !requestBodyReplayable(execCtx, opts) {
 			unregisterAttemptRelease()
-			return nil, &Error{Code: "request_body_released", Message: "request body released; retry disabled"}
+			return nil, withAuthErrorResponseSource(&Error{Code: "request_body_released", Message: "request body released; retry disabled"}, auth, provider)
 		}
 		auth.bindExecutorOwner(executor)
 		runtimeCtx, releaseExecution, active := auth.BeginRuntimeExecution(execCtx)
@@ -6070,7 +6086,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 				roundState.blockProvider(provider)
 				roundState.setLastError(auth, errStream)
 				if strictSessionAffinity || !requestBodyReplayable(execCtx, opts) {
-					return nil, errStream
+					return nil, withAuthErrorResponseSource(errStream, auth, provider)
 				}
 				continue
 			}
@@ -6140,14 +6156,14 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			}
 			triggerChatGPTWebUnauthorizedRequestRefresh(errStream)
 			if m.isRequestInvalidError(errStream) {
-				return nil, errStream
+				return nil, withAuthErrorResponseSource(errStream, auth, provider)
 			}
 			if strictSessionAffinity {
-				return nil, errStream
+				return nil, withAuthErrorResponseSource(errStream, auth, provider)
 			}
 			roundState.setLastError(auth, errStream)
 			if !requestBodyReplayable(execCtx, opts) {
-				return nil, errStream
+				return nil, withAuthErrorResponseSource(errStream, auth, provider)
 			}
 			continue
 		}
@@ -6604,7 +6620,7 @@ func (m *Manager) tryAntigravityCreditsExecute(ctx context.Context, req cliproxy
 		roundState.markAttempted(c.auth)
 		resolvedAuth, errProxy := m.ResolveProxyAuth(ctx, c.auth)
 		if errProxy != nil {
-			lastPrepareErr = errProxy
+			lastPrepareErr = withAuthErrorResponseSource(errProxy, c.auth, c.provider)
 			continue
 		}
 		c.auth = resolvedAuth
@@ -6627,7 +6643,7 @@ func (m *Manager) tryAntigravityCreditsExecute(ctx context.Context, req cliproxy
 				if !skipAuthResultForError(errPrepare) {
 					m.markExecutionResult(creditsCtx, result)
 				}
-				lastPrepareErr = errPrepare
+				lastPrepareErr = withAuthErrorResponseSource(errPrepare, c.auth, c.provider)
 			} else {
 				roundState.forgetRetiredAttempt(c.auth)
 			}
@@ -6635,7 +6651,7 @@ func (m *Manager) tryAntigravityCreditsExecute(ctx context.Context, req cliproxy
 		}
 		carryRuntimeProxy(c.auth, preparedAuth)
 		c.auth = preparedAuth
-		publishSelectedAuthMetadata(creditsOpts.Metadata, c.auth.ID)
+		publishSelectedAuthMetadata(creditsOpts.Metadata, c.auth, c.provider)
 		creditsOpts = withSelectedAuthInstanceMetadata(creditsOpts, c.auth)
 		models := m.executionModelCandidates(c.auth, routeModel)
 		if len(models) == 0 {
@@ -6705,7 +6721,7 @@ func (m *Manager) tryAntigravityCreditsExecuteStream(ctx context.Context, req cl
 		roundState.markAttempted(c.auth)
 		resolvedAuth, errProxy := m.ResolveProxyAuth(ctx, c.auth)
 		if errProxy != nil {
-			lastPrepareErr = errProxy
+			lastPrepareErr = withAuthErrorResponseSource(errProxy, c.auth, c.provider)
 			continue
 		}
 		c.auth = resolvedAuth
@@ -6728,7 +6744,7 @@ func (m *Manager) tryAntigravityCreditsExecuteStream(ctx context.Context, req cl
 				if !skipAuthResultForError(errPrepare) {
 					m.markExecutionResult(creditsCtx, result)
 				}
-				lastPrepareErr = errPrepare
+				lastPrepareErr = withAuthErrorResponseSource(errPrepare, c.auth, c.provider)
 			} else {
 				roundState.forgetRetiredAttempt(c.auth)
 			}
@@ -6736,7 +6752,7 @@ func (m *Manager) tryAntigravityCreditsExecuteStream(ctx context.Context, req cl
 		}
 		carryRuntimeProxy(c.auth, preparedAuth)
 		c.auth = preparedAuth
-		publishSelectedAuthMetadata(creditsOpts.Metadata, c.auth.ID)
+		publishSelectedAuthMetadata(creditsOpts.Metadata, c.auth, c.provider)
 		creditsOpts = withSelectedAuthInstanceMetadata(creditsOpts, c.auth)
 		models := m.executionModelCandidates(c.auth, routeModel)
 		if len(models) == 0 {
@@ -6871,11 +6887,14 @@ func pinnedAuthIDFromMetadata(meta map[string]any) string {
 	}
 }
 
-func publishSelectedAuthMetadata(meta map[string]any, authID string) {
+func publishSelectedAuthMetadata(meta map[string]any, auth *Auth, fallbackProvider string) {
 	if len(meta) == 0 {
 		return
 	}
-	authID = strings.TrimSpace(authID)
+	if auth == nil {
+		return
+	}
+	authID := strings.TrimSpace(auth.ID)
 	if authID == "" {
 		return
 	}
@@ -6883,6 +6902,7 @@ func publishSelectedAuthMetadata(meta map[string]any, authID string) {
 	if callback, ok := meta[cliproxyexecutor.SelectedAuthCallbackMetadataKey].(func(string)); ok && callback != nil {
 		callback(authID)
 	}
+	publishErrorResponseSourceMetadata(meta, errorResponseSourceForAuth(auth, fallbackProvider))
 }
 
 func rewriteModelForAuth(model string, auth *Auth) string {
@@ -7550,7 +7570,11 @@ func finalAuthSelectionError(err error) error {
 	}
 	var cooldownErr *modelCooldownError
 	if errors.As(err, &cooldownErr) {
-		return &Error{Code: "auth_unavailable", Message: "no auth available"}
+		converted := error(&Error{Code: "auth_unavailable", Message: "no auth available"})
+		if source, ok := cliproxyexecutor.ErrorResponseSourceOf(err); ok {
+			converted = cliproxyexecutor.WithErrorResponseSource(converted, source)
+		}
+		return converted
 	}
 	return err
 }

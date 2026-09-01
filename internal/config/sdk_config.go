@@ -120,6 +120,10 @@ type APIKeyGroup struct {
 
 // ErrorResponseRewriteRule projects a matching final error to a client-facing status or JSON body.
 type ErrorResponseRewriteRule struct {
+	// Sources optionally restricts the rule to final error provider IDs or local errors.
+	Sources []string `yaml:"sources,omitempty" json:"sources,omitempty"`
+	// AuthPriorities optionally restricts the rule to final credential priorities.
+	AuthPriorities []int `yaml:"auth-priorities,omitempty" json:"auth-priorities,omitempty"`
 	// StatusCode optionally restricts the rule to one original HTTP status code.
 	StatusCode int `yaml:"status-code,omitempty" json:"status-code,omitempty"`
 	// MessageContains optionally matches the original error text case-insensitively.

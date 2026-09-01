@@ -905,7 +905,7 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesWebsocket(
 						payloadErrMsg = responsesWebsocketErrorMessageFromPayload(payloads[i])
 						projected := payloadErrMsg
 						if h != nil && h.BaseAPIHandler != nil {
-							projected = h.RewriteExecutionErrorResponse(payloadErrMsg)
+							projected = h.RewriteExecutionErrorResponseForGin(c, payloadErrMsg)
 							projected = h.ProjectChatGPTWebImageErrorResponse(c, projected, payloads[i])
 						}
 						if projected != payloadErrMsg {

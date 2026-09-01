@@ -349,7 +349,7 @@ func (h *OpenAIResponsesAPIHandler) rewriteResponsesSSETerminalErrorFrameForCont
 		return frame, nil, false
 	}
 	projectionInput := responsesWebsocketErrorMessageFromPayload(payload)
-	projected := h.RewriteExecutionErrorResponse(projectionInput)
+	projected := h.RewriteExecutionErrorResponseForGin(c, projectionInput)
 	projected = h.ProjectChatGPTWebImageErrorResponse(c, projected, payload)
 	if projected == projectionInput {
 		return frame, nil, false
@@ -717,7 +717,7 @@ func (h *OpenAIResponsesAPIHandler) handleStreamingResponse(c *gin.Context, rawJ
 				}
 				framer.Flush(&firstFrame)
 				if errFrame := framer.Err(); errFrame != nil {
-					h.WriteErrorResponse(c, h.RewriteExecutionErrorResponse(&interfaces.ErrorMessage{
+					h.WriteErrorResponse(c, h.RewriteExecutionErrorResponseForContext(cliCtx, &interfaces.ErrorMessage{
 						StatusCode: http.StatusBadGateway,
 						Error:      errFrame,
 					}))
@@ -736,7 +736,7 @@ func (h *OpenAIResponsesAPIHandler) handleStreamingResponse(c *gin.Context, rawJ
 
 			framer.WriteChunk(&firstFrame, chunk)
 			if errFrame := framer.Err(); errFrame != nil {
-				errMsg := h.RewriteExecutionErrorResponse(&interfaces.ErrorMessage{
+				errMsg := h.RewriteExecutionErrorResponseForContext(cliCtx, &interfaces.ErrorMessage{
 					StatusCode: http.StatusBadGateway,
 					Error:      errFrame,
 				})

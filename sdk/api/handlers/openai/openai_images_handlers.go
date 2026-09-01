@@ -845,7 +845,7 @@ func (h *OpenAIImagesAPIHandler) handleNonStreamingImagesResponse(c *gin.Context
 		}
 		parsed, err := parseResponsesToImagesResponse(resp, time.Now().Unix())
 		if err != nil {
-			h.WriteErrorResponse(c, h.RewriteExecutionErrorResponse(imageConversionErrorMessage(markChatGPTWebImageProcessingError(err, webImageRoute))))
+			h.WriteErrorResponse(c, h.RewriteExecutionErrorResponseForContext(cliCtx, imageConversionErrorMessage(markChatGPTWebImageProcessingError(err, webImageRoute))))
 			cliCancel(err)
 			return
 		}
@@ -958,7 +958,7 @@ func (h *OpenAIImagesAPIHandler) handleStreamingImagesResponse(c *gin.Context, r
 				}
 				mapper.flush(&firstFrame)
 				if errMapper := mapper.fatalError(); errMapper != nil {
-					h.WriteErrorResponse(c, h.RewriteExecutionErrorResponse(imageConversionErrorMessage(errMapper)))
+					h.WriteErrorResponse(c, h.RewriteExecutionErrorResponseForContext(cliCtx, imageConversionErrorMessage(errMapper)))
 					cliCancel(errMapper)
 					return
 				}
@@ -974,7 +974,7 @@ func (h *OpenAIImagesAPIHandler) handleStreamingImagesResponse(c *gin.Context, r
 			}
 			mapper.writeChunk(&firstFrame, chunk)
 			if errMapper := mapper.fatalError(); errMapper != nil {
-				h.WriteErrorResponse(c, h.RewriteExecutionErrorResponse(imageConversionErrorMessage(errMapper)))
+				h.WriteErrorResponse(c, h.RewriteExecutionErrorResponseForContext(cliCtx, imageConversionErrorMessage(errMapper)))
 				cliCancel(errMapper)
 				return
 			}

@@ -21,6 +21,8 @@ func TestNormalizeErrorResponseRewritesPreservesOrderAndEmptyBody(t *testing.T) 
 	emptyBody := map[string]any{}
 	rules, errNormalize := NormalizeErrorResponseRewrites([]ErrorResponseRewriteRule{
 		{
+			Sources:            []string{" ChatGPT-Web ", "codex", "CHATGPT-WEB"},
+			AuthPriorities:     []int{0, -1, 0},
 			StatusCode:         429,
 			MessageContains:    "  Maximum Context  ",
 			ResponseStatusCode: 400,
@@ -39,6 +41,12 @@ func TestNormalizeErrorResponseRewritesPreservesOrderAndEmptyBody(t *testing.T) 
 	}
 	if rules[0].MessageContains != "Maximum Context" || rules[0].ResponseStatusCode != 400 {
 		t.Fatalf("first rule = %#v", rules[0])
+	}
+	if got := strings.Join(rules[0].Sources, ","); got != "chatgpt-web,codex" {
+		t.Fatalf("normalized sources = %q", got)
+	}
+	if len(rules[0].AuthPriorities) != 2 || rules[0].AuthPriorities[0] != 0 || rules[0].AuthPriorities[1] != -1 {
+		t.Fatalf("normalized auth priorities = %v", rules[0].AuthPriorities)
 	}
 	if rules[1].ResponseBody == nil || len(*rules[1].ResponseBody) != 0 {
 		t.Fatalf("empty response body = %#v, want explicit empty object", rules[1].ResponseBody)
@@ -68,6 +76,7 @@ func TestNormalizeErrorResponseRewritesRejectsInvalidRules(t *testing.T) {
 		{name: "invalid response status", rule: ErrorResponseRewriteRule{StatusCode: 429, ResponseStatusCode: 399}, want: "response-status-code must be between"},
 		{name: "invalid response body", rule: ErrorResponseRewriteRule{StatusCode: 429, ResponseBody: &invalidBody}, want: "response-body must be a JSON object"},
 		{name: "nil response body map", rule: ErrorResponseRewriteRule{StatusCode: 429, ResponseBody: new(map[string]any)}, want: "response-body must be a JSON object"},
+		{name: "invalid source", rule: ErrorResponseRewriteRule{Sources: []string{"chatgpt web"}, StatusCode: 429, ResponseStatusCode: 400}, want: "contains invalid provider ID"},
 		{name: "valid body guard", rule: ErrorResponseRewriteRule{StatusCode: 429, ResponseBody: &validBody}},
 	}
 	for _, testCase := range testCases {
@@ -201,6 +210,8 @@ func TestSaveConfigPreserveCommentsReplacesErrorResponseRewriteFields(t *testing
 		t.Fatalf("LoadConfig() error = %v", errLoad)
 	}
 	cfg.ErrorResponseRewrites = []ErrorResponseRewriteRule{{
+		Sources:            []string{"ChatGPT-Web", "custom-provider"},
+		AuthPriorities:     []int{0, -1},
 		MessageContains:    "new matcher",
 		ResponseStatusCode: 503,
 	}}
@@ -216,7 +227,8 @@ func TestSaveConfigPreserveCommentsReplacesErrorResponseRewriteFields(t *testing
 		t.Fatalf("reloaded rules = %#v, want one", reloaded.ErrorResponseRewrites)
 	}
 	rule := reloaded.ErrorResponseRewrites[0]
-	if rule.StatusCode != 0 || rule.MessageContains != "new matcher" || rule.ResponseStatusCode != 503 || rule.ResponseBody != nil {
+	if rule.StatusCode != 0 || rule.MessageContains != "new matcher" || rule.ResponseStatusCode != 503 || rule.ResponseBody != nil ||
+		strings.Join(rule.Sources, ",") != "chatgpt-web,custom-provider" || len(rule.AuthPriorities) != 2 || rule.AuthPriorities[1] != -1 {
 		t.Fatalf("reloaded rule retained deleted fields: %#v", rule)
 	}
 }

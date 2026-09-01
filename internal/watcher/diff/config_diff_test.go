@@ -94,6 +94,18 @@ func TestBuildConfigChangeDetails_NoChanges(t *testing.T) {
 	}
 }
 
+func TestBuildConfigChangeDetails_ErrorResponseRewriteFilters(t *testing.T) {
+	details := BuildConfigChangeDetails(&config.Config{}, &config.Config{SDKConfig: sdkconfig.SDKConfig{
+		ErrorResponseRewrites: []sdkconfig.ErrorResponseRewriteRule{{
+			Sources:            []string{"chatgpt-web"},
+			AuthPriorities:     []int{-1},
+			StatusCode:         400,
+			ResponseStatusCode: 429,
+		}},
+	}})
+	expectContains(t, details, "error-response-rewrites: updated")
+}
+
 func TestBuildConfigChangeDetails_CodexSessionIdentitySpoof(t *testing.T) {
 	disabled := false
 	details := BuildConfigChangeDetails(&config.Config{}, &config.Config{

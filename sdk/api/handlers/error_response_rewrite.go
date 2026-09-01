@@ -7,7 +7,10 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/interfaces"
+	coreexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
+	"golang.org/x/net/context"
 )
 
 type projectedExecutionError struct {
@@ -69,6 +72,34 @@ func (e *projectedExecutionError) RewrittenResponseBody() []byte {
 // RewriteExecutionErrorResponse applies the first matching final-response rule without
 // feeding the projected status or body back into auth retry, cooldown, or routing decisions.
 func (h *BaseAPIHandler) RewriteExecutionErrorResponse(msg *interfaces.ErrorMessage) *interfaces.ErrorMessage {
+	source := coreexecutor.LocalErrorResponseSource()
+	if msg != nil {
+		if attached, ok := coreexecutor.ErrorResponseSourceOf(msg.Error); ok {
+			source = attached
+		}
+	}
+	return h.rewriteExecutionErrorResponse(msg, source)
+}
+
+// RewriteExecutionErrorResponseForContext applies rewrite filters using request-scoped credential source state.
+func (h *BaseAPIHandler) RewriteExecutionErrorResponseForContext(ctx context.Context, msg *interfaces.ErrorMessage) *interfaces.ErrorMessage {
+	var err error
+	if msg != nil {
+		err = msg.Error
+	}
+	return h.rewriteExecutionErrorResponse(msg, errorResponseSourceForContext(ctx, err))
+}
+
+// RewriteExecutionErrorResponseForGin applies rewrite filters using the current Gin request source state.
+func (h *BaseAPIHandler) RewriteExecutionErrorResponseForGin(c *gin.Context, msg *interfaces.ErrorMessage) *interfaces.ErrorMessage {
+	var err error
+	if msg != nil {
+		err = msg.Error
+	}
+	return h.rewriteExecutionErrorResponse(msg, errorResponseSourceForGin(c, err))
+}
+
+func (h *BaseAPIHandler) rewriteExecutionErrorResponse(msg *interfaces.ErrorMessage, source coreexecutor.ErrorResponseSourceSnapshot) *interfaces.ErrorMessage {
 	if msg == nil || h == nil || h.Cfg == nil || len(h.Cfg.ErrorResponseRewrites) == 0 {
 		return msg
 	}
@@ -92,6 +123,12 @@ func (h *BaseAPIHandler) RewriteExecutionErrorResponse(msg *interfaces.ErrorMess
 			continue
 		}
 		if messageContains != "" && !strings.Contains(lowerText, strings.ToLower(messageContains)) {
+			continue
+		}
+		if !errorResponseRewriteSourceMatches(rule.Sources, source.Provider) {
+			continue
+		}
+		if !errorResponseRewritePriorityMatches(rule.AuthPriorities, source) {
 			continue
 		}
 
@@ -128,6 +165,34 @@ func (h *BaseAPIHandler) RewriteExecutionErrorResponse(msg *interfaces.ErrorMess
 		}
 	}
 	return msg
+}
+
+func errorResponseRewriteSourceMatches(allowed []string, source string) bool {
+	if len(allowed) == 0 {
+		return true
+	}
+	source = strings.ToLower(strings.TrimSpace(source))
+	for _, candidate := range allowed {
+		if strings.EqualFold(strings.TrimSpace(candidate), source) {
+			return true
+		}
+	}
+	return false
+}
+
+func errorResponseRewritePriorityMatches(allowed []int, source coreexecutor.ErrorResponseSourceSnapshot) bool {
+	if len(allowed) == 0 {
+		return true
+	}
+	if !source.HasAuthPriority {
+		return false
+	}
+	for _, candidate := range allowed {
+		if candidate == source.AuthPriority {
+			return true
+		}
+	}
+	return false
 }
 
 // ShouldRemoveRewrittenErrorHeader reports whether a projected response invalidates a header.

@@ -559,7 +559,7 @@ func (h *BaseAPIHandler) ForwardStream(c *gin.Context, flusher http.Flusher, can
 		if status == 0 {
 			status = http.StatusBadGateway
 		}
-		return h.RewriteExecutionErrorResponse(&interfaces.ErrorMessage{
+		return h.RewriteExecutionErrorResponseForGin(c, &interfaces.ErrorMessage{
 			StatusCode: status,
 			Error:      err,
 		})
