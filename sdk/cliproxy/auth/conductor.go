@@ -2574,7 +2574,7 @@ func (m *Manager) executeStreamWithModelPool(ctx, resultCtx context.Context, exe
 			remaining = closedCh
 		}
 		opts.UsageOutcome.AcceptStreamAttempt(usageAttempt)
-		return m.wrapStreamResult(ctx, resultCtx, auth.Clone(), affinityProviders, provider, routeModel, resultModel, wrapOpts, streamResult.Headers, buffered, remaining, aliasResult, onDone), nil
+		return m.wrapStreamResult(attemptCtx, resultCtx, auth.Clone(), affinityProviders, provider, routeModel, resultModel, wrapOpts, streamResult.Headers, buffered, remaining, aliasResult, onDone), nil
 	}
 	if lastErr == nil {
 		lastErr = &Error{Code: "auth_not_found", Message: "no upstream model available"}

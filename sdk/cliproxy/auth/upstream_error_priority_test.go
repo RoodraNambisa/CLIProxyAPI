@@ -42,8 +42,11 @@ func (e *upstreamPriorityExecutor) ExecuteStream(ctx context.Context, auth *Auth
 		if e.streamMode == "nil" {
 			return nil, nil
 		}
-		chunks := make(chan executor.StreamChunk, 1)
-		if e.streamMode == "error-chunk" {
+		chunks := make(chan executor.StreamChunk, 2)
+		if e.streamMode == "late" {
+			chunks <- executor.StreamChunk{Payload: []byte("event: pending\nid: 1\n\n")}
+		}
+		if e.streamMode == "error-chunk" || e.streamMode == "late" {
 			chunks <- executor.StreamChunk{Err: err}
 		}
 		close(chunks)
@@ -91,7 +94,7 @@ func TestManagerPrefersObservedUpstreamErrorOverLaterLocalPreparation(t *testing
 }
 
 func TestManagerKeepsObservedStreamFailureAndHeadersAfterLocalPreparationFailure(t *testing.T) {
-	for _, mode := range []string{"empty", "nil", "error-chunk"} {
+	for _, mode := range []string{"empty", "nil", "error-chunk", "late"} {
 		t.Run(mode, func(t *testing.T) {
 			manager := NewManager(nil, &FillFirstSelector{}, nil)
 			exec := &upstreamPriorityExecutor{schedulerProviderTestExecutor: schedulerProviderTestExecutor{provider: "codex"}, upstream: &Error{HTTPStatus: 503, Message: "upstream failed"}, local: errors.New("local preparation unavailable"), mark: true, streamMode: mode}
@@ -121,10 +124,10 @@ func TestManagerKeepsObservedStreamFailureAndHeadersAfterLocalPreparationFailure
 			if err == nil || errors.Is(err, exec.local) || !executor.IsUpstreamAttemptError(err) || len(exec.attempts) != 1 {
 				t.Fatal("observed stream failure was replaced by local preparation or retried")
 			}
-			if mode == "error-chunk" && !errors.Is(err, exec.upstream) {
+			if (mode == "error-chunk" || mode == "late") && !errors.Is(err, exec.upstream) {
 				t.Fatal("stream bootstrap lost its original cause")
 			}
-			if mode != "error-chunk" && !strings.Contains(err.Error(), "upstream stream") {
+			if (mode == "empty" || mode == "nil") && !strings.Contains(err.Error(), "upstream stream") {
 				t.Fatal("empty stream cause was lost")
 			}
 			if mode != "nil" && headers.Get("Retry-After") != "12" {
