@@ -72,6 +72,26 @@ func TestCodexResponsesLitePreservesImageToolPolicy(t *testing.T) {
 	}
 }
 
+func TestCodexResponsesLiteImageUsageUsesDeclaredModel(t *testing.T) {
+	body := []byte(`{"input":[{"type":"additional_tools","tools":[{"type":"image_generation","model":"gpt-image-1.5"}]}]}`)
+	if codexImageGenerationToolModel(body) != "gpt-image-1.5" {
+		t.Fatal("additional image declaration lost its billing model")
+	}
+	body = []byte(`{"tools":[{"type":"image_generation"}],"input":[{"type":"additional_tools","tools":[{"type":"image_generation","model":"gpt-image-1.5"}]}]}`)
+	if codexImageGenerationToolModel(body) != codexDefaultImageToolModel {
+		t.Fatal("additional declaration overrode the top-level default model")
+	}
+	for _, invalid := range []string{
+		`{"tools":{"type":"image_generation","model":"gpt-image-1.5"}}`,
+		`{"input":{"type":"additional_tools","tools":[{"type":"image_generation","model":"gpt-image-1.5"}]}}`,
+		`{"input":[{"type":"additional_tools","tools":{"type":"image_generation","model":"gpt-image-1.5"}}]}`,
+	} {
+		if codexImageGenerationToolModel([]byte(invalid)) != codexDefaultImageToolModel {
+			t.Fatal("non-array declaration changed the default billing model")
+		}
+	}
+}
+
 func TestCodexResponsesLiteWireTurnsAndHTTPHeaders(t *testing.T) {
 	for _, useWebsocket := range []bool{false, true} {
 		t.Run(fmt.Sprintf("websocket=%t", useWebsocket), func(t *testing.T) {

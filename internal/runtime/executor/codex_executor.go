@@ -2757,8 +2757,18 @@ func codexToolChoiceSelectsImageGeneration(choice gjson.Result) bool {
 }
 
 func codexImageGenerationToolModel(body []byte) string {
-	tools := gjson.GetBytes(body, "tools")
-	if tools.IsArray() {
+	declarations := []gjson.Result{gjson.GetBytes(body, "tools")}
+	if input := gjson.GetBytes(body, "input"); input.IsArray() {
+		for _, item := range input.Array() {
+			if item.Get("type").String() == "additional_tools" {
+				declarations = append(declarations, item.Get("tools"))
+			}
+		}
+	}
+	for _, tools := range declarations {
+		if !tools.IsArray() {
+			continue
+		}
 		for _, tool := range tools.Array() {
 			if tool.Get("type").String() != "image_generation" {
 				continue
@@ -2766,7 +2776,7 @@ func codexImageGenerationToolModel(body []byte) string {
 			if model := strings.TrimSpace(tool.Get("model").String()); model != "" {
 				return model
 			}
-			break
+			return codexDefaultImageToolModel
 		}
 	}
 	return codexDefaultImageToolModel
