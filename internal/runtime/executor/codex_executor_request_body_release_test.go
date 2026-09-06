@@ -277,6 +277,18 @@ func TestSlimCodexOriginalPayloadForTranslationKeepsProviderToolNames(t *testing
 			want: "openai_tool",
 		},
 		{
+			name: "openai custom",
+			from: sdktranslator.FormatOpenAI,
+			body: []byte(`{"tools":[{"type":"custom","custom":{"name":"custom_tool","format":{"definition":"drop"}}}],"messages":[{"content":"drop"}]}`),
+			want: `"custom":{"name":"custom_tool"}`,
+		},
+		{
+			name: "openai flat custom",
+			from: sdktranslator.FormatOpenAI,
+			body: []byte(`{"tools":[{"type":"custom","name":"custom_tool","description":"drop"}],"messages":[{"content":"drop"}]}`),
+			want: `"name":"custom_tool"`,
+		},
+		{
 			name: "claude",
 			from: sdktranslator.FormatClaude,
 			body: []byte(`{"tools":[{"name":"claude_tool","description":"drop"}],"messages":[{"content":"drop"}]}`),

@@ -589,6 +589,18 @@ func slimCodexOpenAITools(tools []gjson.Result) []byte {
 	out := []byte(`{"tools":[]}`)
 	index := 0
 	for _, tool := range tools {
+		if tool.Get("type").String() == "custom" {
+			namePath := "name"
+			if tool.Get("custom").IsObject() {
+				namePath = "custom.name"
+			}
+			if name := tool.Get(namePath).String(); name != "" {
+				entry, _ := sjson.SetBytes([]byte(`{"type":"custom"}`), namePath, name)
+				out, _ = sjson.SetRawBytes(out, fmt.Sprintf("tools.%d", index), entry)
+				index++
+			}
+			continue
+		}
 		name := strings.TrimSpace(tool.Get("function.name").String())
 		if name == "" {
 			continue
