@@ -277,6 +277,7 @@ type executionResult struct {
 	imageSuccessCount       int64
 	imageSuccessModels      []string
 	quotaProjectionOnly     bool
+	availabilityNeutral     bool
 }
 
 func resultForAuth(auth *Auth, provider, model string, success bool) executionResult {
@@ -2319,6 +2320,7 @@ func (m *Manager) wrapStreamResult(ctx, resultCtx context.Context, auth *Auth, a
 					rerr.Code = executionResultErrorCode(chunk.Err)
 					result.Error = rerr
 					result.RetryAfter = retryAfterFromError(chunk.Err)
+					result.availabilityNeutral = isResponsesCompactAvailabilityNeutralError(opts, chunk.Err)
 					m.markExecutionResult(resultCtx, result)
 				}
 			}
@@ -2470,10 +2472,11 @@ func (m *Manager) executeStreamWithModelPool(ctx, resultCtx context.Context, exe
 			rerr.Code = executionResultErrorCode(errStream)
 			result.Error = rerr
 			result.RetryAfter = retryAfterFromError(errStream)
+			result.availabilityNeutral = isResponsesCompactAvailabilityNeutralError(opts, errStream)
 			if !skipAuthResultForError(errStream) && !deferUnauthorizedStreamResult(auth, errStream) {
 				m.markExecutionResult(ctx, result)
 			}
-			if m.isRequestInvalidError(errStream) {
+			if isResponsesCompactRequestFaultError(opts, errStream) || m.isRequestInvalidError(errStream) {
 				return nil, errStream
 			}
 			lastErr = errStream
@@ -2494,7 +2497,7 @@ func (m *Manager) executeStreamWithModelPool(ctx, resultCtx context.Context, exe
 			}
 			bootstrapErr = m.reportProxyFailure(ctx, auth, bootstrapErr)
 			m.projectFailedImageGenerationQuota(ctx, auth, provider, executionResultModelForError(resultModel, bootstrapErr), opts)
-			if m.isRequestInvalidError(bootstrapErr) {
+			if isResponsesCompactRequestFaultError(opts, bootstrapErr) || m.isRequestInvalidError(bootstrapErr) {
 				rerr := &Error{Message: bootstrapErr.Error()}
 				if se, ok := errors.AsType[cliproxyexecutor.StatusError](bootstrapErr); ok && se != nil {
 					rerr.HTTPStatus = se.StatusCode()
@@ -2503,6 +2506,7 @@ func (m *Manager) executeStreamWithModelPool(ctx, resultCtx context.Context, exe
 				rerr.Code = executionResultErrorCode(bootstrapErr)
 				result.Error = rerr
 				result.RetryAfter = retryAfterFromError(bootstrapErr)
+				result.availabilityNeutral = isResponsesCompactAvailabilityNeutralError(opts, bootstrapErr)
 				if !skipAuthResultForError(bootstrapErr) && !deferUnauthorizedStreamResult(auth, bootstrapErr) {
 					m.markExecutionResult(ctx, result)
 				}
@@ -2518,6 +2522,7 @@ func (m *Manager) executeStreamWithModelPool(ctx, resultCtx context.Context, exe
 				rerr.Code = executionResultErrorCode(bootstrapErr)
 				result.Error = rerr
 				result.RetryAfter = retryAfterFromError(bootstrapErr)
+				result.availabilityNeutral = isResponsesCompactAvailabilityNeutralError(opts, bootstrapErr)
 				if !skipAuthResultForError(bootstrapErr) && !deferUnauthorizedStreamResult(auth, bootstrapErr) {
 					m.markExecutionResult(ctx, result)
 				}
@@ -2533,6 +2538,7 @@ func (m *Manager) executeStreamWithModelPool(ctx, resultCtx context.Context, exe
 			rerr.Code = executionResultErrorCode(bootstrapErr)
 			result.Error = rerr
 			result.RetryAfter = retryAfterFromError(bootstrapErr)
+			result.availabilityNeutral = isResponsesCompactAvailabilityNeutralError(opts, bootstrapErr)
 			if !skipAuthResultForError(bootstrapErr) && !deferUnauthorizedStreamResult(auth, bootstrapErr) {
 				m.markExecutionResult(ctx, result)
 			}
@@ -2547,6 +2553,7 @@ func (m *Manager) executeStreamWithModelPool(ctx, resultCtx context.Context, exe
 			emptyErr := &Error{Code: "empty_stream", Message: "upstream stream closed before first payload", Retryable: true}
 			result := resultForAuth(auth, provider, resultModel, false)
 			result.Error = emptyErr
+			result.availabilityNeutral = isResponsesCompactAvailabilityNeutralError(opts, emptyErr)
 			m.markExecutionResult(ctx, result)
 			if idx < len(execModels)-1 && requestBodyReplayable(ctx, replayOpts) {
 				lastErr = emptyErr
@@ -4365,7 +4372,7 @@ func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxye
 			}
 			continue
 		}
-		if strictSessionAffinity || !requestBodyReplayable(ctx, opts) || !shouldRetryRequestRound(errExec, m.currentConfig()) || attempt >= requestRetry {
+		if strictSessionAffinity || !requestBodyReplayable(ctx, opts) || isResponsesCompactRequestFaultError(opts, errExec) || !shouldRetryRequestRound(errExec, m.currentConfig()) || attempt >= requestRetry {
 			break
 		}
 		if wait, shouldWait := retryAfterWaitFromError(errExec, maxWait); shouldWait {
@@ -4537,7 +4544,7 @@ func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cli
 			}
 			continue
 		}
-		if strictSessionAffinity || !requestBodyReplayable(ctx, opts) || !shouldRetryRequestRound(errStream, m.currentConfig()) || attempt >= requestRetry {
+		if strictSessionAffinity || !requestBodyReplayable(ctx, opts) || isResponsesCompactRequestFaultError(opts, errStream) || !shouldRetryRequestRound(errStream, m.currentConfig()) || attempt >= requestRetry {
 			break
 		}
 		if wait, shouldWait := retryAfterWaitFromError(errStream, maxWait); shouldWait {
@@ -5651,6 +5658,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			result := resultForAuth(auth, provider, resultModel, false)
 			result.Error = executionResultError(auth, errExec)
 			result.Error.Code = executionResultErrorCode(errExec)
+			result.availabilityNeutral = isResponsesCompactAvailabilityNeutralError(opts, errExec)
 			if se, ok := errors.AsType[cliproxyexecutor.StatusError](errExec); ok && se != nil {
 				result.Error.HTTPStatus = se.StatusCode()
 			}
@@ -5661,7 +5669,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 				m.markExecutionResult(execCtx, result)
 			}
 			triggerChatGPTWebUnauthorizedRequestRefresh(errExec)
-			if m.isRequestInvalidError(errExec) {
+			if isResponsesCompactRequestFaultError(opts, errExec) || m.isRequestInvalidError(errExec) {
 				return cliproxyexecutor.Response{}, withAuthErrorResponseSource(errExec, auth, provider)
 			}
 			authErr = errExec
@@ -5671,7 +5679,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			continue
 		}
 		if authErr != nil {
-			if m.isRequestInvalidError(authErr) {
+			if isResponsesCompactRequestFaultError(opts, authErr) || m.isRequestInvalidError(authErr) {
 				return cliproxyexecutor.Response{}, withAuthErrorResponseSource(authErr, auth, provider)
 			}
 			if strictSessionAffinity {
@@ -6161,7 +6169,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 				m.markExecutionResult(execCtx, result)
 			}
 			triggerChatGPTWebUnauthorizedRequestRefresh(errStream)
-			if m.isRequestInvalidError(errStream) {
+			if isResponsesCompactRequestFaultError(opts, errStream) || m.isRequestInvalidError(errStream) {
 				return nil, withAuthErrorResponseSource(errStream, auth, provider)
 			}
 			if strictSessionAffinity {
@@ -7646,7 +7654,7 @@ func waitForCooldown(ctx context.Context, wait time.Duration) error {
 
 // MarkResult records an execution result and notifies hooks.
 func (m *Manager) MarkResult(ctx context.Context, result Result) {
-	m.markResult(ctx, result, "", nil, 0, nil, false)
+	m.markResult(ctx, result, "", nil, 0, nil, false, false)
 }
 
 func (m *Manager) markExecutionResult(ctx context.Context, result executionResult) {
@@ -7658,6 +7666,7 @@ func (m *Manager) markExecutionResult(ctx context.Context, result executionResul
 		result.imageSuccessCount,
 		result.imageSuccessModels,
 		result.quotaProjectionOnly,
+		result.availabilityNeutral,
 	)
 }
 
@@ -7669,6 +7678,7 @@ func (m *Manager) markResult(
 	imageSuccessCount int64,
 	imageSuccessModels []string,
 	quotaProjectionOnly bool,
+	availabilityNeutral bool,
 ) {
 	if result.AuthID == "" {
 		return
@@ -7821,8 +7831,8 @@ func (m *Manager) markResult(
 			disableAuthForInvalidGrant(auth, result.Error, now)
 		} else if !result.Success && (auth.Disabled || auth.Status == StatusDisabled) {
 			// Preserve an explicit disabled state against late in-flight results.
-		} else if !result.Success && isCredentialNeutralFailure(result.Error) {
-			// Request faults do not change credential availability.
+		} else if !result.Success && (availabilityNeutral || isCredentialNeutralFailure(result.Error)) {
+			// Request faults and connection lifecycles do not change credential availability.
 		} else if staleDynamicModelResult {
 			// A dynamic catalog refresh already removed this model while the
 			// request was in flight. Keep the result observable to hooks without
