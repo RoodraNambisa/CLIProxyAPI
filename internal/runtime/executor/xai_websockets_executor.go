@@ -88,7 +88,7 @@ func writeCurrentXAIWebsocketMessage(ctx context.Context, auth *cliproxyauth.Aut
 	if (ctx != nil && ctx.Err() != nil) || !xaiAuthExecutionCurrent(auth) {
 		return errXAIWebsocketSessionTerminated
 	}
-	return writeCodexWebsocketMessage(sess, conn, payload)
+	return helps.ObserveUpstreamWebsocketWrite(ctx, writeCodexWebsocketMessage(sess, conn, payload))
 }
 
 type xaiWebsocketIDStateStore struct {
@@ -1125,6 +1125,7 @@ func (e *XAIWebsocketsExecutor) dialXAIWebsocket(ctx context.Context, auth *clip
 		ctx = context.Background()
 	}
 	conn, resp, err := dialer.DialContext(ctx, wsURL, headers)
+	helps.ObserveUpstreamWebsocketDial(ctx, resp, err)
 	if conn != nil {
 		// Avoid gorilla/websocket flate tail validation issues on some upstreams/Go versions.
 		conn.EnableWriteCompression(false)

@@ -41,7 +41,7 @@ func TestXAIWebsocketResponseDoneRestoresOutput(t *testing.T) {
 
 	exec := NewXAIWebsocketsExecutor(&config.Config{})
 	auth := &cliproxyauth.Auth{ID: "xai-done", Provider: "xai", Attributes: map[string]string{"base_url": server.URL, "api_key": "token"}}
-	ctx := cliproxyexecutor.WithDownstreamWebsocket(t.Context())
+	ctx := cliproxyexecutor.WithUpstreamAttempt(cliproxyexecutor.WithDownstreamWebsocket(t.Context()))
 	result, errExecute := exec.executeStream(ctx, auth, xaiStreamRequest(), cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatOpenAIResponse, Stream: true})
 	if errExecute != nil {
 		t.Fatalf("executeStream() error = %v", errExecute)
@@ -57,6 +57,9 @@ func TestXAIWebsocketResponseDoneRestoresOutput(t *testing.T) {
 	}
 	if got := gjson.GetBytes(completed, "response.output.0.content.0.text").String(); got != "hello" {
 		t.Fatalf("completed output text = %q; payload=%s", got, completed)
+	}
+	if !cliproxyexecutor.IsUpstreamAttemptError(cliproxyexecutor.ErrorFromUpstreamAttempt(ctx, errors.New("observed request"))) {
+		t.Fatal("successful WebSocket request did not retain upstream evidence")
 	}
 }
 
@@ -657,7 +660,8 @@ func TestXAIWebsocketRetiredAuthInstanceCannotDial(t *testing.T) {
 		xaiStreamRequest(),
 		{Model: "grok-4.3", Payload: []byte(`{"input":[{"type":"compaction_trigger"}]}`)},
 	} {
-		_, errStream := exec.ExecuteStream(t.Context(), auth, req, cliproxyexecutor.Options{
+		ctx := cliproxyexecutor.WithUpstreamAttempt(t.Context())
+		_, errStream := exec.ExecuteStream(ctx, auth, req, cliproxyexecutor.Options{
 			SourceFormat: sdktranslator.FormatOpenAIResponse,
 			Stream:       true,
 			Metadata: map[string]any{
@@ -667,6 +671,9 @@ func TestXAIWebsocketRetiredAuthInstanceCannotDial(t *testing.T) {
 		})
 		if !errors.Is(errStream, errXAIWebsocketSessionTerminated) {
 			t.Fatalf("ExecuteStream() error = %v, want terminated", errStream)
+		}
+		if cliproxyexecutor.IsUpstreamAttemptError(cliproxyexecutor.ErrorFromUpstreamAttempt(ctx, errStream)) {
+			t.Fatal("retired credential was counted as an upstream attempt")
 		}
 	}
 	if got := requestCount.Load(); got != 0 {
