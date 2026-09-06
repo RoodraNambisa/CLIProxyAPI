@@ -4773,7 +4773,7 @@ func (m *Manager) installPreparedRequestAuthWithRuntimeMetadata(
 		return nil, runtimeAuthInstanceRetiredError()
 	}
 	candidate := updated.Clone()
-	if allowRuntimeMetadataChanges {
+	if allowRuntimeMetadataChanges || strings.EqualFold(strings.TrimSpace(current.Provider), "codex") {
 		carryForwardConcurrentRefreshMetadata(expected, current, updated, candidate)
 	}
 	clearRuntimeProxy(candidate)
@@ -12841,6 +12841,10 @@ func carryForwardConcurrentRefreshRuntimeState(baseline, current, next *Auth) {
 
 func carryForwardConcurrentRefreshMetadata(baseline, current, refreshed, next *Auth) {
 	if baseline == nil || current == nil || refreshed == nil || next == nil {
+		return
+	}
+	if strings.EqualFold(strings.TrimSpace(current.Provider), "codex") {
+		next.Metadata = mergeCodexRefreshMetadata(baseline.Metadata, current.Metadata, refreshed.Metadata)
 		return
 	}
 	baselineCredential, errBaseline := chatgptwebauth.ParseCredential(baseline.Metadata)
