@@ -6,6 +6,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	executorhelps "github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor/helps"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -31,6 +32,7 @@ func readOpenAIJSONRequestBodyWithLimit(c *gin.Context, limit int64) ([]byte, er
 	}
 	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, limit)
 	body, err := c.GetRawData()
+	util.RegisterPromptCacheLogPolicy(c, body)
 	releaseOpenAIRequestBody(c)
 	return body, err
 }

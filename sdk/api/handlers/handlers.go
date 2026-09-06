@@ -800,8 +800,10 @@ type BaseAPIHandler struct {
 	// AuthManager manages auth lifecycle and execution in the new architecture.
 	AuthManager *coreauth.Manager
 
-	// Cfg holds the current application configuration.
-	Cfg *config.SDKConfig
+	// Cfg holds the current application configuration. New request snapshots
+	// should use ConfigSnapshot when racing with UpdateClients.
+	Cfg   *config.SDKConfig
+	cfgMu sync.RWMutex
 }
 
 // NewBaseAPIHandlers creates a new API handlers instance.
@@ -826,7 +828,21 @@ func NewBaseAPIHandlers(cfg *config.SDKConfig, authManager *coreauth.Manager) *B
 // Parameters:
 //   - clients: The new slice of AI service clients
 //   - cfg: The new application configuration
-func (h *BaseAPIHandler) UpdateClients(cfg *config.SDKConfig) { h.Cfg = cfg }
+func (h *BaseAPIHandler) UpdateClients(cfg *config.SDKConfig) {
+	h.cfgMu.Lock()
+	defer h.cfgMu.Unlock()
+	h.Cfg = cfg
+}
+
+// ConfigSnapshot returns the immutable configuration installed for new requests.
+func (h *BaseAPIHandler) ConfigSnapshot() *config.SDKConfig {
+	if h == nil {
+		return nil
+	}
+	h.cfgMu.RLock()
+	defer h.cfgMu.RUnlock()
+	return h.Cfg
+}
 
 // GetAlt extracts the 'alt' parameter from the request query string.
 // It checks both 'alt' and '$alt' parameters and returns the appropriate value.
@@ -1712,8 +1728,19 @@ func (h *BaseAPIHandler) WriteErrorResponse(c *gin.Context, msg *interfaces.Erro
 }
 
 func (h *BaseAPIHandler) LoggingAPIResponseError(ctx context.Context, err *interfaces.ErrorMessage) {
-	if h.Cfg.RequestLog {
-		if ginContext, ok := ctx.Value("gin").(*gin.Context); ok {
+	if ctx == nil {
+		return
+	}
+	if cfg := h.ConfigSnapshot(); cfg != nil && cfg.RequestLog {
+		if ginContext, ok := ctx.Value("gin").(*gin.Context); ok && ginContext != nil {
+			if redactor := util.PromptCacheLogForGin(ginContext); redactor != nil && err != nil {
+				copyError := *err
+				if err.Error != nil {
+					copyError.Error = errors.New(redactor.Redact(err.Error.Error()))
+				}
+				copyError.Addon = redactor.Headers(err.Addon)
+				err = &copyError
+			}
 			if apiResponseErrors, isExist := ginContext.Get("API_RESPONSE_ERROR"); isExist {
 				if slicesAPIResponseError, isOk := apiResponseErrors.([]*interfaces.ErrorMessage); isOk {
 					slicesAPIResponseError = append(slicesAPIResponseError, err)
