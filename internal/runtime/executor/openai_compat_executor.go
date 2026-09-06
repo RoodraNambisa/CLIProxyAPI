@@ -116,7 +116,7 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 		return resp, err
 	}
 	httpReq.ContentLength = int64(bodyReader.Len())
-	originalRef, translatedRef, unregisterBodies := helps.RequestBodyRefs(ctx, opts, opts.OriginalRequest, translated)
+	originalRef, translatedRef, unregisterBodies := helps.RequestBodyRefs(ctx, opts, originalPayload, translated)
 	defer unregisterBodies()
 	defer originalRef.Release()
 	defer translatedRef.Release()
@@ -229,7 +229,7 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 		return nil, err
 	}
 	httpReq.ContentLength = int64(bodyReader.Len())
-	originalRef, translatedRef, unregisterBodies := helps.RequestBodyRefs(ctx, opts, opts.OriginalRequest, translated)
+	originalRef, translatedRef, unregisterBodies := helps.RequestBodyRefs(ctx, opts, originalPayload, translated)
 	cleanupBodies := func() {
 		unregisterBodies()
 		originalRef.Release()
