@@ -1025,11 +1025,11 @@ func (s *SessionAffinitySelector) cachedAuthID(provider, model string, opts clip
 	if primaryID == "" {
 		return ""
 	}
-	if authID, ok := s.cache.GetAndRefresh(provider + "::" + primaryID + "::" + model); ok {
+	if authID, ok := s.cache.GetAndRefresh(provider + "::" + primaryID + "::" + canonicalModelKey(model)); ok {
 		return authID
 	}
 	if fallbackID != "" && fallbackID != primaryID {
-		if authID, ok := s.cache.GetAndRefresh(provider + "::" + fallbackID + "::" + model); ok {
+		if authID, ok := s.cache.GetAndRefresh(provider + "::" + fallbackID + "::" + canonicalModelKey(model)); ok {
 			return authID
 		}
 	}
@@ -1065,7 +1065,7 @@ func (s *SessionAffinitySelector) pickWithFallbackDeferredBinding(ctx context.Co
 		return nil, nil, err
 	}
 
-	cacheKey := provider + "::" + primaryID + "::" + model
+	cacheKey := provider + "::" + primaryID + "::" + canonicalModelKey(model)
 
 	if cachedAuthID, ok := s.cache.GetAndRefresh(cacheKey); ok {
 		for _, auth := range available {
@@ -1094,7 +1094,7 @@ func (s *SessionAffinitySelector) pickWithFallbackDeferredBinding(ctx context.Co
 	}
 
 	if fallbackID != "" && fallbackID != primaryID {
-		fallbackKey := provider + "::" + fallbackID + "::" + model
+		fallbackKey := provider + "::" + fallbackID + "::" + canonicalModelKey(model)
 		if cachedAuthID, ok := s.cache.Get(fallbackKey); ok {
 			for _, auth := range available {
 				if auth.ID == cachedAuthID {
@@ -1135,7 +1135,7 @@ func (s *SessionAffinitySelector) pickWithPreparedFallbackDeferredBinding(ctx co
 		return auth, nil, err
 	}
 
-	cacheKey := provider + "::" + primaryID + "::" + model
+	cacheKey := provider + "::" + primaryID + "::" + canonicalModelKey(model)
 	if cachedAuthID, ok := s.cache.GetAndRefresh(cacheKey); ok {
 		for _, auth := range available {
 			if auth.ID == cachedAuthID {
@@ -1162,7 +1162,7 @@ func (s *SessionAffinitySelector) pickWithPreparedFallbackDeferredBinding(ctx co
 	}
 
 	if fallbackID != "" && fallbackID != primaryID {
-		fallbackKey := provider + "::" + fallbackID + "::" + model
+		fallbackKey := provider + "::" + fallbackID + "::" + canonicalModelKey(model)
 		if cachedAuthID, ok := s.cache.Get(fallbackKey); ok {
 			for _, auth := range available {
 				if auth.ID == cachedAuthID {
@@ -1208,7 +1208,7 @@ func (s *SessionAffinitySelector) BindSessionWithRollback(ctx context.Context, p
 	if primaryID == "" {
 		return nil
 	}
-	cacheKey := provider + "::" + primaryID + "::" + model
+	cacheKey := provider + "::" + primaryID + "::" + canonicalModelKey(model)
 	mutation := s.cache.setWithRollback(cacheKey, authID)
 	entry.Infof("session-affinity: bound on success | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), authID, provider, model)
 	return func() {
