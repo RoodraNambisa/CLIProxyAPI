@@ -2661,36 +2661,48 @@ func disabledImageGenerationToolError(cfg *config.Config) statusErr {
 }
 
 func removeCodexImageGenerationTool(body []byte) []byte {
-	tools := gjson.GetBytes(body, "tools")
-	if !tools.IsArray() {
-		return body
+	paths := []string{"tools"}
+	if input := gjson.GetBytes(body, "input"); input.IsArray() {
+		for index, item := range input.Array() {
+			if item.Get("type").String() == "additional_tools" {
+				paths = append(paths, fmt.Sprintf("input.%d.tools", index))
+			}
+		}
 	}
-	var retained bytes.Buffer
-	retained.WriteByte('[')
-	retainedCount := 0
-	for _, tool := range tools.Array() {
-		toolRaw, keep := removeCodexImageGenerationFromTool(tool)
-		if !keep {
+	for _, path := range paths {
+		tools := gjson.GetBytes(body, path)
+		if !tools.IsArray() {
 			continue
 		}
-		if retainedCount > 0 {
-			retained.WriteByte(',')
+		var retained bytes.Buffer
+		retained.WriteByte('[')
+		retainedCount := 0
+		for _, tool := range tools.Array() {
+			toolRaw, keep := removeCodexImageGenerationFromTool(tool)
+			if !keep {
+				continue
+			}
+			if retainedCount > 0 {
+				retained.WriteByte(',')
+			}
+			retained.Write(toolRaw)
+			retainedCount++
 		}
-		retained.Write(toolRaw)
-		retainedCount++
+		retained.WriteByte(']')
+		if retainedCount == 0 && path == "tools" {
+			body, _ = sjson.DeleteBytes(body, path)
+		} else {
+			body, _ = sjson.SetRawBytes(body, path, retained.Bytes())
+		}
 	}
-	retained.WriteByte(']')
-	if retainedCount == 0 {
-		body, _ = sjson.DeleteBytes(body, "tools")
+	if !helps.HasCodexToolDeclarations(body) {
 		body, _ = sjson.DeleteBytes(body, "tool_choice")
 		body, _ = sjson.DeleteBytes(body, "parallel_tool_calls")
-	} else {
-		body, _ = sjson.SetRawBytes(body, "tools", retained.Bytes())
 	}
 	if codexToolChoiceSelectsImageGeneration(gjson.GetBytes(body, "tool_choice")) {
 		body, _ = sjson.DeleteBytes(body, "tool_choice")
 	}
-	return body
+	return helps.PruneCodexAllowedImageTools(body)
 }
 
 func removeCodexImageGenerationFromTool(tool gjson.Result) ([]byte, bool) {

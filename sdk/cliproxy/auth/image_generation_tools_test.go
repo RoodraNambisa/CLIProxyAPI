@@ -167,3 +167,24 @@ func TestPayloadExplicitlySelectsImageGenerationTool(t *testing.T) {
 		})
 	}
 }
+
+func TestAdditionalImageToolsPreserveSelectionAndArrayBoundaries(t *testing.T) {
+	for _, tc := range []struct {
+		name, payload    string
+		has, may, forced bool
+	}{
+		{"additional required", `{"input":[{"type":"additional_tools","tools":[{"type":"image_generation"}]}],"tool_choice":"required"}`, true, true, true},
+		{"additional none", `{"input":[{"type":"additional_tools","tools":[{"type":"image_generation"}]}],"tool_choice":"none"}`, true, false, false},
+		{"mixed required", `{"tools":[{"type":"function","name":"read"}],"input":[{"type":"additional_tools","tools":[{"type":"image_generation"}]}],"tool_choice":"required"}`, true, true, false},
+		{"invalid root tools", `{"tools":{"type":"image_generation"},"tool_choice":"required"}`, false, false, false},
+		{"invalid additional tools", `{"input":[{"type":"additional_tools","tools":{"type":"image_generation"}}],"tool_choice":"required"}`, false, false, false},
+		{"invalid input object", `{"input":{"type":"additional_tools","tools":[{"type":"image_generation"}]},"tool_choice":"required"}`, false, false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			body := []byte(tc.payload)
+			if PayloadHasImageGenerationTool(body) != tc.has || PayloadMaySelectImageGenerationTool(body) != tc.may || PayloadExplicitlySelectsImageGenerationTool(body) != tc.forced {
+				t.Fatal("additional image selection or declared array boundary changed")
+			}
+		})
+	}
+}

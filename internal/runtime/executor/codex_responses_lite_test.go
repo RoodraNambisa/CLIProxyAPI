@@ -44,6 +44,34 @@ func TestCodexResponsesLitePreparationSnapshotsEachTurn(t *testing.T) {
 	}
 }
 
+func TestCodexResponsesLitePreservesImageToolPolicy(t *testing.T) {
+	for _, action := range []string{"remove", "error"} {
+		cfg := &config.Config{DisabledImageGenerationToolAction: action, AuthModelExclusions: []config.AuthModelExclusionRule{{DisableImageGeneration: true, Priorities: []int{-1}}}}
+		executor := NewCodexExecutor(cfg)
+		auth := &cliproxyauth.Auth{Provider: "codex", Attributes: map[string]string{"priority": "-1"}}
+		body := []byte(`{"input":[{"type":"additional_tools","tools":[{"type":"namespace","name":"image_gen","tools":[{"type":"function","name":"imagegen"},{"type":"function","name":"inspect"}]},{"type":"custom","name":"exec"}]}],"tool_choice":"required"}`)
+		if !cliproxyauth.PayloadHasImageGenerationTool(body) {
+			t.Fatal("image declarations escaped scheduling checks")
+		}
+		got, err := executor.applyDisabledImageGenerationToolPolicy(auth, body)
+		if action == "error" {
+			if err == nil {
+				t.Fatal("Lite image tool bypassed rejection")
+			}
+			continue
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cliproxyauth.PayloadHasImageGenerationTool(got) {
+			t.Fatal("Lite image tool bypassed removal")
+		}
+		if gjson.GetBytes(got, "input.0.tools.0.tools.0.name").String() != "inspect" || gjson.GetBytes(got, "input.0.tools.1.name").String() != "exec" || gjson.GetBytes(got, "tool_choice").String() != "required" {
+			t.Fatal("removal changed unrelated declarations or tool choice")
+		}
+	}
+}
+
 func TestCodexResponsesLiteWireTurnsAndHTTPHeaders(t *testing.T) {
 	for _, useWebsocket := range []bool{false, true} {
 		t.Run(fmt.Sprintf("websocket=%t", useWebsocket), func(t *testing.T) {

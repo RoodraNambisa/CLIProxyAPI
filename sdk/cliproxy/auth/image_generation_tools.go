@@ -11,13 +11,11 @@ func PayloadHasImageGenerationTool(payload []byte) bool {
 	if len(payload) == 0 {
 		return false
 	}
-	tools := gjson.GetBytes(payload, "tools")
-	if !tools.IsArray() {
-		return false
-	}
-	for _, tool := range tools.Array() {
-		if ToolHasImageGeneration(tool) {
-			return true
+	for _, tools := range imageToolDeclarationLists(payload) {
+		for _, tool := range tools.Array() {
+			if ToolHasImageGeneration(tool) {
+				return true
+			}
 		}
 	}
 	return false
@@ -67,9 +65,16 @@ func PayloadExplicitlySelectsImageGenerationTool(payload []byte) bool {
 		!strings.EqualFold(strings.TrimSpace(choice.String()), "required") {
 		return false
 	}
-	tools := gjson.GetBytes(payload, "tools")
-	declared := tools.Array()
-	return len(declared) == 1 && toolForcesImageGeneration(declared[0])
+	count := 0
+	for _, tools := range imageToolDeclarationLists(payload) {
+		for _, tool := range tools.Array() {
+			if !toolForcesImageGeneration(tool) {
+				return false
+			}
+			count++
+		}
+	}
+	return count == 1
 }
 
 func toolChoiceForcesImageGeneration(payload []byte, choice gjson.Result) bool {
@@ -79,14 +84,33 @@ func toolChoiceForcesImageGeneration(payload []byte, choice gjson.Result) bool {
 	if !strings.EqualFold(strings.TrimSpace(choice.Get("name").String()), "image_gen") {
 		return false
 	}
-	for _, tool := range gjson.GetBytes(payload, "tools").Array() {
-		if !strings.EqualFold(strings.TrimSpace(tool.Get("type").String()), "namespace") ||
-			!strings.EqualFold(strings.TrimSpace(tool.Get("name").String()), "image_gen") {
-			continue
+	for _, tools := range imageToolDeclarationLists(payload) {
+		for _, tool := range tools.Array() {
+			if !strings.EqualFold(strings.TrimSpace(tool.Get("type").String()), "namespace") ||
+				!strings.EqualFold(strings.TrimSpace(tool.Get("name").String()), "image_gen") {
+				continue
+			}
+			return toolForcesImageGeneration(tool)
 		}
-		return toolForcesImageGeneration(tool)
 	}
 	return false
+}
+
+func imageToolDeclarationLists(payload []byte) []gjson.Result {
+	var lists []gjson.Result
+	if tools := gjson.GetBytes(payload, "tools"); tools.IsArray() {
+		lists = append(lists, tools)
+	}
+	input := gjson.GetBytes(payload, "input")
+	if !input.IsArray() {
+		return lists
+	}
+	for _, item := range input.Array() {
+		if tools := item.Get("tools"); item.Get("type").String() == "additional_tools" && tools.IsArray() {
+			lists = append(lists, tools)
+		}
+	}
+	return lists
 }
 
 func allowedToolsContainImageGeneration(choice gjson.Result) bool {
