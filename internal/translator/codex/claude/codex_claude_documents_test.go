@@ -29,3 +29,28 @@ func TestClaudeUnsupportedDocumentsKeepLegacyBehavior(t *testing.T) {
 		}
 	}
 }
+
+func TestClaudeStructuredOutputPreservesSchemaAndStrict(t *testing.T) {
+	for _, strict := range []string{"", `,"strict":false`, `,"strict":true`} {
+		body := []byte(`{"messages":[],"thinking":{"type":"adaptive"},"output_config":{"effort":"high","format":{"type":"json_schema","schema":{"type":"object","properties":{"value":{"type":"string"}},"required":["value"],"additionalProperties":false}` + strict + `}}}`)
+		got := ConvertClaudeRequestToCodex("gpt-5.4", body, true)
+		if gjson.GetBytes(got, "text.format.schema").Raw != gjson.GetBytes(body, "output_config.format.schema").Raw {
+			t.Fatal("schema semantics changed")
+		}
+		if gjson.GetBytes(got, "text.format.strict").Bool() != (strict != `,"strict":false`) {
+			t.Fatal("strict default or explicit false was lost")
+		}
+		if gjson.GetBytes(got, "text.format.name").String() != "cli_proxy_structured_output" || gjson.GetBytes(got, "reasoning.effort").String() != "high" {
+			t.Fatal("format or thinking settings changed")
+		}
+	}
+	got := ConvertClaudeRequestToCodex("gpt-5.4", []byte(`{"output_config":{"format":{"type":"json_schema","name":"explicit","strict":false,"schema":{}}}}`), false)
+	if gjson.GetBytes(got, "text.format.name").String() != "explicit" {
+		t.Fatal("explicit schema name was replaced")
+	}
+	for _, body := range []string{`{}`, `{"output_config":{"format":{"type":"text"}}}`, `{"output_config":{"format":{"type":"json_schema","schema":[]}}}`} {
+		if got := ConvertClaudeRequestToCodex("gpt-5.4", []byte(body), false); gjson.GetBytes(got, "text.format").Exists() {
+			t.Fatal("added schema for an unsupported format")
+		}
+	}
+}

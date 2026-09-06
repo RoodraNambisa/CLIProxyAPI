@@ -331,6 +331,18 @@ func ConvertClaudeRequestToCodex(modelName string, inputRawJSON []byte, _ bool) 
 	template, _ = sjson.SetBytes(template, "stream", true)
 	template, _ = sjson.SetBytes(template, "store", false)
 	template, _ = sjson.SetBytes(template, "include", []string{"reasoning.encrypted_content"})
+	// Structured output is independent of the canonical thinking configuration.
+	if format := rootResult.Get("output_config.format"); format.IsObject() && format.Get("type").String() == "json_schema" && format.Get("schema").IsObject() {
+		name := format.Get("name").String()
+		if name == "" {
+			name = "cli_proxy_structured_output"
+		}
+		translated := []byte(`{"type":"json_schema","name":"","strict":true,"schema":{}}`)
+		translated, _ = sjson.SetBytes(translated, "name", name)
+		translated, _ = sjson.SetBytes(translated, "strict", format.Get("strict").Type != gjson.False)
+		translated, _ = sjson.SetRawBytes(translated, "schema", []byte(format.Get("schema").Raw))
+		template, _ = sjson.SetRawBytes(template, "text.format", translated)
+	}
 
 	return template
 }
