@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"hash/fnv"
@@ -1229,12 +1230,14 @@ func selectorLogEntry(ctx context.Context) *log.Entry {
 	return log.NewEntry(log.StandardLogger())
 }
 
-// truncateSessionID shortens session ID for logging (first 8 chars + "...")
+// truncateSessionID returns a stable diagnostic digest. A session identity can
+// equal the caller's cache key, including short values that truncation exposed.
 func truncateSessionID(id string) string {
-	if len(id) <= 20 {
-		return id
+	if id == "" {
+		return ""
 	}
-	return id[:8] + "..."
+	digest := sha256.Sum256([]byte(id))
+	return fmt.Sprintf("sha256:%x", digest[:8])
 }
 
 // Stop releases resources held by the selector.
