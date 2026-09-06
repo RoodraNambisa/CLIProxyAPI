@@ -1,10 +1,13 @@
 package auth
 
 import (
+	"context"
 	"errors"
+	"io"
 	"net/http"
 	"strings"
 
+	"github.com/gorilla/websocket"
 	"github.com/tidwall/gjson"
 )
 
@@ -112,9 +115,36 @@ func matchesKnownRequestFault(err error, policyOnly bool) bool {
 	return false
 }
 
+// isConnectionLifecycleFailure never infers credential health from a response
+// carrying an HTTP status. Disconnects remain distinct from non-retryable input.
+func isConnectionLifecycleFailure(err error) bool {
+	if err == nil || statusCodeFromError(err) != 0 {
+		return false
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return true
+	}
+	var closeErr *websocket.CloseError
+	if errors.As(err, &closeErr) && closeErr != nil {
+		return closeErr.Code == websocket.CloseNormalClosure || closeErr.Code == websocket.CloseGoingAway || closeErr.Code == websocket.CloseAbnormalClosure
+	}
+	message := strings.ToLower(strings.TrimSpace(err.Error()))
+	switch message {
+	case "context canceled", "context deadline exceeded", "eof", "unexpected eof":
+		return true
+	}
+	for _, prefix := range []string{"websocket: close 1000 ", "websocket: close 1001 ", "websocket: close 1006 "} {
+		if strings.Contains(message, prefix) {
+			return true
+		}
+	}
+	return strings.HasSuffix(message, ": unexpected eof") || strings.HasSuffix(message, ": eof") ||
+		strings.HasSuffix(message, ": context canceled") || strings.HasSuffix(message, ": context deadline exceeded")
+}
+
 func isCredentialNeutralFailure(err *Error) bool {
 	if err == nil || err.HTTPStatus == http.StatusPaymentRequired || err.HTTPStatus == http.StatusTooManyRequests || isInvalidGrantResultError(err) {
 		return false
 	}
-	return isKnownRequestFault(err) || isRequestScopedNotFoundResultError(err)
+	return isKnownRequestFault(err) || isConnectionLifecycleFailure(err) || isRequestScopedNotFoundResultError(err)
 }

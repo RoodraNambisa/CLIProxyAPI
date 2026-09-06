@@ -4,9 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
+	"reflect"
 	"testing"
 
+	"github.com/gorilla/websocket"
 	internalconfig "github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 )
@@ -118,6 +121,35 @@ func TestManagerRequestFaultDoesNotTriggerUnauthorizedRefresh(t *testing.T) {
 	}
 	if deferUnauthorizedStreamResult(auth, err) {
 		t.Fatal("request fault deferred stream result for a credential refresh")
+	}
+}
+
+func TestManagerConnectionLifecycleDoesNotCoolOrStopFallback(t *testing.T) {
+	for _, err := range []error{context.Canceled, context.DeadlineExceeded, io.EOF, io.ErrUnexpectedEOF,
+		&websocket.CloseError{Code: 1000}, &websocket.CloseError{Code: 1001}, &websocket.CloseError{Code: 1006},
+	} {
+		t.Run(err.Error(), func(t *testing.T) {
+			manager, executor := newCredentialRetryLimitTestManagerWithAuthCount(t, 0, 1)
+			auth := manager.List()[0]
+			before := auth.Clone()
+			resultError := executionResultError(auth, fmt.Errorf("transport: %w", err))
+			manager.MarkResult(t.Context(), Result{AuthID: auth.ID, Provider: auth.Provider, Model: "test-model", Error: resultError})
+			after, _ := manager.GetByID(auth.ID)
+			if before.Unavailable != after.Unavailable || before.NextRetryAfter != after.NextRetryAfter || !reflect.DeepEqual(before.ModelStates, after.ModelStates) {
+				t.Fatal("lifecycle error changed availability")
+			}
+			if isRequestInvalidErrorWithConfig(err, nil) {
+				t.Fatal("lifecycle error was treated as invalid input")
+			}
+			if executor.Calls() != 0 {
+				t.Fatal("marking a result executed a request")
+			}
+		})
+	}
+	for _, status := range []int{http.StatusUnauthorized, http.StatusTooManyRequests, http.StatusServiceUnavailable} {
+		if isConnectionLifecycleFailure(&Error{HTTPStatus: status, Message: "unexpected EOF"}) {
+			t.Fatal("status-bearing upstream failure was hidden by its message")
+		}
 	}
 }
 
