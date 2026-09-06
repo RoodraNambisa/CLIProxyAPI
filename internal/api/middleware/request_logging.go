@@ -155,12 +155,13 @@ func captureRequestInfo(c *gin.Context, captureBody bool, releaseCfg config.Requ
 	}
 
 	requestInfo := &RequestInfo{
-		URL:       url,
-		Method:    method,
-		Headers:   headers,
-		Body:      body,
-		RequestID: logging.GetGinRequestID(c),
-		Timestamp: time.Now(),
+		cacheLogRedactor: util.RegisterPromptCacheLogPolicy(c, body),
+		URL:              url,
+		Method:           method,
+		Headers:          headers,
+		Body:             body,
+		RequestID:        logging.GetGinRequestID(c),
+		Timestamp:        time.Now(),
 		StreamHint: bytes.Contains(body, []byte(`"stream": true`)) ||
 			bytes.Contains(body, []byte(`"stream":true`)),
 	}

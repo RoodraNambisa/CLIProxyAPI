@@ -5,6 +5,7 @@ package middleware
 
 import (
 	"bytes"
+	"errors"
 	"net/http"
 	"strings"
 	"sync"
@@ -13,6 +14,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 )
 
@@ -23,6 +25,7 @@ const requestLogContextMutexKey = "REQUEST_LOG_CONTEXT_MUTEX"
 
 // RequestInfo holds essential details of an incoming HTTP request for logging purposes.
 type RequestInfo struct {
+	cacheLogRedactor  *util.PromptCacheLogRedactor
 	mu                sync.RWMutex
 	releaseMu         sync.Mutex
 	releaseGeneration uint64
@@ -42,7 +45,30 @@ func (r *RequestInfo) BodyBytes() []byte {
 	}
 	r.mu.RLock()
 	defer r.mu.RUnlock()
+	if r.cacheLogRedactor != nil {
+		return []byte(r.cacheLogRedactor.Redact(string(r.Body)))
+	}
 	return bytes.Clone(r.Body)
+}
+
+func (r *RequestInfo) logRedactor() *util.PromptCacheLogRedactor {
+	if r == nil {
+		return nil
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.cacheLogRedactor
+}
+
+func (w *ResponseWriterWrapper) SetPromptCacheLogRedactor(redactor *util.PromptCacheLogRedactor) {
+	if w == nil || w.requestInfo == nil || redactor == nil {
+		return
+	}
+	w.requestInfo.mu.Lock()
+	defer w.requestInfo.mu.Unlock()
+	if w.requestInfo.cacheLogRedactor == nil {
+		w.requestInfo.cacheLogRedactor = redactor
+	}
 }
 
 func (r *RequestInfo) SetBody(body []byte) {
@@ -236,7 +262,7 @@ func (w *ResponseWriterWrapper) WriteHeader(statusCode int) {
 		streamWriter, err := w.logger.LogStreamingRequest(
 			w.requestInfo.URL,
 			w.requestInfo.Method,
-			w.requestInfo.Headers,
+			w.requestInfo.logRedactor().Headers(w.requestInfo.Headers),
 			w.requestInfo.BodyBytes(),
 			w.requestInfo.RequestID,
 		)
@@ -250,7 +276,7 @@ func (w *ResponseWriterWrapper) WriteHeader(statusCode int) {
 			go w.processStreamingChunks(doneChan)
 
 			// Write status immediately
-			_ = streamWriter.WriteStatus(statusCode, w.headers)
+			_ = streamWriter.WriteStatus(statusCode, w.requestInfo.logRedactor().Headers(w.headers))
 		}
 	}
 
@@ -319,8 +345,14 @@ func (w *ResponseWriterWrapper) processStreamingChunks(done chan struct{}) {
 		return
 	}
 
+	redactor := w.requestInfo.logRedactor().Stream()
 	for chunk := range w.chunkChannel {
-		w.streamWriter.WriteChunkAsync(chunk)
+		if masked := redactor.Write(chunk, false); len(masked) > 0 {
+			w.streamWriter.WriteChunkAsync(masked)
+		}
+	}
+	if tail := redactor.Write(nil, true); len(tail) > 0 {
+		w.streamWriter.WriteChunkAsync(tail)
 	}
 }
 
@@ -359,28 +391,30 @@ func (w *ResponseWriterWrapper) Finalize(c *gin.Context) error {
 	if w.isStreaming && w.streamWriter != nil {
 		if w.chunkChannel != nil {
 			close(w.chunkChannel)
-			w.chunkChannel = nil
 		}
 
 		if w.streamDone != nil {
 			<-w.streamDone
 			w.streamDone = nil
 		}
+		// The processor reads this channel when it starts. Keep it installed
+		// until the goroutine has drained and exited, including very short streams.
+		w.chunkChannel = nil
 
 		w.streamWriter.SetFirstChunkTimestamp(w.firstChunkTimestamp)
 
 		// Write API Request and Response to the streaming log before closing
 		apiRequest := w.extractAPIRequest(c)
 		if len(apiRequest) > 0 {
-			_ = w.streamWriter.WriteAPIRequest(apiRequest)
+			_ = w.streamWriter.WriteAPIRequest([]byte(w.requestInfo.logRedactor().Redact(string(apiRequest))))
 		}
 		apiResponse := w.extractAPIResponse(c)
 		if len(apiResponse) > 0 {
-			_ = w.streamWriter.WriteAPIResponse(apiResponse)
+			_ = w.streamWriter.WriteAPIResponse([]byte(w.requestInfo.logRedactor().Redact(string(apiResponse))))
 		}
 		apiWebsocketTimeline := w.extractAPIWebsocketTimeline(c)
 		if len(apiWebsocketTimeline) > 0 {
-			_ = w.streamWriter.WriteAPIWebsocketTimeline(apiWebsocketTimeline)
+			_ = w.streamWriter.WriteAPIWebsocketTimeline([]byte(w.requestInfo.logRedactor().Redact(string(apiWebsocketTimeline))))
 		}
 		if err := w.streamWriter.Close(); err != nil {
 			w.streamWriter = nil
@@ -535,6 +569,28 @@ func (w *ResponseWriterWrapper) logRequest(requestBody []byte, statusCode int, h
 	if w.requestInfo == nil {
 		return nil
 	}
+	redactor := w.requestInfo.logRedactor()
+	requestHeaders := w.requestInfo.Headers
+	if redactor != nil {
+		requestHeaders = redactor.Headers(requestHeaders)
+		headers = redactor.Headers(headers)
+		for _, data := range []*[]byte{&requestBody, &body, &websocketTimeline, &apiRequestBody, &apiResponseBody, &apiWebsocketTimeline} {
+			*data = []byte(redactor.Redact(string(*data)))
+		}
+		maskedErrors := make([]*interfaces.ErrorMessage, len(apiResponseErrors))
+		for i, original := range apiResponseErrors {
+			if original == nil {
+				continue
+			}
+			copyError := *original
+			if original.Error != nil {
+				copyError.Error = errors.New(redactor.Redact(original.Error.Error()))
+			}
+			copyError.Addon = redactor.Headers(original.Addon)
+			maskedErrors[i] = &copyError
+		}
+		apiResponseErrors = maskedErrors
+	}
 
 	if loggerWithOptions, ok := w.logger.(interface {
 		LogRequestWithOptions(string, string, map[string][]string, []byte, int, map[string][]string, []byte, []byte, []byte, []byte, []byte, []*interfaces.ErrorMessage, bool, string, time.Time, time.Time) error
@@ -542,7 +598,7 @@ func (w *ResponseWriterWrapper) logRequest(requestBody []byte, statusCode int, h
 		return loggerWithOptions.LogRequestWithOptions(
 			w.requestInfo.URL,
 			w.requestInfo.Method,
-			w.requestInfo.Headers,
+			requestHeaders,
 			requestBody,
 			statusCode,
 			headers,
@@ -562,7 +618,7 @@ func (w *ResponseWriterWrapper) logRequest(requestBody []byte, statusCode int, h
 	return w.logger.LogRequest(
 		w.requestInfo.URL,
 		w.requestInfo.Method,
-		w.requestInfo.Headers,
+		requestHeaders,
 		requestBody,
 		statusCode,
 		headers,
