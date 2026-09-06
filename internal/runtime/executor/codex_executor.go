@@ -320,6 +320,7 @@ func NewCodexExecutor(cfg *config.Config) *CodexExecutor { return &CodexExecutor
 func (e *CodexExecutor) Identifier() string { return "codex" }
 
 type codexPreparedSessionIdentity struct {
+	PromptCacheLog *util.PromptCacheLogRedactor
 	PromptCacheKey helps.CodexPromptCacheKeySnapshot
 	ResponsesLite  helps.CodexResponsesLiteSnapshot
 	Enabled        bool
@@ -360,6 +361,7 @@ func (e *CodexExecutor) PrepareProviderRequest(ctx context.Context, req cliproxy
 		liteHeaders.Set(helps.CodexResponsesLiteHeader, value)
 	}
 	prepared := codexPreparedSessionIdentity{
+		PromptCacheLog: helps.SnapshotCodexPromptCacheLog(ctx, payload),
 		PromptCacheKey: helps.SnapshotCodexPromptCacheKey(payload, e.cfg != nil && e.cfg.Codex.PassthroughPromptCacheKey),
 		ResponsesLite:  helps.SnapshotCodexResponsesLite(payload, liteHeaders, cliproxyexecutor.DownstreamWebsocket(ctx)),
 		Enabled:        codexSpoofSessionIdentityEnabled(e.cfg),
@@ -755,6 +757,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	if err != nil {
 		return resp, err
 	}
+	ctx = helps.WithCodexPromptCacheLogRedaction(ctx, e.codexPreparedSessionIdentity(ctx, req, opts).PromptCacheLog)
 	if isCodexOpenAIImageRequest(opts) {
 		return e.executeOpenAIImage(ctx, auth, req, opts)
 	}
@@ -866,7 +869,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 		upstreamBody := applyCodexIdentityConfuseResponsePayload(b, identityState)
 		upstreamBody = codexauth.SanitizeAgentIdentityErrorBody(authMetadata(auth), upstreamBody)
 		helps.AppendAPIResponseChunk(ctx, e.cfg, upstreamBody)
-		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), upstreamBody))
+		helps.DebugCodexResponseError(ctx, httpResp.StatusCode, httpResp.Header.Get("Content-Type"), upstreamBody)
 		clientBody := applyCodexIdentityExposeResponsePayload(upstreamBody, identityState)
 		helps.ClearCodexReasoningReplayOnInvalidSignature(replayScope, httpResp.StatusCode, clientBody)
 		err = newCodexStatusErr(httpResp.StatusCode, clientBody)
@@ -1057,7 +1060,7 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 		upstreamBody := applyCodexIdentityConfuseResponsePayload(b, identityState)
 		upstreamBody = codexauth.SanitizeAgentIdentityErrorBody(authMetadata(auth), upstreamBody)
 		helps.AppendAPIResponseChunk(ctx, e.cfg, upstreamBody)
-		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), upstreamBody))
+		helps.DebugCodexResponseError(ctx, httpResp.StatusCode, httpResp.Header.Get("Content-Type"), upstreamBody)
 		clientBody := applyCodexIdentityExposeResponsePayload(upstreamBody, identityState)
 		err = newCodexStatusErr(httpResp.StatusCode, clientBody)
 		return resp, err
@@ -1084,6 +1087,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	if err != nil {
 		return nil, err
 	}
+	ctx = helps.WithCodexPromptCacheLogRedaction(ctx, e.codexPreparedSessionIdentity(ctx, req, opts).PromptCacheLog)
 	if isCodexOpenAIImageRequest(opts) {
 		return e.executeOpenAIImageStream(ctx, auth, req, opts)
 	}
@@ -1204,7 +1208,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 		upstreamBody := applyCodexIdentityConfuseResponsePayload(data, identityState)
 		upstreamBody = codexauth.SanitizeAgentIdentityErrorBody(authMetadata(auth), upstreamBody)
 		helps.AppendAPIResponseChunk(ctx, e.cfg, upstreamBody)
-		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), upstreamBody))
+		helps.DebugCodexResponseError(ctx, httpResp.StatusCode, httpResp.Header.Get("Content-Type"), upstreamBody)
 		clientBody := applyCodexIdentityExposeResponsePayload(upstreamBody, identityState)
 		helps.ClearCodexReasoningReplayOnInvalidSignature(replayScope, httpResp.StatusCode, clientBody)
 		err = newCodexStatusErr(httpResp.StatusCode, clientBody)

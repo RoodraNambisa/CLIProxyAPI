@@ -155,7 +155,7 @@ func (e *CodexExecutor) executeOpenAIImage(ctx context.Context, auth *cliproxyau
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
 		upstreamData = codexauth.SanitizeAgentIdentityErrorBody(authMetadata(auth), upstreamData)
 		helps.AppendAPIResponseChunk(ctx, e.cfg, upstreamData)
-		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), upstreamData))
+		helps.DebugCodexResponseError(ctx, httpResp.StatusCode, httpResp.Header.Get("Content-Type"), upstreamData)
 		clientBody := applyCodexIdentityExposeResponsePayload(upstreamData, identityState)
 		err = newCodexStatusErr(httpResp.StatusCode, clientBody)
 		return resp, err
@@ -228,7 +228,7 @@ func (e *CodexExecutor) executeOpenAIImageStream(ctx context.Context, auth *clip
 		upstreamBody := applyCodexIdentityConfuseResponsePayload(data, identityState)
 		upstreamBody = codexauth.SanitizeAgentIdentityErrorBody(authMetadata(auth), upstreamBody)
 		helps.AppendAPIResponseChunk(ctx, e.cfg, upstreamBody)
-		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), upstreamBody))
+		helps.DebugCodexResponseError(ctx, httpResp.StatusCode, httpResp.Header.Get("Content-Type"), upstreamBody)
 		clientBody := applyCodexIdentityExposeResponsePayload(upstreamBody, identityState)
 		err = newCodexStatusErr(httpResp.StatusCode, clientBody)
 		return nil, err

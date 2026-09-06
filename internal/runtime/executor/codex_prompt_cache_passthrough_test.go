@@ -203,6 +203,9 @@ func TestCodexPromptCachePassthroughSnapshotSurvivesReleaseAndReplacement(t *tes
 		replacement.Codex.PassthroughPromptCacheKey = !initiallyEnabled
 		executor = NewCodexExecutor(&replacement)
 		prepared := executor.codexPreparedSessionIdentity(t.Context(), req, opts)
+		if prepared.PromptCacheLog == nil || !prepared.PromptCacheLog.ProtectsKey("original") {
+			t.Fatal("request release lost log protection independently of the passthrough setting")
+		}
 		upstream, state := applyCodexPreparedIdentityConfuseBody(&replacement, &cliproxyauth.Auth{ID: "retry-auth"}, nil, []byte(`{"prompt_cache_key":"generated"}`), prepared)
 		want := "generated"
 		if initiallyEnabled {

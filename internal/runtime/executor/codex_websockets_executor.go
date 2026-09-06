@@ -231,6 +231,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 	if err != nil {
 		return resp, err
 	}
+	ctx = helps.WithCodexPromptCacheLogRedaction(ctx, e.codexPreparedSessionIdentity(ctx, req, opts).PromptCacheLog)
 	if opts.Alt == "responses/compact" {
 		return e.CodexExecutor.executeCompact(ctx, auth, req, opts)
 	}
@@ -534,6 +535,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 	if err != nil {
 		return nil, err
 	}
+	ctx = helps.WithCodexPromptCacheLogRedaction(ctx, e.codexPreparedSessionIdentity(ctx, req, opts).PromptCacheLog)
 	if opts.Alt == "responses/compact" {
 		return nil, statusErr{code: http.StatusBadRequest, msg: "streaming not supported for /responses/compact"}
 	}

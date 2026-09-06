@@ -70,10 +70,11 @@ func RecordAPIRequest(ctx context.Context, cfg *config.Config, info UpstreamRequ
 	attempts := getAttempts(ginCtx)
 	index := len(attempts) + 1
 
-	prefix := formatAPIRequestPrefix(index, info)
+	info.Headers = CodexPromptCacheLogRedactor(ctx).Headers(info.Headers)
+	prefix := redactCodexPromptCacheLog(ctx, formatAPIRequestPrefix(index, info))
 	bodyText := "<empty>"
 	if len(info.Body) > 0 {
-		bodyText = string(info.Body)
+		bodyText = redactCodexPromptCacheLog(ctx, string(info.Body))
 	}
 
 	attempt := &upstreamAttempt{
@@ -117,7 +118,7 @@ func RecordAPIResponseMetadata(ctx context.Context, cfg *config.Config, status i
 	}
 	if !attempt.headersWritten {
 		attempt.response.WriteString("Headers:\n")
-		writeHeaders(attempt.response, headers)
+		writeHeadersWithCodexCacheRedaction(ctx, attempt.response, headers)
 		attempt.headersWritten = true
 		attempt.response.WriteString("\n")
 	}
@@ -147,7 +148,7 @@ func RecordAPIResponseError(ctx context.Context, cfg *config.Config, err error) 
 	if attempt.errorWritten {
 		attempt.response.WriteString("\n")
 	}
-	attempt.response.WriteString(fmt.Sprintf("Error: %s\n", err.Error()))
+	attempt.response.WriteString(fmt.Sprintf("Error: %s\n", redactCodexPromptCacheLog(ctx, err.Error())))
 	attempt.errorWritten = true
 
 	updateAggregatedResponse(ginCtx, attempts)
@@ -191,7 +192,7 @@ func AppendAPIResponseChunk(ctx context.Context, cfg *config.Config, chunk []byt
 		}
 		attempt.response.WriteString(separator)
 	}
-	attempt.response.WriteString(string(data))
+	attempt.response.WriteString(redactCodexPromptCacheLog(ctx, string(data)))
 	attempt.bodyHasContent = true
 	attempt.prevWasSSEEvent = currentChunkIsSSEEvent
 
@@ -208,11 +209,12 @@ func RecordAPIWebsocketRequest(ctx context.Context, cfg *config.Config, info Ups
 		return
 	}
 
-	prefix := formatAPIWebsocketRequestPrefix(info)
+	info.Headers = CodexPromptCacheLogRedactor(ctx).Headers(info.Headers)
+	prefix := redactCodexPromptCacheLog(ctx, formatAPIWebsocketRequestPrefix(info))
 	builder := &strings.Builder{}
 	builder.WriteString(prefix)
 	if len(info.Body) > 0 {
-		builder.Write(info.Body)
+		builder.WriteString(redactCodexPromptCacheLog(ctx, string(info.Body)))
 	} else {
 		builder.WriteString("<empty>")
 	}
@@ -243,7 +245,7 @@ func RecordAPIWebsocketHandshake(ctx context.Context, cfg *config.Config, status
 		builder.WriteString(fmt.Sprintf("Status: %d\n", status))
 	}
 	builder.WriteString("Headers:\n")
-	writeHeaders(builder, headers)
+	writeHeadersWithCodexCacheRedaction(ctx, builder, headers)
 	builder.WriteString("\n")
 
 	appendAPIWebsocketTimeline(ginCtx, []byte(builder.String()))
@@ -301,7 +303,7 @@ func AppendAPIWebsocketResponse(ctx context.Context, cfg *config.Config, payload
 	builder := &strings.Builder{}
 	builder.WriteString(fmt.Sprintf("Timestamp: %s\n", time.Now().Format(time.RFC3339Nano)))
 	builder.WriteString("Event: api.websocket.response\n")
-	builder.Write(data)
+	builder.WriteString(redactCodexPromptCacheLog(ctx, string(data)))
 	builder.WriteString("\n")
 
 	appendAPIWebsocketTimeline(ginCtx, []byte(builder.String()))
@@ -324,7 +326,7 @@ func RecordAPIWebsocketError(ctx context.Context, cfg *config.Config, stage stri
 	if trimmed := strings.TrimSpace(stage); trimmed != "" {
 		builder.WriteString(fmt.Sprintf("Stage: %s\n", trimmed))
 	}
-	builder.WriteString(fmt.Sprintf("Error: %s\n", err.Error()))
+	builder.WriteString(fmt.Sprintf("Error: %s\n", redactCodexPromptCacheLog(ctx, err.Error())))
 
 	appendAPIWebsocketTimeline(ginCtx, []byte(builder.String()))
 }
