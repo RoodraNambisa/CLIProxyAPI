@@ -114,11 +114,13 @@ type providerScheduler struct {
 
 // scheduledAuthMeta stores the immutable scheduling fields derived from an auth snapshot.
 type scheduledAuthMeta struct {
-	auth              *Auth
-	providerKey       string
-	priority          int
-	websocketEnabled  bool
-	supportedModelSet map[string]struct{}
+	auth                 *Auth
+	providerKey          string
+	priority             int
+	websocketEnabled     bool
+	supportedModelSet    map[string]struct{}
+	accessTokenExpiresAt time.Time
+	hasAccessTokenExpiry bool
 }
 
 // modelScheduler tracks ready and blocked auths for one provider/model combination.
@@ -1415,12 +1417,15 @@ func buildScheduledAuthMeta(auth *Auth) *scheduledAuthMeta {
 
 func buildScheduledAuthMetaWithSupportedModels(auth *Auth, supportedModelSet map[string]struct{}) *scheduledAuthMeta {
 	providerKey := strings.ToLower(strings.TrimSpace(auth.Provider))
+	expires, hasExpiry := codexAccessTokenExpiration(auth)
 	return &scheduledAuthMeta{
-		auth:              auth,
-		providerKey:       providerKey,
-		priority:          authPriority(auth),
-		websocketEnabled:  authWebsocketsEnabled(auth),
-		supportedModelSet: supportedModelSet,
+		auth:                 auth,
+		providerKey:          providerKey,
+		priority:             authPriority(auth),
+		websocketEnabled:     authWebsocketsEnabled(auth),
+		supportedModelSet:    supportedModelSet,
+		accessTokenExpiresAt: expires,
+		hasAccessTokenExpiry: hasExpiry,
 	}
 }
 
@@ -1592,12 +1597,22 @@ func (m *modelScheduler) removeEntryLocked(authID string) {
 	m.rebuildIndexesLocked()
 }
 
-// promoteExpiredLocked reevaluates blocked auths whose retry time has elapsed.
+// promoteExpiredLocked reevaluates cooldowns and expires ready Codex tokens.
 func (m *modelScheduler) promoteExpiredLocked(now time.Time) {
-	if m == nil || len(m.blocked) == 0 {
+	if m == nil {
 		return
 	}
 	changed := false
+	for _, entry := range m.entries {
+		if entry == nil || entry.meta == nil || entry.state != scheduledStateReady || !entry.meta.hasAccessTokenExpiry {
+			continue
+		}
+		if !entry.meta.accessTokenExpiresAt.After(now) {
+			entry.state = scheduledStateBlocked
+			entry.nextRetryAt = time.Time{}
+			changed = true
+		}
+	}
 	for _, entry := range m.blocked {
 		if entry == nil || entry.auth == nil {
 			continue
