@@ -32,6 +32,7 @@ type CodexSessionIdentityHeaderSource struct {
 // CodexSessionIdentityProjection controls forced per-credential identity while
 // preserving the existing fill-missing behavior for ordinary session spoofing.
 type CodexSessionIdentityProjection struct {
+	ProtectedPromptCacheKey   string
 	InstallationID            string
 	ForcedIdentity            CodexSessionIdentity
 	ProjectSession            bool
@@ -267,7 +268,7 @@ func rebuildCodexSessionIdentityPayload(
 }
 
 func shouldRewriteCodexPromptCacheAlias(value string, projection CodexSessionIdentityProjection) bool {
-	return projection.PromptCacheKeyAlias != "" &&
+	return projection.ProtectedPromptCacheKey == "" && projection.PromptCacheKeyAlias != "" &&
 		projection.PromptCacheKeyReplacement != "" &&
 		value == projection.PromptCacheKeyAlias
 }
