@@ -2299,6 +2299,7 @@ func (m *Manager) wrapStreamResult(ctx, resultCtx context.Context, auth *Auth, a
 					chunk.Err = runtimeAuthInstanceRetiredError()
 				} else {
 					chunk.Err = m.reportProxyFailure(resultCtx, auth, chunk.Err)
+					chunk.Err = recordExecutionAttemptError(ctx, auth, provider, chunk.Err)
 					if strings.EqualFold(strings.TrimSpace(provider), "chatgpt-web") && isChatGPTWebAuthenticationRecoveryError(chunk.Err) {
 						chunk.Err = m.wrapChatGPTWebUnauthorizedRequestError(resultCtx, auth, chunk.Err)
 						triggerChatGPTWebUnauthorizedRequestRefresh(chunk.Err)
@@ -2452,8 +2453,10 @@ func (m *Manager) executeStreamWithModelPool(ctx, resultCtx context.Context, exe
 			return nil, &Error{Code: "request_body_released", Message: "request body released; retry disabled"}
 		}
 		attemptCtx, usageAttempt := cliproxyexecutor.WithRequestUsageAttempt(ctx)
+		attemptCtx = cliproxyexecutor.WithUpstreamAttempt(attemptCtx)
 		streamResult, errStream := executor.ExecuteStream(attemptCtx, auth, execReq, execOpts)
 		streamResult, errStream = validateStreamResult(streamResult, errStream)
+		errStream = recordExecutionAttemptError(attemptCtx, auth, provider, errStream)
 		if errStream != nil {
 			unregisterRelease()
 			if errCtx := ctx.Err(); errCtx != nil {
@@ -2486,6 +2489,7 @@ func (m *Manager) executeStreamWithModelPool(ctx, resultCtx context.Context, exe
 			continue
 		}
 		buffered, closed, bootstrapErr := readStreamBootstrap(ctx, streamResult.Chunks)
+		bootstrapErr = recordExecutionAttemptError(attemptCtx, auth, provider, bootstrapErr, streamResult.Headers)
 		unregisterRelease()
 		releaseMu.Lock()
 		wrapOpts := opts
@@ -2555,11 +2559,12 @@ func (m *Manager) executeStreamWithModelPool(ctx, resultCtx context.Context, exe
 			result.Error = emptyErr
 			result.availabilityNeutral = isResponsesCompactAvailabilityNeutralError(opts, emptyErr)
 			m.markExecutionResult(ctx, result)
+			observedEmptyErr := recordExecutionAttemptError(attemptCtx, auth, provider, emptyErr, streamResult.Headers)
 			if idx < len(execModels)-1 && requestBodyReplayable(ctx, replayOpts) {
-				lastErr = emptyErr
+				lastErr = observedEmptyErr
 				continue
 			}
-			return nil, newStreamBootstrapError(emptyErr, streamResult.Headers)
+			return nil, newStreamBootstrapError(observedEmptyErr, streamResult.Headers)
 		}
 
 		remaining := streamResult.Chunks
@@ -4315,6 +4320,7 @@ func authFilePathQuarantined(auth *Auth, authDir string) bool {
 // Execute performs a non-streaming execution using the configured selector and executor.
 // It supports multiple providers for the same model and round-robins the starting provider per model.
 func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (response cliproxyexecutor.Response, err error) {
+	ctx, upstreamErrors := withUpstreamErrorHistory(ctx)
 	var releaseProducer func()
 	ctx, _, releaseProducer, err = m.beginResultPersistenceProducer(ctx)
 	if err != nil {
@@ -4324,6 +4330,7 @@ func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxye
 	opts = m.ensureExecutionDiagnostics(opts)
 	ctx = cliproxyexecutor.WithRequestUsageOutcome(ctx, opts.UsageOutcome)
 	defer func() {
+		err = upstreamErrors.preferred(err)
 		if err != nil {
 			err = finalizeErrorResponseSource(opts.Metadata, err)
 		}
@@ -4402,6 +4409,7 @@ func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxye
 // ExecuteCount performs a non-streaming execution using the configured selector and executor.
 // It supports multiple providers for the same model and round-robins the starting provider per model.
 func (m *Manager) ExecuteCount(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (response cliproxyexecutor.Response, err error) {
+	ctx, upstreamErrors := withUpstreamErrorHistory(ctx)
 	var releaseProducer func()
 	ctx, _, releaseProducer, err = m.beginResultPersistenceProducer(ctx)
 	if err != nil {
@@ -4411,6 +4419,7 @@ func (m *Manager) ExecuteCount(ctx context.Context, providers []string, req clip
 	opts = m.ensureExecutionDiagnostics(opts)
 	ctx = cliproxyexecutor.WithRequestUsageOutcome(ctx, opts.UsageOutcome)
 	defer func() {
+		err = upstreamErrors.preferred(err)
 		if err != nil {
 			err = finalizeErrorResponseSource(opts.Metadata, err)
 		}
@@ -4482,6 +4491,7 @@ func (m *Manager) ExecuteCount(ctx context.Context, providers []string, req clip
 // ExecuteStream performs a streaming execution using the configured selector and executor.
 // It supports multiple providers for the same model and round-robins the starting provider per model.
 func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (result *cliproxyexecutor.StreamResult, err error) {
+	ctx, upstreamErrors := withUpstreamErrorHistory(ctx)
 	var producer *resultPersistenceProducer
 	var releaseProducer func()
 	ctx, producer, releaseProducer, err = m.beginResultPersistenceProducer(ctx)
@@ -4496,6 +4506,7 @@ func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cli
 	opts = m.ensureExecutionDiagnostics(opts)
 	ctx = cliproxyexecutor.WithRequestUsageOutcome(ctx, opts.UsageOutcome)
 	defer func() {
+		err = upstreamErrors.preferred(err)
 		if err != nil {
 			err = finalizeErrorResponseSource(opts.Metadata, err)
 		}
@@ -5570,8 +5581,12 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 				break
 			}
 			roundState.markAttempted(auth)
+			runtimeCtx = cliproxyexecutor.WithUpstreamAttempt(runtimeCtx)
 			resp, errExec := executor.Execute(runtimeCtx, auth, execReq, opts)
 			retiredDuringExecution := releaseExecution()
+			if !retiredDuringExecution {
+				errExec = recordExecutionAttemptError(runtimeCtx, auth, provider, errExec)
+			}
 			unregisterAttemptRelease()
 			if errExec == nil {
 				if !retiredDuringExecution {
@@ -5628,8 +5643,12 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 						authErr = nil
 						break
 					}
+					retryCtx = cliproxyexecutor.WithUpstreamAttempt(retryCtx)
 					resp, errExec = executor.Execute(retryCtx, auth, execReq, opts)
 					retiredDuringRetry := releaseRetry()
+					if !retiredDuringRetry {
+						errExec = recordExecutionAttemptError(retryCtx, auth, provider, errExec)
+					}
 					if errExec == nil {
 						if !retiredDuringRetry {
 							m.markExecutionResult(execCtx, successfulExecutionResultForAuth(auth, provider, resultModel, opts))
@@ -5836,8 +5855,12 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 				break
 			}
 			roundState.markAttempted(auth)
+			runtimeCtx = cliproxyexecutor.WithUpstreamAttempt(runtimeCtx)
 			resp, errExec := executor.CountTokens(runtimeCtx, auth, execReq, opts)
 			retiredDuringExecution := releaseExecution()
+			if !retiredDuringExecution {
+				errExec = recordExecutionAttemptError(runtimeCtx, auth, provider, errExec)
+			}
 			unregisterAttemptRelease()
 			if errExec == nil {
 				if !retiredDuringExecution {
@@ -5888,8 +5911,12 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 						authErr = nil
 						break
 					}
+					retryCtx = cliproxyexecutor.WithUpstreamAttempt(retryCtx)
 					resp, errExec = executor.CountTokens(retryCtx, auth, execReq, opts)
 					retiredDuringRetry := releaseRetry()
+					if !retiredDuringRetry {
+						errExec = recordExecutionAttemptError(retryCtx, auth, provider, errExec)
+					}
 					if errExec == nil {
 						if !retiredDuringRetry {
 							m.markExecutionResult(execCtx, resultForAuth(auth, provider, resultModel, true))
@@ -6685,8 +6712,12 @@ func (m *Manager) tryAntigravityCreditsExecute(ctx context.Context, req cliproxy
 				break
 			}
 			lastPrepareErr = nil
+			runtimeCtx = cliproxyexecutor.WithUpstreamAttempt(runtimeCtx)
 			resp, errExec := c.executor.Execute(runtimeCtx, c.auth, execReq, creditsOpts)
 			retiredDuringExecution := releaseExecution()
+			if !retiredDuringExecution {
+				errExec = recordExecutionAttemptError(runtimeCtx, c.auth, c.provider, errExec)
+			}
 			if errExec == nil {
 				if !retiredDuringExecution {
 					m.markExecutionResult(creditsCtx, resultForAuth(c.auth, c.provider, resultModel, true))
