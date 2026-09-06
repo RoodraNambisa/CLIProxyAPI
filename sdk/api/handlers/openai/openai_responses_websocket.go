@@ -429,16 +429,20 @@ func shouldReplaceWebsocketTranscript(rawJSON []byte, nextInput gjson.Result) bo
 	if requestType != wsRequestTypeCreate && requestType != wsRequestTypeAppend {
 		return false
 	}
-	if strings.TrimSpace(gjson.GetBytes(rawJSON, "previous_response_id").String()) != "" {
+	previousResponseID := gjson.GetBytes(rawJSON, "previous_response_id")
+	if strings.TrimSpace(previousResponseID.String()) != "" {
 		return false
 	}
 	if !nextInput.Exists() || !nextInput.IsArray() {
 		return false
 	}
+	if requestType == wsRequestTypeCreate && !previousResponseID.Exists() && inputHasCodexLocalCompactionSummary(nextInput) {
+		return true
+	}
 
 	for _, item := range nextInput.Array() {
 		switch strings.TrimSpace(item.Get("type").String()) {
-		case "function_call", "custom_tool_call":
+		case "function_call", "custom_tool_call", "compaction", "compaction_summary":
 			return true
 		case "message":
 			role := strings.TrimSpace(item.Get("role").String())
