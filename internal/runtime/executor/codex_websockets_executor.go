@@ -274,6 +274,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 	body = helps.SanitizeCodexInputItemIDs(body)
 	body = helps.SanitizeCodexReasoningEncryptedContent(ctx, "codex websockets executor", body)
 	body = helps.NormalizeCodexToolSelection(body)
+	body = e.codexPreparedSessionIdentity(ctx, req, opts).ResponsesLite.ApplyBody(body, true)
 	reporter.SetRequestServiceTierFromPayload(body)
 
 	httpURL := strings.TrimSuffix(baseURL, "/") + "/responses"
@@ -572,6 +573,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 	body = helps.SanitizeCodexInputItemIDs(body)
 	body = helps.SanitizeCodexReasoningEncryptedContent(ctx, "codex websockets executor", body)
 	body = helps.NormalizeCodexToolSelection(body)
+	body = e.codexPreparedSessionIdentity(ctx, req, opts).ResponsesLite.ApplyBody(body, true)
 	reporter.SetRequestServiceTierFromPayload(body)
 
 	httpURL := strings.TrimSuffix(baseURL, "/") + "/responses"

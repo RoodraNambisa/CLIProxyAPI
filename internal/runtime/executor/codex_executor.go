@@ -320,6 +320,7 @@ func NewCodexExecutor(cfg *config.Config) *CodexExecutor { return &CodexExecutor
 func (e *CodexExecutor) Identifier() string { return "codex" }
 
 type codexPreparedSessionIdentity struct {
+	ResponsesLite  helps.CodexResponsesLiteSnapshot
 	Enabled        bool
 	SessionID      string
 	ThreadID       string
@@ -347,7 +348,18 @@ func (e *CodexExecutor) PrepareProviderRequest(ctx context.Context, req cliproxy
 		return nil, err
 	}
 	affinityKind, affinityDigest, tenantDigest, clientThreadID, spoofThreadID := codexPreparedRequestAffinity(ctx, opts, payload, turnID)
+	var incomingHeaders http.Header
+	if ctx != nil {
+		if ginCtx, ok := ctx.Value("gin").(*gin.Context); ok && ginCtx != nil && ginCtx.Request != nil {
+			incomingHeaders = ginCtx.Request.Header
+		}
+	}
+	liteHeaders := http.Header{}
+	if value := firstCodexHeaderValue(helps.CodexResponsesLiteHeader, opts.Headers, incomingHeaders); value != "" {
+		liteHeaders.Set(helps.CodexResponsesLiteHeader, value)
+	}
 	prepared := codexPreparedSessionIdentity{
+		ResponsesLite:  helps.SnapshotCodexResponsesLite(payload, liteHeaders, cliproxyexecutor.DownstreamWebsocket(ctx)),
 		Enabled:        codexSpoofSessionIdentityEnabled(e.cfg),
 		TurnID:         turnID,
 		RequestKind:    codexSessionRequestKind(opts, payload),
@@ -785,6 +797,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	body = helps.SanitizeCodexInputItemIDs(body)
 	body = helps.SanitizeCodexReasoningEncryptedContent(ctx, "codex executor", body)
 	body = helps.NormalizeCodexToolSelection(body)
+	body = e.codexPreparedSessionIdentity(ctx, req, opts).ResponsesLite.ApplyBody(body, false)
 	replayAuthID := ""
 	if auth != nil {
 		replayAuthID = auth.ID
@@ -981,6 +994,7 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 	body = helps.SanitizeCodexInputItemIDs(body)
 	body = helps.SanitizeCodexReasoningEncryptedContent(ctx, "codex executor", body)
 	body = helps.NormalizeCodexToolSelection(body)
+	body = e.codexPreparedSessionIdentity(ctx, req, opts).ResponsesLite.ApplyBody(body, false)
 	reporter.SetRequestServiceTierFromPayload(body)
 	imageRequest := cliproxyauth.PayloadHasImageGenerationTool(body)
 
@@ -1112,6 +1126,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	body = helps.SanitizeCodexInputItemIDs(body)
 	body = helps.SanitizeCodexReasoningEncryptedContent(ctx, "codex executor", body)
 	body = helps.NormalizeCodexToolSelection(body)
+	body = e.codexPreparedSessionIdentity(ctx, req, opts).ResponsesLite.ApplyBody(body, false)
 	replayAuthID := ""
 	if auth != nil {
 		replayAuthID = auth.ID
@@ -1725,6 +1740,7 @@ func (e *CodexExecutor) applyCodexHTTPSessionIdentity(
 	rawJSON []byte,
 	identityConfuse *codexIdentityConfuseState,
 ) ([]byte, error) {
+	e.codexPreparedSessionIdentity(ctx, req, opts).ResponsesLite.ApplyHeaders(httpReq.Header)
 	projected, state, err := e.projectCodexSessionIdentity(ctx, auth, req, opts, rawJSON, identityConfuse)
 	if err != nil {
 		closeCodexRequestBody(httpReq)
