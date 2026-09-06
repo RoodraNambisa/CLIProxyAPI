@@ -7,7 +7,7 @@ import (
 )
 
 const (
-	DefaultUserAgent                  = "codex_cli_rs/0.146.0 (Mac OS 26.5.0; arm64) iTerm.app/3.6.10"
+	DefaultUserAgent                  = "codex_cli_rs/0.153.4 (Mac OS 26.5.0; arm64) iTerm.app/3.6.10"
 	DefaultOriginator                 = "codex_cli_rs"
 	MinimumCompatibleUserAgentVersion = "0.144.0"
 )

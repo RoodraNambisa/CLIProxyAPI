@@ -14,7 +14,7 @@ func TestResolveSoftwareIdentity(t *testing.T) {
 			name:        "default",
 			wantAgent:   DefaultUserAgent,
 			wantOrigin:  DefaultOriginator,
-			wantVersion: "0.146.0",
+			wantVersion: "0.153.4",
 		},
 		{
 			name:        "supported custom client",
@@ -26,23 +26,23 @@ func TestResolveSoftwareIdentity(t *testing.T) {
 		{
 			name:        "old version keeps client shape",
 			userAgent:   "codex-tui/0.143.9 (Linux; x86_64) tmux/3.5",
-			wantAgent:   "codex-tui/0.146.0 (Linux; x86_64) tmux/3.5",
+			wantAgent:   "codex-tui/0.153.4 (Linux; x86_64) tmux/3.5",
 			wantOrigin:  "codex-tui",
-			wantVersion: "0.146.0",
+			wantVersion: "0.153.4",
 		},
 		{
 			name:        "minimum prerelease is upgraded",
 			userAgent:   "codex-tui/0.144.0-alpha.1 (Linux; arm64)",
-			wantAgent:   "codex-tui/0.146.0 (Linux; arm64)",
+			wantAgent:   "codex-tui/0.153.4 (Linux; arm64)",
 			wantOrigin:  "codex-tui",
-			wantVersion: "0.146.0",
+			wantVersion: "0.153.4",
 		},
 		{
 			name:        "invalid falls back",
 			userAgent:   "custom-client",
 			wantAgent:   DefaultUserAgent,
 			wantOrigin:  DefaultOriginator,
-			wantVersion: "0.146.0",
+			wantVersion: "0.153.4",
 		},
 	}
 

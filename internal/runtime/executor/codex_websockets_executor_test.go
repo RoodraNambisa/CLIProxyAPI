@@ -859,8 +859,8 @@ func TestApplyCodexWebsocketHeadersDefaultsToCurrentResponsesBeta(t *testing.T) 
 	if got := headers.Get("Originator"); got != codexOriginator {
 		t.Fatalf("Originator = %s, want %s", got, codexOriginator)
 	}
-	if got := headers.Get("Version"); got != "0.146.0" {
-		t.Fatalf("Version = %q, want 0.146.0", got)
+	if got := headers.Get("Version"); got != "0.153.4" {
+		t.Fatalf("Version = %q, want 0.153.4", got)
 	}
 	if got := headers.Get("x-codex-beta-features"); got != "" {
 		t.Fatalf("x-codex-beta-features = %q, want empty", got)
@@ -893,8 +893,8 @@ func TestApplyCodexWebsocketHeadersIgnoresClientUserAgentWhenEnforced(t *testing
 	if got := headers.Get("Originator"); got != codexOriginator {
 		t.Fatalf("Originator = %q, want %q", got, codexOriginator)
 	}
-	if got := headers.Get("Version"); got != "0.146.0" {
-		t.Fatalf("Version = %q, want 0.146.0", got)
+	if got := headers.Get("Version"); got != "0.153.4" {
+		t.Fatalf("Version = %q, want 0.153.4", got)
 	}
 }
 
@@ -1688,8 +1688,8 @@ func TestApplyCodexHeadersIgnoresClientUserAgentWhenEnforced(t *testing.T) {
 	if got := req.Header.Get("Originator"); got != codexOriginator {
 		t.Fatalf("Originator = %q, want %q", got, codexOriginator)
 	}
-	if got := req.Header.Get("Version"); got != "0.146.0" {
-		t.Fatalf("Version = %q, want 0.146.0", got)
+	if got := req.Header.Get("Version"); got != "0.153.4" {
+		t.Fatalf("Version = %q, want 0.153.4", got)
 	}
 }
 
@@ -1705,14 +1705,14 @@ func TestApplyCodexHeadersUpgradesOldConfiguredVersionWithoutMutation(t *testing
 	if errApply := applyCodexHeaders(req, auth, "oauth-token", false, cfg); errApply != nil {
 		t.Fatalf("applyCodexHeaders() error = %v", errApply)
 	}
-	if got := req.Header.Get("User-Agent"); got != "codex-tui/0.146.0 (Linux; arm64) tmux/3.5" {
+	if got := req.Header.Get("User-Agent"); got != "codex-tui/0.153.4 (Linux; arm64) tmux/3.5" {
 		t.Fatalf("User-Agent = %q, want upgraded version with preserved shape", got)
 	}
 	if got := req.Header.Get("Originator"); got != "codex-tui" {
 		t.Fatalf("Originator = %q, want codex-tui", got)
 	}
-	if got := req.Header.Get("Version"); got != "0.146.0" {
-		t.Fatalf("Version = %q, want 0.146.0", got)
+	if got := req.Header.Get("Version"); got != "0.153.4" {
+		t.Fatalf("Version = %q, want 0.153.4", got)
 	}
 	if cfg.CodexHeaderDefaults.UserAgent != configuredUserAgent {
 		t.Fatalf("configured User-Agent mutated to %q", cfg.CodexHeaderDefaults.UserAgent)
@@ -1773,8 +1773,8 @@ func TestApplyCodexDirectImageHeadersIgnoresDownstreamUserAgent(t *testing.T) {
 	if got := req.Header.Get("User-Agent"); got == "client-ua" {
 		t.Fatalf("User-Agent = %s, want generated Codex default", got)
 	}
-	if got := req.Header.Get("Version"); got != "0.146.0" {
-		t.Fatalf("Version = %s, want 0.146.0", got)
+	if got := req.Header.Get("Version"); got != "0.153.4" {
+		t.Fatalf("Version = %s, want 0.153.4", got)
 	}
 	if got := req.Header.Get("X-Client-Request-Id"); got != "req-1" {
 		t.Fatalf("X-Client-Request-Id = %s, want req-1", got)
@@ -2063,8 +2063,8 @@ func TestApplyCodexHeadersDoesNotInjectClientOnlyHeadersByDefault(t *testing.T) 
 
 	applyCodexHeaders(req, nil, "oauth-token", true, nil)
 
-	if got := req.Header.Get("Version"); got != "0.146.0" {
-		t.Fatalf("Version = %q, want 0.146.0", got)
+	if got := req.Header.Get("Version"); got != "0.153.4" {
+		t.Fatalf("Version = %q, want 0.153.4", got)
 	}
 	if got := req.Header.Get("X-Codex-Turn-Metadata"); got != "" {
 		t.Fatalf("X-Codex-Turn-Metadata = %q, want empty", got)
