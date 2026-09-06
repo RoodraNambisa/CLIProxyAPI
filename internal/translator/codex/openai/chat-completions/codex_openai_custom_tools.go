@@ -1,6 +1,9 @@
 package chat_completions
 
-import "github.com/tidwall/gjson"
+import (
+	"github.com/tidwall/gjson"
+	"github.com/tidwall/sjson"
+)
 
 // codexOpenAIToolNames shares one shortening map between definitions, replay, and responses.
 // A function/custom name collision keeps function-envelope replay unambiguous.
@@ -47,4 +50,41 @@ func codexOpenAICustomToolDefinition(tool gjson.Result) gjson.Result {
 		return nested
 	}
 	return tool
+}
+
+func codexOpenAIUsesNativeCustomEnvelope(original []byte, name string) bool {
+	for _, tool := range gjson.GetBytes(original, "tools").Array() {
+		if tool.Get("type").String() == "custom" && tool.Get("custom").IsObject() && tool.Get("custom.name").String() == name {
+			return true
+		}
+	}
+	return false
+}
+
+func isCodexToolCallType(kind string) bool {
+	return kind == "function_call" || kind == "custom_tool_call"
+}
+
+func codexToolCallArguments(item gjson.Result) string {
+	if item.Get("type").String() == "custom_tool_call" {
+		return item.Get("input").String()
+	}
+	return item.Get("arguments").String()
+}
+
+func codexOpenAIClientToolCall(item gjson.Result, original []byte) []byte {
+	name := item.Get("name").String()
+	if restored, ok := buildReverseMapFromOriginalOpenAI(original)[name]; ok {
+		name = restored
+	}
+	out := []byte(`{"id":"","type":"function","function":{"name":"","arguments":""}}`)
+	namePath, inputPath := "function.name", "function.arguments"
+	if item.Get("type").String() == "custom_tool_call" && codexOpenAIUsesNativeCustomEnvelope(original, name) {
+		out = []byte(`{"id":"","type":"custom","custom":{"name":"","input":""}}`)
+		namePath, inputPath = "custom.name", "custom.input"
+	}
+	out, _ = sjson.SetBytes(out, "id", item.Get("call_id").String())
+	out, _ = sjson.SetBytes(out, namePath, name)
+	out, _ = sjson.SetBytes(out, inputPath, codexToolCallArguments(item))
+	return out
 }

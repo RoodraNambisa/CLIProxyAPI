@@ -403,28 +403,8 @@ func ConvertCodexResponseToOpenAINonStream(_ context.Context, _ string, original
 						}
 					}
 				}
-			case "function_call":
-				// Handle function call content
-				functionCallTemplate := []byte(`{"id":"","type":"function","function":{"name":"","arguments":""}}`)
-
-				if callIdResult := outputItem.Get("call_id"); callIdResult.Exists() {
-					functionCallTemplate, _ = sjson.SetBytes(functionCallTemplate, "id", callIdResult.String())
-				}
-
-				if nameResult := outputItem.Get("name"); nameResult.Exists() {
-					n := nameResult.String()
-					rev := buildReverseMapFromOriginalOpenAI(originalRequestRawJSON)
-					if orig, ok := rev[n]; ok {
-						n = orig
-					}
-					functionCallTemplate, _ = sjson.SetBytes(functionCallTemplate, "function.name", n)
-				}
-
-				if argsResult := outputItem.Get("arguments"); argsResult.Exists() {
-					functionCallTemplate, _ = sjson.SetBytes(functionCallTemplate, "function.arguments", argsResult.String())
-				}
-
-				toolCalls = append(toolCalls, functionCallTemplate)
+			case "function_call", "custom_tool_call":
+				toolCalls = append(toolCalls, codexOpenAIClientToolCall(outputItem, originalRequestRawJSON))
 			case "image_generation_call":
 				b64 := outputItem.Get("result").String()
 				if b64 == "" {
@@ -490,32 +470,12 @@ func ConvertCodexResponseToOpenAINonStream(_ context.Context, _ string, original
 // buildReverseMapFromOriginalOpenAI builds a map of shortened tool name -> original tool name
 // from the original OpenAI-style request JSON using the same shortening logic.
 func buildReverseMapFromOriginalOpenAI(original []byte) map[string]string {
-	tools := gjson.GetBytes(original, "tools")
-	rev := map[string]string{}
-	if tools.IsArray() && len(tools.Array()) > 0 {
-		var names []string
-		arr := tools.Array()
-		for i := 0; i < len(arr); i++ {
-			t := arr[i]
-			if t.Get("type").String() != "function" {
-				continue
-			}
-			fn := t.Get("function")
-			if !fn.Exists() {
-				continue
-			}
-			if v := fn.Get("name"); v.Exists() {
-				names = append(names, v.String())
-			}
-		}
-		if len(names) > 0 {
-			m := buildShortNameMap(names)
-			for orig, short := range m {
-				rev[short] = orig
-			}
-		}
+	shortNames, _ := codexOpenAIToolNames(original)
+	reverse := make(map[string]string, len(shortNames))
+	for original, short := range shortNames {
+		reverse[short] = original
 	}
-	return rev
+	return reverse
 }
 
 func mimeTypeFromCodexOutputFormat(outputFormat string) string {
