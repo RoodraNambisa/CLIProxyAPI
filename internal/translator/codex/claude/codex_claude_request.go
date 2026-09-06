@@ -149,6 +149,23 @@ func ConvertClaudeRequestToCodex(modelName string, inputRawJSON []byte, _ bool) 
 								appendImageContent(dataURL)
 							}
 						}
+					case "document":
+						source := messageContentResult.Get("source")
+						if source.Get("type").String() != "base64" || !strings.EqualFold(strings.TrimSpace(source.Get("media_type").String()), "application/pdf") {
+							continue
+						}
+						data := source.Get("data")
+						if data.Type != gjson.String || data.Str == "" {
+							data = source.Get("base64")
+						}
+						if data.Type != gjson.String || data.Str == "" {
+							continue
+						}
+						file := []byte(`{"type":"input_file","filename":"document.pdf","file_data":""}`)
+						file, _ = sjson.SetBytes(file, "file_data", "data:application/pdf;base64,"+data.Str)
+						message, _ = sjson.SetRawBytes(message, fmt.Sprintf("content.%d", contentIndex), file)
+						contentIndex++
+						hasContent = true
 					case "tool_use":
 						flushMessage()
 						functionCallMessage := []byte(`{"type":"function_call"}`)
