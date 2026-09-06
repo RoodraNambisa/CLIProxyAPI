@@ -183,10 +183,17 @@ func codexResponseFailedError(eventData []byte) statusErr {
 	if code == "" {
 		code = "server_error"
 	}
-	return codexStreamStatusErr(codexStreamErrorStatus(code, http.StatusInternalServerError), message, code, codexStreamErrorType(code), nil)
+	errType := strings.TrimSpace(gjson.GetBytes(eventData, "response.error.type").String())
+	if errType == "" {
+		errType = codexStreamErrorType(code)
+	}
+	return codexStreamStatusErr(codexStreamErrorStatus(code, http.StatusInternalServerError), message, code, errType, nil)
 }
 
 func codexResponseIncompleteError(eventData []byte) statusErr {
+	if cliproxyauth.IsPolicyRefusalError(statusErr{code: http.StatusBadGateway, msg: string(eventData)}) {
+		return codexResponseFailedError(eventData)
+	}
 	reason := strings.TrimSpace(gjson.GetBytes(eventData, "response.incomplete_details.reason").String())
 	message := strings.TrimSpace(gjson.GetBytes(eventData, "response.error.message").String())
 	if message == "" && reason != "" {
@@ -2423,6 +2430,9 @@ func classifyCodexStatusError(statusCode int, body []byte) []byte {
 }
 
 func codexStatusErrorClassification(statusCode int, body []byte) (code string, errType string, ok bool) {
+	if cliproxyauth.IsPolicyRefusalError(statusErr{code: statusCode, msg: string(body)}) {
+		return "", "", false
+	}
 	lower := strings.ToLower(strings.TrimSpace(string(body)))
 	upstreamCode := ""
 	for _, path := range []string{"error.code", "response.error.code", "code"} {
