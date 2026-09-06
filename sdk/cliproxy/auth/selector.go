@@ -26,7 +26,7 @@ import (
 // RoundRobinSelector provides a simple provider scoped round-robin selection strategy.
 type RoundRobinSelector struct {
 	mu      sync.Mutex
-	cursors map[string]int
+	cursors map[string]string
 	maxKeys int
 }
 
@@ -545,8 +545,9 @@ func (s *RoundRobinSelector) Pick(ctx context.Context, provider, model string, o
 	}
 	key := provider + ":" + canonicalModelKey(model)
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.cursors == nil {
-		s.cursors = make(map[string]int)
+		s.cursors = make(map[string]string)
 	}
 	limit := s.maxKeys
 	if limit <= 0 {
@@ -554,20 +555,30 @@ func (s *RoundRobinSelector) Pick(ctx context.Context, provider, model string, o
 	}
 
 	s.ensureCursorKey(key, limit)
-	index := s.cursors[key]
-	if index >= 2_147_483_640 {
-		index = 0
+	index := authSuccessorIndex(available, s.cursors[key])
+	picked := available[index]
+	s.cursors[key] = picked.ID
+	return picked, nil
+}
+
+// Selection candidates are sorted by ID. Retaining the last identity instead of
+// an offset keeps rotation stable when a retry or cooldown removes candidates.
+func authSuccessorIndex(available []*Auth, lastID string) int {
+	if lastID == "" {
+		return 0
 	}
-	s.cursors[key] = index + 1
-	s.mu.Unlock()
-	return available[index%len(available)], nil
+	index := sort.Search(len(available), func(i int) bool { return available[i].ID > lastID })
+	if index == len(available) {
+		return 0
+	}
+	return index
 }
 
 // ensureCursorKey ensures the cursor map has capacity for the given key.
 // Must be called with s.mu held.
 func (s *RoundRobinSelector) ensureCursorKey(key string, limit int) {
 	if _, ok := s.cursors[key]; !ok && len(s.cursors) >= limit {
-		s.cursors = make(map[string]int)
+		s.cursors = make(map[string]string)
 	}
 }
 

@@ -146,15 +146,15 @@ type readyBucket struct {
 
 // readyView holds the selection order for selection traversal.
 type readyView struct {
-	flat   []*scheduledAuth
-	cursor int
+	flat       []*scheduledAuth
+	lastPicked string
 }
 
 // cooldownQueue is the blocked auth collection ordered by next retry time during rebuilds.
 type cooldownQueue []*scheduledAuth
 
 type readyViewCursorState struct {
-	cursor int
+	lastPicked string
 }
 
 type readyBucketCursorState struct {
@@ -163,27 +163,14 @@ type readyBucketCursorState struct {
 }
 
 func snapshotReadyViewCursors(view readyView) readyViewCursorState {
-	return readyViewCursorState{cursor: view.cursor}
+	return readyViewCursorState{lastPicked: view.lastPicked}
 }
 
 func restoreReadyViewCursors(view *readyView, state readyViewCursorState) {
 	if view == nil {
 		return
 	}
-	if len(view.flat) > 0 {
-		view.cursor = normalizeCursor(state.cursor, len(view.flat))
-	}
-}
-
-func normalizeCursor(cursor, size int) int {
-	if size <= 0 || cursor <= 0 {
-		return 0
-	}
-	cursor = cursor % size
-	if cursor < 0 {
-		cursor += size
-	}
-	return cursor
+	view.lastPicked = state.lastPicked
 }
 
 // newAuthScheduler constructs an empty scheduler configured for the supplied selector strategy.
@@ -2188,20 +2175,28 @@ func (v *readyView) pickRoundRobin(predicate func(*scheduledAuth) bool) *schedul
 	if len(v.flat) == 0 {
 		return nil
 	}
-	start := 0
-	if len(v.flat) > 0 {
-		start = v.cursor % len(v.flat)
-	}
+	start := scheduledSuccessorIndex(v.flat, v.lastPicked)
 	for offset := 0; offset < len(v.flat); offset++ {
 		index := (start + offset) % len(v.flat)
 		entry := v.flat[index]
 		if predicate != nil && !predicate(entry) {
 			continue
 		}
-		v.cursor = index + 1
+		v.lastPicked = entry.auth.ID
 		return entry
 	}
 	return nil
+}
+
+func scheduledSuccessorIndex(entries []*scheduledAuth, lastID string) int {
+	if lastID == "" {
+		return 0
+	}
+	index := sort.Search(len(entries), func(i int) bool { return entries[i].auth.ID > lastID })
+	if index == len(entries) {
+		return 0
+	}
+	return index
 }
 
 func (v *readyView) pickRandom(predicate func(*scheduledAuth) bool) *scheduledAuth {
@@ -2265,12 +2260,12 @@ func (v *readyView) pickWithRequestLimit(strategy schedulerStrategy, predicate f
 			candidates = candidates[:len(candidates)-1]
 		}
 	default:
-		start := v.cursor % len(v.flat)
+		start := scheduledSuccessorIndex(v.flat, v.lastPicked)
 		for offset := 0; offset < len(v.flat); offset++ {
 			index := (start + offset) % len(v.flat)
 			entry := v.flat[index]
 			if tryEntry(entry) {
-				v.cursor = index + 1
+				v.lastPicked = entry.auth.ID
 				return entry, authRequestLimitBlock{}
 			}
 		}
