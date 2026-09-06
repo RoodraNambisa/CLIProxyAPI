@@ -102,8 +102,9 @@ func TestCodexHTTPClientImagesForceHTTP1OnlyForImageRequests(t *testing.T) {
 	if !ok {
 		t.Fatalf("text transport type = %T, want *http.Transport", textClient.Transport)
 	}
-	if textTransport.TLSNextProto != nil {
-		t.Fatalf("text TLSNextProto = %#v, want nil without image request", textTransport.TLSNextProto)
+	// Go may initialize this shared transport before the assertion runs.
+	if !textTransport.ForceAttemptHTTP2 || (textTransport.TLSNextProto != nil && textTransport.TLSNextProto["h2"] == nil) {
+		t.Fatal("text transport disabled HTTP/2 without an image request")
 	}
 
 	imageClient := executor.newCodexHTTPClient(context.Background(), nil, true)
@@ -114,7 +115,7 @@ func TestCodexHTTPClientImagesForceHTTP1OnlyForImageRequests(t *testing.T) {
 	if imageTransport.ForceAttemptHTTP2 {
 		t.Fatal("image ForceAttemptHTTP2 = true, want false")
 	}
-	if imageTransport.TLSNextProto == nil {
-		t.Fatal("image TLSNextProto = nil, want empty map to disable HTTP/2")
+	if imageTransport.TLSNextProto == nil || len(imageTransport.TLSNextProto) != 0 {
+		t.Fatal("image TLSNextProto must be an explicit empty map to disable HTTP/2")
 	}
 }
