@@ -1413,7 +1413,7 @@ func (h *BaseAPIHandler) executeStreamWithResolvedProviders(ctx context.Context,
 								chunks = retryResult.Chunks
 								continue outer
 							}
-							streamErr = enrichAuthSelectionError(retryErr, providers, normalizedRouteModel)
+							streamErr = coreexecutor.PreferUpstreamError(streamErr, enrichAuthSelectionError(retryErr, providers, normalizedRouteModel))
 						}
 					}
 
