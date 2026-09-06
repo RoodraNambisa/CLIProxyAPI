@@ -83,6 +83,28 @@ func TestCodexToolStreamsRecoverMissingStartAndIgnoreDuplicateTerminal(t *testin
 	}
 }
 
+func TestCodexReasoningTextStreamAndNonStream(t *testing.T) {
+	var state any
+	var reasoning strings.Builder
+	for _, event := range []string{
+		`{"type":"response.reasoning_text.delta","item_id":"rs_1","delta":"one"}`,
+		`{"type":"response.reasoning_text.delta","item_id":"rs_1","delta":"two"}`,
+		`{"type":"response.reasoning_text.done","item_id":"rs_1"}`,
+		`{"type":"response.reasoning_text.done","item_id":"rs_1"}`,
+	} {
+		for _, chunk := range ConvertCodexResponseToOpenAI(t.Context(), "model", nil, nil, []byte("data: "+event), &state) {
+			reasoning.WriteString(gjson.GetBytes(chunk, "choices.0.delta.reasoning_content").String())
+		}
+	}
+	if reasoning.String() != "onetwo\n\n" {
+		t.Fatal("reasoning text was dropped or terminal duplicated")
+	}
+	nonStream := ConvertCodexResponseToOpenAINonStream(t.Context(), "model", nil, nil, []byte(`{"type":"response.completed","response":{"status":"completed","output":[{"type":"reasoning","content":[{"type":"reasoning_text","text":"one"},{"type":"reasoning_text","text":"two"}]},{"type":"message","content":[{"type":"output_text","text":"a"},{"type":"output_text","text":"b"}]}]}}`), nil)
+	if gjson.GetBytes(nonStream, "choices.0.message.reasoning_content").String() != "onetwo" || gjson.GetBytes(nonStream, "choices.0.message.content").String() != "ab" {
+		t.Fatal("non-stream conversion lost content parts")
+	}
+}
+
 func TestCodexNativeCustomToolStreamUsesCustomInput(t *testing.T) {
 	var state any
 	original := []byte(`{"tools":[{"type":"custom","custom":{"name":"code_exec"}}]}`)

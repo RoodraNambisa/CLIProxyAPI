@@ -28,6 +28,7 @@ type ConvertCliToOpenAIParams struct {
 	FunctionCallIndex     int
 	toolCallStates        map[string]*toolCallStreamState
 	terminalEmitted       bool
+	reasoningDone         map[string]bool
 	LastImageHashByItemID map[string][32]byte
 }
 
@@ -122,12 +123,20 @@ func ConvertCodexResponseToOpenAI(_ context.Context, modelName string, originalR
 	if chunks, handled := convertCodexToolEvent(p, rootResult, template, originalRequestRawJSON); handled {
 		return chunks
 	}
-	if dataType == "response.reasoning_summary_text.delta" {
+	if dataType == "response.reasoning_summary_text.delta" || dataType == "response.reasoning_text.delta" {
 		if deltaResult := rootResult.Get("delta"); deltaResult.Exists() {
 			template, _ = sjson.SetBytes(template, "choices.0.delta.role", "assistant")
 			template, _ = sjson.SetBytes(template, "choices.0.delta.reasoning_content", deltaResult.String())
 		}
-	} else if dataType == "response.reasoning_summary_text.done" {
+	} else if dataType == "response.reasoning_summary_text.done" || dataType == "response.reasoning_text.done" {
+		key := dataType + "|" + rootResult.Get("item_id").String() + "|" + rootResult.Get("output_index").Raw + "|" + rootResult.Get("content_index").Raw + "|" + rootResult.Get("summary_index").Raw
+		if p.reasoningDone[key] {
+			return nil
+		}
+		if p.reasoningDone == nil {
+			p.reasoningDone = make(map[string]bool)
+		}
+		p.reasoningDone[key] = true
 		template, _ = sjson.SetBytes(template, "choices.0.delta.role", "assistant")
 		template, _ = sjson.SetBytes(template, "choices.0.delta.reasoning_content", "\n\n")
 	} else if dataType == "response.output_text.delta" {
@@ -310,9 +319,13 @@ func ConvertCodexResponseToOpenAINonStream(_ context.Context, _ string, original
 					summaryArray := summaryResult.Array()
 					for _, summaryItem := range summaryArray {
 						if summaryItem.Get("type").String() == "summary_text" {
-							reasoningText = summaryItem.Get("text").String()
-							break
+							reasoningText += summaryItem.Get("text").String()
 						}
+					}
+				}
+				for _, content := range outputItem.Get("content").Array() {
+					if content.Get("type").String() == "reasoning_text" {
+						reasoningText += content.Get("text").String()
 					}
 				}
 			case "message":
@@ -321,8 +334,7 @@ func ConvertCodexResponseToOpenAINonStream(_ context.Context, _ string, original
 					contentArray := contentResult.Array()
 					for _, contentItem := range contentArray {
 						if contentItem.Get("type").String() == "output_text" {
-							contentText = contentItem.Get("text").String()
-							break
+							contentText += contentItem.Get("text").String()
 						}
 					}
 				}
