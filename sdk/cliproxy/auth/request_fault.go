@@ -8,6 +8,13 @@ import (
 	"github.com/tidwall/gjson"
 )
 
+// SnapshotRequestErrorRetryPolicy captures request error rules for outer stream
+// recovery. A hot reload must not change those rules between retry layers.
+func (m *Manager) SnapshotRequestErrorRetryPolicy() func(error) bool {
+	cfg := m.currentConfig()
+	return func(err error) bool { return shouldRetryRequestRound(err, cfg) }
+}
+
 // isKnownRequestFault recognizes structured request failures independently of
 // transport status. Quota, payment, and authentication evidence takes priority.
 // Image-specific configurable rules remain in non-retryable-errors.

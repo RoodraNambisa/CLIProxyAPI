@@ -1254,6 +1254,7 @@ func (h *BaseAPIHandler) executeStreamWithResolvedProviders(ctx context.Context,
 		SourceFormat:    sdktranslator.FromString(handlerType),
 	}
 	opts.Metadata = reqMeta
+	allowRequestErrorRetry := h.AuthManager.SnapshotRequestErrorRetryPolicy()
 	streamResult, err := h.AuthManager.ExecuteStream(ctx, providers, req, opts)
 	if err != nil {
 		errChan := make(chan *interfaces.ErrorMessage, 1)
@@ -1402,7 +1403,7 @@ func (h *BaseAPIHandler) executeStreamWithResolvedProviders(ctx context.Context,
 					// Safe bootstrap recovery: if the upstream fails before any payload bytes are sent,
 					// retry a few times (to allow auth rotation / transient recovery) and then attempt model fallback.
 					if !sentPayload && pendingProtocolProjection == nil {
-						if bootstrapRetries < maxBootstrapRetries && bootstrapEligible(streamErr) && coreauth.ConsumeRequestRetryBudget(ctx) {
+						if bootstrapRetries < maxBootstrapRetries && allowRequestErrorRetry(streamErr) && bootstrapEligible(streamErr) && coreauth.ConsumeRequestRetryBudget(ctx) {
 							bootstrapRetries++
 							retryResult, retryErr := h.AuthManager.ExecuteStream(ctx, providers, req, opts)
 							if retryErr == nil {

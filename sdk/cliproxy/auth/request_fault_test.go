@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net/http"
@@ -34,6 +35,24 @@ func TestKnownRequestFaultPreservesCredentialEvidence(t *testing.T) {
 				t.Fatalf("request fault = %t, want %t", got, tc.want)
 			}
 		})
+	}
+}
+
+func TestRequestErrorRetryPolicyKeepsConfigurationSnapshot(t *testing.T) {
+	manager := NewManager(nil, nil, nil)
+	manager.SetConfig(&internalconfig.Config{NonRetryableErrors: []internalconfig.NonRetryableErrorRule{{StatusCode: 400, Code: "custom-stop"}}})
+	before := manager.SnapshotRequestErrorRetryPolicy()
+	fault := &Error{HTTPStatus: 403, Message: `{"error":{"code":"misalignment_policy_violation"}}`}
+	manager.SetConfig(&internalconfig.Config{})
+	custom := &Error{HTTPStatus: 400, Message: `{"error":{"code":"custom-stop"}}`}
+	if before(custom) || !manager.SnapshotRequestErrorRetryPolicy()(custom) {
+		t.Fatal("hot reload changed the captured custom error rules")
+	}
+	if before(fault) || before(context.Canceled) {
+		t.Fatal("request policy allowed a non-retryable error")
+	}
+	if !before(&Error{HTTPStatus: 429, Message: "rate limited"}) {
+		t.Fatal("request policy blocked normal quota recovery")
 	}
 }
 
