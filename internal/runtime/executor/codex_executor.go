@@ -770,6 +770,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	if err != nil {
 		return resp, err
 	}
+	body = helps.SanitizeCodexInputItemIDs(body)
 	body = helps.SanitizeCodexReasoningEncryptedContent(ctx, "codex executor", body)
 	body = helps.NormalizeCodexToolSelection(body)
 	replayAuthID := ""
@@ -965,6 +966,7 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 	if err != nil {
 		return resp, err
 	}
+	body = helps.SanitizeCodexInputItemIDs(body)
 	body = helps.SanitizeCodexReasoningEncryptedContent(ctx, "codex executor", body)
 	body = helps.NormalizeCodexToolSelection(body)
 	reporter.SetRequestServiceTierFromPayload(body)
@@ -1095,6 +1097,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	if err != nil {
 		return nil, err
 	}
+	body = helps.SanitizeCodexInputItemIDs(body)
 	body = helps.SanitizeCodexReasoningEncryptedContent(ctx, "codex executor", body)
 	body = helps.NormalizeCodexToolSelection(body)
 	replayAuthID := ""

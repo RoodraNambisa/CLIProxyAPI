@@ -271,6 +271,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 	if !gjson.GetBytes(body, "instructions").Exists() {
 		body, _ = sjson.SetBytes(body, "instructions", "")
 	}
+	body = helps.SanitizeCodexInputItemIDs(body)
 	body = helps.SanitizeCodexReasoningEncryptedContent(ctx, "codex websockets executor", body)
 	body = helps.NormalizeCodexToolSelection(body)
 	reporter.SetRequestServiceTierFromPayload(body)
@@ -568,6 +569,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 	if err != nil {
 		return nil, err
 	}
+	body = helps.SanitizeCodexInputItemIDs(body)
 	body = helps.SanitizeCodexReasoningEncryptedContent(ctx, "codex websockets executor", body)
 	body = helps.NormalizeCodexToolSelection(body)
 	reporter.SetRequestServiceTierFromPayload(body)
