@@ -97,6 +97,8 @@ type codexWebsocketSession struct {
 
 	upstreamDisconnectOnce sync.Once
 	upstreamDisconnectCh   chan error
+	// logRedactor is protected by connMu.
+	logRedactor *util.PromptCacheLogRedactor
 }
 
 func NewCodexWebsocketsExecutor(cfg *config.Config) *CodexWebsocketsExecutor {
@@ -376,13 +378,13 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 	}
 	dropCodexRawRequestCopies(&req, &opts)
 	if sess == nil {
-		logCodexWebsocketConnected(executionSessionID, authID, wsURL)
+		logCodexWebsocketConnected(executionSessionID, authID, wsURL, helps.CodexPromptCacheLogRedactor(ctx))
 		defer func() {
 			reason := "completed"
 			if err != nil {
 				reason = "error"
 			}
-			logCodexWebsocketDisconnected(executionSessionID, authID, wsURL, reason, err)
+			logCodexWebsocketDisconnected(executionSessionID, authID, wsURL, reason, err, helps.CodexPromptCacheLogRedactor(ctx))
 			if errClose := conn.Close(); errClose != nil {
 				log.Errorf("codex websockets executor: close websocket error: %v", errClose)
 			}
@@ -683,7 +685,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 	dropCodexRawRequestCopies(&req, &opts)
 
 	if sess == nil {
-		logCodexWebsocketConnected(executionSessionID, authID, wsURL)
+		logCodexWebsocketConnected(executionSessionID, authID, wsURL, helps.CodexPromptCacheLogRedactor(ctx))
 	}
 
 	var readCh chan codexWebsocketRead
@@ -741,7 +743,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 			conn = connRetry
 			wsReqBodyRetry = nil
 		} else {
-			logCodexWebsocketDisconnected(executionSessionID, authID, wsURL, "send_error", errSend)
+			logCodexWebsocketDisconnected(executionSessionID, authID, wsURL, "send_error", errSend, helps.CodexPromptCacheLogRedactor(ctx))
 			if errClose := conn.Close(); errClose != nil {
 				log.Errorf("codex websockets executor: close websocket error: %v", errClose)
 			}
@@ -764,7 +766,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 				sess.reqMu.Unlock()
 				return
 			}
-			logCodexWebsocketDisconnected(executionSessionID, authID, wsURL, terminateReason, terminateErr)
+			logCodexWebsocketDisconnected(executionSessionID, authID, wsURL, terminateReason, terminateErr, helps.CodexPromptCacheLogRedactor(ctx))
 			if errClose := conn.Close(); errClose != nil {
 				log.Errorf("codex websockets executor: close websocket error: %v", errClose)
 			}
@@ -1705,6 +1707,10 @@ func (e *CodexWebsocketsExecutor) ensureUpstreamConn(ctx context.Context, auth *
 		conn = nil
 		readerConn = nil
 	}
+	// Retire the previous connection before changing its diagnostic policy.
+	sess.connMu.Lock()
+	sess.logRedactor = helps.CodexPromptCacheLogRedactor(ctx)
+	sess.connMu.Unlock()
 	if conn != nil {
 		if readerConn != conn {
 			sess.connMu.Lock()
@@ -1795,7 +1801,7 @@ func (e *CodexWebsocketsExecutor) ensureUpstreamConn(ctx context.Context, auth *
 
 	sess.configureConn(conn)
 	go e.readUpstreamLoop(sess, conn)
-	logCodexWebsocketConnected(sess.sessionID, authID, wsURL)
+	logCodexWebsocketConnected(sess.sessionID, authID, wsURL, helps.CodexPromptCacheLogRedactor(ctx))
 	return conn, resp, nil
 }
 
@@ -1908,9 +1914,10 @@ func (e *CodexWebsocketsExecutor) invalidateUpstreamConnWithNotify(sess *codexWe
 	sess.proxyBindingID = ""
 	sess.proxyIdentity = ""
 	sess.wsURL = ""
+	logRedactor := sess.logRedactor
 	sess.connMu.Unlock()
 
-	logCodexWebsocketDisconnected(sessionID, authID, wsURL, reason, err)
+	logCodexWebsocketDisconnected(sessionID, authID, wsURL, reason, err, logRedactor)
 	if notify {
 		sess.notifyUpstreamDisconnect(err)
 	}
@@ -2018,27 +2025,46 @@ func closeCodexWebsocketSession(sess *codexWebsocketSession, reason string) {
 		sess.readerConn = nil
 	}
 	sessionID := sess.sessionID
+	logRedactor := sess.logRedactor
 	sess.connMu.Unlock()
 
 	if conn == nil {
 		return
 	}
-	logCodexWebsocketDisconnected(sessionID, authID, wsURL, reason, nil)
+	logCodexWebsocketDisconnected(sessionID, authID, wsURL, reason, nil, logRedactor)
 	if errClose := conn.Close(); errClose != nil {
 		log.Errorf("codex websockets executor: close websocket error: %v", errClose)
 	}
 }
 
-func logCodexWebsocketConnected(sessionID string, authID string, wsURL string) {
-	log.Infof("codex websockets: upstream connected session=%s auth=%s url=%s", strings.TrimSpace(sessionID), strings.TrimSpace(authID), strings.TrimSpace(wsURL))
-}
-
-func logCodexWebsocketDisconnected(sessionID string, authID string, wsURL string, reason string, err error) {
-	if err != nil {
-		log.Infof("codex websockets: upstream disconnected session=%s auth=%s url=%s reason=%s err=%v", strings.TrimSpace(sessionID), strings.TrimSpace(authID), strings.TrimSpace(wsURL), strings.TrimSpace(reason), err)
+func logCodexWebsocketConnected(sessionID string, authID string, wsURL string, redactors ...*util.PromptCacheLogRedactor) {
+	if !log.IsLevelEnabled(log.InfoLevel) {
 		return
 	}
-	log.Infof("codex websockets: upstream disconnected session=%s auth=%s url=%s reason=%s", strings.TrimSpace(sessionID), strings.TrimSpace(authID), strings.TrimSpace(wsURL), strings.TrimSpace(reason))
+	var redactor *util.PromptCacheLogRedactor
+	if len(redactors) > 0 {
+		redactor = redactors[0]
+	}
+	log.Infof("codex websockets: upstream connected session=%s auth=%s url=%s", helps.CodexWebsocketSessionLogID(sessionID), redactor.Redact(strings.TrimSpace(authID)), redactor.Redact(strings.TrimSpace(wsURL)))
+}
+
+func logCodexWebsocketDisconnected(sessionID string, authID string, wsURL string, reason string, err error, redactors ...*util.PromptCacheLogRedactor) {
+	if !log.IsLevelEnabled(log.InfoLevel) {
+		return
+	}
+	var redactor *util.PromptCacheLogRedactor
+	if len(redactors) > 0 {
+		redactor = redactors[0]
+	}
+	sessionID = helps.CodexWebsocketSessionLogID(sessionID)
+	authID = redactor.Redact(strings.TrimSpace(authID))
+	wsURL = redactor.Redact(strings.TrimSpace(wsURL))
+	reason = redactor.Redact(strings.TrimSpace(reason))
+	if err != nil {
+		log.Infof("codex websockets: upstream disconnected session=%s auth=%s url=%s reason=%s err=%s", sessionID, authID, wsURL, reason, helps.CodexWebsocketLogError(err, redactor))
+		return
+	}
+	log.Infof("codex websockets: upstream disconnected session=%s auth=%s url=%s reason=%s", sessionID, authID, wsURL, reason)
 }
 
 // CloseCodexWebsocketSessionsForAuthID closes all active Codex upstream websocket sessions
