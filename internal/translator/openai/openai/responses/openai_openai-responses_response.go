@@ -621,6 +621,7 @@ func ConvertOpenAIChatCompletionsResponseToOpenAIResponses(ctx context.Context, 
 // ConvertOpenAIChatCompletionsResponseToOpenAIResponsesNonStream builds a single Responses JSON
 // from a non-streaming OpenAI Chat Completions response.
 func ConvertOpenAIChatCompletionsResponseToOpenAIResponsesNonStream(_ context.Context, _ string, originalRequestRawJSON, requestRawJSON, rawJSON []byte, _ *any) []byte {
+	toolIdentities := responsesToolIdentities(pickResponsesRequestJSON(originalRequestRawJSON, requestRawJSON))
 	root := gjson.ParseBytes(rawJSON)
 
 	// Basic response scaffold
@@ -641,8 +642,8 @@ func ConvertOpenAIChatCompletionsResponseToOpenAIResponsesNonStream(_ context.Co
 	resp, _ = sjson.SetBytes(resp, "created_at", created)
 
 	// Echo request fields when available (aligns with streaming path behavior)
-	if len(requestRawJSON) > 0 {
-		req := gjson.ParseBytes(requestRawJSON)
+	if request := pickResponsesRequestJSON(originalRequestRawJSON, requestRawJSON); len(request) > 0 {
+		req := gjson.ParseBytes(request)
 		if v := req.Get("instructions"); v.Exists() {
 			resp, _ = sjson.SetBytes(resp, "instructions", v.String())
 		}
@@ -756,11 +757,7 @@ func ConvertOpenAIChatCompletionsResponseToOpenAIResponsesNonStream(_ context.Co
 						callID := tc.Get("id").String()
 						name := tc.Get("function.name").String()
 						args := tc.Get("function.arguments").String()
-						item := []byte(`{"id":"","type":"function_call","status":"completed","arguments":"","call_id":"","name":""}`)
-						item, _ = sjson.SetBytes(item, "id", fmt.Sprintf("fc_%s", callID))
-						item, _ = sjson.SetBytes(item, "arguments", args)
-						item, _ = sjson.SetBytes(item, "call_id", callID)
-						item, _ = sjson.SetBytes(item, "name", name)
+						item := buildResponsesToolItem(toolIdentities, name, callID, args, "completed")
 						outputsWrapper, _ = sjson.SetRawBytes(outputsWrapper, "arr.-1", item)
 						return true
 					})

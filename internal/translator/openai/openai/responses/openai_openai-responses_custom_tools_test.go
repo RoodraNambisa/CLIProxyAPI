@@ -41,3 +41,22 @@ func TestResponsesToolRequestKeepsQualifiedNamesAndExactSchema(t *testing.T) {
 		t.Fatal("tool schema numeric precision or explicit strict=false changed")
 	}
 }
+
+func TestResponsesCustomToolsNonStreamIdentityUsesWinningDeclaration(t *testing.T) {
+	for _, custom := range []bool{false, true} {
+		request := []byte(`{"input":[{"type":"additional_tools","tools":[{"type":"namespace","name":"editor","tools":[{"type":"custom","name":"patch"}]}]}]}`)
+		if !custom {
+			request = []byte(`{"tools":[{"type":"function","name":"editor__patch","parameters":{}}],"input":[{"type":"additional_tools","tools":[{"type":"namespace","name":"editor","tools":[{"type":"custom","name":"patch"}]}]}]}`)
+		}
+		response := []byte(`{"id":"reply","choices":[{"message":{"tool_calls":[{"id":"call_x","function":{"name":"editor__patch","arguments":"{\"input\":\"raw\\ntext\"}"}}]},"finish_reason":"tool_calls"}]}`)
+		out := ConvertOpenAIChatCompletionsResponseToOpenAIResponsesNonStream(t.Context(), "model", request, nil, response, nil)
+		item := gjson.GetBytes(out, "output.0")
+		if custom {
+			if item.Get("type").String() != "custom_tool_call" || item.Get("input").String() != "raw\ntext" || item.Get("namespace").String() != "editor" || item.Get("name").String() != "patch" {
+				t.Fatal("custom output identity or input was lost")
+			}
+		} else if item.Get("type").String() != "function_call" || item.Get("name").String() != "editor__patch" || item.Get("namespace").Exists() || item.Get("input").Exists() {
+			t.Fatal("discarded custom declaration changed an ordinary function")
+		}
+	}
+}
