@@ -72,6 +72,21 @@ func SlimRequestBodyForTranslation(body []byte) []byte {
 		out, _ = sjson.SetRawBytes(out, "tools", tools)
 		copied = true
 	}
+	var additionalTools []json.RawMessage
+	for _, item := range gjson.GetBytes(body, "input").Array() {
+		if item.Get("type").String() != "additional_tools" {
+			continue
+		}
+		if tools := slimRequestTools(item.Get("tools")); len(tools) > 0 {
+			declaration, _ := sjson.SetRawBytes([]byte(`{"type":"additional_tools"}`), "tools", tools)
+			additionalTools = append(additionalTools, declaration)
+		}
+	}
+	if len(additionalTools) > 0 {
+		encoded, _ := json.Marshal(additionalTools)
+		out, _ = sjson.SetRawBytes(out, "input", encoded)
+		copied = true
+	}
 	if nested := gjson.GetBytes(body, "request"); nested.IsObject() {
 		if slim := SlimRequestBodyForTranslation([]byte(nested.Raw)); len(slim) > 0 {
 			out, _ = sjson.SetRawBytes(out, "request", slim)
@@ -95,6 +110,7 @@ func slimRequestTools(tools gjson.Result) []byte {
 		Name string `json:"name,omitempty"`
 	}
 	type slimTool struct {
+		Tools                json.RawMessage   `json:"tools,omitempty"`
 		Type                 string            `json:"type,omitempty"`
 		Name                 string            `json:"name,omitempty"`
 		Function             *slimFunction     `json:"function,omitempty"`
@@ -108,6 +124,9 @@ func slimRequestTools(tools gjson.Result) []byte {
 		}
 		if name := strings.TrimSpace(tool.Get("function.name").String()); name != "" {
 			item.Function = &slimFunction{Name: name}
+		}
+		if item.Type == "namespace" {
+			item.Tools = slimRequestTools(tool.Get("tools"))
 		}
 		if declarations := tool.Get("functionDeclarations"); declarations.IsArray() {
 			for _, declaration := range declarations.Array() {
