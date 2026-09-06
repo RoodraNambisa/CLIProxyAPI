@@ -110,6 +110,7 @@ func codexRequestField(rawKey []byte) codexRequestFieldKind {
 	case bytes.Equal(rawKey, []byte(`"stream_options"`)):
 		return codexRequestFieldStreamOptions
 	case bytes.Equal(rawKey, []byte(`"previous_response_id"`)),
+		bytes.Equal(rawKey, []byte(`"generate"`)),
 		bytes.Equal(rawKey, []byte(`"prompt_cache_retention"`)),
 		bytes.Equal(rawKey, []byte(`"safety_identifier"`)):
 		return codexRequestFieldResponseState
@@ -130,7 +131,7 @@ func codexRequestField(rawKey []byte) codexRequestFieldKind {
 		return codexRequestFieldInstructions
 	case "stream_options":
 		return codexRequestFieldStreamOptions
-	case "previous_response_id", "prompt_cache_retention", "safety_identifier":
+	case "previous_response_id", "generate", "prompt_cache_retention", "safety_identifier":
 		return codexRequestFieldResponseState
 	default:
 		return codexRequestFieldOther

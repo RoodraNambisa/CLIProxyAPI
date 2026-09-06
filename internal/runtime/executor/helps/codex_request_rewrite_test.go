@@ -7,6 +7,18 @@ import (
 	"github.com/tidwall/gjson"
 )
 
+func TestCodexRequestEnvelopeDropsWebsocketGenerateOnlyForHTTP(t *testing.T) {
+	for _, strip := range []bool{false, true} {
+		got, err := RewriteCodexRequestEnvelope([]byte(`{"generate":false,"gen\u0065rate":false,"input":[]}`), CodexRequestRewriteOptions{StripResponseState: strip})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if gjson.GetBytes(got, "generate").Exists() == strip {
+			t.Fatal("WebSocket-only generate flag crossed the HTTP boundary or was removed from WebSocket")
+		}
+	}
+}
+
 func TestRewriteCodexRequestEnvelope(t *testing.T) {
 	payload := []byte(`{"model":"old","stream":false,"previous_response_id":"resp-1","prompt_cache_retention":"24h","safety_identifier":"safe","stream_options":{"include_usage":true},"instructions":null,"input":[{"type":"input_image","image_url":"data:image/png;base64,AAAA"}],"unknown":{"nested":[1,{"keep":true}]}}`)
 	wantInput := gjson.GetBytes(payload, "input").Raw
