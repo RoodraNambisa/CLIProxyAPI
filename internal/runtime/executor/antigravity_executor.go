@@ -385,7 +385,7 @@ func (e *AntigravityExecutor) HttpRequest(ctx context.Context, auth *cliproxyaut
 	}
 
 	httpClient := newAntigravityHTTPClient(ctx, e.cfg, auth, 0)
-	return httpClient.Do(httpReq)
+	return helps.DoUpstreamHTTPRequest(httpClient, httpReq)
 }
 
 func injectEnabledCreditTypes(payload []byte) []byte {
@@ -842,7 +842,7 @@ func (e *AntigravityExecutor) attemptCreditsFallback(
 		recordAntigravityCreditsFailure(auth, now)
 		return nil, true
 	}
-	httpResp, errDo := httpClient.Do(httpReq)
+	httpResp, errDo := helps.DoUpstreamHTTPRequest(httpClient, httpReq)
 	if errDo != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, errDo)
 		clearAntigravityPreferCredits(auth, modelName)
@@ -1024,7 +1024,7 @@ attemptLoop:
 				return resp, err
 			}
 
-			httpResp, errDo := httpClient.Do(httpReq)
+			httpResp, errDo := helps.DoUpstreamHTTPRequest(httpClient, httpReq)
 			if errDo != nil {
 				helps.RecordAPIResponseError(ctx, e.cfg, errDo)
 				if errors.Is(errDo, context.Canceled) || errors.Is(errDo, context.DeadlineExceeded) {
@@ -1272,7 +1272,7 @@ attemptLoop:
 				return resp, err
 			}
 
-			httpResp, errDo := httpClient.Do(httpReq)
+			httpResp, errDo := helps.DoUpstreamHTTPRequest(httpClient, httpReq)
 			if errDo != nil {
 				helps.RecordAPIResponseError(ctx, e.cfg, errDo)
 				if errors.Is(errDo, context.Canceled) || errors.Is(errDo, context.DeadlineExceeded) {
@@ -1782,7 +1782,7 @@ attemptLoop:
 				err = errReq
 				return nil, err
 			}
-			httpResp, errDo := httpClient.Do(httpReq)
+			httpResp, errDo := helps.DoUpstreamHTTPRequest(httpClient, httpReq)
 			if errDo != nil {
 				helps.RecordAPIResponseError(ctx, e.cfg, errDo)
 				if errors.Is(errDo, context.Canceled) || errors.Is(errDo, context.DeadlineExceeded) {
@@ -2203,7 +2203,7 @@ func (e *AntigravityExecutor) CountTokens(ctx context.Context, auth *cliproxyaut
 			AuthValue: authValue,
 		})
 
-		httpResp, errDo := httpClient.Do(httpReq)
+		httpResp, errDo := helps.DoUpstreamHTTPRequest(httpClient, httpReq)
 		if errDo != nil {
 			helps.RecordAPIResponseError(ctx, e.cfg, errDo)
 			if errors.Is(errDo, context.Canceled) || errors.Is(errDo, context.DeadlineExceeded) {
@@ -2561,7 +2561,7 @@ func (e *AntigravityExecutor) refreshTokenSingleFlight(ctx context.Context, auth
 	httpReq.Header.Set("User-Agent", "Go-http-client/2.0")
 
 	httpClient := newAntigravityHTTPClient(ctx, e.cfg, auth, 0)
-	httpResp, errDo := httpClient.Do(httpReq)
+	httpResp, errDo := helps.DoUpstreamHTTPRequest(httpClient, httpReq)
 	if errDo != nil {
 		return nil, errDo
 	}
@@ -2698,7 +2698,7 @@ func (e *AntigravityExecutor) fetchAntigravityCreditsHint(ctx context.Context, a
 	httpReq.Header.Set("User-Agent", misc.AntigravityLoadCodeAssistUserAgent(resolveUserAgent(auth)))
 
 	httpClient := newAntigravityHTTPClient(ctx, e.cfg, auth, 0)
-	httpResp, errDo := httpClient.Do(httpReq)
+	httpResp, errDo := helps.DoUpstreamHTTPRequest(httpClient, httpReq)
 	if errDo != nil {
 		log.Debugf("antigravity executor: loadCodeAssist request error: %v", errDo)
 		return cliproxyauth.AntigravityCreditsHint{}, false

@@ -154,7 +154,7 @@ func executeXAIHTTPRequest(httpClient *http.Client, req *http.Request, auth *cli
 	if !active {
 		return nil, errXAIWebsocketSessionTerminated
 	}
-	resp, errRequest := httpClient.Do(req.WithContext(runtimeCtx))
+	resp, errRequest := helps.DoUpstreamHTTPRequest(httpClient, req.WithContext(runtimeCtx))
 	if errRequest != nil || resp == nil || resp.Body == nil {
 		if releaseExecution() {
 			return nil, errXAIWebsocketSessionTerminated

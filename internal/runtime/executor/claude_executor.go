@@ -125,7 +125,7 @@ func (e *ClaudeExecutor) HttpRequest(ctx context.Context, auth *cliproxyauth.Aut
 		return nil, err
 	}
 	httpClient := helps.NewUtlsHTTPClient(e.cfg, auth, 0)
-	return httpClient.Do(httpReq)
+	return helps.DoUpstreamHTTPRequest(httpClient, httpReq)
 }
 
 func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (resp cliproxyexecutor.Response, err error) {
@@ -246,7 +246,7 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	bodyForUpstream = nil
 
 	httpClient := helps.NewUtlsHTTPClient(e.cfg, auth, 0)
-	httpResp, err := httpClient.Do(httpReq)
+	httpResp, err := helps.DoUpstreamHTTPRequest(httpClient, httpReq)
 	if err != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
 		return resp, err
@@ -443,7 +443,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	bodyForUpstream = nil
 
 	httpClient := helps.NewUtlsHTTPClient(e.cfg, auth, 0)
-	httpResp, err := httpClient.Do(httpReq)
+	httpResp, err := helps.DoUpstreamHTTPRequest(httpClient, httpReq)
 	if err != nil {
 		cleanupBodies()
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
@@ -689,7 +689,7 @@ func (e *ClaudeExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Aut
 	body = nil
 
 	httpClient := helps.NewUtlsHTTPClient(e.cfg, auth, 0)
-	resp, err := httpClient.Do(httpReq)
+	resp, err := helps.DoUpstreamHTTPRequest(httpClient, httpReq)
 	if err != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
 		return cliproxyexecutor.Response{}, err
