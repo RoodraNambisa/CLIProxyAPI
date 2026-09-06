@@ -276,7 +276,8 @@ func TestChatGPTWebExecutorExecuteTextConversation(t *testing.T) {
 	executor := NewChatGPTWebExecutor(nil, nil)
 	executor.runtimeBaseURL = server.URL
 
-	response, err := executor.Execute(context.Background(), chatGPTWebRuntimeAuth(), cliproxyexecutor.Request{
+	ctx := cliproxyexecutor.WithUpstreamAttempt(t.Context())
+	response, err := executor.Execute(ctx, chatGPTWebRuntimeAuth(), cliproxyexecutor.Request{
 		Model:   "gpt-5",
 		Payload: []byte(`{"model":"gpt-5","input":"hello"}`),
 	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatCodex, ResponseFormat: sdktranslator.FormatCodex})
@@ -285,6 +286,9 @@ func TestChatGPTWebExecutorExecuteTextConversation(t *testing.T) {
 	}
 	if got := gjson.GetBytes(response.Payload, "response.output.0.content.0.text").String(); got != "Hello world" {
 		t.Fatalf("assistant text = %q, payload=%s", got, response.Payload)
+	}
+	if !cliproxyexecutor.IsUpstreamAttemptError(cliproxyexecutor.ErrorFromUpstreamAttempt(ctx, errors.New("observed request"))) {
+		t.Fatal("text execution did not retain upstream evidence")
 	}
 }
 
@@ -466,7 +470,8 @@ func TestChatGPTWebExecutorExecuteStreamTextConversation(t *testing.T) {
 	executor := NewChatGPTWebExecutor(nil, nil)
 	executor.runtimeBaseURL = server.URL
 
-	result, err := executor.ExecuteStream(context.Background(), chatGPTWebRuntimeAuth(), cliproxyexecutor.Request{
+	ctx := cliproxyexecutor.WithUpstreamAttempt(t.Context())
+	result, err := executor.ExecuteStream(ctx, chatGPTWebRuntimeAuth(), cliproxyexecutor.Request{
 		Model:   "gpt-5",
 		Payload: []byte(`{"model":"gpt-5","input":"hello","stream":true}`),
 	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatCodex, ResponseFormat: sdktranslator.FormatCodex})
@@ -493,6 +498,9 @@ func TestChatGPTWebExecutorExecuteStreamTextConversation(t *testing.T) {
 		t.Fatalf("stream output = %s", output.String())
 	}
 	assertChatGPTWebEventSequence(t, events)
+	if !cliproxyexecutor.IsUpstreamAttemptError(cliproxyexecutor.ErrorFromUpstreamAttempt(ctx, errors.New("observed request"))) {
+		t.Fatal("stream execution did not retain upstream evidence")
+	}
 }
 
 func TestChatGPTWebExecutorTextStreamCommitsBeforeLateProtocolFailure(t *testing.T) {
@@ -1057,7 +1065,8 @@ func TestChatGPTWebExecutorImageLifecycleAdmissionPrecedesFirstUpstream(t *testi
 	}
 	defer release()
 
-	_, err = executor.Execute(t.Context(), chatGPTWebRuntimeAuth(), cliproxyexecutor.Request{
+	ctx := cliproxyexecutor.WithUpstreamAttempt(t.Context())
+	_, err = executor.Execute(ctx, chatGPTWebRuntimeAuth(), cliproxyexecutor.Request{
 		Model:   "gpt-image-2",
 		Payload: []byte(`{"model":"gpt-image-2","input":"draw","tools":[{"type":"image_generation"}]}`),
 	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatCodex, ResponseFormat: sdktranslator.FormatCodex})
@@ -1066,6 +1075,9 @@ func TestChatGPTWebExecutorImageLifecycleAdmissionPrecedesFirstUpstream(t *testi
 	}
 	if got := upstreamCalls.Load(); got != 0 {
 		t.Fatalf("upstream calls = %d, want 0", got)
+	}
+	if cliproxyexecutor.IsUpstreamAttemptError(cliproxyexecutor.ErrorFromUpstreamAttempt(ctx, err)) {
+		t.Fatal("local capacity rejection was counted as upstream traffic")
 	}
 }
 

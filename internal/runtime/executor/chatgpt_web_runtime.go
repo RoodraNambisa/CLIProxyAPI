@@ -340,7 +340,10 @@ func (e *ChatGPTWebExecutor) executeRuntime(ctx context.Context, auth *cliproxya
 	if err != nil {
 		return resp, err
 	}
-	client.SetBeforeRequestHook(func() { commitChatGPTWebAuthRequestSlot(opts) })
+	client.SetBeforeRequestHook(func() {
+		cliproxyexecutor.MarkUpstreamAttempt(ctx)
+		commitChatGPTWebAuthRequestSlot(opts)
+	})
 	outcomePersona = credential.Persona
 	defer e.finishChatGPTWebRuntimeClient(ctx, auth, credential, client)
 
@@ -444,7 +447,10 @@ func (e *ChatGPTWebExecutor) executeRuntimeStream(ctx context.Context, auth *cli
 		prepared.discardUsageProjection()
 		return nil, err
 	}
-	client.SetBeforeRequestHook(func() { commitChatGPTWebAuthRequestSlot(opts) })
+	client.SetBeforeRequestHook(func() {
+		cliproxyexecutor.MarkUpstreamAttempt(ctx)
+		commitChatGPTWebAuthRequestSlot(opts)
+	})
 	outcomePersona = credential.Persona
 
 	if prepared.request.Image != nil {
