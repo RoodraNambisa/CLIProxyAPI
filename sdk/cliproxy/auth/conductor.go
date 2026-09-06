@@ -7821,6 +7821,8 @@ func (m *Manager) markResult(
 			disableAuthForInvalidGrant(auth, result.Error, now)
 		} else if !result.Success && (auth.Disabled || auth.Status == StatusDisabled) {
 			// Preserve an explicit disabled state against late in-flight results.
+		} else if !result.Success && isCredentialNeutralFailure(result.Error) {
+			// Request faults do not change credential availability.
 		} else if staleDynamicModelResult {
 			// A dynamic catalog refresh already removed this model while the
 			// request was in flight. Keep the result observable to hooks without
@@ -8658,7 +8660,7 @@ func authHasRefreshCredential(auth *Auth) bool {
 }
 
 func deferUnauthorizedStreamResult(auth *Auth, err error) bool {
-	if auth == nil {
+	if auth == nil || isKnownRequestFault(err) {
 		return false
 	}
 	switch strings.ToLower(strings.TrimSpace(auth.Provider)) {
@@ -8899,6 +8901,9 @@ func isRequestInvalidErrorWithConfig(err error, cfg *internalconfig.Config) bool
 	if isModelSupportError(err) {
 		return false
 	}
+	if isKnownRequestFault(err) {
+		return true
+	}
 	status := statusCodeFromError(err)
 	switch status {
 	case http.StatusBadRequest:
@@ -9019,7 +9024,7 @@ func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Durati
 	if auth == nil {
 		return
 	}
-	if isRequestScopedNotFoundResultError(resultErr) {
+	if isCredentialNeutralFailure(resultErr) {
 		return
 	}
 	auth.Status = StatusError
@@ -10859,7 +10864,7 @@ func sameAuthRequestRefreshLockIDs(left, right []string) bool {
 // tryRefreshAfterUnauthorized applies the provider-specific recovery policy
 // after an unauthorized response.
 func (m *Manager) tryRefreshAfterUnauthorized(ctx context.Context, executor ProviderExecutor, auth *Auth, execErr error, alreadyTried bool) (*Auth, bool, error) {
-	if m == nil || auth == nil || alreadyTried || execErr == nil {
+	if m == nil || auth == nil || alreadyTried || execErr == nil || isKnownRequestFault(execErr) {
 		return auth, false, nil
 	}
 	if recoverer, ok := executor.(UnauthorizedAuthRecoverer); ok && recoverer.ShouldRecoverUnauthorized(auth, execErr) {
