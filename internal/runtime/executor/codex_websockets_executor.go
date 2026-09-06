@@ -924,6 +924,7 @@ func (e *CodexWebsocketsExecutor) dialCodexWebsocket(ctx context.Context, auth *
 		ctx = context.Background()
 	}
 	conn, resp, err := dialer.DialContext(ctx, wsURL, headers)
+	helps.ObserveUpstreamWebsocketDial(ctx, resp, err)
 	if conn != nil {
 		// Avoid gorilla/websocket flate tail validation issues on some upstreams/Go versions.
 		// Negotiating permessage-deflate is fine; we just don't compress outbound messages.
@@ -946,7 +947,7 @@ func writeCurrentCodexWebsocketMessage(ctx context.Context, auth *cliproxyauth.A
 	if errCurrent := codexWebsocketExecutionStateError(ctx, auth); errCurrent != nil {
 		return errCurrent
 	}
-	return writeCodexWebsocketMessage(sess, conn, payload)
+	return helps.ObserveUpstreamWebsocketWrite(ctx, writeCodexWebsocketMessage(sess, conn, payload))
 }
 
 func mapCodexWebsocketReadError(err error) error {

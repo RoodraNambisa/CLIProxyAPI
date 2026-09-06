@@ -720,7 +720,7 @@ func (e *CodexExecutor) HttpRequest(ctx context.Context, auth *cliproxyauth.Auth
 		return nil, err
 	}
 	httpClient := e.newCodexHTTPClient(ctx, auth, false)
-	return httpClient.Do(httpReq)
+	return helps.DoUpstreamHTTPRequest(httpClient, httpReq)
 }
 
 func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (resp cliproxyexecutor.Response, err error) {
@@ -823,7 +823,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	})
 	upstreamBody = nil
 	httpClient := e.newCodexHTTPClient(ctx, auth, imageRequest)
-	httpResp, err := httpClient.Do(httpReq)
+	httpResp, err := helps.DoUpstreamHTTPRequest(httpClient, httpReq)
 	if err != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
 		return resp, err
@@ -1013,7 +1013,7 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 	})
 	upstreamBody = nil
 	httpClient := e.newCodexHTTPClient(ctx, auth, imageRequest)
-	httpResp, err := httpClient.Do(httpReq)
+	httpResp, err := helps.DoUpstreamHTTPRequest(httpClient, httpReq)
 	if err != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
 		return resp, err
@@ -1155,7 +1155,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	upstreamBody = nil
 
 	httpClient := e.newCodexHTTPClient(ctx, auth, imageRequest)
-	httpResp, err := httpClient.Do(httpReq)
+	httpResp, err := helps.DoUpstreamHTTPRequest(httpClient, httpReq)
 	if err != nil {
 		cleanupBodies()
 		helps.RecordAPIResponseError(ctx, e.cfg, err)

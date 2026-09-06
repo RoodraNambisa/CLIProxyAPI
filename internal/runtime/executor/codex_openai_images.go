@@ -131,7 +131,7 @@ func (e *CodexExecutor) executeOpenAIImage(ctx context.Context, auth *cliproxyau
 	recordCodexOpenAIImageRequest(ctx, e, auth, url, httpReq.Header.Clone(), upstreamBody)
 	upstreamBody = nil
 
-	httpResp, err := e.newCodexHTTPClient(ctx, auth, true).Do(httpReq)
+	httpResp, err := helps.DoUpstreamHTTPRequest(e.newCodexHTTPClient(ctx, auth, true), httpReq)
 	if err != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
 		return resp, err
@@ -210,7 +210,7 @@ func (e *CodexExecutor) executeOpenAIImageStream(ctx context.Context, auth *clip
 	recordCodexOpenAIImageRequest(ctx, e, auth, url, httpReq.Header.Clone(), upstreamBody)
 	upstreamBody = nil
 
-	httpResp, err := e.newCodexHTTPClient(ctx, auth, true).Do(httpReq)
+	httpResp, err := helps.DoUpstreamHTTPRequest(e.newCodexHTTPClient(ctx, auth, true), httpReq)
 	if err != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
 		return nil, err
