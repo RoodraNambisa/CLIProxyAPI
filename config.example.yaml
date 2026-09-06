@@ -685,6 +685,10 @@ nonstream-keepalive-interval: 0
 # Upstream response states are always recorded and returned to the client. The default is `guard-cross-account`.
 # codex:
 #   identity-confuse: false
+#   # Preserve explicit non-empty string prompt_cache_key values across identity remapping.
+#   # Defaults to false. Missing/invalid keys keep existing generation behavior.
+#   # Hot updates affect the next logical request (or next WebSocket turn), never its retries.
+#   passthrough-prompt-cache-key: false
 #   spoof-session-identity: false
 #   turn-state-policy: "guard-cross-account"
 #   enforce-software-identity: true # normalize outbound User-Agent, Originator, and Version; default true

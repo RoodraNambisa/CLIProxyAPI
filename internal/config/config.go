@@ -539,10 +539,12 @@ type CodexHeaderDefaults struct {
 
 // CodexConfig configures provider-wide Codex request behavior.
 type CodexConfig struct {
-	IdentityConfuse         bool                 `yaml:"identity-confuse" json:"identity-confuse"`
-	SpoofSessionIdentity    bool                 `yaml:"spoof-session-identity" json:"spoof-session-identity"`
-	TurnStatePolicy         CodexTurnStatePolicy `yaml:"turn-state-policy" json:"turn-state-policy"`
-	EnforceSoftwareIdentity *bool                `yaml:"enforce-software-identity,omitempty" json:"enforce-software-identity,omitempty"`
+	// PassthroughPromptCacheKey preserves explicit client cache keys independently of session identity.
+	PassthroughPromptCacheKey bool                 `yaml:"passthrough-prompt-cache-key" json:"passthrough-prompt-cache-key"`
+	IdentityConfuse           bool                 `yaml:"identity-confuse" json:"identity-confuse"`
+	SpoofSessionIdentity      bool                 `yaml:"spoof-session-identity" json:"spoof-session-identity"`
+	TurnStatePolicy           CodexTurnStatePolicy `yaml:"turn-state-policy" json:"turn-state-policy"`
+	EnforceSoftwareIdentity   *bool                `yaml:"enforce-software-identity,omitempty" json:"enforce-software-identity,omitempty"`
 }
 
 // CodexTurnStatePolicy controls how client turn-state headers are forwarded to Codex OAuth upstreams.

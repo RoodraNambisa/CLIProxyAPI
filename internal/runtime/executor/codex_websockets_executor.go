@@ -289,7 +289,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 	}
 	clientBody := body
 	preparedIdentity := e.codexPreparedSessionIdentity(ctx, req, opts)
-	upstreamBody, identityState := applyCodexIdentityConfuseBody(e.cfg, auth, originalPayloadSource, body, preparedIdentity.TurnID)
+	upstreamBody, identityState := applyCodexPreparedIdentityConfuseBody(e.cfg, auth, originalPayloadSource, body, preparedIdentity)
 	wsHeaders, err = prepareCodexWebsocketHeadersForURL(ctx, wsHeaders, auth, apiKey, e.cfg, parsedURLOrNil(wsURL))
 	if err != nil {
 		return resp, err
@@ -588,7 +588,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 	}
 	clientBody := body
 	preparedIdentity := e.codexPreparedSessionIdentity(ctx, req, opts)
-	upstreamBody, identityState := applyCodexIdentityConfuseBody(e.cfg, auth, userPayload, body, preparedIdentity.TurnID)
+	upstreamBody, identityState := applyCodexPreparedIdentityConfuseBody(e.cfg, auth, userPayload, body, preparedIdentity)
 	wsHeaders, err = prepareCodexWebsocketHeadersForURL(ctx, wsHeaders, auth, apiKey, e.cfg, parsedURLOrNil(wsURL))
 	if err != nil {
 		return nil, err

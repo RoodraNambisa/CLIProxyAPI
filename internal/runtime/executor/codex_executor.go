@@ -320,6 +320,7 @@ func NewCodexExecutor(cfg *config.Config) *CodexExecutor { return &CodexExecutor
 func (e *CodexExecutor) Identifier() string { return "codex" }
 
 type codexPreparedSessionIdentity struct {
+	PromptCacheKey helps.CodexPromptCacheKeySnapshot
 	ResponsesLite  helps.CodexResponsesLiteSnapshot
 	Enabled        bool
 	SessionID      string
@@ -359,6 +360,7 @@ func (e *CodexExecutor) PrepareProviderRequest(ctx context.Context, req cliproxy
 		liteHeaders.Set(helps.CodexResponsesLiteHeader, value)
 	}
 	prepared := codexPreparedSessionIdentity{
+		PromptCacheKey: helps.SnapshotCodexPromptCacheKey(payload, e.cfg != nil && e.cfg.Codex.PassthroughPromptCacheKey),
 		ResponsesLite:  helps.SnapshotCodexResponsesLite(payload, liteHeaders, cliproxyexecutor.DownstreamWebsocket(ctx)),
 		Enabled:        codexSpoofSessionIdentityEnabled(e.cfg),
 		TurnID:         turnID,
@@ -1710,12 +1712,13 @@ func (e *CodexExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*
 }
 
 type codexIdentityConfuseState struct {
-	enabled                bool
-	authID                 string
-	originalPromptCacheKey string
-	promptCacheKey         string
-	turnIDBase             string
-	turnIDs                []codexIdentityReplacement
+	protectedPromptCacheKey string
+	enabled                 bool
+	authID                  string
+	originalPromptCacheKey  string
+	promptCacheKey          string
+	turnIDBase              string
+	turnIDs                 []codexIdentityReplacement
 }
 
 type codexIdentityReplacement struct {
@@ -1814,8 +1817,9 @@ func (e *CodexExecutor) projectCodexSessionIdentity(
 		client = applyCodexIdentityConfuseSessionSource(client, identityConfuse)
 	}
 	projection := helps.CodexSessionIdentityProjection{
-		InstallationID: fingerprint.installationID,
-		ProjectSession: projectSession,
+		ProtectedPromptCacheKey: prepared.PromptCacheKey.Key,
+		InstallationID:          fingerprint.installationID,
+		ProjectSession:          projectSession,
 	}
 	if fingerprint.mode == codexauth.FingerprintModeSession || fingerprint.mode == codexauth.FingerprintModeFull {
 		projection.ForcedIdentity = helps.CodexSessionIdentity{
@@ -2034,9 +2038,11 @@ func (e *CodexExecutor) cacheHelper(ctx context.Context, from sdktranslator.Form
 		sessionHeaderID = cache.ID
 	}
 	var identityState codexIdentityConfuseState
+	prepared := e.codexPreparedSessionIdentity(ctx, req, opts)
 	if allowIdentityConfuse {
-		prepared := e.codexPreparedSessionIdentity(ctx, req, opts)
-		rawJSON, identityState = applyCodexIdentityConfuseBody(e.cfg, auth, userPayload, rawJSON, prepared.TurnID)
+		rawJSON, identityState = applyCodexPreparedIdentityConfuseBody(e.cfg, auth, userPayload, rawJSON, prepared)
+	} else {
+		rawJSON = prepared.PromptCacheKey.Apply(rawJSON)
 	}
 	if identityState.promptCacheKey != "" {
 		cache.ID = identityState.promptCacheKey
@@ -2074,18 +2080,33 @@ func codexPromptCacheLookupKey(namespace, value string) string {
 }
 
 func applyCodexIdentityConfuseBody(cfg *config.Config, auth *cliproxyauth.Auth, userPayload []byte, rawJSON []byte, turnIDBase ...string) ([]byte, codexIdentityConfuseState) {
+	return applyCodexIdentityConfuseBodyWithCacheKey(cfg, auth, userPayload, rawJSON, "", turnIDBase...)
+}
+
+func applyCodexPreparedIdentityConfuseBody(cfg *config.Config, auth *cliproxyauth.Auth, userPayload, rawJSON []byte, prepared codexPreparedSessionIdentity) ([]byte, codexIdentityConfuseState) {
+	rawJSON, state := applyCodexIdentityConfuseBodyWithCacheKey(cfg, auth, userPayload, rawJSON, prepared.PromptCacheKey.Key, prepared.TurnID)
+	return prepared.PromptCacheKey.Apply(rawJSON), state
+}
+
+func applyCodexIdentityConfuseBodyWithCacheKey(cfg *config.Config, auth *cliproxyauth.Auth, userPayload []byte, rawJSON []byte, protectedKey string, turnIDBase ...string) ([]byte, codexIdentityConfuseState) {
 	if !codexIdentityConfuseEnabled(cfg) || auth == nil || strings.TrimSpace(auth.ID) == "" || len(rawJSON) == 0 {
 		return rawJSON, codexIdentityConfuseState{}
 	}
 
-	state := codexIdentityConfuseState{enabled: true, authID: strings.TrimSpace(auth.ID)}
+	state := codexIdentityConfuseState{enabled: true, authID: strings.TrimSpace(auth.ID), protectedPromptCacheKey: protectedKey}
 	if len(turnIDBase) > 0 {
 		state.turnIDBase = strings.TrimSpace(turnIDBase[0])
 	}
-	if promptCacheKey := gjson.GetBytes(userPayload, "prompt_cache_key").String(); strings.TrimSpace(promptCacheKey) != "" {
+	promptCacheKey := gjson.GetBytes(userPayload, "prompt_cache_key").String()
+	if protectedKey != "" {
+		promptCacheKey = protectedKey
+	}
+	if strings.TrimSpace(promptCacheKey) != "" {
 		state.originalPromptCacheKey = promptCacheKey
 		state.promptCacheKey = codexIdentityConfuseUUID(auth.ID, "prompt-cache", promptCacheKey)
-		rawJSON, _ = sjson.SetBytes(rawJSON, "prompt_cache_key", state.promptCacheKey)
+		if protectedKey == "" {
+			rawJSON, _ = sjson.SetBytes(rawJSON, "prompt_cache_key", state.promptCacheKey)
+		}
 	}
 	if installationID := strings.TrimSpace(gjson.GetBytes(userPayload, "client_metadata.x-codex-installation-id").String()); installationID != "" {
 		rawJSON, _ = sjson.SetBytes(rawJSON, "client_metadata.x-codex-installation-id", codexIdentityConfuseUUID(auth.ID, "installation", installationID))
@@ -2123,7 +2144,9 @@ func applyCodexTurnMetadataIdentityConfuse(rawTurnMetadata string, state *codexI
 		return updatedTurnMetadata
 	}
 	if state.promptCacheKey != "" && gjson.Get(rawTurnMetadata, "prompt_cache_key").Exists() {
-		updatedTurnMetadata, _ = sjson.Set(updatedTurnMetadata, "prompt_cache_key", state.promptCacheKey)
+		if state.protectedPromptCacheKey == "" {
+			updatedTurnMetadata, _ = sjson.Set(updatedTurnMetadata, "prompt_cache_key", state.promptCacheKey)
+		}
 	}
 	if turnID := strings.TrimSpace(gjson.Get(rawTurnMetadata, "turn_id").String()); turnID != "" {
 		updatedTurnMetadata, _ = sjson.Set(updatedTurnMetadata, "turn_id", state.confuseTurnID(turnID))
@@ -2132,6 +2155,13 @@ func applyCodexTurnMetadataIdentityConfuse(rawTurnMetadata string, state *codexI
 }
 
 func applyCodexIdentityConfuseResponsePayload(payload []byte, state codexIdentityConfuseState) []byte {
+	if state.protectedPromptCacheKey != "" {
+		payload = helps.ReplaceCodexResponseIdentityFields(payload, state.originalPromptCacheKey, state.promptCacheKey, helps.CodexResponseSessionIdentity)
+		for _, turnID := range state.turnIDs {
+			payload = helps.ReplaceCodexResponseIdentityFields(payload, turnID.original, turnID.confused, helps.CodexResponseTurnIdentity)
+		}
+		return payload
+	}
 	payload = replaceCodexIdentityResponsePayload(payload, state.originalPromptCacheKey, state.promptCacheKey)
 	for _, turnID := range state.turnIDs {
 		payload = replaceCodexIdentityResponsePayload(payload, turnID.original, turnID.confused)
@@ -2140,6 +2170,13 @@ func applyCodexIdentityConfuseResponsePayload(payload []byte, state codexIdentit
 }
 
 func applyCodexIdentityExposeResponsePayload(payload []byte, state codexIdentityConfuseState) []byte {
+	if state.protectedPromptCacheKey != "" {
+		payload = helps.ReplaceCodexResponseIdentityFields(payload, state.promptCacheKey, state.originalPromptCacheKey, helps.CodexResponseSessionIdentity)
+		for _, turnID := range state.turnIDs {
+			payload = helps.ReplaceCodexResponseIdentityFields(payload, turnID.confused, turnID.original, helps.CodexResponseTurnIdentity)
+		}
+		return payload
+	}
 	payload = replaceCodexIdentityResponsePayload(payload, state.promptCacheKey, state.originalPromptCacheKey)
 	for _, turnID := range state.turnIDs {
 		payload = replaceCodexIdentityResponsePayload(payload, turnID.confused, turnID.original)
