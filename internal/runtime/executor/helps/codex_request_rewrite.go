@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+
+	"github.com/tidwall/gjson"
 )
 
 // CodexStreamRewrite controls how the top-level stream field is emitted.
@@ -53,6 +55,14 @@ func RewriteCodexRequestEnvelope(payload []byte, opts CodexRequestRewriteOptions
 			if opts.StripResponseState {
 				return
 			}
+		case codexRequestFieldStreamOptions:
+			if opts.StripResponseState {
+				delivery := gjson.GetBytes(rawValue, "reasoning_summary_delivery")
+				if !delivery.Exists() {
+					return
+				}
+				rawValue = []byte(`{"reasoning_summary_delivery":` + delivery.Raw + `}`)
+			}
 		case codexRequestFieldInstructions:
 			instructionsFound = !bytes.Equal(bytes.TrimSpace(rawValue), []byte("null"))
 			if opts.EnsureInstructions && !instructionsFound {
@@ -86,6 +96,7 @@ const (
 	codexRequestFieldStream
 	codexRequestFieldResponseState
 	codexRequestFieldInstructions
+	codexRequestFieldStreamOptions
 )
 
 func codexRequestField(rawKey []byte) codexRequestFieldKind {
@@ -96,10 +107,11 @@ func codexRequestField(rawKey []byte) codexRequestFieldKind {
 		return codexRequestFieldStream
 	case bytes.Equal(rawKey, []byte(`"instructions"`)):
 		return codexRequestFieldInstructions
+	case bytes.Equal(rawKey, []byte(`"stream_options"`)):
+		return codexRequestFieldStreamOptions
 	case bytes.Equal(rawKey, []byte(`"previous_response_id"`)),
 		bytes.Equal(rawKey, []byte(`"prompt_cache_retention"`)),
-		bytes.Equal(rawKey, []byte(`"safety_identifier"`)),
-		bytes.Equal(rawKey, []byte(`"stream_options"`)):
+		bytes.Equal(rawKey, []byte(`"safety_identifier"`)):
 		return codexRequestFieldResponseState
 	}
 	if !bytes.Contains(rawKey, []byte{'\\'}) {
@@ -116,7 +128,9 @@ func codexRequestField(rawKey []byte) codexRequestFieldKind {
 		return codexRequestFieldStream
 	case "instructions":
 		return codexRequestFieldInstructions
-	case "previous_response_id", "prompt_cache_retention", "safety_identifier", "stream_options":
+	case "stream_options":
+		return codexRequestFieldStreamOptions
+	case "previous_response_id", "prompt_cache_retention", "safety_identifier":
 		return codexRequestFieldResponseState
 	default:
 		return codexRequestFieldOther

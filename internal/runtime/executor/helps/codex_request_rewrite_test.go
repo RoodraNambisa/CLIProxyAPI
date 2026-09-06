@@ -69,6 +69,22 @@ func TestRewriteCodexRequestEnvelopePreservesOrRemovesStream(t *testing.T) {
 	}
 }
 
+func TestRewriteCodexRequestEnvelopePreservesReasoningSummaryDelivery(t *testing.T) {
+	for _, field := range []string{`"stream_options"`, `"stream_\u006fptions"`} {
+		payload := []byte(`{` + field + `:{"reasoning_summary_delivery":"auto","include_usage":true},"input":"hello"}`)
+		got, err := RewriteCodexRequestEnvelope(payload, CodexRequestRewriteOptions{StripResponseState: true, Stream: CodexStreamForceEnabled})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if gjson.GetBytes(got, "stream_options.reasoning_summary_delivery").String() != "auto" {
+			t.Fatal("lost supported summary delivery field")
+		}
+		if gjson.GetBytes(got, "stream_options.include_usage").Exists() {
+			t.Fatal("retained unsupported upstream stream option")
+		}
+	}
+}
+
 func TestRewriteCodexRequestEnvelopeRecognizesEscapedKeys(t *testing.T) {
 	payload := []byte(`{"\u006dodel":"old","\u0073tream":false,"\u0069nstructions":null,"input":"hello"}`)
 	got, err := RewriteCodexRequestEnvelope(payload, CodexRequestRewriteOptions{
