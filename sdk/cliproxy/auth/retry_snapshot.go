@@ -21,10 +21,11 @@ type cooldownRulesSnapshot struct {
 }
 
 type requestRetrySettings struct {
-	manager       *Manager
-	settings      *retrySettingsSnapshot
-	errorRules    []internalconfig.NonRetryableErrorRule
-	cooldownRules cooldownRulesSnapshot
+	codexOptimizeMultiAgentV2 bool
+	manager                   *Manager
+	settings                  *retrySettingsSnapshot
+	errorRules                []internalconfig.NonRetryableErrorRule
+	cooldownRules             cooldownRulesSnapshot
 }
 
 func (m *Manager) withRetrySettingsSnapshot(ctx context.Context) context.Context {
@@ -36,7 +37,8 @@ func (m *Manager) withRetrySettingsSnapshot(ctx context.Context) context.Context
 	cooldownRules.noCooldownStatusCodes = slices.Clone(cooldownRules.noCooldownStatusCodes)
 	cooldownRules.fixedErrorCooldowns = slices.Clone(cooldownRules.fixedErrorCooldowns)
 	return context.WithValue(ctx, retrySettingsContextKey{}, &requestRetrySettings{
-		manager: m, settings: m.retryConfig.Load(),
+		codexOptimizeMultiAgentV2: cfg != nil && cfg.Codex.OptimizeMultiAgentV2,
+		manager:                   m, settings: m.retryConfig.Load(),
 		errorRules: slices.Clone(nonRetryableErrorRulesForConfig(cfg)), cooldownRules: cooldownRules,
 	})
 }
