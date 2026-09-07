@@ -5540,7 +5540,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 	opts.AuthRequestSlot = newAuthRequestSlot(opts.ExecutionDiagnostics, opts.ExecutionMetrics)
 	defer opts.AuthRequestSlot.Release()
 	strictSessionAffinity := m.strictSessionAffinityForRequest(req, opts)
-	pickAllowed := m.requestRoundPickAllowed(roundState, maxRetryCredentials, requestAttempt, defaultRequestRetry)
+	pickAllowed := m.requestRoundPickAllowed(ctx, roundState, maxRetryCredentials, requestAttempt, defaultRequestRetry)
 	unregisterRelease := registerRequestBodyReleaseCallback(ctx, opts, func([]byte) {
 		req.Payload = nil
 		opts.OriginalRequest = nil
@@ -5817,7 +5817,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 	opts.AuthRequestSlot = newAuthRequestSlot(opts.ExecutionDiagnostics, opts.ExecutionMetrics)
 	defer opts.AuthRequestSlot.Release()
 	strictSessionAffinity := m.strictSessionAffinityForRequest(req, opts)
-	pickAllowed := m.requestRoundPickAllowed(roundState, maxRetryCredentials, requestAttempt, defaultRequestRetry)
+	pickAllowed := m.requestRoundPickAllowed(ctx, roundState, maxRetryCredentials, requestAttempt, defaultRequestRetry)
 	unregisterRelease := registerRequestBodyReleaseCallback(ctx, opts, func([]byte) {
 		req.Payload = nil
 		opts.OriginalRequest = nil
@@ -6081,7 +6081,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 	opts.AuthRequestSlot = newAuthRequestSlot(opts.ExecutionDiagnostics, opts.ExecutionMetrics)
 	defer opts.AuthRequestSlot.Release()
 	strictSessionAffinity := m.strictSessionAffinityForRequest(req, opts)
-	pickAllowed := m.requestRoundPickAllowed(roundState, maxRetryCredentials, requestAttempt, defaultRequestRetry)
+	pickAllowed := m.requestRoundPickAllowed(ctx, roundState, maxRetryCredentials, requestAttempt, defaultRequestRetry)
 	unregisterRelease := registerRequestBodyReleaseCallback(ctx, opts, func([]byte) {
 		req.Payload = nil
 		opts.OriginalRequest = nil
@@ -6655,7 +6655,7 @@ func (m *Manager) pickAntigravityCreditsAtPriority(ctx context.Context, opts cli
 func (m *Manager) pickAntigravityCreditsCandidate(ctx context.Context, routeModel string, opts cliproxyexecutor.Options, roundState *requestRoundState, maxRetryCredentials int) (*creditsCandidateEntry, error) {
 	roundState = roundState.ensure()
 	candidates := m.collectAntigravityCreditsCandidateAuths(routeModel, opts)
-	pickAllowed := m.roundPickAllowed(roundState, maxRetryCredentials)
+	pickAllowed := m.roundPickAllowed(roundState, maxRetryCredentials, ctx)
 	var lastPickErr error
 	var earliestBlocker error
 	for start := 0; start < len(candidates); {
@@ -7514,28 +7514,16 @@ func requestErrorCode(err error) string {
 	return "invalid_request"
 }
 
-func (m *Manager) maxRetryCredentialsForPriority(priority int, globalMaxRetryCredentials int) int {
-	if m == nil {
-		return globalMaxRetryCredentials
-	}
-	cfg, _ := m.runtimeConfig.Load().(*internalconfig.Config)
-	if cfg == nil {
-		return globalMaxRetryCredentials
-	}
-	for _, override := range cfg.Routing.PriorityOverrides {
-		if override.Priority != priority || override.MaxRetryCredentials == nil {
-			continue
+func (m *Manager) maxRetryCredentialsForPriority(priority int, globalMaxRetryCredentials int, contexts ...context.Context) int {
+	if policy := m.selectionPolicy(contexts...); policy != nil {
+		if value, exists := policy.priorityMaxRetries[priority]; exists {
+			return value
 		}
-		value := *override.MaxRetryCredentials
-		if value < 0 {
-			return 0
-		}
-		return value
 	}
 	return globalMaxRetryCredentials
 }
 
-func (m *Manager) roundPickAllowed(roundState *requestRoundState, globalMaxRetryCredentials int) func(*Auth) bool {
+func (m *Manager) roundPickAllowed(roundState *requestRoundState, globalMaxRetryCredentials int, contexts ...context.Context) func(*Auth) bool {
 	return func(auth *Auth) bool {
 		if auth == nil || auth.RuntimeInstanceRetired() {
 			return false
@@ -7544,7 +7532,7 @@ func (m *Manager) roundPickAllowed(roundState *requestRoundState, globalMaxRetry
 			return false
 		}
 		priority := authPriority(auth)
-		maxRetryCredentials := m.maxRetryCredentialsForPriority(priority, globalMaxRetryCredentials)
+		maxRetryCredentials := m.maxRetryCredentialsForPriority(priority, globalMaxRetryCredentials, contexts...)
 		if maxRetryCredentials <= 0 {
 			return true
 		}

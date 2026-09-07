@@ -1,6 +1,9 @@
 package auth
 
-import "errors"
+import (
+	"context"
+	"errors"
+)
 
 // effectiveCredentialRequestRetry preserves the local negative-as-zero contract.
 func effectiveCredentialRequestRetry(auth *Auth, defaultRetry int) int {
@@ -13,8 +16,8 @@ func effectiveCredentialRequestRetry(auth *Auth, defaultRetry int) int {
 // requestRoundPickAllowed filters before scheduling or reserving capacity. The
 // global default belongs to the logical request; each candidate is the current
 // credential snapshot, including edits and runtime-instance retirement.
-func (m *Manager) requestRoundPickAllowed(state *requestRoundState, maxCredentials, round, defaultRetry int) func(*Auth) bool {
-	allowed := m.roundPickAllowed(state, maxCredentials)
+func (m *Manager) requestRoundPickAllowed(ctx context.Context, state *requestRoundState, maxCredentials, round, defaultRetry int) func(*Auth) bool {
+	allowed := m.roundPickAllowed(state, maxCredentials, ctx)
 	return func(auth *Auth) bool {
 		return allowed(auth) && (round <= 0 || round <= effectiveCredentialRequestRetry(auth, defaultRetry))
 	}

@@ -10,14 +10,15 @@ import (
 // routingRequestPolicy freezes selection choices, not credential availability or
 // limiter generations. Retired instances and current capacity remain authoritative.
 type routingRequestPolicy struct {
-	manager       *Manager
-	selector      Selector
-	strategy      schedulerStrategy
-	strategies    map[int]schedulerStrategy
-	fillRange     int
-	fillRPM       int
-	priorityRange map[int]int
-	priorityRPM   map[int]int
+	manager            *Manager
+	selector           Selector
+	strategy           schedulerStrategy
+	strategies         map[int]schedulerStrategy
+	fillRange          int
+	fillRPM            int
+	priorityRange      map[int]int
+	priorityRPM        map[int]int
+	priorityMaxRetries map[int]int
 }
 
 type routingRequestPolicyKey struct{}
@@ -69,8 +70,14 @@ func newRoutingRequestPolicy(m *Manager, selector Selector, routing config.Routi
 		fillRange:     normalizeFillFirstRangeValue(routing.FillFirstRange),
 		fillRPM:       normalizeFillFirstPerAuthRPMValue(routing.FillFirstPerAuthRPM),
 		priorityRange: make(map[int]int), priorityRPM: make(map[int]int),
+		priorityMaxRetries: make(map[int]int),
 	}
 	for _, rule := range routing.PriorityOverrides {
+		if rule.MaxRetryCredentials != nil {
+			if _, exists := p.priorityMaxRetries[rule.Priority]; !exists {
+				p.priorityMaxRetries[rule.Priority] = max(0, *rule.MaxRetryCredentials)
+			}
+		}
 		if strategy, ok := schedulerStrategyFromName(rule.Strategy); ok && strings.TrimSpace(rule.Strategy) != "" {
 			p.strategies[rule.Priority] = strategy
 		}
