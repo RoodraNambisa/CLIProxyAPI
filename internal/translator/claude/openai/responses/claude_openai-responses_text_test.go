@@ -70,6 +70,22 @@ func TestClaudeResponsesTextStreamsUseDistinctPositions(t *testing.T) {
 	assertClaudeResponsesTextOrder(t, completed)
 }
 
+func TestClaudeResponsesTextNonStreamUsesDistinctPositions(t *testing.T) {
+	events := append(claudeResponsesTextFixture(), `{"type":"content_block_start","index":3,"content_block":{"type":"text"}}`, `{"type":"content_block_delta","index":3,"delta":{"type":"text_delta","text":"after completion"}}`)
+	raw := []byte("data: " + strings.Join(events, "\n\ndata: ") + "\n\n")
+	response := ConvertClaudeResponseToOpenAIResponsesNonStream(t.Context(), "", nil, nil, raw, nil)
+	assertClaudeResponsesTextOrder(t, gjson.ParseBytes(response))
+	events = append(events,
+		`{"type":"message_start","message":{"id":"next"}}`,
+		`{"type":"content_block_start","content_block":{"type":"text"}}`,
+		`{"type":"content_block_delta","delta":{"type":"text_delta","text":"legacy"}}`,
+		`{"type":"content_block_stop"}`, `{"type":"message_stop"}`)
+	response = ConvertClaudeResponseToOpenAIResponsesNonStream(t.Context(), "", nil, nil, []byte("data: "+strings.Join(events, "\n\ndata: ")+"\n\n"), nil)
+	if gjson.GetBytes(response, "output.#").Int() != 1 || gjson.GetBytes(response, "output.0.id").String() != "msg_next_0" || gjson.GetBytes(response, "output.0.content.0.text").String() != "legacy" {
+		t.Fatal("message reset or unindexed legacy text changed")
+	}
+}
+
 func assertClaudeResponsesTextOrder(t *testing.T, response gjson.Result) {
 	t.Helper()
 	if response.Get("output.#").Int() != 3 || response.Get("output.0.call_id").String() != "pair" || response.Get("output.1.id").String() != "msg_result_1" || response.Get("output.1.content.0.text").String() != "first" || response.Get("output.2.id").String() != "msg_result_2" || response.Get("output.2.content.0.text").String() != "second" {

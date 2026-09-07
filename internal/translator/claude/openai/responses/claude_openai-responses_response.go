@@ -524,14 +524,15 @@ func ConvertClaudeResponseToOpenAIResponsesNonStream(_ context.Context, _ string
 	var (
 		responseID      string
 		createdAt       int64
-		currentMsgID    string
-		textBuf         strings.Builder
 		reasoningBuf    strings.Builder
 		reasoningActive bool
 		reasoningItemID string
+		reasoningIndex  int
 		inputTokens     int64
 		outputTokens    int64
+		completed       bool
 	)
+	textBlocks := make(map[int]*claudeResponsesTextBlock)
 
 	// Per-index tool call aggregation
 	type toolState struct {
@@ -546,11 +547,14 @@ func ConvertClaudeResponseToOpenAIResponsesNonStream(_ context.Context, _ string
 	for _, ch := range chunks {
 		root := gjson.ParseBytes(ch)
 		ev := root.Get("type").String()
+		if completed && ev != "message_start" {
+			continue
+		}
 		idx := int(root.Get("index").Int())
 		toolEvent := ev == "content_block_start" && root.Get("content_block.type").String() == "tool_use" ||
 			ev == "content_block_delta" && root.Get("delta.type").String() == "input_json_delta" ||
 			ev == "content_block_stop" && len(toolCalls) > 0
-		if toolEvent {
+		if toolEvent || root.Get("index").Exists() && strings.HasPrefix(ev, "content_block_") {
 			var valid bool
 			idx, valid = claudeResponsesBlockIndex(root.Get("index"))
 			if !valid {
@@ -561,6 +565,12 @@ func ConvertClaudeResponseToOpenAIResponsesNonStream(_ context.Context, _ string
 		switch ev {
 		case "message_start":
 			if msg := root.Get("message"); msg.Exists() {
+				textBlocks = make(map[int]*claudeResponsesTextBlock)
+				toolCalls = make(map[int]*toolState)
+				reasoningBuf.Reset()
+				reasoningActive, reasoningItemID = false, ""
+				completed = false
+				inputTokens, outputTokens = 0, 0
 				responseID = msg.Get("id").String()
 				createdAt = time.Now().Unix()
 				if usage := msg.Get("usage"); usage.Exists() {
@@ -574,9 +584,12 @@ func ConvertClaudeResponseToOpenAIResponsesNonStream(_ context.Context, _ string
 				continue
 			}
 			typ := cb.Get("type").String()
+			if textBlocks[idx] != nil || toolCalls[idx] != nil || reasoningItemID != "" && reasoningIndex == idx {
+				continue
+			}
 			switch typ {
 			case "text":
-				currentMsgID = "msg_" + responseID + "_0"
+				textBlocks[idx] = &claudeResponsesTextBlock{ID: fmt.Sprintf("msg_%s_%d", responseID, idx)}
 			case "tool_use":
 				callID := cb.Get("id").String()
 				if toolCalls[idx] == nil && callID != "" {
@@ -584,6 +597,7 @@ func ConvertClaudeResponseToOpenAIResponsesNonStream(_ context.Context, _ string
 				}
 			case "thinking":
 				reasoningActive = true
+				reasoningIndex = idx
 				reasoningItemID = fmt.Sprintf("rs_%s_%d", responseID, idx)
 			}
 
@@ -595,8 +609,18 @@ func ConvertClaudeResponseToOpenAIResponsesNonStream(_ context.Context, _ string
 			dt := d.Get("type").String()
 			switch dt {
 			case "text_delta":
+				if toolCalls[idx] != nil || reasoningItemID != "" && reasoningIndex == idx {
+					continue
+				}
+				block := textBlocks[idx]
+				if block == nil {
+					block = &claudeResponsesTextBlock{ID: fmt.Sprintf("msg_%s_%d", responseID, idx)}
+					textBlocks[idx] = block
+				}
 				if t := d.Get("text"); t.Exists() {
-					textBuf.WriteString(t.String())
+					if !block.Done {
+						block.Text.WriteString(t.String())
+					}
 				}
 			case "input_json_delta":
 				if pj := d.Get("partial_json"); pj.Exists() {
@@ -613,6 +637,9 @@ func ConvertClaudeResponseToOpenAIResponsesNonStream(_ context.Context, _ string
 			}
 
 		case "content_block_stop":
+			if block := textBlocks[idx]; block != nil {
+				block.Done = true
+			}
 			if call := toolCalls[idx]; call != nil {
 				call.done = true
 			}
@@ -621,6 +648,8 @@ func ConvertClaudeResponseToOpenAIResponsesNonStream(_ context.Context, _ string
 			if usage := root.Get("usage"); usage.Exists() {
 				outputTokens = usage.Get("output_tokens").Int()
 			}
+		case "message_stop":
+			completed = true
 		}
 	}
 
@@ -695,44 +724,25 @@ func ConvertClaudeResponseToOpenAIResponsesNonStream(_ context.Context, _ string
 	}
 
 	// Build output array
-	outputsWrapper := []byte(`{"arr":[]}`)
+	outputItems := make(map[int][]byte)
 	if reasoningBuf.Len() > 0 {
 		item := []byte(`{"id":"","type":"reasoning","summary":[{"type":"summary_text","text":""}]}`)
 		item, _ = sjson.SetBytes(item, "id", reasoningItemID)
 		item, _ = sjson.SetBytes(item, "summary.0.text", reasoningBuf.String())
-		outputsWrapper, _ = sjson.SetRawBytes(outputsWrapper, "arr.-1", item)
+		outputItems[reasoningIndex] = item
 	}
-	if currentMsgID != "" || textBuf.Len() > 0 {
-		item := []byte(`{"id":"","type":"message","status":"completed","content":[{"type":"output_text","annotations":[],"logprobs":[],"text":""}],"role":"assistant"}`)
-		item, _ = sjson.SetBytes(item, "id", currentMsgID)
-		item, _ = sjson.SetBytes(item, "content.0.text", textBuf.String())
-		outputsWrapper, _ = sjson.SetRawBytes(outputsWrapper, "arr.-1", item)
+	for index, block := range textBlocks {
+		outputItems[index] = claudeResponsesTextItem(block)
 	}
-	if len(toolCalls) > 0 {
-		// Preserve index order
-		idxs := make([]int, 0, len(toolCalls))
-		for i := range toolCalls {
-			idxs = append(idxs, i)
+	for index, call := range toolCalls {
+		args := call.args.String()
+		if args == "" {
+			args = "{}"
 		}
-		for i := 0; i < len(idxs); i++ {
-			for j := i + 1; j < len(idxs); j++ {
-				if idxs[j] < idxs[i] {
-					idxs[i], idxs[j] = idxs[j], idxs[i]
-				}
-			}
-		}
-		for _, i := range idxs {
-			st := toolCalls[i]
-			args := st.args.String()
-			if args == "" {
-				args = "{}"
-			}
-			item := buildClaudeResponsesToolItem(toolIdentities, st.name, st.id, args, "completed")
-			outputsWrapper, _ = sjson.SetRawBytes(outputsWrapper, "arr.-1", item)
-		}
+		outputItems[index] = buildClaudeResponsesToolItem(toolIdentities, call.name, call.id, args, "completed")
 	}
-	if gjson.GetBytes(outputsWrapper, "arr.#").Int() > 0 {
-		out, _ = sjson.SetRawBytes(out, "output", []byte(gjson.GetBytes(outputsWrapper, "arr").Raw))
+	if len(outputItems) > 0 {
+		out, _ = sjson.SetRawBytes(out, "output", claudeResponsesOrderedOutput(outputItems))
 	}
 
 	// Usage
