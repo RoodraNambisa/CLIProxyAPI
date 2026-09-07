@@ -963,8 +963,17 @@ func (e *XAIExecutor) prepareResponsesRequestTo(ctx context.Context, auth *clipr
 		originalPayloadSource = opts.OriginalRequest
 	}
 	originalPayload := bytes.Clone(originalPayloadSource)
+	// xAI shares the Responses wire format but cannot consume Codex agent ciphertext.
+	originalPayload, errNormalize := helps.NormalizeCodexMultiAgentRequest(ctx, opts.Headers, e.cfg, from, sdktranslator.FromString(e.Identifier()), originalPayload)
+	if errNormalize != nil {
+		return nil, errNormalize
+	}
+	requestPayload, errNormalize := helps.NormalizeCodexMultiAgentRequest(ctx, opts.Headers, e.cfg, from, sdktranslator.FromString(e.Identifier()), req.Payload)
+	if errNormalize != nil {
+		return nil, errNormalize
+	}
 	originalTranslated := sdktranslator.TranslateRequest(from, to, baseModel, originalPayload, stream)
-	body := sdktranslator.TranslateRequest(from, to, baseModel, bytes.Clone(req.Payload), stream)
+	body := sdktranslator.TranslateRequest(from, to, baseModel, bytes.Clone(requestPayload), stream)
 
 	var err error
 	body, err = thinking.ApplyThinking(body, req.Model, from.String(), e.Identifier(), e.Identifier())
