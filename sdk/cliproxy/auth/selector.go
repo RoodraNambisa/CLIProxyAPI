@@ -1006,6 +1006,7 @@ type SessionAffinitySelector struct {
 	cache            *SessionCache
 	failover         bool
 	acrossPriorities bool
+	subagents        bool
 }
 
 // SessionAffinityConfig configures the session affinity selector.
@@ -1015,6 +1016,8 @@ type SessionAffinityConfig struct {
 	Failover *bool
 	// AcrossPriorities keeps eligible bindings ahead of priority. Default: false.
 	AcrossPriorities bool
+	// Subagents permits explicit child/fork inheritance. Default: false.
+	Subagents bool
 }
 
 // NewSessionAffinitySelector creates a new session-aware selector.
@@ -1042,6 +1045,7 @@ func NewSessionAffinitySelectorWithConfig(cfg SessionAffinityConfig) *SessionAff
 		cache:            NewSessionCache(cfg.TTL),
 		failover:         failover,
 		acrossPriorities: cfg.AcrossPriorities,
+		subagents:        cfg.Subagents,
 	}
 }
 
@@ -1062,11 +1066,15 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 	return s.pickWithFallback(ctx, provider, model, opts, auths, s.fallback)
 }
 
-func (s *SessionAffinitySelector) cachedAuthID(provider, model string, opts cliproxyexecutor.Options) string {
+func (s *SessionAffinitySelector) cachedAuthID(provider, model string, opts cliproxyexecutor.Options, contexts ...context.Context) string {
 	if s == nil || s.cache == nil {
 		return ""
 	}
-	primaryID, fallbackID := extractSessionIDs(opts.Headers, opts.OriginalRequest, opts.Metadata)
+	var ctx context.Context
+	if len(contexts) > 0 {
+		ctx = contexts[0]
+	}
+	primaryID, fallbackID := s.sessionIDs(ctx, opts)
 	if primaryID == "" {
 		return ""
 	}
@@ -1090,6 +1098,11 @@ func (s *SessionAffinitySelector) pickWithFallback(ctx context.Context, provider
 }
 
 func (s *SessionAffinitySelector) pickWithFallbackDeferredBinding(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth, fallback Selector) (*Auth, func(), error) {
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return nil, nil, err
+		}
+	}
 	if fallback == nil {
 		fallback = s.fallback
 	}
@@ -1100,7 +1113,7 @@ func (s *SessionAffinitySelector) pickWithFallbackDeferredBinding(ctx context.Co
 		auths = positiveWeightAuths(auths)
 	}
 	entry := selectorLogEntry(ctx)
-	primaryID, fallbackID := extractSessionIDs(opts.Headers, opts.OriginalRequest, opts.Metadata)
+	primaryID, fallbackID := s.sessionIDs(ctx, opts)
 	if primaryID == "" {
 		entry.Debugf("session-affinity: no session ID extracted, falling back to default selector | provider=%s model=%s", provider, model)
 		auth, err := fallback.Pick(ctx, provider, model, opts, auths)
@@ -1178,11 +1191,16 @@ func (s *SessionAffinitySelector) pickWithPreparedFallback(ctx context.Context, 
 }
 
 func (s *SessionAffinitySelector) pickWithPreparedFallbackDeferredBinding(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, available []*Auth, pickFallback func() (*Auth, error)) (*Auth, func(), error) {
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return nil, nil, err
+		}
+	}
 	if pickFallback == nil {
 		return nil, nil, &Error{Code: "auth_not_found", Message: "no auth available"}
 	}
 	entry := selectorLogEntry(ctx)
-	primaryID, fallbackID := extractSessionIDs(opts.Headers, opts.OriginalRequest, opts.Metadata)
+	primaryID, fallbackID := s.sessionIDs(ctx, opts)
 	if primaryID == "" {
 		entry.Debugf("session-affinity: no session ID extracted, falling back to default selector | provider=%s model=%s", provider, model)
 		auth, err := pickFallback()
@@ -1258,7 +1276,7 @@ func (s *SessionAffinitySelector) BindSessionWithRollback(ctx context.Context, p
 		return nil
 	}
 	entry := selectorLogEntry(ctx)
-	primaryID, _ := extractSessionIDs(opts.Headers, opts.OriginalRequest, opts.Metadata)
+	primaryID, _ := s.sessionIDs(ctx, opts)
 	if primaryID == "" {
 		return nil
 	}

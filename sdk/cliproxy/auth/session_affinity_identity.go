@@ -16,8 +16,10 @@ import (
 const affinityIdentityMetadataKey = "session_affinity_identity_snapshot"
 
 type affinityRequestIdentity struct {
-	scope    string
-	identity session.Identity
+	scope          string
+	identity       session.Identity
+	legacyPrimary  string
+	legacyFallback string
 }
 
 func captureAffinityIdentity(ctx context.Context, req core.Request, opts core.Options) affinityRequestIdentity {
@@ -44,8 +46,13 @@ func captureAffinityIdentity(ctx context.Context, req core.Request, opts core.Op
 	if len(payload) == 0 {
 		payload = req.Payload
 	}
-	identity, _ := session.ExtractCodexIdentity(headers, payload)
-	return affinityRequestIdentity{scope: scope, identity: identity}
+	executionID, _ := opts.Metadata[core.ExecutionSessionMetadataKey].(string)
+	identity, _ := session.ExtractExplicitIdentity(headers, payload, executionID)
+	captured := affinityRequestIdentity{scope: scope, identity: identity}
+	if identity.SessionID == "" {
+		captured.legacyPrimary, captured.legacyFallback = extractMessageHashIDs(payload)
+	}
+	return captured
 }
 
 // withAffinityIdentity detaches optional inference inputs before provider
@@ -71,4 +78,22 @@ func scopedAffinityID(scope, id string) string {
 	raw, _ := json.Marshal([]string{"session-affinity-v1", scope, id})
 	digest := sha256.Sum256(raw)
 	return "scoped:" + hex.EncodeToString(digest[:])
+}
+
+func (s *SessionAffinitySelector) sessionIDs(ctx context.Context, opts core.Options) (string, string) {
+	if s != nil && s.subagents {
+		captured := captureAffinityIdentity(ctx, core.Request{}, opts)
+		if captured.scope != "" {
+			if captured.identity.SessionID == "" {
+				return scopedAffinityID(captured.scope, captured.legacyPrimary), scopedAffinityID(captured.scope, captured.legacyFallback)
+			}
+			primary := scopedAffinityID(captured.scope, captured.identity.SessionID)
+			parent := ""
+			if captured.identity.IsSubagent || captured.identity.IsFork {
+				parent = scopedAffinityID(captured.scope, captured.identity.ParentSessionID)
+			}
+			return primary, parent
+		}
+	}
+	return extractSessionIDs(opts.Headers, opts.OriginalRequest, opts.Metadata)
 }
