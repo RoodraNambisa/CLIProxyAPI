@@ -83,6 +83,10 @@ func FingerprintHistory(format sdktranslator.Format, payload []byte) History {
 	format = sdktranslator.Format(strings.ToLower(strings.TrimSpace(string(format))))
 	if format == "" {
 		switch {
+		case root.Get("contents").IsArray() || root.Get("request.contents").IsArray():
+			format = sdktranslator.FormatGemini
+		case root.Get("input").Exists() && (root.Get("system_instruction").Exists() || root.Get(`input.#(type=="user_input")`).Exists() || root.Get(`input.#(type=="model_output")`).Exists()):
+			format = sdktranslator.FormatInteractions
 		case root.Get("system").Exists():
 			format = sdktranslator.FormatClaude
 		case root.Get("messages").IsArray():
@@ -95,6 +99,14 @@ func FingerprintHistory(format sdktranslator.Format, payload []byte) History {
 	// Tool declarations affect the prompt prefix but cannot establish a user anchor.
 	b.add("system", root.Get("tools"))
 	switch format {
+	case sdktranslator.FormatGemini, sdktranslator.FormatAntigravity:
+		b.addGeminiHistory(root)
+	case sdktranslator.FormatInteractions:
+		if previous := root.Get("previous_interaction_id"); previous.Exists() && previous.Type != gjson.Null && previous.String() != "" {
+			return History{}
+		}
+		b.addGoogleSystem(root)
+		b.addInteractionHistory(root.Get("input"), "user", 0)
 	case sdktranslator.FormatOpenAI, sdktranslator.FormatClaude:
 		if format == sdktranslator.FormatClaude {
 			b.add("system", root.Get("system"))

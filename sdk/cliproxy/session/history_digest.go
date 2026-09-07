@@ -110,7 +110,12 @@ func (b *historyDigestBuilder) add(value gjson.Result, depth int) {
 			}
 		}
 		kind = "json"
-		for _, key := range []string{"image_url", "inlineData", "inline_data", "fileData", "file_data", "source", "file_id"} {
+		if typ == "image" || typ == "document" || typ == "audio" || typ == "video" {
+			if value.Get("data").Type == gjson.String || value.Get("uri").Type == gjson.String || value.Get("url").Type == gjson.String {
+				kind, userContent = "media", true
+			}
+		}
+		for _, key := range []string{"image_url", "inlineData", "inline_data", "fileData", "file_data", "source", "file_id", "file_url", "input_audio", "audio_url", "video_url"} {
 			if value.Get(key).Exists() {
 				kind = "media"
 				userContent = true
