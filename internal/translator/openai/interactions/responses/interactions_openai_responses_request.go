@@ -26,7 +26,10 @@ func ConvertOpenAIResponsesRequestToInteractions(modelName string, inputRawJSON 
 	out = appendResponsesToolsToInteractions(out, root)
 	if toolChoice := root.Get("tool_choice"); toolChoice.Exists() {
 		out, _ = sjson.SetRawBytes(out, "generation_config.tool_choice", []byte(toolChoice.Raw))
-		if toolChoice.Get("type").String() == "function" {
+		if kind := toolChoice.Get("type").String(); kind == "function" || kind == "custom" {
+			if kind == "custom" {
+				out, _ = sjson.SetBytes(out, "generation_config.tool_choice.type", "function")
+			}
 			name := firstNonEmpty(toolChoice.Get("name").String(), toolChoice.Get("function.name").String())
 			if strings.TrimSpace(name) != "" && toolChoice.Get("namespace").String() != "" {
 				choice, _ := sjson.Set(toolChoice.Raw, "name", name)
@@ -198,7 +201,7 @@ func appendResponsesInputItemToInteractions(out []byte, item gjson.Result, funct
 		step, _ = sjson.SetBytes(step, "type", stepType)
 		step = appendResponsesContentToInteractions(step, item.Get("content"), stepType)
 		out, _ = sjson.SetRawBytes(out, "input.-1", step)
-	case "function_call":
+	case "function_call", "custom_tool_call":
 		callID := firstNonEmpty(item.Get("call_id").String(), item.Get("id").String())
 		if callID != "" {
 			if name := qualifiedResponsesInteractionName(item); name != "" {
@@ -206,7 +209,7 @@ func appendResponsesInputItemToInteractions(out []byte, item gjson.Result, funct
 			}
 		}
 		out, _ = sjson.SetRawBytes(out, "input.-1", responsesFunctionCallToInteractions(item))
-	case "function_call_output":
+	case "function_call_output", "custom_tool_call_output":
 		out, _ = sjson.SetRawBytes(out, "input.-1", responsesFunctionOutputToInteractions(item, functionNamesByCallID))
 	case "input_text", "output_text", "text":
 		stepType := "user_input"
@@ -307,7 +310,11 @@ func responsesFunctionCallToInteractions(item gjson.Result) []byte {
 	if callID := firstNonEmpty(item.Get("call_id").String(), item.Get("id").String()); callID != "" {
 		out, _ = sjson.SetBytes(out, "call_id", callID)
 	}
-	setJSONValue(&out, "arguments", item.Get("arguments"), []byte(`{}`))
+	if item.Get("type").String() == "custom_tool_call" {
+		out, _ = sjson.SetBytes(out, "arguments.input", item.Get("input").String())
+	} else {
+		setJSONValue(&out, "arguments", item.Get("arguments"), []byte(`{}`))
+	}
 	return out
 }
 
@@ -355,7 +362,11 @@ func functionToolToInteractions(tool gjson.Result) ([]byte, bool) {
 	out := []byte(`{"type":"function","name":""}`)
 	out, _ = sjson.SetBytes(out, "name", name)
 	copyOptionalString(&out, "description", firstExisting(tool.Get("description"), tool.Get("function.description")))
-	copyOptionalRaw(&out, "parameters", firstExisting(tool.Get("parameters"), tool.Get("function.parameters")))
+	if tool.Get("type").String() == "custom" {
+		out, _ = sjson.SetRawBytes(out, "parameters", []byte(`{"type":"object","properties":{"input":{"type":"string"}},"required":["input"]}`))
+	} else {
+		copyOptionalRaw(&out, "parameters", firstExisting(tool.Get("parameters"), tool.Get("function.parameters")))
+	}
 	return out, true
 }
 

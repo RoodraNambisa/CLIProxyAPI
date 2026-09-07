@@ -21,7 +21,7 @@ func responsesInteractionToolDeclarations(root gjson.Result) []translatorcommon.
 				visit(children, translatorcommon.QualifyResponsesToolName(namespace, name))
 				continue
 			}
-			if kind := tool.Get("type").String(); kind != "function" && kind != "" || name == "" {
+			if kind := tool.Get("type").String(); kind != "function" && kind != "custom" && kind != "" || name == "" {
 				continue
 			}
 			qualified := translatorcommon.QualifyResponsesToolName(namespace, name)
