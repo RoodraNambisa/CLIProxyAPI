@@ -444,7 +444,13 @@ auth-maintenance:
 
 # Routing strategy for selecting credentials when multiple match.
 routing:
-  strategy: "round-robin" # round-robin (default), fill-first, random
+  strategy: "round-robin" # round-robin (default), fill-first, random, weighted-round-robin
+  # Weighted routing reads each credential's optional weight: absent = 1,
+  # integer range 0..1000000; legacy negative integers act as 0. Zero excludes
+  # the credential only in weighted routing. Other strategies ignore weights.
+  # Configure weight on each API-key entry or in an OAuth credential JSON file.
+  # Strategy choices are fixed per logical request; credential edits apply on
+  # the next selection attempt. Capacity and credential retirement stay live.
   fill-first-range: 1 # fill-first only; N credentials per fill group, group-internal random
   fill-first-per-auth-rpm: 0 # fill-first only; 0 disables; mutually exclusive with fill-first-range > 1
   per-auth-request-limit: 0 # all strategies; 0 disables the generic per-auth fixed-window limit

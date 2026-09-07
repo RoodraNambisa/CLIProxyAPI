@@ -233,6 +233,8 @@ func (b *Builder) Build() (*Service, error) {
 			selector = &coreauth.FillFirstSelector{Range: normalizedRoutingFillFirstRange(b.cfg)}
 		case "random", "rand", "r":
 			selector = &coreauth.RandomSelector{}
+		case "weighted-round-robin", "weightedroundrobin", "wrr":
+			selector = &coreauth.WeightedRoundRobinSelector{}
 		default:
 			selector = &coreauth.RoundRobinSelector{}
 		}

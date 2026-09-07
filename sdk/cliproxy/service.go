@@ -4756,6 +4756,8 @@ func normalizeRuntimeRoutingStrategy(strategy string) string {
 		return "fill-first"
 	case "random", "rand", "r":
 		return "random"
+	case "weighted-round-robin", "weightedroundrobin", "wrr":
+		return "weighted-round-robin"
 	default:
 		return "round-robin"
 	}
@@ -4914,6 +4916,8 @@ func (s *Service) applyRuntimeConfigState(ctx context.Context, previousCfg, next
 			selector = &coreauth.FillFirstSelector{Range: normalizedRoutingFillFirstRange(nextCfg)}
 		case "random":
 			selector = &coreauth.RandomSelector{}
+		case "weighted-round-robin":
+			selector = &coreauth.WeightedRoundRobinSelector{}
 		default:
 			selector = &coreauth.RoundRobinSelector{}
 		}

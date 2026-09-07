@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	core "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 )
 
@@ -31,6 +32,28 @@ func TestWeightedSchedulerSingleAndMixedProportions(t *testing.T) {
 		if counts[pool[0].ID] != 50 || counts[pool[1].ID] != 10 || counts[pool[2].ID] != 10 {
 			t.Fatal("scheduler lost configured proportions")
 		}
+	}
+}
+
+func TestWeightedSchedulerPriorityOverridesDoNotDisableOtherStrategies(t *testing.T) {
+	zero, positive := weightedTestAuth(schedulerTestID(t, "zero"), 0), weightedTestAuth(schedulerTestID(t, "positive"), 1)
+	zero.Attributes["priority"] = "10"
+	registerSchedulerModels(t, "codex", "weighted-model", zero.ID, positive.ID)
+	scheduler := newSchedulerForTest(&WeightedRoundRobinSelector{}, zero, positive)
+	picked, err := scheduler.pickSingle(t.Context(), "codex", "weighted-model", core.Options{}, nil)
+	if err != nil || picked.ID != positive.ID {
+		t.Fatal("zero-weight priority blocked positive credentials")
+	}
+	scheduler.setRoutingPriorityOverrides([]config.RoutingPriorityOverride{{Priority: 10, Strategy: "round-robin"}})
+	picked, err = scheduler.pickSingle(t.Context(), "codex", "weighted-model", core.Options{}, nil)
+	if err != nil || picked.ID != zero.ID {
+		t.Fatal("non-weighted priority override interpreted weight")
+	}
+	scheduler.setSelector(&RoundRobinSelector{})
+	scheduler.setRoutingPriorityOverrides([]config.RoutingPriorityOverride{{Priority: 10, Strategy: "weighted-round-robin"}})
+	picked, err = scheduler.pickSingle(t.Context(), "codex", "weighted-model", core.Options{}, nil)
+	if err != nil || picked.ID != positive.ID {
+		t.Fatal("weighted priority override did not exclude zero")
 	}
 }
 
