@@ -9,7 +9,6 @@ import (
 	"time"
 
 	translatorcommon "github.com/router-for-me/CLIProxyAPI/v6/internal/translator/common"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
@@ -37,12 +36,12 @@ type geminiToResponsesState struct {
 	ReasoningClosed bool
 
 	// function call aggregation (keyed by output_index)
-	NextIndex        int
-	FuncArgsBuf      map[int]*strings.Builder
-	FuncNames        map[int]string
-	FuncCallIDs      map[int]string
-	FuncDone         map[int]bool
-	SanitizedNameMap map[string]string
+	NextIndex      int
+	FuncArgsBuf    map[int]*strings.Builder
+	FuncNames      map[int]string
+	FuncCallIDs    map[int]string
+	FuncDone       map[int]bool
+	ToolIdentities map[string]geminiResponsesToolIdentity
 }
 
 // responseIDCounter provides a process-wide unique counter for synthesized response identifiers.
@@ -92,11 +91,11 @@ func emitEvent(event string, payload []byte) []byte {
 func ConvertGeminiResponseToOpenAIResponses(_ context.Context, modelName string, originalRequestRawJSON, requestRawJSON, rawJSON []byte, param *any) [][]byte {
 	if *param == nil {
 		*param = &geminiToResponsesState{
-			FuncArgsBuf:      make(map[int]*strings.Builder),
-			FuncNames:        make(map[int]string),
-			FuncCallIDs:      make(map[int]string),
-			FuncDone:         make(map[int]bool),
-			SanitizedNameMap: util.SanitizedToolNameMap(originalRequestRawJSON),
+			FuncArgsBuf:    make(map[int]*strings.Builder),
+			FuncNames:      make(map[int]string),
+			FuncCallIDs:    make(map[int]string),
+			FuncDone:       make(map[int]bool),
+			ToolIdentities: geminiResponsesToolIdentities(originalRequestRawJSON, requestRawJSON),
 		}
 	}
 	st := (*param).(*geminiToResponsesState)
@@ -112,8 +111,8 @@ func ConvertGeminiResponseToOpenAIResponses(_ context.Context, modelName string,
 	if st.FuncDone == nil {
 		st.FuncDone = make(map[int]bool)
 	}
-	if st.SanitizedNameMap == nil {
-		st.SanitizedNameMap = util.SanitizedToolNameMap(originalRequestRawJSON)
+	if st.ToolIdentities == nil {
+		st.ToolIdentities = geminiResponsesToolIdentities(originalRequestRawJSON, requestRawJSON)
 	}
 
 	if bytes.HasPrefix(rawJSON, []byte("data:")) {
@@ -312,7 +311,7 @@ func ConvertGeminiResponseToOpenAIResponses(_ context.Context, modelName string,
 				// Responses streaming requires message done events before the next output_item.added.
 				finalizeReasoning()
 				finalizeMessage()
-				name := util.RestoreSanitizedToolName(st.SanitizedNameMap, fc.Get("name").String())
+				name := fc.Get("name").String()
 				idx := st.NextIndex
 				st.NextIndex++
 				// Ensure buffers
@@ -338,7 +337,7 @@ func ConvertGeminiResponseToOpenAIResponses(_ context.Context, modelName string,
 				item, _ = sjson.SetBytes(item, "output_index", idx)
 				item, _ = sjson.SetBytes(item, "item.id", fmt.Sprintf("fc_%s", st.FuncCallIDs[idx]))
 				item, _ = sjson.SetBytes(item, "item.call_id", st.FuncCallIDs[idx])
-				item, _ = sjson.SetBytes(item, "item.name", name)
+				item = restoreGeminiResponsesToolIdentity(item, "item.", name, st.ToolIdentities)
 				out = append(out, emitEvent("response.output_item.added", item))
 
 				// Emit arguments delta (full args in one chunk).
@@ -367,7 +366,7 @@ func ConvertGeminiResponseToOpenAIResponses(_ context.Context, modelName string,
 					itemDone, _ = sjson.SetBytes(itemDone, "item.id", fmt.Sprintf("fc_%s", st.FuncCallIDs[idx]))
 					itemDone, _ = sjson.SetBytes(itemDone, "item.arguments", argsJSON)
 					itemDone, _ = sjson.SetBytes(itemDone, "item.call_id", st.FuncCallIDs[idx])
-					itemDone, _ = sjson.SetBytes(itemDone, "item.name", st.FuncNames[idx])
+					itemDone = restoreGeminiResponsesToolIdentity(itemDone, "item.", st.FuncNames[idx], st.ToolIdentities)
 					out = append(out, emitEvent("response.output_item.done", itemDone))
 
 					st.FuncDone[idx] = true
@@ -421,7 +420,7 @@ func ConvertGeminiResponseToOpenAIResponses(_ context.Context, modelName string,
 				itemDone, _ = sjson.SetBytes(itemDone, "item.id", fmt.Sprintf("fc_%s", st.FuncCallIDs[idx]))
 				itemDone, _ = sjson.SetBytes(itemDone, "item.arguments", args)
 				itemDone, _ = sjson.SetBytes(itemDone, "item.call_id", st.FuncCallIDs[idx])
-				itemDone, _ = sjson.SetBytes(itemDone, "item.name", st.FuncNames[idx])
+				itemDone = restoreGeminiResponsesToolIdentity(itemDone, "item.", st.FuncNames[idx], st.ToolIdentities)
 				out = append(out, emitEvent("response.output_item.done", itemDone))
 
 				st.FuncDone[idx] = true
@@ -528,7 +527,7 @@ func ConvertGeminiResponseToOpenAIResponses(_ context.Context, modelName string,
 				item, _ = sjson.SetBytes(item, "id", fmt.Sprintf("fc_%s", callID))
 				item, _ = sjson.SetBytes(item, "arguments", args)
 				item, _ = sjson.SetBytes(item, "call_id", callID)
-				item, _ = sjson.SetBytes(item, "name", st.FuncNames[idx])
+				item = restoreGeminiResponsesToolIdentity(item, "", st.FuncNames[idx], st.ToolIdentities)
 				outputsWrapper, _ = sjson.SetRawBytes(outputsWrapper, "arr.-1", item)
 			}
 		}
@@ -571,7 +570,7 @@ func ConvertGeminiResponseToOpenAIResponses(_ context.Context, modelName string,
 func ConvertGeminiResponseToOpenAIResponsesNonStream(_ context.Context, _ string, originalRequestRawJSON, requestRawJSON, rawJSON []byte, _ *any) []byte {
 	root := gjson.ParseBytes(rawJSON)
 	root = unwrapGeminiResponseRoot(root)
-	sanitizedNameMap := util.SanitizedToolNameMap(originalRequestRawJSON)
+	toolIdentities := geminiResponsesToolIdentities(originalRequestRawJSON, requestRawJSON)
 
 	// Base response scaffold
 	resp := []byte(`{"id":"","object":"response","created_at":0,"status":"completed","background":false,"error":null,"incomplete_details":null}`)
@@ -701,13 +700,13 @@ func ConvertGeminiResponseToOpenAIResponsesNonStream(_ context.Context, _ string
 				return true
 			}
 			if fc := p.Get("functionCall"); fc.Exists() {
-				name := util.RestoreSanitizedToolName(sanitizedNameMap, fc.Get("name").String())
+				name := fc.Get("name").String()
 				args := fc.Get("args")
 				callID := fmt.Sprintf("call_%x_%d", time.Now().UnixNano(), atomic.AddUint64(&funcCallIDCounter, 1))
 				itemJSON := []byte(`{"id":"","type":"function_call","status":"completed","arguments":"","call_id":"","name":""}`)
 				itemJSON, _ = sjson.SetBytes(itemJSON, "id", fmt.Sprintf("fc_%s", callID))
 				itemJSON, _ = sjson.SetBytes(itemJSON, "call_id", callID)
-				itemJSON, _ = sjson.SetBytes(itemJSON, "name", name)
+				itemJSON = restoreGeminiResponsesToolIdentity(itemJSON, "", name, toolIdentities)
 				argsStr := ""
 				if args.Exists() {
 					argsStr = args.Raw

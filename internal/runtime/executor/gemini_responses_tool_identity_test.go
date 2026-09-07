@@ -1,0 +1,89 @@
+package executor
+
+import (
+	"bytes"
+	"context"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor/helps"
+	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
+	core "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
+	sdktranslator "github.com/router-for-me/CLIProxyAPI/v6/sdk/translator"
+	"github.com/tidwall/gjson"
+)
+
+func TestGeminiResponsesToolIdentityAfterRequestBodyRelease(t *testing.T) {
+	for _, stream := range []bool{false, true} {
+		for _, explicitOriginal := range []bool{false, true} {
+			t.Run(fmt.Sprintf("stream=%t/original=%t", stream, explicitOriginal), func(t *testing.T) {
+				controller := core.NewRequestBodyReleaseController(1, []byte("<released>"))
+				ctx := context.WithValue(t.Context(), "cliproxy.roundtripper", streamTerminalRoundTripFunc(func(r *http.Request) (*http.Response, error) {
+					body, err := io.ReadAll(r.Body)
+					if err != nil {
+						t.Error(err)
+					}
+					if gjson.GetBytes(body, "tools.0.functionDeclarations.0.name").String() != "collaboration__spawn_agent" {
+						t.Error("namespace declaration did not reach the fake upstream")
+					}
+					controller.Release()
+					w := httptest.NewRecorder()
+					response := `{"candidates":[{"content":{"role":"model","parts":[{"functionCall":{"name":"collaboration__spawn_agent","args":{"message":"work"}}}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":1,"candidatesTokenCount":1,"totalTokenCount":2}}`
+					if stream {
+						w.Header().Set("Content-Type", "text/event-stream")
+						_, _ = io.WriteString(w, "data: "+response+"\n\n")
+					} else {
+						w.Header().Set("Content-Type", "application/json")
+						_, _ = io.WriteString(w, response)
+					}
+					return w.Result(), nil
+				}))
+				executor := NewGeminiExecutor(&config.Config{})
+				auth := &cliproxyauth.Auth{Attributes: map[string]string{"base_url": "https://google-fixture.invalid", "api_key": "fixture"}}
+				req := core.Request{Model: "gemini-2.5-flash", Payload: []byte(`{"input":[],"tools":[{"type":"namespace","name":"collaboration","tools":[{"type":"function","name":"spawn_agent","parameters":{"type":"object"}}]}]}`)}
+				opts := core.Options{SourceFormat: sdktranslator.FormatOpenAIResponse, Metadata: map[string]any{core.BodyReleaseControllerMetadataKey: controller}}
+				if explicitOriginal {
+					opts.OriginalRequest = bytes.Clone(req.Payload)
+				}
+				var items []gjson.Result
+				if stream {
+					result, err := executor.ExecuteStream(ctx, auth, req, opts)
+					if err != nil {
+						t.Fatal(err)
+					}
+					for chunk := range result.Chunks {
+						if chunk.Err != nil {
+							t.Fatal(chunk.Err)
+						}
+						for _, line := range bytes.Split(chunk.Payload, []byte("\n")) {
+							event := gjson.ParseBytes(helps.JSONPayload(line))
+							if event.Get("item.type").String() == "function_call" {
+								items = append(items, event.Get("item"))
+							} else if event.Get("type").String() == "response.completed" {
+								items = append(items, event.Get("response.output.0"))
+							}
+						}
+					}
+				} else {
+					result, err := executor.Execute(ctx, auth, req, opts)
+					if err != nil {
+						t.Fatal(err)
+					}
+					items = append(items, gjson.GetBytes(result.Payload, "output.0"))
+				}
+				if len(items) != 1 && !stream || len(items) != 3 && stream || !controller.Released() {
+					t.Fatalf("identity events = %d, released = %t", len(items), controller.Released())
+				}
+				for _, item := range items {
+					if item.Get("name").String() != "spawn_agent" || item.Get("namespace").String() != "collaboration" || item.Get("call_id").String() == "" || item.Get("call_id").String() != items[0].Get("call_id").String() {
+						t.Fatal("tool identity was lost after request release")
+					}
+				}
+			})
+		}
+	}
+}

@@ -166,7 +166,7 @@ func (e *GeminiExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 		return resp, err
 	}
 	httpReq.ContentLength = int64(bodyReader.Len())
-	originalRef, bodyRef, unregisterBodies := helps.RequestBodyRefs(ctx, opts, opts.OriginalRequest, body)
+	originalRef, bodyRef, unregisterBodies := helps.RequestBodyRefs(ctx, opts, originalPayload, body)
 	defer unregisterBodies()
 	defer originalRef.Release()
 	defer bodyRef.Release()
@@ -288,7 +288,7 @@ func (e *GeminiExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		return nil, err
 	}
 	httpReq.ContentLength = int64(bodyReader.Len())
-	originalRef, bodyRef, unregisterBodies := helps.RequestBodyRefs(ctx, opts, opts.OriginalRequest, body)
+	originalRef, bodyRef, unregisterBodies := helps.RequestBodyRefs(ctx, opts, originalPayload, body)
 	cleanupBodies := func() {
 		unregisterBodies()
 		originalRef.Release()
