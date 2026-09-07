@@ -691,3 +691,12 @@ func TestSessionAffinityAcrossPrioritiesChangeDetails(t *testing.T) {
 		t.Fatal("missing or noisy affinity change detail")
 	}
 }
+
+func TestSessionAffinitySubagentsChangeDetails(t *testing.T) {
+	oldCfg, nextCfg := &config.Config{}, &config.Config{}
+	nextCfg.Routing.SessionAffinitySubagents = true
+	changes := BuildConfigChangeDetails(oldCfg, nextCfg)
+	if len(changes) != 1 || changes[0] != "routing.session-affinity-subagents: false -> true" || len(BuildConfigChangeDetails(nextCfg, nextCfg)) != 0 {
+		t.Fatal("missing or noisy subagent affinity change detail")
+	}
+}

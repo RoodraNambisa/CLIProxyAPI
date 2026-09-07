@@ -1767,6 +1767,11 @@ type RoutingConfig struct {
 	// Hot reload affects new requests, not an in-flight routing policy.
 	SessionAffinityAcrossPriorities bool `yaml:"session-affinity-across-priorities" json:"session-affinity-across-priorities"`
 
+	// SessionAffinitySubagents permits explicit child/fork parent credential
+	// inheritance within a trusted caller scope. Requires SessionAffinity;
+	// default false. Hot reload affects new requests only.
+	SessionAffinitySubagents bool `yaml:"session-affinity-subagents" json:"session-affinity-subagents"`
+
 	// SessionAffinityFailover controls whether a session may move to another credential
 	// when the bound credential is unavailable or the request fails. Defaults to true.
 	SessionAffinityFailover *bool `yaml:"session-affinity-failover,omitempty" json:"session-affinity-failover,omitempty"`

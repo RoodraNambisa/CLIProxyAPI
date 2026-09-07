@@ -498,6 +498,10 @@ routing:
   # Requires session affinity. Cold selection and failover still follow priority.
   # Boolean only; hot reload applies to new requests, not in-flight routing policy.
   session-affinity-across-priorities: false
+  # Prefer an eligible parent's credential for explicit subagents and forks
+  # without an existing binding. Requires session-affinity and a trusted caller
+  # scope. Boolean only, default false; hot reload affects new requests only.
+  session-affinity-subagents: false
   # Allow a bound session to move to another credential when the bound credential
   # is unavailable or the request fails. Set false for strict sticky sessions.
   session-affinity-failover: true # default: true
