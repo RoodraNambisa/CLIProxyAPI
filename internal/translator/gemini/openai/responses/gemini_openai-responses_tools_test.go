@@ -97,3 +97,23 @@ func TestGeminiResponsesToolChoiceModesAndRootPrecedence(t *testing.T) {
 		}
 	}
 }
+
+func TestGeminiResponsesStructuredToolResultsPreserveValues(t *testing.T) {
+	for _, tc := range []struct{ output, result string }{
+		{`{"value":9007199254740993}`, `{"value":9007199254740993}`},
+		{`["one",{"text":"two"}]`, `["one",{"text":"two"}]`},
+		{`9007199254740993`, `9007199254740993`},
+		{`false`, `false`},
+		{`"plain\ntext"`, `"plain\ntext"`},
+		{`"{\"value\":9007199254740993}"`, `{"value":9007199254740993}`},
+		{`"123"`, `"123"`},
+		{`null`, ""}, {`""`, ""}, {`"null"`, ""},
+	} {
+		raw := []byte(`{"input":[{"type":"function_call","name":"lookup","call_id":"pair","arguments":"{}"},{"type":"function_call_output","call_id":"pair","output":` + tc.output + `}]}`)
+		got := ConvertOpenAIResponsesRequestToGemini("gemini-2.5-flash", raw, false)
+		result := gjson.GetBytes(got, "contents.1.parts.0.functionResponse")
+		if result.Get("name").String() != "lookup" || result.Get("id").String() != "pair" || result.Get("response.result").Raw != tc.result {
+			t.Errorf("tool result %s: got value %s, want %s", tc.output, result.Get("response.result").Raw, tc.result)
+		}
+	}
+}

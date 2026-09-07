@@ -317,8 +317,8 @@ func ConvertOpenAIResponsesRequestToGemini(modelName string, inputRawJSON []byte
 			case "function_call_output":
 				// Handle function call outputs - convert to function message with functionResponse
 				callID := item.Get("call_id").String()
-				// Use .Raw to preserve the JSON encoding (includes quotes for strings)
-				outputRaw := item.Get("output").Str
+				outputValue := item.Get("output")
+				outputRaw := outputValue.Str
 
 				functionContent := []byte(`{"role":"function","parts":[]}`)
 				functionResponse := []byte(`{"functionResponse":{"name":"","response":{}}}`)
@@ -343,8 +343,10 @@ func ConvertOpenAIResponsesRequestToGemini(modelName string, inputRawJSON []byte
 				functionResponse, _ = sjson.SetBytes(functionResponse, "functionResponse.name", functionName)
 				functionResponse, _ = sjson.SetBytes(functionResponse, "functionResponse.id", callID)
 
-				// Set the raw JSON output directly (preserves string encoding)
-				if outputRaw != "" && outputRaw != "null" {
+				// Preserve structured values and the existing interpretation of string results.
+				if outputValue.Exists() && outputValue.Type != gjson.String && outputValue.Type != gjson.Null && json.Valid([]byte(outputValue.Raw)) {
+					functionResponse, _ = sjson.SetRawBytes(functionResponse, "functionResponse.response.result", []byte(outputValue.Raw))
+				} else if outputRaw != "" && outputRaw != "null" {
 					output := gjson.Parse(outputRaw)
 					if output.Type == gjson.JSON && json.Valid([]byte(output.Raw)) {
 						functionResponse, _ = sjson.SetRawBytes(functionResponse, "functionResponse.response.result", []byte(output.Raw))
