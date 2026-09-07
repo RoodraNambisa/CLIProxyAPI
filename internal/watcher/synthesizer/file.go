@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/credentialweight"
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v6/sdk/auth"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 )
@@ -65,6 +66,9 @@ func SynthesizeAuthFile(ctx *SynthesisContext, fullPath string, data []byte) []*
 
 func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) []*coreauth.Auth {
 	if ctx == nil || len(data) == 0 {
+		return nil
+	}
+	if errWeight := credentialweight.ValidateMetadataJSON(data); errWeight != nil {
 		return nil
 	}
 	var metadata map[string]any

@@ -31,6 +31,9 @@ func ApplyFileAuthProjection(auth *Auth, opts FileAuthProjectionOptions) error {
 	if auth == nil || auth.Metadata == nil {
 		return nil
 	}
+	if errWeight := ValidateAuthWeight(&Auth{Metadata: auth.Metadata}); errWeight != nil {
+		return errWeight
+	}
 	metadata := auth.Metadata
 	provider := strings.ToLower(strings.TrimSpace(metadataStringValue(metadata, "type")))
 	if provider == "" {
@@ -99,6 +102,9 @@ func ApplyFileAuthProjection(auth *Auth, opts FileAuthProjectionOptions) error {
 	}
 	if priority, ok := fileAuthPriority(metadata["priority"]); ok {
 		auth.Attributes["priority"] = priority
+	}
+	if errWeight := ApplyAuthWeightMetadata(auth, metadata); errWeight != nil {
+		return errWeight
 	}
 	if note := strings.TrimSpace(metadataStringValue(metadata, "note")); note != "" {
 		auth.Attributes["note"] = note
