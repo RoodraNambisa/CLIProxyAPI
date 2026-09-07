@@ -13,6 +13,7 @@ import (
 )
 
 type interactionsToResponsesStreamState struct {
+	ToolIdentities     map[string]interactionsResponsesToolIdentity
 	FunctionCalls      map[int]*interactionsFunctionCallState
 	ItemIDs            map[int]string
 	ItemTypes          map[int]string
@@ -47,14 +48,12 @@ type responsesToInteractionsStreamState struct {
 
 func ConvertInteractionsResponseToOpenAIResponses(ctx context.Context, modelName string, originalRequestRawJSON, requestRawJSON, rawJSON []byte, param *any) [][]byte {
 	_ = ctx
-	_ = originalRequestRawJSON
-	_ = requestRawJSON
 	if param == nil {
 		var local any
 		param = &local
 	}
 	if *param == nil {
-		*param = &interactionsToResponsesStreamState{}
+		*param = &interactionsToResponsesStreamState{ToolIdentities: interactionsResponsesToolIdentities(originalRequestRawJSON, requestRawJSON)}
 	}
 	st := (*param).(*interactionsToResponsesStreamState)
 	if st.FunctionCalls == nil {
@@ -80,8 +79,6 @@ func ConvertInteractionsResponseToOpenAIResponses(ctx context.Context, modelName
 
 func ConvertInteractionsResponseToOpenAIResponsesNonStream(ctx context.Context, modelName string, originalRequestRawJSON, requestRawJSON, rawJSON []byte, _ *any) []byte {
 	_ = ctx
-	_ = originalRequestRawJSON
-	_ = requestRawJSON
 	root := gjson.ParseBytes(rawJSON)
 	out := []byte(`{"id":"","object":"response","status":"completed","model":"","output":[]}`)
 	out, _ = sjson.SetBytes(out, "id", firstNonEmpty(root.Get("id").String(), root.Get("interaction.id").String()))
@@ -90,8 +87,12 @@ func ConvertInteractionsResponseToOpenAIResponsesNonStream(ctx context.Context, 
 	if !steps.Exists() {
 		steps = root.Get("interaction.steps")
 	}
+	identities := interactionsResponsesToolIdentities(originalRequestRawJSON, requestRawJSON)
 	steps.ForEach(func(_, step gjson.Result) bool {
 		if item, ok := interactionsStepToResponsesOutput(step); ok {
+			if step.Get("type").String() == "function_call" {
+				item = restoreInteractionsResponsesToolIdentity(item, "", step.Get("name").String(), identities)
+			}
 			out, _ = sjson.SetRawBytes(out, "output.-1", item)
 		}
 		return true
@@ -225,6 +226,7 @@ func interactionsStepStartToResponses(root gjson.Result, st *interactionsToRespo
 		added, _ = sjson.SetBytes(added, "item.id", itemID)
 		added, _ = sjson.SetBytes(added, "item.call_id", itemID)
 		added, _ = sjson.SetBytes(added, "item.name", call.Name)
+		added = restoreInteractionsResponsesToolIdentity(added, "item.", call.Name, st.ToolIdentities)
 		return [][]byte{emitResponsesEvent("response.output_item.added", added)}
 	}
 	return nil
@@ -305,6 +307,7 @@ func interactionsStepStopToResponses(root gjson.Result, st *interactionsToRespon
 		done, _ = sjson.SetBytes(done, "item.call_id", itemID)
 		if call != nil {
 			done, _ = sjson.SetBytes(done, "item.name", call.Name)
+			done = restoreInteractionsResponsesToolIdentity(done, "item.", call.Name, st.ToolIdentities)
 			done, _ = sjson.SetBytes(done, "item.arguments", call.Arguments.String())
 		}
 		return [][]byte{emitResponsesEvent("response.output_item.done", done)}
@@ -414,6 +417,7 @@ func responsesCompletedOutputItem(index int, itemType string, st *interactionsTo
 		item, _ = sjson.SetBytes(item, "call_id", itemID)
 		if call := st.FunctionCalls[index]; call != nil {
 			item, _ = sjson.SetBytes(item, "name", call.Name)
+			item = restoreInteractionsResponsesToolIdentity(item, "", call.Name, st.ToolIdentities)
 			item, _ = sjson.SetBytes(item, "arguments", call.Arguments.String())
 		}
 		return item, true

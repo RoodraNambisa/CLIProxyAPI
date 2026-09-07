@@ -42,13 +42,28 @@ func runGoogleResponsesToolIdentity(t *testing.T, provider string, enabled bool)
 					if err != nil {
 						t.Error(err)
 					}
-					if gjson.GetBytes(body, "tools.0.functionDeclarations.0.name").String() != "collaboration__spawn_agent" {
+					namePath := "tools.0.functionDeclarations.0.name"
+					if provider == "gemini-interactions" {
+						namePath = "tools.0.name"
+					}
+					if gjson.GetBytes(body, namePath).String() != "collaboration__spawn_agent" {
 						t.Error("namespace declaration did not reach the fake upstream")
 					}
 					cfg.Codex.OptimizeMultiAgentV2 = !enabled
 					controller.Release()
 					w := httptest.NewRecorder()
 					response := `{"candidates":[{"content":{"role":"model","parts":[{"functionCall":{"name":"collaboration__spawn_agent","args":{"message":"work"}}}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":1,"candidatesTokenCount":1,"totalTokenCount":2}}`
+					if provider == "gemini-interactions" {
+						step := `{"id":"pair","type":"function_call","name":"collaboration__spawn_agent","arguments":{"message":"work"}}`
+						response = `{"id":"result","status":"completed","steps":[` + step + `],"usage":{"total_input_tokens":1,"total_output_tokens":1,"total_tokens":2}}`
+						if stream {
+							w.Header().Set("Content-Type", "text/event-stream")
+							for _, event := range []string{`{"event_type":"step.start","index":0,"step":` + step + `}`, `{"event_type":"step.stop","index":0}`, `{"event_type":"interaction.completed","interaction":` + response + `}`} {
+								_, _ = io.WriteString(w, "data: "+event+"\n\n")
+							}
+							return w.Result(), nil
+						}
+					}
 					if stream {
 						w.Header().Set("Content-Type", "text/event-stream")
 						_, _ = io.WriteString(w, "data: "+response+"\n\n")
@@ -121,4 +136,8 @@ func TestVertexResponsesToolIdentityAndMultiAgentAfterRelease(t *testing.T) {
 			})
 		}
 	}
+}
+
+func TestInteractionsResponsesToolIdentityAfterRelease(t *testing.T) {
+	runGoogleResponsesToolIdentity(t, "gemini-interactions", false)
 }
