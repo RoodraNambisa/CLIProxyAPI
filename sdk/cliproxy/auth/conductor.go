@@ -549,7 +549,7 @@ type Manager struct {
 type requestRetryBudgetContextKey struct{}
 
 type requestRetryBudget struct {
-	remaining atomic.Int32
+	remaining atomic.Int64
 }
 
 type requestRoundState struct {
@@ -7555,6 +7555,9 @@ func (m *Manager) WithRequestRetryBudgetForProviders(ctx context.Context, provid
 
 // ConsumeRequestRetryBudget spends one bootstrap retry from the context budget.
 func ConsumeRequestRetryBudget(ctx context.Context) bool {
+	if ctx != nil && ctx.Err() != nil {
+		return false
+	}
 	if ctrl := cliproxyexecutor.RequestBodyReleaseControllerFromContext(ctx); ctrl != nil && !ctrl.Replayable() {
 		return false
 	}
@@ -7587,7 +7590,8 @@ func (m *Manager) withRequestRetryBudget(ctx context.Context, providers []string
 	if bootstrapRetries < 0 {
 		bootstrapRetries = 0
 	}
-	if existing := requestRetryBudgetFromContext(ctx); existing != nil && existing.remaining.Load() >= int32(bootstrapRetries) {
+	// Nested setup shares the original budget, including an exhausted one.
+	if existing := requestRetryBudgetFromContext(ctx); existing != nil {
 		return ctx
 	}
 	return context.WithValue(ctx, requestRetryBudgetContextKey{}, newRequestRetryBudget(bootstrapRetries))
@@ -7649,7 +7653,7 @@ func newRequestRetryBudget(total int) *requestRetryBudget {
 		total = 0
 	}
 	budget := &requestRetryBudget{}
-	budget.remaining.Store(int32(total))
+	budget.remaining.Store(int64(total))
 	return budget
 }
 
