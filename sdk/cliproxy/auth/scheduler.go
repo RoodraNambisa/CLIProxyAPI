@@ -955,7 +955,10 @@ func (s *authScheduler) pickMixed(ctx context.Context, providers []string, model
 	priorityPredicate := func(entry *scheduledAuth) bool {
 		return entry != nil && entry.auth != nil && (strategyForPriority(authPriority(entry.auth)) != schedulerStrategyWeightedRoundRobin || authWeight(entry.auth) > 0)
 	}
-	pickPredicate := triedPredicate(tried, authAllowed...)
+	basePickPredicate := triedPredicate(tried, authAllowed...)
+	pickPredicate := func(entry *scheduledAuth) bool {
+		return priorityPredicate(entry) && basePickPredicate(entry)
+	}
 	candidateShards := make([]*modelScheduler, len(normalized))
 	prioritySet := make(map[int]struct{})
 	now := time.Now()
@@ -979,7 +982,7 @@ func (s *authScheduler) pickMixed(ctx context.Context, providers []string, model
 		}
 	}
 	if len(prioritySet) == 0 {
-		return nil, "", mixedUnavailableErrorFromShards(normalized, candidateShards, model, tried)
+		return nil, "", mixedUnavailableErrorFromShardsWithPredicate(normalized, candidateShards, model, pickPredicate)
 	}
 
 	priorities := make([]int, 0, len(prioritySet))
@@ -991,7 +994,7 @@ func (s *authScheduler) pickMixed(ctx context.Context, providers []string, model
 	})
 	prioritiesToTry := selectionPrioritiesForAttempt(priorities, selectionAttempt)
 	if len(prioritiesToTry) == 0 {
-		return nil, "", mixedUnavailableErrorFromShards(normalized, candidateShards, model, tried)
+		return nil, "", mixedUnavailableErrorFromShardsWithPredicate(normalized, candidateShards, model, pickPredicate)
 	}
 
 	type mixedCandidate struct {
