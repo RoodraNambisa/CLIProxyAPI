@@ -41,6 +41,28 @@ func TestKnownRequestFaultPreservesCredentialEvidence(t *testing.T) {
 	}
 }
 
+func TestManagerWebsocketReplayRequirementDoesNotRotateOrCoolCredentials(t *testing.T) {
+	for _, stream := range []bool{false, true} {
+		manager, exec := newCredentialRetryLimitTestManagerWithAuthCount(t, 0, 3)
+		manager.SetRetryConfig(3, 0, 0)
+		exec.err = cliproxyexecutor.NewUpstreamWebsocketReplayRequiredError()
+		var err error
+		if stream {
+			_, err = manager.ExecuteStream(t.Context(), []string{"claude"}, cliproxyexecutor.Request{Model: "test-model"}, cliproxyexecutor.Options{})
+		} else {
+			_, err = manager.Execute(t.Context(), []string{"claude"}, cliproxyexecutor.Request{Model: "test-model"}, cliproxyexecutor.Options{})
+		}
+		if !errors.Is(err, exec.err) || exec.Calls() != 1 {
+			t.Fatal("replay requirement rotated credentials or lost cause")
+		}
+		for _, auth := range manager.List() {
+			if auth.Unavailable || len(auth.ModelStates) > 0 {
+				t.Fatal("replay requirement changed credential availability")
+			}
+		}
+	}
+}
+
 func TestRequestErrorRetryPolicyKeepsConfigurationSnapshot(t *testing.T) {
 	manager := NewManager(nil, nil, nil)
 	manager.SetConfig(&internalconfig.Config{NonRetryableErrors: []internalconfig.NonRetryableErrorRule{{StatusCode: 400, Code: "custom-stop"}}})
@@ -51,7 +73,7 @@ func TestRequestErrorRetryPolicyKeepsConfigurationSnapshot(t *testing.T) {
 	if before(custom) || !manager.SnapshotRequestErrorRetryPolicy()(custom) {
 		t.Fatal("hot reload changed the captured custom error rules")
 	}
-	if before(fault) || before(context.Canceled) {
+	if before(fault) || before(context.Canceled) || before(cliproxyexecutor.NewUpstreamWebsocketReplayRequiredError()) {
 		t.Fatal("request policy allowed a non-retryable error")
 	}
 	if !before(&Error{HTTPStatus: 429, Message: "rate limited"}) {

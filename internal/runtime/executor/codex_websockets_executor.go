@@ -278,6 +278,9 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 	body = helps.SanitizeCodexReasoningEncryptedContent(ctx, "codex websockets executor", body)
 	body = helps.NormalizeCodexToolSelection(body)
 	body = e.codexPreparedSessionIdentity(ctx, req, opts).ResponsesLite.ApplyBody(body, true)
+	if strings.TrimSpace(gjson.GetBytes(body, "previous_response_id").String()) != "" {
+		ctx = cliproxyexecutor.WithRequiredUpstreamWebsocket(ctx)
+	}
 	reporter.SetRequestServiceTierFromPayload(body)
 
 	httpURL := strings.TrimSuffix(baseURL, "/") + "/responses"
@@ -399,6 +402,15 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 	}
 
 	if errSend := writeCurrentCodexWebsocketMessage(ctx, auth, sess, conn, wsReqBody); errSend != nil {
+		if cliproxyexecutor.RequiredUpstreamWebsocket(ctx) {
+			if sess != nil {
+				e.invalidateUpstreamConnWithoutDisconnectNotify(sess, conn, "send_error", errSend)
+			}
+			if errCurrent := codexWebsocketExecutionStateError(ctx, auth); errCurrent != nil {
+				return resp, errCurrent
+			}
+			return resp, helps.CodexWebsocketReplayError(ctx, mapCodexWebsocketReadError(errSend))
+		}
 		if sess != nil {
 			e.invalidateUpstreamConn(sess, conn, "send_error", errSend)
 			if !helps.RequestBodyReplayable(ctx, opts) {
@@ -578,6 +590,9 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 	body = helps.SanitizeCodexReasoningEncryptedContent(ctx, "codex websockets executor", body)
 	body = helps.NormalizeCodexToolSelection(body)
 	body = e.codexPreparedSessionIdentity(ctx, req, opts).ResponsesLite.ApplyBody(body, true)
+	if strings.TrimSpace(gjson.GetBytes(body, "previous_response_id").String()) != "" {
+		ctx = cliproxyexecutor.WithRequiredUpstreamWebsocket(ctx)
+	}
 	reporter.SetRequestServiceTierFromPayload(body)
 
 	httpURL := strings.TrimSuffix(baseURL, "/") + "/responses"
@@ -695,6 +710,20 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 	}
 
 	if errSend := writeCurrentCodexWebsocketMessage(ctx, auth, sess, conn, wsReqBody); errSend != nil {
+		if cliproxyexecutor.RequiredUpstreamWebsocket(ctx) {
+			if sess != nil {
+				e.invalidateUpstreamConnWithoutDisconnectNotify(sess, conn, "send_error", errSend)
+				sess.clearActiveForConn(readCh, conn)
+				sess.reqMu.Unlock()
+			} else {
+				_ = conn.Close()
+			}
+			cleanupBodies()
+			if errCurrent := codexWebsocketExecutionStateError(ctx, auth); errCurrent != nil {
+				return nil, errCurrent
+			}
+			return nil, helps.CodexWebsocketReplayError(ctx, mapCodexWebsocketReadError(errSend))
+		}
 		helps.RecordAPIWebsocketError(ctx, e.cfg, "send", errSend)
 		if sess != nil {
 			e.invalidateUpstreamConn(sess, conn, "send_error", errSend)
@@ -1660,6 +1689,9 @@ func (e *CodexWebsocketsExecutor) ensureUpstreamConn(ctx context.Context, auth *
 		return nil, nil, errCurrent
 	}
 	if sess == nil {
+		if cliproxyexecutor.RequiredUpstreamWebsocket(ctx) {
+			return nil, nil, cliproxyexecutor.NewUpstreamWebsocketReplayRequiredError()
+		}
 		conn, resp, errDial := e.dialCodexWebsocket(ctx, auth, wsURL, headers)
 		if errDial != nil {
 			if errCurrent := codexWebsocketExecutionStateError(ctx, auth); errCurrent != nil {
@@ -1702,6 +1734,9 @@ func (e *CodexWebsocketsExecutor) ensureUpstreamConn(ctx context.Context, auth *
 	requestedProxyBindingID := auth.EffectiveProxyBindingID()
 	requestedProxyIdentity := websocketProxyIdentity(e.cfg, auth)
 	requestedWSURL := strings.TrimSpace(wsURL)
+	if cliproxyexecutor.RequiredUpstreamWebsocket(ctx) && (conn == nil || currentAuthID != requestedAuthID || currentAuthInstanceID != requestedAuthInstanceID || currentProxyBindingID != requestedProxyBindingID || currentProxyIdentity != requestedProxyIdentity || currentWSURL != requestedWSURL) {
+		return nil, nil, cliproxyexecutor.NewUpstreamWebsocketReplayRequiredError()
+	}
 	if conn != nil && (currentAuthID != requestedAuthID || currentAuthInstanceID != requestedAuthInstanceID || currentProxyBindingID != requestedProxyBindingID || currentProxyIdentity != requestedProxyIdentity || currentWSURL != requestedWSURL) {
 		e.invalidateUpstreamConnWithoutDisconnectNotify(sess, conn, "auth_changed", nil)
 		conn = nil

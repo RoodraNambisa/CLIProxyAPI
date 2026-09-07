@@ -752,6 +752,12 @@ func (e *CodexExecutor) HttpRequest(ctx context.Context, auth *cliproxyauth.Auth
 }
 
 func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (resp cliproxyexecutor.Response, err error) {
+	if cliproxyexecutor.RequiredUpstreamWebsocket(ctx) {
+		if errCurrent := codexWebsocketExecutionStateError(ctx, auth); errCurrent != nil {
+			return resp, errCurrent
+		}
+		return resp, cliproxyexecutor.NewUpstreamWebsocketReplayRequiredError()
+	}
 	ctx = contextWithCodexFingerprintPersona(ctx, e.cfg, auth)
 	opts, err = e.ensureCodexPreparedSessionIdentity(ctx, req, opts, cliproxyexecutor.RequestOperationExecute)
 	if err != nil {
@@ -966,6 +972,12 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 }
 
 func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (resp cliproxyexecutor.Response, err error) {
+	if cliproxyexecutor.RequiredUpstreamWebsocket(ctx) {
+		if errCurrent := codexWebsocketExecutionStateError(ctx, auth); errCurrent != nil {
+			return resp, errCurrent
+		}
+		return resp, cliproxyexecutor.NewUpstreamWebsocketReplayRequiredError()
+	}
 	ctx = contextWithCodexFingerprintPersona(ctx, e.cfg, auth)
 	baseModel := thinking.ParseSuffix(req.Model).ModelName
 
@@ -1082,6 +1094,12 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 }
 
 func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (_ *cliproxyexecutor.StreamResult, err error) {
+	if cliproxyexecutor.RequiredUpstreamWebsocket(ctx) {
+		if errCurrent := codexWebsocketExecutionStateError(ctx, auth); errCurrent != nil {
+			return nil, errCurrent
+		}
+		return nil, cliproxyexecutor.NewUpstreamWebsocketReplayRequiredError()
+	}
 	ctx = contextWithCodexFingerprintPersona(ctx, e.cfg, auth)
 	opts, err = e.ensureCodexPreparedSessionIdentity(ctx, req, opts, cliproxyexecutor.RequestOperationStream)
 	if err != nil {

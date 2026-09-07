@@ -273,6 +273,14 @@ func TestCodexWebsocketsExecutePreservesPreviousResponseIDUpstream(t *testing.T)
 		}
 		defer func() { _ = conn.Close() }()
 
+		if _, _, errInitial := conn.ReadMessage(); errInitial != nil {
+			t.Error(errInitial)
+			return
+		}
+		if errInitial := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.completed","response":{"id":"resp-1","output":[]}}`)); errInitial != nil {
+			t.Error(errInitial)
+			return
+		}
 		msgType, payload, err := conn.ReadMessage()
 		if err != nil {
 			t.Fatalf("read upstream websocket message: %v", err)
@@ -290,12 +298,18 @@ func TestCodexWebsocketsExecutePreservesPreviousResponseIDUpstream(t *testing.T)
 	defer server.Close()
 
 	exec := NewCodexWebsocketsExecutor(&config.Config{})
+	exec.store = &codexWebsocketSessionStore{sessions: make(map[string]*codexWebsocketSession)}
+	t.Cleanup(func() { exec.CloseExecutionSession("previous-response-test") })
 	auth := &cliproxyauth.Auth{Attributes: map[string]string{"api_key": "sk-test", "base_url": server.URL}}
 	req := cliproxyexecutor.Request{
 		Model:   "gpt-5-codex",
 		Payload: []byte(`{"model":"gpt-5-codex","previous_response_id":"resp-1","input":[{"type":"reasoning","encrypted_content":"gAAAA-invalid"},{"type":"message","id":"msg-1"}],"tools":[],"tool_choice":"auto","parallel_tool_calls":true}`),
 	}
-	opts := cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("codex")}
+	opts := cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("codex"), Metadata: map[string]any{cliproxyexecutor.ExecutionSessionMetadataKey: "previous-response-test"}}
+	initial := cliproxyexecutor.Request{Model: req.Model, Payload: []byte(`{"model":"gpt-5-codex","input":[{"role":"user","content":"initial"}]}`)}
+	if _, err := exec.Execute(context.Background(), auth, initial, opts); err != nil {
+		t.Fatal(err)
+	}
 
 	if _, err := exec.Execute(context.Background(), auth, req, opts); err != nil {
 		t.Fatalf("Execute() error = %v", err)
