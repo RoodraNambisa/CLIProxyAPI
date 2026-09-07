@@ -11,6 +11,9 @@ import (
 // PromoteXAIAdditionalTools feeds Lite declarations through xAI's existing
 // namespace flattening and tool filters without changing its short-name policy.
 func PromoteXAIAdditionalTools(body []byte) []byte {
+	if !gjson.GetBytes(body, `input.#(type=="additional_tools")`).Exists() {
+		return body
+	}
 	root := gjson.ParseBytes(body)
 	if !root.Get("input").IsArray() || root.Get("tools").Exists() && !root.Get("tools").IsArray() {
 		return body

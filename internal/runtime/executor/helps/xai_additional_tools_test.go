@@ -2,6 +2,7 @@ package helps
 
 import (
 	"bytes"
+	"strings"
 	"testing"
 
 	"github.com/tidwall/gjson"
@@ -31,5 +32,18 @@ func TestPromoteXAIAdditionalToolsPreservesNonLiteAndMalformedInput(t *testing.T
 	out := PromoteXAIAdditionalTools([]byte(`{"input":[{"type":"additional_tools","tools":[]}]}`))
 	if gjson.GetBytes(out, "input").Raw != "[]" || gjson.GetBytes(out, "tools").Raw != "[]" {
 		t.Fatal("empty declaration arrays did not remain arrays")
+	}
+	escaped := PromoteXAIAdditionalTools([]byte(`{"input":[{"type":"additional_\u0074ools","tools":[]}]}`))
+	if gjson.GetBytes(escaped, "input").Raw != "[]" {
+		t.Fatal("escaped type did not reach the declaration path")
+	}
+}
+
+func BenchmarkPromoteXAIAdditionalToolsNonLite(b *testing.B) {
+	body := []byte(`{"tools":[],"input":[` + strings.Repeat(`{"role":"user","content":"`+strings.Repeat("x", 1000)+`"},`, 999) + `{"role":"user","content":"last"}]}`)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		PromoteXAIAdditionalTools(body)
 	}
 }
