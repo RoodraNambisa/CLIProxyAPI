@@ -90,6 +90,7 @@ func agentIdentity(sessionID, agent string) string {
 // relationship from messages, cache keys, or arbitrary tool arguments.
 func ExtractCodexIdentity(headers http.Header, payload []byte) (Identity, bool) {
 	roots := protocolRoots(payload)
+	headers = codexFrameIdentityHeaders(headers, roots)
 	sid := explicitID(headerValue(headers, "Session-Id"))
 	if sid == "" {
 		sid = explicitID(headerValue(headers, "Session_id"))
