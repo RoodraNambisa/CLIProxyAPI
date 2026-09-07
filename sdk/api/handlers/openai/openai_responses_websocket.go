@@ -109,6 +109,7 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 
 	var lastRequest []byte
 	lastResponseOutput := []byte("[]")
+	lastResponseID := ""
 	pinnedAuthID := ""
 	lastAttemptedAuthID := ""
 
@@ -147,10 +148,11 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 		var requestJSON []byte
 		var updatedLastRequest []byte
 		var errMsg *interfaces.ErrorMessage
-		requestJSON, updatedLastRequest, errMsg = normalizeResponsesWebsocketRequestWithMode(
+		requestJSON, updatedLastRequest, errMsg = normalizeResponsesWebsocketRequestWithContext(
 			payload,
 			lastRequest,
 			lastResponseOutput,
+			lastResponseID,
 			allowIncrementalInputWithPreviousResponseID,
 		)
 		if errMsg != nil {
@@ -203,7 +205,7 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 			}
 			lastRequest = updatedLastRequest
 			lastResponseOutput = []byte("[]")
-			if errWrite := writeResponsesWebsocketSyntheticPrewarm(c, conn, requestJSON, &wsTimelineLog, passthroughSessionID); errWrite != nil {
+			if errWrite := writeResponsesWebsocketSyntheticPrewarm(c, conn, requestJSON, &wsTimelineLog, passthroughSessionID, &lastResponseID); errWrite != nil {
 				wsTerminateErr = errWrite
 				return
 			}
@@ -219,6 +221,9 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 		modelName := gjson.GetBytes(requestJSON, "model").String()
 		cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
 		cliCtx = cliproxyexecutor.WithDownstreamWebsocket(cliCtx)
+		if strings.TrimSpace(gjson.GetBytes(requestJSON, "previous_response_id").String()) != "" {
+			cliCtx = cliproxyexecutor.WithRequiredUpstreamWebsocket(cliCtx)
+		}
 		cliCtx = handlers.WithExecutionSessionID(cliCtx, passthroughSessionID)
 		lastAttemptedAuthID = ""
 		if pinnedAuthID != "" {
@@ -255,6 +260,7 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 			toolCacheTurn.commit()
 			lastRequest = updatedLastRequest
 			lastResponseOutput = completedOutput
+			lastResponseID = toolCacheTurn.responseID
 		}
 	}
 }
@@ -713,6 +719,7 @@ func writeResponsesWebsocketSyntheticPrewarm(
 	requestJSON []byte,
 	wsTimelineLog *strings.Builder,
 	sessionID string,
+	responseIDs ...*string,
 ) error {
 	payloads, errPayloads := syntheticResponsesWebsocketPrewarmPayloads(requestJSON)
 	if errPayloads != nil {
@@ -736,6 +743,9 @@ func writeResponsesWebsocketSyntheticPrewarm(
 			)
 			return errWrite
 		}
+	}
+	if len(responseIDs) > 0 && responseIDs[0] != nil {
+		*responseIDs[0] = strings.Clone(gjson.GetBytes(payloads[len(payloads)-1], "response.id").String())
 	}
 	return nil
 }
