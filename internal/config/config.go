@@ -3865,6 +3865,9 @@ func SaveConfigPreserveComments(configFile string, cfg *Config) error {
 		return fmt.Errorf("expected generated root mapping node")
 	}
 
+	if err := prepareCredentialYAMLForSave(original.Content[0]); err != nil {
+		return err
+	}
 	// Remove deprecated sections before merging back the sanitized config.
 	removeLegacyAuthBlock(original.Content[0])
 	removeLegacyOpenAICompatAPIKeys(original.Content[0])
@@ -4081,7 +4084,7 @@ func mergeNodePreserve(dst, src *yaml.Node, path ...[]string) {
 			mergeNodePreserve(dst.Content[i], src.Content[i], currentPath)
 			if dst.Content[i] != nil && src.Content[i] != nil &&
 				dst.Content[i].Kind == yaml.MappingNode && src.Content[i].Kind == yaml.MappingNode {
-				pruneMissingMapKeys(dst.Content[i], src.Content[i])
+				pruneMissingCredentialYAMLKeys(dst.Content[i], src.Content[i], currentPath)
 			}
 		}
 		// Append any extra items from src
