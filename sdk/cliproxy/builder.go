@@ -173,6 +173,9 @@ func (b *Builder) Build() (*Service, error) {
 	if b.configPath == "" {
 		return nil, fmt.Errorf("cliproxy: configuration path is required")
 	}
+	if errWeight := b.cfg.ValidateCredentialWeights(); errWeight != nil {
+		return nil, errWeight
+	}
 
 	tokenProvider := b.tokenProvider
 	if tokenProvider == nil {
