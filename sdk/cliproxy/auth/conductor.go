@@ -2927,6 +2927,9 @@ func (m *Manager) register(ctx context.Context, auth *Auth, requireAbsent bool) 
 	if auth == nil {
 		return nil, nil
 	}
+	if errWeight := ValidateAuthWeight(auth); errWeight != nil {
+		return nil, errWeight
+	}
 	auth.requestRefreshFamilyID = ""
 	auth.ID = strings.TrimSpace(auth.ID)
 	if auth.ID == "" {
@@ -3180,6 +3183,9 @@ func (m *Manager) chatGPTWebStoredCredentialConflict(ctx context.Context, authID
 func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 	if auth == nil || strings.TrimSpace(auth.ID) == "" {
 		return nil, nil
+	}
+	if errWeight := ValidateAuthWeight(auth); errWeight != nil {
+		return nil, errWeight
 	}
 	auth = auth.Clone()
 	auth.ID = strings.TrimSpace(auth.ID)
@@ -4786,6 +4792,9 @@ func (m *Manager) installPreparedRequestAuthWithRuntimeMetadata(
 	candidate := updated.Clone()
 	if allowRuntimeMetadataChanges || strings.EqualFold(strings.TrimSpace(current.Provider), "codex") {
 		carryForwardConcurrentRefreshMetadata(expected, current, updated, candidate)
+	}
+	if refreshAware || authWeightConfigurationChanged(expected, current) {
+		carryForwardConfiguredAuthWeight(current, candidate)
 	}
 	clearRuntimeProxy(candidate)
 	if chatGPTWebEmailChanged(current, candidate) && m.shouldPersistAuth(ctx, candidate) {
@@ -9952,6 +9961,9 @@ func authIsRuntimeOnly(auth *Auth) bool {
 }
 
 func (m *Manager) persistWithoutLock(ctx context.Context, auth *Auth, syncCurrentHash bool) error {
+	if errWeight := ValidateAuthWeight(auth); errWeight != nil {
+		return errWeight
+	}
 	if !m.shouldPersistAuth(ctx, auth) {
 		return nil
 	}
@@ -9975,6 +9987,9 @@ func (m *Manager) persistWithoutLock(ctx context.Context, auth *Auth, syncCurren
 }
 
 func (m *Manager) persistNewWithoutLock(ctx context.Context, auth *Auth) error {
+	if errWeight := ValidateAuthWeight(auth); errWeight != nil {
+		return errWeight
+	}
 	if !m.shouldPersistAuth(ctx, auth) {
 		return nil
 	}
@@ -12740,6 +12755,7 @@ func (m *Manager) applyRefreshedAuth(ctx context.Context, expected, refreshBasel
 	if !refreshIdentityChanged {
 		carryForwardConcurrentRefreshMetadata(refreshBaseline, current, refreshOutput, updated)
 	}
+	carryForwardConfiguredAuthWeight(current, updated)
 	credentialChanged := prepareRefreshedChatGPTWebCredentialReplacement(current, updated, time.Now())
 	if !credentialChanged {
 		carryForwardConcurrentRefreshRuntimeState(refreshBaseline, current, updated)
@@ -12771,6 +12787,7 @@ func (m *Manager) applyRefreshedAuth(ctx context.Context, expected, refreshBasel
 	if !refreshIdentityChanged {
 		carryForwardConcurrentRefreshMetadata(refreshBaseline, current, refreshOutput, updated)
 	}
+	carryForwardConfiguredAuthWeight(current, updated)
 	credentialChanged = prepareRefreshedChatGPTWebCredentialReplacement(current, updated, time.Now())
 	if !credentialChanged {
 		carryForwardConcurrentRefreshRuntimeState(refreshBaseline, current, updated)
