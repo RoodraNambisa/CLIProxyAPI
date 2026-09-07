@@ -1665,7 +1665,7 @@ func (m *Manager) pickBoundAcrossPriorities(ctx context.Context, auths []*Auth, 
 	if m.routingStrategyForPriority(priority, ctx) == schedulerStrategyFillFirst && m.routingAuthRequestLimitPolicyForAuth(bound).limit == 0 {
 		rpm := m.routingFillFirstPerAuthRPMForPriority(priority, ctx)
 		if rpm > 0 && !m.fillFirstLimiter().tryAcquireAt(bound.ID, rpm, now) {
-			if !selector.failover && selector.cachedStrictAuthID(ctx, provider, model, opts) != "" {
+			if !selector.failover && selector.cachedStrictAuthID(ctx, provider, model, opts) == bound.ID {
 				return nil, true, newAuthRPMLimitedError(fillFirstRPMRetryAfterAt(m.fillFirstLimiter(), now))
 			}
 			return nil, false, nil

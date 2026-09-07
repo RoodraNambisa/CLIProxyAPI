@@ -3,6 +3,7 @@ package auth
 import (
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	core "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
@@ -70,5 +71,30 @@ func TestParentAffinityCapacityIsNotAnEstablishedStrictChildBinding(t *testing.T
 				})
 			}
 		}
+	}
+}
+
+func TestParentCapacityFailureDoesNotLockAConcurrentlyDifferentChildBinding(t *testing.T) {
+	failover := false
+	s := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{Subagents: true, AcrossPriorities: true, Failover: &failover})
+	t.Cleanup(s.Stop)
+	m := NewManager(nil, s, nil)
+	m.SetConfig(&config.Config{Routing: config.RoutingConfig{Strategy: "fill-first", PriorityOverrides: []config.RoutingPriorityOverride{{Priority: 0, Strategy: "fill-first"}}, FillFirstPerAuthRPM: 1}})
+	ctx := affinityCallerContext(t, "caller-a", "test")
+	child := subagentOptions("child", "root", false)
+	s.BindSession(ctx, "test", "", subagentOptions("root", "", false), "b")
+	now := time.Now()
+	if !m.fillFirstLimiter().tryAcquireAt("b", 1, now) {
+		t.Fatal("fixture capacity was unavailable")
+	}
+	auths := []*Auth{{ID: "a", Provider: "test"}, {ID: "b", Provider: "test"}}
+	_, handled, err := m.pickBoundAcrossPriorities(ctx, auths, "test", "", child, now, func(auth *Auth) bool {
+		if auth.ID == "b" {
+			s.BindSession(ctx, "test", "", child, "a")
+		}
+		return true
+	})
+	if handled || err != nil {
+		t.Fatal("old parent capacity failure locked the child's different new binding")
 	}
 }
