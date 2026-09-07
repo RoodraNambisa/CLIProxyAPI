@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
@@ -27,7 +28,7 @@ const codexTestBootstrapFailure = `{"type":"response.failed","response":{"error"
 const codexTestBootstrapCompleted = `{"type":"response.completed","response":{"id":"done","output":[],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}`
 
 func TestCodexBootstrapWireAttemptsRespectExistingBudget(t *testing.T) {
-	for _, transport := range []string{"http", "images"} {
+	for _, transport := range []string{"http", "websocket", "images"} {
 		for _, tc := range []struct {
 			name        string
 			enabled     bool
@@ -217,7 +218,7 @@ func TestCodexBootstrapCancellationAndBodyRelease(t *testing.T) {
 }
 
 func TestCodexBootstrapPreservesRateLimitStatusAndHeaders(t *testing.T) {
-	for _, useWS := range []bool{false} {
+	for _, useWS := range []bool{false, true} {
 		t.Run(fmt.Sprint(useWS), func(t *testing.T) {
 			const event = `{"type":"error","status":429,"headers":{"X-Test-Rate":"retained"},"error":{"code":"server_is_overloaded","type":"service_unavailable_error","message":"busy"}}`
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -252,5 +253,108 @@ func TestCodexBootstrapPreservesRateLimitStatusAndHeaders(t *testing.T) {
 				t.Fatal("bootstrap changed actual status or public headers")
 			}
 		})
+	}
+}
+
+func TestCodexBootstrapDoesNotReplayIncrementalWebsocketContext(t *testing.T) {
+	var connections atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		connections.Add(1)
+		upgrader := websocket.Upgrader{}
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		defer func() { _ = conn.Close() }()
+		_, _, _ = conn.ReadMessage()
+		_ = conn.WriteMessage(websocket.TextMessage, []byte(codexTestBootstrapCompleted))
+		_, _, _ = conn.ReadMessage()
+		_ = conn.WriteMessage(websocket.TextMessage, []byte(codexTestBootstrapCreated))
+		_ = conn.WriteMessage(websocket.TextMessage, []byte(codexTestBootstrapFailure))
+		_, _, _ = conn.ReadMessage()
+	}))
+	defer server.Close()
+	ws := NewCodexWebsocketsExecutor(&config.Config{SDKConfig: sdkconfig.SDKConfig{ProxyURL: "direct"}, Codex: config.CodexConfig{StreamBootstrapBuffering: true}})
+	session := uuid.NewString()
+	defer ws.CloseExecutionSession(session)
+	credential := &auth.Auth{ID: "incremental", Provider: "codex", Attributes: map[string]string{"api_key": "test", "base_url": server.URL}}
+	opts := core.Options{SourceFormat: translator.FromString("codex"), Metadata: map[string]any{core.ExecutionSessionMetadataKey: session}}
+	for index, body := range []string{`{"input":[]}`, `{"input":[],"previous_response_id":"done"}`} {
+		stream, err := ws.ExecuteStream(t.Context(), credential, core.Request{Model: "gpt-5.4", Payload: []byte(body)}, opts)
+		if err != nil {
+			t.Fatal("incremental context became a synchronous failover")
+		}
+		failed := false
+		for chunk := range stream.Chunks {
+			failed = failed || chunk.Err != nil
+		}
+		if failed != (index == 1) {
+			t.Fatal("incremental failure did not use ordinary in-stream semantics")
+		}
+	}
+	if connections.Load() != 1 {
+		t.Fatal("incremental failure opened another connection")
+	}
+}
+
+func TestCodexBootstrapWebsocketCancellationReleasesProbeState(t *testing.T) {
+	started := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upgrader := websocket.Upgrader{}
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		defer func() { _ = conn.Close() }()
+		_, _, _ = conn.ReadMessage()
+		_ = conn.WriteMessage(websocket.TextMessage, []byte(codexTestBootstrapCreated))
+		close(started)
+		_, _, _ = conn.ReadMessage()
+	}))
+	defer server.Close()
+	ws := NewCodexWebsocketsExecutor(&config.Config{SDKConfig: sdkconfig.SDKConfig{ProxyURL: "direct"}, Codex: config.CodexConfig{StreamBootstrapBuffering: true}})
+	session := uuid.NewString()
+	defer ws.CloseExecutionSession(session)
+	credential := &auth.Auth{ID: "bootstrap-ws-cancel", Provider: "codex", Attributes: map[string]string{"api_key": "test", "base_url": server.URL}}
+	opts := core.Options{SourceFormat: translator.FromString("codex"), Metadata: map[string]any{core.ExecutionSessionMetadataKey: session}}
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		stream, err := ws.ExecuteStream(ctx, credential, core.Request{Model: "gpt-5.4", Payload: []byte(`{"input":[]}`)}, opts)
+		if stream != nil {
+			for chunk := range stream.Chunks {
+				if chunk.Err != nil {
+					err = chunk.Err
+				}
+			}
+		}
+		done <- err
+	}()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("bootstrap did not start")
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatal("bootstrap replaced cancellation")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("cancel left bootstrap blocked")
+	}
+	sess := ws.getOrCreateSession(session)
+	if !sess.reqMu.TryLock() {
+		t.Fatal("canceled probe kept the request lock")
+	}
+	sess.reqMu.Unlock()
+	sess.connMu.Lock()
+	defer sess.connMu.Unlock()
+	if sess.bootstrapDisconnectGate != nil {
+		t.Fatal("canceled probe retained its disconnect gate")
 	}
 }
