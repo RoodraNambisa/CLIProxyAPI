@@ -317,7 +317,11 @@ func interactionsStepStopToResponses(root gjson.Result, st *interactionsToRespon
 		}
 	}
 	itemID := st.ItemIDs[index]
-	switch st.ItemTypes[index] {
+	itemType := st.ItemTypes[index]
+	if itemType == "" && (len(st.ReasoningSummaries[index]) != 0 || st.ReasoningEncrypted[index] != "") {
+		itemType = "thought"
+	}
+	switch itemType {
 	case "model_output":
 		text := ""
 		if builder := st.TextOutputs[index]; builder != nil {

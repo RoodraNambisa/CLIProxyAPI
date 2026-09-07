@@ -123,3 +123,26 @@ func TestInteractionsToolStreamSparseIndexAndLegacyText(t *testing.T) {
 		t.Fatalf("sparse call = %q", got)
 	}
 }
+
+func TestInteractionsReasoningStopWithoutStart(t *testing.T) {
+	for _, delta := range []string{
+		`{"type":"thought_summary","text":"summary"}`,
+		`{"type":"thought_signature","signature":"fixture-signature"}`,
+	} {
+		t.Run(delta, func(t *testing.T) {
+			var state any
+			ConvertInteractionsResponseToOpenAIResponses(context.Background(), "fixture", nil, nil, []byte(`{"event_type":"step.delta","index":3,"delta":`+delta+`}`), &state)
+			out := ConvertInteractionsResponseToOpenAIResponses(context.Background(), "fixture", nil, nil, []byte(`{"event_type":"step.stop","index":3}`), &state)
+			item := gjson.GetBytes(findResponsesEventPayload(out, "response.output_item.done"), "item")
+			if item.Get("type").String() != "reasoning" {
+				t.Fatal("known reasoning state was dropped without a start event")
+			}
+			if gjson.Get(delta, "type").String() == "thought_summary" && item.Get("summary.0.text").String() != "summary" {
+				t.Fatal("reasoning summary was lost")
+			}
+			if gjson.Get(delta, "type").String() == "thought_signature" && item.Get("encrypted_content").String() != "fixture-signature" {
+				t.Fatal("reasoning signature was lost")
+			}
+		})
+	}
+}
