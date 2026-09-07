@@ -467,10 +467,8 @@ type Manager struct {
 	// providerOffsets tracks per-model provider rotation state for multi-provider routing.
 	providerOffsets map[string]int
 
-	// Retry controls request retry behavior.
-	requestRetry        atomic.Int32
-	maxRetryCredentials atomic.Int32
-	maxRetryInterval    atomic.Int64
+	// Retry settings are published together and captured at request entry.
+	retryConfig atomic.Pointer[retrySettingsSnapshot]
 
 	// oauthModelAlias stores global OAuth model alias mappings (alias -> upstream name) keyed by channel.
 	oauthModelAlias atomic.Value
@@ -2823,9 +2821,7 @@ func (m *Manager) SetRetryConfig(retry int, maxRetryInterval time.Duration, maxR
 	if maxRetryInterval < 0 {
 		maxRetryInterval = 0
 	}
-	m.requestRetry.Store(int32(retry))
-	m.maxRetryCredentials.Store(int32(maxRetryCredentials))
-	m.maxRetryInterval.Store(maxRetryInterval.Nanoseconds())
+	m.retryConfig.Store(&retrySettingsSnapshot{retries: retry, credentials: maxRetryCredentials, wait: maxRetryInterval})
 }
 
 // RegisterExecutor registers a provider executor with the manager.
@@ -4439,7 +4435,7 @@ func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxye
 	}
 	strictSessionAffinity := m.strictSessionAffinityForRequest(req, opts)
 
-	defaultRequestRetry, maxRetryCredentials, maxWait := m.retrySettings()
+	defaultRequestRetry, maxRetryCredentials, maxWait := m.retrySettings(ctx)
 	requestRetry := m.maxRequestRetryForProviders(normalized, defaultRequestRetry)
 	roundState := newRequestRoundState()
 
@@ -4532,7 +4528,7 @@ func (m *Manager) ExecuteCount(ctx context.Context, providers []string, req clip
 	}
 	strictSessionAffinity := m.strictSessionAffinityForRequest(req, opts)
 
-	defaultRequestRetry, maxRetryCredentials, maxWait := m.retrySettings()
+	defaultRequestRetry, maxRetryCredentials, maxWait := m.retrySettings(ctx)
 	requestRetry := m.maxRequestRetryForProviders(normalized, defaultRequestRetry)
 	roundState := newRequestRoundState()
 
@@ -4623,7 +4619,7 @@ func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cli
 	}
 	strictSessionAffinity := m.strictSessionAffinityForRequest(req, opts)
 
-	defaultRequestRetry, maxRetryCredentials, maxWait := m.retrySettings()
+	defaultRequestRetry, maxRetryCredentials, maxWait := m.retrySettings(ctx)
 	requestRetry := m.maxRequestRetryForProviders(normalized, defaultRequestRetry)
 	roundState := newRequestRoundState()
 
@@ -6748,7 +6744,7 @@ func (m *Manager) tryAntigravityCreditsExecute(ctx context.Context, req cliproxy
 		return cliproxyexecutor.Response{}, false, nil
 	}
 	routeModel := req.Model
-	_, maxRetryCredentials, _ := m.retrySettings()
+	_, maxRetryCredentials, _ := m.retrySettings(ctx)
 	roundState := newRequestRoundState()
 	var lastPrepareErr error
 	for {
@@ -6853,7 +6849,7 @@ func (m *Manager) tryAntigravityCreditsExecuteStream(ctx context.Context, req cl
 		return nil, false, nil
 	}
 	routeModel := req.Model
-	_, maxRetryCredentials, _ := m.retrySettings()
+	_, maxRetryCredentials, _ := m.retrySettings(ctx)
 	roundState := newRequestRoundState()
 	var lastPrepareErr error
 	for {
@@ -7516,13 +7512,6 @@ func requestErrorCode(err error) string {
 		return fmt.Sprintf("http_%d", status.StatusCode())
 	}
 	return "invalid_request"
-}
-
-func (m *Manager) retrySettings() (int, int, time.Duration) {
-	if m == nil {
-		return 0, 0, 0
-	}
-	return int(m.requestRetry.Load()), int(m.maxRetryCredentials.Load()), time.Duration(m.maxRetryInterval.Load())
 }
 
 func (m *Manager) maxRetryCredentialsForPriority(priority int, globalMaxRetryCredentials int) int {

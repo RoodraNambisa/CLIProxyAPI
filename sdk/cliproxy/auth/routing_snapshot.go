@@ -93,7 +93,8 @@ func routingPolicyFromContext(ctx context.Context) *routingRequestPolicy {
 }
 
 // WithRoutingPolicySnapshot preserves one logical request's choices across SDK
-// attempts and handler bootstrap retries. It retains no credential pool or body.
+// attempts and handler bootstrap retries, including retry settings. It retains
+// no credential pool or body.
 func (m *Manager) WithRoutingPolicySnapshot(ctx context.Context) context.Context {
 	if ctx == nil {
 		ctx = context.Background()
@@ -101,6 +102,7 @@ func (m *Manager) WithRoutingPolicySnapshot(ctx context.Context) context.Context
 	if m == nil {
 		return ctx
 	}
+	ctx = m.withRetrySettingsSnapshot(ctx)
 	if p := routingPolicyFromContext(ctx); p != nil && p.manager == m {
 		return ctx
 	}
