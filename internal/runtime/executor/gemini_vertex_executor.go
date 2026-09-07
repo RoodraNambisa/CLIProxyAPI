@@ -301,12 +301,17 @@ func (e *GeminiVertexExecutor) Refresh(_ context.Context, auth *cliproxyauth.Aut
 // executeWithServiceAccount handles authentication using service account credentials.
 // This method contains the original service account authentication logic.
 func (e *GeminiVertexExecutor) executeWithServiceAccount(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, projectID, location string, saJSON []byte) (resp cliproxyexecutor.Response, err error) {
+	multiAgentResponse := helps.CodexPlaintextResponsePolicy(ctx, opts.Headers, e.cfg, opts.SourceFormat)
 	baseModel := thinking.ParseSuffix(req.Model).ModelName
 
 	reporter := helps.NewUsageReporter(ctx, e.Identifier(), baseModel, auth)
 	defer reporter.TrackFailure(ctx, &err)
 
 	var body []byte
+	originalPayload := req.Payload
+	if len(opts.OriginalRequest) > 0 {
+		originalPayload = opts.OriginalRequest
+	}
 
 	// Handle Imagen models with special request format
 	if isImagenModel(baseModel) {
@@ -320,11 +325,6 @@ func (e *GeminiVertexExecutor) executeWithServiceAccount(ctx context.Context, au
 		from := opts.SourceFormat
 		to := sdktranslator.FromString("gemini")
 
-		originalPayloadSource := req.Payload
-		if len(opts.OriginalRequest) > 0 {
-			originalPayloadSource = opts.OriginalRequest
-		}
-		originalPayload := originalPayloadSource
 		originalTranslated, errTranslate := helps.TranslateRequestWithCodexMultiAgentV2(ctx, opts.Headers, e.cfg, from, to, baseModel, originalPayload, false)
 		if errTranslate != nil {
 			return resp, errTranslate
@@ -364,10 +364,11 @@ func (e *GeminiVertexExecutor) executeWithServiceAccount(ctx context.Context, au
 		return resp, errNewReq
 	}
 	httpReq.ContentLength = int64(bodyReader.Len())
-	originalRef, bodyRef, unregisterBodies := helps.RequestBodyRefs(ctx, opts, opts.OriginalRequest, body)
+	originalRef, bodyRef, unregisterBodies := helps.RequestBodyRefs(ctx, opts, originalPayload, body)
 	defer unregisterBodies()
 	defer originalRef.Release()
 	defer bodyRef.Release()
+	originalPayload = nil
 	body = nil
 	req.Payload = nil
 	opts.OriginalRequest = nil
@@ -440,13 +441,14 @@ func (e *GeminiVertexExecutor) executeWithServiceAccount(ctx context.Context, au
 	from := opts.SourceFormat
 	to := sdktranslator.FromString("gemini")
 	var param any
-	out := sdktranslator.TranslateNonStream(ctx, to, from, req.Model, originalRef.Bytes(), bodyRef.Bytes(), data, &param)
+	out := multiAgentResponse.TranslateNonStream(ctx, to, from, req.Model, originalRef.Bytes(), bodyRef.Bytes(), data, &param)
 	resp = cliproxyexecutor.Response{Payload: out, Headers: httpResp.Header.Clone()}
 	return resp, nil
 }
 
 // executeWithAPIKey handles authentication using API key credentials.
 func (e *GeminiVertexExecutor) executeWithAPIKey(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, apiKey, baseURL string) (resp cliproxyexecutor.Response, err error) {
+	multiAgentResponse := helps.CodexPlaintextResponsePolicy(ctx, opts.Headers, e.cfg, opts.SourceFormat)
 	baseModel := thinking.ParseSuffix(req.Model).ModelName
 
 	reporter := helps.NewUsageReporter(ctx, e.Identifier(), baseModel, auth)
@@ -502,7 +504,7 @@ func (e *GeminiVertexExecutor) executeWithAPIKey(ctx context.Context, auth *clip
 		return resp, errNewReq
 	}
 	httpReq.ContentLength = int64(bodyReader.Len())
-	originalRef, bodyRef, unregisterBodies := helps.RequestBodyRefs(ctx, opts, opts.OriginalRequest, body)
+	originalRef, bodyRef, unregisterBodies := helps.RequestBodyRefs(ctx, opts, originalPayload, body)
 	defer unregisterBodies()
 	defer originalRef.Release()
 	defer bodyRef.Release()
@@ -568,13 +570,14 @@ func (e *GeminiVertexExecutor) executeWithAPIKey(ctx context.Context, auth *clip
 	helps.AppendAPIResponseChunk(ctx, e.cfg, data)
 	reporter.Publish(ctx, helps.ParseGeminiUsage(data))
 	var param any
-	out := sdktranslator.TranslateNonStream(ctx, to, from, req.Model, originalRef.Bytes(), bodyRef.Bytes(), data, &param)
+	out := multiAgentResponse.TranslateNonStream(ctx, to, from, req.Model, originalRef.Bytes(), bodyRef.Bytes(), data, &param)
 	resp = cliproxyexecutor.Response{Payload: out, Headers: httpResp.Header.Clone()}
 	return resp, nil
 }
 
 // executeStreamWithServiceAccount handles streaming authentication using service account credentials.
 func (e *GeminiVertexExecutor) executeStreamWithServiceAccount(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, projectID, location string, saJSON []byte) (_ *cliproxyexecutor.StreamResult, err error) {
+	multiAgentResponse := helps.CodexPlaintextResponsePolicy(ctx, opts.Headers, e.cfg, opts.SourceFormat)
 	baseModel := thinking.ParseSuffix(req.Model).ModelName
 
 	reporter := helps.NewUsageReporter(ctx, e.Identifier(), baseModel, auth)
@@ -626,7 +629,7 @@ func (e *GeminiVertexExecutor) executeStreamWithServiceAccount(ctx context.Conte
 		return nil, errNewReq
 	}
 	httpReq.ContentLength = int64(bodyReader.Len())
-	originalRef, bodyRef, unregisterBodies := helps.RequestBodyRefs(ctx, opts, opts.OriginalRequest, body)
+	originalRef, bodyRef, unregisterBodies := helps.RequestBodyRefs(ctx, opts, originalPayload, body)
 	cleanupBodies := func() {
 		unregisterBodies()
 		originalRef.Release()
@@ -722,7 +725,7 @@ func (e *GeminiVertexExecutor) executeStreamWithServiceAccount(ctx context.Conte
 			if usagePresent {
 				reporter.Observe(detail)
 			}
-			lines := sdktranslator.TranslateStream(ctx, to, from, req.Model, originalRef.Bytes(), bodyRef.Bytes(), bytes.Clone(line), &param)
+			lines := multiAgentResponse.TranslateStream(ctx, to, from, req.Model, originalRef.Bytes(), bodyRef.Bytes(), bytes.Clone(line), &param)
 			for i := range lines {
 				out <- cliproxyexecutor.StreamChunk{Payload: lines[i]}
 			}
@@ -730,7 +733,7 @@ func (e *GeminiVertexExecutor) executeStreamWithServiceAccount(ctx context.Conte
 			terminalReady := terminal && (isImagenModel(baseModel) || !helps.GeminiTerminalAwaitsUsage(payload)) || terminalSeen && usagePresent
 			if markerRequested && terminalReady && !protocolFailed {
 				reporter.EnsurePublished(ctx)
-				lines = sdktranslator.TranslateStream(ctx, to, from, req.Model, originalRef.Bytes(), bodyRef.Bytes(), []byte("[DONE]"), &param)
+				lines = multiAgentResponse.TranslateStream(ctx, to, from, req.Model, originalRef.Bytes(), bodyRef.Bytes(), []byte("[DONE]"), &param)
 				for i := range lines {
 					out <- cliproxyexecutor.StreamChunk{Payload: lines[i]}
 				}
@@ -743,7 +746,7 @@ func (e *GeminiVertexExecutor) executeStreamWithServiceAccount(ctx context.Conte
 			reporter.PublishFailure(ctx)
 			out <- cliproxyexecutor.StreamChunk{Err: errScan}
 		} else if terminalSeen && !protocolFailed {
-			lines := sdktranslator.TranslateStream(ctx, to, from, req.Model, originalRef.Bytes(), bodyRef.Bytes(), []byte("[DONE]"), &param)
+			lines := multiAgentResponse.TranslateStream(ctx, to, from, req.Model, originalRef.Bytes(), bodyRef.Bytes(), []byte("[DONE]"), &param)
 			for i := range lines {
 				out <- cliproxyexecutor.StreamChunk{Payload: lines[i]}
 			}
@@ -766,6 +769,7 @@ func (e *GeminiVertexExecutor) executeStreamWithServiceAccount(ctx context.Conte
 
 // executeStreamWithAPIKey handles streaming authentication using API key credentials.
 func (e *GeminiVertexExecutor) executeStreamWithAPIKey(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, apiKey, baseURL string) (_ *cliproxyexecutor.StreamResult, err error) {
+	multiAgentResponse := helps.CodexPlaintextResponsePolicy(ctx, opts.Headers, e.cfg, opts.SourceFormat)
 	baseModel := thinking.ParseSuffix(req.Model).ModelName
 
 	reporter := helps.NewUsageReporter(ctx, e.Identifier(), baseModel, auth)
@@ -820,7 +824,7 @@ func (e *GeminiVertexExecutor) executeStreamWithAPIKey(ctx context.Context, auth
 		return nil, errNewReq
 	}
 	httpReq.ContentLength = int64(bodyReader.Len())
-	originalRef, bodyRef, unregisterBodies := helps.RequestBodyRefs(ctx, opts, opts.OriginalRequest, body)
+	originalRef, bodyRef, unregisterBodies := helps.RequestBodyRefs(ctx, opts, originalPayload, body)
 	cleanupBodies := func() {
 		unregisterBodies()
 		originalRef.Release()
@@ -913,7 +917,7 @@ func (e *GeminiVertexExecutor) executeStreamWithAPIKey(ctx context.Context, auth
 			if usagePresent {
 				reporter.Observe(detail)
 			}
-			lines := sdktranslator.TranslateStream(ctx, to, from, req.Model, originalRef.Bytes(), bodyRef.Bytes(), bytes.Clone(line), &param)
+			lines := multiAgentResponse.TranslateStream(ctx, to, from, req.Model, originalRef.Bytes(), bodyRef.Bytes(), bytes.Clone(line), &param)
 			for i := range lines {
 				out <- cliproxyexecutor.StreamChunk{Payload: lines[i]}
 			}
@@ -921,7 +925,7 @@ func (e *GeminiVertexExecutor) executeStreamWithAPIKey(ctx context.Context, auth
 			terminalReady := terminal && (isImagenModel(baseModel) || !helps.GeminiTerminalAwaitsUsage(payload)) || terminalSeen && usagePresent
 			if markerRequested && terminalReady && !protocolFailed {
 				reporter.EnsurePublished(ctx)
-				lines = sdktranslator.TranslateStream(ctx, to, from, req.Model, originalRef.Bytes(), bodyRef.Bytes(), []byte("[DONE]"), &param)
+				lines = multiAgentResponse.TranslateStream(ctx, to, from, req.Model, originalRef.Bytes(), bodyRef.Bytes(), []byte("[DONE]"), &param)
 				for i := range lines {
 					out <- cliproxyexecutor.StreamChunk{Payload: lines[i]}
 				}
@@ -934,7 +938,7 @@ func (e *GeminiVertexExecutor) executeStreamWithAPIKey(ctx context.Context, auth
 			reporter.PublishFailure(ctx)
 			out <- cliproxyexecutor.StreamChunk{Err: errScan}
 		} else if terminalSeen && !protocolFailed {
-			lines := sdktranslator.TranslateStream(ctx, to, from, req.Model, originalRef.Bytes(), bodyRef.Bytes(), []byte("[DONE]"), &param)
+			lines := multiAgentResponse.TranslateStream(ctx, to, from, req.Model, originalRef.Bytes(), bodyRef.Bytes(), []byte("[DONE]"), &param)
 			for i := range lines {
 				out <- cliproxyexecutor.StreamChunk{Payload: lines[i]}
 			}

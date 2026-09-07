@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
@@ -31,7 +32,12 @@ func runGoogleResponsesToolIdentity(t *testing.T, provider string, enabled bool)
 			t.Run(fmt.Sprintf("stream=%t/original=%t", stream, explicitOriginal), func(t *testing.T) {
 				cfg := &config.Config{Codex: config.CodexConfig{OptimizeMultiAgentV2: enabled}}
 				controller := core.NewRequestBodyReleaseController(1, []byte("<released>"))
+				tokenCalls := 0
 				ctx := context.WithValue(t.Context(), "cliproxy.roundtripper", streamTerminalRoundTripFunc(func(r *http.Request) (*http.Response, error) {
+					if r.URL.Host == "oauth-fixture.invalid" {
+						tokenCalls++
+						return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": {"application/json"}}, Body: io.NopCloser(strings.NewReader(`{"access_token":"fixture-token","token_type":"Bearer","expires_in":3600}`))}, nil
+					}
 					body, err := io.ReadAll(r.Body)
 					if err != nil {
 						t.Error(err)
@@ -87,6 +93,13 @@ func runGoogleResponsesToolIdentity(t *testing.T, provider string, enabled bool)
 				if len(items) != 1 && !stream || len(items) != 3 && stream || !controller.Released() {
 					t.Fatalf("identity events = %d, released = %t", len(items), controller.Released())
 				}
+				wantTokens := 0
+				if provider == "vertex-service-account" {
+					wantTokens = 1
+				}
+				if tokenCalls != wantTokens {
+					t.Fatalf("credential acquisition calls = %d, want %d", tokenCalls, wantTokens)
+				}
 				for _, item := range items {
 					if item.Get("encrypted_function_args").Exists() != enabled || enabled && item.Get("encrypted_function_args").Raw != "[]" {
 						t.Fatal("plaintext marker did not keep the request snapshot after release and configuration update")
@@ -95,6 +108,16 @@ func runGoogleResponsesToolIdentity(t *testing.T, provider string, enabled bool)
 						t.Fatal("tool identity was lost after request release")
 					}
 				}
+			})
+		}
+	}
+}
+
+func TestVertexResponsesToolIdentityAndMultiAgentAfterRelease(t *testing.T) {
+	for _, provider := range []string{"vertex", "vertex-service-account"} {
+		for _, enabled := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/enabled=%t", provider, enabled), func(t *testing.T) {
+				runGoogleResponsesToolIdentity(t, provider, enabled)
 			})
 		}
 	}
