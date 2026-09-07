@@ -9,6 +9,35 @@ import (
 	"github.com/tidwall/gjson"
 )
 
+func TestCodexMultiAgentSSEChunkKeepsFrameBoundaries(t *testing.T) {
+	policy := CodexMultiAgentResponsePolicy{PlaintextCalls: true}
+	call := `{"type":"response.output_item.done","item":{"type":"function_call","namespace":"collaboration","name":"spawn_agent","call_id":"pair","arguments":"opaque"}}`
+	for _, ending := range []string{"\n", "\r\n", "\r"} {
+		frame := "event: response.output_item.done" + ending + "data: " + call + ending + ending
+		controls := ": keep" + ending + ending
+		partial := "data: {\"type\":\"response.completed\",\"response\":"
+		raw := []byte(controls + frame + frame + partial)
+		got := policy.RewriteSSEChunk(raw)
+		if !bytes.HasPrefix(got, []byte(controls)) || !bytes.HasSuffix(got, []byte(partial)) ||
+			bytes.Count(got, []byte(`"encrypted_function_args":[]`)) != 2 ||
+			bytes.Count(got, []byte("event: response.output_item.done"+ending)) != 2 {
+			t.Fatal("coalesced events lost controls, markers, boundaries or the trailing fragment")
+		}
+		if disabled := (CodexMultiAgentResponsePolicy{}).RewriteSSEChunk(raw); !bytes.Equal(disabled, raw) || &disabled[0] != &raw[0] {
+			t.Fatal("disabled mode copied or changed a chunk")
+		}
+	}
+	for _, raw := range []string{
+		"data: [DONE]\n\n", "data: {\"type\":",
+		`{"type":"response.completed","response":{"output":[{"type":"message","content":[{"type":"output_text","text":"collaboration"}]}]}}`,
+	} {
+		payload := []byte(raw)
+		if got := policy.RewriteSSEChunk(payload); !bytes.Equal(got, payload) || &got[0] != &payload[0] {
+			t.Fatal("non-collaboration data changed")
+		}
+	}
+}
+
 func TestCodexMultiAgentSSEFramePreservesControlsAndOpaqueFields(t *testing.T) {
 	policy := CodexMultiAgentResponsePolicy{NamespaceOptimized: true, PlaintextCalls: true}
 	for _, ending := range []string{"\n", "\r\n", "\r"} {

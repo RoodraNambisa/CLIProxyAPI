@@ -26,6 +26,9 @@ func NormalizeCodexMultiAgentRequest(ctx context.Context, headers http.Header, c
 		if policy.Enabled && ctx != nil && ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
+		if policy.Enabled && !policy.ToolsPrepared {
+			payload = PrepareCodexCollaborationTools(payload, "")
+		}
 		return NormalizeCodexMultiAgentInput(payload, policy.Enabled, target)
 	}
 	return payload, nil

@@ -9,6 +9,53 @@ type codexSSEDataSpan struct {
 	start, dataStart, contentEnd, end int
 }
 
+// RewriteSSEChunk handles complete translator output events, including multiple
+// SSE frames in one chunk. An incomplete trailing frame remains untouched.
+func (policy CodexMultiAgentResponsePolicy) RewriteSSEChunk(chunk []byte) []byte {
+	if !policy.NamespaceOptimized && !policy.PlaintextCalls {
+		return chunk
+	}
+	if json.Valid(chunk) {
+		return policy.Rewrite(chunk)
+	}
+	var out []byte
+	frameStart := 0
+	appendFrame := func(end int) {
+		frame := chunk[frameStart:end]
+		rewritten := policy.RewriteSSEFrame(frame)
+		if out != nil || !bytes.Equal(frame, rewritten) {
+			if out == nil {
+				out = make([]byte, 0, len(chunk)+64)
+				out = append(out, chunk[:frameStart]...)
+			}
+			out = append(out, rewritten...)
+		}
+		frameStart = end
+	}
+	for lineStart := 0; lineStart < len(chunk); {
+		offset := bytes.IndexAny(chunk[lineStart:], "\r\n")
+		if offset < 0 {
+			break
+		}
+		contentEnd := lineStart + offset
+		end := contentEnd + 1
+		if chunk[contentEnd] == '\r' && end < len(chunk) && chunk[end] == '\n' {
+			end++
+		}
+		if contentEnd == lineStart {
+			appendFrame(end)
+		}
+		lineStart = end
+	}
+	if frameStart < len(chunk) {
+		appendFrame(len(chunk))
+	}
+	if out == nil {
+		return chunk
+	}
+	return out
+}
+
 // RewriteSSEFrame accepts one framed SSE event, a complete data line, or a raw
 // Responses event. Unchanged frames retain their original bytes and ownership.
 func (policy CodexMultiAgentResponsePolicy) RewriteSSEFrame(frame []byte) []byte {
