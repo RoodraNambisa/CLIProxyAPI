@@ -15,14 +15,18 @@ func (policy CodexMultiAgentResponsePolicy) RewriteSSEChunk(chunk []byte) []byte
 	if !policy.NamespaceOptimized && !policy.PlaintextCalls {
 		return chunk
 	}
+	return rewriteCodexSSEChunk(chunk, policy.Rewrite)
+}
+
+func rewriteCodexSSEChunk(chunk []byte, rewrite func([]byte) []byte) []byte {
 	if json.Valid(chunk) {
-		return policy.Rewrite(chunk)
+		return rewrite(chunk)
 	}
 	var out []byte
 	frameStart := 0
 	appendFrame := func(end int) {
 		frame := chunk[frameStart:end]
-		rewritten := policy.RewriteSSEFrame(frame)
+		rewritten := rewriteCodexSSEFrame(frame, rewrite)
 		if out != nil || !bytes.Equal(frame, rewritten) {
 			if out == nil {
 				out = make([]byte, 0, len(chunk)+64)
@@ -62,8 +66,12 @@ func (policy CodexMultiAgentResponsePolicy) RewriteSSEFrame(frame []byte) []byte
 	if !policy.NamespaceOptimized && !policy.PlaintextCalls {
 		return frame
 	}
+	return rewriteCodexSSEFrame(frame, policy.Rewrite)
+}
+
+func rewriteCodexSSEFrame(frame []byte, rewrite func([]byte) []byte) []byte {
 	if json.Valid(frame) {
-		return policy.Rewrite(frame)
+		return rewrite(frame)
 	}
 	var spans []codexSSEDataSpan
 	var data, joined []byte
@@ -109,7 +117,7 @@ func (policy CodexMultiAgentResponsePolicy) RewriteSSEFrame(frame []byte) []byte
 	if len(spans) > 1 {
 		data = joined
 	}
-	rewritten := policy.Rewrite(data)
+	rewritten := rewrite(data)
 	if bytes.Equal(rewritten, data) {
 		return frame
 	}

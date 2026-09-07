@@ -22,7 +22,6 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
-	sdktranslator "github.com/router-for-me/CLIProxyAPI/v6/sdk/translator"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -896,6 +895,8 @@ func (e *XAIWebsocketsExecutor) executeStream(ctx context.Context, auth *cliprox
 							downstreamWarmupCompletedPayload = idMapper.downstreamResponsePayload(warmupCompletedPayload)
 						}
 					}
+					downstreamPayload = prepared.outputPolicy.Rewrite(downstreamPayload)
+					downstreamWarmupCompletedPayload = prepared.outputPolicy.Rewrite(downstreamWarmupCompletedPayload)
 					if !send(cliproxyexecutor.StreamChunk{Payload: downstreamPayload}) {
 						terminateReason = "context_done"
 						terminateErr = ctx.Err()
@@ -923,7 +924,7 @@ func (e *XAIWebsocketsExecutor) executeStream(ctx context.Context, auth *cliprox
 
 				payload = normalizeCodexWebsocketCompletion(payload)
 				line := encodeCodexWebsocketAsSSE(payload)
-				chunks := sdktranslator.TranslateStream(ctx, prepared.to, prepared.responseFormat, req.Model, prepared.originalPayload, prepared.body, line, &param)
+				chunks := prepared.outputPolicy.TranslateStream(ctx, prepared.to, prepared.responseFormat, req.Model, prepared.originalPayload, prepared.body, line, &param)
 				for i := range chunks {
 					if !send(cliproxyexecutor.StreamChunk{Payload: chunks[i]}) {
 						terminateReason = "context_done"
@@ -934,7 +935,7 @@ func (e *XAIWebsocketsExecutor) executeStream(ctx context.Context, auth *cliprox
 				}
 				if len(warmupCompletedPayload) > 0 {
 					line = encodeCodexWebsocketAsSSE(warmupCompletedPayload)
-					chunks = sdktranslator.TranslateStream(ctx, prepared.to, prepared.responseFormat, req.Model, prepared.originalPayload, prepared.body, line, &param)
+					chunks = prepared.outputPolicy.TranslateStream(ctx, prepared.to, prepared.responseFormat, req.Model, prepared.originalPayload, prepared.body, line, &param)
 					for i := range chunks {
 						if !send(cliproxyexecutor.StreamChunk{Payload: chunks[i]}) {
 							terminateReason = "context_done"
