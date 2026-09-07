@@ -187,6 +187,10 @@ const (
 	SelectedAuthSourceCallbackMetadataKey = "selected_auth_source_callback"
 	// ExecutionSessionMetadataKey identifies a long-lived downstream execution session.
 	ExecutionSessionMetadataKey = "execution_session_id"
+	// CallerScopeMetadataKey is supplied only by trusted SDK integrations and must
+	// include both caller identity and its authorization scope. Never populate it
+	// from an unverified client header or body field.
+	CallerScopeMetadataKey = "caller_scope"
 )
 
 // ChatGPTWebImageConfigSnapshot contains request-scoped Web image adaptation settings.
