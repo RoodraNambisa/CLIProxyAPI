@@ -1,7 +1,9 @@
 package openai
 
 import (
+	"bytes"
 	"encoding/json"
+	"math"
 	"sort"
 	"strconv"
 	"strings"
@@ -182,7 +184,8 @@ func applyCodexClientNonTemplatePriorities(result []map[string]any, templates ma
 	})
 
 	for rank, entry := range pending {
-		result[entry.index]["priority"] = basePriority + 100*(rank+1)
+		priority := min(int64(math.MaxInt32), int64(basePriority)+100*int64(rank+1))
+		result[entry.index]["priority"] = int(priority)
 	}
 }
 
@@ -196,7 +199,9 @@ func loadCodexClientModelTemplatesSnapshot(raw []byte, revision uint64) (map[str
 	defer codexClientModelTemplatesMu.Unlock()
 	if !codexClientModelTemplatesLoaded || codexClientModelTemplatesRevision != revision {
 		var payload codexClientModelsPayload
-		if err := json.Unmarshal(raw, &payload); err != nil {
+		decoder := json.NewDecoder(bytes.NewReader(raw))
+		decoder.UseNumber()
+		if err := decoder.Decode(&payload); err != nil {
 			return nil, nil, err
 		}
 
@@ -423,6 +428,11 @@ func codexClientReasoningDescription(level string) string {
 }
 
 func codexClientModelPriority(model map[string]any) int {
+	if priority, ok := model["priority"].(json.Number); ok {
+		if value, err := priority.Int64(); err == nil {
+			return int(value)
+		}
+	}
 	if priority, ok := model["priority"].(int); ok {
 		return priority
 	}
@@ -451,6 +461,12 @@ func intModelValue(model map[string]any, key string) int {
 		return 0
 	}
 	switch value := model[key].(type) {
+	case json.Number:
+		parsed, err := value.Int64()
+		if err != nil {
+			return 0
+		}
+		return int(parsed)
 	case int:
 		return value
 	case int64:
