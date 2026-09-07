@@ -1182,6 +1182,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	body = helps.SanitizeCodexReasoningEncryptedContent(ctx, "codex executor", body)
 	body = helps.NormalizeCodexToolSelection(body)
 	body = e.codexPreparedSessionIdentity(ctx, req, opts).ResponsesLite.ApplyBody(body, false)
+	body, multiAgentResponse := helps.OptimizeCodexMultiAgentV2Request(body, e.codexPreparedSessionIdentity(ctx, req, opts).MultiAgentV2)
 	replayAuthID := ""
 	if auth != nil {
 		replayAuthID = auth.ID
@@ -1333,6 +1334,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 			}
 			frame := trustedFrame
 			trustedFrame = nil
+			frame = multiAgentResponse.RewriteSSEFrame(frame)
 			hasData := false
 			terminal := false
 			if codexTrustedSSEFrameNeedsInspection(frame) {
@@ -1355,6 +1357,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 			line := scanner.Bytes()
 			if !trustUpstreamSSE {
 				line = applyCodexIdentityConfuseResponsePayload(line, identityState)
+				line = multiAgentResponse.RewriteSSEFrame(line)
 			}
 			clientLine := applyCodexIdentityExposeResponsePayload(line, identityState)
 			if bytes.HasPrefix(clientLine, dataTag) {
