@@ -1665,7 +1665,7 @@ func (m *Manager) pickBoundAcrossPriorities(ctx context.Context, auths []*Auth, 
 	if m.routingStrategyForPriority(priority, ctx) == schedulerStrategyFillFirst && m.routingAuthRequestLimitPolicyForAuth(bound).limit == 0 {
 		rpm := m.routingFillFirstPerAuthRPMForPriority(priority, ctx)
 		if rpm > 0 && !m.fillFirstLimiter().tryAcquireAt(bound.ID, rpm, now) {
-			if !selector.failover {
+			if !selector.failover && selector.cachedStrictAuthID(ctx, provider, model, opts) != "" {
 				return nil, true, newAuthRPMLimitedError(fillFirstRPMRetryAfterAt(m.fillFirstLimiter(), now))
 			}
 			return nil, false, nil
@@ -9567,7 +9567,7 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 	dynamicallyLimited := make(map[string]struct{})
 	strictBoundAuthID := ""
 	if sessionSelector, ok := m.selectorForContext(ctx).(*SessionAffinitySelector); ok && sessionSelector != nil && !sessionSelector.failover {
-		strictBoundAuthID = sessionSelector.cachedAuthID(provider, selectionArgForSelector(m.selectorForContext(ctx), model), opts, ctx)
+		strictBoundAuthID = sessionSelector.cachedStrictAuthID(ctx, provider, selectionArgForSelector(m.selectorForContext(ctx), model), opts)
 		for _, candidate := range candidates {
 			if candidate == nil || candidate.ID != strictBoundAuthID {
 				continue
@@ -9790,7 +9790,7 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 	dynamicallyLimited := make(map[string]struct{})
 	strictBoundAuthID := ""
 	if sessionSelector, ok := m.selectorForContext(ctx).(*SessionAffinitySelector); ok && sessionSelector != nil && !sessionSelector.failover {
-		strictBoundAuthID = sessionSelector.cachedAuthID(selectorProvider, selectionArgForSelector(m.selectorForContext(ctx), model), opts, ctx)
+		strictBoundAuthID = sessionSelector.cachedStrictAuthID(ctx, selectorProvider, selectionArgForSelector(m.selectorForContext(ctx), model), opts)
 		for _, candidate := range candidates {
 			if candidate == nil || candidate.ID != strictBoundAuthID {
 				continue

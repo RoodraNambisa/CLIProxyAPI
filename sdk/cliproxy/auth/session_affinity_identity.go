@@ -97,3 +97,17 @@ func (s *SessionAffinitySelector) sessionIDs(ctx context.Context, opts core.Opti
 	}
 	return extractSessionIDs(opts.Headers, opts.OriginalRequest, opts.Metadata)
 }
+
+// An explicit parent is only a preference until the child has a binding of its
+// own. A parent's exhausted capacity must not turn that preference into a lock.
+func (s *SessionAffinitySelector) cachedStrictAuthID(ctx context.Context, provider, model string, opts core.Options) string {
+	if s != nil && s.subagents {
+		captured := captureAffinityIdentity(ctx, core.Request{}, opts)
+		if captured.scope != "" && captured.identity.ParentSessionID != "" {
+			primary, _ := s.sessionIDs(ctx, opts)
+			authID, _ := s.cache.GetAndRefresh(provider + "::" + primary + "::" + canonicalModelKey(model))
+			return authID
+		}
+	}
+	return s.cachedAuthID(provider, model, opts, ctx)
+}
