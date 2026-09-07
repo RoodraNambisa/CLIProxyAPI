@@ -1636,6 +1636,11 @@ func enrichAuthSelectionError(err error, providers []string, model string) error
 		baseMessage = "no auth available"
 	}
 	detail := fmt.Sprintf("%s (providers=%s, model=%s)", baseMessage, providerText, modelText)
+	storedFailure := coreauth.StoredAuthFailureOf(err)
+	if storedFailure != nil && storedFailure.HTTPStatus >= 400 && storedFailure.HTTPStatus <= 599 {
+		// Expose only a fixed status summary; stored messages may belong to another request.
+		detail += fmt.Sprintf("; previous credential failure: HTTP %d %s", storedFailure.HTTPStatus, http.StatusText(storedFailure.HTTPStatus))
+	}
 
 	// Clarify the most common alias confusion between Anthropic route names and internal provider keys.
 	if strings.Contains(","+providerText+",", ",claude,") {
@@ -1651,7 +1656,7 @@ func enrichAuthSelectionError(err error, providers []string, model string) error
 	enriched.Message = detail
 	enriched.HTTPStatus = status
 	enriched.Diagnostic = authErr.Diagnostic.Clone()
-	var result error = &enriched
+	result := coreauth.WithStoredAuthFailure(&enriched, storedFailure)
 	var headerError interface{ Headers() http.Header }
 	if errors.As(err, &headerError) && headerError != nil {
 		result = coreauth.WithResponseHeaders(result, headerError.Headers())
