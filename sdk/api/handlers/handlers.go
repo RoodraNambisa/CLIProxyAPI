@@ -907,6 +907,7 @@ func (h *BaseAPIHandler) GetContextWithCancel(handler interfaces.APIHandler, c *
 		}()
 	}
 	newCtx = context.WithValue(newCtx, "gin", c)
+	newCtx = executorhelps.CaptureCodexMultiAgentPolicyContext(newCtx)
 	newCtx = context.WithValue(newCtx, "handler", handler)
 	newCtx, _ = ensureErrorResponseSourceTracker(newCtx, c)
 	return newCtx, func(params ...interface{}) {
