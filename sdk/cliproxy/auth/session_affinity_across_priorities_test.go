@@ -158,3 +158,55 @@ func TestSessionAffinityAcrossPrioritiesDirectAndPinnedPolicy(t *testing.T) {
 		t.Fatal("direct selector differs from Manager selection")
 	}
 }
+
+type acrossPrioritySecondExecutor struct{ schedulerTestExecutor }
+
+func (acrossPrioritySecondExecutor) Identifier() string { return "second" }
+
+func TestSessionAffinityAcrossPrioritiesRPMFailoverUsesRecoveredTierStrategy(t *testing.T) {
+	for _, strategy := range []string{"round-robin", "weighted-round-robin"} {
+		for _, mixed := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/mixed=%t", strategy, mixed), func(t *testing.T) {
+				manager, selector := newAcrossPriorityFixture(t, "round-robin", true, true)
+				provider := "test"
+				providers := []string{"test"}
+				if mixed {
+					provider = "second"
+					providers = append(providers, provider)
+					manager.RegisterExecutor(acrossPrioritySecondExecutor{})
+				}
+				if _, err := manager.Register(WithSkipPersist(t.Context()), &Auth{ID: "high2", Provider: provider, Attributes: map[string]string{"priority": "10", "weight": "3"}}); err != nil {
+					t.Fatal(err)
+				}
+				rpm := 1
+				manager.SetConfig(&internalconfig.Config{Routing: internalconfig.RoutingConfig{Strategy: "round-robin", PriorityOverrides: []internalconfig.RoutingPriorityOverride{{Priority: 0, Strategy: "fill-first", FillFirstPerAuthRPM: &rpm}, {Priority: 10, Strategy: strategy}}}})
+				opts := core.Options{Headers: http.Header{"Session-Id": {"fixture"}}}
+				selector.BindSession(t.Context(), affinityProviderKey(providers), "", opts, "low")
+				counts := make(map[string]int)
+				for index := range 5 {
+					var auth *Auth
+					var err error
+					if mixed {
+						auth, _, _, err = manager.pickNextMixed(t.Context(), providers, "", opts, nil)
+					} else {
+						auth, _, err = manager.pickNext(t.Context(), "test", "", opts, nil)
+					}
+					if err != nil || auth == nil {
+						t.Fatalf("RPM failover failed: %v", err)
+					}
+					if index == 0 && auth.ID != "low" {
+						t.Fatal("first request did not retain the eligible bound credential")
+					}
+					counts[auth.ID]++
+				}
+				wantHigh := 2
+				if strategy == "weighted-round-robin" {
+					wantHigh = 1
+				}
+				if counts["low"] != 1 || counts["high"] != wantHigh || counts["high2"] != 4-wantHigh {
+					t.Fatalf("RPM failover bypassed the recovered tier's strategy: %v", counts)
+				}
+			})
+		}
+	}
+}

@@ -1615,11 +1615,11 @@ func (m *Manager) availableAuthsForRouteModelFiltered(auths []*Auth, provider, r
 }
 
 func (m *Manager) availableAuthsForRouteModelFilteredForContext(ctx context.Context, auths []*Auth, provider, routeModel string, opts cliproxyexecutor.Options, now time.Time, pickAllowed func(*Auth) bool) ([]*Auth, error) {
+	return m.availableAuthsForRouteModelWithPreference(ctx, auths, provider, routeModel, opts, now, pickAllowed, "")
+}
+
+func (m *Manager) availableAuthsForRouteModelWithPreference(ctx context.Context, auths []*Auth, provider, routeModel string, opts cliproxyexecutor.Options, now time.Time, pickAllowed func(*Auth) bool, preferred string) ([]*Auth, error) {
 	auths = m.weightedEligibleAuths(auths, ctx)
-	preferred := ""
-	if selector, ok := m.selectorForContext(ctx).(*SessionAffinitySelector); ok && selector != nil && selector.acrossPriorities {
-		preferred = selector.cachedAuthID(provider, routeModel, opts)
-	}
 	if shouldPreferCodexWebsocket(ctx, provider) {
 		websocketAuths := make([]*Auth, 0, len(auths))
 		hasReadyWebsocket := false
@@ -1643,6 +1643,35 @@ func (m *Manager) availableAuthsForRouteModelFilteredForContext(ctx context.Cont
 	return selectAvailableAuthsForAttemptFilteredWithPriority(auths, provider, routeModel, now, selectionAttemptFromMetadata(opts.Metadata), func(auth *Auth) string {
 		return m.selectionModelForAuth(auth, routeModel)
 	}, pickAllowed, true, preferred)
+}
+
+// Keep bound selection separate from fallback tier selection. A bound auth can
+// have different routing and limiter rules than the tier used after failover.
+func (m *Manager) pickBoundAcrossPriorities(ctx context.Context, auths []*Auth, provider, model string, opts cliproxyexecutor.Options, now time.Time, pickAllowed func(*Auth) bool) (*Auth, bool, error) {
+	selector, ok := m.selectorForContext(ctx).(*SessionAffinitySelector)
+	if !ok || selector == nil || !selector.acrossPriorities {
+		return nil, false, nil
+	}
+	preferred := selector.cachedAuthID(provider, model, opts)
+	if preferred == "" {
+		return nil, false, nil
+	}
+	available, err := m.availableAuthsForRouteModelWithPreference(ctx, auths, provider, model, opts, now, pickAllowed, preferred)
+	if err != nil || len(available) != 1 || available[0].ID != preferred {
+		return nil, false, nil
+	}
+	bound := available[0]
+	priority := authPriority(bound)
+	if m.routingStrategyForPriority(priority, ctx) == schedulerStrategyFillFirst && m.routingAuthRequestLimitPolicyForAuth(bound).limit == 0 {
+		rpm := m.routingFillFirstPerAuthRPMForPriority(priority, ctx)
+		if rpm > 0 && !m.fillFirstLimiter().tryAcquireAt(bound.ID, rpm, now) {
+			if !selector.failover {
+				return nil, true, newAuthRPMLimitedError(fillFirstRPMRetryAfterAt(m.fillFirstLimiter(), now))
+			}
+			return nil, false, nil
+		}
+	}
+	return bound, true, nil
 }
 
 func selectionArgForSelector(selector Selector, routeModel string) string {
@@ -1987,16 +2016,6 @@ func (m *Manager) pickLegacyFillFirstRangeAuthWithDeferredBinding(ctx context.Co
 	if useSessionSelector && fillFirstPerAuthRPM > 0 {
 		if cachedAuthID := sessionSelector.cachedAuthID(provider, routeModel, opts); cachedAuthID != "" {
 			cachedAuth := authFromListByID(available, cachedAuthID)
-			if sessionSelector.acrossPriorities && cachedAuth != nil && m.routingAuthRequestLimitPolicyForAuth(cachedAuth).limit == 0 {
-				limiter := m.fillFirstLimiter()
-				now := time.Now()
-				if limiter.tryAcquireAt(cachedAuth.ID, fillFirstPerAuthRPM, now) {
-					return cachedAuth, true, nil, nil
-				}
-				if !sessionSelector.failover {
-					return nil, true, nil, newAuthRPMLimitedError(fillFirstRPMRetryAfterAt(limiter, now))
-				}
-			}
 			if cachedAuth == nil || m.routingAuthRequestLimitPolicyForAuth(cachedAuth).limit == 0 {
 				useSessionSelector = false
 			}
@@ -9594,7 +9613,12 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 		}
 
 		var selected *Auth
-		if picked, handled, _, errPick := m.pickLegacyFillFirstRangeAuthWithDeferredBinding(ctx, provider, model, opts, candidates, pickAllowed); handled {
+		if bound, handled, errPick := m.pickBoundAcrossPriorities(ctx, candidates, provider, model, opts, now, pickAllowed); handled {
+			if errPick != nil {
+				return nil, nil, preferAuthRequestLimitError(errPick, requestBlocked)
+			}
+			selected = bound
+		} else if picked, handled, _, errPick := m.pickLegacyFillFirstRangeAuthWithDeferredBinding(ctx, provider, model, opts, candidates, pickAllowed); handled {
 			if errPick != nil {
 				return nil, nil, preferAuthRequestLimitError(errPick, requestBlocked)
 			}
@@ -9815,7 +9839,12 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 		}
 
 		var selected *Auth
-		if picked, handled, _, errPick := m.pickLegacyFillFirstRangeAuthWithDeferredBinding(ctx, selectorProvider, model, opts, candidates, pickAllowedForSelection); handled {
+		if bound, handled, errPick := m.pickBoundAcrossPriorities(ctx, candidates, selectorProvider, model, opts, now, pickAllowedForSelection); handled {
+			if errPick != nil {
+				return nil, nil, "", preferAuthRequestLimitError(errPick, requestBlocked)
+			}
+			selected = bound
+		} else if picked, handled, _, errPick := m.pickLegacyFillFirstRangeAuthWithDeferredBinding(ctx, selectorProvider, model, opts, candidates, pickAllowedForSelection); handled {
 			if errPick != nil {
 				return nil, nil, "", preferAuthRequestLimitError(errPick, requestBlocked)
 			}
