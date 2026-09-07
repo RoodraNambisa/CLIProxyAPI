@@ -4830,6 +4830,9 @@ func (s *Service) ApplyRuntimeConfig(ctx context.Context, requested *config.Conf
 	if errWeight := requestedSnapshot.ValidateCredentialWeights(); errWeight != nil {
 		return result, errWeight
 	}
+	if errRetry := requestedSnapshot.ValidateCredentialRequestRetries(); errRetry != nil {
+		return result, errRetry
+	}
 	s.runtimeConfigApplyMu.Lock()
 	defer s.runtimeConfigApplyMu.Unlock()
 

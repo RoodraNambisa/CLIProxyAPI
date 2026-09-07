@@ -176,6 +176,9 @@ func (b *Builder) Build() (*Service, error) {
 	if errWeight := b.cfg.ValidateCredentialWeights(); errWeight != nil {
 		return nil, errWeight
 	}
+	if errRetry := b.cfg.ValidateCredentialRequestRetries(); errRetry != nil {
+		return nil, errRetry
+	}
 
 	tokenProvider := b.tokenProvider
 	if tokenProvider == nil {

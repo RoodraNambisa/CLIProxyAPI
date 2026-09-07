@@ -1351,6 +1351,9 @@ func (s *Server) updateClients(cfg *config.Config, rollbackOnError bool) error {
 	if errWeight := runtimeCfg.ValidateCredentialWeights(); errWeight != nil {
 		return errWeight
 	}
+	if errRetry := runtimeCfg.ValidateCredentialRequestRetries(); errRetry != nil {
+		return errRetry
+	}
 	// Reconstruct old config from YAML snapshot to avoid reference sharing issues
 	var oldCfg *config.Config
 	if len(s.oldConfigYaml) > 0 {
