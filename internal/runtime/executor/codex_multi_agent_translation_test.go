@@ -163,3 +163,106 @@ func TestOpenAICompatMultiAgentCountsPlaintextHistory(t *testing.T) {
 		t.Fatal("token counting did not include the plaintext collaboration message")
 	}
 }
+
+func TestClaudeAndKimiMultiAgentPlaintextHistory(t *testing.T) {
+	for _, provider := range []string{"claude", "kimi"} {
+		for _, operation := range []string{"execute", "stream", "count"} {
+			if provider == "kimi" && operation == "count" {
+				continue
+			}
+			for _, enabled := range []bool{false, true} {
+				t.Run(fmt.Sprintf("%s/%s/%t", provider, operation, enabled), func(t *testing.T) {
+					var calls atomic.Int32
+					handle := func(w http.ResponseWriter, r *http.Request) {
+						calls.Add(1)
+						body, err := io.ReadAll(r.Body)
+						if err != nil {
+							t.Error(err)
+						}
+						messages := gjson.GetBytes(body, "messages").Raw
+						before, worker, after := strings.Index(messages, `"before"`), strings.Index(messages, `"worker result"`), strings.Index(messages, `"after"`)
+						if before < 0 || after <= before || (worker >= 0) != enabled || enabled && (worker <= before || worker >= after) {
+							t.Error("collaboration content order or default behavior changed")
+						}
+						if operation == "count" {
+							w.Header().Set("Content-Type", "application/json")
+							_, _ = io.WriteString(w, `{"input_tokens":10}`)
+						} else if provider == "kimi" {
+							if operation == "stream" {
+								w.Header().Set("Content-Type", "text/event-stream")
+								_, _ = io.WriteString(w, "data: {\"id\":\"result\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n")
+							} else {
+								w.Header().Set("Content-Type", "application/json")
+								_, _ = io.WriteString(w, `{"id":"result","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}`)
+							}
+						} else {
+							w.Header().Set("Content-Type", "text/event-stream")
+							for _, event := range []string{
+								`{"type":"message_start","message":{"id":"msg_fixture","type":"message","role":"assistant","model":"claude-sonnet-4-6","content":[],"usage":{"input_tokens":1,"output_tokens":0}}}`,
+								`{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`,
+								`{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ok"}}`,
+								`{"type":"content_block_stop","index":0}`,
+								`{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}`,
+								`{"type":"message_stop"}`,
+							} {
+								_, _ = io.WriteString(w, "data: "+event+"\n\n")
+							}
+						}
+					}
+					server := httptest.NewServer(http.HandlerFunc(handle))
+					defer server.Close()
+					cfg := &config.Config{Codex: config.CodexConfig{OptimizeMultiAgentV2: enabled}}
+					var executor multiAgentTranslationExecutor = NewClaudeExecutor(cfg)
+					ctx := t.Context()
+					if provider == "kimi" {
+						executor = NewKimiExecutor(cfg)
+						ctx = context.WithValue(ctx, "cliproxy.roundtripper", streamTerminalRoundTripFunc(func(r *http.Request) (*http.Response, error) {
+							recorder := httptest.NewRecorder()
+							handle(recorder, r)
+							return recorder.Result(), nil
+						}))
+					}
+					auth := &cliproxyauth.Auth{Attributes: map[string]string{"base_url": server.URL, "api_key": "fixture"}}
+					req := core.Request{Model: "claude-sonnet-4-6", Payload: []byte(codexPlainAgentHistory)}
+					opts := core.Options{SourceFormat: sdktranslator.FormatOpenAIResponse, OriginalRequest: req.Payload, Headers: http.Header{"User-Agent": {"codex_cli_rs/0.153.4"}}}
+					if _, err := executeMultiAgentTranslation(ctx, executor, operation, auth, req, opts); err != nil {
+						t.Fatal(err)
+					}
+					if calls.Load() != 1 {
+						t.Fatal("translation changed upstream call count")
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestClaudeAndKimiMultiAgentCiphertextStopsBeforeUpstream(t *testing.T) {
+	var calls atomic.Int32
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { calls.Add(1); w.WriteHeader(http.StatusBadRequest) }))
+	defer proxy.Close()
+	cfg := &config.Config{Codex: config.CodexConfig{OptimizeMultiAgentV2: true}}
+	for _, executor := range []multiAgentTranslationExecutor{NewClaudeExecutor(cfg), NewKimiExecutor(cfg)} {
+		for _, operation := range []string{"execute", "stream", "count"} {
+			auth := &cliproxyauth.Auth{ProxyURL: proxy.URL, Attributes: map[string]string{"base_url": proxy.URL, "api_key": "fixture"}}
+			req := core.Request{Model: "claude-sonnet-4-6", Payload: []byte(codexEncryptedAgentHistory)}
+			opts := core.Options{SourceFormat: sdktranslator.FormatOpenAIResponse, Headers: http.Header{"User-Agent": {"codex_cli_rs/0.153.4"}}}
+			_, err := executeMultiAgentTranslation(t.Context(), executor, operation, auth, req, opts)
+			var local interface {
+				SkipAuthResult() bool
+				RetryOtherAuth() bool
+			}
+			if err == nil || !errors.As(err, &local) || !local.SkipAuthResult() || local.RetryOtherAuth() || !strings.Contains(err.Error(), "codex_encrypted_agent_message_unsupported") {
+				t.Fatalf("%T/%s lost the request-scoped unsupported error", executor, operation)
+			}
+			ctx, cancel := context.WithCancel(t.Context())
+			cancel()
+			if _, err := executeMultiAgentTranslation(ctx, executor, operation, auth, req, opts); !errors.Is(err, context.Canceled) {
+				t.Fatal("encrypted input replaced cancellation")
+			}
+		}
+	}
+	if calls.Load() != 0 {
+		t.Fatal("unsupported ciphertext reached the fixture proxy")
+	}
+}
