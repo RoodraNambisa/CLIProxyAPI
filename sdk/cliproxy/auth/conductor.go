@@ -1652,7 +1652,7 @@ func (m *Manager) pickBoundAcrossPriorities(ctx context.Context, auths []*Auth, 
 	if !ok || selector == nil || !selector.acrossPriorities {
 		return nil, false, nil
 	}
-	preferred := selector.cachedAuthID(provider, model, opts)
+	preferred := selector.cachedAuthID(provider, model, opts, ctx)
 	if preferred == "" {
 		return nil, false, nil
 	}
@@ -2014,7 +2014,7 @@ func (m *Manager) pickLegacyFillFirstRangeAuthWithDeferredBinding(ctx context.Co
 	}
 	useSessionSelector := hasSessionSelector && sessionSelector != nil
 	if useSessionSelector && fillFirstPerAuthRPM > 0 {
-		if cachedAuthID := sessionSelector.cachedAuthID(provider, routeModel, opts); cachedAuthID != "" {
+		if cachedAuthID := sessionSelector.cachedAuthID(provider, routeModel, opts, ctx); cachedAuthID != "" {
 			cachedAuth := authFromListByID(available, cachedAuthID)
 			if cachedAuth == nil || m.routingAuthRequestLimitPolicyForAuth(cachedAuth).limit == 0 {
 				useSessionSelector = false
@@ -6353,6 +6353,10 @@ func (m *Manager) strictSessionAffinityForRequest(ctx context.Context, req clipr
 	if policy := m.selectionPolicy(ctx); policy == nil || !policy.strictAffinity {
 		return false
 	}
+	if selector, ok := m.selectorForContext(ctx).(*SessionAffinitySelector); ok && selector != nil && selector.subagents {
+		primary, _ := selector.sessionIDs(ctx, opts)
+		return primary != ""
+	}
 	payload := opts.OriginalRequest
 	if len(payload) == 0 {
 		payload = req.Payload
@@ -7432,6 +7436,9 @@ func (m *Manager) prepareProviderRequests(
 	opts cliproxyexecutor.Options,
 	operation cliproxyexecutor.RequestOperation,
 ) ([]string, cliproxyexecutor.Options, error) {
+	if selector, ok := m.selectorForContext(ctx).(*SessionAffinitySelector); ok && selector != nil && selector.subagents {
+		opts = withAffinityIdentity(ctx, req, opts)
+	}
 	preparedProviders := make([]string, 0, len(providers))
 	preparedOpts := opts
 	var firstErr error
@@ -9560,7 +9567,7 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 	dynamicallyLimited := make(map[string]struct{})
 	strictBoundAuthID := ""
 	if sessionSelector, ok := m.selectorForContext(ctx).(*SessionAffinitySelector); ok && sessionSelector != nil && !sessionSelector.failover {
-		strictBoundAuthID = sessionSelector.cachedAuthID(provider, selectionArgForSelector(m.selectorForContext(ctx), model), opts)
+		strictBoundAuthID = sessionSelector.cachedAuthID(provider, selectionArgForSelector(m.selectorForContext(ctx), model), opts, ctx)
 		for _, candidate := range candidates {
 			if candidate == nil || candidate.ID != strictBoundAuthID {
 				continue
@@ -9783,7 +9790,7 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 	dynamicallyLimited := make(map[string]struct{})
 	strictBoundAuthID := ""
 	if sessionSelector, ok := m.selectorForContext(ctx).(*SessionAffinitySelector); ok && sessionSelector != nil && !sessionSelector.failover {
-		strictBoundAuthID = sessionSelector.cachedAuthID(selectorProvider, selectionArgForSelector(m.selectorForContext(ctx), model), opts)
+		strictBoundAuthID = sessionSelector.cachedAuthID(selectorProvider, selectionArgForSelector(m.selectorForContext(ctx), model), opts, ctx)
 		for _, candidate := range candidates {
 			if candidate == nil || candidate.ID != strictBoundAuthID {
 				continue
