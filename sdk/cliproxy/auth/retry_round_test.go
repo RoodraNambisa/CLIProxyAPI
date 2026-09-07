@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"reflect"
+	"strconv"
 	"sync"
 	"testing"
 
@@ -250,5 +252,40 @@ func TestCredentialRetryRoundUsesUpdatedCredentialAtNextSelection(t *testing.T) 
 				t.Fatalf("updated credential retry counts: %v", got)
 			}
 		})
+	}
+}
+
+func TestCredentialRetryRoundKeepsPriorityProgression(t *testing.T) {
+	for _, legacy := range []bool{false, true} {
+		for _, mode := range []string{"execute", "count", "stream"} {
+			t.Run(fmt.Sprintf("%s/legacy=%t", mode, legacy), func(t *testing.T) {
+				var selector Selector = &RoundRobinSelector{}
+				if legacy {
+					selector = &retryRoundLegacySelector{}
+				}
+				manager := NewManager(nil, selector, nil)
+				manager.SetConfig(&config.Config{NoCooldownStatusCodes: []int{500}})
+				errs := map[string]error{}
+				executor := &authFallbackExecutor{id: "claude", executeErrors: errs, countErrors: errs, streamFirstErrors: errs}
+				manager.RegisterExecutor(executor)
+				for _, row := range []struct {
+					id              string
+					priority, retry int
+				}{{"high", 10, 0}, {"middle", 5, 1}, {"low", 0, 2}} {
+					errs[row.id] = &Error{HTTPStatus: 500, Message: "synthetic failure"}
+					registerFallbackAuthForModel(t, manager, &Auth{ID: row.id, Provider: "claude", Attributes: map[string]string{"priority": strconv.Itoa(row.priority)}, Metadata: map[string]any{"request_retry": row.retry}}, "priority-retry-model")
+				}
+				if err := runCredentialRetryOperation(t.Context(), manager, mode, core.Request{Model: "priority-retry-model"}, core.Options{}); err == nil {
+					t.Fatal("missing upstream failure")
+				}
+				calls := append(executor.ExecuteCalls(), executor.CountCalls()...)
+				calls = append(calls, executor.StreamCalls()...)
+				// A round can fail over through remaining lower priorities; only
+				// its starting tier advances between additional request rounds.
+				if !reflect.DeepEqual(calls, []string{"high", "middle", "low", "middle", "low", "low"}) {
+					t.Fatalf("retry filtering changed priority progression: %v", calls)
+				}
+			})
+		}
 	}
 }
