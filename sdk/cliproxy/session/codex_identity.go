@@ -81,15 +81,22 @@ func rootID(roots []gjson.Result, paths ...string) string {
 }
 
 func agentIdentity(sessionID, agent string) string {
+	return agentIdentityForClient("codex", sessionID, agent)
+}
+
+func agentIdentityForClient(client, sessionID, agent string) string {
 	raw, _ := json.Marshal([]string{sessionID, agent})
 	digest := sha256.Sum256(raw)
-	return "codex-agent:" + hex.EncodeToString(digest[:])
+	return client + "-agent:" + hex.EncodeToString(digest[:])
 }
 
 // ExtractCodexIdentity reads only known protocol fields. It does not infer a
 // relationship from messages, cache keys, or arbitrary tool arguments.
 func ExtractCodexIdentity(headers http.Header, payload []byte) (Identity, bool) {
-	roots := protocolRoots(payload)
+	return extractCodexIdentity(headers, protocolRoots(payload))
+}
+
+func extractCodexIdentity(headers http.Header, roots []gjson.Result) (Identity, bool) {
 	headers = codexFrameIdentityHeaders(headers, roots)
 	sid := explicitID(headerValue(headers, "Session-Id"))
 	if sid == "" {
