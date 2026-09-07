@@ -38,3 +38,60 @@ func TestGeminiResponsesCustomDeclarationsAndMixedHistory(t *testing.T) {
 		}
 	}
 }
+
+func TestGeminiResponsesCustomOutputTypesEventsAndOwnership(t *testing.T) {
+	for _, input := range []string{"", "line\n😀", `literal {"input":"nested"}`} {
+		original := []byte(`{"tools":[{"type":"function","name":"lookup"}],"input":[{"type":"additional_tools","tools":[{"type":"namespace","name":"editor","tools":[{"type":"custom","name":"patch/file"}]}]}]}`)
+		response := []byte(`{"candidates":[{"content":{"parts":[{"functionCall":{"name":"editor__patch_file","args":{"input":""}}},{"functionCall":{"name":"lookup","args":{"value":9007199254740993}}}]},"finishReason":"STOP"}]}`)
+		response, _ = sjson.SetBytes(response, "candidates.0.content.parts.0.functionCall.args.input", input)
+		nonstream := gjson.ParseBytes(ConvertGeminiResponseToOpenAIResponsesNonStream(t.Context(), "", original, nil, response, nil))
+		var state any
+		ConvertGeminiResponseToOpenAIResponses(t.Context(), "", original, nil, []byte(`{"candidates":[{"content":{"parts":[]}}]}`), &state)
+		clear(original)
+		counts := make(map[string]int)
+		var completed gjson.Result
+		var callID string
+		for _, chunk := range ConvertGeminiResponseToOpenAIResponses(t.Context(), "", nil, nil, response, &state) {
+			kind, data := parseSSEEvent(t, chunk)
+			counts[kind]++
+			if item := data.Get("item"); item.Get("type").String() == "custom_tool_call" {
+				if callID == "" {
+					callID = item.Get("call_id").String()
+				}
+				if item.Get("call_id").String() != callID || item.Get("id").String() != "ctc_"+callID || item.Get("arguments").Exists() || item.Get("name").String() != "patch/file" || item.Get("namespace").String() != "editor" {
+					t.Fatal("custom event lost its original identity or retained function fields")
+				}
+			}
+			if kind == "response.custom_tool_call_input.done" && (data.Get("input").String() != input || data.Get("item_id").String() != "ctc_"+callID) {
+				t.Fatal("custom input completion disagrees with its item")
+			}
+			if kind == "response.custom_tool_call_input.delta" && data.Get("delta").String() != input {
+				t.Fatal("JSON wrapper leaked into the input delta")
+			}
+			if kind == "response.completed" {
+				completed = data.Get("response")
+			}
+		}
+		wantDelta := 1
+		if input == "" {
+			wantDelta = 0
+		}
+		if counts["response.custom_tool_call_input.delta"] != wantDelta || counts["response.custom_tool_call_input.done"] != 1 || counts["response.function_call_arguments.delta"] != 1 || counts["response.function_call_arguments.done"] != 1 {
+			t.Fatalf("tool event types diverged: %v", counts)
+		}
+		for _, output := range []gjson.Result{completed, nonstream} {
+			if output.Get("output.#").Int() != 2 || output.Get("output.0.type").String() != "custom_tool_call" || output.Get("output.0.input").String() != input || output.Get("output.0.name").String() != "patch/file" || output.Get("output.1.type").String() != "function_call" || output.Get("output.1.arguments").String() != `{"value":9007199254740993}` {
+				t.Fatal("custom and ordinary completed results disagree")
+			}
+		}
+	}
+}
+
+func TestGeminiResponsesCustomOutputDoesNotGuessAfterNameCollision(t *testing.T) {
+	original := []byte(`{"tools":[{"type":"custom","name":"patch/file"},{"type":"function","name":"patch_file"}]}`)
+	response := []byte(`{"candidates":[{"content":{"parts":[{"functionCall":{"name":"patch_file","args":{"input":"preserve"}}},{"functionCall":{"name":"unknown"}}]},"finishReason":"STOP"}]}`)
+	got := ConvertGeminiResponseToOpenAIResponsesNonStream(t.Context(), "", original, nil, response, nil)
+	if gjson.GetBytes(got, "output.0.type").String() != "function_call" || gjson.GetBytes(got, "output.0.arguments").String() != `{"input":"preserve"}` || gjson.GetBytes(got, "output.1.arguments").String() != "{}" {
+		t.Fatal("ambiguous custom identity was guessed or empty function arguments lost their object value")
+	}
+}

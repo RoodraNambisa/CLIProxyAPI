@@ -32,6 +32,11 @@ func runGoogleResponsesToolIdentity(t *testing.T, provider string, enabled bool)
 
 func runGoogleResponsesToolIdentityWithNamespaceField(t *testing.T, provider string, enabled bool, namespaceField string) {
 	t.Helper()
+	runGoogleResponsesToolOutputFixture(t, provider, enabled, namespaceField, "function")
+}
+
+func runGoogleResponsesToolOutputFixture(t *testing.T, provider string, enabled bool, namespaceField, toolKind string) {
+	t.Helper()
 	isAntigravity := strings.HasPrefix(provider, "antigravity")
 	for _, stream := range []bool{false, true} {
 		for _, explicitOriginal := range []bool{false, true} {
@@ -73,6 +78,9 @@ func runGoogleResponsesToolIdentityWithNamespaceField(t *testing.T, provider str
 					controller.Release()
 					w := httptest.NewRecorder()
 					response := `{"candidates":[{"content":{"role":"model","parts":[{"functionCall":{"name":"collaboration__spawn_agent","args":{"message":"work"}}}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":1,"candidatesTokenCount":1,"totalTokenCount":2}}`
+					if toolKind == "custom" {
+						response = strings.Replace(response, `"args":{"message":"work"}`, `"args":{"input":"work"}`, 1)
+					}
 					if isAntigravity {
 						response = `{"response":` + response + `}`
 					}
@@ -97,7 +105,7 @@ func runGoogleResponsesToolIdentityWithNamespaceField(t *testing.T, provider str
 					return w.Result(), nil
 				}))
 				executor, auth := newGoogleMultiAgentFixtureExecutor(t, provider, cfg)
-				req := core.Request{Model: "gemini-2.5-flash", Payload: []byte(`{"input":[],"tools":[{"type":"namespace","name":"collaboration","` + namespaceField + `":[{"type":"function","name":"spawn_agent","parameters":{"type":"object"}}]}]}`)}
+				req := core.Request{Model: "gemini-2.5-flash", Payload: []byte(`{"input":[],"tools":[{"type":"namespace","name":"collaboration","` + namespaceField + `":[{"type":"` + toolKind + `","name":"spawn_agent","parameters":{"type":"object"}}]}]}`)}
 				if provider == "antigravity-claude" {
 					req.Model = "claude-sonnet-4-6"
 				}
@@ -117,7 +125,7 @@ func runGoogleResponsesToolIdentityWithNamespaceField(t *testing.T, provider str
 						}
 						for _, line := range bytes.Split(chunk.Payload, []byte("\n")) {
 							event := gjson.ParseBytes(helps.JSONPayload(line))
-							if event.Get("item.type").String() == "function_call" {
+							if kind := event.Get("item.type").String(); kind == "function_call" || kind == "custom_tool_call" {
 								items = append(items, event.Get("item"))
 							} else if event.Get("type").String() == "response.completed" {
 								items = append(items, event.Get("response.output.0"))
@@ -149,8 +157,12 @@ func runGoogleResponsesToolIdentityWithNamespaceField(t *testing.T, provider str
 					t.Fatalf("upstream calls = %d, want %d", upstreamCalls, wantCalls)
 				}
 				for _, item := range items {
-					if item.Get("encrypted_function_args").Exists() != enabled || enabled && item.Get("encrypted_function_args").Raw != "[]" {
+					wantMarker := enabled && toolKind == "function"
+					if item.Get("encrypted_function_args").Exists() != wantMarker || wantMarker && item.Get("encrypted_function_args").Raw != "[]" {
 						t.Fatal("plaintext marker did not keep the request snapshot after release and configuration update")
+					}
+					if toolKind == "custom" && (item.Get("type").String() != "custom_tool_call" || item.Get("id").String() != "ctc_"+item.Get("call_id").String() || item.Get("arguments").Exists() || item.Get("status").String() == "completed" && item.Get("input").String() != "work") {
+						t.Fatal("released custom output retained the function representation or lost input")
 					}
 					if item.Get("name").String() != "spawn_agent" || item.Get("namespace").String() != "collaboration" || item.Get("call_id").String() == "" || item.Get("call_id").String() != items[0].Get("call_id").String() {
 						t.Fatal("tool identity was lost after request release")
@@ -188,6 +200,18 @@ func TestAntigravityResponsesToolIdentityAfterRelease(t *testing.T) {
 		for _, enabled := range []bool{false, true} {
 			t.Run(fmt.Sprintf("%s/enabled=%t", provider, enabled), func(t *testing.T) {
 				runGoogleResponsesToolIdentity(t, provider, enabled)
+			})
+		}
+	}
+}
+
+func TestGoogleCustomToolOutputAfterRelease(t *testing.T) {
+	resetAntigravityCreditsRetryState()
+	t.Cleanup(resetAntigravityCreditsRetryState)
+	for _, provider := range []string{"gemini", "vertex", "vertex-service-account", "antigravity", "antigravity-claude", "antigravity-credits"} {
+		for _, enabled := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/enabled=%t", provider, enabled), func(t *testing.T) {
+				runGoogleResponsesToolOutputFixture(t, provider, enabled, "tools", "custom")
 			})
 		}
 	}

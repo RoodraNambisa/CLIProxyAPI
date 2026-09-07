@@ -20,6 +20,15 @@ import (
 )
 
 func TestAIStudioResponsesToolsAcrossRelayResults(t *testing.T) {
+	runAIStudioResponsesToolsAcrossRelayResults(t, false)
+}
+
+func TestAIStudioCustomToolsAcrossRelayResults(t *testing.T) {
+	runAIStudioResponsesToolsAcrossRelayResults(t, true)
+}
+
+func runAIStudioResponsesToolsAcrossRelayResults(t *testing.T, custom bool) {
+	t.Helper()
 	for _, operation := range []string{"execute", "stream", "stream-http-response"} {
 		for _, enabled := range []bool{false, true} {
 			t.Run(fmt.Sprintf("%s/enabled=%t", operation, enabled), func(t *testing.T) {
@@ -55,6 +64,9 @@ func TestAIStudioResponsesToolsAcrossRelayResults(t *testing.T) {
 					}
 					controller.Release()
 					response := `{"candidates":[{"content":{"role":"model","parts":[{"functionCall":{"name":"collaboration__spawn_agent","args":{"message":"work"}}}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":1,"candidatesTokenCount":1,"totalTokenCount":2}}`
+					if custom {
+						response = strings.Replace(response, `"args":{"message":"work"}`, `"args":{"input":"work"}`, 1)
+					}
 					messages := []wsrelay.Message{{ID: request.ID, Type: wsrelay.MessageTypeHTTPResp, Payload: map[string]any{"status": http.StatusOK, "body": response}}}
 					if operation == "stream" {
 						messages = []wsrelay.Message{
@@ -74,6 +86,9 @@ func TestAIStudioResponsesToolsAcrossRelayResults(t *testing.T) {
 				}()
 				executor := NewAIStudioExecutor(&config.Config{Codex: config.CodexConfig{OptimizeMultiAgentV2: enabled}}, authID, relay)
 				req := core.Request{Model: "gemini-2.5-flash", Payload: []byte(`{"input":[],"tools":[{"type":"namespace","name":"collaboration","tools":[{"type":"function","name":"spawn_agent","parameters":{"type":"object"}}]}]}`)}
+				if custom {
+					req.Payload = bytes.Replace(req.Payload, []byte(`"type":"function"`), []byte(`"type":"custom"`), 1)
+				}
 				opts := core.Options{SourceFormat: sdktranslator.FormatOpenAIResponse, Headers: http.Header{"User-Agent": {"codex_cli_rs/0.153.4"}}, Metadata: map[string]any{core.BodyReleaseControllerMetadataKey: controller}}
 				var items []gjson.Result
 				if operation == "execute" {
@@ -93,7 +108,7 @@ func TestAIStudioResponsesToolsAcrossRelayResults(t *testing.T) {
 						}
 						for _, line := range bytes.Split(chunk.Payload, []byte("\n")) {
 							event := gjson.ParseBytes(helps.JSONPayload(line))
-							if event.Get("item.type").String() == "function_call" {
+							if kind := event.Get("item.type").String(); kind == "function_call" || kind == "custom_tool_call" {
 								items = append(items, event.Get("item"))
 							}
 							if event.Get("type").String() == "response.completed" {
@@ -109,13 +124,17 @@ func TestAIStudioResponsesToolsAcrossRelayResults(t *testing.T) {
 					t.Fatalf("release/output events: released=%t, items=%d", controller.Released(), len(items))
 				}
 				for _, item := range items {
-					if item.Get("status").String() != "in_progress" && gjson.Get(item.Get("arguments").String(), "message").String() != "work" {
+					if !custom && item.Get("status").String() != "in_progress" && gjson.Get(item.Get("arguments").String(), "message").String() != "work" {
 						t.Fatal("relay conversion changed the completed tool arguments")
+					}
+					if custom && (item.Get("type").String() != "custom_tool_call" || item.Get("id").String() != "ctc_"+item.Get("call_id").String() || item.Get("arguments").Exists() || item.Get("status").String() == "completed" && item.Get("input").String() != "work") {
+						t.Fatal("relay conversion lost the custom type or input")
 					}
 					if item.Get("name").String() != "spawn_agent" || item.Get("namespace").String() != "collaboration" || item.Get("call_id").String() == "" || item.Get("call_id").String() != items[0].Get("call_id").String() {
 						t.Fatal("tool identity changed after release")
 					}
-					if item.Get("encrypted_function_args").Exists() != enabled || enabled && item.Get("encrypted_function_args").Raw != "[]" {
+					wantMarker := enabled && !custom
+					if item.Get("encrypted_function_args").Exists() != wantMarker || wantMarker && item.Get("encrypted_function_args").Raw != "[]" {
 						t.Fatal("plaintext marker did not follow the optional policy")
 					}
 				}
