@@ -122,6 +122,7 @@ func (e *GeminiExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	// Official Gemini API via API key.
 	from := opts.SourceFormat
 	to := sdktranslator.FromString("gemini")
+	multiAgentResponse := helps.CodexPlaintextResponsePolicy(ctx, opts.Headers, e.cfg, from)
 	originalPayloadSource := req.Payload
 	if len(opts.OriginalRequest) > 0 {
 		originalPayloadSource = opts.OriginalRequest
@@ -226,7 +227,7 @@ func (e *GeminiExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	helps.AppendAPIResponseChunk(ctx, e.cfg, data)
 	reporter.Publish(ctx, helps.ParseGeminiUsage(data))
 	var param any
-	out := sdktranslator.TranslateNonStream(ctx, to, from, req.Model, originalRef.Bytes(), bodyRef.Bytes(), data, &param)
+	out := multiAgentResponse.TranslateNonStream(ctx, to, from, req.Model, originalRef.Bytes(), bodyRef.Bytes(), data, &param)
 	resp = cliproxyexecutor.Response{Payload: out, Headers: httpResp.Header.Clone()}
 	return resp, nil
 }
@@ -248,6 +249,7 @@ func (e *GeminiExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 
 	from := opts.SourceFormat
 	to := sdktranslator.FromString("gemini")
+	multiAgentResponse := helps.CodexPlaintextResponsePolicy(ctx, opts.Headers, e.cfg, from)
 	originalPayloadSource := req.Payload
 	if len(opts.OriginalRequest) > 0 {
 		originalPayloadSource = opts.OriginalRequest
@@ -381,7 +383,7 @@ func (e *GeminiExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 			}
 			var lines [][]byte
 			if len(payload) > 0 {
-				lines = sdktranslator.TranslateStream(ctx, to, from, req.Model, originalRef.Bytes(), bodyRef.Bytes(), bytes.Clone(payload), &param)
+				lines = multiAgentResponse.TranslateStream(ctx, to, from, req.Model, originalRef.Bytes(), bodyRef.Bytes(), bytes.Clone(payload), &param)
 				for i := range lines {
 					out <- cliproxyexecutor.StreamChunk{Payload: lines[i]}
 				}
@@ -390,7 +392,7 @@ func (e *GeminiExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 			terminalReady := terminal && !helps.GeminiTerminalAwaitsUsage(rawPayload) || terminalSeen && usagePresent
 			if markerRequested && terminalReady && !protocolFailed && scanner.Err() == nil {
 				reporter.EnsurePublished(ctx)
-				lines = sdktranslator.TranslateStream(ctx, to, from, req.Model, originalRef.Bytes(), bodyRef.Bytes(), []byte("[DONE]"), &param)
+				lines = multiAgentResponse.TranslateStream(ctx, to, from, req.Model, originalRef.Bytes(), bodyRef.Bytes(), []byte("[DONE]"), &param)
 				for i := range lines {
 					out <- cliproxyexecutor.StreamChunk{Payload: lines[i]}
 				}
@@ -403,7 +405,7 @@ func (e *GeminiExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 			reporter.PublishFailure(ctx)
 			out <- cliproxyexecutor.StreamChunk{Err: errScan}
 		} else if terminalSeen && !protocolFailed {
-			lines := sdktranslator.TranslateStream(ctx, to, from, req.Model, originalRef.Bytes(), bodyRef.Bytes(), []byte("[DONE]"), &param)
+			lines := multiAgentResponse.TranslateStream(ctx, to, from, req.Model, originalRef.Bytes(), bodyRef.Bytes(), []byte("[DONE]"), &param)
 			for i := range lines {
 				out <- cliproxyexecutor.StreamChunk{Payload: lines[i]}
 			}

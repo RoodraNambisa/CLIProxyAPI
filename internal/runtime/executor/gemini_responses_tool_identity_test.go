@@ -11,16 +11,25 @@ import (
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor/helps"
-	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	core "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v6/sdk/translator"
 	"github.com/tidwall/gjson"
 )
 
-func TestGeminiResponsesToolIdentityAfterRequestBodyRelease(t *testing.T) {
+func TestGeminiResponsesToolIdentityAndMultiAgentAfterRelease(t *testing.T) {
+	for _, enabled := range []bool{false, true} {
+		t.Run(fmt.Sprintf("enabled=%t", enabled), func(t *testing.T) {
+			runGoogleResponsesToolIdentity(t, "gemini", enabled)
+		})
+	}
+}
+
+func runGoogleResponsesToolIdentity(t *testing.T, provider string, enabled bool) {
+	t.Helper()
 	for _, stream := range []bool{false, true} {
 		for _, explicitOriginal := range []bool{false, true} {
 			t.Run(fmt.Sprintf("stream=%t/original=%t", stream, explicitOriginal), func(t *testing.T) {
+				cfg := &config.Config{Codex: config.CodexConfig{OptimizeMultiAgentV2: enabled}}
 				controller := core.NewRequestBodyReleaseController(1, []byte("<released>"))
 				ctx := context.WithValue(t.Context(), "cliproxy.roundtripper", streamTerminalRoundTripFunc(func(r *http.Request) (*http.Response, error) {
 					body, err := io.ReadAll(r.Body)
@@ -30,6 +39,7 @@ func TestGeminiResponsesToolIdentityAfterRequestBodyRelease(t *testing.T) {
 					if gjson.GetBytes(body, "tools.0.functionDeclarations.0.name").String() != "collaboration__spawn_agent" {
 						t.Error("namespace declaration did not reach the fake upstream")
 					}
+					cfg.Codex.OptimizeMultiAgentV2 = !enabled
 					controller.Release()
 					w := httptest.NewRecorder()
 					response := `{"candidates":[{"content":{"role":"model","parts":[{"functionCall":{"name":"collaboration__spawn_agent","args":{"message":"work"}}}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":1,"candidatesTokenCount":1,"totalTokenCount":2}}`
@@ -42,10 +52,9 @@ func TestGeminiResponsesToolIdentityAfterRequestBodyRelease(t *testing.T) {
 					}
 					return w.Result(), nil
 				}))
-				executor := NewGeminiExecutor(&config.Config{})
-				auth := &cliproxyauth.Auth{Attributes: map[string]string{"base_url": "https://google-fixture.invalid", "api_key": "fixture"}}
+				executor, auth := newGoogleMultiAgentFixtureExecutor(t, provider, cfg)
 				req := core.Request{Model: "gemini-2.5-flash", Payload: []byte(`{"input":[],"tools":[{"type":"namespace","name":"collaboration","tools":[{"type":"function","name":"spawn_agent","parameters":{"type":"object"}}]}]}`)}
-				opts := core.Options{SourceFormat: sdktranslator.FormatOpenAIResponse, Metadata: map[string]any{core.BodyReleaseControllerMetadataKey: controller}}
+				opts := core.Options{SourceFormat: sdktranslator.FormatOpenAIResponse, Headers: http.Header{"User-Agent": {"codex_cli_rs/0.153.4"}}, Metadata: map[string]any{core.BodyReleaseControllerMetadataKey: controller}}
 				if explicitOriginal {
 					opts.OriginalRequest = bytes.Clone(req.Payload)
 				}
@@ -79,6 +88,9 @@ func TestGeminiResponsesToolIdentityAfterRequestBodyRelease(t *testing.T) {
 					t.Fatalf("identity events = %d, released = %t", len(items), controller.Released())
 				}
 				for _, item := range items {
+					if item.Get("encrypted_function_args").Exists() != enabled || enabled && item.Get("encrypted_function_args").Raw != "[]" {
+						t.Fatal("plaintext marker did not keep the request snapshot after release and configuration update")
+					}
 					if item.Get("name").String() != "spawn_agent" || item.Get("namespace").String() != "collaboration" || item.Get("call_id").String() == "" || item.Get("call_id").String() != items[0].Get("call_id").String() {
 						t.Fatal("tool identity was lost after request release")
 					}
