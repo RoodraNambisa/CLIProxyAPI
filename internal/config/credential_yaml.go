@@ -58,6 +58,46 @@ func yamlFieldName(field reflect.StructField) string {
 	return name
 }
 
+// Credential extensions must not act as identifiers. Secondary fields separate
+// shared keys and models, while a unique primary identity allows target edits.
+func matchCredentialYAMLSequenceElement(original []*yaml.Node, used []bool, target *yaml.Node, path []string) (int, bool) {
+	if target == nil || target.Kind != yaml.MappingNode {
+		return -1, false
+	}
+	var primary, secondary string
+	switch credentialYAMLMappingType(path) {
+	case reflect.TypeFor[GeminiKey](), reflect.TypeFor[ClaudeKey](), reflect.TypeFor[CodexKey](), reflect.TypeFor[VertexCompatKey]():
+		primary, secondary = "api-key", "base-url"
+	case reflect.TypeFor[OpenAICompatibilityAPIKey]():
+		primary, secondary = "api-key", "proxy-url"
+	case reflect.TypeFor[OpenAICompatibility]():
+		primary, secondary = "name", "base-url"
+	case reflect.TypeFor[GeminiModel](), reflect.TypeFor[ClaudeModel](), reflect.TypeFor[CodexModel](), reflect.TypeFor[VertexCompatModel](), reflect.TypeFor[OpenAICompatibilityModel]():
+		primary, secondary = "name", "alias"
+	default:
+		return -1, false
+	}
+	key, qualifier := mappingScalarValue(target, primary), mappingScalarValue(target, secondary)
+	count, sole, exact := 0, -1, -1
+	for index, node := range original {
+		if used[index] || node == nil || node.Kind != yaml.MappingNode || mappingScalarValue(node, primary) != key {
+			continue
+		}
+		count++
+		sole = index
+		if exact < 0 && mappingScalarValue(node, secondary) == qualifier {
+			exact = index
+		}
+	}
+	if exact >= 0 {
+		return exact, true
+	}
+	if count == 1 {
+		return sole, true
+	}
+	return -1, true
+}
+
 // Materialize credential aliases and merges before updating fields. Otherwise
 // deleting a known field can reintroduce its old value from an inherited map.
 func prepareCredentialYAMLForSave(root *yaml.Node) error {

@@ -4072,7 +4072,7 @@ func mergeNodePreserve(dst, src *yaml.Node, path ...[]string) {
 			dst.Tag = "!!seq"
 			dst.Content = nil
 		}
-		reorderSequenceForMerge(dst, src)
+		reorderSequenceForMerge(dst, src, currentPath)
 		// Update elements in place
 		minContent := len(dst.Content)
 		if len(src.Content) < minContent {
@@ -4423,7 +4423,7 @@ func copyNodeShallow(dst, src *yaml.Node) {
 	}
 }
 
-func reorderSequenceForMerge(dst, src *yaml.Node) {
+func reorderSequenceForMerge(dst, src *yaml.Node, paths ...[]string) {
 	if dst == nil || src == nil {
 		return
 	}
@@ -4437,7 +4437,7 @@ func reorderSequenceForMerge(dst, src *yaml.Node) {
 	used := make([]bool, len(original))
 	ordered := make([]*yaml.Node, len(src.Content))
 	for i := range src.Content {
-		if idx := matchSequenceElement(original, used, src.Content[i]); idx >= 0 {
+		if idx := matchSequenceElement(original, used, src.Content[i], paths...); idx >= 0 {
 			ordered[i] = original[idx]
 			used[idx] = true
 		}
@@ -4445,9 +4445,14 @@ func reorderSequenceForMerge(dst, src *yaml.Node) {
 	dst.Content = ordered
 }
 
-func matchSequenceElement(original []*yaml.Node, used []bool, target *yaml.Node) int {
+func matchSequenceElement(original []*yaml.Node, used []bool, target *yaml.Node, paths ...[]string) int {
 	if target == nil {
 		return -1
+	}
+	if len(paths) > 0 {
+		if index, handled := matchCredentialYAMLSequenceElement(original, used, target, paths[0]); handled {
+			return index
+		}
 	}
 	switch target.Kind {
 	case yaml.MappingNode:
