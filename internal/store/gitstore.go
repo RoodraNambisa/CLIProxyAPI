@@ -27,6 +27,7 @@ import (
 	"github.com/google/uuid"
 	internalcodex "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/codex"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/authfileguard"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/credentialweight"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/jsonsemantic"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	log "github.com/sirupsen/logrus"
@@ -615,6 +616,9 @@ func (s *GitTokenStore) enqueueRefreshSave(
 	}
 	if auth == nil {
 		return "", errors.New("auth filestore: auth is nil")
+	}
+	if errWeight := cliproxyauth.ValidateAuthWeight(auth); errWeight != nil {
+		return "", errWeight
 	}
 	targetIdentity, errIdentity := s.refreshSaveTargetIdentity(auth, info)
 	if errIdentity != nil {
@@ -1358,6 +1362,9 @@ func (s *GitTokenStore) save(ctx context.Context, auth *cliproxyauth.Auth, requi
 	}
 	if auth == nil {
 		return "", fmt.Errorf("auth filestore: auth is nil")
+	}
+	if errWeight := cliproxyauth.ValidateAuthWeight(auth); errWeight != nil {
+		return "", errWeight
 	}
 	if cliproxyauth.IsRetiredGeminiCLIAuth(auth) {
 		cliproxyauth.WarnRetiredGeminiCLIAuthIgnored()
@@ -2571,6 +2578,9 @@ func (s *GitTokenStore) readAuthFile(path, baseDir string) (*cliproxyauth.Auth, 
 	metadata := make(map[string]any)
 	if err = json.Unmarshal(data, &metadata); err != nil {
 		return nil, fmt.Errorf("unmarshal auth json: %w", err)
+	}
+	if errWeight := credentialweight.ValidateMetadataJSON(data); errWeight != nil {
+		return nil, errWeight
 	}
 	provider, _ := metadata["type"].(string)
 	if provider == "" {

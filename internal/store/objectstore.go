@@ -21,6 +21,7 @@ import (
 	"github.com/minio/minio-go/v7/pkg/credentials"
 	internalcodex "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/codex"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/authfileguard"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/credentialweight"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/misc"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	log "github.com/sirupsen/logrus"
@@ -198,6 +199,9 @@ func (s *ObjectTokenStore) SaveIfSourceHashMatches(ctx context.Context, auth *cl
 func (s *ObjectTokenStore) save(ctx context.Context, auth *cliproxyauth.Auth, requireAbsent bool, expectedSourceHash string) (savedPath string, resultErr error) {
 	if auth == nil {
 		return "", fmt.Errorf("object store: auth is nil")
+	}
+	if errWeight := cliproxyauth.ValidateAuthWeight(auth); errWeight != nil {
+		return "", errWeight
 	}
 	if cliproxyauth.IsRetiredGeminiCLIAuth(auth) {
 		cliproxyauth.WarnRetiredGeminiCLIAuthIgnored()
@@ -1562,6 +1566,9 @@ func (s *ObjectTokenStore) readAuthFile(path, baseDir string) (*cliproxyauth.Aut
 	metadata := make(map[string]any)
 	if err = json.Unmarshal(data, &metadata); err != nil {
 		return nil, fmt.Errorf("unmarshal auth json: %w", err)
+	}
+	if errWeight := credentialweight.ValidateMetadataJSON(data); errWeight != nil {
+		return nil, errWeight
 	}
 	provider := strings.TrimSpace(valueAsString(metadata["type"]))
 	if provider == "" {

@@ -17,6 +17,7 @@ import (
 	"github.com/google/uuid"
 	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/authfileguard"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/credentialweight"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/misc"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	log "github.com/sirupsen/logrus"
@@ -248,6 +249,9 @@ func (s *PostgresStore) SaveIfSourceHashMatches(ctx context.Context, auth *clipr
 func (s *PostgresStore) save(ctx context.Context, auth *cliproxyauth.Auth, requireAbsent bool, expectedSourceHash string) (savedPath string, resultErr error) {
 	if auth == nil {
 		return "", fmt.Errorf("postgres store: auth is nil")
+	}
+	if errWeight := cliproxyauth.ValidateAuthWeight(auth); errWeight != nil {
+		return "", errWeight
 	}
 	if cliproxyauth.IsRetiredGeminiCLIAuth(auth) {
 		cliproxyauth.WarnRetiredGeminiCLIAuthIgnored()
@@ -571,6 +575,10 @@ func (s *PostgresStore) ListWithReport(ctx context.Context) ([]*cliproxyauth.Aut
 		metadata := make(map[string]any)
 		if err = json.Unmarshal(payloadData, &metadata); err != nil {
 			log.WithError(err).Warnf("postgres store: skipping auth %s with invalid json", id)
+			continue
+		}
+		if errWeight := credentialweight.ValidateMetadataJSON(payloadData); errWeight != nil {
+			log.WithError(errWeight).Warn("postgres store: skipping auth with invalid weight")
 			continue
 		}
 		provider := strings.TrimSpace(valueAsString(metadata["type"]))
