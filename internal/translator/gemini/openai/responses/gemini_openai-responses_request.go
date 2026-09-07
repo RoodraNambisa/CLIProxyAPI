@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	sigcompat "github.com/router-for-me/CLIProxyAPI/v6/internal/signature"
+	translatorcommon "github.com/router-for-me/CLIProxyAPI/v6/internal/translator/common"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/translator/gemini/common"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	"github.com/tidwall/gjson"
@@ -295,7 +296,7 @@ func ConvertOpenAIResponsesRequestToGemini(modelName string, inputRawJSON []byte
 
 			case "function_call":
 				// Handle function calls - convert to model message with functionCall
-				name := util.SanitizeFunctionName(item.Get("name").String())
+				name := util.SanitizeFunctionName(translatorcommon.QualifyResponsesToolName(strings.TrimSpace(item.Get("namespace").String()), strings.TrimSpace(item.Get("name").String())))
 				arguments := item.Get("arguments").String()
 
 				modelContent := []byte(`{"role":"model","parts":[]}`)
@@ -331,7 +332,7 @@ func ConvertOpenAIResponsesRequestToGemini(modelName string, inputRawJSON []byte
 				if inputArray := root.Get("input"); inputArray.Exists() && inputArray.IsArray() {
 					inputArray.ForEach(func(_, prevItem gjson.Result) bool {
 						if prevItem.Get("type").String() == "function_call" && prevItem.Get("call_id").String() == callID {
-							functionName = prevItem.Get("name").String()
+							functionName = translatorcommon.QualifyResponsesToolName(strings.TrimSpace(prevItem.Get("namespace").String()), strings.TrimSpace(prevItem.Get("name").String()))
 							return false // Stop iteration
 						}
 						return true
@@ -390,10 +391,11 @@ func ConvertOpenAIResponsesRequestToGemini(modelName string, inputRawJSON []byte
 	}
 
 	// Convert tools to Gemini functionDeclarations format
-	if tools := root.Get("tools"); tools.Exists() && tools.IsArray() {
+	if tools := translatorcommon.ResponsesToolDeclarations(root); len(tools) > 0 {
 		geminiTools := []byte(`[{"functionDeclarations":[]}]`)
 
-		tools.ForEach(func(_, tool gjson.Result) bool {
+		for _, declaration := range tools {
+			tool := declaration.Tool
 			if tool.Get("type").String() == "function" {
 				funcDecl := []byte(`{"name":"","description":"","parametersJsonSchema":{}}`)
 
@@ -409,12 +411,35 @@ func ConvertOpenAIResponsesRequestToGemini(modelName string, inputRawJSON []byte
 
 				geminiTools, _ = sjson.SetRawBytes(geminiTools, "0.functionDeclarations.-1", funcDecl)
 			}
-			return true
-		})
+		}
 
 		// Only add tools if there are function declarations
 		if funcDecls := gjson.GetBytes(geminiTools, "0.functionDeclarations"); funcDecls.Exists() && len(funcDecls.Array()) > 0 {
 			out, _ = sjson.SetRawBytes(out, "tools", geminiTools)
+		}
+	}
+
+	if choice := root.Get("tool_choice"); choice.Exists() {
+		switch choice.String() {
+		case "auto":
+			out, _ = sjson.SetBytes(out, "toolConfig.functionCallingConfig.mode", "AUTO")
+		case "none":
+			out, _ = sjson.SetBytes(out, "toolConfig.functionCallingConfig.mode", "NONE")
+		case "required":
+			out, _ = sjson.SetBytes(out, "toolConfig.functionCallingConfig.mode", "ANY")
+		default:
+			if choice.Get("type").String() == "function" {
+				name := choice.Get("name").String()
+				if name == "" {
+					name = choice.Get("function.name").String()
+				}
+				name = strings.TrimSpace(name)
+				if name != "" {
+					name = util.SanitizeFunctionName(translatorcommon.QualifyResponsesToolName(strings.TrimSpace(choice.Get("namespace").String()), name))
+					out, _ = sjson.SetBytes(out, "toolConfig.functionCallingConfig.mode", "ANY")
+					out, _ = sjson.SetBytes(out, "toolConfig.functionCallingConfig.allowedFunctionNames", []string{name})
+				}
+			}
 		}
 	}
 
