@@ -309,6 +309,8 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 	body = helps.SanitizeCodexReasoningEncryptedContent(ctx, "codex websockets executor", body)
 	body = helps.NormalizeCodexToolSelection(body)
 	body = e.codexPreparedSessionIdentity(ctx, req, opts).ResponsesLite.ApplyBody(body, true)
+	multiAgentDeclaresTools := helps.CodexMultiAgentDeclaresTools(body)
+	body, multiAgentResponse := helps.OptimizeCodexMultiAgentV2Request(body, e.codexPreparedSessionIdentity(ctx, req, opts).MultiAgentV2)
 	if strings.TrimSpace(gjson.GetBytes(body, "previous_response_id").String()) != "" {
 		ctx = cliproxyexecutor.WithRequiredUpstreamWebsocket(ctx)
 	}
@@ -491,6 +493,9 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 		}
 	}
 	wsReqBody = nil
+	if !multiAgentDeclaresTools {
+		multiAgentResponse = sess.multiAgentResponseForConn(conn)
+	}
 
 	streamEstablished := false
 	for {
@@ -564,7 +569,11 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 				reporter.Publish(ctx, detail)
 			}
 			var param any
+			clientPayload = multiAgentResponse.Rewrite(clientPayload)
 			out := sdktranslator.TranslateNonStream(ctx, to, from, req.Model, originalRef.Bytes(), clientBodyRef.Bytes(), clientPayload, &param)
+			if ctx.Err() == nil {
+				sess.commitMultiAgentResponseForConn(conn, multiAgentResponse)
+			}
 			resp = cliproxyexecutor.Response{Payload: out, Headers: codexSuccessfulResponseHeaders(auth, upstreamHeaders)}
 			return resp, nil
 		}
