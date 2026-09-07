@@ -321,7 +321,11 @@ func TestCodexBootstrapWebsocketCancellationReleasesProbeState(t *testing.T) {
 	opts := core.Options{SourceFormat: translator.FromString("codex"), Metadata: map[string]any{core.ExecutionSessionMetadataKey: session}}
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
-	done := make(chan error, 1)
+	type probeResult struct {
+		err       error
+		hadStream bool
+	}
+	done := make(chan probeResult, 1)
 	go func() {
 		stream, err := ws.ExecuteStream(ctx, credential, core.Request{Model: "gpt-5.4", Payload: []byte(`{"input":[]}`)}, opts)
 		if stream != nil {
@@ -331,7 +335,7 @@ func TestCodexBootstrapWebsocketCancellationReleasesProbeState(t *testing.T) {
 				}
 			}
 		}
-		done <- err
+		done <- probeResult{err: err, hadStream: stream != nil}
 	}()
 	select {
 	case <-started:
@@ -340,9 +344,14 @@ func TestCodexBootstrapWebsocketCancellationReleasesProbeState(t *testing.T) {
 	}
 	cancel()
 	select {
-	case err := <-done:
-		if !errors.Is(err, context.Canceled) {
+	case result := <-done:
+		// A canceled producer may close its stream without delivering an error
+		// chunk. The caller's canceled context remains authoritative in that case.
+		if result.err != nil && !errors.Is(result.err, context.Canceled) {
 			t.Fatal("bootstrap replaced cancellation")
+		}
+		if result.err == nil && (!result.hadStream || ctx.Err() != context.Canceled) {
+			t.Fatal("bootstrap did not report cancellation or close a canceled stream")
 		}
 	case <-time.After(time.Second):
 		t.Fatal("cancel left bootstrap blocked")
