@@ -48,7 +48,7 @@ func ConvertOpenAIResponsesRequestToGemini(modelName string, inputRawJSON []byte
 				itemType = "message"
 			}
 
-			if itemType == "function_call" {
+			if itemType == "function_call" || itemType == "custom_tool_call" {
 				var calls []gjson.Result
 				var outputs []gjson.Result
 
@@ -59,7 +59,7 @@ func ConvertOpenAIResponsesRequestToGemini(modelName string, inputRawJSON []byte
 					if nextType == "" && nextRole != "" {
 						nextType = "message"
 					}
-					if nextType != "function_call" {
+					if nextType != "function_call" && nextType != "custom_tool_call" {
 						break
 					}
 					calls = append(calls, next)
@@ -73,7 +73,7 @@ func ConvertOpenAIResponsesRequestToGemini(modelName string, inputRawJSON []byte
 					if nextType == "" && nextRole != "" {
 						nextType = "message"
 					}
-					if nextType != "function_call_output" {
+					if nextType != "function_call_output" && nextType != "custom_tool_call_output" {
 						break
 					}
 					outputs = append(outputs, next)
@@ -294,7 +294,7 @@ func ConvertOpenAIResponsesRequestToGemini(modelName string, inputRawJSON []byte
 					out, _ = sjson.SetRawBytes(out, "contents.-1", one)
 				}
 
-			case "function_call":
+			case "function_call", "custom_tool_call":
 				// Handle function calls - convert to model message with functionCall
 				name := util.SanitizeFunctionName(translatorcommon.QualifyResponsesToolName(strings.TrimSpace(item.Get("namespace").String()), strings.TrimSpace(item.Get("name").String())))
 				arguments := item.Get("arguments").String()
@@ -306,7 +306,9 @@ func ConvertOpenAIResponsesRequestToGemini(modelName string, inputRawJSON []byte
 				functionCall, _ = sjson.SetBytes(functionCall, "functionCall.id", item.Get("call_id").String())
 
 				// Parse arguments JSON string and set as args object
-				if arguments != "" {
+				if item.Get("type").String() == "custom_tool_call" {
+					functionCall, _ = sjson.SetBytes(functionCall, "functionCall.args.input", item.Get("input").String())
+				} else if arguments != "" {
 					argsResult := gjson.Parse(arguments)
 					functionCall, _ = sjson.SetRawBytes(functionCall, "functionCall.args", []byte(argsResult.Raw))
 				}
@@ -314,7 +316,7 @@ func ConvertOpenAIResponsesRequestToGemini(modelName string, inputRawJSON []byte
 				modelContent, _ = sjson.SetRawBytes(modelContent, "parts.-1", functionCall)
 				out, _ = sjson.SetRawBytes(out, "contents.-1", modelContent)
 
-			case "function_call_output":
+			case "function_call_output", "custom_tool_call_output":
 				// Handle function call outputs - convert to function message with functionResponse
 				callID := item.Get("call_id").String()
 				outputValue := item.Get("output")
@@ -331,7 +333,8 @@ func ConvertOpenAIResponsesRequestToGemini(modelName string, inputRawJSON []byte
 				// We need to look back through the input array to find the matching call
 				if inputArray := root.Get("input"); inputArray.Exists() && inputArray.IsArray() {
 					inputArray.ForEach(func(_, prevItem gjson.Result) bool {
-						if prevItem.Get("type").String() == "function_call" && prevItem.Get("call_id").String() == callID {
+						kind := prevItem.Get("type").String()
+						if (kind == "function_call" || kind == "custom_tool_call") && prevItem.Get("call_id").String() == callID {
 							functionName = translatorcommon.QualifyResponsesToolName(strings.TrimSpace(prevItem.Get("namespace").String()), strings.TrimSpace(prevItem.Get("name").String()))
 							return false // Stop iteration
 						}
@@ -398,7 +401,7 @@ func ConvertOpenAIResponsesRequestToGemini(modelName string, inputRawJSON []byte
 
 		for _, declaration := range tools {
 			tool := declaration.Tool
-			if tool.Get("type").String() == "function" {
+			if kind := tool.Get("type").String(); kind == "function" || kind == "custom" {
 				funcDecl := []byte(`{"name":"","description":"","parametersJsonSchema":{}}`)
 
 				if name := tool.Get("name"); name.Exists() {
@@ -407,7 +410,9 @@ func ConvertOpenAIResponsesRequestToGemini(modelName string, inputRawJSON []byte
 				if desc := tool.Get("description"); desc.Exists() {
 					funcDecl, _ = sjson.SetBytes(funcDecl, "description", desc.String())
 				}
-				if params := tool.Get("parameters"); params.Exists() {
+				if kind == "custom" {
+					funcDecl, _ = sjson.SetRawBytes(funcDecl, "parametersJsonSchema", []byte(`{"type":"object","properties":{"input":{"type":"string"}},"required":["input"]}`))
+				} else if params := tool.Get("parameters"); params.Exists() {
 					funcDecl, _ = sjson.SetRawBytes(funcDecl, "parametersJsonSchema", []byte(params.Raw))
 				}
 
@@ -430,7 +435,7 @@ func ConvertOpenAIResponsesRequestToGemini(modelName string, inputRawJSON []byte
 		case "required":
 			out, _ = sjson.SetBytes(out, "toolConfig.functionCallingConfig.mode", "ANY")
 		default:
-			if choice.Get("type").String() == "function" {
+			if kind := choice.Get("type").String(); kind == "function" || kind == "custom" {
 				name := choice.Get("name").String()
 				if name == "" {
 					name = choice.Get("function.name").String()
