@@ -57,6 +57,12 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 	if err != nil {
 		return
 	}
+	readCtx, stopReading := context.WithCancelCause(c.Request.Context())
+	c.Request = c.Request.WithContext(readCtx)
+	stopCloseOnCancel := context.AfterFunc(readCtx, func() { _ = conn.Close() })
+	defer stopCloseOnCancel()
+	incoming, readerDone := readResponsesWebsocketRequests(readCtx, stopReading, conn)
+	defer func() { stopReading(context.Canceled); _ = conn.Close(); <-readerDone }()
 	passthroughSessionID := uuid.NewString()
 	downstreamSessionKey := websocketToolPairScopeKey(c, websocketDownstreamSessionKey(c.Request))
 	toolPairState := acquireResponsesWebsocketToolPairState(downstreamSessionKey)
@@ -114,8 +120,12 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 	lastAttemptedAuthID := ""
 
 	for {
-		msgType, payload, errReadMessage := conn.ReadMessage()
-		if errReadMessage != nil {
+		var message responsesWebsocketRequestMessage
+		select {
+		case <-readCtx.Done():
+		case message = <-incoming:
+		}
+		if errReadMessage := context.Cause(readCtx); errReadMessage != nil {
 			wsTerminateErr = errReadMessage
 			if websocket.IsCloseError(errReadMessage, websocket.CloseNormalClosure, websocket.CloseGoingAway, websocket.CloseNoStatusReceived) {
 				log.Infof("responses websocket: client disconnected id=%s error=%v", executorhelps.CodexWebsocketSessionLogID(passthroughSessionID), executorhelps.CodexWebsocketLogError(errReadMessage, util.PromptCacheLogForGin(c)))
@@ -124,6 +134,7 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 			}
 			return
 		}
+		msgType, payload := message.kind, message.payload
 		if msgType != websocket.TextMessage && msgType != websocket.BinaryMessage {
 			continue
 		}
