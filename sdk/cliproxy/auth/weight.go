@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"context"
 	"fmt"
 	"reflect"
 	"strconv"
@@ -85,6 +86,25 @@ func authWeight(auth *Auth) int64 {
 		return weight
 	}
 	return credentialweight.Default
+}
+
+func (m *Manager) weightedEligibleAuths(auths []*Auth, contexts ...context.Context) []*Auth {
+	var eligible []*Auth
+	for index, candidate := range auths {
+		excluded := candidate != nil && m.routingStrategyForPriority(authPriority(candidate), contexts...) == schedulerStrategyWeightedRoundRobin && authWeight(candidate) <= 0
+		if excluded {
+			if eligible == nil {
+				eligible = make([]*Auth, 0, len(auths))
+				eligible = append(eligible, auths[:index]...)
+			}
+		} else if eligible != nil {
+			eligible = append(eligible, candidate)
+		}
+	}
+	if eligible == nil {
+		return auths
+	}
+	return eligible
 }
 
 // ApplyAuthWeightMetadata imports a validated file weight into scheduling

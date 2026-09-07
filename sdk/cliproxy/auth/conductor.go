@@ -818,7 +818,7 @@ func (m *Manager) RoutingDiagnostics(provider, model string, now time.Time) Rout
 
 func isBuiltInSelector(selector Selector) bool {
 	switch selector.(type) {
-	case *RoundRobinSelector, *FillFirstSelector, *RandomSelector:
+	case *RoundRobinSelector, *FillFirstSelector, *RandomSelector, *WeightedRoundRobinSelector:
 		return true
 	default:
 		return false
@@ -1577,18 +1577,21 @@ func finishForceMappedStreamChunks(rewriter *StreamRewriter) []byte {
 }
 
 func (m *Manager) availableAuthsForRouteModel(auths []*Auth, provider, routeModel string, opts cliproxyexecutor.Options, now time.Time) ([]*Auth, error) {
+	auths = m.weightedEligibleAuths(auths)
 	return selectAvailableAuthsForAttempt(auths, provider, routeModel, now, selectionAttemptFromMetadata(opts.Metadata), func(auth *Auth) string {
 		return m.selectionModelForAuth(auth, routeModel)
 	})
 }
 
 func (m *Manager) availableAuthsForRouteModelFiltered(auths []*Auth, provider, routeModel string, opts cliproxyexecutor.Options, now time.Time, pickAllowed func(*Auth) bool) ([]*Auth, error) {
+	auths = m.weightedEligibleAuths(auths)
 	return selectAvailableAuthsForAttemptFiltered(auths, provider, routeModel, now, selectionAttemptFromMetadata(opts.Metadata), func(auth *Auth) string {
 		return m.selectionModelForAuth(auth, routeModel)
 	}, pickAllowed)
 }
 
 func (m *Manager) availableAuthsForRouteModelFilteredForContext(ctx context.Context, auths []*Auth, provider, routeModel string, opts cliproxyexecutor.Options, now time.Time, pickAllowed func(*Auth) bool) ([]*Auth, error) {
+	auths = m.weightedEligibleAuths(auths, ctx)
 	if shouldPreferCodexWebsocket(ctx, provider) {
 		websocketAuths := make([]*Auth, 0, len(auths))
 		hasReadyWebsocket := false
@@ -1609,7 +1612,9 @@ func (m *Manager) availableAuthsForRouteModelFilteredForContext(ctx context.Cont
 			}, pickAllowed)
 		}
 	}
-	return m.availableAuthsForRouteModelFiltered(auths, provider, routeModel, opts, now, pickAllowed)
+	return selectAvailableAuthsForAttemptFiltered(auths, provider, routeModel, now, selectionAttemptFromMetadata(opts.Metadata), func(auth *Auth) string {
+		return m.selectionModelForAuth(auth, routeModel)
+	}, pickAllowed)
 }
 
 func selectionArgForSelector(selector Selector, routeModel string) string {
@@ -1619,7 +1624,11 @@ func selectionArgForSelector(selector Selector, routeModel string) string {
 	return routeModel
 }
 
-func (m *Manager) routingStrategyOverrideForPriority(priority int) (schedulerStrategy, bool) {
+func (m *Manager) routingStrategyOverrideForPriority(priority int, contexts ...context.Context) (schedulerStrategy, bool) {
+	if p := m.selectionPolicy(contexts...); p != nil {
+		strategy, ok := p.strategies[priority]
+		return strategy, ok
+	}
 	if m == nil {
 		return schedulerStrategyRoundRobin, false
 	}
@@ -1654,7 +1663,10 @@ func (m *Manager) routingFillFirstRangeOverrideForPriority(priority int) (int, b
 	return 1, false
 }
 
-func (m *Manager) routingFillFirstRangeForPriority(priority int) int {
+func (m *Manager) routingFillFirstRangeForPriority(priority int, contexts ...context.Context) int {
+	if p := m.selectionPolicy(contexts...); p != nil {
+		return p.rangeForPriority(priority)
+	}
 	if m == nil {
 		return 1
 	}
@@ -1685,7 +1697,10 @@ func (m *Manager) routingFillFirstPerAuthRPMOverrideForPriority(priority int) (i
 	return 0, false
 }
 
-func (m *Manager) routingFillFirstPerAuthRPMForPriority(priority int) int {
+func (m *Manager) routingFillFirstPerAuthRPMForPriority(priority int, contexts ...context.Context) int {
+	if p := m.selectionPolicy(contexts...); p != nil {
+		return p.rpmForPriority(priority)
+	}
 	if m == nil {
 		return 0
 	}
@@ -1817,22 +1832,22 @@ func (m *Manager) preferEarlierRoundAvailabilityError(selectionErr error, roundS
 	return earlierAvailabilityBlocker(selectionErr, roundState.lastErr)
 }
 
-func (m *Manager) routingStrategyForPriority(priority int) schedulerStrategy {
-	if strategy, ok := m.routingStrategyOverrideForPriority(priority); ok {
+func (m *Manager) routingStrategyForPriority(priority int, contexts ...context.Context) schedulerStrategy {
+	if strategy, ok := m.routingStrategyOverrideForPriority(priority, contexts...); ok {
 		return strategy
 	}
 	if m == nil {
 		return schedulerStrategyRoundRobin
 	}
-	return selectorStrategy(m.selector)
+	return selectorStrategy(m.selectorForContext(contexts...))
 }
 
-func (m *Manager) legacyPrioritySelector(priority int, strategy schedulerStrategy, fillFirstRange int) Selector {
+func (m *Manager) legacyPrioritySelector(priority int, strategy schedulerStrategy, fillFirstRange int, contexts ...context.Context) Selector {
 	if m == nil {
 		return &RoundRobinSelector{}
 	}
 	fillFirstRange = normalizeFillFirstRangeValue(fillFirstRange)
-	base := baseSelector(m.selector)
+	base := baseSelector(m.selectorForContext(contexts...))
 	if selectorStrategy(base) == strategy && (strategy != schedulerStrategyFillFirst || fillFirstRangeFromSelector(base) == fillFirstRange) {
 		return base
 	}
@@ -1848,6 +1863,8 @@ func (m *Manager) legacyPrioritySelector(priority int, strategy schedulerStrateg
 		selector = &FillFirstSelector{Range: fillFirstRange}
 	case schedulerStrategyRandom:
 		selector = &RandomSelector{}
+	case schedulerStrategyWeightedRoundRobin:
+		selector = &WeightedRoundRobinSelector{}
 	default:
 		selector = &RoundRobinSelector{}
 	}
@@ -1858,23 +1875,23 @@ func (m *Manager) legacyPrioritySelector(priority int, strategy schedulerStrateg
 	return selector
 }
 
-func (m *Manager) prioritySelectorForAvailable(available []*Auth) (Selector, bool) {
+func (m *Manager) prioritySelectorForAvailable(available []*Auth, contexts ...context.Context) (Selector, bool) {
 	if len(available) == 0 {
 		return nil, false
 	}
 	priority := authPriority(available[0])
-	strategy, ok := m.routingStrategyOverrideForPriority(priority)
-	fillFirstRange := m.routingFillFirstRangeForPriority(priority)
-	fillFirstPerAuthRPM := m.routingFillFirstPerAuthRPMForPriority(priority)
+	strategy, ok := m.routingStrategyOverrideForPriority(priority, contexts...)
+	fillFirstRange := m.routingFillFirstRangeForPriority(priority, contexts...)
+	fillFirstPerAuthRPM := m.routingFillFirstPerAuthRPMForPriority(priority, contexts...)
 	if !ok {
-		strategy = selectorStrategy(m.selector)
+		strategy = selectorStrategy(m.selectorForContext(contexts...))
 		if strategy != schedulerStrategyFillFirst || (fillFirstRange <= 1 && fillFirstPerAuthRPM <= 0) {
 			return nil, false
 		}
 		if fillFirstPerAuthRPM > 0 {
 			return nil, false
 		}
-		return m.legacyPrioritySelector(priority, strategy, fillFirstRange), true
+		return m.legacyPrioritySelector(priority, strategy, fillFirstRange, contexts...), true
 	}
 	if strategy != schedulerStrategyFillFirst {
 		fillFirstRange = 1
@@ -1883,7 +1900,7 @@ func (m *Manager) prioritySelectorForAvailable(available []*Auth) (Selector, boo
 	if fillFirstPerAuthRPM > 0 {
 		return nil, false
 	}
-	return m.legacyPrioritySelector(priority, strategy, fillFirstRange), true
+	return m.legacyPrioritySelector(priority, strategy, fillFirstRange, contexts...), true
 }
 
 func (m *Manager) pickLegacyFillFirstRangeAuth(ctx context.Context, provider, routeModel string, opts cliproxyexecutor.Options, candidates []*Auth, pickAllowed func(*Auth) bool) (*Auth, bool, error) {
@@ -1898,8 +1915,8 @@ func (m *Manager) pickLegacyFillFirstRangeAuthWithDeferredBinding(ctx context.Co
 	if len(candidates) == 0 || m == nil {
 		return nil, false, nil, nil
 	}
-	sessionSelector, hasSessionSelector := m.selector.(*SessionAffinitySelector)
-	if !isBuiltInSelector(m.selector) && !hasSessionSelector {
+	sessionSelector, hasSessionSelector := m.selectorForContext(ctx).(*SessionAffinitySelector)
+	if !isBuiltInSelector(m.selectorForContext(ctx)) && !hasSessionSelector {
 		return nil, false, nil, nil
 	}
 	available, errAvailable := m.availableAuthsForRouteModelFilteredForContext(ctx, candidates, provider, routeModel, opts, time.Now(), pickAllowed)
@@ -1910,26 +1927,26 @@ func (m *Manager) pickLegacyFillFirstRangeAuthWithDeferredBinding(ctx context.Co
 		return nil, true, nil, &Error{Code: "auth_not_found", Message: "no auth available"}
 	}
 	priority := authPriority(available[0])
-	strategy := m.routingStrategyForPriority(priority)
+	strategy := m.routingStrategyForPriority(priority, ctx)
 	if strategy != schedulerStrategyFillFirst {
 		return nil, false, nil, nil
 	}
-	fillFirstRange := m.routingFillFirstRangeForPriority(priority)
-	fillFirstPerAuthRPM := m.routingFillFirstPerAuthRPMForPriority(priority)
+	fillFirstRange := m.routingFillFirstRangeForPriority(priority, ctx)
+	fillFirstPerAuthRPM := m.routingFillFirstPerAuthRPMForPriority(priority, ctx)
 	if fillFirstRange <= 1 && fillFirstPerAuthRPM <= 0 {
 		return nil, false, nil, nil
 	}
 	fillFirstRangeForPriority := func(priority int) int {
-		if m.routingStrategyForPriority(priority) != schedulerStrategyFillFirst {
+		if m.routingStrategyForPriority(priority, ctx) != schedulerStrategyFillFirst {
 			return 1
 		}
-		return m.routingFillFirstRangeForPriority(priority)
+		return m.routingFillFirstRangeForPriority(priority, ctx)
 	}
 	fillFirstPerAuthRPMForPriority := func(priority int) int {
-		if m.routingStrategyForPriority(priority) != schedulerStrategyFillFirst {
+		if m.routingStrategyForPriority(priority, ctx) != schedulerStrategyFillFirst {
 			return 0
 		}
-		return m.routingFillFirstPerAuthRPMForPriority(priority)
+		return m.routingFillFirstPerAuthRPMForPriority(priority, ctx)
 	}
 	pickFallback := func() (*Auth, error) {
 		return selectFillFirstAuthsForContextWithPolicy(ctx, candidates, provider, routeModel, time.Now(), selectionAttemptFromMetadata(opts.Metadata), fillFirstRangeForPriority, fillFirstPerAuthRPMForPriority, m.fillFirstLimiter(), func(auth *Auth) bool {
@@ -1958,29 +1975,41 @@ func (m *Manager) pickLegacyFillFirstRangeAuthWithDeferredBinding(ctx context.Co
 	return selected, true, nil, errPick
 }
 
-func (m *Manager) pickAvailableAuthWithPriorityPolicy(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, available []*Auth) (*Auth, error) {
+func (m *Manager) pickAvailableAuthWithPriorityPolicy(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, available []*Auth, acceptors ...func(*Auth) bool) (*Auth, error) {
 	if len(available) == 0 {
 		return nil, &Error{Code: "auth_not_found", Message: "no auth available"}
 	}
 	if m == nil {
 		return nil, &Error{Code: "auth_not_found", Message: "no auth available"}
 	}
-	if selector, ok := m.selector.(*SessionAffinitySelector); ok && selector != nil {
-		if fallback, hasOverride := m.prioritySelectorForAvailable(available); hasOverride {
-			selected, _, err := selector.pickWithFallbackDeferredBinding(ctx, provider, model, opts, available, fallback)
-			return selected, err
+	var accept func(*Auth) bool
+	if len(acceptors) > 0 {
+		accept = acceptors[0]
+	}
+	pick := func(selector Selector) (*Auth, error) {
+		if weighted, ok := selector.(*WeightedRoundRobinSelector); ok {
+			return weighted.pickAccepted(ctx, provider, model, opts, available, accept)
 		}
-		selected, _, err := selector.pickWithFallbackDeferredBinding(ctx, provider, model, opts, available, selector.fallback)
+		return selector.Pick(ctx, provider, model, opts, available)
+	}
+	if selector, ok := m.selectorForContext(ctx).(*SessionAffinitySelector); ok && selector != nil {
+		fallback, hasOverride := m.prioritySelectorForAvailable(available, ctx)
+		if !hasOverride {
+			fallback = selector.fallback
+		}
+		selected, _, err := selector.pickWithPreparedFallbackDeferredBinding(ctx, provider, model, opts, available, func() (*Auth, error) {
+			return pick(fallback)
+		})
 		return selected, err
 	}
-	if !isBuiltInSelector(m.selector) {
-		return m.selector.Pick(ctx, provider, model, opts, available)
+	if !isBuiltInSelector(m.selectorForContext(ctx)) {
+		return pick(m.selectorForContext(ctx))
 	}
-	selector, hasOverride := m.prioritySelectorForAvailable(available)
+	selector, hasOverride := m.prioritySelectorForAvailable(available, ctx)
 	if !hasOverride {
-		return m.selector.Pick(ctx, provider, model, opts, available)
+		selector = m.selectorForContext(ctx)
 	}
-	return selector.Pick(ctx, provider, model, opts, available)
+	return pick(selector)
 }
 
 func authFromListByID(auths []*Auth, authID string) *Auth {
@@ -3386,7 +3415,7 @@ func (m *Manager) invalidateSessionAffinity(id string) {
 		return
 	}
 	m.mu.RLock()
-	selector, ok := m.selector.(sessionAffinityInvalidator)
+	selector, ok := m.selectorForContext().(sessionAffinityInvalidator)
 	m.mu.RUnlock()
 	if ok && selector != nil {
 		selector.InvalidateAuth(id)
@@ -4343,6 +4372,7 @@ func authFilePathQuarantined(auth *Auth, authDir string) bool {
 // Execute performs a non-streaming execution using the configured selector and executor.
 // It supports multiple providers for the same model and round-robins the starting provider per model.
 func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (response cliproxyexecutor.Response, err error) {
+	ctx = m.WithRoutingPolicySnapshot(ctx)
 	ctx, upstreamErrors := withUpstreamErrorHistory(ctx)
 	var releaseProducer func()
 	ctx, _, releaseProducer, err = m.beginResultPersistenceProducer(ctx)
@@ -4432,6 +4462,7 @@ func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxye
 // ExecuteCount performs a non-streaming execution using the configured selector and executor.
 // It supports multiple providers for the same model and round-robins the starting provider per model.
 func (m *Manager) ExecuteCount(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (response cliproxyexecutor.Response, err error) {
+	ctx = m.WithRoutingPolicySnapshot(ctx)
 	ctx, upstreamErrors := withUpstreamErrorHistory(ctx)
 	var releaseProducer func()
 	ctx, _, releaseProducer, err = m.beginResultPersistenceProducer(ctx)
@@ -4514,6 +4545,7 @@ func (m *Manager) ExecuteCount(ctx context.Context, providers []string, req clip
 // ExecuteStream performs a streaming execution using the configured selector and executor.
 // It supports multiple providers for the same model and round-robins the starting provider per model.
 func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (result *cliproxyexecutor.StreamResult, err error) {
+	ctx = m.WithRoutingPolicySnapshot(ctx)
 	ctx, upstreamErrors := withUpstreamErrorHistory(ctx)
 	var producer *resultPersistenceProducer
 	var releaseProducer func()
@@ -6295,7 +6327,7 @@ func (m *Manager) bindSessionAffinity(ctx context.Context, providers []string, r
 		m.mu.RUnlock()
 		return
 	}
-	selector := m.selector
+	selector := m.selectorForContext(ctx)
 	binder, ok := selector.(sessionAffinityBinder)
 	m.mu.RUnlock()
 	if !ok || binder == nil {
@@ -6497,14 +6529,18 @@ func (m *Manager) pickAntigravityCreditsAtPriority(ctx context.Context, opts cli
 		return nil, nil
 	}
 	opts = setSelectionAttemptMetadata(opts, 0)
-	strategy := m.routingStrategyForPriority(priority)
+	strategy := m.routingStrategyForPriority(priority, ctx)
 	requestLimiter := m.authRequestLimiter()
 	requestBlocked := authRequestLimitBlock{}
 	dynamicallyLimited := make(map[string]struct{})
 	for {
 		now := requestLimiter.nowTime()
+		reservation := weightedRequestReservation{manager: m, options: opts, now: now, blocked: &requestBlocked, rejected: dynamicallyLimited}
 		combinedAllowed := func(auth *Auth) bool {
 			if auth == nil || (pickAllowed != nil && !pickAllowed(auth)) {
+				return false
+			}
+			if strategy == schedulerStrategyWeightedRoundRobin && authWeight(auth) <= 0 {
 				return false
 			}
 			if _, limited := dynamicallyLimited[auth.ID]; limited {
@@ -6520,8 +6556,8 @@ func (m *Manager) pickAntigravityCreditsAtPriority(ctx context.Context, opts cli
 		var selected *Auth
 		var errPick error
 		if strategy == schedulerStrategyFillFirst {
-			fillFirstRange := m.routingFillFirstRangeForPriority(priority)
-			fillFirstRPM := m.routingFillFirstPerAuthRPMForPriority(priority)
+			fillFirstRange := m.routingFillFirstRangeForPriority(priority, ctx)
+			fillFirstRPM := m.routingFillFirstPerAuthRPMForPriority(priority, ctx)
 			selected, errPick = selectFillFirstAuthsForContextWithPolicy(ctx, auths, "antigravity", "", now, 0, func(int) int {
 				return fillFirstRange
 			}, func(int) int {
@@ -6539,14 +6575,18 @@ func (m *Manager) pickAntigravityCreditsAtPriority(ctx context.Context, opts cli
 			if len(filtered) == 0 {
 				return nil, preferAuthRequestLimitError(nil, requestBlocked)
 			}
-			selector := baseSelector(m.selector)
+			selector := baseSelector(m.selectorForContext(ctx))
 			if strategy != schedulerStrategyCustom {
-				selector = m.legacyPrioritySelector(priority, strategy, m.routingFillFirstRangeForPriority(priority))
+				selector = m.legacyPrioritySelector(priority, strategy, m.routingFillFirstRangeForPriority(priority, ctx), ctx)
 			}
 			if selector == nil {
 				selector = &RoundRobinSelector{}
 			}
-			selected, errPick = selector.Pick(ctx, "antigravity", "", opts, filtered)
+			if weighted, ok := selector.(*WeightedRoundRobinSelector); ok {
+				selected, errPick = weighted.pickAccepted(ctx, "antigravity", "", opts, filtered, reservation.acquire)
+			} else {
+				selected, errPick = selector.Pick(ctx, "antigravity", "", opts, filtered)
+			}
 			if errPick == nil && selected != nil {
 				selected = authFromListByID(filtered, selected.ID)
 				if selected == nil {
@@ -6554,22 +6594,23 @@ func (m *Manager) pickAntigravityCreditsAtPriority(ctx context.Context, opts cli
 				}
 			}
 		}
+		if reservation.stalePolicy {
+			requestBlocked = authRequestLimitBlock{}
+			clear(dynamicallyLimited)
+			continue
+		}
 		if errPick != nil {
 			return nil, preferAuthRequestLimitError(errPick, requestBlocked)
 		}
 		if selected == nil {
 			return nil, preferAuthRequestLimitError(nil, requestBlocked)
 		}
-		requestPolicy := m.routingAuthRequestLimitPolicyForAuth(selected)
-		requestPolicy.requestSlot = opts.AuthRequestSlot
-		if acquired, block := requestLimiter.tryAcquireAt(selected.ID, requestPolicy, now); !acquired {
-			if block.stalePolicy {
+		if !reservation.acquire(selected) {
+			if reservation.stalePolicy {
 				requestBlocked = authRequestLimitBlock{}
 				clear(dynamicallyLimited)
 				continue
 			}
-			requestBlocked = earlierAuthRequestLimitBlock(requestBlocked, block)
-			dynamicallyLimited[selected.ID] = struct{}{}
 			continue
 		}
 		return entryByID[selected.ID], nil
@@ -9357,11 +9398,11 @@ func (m *Manager) CloseExecutionSession(sessionID string) {
 	}
 }
 
-func (m *Manager) useSchedulerFastPath() bool {
+func (m *Manager) useSchedulerFastPath(contexts ...context.Context) bool {
 	if m == nil || m.scheduler == nil {
 		return false
 	}
-	return isBuiltInSelector(m.selector)
+	return isBuiltInSelector(m.selectorForContext(contexts...))
 }
 
 func shouldRetrySchedulerPick(err error) bool {
@@ -9461,6 +9502,7 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 		}
 		candidates = filtered
 	}
+	candidates = m.weightedEligibleAuths(candidates, ctx)
 	if len(candidates) == 0 {
 		return nil, nil, &Error{Code: "auth_not_found", Message: "no auth available"}
 	}
@@ -9468,8 +9510,8 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 	requestBlocked := authRequestLimitBlock{}
 	dynamicallyLimited := make(map[string]struct{})
 	strictBoundAuthID := ""
-	if sessionSelector, ok := m.selector.(*SessionAffinitySelector); ok && sessionSelector != nil && !sessionSelector.failover {
-		strictBoundAuthID = sessionSelector.cachedAuthID(provider, selectionArgForSelector(m.selector, model), opts)
+	if sessionSelector, ok := m.selectorForContext(ctx).(*SessionAffinitySelector); ok && sessionSelector != nil && !sessionSelector.failover {
+		strictBoundAuthID = sessionSelector.cachedAuthID(provider, selectionArgForSelector(m.selectorForContext(ctx), model), opts)
 		for _, candidate := range candidates {
 			if candidate == nil || candidate.ID != strictBoundAuthID {
 				continue
@@ -9487,6 +9529,7 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 	}
 	for {
 		now := requestLimiter.nowTime()
+		reservation := weightedRequestReservation{manager: m, options: opts, now: now, blocked: &requestBlocked, rejected: dynamicallyLimited}
 		pickAllowed := func(auth *Auth) bool {
 			if auth == nil {
 				return false
@@ -9525,7 +9568,12 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 				return nil, nil, preferAuthRequestLimitError(errAvailable, requestBlocked)
 			}
 			var errPick error
-			selected, errPick = m.pickAvailableAuthWithPriorityPolicy(ctx, provider, selectionArgForSelector(m.selector, model), opts, available)
+			selected, errPick = m.pickAvailableAuthWithPriorityPolicy(ctx, provider, selectionArgForSelector(m.selectorForContext(ctx), model), opts, available, reservation.acquire)
+			if reservation.stalePolicy {
+				requestBlocked = authRequestLimitBlock{}
+				clear(dynamicallyLimited)
+				continue
+			}
 			if errPick != nil {
 				return nil, nil, preferAuthRequestLimitError(errPick, requestBlocked)
 			}
@@ -9539,16 +9587,12 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 		if selected == nil {
 			return nil, nil, preferAuthRequestLimitError(&Error{Code: "auth_not_found", Message: "selector returned no auth"}, requestBlocked)
 		}
-		policy := m.routingAuthRequestLimitPolicyForAuth(selected)
-		policy.requestSlot = opts.AuthRequestSlot
-		if acquired, block := requestLimiter.tryAcquireAt(selected.ID, policy, now); !acquired {
-			if block.stalePolicy {
+		if !reservation.acquire(selected) {
+			if reservation.stalePolicy {
 				requestBlocked = authRequestLimitBlock{}
 				clear(dynamicallyLimited)
 				continue
 			}
-			requestBlocked = earlierAuthRequestLimitBlock(requestBlocked, block)
-			dynamicallyLimited[selected.ID] = struct{}{}
 			continue
 		}
 		authCopy := selected.Clone()
@@ -9568,7 +9612,7 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 
 func (m *Manager) pickNext(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, ProviderExecutor, error) {
 	m.triggerDueChatGPTWebImageQuotaRefreshes([]string{provider}, model, opts, tried, nil, false)
-	if !m.useSchedulerFastPath() {
+	if !m.useSchedulerFastPath(ctx) {
 		auth, executor, errPick := m.pickNextLegacy(ctx, provider, model, opts, tried)
 		if errPick != nil {
 			errPick = m.preferChatGPTWebImageQuotaError(errPick, []string{provider}, model, opts, tried, nil)
@@ -9670,6 +9714,7 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 		}
 		candidates = filtered
 	}
+	candidates = m.weightedEligibleAuths(candidates, ctx)
 	if len(candidates) == 0 {
 		return nil, nil, "", &Error{Code: "auth_not_found", Message: "no auth available"}
 	}
@@ -9683,8 +9728,8 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 	requestBlocked := authRequestLimitBlock{}
 	dynamicallyLimited := make(map[string]struct{})
 	strictBoundAuthID := ""
-	if sessionSelector, ok := m.selector.(*SessionAffinitySelector); ok && sessionSelector != nil && !sessionSelector.failover {
-		strictBoundAuthID = sessionSelector.cachedAuthID(selectorProvider, selectionArgForSelector(m.selector, model), opts)
+	if sessionSelector, ok := m.selectorForContext(ctx).(*SessionAffinitySelector); ok && sessionSelector != nil && !sessionSelector.failover {
+		strictBoundAuthID = sessionSelector.cachedAuthID(selectorProvider, selectionArgForSelector(m.selectorForContext(ctx), model), opts)
 		for _, candidate := range candidates {
 			if candidate == nil || candidate.ID != strictBoundAuthID {
 				continue
@@ -9702,6 +9747,7 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 	}
 	for {
 		now := requestLimiter.nowTime()
+		reservation := weightedRequestReservation{manager: m, options: opts, now: now, blocked: &requestBlocked, rejected: dynamicallyLimited}
 		pickAllowedForSelection := func(auth *Auth) bool {
 			if auth == nil {
 				return false
@@ -9743,7 +9789,12 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 				return nil, nil, "", preferAuthRequestLimitError(errAvailable, requestBlocked)
 			}
 			var errPick error
-			selected, errPick = m.pickAvailableAuthWithPriorityPolicy(ctx, selectorProvider, selectionArgForSelector(m.selector, model), opts, available)
+			selected, errPick = m.pickAvailableAuthWithPriorityPolicy(ctx, selectorProvider, selectionArgForSelector(m.selectorForContext(ctx), model), opts, available, reservation.acquire)
+			if reservation.stalePolicy {
+				requestBlocked = authRequestLimitBlock{}
+				clear(dynamicallyLimited)
+				continue
+			}
 			if errPick != nil {
 				return nil, nil, "", preferAuthRequestLimitError(errPick, requestBlocked)
 			}
@@ -9757,16 +9808,12 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 		if selected == nil {
 			return nil, nil, "", preferAuthRequestLimitError(&Error{Code: "auth_not_found", Message: "selector returned no auth"}, requestBlocked)
 		}
-		policy := m.routingAuthRequestLimitPolicyForAuth(selected)
-		policy.requestSlot = opts.AuthRequestSlot
-		if acquired, block := requestLimiter.tryAcquireAt(selected.ID, policy, now); !acquired {
-			if block.stalePolicy {
+		if !reservation.acquire(selected) {
+			if reservation.stalePolicy {
 				requestBlocked = authRequestLimitBlock{}
 				clear(dynamicallyLimited)
 				continue
 			}
-			requestBlocked = earlierAuthRequestLimitBlock(requestBlocked, block)
-			dynamicallyLimited[selected.ID] = struct{}{}
 			continue
 		}
 		providerKey := strings.TrimSpace(strings.ToLower(selected.Provider))
@@ -9795,7 +9842,7 @@ func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model s
 		allowed = pickAllowed[0]
 	}
 	m.triggerDueChatGPTWebImageQuotaRefreshes(providers, model, opts, tried, allowed, false)
-	if !m.useSchedulerFastPath() {
+	if !m.useSchedulerFastPath(ctx) {
 		auth, executor, provider, errPick := m.pickNextMixedLegacy(ctx, providers, model, opts, tried, allowed)
 		if errPick != nil {
 			errPick = m.preferChatGPTWebImageQuotaError(errPick, providers, model, opts, tried, allowed)

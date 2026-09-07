@@ -794,6 +794,11 @@ func (s *authScheduler) pickSingle(ctx context.Context, provider, model string, 
 	strategyForPriority := s.strategyForPriorityLocked
 	fillFirstRangeForPriority := s.fillFirstRangeForPriorityLocked
 	fillFirstPerAuthRPMForPriority := s.fillFirstPerAuthRPMForPriorityLocked
+	if policy := routingPolicyFromContext(ctx); policy != nil && policy.manager.scheduler == s {
+		strategyForPriority = policy.strategyForPriority
+		fillFirstRangeForPriority = policy.rangeForPriority
+		fillFirstPerAuthRPMForPriority = policy.rpmForPriority
+	}
 	baseRequestLimitForAuth := s.requestLimitPolicyForAuthLocked
 	requestLimitForAuth := func(auth *Auth) authRequestLimitPolicy {
 		policy := baseRequestLimitForAuth(auth)
@@ -885,6 +890,11 @@ func (s *authScheduler) pickMixed(ctx context.Context, providers []string, model
 	}
 	fillFirstRangeForPriority := s.fillFirstRangeForPriorityLocked
 	fillFirstPerAuthRPMForPriority := s.fillFirstPerAuthRPMForPriorityLocked
+	if policy := routingPolicyFromContext(ctx); policy != nil && policy.manager.scheduler == s {
+		strategyForPriority = policy.strategyForPriority
+		fillFirstRangeForPriority = policy.rangeForPriority
+		fillFirstPerAuthRPMForPriority = policy.rpmForPriority
+	}
 	baseRequestLimitForAuth := s.requestLimitPolicyForAuthLocked
 	requestLimitForAuth := func(auth *Auth) authRequestLimitPolicy {
 		policy := baseRequestLimitForAuth(auth)

@@ -1054,6 +1054,9 @@ func (s *SessionAffinitySelector) pickWithFallbackDeferredBinding(ctx context.Co
 	if fallback == nil {
 		fallback = &RoundRobinSelector{}
 	}
+	if _, weighted := fallback.(*WeightedRoundRobinSelector); weighted {
+		auths = positiveWeightAuths(auths)
+	}
 	entry := selectorLogEntry(ctx)
 	primaryID, fallbackID := extractSessionIDs(opts.Headers, opts.OriginalRequest, opts.Metadata)
 	if primaryID == "" {
