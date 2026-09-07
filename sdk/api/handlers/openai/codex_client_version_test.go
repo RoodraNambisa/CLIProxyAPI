@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/gin-gonic/gin"
@@ -142,5 +143,25 @@ func TestCodexClientVersionQueryControlsModelResponse(t *testing.T) {
 		if recorder.Code != http.StatusOK || !foundModel || extended != (version == "0.153.4") {
 			t.Fatalf("client_version=%s was not applied independently of software headers", version)
 		}
+	}
+}
+
+func TestCodexClientAstraCatalogUsesReviewedTemplateAndCapabilities(t *testing.T) {
+	response := CodexClientModelsResponseForClient([]map[string]any{{"id": "gpt-6-astra"}}, "0.153.4")
+	models := response["models"].([]map[string]any)
+	if len(models) != 1 {
+		t.Fatal("Astra model was omitted")
+	}
+	astra := models[0]
+	if astra["minimal_client_version"] != "0.153.0" || astra["use_responses_lite"] != true || astra["tool_mode"] != "code_mode_only" || astra["multi_agent_version"] != "v2" {
+		t.Fatal("Astra protocol capabilities are incorrect")
+	}
+	message := astra["model_messages"].(map[string]any)
+	template := message["instructions_template"].(string)
+	if strings.Contains(template, "functions.send_user_message_async") || !strings.Contains(template, "functions.request_user_input_async") {
+		t.Fatal("Astra still uses the obsolete template paragraph")
+	}
+	if !strings.Contains(message["persistent_instructions"].(string), "functions.send_user_message_async") {
+		t.Fatal("unrelated official instruction fields were globally rewritten")
 	}
 }
