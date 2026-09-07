@@ -33,6 +33,7 @@ import (
 	xaiauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/xai"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/authfileguard"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/credentialweight"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/misc"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	internalstore "github.com/router-for-me/CLIProxyAPI/v6/internal/store"
@@ -579,6 +580,11 @@ func (h *Handler) listAuthFilesFromDisk(c *gin.Context, manager *coreauth.Manage
 				dependencyAuths = append(dependencyAuths, dependencyAuth)
 				dependencyAuthsByName[managedAuthNameKey(diskFile.Name)] = dependencyAuth
 			}
+			if rawWeight := gjson.GetBytes(data, "weight"); rawWeight.Exists() && credentialweight.ValidateMetadataJSON(data) == nil {
+				if weight, errWeight := credentialweight.ParseValue(rawWeight.Value()); errWeight == nil {
+					fileData["weight"] = weight
+				}
+			}
 			if pv := gjson.GetBytes(data, "priority"); pv.Exists() {
 				switch pv.Type {
 				case gjson.Number:
@@ -732,6 +738,9 @@ func (h *Handler) buildAuthFileEntryAtWithRuntime(auth *coreauth.Auth, now time.
 	}
 	if claims := extractCodexIDTokenClaims(auth); claims != nil {
 		entry["id_token"] = claims
+	}
+	if weight, present := configuredAuthFileWeight(auth); present {
+		entry["weight"] = weight
 	}
 	// Expose priority from Attributes (set by synthesizer from JSON "priority" field).
 	// Fall back to Metadata for auths registered via UploadAuthFile (no synthesizer).
@@ -1979,6 +1988,9 @@ func (h *Handler) writeAuthFile(ctx context.Context, name string, data []byte) e
 	if retired {
 		return errGeminiCLIAuthGone
 	}
+	if errWeight := credentialweight.ValidateMetadataJSON(data); errWeight != nil {
+		return fmt.Errorf("%w: %v", errInvalidAuthFileData, errWeight)
+	}
 	data, errParse = h.applyCodexFingerprintUploadDefault(data, metadata)
 	if errParse != nil {
 		return fmt.Errorf("%w: %v", errInvalidAuthFileData, errParse)
@@ -3039,6 +3051,9 @@ func (h *Handler) buildAuthFromFileData(path string, data []byte) (*coreauth.Aut
 	if err := json.Unmarshal(data, &metadata); err != nil {
 		return nil, fmt.Errorf("%w: %v", errInvalidAuthFileData, err)
 	}
+	if errWeight := credentialweight.ValidateMetadataJSON(data); errWeight != nil {
+		return nil, fmt.Errorf("%w: %v", errInvalidAuthFileData, errWeight)
+	}
 	provider, _ := metadata["type"].(string)
 	if provider == "" {
 		provider = "unknown"
@@ -3103,6 +3118,9 @@ func (h *Handler) buildAuthFromFileData(path string, data []byte) (*coreauth.Aut
 		UpdatedAt:     time.Now(),
 	}
 	coreauth.ApplyFileBackedGeminiAPIKey(auth)
+	if errWeight := coreauth.ApplyAuthWeightMetadata(auth, metadata); errWeight != nil {
+		return nil, fmt.Errorf("%w: %v", errInvalidAuthFileData, errWeight)
+	}
 	if hasLastRefresh {
 		auth.LastRefreshedAt = lastRefresh
 	}
