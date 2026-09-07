@@ -457,12 +457,13 @@ type ModelState struct {
 	UpdatedAt time.Time `json:"updated_at"`
 }
 
-// Clone shallow copies the Auth structure, duplicating maps to avoid accidental mutation.
+// Clone shallow copies the Auth structure, duplicating maps and errors to avoid accidental mutation.
 func (a *Auth) Clone() *Auth {
 	if a == nil {
 		return nil
 	}
 	copyAuth := *a
+	copyAuth.LastError = cloneError(a.LastError)
 	if len(a.Attributes) > 0 {
 		copyAuth.Attributes = make(map[string]string, len(a.Attributes))
 		for key, value := range a.Attributes {
