@@ -218,12 +218,14 @@ func (b *Builder) Build() (*Service, error) {
 		strategy := ""
 		sessionAffinity := false
 		sessionAffinityFailover := true
+		sessionAffinityAcrossPriorities := false
 		sessionAffinityTTL := time.Hour
 		if b.cfg != nil {
 			strategy = strings.ToLower(strings.TrimSpace(b.cfg.Routing.Strategy))
 			// Support both legacy ClaudeCodeSessionAffinity and new universal SessionAffinity
 			sessionAffinity = b.cfg.Routing.ClaudeCodeSessionAffinity || b.cfg.Routing.SessionAffinity
 			sessionAffinityFailover = routingSessionAffinityFailoverEnabled(b.cfg)
+			sessionAffinityAcrossPriorities = b.cfg.Routing.SessionAffinityAcrossPriorities
 			if ttlStr := strings.TrimSpace(b.cfg.Routing.SessionAffinityTTL); ttlStr != "" {
 				if parsed, err := time.ParseDuration(ttlStr); err == nil && parsed > 0 {
 					sessionAffinityTTL = parsed
@@ -245,9 +247,10 @@ func (b *Builder) Build() (*Service, error) {
 		// Wrap with session affinity if enabled.
 		if sessionAffinity {
 			selector = coreauth.NewSessionAffinitySelectorWithConfig(coreauth.SessionAffinityConfig{
-				Fallback: selector,
-				TTL:      sessionAffinityTTL,
-				Failover: &sessionAffinityFailover,
+				Fallback:         selector,
+				TTL:              sessionAffinityTTL,
+				Failover:         &sessionAffinityFailover,
+				AcrossPriorities: sessionAffinityAcrossPriorities,
 			})
 		}
 

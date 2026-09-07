@@ -4933,9 +4933,10 @@ func (s *Service) applyRuntimeConfigState(ctx context.Context, previousCfg, next
 			}
 			failover := routingSessionAffinityFailoverEnabled(nextCfg)
 			selector = coreauth.NewSessionAffinitySelectorWithConfig(coreauth.SessionAffinityConfig{
-				Fallback: selector,
-				TTL:      ttl,
-				Failover: &failover,
+				Fallback:         selector,
+				TTL:              ttl,
+				Failover:         &failover,
+				AcrossPriorities: nextCfg.Routing.SessionAffinityAcrossPriorities,
 			})
 		}
 		s.coreManager.SetConfigAndSelector(nextCfg, selector)
