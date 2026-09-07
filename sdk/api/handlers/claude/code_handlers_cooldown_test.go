@@ -63,7 +63,7 @@ func TestClaudeCoolingResponsesPreserveRetryAfterWithoutExecuting(t *testing.T) 
 				delay := time.Minute
 				manager.MarkResult(coreauth.WithSkipPersist(t.Context()), coreauth.Result{
 					AuthID: id, Provider: "claude", Model: model,
-					RetryAfter: &delay, Error: &coreauth.Error{HTTPStatus: 429, Message: "quota exhausted"},
+					RetryAfter: &delay, Error: &coreauth.Error{HTTPStatus: 429, Message: "test-private-previous-response", Diagnostic: &coreauth.ErrorDiagnostic{ResponseBody: "test-private-diagnostic"}},
 				})
 				installed, _ := manager.GetByID(id)
 				if state := installed.ModelStates[model]; state == nil || !state.NextRetryAfter.After(time.Now()) || !installed.LifecycleSelectable() {
@@ -91,6 +91,9 @@ func TestClaudeCoolingResponsesPreserveRetryAfterWithoutExecuting(t *testing.T) 
 				}
 				if executor.calls.Load() != 0 {
 					t.Fatal("an unavailable pool invoked or refreshed a credential")
+				}
+				if !strings.Contains(recorder.Body.String(), "previous credential failure: HTTP 429") || strings.Contains(recorder.Body.String(), "test-private") {
+					t.Fatal("stored failure summary was missing or exposed private details")
 				}
 			})
 		}
