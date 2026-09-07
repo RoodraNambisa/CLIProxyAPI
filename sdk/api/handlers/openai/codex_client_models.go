@@ -122,6 +122,7 @@ func buildCodexClientModels(models []map[string]any, providersForModel codexClie
 
 		if template, ok := templates[id]; ok {
 			entry := cloneCodexClientModelMap(template)
+			applyCodexClientDisplayName(entry, model)
 			applyCodexClientSearchToolSupport(entry, id, true, providersForModel)
 			sanitizeCodexClientReasoningMetadata(entry)
 			applyCodexClientVisibilityOverride(entry, id)
@@ -237,6 +238,12 @@ func loadCodexClientModelTemplatesSnapshot(raw []byte, revision uint64) (map[str
 	}
 
 	return codexClientModelTemplates, codexClientDefaultTemplate, codexClientModelTemplatesErr
+}
+
+func applyCodexClientDisplayName(entry map[string]any, model map[string]any) {
+	if displayName := stringModelValue(model, "display_name"); displayName != "" {
+		entry["display_name"] = displayName
+	}
 }
 
 func applyCodexClientModelMetadata(entry map[string]any, id string, model map[string]any) {
