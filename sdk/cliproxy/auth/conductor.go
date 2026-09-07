@@ -484,8 +484,9 @@ type Manager struct {
 
 	// runtimeConfig stores the latest application config for request-time decisions.
 	// It is initialized in NewManager; never Load() before first Store().
-	runtimeConfig atomic.Value
-	routingPolicy atomic.Pointer[routingRequestPolicy]
+	runtimeConfig   atomic.Value
+	routingPolicy   atomic.Pointer[routingRequestPolicy]
+	routingUpdateMu sync.Mutex
 
 	// Optional HTTP RoundTripper provider injected by host.
 	rtProviderMu     sync.RWMutex
@@ -1159,10 +1160,13 @@ func (m *Manager) SetSelector(selector Selector) {
 	if m == nil {
 		return
 	}
+	m.routingUpdateMu.Lock()
+	defer m.routingUpdateMu.Unlock()
 	if selector == nil {
 		selector = &RoundRobinSelector{}
 	}
 	m.mu.Lock()
+	previousSelector := m.selector
 	m.selector = selector
 	cfg, _ := m.runtimeConfig.Load().(*internalconfig.Config)
 	routing := internalconfig.RoutingConfig{}
@@ -1176,6 +1180,7 @@ func (m *Manager) SetSelector(selector Selector) {
 		m.scheduler.setSelector(selector)
 		m.syncScheduler()
 	}
+	stopReplacedSessionCacheMaintenance(previousSelector, selector)
 }
 
 // Hook returns the currently configured lifecycle hook.
@@ -1280,6 +1285,8 @@ func (m *Manager) SetConfig(cfg *internalconfig.Config) {
 	if m == nil {
 		return
 	}
+	m.routingUpdateMu.Lock()
+	defer m.routingUpdateMu.Unlock()
 	if cfg == nil {
 		cfg = &internalconfig.Config{}
 	}
@@ -10517,7 +10524,7 @@ func (m *Manager) StopAutoRefresh() {
 		log.Warn("auth refresh loop did not stop before shutdown")
 	}
 	// Stop selector if it implements StoppableSelector (e.g., SessionAffinitySelector)
-	if stoppable, ok := m.selector.(StoppableSelector); ok {
+	if stoppable, ok := m.selectorForContext().(StoppableSelector); ok {
 		stoppable.Stop()
 	}
 }

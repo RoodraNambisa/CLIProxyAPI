@@ -22,6 +22,46 @@ type routingRequestPolicy struct {
 
 type routingRequestPolicyKey struct{}
 
+// Only owned, fully known selector chains can be retired here. Opaque custom
+// selectors may retain a previous selector and keep their existing lifecycle.
+func sessionCacheMaintenanceChain(selector Selector) (map[*SessionCache]struct{}, bool) {
+	caches := make(map[*SessionCache]struct{})
+	visited := make(map[*SessionAffinitySelector]struct{})
+	for {
+		switch current := selector.(type) {
+		case *SessionAffinitySelector:
+			if current == nil {
+				return caches, false
+			}
+			if _, exists := visited[current]; exists {
+				return caches, false
+			}
+			visited[current] = struct{}{}
+			if current.cache != nil {
+				caches[current.cache] = struct{}{}
+			}
+			selector = current.fallback
+		case nil, *RoundRobinSelector, *FillFirstSelector, *RandomSelector, *WeightedRoundRobinSelector:
+			return caches, true
+		default:
+			return caches, false
+		}
+	}
+}
+
+func stopReplacedSessionCacheMaintenance(previous, next Selector) {
+	retained, known := sessionCacheMaintenanceChain(next)
+	if !known {
+		return
+	}
+	old, _ := sessionCacheMaintenanceChain(previous)
+	for cache := range old {
+		if _, exists := retained[cache]; !exists {
+			cache.Stop()
+		}
+	}
+}
+
 func newRoutingRequestPolicy(m *Manager, selector Selector, routing config.RoutingConfig) *routingRequestPolicy {
 	p := &routingRequestPolicy{
 		manager: m, selector: selector, strategy: selectorStrategy(selector),
