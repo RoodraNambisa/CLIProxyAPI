@@ -19,6 +19,7 @@ type routingRequestPolicy struct {
 	priorityRange      map[int]int
 	priorityRPM        map[int]int
 	priorityMaxRetries map[int]int
+	strictAffinity     bool
 }
 
 type routingRequestPolicyKey struct{}
@@ -66,10 +67,11 @@ func stopReplacedSessionCacheMaintenance(previous, next Selector) {
 func newRoutingRequestPolicy(m *Manager, selector Selector, routing config.RoutingConfig) *routingRequestPolicy {
 	p := &routingRequestPolicy{
 		manager: m, selector: selector, strategy: selectorStrategy(selector),
-		strategies:    make(map[int]schedulerStrategy),
-		fillRange:     normalizeFillFirstRangeValue(routing.FillFirstRange),
-		fillRPM:       normalizeFillFirstPerAuthRPMValue(routing.FillFirstPerAuthRPM),
-		priorityRange: make(map[int]int), priorityRPM: make(map[int]int),
+		strictAffinity: (routing.SessionAffinity || routing.ClaudeCodeSessionAffinity) && routing.SessionAffinityFailover != nil && !*routing.SessionAffinityFailover,
+		strategies:     make(map[int]schedulerStrategy),
+		fillRange:      normalizeFillFirstRangeValue(routing.FillFirstRange),
+		fillRPM:        normalizeFillFirstPerAuthRPMValue(routing.FillFirstPerAuthRPM),
+		priorityRange:  make(map[int]int), priorityRPM: make(map[int]int),
 		priorityMaxRetries: make(map[int]int),
 	}
 	for _, rule := range routing.PriorityOverrides {

@@ -4462,7 +4462,7 @@ func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxye
 	if errPrepare != nil {
 		return cliproxyexecutor.Response{}, errPrepare
 	}
-	strictSessionAffinity := m.strictSessionAffinityForRequest(req, opts)
+	strictSessionAffinity := m.strictSessionAffinityForRequest(ctx, req, opts)
 
 	defaultRequestRetry, maxRetryCredentials, maxWait := m.retrySettings(ctx)
 	requestRetry := m.maxRequestRetryForProviders(normalized, defaultRequestRetry)
@@ -4555,7 +4555,7 @@ func (m *Manager) ExecuteCount(ctx context.Context, providers []string, req clip
 	if errPrepare != nil {
 		return cliproxyexecutor.Response{}, errPrepare
 	}
-	strictSessionAffinity := m.strictSessionAffinityForRequest(req, opts)
+	strictSessionAffinity := m.strictSessionAffinityForRequest(ctx, req, opts)
 
 	defaultRequestRetry, maxRetryCredentials, maxWait := m.retrySettings(ctx)
 	requestRetry := m.maxRequestRetryForProviders(normalized, defaultRequestRetry)
@@ -4646,7 +4646,7 @@ func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cli
 	if errPrepare != nil {
 		return nil, errPrepare
 	}
-	strictSessionAffinity := m.strictSessionAffinityForRequest(req, opts)
+	strictSessionAffinity := m.strictSessionAffinityForRequest(ctx, req, opts)
 
 	defaultRequestRetry, maxRetryCredentials, maxWait := m.retrySettings(ctx)
 	requestRetry := m.maxRequestRetryForProviders(normalized, defaultRequestRetry)
@@ -5568,7 +5568,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 	opts = withImageGenerationResultState(req, opts)
 	opts.AuthRequestSlot = newAuthRequestSlot(opts.ExecutionDiagnostics, opts.ExecutionMetrics)
 	defer opts.AuthRequestSlot.Release()
-	strictSessionAffinity := m.strictSessionAffinityForRequest(req, opts)
+	strictSessionAffinity := m.strictSessionAffinityForRequest(ctx, req, opts)
 	pickAllowed := m.requestRoundPickAllowed(ctx, roundState, maxRetryCredentials, requestAttempt, defaultRequestRetry)
 	unregisterRelease := registerRequestBodyReleaseCallback(ctx, opts, func([]byte) {
 		req.Payload = nil
@@ -5845,7 +5845,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 	opts = setSelectionAttemptMetadata(opts, requestAttempt)
 	opts.AuthRequestSlot = newAuthRequestSlot(opts.ExecutionDiagnostics, opts.ExecutionMetrics)
 	defer opts.AuthRequestSlot.Release()
-	strictSessionAffinity := m.strictSessionAffinityForRequest(req, opts)
+	strictSessionAffinity := m.strictSessionAffinityForRequest(ctx, req, opts)
 	pickAllowed := m.requestRoundPickAllowed(ctx, roundState, maxRetryCredentials, requestAttempt, defaultRequestRetry)
 	unregisterRelease := registerRequestBodyReleaseCallback(ctx, opts, func([]byte) {
 		req.Payload = nil
@@ -6109,7 +6109,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 	opts = withImageGenerationResultState(req, opts)
 	opts.AuthRequestSlot = newAuthRequestSlot(opts.ExecutionDiagnostics, opts.ExecutionMetrics)
 	defer opts.AuthRequestSlot.Release()
-	strictSessionAffinity := m.strictSessionAffinityForRequest(req, opts)
+	strictSessionAffinity := m.strictSessionAffinityForRequest(ctx, req, opts)
 	pickAllowed := m.requestRoundPickAllowed(ctx, roundState, maxRetryCredentials, requestAttempt, defaultRequestRetry)
 	unregisterRelease := registerRequestBodyReleaseCallback(ctx, opts, func([]byte) {
 		req.Payload = nil
@@ -6346,18 +6346,11 @@ func sanitizeDownstreamWebsocketFallbackRequest(ctx context.Context, auth *Auth,
 	return req
 }
 
-func (m *Manager) strictSessionAffinityForRequest(req cliproxyexecutor.Request, opts cliproxyexecutor.Options) bool {
+func (m *Manager) strictSessionAffinityForRequest(ctx context.Context, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) bool {
 	if m == nil {
 		return false
 	}
-	cfg, _ := m.runtimeConfig.Load().(*internalconfig.Config)
-	if cfg == nil {
-		return false
-	}
-	if !(cfg.Routing.ClaudeCodeSessionAffinity || cfg.Routing.SessionAffinity) {
-		return false
-	}
-	if sessionAffinityFailoverEnabled(cfg) {
+	if policy := m.selectionPolicy(ctx); policy == nil || !policy.strictAffinity {
 		return false
 	}
 	payload := opts.OriginalRequest
