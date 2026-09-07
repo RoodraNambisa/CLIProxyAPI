@@ -56,6 +56,7 @@ const (
 
 type priorityBlockInfo struct {
 	earliest time.Time
+	failures candidateFailureChoice
 }
 
 type modelCooldownError struct {
@@ -192,8 +193,7 @@ func shouldFallbackFromWebsocketFillFirstError(err error) bool {
 	if isAuthRPMLimitedError(err) {
 		return true
 	}
-	_, ok := err.(*modelCooldownError)
-	return ok
+	return isModelCooldownError(err)
 }
 
 func (e *authRPMLimitedError) Error() string {
@@ -467,6 +467,7 @@ func selectAvailableAuthsForAttemptFilteredWithPriority(auths []*Auth, provider,
 	availableByPriority := make(map[int][]*Auth)
 	blockedByPriority := make(map[int]priorityBlockInfo)
 	prioritySet := make(map[int]struct{})
+	var unrankedFailures candidateFailureChoice
 	for _, candidate := range auths {
 		priority := authPriority(candidate)
 		checkModel := model
@@ -484,6 +485,14 @@ func selectAvailableAuthsForAttemptFilteredWithPriority(auths []*Auth, provider,
 			}
 			continue
 		}
+		if allowed && reason != blockReasonDisabled {
+			info := blockedByPriority[priority]
+			info.failures.observe(candidate, checkModel)
+			blockedByPriority[priority] = info
+			if next.IsZero() {
+				unrankedFailures.merge(info.failures)
+			}
+		}
 		if reason == blockReasonDisabled || next.IsZero() {
 			continue
 		}
@@ -499,7 +508,7 @@ func selectAvailableAuthsForAttemptFilteredWithPriority(auths []*Auth, provider,
 		}
 	}
 	if len(prioritySet) == 0 {
-		return nil, &Error{Code: "auth_unavailable", Message: "no auth available"}
+		return nil, WithStoredAuthFailure(&Error{Code: "auth_unavailable", Message: "no auth available"}, unrankedFailures.latest())
 	}
 
 	priorities := make([]int, 0, len(prioritySet))
@@ -510,7 +519,9 @@ func selectAvailableAuthsForAttemptFilteredWithPriority(auths []*Auth, provider,
 		return priorities[i] > priorities[j]
 	})
 	var earliest time.Time
+	var failures candidateFailureChoice
 	for _, priority := range selectionPrioritiesForAttempt(priorities, selectionAttempt) {
+		failures.merge(blockedByPriority[priority].failures)
 		available := append([]*Auth(nil), availableByPriority[priority]...)
 		if len(available) == 0 {
 			if info, ok := blockedByPriority[priority]; ok && !info.earliest.IsZero() && (earliest.IsZero() || info.earliest.Before(earliest)) {
@@ -532,9 +543,9 @@ func selectAvailableAuthsForAttemptFilteredWithPriority(auths []*Auth, provider,
 		if resetIn < 0 {
 			resetIn = 0
 		}
-		return nil, newModelCooldownError(model, providerForError, resetIn)
+		return nil, WithStoredAuthFailure(newModelCooldownError(model, providerForError, resetIn), failures.latest())
 	}
-	return nil, &Error{Code: "auth_unavailable", Message: "no auth available"}
+	return nil, WithStoredAuthFailure(&Error{Code: "auth_unavailable", Message: "no auth available"}, failures.latest())
 }
 
 // Pick selects the next available auth for the provider in a round-robin manner.
@@ -731,6 +742,7 @@ func selectFillFirstAuthsForAttemptWithPolicy(auths []*Auth, provider, model str
 	readyByPriority := make(map[int]map[string]*Auth)
 	blockedByPriority := make(map[int]priorityBlockInfo)
 	prioritySet := make(map[int]struct{})
+	var unrankedFailures candidateFailureChoice
 	for _, candidate := range auths {
 		if candidate == nil {
 			continue
@@ -753,6 +765,14 @@ func selectFillFirstAuthsForAttemptWithPolicy(auths []*Auth, provider, model str
 			}
 			continue
 		}
+		if allowed && reason != blockReasonDisabled {
+			info := blockedByPriority[priority]
+			info.failures.observe(candidate, checkModel)
+			blockedByPriority[priority] = info
+			if next.IsZero() {
+				unrankedFailures.merge(info.failures)
+			}
+		}
 		if reason == blockReasonDisabled || next.IsZero() {
 			continue
 		}
@@ -767,7 +787,7 @@ func selectFillFirstAuthsForAttemptWithPolicy(auths []*Auth, provider, model str
 		}
 	}
 	if len(prioritySet) == 0 {
-		return nil, &Error{Code: "auth_unavailable", Message: "no auth available"}
+		return nil, WithStoredAuthFailure(&Error{Code: "auth_unavailable", Message: "no auth available"}, unrankedFailures.latest())
 	}
 	priorities := make([]int, 0, len(prioritySet))
 	for priority := range prioritySet {
@@ -775,8 +795,10 @@ func selectFillFirstAuthsForAttemptWithPolicy(auths []*Auth, provider, model str
 	}
 	sort.Slice(priorities, func(i, j int) bool { return priorities[i] > priorities[j] })
 	var earliest time.Time
+	var failures candidateFailureChoice
 	rpmLimited := false
 	for _, priority := range selectionPrioritiesForAttempt(priorities, selectionAttempt) {
+		failures.merge(blockedByPriority[priority].failures)
 		members := append([]*Auth(nil), membersByPriority[priority]...)
 		if len(members) == 0 {
 			continue
@@ -838,14 +860,14 @@ func selectFillFirstAuthsForAttemptWithPolicy(auths []*Auth, provider, model str
 	if rpmLimited {
 		rpmRetryAfter := fillFirstRPMRetryAfterAt(rpmLimiter, now)
 		if cooldownBeforeRPMReset(earliest, rpmRetryAfter, now) {
-			return nil, newModelCooldownErrorUntil(model, provider, earliest, now)
+			return nil, WithStoredAuthFailure(newModelCooldownErrorUntil(model, provider, earliest, now), failures.latest())
 		}
 		return nil, newAuthRPMLimitedError(rpmRetryAfter)
 	}
 	if !earliest.IsZero() {
-		return nil, newModelCooldownErrorUntil(model, provider, earliest, now)
+		return nil, WithStoredAuthFailure(newModelCooldownErrorUntil(model, provider, earliest, now), failures.latest())
 	}
-	return nil, &Error{Code: "auth_unavailable", Message: "no auth available"}
+	return nil, WithStoredAuthFailure(&Error{Code: "auth_unavailable", Message: "no auth available"}, failures.latest())
 }
 
 func (s *RandomSelector) Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error) {

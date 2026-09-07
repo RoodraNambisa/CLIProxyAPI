@@ -828,7 +828,7 @@ func chatGPTWebImageSelectionErrorEligible(err error) bool {
 	if err == nil {
 		return false
 	}
-	if _, ok := err.(*modelCooldownError); ok {
+	if isModelCooldownError(err) {
 		return true
 	}
 	var authErr *Error
