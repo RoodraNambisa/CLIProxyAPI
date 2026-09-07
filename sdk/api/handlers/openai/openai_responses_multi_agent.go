@@ -22,7 +22,7 @@ func (h *OpenAIResponsesAPIHandler) prepareCodexMultiAgentV2(c *gin.Context, pay
 	var modelList string
 	if helps.CodexCollaborationNeedsModelList(payload) {
 		models := h.FilterModelsByProviderAccess(c, h.Models())
-		response := codexClientModelsResponseForClient(models, policy.ClientVersion, registry.GetGlobalRegistry().GetModelProviders)
+		response := codexClientModelsResponseForClient(models, policy.ClientVersion, registry.GetGlobalRegistry().GetModelProviders, policy.Enabled)
 		modelList = helps.FormatCodexCollaborationModels(response["models"].([]map[string]any))
 	}
 	return helps.PrepareCodexCollaborationTools(payload, modelList)

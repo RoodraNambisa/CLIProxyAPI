@@ -51,11 +51,16 @@ func codexClientModelsResponse(models []map[string]any, providersForModel codexC
 // CodexClientModelsResponseForClient filters only capabilities the real client
 // cannot decode. Outbound software identity does not determine client capability.
 func CodexClientModelsResponseForClient(models []map[string]any, clientVersion string) map[string]any {
-	return codexClientModelsResponseForClient(models, clientVersion, nil)
+	return codexClientModelsResponseForClient(models, clientVersion, nil, false)
 }
 
-func codexClientModelsResponseForClient(models []map[string]any, clientVersion string, providersForModel codexClientModelProvidersFunc) map[string]any {
+func codexClientModelsResponseForClient(models []map[string]any, clientVersion string, providersForModel codexClientModelProvidersFunc, optimizeMultiAgentV2 bool) map[string]any {
 	response := codexClientModelsResponse(models, providersForModel)
+	if optimizeMultiAgentV2 {
+		for _, model := range response["models"].([]map[string]any) {
+			model["multi_agent_version"] = "v2"
+		}
+	}
 	if supportsExtendedCodexClientReasoning(clientVersion) {
 		return response
 	}
