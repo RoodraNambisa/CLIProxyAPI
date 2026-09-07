@@ -9,6 +9,8 @@ import "strings"
 //
 // Example services: zenmux.ai and similar Vertex-compatible providers.
 type VertexCompatKey struct {
+	// Weight is optional; only weighted-round-robin uses it. Missing means one.
+	Weight *int `yaml:"weight,omitempty" json:"weight,omitempty"`
 	// APIKey is the authentication key for accessing the Vertex-compatible API.
 	// Maps to the x-goog-api-key header.
 	APIKey string `yaml:"api-key" json:"api-key"`

@@ -1852,6 +1852,8 @@ type CloakConfig struct {
 // ClaudeKey represents the configuration for a Claude API key,
 // including the API key itself and an optional base URL for the API endpoint.
 type ClaudeKey struct {
+	// Weight is optional; only weighted-round-robin uses it. Missing means one.
+	Weight *int `yaml:"weight,omitempty" json:"weight,omitempty"`
 	// APIKey is the authentication key for accessing Claude API services.
 	APIKey string `yaml:"api-key" json:"api-key"`
 
@@ -1909,6 +1911,8 @@ func (m ClaudeModel) GetForceMapping() bool { return m.ForceMapping }
 // CodexKey represents the configuration for a Codex API key,
 // including the API key itself and an optional base URL for the API endpoint.
 type CodexKey struct {
+	// Weight is optional; only weighted-round-robin uses it. Missing means one.
+	Weight *int `yaml:"weight,omitempty" json:"weight,omitempty"`
 	// APIKey is the authentication key for accessing Codex API services.
 	APIKey string `yaml:"api-key" json:"api-key"`
 
@@ -1961,6 +1965,8 @@ func (m CodexModel) GetForceMapping() bool { return m.ForceMapping }
 // GeminiKey represents the configuration for a Gemini API key,
 // including optional overrides for upstream base URL, proxy routing, and headers.
 type GeminiKey struct {
+	// Weight is optional; only weighted-round-robin uses it. Missing means one.
+	Weight *int `yaml:"weight,omitempty" json:"weight,omitempty"`
 	// APIKey is the authentication key for accessing Gemini API services.
 	APIKey string `yaml:"api-key" json:"api-key"`
 
@@ -2037,6 +2043,8 @@ type OpenAICompatibility struct {
 
 // OpenAICompatibilityAPIKey represents an API key configuration with optional proxy setting.
 type OpenAICompatibilityAPIKey struct {
+	// Weight applies to this credential, independently of the provider priority.
+	Weight *int `yaml:"weight,omitempty" json:"weight,omitempty"`
 	// APIKey is the authentication key for accessing the external API services.
 	APIKey string `yaml:"api-key" json:"api-key"`
 
@@ -2145,6 +2153,9 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	if lifecycleErr := validateChatGPTWebLifecycleOptionsYAML(data); lifecycleErr != nil {
 		return nil, fmt.Errorf("failed to parse config file: %w", lifecycleErr)
 	}
+	if errWeight := validateCredentialWeightYAML(data); errWeight != nil {
+		return nil, errWeight
+	}
 	if err = yaml.Unmarshal(data, &cfg); err != nil {
 		if optional {
 			if accountInfoErr := validateChatGPTWebAccountInfoYAML(data); accountInfoErr != nil {
@@ -2174,6 +2185,9 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	// 	}
 	// }
 
+	if errWeight := cfg.ValidateCredentialWeights(); errWeight != nil {
+		return nil, errWeight
+	}
 	// Hash remote management key if plaintext is detected (nested)
 	// We consider a value to be already hashed if it looks like a bcrypt hash ($2a$, $2b$, or $2y$ prefix).
 	if cfg.RemoteManagement.SecretKey != "" && !looksLikeBcrypt(cfg.RemoteManagement.SecretKey) {
@@ -3809,6 +3823,9 @@ func SaveConfigPreserveComments(configFile string, cfg *Config) error {
 	if cfg == nil {
 		return fmt.Errorf("config is nil")
 	}
+	if errWeight := cfg.ValidateCredentialWeights(); errWeight != nil {
+		return errWeight
+	}
 	persistCfg := *cfg
 	groups, errNormalizeGroups := NormalizeAPIKeyGroups(persistCfg.APIKeyGroups, persistCfg.APIKeys)
 	if errNormalizeGroups != nil {
@@ -4140,6 +4157,10 @@ func isKnownDefaultValue(path []string, node *yaml.Node) bool {
 		switch fullPath {
 		case "routing.priority-overrides.priority":
 			// Priority zero is an identity, not an omitted default.
+			return false
+		case "gemini-api-key.weight", "interactions-api-key.weight", "claude-api-key.weight",
+			"codex-api-key.weight", "vertex-api-key.weight", "openai-compatibility.api-key-entries.weight":
+			// An explicit zero excludes this credential only in weighted routing.
 			return false
 		case "routing.priority-overrides.per-auth-request-limit":
 			// This pointer field uses an explicit zero to disable an inherited limit.
