@@ -320,19 +320,20 @@ func NewCodexExecutor(cfg *config.Config) *CodexExecutor { return &CodexExecutor
 func (e *CodexExecutor) Identifier() string { return "codex" }
 
 type codexPreparedSessionIdentity struct {
-	PromptCacheLog *util.PromptCacheLogRedactor
-	PromptCacheKey helps.CodexPromptCacheKeySnapshot
-	ResponsesLite  helps.CodexResponsesLiteSnapshot
-	Enabled        bool
-	SessionID      string
-	ThreadID       string
-	TurnID         string
-	WindowID       string
-	RequestKind    string
-	AffinityKind   string
-	AffinityDigest string
-	TenantDigest   string
-	ClientThreadID string
+	StreamBootstrapBuffering bool
+	PromptCacheLog           *util.PromptCacheLogRedactor
+	PromptCacheKey           helps.CodexPromptCacheKeySnapshot
+	ResponsesLite            helps.CodexResponsesLiteSnapshot
+	Enabled                  bool
+	SessionID                string
+	ThreadID                 string
+	TurnID                   string
+	WindowID                 string
+	RequestKind              string
+	AffinityKind             string
+	AffinityDigest           string
+	TenantDigest             string
+	ClientThreadID           string
 }
 
 // PrepareProviderRequest creates one immutable identity fallback shared by all
@@ -361,16 +362,17 @@ func (e *CodexExecutor) PrepareProviderRequest(ctx context.Context, req cliproxy
 		liteHeaders.Set(helps.CodexResponsesLiteHeader, value)
 	}
 	prepared := codexPreparedSessionIdentity{
-		PromptCacheLog: helps.SnapshotCodexPromptCacheLog(ctx, payload),
-		PromptCacheKey: helps.SnapshotCodexPromptCacheKey(payload, e.cfg != nil && e.cfg.Codex.PassthroughPromptCacheKey),
-		ResponsesLite:  helps.SnapshotCodexResponsesLite(payload, liteHeaders, cliproxyexecutor.DownstreamWebsocket(ctx)),
-		Enabled:        codexSpoofSessionIdentityEnabled(e.cfg),
-		TurnID:         turnID,
-		RequestKind:    codexSessionRequestKind(opts, payload),
-		AffinityKind:   affinityKind,
-		AffinityDigest: affinityDigest,
-		TenantDigest:   tenantDigest,
-		ClientThreadID: clientThreadID,
+		StreamBootstrapBuffering: e.cfg != nil && e.cfg.Codex.StreamBootstrapBuffering,
+		PromptCacheLog:           helps.SnapshotCodexPromptCacheLog(ctx, payload),
+		PromptCacheKey:           helps.SnapshotCodexPromptCacheKey(payload, e.cfg != nil && e.cfg.Codex.PassthroughPromptCacheKey),
+		ResponsesLite:            helps.SnapshotCodexResponsesLite(payload, liteHeaders, cliproxyexecutor.DownstreamWebsocket(ctx)),
+		Enabled:                  codexSpoofSessionIdentityEnabled(e.cfg),
+		TurnID:                   turnID,
+		RequestKind:              codexSessionRequestKind(opts, payload),
+		AffinityKind:             affinityKind,
+		AffinityDigest:           affinityDigest,
+		TenantDigest:             tenantDigest,
+		ClientThreadID:           clientThreadID,
 	}
 	if !prepared.Enabled {
 		return prepared, nil
@@ -1234,6 +1236,27 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	}
 	if state, ok := opts.Metadata[cliproxyexecutor.ImageGenerationStreamPassthroughStateMetadataKey].(*cliproxyexecutor.ImageGenerationStreamPassthroughState); ok {
 		state.SetEnabled(imageStreamPassthrough)
+	}
+	if e.codexPreparedSessionIdentity(ctx, req, opts).StreamBootstrapBuffering && helps.RequestBodyReplayable(ctx, opts) {
+		bodyReplay, failure, errProbe := helps.ProbeCodexSSEBootstrap(ctx, httpResp.Body, func() bool {
+			return helps.RequestBodyReplayable(ctx, opts)
+		})
+		if errProbe != nil || failure != nil {
+			cleanupBodies()
+			if errClose := httpResp.Body.Close(); errClose != nil {
+				log.Errorf("codex executor: close bootstrap response body error: %v", errClose)
+			}
+			if errProbe != nil {
+				helps.RecordAPIResponseError(ctx, e.cfg, errProbe)
+				return nil, errProbe
+			}
+			upstreamError := applyCodexIdentityConfuseResponsePayload(failure.Payload, identityState)
+			upstreamError = codexauth.SanitizeAgentIdentityErrorBody(authMetadata(auth), upstreamError)
+			helps.AppendAPIResponseChunk(ctx, e.cfg, upstreamError)
+			clientError := applyCodexIdentityExposeResponsePayload(upstreamError, identityState)
+			return nil, statusErrWithHeaders{statusErr: newCodexStatusErr(failure.Status, helps.CodexBootstrapErrorBody(clientError)), headers: httpResp.Header.Clone()}
+		}
+		httpResp.Body = bodyReplay
 	}
 	helps.ReleaseRequestBodyAfterStreamEstablished(ctx, opts)
 	out := make(chan cliproxyexecutor.StreamChunk, cliproxyexecutor.StreamBufferSize)

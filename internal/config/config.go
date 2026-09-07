@@ -539,6 +539,8 @@ type CodexHeaderDefaults struct {
 
 // CodexConfig configures provider-wide Codex request behavior.
 type CodexConfig struct {
+	// StreamBootstrapBuffering holds bounded pre-output metadata to detect retryable overloads.
+	StreamBootstrapBuffering bool `yaml:"stream-bootstrap-buffering" json:"stream-bootstrap-buffering"`
 	// PassthroughPromptCacheKey preserves explicit client cache keys independently of session identity.
 	PassthroughPromptCacheKey bool                 `yaml:"passthrough-prompt-cache-key" json:"passthrough-prompt-cache-key"`
 	IdentityConfuse           bool                 `yaml:"identity-confuse" json:"identity-confuse"`

@@ -234,6 +234,26 @@ func (e *CodexExecutor) executeOpenAIImageStream(ctx context.Context, auth *clip
 		return nil, err
 	}
 
+	if e.codexPreparedSessionIdentity(ctx, req, opts).StreamBootstrapBuffering && helps.RequestBodyReplayable(ctx, opts) {
+		bodyReplay, failure, errProbe := helps.ProbeCodexSSEBootstrap(ctx, httpResp.Body, func() bool {
+			return helps.RequestBodyReplayable(ctx, opts)
+		})
+		if errProbe != nil || failure != nil {
+			if errClose := httpResp.Body.Close(); errClose != nil {
+				log.Errorf("codex executor: close image bootstrap response body error: %v", errClose)
+			}
+			if errProbe != nil {
+				helps.RecordAPIResponseError(ctx, e.cfg, errProbe)
+				return nil, errProbe
+			}
+			upstreamError := applyCodexIdentityConfuseResponsePayload(failure.Payload, identityState)
+			upstreamError = codexauth.SanitizeAgentIdentityErrorBody(authMetadata(auth), upstreamError)
+			helps.AppendAPIResponseChunk(ctx, e.cfg, upstreamError)
+			clientError := applyCodexIdentityExposeResponsePayload(upstreamError, identityState)
+			return nil, statusErrWithHeaders{statusErr: newCodexStatusErr(failure.Status, helps.CodexBootstrapErrorBody(clientError)), headers: httpResp.Header.Clone()}
+		}
+		httpResp.Body = bodyReplay
+	}
 	helps.ReleaseRequestBodyAfterStreamEstablished(ctx, opts)
 	out := make(chan cliproxyexecutor.StreamChunk, cliproxyexecutor.StreamBufferSize)
 	go func() {

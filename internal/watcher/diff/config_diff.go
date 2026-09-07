@@ -271,6 +271,9 @@ func BuildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 	if oldCfg.Codex.PassthroughPromptCacheKey != newCfg.Codex.PassthroughPromptCacheKey {
 		changes = append(changes, fmt.Sprintf("codex.passthrough-prompt-cache-key: %t -> %t", oldCfg.Codex.PassthroughPromptCacheKey, newCfg.Codex.PassthroughPromptCacheKey))
 	}
+	if oldCfg.Codex.StreamBootstrapBuffering != newCfg.Codex.StreamBootstrapBuffering {
+		changes = append(changes, fmt.Sprintf("codex.stream-bootstrap-buffering: %t -> %t", oldCfg.Codex.StreamBootstrapBuffering, newCfg.Codex.StreamBootstrapBuffering))
+	}
 	if oldCfg.Codex.SpoofSessionIdentity != newCfg.Codex.SpoofSessionIdentity {
 		changes = append(changes, fmt.Sprintf("codex.spoof-session-identity: %t -> %t", oldCfg.Codex.SpoofSessionIdentity, newCfg.Codex.SpoofSessionIdentity))
 	}
