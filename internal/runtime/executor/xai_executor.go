@@ -1302,6 +1302,7 @@ func sanitizeXAIResponsesBody(body []byte, model string) []byte {
 }
 
 func normalizeXAITools(body []byte) []byte {
+	body = helps.PromoteXAIAdditionalTools(body)
 	tools := gjson.GetBytes(body, "tools")
 	if !tools.Exists() || !tools.IsArray() {
 		return body

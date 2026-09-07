@@ -20,6 +20,14 @@ import (
 )
 
 func TestXAIResponsesOutputIdentityAndOptionalPlaintext(t *testing.T) {
+	runXAIResponsesOutputIdentity(t, false)
+}
+
+func TestXAIAdditionalToolsOutputIdentityAndOptionalPlaintext(t *testing.T) {
+	runXAIResponsesOutputIdentity(t, true)
+}
+
+func runXAIResponsesOutputIdentity(t *testing.T, additional bool) {
 	for _, operation := range []string{"execute", "stream", "compact", "websocket", "websocket-sse"} {
 		for _, enabled := range []bool{false, true} {
 			t.Run(fmt.Sprintf("%s/enabled=%t", operation, enabled), func(t *testing.T) {
@@ -84,6 +92,9 @@ func TestXAIResponsesOutputIdentityAndOptionalPlaintext(t *testing.T) {
 				}
 				auth := &cliproxyauth.Auth{ID: "xai-output-fixture", Provider: "xai", Attributes: map[string]string{"base_url": server.URL, "api_key": "fixture"}}
 				req := core.Request{Model: "grok-4", Payload: []byte(`{"input":[],"tools":[{"type":"namespace","name":"collaboration","tools":[{"type":"function","name":"spawn_agent","parameters":{"type":"object"}}]}]}`)}
+				if additional {
+					req.Payload = []byte(`{"input":[{"type":"additional_tools","tools":` + gjson.GetBytes(req.Payload, "tools").Raw + `}]}`)
+				}
 				opts := core.Options{SourceFormat: sdktranslator.FormatOpenAIResponse, Headers: http.Header{"User-Agent": {"codex_cli_rs/0.153.4"}}}
 				var items []gjson.Result
 				if operation == "execute" || operation == "compact" {
