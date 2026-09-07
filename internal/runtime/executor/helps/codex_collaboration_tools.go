@@ -95,6 +95,12 @@ func HasCodexMultiAgentV2NamespaceConflict(payload []byte) bool {
 	return scanCodexCollaborationTools(payload).conflict
 }
 
+// CodexCollaborationNeedsModelList avoids building a catalog for ordinary turns.
+func CodexCollaborationNeedsModelList(payload []byte) bool {
+	scan := scanCodexCollaborationTools(payload)
+	return len(scan.spawnAgentPaths) > 0 && !scan.conflict
+}
+
 func removeCodexCollaborationMessageEncryption(payload []byte, toolPaths []string) []byte {
 	if !gjson.ValidBytes(payload) {
 		return payload

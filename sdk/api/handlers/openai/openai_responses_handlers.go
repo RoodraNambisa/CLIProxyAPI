@@ -546,6 +546,7 @@ func (h *OpenAIResponsesAPIHandler) Responses(c *gin.Context) {
 	}
 	h.BeginChatGPTWebImageErrorSanitization(c, cliproxyauth.PayloadHasImageGenerationTool(rawJSON))
 	rawJSON = h.prepareOrphanDelegation(c, rawJSON)
+	rawJSON = h.prepareCodexMultiAgentV2(c, rawJSON)
 
 	// Check if the client requested a streaming response.
 	streamResult := gjson.GetBytes(rawJSON, "stream")
@@ -566,6 +567,7 @@ func (h *OpenAIResponsesAPIHandler) Compact(c *gin.Context) {
 	}
 	h.BeginChatGPTWebImageErrorSanitization(c, cliproxyauth.PayloadHasImageGenerationTool(rawJSON))
 	rawJSON = h.prepareOrphanDelegation(c, rawJSON)
+	rawJSON = h.prepareCodexMultiAgentV2(c, rawJSON)
 
 	streamResult := gjson.GetBytes(rawJSON, "stream")
 	if streamResult.Type == gjson.True {

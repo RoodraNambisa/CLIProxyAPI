@@ -65,3 +65,21 @@ func TestCodexCollaborationReservedNamespaceConflicts(t *testing.T) {
 		}
 	}
 }
+func TestCodexCollaborationModelListDemand(t *testing.T) {
+	for _, tc := range []struct {
+		payload string
+		want    bool
+	}{
+		{`{"tools":[{"type":"function","name":"spawn_agent"}]}`, true},
+		{`{"input":[{"type":"additional_tools","tools":[{"type":"function","name":"spawn_agent"}]}]}`, true},
+		{`{"tools":[{"type":"function","name":"send_message"}]}`, false},
+		{`{"tools":[{"type":"namespace","name":"other","tools":[{"type":"function","name":"spawn_agent"}]}]}`, false},
+		{`{"tools":[{"type":"function","name":"spawn_agent"},{"type":"namespace","name":"collaboration-optimize"}]}`, false},
+		{`{"input":"spawn_agent","metadata":{"name":"spawn_agent"}}`, false},
+		{"invalid", false},
+	} {
+		if got := CodexCollaborationNeedsModelList([]byte(tc.payload)); got != tc.want {
+			t.Fatalf("model list demand = %t, want %t", got, tc.want)
+		}
+	}
+}
