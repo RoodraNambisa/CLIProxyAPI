@@ -1744,6 +1744,21 @@ func TestResponsesWebsocketPinsOnlyWebsocketCapableAuth(t *testing.T) {
 }
 
 func TestResponsesWebsocketSharesToolStateAcrossConnectionsWithSameSessionID(t *testing.T) {
+	for _, tc := range []struct {
+		name, firstCaller, secondCaller string
+		shared                          bool
+	}{
+		{"same authenticated caller", "caller-one", "caller-one", true},
+		{"different authenticated callers", "caller-one", "caller-two", false},
+		{"unverified callers", "", "", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			testResponsesWebsocketToolCacheSharing(t, tc.firstCaller, tc.secondCaller, tc.shared)
+		})
+	}
+}
+
+func testResponsesWebsocketToolCacheSharing(t *testing.T, firstCaller, secondCaller string, shared bool) {
 	gin.SetMode(gin.TestMode)
 
 	executor := &websocketCompactionCaptureExecutor{}
@@ -1761,14 +1776,22 @@ func TestResponsesWebsocketSharesToolStateAcrossConnectionsWithSameSessionID(t *
 	base := handlers.NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, manager)
 	h := NewOpenAIResponsesAPIHandler(base)
 	router := gin.New()
-	router.GET("/v1/responses/ws", h.ResponsesWebsocket)
+	router.GET("/v1/responses/ws", func(c *gin.Context) {
+		// Model a successful authentication provider result in this fixture.
+		if principal := c.Request.Header.Get("X-Test-Principal"); principal != "" {
+			c.Set("apiKey", principal)
+			c.Set("accessProvider", "test-auth")
+		}
+		h.ResponsesWebsocket(c)
+	})
 
 	server := httptest.NewServer(router)
 	defer server.Close()
 
 	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/v1/responses/ws"
 	headers := http.Header{}
-	headers.Set("Session_id", "shared-session")
+	headers.Set("Session_id", "shared-"+t.Name())
+	headers.Set("X-Test-Principal", firstCaller)
 
 	conn1, _, err := websocket.DefaultDialer.Dial(wsURL, headers)
 	if err != nil {
@@ -1788,6 +1811,7 @@ func TestResponsesWebsocketSharesToolStateAcrossConnectionsWithSameSessionID(t *
 		t.Fatalf("read first websocket response: %v", errReadMessage)
 	}
 
+	headers.Set("X-Test-Principal", secondCaller)
 	conn2, _, err := websocket.DefaultDialer.Dial(wsURL, headers)
 	if err != nil {
 		t.Fatalf("dial second websocket: %v", err)
@@ -1814,6 +1838,12 @@ func TestResponsesWebsocketSharesToolStateAcrossConnectionsWithSameSessionID(t *
 	}
 	merged := executor.streamPayloads[1]
 	items := gjson.GetBytes(merged, "input").Array()
+	if !shared {
+		if len(items) != 2 || items[0].Get("id").String() != "assistant-compact" || items[1].Get("id").String() != "msg-2" {
+			t.Fatal("a different or unverified caller inherited cached tool data")
+		}
+		return
+	}
 	if len(items) != 4 {
 		t.Fatalf("merged input len = %d, want 4: %s", len(items), merged)
 	}

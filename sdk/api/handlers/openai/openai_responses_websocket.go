@@ -58,7 +58,7 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 		return
 	}
 	passthroughSessionID := uuid.NewString()
-	downstreamSessionKey := websocketDownstreamSessionKey(c.Request)
+	downstreamSessionKey := websocketToolPairScopeKey(c, websocketDownstreamSessionKey(c.Request))
 	toolPairState := acquireResponsesWebsocketToolPairState(downstreamSessionKey)
 	clientIP := websocketClientAddress(c)
 	log.Infof("responses websocket: client connected id=%s remote=%s", executorhelps.CodexWebsocketSessionLogID(passthroughSessionID), clientIP)

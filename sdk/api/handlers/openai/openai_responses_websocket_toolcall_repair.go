@@ -1,11 +1,14 @@
 package openai
 
 import (
+	"crypto/sha256"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"strings"
 	"sync"
 
+	"github.com/gin-gonic/gin"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
@@ -14,6 +17,7 @@ const websocketToolPairStateMaxEntries = 256
 
 var defaultWebsocketToolPairStates = newWebsocketToolPairStateRegistry()
 var defaultWebsocketToolPairRefs = newWebsocketToolPairRefCounter()
+var websocketToolPairLifecycleMu sync.Mutex
 
 type websocketToolPairState struct {
 	mu          sync.RWMutex
@@ -185,6 +189,8 @@ func acquireResponsesWebsocketToolPairState(sessionKey string) *websocketToolPai
 	if sessionKey == "" {
 		return newWebsocketToolPairState()
 	}
+	websocketToolPairLifecycleMu.Lock()
+	defer websocketToolPairLifecycleMu.Unlock()
 	defaultWebsocketToolPairRefs.acquire(sessionKey)
 	return defaultWebsocketToolPairStates.getOrCreate(sessionKey)
 }
@@ -194,10 +200,28 @@ func releaseResponsesWebsocketToolPairState(sessionKey string) {
 	if sessionKey == "" {
 		return
 	}
+	websocketToolPairLifecycleMu.Lock()
+	defer websocketToolPairLifecycleMu.Unlock()
 	if !defaultWebsocketToolPairRefs.release(sessionKey) {
 		return
 	}
 	defaultWebsocketToolPairStates.delete(sessionKey)
+}
+
+// websocketToolPairScopeKey uses trusted authentication context, never a client
+// supplied identity header, to separate overlapping caller session identifiers.
+func websocketToolPairScopeKey(c *gin.Context, sessionKey string) string {
+	sessionKey = strings.TrimSpace(sessionKey)
+	if sessionKey == "" || c == nil || strings.TrimSpace(c.GetString("apiKey")) == "" {
+		return ""
+	}
+	metadata, _ := c.Get("accessMetadata")
+	raw, err := json.Marshal([]any{c.GetString("accessProvider"), c.GetString("apiKey"), metadata, sessionKey})
+	if err != nil {
+		// A private, unshared state is preferable to merging unknown principals.
+		return ""
+	}
+	return fmt.Sprintf("%x", sha256.Sum256(raw))
 }
 
 func repairResponsesWebsocketToolCalls(state *websocketToolPairState, payload []byte) []byte {
