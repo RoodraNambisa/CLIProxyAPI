@@ -642,6 +642,8 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 	body = helps.SanitizeCodexReasoningEncryptedContent(ctx, "codex websockets executor", body)
 	body = helps.NormalizeCodexToolSelection(body)
 	body = e.codexPreparedSessionIdentity(ctx, req, opts).ResponsesLite.ApplyBody(body, true)
+	multiAgentDeclaresTools := helps.CodexMultiAgentDeclaresTools(body)
+	body, multiAgentResponse := helps.OptimizeCodexMultiAgentV2Request(body, e.codexPreparedSessionIdentity(ctx, req, opts).MultiAgentV2)
 	if strings.TrimSpace(gjson.GetBytes(body, "previous_response_id").String()) != "" {
 		ctx = cliproxyexecutor.WithRequiredUpstreamWebsocket(ctx)
 	}
@@ -785,6 +787,9 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 		sess.setActiveForConn(readCh, conn)
 	}
 
+	if !multiAgentDeclaresTools {
+		multiAgentResponse = sess.multiAgentResponseForConn(conn)
+	}
 	if errSend := writeCurrentCodexWebsocketMessage(ctx, auth, sess, conn, wsReqBody); errSend != nil {
 		if cliproxyexecutor.RequiredUpstreamWebsocket(ctx) {
 			if sess != nil {
@@ -836,6 +841,9 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 			recordAPIWebsocketHandshake(ctx, e.cfg, respHSRetry)
 			if respHSRetry != nil {
 				upstreamHeaders = respHSRetry.Header.Clone()
+			}
+			if !multiAgentDeclaresTools {
+				multiAgentResponse = sess.multiAgentResponseForConn(connRetry)
 			}
 			if errSendRetry := writeCurrentCodexWebsocketMessage(ctx, auth, sess, connRetry, wsReqBodyRetry); errSendRetry != nil {
 				helps.RecordAPIWebsocketError(ctx, e.cfg, "send_retry", errSendRetry)
@@ -1042,6 +1050,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 				}
 			}
 
+			clientPayload = multiAgentResponse.Rewrite(clientPayload)
 			line := encodeCodexWebsocketAsSSE(clientPayload)
 			chunks := sdktranslator.TranslateStream(ctx, to, from, req.Model, originalRef.Bytes(), clientBodyRef.Bytes(), line, &param)
 			for i := range chunks {
@@ -1052,6 +1061,9 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 				}
 			}
 			if isCodexSuccessfulCompletion(payload) {
+				if ctx.Err() == nil {
+					sess.commitMultiAgentResponseForConn(conn, multiAgentResponse)
+				}
 				reporter.EnsurePublished(ctx)
 				if metadataBool(opts.Metadata, cliproxyexecutor.StreamTerminalMarkerMetadataKey) {
 					if !send(cliproxyexecutor.SuccessfulStreamTerminalChunk()) {
