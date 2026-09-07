@@ -286,6 +286,9 @@ func BuildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 	if oldCfg.Codex.IdentityConfuse != newCfg.Codex.IdentityConfuse {
 		changes = append(changes, fmt.Sprintf("codex.identity-confuse: %t -> %t", oldCfg.Codex.IdentityConfuse, newCfg.Codex.IdentityConfuse))
 	}
+	if oldCfg.Codex.OptimizeMultiAgentV2 != newCfg.Codex.OptimizeMultiAgentV2 {
+		changes = append(changes, fmt.Sprintf("codex.optimize-multi-agent-v2: %t -> %t", oldCfg.Codex.OptimizeMultiAgentV2, newCfg.Codex.OptimizeMultiAgentV2))
+	}
 	if oldCfg.Codex.PassthroughPromptCacheKey != newCfg.Codex.PassthroughPromptCacheKey {
 		changes = append(changes, fmt.Sprintf("codex.passthrough-prompt-cache-key: %t -> %t", oldCfg.Codex.PassthroughPromptCacheKey, newCfg.Codex.PassthroughPromptCacheKey))
 	}

@@ -9,6 +9,7 @@ func sdkHandlerConfig(cfg *config.Config) *config.SDKConfig {
 		return nil
 	}
 	snapshot := cfg.SDKConfig
+	snapshot.CodexOptimizeMultiAgentV2 = cfg.Codex.OptimizeMultiAgentV2
 	snapshot.CodexOrphanDelegationCompatibility = cfg.Codex.OrphanDelegationCompatibility
 	return &snapshot
 }

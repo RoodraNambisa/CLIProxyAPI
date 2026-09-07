@@ -711,6 +711,10 @@ nonstream-keepalive-interval: 0
 #   # Convert unpaired Codex app delegation results to user messages only for
 #   # X-Openai-Subagent: collab_spawn. Paired calls and other tools are unchanged.
 #   orphan-delegation-compatibility: false
+#   # Opt into official Codex multi-agent v2 tool preparation and model descriptions.
+#   # Defaults to false. Hot updates apply to the next logical request / WebSocket turn.
+#   # Existing encrypted history remains opaque; other protocols cannot consume it.
+#   optimize-multi-agent-v2: false
 #   spoof-session-identity: false
 #   turn-state-policy: "guard-cross-account"
 #   enforce-software-identity: true # normalize outbound User-Agent, Originator, and Version; default true

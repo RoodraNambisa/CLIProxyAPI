@@ -670,3 +670,15 @@ func TestTrimStrings(t *testing.T) {
 		t.Fatalf("unexpected trimmed strings: %v", out)
 	}
 }
+
+func TestCodexMultiAgentV2ChangeDetails(t *testing.T) {
+	oldCfg, nextCfg := &config.Config{}, &config.Config{}
+	nextCfg.Codex.OptimizeMultiAgentV2 = true
+	changes := BuildConfigChangeDetails(oldCfg, nextCfg)
+	if len(changes) != 1 || changes[0] != "codex.optimize-multi-agent-v2: false -> true" {
+		t.Fatal("missing or noisy multi-agent change detail")
+	}
+	if len(BuildConfigChangeDetails(nextCfg, nextCfg)) != 0 {
+		t.Fatal("unchanged policy generated a diff")
+	}
+}

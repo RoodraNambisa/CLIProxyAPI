@@ -539,6 +539,8 @@ type CodexHeaderDefaults struct {
 
 // CodexConfig configures provider-wide Codex request behavior.
 type CodexConfig struct {
+	// OptimizeMultiAgentV2 prepares collaboration tools for official Codex clients.
+	OptimizeMultiAgentV2 bool `yaml:"optimize-multi-agent-v2" json:"optimize-multi-agent-v2"`
 	// OrphanDelegationCompatibility repairs known orphan app delegation results in subagents.
 	OrphanDelegationCompatibility bool `yaml:"orphan-delegation-compatibility" json:"orphan-delegation-compatibility"`
 	// StreamBootstrapBuffering holds bounded pre-output metadata to detect retryable overloads.
