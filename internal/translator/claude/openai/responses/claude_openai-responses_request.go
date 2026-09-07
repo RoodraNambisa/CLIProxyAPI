@@ -306,7 +306,7 @@ func ConvertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte
 				if callID == "" {
 					callID = genToolCallID()
 				}
-				name := item.Get("name").String()
+				name := qualifyClaudeResponsesToolName(strings.TrimSpace(item.Get("namespace").String()), strings.TrimSpace(item.Get("name").String()))
 				argsStr := item.Get("arguments").String()
 
 				toolUse := []byte(`{"type":"tool_use","id":"","name":"","input":{}}`)
@@ -340,9 +340,9 @@ func ConvertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte
 	}
 
 	// tools mapping: parameters -> input_schema
-	if tools := root.Get("tools"); tools.Exists() && tools.IsArray() {
+	if tools := claudeResponsesTools(root); len(tools) > 0 {
 		toolsJSON := []byte("[]")
-		tools.ForEach(func(_, tool gjson.Result) bool {
+		for _, tool := range tools {
 			tJSON := []byte(`{"name":"","description":"","input_schema":{}}`)
 			if n := tool.Get("name"); n.Exists() {
 				tJSON, _ = sjson.SetBytes(tJSON, "name", n.String())
@@ -358,8 +358,7 @@ func ConvertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte
 			}
 
 			toolsJSON, _ = sjson.SetRawBytes(toolsJSON, "-1", tJSON)
-			return true
-		})
+		}
 		if parsedTools := gjson.ParseBytes(toolsJSON); parsedTools.IsArray() && len(parsedTools.Array()) > 0 {
 			out, _ = sjson.SetRawBytes(out, "tools", toolsJSON)
 		}
@@ -379,7 +378,11 @@ func ConvertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte
 			}
 		case gjson.JSON:
 			if toolChoice.Get("type").String() == "function" {
-				fn := toolChoice.Get("function.name").String()
+				fn := toolChoice.Get("name").String()
+				if fn == "" {
+					fn = toolChoice.Get("function.name").String()
+				}
+				fn = qualifyClaudeResponsesToolName(strings.TrimSpace(toolChoice.Get("namespace").String()), strings.TrimSpace(fn))
 				toolChoiceJSON := []byte(`{"name":"","type":"tool"}`)
 				toolChoiceJSON, _ = sjson.SetBytes(toolChoiceJSON, "name", fn)
 				out, _ = sjson.SetRawBytes(out, "tool_choice", toolChoiceJSON)
