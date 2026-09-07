@@ -32,12 +32,14 @@ func runGoogleResponsesToolIdentity(t *testing.T, provider string, enabled bool)
 
 func runGoogleResponsesToolIdentityWithNamespaceField(t *testing.T, provider string, enabled bool, namespaceField string) {
 	t.Helper()
+	isAntigravity := strings.HasPrefix(provider, "antigravity")
 	for _, stream := range []bool{false, true} {
 		for _, explicitOriginal := range []bool{false, true} {
 			t.Run(fmt.Sprintf("stream=%t/original=%t", stream, explicitOriginal), func(t *testing.T) {
 				cfg := &config.Config{Codex: config.CodexConfig{OptimizeMultiAgentV2: enabled}}
 				controller := core.NewRequestBodyReleaseController(1, []byte("<released>"))
 				tokenCalls := 0
+				upstreamCalls := 0
 				ctx := context.WithValue(t.Context(), "cliproxy.roundtripper", streamTerminalRoundTripFunc(func(r *http.Request) (*http.Response, error) {
 					if r.URL.Host == "oauth-fixture.invalid" {
 						tokenCalls++
@@ -47,21 +49,31 @@ func runGoogleResponsesToolIdentityWithNamespaceField(t *testing.T, provider str
 					if err != nil {
 						t.Error(err)
 					}
+					upstreamCalls++
 					namePath := "tools.0.functionDeclarations.0.name"
 					if provider == "gemini-interactions" {
 						namePath = "tools.0.name"
 					}
-					if provider == "antigravity" {
+					if isAntigravity {
 						namePath = "request." + namePath
 					}
 					if gjson.GetBytes(body, namePath).String() != "collaboration__spawn_agent" {
 						t.Error("namespace declaration did not reach the fake upstream")
 					}
 					cfg.Codex.OptimizeMultiAgentV2 = !enabled
+					if provider == "antigravity-credits" && upstreamCalls == 1 {
+						w := httptest.NewRecorder()
+						w.WriteHeader(http.StatusTooManyRequests)
+						_, _ = io.WriteString(w, `{"error":{"status":"RESOURCE_EXHAUSTED","message":"QUOTA_EXHAUSTED"}}`)
+						return w.Result(), nil
+					}
+					if provider == "antigravity-credits" && !strings.Contains(string(body), `"enabledCreditTypes":["GOOGLE_ONE_AI"]`) {
+						t.Error("credits fallback was not exercised")
+					}
 					controller.Release()
 					w := httptest.NewRecorder()
 					response := `{"candidates":[{"content":{"role":"model","parts":[{"functionCall":{"name":"collaboration__spawn_agent","args":{"message":"work"}}}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":1,"candidatesTokenCount":1,"totalTokenCount":2}}`
-					if provider == "antigravity" {
+					if isAntigravity {
 						response = `{"response":` + response + `}`
 					}
 					if provider == "gemini-interactions" {
@@ -75,7 +87,7 @@ func runGoogleResponsesToolIdentityWithNamespaceField(t *testing.T, provider str
 							return w.Result(), nil
 						}
 					}
-					if stream {
+					if stream || provider == "antigravity-claude" {
 						w.Header().Set("Content-Type", "text/event-stream")
 						_, _ = io.WriteString(w, "data: "+response+"\n\n")
 					} else {
@@ -86,6 +98,9 @@ func runGoogleResponsesToolIdentityWithNamespaceField(t *testing.T, provider str
 				}))
 				executor, auth := newGoogleMultiAgentFixtureExecutor(t, provider, cfg)
 				req := core.Request{Model: "gemini-2.5-flash", Payload: []byte(`{"input":[],"tools":[{"type":"namespace","name":"collaboration","` + namespaceField + `":[{"type":"function","name":"spawn_agent","parameters":{"type":"object"}}]}]}`)}
+				if provider == "antigravity-claude" {
+					req.Model = "claude-sonnet-4-6"
+				}
 				opts := core.Options{SourceFormat: sdktranslator.FormatOpenAIResponse, Headers: http.Header{"User-Agent": {"codex_cli_rs/0.153.4"}}, Metadata: map[string]any{core.BodyReleaseControllerMetadataKey: controller}}
 				if explicitOriginal {
 					opts.OriginalRequest = bytes.Clone(req.Payload)
@@ -126,6 +141,13 @@ func runGoogleResponsesToolIdentityWithNamespaceField(t *testing.T, provider str
 				if tokenCalls != wantTokens {
 					t.Fatalf("credential acquisition calls = %d, want %d", tokenCalls, wantTokens)
 				}
+				wantCalls := 1
+				if provider == "antigravity-credits" {
+					wantCalls = 2
+				}
+				if upstreamCalls != wantCalls {
+					t.Fatalf("upstream calls = %d, want %d", upstreamCalls, wantCalls)
+				}
 				for _, item := range items {
 					if item.Get("encrypted_function_args").Exists() != enabled || enabled && item.Get("encrypted_function_args").Raw != "[]" {
 						t.Fatal("plaintext marker did not keep the request snapshot after release and configuration update")
@@ -160,5 +182,13 @@ func TestInteractionsResponsesToolIdentityAfterRelease(t *testing.T) {
 }
 
 func TestAntigravityResponsesToolIdentityAfterRelease(t *testing.T) {
-	runGoogleResponsesToolIdentity(t, "antigravity", false)
+	resetAntigravityCreditsRetryState()
+	t.Cleanup(resetAntigravityCreditsRetryState)
+	for _, provider := range []string{"antigravity", "antigravity-claude", "antigravity-credits"} {
+		for _, enabled := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/enabled=%t", provider, enabled), func(t *testing.T) {
+				runGoogleResponsesToolIdentity(t, provider, enabled)
+			})
+		}
+	}
 }

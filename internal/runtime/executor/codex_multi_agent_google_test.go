@@ -160,9 +160,13 @@ func newGoogleMultiAgentFixtureExecutor(t *testing.T, provider string, cfg *conf
 	t.Helper()
 	auth := &cliproxyauth.Auth{Provider: provider, Attributes: map[string]string{"api_key": "fixture"}}
 	switch provider {
-	case "antigravity":
+	case "antigravity", "antigravity-claude", "antigravity-credits":
 		auth = antigravityStreamTestAuth()
 		auth.ID = "tool-output-" + t.Name()
+		if provider == "antigravity-credits" {
+			cfg.QuotaExceeded.AntigravityCredits = true
+			setFreshAntigravityCreditsHint(auth, true)
+		}
 		return NewAntigravityExecutor(cfg), auth
 	case "gemini-interactions":
 		return NewGeminiInteractionsExecutor(cfg), auth

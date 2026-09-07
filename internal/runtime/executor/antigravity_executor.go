@@ -941,6 +941,7 @@ func (e *AntigravityExecutor) Execute(ctx context.Context, auth *cliproxyauth.Au
 
 	from := opts.SourceFormat
 	to := sdktranslator.FromString("antigravity")
+	multiAgentResponse := helps.CodexPlaintextResponsePolicy(ctx, opts.Headers, e.cfg, from)
 
 	originalPayloadSource := req.Payload
 	if len(opts.OriginalRequest) > 0 {
@@ -1102,7 +1103,7 @@ attemptLoop:
 							creditsBody = e.resolveWebSearchGroundingURLs(ctx, auth, from, originalRef.Bytes(), translatedRef.Bytes(), creditsBody)
 							reporter.Publish(ctx, helps.ParseAntigravityUsage(creditsBody))
 							var param any
-							converted := sdktranslator.TranslateNonStream(ctx, to, from, req.Model, originalRef.Bytes(), translatedRef.Bytes(), creditsBody, &param)
+							converted := multiAgentResponse.TranslateNonStream(ctx, to, from, req.Model, originalRef.Bytes(), translatedRef.Bytes(), creditsBody, &param)
 							resp = cliproxyexecutor.Response{Payload: converted, Headers: creditsResp.Header.Clone()}
 							reporter.EnsurePublished(ctx)
 							return resp, nil
@@ -1166,7 +1167,7 @@ attemptLoop:
 			bodyBytes = e.resolveWebSearchGroundingURLs(ctx, auth, from, originalRef.Bytes(), translatedRef.Bytes(), bodyBytes)
 			reporter.Publish(ctx, helps.ParseAntigravityUsage(bodyBytes))
 			var param any
-			converted := sdktranslator.TranslateNonStream(ctx, to, from, req.Model, originalRef.Bytes(), translatedRef.Bytes(), bodyBytes, &param)
+			converted := multiAgentResponse.TranslateNonStream(ctx, to, from, req.Model, originalRef.Bytes(), translatedRef.Bytes(), bodyBytes, &param)
 			resp = cliproxyexecutor.Response{Payload: converted, Headers: httpResp.Header.Clone()}
 			reporter.EnsurePublished(ctx)
 			return resp, nil
@@ -1200,6 +1201,7 @@ func (e *AntigravityExecutor) executeClaudeNonStream(ctx context.Context, auth *
 
 	from := opts.SourceFormat
 	to := sdktranslator.FromString("antigravity")
+	multiAgentResponse := helps.CodexPlaintextResponsePolicy(ctx, opts.Headers, e.cfg, from)
 
 	originalPayloadSource := req.Payload
 	if len(opts.OriginalRequest) > 0 {
@@ -1464,7 +1466,7 @@ attemptLoop:
 			resp.Payload = e.resolveWebSearchGroundingURLs(ctx, auth, from, originalRef.Bytes(), translatedRef.Bytes(), resp.Payload)
 			reporter.Publish(ctx, helps.ParseAntigravityUsage(resp.Payload))
 			var param any
-			converted := sdktranslator.TranslateNonStream(ctx, to, from, req.Model, originalRef.Bytes(), translatedRef.Bytes(), resp.Payload, &param)
+			converted := multiAgentResponse.TranslateNonStream(ctx, to, from, req.Model, originalRef.Bytes(), translatedRef.Bytes(), resp.Payload, &param)
 			resp = cliproxyexecutor.Response{Payload: converted, Headers: httpResp.Header.Clone()}
 			reporter.EnsurePublished(ctx)
 
@@ -1697,6 +1699,7 @@ func (e *AntigravityExecutor) ExecuteStream(ctx context.Context, auth *cliproxya
 
 	from := opts.SourceFormat
 	to := sdktranslator.FromString("antigravity")
+	multiAgentResponse := helps.CodexPlaintextResponsePolicy(ctx, opts.Headers, e.cfg, from)
 
 	originalPayloadSource := req.Payload
 	if len(opts.OriginalRequest) > 0 {
@@ -1990,7 +1993,7 @@ attemptLoop:
 					}
 
 					payload = e.resolveWebSearchGroundingURLs(ctx, auth, from, originalRef.Bytes(), translatedRef.Bytes(), payload)
-					chunks := sdktranslator.TranslateStream(ctx, to, from, req.Model, originalRef.Bytes(), translatedRef.Bytes(), bytes.Clone(payload), &param)
+					chunks := multiAgentResponse.TranslateStream(ctx, to, from, req.Model, originalRef.Bytes(), translatedRef.Bytes(), bytes.Clone(payload), &param)
 					for i := range chunks {
 						if !send(cliproxyexecutor.StreamChunk{Payload: chunks[i]}) {
 							return
@@ -1999,7 +2002,7 @@ attemptLoop:
 					terminalSeen = terminalSeen || terminal
 					terminalReady := terminal && !helps.GeminiTerminalAwaitsUsage(rawPayload) || terminalSeen && usagePresent
 					if markerRequested && terminalReady && !protocolFailed && scanner.Err() == nil {
-						tail := sdktranslator.TranslateStream(ctx, to, from, req.Model, originalRef.Bytes(), translatedRef.Bytes(), []byte("[DONE]"), &param)
+						tail := multiAgentResponse.TranslateStream(ctx, to, from, req.Model, originalRef.Bytes(), translatedRef.Bytes(), []byte("[DONE]"), &param)
 						for i := range tail {
 							if !send(cliproxyexecutor.StreamChunk{Payload: tail[i]}) {
 								return
@@ -2018,7 +2021,7 @@ attemptLoop:
 					reporter.PublishFailure(ctx)
 					send(cliproxyexecutor.StreamChunk{Err: errScan})
 				} else if terminalSeen && !protocolFailed {
-					tail := sdktranslator.TranslateStream(ctx, to, from, req.Model, originalRef.Bytes(), translatedRef.Bytes(), []byte("[DONE]"), &param)
+					tail := multiAgentResponse.TranslateStream(ctx, to, from, req.Model, originalRef.Bytes(), translatedRef.Bytes(), []byte("[DONE]"), &param)
 					for i := range tail {
 						if !send(cliproxyexecutor.StreamChunk{Payload: tail[i]}) {
 							return
