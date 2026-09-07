@@ -51,6 +51,9 @@ func runGoogleResponsesToolIdentityWithNamespaceField(t *testing.T, provider str
 					if provider == "gemini-interactions" {
 						namePath = "tools.0.name"
 					}
+					if provider == "antigravity" {
+						namePath = "request." + namePath
+					}
 					if gjson.GetBytes(body, namePath).String() != "collaboration__spawn_agent" {
 						t.Error("namespace declaration did not reach the fake upstream")
 					}
@@ -58,6 +61,9 @@ func runGoogleResponsesToolIdentityWithNamespaceField(t *testing.T, provider str
 					controller.Release()
 					w := httptest.NewRecorder()
 					response := `{"candidates":[{"content":{"role":"model","parts":[{"functionCall":{"name":"collaboration__spawn_agent","args":{"message":"work"}}}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":1,"candidatesTokenCount":1,"totalTokenCount":2}}`
+					if provider == "antigravity" {
+						response = `{"response":` + response + `}`
+					}
 					if provider == "gemini-interactions" {
 						step := `{"id":"pair","type":"function_call","name":"collaboration__spawn_agent","arguments":{"message":"work"}}`
 						response = `{"id":"result","status":"completed","steps":[` + step + `],"usage":{"total_input_tokens":1,"total_output_tokens":1,"total_tokens":2}}`
@@ -151,4 +157,8 @@ func TestInteractionsResponsesToolIdentityAfterRelease(t *testing.T) {
 			})
 		}
 	}
+}
+
+func TestAntigravityResponsesToolIdentityAfterRelease(t *testing.T) {
+	runGoogleResponsesToolIdentity(t, "antigravity", false)
 }

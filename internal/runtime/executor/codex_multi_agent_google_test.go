@@ -160,6 +160,10 @@ func newGoogleMultiAgentFixtureExecutor(t *testing.T, provider string, cfg *conf
 	t.Helper()
 	auth := &cliproxyauth.Auth{Provider: provider, Attributes: map[string]string{"api_key": "fixture"}}
 	switch provider {
+	case "antigravity":
+		auth = antigravityStreamTestAuth()
+		auth.ID = "tool-output-" + t.Name()
+		return NewAntigravityExecutor(cfg), auth
 	case "gemini-interactions":
 		return NewGeminiInteractionsExecutor(cfg), auth
 	case "vertex", "vertex-service-account":
