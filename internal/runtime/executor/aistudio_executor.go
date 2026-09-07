@@ -132,7 +132,7 @@ func (e *AIStudioExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth,
 	reporter := helps.NewUsageReporter(ctx, e.Identifier(), baseModel, auth)
 	defer reporter.TrackFailure(ctx, &err)
 
-	_, body, err := e.translateRequest(req, opts, false)
+	_, body, err := e.translateRequest(ctx, req, opts, false)
 	if err != nil {
 		return resp, err
 	}
@@ -206,7 +206,7 @@ func (e *AIStudioExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth
 	reporter := helps.NewUsageReporter(ctx, e.Identifier(), baseModel, auth)
 	defer reporter.TrackFailure(ctx, &err)
 
-	_, body, err := e.translateRequest(req, opts, true)
+	_, body, err := e.translateRequest(ctx, req, opts, true)
 	if err != nil {
 		return nil, err
 	}
@@ -483,7 +483,7 @@ func (e *AIStudioExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth
 // CountTokens counts tokens for the given request using the AI Studio API.
 func (e *AIStudioExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
 	baseModel := thinking.ParseSuffix(req.Model).ModelName
-	_, body, err := e.translateRequest(req, opts, false)
+	_, body, err := e.translateRequest(ctx, req, opts, false)
 	if err != nil {
 		return cliproxyexecutor.Response{}, err
 	}
@@ -550,7 +550,7 @@ type translatedPayload struct {
 	toFormat sdktranslator.Format
 }
 
-func (e *AIStudioExecutor) translateRequest(req cliproxyexecutor.Request, opts cliproxyexecutor.Options, stream bool) ([]byte, translatedPayload, error) {
+func (e *AIStudioExecutor) translateRequest(ctx context.Context, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, stream bool) ([]byte, translatedPayload, error) {
 	baseModel := thinking.ParseSuffix(req.Model).ModelName
 
 	from := opts.SourceFormat
@@ -560,9 +560,15 @@ func (e *AIStudioExecutor) translateRequest(req cliproxyexecutor.Request, opts c
 		originalPayloadSource = opts.OriginalRequest
 	}
 	originalPayload := originalPayloadSource
-	originalTranslated := sdktranslator.TranslateRequest(from, to, baseModel, originalPayload, stream)
-	payload := sdktranslator.TranslateRequest(from, to, baseModel, req.Payload, stream)
-	payload, err := thinking.ApplyThinking(payload, req.Model, from.String(), to.String(), e.Identifier())
+	originalTranslated, err := helps.TranslateRequestWithCodexMultiAgentV2(ctx, opts.Headers, e.cfg, from, to, baseModel, originalPayload, stream)
+	if err != nil {
+		return nil, translatedPayload{}, err
+	}
+	payload, err := helps.TranslateRequestWithCodexMultiAgentV2(ctx, opts.Headers, e.cfg, from, to, baseModel, req.Payload, stream)
+	if err != nil {
+		return nil, translatedPayload{}, err
+	}
+	payload, err = thinking.ApplyThinking(payload, req.Model, from.String(), to.String(), e.Identifier())
 	if err != nil {
 		return nil, translatedPayload{}, err
 	}
