@@ -145,8 +145,10 @@ func TestVertexResponsesToolIdentityAndMultiAgentAfterRelease(t *testing.T) {
 
 func TestInteractionsResponsesToolIdentityAfterRelease(t *testing.T) {
 	for _, field := range []string{"tools", "children"} {
-		t.Run(field, func(t *testing.T) {
-			runGoogleResponsesToolIdentityWithNamespaceField(t, "gemini-interactions", false, field)
-		})
+		for _, enabled := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/enabled=%t", field, enabled), func(t *testing.T) {
+				runGoogleResponsesToolIdentityWithNamespaceField(t, "gemini-interactions", enabled, field)
+			})
+		}
 	}
 }

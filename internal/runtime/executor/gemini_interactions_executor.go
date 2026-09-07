@@ -245,6 +245,7 @@ func appendGeminiInteractionsFrameLine(frame, line []byte, maxBytes int) ([]byte
 }
 
 func (e *GeminiExecutor) executeInteractions(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (resp cliproxyexecutor.Response, err error) {
+	multiAgentResponse := helps.CodexPlaintextResponsePolicy(ctx, opts.Headers, e.cfg, cliproxyexecutor.ResponseFormatOrSource(opts))
 	targetName := thinking.ParseSuffix(req.Model).ModelName
 	reporter := helps.NewExecutorUsageReporter(ctx, e, targetName, auth)
 	defer reporter.TrackFailure(ctx, &err)
@@ -330,11 +331,13 @@ func (e *GeminiExecutor) executeInteractions(ctx context.Context, auth *cliproxy
 
 	reporter.Publish(ctx, helps.ParseInteractionsUsage(data))
 	var param any
-	out := sdktranslator.TranslateNonStream(ctx, sdktranslator.FormatInteractions, cliproxyexecutor.ResponseFormatOrSource(opts), req.Model, originalRef.Bytes(), bodyRef.Bytes(), data, &param)
+	out := multiAgentResponse.TranslateNonStream(ctx, sdktranslator.FormatInteractions, cliproxyexecutor.ResponseFormatOrSource(opts), req.Model, originalRef.Bytes(), bodyRef.Bytes(), data, &param)
 	return cliproxyexecutor.Response{Payload: out, Headers: responseHeaders}, nil
 }
 
 func (e *GeminiExecutor) executeInteractionsStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (_ *cliproxyexecutor.StreamResult, err error) {
+	responseFormat := cliproxyexecutor.ResponseFormatOrSource(opts)
+	multiAgentResponse := helps.CodexPlaintextResponsePolicy(ctx, opts.Headers, e.cfg, responseFormat)
 	targetName := thinking.ParseSuffix(req.Model).ModelName
 	reporter := helps.NewExecutorUsageReporter(ctx, e, targetName, auth)
 	defer reporter.TrackFailure(ctx, &err)
@@ -415,8 +418,7 @@ func (e *GeminiExecutor) executeInteractionsStream(ctx context.Context, auth *cl
 
 	helps.ReleaseRequestBodyAfterStreamEstablished(ctx, opts)
 	out := make(chan cliproxyexecutor.StreamChunk)
-	responseFormat := cliproxyexecutor.ResponseFormatOrSource(opts)
-	go e.consumeInteractionsStream(ctx, httpResp.Body, req.Model, responseFormat, opts, originalRef, bodyRef, reporter, cleanupBodies, out)
+	go e.consumeInteractionsStream(ctx, httpResp.Body, req.Model, responseFormat, multiAgentResponse, opts, originalRef, bodyRef, reporter, cleanupBodies, out)
 	return &cliproxyexecutor.StreamResult{Headers: responseHeaders, Chunks: out}, nil
 }
 
@@ -425,6 +427,7 @@ func (e *GeminiExecutor) consumeInteractionsStream(
 	responseBody io.ReadCloser,
 	model string,
 	responseFormat sdktranslator.Format,
+	multiAgentResponse helps.CodexMultiAgentResponsePolicy,
 	opts cliproxyexecutor.Options,
 	originalRef, bodyRef *cliproxyexecutor.ReleasableBytes,
 	reporter *helps.UsageReporter,
@@ -483,7 +486,7 @@ func (e *GeminiExecutor) consumeInteractionsStream(
 		if len(payload) == 0 {
 			return true
 		}
-		lines := sdktranslator.TranslateStream(ctx, sdktranslator.FormatInteractions, responseFormat, model, originalRef.Bytes(), bodyRef.Bytes(), bytes.Clone(payload), &param)
+		lines := multiAgentResponse.TranslateStream(ctx, sdktranslator.FormatInteractions, responseFormat, model, originalRef.Bytes(), bodyRef.Bytes(), bytes.Clone(payload), &param)
 		for i := range lines {
 			if !send(cliproxyexecutor.StreamChunk{Payload: lines[i]}) {
 				return false
