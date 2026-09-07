@@ -20,6 +20,14 @@ type claudeResponsesToolIdentity struct {
 	name, namespace string
 }
 
+func claudeResponsesBlockIndex(value gjson.Result) (int, bool) {
+	index := value.Int()
+	if value.Type != gjson.Number || index < 0 || value.Float() != float64(index) || int64(int(index)) != index {
+		return 0, false
+	}
+	return int(index), true
+}
+
 func claudeResponsesToolIdentities(original, translated []byte) map[string]claudeResponsesToolIdentity {
 	identities := make(map[string]claudeResponsesToolIdentity)
 	for _, declaration := range claudeResponsesTools(gjson.ParseBytes(pickRequestJSON(original, translated))) {
