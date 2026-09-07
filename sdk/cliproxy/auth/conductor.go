@@ -485,6 +485,7 @@ type Manager struct {
 	// runtimeConfig stores the latest application config for request-time decisions.
 	// It is initialized in NewManager; never Load() before first Store().
 	runtimeConfig atomic.Value
+	routingPolicy atomic.Pointer[routingRequestPolicy]
 
 	// Optional HTTP RoundTripper provider injected by host.
 	rtProviderMu     sync.RWMutex
@@ -781,6 +782,7 @@ func NewManager(store Store, selector Selector, hook Hook) *Manager {
 	manager.hookValue.Store(hookState{hook: hook})
 	// atomic.Value requires non-nil initial value.
 	manager.runtimeConfig.Store(&internalconfig.Config{})
+	manager.routingPolicy.Store(newRoutingRequestPolicy(manager, selector, internalconfig.RoutingConfig{FillFirstRange: fillFirstRangeFromSelector(selector)}))
 	manager.apiKeyModelAlias.Store(apiKeyModelAliasTable(nil))
 	manager.scheduler = newAuthScheduler(selector)
 	manager.executionMetrics = &cliproxyexecutor.RequestExecutionMetrics{}
@@ -1162,6 +1164,13 @@ func (m *Manager) SetSelector(selector Selector) {
 	}
 	m.mu.Lock()
 	m.selector = selector
+	cfg, _ := m.runtimeConfig.Load().(*internalconfig.Config)
+	routing := internalconfig.RoutingConfig{}
+	if cfg != nil {
+		routing = cfg.Routing
+	}
+	routing.FillFirstRange = fillFirstRangeFromSelector(selector)
+	m.routingPolicy.Store(newRoutingRequestPolicy(m, selector, routing))
 	m.mu.Unlock()
 	if m.scheduler != nil {
 		m.scheduler.setSelector(selector)
@@ -1277,8 +1286,9 @@ func (m *Manager) SetConfig(cfg *internalconfig.Config) {
 	if m.scheduler != nil {
 		m.scheduler.setRoutingConfig(cfg.Routing)
 	}
-	m.runtimeConfig.Store(cfg)
 	m.mu.Lock()
+	m.runtimeConfig.Store(cfg)
+	m.routingPolicy.Store(newRoutingRequestPolicy(m, m.selector, cfg.Routing))
 	if m.backingPathAuthDir != strings.TrimSpace(cfg.AuthDir) {
 		m.rebuildBackingPathIndexLocked(cfg)
 	}
