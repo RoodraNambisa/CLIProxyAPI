@@ -18,6 +18,7 @@ func claudeResponsesTools(root gjson.Result) []translatorcommon.ResponsesToolDec
 
 type claudeResponsesToolIdentity struct {
 	name, namespace string
+	custom          bool
 }
 
 func claudeResponsesBlockIndex(value gjson.Result) (int, bool) {
@@ -33,6 +34,7 @@ func claudeResponsesToolIdentities(original, translated []byte) map[string]claud
 	for _, declaration := range claudeResponsesTools(gjson.ParseBytes(pickRequestJSON(original, translated))) {
 		identities[strings.Clone(declaration.QualifiedName)] = claudeResponsesToolIdentity{
 			name: strings.Clone(declaration.Name), namespace: strings.Clone(declaration.Namespace),
+			custom: declaration.Tool.Get("type").String() == "custom",
 		}
 	}
 	return identities
@@ -48,4 +50,41 @@ func restoreClaudeResponsesToolIdentity(payload []byte, prefix, wireName string,
 		payload, _ = sjson.SetBytes(payload, prefix+"namespace", namespace)
 	}
 	return payload
+}
+
+func claudeResponsesToolItemID(identities map[string]claudeResponsesToolIdentity, name, callID string) string {
+	if identities[name].custom {
+		return "ctc_" + callID
+	}
+	return "fc_" + callID
+}
+
+func claudeResponsesCustomInput(arguments string) string {
+	if !gjson.Valid(arguments) {
+		return arguments
+	}
+	if input := gjson.Get(arguments, "input"); input.Exists() {
+		if input.Type == gjson.String {
+			return input.String()
+		}
+		return input.Raw
+	}
+	return arguments
+}
+
+func buildClaudeResponsesToolItem(identities map[string]claudeResponsesToolIdentity, name, callID, arguments, status string) []byte {
+	kind, field := "function_call", "arguments"
+	if identities[name].custom {
+		kind, field = "custom_tool_call", "input"
+		arguments = claudeResponsesCustomInput(arguments)
+	} else if status == "completed" && arguments == "" {
+		arguments = "{}"
+	}
+	item := []byte(`{"id":"","type":"","status":"","call_id":"","name":""}`)
+	item, _ = sjson.SetBytes(item, "id", claudeResponsesToolItemID(identities, name, callID))
+	item, _ = sjson.SetBytes(item, "type", kind)
+	item, _ = sjson.SetBytes(item, "status", status)
+	item, _ = sjson.SetBytes(item, "call_id", callID)
+	item, _ = sjson.SetBytes(item, field, arguments)
+	return restoreClaudeResponsesToolIdentity(item, "", name, identities)
 }
