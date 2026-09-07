@@ -97,3 +97,58 @@ func TestCodexCollaborationRestoreLeavesOpaqueOrInactivePayloads(t *testing.T) {
 		t.Fatal("inactive restore changed a response")
 	}
 }
+
+func TestCodexCollaborationGeneratedPlaintextCallHasExplicitMarker(t *testing.T) {
+	raw := []byte(`{"type":"response.output_item.added","item":{"type":"function_call","namespace":"collaboration-optimize","name":"spawn_agent","arguments":"{}"}}`)
+	got := RestoreCodexMultiAgentV2Response(raw, true)
+	if gjson.GetBytes(got, "item.encrypted_function_args").Raw != "[]" {
+		t.Fatal("plaintext collaboration call lacks the client's explicit marker")
+	}
+}
+
+func TestCodexCollaborationPlaintextMarkerPreservesEncryptionAndScope(t *testing.T) {
+	for _, tc := range []struct {
+		name, namespace, toolName, itemType, marker string
+		restore, plaintext, wantMarker              bool
+	}{
+		{"prepared-native", "collaboration", "send_message", "function_call", "", false, true, true},
+		{"flattened", "", "collaboration__followup_task", "function_call", "", false, true, true},
+		{"renamed", "collaboration-optimize", "spawn_agent", "function_call", "", true, true, true},
+		{"null", "collaboration", "spawn_agent", "function_call", "null", false, true, true},
+		{"empty", "collaboration", "spawn_agent", "function_call", "[]", false, true, false},
+		{"encrypted", "collaboration", "spawn_agent", "function_call", `["message"]`, false, true, false},
+		{"invalid-marker", "collaboration", "spawn_agent", "function_call", `{"message":true}`, false, true, false},
+		{"other-namespace", "external", "spawn_agent", "function_call", "", true, true, false},
+		{"plain-top-level", "", "spawn_agent", "function_call", "", true, true, false},
+		{"other-tool", "collaboration", "wait", "function_call", "", false, true, false},
+		{"custom", "collaboration", "spawn_agent", "custom_tool_call", "", true, true, false},
+		{"disabled", "collaboration", "spawn_agent", "function_call", "", false, false, false},
+		{"rename-only", "collaboration-optimize", "spawn_agent", "function_call", "", true, false, false},
+		{"conflict-unrenamed", "collaboration-optimize", "spawn_agent", "function_call", "", false, true, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			marker := ""
+			if tc.marker != "" {
+				marker = `,"encrypted_function_args":` + tc.marker
+			}
+			raw := []byte(fmt.Sprintf(`{"type":"response.completed","response":{"output":[{"type":%q,"namespace":%q,"name":%q,"call_id":"pair","arguments":"exact","metadata":{"encrypted_function_args":null}%s}]}}`, tc.itemType, tc.namespace, tc.toolName, marker))
+			original := bytes.Clone(raw)
+			got := RewriteCodexMultiAgentV2Response(raw, tc.restore, tc.plaintext)
+			want := tc.marker
+			if tc.wantMarker {
+				want = "[]"
+			}
+			if gjson.GetBytes(got, "response.output.0.encrypted_function_args").Raw != want {
+				t.Fatal("plaintext marker did not respect existing encryption metadata or tool scope")
+			}
+			for _, path := range []string{"response.output.0.call_id", "response.output.0.arguments", "response.output.0.metadata"} {
+				if gjson.GetBytes(got, path).Raw != gjson.GetBytes(raw, path).Raw {
+					t.Fatalf("unrelated content changed: %s", path)
+				}
+			}
+			if !bytes.Equal(original, raw) || !bytes.Equal(RewriteCodexMultiAgentV2Response(got, tc.restore, tc.plaintext), got) {
+				t.Fatal("rewrite mutated the request or was not idempotent")
+			}
+		})
+	}
+}

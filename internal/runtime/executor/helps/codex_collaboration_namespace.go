@@ -46,7 +46,13 @@ type codexProtocolNode struct {
 // RestoreCodexMultiAgentV2Response restores tool identities in Responses items,
 // events and echoed tool declarations. Opaque business data is never traversed.
 func RestoreCodexMultiAgentV2Response(payload []byte, optimized bool) []byte {
-	if !optimized || !gjson.ValidBytes(payload) {
+	return RewriteCodexMultiAgentV2Response(payload, optimized, optimized)
+}
+
+// RewriteCodexMultiAgentV2Response also supports prepared plaintext tools that
+// did not require a namespace rename, such as non-Codex provider responses.
+func RewriteCodexMultiAgentV2Response(payload []byte, restoreNamespace, plaintextCalls bool) []byte {
+	if (!restoreNamespace && !plaintextCalls) || !gjson.ValidBytes(payload) {
 		return payload
 	}
 	updated := payload
@@ -106,7 +112,7 @@ func RestoreCodexMultiAgentV2Response(payload []byte, optimized bool) []byte {
 			continue
 		}
 		if itemType == "namespace" && (node.kind == "tool" || node.kind == "item") {
-			if node.value.Get("name").String() == codexOptimizedCollaborationNamespace &&
+			if restoreNamespace && node.value.Get("name").String() == codexOptimizedCollaborationNamespace &&
 				!set(fieldPath(node.path, "name"), codexCollaborationNamespace) {
 				return payload
 			}
@@ -117,15 +123,51 @@ func RestoreCodexMultiAgentV2Response(payload []byte, optimized bool) []byte {
 		if !isCall {
 			continue
 		}
-		if node.value.Get("namespace").String() == codexOptimizedCollaborationNamespace &&
+		if restoreNamespace && node.value.Get("namespace").String() == codexOptimizedCollaborationNamespace &&
 			!set(fieldPath(node.path, "namespace"), codexCollaborationNamespace) {
 			return payload
 		}
 		name := node.value.Get("name").String()
-		if strings.HasPrefix(name, codexOptimizedCollaborationNamePrefix) &&
+		if restoreNamespace && strings.HasPrefix(name, codexOptimizedCollaborationNamePrefix) &&
 			!set(fieldPath(node.path, "name"), codexCollaborationNamespace+"__"+strings.TrimPrefix(name, codexOptimizedCollaborationNamePrefix)) {
 			return payload
 		}
+		if plaintextCalls && itemType == "function_call" && codexPlaintextCollaborationCall(node.value, restoreNamespace) {
+			marker := node.value.Get("encrypted_function_args")
+			if !marker.Exists() || marker.Type == gjson.Null {
+				var errSet error
+				updated, errSet = sjson.SetRawBytes(updated, fieldPath(node.path, "encrypted_function_args"), []byte("[]"))
+				if errSet != nil {
+					return payload
+				}
+			}
+		}
 	}
 	return updated
+}
+
+func codexPlaintextCollaborationCall(item gjson.Result, restoreNamespace bool) bool {
+	namespace, name := item.Get("namespace").String(), item.Get("name").String()
+	if restoreNamespace {
+		if namespace == codexOptimizedCollaborationNamespace {
+			namespace = codexCollaborationNamespace
+		}
+		if strings.HasPrefix(name, codexOptimizedCollaborationNamePrefix) {
+			name = codexCollaborationNamespace + "__" + strings.TrimPrefix(name, codexOptimizedCollaborationNamePrefix)
+		}
+	}
+	if namespace != "" && namespace != codexCollaborationNamespace {
+		return false
+	}
+	if strings.HasPrefix(name, codexCollaborationNamespace+"__") {
+		name = strings.TrimPrefix(name, codexCollaborationNamespace+"__")
+	} else if namespace != codexCollaborationNamespace {
+		return false
+	}
+	switch name {
+	case "spawn_agent", "send_message", "followup_task":
+		return true
+	default:
+		return false
+	}
 }
