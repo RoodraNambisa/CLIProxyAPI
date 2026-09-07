@@ -17,12 +17,13 @@ type historyIndexKey struct {
 }
 
 type historyEntry struct {
-	key     historyIndexKey
-	history History
-	authID  string
-	expires time.Time
-	version uint64
-	lru     *list.Element
+	key       historyIndexKey
+	history   History
+	authID    string
+	expires   time.Time
+	version   uint64
+	lru       *list.Element
+	discarded bool
 }
 
 // HistoryMatcher holds bounded, caller-scoped credential preferences. It has
@@ -37,6 +38,7 @@ type HistoryMatcher struct {
 	lru                    list.List
 	prefixCount            int
 	version, operations    uint64
+	invalidations          uint64
 }
 
 type HistoryMatch struct {
@@ -104,18 +106,23 @@ func (m *HistoryMatcher) Match(namespace string, history History) (HistoryMatch,
 // Bind publishes a completed request's credential preference and returns its
 // revision. A zero revision means the history was ineligible or over budget.
 func (m *HistoryMatcher) Bind(namespace string, history History, authID string) uint64 {
+	return m.bind(namespace, history, authID).version
+}
+
+func (m *HistoryMatcher) bind(namespace string, history History, authID string) historyMutation {
 	if m == nil || namespace == "" || authID == "" || !history.Usable() {
-		return 0
+		return historyMutation{}
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.now == nil || m.groups == nil || len(history.prefixes)-history.minimum+1 > m.maxPrefixes {
-		return 0
+		return historyMutation{}
 	}
 	now := m.now()
 	m.pruneLocked(now)
 	key := historyIndexKey{sha256.Sum256([]byte(namespace)), history.prefixes[len(history.prefixes)-1]}
-	if previous := m.groups[key]; previous != nil {
+	previous := m.groups[key]
+	if previous != nil {
 		m.removeLocked(previous)
 	}
 	needed := len(history.prefixes) - history.minimum + 1
@@ -125,7 +132,7 @@ func (m *HistoryMatcher) Bind(namespace string, history History, authID string) 
 	m.version++
 	entry := &historyEntry{key: key, history: history, authID: strings.Clone(authID), expires: now.Add(m.ttl), version: m.version}
 	m.addLocked(entry)
-	return entry.version
+	return historyMutation{key: key, version: entry.version, entry: entry, previous: previous, invalidations: m.invalidations}
 }
 
 func (m *HistoryMatcher) addLocked(entry *historyEntry) {
@@ -175,6 +182,7 @@ func (m *HistoryMatcher) InvalidateAuth(authID string) {
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.invalidations++
 	for _, entry := range m.groups {
 		if entry.authID == authID {
 			m.removeLocked(entry)
