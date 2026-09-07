@@ -547,7 +547,9 @@ nonstream-keepalive-interval: 0
 #       unsupported-model-message: "Native image edit is not enabled for model {model}"
 # Streaming behavior (SSE keep-alives + safe bootstrap retries).
 # streaming:
-#   keepalive-seconds: 15            # Default: 0 (disabled). <= 0 disables keep-alives.
+#   keepalive-seconds: 15            # SSE heartbeats and WebSocket Ping. Default: 0 (disabled).
+#                                  # Positive range: 1..9223372036 seconds; <= 0 or overflow disables.
+#                                  # WebSocket turns snapshot the interval; reload affects the next turn.
 #   bootstrap-retries: 1             # Default: 0 (disabled). Retries before first byte is sent.
 #   enable-stream-flush: false       # Batch regular non-image stream flushes when true.
 #   stream-flush-interval-ms: 0      # Batch regular stream flushes for up to N ms. 0 disables time batching.

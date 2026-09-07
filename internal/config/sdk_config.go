@@ -136,8 +136,8 @@ type ErrorResponseRewriteRule struct {
 
 // StreamingConfig holds server streaming behavior configuration.
 type StreamingConfig struct {
-	// KeepAliveSeconds controls how often the server emits SSE heartbeats (": keep-alive\n\n").
-	// <= 0 disables keep-alives. Default is 0.
+	// KeepAliveSeconds controls SSE heartbeats (": keep-alive\n\n") and WebSocket Ping frames.
+	// <= 0 or a value overflowing time.Duration disables keep-alives. Default is 0.
 	KeepAliveSeconds int `yaml:"keepalive-seconds,omitempty" json:"keepalive-seconds,omitempty"`
 
 	// BootstrapRetries controls how many times the server may retry a streaming request before any bytes are sent,

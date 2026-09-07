@@ -538,14 +538,14 @@ func BuildErrorResponseBody(status int, errText string) []byte {
 	return payload
 }
 
-// StreamingKeepAliveInterval returns the SSE keep-alive interval for this server.
+// StreamingKeepAliveInterval returns the SSE heartbeat and WebSocket Ping interval.
 // Returning 0 disables keep-alives (default when unset).
 func StreamingKeepAliveInterval(cfg *config.SDKConfig) time.Duration {
 	seconds := defaultStreamingKeepAliveSeconds
 	if cfg != nil {
 		seconds = cfg.Streaming.KeepAliveSeconds
 	}
-	if seconds <= 0 {
+	if seconds <= 0 || int64(seconds) > int64((1<<63-1)/time.Second) {
 		return 0
 	}
 	return time.Duration(seconds) * time.Second

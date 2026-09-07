@@ -138,6 +138,9 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 		if msgType != websocket.TextMessage && msgType != websocket.BinaryMessage {
 			continue
 		}
+		// Freeze handler policy once for this logical turn, including a potentially
+		// slow credential/bootstrap phase before the first upstream output.
+		h := NewOpenAIResponsesAPIHandler(handlers.NewBaseAPIHandlers(h.ConfigSnapshot(), h.AuthManager))
 		util.RegisterPromptCacheLogPolicy(c, payload)
 		h.BeginChatGPTWebImageErrorSanitization(c, false)
 		// log.Infof(
@@ -256,9 +259,11 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 				}
 			})
 		}
-		dataChan, _, errChan := h.ExecuteStreamWithAuthManager(cliCtx, h.HandlerType(), modelName, requestJSON, "")
+		dataChan, errChan, streamDone := h.startResponsesWebsocketStream(cliCtx, modelName, requestJSON)
 
 		completedOutput, forwardErrMsg, errForward := h.forwardResponsesWebsocket(c, conn, cliCancel, dataChan, errChan, &wsTimelineLog, passthroughSessionID, toolPairState, toolCacheTurn)
+		cliCancel(nil)
+		<-streamDone
 		if errForward != nil {
 			wsTerminateErr = errForward
 			log.Warnf("responses websocket: forward failed id=%s error=%v", executorhelps.CodexWebsocketSessionLogID(passthroughSessionID), executorhelps.CodexWebsocketLogError(errForward, util.PromptCacheLogForGin(c)))
@@ -863,6 +868,17 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesWebsocket(
 	}()
 	completed := false
 	completedSuccessfully := false
+	keepAliveInterval := time.Duration(0)
+	if h != nil && h.BaseAPIHandler != nil {
+		keepAliveInterval = handlers.StreamingKeepAliveInterval(h.ConfigSnapshot())
+	}
+	var keepAlive *time.Timer
+	var keepAliveC <-chan time.Time
+	if keepAliveInterval > 0 {
+		keepAlive = time.NewTimer(keepAliveInterval)
+		defer keepAlive.Stop()
+		keepAliveC = keepAlive.C
+	}
 	completedOutput := []byte("[]")
 	outputItemsByIndex := make(map[int64][]byte)
 	var outputItemsFallback [][]byte
@@ -902,6 +918,14 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesWebsocket(
 		case <-c.Request.Context().Done():
 			cancel(c.Request.Context().Err())
 			return completedOutput, nil, c.Request.Context().Err()
+		case <-keepAliveC:
+			// All application data and proactive Ping frames use this writer loop.
+			// A zero deadline preserves the existing no-network-timeout contract.
+			if errPing := conn.WriteControl(websocket.PingMessage, nil, time.Time{}); errPing != nil {
+				cancel(errPing)
+				return completedOutput, nil, errPing
+			}
+			keepAlive.Reset(keepAliveInterval)
 		case errMsg, ok := <-errs:
 			if !ok {
 				errs = nil
@@ -984,6 +1008,9 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesWebsocket(
 					)
 					cancel(errWrite)
 					return completedOutput, nil, errWrite
+				}
+				if keepAlive != nil {
+					keepAlive.Reset(keepAliveInterval)
 				}
 				if payloadErrMsg != nil {
 					cancel(payloadErrMsg.Error)
