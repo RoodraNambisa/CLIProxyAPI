@@ -4439,15 +4439,18 @@ func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxye
 	}
 	strictSessionAffinity := m.strictSessionAffinityForRequest(req, opts)
 
-	_, maxRetryCredentials, maxWait := m.retrySettings()
-	requestRetry := m.maxRequestRetryForProviders(normalized)
+	defaultRequestRetry, maxRetryCredentials, maxWait := m.retrySettings()
+	requestRetry := m.maxRequestRetryForProviders(normalized, defaultRequestRetry)
 	roundState := newRequestRoundState()
 
 	var lastErr error
 	for attempt := 0; ; {
-		resp, errExec := m.executeMixedOnce(ctx, normalized, req, opts, attempt, maxRetryCredentials, roundState)
+		resp, errExec := m.executeMixedOnce(ctx, normalized, req, opts, attempt, maxRetryCredentials, defaultRequestRetry, roundState)
 		if errExec == nil {
 			return resp, nil
+		}
+		if lastErr != nil && emptyCredentialRetryRound(roundState, errExec) {
+			break
 		}
 		lastErr = errExec
 		if !requestBodyReplayable(ctx, opts) {
@@ -4529,15 +4532,18 @@ func (m *Manager) ExecuteCount(ctx context.Context, providers []string, req clip
 	}
 	strictSessionAffinity := m.strictSessionAffinityForRequest(req, opts)
 
-	_, maxRetryCredentials, maxWait := m.retrySettings()
-	requestRetry := m.maxRequestRetryForProviders(normalized)
+	defaultRequestRetry, maxRetryCredentials, maxWait := m.retrySettings()
+	requestRetry := m.maxRequestRetryForProviders(normalized, defaultRequestRetry)
 	roundState := newRequestRoundState()
 
 	var lastErr error
 	for attempt := 0; ; {
-		resp, errExec := m.executeCountMixedOnce(ctx, normalized, req, opts, attempt, maxRetryCredentials, roundState)
+		resp, errExec := m.executeCountMixedOnce(ctx, normalized, req, opts, attempt, maxRetryCredentials, defaultRequestRetry, roundState)
 		if errExec == nil {
 			return resp, nil
+		}
+		if lastErr != nil && emptyCredentialRetryRound(roundState, errExec) {
+			break
 		}
 		lastErr = errExec
 		if !requestBodyReplayable(ctx, opts) {
@@ -4617,15 +4623,18 @@ func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cli
 	}
 	strictSessionAffinity := m.strictSessionAffinityForRequest(req, opts)
 
-	_, maxRetryCredentials, maxWait := m.retrySettings()
-	requestRetry := m.maxRequestRetryForProviders(normalized)
+	defaultRequestRetry, maxRetryCredentials, maxWait := m.retrySettings()
+	requestRetry := m.maxRequestRetryForProviders(normalized, defaultRequestRetry)
 	roundState := newRequestRoundState()
 
 	var lastErr error
 	for attempt := 0; ; {
-		result, errStream := m.executeStreamMixedOnce(ctx, normalized, req, opts, attempt, maxRetryCredentials, roundState)
+		result, errStream := m.executeStreamMixedOnce(ctx, normalized, req, opts, attempt, maxRetryCredentials, defaultRequestRetry, roundState)
 		if errStream == nil {
 			return result, nil
+		}
+		if lastErr != nil && emptyCredentialRetryRound(roundState, errStream) {
+			break
 		}
 		lastErr = errStream
 		if !requestBodyReplayable(ctx, opts) {
@@ -5523,7 +5532,7 @@ func (m *Manager) prepareRequestAuthWithUnauthorizedRefresh(ctx context.Context,
 	return prepared, true, errPrepare
 }
 
-func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, requestAttempt int, maxRetryCredentials int, roundState *requestRoundState) (cliproxyexecutor.Response, error) {
+func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, requestAttempt int, maxRetryCredentials int, defaultRequestRetry int, roundState *requestRoundState) (cliproxyexecutor.Response, error) {
 	if len(providers) == 0 {
 		return cliproxyexecutor.Response{}, &Error{Code: "provider_not_found", Message: "no provider supplied"}
 	}
@@ -5535,7 +5544,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 	opts.AuthRequestSlot = newAuthRequestSlot(opts.ExecutionDiagnostics, opts.ExecutionMetrics)
 	defer opts.AuthRequestSlot.Release()
 	strictSessionAffinity := m.strictSessionAffinityForRequest(req, opts)
-	pickAllowed := m.roundPickAllowed(roundState, maxRetryCredentials)
+	pickAllowed := m.requestRoundPickAllowed(roundState, maxRetryCredentials, requestAttempt, defaultRequestRetry)
 	unregisterRelease := registerRequestBodyReleaseCallback(ctx, opts, func([]byte) {
 		req.Payload = nil
 		opts.OriginalRequest = nil
@@ -5801,7 +5810,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 	}
 }
 
-func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, requestAttempt int, maxRetryCredentials int, roundState *requestRoundState) (cliproxyexecutor.Response, error) {
+func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, requestAttempt int, maxRetryCredentials int, defaultRequestRetry int, roundState *requestRoundState) (cliproxyexecutor.Response, error) {
 	if len(providers) == 0 {
 		return cliproxyexecutor.Response{}, &Error{Code: "provider_not_found", Message: "no provider supplied"}
 	}
@@ -5812,7 +5821,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 	opts.AuthRequestSlot = newAuthRequestSlot(opts.ExecutionDiagnostics, opts.ExecutionMetrics)
 	defer opts.AuthRequestSlot.Release()
 	strictSessionAffinity := m.strictSessionAffinityForRequest(req, opts)
-	pickAllowed := m.roundPickAllowed(roundState, maxRetryCredentials)
+	pickAllowed := m.requestRoundPickAllowed(roundState, maxRetryCredentials, requestAttempt, defaultRequestRetry)
 	unregisterRelease := registerRequestBodyReleaseCallback(ctx, opts, func([]byte) {
 		req.Payload = nil
 		opts.OriginalRequest = nil
@@ -6064,7 +6073,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 	}
 }
 
-func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, requestAttempt int, maxRetryCredentials int, roundState *requestRoundState) (*cliproxyexecutor.StreamResult, error) {
+func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, requestAttempt int, maxRetryCredentials int, defaultRequestRetry int, roundState *requestRoundState) (*cliproxyexecutor.StreamResult, error) {
 	if len(providers) == 0 {
 		return nil, &Error{Code: "provider_not_found", Message: "no provider supplied"}
 	}
@@ -6076,7 +6085,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 	opts.AuthRequestSlot = newAuthRequestSlot(opts.ExecutionDiagnostics, opts.ExecutionMetrics)
 	defer opts.AuthRequestSlot.Release()
 	strictSessionAffinity := m.strictSessionAffinityForRequest(req, opts)
-	pickAllowed := m.roundPickAllowed(roundState, maxRetryCredentials)
+	pickAllowed := m.requestRoundPickAllowed(roundState, maxRetryCredentials, requestAttempt, defaultRequestRetry)
 	unregisterRelease := registerRequestBodyReleaseCallback(ctx, opts, func([]byte) {
 		req.Payload = nil
 		opts.OriginalRequest = nil
@@ -7607,8 +7616,11 @@ func (m *Manager) withRequestRetryBudget(ctx context.Context, providers []string
 	return context.WithValue(ctx, requestRetryBudgetContextKey{}, newRequestRetryBudget(bootstrapRetries))
 }
 
-func (m *Manager) maxRequestRetryForProviders(providers []string) int {
+func (m *Manager) maxRequestRetryForProviders(providers []string, capturedDefault ...int) int {
 	defaultRetry, _, _ := m.retrySettings()
+	if len(capturedDefault) > 0 {
+		defaultRetry = capturedDefault[0]
+	}
 	if defaultRetry < 0 {
 		defaultRetry = 0
 	}
