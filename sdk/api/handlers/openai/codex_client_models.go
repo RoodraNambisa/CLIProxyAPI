@@ -3,6 +3,7 @@ package openai
 import (
 	"encoding/json"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -21,19 +22,75 @@ var (
 )
 
 var codexClientAllowedReasoningLevels = map[string]struct{}{
-	"none":   {},
-	"low":    {},
-	"medium": {},
-	"high":   {},
-	"xhigh":  {},
-	"max":    {},
-	"ultra":  {},
+	"none":    {},
+	"minimal": {},
+	"low":     {},
+	"medium":  {},
+	"high":    {},
+	"xhigh":   {},
+	"max":     {},
+	"ultra":   {},
 }
 
 func CodexClientModelsResponse(models []map[string]any) map[string]any {
 	return map[string]any{
 		"models": buildCodexClientModels(models),
 	}
+}
+
+// CodexClientModelsResponseForClient filters only capabilities the real client
+// cannot decode. Outbound software identity does not determine client capability.
+func CodexClientModelsResponseForClient(models []map[string]any, clientVersion string) map[string]any {
+	response := CodexClientModelsResponse(models)
+	if supportsExtendedCodexClientReasoning(clientVersion) {
+		return response
+	}
+	for _, model := range response["models"].([]map[string]any) {
+		levels, ok := model["supported_reasoning_levels"].([]any)
+		if !ok {
+			continue
+		}
+		retained := make([]any, 0, len(levels))
+		for _, raw := range levels {
+			entry, ok := raw.(map[string]any)
+			if !ok {
+				continue
+			}
+			level := stringModelValue(entry, "effort")
+			if level != "max" && level != "ultra" {
+				retained = append(retained, entry)
+			}
+		}
+		model["supported_reasoning_levels"] = retained
+		sanitizeCodexClientReasoningMetadata(model)
+	}
+	return response
+}
+
+func supportsExtendedCodexClientReasoning(version string) bool {
+	core := strings.TrimSpace(version)
+	if strings.HasPrefix(core, "v") || strings.HasPrefix(core, "V") {
+		core = core[1:]
+	}
+	if index := strings.IndexAny(core, "-+"); index >= 0 {
+		core = core[:index]
+	}
+	parts := strings.Split(core, ".")
+	if len(parts) < 2 || len(parts) > 3 {
+		return true
+	}
+	major, errMajor := strconv.Atoi(parts[0])
+	minor, errMinor := strconv.Atoi(parts[1])
+	if errMajor != nil || errMinor != nil || major < 0 || minor < 0 {
+		return true
+	}
+	if len(parts) == 3 {
+		patch, errPatch := strconv.Atoi(parts[2])
+		if errPatch != nil || patch < 0 {
+			return true
+		}
+	}
+	return major > 0 || minor >= 144
 }
 
 func buildCodexClientModels(models []map[string]any) []map[string]any {
@@ -247,6 +304,7 @@ func applyCodexClientInputModalitiesMetadata(entry map[string]any, modalities []
 }
 
 func applyCodexClientThinkingMetadata(entry map[string]any, thinking *registry.ThinkingSupport) {
+	// Budget-only metadata retains the existing template's discrete choices.
 	if thinking == nil || len(thinking.Levels) == 0 {
 		return
 	}
@@ -271,6 +329,8 @@ func applyCodexClientThinkingMetadata(entry map[string]any, thinking *registry.T
 		})
 	}
 	if len(levels) == 0 {
+		entry["supported_reasoning_levels"] = levels
+		delete(entry, "default_reasoning_level")
 		return
 	}
 	if defaultLevel == "" {
@@ -305,7 +365,7 @@ func sanitizeCodexClientReasoningMetadata(entry map[string]any) {
 	}
 
 	if len(levels) == 0 {
-		delete(entry, "supported_reasoning_levels")
+		entry["supported_reasoning_levels"] = levels
 		delete(entry, "default_reasoning_level")
 		return
 	}
@@ -331,6 +391,8 @@ func codexClientReasoningDescription(level string) string {
 	switch level {
 	case "none":
 		return "No reasoning"
+	case "minimal":
+		return "Minimal reasoning for low-latency responses"
 	case "low":
 		return "Fast responses with lighter reasoning"
 	case "medium":
