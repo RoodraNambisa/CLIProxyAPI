@@ -20,6 +20,7 @@ import (
 	internalauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth"
 	internalcodex "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/codex"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/authfileguard"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/credentialweight"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/jsonsemantic"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	"github.com/sirupsen/logrus"
@@ -725,6 +726,9 @@ func (s *FileTokenStore) save(ctx context.Context, auth *cliproxyauth.Auth, requ
 	}
 	if auth == nil {
 		return "", fmt.Errorf("auth filestore: auth is nil")
+	}
+	if errWeight := cliproxyauth.ValidateAuthWeight(auth); errWeight != nil {
+		return "", errWeight
 	}
 	createChatGPTWeb := requireAbsent && strings.EqualFold(strings.TrimSpace(auth.Provider), "chatgpt-web")
 	if cliproxyauth.IsRetiredGeminiCLIAuth(auth) {
@@ -1905,6 +1909,9 @@ func (s *FileTokenStore) readAuthFileFromRoot(ctx context.Context, root *os.Root
 		return nil, nil
 	}
 	data := snapshot.data
+	if errWeight := credentialweight.ValidateMetadataJSON(data); errWeight != nil {
+		return nil, errWeight
+	}
 	metadata := make(map[string]any)
 	if err = json.Unmarshal(data, &metadata); err != nil {
 		return nil, fmt.Errorf("unmarshal auth json: %w", err)
