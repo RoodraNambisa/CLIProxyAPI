@@ -68,3 +68,56 @@ func TestClaudeResponsesReasoningBlocksKeepIdentityAndOrder(t *testing.T) {
 		}
 	}
 }
+
+func TestClaudeResponsesCompletionClosesPendingBlocksOnce(t *testing.T) {
+	for _, complete := range []bool{false, true} {
+		var state any
+		request := []byte(`{"tools":[{"type":"custom","name":"patch"}]}`)
+		events := []string{
+			`{"type":"message_start","message":{"id":"result"}}`,
+			`{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"pair","name":"patch"}}`,
+			`{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"input\":\"work\"}"}}`,
+			`{"type":"content_block_start","index":1,"content_block":{"type":"text"}}`,
+			`{"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"answer"}}`,
+			`{"type":"content_block_start","index":2,"content_block":{"type":"thinking"}}`,
+			`{"type":"content_block_delta","index":2,"delta":{"type":"thinking_delta","thinking":"summary"}}`,
+		}
+		if complete {
+			events = append(events, `{"type":"message_stop"}`, `{"type":"message_stop"}`, `{"type":"content_block_stop","index":0}`)
+		} else {
+			events = append(events, `{"type":"error","error":{"type":"overloaded_error"}}`)
+		}
+		counts := make(map[string]int)
+		lastSequence := int64(0)
+		for _, event := range events {
+			for _, chunk := range ConvertClaudeResponseToOpenAIResponses(t.Context(), "", request, nil, []byte("data: "+event), &state) {
+				for _, line := range strings.Split(string(chunk), "\n") {
+					if !strings.HasPrefix(line, "data:") {
+						continue
+					}
+					data := gjson.Parse(strings.TrimPrefix(line, "data:"))
+					kind := data.Get("type").String()
+					counts[kind]++
+					if seq := data.Get("sequence_number").Int(); seq <= lastSequence {
+						t.Fatal("completion events are not ordered")
+					} else {
+						lastSequence = seq
+					}
+					if kind == "response.custom_tool_call_input.done" && data.Get("input").String() != "work" {
+						t.Fatal("completed custom input was lost")
+					}
+					if kind == "response.completed" && counts["response.output_item.done"] != 3 {
+						t.Error("response completed before its items")
+					}
+				}
+			}
+		}
+		want := 0
+		if complete {
+			want = 1
+		}
+		if counts["response.output_item.done"] != 3*want || counts["response.completed"] != want || counts["response.custom_tool_call_input.done"] != want || counts["response.custom_tool_call_input.delta"] != want || counts["response.output_text.done"] != want || counts["response.reasoning_summary_text.done"] != want {
+			t.Fatalf("pending block completion (success=%t): %v", complete, counts)
+		}
+	}
+}

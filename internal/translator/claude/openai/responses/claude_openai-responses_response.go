@@ -343,6 +343,10 @@ func ConvertClaudeResponseToOpenAIResponses(ctx context.Context, modelName strin
 			}
 		}
 	case "message_stop":
+		for _, index := range st.pendingBlockIndexes() {
+			stop := []byte(fmt.Sprintf(`data: {"type":"content_block_stop","index":%d}`, index))
+			out = append(out, ConvertClaudeResponseToOpenAIResponses(ctx, modelName, nil, nil, stop, param)...)
+		}
 		st.Completed = true
 
 		completed := []byte(`{"type":"response.completed","sequence_number":0,"response":{"id":"","object":"response","created_at":0,"status":"completed","background":false,"error":null}}`)
@@ -457,6 +461,27 @@ func ConvertClaudeResponseToOpenAIResponses(ctx context.Context, modelName strin
 	}
 
 	return out
+}
+
+func (st *claudeToResponsesState) pendingBlockIndexes() []int {
+	var indexes []int
+	for index, block := range st.TextBlocks {
+		if !block.Done {
+			indexes = append(indexes, index)
+		}
+	}
+	for index, block := range st.ReasoningBlocks {
+		if !block.Done {
+			indexes = append(indexes, index)
+		}
+	}
+	for index := range st.FuncCallIDs {
+		if !st.FuncDone[index] {
+			indexes = append(indexes, index)
+		}
+	}
+	sort.Ints(indexes)
+	return indexes
 }
 
 func claudeResponsesTextItem(block *claudeResponsesTextBlock) []byte {
