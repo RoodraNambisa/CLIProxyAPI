@@ -54,3 +54,39 @@ func codexLocalCompactionMessageText(message gjson.Result) string {
 	}
 	return text.String()
 }
+
+// Only a successful compaction result consumes earlier triggers. Current input
+// is appended later and must retain any newly requested trigger.
+func dropConsumedWebsocketCompactionTriggers(previous, output gjson.Result) string {
+	if !previous.IsArray() || !output.IsArray() {
+		return previous.Raw
+	}
+	compacted := false
+	for _, item := range output.Array() {
+		typ := item.Get("type").String()
+		if typ == "compaction" || typ == "compaction_summary" {
+			compacted = true
+			break
+		}
+	}
+	if !compacted {
+		return previous.Raw
+	}
+	items := previous.Array()
+	var retained strings.Builder
+	retained.Grow(len(previous.Raw))
+	retained.WriteByte('[')
+	count := 0
+	for _, item := range items {
+		if item.Get("type").String() == "compaction_trigger" {
+			continue
+		}
+		if count > 0 {
+			retained.WriteByte(',')
+		}
+		retained.WriteString(item.Raw)
+		count++
+	}
+	retained.WriteByte(']')
+	return retained.String()
+}

@@ -375,7 +375,8 @@ func normalizeResponseSubsequentRequest(rawJSON []byte, lastRequest []byte, last
 	}
 
 	existingInput := gjson.GetBytes(lastRequest, "input")
-	mergedInput, errMerge := mergeJSONArrayRaw(existingInput.Raw, normalizeJSONArrayRaw(lastResponseOutput))
+	existingRaw := dropConsumedWebsocketCompactionTriggers(existingInput, gjson.ParseBytes(lastResponseOutput))
+	mergedInput, errMerge := mergeJSONArrayRaw(existingRaw, normalizeJSONArrayRaw(lastResponseOutput))
 	if errMerge != nil {
 		return nil, lastRequest, &interfaces.ErrorMessage{
 			StatusCode: http.StatusBadRequest,

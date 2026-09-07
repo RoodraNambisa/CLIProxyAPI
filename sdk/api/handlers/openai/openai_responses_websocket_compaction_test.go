@@ -67,3 +67,33 @@ func TestResponsesWebsocketLocalCompactionReplacesOnlyRecognizedTranscript(t *te
 		t.Fatal("summary split across text parts was missed")
 	}
 }
+
+func TestResponsesWebsocketDropsOnlyConsumedCompactionTriggers(t *testing.T) {
+
+	previous := gjson.Parse(`[{"type":"compaction_trigger","id":"pending"}]`)
+	for _, raw := range []string{`{"type":"compaction"}`, `null`, `"compaction"`, `[]`} {
+		if dropConsumedWebsocketCompactionTriggers(previous, gjson.Parse(raw)) != previous.Raw {
+			t.Fatal("invalid or empty output consumed an earlier trigger")
+		}
+	}
+	for _, outputType := range []string{"compaction", "compaction_summary", "message"} {
+		previous := []byte(`{"model":"gpt-6-astra","input":[{"type":"message","role":"user","content":"history"}]}`)
+		trigger := []byte(`{"type":"response.create","input":[{"type":"compaction_trigger","id":"old-trigger"}]}`)
+		_, next, errMsg := normalizeResponsesWebsocketRequestWithMode(trigger, previous, []byte(`[]`), false)
+		if errMsg != nil {
+			t.Fatal(errMsg.Error)
+		}
+		current := []byte(`{"type":"response.create","input":[{"type":"message","role":"user","content":"continue"},{"type":"compaction_trigger","id":"new-trigger"}]}`)
+		output := []byte(fmt.Sprintf(`[{"type":%q,"id":"output"}]`, outputType))
+		merged, _, errMsg := normalizeResponsesWebsocketRequestWithMode(current, next, output, false)
+		if errMsg != nil {
+			t.Fatal(errMsg.Error)
+		}
+		if bytes.Contains(merged, []byte("old-trigger")) != (outputType == "message") || !bytes.Contains(merged, []byte("new-trigger")) || !bytes.Contains(merged, []byte("history")) {
+			t.Fatal("compaction trigger consumption discarded history or a fresh trigger")
+		}
+		if outputType != "message" && !shouldReplaceWebsocketTranscript([]byte(`{"type":"response.create"}`), gjson.ParseBytes(output)) {
+			t.Fatal("explicit compaction item was not recognized as a transcript")
+		}
+	}
+}
