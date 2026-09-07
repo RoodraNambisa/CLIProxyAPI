@@ -18,6 +18,15 @@ import (
 )
 
 func TestGeminiMultiAgentHistoryAndClientGate(t *testing.T) {
+	runGeminiMultiAgentHistory(t, false)
+}
+
+func TestGeminiInteractionsMultiAgentHistoryAndClientGate(t *testing.T) {
+	runGeminiMultiAgentHistory(t, true)
+}
+
+func runGeminiMultiAgentHistory(t *testing.T, interactions bool) {
+	t.Helper()
 	for _, operation := range []string{"execute", "stream", "count"} {
 		for _, mode := range []string{"disabled", "enabled", "other-client"} {
 			t.Run(operation+"/"+mode, func(t *testing.T) {
@@ -29,9 +38,13 @@ func TestGeminiMultiAgentHistoryAndClientGate(t *testing.T) {
 						return nil, err
 					}
 					content := gjson.GetBytes(body, "contents").Raw
+					if interactions && operation != "count" {
+						content = gjson.GetBytes(body, "input").Raw
+					}
 					before, worker, after := strings.Index(content, `"before"`), strings.Index(content, `"worker result"`), strings.Index(content, `"after"`)
-					enabled := mode == "enabled"
-					if before < 0 || after <= before || (worker >= 0) != enabled || enabled && (worker <= before || worker >= after) {
+					// Interactions already retained plaintext through its generic content fallback.
+					wantWorker := mode == "enabled" || interactions && operation != "count"
+					if before < 0 || after <= before || (worker >= 0) != wantWorker || wantWorker && (worker <= before || worker >= after) {
 						t.Error("Gemini lost collaboration order or client gating")
 					}
 					result := `{"candidates":[{"content":{"role":"model","parts":[{"text":"ok"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":1,"candidatesTokenCount":1,"totalTokenCount":2}}`
@@ -43,10 +56,20 @@ func TestGeminiMultiAgentHistoryAndClientGate(t *testing.T) {
 					if operation == "count" {
 						result = `{"totalTokens":12}`
 					}
+					if interactions && operation != "count" {
+						result = `{"id":"i1","status":"completed","outputs":[{"type":"text","text":"ok"}],"usage":{"total_input_tokens":1,"total_output_tokens":1,"total_tokens":2}}`
+						if operation == "stream" {
+							result = "event: interaction.completed\ndata: {\"event_type\":\"interaction.completed\",\"interaction\":" + result + "}\n\n"
+						}
+					}
 					return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": {contentType}}, Body: io.NopCloser(strings.NewReader(result))}, nil
 				}))
 				executor := NewGeminiExecutor(&config.Config{Codex: config.CodexConfig{OptimizeMultiAgentV2: mode != "disabled"}})
 				auth := &cliproxyauth.Auth{Attributes: map[string]string{"api_key": "fixture"}}
+				if interactions {
+					executor = NewGeminiInteractionsExecutor(executor.cfg)
+					auth.Provider = "gemini-interactions"
+				}
 				userAgent := "codex_cli_rs/0.153.4"
 				if mode == "other-client" {
 					userAgent = "other/1"
@@ -65,6 +88,15 @@ func TestGeminiMultiAgentHistoryAndClientGate(t *testing.T) {
 }
 
 func TestGeminiMultiAgentCiphertextAndCancellation(t *testing.T) {
+	runGeminiMultiAgentCiphertext(t, false)
+}
+
+func TestGeminiInteractionsMultiAgentCiphertextAndCancellation(t *testing.T) {
+	runGeminiMultiAgentCiphertext(t, true)
+}
+
+func runGeminiMultiAgentCiphertext(t *testing.T, interactions bool) {
+	t.Helper()
 	var calls atomic.Int32
 	ctx := context.WithValue(t.Context(), "cliproxy.roundtripper", streamTerminalRoundTripFunc(func(*http.Request) (*http.Response, error) {
 		calls.Add(1)
@@ -72,6 +104,10 @@ func TestGeminiMultiAgentCiphertextAndCancellation(t *testing.T) {
 	}))
 	executor := NewGeminiExecutor(&config.Config{Codex: config.CodexConfig{OptimizeMultiAgentV2: true}})
 	auth := &cliproxyauth.Auth{Attributes: map[string]string{"api_key": "fixture"}}
+	if interactions {
+		executor = NewGeminiInteractionsExecutor(executor.cfg)
+		auth.Provider = "gemini-interactions"
+	}
 	for _, operation := range []string{"execute", "stream", "count"} {
 		for _, originalOnly := range []bool{false, true} {
 			if originalOnly && operation == "count" {
