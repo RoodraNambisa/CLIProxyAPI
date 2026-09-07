@@ -81,7 +81,7 @@ func validateCredentialWeightYAML(data []byte) error {
 			return nil
 		}
 		for index, item := range sequence.Content {
-			weight, err := credentialWeightYAMLField(item, "weight", make(map[*yaml.Node]bool))
+			weight, err := credentialYAMLField(item, "weight", make(map[*yaml.Node]bool))
 			if err != nil {
 				return err
 			}
@@ -102,7 +102,7 @@ func validateCredentialWeightYAML(data []byte) error {
 		return nil
 	}
 	for _, name := range []string{"gemini-api-key", "interactions-api-key", "claude-api-key", "codex-api-key", "vertex-api-key"} {
-		sequence, err := credentialWeightYAMLField(root, name, make(map[*yaml.Node]bool))
+		sequence, err := credentialYAMLField(root, name, make(map[*yaml.Node]bool))
 		if err != nil {
 			return err
 		}
@@ -110,7 +110,7 @@ func validateCredentialWeightYAML(data []byte) error {
 			return err
 		}
 	}
-	providers, err := credentialWeightYAMLField(root, "openai-compatibility", make(map[*yaml.Node]bool))
+	providers, err := credentialYAMLField(root, "openai-compatibility", make(map[*yaml.Node]bool))
 	if err != nil {
 		return err
 	}
@@ -119,7 +119,7 @@ func validateCredentialWeightYAML(data []byte) error {
 	}
 	if providers != nil && providers.Kind == yaml.SequenceNode {
 		for index, provider := range providers.Content {
-			sequence, err := credentialWeightYAMLField(provider, "api-key-entries", make(map[*yaml.Node]bool))
+			sequence, err := credentialYAMLField(provider, "api-key-entries", make(map[*yaml.Node]bool))
 			if err != nil {
 				return err
 			}
@@ -131,29 +131,35 @@ func validateCredentialWeightYAML(data []byte) error {
 	return nil
 }
 
-func credentialWeightYAMLField(node *yaml.Node, name string, visited map[*yaml.Node]bool) (*yaml.Node, error) {
+func credentialYAMLField(node *yaml.Node, name string, visited map[*yaml.Node]bool) (*yaml.Node, error) {
 	if node == nil {
 		return nil, nil
 	}
 	if visited[node] || len(visited) > 256 {
-		return nil, fmt.Errorf("credential weight YAML contains a cycle or exceeds the nesting limit")
+		return nil, fmt.Errorf("credential YAML contains a cycle or exceeds the nesting limit")
 	}
 	visited[node] = true
 	defer delete(visited, node)
 	if node.Kind == yaml.AliasNode {
-		return credentialWeightYAMLField(node.Alias, name, visited)
+		return credentialYAMLField(node.Alias, name, visited)
 	}
 	if node.Kind != yaml.MappingNode {
 		return nil, nil
 	}
+	var explicit *yaml.Node
 	for index := 0; index+1 < len(node.Content); index += 2 {
 		if node.Content[index].Value == name {
-			value := node.Content[index+1]
-			if value.Kind == yaml.AliasNode {
-				value = value.Alias
+			if explicit != nil {
+				return nil, fmt.Errorf("credential YAML contains duplicate %s fields", name)
 			}
-			return value, nil
+			explicit = node.Content[index+1]
 		}
+	}
+	if explicit != nil {
+		if explicit.Kind == yaml.AliasNode {
+			explicit = explicit.Alias
+		}
+		return explicit, nil
 	}
 	for index := 0; index+1 < len(node.Content); index += 2 {
 		if node.Content[index].Tag != "!!merge" {
@@ -162,11 +168,11 @@ func credentialWeightYAMLField(node *yaml.Node, name string, visited map[*yaml.N
 		merge := node.Content[index+1]
 		if merge.Kind == yaml.SequenceNode {
 			for _, item := range merge.Content {
-				if field, err := credentialWeightYAMLField(item, name, visited); field != nil || err != nil {
+				if field, err := credentialYAMLField(item, name, visited); field != nil || err != nil {
 					return field, err
 				}
 			}
-		} else if field, err := credentialWeightYAMLField(merge, name, visited); field != nil || err != nil {
+		} else if field, err := credentialYAMLField(merge, name, visited); field != nil || err != nil {
 			return field, err
 		}
 	}

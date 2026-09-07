@@ -1852,6 +1852,9 @@ type CloakConfig struct {
 // ClaudeKey represents the configuration for a Claude API key,
 // including the API key itself and an optional base URL for the API endpoint.
 type ClaudeKey struct {
+	// RequestRetry overrides additional credential retry rounds. Nil inherits;
+	// negative values act as zero. Values above MaxCredentialRequestRetry are invalid.
+	RequestRetry *int `yaml:"request-retry,omitempty" json:"request-retry,omitempty"`
 	// Weight is optional; only weighted-round-robin uses it. Missing means one.
 	Weight *int `yaml:"weight,omitempty" json:"weight,omitempty"`
 	// APIKey is the authentication key for accessing Claude API services.
@@ -1911,6 +1914,9 @@ func (m ClaudeModel) GetForceMapping() bool { return m.ForceMapping }
 // CodexKey represents the configuration for a Codex API key,
 // including the API key itself and an optional base URL for the API endpoint.
 type CodexKey struct {
+	// RequestRetry overrides additional credential retry rounds. Nil inherits;
+	// negative values act as zero. Values above MaxCredentialRequestRetry are invalid.
+	RequestRetry *int `yaml:"request-retry,omitempty" json:"request-retry,omitempty"`
 	// Weight is optional; only weighted-round-robin uses it. Missing means one.
 	Weight *int `yaml:"weight,omitempty" json:"weight,omitempty"`
 	// APIKey is the authentication key for accessing Codex API services.
@@ -1965,6 +1971,9 @@ func (m CodexModel) GetForceMapping() bool { return m.ForceMapping }
 // GeminiKey represents the configuration for a Gemini API key,
 // including optional overrides for upstream base URL, proxy routing, and headers.
 type GeminiKey struct {
+	// RequestRetry overrides additional credential retry rounds. Nil inherits;
+	// negative values act as zero. Values above MaxCredentialRequestRetry are invalid.
+	RequestRetry *int `yaml:"request-retry,omitempty" json:"request-retry,omitempty"`
 	// Weight is optional; only weighted-round-robin uses it. Missing means one.
 	Weight *int `yaml:"weight,omitempty" json:"weight,omitempty"`
 	// APIKey is the authentication key for accessing Gemini API services.
@@ -2015,6 +2024,9 @@ func (m GeminiModel) GetForceMapping() bool { return m.ForceMapping }
 // OpenAICompatibility represents the configuration for OpenAI API compatibility
 // with external providers, allowing model aliases to be routed through OpenAI API format.
 type OpenAICompatibility struct {
+	// RequestRetry applies to credentials of this provider. Nil inherits;
+	// negative values act as zero. Values above MaxCredentialRequestRetry are invalid.
+	RequestRetry *int `yaml:"request-retry,omitempty" json:"request-retry,omitempty"`
 	// Name is the identifier for this OpenAI compatibility configuration.
 	Name string `yaml:"name" json:"name"`
 
@@ -2156,6 +2168,9 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	if errWeight := validateCredentialWeightYAML(data); errWeight != nil {
 		return nil, errWeight
 	}
+	if errRetry := validateCredentialRequestRetryYAML(data); errRetry != nil {
+		return nil, errRetry
+	}
 	if err = yaml.Unmarshal(data, &cfg); err != nil {
 		if optional {
 			if accountInfoErr := validateChatGPTWebAccountInfoYAML(data); accountInfoErr != nil {
@@ -2187,6 +2202,9 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 
 	if errWeight := cfg.ValidateCredentialWeights(); errWeight != nil {
 		return nil, errWeight
+	}
+	if errRetry := cfg.ValidateCredentialRequestRetries(); errRetry != nil {
+		return nil, errRetry
 	}
 	// Hash remote management key if plaintext is detected (nested)
 	// We consider a value to be already hashed if it looks like a bcrypt hash ($2a$, $2b$, or $2y$ prefix).
@@ -3828,6 +3846,9 @@ func SaveConfigPreserveComments(configFile string, cfg *Config) error {
 	if errWeight := cfg.ValidateCredentialWeights(); errWeight != nil {
 		return errWeight
 	}
+	if errRetry := cfg.ValidateCredentialRequestRetries(); errRetry != nil {
+		return errRetry
+	}
 	persistCfg := *cfg
 	groups, errNormalizeGroups := NormalizeAPIKeyGroups(persistCfg.APIKeyGroups, persistCfg.APIKeys)
 	if errNormalizeGroups != nil {
@@ -4166,6 +4187,10 @@ func isKnownDefaultValue(path []string, node *yaml.Node) bool {
 		case "gemini-api-key.weight", "interactions-api-key.weight", "claude-api-key.weight",
 			"codex-api-key.weight", "vertex-api-key.weight", "openai-compatibility.api-key-entries.weight":
 			// An explicit zero excludes this credential only in weighted routing.
+			return false
+		case "gemini-api-key.request-retry", "interactions-api-key.request-retry", "claude-api-key.request-retry",
+			"codex-api-key.request-retry", "vertex-api-key.request-retry", "openai-compatibility.request-retry":
+			// An explicit zero disables extra rounds instead of inheriting the global limit.
 			return false
 		case "routing.priority-overrides.per-auth-request-limit":
 			// This pointer field uses an explicit zero to disable an inherited limit.

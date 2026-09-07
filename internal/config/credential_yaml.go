@@ -104,7 +104,7 @@ func prepareCredentialYAMLForSave(root *yaml.Node) error {
 	for name := range credentialYAMLTypes {
 		index := findMapKeyIndex(root, name)
 		if index < 0 {
-			inherited, err := credentialWeightYAMLField(root, name, make(map[*yaml.Node]bool))
+			inherited, err := credentialYAMLField(root, name, make(map[*yaml.Node]bool))
 			if err != nil {
 				return err
 			}
