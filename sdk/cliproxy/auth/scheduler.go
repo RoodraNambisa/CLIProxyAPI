@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"fmt"
 	"math/rand/v2"
 	"reflect"
 	"sort"
@@ -23,6 +24,7 @@ const (
 	schedulerStrategyRoundRobin
 	schedulerStrategyFillFirst
 	schedulerStrategyRandom
+	schedulerStrategyWeightedRoundRobin
 )
 
 // scheduledState describes how an auth currently participates in a model shard.
@@ -60,6 +62,7 @@ type authScheduler struct {
 	requestLimiter       *authRequestWindowLimiter
 	mixedCursorMu        sync.Mutex
 	mixedCursors         map[string]int
+	mixedWeightedStates  map[string]*smoothWeightedState
 }
 
 // RoutingDiagnosticsSnapshot summarizes credential availability for one provider/model shard.
@@ -150,6 +153,7 @@ type readyBucket struct {
 type readyView struct {
 	flat       []*scheduledAuth
 	lastPicked string
+	weighted   smoothWeightedState
 }
 
 // cooldownQueue is the blocked auth collection ordered by next retry time during rebuilds.
@@ -157,6 +161,7 @@ type cooldownQueue []*scheduledAuth
 
 type readyViewCursorState struct {
 	lastPicked string
+	weighted   smoothWeightedState
 }
 
 type readyBucketCursorState struct {
@@ -165,7 +170,7 @@ type readyBucketCursorState struct {
 }
 
 func snapshotReadyViewCursors(view readyView) readyViewCursorState {
-	return readyViewCursorState{lastPicked: view.lastPicked}
+	return readyViewCursorState{lastPicked: view.lastPicked, weighted: view.weighted.clone()}
 }
 
 func restoreReadyViewCursors(view *readyView, state readyViewCursorState) {
@@ -173,6 +178,7 @@ func restoreReadyViewCursors(view *readyView, state readyViewCursorState) {
 		return
 	}
 	view.lastPicked = state.lastPicked
+	view.weighted = state.weighted.clone()
 }
 
 // newAuthScheduler constructs an empty scheduler configured for the supplied selector strategy.
@@ -206,6 +212,8 @@ func selectorStrategy(selector Selector) schedulerStrategy {
 		return schedulerStrategyFillFirst
 	case *RandomSelector:
 		return schedulerStrategyRandom
+	case *WeightedRoundRobinSelector:
+		return schedulerStrategyWeightedRoundRobin
 	case nil, *RoundRobinSelector:
 		return schedulerStrategyRoundRobin
 	default:
@@ -238,6 +246,8 @@ func schedulerStrategyFromName(strategy string) (schedulerStrategy, bool) {
 		return schedulerStrategyFillFirst, true
 	case "random":
 		return schedulerStrategyRandom, true
+	case "weighted-round-robin":
+		return schedulerStrategyWeightedRoundRobin, true
 	default:
 		return schedulerStrategyRoundRobin, true
 	}
@@ -619,6 +629,7 @@ func (s *authScheduler) setSelector(selector Selector) {
 	s.mixedCursorMu.Lock()
 	defer s.mixedCursorMu.Unlock()
 	clear(s.mixedCursors)
+	clear(s.mixedWeightedStates)
 }
 
 // rebuild recreates the complete scheduler state from an auth snapshot.
@@ -632,6 +643,7 @@ func (s *authScheduler) rebuild(auths []*Auth) {
 	s.authProviders = make(map[string]string)
 	s.mixedCursorMu.Lock()
 	s.mixedCursors = make(map[string]int)
+	s.mixedWeightedStates = make(map[string]*smoothWeightedState)
 	s.mixedCursorMu.Unlock()
 	now := time.Now()
 	for _, auth := range auths {
@@ -753,8 +765,18 @@ func (s *authScheduler) unblockAuthRequestRefresh(authID string, auth *Auth) {
 	s.mu.Unlock()
 }
 
+func schedulerContextError(ctx context.Context) error {
+	if ctx != nil {
+		return ctx.Err()
+	}
+	return nil
+}
+
 // pickSingle returns the next auth for a single provider/model request using scheduler state.
 func (s *authScheduler) pickSingle(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, tried map[string]struct{}, authAllowed ...func(*Auth) bool) (*Auth, error) {
+	if err := schedulerContextError(ctx); err != nil {
+		return nil, err
+	}
 	if s == nil {
 		return nil, &Error{Code: "auth_not_found", Message: "no auth available"}
 	}
@@ -766,6 +788,9 @@ func (s *authScheduler) pickSingle(ctx context.Context, provider, model string, 
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	providerState := s.providers[providerKey]
+	if err := schedulerContextError(ctx); err != nil {
+		return nil, err
+	}
 	strategyForPriority := s.strategyForPriorityLocked
 	fillFirstRangeForPriority := s.fillFirstRangeForPriorityLocked
 	fillFirstPerAuthRPMForPriority := s.fillFirstPerAuthRPMForPriorityLocked
@@ -783,12 +808,18 @@ func (s *authScheduler) pickSingle(ctx context.Context, provider, model string, 
 	}
 	providerState.mu.Lock()
 	defer providerState.mu.Unlock()
+	if err := schedulerContextError(ctx); err != nil {
+		return nil, err
+	}
 	shard := providerState.ensureModelLocked(modelKey, time.Now())
 	if shard == nil {
 		return nil, &Error{Code: "auth_not_found", Message: "no auth available"}
 	}
 	priorityPredicate := func(entry *scheduledAuth) bool {
 		if entry == nil || entry.auth == nil {
+			return false
+		}
+		if strategyForPriority(authPriority(entry.auth)) == schedulerStrategyWeightedRoundRobin && authWeight(entry.auth) <= 0 {
 			return false
 		}
 		if pinnedAuthID != "" && entry.auth.ID != pinnedAuthID {
@@ -820,6 +851,9 @@ func (s *authScheduler) pickSingle(ctx context.Context, provider, model string, 
 
 // pickMixed returns the next auth and provider for a mixed-provider request.
 func (s *authScheduler) pickMixed(ctx context.Context, providers []string, model string, opts cliproxyexecutor.Options, tried map[string]struct{}, authAllowed ...func(*Auth) bool) (*Auth, string, error) {
+	if err := schedulerContextError(ctx); err != nil {
+		return nil, "", err
+	}
 	if s == nil {
 		return nil, "", &Error{Code: "auth_not_found", Message: "no auth available"}
 	}
@@ -846,6 +880,9 @@ func (s *authScheduler) pickMixed(ctx context.Context, providers []string, model
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	strategyForPriority := s.strategyForPriorityLocked
+	if err := schedulerContextError(ctx); err != nil {
+		return nil, "", err
+	}
 	fillFirstRangeForPriority := s.fillFirstRangeForPriorityLocked
 	fillFirstPerAuthRPMForPriority := s.fillFirstPerAuthRPMForPriorityLocked
 	baseRequestLimitForAuth := s.requestLimitPolicyForAuthLocked
@@ -868,12 +905,15 @@ func (s *authScheduler) pickMixed(ctx context.Context, providers []string, model
 		}
 		providerState.mu.Lock()
 		defer providerState.mu.Unlock()
+		if err := schedulerContextError(ctx); err != nil {
+			return nil, "", err
+		}
 		shard := providerState.ensureModelLocked(modelKey, time.Now())
 		priorityPredicate := func(entry *scheduledAuth) bool {
 			if entry == nil || entry.auth == nil {
 				return false
 			}
-			return entry.auth.ID == pinnedAuthID
+			return entry.auth.ID == pinnedAuthID && (strategyForPriority(authPriority(entry.auth)) != schedulerStrategyWeightedRoundRobin || authWeight(entry.auth) > 0)
 		}
 		pickPredicate := func(entry *scheduledAuth) bool {
 			if !priorityPredicate(entry) {
@@ -903,7 +943,7 @@ func (s *authScheduler) pickMixed(ctx context.Context, providers []string, model
 	}
 
 	priorityPredicate := func(entry *scheduledAuth) bool {
-		return entry != nil && entry.auth != nil
+		return entry != nil && entry.auth != nil && (strategyForPriority(authPriority(entry.auth)) != schedulerStrategyWeightedRoundRobin || authWeight(entry.auth) > 0)
 	}
 	pickPredicate := triedPredicate(tried, authAllowed...)
 	candidateShards := make([]*modelScheduler, len(normalized))
@@ -911,6 +951,9 @@ func (s *authScheduler) pickMixed(ctx context.Context, providers []string, model
 	now := time.Now()
 	lockedProviders := lockProviderSchedulers(providerStates)
 	defer unlockProviderSchedulers(lockedProviders)
+	if err := schedulerContextError(ctx); err != nil {
+		return nil, "", err
+	}
 	for providerIndex, providerKey := range normalized {
 		providerState := providerStates[providerKey]
 		if providerState == nil {
@@ -950,6 +993,48 @@ func (s *authScheduler) pickMixed(ctx context.Context, providers []string, model
 	requestLimited := authRequestLimitBlock{}
 	for _, targetPriority := range prioritiesToTry {
 		switch strategyForPriority(targetPriority) {
+		case schedulerStrategyWeightedRoundRobin:
+			candidates := make([]*Auth, 0)
+			owners := make(map[string]string)
+			for providerIndex, providerKey := range normalized {
+				shard := candidateShards[providerIndex]
+				if shard == nil {
+					continue
+				}
+				for _, entry := range shard.readyEntriesAtPriorityLocked(false, targetPriority, pickPredicate) {
+					if entry != nil && entry.auth != nil && authWeight(entry.auth) > 0 {
+						candidates = append(candidates, entry.auth)
+						owners[entry.auth.ID] = providerKey
+					}
+				}
+			}
+			sort.Slice(candidates, func(i, j int) bool { return candidates[i].ID < candidates[j].ID })
+			s.mixedCursorMu.Lock()
+			if err := schedulerContextError(ctx); err != nil {
+				s.mixedCursorMu.Unlock()
+				return nil, "", err
+			}
+			if s.mixedWeightedStates == nil {
+				s.mixedWeightedStates = make(map[string]*smoothWeightedState)
+			}
+			stateKey := cursorKey + ":" + fmt.Sprint(targetPriority)
+			if s.mixedWeightedStates[stateKey] == nil {
+				if len(s.mixedWeightedStates) >= 4096 {
+					clear(s.mixedWeightedStates)
+				}
+				s.mixedWeightedStates[stateKey] = &smoothWeightedState{}
+			}
+			state := s.mixedWeightedStates[stateKey]
+			picked := state.pickAccepted(candidates, func(candidate *Auth) bool {
+				policy := requestLimitForAuth(candidate)
+				acquired, block := requestLimiter.tryAcquireAt(candidate.ID, policy, requestLimiter.nowTime())
+				requestLimited = earlierAuthRequestLimitBlock(requestLimited, block)
+				return acquired
+			})
+			s.mixedCursorMu.Unlock()
+			if picked != nil {
+				return picked, owners[picked.ID], nil
+			}
 		case schedulerStrategyRandom:
 			candidates := make([]mixedCandidate, 0)
 			for providerIndex, providerKey := range normalized {
@@ -2252,6 +2337,18 @@ func (v *readyView) pickWithRequestLimit(strategy schedulerStrategy, predicate f
 		return acquired
 	}
 	switch strategy {
+	case schedulerStrategyWeightedRoundRobin:
+		candidates := make([]*Auth, 0, len(v.flat))
+		entries := make(map[string]*scheduledAuth, len(v.flat))
+		for _, entry := range v.flat {
+			if entry != nil && entry.auth != nil && authWeight(entry.auth) > 0 && (predicate == nil || predicate(entry)) {
+				candidates = append(candidates, entry.auth)
+				entries[entry.auth.ID] = entry
+			}
+		}
+		if picked := v.weighted.pickAccepted(candidates, func(candidate *Auth) bool { return tryEntry(entries[candidate.ID]) }); picked != nil {
+			return entries[picked.ID], authRequestLimitBlock{}
+		}
 	case schedulerStrategyFillFirst:
 		for _, entry := range v.flat {
 			if tryEntry(entry) {
