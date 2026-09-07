@@ -539,6 +539,8 @@ type CodexHeaderDefaults struct {
 
 // CodexConfig configures provider-wide Codex request behavior.
 type CodexConfig struct {
+	// OrphanDelegationCompatibility repairs known orphan app delegation results in subagents.
+	OrphanDelegationCompatibility bool `yaml:"orphan-delegation-compatibility" json:"orphan-delegation-compatibility"`
 	// StreamBootstrapBuffering holds bounded pre-output metadata to detect retryable overloads.
 	StreamBootstrapBuffering bool `yaml:"stream-bootstrap-buffering" json:"stream-bootstrap-buffering"`
 	// PassthroughPromptCacheKey preserves explicit client cache keys independently of session identity.

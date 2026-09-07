@@ -274,6 +274,9 @@ func BuildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 	if oldCfg.Codex.StreamBootstrapBuffering != newCfg.Codex.StreamBootstrapBuffering {
 		changes = append(changes, fmt.Sprintf("codex.stream-bootstrap-buffering: %t -> %t", oldCfg.Codex.StreamBootstrapBuffering, newCfg.Codex.StreamBootstrapBuffering))
 	}
+	if oldCfg.Codex.OrphanDelegationCompatibility != newCfg.Codex.OrphanDelegationCompatibility {
+		changes = append(changes, fmt.Sprintf("codex.orphan-delegation-compatibility: %t -> %t", oldCfg.Codex.OrphanDelegationCompatibility, newCfg.Codex.OrphanDelegationCompatibility))
+	}
 	if oldCfg.Codex.SpoofSessionIdentity != newCfg.Codex.SpoofSessionIdentity {
 		changes = append(changes, fmt.Sprintf("codex.spoof-session-identity: %t -> %t", oldCfg.Codex.SpoofSessionIdentity, newCfg.Codex.SpoofSessionIdentity))
 	}

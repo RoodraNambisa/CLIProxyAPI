@@ -256,9 +256,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 	if len(opts.OriginalRequest) > 0 {
 		originalPayloadSource = opts.OriginalRequest
 	}
-	originalPayload := originalPayloadSource
-	originalTranslated := sdktranslator.TranslateRequest(from, to, baseModel, originalPayload, false)
-	body := sdktranslator.TranslateRequest(from, to, baseModel, req.Payload, false)
+	originalPayload, originalTranslated, body := e.translateCodexRequestBodies(ctx, from, to, baseModel, req, opts, false)
 
 	body, err = thinking.ApplyThinking(body, req.Model, from.String(), to.String(), e.Identifier())
 	if err != nil {
@@ -573,7 +571,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 
 	from := opts.SourceFormat
 	to := sdktranslator.FromString("codex")
-	body := req.Payload
+	body := helps.RewriteCodexOrphanDelegationInput(req.Payload, e.codexPreparedSessionIdentity(ctx, req, opts).OrphanDelegationCompatibility)
 	userPayload := req.Payload
 	if len(opts.OriginalRequest) > 0 {
 		userPayload = opts.OriginalRequest

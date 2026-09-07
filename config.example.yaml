@@ -694,6 +694,9 @@ nonstream-keepalive-interval: 0
 #   # Buffer up to 16 pre-output metadata events / 64 KiB to detect overloads before
 #   # committing the stream. Uses the existing retry budget and requires a replayable request.
 #   stream-bootstrap-buffering: false
+#   # Convert unpaired Codex app delegation results to user messages only for
+#   # X-Openai-Subagent: collab_spawn. Paired calls and other tools are unchanged.
+#   orphan-delegation-compatibility: false
 #   spoof-session-identity: false
 #   turn-state-policy: "guard-cross-account"
 #   enforce-software-identity: true # normalize outbound User-Agent, Originator, and Version; default true

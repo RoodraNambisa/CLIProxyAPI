@@ -320,20 +320,21 @@ func NewCodexExecutor(cfg *config.Config) *CodexExecutor { return &CodexExecutor
 func (e *CodexExecutor) Identifier() string { return "codex" }
 
 type codexPreparedSessionIdentity struct {
-	StreamBootstrapBuffering bool
-	PromptCacheLog           *util.PromptCacheLogRedactor
-	PromptCacheKey           helps.CodexPromptCacheKeySnapshot
-	ResponsesLite            helps.CodexResponsesLiteSnapshot
-	Enabled                  bool
-	SessionID                string
-	ThreadID                 string
-	TurnID                   string
-	WindowID                 string
-	RequestKind              string
-	AffinityKind             string
-	AffinityDigest           string
-	TenantDigest             string
-	ClientThreadID           string
+	StreamBootstrapBuffering      bool
+	PromptCacheLog                *util.PromptCacheLogRedactor
+	PromptCacheKey                helps.CodexPromptCacheKeySnapshot
+	ResponsesLite                 helps.CodexResponsesLiteSnapshot
+	OrphanDelegationCompatibility bool
+	Enabled                       bool
+	SessionID                     string
+	ThreadID                      string
+	TurnID                        string
+	WindowID                      string
+	RequestKind                   string
+	AffinityKind                  string
+	AffinityDigest                string
+	TenantDigest                  string
+	ClientThreadID                string
 }
 
 // PrepareProviderRequest creates one immutable identity fallback shared by all
@@ -362,17 +363,18 @@ func (e *CodexExecutor) PrepareProviderRequest(ctx context.Context, req cliproxy
 		liteHeaders.Set(helps.CodexResponsesLiteHeader, value)
 	}
 	prepared := codexPreparedSessionIdentity{
-		StreamBootstrapBuffering: e.cfg != nil && e.cfg.Codex.StreamBootstrapBuffering,
-		PromptCacheLog:           helps.SnapshotCodexPromptCacheLog(ctx, payload),
-		PromptCacheKey:           helps.SnapshotCodexPromptCacheKey(payload, e.cfg != nil && e.cfg.Codex.PassthroughPromptCacheKey),
-		ResponsesLite:            helps.SnapshotCodexResponsesLite(payload, liteHeaders, cliproxyexecutor.DownstreamWebsocket(ctx)),
-		Enabled:                  codexSpoofSessionIdentityEnabled(e.cfg),
-		TurnID:                   turnID,
-		RequestKind:              codexSessionRequestKind(opts, payload),
-		AffinityKind:             affinityKind,
-		AffinityDigest:           affinityDigest,
-		TenantDigest:             tenantDigest,
-		ClientThreadID:           clientThreadID,
+		StreamBootstrapBuffering:      e.cfg != nil && e.cfg.Codex.StreamBootstrapBuffering,
+		PromptCacheLog:                helps.SnapshotCodexPromptCacheLog(ctx, payload),
+		PromptCacheKey:                helps.SnapshotCodexPromptCacheKey(payload, e.cfg != nil && e.cfg.Codex.PassthroughPromptCacheKey),
+		ResponsesLite:                 helps.SnapshotCodexResponsesLite(payload, liteHeaders, cliproxyexecutor.DownstreamWebsocket(ctx)),
+		OrphanDelegationCompatibility: helps.CodexOrphanDelegationEnabled(ctx, opts.Headers, e.cfg != nil && e.cfg.Codex.OrphanDelegationCompatibility),
+		Enabled:                       codexSpoofSessionIdentityEnabled(e.cfg),
+		TurnID:                        turnID,
+		RequestKind:                   codexSessionRequestKind(opts, payload),
+		AffinityKind:                  affinityKind,
+		AffinityDigest:                affinityDigest,
+		TenantDigest:                  tenantDigest,
+		ClientThreadID:                clientThreadID,
 	}
 	if !prepared.Enabled {
 		return prepared, nil
@@ -542,6 +544,24 @@ func (e *CodexExecutor) registerAgentIdentityTask(ctx context.Context, auth *cli
 	}
 	updated.Metadata["task_id"] = taskID
 	return updated, nil
+}
+
+func (e *CodexExecutor) translateCodexRequestBodies(ctx context.Context, from, to sdktranslator.Format, baseModel string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, stream bool) ([]byte, []byte, []byte) {
+	if from == sdktranslator.FormatCodex || from == sdktranslator.FormatOpenAIResponse {
+		enabled := e.codexPreparedSessionIdentity(ctx, req, opts).OrphanDelegationCompatibility
+		if enabled {
+			payload := helps.RewriteCodexOrphanDelegationInput(req.Payload, true)
+			if len(opts.OriginalRequest) > 0 {
+				if bytes.Equal(opts.OriginalRequest, req.Payload) {
+					opts.OriginalRequest = payload
+				} else {
+					opts.OriginalRequest = helps.RewriteCodexOrphanDelegationInput(opts.OriginalRequest, true)
+				}
+			}
+			req.Payload = payload
+		}
+	}
+	return translateCodexRequestBodies(from, to, baseModel, req, opts, stream)
 }
 
 func translateCodexRequestBodies(from, to sdktranslator.Format, baseModel string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, stream bool) ([]byte, []byte, []byte) {
@@ -784,7 +804,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 
 	from := opts.SourceFormat
 	to := sdktranslator.FromString("codex")
-	originalPayload, originalTranslated, body := translateCodexRequestBodies(from, to, baseModel, req, opts, false)
+	originalPayload, originalTranslated, body := e.translateCodexRequestBodies(ctx, from, to, baseModel, req, opts, false)
 
 	body, err = thinking.ApplyThinking(body, req.Model, from.String(), to.String(), e.Identifier())
 	if err != nil {
@@ -993,7 +1013,7 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 
 	from := opts.SourceFormat
 	to := sdktranslator.FromString("openai-response")
-	originalPayload, originalTranslated, body := translateCodexRequestBodies(from, to, baseModel, req, opts, false)
+	originalPayload, originalTranslated, body := e.translateCodexRequestBodies(ctx, from, to, baseModel, req, opts, false)
 
 	body, err = thinking.ApplyThinking(body, req.Model, from.String(), to.String(), e.Identifier())
 	if err != nil {
@@ -1126,7 +1146,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 
 	from := opts.SourceFormat
 	to := sdktranslator.FromString("codex")
-	originalPayload, originalTranslated, body := translateCodexRequestBodies(from, to, baseModel, req, opts, true)
+	originalPayload, originalTranslated, body := e.translateCodexRequestBodies(ctx, from, to, baseModel, req, opts, true)
 
 	body, err = thinking.ApplyThinking(body, req.Model, from.String(), to.String(), e.Identifier())
 	if err != nil {
