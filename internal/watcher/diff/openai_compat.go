@@ -76,6 +76,9 @@ func describeOpenAICompatibilityUpdate(oldEntry, newEntry config.OpenAICompatibi
 	if oldEntry.Disabled != newEntry.Disabled {
 		details = append(details, fmt.Sprintf("disabled %t -> %t", oldEntry.Disabled, newEntry.Disabled))
 	}
+	if !reflect.DeepEqual(oldEntry.RequestRetry, newEntry.RequestRetry) {
+		details = append(details, "request-retry updated")
+	}
 	if !equalStringMap(oldEntry.Headers, newEntry.Headers) {
 		details = append(details, "headers updated")
 	}

@@ -315,6 +315,14 @@ passthrough-headers: false
 # Each request round targets the next lower credential priority when available.
 request-retry: 3
 
+# Individual Gemini, Interactions, Claude, Codex and Vertex API key entries can
+# override request-retry (0..2147483647). OpenAI-compatibility sets it on the provider.
+# Omit the option or set null to inherit; legacy negative values act as zero.
+# Zero permits the initial round only; same-round credential failover still follows
+# the configured credential limit. Changing an override does not change credential IDs.
+# Global settings are captured at request entry; credential overrides are checked
+# from the current credential snapshot at each selection.
+
 # Maximum number of different credentials to try in each request round.
 # Set to 0 to try all available credentials in the current target priority.
 max-retry-credentials: 0
