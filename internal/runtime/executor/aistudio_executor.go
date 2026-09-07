@@ -125,6 +125,7 @@ func (e *AIStudioExecutor) HttpRequest(ctx context.Context, auth *cliproxyauth.A
 
 // Execute performs a non-streaming request to the AI Studio API.
 func (e *AIStudioExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (resp cliproxyexecutor.Response, err error) {
+	multiAgentResponse := helps.CodexPlaintextResponsePolicy(ctx, opts.Headers, e.cfg, opts.SourceFormat)
 	if opts.Alt == "responses/compact" {
 		return resp, statusErr{code: http.StatusNotImplemented, msg: "/responses/compact not supported"}
 	}
@@ -137,7 +138,12 @@ func (e *AIStudioExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth,
 		return resp, err
 	}
 	payload := body.payload
-	originalRef, payloadRef, unregisterBodies := helps.RequestBodyRefs(ctx, opts, opts.OriginalRequest, payload)
+	original := opts.OriginalRequest
+	if len(original) == 0 {
+		original = req.Payload
+	}
+	originalRef, payloadRef, unregisterBodies := helps.RequestBodyRefs(ctx, opts, original, payload)
+	original = nil
 	defer unregisterBodies()
 	defer originalRef.Release()
 	defer payloadRef.Release()
@@ -192,13 +198,14 @@ func (e *AIStudioExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth,
 	}
 	reporter.Publish(ctx, helps.ParseGeminiUsage(wsResp.Body))
 	var param any
-	out := sdktranslator.TranslateNonStream(ctx, toFormat, opts.SourceFormat, req.Model, originalRef.Bytes(), payloadRef.Bytes(), wsResp.Body, &param)
+	out := multiAgentResponse.TranslateNonStream(ctx, toFormat, opts.SourceFormat, req.Model, originalRef.Bytes(), payloadRef.Bytes(), wsResp.Body, &param)
 	resp = cliproxyexecutor.Response{Payload: ensureColonSpacedJSON(out), Headers: wsResp.Headers.Clone()}
 	return resp, nil
 }
 
 // ExecuteStream performs a streaming request to the AI Studio API.
 func (e *AIStudioExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (_ *cliproxyexecutor.StreamResult, err error) {
+	multiAgentResponse := helps.CodexPlaintextResponsePolicy(ctx, opts.Headers, e.cfg, opts.SourceFormat)
 	if opts.Alt == "responses/compact" {
 		return nil, statusErr{code: http.StatusNotImplemented, msg: "/responses/compact not supported"}
 	}
@@ -211,7 +218,12 @@ func (e *AIStudioExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth
 		return nil, err
 	}
 	payload := body.payload
-	originalRef, payloadRef, unregisterBodies := helps.RequestBodyRefs(ctx, opts, opts.OriginalRequest, payload)
+	original := opts.OriginalRequest
+	if len(original) == 0 {
+		original = req.Payload
+	}
+	originalRef, payloadRef, unregisterBodies := helps.RequestBodyRefs(ctx, opts, original, payload)
+	original = nil
 	cleanupBodies := func() {
 		unregisterBodies()
 		originalRef.Release()
@@ -388,7 +400,7 @@ func (e *AIStudioExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth
 						return false
 					}
 					filtered := helps.FilterSSEUsageMetadata(event.Payload)
-					lines := sdktranslator.TranslateStream(ctx, toFormat, opts.SourceFormat, req.Model, originalRef.Bytes(), payloadRef.Bytes(), filtered, &param)
+					lines := multiAgentResponse.TranslateStream(ctx, toFormat, opts.SourceFormat, req.Model, originalRef.Bytes(), payloadRef.Bytes(), filtered, &param)
 					for i := range lines {
 						emittedPayload = emittedPayload || len(lines[i]) > 0
 						out <- cliproxyexecutor.StreamChunk{Payload: ensureColonSpacedJSON(lines[i])}
@@ -446,7 +458,7 @@ func (e *AIStudioExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth
 					emitStreamError(streamErr)
 					return false
 				}
-				lines := sdktranslator.TranslateStream(ctx, toFormat, opts.SourceFormat, req.Model, originalRef.Bytes(), payloadRef.Bytes(), event.Payload, &param)
+				lines := multiAgentResponse.TranslateStream(ctx, toFormat, opts.SourceFormat, req.Model, originalRef.Bytes(), payloadRef.Bytes(), event.Payload, &param)
 				for i := range lines {
 					emittedPayload = emittedPayload || len(lines[i]) > 0
 					out <- cliproxyexecutor.StreamChunk{Payload: ensureColonSpacedJSON(lines[i])}
