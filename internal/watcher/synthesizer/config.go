@@ -29,6 +29,9 @@ func (s *ConfigSynthesizer) Synthesize(ctx *SynthesisContext) ([]*coreauth.Auth,
 	if errWeight := ctx.Config.ValidateCredentialWeights(); errWeight != nil {
 		return nil, errWeight
 	}
+	if errRetry := ctx.Config.ValidateCredentialRequestRetries(); errRetry != nil {
+		return nil, errRetry
+	}
 
 	// Gemini API Keys
 	out = append(out, s.synthesizeGeminiKeys(ctx)...)
@@ -105,6 +108,7 @@ func (s *ConfigSynthesizer) synthesizeGeminiKeyEntries(ctx *SynthesisContext, en
 			UpdatedAt:  now,
 		}
 		ApplyAuthExcludedModelsMeta(a, cfg, entry.ExcludedModels, "apikey")
+		applyConfigCredentialRequestRetry(a, entry.RequestRetry)
 		out = append(out, a)
 	}
 	return out
@@ -154,6 +158,7 @@ func (s *ConfigSynthesizer) synthesizeClaudeKeys(ctx *SynthesisContext) []*corea
 			UpdatedAt:  now,
 		}
 		ApplyAuthExcludedModelsMeta(a, cfg, ck.ExcludedModels, "apikey")
+		applyConfigCredentialRequestRetry(a, ck.RequestRetry)
 		out = append(out, a)
 	}
 	return out
@@ -205,6 +210,7 @@ func (s *ConfigSynthesizer) synthesizeCodexKeys(ctx *SynthesisContext) []*coreau
 			UpdatedAt:  now,
 		}
 		ApplyAuthExcludedModelsMeta(a, cfg, ck.ExcludedModels, "apikey")
+		applyConfigCredentialRequestRetry(a, ck.RequestRetry)
 		out = append(out, a)
 	}
 	return out
@@ -262,6 +268,7 @@ func (s *ConfigSynthesizer) synthesizeOpenAICompat(ctx *SynthesisContext) []*cor
 				CreatedAt:  now,
 				UpdatedAt:  now,
 			}
+			applyConfigCredentialRequestRetry(a, compat.RequestRetry)
 			out = append(out, a)
 			createdEntries++
 		}
@@ -292,6 +299,7 @@ func (s *ConfigSynthesizer) synthesizeOpenAICompat(ctx *SynthesisContext) []*cor
 				CreatedAt:  now,
 				UpdatedAt:  now,
 			}
+			applyConfigCredentialRequestRetry(a, compat.RequestRetry)
 			out = append(out, a)
 		}
 	}
@@ -356,6 +364,7 @@ func (s *ConfigSynthesizer) synthesizeVertexCompat(ctx *SynthesisContext) []*cor
 			UpdatedAt:  now,
 		}
 		ApplyAuthExcludedModelsMeta(a, cfg, compat.ExcludedModels, "apikey")
+		applyConfigCredentialRequestRetry(a, compat.RequestRetry)
 		out = append(out, a)
 	}
 	return out

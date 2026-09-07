@@ -57,6 +57,17 @@ func ApplyAuthExcludedModelsMeta(auth *coreauth.Auth, cfg *config.Config, perKey
 	coreauth.ApplyAuthExcludedModelsMeta(auth, cfg, perKey, authKind)
 }
 
+// Copy the override by value; an omitted option keeps legacy nil metadata.
+func applyConfigCredentialRequestRetry(auth *coreauth.Auth, retry *int) {
+	if auth == nil || retry == nil {
+		return
+	}
+	if auth.Metadata == nil {
+		auth.Metadata = make(map[string]any)
+	}
+	auth.Metadata["request_retry"] = max(0, *retry)
+}
+
 // addConfigHeadersToAttrs adds header configuration to auth attributes.
 // Headers are prefixed with "header:" in the attributes map.
 func addConfigHeadersToAttrs(headers map[string]string, attrs map[string]string) {
