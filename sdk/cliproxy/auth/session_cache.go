@@ -30,6 +30,7 @@ type SessionCache struct {
 	entries         map[string]sessionEntry
 	ttl             time.Duration
 	stopCh          chan struct{}
+	stopOnce        sync.Once
 	version         uint64
 	authGenerations map[string]authGenerationState
 }
@@ -190,15 +191,14 @@ func (c *SessionCache) InvalidateAuth(authID string) {
 
 // Stop terminates the background cleanup goroutine.
 func (c *SessionCache) Stop() {
-	select {
-	case <-c.stopCh:
-	default:
+	c.stopOnce.Do(func() {
 		close(c.stopCh)
-	}
+	})
 }
 
 func (c *SessionCache) cleanupLoop() {
-	ticker := time.NewTicker(c.ttl / 2)
+	// A positive TTL can halve to zero at nanosecond precision.
+	ticker := time.NewTicker(max(c.ttl/2, time.Nanosecond))
 	defer ticker.Stop()
 	for {
 		select {
