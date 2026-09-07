@@ -15,10 +15,12 @@ type codexClientModelsPayload struct {
 }
 
 var (
-	codexClientModelTemplatesOnce sync.Once
-	codexClientModelTemplates     map[string]map[string]any
-	codexClientDefaultTemplate    map[string]any
-	codexClientModelTemplatesErr  error
+	codexClientModelTemplatesMu       sync.Mutex
+	codexClientModelTemplatesRevision uint64
+	codexClientModelTemplatesLoaded   bool
+	codexClientModelTemplates         map[string]map[string]any
+	codexClientDefaultTemplate        map[string]any
+	codexClientModelTemplatesErr      error
 )
 
 var codexClientAllowedReasoningLevels = map[string]struct{}{
@@ -185,25 +187,37 @@ func applyCodexClientNonTemplatePriorities(result []map[string]any, templates ma
 }
 
 func loadCodexClientModelTemplates() (map[string]map[string]any, map[string]any, error) {
-	codexClientModelTemplatesOnce.Do(func() {
+	raw, revision := registry.GetCodexClientModelsSnapshot()
+	return loadCodexClientModelTemplatesSnapshot(raw, revision)
+}
+
+func loadCodexClientModelTemplatesSnapshot(raw []byte, revision uint64) (map[string]map[string]any, map[string]any, error) {
+	codexClientModelTemplatesMu.Lock()
+	defer codexClientModelTemplatesMu.Unlock()
+	if !codexClientModelTemplatesLoaded || codexClientModelTemplatesRevision != revision {
 		var payload codexClientModelsPayload
-		codexClientModelTemplatesErr = json.Unmarshal(registry.GetCodexClientModelsJSON(), &payload)
-		if codexClientModelTemplatesErr != nil {
-			return
+		if err := json.Unmarshal(raw, &payload); err != nil {
+			return nil, nil, err
 		}
 
-		codexClientModelTemplates = make(map[string]map[string]any, len(payload.Models))
+		templates := make(map[string]map[string]any, len(payload.Models))
+		var defaultTemplate map[string]any
 		for _, model := range payload.Models {
 			slug := strings.TrimSpace(stringModelValue(model, "slug"))
 			if slug == "" {
 				continue
 			}
-			codexClientModelTemplates[slug] = cloneCodexClientModelMap(model)
+			templates[slug] = cloneCodexClientModelMap(model)
 			if slug == "gpt-5.5" {
-				codexClientDefaultTemplate = cloneCodexClientModelMap(model)
+				defaultTemplate = cloneCodexClientModelMap(model)
 			}
 		}
-	})
+		codexClientModelTemplates = templates
+		codexClientDefaultTemplate = defaultTemplate
+		codexClientModelTemplatesErr = nil
+		codexClientModelTemplatesRevision = revision
+		codexClientModelTemplatesLoaded = true
+	}
 
 	return codexClientModelTemplates, codexClientDefaultTemplate, codexClientModelTemplatesErr
 }
