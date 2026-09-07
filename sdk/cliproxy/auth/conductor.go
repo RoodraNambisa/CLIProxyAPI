@@ -1287,6 +1287,36 @@ func (m *Manager) SetConfig(cfg *internalconfig.Config) {
 	}
 	m.routingUpdateMu.Lock()
 	defer m.routingUpdateMu.Unlock()
+	m.setConfigLocked(cfg)
+}
+
+// SetConfigAndSelector publishes one complete routing policy during service reload.
+// Existing request snapshots keep their selector and priority rules together.
+func (m *Manager) SetConfigAndSelector(cfg *internalconfig.Config, selector Selector) {
+	if m == nil {
+		return
+	}
+	m.routingUpdateMu.Lock()
+	defer m.routingUpdateMu.Unlock()
+	if selector == nil {
+		selector = &RoundRobinSelector{}
+	}
+	if m.scheduler != nil {
+		m.scheduler.setSelector(selector)
+	}
+	m.mu.Lock()
+	previousSelector := m.selector
+	m.selector = selector
+	m.mu.Unlock()
+	m.setConfigLocked(cfg)
+	if m.scheduler != nil {
+		m.syncScheduler()
+	}
+	stopReplacedSessionCacheMaintenance(previousSelector, selector)
+}
+
+// setConfigLocked requires routingUpdateMu.
+func (m *Manager) setConfigLocked(cfg *internalconfig.Config) {
 	if cfg == nil {
 		cfg = &internalconfig.Config{}
 	}

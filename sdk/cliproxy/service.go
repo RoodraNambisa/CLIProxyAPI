@@ -4935,7 +4935,7 @@ func (s *Service) applyRuntimeConfigState(ctx context.Context, previousCfg, next
 				Failover: &failover,
 			})
 		}
-		s.coreManager.SetSelector(selector)
+		s.coreManager.SetConfigAndSelector(nextCfg, selector)
 	}
 
 	s.applyRetryConfig(nextCfg)
@@ -4955,7 +4955,6 @@ func (s *Service) applyRuntimeConfigState(ctx context.Context, previousCfg, next
 	s.cfg = nextCfg
 	s.cfgMu.Unlock()
 	if s.coreManager != nil {
-		s.coreManager.SetConfig(nextCfg)
 		s.coreManager.SetOAuthModelAlias(nextCfg.OAuthModelAlias)
 	}
 	s.rebindExecutors()
