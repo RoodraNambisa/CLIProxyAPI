@@ -277,6 +277,10 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 	if !gjson.GetBytes(body, "instructions").Exists() {
 		body, _ = sjson.SetBytes(body, "instructions", "")
 	}
+	body, err = e.applyDisabledImageGenerationToolPolicy(auth, body)
+	if err != nil {
+		return resp, err
+	}
 	body = helps.SanitizeCodexInputItemIDs(body)
 	body = helps.SanitizeCodexReasoningEncryptedContent(ctx, "codex websockets executor", body)
 	body = helps.NormalizeCodexToolSelection(body)
