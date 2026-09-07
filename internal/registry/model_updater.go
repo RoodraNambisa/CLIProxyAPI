@@ -24,6 +24,11 @@ var modelsURLs = []string{
 	"https://models.router-for.me/models.json",
 }
 
+var codexClientModelsURLs = []string{
+	"https://raw.githubusercontent.com/router-for-me/models/refs/heads/main/codex_client_models.json",
+	"https://models.router-for.me/codex_client_models.json",
+}
+
 //go:embed models/models.json
 var embeddedModelsJSON []byte
 
@@ -81,35 +86,85 @@ func StartModelsUpdater(ctx context.Context) {
 }
 
 func runModelsUpdater(ctx context.Context) {
-	tryStartupRefresh(ctx)
-	periodicRefresh(ctx)
-}
-
-func periodicRefresh(ctx context.Context) {
 	ticker := time.NewTicker(modelsRefreshInterval)
 	defer ticker.Stop()
 	log.Infof("periodic model refresh started (interval=%s)", modelsRefreshInterval)
+	runModelCatalogRefreshLoop(ctx, ticker.C, tryRefreshModels, tryRefreshCodexClientModels)
+}
+
+func runModelCatalogRefreshLoop(ctx context.Context, ticks <-chan time.Time, ordinary, codex func(context.Context, string)) {
+	completed := make(chan int, 2)
+	refreshers := []func(context.Context, string){ordinary, codex}
+	running := [2]bool{}
+	var pending sync.WaitGroup
+	defer pending.Wait()
+	start := func(label string) {
+		for i, refresh := range refreshers {
+			if running[i] || ctx.Err() != nil {
+				continue
+			}
+			running[i] = true
+			pending.Add(1)
+			go func(index int, fetch func(context.Context, string)) {
+				defer pending.Done()
+				fetch(ctx, label)
+				completed <- index
+			}(i, refresh)
+		}
+	}
+	start("startup model refresh")
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
-			tryPeriodicRefresh(ctx)
+		case index := <-completed:
+			running[index] = false
+		case <-ticks:
+			start("periodic model refresh")
 		}
 	}
 }
 
-// tryPeriodicRefresh fetches models from remote, compares with the current
-// catalog, and notifies the registered callback if any provider changed.
-func tryPeriodicRefresh(ctx context.Context) {
-	tryRefreshModels(ctx, "periodic model refresh")
-}
-
-// tryStartupRefresh fetches models from remote in the background during
-// process startup. It uses the same change detection as periodic refresh so
-// existing auth registrations can be updated after the callback is registered.
-func tryStartupRefresh(ctx context.Context) {
-	tryRefreshModels(ctx, "startup model refresh")
+func tryRefreshCodexClientModels(ctx context.Context, label string) {
+	client := &http.Client{}
+	for _, url := range codexClientModelsURLs {
+		if ctx.Err() != nil {
+			return
+		}
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+		if err != nil {
+			continue
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			log.Debugf("Codex client catalog fetch failed: %v", err)
+			continue
+		}
+		if resp.StatusCode != http.StatusOK {
+			if errClose := resp.Body.Close(); errClose != nil {
+				log.Debugf("Codex client catalog response close failed: %v", errClose)
+			}
+			continue
+		}
+		data, errRead := io.ReadAll(io.LimitReader(resp.Body, maxModelsCatalogBytes+1))
+		if errClose := resp.Body.Close(); errClose != nil {
+			log.Debugf("Codex client catalog response close failed: %v", errClose)
+		}
+		if ctx.Err() != nil {
+			return
+		}
+		if errRead != nil {
+			continue
+		}
+		changed, errLoad := loadCodexClientModelsFromBytes(data, url)
+		if errLoad != nil {
+			log.Warnf("%s: invalid Codex client catalog: %v", label, errLoad)
+			continue
+		}
+		log.Infof("%s: Codex client catalog refreshed (changed=%t)", label, changed)
+		return
+	}
+	log.Warnf("%s: Codex client catalog fetch failed, keeping current data", label)
 }
 
 func tryRefreshModels(ctx context.Context, label string) {
@@ -165,11 +220,11 @@ func fetchModelsFromRemote(ctx context.Context) (*staticModelsJSON, string) {
 			continue
 		}
 
-		data, err := io.ReadAll(resp.Body)
+		data, err := io.ReadAll(io.LimitReader(resp.Body, maxModelsCatalogBytes+1))
 		resp.Body.Close()
 		cancel()
 
-		if err != nil {
+		if err != nil || len(data) > maxModelsCatalogBytes {
 			log.Debugf("models fetch read error from %s: %v", url, err)
 			continue
 		}

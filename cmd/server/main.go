@@ -531,14 +531,14 @@ func main() {
 		if localModel && (!tuiMode || standalone) {
 			log.Info("Local model mode: using embedded model catalog, remote model updates disabled")
 		}
+		if shouldStartModelsUpdater(localModel, tuiMode, standalone) {
+			registry.StartModelsUpdater(context.Background())
+		}
 		if tuiMode {
 			if standalone {
 				// Standalone mode: start an embedded local server and connect TUI client to it.
 				managementasset.StartAutoUpdater(context.Background(), configFilePath)
 				misc.StartAntigravityVersionUpdater(context.Background())
-				if !localModel {
-					registry.StartModelsUpdater(context.Background())
-				}
 				hook := tui.NewLogHook(2000)
 				hook.SetFormatter(&logging.LogFormatter{})
 				log.AddHook(hook)
@@ -623,10 +623,11 @@ func main() {
 			// Start the main proxy service
 			managementasset.StartAutoUpdater(context.Background(), configFilePath)
 			misc.StartAntigravityVersionUpdater(context.Background())
-			if !localModel {
-				registry.StartModelsUpdater(context.Background())
-			}
 			cmd.StartService(cfg, configFilePath, password)
 		}
 	}
+}
+
+func shouldStartModelsUpdater(localModel, tuiMode, standalone bool) bool {
+	return !localModel && (!tuiMode || standalone)
 }
