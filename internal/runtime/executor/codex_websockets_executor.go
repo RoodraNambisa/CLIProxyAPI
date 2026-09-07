@@ -435,6 +435,9 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 		defer func() { sess.clearActiveForConn(readCh, conn) }()
 	}
 
+	if !multiAgentDeclaresTools {
+		multiAgentResponse = sess.multiAgentResponseForConn(conn)
+	}
 	if errSend := writeCurrentCodexWebsocketMessage(ctx, auth, sess, conn, wsReqBody); errSend != nil {
 		if cliproxyexecutor.RequiredUpstreamWebsocket(ctx) {
 			if sess != nil {
@@ -474,6 +477,9 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 				if respHSRetry != nil {
 					upstreamHeaders = respHSRetry.Header.Clone()
 				}
+				if !multiAgentDeclaresTools {
+					multiAgentResponse = sess.multiAgentResponseForConn(connRetry)
+				}
 				if errSendRetry := writeCurrentCodexWebsocketMessage(ctx, auth, sess, connRetry, wsReqBodyRetry); errSendRetry == nil {
 					conn = connRetry
 					wsReqBodyRetry = nil
@@ -493,9 +499,6 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 		}
 	}
 	wsReqBody = nil
-	if !multiAgentDeclaresTools {
-		multiAgentResponse = sess.multiAgentResponseForConn(conn)
-	}
 
 	streamEstablished := false
 	for {
