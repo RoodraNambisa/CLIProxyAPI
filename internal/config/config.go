@@ -1762,6 +1762,11 @@ type RoutingConfig struct {
 	// conversation_id, or message hash.
 	SessionAffinity bool `yaml:"session-affinity,omitempty" json:"session-affinity,omitempty"`
 
+	// SessionAffinityAcrossPriorities keeps an eligible existing binding when a
+	// higher-priority credential recovers. Requires session affinity; default false.
+	// Hot reload affects new requests, not an in-flight routing policy.
+	SessionAffinityAcrossPriorities bool `yaml:"session-affinity-across-priorities" json:"session-affinity-across-priorities"`
+
 	// SessionAffinityFailover controls whether a session may move to another credential
 	// when the bound credential is unavailable or the request fails. Defaults to true.
 	SessionAffinityFailover *bool `yaml:"session-affinity-failover,omitempty" json:"session-affinity-failover,omitempty"`

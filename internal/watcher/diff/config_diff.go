@@ -145,6 +145,9 @@ func BuildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 	if routingSessionAffinityFailoverEnabled(oldCfg) != routingSessionAffinityFailoverEnabled(newCfg) {
 		changes = append(changes, fmt.Sprintf("routing.session-affinity-failover: %t -> %t", routingSessionAffinityFailoverEnabled(oldCfg), routingSessionAffinityFailoverEnabled(newCfg)))
 	}
+	if oldCfg.Routing.SessionAffinityAcrossPriorities != newCfg.Routing.SessionAffinityAcrossPriorities {
+		changes = append(changes, fmt.Sprintf("routing.session-affinity-across-priorities: %t -> %t", oldCfg.Routing.SessionAffinityAcrossPriorities, newCfg.Routing.SessionAffinityAcrossPriorities))
+	}
 
 	// API keys (redacted) and counts
 	if len(oldCfg.APIKeys) != len(newCfg.APIKeys) {

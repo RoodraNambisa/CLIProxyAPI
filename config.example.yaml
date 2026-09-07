@@ -494,6 +494,10 @@ routing:
   # Session IDs are extracted from: metadata.user_id, X-Session-ID,
   # Session-Id/Session_id, X-Client-Request-Id, conversation_id, or message hash.
   session-affinity: false # default: false
+  # Keep an eligible existing binding when a higher-priority credential recovers.
+  # Requires session affinity. Cold selection and failover still follow priority.
+  # Boolean only; hot reload applies to new requests, not in-flight routing policy.
+  session-affinity-across-priorities: false
   # Allow a bound session to move to another credential when the bound credential
   # is unavailable or the request fails. Set false for strict sticky sessions.
   session-affinity-failover: true # default: true

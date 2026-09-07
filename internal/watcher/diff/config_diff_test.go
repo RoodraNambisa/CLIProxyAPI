@@ -682,3 +682,12 @@ func TestCodexMultiAgentV2ChangeDetails(t *testing.T) {
 		t.Fatal("unchanged policy generated a diff")
 	}
 }
+
+func TestSessionAffinityAcrossPrioritiesChangeDetails(t *testing.T) {
+	oldCfg, nextCfg := &config.Config{}, &config.Config{}
+	nextCfg.Routing.SessionAffinityAcrossPriorities = true
+	changes := BuildConfigChangeDetails(oldCfg, nextCfg)
+	if len(changes) != 1 || changes[0] != "routing.session-affinity-across-priorities: false -> true" || len(BuildConfigChangeDetails(nextCfg, nextCfg)) != 0 {
+		t.Fatal("missing or noisy affinity change detail")
+	}
+}
