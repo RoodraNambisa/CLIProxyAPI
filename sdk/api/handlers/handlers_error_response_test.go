@@ -12,6 +12,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/proxypool"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
+	coreexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v6/sdk/config"
 )
 
@@ -185,5 +186,37 @@ func TestEnrichAuthSelectionError_IgnoresOtherErrors(t *testing.T) {
 	out := enrichAuthSelectionError(in, []string{"claude"}, "claude-sonnet-4-6")
 	if out != in {
 		t.Fatalf("expected original error to be returned unchanged")
+	}
+}
+
+func TestEnrichAuthSelectionErrorPreservesResponseMetadata(t *testing.T) {
+	in := &coreauth.Error{
+		Code: "auth_unavailable", Message: "no auth available", Retryable: true,
+		Diagnostic: &coreauth.ErrorDiagnostic{Provider: "claude", Stage: "selection"},
+	}
+	source := coreexecutor.CredentialErrorResponseSource("claude", 2)
+	wrapped := coreexecutor.WithErrorResponseSource(coreauth.WithResponseHeaders(in, http.Header{"Retry-After": {"30"}}), source)
+	msg := executionErrorMessage(wrapped, []string{"claude"}, "test-model")
+	var enriched *coreauth.Error
+	if !errors.As(msg.Error, &enriched) || enriched == in || !enriched.Retryable {
+		t.Fatal("enrichment did not preserve an independent typed error")
+	}
+	if msg.StatusCode != http.StatusServiceUnavailable || msg.Addon.Get("Retry-After") != "30" {
+		t.Fatal("enrichment discarded response hints or changed the unavailable status")
+	}
+	if got, ok := coreexecutor.ErrorResponseSourceOf(msg.Error); !ok || got != source {
+		t.Fatal("enrichment changed error-source filtering")
+	}
+	if enriched.Diagnostic == in.Diagnostic || !reflect.DeepEqual(enriched.Diagnostic, in.Diagnostic) {
+		t.Fatal("enrichment discarded or shared diagnostic state")
+	}
+	enriched.Diagnostic.Stage = "changed"
+	if in.Message != "no auth available" || in.HTTPStatus != 0 || in.Diagnostic.Stage != "selection" {
+		t.Fatal("enrichment mutated the original error")
+	}
+	msg.Addon.Set("Retry-After", "99")
+	var headers interface{ Headers() http.Header }
+	if !errors.As(msg.Error, &headers) || headers.Headers().Get("Retry-After") != "30" {
+		t.Fatal("response headers share mutable state with the error")
 	}
 }

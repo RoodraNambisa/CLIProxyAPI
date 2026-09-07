@@ -1647,12 +1647,19 @@ func enrichAuthSelectionError(err error, providers []string, model string) error
 		status = http.StatusServiceUnavailable
 	}
 
-	return &coreauth.Error{
-		Code:       authErr.Code,
-		Message:    detail,
-		Retryable:  authErr.Retryable,
-		HTTPStatus: status,
+	enriched := *authErr
+	enriched.Message = detail
+	enriched.HTTPStatus = status
+	enriched.Diagnostic = authErr.Diagnostic.Clone()
+	var result error = &enriched
+	var headerError interface{ Headers() http.Header }
+	if errors.As(err, &headerError) && headerError != nil {
+		result = coreauth.WithResponseHeaders(result, headerError.Headers())
 	}
+	if source, ok := coreexecutor.ErrorResponseSourceOf(err); ok {
+		result = coreexecutor.WithErrorResponseSource(result, source)
+	}
+	return result
 }
 
 func shouldForwardErrorAddonHeader(key string, passthroughHeaders bool) bool {

@@ -7712,7 +7712,7 @@ func finalAuthSelectionError(err error) error {
 	}
 	var cooldownErr *modelCooldownError
 	if errors.As(err, &cooldownErr) {
-		converted := error(&Error{Code: "auth_unavailable", Message: "no auth available"})
+		converted := WithResponseHeaders(&Error{Code: "auth_unavailable", Message: "no auth available"}, cooldownErr.Headers())
 		if source, ok := cliproxyexecutor.ErrorResponseSourceOf(err); ok {
 			converted = cliproxyexecutor.WithErrorResponseSource(converted, source)
 		}
