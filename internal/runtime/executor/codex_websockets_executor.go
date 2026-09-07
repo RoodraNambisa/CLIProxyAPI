@@ -75,6 +75,9 @@ type codexWebsocketSession struct {
 	proxyBindingID   string
 	proxyIdentity    string
 	softwareIdentity codexauth.SoftwareIdentity
+	// multiAgentResponse describes only the tools committed on the current conn.
+	// It is guarded by connMu and contains no request bodies or connection pointer.
+	multiAgentResponse helps.CodexMultiAgentResponsePolicy
 	// pendingAuthID and dialGeneration identify an in-flight Codex dial before a
 	// connection has been installed on the session.
 	pendingAuthID         string
@@ -116,6 +119,29 @@ type codexWebsocketRead struct {
 	msgType int
 	payload []byte
 	err     error
+}
+
+func (s *codexWebsocketSession) multiAgentResponseForConn(conn *websocket.Conn) helps.CodexMultiAgentResponsePolicy {
+	if s == nil || conn == nil {
+		return helps.CodexMultiAgentResponsePolicy{}
+	}
+	s.connMu.Lock()
+	defer s.connMu.Unlock()
+	if s.terminated || s.conn != conn {
+		return helps.CodexMultiAgentResponsePolicy{}
+	}
+	return s.multiAgentResponse
+}
+
+func (s *codexWebsocketSession) commitMultiAgentResponseForConn(conn *websocket.Conn, policy helps.CodexMultiAgentResponsePolicy) {
+	if s == nil || conn == nil {
+		return
+	}
+	s.connMu.Lock()
+	defer s.connMu.Unlock()
+	if !s.terminated && s.conn == conn {
+		s.multiAgentResponse = policy
+	}
 }
 
 func (s *codexWebsocketSession) setActive(ch chan codexWebsocketRead) {
@@ -1902,6 +1928,7 @@ func (e *CodexWebsocketsExecutor) ensureUpstreamConn(ctx context.Context, auth *
 		return previous, nil, nil
 	}
 	sess.conn = conn
+	sess.multiAgentResponse = helps.CodexMultiAgentResponsePolicy{}
 	sess.wsURL = wsURL
 	sess.authID = authID
 	sess.authInstanceID = auth.RuntimeInstanceID()
@@ -2026,6 +2053,7 @@ func (e *CodexWebsocketsExecutor) invalidateUpstreamConnWithNotify(sess *codexWe
 		return
 	}
 	sess.conn = nil
+	sess.multiAgentResponse = helps.CodexMultiAgentResponsePolicy{}
 	sess.softwareIdentity = codexauth.SoftwareIdentity{}
 	if sess.readerConn == conn {
 		sess.readerConn = nil
@@ -2139,6 +2167,7 @@ func closeCodexWebsocketSession(sess *codexWebsocketSession, reason string) {
 	authID := sess.authID
 	wsURL := sess.wsURL
 	sess.conn = nil
+	sess.multiAgentResponse = helps.CodexMultiAgentResponsePolicy{}
 	sess.softwareIdentity = codexauth.SoftwareIdentity{}
 	if !sess.terminated {
 		sess.terminated = true
