@@ -158,6 +158,9 @@ func BuildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 		for i := range oldCfg.GeminiKey {
 			o := oldCfg.GeminiKey[i]
 			n := newCfg.GeminiKey[i]
+			if !reflect.DeepEqual(o.Weight, n.Weight) {
+				changes = append(changes, fmt.Sprintf("gemini[%d].weight: updated", i))
+			}
 			if strings.TrimSpace(o.BaseURL) != strings.TrimSpace(n.BaseURL) {
 				changes = append(changes, fmt.Sprintf("gemini[%d].base-url: %s -> %s", i, strings.TrimSpace(o.BaseURL), strings.TrimSpace(n.BaseURL)))
 			}
@@ -191,6 +194,9 @@ func BuildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 		for i := range oldCfg.InteractionsKey {
 			o := oldCfg.InteractionsKey[i]
 			n := newCfg.InteractionsKey[i]
+			if !reflect.DeepEqual(o.Weight, n.Weight) {
+				changes = append(changes, fmt.Sprintf("interactions[%d].weight: updated", i))
+			}
 			if strings.TrimSpace(o.BaseURL) != strings.TrimSpace(n.BaseURL) {
 				changes = append(changes, fmt.Sprintf("interactions[%d].base-url: %s -> %s", i, strings.TrimSpace(o.BaseURL), strings.TrimSpace(n.BaseURL)))
 			}
@@ -226,6 +232,9 @@ func BuildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 		for i := range oldCfg.ClaudeKey {
 			o := oldCfg.ClaudeKey[i]
 			n := newCfg.ClaudeKey[i]
+			if !reflect.DeepEqual(o.Weight, n.Weight) {
+				changes = append(changes, fmt.Sprintf("claude[%d].weight: updated", i))
+			}
 			if strings.TrimSpace(o.BaseURL) != strings.TrimSpace(n.BaseURL) {
 				changes = append(changes, fmt.Sprintf("claude[%d].base-url: %s -> %s", i, strings.TrimSpace(o.BaseURL), strings.TrimSpace(n.BaseURL)))
 			}
@@ -389,6 +398,9 @@ func BuildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 		for i := range oldCfg.CodexKey {
 			o := oldCfg.CodexKey[i]
 			n := newCfg.CodexKey[i]
+			if !reflect.DeepEqual(o.Weight, n.Weight) {
+				changes = append(changes, fmt.Sprintf("codex[%d].weight: updated", i))
+			}
 			if strings.TrimSpace(o.BaseURL) != strings.TrimSpace(n.BaseURL) {
 				changes = append(changes, fmt.Sprintf("codex[%d].base-url: %s -> %s", i, strings.TrimSpace(o.BaseURL), strings.TrimSpace(n.BaseURL)))
 			}
@@ -480,6 +492,9 @@ func BuildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 		for i := range oldCfg.VertexCompatAPIKey {
 			o := oldCfg.VertexCompatAPIKey[i]
 			n := newCfg.VertexCompatAPIKey[i]
+			if !reflect.DeepEqual(o.Weight, n.Weight) {
+				changes = append(changes, fmt.Sprintf("vertex[%d].weight: updated", i))
+			}
 			if strings.TrimSpace(o.BaseURL) != strings.TrimSpace(n.BaseURL) {
 				changes = append(changes, fmt.Sprintf("vertex[%d].base-url: %s -> %s", i, strings.TrimSpace(o.BaseURL), strings.TrimSpace(n.BaseURL)))
 			}

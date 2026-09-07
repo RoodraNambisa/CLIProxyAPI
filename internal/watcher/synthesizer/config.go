@@ -26,6 +26,9 @@ func (s *ConfigSynthesizer) Synthesize(ctx *SynthesisContext) ([]*coreauth.Auth,
 	if ctx == nil || ctx.Config == nil {
 		return out, nil
 	}
+	if errWeight := ctx.Config.ValidateCredentialWeights(); errWeight != nil {
+		return nil, errWeight
+	}
 
 	// Gemini API Keys
 	out = append(out, s.synthesizeGeminiKeys(ctx)...)
@@ -41,6 +44,12 @@ func (s *ConfigSynthesizer) Synthesize(ctx *SynthesisContext) ([]*coreauth.Auth,
 	out = append(out, s.synthesizeVertexCompat(ctx)...)
 
 	return out, nil
+}
+
+func applyConfigCredentialWeight(attrs map[string]string, weight *int) {
+	if weight != nil {
+		attrs[coreauth.AttributeWeight] = strconv.Itoa(max(0, *weight))
+	}
 }
 
 // synthesizeGeminiKeys creates Auth entries for Gemini API keys.
@@ -76,6 +85,7 @@ func (s *ConfigSynthesizer) synthesizeGeminiKeyEntries(ctx *SynthesisContext, en
 		if entry.Priority != 0 {
 			attrs["priority"] = strconv.Itoa(entry.Priority)
 		}
+		applyConfigCredentialWeight(attrs, entry.Weight)
 		if base != "" {
 			attrs["base_url"] = base
 		}
@@ -123,6 +133,7 @@ func (s *ConfigSynthesizer) synthesizeClaudeKeys(ctx *SynthesisContext) []*corea
 		if ck.Priority != 0 {
 			attrs["priority"] = strconv.Itoa(ck.Priority)
 		}
+		applyConfigCredentialWeight(attrs, ck.Weight)
 		if base != "" {
 			attrs["base_url"] = base
 		}
@@ -170,6 +181,7 @@ func (s *ConfigSynthesizer) synthesizeCodexKeys(ctx *SynthesisContext) []*coreau
 		if ck.Priority != 0 {
 			attrs["priority"] = strconv.Itoa(ck.Priority)
 		}
+		applyConfigCredentialWeight(attrs, ck.Weight)
 		if ck.BaseURL != "" {
 			attrs["base_url"] = ck.BaseURL
 		}
@@ -231,6 +243,7 @@ func (s *ConfigSynthesizer) synthesizeOpenAICompat(ctx *SynthesisContext) []*cor
 			if compat.Priority != 0 {
 				attrs["priority"] = strconv.Itoa(compat.Priority)
 			}
+			applyConfigCredentialWeight(attrs, entry.Weight)
 			if key != "" {
 				attrs["api_key"] = key
 			}
@@ -323,6 +336,7 @@ func (s *ConfigSynthesizer) synthesizeVertexCompat(ctx *SynthesisContext) []*cor
 		if compat.Priority != 0 {
 			attrs["priority"] = strconv.Itoa(compat.Priority)
 		}
+		applyConfigCredentialWeight(attrs, compat.Weight)
 		if key != "" {
 			attrs["api_key"] = key
 		}

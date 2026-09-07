@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"reflect"
 	"sort"
 	"strings"
 
@@ -77,6 +78,14 @@ func describeOpenAICompatibilityUpdate(oldEntry, newEntry config.OpenAICompatibi
 	}
 	if !equalStringMap(oldEntry.Headers, newEntry.Headers) {
 		details = append(details, "headers updated")
+	}
+	if len(oldEntry.APIKeyEntries) == len(newEntry.APIKeyEntries) {
+		for index := range oldEntry.APIKeyEntries {
+			if !reflect.DeepEqual(oldEntry.APIKeyEntries[index].Weight, newEntry.APIKeyEntries[index].Weight) {
+				details = append(details, "weights updated")
+				break
+			}
+		}
 	}
 	if len(details) == 0 {
 		return ""
