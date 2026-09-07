@@ -320,6 +320,7 @@ func NewCodexExecutor(cfg *config.Config) *CodexExecutor { return &CodexExecutor
 func (e *CodexExecutor) Identifier() string { return "codex" }
 
 type codexPreparedSessionIdentity struct {
+	MultiAgentV2                  helps.CodexMultiAgentPolicy
 	StreamBootstrapBuffering      bool
 	PromptCacheLog                *util.PromptCacheLogRedactor
 	PromptCacheKey                helps.CodexPromptCacheKeySnapshot
@@ -363,6 +364,7 @@ func (e *CodexExecutor) PrepareProviderRequest(ctx context.Context, req cliproxy
 		liteHeaders.Set(helps.CodexResponsesLiteHeader, value)
 	}
 	prepared := codexPreparedSessionIdentity{
+		MultiAgentV2:                  helps.SnapshotCodexMultiAgentPolicy(ctx, opts.Headers, e.cfg != nil && e.cfg.Codex.OptimizeMultiAgentV2),
 		StreamBootstrapBuffering:      e.cfg != nil && e.cfg.Codex.StreamBootstrapBuffering,
 		PromptCacheLog:                helps.SnapshotCodexPromptCacheLog(ctx, payload),
 		PromptCacheKey:                helps.SnapshotCodexPromptCacheKey(payload, e.cfg != nil && e.cfg.Codex.PassthroughPromptCacheKey),
@@ -375,6 +377,9 @@ func (e *CodexExecutor) PrepareProviderRequest(ctx context.Context, req cliproxy
 		AffinityDigest:                affinityDigest,
 		TenantDigest:                  tenantDigest,
 		ClientThreadID:                clientThreadID,
+	}
+	if opts.SourceFormat != sdktranslator.FormatCodex && opts.SourceFormat != sdktranslator.FormatOpenAIResponse {
+		prepared.MultiAgentV2 = helps.CodexMultiAgentPolicy{}
 	}
 	if !prepared.Enabled {
 		return prepared, nil
@@ -831,6 +836,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	body = helps.SanitizeCodexReasoningEncryptedContent(ctx, "codex executor", body)
 	body = helps.NormalizeCodexToolSelection(body)
 	body = e.codexPreparedSessionIdentity(ctx, req, opts).ResponsesLite.ApplyBody(body, false)
+	body, multiAgentResponse := helps.OptimizeCodexMultiAgentV2Request(body, e.codexPreparedSessionIdentity(ctx, req, opts).MultiAgentV2)
 	replayAuthID := ""
 	if auth != nil {
 		replayAuthID = auth.ID
@@ -985,6 +991,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 
 		var param any
 		clientCompletedData := applyCodexIdentityExposeResponsePayload(completedData, identityState)
+		clientCompletedData = multiAgentResponse.Rewrite(clientCompletedData)
 		out := sdktranslator.TranslateNonStream(ctx, to, from, req.Model, originalRef.Bytes(), bodyRef.Bytes(), clientCompletedData, &param)
 		resp = cliproxyexecutor.Response{Payload: out, Headers: codexSuccessfulResponseHeaders(auth, httpResp.Header)}
 		return resp, nil
@@ -1034,6 +1041,7 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 	body = helps.SanitizeCodexReasoningEncryptedContent(ctx, "codex executor", body)
 	body = helps.NormalizeCodexToolSelection(body)
 	body = e.codexPreparedSessionIdentity(ctx, req, opts).ResponsesLite.ApplyBody(body, false)
+	body, multiAgentResponse := helps.OptimizeCodexMultiAgentV2Request(body, e.codexPreparedSessionIdentity(ctx, req, opts).MultiAgentV2)
 	reporter.SetRequestServiceTierFromPayload(body)
 	imageRequest := cliproxyauth.PayloadHasImageGenerationTool(body)
 
@@ -1110,6 +1118,7 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 	reporter.EnsurePublished(ctx)
 	var param any
 	clientData := applyCodexIdentityExposeResponsePayload(upstreamData, identityState)
+	clientData = multiAgentResponse.Rewrite(clientData)
 	out := sdktranslator.TranslateNonStream(ctx, to, from, req.Model, originalRef.Bytes(), bodyRef.Bytes(), clientData, &param)
 	resp = cliproxyexecutor.Response{Payload: out, Headers: codexSuccessfulResponseHeaders(auth, httpResp.Header)}
 	return resp, nil
