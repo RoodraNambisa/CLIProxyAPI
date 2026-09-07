@@ -143,6 +143,7 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	defer reporter.TrackFailure(ctx, &err)
 	from := opts.SourceFormat
 	to := sdktranslator.FromString("claude")
+	multiAgentResponse := helps.CodexPlaintextResponsePolicy(ctx, opts.Headers, e.cfg, from)
 	// Use streaming translation to preserve function calling, except for claude.
 	stream := from != to
 	originalPayloadSource := req.Payload
@@ -321,7 +322,7 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 		data = reverseRemapOAuthToolNames(data)
 	}
 	var param any
-	out := sdktranslator.TranslateNonStream(
+	out := multiAgentResponse.TranslateNonStream(
 		ctx,
 		to,
 		from,
@@ -350,6 +351,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	defer reporter.TrackFailure(ctx, &err)
 	from := opts.SourceFormat
 	to := sdktranslator.FromString("claude")
+	multiAgentResponse := helps.CodexPlaintextResponsePolicy(ctx, opts.Headers, e.cfg, from)
 	originalPayloadSource := req.Payload
 	if len(opts.OriginalRequest) > 0 {
 		originalPayloadSource = opts.OriginalRequest
@@ -599,7 +601,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 			if isClaudeOAuthToken(apiKey) && oauthToolNamesRemapped {
 				line = reverseRemapOAuthToolNamesFromStreamLine(line)
 			}
-			chunks := sdktranslator.TranslateStream(
+			chunks := multiAgentResponse.TranslateStream(
 				ctx,
 				to,
 				from,
