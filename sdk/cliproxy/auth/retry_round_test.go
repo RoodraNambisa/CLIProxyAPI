@@ -109,13 +109,14 @@ func runCredentialRetryOperation(ctx context.Context, manager *Manager, mode str
 	case "stream":
 		stream, err := manager.ExecuteStream(ctx, []string{"claude"}, request, opts)
 		if stream != nil {
-			if stream.Headers.Get("X-Auth") == "" {
-				return errors.New("stream lost the selected failure's headers")
-			}
+			missingHeaders := stream.Headers.Get("X-Auth") == ""
 			for chunk := range stream.Chunks {
 				if chunk.Err != nil {
 					err = chunk.Err
 				}
+			}
+			if missingHeaders {
+				return errors.New("stream lost the selected failure's headers")
 			}
 		}
 		return err
