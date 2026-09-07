@@ -1766,6 +1766,7 @@ func (e *CodexExecutor) applyCodexHTTPSessionIdentity(
 	identityConfuse *codexIdentityConfuseState,
 ) ([]byte, error) {
 	e.codexPreparedSessionIdentity(ctx, req, opts).ResponsesLite.ApplyHeaders(httpReq.Header)
+	applyCodexSoftwareIdentity(httpReq.Header, auth, e.cfg, req.Model)
 	projected, state, err := e.projectCodexSessionIdentity(ctx, auth, req, opts, rawJSON, identityConfuse)
 	if err != nil {
 		closeCodexRequestBody(httpReq)
@@ -2345,7 +2346,7 @@ func applyCodexHeadersFromSources(r *http.Request, auth *cliproxyauth.Auth, toke
 	return nil
 }
 
-func applyCodexSoftwareIdentity(headers http.Header, auth *cliproxyauth.Auth, cfg *config.Config) {
+func applyCodexSoftwareIdentity(headers http.Header, auth *cliproxyauth.Auth, cfg *config.Config, models ...string) {
 	if headers == nil || codexAuthUsesAPIKey(auth) || !codexEnforceSoftwareIdentity(cfg) {
 		return
 	}
@@ -2354,6 +2355,9 @@ func applyCodexSoftwareIdentity(headers http.Header, auth *cliproxyauth.Auth, cf
 		candidate = strings.TrimSpace(cfg.CodexHeaderDefaults.UserAgent)
 	}
 	identity := codexauth.ResolveSoftwareIdentity(candidate)
+	if len(models) > 0 {
+		identity = codexauth.ResolveSoftwareIdentityForModel(candidate, thinking.ParseSuffix(models[0]).ModelName)
+	}
 	deleteHeaderCaseInsensitive(headers, "User-Agent")
 	deleteHeaderCaseInsensitive(headers, "Originator")
 	deleteHeaderCaseInsensitive(headers, "Version")

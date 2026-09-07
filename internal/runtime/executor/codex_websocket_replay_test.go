@@ -126,7 +126,7 @@ func TestCodexIncrementalConnectionRequiresSameCredentialInstanceAndProxy(t *tes
 		case "missing connection":
 			sess.conn = nil
 		}
-		got, _, err := e.ensureUpstreamConn(core.WithRequiredUpstreamWebsocket(t.Context()), credential, sess, credential.ID, "ws://unused.test/responses", nil)
+		got, _, err := e.ensureUpstreamConn(core.WithRequiredUpstreamWebsocket(t.Context()), credential, sess, credential.ID, "ws://unused.test/responses", nil, "gpt-6-astra")
 		if mismatch == "none" {
 			if got != conn || err != nil {
 				t.Fatal("matching established connection was not reused")

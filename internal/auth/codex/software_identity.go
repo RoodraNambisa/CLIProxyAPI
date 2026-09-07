@@ -10,6 +10,7 @@ const (
 	DefaultUserAgent                  = "codex_cli_rs/0.153.4 (Mac OS 26.5.0; arm64) iTerm.app/3.6.10"
 	DefaultOriginator                 = "codex_cli_rs"
 	MinimumCompatibleUserAgentVersion = "0.144.0"
+	MinimumAstraUserAgentVersion      = "0.153.0"
 )
 
 var codexSoftwareIdentityPattern = regexp.MustCompile(`^([A-Za-z0-9][A-Za-z0-9._-]*)/([0-9]+\.[0-9]+\.[0-9]+(?:[-+][A-Za-z0-9.-]+)?)((?:\s.*)?)$`)
@@ -31,6 +32,45 @@ type codexSoftwareVersion struct {
 // ResolveSoftwareIdentity validates a Codex User-Agent and upgrades only its
 // version segment when it is older than the supported baseline.
 func ResolveSoftwareIdentity(candidate string) SoftwareIdentity {
+	return resolveSoftwareIdentityWithMinimum(candidate, MinimumCompatibleUserAgentVersion)
+}
+
+// ResolveSoftwareIdentityForModel preserves the general compatibility floor while
+// enforcing a newer minimum only for models whose protocol requires it.
+func ResolveSoftwareIdentityForModel(candidate, model string) SoftwareIdentity {
+	return resolveSoftwareIdentityWithMinimum(candidate, minimumSoftwareVersionForModel(model))
+}
+
+// SoftwareIdentitySupportsModel checks the actual handshake's UA and Version
+// independently; a newer Version header must not hide an older client UA.
+func SoftwareIdentitySupportsModel(identity SoftwareIdentity, model string) bool {
+	parsed, ok := parseCodexSoftwareIdentity(identity.UserAgent)
+	if !ok {
+		return false
+	}
+	userAgentVersion, ok := parseCodexSoftwareVersion(parsed.Version)
+	if !ok {
+		return false
+	}
+	headerValue := strings.TrimSpace(identity.Version)
+	headerIdentity, ok := parseCodexSoftwareIdentity("codex/" + headerValue)
+	if !ok || headerIdentity.Version != headerValue {
+		return false
+	}
+	headerVersion, _ := parseCodexSoftwareVersion(headerIdentity.Version)
+	minimum, _ := parseCodexSoftwareVersion(minimumSoftwareVersionForModel(model))
+	return userAgentVersion.compare(minimum) >= 0 && headerVersion.compare(minimum) >= 0
+}
+
+func minimumSoftwareVersionForModel(model string) string {
+	minimum := MinimumCompatibleUserAgentVersion
+	if strings.EqualFold(strings.TrimSpace(model), "gpt-6-astra") {
+		minimum = MinimumAstraUserAgentVersion
+	}
+	return minimum
+}
+
+func resolveSoftwareIdentityWithMinimum(candidate, minimumVersion string) SoftwareIdentity {
 	candidate = strings.TrimSpace(candidate)
 	if candidate == "" {
 		candidate = DefaultUserAgent
@@ -40,7 +80,7 @@ func ResolveSoftwareIdentity(candidate string) SoftwareIdentity {
 		parsed, _ = parseCodexSoftwareIdentity(DefaultUserAgent)
 		return parsed
 	}
-	minimum, _ := parseCodexSoftwareVersion(MinimumCompatibleUserAgentVersion)
+	minimum, _ := parseCodexSoftwareVersion(minimumVersion)
 	current, _ := parseCodexSoftwareVersion(parsed.Version)
 	if current.compare(minimum) >= 0 {
 		return parsed

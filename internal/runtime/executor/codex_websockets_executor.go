@@ -67,13 +67,14 @@ type codexWebsocketSession struct {
 
 	reqMu sync.Mutex
 
-	connMu         sync.Mutex
-	conn           *websocket.Conn
-	wsURL          string
-	authID         string
-	authInstanceID string
-	proxyBindingID string
-	proxyIdentity  string
+	connMu           sync.Mutex
+	conn             *websocket.Conn
+	wsURL            string
+	authID           string
+	authInstanceID   string
+	proxyBindingID   string
+	proxyIdentity    string
+	softwareIdentity codexauth.SoftwareIdentity
 	// pendingAuthID and dialGeneration identify an in-flight Codex dial before a
 	// connection has been installed on the session.
 	pendingAuthID         string
@@ -300,6 +301,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 	if err != nil {
 		return resp, err
 	}
+	applyCodexSoftwareIdentity(wsHeaders, auth, e.cfg, req.Model)
 	applyCodexIdentityConfuseHeaders(wsHeaders, &identityState)
 	upstreamBody, sessionIdentity, err := e.projectCodexSessionIdentity(ctx, auth, req, opts, upstreamBody, &identityState)
 	if err != nil {
@@ -355,7 +357,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 	}
 	helps.RecordAPIWebsocketRequest(ctx, e.cfg, wsReqLog)
 
-	conn, respHS, errDial := e.ensureUpstreamConn(ctx, auth, sess, authID, wsURL, wsHeaders)
+	conn, respHS, errDial := e.ensureUpstreamConn(ctx, auth, sess, authID, wsURL, wsHeaders, req.Model)
 	if errDial != nil {
 		bodyErr := websocketHandshakeBody(respHS)
 		bodyErr = codexauth.SanitizeAgentIdentityErrorBody(authMetadata(auth), bodyErr)
@@ -421,7 +423,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 			// Retry once with a fresh websocket connection. This is mainly to handle
 			// upstream closing the socket between sequential requests within the same
 			// execution session.
-			connRetry, respHSRetry, errDialRetry := e.ensureUpstreamConn(ctx, auth, sess, authID, wsURL, wsHeaders)
+			connRetry, respHSRetry, errDialRetry := e.ensureUpstreamConn(ctx, auth, sess, authID, wsURL, wsHeaders, req.Model)
 			if errDialRetry == nil && connRetry != nil {
 				readCh = sess.replaceActiveForConn(readCh, conn, connRetry)
 				wsReqBodyRetry := buildCodexWebsocketRequestBody(upstreamRef.Bytes())
@@ -612,6 +614,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 	if err != nil {
 		return nil, err
 	}
+	applyCodexSoftwareIdentity(wsHeaders, auth, e.cfg, req.Model)
 	applyCodexIdentityConfuseHeaders(wsHeaders, &identityState)
 	upstreamBody, sessionIdentity, err := e.projectCodexSessionIdentity(ctx, auth, req, opts, upstreamBody, &identityState)
 	if err != nil {
@@ -666,7 +669,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 	}
 	helps.RecordAPIWebsocketRequest(ctx, e.cfg, wsReqLog)
 
-	conn, respHS, errDial := e.ensureUpstreamConn(ctx, auth, sess, authID, wsURL, wsHeaders)
+	conn, respHS, errDial := e.ensureUpstreamConn(ctx, auth, sess, authID, wsURL, wsHeaders, req.Model)
 	var upstreamHeaders http.Header
 	if errDial != nil {
 		if sess != nil {
@@ -735,7 +738,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 			}
 
 			// Retry once with a new websocket connection for the same execution session.
-			connRetry, respHSRetry, errDialRetry := e.ensureUpstreamConn(ctx, auth, sess, authID, wsURL, wsHeaders)
+			connRetry, respHSRetry, errDialRetry := e.ensureUpstreamConn(ctx, auth, sess, authID, wsURL, wsHeaders, req.Model)
 			if errDialRetry != nil || connRetry == nil {
 				closeHTTPResponseBody(respHSRetry, "codex websockets executor: close handshake response body error")
 				helps.RecordAPIWebsocketError(ctx, e.cfg, "dial_retry", errDialRetry)
@@ -1684,7 +1687,7 @@ func (e *CodexWebsocketsExecutor) UpstreamDisconnectChan(sessionID string) <-cha
 	return sess.upstreamDisconnectCh
 }
 
-func (e *CodexWebsocketsExecutor) ensureUpstreamConn(ctx context.Context, auth *cliproxyauth.Auth, sess *codexWebsocketSession, authID string, wsURL string, headers http.Header) (*websocket.Conn, *http.Response, error) {
+func (e *CodexWebsocketsExecutor) ensureUpstreamConn(ctx context.Context, auth *cliproxyauth.Auth, sess *codexWebsocketSession, authID string, wsURL string, headers http.Header, models ...string) (*websocket.Conn, *http.Response, error) {
 	if errCurrent := codexWebsocketExecutionStateError(ctx, auth); errCurrent != nil {
 		return nil, nil, errCurrent
 	}
@@ -1728,17 +1731,24 @@ func (e *CodexWebsocketsExecutor) ensureUpstreamConn(ctx context.Context, auth *
 	currentProxyBindingID := strings.TrimSpace(sess.proxyBindingID)
 	currentProxyIdentity := strings.TrimSpace(sess.proxyIdentity)
 	currentWSURL := strings.TrimSpace(sess.wsURL)
+	currentSoftwareIdentity := sess.softwareIdentity
 	sess.connMu.Unlock()
 	requestedAuthID := strings.TrimSpace(authID)
 	requestedAuthInstanceID := auth.RuntimeInstanceID()
 	requestedProxyBindingID := auth.EffectiveProxyBindingID()
 	requestedProxyIdentity := websocketProxyIdentity(e.cfg, auth)
 	requestedWSURL := strings.TrimSpace(wsURL)
-	if cliproxyexecutor.RequiredUpstreamWebsocket(ctx) && (conn == nil || currentAuthID != requestedAuthID || currentAuthInstanceID != requestedAuthInstanceID || currentProxyBindingID != requestedProxyBindingID || currentProxyIdentity != requestedProxyIdentity || currentWSURL != requestedWSURL) {
+	softwareChanged := conn != nil && len(models) > 0 && codexEnforceSoftwareIdentity(e.cfg) && !codexAuthUsesAPIKey(auth) &&
+		!codexauth.SoftwareIdentitySupportsModel(currentSoftwareIdentity, thinking.ParseSuffix(models[0]).ModelName)
+	if cliproxyexecutor.RequiredUpstreamWebsocket(ctx) && (conn == nil || currentAuthID != requestedAuthID || currentAuthInstanceID != requestedAuthInstanceID || currentProxyBindingID != requestedProxyBindingID || currentProxyIdentity != requestedProxyIdentity || currentWSURL != requestedWSURL || softwareChanged) {
 		return nil, nil, cliproxyexecutor.NewUpstreamWebsocketReplayRequiredError()
 	}
-	if conn != nil && (currentAuthID != requestedAuthID || currentAuthInstanceID != requestedAuthInstanceID || currentProxyBindingID != requestedProxyBindingID || currentProxyIdentity != requestedProxyIdentity || currentWSURL != requestedWSURL) {
-		e.invalidateUpstreamConnWithoutDisconnectNotify(sess, conn, "auth_changed", nil)
+	if conn != nil && (currentAuthID != requestedAuthID || currentAuthInstanceID != requestedAuthInstanceID || currentProxyBindingID != requestedProxyBindingID || currentProxyIdentity != requestedProxyIdentity || currentWSURL != requestedWSURL || softwareChanged) {
+		reason := "auth_changed"
+		if softwareChanged {
+			reason = "software_version"
+		}
+		e.invalidateUpstreamConnWithoutDisconnectNotify(sess, conn, reason, nil)
 		conn = nil
 		readerConn = nil
 	}
@@ -1827,6 +1837,11 @@ func (e *CodexWebsocketsExecutor) ensureUpstreamConn(ctx context.Context, auth *
 	sess.authInstanceID = auth.RuntimeInstanceID()
 	sess.proxyBindingID = requestedProxyBindingID
 	sess.proxyIdentity = requestedProxyIdentity
+	sess.softwareIdentity = codexauth.SoftwareIdentity{
+		UserAgent:  headers.Get("User-Agent"),
+		Version:    headers.Get("Version"),
+		Originator: headers.Get("Originator"),
+	}
 	sess.pendingAuthID = ""
 	sess.pendingAuthInstanceID = ""
 	sess.pendingProxyBindingID = ""
@@ -1941,6 +1956,7 @@ func (e *CodexWebsocketsExecutor) invalidateUpstreamConnWithNotify(sess *codexWe
 		return
 	}
 	sess.conn = nil
+	sess.softwareIdentity = codexauth.SoftwareIdentity{}
 	if sess.readerConn == conn {
 		sess.readerConn = nil
 	}
@@ -2048,6 +2064,7 @@ func closeCodexWebsocketSession(sess *codexWebsocketSession, reason string) {
 	authID := sess.authID
 	wsURL := sess.wsURL
 	sess.conn = nil
+	sess.softwareIdentity = codexauth.SoftwareIdentity{}
 	if !sess.terminated {
 		sess.terminated = true
 		sess.dialGeneration++

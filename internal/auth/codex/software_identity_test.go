@@ -55,3 +55,42 @@ func TestResolveSoftwareIdentity(t *testing.T) {
 		})
 	}
 }
+
+func TestResolveSoftwareIdentityForAstraKeepsGenericFloorAndClientSuffix(t *testing.T) {
+	old := "my-codex/0.148.0 (Linux; arm64) tmux/3.5"
+	if got := ResolveSoftwareIdentityForModel(old, "gpt-5.4"); got.UserAgent != old {
+		t.Fatal("generic compatibility floor was raised")
+	}
+	if got := ResolveSoftwareIdentityForModel(old, "gpt-6-astra"); got.UserAgent != "my-codex/0.153.4 (Linux; arm64) tmux/3.5" || got.Originator != "my-codex" || got.Version != "0.153.4" {
+		t.Fatal("Astra identity did not preserve the client shape")
+	}
+	current := "my-codex/0.153.0 (Linux; arm64) tmux/3.5"
+	if got := ResolveSoftwareIdentityForModel(current, "gpt-6-astra"); got.UserAgent != current {
+		t.Fatal("supported explicit version was replaced")
+	}
+}
+
+func TestSoftwareIdentitySupportsModelChecksBothHandshakeVersions(t *testing.T) {
+	for _, tc := range []struct {
+		userAgentVersion string
+		headerVersion    string
+		model            string
+		want             bool
+	}{
+		{"0.148.0", "0.148.0", "gpt-5.4", true},
+		{"0.148.0", "0.153.4", "gpt-6-astra", false},
+		{"0.153.4", "0.148.0", "gpt-6-astra", false},
+		{"0.153.4", "", "gpt-6-astra", false},
+		{"0.153.4", "0.153.4 suffix", "gpt-6-astra", false},
+		{"0.153.4", "0.153.4+", "gpt-6-astra", false},
+		{"0.153.0-alpha", "0.153.0", "gpt-6-astra", false},
+		{"0.153.0", "0.153.0-alpha", "gpt-6-astra", false},
+		{"0.153.0", "0.153.0", "gpt-6-astra", true},
+		{"0.154.0-beta", "0.154.0-beta", "gpt-6-astra", true},
+	} {
+		identity := SoftwareIdentity{UserAgent: "local-codex/" + tc.userAgentVersion + " (Linux) tmux", Version: tc.headerVersion}
+		if got := SoftwareIdentitySupportsModel(identity, tc.model); got != tc.want {
+			t.Fatalf("versions %q/%q for %s: got %t, want %t", tc.userAgentVersion, tc.headerVersion, tc.model, got, tc.want)
+		}
+	}
+}
