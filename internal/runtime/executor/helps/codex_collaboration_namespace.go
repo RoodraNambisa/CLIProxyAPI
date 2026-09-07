@@ -34,6 +34,13 @@ func OptimizeCodexCollaborationNamespace(payload []byte) ([]byte, bool) {
 		}
 		optimized = true
 	}
+	if optimized {
+		var errChoice error
+		updated, errChoice = rewriteCodexCollaborationChoice(updated, "tool_choice", codexCollaborationNamespace, codexOptimizedCollaborationNamespace)
+		if errChoice != nil {
+			return payload, false
+		}
+	}
 	return updated, optimized
 }
 
@@ -103,6 +110,13 @@ func RewriteCodexMultiAgentV2Response(payload []byte, restoreNamespace, plaintex
 			}
 		}
 		if node.kind == "response" {
+			if restoreNamespace {
+				var errChoice error
+				updated, errChoice = rewriteCodexCollaborationChoice(updated, fieldPath(node.path, "tool_choice"), codexOptimizedCollaborationNamespace, codexCollaborationNamespace)
+				if errChoice != nil {
+					return payload
+				}
+			}
 			pushArray(node.value.Get("output"), fieldPath(node.path, "output"), "item")
 			pushArray(node.value.Get("tools"), fieldPath(node.path, "tools"), "tool")
 			continue
