@@ -435,6 +435,10 @@ func getAvailableAuths(auths []*Auth, provider, model string, now time.Time, sel
 }
 
 func getAvailableAuthsForContext(ctx context.Context, auths []*Auth, provider, model string, now time.Time, selectionAttempt int) ([]*Auth, error) {
+	return getAvailableAuthsForContextWithPreference(ctx, auths, provider, model, now, selectionAttempt, "")
+}
+
+func getAvailableAuthsForContextWithPreference(ctx context.Context, auths []*Auth, provider, model string, now time.Time, selectionAttempt int, preferredAuthID string) ([]*Auth, error) {
 	if shouldPreferCodexWebsocket(ctx, provider) && hasReadyCodexWebsocketAuth(auths, model, now) {
 		websocketAuths := make([]*Auth, 0, len(auths))
 		for _, auth := range auths {
@@ -442,9 +446,9 @@ func getAvailableAuthsForContext(ctx context.Context, auths []*Auth, provider, m
 				websocketAuths = append(websocketAuths, auth)
 			}
 		}
-		return selectAvailableAuthsForAttempt(websocketAuths, provider, model, now, selectionAttempt, nil)
+		return selectAvailableAuthsForAttemptFilteredWithPriority(websocketAuths, provider, model, now, selectionAttempt, nil, nil, true, preferredAuthID)
 	}
-	return getAvailableAuths(auths, provider, model, now, selectionAttempt)
+	return selectAvailableAuthsForAttemptFilteredWithPriority(auths, provider, model, now, selectionAttempt, nil, nil, true, preferredAuthID)
 }
 
 func selectAvailableAuthsForAttempt(auths []*Auth, provider, model string, now time.Time, selectionAttempt int, modelForAuth func(*Auth) string) ([]*Auth, error) {
@@ -452,14 +456,14 @@ func selectAvailableAuthsForAttempt(auths []*Auth, provider, model string, now t
 }
 
 func selectAvailableAuthsForAttemptFiltered(auths []*Auth, provider, model string, now time.Time, selectionAttempt int, modelForAuth func(*Auth) string, pickAllowed func(*Auth) bool) ([]*Auth, error) {
-	return selectAvailableAuthsForAttemptFilteredWithPriority(auths, provider, model, now, selectionAttempt, modelForAuth, pickAllowed, true)
+	return selectAvailableAuthsForAttemptFilteredWithPriority(auths, provider, model, now, selectionAttempt, modelForAuth, pickAllowed, true, "")
 }
 
 func selectAvailableAuthsForAttemptFilteredWithPickablePriority(auths []*Auth, provider, model string, now time.Time, selectionAttempt int, modelForAuth func(*Auth) string, pickAllowed func(*Auth) bool) ([]*Auth, error) {
-	return selectAvailableAuthsForAttemptFilteredWithPriority(auths, provider, model, now, selectionAttempt, modelForAuth, pickAllowed, false)
+	return selectAvailableAuthsForAttemptFilteredWithPriority(auths, provider, model, now, selectionAttempt, modelForAuth, pickAllowed, false, "")
 }
 
-func selectAvailableAuthsForAttemptFilteredWithPriority(auths []*Auth, provider, model string, now time.Time, selectionAttempt int, modelForAuth func(*Auth) string, pickAllowed func(*Auth) bool, preserveFilteredPriority bool) ([]*Auth, error) {
+func selectAvailableAuthsForAttemptFilteredWithPriority(auths []*Auth, provider, model string, now time.Time, selectionAttempt int, modelForAuth func(*Auth) string, pickAllowed func(*Auth) bool, preserveFilteredPriority bool, preferredAuthID string) ([]*Auth, error) {
 	if len(auths) == 0 {
 		return nil, &Error{Code: "auth_not_found", Message: "no auth candidates"}
 	}
@@ -518,9 +522,21 @@ func selectAvailableAuthsForAttemptFilteredWithPriority(auths []*Auth, provider,
 	sort.Slice(priorities, func(i, j int) bool {
 		return priorities[i] > priorities[j]
 	})
+	eligiblePriorities := selectionPrioritiesForAttempt(priorities, selectionAttempt)
+	// A binding can precede priority only after availability and capacity filters.
+	// Keep the retry's eligible priority range intact and reuse this single scan.
+	if preferredAuthID != "" {
+		for _, priority := range eligiblePriorities {
+			for _, candidate := range availableByPriority[priority] {
+				if candidate.ID == preferredAuthID {
+					return []*Auth{candidate}, nil
+				}
+			}
+		}
+	}
 	var earliest time.Time
 	var failures candidateFailureChoice
-	for _, priority := range selectionPrioritiesForAttempt(priorities, selectionAttempt) {
+	for _, priority := range eligiblePriorities {
 		failures.merge(blockedByPriority[priority].failures)
 		available := append([]*Auth(nil), availableByPriority[priority]...)
 		if len(available) == 0 {
