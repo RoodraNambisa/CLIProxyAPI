@@ -22,19 +22,20 @@ import (
 )
 
 type patchAuthFileFieldsRequest struct {
-	Name                 string            `json:"name"`
-	Names                []string          `json:"names"`
-	Fields               json.RawMessage   `json:"fields"`
-	Prefix               *string           `json:"prefix"`
-	ProxyURL             *string           `json:"proxy_url"`
-	Headers              map[string]string `json:"headers"`
-	Priority             *int              `json:"priority"`
-	Note                 *string           `json:"note"`
-	UsingAPI             *bool             `json:"using_api"`
-	Websockets           *bool             `json:"websockets"`
-	LoginMethod          *string           `json:"login_method"`
-	API798URL            *string           `json:"api798_url"`
-	CodexFingerprintMode *string           `json:"codex_fingerprint_mode"`
+	Name                 string                `json:"name"`
+	Names                []string              `json:"names"`
+	Fields               json.RawMessage       `json:"fields"`
+	Prefix               *string               `json:"prefix"`
+	ProxyURL             *string               `json:"proxy_url"`
+	Headers              map[string]string     `json:"headers"`
+	Priority             *int                  `json:"priority"`
+	Weight               credentialWeightPatch `json:"weight"`
+	Note                 *string               `json:"note"`
+	UsingAPI             *bool                 `json:"using_api"`
+	Websockets           *bool                 `json:"websockets"`
+	LoginMethod          *string               `json:"login_method"`
+	API798URL            *string               `json:"api798_url"`
+	CodexFingerprintMode *string               `json:"codex_fingerprint_mode"`
 }
 
 type authFileFieldValues struct {
@@ -44,6 +45,8 @@ type authFileFieldValues struct {
 	headersSet           bool
 	priority             *int
 	prioritySet          bool
+	weight               *int
+	weightSet            bool
 	note                 *string
 	usingAPI             *bool
 	websockets           *bool
@@ -111,6 +114,8 @@ func (h *Handler) patchAuthFileFieldsLegacy(c *gin.Context, req *patchAuthFileFi
 		websockets:      req.Websockets,
 		api798URL:       req.API798URL,
 		legacyHeaderOps: true,
+		weight:          req.Weight.value,
+		weightSet:       req.Weight.set,
 	}
 	if req.CodexFingerprintMode != nil {
 		mode, ok := codexauth.NormalizeFingerprintMode(*req.CodexFingerprintMode)
@@ -257,6 +262,12 @@ func decodeAuthFileFieldValues(raw json.RawMessage) (authFileFieldValues, error)
 				return authFileFieldValues{}, fmt.Errorf("invalid priority")
 			}
 			values.priority = &decoded
+		case "weight":
+			var patch credentialWeightPatch
+			if err := json.Unmarshal(value, &patch); err != nil {
+				return authFileFieldValues{}, err
+			}
+			values.weight, values.weightSet = patch.value, patch.set
 		case "note":
 			var decoded string
 			if err := decodeNonNullAuthField(value, &decoded); err != nil {
@@ -332,13 +343,13 @@ func decodeNonNullAuthField(raw json.RawMessage, target any) error {
 }
 
 func (v authFileFieldValues) hasFields() bool {
-	return v.prefix != nil || v.proxyURL != nil || v.headersSet || v.prioritySet || v.note != nil ||
+	return v.prefix != nil || v.proxyURL != nil || v.headersSet || v.prioritySet || v.weightSet || v.note != nil ||
 		v.usingAPI != nil || v.websockets != nil || v.excludedSet || v.disableCooling != nil ||
 		v.loginMethod != nil || v.api798URL != nil || v.codexFingerprintMode != nil
 }
 
 func (v authFileFieldValues) hasNonHeaderFields() bool {
-	return v.prefix != nil || v.proxyURL != nil || v.prioritySet || v.note != nil || v.usingAPI != nil ||
+	return v.prefix != nil || v.proxyURL != nil || v.prioritySet || v.weightSet || v.note != nil || v.usingAPI != nil ||
 		v.websockets != nil || v.excludedSet || v.disableCooling != nil || v.loginMethod != nil ||
 		v.api798URL != nil || v.codexFingerprintMode != nil
 }
@@ -489,6 +500,15 @@ func (h *Handler) applyAuthFileFieldValues(auth *coreauth.Auth, values authFileF
 	}
 	if values.note != nil {
 		setOrDeleteAuthString(auth, "note", strings.TrimSpace(*values.note))
+	}
+	if values.weightSet {
+		if values.weight == nil {
+			delete(auth.Metadata, coreauth.AttributeWeight)
+			delete(auth.Attributes, coreauth.AttributeWeight)
+		} else {
+			auth.Metadata[coreauth.AttributeWeight] = *values.weight
+			auth.Attributes[coreauth.AttributeWeight] = strconv.Itoa(*values.weight)
+		}
 	}
 	if values.usingAPI != nil {
 		auth.Metadata["using_api"] = *values.usingAPI

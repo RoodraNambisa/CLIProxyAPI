@@ -1,14 +1,17 @@
 package management
 
 import (
-	"github.com/gin-gonic/gin"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"reflect"
 	"strings"
 	"testing"
+
+	"github.com/gin-gonic/gin"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 )
 
 func TestCredentialWeightConfigPatchRoundTripAndRejectedSave(t *testing.T) {
@@ -69,5 +72,51 @@ func TestCredentialWeightConfigPatchRoundTripAndRejectedSave(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestCredentialWeightAuthFilePatchAndClear(t *testing.T) {
+	for _, batch := range []bool{false, true} {
+		store := &memoryAuthStore{}
+		manager := coreauth.NewManager(store, nil, nil)
+		a := &coreauth.Auth{ID: "weight.json", FileName: "weight.json", Provider: "codex", Metadata: map[string]any{"type": "codex"}}
+		if _, err := manager.Register(t.Context(), a); err != nil {
+			t.Fatal(err)
+		}
+		h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, manager)
+		for _, value := range []string{"0", "7", "omitted", "null"} {
+			body := `{"name":"weight.json","weight":` + value + `}`
+			if value == "omitted" {
+				body = `{"name":"weight.json","note":"retained"}`
+			}
+			if batch {
+				body = `{"names":["weight.json"],"fields":{"weight":` + value + `}}`
+				if value == "omitted" {
+					body = `{"names":["weight.json"],"fields":{"note":"retained"}}`
+				}
+			}
+			rec := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(rec)
+			c.Request = httptest.NewRequest(http.MethodPatch, "/weight", strings.NewReader(body))
+			c.Request.Header.Set("Content-Type", "application/json")
+			h.PatchAuthFileFields(c)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("auth weight patch failed: status %d", rec.Code)
+			}
+			current, _ := manager.GetByID(a.ID)
+			weight, present := configuredAuthFileWeight(current)
+			if value == "null" {
+				if present {
+					t.Fatal("clearing weight left a shadowing source")
+				}
+			} else if !present || (value == "0" && weight != 0) || ((value == "7" || value == "omitted") && weight != 7) {
+				t.Fatalf("auth patch did not update effective weight: input=%s, present=%v, value=%d", value, present, weight)
+			}
+		}
+	}
+	for _, raw := range []string{`{"weight":1.5}`, `{"weight":true}`, `{"weight":1000001}`} {
+		if _, err := decodeAuthFileFieldValues(json.RawMessage(raw)); err == nil {
+			t.Fatal("invalid batch weight accepted")
+		}
 	}
 }
