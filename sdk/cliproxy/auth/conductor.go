@@ -2553,7 +2553,7 @@ func (m *Manager) executeStreamWithModelPool(ctx, resultCtx context.Context, exe
 			if !skipAuthResultForError(errStream) && !deferUnauthorizedStreamResult(auth, errStream) {
 				m.markExecutionResult(ctx, result)
 			}
-			if isResponsesCompactRequestFaultError(opts, errStream) || m.isRequestInvalidError(errStream) {
+			if isResponsesCompactRequestFaultError(opts, errStream) || m.isRequestInvalidError(errStream, ctx) {
 				return nil, errStream
 			}
 			lastErr = errStream
@@ -2575,7 +2575,7 @@ func (m *Manager) executeStreamWithModelPool(ctx, resultCtx context.Context, exe
 			}
 			bootstrapErr = m.reportProxyFailure(ctx, auth, bootstrapErr)
 			m.projectFailedImageGenerationQuota(ctx, auth, provider, executionResultModelForError(resultModel, bootstrapErr), opts)
-			if isResponsesCompactRequestFaultError(opts, bootstrapErr) || m.isRequestInvalidError(bootstrapErr) {
+			if isResponsesCompactRequestFaultError(opts, bootstrapErr) || m.isRequestInvalidError(bootstrapErr, ctx) {
 				rerr := &Error{Message: bootstrapErr.Error()}
 				if se, ok := errors.AsType[cliproxyexecutor.StatusError](bootstrapErr); ok && se != nil {
 					rerr.HTTPStatus = se.StatusCode()
@@ -4461,7 +4461,7 @@ func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxye
 			}
 			continue
 		}
-		if strictSessionAffinity || !requestBodyReplayable(ctx, opts) || isResponsesCompactRequestFaultError(opts, errExec) || !shouldRetryRequestRound(errExec, m.currentConfig()) || attempt >= requestRetry {
+		if strictSessionAffinity || !requestBodyReplayable(ctx, opts) || isResponsesCompactRequestFaultError(opts, errExec) || !shouldRetryRequestRound(errExec, m.requestNonRetryableErrorRules(ctx)) || attempt >= requestRetry {
 			break
 		}
 		if wait, shouldWait := retryAfterWaitFromError(errExec, maxWait); shouldWait {
@@ -4554,7 +4554,7 @@ func (m *Manager) ExecuteCount(ctx context.Context, providers []string, req clip
 			}
 			continue
 		}
-		if strictSessionAffinity || !requestBodyReplayable(ctx, opts) || !shouldRetryRequestRound(errExec, m.currentConfig()) || attempt >= requestRetry {
+		if strictSessionAffinity || !requestBodyReplayable(ctx, opts) || !shouldRetryRequestRound(errExec, m.requestNonRetryableErrorRules(ctx)) || attempt >= requestRetry {
 			break
 		}
 		if wait, shouldWait := retryAfterWaitFromError(errExec, maxWait); shouldWait {
@@ -4645,7 +4645,7 @@ func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cli
 			}
 			continue
 		}
-		if strictSessionAffinity || !requestBodyReplayable(ctx, opts) || isResponsesCompactRequestFaultError(opts, errStream) || !shouldRetryRequestRound(errStream, m.currentConfig()) || attempt >= requestRetry {
+		if strictSessionAffinity || !requestBodyReplayable(ctx, opts) || isResponsesCompactRequestFaultError(opts, errStream) || !shouldRetryRequestRound(errStream, m.requestNonRetryableErrorRules(ctx)) || attempt >= requestRetry {
 			break
 		}
 		if wait, shouldWait := retryAfterWaitFromError(errStream, maxWait); shouldWait {
@@ -5781,7 +5781,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 				m.markExecutionResult(execCtx, result)
 			}
 			triggerChatGPTWebUnauthorizedRequestRefresh(errExec)
-			if isResponsesCompactRequestFaultError(opts, errExec) || m.isRequestInvalidError(errExec) {
+			if isResponsesCompactRequestFaultError(opts, errExec) || m.isRequestInvalidError(errExec, ctx) {
 				return cliproxyexecutor.Response{}, withAuthErrorResponseSource(errExec, auth, provider)
 			}
 			authErr = errExec
@@ -5791,7 +5791,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			continue
 		}
 		if authErr != nil {
-			if isResponsesCompactRequestFaultError(opts, authErr) || m.isRequestInvalidError(authErr) {
+			if isResponsesCompactRequestFaultError(opts, authErr) || m.isRequestInvalidError(authErr, ctx) {
 				return cliproxyexecutor.Response{}, withAuthErrorResponseSource(authErr, auth, provider)
 			}
 			if strictSessionAffinity {
@@ -6044,7 +6044,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 				m.markExecutionResult(execCtx, result)
 			}
 			triggerChatGPTWebUnauthorizedRequestRefresh(errExec)
-			if m.isRequestInvalidError(errExec) {
+			if m.isRequestInvalidError(errExec, ctx) {
 				return cliproxyexecutor.Response{}, withAuthErrorResponseSource(errExec, auth, provider)
 			}
 			authErr = errExec
@@ -6054,7 +6054,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 			continue
 		}
 		if authErr != nil {
-			if m.isRequestInvalidError(authErr) {
+			if m.isRequestInvalidError(authErr, ctx) {
 				return cliproxyexecutor.Response{}, withAuthErrorResponseSource(authErr, auth, provider)
 			}
 			if strictSessionAffinity {
@@ -6289,7 +6289,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 				m.markExecutionResult(execCtx, result)
 			}
 			triggerChatGPTWebUnauthorizedRequestRefresh(errStream)
-			if isResponsesCompactRequestFaultError(opts, errStream) || m.isRequestInvalidError(errStream) {
+			if isResponsesCompactRequestFaultError(opts, errStream) || m.isRequestInvalidError(errStream, ctx) {
 				return nil, withAuthErrorResponseSource(errStream, auth, provider)
 			}
 			if strictSessionAffinity {
@@ -7672,7 +7672,7 @@ func (b *requestRetryBudget) consume() bool {
 	}
 }
 
-func shouldRetryRequestRound(err error, cfg *internalconfig.Config) bool {
+func shouldRetryRequestRound(err error, rules []internalconfig.NonRetryableErrorRule) bool {
 	if err == nil {
 		return false
 	}
@@ -7686,7 +7686,7 @@ func shouldRetryRequestRound(err error, cfg *internalconfig.Config) bool {
 	if status == http.StatusOK {
 		return false
 	}
-	if isRequestInvalidErrorWithConfig(err, cfg) {
+	if isRequestInvalidErrorWithRules(err, rules) {
 		return false
 	}
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
@@ -7695,8 +7695,8 @@ func shouldRetryRequestRound(err error, cfg *internalconfig.Config) bool {
 	return true
 }
 
-func (m *Manager) isRequestInvalidError(err error) bool {
-	return isRequestInvalidErrorWithConfig(err, m.currentConfig())
+func (m *Manager) isRequestInvalidError(err error, contexts ...context.Context) bool {
+	return isRequestInvalidErrorWithRules(err, m.requestNonRetryableErrorRules(contexts...))
 }
 
 func finalAuthSelectionError(err error) error {
@@ -9014,6 +9014,10 @@ func isRequestScopedNotFoundResultError(err *Error) bool {
 // request error that should not be retried. Built-in request-shape failures are
 // preserved, and custom non-retryable error rules can add stable upstream errors.
 func isRequestInvalidErrorWithConfig(err error, cfg *internalconfig.Config) bool {
+	return isRequestInvalidErrorWithRules(err, nonRetryableErrorRulesForConfig(cfg))
+}
+
+func isRequestInvalidErrorWithRules(err error, rules []internalconfig.NonRetryableErrorRule) bool {
 	if err == nil {
 		return false
 	}
@@ -9047,14 +9051,13 @@ func isRequestInvalidErrorWithConfig(err error, cfg *internalconfig.Config) bool
 	case http.StatusUnprocessableEntity:
 		return true
 	}
-	return matchesNonRetryableErrorRules(err, status, cfg)
+	return matchesNonRetryableErrorRules(err, status, rules)
 }
 
-func matchesNonRetryableErrorRules(err error, statusCode int, cfg *internalconfig.Config) bool {
+func matchesNonRetryableErrorRules(err error, statusCode int, rules []internalconfig.NonRetryableErrorRule) bool {
 	if err == nil {
 		return false
 	}
-	rules := nonRetryableErrorRulesForConfig(cfg)
 	if len(rules) == 0 {
 		return false
 	}

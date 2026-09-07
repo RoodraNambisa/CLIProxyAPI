@@ -5,17 +5,18 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"slices"
 	"strings"
 
 	"github.com/gorilla/websocket"
 	"github.com/tidwall/gjson"
 )
 
-// SnapshotRequestErrorRetryPolicy captures request error rules for outer stream
-// recovery. A hot reload must not change those rules between retry layers.
-func (m *Manager) SnapshotRequestErrorRetryPolicy() func(error) bool {
-	cfg := m.currentConfig()
-	return func(err error) bool { return shouldRetryRequestRound(err, cfg) }
+// SnapshotRequestErrorRetryPolicy reuses logical request rules for outer stream
+// recovery, or captures current rules when no request context is provided.
+func (m *Manager) SnapshotRequestErrorRetryPolicy(contexts ...context.Context) func(error) bool {
+	rules := slices.Clone(m.requestNonRetryableErrorRules(contexts...))
+	return func(err error) bool { return shouldRetryRequestRound(err, rules) }
 }
 
 // isKnownRequestFault recognizes structured request failures independently of

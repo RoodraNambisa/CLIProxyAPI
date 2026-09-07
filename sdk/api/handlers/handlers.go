@@ -1271,7 +1271,7 @@ func (h *BaseAPIHandler) executeStreamWithResolvedProviders(ctx context.Context,
 		SourceFormat:    sdktranslator.FromString(handlerType),
 	}
 	opts.Metadata = reqMeta
-	allowRequestErrorRetry := h.AuthManager.SnapshotRequestErrorRetryPolicy()
+	allowRequestErrorRetry := h.AuthManager.SnapshotRequestErrorRetryPolicy(ctx)
 	streamResult, err := h.AuthManager.ExecuteStream(ctx, providers, req, opts)
 	if err != nil {
 		errChan := make(chan *interfaces.ErrorMessage, 1)
