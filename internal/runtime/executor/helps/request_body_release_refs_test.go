@@ -9,6 +9,21 @@ import (
 	"github.com/tidwall/gjson"
 )
 
+func TestRequestBodyRefsPreserveLegacyChildrenAndEmptyOverride(t *testing.T) {
+	original := []byte(`{"input":[{"type":"additional_tools","tools":[{"type":"namespace","name":"editor","children":[{"type":"function","name":"patch","parameters":{"description":"discarded"}}]},{"type":"namespace","name":"disabled","children":[],"tools":[{"type":"function","name":"shadowed"}]}]}]}`)
+	controller := core.NewRequestBodyReleaseController(int64(len(original)), []byte("<released>"))
+	opts := core.Options{Metadata: map[string]any{core.BodyReleaseControllerMetadataKey: controller}}
+	ref, translated, unregister := RequestBodyRefs(t.Context(), opts, original, nil)
+	defer unregister()
+	defer ref.Release()
+	defer translated.Release()
+	controller.Release()
+	got := ref.Bytes()
+	if gjson.GetBytes(got, "input.0.tools.0.children.0.name").String() != "patch" || gjson.GetBytes(got, "input.0.tools.1.children").Raw != "[]" || strings.Contains(string(got), "discarded") {
+		t.Fatal("release lost a legacy declaration, its empty override, or retained its schema")
+	}
+}
+
 func TestRequestBodyRefsRetainExpandedToolIdentityAfterRelease(t *testing.T) {
 	for _, mode := range []string{"unconfigured", "log-only", "release"} {
 		t.Run(mode, func(t *testing.T) {

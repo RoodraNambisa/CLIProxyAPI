@@ -111,6 +111,7 @@ func slimRequestTools(tools gjson.Result) []byte {
 	}
 	type slimTool struct {
 		Tools                json.RawMessage   `json:"tools,omitempty"`
+		Children             json.RawMessage   `json:"children,omitempty"`
 		Type                 string            `json:"type,omitempty"`
 		Name                 string            `json:"name,omitempty"`
 		Function             *slimFunction     `json:"function,omitempty"`
@@ -127,6 +128,12 @@ func slimRequestTools(tools gjson.Result) []byte {
 		}
 		if item.Type == "namespace" {
 			item.Tools = slimRequestTools(tool.Get("tools"))
+			if children := tool.Get("children"); children.IsArray() {
+				item.Children = slimRequestTools(children)
+				if len(item.Children) == 0 {
+					item.Children = json.RawMessage(`[]`)
+				}
+			}
 		}
 		if declarations := tool.Get("functionDeclarations"); declarations.IsArray() {
 			for _, declaration := range declarations.Array() {

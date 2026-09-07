@@ -27,6 +27,11 @@ func TestGeminiResponsesToolIdentityAndMultiAgentAfterRelease(t *testing.T) {
 
 func runGoogleResponsesToolIdentity(t *testing.T, provider string, enabled bool) {
 	t.Helper()
+	runGoogleResponsesToolIdentityWithNamespaceField(t, provider, enabled, "tools")
+}
+
+func runGoogleResponsesToolIdentityWithNamespaceField(t *testing.T, provider string, enabled bool, namespaceField string) {
+	t.Helper()
 	for _, stream := range []bool{false, true} {
 		for _, explicitOriginal := range []bool{false, true} {
 			t.Run(fmt.Sprintf("stream=%t/original=%t", stream, explicitOriginal), func(t *testing.T) {
@@ -74,7 +79,7 @@ func runGoogleResponsesToolIdentity(t *testing.T, provider string, enabled bool)
 					return w.Result(), nil
 				}))
 				executor, auth := newGoogleMultiAgentFixtureExecutor(t, provider, cfg)
-				req := core.Request{Model: "gemini-2.5-flash", Payload: []byte(`{"input":[],"tools":[{"type":"namespace","name":"collaboration","tools":[{"type":"function","name":"spawn_agent","parameters":{"type":"object"}}]}]}`)}
+				req := core.Request{Model: "gemini-2.5-flash", Payload: []byte(`{"input":[],"tools":[{"type":"namespace","name":"collaboration","` + namespaceField + `":[{"type":"function","name":"spawn_agent","parameters":{"type":"object"}}]}]}`)}
 				opts := core.Options{SourceFormat: sdktranslator.FormatOpenAIResponse, Headers: http.Header{"User-Agent": {"codex_cli_rs/0.153.4"}}, Metadata: map[string]any{core.BodyReleaseControllerMetadataKey: controller}}
 				if explicitOriginal {
 					opts.OriginalRequest = bytes.Clone(req.Payload)
@@ -139,5 +144,9 @@ func TestVertexResponsesToolIdentityAndMultiAgentAfterRelease(t *testing.T) {
 }
 
 func TestInteractionsResponsesToolIdentityAfterRelease(t *testing.T) {
-	runGoogleResponsesToolIdentity(t, "gemini-interactions", false)
+	for _, field := range []string{"tools", "children"} {
+		t.Run(field, func(t *testing.T) {
+			runGoogleResponsesToolIdentityWithNamespaceField(t, "gemini-interactions", false, field)
+		})
+	}
 }
