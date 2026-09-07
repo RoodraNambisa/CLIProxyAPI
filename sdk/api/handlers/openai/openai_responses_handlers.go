@@ -537,6 +537,7 @@ func (h *OpenAIResponsesAPIHandler) OpenAIResponsesModels(c *gin.Context) {
 // Parameters:
 //   - c: The Gin context containing the HTTP request and response
 func (h *OpenAIResponsesAPIHandler) Responses(c *gin.Context) {
+	h = NewOpenAIResponsesAPIHandler(handlers.NewBaseAPIHandlers(h.ConfigSnapshot(), h.AuthManager))
 	rawJSON, err := readOpenAIJSONRequestBody(c)
 	// If data retrieval fails, return a 400 Bad Request error.
 	if err != nil {
@@ -544,6 +545,7 @@ func (h *OpenAIResponsesAPIHandler) Responses(c *gin.Context) {
 		return
 	}
 	h.BeginChatGPTWebImageErrorSanitization(c, cliproxyauth.PayloadHasImageGenerationTool(rawJSON))
+	rawJSON = h.prepareOrphanDelegation(c, rawJSON)
 
 	// Check if the client requested a streaming response.
 	streamResult := gjson.GetBytes(rawJSON, "stream")
@@ -556,12 +558,14 @@ func (h *OpenAIResponsesAPIHandler) Responses(c *gin.Context) {
 }
 
 func (h *OpenAIResponsesAPIHandler) Compact(c *gin.Context) {
+	h = NewOpenAIResponsesAPIHandler(handlers.NewBaseAPIHandlers(h.ConfigSnapshot(), h.AuthManager))
 	rawJSON, err := readOpenAIJSONRequestBody(c)
 	if err != nil {
 		writeResponsesRequestReadError(c, err)
 		return
 	}
 	h.BeginChatGPTWebImageErrorSanitization(c, cliproxyauth.PayloadHasImageGenerationTool(rawJSON))
+	rawJSON = h.prepareOrphanDelegation(c, rawJSON)
 
 	streamResult := gjson.GetBytes(rawJSON, "stream")
 	if streamResult.Type == gjson.True {

@@ -226,6 +226,10 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 			continue
 		}
 
+		requestJSON = h.prepareOrphanDelegation(c, requestJSON, func(callID string) bool {
+			_, exists := toolPairState.getCall(callID)
+			return exists
+		})
 		toolCacheTurn := newResponsesWebsocketToolCacheTurn(toolPairState)
 		requestJSON = toolCacheTurn.repairRequest(requestJSON)
 		requestJSON = dedupeResponsesWebsocketInputItemsByID(requestJSON)

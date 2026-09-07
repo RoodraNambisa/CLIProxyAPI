@@ -351,7 +351,7 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 	// Create server instance
 	s := &Server{
 		engine:                 engine,
-		handlers:               handlers.NewBaseAPIHandlers(&cfg.SDKConfig, authManager),
+		handlers:               handlers.NewBaseAPIHandlers(sdkHandlerConfig(cfg), authManager),
 		cfg:                    cfg,
 		accessManager:          accessManager,
 		requestLogger:          requestLogger,
@@ -1441,7 +1441,7 @@ func (s *Server) updateClients(cfg *config.Config, rollbackOnError bool) error {
 	}
 	managementasset.SetCurrentConfig(runtimeCfg)
 
-	s.handlers.UpdateClients(&runtimeCfg.SDKConfig)
+	s.handlers.UpdateClients(sdkHandlerConfig(runtimeCfg))
 
 	if s.mgmt != nil {
 		if errManagement := s.mgmt.SetConfig(runtimeCfg); errManagement != nil {

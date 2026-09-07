@@ -13,6 +13,8 @@ import (
 
 // SDKConfig represents the application's configuration, loaded from a YAML file.
 type SDKConfig struct {
+	// CodexOrphanDelegationCompatibility is a derived Responses handler policy.
+	CodexOrphanDelegationCompatibility bool `yaml:"-" json:"-"`
 	// ProxyURL is the URL of an optional proxy server to use for outbound requests.
 	ProxyURL string `yaml:"proxy-url" json:"proxy-url"`
 
