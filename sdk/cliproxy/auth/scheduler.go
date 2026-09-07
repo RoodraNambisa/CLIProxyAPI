@@ -1151,13 +1151,13 @@ func (s *authScheduler) pickMixed(ctx context.Context, providers []string, model
 			rpmRetryAfter := fillFirstRPMRetryAfterAt(fillFirstLimiter, requestNow)
 			if rpmRetryAfter < requestLimited.resetIn {
 				if earliest := mixedBlockedEarliestAtPrioritiesLocked(candidateShards, prioritiesToTry, pickPredicate); cooldownBeforeRPMReset(earliest, rpmRetryAfter, requestNow) {
-					return nil, "", newModelCooldownErrorUntil(model, "", earliest, requestNow)
+					return nil, "", WithStoredAuthFailure(newModelCooldownErrorUntil(model, "", earliest, requestNow), mixedCandidateFailuresLocked(candidateShards, prioritiesToTry, pickPredicate).latest())
 				}
 				return nil, "", newAuthRPMLimitedError(rpmRetryAfter)
 			}
 		}
 		if earliest := mixedBlockedEarliestAtPrioritiesLocked(candidateShards, prioritiesToTry, pickPredicate); cooldownBeforeRPMReset(earliest, requestLimited.resetIn, requestNow) {
-			return nil, "", newModelCooldownErrorUntil(model, "", earliest, requestNow)
+			return nil, "", WithStoredAuthFailure(newModelCooldownErrorUntil(model, "", earliest, requestNow), mixedCandidateFailuresLocked(candidateShards, prioritiesToTry, pickPredicate).latest())
 		}
 		return nil, "", newAuthRequestLimitedError(requestLimited)
 	}
@@ -1165,7 +1165,7 @@ func (s *authScheduler) pickMixed(ctx context.Context, providers []string, model
 		rpmNow := fillFirstLimiterNow(fillFirstLimiter)
 		rpmRetryAfter := fillFirstRPMRetryAfterAt(fillFirstLimiter, rpmNow)
 		if earliest := mixedBlockedEarliestAtPrioritiesLocked(candidateShards, prioritiesToTry, pickPredicate); cooldownBeforeRPMReset(earliest, rpmRetryAfter, rpmNow) {
-			return nil, "", newModelCooldownErrorUntil(model, "", earliest, rpmNow)
+			return nil, "", WithStoredAuthFailure(newModelCooldownErrorUntil(model, "", earliest, rpmNow), mixedCandidateFailuresLocked(candidateShards, prioritiesToTry, pickPredicate).latest())
 		}
 		return nil, "", newAuthRPMLimitedError(rpmRetryAfter)
 	}
@@ -1301,14 +1301,15 @@ func mixedUnavailableErrorFromShardsWithPredicate(providers []string, candidateS
 	if total == 0 {
 		return &Error{Code: "auth_not_found", Message: "no auth available"}
 	}
+	failures := mixedCandidateFailuresLocked(candidateShards, nil, predicate)
 	if cooldownCount == total && !earliest.IsZero() {
 		resetIn := earliest.Sub(now)
 		if resetIn < 0 {
 			resetIn = 0
 		}
-		return newModelCooldownError(model, "", resetIn)
+		return WithStoredAuthFailure(newModelCooldownError(model, "", resetIn), failures.latest())
 	}
-	return &Error{Code: "auth_unavailable", Message: "no auth available"}
+	return WithStoredAuthFailure(&Error{Code: "auth_unavailable", Message: "no auth available"}, failures.latest())
 }
 
 func mixedUnavailableErrorFromShardsForAttempt(providers []string, candidateShards []*modelScheduler, model string, priorityPredicate func(*scheduledAuth) bool, pickPredicate func(*scheduledAuth) bool, selectionAttempt int) error {
@@ -1335,6 +1336,7 @@ func mixedUnavailableErrorFromShardsForAttempt(providers []string, candidateShar
 	if len(prioritiesToTry) == 0 {
 		return mixedUnavailableErrorFromShardsWithPredicate(providers, candidateShards, model, pickPredicate)
 	}
+	failures := mixedCandidateFailuresLocked(candidateShards, prioritiesToTry, pickPredicate)
 	now := time.Now()
 	var earliest time.Time
 	for _, priority := range prioritiesToTry {
@@ -1352,9 +1354,9 @@ func mixedUnavailableErrorFromShardsForAttempt(providers []string, candidateShar
 		if resetIn < 0 {
 			resetIn = 0
 		}
-		return newModelCooldownError(model, "", resetIn)
+		return WithStoredAuthFailure(newModelCooldownError(model, "", resetIn), failures.latest())
 	}
-	return &Error{Code: "auth_unavailable", Message: "no auth available"}
+	return WithStoredAuthFailure(&Error{Code: "auth_unavailable", Message: "no auth available"}, failures.latest())
 }
 
 // triedPredicate builds a filter that excludes auths already attempted for the current request.
@@ -1797,13 +1799,13 @@ func (m *modelScheduler) pickReadyLocked(preferWebsocket bool, strategyForPriori
 			rpmRetryAfter := fillFirstRPMRetryAfterAt(rpmLimiter, requestNow)
 			if rpmRetryAfter < requestLimited.resetIn {
 				if earliest := m.blockedEarliestForAttemptLocked(restrictWebsocket, priorities, selectionAttempt, pickPredicate); cooldownBeforeRPMReset(earliest, rpmRetryAfter, requestNow) {
-					return nil, newModelCooldownErrorUntil(model, provider, earliest, requestNow)
+					return nil, WithStoredAuthFailure(newModelCooldownErrorUntil(model, provider, earliest, requestNow), m.candidateFailuresLocked(restrictWebsocket, selectionPrioritiesForAttempt(priorities, selectionAttempt), pickPredicate).latest())
 				}
 				return nil, newAuthRPMLimitedError(rpmRetryAfter)
 			}
 		}
 		if earliest := m.blockedEarliestForAttemptLocked(restrictWebsocket, priorities, selectionAttempt, pickPredicate); cooldownBeforeRPMReset(earliest, requestLimited.resetIn, requestNow) {
-			return nil, newModelCooldownErrorUntil(model, provider, earliest, requestNow)
+			return nil, WithStoredAuthFailure(newModelCooldownErrorUntil(model, provider, earliest, requestNow), m.candidateFailuresLocked(restrictWebsocket, selectionPrioritiesForAttempt(priorities, selectionAttempt), pickPredicate).latest())
 		}
 		return nil, newAuthRequestLimitedError(requestLimited)
 	}
@@ -1811,7 +1813,7 @@ func (m *modelScheduler) pickReadyLocked(preferWebsocket bool, strategyForPriori
 		rpmNow := fillFirstLimiterNow(rpmLimiter)
 		rpmRetryAfter := fillFirstRPMRetryAfterAt(rpmLimiter, rpmNow)
 		if earliest := m.blockedEarliestForAttemptLocked(restrictWebsocket, priorities, selectionAttempt, pickPredicate); cooldownBeforeRPMReset(earliest, rpmRetryAfter, rpmNow) {
-			return nil, newModelCooldownErrorUntil(model, provider, earliest, rpmNow)
+			return nil, WithStoredAuthFailure(newModelCooldownErrorUntil(model, provider, earliest, rpmNow), m.candidateFailuresLocked(restrictWebsocket, selectionPrioritiesForAttempt(priorities, selectionAttempt), pickPredicate).latest())
 		}
 		return nil, newAuthRPMLimitedError(rpmRetryAfter)
 	}
@@ -2093,6 +2095,7 @@ func (m *modelScheduler) unavailableErrorLocked(provider, model string, predicat
 	if total == 0 {
 		return &Error{Code: "auth_not_found", Message: "no auth available"}
 	}
+	failures := m.candidateFailuresLocked(false, nil, predicate)
 	if cooldownCount == total && !earliest.IsZero() {
 		providerForError := provider
 		if providerForError == "mixed" {
@@ -2102,9 +2105,9 @@ func (m *modelScheduler) unavailableErrorLocked(provider, model string, predicat
 		if resetIn < 0 {
 			resetIn = 0
 		}
-		return newModelCooldownError(model, providerForError, resetIn)
+		return WithStoredAuthFailure(newModelCooldownError(model, providerForError, resetIn), failures.latest())
 	}
-	return &Error{Code: "auth_unavailable", Message: "no auth available"}
+	return WithStoredAuthFailure(&Error{Code: "auth_unavailable", Message: "no auth available"}, failures.latest())
 }
 
 func (m *modelScheduler) unavailableErrorForAttemptLocked(provider, model string, preferWebsocket bool, selectionAttempt int, priorityPredicate func(*scheduledAuth) bool, pickPredicate func(*scheduledAuth) bool) error {
@@ -2113,11 +2116,12 @@ func (m *modelScheduler) unavailableErrorForAttemptLocked(provider, model string
 	if len(priorities) == 0 {
 		return m.unavailableErrorLocked(provider, model, pickPredicate)
 	}
+	failures := m.candidateFailuresLocked(restrictWebsocket, selectionPrioritiesForAttempt(priorities, selectionAttempt), pickPredicate)
 	earliest := m.blockedEarliestForAttemptLocked(restrictWebsocket, priorities, selectionAttempt, pickPredicate)
 	if !earliest.IsZero() {
-		return newModelCooldownErrorUntil(model, provider, earliest, now)
+		return WithStoredAuthFailure(newModelCooldownErrorUntil(model, provider, earliest, now), failures.latest())
 	}
-	return &Error{Code: "auth_unavailable", Message: "no auth available"}
+	return WithStoredAuthFailure(&Error{Code: "auth_unavailable", Message: "no auth available"}, failures.latest())
 }
 
 func (m *modelScheduler) blockedEarliestForAttemptLocked(preferWebsocket bool, priorities []int, selectionAttempt int, predicate func(*scheduledAuth) bool) time.Time {
