@@ -21,9 +21,14 @@ func qualifyClaudeResponsesToolName(namespace, name string) string {
 	return prefix + name
 }
 
+type claudeResponsesTool struct {
+	tool                       gjson.Result
+	name, namespace, qualified string
+}
+
 // claudeResponsesTools shares first-wins order across root and additional tools.
-func claudeResponsesTools(root gjson.Result) []gjson.Result {
-	var result []gjson.Result
+func claudeResponsesTools(root gjson.Result) []claudeResponsesTool {
+	var result []claudeResponsesTool
 	seen := make(map[string]bool)
 	var visit func(gjson.Result, string)
 	visit = func(tools gjson.Result, namespace string) {
@@ -47,7 +52,7 @@ func claudeResponsesTools(root gjson.Result) []gjson.Result {
 				}
 				tool = gjson.Parse(updated)
 			}
-			result = append(result, tool)
+			result = append(result, claudeResponsesTool{tool: tool, name: name, namespace: namespace, qualified: qualified})
 		}
 	}
 	visit(root.Get("tools"), "")
@@ -57,4 +62,30 @@ func claudeResponsesTools(root gjson.Result) []gjson.Result {
 		}
 	}
 	return result
+}
+
+type claudeResponsesToolIdentity struct {
+	name, namespace string
+}
+
+func claudeResponsesToolIdentities(original, translated []byte) map[string]claudeResponsesToolIdentity {
+	identities := make(map[string]claudeResponsesToolIdentity)
+	for _, declaration := range claudeResponsesTools(gjson.ParseBytes(pickRequestJSON(original, translated))) {
+		identities[strings.Clone(declaration.qualified)] = claudeResponsesToolIdentity{
+			name: strings.Clone(declaration.name), namespace: strings.Clone(declaration.namespace),
+		}
+	}
+	return identities
+}
+
+func restoreClaudeResponsesToolIdentity(payload []byte, prefix, wireName string, identities map[string]claudeResponsesToolIdentity) []byte {
+	name, namespace := wireName, ""
+	if identity, exists := identities[wireName]; exists {
+		name, namespace = identity.name, identity.namespace
+	}
+	payload, _ = sjson.SetBytes(payload, prefix+"name", name)
+	if namespace != "" {
+		payload, _ = sjson.SetBytes(payload, prefix+"namespace", namespace)
+	}
+	return payload
 }

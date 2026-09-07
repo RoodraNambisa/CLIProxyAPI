@@ -342,7 +342,8 @@ func ConvertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte
 	// tools mapping: parameters -> input_schema
 	if tools := claudeResponsesTools(root); len(tools) > 0 {
 		toolsJSON := []byte("[]")
-		for _, tool := range tools {
+		for _, declaration := range tools {
+			tool := declaration.tool
 			tJSON := []byte(`{"name":"","description":"","input_schema":{}}`)
 			if n := tool.Get("name"); n.Exists() {
 				tJSON, _ = sjson.SetBytes(tJSON, "name", n.String())

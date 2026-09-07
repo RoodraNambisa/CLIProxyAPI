@@ -128,7 +128,7 @@ func (e *KimiExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req
 		return resp, err
 	}
 	httpReq.ContentLength = int64(bodyReader.Len())
-	originalRef, bodyRef, unregisterBodies := helps.RequestBodyRefs(ctx, opts, opts.OriginalRequest, body)
+	originalRef, bodyRef, unregisterBodies := helps.RequestBodyRefs(ctx, opts, originalPayload, body)
 	defer unregisterBodies()
 	defer originalRef.Release()
 	defer bodyRef.Release()
@@ -256,7 +256,7 @@ func (e *KimiExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 		return nil, err
 	}
 	httpReq.ContentLength = int64(bodyReader.Len())
-	originalRef, bodyRef, unregisterBodies := helps.RequestBodyRefs(ctx, opts, opts.OriginalRequest, body)
+	originalRef, bodyRef, unregisterBodies := helps.RequestBodyRefs(ctx, opts, originalPayload, body)
 	cleanupBodies := func() {
 		unregisterBodies()
 		originalRef.Release()

@@ -131,6 +131,9 @@ func runMultiAgentPlaintextToolMarkers(t *testing.T, provider string) {
 				if item.Get("type").String() != "function_call" || item.Get("call_id").String() != "pair" || item.Get("arguments").String() != `{"message":"work"}` {
 					t.Fatalf("translated fixture tool: type=%q call_id=%q arguments=%q", item.Get("type").String(), item.Get("call_id").String(), item.Get("arguments").String())
 				}
+				if item.Get("namespace").String() != "collaboration" || item.Get("name").String() != "spawn_agent" {
+					t.Fatal("tool output did not restore the caller's namespace and short name")
+				}
 				if item.Get("encrypted_function_args").Exists() != enabled || enabled && item.Get("encrypted_function_args").Raw != "[]" {
 					t.Fatal("plaintext marker lost its request snapshot after release and config change")
 				}

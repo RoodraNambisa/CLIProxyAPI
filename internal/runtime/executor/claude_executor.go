@@ -221,7 +221,7 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 		return resp, err
 	}
 	httpReq.ContentLength = int64(bodyReader.Len())
-	originalRef, translationRef, unregisterBodies := helps.RequestBodyRefs(ctx, opts, opts.OriginalRequest, bodyForTranslation)
+	originalRef, translationRef, unregisterBodies := helps.RequestBodyRefs(ctx, opts, originalPayload, bodyForTranslation)
 	defer unregisterBodies()
 	defer originalRef.Release()
 	defer translationRef.Release()
@@ -423,7 +423,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		return nil, err
 	}
 	httpReq.ContentLength = int64(bodyReader.Len())
-	originalRef, translationRef, unregisterBodies := helps.RequestBodyRefs(ctx, opts, opts.OriginalRequest, bodyForTranslation)
+	originalRef, translationRef, unregisterBodies := helps.RequestBodyRefs(ctx, opts, originalPayload, bodyForTranslation)
 	cleanupBodies := func() {
 		unregisterBodies()
 		originalRef.Release()

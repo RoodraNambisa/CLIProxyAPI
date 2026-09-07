@@ -23,8 +23,9 @@ type claudeToResponsesState struct {
 	InFuncBlock  bool
 	FuncArgsBuf  map[int]*strings.Builder // index -> args
 	// function call bookkeeping for output aggregation
-	FuncNames   map[int]string // index -> function name
-	FuncCallIDs map[int]string // index -> call id
+	FuncNames      map[int]string // index -> function name
+	FuncCallIDs    map[int]string // index -> call id
+	ToolIdentities map[string]claudeResponsesToolIdentity
 	// message text aggregation
 	TextBuf strings.Builder
 	// reasoning state
@@ -59,6 +60,7 @@ func emitEvent(event string, payload []byte) []byte {
 func ConvertClaudeResponseToOpenAIResponses(ctx context.Context, modelName string, originalRequestRawJSON, requestRawJSON, rawJSON []byte, param *any) [][]byte {
 	if *param == nil {
 		*param = &claudeToResponsesState{FuncArgsBuf: make(map[int]*strings.Builder), FuncNames: make(map[int]string), FuncCallIDs: make(map[int]string)}
+		(*param).(*claudeToResponsesState).ToolIdentities = claudeResponsesToolIdentities(originalRequestRawJSON, requestRawJSON)
 	}
 	st := (*param).(*claudeToResponsesState)
 
@@ -147,7 +149,7 @@ func ConvertClaudeResponseToOpenAIResponses(ctx context.Context, modelName strin
 			item, _ = sjson.SetBytes(item, "output_index", idx)
 			item, _ = sjson.SetBytes(item, "item.id", fmt.Sprintf("fc_%s", st.CurrentFCID))
 			item, _ = sjson.SetBytes(item, "item.call_id", st.CurrentFCID)
-			item, _ = sjson.SetBytes(item, "item.name", name)
+			item = restoreClaudeResponsesToolIdentity(item, "item.", name, st.ToolIdentities)
 			out = append(out, emitEvent("response.output_item.added", item))
 			if st.FuncArgsBuf[idx] == nil {
 				st.FuncArgsBuf[idx] = &strings.Builder{}
@@ -252,7 +254,7 @@ func ConvertClaudeResponseToOpenAIResponses(ctx context.Context, modelName strin
 			itemDone, _ = sjson.SetBytes(itemDone, "item.id", fmt.Sprintf("fc_%s", st.CurrentFCID))
 			itemDone, _ = sjson.SetBytes(itemDone, "item.arguments", args)
 			itemDone, _ = sjson.SetBytes(itemDone, "item.call_id", st.CurrentFCID)
-			itemDone, _ = sjson.SetBytes(itemDone, "item.name", st.FuncNames[idx])
+			itemDone = restoreClaudeResponsesToolIdentity(itemDone, "item.", st.FuncNames[idx], st.ToolIdentities)
 			out = append(out, emitEvent("response.output_item.done", itemDone))
 			st.InFuncBlock = false
 		} else if st.ReasoningActive {
@@ -401,7 +403,7 @@ func ConvertClaudeResponseToOpenAIResponses(ctx context.Context, modelName strin
 				item, _ = sjson.SetBytes(item, "id", fmt.Sprintf("fc_%s", callID))
 				item, _ = sjson.SetBytes(item, "arguments", args)
 				item, _ = sjson.SetBytes(item, "call_id", callID)
-				item, _ = sjson.SetBytes(item, "name", name)
+				item = restoreClaudeResponsesToolIdentity(item, "", name, st.ToolIdentities)
 				outputsWrapper, _ = sjson.SetRawBytes(outputsWrapper, "arr.-1", item)
 			}
 		}
@@ -434,6 +436,7 @@ func ConvertClaudeResponseToOpenAIResponses(ctx context.Context, modelName strin
 
 // ConvertClaudeResponseToOpenAIResponsesNonStream aggregates Claude SSE into a single OpenAI Responses JSON.
 func ConvertClaudeResponseToOpenAIResponsesNonStream(_ context.Context, _ string, originalRequestRawJSON, requestRawJSON, rawJSON []byte, _ *any) []byte {
+	toolIdentities := claudeResponsesToolIdentities(originalRequestRawJSON, requestRawJSON)
 	// Aggregate Claude SSE lines into a single OpenAI Responses JSON (non-stream)
 	// We follow the same aggregation logic as the streaming variant but produce
 	// one final object matching docs/out.json structure.
@@ -664,7 +667,7 @@ func ConvertClaudeResponseToOpenAIResponsesNonStream(_ context.Context, _ string
 			item, _ = sjson.SetBytes(item, "id", fmt.Sprintf("fc_%s", st.id))
 			item, _ = sjson.SetBytes(item, "arguments", args)
 			item, _ = sjson.SetBytes(item, "call_id", st.id)
-			item, _ = sjson.SetBytes(item, "name", st.name)
+			item = restoreClaudeResponsesToolIdentity(item, "", st.name, toolIdentities)
 			outputsWrapper, _ = sjson.SetRawBytes(outputsWrapper, "arr.-1", item)
 		}
 	}
