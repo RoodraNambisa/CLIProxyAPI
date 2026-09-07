@@ -1616,6 +1616,10 @@ func (m *Manager) availableAuthsForRouteModelFiltered(auths []*Auth, provider, r
 
 func (m *Manager) availableAuthsForRouteModelFilteredForContext(ctx context.Context, auths []*Auth, provider, routeModel string, opts cliproxyexecutor.Options, now time.Time, pickAllowed func(*Auth) bool) ([]*Auth, error) {
 	auths = m.weightedEligibleAuths(auths, ctx)
+	preferred := ""
+	if selector, ok := m.selectorForContext(ctx).(*SessionAffinitySelector); ok && selector != nil && selector.acrossPriorities {
+		preferred = selector.cachedAuthID(provider, routeModel, opts)
+	}
 	if shouldPreferCodexWebsocket(ctx, provider) {
 		websocketAuths := make([]*Auth, 0, len(auths))
 		hasReadyWebsocket := false
@@ -1631,14 +1635,14 @@ func (m *Manager) availableAuthsForRouteModelFilteredForContext(ctx context.Cont
 			}
 		}
 		if hasReadyWebsocket {
-			return selectAvailableAuthsForAttemptFilteredWithPickablePriority(websocketAuths, provider, routeModel, now, selectionAttemptFromMetadata(opts.Metadata), func(auth *Auth) string {
+			return selectAvailableAuthsForAttemptFilteredWithPriority(websocketAuths, provider, routeModel, now, selectionAttemptFromMetadata(opts.Metadata), func(auth *Auth) string {
 				return m.selectionModelForAuth(auth, routeModel)
-			}, pickAllowed)
+			}, pickAllowed, false, preferred)
 		}
 	}
-	return selectAvailableAuthsForAttemptFiltered(auths, provider, routeModel, now, selectionAttemptFromMetadata(opts.Metadata), func(auth *Auth) string {
+	return selectAvailableAuthsForAttemptFilteredWithPriority(auths, provider, routeModel, now, selectionAttemptFromMetadata(opts.Metadata), func(auth *Auth) string {
 		return m.selectionModelForAuth(auth, routeModel)
-	}, pickAllowed)
+	}, pickAllowed, true, preferred)
 }
 
 func selectionArgForSelector(selector Selector, routeModel string) string {
@@ -1983,6 +1987,16 @@ func (m *Manager) pickLegacyFillFirstRangeAuthWithDeferredBinding(ctx context.Co
 	if useSessionSelector && fillFirstPerAuthRPM > 0 {
 		if cachedAuthID := sessionSelector.cachedAuthID(provider, routeModel, opts); cachedAuthID != "" {
 			cachedAuth := authFromListByID(available, cachedAuthID)
+			if sessionSelector.acrossPriorities && cachedAuth != nil && m.routingAuthRequestLimitPolicyForAuth(cachedAuth).limit == 0 {
+				limiter := m.fillFirstLimiter()
+				now := time.Now()
+				if limiter.tryAcquireAt(cachedAuth.ID, fillFirstPerAuthRPM, now) {
+					return cachedAuth, true, nil, nil
+				}
+				if !sessionSelector.failover {
+					return nil, true, nil, newAuthRPMLimitedError(fillFirstRPMRetryAfterAt(limiter, now))
+				}
+			}
 			if cachedAuth == nil || m.routingAuthRequestLimitPolicyForAuth(cachedAuth).limit == 0 {
 				useSessionSelector = false
 			}

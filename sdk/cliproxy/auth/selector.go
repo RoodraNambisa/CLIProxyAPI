@@ -1002,9 +1002,10 @@ var sessionPattern = regexp.MustCompile(`_session_([a-f0-9-]+)$`)
 // It extracts session ID from multiple sources and maintains session-to-auth
 // mappings with automatic failover when the bound auth becomes unavailable.
 type SessionAffinitySelector struct {
-	fallback Selector
-	cache    *SessionCache
-	failover bool
+	fallback         Selector
+	cache            *SessionCache
+	failover         bool
+	acrossPriorities bool
 }
 
 // SessionAffinityConfig configures the session affinity selector.
@@ -1012,6 +1013,8 @@ type SessionAffinityConfig struct {
 	Fallback Selector
 	TTL      time.Duration
 	Failover *bool
+	// AcrossPriorities keeps eligible bindings ahead of priority. Default: false.
+	AcrossPriorities bool
 }
 
 // NewSessionAffinitySelector creates a new session-aware selector.
@@ -1035,9 +1038,10 @@ func NewSessionAffinitySelectorWithConfig(cfg SessionAffinityConfig) *SessionAff
 		failover = *cfg.Failover
 	}
 	return &SessionAffinitySelector{
-		fallback: cfg.Fallback,
-		cache:    NewSessionCache(cfg.TTL),
-		failover: failover,
+		fallback:         cfg.Fallback,
+		cache:            NewSessionCache(cfg.TTL),
+		failover:         failover,
+		acrossPriorities: cfg.AcrossPriorities,
 	}
 }
 
@@ -1104,12 +1108,18 @@ func (s *SessionAffinitySelector) pickWithFallbackDeferredBinding(ctx context.Co
 	}
 
 	now := time.Now()
-	available, err := getAvailableAuthsForContext(ctx, auths, provider, model, now, selectionAttemptFromMetadata(opts.Metadata))
+	cacheKey := provider + "::" + primaryID + "::" + canonicalModelKey(model)
+	preferred := ""
+	if s.acrossPriorities {
+		preferred, _ = s.cache.Get(cacheKey)
+		if preferred == "" && fallbackID != "" && fallbackID != primaryID {
+			preferred, _ = s.cache.Get(provider + "::" + fallbackID + "::" + canonicalModelKey(model))
+		}
+	}
+	available, err := getAvailableAuthsForContextWithPreference(ctx, auths, provider, model, now, selectionAttemptFromMetadata(opts.Metadata), preferred)
 	if err != nil {
 		return nil, nil, err
 	}
-
-	cacheKey := provider + "::" + primaryID + "::" + canonicalModelKey(model)
 
 	if cachedAuthID, ok := s.cache.GetAndRefresh(cacheKey); ok {
 		for _, auth := range available {
