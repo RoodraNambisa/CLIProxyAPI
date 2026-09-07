@@ -76,7 +76,7 @@ func (h *OpenAIAPIHandler) OpenAIModels(c *gin.Context) {
 	// Filter before shaping either the standard or Codex client catalog response.
 	allModels := h.FilterModelsByProviderAccess(c, h.Models())
 	if _, ok := c.Request.URL.Query()["client_version"]; ok {
-		c.JSON(http.StatusOK, CodexClientModelsResponseForClient(allModels, c.Query("client_version")))
+		c.JSON(http.StatusOK, codexClientModelsResponseForClient(allModels, c.Query("client_version"), registry.GetGlobalRegistry().GetModelProviders))
 		return
 	}
 

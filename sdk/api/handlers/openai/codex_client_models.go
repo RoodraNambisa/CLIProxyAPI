@@ -12,6 +12,8 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 )
 
+type codexClientModelProvidersFunc func(string) []string
+
 type codexClientModelsPayload struct {
 	Models []map[string]any `json:"models"`
 }
@@ -37,15 +39,23 @@ var codexClientAllowedReasoningLevels = map[string]struct{}{
 }
 
 func CodexClientModelsResponse(models []map[string]any) map[string]any {
+	return codexClientModelsResponse(models, nil)
+}
+
+func codexClientModelsResponse(models []map[string]any, providersForModel codexClientModelProvidersFunc) map[string]any {
 	return map[string]any{
-		"models": buildCodexClientModels(models),
+		"models": buildCodexClientModels(models, providersForModel),
 	}
 }
 
 // CodexClientModelsResponseForClient filters only capabilities the real client
 // cannot decode. Outbound software identity does not determine client capability.
 func CodexClientModelsResponseForClient(models []map[string]any, clientVersion string) map[string]any {
-	response := CodexClientModelsResponse(models)
+	return codexClientModelsResponseForClient(models, clientVersion, nil)
+}
+
+func codexClientModelsResponseForClient(models []map[string]any, clientVersion string, providersForModel codexClientModelProvidersFunc) map[string]any {
+	response := codexClientModelsResponse(models, providersForModel)
 	if supportsExtendedCodexClientReasoning(clientVersion) {
 		return response
 	}
@@ -97,7 +107,7 @@ func supportsExtendedCodexClientReasoning(version string) bool {
 	return major > 0 || minor >= 144
 }
 
-func buildCodexClientModels(models []map[string]any) []map[string]any {
+func buildCodexClientModels(models []map[string]any, providersForModel codexClientModelProvidersFunc) []map[string]any {
 	templates, defaultTemplate, err := loadCodexClientModelTemplates()
 	if err != nil || defaultTemplate == nil {
 		return nil
@@ -112,6 +122,7 @@ func buildCodexClientModels(models []map[string]any) []map[string]any {
 
 		if template, ok := templates[id]; ok {
 			entry := cloneCodexClientModelMap(template)
+			applyCodexClientSearchToolSupport(entry, id, true, providersForModel)
 			sanitizeCodexClientReasoningMetadata(entry)
 			applyCodexClientVisibilityOverride(entry, id)
 			result = append(result, entry)
@@ -120,6 +131,7 @@ func buildCodexClientModels(models []map[string]any) []map[string]any {
 
 		entry := cloneCodexClientModelMap(defaultTemplate)
 		applyCodexClientModelMetadata(entry, id, model)
+		applyCodexClientSearchToolSupport(entry, id, false, providersForModel)
 		sanitizeCodexClientReasoningMetadata(entry)
 		applyCodexClientVisibilityOverride(entry, id)
 		result = append(result, entry)
@@ -503,5 +515,30 @@ func cloneCodexClientModelValue(value any) any {
 		return append([]string(nil), typed...)
 	default:
 		return value
+	}
+}
+
+func applyCodexClientSearchToolSupport(entry map[string]any, id string, templateModel bool, providersForModel codexClientModelProvidersFunc) {
+	supportsSearch, _ := entry["supports_search_tool"].(bool)
+	if !supportsSearch {
+		return
+	}
+	if !templateModel {
+		entry["supports_search_tool"] = false
+		return
+	}
+	if providersForModel == nil {
+		return
+	}
+	providers := providersForModel(id)
+	if len(providers) == 0 {
+		entry["supports_search_tool"] = false
+		return
+	}
+	for _, provider := range providers {
+		if !strings.EqualFold(strings.TrimSpace(provider), "codex") {
+			entry["supports_search_tool"] = false
+			return
+		}
 	}
 }
