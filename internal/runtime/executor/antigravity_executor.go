@@ -952,6 +952,10 @@ func (e *AntigravityExecutor) Execute(ctx context.Context, auth *cliproxyauth.Au
 		return resp, errValidate
 	}
 	originalPayload = prepareAntigravityWebSearchTranslationPayload(auth, baseModel, originalPayload)
+	originalPayload, errNormalize := helps.NormalizeCodexMultiAgentRequest(ctx, opts.Headers, e.cfg, from, to, originalPayload)
+	if errNormalize != nil {
+		return resp, errNormalize
+	}
 	req.Payload = originalPayload
 	token, updatedAuth, errToken := e.ensureAccessToken(ctx, auth)
 	if errToken != nil {
@@ -1207,6 +1211,10 @@ func (e *AntigravityExecutor) executeClaudeNonStream(ctx context.Context, auth *
 		return resp, errValidate
 	}
 	originalPayload = prepareAntigravityWebSearchTranslationPayload(auth, baseModel, originalPayload)
+	originalPayload, errNormalize := helps.NormalizeCodexMultiAgentRequest(ctx, opts.Headers, e.cfg, from, to, originalPayload)
+	if errNormalize != nil {
+		return resp, errNormalize
+	}
 	req.Payload = originalPayload
 	token, updatedAuth, errToken := e.ensureAccessToken(ctx, auth)
 	if errToken != nil {
@@ -1700,6 +1708,10 @@ func (e *AntigravityExecutor) ExecuteStream(ctx context.Context, auth *cliproxya
 		return nil, errValidate
 	}
 	originalPayload = prepareAntigravityWebSearchTranslationPayload(auth, baseModel, originalPayload)
+	originalPayload, errNormalize := helps.NormalizeCodexMultiAgentRequest(ctx, opts.Headers, e.cfg, from, to, originalPayload)
+	if errNormalize != nil {
+		return nil, errNormalize
+	}
 	req.Payload = originalPayload
 	token, updatedAuth, errToken := e.ensureAccessToken(ctx, auth)
 	if errToken != nil {
@@ -2110,6 +2122,10 @@ func (e *AntigravityExecutor) CountTokens(ctx context.Context, auth *cliproxyaut
 		return cliproxyexecutor.Response{}, errValidate
 	}
 	originalPayloadSource = prepareAntigravityWebSearchTranslationPayload(auth, baseModel, originalPayloadSource)
+	originalPayloadSource, errNormalize := helps.NormalizeCodexMultiAgentRequest(ctx, opts.Headers, e.cfg, from, to, originalPayloadSource)
+	if errNormalize != nil {
+		return cliproxyexecutor.Response{}, errNormalize
+	}
 	req.Payload = originalPayloadSource
 	token, updatedAuth, errToken := e.ensureAccessToken(ctx, auth)
 	if errToken != nil {
