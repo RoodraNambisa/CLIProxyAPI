@@ -300,7 +300,7 @@ func ConvertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte
 					out, _ = sjson.SetRawBytes(out, "messages.-1", msg)
 				}
 
-			case "function_call":
+			case "function_call", "custom_tool_call":
 				// Map to assistant tool_use
 				callID := item.Get("call_id").String()
 				if callID == "" {
@@ -312,7 +312,9 @@ func ConvertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte
 				toolUse := []byte(`{"type":"tool_use","id":"","name":"","input":{}}`)
 				toolUse, _ = sjson.SetBytes(toolUse, "id", callID)
 				toolUse, _ = sjson.SetBytes(toolUse, "name", name)
-				if argsStr != "" && gjson.Valid(argsStr) {
+				if item.Get("type").String() == "custom_tool_call" {
+					toolUse, _ = sjson.SetBytes(toolUse, "input.input", item.Get("input").String())
+				} else if argsStr != "" && gjson.Valid(argsStr) {
 					argsJSON := gjson.Parse(argsStr)
 					if argsJSON.IsObject() {
 						toolUse, _ = sjson.SetRawBytes(toolUse, "input", []byte(argsJSON.Raw))
@@ -323,7 +325,7 @@ func ConvertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte
 				asst, _ = sjson.SetRawBytes(asst, "content.-1", toolUse)
 				out, _ = sjson.SetRawBytes(out, "messages.-1", asst)
 
-			case "function_call_output":
+			case "function_call_output", "custom_tool_call_output":
 				// Map to user tool_result
 				callID := item.Get("call_id").String()
 				outputStr := item.Get("output").String()
@@ -352,7 +354,9 @@ func ConvertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte
 				tJSON, _ = sjson.SetBytes(tJSON, "description", d.String())
 			}
 
-			if params := tool.Get("parameters"); params.Exists() {
+			if tool.Get("type").String() == "custom" {
+				tJSON, _ = sjson.SetRawBytes(tJSON, "input_schema", []byte(`{"type":"object","properties":{"input":{"type":"string"}},"required":["input"]}`))
+			} else if params := tool.Get("parameters"); params.Exists() {
 				tJSON, _ = sjson.SetRawBytes(tJSON, "input_schema", []byte(params.Raw))
 			} else if params = tool.Get("parametersJsonSchema"); params.Exists() {
 				tJSON, _ = sjson.SetRawBytes(tJSON, "input_schema", []byte(params.Raw))
@@ -378,7 +382,7 @@ func ConvertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte
 				out, _ = sjson.SetRawBytes(out, "tool_choice", []byte(`{"type":"any"}`))
 			}
 		case gjson.JSON:
-			if toolChoice.Get("type").String() == "function" {
+			if kind := toolChoice.Get("type").String(); kind == "function" || kind == "custom" {
 				fn := toolChoice.Get("name").String()
 				if fn == "" {
 					fn = toolChoice.Get("function.name").String()
