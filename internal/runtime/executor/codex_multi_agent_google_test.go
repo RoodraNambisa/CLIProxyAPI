@@ -2,6 +2,10 @@ package executor
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
@@ -18,20 +22,32 @@ import (
 )
 
 func TestGeminiMultiAgentHistoryAndClientGate(t *testing.T) {
-	runGeminiMultiAgentHistory(t, false)
+	runGeminiMultiAgentHistory(t, "gemini")
 }
 
 func TestGeminiInteractionsMultiAgentHistoryAndClientGate(t *testing.T) {
-	runGeminiMultiAgentHistory(t, true)
+	runGeminiMultiAgentHistory(t, "gemini-interactions")
 }
 
-func runGeminiMultiAgentHistory(t *testing.T, interactions bool) {
+func TestVertexMultiAgentHistoryAndClientGate(t *testing.T) {
+	for _, provider := range []string{"vertex", "vertex-service-account"} {
+		t.Run(provider, func(t *testing.T) { runGeminiMultiAgentHistory(t, provider) })
+	}
+}
+
+func runGeminiMultiAgentHistory(t *testing.T, provider string) {
 	t.Helper()
+	interactions := provider == "gemini-interactions"
 	for _, operation := range []string{"execute", "stream", "count"} {
 		for _, mode := range []string{"disabled", "enabled", "other-client"} {
 			t.Run(operation+"/"+mode, func(t *testing.T) {
 				var calls atomic.Int32
+				var tokenCalls atomic.Int32
 				ctx := context.WithValue(t.Context(), "cliproxy.roundtripper", streamTerminalRoundTripFunc(func(r *http.Request) (*http.Response, error) {
+					if r.URL.Host == "oauth-fixture.invalid" {
+						tokenCalls.Add(1)
+						return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": {"application/json"}}, Body: io.NopCloser(strings.NewReader(`{"access_token":"fixture-token","token_type":"Bearer","expires_in":3600}`))}, nil
+					}
 					calls.Add(1)
 					body, err := io.ReadAll(r.Body)
 					if err != nil {
@@ -64,12 +80,7 @@ func runGeminiMultiAgentHistory(t *testing.T, interactions bool) {
 					}
 					return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": {contentType}}, Body: io.NopCloser(strings.NewReader(result))}, nil
 				}))
-				executor := NewGeminiExecutor(&config.Config{Codex: config.CodexConfig{OptimizeMultiAgentV2: mode != "disabled"}})
-				auth := &cliproxyauth.Auth{Attributes: map[string]string{"api_key": "fixture"}}
-				if interactions {
-					executor = NewGeminiInteractionsExecutor(executor.cfg)
-					auth.Provider = "gemini-interactions"
-				}
+				executor, auth := newGoogleMultiAgentFixtureExecutor(t, provider, &config.Config{Codex: config.CodexConfig{OptimizeMultiAgentV2: mode != "disabled"}})
 				userAgent := "codex_cli_rs/0.153.4"
 				if mode == "other-client" {
 					userAgent = "other/1"
@@ -82,32 +93,36 @@ func runGeminiMultiAgentHistory(t *testing.T, interactions bool) {
 				if calls.Load() != 1 {
 					t.Fatal("translation changed upstream call count")
 				}
+				if (tokenCalls.Load() == 1) != (provider == "vertex-service-account") {
+					t.Fatal("service-account authentication was not exercised through the fixture")
+				}
 			})
 		}
 	}
 }
 
 func TestGeminiMultiAgentCiphertextAndCancellation(t *testing.T) {
-	runGeminiMultiAgentCiphertext(t, false)
+	runGeminiMultiAgentCiphertext(t, "gemini")
 }
 
 func TestGeminiInteractionsMultiAgentCiphertextAndCancellation(t *testing.T) {
-	runGeminiMultiAgentCiphertext(t, true)
+	runGeminiMultiAgentCiphertext(t, "gemini-interactions")
 }
 
-func runGeminiMultiAgentCiphertext(t *testing.T, interactions bool) {
+func TestVertexMultiAgentCiphertextAndCancellation(t *testing.T) {
+	for _, provider := range []string{"vertex", "vertex-service-account"} {
+		t.Run(provider, func(t *testing.T) { runGeminiMultiAgentCiphertext(t, provider) })
+	}
+}
+
+func runGeminiMultiAgentCiphertext(t *testing.T, provider string) {
 	t.Helper()
 	var calls atomic.Int32
 	ctx := context.WithValue(t.Context(), "cliproxy.roundtripper", streamTerminalRoundTripFunc(func(*http.Request) (*http.Response, error) {
 		calls.Add(1)
 		return nil, fmt.Errorf("unexpected fixture request")
 	}))
-	executor := NewGeminiExecutor(&config.Config{Codex: config.CodexConfig{OptimizeMultiAgentV2: true}})
-	auth := &cliproxyauth.Auth{Attributes: map[string]string{"api_key": "fixture"}}
-	if interactions {
-		executor = NewGeminiInteractionsExecutor(executor.cfg)
-		auth.Provider = "gemini-interactions"
-	}
+	executor, auth := newGoogleMultiAgentFixtureExecutor(t, provider, &config.Config{Codex: config.CodexConfig{OptimizeMultiAgentV2: true}})
 	for _, operation := range []string{"execute", "stream", "count"} {
 		for _, originalOnly := range []bool{false, true} {
 			if originalOnly && operation == "count" {
@@ -138,5 +153,33 @@ func runGeminiMultiAgentCiphertext(t *testing.T, interactions bool) {
 	}
 	if calls.Load() != 0 {
 		t.Fatal("unsupported content reached the transport")
+	}
+}
+
+func newGoogleMultiAgentFixtureExecutor(t *testing.T, provider string, cfg *config.Config) (multiAgentTranslationExecutor, *cliproxyauth.Auth) {
+	t.Helper()
+	auth := &cliproxyauth.Auth{Provider: provider, Attributes: map[string]string{"api_key": "fixture"}}
+	switch provider {
+	case "gemini-interactions":
+		return NewGeminiInteractionsExecutor(cfg), auth
+	case "vertex", "vertex-service-account":
+		if provider == "vertex-service-account" {
+			key, err := rsa.GenerateKey(rand.Reader, 2048)
+			if err != nil {
+				t.Fatal(err)
+			}
+			delete(auth.Attributes, "api_key")
+			auth.Metadata = map[string]any{
+				"project_id": "fixture-project",
+				"service_account": map[string]any{
+					"type": "service_account", "client_email": "fixture@example.invalid",
+					"private_key": string(pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)})),
+					"token_uri":   "https://oauth-fixture.invalid/token",
+				},
+			}
+		}
+		return NewGeminiVertexExecutor(cfg), auth
+	default:
+		return NewGeminiExecutor(cfg), auth
 	}
 }
