@@ -230,6 +230,7 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 			_, exists := toolPairState.getCall(callID)
 			return exists
 		})
+		requestJSON = h.prepareCodexMultiAgentV2(c, requestJSON)
 		toolCacheTurn := newResponsesWebsocketToolCacheTurn(toolPairState)
 		requestJSON = toolCacheTurn.repairRequest(requestJSON)
 		requestJSON = dedupeResponsesWebsocketInputItemsByID(requestJSON)

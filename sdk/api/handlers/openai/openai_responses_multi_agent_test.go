@@ -10,6 +10,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"github.com/gorilla/websocket"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor/helps"
 	sdkaccess "github.com/router-for-me/CLIProxyAPI/v6/sdk/access"
@@ -134,6 +135,60 @@ func TestResponsesMultiAgentPreparationHandlesAdditionalToolsAndConflicts(t *tes
 		}
 		if gjson.GetBytes(got, "metadata").Raw != gjson.GetBytes(body, "metadata").Raw {
 			t.Fatal("business JSON changed")
+		}
+	}
+}
+
+func TestResponsesMultiAgentWebsocketPreparesEachTurn(t *testing.T) {
+	h, executor := newMultiAgentBoundaryHandler(t)
+	router := gin.New()
+	router.Use(func(c *gin.Context) {
+		c.Set("accessMetadata", map[string]string{sdkaccess.MetadataAllowedProviders: executor.Identifier()})
+		c.Next()
+	})
+	router.GET("/v1/responses", h.ResponsesWebsocket)
+	server := httptest.NewServer(router)
+	defer server.Close()
+	conn, _, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(server.URL, "http")+"/v1/responses", http.Header{"User-Agent": {"codex_cli_rs/0.153.4"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close() }()
+	refreshID := uuid.NewString()
+	defer registry.GetGlobalRegistry().UnregisterClient(refreshID)
+	for turn, enabled := range []bool{true, false, true} {
+		h.UpdateClients(&config.SDKConfig{CodexOptimizeMultiAgentV2: enabled})
+		if turn == 2 {
+			registry.GetGlobalRegistry().RegisterClient(refreshID, executor.Identifier(), []*registry.ModelInfo{{ID: "newly-listed-model", Description: "New model"}})
+		}
+		previous := ""
+		if turn > 0 {
+			previous = `,"previous_response_id":"done"`
+		}
+		body := fmt.Sprintf(`{"type":"response.create","model":"multi-agent-model"%s,"input":[{"type":"additional_tools","tools":%s}]}`, previous, multiAgentBoundaryTools)
+		if err := conn.WriteMessage(websocket.TextMessage, []byte(body)); err != nil {
+			t.Fatal(err)
+		}
+		for {
+			_, response, err := conn.ReadMessage()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if gjson.GetBytes(response, "type").String() == "error" {
+				t.Fatal("WebSocket rejected the test turn")
+			}
+			if gjson.GetBytes(response, "type").String() == "response.completed" {
+				break
+			}
+		}
+		got := <-executor.requests
+		if got.policy.Enabled != enabled || got.policy.ToolsPrepared != enabled {
+			t.Fatal("WebSocket reused a previous turn's policy")
+		}
+		description := gjson.GetBytes(got.payload, "input.0.tools.0.tools.0.description").String()
+		if strings.Contains(description, "multi-agent-model") != enabled ||
+			strings.Contains(description, "newly-listed-model") != (turn == 2) || strings.Contains(description, "private-model") {
+			t.Fatal("WebSocket description lost its current caller-filtered model snapshot")
 		}
 	}
 }
