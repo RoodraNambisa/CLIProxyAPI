@@ -42,7 +42,10 @@ func responsesInteractionToolDeclarations(root gjson.Result) []translatorcommon.
 	return declarations
 }
 
-type interactionsResponsesToolIdentity struct{ name, namespace string }
+type interactionsResponsesToolIdentity struct {
+	name, namespace string
+	custom          bool
+}
 
 func interactionsResponsesToolIdentities(original, translated []byte) map[string]interactionsResponsesToolIdentity {
 	if !gjson.ValidBytes(original) {
@@ -50,7 +53,9 @@ func interactionsResponsesToolIdentities(original, translated []byte) map[string
 	}
 	identities := make(map[string]interactionsResponsesToolIdentity)
 	for _, declaration := range responsesInteractionToolDeclarations(gjson.ParseBytes(original)) {
-		identities[strings.Clone(declaration.QualifiedName)] = interactionsResponsesToolIdentity{strings.Clone(declaration.Name), strings.Clone(declaration.Namespace)}
+		identities[strings.Clone(declaration.QualifiedName)] = interactionsResponsesToolIdentity{
+			name: strings.Clone(declaration.Name), namespace: strings.Clone(declaration.Namespace), custom: declaration.Tool.Get("type").String() == "custom",
+		}
 	}
 	return identities
 }
@@ -63,6 +68,42 @@ func restoreInteractionsResponsesToolIdentity(payload []byte, prefix, wireName s
 		}
 	}
 	return payload
+}
+
+func interactionsResponsesToolArguments(identities map[string]interactionsResponsesToolIdentity, name, arguments string) (string, string, string) {
+	if !identities[name].custom {
+		return "response.function_call_arguments", "arguments", arguments
+	}
+	if gjson.Valid(arguments) {
+		if input := gjson.Get(arguments, "input"); input.Exists() {
+			if input.Type == gjson.String {
+				arguments = input.String()
+			} else {
+				arguments = input.Raw
+			}
+		}
+	}
+	return "response.custom_tool_call_input", "input", arguments
+}
+
+func buildInteractionsResponsesToolItem(identities map[string]interactionsResponsesToolIdentity, name, itemID, callID, arguments, status string) []byte {
+	kind := "function_call"
+	if identities[name].custom {
+		kind, itemID = "custom_tool_call", "ctc_"+callID
+	}
+	_, field, value := interactionsResponsesToolArguments(identities, name, arguments)
+	item := []byte(`{"type":"","call_id":"","name":""}`)
+	item, _ = sjson.SetBytes(item, "type", kind)
+	if itemID != "" {
+		item, _ = sjson.SetBytes(item, "id", itemID)
+	}
+	if identities[name].custom {
+		item, _ = sjson.SetBytes(item, "status", status)
+	}
+	item, _ = sjson.SetBytes(item, "call_id", callID)
+	item, _ = sjson.SetBytes(item, "name", name)
+	item, _ = sjson.SetBytes(item, field, value)
+	return restoreInteractionsResponsesToolIdentity(item, "", name, identities)
 }
 
 func qualifiedResponsesInteractionName(item gjson.Result) string {

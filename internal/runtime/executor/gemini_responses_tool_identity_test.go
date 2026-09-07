@@ -86,6 +86,9 @@ func runGoogleResponsesToolOutputFixture(t *testing.T, provider string, enabled 
 					}
 					if provider == "gemini-interactions" {
 						step := `{"id":"pair","type":"function_call","name":"collaboration__spawn_agent","arguments":{"message":"work"}}`
+						if toolKind == "custom" {
+							step = strings.Replace(step, `"arguments":{"message":"work"}`, `"arguments":{"input":"work"}`, 1)
+						}
 						response = `{"id":"result","status":"completed","steps":[` + step + `],"usage":{"total_input_tokens":1,"total_output_tokens":1,"total_tokens":2}}`
 						if stream {
 							w.Header().Set("Content-Type", "text/event-stream")
@@ -188,6 +191,16 @@ func TestInteractionsResponsesToolIdentityAfterRelease(t *testing.T) {
 		for _, enabled := range []bool{false, true} {
 			t.Run(fmt.Sprintf("%s/enabled=%t", field, enabled), func(t *testing.T) {
 				runGoogleResponsesToolIdentityWithNamespaceField(t, "gemini-interactions", enabled, field)
+			})
+		}
+	}
+}
+
+func TestInteractionsCustomToolOutputAfterRelease(t *testing.T) {
+	for _, field := range []string{"tools", "children"} {
+		for _, enabled := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/enabled=%t", field, enabled), func(t *testing.T) {
+				runGoogleResponsesToolOutputFixture(t, "gemini-interactions", enabled, field, "custom")
 			})
 		}
 	}
