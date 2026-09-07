@@ -210,11 +210,11 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 			continue
 		}
 
-		requestJSON = repairResponsesWebsocketToolCalls(toolPairState, requestJSON)
+		toolCacheTurn := newResponsesWebsocketToolCacheTurn(toolPairState)
+		requestJSON = toolCacheTurn.repairRequest(requestJSON)
 		requestJSON = dedupeResponsesWebsocketInputItemsByID(requestJSON)
 		h.PinChatGPTWebImageErrorSanitization(c, coreauth.PayloadHasImageGenerationTool(requestJSON))
 		updatedLastRequest = bytes.Clone(requestJSON)
-		lastRequest = updatedLastRequest
 
 		modelName := gjson.GetBytes(requestJSON, "model").String()
 		cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
@@ -242,7 +242,7 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 		}
 		dataChan, _, errChan := h.ExecuteStreamWithAuthManager(cliCtx, h.HandlerType(), modelName, requestJSON, "")
 
-		completedOutput, forwardErrMsg, errForward := h.forwardResponsesWebsocket(c, conn, cliCancel, dataChan, errChan, &wsTimelineLog, passthroughSessionID, toolPairState)
+		completedOutput, forwardErrMsg, errForward := h.forwardResponsesWebsocket(c, conn, cliCancel, dataChan, errChan, &wsTimelineLog, passthroughSessionID, toolPairState, toolCacheTurn)
 		if errForward != nil {
 			wsTerminateErr = errForward
 			log.Warnf("responses websocket: forward failed id=%s error=%v", executorhelps.CodexWebsocketSessionLogID(passthroughSessionID), executorhelps.CodexWebsocketLogError(errForward, util.PromptCacheLogForGin(c)))
@@ -251,7 +251,11 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 		if shouldClearResponsesWebsocketPinnedAuth(pinnedAuthID, lastAttemptedAuthID, forwardErrMsg) {
 			pinnedAuthID = ""
 		}
-		lastResponseOutput = completedOutput
+		if forwardErrMsg == nil && toolCacheTurn.succeeded {
+			toolCacheTurn.commit()
+			lastRequest = updatedLastRequest
+			lastResponseOutput = completedOutput
+		}
 	}
 }
 
@@ -824,8 +828,19 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesWebsocket(
 	wsTimelineLog *strings.Builder,
 	sessionID string,
 	toolPairState *websocketToolPairState,
+	turns ...*responsesWebsocketToolCacheTurn,
 ) ([]byte, *interfaces.ErrorMessage, error) {
+	toolCacheTurn := newResponsesWebsocketToolCacheTurn(toolPairState)
+	if len(turns) > 0 && turns[0] != nil {
+		toolCacheTurn = turns[0]
+	}
+	defer func() {
+		if len(turns) == 0 {
+			toolCacheTurn.commit()
+		}
+	}()
 	completed := false
+	completedSuccessfully := false
 	completedOutput := []byte("[]")
 	outputItemsByIndex := make(map[int64][]byte)
 	var outputItemsFallback [][]byte
@@ -871,6 +886,8 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesWebsocket(
 				continue
 			}
 			if completed {
+				// A completed response remains authoritative over late transport errors.
+				toolCacheTurn.succeeded = completedSuccessfully && c.Request.Context().Err() == nil
 				cancel(nil)
 				return completedOutput, nil, nil
 			}
@@ -890,18 +907,22 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesWebsocket(
 					forwardErrMsg, errForward := forwardError(errMsg, true)
 					return completedOutput, forwardErrMsg, errForward
 				}
+				toolCacheTurn.succeeded = completedSuccessfully && c.Request.Context().Err() == nil
 				cancel(nil)
 				return completedOutput, nil, nil
 			}
 
 			payloads := websocketJSONPayloadsFromChunk(chunk)
 			for i := range payloads {
+				if completed {
+					continue
+				}
 				collectResponsesWebsocketOutputItem(payloads[i], outputItemsByIndex, &outputItemsFallback)
 				eventType := gjson.GetBytes(payloads[i], "type").String()
 				if responsesWebsocketCompletionEvent(eventType) {
 					payloads[i] = restoreResponsesWebsocketCompletionOutput(payloads[i], outputItemsByIndex, outputItemsFallback)
 				}
-				recordResponsesWebsocketToolCallsFromPayload(toolPairState, payloads[i])
+				toolCacheTurn.recordResponse(payloads[i])
 				var payloadErrMsg *interfaces.ErrorMessage
 				if responsesWebsocketTerminalEvent(eventType) {
 					completed = true
@@ -945,6 +966,10 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesWebsocket(
 				if payloadErrMsg != nil {
 					cancel(payloadErrMsg.Error)
 					return completedOutput, payloadErrMsg, nil
+				}
+				if responsesWebsocketTerminalEvent(eventType) {
+					status := gjson.GetBytes(payloads[i], "response.status").String()
+					completedSuccessfully = responsesWebsocketCompletionEvent(eventType) && (status == "" || status == "completed")
 				}
 			}
 		}

@@ -245,7 +245,7 @@ func (e *websocketCompactionCaptureExecutor) ExecuteStream(_ context.Context, _ 
 	var payload []byte
 	switch callIndex {
 	case 0:
-		payload = []byte(`{"type":"response.completed","response":{"id":"resp-1","output":[{"type":"function_call","id":"fc-1","call_id":"call-1","name":"tool"}]}}`)
+		payload = []byte(`{"type":"response.completed","response":{"id":"resp-1","output":[{"type":"function_call","id":"fc-1","call_id":"call-1","name":"tool","arguments":"{}"}]}}`)
 	case 1:
 		payload = []byte(`{"type":"response.completed","response":{"id":"resp-2","output":[{"type":"message","id":"assistant-1"}]}}`)
 	default:

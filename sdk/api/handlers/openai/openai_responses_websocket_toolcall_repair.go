@@ -225,6 +225,10 @@ func websocketToolPairScopeKey(c *gin.Context, sessionKey string) string {
 }
 
 func repairResponsesWebsocketToolCalls(state *websocketToolPairState, payload []byte) []byte {
+	return repairResponsesWebsocketToolCallsWithRecording(state, payload, true)
+}
+
+func repairResponsesWebsocketToolCallsWithRecording(state *websocketToolPairState, payload []byte, record bool) []byte {
 	if state == nil || len(payload) == 0 {
 		return payload
 	}
@@ -238,7 +242,7 @@ func repairResponsesWebsocketToolCalls(state *websocketToolPairState, payload []
 	}
 
 	allowOrphanOutputs := strings.TrimSpace(gjson.GetBytes(payload, "previous_response_id").String()) != ""
-	updatedRaw, errRepair := repairResponsesToolCallsArray(state, input.Raw, allowOrphanOutputs)
+	updatedRaw, errRepair := repairResponsesToolCallsArrayWithRecording(state, input.Raw, allowOrphanOutputs, record)
 	if errRepair != nil || updatedRaw == "" || updatedRaw == input.Raw {
 		return payload
 	}
@@ -260,6 +264,10 @@ func shouldRepairResponsesWebsocketToolCalls(inputRaw string) bool {
 }
 
 func repairResponsesToolCallsArray(state *websocketToolPairState, rawArray string, allowOrphanOutputs bool) (string, error) {
+	return repairResponsesToolCallsArrayWithRecording(state, rawArray, allowOrphanOutputs, true)
+}
+
+func repairResponsesToolCallsArrayWithRecording(state *websocketToolPairState, rawArray string, allowOrphanOutputs, record bool) (string, error) {
 	rawArray = strings.TrimSpace(rawArray)
 	if rawArray == "" {
 		return "[]", nil
@@ -350,6 +358,9 @@ func repairResponsesToolCallsArray(state *websocketToolPairState, rawArray strin
 	}
 
 	for _, item := range filtered {
+		if !record {
+			break
+		}
 		if len(item) == 0 {
 			continue
 		}
@@ -371,6 +382,93 @@ func repairResponsesToolCallsArray(state *websocketToolPairState, rawArray strin
 		return "", errMarshal
 	}
 	return string(out), nil
+}
+
+type responsesWebsocketToolCacheTurn struct {
+	target     *websocketToolPairState
+	pending    *websocketToolPairState
+	succeeded  bool
+	responseID string
+}
+
+func newResponsesWebsocketToolCacheTurn(state *websocketToolPairState) *responsesWebsocketToolCacheTurn {
+	return &responsesWebsocketToolCacheTurn{target: state, pending: newWebsocketToolPairState()}
+}
+
+func (t *responsesWebsocketToolCacheTurn) repairRequest(payload []byte) []byte {
+	view := newWebsocketToolPairState()
+	if t.target != nil {
+		t.target.mu.RLock()
+		// Published raw items are immutable. Copy just map entries for an atomic
+		// read view, not every cached request/output body.
+		for key, value := range t.target.calls {
+			view.calls[key] = value
+		}
+		for key, value := range t.target.outputs {
+			view.outputs[key] = value
+		}
+		t.target.mu.RUnlock()
+	}
+	repaired := repairResponsesWebsocketToolCallsWithRecording(view, payload, false)
+	for _, item := range gjson.GetBytes(repaired, "input").Array() {
+		t.recordItem(item)
+	}
+	return repaired
+}
+
+func (t *responsesWebsocketToolCacheTurn) recordItem(item gjson.Result) {
+	callID := strings.TrimSpace(item.Get("call_id").String())
+	if callID == "" {
+		return
+	}
+	switch {
+	case isResponsesToolCallType(item.Get("type").String()):
+		t.pending.recordCall(callID, json.RawMessage(item.Raw))
+	case isResponsesToolCallOutputType(item.Get("type").String()):
+		t.pending.recordOutput(callID, json.RawMessage(item.Raw))
+	}
+}
+
+func (t *responsesWebsocketToolCacheTurn) recordResponse(payload []byte) {
+	if t == nil {
+		return
+	}
+	event := gjson.GetBytes(payload, "type").String()
+	var items []gjson.Result
+	if responsesWebsocketCompletionEvent(event) {
+		t.responseID = strings.Clone(gjson.GetBytes(payload, "response.id").String())
+		items = gjson.GetBytes(payload, "response.output").Array()
+	} else if event == "response.output_item.done" {
+		items = []gjson.Result{gjson.GetBytes(payload, "item")}
+	}
+	for _, item := range items {
+		status := item.Get("status").String()
+		if !isResponsesToolCallType(item.Get("type").String()) || (status != "" && status != "completed") {
+			continue
+		}
+		field := "arguments"
+		if item.Get("type").String() == "custom_tool_call" {
+			field = "input"
+		}
+		if item.Get("name").Type == gjson.String && item.Get("name").String() != "" && item.Get(field).Type == gjson.String {
+			t.recordItem(item)
+		}
+	}
+}
+
+func (t *responsesWebsocketToolCacheTurn) commit() {
+	if t == nil || t.target == nil || !t.succeeded {
+		return
+	}
+	t.target.mu.Lock()
+	defer t.target.mu.Unlock()
+	for _, key := range t.pending.callOrder {
+		recordWebsocketToolPairItem(t.target.calls, &t.target.callOrder, key, t.pending.calls[key])
+	}
+	for _, key := range t.pending.outputOrder {
+		recordWebsocketToolPairItem(t.target.outputs, &t.target.outputOrder, key, t.pending.outputs[key])
+	}
+	t.succeeded = false
 }
 
 func recordResponsesWebsocketToolCallsFromPayload(state *websocketToolPairState, payload []byte) {
