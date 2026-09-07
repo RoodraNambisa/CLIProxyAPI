@@ -1215,6 +1215,7 @@ func (h *BaseAPIHandler) ExecuteStreamWithAuthManager(ctx context.Context, handl
 }
 
 func (h *BaseAPIHandler) executeStreamWithResolvedProviders(ctx context.Context, providers []string, handlerType, normalizedRouteModel, executionModelName string, rawJSON []byte, alt string) (<-chan []byte, http.Header, <-chan *interfaces.ErrorMessage) {
+	ctx = h.AuthManager.WithRoutingPolicySnapshot(ctx)
 	ctx, _ = ensureErrorResponseSourceTracker(ctx, nil)
 	var errRestricted *interfaces.ErrorMessage
 	providers, errRestricted = restrictExecutionProviders(ctx, providers)
