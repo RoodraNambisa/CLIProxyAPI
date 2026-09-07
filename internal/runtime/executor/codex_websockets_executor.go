@@ -346,8 +346,11 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 	releasedClientBody := slimCodexBodyForStreamUsage(clientBody)
 	originalRef, clientBodyRef, unregisterClientBodies := codexStreamBodyRefs(ctx, opts, originalPayload, clientBody, releasedOriginalPayload, releasedClientBody)
 	_, upstreamRef, unregisterUpstreamBody := codexStreamBodyRefs(ctx, opts, nil, upstreamBody, nil, slimCodexBodyForStreamUsage(upstreamBody))
-	unregisterRawBodyCleanup := cliproxyexecutor.RegisterRequestBodyReleaseCleanup(ctx, &req, &opts)
-	defer unregisterRawBodyCleanup()
+	fallbackPayloadRef, fallbackOriginalRef, unregisterFallbackBodies := codexStreamBodyRefs(ctx, opts, req.Payload, opts.OriginalRequest, nil, nil)
+	dropCodexRawRequestCopies(&req, &opts)
+	defer unregisterFallbackBodies()
+	defer fallbackPayloadRef.Release()
+	defer fallbackOriginalRef.Release()
 	defer unregisterClientBodies()
 	defer unregisterUpstreamBody()
 	defer originalRef.Release()
@@ -397,10 +400,13 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 			helps.RecordAPIWebsocketUpgradeRejection(ctx, e.cfg, websocketUpgradeRequestLog(wsReqLog), respHS.StatusCode, respHS.Header.Clone(), bodyErr)
 		}
 		if respHS != nil && respHS.StatusCode == http.StatusUpgradeRequired {
+			fallbackReq, fallbackOpts := req, opts
+			fallbackReq.Payload = fallbackPayloadRef.Bytes()
+			fallbackOpts.OriginalRequest = fallbackOriginalRef.Bytes()
 			if !helps.RequestBodyReplayable(ctx, opts) {
 				return resp, newCodexWebsocketHandshakeStatusErr(respHS.StatusCode, bodyErr, respHS.Header)
 			}
-			return e.CodexExecutor.Execute(ctx, auth, req, opts)
+			return e.CodexExecutor.Execute(ctx, auth, fallbackReq, fallbackOpts)
 		}
 		if respHS != nil && respHS.StatusCode > 0 {
 			return resp, newCodexWebsocketHandshakeStatusErr(respHS.StatusCode, bodyErr, respHS.Header)
@@ -413,7 +419,9 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 	if respHS != nil {
 		upstreamHeaders = respHS.Header.Clone()
 	}
-	dropCodexRawRequestCopies(&req, &opts)
+	unregisterFallbackBodies()
+	fallbackPayloadRef.Release()
+	fallbackOriginalRef.Release()
 	if sess == nil {
 		logCodexWebsocketConnected(executionSessionID, authID, wsURL, helps.CodexPromptCacheLogRedactor(ctx))
 		defer func() {
@@ -669,11 +677,14 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 	releasedClientBody := slimCodexBodyForStreamUsage(clientBody)
 	originalRef, clientBodyRef, unregisterClientBodies := codexStreamBodyRefs(ctx, opts, userPayload, clientBody, releasedOriginalPayload, releasedClientBody)
 	_, upstreamRef, unregisterUpstreamBody := codexStreamBodyRefs(ctx, opts, nil, upstreamBody, nil, slimCodexBodyForStreamUsage(upstreamBody))
-	unregisterRawBodyCleanup := cliproxyexecutor.RegisterRequestBodyReleaseCleanup(ctx, &req, &opts)
+	fallbackPayloadRef, fallbackOriginalRef, unregisterFallbackBodies := codexStreamBodyRefs(ctx, opts, req.Payload, opts.OriginalRequest, nil, nil)
+	dropCodexRawRequestCopies(&req, &opts)
 	cleanupBodies := func() {
-		unregisterRawBodyCleanup()
+		unregisterFallbackBodies()
 		unregisterClientBodies()
 		unregisterUpstreamBody()
+		fallbackPayloadRef.Release()
+		fallbackOriginalRef.Release()
 		originalRef.Release()
 		clientBodyRef.Release()
 		upstreamRef.Release()
@@ -738,12 +749,15 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 			helps.RecordAPIWebsocketUpgradeRejection(ctx, e.cfg, websocketUpgradeRequestLog(wsReqLog), respHS.StatusCode, respHS.Header.Clone(), bodyErr)
 		}
 		if respHS != nil && respHS.StatusCode == http.StatusUpgradeRequired {
+			fallbackReq, fallbackOpts := req, opts
+			fallbackReq.Payload = fallbackPayloadRef.Bytes()
+			fallbackOpts.OriginalRequest = fallbackOriginalRef.Bytes()
 			if !helps.RequestBodyReplayable(ctx, opts) {
 				cleanupBodies()
 				return nil, newCodexWebsocketHandshakeStatusErr(respHS.StatusCode, bodyErr, respHS.Header)
 			}
 			cleanupBodies()
-			return e.CodexExecutor.ExecuteStream(ctx, auth, req, opts)
+			return e.CodexExecutor.ExecuteStream(ctx, auth, fallbackReq, fallbackOpts)
 		}
 		if respHS != nil && respHS.StatusCode > 0 {
 			cleanupBodies()
@@ -757,7 +771,9 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 	if respHS != nil {
 		upstreamHeaders = respHS.Header.Clone()
 	}
-	dropCodexRawRequestCopies(&req, &opts)
+	unregisterFallbackBodies()
+	fallbackPayloadRef.Release()
+	fallbackOriginalRef.Release()
 
 	if sess == nil {
 		logCodexWebsocketConnected(executionSessionID, authID, wsURL, helps.CodexPromptCacheLogRedactor(ctx))
