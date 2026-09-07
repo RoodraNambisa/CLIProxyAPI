@@ -144,12 +144,13 @@ func (h *Handler) PutGeminiKeys(c *gin.Context) {
 }
 func (h *Handler) PatchGeminiKey(c *gin.Context) {
 	type geminiKeyPatch struct {
-		APIKey         *string            `json:"api-key"`
-		Prefix         *string            `json:"prefix"`
-		BaseURL        *string            `json:"base-url"`
-		ProxyURL       *string            `json:"proxy-url"`
-		Headers        *map[string]string `json:"headers"`
-		ExcludedModels *[]string          `json:"excluded-models"`
+		Weight         credentialWeightPatch `json:"weight"`
+		APIKey         *string               `json:"api-key"`
+		Prefix         *string               `json:"prefix"`
+		BaseURL        *string               `json:"base-url"`
+		ProxyURL       *string               `json:"proxy-url"`
+		Headers        *map[string]string    `json:"headers"`
+		ExcludedModels *[]string             `json:"excluded-models"`
 	}
 	var body struct {
 		Index *int            `json:"index"`
@@ -190,6 +191,9 @@ func (h *Handler) PatchGeminiKey(c *gin.Context) {
 
 	previous := append([]config.GeminiKey(nil), h.cfg.GeminiKey...)
 	entry := h.cfg.GeminiKey[targetIndex]
+	if body.Value.Weight.set {
+		entry.Weight = body.Value.Weight.value
+	}
 	if body.Value.APIKey != nil {
 		trimmed := strings.TrimSpace(*body.Value.APIKey)
 		if trimmed == "" {
@@ -334,6 +338,7 @@ func (h *Handler) PutInteractionsKeys(c *gin.Context) {
 
 func (h *Handler) PatchInteractionsKey(c *gin.Context) {
 	type geminiKeyPatch struct {
+		Weight         credentialWeightPatch `json:"weight"`
 		APIKey         *string               `json:"api-key"`
 		Priority       *int                  `json:"priority"`
 		Prefix         *string               `json:"prefix"`
@@ -382,6 +387,9 @@ func (h *Handler) PatchInteractionsKey(c *gin.Context) {
 
 	previous := append([]config.GeminiKey(nil), h.cfg.InteractionsKey...)
 	entry := h.cfg.InteractionsKey[targetIndex]
+	if body.Value.Weight.set {
+		entry.Weight = body.Value.Weight.value
+	}
 	if body.Value.APIKey != nil {
 		trimmed := strings.TrimSpace(*body.Value.APIKey)
 		if trimmed == "" {
@@ -533,6 +541,7 @@ func (h *Handler) PutClaudeKeys(c *gin.Context) {
 }
 func (h *Handler) PatchClaudeKey(c *gin.Context) {
 	type claudeKeyPatch struct {
+		Weight         credentialWeightPatch `json:"weight"`
 		APIKey         *string               `json:"api-key"`
 		Prefix         *string               `json:"prefix"`
 		BaseURL        *string               `json:"base-url"`
@@ -578,6 +587,9 @@ func (h *Handler) PatchClaudeKey(c *gin.Context) {
 
 	previous := append([]config.ClaudeKey(nil), h.cfg.ClaudeKey...)
 	entry := h.cfg.ClaudeKey[targetIndex]
+	if body.Value.Weight.set {
+		entry.Weight = body.Value.Weight.value
+	}
 	if body.Value.APIKey != nil {
 		entry.APIKey = strings.TrimSpace(*body.Value.APIKey)
 	}
@@ -900,6 +912,7 @@ func (h *Handler) PutVertexCompatKeys(c *gin.Context) {
 }
 func (h *Handler) PatchVertexCompatKey(c *gin.Context) {
 	type vertexCompatPatch struct {
+		Weight         credentialWeightPatch       `json:"weight"`
 		APIKey         *string                     `json:"api-key"`
 		Prefix         *string                     `json:"prefix"`
 		BaseURL        *string                     `json:"base-url"`
@@ -947,6 +960,9 @@ func (h *Handler) PatchVertexCompatKey(c *gin.Context) {
 
 	previous := append([]config.VertexCompatKey(nil), h.cfg.VertexCompatAPIKey...)
 	entry := h.cfg.VertexCompatAPIKey[targetIndex]
+	if body.Value.Weight.set {
+		entry.Weight = body.Value.Weight.value
+	}
 	if body.Value.APIKey != nil {
 		trimmed := strings.TrimSpace(*body.Value.APIKey)
 		if trimmed == "" {
@@ -1319,13 +1335,14 @@ func (h *Handler) PutCodexKeys(c *gin.Context) {
 }
 func (h *Handler) PatchCodexKey(c *gin.Context) {
 	type codexKeyPatch struct {
-		APIKey         *string              `json:"api-key"`
-		Prefix         *string              `json:"prefix"`
-		BaseURL        *string              `json:"base-url"`
-		ProxyURL       *string              `json:"proxy-url"`
-		Models         *[]config.CodexModel `json:"models"`
-		Headers        *map[string]string   `json:"headers"`
-		ExcludedModels *[]string            `json:"excluded-models"`
+		Weight         credentialWeightPatch `json:"weight"`
+		APIKey         *string               `json:"api-key"`
+		Prefix         *string               `json:"prefix"`
+		BaseURL        *string               `json:"base-url"`
+		ProxyURL       *string               `json:"proxy-url"`
+		Models         *[]config.CodexModel  `json:"models"`
+		Headers        *map[string]string    `json:"headers"`
+		ExcludedModels *[]string             `json:"excluded-models"`
 	}
 	var body struct {
 		Index *int           `json:"index"`
@@ -1364,6 +1381,9 @@ func (h *Handler) PatchCodexKey(c *gin.Context) {
 
 	previous := append([]config.CodexKey(nil), h.cfg.CodexKey...)
 	entry := h.cfg.CodexKey[targetIndex]
+	if body.Value.Weight.set {
+		entry.Weight = body.Value.Weight.value
+	}
 	if body.Value.APIKey != nil {
 		entry.APIKey = strings.TrimSpace(*body.Value.APIKey)
 	}
