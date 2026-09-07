@@ -173,15 +173,11 @@ func (m *Manager) currentConfig() *internalconfig.Config {
 	return cfg
 }
 
-func (m *Manager) cooldownSkippedForStatus(statusCode int) bool {
+func (m *Manager) cooldownSkippedForStatus(statusCode int, contexts ...context.Context) bool {
 	if m == nil || statusCode == 0 {
 		return false
 	}
-	cfg := m.currentConfig()
-	if cfg == nil || len(cfg.NoCooldownStatusCodes) == 0 {
-		return false
-	}
-	for _, code := range cfg.NoCooldownStatusCodes {
+	for _, code := range m.requestCooldownRules(contexts...).noCooldownStatusCodes {
 		if code == statusCode {
 			return true
 		}
@@ -194,18 +190,18 @@ type fixedErrorCooldownMatch struct {
 	scope    string
 }
 
-func (m *Manager) fixedErrorCooldownForResult(err *Error) (fixedErrorCooldownMatch, bool) {
+func (m *Manager) fixedErrorCooldownForResult(err *Error, contexts ...context.Context) (fixedErrorCooldownMatch, bool) {
 	statusCode := statusCodeFromResult(err)
 	if m == nil || err == nil {
 		return fixedErrorCooldownMatch{}, false
 	}
-	cfg := m.currentConfig()
-	if cfg == nil || len(cfg.FixedErrorCooldowns) == 0 {
+	rules := m.requestCooldownRules(contexts...).fixedErrorCooldowns
+	if len(rules) == 0 {
 		return fixedErrorCooldownMatch{}, false
 	}
 	errorText := fixedErrorCooldownMatchText(err)
 	lowerText := strings.ToLower(errorText)
-	for _, rule := range cfg.FixedErrorCooldowns {
+	for _, rule := range rules {
 		if rule.StatusCode != 0 && rule.StatusCode != statusCode {
 			continue
 		}
@@ -7925,7 +7921,7 @@ func (m *Manager) markResult(
 	if auth, ok := m.auths[result.AuthID]; ok && auth != nil && (authInstanceID == "" || authInstanceID == auth.instanceID) {
 		acceptedResult = true
 		now = time.Now()
-		dynamicFixedCooldown, hasDynamicFixedCooldown := m.fixedErrorCooldownForResult(result.Error)
+		dynamicFixedCooldown, hasDynamicFixedCooldown := m.fixedErrorCooldownForResult(result.Error, ctx)
 		resultStatusCode := statusCodeFromResult(result.Error)
 		chatGPTWebImageQuotaResult := result.Error != nil &&
 			strings.EqualFold(strings.TrimSpace(result.Error.Code), "chatgpt_web_image_quota")
@@ -8000,7 +7996,7 @@ func (m *Manager) markResult(
 			}
 			if result.Model != "" {
 				if authWideDynamicCooldown {
-					skipCooling := !hasDynamicFixedCooldown && m.cooldownSkippedForStatus(resultStatusCode)
+					skipCooling := !hasDynamicFixedCooldown && m.cooldownSkippedForStatus(resultStatusCode, ctx)
 					auth.Status = StatusError
 					auth.UpdatedAt = now
 					if result.Error != nil {
@@ -8026,11 +8022,11 @@ func (m *Manager) markResult(
 					}
 
 					statusCode := statusCodeFromResult(result.Error)
-					fixedCooldown, hasFixedCooldown := m.fixedErrorCooldownForResult(result.Error)
+					fixedCooldown, hasFixedCooldown := m.fixedErrorCooldownForResult(result.Error, ctx)
 					if (chatGPTWebImageQuotaResult || chatGPTWebImage429Result) && hasFixedCooldown {
 						fixedCooldown.scope = cooldownScopeModel
 					}
-					skipCooling := !hasFixedCooldown && m.cooldownSkippedForStatus(statusCode)
+					skipCooling := !hasFixedCooldown && m.cooldownSkippedForStatus(statusCode, ctx)
 					disableCooling := quotaCooldownDisabledForAuth(auth)
 					if hasFixedCooldown && fixedCooldown.scope == cooldownScopeAuth && !skipCooling {
 						applyAuthWideCooldown(auth, fixedCooldown.cooldown, now, disableCooling)
@@ -8132,8 +8128,8 @@ func (m *Manager) markResult(
 				}
 			} else {
 				statusCode := statusCodeFromResult(result.Error)
-				fixedCooldown, hasFixedCooldown := m.fixedErrorCooldownForResult(result.Error)
-				applyAuthFailureState(auth, result.Error, result.RetryAfter, now, !hasFixedCooldown && m.cooldownSkippedForStatus(statusCode), fixedCooldown, hasFixedCooldown)
+				fixedCooldown, hasFixedCooldown := m.fixedErrorCooldownForResult(result.Error, ctx)
+				applyAuthFailureState(auth, result.Error, result.RetryAfter, now, !hasFixedCooldown && m.cooldownSkippedForStatus(statusCode, ctx), fixedCooldown, hasFixedCooldown)
 			}
 		}
 

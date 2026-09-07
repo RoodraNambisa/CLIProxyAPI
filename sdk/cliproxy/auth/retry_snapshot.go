@@ -15,17 +15,30 @@ type retrySettingsSnapshot struct {
 }
 
 type retrySettingsContextKey struct{}
+type cooldownRulesSnapshot struct {
+	noCooldownStatusCodes []int
+	fixedErrorCooldowns   []internalconfig.FixedErrorCooldownRule
+}
+
 type requestRetrySettings struct {
-	manager    *Manager
-	settings   *retrySettingsSnapshot
-	errorRules []internalconfig.NonRetryableErrorRule
+	manager       *Manager
+	settings      *retrySettingsSnapshot
+	errorRules    []internalconfig.NonRetryableErrorRule
+	cooldownRules cooldownRulesSnapshot
 }
 
 func (m *Manager) withRetrySettingsSnapshot(ctx context.Context) context.Context {
 	if prior, _ := ctx.Value(retrySettingsContextKey{}).(*requestRetrySettings); prior != nil && prior.manager == m {
 		return ctx
 	}
-	return context.WithValue(ctx, retrySettingsContextKey{}, &requestRetrySettings{manager: m, settings: m.retryConfig.Load(), errorRules: slices.Clone(nonRetryableErrorRulesForConfig(m.currentConfig()))})
+	cfg := m.currentConfig()
+	cooldownRules := cooldownRulesForConfig(cfg)
+	cooldownRules.noCooldownStatusCodes = slices.Clone(cooldownRules.noCooldownStatusCodes)
+	cooldownRules.fixedErrorCooldowns = slices.Clone(cooldownRules.fixedErrorCooldowns)
+	return context.WithValue(ctx, retrySettingsContextKey{}, &requestRetrySettings{
+		manager: m, settings: m.retryConfig.Load(),
+		errorRules: slices.Clone(nonRetryableErrorRulesForConfig(cfg)), cooldownRules: cooldownRules,
+	})
 }
 
 func (m *Manager) retrySettings(contexts ...context.Context) (int, int, time.Duration) {
@@ -51,4 +64,20 @@ func (m *Manager) requestNonRetryableErrorRules(contexts ...context.Context) []i
 		}
 	}
 	return nonRetryableErrorRulesForConfig(m.currentConfig())
+}
+
+func cooldownRulesForConfig(cfg *internalconfig.Config) cooldownRulesSnapshot {
+	if cfg == nil {
+		return cooldownRulesSnapshot{}
+	}
+	return cooldownRulesSnapshot{noCooldownStatusCodes: cfg.NoCooldownStatusCodes, fixedErrorCooldowns: cfg.FixedErrorCooldowns}
+}
+
+func (m *Manager) requestCooldownRules(contexts ...context.Context) cooldownRulesSnapshot {
+	if len(contexts) > 0 && contexts[0] != nil {
+		if captured, _ := contexts[0].Value(retrySettingsContextKey{}).(*requestRetrySettings); captured != nil && captured.manager == m {
+			return captured.cooldownRules
+		}
+	}
+	return cooldownRulesForConfig(m.currentConfig())
 }
