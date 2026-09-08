@@ -361,6 +361,10 @@ type Config struct {
 	// NonRetryableErrors marks stable request errors that should not trigger credential or request-round retry.
 	NonRetryableErrors []NonRetryableErrorRule `yaml:"non-retryable-errors" json:"non-retryable-errors"`
 
+	// OAuthRequestScopedErrors supplies optional provider rules for OAuth credentials.
+	// Nonempty credential rules take precedence. Missing/empty lists are inactive.
+	OAuthRequestScopedErrors map[string][]RequestScopedErrorRule `yaml:"oauth-request-scoped-errors,omitempty" json:"oauth-request-scoped-errors,omitempty"`
+
 	// AuthModelExclusions removes models from matching credentials before registry registration.
 	AuthModelExclusions []AuthModelExclusionRule `yaml:"auth-model-exclusions" json:"auth-model-exclusions"`
 
@@ -1869,6 +1873,7 @@ type CloakConfig struct {
 // ClaudeKey represents the configuration for a Claude API key,
 // including the API key itself and an optional base URL for the API endpoint.
 type ClaudeKey struct {
+	RequestScopedErrors []RequestScopedErrorRule `yaml:"request-scoped-errors,omitempty" json:"request-scoped-errors,omitempty"`
 	// RequestRetry overrides additional credential retry rounds. Nil inherits;
 	// negative values act as zero. Values above MaxCredentialRequestRetry are invalid.
 	RequestRetry *int `yaml:"request-retry,omitempty" json:"request-retry,omitempty"`
@@ -1931,6 +1936,7 @@ func (m ClaudeModel) GetForceMapping() bool { return m.ForceMapping }
 // CodexKey represents the configuration for a Codex API key,
 // including the API key itself and an optional base URL for the API endpoint.
 type CodexKey struct {
+	RequestScopedErrors []RequestScopedErrorRule `yaml:"request-scoped-errors,omitempty" json:"request-scoped-errors,omitempty"`
 	// RequestRetry overrides additional credential retry rounds. Nil inherits;
 	// negative values act as zero. Values above MaxCredentialRequestRetry are invalid.
 	RequestRetry *int `yaml:"request-retry,omitempty" json:"request-retry,omitempty"`
@@ -1988,6 +1994,7 @@ func (m CodexModel) GetForceMapping() bool { return m.ForceMapping }
 // GeminiKey represents the configuration for a Gemini API key,
 // including optional overrides for upstream base URL, proxy routing, and headers.
 type GeminiKey struct {
+	RequestScopedErrors []RequestScopedErrorRule `yaml:"request-scoped-errors,omitempty" json:"request-scoped-errors,omitempty"`
 	// RequestRetry overrides additional credential retry rounds. Nil inherits;
 	// negative values act as zero. Values above MaxCredentialRequestRetry are invalid.
 	RequestRetry *int `yaml:"request-retry,omitempty" json:"request-retry,omitempty"`
@@ -2041,6 +2048,7 @@ func (m GeminiModel) GetForceMapping() bool { return m.ForceMapping }
 // OpenAICompatibility represents the configuration for OpenAI API compatibility
 // with external providers, allowing model aliases to be routed through OpenAI API format.
 type OpenAICompatibility struct {
+	RequestScopedErrors []RequestScopedErrorRule `yaml:"request-scoped-errors,omitempty" json:"request-scoped-errors,omitempty"`
 	// RequestRetry applies to credentials of this provider. Nil inherits;
 	// negative values act as zero. Values above MaxCredentialRequestRetry are invalid.
 	RequestRetry *int `yaml:"request-retry,omitempty" json:"request-retry,omitempty"`
@@ -2188,6 +2196,9 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	if errRetry := validateCredentialRequestRetryYAML(data); errRetry != nil {
 		return nil, errRetry
 	}
+	if errRules := validateRequestScopedErrorsYAML(data); errRules != nil {
+		return nil, errRules
+	}
 	if err = yaml.Unmarshal(data, &cfg); err != nil {
 		if optional {
 			if accountInfoErr := validateChatGPTWebAccountInfoYAML(data); accountInfoErr != nil {
@@ -2222,6 +2233,9 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	}
 	if errRetry := cfg.ValidateCredentialRequestRetries(); errRetry != nil {
 		return nil, errRetry
+	}
+	if errRules := cfg.ValidateRequestScopedErrorRules(); errRules != nil {
+		return nil, errRules
 	}
 	// Hash remote management key if plaintext is detected (nested)
 	// We consider a value to be already hashed if it looks like a bcrypt hash ($2a$, $2b$, or $2y$ prefix).
@@ -3866,6 +3880,9 @@ func SaveConfigPreserveComments(configFile string, cfg *Config) error {
 	if errRetry := cfg.ValidateCredentialRequestRetries(); errRetry != nil {
 		return errRetry
 	}
+	if errRules := cfg.ValidateRequestScopedErrorRules(); errRules != nil {
+		return errRules
+	}
 	persistCfg := *cfg
 	groups, errNormalizeGroups := NormalizeAPIKeyGroups(persistCfg.APIKeyGroups, persistCfg.APIKeys)
 	if errNormalizeGroups != nil {
@@ -3917,6 +3934,17 @@ func SaveConfigPreserveComments(configFile string, cfg *Config) error {
 
 	pruneMappingToGeneratedKeys(original.Content[0], generated.Content[0], "oauth-excluded-models")
 	pruneMappingToGeneratedKeys(original.Content[0], generated.Content[0], "oauth-model-alias")
+	pruneMappingToGeneratedKeys(original.Content[0], generated.Content[0], "oauth-request-scoped-errors")
+	if len(persistCfg.OAuthRequestScopedErrors) == 0 {
+		// An explicit empty map must shadow rules inherited from a root merge.
+		inherited, errRulesYAML := credentialYAMLField(original.Content[0], "oauth-request-scoped-errors", make(map[*yaml.Node]bool))
+		if errRulesYAML != nil {
+			return errRulesYAML
+		}
+		if inherited != nil {
+			copyNodeShallow(getOrCreateMapValue(original.Content[0], "oauth-request-scoped-errors"), &yaml.Node{Kind: yaml.MappingNode, Tag: "!!map"})
+		}
+	}
 	if findMapKeyIndex(generated.Content[0], "error-response-rewrites") < 0 {
 		removeMapKey(original.Content[0], "error-response-rewrites")
 	}

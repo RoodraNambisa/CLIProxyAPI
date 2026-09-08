@@ -375,6 +375,21 @@ non-retryable-errors:
     type: image_generation_user_error
     code: moderation_blocked
 
+# Optional OAuth provider error actions. Empty rules are inactive; no enable switch.
+# Credential request-scoped-errors override the provider list when nonempty.
+# Valid status: 100-599. Actions: stop, stop-and-cooldown, continue, continue-and-cooldown.
+# The first matching rule wins; match and match-regexr are OR conditions.
+# Literal whitespace/case is preserved. Invalid rules reject the new configuration.
+# Changes apply to new requests; cancellation, policy refusal, committed output,
+# non-replayable requests and explicit no-cooling constraints remain authoritative.
+oauth-request-scoped-errors: {}
+# oauth-request-scoped-errors:
+#   codex:
+#     - status: 400
+#       match: ["example upstream error"]
+#       match-regexr: ['^example error [0-9]+$']
+#       action: stop
+
 # Remove route models from matching credentials before model prefixing and registry registration.
 # Matching fields use non-secret auth metadata only.
 auth-model-exclusions: []
@@ -630,6 +645,8 @@ nonstream-keepalive-interval: 0
 #       - "gemini-2.5-pro"
 
 # Codex API keys
+# API key entries also accept request-scoped-errors with the rule format above.
+# For OpenAI compatibility, put the rules on the provider entry.
 # codex-api-key:
 #   - api-key: "sk-atSM..."
 #     prefix: "test" # optional: require calls like "test/gpt-5-codex" to target this credential
