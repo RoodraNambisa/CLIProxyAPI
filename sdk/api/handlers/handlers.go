@@ -426,6 +426,21 @@ func providerNotAllowedError() *interfaces.ErrorMessage {
 	}
 }
 
+// ModelsForProviderAccess returns model metadata from the request's allowed
+// providers, while keeping the unrestricted catalog behavior unchanged.
+func (h *BaseAPIHandler) ModelsForProviderAccess(c *gin.Context, handlerType string) []map[string]any {
+	allowed, restricted := allowedProviderSetFromGin(c)
+	modelRegistry := registry.GetGlobalRegistry()
+	if !restricted {
+		return modelRegistry.GetAvailableModels(handlerType)
+	}
+	providers := make([]string, 0, len(allowed))
+	for provider := range allowed {
+		providers = append(providers, provider)
+	}
+	return modelRegistry.GetAvailableModelsForProviders(handlerType, providers)
+}
+
 // FilterModelsByProviderAccess removes models that cannot use any provider allowed for the request API key.
 func (h *BaseAPIHandler) FilterModelsByProviderAccess(c *gin.Context, models []map[string]any) []map[string]any {
 	allowed, restricted := allowedProviderSetFromGin(c)

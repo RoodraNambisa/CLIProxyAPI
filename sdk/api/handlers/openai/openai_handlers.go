@@ -76,7 +76,7 @@ func (h *OpenAIAPIHandler) OpenAIModels(c *gin.Context) {
 	cfg := h.ConfigSnapshot()
 	optimizeMultiAgentV2 := cfg != nil && cfg.CodexOptimizeMultiAgentV2
 	// Filter before shaping either the standard or Codex client catalog response.
-	allModels := h.FilterModelsByProviderAccess(c, h.Models())
+	allModels := h.ModelsForProviderAccess(c, "openai")
 	if _, ok := c.Request.URL.Query()["client_version"]; ok {
 		c.JSON(http.StatusOK, codexClientModelsResponseForClient(allModels, c.Query("client_version"), registry.GetGlobalRegistry().GetModelProviders, optimizeMultiAgentV2))
 		return
