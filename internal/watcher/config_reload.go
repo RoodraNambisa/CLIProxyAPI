@@ -147,7 +147,7 @@ func (w *Watcher) reloadConfig() bool {
 
 	authDirChanged := oldRuntimeConfig == nil || oldRuntimeConfig.AuthDir != appliedConfig.AuthDir
 	retryConfigChanged := oldRuntimeConfig != nil && (oldRuntimeConfig.RequestRetry != appliedConfig.RequestRetry || oldRuntimeConfig.MaxRetryInterval != appliedConfig.MaxRetryInterval || oldRuntimeConfig.MaxRetryCredentials != appliedConfig.MaxRetryCredentials)
-	forceAuthRefresh := oldRuntimeConfig != nil && (oldRuntimeConfig.ForceModelPrefix != appliedConfig.ForceModelPrefix || !reflect.DeepEqual(oldRuntimeConfig.OAuthModelAlias, appliedConfig.OAuthModelAlias) || !reflect.DeepEqual(oldRuntimeConfig.AuthModelExclusions, appliedConfig.AuthModelExclusions) || retryConfigChanged)
+	forceAuthRefresh := oldRuntimeConfig != nil && (oldRuntimeConfig.ForceModelPrefix != appliedConfig.ForceModelPrefix || !oauthModelAliasRoutingEqual(oldRuntimeConfig.OAuthModelAlias, appliedConfig.OAuthModelAlias) || !reflect.DeepEqual(oldRuntimeConfig.AuthModelExclusions, appliedConfig.AuthModelExclusions) || retryConfigChanged)
 
 	log.Infof("config successfully reloaded, triggering client reload")
 	w.reloadClientsWithOptions(authDirChanged, affectedOAuthProviders, forceAuthRefresh, false, configApply == nil)
