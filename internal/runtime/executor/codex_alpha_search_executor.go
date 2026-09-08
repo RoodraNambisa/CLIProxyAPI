@@ -51,7 +51,7 @@ func (e *CodexExecutor) executeAlphaSearch(ctx context.Context, auth *cliproxyau
 		return resp, statusErr{code: code, msg: err.Error(), skipAuthResult: true}
 	}
 	if model.HasSuffix {
-		body, err = thinking.ApplyThinking(body, req.Model, "codex", "codex", e.Identifier())
+		body, err = helps.ApplyRequestThinking(body, req, opts, "codex", "codex", e.Identifier())
 		if err != nil {
 			return resp, err
 		}
