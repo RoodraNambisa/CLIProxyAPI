@@ -4836,6 +4836,9 @@ func (s *Service) ApplyRuntimeConfig(ctx context.Context, requested *config.Conf
 	if errRules := requestedSnapshot.ValidateRequestScopedErrorRules(); errRules != nil {
 		return result, errRules
 	}
+	if errModels := requestedSnapshot.ValidateModelContextLengths(); errModels != nil {
+		return result, errModels
+	}
 	s.runtimeConfigApplyMu.Lock()
 	defer s.runtimeConfigApplyMu.Unlock()
 

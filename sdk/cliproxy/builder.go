@@ -182,6 +182,9 @@ func (b *Builder) Build() (*Service, error) {
 	if errRules := b.cfg.ValidateRequestScopedErrorRules(); errRules != nil {
 		return nil, errRules
 	}
+	if errModels := b.cfg.ValidateModelContextLengths(); errModels != nil {
+		return nil, errModels
+	}
 
 	tokenProvider := b.tokenProvider
 	if tokenProvider == nil {
