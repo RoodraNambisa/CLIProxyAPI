@@ -55,6 +55,9 @@ func (h *Handler) HandleDirectWebsocket(c *gin.Context) {
 	defer lease.Close()
 	selected := lease.CloneAuth()
 	headers := realtimeProtocolHeaders(c.Request.Header)
+	if headers.Get("Originator") == "" {
+		headers.Set("Originator", "Codex Desktop")
+	}
 	if account, ok := selected.Metadata["account_id"].(string); ok && strings.TrimSpace(account) != "" {
 		headers.Set("Chatgpt-Account-Id", strings.TrimSpace(account))
 	}

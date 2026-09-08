@@ -345,3 +345,56 @@ func TestLiveDirectResolvesCredentialPrefixAndModelAlias(t *testing.T) {
 		t.Fatal("public prefix or alias was sent as the upstream model")
 	}
 }
+
+func TestLiveDirectDefaultOriginatorAndExplicitHeader(t *testing.T) {
+	enabled, disabled := true, false
+	for _, identity := range []struct {
+		name                  string
+		enforce               *bool
+		userAgent, originator string
+	}{{"default", nil, "", "codex_cli_rs"}, {"enforced", &enabled, "local-codex/0.153.4 (Linux; arm64) tmux/3.5", "local-codex"}, {"disabled", &disabled, "", ""}} {
+		for _, originator := range []string{"", "Fixture Client"} {
+			t.Run(identity.name+"/"+map[bool]string{true: "default", false: "explicit"}[originator == ""], func(t *testing.T) {
+				observed := make(chan string, 1)
+				cfg := &config.Config{}
+				cfg.Codex.LiveEnabled = true
+				cfg.Codex.EnforceSoftwareIdentity = identity.enforce
+				cfg.CodexHeaderDefaults.UserAgent = identity.userAgent
+				_, _, endpoint, _ := newDirectLiveFixture(t, cfg, func(w http.ResponseWriter, r *http.Request) {
+					observed <- r.Header.Get("Originator")
+					upgrader := websocket.Upgrader{}
+					conn, errUpgrade := upgrader.Upgrade(w, r, nil)
+					if errUpgrade != nil {
+						t.Error(errUpgrade)
+						return
+					}
+					defer closeRealtimeSocket(conn)
+					_, _, _ = conn.ReadMessage()
+				})
+				headers := http.Header{"Authorization": {"Bearer fixture-caller"}}
+				if originator != "" {
+					headers.Set("Originator", originator)
+				}
+				conn, response, errDial := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(endpoint, "http"), headers)
+				closeRealtimeResponse(response)
+				if errDial != nil {
+					t.Fatal(errDial)
+				}
+				closeRealtimeSocket(conn)
+				want := originator
+				if want == "" {
+					want = "Codex Desktop"
+				}
+				if identity.originator != "" {
+					want = identity.originator
+				}
+				if got := <-observed; got != want {
+					t.Fatalf("upstream Originator=%q, want %q", got, want)
+				}
+				if cfg.CodexHeaderDefaults.UserAgent != identity.userAgent {
+					t.Fatal("native fallback rewrote the saved software identity")
+				}
+			})
+		}
+	}
+}
