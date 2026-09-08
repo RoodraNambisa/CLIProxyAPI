@@ -58,7 +58,7 @@ func (e *CodexExecutor) executeAlphaSearch(ctx context.Context, auth *cliproxyau
 	}
 	ctx = contextWithCodexFingerprintPersona(ctx, e.cfg, auth)
 	ctx = helps.WithCodexPromptCacheLogRedaction(ctx, helps.SnapshotCodexPromptCacheLog(ctx, req.Payload))
-	reporter := helps.NewUsageReporter(ctx, e.Identifier(), req.Model, auth)
+	reporter := helps.NewUsageReporter(ctx, e.Identifier(), model.ModelName, auth)
 	defer reporter.TrackFailure(ctx, &err)
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
 	if err != nil {
@@ -130,6 +130,9 @@ func (e *CodexExecutor) executeAlphaSearch(ctx context.Context, auth *cliproxyau
 	}
 	helps.AppendAPIResponseChunk(ctx, e.cfg, data)
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
+		if gjson.GetBytes(data, "usage").IsObject() {
+			reporter.PublishFailureWithUsage(ctx, helps.ParseOpenAIUsage(data))
+		}
 		upstreamErr := statusErr{code: httpResp.StatusCode, msg: string(data), skipAuthResult: isCodexContextTooLargeRequestError(httpResp.StatusCode, data)}
 		upstreamErr.retryAfter = parseCodexRetryAfter(httpResp.StatusCode, data, time.Now())
 		if upstreamErr.retryAfter == nil {

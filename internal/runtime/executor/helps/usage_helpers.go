@@ -238,6 +238,12 @@ func (r *UsageReporter) PublishFailure(ctx context.Context, _ ...error) {
 	r.publishWithOutcome(ctx, usage.Detail{}, true, true)
 }
 
+// PublishFailureWithUsage preserves token counts explicitly reported by an
+// upstream error response while retaining the final request failure outcome.
+func (r *UsageReporter) PublishFailureWithUsage(ctx context.Context, detail usage.Detail) {
+	r.publishWithOutcome(ctx, detail, true, true)
+}
+
 func (r *UsageReporter) TrackFailure(ctx context.Context, errPtr *error) {
 	if r == nil || errPtr == nil {
 		return
