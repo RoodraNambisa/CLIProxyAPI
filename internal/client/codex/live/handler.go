@@ -89,6 +89,10 @@ type liveRequest struct {
 // begin requires an authenticated caller even when legacy API authentication
 // permits anonymous requests. Ownership cannot be assigned to ambient cookies.
 func (h *Handler) begin(c *gin.Context) *liveRequest {
+	return h.beginRequest(c, true)
+}
+
+func (h *Handler) beginRequest(c *gin.Context, newSession bool) *liveRequest {
 	if h == nil || h.runtime.Load() == nil {
 		writeRealtimeError(c, http.StatusServiceUnavailable, "Codex realtime is unavailable", "server_error", "codex_live_unavailable")
 		return nil
@@ -99,6 +103,20 @@ func (h *Handler) begin(c *gin.Context) *liveRequest {
 	}
 	runtime := h.runtime.Load()
 	ctx, cancelRequest := runtime.base.GetContextWithCancel(h, c, c.Request.Context())
+	if !newSession {
+		// Authenticated cleanup checks stored ownership in the handler. It must
+		// remain possible after new admission or provider access is disabled.
+		cleanupCtx, cancelCleanup := context.WithCancelCause(ctx)
+		stopRoot := context.AfterFunc(h.root, func() { cancelCleanup(context.Cause(h.root)) })
+		if errRoot := context.Cause(h.root); errRoot != nil {
+			cancelCleanup(errRoot)
+		}
+		return &liveRequest{handlerRuntime: runtime, ctx: cleanupCtx, finish: func() {
+			stopRoot()
+			cancelCleanup(nil)
+			cancelRequest()
+		}}
+	}
 	if denied := runtime.base.ValidateProviderAccess(ctx, "codex"); denied != nil {
 		runtime.base.WriteErrorResponse(c, denied)
 		cancelRequest()
@@ -133,8 +151,10 @@ func (h *Handler) begin(c *gin.Context) *liveRequest {
 }
 
 func (r *liveRequest) active() error {
-	if errCtx := context.Cause(r.admission.ctx); errCtx != nil {
-		return errCtx
+	if r.admission != nil {
+		if errCtx := context.Cause(r.admission.ctx); errCtx != nil {
+			return errCtx
+		}
 	}
 	return context.Cause(r.ctx)
 }
