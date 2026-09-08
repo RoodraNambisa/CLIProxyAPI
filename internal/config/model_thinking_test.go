@@ -4,11 +4,27 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 )
+
+func TestNormalizeModelThinkingSupportPreservesSourceAndLevelOrder(t *testing.T) {
+	raw := &registry.ThinkingSupport{Min: 1024, Max: 32768, Levels: []string{" HIGH ", "max", "HIGH", "none", "AUTO", ""}}
+	normalized := NormalizeModelThinkingSupport(raw)
+	if normalized == raw || !reflect.DeepEqual(normalized.Levels, []string{"high", "max", "none", "auto"}) || !normalized.ZeroAllowed || !normalized.DynamicAllowed || normalized.Min != 1024 || normalized.Max != 32768 {
+		t.Fatal("thinking normalization changed budget or level order")
+	}
+	normalized.Levels[0] = "low"
+	if raw.Levels[0] != " HIGH " || raw.ZeroAllowed || raw.DynamicAllowed {
+		t.Fatal("normalization mutated saved thinking")
+	}
+	if NormalizeModelThinkingSupport(nil) != nil {
+		t.Fatal("missing thinking gained an override")
+	}
+}
 
 func TestModelThinkingRejectsInvalidYAMLBeforeOptionalFallback(t *testing.T) {
 	for _, family := range retryConfigFamilies {

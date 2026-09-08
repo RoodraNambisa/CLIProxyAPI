@@ -11,6 +11,32 @@ import (
 
 const MaxModelThinkingBudget = math.MaxInt32
 
+// NormalizeModelThinkingSupport creates a private capability snapshot. Preserve
+// level order because it may determine the provider's lowest allowed effort.
+func NormalizeModelThinkingSupport(raw *registry.ThinkingSupport) *registry.ThinkingSupport {
+	if raw == nil {
+		return nil
+	}
+	normalized := *raw
+	normalized.Levels = nil
+	seen := make(map[string]bool, len(raw.Levels))
+	for _, value := range raw.Levels {
+		level := strings.ToLower(strings.TrimSpace(value))
+		if level == "" || seen[level] {
+			continue
+		}
+		seen[level] = true
+		normalized.Levels = append(normalized.Levels, level)
+		if level == "none" {
+			normalized.ZeroAllowed = true
+		}
+		if level == "auto" {
+			normalized.DynamicAllowed = true
+		}
+	}
+	return &normalized
+}
+
 // ValidateModelThinkingSupport validates declarations without changing saved
 // values. Level normalization belongs to the immutable execution snapshot.
 func ValidateModelThinkingSupport(support *registry.ThinkingSupport) error {

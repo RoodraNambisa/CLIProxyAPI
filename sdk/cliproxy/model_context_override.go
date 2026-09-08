@@ -1,13 +1,17 @@
 package cliproxy
 
-import "github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
+import (
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
+)
 
 func applyConfiguredModelCatalogMetadata(info *ModelInfo, model modelEntry) {
 	if info == nil {
 		return
 	}
 	// Inherit the actual upstream model's catalog, never another alias/client.
-	if upstream := registry.LookupStaticModelInfo(info.UpstreamID); upstream != nil {
+	if upstream := registry.LookupStaticModelInfo(thinking.ParseSuffix(info.UpstreamID).ModelName); upstream != nil {
 		info.ContextLength = upstream.ContextLength
 		if info.ContextLength <= 0 {
 			info.ContextLength = upstream.InputTokenLimit
@@ -31,5 +35,9 @@ func applyConfiguredModelCatalogMetadata(info *ModelInfo, model modelEntry) {
 	if limit := model.GetMaxContextLength(); limit > 0 {
 		info.ContextLength = limit
 		info.MaxContextLength = limit
+	}
+	if support := model.GetThinking(); support != nil {
+		info.Thinking = config.NormalizeModelThinkingSupport(support)
+		info.UserDefined = false
 	}
 }
