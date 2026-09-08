@@ -22,6 +22,8 @@ const (
 
 var callIDPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`)
 
+var errCallIDConflict = errors.New("realtime call ID is already registered")
+
 type callOwner [sha256.Size]byte
 
 func requestCallOwner(c *gin.Context) (callOwner, bool) {
@@ -85,7 +87,7 @@ func (s *callStore) put(call *liveCall) error {
 		return errCtx
 	}
 	if s.entries[call.id] != nil {
-		return errors.New("realtime call ID is already registered")
+		return errCallIDConflict
 	}
 	if len(s.entries) >= s.capacity {
 		return errors.New("realtime call registry is at capacity")
@@ -153,15 +155,25 @@ func (s *callStore) expire(entry *callEntry, version uint64) {
 }
 
 func (s *callStore) remove(call *liveCall) {
+	if s.detach(call) {
+		call.close()
+	}
+}
+
+// detach returns cleanup ownership to the caller, for example when delivery
+// failed and an upstream hangup must complete before closing the lease.
+func (s *callStore) detach(call *liveCall) bool {
 	s.mu.Lock()
 	entry := s.entries[call.id]
 	if entry == nil || entry.call != call {
 		s.mu.Unlock()
-		return
+		return false
 	}
 	delete(s.entries, call.id)
 	s.mu.Unlock()
-	closeCallEntry(entry)
+	entry.timer.Stop()
+	entry.stop()
+	return true
 }
 
 func (s *callStore) close() {

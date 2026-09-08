@@ -82,6 +82,12 @@ func (g *admissionGate) begin(ctx context.Context) (*liveAdmission, error) {
 // commit is the last admission check after setup succeeds. Callers must still
 // roll back their allocated resources if commit fails or response delivery fails.
 func (a *liveAdmission) commit() error {
+	return a.commitWith(nil)
+}
+
+// publish may perform only local state changes. No network operation or
+// resource cleanup may run while admission is serialized with configuration.
+func (a *liveAdmission) commitWith(publish func() error) error {
 	g := a.gate
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -96,6 +102,11 @@ func (a *liveAdmission) commit() error {
 	}
 	if !g.enabled || a.generation != g.generation {
 		return errLiveDisabled
+	}
+	if publish != nil {
+		if errPublish := publish(); errPublish != nil {
+			return errPublish
+		}
 	}
 	a.committed = true
 	delete(g.pending, a)

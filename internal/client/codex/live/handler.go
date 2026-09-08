@@ -33,11 +33,12 @@ type Handler struct {
 	shutdown         context.CancelFunc
 	websocketBaseURL string
 	calls            *callStore
+	callURL          string
 }
 
 func NewHandler(cfg *config.Config, manager *auth.Manager) *Handler {
 	ctx, cancel := context.WithCancel(context.Background())
-	h := &Handler{manager: manager, root: ctx, shutdown: cancel, websocketBaseURL: "wss://api.openai.com/v1", calls: newCallStore()}
+	h := &Handler{manager: manager, root: ctx, shutdown: cancel, websocketBaseURL: "wss://api.openai.com/v1", calls: newCallStore(), callURL: "https://chatgpt.com/backend-api/codex/realtime/calls?intent=quicksilver&architecture=avas"}
 	h.UpdateConfig(cfg)
 	return h
 }
@@ -140,10 +141,14 @@ func (r *liveRequest) active() error {
 
 // commit detaches setup cancellation before releasing admission bookkeeping.
 func (r *liveRequest) commit() error {
+	return r.commitWith(nil)
+}
+
+func (r *liveRequest) commitWith(publish func() error) error {
 	if errCtx := context.Cause(r.ctx); errCtx != nil {
 		return errCtx
 	}
-	if errCommit := r.admission.commit(); errCommit != nil {
+	if errCommit := r.admission.commitWith(publish); errCommit != nil {
 		return errCommit
 	}
 	r.stopSetup()
