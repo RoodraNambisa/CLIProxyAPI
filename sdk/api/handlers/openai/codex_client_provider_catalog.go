@@ -7,11 +7,11 @@ import (
 )
 
 func codexClientModelsForRequest(c *gin.Context, base *handlers.BaseAPIHandler, version string, optimizeMultiAgentV2 bool) map[string]any {
-	if catalog, restricted := base.RestrictedModelCatalog(c, "openai"); restricted {
-		return codexClientModelsResponseForClient(catalog.Models, version,
-			func(id string) []string { return catalog.Providers[id] }, optimizeMultiAgentV2,
-			func(id string) *registry.ModelInfo { return catalog.Metadata[id] })
+	catalog, restricted := base.RestrictedModelCatalog(c, "openai")
+	if !restricted {
+		catalog = registry.GetGlobalRegistry().GetOpenAIModelCatalog()
 	}
-	r := registry.GetGlobalRegistry()
-	return codexClientModelsResponseForClient(r.GetAvailableModels("openai"), version, r.GetModelProviders, optimizeMultiAgentV2)
+	return codexClientModelsResponseForClient(catalog.Models, version,
+		func(id string) []string { return catalog.Providers[id] }, optimizeMultiAgentV2,
+		func(id string) *registry.ModelInfo { return catalog.Metadata[id] })
 }

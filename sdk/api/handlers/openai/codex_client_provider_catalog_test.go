@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/gin-gonic/gin"
@@ -85,4 +86,42 @@ func TestCodexClientScopedSnapshotSurvivesRegistryChanges(t *testing.T) {
 	if missing["display_name"] != id || missing["description"] != id {
 		t.Fatal("missing scoped metadata fell back to the global registry")
 	}
+}
+
+func TestCodexClientHTTPConcurrentCatalogUpdates(t *testing.T) {
+	const client = "http-catalog-concurrency"
+	r := registry.GetGlobalRegistry()
+	register := func(revision int) {
+		var models []*registry.ModelInfo
+		for _, id := range []string{client + "-one", client + "-two"} {
+			models = append(models, &registry.ModelInfo{ID: id, DisplayName: fmt.Sprint(revision), Description: fmt.Sprint(revision), ContextLength: revision})
+		}
+		r.RegisterClient(client, "codex", models)
+	}
+	register(1000)
+	t.Cleanup(func() { r.UnregisterClient(client) })
+	var readers sync.WaitGroup
+	for _, scope := range []string{"", "codex"} {
+		for range 4 {
+			readers.Go(func() {
+				for range 50 {
+					w := httptest.NewRecorder()
+					c, _ := gin.CreateTestContext(w)
+					c.Request = httptest.NewRequest(http.MethodGet, "/v1/models?client_version=0.153.4", nil)
+					c.Set("accessMetadata", map[string]string{sdkaccess.MetadataAllowedProviders: scope})
+					(&OpenAIAPIHandler{}).OpenAIModels(c)
+					one := gjson.GetBytes(w.Body.Bytes(), `models.#(slug=="http-catalog-concurrency-one")`)
+					two := gjson.GetBytes(w.Body.Bytes(), `models.#(slug=="http-catalog-concurrency-two")`)
+					if !one.Exists() || !two.Exists() || one.Get("display_name").String() != two.Get("display_name").String() || one.Get("display_name").Int() != one.Get("context_window").Int() || one.Get("description").String() != one.Get("display_name").String() || two.Get("description").String() != two.Get("display_name").String() {
+						t.Errorf("scope %q returned mixed registry revisions", scope)
+						return
+					}
+				}
+			})
+		}
+	}
+	for revision := 1001; revision < 1500; revision++ {
+		register(revision)
+	}
+	readers.Wait()
 }
