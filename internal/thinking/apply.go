@@ -85,7 +85,20 @@ func IsUserDefinedModel(modelInfo *registry.ModelInfo) bool {
 //	// Without suffix - uses body config
 //	result, err := thinking.ApplyThinking(body, "gemini-2.5-pro", "gemini", "gemini", "gemini")
 func ApplyThinking(body []byte, model string, fromFormat string, toFormat string, providerKey string) ([]byte, error) {
+	return applyThinking(body, nil, model, fromFormat, toFormat, providerKey, nil, false)
+}
+
+// ApplyThinkingWithModelInfo uses the capability snapshot selected for this
+// execution attempt, while keeping the canonical validation and provider path.
+func ApplyThinkingWithModelInfo(body, sourceBody []byte, model, fromFormat, toFormat, providerKey string, modelInfo *registry.ModelInfo) ([]byte, error) {
+	return applyThinking(body, sourceBody, model, fromFormat, toFormat, providerKey, modelInfo, true)
+}
+
+func applyThinking(body, sourceBody []byte, model, fromFormat, toFormat, providerKey string, resolvedModelInfo *registry.ModelInfo, resolved bool) ([]byte, error) {
 	providerFormat := strings.ToLower(strings.TrimSpace(toFormat))
+	if resolved && providerFormat == "openai-response" {
+		providerFormat = "codex"
+	}
 	providerKey = strings.ToLower(strings.TrimSpace(providerKey))
 	if providerKey == "" {
 		providerKey = providerFormat
@@ -108,7 +121,10 @@ func ApplyThinking(body []byte, model string, fromFormat string, toFormat string
 	suffixResult := ParseSuffix(model)
 	baseModel := suffixResult.ModelName
 	// Use provider-specific lookup to handle capability differences across providers.
-	modelInfo := registry.LookupModelInfo(baseModel, providerKey)
+	modelInfo := resolvedModelInfo
+	if !resolved {
+		modelInfo = registry.LookupModelInfo(baseModel, providerKey)
+	}
 
 	// 3. Model capability check
 	// Unknown models are treated as user-defined so thinking config can still be applied.
@@ -144,7 +160,16 @@ func ApplyThinking(body []byte, model string, fromFormat string, toFormat string
 			"level":    config.Level,
 		}).Debug("thinking: config from model suffix |")
 	} else {
-		config = extractThinkingConfig(body, providerFormat)
+		if resolved && len(sourceBody) > 0 {
+			sourceFormat := fromFormat
+			if sourceFormat == "openai-response" {
+				sourceFormat = "codex"
+			}
+			config = extractThinkingConfig(sourceBody, sourceFormat)
+		}
+		if !hasThinkingConfig(config) {
+			config = extractThinkingConfig(body, providerFormat)
+		}
 		if hasThinkingConfig(config) {
 			log.WithFields(log.Fields{
 				"provider": providerFormat,
@@ -162,6 +187,10 @@ func ApplyThinking(body []byte, model string, fromFormat string, toFormat string
 			"model":    modelInfo.ID,
 		}).Debug("thinking: no config found, passthrough |")
 		return body, nil
+	}
+
+	if resolved && config.Mode == ModeLevel && configuredThinkingCrossesFamily(fromFormat, providerFormat, modelInfo) {
+		config.Level = configuredThinkingHighIntent(config.Level, modelInfo.Thinking)
 	}
 
 	// 5. Validate and normalize configuration
