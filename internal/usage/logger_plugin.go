@@ -1593,6 +1593,15 @@ func dedupKey(apiName, modelName string, detail RequestDetail) string {
 }
 
 func resolveAPIIdentifier(ctx context.Context, record coreusage.Record) string {
+	if metadata, ok := coreusage.RequestMetadataFromContext(ctx); ok {
+		if metadata.APIIdentifier != "" {
+			return metadata.APIIdentifier
+		}
+		if record.Provider != "" {
+			return record.Provider
+		}
+		return "unknown"
+	}
 	if ctx != nil {
 		if ginCtx, ok := ctx.Value("gin").(*gin.Context); ok && ginCtx != nil {
 			path := ginCtx.FullPath()
@@ -1618,6 +1627,11 @@ func resolveAPIIdentifier(ctx context.Context, record coreusage.Record) string {
 }
 
 func resolveSuccess(ctx context.Context) bool {
+	// Captured HTTP requests use the producer's explicit Record.Failed outcome.
+	// The consumer may run before headers are written or after Gin is reused.
+	if _, captured := coreusage.RequestMetadataFromContext(ctx); captured {
+		return true
+	}
 	if ctx == nil {
 		return true
 	}
@@ -1633,6 +1647,9 @@ func resolveSuccess(ctx context.Context) bool {
 }
 
 func resolveClientIP(ctx context.Context) string {
+	if metadata, ok := coreusage.RequestMetadataFromContext(ctx); ok {
+		return metadata.ClientIP
+	}
 	if ctx == nil {
 		return ""
 	}

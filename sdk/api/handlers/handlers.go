@@ -24,6 +24,7 @@ import (
 	sdkaccess "github.com/router-for-me/CLIProxyAPI/v6/sdk/access"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	coreexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
+	coreusage "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/usage"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/config"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v6/sdk/translator"
 	"golang.org/x/net/context"
@@ -930,6 +931,17 @@ func (h *BaseAPIHandler) GetContextWithCancel(handler interfaces.APIHandler, c *
 		}()
 	}
 	newCtx = context.WithValue(newCtx, "gin", c)
+	if c != nil && c.Request != nil {
+		path := c.FullPath()
+		if path == "" && c.Request.URL != nil {
+			path = c.Request.URL.Path
+		}
+		identifier := path
+		if path != "" && c.Request.Method != "" {
+			identifier = c.Request.Method + " " + path
+		}
+		newCtx = coreusage.WithRequestMetadata(newCtx, coreusage.RequestMetadata{APIIdentifier: identifier, ClientIP: logging.ResolveClientIP(c)})
+	}
 	newCtx = executorhelps.CaptureCodexMultiAgentPolicyContext(newCtx)
 	newCtx = context.WithValue(newCtx, "handler", handler)
 	newCtx, _ = ensureErrorResponseSourceTracker(newCtx, c)
