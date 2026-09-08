@@ -80,10 +80,18 @@ func TestProviderCatalogConcurrentUpdatesKeepOneSnapshot(t *testing.T) {
 	for range 8 {
 		readers.Go(func() {
 			for range 100 {
-				models := r.GetAvailableModelsForProviders("openai", []string{"codex"})
+				catalog := r.GetModelCatalogForProviders("openai", []string{"codex"})
+				models := catalog.Models
 				if len(models) != 2 || models[0]["display_name"] != models[1]["display_name"] || models[0]["max_context_length"] != models[1]["max_context_length"] {
 					t.Errorf("mixed snapshot: %#v", models)
 					return
+				}
+				for _, model := range models {
+					id := model["id"].(string)
+					if catalog.Metadata[id].DisplayName != model["display_name"] || catalog.Metadata[id].MaxContextLength != model["max_context_length"] || !reflect.DeepEqual(catalog.Providers[id], []string{"codex"}) {
+						t.Error("capability lookup differs from formatted snapshot")
+						return
+					}
 				}
 			}
 		})
@@ -92,4 +100,25 @@ func TestProviderCatalogConcurrentUpdatesKeepOneSnapshot(t *testing.T) {
 		register(revision)
 	}
 	readers.Wait()
+}
+
+func TestProviderCatalogCapabilitySnapshotIsIndependent(t *testing.T) {
+	r := newTestModelRegistry()
+	r.RegisterClient("allowed", "codex", []*ModelInfo{{ID: "shared", Thinking: &ThinkingSupport{Levels: []string{"low"}}, SupportedInputModalities: []string{"text"}}})
+	r.RegisterClient("forbidden", "xai", []*ModelInfo{{ID: "shared", Thinking: &ThinkingSupport{Levels: []string{"high"}}, SupportedInputModalities: []string{"image"}}})
+	first := r.GetModelCatalogForProviders("openai", []string{"codex"})
+	if !reflect.DeepEqual(first.Metadata["shared"].Thinking.Levels, []string{"low"}) || !reflect.DeepEqual(first.Providers["shared"], []string{"codex"}) {
+		t.Fatal("snapshot used forbidden capability metadata")
+	}
+	first.Metadata["shared"].Thinking.Levels[0] = "mutated"
+	first.Metadata["shared"].SupportedInputModalities[0] = "mutated"
+	first.Providers["shared"][0] = "mutated"
+	second := r.GetModelCatalogForProviders("openai", []string{"codex"})
+	if second.Metadata["shared"].Thinking.Levels[0] != "low" || second.Metadata["shared"].SupportedInputModalities[0] != "text" || second.Providers["shared"][0] != "codex" {
+		t.Fatal("returned snapshot changed registry capabilities")
+	}
+	r.UnregisterClient("allowed")
+	if len(r.GetModelCatalogForProviders("openai", []string{"codex"}).Metadata) != 0 || second.Metadata["shared"].Thinking.Levels[0] != "low" {
+		t.Fatal("deletion changed a returned snapshot or used another provider")
+	}
 }
