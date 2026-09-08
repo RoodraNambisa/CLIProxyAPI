@@ -89,3 +89,20 @@ func CodexAlphaSearchURL(baseURL string, isAPIKey bool) (string, error) {
 	}
 	return u.JoinPath("alpha", "search").String(), nil
 }
+
+type codexAlphaSearchReadError struct{ responseError, readError error }
+
+func (e codexAlphaSearchReadError) Error() string   { return e.responseError.Error() }
+func (e codexAlphaSearchReadError) Unwrap() []error { return []error{e.responseError, e.readError} }
+
+// WithCodexAlphaSearchReadError retains both HTTP evidence and the read cause.
+// A broken or oversized error body must not hide an actual upstream 429.
+func WithCodexAlphaSearchReadError(responseError, readError error) error {
+	if readError == nil {
+		return responseError
+	}
+	if responseError == nil {
+		return readError
+	}
+	return codexAlphaSearchReadError{responseError: responseError, readError: readError}
+}

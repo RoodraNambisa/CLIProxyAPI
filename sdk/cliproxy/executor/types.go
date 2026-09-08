@@ -844,6 +844,8 @@ func ResponseFormatOrSource(opts Options) sdktranslator.Format {
 
 // Response wraps either a full provider response or metadata for streaming flows.
 type Response struct {
+	// StatusCode preserves native HTTP endpoint status. Zero keeps the caller's default.
+	StatusCode int
 	// Payload is the provider response in the executor format.
 	Payload []byte
 	// Metadata exposes optional structured data for translators.
