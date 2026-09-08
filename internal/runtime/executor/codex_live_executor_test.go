@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/gorilla/websocket"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
@@ -115,5 +116,46 @@ func TestCodexLiveDialRejectsUnsupportedAuthAndCancellation(t *testing.T) {
 	conn, _, errDial := e.DialCodexLiveWebsocket(ctx, &auth.Auth{Provider: "codex", Metadata: map[string]any{"access_token": "fixture"}}, "ws://127.0.0.1:1/unused", nil, nil)
 	if conn != nil || !errors.Is(errDial, context.Canceled) {
 		t.Fatal("cancelled request reached the dialer")
+	}
+}
+
+func TestCodexLiveDialCancellationInterruptsPendingHTTPUpgrade(t *testing.T) {
+	entered, cancelled := make(chan struct{}), make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		close(entered)
+		<-r.Context().Done()
+		close(cancelled)
+	}))
+	defer server.Close()
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	executor := NewCodexAutoExecutor(&config.Config{SDKConfig: sdkconfig.SDKConfig{ProxyURL: "direct"}})
+	done := make(chan error, 1)
+	go func() {
+		conn, response, errDial := executor.DialCodexLiveWebsocket(ctx, &auth.Auth{Provider: "codex", Metadata: map[string]any{"access_token": "fixture"}}, "ws"+strings.TrimPrefix(server.URL, "http"), nil, nil)
+		if conn != nil {
+			_ = conn.Close()
+		}
+		if response != nil && response.Body != nil {
+			_ = response.Body.Close()
+		}
+		done <- errDial
+	}()
+	<-entered
+	cancel()
+	select {
+	case errDial := <-done:
+		if !errors.Is(errDial, context.Canceled) {
+			t.Fatal("handshake lost the cancellation cause")
+		}
+	case <-time.After(time.Second):
+		server.CloseClientConnections()
+		<-done
+		t.Fatal("cancelled HTTP upgrade waited for the handshake timeout")
+	}
+	select {
+	case <-cancelled:
+	case <-time.After(time.Second):
+		t.Fatal("pending upstream HTTP connection was not closed")
 	}
 }

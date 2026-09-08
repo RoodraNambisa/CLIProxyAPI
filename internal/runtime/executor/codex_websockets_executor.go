@@ -1155,7 +1155,7 @@ func (e *CodexExecutor) DialCodexLiveWebsocket(ctx context.Context, auth *clipro
 			break
 		}
 	}
-	conn, resp, errDial := dialer.DialContext(ctx, target, req.Header)
+	conn, resp, errDial := helps.DialWebsocketHandshake(ctx, dialer, target, req.Header)
 	helps.ObserveUpstreamWebsocketDial(ctx, resp, errDial)
 	if conn != nil {
 		conn.EnableWriteCompression(false)
