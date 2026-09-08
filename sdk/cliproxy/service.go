@@ -4970,8 +4970,8 @@ func (s *Service) applyRuntimeConfigState(ctx context.Context, previousCfg, next
 		s.coreManager.SetOAuthModelAlias(nextCfg.OAuthModelAlias)
 	}
 	s.rebindExecutors()
-	if errLabels := s.refreshConfiguredModelDisplayNames(ctx, previousCfg, nextCfg); errLabels != nil {
-		return errLabels
+	if errCatalog := s.refreshConfiguredModelCatalog(ctx, previousCfg, nextCfg); errCatalog != nil {
+		return errCatalog
 	}
 	authModelExclusionsChanged := authModelExclusionsSignature(previousCfg) != authModelExclusionsSignature(nextCfg)
 	if s.coreManager != nil && !authModelExclusionsChanged && shouldRefreshChatGPTWebRegistrations(previousCfg, nextCfg) {

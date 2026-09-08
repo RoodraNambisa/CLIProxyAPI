@@ -645,6 +645,12 @@ nonstream-keepalive-interval: 0
 #       - "gemini-2.5-pro"
 
 # Codex API keys
+# All configured API key model lists accept optional catalog declarations:
+# display-name: human-readable label; blank inherits the existing catalog name.
+# max-context-length: integer from 0 to 2147483647; 0 or omission inherits the
+# upstream model's catalog window. Invalid values reject the configuration.
+# Changes apply to later catalog queries without retiring credentials or clearing
+# their cooldowns. These declarations do not increase actual upstream capacity.
 # API key entries also accept request-scoped-errors with the rule format above.
 # For OpenAI compatibility, put the rules on the provider entry.
 # codex-api-key:

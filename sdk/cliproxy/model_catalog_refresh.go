@@ -11,39 +11,40 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 )
 
-func appendModelDisplayNames[T modelEntry](out [][]string, family string, index int, models []T) [][]string {
+func appendModelCatalogOverrides[T modelEntry](out [][]string, family string, index int, models []T) [][]string {
 	for _, model := range models {
-		if label := strings.TrimSpace(model.GetDisplayName()); label != "" {
-			out = append(out, []string{family, strconv.Itoa(index), model.GetName(), model.GetAlias(), label})
+		label, limit := strings.TrimSpace(model.GetDisplayName()), model.GetMaxContextLength()
+		if label != "" || limit > 0 {
+			out = append(out, []string{family, strconv.Itoa(index), model.GetName(), model.GetAlias(), label, strconv.Itoa(limit)})
 		}
 	}
 	return out
 }
 
-// Catalog labels are excluded from credential routing hashes. Changing a label
+// Catalog declarations are excluded from credential routing hashes. Editing them
 // must not retire an in-flight credential or clear its availability state.
-func configuredModelDisplayNames(cfg *config.Config) [][]string {
+func configuredModelCatalogOverrides(cfg *config.Config) [][]string {
 	if cfg == nil {
 		return nil
 	}
 	var out [][]string
 	for i, entry := range cfg.GeminiKey {
-		out = appendModelDisplayNames(out, "gemini", i, entry.Models)
+		out = appendModelCatalogOverrides(out, "gemini", i, entry.Models)
 	}
 	for i, entry := range cfg.InteractionsKey {
-		out = appendModelDisplayNames(out, "interactions", i, entry.Models)
+		out = appendModelCatalogOverrides(out, "interactions", i, entry.Models)
 	}
 	for i, entry := range cfg.ClaudeKey {
-		out = appendModelDisplayNames(out, "claude", i, entry.Models)
+		out = appendModelCatalogOverrides(out, "claude", i, entry.Models)
 	}
 	for i, entry := range cfg.CodexKey {
-		out = appendModelDisplayNames(out, "codex", i, entry.Models)
+		out = appendModelCatalogOverrides(out, "codex", i, entry.Models)
 	}
 	for i, entry := range cfg.VertexCompatAPIKey {
-		out = appendModelDisplayNames(out, "vertex", i, entry.Models)
+		out = appendModelCatalogOverrides(out, "vertex", i, entry.Models)
 	}
 	for i, entry := range cfg.OpenAICompatibility {
-		out = appendModelDisplayNames(out, "openai", i, entry.Models)
+		out = appendModelCatalogOverrides(out, "openai", i, entry.Models)
 	}
 	providers := make([]string, 0, len(cfg.OAuthModelAlias))
 	for provider := range cfg.OAuthModelAlias {
@@ -60,8 +61,8 @@ func configuredModelDisplayNames(cfg *config.Config) [][]string {
 	return out
 }
 
-func (s *Service) refreshConfiguredModelDisplayNames(ctx context.Context, before, after *config.Config) error {
-	if s == nil || s.coreManager == nil || reflect.DeepEqual(configuredModelDisplayNames(before), configuredModelDisplayNames(after)) {
+func (s *Service) refreshConfiguredModelCatalog(ctx context.Context, before, after *config.Config) error {
+	if s == nil || s.coreManager == nil || reflect.DeepEqual(configuredModelCatalogOverrides(before), configuredModelCatalogOverrides(after)) {
 		return nil
 	}
 	for _, summary := range s.coreManager.ListMetadataSummaries("type", "provider_key", "compat_name") {
@@ -87,7 +88,7 @@ func (s *Service) refreshConfiguredModelDisplayNames(ctx context.Context, before
 			s.registerModelsForAuthPreservingState(installed)
 			return nil
 		}(); err != nil {
-			return fmt.Errorf("refresh model display labels: %w", err)
+			return fmt.Errorf("refresh model catalog overrides: %w", err)
 		}
 	}
 	return nil
