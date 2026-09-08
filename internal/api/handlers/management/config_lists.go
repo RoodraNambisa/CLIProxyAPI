@@ -144,14 +144,15 @@ func (h *Handler) PutGeminiKeys(c *gin.Context) {
 }
 func (h *Handler) PatchGeminiKey(c *gin.Context) {
 	type geminiKeyPatch struct {
-		Weight         credentialWeightPatch       `json:"weight"`
-		RequestRetry   credentialRequestRetryPatch `json:"request-retry"`
-		APIKey         *string                     `json:"api-key"`
-		Prefix         *string                     `json:"prefix"`
-		BaseURL        *string                     `json:"base-url"`
-		ProxyURL       *string                     `json:"proxy-url"`
-		Headers        *map[string]string          `json:"headers"`
-		ExcludedModels *[]string                   `json:"excluded-models"`
+		Weight              credentialWeightPatch       `json:"weight"`
+		RequestRetry        credentialRequestRetryPatch `json:"request-retry"`
+		RequestScopedErrors requestScopedErrorsPatch    `json:"request-scoped-errors"`
+		APIKey              *string                     `json:"api-key"`
+		Prefix              *string                     `json:"prefix"`
+		BaseURL             *string                     `json:"base-url"`
+		ProxyURL            *string                     `json:"proxy-url"`
+		Headers             *map[string]string          `json:"headers"`
+		ExcludedModels      *[]string                   `json:"excluded-models"`
 	}
 	var body struct {
 		Index *int            `json:"index"`
@@ -197,6 +198,9 @@ func (h *Handler) PatchGeminiKey(c *gin.Context) {
 	}
 	if body.Value.RequestRetry.set {
 		entry.RequestRetry = body.Value.RequestRetry.value
+	}
+	if body.Value.RequestScopedErrors.set {
+		entry.RequestScopedErrors = body.Value.RequestScopedErrors.value
 	}
 	if body.Value.APIKey != nil {
 		trimmed := strings.TrimSpace(*body.Value.APIKey)
@@ -342,16 +346,17 @@ func (h *Handler) PutInteractionsKeys(c *gin.Context) {
 
 func (h *Handler) PatchInteractionsKey(c *gin.Context) {
 	type geminiKeyPatch struct {
-		Weight         credentialWeightPatch       `json:"weight"`
-		RequestRetry   credentialRequestRetryPatch `json:"request-retry"`
-		APIKey         *string                     `json:"api-key"`
-		Priority       *int                        `json:"priority"`
-		Prefix         *string                     `json:"prefix"`
-		BaseURL        *string                     `json:"base-url"`
-		ProxyURL       *string                     `json:"proxy-url"`
-		Models         *[]config.GeminiModel       `json:"models"`
-		Headers        *map[string]string          `json:"headers"`
-		ExcludedModels *[]string                   `json:"excluded-models"`
+		Weight              credentialWeightPatch       `json:"weight"`
+		RequestRetry        credentialRequestRetryPatch `json:"request-retry"`
+		RequestScopedErrors requestScopedErrorsPatch    `json:"request-scoped-errors"`
+		APIKey              *string                     `json:"api-key"`
+		Priority            *int                        `json:"priority"`
+		Prefix              *string                     `json:"prefix"`
+		BaseURL             *string                     `json:"base-url"`
+		ProxyURL            *string                     `json:"proxy-url"`
+		Models              *[]config.GeminiModel       `json:"models"`
+		Headers             *map[string]string          `json:"headers"`
+		ExcludedModels      *[]string                   `json:"excluded-models"`
 	}
 	var body struct {
 		Index *int            `json:"index"`
@@ -397,6 +402,9 @@ func (h *Handler) PatchInteractionsKey(c *gin.Context) {
 	}
 	if body.Value.RequestRetry.set {
 		entry.RequestRetry = body.Value.RequestRetry.value
+	}
+	if body.Value.RequestScopedErrors.set {
+		entry.RequestScopedErrors = body.Value.RequestScopedErrors.value
 	}
 	if body.Value.APIKey != nil {
 		trimmed := strings.TrimSpace(*body.Value.APIKey)
@@ -549,15 +557,16 @@ func (h *Handler) PutClaudeKeys(c *gin.Context) {
 }
 func (h *Handler) PatchClaudeKey(c *gin.Context) {
 	type claudeKeyPatch struct {
-		Weight         credentialWeightPatch       `json:"weight"`
-		RequestRetry   credentialRequestRetryPatch `json:"request-retry"`
-		APIKey         *string                     `json:"api-key"`
-		Prefix         *string                     `json:"prefix"`
-		BaseURL        *string                     `json:"base-url"`
-		ProxyURL       *string                     `json:"proxy-url"`
-		Models         *[]config.ClaudeModel       `json:"models"`
-		Headers        *map[string]string          `json:"headers"`
-		ExcludedModels *[]string                   `json:"excluded-models"`
+		Weight              credentialWeightPatch       `json:"weight"`
+		RequestRetry        credentialRequestRetryPatch `json:"request-retry"`
+		RequestScopedErrors requestScopedErrorsPatch    `json:"request-scoped-errors"`
+		APIKey              *string                     `json:"api-key"`
+		Prefix              *string                     `json:"prefix"`
+		BaseURL             *string                     `json:"base-url"`
+		ProxyURL            *string                     `json:"proxy-url"`
+		Models              *[]config.ClaudeModel       `json:"models"`
+		Headers             *map[string]string          `json:"headers"`
+		ExcludedModels      *[]string                   `json:"excluded-models"`
 	}
 	var body struct {
 		Index *int            `json:"index"`
@@ -601,6 +610,9 @@ func (h *Handler) PatchClaudeKey(c *gin.Context) {
 	}
 	if body.Value.RequestRetry.set {
 		entry.RequestRetry = body.Value.RequestRetry.value
+	}
+	if body.Value.RequestScopedErrors.set {
+		entry.RequestScopedErrors = body.Value.RequestScopedErrors.value
 	}
 	if body.Value.APIKey != nil {
 		entry.APIKey = strings.TrimSpace(*body.Value.APIKey)
@@ -739,14 +751,15 @@ func (h *Handler) PutOpenAICompat(c *gin.Context) {
 }
 func (h *Handler) PatchOpenAICompat(c *gin.Context) {
 	type openAICompatPatch struct {
-		RequestRetry  credentialRequestRetryPatch         `json:"request-retry"`
-		Name          *string                             `json:"name"`
-		Prefix        *string                             `json:"prefix"`
-		Disabled      *bool                               `json:"disabled"`
-		BaseURL       *string                             `json:"base-url"`
-		APIKeyEntries *[]config.OpenAICompatibilityAPIKey `json:"api-key-entries"`
-		Models        *[]config.OpenAICompatibilityModel  `json:"models"`
-		Headers       *map[string]string                  `json:"headers"`
+		RequestRetry        credentialRequestRetryPatch         `json:"request-retry"`
+		RequestScopedErrors requestScopedErrorsPatch            `json:"request-scoped-errors"`
+		Name                *string                             `json:"name"`
+		Prefix              *string                             `json:"prefix"`
+		Disabled            *bool                               `json:"disabled"`
+		BaseURL             *string                             `json:"base-url"`
+		APIKeyEntries       *[]config.OpenAICompatibilityAPIKey `json:"api-key-entries"`
+		Models              *[]config.OpenAICompatibilityModel  `json:"models"`
+		Headers             *map[string]string                  `json:"headers"`
 	}
 	var body struct {
 		Name  *string            `json:"name"`
@@ -787,6 +800,9 @@ func (h *Handler) PatchOpenAICompat(c *gin.Context) {
 	entry := h.cfg.OpenAICompatibility[targetIndex]
 	if body.Value.RequestRetry.set {
 		entry.RequestRetry = body.Value.RequestRetry.value
+	}
+	if body.Value.RequestScopedErrors.set {
+		entry.RequestScopedErrors = body.Value.RequestScopedErrors.value
 	}
 	if body.Value.Name != nil {
 		entry.Name = strings.TrimSpace(*body.Value.Name)
@@ -928,15 +944,16 @@ func (h *Handler) PutVertexCompatKeys(c *gin.Context) {
 }
 func (h *Handler) PatchVertexCompatKey(c *gin.Context) {
 	type vertexCompatPatch struct {
-		Weight         credentialWeightPatch       `json:"weight"`
-		RequestRetry   credentialRequestRetryPatch `json:"request-retry"`
-		APIKey         *string                     `json:"api-key"`
-		Prefix         *string                     `json:"prefix"`
-		BaseURL        *string                     `json:"base-url"`
-		ProxyURL       *string                     `json:"proxy-url"`
-		Headers        *map[string]string          `json:"headers"`
-		Models         *[]config.VertexCompatModel `json:"models"`
-		ExcludedModels *[]string                   `json:"excluded-models"`
+		Weight              credentialWeightPatch       `json:"weight"`
+		RequestRetry        credentialRequestRetryPatch `json:"request-retry"`
+		RequestScopedErrors requestScopedErrorsPatch    `json:"request-scoped-errors"`
+		APIKey              *string                     `json:"api-key"`
+		Prefix              *string                     `json:"prefix"`
+		BaseURL             *string                     `json:"base-url"`
+		ProxyURL            *string                     `json:"proxy-url"`
+		Headers             *map[string]string          `json:"headers"`
+		Models              *[]config.VertexCompatModel `json:"models"`
+		ExcludedModels      *[]string                   `json:"excluded-models"`
 	}
 	var body struct {
 		Index *int               `json:"index"`
@@ -982,6 +999,9 @@ func (h *Handler) PatchVertexCompatKey(c *gin.Context) {
 	}
 	if body.Value.RequestRetry.set {
 		entry.RequestRetry = body.Value.RequestRetry.value
+	}
+	if body.Value.RequestScopedErrors.set {
+		entry.RequestScopedErrors = body.Value.RequestScopedErrors.value
 	}
 	if body.Value.APIKey != nil {
 		trimmed := strings.TrimSpace(*body.Value.APIKey)
@@ -1355,15 +1375,16 @@ func (h *Handler) PutCodexKeys(c *gin.Context) {
 }
 func (h *Handler) PatchCodexKey(c *gin.Context) {
 	type codexKeyPatch struct {
-		Weight         credentialWeightPatch       `json:"weight"`
-		RequestRetry   credentialRequestRetryPatch `json:"request-retry"`
-		APIKey         *string                     `json:"api-key"`
-		Prefix         *string                     `json:"prefix"`
-		BaseURL        *string                     `json:"base-url"`
-		ProxyURL       *string                     `json:"proxy-url"`
-		Models         *[]config.CodexModel        `json:"models"`
-		Headers        *map[string]string          `json:"headers"`
-		ExcludedModels *[]string                   `json:"excluded-models"`
+		Weight              credentialWeightPatch       `json:"weight"`
+		RequestRetry        credentialRequestRetryPatch `json:"request-retry"`
+		RequestScopedErrors requestScopedErrorsPatch    `json:"request-scoped-errors"`
+		APIKey              *string                     `json:"api-key"`
+		Prefix              *string                     `json:"prefix"`
+		BaseURL             *string                     `json:"base-url"`
+		ProxyURL            *string                     `json:"proxy-url"`
+		Models              *[]config.CodexModel        `json:"models"`
+		Headers             *map[string]string          `json:"headers"`
+		ExcludedModels      *[]string                   `json:"excluded-models"`
 	}
 	var body struct {
 		Index *int           `json:"index"`
@@ -1407,6 +1428,9 @@ func (h *Handler) PatchCodexKey(c *gin.Context) {
 	}
 	if body.Value.RequestRetry.set {
 		entry.RequestRetry = body.Value.RequestRetry.value
+	}
+	if body.Value.RequestScopedErrors.set {
+		entry.RequestScopedErrors = body.Value.RequestScopedErrors.value
 	}
 	if body.Value.APIKey != nil {
 		entry.APIKey = strings.TrimSpace(*body.Value.APIKey)

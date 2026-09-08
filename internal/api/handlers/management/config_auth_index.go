@@ -35,16 +35,17 @@ type openAICompatibilityAPIKeyWithAuthIndex struct {
 }
 
 type openAICompatibilityWithAuthIndex struct {
-	RequestRetry  *int                                     `json:"request-retry,omitempty"`
-	Name          string                                   `json:"name"`
-	Priority      int                                      `json:"priority,omitempty"`
-	Disabled      bool                                     `json:"disabled"`
-	Prefix        string                                   `json:"prefix,omitempty"`
-	BaseURL       string                                   `json:"base-url"`
-	APIKeyEntries []openAICompatibilityAPIKeyWithAuthIndex `json:"api-key-entries,omitempty"`
-	Models        []config.OpenAICompatibilityModel        `json:"models,omitempty"`
-	Headers       map[string]string                        `json:"headers,omitempty"`
-	AuthIndex     string                                   `json:"auth-index,omitempty"`
+	RequestScopedErrors []config.RequestScopedErrorRule          `json:"request-scoped-errors,omitempty"`
+	RequestRetry        *int                                     `json:"request-retry,omitempty"`
+	Name                string                                   `json:"name"`
+	Priority            int                                      `json:"priority,omitempty"`
+	Disabled            bool                                     `json:"disabled"`
+	Prefix              string                                   `json:"prefix,omitempty"`
+	BaseURL             string                                   `json:"base-url"`
+	APIKeyEntries       []openAICompatibilityAPIKeyWithAuthIndex `json:"api-key-entries,omitempty"`
+	Models              []config.OpenAICompatibilityModel        `json:"models,omitempty"`
+	Headers             map[string]string                        `json:"headers,omitempty"`
+	AuthIndex           string                                   `json:"auth-index,omitempty"`
 }
 
 func (h *Handler) liveAuthIndexByID() map[string]string {
@@ -223,15 +224,16 @@ func (h *Handler) openAICompatibilityWithAuthIndex() []openAICompatibilityWithAu
 		idKind := fmt.Sprintf("openai-compatibility:%s", providerName)
 
 		response := openAICompatibilityWithAuthIndex{
-			RequestRetry: entry.RequestRetry,
-			Name:         entry.Name,
-			Priority:     entry.Priority,
-			Disabled:     entry.Disabled,
-			Prefix:       entry.Prefix,
-			BaseURL:      entry.BaseURL,
-			Models:       entry.Models,
-			Headers:      entry.Headers,
-			AuthIndex:    "",
+			RequestRetry:        entry.RequestRetry,
+			RequestScopedErrors: entry.RequestScopedErrors,
+			Name:                entry.Name,
+			Priority:            entry.Priority,
+			Disabled:            entry.Disabled,
+			Prefix:              entry.Prefix,
+			BaseURL:             entry.BaseURL,
+			Models:              entry.Models,
+			Headers:             entry.Headers,
+			AuthIndex:           "",
 		}
 		if len(entry.APIKeyEntries) == 0 {
 			if !entry.Disabled {
