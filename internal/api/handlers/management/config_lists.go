@@ -152,6 +152,7 @@ func (h *Handler) PatchGeminiKey(c *gin.Context) {
 		BaseURL             *string                     `json:"base-url"`
 		ProxyURL            *string                     `json:"proxy-url"`
 		Headers             *map[string]string          `json:"headers"`
+		Models              *[]config.GeminiModel       `json:"models"`
 		ExcludedModels      *[]string                   `json:"excluded-models"`
 	}
 	var body struct {
@@ -233,6 +234,9 @@ func (h *Handler) PatchGeminiKey(c *gin.Context) {
 	}
 	if body.Value.ExcludedModels != nil {
 		entry.ExcludedModels = config.NormalizeExcludedModels(*body.Value.ExcludedModels)
+	}
+	if body.Value.Models != nil {
+		entry.Models = append([]config.GeminiModel(nil), (*body.Value.Models)...)
 	}
 	h.cfg.GeminiKey[targetIndex] = entry
 	h.cfg.SanitizeGeminiKeys()
