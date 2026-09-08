@@ -103,3 +103,35 @@ func TestCodexClientContextOverrideThroughHTTPModels(t *testing.T) {
 		}
 	}
 }
+
+func TestCodexClientInheritsGoogleTokenLimitsThroughHTTP(t *testing.T) {
+	r := registry.GetGlobalRegistry()
+	const client = "google-token-limits-http"
+	var models []*registry.ModelInfo
+	for _, id := range []string{"gemini-token-limit-fixture", "tenant/google-token-alias"} {
+		models = append(models, &registry.ModelInfo{ID: id, UpstreamID: "gemini-2.5-pro", InputTokenLimit: 1048576, OutputTokenLimit: 65536})
+	}
+	r.RegisterClient(client, "gemini", models)
+	t.Cleanup(func() { r.UnregisterClient(client) })
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodGet, "/v1/models?client_version=0.153.4", nil)
+	(&OpenAIAPIHandler{}).OpenAIModels(c)
+	var payload codexClientModelsPayload
+	if err := json.Unmarshal(w.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	found := 0
+	for _, model := range payload.Models {
+		if model["slug"] != "gemini-token-limit-fixture" && model["slug"] != "tenant/google-token-alias" {
+			continue
+		}
+		found++
+		if intModelValue(model, "context_window") != 1048576 || intModelValue(model, "max_context_window") != 1048576 || intModelValue(model, "max_tokens") != 65536 {
+			t.Fatal("Google token limits were replaced by a Codex fallback template")
+		}
+	}
+	if found != 2 {
+		t.Fatal("native or prefixed Google model missing")
+	}
+}

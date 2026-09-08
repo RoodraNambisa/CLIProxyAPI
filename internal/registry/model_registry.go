@@ -1293,14 +1293,22 @@ func (r *ModelRegistry) convertModelToMap(model *ModelInfo, handlerType string) 
 		if model.Description != "" {
 			result["description"] = model.Description
 		}
-		if model.ContextLength > 0 {
-			result["context_length"] = model.ContextLength
+		contextLength := model.ContextLength
+		if contextLength <= 0 {
+			contextLength = model.InputTokenLimit
+		}
+		if contextLength > 0 {
+			result["context_length"] = contextLength
 		}
 		if model.MaxContextLength > 0 {
 			result["max_context_length"] = model.MaxContextLength
 		}
-		if model.MaxCompletionTokens > 0 {
-			result["max_completion_tokens"] = model.MaxCompletionTokens
+		maxCompletionTokens := model.MaxCompletionTokens
+		if maxCompletionTokens <= 0 {
+			maxCompletionTokens = model.OutputTokenLimit
+		}
+		if maxCompletionTokens > 0 {
+			result["max_completion_tokens"] = maxCompletionTokens
 		}
 		if len(model.SupportedParameters) > 0 {
 			result["supported_parameters"] = append([]string(nil), model.SupportedParameters...)
