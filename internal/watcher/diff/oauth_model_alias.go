@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
@@ -79,7 +80,7 @@ func summarizeOAuthModelAliasList(list []config.OAuthModelAlias) OAuthModelAlias
 		if name == "" || aliasVal == "" {
 			continue
 		}
-		key := name + "->" + aliasVal
+		key := name + "->" + aliasVal + "|" + strconv.Quote(strings.TrimSpace(alias.DisplayName))
 		if alias.Fork {
 			key += "|fork"
 		}

@@ -72,6 +72,8 @@ func describeOpenAICompatibilityUpdate(oldEntry, newEntry config.OpenAICompatibi
 	}
 	if oldModelCount != newModelCount {
 		details = append(details, fmt.Sprintf("models %d -> %d", oldModelCount, newModelCount))
+	} else if !reflect.DeepEqual(oldEntry.Models, newEntry.Models) {
+		details = append(details, "models updated")
 	}
 	if oldEntry.Disabled != newEntry.Disabled {
 		details = append(details, fmt.Sprintf("disabled %t -> %t", oldEntry.Disabled, newEntry.Disabled))
