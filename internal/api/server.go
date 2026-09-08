@@ -492,6 +492,7 @@ func (s *Server) setupRoutes() {
 	claudeCodeHandlers := claude.NewClaudeCodeAPIHandler(s.handlers)
 	openaiResponsesHandlers := openai.NewOpenAIResponsesAPIHandler(s.handlers)
 	openaiImagesHandlers := openai.NewOpenAIImagesAPIHandler(s.handlers)
+	codexSearchHandlers := handlers.NewCodexAlphaSearchAPIHandler(s.handlers)
 
 	// OpenAI compatible API routes
 	v1 := s.engine.Group("/v1")
@@ -508,6 +509,7 @@ func (s *Server) setupRoutes() {
 		v1.GET("/responses", openaiResponsesHandlers.ResponsesWebsocket)
 		v1.POST("/responses", openaiResponsesHandlers.Responses)
 		v1.POST("/responses/compact", openaiResponsesHandlers.Compact)
+		v1.POST("/alpha/search", codexSearchHandlers.Search)
 		v1.POST("/images/generations", openaiImagesHandlers.Generations)
 		v1.POST("/images/edits", openaiImagesHandlers.Edits)
 		v1.POST("/videos", openaiHandlers.XAIVideosGenerations)
@@ -516,6 +518,9 @@ func (s *Server) setupRoutes() {
 		v1.POST("/videos/extensions", openaiHandlers.XAIVideosExtensions)
 		v1.GET("/videos/:request_id", openaiHandlers.XAIVideosRetrieve)
 	}
+
+	// Codex CLI search alias uses the same authentication and request policies.
+	s.engine.POST("/backend-api/codex/alpha/search", AuthMiddleware(s.accessManager), s.proxyReadinessMiddleware(), s.requestBodyAuditMiddleware(), codexSearchHandlers.Search)
 
 	// Gemini compatible API routes
 	v1beta := s.engine.Group("/v1beta")

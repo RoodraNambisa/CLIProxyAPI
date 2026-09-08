@@ -164,7 +164,8 @@ func shouldAuditRequestBody(req *http.Request) bool {
 	}
 	path := req.URL.Path
 	return strings.HasPrefix(path, "/v1/") ||
-		strings.HasPrefix(path, "/v1beta/")
+		strings.HasPrefix(path, "/v1beta/") ||
+		path == "/backend-api/codex/alpha/search"
 }
 
 func readAuditRequestBody(req *http.Request, maxBodyBytes int64) ([]byte, bool, error) {
