@@ -5764,7 +5764,8 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 				authErr = errExec
 				break
 			}
-			if errExec != nil && requestBodyReplayable(execCtx, opts) {
+			action, matchedAction := m.matchRequestScopedErrorAction(execCtx, auth, opts, errExec)
+			if !matchedAction && errExec != nil && requestBodyReplayable(execCtx, opts) {
 				refreshed, attemptedRefresh, errRefresh := m.tryRefreshAfterUnauthorized(execCtx, executor, auth, errExec, didRefreshOnUnauthorized)
 				if attemptedRefresh {
 					didRefreshOnUnauthorized = true
@@ -5835,8 +5836,15 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			if ra := retryAfterFromError(errExec); ra != nil {
 				result.RetryAfter = ra
 			}
+			if !matchedAction {
+				action, matchedAction = m.matchRequestScopedErrorAction(execCtx, auth, opts, errExec)
+			}
+			applyRequestScopedActionToResult(action, matchedAction, &result)
 			if !skipAuthResultForError(errExec) {
 				m.markExecutionResult(execCtx, result)
+			}
+			if matchedAction && (action == internalconfig.RequestScopedActionStop || action == internalconfig.RequestScopedActionStopAndCooldown) {
+				return cliproxyexecutor.Response{}, withAuthErrorResponseSource(&requestScopedActionError{error: errExec, action: action}, auth, provider)
 			}
 			triggerChatGPTWebUnauthorizedRequestRefresh(errExec)
 			if isResponsesCompactRequestFaultError(opts, errExec) || m.isRequestInvalidError(errExec, ctx) {
@@ -6032,7 +6040,8 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 			if errCtx := execCtx.Err(); errCtx != nil {
 				return cliproxyexecutor.Response{}, withAuthErrorResponseSource(errCtx, auth, provider)
 			}
-			if errExec != nil && requestBodyReplayable(execCtx, opts) {
+			action, matchedAction := m.matchRequestScopedErrorAction(execCtx, auth, opts, errExec)
+			if !matchedAction && errExec != nil && requestBodyReplayable(execCtx, opts) {
 				refreshed, attemptedRefresh, errRefresh := m.tryRefreshAfterUnauthorized(execCtx, executor, auth, errExec, didRefreshOnUnauthorized)
 				if attemptedRefresh {
 					didRefreshOnUnauthorized = true
@@ -6098,8 +6107,15 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 			if ra := retryAfterFromError(errExec); ra != nil {
 				result.RetryAfter = ra
 			}
+			if !matchedAction {
+				action, matchedAction = m.matchRequestScopedErrorAction(execCtx, auth, opts, errExec)
+			}
+			applyRequestScopedActionToResult(action, matchedAction, &result)
 			if !skipAuthResultForError(errExec) {
 				m.markExecutionResult(execCtx, result)
+			}
+			if matchedAction && (action == internalconfig.RequestScopedActionStop || action == internalconfig.RequestScopedActionStopAndCooldown) {
+				return cliproxyexecutor.Response{}, withAuthErrorResponseSource(&requestScopedActionError{error: errExec, action: action}, auth, provider)
 			}
 			triggerChatGPTWebUnauthorizedRequestRefresh(errExec)
 			if m.isRequestInvalidError(errExec, ctx) {
