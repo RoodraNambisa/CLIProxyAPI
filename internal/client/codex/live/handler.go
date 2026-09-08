@@ -1,0 +1,152 @@
+package live
+
+import (
+	"context"
+	"errors"
+	"net/http"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/gin-gonic/gin"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v6/sdk/api/handlers"
+	"github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
+	"github.com/router-for-me/CLIProxyAPI/v6/sdk/translator"
+)
+
+type handlerRuntime struct {
+	base      *handlers.BaseAPIHandler
+	keepalive time.Duration
+}
+
+// Handler owns native realtime admission and process lifetime independently
+// from the Responses executor's connection and conversation caches.
+type Handler struct {
+	manager  *auth.Manager
+	gate     admissionGate
+	runtime  atomic.Pointer[handlerRuntime]
+	updateMu sync.Mutex
+	closed   bool
+	root     context.Context
+	shutdown context.CancelFunc
+}
+
+func NewHandler(cfg *config.Config, manager *auth.Manager) *Handler {
+	ctx, cancel := context.WithCancel(context.Background())
+	h := &Handler{manager: manager, root: ctx, shutdown: cancel}
+	h.UpdateConfig(cfg)
+	return h
+}
+
+func (*Handler) HandlerType() string      { return translator.FormatCodexLive.String() }
+func (*Handler) Models() []map[string]any { return nil }
+
+// UpdateConfig publishes immutable request settings and changes new admission.
+// Existing committed sessions retain their settings and independent context.
+func (h *Handler) UpdateConfig(cfg *config.Config) {
+	if cfg == nil {
+		cfg = &config.Config{}
+	}
+	h.updateMu.Lock()
+	defer h.updateMu.Unlock()
+	if h.closed {
+		return
+	}
+	h.runtime.Store(&handlerRuntime{base: handlers.NewBaseAPIHandlers(&cfg.SDKConfig, h.manager), keepalive: handlers.StreamingKeepAliveInterval(&cfg.SDKConfig)})
+	h.gate.update(cfg.Codex.LiveEnabled)
+}
+
+// Close rejects new work and cancels all process-owned realtime sessions.
+func (h *Handler) Close() {
+	if h == nil {
+		return
+	}
+	h.updateMu.Lock()
+	defer h.updateMu.Unlock()
+	if h.closed {
+		return
+	}
+	h.closed = true
+	h.gate.update(false)
+	h.shutdown()
+}
+
+type liveRequest struct {
+	*handlerRuntime
+	ctx       context.Context
+	admission *liveAdmission
+	stopSetup func() bool
+	finish    func()
+}
+
+// begin requires an authenticated caller even when legacy API authentication
+// permits anonymous requests. Ownership cannot be assigned to ambient cookies.
+func (h *Handler) begin(c *gin.Context) *liveRequest {
+	if h == nil || h.runtime.Load() == nil {
+		writeRealtimeError(c, http.StatusServiceUnavailable, "Codex realtime is unavailable", "server_error", "codex_live_unavailable")
+		return nil
+	}
+	if strings.TrimSpace(c.GetString("apiKey")) == "" {
+		writeRealtimeError(c, http.StatusUnauthorized, "Realtime requires an authenticated API caller", "authentication_error", "realtime_auth_required")
+		return nil
+	}
+	runtime := h.runtime.Load()
+	ctx, cancelRequest := runtime.base.GetContextWithCancel(h, c, c.Request.Context())
+	if denied := runtime.base.ValidateProviderAccess(ctx, "codex"); denied != nil {
+		runtime.base.WriteErrorResponse(c, denied)
+		cancelRequest()
+		return nil
+	}
+	admission, errBegin := h.gate.begin(ctx)
+	if errBegin != nil {
+		if errors.Is(errBegin, errLiveDisabled) {
+			writeRealtimeError(c, http.StatusServiceUnavailable, errLiveDisabled.Error(), "server_error", liveDisabledCode)
+		} else {
+			status := 499
+			if errors.Is(errBegin, context.DeadlineExceeded) {
+				status = http.StatusRequestTimeout
+			}
+			writeRealtimeError(c, status, "Realtime request was cancelled", "invalid_request_error", "realtime_request_cancelled")
+		}
+		cancelRequest()
+		return nil
+	}
+	sessionCtx, cancelSession := context.WithCancelCause(ctx)
+	stopSetup := context.AfterFunc(admission.ctx, func() { cancelSession(context.Cause(admission.ctx)) })
+	stopRoot := context.AfterFunc(h.root, func() { cancelSession(context.Cause(h.root)) })
+	request := &liveRequest{handlerRuntime: runtime, ctx: sessionCtx, admission: admission, stopSetup: stopSetup}
+	request.finish = func() {
+		stopSetup()
+		stopRoot()
+		admission.close()
+		cancelSession(nil)
+		cancelRequest()
+	}
+	return request
+}
+
+func (r *liveRequest) active() error {
+	if errCtx := context.Cause(r.admission.ctx); errCtx != nil {
+		return errCtx
+	}
+	return context.Cause(r.ctx)
+}
+
+// commit detaches setup cancellation before releasing admission bookkeeping.
+func (r *liveRequest) commit() error {
+	if errCtx := context.Cause(r.ctx); errCtx != nil {
+		return errCtx
+	}
+	if errCommit := r.admission.commit(); errCommit != nil {
+		return errCommit
+	}
+	r.stopSetup()
+	r.admission.close()
+	return nil
+}
+
+func writeRealtimeError(c *gin.Context, status int, message, kind, code string) {
+	c.JSON(status, gin.H{"error": gin.H{"message": message, "type": kind, "code": code}})
+}

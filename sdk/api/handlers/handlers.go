@@ -406,6 +406,12 @@ func chatGPTWebStrictImageSizeUnavailableError(ctx context.Context, err error) *
 	}
 }
 
+// ValidateProviderAccess checks a native endpoint without resolving a Responses model.
+func (h *BaseAPIHandler) ValidateProviderAccess(ctx context.Context, provider string) *interfaces.ErrorMessage {
+	_, denied := restrictExecutionProviders(ctx, []string{provider})
+	return denied
+}
+
 // ValidateModelProviderAccess checks a model route without selecting or executing an auth.
 func (h *BaseAPIHandler) ValidateModelProviderAccess(ctx context.Context, handlerType, modelName string) *interfaces.ErrorMessage {
 	if _, restricted := allowedProviderSetFromContext(ctx); !restricted {
