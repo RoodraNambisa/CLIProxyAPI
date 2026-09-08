@@ -254,6 +254,9 @@ func (s *codexWebsocketSession) notifyUpstreamDisconnect(err error) {
 }
 
 func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (resp cliproxyexecutor.Response, err error) {
+	if opts.SourceFormat == sdktranslator.FormatCodexLive {
+		return resp, helps.CodexLiveNativeRouteError{}
+	}
 	if opts.SourceFormat == sdktranslator.FormatCodexAlphaSearch {
 		return resp, statusErr{code: http.StatusNotImplemented, msg: "Codex search does not support WebSocket transport", skipAuthResult: true}
 	}
@@ -595,6 +598,9 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 }
 
 func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (_ *cliproxyexecutor.StreamResult, err error) {
+	if opts.SourceFormat == sdktranslator.FormatCodexLive {
+		return nil, helps.CodexLiveNativeRouteError{}
+	}
 	if opts.SourceFormat == sdktranslator.FormatCodexAlphaSearch {
 		return nil, statusErr{code: http.StatusNotImplemented, msg: "Codex search does not support streaming", skipAuthResult: true}
 	}

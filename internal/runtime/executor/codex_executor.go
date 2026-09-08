@@ -341,6 +341,9 @@ type codexPreparedSessionIdentity struct {
 // PrepareProviderRequest creates one immutable identity fallback shared by all
 // credential retries and transport fallbacks for the logical request.
 func (e *CodexExecutor) PrepareProviderRequest(ctx context.Context, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, operation cliproxyexecutor.RequestOperation) (any, error) {
+	if opts.SourceFormat == sdktranslator.FormatCodexLive {
+		return nil, cliproxyexecutor.NewGlobalProviderRequestPreparationError(helps.CodexLiveNativeRouteError{})
+	}
 	if opts.SourceFormat == sdktranslator.FormatCodexAlphaSearch {
 		if operation != cliproxyexecutor.RequestOperationExecute || opts.Stream {
 			return nil, cliproxyexecutor.NewGlobalProviderRequestPreparationError(statusErr{code: http.StatusNotImplemented, msg: "Codex search supports non-streaming HTTP requests only", skipAuthResult: true})
@@ -792,6 +795,9 @@ func (e *CodexExecutor) HttpRequest(ctx context.Context, auth *cliproxyauth.Auth
 }
 
 func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (resp cliproxyexecutor.Response, err error) {
+	if opts.SourceFormat == sdktranslator.FormatCodexLive {
+		return resp, helps.CodexLiveNativeRouteError{}
+	}
 	if opts.SourceFormat == sdktranslator.FormatCodexAlphaSearch {
 		return e.executeAlphaSearch(ctx, auth, req, opts)
 	}
@@ -1141,6 +1147,9 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 }
 
 func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (_ *cliproxyexecutor.StreamResult, err error) {
+	if opts.SourceFormat == sdktranslator.FormatCodexLive {
+		return nil, helps.CodexLiveNativeRouteError{}
+	}
 	if opts.SourceFormat == sdktranslator.FormatCodexAlphaSearch {
 		return nil, statusErr{code: http.StatusNotImplemented, msg: "Codex search does not support streaming", skipAuthResult: true}
 	}
@@ -1607,6 +1616,9 @@ func normalizeCodexSSEPassThroughLine(line []byte) []byte {
 }
 
 func (e *CodexExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	if opts.SourceFormat == sdktranslator.FormatCodexLive {
+		return cliproxyexecutor.Response{}, helps.CodexLiveNativeRouteError{}
+	}
 	if opts.SourceFormat == sdktranslator.FormatCodexAlphaSearch {
 		return cliproxyexecutor.Response{}, statusErr{code: http.StatusNotImplemented, msg: "Codex search does not support token counting", skipAuthResult: true}
 	}
