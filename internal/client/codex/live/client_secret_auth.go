@@ -8,6 +8,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
+	sdkaccess "github.com/router-for-me/CLIProxyAPI/v6/sdk/access"
 )
 
 // AuthenticateClientSecret checks only local credentials. Callers should try
@@ -31,6 +32,29 @@ func (h *Handler) AuthenticateClientSecret(request *http.Request) (ClientSecretA
 	}
 	authorization, errAuth := h.clientSecrets.authenticate(token)
 	return authorization, true, errAuth
+}
+
+// ApplyClientSecretAuthorization installs only local scope, never the token.
+// New requests and their final admission commit will validate the grant again.
+func (h *Handler) ApplyClientSecretAuthorization(c *gin.Context, authorization ClientSecretAuthorization) bool {
+	if h == nil || h.clientSecrets == nil || !h.clientSecrets.valid(authorization) {
+		h.WriteClientSecretError(c, errInvalidClientSecret)
+		return false
+	}
+	c.Set(clientSecretContextKey, authorization.clone())
+	c.Set("apiKey", authorization.principal)
+	c.Set("accessProvider", "codex-live-client-secret")
+	c.Set("accessMetadata", map[string]string{sdkaccess.MetadataAllowedProviders: "codex"})
+	return true
+}
+
+func clientSecretAuthorization(c *gin.Context) (ClientSecretAuthorization, bool) {
+	value, exists := c.Get(clientSecretContextKey)
+	if !exists {
+		return ClientSecretAuthorization{}, false
+	}
+	a, ok := value.(ClientSecretAuthorization)
+	return a, ok
 }
 
 func realtimeClientSecretToken(request *http.Request) (string, bool, error) {

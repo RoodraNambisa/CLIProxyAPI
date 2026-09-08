@@ -89,6 +89,7 @@ type liveRequest struct {
 	admission *liveAdmission
 	stopSetup func() bool
 	finish    func()
+	validate  func() error
 }
 
 // begin requires an authenticated caller even when legacy API authentication
@@ -108,6 +109,21 @@ func (h *Handler) beginRequest(c *gin.Context, newSession bool) *liveRequest {
 	}
 	runtime := h.runtime.Load()
 	ctx, cancelRequest := runtime.base.GetContextWithCancel(h, c, c.Request.Context())
+	var validateGrant func() error
+	if value, present := c.Get(clientSecretContextKey); present {
+		grant, validType := value.(ClientSecretAuthorization)
+		if !newSession || !validType || !h.clientSecrets.valid(grant) {
+			h.WriteClientSecretError(c, errInvalidClientSecret)
+			cancelRequest()
+			return nil
+		}
+		validateGrant = func() error {
+			if !h.clientSecrets.valid(grant) {
+				return errInvalidClientSecret
+			}
+			return nil
+		}
+	}
 	if !newSession {
 		// Authenticated cleanup checks stored ownership in the handler. It must
 		// remain possible after new admission or provider access is disabled.
@@ -144,7 +160,7 @@ func (h *Handler) beginRequest(c *gin.Context, newSession bool) *liveRequest {
 	sessionCtx, cancelSession := context.WithCancelCause(ctx)
 	stopSetup := context.AfterFunc(admission.ctx, func() { cancelSession(context.Cause(admission.ctx)) })
 	stopRoot := context.AfterFunc(h.root, func() { cancelSession(context.Cause(h.root)) })
-	request := &liveRequest{handlerRuntime: runtime, ctx: sessionCtx, admission: admission, stopSetup: stopSetup}
+	request := &liveRequest{handlerRuntime: runtime, ctx: sessionCtx, admission: admission, stopSetup: stopSetup, validate: validateGrant}
 	request.finish = func() {
 		stopSetup()
 		stopRoot()
@@ -161,7 +177,13 @@ func (r *liveRequest) active() error {
 			return errCtx
 		}
 	}
-	return context.Cause(r.ctx)
+	if errCtx := context.Cause(r.ctx); errCtx != nil {
+		return errCtx
+	}
+	if r.validate != nil {
+		return r.validate()
+	}
+	return nil
 }
 
 // commit detaches setup cancellation before releasing admission bookkeeping.
@@ -173,7 +195,17 @@ func (r *liveRequest) commitWith(publish func() error) error {
 	if errCtx := context.Cause(r.ctx); errCtx != nil {
 		return errCtx
 	}
-	if errCommit := r.admission.commitWith(publish); errCommit != nil {
+	if errCommit := r.admission.commitWith(func() error {
+		if r.validate != nil {
+			if errValidate := r.validate(); errValidate != nil {
+				return errValidate
+			}
+		}
+		if publish != nil {
+			return publish()
+		}
+		return nil
+	}); errCommit != nil {
 		return errCommit
 	}
 	r.stopSetup()

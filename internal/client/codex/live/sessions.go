@@ -30,6 +30,9 @@ func requestCallOwner(c *gin.Context) (callOwner, bool) {
 	if c == nil || strings.TrimSpace(c.GetString("apiKey")) == "" {
 		return callOwner{}, false
 	}
+	if grant, temporary := clientSecretAuthorization(c); temporary {
+		return grant.owner, grant.owner != (callOwner{})
+	}
 	// Store only an ownership digest, never a caller's key or the Gin context.
 	identity, _ := json.Marshal([]string{"codex-live-owner-v1", c.GetString("accessProvider"), c.GetString("apiKey")})
 	return sha256.Sum256(identity), true

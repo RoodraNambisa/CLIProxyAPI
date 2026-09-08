@@ -30,6 +30,10 @@ func (r *liveRequest) fail(c *gin.Context, cause error, lease *auth.CodexLiveLea
 		writeRealtimeError(c, http.StatusServiceUnavailable, errLiveDisabled.Error(), "server_error", liveDisabledCode)
 		return
 	}
+	if errors.Is(cause, errInvalidClientSecret) {
+		writeRealtimeError(c, http.StatusUnauthorized, errInvalidClientSecret.Error(), "authentication_error", "invalid_realtime_client_secret")
+		return
+	}
 	if errors.Is(cause, context.Canceled) || errors.Is(cause, context.DeadlineExceeded) {
 		status, message, kind, code, body = 499, "Realtime request was cancelled", "invalid_request_error", "realtime_request_cancelled", nil
 		if errors.Is(cause, context.DeadlineExceeded) {
