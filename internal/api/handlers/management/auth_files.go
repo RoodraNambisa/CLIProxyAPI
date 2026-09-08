@@ -3054,6 +3054,9 @@ func (h *Handler) buildAuthFromFileData(path string, data []byte) (*coreauth.Aut
 	if errWeight := credentialweight.ValidateMetadataJSON(data); errWeight != nil {
 		return nil, fmt.Errorf("%w: %v", errInvalidAuthFileData, errWeight)
 	}
+	if errRules := coreauth.ValidateAuthRequestScopedErrors(&coreauth.Auth{Metadata: metadata}); errRules != nil {
+		return nil, fmt.Errorf("%w: %v", errInvalidAuthFileData, errRules)
+	}
 	provider, _ := metadata["type"].(string)
 	if provider == "" {
 		provider = "unknown"
