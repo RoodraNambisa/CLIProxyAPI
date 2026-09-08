@@ -545,6 +545,8 @@ type CodexHeaderDefaults struct {
 type CodexConfig struct {
 	// LiveEnabled admits new realtime sessions, credentials and connections.
 	LiveEnabled bool `yaml:"live-enabled" json:"live-enabled"`
+	// LiveMediaRelay controls in-process WebRTC media forwarding independently of admission.
+	LiveMediaRelay CodexLiveMediaRelayConfig `yaml:"live-media-relay" json:"live-media-relay"`
 	// OptimizeMultiAgentV2 prepares collaboration tools for official Codex clients.
 	OptimizeMultiAgentV2 bool `yaml:"optimize-multi-agent-v2" json:"optimize-multi-agent-v2"`
 	// OrphanDelegationCompatibility repairs known orphan app delegation results in subagents.
@@ -2240,6 +2242,9 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	if errLive := validateCodexLiveEnabledYAML(data); errLive != nil {
 		return nil, errLive
 	}
+	if errMedia := validateCodexLiveMediaYAML(data); errMedia != nil {
+		return nil, errMedia
+	}
 	if err = yaml.Unmarshal(data, &cfg); err != nil {
 		if optional {
 			if accountInfoErr := validateChatGPTWebAccountInfoYAML(data); accountInfoErr != nil {
@@ -3929,6 +3934,9 @@ func SaveConfigPreserveComments(configFile string, cfg *Config) error {
 	}
 	if errModels := cfg.ValidateModelContextLengths(); errModels != nil {
 		return errModels
+	}
+	if errMedia := cfg.Codex.LiveMediaRelay.Validate(); errMedia != nil {
+		return errMedia
 	}
 	persistCfg := *cfg
 	groups, errNormalizeGroups := NormalizeAPIKeyGroups(persistCfg.APIKeyGroups, persistCfg.APIKeys)

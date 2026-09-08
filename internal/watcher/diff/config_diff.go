@@ -310,6 +310,9 @@ func BuildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 	if oldCfg.Codex.LiveEnabled != newCfg.Codex.LiveEnabled {
 		changes = append(changes, fmt.Sprintf("codex.live-enabled: %t -> %t", oldCfg.Codex.LiveEnabled, newCfg.Codex.LiveEnabled))
 	}
+	if !reflect.DeepEqual(oldCfg.Codex.LiveMediaRelay, newCfg.Codex.LiveMediaRelay) {
+		changes = append(changes, "codex.live-media-relay: updated")
+	}
 	if oldCfg.Codex.OptimizeMultiAgentV2 != newCfg.Codex.OptimizeMultiAgentV2 {
 		changes = append(changes, fmt.Sprintf("codex.optimize-multi-agent-v2: %t -> %t", oldCfg.Codex.OptimizeMultiAgentV2, newCfg.Codex.OptimizeMultiAgentV2))
 	}

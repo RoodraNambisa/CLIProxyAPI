@@ -744,6 +744,22 @@ nonstream-keepalive-interval: 0
 #   # Disabling blocks new sessions, client secrets and connections, cancels pending setup,
 #   # and keeps established sessions and authenticated hangup/cleanup available.
 #   live-enabled: false
+#   # WebRTC media relay only; new sessions still require live-enabled.
+#   # Changes apply to new sessions; established sessions retain their configuration.
+#   live-media-relay:
+#     enabled: false
+#     # 0 inherits 32; otherwise 1..2147483647. Invalid values reject config saves.
+#     max-sessions: 32
+#     # Keep private downstream candidates usable for LAN clients by default.
+#     disable-private-remote-ips: false
+#     public-ip: "" # Optional advertised IP; no public address is inferred.
+#     # Both 0 use OS allocation. Otherwise 1..65535, min <= max,
+#     # with at least two ports per configured session.
+#     udp-port-min: 0
+#     udp-port-max: 0
+#     # Optional STUN/TURN URLs; TURN entries require username and credential.
+#     # These secrets are retained in YAML and omitted from config JSON responses.
+#     ice-servers: []
 #   identity-confuse: false
 #   # Preserve explicit non-empty string prompt_cache_key values across identity remapping.
 #   # Defaults to false. Missing/invalid keys keep existing generation behavior.

@@ -32,6 +32,19 @@ func TestCodexLiveEnabledConfigChangeDetails(t *testing.T) {
 	}
 }
 
+func TestCodexLiveMediaChangesDoNotExposeICECredentials(t *testing.T) {
+	oldCfg, newCfg := &config.Config{}, &config.Config{Codex: config.CodexConfig{LiveMediaRelay: config.CodexLiveMediaRelayConfig{
+		ICEServers: []config.CodexLiveICEServer{{URLs: []string{"turn:private.invalid"}, Username: "user-fixture", Credential: "secret-fixture"}},
+	}}}
+	changes := BuildConfigChangeDetails(oldCfg, newCfg)
+	if len(changes) != 1 || changes[0] != "codex.live-media-relay: updated" {
+		t.Fatal("media update did not produce safe change details")
+	}
+	if changes := BuildConfigChangeDetails(newCfg, newCfg); len(changes) != 0 {
+		t.Fatal("unchanged media config produced change details")
+	}
+}
+
 func TestBuildConfigChangeDetails(t *testing.T) {
 	oldCfg := &config.Config{
 		Port:    8080,
