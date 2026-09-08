@@ -83,9 +83,20 @@ func (r *ModelRegistry) GetModelCatalogForProviders(handlerType string, allowedP
 			}
 		}
 		if selected != "" {
-			if model := r.convertModelToMap(registration.InfoByProvider[selected], handlerType); model != nil {
+			info := registration.InfoByProvider[selected]
+			// Keep the original catalog record when its provider remains in scope.
+			if registration.Info != nil {
+				owner := r.clientProviders[registration.infoClientID]
+				for _, provider := range providers {
+					if provider == owner {
+						info = registration.Info
+						break
+					}
+				}
+			}
+			if model := r.convertModelToMap(info, handlerType); model != nil {
 				catalog.Models = append(catalog.Models, model)
-				catalog.Metadata[id] = cloneModelInfo(registration.InfoByProvider[selected])
+				catalog.Metadata[id] = cloneModelInfo(info)
 				catalog.Providers[id] = providers
 			}
 		}

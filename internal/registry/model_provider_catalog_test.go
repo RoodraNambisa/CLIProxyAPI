@@ -184,3 +184,27 @@ func TestUnrestrictedCatalogUpdatesAreAtomicAndCloned(t *testing.T) {
 		t.Fatal("caller modified registry capability metadata")
 	}
 }
+
+func TestProviderCatalogKeepsExistingMetadataSelectionWithinAllowedScope(t *testing.T) {
+	r := newTestModelRegistry()
+	r.RegisterClient("codex-low", "codex", []*ModelInfo{{ID: "shared", DisplayName: "Small", MaxContextLength: 131072}})
+	r.RegisterClient("codex-high", "codex", []*ModelInfo{{ID: "shared", DisplayName: "Large", MaxContextLength: 1048576}})
+	r.RegisterClient("xai-last", "xai", []*ModelInfo{{ID: "shared", DisplayName: "Last", MaxContextLength: 524288}})
+	for _, tc := range []struct {
+		providers []string
+		label     string
+		limit     int
+	}{
+		{[]string{"codex", "xai"}, "Last", 524288},
+		{[]string{"codex"}, "Large", 1048576},
+		{[]string{"xai"}, "Last", 524288},
+	} {
+		catalog := r.GetModelCatalogForProviders("openai", tc.providers)
+		if len(catalog.Models) != 1 || catalog.Models[0]["display_name"] != tc.label || catalog.Models[0]["max_context_length"] != tc.limit || catalog.Metadata["shared"].MaxContextLength != tc.limit {
+			t.Fatalf("scope %#v changed existing metadata selection", tc.providers)
+		}
+	}
+	if got := r.GetModelProviders("shared"); len(got) != 2 || got[0] != "codex" {
+		t.Fatal("catalog lookup changed provider selection")
+	}
+}

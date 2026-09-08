@@ -36,7 +36,7 @@ func TestModelEndpointsUseProviderScopedMetadata(t *testing.T) {
 		{"gemini-get", "/v1beta/models/" + modelID, "", "name", "displayName", gemini.NewGeminiAPIHandler(base).GeminiGetHandler},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			for _, scope := range []string{"codex", "xai", "unknown", ""} {
+			for _, scope := range []string{"codex", "xai", "codex,xai", "unknown", ""} {
 				recorder := httptest.NewRecorder()
 				c, _ := gin.CreateTestContext(recorder)
 				c.Request = httptest.NewRequest(http.MethodGet, tc.path, nil)
