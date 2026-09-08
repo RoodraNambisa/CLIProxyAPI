@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"reflect"
+	"slices"
 	"sort"
 	"strings"
 
@@ -10,17 +11,21 @@ import (
 )
 
 var credentialYAMLTypes = map[string]reflect.Type{
-	"gemini-api-key":       reflect.TypeFor[GeminiKey](),
-	"interactions-api-key": reflect.TypeFor[GeminiKey](),
-	"claude-api-key":       reflect.TypeFor[ClaudeKey](),
-	"codex-api-key":        reflect.TypeFor[CodexKey](),
-	"vertex-api-key":       reflect.TypeFor[VertexCompatKey](),
-	"openai-compatibility": reflect.TypeFor[OpenAICompatibility](),
+	"gemini-api-key":              reflect.TypeFor[GeminiKey](),
+	"interactions-api-key":        reflect.TypeFor[GeminiKey](),
+	"claude-api-key":              reflect.TypeFor[ClaudeKey](),
+	"codex-api-key":               reflect.TypeFor[CodexKey](),
+	"vertex-api-key":              reflect.TypeFor[VertexCompatKey](),
+	"openai-compatibility":        reflect.TypeFor[OpenAICompatibility](),
+	"oauth-request-scoped-errors": reflect.TypeFor[map[string][]RequestScopedErrorRule](),
 }
 
 func credentialYAMLMappingType(path []string) reflect.Type {
 	if len(path) == 0 {
 		return nil
+	}
+	if len(path) == 2 && path[0] == "oauth-request-scoped-errors" {
+		return reflect.TypeFor[RequestScopedErrorRule]()
 	}
 	typ := credentialYAMLTypes[path[0]]
 	unwrap := func(t reflect.Type) reflect.Type {
@@ -66,6 +71,8 @@ func matchCredentialYAMLSequenceElement(original []*yaml.Node, used []bool, targ
 	}
 	var primary, secondary string
 	switch credentialYAMLMappingType(path) {
+	case reflect.TypeFor[RequestScopedErrorRule]():
+		return matchRequestScopedErrorYAMLRule(original, used, target), true
 	case reflect.TypeFor[GeminiKey](), reflect.TypeFor[ClaudeKey](), reflect.TypeFor[CodexKey](), reflect.TypeFor[VertexCompatKey]():
 		primary, secondary = "api-key", "base-url"
 	case reflect.TypeFor[OpenAICompatibilityAPIKey]():
@@ -96,6 +103,36 @@ func matchCredentialYAMLSequenceElement(original []*yaml.Node, used []bool, targ
 		return sole, true
 	}
 	return -1, true
+}
+
+// Status alone is not an identity: many ordered rules intentionally match the
+// same status. Preserve exact rules first, then an unambiguous action edit.
+func matchRequestScopedErrorYAMLRule(original []*yaml.Node, used []bool, target *yaml.Node) int {
+	var wanted RequestScopedErrorRule
+	if err := target.Decode(&wanted); err != nil {
+		return -1
+	}
+	candidate, matches := -1, 0
+	for index, node := range original {
+		if used[index] || node == nil {
+			continue
+		}
+		var current RequestScopedErrorRule
+		if err := node.Decode(&current); err != nil {
+			continue
+		}
+		if current.Status != wanted.Status || !slices.Equal(current.Match, wanted.Match) || !slices.Equal(current.MatchRegexr, wanted.MatchRegexr) {
+			continue
+		}
+		if strings.EqualFold(strings.TrimSpace(current.Action), strings.TrimSpace(wanted.Action)) {
+			return index
+		}
+		candidate, matches = index, matches+1
+	}
+	if matches == 1 {
+		return candidate
+	}
+	return -1
 }
 
 // Materialize credential aliases and merges before updating fields. Otherwise
@@ -138,7 +175,8 @@ func cloneCredentialYAMLNode(node *yaml.Node) *yaml.Node {
 }
 
 func materializeCredentialYAML(node *yaml.Node, path []string) error {
-	if node == nil || credentialYAMLMappingType(path) == nil {
+	isOAuthErrorMap := len(path) == 1 && path[0] == "oauth-request-scoped-errors"
+	if node == nil || (!isOAuthErrorMap && credentialYAMLMappingType(path) == nil) {
 		return nil
 	}
 	if node.Kind == yaml.AliasNode {
