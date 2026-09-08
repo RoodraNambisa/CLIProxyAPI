@@ -2,6 +2,7 @@ package live
 
 import (
 	"testing"
+	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 )
@@ -52,4 +53,44 @@ func TestMediaRuntimeUsesImmutableConfigurationAndSharedCapacity(t *testing.T) {
 	if old.media.maxSessions != 1 {
 		t.Fatal("hot disable changed existing media settings")
 	}
+}
+
+func TestMediaLimiterShutdownWaitsForUnregisteredSessions(t *testing.T) {
+	limiter := &mediaSessionLimiter{}
+	release, ok := limiter.acquire(1)
+	if !ok {
+		t.Fatal("fixture capacity unavailable")
+	}
+	defer release()
+	finished := make(chan struct{})
+	go func() { limiter.close(); close(finished) }()
+	deadline := time.NewTimer(time.Second)
+	defer deadline.Stop()
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	for {
+		limiter.mu.Lock()
+		closed := limiter.closed
+		limiter.mu.Unlock()
+		if closed {
+			break
+		}
+		select {
+		case <-ticker.C:
+		case <-deadline.C:
+			t.Fatal("limiter did not begin shutdown")
+		}
+	}
+	if release, ok := limiter.acquire(32); ok {
+		release()
+		t.Fatal("shutdown accepted a new media session")
+	}
+	select {
+	case <-finished:
+		t.Fatal("shutdown returned before session release")
+	default:
+	}
+	release()
+	receiveMediaValue(t, finished)
+	limiter.close()
 }

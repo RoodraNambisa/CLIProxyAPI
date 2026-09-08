@@ -91,6 +91,7 @@ func (h *Handler) Close() {
 	h.updateMu.Unlock()
 	h.calls.close()
 	h.clientSecrets.close()
+	h.mediaLimiter.close()
 }
 
 type liveRequest struct {

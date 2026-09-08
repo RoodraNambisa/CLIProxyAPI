@@ -23,6 +23,10 @@ func (h *Handler) HandleCall(c *gin.Context) {
 		return
 	}
 	defer r.finish()
+	if r.mediaError != nil {
+		r.fail(c, r.mediaError, nil, http.StatusServiceUnavailable, "Realtime media configuration is unavailable", "server_error", "realtime_media_unavailable", nil, nil)
+		return
+	}
 	body, errRead := readCallBody(c.Request.Body)
 	if errRead != nil {
 		status := http.StatusBadRequest
@@ -55,6 +59,14 @@ func (h *Handler) HandleCall(c *gin.Context) {
 		}
 		secretPrincipal = grant.principal
 	}
+	clientOffer := ""
+	if r.media != nil {
+		clientOffer, errPayload = payload.mediaOffer()
+		if errPayload != nil {
+			r.fail(c, errPayload, nil, http.StatusBadRequest, errPayload.Error(), "invalid_request_error", "invalid_realtime_request", nil, nil)
+			return
+		}
+	}
 	// Copy only immutable accounting metadata. Never detach the entire request
 	// with WithoutCancel, which would retain Gin and the request body for an hour.
 	lifetime := h.root
@@ -67,8 +79,10 @@ func (h *Handler) HandleCall(c *gin.Context) {
 		return
 	}
 	retained, allocatedID := false, ""
+	var media *pionMediaSession
 	defer func() {
 		if !retained {
+			_ = media.Close()
 			if allocatedID != "" {
 				h.rollbackCall(lease, allocatedID)
 			} else {
@@ -84,6 +98,35 @@ func (h *Handler) HandleCall(c *gin.Context) {
 		}
 		r.fail(c, errPayload, nil, status, "Failed to encode realtime call request", "invalid_request_error", "invalid_realtime_request", nil, nil)
 		return
+	}
+	if r.media != nil {
+		proxyURL := lease.CloneAuth().EffectiveProxyURL()
+		if proxyURL == "" {
+			proxyURL = r.mediaProxyURL
+		}
+		var offer string
+		var errMedia error
+		media, offer, errMedia = r.media.NewSession(r.ctx, lease.Context(), clientOffer, proxyURL)
+		if errMedia != nil {
+			status, kind, code := http.StatusServiceUnavailable, "server_error", "realtime_media_unavailable"
+			if errors.Is(errMedia, errMediaInvalidOffer) {
+				status, kind, code = http.StatusBadRequest, "invalid_request_error", "invalid_realtime_request"
+			}
+			if errors.Is(errMedia, errMediaCapacity) {
+				code = "realtime_media_capacity"
+			}
+			r.fail(c, errMedia, nil, status, "Realtime media setup failed", kind, code, nil, nil)
+			return
+		}
+		payload, errPayload = payload.withMediaOffer(offer)
+		if errPayload != nil {
+			status := http.StatusInternalServerError
+			if errors.Is(errPayload, errCallBodyTooLarge) {
+				status = http.StatusRequestEntityTooLarge
+			}
+			r.fail(c, errPayload, nil, status, "Failed to encode realtime media offer", "server_error", "realtime_media_unavailable", nil, nil)
+			return
+		}
 	}
 	headers := realtimeCallHeaders(c.Request.Header, lease)
 	headers.Set("Content-Type", payload.contentType)
@@ -124,8 +167,21 @@ func (h *Handler) HandleCall(c *gin.Context) {
 		r.fail(c, nil, lease, http.StatusBadGateway, "Realtime response is missing an answer or valid call ID", "api_error", "invalid_realtime_response", nil, nil)
 		return
 	}
+	if media != nil {
+		answer, errMedia := media.AcceptUpstreamAnswer(r.ctx, string(responseBody))
+		if errMedia != nil {
+			r.fail(c, errMedia, lease, http.StatusBadGateway, "Realtime upstream media answer is unavailable", "api_error", "invalid_realtime_response", nil, nil)
+			return
+		}
+		responseBody = []byte(answer)
+	}
 	call := &liveCall{id: allocatedID, owner: owner, lease: lease, secretPrincipal: secretPrincipal}
-	if errCommit := r.commitWith(func() error { return h.calls.put(call) }); errCommit != nil {
+	publish := func() error { return h.calls.put(call) }
+	if media != nil {
+		call.onClose = func() { _ = media.Close() }
+		publish = func() error { return media.Commit(func() error { return h.calls.put(call) }) }
+	}
+	if errCommit := r.commitWith(publish); errCommit != nil {
 		if errors.Is(errCommit, errCallIDConflict) {
 			// An upstream duplicate must not hang up a previously established call.
 			allocatedID = ""
@@ -134,6 +190,15 @@ func (h *Handler) HandleCall(c *gin.Context) {
 		return
 	}
 	retained = true
+	if media != nil {
+		// Installing after publication also delivers a failure that won the race
+		// immediately after Commit. Cleanup owns only this exact stored call.
+		media.SetCloseHandler(func(error) {
+			if h.calls.detach(call) {
+				h.rollbackCall(call.lease, call.id)
+			}
+		})
+	}
 	if handlers.PassthroughHeadersEnabled(r.base.Cfg) {
 		headers := handlers.FilterUpstreamHeaders(response.Header)
 		headers.Del("Location")
@@ -145,7 +210,7 @@ func (h *Handler) HandleCall(c *gin.Context) {
 	}
 	c.Header("Location", location)
 	contentType := response.Header.Get("Content-Type")
-	if contentType == "" {
+	if contentType == "" || media != nil {
 		contentType = "application/sdp"
 	}
 	c.Header("Content-Type", contentType)

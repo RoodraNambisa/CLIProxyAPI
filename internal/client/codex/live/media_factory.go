@@ -21,19 +21,31 @@ var mediaOpusCodec = webrtc.RTPCodecCapability{
 // One limiter is shared across configuration revisions. Each new session uses
 // its own admission limit, and releases exactly one slot when it closes.
 type mediaSessionLimiter struct {
-	mu     sync.Mutex
-	active int
+	mu       sync.Mutex
+	active   int
+	closed   bool
+	sessions sync.WaitGroup
 }
 
 func (l *mediaSessionLimiter) acquire(limit int) (func(), bool) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if limit <= 0 || l.active >= limit {
+	if l.closed || limit <= 0 || l.active >= limit {
 		return nil, false
 	}
 	l.active++
+	l.sessions.Add(1)
 	var once sync.Once
-	return func() { once.Do(func() { l.mu.Lock(); l.active--; l.mu.Unlock() }) }, true
+	return func() { once.Do(func() { l.mu.Lock(); l.active--; l.mu.Unlock(); l.sessions.Done() }) }, true
+}
+
+// Stop acquisition before waiting, including setups not yet in the call store.
+// Session owners must cancel their lifetimes before calling close.
+func (l *mediaSessionLimiter) close() {
+	l.mu.Lock()
+	l.closed = true
+	l.mu.Unlock()
+	l.sessions.Wait()
 }
 
 type pionMediaRelay struct {

@@ -12,6 +12,7 @@ import (
 )
 
 var errMediaCapacity = errors.New("realtime media relay is at capacity")
+var errMediaInvalidOffer = errors.New("invalid realtime SDP offer")
 
 type mediaSessionError struct {
 	stage string
@@ -108,7 +109,7 @@ func (r *pionMediaRelay) NewSession(setup, lifetime context.Context, clientOffer
 		return nil, "", context.Cause(s.ctx)
 	}
 	if err := downstream.SetRemoteDescription(webrtc.SessionDescription{Type: webrtc.SDPTypeOffer, SDP: clientOffer}); err != nil {
-		return fail("invalid downstream media offer", err)
+		return fail("invalid downstream media offer", errors.Join(errMediaInvalidOffer, err))
 	}
 	if err := s.installAudioTracks(); err != nil {
 		return fail("configure media audio tracks", err)
