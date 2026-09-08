@@ -4833,6 +4833,9 @@ func (s *Service) ApplyRuntimeConfig(ctx context.Context, requested *config.Conf
 	if errRetry := requestedSnapshot.ValidateCredentialRequestRetries(); errRetry != nil {
 		return result, errRetry
 	}
+	if errRules := requestedSnapshot.ValidateRequestScopedErrorRules(); errRules != nil {
+		return result, errRules
+	}
 	s.runtimeConfigApplyMu.Lock()
 	defer s.runtimeConfigApplyMu.Unlock()
 

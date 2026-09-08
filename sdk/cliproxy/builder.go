@@ -179,6 +179,9 @@ func (b *Builder) Build() (*Service, error) {
 	if errRetry := b.cfg.ValidateCredentialRequestRetries(); errRetry != nil {
 		return nil, errRetry
 	}
+	if errRules := b.cfg.ValidateRequestScopedErrorRules(); errRules != nil {
+		return nil, errRules
+	}
 
 	tokenProvider := b.tokenProvider
 	if tokenProvider == nil {

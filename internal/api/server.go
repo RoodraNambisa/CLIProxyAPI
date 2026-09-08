@@ -1354,6 +1354,9 @@ func (s *Server) updateClients(cfg *config.Config, rollbackOnError bool) error {
 	if errRetry := runtimeCfg.ValidateCredentialRequestRetries(); errRetry != nil {
 		return errRetry
 	}
+	if errRules := runtimeCfg.ValidateRequestScopedErrorRules(); errRules != nil {
+		return errRules
+	}
 	// Reconstruct old config from YAML snapshot to avoid reference sharing issues
 	var oldCfg *config.Config
 	if len(s.oldConfigYaml) > 0 {
