@@ -2379,7 +2379,14 @@
         "max": 64000,
         "zero_allowed": true,
         "dynamic_allowed": true
-      }
+      },
+      "supportedInputModalities": [
+        "text",
+        "image"
+      ],
+      "supportedOutputModalities": [
+        "text"
+      ]
     },
     {
       "id": "claude-sonnet-4-6",
@@ -2396,7 +2403,14 @@
         "max": 64000,
         "zero_allowed": true,
         "dynamic_allowed": true
-      }
+      },
+      "supportedInputModalities": [
+        "text",
+        "image"
+      ],
+      "supportedOutputModalities": [
+        "text"
+      ]
     },
     {
       "id": "gemini-3-flash",
@@ -2418,7 +2432,16 @@
           "medium",
           "high"
         ]
-      }
+      },
+      "supportedInputModalities": [
+        "text",
+        "image",
+        "audio",
+        "video"
+      ],
+      "supportedOutputModalities": [
+        "text"
+      ]
     },
     {
       "id": "gemini-3-flash-agent",
@@ -2458,7 +2481,15 @@
           "minimal",
           "high"
         ]
-      }
+      },
+      "supportedInputModalities": [
+        "text",
+        "image"
+      ],
+      "supportedOutputModalities": [
+        "text",
+        "image"
+      ]
     },
     {
       "id": "gemini-pro-agent",
@@ -2479,7 +2510,16 @@
           "medium",
           "high"
         ]
-      }
+      },
+      "supportedInputModalities": [
+        "text",
+        "image",
+        "audio",
+        "video"
+      ],
+      "supportedOutputModalities": [
+        "text"
+      ]
     },
     {
       "id": "gemini-3.1-pro-low",
@@ -2500,7 +2540,16 @@
           "medium",
           "high"
         ]
-      }
+      },
+      "supportedInputModalities": [
+        "text",
+        "image",
+        "audio",
+        "video"
+      ],
+      "supportedOutputModalities": [
+        "text"
+      ]
     },
     {
       "id": "gpt-oss-120b-medium",
@@ -2511,7 +2560,13 @@
       "name": "gpt-oss-120b-medium",
       "description": "GPT-OSS 120B (Medium)",
       "context_length": 114000,
-      "max_completion_tokens": 32768
+      "max_completion_tokens": 32768,
+      "supportedInputModalities": [
+        "text"
+      ],
+      "supportedOutputModalities": [
+        "text"
+      ]
     },
     {
       "id": "gemini-3.1-flash-lite",
@@ -2534,7 +2589,16 @@
           "medium",
           "high"
         ]
-      }
+      },
+      "supportedInputModalities": [
+        "text",
+        "image",
+        "audio",
+        "video"
+      ],
+      "supportedOutputModalities": [
+        "text"
+      ]
     },
     {
       "id": "gemini-3.5-flash-low",
@@ -2590,7 +2654,14 @@
       "name": "grok-build-0.1",
       "description": "Grok Build 0.1 is xAI’s fast coding model trained specifically for agentic software engineering workflows.",
       "context_length": 256000,
-      "max_completion_tokens": 256000
+      "max_completion_tokens": 256000,
+      "supportedInputModalities": [
+        "text",
+        "image"
+      ],
+      "supportedOutputModalities": [
+        "text"
+      ]
     },
     {
       "id": "grok-4.5",
@@ -2610,7 +2681,14 @@
           "medium",
           "high"
         ]
-      }
+      },
+      "supportedInputModalities": [
+        "text",
+        "image"
+      ],
+      "supportedOutputModalities": [
+        "text"
+      ]
     },
     {
       "id": "grok-4.3",
@@ -2631,7 +2709,14 @@
           "medium",
           "high"
         ]
-      }
+      },
+      "supportedInputModalities": [
+        "text",
+        "image"
+      ],
+      "supportedOutputModalities": [
+        "text"
+      ]
     },
     {
       "id": "grok-4.20-0309-reasoning",
@@ -2643,7 +2728,14 @@
       "name": "grok-4.20-0309-reasoning",
       "description": "xAI Grok 4.20 0309 reasoning model for the Responses API.",
       "context_length": 2000000,
-      "max_completion_tokens": 65536
+      "max_completion_tokens": 65536,
+      "supportedInputModalities": [
+        "text",
+        "image"
+      ],
+      "supportedOutputModalities": [
+        "text"
+      ]
     },
     {
       "id": "grok-4.20-0309-non-reasoning",
@@ -2655,7 +2747,14 @@
       "name": "grok-4.20-0309-non-reasoning",
       "description": "xAI Grok 4.20 0309 non-reasoning model for the Responses API.",
       "context_length": 2000000,
-      "max_completion_tokens": 65536
+      "max_completion_tokens": 65536,
+      "supportedInputModalities": [
+        "text",
+        "image"
+      ],
+      "supportedOutputModalities": [
+        "text"
+      ]
     },
     {
       "id": "grok-4.20-multi-agent-0309",
@@ -2674,7 +2773,14 @@
           "medium",
           "high"
         ]
-      }
+      },
+      "supportedInputModalities": [
+        "text",
+        "image"
+      ],
+      "supportedOutputModalities": [
+        "text"
+      ]
     },
     {
       "id": "grok-3-mini",
@@ -2693,7 +2799,13 @@
           "medium",
           "high"
         ]
-      }
+      },
+      "supportedInputModalities": [
+        "text"
+      ],
+      "supportedOutputModalities": [
+        "text"
+      ]
     },
     {
       "id": "grok-3-mini-fast",
@@ -2712,7 +2824,13 @@
           "medium",
           "high"
         ]
-      }
+      },
+      "supportedInputModalities": [
+        "text"
+      ],
+      "supportedOutputModalities": [
+        "text"
+      ]
     },
     {
       "id": "grok-composer-2.5-fast",

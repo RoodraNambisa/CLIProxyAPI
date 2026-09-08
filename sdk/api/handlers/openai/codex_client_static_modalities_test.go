@@ -13,7 +13,7 @@ import (
 	"github.com/tidwall/gjson"
 )
 
-func TestCodexClientUsesStaticClaudeAndKimiModalities(t *testing.T) {
+func TestCodexClientUsesStaticTextAndImageModalities(t *testing.T) {
 	for _, tc := range []struct {
 		provider, id string
 		load         func() []*registry.ModelInfo
@@ -26,6 +26,11 @@ func TestCodexClientUsesStaticClaudeAndKimiModalities(t *testing.T) {
 		{"kimi", "kimi-k2.6", registry.GetKimiModels, []string{"text", "image", "video"}, true},
 		{"claude", "claude-opus-4-6", registry.GetClaudeModels, []string{"text", "image"}, true},
 		{"claude", "claude-sonnet-4-6", registry.GetClaudeModels, []string{"text", "image"}, true},
+		{"antigravity", "gpt-oss-120b-medium", registry.GetAntigravityModels, []string{"text"}, false},
+		{"antigravity", "claude-sonnet-4-6", registry.GetAntigravityModels, []string{"text", "image"}, true},
+		{"xai", "grok-3-mini", registry.GetXAIModels, []string{"text"}, false},
+		{"xai", "grok-3-mini-fast", registry.GetXAIModels, []string{"text"}, false},
+		{"xai", "grok-4.5", registry.GetXAIModels, []string{"text", "image"}, true},
 	} {
 		t.Run(tc.id, func(t *testing.T) {
 			var info *registry.ModelInfo
@@ -63,7 +68,14 @@ func TestCodexClientUsesStaticClaudeAndKimiModalities(t *testing.T) {
 				if !reflect.DeepEqual(input, want) || model.Get("supports_image_detail_original").Bool() != tc.wantImage {
 					t.Fatalf("scope %q returned wrong client image capability", scope)
 				}
-				if model.Get("context_window").Int() != int64(info.ContextLength) || model.Get("max_tokens").Int() != int64(info.MaxCompletionTokens) {
+				contextLimit, outputLimit := info.ContextLength, info.MaxCompletionTokens
+				if contextLimit <= 0 {
+					contextLimit = info.InputTokenLimit
+				}
+				if outputLimit <= 0 {
+					outputLimit = info.OutputTokenLimit
+				}
+				if model.Get("context_window").Int() != int64(contextLimit) || model.Get("max_tokens").Int() != int64(outputLimit) {
 					t.Fatal("modality metadata changed token capacity")
 				}
 			}
