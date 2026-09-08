@@ -126,6 +126,15 @@ func buildCodexClientModels(models []map[string]any, providersForModel codexClie
 		if id == "" {
 			continue
 		}
+		var info *registry.ModelInfo
+		if len(infoForModel) == 0 {
+			info = registry.LookupModelInfo(id)
+		} else if infoForModel[0] != nil {
+			info = infoForModel[0](id)
+		}
+		if info != nil && info.Type == registry.CodexRealtimeModelType {
+			continue
+		}
 
 		if template, ok := templates[id]; ok {
 			entry := cloneCodexClientModelMap(template)
@@ -140,12 +149,6 @@ func buildCodexClientModels(models []map[string]any, providersForModel codexClie
 		}
 
 		entry := cloneCodexClientModelMap(defaultTemplate)
-		var info *registry.ModelInfo
-		if len(infoForModel) == 0 {
-			info = registry.LookupModelInfo(id)
-		} else if infoForModel[0] != nil {
-			info = infoForModel[0](id)
-		}
 		applyCodexClientModelMetadata(entry, id, model, info)
 		applyCodexClientContextOverride(entry, model)
 		applyCodexClientMaxTokens(entry, model)

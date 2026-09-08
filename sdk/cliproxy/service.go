@@ -5621,6 +5621,9 @@ func (s *Service) registerModelsForAuthWithState(a *coreauth.Auth, preserveTrans
 			}
 		}
 		if authKind != "apikey" {
+			if codexLiveEnabled(s.cfg) && coreauth.SupportsCodexLive(a) {
+				models = upsertModelInfos(models, registry.GetCodexRealtimeModels())
+			}
 			models = removeCodexCustomModelOverrides(models, s.cfg)
 			models = upsertModelInfos(models, codexCustomModelInfosForPlan(s.cfg, codexPlanType))
 		}
@@ -6047,6 +6050,9 @@ func configuredImagesImageModel(cfg *config.Config) string {
 }
 
 func shouldRefreshCodexRegistrations(previousCfg, nextCfg *config.Config) bool {
+	if codexLiveEnabled(previousCfg) != codexLiveEnabled(nextCfg) {
+		return true
+	}
 	if configuredImagesImageModel(previousCfg) != configuredImagesImageModel(nextCfg) {
 		return true
 	}
@@ -6061,6 +6067,10 @@ func shouldRefreshCodexRegistrations(previousCfg, nextCfg *config.Config) bool {
 
 func shouldRefreshChatGPTWebRegistrations(previousCfg, nextCfg *config.Config) bool {
 	return configuredImagesImageModel(previousCfg) != configuredImagesImageModel(nextCfg)
+}
+
+func codexLiveEnabled(cfg *config.Config) bool {
+	return cfg != nil && cfg.Codex.LiveEnabled
 }
 
 func freePlanImageModelEnabled(cfg *config.Config) bool {
